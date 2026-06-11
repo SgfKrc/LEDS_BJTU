@@ -196,10 +196,13 @@ export default function AdminPanel({ onToast, myRole }) {
       `⚠️ 确定要将主节点身份转让给从节点「${targetName}」吗？\n\n` +
       `此操作将：\n` +
       `  1. 通知目标从节点准备升级为主节点\n` +
-      `  2. 保存降级日志到数据库\n` +
-      `  3. 更新数据库中的主节点信息\n\n` +
-      `转让后建议双方重启服务以应用新角色。\n` +
-      `本节点重启后将以从节点模式运行。`
+      `  2. 激活备用主节点「${spareMaster?.node_id || '未知'}」暂代监政\n` +
+      `  3. 保存降级日志和备用激活日志到数据库\n` +
+      `  4. 更新数据库中的主节点信息\n\n` +
+      `转让后建议三方重启服务：\n` +
+      `  • 目标节点以主节点模式运行\n` +
+      `  • 本节点以从节点模式运行\n` +
+      `  • 新主节点上线后将自动通知备用主节点退出暂代`
     )) return;
 
     setTransferring(true);
@@ -235,10 +238,6 @@ export default function AdminPanel({ onToast, myRole }) {
       fetchSpareMaster()
         .then(data => {
           setSpareMaster(data.spare_master || null);
-          // 自动同步转让目标为备用主节点
-          if (data.spare_master?.node_id) {
-            setTransferTarget(data.spare_master.node_id);
-          }
         })
         .catch(() => {});
       fetchSpareMasterLogs()
@@ -995,10 +994,10 @@ export default function AdminPanel({ onToast, myRole }) {
             <h3>🛡️ 备用主节点</h3>
             <div className="identity-management">
               <p className="connect-desc">
-                指定一个从节点作为备用主节点。备用主节点是身份转让的<strong>指定接班人</strong>。
-                <br />• 只有指定了备用主节点后，才能转让主节点身份
-                <br />• 必须有至少<strong>3 个在线节点</strong>（主 + 备用 + 至少 1 个其他从节点）才能转让
-                <br />• 指定操作通过 TCP 通知从节点，并记录操作日志
+                指定一个从节点作为备用主节点。转让期间，备用主节点<strong>暂代主节点职责</strong>填补空窗期。
+                <br />• 转让前，主节点向备用主节点发送激活通知（TCP），备用暂代监政
+                <br />• 新主节点上线后，自动向备用主节点发送接管通知，备用退出暂代
+                <br />• 转让目标<strong>不能</strong>是备用主节点本身（请选择其他在线从节点）
               </p>
               {/* 当前备用主节点状态 */}
               {spareMaster ? (
@@ -1111,10 +1110,11 @@ export default function AdminPanel({ onToast, myRole }) {
             <h3>🔄 转让主节点身份</h3>
             <div className="identity-management">
               <p className="connect-desc">
-                将主节点身份转让给<strong>备用主节点</strong>。转让前须先指定备用主节点。
-                <br />• 目标从节点将收到 TCP 通知并保存升级日志
-                <br />• 本节点保存降级日志并更新数据库中的主节点信息
-                <br />• <strong>建议双方重启服务</strong>以应用新角色（新主节点重启后以主节点模式运行，原主节点以从节点模式运行）
+                将主节点身份转让给任意在线从节点。<strong>备用主节点</strong>在转让空窗期暂代主节点职责。
+                <br />• <strong>转让目标</strong>（新主节点）收到 TCP 通知并保存升级日志
+                <br />• <strong>备用主节点</strong>收到激活通知，暂代监政直到新主节点上线接管
+                <br />• 本节点保存降级日志并更新数据库
+                <br />• <strong>建议三方重启服务</strong>：目标节点以主节点模式运行，本节点以从节点模式运行，备用节点退出暂代
               </p>
               {/* 转让前置条件检查 */}
               {!spareMaster ? (
@@ -1123,38 +1123,58 @@ export default function AdminPanel({ onToast, myRole }) {
                   borderRadius: 8, padding: '10px 14px', marginBottom: 12,
                 }}>
                   <span style={{ color: 'var(--warning)' }}>
-                    ⚠️ 未指定备用主节点，无法转让。请先在上方「🛡️ 备用主节点」中指定。
+                    ⚠️ 未指定备用主节点，无法转让。请先在上方「🛡️ 备用主节点」中指定一个从节点作为空窗期监政。
+                  </span>
+                </div>
+              ) : !spareMaster?.is_online ? (
+                <div style={{
+                  background: 'var(--warning-bg)', border: '1px solid var(--warning)',
+                  borderRadius: 8, padding: '10px 14px', marginBottom: 12,
+                }}>
+                  <span style={{ color: 'var(--warning)' }}>
+                    ⚠️ 备用主节点 '{spareMaster.node_id}' 当前离线，无法激活暂代。请等待其上线上再转让。
                   </span>
                 </div>
               ) : (
-                <div className="transfer-form">
-                  <div className="connect-field" style={{ flex: 1 }}>
-                    <label>目标从节点（固定为备用主节点）</label>
-                    <select
-                      className="connect-input"
-                      value={transferTarget}
-                      onChange={(e) => setTransferTarget(e.target.value)}
-                      style={{ width: '100%' }}
-                      disabled
+                <>
+                  {spareMaster.is_active && (
+                    <div style={{
+                      background: 'var(--info-bg)', border: '1px solid var(--info)',
+                      borderRadius: 8, padding: '10px 14px', marginBottom: 12,
+                    }}>
+                      <span>🛡️ 备用主节点 <strong>{spareMaster.node_id}</strong> 当前处于<strong>暂代激活</strong>状态，等待新主节点上线接管。</span>
+                    </div>
+                  )}
+                  <div className="transfer-form">
+                    <div className="connect-field" style={{ flex: 1 }}>
+                      <label>目标从节点（新主节点）</label>
+                      <select
+                        className="connect-input"
+                        value={transferTarget}
+                        onChange={(e) => setTransferTarget(e.target.value)}
+                        style={{ width: '100%' }}
+                      >
+                        <option value="">— 选择在线从节点 —</option>
+                        {(nodes?.nodes || [])
+                          .filter(n => n.role === 'client' && n.state === 'online' && n.node_id !== spareMaster?.node_id)
+                          .map(n => (
+                            <option key={n.node_id} value={n.node_id}>
+                              💻 {n.node_id} {n.hostname ? `(${n.hostname})` : ''} {n.address ? `@ ${n.address}` : ''}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                    <button
+                      className="btn-primary"
+                      onClick={handleTransferMaster}
+                      disabled={transferring || !transferTarget}
+                      style={{ fontSize: 13, alignSelf: 'flex-end' }}
+                      title="将主节点身份转让给选中的从节点，备用主节点将在空窗期暂代"
                     >
-                      <option value={spareMaster.node_id}>
-                        🛡️ {spareMaster.node_id} {spareMaster.hostname ? `(${spareMaster.hostname})` : ''} — 备用主节点
-                      </option>
-                    </select>
+                      {transferring ? '⏳ 转让中...' : '🔄 转让身份'}
+                    </button>
                   </div>
-                  <button
-                    className="btn-primary"
-                    onClick={handleTransferMaster}
-                    disabled={transferring || !transferTarget || !spareMaster?.is_online}
-                    style={{ fontSize: 13, alignSelf: 'flex-end' }}
-                    title={
-                      !spareMaster?.is_online ? '备用主节点离线，无法转让' :
-                      '将主节点身份转让给备用主节点'
-                    }
-                  >
-                    {transferring ? '⏳ 转让中...' : '🔄 转让身份'}
-                  </button>
-                </div>
+                </>
               )}
               {/* 转让日志 */}
               {transferLogs.length > 0 && (

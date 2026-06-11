@@ -199,6 +199,12 @@ class Scheduler:
                 self._register_master_in_db()
                 # 启动数据库心跳刷新线程
                 self._start_master_db_heartbeat()
+                # 检查是否需要向备用主节点发送接管通知（转让后新主节点启动）
+                threading.Thread(
+                    target=self.deactivate_spare_master_on_startup,
+                    name="spare-deactivate",
+                    daemon=True,
+                ).start()
             else:
                 logger.info(f"调度器已启动（分布式模式，从节点），监听 {bind_host}:{actual_port}")
                 # 从节点启动后台线程：监控主节点健康状态 + 自动重连
@@ -917,6 +923,18 @@ class Scheduler:
             # 主节点收到从节点的备用指定确认
             self._handle_spare_master_designate_ack(client_id, msg)
 
+        elif msg_type == "spare_master_activate":
+            # 备用主节点收到激活（暂代主节点职责）通知
+            self._handle_spare_master_activate(client_id, msg)
+
+        elif msg_type == "spare_master_activate_ack":
+            # 主节点收到备用主节点的激活确认
+            self._handle_spare_master_activate_ack(client_id, msg)
+
+        elif msg_type == "spare_master_deactivate":
+            # 备用主节点收到新主节点的接管通知
+            self._handle_spare_master_deactivate(client_id, msg)
+
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
         self.deregister_node(client_id)
@@ -946,35 +964,40 @@ class Scheduler:
             return {"status": "denied", "reason": "仅主节点可发起角色转让"}
 
         # ---- 备用主节点前置检查 ----
+        # 备用主节点用于填补转让空窗期，不是转让目标
         spare = self.get_spare_master()
         if not spare or not spare.get("node_id"):
             return {
                 "status": "invalid",
-                "reason": "未指定备用主节点，无法转让。请先在「备用主节点」中指定一个从节点作为备用主节点。",
+                "reason": (
+                    "未指定备用主节点，无法转让。"
+                    "备用主节点在转让空窗期暂代主节点职责，请先在「备用主节点」中指定。"
+                ),
             }
 
         spare_id = spare.get("node_id")
-        if target_node_id != spare_id:
-            return {
-                "status": "invalid",
-                "reason": f"只能转让给备用主节点 '{spare_id}'。请先在「备用主节点」中重新指定目标节点。",
-            }
 
-        # 检查是否只有 master + spare_master（没有其他从节点）
-        online_clients = [
-            nid for nid, info in self.nodes.items()
-            if info.role in ("client", NodeRole.CLIENT)
-            and info.is_available()
-            and nid != spare_id  # 排除备用主节点本身
-        ]
-        if not online_clients:
+        # 转让目标不能是备用主节点本身（备用主节点负责监政，不兼任新主节点）
+        if target_node_id == spare_id:
             return {
                 "status": "invalid",
                 "reason": (
-                    "当前只有主节点和备用主节点在线，转让将导致集群无人监督。"
-                    "请确保至少还有一个其他从节点在线后再转让。"
+                    f"备用主节点 '{spare_id}' 负责在空窗期暂代监政，不能同时成为转让目标。"
+                    "请选择其他在线从节点作为新主节点。"
                 ),
             }
+
+        # 检查是否有至少一个其他在线从节点（非备用、非转让目标）
+        other_clients = [
+            nid for nid, info in self.nodes.items()
+            if info.role in ("client", NodeRole.CLIENT)
+            and info.is_available()
+            and nid not in (spare_id, target_node_id)
+        ]
+        if not other_clients and not (target_node_id != spare_id):
+            # 如果转让目标就是唯一的另一个从节点，这是允许的最后一次转让
+            pass  # 至少有一个其他从节点即可
+        # 放宽限制：只要有备用主节点在线即可
 
         # ---- 备用主节点检查通过 ----
 
@@ -1008,7 +1031,7 @@ class Scheduler:
             },
         }
 
-        # 步骤 1: 发送 ROLE_TRANSFER 给目标从节点
+        # 步骤 1: 发送 ROLE_TRANSFER 给目标从节点（新主节点）
         try:
             from tcp_comm import MessageType
             self._tcp_server.send_to_client(
@@ -1019,32 +1042,77 @@ class Scheduler:
                 f"(transfer_id={transfer_id})"
             )
         except Exception as e:
-            return {"status": "error", "reason": f"TCP 发送失败: {e}"}
+            return {"status": "error", "reason": f"TCP 发送失败 (目标节点): {e}"}
 
-        # 步骤 2: 等待 ACK（轮询，超时 15s）
+        # 步骤 2: 发送 SPARE_MASTER_ACTIVATE 给备用主节点（暂代监政）
+        activate_data = {
+            "activate_id": f"activate_{transfer_id}",
+            "transfer_id": transfer_id,
+            "old_master_id": NODE_ID,
+            "new_master_id": target_node_id,
+            "server_ip": getattr(self, '_lan_ip', '') or SERVER_IP,
+            "server_port": SERVER_PORT,
+            "timestamp": time.time(),
+            "message": (
+                f"主节点身份即将从 {NODE_ID} 转让给 {target_node_id}。"
+                "请暂代主节点职责，直到新主节点上线接管。"
+            ),
+        }
+        try:
+            self._tcp_server.send_to_client(
+                spare_id, activate_data, MessageType.SPARE_MASTER_ACTIVATE
+            )
+            logger.info(
+                f"备用主节点激活请求已发送: {spare_id} "
+                f"(等待新主节点 {target_node_id} 上线)"
+            )
+        except Exception as e:
+            return {"status": "error", "reason": f"TCP 发送失败 (备用主节点): {e}"}
+
+        # 步骤 3: 等待两个 ACK（ROLE_TRANSFER_ACK + SPARE_MASTER_ACTIVATE_ACK）
         if not hasattr(self, "_transfer_acks"):
             self._transfer_acks = {}
+        if not hasattr(self, "_spare_activate_acks"):
+            self._spare_activate_acks = {}
         self._transfer_acks[transfer_id] = None
+        self._spare_activate_acks[activate_data["activate_id"]] = None
 
         deadline = time.time() + 15
-        ack_received = False
+        target_ack = None
+        spare_ack = None
         while time.time() < deadline:
-            if self._transfer_acks.get(transfer_id) is not None:
-                ack_received = True
+            if target_ack is None:
+                target_ack = self._transfer_acks.get(transfer_id)
+            if spare_ack is None:
+                spare_ack = self._spare_activate_acks.get(activate_data["activate_id"])
+            if target_ack is not None and spare_ack is not None:
                 break
             time.sleep(0.3)
 
-        if not ack_received:
+        # 检查目标节点 ACK
+        if target_ack is None:
             self._transfer_acks.pop(transfer_id, None)
+            self._spare_activate_acks.pop(activate_data["activate_id"], None)
             return {
                 "status": "timeout",
-                "reason": f"节点 '{target_node_id}' 未在 15s 内确认转让",
+                "reason": f"目标节点 '{target_node_id}' 未在 15s 内确认转让",
                 "transfer_id": transfer_id,
             }
 
-        ack_data = self._transfer_acks.pop(transfer_id)
+        # 检查备用主节点 ACK
+        if spare_ack is None:
+            self._transfer_acks.pop(transfer_id, None)
+            self._spare_activate_acks.pop(activate_data["activate_id"], None)
+            return {
+                "status": "timeout",
+                "reason": f"备用主节点 '{spare_id}' 未在 15s 内确认激活",
+                "transfer_id": transfer_id,
+            }
 
-        # 步骤 3: 主节点保存降级日志
+        self._transfer_acks.pop(transfer_id, None)
+        self._spare_activate_acks.pop(activate_data["activate_id"], None)
+
+        # 步骤 4: 主节点保存降级日志 + 备用激活日志
         db = _get_db()
         try:
             if db and _db_available:
@@ -1055,39 +1123,56 @@ class Scheduler:
                     related_node=target_node_id,
                     details={
                         "transfer_id": transfer_id,
-                        "ack_data": ack_data,
+                        "target_ack": target_ack,
+                        "spare_activated": spare_id,
+                        "spare_ack": spare_ack,
                         "node_count": len(self.nodes),
                     },
                 )
+                db.append_spare_master_log(
+                    direction="activated",
+                    details={
+                        "transfer_id": transfer_id,
+                        "old_master_id": NODE_ID,
+                        "new_master_id": target_node_id,
+                        "spare_node_id": spare_id,
+                        "ack": spare_ack,
+                    },
+                )
         except Exception as e:
-            logger.warning(f"降级日志写入失败: {e}")
+            logger.warning(f"日志写入失败: {e}")
 
-        # 步骤 4: 更新数据库 — 新主节点信息
+        # 步骤 5: 更新数据库 — 新主节点信息
         try:
             if db and _db_available:
                 db.set_config("master_node_id", target_node_id)
+                db.set_config("new_master_node_id", target_node_id)
                 db.set_config("master_role_transferred", "true")
+                db.set_config("spare_master_active", "true")  # 标记备用主节点已激活
                 db.set_config("last_transfer_id", transfer_id)
                 db.set_config("last_transfer_time", str(time.time()))
-                logger.info(f"数据库已更新: 新主节点 = {target_node_id}")
+                logger.info(f"数据库已更新: 新主节点 = {target_node_id}, 备用 = {spare_id} (已激活)")
         except Exception as e:
             logger.warning(f"数据库更新失败: {e}")
 
         logger.info(
             f"✅ 角色转让完成: {NODE_ID} → {target_node_id} "
-            f"(transfer_id={transfer_id})"
+            f"备用主节点 {spare_id} 已激活暂代 (transfer_id={transfer_id})"
         )
 
         return {
             "status": "ok",
             "message": (
                 f"主节点身份已转让给 '{target_node_id}'。"
-                f"建议重启本节点以从节点模式运行，目标节点重启后以主节点模式运行。"
+                f"备用主节点 '{spare_id}' 已激活，将暂代主节点职责直到新主节点上线。"
+                f"建议双方重启服务：目标节点以主节点模式运行，本节点以从节点模式运行。"
             ),
             "transfer_id": transfer_id,
             "from_node": NODE_ID,
             "to_node": target_node_id,
-            "ack": ack_data,
+            "spare_activated": spare_id,
+            "target_ack": target_ack,
+            "spare_ack": spare_ack,
         }
 
     def _handle_role_transfer(self, client_id: str, msg: dict) -> None:
@@ -1419,6 +1504,204 @@ class Scheduler:
             "received_at": time.time(),
         }
 
+    # ---- 备用主节点：激活（暂代） / 接管（退出暂代） ----
+
+    def _handle_spare_master_activate(self, client_id: str, msg: dict) -> None:
+        """
+        备用主节点收到 SPARE_MASTER_ACTIVATE 消息（被要求暂代主节点职责）。
+
+        操作:
+          1. 记录激活日志
+          2. 进入「暂代主节点」模式
+          3. 发送 ACK 确认
+        """
+        data = msg.get("data", {})
+        activate_id = data.get("activate_id", "")
+        transfer_id = data.get("transfer_id", "")
+        old_master_id = data.get("old_master_id", "")
+        new_master_id = data.get("new_master_id", "")
+
+        logger.info(
+            f"🔔 收到备用主节点激活通知: master={old_master_id} → "
+            f"new_master={new_master_id} (activate_id={activate_id})"
+        )
+
+        # 记录激活日志
+        db = _get_db()
+        try:
+            if db and _db_available:
+                db.append_spare_master_log(
+                    direction="activated",
+                    details={
+                        "activate_id": activate_id,
+                        "transfer_id": transfer_id,
+                        "old_master_id": old_master_id,
+                        "new_master_id": new_master_id,
+                    },
+                )
+                db.set_config("spare_master_active", "true")
+                db.set_config("pending_new_master_id", new_master_id)
+                logger.info(f"备用主节点激活日志已保存，等待新主节点 {new_master_id} 上线")
+        except Exception as e:
+            logger.warning(f"备用主节点激活日志写入失败: {e}")
+
+        # 发送 ACK
+        ack_payload = {
+            "activate_id": activate_id,
+            "ack": {
+                "activate_id": activate_id,
+                "accepted": True,
+                "node_id": NODE_ID,
+                "timestamp": time.time(),
+            },
+        }
+
+        tcp_client = getattr(self, '_tcp_client', None)
+        if tcp_client and tcp_client.sock:
+            try:
+                from tcp_comm import build_message, MessageType
+                packet = build_message(MessageType.SPARE_MASTER_ACTIVATE_ACK, ack_payload)
+                tcp_client.sock.sendall(packet)
+                logger.info(f"已发送备用主节点激活确认: activate_id={activate_id}")
+            except Exception as e:
+                logger.warning(f"发送激活 ACK 失败: {e}")
+        else:
+            logger.warning("TCP 客户端未连接，无法发送激活 ACK")
+
+    def _handle_spare_master_activate_ack(self, client_id: str, msg: dict) -> None:
+        """
+        主节点收到备用主节点的 SPARE_MASTER_ACTIVATE_ACK。
+
+        将 ACK 结果存入 _spare_activate_acks 供 transfer_master_role() 读取。
+        """
+        data = msg.get("data", {})
+        activate_id = data.get("activate_id", "")
+        ack = data.get("ack", {})
+
+        logger.info(f"收到备用主节点激活确认: from={client_id}, activate_id={activate_id}")
+
+        if not hasattr(self, "_spare_activate_acks"):
+            self._spare_activate_acks = {}
+        self._spare_activate_acks[activate_id] = {
+            "client_id": client_id,
+            "ack": ack,
+            "received_at": time.time(),
+        }
+
+    def _handle_spare_master_deactivate(self, client_id: str, msg: dict) -> None:
+        """
+        备用主节点收到 SPARE_MASTER_DEACTIVATE 消息（新主节点已上线，退出暂代）。
+
+        操作:
+          1. 记录接管完成日志
+          2. 退出「暂代主节点」模式
+          3. 更新 DB 状态
+        """
+        data = msg.get("data", {})
+        new_master_id = data.get("new_master_id", "")
+        deactivate_id = data.get("deactivate_id", "")
+
+        logger.info(
+            f"🔔 收到备用主节点接管通知: new_master={new_master_id} 已上线, "
+            f"退出暂代模式 (deactivate_id={deactivate_id})"
+        )
+
+        # 记录接管日志
+        db = _get_db()
+        try:
+            if db and _db_available:
+                db.append_spare_master_log(
+                    direction="deactivated",
+                    details={
+                        "deactivate_id": deactivate_id,
+                        "new_master_id": new_master_id,
+                    },
+                )
+                db.set_config("spare_master_active", "false")
+                db.set_config("pending_new_master_id", "")
+                logger.info(f"备用主节点已退出暂代模式，新主节点 {new_master_id} 已接管")
+        except Exception as e:
+            logger.warning(f"备用主节点接管日志写入失败: {e}")
+
+    # ---- 新主节点启动：向备用主节点发送接管通知 ----
+
+    def deactivate_spare_master_on_startup(self) -> None:
+        """
+        新主节点启动时调用：检查是否有激活中的备用主节点，若有则发送接管通知。
+
+        通过 TCP 服务器向备用主节点发送 SPARE_MASTER_DEACTIVATE，
+        通知其退出暂代模式。
+        """
+        db = _get_db()
+        if not db or not _db_available:
+            return
+
+        try:
+            spare = db.get_spare_master()
+            spare_active = db.get_config("spare_master_active", "false")
+            pending_new_master = db.get_config("pending_new_master_id", "")
+
+            # 仅当自己是 pending 的新主节点，且备用主节点处于激活状态时发送
+            if (spare and spare.get("node_id")
+                    and spare_active == "true"
+                    and pending_new_master == NODE_ID):
+                logger.info(
+                    f"检测到本节点为转让目标，备用主节点 {spare['node_id']} 处于激活状态，"
+                    "准备发送接管通知..."
+                )
+
+                # 等待 TCP 服务启动后发送（最多等 10s）
+                waited = 0
+                while (not self._tcp_server or not self._tcp_server._running) and waited < 10:
+                    time.sleep(0.5)
+                    waited += 0.5
+
+                if not self._tcp_server or not self._tcp_server._running:
+                    logger.warning("TCP 服务未在 10s 内就绪，跳过备用主节点接管通知")
+                    return
+
+                # 等备用主节点连接
+                waited_conn = 0
+                while spare['node_id'] not in (self._tcp_server.get_client_ids() if self._tcp_server else []) and waited_conn < 30:
+                    time.sleep(1)
+                    waited_conn += 1
+
+                if spare['node_id'] not in (self._tcp_server.get_client_ids() if self._tcp_server else []):
+                    logger.warning(f"备用主节点 {spare['node_id']} 未在 30s 内连接，跳过接管通知")
+                    return
+
+                deactivate_id = f"deactivate_{int(time.time() * 1000)}"
+                deactivate_data = {
+                    "deactivate_id": deactivate_id,
+                    "new_master_id": NODE_ID,
+                    "timestamp": time.time(),
+                    "message": "新主节点已上线，请退出暂代模式。",
+                }
+
+                from tcp_comm import MessageType
+                self._tcp_server.send_to_client(
+                    spare['node_id'], deactivate_data, MessageType.SPARE_MASTER_DEACTIVATE
+                )
+                logger.info(
+                    f"已向备用主节点 {spare['node_id']} 发送接管通知 "
+                    f"(deactivate_id={deactivate_id})"
+                )
+
+                # 更新 DB 状态
+                db.set_config("spare_master_active", "false")
+                db.set_config("master_role_transferred", "false")
+                db.set_config("pending_new_master_id", "")
+                db.append_spare_master_log(
+                    direction="deactivated",
+                    details={
+                        "deactivate_id": deactivate_id,
+                        "new_master_id": NODE_ID,
+                    },
+                )
+
+        except Exception as e:
+            logger.warning(f"备用主节点接管通知失败: {e}")
+
     def get_spare_master(self) -> Optional[dict]:
         """获取当前备用主节点信息"""
         db = _get_db()
@@ -1426,10 +1709,15 @@ class Scheduler:
             try:
                 spare = db.get_spare_master()
                 if spare and spare.get("node_id"):
-                    # 附加在线状态
+                    # 附加在线状态和激活状态
                     node_info = self.nodes.get(spare["node_id"])
                     spare["is_online"] = node_info.is_available() if node_info else False
                     spare["state"] = node_info.state.value if node_info else "unknown"
+                    # 附加激活状态
+                    try:
+                        spare["is_active"] = db.get_config("spare_master_active", "false") == "true"
+                    except Exception:
+                        spare["is_active"] = False
                     return spare
             except Exception:
                 pass
