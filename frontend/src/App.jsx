@@ -3,6 +3,7 @@ import DevicePanel from './components/DevicePanel';
 import ModelSelector from './components/ModelSelector';
 import MetricsPanel from './components/MetricsPanel';
 import ChatPanel from './components/ChatPanel';
+import AdminPanel from './components/AdminPanel';
 import SettingsModal from './components/SettingsModal';
 
 // ---- 设备档位预设 ----
@@ -28,6 +29,8 @@ const DEFAULT_SETTINGS = {
   maxNewTokens: 512,
   temperature: 0.7,
   topP: 0.9,
+  distributedInference: true,  // 分布式推理：主节点默认开启，从节点从服务端同步
+  cloudSync: false,            // 云同步设置偏好：默认关闭，需手动开启
 };
 
 // 从 localStorage 读取主题，默认暗色
@@ -75,9 +78,50 @@ export default function App() {
   const [theme, setTheme] = useState(getInitialTheme);
   const [settings, setSettings] = useState(getInitialSettings);
   const [deviceTier, setDeviceTier] = useState(null);  // 由 DevicePanel 检测后回传
+  const [activeView, setActiveView] = useState('chat'); // 'chat' | 'admin'
+  const [myRole, setMyRole] = useState(null);  // { node_role, node_id, is_master, is_client, ... }
 
   // 初始化主题
   useEffect(() => { applyTheme(theme); }, [theme]);
+
+  // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复
+  useEffect(() => {
+    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings }) => {
+      // 获取角色
+      fetchMyRole()
+        .then(setMyRole)
+        .catch(() => setMyRole({ node_role: 'master', node_id: 'master', is_master: true, is_client: false }));
+      // 从服务端同步分布式推理开关状态
+      fetchDistributedInferenceConfig()
+        .then((config) => {
+          if (config && typeof config.enabled === 'boolean') {
+            updateSettings({ distributedInference: config.enabled });
+          }
+        })
+        .catch(() => {});  // 服务端不可用时保持本地设置
+      // 从云端恢复用户偏好设置（仅在用户已开启云同步时）
+      const localSettings = getInitialSettings();
+      if (localSettings.cloudSync) {
+        fetchUserSettings()
+          .then((res) => {
+            if (res && res.settings && Object.keys(res.settings).length > 0) {
+              setSettings((prev) => {
+                // localStorage 优先（最新用户意图），云端补充缺失字段
+                const merged = { ...res.settings, ...prev };
+                saveSettings(merged);
+                return merged;
+              });
+            }
+          })
+          .catch(() => {});  // 服务端不可用时保持本地设置
+      }
+    });
+  }, []);
+
+  // 后台管理 Tab 是否可见
+  const showAdminTab = !myRole                     // 加载中：显示（兜底）
+    || myRole.is_master                           // 主节点：始终显示
+    || (myRole.is_client && settings.distributedInference);  // 从节点：需开启分布式推理
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => {
@@ -87,11 +131,17 @@ export default function App() {
     });
   }, []);
 
-  // 更新设置（自动持久化到 localStorage）
+  // 更新设置（自动持久化到 localStorage，云同步需手动开启）
   const updateSettings = useCallback((partial) => {
     setSettings((prev) => {
       const next = { ...prev, ...partial };
       saveSettings(next);
+      // 仅当用户手动开启「云同步设置」时才推送到云数据库
+      if (next.cloudSync) {
+        import('./api/client').then(({ updateUserSettings }) => {
+          updateUserSettings(next).catch(() => {});
+        });
+      }
       return next;
     });
   }, []);
@@ -155,6 +205,24 @@ export default function App() {
               <div className="subtitle">
                 北京交通大学 · 大创项目 | Qwen-1.8B-Chat
               </div>
+
+              {/* 导航切换 */}
+              <div className="nav-tabs">
+                <button
+                  className={`nav-tab ${activeView === 'chat' ? 'active' : ''}`}
+                  onClick={() => setActiveView('chat')}
+                >
+                  💬 对话
+                </button>
+                {showAdminTab && (
+                  <button
+                    className={`nav-tab ${activeView === 'admin' ? 'active' : ''}`}
+                    onClick={() => setActiveView('admin')}
+                  >
+                    ⚙️ 后台管理
+                  </button>
+                )}
+              </div>
             </>
           )}
           {sidebarCollapsed && (
@@ -182,39 +250,45 @@ export default function App() {
           <div className="sidebar-collapsed-icons">
             <button
               className="sidebar-icon-btn"
-              onClick={() => setSidebarCollapsed(false)}
-              title="模型选择"
+              onClick={() => { setSidebarCollapsed(false); setActiveView('chat'); }}
+              title="对话"
             >
-              🧩
+              💬
             </button>
-            <button
-              className="sidebar-icon-btn"
-              onClick={() => setSidebarCollapsed(false)}
-              title="系统状态"
-            >
-              📊
-            </button>
+            {showAdminTab && (
+              <button
+                className="sidebar-icon-btn"
+                onClick={() => { setSidebarCollapsed(false); setActiveView('admin'); }}
+                title="后台管理"
+              >
+                ⚙️
+              </button>
+            )}
             <button
               className="sidebar-icon-btn"
               onClick={() => setSettingsOpen(true)}
               title="系统设置"
             >
-              ⚙️
+              🔧
             </button>
           </div>
         )}
       </aside>
 
-      {/* Main Chat Area */}
+      {/* Main Area */}
       <main className="main-area">
-        <ChatPanel
-          modelLoaded={modelLoaded}
-          currentQuant={currentQuant}
-          onToast={showToast}
-          metricsTrigger={handleInferMetrics}
-          onOpenSettings={() => setSettingsOpen(true)}
-          settings={settings}
-        />
+        {activeView === 'chat' || !showAdminTab ? (
+          <ChatPanel
+            modelLoaded={modelLoaded}
+            currentQuant={currentQuant}
+            onToast={showToast}
+            metricsTrigger={handleInferMetrics}
+            onOpenSettings={() => setSettingsOpen(true)}
+            settings={settings}
+          />
+        ) : (
+          <AdminPanel onToast={showToast} myRole={myRole} />
+        )}
       </main>
 
       {/* Settings Modal */}
@@ -229,6 +303,7 @@ export default function App() {
         onSettingsChange={updateSettings}
         deviceTier={deviceTier}
         onApplyTierPreset={applyTierPreset}
+        myRole={myRole}
       />
 
       {/* Toast */}

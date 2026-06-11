@@ -35,10 +35,22 @@ from pydantic import BaseModel, Field
 from model_module import ModelManager
 from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
+from scheduler import Scheduler
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
     DEVICE, PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN, RUN_MODE,
+    NODE_ROLE, NODE_ID, MAX_NODES,
 )
+
+# 数据库模块（可选，未安装 psycopg2 时使用内存降级）
+try:
+    from db import init_db, close_db, db_health
+    _db_available = True
+except ImportError:
+    _db_available = False
+    init_db = lambda: None
+    close_db = lambda: None
+    db_health = lambda: {"status": "unavailable", "message": "psycopg2 未安装"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,6 +100,9 @@ generation_config: dict = {
     "do_sample": True,
 }
 
+# 调度器（单机 / 分布式模式共用）
+scheduler: Scheduler = Scheduler()
+
 
 # ============================================================
 # 启动事件 — 设备检测
@@ -95,8 +110,8 @@ generation_config: dict = {
 
 @app.on_event("startup")
 async def startup_device_detection():
-    """启动时自动检测设备能力并缓存画像"""
-    global device_profile
+    """启动时自动检测设备能力并缓存画像，初始化调度器"""
+    global device_profile, scheduler
     try:
         profiler = get_profile()
         device_profile = profiler.to_dict()
@@ -112,6 +127,30 @@ async def startup_device_detection():
     except Exception as e:
         logger.error(f"设备检测失败: {e}")
         device_profile = None
+
+    # 初始化调度器（单机模式下不启动 TCP 监听）
+    try:
+        scheduler.start()
+        logger.info(f"调度器已初始化: mode={RUN_MODE}")
+    except Exception as e:
+        logger.error(f"调度器初始化失败: {e}")
+
+    # 初始化数据库连接
+    try:
+        init_db()
+        logger.info("数据库已连接")
+    except Exception as e:
+        logger.warning(f"数据库初始化失败（使用内存降级）: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    """应用关闭时清理数据库连接池"""
+    try:
+        close_db()
+        logger.info("数据库连接池已关闭")
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -141,6 +180,38 @@ class ChatResponse(BaseModel):
     content: str
     metrics: dict = {}
     followups: list[str] = []
+
+
+class NodeDetail(BaseModel):
+    node_id: str
+    role: str
+    state: str
+    address: str = ""
+    hostname: str = ""
+    device_info: dict = {}
+    network_type: str = "unknown"
+    connected_at: float = 0.0
+    last_heartbeat: float = 0.0
+    task_count: int = 0
+    error_count: int = 0
+    is_available: bool = False
+
+
+class ClusterStatus(BaseModel):
+    run_mode: str
+    nodes_ready: bool
+    nodes: dict[str, NodeDetail] = {}
+    current_task: Optional[dict] = None
+    tcp_server: Optional[dict] = None
+
+
+class UpdateMaxNodesRequest(BaseModel):
+    max_nodes: int = Field(..., ge=1, le=64, description="新的最大节点数（包含 master）")
+
+
+class ConnectToMasterRequest(BaseModel):
+    master_host: str = Field(..., description="主节点 IP 地址", min_length=1)
+    master_port: int = Field(8888, ge=1, le=65535, description="主节点端口")
 
 
 # ============================================================
@@ -809,6 +880,9 @@ async def get_status():
         "model_name": MODEL_NAME,
         "model_path": MODEL_PATH,
         "run_mode": RUN_MODE,
+        "node_role": NODE_ROLE,
+        "node_id": NODE_ID,
+        "max_nodes": MAX_NODES,
         "gpu": gpu_info,
         "kv_cache": kv_stats,
         "conversation_turns": len(conversation_history),
@@ -867,6 +941,13 @@ async def load_model(req: LoadModelRequest):
                 "total_time_seconds": 0.0,
                 "rounds": 0,
             }
+            # 同步清空数据库对话历史
+            if _db_available:
+                try:
+                    import db as _db_mod
+                    _db_mod.clear_conversation("default")
+                except Exception:
+                    pass
             model_loaded = False
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -925,6 +1006,38 @@ async def chat(req: ChatRequest):
     if not model_loaded or model_manager.model is None:
         raise HTTPException(400, "模型未加载，请先在控制面板中选择并加载模型")
 
+    # ---- 分布式推理路由：从节点转发给主节点 ----
+    if (scheduler.get_distributed_inference_enabled()
+            and RUN_MODE == "distributed"
+            and NODE_ROLE == "client"):
+        try:
+            result = scheduler.forward_inference_to_master(
+                message=req.message,
+                max_new_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+            )
+            if result.get("status") == "ok":
+                # 也保存到本地对话历史
+                conversation_history.append({"role": "user", "content": req.message})
+                response_text = result.get("content", "")
+                conversation_history.append({"role": "assistant", "content": response_text})
+                return ChatResponse(
+                    response=response_text,
+                    model=model_name,
+                    tokens=len(response_text),
+                    tokens_per_sec=0,
+                    followups=[],
+                )
+            elif result.get("status") == "disconnected":
+                logger.warning("分布式推理转发失败（未连接主节点），回退到本地推理")
+            elif result.get("status") == "timeout":
+                logger.warning("分布式推理转发超时，回退到本地推理")
+            else:
+                logger.warning(f"分布式推理转发失败: {result.get('error', 'unknown')}，回退到本地推理")
+        except Exception as e:
+            logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
+
     try:
         # 更新生成配置（应用设备档位上限，取请求值与档位值的较小者）
         tier_max = generation_config.get("tier_max_new_tokens", generation_config["max_new_tokens"])
@@ -980,11 +1093,27 @@ async def chat(req: ChatRequest):
             else 0,
         }
 
+        # 持久化到数据库（受 save_history 开关控制）
+        if _db_available:
+            try:
+                import db as _db_mod
+                if _db_mod.get_save_history():
+                    _db_mod.save_message("default", "user", req.message)
+                    _db_mod.save_message("default", "assistant", response_text, metrics)
+            except Exception:
+                pass
+
         # 累计对话统计
         conversation_stats["total_prompt_tokens"] += prompt_len
         conversation_stats["total_generated_tokens"] += new_tokens
         conversation_stats["total_time_seconds"] += elapsed
         conversation_stats["rounds"] += 1
+
+        # 更新调度器任务计数（前端心跳/任务统计列显示）
+        try:
+            scheduler.record_task_complete(success=True)
+        except Exception:
+            pass
 
         logger.info(
             f"推理完成: {new_tokens} tokens / {elapsed:.2f}s = {tokens_per_sec:.1f} tok/s"
@@ -999,6 +1128,10 @@ async def chat(req: ChatRequest):
 
     except torch.cuda.OutOfMemoryError:
         # OOM 恢复
+        try:
+            scheduler.record_task_error()
+        except Exception:
+            pass
         if kv_cache:
             kv_cache.clear()
         conversation_history = []
@@ -1007,6 +1140,10 @@ async def chat(req: ChatRequest):
         raise HTTPException(507, "GPU 显存不足（OOM），已自动清空对话历史。请缩短消息后重试。")
 
     except Exception as e:
+        try:
+            scheduler.record_task_error()
+        except Exception:
+            pass
         logger.error(f"推理异常: {e}")
         raise HTTPException(500, f"推理失败: {str(e)}")
 
@@ -1061,6 +1198,629 @@ async def list_available_models():
         ],
         "current": current_quant if model_loaded else None,
     }
+
+
+# ============================================================
+# 集群管理 API
+# ============================================================
+
+@app.get("/api/cluster/status", response_model=ClusterStatus)
+async def get_cluster_status():
+    """
+    获取集群整体状态。
+
+    包含所有节点状态、TCP 连接信息、当前任务等。
+    单机模式下返回 3 个默认节点（均为 online）。
+    """
+    return scheduler.get_status()
+
+
+@app.get("/api/cluster/nodes")
+async def get_cluster_nodes():
+    """
+    获取所有节点详情列表。
+
+    Returns:
+        { nodes: [...], count: int, online_count: int }
+    """
+    nodes = scheduler.get_nodes()
+    online_count = sum(1 for n in nodes if n["is_available"])
+    return {
+        "nodes": nodes,
+        "count": len(nodes),
+        "online_count": online_count,
+        "offline_count": len(nodes) - online_count,
+    }
+
+
+@app.post("/api/cluster/nodes/{node_id}/deregister")
+async def deregister_node(node_id: str):
+    """
+    强制注销一个从节点。
+
+    仅在分布式模式下有效；master 节点不可注销。
+    """
+    if node_id == "master":
+        raise HTTPException(400, "主节点不可注销")
+
+    success = scheduler.deregister_node(node_id)
+    if not success:
+        raise HTTPException(404, f"节点 '{node_id}' 不存在")
+
+    logger.info(f"节点 {node_id} 已被强制注销")
+    return {
+        "status": "deregistered",
+        "node_id": node_id,
+    }
+
+
+@app.get("/api/cluster/config")
+async def get_cluster_config():
+    """
+    获取分布式配置信息。
+
+    包含网络配置、分层配置、模型配置、任务统计、当前节点角色。
+    """
+    return scheduler.get_config()
+
+
+@app.get("/api/cluster/my-role")
+async def get_my_role():
+    """
+    获取当前节点的角色信息。
+
+    用于前端判断：
+    - master 节点：后台管理 Tab 完全开放
+    - client 节点：需在设置中开启"分布式推理优化"后才可见
+    """
+    return scheduler.get_my_role()
+
+
+@app.put("/api/cluster/config/max-nodes")
+async def update_max_nodes(req: UpdateMaxNodesRequest):
+    """
+    动态调整最大节点数量（仅主节点可调用）。
+
+    增加时自动创建新的 client 节点槽位；
+    减少时仅移除离线且未注册的空位，保留在线节点。
+    """
+    result = scheduler.update_max_nodes(req.max_nodes)
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "权限不足"))
+    if result.get("status") == "invalid":
+        raise HTTPException(400, result.get("reason", "无效参数"))
+    return result
+
+
+@app.get("/api/cluster/invite")
+async def get_invite_info():
+    """
+    获取主节点的邀请/连接信息（供从节点连接使用）。
+
+    主节点调用此接口获取自身监听地址和端口，
+    用户将此信息提供给从节点，从节点在后台管理中输入并连接。
+    """
+    return scheduler.get_invite_info()
+
+
+@app.post("/api/cluster/connect")
+async def connect_to_master(req: ConnectToMasterRequest):
+    """
+    从节点主动连接主节点（从节点的「连接主节点」按钮触发）。
+
+    调用后本节点将通过 TCP 向指定主节点发起注册，
+    注册成功后主节点的节点列表中将出现本节点。
+    """
+    result = scheduler.connect_to_master(req.master_host, req.master_port)
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "仅从节点可连接主节点"))
+    if result.get("status") == "failed":
+        raise HTTPException(400, result.get("reason", "连接失败"))
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("reason", "连接异常"))
+    return result
+
+
+class ManualRegisterRequest(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=64, description="节点标识")
+    hostname: str = Field(default="", description="主机名")
+    address: str = Field(default="", description="预留 IP:Port")
+    network_type: str = Field(default="unknown", description="网络类型: wifi | ethernet | unknown")
+
+
+@app.post("/api/cluster/nodes/register")
+async def manual_register_node(req: ManualRegisterRequest):
+    """
+    主节点手动注册一个从节点（无需 TCP 连接）。
+
+    管理员可在后台管理页面提前录入从节点信息。
+    手动注册的节点初始状态为 offline，待从节点通过 TCP 连接后自动变为 online。
+
+    如果从节点主动通过「连接主节点」发起 TCP 注册，也会自动加入节点列表，
+    无需手动注册。此接口用于管理员提前规划节点或预留槽位。
+    """
+    result = scheduler.manual_register_node(
+        node_id=req.node_id,
+        hostname=req.hostname,
+        address=req.address,
+        network_type=req.network_type,
+    )
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "仅主节点可手动注册"))
+    if result.get("status") == "invalid":
+        raise HTTPException(400, result.get("reason", "无效参数"))
+    if result.get("status") == "full":
+        raise HTTPException(400, result.get("reason", "节点容量已满"))
+    if result.get("status") == "exists":
+        return result  # 已存在不报错，返回当前状态
+    return result
+
+
+@app.get("/api/cluster/master-health")
+async def check_master_health():
+    """
+    检查主节点是否在线（通过数据库心跳时间戳）。
+
+    从节点前端周期性调用此接口（配合 5 秒轮询），
+    当检测到主节点宕机时显示告警横幅。
+    主节点自身调用时返回本地运行状态。
+
+    Returns:
+        { master_online, last_seen_seconds_ago, stale, master_host, master_port }
+    """
+    if NODE_ROLE == "master":
+        # 主节点自身：直接返回在线
+        return {
+            "master_online": True,
+            "last_seen_seconds_ago": 0,
+            "stale": False,
+            "master_host": getattr(scheduler, '_lan_ip', '') or SERVER_IP,
+            "master_port": SERVER_PORT,
+            "source": "self",
+        }
+    return scheduler.get_client_master_status()
+
+
+@app.get("/api/cluster/discover")
+async def discover_master():
+    """
+    从数据库查询主节点的连接信息（从节点自动发现）。
+
+    从节点启动后调用此接口，尝试在数据库中查找已注册的主节点。
+    如果找到且在 120 秒内有心跳，则返回主节点地址，
+    前端可自动填充连接表单。
+
+     Returns:
+         {
+             "found": bool,           # 是否在数据库中找到主节点
+             "master_host": str,      # 主节点 IP
+             "master_port": int,      # 主节点端口
+             "master_mac_addresses": [str],  # 主节点 MAC 地址（身份标识）
+             "stale": bool,           # 心跳是否过期 (>120s)
+             "source": str,           # "database" | "config" | "none"
+         }
+    """
+    return scheduler.discover_master()
+
+
+class ResetIdentityRequest(BaseModel):
+    confirm: str = Field(default="", description="输入 'reset' 确认重置")
+
+
+@app.post("/api/cluster/reset-identity")
+async def reset_master_identity(req: ResetIdentityRequest):
+    """
+    重置主节点身份标识（仅主节点可调用）。
+
+    用于更换主节点机器或网卡后，清除数据库中旧的 MAC 地址记录。
+    需要输入确认字符串 'reset' 以防止误操作。
+
+    调用后需重启主节点后端服务，新的 MAC 地址将在下次启动时自动记录。
+    """
+    if req.confirm.strip().lower() != "reset":
+        raise HTTPException(400, "请输入 'reset' 确认重置操作")
+    result = scheduler.reset_master_identity()
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "权限不足"))
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("reason", "操作失败"))
+    return result
+
+
+@app.post("/api/cluster/email-test")
+async def test_email_notification():
+    """
+    发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
+
+    邮件将发送到 SMTP.md 中配置的目标邮箱。
+    任何节点均可调用（主节点和从节点均可测试邮件发送）。
+    """
+    try:
+        from email_notifier import send_test_email
+        ok = send_test_email()
+        if ok:
+            return {"status": "ok", "message": "测试邮件已发送，请检查目标邮箱"}
+        else:
+            raise HTTPException(500, "邮件发送失败，请检查后端日志了解详情")
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    except Exception as e:
+        raise HTTPException(500, f"邮件发送异常: {e}")
+
+
+# ============================================================
+# 分布式推理开关 API
+# ============================================================
+
+@app.get("/api/cluster/config/distributed-inference")
+async def get_distributed_inference_config():
+    """
+    获取分布式推理开关状态。
+    """
+    from config import DISTRIBUTED_INFERENCE_ENABLED
+    return {
+        "enabled": scheduler.get_distributed_inference_enabled(),
+        "default": DISTRIBUTED_INFERENCE_ENABLED,
+    }
+
+
+class DistributedInferenceRequest(BaseModel):
+    enabled: bool = Field(..., description="是否启用分布式推理")
+
+
+@app.put("/api/cluster/config/distributed-inference")
+async def set_distributed_inference_config(req: DistributedInferenceRequest):
+    """
+    设置分布式推理开关。
+
+    - 主节点：控制是否接收从节点连接和协调分布式推理
+    - 从节点：控制是否将推理请求转发给主节点
+    """
+    result = scheduler.set_distributed_inference_enabled(req.enabled)
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("reason", "设置失败"))
+    return result
+
+
+# ============================================================
+# 动态模型分层 API
+# ============================================================
+
+@app.get("/api/cluster/layers")
+async def get_layer_assignments():
+    """
+    获取当前模型分层配置。
+
+    Returns:
+        {
+            "total": 24,
+            "strategy": "dynamic" | "manual",
+            "assignments": [{node_id, role, start_layer, end_layer,
+                             has_embedding, has_lm_head, score}],
+            "computed_at": timestamp | null,
+        }
+    """
+    return scheduler.get_layer_assignments()
+
+
+class LayerOverrideItem(BaseModel):
+    node_id: str = Field(..., description="节点标识")
+    start_layer: int = Field(..., ge=0, le=23, description="起始层（含）")
+    end_layer: int = Field(..., ge=1, le=24, description="结束层（不含）")
+
+
+class LayerOverrideRequest(BaseModel):
+    assignments: list[LayerOverrideItem] = Field(..., min_items=1, description="分层覆盖列表")
+
+
+@app.put("/api/cluster/layers")
+async def override_layer_assignments(req: LayerOverrideRequest):
+    """
+    手动覆盖模型分层配置（仅主节点可调用）。
+
+    验证规则:
+      - 所有区间必须从 0 开始连续覆盖到 24
+      - node_id 必须是已注册节点
+      - 区间不能重叠
+    """
+    result = scheduler.override_layer_assignments([
+        {"node_id": a.node_id, "start_layer": a.start_layer, "end_layer": a.end_layer}
+        for a in req.assignments
+    ])
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "仅主节点可修改"))
+    if result.get("status") == "invalid":
+        raise HTTPException(400, result.get("reason", "分层配置无效"))
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("reason", "操作失败"))
+    return result
+
+
+# ============================================================
+# 角色转让 API
+# ============================================================
+
+class TransferMasterRequest(BaseModel):
+    target_node_id: str = Field(..., min_length=1, max_length=64,
+                                 description="目标从节点 ID（将升级为新主节点）")
+
+
+@app.post("/api/cluster/transfer-master")
+async def transfer_master_role(req: TransferMasterRequest):
+    """
+    将主节点身份转让给指定从节点（仅主节点可调用）。
+
+    流程:
+      1. 主节点通过 TCP 向目标从节点发送 ROLE_TRANSFER 消息
+      2. 从节点保存升级日志、返回 ACK
+      3. 主节点保存降级日志、更新数据库中的主节点信息
+      4. 建议双方重启以应用新角色
+
+    注意: 转让后需要重启服务才能生效：
+      - 原主节点重启后以从节点模式运行
+      - 新主节点重启后以主节点模式运行
+    """
+    result = scheduler.transfer_master_role(req.target_node_id)
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "权限不足"))
+    if result.get("status") == "invalid":
+        raise HTTPException(400, result.get("reason", "参数无效"))
+    if result.get("status") == "timeout":
+        raise HTTPException(408, result.get("reason", "超时"))
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("reason", "操作失败"))
+    return result
+
+
+@app.get("/api/cluster/transfer-logs")
+async def get_transfer_logs():
+    """
+    获取角色转让日志（降级 + 升级）。
+
+    Returns:
+        { logs: [{direction, from_role, to_role, related_node, timestamp, ...}] }
+    """
+    logs = scheduler.get_transfer_logs()
+    return {"logs": logs, "count": len(logs)}
+
+
+# ============================================================
+# 备用主节点管理 API
+# ============================================================
+
+class SpareMasterRequest(BaseModel):
+    target_node_id: str
+
+
+@app.get("/api/cluster/spare-master")
+async def get_spare_master():
+    """
+    获取当前备用主节点信息。
+
+    Returns:
+        { spare_master: {node_id, hostname, address, designated_at, is_online, state} | null }
+    """
+    spare = scheduler.get_spare_master()
+    return {"spare_master": spare}
+
+
+@app.post("/api/cluster/spare-master")
+async def designate_spare_master(req: SpareMasterRequest):
+    """
+    指定一个在线从节点为备用主节点（仅主节点可调用）。
+
+    规则:
+      - 集群节点数 ≥ 2
+      - 目标节点必须在线且为 client
+
+    Returns:
+        { status, message, spare_master, ... }
+    """
+    result = scheduler.designate_spare_master(req.target_node_id)
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "权限不足"))
+    if result.get("status") == "invalid":
+        raise HTTPException(400, result.get("reason", "参数无效"))
+    if result.get("status") == "timeout":
+        raise HTTPException(408, result.get("reason", "超时"))
+    if result.get("status") == "duplicate":
+        return result  # 不抛异常，返回已有信息
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("reason", "操作失败"))
+    return result
+
+
+@app.delete("/api/cluster/spare-master")
+async def clear_spare_master():
+    """
+    清除备用主节点指定（仅主节点可调用）。
+
+    Returns:
+        { status, message }
+    """
+    result = scheduler.clear_spare_master()
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "权限不足"))
+    return result
+
+
+@app.get("/api/cluster/spare-master/logs")
+async def get_spare_master_logs():
+    """
+    获取备用主节点操作日志。
+
+    Returns:
+        { logs: [{direction, timestamp, details, ...}] }
+    """
+    logs = scheduler.get_spare_master_logs()
+    return {"logs": logs, "count": len(logs)}
+
+
+# ============================================================
+# 用户偏好设置云同步 API
+# ============================================================
+
+@app.get("/api/user/settings")
+async def get_user_settings():
+    """
+    从云数据库读取用户偏好设置。
+
+    返回完整的 settings JSON，与 localStorage 格式一致。
+    如果数据库不可用，返回空 dict（前端使用 localStorage 值）。
+    """
+    if not _db_available:
+        return {"settings": {}, "source": "none"}
+    try:
+        import db as _db_mod
+        settings = _db_mod.get_user_settings()
+        return {"settings": settings, "source": "database"}
+    except Exception as e:
+        logger.warning(f"读取用户设置失败: {e}")
+        return {"settings": {}, "source": "error"}
+
+
+class UserSettingsRequest(BaseModel):
+    settings: dict = Field(default={}, description="完整的用户设置 JSON")
+
+
+@app.put("/api/user/settings")
+async def update_user_settings(req: UserSettingsRequest):
+    """
+    将用户偏好设置存储到云数据库。
+
+    前端在更新 localStorage 后调用此接口同步到云端。
+    同时同步 save_history 和 distributed_inference 到各自的专用键。
+    """
+    if not _db_available:
+        return {"status": "skipped", "reason": "数据库不可用"}
+    try:
+        import db as _db_mod
+        settings = req.settings
+
+        # 存储完整的 settings JSON
+        _db_mod.set_user_settings(settings)
+
+        # 同步 save_history 到专用键（后端推理保存逻辑依赖此键）
+        if "saveHistory" in settings:
+            _db_mod.set_save_history(bool(settings["saveHistory"]))
+
+        # 同步 distributedInference 到专用键
+        if "distributedInference" in settings:
+            _db_mod.set_distributed_inference_enabled(bool(settings["distributedInference"]))
+
+        return {"status": "ok", "synced_fields": list(settings.keys())}
+    except Exception as e:
+        logger.error(f"存储用户设置失败: {e}")
+        raise HTTPException(500, f"存储失败: {e}")
+
+
+# ============================================================
+# 对话云同步状态 API
+# ============================================================
+
+@app.get("/api/conversations/sync-status")
+async def get_conversation_sync_status():
+    """
+    获取对话历史云同步状态。
+    """
+    save_history = False
+    if _db_available:
+        try:
+            import db as _db_mod
+            save_history = _db_mod.get_save_history()
+        except Exception:
+            pass
+
+    return {
+        "save_history": save_history,
+        "db_connected": _db_available,
+        "local_save_enabled": True,  # localStorage 始终可用
+        "cloud_sync_enabled": save_history and _db_available,
+    }
+
+
+# ============================================================
+# 对话历史 API（数据库持久化）
+# ============================================================
+
+@app.get("/api/conversations")
+async def get_conversations(session_id: str = "default", limit: int = 200):
+    """
+    从数据库加载指定会话的对话历史。
+
+    如果数据库不可用，回退到内存中的对话历史。
+    """
+    if not _db_available:
+        return {
+            "messages": [
+                {"role": m["role"], "content": m["content"]}
+                for m in conversation_history
+            ],
+            "count": len(conversation_history),
+            "source": "memory",
+        }
+
+    try:
+        import db as _db_mod
+        messages = _db_mod.get_conversation(session_id, limit)
+        count = _db_mod.get_conversation_count(session_id)
+        return {
+            "messages": [
+                {"role": m["role"], "content": m["content"], "created_at": m.get("created_at")}
+                for m in messages
+            ],
+            "count": count,
+            "source": "database",
+        }
+    except Exception as e:
+        logger.warning(f"数据库读取对话历史失败: {e}")
+        return {
+            "messages": [
+                {"role": m["role"], "content": m["content"]}
+                for m in conversation_history
+            ],
+            "count": len(conversation_history),
+            "source": "memory_fallback",
+        }
+
+
+@app.delete("/api/conversations")
+async def delete_conversations(session_id: str = "default"):
+    """
+    清空指定会话的对话历史（数据库 + 内存同步）。
+
+    单机模式下仅清空当前会话上下文；分布式模式下可跨节点同步。
+    """
+    global conversation_history
+    deleted_count = 0
+
+    if _db_available:
+        try:
+            import db as _db_mod
+            deleted_count = _db_mod.clear_conversation(session_id)
+            logger.info(f"数据库对话历史已清空: session={session_id}, {deleted_count} 条")
+        except Exception as e:
+            logger.warning(f"数据库清空对话历史失败: {e}")
+
+    conversation_history = []
+    logger.info(f"对话历史已清空 (内存)")
+    return {
+        "status": "cleared",
+        "session_id": session_id,
+        "deleted_count": deleted_count,
+    }
+
+
+# ============================================================
+# 数据库健康检查
+# ============================================================
+
+@app.get("/api/db/health")
+async def database_health():
+    """数据库连接健康检查"""
+    if not _db_available:
+        return {"status": "unavailable", "message": "psycopg2 未安装，使用内存降级模式"}
+    return db_health()
 
 
 # ============================================================

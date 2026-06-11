@@ -42,15 +42,37 @@ MAX_PAGE_NUM = 256               # 最大内存页数
 MAX_SEQ_LEN = 4096               # 最大序列长度（Qwen-1.8B 原生 8K，laptop 档用 4K）
 
 # ============================================================
-# 4. 模型分层配置（三台节点起止层）
-#    Qwen-1.8B-Chat 共 24 层 Transformer，按设备性能分配
+# 4. 模型分层配置（动态分配，运行时由 scheduler 根据设备画像计算）
+#    Qwen-1.8B-Chat 共 24 层 Transformer
 # ============================================================
-MAIN_NODE_LAYERS = (0, 8)        # 主节点: Embedding + Layer 0-7
-CLIENT1_LAYERS = (8, 16)         # 从节点1: Layer 8-15
-CLIENT2_LAYERS = (16, 24)        # 从节点2: Layer 16-23 + LM Head
+TOTAL_MODEL_LAYERS = 24                  # Qwen-1.8B-Chat Transformer 层总数
+LAYER_STRATEGY = "dynamic"              # 分层策略: "dynamic" 动态 | "manual" 手动覆盖
+DISTRIBUTED_INFERENCE_ENABLED = True    # 分布式推理开关（主节点默认开启，从节点默认关闭）
+
+# 回退分层配置（当没有从节点注册时使用）
+DEFAULT_LAYER_CONFIG = {
+    "master":  (0, 8),                   # 主节点: Embedding + Layer 0-7
+    "client1": (8, 16),                  # 从节点1: Layer 8-15
+    "client2": (16, 24),                 # 从节点2: Layer 16-23 + LM Head
+}
 
 # ============================================================
-# 5. 运行模式
+# 5. 节点身份配置
+# ============================================================
+NODE_ROLE = "master"             # 节点角色: "master" 主节点 | "client" 从节点
+NODE_ID = "master"               # 节点唯一标识（master 固定为 "master"，client 按 hostname 自动生成）
+MAX_NODES = 3                    # 最大节点数上限（主节点可动态调整，仅限已注册节点，不含空位）
+                                  # 从节点通过 TCP 注册后自动加入列表，不再预创建空槽位
+
+# 从节点连接主节点配置（仅 NODE_ROLE="client" 时生效）
+CLIENT_MASTER_HOST = "192.168.x.x"   # 主节点 IP 地址（部署时改为实际 IP）
+CLIENT_MASTER_PORT = 8888            # 主节点监听端口
+
+# SMTP 邮件告警配置（详见 src/email_notifier.py）
+MASTER_DOWN_EMAIL_TIMEOUT = 180      # 主节点宕机超过此秒数（3分钟）后发送邮件告警（0=禁用）
+
+# ============================================================
+# 6. 运行模式
 # ============================================================
 RUN_MODE = "distributed"         # "single" 单机 | "distributed" 分布式
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG | INFO | WARNING | ERROR
