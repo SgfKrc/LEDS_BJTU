@@ -77,6 +77,9 @@ class MessageType(str, Enum):
     # 备用主节点
     SPARE_MASTER_DESIGNATE = "spare_master_designate"          # 主节点 → 从节点：指定为备用主节点
     SPARE_MASTER_DESIGNATE_ACK = "spare_master_designate_ack"  # 从节点 → 主节点：确认接收备用身份
+    SPARE_MASTER_ACTIVATE = "spare_master_activate"            # 主节点 → 备用：激活暂代主节点职责
+    SPARE_MASTER_ACTIVATE_ACK = "spare_master_activate_ack"    # 备用 → 主节点：确认激活
+    SPARE_MASTER_DEACTIVATE = "spare_master_deactivate"        # 新主节点 → 备用：接管完成，退出暂代
 
 
 # ================================================================

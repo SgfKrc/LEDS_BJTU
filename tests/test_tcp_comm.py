@@ -88,6 +88,8 @@ class TestMessageType:
             "infer_forward", "infer_result", "layer_config",
             "role_transfer", "role_transfer_ack",
             "spare_master_designate", "spare_master_designate_ack",
+            "spare_master_activate", "spare_master_activate_ack",
+            "spare_master_deactivate",
         }
         actual = set(MessageType.__members__.keys())
         for t in expected:
