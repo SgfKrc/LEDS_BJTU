@@ -1,0 +1,36 @@
+# ============================================================
+# 轻量化大模型分布式边缘推理优化系统 — 依赖清单
+# ============================================================
+# 安装: pip install -r requirements.txt
+#
+# 兼容性说明:
+#   - transformers 需保持 4.x 版本（5.x 与 bitsandbytes 量化不兼容）
+#   - bitsandbytes >= 0.45.0 支持 Windows + CUDA 12.x
+#   - PyTorch 需与 CUDA 版本匹配
+
+# --- 核心深度学习框架 ---
+torch>=2.2.0
+transformers>=4.45.0,<5.0.0     # 4.x 系列，兼容 bitsandbytes 量化
+accelerate>=1.0.0                # 模型加载加速（bitsandbytes 依赖）
+
+# --- 模型量化 ---
+bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容）
+# auto-gptq                      # 可选：离线 GPTQ 量化 (Linux only, Windows 安装困难)
+
+# --- 推理优化 ---
+# torch.compile 已内置于 PyTorch 2.x，无需额外安装
+
+# --- 网络通信（标准库）---
+# socket, struct, threading, json — Python 内置
+
+# --- Web 可视化 ---
+streamlit>=1.30.0
+plotly>=5.18.0                   # 交互式图表
+pandas>=2.0.0                    # 数据处理
+fastapi>=0.110.0                 # API 后端框架
+uvicorn[standard]>=0.29.0        # ASGI 服务器
+python-multipart>=0.0.12          # 文件上传支持
+
+# --- 工具 ---
+tqdm>=4.65.0                     # 进度条
+psutil>=5.9.0                    # 系统资源监控（CPU/内存）

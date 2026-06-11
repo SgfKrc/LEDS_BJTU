@@ -1,0 +1,1073 @@
+"""
+FastAPI 后端服务 — 模型管理 + 对话接口 + 性能监控 + 设备检测
+===============================================================
+启动: python -m uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+      或在项目根目录: uvicorn src.api_server:app --host 0.0.0.0 --port 8000
+
+功能:
+- POST /api/models/load      — 加载/切换模型 (fp16 / int4 / int8)
+- POST /api/chat             — 对话（多轮会话，自动维护 KV 缓存）
+- POST /api/chat/clear       — 清空对话历史 + KV 缓存
+- GET  /api/status           — 系统状态（模型信息、GPU、KV缓存、设备档位）
+- GET  /api/models/current   — 当前模型信息
+- GET  /api/device/profile   — 完整设备画像（CPU/RAM/GPU/Disk/OS）
+- POST /api/device/auto-configure — 应用设备自适应配置
+- POST /api/chat/upload       — 上传文本文件（txt/md/csv/py/json/log）
+- GET  /api/presets           — 预设问题列表
+"""
+
+import json
+import logging
+import time
+import sys
+import os
+from typing import Optional
+
+import torch
+
+# 确保 src 目录在 path 中
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from model_module import ModelManager
+from paged_kv_cache import PagedKVCache
+from device_profiler import DeviceProfiler, get_profile
+from config import (
+    MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
+    DEVICE, PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN, RUN_MODE,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("api_server")
+
+# ============================================================
+# FastAPI 应用初始化
+# ============================================================
+
+app = FastAPI(
+    title="轻量化大模型分布式边缘推理优化系统",
+    version="0.1.0",
+    description="北京交通大学 · 大学生创新创业训练计划",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================
+# 全局状态
+# ============================================================
+
+model_manager = ModelManager()
+kv_cache: Optional[PagedKVCache] = None
+conversation_history: list[dict] = []          # [{"role": "user"|"assistant", "content": "..."}]
+conversation_stats: dict = {                    # 累计对话统计（实际消耗追踪）
+    "total_prompt_tokens": 0,
+    "total_generated_tokens": 0,
+    "total_time_seconds": 0.0,
+    "rounds": 0,
+}
+current_quant: str = QUANT_TYPE
+model_loaded: bool = False
+device_profile: Optional[dict] = None           # 设备画像缓存
+generation_config: dict = {
+    "max_new_tokens": 1024,          # laptop 档默认值
+    "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": True,
+}
+
+
+# ============================================================
+# 启动事件 — 设备检测
+# ============================================================
+
+@app.on_event("startup")
+async def startup_device_detection():
+    """启动时自动检测设备能力并缓存画像"""
+    global device_profile
+    try:
+        profiler = get_profile()
+        device_profile = profiler.to_dict()
+        logger.info(
+            f"🚀 设备检测完成: tier={profiler.tier.value} "
+            f"score={profiler.score:.1f}/100 | "
+            f"CPU={profiler.cpu.physical_cores}核 RAM={profiler.ram.total_gb}GB "
+            f"GPU={profiler.gpu.name}"
+        )
+        logger.info(f"   推荐配置: {profiler.recommend_config()['description']}")
+        for warning in device_profile.get("warnings", []):
+            logger.warning(f"   {warning}")
+    except Exception as e:
+        logger.error(f"设备检测失败: {e}")
+        device_profile = None
+
+
+# ============================================================
+# Pydantic 模型
+# ============================================================
+
+class LoadModelRequest(BaseModel):
+    quant_type: str = Field(
+        default="int4",
+        description="量化精度: fp16 | int8 | int4",
+    )
+    use_compile: bool = Field(
+        default=False,
+        description="是否开启 torch.compile 算子融合（仅 FP16 有效）",
+    )
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., description="用户消息", min_length=1)
+    max_new_tokens: int = Field(default=1024, ge=1, le=4096)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+
+
+class ChatResponse(BaseModel):
+    role: str = "assistant"
+    content: str
+    metrics: dict = {}
+    followups: list[str] = []
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+
+def _build_chat_prompt(messages: list[dict]) -> str:
+    """
+    使用 Qwen 的 chat template 构建对话 prompt。
+    Qwen-1.8B-Chat 使用 <|im_start|>/<|im_end|> 格式。
+    """
+    parts = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    parts.append("<|im_start|>assistant\n")
+    return "\n".join(parts)
+
+
+def _generate_followups(history: list[dict], tokenizer, model, device) -> list[str]:
+    """
+    根据对话上下文，让模型生成 2-3 个追问建议。
+
+    类似豆包/千问 App 的追问推荐功能。
+    使用 few-shot prompt + 质量过滤 + 模板兜底，适配 1.8B 小模型。
+    """
+    if not history or len(history) < 2:
+        return []
+
+    # ---- Few-shot prompt：给模型明确的输出格式和示例 ----
+    system_prompt = (
+        "根据对话历史，生成3个用户可能追问的问题。"
+        "每个问题以Q:开头，单独一行，不要其他内容。\n"
+        "示例:\n"
+        "Q: 深度学习与机器学习有什么区别？\n"
+        "Q: 能推荐一些入门学习资源吗？\n"
+        "Q: 这个概念在实际中有哪些应用？"
+    )
+    followup_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+    # 只取最近 3 轮对话
+    recent = history[-6:]
+    for msg in recent:
+        followup_prompt += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
+    followup_prompt += "<|im_start|>assistant\n"
+
+    questions = []
+
+    try:
+        inputs = tokenizer(followup_prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids,
+                max_new_tokens=80,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        generated = outputs[0][input_ids.shape[1]:]
+        text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+        # 解析 Q: 前缀的行，也兼容编号格式
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # 匹配 Q: 前缀
+            if line.upper().startswith("Q:") or line.upper().startswith("Q：") or line.startswith("问："):
+                q = line.split(":", 1)[-1].split("：", 1)[-1].strip()
+            else:
+                # 兼容编号格式: 1. xxx, 1、xxx, 1) xxx
+                import re
+                q = re.sub(r'^[\d]+[\.\、\)）\s\-]+', '', line).strip()
+            if q and len(q) >= 5 and len(q) <= 80:
+                questions.append(q)
+
+        # ---- 质量过滤 ----
+        # 过滤包含幻觉模型名称的追问（通义千问、ChatGPT、Claude 等）
+        hallucination_patterns = [
+            "通义千问", "千问", "ChatGPT", "Claude", "GPT-", "文心一言",
+            "讯飞星火", "豆包", "Kimi", "Copilot", "Bard", "Gemini",
+            "百川", "智谱", "ChatGLM", "混元",
+        ]
+        questions = [
+            q for q in questions
+            if not any(p in q for p in hallucination_patterns)
+        ]
+
+        # 过滤高度重复的追问（如 "通义千问，通义千问，通义千问"）
+        filtered = []
+        seen_words = set()
+        for q in questions:
+            # 提取核心关键词
+            words = frozenset(q[:10])  # 前 10 个字符作为特征
+            if words not in seen_words:
+                seen_words.add(words)
+                filtered.append(q)
+        questions = filtered
+
+        logger.info(f"模型追问生成: {len(questions)} 条 → {questions}")
+
+    except Exception as e:
+        logger.warning(f"追问生成失败（非致命）: {e}")
+        questions = []
+
+    # ---- 模板兜底：如果模型输出不足 2 条，用规则补足 ----
+    if len(questions) < 2:
+        fallback = _fallback_followups(history, questions)
+        questions = fallback
+
+    return questions[:3]
+
+
+def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
+    """
+    基于对话关键词匹配的追问模板兜底。
+
+    当 1.8B 小模型无法生成合格追问时启用。
+    """
+    import re
+
+    # 提取最后一轮问答的关键词
+    last_assistant = ""
+    last_user = ""
+    for msg in reversed(history):
+        if msg["role"] == "assistant" and not last_assistant:
+            last_assistant = msg["content"]
+        if msg["role"] == "user" and not last_user:
+            last_user = msg["content"]
+
+    combined = (last_user + " " + last_assistant).lower()
+
+    # 关键词 → 追问模板映射
+    templates = []
+
+    if any(kw in combined for kw in ["量化", "quant", "int4", "int8", "fp16", "精度"]):
+        templates.extend([
+            "INT4和INT8量化在实际应用中如何选择？",
+            "量化会对模型推理能力造成多大影响？",
+        ])
+
+    if any(kw in combined for kw in ["边缘计算", "边缘", "edge", "分布式", "推理"]):
+        templates.extend([
+            "边缘推理和云端推理各有什么优缺点？",
+            "分布式推理中的通信开销如何优化？",
+        ])
+
+    if any(kw in combined for kw in ["python", "代码", "编程", "写一个", "函数"]):
+        templates.extend([
+            "这段代码的时间复杂度是多少？",
+            "有没有更高效的实现方式？",
+        ])
+
+    if any(kw in combined for kw in ["模型", "训练", "微调", "lora", "参数"]):
+        templates.extend([
+            "这个模型的训练数据来源是什么？",
+            "如何在特定领域数据上微调模型？",
+        ])
+
+    if any(kw in combined for kw in ["transformer", "注意力", "attention", "架构"]):
+        templates.extend([
+            "Transformer相比RNN有哪些优势？",
+            "自注意力机制的计算复杂度如何？",
+        ])
+
+    if any(kw in combined for kw in ["token", "tokenizer", "分词", "词表"]):
+        templates.extend([
+            "不同的分词方法对模型性能有影响吗？",
+            "中文分词和英文分词的主要区别是什么？",
+        ])
+
+    if any(kw in combined for kw in ["显存", "gpu", "内存", "oom", "优化", "加速"]):
+        templates.extend([
+            "还有哪些降低推理显存占用的方法？",
+            "CPU推理在什么场景下比GPU更合适？",
+        ])
+
+    if any(kw in combined for kw in ["应用", "场景", "实际", "落地", "工业"]):
+        templates.extend([
+            "当前这个技术还有哪些落地挑战？",
+            "业界有哪些成功的应用案例可以参考？",
+        ])
+
+    if any(kw in combined for kw in ["hello", "你好", "介绍", "你是谁", "能做什么"]):
+        templates.extend([
+            "你能帮我写代码吗？",
+            "你的知识截止到什么时候？",
+        ])
+
+    # 默认通用追问
+    default_templates = [
+        "能再详细解释一下吗？",
+        "这个结论有什么前提条件？",
+        "有没有相关的参考资料可以推荐？",
+    ]
+
+    # 选择不重复的追问
+    result = list(existing)
+    candidate_pool = templates + default_templates
+    for q in candidate_pool:
+        if q not in result and len(result) < 3:
+            result.append(q)
+
+    if len(result) < 2:
+        # 不可能到这一步，但也处理一下
+        for q in default_templates:
+            if q not in result and len(result) < 3:
+                result.append(q)
+
+    logger.info(f"追问兜底: 模型生成了 {len(existing)} 条，模板补充至 {len(result)} 条")
+    return result
+
+
+def _init_kv_cache():
+    """初始化分页 KV 缓存（根据设备画像自适应大小）"""
+    global kv_cache
+    num_heads = 16      # Qwen-1.8B: 16 attention heads
+    head_dim = 64       # 隐藏维度 2048 / 16 heads = 128, 但实际是 64 per head for K/V
+    # 从模型获取实际的 head_dim
+    if model_manager.model is not None:
+        try:
+            cfg = model_manager.model.config
+            num_heads = cfg.num_attention_heads
+            head_dim = cfg.hidden_size // num_heads
+        except Exception:
+            pass
+
+    # 优先使用设备画像自适应大小
+    if device_profile:
+        kv_cache = PagedKVCache.from_profile(
+            profile=device_profile,
+            device=str(model_manager.get_device()),
+            dtype=torch.float16,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    else:
+        kv_cache = PagedKVCache(
+            page_size=PAGE_SIZE,
+            max_pages=MAX_PAGE_NUM,
+            device=str(model_manager.get_device()),
+            dtype=torch.float16,
+        )
+    return kv_cache
+
+
+# ============================================================
+# API 路由
+# ============================================================
+
+@app.get("/api/health")
+async def health():
+    """健康检查"""
+    return {"status": "ok", "timestamp": time.time()}
+
+
+@app.get("/api/presets")
+async def get_presets():
+    """
+    返回预设问题列表，包含预估 Token 消耗和显存占用。
+
+    类似豆包/千问 APP 的建议提问功能。
+    Token 估算基于 Qwen-1.8B 的经验数据：
+      - 中文约 1.5-2 tokens/字
+      - 英文约 1-1.3 tokens/字
+      - 回复通常为问题的 1-3 倍长度
+    """
+    # 根据当前加载的量化类型估算速度
+    speed_map = {"fp16": 53, "int8": 10, "int4": 29}
+    tok_s = speed_map.get(current_quant if model_loaded else "int4", 29)
+
+    # 从设备画像获取档位，调整预估
+    max_tokens = generation_config.get("max_new_tokens", 512)
+
+    presets = [
+        {
+            "id": "intro",
+            "icon": "👋",
+            "label": "自我介绍",
+            "question": "请简单介绍一下你自己，你能做什么？",
+            "estimated_prompt_tokens": 25,
+            "estimated_response_tokens": 120,
+            "estimated_memory_mb": round(145 * 96 / 1024, 1),  # ~13.6 MB KV cache
+            "estimated_seconds": round(120 / tok_s, 1),
+        },
+        {
+            "id": "edge_computing",
+            "icon": "🌐",
+            "label": "边缘计算科普",
+            "question": "什么是边缘计算？它和云计算有什么区别？",
+            "estimated_prompt_tokens": 35,
+            "estimated_response_tokens": 200,
+            "estimated_memory_mb": round(235 * 96 / 1024, 1),  # ~22.0 MB
+            "estimated_seconds": round(200 / tok_s, 1),
+        },
+        {
+            "id": "model_quantization",
+            "icon": "⚡",
+            "label": "模型量化原理",
+            "question": "大模型的INT4量化是怎么做到的？精度损失大吗？",
+            "estimated_prompt_tokens": 40,
+            "estimated_response_tokens": 250,
+            "estimated_memory_mb": round(290 * 96 / 1024, 1),  # ~27.2 MB
+            "estimated_seconds": round(250 / tok_s, 1),
+        },
+        {
+            "id": "code_assist",
+            "icon": "💻",
+            "label": "Python 代码助手",
+            "question": "用Python写一个函数，计算两个大文件的MD5哈希并比较是否相同",
+            "estimated_prompt_tokens": 45,
+            "estimated_response_tokens": 300,
+            "estimated_memory_mb": round(345 * 96 / 1024, 1),  # ~32.3 MB
+            "estimated_seconds": round(300 / tok_s, 1),
+        },
+        {
+            "id": "creative",
+            "icon": "✨",
+            "label": "创意写作",
+            "question": "以「边缘设备上的AI觉醒」为题，写一个300字的科幻微小说",
+            "estimated_prompt_tokens": 50,
+            "estimated_response_tokens": 400,
+            "estimated_memory_mb": round(450 * 96 / 1024, 1),  # ~42.2 MB
+            "estimated_seconds": round(400 / tok_s, 1),
+        },
+        {
+            "id": "reasoning",
+            "icon": "🧩",
+            "label": "逻辑推理",
+            "question": "A说B撒谎，B说C撒谎，C说A和B都在撒谎。请问谁说的是真话？",
+            "estimated_prompt_tokens": 55,
+            "estimated_response_tokens": 350,
+            "estimated_memory_mb": round(405 * 96 / 1024, 1),  # ~38.0 MB
+            "estimated_seconds": round(350 / tok_s, 1),
+        },
+    ]
+
+    return {
+        "presets": presets,
+        "current_speed_tok_s": tok_s,
+        "current_quant": current_quant if model_loaded else None,
+        "max_new_tokens": max_tokens,
+    }
+
+
+# ---- 支持的文件类型 ----
+ALLOWED_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".py", ".json", ".log",
+    ".xml", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+    ".js", ".ts", ".jsx", ".tsx", ".html", ".css",
+    ".sh", ".bash", ".zsh", ".ps1",
+    ".cpp", ".c", ".h", ".java", ".go", ".rs", ".rb",
+    ".sql", ".r", ".m", ".swift", ".kt",
+    ".toml", ".properties", ".env",
+}
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+MAX_UPLOAD_LINES = 5000              # 超过截断
+
+
+@app.post("/api/chat/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """
+    上传文本文件，返回解析后的内容。
+
+    支持 txt / md / csv / py / json / log 等纯文本格式。
+    限制 5 MB，超过 5000 行自动截断（保留前 5000 行）。
+    """
+    import os as _os
+
+    # 1. 校验扩展名
+    filename = file.filename or "untitled"
+    ext = _os.path.splitext(filename)[1].lower()
+    if ext not in ALLOWED_TEXT_EXTENSIONS:
+        raise HTTPException(
+            400,
+            f"不支持的文件类型: {ext}。"
+            f"支持的格式: {', '.join(sorted(ALLOWED_TEXT_EXTENSIONS))}",
+        )
+
+    # 2. 读取内容
+    try:
+        raw = await file.read()
+    except Exception as e:
+        raise HTTPException(400, f"文件读取失败: {e}")
+
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            f"文件过大 ({len(raw) / 1024 / 1024:.1f} MB)，"
+            f"限制 {MAX_UPLOAD_BYTES / 1024 / 1024:.0f} MB",
+        )
+
+    # 3. 解码（尝试 UTF-8 → GBK → latin-1）
+    content = None
+    for encoding in ("utf-8", "gbk", "latin-1"):
+        try:
+            content = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if content is None:
+        raise HTTPException(400, "无法解码文件内容，请确认文件编码为 UTF-8 或 GBK")
+
+    # 4. 统计 + 截断
+    lines = content.split("\n")
+    total_lines = len(lines)
+    if total_lines > MAX_UPLOAD_LINES:
+        content = "\n".join(lines[:MAX_UPLOAD_LINES])
+        truncated = True
+    else:
+        truncated = False
+
+    # 统计字符数和词数近似值
+    char_count = len(content)
+    word_count = len(content.split())
+
+    # 检测语言类型（用于前端代码高亮）
+    lang_map = {
+        ".py": "python", ".js": "javascript", ".ts": "typescript",
+        ".jsx": "jsx", ".tsx": "tsx", ".html": "html", ".css": "css",
+        ".json": "json", ".md": "markdown", ".csv": "csv",
+        ".xml": "xml", ".yaml": "yaml", ".yml": "yaml",
+        ".sh": "bash", ".bash": "bash", ".ps1": "powershell",
+        ".cpp": "cpp", ".c": "c", ".h": "c", ".java": "java",
+        ".go": "go", ".rs": "rust", ".rb": "ruby",
+        ".sql": "sql", ".r": "r", ".swift": "swift", ".kt": "kotlin",
+        ".toml": "toml", ".ini": "ini", ".cfg": "ini",
+    }
+    language = lang_map.get(ext, "plaintext")
+
+    logger.info(
+        f"文件上传: {filename} ({ext}) {char_count} 字符 "
+        f"{total_lines} 行{' (已截断)' if truncated else ''}"
+    )
+
+    return {
+        "filename": filename,
+        "extension": ext,
+        "language": language,
+        "char_count": char_count,
+        "word_count": word_count,
+        "line_count": total_lines if not truncated else MAX_UPLOAD_LINES,
+        "total_lines": total_lines,
+        "truncated": truncated,
+        "truncated_lines": total_lines - MAX_UPLOAD_LINES if truncated else 0,
+        "size_bytes": len(raw),
+        "content": content,
+    }
+
+
+@app.get("/api/device/profile")
+async def get_device_profile():
+    """
+    获取完整设备画像。
+
+    包含 CPU / RAM / GPU / 磁盘 / OS 信息，
+    设备档位、评分、推荐配置、警告。
+    启动时自动检测一次，后续请求返回缓存。
+    """
+    global device_profile
+    if device_profile is None:
+        try:
+            profiler = get_profile()
+            device_profile = profiler.to_dict()
+        except Exception as e:
+            raise HTTPException(500, f"设备检测失败: {e}")
+    return device_profile
+
+
+@app.post("/api/device/auto-configure")
+async def auto_configure():
+    """
+    根据设备画像自动应用推荐配置。
+
+    更新 KV 缓存大小、序列长度、生成参数等运行时配置。
+    不重新加载模型（如需切换量化精度，请手动调用 /api/models/load）。
+    """
+    global kv_cache, device_profile, generation_config
+
+    if device_profile is None:
+        try:
+            profiler = get_profile()
+            device_profile = profiler.to_dict()
+        except Exception as e:
+            raise HTTPException(500, f"设备检测失败: {e}")
+
+    rec = device_profile.get("recommendations", [])
+    warnings = device_profile.get("warnings", [])
+    tier = device_profile.get("tier", "laptop")
+    score = device_profile.get("score_total", 50)
+
+    # 从 device_profiler 获取推荐配置
+    from device_profiler import DeviceProfiler
+    profiler = get_profile()
+    config = profiler.recommend_config()
+
+    # 应用 KV 缓存配置（如果尚未加载模型，则更新默认值）
+    import config as cfg
+    cfg.PAGE_SIZE = config["page_size"]
+    cfg.MAX_PAGE_NUM = config["max_pages"]
+    cfg.MAX_SEQ_LEN = config["max_seq_len"]
+
+    # 更新生成配置（设置档位上限）
+    generation_config["max_new_tokens"] = config["max_new_tokens"]
+    generation_config["tier_max_new_tokens"] = config["max_new_tokens"]
+
+    # 如果 KV 缓存已存在，重建
+    if kv_cache and model_loaded:
+        kv_cache.clear()
+        from paged_kv_cache import PagedKVCache
+        kv_cache = PagedKVCache(
+            page_size=config["page_size"],
+            max_pages=config["max_pages"],
+            device=kv_cache.device,
+            dtype=kv_cache.dtype,
+        )
+        logger.info(
+            f"KV 缓存已重建: page_size={config['page_size']}, "
+            f"max_pages={config['max_pages']}"
+        )
+
+    logger.info(f"自适应配置已应用: {config['description']}")
+
+    return {
+        "status": "configured",
+        "tier": tier,
+        "score": score,
+        "applied_config": config,
+        "recommendations": rec,
+        "warnings": warnings,
+    }
+
+
+class SelectGpuRequest(BaseModel):
+    gpu_index: int = Field(..., ge=0, description="GPU 列表中要切换到的序号")
+
+
+@app.post("/api/device/select-gpu")
+async def select_gpu(req: SelectGpuRequest):
+    """
+    切换推理 GPU。
+
+    在集显（CPU 推理）和独显（CUDA）之间切换。
+    切换后需要重新加载模型才能生效。
+
+    游戏本默认使用集显（低功耗），用户可手动切换到独显。
+    """
+    global device_profile, model_loaded
+
+    if device_profile is None:
+        raise HTTPException(400, "设备画像未就绪，请先调用 GET /api/device/profile")
+
+    gpus = device_profile.get("gpus", [])
+    if req.gpu_index < 0 or req.gpu_index >= len(gpus):
+        raise HTTPException(
+            400,
+            f"无效的 GPU 序号: {req.gpu_index}。"
+            f"可用范围: 0-{len(gpus) - 1}（共 {len(gpus)} 个 GPU）",
+        )
+
+    # 更新 profiler 中的选中 GPU
+    from device_profiler import get_profile
+    profiler = get_profile()
+    if not profiler.select_gpu(req.gpu_index):
+        raise HTTPException(500, "GPU 切换失败")
+
+    # 更新缓存的 device_profile
+    device_profile = profiler.to_dict()
+
+    selected = gpus[req.gpu_index]
+    logger.info(
+        f"GPU 已切换: [{req.gpu_index}] {selected['name']} "
+        f"({selected['gpu_type']}, CUDA: {selected['cuda_available']})"
+    )
+
+    return {
+        "status": "switched",
+        "selected_gpu_index": req.gpu_index,
+        "selected_gpu": {
+            "name": selected["name"],
+            "gpu_type": selected["gpu_type"],
+            "cuda_available": selected["cuda_available"],
+            "vram_total_gb": selected["vram_total_gb"],
+        },
+        "device": profiler.recommend_config()["device"],
+        "warning": (
+            "切换 GPU 后需要重新加载模型才能生效。"
+            if model_loaded
+            else None
+        ),
+    }
+
+
+@app.get("/api/status")
+async def get_status():
+    """获取系统完整状态（含设备档位）"""
+    gpu_info = {}
+    if torch.cuda.is_available():
+        gpu_info = {
+            "name": torch.cuda.get_device_name(0),
+            "total_mb": round(torch.cuda.get_device_properties(0).total_memory / (1024**2)),
+            "allocated_mb": round(torch.cuda.memory_allocated() / (1024**2), 1),
+            "reserved_mb": round(torch.cuda.memory_reserved() / (1024**2), 1),
+            "utilization": round(
+                torch.cuda.memory_allocated()
+                / torch.cuda.get_device_properties(0).total_memory
+                * 100,
+                1,
+            ),
+        }
+
+    # ---- KV 缓存统计（基于实际对话 token 消耗估算） ----
+    # 注：单机模式下 model.generate() 使用内置 KV 缓存，PagedKVCache 未接入。
+    # 这里根据实际对话 token 数估算 KV 缓存显存占用。
+    num_heads = 16
+    head_dim = 64
+    num_layers = 24   # Qwen-1.8B
+    dtype_bytes = 2   # fp16/bf16
+    total_tokens = conversation_stats["total_prompt_tokens"] + conversation_stats["total_generated_tokens"]
+    # KV cache per token = num_layers × 2(K+V) × num_heads × head_dim × dtype_bytes
+    kv_bytes_per_token = num_layers * 2 * num_heads * head_dim * dtype_bytes
+    kv_memory_mb = round(total_tokens * kv_bytes_per_token / (1024 ** 2), 2)
+
+    # 已分配页估算（以当前 PAGE_SIZE 为基准）
+    page_size = PAGE_SIZE
+    estimated_pages = (total_tokens + page_size - 1) // page_size if total_tokens > 0 else 0
+    max_pages = MAX_PAGE_NUM
+    utilization = estimated_pages / max_pages if max_pages > 0 else 0.0
+
+    kv_stats = {
+        "total_tokens": total_tokens,
+        "max_tokens": page_size * max_pages,
+        "allocated_pages": estimated_pages,
+        "free_pages": max_pages - estimated_pages,
+        "max_pages": max_pages,
+        "page_size": page_size,
+        "utilization": round(utilization, 4),
+        "estimated_memory_mb": kv_memory_mb,
+        "rounds": conversation_stats["rounds"],
+        "total_time_s": round(conversation_stats["total_time_seconds"], 1),
+    }
+
+    # 设备画像摘要
+    device_summary = None
+    if device_profile:
+        device_summary = {
+            "tier": device_profile.get("tier"),
+            "tier_label": device_profile.get("tier_label"),
+            "tier_icon": device_profile.get("tier_icon"),
+            "score": device_profile.get("score_total"),
+            "gpus": device_profile.get("gpus", []),
+            "selected_gpu_index": device_profile.get("selected_gpu_index", 0),
+            "recommendations": device_profile.get("recommendations", [])[:3],
+            "warnings": device_profile.get("warnings", []),
+        }
+
+    return {
+        "model_loaded": model_loaded,
+        "current_quant": current_quant,
+        "use_compile": USE_COMPILE if model_loaded else False,
+        "model_name": MODEL_NAME,
+        "model_path": MODEL_PATH,
+        "run_mode": RUN_MODE,
+        "gpu": gpu_info,
+        "kv_cache": kv_stats,
+        "conversation_turns": len(conversation_history),
+        "generation_config": generation_config,
+        "device": device_summary,
+    }
+
+
+@app.get("/api/models/current")
+async def get_current_model():
+    """当前模型信息"""
+    if not model_loaded:
+        return {"loaded": False, "quant_type": None}
+
+    info = model_manager.get_model_info()
+    mem = model_manager.get_memory_usage()
+    return {
+        "loaded": True,
+        "quant_type": current_quant,
+        "model_name": MODEL_NAME,
+        "total_params": info.get("total_params", "N/A"),
+        "device": info.get("device", "N/A"),
+        "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
+        "gpu_reserved_gb": mem.get("gpu_reserved_gb", 0),
+    }
+
+
+@app.post("/api/models/load")
+async def load_model(req: LoadModelRequest):
+    """
+    加载/切换模型。
+
+    耗时约 5-20 秒（取决于量化类型），期间会先卸载旧模型。
+    """
+    global model_loaded, current_quant, kv_cache, conversation_history, conversation_stats
+
+    quant = req.quant_type.lower()
+    if quant not in ("fp16", "int8", "int4"):
+        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
+
+    try:
+        t0 = time.time()
+
+        # 卸载旧模型
+        if model_manager.model is not None:
+            logger.info("卸载旧模型...")
+            model_manager.model = None
+            model_manager.tokenizer = None
+            if kv_cache:
+                kv_cache.clear()
+            kv_cache = None
+            conversation_history = []
+            conversation_stats = {
+                "total_prompt_tokens": 0,
+                "total_generated_tokens": 0,
+                "total_time_seconds": 0.0,
+                "rounds": 0,
+            }
+            model_loaded = False
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+        # 临时修改 config
+        import config as cfg
+        cfg.QUANT_TYPE = quant
+        cfg.USE_COMPILE = req.use_compile
+
+        # 加载新模型（传入设备画像以启用自适应加载）
+        logger.info(f"加载模型: quant={quant}, compile={req.use_compile}")
+        model_manager.load_model(
+            model_path=MODEL_PATH,
+            quant_type=quant,
+            profile=device_profile,
+        )
+
+        # 初始化 KV 缓存
+        _init_kv_cache()
+        conversation_history = []
+        conversation_stats = {
+            "total_prompt_tokens": 0,
+            "total_generated_tokens": 0,
+            "total_time_seconds": 0.0,
+            "rounds": 0,
+        }
+
+        model_loaded = True
+        current_quant = quant
+        generation_config["use_compile"] = req.use_compile
+
+        elapsed = time.time() - t0
+
+        status = await get_status()
+        status["load_time_seconds"] = round(elapsed, 1)
+
+        logger.info(f"模型加载完成 ({elapsed:.1f}s): {quant}")
+        return status
+
+    except Exception as e:
+        model_loaded = False
+        logger.error(f"模型加载失败: {e}")
+        raise HTTPException(500, f"模型加载失败: {str(e)}")
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """
+    发送消息并获取模型回复（多轮对话）。
+
+    自动维护对话历史 + KV 缓存。
+    """
+    global conversation_history, kv_cache, conversation_stats
+
+    if not model_loaded or model_manager.model is None:
+        raise HTTPException(400, "模型未加载，请先在控制面板中选择并加载模型")
+
+    try:
+        # 更新生成配置（应用设备档位上限，取请求值与档位值的较小者）
+        tier_max = generation_config.get("tier_max_new_tokens", generation_config["max_new_tokens"])
+        effective_max = min(req.max_new_tokens, tier_max)
+        generation_config["max_new_tokens"] = effective_max
+        generation_config["temperature"] = req.temperature
+        generation_config["top_p"] = req.top_p
+
+        # 追加用户消息
+        conversation_history.append({"role": "user", "content": req.message})
+
+        # 构建 Qwen chat prompt
+        prompt = _build_chat_prompt(conversation_history)
+
+        # Tokenize
+        tokenizer = model_manager.tokenizer
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(model_manager.get_device())
+        prompt_len = input_ids.shape[1]
+
+        # 生成
+        t0 = time.time()
+        with torch.no_grad():
+            outputs = model_manager.model.generate(
+                input_ids,
+                max_new_tokens=req.max_new_tokens,
+                temperature=req.temperature if req.temperature > 0 else 1.0,
+                top_p=req.top_p,
+                do_sample=req.temperature > 0,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        elapsed = time.time() - t0
+
+        # 解码（仅提取新生成的部分）
+        generated_ids = outputs[0][prompt_len:]
+        response_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+        # 追加助手回复
+        conversation_history.append({"role": "assistant", "content": response_text})
+
+        # 性能指标
+        new_tokens = len(generated_ids)
+        tokens_per_sec = new_tokens / elapsed if elapsed > 0 else 0
+        metrics = {
+            "prompt_tokens": prompt_len,
+            "new_tokens": new_tokens,
+            "total_tokens": prompt_len + new_tokens,
+            "elapsed_seconds": round(elapsed, 3),
+            "tokens_per_second": round(tokens_per_sec, 1),
+            "gpu_memory_mb": round(torch.cuda.memory_allocated() / (1024**2), 1)
+            if torch.cuda.is_available()
+            else 0,
+        }
+
+        # 累计对话统计
+        conversation_stats["total_prompt_tokens"] += prompt_len
+        conversation_stats["total_generated_tokens"] += new_tokens
+        conversation_stats["total_time_seconds"] += elapsed
+        conversation_stats["rounds"] += 1
+
+        logger.info(
+            f"推理完成: {new_tokens} tokens / {elapsed:.2f}s = {tokens_per_sec:.1f} tok/s"
+        )
+
+        # 生成追问建议（非阻塞，如失败则返回空列表不影响主流程）
+        followups = _generate_followups(
+            conversation_history, tokenizer, model_manager.model, model_manager.get_device()
+        )
+
+        return ChatResponse(content=response_text, metrics=metrics, followups=followups)
+
+    except torch.cuda.OutOfMemoryError:
+        # OOM 恢复
+        if kv_cache:
+            kv_cache.clear()
+        conversation_history = []
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(507, "GPU 显存不足（OOM），已自动清空对话历史。请缩短消息后重试。")
+
+    except Exception as e:
+        logger.error(f"推理异常: {e}")
+        raise HTTPException(500, f"推理失败: {str(e)}")
+
+
+@app.post("/api/chat/clear")
+async def clear_chat():
+    """清空对话历史与 KV 缓存"""
+    global conversation_history, kv_cache, conversation_stats
+    conversation_history = []
+    conversation_stats = {
+        "total_prompt_tokens": 0,
+        "total_generated_tokens": 0,
+        "total_time_seconds": 0.0,
+        "rounds": 0,
+    }
+    if kv_cache:
+        kv_cache.clear()
+    _init_kv_cache()
+    logger.info("对话历史已清空")
+    return {"status": "cleared", "conversation_turns": 0}
+
+
+@app.get("/api/models/available")
+async def list_available_models():
+    """列出可选模型配置"""
+    return {
+        "models": [
+            {
+                "id": "fp16",
+                "name": "FP16 原版",
+                "description": "原始精度，显存 ~3.5 GB，速度最快 (~53 tok/s)",
+                "memory_gb": 3.5,
+                "speed_tok_s": 53,
+                "compile_support": True,
+            },
+            {
+                "id": "int4",
+                "name": "INT4 量化 ⭐",
+                "description": "4-bit 量化，显存 ~1.8 GB，速度 ~29 tok/s（推荐边缘设备）",
+                "memory_gb": 1.8,
+                "speed_tok_s": 29,
+                "compile_support": False,
+            },
+            {
+                "id": "int8",
+                "name": "INT8 量化",
+                "description": "8-bit 量化，显存 ~2.3 GB，速度 ~10 tok/s",
+                "memory_gb": 2.3,
+                "speed_tok_s": 10,
+                "compile_support": False,
+            },
+        ],
+        "current": current_quant if model_loaded else None,
+    }
+
+
+# ============================================================
+# 启动入口
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("启动 API 服务器...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
