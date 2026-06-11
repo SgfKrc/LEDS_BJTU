@@ -28,7 +28,7 @@ from transformers import (
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
     DEVICE, TRUST_REMOTE_CODE,
-    MAIN_NODE_LAYERS, CLIENT1_LAYERS, CLIENT2_LAYERS,
+    TOTAL_MODEL_LAYERS, DEFAULT_LAYER_CONFIG,
 )
 
 logger = logging.getLogger(__name__)
