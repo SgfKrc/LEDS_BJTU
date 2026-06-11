@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { sendMessage, clearChat, fetchPresets, uploadFile } from '../api/client';
+import { sendMessage, clearChat, fetchPresets, uploadFile, fetchConversations, deleteConversations } from '../api/client';
 
 const CHAT_HISTORY_KEY = 'qlh-chat-history';
 
@@ -25,27 +25,55 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     inputRef.current?.focus();
   }, []);
 
-  // ---- 对话历史持久化: 加载 ----
+  // ---- 对话历史持久化: 加载（服务器优先，localStorage 降级） ----
   useEffect(() => {
-    if (settings?.saveHistory) {
+    if (!settings?.saveHistory) return;
+
+    let cancelled = false;
+
+    const loadHistory = async () => {
+      // 优先从服务器（数据库）加载
+      try {
+        const res = await fetchConversations();
+        if (!cancelled && res?.messages?.length > 0) {
+          const msgs = res.messages.map((m, i) => ({
+            role: m.role,
+            content: m.content,
+            id: Date.now() - res.messages.length + i,
+            metrics: m.role === 'assistant' && i === res.messages.length - 1 ? null : null,
+          }));
+          setMessages(msgs);
+          // 同时更新 localStorage 缓存
+          try { localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(msgs)); } catch (_) {}
+          return;
+        }
+      } catch (_) {
+        // 服务器不可用，尝试 localStorage 降级
+      }
+
+      // 降级：从 localStorage 加载
       try {
         const saved = localStorage.getItem(CHAT_HISTORY_KEY);
         if (saved) {
           const parsed = JSON.parse(saved);
           if (Array.isArray(parsed) && parsed.length > 0) {
-            setMessages(parsed);
-            // 恢复最后一条 assistant 消息的 metrics
-            const lastAssistant = [...parsed].reverse().find(m => m.role === 'assistant');
-            if (lastAssistant?.metrics) {
-              setLastMetrics(lastAssistant.metrics);
+            if (!cancelled) {
+              setMessages(parsed);
+              const lastAssistant = [...parsed].reverse().find(m => m.role === 'assistant');
+              if (lastAssistant?.metrics) {
+                setLastMetrics(lastAssistant.metrics);
+              }
             }
           }
         }
       } catch (_) {}
-    }
+    };
+
+    loadHistory();
+    return () => { cancelled = true; };
   }, []); // 仅首次挂载
 
-  // ---- 对话历史持久化: 保存 ----
+  // ---- 对话历史持久化: 保存（localStorage 即时缓存，服务器已由后端自动持久化） ----
   useEffect(() => {
     if (settings?.saveHistory && messages.length > 0) {
       try {
@@ -141,14 +169,49 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         temperature: settings?.temperature ?? 0.7,
         topP: settings?.topP ?? 0.9,
       });
+      const fullContent = res.content;
+      const msgId = Date.now() + 1;
+
+      // 先插入一个 content 为空的助手消息（显示 typing 动画 → 立即开始逐字输出）
       const assistantMsg = {
         role: 'assistant',
-        content: res.content,
+        content: '',
         metrics: res.metrics,
         followups: res.followups || [],
-        id: Date.now() + 1,
+        id: msgId,
       };
       setMessages((prev) => [...prev, assistantMsg]);
+
+      // ---- 假流式：逐字符输出 ----
+      // 不再显示 typing dots，直接开始逐字填充
+      let charIndex = 0;
+      const totalLen = fullContent.length;
+      const baseInterval = 18;   // 基础间隔 ms（约 30-55 char/s，贴近真实生成速度）
+
+      const streamTimer = setInterval(() => {
+        // 每次吐出 1-3 个字符，模拟不均匀生成
+        const burst = 1 + Math.floor(Math.random() * 3);
+        charIndex = Math.min(charIndex + burst, totalLen);
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === msgId
+              ? { ...m, content: fullContent.slice(0, charIndex) }
+              : m
+          )
+        );
+
+        if (charIndex >= totalLen) {
+          clearInterval(streamTimer);
+          // 确保最终完整文本
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === msgId ? { ...m, content: fullContent } : m
+            )
+          );
+        }
+      }, baseInterval + Math.random() * 12);  // 18-30ms 随机间隔
+
       setLastMetrics(res.metrics);
       metricsTrigger?.(res.metrics);
     } catch (err) {
@@ -168,12 +231,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const handleClear = async () => {
     try {
       await clearChat();
+      // 同时清除服务器端（数据库）和本地保存的历史
+      try { await deleteConversations(); } catch (_) {}
+      try { localStorage.removeItem(CHAT_HISTORY_KEY); } catch (_) {}
       setMessages([]);
       setLastMetrics(null);
       setUploadedFile(null);
-      // 同时清除本地保存的历史
-      try { localStorage.removeItem(CHAT_HISTORY_KEY); } catch (_) {}
-      onToast?.({ type: 'success', msg: '对话历史已清空' });
+      onToast?.({ type: 'success', msg: '对话历史已清空（服务器 + 本地）' });
     } catch (err) {
       onToast?.({ type: 'error', msg: `清空失败: ${err.message}` });
     }

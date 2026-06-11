@@ -36,6 +36,7 @@ const TOPP_OPTIONS = [
 export default function SettingsModal({
   open, onClose, deviceRefreshKey, onToast, theme, onToggleTheme,
   settings, onSettingsChange, deviceTier, onApplyTierPreset,
+  myRole,
 }) {
   const overlayRef = useRef(null);
 
@@ -229,9 +230,9 @@ export default function SettingsModal({
             <h3>💾 对话记录</h3>
             <div className="setting-toggle-row">
               <div>
-                <div className="setting-label">保存对话历史到本地</div>
+                <div className="setting-label">保存对话历史</div>
                 <div className="setting-desc">
-                  启用后对话内容将自动保存到浏览器本地存储，刷新页面后自动恢复
+                  启用后对话内容将保存到浏览器本地存储{myRole?.is_master && '并同步到云端数据库'}。关闭后对话仅保留在内存中，刷新页面后丢失。
                 </div>
               </div>
               <button
@@ -251,7 +252,82 @@ export default function SettingsModal({
             </div>
             {settings.saveHistory && (
               <div className="setting-hint">
-                ✅ 对话历史将保存到本地浏览器。清除浏览器数据会导致历史丢失。
+                ✅ 对话历史将保存到本地浏览器{myRole?.is_master ? '和云端数据库，' : '。'}清除浏览器数据会导致本地历史丢失。
+              </div>
+            )}
+          </div>
+
+          {/* ======== 云同步设置偏好 ======== */}
+          <div className="sidebar-section">
+            <h3>☁️ 云同步</h3>
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-label">同步设置到云端</div>
+                <div className="setting-desc">
+                  启用后，推理参数、对话历史开关、分布式推理开关等偏好设置将自动同步到云数据库。
+                  关闭后设置仅保存在浏览器本地存储。在新设备或清除缓存后可恢复设置。
+                </div>
+              </div>
+              <button
+                className={`setting-toggle-btn${settings.cloudSync ? ' on' : ''}`}
+                onClick={() => onSettingsChange({ cloudSync: !settings.cloudSync })}
+                title={settings.cloudSync ? '已启用 — 点击关闭' : '已关闭 — 点击启用'}
+              >
+                <span className="setting-toggle-track">
+                  <span
+                    className="setting-toggle-thumb"
+                    style={{
+                      transform: settings.cloudSync ? 'translateX(22px)' : 'translateX(0)',
+                    }}
+                  />
+                </span>
+              </button>
+            </div>
+            {settings.cloudSync && (
+              <div className="setting-hint">
+                ✅ 设置将自动同步到云数据库。在新设备登录或清除浏览器缓存后可自动恢复偏好。
+              </div>
+            )}
+          </div>
+
+          {/* ======== 分布式推理优化（所有节点可见） ======== */}
+          <div className="sidebar-section">
+            <h3>🌐 分布式推理优化</h3>
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-label">启用分布式推理优化</div>
+                <div className="setting-desc">
+                  {myRole?.is_master
+                    ? '主节点：开启后将协调所有从节点进行分布式推理，从节点对话请求通过 TCP 转发至主节点统一调度。关闭后本节点独立运行，不接受从节点连接。'
+                    : '从节点：开启后将参与分布式推理集群，对话请求自动转发至主节点执行。关闭后仅使用本地模型推理，不连接主节点。'}
+                </div>
+              </div>
+              <button
+                className={`setting-toggle-btn${settings.distributedInference ? ' on' : ''}`}
+                onClick={() => onSettingsChange({ distributedInference: !settings.distributedInference })}
+                title={settings.distributedInference ? '已启用 — 点击关闭' : '已关闭 — 点击启用'}
+              >
+                <span className="setting-toggle-track">
+                  <span
+                    className="setting-toggle-thumb"
+                    style={{
+                      transform: settings.distributedInference ? 'translateX(22px)' : 'translateX(0)',
+                    }}
+                  />
+                </span>
+              </button>
+            </div>
+            {settings.distributedInference && (
+              <div className="setting-hint" style={{ marginTop: 8 }}>
+                {myRole?.is_master
+                  ? '✅ 分布式推理已启用。后台管理中将显示集群状态、分层配置与节点管理。'
+                  : '✅ 已启用分布式推理优化。后台管理中将显示本节点的运行状态与性能指标。'}
+              </div>
+            )}
+            {myRole?.node_id && (
+              <div className="setting-node-id-row">
+                <span className="setting-label">节点标识</span>
+                <span className="setting-mono-badge">{myRole.node_id}</span>
               </div>
             )}
           </div>
