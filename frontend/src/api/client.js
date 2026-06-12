@@ -41,9 +41,11 @@ export async function sendMessage(message, opts = {}) {
     method: 'POST',
     body: JSON.stringify({
       message,
+      session_id: opts.sessionId || null,
       max_new_tokens: opts.maxNewTokens || 512,
       temperature: opts.temperature ?? 0.7,
       top_p: opts.topP ?? 0.9,
+      show_thinking: opts.showThinking || false,
     }),
   });
 }
@@ -132,6 +134,52 @@ export async function deleteConversations(sessionId = 'default') {
 
 export async function fetchDbHealth() {
   return request('/db/health');
+}
+
+// ---- 会话管理（多会话支持） ----
+
+export async function createSession(title = '新对话', firstMessage = null) {
+  const body = { title };
+  if (firstMessage) body.first_message = firstMessage;
+  return request('/sessions', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function fetchSessions(limit = 50, offset = 0) {
+  return request(`/sessions?limit=${limit}&offset=${offset}`);
+}
+
+export async function fetchSession(sessionId) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export async function renameSession(sessionId, title) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ title }),
+  });
+}
+
+export async function deleteSession(sessionId) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function activateSession(sessionId) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/activate`, {
+    method: 'POST',
+  });
+}
+
+// ---- 单轮对话删除 ----
+
+export async function deleteTurn(sessionId, turnIndex) {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/turns/${turnIndex}`, {
+    method: 'DELETE',
+  });
 }
 
 // ---- 节点连接 ----

@@ -153,8 +153,19 @@ def _init_schema() -> None:
             )
         """)
 
+        # ---- 会话元数据表 ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id            VARCHAR(64) PRIMARY KEY,
+                title         VARCHAR(256) NOT NULL DEFAULT '新对话',
+                created_at    TIMESTAMP DEFAULT NOW(),
+                updated_at    TIMESTAMP DEFAULT NOW(),
+                message_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
         conn.commit()
-        logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config)")
+        logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions)")
 
 
 # ================================================================
@@ -346,6 +357,168 @@ def get_conversation_count(session_id: str = "default") -> int:
             (session_id,)
         )
         return cur.fetchone()[0]
+
+
+def delete_message_range(session_id: str, turn_index: int) -> int:
+    """
+    删除指定会话中某轮对话（user + assistant 两条消息）。
+
+    turn_index: 0-based 对话轮次索引。
+    turn 0 = 第1个user + 第1个assistant，
+    turn 1 = 第2个user + 第2个assistant，以此类推。
+
+    使用 CTE 定位要删除的行 ID，然后 DELETE。
+    返回实际删除的行数。
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 使用子查询定位第 2*turn_index 和 2*turn_index+1 条消息的 ID
+        cur.execute("""
+            WITH ordered AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC) - 1 AS rn
+                FROM conversations
+                WHERE session_id = %s
+            )
+            DELETE FROM conversations
+            WHERE id IN (
+                SELECT id FROM ordered
+                WHERE rn IN (%s, %s)
+            )
+        """, (session_id, 2 * turn_index, 2 * turn_index + 1))
+        conn.commit()
+        return cur.rowcount
+
+
+# ================================================================
+# 会话管理（多会话支持）
+# ================================================================
+
+def create_session(session_id: str, title: str = "新对话") -> dict:
+    """创建新会话记录"""
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            INSERT INTO sessions (id, title)
+            VALUES (%s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                updated_at = NOW()
+            RETURNING *
+        """, (session_id, title))
+        conn.commit()
+        row = cur.fetchone()
+        d = dict(row) if row else {}
+        if "created_at" in d and d["created_at"]:
+            d["created_at"] = d["created_at"].isoformat()
+        if "updated_at" in d and d["updated_at"]:
+            d["updated_at"] = d["updated_at"].isoformat()
+        return d
+
+
+def get_all_sessions(limit: int = 50, offset: int = 0) -> list[dict]:
+    """获取所有会话列表（按 updated_at DESC 排序）"""
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT * FROM sessions
+            ORDER BY updated_at DESC
+            LIMIT %s OFFSET %s
+        """, (limit, offset))
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if "created_at" in d and d["created_at"]:
+                d["created_at"] = d["created_at"].isoformat()
+            if "updated_at" in d and d["updated_at"]:
+                d["updated_at"] = d["updated_at"].isoformat()
+            result.append(d)
+        return result
+
+
+def get_session(session_id: str) -> Optional[dict]:
+    """获取单个会话元数据"""
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if "created_at" in d and d["created_at"]:
+            d["created_at"] = d["created_at"].isoformat()
+        if "updated_at" in d and d["updated_at"]:
+            d["updated_at"] = d["updated_at"].isoformat()
+        return d
+
+
+def get_session_count() -> int:
+    """获取会话总数"""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM sessions")
+        return cur.fetchone()[0]
+
+
+def update_session_title(session_id: str, title: str) -> Optional[dict]:
+    """更新会话标题"""
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            UPDATE sessions
+            SET title = %s, updated_at = NOW()
+            WHERE id = %s
+            RETURNING *
+        """, (title, session_id))
+        conn.commit()
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if "created_at" in d and d["created_at"]:
+            d["created_at"] = d["created_at"].isoformat()
+        if "updated_at" in d and d["updated_at"]:
+            d["updated_at"] = d["updated_at"].isoformat()
+        return d
+
+
+def delete_session(session_id: str) -> int:
+    """
+    删除会话及其所有对话消息（事务内完成）。
+    返回删除的会话数（0 或 1）。
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # 先删消息（外键未定义，需手动级联）
+        cur.execute("DELETE FROM conversations WHERE session_id = %s", (session_id,))
+        # 再删会话
+        cur.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+        conn.commit()
+        return cur.rowcount
+
+
+def increment_session_message_count(session_id: str) -> None:
+    """会话消息数 +1，同时更新 updated_at"""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE sessions
+            SET message_count = message_count + 1, updated_at = NOW()
+            WHERE id = %s
+        """, (session_id,))
+        conn.commit()
+
+
+def decrement_session_message_count(session_id: str, count: int = 2) -> None:
+    """会话消息数 -count（不小于0），同时更新 updated_at"""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE sessions
+            SET message_count = GREATEST(0, message_count - %s),
+                updated_at = NOW()
+            WHERE id = %s
+        """, (count, session_id,))
+        conn.commit()
 
 
 # ================================================================
