@@ -33,3 +33,15 @@ logs/*.log
 # Model weights (downloaded separately)
 models/qwen-1_8b-chat/
 !models/README.md
+
+# Large binaries
+models/*.gguf
+models/*.7z
+models.7z
+
+# Packaging build artifacts
+packaging/dist/
+packaging/build/
+packaging/__pycache__/
+packaging/.venv-packaging/
+.venv-packaging/

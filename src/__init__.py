@@ -8,7 +8,7 @@
 - paged_kv_cache: 轻量化分页KV缓存
 - tcp_comm: TCP主从通信
 - scheduler: 任务调度控制
-- web_ui: Streamlit可视化平台
+- api_server: FastAPI 后端 + React 前端一体化服务
 """
 
 __version__ = "0.1.0"

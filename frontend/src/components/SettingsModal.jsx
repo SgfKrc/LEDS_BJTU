@@ -225,6 +225,39 @@ export default function SettingsModal({
             </div>
           </div>
 
+          {/* ======== 深度思考 ======== */}
+          <div className="sidebar-section">
+            <h3>🧠 深度思考</h3>
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-label">深度思考展示</div>
+                <div className="setting-desc">
+                  启用后，模型在回答前会展示推理过程。你可以在对话中展开「🧠 深度思考」折叠面板查看模型的思考逻辑。
+                  注意：思考过程会消耗额外的 Token 配额（约+256 tokens）。
+                </div>
+              </div>
+              <button
+                className={`setting-toggle-btn${settings.showThinking ? ' on' : ''}`}
+                onClick={() => onSettingsChange({ showThinking: !settings.showThinking })}
+                title={settings.showThinking ? '已启用 — 点击关闭' : '已关闭 — 点击启用'}
+              >
+                <span className="setting-toggle-track">
+                  <span
+                    className="setting-toggle-thumb"
+                    style={{
+                      transform: settings.showThinking ? 'translateX(22px)' : 'translateX(0)',
+                    }}
+                  />
+                </span>
+              </button>
+            </div>
+            {settings.showThinking && (
+              <div className="setting-hint">
+                ✅ 深度思考已启用。模型将在回答前展示推理过程，思考内容仅用于展示，不会进入对话历史。
+              </div>
+            )}
+          </div>
+
           {/* ======== 对话历史 ======== */}
           <div className="sidebar-section">
             <h3>💾 对话记录</h3>

@@ -24,8 +24,7 @@ bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容
 # socket, struct, threading, json — Python 内置
 
 # --- Web 可视化 ---
-streamlit>=1.30.0
-plotly>=5.18.0                   # 交互式图表
+# 注：Streamlit 已移除，统一使用 FastAPI + React 前端
 pandas>=2.0.0                    # 数据处理
 fastapi>=0.110.0                 # API 后端框架
 uvicorn[standard]>=0.29.0        # ASGI 服务器

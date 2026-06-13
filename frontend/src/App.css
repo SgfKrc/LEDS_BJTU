@@ -372,6 +372,70 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 .message.user .bubble { background: var(--accent-dim); border-color: var(--accent); }
 
+/* ---- 深度思考展示 ---- */
+.thinking-section {
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.thinking-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+}
+
+.thinking-toggle:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.thinking-toggle-icon {
+  font-size: 10px;
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+}
+
+.thinking-toggle-label {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.thinking-toggle-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: auto;
+  opacity: 0.7;
+}
+
+.thinking-content {
+  margin-top: 8px;
+  padding: 12px 14px;
+  background: rgba(99, 102, 241, 0.04);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
 .message .meta {
   font-size: 10px;
   color: var(--text-muted);
@@ -1383,6 +1447,14 @@ input:focus, textarea:focus { border-color: var(--accent); }
   background: #e0e0ff;
   border-color: var(--accent);
   color: #1a1a2e;
+}
+
+[data-theme="light"] .thinking-toggle:hover {
+  background: rgba(99, 102, 241, 0.06);
+}
+
+[data-theme="light"] .thinking-content {
+  background: rgba(99, 102, 241, 0.03);
 }
 
 [data-theme="light"] .gpu-toggle-btn.active {
@@ -2517,4 +2589,243 @@ input:focus, textarea:focus { border-color: var(--accent); }
 
 [data-theme="light"] .transfer-form {
   /* 继承根变量 */
+}
+
+/* ================================================================
+   会话列表 (SessionList)
+   ================================================================ */
+.session-list {
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 24px 6px;
+}
+
+.session-list-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.session-new-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+
+.session-new-btn:hover {
+  background: var(--accent-hover);
+}
+
+.session-list-items {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.session-list-empty {
+  padding: 16px 24px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 24px;
+  cursor: pointer;
+  transition: background 0.12s;
+  position: relative;
+  min-height: 36px;
+}
+
+.session-item:hover {
+  background: var(--bg-input);
+}
+
+.session-item.active {
+  background: var(--accent-dim);
+  border-left: 3px solid var(--accent);
+  padding-left: 21px;
+}
+
+.session-item-title {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.session-item-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.session-item-delete {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.session-item:hover .session-item-delete {
+  display: flex;
+}
+
+.session-item-delete:hover {
+  color: var(--danger);
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.session-item-rename-input {
+  flex: 1;
+  padding: 2px 6px;
+  font-size: 13px;
+  background: var(--bg-input);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text-primary);
+  outline: none;
+  min-width: 0;
+}
+
+/* 会话删除确认（inline） */
+.session-delete-confirm {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.session-delete-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.session-delete-btn.confirm {
+  background: var(--danger);
+  color: #fff;
+}
+
+.session-delete-btn.cancel {
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+}
+
+/* ================================================================
+   单轮消息删除按钮
+   ================================================================ */
+.message {
+  position: relative;
+}
+
+.message-delete-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+  z-index: 5;
+  line-height: 1;
+}
+
+.message:hover .message-delete-btn {
+  opacity: 1;
+}
+
+.message-delete-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* 删除确认覆盖层 */
+.delete-confirm-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  z-index: 10;
+  backdrop-filter: blur(2px);
+}
+
+.delete-confirm-text {
+  font-size: 12px;
+  color: #fff;
+}
+
+.delete-confirm-btn {
+  padding: 4px 12px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+}
+
+.delete-confirm-btn.confirm {
+  background: var(--danger);
+  color: #fff;
+}
+
+.delete-confirm-btn.cancel {
+  background: rgba(255, 255, 255, 0.15);
+  color: #ccc;
+}
+
+.delete-confirm-btn.cancel:hover {
+  background: rgba(255, 255, 255, 0.25);
 }

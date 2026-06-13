@@ -449,15 +449,16 @@ class DeviceProfiler:
         self._score = sum(self._score_breakdown.values())
         self._tier = self._classify_tier()
 
-        # 游戏本默认切回集显
-        if self.is_gaming_laptop and self._selected_gpu_index != 0:
-            igpu_idx = next((i for i, g in enumerate(self._gpus) if g.is_integrated), 0)
-            self.select_gpu(igpu_idx)
-            logger.info(
-                f"🎮 检测到游戏本（集显+独显混合），"
-                f"默认使用集显推理（{self._gpu.name}）。"
-                f"可在设备面板切换至独显。"
-            )
+        # 游戏本：检测到集显+独显混合，默认使用独显（CUDA 加速）
+        # 用户可在设备面板手动切换到集显以降低功耗
+        if self.is_gaming_laptop:
+            dgpu = next((g for g in self._gpus if not g.is_integrated and g.cuda_available), None)
+            igpu = next((g for g in self._gpus if g.is_integrated), None)
+            if dgpu and igpu:
+                logger.info(
+                    f"检测到游戏本: {igpu.name}（集显）+ {dgpu.name}（独显），"
+                    f"默认使用独显推理。可在设备面板切换至集显省电。"
+                )
 
     def _detect_cpu(self) -> CPUInfo:
         """检测 CPU 信息"""
@@ -538,20 +539,23 @@ class DeviceProfiler:
             return GPUInfo(name="CPU-only (无 GPU)", is_integrated=True, gpu_type="integrated")
 
         # 默认选择策略：
-        # - 游戏本（集显+独显混合且非工作站级）→ 默认选集显 (index 0)
-        # - 其他情况 → 选独显（最后一个 GPU，通常是性能更好的）
-        if self.is_gaming_laptop:
-            # 找集显的 index
-            igpu_idx = next((i for i, g in enumerate(self._gpus) if g.is_integrated), 0)
-            self._selected_gpu_index = igpu_idx
-        else:
-            # 默认选独显（通常是最后一个，性能最好）
-            dgpu_idx = next(
-                (i for i, g in reversed(list(enumerate(self._gpus)))
-                 if not g.is_integrated and g.cuda_available),
-                len(self._gpus) - 1
-            )
+        # - 有独显（CUDA）→ 优先选独显（最佳推理性能）
+        # - 游戏本（集显+独显混合）→ 默认选独显，用户可在设备面板切换到集显省电
+        # - 无独显 → 选集显 / CPU-only
+        dgpu_idx = next(
+            (i for i, g in enumerate(self._gpus)
+             if not g.is_integrated and g.cuda_available),
+            None,
+        )
+        if dgpu_idx is not None:
             self._selected_gpu_index = dgpu_idx
+        else:
+            # 无独显：选第一个集显或最后一个
+            igpu_idx = next(
+                (i for i, g in enumerate(self._gpus) if g.is_integrated),
+                len(self._gpus) - 1,
+            )
+            self._selected_gpu_index = igpu_idx
 
         self._gpu = self._gpus[self._selected_gpu_index]
         return self._gpu
@@ -579,12 +583,14 @@ class DeviceProfiler:
                     vram = round(props.total_memory / (1024 ** 3), 1)
 
                     # 判断独显还是集显
+                    # 注意：CUDA 路径仅检测 NVIDIA GPU，均为独显/独立 GPU
+                    # "mx" 不应在此列表中 — GeForce MX 系列（MX150/250/350）是独显
                     name_lower = name.lower()
-                    integrated_kw = ["mx", "intel", "radeon", "adreno", "mali",
+                    integrated_kw = ["intel", "radeon", "adreno", "mali",
                                      "iris", "uhd", "hd graphics"]
                     is_integrated = (
                         any(kw in name_lower for kw in integrated_kw)
-                        or vram <= 2.0
+                        or vram < 0.5  # VRAM < 0.5GB 才可能为虚拟/集显
                     )
 
                     free_mem = (props.total_memory - torch.cuda.memory_allocated(i)) / (1024 ** 3)
@@ -854,12 +860,12 @@ class DeviceProfiler:
 
         ram_gb = ram.total_gb if ram else 4.0
 
-        # 找到最强 GPU（独显+CUDA > 独显 > 集显+CUDA > 集显 > 无）
+        # 找到最强 GPU（独显 > 集显，按 VRAM 排序）
         best_gpu = None
         for g in sorted(self._gpus,
                         key=lambda g: (
-                            g.cuda_available and not g.is_integrated,
-                            not g.is_integrated,
+                            g.gpu_type == "discrete" or not g.is_integrated,
+                            g.cuda_available,
                             g.vram_total_gb,
                         ),
                         reverse=True):
@@ -867,7 +873,9 @@ class DeviceProfiler:
             break
 
         vram_gb = best_gpu.vram_total_gb if best_gpu else 0.0
-        has_dgpu = best_gpu and best_gpu.cuda_available and not best_gpu.is_integrated if best_gpu else False
+        # 独显判定：基于 GPU 物理类型（gpu_type/is_integrated），而非 PyTorch 是否编译了 CUDA
+        # CPU-only PyTorch 环境下 CUDA 不可用，但硬件独显仍然是独显
+        has_dgpu = best_gpu and (best_gpu.gpu_type == "discrete" or not best_gpu.is_integrated) if best_gpu else False
 
         # 规则 1: ARM + 极低 RAM → MOBILE
         if is_arm and ram_gb < 4.0:
@@ -933,8 +941,8 @@ class DeviceProfiler:
             igpu_name = self._gpu.name if self._gpu and self._gpu.is_integrated else "集显"
             dgpu_name = dgpu.name if dgpu else "独显"
             recs.append(
-                f"🎮 检测到游戏本：{igpu_name}（集显）+ {dgpu_name}（独显）\n"
-                f"   默认使用集显（CPU 推理），可在下方切换至独显（CUDA 加速）"
+                f"检测到游戏本：{igpu_name}（集显）+ {dgpu_name}（独显）\n"
+                f"   默认使用独显（CUDA 加速），可在下方切换至集显（低功耗）"
             )
         elif self.has_multiple_gpus:
             recs.append("🔄 检测到多个 GPU，可在下方切换")
@@ -982,24 +990,44 @@ class DeviceProfiler:
         ram = self._ram
         cpu = self._cpu
 
+        # 检测是否存在可用的独显（即使当前未选中）
+        _dgpu = None
+        for g in self._gpus:
+            if not g.is_integrated and g.cuda_available:
+                _dgpu = g
+                break
+
         # 基于当前选中 GPU 的警告
         if gpu and gpu.is_integrated and gpu.cuda_available:
-            warnings.append("⚠️ 当前使用集成显卡，推理速度可能较慢")
+            warnings.append("当前使用集成显卡（含 CUDA），推理速度可能较慢")
 
         if gpu and gpu.is_integrated and not gpu.cuda_available:
-            warnings.append("⚠️ 当前使用集显 / CPU 推理模式，速度约为 CUDA 的 1/5 ~ 1/10")
+            if _dgpu:
+                # 集显模式，但有独显可用 — 明确告知可切换
+                warnings.append(
+                    f"当前使用集显 ({gpu.name})，CPU 推理速度约为独显的 1/5。"
+                    f"可切换至独显 ({_dgpu.name}) 获得 CUDA 加速。"
+                )
+            else:
+                # 真·无独显
+                warnings.append("当前使用集显，CPU 推理速度约为 CUDA 的 1/5 ~ 1/10")
 
         if not gpu or (not gpu.cuda_available and not gpu.mps_available):
-            warnings.append("⚠️ 未检测到可用 GPU 加速器，将使用 CPU 推理")
+            if _dgpu:
+                # 已有第一条集显警告，此处不再重复
+                pass
+            else:
+                # 真·无任何加速器
+                warnings.append("未检测到 GPU 加速器，将使用 CPU 推理（可安装 llama.cpp + GGUF 加速）")
 
         if ram and ram.total_gb < 8.0:
-            warnings.append("⚠️ 系统内存不足 8 GB，大序列对话可能 OOM")
+            warnings.append("系统内存不足 8 GB，大序列对话可能 OOM")
 
         if cpu and cpu.physical_cores < 4:
-            warnings.append("⚠️ CPU 核心数不足 4，多线程推理受限")
+            warnings.append("CPU 核心数不足 4，多线程推理受限")
 
         if gpu and gpu.cuda_available and gpu.vram_total_gb < 2.0:
-            warnings.append("🔴 显存不足 2 GB，仅 INT4 量化可运行")
+            warnings.append("显存不足 2 GB，仅 INT4 量化可运行")
 
         # 游戏本切换警告
         if self.is_gaming_laptop and self._gpu and not self._gpu.is_integrated:

@@ -30,7 +30,6 @@
 │   ├── paged_kv_cache.py    # 轻量化分页KV缓存（内存页管理、动态分配）
 │   ├── tcp_comm.py          # TCP主从通信（长连接、心跳、封包解包、张量序列化）
 │   ├── scheduler.py         # 任务调度（节点状态管理、推理分发、流水线控制）
-│   └── web_ui.py            # Streamlit可视化平台（对话+监控+图表+对照实验）
 ├── frontend/                # React 前端（Vite + FastAPI 后端）
 │   └── src/
 │       ├── App.jsx          # 主布局 & 设置状态管理
@@ -56,11 +55,11 @@
 
 | 层级 | 功能 | 技术 |
 |------|------|------|
-| 应用层 | 可视化交互 & 性能监控 | React + FastAPI |
+| 应用层 | 可视化交互 & 性能监控 | React + FastAPI（已移除 Streamlit） |
 | 调度层 | 任务调度、指令分发、状态管理 | Python threading |
 | 通信层 | TCP长连接、粘包处理、心跳、序列化 | Python socket + torch.save |
-| 推理层 | 模型加载、量化、融合、KV缓存、前向计算 | PyTorch + Transformers |
-| 基础层 | 运行环境 | Python / CUDA / bitsandbytes |
+| 推理层 | 双引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU) |
+| 基础层 | 运行环境 | Python / CUDA / bitsandbytes / llama.cpp |
 
 ---
 
@@ -81,12 +80,16 @@
 |------|----------|------|
 | bitsandbytes | ≥ 0.45.0 | INT4/INT8 量化，Windows + CUDA 12.x 已支持 |
 
+### CPU/集显推理引擎（llama.cpp）
+
+| 依赖 | 版本要求 | 说明 |
+|------|----------|------|
+| llama-cpp-python | ≥ 0.3.0 | CPU 优化 GGUF 量化推理，3-5x 快于 PyTorch CPU |
+
 ### Web 可视化
 
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
-| streamlit | ≥ 1.30.0 | Web 可视化平台 |
-| plotly | ≥ 5.18.0 | 交互式图表 |
 | pandas | ≥ 2.0.0 | 数据处理 |
 | fastapi | ≥ 0.110.0 | API 后端框架 |
 | uvicorn[standard] | ≥ 0.29.0 | ASGI 服务器 |
@@ -148,9 +151,9 @@ huggingface-cli download Qwen/Qwen-1.8B-Chat --local-dir models/qwen-1_8b-chat
 
 ### 方式三：百度网盘（备用）
 
-> 📎 网盘链接：https://pan.baidu.com/s/1trocmWlmG3F1lOB6krIz4w
+> 📎 网盘链接：https://pan.baidu.com/s/1hAAaIN1Og-ZdeEHzxU-o4g?pwd=vtp3
 >
-> 提取码：t7qk
+> 提取码：vtp3
 
 下载后将所有文件放入 `models/qwen-1_8b-chat/` 目录即可。
 
@@ -206,27 +209,23 @@ python scripts/quantize_model.py --all --skip-copy
 #### 前端 + API 模式（推荐）
 
 ```bash
-# 终端 1：启动 FastAPI 后端
-cd src && uvicorn app:app --host 0.0.0.0 --port 8000
+# 开发模式 — 终端 1：启动 FastAPI 后端
+python -m uvicorn src.api_server:app --host 0.0.0.0 --port 8000
 
-# 终端 2：启动前端开发服务器
+# 开发模式 — 终端 2：启动前端开发服务器
 cd frontend && npm run dev
 ```
 
 浏览器打开 `http://localhost:5173` 即可使用。
 
-#### Streamlit 可视化模式
-
-```bash
-streamlit run src/web_ui.py
-```
+> **生产模式**：`npm run build` 构建前端后，FastAPI 在 8000 端口直接提供全部服务（无需 Vite）。
 
 #### 分布式模式（3台设备）
 
 **主节点（设备1）**：
 ```bash
-python src/scheduler.py           # 启动调度器 + TCP服务端
-streamlit run src/web_ui.py       # 启动可视化界面
+python src/scheduler.py                               # 启动调度器 + TCP服务端
+python -m uvicorn src.api_server:app --port 8000      # 启动 API + 前端
 ```
 
 **从节点1（设备2）**：
@@ -243,12 +242,33 @@ python src/tcp_comm.py --role client2  # 连接主节点，加载后半层
 
 ```bash
 # 修改 config.py: RUN_MODE = "single"
-streamlit run src/web_ui.py
+python -m uvicorn src.api_server:app --port 8000
 ```
 
 ---
 
+### 方式四：GGUF 量化模型（CPU/集显推荐）
+
+🔗 **GGUF 仓库**：[RichardErkhov/Qwen-1_8B-Chat-GGUF](https://huggingface.co/RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf)
+
+```bash
+# 下载推荐版本 Q4_K_M (~1.16 GB)
+huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
+  Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/
+```
+
+| 量化 | 大小 | 说明 |
+|------|------|------|
+| Q3_K_M | ~0.94 GB | 低质量，极限内存 |
+| **Q4_K_M** ⭐ | **~1.16 GB** | **推荐 — 速度/质量最佳平衡** |
+| Q5_K_M | ~1.31 GB | 更高质量 |
+| Q8_0 | ~1.82 GB | 近无损 |
+
+---
+
 ## 📊 量化效果（已验证）
+
+### CUDA 独显（PyTorch + bitsandbytes）
 
 > 测试环境: NVIDIA RTX GPU + CUDA 12.6 + PyTorch 2.12.0 + Qwen-1.8B-Chat (24层 Transformer)  
 > 统一 prompt，50 token 生成，3 轮取均值
@@ -262,6 +282,20 @@ streamlit run src/web_ui.py
 
 > INT4 相比 FP16: 显存 **-50%**，速度仍有 29 tok/s  
 > torch.compile 仅对 FP16 有效 (+3.6%)，INT4/INT8 下自动跳过（模型模块已内置保护）
+
+### CPU / 集显（llama.cpp + GGUF）
+
+> 测试环境: Intel i5-12400F / AMD R5 5600 + 16GB RAM + Windows 11  
+> Qwen-1.8B-Chat GGUF，Q4_K_M 量化
+
+| 引擎 | 量化 | 内存 | 推理速度 | 备注 |
+|------|------|------|----------|------|
+| PyTorch CPU | FP16 | ~3.5 GB | ~3 tok/s | 无 CUDA 回退 |
+| llama.cpp | Q4_K_M | ~1.2 GB | **~12 tok/s** | **推荐 CPU/集显** |
+| llama.cpp | Q5_K_M | ~1.4 GB | ~10 tok/s | 更高质量 |
+
+> **llama.cpp 相比 PyTorch CPU：内存 -65%，速度 +300%（3-5x）**  
+> 引擎选择由 `config.INFERENCE_ENGINE` 控制，默认 "auto" 自动检测 CUDA
 
 ---
 
