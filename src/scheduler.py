@@ -2020,6 +2020,8 @@ class Scheduler:
                                      max_new_tokens: int = 512,
                                      temperature: float = 0.7,
                                      top_p: float = 0.9,
+                                     show_thinking: bool = False,
+                                     session_id: str = None,
                                      timeout: float = 120.0) -> dict:
         """
         从节点将推理请求转发给主节点，并等待结果。
@@ -2031,6 +2033,8 @@ class Scheduler:
             max_new_tokens: 最大新 token 数
             temperature: 温度
             top_p: top_p
+            show_thinking: 是否启用深度思考展示
+            session_id: 会话 ID（多会话支持）
             timeout: 等待结果超时秒数
 
         Returns:
@@ -2055,6 +2059,8 @@ class Scheduler:
                 "max_new_tokens": max_new_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
+                "show_thinking": show_thinking,
+                "session_id": session_id,
             }
             tcp_client.send_data(infer_data, MessageType.INFER_FORWARD)
             logger.info(f"📤 推理请求已转发至主节点 (prompt_len={len(message)})")
@@ -2073,6 +2079,7 @@ class Scheduler:
                         "status": "ok",
                         "content": result.get("content", ""),
                         "metrics": result.get("metrics", {}),
+                        "followups": result.get("followups", []),
                     }
                 time.sleep(0.5)
 
@@ -2503,18 +2510,25 @@ class Scheduler:
             self._send_infer_result(client_id, "", "", {"error": str(e)})
 
     def _send_infer_result(self, client_id: str, task_id: str,
-                           content: str, metrics: dict = None) -> None:
+                           content: str, metrics: dict = None,
+                           thinking_content: str = None,
+                           followups: list = None) -> None:
         """向从节点回传推理结果"""
         if self._tcp_server and self._tcp_server._running:
             try:
                 from tcp_comm import MessageType
+                result_data = {
+                    "task_id": task_id,
+                    "content": content,
+                    "metrics": metrics or {},
+                }
+                if thinking_content:
+                    result_data["thinking_content"] = thinking_content
+                if followups:
+                    result_data["followups"] = followups
                 self._tcp_server.send_to_client(
                     client_id,
-                    {
-                        "task_id": task_id,
-                        "content": content,
-                        "metrics": metrics or {},
-                    },
+                    result_data,
                     msg_type=MessageType.INFER_RESULT,
                 )
             except Exception as e:
