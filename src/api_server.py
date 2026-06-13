@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from model_module import ModelManager
@@ -71,7 +72,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173",
+                   "http://localhost:8000", "http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -147,12 +149,30 @@ async def startup_device_detection():
 
 @app.on_event("shutdown")
 async def shutdown_db():
-    """应用关闭时清理数据库连接池"""
+    """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
+    # 1. 停止调度器（关闭 TCP 连接，注销从节点）
     try:
-        close_db()
+        scheduler.stop()
+        logger.info("调度器已停止")
+    except Exception as e:
+        logger.warning(f"调度器停止异常: {e}")
+
+    # 2. 关闭数据库连接池（线程超时防卡死）
+    import threading as _th
+
+    def _close_db_safe():
+        try:
+            close_db()
+        except Exception:
+            pass
+
+    _t = _th.Thread(target=_close_db_safe, daemon=True)
+    _t.start()
+    _t.join(timeout=3.0)
+    if _t.is_alive():
+        logger.warning("数据库连接池关闭超时（3s），跳过")
+    else:
         logger.info("数据库连接池已关闭")
-    except Exception:
-        pass
 
 
 # ============================================================
@@ -257,13 +277,15 @@ THINKING_END   = "【思考结束】"
 
 THINKING_SYSTEM_PROMPT = (
     "你是一个善于深度思考的AI助手。回答前先进行推理分析，再给出答案。\n\n"
-    "输出时严格遵循以下格式：\n"
+    "严格按以下格式输出：\n"
     "【思考】\n"
-    "【思考结束】\n\n"
-    "在【思考】和【思考结束】之间写推理过程（至少3句话）。\n"
-    "在【思考结束】之后直接写答案内容，不要加任何标题或前缀。\n"
-    "推理过程不要写代码或故事，这些只放在答案里。\n"
-    "必须输出【思考结束】标记。"
+    "（你的推理过程，2-3句话即可）\n"
+    "【思考结束】\n"
+    "（你的最终回答）\n\n"
+    "注意：\n"
+    "- 必须在【思考结束】之后写回答内容\n"
+    "- 回答部分不要写标记符号\n"
+    "- 不要重复输出【思考】或【思考结束】"
 )
 
 
@@ -278,53 +300,76 @@ def _parse_thinking_response(text: str) -> tuple:
         【思考结束】
         (最终答案)
 
+    本函数对各种格式错误具有容错能力：
+    - 缺少结束标记 → 尝试智能分割
+    - 答案为空 → 从思考中提取最后一段作为答案
+    - 重复标记 → 使用第一次出现的有效标记对
+
     Args:
-        text: 模型原始输出文本
+        text: 模型原始输出文本（已包含预填的【思考】前缀）
 
     Returns:
         (answer_content, thinking_content)
-        - answer_content: 最终答案文本
+        - answer_content: 最终答案文本（绝不包含思考标记）
         - thinking_content: 思考过程文本，格式不匹配时为 None
     """
-    if not text:
-        return text, None
+    import re as _re
 
+    if not text:
+        return "", None
+
+    # ---- 查找标记位置 ----
     start_idx = text.find(THINKING_START)
     end_idx = text.find(THINKING_END)
 
-    # 标记必须成对出现且顺序正确
-    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-        return text, None
+    # ---- 情况1：标记成对且顺序正确 ----
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        thinking = text[start_idx + len(THINKING_START):end_idx].strip()
+        answer = text[end_idx + len(THINKING_END):].strip()
 
-    # 提取思考内容（标记之间的部分）
-    thinking = text[start_idx + len(THINKING_START):end_idx].strip()
+        # 清理思考中的标题前缀
+        thinking = _re.sub(r'^分析思路[：:]\s*', '', thinking)
 
-    # 提取最终答案（结束标记之后的部分）
-    answer = text[end_idx + len(THINKING_END):].strip()
+        # 清理答案开头的标题前缀
+        answer = _re.sub(r'^【最终答案】[：:]?\s*', '', answer)
+        answer = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', answer, flags=_re.IGNORECASE)
+        for _pat in [r'^\[你的最终回答[^\]]*\]\s*', r'^\[你的推理过程[^\]]*\]\s*',
+                     r'^（推理内容）\s*', r'^（答案内容）\s*',
+                     r'^（给用户的答案[^）]*）\s*']:
+            answer = _re.sub(_pat, '', answer)
 
-    # 清理模型可能输出的标题前缀
-    import re as _re
-    # 去除开头的「分析思路：」等 prefill 残余
-    thinking = _re.sub(r'^分析思路[：:]\s*', '', thinking)
-    # 去除答案开头的「【最终答案】」「最终答案：」「回答：」等标题
-    answer = _re.sub(r'^【最终答案】[：:]??\s*', '', answer)
-    answer = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', answer, flags=_re.IGNORECASE)
-    # 去除答案开头的占位符行（模型照抄系统提示词的情况）
-    for _pat in [r'^\[你的最终回答[^\]]*\]\s*', r'^\[你的推理过程[^\]]*\]\s*',
-                 r'^（推理内容）\s*', r'^（答案内容）\s*',
-                 r'^（给用户的答案[^）]*）\s*']:
-        answer = _re.sub(_pat, '', answer)
+        # 清理答案中残留的思考标记（模型可能在答案里又输出了标记）
+        answer = answer.replace(THINKING_START, "").replace(THINKING_END, "").strip()
 
-    # 开始标记之前可能还有模型输出的内容，拼入答案
-    prefix = text[:start_idx].strip()
-    if prefix:
-        answer = prefix + ("\n" + answer if answer else "")
+        # 开始标记之前的内容拼入答案
+        prefix = text[:start_idx].strip()
+        if prefix:
+            answer = prefix + ("\n" + answer if answer else "")
 
-    # 思考内容为空视为未遵循格式
-    if not thinking:
-        return text, None
+        # 思考内容为空 → 格式未遵循，fallthrough 到情况2
+        if thinking:
+            # 如果答案为空但思考非空 → 尝试从思考中提取最后一段作为答案
+            # 1.8B 模型常见失败模式：把所有内容都放在思考里，答案留空
+            if not answer and thinking:
+                paragraphs = thinking.split("\n")
+                # 取最后一段非空内容作为答案
+                for p in reversed(paragraphs):
+                    p = p.strip()
+                    if p and len(p) > 10:
+                        answer = p
+                        break
+                # 如果还是空，用整个思考作为答案
+                if not answer:
+                    answer = thinking
+            return answer, thinking
 
-    return answer, thinking
+    # ---- 情况2：格式未遵循（缺少标记或标记顺序错误） ----
+    # 清理所有思考标记，返回干净的文本作为答案
+    cleaned = text.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+    # 清理常见的标题前缀
+    cleaned = _re.sub(r'^分析思路[：:]\s*', '', cleaned)
+    cleaned = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', cleaned, flags=_re.IGNORECASE)
+    return cleaned, None
 
 
 # ================================================================
@@ -546,6 +591,81 @@ def _generate_followups(history: list[dict], tokenizer, model, device) -> list[s
     return questions[:3]
 
 
+def _generate_followups_llama(history: list[dict]) -> list[str]:
+    """
+    使用 llama.cpp 引擎生成追问建议。
+
+    通过 model_manager.chat() 调用（llama.cpp 路径），
+    使用简化的 few-shot prompt 适配小模型能力。
+    失败时回退到关键词模板兜底。
+    """
+    if not history or len(history) < 2:
+        return []
+
+    # 简化版 prompt：直接要求输出问题，不需要 Q: 前缀格式
+    system_prompt = (
+        "根据对话内容，生成2-3个你会追问的问题。每个问题一行，以？结尾。"
+    )
+    followup_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"根据以下对话，生成我想追问的问题：\n"
+         f"用户：{history[-2]['content'][:200]}\n"
+         f"助手：{history[-1]['content'][:300]}"},
+    ]
+
+    questions = []
+    try:
+        result = model_manager.chat(
+            messages=followup_messages,
+            max_tokens=128,
+            temperature=0.8,
+            top_p=0.9,
+        )
+        text = result.get("content", "").strip()
+
+        # 解析：每行一个追问
+        for line in text.split("\n"):
+            line = line.strip()
+            # 清理编号前缀
+            line = re.sub(r'^[\d]+[\.\、\)）\s\-]+', '', line).strip()
+            # 清理 Q: 前缀
+            if line.upper().startswith("Q:") or line.upper().startswith("Q："):
+                line = line.split(":", 1)[-1].split("：", 1)[-1].strip()
+            if line and len(line) >= 5 and len(line) <= 80 and _is_question(line):
+                questions.append(line)
+
+        # 质量过滤（同 _generate_followups）
+        hallucination_patterns = [
+            "通义千问", "千问", "ChatGPT", "Claude", "GPT-", "文心一言",
+            "讯飞星火", "豆包", "Kimi", "Copilot", "Bard", "Gemini",
+            "百川", "智谱", "ChatGLM", "混元",
+        ]
+        questions = [q for q in questions if not any(p in q for p in hallucination_patterns)]
+
+        # 去重
+        filtered = []
+        seen = set()
+        for q in questions:
+            key = q[:15]
+            if key not in seen:
+                seen.add(key)
+                filtered.append(q)
+        questions = filtered
+
+        logger.info(f"llama.cpp 追问生成: {len(questions)} 条 → {questions}")
+
+    except Exception as e:
+        logger.warning(f"llama.cpp 追问生成失败（非致命）: {e}")
+        questions = []
+
+    # 模板兜底
+    if len(questions) < 2:
+        fallback = _fallback_followups(history, questions)
+        questions = fallback
+
+    return questions[:3]
+
+
 def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
     """
     基于对话关键词匹配的追问模板兜底。
@@ -563,68 +683,107 @@ def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
 
     combined = (last_user + " " + last_assistant).lower()
 
-    # 关键词 → 追问模板映射
+    # 关键词 → 追问模板映射（按优先级排序，更具体的匹配在前）
     templates = []
 
     if any(kw in combined for kw in ["量化", "quant", "int4", "int8", "fp16", "精度"]):
         templates.extend([
             "INT4和INT8量化在实际应用中如何选择？",
             "量化会对模型推理能力造成多大影响？",
+            "除了量化还有哪些模型压缩方法？",
         ])
 
     if any(kw in combined for kw in ["边缘计算", "边缘", "edge", "分布式", "推理"]):
         templates.extend([
             "边缘推理和云端推理各有什么优缺点？",
             "分布式推理中的通信开销如何优化？",
+            "边缘设备的算力瓶颈通常在哪里？",
         ])
 
-    if any(kw in combined for kw in ["python", "代码", "编程", "写一个", "函数"]):
+    if any(kw in combined for kw in ["python", "代码", "编程", "写一个", "函数", "算法"]):
         templates.extend([
             "这段代码的时间复杂度是多少？",
             "有没有更高效的实现方式？",
+            "能解释一下这段代码的核心逻辑吗？",
         ])
 
     if any(kw in combined for kw in ["模型", "训练", "微调", "lora", "参数"]):
         templates.extend([
             "这个模型的训练数据来源是什么？",
             "如何在特定领域数据上微调模型？",
+            "LoRA微调相比全参数微调有哪些优势？",
         ])
 
     if any(kw in combined for kw in ["transformer", "注意力", "attention", "架构"]):
         templates.extend([
             "Transformer相比RNN有哪些优势？",
             "自注意力机制的计算复杂度如何？",
+            "多头注意力的作用是什么？",
         ])
 
     if any(kw in combined for kw in ["token", "tokenizer", "分词", "词表"]):
         templates.extend([
             "不同的分词方法对模型性能有影响吗？",
             "中文分词和英文分词的主要区别是什么？",
+            "BPE分词算法的原理是什么？",
         ])
 
     if any(kw in combined for kw in ["显存", "gpu", "内存", "oom", "优化", "加速"]):
         templates.extend([
             "还有哪些降低推理显存占用的方法？",
             "CPU推理在什么场景下比GPU更合适？",
+            "KV Cache的显存占用如何估算？",
         ])
 
     if any(kw in combined for kw in ["应用", "场景", "实际", "落地", "工业"]):
         templates.extend([
             "当前这个技术还有哪些落地挑战？",
             "业界有哪些成功的应用案例可以参考？",
+            "这项技术的商业化前景如何？",
         ])
 
     if any(kw in combined for kw in ["hello", "你好", "介绍", "你是谁", "能做什么"]):
         templates.extend([
             "你能帮我写代码吗？",
             "你的知识截止到什么时候？",
+            "你擅长哪些类型的任务？",
         ])
 
-    # 默认通用追问
+    if any(kw in combined for kw in ["学习", "入门", "新手", "教程", "怎么学"]):
+        templates.extend([
+            "有哪些推荐的学习资源或课程？",
+            "学习这个需要什么前置知识？",
+            "从入门到精通大概需要多久？",
+        ])
+
+    if any(kw in combined for kw in ["区别", "对比", "比较", "不同", "差异", "选择"]):
+        templates.extend([
+            "在选择时应该考虑哪些关键因素？",
+            "有没有具体的场景举例说明？",
+            "未来哪个方向更有发展前景？",
+        ])
+
+    if any(kw in combined for kw in ["安全", "隐私", "加密", "攻击", "漏洞"]):
+        templates.extend([
+            "这种攻击的防御措施有哪些？",
+            "业界有哪些典型的安全事件？",
+            "如何在性能和安全性之间平衡？",
+        ])
+
+    if any(kw in combined for kw in ["数据", "dataset", "数据集", "预处理", "清洗"]):
+        templates.extend([
+            "数据质量对模型效果的影响有多大？",
+            "有哪些常用的数据增强方法？",
+            "如何处理数据中的类别不平衡问题？",
+        ])
+
+    # 默认通用追问（更智能的追问）
     default_templates = [
         "能再详细解释一下吗？",
-        "这个结论有什么前提条件？",
-        "有没有相关的参考资料可以推荐？",
+        "这个结论有什么前提条件或局限性？",
+        "有没有相关的参考资料或论文推荐？",
+        "实际应用中需要注意哪些细节？",
+        "能举一个具体的例子说明吗？",
     ]
 
     # 选择不重复的追问
@@ -976,7 +1135,7 @@ async def select_gpu(req: SelectGpuRequest):
     在集显（CPU 推理）和独显（CUDA）之间切换。
     切换后需要重新加载模型才能生效。
 
-    游戏本默认使用集显（低功耗），用户可手动切换到独显。
+    游戏本默认使用独显（CUDA 加速），用户可手动切换到集显（低功耗）。
     """
     global device_profile, model_loaded
 
@@ -1140,11 +1299,16 @@ async def load_model(req: LoadModelRequest):
     try:
         t0 = time.time()
 
-        # 卸载旧模型
-        if model_manager.model is not None:
+        # 卸载旧模型（双引擎兼容）
+        if model_manager.is_loaded:
             logger.info("卸载旧模型...")
-            model_manager.model = None
-            model_manager.tokenizer = None
+            if model_manager._engine_type == "llama_cpp" and model_manager._llama_engine:
+                model_manager._llama_engine.unload()
+                model_manager._llama_engine = None
+            elif model_manager.model is not None:
+                model_manager.model = None
+                model_manager.tokenizer = None
+            model_manager._engine_type = ""
             if kv_cache:
                 kv_cache.clear()
             kv_cache = None
@@ -1215,7 +1379,7 @@ async def chat(req: ChatRequest):
     """
     global kv_cache, conversation_stats
 
-    if not model_loaded or model_manager.model is None:
+    if not model_loaded or not model_manager.is_loaded:
         raise HTTPException(400, "模型未加载，请先在控制面板中选择并加载模型")
 
     # ---- 多会话支持：确定目标会话并切换（分布式 & 本地共用） ----
@@ -1246,12 +1410,50 @@ async def chat(req: ChatRequest):
                 history.append({"role": "user", "content": req.message})
                 response_text = result.get("content", "")
                 history.append({"role": "assistant", "content": response_text})
+
+                # 持久化到数据库
+                db_session_id = target_session_id or "default"
+                if _db_available:
+                    try:
+                        import db as _db_mod
+                        if _db_mod.get_save_history():
+                            _db_mod.save_message(db_session_id, "user", req.message)
+                            _db_mod.save_message(db_session_id, "assistant", response_text,
+                                                {"engine": "distributed"})
+                            _db_mod.increment_session_message_count(db_session_id)
+                    except Exception:
+                        pass
+
+                # 累计对话统计
+                conversation_stats["rounds"] += 1
+
+                # 更新调度器任务计数（后台管理面板显示）
+                try:
+                    scheduler.record_task_complete(success=True)
+                except Exception:
+                    pass
+
+                # 生成追问建议（优先主节点返回的，否则本地模型生成）
+                master_followups = result.get("followups", [])
+                if master_followups:
+                    followups = master_followups[:3]
+                elif model_manager._engine_type == "llama_cpp":
+                    followups = _generate_followups_llama(history)
+                elif model_manager._engine_type == "pytorch":
+                    try:
+                        followups = _generate_followups(
+                            history, model_manager.tokenizer,
+                            model_manager.model, model_manager.get_device()
+                        )
+                    except Exception:
+                        followups = _fallback_followups(history, [])
+                else:
+                    followups = _fallback_followups(history, [])
+
                 return ChatResponse(
-                    response=response_text,
-                    model=model_name,
-                    tokens=len(response_text),
-                    tokens_per_sec=0,
-                    followups=[],
+                    content=response_text,
+                    metrics={"engine": "distributed"},
+                    followups=followups,
                 )
             elif result.get("status") == "disconnected":
                 logger.warning("分布式推理转发失败（未连接主节点），回退到本地推理")
@@ -1262,6 +1464,69 @@ async def chat(req: ChatRequest):
         except Exception as e:
             logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
 
+    # ---- llama.cpp 引擎路径（CPU/集显，GGUF）----
+    if model_manager._engine_type == "llama_cpp":
+        try:
+            history.append({"role": "user", "content": req.message})
+            result = model_manager.chat(
+                messages=list(history),
+                max_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+            )
+            response_text = result.get("content", "")
+            history.append({"role": "assistant", "content": response_text})
+            tokens_per_sec = result.get("tokens_per_second", 0)
+            usage = result.get("usage", {})
+            completion_tokens = usage.get("completion_tokens", 0)
+
+            # 持久化到数据库（受 save_history 开关控制）
+            db_session_id = target_session_id or "default"
+
+            # 生成追问建议（在 DB 保存之前，以便持久化到 metrics 中）
+            followups = _generate_followups_llama(history)
+
+            if _db_available:
+                try:
+                    import db as _db_mod
+                    if _db_mod.get_save_history():
+                        _db_mod.save_message(db_session_id, "user", req.message)
+                        _db_mod.save_message(db_session_id, "assistant", response_text,
+                                            {"engine": "llama.cpp", "tokens_per_sec": round(tokens_per_sec, 1),
+                                             "completion_tokens": completion_tokens,
+                                             "followups": followups})
+                        _db_mod.increment_session_message_count(db_session_id)
+                except Exception:
+                    pass
+
+            # 累计对话统计
+            conversation_stats["total_generated_tokens"] += completion_tokens
+            conversation_stats["rounds"] += 1
+
+            # 更新调度器任务计数（后台管理面板显示）
+            try:
+                scheduler.record_task_complete(success=True)
+            except Exception:
+                pass
+
+            return ChatResponse(
+                content=response_text,
+                metrics={
+                    "engine": "llama.cpp",
+                    "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                    "completion_tokens": completion_tokens,
+                },
+                followups=followups,
+            )
+        except Exception as e:
+            try:
+                scheduler.record_task_error()
+            except Exception:
+                pass
+            logger.error(f"llama.cpp 推理失败: {e}")
+            raise HTTPException(500, f"推理失败: {str(e)}")
+
+    # ---- PyTorch 引擎路径（CUDA/独显）----
     try:
         # 更新生成配置（应用设备档位上限，取请求值与档位值的较小者）
         tier_max = generation_config.get("tier_max_new_tokens", generation_config["max_new_tokens"])
@@ -1315,9 +1580,7 @@ async def chat(req: ChatRequest):
         if req.show_thinking:
             parsed_text = "【思考】\n" + raw_text
             response_text, thinking_content = _parse_thinking_response(parsed_text)
-            # 模型未遵循格式（缺少【思考结束】）时，直接用原始输出，避免 prefill 标记泄露
-            if thinking_content is None:
-                response_text = raw_text.strip()
+            # 解析器已做清洗：answer 绝不包含思考标记；thinking_content=None 时 response_text 已清理
         else:
             response_text = raw_text
 
@@ -1340,12 +1603,21 @@ async def chat(req: ChatRequest):
 
         # 持久化到数据库（受 save_history 开关控制）
         db_session_id = target_session_id or "default"
+
+        # 生成追问建议（在 DB 保存之前，以便持久化）
+        followups = _generate_followups(
+            history, tokenizer, model_manager.model, model_manager.get_device()
+        )
+
         if _db_available:
             try:
                 import db as _db_mod
                 if _db_mod.get_save_history():
                     _db_mod.save_message(db_session_id, "user", req.message)
-                    _db_mod.save_message(db_session_id, "assistant", response_text, metrics)
+                    # 将 followups 嵌入 metrics，确保切换会话后能够恢复
+                    save_metrics = dict(metrics)
+                    save_metrics["followups"] = followups
+                    _db_mod.save_message(db_session_id, "assistant", response_text, save_metrics)
                     _db_mod.increment_session_message_count(db_session_id)
             except Exception:
                 pass
@@ -1364,11 +1636,6 @@ async def chat(req: ChatRequest):
 
         logger.info(
             f"推理完成: {new_tokens} tokens / {elapsed:.2f}s = {tokens_per_sec:.1f} tok/s"
-        )
-
-        # 生成追问建议（非阻塞，如失败则返回空列表不影响主流程）
-        followups = _generate_followups(
-            history, tokenizer, model_manager.model, model_manager.get_device()
         )
 
         return ChatResponse(
@@ -2310,10 +2577,34 @@ async def database_health():
 
 
 # ============================================================
+# 生产模式：挂载 React 前端静态文件
+# ============================================================
+# 构建前端: cd frontend && npm run build （输出到 frontend/dist/）
+# 生产模式下 FastAPI 在 8000 端口直接提供全部服务（无需 Vite dev server）
+# 开发模式下 dist 目录不存在，跳过挂载，使用 Vite proxy 模式
+
+# PyInstaller 打包后前端文件在 sys._MEIPASS/frontend/dist/ 下
+if getattr(sys, 'frozen', False):
+    _frontend_dist = os.path.join(sys._MEIPASS, "frontend", "dist")
+else:
+    _frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist")
+
+if os.path.isdir(_frontend_dist):
+    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
+    logger.info(f"前端静态文件已挂载: {_frontend_dist}")
+else:
+    logger.info("前端 dist 目录未找到，使用纯 API 模式（开发时由 Vite 提供前端）")
+
+# ============================================================
 # 启动入口
 # ============================================================
 
 if __name__ == "__main__":
     import uvicorn
+
+    # 启动前检查模型文件（静默模式，仅日志提示）
+    from model_downloader import ensure_model_or_warn
+    ensure_model_or_warn()
+
     logger.info("启动 API 服务器...")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

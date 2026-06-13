@@ -2079,6 +2079,7 @@ class Scheduler:
                         "status": "ok",
                         "content": result.get("content", ""),
                         "metrics": result.get("metrics", {}),
+                        "followups": result.get("followups", []),
                     }
                 time.sleep(0.5)
 
@@ -2510,7 +2511,8 @@ class Scheduler:
 
     def _send_infer_result(self, client_id: str, task_id: str,
                            content: str, metrics: dict = None,
-                           thinking_content: str = None) -> None:
+                           thinking_content: str = None,
+                           followups: list = None) -> None:
         """向从节点回传推理结果"""
         if self._tcp_server and self._tcp_server._running:
             try:
@@ -2522,6 +2524,8 @@ class Scheduler:
                 }
                 if thinking_content:
                     result_data["thinking_content"] = thinking_content
+                if followups:
+                    result_data["followups"] = followups
                 self._tcp_server.send_to_client(
                     client_id,
                     result_data,

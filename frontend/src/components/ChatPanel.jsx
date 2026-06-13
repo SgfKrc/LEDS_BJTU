@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { sendMessage, clearChat, fetchPresets, uploadFile, fetchConversations, deleteConversations, deleteTurn, deleteSession, createSession } from '../api/client';
+import { sendMessage, clearChat, fetchPresets, uploadFile, fetchConversations, deleteConversations, deleteTurn, deleteSession, createSession, activateSession } from '../api/client';
 
 const CHAT_HISTORY_KEY_PREFIX = 'qlh-chat-history-';
 
@@ -108,7 +108,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
 
     const loadHistory = async () => {
       console.log('[ChatPanel] history-loading: fetch start', { sessionId, storageKey });
-      // 优先从服务器（数据库）加载
+      // ★ 先同步后端活跃会话状态（确保 session_histories 中已加载该会话）
+      try {
+        await activateSession(sessionId);
+      } catch (_) {
+        // 非致命：后端不可用时仍可从 localStorage 加载
+      }
+      // 再从服务器（数据库 / 后端内存）加载完整历史（含 metrics/followups）
       try {
         const res = await fetchConversations(sessionId);
         console.log('[ChatPanel] history-loading: server response', {
@@ -118,12 +124,22 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           source: res?.source,
         });
         if (!cancelled && res?.messages?.length > 0) {
-          const msgs = res.messages.map((m, i) => ({
-            role: m.role,
-            content: m.content,
-            id: Date.now() - res.messages.length + i,
-            metrics: m.role === 'assistant' && i === res.messages.length - 1 ? null : null,
-          }));
+          // 从 DB 加载的消息中恢复 followups（保存在最后一条 assistant 的 metrics.followups 中）
+          let savedFollowups = null;
+          const lastAssistantMsg = [...res.messages].reverse().find(m => m.role === 'assistant');
+          if (lastAssistantMsg?.metrics?.followups) {
+            savedFollowups = lastAssistantMsg.metrics.followups;
+          }
+          const msgs = res.messages.map((m, i) => {
+            const isLastAssistant = m.role === 'assistant' && i === res.messages.length - 1;
+            return {
+              role: m.role,
+              content: m.content,
+              id: Date.now() - res.messages.length + i,
+              metrics: isLastAssistant ? (m.metrics || null) : null,
+              followups: isLastAssistant ? (savedFollowups || []) : undefined,
+            };
+          });
           if (!cancelled) {
             console.log('[ChatPanel] history-loading: SET messages from server', { count: msgs.length, firstRole: msgs[0]?.role });
             setMessages(msgs);

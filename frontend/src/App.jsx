@@ -26,12 +26,12 @@ export const TIER_LABELS = {
 
 // 默认设置（无设备档位时使用）
 const DEFAULT_SETTINGS = {
-  saveHistory: false,
+  saveHistory: true,             // 对话历史云端持久化：默认开启，确保跨设备数据共享
   maxNewTokens: 512,
   temperature: 0.7,
   topP: 0.9,
   distributedInference: true,  // 分布式推理：主节点默认开启，从节点从服务端同步
-  cloudSync: false,            // 云同步设置偏好：默认关闭，需手动开启
+  cloudSync: true,             // 云同步设置偏好：默认开启，确保跨设备设置一致
   showThinking: false,         // 深度思考展示：默认关闭
 };
 

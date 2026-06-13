@@ -873,10 +873,10 @@ def set_user_settings(settings: dict) -> None:
 # ================================================================
 
 def get_save_history() -> bool:
-    """读取对话历史保存开关（默认 False）"""
+    """读取对话历史保存开关（默认 True — 云端持久化开启）"""
     val = get_config("save_history", "")
     if val == "":
-        return False
+        return True  # 默认开启，确保跨设备数据共享
     return val.lower() == "true"
 
 
