@@ -142,7 +142,10 @@ async def startup_device_detection():
     # 初始化数据库连接
     try:
         init_db()
-        logger.info("数据库已连接")
+        # ★ 设置数据隔离参数：conversations/sessions 将按 node_id 过滤
+        from db import set_active_node_id
+        set_active_node_id(scheduler.get_effective_node_id())
+        logger.info(f"数据库已连接，活跃节点: {scheduler.get_effective_node_id()}")
     except Exception as e:
         logger.warning(f"数据库初始化失败（使用内存降级）: {e}")
 

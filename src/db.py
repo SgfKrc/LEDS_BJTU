@@ -79,6 +79,24 @@ def get_pool() -> pool.ThreadedConnectionPool:
         return _connection_pool
 
 
+# ================================================================
+# 活跃节点 ID（用于数据隔离）
+# 由 api_server 在启动时调用 set_active_node_id() 设置
+# ================================================================
+_active_node_id: str = "master"
+
+
+def set_active_node_id(node_id: str) -> None:
+    """设置当前活跃节点 ID，用于 conversations/sessions 数据隔离"""
+    global _active_node_id
+    _active_node_id = node_id or "master"
+    logger.info(f"活跃节点 ID: {_active_node_id}")
+
+
+def get_active_node_id() -> str:
+    return _active_node_id
+
+
 def _ensure_database() -> None:
     """确保目标数据库存在，不存在则创建"""
     try:
@@ -136,6 +154,7 @@ def _init_schema() -> None:
                 content       TEXT NOT NULL,
                 metrics       JSONB DEFAULT '{}',
                 file_context  JSONB DEFAULT NULL,
+                node_id       VARCHAR(64) NOT NULL DEFAULT 'master',
                 created_at    TIMESTAMP DEFAULT NOW()
             )
         """)
@@ -143,6 +162,20 @@ def _init_schema() -> None:
             CREATE INDEX IF NOT EXISTS idx_conv_session
             ON conversations(session_id, created_at)
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conv_node
+            ON conversations(node_id, created_at)
+        """)
+
+        # 低风险迁移：为新部署添加 node_id，旧部署已有则忽略
+        try:
+            cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS node_id VARCHAR(64) NOT NULL DEFAULT 'master'")
+        except Exception:
+            conn.rollback()
+        try:
+            cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS node_id VARCHAR(64) NOT NULL DEFAULT 'master'")
+        except Exception:
+            conn.rollback()
 
         # ---- 集群配置表（键值对） ----
         cur.execute("""
@@ -158,10 +191,15 @@ def _init_schema() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 id            VARCHAR(64) PRIMARY KEY,
                 title         VARCHAR(256) NOT NULL DEFAULT '新对话',
+                node_id       VARCHAR(64) NOT NULL DEFAULT 'master',
                 created_at    TIMESTAMP DEFAULT NOW(),
                 updated_at    TIMESTAMP DEFAULT NOW(),
                 message_count INTEGER NOT NULL DEFAULT 0
             )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_node
+            ON sessions(node_id, updated_at DESC)
         """)
 
         conn.commit()
@@ -288,13 +326,14 @@ def save_message(session_id: str, role: str, content: str,
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            INSERT INTO conversations (session_id, role, content, metrics, file_context)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO conversations (session_id, role, content, metrics, file_context, node_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             session_id, role, content,
             json.dumps(metrics or {}),
             json.dumps(file_context) if file_context else None,
+            _active_node_id,
         ))
         conn.commit()
         row = cur.fetchone()
@@ -312,16 +351,16 @@ def save_message(session_id: str, role: str, content: str,
 
 def get_conversation(session_id: str = "default",
                      limit: int = 200) -> list[dict]:
-    """获取指定会话的对话历史（最近 N 条）"""
+    """获取指定会话的对话历史（最近 N 条，仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT id, session_id, role, content, metrics, file_context, created_at
             FROM conversations
-            WHERE session_id = %s
+            WHERE session_id = %s AND node_id = %s
             ORDER BY created_at ASC
             LIMIT %s
-        """, (session_id, limit))
+        """, (session_id, _active_node_id, limit))
         rows = cur.fetchall()
         result = []
         for r in rows:
@@ -337,24 +376,24 @@ def get_conversation(session_id: str = "default",
 
 
 def clear_conversation(session_id: str = "default") -> int:
-    """清空指定会话的对话历史，返回删除条数"""
+    """清空指定会话的对话历史（仅本节点），返回删除条数"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "DELETE FROM conversations WHERE session_id = %s",
-            (session_id,)
+            "DELETE FROM conversations WHERE session_id = %s AND node_id = %s",
+            (session_id, _active_node_id)
         )
         conn.commit()
         return cur.rowcount
 
 
 def get_conversation_count(session_id: str = "default") -> int:
-    """获取会话消息条数"""
+    """获取会话消息条数（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) FROM conversations WHERE session_id = %s",
-            (session_id,)
+            "SELECT COUNT(*) FROM conversations WHERE session_id = %s AND node_id = %s",
+            (session_id, _active_node_id)
         )
         return cur.fetchone()[0]
 
@@ -383,8 +422,8 @@ def delete_message_range(session_id: str, turn_index: int) -> int:
             WHERE id IN (
                 SELECT id FROM ordered
                 WHERE rn IN (%s, %s)
-            )
-        """, (session_id, 2 * turn_index, 2 * turn_index + 1))
+            ) AND node_id = %s
+        """, (session_id, 2 * turn_index, 2 * turn_index + 1, _active_node_id))
         conn.commit()
         return cur.rowcount
 
@@ -394,16 +433,17 @@ def delete_message_range(session_id: str, turn_index: int) -> int:
 # ================================================================
 
 def create_session(session_id: str, title: str = "新对话") -> dict:
-    """创建新会话记录"""
+    """创建新会话记录（关联到当前节点）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            INSERT INTO sessions (id, title)
-            VALUES (%s, %s)
+            INSERT INTO sessions (id, title, node_id)
+            VALUES (%s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
-                updated_at = NOW()
+                updated_at = NOW(),
+                node_id = EXCLUDED.node_id
             RETURNING *
-        """, (session_id, title))
+        """, (session_id, title, _active_node_id))
         conn.commit()
         row = cur.fetchone()
         d = dict(row) if row else {}
@@ -415,14 +455,15 @@ def create_session(session_id: str, title: str = "新对话") -> dict:
 
 
 def get_all_sessions(limit: int = 50, offset: int = 0) -> list[dict]:
-    """获取所有会话列表（按 updated_at DESC 排序）"""
+    """获取本节点的所有会话列表（按 updated_at DESC 排序）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT * FROM sessions
+            WHERE node_id = %s
             ORDER BY updated_at DESC
             LIMIT %s OFFSET %s
-        """, (limit, offset))
+        """, (_active_node_id, limit, offset))
         rows = cur.fetchall()
         result = []
         for r in rows:
@@ -452,10 +493,10 @@ def get_session(session_id: str) -> Optional[dict]:
 
 
 def get_session_count() -> int:
-    """获取会话总数"""
+    """获取本节点会话总数"""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM sessions")
+        cur.execute("SELECT COUNT(*) FROM sessions WHERE node_id = %s", (_active_node_id,))
         return cur.fetchone()[0]
 
 
@@ -488,10 +529,12 @@ def delete_session(session_id: str) -> int:
     """
     with get_conn() as conn:
         cur = conn.cursor()
-        # 先删消息（外键未定义，需手动级联）
-        cur.execute("DELETE FROM conversations WHERE session_id = %s", (session_id,))
+        # 先删消息（仅本节点，防止误删其他节点同名会话）
+        cur.execute("DELETE FROM conversations WHERE session_id = %s AND node_id = %s",
+                    (session_id, _active_node_id))
         # 再删会话
-        cur.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+        cur.execute("DELETE FROM sessions WHERE id = %s AND node_id = %s",
+                    (session_id, _active_node_id))
         conn.commit()
         return cur.rowcount
 

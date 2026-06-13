@@ -271,7 +271,17 @@ class Scheduler:
 
         # ---- 从节点模式：仅创建自身 ----
         else:
-            node_id = NODE_ID or f"client_{__import__('socket').gethostname()}"
+            # ★ 安全：从节点绝不能使用 "master" 作为 node_id
+            # 否则会从数据库加载主节点记录，导致后台面板显示主节点数据
+            if not NODE_ID or NODE_ID == "master":
+                node_id = f"client_{__import__('socket').gethostname()}"
+                if NODE_ID == "master":
+                    logger.warning(
+                        f"⚠️ 从节点 NODE_ID 配置错误（仍为 \"master\"），"
+                        f"已自动生成: {node_id}"
+                    )
+            else:
+                node_id = NODE_ID
             if node_id in db_nodes:
                 self.nodes[node_id] = self._node_from_db(db_nodes[node_id])
             else:
@@ -1974,7 +1984,11 @@ class Scheduler:
         try:
             from tcp_comm import TCPClient
 
-            node_id = NODE_ID or f"client_{__import__('socket').gethostname()}"
+            # ★ 安全：从节点绝不能使用 "master" 作为 client_id
+            if not NODE_ID or NODE_ID == "master":
+                node_id = f"client_{__import__('socket').gethostname()}"
+            else:
+                node_id = NODE_ID
             client = TCPClient(
                 server_host=master_host,
                 server_port=master_port,
@@ -2134,6 +2148,17 @@ class Scheduler:
             "identity_reason": getattr(self, '_master_identity_reason', ''),
         }
 
+    def get_effective_node_id(self) -> str:
+        """
+        返回当前节点的有效 ID。
+
+        主节点 → "master"
+        从节点 → 使用配置的 NODE_ID，若为 "master"（默认值）则自动生成
+        """
+        if NODE_ROLE == "client" and (not NODE_ID or NODE_ID == "master"):
+            return f"client_{__import__('socket').gethostname()}"
+        return NODE_ID
+
     def get_my_role(self) -> dict:
         """
         获取当前节点的角色信息。
@@ -2147,10 +2172,11 @@ class Scheduler:
         Returns:
             { node_role, node_id, is_master, max_nodes, master_discovery, ... }
         """
-        my_info = self.nodes.get(NODE_ID)
+        _effective_id = self.get_effective_node_id()
+        my_info = self.nodes.get(_effective_id)
         result = {
             "node_role": NODE_ROLE,
-            "node_id": NODE_ID,
+            "node_id": _effective_id,
             "is_master": NODE_ROLE == "master",
             "is_client": NODE_ROLE == "client",
             "max_nodes": MAX_NODES,

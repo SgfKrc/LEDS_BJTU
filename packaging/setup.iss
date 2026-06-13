@@ -124,7 +124,7 @@ Filename: "{app}\{#MyAppExeName}"; \
 ; 清理运行时产生的文件
 Type: files; Name: "{app}\logs\*"
 Type: dirifempty; Name: "{app}\logs"
-Type: dirifempty; Name: "{app}\models"
+Type: filesandordirs; Name: "{app}\models"
 
 [Code]
 // 安装完成的提示（中文/英文自适应）
