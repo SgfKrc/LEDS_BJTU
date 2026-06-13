@@ -267,6 +267,39 @@ input:focus, textarea:focus { border-color: var(--accent); }
   border-radius: 10px;
 }
 
+/* ---- 引擎切换标签 ---- */
+.engine-selector {
+  margin-bottom: 12px;
+}
+.engine-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+  display: block;
+}
+.engine-tabs {
+  display: flex;
+  gap: 4px;
+}
+.engine-tab {
+  flex: 1;
+  padding: 6px 4px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+  text-align: center;
+}
+.engine-tab:hover { border-color: var(--text-muted); }
+.engine-tab.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
 /* ---- 状态面板 ---- */
 .status-grid {
   display: grid;
@@ -1337,6 +1370,20 @@ input:focus, textarea:focus { border-color: var(--accent); }
   font-size: 10px;
   color: var(--success);
   line-height: 1.5;
+}
+
+.setting-disabled-hint {
+  padding: 12px;
+  background: var(--bg-input);
+  border-radius: 8px;
+  border: 1px dashed var(--border);
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}
+
+.setting-disabled-hint strong {
+  color: var(--warning);
 }
 
 /* ---- 设备档位预设卡片 ---- */

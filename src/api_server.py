@@ -144,6 +144,18 @@ async def startup_device_detection():
         init_db()
         # ★ 设置数据隔离参数：conversations/sessions 将按 node_id 过滤
         from db import set_active_node_id
+        # ★ MAC 不匹配自动切换：若 start() 时检测到 MAC 不匹配且有真实主节点，
+        #    后台线程 _auto_switch_to_client 会在 2s 后完成切换。
+        #    此处等待最多 5s，确保切换完成后再设置 node_id。
+        if (getattr(scheduler, '_master_identity_reason', '') == 'mac_mismatch'
+                and getattr(scheduler, '_role_override', None) != 'client'):
+            # 自动切换尚未完成（后台线程延迟 2s），等待切换
+            logger.info("⏳ 等待 MAC 不匹配自动切换到从节点模式...")
+            import time as _time
+            for _ in range(10):  # 最多等 5 秒 (10 × 0.5s)
+                _time.sleep(0.5)
+                if getattr(scheduler, '_role_override', None) == 'client':
+                    break
         set_active_node_id(scheduler.get_effective_node_id())
         logger.info(f"数据库已连接，活跃节点: {scheduler.get_effective_node_id()}")
     except Exception as e:
@@ -183,13 +195,17 @@ async def shutdown_db():
 # ============================================================
 
 class LoadModelRequest(BaseModel):
+    engine: str = Field(
+        default="auto",
+        description="推理引擎: auto (自动检测) | llama_cpp (GGUF) | pytorch (Safetensors)",
+    )
     quant_type: str = Field(
         default="int4",
-        description="量化精度: fp16 | int8 | int4",
+        description="PyTorch 量化精度: fp16 | int8 | int4（llama_cpp 引擎忽略此参数）",
     )
     use_compile: bool = Field(
         default=False,
-        description="是否开启 torch.compile 算子融合（仅 FP16 有效）",
+        description="是否开启 torch.compile 算子融合（仅 PyTorch FP16 有效）",
     )
 
 
@@ -1256,8 +1272,8 @@ async def get_status():
         "model_name": MODEL_NAME,
         "model_path": MODEL_PATH,
         "run_mode": RUN_MODE,
-        "node_role": NODE_ROLE,
-        "node_id": NODE_ID,
+        "node_role": scheduler._effective_role(),
+        "node_id": scheduler.get_effective_node_id(),
         "max_nodes": MAX_NODES,
         "gpu": gpu_info,
         "kv_cache": kv_stats,
@@ -1295,8 +1311,16 @@ async def load_model(req: LoadModelRequest):
     """
     global model_loaded, current_quant, kv_cache, conversation_stats
 
+    engine = req.engine.lower()
+    if engine not in ("auto", "llama_cpp", "pytorch"):
+        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch")
+
     quant = req.quant_type.lower()
-    if quant not in ("fp16", "int8", "int4"):
+    # llama_cpp 引擎使用 GGUF 格式，不涉及 bitsandbytes 量化精度
+    # gguf / any 等占位值均合法（由 ModelManager 自动选择 GGUF 文件）
+    if engine == "llama_cpp":
+        pass  # quant_type 对 llama.cpp 无意义，放行任意值
+    elif quant not in ("fp16", "int8", "int4"):
         raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
 
     try:
@@ -1333,13 +1357,14 @@ async def load_model(req: LoadModelRequest):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
-        # 临时修改 config
+        # 临时修改 config（引擎 + 量化）
         import config as cfg
+        cfg.INFERENCE_ENGINE = engine
         cfg.QUANT_TYPE = quant
         cfg.USE_COMPILE = req.use_compile
 
-        # 加载新模型（传入设备画像以启用自适应加载）
-        logger.info(f"加载模型: quant={quant}, compile={req.use_compile}")
+        # 加载新模型
+        logger.info(f"加载模型: engine={engine}, quant={quant}, compile={req.use_compile}")
         model_manager.load_model(
             model_path=MODEL_PATH,
             quant_type=quant,
@@ -1398,7 +1423,7 @@ async def chat(req: ChatRequest):
     # ---- 分布式推理路由：从节点转发给主节点 ----
     if (scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
-            and NODE_ROLE == "client"):
+            and scheduler._effective_role() == "client"):
         try:
             result = scheduler.forward_inference_to_master(
                 message=req.message,
@@ -1690,7 +1715,31 @@ async def clear_chat():
 
 @app.get("/api/models/available")
 async def list_available_models():
-    """列出可选模型配置"""
+    """列出可选模型配置 + 可用引擎"""
+    import config as cfg
+    # 检测当前环境实际可用的引擎
+    available_engines = []
+    # llama.cpp: 有 GGUF 模型文件即可
+    from model_downloader import gguf_model_exists
+    if gguf_model_exists():
+        available_engines.append({
+            "id": "llama_cpp",
+            "name": "llama.cpp + GGUF",
+            "description": "CPU/集显推理，Q4_K_M ~1.16 GB，~10-15 tok/s",
+            "model_size_gb": 1.2,
+            "requires_cuda": False,
+        })
+    # PyTorch: 有 Safetensors 模型文件即可
+    from model_downloader import safetensors_model_exists
+    if safetensors_model_exists():
+        has_cuda = torch.cuda.is_available()
+        available_engines.append({
+            "id": "pytorch",
+            "name": "PyTorch + Safetensors" + (" (CUDA)" if has_cuda else " (CPU)"),
+            "description": "Safetensors 格式，支持 INT4/INT8/FP16 量化" + ("，GPU 加速" if has_cuda else "，CPU 模式较慢"),
+            "model_size_gb": 1.8 if has_cuda else 3.5,
+            "requires_cuda": has_cuda,
+        })
     return {
         "models": [
             {
@@ -1700,6 +1749,7 @@ async def list_available_models():
                 "memory_gb": 3.5,
                 "speed_tok_s": 53,
                 "compile_support": True,
+                "engine": "pytorch",
             },
             {
                 "id": "int4",
@@ -1708,6 +1758,7 @@ async def list_available_models():
                 "memory_gb": 1.8,
                 "speed_tok_s": 29,
                 "compile_support": False,
+                "engine": "pytorch",
             },
             {
                 "id": "int8",
@@ -1716,9 +1767,12 @@ async def list_available_models():
                 "memory_gb": 2.3,
                 "speed_tok_s": 10,
                 "compile_support": False,
+                "engine": "pytorch",
             },
         ],
         "current": current_quant if model_loaded else None,
+        "current_engine": model_manager._engine_type if model_manager.is_loaded else None,
+        "available_engines": available_engines,
     }
 
 
@@ -1890,7 +1944,7 @@ async def check_master_health():
     Returns:
         { master_online, last_seen_seconds_ago, stale, master_host, master_port }
     """
-    if NODE_ROLE == "master":
+    if scheduler._effective_role() == "master":
         # 主节点自身：直接返回在线
         return {
             "master_online": True,

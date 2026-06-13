@@ -167,16 +167,6 @@ def _init_schema() -> None:
             ON conversations(node_id, created_at)
         """)
 
-        # 低风险迁移：为新部署添加 node_id，旧部署已有则忽略
-        try:
-            cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS node_id VARCHAR(64) NOT NULL DEFAULT 'master'")
-        except Exception:
-            conn.rollback()
-        try:
-            cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS node_id VARCHAR(64) NOT NULL DEFAULT 'master'")
-        except Exception:
-            conn.rollback()
-
         # ---- 集群配置表（键值对） ----
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cluster_config (
@@ -203,7 +193,58 @@ def _init_schema() -> None:
         """)
 
         conn.commit()
-        logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions)")
+
+    # ★ 迁移：为旧版表添加 node_id 列（在事务外执行，避免回滚影响建表）
+    #    使用连接池而非独立连接，避免独立连接因网络/DNS 问题静默失败
+    _migrate_add_node_id_columns()
+
+    logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions)")
+
+
+def _migrate_add_node_id_columns() -> None:
+    """
+    为旧版表添加 node_id 列（幂等迁移）。
+
+    旧版 conversations / sessions 表可能缺少 node_id 列。
+    此迁移使用 ALTER TABLE ... ADD COLUMN IF NOT EXISTS，
+    已存在的列不会被修改。
+
+    使用连接池连接并设置 autocommit，避免：
+    1. 独立 psycopg2.connect() 因网络/DNS 问题静默失败
+    2. 迁移失败导致整个 _init_schema 事务回滚
+    """
+    pool_ = None
+    conn = None
+    try:
+        pool_ = get_pool()
+        conn = pool_.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS "
+                "node_id VARCHAR(64) NOT NULL DEFAULT 'master'"
+            )
+            logger.info("迁移: conversations.node_id 列已就绪")
+        except Exception as e:
+            logger.warning(f"迁移 conversations.node_id 跳过: {e}")
+        try:
+            cur.execute(
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS "
+                "node_id VARCHAR(64) NOT NULL DEFAULT 'master'"
+            )
+            logger.info("迁移: sessions.node_id 列已就绪")
+        except Exception as e:
+            logger.warning(f"迁移 sessions.node_id 跳过: {e}")
+        cur.close()
+    except Exception as e:
+        logger.warning(f"node_id 列迁移失败（非致命）: {e}")
+    finally:
+        if conn and pool_:
+            try:
+                pool_.putconn(conn)
+            except Exception:
+                pass
 
 
 # ================================================================
@@ -416,14 +457,14 @@ def delete_message_range(session_id: str, turn_index: int) -> int:
             WITH ordered AS (
                 SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC) - 1 AS rn
                 FROM conversations
-                WHERE session_id = %s
+                WHERE session_id = %s AND node_id = %s
             )
             DELETE FROM conversations
             WHERE id IN (
                 SELECT id FROM ordered
                 WHERE rn IN (%s, %s)
-            ) AND node_id = %s
-        """, (session_id, 2 * turn_index, 2 * turn_index + 1, _active_node_id))
+            )
+        """, (session_id, _active_node_id, 2 * turn_index, 2 * turn_index + 1))
         conn.commit()
         return cur.rowcount
 
@@ -477,10 +518,13 @@ def get_all_sessions(limit: int = 50, offset: int = 0) -> list[dict]:
 
 
 def get_session(session_id: str) -> Optional[dict]:
-    """获取单个会话元数据"""
+    """获取单个会话元数据（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+        cur.execute(
+            "SELECT * FROM sessions WHERE id = %s AND node_id = %s",
+            (session_id, _active_node_id)
+        )
         row = cur.fetchone()
         if not row:
             return None
@@ -507,9 +551,9 @@ def update_session_title(session_id: str, title: str) -> Optional[dict]:
         cur.execute("""
             UPDATE sessions
             SET title = %s, updated_at = NOW()
-            WHERE id = %s
+            WHERE id = %s AND node_id = %s
             RETURNING *
-        """, (title, session_id))
+        """, (title, session_id, _active_node_id))
         conn.commit()
         row = cur.fetchone()
         if not row:
@@ -540,27 +584,27 @@ def delete_session(session_id: str) -> int:
 
 
 def increment_session_message_count(session_id: str) -> None:
-    """会话消息数 +1，同时更新 updated_at"""
+    """会话消息数 +1，同时更新 updated_at（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE sessions
             SET message_count = message_count + 1, updated_at = NOW()
-            WHERE id = %s
-        """, (session_id,))
+            WHERE id = %s AND node_id = %s
+        """, (session_id, _active_node_id))
         conn.commit()
 
 
 def decrement_session_message_count(session_id: str, count: int = 2) -> None:
-    """会话消息数 -count（不小于0），同时更新 updated_at"""
+    """会话消息数 -count（不小于0），同时更新 updated_at（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE sessions
             SET message_count = GREATEST(0, message_count - %s),
                 updated_at = NOW()
-            WHERE id = %s
-        """, (count, session_id,))
+            WHERE id = %s AND node_id = %s
+        """, (count, session_id, _active_node_id))
         conn.commit()
 
 

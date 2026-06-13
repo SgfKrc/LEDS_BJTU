@@ -14,7 +14,7 @@
 
 #define MyAppName         "QLH Edge Inference"
 #define MyAppNameCN       "轻量化大模型分布式边缘推理系统"
-#define MyAppVersion      "0.1.0"
+#define MyAppVersion      "0.1.2"
 #define MyAppPublisher    "北京交通大学 · 大创项目"
 #define MyAppExeName      "QLH-Edge-Inference.exe"
 #define MyAppSourceDir    "dist\QLH-Edge-Inference"
@@ -22,7 +22,7 @@
 
 [Setup]
 ; 全局唯一标识 — 不要修改（用于升级检测和卸载）
-AppId={{F1A3B5C7-8D2E-4F6A-9B1C-3D5E7F8A0B2C}
+AppId={{F1A3B5C7-8D2E-4F6A-9B1C-3D5E7F8A0B2C}}
 
 ; 基本信息
 AppName={#MyAppName}
@@ -121,10 +121,9 @@ Filename: "{app}\{#MyAppExeName}"; \
   Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
-; 清理运行时产生的文件
+; 清理运行时产生的文件（卸载时删除日志和前端缓存，保留模型文件）
 Type: files; Name: "{app}\logs\*"
 Type: dirifempty; Name: "{app}\logs"
-Type: filesandordirs; Name: "{app}\models"
 
 [Code]
 // 安装完成的提示（中文/英文自适应）

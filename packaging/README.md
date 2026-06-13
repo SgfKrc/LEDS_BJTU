@@ -32,7 +32,7 @@ npm install
 npx vite build
 cd ..
 
-# 3. PyInstaller 打包
+# 3. PyInstaller 打包（.venv-packaging）
 pip install pyinstaller
 cd packaging
 pyinstaller qlh-cpu.spec --noconfirm

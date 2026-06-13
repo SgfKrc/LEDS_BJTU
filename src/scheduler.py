@@ -195,10 +195,39 @@ class Scheduler:
                 # 验证主节点身份（MAC 匹配）
                 self._verify_master_identity()
 
-                # 自动注册到数据库，供从节点发现
-                self._register_master_in_db()
-                # 启动数据库心跳刷新线程
-                self._start_master_db_heartbeat()
+                # ★ MAC 不匹配时的处理策略
+                if self._master_identity_reason == "mac_mismatch":
+                    # 尝试在数据库中发现真正的主节点
+                    discovery = self.discover_master()
+                    if discovery.get("found"):
+                        # 数据库中存在真正的主节点记录 → 自动切换为从节点
+                        stale_note = "（心跳过期，IP 可能已变更）" if discovery.get("stale") else ""
+                        logger.warning(
+                            f"⛔ 主节点身份验证失败！本机 MAC 与数据库中记录不匹配。\n"
+                            f"   数据库中存在真正的主节点 ({discovery['master_host']}:{discovery['master_port']}){stale_note}，\n"
+                            f"   自动切换为从节点模式并尝试连接..."
+                        )
+                        # 启动后台线程处理切换（避免阻塞 start()）
+                        threading.Thread(
+                            target=self._auto_switch_to_client,
+                            args=(discovery["master_host"], discovery["master_port"]),
+                            name="auto-switch-client",
+                            daemon=True,
+                        ).start()
+                    else:
+                        # 数据库中没有主节点记录 → 可能是首次配置错误
+                        logger.error(
+                            f"⛔ 主节点身份验证失败 — 拒绝注册到数据库！\n"
+                            f"   本机 MAC 与数据库中记录不匹配，且未发现其他主节点。\n"
+                            f"   如需更换主节点机器，请先在原主节点的后台管理中"
+                            f"使用「重置主节点身份」功能，或手动清除数据库中的 MAC 记录。\n"
+                            f"   当前将以单机模式运行（不写入 DB 注册信息）。"
+                        )
+                else:
+                    # 自动注册到数据库，供从节点发现
+                    self._register_master_in_db()
+                    # 启动数据库心跳刷新线程
+                    self._start_master_db_heartbeat()
                 # 检查是否需要向备用主节点发送接管通知（转让后新主节点启动）
                 threading.Thread(
                     target=self.deactivate_spare_master_on_startup,
@@ -209,6 +238,12 @@ class Scheduler:
                 logger.info(f"调度器已启动（分布式模式，从节点），监听 {bind_host}:{actual_port}")
                 # 从节点启动后台线程：监控主节点健康状态 + 自动重连
                 self._start_client_health_monitor()
+                # 启动后尝试自动发现并连接主节点
+                threading.Thread(
+                    target=self._auto_connect_on_startup,
+                    name="auto-connect-startup",
+                    daemon=True,
+                ).start()
         else:
             logger.info("调度器已启动（单机模式）")
 
@@ -223,6 +258,15 @@ class Scheduler:
     # 节点管理
     # ================================================================
 
+    def _effective_role(self) -> str:
+        """
+        返回当前节点的有效角色。
+
+        正常情况返回 config.NODE_ROLE；若 MAC 不匹配时自动切换到
+        client 模式，则返回 "client"（通过 _role_override 覆盖）。
+        """
+        return getattr(self, '_role_override', None) or NODE_ROLE
+
     def init_nodes(self) -> None:
         """
         初始化节点状态。
@@ -230,6 +274,7 @@ class Scheduler:
         - 从节点：创建自身记录，等待用户操作连接主节点
         - 优先从数据库恢复已注册节点
         """
+        effective_role = self._effective_role()
         db = _get_db()
         db_nodes = {}
         if db and _db_available:
@@ -240,7 +285,7 @@ class Scheduler:
                 logger.warning(f"数据库读取失败，使用默认初始化: {e}")
 
         # ---- 主节点模式：仅创建 master，不预创建 client 空位 ----
-        if NODE_ROLE == "master":
+        if effective_role == "master":
             now_ts = time.time()
             if "master" in db_nodes:
                 self.nodes["master"] = self._node_from_db(db_nodes["master"])
@@ -292,7 +337,7 @@ class Scheduler:
                 )
 
         # 从 DB 同步 MAX_NODES（仅主节点）
-        if db and _db_available and NODE_ROLE == "master":
+        if db and _db_available and effective_role == "master":
             try:
                 stored_max = db.get_config("max_nodes", "")
                 if stored_max and stored_max.isdigit():
@@ -320,7 +365,7 @@ class Scheduler:
 
         logger.info(
             f"节点初始化完成: {len(self.nodes)} 个节点 "
-            f"(mode={RUN_MODE}, max_nodes={MAX_NODES}, my_role={NODE_ROLE})"
+            f"(mode={RUN_MODE}, max_nodes={MAX_NODES}, my_role={effective_role})"
         )
         for nid, info in self.nodes.items():
             logger.info(f"  {nid}: role={info.role}, state={info.state.value}")
@@ -444,6 +489,12 @@ class Scheduler:
             except Exception as e:
                 logger.warning(f"节点注销 DB 持久化失败: {e}")
 
+        # 主节点：推送节点离线更新给所有已连接从节点
+        if self._effective_role() == "master":
+            self._push_node_update_to_all_clients(
+                node_id, "update", node
+            )
+
         logger.info(f"节点注销: {node_id} ({old_state.value} → offline)")
         return True
 
@@ -462,10 +513,10 @@ class Scheduler:
         记录一次推理任务完成。
 
         Args:
-            node_id: 执行推理的节点（默认 NODE_ID）
+            node_id: 执行推理的节点（默认本节点）
             success: 是否成功
         """
-        nid = node_id or NODE_ID
+        nid = node_id or self.get_effective_node_id()
         if nid in self.nodes:
             if success:
                 self.nodes[nid].task_count += 1
@@ -764,7 +815,7 @@ class Scheduler:
         """
         from config import TOTAL_MODEL_LAYERS
 
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可覆盖分层配置"}
 
         # 基本验证
@@ -877,8 +928,14 @@ class Scheduler:
                 network_type=data.get("network_type", client_info.get("network_type", "unknown")),
             )
             # 新节点注册后重新计算分层并推送
-            if registered and NODE_ROLE == "master":
+            if registered and self._effective_role() == "master":
                 self.push_layer_config_to_clients()
+                # 向新注册的从节点推送全量节点列表（同步管理面板）
+                self._push_node_list_to_client(client_id)
+                # 向其他从节点推送新节点加入更新
+                self._push_node_update_to_all_clients(
+                    client_id, "add", self.nodes.get(client_id)
+                )
 
         elif msg_type == "heartbeat":
             if client_id in self.nodes:
@@ -945,9 +1002,216 @@ class Scheduler:
             # 备用主节点收到新主节点的接管通知
             self._handle_spare_master_deactivate(client_id, msg)
 
+        elif msg_type == "node_list_sync":
+            # ---- 从节点收到主节点推送的全量节点列表 ----
+            data = msg.get("data", {})
+            if data.get("request") == "node_list":
+                # 从节点请求节点列表 → 主节点响应
+                self._push_node_list_to_client(client_id)
+            else:
+                # 从节点接收全量节点列表
+                nodes_data = data.get("nodes", [])
+                if nodes_data:
+                    self._apply_node_list_sync(nodes_data)
+                    logger.info(
+                        f"📋 收到主节点推送的全量节点列表: {len(nodes_data)} 个节点"
+                    )
+
+        elif msg_type == "node_update":
+            # ---- 从节点收到单节点变更通知 ----
+            data = msg.get("data", {})
+            action = data.get("action", "")
+            node_data = data.get("node", {})
+            if action and node_data:
+                self._apply_node_update(action, node_data)
+                logger.info(
+                    f"📋 节点变更: {action} {node_data.get('node_id', '?')}"
+                )
+
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
+        if client_id in self.nodes:
+            self.nodes[client_id].state = NodeState.OFFLINE
+        # 推送节点离线更新给所有连接的从节点
+        if self._effective_role() == "master":
+            self._push_node_update_to_all_clients(
+                client_id, "update", self.nodes.get(client_id)
+            )
         self.deregister_node(client_id)
+
+    # ================================================================
+    # 节点列表同步（主 → 从）
+    # ================================================================
+
+    def _push_node_list_to_client(self, client_id: str) -> None:
+        """
+        向指定从节点推送全量节点列表。
+
+        调用时机:
+        - 从节点注册成功后
+        - 从节点主动请求 (node_list_sync with request="node_list")
+        """
+        if not self._tcp_server or not self._tcp_server._running:
+            return
+        try:
+            from tcp_comm import MessageType
+            nodes_data = [info.to_dict() for info in self.nodes.values()]
+            self._tcp_server.send_to_client(
+                client_id,
+                {"nodes": nodes_data},
+                MessageType.NODE_LIST_SYNC,
+            )
+            logger.debug(f"已向 {client_id} 推送全量节点列表 ({len(nodes_data)} 个)")
+        except Exception as e:
+            logger.warning(f"推送节点列表到 {client_id} 失败: {e}")
+
+    def _push_node_update_to_all_clients(self, changed_id: str,
+                                         action: str, node_info) -> None:
+        """
+        向所有已连接从节点推送单节点变更通知。
+
+        Args:
+            changed_id: 变更的节点 ID
+            action: "add" | "update" | "remove"
+            node_info: NodeInfo 对象或 None (remove 时)
+        """
+        if not self._tcp_server or not self._tcp_server._running:
+            return
+        try:
+            from tcp_comm import MessageType
+            node_data = node_info.to_dict() if node_info else {"node_id": changed_id}
+            payload = {
+                "action": action,
+                "node": node_data,
+            }
+            for cid in self._tcp_server.get_client_ids():
+                if cid == changed_id:
+                    continue  # 不推送给变更节点自身
+                try:
+                    self._tcp_server.send_to_client(
+                        cid, payload, MessageType.NODE_UPDATE
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"推送节点更新失败: {e}")
+
+    def _apply_node_list_sync(self, nodes_data: list) -> None:
+        """
+        从节点：应用主节点推送的全量节点列表。
+
+        保留本地节点信息，用主节点的数据补充/覆盖其他节点。
+        """
+        local_id = self.get_effective_node_id()
+        now_ts = time.time()
+        for nd in nodes_data:
+            nid = nd.get("node_id", "")
+            if nid == local_id:
+                # ★ 更新自身节点信息（主节点视角更准确: network_type, last_heartbeat 等）
+                local = self.nodes.get(local_id)
+                if local:
+                    local.network_type = nd.get("network_type", local.network_type)
+                    local.last_heartbeat = nd.get("last_heartbeat", local.last_heartbeat)
+                    local.connected_at = nd.get("connected_at", local.connected_at)
+                    local.address = nd.get("address", local.address)
+                    local.hostname = nd.get("hostname", local.hostname)
+                    local.device_info = nd.get("device_info", local.device_info)
+                    local.task_count = nd.get("task_count", local.task_count)
+                    local.error_count = nd.get("error_count", local.error_count)
+                    try:
+                        local.state = NodeState(nd.get("state", local.state.value))
+                    except ValueError:
+                        pass
+                continue
+            if nid in self.nodes:
+                # 更新已有节点
+                existing = self.nodes[nid]
+                existing.role = nd.get("role", existing.role)
+                existing.hostname = nd.get("hostname", existing.hostname)
+                existing.address = nd.get("address", existing.address)
+                existing.device_info = nd.get("device_info", existing.device_info)
+                existing.network_type = nd.get("network_type", existing.network_type)
+                existing.task_count = nd.get("task_count", existing.task_count)
+                existing.error_count = nd.get("error_count", existing.error_count)
+                try:
+                    existing.state = NodeState(nd.get("state", "offline"))
+                except ValueError:
+                    pass
+            else:
+                # 新增节点
+                try:
+                    state = NodeState(nd.get("state", "offline"))
+                except ValueError:
+                    state = NodeState.OFFLINE
+                self.nodes[nid] = NodeInfo(
+                    node_id=nid,
+                    role=nd.get("role", "client"),
+                    state=state,
+                    address=nd.get("address", ""),
+                    hostname=nd.get("hostname", ""),
+                    device_info=nd.get("device_info", {}),
+                    network_type=nd.get("network_type", "unknown"),
+                    connected_at=nd.get("connected_at", now_ts),
+                    last_heartbeat=nd.get("last_heartbeat", now_ts),
+                    task_count=nd.get("task_count", 0),
+                    error_count=nd.get("error_count", 0),
+                )
+
+    def _apply_node_update(self, action: str, node_data: dict) -> None:
+        """
+        从节点：应用单节点变更通知。
+        """
+        nid = node_data.get("node_id", "")
+        if not nid:
+            return
+        local_id = self.get_effective_node_id()
+        if nid == local_id:
+            # ★ 更新自身节点信息（来自主节点的状态更新）
+            if action in ("add", "update"):
+                local = self.nodes.get(local_id)
+                if local:
+                    local.last_heartbeat = node_data.get("last_heartbeat", local.last_heartbeat)
+                    local.network_type = node_data.get("network_type", local.network_type)
+                    local.connected_at = node_data.get("connected_at", local.connected_at)
+                    local.task_count = node_data.get("task_count", local.task_count)
+                    local.error_count = node_data.get("error_count", local.error_count)
+                    try:
+                        local.state = NodeState(node_data.get("state", local.state.value))
+                    except ValueError:
+                        pass
+            return
+        if action == "remove":
+            self.nodes.pop(nid, None)
+        elif action in ("add", "update"):
+            now_ts = time.time()
+            try:
+                state = NodeState(node_data.get("state", "offline"))
+            except ValueError:
+                state = NodeState.OFFLINE
+            if nid in self.nodes:
+                existing = self.nodes[nid]
+                existing.state = state
+                existing.role = node_data.get("role", existing.role)
+                existing.hostname = node_data.get("hostname", existing.hostname)
+                existing.address = node_data.get("address", existing.address)
+                existing.device_info = node_data.get("device_info", existing.device_info)
+                existing.network_type = node_data.get("network_type", existing.network_type)
+                existing.task_count = node_data.get("task_count", existing.task_count)
+                existing.error_count = node_data.get("error_count", existing.error_count)
+            else:
+                self.nodes[nid] = NodeInfo(
+                    node_id=nid,
+                    role=node_data.get("role", "client"),
+                    state=state,
+                    address=node_data.get("address", ""),
+                    hostname=node_data.get("hostname", ""),
+                    device_info=node_data.get("device_info", {}),
+                    network_type=node_data.get("network_type", "unknown"),
+                    connected_at=node_data.get("connected_at", now_ts),
+                    last_heartbeat=node_data.get("last_heartbeat", now_ts),
+                    task_count=node_data.get("task_count", 0),
+                    error_count=node_data.get("error_count", 0),
+                )
 
     # ================================================================
     # 角色转让 — 主节点身份转移
@@ -970,7 +1234,7 @@ class Scheduler:
         Returns:
             {status, message, transfer_id, ...}
         """
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可发起角色转让"}
 
         # ---- 备用主节点前置检查 ----
@@ -1310,7 +1574,7 @@ class Scheduler:
         Returns:
             {status, message, spare_master, ...}
         """
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可指定备用主节点"}
 
         # 检查集群节点数 ≥ 2
@@ -1740,7 +2004,7 @@ class Scheduler:
         Returns:
             {status, message}
         """
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可清除备用主节点"}
 
         db = _get_db()
@@ -1938,8 +2202,8 @@ class Scheduler:
 
         return {
             "run_mode": RUN_MODE,
-            "node_role": NODE_ROLE,
-            "node_id": NODE_ID,
+            "node_role": self._effective_role(),
+            "node_id": self.get_effective_node_id(),
             "max_nodes": MAX_NODES,
             "network": {
                 "server_ip": server_ip,
@@ -1978,7 +2242,8 @@ class Scheduler:
         Returns:
             { status, node_id, master, message }
         """
-        if NODE_ROLE != "client":
+        effective_role = self._effective_role()
+        if effective_role != "client":
             return {"status": "denied", "reason": "仅从节点可以连接主节点"}
 
         try:
@@ -1995,12 +2260,20 @@ class Scheduler:
                 client_id=node_id,
                 role="client",
             )
+            # ★ 心跳回调：每次发送心跳成功后更新自身节点的 last_heartbeat
+            client.on_heartbeat = lambda: (
+                self.nodes[node_id].__setattr__("last_heartbeat", time.time())
+                if node_id in self.nodes else None
+            )
+
             # 更新自身节点信息
             if node_id in self.nodes:
                 self.nodes[node_id].state = NodeState.ONLINE
                 self.nodes[node_id].address = f"{master_host}:{master_port}"
 
-            ok = client.connect(on_message=self._on_tcp_message)
+            ok = client.connect(
+                on_message=lambda msg: self._on_tcp_message("master", msg)
+            )
             if ok:
                 # 存储客户端引用，供分布式推理转发使用
                 self._tcp_client = client
@@ -2008,11 +2281,21 @@ class Scheduler:
                 # 更新全局 node_id
                 import config as cfg
                 cfg.NODE_ID = node_id
+                # 若通过 activate_client_mode 切换而来，同步更新角色
+                if getattr(self, '_role_override', None) == "client":
+                    cfg.NODE_ROLE = "client"
 
                 # 不在此处持久化到数据库 — 主节点收到 TCP 注册消息后
                 # 会通过 _on_tcp_message → register_node() → db.upsert_node()
                 # 统一写入，保证节点管理数据的一致性。
                 # 从节点不应直接写入 master_host/master_port（数据库共享表）。
+
+                # 主节点注册成功后，请求全量节点列表以同步管理面板
+                try:
+                    from tcp_comm import MessageType
+                    client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
+                except Exception:
+                    pass
 
                 logger.info(f"✅ 从节点 {node_id} 已连接到主节点 {master_host}:{master_port}")
                 return {
@@ -2024,11 +2307,11 @@ class Scheduler:
             else:
                 return {
                     "status": "failed",
-                    "reason": "TCP 连接失败，请检查主节点地址和端口是否正确",
+                    "reason": f"TCP 连接失败 ({master_host}:{master_port})，请检查主节点地址和端口是否正确",
                 }
         except Exception as e:
-            logger.error(f"连接主节点失败: {e}")
-            return {"status": "error", "reason": str(e)}
+            logger.error(f"连接主节点 {master_host}:{master_port} 失败: {e}")
+            return {"status": "error", "reason": f"{master_host}:{master_port} - {e}"}
 
     def forward_inference_to_master(self, message: str,
                                      max_new_tokens: int = 512,
@@ -2054,7 +2337,7 @@ class Scheduler:
         Returns:
             {status, content, metrics, error}
         """
-        if NODE_ROLE != "client":
+        if self._effective_role() != "client":
             return {"status": "denied", "error": "仅从节点可转发推理请求"}
 
         tcp_client = getattr(self, '_tcp_client', None)
@@ -2148,6 +2431,114 @@ class Scheduler:
             "identity_reason": getattr(self, '_master_identity_reason', ''),
         }
 
+    def activate_client_mode(self, master_host: str = None, master_port: int = None) -> dict:
+        """
+        从失败的主节点模式自动切换到从节点模式。
+
+        调用时机：MAC 地址不匹配时，若数据库中存在真正的主节点记录，
+        表明本机并非主节点，应自动切换为从节点并尝试连接真正的主节点。
+
+        Args:
+            master_host: 主节点 IP（从 discover_master() 获取）
+            master_port: 主节点端口
+
+        Returns:
+            { status, node_id, message }
+        """
+        import config as cfg
+
+        logger.info("🔄 正在从失败的主节点模式切换到从节点模式...")
+
+        # 1. 设置角色覆盖
+        self._role_override = "client"
+        cfg.NODE_ROLE = "client"
+
+        # 2. 重新初始化为从节点
+        self.nodes.clear()
+        self.init_nodes()
+        effective_id = self.get_effective_node_id()
+        cfg.NODE_ID = effective_id
+
+        # 3. 启动从节点健康监控
+        self._start_client_health_monitor()
+
+        logger.info(
+            f"✅ 已切换到从节点模式: node_id={effective_id}, "
+            f"role=client"
+        )
+
+        result = {
+            "status": "switched",
+            "node_id": effective_id,
+            "message": f"已自动切换为从节点模式 (ID: {effective_id})",
+        }
+
+        # 4. 如果提供了主节点地址，尝试自动连接
+        if master_host and master_port:
+            logger.info(f"🔗 尝试自动连接主节点 {master_host}:{master_port}...")
+            conn_result = self.connect_to_master(master_host, master_port)
+            result["connect_result"] = conn_result
+            if conn_result.get("status") == "connected":
+                result["message"] += f"，已连接到主节点 {master_host}:{master_port}"
+                logger.info(f"✅ 自动连接主节点成功")
+            else:
+                result["message"] += f"，自动连接主节点失败: {conn_result.get('reason', conn_result.get('status'))}"
+                logger.warning(f"⚠️ 自动连接主节点失败: {conn_result}")
+        else:
+            result["message"] += "，未提供主节点地址，请手动连接"
+
+        return result
+
+    def _auto_switch_to_client(self, master_host: str, master_port: int) -> None:
+        """
+        后台线程：MAC 不匹配时自动切换到从节点模式并连接主节点。
+
+        延迟 2 秒执行，确保 TCP 服务端完全就绪。
+        """
+        time.sleep(2)
+        try:
+            result = self.activate_client_mode(master_host, master_port)
+            # 更新 api_server 中的 active_node_id
+            try:
+                from db import set_active_node_id
+                set_active_node_id(self.get_effective_node_id())
+            except Exception:
+                pass
+            logger.info(f"自动切换完成: {result.get('message', '')}")
+        except Exception as e:
+            logger.error(f"自动切换到从节点模式失败: {e}")
+
+    def _auto_connect_on_startup(self) -> None:
+        """
+        后台线程：从节点启动后自动发现并连接主节点。
+
+        启动后延迟 5 秒（给主节点 DB 心跳足够时间写入），
+        然后尝试发现主节点并连接。
+        """
+        time.sleep(5)
+        # 如果已经连接（例如通过 activate_client_mode），跳过
+        tcp_client = getattr(self, '_tcp_client', None)
+        if tcp_client and tcp_client._running:
+            logger.info("已有活跃 TCP 连接，跳过启动自动连接")
+            return
+
+        try:
+            discovery = self.discover_master()
+            if discovery.get("found"):
+                stale_note = "（心跳过期）" if discovery.get("stale") else ""
+                host = discovery["master_host"]
+                port = discovery["master_port"]
+                logger.info(f"🔍 启动自动发现: 主节点 {host}:{port}{stale_note}，尝试连接...")
+                result = self.connect_to_master(host, port)
+                if result.get("status") == "connected":
+                    logger.info(f"✅ 启动自动连接成功: {host}:{port}")
+                else:
+                    logger.info(f"启动自动连接失败: {result.get('reason', result.get('status'))}")
+            else:
+                logger.info("启动自动发现: 未找到可用主节点，稍后可通过前端手动连接")
+        except Exception as e:
+            logger.warning(f"启动自动连接异常: {e}")
+
     def get_effective_node_id(self) -> str:
         """
         返回当前节点的有效 ID。
@@ -2155,7 +2546,8 @@ class Scheduler:
         主节点 → "master"
         从节点 → 使用配置的 NODE_ID，若为 "master"（默认值）则自动生成
         """
-        if NODE_ROLE == "client" and (not NODE_ID or NODE_ID == "master"):
+        effective_role = self._effective_role()
+        if effective_role == "client" and (not NODE_ID or NODE_ID == "master"):
             return f"client_{__import__('socket').gethostname()}"
         return NODE_ID
 
@@ -2172,13 +2564,14 @@ class Scheduler:
         Returns:
             { node_role, node_id, is_master, max_nodes, master_discovery, ... }
         """
+        effective_role = self._effective_role()
         _effective_id = self.get_effective_node_id()
         my_info = self.nodes.get(_effective_id)
         result = {
-            "node_role": NODE_ROLE,
+            "node_role": effective_role,
             "node_id": _effective_id,
-            "is_master": NODE_ROLE == "master",
-            "is_client": NODE_ROLE == "client",
+            "is_master": effective_role == "master",
+            "is_client": effective_role == "client",
             "max_nodes": MAX_NODES,
             "run_mode": RUN_MODE,
             "my_node": my_info.to_dict() if my_info else None,
@@ -2186,13 +2579,13 @@ class Scheduler:
         }
 
         # 主节点：附加 MAC 身份验证状态
-        if NODE_ROLE == "master":
+        if effective_role == "master":
             result["mac_addresses"] = getattr(self, '_mac_addresses', [])
             result["identity_verified"] = getattr(self, '_master_identity_verified', False)
             result["identity_reason"] = getattr(self, '_master_identity_reason', '')
 
         # 从节点：查询数据库以自动发现主节点
-        if NODE_ROLE == "client":
+        if effective_role == "client":
             try:
                 discovery = self.discover_master()
                 result["master_discovery"] = discovery
@@ -2215,7 +2608,7 @@ class Scheduler:
         """
         import config as cfg
 
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可修改最大节点数"}
 
         if new_max < 1:
@@ -2503,37 +2896,101 @@ class Scheduler:
 
         主节点收到 INFER_FORWARD 后:
           1. 创建推理任务
-          2. 执行分布式流水线（TODO: 依赖 model_module.py 完成）
+          2. 在主节点本地执行完整模型推理（全部层）
           3. 将结果通过 INFER_RESULT 回传给请求方
 
-        当前实现: 创建任务并记录日志，实际分布式执行待 model_module.py 实现。
+        TODO: 真正的分布式流水线（模型层拆分到多个节点并行推理）
+              当前先实现「全部层都在主节点」模式，让从节点转发可用。
         """
         data = msg.get("data", {})
         prompt = data.get("prompt", "")
         max_new_tokens = data.get("max_new_tokens", 512)
         temperature = data.get("temperature", 0.7)
         top_p = data.get("top_p", 0.9)
+        show_thinking = data.get("show_thinking", False)
+        session_id = data.get("session_id")
 
-        try:
-            task_id = self.start_infer_task(prompt)
-            logger.info(
-                f"📨 收到从节点 {client_id} 转发的推理请求: "
-                f"task={task_id}, prompt_len={len(prompt)}, "
-                f"max_tokens={max_new_tokens}, temp={temperature}"
-            )
+        import threading as _thr
 
-            # TODO: 实际分布式推理流水线执行
-            # 1. 根据分层配置，协调各节点执行模型推理
-            # 2. 收集最终结果
-            # 3. 通过 INFER_RESULT 回传给 client_id
-            #
-            # 当前阶段: 模型拆分和流水线（model_module.py）未实现，
-            # 此处仅完成消息路由框架。完成后调用:
-            #   self._send_infer_result(client_id, task_id, result_text, metrics)
+        def _run_inference():
+            try:
+                task_id = self.start_infer_task(prompt)
+                logger.info(
+                    f"📨 收到从节点 {client_id} 转发的推理请求: "
+                    f"task={task_id}, prompt_len={len(prompt)}, "
+                    f"max_tokens={max_new_tokens}, temp={temperature}"
+                )
 
-        except Exception as e:
-            logger.error(f"转发推理请求失败: {e}")
-            self._send_infer_result(client_id, "", "", {"error": str(e)})
+                # 在主节点本地执行推理（全部层）
+                try:
+                    from model_module import ModelManager
+                except ImportError:
+                    self._send_infer_result(
+                        client_id, task_id, "",
+                        {"error": "模型模块未加载，请确认模型文件已就绪"}
+                    )
+                    return
+
+                # api_server 中的全局 model_manager 实例
+                import api_server as _api
+                mgr = getattr(_api, 'model_manager', None)
+                if not mgr or not mgr.is_loaded:
+                    self._send_infer_result(
+                        client_id, task_id, "",
+                        {"error": "模型未就绪，请确认模型文件已下载并加载成功"}
+                    )
+                    return
+
+                # 使用相同的 chat() 方法（与直连 localhost 一致）
+                messages = [{"role": "user", "content": prompt}]
+                output = mgr.chat(
+                    messages=messages,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+
+                content = output.get("response", "") if isinstance(output, dict) else str(output)
+                thinking = output.get("thinking") if isinstance(output, dict) else None
+                followups = output.get("followups") if isinstance(output, dict) else None
+                metrics = output.get("metrics", {}) if isinstance(output, dict) else {}
+
+                # 保存到对话历史（主节点侧）
+                try:
+                    from db import save_message
+                    save_message(
+                        session_id=session_id or "default",
+                        role="user",
+                        content=prompt,
+                    )
+                    save_message(
+                        session_id=session_id or "default",
+                        role="assistant",
+                        content=content,
+                        metrics=metrics,
+                    )
+                except Exception:
+                    pass
+
+                self.complete_infer_task(task_id, content)
+                self._send_infer_result(
+                    client_id, task_id, content, metrics,
+                    thinking_content=thinking,
+                    followups=followups,
+                )
+                logger.info(
+                    f"✅ 推理完成 → {client_id}: task={task_id}, "
+                    f"len={len(content)}"
+                )
+
+            except Exception as e:
+                logger.error(f"转发推理执行失败: {e}", exc_info=True)
+                self._send_infer_result(
+                    client_id, "", "",
+                    {"error": str(e)}
+                )
+
+        _thr.Thread(target=_run_inference, name=f"infer-{client_id}", daemon=True).start()
 
     def _send_infer_result(self, client_id: str, task_id: str,
                            content: str, metrics: dict = None,
@@ -2571,7 +3028,7 @@ class Scheduler:
 
         调用后下一次启动时将自动记录新的 MAC 地址。
         """
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可重置身份标识"}
 
         db = _get_db()
@@ -2609,7 +3066,7 @@ class Scheduler:
         Returns:
             { status, node_id, message }
         """
-        if NODE_ROLE != "master":
+        if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可手动注册从节点"}
 
         if node_id == "master":
@@ -2735,18 +3192,28 @@ class Scheduler:
         当宕机超过 MASTER_DOWN_EMAIL_TIMEOUT 秒时，发送邮件告警。
         当主节点恢复在线时，发送恢复通知 + 自动重连（如已配置）。
         """
-        self._client_master_was_online = False
-        self._client_master_online = False
+        # ★ 从数据库读取主节点当前在线状态作为初始值，
+        #    避免启动时 was_online=False + DB 显示在线 → 误触发 "恢复重连"
+        try:
+            initial_health = self.check_master_health()
+            initial_online = initial_health.get("master_online", False)
+        except Exception:
+            initial_online = False
+        self._client_master_was_online = initial_online
+        self._client_master_online = initial_online
         self._client_reconnect_enabled = True
 
         # 邮件告警状态
-        self._client_master_down_since = 0.0       # 主节点首次检测到宕机的时间戳
+        self._client_master_down_since = 0.0         # 主节点首次检测到宕机的时间戳
         self._client_master_down_email_sent = False  # 本轮宕机是否已发送告警邮件
+
+        # 周期性重连：当主节点在线但本地 TCP 未连接时，每隔一定时间重试
+        self._client_last_reconnect_attempt = 0.0    # 上次重连尝试的时间戳
 
         t = threading.Thread(target=self._client_health_monitor_loop, daemon=True)
         t.start()
         threshold_info = f"，宕机邮件告警阈值: {MASTER_DOWN_EMAIL_TIMEOUT}s" if MASTER_DOWN_EMAIL_TIMEOUT > 0 else "（邮件告警已禁用）"
-        logger.info(f"从节点主节点健康监控已启动（间隔 15s）{threshold_info}")
+        logger.info(f"从节点主节点健康监控已启动（间隔 15s，重连间隔 60s）{threshold_info}")
 
     def _client_health_monitor_loop(self) -> None:
         """从节点健康监控循环（后台 daemon 线程）"""
@@ -2779,7 +3246,7 @@ class Scheduler:
                             host = health.get("master_host", "")
                             port = health.get("master_port", 0)
                             last_seen = health.get("last_seen_seconds_ago")
-                            client_id = NODE_ID or "unknown"
+                            client_id = self.get_effective_node_id()
                             ok = send_master_down_alert(
                                 host, port, downtime,
                                 last_seen_seconds_ago=last_seen,
@@ -2804,7 +3271,7 @@ class Scheduler:
                             from email_notifier import send_master_recovery_alert
                             host = health.get("master_host", "")
                             port = health.get("master_port", 0)
-                            client_id = NODE_ID or "unknown"
+                            client_id = self.get_effective_node_id()
                             send_master_recovery_alert(
                                 host, port, total_downtime,
                                 client_node_id=client_id,
@@ -2829,6 +3296,30 @@ class Scheduler:
                             result = self.connect_to_master(host, port)
                             if result.get("status") == "connected":
                                 logger.info(f"🔄 已自动重连到主节点 {host}:{port}")
+
+                # ---- 周期性重连：主节点在线但本地 TCP 未连接时定期重试 ----
+                if (is_online
+                        and self._client_reconnect_enabled
+                        and self._effective_role() == "client"):
+                    tcp_client = getattr(self, '_tcp_client', None)
+                    tcp_connected = (tcp_client is not None
+                                     and getattr(tcp_client, '_running', False)
+                                     and getattr(tcp_client, 'sock', None) is not None)
+                    if not tcp_connected:
+                        now = time.time()
+                        last_attempt = getattr(self, '_client_last_reconnect_attempt', 0.0)
+                        if now - last_attempt >= 60:  # 每 60 秒重试一次
+                            self._client_last_reconnect_attempt = now
+                            host = health.get("master_host", "")
+                            port = health.get("master_port", 0)
+                            if host and port:
+                                logger.info(
+                                    f"🔄 周期性重连尝试: {host}:{port}"
+                                )
+                                result = self.connect_to_master(host, port)
+                                if result.get("status") == "connected":
+                                    logger.info(f"✅ 周期性重连成功: {host}:{port}")
+                                    self._client_last_reconnect_attempt = 0.0  # 成功后重置
 
                 self._client_master_was_online = is_online
             except Exception as e:

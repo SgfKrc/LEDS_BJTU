@@ -80,6 +80,9 @@ class MessageType(str, Enum):
     SPARE_MASTER_ACTIVATE = "spare_master_activate"            # 主节点 → 备用：激活暂代主节点职责
     SPARE_MASTER_ACTIVATE_ACK = "spare_master_activate_ack"    # 备用 → 主节点：确认激活
     SPARE_MASTER_DEACTIVATE = "spare_master_deactivate"        # 新主节点 → 备用：接管完成，退出暂代
+    # 节点列表同步
+    NODE_LIST_SYNC = "node_list_sync"            # 主节点 → 从节点：全量节点列表同步
+    NODE_UPDATE = "node_update"                  # 主节点 → 从节点：单节点变更 (add/update/remove)
 
 
 # ================================================================
@@ -187,39 +190,81 @@ def detect_network_type() -> str:
 
 def detect_lan_ip() -> str:
     """
-    检测本机局域网 IP 地址（供其他节点连接使用）。
+    检测本机最优可达 IP 地址（供其他节点连接使用）。
 
-    通过多种策略检测，优先级:
-    1. UDP 连接外部地址 → 获取默认路由 IP
-    2. psutil 枚举网络接口 → 过滤回环/虚拟/Docker 接口
-    3. socket.gethostbyname(hostname) → 最后兜底
+    优先级（从高到低）:
+    1. Tailscale / ZeroTier 虚拟组网 IP（100.x.y.z）— 最可靠，跨子网直连
+    2. psutil 枚举物理网卡（以太网 > WiFi）— 同局域网直连
+    3. UDP 默认路由 IP — 出网网卡 IP
+    4. socket.gethostbyname(hostname) — 最后兜底
 
     Returns:
-        IP 地址字符串，如 "192.168.1.100"，检测失败返回 "127.0.0.1"
+        IP 地址字符串，检测失败返回 "127.0.0.1"
     """
-    # 策略 1: 通过 UDP "连接" 外部地址获取默认路由 IP（不发送数据包）
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(1.0)
-        s.connect(("8.8.8.8", 53))
-        ip = s.getsockname()[0]
-        s.close()
-        if ip and not ip.startswith("127."):
-            logger.info(f"检测到局域网 IP (UDP): {ip}")
-            return ip
-    except Exception:
-        pass
 
-    # 策略 2: psutil 枚举网络接口
+    # ---- 策略 1: 优先检测 Tailscale / ZeroTier 虚拟组网 IP ----
+    #   Tailscale 使用 100.64.0.0/10 (CGNAT) 地址段，接口名含 "tailscale"
+    #   ZeroTier 接口名含 "zerotier"
+    #   这些 IP 在组网内是全局可达的，不受物理子网隔离影响
     if _HAS_PSUTIL:
         try:
             import socket as _sock
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
 
-            # 排除的接口前缀（虚拟 / 容器 / 回环）
+            # 检测 Tailscale / ZeroTier 接口
+            overlay_keywords = ('tailscale', 'zerotier', 'zt')
+            # 100.64.0.0/10 范围: 100.64.0.0 ~ 100.127.255.255
+            _TAILSCALE_LO = 0x64400000   # 100.64.0.0
+            _TAILSCALE_HI = 0x647FFFFF   # 100.127.255.255
+
+            overlay_candidates = []  # [(ip, iface, is_up)]
+
+            for iface, addr_list in addrs.items():
+                iface_lower = iface.lower()
+                # Tailscale / ZeroTier 接口名匹配
+                is_overlay = any(kw in iface_lower for kw in overlay_keywords)
+
+                stat = stats.get(iface)
+                is_up = stat.isup if stat else False
+
+                for addr in addr_list:
+                    if addr.family != _sock.AF_INET:
+                        continue
+                    ip = addr.address
+                    if ip.startswith("127."):
+                        continue
+                    # 100.64.0.0/10 范围的 IP 也视为 overlay（即使接口名不匹配）
+                    try:
+                        octets = [int(o) for o in ip.split(".")]
+                        ip_int = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+                        in_tailscale_range = _TAILSCALE_LO <= ip_int <= _TAILSCALE_HI
+                    except (ValueError, IndexError):
+                        in_tailscale_range = False
+
+                    if is_overlay or in_tailscale_range:
+                        overlay_candidates.append((ip, iface, is_up))
+
+            if overlay_candidates:
+                # 优先启用的接口
+                overlay_candidates.sort(key=lambda c: (0 if c[2] else 1))
+                ip = overlay_candidates[0][0]
+                logger.info(f"检测到组网 IP (Tailscale/ZeroTier): {ip} (接口: {overlay_candidates[0][1]})")
+                return ip
+        except Exception:
+            pass
+
+    # ---- 策略 2: psutil 枚举物理网络接口 ----
+    if _HAS_PSUTIL:
+        try:
+            import socket as _sock
+            addrs = psutil.net_if_addrs()
+            stats = psutil.net_if_stats()
+
+            # 排除的接口前缀（虚拟 / 容器 / 回环 / 组网）
             skip_prefixes = ('lo', 'veth', 'docker', 'br-', 'vmnet', 'virbr',
-                             'tun', 'tap', 'wg', 'utun', 'anpi', 'bluetooth')
+                             'tun', 'tap', 'wg', 'utun', 'anpi', 'bluetooth',
+                             'tailscale', 'zerotier', 'zt')
 
             candidates = []  # [(ip, iface, is_up, is_wifi)]
 
@@ -255,7 +300,20 @@ def detect_lan_ip() -> str:
         except Exception:
             pass
 
-    # 策略 3: gethostbyname 兜底
+    # ---- 策略 3: UDP 默认路由 IP ----
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        s.connect(("8.8.8.8", 53))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            logger.info(f"检测到局域网 IP (UDP): {ip}")
+            return ip
+    except Exception:
+        pass
+
+    # ---- 策略 4: gethostbyname 兜底 ----
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
@@ -724,6 +782,36 @@ class TCPServer:
         device_info = data.get("device_info", {})
         network_type = data.get("network_type", "unknown")
 
+        # ★ 安全：拒绝 client_id="master" 或 role="master" 的注册
+        if client_id == "master":
+            logger.error(
+                f"⛔ 拒绝注册: client_id='master' 是保留字，"
+                f"来源 {addr[0]}:{addr[1]} hostname={hostname}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": "client_id 'master' 是保留字，请使用其他 ID",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError:
+                pass
+            return temp_id  # 返回临时 ID，后续会被清理
+        if role == "master":
+            logger.error(
+                f"⛔ 拒绝注册: 从节点不能声明 role='master'，"
+                f"来源 {addr[0]}:{addr[1]} hostname={hostname}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": "role 'master' 仅限于主节点自身",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError:
+                pass
+            return temp_id
+
         client_conn = ClientConn(
             client_id=client_id,
             sock=conn,
@@ -892,6 +980,7 @@ class TCPClient:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._recv_thread: Optional[threading.Thread] = None
         self.on_message: Optional[Callable] = None
+        self.on_heartbeat: Optional[Callable] = None  # 心跳发送后回调（无参数）
         self._registered = False
 
     def connect(self, on_message: Callable = None) -> bool:
@@ -967,18 +1056,24 @@ class TCPClient:
                 return True
             except ConnectionRefusedError:
                 logger.warning(
-                    f"连接失败 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES})，"
-                    f"{RECONNECT_DELAY}s 后重试..."
+                    f"连接被拒绝 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
+                )
+                time.sleep(RECONNECT_DELAY)
+            except socket.timeout:
+                logger.warning(
+                    f"连接超时 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
                 )
                 time.sleep(RECONNECT_DELAY)
             except OSError as e:
                 logger.warning(
-                    f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e}，"
-                    f"{RECONNECT_DELAY}s 后重试..."
+                    f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e} → "
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
                 )
                 time.sleep(RECONNECT_DELAY)
 
-        logger.error(f"无法连接主节点，已重试 {RECONNECT_MAX_RETRIES} 次")
+        logger.error(f"无法连接主节点 {self.server_host}:{self.server_port}，已重试 {RECONNECT_MAX_RETRIES} 次")
         return False
 
     def _recv_loop(self) -> None:
@@ -1048,6 +1143,11 @@ class TCPClient:
         while self._running and self.sock:
             try:
                 self.send_data(None, MessageType.HEARTBEAT)
+                if self.on_heartbeat:
+                    try:
+                        self.on_heartbeat()
+                    except Exception:
+                        pass
                 time.sleep(HEARTBEAT_INTERVAL)
             except (ConnectionError, OSError):
                 logger.warning("心跳发送失败，尝试重连...")

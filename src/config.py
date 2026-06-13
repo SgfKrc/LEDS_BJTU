@@ -98,7 +98,10 @@ MAX_NODES = 3                    # 最大节点数上限（主节点可动态调
                                   # 从节点通过 TCP 注册后自动加入列表，不再预创建空槽位
 
 # 从节点连接主节点配置（仅 NODE_ROLE="client" 时生效）
-CLIENT_MASTER_HOST = "192.168.x.x"   # 主节点 IP 地址（部署时改为实际 IP）
+# 主节点启动后自动检测 Tailscale/ZeroTier 组网 IP 并写入共享数据库，
+# 从节点通过 discover_master() 自动发现即可，通常无需手动配置。
+# 仅当数据库不可用时才回退到此配置值。
+CLIENT_MASTER_HOST = "192.168.x.x"   # 主节点 IP 地址（推荐用 Tailscale IP: 100.x.y.z）
 CLIENT_MASTER_PORT = 8888            # 主节点监听端口
 
 # SMTP 邮件告警配置（详见 src/email_notifier.py）
