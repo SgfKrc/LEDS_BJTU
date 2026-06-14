@@ -2876,3 +2876,344 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .delete-confirm-btn.cancel:hover {
   background: rgba(255, 255, 255, 0.25);
 }
+
+/* ============================================================
+   流水线拓扑图
+   ============================================================ */
+
+.pipeline-topology {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---- 状态横幅 ---- */
+
+.pipeline-status-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.pipeline-status-banner.pipeline-healthy {
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid var(--success);
+}
+
+.pipeline-status-banner.pipeline-degraded {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid var(--warning);
+}
+
+.pipeline-status-banner.pipeline-inactive,
+.pipeline-status-banner.pipeline-error {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid var(--danger);
+}
+
+.pipeline-status-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.pipeline-status-text {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* ---- 单节点模式 ---- */
+
+.pipeline-single-node {
+  display: flex;
+  justify-content: center;
+  padding: 16px 0;
+}
+
+/* ---- 流水线流布局 ---- */
+
+.pipeline-flow {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  overflow-x: auto;
+  padding: 16px 4px;
+  min-height: 160px;
+}
+
+.pipeline-flow-item {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-shrink: 0;
+}
+
+/* ---- 节点卡片 ---- */
+
+.pipeline-node-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  min-width: 200px;
+  max-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.pipeline-node-card.node-online {
+  border-color: var(--success);
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.1);
+}
+
+.pipeline-node-card.node-offline {
+  border-color: var(--danger);
+  opacity: 0.6;
+}
+
+.pipeline-node-card.node-master {
+  border-left: 3px solid var(--accent);
+}
+
+.pipeline-node-card.node-worker {
+  border-left: 3px solid var(--info);
+}
+
+.pipeline-node-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pipeline-node-role {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pipeline-node-status {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.pipeline-node-status.status-online { color: var(--success); }
+.pipeline-node-status.status-offline { color: var(--danger); }
+.pipeline-node-status.status-unknown { color: var(--text-muted); }
+
+.pipeline-node-id {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.pipeline-node-layers {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pipeline-layer-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pipeline-layer-range {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.pipeline-layer-count {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-left: 6px;
+  font-weight: 400;
+}
+
+/* ---- 特殊层标记 ---- */
+
+.pipeline-node-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.pipeline-flag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.flag-embed {
+  background: rgba(99, 102, 241, 0.15);
+  color: var(--accent-hover);
+}
+
+.flag-lmhead {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+}
+
+.flag-transformer {
+  background: rgba(59, 130, 246, 0.1);
+  color: var(--info);
+}
+
+.flag-entry {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+}
+
+.flag-exit {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--danger);
+}
+
+/* ---- RTT 延迟 ---- */
+
+.pipeline-node-rtt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+.pipeline-rtt-label {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.pipeline-rtt-value {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pipeline-rtt-value.rtt-good { color: var(--success); }
+.pipeline-rtt-value.rtt-ok { color: var(--warning); }
+.pipeline-rtt-value.rtt-slow { color: var(--danger); }
+
+/* ---- GPU 信息 ---- */
+
+.pipeline-node-gpu {
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* ---- 箭头 ---- */
+
+.pipeline-arrow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.pipeline-arrow-line {
+  width: 32px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+.pipeline-arrow-head {
+  font-size: 10px;
+  color: var(--accent);
+  line-height: 1;
+}
+
+.pipeline-arrow-label {
+  font-size: 9px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  margin-top: 2px;
+}
+
+/* ---- 图例 ---- */
+
+.pipeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 10px 14px;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.pipeline-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.pipeline-legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.pipeline-legend-swatch.master {
+  background: var(--accent);
+}
+
+.pipeline-legend-swatch.client-online {
+  background: var(--success);
+}
+
+.pipeline-legend-swatch.client-offline {
+  background: var(--danger);
+  opacity: 0.5;
+}
+
+.pipeline-legend-swatch.arrow {
+  background: linear-gradient(90deg, var(--accent), transparent);
+  width: 20px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+/* ---- 亮色主题适配 ---- */
+
+[data-theme="light"] .pipeline-node-card {
+  background: #fff;
+  border-color: #d1d5db;
+}
+
+[data-theme="light"] .pipeline-node-card.node-online {
+  border-color: #22c55e;
+}
+
+[data-theme="light"] .pipeline-node-card.node-offline {
+  border-color: #ef4444;
+}
+
+[data-theme="light"] .pipeline-legend {
+  background: #f3f4f6;
+}
+
+[data-theme="light"] .pipeline-status-banner.pipeline-healthy {
+  background: rgba(34, 197, 94, 0.08);
+}
+
+[data-theme="light"] .pipeline-status-banner.pipeline-degraded {
+  background: rgba(245, 158, 11, 0.08);
+}

@@ -83,6 +83,12 @@ class MessageType(str, Enum):
     # 节点列表同步
     NODE_LIST_SYNC = "node_list_sync"            # 主节点 → 从节点：全量节点列表同步
     NODE_UPDATE = "node_update"                  # 主节点 → 从节点：单节点变更 (add/update/remove)
+    # 分布式流水线推理
+    LAYER_FORWARD = "layer_forward"              # 主→从：执行层前向传播
+    LAYER_RESULT = "layer_result"                # 从→主：层前向传播结果
+    CHAIN_FORWARD = "chain_forward"              # 从→从：链式直连层前向转发（P2 优化）
+    PIPELINE_DONE = "pipeline_done"              # 主→从：流水线任务完成（清理 KV 缓存）
+    PIPELINE_ABORT = "pipeline_abort"            # 主→从：取消流水线任务
 
 
 # ================================================================
@@ -537,6 +543,100 @@ def deserialize_tensor(data: bytes) -> torch.Tensor:
     return torch.load(buffer)
 
 
+# ---- 高速序列化路径（流水线隐藏状态传输优化） ----
+
+def serialize_tensor_fast(tensor: torch.Tensor) -> bytes:
+    """
+    高速张量序列化，自动选择最优路径。
+
+    小张量 (< 1MB): 使用 torch.save（兼容性好、含完整元数据）
+    大张量 (≥ 1MB): 使用 numpy tobytes + 自定义头（零拷贝、速度快 ~3x）
+
+    自定义头格式（大张量路径）:
+        [4B  magic: b'TNR0' ]
+        [1B  dtype_code      ]  # 0=float16, 1=float32, 2=int64, 3=int32
+        [1B  ndim             ]
+        [4B  dim0             ]
+        [4B  dim1             ]
+        [4B  dim2 (optional)  ]
+        [4B  dim3 (optional)  ]
+        [NB  raw_bytes        ]
+    总开销: 10-22 字节
+
+    小张量路径:
+        [4B  magic: b'TNR1' ]
+        [NB  torch.save 输出]
+    """
+    tensor_cpu = tensor.detach().cpu()
+    nbytes = tensor_cpu.numel() * tensor_cpu.element_size()
+
+    if nbytes < 1_000_000:
+        # 小张量：torch.save（兼容性好）
+        buf = io.BytesIO()
+        torch.save(tensor_cpu, buf)
+        payload = buf.getvalue()
+        return b'TNR1' + payload
+    else:
+        # 大张量：numpy tobytes（零拷贝）
+        import numpy as np
+        arr = tensor_cpu.numpy()
+        dtype_map = {
+            np.float16: 0, np.float32: 1,
+            np.int64: 2, np.int32: 3,
+        }
+        dtype_code = dtype_map.get(arr.dtype.type, 1)
+        ndim = arr.ndim
+        shape = arr.shape
+
+        header = struct.pack(
+            f'>4s B B {"I" * ndim}',
+            b'TNR0', dtype_code, ndim, *shape,
+        )
+        return header + arr.tobytes()
+
+
+def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
+    """
+    反序列化 serialize_tensor_fast 的输出。
+
+    magic b'TNR0' → 大张量路径（numpy frombuffer）
+    magic b'TNR1' → 小张量路径（torch.load）
+    """
+    if not data or len(data) < 4:
+        raise ValueError("序列化数据为空或长度不足")
+
+    magic = data[:4]
+    if magic == b'TNR1':
+        # 小张量路径
+        buf = io.BytesIO(data[4:])
+        return torch.load(buf)
+    elif magic == b'TNR0':
+        # 大张量路径
+        import numpy as np
+        dtype_map = {
+            0: np.float16, 1: np.float32,
+            2: np.int64, 3: np.int32,
+        }
+        dtype_code = data[4]
+        ndim = data[5]
+        dtype = dtype_map.get(dtype_code, np.float32)
+        # 解析 shape（每个维度 4 字节）
+        shape = []
+        offset = 6
+        for _ in range(ndim):
+            dim = struct.unpack_from('>I', data, offset)[0]
+            shape.append(dim)
+            offset += 4
+        # 重建张量
+        raw = data[offset:]
+        arr = np.frombuffer(raw, dtype=dtype).reshape(shape)
+        return torch.from_numpy(arr.copy())  # copy 确保内存连续
+    else:
+        # 未知格式，回退到 torch.load
+        buf = io.BytesIO(data)
+        return torch.load(buf)
+
+
 # ================================================================
 # 消息构建与解析
 # ================================================================
@@ -738,8 +838,8 @@ class TCPServer:
                     self._recv_threads[client_id] = threading.current_thread()
 
                 elif msg_type == MessageType.HEARTBEAT.value:
-                    # 心跳：回复 ACK
-                    self._handle_heartbeat(client_id)
+                    # 心跳：回显客户端时间戳并回复 ACK
+                    self._handle_heartbeat(client_id, msg)
 
                 # 回调上层（scheduler）
                 if self.on_message:
@@ -839,14 +939,20 @@ class TCPServer:
 
         return client_id
 
-    def _handle_heartbeat(self, client_id: str) -> None:
-        """处理心跳消息：更新时间戳并回复 ACK"""
+    def _handle_heartbeat(self, client_id: str, msg: dict = None) -> None:
+        """处理心跳消息：更新时间戳并回复 ACK（回显客户端时间戳用于 RTT 测量）"""
         if client_id in self.clients:
             self.clients[client_id].last_heartbeat = time.time()
             self.clients[client_id].heartbeat_missed = 0
+            # 提取客户端发送时间戳，原样回显
+            echo_data = None
+            if msg and isinstance(msg.get("data"), dict):
+                t_send = msg["data"].get("t_send", 0)
+                if t_send:
+                    echo_data = {"t_send": t_send}
             # 回复 ACK
             try:
-                ack = build_message(MessageType.HEARTBEAT_ACK)
+                ack = build_message(MessageType.HEARTBEAT_ACK, echo_data)
                 self.clients[client_id].sock.sendall(ack)
             except OSError:
                 pass  # 心跳回复失败由断线检测处理
@@ -982,6 +1088,8 @@ class TCPClient:
         self.on_message: Optional[Callable] = None
         self.on_heartbeat: Optional[Callable] = None  # 心跳发送后回调（无参数）
         self._registered = False
+        self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
+        self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
 
     def connect(self, on_message: Callable = None) -> bool:
         """
@@ -1083,6 +1191,10 @@ class TCPClient:
                 msg = self.recv_data()
                 if msg is None:
                     break  # 连接断开
+                # 内部处理：HEARTBEAT_ACK → 计算 RTT
+                if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
+                    self._handle_heartbeat_ack(msg)
+                    continue  # 不向上层转发
                 if self.on_message:
                     try:
                         self.on_message(msg)
@@ -1138,11 +1250,38 @@ class TCPClient:
 
         return msg
 
+    def _handle_heartbeat_ack(self, msg: dict) -> None:
+        """
+        处理心跳应答：计算往返延迟 RTT。
+
+        服务端在 HEARTBEAT_ACK 中回显客户端发送的时间戳，
+        客户端收到后计算 RTT = now - t_send，并用指数加权滑动平均平滑。
+        """
+        data = msg.get("data", {})
+        t_echo = data.get("t_send", 0) if isinstance(data, dict) else 0
+        t_now = time.time()
+        if t_echo > 0:
+            rtt_ms = (t_now - t_echo) * 1000
+        elif self._last_heartbeat_send > 0:
+            rtt_ms = (t_now - self._last_heartbeat_send) * 1000
+        else:
+            return  # 无法计算
+
+        # 指数加权滑动平均（α=0.1），平滑网络抖动
+        if self.avg_rtt_ms > 0:
+            self.avg_rtt_ms = 0.9 * self.avg_rtt_ms + 0.1 * rtt_ms
+        else:
+            self.avg_rtt_ms = rtt_ms
+
     def _heartbeat_loop(self) -> None:
-        """心跳发送循环"""
+        """心跳发送循环（含时间戳用于 RTT 测量）"""
         while self._running and self.sock:
             try:
-                self.send_data(None, MessageType.HEARTBEAT)
+                self._last_heartbeat_send = time.time()
+                self.send_data(
+                    {"t_send": self._last_heartbeat_send},
+                    MessageType.HEARTBEAT,
+                )
                 if self.on_heartbeat:
                     try:
                         self.on_heartbeat()

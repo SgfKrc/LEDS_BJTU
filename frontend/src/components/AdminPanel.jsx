@@ -44,6 +44,203 @@ function formatUptime(ts) {
   return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
 }
 
+// ================================================================
+// 流水线拓扑子组件
+// ================================================================
+
+function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
+  // 按 start_layer 排序，确保流水线顺序
+  const sorted = [...assignments].sort((a, b) => (a.start_layer ?? 0) - (b.start_layer ?? 0));
+
+  // 分离主节点和从节点
+  const pipelineNodes = sorted.filter(a => a.node_id !== 'master');
+  const masterNode = sorted.find(a => a.node_id === 'master');
+
+  // 检查流水线就绪状态
+  const nodeMap = {};
+  (nodes || []).forEach(n => { nodeMap[n.node_id] = n; });
+
+  const allWorkersOnline = pipelineNodes.every(a => {
+    const n = nodeMap[a.node_id];
+    return n && n.state === 'online';
+  });
+  const anyWorkerOffline = pipelineNodes.some(a => {
+    const n = nodeMap[a.node_id];
+    return n && n.state === 'offline';
+  });
+
+  const isPipelineActive = isDistributed && runMode === 'distributed' && pipelineNodes.length > 0;
+  const isPipelineHealthy = isPipelineActive && allWorkersOnline;
+  const isPipelineDegraded = isPipelineActive && anyWorkerOffline && !allWorkersOnline;
+
+  // 单节点模式（无从节点）
+  if (pipelineNodes.length === 0) {
+    return (
+      <div className="pipeline-topology">
+        <div className="pipeline-status-banner" style={{ background: 'var(--warning-bg)', border: '1px solid var(--warning)' }}>
+          <span>⚠️ 未检测到从节点，流水线模式不可用。</span>
+          <span style={{ color: 'var(--text-muted)', marginLeft: 8 }}>
+            需要至少 1 个从节点参与分布式推理才能启用流水线。
+          </span>
+        </div>
+        {masterNode && (
+          <div className="pipeline-single-node">
+            <PipelineNodeCard
+              node={masterNode}
+              nodeInfo={nodeMap[masterNode.node_id]}
+              isFirst={true}
+              isLast={true}
+              isMaster={true}
+            />
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // 构建完整流水线：主节点（若有分配） + 从节点（按层序）
+  const fullPipeline = [];
+  if (masterNode && masterNode.layers_count > 0) {
+    fullPipeline.push({ ...masterNode, _isMaster: true });
+  }
+  pipelineNodes.forEach(n => fullPipeline.push({ ...n, _isMaster: false }));
+
+  return (
+    <div className="pipeline-topology">
+      {/* 流水线状态横幅 */}
+      <div className={`pipeline-status-banner ${
+        !isPipelineActive ? 'pipeline-inactive' :
+        isPipelineHealthy ? 'pipeline-healthy' :
+        isPipelineDegraded ? 'pipeline-degraded' : 'pipeline-error'
+      }`}>
+        <span className="pipeline-status-icon">
+          {!isPipelineActive ? '⏸️' :
+           isPipelineHealthy ? '✅' :
+           isPipelineDegraded ? '⚠️' : '❌'}
+        </span>
+        <span className="pipeline-status-text">
+          {!isPipelineActive ? '流水线未激活 — 请启用分布式推理并确保有从节点在线' :
+           isPipelineHealthy ? '流水线就绪 — 所有节点在线，分布式层推理正常工作' :
+           isPipelineDegraded ? '流水线降级 — 部分从节点离线，将自动回退到主节点全模型推理' :
+           '流水线不可用 — 所有从节点离线'}
+        </span>
+      </div>
+
+      {/* 拓扑图 */}
+      <div className="pipeline-flow">
+        {fullPipeline.map((node, idx) => (
+          <div key={node.node_id} className="pipeline-flow-item">
+            <PipelineNodeCard
+              node={node}
+              nodeInfo={nodeMap[node.node_id]}
+              isFirst={idx === 0}
+              isLast={idx === fullPipeline.length - 1}
+              isMaster={node._isMaster}
+            />
+            {idx < fullPipeline.length - 1 && (
+              <div className="pipeline-arrow">
+                <div className="pipeline-arrow-line" />
+                <div className="pipeline-arrow-head">▶</div>
+                <div className="pipeline-arrow-label">hidden_states</div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 图例 */}
+      <div className="pipeline-legend">
+        <span className="pipeline-legend-item">
+          <span className="pipeline-legend-swatch master" /> 主节点
+        </span>
+        <span className="pipeline-legend-item">
+          <span className="pipeline-legend-swatch client-online" /> 从节点 (在线)
+        </span>
+        <span className="pipeline-legend-item">
+          <span className="pipeline-legend-swatch client-offline" /> 从节点 (离线)
+        </span>
+        <span className="pipeline-legend-item">
+          <span className="pipeline-legend-swatch arrow" /> 隐藏状态传输
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
+  const isOnline = nodeInfo?.state === 'online';
+  const isOffline = nodeInfo?.state === 'offline';
+  const rtt = nodeInfo?.avg_rtt_ms ?? nodeInfo?.last_rtt_ms ?? 0;
+  const roleIcon = isMaster ? '🖥️' : '💻';
+  const roleLabel = isMaster ? '主节点' : '从节点';
+
+  return (
+    <div className={`pipeline-node-card ${
+      isOnline ? 'node-online' :
+      isOffline ? 'node-offline' : 'node-unknown'
+    } ${isMaster ? 'node-master' : 'node-worker'}`}>
+      {/* 节点头部 */}
+      <div className="pipeline-node-header">
+        <span className="pipeline-node-role">
+          {roleIcon} {roleLabel}
+        </span>
+        <span className={`pipeline-node-status ${
+          isOnline ? 'status-online' :
+          isOffline ? 'status-offline' : 'status-unknown'
+        }`}>
+          {isOnline ? '🟢 在线' :
+           isOffline ? '🔴 离线' : '⚪ 未知'}
+        </span>
+      </div>
+
+      {/* 节点标识 */}
+      <div className="pipeline-node-id mono">{node.node_id}</div>
+
+      {/* 层范围 */}
+      <div className="pipeline-node-layers">
+        <span className="pipeline-layer-label">层范围</span>
+        <span className="pipeline-layer-range mono">
+          Layer {node.start_layer} – {node.end_layer}
+          <span className="pipeline-layer-count">
+            ({node.layers_count ?? (node.end_layer - node.start_layer)} 层)
+          </span>
+        </span>
+      </div>
+
+      {/* 特殊层标记 */}
+      <div className="pipeline-node-flags">
+        {node.has_embedding && <span className="pipeline-flag flag-embed">📥 Embedding</span>}
+        {node.has_lm_head && <span className="pipeline-flag flag-lmhead">📤 LM Head</span>}
+        {!node.has_embedding && !node.has_lm_head && (
+          <span className="pipeline-flag flag-transformer">🔄 Transformer</span>
+        )}
+        {isFirst && <span className="pipeline-flag flag-entry">🚪 入口</span>}
+        {isLast && <span className="pipeline-flag flag-exit">🚪 出口</span>}
+      </div>
+
+      {/* RTT 延迟 */}
+      {isOnline && rtt > 0 && (
+        <div className="pipeline-node-rtt">
+          <span className="pipeline-rtt-label">网络延迟</span>
+          <span className={`pipeline-rtt-value mono ${
+            rtt < 10 ? 'rtt-good' : rtt < 50 ? 'rtt-ok' : 'rtt-slow'
+          }`}>
+            {rtt.toFixed(1)} ms
+          </span>
+        </div>
+      )}
+
+      {/* 设备信息 */}
+      {nodeInfo?.device_info?.gpu?.name && (
+        <div className="pipeline-node-gpu" title={nodeInfo.device_info.gpu.name}>
+          🎮 {nodeInfo.device_info.gpu.name}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 export default function AdminPanel({ onToast, myRole }) {
   const [status, setStatus] = useState(null);
   const [nodes, setNodes] = useState(null);
@@ -1292,7 +1489,8 @@ export default function AdminPanel({ onToast, myRole }) {
                   <div className="config-row">
                     <span className="config-key">策略</span>
                     <span className="config-value">
-                      {config.layers?.strategy === 'dynamic' ? '🔄 自动分配' : '✏️ 手动覆盖'}
+                      {config.layers?.strategy === 'graph_orchestrator' ? '🧠 智能编排' :
+                       config.layers?.strategy === 'dynamic' ? '🔄 自动分配' : '✏️ 手动覆盖'}
                       <span className="chip-badge" style={{ marginLeft: 8 }}>
                         {config.layers?.total ?? 24} 层
                       </span>
@@ -1313,6 +1511,42 @@ export default function AdminPanel({ onToast, myRole }) {
                   ))}
                 </div>
               </div>
+              {/* ---- 流水线请求队列状态 ---- */}
+              {status?.pipeline_queue && (
+                <div className="config-card">
+                  <div className="config-card-header">📋 请求队列</div>
+                  <div className="config-rows">
+                    <div className="config-row">
+                      <span className="config-key">状态</span>
+                      <span className="config-value">
+                        <span className={`status-dot ${status.pipeline_queue.running ? 'online' : 'offline'}`} />
+                        {status.pipeline_queue.running ? '运行中' : '已停止'}
+                      </span>
+                    </div>
+                    <div className="config-row">
+                      <span className="config-key">当前任务</span>
+                      <span className="config-value mono">
+                        {status.pipeline_queue.current_task || '—'}
+                      </span>
+                    </div>
+                    <div className="config-row">
+                      <span className="config-key">排队深度</span>
+                      <span className="config-value">
+                        <span className="chip-badge" style={{
+                          background: (status.pipeline_queue.queue_size ?? 0) > 3
+                            ? 'var(--warning-bg)' : 'var(--bg-card)'
+                        }}>
+                          {status.pipeline_queue.queue_size ?? 0}
+                        </span>
+                      </span>
+                    </div>
+                    <div className="config-row">
+                      <span className="config-key">已完成</span>
+                      <span className="config-value">{status.pipeline_queue.completed_count ?? 0}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
               <div className="config-card">
                 <div className="config-card-header">📈 任务统计</div>
                 <div className="config-rows">
@@ -1374,6 +1608,19 @@ export default function AdminPanel({ onToast, myRole }) {
                 </button>
               </div>
             </div>
+          </section>
+        )}
+
+        {/* ---- 流水线拓扑（仅主节点 + 分布式模式） ---- */}
+        {isMaster && distributedEnabled && layerAssignment?.assignments && layerAssignment.assignments.length > 0 && (
+          <section className="admin-section">
+            <h3>🔗 流水线拓扑</h3>
+            <PipelineTopology
+              assignments={layerAssignment.assignments}
+              nodes={nodes?.nodes || []}
+              isDistributed={distributedEnabled}
+              runMode={status?.run_mode || 'single'}
+            />
           </section>
         )}
 

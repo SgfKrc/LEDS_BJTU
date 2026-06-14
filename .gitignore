@@ -41,6 +41,7 @@ models/*.7z
 models.7z
 
 # Packaging build artifacts
+build/
 packaging/dist/
 packaging/build/
 packaging/__pycache__/

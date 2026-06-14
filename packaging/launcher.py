@@ -22,6 +22,34 @@ import threading
 import time
 import subprocess as _sp
 
+# ★ 强制在 psycopg2 之前加载 ssl，避免 OpenSSL DLL 冲突
+# psycopg2-binary 捆绑了自己的 libssl-3-x64-{hash}.dll，通过 add_dll_directory 注册后
+# 可能干扰 Python _ssl.pyd 加载 libssl-3.dll，导致"内存位置访问无效"
+#
+# 在 PyInstaller 环境下，bootloader 的 DLL 搜索路径设置可能与 _ssl.pyd 的
+# 隐式依赖加载顺序冲突。先用 ctypes 显式加载 libcrypto-3.dll + libssl-3.dll，
+# 确保 _ssl.pyd 导入时依赖的 DLL 已经在内存中，避免 Windows LoadLibrary 搜索混乱。
+import ctypes as _ctypes
+import os as _os
+
+if getattr(sys, 'frozen', False):
+    _internal_dir = _os.path.join(_os.path.dirname(sys.executable), '_internal')
+    if _os.path.isdir(_internal_dir):
+        try:
+            _os.add_dll_directory(_internal_dir)
+        except Exception:
+            pass
+        # 按依赖顺序加载：libcrypto 先，libssl 后
+        for _dll_name in ('libcrypto-3.dll', 'libssl-3.dll'):
+            _dll_path = _os.path.join(_internal_dir, _dll_name)
+            if _os.path.isfile(_dll_path):
+                try:
+                    _ctypes.CDLL(_dll_path)
+                except Exception:
+                    pass
+
+import ssl  # noqa: E402, F401
+
 # 确保 src 目录在 path 中（开发模式：launcher.py 在 packaging/ 子目录下）
 # PyInstaller 打包后所有模块由 bootloader 加载，无需手动添加 path
 if getattr(sys, 'frozen', False):

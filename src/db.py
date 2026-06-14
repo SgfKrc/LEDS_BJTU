@@ -10,7 +10,7 @@
 
 依赖: psycopg2-binary
 
-数据库: 8.160.161.53:5432 / postgres / 123456
+数据库: 8.160.161.53:5432 / postgres / WUTqw6bLkK3Hn5Va
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ DB_HOST = "8.160.161.53"
 DB_PORT = 5432
 DB_NAME = "qlh_edge_inference"
 DB_USER = "postgres"
-DB_PASSWORD = "123456"
+DB_PASSWORD = "WUTqw6bLkK3Hn5Va"
 DB_MIN_CONN = 2
 DB_MAX_CONN = 8
 
@@ -71,7 +71,8 @@ def get_pool() -> pool.ThreadedConnectionPool:
             password=DB_PASSWORD,
         )
         logger.info(f"数据库连接池已创建: {DB_HOST}:{DB_PORT}/{DB_NAME} "
-                     f"(min={DB_MIN_CONN}, max={DB_MAX_CONN})")
+                     f"(min={DB_MIN_CONN}, max={DB_MAX_CONN}) "
+                     f"user={DB_USER} pwd={DB_PASSWORD[:4]}...{DB_PASSWORD[-4:]}")
 
         # 初始化表结构
         _init_schema()

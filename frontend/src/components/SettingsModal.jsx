@@ -369,11 +369,45 @@ export default function SettingsModal({
               </button>
             </div>
             {settings.distributedInference && (
-              <div className="setting-hint" style={{ marginTop: 8 }}>
-                {myRole?.is_master
-                  ? '✅ 分布式推理已启用。后台管理中将显示集群状态、分层配置与节点管理。'
-                  : '✅ 已启用分布式推理优化。后台管理中将显示本节点的运行状态与性能指标。'}
-              </div>
+              <>
+                <div className="setting-hint" style={{ marginTop: 8 }}>
+                  {myRole?.is_master
+                    ? '✅ 分布式推理已启用。后台管理中将显示集群状态、分层配置与节点管理。'
+                    : '✅ 已启用分布式推理优化。后台管理中将显示本节点的运行状态与性能指标。'}
+                </div>
+                {/* ---- 流水线模式指示 ---- */}
+                {myRole?.is_master && (
+                  <div className="pipeline-mode-indicator" style={{
+                    marginTop: 12,
+                    padding: '10px 14px',
+                    borderRadius: 8,
+                    background: 'var(--bg-card)',
+                    border: '1px solid var(--border)',
+                  }}>
+                    <div className="setting-label" style={{ marginBottom: 6 }}>
+                      🔗 流水线模式（层拆分推理）
+                    </div>
+                    <div className="setting-desc" style={{ marginBottom: 8 }}>
+                      将 Qwen-1.8B 的 24 层 Transformer 按算力比例拆分到主节点和从节点，
+                      各节点仅加载分配的层范围，通过 TCP 传递隐藏状态完成协作推理。
+                      <strong>仅 PyTorch 引擎可用</strong>（llama.cpp 不支持层间拆分）。
+                    </div>
+                    <div className="pipeline-mode-status">
+                      <span className="pipeline-mode-dot" style={{
+                        display: 'inline-block',
+                        width: 8, height: 8,
+                        borderRadius: '50%',
+                        background: 'var(--accent)',
+                        marginRight: 6,
+                      }} />
+                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                        流水线模式在推理时自动启用 — 当从节点在线且模型为 PyTorch 引擎时自动生效，
+                        否则自动回退到主节点全模型推理。
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
             {myRole?.node_id && (
               <div className="setting-node-id-row">

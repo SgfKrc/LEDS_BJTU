@@ -89,6 +89,30 @@ DEFAULT_LAYER_CONFIG = {
     "client2": (16, 24),                 # 从节点2: Layer 16-23 + LM Head
 }
 
+# 显存约束：单层 Transformer 最低显存 + 量化修正系数
+# Qwen-1.8B 每层 ~70MB (FP16)，Embedding + LM Head 各 ~580MB
+MIN_VRAM_PER_LAYER_MB = 70               # 单层最低显存（FP16 基准）
+EMBEDDING_VRAM_MB = 580                  # Token Embedding 层
+LM_HEAD_VRAM_MB = 580                    # LM Head 输出层
+SAFE_VRAM_MARGIN = 1.1                   # 10% 安全余量
+LAYER_VRAM_FACTOR = {                    # 量化精度修正系数
+    "fp16": 1.0,
+    "int8": 0.55,
+    "int4": 0.35,
+}
+
+# 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
+# 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
+GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序
+
+# 流水线推理超时与并发控制
+PIPELINE_TIMEOUT = 120                   # 流水线单步超时（秒），含网络传输 + 前向计算
+PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行）
+PIPELINE_STEP_TIMEOUT = 30               # 单个节点前向传播超时（秒）
+PIPELINE_QUEUE_MAX_SIZE = 100            # 请求队列最大容量（超出返回 503）
+PIPELINE_QUEUE_RESULT_TTL = 300          # 已完成任务结果保留时间（秒），超时清理
+PIPELINE_QUEUE_POLL_INTERVAL = 0.5       # 排队请求轮询间隔（秒）
+
 # ============================================================
 # 5. 节点身份配置
 # ============================================================

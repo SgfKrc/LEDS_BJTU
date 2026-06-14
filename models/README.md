@@ -26,9 +26,9 @@ huggingface-cli download Qwen/Qwen-1.8B-Chat --local-dir models/qwen-1_8b-chat
 
 ### 方式三：百度网盘（备用）
 
-> 📎 网盘链接：*待补充*
+> 📎 网盘链接：[https://pan.baidu.com/s/1QnZXZb50ssZQIAuBQOKEUA?pwd=avne](https://pan.baidu.com/s/1QnZXZb50ssZQIAuBQOKEUA?pwd=avne)
 >
-> 提取码：*待补充*
+> 提取码：avne
 
 ---
 
