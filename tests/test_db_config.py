@@ -179,13 +179,13 @@ class TestUserSettings:
 class TestDedicatedKeys:
     """测试 save_history 和 distributed_inference_enabled 专用键"""
 
-    def test_save_history_default_false(self):
-        """默认应返回 False（无记录时）"""
+    def test_save_history_default_true(self):
+        """默认应返回 True（无记录时开启云端持久化）"""
         from db import get_save_history, set_config
         # 清空已有记录，确保测试默认行为
         set_config("save_history", "")
         result = get_save_history()
-        assert result is False
+        assert result is True
 
     def test_save_history_set_true(self):
         """设置为 True 后应返回 True"""

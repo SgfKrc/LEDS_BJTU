@@ -29,10 +29,10 @@ export async function fetchAvailableModels() {
   return request('/models/available');
 }
 
-export async function loadModel(quantType, useCompile = false) {
+export async function loadModel(engine, quantType, useCompile = false) {
   return request('/models/load', {
     method: 'POST',
-    body: JSON.stringify({ quant_type: quantType, use_compile: useCompile }),
+    body: JSON.stringify({ engine: engine || 'auto', quant_type: quantType, use_compile: useCompile }),
   });
 }
 

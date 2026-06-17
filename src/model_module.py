@@ -63,9 +63,9 @@ class ModelManager:
         self.model: Optional[nn.Module] = None
         self.tokenizer = None
         self.quant_type: Optional[str] = None
-        self.layer_range: Optional[Tuple[int, int]] = None
-        self.sub_model: Optional[nn.Module] = None  # 拆分后的子模型
-        self._model_layers: int = 0  # 模型总层数
+        self.layer_range: Optional[Tuple[int, int]] = None  # (start, end) 当前加载的层范围
+        self._model_layers: int = 0          # 当前加载的层数（range 或 full）
+        self._total_model_layers: int = 0    # 完整模型的总层数（加载时记录，load_layer_range 不覆盖）
 
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
@@ -208,6 +208,123 @@ class ModelManager:
         else:
             self._load_pytorch(model_path, quant_type, profile)
 
+    def load_layer_range(
+        self,
+        start_layer: int = 0,
+        end_layer: int = 24,
+        has_embedding: bool = True,
+        has_lm_head: bool = True,
+        model_path: str = None,
+        quant_type: str = None,
+        profile: dict = None,
+    ) -> None:
+        """
+        加载模型的指定层范围（分布式流水线节点专用）。
+
+        加载完整 PyTorch 模型后，仅保留 [start_layer, end_layer) 的
+        Transformer 层，根据需要保留/丢弃 Embedding 和 LM Head，
+        然后释放不需要的层所占用的显存。
+
+        Args:
+            start_layer: 起始层编号（0-based，含）
+            end_layer: 结束层编号（0-based，不含）
+            has_embedding: 是否保留 Token Embedding（首节点为 True）
+            has_lm_head: 是否保留 LM Head 输出层（末节点为 True）
+            model_path: 模型路径，默认使用 config.MODEL_PATH
+            quant_type: 量化精度，默认使用 config.QUANT_TYPE
+            profile: 设备画像 dict
+
+        示例:
+            # 主节点：Layer 0-7 + Embedding
+            mgr.load_layer_range(0, 8, has_embedding=True, has_lm_head=False)
+
+            # 中间节点：Layer 8-15
+            mgr.load_layer_range(8, 16, has_embedding=False, has_lm_head=False)
+
+            # 末节点：Layer 16-24 + LM Head
+            mgr.load_layer_range(16, 24, has_embedding=False, has_lm_head=True)
+        """
+        import torch.nn as nn
+
+        # ---- 参数校验 ----
+        from config import TOTAL_MODEL_LAYERS
+        if start_layer < 0 or end_layer > TOTAL_MODEL_LAYERS or start_layer >= end_layer:
+            raise ValueError(
+                f"无效的层范围: [{start_layer}, {end_layer})，"
+                f"有效范围: [0, {TOTAL_MODEL_LAYERS})"
+            )
+
+        layers_count = end_layer - start_layer
+        logger.info(
+            f"🎯 层范围加载: Layer {start_layer}-{end_layer} ({layers_count}层), "
+            f"embed={has_embedding}, lm_head={has_lm_head}"
+        )
+
+        # ---- 先加载完整模型 ----
+        self._load_pytorch(model_path=model_path, quant_type=quant_type, profile=profile)
+        self._engine_type = "pytorch"
+
+        if self.model is None:
+            raise RuntimeError("模型加载失败，无法进行层范围裁剪")
+
+        # ---- 裁剪 Transformer 层 ----
+        # Qwen2ForCausalLM 结构:
+        #   model.model.embed_tokens   → Embedding
+        #   model.model.layers         → nn.ModuleList([24× Qwen2DecoderLayer])
+        #   model.model.norm           → RMSNorm
+        #   model.lm_head              → Linear(2048, 151936)
+        transformer = self.model.model  # Qwen2Model
+
+        # 1. 保留指定范围的 Transformer 层
+        all_layers = list(transformer.layers)
+        kept = all_layers[start_layer:end_layer]
+        transformer.layers = nn.ModuleList(kept)
+
+        # 释放被裁剪层的引用，帮助 GC 回收显存
+        for layer in all_layers[:start_layer]:
+            del layer
+        for layer in all_layers[end_layer:]:
+            del layer
+        del all_layers
+
+        # 2. 根据需要保留 Embedding
+        if not has_embedding:
+            if hasattr(transformer, 'embed_tokens'):
+                del transformer.embed_tokens
+                transformer.embed_tokens = None
+
+        # 3. 根据需要保留 LM Head
+        if not has_lm_head:
+            if hasattr(self.model, 'lm_head'):
+                del self.model.lm_head
+                self.model.lm_head = None
+
+        # 4. 清理显存
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        # ---- 记录层范围 ----
+        self.layer_range = (start_layer, end_layer)
+        self._model_layers = layers_count
+        # _total_model_layers 在 _load_pytorch 中已设为完整模型总层数，此处不覆盖
+
+        # ---- 显存统计 ----
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / (1024 ** 3)
+            logger.info(
+                f"✅ 层范围加载完成: 显存 {mem:.2f} GB, "
+                f"层 {start_layer}-{end_layer}, "
+                f"embed={has_embedding}, lm_head={has_lm_head}"
+            )
+        else:
+            logger.info(
+                f"✅ 层范围加载完成: Layer {start_layer}-{end_layer}, "
+                f"embed={has_embedding}, lm_head={has_lm_head}"
+            )
+
     def _load_llama_cpp(self, model_path: str = None, profile: dict = None) -> None:
         """
         加载 llama.cpp + GGUF 模型。
@@ -348,7 +465,9 @@ class ModelManager:
         # 记录模型信息
         total_params = sum(p.numel() for p in self.model.parameters())
         param_dtype = next(self.model.parameters()).dtype
-        self._model_layers = self._count_transformer_layers()
+        layers = self._count_transformer_layers()
+        self._model_layers = layers
+        self._total_model_layers = layers
 
         logger.info(f"模型加载完成 ({load_time:.1f}s)")
         logger.info(f"  参数量: {total_params/1e9:.2f}B  |  类型: {param_dtype}")
@@ -565,74 +684,252 @@ class ModelManager:
 
     def split_model(self, layer_config: Tuple[int, int]) -> nn.Module:
         """
-        根据配置拆分模型层，返回当前节点负责的子模型。
+        [已废弃] 模型层级拆分 — 请使用 load_layer_range() 代替。
 
-        Qwen-1.8B 模型结构:
-            model.transformer.wte          — Embedding（仅首节点）
-            model.transformer.h[0..23]     — 24 层 Transformer
-            model.lm_head                  — LM Head（仅末节点）
+        此方法在加载完整模型后进行运行时拆分，已被 load_layer_range()
+        的"加载即裁剪"方案取代（零额外显存峰值）。
 
-        注意: llama.cpp 不支持层级拆分，分布式推理需使用 PyTorch 引擎。
+        保留此方法仅为向后兼容，新代码请直接使用:
+            mgr.load_layer_range(start, end, has_embedding=..., has_lm_head=...)
+            result = mgr.forward_layers(input_ids=...)
 
         Args:
             layer_config: (start_layer, end_layer) 起止层编号，左闭右开
 
         Returns:
-            拆分后的子模型 nn.Module
+            None（始终抛 NotImplementedError）
         """
-        if self._engine_type == "llama_cpp":
-            logger.warning(
-                "llama.cpp 不支持模型层级拆分。分布式推理请使用 PyTorch 引擎。"
-            )
-            return None
-
-        self.layer_range = layer_config
-        start, end = layer_config
-        n_layers = end - start
-        logger.info(f"模型拆分: 层 [{start}, {end}) 共 {n_layers} 层")
-
-        # TODO: 实际拆分实现
-        # 1. 浅拷贝原始模型结构
-        # 2. 如果 start == 0: 保留 Embedding (model.transformer.wte)
-        # 3. 切片 model.transformer.h[start:end]
-        # 4. 如果 end == total_layers: 保留 LM Head (model.lm_head)
-        # 5. 将不用的层设为 None 以释放显存
-
-        self.sub_model = None  # TODO: 替换为拆分后的模型
-        return self.sub_model
+        raise NotImplementedError(
+            "split_model() 已废弃，请使用 load_layer_range() 代替。\n"
+            "示例: mgr.load_layer_range(start, end, has_embedding=True, has_lm_head=False)"
+        )
 
     # ================================================================
     # 前向推理（PyTorch 分布式专用）
     # ================================================================
 
-    def model_forward(
+    def forward_layers(
         self,
         input_ids: torch.Tensor = None,
         hidden_states: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
+        position_ids: torch.Tensor = None,
+        past_key_values: tuple = None,
         use_cache: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        单步前向推理，输出中间特征或最终结果。
+        执行本节点层范围的单步前向传播（分布式流水线节点专用）。
 
-        两种调用模式:
-        1. 首节点（Prefill）: 传 input_ids，从 Embedding 开始
-        2. 后续节点: 传 hidden_states，仅经过 Transformer 层
+        三种节点角色:
+         - 首节点 (has_embedding): input_ids → embed_tokens → layers → hidden_states
+         - 中间节点:              hidden_states → layers → hidden_states
+         - 末节点 (has_lm_head):  hidden_states → layers → norm → lm_head → logits
 
-        注意: 此接口仅 PyTorch 引擎支持，llama.cpp 使用 chat() 接口。
+        严格遵循 Qwen2Model.forward() 的调用链，复用其 RoPE、causal_mask、
+        和 position_embeddings 计算逻辑，确保分布式与单机推理输出一致。
+
+        **KV Cache 支持 (Phase 3 — 增量解码)**:
+         - Prefill (past_key_values=None): 处理完整输入序列，构建 KV cache
+         - Decode (past_key_values 存在): 仅处理新 token，基于缓存的 KV 增量计算
+         - KV Cache 形状: 每层 (batch, num_heads, total_seq_len, head_dim)
+         - past_key_values 索引 0..(N-1) 对应本节点的 N 个本地层
+
+        Args:
+            input_ids: 输入 token IDs (batch, seq_len)，仅首节点使用
+            hidden_states: 中间隐藏状态 (batch, seq_len, hidden_dim)，中间/末节点使用
+            attention_mask: 2D 注意力掩码 (batch, seq_len)，1=有效，0=填充
+            position_ids: 位置 ID (batch, seq_len)，None 则自动生成
+            past_key_values: 已缓存的 KV cache，tuple of (key, value) per local layer
+            use_cache: 是否返回新的 KV cache（decode 阶段应为 True）
+
+        Returns:
+            {"hidden_states": Tensor}       — 非末节点，形状 (batch, seq_len, hidden_dim)
+            {"logits": Tensor}             — 末节点，形状 (batch, seq_len, vocab_size)
+            当 use_cache=True 时附加:
+            {"past_key_values": tuple}     — 更新后的 KV cache（每层一个 (k,v) 元组）
         """
-        model = self.sub_model if self.sub_model is not None else self.model
+        if self.model is None:
+            raise RuntimeError("模型未加载，请先调用 load_model() 或 load_layer_range()")
 
-        if model is None:
-            raise RuntimeError("模型未加载，请先调用 load_model()")
+        if self._engine_type != "pytorch":
+            raise RuntimeError("forward_layers 仅支持 PyTorch 引擎")
 
-        start, end = self.layer_range or (0, self._model_layers)
-        is_first = (start == 0)
-        is_last = (end >= self._model_layers)
+        # ---- 输入校验 ----
+        if input_ids is None and hidden_states is None:
+            raise ValueError("必须提供 input_ids 或 hidden_states 之一")
+        if input_ids is not None and hidden_states is not None:
+            raise ValueError("input_ids 和 hidden_states 不能同时提供")
 
-        logger.debug(f"model_forward: layers [{start},{end}), first={is_first}, last={is_last}")
+        device = self.get_device()
+        transformer = self.model.model  # Qwen2Model
+        dtype = next(self.model.parameters()).dtype
 
-        return {}  # TODO: 实现实际推理逻辑
+        # 检测节点角色
+        has_embed = (
+            hasattr(transformer, 'embed_tokens')
+            and transformer.embed_tokens is not None
+        )
+        has_lm_head = (
+            hasattr(self.model, 'lm_head')
+            and self.model.lm_head is not None
+        )
+
+        batch_size: int
+        seq_len: int
+
+        # ============================================================
+        # 整个前向传播在 torch.no_grad() 下执行，避免梯度追踪开销。
+        # ============================================================
+        with torch.no_grad():
+            # ============================================================
+            # Step 1: Embedding（首节点）
+            # ============================================================
+            if input_ids is not None:
+                if not has_embed:
+                    raise RuntimeError(
+                        "当前节点不含 Embedding 层（加载时未设置 has_embedding=True），"
+                        "请传入 hidden_states"
+                    )
+                input_ids = input_ids.to(device)
+                batch_size, seq_len = input_ids.shape
+                hidden_states = transformer.embed_tokens(input_ids).to(dtype=dtype)
+            else:
+                batch_size = hidden_states.shape[0]
+                seq_len = hidden_states.shape[1]
+                if hidden_states.device != device:
+                    hidden_states = hidden_states.to(device)
+                if hidden_states.dtype != dtype:
+                    hidden_states = hidden_states.to(dtype)
+
+            # ============================================================
+            # Step 2: KV Cache 初始化 — DynamicCache with local indices
+            # ============================================================
+            # Qwen2SdpaAttention / FlashAttention2 使用 DynamicCache，
+            # 其内部以 self_attn.layer_idx 为索引存储 key/value。
+            #
+            # ★ 分布式节点仅加载部分层，若使用原始 global_idx（如 8-15），
+            #    DynamicCache 会产生稀疏空洞（需 None 填充），导致
+            #    get_seq_length() 对空洞条目抛 TypeError。
+            #
+            #    解决方案: 临时将各层的 self_attn.layer_idx 改为本地索引
+            #    (0, 1, 2, ...)，使 DynamicCache 按连续本地索引存储。
+            #    forward 后恢复原始 global_idx，确保后续调用不受影响。
+            from transformers.cache_utils import DynamicCache
+
+            # 保存并覆盖层索引为本地连续编号
+            saved_layer_indices: list = []
+            for local_idx, layer in enumerate(transformer.layers):
+                saved_layer_indices.append(layer.self_attn.layer_idx)
+                layer.self_attn.layer_idx = local_idx
+
+            if use_cache:
+                if past_key_values is not None:
+                    # Decode: tuple of (k,v) → DynamicCache（本地索引 0..N-1）
+                    cache = DynamicCache()
+                    for k, v in past_key_values:
+                        cache.key_cache.append(k)
+                        cache.value_cache.append(v)
+                else:
+                    # Prefill: 创建空 DynamicCache
+                    cache = DynamicCache()
+            else:
+                cache = None
+
+            # ---- 从 cache 获取 past_seen_tokens ----
+            if cache is not None and len(cache.key_cache) > 0:
+                try:
+                    past_seen_tokens = cache.get_seq_length()
+                except Exception:
+                    past_seen_tokens = 0
+            else:
+                past_seen_tokens = 0
+
+            # ============================================================
+            # Step 3: position_ids / cache_position
+            # ============================================================
+            if position_ids is None:
+                cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + seq_len,
+                    device=device
+                )
+                position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
+            else:
+                position_ids = position_ids.to(device)
+                cache_position = torch.arange(
+                    past_seen_tokens, past_seen_tokens + seq_len,
+                    device=device
+                )
+
+            # ============================================================
+            # Step 4: causal_mask — 复用 Qwen2Model 内置逻辑
+            # ============================================================
+            # _update_causal_mask 会根据 attention 实现自动选择:
+            #   flash_attention_2 → None（flash 内核自行处理因果掩码）
+            #   sdpa + 纯因果 → None（SDPA is_causal 路径）
+            #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
+            #
+            # ★ KV Cache: DynamicCache 直接传给 _update_causal_mask，
+            #    其内置 get_seq_length() 方法用于正确计算掩码。
+            causal_mask = transformer._update_causal_mask(
+                attention_mask=attention_mask.to(device) if attention_mask is not None else None,
+                input_tensor=hidden_states,
+                cache_position=cache_position,
+                past_key_values=cache,
+                output_attentions=False,
+            )
+
+            # ============================================================
+            # Step 5: position_embeddings — RoPE 旋转位置编码
+            # ============================================================
+            # Qwen2Model.rotary_emb 会将 position_ids 转换为 cos/sin 元组，
+            # 各 attention 层内部通过 apply_rotary_pos_emb 应用到 Q/K 上。
+            # 此步在层循环外仅计算一次，所有层共享同一份 position_embeddings。
+            position_embeddings = transformer.rotary_emb(hidden_states, position_ids)
+
+            # ============================================================
+            # Step 6: Transformer 层前向传播（支持 KV cache）
+            # ============================================================
+            # DynamicCache 由 SDPA/FlashAttention 在 forward 时原地更新，
+            # 每层的 key/value 被追加到 cache.key_cache[layer_idx] 中。
+            try:
+                for i, layer in enumerate(transformer.layers):
+                    layer_output = layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        position_embeddings=position_embeddings,
+                        past_key_value=cache,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
+                    # Qwen2DecoderLayer 返回: (hidden_states,) 或 (hidden_states, present_key_value)
+                    hidden_states = layer_output[0]
+                    del layer_output
+
+                # ============================================================
+                # Step 7: 最终 Norm + LM Head（末节点）
+                # ============================================================
+                result: Dict[str, torch.Tensor] = {}
+
+                if has_lm_head:
+                    hidden_states = transformer.norm(hidden_states)
+                    logits = self.model.lm_head(hidden_states)
+                    result["logits"] = logits
+                else:
+                    result["hidden_states"] = hidden_states
+
+                # ---- KV Cache: 转为 tuple 存储 ----
+                if use_cache and cache is not None and len(cache.key_cache) > 0:
+                    result["past_key_values"] = tuple(
+                        (cache.key_cache[i], cache.value_cache[i])
+                        for i in range(len(cache.key_cache))
+                    )
+
+                return result
+            finally:
+                # ★ 无论成功/异常，必须恢复原始 layer_idx
+                for layer, orig_idx in zip(transformer.layers, saved_layer_indices):
+                    layer.self_attn.layer_idx = orig_idx
 
     # ================================================================
     # 工具方法
@@ -671,7 +968,8 @@ class ModelManager:
             "quant_type": self.quant_type,
             "compile": USE_COMPILE,
             "layer_range": self.layer_range,
-            "total_layers": self._model_layers,
+            "total_layers": self._total_model_layers or self._model_layers,
+            "loaded_layers": self._model_layers,
             "device": str(self.get_device()),
         }
         if torch.cuda.is_available():
@@ -696,3 +994,39 @@ class ModelManager:
         if self._engine_type == "llama_cpp" and self._llama_engine:
             self._llama_engine.reset_kv_cache()
         # PyTorch: KV cache 由 transformers generate() 内部管理，每次调用自动重置
+
+    # ================================================================
+    # KV Cache 工具方法（Phase 3 — 增量解码）
+    # ================================================================
+
+    @staticmethod
+    def _tuple_to_dynamic_cache(past_key_values: tuple, start_layer: int = 0):
+        """
+        将旧格式 tuple of (k,v) 转换为 DynamicCache。
+
+        Qwen2 SDPA/Flash Attention 使用 DynamicCache（transformers >= 4.44），
+        每层的 self_attn.layer_idx 为全局层编号，故 DynamicCache 内部
+        以全局 layer_idx 为索引存储 key/value。
+
+        Args:
+            past_key_values: tuple of (key, value) per layer，索引 0..N-1
+            start_layer: 第一个元素的全局层编号（分布式节点专用）
+
+        Returns:
+            DynamicCache 对象
+        """
+        from transformers.cache_utils import DynamicCache
+
+        cache = DynamicCache()
+        for i, kv in enumerate(past_key_values):
+            if kv is None:
+                continue
+            k, v = kv
+            global_idx = start_layer + i
+            # 确保列表长度足够
+            while len(cache.key_cache) <= global_idx:
+                cache.key_cache.append(None)
+                cache.value_cache.append(None)
+            cache.key_cache[global_idx] = k
+            cache.value_cache[global_idx] = v
+        return cache

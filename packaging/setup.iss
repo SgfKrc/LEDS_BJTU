@@ -9,20 +9,20 @@
 ;   1. 已完成 PyInstaller 打包 → dist/QLH-Edge-Inference/
 ;   2. 已安装 Inno Setup 6 (默认路径 C:\Program Files (x86)\Inno Setup 6)
 ;
-; 输出: dist/QLH-Edge-Inference-Setup-v0.1.0.exe
+; 输出: dist/QLH-Edge-Inference-Setup-v0.1.4.exe
 ; ============================================================
 
 #define MyAppName         "QLH Edge Inference"
 #define MyAppNameCN       "轻量化大模型分布式边缘推理系统"
-#define MyAppVersion      "0.1.0"
+#define MyAppVersion      "0.1.4"
 #define MyAppPublisher    "北京交通大学 · 大创项目"
 #define MyAppExeName      "QLH-Edge-Inference.exe"
-#define MyAppSourceDir    "dist\QLH-Edge-Inference"
+#define MyAppSourceDir    "..\dist\QLH-Edge-Inference"
 #define MyAppOutputDir    "dist"
 
 [Setup]
 ; 全局唯一标识 — 不要修改（用于升级检测和卸载）
-AppId={{F1A3B5C7-8D2E-4F6A-9B1C-3D5E7F8A0B2C}
+AppId={{F1A3B5C7-8D2E-4F6A-9B1C-3D5E7F8A0B2C}}
 
 ; 基本信息
 AppName={#MyAppName}
@@ -77,8 +77,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; ---- 主程序（PyInstaller 输出） ----
+; restartreplace: 若文件被旧版进程锁定，标记为重启后替换
+; ignoreversion: 不比较版本号，直接覆盖
 Source: "{#MyAppSourceDir}\*"; DestDir: "{app}"; \
-  Flags: ignoreversion recursesubdirs createallsubdirs
+  Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 
 ; ---- 项目文档 ----
 Source: "..\README.md"; DestDir: "{app}\docs"; Flags: ignoreversion
@@ -121,12 +123,52 @@ Filename: "{app}\{#MyAppExeName}"; \
   Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
-; 清理运行时产生的文件
+; 清理运行时产生的文件（卸载时删除日志和前端缓存，保留模型文件）
 Type: files; Name: "{app}\logs\*"
 Type: dirifempty; Name: "{app}\logs"
-Type: dirifempty; Name: "{app}\models"
 
 [Code]
+// ---- 卸载旧版本（通过注册表 AppId 查找已有安装）----
+function GetOldUninstallString(var UninstPath: String): Boolean;
+begin
+  Result := RegQueryStringValue(
+    HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    '{#emit SetupSetting("AppId")}_is1', 'UninstallString', UninstPath
+  ) or RegQueryStringValue(
+    HKEY_CURRENT_USER, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    '{#emit SetupSetting("AppId")}_is1', 'UninstallString', UninstPath
+  );
+end;
+
+// ---- 安装前检查 ----
+function InitializeSetup: Boolean;
+var
+  UninstPath: String;
+  ResultCode: Integer;
+begin
+  Result := True;
+
+  // 检测是否有已安装的旧版本
+  if GetOldUninstallString(UninstPath) then
+  begin
+    if MsgBox(
+      '检测到已安装的旧版本 {#MyAppNameCN}。' + #13#10 +
+      '覆盖安装可能导致文件冲突（新旧 DLL 混在一起）。' + #13#10#13#10 +
+      '建议：先卸载旧版本，再重新安装。' + #13#10 +
+      '模型文件和日志不会被删除。' + #13#10#13#10 +
+      '是否自动卸载旧版本后继续？' + #13#10 +
+      '（选「否」则直接覆盖安装，不推荐）',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON1
+    ) = IDYES then
+    begin
+      // 静默卸载旧版本
+      Exec(RemoveQuotes(ExtractFilePath(UninstPath)),
+           '/VERYSILENT /SUPPRESSMSGBOXES',
+           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+
 // 安装完成的提示（中文/英文自适应）
 procedure CurStepChanged(CurStep: TSetupStep);
 begin

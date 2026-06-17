@@ -47,12 +47,19 @@ from config import (
 # 数据库模块（可选，未安装 psycopg2 时使用内存降级）
 try:
     from db import init_db, close_db, db_health
-    _db_available = True
+    _db_importable = True
 except ImportError:
-    _db_available = False
+    _db_importable = False
     init_db = lambda: None
     close_db = lambda: None
     db_health = lambda: {"status": "unavailable", "message": "psycopg2 未安装"}
+
+# _db_available 动态追踪实际连接状态：启动时尝试连接，失败则标记 False
+# _db_importable 仅表示 psycopg2 已安装（静态）
+_db_available = _db_importable
+
+# 本地文件储存（云数据库不可用时的降级方案）
+import local_store as _local_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +73,7 @@ logger = logging.getLogger("api_server")
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.0",
+    version="0.1.4",
     description="北京交通大学 · 大学生创新创业训练计划",
 )
 
@@ -142,9 +149,26 @@ async def startup_device_detection():
     # 初始化数据库连接
     try:
         init_db()
-        logger.info("数据库已连接")
+        # ★ 设置数据隔离参数：conversations/sessions 将按 node_id 过滤
+        from db import set_active_node_id
+        # ★ MAC 不匹配自动切换：若 start() 时检测到 MAC 不匹配且有真实主节点，
+        #    后台线程 _auto_switch_to_client 会在 2s 后完成切换。
+        #    此处等待最多 5s，确保切换完成后再设置 node_id。
+        if (getattr(scheduler, '_master_identity_reason', '') == 'mac_mismatch'
+                and getattr(scheduler, '_role_override', None) != 'client'):
+            # 自动切换尚未完成（后台线程延迟 2s），等待切换
+            logger.info("⏳ 等待 MAC 不匹配自动切换到从节点模式...")
+            import time as _time
+            for _ in range(10):  # 最多等 5 秒 (10 × 0.5s)
+                _time.sleep(0.5)
+                if getattr(scheduler, '_role_override', None) == 'client':
+                    break
+        set_active_node_id(scheduler.get_effective_node_id())
+        logger.info(f"数据库已连接，活跃节点: {scheduler.get_effective_node_id()}")
     except Exception as e:
-        logger.warning(f"数据库初始化失败（使用内存降级）: {e}")
+        global _db_available
+        _db_available = False
+        logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
 
 
 @app.on_event("shutdown")
@@ -180,13 +204,17 @@ async def shutdown_db():
 # ============================================================
 
 class LoadModelRequest(BaseModel):
+    engine: str = Field(
+        default="auto",
+        description="推理引擎: auto (自动检测) | llama_cpp (GGUF) | pytorch (Safetensors)",
+    )
     quant_type: str = Field(
         default="int4",
-        description="量化精度: fp16 | int8 | int4",
+        description="PyTorch 量化精度: fp16 | int8 | int4（llama_cpp 引擎忽略此参数）",
     )
     use_compile: bool = Field(
         default=False,
-        description="是否开启 torch.compile 算子融合（仅 FP16 有效）",
+        description="是否开启 torch.compile 算子融合（仅 PyTorch FP16 有效）",
     )
 
 
@@ -228,6 +256,8 @@ class ClusterStatus(BaseModel):
     nodes: dict[str, NodeDetail] = {}
     current_task: Optional[dict] = None
     tcp_server: Optional[dict] = None
+    pipeline: Optional[dict] = None
+    pipeline_queue: Optional[dict] = None
 
 
 class UpdateMaxNodesRequest(BaseModel):
@@ -403,7 +433,7 @@ def _switch_session(target_id: str) -> None:
 
     active_session_id = target_id
 
-    # 如果目标会话不在内存中，尝试从 DB 加载
+    # 如果目标会话不在内存中，尝试从 DB 或本地文件加载
     if target_id not in session_histories:
         messages = []
         if _db_available:
@@ -411,6 +441,13 @@ def _switch_session(target_id: str) -> None:
                 import db as _db_mod
                 rows = _db_mod.get_conversation(target_id)
                 messages = [{"role": r["role"], "content": r["content"]} for r in rows]
+            except Exception:
+                pass
+        if not messages:
+            # DB 不可用或返回空 → 尝试本地文件
+            try:
+                local_rows = _local_store.load_local_conversation(target_id)
+                messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
             except Exception:
                 pass
         session_histories[target_id] = messages
@@ -431,6 +468,11 @@ def _auto_title_session(session_id: str, first_message: str) -> None:
         try:
             import db as _db_mod
             _db_mod.update_session_title(session_id, title)
+        except Exception:
+            pass
+    else:
+        try:
+            _local_store.update_local_session_title(session_id, title)
         except Exception:
             pass
 
@@ -826,12 +868,20 @@ def _init_kv_cache():
             num_heads=num_heads,
             head_dim=head_dim,
         )
+        logger.info(
+            f"🧠 KV 缓存已初始化 (profile): num_heads={num_heads}, "
+            f"head_dim={head_dim}, device={model_manager.get_device()}"
+        )
     else:
         kv_cache = PagedKVCache(
             page_size=PAGE_SIZE,
             max_pages=MAX_PAGE_NUM,
             device=str(model_manager.get_device()),
             dtype=torch.float16,
+        )
+        logger.info(
+            f"🧠 KV 缓存已初始化 (default): page_size={PAGE_SIZE}, "
+            f"max_pages={MAX_PAGE_NUM}, device={model_manager.get_device()}"
         )
     return kv_cache
 
@@ -1253,8 +1303,8 @@ async def get_status():
         "model_name": MODEL_NAME,
         "model_path": MODEL_PATH,
         "run_mode": RUN_MODE,
-        "node_role": NODE_ROLE,
-        "node_id": NODE_ID,
+        "node_role": scheduler._effective_role(),
+        "node_id": scheduler.get_effective_node_id(),
         "max_nodes": MAX_NODES,
         "gpu": gpu_info,
         "kv_cache": kv_stats,
@@ -1292,8 +1342,16 @@ async def load_model(req: LoadModelRequest):
     """
     global model_loaded, current_quant, kv_cache, conversation_stats
 
+    engine = req.engine.lower()
+    if engine not in ("auto", "llama_cpp", "pytorch"):
+        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch")
+
     quant = req.quant_type.lower()
-    if quant not in ("fp16", "int8", "int4"):
+    # llama_cpp 引擎使用 GGUF 格式，不涉及 bitsandbytes 量化精度
+    # gguf / any 等占位值均合法（由 ModelManager 自动选择 GGUF 文件）
+    if engine == "llama_cpp":
+        pass  # quant_type 对 llama.cpp 无意义，放行任意值
+    elif quant not in ("fp16", "int8", "int4"):
         raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
 
     try:
@@ -1330,13 +1388,14 @@ async def load_model(req: LoadModelRequest):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
-        # 临时修改 config
+        # 临时修改 config（引擎 + 量化）
         import config as cfg
+        cfg.INFERENCE_ENGINE = engine
         cfg.QUANT_TYPE = quant
         cfg.USE_COMPILE = req.use_compile
 
-        # 加载新模型（传入设备画像以启用自适应加载）
-        logger.info(f"加载模型: quant={quant}, compile={req.use_compile}")
+        # 加载新模型
+        logger.info(f"加载模型: engine={engine}, quant={quant}, compile={req.use_compile}")
         model_manager.load_model(
             model_path=MODEL_PATH,
             quant_type=quant,
@@ -1395,7 +1454,7 @@ async def chat(req: ChatRequest):
     # ---- 分布式推理路由：从节点转发给主节点 ----
     if (scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
-            and NODE_ROLE == "client"):
+            and scheduler._effective_role() == "client"):
         try:
             result = scheduler.forward_inference_to_master(
                 message=req.message,
@@ -1411,7 +1470,7 @@ async def chat(req: ChatRequest):
                 response_text = result.get("content", "")
                 history.append({"role": "assistant", "content": response_text})
 
-                # 持久化到数据库
+                # 持久化到数据库（或本地文件降级）
                 db_session_id = target_session_id or "default"
                 if _db_available:
                     try:
@@ -1421,6 +1480,14 @@ async def chat(req: ChatRequest):
                             _db_mod.save_message(db_session_id, "assistant", response_text,
                                                 {"engine": "distributed"})
                             _db_mod.increment_session_message_count(db_session_id)
+                    except Exception:
+                        pass
+                if not _db_available:
+                    try:
+                        _local_store.save_local_message(db_session_id, "user", req.message)
+                        _local_store.save_local_message(db_session_id, "assistant", response_text,
+                                                        {"engine": "distributed"})
+                        _local_store.increment_local_session_message_count(db_session_id)
                     except Exception:
                         pass
 
@@ -1464,6 +1531,81 @@ async def chat(req: ChatRequest):
         except Exception as e:
             logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
 
+    # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
+    if (scheduler.get_distributed_inference_enabled()
+            and RUN_MODE == "distributed"
+            and scheduler._effective_role() == "master"
+            and model_manager._engine_type == "pytorch"):
+        try:
+            pipeline_result = scheduler.run_pipeline_safe(
+                req.message,
+                max_new_tokens=req.max_new_tokens,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                session_id=req.session_id,
+            )
+            if pipeline_result.get("error"):
+                logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
+            else:
+                response_text = pipeline_result.get("response", "")
+                if not response_text:
+                    logger.warning("流水线返回空响应，回退到本地推理")
+                else:
+                    history.append({"role": "user", "content": req.message})
+                    history.append({"role": "assistant", "content": response_text})
+
+                    db_session_id = target_session_id or "default"
+                    pipeline_metrics = pipeline_result.get("metrics", {})
+                    if _db_available:
+                        try:
+                            import db as _db_mod
+                            if _db_mod.get_save_history():
+                                _db_mod.save_message(db_session_id, "user", req.message)
+                                _db_mod.save_message(db_session_id, "assistant", response_text,
+                                                    {"engine": "distributed_pipeline",
+                                                     "pipeline": pipeline_metrics})
+                                _db_mod.increment_session_message_count(db_session_id)
+                        except Exception:
+                            pass
+                    if not _db_available:
+                        try:
+                            _local_store.save_local_message(db_session_id, "user", req.message)
+                            _local_store.save_local_message(db_session_id, "assistant",
+                                                            response_text,
+                                                            {"engine": "distributed_pipeline"})
+                            _local_store.increment_local_session_message_count(db_session_id)
+                        except Exception:
+                            pass
+
+                    conversation_stats["rounds"] += 1
+                    try:
+                        scheduler.record_task_complete(success=True)
+                    except Exception:
+                        pass
+
+                    # 生成追问建议
+                    if model_manager._engine_type == "llama_cpp":
+                        followups = _generate_followups_llama(history)
+                    elif model_manager._engine_type == "pytorch":
+                        try:
+                            followups = _generate_followups(
+                                history, model_manager.tokenizer,
+                                model_manager.model, model_manager.get_device()
+                            )
+                        except Exception:
+                            followups = _fallback_followups(history, [])
+                    else:
+                        followups = _fallback_followups(history, [])
+
+                    return ChatResponse(
+                        content=response_text,
+                        metrics={"engine": "distributed_pipeline",
+                                 "pipeline": pipeline_metrics},
+                        followups=followups,
+                    )
+        except Exception as e:
+            logger.warning(f"流水线推理异常: {e}，回退到本地推理")
+
     # ---- llama.cpp 引擎路径（CPU/集显，GGUF）----
     if model_manager._engine_type == "llama_cpp":
         try:
@@ -1480,10 +1622,10 @@ async def chat(req: ChatRequest):
             usage = result.get("usage", {})
             completion_tokens = usage.get("completion_tokens", 0)
 
-            # 持久化到数据库（受 save_history 开关控制）
+            # 持久化（数据库优先，不可用时使用本地文件降级）
             db_session_id = target_session_id or "default"
 
-            # 生成追问建议（在 DB 保存之前，以便持久化到 metrics 中）
+            # 生成追问建议（在保存之前，以便持久化到 metrics 中）
             followups = _generate_followups_llama(history)
 
             if _db_available:
@@ -1496,6 +1638,14 @@ async def chat(req: ChatRequest):
                                              "completion_tokens": completion_tokens,
                                              "followups": followups})
                         _db_mod.increment_session_message_count(db_session_id)
+                except Exception:
+                    pass
+            if not _db_available:
+                try:
+                    _local_store.save_local_message(db_session_id, "user", req.message)
+                    _local_store.save_local_message(db_session_id, "assistant", response_text,
+                                                    {"engine": "llama.cpp"})
+                    _local_store.increment_local_session_message_count(db_session_id)
                 except Exception:
                     pass
 
@@ -1601,10 +1751,10 @@ async def chat(req: ChatRequest):
             else 0,
         }
 
-        # 持久化到数据库（受 save_history 开关控制）
+        # 持久化（数据库优先，不可用时使用本地文件降级）
         db_session_id = target_session_id or "default"
 
-        # 生成追问建议（在 DB 保存之前，以便持久化）
+        # 生成追问建议（在保存之前，以便持久化）
         followups = _generate_followups(
             history, tokenizer, model_manager.model, model_manager.get_device()
         )
@@ -1619,6 +1769,15 @@ async def chat(req: ChatRequest):
                     save_metrics["followups"] = followups
                     _db_mod.save_message(db_session_id, "assistant", response_text, save_metrics)
                     _db_mod.increment_session_message_count(db_session_id)
+            except Exception:
+                pass
+        if not _db_available:
+            try:
+                save_metrics = dict(metrics)
+                save_metrics["followups"] = followups
+                _local_store.save_local_message(db_session_id, "user", req.message)
+                _local_store.save_local_message(db_session_id, "assistant", response_text, save_metrics)
+                _local_store.increment_local_session_message_count(db_session_id)
             except Exception:
                 pass
 
@@ -1687,7 +1846,31 @@ async def clear_chat():
 
 @app.get("/api/models/available")
 async def list_available_models():
-    """列出可选模型配置"""
+    """列出可选模型配置 + 可用引擎"""
+    import config as cfg
+    # 检测当前环境实际可用的引擎
+    available_engines = []
+    # llama.cpp: 有 GGUF 模型文件即可
+    from model_downloader import gguf_model_exists
+    if gguf_model_exists():
+        available_engines.append({
+            "id": "llama_cpp",
+            "name": "llama.cpp + GGUF",
+            "description": "CPU/集显推理，Q4_K_M ~1.16 GB，~10-15 tok/s",
+            "model_size_gb": 1.2,
+            "requires_cuda": False,
+        })
+    # PyTorch: 有 Safetensors 模型文件即可
+    from model_downloader import safetensors_model_exists
+    if safetensors_model_exists():
+        has_cuda = torch.cuda.is_available()
+        available_engines.append({
+            "id": "pytorch",
+            "name": "PyTorch + Safetensors" + (" (CUDA)" if has_cuda else " (CPU)"),
+            "description": "Safetensors 格式，支持 INT4/INT8/FP16 量化" + ("，GPU 加速" if has_cuda else "，CPU 模式较慢"),
+            "model_size_gb": 1.8 if has_cuda else 3.5,
+            "requires_cuda": has_cuda,
+        })
     return {
         "models": [
             {
@@ -1697,6 +1880,7 @@ async def list_available_models():
                 "memory_gb": 3.5,
                 "speed_tok_s": 53,
                 "compile_support": True,
+                "engine": "pytorch",
             },
             {
                 "id": "int4",
@@ -1705,6 +1889,7 @@ async def list_available_models():
                 "memory_gb": 1.8,
                 "speed_tok_s": 29,
                 "compile_support": False,
+                "engine": "pytorch",
             },
             {
                 "id": "int8",
@@ -1713,9 +1898,12 @@ async def list_available_models():
                 "memory_gb": 2.3,
                 "speed_tok_s": 10,
                 "compile_support": False,
+                "engine": "pytorch",
             },
         ],
         "current": current_quant if model_loaded else None,
+        "current_engine": model_manager._engine_type if model_manager.is_loaded else None,
+        "available_engines": available_engines,
     }
 
 
@@ -1887,7 +2075,7 @@ async def check_master_health():
     Returns:
         { master_online, last_seen_seconds_ago, stale, master_host, master_port }
     """
-    if NODE_ROLE == "master":
+    if scheduler._effective_role() == "master":
         # 主节点自身：直接返回在线
         return {
             "master_online": True,
@@ -2254,6 +2442,7 @@ async def get_conversation_sync_status():
         "save_history": save_history,
         "db_connected": _db_available,
         "local_save_enabled": True,  # localStorage 始终可用
+        "local_store_enabled": True,  # 本地文件降级始终可用
         "cloud_sync_enabled": save_history and _db_available,
     }
 
@@ -2269,40 +2458,48 @@ async def get_conversations(session_id: str = "default", limit: int = 200):
 
     如果数据库不可用，回退到内存中的对话历史（按 session_id 过滤）。
     """
-    if not _db_available:
-        targeted_history = session_histories.get(session_id, [])
-        return {
-            "messages": [
-                {"role": m["role"], "content": m["content"]}
-                for m in targeted_history
-            ],
-            "count": len(targeted_history),
-            "source": "memory",
-        }
+    # ---- 加载顺序: 数据库 → 本地文件 → 内存 ----
+    if _db_available:
+        try:
+            import db as _db_mod
+            messages = _db_mod.get_conversation(session_id, limit)
+            count = _db_mod.get_conversation_count(session_id)
+            return {
+                "messages": [
+                    {"role": m["role"], "content": m["content"], "created_at": m.get("created_at")}
+                    for m in messages
+                ],
+                "count": count,
+                "source": "database",
+            }
+        except Exception as e:
+            logger.warning(f"数据库读取对话历史失败: {e}")
 
+    # 尝试本地文件
     try:
-        import db as _db_mod
-        messages = _db_mod.get_conversation(session_id, limit)
-        count = _db_mod.get_conversation_count(session_id)
-        return {
-            "messages": [
-                {"role": m["role"], "content": m["content"], "created_at": m.get("created_at")}
-                for m in messages
-            ],
-            "count": count,
-            "source": "database",
-        }
-    except Exception as e:
-        logger.warning(f"数据库读取对话历史失败: {e}")
-        targeted_history = session_histories.get(session_id, [])
-        return {
-            "messages": [
-                {"role": m["role"], "content": m["content"]}
-                for m in targeted_history
-            ],
-            "count": len(targeted_history),
-            "source": "memory_fallback",
-        }
+        local_messages = _local_store.load_local_conversation(session_id, limit)
+        if local_messages:
+            return {
+                "messages": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in local_messages
+                ],
+                "count": len(local_messages),
+                "source": "local_store",
+            }
+    except Exception:
+        pass
+
+    # 最终降级：内存
+    targeted_history = session_histories.get(session_id, [])
+    return {
+        "messages": [
+            {"role": m["role"], "content": m["content"]}
+            for m in targeted_history
+        ],
+        "count": len(targeted_history),
+        "source": "memory_fallback",
+    }
 
 
 @app.delete("/api/conversations")
@@ -2321,6 +2518,12 @@ async def delete_conversations(session_id: str = "default"):
             logger.info(f"数据库对话历史已清空: session={session_id}, {deleted_count} 条")
         except Exception as e:
             logger.warning(f"数据库清空对话历史失败: {e}")
+    if not _db_available:
+        try:
+            deleted_count = _local_store.clear_local_conversation(session_id)
+            logger.info(f"本地对话历史已清空: session={session_id}, {deleted_count} 条")
+        except Exception as e:
+            logger.warning(f"本地清空对话历史失败: {e}")
 
     if session_id == active_session_id or session_id == "default":
         _get_active_history().clear()
@@ -2364,13 +2567,18 @@ async def create_session(req: CreateSessionRequest = None):
     elif req and req.title:
         title = req.title
 
-    # 持久化到数据库
+    # 持久化到数据库（或本地文件降级）
     if _db_available:
         try:
             import db as _db_mod
             _db_mod.create_session(session_id, title)
         except Exception as e:
             logger.warning(f"数据库创建会话失败: {e}")
+    if not _db_available:
+        try:
+            _local_store.create_local_session(session_id, title)
+        except Exception as e:
+            logger.warning(f"本地创建会话失败: {e}")
 
     # 注册到内存并激活
     session_histories[session_id] = []
@@ -2403,16 +2611,39 @@ async def list_sessions(limit: int = 50, offset: int = 0):
         except Exception as e:
             logger.warning(f"数据库读取会话列表失败: {e}")
 
-    # 降级：从内存构造
+    # 降级：从本地文件 + 内存合并
     mem_sessions = []
+    seen_ids = set()
+
+    # 1. 本地文件中的会话（有持久化的元数据）
+    try:
+        local_sessions = _local_store.get_all_local_sessions(limit, offset)
+        for ls in local_sessions:
+            sid = ls["id"]
+            seen_ids.add(sid)
+            # 用内存中的实际消息数更新计数
+            hist = session_histories.get(sid, [])
+            mem_sessions.append({
+                "id": sid,
+                "title": ls.get("title", "新对话"),
+                "message_count": len(hist) or ls.get("message_count", 0),
+                "created_at": ls.get("created_at"),
+                "updated_at": ls.get("updated_at"),
+            })
+    except Exception:
+        pass
+
+    # 2. 内存中有但本地文件中没有的会话
     for sid, hist in session_histories.items():
-        mem_sessions.append({
-            "id": sid,
-            "title": "会话" if not hist else (hist[0].get("content", "")[:30] if hist else "新对话"),
-            "message_count": len(hist),
-            "created_at": None,
-            "updated_at": None,
-        })
+        if sid not in seen_ids:
+            mem_sessions.append({
+                "id": sid,
+                "title": "会话" if not hist else (hist[0].get("content", "")[:30] if hist else "新对话"),
+                "message_count": len(hist),
+                "created_at": None,
+                "updated_at": None,
+            })
+
     return {
         "sessions": mem_sessions,
         "active_session_id": active_session_id,
@@ -2431,7 +2662,17 @@ async def get_session_info(session_id: str):
                 return session
         except Exception:
             pass
-    # 降级
+    # 尝试本地文件
+    try:
+        local_session = _local_store.get_local_session(session_id)
+        if local_session:
+            hist = session_histories.get(session_id, [])
+            local_session["message_count"] = len(hist) or local_session.get("message_count", 0)
+            local_session["active"] = session_id == active_session_id
+            return local_session
+    except Exception:
+        pass
+    # 最终降级
     hist = session_histories.get(session_id, [])
     return {
         "id": session_id,
@@ -2452,6 +2693,13 @@ async def rename_session(session_id: str, req: RenameSessionRequest):
                 return updated
         except Exception as e:
             logger.warning(f"数据库重命名会话失败: {e}")
+    if not _db_available:
+        try:
+            updated = _local_store.update_local_session_title(session_id, req.title)
+            if updated:
+                return updated
+        except Exception as e:
+            logger.warning(f"本地重命名会话失败: {e}")
     raise HTTPException(404, f"会话不存在: {session_id}")
 
 
@@ -2471,6 +2719,11 @@ async def delete_session(session_id: str):
             deleted = _db_mod.delete_session(session_id)
         except Exception as e:
             logger.warning(f"数据库删除会话失败: {e}")
+    if not _db_available:
+        try:
+            deleted = _local_store.delete_local_session(session_id)
+        except Exception as e:
+            logger.warning(f"本地删除会话失败: {e}")
 
     # 从内存中移除
     session_histories.pop(session_id, None)
@@ -2517,12 +2770,19 @@ async def delete_turn(session_id: str, turn_index: int):
     # 验证 turn_index 范围
     history = session_histories.get(session_id, [])
     if not history:
-        # 尝试从 DB 加载
+        # 尝试从 DB 或本地文件加载
         if _db_available:
             try:
                 import db as _db_mod
                 rows = _db_mod.get_conversation(session_id)
                 history = [{"role": r["role"], "content": r["content"]} for r in rows]
+                session_histories[session_id] = history
+            except Exception:
+                pass
+        if not history:
+            try:
+                local_rows = _local_store.load_local_conversation(session_id)
+                history = [{"role": r["role"], "content": r["content"]} for r in local_rows]
                 session_histories[session_id] = history
             except Exception:
                 pass
@@ -2533,7 +2793,7 @@ async def delete_turn(session_id: str, turn_index: int):
     if turn_index < 0 or turn_index > max_turn:
         raise HTTPException(400, f"无效的轮次索引: {turn_index}（有效范围: 0-{max_turn}）")
 
-    # 从 DB 删除
+    # 从 DB 或本地文件删除
     deleted_count = 0
     if _db_available:
         try:
@@ -2542,6 +2802,12 @@ async def delete_turn(session_id: str, turn_index: int):
             _db_mod.decrement_session_message_count(session_id, 2)
         except Exception as e:
             logger.warning(f"数据库删除消息失败: {e}")
+    if not _db_available:
+        try:
+            deleted_count = _local_store.delete_local_message_range(session_id, turn_index)
+            _local_store.decrement_local_session_message_count(session_id, 2)
+        except Exception as e:
+            logger.warning(f"本地删除消息失败: {e}")
 
     # 从内存中移除这两条消息
     idx = turn_index * 2

@@ -114,7 +114,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       } catch (_) {
         // 非致命：后端不可用时仍可从 localStorage 加载
       }
-      // 再从服务器（数据库 / 后端内存）加载完整历史（含 metrics/followups）
+      // 再从服务器（数据库 / 本地文件 / 后端内存）加载完整历史（含 metrics/followups）
       try {
         const res = await fetchConversations(sessionId);
         console.log('[ChatPanel] history-loading: server response', {
@@ -124,7 +124,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           source: res?.source,
         });
         if (!cancelled && res?.messages?.length > 0) {
-          // 从 DB 加载的消息中恢复 followups（保存在最后一条 assistant 的 metrics.followups 中）
+          // 从服务器加载的消息中恢复 followups（保存在最后一条 assistant 的 metrics.followups 中）
           let savedFollowups = null;
           const lastAssistantMsg = [...res.messages].reverse().find(m => m.role === 'assistant');
           if (lastAssistantMsg?.metrics?.followups) {
@@ -141,42 +141,38 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             };
           });
           if (!cancelled) {
-            console.log('[ChatPanel] history-loading: SET messages from server', { count: msgs.length, firstRole: msgs[0]?.role });
+            console.log('[ChatPanel] history-loading: SET messages from server', { count: msgs.length, source: res?.source });
             setMessages(msgs);
             setHistoryLoading(false);
           }
-          // 同时更新 localStorage 缓存（仅当 saveHistory 开启时）
-          if (settings?.saveHistory) {
-            try { localStorage.setItem(storageKey, JSON.stringify(msgs)); } catch (_) {}
-          }
+          // 更新 localStorage 缓存（始终同步）
+          try { localStorage.setItem(storageKey, JSON.stringify(msgs)); } catch (_) {}
           return;
         }
-        // 服务器返回空 → 尝试 localStorage 缓存（save_history 关闭时消息仅存本地）
+        // 服务器返回空 → 尝试 localStorage 缓存
       } catch (err) {
         console.log('[ChatPanel] history-loading: server fetch failed, trying localStorage', { sessionId, error: err.message });
       }
 
-      // 降级：从 localStorage 加载（save_history 关闭时的主存储，或服务器不可用时的回退）
-      if (settings?.saveHistory) {
-        try {
-          const saved = localStorage.getItem(storageKey);
-          if (saved) {
-            const parsed = JSON.parse(saved);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              if (!cancelled) {
-                console.log('[ChatPanel] history-loading: SET messages from localStorage', { count: parsed.length });
-                setMessages(parsed);
-                const lastAssistant = [...parsed].reverse().find(m => m.role === 'assistant');
-                if (lastAssistant?.metrics) {
-                  setLastMetrics(lastAssistant.metrics);
-                }
-                setHistoryLoading(false);
-                return;
+      // 降级：从 localStorage 加载（本地持久化主存储，或服务器不可用时的回退）
+      try {
+        const saved = localStorage.getItem(storageKey);
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            if (!cancelled) {
+              console.log('[ChatPanel] history-loading: SET messages from localStorage', { count: parsed.length });
+              setMessages(parsed);
+              const lastAssistant = [...parsed].reverse().find(m => m.role === 'assistant');
+              if (lastAssistant?.metrics) {
+                setLastMetrics(lastAssistant.metrics);
               }
+              setHistoryLoading(false);
+              return;
             }
           }
-        } catch (_) {}
-      }
+        }
+      } catch (_) {}
 
       // 无历史（新会话或全部清空）
       if (!cancelled) {
@@ -192,30 +188,21 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   // 跟踪上次保存时对应的 sessionId，防止会话切换瞬间把旧消息存入新会话的 key
   const lastSavedSessionRef = useRef(sessionId);
 
-  // ---- 对话历史持久化: 保存（localStorage 即时缓存，服务器已由后端自动持久化） ----
+  // ---- 对话历史持久化: 保存（localStorage 始终启用，云同步由 saveHistory 控制） ----
   useEffect(() => {
     // ★ 关键守卫：如果 sessionId 刚刚改变，messages 仍属于旧会话，不能保存
     if (lastSavedSessionRef.current !== sessionId) {
       lastSavedSessionRef.current = sessionId;
       return;
     }
-    if (settings?.saveHistory && messages.length > 0 && sessionId) {
+    // ★ localStorage 始终保存（本地缓存，不依赖云连接）
+    if (messages.length > 0 && sessionId) {
       try {
         const storageKey = CHAT_HISTORY_KEY_PREFIX + sessionId;
         localStorage.setItem(storageKey, JSON.stringify(messages));
       } catch (_) {}
     }
-  }, [messages, settings?.saveHistory, sessionId]);
-
-  // ---- 关闭保存时清除本地历史 ----
-  useEffect(() => {
-    if (!settings?.saveHistory && sessionId) {
-      try {
-        const storageKey = CHAT_HISTORY_KEY_PREFIX + sessionId;
-        localStorage.removeItem(storageKey);
-      } catch (_) {}
-    }
-  }, [settings?.saveHistory, sessionId]);
+  }, [messages, sessionId]);
 
   const autoCreatedSessionId = useRef(null);  // handleSend 自动创建的会话 ID，仅此 ID 跳过清空
   const prevSessionIdRef = useRef(sessionId);   // 跟踪上一次 sessionId，用于日志
