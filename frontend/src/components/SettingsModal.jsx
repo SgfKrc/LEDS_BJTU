@@ -35,7 +35,8 @@ const TOPP_OPTIONS = [
 
 export default function SettingsModal({
   open, onClose, deviceRefreshKey, onToast, theme, onToggleTheme,
-  settings, onSettingsChange, deviceTier, onApplyTierPreset,
+  settings, onSettingsChange, deviceTier, hasDedicatedGpu,
+  onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
 }) {
   const overlayRef = useRef(null);
@@ -60,12 +61,13 @@ export default function SettingsModal({
     if (e.target === overlayRef.current) onClose();
   };
 
-  // 设备档位检测回调
-  const handleTierDetected = useCallback((tier) => {
-    if (tier && onApplyTierPreset) {
-      onApplyTierPreset(tier);
+  // 设备档位检测回调：仅记录设备信息（用于显示推荐徽章），
+  // 不自动应用档位预设（避免每次打开设置都覆盖用户手动调整的参数）
+  const handleDeviceProfile = useCallback((profile) => {
+    if (onDeviceProfileLoaded) {
+      onDeviceProfileLoaded(profile);
     }
-  }, [onApplyTierPreset]);
+  }, [onDeviceProfileLoaded]);
 
   // 判断档位是否匹配当前设备
   const isCurrentTier = (tier) => deviceTier === tier;
@@ -91,7 +93,7 @@ export default function SettingsModal({
           <DevicePanel
             key={deviceRefreshKey}
             onToast={onToast}
-            onTierDetected={handleTierDetected}
+            onProfileLoaded={handleDeviceProfile}
           />
 
           {/* ======== 推理参数设置 ======== */}
@@ -225,35 +227,51 @@ export default function SettingsModal({
             </div>
           </div>
 
-          {/* ======== 深度思考 ======== */}
+          {/* ======== 深度思考（仅独显设备可用） ======== */}
           <div className="sidebar-section">
             <h3>🧠 深度思考</h3>
-            <div className="setting-toggle-row">
-              <div>
-                <div className="setting-label">深度思考展示</div>
-                <div className="setting-desc">
-                  启用后，模型在回答前会展示推理过程。你可以在对话中展开「🧠 深度思考」折叠面板查看模型的思考逻辑。
-                  注意：思考过程会消耗额外的 Token 配额（约+256 tokens）。
+            {hasDedicatedGpu ? (
+              <>
+                <div className="setting-toggle-row">
+                  <div>
+                    <div className="setting-label">深度思考展示</div>
+                    <div className="setting-desc">
+                      启用后，模型在回答前会展示推理过程。你可以在对话中展开「🧠 深度思考」折叠面板查看模型的思考逻辑。
+                      注意：思考过程会消耗额外的 Token 配额（约+256 tokens）。
+                    </div>
+                  </div>
+                  <button
+                    className={`setting-toggle-btn${settings.showThinking ? ' on' : ''}`}
+                    onClick={() => onSettingsChange({ showThinking: !settings.showThinking })}
+                    title={settings.showThinking ? '已启用 — 点击关闭' : '已关闭 — 点击启用'}
+                  >
+                    <span className="setting-toggle-track">
+                      <span
+                        className="setting-toggle-thumb"
+                        style={{
+                          transform: settings.showThinking ? 'translateX(22px)' : 'translateX(0)',
+                        }}
+                      />
+                    </span>
+                  </button>
                 </div>
-              </div>
-              <button
-                className={`setting-toggle-btn${settings.showThinking ? ' on' : ''}`}
-                onClick={() => onSettingsChange({ showThinking: !settings.showThinking })}
-                title={settings.showThinking ? '已启用 — 点击关闭' : '已关闭 — 点击启用'}
-              >
-                <span className="setting-toggle-track">
-                  <span
-                    className="setting-toggle-thumb"
-                    style={{
-                      transform: settings.showThinking ? 'translateX(22px)' : 'translateX(0)',
-                    }}
-                  />
-                </span>
-              </button>
-            </div>
-            {settings.showThinking && (
-              <div className="setting-hint">
-                ✅ 深度思考已启用。模型将在回答前展示推理过程，思考内容仅用于展示，不会进入对话历史。
+                {settings.showThinking && (
+                  <div className="setting-hint">
+                    ✅ 深度思考已启用。模型将在回答前展示推理过程，思考内容仅用于展示，不会进入对话历史。
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="setting-disabled-hint">
+                <p>
+                  ⚠️ 深度思考功能需要<strong>独立显卡</strong>（NVIDIA CUDA 或等效 GPU）。
+                </p>
+                <p>
+                  当前设备为集显或 CPU-only 模式，推理计算资源不足以支持深度思考的额外开销。
+                </p>
+                <p style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
+                  💡 如连接了外置独显或 eGPU，请重新检测设备画像后重试。
+                </p>
               </div>
             )}
           </div>
@@ -351,11 +369,45 @@ export default function SettingsModal({
               </button>
             </div>
             {settings.distributedInference && (
-              <div className="setting-hint" style={{ marginTop: 8 }}>
-                {myRole?.is_master
-                  ? '✅ 分布式推理已启用。后台管理中将显示集群状态、分层配置与节点管理。'
-                  : '✅ 已启用分布式推理优化。后台管理中将显示本节点的运行状态与性能指标。'}
-              </div>
+              <>
+                <div className="setting-hint" style={{ marginTop: 8 }}>
+                  {myRole?.is_master
+                    ? '✅ 分布式推理已启用。后台管理中将显示集群状态、分层配置与节点管理。'
+                    : '✅ 已启用分布式推理优化。后台管理中将显示本节点的运行状态与性能指标。'}
+                </div>
+                {/* ---- 流水线模式指示 ---- */}
+                {myRole?.is_master && (
+                  <div className="pipeline-mode-indicator" style={{
+                    marginTop: 12,
+                    padding: '10px 14px',
+                    borderRadius: 8,
+                    background: 'var(--bg-card)',
+                    border: '1px solid var(--border)',
+                  }}>
+                    <div className="setting-label" style={{ marginBottom: 6 }}>
+                      🔗 流水线模式（层拆分推理）
+                    </div>
+                    <div className="setting-desc" style={{ marginBottom: 8 }}>
+                      将 Qwen-1.8B 的 24 层 Transformer 按算力比例拆分到主节点和从节点，
+                      各节点仅加载分配的层范围，通过 TCP 传递隐藏状态完成协作推理。
+                      <strong>仅 PyTorch 引擎可用</strong>（llama.cpp 不支持层间拆分）。
+                    </div>
+                    <div className="pipeline-mode-status">
+                      <span className="pipeline-mode-dot" style={{
+                        display: 'inline-block',
+                        width: 8, height: 8,
+                        borderRadius: '50%',
+                        background: 'var(--accent)',
+                        marginRight: 6,
+                      }} />
+                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                        流水线模式在推理时自动启用 — 当从节点在线且模型为 PyTorch 引擎时自动生效，
+                        否则自动回退到主节点全模型推理。
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
             {myRole?.node_id && (
               <div className="setting-node-id-row">

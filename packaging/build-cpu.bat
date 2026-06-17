@@ -53,15 +53,14 @@ echo.
 echo [5/5] PyInstaller 打包...
 echo   这可能需要 5-15 分钟，请耐心等待...
 pip install pyinstaller --quiet
-cd packaging
-pyinstaller qlh-cpu.spec --noconfirm
-cd ..
+REM ★ 从项目根目录运行，输出到 dist/QLH-Edge-Inference/
+pyinstaller packaging\qlh-cpu.spec --noconfirm
 
-if exist "packaging\dist\QLH-Dist" (
+if exist "dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
     echo.
     echo ============================================
     echo   打包完成！
-    echo   输出目录: packaging\dist\QLH-Dist\
+    echo   输出目录: dist\QLH-Edge-Inference\
     echo   可执行文件: QLH-Edge-Inference.exe
     echo ============================================
 ) else (

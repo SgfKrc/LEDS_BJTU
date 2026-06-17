@@ -10,7 +10,7 @@
 
 依赖: psycopg2-binary
 
-数据库: 8.160.161.53:5432 / postgres / 123456
+数据库: 8.160.161.53:5432 / postgres / WUTqw6bLkK3Hn5Va
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ DB_HOST = "8.160.161.53"
 DB_PORT = 5432
 DB_NAME = "qlh_edge_inference"
 DB_USER = "postgres"
-DB_PASSWORD = "123456"
+DB_PASSWORD = "WUTqw6bLkK3Hn5Va"
 DB_MIN_CONN = 2
 DB_MAX_CONN = 8
 
@@ -71,12 +71,31 @@ def get_pool() -> pool.ThreadedConnectionPool:
             password=DB_PASSWORD,
         )
         logger.info(f"数据库连接池已创建: {DB_HOST}:{DB_PORT}/{DB_NAME} "
-                     f"(min={DB_MIN_CONN}, max={DB_MAX_CONN})")
+                     f"(min={DB_MIN_CONN}, max={DB_MAX_CONN}) "
+                     f"user={DB_USER} pwd={DB_PASSWORD[:4]}...{DB_PASSWORD[-4:]}")
 
         # 初始化表结构
         _init_schema()
 
         return _connection_pool
+
+
+# ================================================================
+# 活跃节点 ID（用于数据隔离）
+# 由 api_server 在启动时调用 set_active_node_id() 设置
+# ================================================================
+_active_node_id: str = "master"
+
+
+def set_active_node_id(node_id: str) -> None:
+    """设置当前活跃节点 ID，用于 conversations/sessions 数据隔离"""
+    global _active_node_id
+    _active_node_id = node_id or "master"
+    logger.info(f"活跃节点 ID: {_active_node_id}")
+
+
+def get_active_node_id() -> str:
+    return _active_node_id
 
 
 def _ensure_database() -> None:
@@ -136,12 +155,17 @@ def _init_schema() -> None:
                 content       TEXT NOT NULL,
                 metrics       JSONB DEFAULT '{}',
                 file_context  JSONB DEFAULT NULL,
+                node_id       VARCHAR(64) NOT NULL DEFAULT 'master',
                 created_at    TIMESTAMP DEFAULT NOW()
             )
         """)
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_conv_session
             ON conversations(session_id, created_at)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conv_node
+            ON conversations(node_id, created_at)
         """)
 
         # ---- 集群配置表（键值对） ----
@@ -158,14 +182,70 @@ def _init_schema() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 id            VARCHAR(64) PRIMARY KEY,
                 title         VARCHAR(256) NOT NULL DEFAULT '新对话',
+                node_id       VARCHAR(64) NOT NULL DEFAULT 'master',
                 created_at    TIMESTAMP DEFAULT NOW(),
                 updated_at    TIMESTAMP DEFAULT NOW(),
                 message_count INTEGER NOT NULL DEFAULT 0
             )
         """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_node
+            ON sessions(node_id, updated_at DESC)
+        """)
 
         conn.commit()
-        logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions)")
+
+    # ★ 迁移：为旧版表添加 node_id 列（在事务外执行，避免回滚影响建表）
+    #    使用连接池而非独立连接，避免独立连接因网络/DNS 问题静默失败
+    _migrate_add_node_id_columns()
+
+    logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions)")
+
+
+def _migrate_add_node_id_columns() -> None:
+    """
+    为旧版表添加 node_id 列（幂等迁移）。
+
+    旧版 conversations / sessions 表可能缺少 node_id 列。
+    此迁移使用 ALTER TABLE ... ADD COLUMN IF NOT EXISTS，
+    已存在的列不会被修改。
+
+    使用连接池连接并设置 autocommit，避免：
+    1. 独立 psycopg2.connect() 因网络/DNS 问题静默失败
+    2. 迁移失败导致整个 _init_schema 事务回滚
+    """
+    pool_ = None
+    conn = None
+    try:
+        pool_ = get_pool()
+        conn = pool_.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS "
+                "node_id VARCHAR(64) NOT NULL DEFAULT 'master'"
+            )
+            logger.info("迁移: conversations.node_id 列已就绪")
+        except Exception as e:
+            logger.warning(f"迁移 conversations.node_id 跳过: {e}")
+        try:
+            cur.execute(
+                "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS "
+                "node_id VARCHAR(64) NOT NULL DEFAULT 'master'"
+            )
+            logger.info("迁移: sessions.node_id 列已就绪")
+        except Exception as e:
+            logger.warning(f"迁移 sessions.node_id 跳过: {e}")
+        cur.close()
+    except Exception as e:
+        logger.warning(f"node_id 列迁移失败（非致命）: {e}")
+    finally:
+        if conn and pool_:
+            try:
+                pool_.putconn(conn)
+            except Exception:
+                pass
 
 
 # ================================================================
@@ -288,13 +368,14 @@ def save_message(session_id: str, role: str, content: str,
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            INSERT INTO conversations (session_id, role, content, metrics, file_context)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO conversations (session_id, role, content, metrics, file_context, node_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING *
         """, (
             session_id, role, content,
             json.dumps(metrics or {}),
             json.dumps(file_context) if file_context else None,
+            _active_node_id,
         ))
         conn.commit()
         row = cur.fetchone()
@@ -312,16 +393,16 @@ def save_message(session_id: str, role: str, content: str,
 
 def get_conversation(session_id: str = "default",
                      limit: int = 200) -> list[dict]:
-    """获取指定会话的对话历史（最近 N 条）"""
+    """获取指定会话的对话历史（最近 N 条，仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT id, session_id, role, content, metrics, file_context, created_at
             FROM conversations
-            WHERE session_id = %s
+            WHERE session_id = %s AND node_id = %s
             ORDER BY created_at ASC
             LIMIT %s
-        """, (session_id, limit))
+        """, (session_id, _active_node_id, limit))
         rows = cur.fetchall()
         result = []
         for r in rows:
@@ -337,24 +418,24 @@ def get_conversation(session_id: str = "default",
 
 
 def clear_conversation(session_id: str = "default") -> int:
-    """清空指定会话的对话历史，返回删除条数"""
+    """清空指定会话的对话历史（仅本节点），返回删除条数"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "DELETE FROM conversations WHERE session_id = %s",
-            (session_id,)
+            "DELETE FROM conversations WHERE session_id = %s AND node_id = %s",
+            (session_id, _active_node_id)
         )
         conn.commit()
         return cur.rowcount
 
 
 def get_conversation_count(session_id: str = "default") -> int:
-    """获取会话消息条数"""
+    """获取会话消息条数（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) FROM conversations WHERE session_id = %s",
-            (session_id,)
+            "SELECT COUNT(*) FROM conversations WHERE session_id = %s AND node_id = %s",
+            (session_id, _active_node_id)
         )
         return cur.fetchone()[0]
 
@@ -377,14 +458,14 @@ def delete_message_range(session_id: str, turn_index: int) -> int:
             WITH ordered AS (
                 SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC) - 1 AS rn
                 FROM conversations
-                WHERE session_id = %s
+                WHERE session_id = %s AND node_id = %s
             )
             DELETE FROM conversations
             WHERE id IN (
                 SELECT id FROM ordered
                 WHERE rn IN (%s, %s)
             )
-        """, (session_id, 2 * turn_index, 2 * turn_index + 1))
+        """, (session_id, _active_node_id, 2 * turn_index, 2 * turn_index + 1))
         conn.commit()
         return cur.rowcount
 
@@ -394,16 +475,17 @@ def delete_message_range(session_id: str, turn_index: int) -> int:
 # ================================================================
 
 def create_session(session_id: str, title: str = "新对话") -> dict:
-    """创建新会话记录"""
+    """创建新会话记录（关联到当前节点）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            INSERT INTO sessions (id, title)
-            VALUES (%s, %s)
+            INSERT INTO sessions (id, title, node_id)
+            VALUES (%s, %s, %s)
             ON CONFLICT (id) DO UPDATE SET
-                updated_at = NOW()
+                updated_at = NOW(),
+                node_id = EXCLUDED.node_id
             RETURNING *
-        """, (session_id, title))
+        """, (session_id, title, _active_node_id))
         conn.commit()
         row = cur.fetchone()
         d = dict(row) if row else {}
@@ -415,14 +497,15 @@ def create_session(session_id: str, title: str = "新对话") -> dict:
 
 
 def get_all_sessions(limit: int = 50, offset: int = 0) -> list[dict]:
-    """获取所有会话列表（按 updated_at DESC 排序）"""
+    """获取本节点的所有会话列表（按 updated_at DESC 排序）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
             SELECT * FROM sessions
+            WHERE node_id = %s
             ORDER BY updated_at DESC
             LIMIT %s OFFSET %s
-        """, (limit, offset))
+        """, (_active_node_id, limit, offset))
         rows = cur.fetchall()
         result = []
         for r in rows:
@@ -436,10 +519,13 @@ def get_all_sessions(limit: int = 50, offset: int = 0) -> list[dict]:
 
 
 def get_session(session_id: str) -> Optional[dict]:
-    """获取单个会话元数据"""
+    """获取单个会话元数据（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+        cur.execute(
+            "SELECT * FROM sessions WHERE id = %s AND node_id = %s",
+            (session_id, _active_node_id)
+        )
         row = cur.fetchone()
         if not row:
             return None
@@ -452,10 +538,10 @@ def get_session(session_id: str) -> Optional[dict]:
 
 
 def get_session_count() -> int:
-    """获取会话总数"""
+    """获取本节点会话总数"""
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM sessions")
+        cur.execute("SELECT COUNT(*) FROM sessions WHERE node_id = %s", (_active_node_id,))
         return cur.fetchone()[0]
 
 
@@ -466,9 +552,9 @@ def update_session_title(session_id: str, title: str) -> Optional[dict]:
         cur.execute("""
             UPDATE sessions
             SET title = %s, updated_at = NOW()
-            WHERE id = %s
+            WHERE id = %s AND node_id = %s
             RETURNING *
-        """, (title, session_id))
+        """, (title, session_id, _active_node_id))
         conn.commit()
         row = cur.fetchone()
         if not row:
@@ -488,36 +574,38 @@ def delete_session(session_id: str) -> int:
     """
     with get_conn() as conn:
         cur = conn.cursor()
-        # 先删消息（外键未定义，需手动级联）
-        cur.execute("DELETE FROM conversations WHERE session_id = %s", (session_id,))
+        # 先删消息（仅本节点，防止误删其他节点同名会话）
+        cur.execute("DELETE FROM conversations WHERE session_id = %s AND node_id = %s",
+                    (session_id, _active_node_id))
         # 再删会话
-        cur.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+        cur.execute("DELETE FROM sessions WHERE id = %s AND node_id = %s",
+                    (session_id, _active_node_id))
         conn.commit()
         return cur.rowcount
 
 
 def increment_session_message_count(session_id: str) -> None:
-    """会话消息数 +1，同时更新 updated_at"""
+    """会话消息数 +1，同时更新 updated_at（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE sessions
             SET message_count = message_count + 1, updated_at = NOW()
-            WHERE id = %s
-        """, (session_id,))
+            WHERE id = %s AND node_id = %s
+        """, (session_id, _active_node_id))
         conn.commit()
 
 
 def decrement_session_message_count(session_id: str, count: int = 2) -> None:
-    """会话消息数 -count（不小于0），同时更新 updated_at"""
+    """会话消息数 -count（不小于0），同时更新 updated_at（仅本节点）"""
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE sessions
             SET message_count = GREATEST(0, message_count - %s),
                 updated_at = NOW()
-            WHERE id = %s
-        """, (count, session_id,))
+            WHERE id = %s AND node_id = %s
+        """, (count, session_id, _active_node_id))
         conn.commit()
 
 

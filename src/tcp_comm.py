@@ -80,6 +80,15 @@ class MessageType(str, Enum):
     SPARE_MASTER_ACTIVATE = "spare_master_activate"            # 主节点 → 备用：激活暂代主节点职责
     SPARE_MASTER_ACTIVATE_ACK = "spare_master_activate_ack"    # 备用 → 主节点：确认激活
     SPARE_MASTER_DEACTIVATE = "spare_master_deactivate"        # 新主节点 → 备用：接管完成，退出暂代
+    # 节点列表同步
+    NODE_LIST_SYNC = "node_list_sync"            # 主节点 → 从节点：全量节点列表同步
+    NODE_UPDATE = "node_update"                  # 主节点 → 从节点：单节点变更 (add/update/remove)
+    # 分布式流水线推理
+    LAYER_FORWARD = "layer_forward"              # 主→从：执行层前向传播
+    LAYER_RESULT = "layer_result"                # 从→主：层前向传播结果
+    CHAIN_FORWARD = "chain_forward"              # 从→从：链式直连层前向转发（P2 优化）
+    PIPELINE_DONE = "pipeline_done"              # 主→从：流水线任务完成（清理 KV 缓存）
+    PIPELINE_ABORT = "pipeline_abort"            # 主→从：取消流水线任务
 
 
 # ================================================================
@@ -187,39 +196,81 @@ def detect_network_type() -> str:
 
 def detect_lan_ip() -> str:
     """
-    检测本机局域网 IP 地址（供其他节点连接使用）。
+    检测本机最优可达 IP 地址（供其他节点连接使用）。
 
-    通过多种策略检测，优先级:
-    1. UDP 连接外部地址 → 获取默认路由 IP
-    2. psutil 枚举网络接口 → 过滤回环/虚拟/Docker 接口
-    3. socket.gethostbyname(hostname) → 最后兜底
+    优先级（从高到低）:
+    1. Tailscale / ZeroTier 虚拟组网 IP（100.x.y.z）— 最可靠，跨子网直连
+    2. psutil 枚举物理网卡（以太网 > WiFi）— 同局域网直连
+    3. UDP 默认路由 IP — 出网网卡 IP
+    4. socket.gethostbyname(hostname) — 最后兜底
 
     Returns:
-        IP 地址字符串，如 "192.168.1.100"，检测失败返回 "127.0.0.1"
+        IP 地址字符串，检测失败返回 "127.0.0.1"
     """
-    # 策略 1: 通过 UDP "连接" 外部地址获取默认路由 IP（不发送数据包）
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(1.0)
-        s.connect(("8.8.8.8", 53))
-        ip = s.getsockname()[0]
-        s.close()
-        if ip and not ip.startswith("127."):
-            logger.info(f"检测到局域网 IP (UDP): {ip}")
-            return ip
-    except Exception:
-        pass
 
-    # 策略 2: psutil 枚举网络接口
+    # ---- 策略 1: 优先检测 Tailscale / ZeroTier 虚拟组网 IP ----
+    #   Tailscale 使用 100.64.0.0/10 (CGNAT) 地址段，接口名含 "tailscale"
+    #   ZeroTier 接口名含 "zerotier"
+    #   这些 IP 在组网内是全局可达的，不受物理子网隔离影响
     if _HAS_PSUTIL:
         try:
             import socket as _sock
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
 
-            # 排除的接口前缀（虚拟 / 容器 / 回环）
+            # 检测 Tailscale / ZeroTier 接口
+            overlay_keywords = ('tailscale', 'zerotier', 'zt')
+            # 100.64.0.0/10 范围: 100.64.0.0 ~ 100.127.255.255
+            _TAILSCALE_LO = 0x64400000   # 100.64.0.0
+            _TAILSCALE_HI = 0x647FFFFF   # 100.127.255.255
+
+            overlay_candidates = []  # [(ip, iface, is_up)]
+
+            for iface, addr_list in addrs.items():
+                iface_lower = iface.lower()
+                # Tailscale / ZeroTier 接口名匹配
+                is_overlay = any(kw in iface_lower for kw in overlay_keywords)
+
+                stat = stats.get(iface)
+                is_up = stat.isup if stat else False
+
+                for addr in addr_list:
+                    if addr.family != _sock.AF_INET:
+                        continue
+                    ip = addr.address
+                    if ip.startswith("127."):
+                        continue
+                    # 100.64.0.0/10 范围的 IP 也视为 overlay（即使接口名不匹配）
+                    try:
+                        octets = [int(o) for o in ip.split(".")]
+                        ip_int = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+                        in_tailscale_range = _TAILSCALE_LO <= ip_int <= _TAILSCALE_HI
+                    except (ValueError, IndexError):
+                        in_tailscale_range = False
+
+                    if is_overlay or in_tailscale_range:
+                        overlay_candidates.append((ip, iface, is_up))
+
+            if overlay_candidates:
+                # 优先启用的接口
+                overlay_candidates.sort(key=lambda c: (0 if c[2] else 1))
+                ip = overlay_candidates[0][0]
+                logger.info(f"检测到组网 IP (Tailscale/ZeroTier): {ip} (接口: {overlay_candidates[0][1]})")
+                return ip
+        except Exception:
+            pass
+
+    # ---- 策略 2: psutil 枚举物理网络接口 ----
+    if _HAS_PSUTIL:
+        try:
+            import socket as _sock
+            addrs = psutil.net_if_addrs()
+            stats = psutil.net_if_stats()
+
+            # 排除的接口前缀（虚拟 / 容器 / 回环 / 组网）
             skip_prefixes = ('lo', 'veth', 'docker', 'br-', 'vmnet', 'virbr',
-                             'tun', 'tap', 'wg', 'utun', 'anpi', 'bluetooth')
+                             'tun', 'tap', 'wg', 'utun', 'anpi', 'bluetooth',
+                             'tailscale', 'zerotier', 'zt')
 
             candidates = []  # [(ip, iface, is_up, is_wifi)]
 
@@ -255,7 +306,20 @@ def detect_lan_ip() -> str:
         except Exception:
             pass
 
-    # 策略 3: gethostbyname 兜底
+    # ---- 策略 3: UDP 默认路由 IP ----
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        s.connect(("8.8.8.8", 53))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            logger.info(f"检测到局域网 IP (UDP): {ip}")
+            return ip
+    except Exception:
+        pass
+
+    # ---- 策略 4: gethostbyname 兜底 ----
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
@@ -479,6 +543,100 @@ def deserialize_tensor(data: bytes) -> torch.Tensor:
     return torch.load(buffer)
 
 
+# ---- 高速序列化路径（流水线隐藏状态传输优化） ----
+
+def serialize_tensor_fast(tensor: torch.Tensor) -> bytes:
+    """
+    高速张量序列化，自动选择最优路径。
+
+    小张量 (< 1MB): 使用 torch.save（兼容性好、含完整元数据）
+    大张量 (≥ 1MB): 使用 numpy tobytes + 自定义头（零拷贝、速度快 ~3x）
+
+    自定义头格式（大张量路径）:
+        [4B  magic: b'TNR0' ]
+        [1B  dtype_code      ]  # 0=float16, 1=float32, 2=int64, 3=int32
+        [1B  ndim             ]
+        [4B  dim0             ]
+        [4B  dim1             ]
+        [4B  dim2 (optional)  ]
+        [4B  dim3 (optional)  ]
+        [NB  raw_bytes        ]
+    总开销: 10-22 字节
+
+    小张量路径:
+        [4B  magic: b'TNR1' ]
+        [NB  torch.save 输出]
+    """
+    tensor_cpu = tensor.detach().cpu()
+    nbytes = tensor_cpu.numel() * tensor_cpu.element_size()
+
+    if nbytes < 1_000_000:
+        # 小张量：torch.save（兼容性好）
+        buf = io.BytesIO()
+        torch.save(tensor_cpu, buf)
+        payload = buf.getvalue()
+        return b'TNR1' + payload
+    else:
+        # 大张量：numpy tobytes（零拷贝）
+        import numpy as np
+        arr = tensor_cpu.numpy()
+        dtype_map = {
+            np.float16: 0, np.float32: 1,
+            np.int64: 2, np.int32: 3,
+        }
+        dtype_code = dtype_map.get(arr.dtype.type, 1)
+        ndim = arr.ndim
+        shape = arr.shape
+
+        header = struct.pack(
+            f'>4s B B {"I" * ndim}',
+            b'TNR0', dtype_code, ndim, *shape,
+        )
+        return header + arr.tobytes()
+
+
+def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
+    """
+    反序列化 serialize_tensor_fast 的输出。
+
+    magic b'TNR0' → 大张量路径（numpy frombuffer）
+    magic b'TNR1' → 小张量路径（torch.load）
+    """
+    if not data or len(data) < 4:
+        raise ValueError("序列化数据为空或长度不足")
+
+    magic = data[:4]
+    if magic == b'TNR1':
+        # 小张量路径
+        buf = io.BytesIO(data[4:])
+        return torch.load(buf)
+    elif magic == b'TNR0':
+        # 大张量路径
+        import numpy as np
+        dtype_map = {
+            0: np.float16, 1: np.float32,
+            2: np.int64, 3: np.int32,
+        }
+        dtype_code = data[4]
+        ndim = data[5]
+        dtype = dtype_map.get(dtype_code, np.float32)
+        # 解析 shape（每个维度 4 字节）
+        shape = []
+        offset = 6
+        for _ in range(ndim):
+            dim = struct.unpack_from('>I', data, offset)[0]
+            shape.append(dim)
+            offset += 4
+        # 重建张量
+        raw = data[offset:]
+        arr = np.frombuffer(raw, dtype=dtype).reshape(shape)
+        return torch.from_numpy(arr.copy())  # copy 确保内存连续
+    else:
+        # 未知格式，回退到 torch.load
+        buf = io.BytesIO(data)
+        return torch.load(buf)
+
+
 # ================================================================
 # 消息构建与解析
 # ================================================================
@@ -680,8 +838,8 @@ class TCPServer:
                     self._recv_threads[client_id] = threading.current_thread()
 
                 elif msg_type == MessageType.HEARTBEAT.value:
-                    # 心跳：回复 ACK
-                    self._handle_heartbeat(client_id)
+                    # 心跳：回显客户端时间戳并回复 ACK
+                    self._handle_heartbeat(client_id, msg)
 
                 # 回调上层（scheduler）
                 if self.on_message:
@@ -724,6 +882,36 @@ class TCPServer:
         device_info = data.get("device_info", {})
         network_type = data.get("network_type", "unknown")
 
+        # ★ 安全：拒绝 client_id="master" 或 role="master" 的注册
+        if client_id == "master":
+            logger.error(
+                f"⛔ 拒绝注册: client_id='master' 是保留字，"
+                f"来源 {addr[0]}:{addr[1]} hostname={hostname}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": "client_id 'master' 是保留字，请使用其他 ID",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError:
+                pass
+            return temp_id  # 返回临时 ID，后续会被清理
+        if role == "master":
+            logger.error(
+                f"⛔ 拒绝注册: 从节点不能声明 role='master'，"
+                f"来源 {addr[0]}:{addr[1]} hostname={hostname}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": "role 'master' 仅限于主节点自身",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError:
+                pass
+            return temp_id
+
         client_conn = ClientConn(
             client_id=client_id,
             sock=conn,
@@ -751,14 +939,20 @@ class TCPServer:
 
         return client_id
 
-    def _handle_heartbeat(self, client_id: str) -> None:
-        """处理心跳消息：更新时间戳并回复 ACK"""
+    def _handle_heartbeat(self, client_id: str, msg: dict = None) -> None:
+        """处理心跳消息：更新时间戳并回复 ACK（回显客户端时间戳用于 RTT 测量）"""
         if client_id in self.clients:
             self.clients[client_id].last_heartbeat = time.time()
             self.clients[client_id].heartbeat_missed = 0
+            # 提取客户端发送时间戳，原样回显
+            echo_data = None
+            if msg and isinstance(msg.get("data"), dict):
+                t_send = msg["data"].get("t_send", 0)
+                if t_send:
+                    echo_data = {"t_send": t_send}
             # 回复 ACK
             try:
-                ack = build_message(MessageType.HEARTBEAT_ACK)
+                ack = build_message(MessageType.HEARTBEAT_ACK, echo_data)
                 self.clients[client_id].sock.sendall(ack)
             except OSError:
                 pass  # 心跳回复失败由断线检测处理
@@ -892,7 +1086,10 @@ class TCPClient:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._recv_thread: Optional[threading.Thread] = None
         self.on_message: Optional[Callable] = None
+        self.on_heartbeat: Optional[Callable] = None  # 心跳发送后回调（无参数）
         self._registered = False
+        self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
+        self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
 
     def connect(self, on_message: Callable = None) -> bool:
         """
@@ -967,18 +1164,24 @@ class TCPClient:
                 return True
             except ConnectionRefusedError:
                 logger.warning(
-                    f"连接失败 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES})，"
-                    f"{RECONNECT_DELAY}s 后重试..."
+                    f"连接被拒绝 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
+                )
+                time.sleep(RECONNECT_DELAY)
+            except socket.timeout:
+                logger.warning(
+                    f"连接超时 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
                 )
                 time.sleep(RECONNECT_DELAY)
             except OSError as e:
                 logger.warning(
-                    f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e}，"
-                    f"{RECONNECT_DELAY}s 后重试..."
+                    f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e} → "
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
                 )
                 time.sleep(RECONNECT_DELAY)
 
-        logger.error(f"无法连接主节点，已重试 {RECONNECT_MAX_RETRIES} 次")
+        logger.error(f"无法连接主节点 {self.server_host}:{self.server_port}，已重试 {RECONNECT_MAX_RETRIES} 次")
         return False
 
     def _recv_loop(self) -> None:
@@ -988,6 +1191,10 @@ class TCPClient:
                 msg = self.recv_data()
                 if msg is None:
                     break  # 连接断开
+                # 内部处理：HEARTBEAT_ACK → 计算 RTT
+                if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
+                    self._handle_heartbeat_ack(msg)
+                    continue  # 不向上层转发
                 if self.on_message:
                     try:
                         self.on_message(msg)
@@ -1043,11 +1250,43 @@ class TCPClient:
 
         return msg
 
+    def _handle_heartbeat_ack(self, msg: dict) -> None:
+        """
+        处理心跳应答：计算往返延迟 RTT。
+
+        服务端在 HEARTBEAT_ACK 中回显客户端发送的时间戳，
+        客户端收到后计算 RTT = now - t_send，并用指数加权滑动平均平滑。
+        """
+        data = msg.get("data", {})
+        t_echo = data.get("t_send", 0) if isinstance(data, dict) else 0
+        t_now = time.time()
+        if t_echo > 0:
+            rtt_ms = (t_now - t_echo) * 1000
+        elif self._last_heartbeat_send > 0:
+            rtt_ms = (t_now - self._last_heartbeat_send) * 1000
+        else:
+            return  # 无法计算
+
+        # 指数加权滑动平均（α=0.1），平滑网络抖动
+        if self.avg_rtt_ms > 0:
+            self.avg_rtt_ms = 0.9 * self.avg_rtt_ms + 0.1 * rtt_ms
+        else:
+            self.avg_rtt_ms = rtt_ms
+
     def _heartbeat_loop(self) -> None:
-        """心跳发送循环"""
+        """心跳发送循环（含时间戳用于 RTT 测量）"""
         while self._running and self.sock:
             try:
-                self.send_data(None, MessageType.HEARTBEAT)
+                self._last_heartbeat_send = time.time()
+                self.send_data(
+                    {"t_send": self._last_heartbeat_send},
+                    MessageType.HEARTBEAT,
+                )
+                if self.on_heartbeat:
+                    try:
+                        self.on_heartbeat()
+                    except Exception:
+                        pass
                 time.sleep(HEARTBEAT_INTERVAL)
             except (ConnectionError, OSError):
                 logger.warning("心跳发送失败，尝试重连...")

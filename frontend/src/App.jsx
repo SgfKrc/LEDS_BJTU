@@ -80,6 +80,7 @@ export default function App() {
   const [theme, setTheme] = useState(getInitialTheme);
   const [settings, setSettings] = useState(getInitialSettings);
   const [deviceTier, setDeviceTier] = useState(null);  // 由 DevicePanel 检测后回传
+  const [hasDedicatedGpu, setHasDedicatedGpu] = useState(false);  // 是否有独显（用于深度思考门控）
   const [activeView, setActiveView] = useState('chat'); // 'chat' | 'admin'
   const [myRole, setMyRole] = useState(null);  // { node_role, node_id, is_master, is_client, ... }
   const [sessions, setSessions] = useState([]);           // 会话列表
@@ -224,13 +225,37 @@ export default function App() {
     }
   }, [showToast]);
 
-  // 按设备档位应用推荐设置
+  // DevicePanel 检测到设备档位时：仅记录档位（展示推荐徽章），不自动覆盖用户设置
+  const handleDeviceProfileLoaded = useCallback((profile) => {
+    if (!profile) return;
+    if (profile.tier) setDeviceTier(profile.tier);
+    // 判断是否有独显：任意非集成 GPU 且显存 > 0
+    const gpu = profile.gpu;
+    const gpus = profile.gpus || [];
+    const hasDgpu = (gpu && !gpu.is_integrated && gpu.vram_total_gb > 0)
+      || gpus.some(g => !g.is_integrated && g.vram_total_gb > 0);
+    setHasDedicatedGpu(!!hasDgpu);
+    // 非独显设备自动关闭深度思考（即使之前从云端同步了 true）
+    if (!hasDgpu) {
+      setSettings((prev) => {
+        if (prev.showThinking) {
+          const next = { ...prev, showThinking: false };
+          saveSettings(next);
+          return next;
+        }
+        return prev;
+      });
+    }
+  }, []);
+
+  // 用户手动点击设备档位卡片 → 应用对应预设（明确意图）
   const applyTierPreset = useCallback((tier) => {
     const preset = TIER_PRESETS[tier];
     if (preset) {
+      showToast({ type: 'info', msg: `已应用「${TIER_LABELS[tier] || tier}」推荐配置` });
       updateSettings(preset);
     }
-  }, [updateSettings]);
+  }, [updateSettings, showToast]);
 
   // Ctrl+B to toggle sidebar
   useEffect(() => {
@@ -425,6 +450,8 @@ export default function App() {
         settings={settings}
         onSettingsChange={updateSettings}
         deviceTier={deviceTier}
+        hasDedicatedGpu={hasDedicatedGpu}
+        onDeviceProfileLoaded={handleDeviceProfileLoaded}
         onApplyTierPreset={applyTierPreset}
         myRole={myRole}
       />

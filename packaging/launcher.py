@@ -8,6 +8,7 @@ Windows 安装包的主入口点。
   2. PyTorch + bitsandbytes — CUDA 引擎（INT4 ~1.75 GB 显存）
 
 启动流程:
+  0. Tailscale 组网检查（首次启动引导加入）
   1. 检测 CUDA 可用性 + 模型文件
   2. 若缺失 → 弹出 Windows 消息框引导下载（智能推荐格式）
   3. 模型就绪 → 自动选择最优引擎 → 后台启动 FastAPI（端口 8000）
@@ -19,6 +20,35 @@ import sys
 import logging
 import threading
 import time
+import subprocess as _sp
+
+# ★ 强制在 psycopg2 之前加载 ssl，避免 OpenSSL DLL 冲突
+# psycopg2-binary 捆绑了自己的 libssl-3-x64-{hash}.dll，通过 add_dll_directory 注册后
+# 可能干扰 Python _ssl.pyd 加载 libssl-3.dll，导致"内存位置访问无效"
+#
+# 在 PyInstaller 环境下，bootloader 的 DLL 搜索路径设置可能与 _ssl.pyd 的
+# 隐式依赖加载顺序冲突。先用 ctypes 显式加载 libcrypto-3.dll + libssl-3.dll，
+# 确保 _ssl.pyd 导入时依赖的 DLL 已经在内存中，避免 Windows LoadLibrary 搜索混乱。
+import ctypes as _ctypes
+import os as _os
+
+if getattr(sys, 'frozen', False):
+    _internal_dir = _os.path.join(_os.path.dirname(sys.executable), '_internal')
+    if _os.path.isdir(_internal_dir):
+        try:
+            _os.add_dll_directory(_internal_dir)
+        except Exception:
+            pass
+        # 按依赖顺序加载：libcrypto 先，libssl 后
+        for _dll_name in ('libcrypto-3.dll', 'libssl-3.dll'):
+            _dll_path = _os.path.join(_internal_dir, _dll_name)
+            if _os.path.isfile(_dll_path):
+                try:
+                    _ctypes.CDLL(_dll_path)
+                except Exception:
+                    pass
+
+import ssl  # noqa: E402, F401
 
 # 确保 src 目录在 path 中（开发模式：launcher.py 在 packaging/ 子目录下）
 # PyInstaller 打包后所有模块由 bootloader 加载，无需手动添加 path
@@ -38,6 +68,208 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("launcher")
+
+# ================================================================
+# Tailscale 组网配置
+# ================================================================
+TAILSCALE_INVITE_URL = "https://login.tailscale.com/uinv/iWAME6zVuB11wUxixU2Z611"
+TAILSCALE_DOWNLOAD_URL = "https://tailscale.com/download/windows"
+
+# 跳过标志文件（位于应用数据目录下，首次完成后创建）
+_TAILSCALE_FLAG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "QLH-Edge-Inference")
+_TAILSCALE_FLAG_FILE = os.path.join(_TAILSCALE_FLAG_DIR, ".tailscale_joined")
+
+
+def _find_tailscale_exe() -> str | None:
+    """查找 tailscale.exe 的完整路径，未安装返回 None。"""
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Tailscale", "tailscale.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Tailscale", "tailscale.exe"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    # 尝试 PATH 中查找（使用 shutil.which，避免 subprocess 触发杀软误报）
+    import shutil
+    exe = shutil.which("tailscale")
+    if exe:
+        return exe
+    return None
+
+
+def _check_tailscale_status() -> dict:
+    """
+    检查本机 Tailscale 状态。
+
+    Returns:
+        {
+            "installed": bool,          # 是否已安装
+            "running": bool,            # Tailscale 服务是否运行
+            "logged_in": bool,          # 是否已登录
+            "tailscale_ip": str | None, # Tailscale IP (100.x.y.z)
+            "hostname": str | None,     # Tailscale 主机名
+        }
+    """
+    result = {
+        "installed": False,
+        "running": False,
+        "logged_in": False,
+        "tailscale_ip": None,
+        "hostname": None,
+    }
+    exe = _find_tailscale_exe()
+    if not exe:
+        return result
+    result["installed"] = True
+
+    try:
+        # tailscale status — 返回 JSON（需要 --json）
+        r = _sp.run(
+            [exe, "status", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            import json
+            data = json.loads(r.stdout)
+            result["running"] = True
+            # 检查是否已登录（有 Self 节点信息）
+            self_node = data.get("Self", {})
+            if self_node:
+                result["logged_in"] = True
+                result["tailscale_ip"] = self_node.get("TailscaleIPs", [None])[0]
+                result["hostname"] = self_node.get("HostName")
+    except Exception:
+        pass
+
+    return result
+
+
+def _prompt_tailscale_setup(status: dict) -> bool:
+    """
+    首次启动时引导用户安装/加入 Tailscale 组网。
+
+    显示 ASCII 引导界面，用户必须明确输入 yes 才能继续。
+    仅在用户确认后返回 True。
+
+    Args:
+        status: _check_tailscale_status() 的返回值
+
+    Returns:
+        True = 用户确认继续（已加入或跳过时也返回 True）
+    """
+    installed = status["installed"]
+    logged_in = status["logged_in"]
+    ts_ip = status.get("tailscale_ip")
+
+    # 已安装且已登录且有 IP → 静默通过
+    if installed and logged_in and ts_ip:
+        return True
+
+    # ---- 显示引导界面 ----
+    print()
+    print("=" * 60)
+    print("  🔗 Tailscale 组网检查")
+    print("=" * 60)
+    print()
+    print("  QLH 分布式推理需要节点间直接通信。")
+    print("  由于校园网不同子网之间相互隔离，")
+    print("  系统采用 Tailscale 虚拟组网实现跨子网互联。")
+    print()
+
+    if not installed:
+        print("  ⚠️  未检测到 Tailscale。请按以下步骤操作：")
+        print()
+        print("  第 1 步：下载并安装 Tailscale")
+        print(f"    {TAILSCALE_DOWNLOAD_URL}")
+        print()
+        print("  第 2 步：安装完成后，打开浏览器访问邀请链接加入组网：")
+        print(f"    {TAILSCALE_INVITE_URL}")
+        print()
+        print("  第 3 步：登录后，系统托盘会出现 Tailscale 图标。")
+        print("    确保图标显示「Connected」状态。")
+    elif not logged_in:
+        print("  ⚠️  Tailscale 已安装但未登录/未加入组网。")
+        print()
+        print("  请打开浏览器访问以下邀请链接完成加入：")
+        print(f"    {TAILSCALE_INVITE_URL}")
+        print()
+        print("  加入后确保系统托盘 Tailscale 图标显示「Connected」。")
+    else:
+        print("  ⚠️  Tailscale 已登录但未获取到 IP，请检查网络状态。")
+
+    print()
+    print("─" * 60)
+    print()
+    print("  加入组网后，请在下面输入 yes 继续。")
+    print("  输入 no 将退出程序。")
+    print()
+
+    while True:
+        try:
+            choice = input("  >>> 是否已加入 Tailscale 组网？(yes/no): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+        if choice in ("yes", "y"):
+            # 再次检查状态，确认用户真的加入了
+            new_status = _check_tailscale_status()
+            if new_status.get("logged_in") and new_status.get("tailscale_ip"):
+                # 写入跳过标志，下次启动不再提示
+                try:
+                    os.makedirs(_TAILSCALE_FLAG_DIR, exist_ok=True)
+                    with open(_TAILSCALE_FLAG_FILE, "w") as f:
+                        f.write(f"joined=1\n")
+                        f.write(f"tailscale_ip={new_status['tailscale_ip']}\n")
+                except Exception:
+                    pass
+                logger.info(f"Tailscale 组网已就绪: {new_status['tailscale_ip']}")
+                return True
+            else:
+                print()
+                print("  ⚠️  仍检测不到 Tailscale 连接。请确认：")
+                print("     1. Tailscale 已安装并运行")
+                print("     2. 已通过邀请链接加入组网")
+                print("     3. 系统托盘图标显示「Connected」")
+                print()
+        elif choice in ("no", "n"):
+            print()
+            print("  已取消。请加入 Tailscale 组网后重新启动程序。")
+            return False
+        else:
+            print("  请输入 yes 或 no。")
+
+
+def _check_tailscale_requirement() -> bool:
+    """
+    检查 Tailscale 组网要求。
+
+    逻辑:
+    - 若标记文件存在 → 静默快速检查（已登录 → 跳过；未登录 → 提示）
+    - 若标记文件不存在 → 首次启动，显示完整引导流程
+
+    Returns:
+        True = 可以继续启动
+        False = 应退出程序
+    """
+    # 已标记为加入 → 快速检查
+    if os.path.isfile(_TAILSCALE_FLAG_FILE):
+        status = _check_tailscale_status()
+        if status.get("logged_in") and status.get("tailscale_ip"):
+            logger.info(f"Tailscale 在线: {status['tailscale_ip']}")
+            return True
+        else:
+            # 标记存在但 Tailscale 未运行（可能未开机自启）
+            logger.warning("Tailscale 已标记但当前未连接，提示重新连接")
+            print()
+            print("  ⚠️  Tailscale 当前未连接。")
+            print("  请确保 Tailscale 正在运行且已连接到组网。")
+            print(f"  如有问题，请重新访问邀请链接: {TAILSCALE_INVITE_URL}")
+            print()
+            return _prompt_tailscale_setup(status)
+
+    # 首次启动 → 完整引导
+    status = _check_tailscale_status()
+    return _prompt_tailscale_setup(status)
 
 
 def _detect_cuda() -> bool:
@@ -137,25 +369,34 @@ def _fallback_browser(url: str):
 
 
 def _kill_port_8000():
-    """清理占用 8000 端口的旧进程（防止重复启动冲突）。"""
-    import subprocess as _sp
+    """
+    检查 8000 端口。若被占用则尝试温和释放（旧实例退出后自行释放），
+    不做强行杀进程操作以避免杀软误报（netstat + taskkill /F 会触发 BITS 行为检测）。
+    """
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        result = _sp.run(
-            ["netstat", "-ano"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in result.stdout.splitlines():
-            if ":8000" in line and "LISTENING" in line:
-                parts = line.strip().split()
-                pid = parts[-1]
-                try:
-                    _sp.run(["taskkill", "/F", "/PID", pid],
-                            capture_output=True, timeout=5)
-                    logger.info(f"已清理占用 8000 端口的旧进程 (PID {pid})")
-                except Exception:
-                    pass
-    except Exception:
-        pass
+        sock.settimeout(0.5)
+        sock.bind(("127.0.0.1", 8000))
+        # 端口空闲，一切正常
+    except OSError:
+        # 端口已被占用 — 可能是旧实例尚未退出
+        logger.warning("端口 8000 已被占用，等待旧实例释放...")
+        print("  ⚠️  端口 8000 被占用，可能是旧实例仍在运行。")
+        print("     请关闭旧窗口或等待 5 秒后自动重试。")
+        for i in range(5, 0, -1):
+            print(f"     {i}...")
+            time.sleep(1)
+            try:
+                sock.bind(("127.0.0.1", 8000))
+                logger.info("端口 8000 已释放，继续启动。")
+                break
+            except OSError:
+                if i == 1:
+                    logger.error("端口 8000 仍被占用，启动可能失败。")
+                    print("  ❌ 端口 8000 仍被占用。请手动关闭占用程序后重试。")
+    finally:
+        sock.close()
 
 
 def main():
@@ -185,6 +426,17 @@ def main():
         print("  🚀 推理引擎: PyTorch + bitsandbytes")
         print("     模型: Safetensors (~3.6 GB)")
         print("     量化: INT4 (~1.75 GB 显存)")
+    print()
+
+    # ---- 第 0 步：Tailscale 组网检查 ----
+    if not _check_tailscale_requirement():
+        print()
+        print("按 Enter 键退出...")
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass
+        sys.exit(1)
     print()
 
     # ---- 第 1 步：检查模型文件 ----

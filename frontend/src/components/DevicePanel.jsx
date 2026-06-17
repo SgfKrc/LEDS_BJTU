@@ -17,7 +17,7 @@ const TIER_ICONS = {
   mobile: '📱',
 };
 
-export default function DevicePanel({ onToast, onTierDetected }) {
+export default function DevicePanel({ onToast, onProfileLoaded }) {
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
   const [applying, setApplying] = useState(false);
@@ -27,14 +27,14 @@ export default function DevicePanel({ onToast, onTierDetected }) {
     fetchDeviceProfile()
       .then((data) => {
         setProfile(data);
-        // 回传设备档位给父组件
-        if (data?.tier && onTierDetected) {
-          onTierDetected(data.tier);
+        // 回传完整设备画像给父组件（档位 + GPU 类型等），不自动应用预设
+        if (onProfileLoaded) {
+          onProfileLoaded(data);
         }
       })
       .catch(() => onToast?.({ type: 'error', msg: '设备检测失败' }))
       .finally(() => setLoading(false));
-  }, [onToast, onTierDetected]);
+  }, [onToast, onProfileLoaded]);
 
   useEffect(() => { refresh(); }, [refresh]);
 

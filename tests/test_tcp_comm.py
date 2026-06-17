@@ -18,6 +18,7 @@ from tcp_comm import (
     MessageType, pack_data, unpack_header,
     build_message, HEADER_LEN, MAX_PACKET_SIZE,
     serialize_tensor, deserialize_tensor,
+    serialize_tensor_fast, deserialize_tensor_fast,
 )
 
 
@@ -109,6 +110,10 @@ class TestMessageType:
     def test_layer_config_type(self):
         """分层配置推送类型"""
         assert MessageType.LAYER_CONFIG.value == "layer_config"
+
+    def test_chain_forward_type(self):
+        """链式直连转发类型（P2 优化）"""
+        assert MessageType.CHAIN_FORWARD.value == "chain_forward"
 
 
 # ================================================================
@@ -240,3 +245,94 @@ class TestPacketSizeLimit:
     def test_header_len_is_4(self):
         """长度头固定 4 字节"""
         assert HEADER_LEN == 4
+
+
+# ================================================================
+# serialize_tensor_fast / deserialize_tensor_fast 测试
+# ================================================================
+
+class TestFastTensorSerialization:
+    """测试高速序列化路径（流水线隐藏状态传输）"""
+
+    def test_fast_small_roundtrip_fp32(self):
+        """小张量 (<1MB) FP32 往返 — 走 TNR1 路径"""
+        tensor = torch.randn(3, 64, 128)  # ~98KB
+        data = serialize_tensor_fast(tensor)
+        assert data[:4] == b'TNR1', f"小张量应走 TNR1 路径，实际 magic: {data[:4]!r}"
+        restored = deserialize_tensor_fast(data)
+        assert torch.equal(restored, tensor)
+
+    def test_fast_small_roundtrip_fp16(self):
+        """小张量 FP16 往返"""
+        tensor = torch.randn(2, 32, 64, dtype=torch.float16)
+        data = serialize_tensor_fast(tensor)
+        restored = deserialize_tensor_fast(data)
+        assert torch.equal(restored, tensor)
+
+    def test_fast_small_roundtrip_int64(self):
+        """小张量 INT64（input_ids）往返"""
+        tensor = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], dtype=torch.int64)
+        data = serialize_tensor_fast(tensor)
+        restored = deserialize_tensor_fast(data)
+        assert torch.equal(restored, tensor)
+
+    def test_fast_large_roundtrip(self):
+        """大张量 (≥1MB) 往返 — 走 TNR0 路径（numpy 零拷贝）"""
+        # (1, 512, 2048) FP16 ≈ 2MB — 模拟 prefill 阶段隐藏状态
+        tensor = torch.randn(1, 512, 2048, dtype=torch.float16)
+        data = serialize_tensor_fast(tensor)
+        assert data[:4] == b'TNR0', f"大张量应走 TNR0 路径，实际 magic: {data[:4]!r}"
+        restored = deserialize_tensor_fast(data)
+        assert torch.equal(restored, tensor)
+
+    def test_fast_large_decode_phase(self):
+        """解码阶段隐藏状态 (1, 1, 2048) FP16 ≈ 4KB — 走小张量路径"""
+        tensor = torch.randn(1, 1, 2048, dtype=torch.float16)
+        data = serialize_tensor_fast(tensor)
+        assert data[:4] == b'TNR1', "decode 阶段张量小，应走 TNR1 路径"
+        restored = deserialize_tensor_fast(data)
+        assert torch.equal(restored, tensor)
+
+    def test_fast_equals_slow(self):
+        """fast 序列化/反序列化结果应与 slow 一致"""
+        tensors = [
+            torch.randn(4, 4),
+            torch.randn(1, 512, 2048, dtype=torch.float16),
+            torch.tensor([[1, 2, 3]], dtype=torch.int64),
+            torch.tensor(42.0),
+        ]
+        for t in tensors:
+            fast_restored = deserialize_tensor_fast(serialize_tensor_fast(t))
+            slow_restored = deserialize_tensor(serialize_tensor(t))
+            assert torch.equal(fast_restored, slow_restored), \
+                f"fast ≠ slow for shape {t.shape}, dtype {t.dtype}"
+
+    def test_fast_returns_bytes(self):
+        """高速序列化应返回 bytes"""
+        tensor = torch.randn(8, 8)
+        result = serialize_tensor_fast(tensor)
+        assert isinstance(result, bytes)
+        assert len(result) > 4  # 至少有 magic header
+
+    def test_fast_large_under_max_packet(self):
+        """大张量序列化后应在 MAX_PACKET_SIZE 范围内"""
+        tensor = torch.randn(1, 2048, 2048, dtype=torch.float16)  # ~8MB
+        data = serialize_tensor_fast(tensor)
+        assert len(data) < MAX_PACKET_SIZE, \
+            f"序列化大小 {len(data)} 超出 MAX_PACKET_SIZE {MAX_PACKET_SIZE}"
+
+    def test_fast_shape_preserved(self):
+        """往返后 shape 和 dtype 应完整保留"""
+        shapes = [
+            (1, 1, 2048),
+            (1, 512, 2048),
+            (3, 64, 128),
+            (1, 24, 32, 64),  # 4D 张量
+        ]
+        for shape in shapes:
+            tensor = torch.randn(*shape, dtype=torch.float16)
+            restored = deserialize_tensor_fast(serialize_tensor_fast(tensor))
+            assert restored.shape == tensor.shape, \
+                f"shape 不一致: {restored.shape} ≠ {tensor.shape}"
+            assert restored.dtype == tensor.dtype, \
+                f"dtype 不一致: {restored.dtype} ≠ {tensor.dtype}"
