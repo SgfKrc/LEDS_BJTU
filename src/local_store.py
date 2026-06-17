@@ -42,9 +42,6 @@ def _get_store_dir() -> str:
     return store_dir
 
 
-STORE_DIR = property(lambda self: _get_store_dir())  # noqa — 惰性求值
-
-
 def _store_dir() -> str:
     return _get_store_dir()
 

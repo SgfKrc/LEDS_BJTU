@@ -43,6 +43,17 @@ function formatUptime(ts) {
   if (sec < 3600) return `${Math.floor(sec / 60)}m`;
   return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
 }
+function formatRTT(rttMs) {
+  if (rttMs == null || rttMs === 0) return '—';
+  if (rttMs < 1) return '<1ms';
+  if (rttMs < 10) return `${rttMs.toFixed(1)}ms`;
+  return `${Math.round(rttMs)}ms`;
+}
+function isTcpActive(clientInfo) {
+  // TCP 判定为活跃：最近一次心跳在 10 秒内
+  if (!clientInfo || !clientInfo.last_heartbeat) return false;
+  return (Date.now() / 1000 - clientInfo.last_heartbeat) < 10;
+}
 
 // ================================================================
 // 流水线拓扑子组件
@@ -296,16 +307,30 @@ export default function AdminPanel({ onToast, myRole }) {
 
   // 拉取全部数据
   const refresh = useCallback(() => {
+    setLoading(true);
     Promise.all([
       fetchClusterStatus().catch(() => null),
       fetchClusterNodes().catch(() => null),
       fetchClusterConfig().catch(() => null),
       isMaster ? fetchInviteInfo().catch(() => null) : Promise.resolve(null),
-    ]).then(([s, n, c, inv]) => {
+      isMaster ? fetchLayerAssignment().catch(() => null) : Promise.resolve(null),
+      !isMaster ? fetchMasterHealth().catch(() => null) : Promise.resolve(null),
+    ]).then(([s, n, c, inv, layerData, mh]) => {
       setStatus(s);
       setNodes(n);
       setConfig(c);
       setInvite(inv);
+      if (layerData) {
+        setLayerAssignment(layerData);
+        const ov = {};
+        (layerData.assignments || []).forEach(a => {
+          ov[a.node_id] = { start: a.start_layer, end: a.end_layer };
+        });
+        setLayerOverrides(ov);
+      }
+      if (mh) {
+        setMasterHealth(mh);
+      }
       if (c?.max_nodes && !maxNodesInput) {
         setMaxNodesInput(String(c.max_nodes));
       }
@@ -1034,10 +1059,11 @@ export default function AdminPanel({ onToast, myRole }) {
                   <th>节点</th>
                   <th>角色</th>
                   <th>状态</th>
-                  <th>网络</th>
+                  <th>🔗 连接</th>
+                  <th>⏱ 延迟</th>
+                  <th>🌐 网络</th>
                   <th>地址</th>
                   <th>主机名</th>
-                  <th>心跳</th>
                   <th>在线时长</th>
                   <th>任务</th>
                   <th>错误</th>
@@ -1047,7 +1073,7 @@ export default function AdminPanel({ onToast, myRole }) {
               <tbody>
                 {filteredNodeList.length === 0 ? (
                   <tr>
-                    <td colSpan={isMaster ? 11 : 10} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                    <td colSpan={isMaster ? 12 : 11} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
                       {isMaster ? '暂无已注册的从节点，使用上方「注册新节点」添加' : '尚未连接到主节点，请在上方输入主节点地址'}
                     </td>
                   </tr>
@@ -1057,6 +1083,29 @@ export default function AdminPanel({ onToast, myRole }) {
                     const isMasterNode = node.role === 'master';
                     const netLabel = NETWORK_LABELS[node.network_type] || NETWORK_LABELS.unknown;
                     const netClass = NETWORK_CLASSES[node.network_type] || NETWORK_CLASSES.unknown;
+
+                    // TCP 连接状态
+                    const tcpDetail = status?.tcp_server?.client_details?.[node.node_id];
+                    const tcpConnected = isTcpActive(tcpDetail);
+                    const tcpMissed = tcpDetail?.heartbeat_missed || 0;
+                    const isSelfMaster = isMasterNode && isMaster;
+
+                    // 延迟 / RTT
+                    let rttDisplay = '—';
+                    let rttMs = null;
+                    if (isMaster && !isSelfMaster) {
+                      // 主节点视角：显示从节点心跳新鲜度
+                      if (tcpDetail?.last_heartbeat) {
+                        const age = Date.now() / 1000 - tcpDetail.last_heartbeat;
+                        rttMs = age * 1000;
+                        rttDisplay = age < 10 ? `${(age * 1000).toFixed(0)}ms` : `${age.toFixed(0)}s`;
+                      }
+                    } else if (!isMaster && isMasterNode) {
+                      // 从节点视角：显示到主节点的 RTT
+                      rttMs = status?.tcp_client?.avg_rtt_ms;
+                      rttDisplay = formatRTT(rttMs);
+                    }
+
                     return (
                       <tr key={node.node_id} className={isOffline ? 'row-offline' : ''}>
                         <td>
@@ -1074,10 +1123,31 @@ export default function AdminPanel({ onToast, myRole }) {
                             {STATE_LABELS[node.state] || node.state}
                           </span>
                         </td>
+                        <td>
+                          {isSelfMaster ? (
+                            <span className="conn-indicator conn-self" title="本机主节点">🖥️ 本地</span>
+                          ) : (
+                            <span
+                              className={`conn-indicator ${tcpConnected ? 'conn-ok' : 'conn-bad'}`}
+                              title={tcpConnected
+                                ? `TCP 连接正常，上次心跳 ${formatTime(tcpDetail?.last_heartbeat)}`
+                                : tcpDetail
+                                  ? `TCP 未连接，心跳丢失 ${tcpMissed} 次`
+                                  : '无 TCP 连接信息'}
+                            >
+                              <span className="conn-dot" />
+                              {tcpConnected ? '已连接' : '未连接'}
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          <span className="rtt-cell" title={rttMs ? `RTT: ${rttMs.toFixed(1)}ms` : undefined}>
+                            {rttDisplay}
+                          </span>
+                        </td>
                         <td><span className={`network-badge ${netClass}`}>{netLabel}</span></td>
                         <td className="mono-cell">{node.address || '—'}</td>
                         <td>{node.hostname || '—'}</td>
-                        <td>{formatTime(node.last_heartbeat)}</td>
                         <td>{isOffline ? '—' : formatUptime(node.connected_at)}</td>
                         <td>{node.task_count}</td>
                         <td>

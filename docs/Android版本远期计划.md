@@ -20,25 +20,30 @@
 
 ### 5.1.2 Android 节点在集群中的角色
 
+> **重要结论**: llama.cpp 不适合作为本项目现有「层间拆分 / LAYER_FORWARD」流水线的从节点。  
+> llama.cpp 的常规 API 面向**完整模型推理**；虽然 llama.cpp 生态存在 GPU layer offload、tensor split、RPC backend 等机制，但它们是 llama.cpp 内部后端调度，不等价于稳定暴露「只跑第 N-M 层并输入/输出 hidden states」的分布式流水线接口。
+
+因此 Android 版本的合理定位应调整为：
+
 ```
 ┌──────────────────────────────────────────────┐
 │              PC 主节点 (Master)               │
-│   PyTorch + CUDA / llama.cpp + GGUF          │
-│   完整推理 + 调度 + Web UI                   │
+│   调度 + Web UI + 请求分发                    │
 └──────┬──────────────┬──────────────┬─────────┘
        │ Tailscale    │              │
        ▼              ▼              ▼
 ┌──────────┐  ┌──────────┐  ┌──────────┐
 │ Android  │  │ Android  │  │  PC 从节点│
-│ 从节点 1 │  │ 从节点 2 │  │  从节点 3 │
-│ 4-6 层   │  │ 4-6 层   │  │ 6-8 层   │
-│ Q4_K_M   │  │ Q4_K_M   │  │ INT4     │
+│ 完整推理 │  │ 完整推理 │  │ 层间拆分 │
+│ GGUF模型 │  │ GGUF模型 │  │ PyTorch  │
+│ llama.cpp│  │ llama.cpp│  │ INT4     │
 └──────────┘  └──────────┘  └──────────┘
 ```
 
-- **Android 节点定位**: 轻量级从节点，承担 4-6 层 Transformer 推理
-- **通信方式**: Tailscale 虚拟组网（Android 有官方 App）+ TCP 长连接
-- **不适用场景**: 主节点（无 Web UI 服务能力）、大规模并发（内存受限）
+- **Android 节点推荐定位**: 独立 llama.cpp 推理 worker，接收完整 prompt，返回完整生成结果
+- **适合的分布式方式**: 请求级并行 / 多会话负载均衡 / 轻量离线节点，而不是 Transformer 层间流水线
+- **通信方式**: Tailscale 虚拟组网（Android 有官方 App）+ HTTP/TCP 任务协议
+- **不适用场景**: 作为当前 PyTorch `LAYER_FORWARD` 协议的层切分节点；大规模并发（内存与温控受限）
 
 ---
 
@@ -48,18 +53,26 @@
 
 | 方案 | 可行性 | 结论 |
 |------|--------|------|
-| **PyTorch Mobile** | Android 有官方支持，但模型需 TorchScript/ExecuTorch 导出 | 备选 |
-| **ONNX Runtime Mobile** | ARM64 + Qualcomm QNN EP 支持，需先导出 ONNX | 备选 |
-| **llama.cpp (NDK)** | ✅ 原生支持 ARM NEON，GGUF 直接加载，零依赖 | **首选** |
-| **MediaPipe LLM** | Google 官方方案，但仅支持 Gemma 系列 | 不适用 |
-| **MLC-LLM** | TVM 编译后端，性能好但复杂度高 | 参考 |
+| **PyTorch Mobile / ExecuTorch** | 有机会改造成层级 forward，但模型导出、算子覆盖、量化链路复杂 | 若坚持层间拆分，优先验证 |
+| **ONNX Runtime Mobile** | 可按子图拆分导出，但需要自己维护 embedding/layers/lm_head 边界与 hidden states 协议 | 层间拆分备选 |
+| **llama.cpp (NDK)** | ✅ 原生支持 ARM NEON，GGUF 直接加载，适合完整模型本地推理；❌ 不适合项目现有层间拆分协议 | **完整推理首选，不作为层切分从节点** |
+| **MediaPipe LLM** | Google 官方方案，但仅支持部分模型与完整推理 | 不适用层拆分 |
+| **MLC-LLM** | TVM 编译后端，性能好但复杂度高；理论上可定制图边界 | 研究参考 |
 
-**选择理由 — llama.cpp**:
-1. 已有 Windows 端 llama.cpp 引擎代码（`src/llama_engine.py`），逻辑可复用
+**选择理由 — llama.cpp 用于 Android 完整推理**:
+1. 已有 Windows 端 llama.cpp 引擎代码（`src/llama_engine.py`），完整推理逻辑可复用
 2. C++ 原生引擎，通过 NDK 交叉编译 → ARM64 二进制，性能极佳
 3. GGUF 格式模型与桌面端完全一致，无需重新导出
 4. Q4_K_M 量化后 Qwen-1.8B 仅 ~1.16GB — 可装入 4GB+ 手机 RAM
 5. 开源社区活跃，持续优化 ARM 性能（NEON / SVE 指令集）
+
+**但 llama.cpp 对层间拆分的限制**:
+- `llama-cpp-python` / llama.cpp 常规接口提供的是 token 输入 → logits/token 输出的完整推理调用，不是「输入 hidden states → 执行 layers N-M → 输出 hidden states」接口。
+- `n_gpu_layers` / split 相关参数主要用于把部分层 offload 到 GPU 或多个后端设备，本质是**单个 llama.cpp 进程内部的模型执行计划**，不是跨本项目 TCP 协议的 Transformer 层流水线。
+- llama.cpp 的 RPC backend 即使能把计算 offload 到远端，也要求远端运行 llama.cpp RPC server，并由 llama.cpp 自己管理 tensor/backend，不等价于当前 `scheduler.py` 的节点注册、层分配、`LAYER_FORWARD` 协议。
+- 若要强行实现，需要 fork/改造 llama.cpp：暴露某层 hidden state、KV cache 边界、position/attention mask、量化张量布局，并保持与 PyTorch 端 hidden states 格式兼容，工程量和维护成本都很高。
+
+**结论**: Android + llama.cpp 的主线价值应从「层间拆分」调整为「完整推理节点池」。如果项目目标必须是层间拆分，Android 路线应优先调研 ExecuTorch / ONNX Runtime Mobile 的子图拆分，而不是 llama.cpp。
 
 ### 5.2.2 应用形态
 

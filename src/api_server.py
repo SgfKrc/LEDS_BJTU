@@ -73,7 +73,7 @@ logger = logging.getLogger("api_server")
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.3",
+    version="0.1.4",
     description="北京交通大学 · 大学生创新创业训练计划",
 )
 

@@ -48,7 +48,7 @@ echo.
 
 REM ---- 编译 Inno Setup ----
 echo 开始编译安装包...
-echo 输出: dist\QLH-Edge-Inference-Setup-v0.1.3.exe
+echo 输出: dist\QLH-Edge-Inference-Setup-v0.1.4.exe
 echo 这可能需要 2-5 分钟（压缩中）...
 echo.
 

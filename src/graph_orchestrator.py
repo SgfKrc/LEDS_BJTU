@@ -551,27 +551,40 @@ class GraphOrchestrator:
                 key=lambda i: path_nodes[i]['vram_mb'],
             )
             for _ in range(-diff):
+                reduced = False
                 for idx in sorted_idx:
                     if raw_layers[idx] > 1:
                         raw_layers[idx] -= 1
+                        reduced = True
                         break
+                # 所有剩余节点都已降至 1 层 → 削去最低显存节点（将被过滤移除）
+                if not reduced:
+                    for idx in sorted_idx:
+                        if raw_layers[idx] >= 1:
+                            raw_layers[idx] -= 1
+                            break
 
-        # 构建分配结果
+        # 构建分配结果（跳过层数为 0 的节点）
         assignments = []
         cursor = 0
+        order = 0
+        total_assigned = sum(1 for c in raw_layers if c > 0)
         for i, n in enumerate(path_nodes):
             count = raw_layers[i]
+            if count <= 0:
+                continue
             assignments.append({
                 'node_id': n['node_id'],
                 'role': n['role'],
                 'start_layer': cursor,
                 'end_layer': cursor + count,
                 'layers_count': count,
-                'has_embedding': (i == 0),
-                'has_lm_head': (i == len(path_nodes) - 1),
+                'has_embedding': (order == 0),
+                'has_lm_head': (order == total_assigned - 1),
                 'score': round(n['compute_weight'], 1),
             })
             cursor += count
+            order += 1
 
         logger.info(
             f"📊 层分配完成 ({len(assignments)} 节点, "

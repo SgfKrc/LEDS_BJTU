@@ -1053,3 +1053,35 @@ class TestEdgeCases:
         total = sum(a["layers_count"] for a in assignments)
         assert total == 24
         # 30 个节点的编排应在合理时间内完成（远小于 1 秒）
+
+    def test_assign_layers_handles_excess_nodes(self):
+        """_assign_layers 在节点数 > 层数时不应崩溃，总层数不超过 model 层数"""
+        from graph_orchestrator import GraphOrchestrator
+
+        # 构造 30 个低配节点
+        nodes = {}
+        for i in range(30):
+            nid = f"node{i}"
+            nodes[nid] = type('MockNode', (), {
+                'node_id': nid,
+                'role': 'client',
+                'device_info': {},
+                'avg_rtt_ms': 0.0,
+                'network_type': 'wifi',
+            })()
+
+        orch = GraphOrchestrator(nodes=nodes, model_memory_mb=1000, total_layers=24)
+
+        # 直接测试 _assign_layers：30 节点路径，仅 24 层
+        vertices = {
+            nid: {'vram_mb': 100, 'compute_weight': 10, 'compute_delay': 5.0,
+                  'role': 'client'}
+            for nid in nodes
+        }
+        path = list(nodes.keys())
+        result = orch._assign_layers(path, vertices)
+
+        total = sum(a["layers_count"] for a in result)
+        assert total <= 24, f"总层数 {total} 不应超过 24，节点数={len(result)}"
+        # 至少应有部分节点被分配（≤ 24 个节点有层）
+        assert 1 <= len(result) <= 24

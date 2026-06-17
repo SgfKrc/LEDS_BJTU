@@ -707,6 +707,13 @@ class Scheduler:
             except Exception as e:
                 logger.warning(f"节点注册 DB 持久化失败: {e}")
 
+        # ★ 清除缓存的层分配方案，强制下次查询重新计算（含新节点）
+        if db and _db_available and self._effective_role() == "master":
+            try:
+                db.set_layer_assignments({})
+            except Exception:
+                pass
+
         logger.info(
             f"✅ 节点注册: {node_id} role={role} "
             f"hostname={hostname} addr={address} net={network_type}"
@@ -748,6 +755,12 @@ class Scheduler:
             self._push_node_update_to_all_clients(
                 node_id, "update", node
             )
+            # ★ 清除缓存的层分配方案，强制下次查询重新计算（剔除已注销节点）
+            if db and _db_available:
+                try:
+                    db.set_layer_assignments({})
+                except Exception:
+                    pass
 
         logger.info(f"节点注销: {node_id} ({old_state.value} → offline)")
         return True
@@ -1086,19 +1099,36 @@ class Scheduler:
                 idx = i % len(raw_layers)
                 raw_layers[idx] += 1
         elif diff < 0:
+            # 从低分节点优先削减，保留高分节点层数
             sorted_indices = sorted(range(len(raw_layers)), key=lambda i: node_list[i]["score"])
             for _ in range(-diff):
-                for idx in reversed(sorted_indices):
+                reduced = False
+                for idx in sorted_indices:
                     if raw_layers[idx] > 1:
                         raw_layers[idx] -= 1
+                        reduced = True
                         break
+                # 所有剩余节点都已降至 1 层 → 削去最低分节点（将被过滤移除）
+                if not reduced:
+                    for idx in sorted_indices:
+                        if raw_layers[idx] >= 1:
+                            raw_layers[idx] -= 1
+                            break
 
-        # Step 3: 排序（master 优先，同角色按权重降序）
+        # ★ 清理分配层数 ≤ 0 的节点（极端情况：节点数远超层数）
+        valid_pairs = [(idx, layers) for idx, layers in enumerate(raw_layers) if layers > 0]
+        if len(valid_pairs) < len(raw_layers):
+            logger.warning(
+                f"节点数 ({len(raw_layers)}) 超过可分配层数 ({distributable})，"
+                f"{len(raw_layers) - len(valid_pairs)} 个低分节点将被排除"
+            )
+
+        # Step 3: 排序（master 优先，同角色按权重降序），跳过已移除节点
         sorted_pairs = sorted(
             enumerate(node_list),
             key=lambda x: (x[1]["role"] != "master", -x[1]["score"])
         )
-        sorted_indices = [i for i, _ in sorted_pairs]
+        sorted_indices = [i for i, _ in sorted_pairs if raw_layers[i] > 0]
 
         # Step 4: 构建区间
         assignments = []
@@ -1139,6 +1169,13 @@ class Scheduler:
         显存约束校验：检查每节点是否有足够显存承载分配的层。
 
         若不足，将超额层转移给 VRAM 最充裕的节点；层数为 0 的节点从列表中移除。
+        转移后重新计算所有节点的 layer 区间以保持连续性。
+
+        ★ 保护规则（方案 A）:
+          - 首节点（has_embedding）至少保留 1 层 Transformer，确保 Embedding 权重有
+            同节点层可锚定，避免出现「纯 Embedding 节点」。
+          - 末节点（has_lm_head）同样至少保留 1 层。
+          - 若连 1 层都保不住，打 ERROR 日志并跳过转移（降级为本地推理兜底）。
         """
         for a in assignments:
             ok, needed, available = self._check_vram_constraint(
@@ -1146,21 +1183,44 @@ class Scheduler:
                 a["has_embedding"], a["has_lm_head"],
             )
             if not ok and available > 0:
+                # ★ 保护：首/末节点必须保留至少 1 层与 Embedding/LM Head 共存
+                if a["has_embedding"] and a["layers_count"] <= 1:
+                    logger.error(
+                        f"❌ 首节点 {a['node_id']} 显存不足（需 {needed}MB / 可用 {available}MB），"
+                        f"但 Embedding 层不可脱离 Transformer 层独立存在。"
+                        f"建议增加该节点显存或降级为本地推理。"
+                    )
+                    continue
+                if a["has_lm_head"] and a["layers_count"] <= 1:
+                    logger.error(
+                        f"❌ 末节点 {a['node_id']} 显存不足（需 {needed}MB / 可用 {available}MB），"
+                        f"但 LM Head 不可脱离 Transformer 层独立存在。"
+                        f"建议增加该节点显存或降级为本地推理。"
+                    )
+                    continue
+
                 best_node = max(
                     (other for other in assignments if other["node_id"] != a["node_id"]),
                     key=lambda x: self._get_node_vram_mb(x["node_id"]),
                     default=None,
                 )
                 if best_node:
-                    overflow = a["layers_count"]
-                    logger.warning(
-                        f"⚠️ 显存不足: {a['node_id']} 需要 {needed}MB, "
-                        f"可用 {available}MB — {overflow} 层转给 {best_node['node_id']}"
-                    )
-                    best_node["layers_count"] += overflow
-                    best_node["end_layer"] = best_node["start_layer"] + best_node["layers_count"]
-                    a["layers_count"] = 0
-                    a["end_layer"] = a["start_layer"]
+                    # ★ 只转移 Transformer 层，保留至少 1 层给 embedding/lm_head
+                    keep = 1 if (a["has_embedding"] or a["has_lm_head"]) else 0
+                    overflow = max(0, a["layers_count"] - keep)
+                    if overflow > 0:
+                        logger.warning(
+                            f"⚠️ 显存不足: {a['node_id']} 需要 {needed}MB, "
+                            f"可用 {available}MB — {overflow} 层转给 {best_node['node_id']}"
+                            + (f"（保留 {keep} 层锚定 Embedding/LM Head）" if keep > 0 else "")
+                        )
+                        best_node["layers_count"] += overflow
+                        a["layers_count"] = keep
+                    else:
+                        logger.warning(
+                            f"⚠️ 显存不足但无可转移层: {a['node_id']} "
+                            f"需要 {needed}MB, 可用 {available}MB"
+                        )
                 else:
                     logger.error(
                         f"❌ 显存不足且无其他节点可接手: {a['node_id']} "
@@ -1169,6 +1229,16 @@ class Scheduler:
 
         # 清除层数为 0 的节点
         assignments[:] = [a for a in assignments if a["layers_count"] > 0]
+
+        # ★ 重新计算所有节点的 layer 区间，确保 start_layer/end_layer 连续
+        cursor = 0
+        for i, a in enumerate(assignments):
+            a["start_layer"] = cursor
+            a["end_layer"] = cursor + a["layers_count"]
+            a["has_embedding"] = (i == 0)
+            a["has_lm_head"] = (i == len(assignments) - 1)
+            cursor += a["layers_count"]
+
         return assignments
 
     def get_layer_assignments(self) -> dict:
@@ -2670,11 +2740,25 @@ class Scheduler:
         # 请求队列状态
         queue_info = self.pipeline_queue.get_status()
 
+        # TCP 客户端状态（从节点视角：到主节点的连接状态）
+        tcp_client_info = None
+        if self._effective_role() == "client":
+            tcp_client = getattr(self, '_tcp_client', None)
+            if tcp_client:
+                tcp_client_info = {
+                    "connected": getattr(tcp_client, 'is_registered', False),
+                    "running": getattr(tcp_client, '_running', False),
+                    "server_host": getattr(tcp_client, 'server_host', ''),
+                    "server_port": getattr(tcp_client, 'server_port', 0),
+                    "avg_rtt_ms": round(getattr(tcp_client, 'avg_rtt_ms', 0.0), 1),
+                }
+
         return {
             "run_mode": RUN_MODE,
             "nodes": node_status,
             "current_task": current_task,
             "tcp_server": tcp_info,
+            "tcp_client": tcp_client_info,
             "nodes_ready": self.check_nodes_ready(),
             "pipeline": pipeline_info,
             "pipeline_queue": queue_info,
@@ -4586,10 +4670,11 @@ class Scheduler:
 
     def check_master_health(self) -> dict:
         """
-        检查主节点是否在线（通过数据库心跳时间戳判断）。
+        检查主节点是否在线。
 
-        从节点可以周期性调用此方法监控主节点状态。
-        如果主节点心跳超过 120 秒未更新，视为宕机。
+        两级检测（从快到慢）:
+          1. 本地 TCP 连接状态 — 秒级（~3s 心跳超时即可感知）
+          2. 数据库心跳时间戳 — 120s 超时（兜底，防止 TCP 假连接）
 
         Returns:
             {
@@ -4598,8 +4683,19 @@ class Scheduler:
                 "stale": bool,
                 "master_host": str,
                 "master_port": int,
+                "source": str,       # "tcp" | "database" | "self" | "db_unavailable"
+                "tcp_connected": bool | None,  # 本地 TCP 是否连通
             }
         """
+        # ★ 第 1 级：本地 TCP 连接状态（秒级感知断连）
+        tcp_client = getattr(self, '_tcp_client', None)
+        tcp_connected = (
+            tcp_client is not None
+            and getattr(tcp_client, '_running', False)
+            and getattr(tcp_client, 'is_registered', False)
+            and getattr(tcp_client, 'sock', None) is not None
+        )
+
         db = _get_db()
         if not db or not _db_available:
             return {
@@ -4609,6 +4705,7 @@ class Scheduler:
                 "master_host": "",
                 "master_port": 0,
                 "source": "db_unavailable",
+                "tcp_connected": tcp_connected,
             }
 
         try:
@@ -4621,12 +4718,25 @@ class Scheduler:
                     "master_host": "",
                     "master_port": 0,
                     "source": "not_found",
+                    "tcp_connected": tcp_connected,
                 }
 
             now = time.time()
             last_seen = info.get("last_seen", 0)
             ago = now - last_seen if last_seen > 0 else None
             stale = info.get("stale", True)
+
+            # ★ 如果本地 TCP 已断开，即使 DB 心跳未过期也立即报告离线
+            if not tcp_connected and self._effective_role() == "client":
+                return {
+                    "master_online": False,
+                    "last_seen_seconds_ago": round(ago, 1) if ago else None,
+                    "stale": stale,
+                    "master_host": info["master_host"],
+                    "master_port": info["master_port"],
+                    "source": "tcp_disconnected",
+                    "tcp_connected": False,
+                }
 
             return {
                 "master_online": not stale,
@@ -4635,6 +4745,7 @@ class Scheduler:
                 "master_host": info["master_host"],
                 "master_port": info["master_port"],
                 "source": "database",
+                "tcp_connected": tcp_connected,
             }
         except Exception as e:
             logger.warning(f"主节点健康检查失败: {e}")
@@ -4645,6 +4756,7 @@ class Scheduler:
                 "master_host": "",
                 "master_port": 0,
                 "source": "error",
+                "tcp_connected": tcp_connected,
             }
 
     # ================================================================

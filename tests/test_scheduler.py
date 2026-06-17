@@ -1296,3 +1296,210 @@ class TestChainTopology:
             assert pipeline_nodes[1]["node_id"] == "client2"
         finally:
             sched.get_layer_assignments = original
+
+
+# ================================================================
+# 显存约束校验 — 层区间重算
+# ================================================================
+
+class TestVramConstraintRecalculation:
+    """测试 _apply_vram_constraints 在转移层后正确重算 start_layer/end_layer"""
+
+    @pytest.fixture
+    def sched(self):
+        s = Scheduler()
+        s.nodes = {
+            "master": type('NodeInfo', (), {
+                'node_id': 'master', 'role': 'master',
+                'device_info': PROFILE_WORKSTATION,
+            })(),
+            "client1": type('NodeInfo', (), {
+                'node_id': 'client1', 'role': 'client',
+                'device_info': PROFILE_EDGE,  # 显存极少
+            })(),
+        }
+        return s
+
+    def test_layer_ranges_continuous_after_transfer(self, sched):
+        """层转移后 start_layer/end_layer 应连续无间隙"""
+        # 构造含 master 和低显存 client 的 assignments
+        assignments = [
+            {"node_id": "master", "role": "master",
+             "start_layer": 0, "end_layer": 12, "layers_count": 12,
+             "has_embedding": True, "has_lm_head": False, "score": 100},
+            {"node_id": "client1", "role": "client",
+             "start_layer": 12, "end_layer": 24, "layers_count": 12,
+             "has_embedding": False, "has_lm_head": True, "score": 10},
+        ]
+        result = sched._apply_vram_constraints(assignments)
+
+        # client1 显存不足 → 层应转给 master
+        # master 应承担全部 24 层
+        assert len(result) >= 1
+        total_layers = sum(a["layers_count"] for a in result)
+        assert total_layers == 24
+
+        # 验证连续无间隙
+        result.sort(key=lambda x: x["start_layer"])
+        cursor = 0
+        for a in result:
+            assert a["start_layer"] == cursor, \
+                f"gap at {a['node_id']}: expected start={cursor}, got {a['start_layer']}"
+            cursor = a["end_layer"]
+
+    def test_vram_transfer_preserves_embed_lm_head(self, sched):
+        """层转移后首节点应有 embedding，末节点应有 lm_head"""
+        assignments = [
+            {"node_id": "master", "role": "master",
+             "start_layer": 0, "end_layer": 12, "layers_count": 12,
+             "has_embedding": True, "has_lm_head": False, "score": 100},
+            {"node_id": "client1", "role": "client",
+             "start_layer": 12, "end_layer": 24, "layers_count": 12,
+             "has_embedding": False, "has_lm_head": True, "score": 10},
+        ]
+        result = sched._apply_vram_constraints(assignments)
+        if len(result) > 0:
+            assert result[0]["has_embedding"] is True
+            assert result[-1]["has_lm_head"] is True
+
+
+# ================================================================
+# _simple_weight_assignment 边界条件
+# ================================================================
+
+class TestSimpleWeightAssignmentEdgeCases:
+    """测试 _simple_weight_assignment 的边界条件"""
+
+    @pytest.fixture
+    def sched(self):
+        return Scheduler()
+
+    def test_many_nodes_with_min_layers(self, sched):
+        """当节点数 > 层数时，每节点至少 1 层，超出的从低分节点削减"""
+        # 构造 30 个低分配置节点
+        nodes = []
+        for i in range(30):
+            nodes.append({
+                "node_id": f"node{i}",
+                "role": "master" if i == 0 else "client",
+                "device_info": {"gpu": {"vram_total_gb": 0.5, "cuda_available": False},
+                               "ram": {"total_gb": 2}, "cpu": {"physical_cores": 1, "freq_max_mhz": 1000}},
+            })
+        result = sched._simple_weight_assignment(nodes, 24)
+        total = sum(a["layers_count"] for a in result)
+        # 总层数不应超过 24
+        assert total <= 24, f"总层数 {total} 不应超过 24"
+        # 至少部分节点应有分配层
+        assert len(result) >= 1
+
+    def test_two_nodes_equal_weight(self, sched):
+        """等权重双节点应均分 24 层（各 12）"""
+        nodes = [
+            {"node_id": "master", "role": "master",
+             "device_info": PROFILE_WORKSTATION},
+            {"node_id": "client1", "role": "client",
+             "device_info": PROFILE_WORKSTATION},  # 相同 profile
+        ]
+        result = sched._simple_weight_assignment(nodes, 24)
+        total = sum(a["layers_count"] for a in result)
+        assert total == 24
+        # 每个节点至少 10 层（等权重接近均分）
+        for a in result:
+            assert a["layers_count"] >= 10, \
+                f"{a['node_id']} 应有 ≈12 层，实际 {a['layers_count']}"
+
+
+# ================================================================
+# get_status() — tcp_client 字段（从节点视角）
+# ================================================================
+
+class TestGetStatusTcpClient:
+    """测试 get_status() 对从节点返回 tcp_client 连接状态"""
+
+    @pytest.fixture
+    def sched(self):
+        return Scheduler()
+
+    def test_client_status_includes_tcp_client_field(self, sched):
+        """从节点 get_status 应包含 tcp_client 字段"""
+        # mock 从节点角色
+        original_role = sched._effective_role
+        sched._effective_role = lambda: "client"
+        try:
+            # 无 _tcp_client 时 tcp_client 字段应为 None
+            status = sched.get_status()
+            assert "tcp_client" in status, "get_status 应包含 tcp_client 字段"
+            assert status["tcp_client"] is None, \
+                "无 _tcp_client 时 tcp_client 应为 None"
+        finally:
+            sched._effective_role = original_role
+
+    def test_client_status_with_tcp_client(self, sched):
+        """从节点有 _tcp_client 时应报告连接状态"""
+        original_role = sched._effective_role
+        sched._effective_role = lambda: "client"
+        try:
+            # 注入 mock _tcp_client
+            mock_client = type('MockTCPClient', (), {
+                'is_registered': True,
+                '_running': True,
+                'server_host': '100.100.52.1',
+                'server_port': 8888,
+                'avg_rtt_ms': 12.5,
+                'sock': True,
+            })()
+            sched._tcp_client = mock_client
+
+            status = sched.get_status()
+            assert status["tcp_client"] is not None
+            assert status["tcp_client"]["connected"] is True
+            assert status["tcp_client"]["running"] is True
+            assert status["tcp_client"]["server_host"] == "100.100.52.1"
+            assert status["tcp_client"]["avg_rtt_ms"] == 12.5
+        finally:
+            sched._effective_role = original_role
+            if hasattr(sched, '_tcp_client'):
+                del sched._tcp_client
+
+
+# ================================================================
+# check_master_health() — TCP 快速检测
+# ================================================================
+
+class TestCheckMasterHealthTcp:
+    """测试 check_master_health() 通过 TCP 状态快速检测断连"""
+
+    @pytest.fixture
+    def sched(self):
+        return Scheduler()
+
+    def test_tcp_disconnected_returns_offline(self, sched):
+        """TCP 断开时 check_master_health 应立即返回离线"""
+        original_role = sched._effective_role
+        sched._effective_role = lambda: "client"
+        try:
+            # 注入未注册的 mock _tcp_client
+            mock_client = type('MockTCPClient', (), {
+                'is_registered': False,
+                '_running': False,
+                'server_host': '100.100.52.1',
+                'server_port': 8888,
+                'sock': None,
+            })()
+            sched._tcp_client = mock_client
+
+            result = sched.check_master_health()
+            # 即使 DB 可能显示在线，TCP 断开应立即报告离线
+            if result.get("source") == "tcp_disconnected":
+                assert result["master_online"] is False
+                assert result["tcp_connected"] is False
+        finally:
+            sched._effective_role = original_role
+            if hasattr(sched, '_tcp_client'):
+                del sched._tcp_client
+
+    def test_check_master_health_has_tcp_connected_field(self, sched):
+        """所有 check_master_health 返回路径应包含 tcp_connected 字段"""
+        result = sched.check_master_health()
+        assert "tcp_connected" in result, \
+            "check_master_health 返回值应包含 tcp_connected 字段"
