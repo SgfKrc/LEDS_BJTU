@@ -1,28 +1,27 @@
 ; ============================================================
-; QLH 边缘推理系统 — Inno Setup 安装脚本
+; QLH 边缘推理系统 — Inno Setup 安装脚本（独显版）
 ; ============================================================
 ; 编译命令:
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
-;   或 双击 setup.iss → Inno Setup Compiler 打开 → Build → Compile
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 ;
 ; 前置条件:
-;   1. 已完成 PyInstaller 打包 → dist/QLH-Edge-Inference/
-;   2. 已安装 Inno Setup 6 (默认路径 C:\Program Files (x86)\Inno Setup 6)
+;   1. 已完成 PyInstaller 打包 → dist/QLH-Edge-Inference-CUDA/
+;   2. 已安装 Inno Setup 6
 ;
-; 输出: dist/QLH-Edge-Inference-Setup-v0.1.5.exe
+; 输出: dist/QLH-Edge-Inference-Setup-v0.1.5-CUDA.exe
 ; ============================================================
 
-#define MyAppName         "QLH Edge Inference"
-#define MyAppNameCN       "轻量化大模型分布式边缘推理系统"
+#define MyAppName         "QLH Edge Inference (CUDA)"
+#define MyAppNameCN       "轻量化大模型分布式边缘推理系统（独显版）"
 #define MyAppVersion      "0.1.5"
 #define MyAppPublisher    "北京交通大学 · 大创项目"
 #define MyAppExeName      "QLH-Edge-Inference.exe"
-#define MyAppSourceDir    "..\dist\QLH-Edge-Inference"
+#define MyAppSourceDir    "..\dist\QLH-Edge-Inference-CUDA"
 #define MyAppOutputDir    "dist"
 
 [Setup]
-; 全局唯一标识 — 不要修改（用于升级检测和卸载）
-AppId={{F1A3B5C7-8D2E-4F6A-9B1C-3D5E7F8A0B2C}}
+; 全局唯一标识 — 与集显版不同，允许共存
+AppId={{F1A3B5C7-8D2E-4F6A-9B1C-3D5E7F8A0B2D}}
 
 ; 基本信息
 AppName={#MyAppName}
@@ -35,13 +34,13 @@ SetupIconFile=g:\C\PYT\qlh\packaging\leds.ico
 
 ; 输出
 OutputDir={#MyAppOutputDir}
-OutputBaseFilename=QLH-Edge-Inference-Setup-v{#MyAppVersion}
+OutputBaseFilename=QLH-Edge-Inference-Setup-v{#MyAppVersion}-CUDA
 
-; 默认安装路径
-DefaultDirName={autopf}\QLH-Edge-Inference
+; 默认安装路径（与集显版不同目录，避免冲突）
+DefaultDirName={autopf}\QLH-Edge-Inference-CUDA
 DefaultGroupName={#MyAppNameCN}
 
-; 权限 — 最低权限即可，如需写 Program Files 会弹 UAC 提权
+; 权限
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
@@ -53,7 +52,7 @@ SolidCompression=yes
 WizardStyle=modern
 DisableWelcomePage=no
 
-; 卸载信息（控制面板 → 程序和功能）
+; 卸载信息
 UninstallDisplayName={#MyAppNameCN}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
@@ -67,18 +66,15 @@ Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [CustomMessages]
-; 安装界面中文字符串（中文语言激活时使用）
-chinese.AppNameCN=轻量化大模型分布式边缘推理系统
+chinese.AppNameCN=轻量化大模型分布式边缘推理系统（独显版）
 chinese.LaunchDesc=立即启动 轻量化大模型分布式边缘推理系统
-chinese.InstallDoneMsg=安装完成！%n%n首次启动会自动检测模型文件。%n若缺失模型，程序会弹出下载引导窗口。%n%n启动后浏览器访问: http://localhost:8000%n%n项目: 北京交通大学 · 大学生创新创业训练计划
+chinese.InstallDoneMsg=安装完成！%n%n本版本支持 NVIDIA GPU 推理（CUDA）+ CPU 推理（llama.cpp）。%n无 GPU 时自动回退 CPU 模式。%n%n首次启动会自动检测模型文件。%n%n启动后浏览器访问: http://localhost:8000%n%n项目: 北京交通大学 · 大学生创新创业训练计划
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 ; ---- 主程序（PyInstaller 输出） ----
-; restartreplace: 若文件被旧版进程锁定，标记为重启后替换
-; ignoreversion: 不比较版本号，直接覆盖
 Source: "{#MyAppSourceDir}\*"; DestDir: "{app}"; \
   Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 
@@ -88,47 +84,40 @@ Source: "..\docs\整体架构.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\docs\模块接口说明.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\docs\核心技术原理.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 
-; ---- GGUF 转换工具（高级用户） ----
+; ---- GGUF 转换工具 ----
 Source: "scripts\convert_to_gguf.py"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 [Dirs]
-; 模型和日志目录（用户可写）
 Name: "{app}\models"; Permissions: users-modify
 Name: "{app}\logs";   Permissions: users-modify
 
 [Icons]
-; 开始菜单 → 启动
 Name: "{group}\{#MyAppNameCN}"; \
   Filename: "{app}\{#MyAppExeName}"; \
   Comment: "启动 {#MyAppNameCN} (端口 8000)"
 
-; 开始菜单 → 卸载
 Name: "{group}\卸载 {#MyAppNameCN}"; \
   Filename: "{uninstallexe}"
 
-; 开始菜单 → 使用说明
 Name: "{group}\使用说明"; \
   Filename: "{app}\docs\README.md"
 
-; 桌面快捷方式（勾选 Tasks → desktopicon 时创建）
 Name: "{autodesktop}\{#MyAppNameCN}"; \
   Filename: "{app}\{#MyAppExeName}"; \
   Tasks: desktopicon; \
   Comment: "启动 {#MyAppNameCN}"
 
 [Run]
-; 安装完成后询问是否立即启动
 Filename: "{app}\{#MyAppExeName}"; \
   Description: "{cm:LaunchDesc}"; \
   Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
-; 清理运行时产生的文件（卸载时删除日志，默认保留模型文件）
 Type: files; Name: "{app}\logs\*"
 Type: dirifempty; Name: "{app}\logs"
 
 [Code]
-// ---- 卸载旧版本（通过注册表 AppId 查找已有安装）----
+// ---- 卸载旧版本 ----
 function GetOldUninstallString(var UninstPath: String): Boolean;
 begin
   Result := RegQueryStringValue(
@@ -140,28 +129,23 @@ begin
   );
 end;
 
-// ---- 安装前检查 ----
 function InitializeSetup: Boolean;
 var
   UninstPath: String;
   ResultCode: Integer;
 begin
   Result := True;
-
-  // 检测是否有已安装的旧版本
   if GetOldUninstallString(UninstPath) then
   begin
     if MsgBox(
       '检测到已安装的旧版本 {#MyAppNameCN}。' + #13#10 +
-      '覆盖安装可能导致文件冲突（新旧 DLL 混在一起）。' + #13#10#13#10 +
+      '覆盖安装可能导致文件冲突。' + #13#10#13#10 +
       '建议：先卸载旧版本，再重新安装。' + #13#10 +
       '模型文件和日志不会被删除。' + #13#10#13#10 +
-      '是否自动卸载旧版本后继续？' + #13#10 +
-      '（选「否」则直接覆盖安装，不推荐）',
+      '是否自动卸载旧版本后继续？',
       mbConfirmation, MB_YESNO or MB_DEFBUTTON1
     ) = IDYES then
     begin
-      // 静默卸载旧版本
       Exec(RemoveQuotes(ExtractFilePath(UninstPath)),
            '/VERYSILENT /SUPPRESSMSGBOXES',
            '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -169,7 +153,7 @@ begin
   end;
 end;
 
-// ---- 卸载时可选删除 models 目录（默认不删除）----
+// ---- 卸载时可选删除 models ----
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
@@ -180,7 +164,7 @@ begin
         '是否同时删除模型目录？' + #13#10#13#10 +
         ExpandConstant('{app}\models') + #13#10#13#10 +
         '注意：模型文件通常较大，重新下载会耗费时间。' + #13#10 +
-        '建议默认保留；只有在彻底清理或释放磁盘空间时选择「是」。',
+        '建议默认保留。',
         mbConfirmation, MB_YESNO or MB_DEFBUTTON2
       ) = IDYES then
       begin
@@ -191,7 +175,6 @@ begin
   end;
 end;
 
-// 安装完成的提示（中文/英文自适应）
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then

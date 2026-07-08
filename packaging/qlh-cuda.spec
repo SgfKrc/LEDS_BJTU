@@ -1,19 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
 # ============================================================
-# PyInstaller spec — QLH 边缘推理系统 集显版 (CPU-only)
+# PyInstaller spec — QLH 边缘推理系统 独显版 (CUDA + CPU)
 # ============================================================
-# 构建命令: cd packaging && pyinstaller qlh-cpu.spec --noconfirm
-# 输出目录: packaging/dist/QLH-Edge-Inference/
+# 构建命令: cd packaging && pyinstaller qlh-cuda.spec --noconfirm
+# 输出目录: dist/QLH-Edge-Inference-CUDA/
 #
-# 双引擎架构:
-#   1. llama.cpp + GGUF  — CPU/集显默认引擎（Q4_K_M ~1.16 GB）
-#   2. PyTorch CPU       — 备选引擎（FP16 ~3.5 GB）
+# 三引擎架构（主节点专用）:
+#   1. PyTorch + bitsandbytes — CUDA GPU 推理（INT4 ~1.75 GB 显存）
+#   2. llama.cpp + GGUF       — CPU/集显推理（Q4_K_M ~1.16 GB）
+#   3. 无 GPU 时自动回退 CPU  — 与集显版行为一致
 #
 # 前置条件:
-#   1. CPU-only PyTorch: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
+#   1. CUDA PyTorch: pip install torch  (自带 CUDA 12.6 DLL)
 #   2. llama-cpp-python: pip install llama-cpp-python
 #   3. 其余依赖: pip install -r packaging/requirements-cpu.txt
-#   4. 前端构建: cd frontend && npm run build
+#   4. NVIDIA 驱动 + CUDA 12.x（运行时需要；打包机必须已安装）
+#   5. 前端构建: cd frontend && npm run build
+#
+# ★ 与 qlh-cpu.spec 的区别：
+#   - 打包时使用 CUDA 版 torch（非 CPU-only），带 ~3.5 GB CUDA DLL
+#   - 输出到独立目录 QLH-Edge-Inference-CUDA，与集显版共存
+#   - 其余完全一致
 # ============================================================
 
 import os
@@ -189,5 +196,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='QLH-Edge-Inference',
+    name='QLH-Edge-Inference-CUDA',   # ★ 独立目录，与集显版共存
 )

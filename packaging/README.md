@@ -121,13 +121,18 @@ cd packaging
 
 ### `serve.py` — 安装包分发服务器
 
-通过 Tailscale 组网，让局域网/虚拟网内的其他节点无需 U 盘即可下载安装包：
+通过 Tailscale 组网，让局域网/虚拟网内的其他节点无需 U 盘即可下载安装包。首页会同时列出 Windows PC 安装包、Android APK/AAB、`models.7z`：
 
 ```bash
 cd packaging
 python serve.py
-# 启动后其他节点浏览器访问 http://<本机Tailscale IP>:9999 即可下载
+# 默认端口 9090，启动后其他节点浏览器访问 http://<本机Tailscale IP>:9090 即可下载
+
+# 如需指定端口：
+python serve.py 9999
 ```
+
+Android 安装包会从 `android/app/build/outputs/**/*.apk` / `*.aab` 自动扫描；若首页未显示，请先运行 `android/gradlew.bat assembleDebug`。
 
 ## 版本号更新清单
 
@@ -135,10 +140,10 @@ python serve.py
 
 | 文件 | 字段 | 示例 |
 |------|------|------|
-| `src/__init__.py` | `__version__` | `"0.1.3"` |
-| `src/api_server.py` | `version=` | `"0.1.3"` |
-| `packaging/setup.iss` | `MyAppVersion` | `"0.1.3"` |
-| `packaging/build-installer.bat` | 安装包文件名 | `v0.1.3.exe` |
+| `src/__init__.py` | `__version__` | `"0.1.5"` |
+| `src/api_server.py` | `version=` | `"0.1.5"` |
+| `packaging/setup.iss` | `MyAppVersion` | `"0.1.5"` |
+| `packaging/build-installer.bat` | 安装包文件名 | `v0.1.5.exe` |
 
 ## 杀软误报处理
 
@@ -170,6 +175,10 @@ A: 包含了完整的 Python 运行环境 + torch + transformers + llama.cpp + p
 **Q: 模型文件在安装包里吗？**
 
 A: 不包含。首次启动会自动检测并弹出下载引导（百度网盘 / ModelScope）。模型需放入 `models/` 目录。
+
+**Q: 卸载时会删除 `models/` 目录吗？**
+
+A: 默认不会。卸载程序会弹出确认框，默认选择「否」以保留模型文件；只有用户明确选择「是」时才会同时删除 `models/` 目录。
 
 **Q: 安装后运行报「数据库密码错误」？**
 
