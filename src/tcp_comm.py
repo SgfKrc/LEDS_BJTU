@@ -22,7 +22,10 @@ import socket
 import struct
 import threading
 import time
+import hashlib
+import hmac
 import io
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Callable
@@ -32,6 +35,7 @@ import torch
 from config import (
     SERVER_IP, SERVER_PORT, HEARTBEAT_INTERVAL,
     RECONNECT_MAX_RETRIES, RECONNECT_DELAY,
+    CLUSTER_SECRET, AUTH_TIMESTAMP_WINDOW,
 )
 
 # 尝试导入 psutil 用于网络类型检测
@@ -49,6 +53,75 @@ logger = logging.getLogger(__name__)
 # ================================================================
 HEADER_LEN = 4          # 长度头字节数（大端序 uint32）
 MAX_PACKET_SIZE = 256 * 1024 * 1024  # 最大包大小 256MB（特征张量可能较大）
+
+
+# ================================================================
+# HMAC 集群认证（阶段 7 — 跨节点安全）
+# ================================================================
+
+def build_auth_signature(node_id: str, timestamp: float = None) -> dict:
+    """
+    为注册消息构建 HMAC 认证签名。
+
+    签名算法: HMAC-SHA256(cluster_secret, "{node_id}:{timestamp}")
+    防重放: timestamp 用于服务端时间窗口校验
+
+    Returns:
+        {"auth_timestamp": float, "auth_signature": str}
+    """
+    ts = timestamp or time.time()
+    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    sig = hmac.new(
+        CLUSTER_SECRET.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+    return {"auth_timestamp": ts, "auth_signature": sig}
+
+
+def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
+    """
+    验证 HMAC 认证签名。
+
+    检查:
+    1. 时间戳在允许窗口内（防重放攻击）
+    2. HMAC-SHA256 签名匹配
+
+    Args:
+        node_id: 注册节点 ID
+        auth_data: {"auth_timestamp": float, "auth_signature": str}
+
+    Returns:
+        (ok: bool, reason: str)
+    """
+    if not auth_data:
+        return False, "缺少认证签名（auth_timestamp/auth_signature）"
+
+    ts = auth_data.get("auth_timestamp")
+    sig = auth_data.get("auth_signature", "")
+
+    if ts is None:
+        return False, "缺少时间戳（auth_timestamp）"
+    if not sig:
+        return False, "缺少签名（auth_signature）"
+
+    # 1. 时间窗口校验（±5 分钟）
+    now = time.time()
+    drift = abs(now - ts)
+    if drift > AUTH_TIMESTAMP_WINDOW:
+        return False, (
+            f"时间戳偏差过大（{drift:.0f}s > {AUTH_TIMESTAMP_WINDOW}s），"
+            f"请检查系统时钟同步"
+        )
+
+    # 2. HMAC 签名校验
+    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    expected = hmac.new(
+        CLUSTER_SECRET.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, sig):
+        return False, "HMAC 签名不匹配 — 集群密钥不一致"
+
+    return True, "ok"
 
 
 class MessageType(str, Enum):
@@ -698,6 +771,7 @@ class ClientConn:
     sock: socket.socket
     addr: tuple                  # (ip, port)
     role: str = ""               # 节点角色
+    node_type: str = "pc"        # 设备平台: "pc" | "android"
     hostname: str = ""           # 客户端主机名
     device_info: dict = None     # 客户端设备信息
     network_type: str = "unknown"  # 网络连接类型: wifi | ethernet | unknown
@@ -878,9 +952,28 @@ class TCPServer:
         data = msg.get("data", {})
         client_id = data.get("client_id", temp_id)
         role = data.get("role", "unknown")
+        node_type = data.get("node_type", "pc")
         hostname = data.get("hostname", "unknown")
         device_info = data.get("device_info", {})
         network_type = data.get("network_type", "unknown")
+
+        # ★ 阶段 7：HMAC 集群认证
+        auth_ok, auth_reason = verify_auth_signature(
+            client_id, data.get("auth", {})
+        )
+        if not auth_ok:
+            logger.error(
+                f"⛔ 认证失败: {client_id}@{addr[0]}:{addr[1]} — {auth_reason}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": f"认证失败: {auth_reason}",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError:
+                pass
+            return temp_id
 
         # ★ 安全：拒绝 client_id="master" 或 role="master" 的注册
         if client_id == "master":
@@ -911,12 +1004,28 @@ class TCPServer:
             except OSError:
                 pass
             return temp_id
+        # Android 节点只能作为 client
+        if node_type == "android" and role == "master":
+            logger.error(
+                f"⛔ 拒绝注册: Android 节点不能担任 master 角色，"
+                f"来源 {addr[0]}:{addr[1]}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": "Android 节点不能担任 master 角色",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError:
+                pass
+            return temp_id
 
         client_conn = ClientConn(
             client_id=client_id,
             sock=conn,
             addr=addr,
             role=role,
+            node_type=node_type,
             hostname=hostname,
             device_info=device_info,
             network_type=network_type,
@@ -1043,6 +1152,7 @@ class TCPServer:
             "client_id": c.client_id,
             "addr": f"{c.addr[0]}:{c.addr[1]}",
             "role": c.role,
+            "node_type": c.node_type,
             "hostname": c.hostname,
             "device_info": c.device_info,
             "network_type": c.network_type,
@@ -1076,11 +1186,13 @@ class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
     def __init__(self, server_host: str = None, server_port: int = None,
-                 client_id: str = None, role: str = None):
+                 client_id: str = None, role: str = None,
+                 node_type: str = "pc"):
         self.server_host = server_host or SERVER_IP
         self.server_port = server_port or SERVER_PORT
         self.client_id = client_id or f"client_{socket.gethostname()}"
         self.role = role or "client"
+        self.node_type = node_type
         self.sock: Optional[socket.socket] = None
         self._running = False
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -1090,6 +1202,63 @@ class TCPClient:
         self._registered = False
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
+
+    @staticmethod
+    def _compute_local_model_sha256() -> str:
+        """
+        计算本地模型文件的 SHA256（用于注册时上报）。
+
+        优先级:
+        1. 读取已有的 .sha256 缓存文件
+        2. 计算实际模型文件的 SHA256
+        3. 无法获取时返回空字符串
+        """
+        import config as cfg
+
+        # 尝试 GGUF 模型路径
+        gguf_path = getattr(cfg, 'GGUF_MODEL_PATH', '')
+        if gguf_path and os.path.isfile(gguf_path):
+            sha256_file = gguf_path + ".sha256"
+            if os.path.isfile(sha256_file):
+                try:
+                    with open(sha256_file, "r") as f:
+                        return f.read().strip().split()[0]
+                except Exception:
+                    pass
+            # 计算并缓存
+            try:
+                h = hashlib.sha256()
+                with open(gguf_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        h.update(chunk)
+                result = h.hexdigest()
+                with open(sha256_file, "w") as f:
+                    f.write(f"{result}  {os.path.basename(gguf_path)}\n")
+                return result
+            except Exception:
+                pass
+
+        # 尝试 Safetensors 模型目录
+        model_path = getattr(cfg, 'MODEL_PATH', '')
+        if model_path and os.path.isdir(model_path):
+            # 计算目录下所有 .safetensors 文件的组合 SHA256
+            try:
+                files = sorted([
+                    f for f in os.listdir(model_path)
+                    if f.endswith('.safetensors') or f.endswith('.bin')
+                ])
+                if files:
+                    h = hashlib.sha256()
+                    for fname in files:
+                        fpath = os.path.join(model_path, fname)
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(8192), b""):
+                                h.update(chunk)
+                    return h.hexdigest()
+            except Exception:
+                pass
+
+        return ""
 
     def connect(self, on_message: Callable = None) -> bool:
         """
@@ -1132,9 +1301,12 @@ class TCPClient:
                 reg_data = {
                     "client_id": self.client_id,
                     "role": self.role,
+                    "node_type": self.node_type,
                     "hostname": _platform.node(),
                     "network_type": network_type,
                     "device_info": _device_info,
+                    "model_sha256": self._compute_local_model_sha256(),
+                    "auth": build_auth_signature(self.client_id),
                 }
                 self.send_data(reg_data, MessageType.REGISTER)
 
