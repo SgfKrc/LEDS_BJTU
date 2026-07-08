@@ -11,7 +11,9 @@
 依赖: threading, logging, socket
 """
 
+import collections
 import logging
+import os
 import threading
 import time
 from enum import Enum
@@ -30,6 +32,12 @@ from config import (
     NODE_ROLE, NODE_ID, MAX_NODES,
     MASTER_DOWN_EMAIL_TIMEOUT,
     PIPELINE_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
+    PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL,
+    PIPELINE_SCHEDULING_STRATEGY,
+    PIPELINE_Q0_MAX_TOKENS, PIPELINE_Q1_MAX_TOKENS,
+    PIPELINE_AGING_Q1_TO_Q0_SECONDS, PIPELINE_AGING_Q2_TO_Q1_SECONDS,
+    PIPELINE_AGING_MAX_WAIT_SECONDS,
+    PIPELINE_PREEMPT_ENABLED,  # 二期协同抢占（当前仅参数预留）
 )
 
 logger = logging.getLogger(__name__)
@@ -83,6 +91,7 @@ class NodeInfo:
     """节点信息（分布式模式下通过 TCP 注册填充）"""
     node_id: str
     role: str                      # 节点角色: "master" | "client"
+    node_type: str = "pc"          # 设备平台: "pc" | "android"
     state: NodeState = NodeState.OFFLINE
     address: str = ""              # "ip:port" 字符串
     hostname: str = ""             # 客户端主机名
@@ -94,6 +103,7 @@ class NodeInfo:
     last_rtt_ms: float = 0.0       # 最近一次 RTT
     task_count: int = 0            # 已完成任务数
     error_count: int = 0           # 错误计数
+    model_sha256: str = ""         # 模型 SHA256 校验值（阶段 7）
 
     def is_available(self) -> bool:
         return self.state == NodeState.ONLINE
@@ -103,6 +113,7 @@ class NodeInfo:
         return {
             "node_id": self.node_id,
             "role": self.role,
+            "node_type": self.node_type,
             "state": self.state.value,
             "address": self.address,
             "hostname": self.hostname,
@@ -114,6 +125,7 @@ class NodeInfo:
             "last_rtt_ms": round(self.last_rtt_ms, 1),
             "task_count": self.task_count,
             "error_count": self.error_count,
+            "model_sha256": self.model_sha256,
             "is_available": self.is_available(),
         }
 
@@ -131,15 +143,77 @@ class InferenceTask:
     metrics: dict = field(default_factory=dict)  # 性能指标
 
 
+@dataclass
+class QueueTask:
+    """
+    流水线队列中的单个任务 — MLFQ 调度单元。
+
+    字段映射:
+    - priority_level: 0=Q0(交互,≤128tk), 1=Q1(普通,≤512tk), 2=Q2(批量,>512tk)
+    - original_level: 入队时的初始级别（用于展示老化状态）
+    - created_at: 入队时间戳（用于老化提升计算）
+    """
+
+    task_id: str
+    prompt: str = ""
+    max_new_tokens: int = 512
+    temperature: float = 0.7
+    top_p: float = 0.9
+    session_id: Optional[str] = None
+    priority_level: int = 1       # 0=Q0(交互), 1=Q1(普通), 2=Q2(批量)
+    created_at: float = field(default_factory=time.time)
+    original_level: int = 1       # 入队时的初始级别
+    # 保留原始 kwargs 以便透传给 process_fn（如 _stream_callback, _queue_timeout）
+    _extra_kwargs: dict = field(default_factory=dict)
+
+    def estimated_duration_seconds(self) -> float:
+        """预估剩余推理时间（用于 SJF 排序）。假设 ~50ms/token。"""
+        return self.max_new_tokens * 0.05
+
+    def wait_seconds(self) -> float:
+        """已等待秒数。"""
+        return time.time() - self.created_at
+
+    def to_task_data(self) -> dict:
+        """重建 **task_data 字典以调用 process_fn（向后兼容）。"""
+        return {
+            "prompt": self.prompt,
+            "max_new_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "session_id": self.session_id,
+            **self._extra_kwargs,
+        }
+
+    def to_dict(self) -> dict:
+        """序列化为前端展示。"""
+        return {
+            "task_id": self.task_id,
+            "priority_level": self.priority_level,
+            "original_level": self.original_level,
+            "max_new_tokens": self.max_new_tokens,
+            "wait_seconds": round(self.wait_seconds(), 1),
+            "estimated_duration_s": round(self.estimated_duration_seconds(), 1),
+            "is_aged": self.priority_level != self.original_level,
+            "created_at": self.created_at,
+        }
+
+
 class PipelineQueue:
     """
-    流水线请求队列 — FIFO 串行执行，单任务并发。
+    流水线请求队列 — MLFQ 三级反馈队列 + FIFO 兼容模式。
+
+    调度策略:
+    - "mlfq": Q0(交互,≤128tk) → Q1(普通,≤512tk) → Q2(批量,>512tk)
+               同级 SJF 排序，老化提升防饥饿
+    - "fifo": 级内先进先出（Q0→Q1→Q2 优先级，同级按入队顺序）。
+              注意: 非严格全局 FIFO——短请求(Q0)始终优先于长请求(Q2)。
 
     特性:
     - 仅 1 个流水线任务执行中，后续请求自动排队
     - 调用方通过 task_id 轮询或阻塞等待结果
     - 已完成结果保留 TTL 秒后自动清理
-    - 线程安全
+    - 线程安全（RLock）
 
     用法:
         queue = PipelineQueue()
@@ -148,10 +222,16 @@ class PipelineQueue:
         result = queue.wait_for_result(task_id, timeout=120)
     """
 
-    def __init__(self, max_size: int = 100, result_ttl: float = 300.0):
-        import collections
+    def __init__(self, max_size: int = 100, result_ttl: float = 300.0,
+                 strategy: str = "mlfq",
+                 q0_max_tokens: int = 128, q1_max_tokens: int = 512,
+                 aging_q1_to_q0: float = 60.0, aging_q2_to_q1: float = 120.0,
+                 aging_max_wait: float = 300.0):
 
-        self._queue: collections.deque = collections.deque()
+        # 三级队列（MLFQ）
+        self._q0: collections.deque = collections.deque()  # Q0 交互级
+        self._q1: collections.deque = collections.deque()  # Q1 普通级
+        self._q2: collections.deque = collections.deque()  # Q2 批量级
         self._results: dict = {}           # task_id → {status, result, created_at, ...}
         self._events: dict = {}            # task_id → threading.Event
         self._lock = threading.RLock()  # 可重入锁：run_pipeline_safe 在持有锁时调用 enqueue
@@ -161,6 +241,43 @@ class PipelineQueue:
         self._result_ttl = result_ttl
         self._worker_thread: Optional[threading.Thread] = None
         self._process_fn: Optional[Callable] = None
+
+        # ---- MLFQ 调度配置 ----
+        self._strategy: str = strategy
+        self._paused: bool = False         # 暂停接受新请求
+        # 分级阈值
+        self._q0_max_tokens: int = q0_max_tokens
+        self._q1_max_tokens: int = q1_max_tokens
+        # 老化参数
+        self._aging_q1_to_q0: float = aging_q1_to_q0
+        self._aging_q2_to_q1: float = aging_q2_to_q1
+        self._aging_max_wait: float = aging_max_wait
+
+        # ---- 抢占统计（二期实施，参数预留） ----
+        self._preempt_count: int = 0
+        self._preempt_total_overhead_ms: float = 0.0
+        self._last_preempt_time: float = 0.0
+
+        # ---- _queue 兼容属性（FIFO 回退时合并视图） ----
+        # 保留为 property，不再作为独立存储
+
+    # ---- 队列兼容属性（FIFO 回退时合并三级队列视图） ----
+
+    @property
+    def _queue(self):
+        """
+        兼容属性：合并三级队列为单一 deque 只读视图。
+
+        ⚠️ 警告:
+        - 每次访问创建新 deque 副本，返回后对副本的修改不会反映到内部队列。
+        - 未加锁，并发修改期间读取可能快照不一致。
+        - 仅用于向后兼容的只读遍历。请使用 enqueue() / _get_next_task() 进行修改。
+        """
+        result = collections.deque()
+        result.extend(self._q0)
+        result.extend(self._q1)
+        result.extend(self._q2)
+        return result
 
     def start(self, process_fn: Callable) -> None:
         """启动后台工作线程，开始处理队列中的任务。"""
@@ -172,7 +289,10 @@ class PipelineQueue:
             target=self._process_loop, name="pipeline-queue", daemon=True
         )
         self._worker_thread.start()
-        logger.info("流水线请求队列已启动 (FIFO, max_size=%d)", self._max_size)
+        logger.info(
+            "流水线请求队列已启动 (strategy=%s, max_size=%d)",
+            self._strategy.upper(), self._max_size
+        )
 
     def stop(self) -> None:
         """停止工作线程，清理等待中的任务。"""
@@ -189,17 +309,18 @@ class PipelineQueue:
 
     def enqueue(self, task_id: str = None, **task_data) -> str:
         """
-        将推理请求加入队列末尾。
+        将推理请求加入队列（MLFQ 自动分级）。
 
         Args:
             task_id: 任务标识（None 则自动生成）
             **task_data: 传递给 process_fn 的关键字参数
+                        必须包含 prompt, max_new_tokens
 
         Returns:
             task_id 字符串
 
         Raises:
-            RuntimeError: 队列已满
+            RuntimeError: 队列已满或已暂停
         """
         import uuid
 
@@ -207,7 +328,13 @@ class PipelineQueue:
             task_id = f"q_{uuid.uuid4().hex[:12]}"
 
         with self._lock:
-            if len(self._queue) >= self._max_size:
+            # 暂停检查
+            if self._paused:
+                raise RuntimeError("请求队列已暂停，暂不接受新请求")
+
+            # 容量检查
+            total_size = len(self._q0) + len(self._q1) + len(self._q2)
+            if total_size >= self._max_size:
                 logger.warning(
                     f"⚠️ 请求队列已满 ({self._max_size}/{self._max_size})，"
                     f"拒绝新请求"
@@ -215,16 +342,34 @@ class PipelineQueue:
                 raise RuntimeError(
                     f"请求队列已满 ({self._max_size} 上限)，请稍后重试"
                 )
-            self._queue.append((task_id, task_data))
+
+            # 构建 QueueTask
+            max_tokens = task_data.get("max_new_tokens", 512)
+            priority_level = self._classify(max_tokens)
+            task = QueueTask(
+                task_id=task_id,
+                prompt=task_data.pop("prompt", ""),
+                max_new_tokens=max_tokens,
+                temperature=task_data.pop("temperature", 0.7),
+                top_p=task_data.pop("top_p", 0.9),
+                session_id=task_data.pop("session_id", None),
+                priority_level=priority_level,
+                original_level=priority_level,
+                _extra_kwargs=task_data,  # 保留其余 kwargs（如 _stream_callback）
+            )
+
+            # 按级别入队
+            self._get_queue(priority_level).append(task)
             self._events[task_id] = threading.Event()
             self._results[task_id] = {
                 "status": "queued",
-                "created_at": time.time(),
+                "created_at": task.created_at,
             }
 
         logger.info(
             f"📥 请求已入队: task={task_id}, "
-            f"queue_depth={self.queue_size}"
+            f"level=Q{priority_level}, max_tokens={max_tokens}, "
+            f"total_depth={total_size + 1}"
         )
         return task_id
 
@@ -251,30 +396,216 @@ class PipelineQueue:
         else:
             return {"status": "timeout", "error": f"任务 {task_id} 超时 ({timeout}s)"}
 
+    # ---- 内部分级与队列选择 ----
+
+    def _classify(self, max_new_tokens: int) -> int:
+        """
+        根据 max_new_tokens 确定优先级级别。
+
+        MLFQ 模式: ≤Q0_MAX→0, ≤Q1_MAX→1, >Q1_MAX→2
+        FIFO 模式: 统一返回 1（所有任务进入同一队列，保持入队顺序）
+        """
+        if self._strategy == "fifo":
+            return 1
+        if max_new_tokens <= self._q0_max_tokens:
+            return 0
+        elif max_new_tokens <= self._q1_max_tokens:
+            return 1
+        else:
+            return 2
+
+    def _get_queue(self, level: int) -> collections.deque:
+        """返回对应级别的队列。"""
+        if level == 0:
+            return self._q0
+        elif level == 1:
+            return self._q1
+        else:
+            return self._q2
+
+    # ---- MLFQ 调度核心 ----
+
+    def _get_next_task(self) -> Optional[QueueTask]:
+        """
+        从队列中选择下一个任务。
+
+        - FIFO 模式：从 Q0 → Q1 → Q2 按入队顺序弹出
+        - MLFQ 模式：调用 schedule_next()（含 aging + SJF）
+        """
+        if self._strategy == "fifo":
+            # 统一 FIFO：按 Q0 → Q1 → Q2 顺序，每级内先进先出
+            for q in [self._q0, self._q1, self._q2]:
+                if q:
+                    return q.popleft()
+            return None
+        else:
+            return self._schedule_next()
+
+    def _schedule_next(self) -> Optional[QueueTask]:
+        """
+        MLFQ 调度：从三级队列中选择下一个要执行的任务。
+
+        ★ 必须在持有 self._lock 时调用（线程安全）。
+
+        规则:
+        1. 老化提升（饥饿保护）
+        2. 每级队列内部 SJF 排序
+        3. 严格优先级：Q0 → Q1 → Q2
+        """
+        self._apply_aging()
+        self._apply_sjf_sorting()
+
+        for q in [self._q0, self._q1, self._q2]:
+            if q:
+                return q.popleft()
+        return None
+
+    def _apply_aging(self, now: float = None) -> None:
+        """
+        老化提升：等待过久的请求逐级上浮（每次调用仅提升一级）。
+
+        - Q2 → Q1: 等待超过 aging_q2_to_q1 秒
+        - Q1 → Q0: 等待超过 aging_q1_to_q0 秒（不含刚从 Q2 提升的）
+        - 绝对上限: 等待超过 aging_max_wait 秒 → 直接置顶 Q0
+        """
+        now = now or time.time()
+        just_promoted: set = set()  # 本轮已提升的 task_id，避免重复提升
+
+        # Q2 → Q1
+        aged_up = [t for t in list(self._q2)
+                   if now - t.created_at > self._aging_q2_to_q1]
+        for t in aged_up:
+            self._q2.remove(t)
+            t.priority_level = 1
+            self._q1.append(t)
+            just_promoted.add(t.task_id)
+            logger.info(
+                f"⬆️ 老化提升 Q2→Q1: {t.task_id} "
+                f"(等待 {now - t.created_at:.0f}s)"
+            )
+
+        # Q1 → Q0（排除刚从 Q2 提升上来的，每次仅提升一级）
+        aged_up = [t for t in list(self._q1)
+                   if now - t.created_at > self._aging_q1_to_q0
+                   and t.task_id not in just_promoted]
+        for t in aged_up:
+            self._q1.remove(t)
+            t.priority_level = 0
+            # 超过绝对上限 → 置顶 Q0；否则追加到队尾
+            if now - t.created_at > self._aging_max_wait:
+                self._q0.appendleft(t)
+                logger.warning(
+                    f"🔴 绝对上限老化 Q1→Q0(置顶): {t.task_id} "
+                    f"(等待 {now - t.created_at:.0f}s > {self._aging_max_wait}s)"
+                )
+            else:
+                self._q0.append(t)
+                logger.info(
+                    f"⬆️ 老化提升 Q1→Q0: {t.task_id} "
+                    f"(等待 {now - t.created_at:.0f}s)"
+                )
+
+        # 绝对上限 → 强制置顶 Q0（对所有队列中等待超过上限的任务）
+        for q in [self._q1, self._q2]:
+            aged_max = [t for t in list(q)
+                        if now - t.created_at > self._aging_max_wait]
+            for t in aged_max:
+                q.remove(t)
+                t.priority_level = 0
+                self._q0.appendleft(t)  # 放到 Q0 队首
+                logger.warning(
+                    f"🔴 绝对上限老化: {t.task_id} 强制置顶 Q0 "
+                    f"(等待 {now - t.created_at:.0f}s > {self._aging_max_wait}s)"
+                )
+
+    def _apply_sjf_sorting(self) -> None:
+        """每级队列内部按预估剩余时间升序排列（SJF）。"""
+        for q in [self._q0, self._q1, self._q2]:
+            if len(q) <= 1:
+                continue
+            q_sorted = sorted(q, key=lambda t: t.estimated_duration_seconds())
+            q.clear()
+            q.extend(q_sorted)
+
+    # ---- 策略控制 ----
+
+    def set_strategy(self, strategy: str) -> None:
+        """切换调度策略: "fifo" | "mlfq"。"""
+        if strategy not in ("fifo", "mlfq"):
+            raise ValueError(f"无效调度策略: {strategy}，仅支持 fifo/mlfq")
+        with self._lock:
+            self._strategy = strategy
+        logger.info(f"调度策略已切换: {strategy.upper()}")
+
+    def get_queue_detail(self) -> dict:
+        """返回三级队列详情（供 API 和前端使用）。"""
+        with self._lock:
+            return {
+                "running": self._running,
+                "strategy": self._strategy,
+                "paused": self._paused,
+                "current_task": self._current_task_id,
+                "queue_size": len(self._q0) + len(self._q1) + len(self._q2),
+                "q0_depth": len(self._q0),
+                "q1_depth": len(self._q1),
+                "q2_depth": len(self._q2),
+                "q0": [t.to_dict() for t in list(self._q0)],
+                "q1": [t.to_dict() for t in list(self._q1)],
+                "q2": [t.to_dict() for t in list(self._q2)],
+                "aging_params": {
+                    "q1_to_q0_s": self._aging_q1_to_q0,
+                    "q2_to_q1_s": self._aging_q2_to_q1,
+                    "max_wait_s": self._aging_max_wait,
+                },
+                "preempt_stats": {
+                    "count": self._preempt_count,
+                    "last_time": self._last_preempt_time,
+                    "total_overhead_ms": round(self._preempt_total_overhead_ms, 1),
+                },
+                "completed_count": sum(
+                    1 for r in self._results.values()
+                    if r.get("status") in ("done", "error", "cancelled")
+                ),
+                "max_size": self._max_size,
+            }
+
     # ---- 内部方法 ----
 
     def _process_loop(self) -> None:
-        """后台工作循环：从队列取任务 → 调用 process_fn → 存储结果。"""
+        """
+        后台工作循环：从队列取任务 → 调用 process_fn → 存储结果。
+
+        ★ 并发安全：pop 前检查 is_busy，防止与 run_pipeline_safe
+          的立即执行路径并发调用 run_pipeline（GPU OOM）。
+
+        ★ MLFQ: 使用 _get_next_task() 代替直接 pop，支持多级调度。
+        """
         while self._running:
             task = None
             with self._lock:
-                if self._queue:
-                    task = self._queue.popleft()
+                if not self.is_busy:
+                    task = self._get_next_task()
+                    if task is not None:
+                        # ★ 原子化：pop + 标记 busy 在同一锁内完成，
+                        # 消除与 run_pipeline_safe 立即执行路径的 TOCTOU 竞态窗口
+                        self._current_task_id = task.task_id
 
             if task is None:
                 time.sleep(0.1)
                 continue
 
-            task_id, task_data = task
-            if task_data is None:  # sentinel
-                continue
+            # task 是 QueueTask 对象
+            task_id = task.task_id
+            task_data = task.to_task_data()
 
             with self._lock:
-                self._current_task_id = task_id
                 self._results[task_id]["status"] = "running"
                 self._results[task_id]["started_at"] = time.time()
 
-            logger.info(f"🚀 开始处理排队任务: {task_id}")
+            logger.info(
+                f"🚀 开始处理排队任务: {task_id} "
+                f"(Q{task.priority_level}, orig=Q{task.original_level}, wait={task.wait_seconds():.0f}s)"
+            )
             t_start = time.time()
 
             try:
@@ -330,22 +661,27 @@ class PipelineQueue:
 
     @property
     def is_busy(self) -> bool:
-        """当前是否有任务在执行中。"""
-        return self._current_task_id is not None
+        """当前是否有任务在执行中（线程安全）。"""
+        with self._lock:
+            return self._current_task_id is not None
 
     @property
     def queue_size(self) -> int:
-        """当前队列长度（不含正在执行的任务）。"""
+        """当前队列总长度（不含正在执行的任务）。"""
         with self._lock:
-            return len(self._queue)
+            return len(self._q0) + len(self._q1) + len(self._q2)
 
     def get_status(self) -> dict:
         """获取队列整体状态。"""
         with self._lock:
             return {
                 "running": self._running,
+                "strategy": self._strategy,
                 "current_task": self._current_task_id,
-                "queue_size": len(self._queue),
+                "queue_size": len(self._q0) + len(self._q1) + len(self._q2),
+                "q0_depth": len(self._q0),
+                "q1_depth": len(self._q1),
+                "q2_depth": len(self._q2),
                 "completed_count": sum(
                     1 for r in self._results.values()
                     if r.get("status") in ("done", "error", "cancelled")
@@ -385,12 +721,19 @@ class Scheduler:
         self._pipeline_events: dict = {}        # key → threading.Event
         self._pipeline_lock = threading.Lock()
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
+        self._layer_config_pushed: set = set()  # 已成功推送层配置的从节点 ID（就绪检查用）
+        self._inference_lock = threading.Lock()  # GPU 推理互斥锁（防止并发执行）
 
-        # 流水线请求队列（FIFO 串行执行）
-        from config import PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL
+        # 流水线请求队列（MLFQ 三级反馈队列，兼容 FIFO）
         self.pipeline_queue = PipelineQueue(
             max_size=PIPELINE_QUEUE_MAX_SIZE,
             result_ttl=PIPELINE_QUEUE_RESULT_TTL,
+            strategy=PIPELINE_SCHEDULING_STRATEGY,
+            q0_max_tokens=PIPELINE_Q0_MAX_TOKENS,
+            q1_max_tokens=PIPELINE_Q1_MAX_TOKENS,
+            aging_q1_to_q0=PIPELINE_AGING_Q1_TO_Q0_SECONDS,
+            aging_q2_to_q1=PIPELINE_AGING_Q2_TO_Q1_SECONDS,
+            aging_max_wait=PIPELINE_AGING_MAX_WAIT_SECONDS,
         )
 
     # ================================================================
@@ -629,6 +972,7 @@ class Scheduler:
         return NodeInfo(
             node_id=db_row["node_id"],
             role=db_row.get("role", "client"),
+            node_type=db_row.get("node_type", "pc"),
             state=NodeState(db_row.get("state", "offline")),
             address=db_row.get("address", ""),
             hostname=db_row.get("hostname", ""),
@@ -638,11 +982,14 @@ class Scheduler:
             last_heartbeat=db_row.get("last_heartbeat", 0.0),
             task_count=db_row.get("task_count", 0),
             error_count=db_row.get("error_count", 0),
+            model_sha256=db_row.get("model_sha256", ""),
         )
 
     def register_node(self, node_id: str, role: str, address: str = "",
                       hostname: str = "", device_info: dict = None,
-                      network_type: str = "unknown") -> bool:
+                      network_type: str = "unknown",
+                      node_type: str = "pc",
+                      model_sha256: str = "") -> bool:
         """
         注册一个从节点。
 
@@ -656,10 +1003,17 @@ class Scheduler:
             hostname: 客户端主机名
             device_info: 客户端设备信息
             network_type: 网络连接类型 "wifi" | "ethernet" | "unknown"
+            node_type: 设备平台 "pc" | "android"（默认 "pc"）
+            model_sha256: 模型 SHA256 校验值（阶段 7，用于跨节点模型一致性验证）
 
         Returns:
             注册是否成功
         """
+        # Android 节点只能作为 client
+        if node_type == "android" and role == "master":
+            logger.error(f"注册失败: Android 节点不能担任 master 角色")
+            return False
+
         # 如果节点不在预定义列表中但仍在 MAX_NODES 范围内，动态添加
         if node_id not in self.nodes:
             if role == NodeRole.MASTER:
@@ -668,9 +1022,10 @@ class Scheduler:
             # 检查是否在 MAX_NODES 范围内
             expected_client_ids = NodeRole.client_ids(MAX_NODES)
             # 也允许用户在 MAX_NODES 之后添加的自定义节点
-            logger.info(f"动态添加节点: {node_id}")
+            logger.info(f"动态添加节点: {node_id} (type={node_type})")
             self.nodes[node_id] = NodeInfo(
                 node_id=node_id, role=NodeRole.CLIENT,
+                node_type=node_type,
                 state=NodeState.OFFLINE,
             )
 
@@ -680,6 +1035,8 @@ class Scheduler:
             return False
 
         node.state = NodeState.ONLINE
+        node.node_type = node_type
+        node.model_sha256 = model_sha256
         node.address = address
         node.hostname = hostname
         node.device_info = device_info or {}
@@ -694,6 +1051,7 @@ class Scheduler:
                 db.upsert_node(
                     node_id=node_id,
                     role=node.role,
+                    node_type=node.node_type,
                     state=node.state.value,
                     address=node.address,
                     hostname=node.hostname,
@@ -703,6 +1061,7 @@ class Scheduler:
                     last_heartbeat=node.last_heartbeat,
                     task_count=node.task_count,
                     error_count=node.error_count,
+                    model_sha256=node.model_sha256,
                 )
             except Exception as e:
                 logger.warning(f"节点注册 DB 持久化失败: {e}")
@@ -715,7 +1074,7 @@ class Scheduler:
                 pass
 
         logger.info(
-            f"✅ 节点注册: {node_id} role={role} "
+            f"✅ 节点注册: {node_id} role={role} type={node_type} "
             f"hostname={hostname} addr={address} net={network_type}"
         )
         return True
@@ -761,6 +1120,8 @@ class Scheduler:
                     db.set_layer_assignments({})
                 except Exception:
                     pass
+            # ★ 清除层配置推送记录（节点离线后需重新推送）
+            self._layer_config_pushed.discard(node_id)
 
         logger.info(f"节点注销: {node_id} ({old_state.value} → offline)")
         return True
@@ -958,17 +1319,23 @@ class Scheduler:
 
         total_layers = TOTAL_MODEL_LAYERS
 
-        # 收集节点数据
+        # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过）
         if nodes is None:
             node_list = [
                 {"node_id": nid, "role": info.role,
+                 "node_type": info.node_type,
                  "device_info": info.device_info}
                 for nid, info in self.nodes.items()
+                if info.node_type == "pc"
             ]
         else:
-            node_list = nodes
+            node_list = [
+                n for n in nodes
+                if n.get("node_type", "pc") == "pc"
+            ]
 
         if not node_list:
+            logger.warning("没有可用的 PC 节点参与流水线层拆分")
             return []
 
         # 单节点：全部层给该节点
@@ -1397,26 +1764,123 @@ class Scheduler:
     def push_layer_config_to_clients(self) -> None:
         """
         向所有 TCP 连接的从节点推送其分层配置。
+
+        ★ 阶段 7：推送前校验从节点模型 SHA256，
+          不匹配的节点将排除出层分配，避免因模型不一致产生推理错误。
         """
         if not self._tcp_server or not self._tcp_server._running:
             return
 
+        # ★ 获取主节点的模型 SHA256 作为基准
+        master_sha256 = self._get_master_model_sha256()
+
         layer_info = self.get_layer_assignments()
-        assignments = {
-            a["node_id"]: {
+        assignments = {}
+        skipped_nodes = []
+
+        for a in layer_info["assignments"]:
+            nid = a["node_id"]
+            if nid == "master":
+                continue
+
+            node_info = self.nodes.get(nid)
+            if not node_info:
+                continue
+
+            # ★ 模型校验：从节点模型 SHA256 必须与主节点一致
+            slave_sha256 = node_info.model_sha256
+            if master_sha256 and slave_sha256:
+                if slave_sha256 != master_sha256:
+                    logger.warning(
+                        f"⚠️ 模型不一致: {nid} SHA256={slave_sha256[:16]}..."
+                        f" ≠ master SHA256={master_sha256[:16]}...，"
+                        f"跳过该节点的层分配"
+                    )
+                    skipped_nodes.append((nid, slave_sha256))
+                    continue  # 不分配层给模型不一致的节点
+            elif master_sha256 and not slave_sha256:
+                logger.info(
+                    f"ℹ️ 节点 {nid} 未上报模型 SHA256，跳过校验（降级放行）"
+                )
+
+            assignments[nid] = {
                 "start_layer": a["start_layer"],
                 "end_layer": a["end_layer"],
                 "has_embedding": a.get("has_embedding", False),
                 "has_lm_head": a.get("has_lm_head", False),
             }
-            for a in layer_info["assignments"]
-        }
+
+        if skipped_nodes:
+            logger.warning(
+                f"模型校验: {len(skipped_nodes)} 个节点因模型不一致被排除: "
+                + ", ".join(f"{nid}({sha[:12]}...)" for nid, sha in skipped_nodes)
+            )
 
         try:
-            self._tcp_server.broadcast_layer_config(assignments)
-            logger.info(f"分层配置已推送到 {len(assignments)} 个从节点")
+            if assignments:
+                self._tcp_server.broadcast_layer_config(assignments)
+                for nid in assignments:
+                    self._layer_config_pushed.add(nid)
+                logger.info(f"分层配置已推送到 {len(assignments)} 个从节点")
+            else:
+                logger.warning("没有可用的从节点接收分层配置")
         except Exception as e:
             logger.warning(f"分层配置推送失败: {e}")
+
+    def _get_master_model_sha256(self) -> str:
+        """
+        获取主节点当前加载模型的 SHA256。
+
+        优先级:
+        1. 从 models/ 目录读取 .sha256 缓存文件
+        2. 计算实际模型文件的 SHA256
+        3. 无法获取时返回空字符串（降级放行）
+        """
+        import hashlib as _hl
+        import api_server as _api
+
+        mgr = getattr(_api, 'model_manager', None)
+
+        # 尝试从 model_manager 获取模型路径
+        if mgr and mgr.is_loaded:
+            try:
+                model_path = getattr(mgr, '_model_path', '') or ''
+                if model_path and os.path.isfile(model_path):
+                    sha256_file = model_path + ".sha256"
+                    if os.path.isfile(sha256_file):
+                        try:
+                            with open(sha256_file, "r") as f:
+                                return f.read().strip().split()[0]
+                        except Exception:
+                            pass
+                    # 计算并缓存
+                    try:
+                        h = _hl.sha256()
+                        with open(model_path, "rb") as f:
+                            for chunk in iter(lambda: f.read(8192), b""):
+                                h.update(chunk)
+                        result = h.hexdigest()
+                        with open(sha256_file, "w") as f:
+                            f.write(f"{result}  {os.path.basename(model_path)}\n")
+                        return result
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # 回退：检查 models/ 目录下的 GGUF 文件
+        import config as cfg
+        gguf_path = getattr(cfg, 'GGUF_MODEL_PATH', '')
+        if gguf_path and os.path.isfile(gguf_path):
+            sha256_file = gguf_path + ".sha256"
+            if os.path.isfile(sha256_file):
+                try:
+                    with open(sha256_file, "r") as f:
+                        return f.read().strip().split()[0]
+                except Exception:
+                    pass
+
+        return ""  # 无法获取 → 降级放行
 
     # ================================================================
     # TCP 消息处理
@@ -1440,6 +1904,8 @@ class Scheduler:
                 hostname=data.get("hostname", ""),
                 device_info=data.get("device_info", {}),
                 network_type=data.get("network_type", client_info.get("network_type", "unknown")),
+                node_type=data.get("node_type", "pc"),
+                model_sha256=data.get("model_sha256", ""),
             )
             # 新节点注册后重新计算分层并推送
             if registered and self._effective_role() == "master":
@@ -1676,6 +2142,7 @@ class Scheduler:
                 # 更新已有节点
                 existing = self.nodes[nid]
                 existing.role = nd.get("role", existing.role)
+                existing.node_type = nd.get("node_type", existing.node_type)
                 existing.hostname = nd.get("hostname", existing.hostname)
                 existing.address = nd.get("address", existing.address)
                 existing.device_info = nd.get("device_info", existing.device_info)
@@ -1697,6 +2164,7 @@ class Scheduler:
                 self.nodes[nid] = NodeInfo(
                     node_id=nid,
                     role=nd.get("role", "client"),
+                    node_type=nd.get("node_type", "pc"),
                     state=state,
                     address=nd.get("address", ""),
                     hostname=nd.get("hostname", ""),
@@ -1747,6 +2215,7 @@ class Scheduler:
                 existing = self.nodes[nid]
                 existing.state = state
                 existing.role = node_data.get("role", existing.role)
+                existing.node_type = node_data.get("node_type", existing.node_type)
                 existing.hostname = node_data.get("hostname", existing.hostname)
                 existing.address = node_data.get("address", existing.address)
                 existing.device_info = node_data.get("device_info", existing.device_info)
@@ -1759,6 +2228,7 @@ class Scheduler:
                 self.nodes[nid] = NodeInfo(
                     node_id=nid,
                     role=node_data.get("role", "client"),
+                    node_type=node_data.get("node_type", "pc"),
                     state=state,
                     address=node_data.get("address", ""),
                     hostname=node_data.get("hostname", ""),
@@ -1820,18 +2290,6 @@ class Scheduler:
                 ),
             }
 
-        # 检查是否有至少一个其他在线从节点（非备用、非转让目标）
-        other_clients = [
-            nid for nid, info in self.nodes.items()
-            if info.role in ("client", NodeRole.CLIENT)
-            and info.is_available()
-            and nid not in (spare_id, target_node_id)
-        ]
-        if not other_clients and not (target_node_id != spare_id):
-            # 如果转让目标就是唯一的另一个从节点，这是允许的最后一次转让
-            pass  # 至少有一个其他从节点即可
-        # 放宽限制：只要有备用主节点在线即可
-
         # ---- 备用主节点检查通过 ----
 
         if target_node_id not in self.nodes:
@@ -1846,6 +2304,30 @@ class Scheduler:
 
         if not self._tcp_server or not self._tcp_server._running:
             return {"status": "error", "reason": "TCP 服务未运行，无法发送转让通知"}
+
+        # ---- P3: 审查门控 ----
+        # 主节点转让需要先通过审查投票（>= +2）
+        try:
+            from review import ReviewManager
+            review_mgr = ReviewManager()
+            approved = review_mgr.find_approved_ticket(target_node_id)
+            if not approved:
+                return {
+                    "status": "needs_review",
+                    "reason": (
+                        f"主节点转让给 '{target_node_id}' 需要审查投票通过。\n"
+                        f"请先通过管理面板创建审查工单（POST /api/cluster/review/create），\n"
+                        f"获得 >= +2 票后重试转让操作。\n"
+                        f"当前仅 PC 独显版节点可参与审查投票。"
+                    ),
+                }
+            logger.info(
+                f"审查门控通过: ticket={approved.ticket_id} "
+                f"score={approved.score} target={target_node_id}"
+            )
+        except ImportError:
+            logger.warning("审查模块不可用，跳过审查门控")
+        # ---- 审查门控结束 ----
 
         transfer_id = f"transfer_{int(time.time() * 1000)}"
 
@@ -2097,6 +2579,32 @@ class Scheduler:
             "ack": ack,
             "received_at": time.time(),
         }
+
+    def can_node_vote(self, node_id: str) -> tuple[bool, str]:
+        """
+        检查节点是否有审查投票资格（P3: 主节点转让审查）。
+
+        仅 node_type="pc" 且 device_info.gpu.cuda_available=True 的节点可投票。
+
+        Args:
+            node_id: 节点 ID
+
+        Returns:
+            (can_vote: bool, reason: str)
+        """
+        if node_id not in self.nodes:
+            return False, f"节点 '{node_id}' 未注册"
+
+        node = self.nodes[node_id]
+        if node.node_type != "pc":
+            return False, "仅 PC 节点可参与审查投票"
+
+        device_info = node.device_info or {}
+        gpu = device_info.get("gpu", {})
+        if not gpu.get("cuda_available", False):
+            return False, "仅 NVIDIA CUDA 独显节点可参与审查投票"
+
+        return True, "ok"
 
     def get_transfer_logs(self) -> list:
         """获取所有角色转让日志"""
@@ -3473,15 +3981,17 @@ class Scheduler:
 
     def handle_infer_forward(self, client_id: str, msg: dict) -> None:
         """
-        处理从节点转发的推理请求。
+        处理从节点转发的推理请求（统一流水线调度）。
 
         主节点收到 INFER_FORWARD 后:
           1. 创建推理任务
-          2. 在主节点本地执行完整模型推理（全部层）
+          2. 通过 run_pipeline_safe() 统一调度:
+             - 流水线节点就绪 → 分布式流水线推理
+             - 流水线节点未就绪 → 自动回退到主节点全模型推理
           3. 将结果通过 INFER_RESULT 回传给请求方
 
-        TODO: 真正的分布式流水线（模型层拆分到多个节点并行推理）
-              当前先实现「全部层都在主节点」模式，让从节点转发可用。
+        路径 A 和路径 B 已统一 — 无论请求来自 HTTP /api/chat 还是
+        TCP INFER_FORWARD，都走同一套 run_pipeline_safe() 调度。
         """
         data = msg.get("data", {})
         prompt = data.get("prompt", "")
@@ -3502,66 +4012,55 @@ class Scheduler:
                     f"max_tokens={max_new_tokens}, temp={temperature}"
                 )
 
-                # 在主节点本地执行推理（全部层）
-                try:
-                    from model_module import ModelManager
-                except ImportError:
-                    self._send_infer_result(
-                        client_id, task_id, "",
-                        {"error": "模型模块未加载，请确认模型文件已就绪"}
-                    )
-                    return
-
-                # api_server 中的全局 model_manager 实例
-                import api_server as _api
-                mgr = getattr(_api, 'model_manager', None)
-                if not mgr or not mgr.is_loaded:
-                    self._send_infer_result(
-                        client_id, task_id, "",
-                        {"error": "模型未就绪，请确认模型文件已下载并加载成功"}
-                    )
-                    return
-
-                # 使用相同的 chat() 方法（与直连 localhost 一致）
-                messages = [{"role": "user", "content": prompt}]
-                output = mgr.chat(
-                    messages=messages,
-                    max_tokens=max_new_tokens,
+                # ★ 统一流水线调度（替代原来的 mgr.chat() 全模型直调）
+                pipeline_result = self.run_pipeline_safe(
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    session_id=session_id,
                 )
 
-                content = output.get("response", "") if isinstance(output, dict) else str(output)
-                thinking = output.get("thinking") if isinstance(output, dict) else None
-                followups = output.get("followups") if isinstance(output, dict) else None
-                metrics = output.get("metrics", {}) if isinstance(output, dict) else {}
+                content = pipeline_result.get("response", "")
+                error = pipeline_result.get("error")
+                metrics = pipeline_result.get("metrics", {})
+
+                if error:
+                    logger.warning(
+                        f"⚠️ 流水线推理失败 → {client_id}: task={task_id}, "
+                        f"error={error}"
+                    )
+                    self._send_infer_result(
+                        client_id, task_id, content,
+                        {**metrics, "error": error},
+                    )
+                    return
 
                 # 保存到对话历史（主节点侧）
-                try:
-                    from db import save_message
-                    save_message(
-                        session_id=session_id or "default",
-                        role="user",
-                        content=prompt,
-                    )
-                    save_message(
-                        session_id=session_id or "default",
-                        role="assistant",
-                        content=content,
-                        metrics=metrics,
-                    )
-                except Exception:
-                    pass
+                if content:
+                    try:
+                        from db import save_message
+                        save_message(
+                            session_id=session_id or "default",
+                            role="user",
+                            content=prompt,
+                        )
+                        save_message(
+                            session_id=session_id or "default",
+                            role="assistant",
+                            content=content,
+                            metrics=metrics,
+                        )
+                    except Exception:
+                        pass
 
                 self.complete_infer_task(task_id, content)
                 self._send_infer_result(
                     client_id, task_id, content, metrics,
-                    thinking_content=thinking,
-                    followups=followups,
                 )
                 logger.info(
                     f"✅ 推理完成 → {client_id}: task={task_id}, "
-                    f"len={len(content)}"
+                    f"len={len(content)}, engine={metrics.get('engine', '?')}"
                 )
 
             except Exception as e:
@@ -3799,16 +4298,19 @@ class Scheduler:
                     f"time={elapsed_ms:.0f}ms"
                 )
 
-            # ---- 链式直连：转发给下一个从节点（P2 优化）----
+            # ---- 链式直连：转发给下一个从节点（P2 优化 + 主节点中转回退）----
             chain_next = data.get("chain_next")
             chain_remaining = data.get("chain_remaining", [])
 
             if chain_next and isinstance(chain_next, dict) and chain_next.get("node_id"):
                 # 非末节点：通过 TCP 直连转发 hidden_states 给下一个节点
+                # ★ hidden_states 为 bytes → base64 编码（JSON 兼容，接收端自动解码）
+                import base64 as _b64
+                _hs = response.get("hidden_states")
                 chain_data = {
                     "task_id": task_id,
                     "step": step,
-                    "hidden_states": response.get("hidden_states"),
+                    "hidden_states": _b64.b64encode(_hs).decode("ascii") if _hs else None,
                     "hidden_shape": response.get("hidden_shape"),
                     "chain_next": chain_remaining[0] if chain_remaining else None,
                     "chain_remaining": chain_remaining[1:] if len(chain_remaining) > 1 else [],
@@ -3816,10 +4318,34 @@ class Scheduler:
                     "temperature": data.get("temperature", 0.7),
                     "top_p": data.get("top_p", 0.9),
                 }
+
+                # L1: 直连下一个从节点
                 ok = self._send_chain_forward(chain_next["node_id"], chain_data)
-                if not ok:
-                    # 链式转发失败 → 向主节点报错
-                    self._send_layer_result("master", task_id, error=f"链式转发到 {chain_next['node_id']} 失败")
+                if ok:
+                    logger.debug(f"🔗 L1 直连成功: → {chain_next['node_id']}")
+                else:
+                    # L2: 主节点中转（从节点 → 主节点 → 目标从节点）
+                    logger.warning(
+                        f"⚠️ L1 直连 {chain_next['node_id']} 失败，"
+                        f"尝试 L2 主节点中转"
+                    )
+                    chain_data["_relay_to"] = chain_next["node_id"]
+                    try:
+                        self._send_layer_result("master", task_id, result_data=chain_data)
+                        logger.info(
+                            f"🔄 L2 中转请求已发送至主节点: "
+                            f"{NODE_ID} → master → {chain_next['node_id']}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"❌ L2 中转请求发送失败: {e}，"
+                            f"回退到全模型推理"
+                        )
+                        self._send_layer_result(
+                            "master", task_id,
+                            error=f"链式转发到 {chain_next['node_id']} 失败 "
+                                  f"(L1直连+L2中转均失败: {e})"
+                        )
             else:
                 # 末节点（或无链配置）：发送 LAYER_RESULT 回主节点
                 self._send_layer_result("master", task_id, result_data=response)
@@ -3872,10 +4398,50 @@ class Scheduler:
         """
         主节点：收到从节点的 LAYER_RESULT → 存储到流水线结果字典，
         唤醒正在等待的 run_pipeline() 主循环。
+
+        特殊处理: 如果 data 中包含 _relay_to 字段，说明从节点请求
+        主节点中转 hidden_states 到目标节点（L2 链式回退），此时
+        主节点转发后直接返回，不存储结果也不唤醒 run_pipeline()。
         """
         data = msg.get("data", {})
         task_id = data.get("task_id", "")
         node_id = data.get("node_id", client_id)
+
+        # ★ 中转请求：从节点直连失败 → 请主节点转发到目标节点
+        relay_target = data.get("_relay_to")
+        if relay_target:
+            logger.info(
+                f"🔄 主节点中转: {node_id} → {relay_target} "
+                f"(task={task_id}, step={data.get('step', '?')})"
+            )
+            try:
+                # 构建转发 payload（去掉 _relay_to 内部标记）
+                relay_data = {
+                    k: v for k, v in data.items()
+                    if k != "_relay_to"
+                }
+                from tcp_comm import MessageType
+                self._send_to_worker(relay_target, relay_data,
+                                     MessageType.CHAIN_FORWARD)
+                logger.info(f"✅ 中转成功: master → {relay_target}")
+                return  # 不存储结果，不唤醒 run_pipeline，链继续
+            except Exception as e:
+                logger.error(
+                    f"❌ 主节点中转失败 → {relay_target}: {e}，"
+                    f"触发全模型回退"
+                )
+                # 中转失败 → 存储错误，唤醒 run_pipeline
+                key = f"{task_id}:{relay_target}"
+                with self._pipeline_lock:
+                    self._pipeline_results[key] = {
+                        "task_id": task_id,
+                        "node_id": relay_target,
+                        "error": f"主节点中转到 {relay_target} 失败: {e}",
+                        "step": data.get("step", -1),
+                    }
+                    if key in self._pipeline_events:
+                        self._pipeline_events[key].set()
+                return
 
         logger.info(
             f"📥 收到层前向结果: task={task_id}, node={node_id}, "
@@ -3903,10 +4469,12 @@ class Scheduler:
 
     def _all_pipeline_nodes_ready(self) -> bool:
         """
-        检查所有流水线节点是否就绪：
-        1. 节点在线
-        2. 已分配层范围
+        检查所有流水线节点是否就绪（预入队快速检查）：
+        1. 节点已注册
+        2. 节点在线（state == ONLINE）
         3. TCP 连接正常
+        4. 心跳新鲜（< 10s，防止"僵尸"节点）
+        5. 层配置已成功推送
         """
         if not self._tcp_server or not self._tcp_server._running:
             return False
@@ -3923,18 +4491,77 @@ class Scheduler:
 
         for node in pipeline_nodes:
             node_id = node["node_id"]
-            if node_id not in self.nodes:
+            node_info = self.nodes.get(node_id)
+            if not node_info:
                 logger.warning(f"流水线节点 {node_id} 未注册")
                 return False
-            if not self.nodes[node_id].is_available():
+            if not node_info.is_available():
                 logger.warning(f"流水线节点 {node_id} 不在线")
                 return False
             if node_id not in (self._tcp_server.clients if self._tcp_server else {}):
                 logger.warning(f"流水线节点 {node_id} TCP 未连接")
                 return False
+            # ★ 心跳新鲜度：超过 10 秒无心跳视为失联
+            heartbeat_age = time.time() - node_info.last_heartbeat
+            if heartbeat_age > 10:
+                logger.warning(
+                    f"流水线节点 {node_id} 心跳过期 "
+                    f"({heartbeat_age:.1f}s > 10s)，视为失联"
+                )
+                return False
+            # ★ 层配置：必须已成功推送
+            if node_id not in self._layer_config_pushed:
+                logger.warning(f"流水线节点 {node_id} 尚未收到层配置")
+                return False
 
         logger.info(f"✅ 所有流水线节点就绪: {[n['node_id'] for n in pipeline_nodes]}")
         return True
+
+    def _verify_pipeline_readiness(self, pipeline_nodes: list
+                                   ) -> tuple:
+        """
+        二次就绪检查（出队后 / 立即执行前调用）。
+
+        与 _all_pipeline_nodes_ready 的区别：
+        - _all_pipeline_nodes_ready: 入队前的快速筛选（Pre-queue gate）
+        - _verify_pipeline_readiness: tokenize 前的最终确认（Post-queue gate）
+
+        入队等待期间节点可能离线 / 心跳超时 / TCP 断开，
+        此检查在即将开始推理前做最后验证，避免浪费 prefill 计算。
+
+        Returns:
+            (ok: bool, reason: str)
+        """
+        if not self._tcp_server or not self._tcp_server._running:
+            return False, "TCP 服务端未运行"
+
+        for node in pipeline_nodes:
+            node_id = node["node_id"]
+            node_info = self.nodes.get(node_id)
+            if not node_info:
+                return False, f"节点 {node_id} 已消失（可能被注销）"
+            if not node_info.is_available():
+                return False, f"节点 {node_id} 已离线 (state={node_info.state.value})"
+            if node_id not in (self._tcp_server.clients if self._tcp_server else {}):
+                return False, f"节点 {node_id} TCP 连接已断开"
+
+            # 心跳新鲜度
+            heartbeat_age = time.time() - node_info.last_heartbeat
+            if heartbeat_age > 10:
+                return False, (
+                    f"节点 {node_id} 心跳过期 "
+                    f"({heartbeat_age:.1f}s > 10s)"
+                )
+
+            # 层配置已推送
+            if node_id not in self._layer_config_pushed:
+                return False, f"节点 {node_id} 尚未收到层配置推送"
+
+        logger.info(
+            f"✅ 二次就绪检查通过: "
+            f"{' → '.join(n['node_id'] for n in pipeline_nodes)}"
+        )
+        return True, "ok"
 
     def _broadcast_pipeline_abort(self, pipeline_nodes: list, task_id: str,
                                    reason: str) -> None:
@@ -4095,7 +4722,8 @@ class Scheduler:
 
     def run_pipeline(self, prompt: str, max_new_tokens: int = 512,
                      temperature: float = 0.7, top_p: float = 0.9,
-                     session_id: str = None) -> dict:
+                     session_id: str = None,
+                     _stream_callback=None) -> dict:
         """
         主节点：协调多节点流水线推理。
 
@@ -4152,6 +4780,13 @@ class Scheduler:
 
         if not pipeline_nodes:
             return {"response": "", "error": "没有可用的流水线从节点"}
+
+        # ★ 二次就绪检查（出队后 / 立即执行前）
+        #   入队等待期间节点可能离线，tokenize 前最后确认。
+        ok, err_msg = self._verify_pipeline_readiness(pipeline_nodes)
+        if not ok:
+            logger.error(f"❌ 流水线就绪检查失败: {err_msg}")
+            return {"response": "", "error": err_msg}
 
         logger.info(
             f"🚀 启动流水线推理: prompt_len={len(prompt)}, "
@@ -4263,16 +4898,18 @@ class Scheduler:
             if "logits" in result and result["logits"] is not None:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
-                    logits = deserialize_tensor_fast(logits_data)
-                logits = logits.to(device=device)
+                    logits = deserialize_tensor_fast(logits_data).to(device=device)
+                elif torch is not None and isinstance(logits_data, torch.Tensor):
+                    logits = logits_data.to(device=device)
+                else:
+                    step_error = f"未知 logits 类型: {type(logits_data).__name__}"
+                    logger.error(step_error)
             else:
                 step_error = "末节点未返回 logits"
                 logger.error(step_error)
-                self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
-                return {"response": "", "error": step_error}
 
             if step_error:
-                # 广播 ABORT（清理各节点的 KV cache）
+                # ★ 统一中止路径：广播 ABORT → 清理各节点 KV cache → 返回错误
                 try:
                     for n in pipeline_nodes:
                         self._send_to_worker(
@@ -4306,6 +4943,11 @@ class Scheduler:
                 break
 
             generated_ids.append(new_token_id)
+
+            # ★ 流式回调：每生成一个 token 立即推送
+            if _stream_callback:
+                new_token_text = tokenizer.decode([new_token_id])
+                _stream_callback({"token": new_token_text})
 
             # 更新完整序列仅用于最终解码（不再发送给首节点）
             new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
@@ -4371,11 +5013,67 @@ class Scheduler:
             f"{tokens_per_sec:.1f} tok/s (KV Cache: ✅)"
         )
 
-        return {
+        result = {
             "response": new_text,
             "full_text": response_text,
             "metrics": pipeline_metrics,
         }
+
+        # ★ 流式完成通知
+        if _stream_callback:
+            _stream_callback({"done": True, **result})
+
+        return result
+
+    def run_pipeline_stream(self, prompt: str, **kwargs):
+        """
+        流式版本：逐 token yield 事件字典，用于 SSE 推送。
+
+        内部通过线程+队列包装 run_pipeline() 的 _stream_callback，
+        将 callback 调用转为 generator yield。
+
+        Yields:
+            {"token": str}       — 新生成的 token 文本
+            {"done": True, "response": str, "metrics": dict, ...}
+                                  — 完成信号（含完整响应和指标）
+            {"done": True, "error": str}
+                                  — 错误信号
+        """
+        import queue
+        import threading as _thr
+
+        q = queue.Queue()
+        callback_called = _thr.Event()
+
+        def on_token(event):
+            if "done" in event:
+                callback_called.set()
+            q.put(event)
+
+        def _run():
+            try:
+                result = self.run_pipeline(
+                    prompt, _stream_callback=on_token, **kwargs
+                )
+                # 错误路径：run_pipeline 直接返回了 error（未走 callback）
+                if not callback_called.is_set():
+                    q.put({
+                        "done": True,
+                        "error": result.get("error", "unknown"),
+                        "response": result.get("response", ""),
+                        "metrics": result.get("metrics", {}),
+                    })
+            except Exception as e:
+                logger.error(f"流式推理异常: {e}", exc_info=True)
+                q.put({"done": True, "error": str(e)})
+
+        _thr.Thread(target=_run, name="pipeline-stream", daemon=True).start()
+
+        while True:
+            event = q.get()
+            yield event
+            if "done" in event:
+                break
 
     # ================================================================
     # 流水线请求队列集成（Phase 4 — 多请求排队）
@@ -4388,18 +5086,21 @@ class Scheduler:
         ★ 直接调用 run_pipeline（绕过 run_pipeline_safe 的排队检查），
            避免死锁：队列 worker 已设置 _current_task_id，若走 run_pipeline_safe
            会再次检测 is_busy=True → enqueue → 永久等待自己完成。
+
+        ★ 持有 _inference_lock 确保 GPU 互斥（阻塞等待）。
         """
-        try:
-            # 检查节点是否就绪
-            if not self._all_pipeline_nodes_ready():
-                logger.warning("流水线节点不可用，队列任务回退到全模型推理")
+        with self._inference_lock:
+            try:
+                # 检查节点是否就绪
+                if not self._all_pipeline_nodes_ready():
+                    logger.warning("流水线节点不可用，队列任务回退到全模型推理")
+                    return self._run_full_model_inference(prompt, **kwargs)
+                return self.run_pipeline(prompt, **kwargs)
+            except Exception as e:
+                logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理")
+                import traceback
+                traceback.print_exc()
                 return self._run_full_model_inference(prompt, **kwargs)
-            return self.run_pipeline(prompt, **kwargs)
-        except Exception as e:
-            logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理")
-            import traceback
-            traceback.print_exc()
-            return self._run_full_model_inference(prompt, **kwargs)
 
     def run_pipeline_safe(self, prompt: str, **kwargs) -> dict:
         """
@@ -4413,6 +5114,22 @@ class Scheduler:
         ★ 立即执行路径与 is_busy 检查在同一锁内完成，消除 TOCTOU 竞态：
           多个调用方线程不可能同时看到 is_busy=False 并绕过队列。
         """
+        # ---- 引擎检查：流水线仅支持 PyTorch 引擎 ----
+        # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
+        # 同时检查模型是否已加载，未加载时走回退路径（给出明确错误）。
+        import api_server as _api
+        mgr = getattr(_api, 'model_manager', None)
+        if not mgr or not mgr.is_loaded:
+            logger.warning("模型未加载，无法执行流水线推理")
+            return self._run_full_model_inference(prompt, **kwargs)
+        engine_type = getattr(mgr, '_engine_type', '')
+        if engine_type and engine_type != 'pytorch':
+            logger.info(
+                f"引擎类型为 {engine_type}，不支持流水线层拆分，"
+                f"使用全模型推理"
+            )
+            return self._run_full_model_inference(prompt, **kwargs)
+
         # ---- 自动回退：节点不可用 → 全模型推理 ----
         try:
             pipeline_ready = self._all_pipeline_nodes_ready()
@@ -4453,14 +5170,21 @@ class Scheduler:
                 return {"response": "", "error": result.get("error", "排队请求失败")}
 
         # ---- 立即执行（已通过原子检查）----
+        # ★ 非阻塞获取推理锁：防止与 _process_loop 残留任务并发
+        if not self._inference_lock.acquire(blocking=False):
+            logger.warning("推理引擎正忙（锁竞争），返回繁忙错误")
+            self.pipeline_queue._current_task_id = None
+            return {"response": "", "error": "推理引擎正忙，请稍后重试"}
         try:
-            return self.run_pipeline(prompt, **kwargs)
-        except Exception as e:
-            logger.error(f"流水线推理失败: {e}，回退到全层主节点模式")
-            import traceback
-            traceback.print_exc()
-            return self._run_full_model_inference(prompt, **kwargs)
+            try:
+                return self.run_pipeline(prompt, **kwargs)
+            except Exception as e:
+                logger.error(f"流水线推理失败: {e}，回退到全层主节点模式")
+                import traceback
+                traceback.print_exc()
+                return self._run_full_model_inference(prompt, **kwargs)
         finally:
+            self._inference_lock.release()
             # ★ 释放预留标记（无论成功/失败/回退）
             if task_id is None:
                 self.pipeline_queue._current_task_id = None
@@ -4502,6 +5226,89 @@ class Scheduler:
         except Exception as e:
             logger.error(f"全模型回退推理失败: {e}")
             return {"response": "", "error": str(e)}
+
+    def _run_full_model_inference_stream(self, prompt: str, **kwargs):
+        """
+        单机 PyTorch 流式推理 — 逐 token yield 事件字典，用于 SSE 推送。
+
+        通过线程+队列包装 model_manager.chat_stream()，
+        将文本 chunk 转为 {"token": text} 事件。
+
+        Yields:
+            {"token": str}       — 增量文本 chunk
+            {"done": True, "response": str, "metrics": dict}
+                                  — 完成信号
+            {"done": True, "error": str}
+                                  — 错误信号
+        """
+        import queue
+        import threading as _thr
+        import api_server as _api
+
+        mgr = getattr(_api, 'model_manager', None)
+        if not mgr or not mgr.is_loaded:
+            yield {"done": True, "error": "模型未加载"}
+            return
+
+        max_new_tokens = kwargs.pop('max_new_tokens', 512)
+        temperature = kwargs.pop('temperature', 0.7)
+        top_p = kwargs.pop('top_p', 0.9)
+
+        q = queue.Queue()
+        full_text_parts = []
+        error_info = [None]
+        metrics_info = [{}]
+
+        def _run():
+            try:
+                messages = [{"role": "user", "content": prompt}]
+                t0 = time.time()
+                token_count = 0
+                for chunk in mgr.chat_stream(
+                    messages=messages,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                ):
+                    if chunk:
+                        full_text_parts.append(chunk)
+                        token_count += 1
+                        q.put({"token": chunk})
+                elapsed = time.time() - t0
+                metrics_info[0] = {
+                    "mode": "single_streaming",
+                    "engine": "pytorch",
+                    "chunks": token_count,
+                    "elapsed_seconds": round(elapsed, 3),
+                }
+            except Exception as e:
+                logger.error(f"单机流式推理异常: {e}", exc_info=True)
+                error_info[0] = str(e)
+            finally:
+                q.put(None)  # sentinel
+
+        _thr.Thread(target=_run, name="full-model-stream", daemon=True).start()
+
+        while True:
+            event = q.get()
+            if event is None:
+                break
+            yield event
+
+        response_text = "".join(full_text_parts)
+        if error_info[0]:
+            yield {
+                "done": True,
+                "error": error_info[0],
+                "response": response_text,
+                "metrics": metrics_info[0],
+            }
+        else:
+            yield {
+                "done": True,
+                "response": response_text,
+                "metrics": metrics_info[0],
+            }
 
     def _get_pipeline_status(self) -> dict:
         """
@@ -4598,7 +5405,8 @@ class Scheduler:
             return {"status": "error", "reason": str(e)}
 
     def manual_register_node(self, node_id: str, hostname: str = "",
-                             address: str = "", network_type: str = "unknown") -> dict:
+                             address: str = "", network_type: str = "unknown",
+                             node_type: str = "pc") -> dict:
         """
         主节点手动注册一个从节点（无需 TCP 连接）。
 
@@ -4641,6 +5449,7 @@ class Scheduler:
         node = NodeInfo(
             node_id=node_id,
             role=NodeRole.CLIENT,
+            node_type=node_type,
             state=NodeState.OFFLINE,
             hostname=hostname or node_id,
             address=address,
@@ -4653,14 +5462,15 @@ class Scheduler:
         if db and _db_available:
             try:
                 db.upsert_node(
-                    node_id=node_id, role="client", state="offline",
+                    node_id=node_id, role="client", node_type=node_type,
+                    state="offline",
                     address=address, hostname=node.hostname,
                     network_type=network_type,
                 )
             except Exception as e:
                 logger.warning(f"手动注册节点 DB 持久化失败: {e}")
 
-        logger.info(f"📝 主节点手动注册从节点: {node_id} (hostname={hostname}, addr={address})")
+        logger.info(f"📝 主节点手动注册从节点: {node_id} type={node_type} (hostname={hostname}, addr={address})")
         return {
             "status": "registered",
             "node_id": node_id,

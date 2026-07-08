@@ -165,15 +165,15 @@ class TestComputeLayerAssignment:
         # 注入模拟节点
         s.nodes = {
             "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master',
+                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
                 'device_info': PROFILE_WORKSTATION,
             })(),
             "client1": type('NodeInfo', (), {
-                'node_id': 'client1', 'role': 'client',
+                'node_id': 'client1', 'role': 'client', 'node_type': 'pc',
                 'device_info': PROFILE_LAPTOP,
             })(),
             "client2": type('NodeInfo', (), {
-                'node_id': 'client2', 'role': 'client',
+                'node_id': 'client2', 'role': 'client', 'node_type': 'pc',
                 'device_info': PROFILE_ULTRABOOK,
             })(),
         }
@@ -326,9 +326,15 @@ class TestGetLayerAssignments:
     @pytest.fixture
     def sched(self):
         s = Scheduler()
+        # ★ 清除 DB 缓存的层分配（避免其他测试/真实运行的旧数据污染）
+        from db import set_layer_assignments as _clear_cache
+        try:
+            _clear_cache({})
+        except Exception:
+            pass
         s.nodes = {
             "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master',
+                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
                 'device_info': PROFILE_LAPTOP,
             })(),
         }
@@ -1310,11 +1316,11 @@ class TestVramConstraintRecalculation:
         s = Scheduler()
         s.nodes = {
             "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master',
+                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
                 'device_info': PROFILE_WORKSTATION,
             })(),
             "client1": type('NodeInfo', (), {
-                'node_id': 'client1', 'role': 'client',
+                'node_id': 'client1', 'role': 'client', 'node_type': 'pc',
                 'device_info': PROFILE_EDGE,  # 显存极少
             })(),
         }
