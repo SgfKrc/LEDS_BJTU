@@ -930,6 +930,169 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 /* ============================================================
+   P3: 实验性模型管理
+   ============================================================ */
+
+.model-badge-chip {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--accent);
+  color: #fff;
+  padding: 2px 10px;
+  border-radius: 10px;
+}
+
+.experimental-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.experimental-model-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.model-card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.model-card-header strong {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.chip-badge {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 6px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.chip-badge.exp {
+  background: #f59e0b;
+  color: #000;
+}
+
+.chip-badge.default {
+  background: var(--success);
+  color: #fff;
+}
+
+.model-card-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+
+.model-card-specs {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.model-card-specs span {
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.model-card-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.setting-btn.danger-ghost {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-size: 11px;
+  padding: 3px 10px;
+}
+
+.setting-btn.danger-ghost:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.add-model-form {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 8px;
+}
+
+.add-model-form h4 {
+  font-size: 13px;
+  margin: 0 0 10px 0;
+  color: var(--text-primary);
+}
+
+.form-row {
+  margin-bottom: 8px;
+}
+
+.form-row label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 3px;
+}
+
+.form-row label .required {
+  color: var(--danger);
+}
+
+.form-row input,
+.form-row select {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-primary);
+  box-sizing: border-box;
+}
+
+.form-row input:focus,
+.form-row select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.form-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.setting-btn.primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+}
+
+.setting-btn.primary:hover {
+  opacity: 0.85;
+}
+
+/* ============================================================
    GPU 选择器 — 集显/独显切换
    ============================================================ */
 
@@ -2666,6 +2829,139 @@ input:focus, textarea:focus { border-color: var(--accent); }
   /* 继承根变量 */
 }
 
+/* ============================================================
+   P3: 审查投票 UI
+   ============================================================ */
+
+.review-create-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.review-create-bar select,
+.review-create-bar input {
+  padding: 6px 10px;
+  font-size: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+}
+
+.review-ticket-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.review-ticket-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.ticket-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.ticket-id {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.ticket-target {
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.ticket-score {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--bg-input);
+}
+
+.ticket-score.score-approved {
+  background: var(--success);
+  color: #fff;
+}
+
+.ticket-score.score-rejected {
+  background: var(--danger);
+  color: #fff;
+}
+
+.ticket-expiry {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.ticket-reason {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  font-style: italic;
+}
+
+.ticket-votes {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.vote-badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+.vote-badge.vote-pos {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--success);
+}
+
+.vote-badge.vote-neg {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--danger);
+}
+
+.ticket-vote-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.ticket-vote-actions button {
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  transition: all 0.15s;
+}
+
+.ticket-vote-actions button:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.ticket-vote-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* ================================================================
    会话列表 (SessionList)
    ================================================================ */
@@ -2833,10 +3129,24 @@ input:focus, textarea:focus { border-color: var(--accent); }
   position: relative;
 }
 
-.message-delete-btn {
+.message-actions {
   position: absolute;
   top: 6px;
   right: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 5;
+}
+
+.message:hover .message-actions,
+.message:focus-within .message-actions {
+  opacity: 1;
+}
+
+.message-copy-btn,
+.message-delete-btn {
   width: 22px;
   height: 22px;
   padding: 0;
@@ -2849,14 +3159,13 @@ input:focus, textarea:focus { border-color: var(--accent); }
   color: var(--text-muted);
   font-size: 10px;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
-  z-index: 5;
+  transition: color 0.15s, border-color 0.15s;
   line-height: 1;
 }
 
-.message:hover .message-delete-btn {
-  opacity: 1;
+.message-copy-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .message-delete-btn:hover {

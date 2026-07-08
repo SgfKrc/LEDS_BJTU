@@ -16,6 +16,8 @@ import {
 
 const ROLE_LABELS = { master: '主节点', client: '从节点' };
 const ROLE_ICONS = { master: '🖥️', client: '💻' };
+const TYPE_ICONS = { pc: '💻', android: '📱' };
+const TYPE_LABELS = { pc: 'PC', android: 'Android' };
 
 const STATE_LABELS = { online: '在线', busy: '忙碌', offline: '离线', error: '异常' };
 const STATE_COLORS = {
@@ -252,7 +254,7 @@ function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
 }
 
 
-export default function AdminPanel({ onToast, myRole }) {
+export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const [status, setStatus] = useState(null);
   const [nodes, setNodes] = useState(null);
   const [config, setConfig] = useState(null);
@@ -303,7 +305,15 @@ export default function AdminPanel({ onToast, myRole }) {
   const [designatingSpare, setDesignatingSpare] = useState(false);
   const [spareMasterLogs, setSpareMasterLogs] = useState([]);
 
-  const isMaster = myRole?.is_master ?? true;
+  // P3: 审查投票
+  const [reviewTickets, setReviewTickets] = useState([]);
+  const [canVote, setCanVote] = useState(false);
+  const [reviewTarget, setReviewTarget] = useState('');
+  const [reviewReason, setReviewReason] = useState('');
+  const [creatingReview, setCreatingReview] = useState(false);
+  const [votingTicket, setVotingTicket] = useState(null);
+
+  const isMaster = myRole?.is_master ?? false;
 
   // 拉取全部数据
   const refresh = useCallback(() => {
@@ -452,6 +462,17 @@ export default function AdminPanel({ onToast, myRole }) {
         .then(data => setTransferLogs(data.logs || []))
         .catch(() => {});
     }
+    // P3: 加载审查数据（主节点始终加载，投票资格由服务端检查）
+    if (isMaster) {
+      import('../api/client').then(({ fetchReviewTickets, checkCanVote }) => {
+        fetchReviewTickets('pending')
+          .then(data => setReviewTickets(data.tickets || []))
+          .catch(() => {});
+        checkCanVote()
+          .then(data => setCanVote(data.can_vote || false))
+          .catch(() => {});
+      });
+    }
   }, [isMaster]);
 
   // ---- 备用主节点 ----
@@ -508,6 +529,58 @@ export default function AdminPanel({ onToast, myRole }) {
     } catch (err) {
       onToast?.({ type: 'error', msg: `取消失败: ${err.message}` });
     }
+  };
+
+  // ---- P3: 审查工单操作 ----
+
+  const handleCreateReview = async () => {
+    if (!reviewTarget.trim()) {
+      onToast?.({ type: 'error', msg: '请选择转让目标节点' });
+      return;
+    }
+    setCreatingReview(true);
+    try {
+      const { createReviewTicket } = await import('../api/client');
+      const result = await createReviewTicket(reviewTarget, reviewReason, 48);
+      onToast?.({ type: 'success', msg: `审查工单 ${result.ticket_id} 已创建` });
+      setReviewTarget('');
+      setReviewReason('');
+      // 刷新工单列表
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `创建工单失败: ${err.message}` });
+    } finally {
+      setCreatingReview(false);
+    }
+  };
+
+  const handleVote = async (ticketId, voteValue) => {
+    setVotingTicket(ticketId);
+    try {
+      const { castVote } = await import('../api/client');
+      await castVote(ticketId, voteValue);
+      onToast?.({ type: 'success', msg: `投票成功: ${voteValue > 0 ? '+' : ''}${voteValue}` });
+      // 刷新
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `投票失败: ${err.message}` });
+    } finally {
+      setVotingTicket(null);
+    }
+  };
+
+  const formatRemaining = (expiresAt) => {
+    if (!expiresAt) return '—';
+    const remaining = expiresAt * 1000 - Date.now();
+    if (remaining <= 0) return '已过期';
+    const hours = Math.floor(remaining / 3600000);
+    const mins = Math.floor((remaining % 3600000) / 60000);
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
   };
 
   // ---- 以太网自动填充 ----
@@ -1106,16 +1179,20 @@ export default function AdminPanel({ onToast, myRole }) {
                       rttDisplay = formatRTT(rttMs);
                     }
 
+                    const typeIcon = TYPE_ICONS[node.node_type] || TYPE_ICONS.pc;
+                    const typeLabel = TYPE_LABELS[node.node_type] || TYPE_LABELS.pc;
+
                     return (
                       <tr key={node.node_id} className={isOffline ? 'row-offline' : ''}>
                         <td>
                           <span className="node-id-cell">
-                            {ROLE_ICONS[node.role] || '❓'} {node.node_id}
+                            {typeIcon} {node.node_id}
                           </span>
                         </td>
                         <td>
                           <span className="role-badge" data-role={node.role === 'master' ? 'master' : 'client'}>
                             {ROLE_LABELS[node.role] || node.role}
+                            {node.node_type === 'android' ? ' · 📱' : ''}
                           </span>
                         </td>
                         <td>
@@ -1482,6 +1559,117 @@ export default function AdminPanel({ onToast, myRole }) {
                 </div>
               )}
             </div>
+          </section>
+        )}
+
+        {/* ---- 主节点转让审查（仅主节点可见） ---- */}
+        {isMaster && (
+          <section className="admin-section">
+            <h3>🗳️ 主节点转让审查</h3>
+            <p className="connect-desc">
+              主节点转让需要经过集群中 PC 独显节点的投票审查。
+              投票通过（≥ +2）后，转让操作才会生效。仅 NVIDIA CUDA 独显节点可投票。
+            </p>
+
+            {/* 创建工单 */}
+            <div className="review-create-bar">
+              <select
+                value={reviewTarget}
+                onChange={e => setReviewTarget(e.target.value)}
+                style={{ flex: 1 }}
+              >
+                <option value="">选择转让目标节点</option>
+                {(nodes?.nodes || [])
+                  .filter(n => n.role === 'client' && n.state === 'online')
+                  .map(n => (
+                    <option key={n.node_id} value={n.node_id}>
+                      {n.node_id} ({n.hostname || '—'})
+                    </option>
+                  ))}
+              </select>
+              <input
+                placeholder="转让原因（可选）"
+                value={reviewReason}
+                onChange={e => setReviewReason(e.target.value)}
+                style={{ flex: 1, marginLeft: 8 }}
+              />
+              <button
+                className="btn-primary"
+                onClick={handleCreateReview}
+                disabled={creatingReview || !reviewTarget.trim()}
+                style={{ marginLeft: 8 }}
+              >
+                {creatingReview ? '⏳ 创建中...' : '📝 创建审查工单'}
+              </button>
+            </div>
+
+            {/* 待处理工单 */}
+            {reviewTickets.length > 0 && (
+              <div className="review-ticket-list" style={{ marginTop: 12 }}>
+                {reviewTickets.map(ticket => (
+                  <div key={ticket.ticket_id} className="review-ticket-card">
+                    <div className="ticket-header">
+                      <span className="ticket-id">{ticket.ticket_id}</span>
+                      <span className="ticket-target">目标: {ticket.target_node_id}</span>
+                      <span className={`ticket-score ${
+                        ticket.score >= 2 ? 'score-approved' :
+                        ticket.score <= -2 ? 'score-rejected' : ''
+                      }`}>
+                        {ticket.score > 0 ? '+' : ''}{ticket.score} 分
+                      </span>
+                      <span className="ticket-expiry">
+                        {formatRemaining(ticket.expires_at)}
+                      </span>
+                    </div>
+                    {ticket.transfer_reason && (
+                      <div className="ticket-reason">{ticket.transfer_reason}</div>
+                    )}
+                    {(ticket.votes || []).length > 0 && (
+                      <div className="ticket-votes">
+                        {(ticket.votes || []).map((v, i) => (
+                          <span key={i} className={`vote-badge vote-${v.value >= 0 ? 'pos' : 'neg'}`}>
+                            {v.voter_node_id}: {v.value > 0 ? '+' : ''}{v.value}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {/* 投票按钮 */}
+                    {canVote && (
+                      <div className="ticket-vote-actions">
+                        <button
+                          className="setting-btn danger-ghost"
+                          onClick={() => handleVote(ticket.ticket_id, -1)}
+                          disabled={votingTicket === ticket.ticket_id}
+                        >👎 -1</button>
+                        <button
+                          className="setting-btn secondary"
+                          onClick={() => handleVote(ticket.ticket_id, 0)}
+                          disabled={votingTicket === ticket.ticket_id}
+                        >⏸️ 0</button>
+                        <button
+                          className="setting-btn primary"
+                          onClick={() => handleVote(ticket.ticket_id, 1)}
+                          disabled={votingTicket === ticket.ticket_id}
+                        >👍 +1</button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {reviewTickets.length === 0 && (
+              <p className="setting-desc" style={{ marginTop: 8 }}>
+                暂无待处理的审查工单。
+              </p>
+            )}
+
+            {/* 非CUDA独显提示 */}
+            {!canVote && (
+              <p className="setting-desc" style={{ marginTop: 8, color: 'var(--warning)' }}>
+                ⚠️ 当前节点不支持投票。仅 NVIDIA CUDA 独显节点可参与审查投票。
+              </p>
+            )}
           </section>
         )}
 
