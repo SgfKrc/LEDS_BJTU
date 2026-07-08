@@ -2549,6 +2549,93 @@ async def test_email_notification():
 
 
 # ============================================================
+# 推理调度队列 API (Phase 3 — MLFQ 三级队列可视化与管理)
+# ============================================================
+
+class SetQueueStrategyRequest(BaseModel):
+    strategy: str = Field(..., pattern="^(fifo|mlfq)$", description="调度策略: fifo | mlfq")
+
+
+class CancelTaskResponse(BaseModel):
+    success: bool
+    task_id: str
+    message: str = ""
+
+
+@app.get("/api/cluster/queue")
+async def get_queue_detail():
+    """
+    获取推理调度队列完整详情。
+
+    返回三级队列（Q0/Q1/Q2）中每个任务的序列化信息，
+    含优先级、等待时间、预估耗时、老化状态、抢占统计。
+    仅主节点可用。
+    """
+    if not scheduler._effective_role() == "master":
+        raise HTTPException(403, "仅主节点可查看请求队列")
+    return scheduler.pipeline_queue.get_queue_detail()
+
+
+@app.post("/api/cluster/queue/strategy")
+async def set_queue_strategy(req: SetQueueStrategyRequest):
+    """切换调度策略: fifo | mlfq。仅主节点。"""
+    if not scheduler._effective_role() == "master":
+        raise HTTPException(403, "仅主节点可切换调度策略")
+    try:
+        scheduler.pipeline_queue.set_strategy(req.strategy)
+        return {"success": True, "strategy": req.strategy}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/cluster/queue/pause")
+async def pause_queue():
+    """暂停接受新请求。仅主节点。"""
+    if not scheduler._effective_role() == "master":
+        raise HTTPException(403, "仅主节点可暂停请求队列")
+    scheduler.pipeline_queue.pause()
+    return {"success": True, "paused": True}
+
+
+@app.post("/api/cluster/queue/resume")
+async def resume_queue():
+    """恢复接受新请求。仅主节点。"""
+    if not scheduler._effective_role() == "master":
+        raise HTTPException(403, "仅主节点可恢复请求队列")
+    scheduler.pipeline_queue.resume()
+    return {"success": True, "paused": False}
+
+
+@app.post("/api/cluster/queue/clear")
+async def clear_queue():
+    """清空所有排队任务（不影响执行中的任务）。仅主节点。"""
+    if not scheduler._effective_role() == "master":
+        raise HTTPException(403, "仅主节点可清空请求队列")
+    count = scheduler.pipeline_queue.clear()
+    return {"success": True, "cleared": count}
+
+
+@app.delete("/api/cluster/queue/task/{task_id}")
+async def cancel_queue_task(task_id: str):
+    """
+    取消指定排队任务。
+
+    执行中的任务无法取消（需通过 PIPELINE_ABORT 协议中止）。
+    仅主节点。
+    """
+    if not scheduler._effective_role() == "master":
+        raise HTTPException(403, "仅主节点可取消队列任务")
+    ok = scheduler.pipeline_queue.cancel_task(task_id)
+    if ok:
+        return CancelTaskResponse(success=True, task_id=task_id, message="任务已取消")
+    else:
+        return CancelTaskResponse(
+            success=False, task_id=task_id,
+            message="任务不存在或正在执行中，无法取消"
+        )
+
+
+# ============================================================
 # 分布式推理开关 API
 # ============================================================
 

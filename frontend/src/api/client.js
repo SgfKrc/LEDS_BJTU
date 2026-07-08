@@ -487,3 +487,34 @@ export async function checkCanVote() {
 export async function expireReviewCheck() {
   return request('/cluster/review/expire-check', { method: 'POST' });
 }
+
+// ---- 请求队列管理 (Phase 3) ----
+
+export async function fetchQueue() {
+  return request('/cluster/queue');
+}
+
+export async function setQueueStrategy(strategy) {
+  return request('/cluster/queue/strategy', {
+    method: 'POST',
+    body: JSON.stringify({ strategy }),
+  });
+}
+
+export async function pauseQueue() {
+  return request('/cluster/queue/pause', { method: 'POST' });
+}
+
+export async function resumeQueue() {
+  return request('/cluster/queue/resume', { method: 'POST' });
+}
+
+export async function clearQueue() {
+  return request('/cluster/queue/clear', { method: 'POST' });
+}
+
+export async function cancelQueueTask(taskId) {
+  return request(`/cluster/queue/task/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE',
+  });
+}

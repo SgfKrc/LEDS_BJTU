@@ -7,10 +7,12 @@
 
 import sys
 import os
+import logging
+import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
-from scheduler import Scheduler
+from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState
 
 
 # ================================================================
@@ -673,6 +675,35 @@ class TestPipelineMessageDispatch:
         # 不应抛出异常（即使 model_manager 不存在也会优雅处理）
         sched._on_tcp_message("master", msg)
 
+    def test_unknown_message_type_logs_debug(self, sched, caplog):
+        """未知消息类型应记录 DEBUG 日志，便于排查协议不匹配。"""
+        with caplog.at_level(logging.DEBUG, logger="scheduler"):
+            sched._on_tcp_message("client1", {"type": "unknown_type"})
+        assert any("未知消息类型" in r.getMessage() for r in caplog.records)
+
+    def test_pipeline_pause_resume_logs_info(self, sched, caplog):
+        """pipeline_pause/resume 应在 INFO 级别可见。"""
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            sched._on_tcp_message("client1", {"type": "pipeline_pause"})
+            sched._on_tcp_message("client1", {"type": "pipeline_resume"})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("PIPELINE_PAUSE" in m for m in messages)
+        assert any("PIPELINE_RESUME" in m for m in messages)
+
+    def test_tcp_disconnect_logs_and_marks_offline(self, sched, caplog):
+        """TCP 断连应记录调度器层日志并标记节点离线。"""
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        sched._push_node_update_to_all_clients = lambda *args, **kwargs: None
+        sched.deregister_node = lambda _client_id: None
+
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            sched._on_tcp_disconnect("client1")
+
+        assert sched.nodes["client1"].state == NodeState.OFFLINE
+        assert any("TCP 断开" in r.getMessage() for r in caplog.records)
+
 
 # ================================================================
 # 流水线回退推理 测试
@@ -862,17 +893,21 @@ class TestPipelineQueueBasics:
         result = queue.wait_for_result("nonexistent", timeout=0.5)
         assert result["status"] == "unknown"
 
-    def test_process_error_captured(self, queue):
-        """process_fn 抛异常时应记录 error 状态"""
+    def test_process_error_captured(self, queue, caplog):
+        """process_fn 抛异常时应记录 error 状态，并带 exc_info。"""
         def failing_process(**kwargs):
             raise ValueError("模拟推理失败")
 
-        queue.start(process_fn=failing_process)
-        tid = queue.enqueue(prompt="test")
-        result = queue.wait_for_result(tid, timeout=5.0)
+        with caplog.at_level(logging.ERROR, logger="scheduler"):
+            queue.start(process_fn=failing_process)
+            tid = queue.enqueue(prompt="test")
+            result = queue.wait_for_result(tid, timeout=5.0)
 
         assert result["status"] == "error"
         assert "模拟推理失败" in result["error"]
+        records = [r for r in caplog.records if "排队任务失败" in r.getMessage()]
+        assert records
+        assert records[0].exc_info is not None
         queue.stop()
 
     def test_queue_fifo_order(self, queue):

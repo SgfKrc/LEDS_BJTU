@@ -37,7 +37,10 @@ from config import (
     PIPELINE_Q0_MAX_TOKENS, PIPELINE_Q1_MAX_TOKENS,
     PIPELINE_AGING_Q1_TO_Q0_SECONDS, PIPELINE_AGING_Q2_TO_Q1_SECONDS,
     PIPELINE_AGING_MAX_WAIT_SECONDS,
-    PIPELINE_PREEMPT_ENABLED,  # 二期协同抢占（当前仅参数预留）
+    PIPELINE_PREEMPT_ENABLED,
+    PIPELINE_PREEMPT_MIN_INTERVAL,       # 两次抢占最小间隔（防抖动）
+    PIPELINE_PREEMPT_MIN_TOKENS,         # 至少生成 N token 后才接受抢占
+    PIPELINE_PREEMPT_MAX_OVERHEAD_MS,    # checkpoint 超限自动禁用
 )
 
 logger = logging.getLogger(__name__)
@@ -199,6 +202,37 @@ class QueueTask:
         }
 
 
+class PreemptState:
+    """
+    被抢占任务的执行状态快照。
+
+    在 decode 步边界保存 Q1/Q2 任务的所有局部状态，供 Q0 完成后恢复。
+    KV cache 按 task_id 保留在各节点，不需 GPU↔CPU checkpoint。
+    """
+    __slots__ = (
+        "task_id", "generated_ids", "full_input_ids", "current_step",
+        "max_new_tokens", "temperature", "top_p", "prompt",
+        "pipeline_nodes", "first_node_id", "_stream_callback",
+    )
+
+    def __init__(self, task_id: str, generated_ids: list,
+                 full_input_ids, current_step: int,
+                 max_new_tokens: int, temperature: float, top_p: float,
+                 prompt: str, pipeline_nodes: list, first_node_id: str,
+                 _stream_callback=None):
+        self.task_id = task_id
+        self.generated_ids = list(generated_ids)       # shallow copy
+        self.full_input_ids = full_input_ids            # Tensor 引用（只读）
+        self.current_step = current_step
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.prompt = prompt
+        self.pipeline_nodes = pipeline_nodes
+        self.first_node_id = first_node_id
+        self._stream_callback = _stream_callback
+
+
 class PipelineQueue:
     """
     流水线请求队列 — MLFQ 三级反馈队列 + FIFO 兼容模式。
@@ -282,6 +316,7 @@ class PipelineQueue:
     def start(self, process_fn: Callable) -> None:
         """启动后台工作线程，开始处理队列中的任务。"""
         if self._running:
+            logger.debug("流水线请求队列已在运行，忽略重复 start")
             return
         self._process_fn = process_fn
         self._running = True
@@ -290,22 +325,29 @@ class PipelineQueue:
         )
         self._worker_thread.start()
         logger.info(
-            "流水线请求队列已启动 (strategy=%s, max_size=%d)",
-            self._strategy.upper(), self._max_size
+            "流水线请求队列已启动 (strategy=%s, max_size=%d, worker=%s)",
+            self._strategy.upper(), self._max_size, self._worker_thread.name
         )
 
     def stop(self) -> None:
         """停止工作线程，清理等待中的任务。"""
         self._running = False
+        cancelled = 0
         # 唤醒所有等待者
         with self._lock:
+            queue_depth = len(self._q0) + len(self._q1) + len(self._q2)
+            current_task = self._current_task_id
             for task_id, event in self._events.items():
                 if not event.is_set():
                     self._results[task_id] = {
                         "status": "cancelled", "error": "队列已停止"
                     }
                     event.set()
-        logger.info("流水线请求队列已停止")
+                    cancelled += 1
+        logger.info(
+            f"流水线请求队列已停止，唤醒等待任务 {cancelled} 个 "
+            f"(queue_depth={queue_depth}, current_task={current_task})"
+        )
 
     def enqueue(self, task_id: str = None, **task_data) -> str:
         """
@@ -462,11 +504,12 @@ class PipelineQueue:
 
     def _apply_aging(self, now: float = None) -> None:
         """
-        老化提升：等待过久的请求逐级上浮（每次调用仅提升一级）。
+        老化提升：等待过久的请求逐级上浮（常规路径每次调用仅提升一级）。
 
         - Q2 → Q1: 等待超过 aging_q2_to_q1 秒
         - Q1 → Q0: 等待超过 aging_q1_to_q0 秒（不含刚从 Q2 提升的）
         - 绝对上限: 等待超过 aging_max_wait 秒 → 直接置顶 Q0
+          （可越级提升，步骤 1 刚升入 Q1 的任务若同时超绝对上限也会被置顶 Q0）
         """
         now = now or time.time()
         just_promoted: set = set()  # 本轮已提升的 task_id，避免重复提升
@@ -537,6 +580,88 @@ class PipelineQueue:
             self._strategy = strategy
         logger.info(f"调度策略已切换: {strategy.upper()}")
 
+    def pause(self) -> None:
+        """暂停接受新请求（已在队列中的任务继续执行）。"""
+        with self._lock:
+            was_paused = self._paused
+            self._paused = True
+            queue_depth = len(self._q0) + len(self._q1) + len(self._q2)
+            current_task = self._current_task_id
+        logger.info(
+            f"⏸️ 请求队列已暂停 (was_paused={was_paused}, "
+            f"queue_depth={queue_depth}, current_task={current_task})"
+        )
+
+    def resume(self) -> None:
+        """恢复接受新请求。"""
+        with self._lock:
+            was_paused = self._paused
+            self._paused = False
+            queue_depth = len(self._q0) + len(self._q1) + len(self._q2)
+            current_task = self._current_task_id
+        logger.info(
+            f"▶️ 请求队列已恢复 (was_paused={was_paused}, "
+            f"queue_depth={queue_depth}, current_task={current_task})"
+        )
+
+    def cancel_task(self, task_id: str) -> bool:
+        """
+        取消指定任务。
+
+        排队中的任务: 从队列移除，标记 cancelled。
+        执行中的任务: 不支持中途取消（需通过 abort 协议），返回 False。
+        已完成的任务: 返回 False。
+
+        Returns: True 表示已取消，False 表示无法取消。
+
+        Complexity: O(n²) 线性扫描 + deque.remove，Q_MAX_SIZE=100 时可接受。
+        """
+        with self._lock:
+            # 搜索三级队列
+            for q in (self._q0, self._q1, self._q2):
+                for task in q:
+                    if task.task_id == task_id:
+                        q.remove(task)
+                        self._results[task_id] = {
+                            "status": "cancelled",
+                            "created_at": self._results.get(task_id, {}).get("created_at", 0),
+                            "completed_at": time.time(),
+                        }
+                        event = self._events.get(task_id)
+                        if event:
+                            event.set()
+                        logger.info(f"🚫 排队任务已取消: {task_id}")
+                        return True
+            # 如果是当前执行中的任务，无法取消
+            if self._current_task_id == task_id:
+                logger.warning(f"无法取消执行中的任务: {task_id}")
+                return False
+        return False
+
+    def clear(self) -> int:
+        """
+        清空所有排队任务。
+
+        执行中的任务不受影响。
+        Returns: 已取消的任务数量。
+        """
+        count = 0
+        with self._lock:
+            for q in (self._q0, self._q1, self._q2):
+                while q:
+                    task = q.popleft()
+                    self._results[task.task_id] = {
+                        "status": "cancelled",
+                        "created_at": self._results.get(task.task_id, {}).get("created_at", 0),
+                        "completed_at": time.time(),
+                    }
+                    event = self._events.get(task.task_id)
+                    if event:
+                        event.set()
+                    count += 1
+        logger.info(f"🧹 已清空 {count} 个排队任务")
+        return count
+
     def get_queue_detail(self) -> dict:
         """返回三级队列详情（供 API 和前端使用）。"""
         with self._lock:
@@ -553,6 +678,8 @@ class PipelineQueue:
                 "q1": [t.to_dict() for t in list(self._q1)],
                 "q2": [t.to_dict() for t in list(self._q2)],
                 "aging_params": {
+                    "q0_max_tokens": self._q0_max_tokens,
+                    "q1_max_tokens": self._q1_max_tokens,
                     "q1_to_q0_s": self._aging_q1_to_q0,
                     "q2_to_q1_s": self._aging_q2_to_q1,
                     "max_wait_s": self._aging_max_wait,
@@ -580,6 +707,7 @@ class PipelineQueue:
 
         ★ MLFQ: 使用 _get_next_task() 代替直接 pop，支持多级调度。
         """
+        logger.info("流水线队列工作线程已启动")
         while self._running:
             task = None
             with self._lock:
@@ -631,7 +759,7 @@ class PipelineQueue:
                         "completed_at": time.time(),
                         "elapsed_s": round(elapsed, 2),
                     }
-                logger.error(f"❌ 排队任务失败: {task_id} — {e}")
+                logger.error(f"❌ 排队任务失败: {task_id} — {e}", exc_info=True)
             finally:
                 event = self._events.get(task_id)
                 if event:
@@ -723,6 +851,14 @@ class Scheduler:
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
         self._layer_config_pushed: set = set()  # 已成功推送层配置的从节点 ID（就绪检查用）
         self._inference_lock = threading.Lock()  # GPU 推理互斥锁（防止并发执行）
+
+        # ---- 协同抢占状态 (Phase 2) ----
+        self._preempted_task: Optional[PreemptState] = None
+        self._preempt_count: int = 0
+        self._preempt_total_overhead_ms: float = 0.0
+        self._preempt_last_time: float = 0.0
+        self._preempt_disabled: bool = False   # 超过 MAX_OVERHEAD_MS 后自动禁用
+        self._preempting: bool = False          # 正在执行抢占（防嵌套）
 
         # 流水线请求队列（MLFQ 三级反馈队列，兼容 FIFO）
         self.pipeline_queue = PipelineQueue(
@@ -1401,10 +1537,9 @@ class Scheduler:
                     return assignments
             except Exception as e:
                 logger.warning(
-                    f"图算法智能编排失败: {e}，回退到简单权重分配"
+                    f"图算法智能编排失败: {e}，回退到简单权重分配",
+                    exc_info=True,
                 )
-                import traceback
-                traceback.print_exc()
 
         # ============================================================
         # 回退：简单权重比例分配（节点数 ≤ 阈值）
@@ -2036,15 +2171,34 @@ class Scheduler:
                 del self._kv_cache[task_id]
             logger.warning(f"⚠️ 流水线任务 {task_id} 已取消")
 
+        elif msg_type == "pipeline_pause":
+            # ---- 从节点/主节点：流水线暂停（二期协同抢占，协议预留）----
+            logger.info(f"⏸️ 收到 PIPELINE_PAUSE: client={client_id}")
+
+        elif msg_type == "pipeline_resume":
+            # ---- 从节点/主节点：流水线恢复（二期协同抢占，协议预留）----
+            logger.info(f"▶️ 收到 PIPELINE_RESUME: client={client_id}")
+
         elif msg_type == "layer_config":
             # ---- 从节点：收到主节点推送的分层配置 ----
             data = msg.get("data", {})
             self._handle_layer_config(client_id, data)
 
+        else:
+            logger.debug(f"未知消息类型: {msg_type}, client={client_id}")
+
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
+        old_state = None
         if client_id in self.nodes:
+            old_state = self.nodes[client_id].state.value
             self.nodes[client_id].state = NodeState.OFFLINE
+            logger.info(
+                f"🔌 节点 {client_id} TCP 断开，已标记 offline "
+                f"(old_state={old_state}, role={self._effective_role()})"
+            )
+        else:
+            logger.debug(f"未知节点 {client_id} TCP 断开，跳过状态标记")
         # 推送节点离线更新给所有连接的从节点
         if self._effective_role() == "master":
             self._push_node_update_to_all_clients(
@@ -4351,9 +4505,7 @@ class Scheduler:
                 self._send_layer_result("master", task_id, result_data=response)
 
         except Exception as e:
-            logger.error(f"层前向传播失败: task={task_id}, error={e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"层前向传播失败: task={task_id}, error={e}", exc_info=True)
             self._send_layer_result("master", task_id, error=str(e))
 
     def _handle_chain_forward(self, client_id: str, msg: dict) -> None:
@@ -4720,6 +4872,191 @@ class Scheduler:
                 decoded[k] = v
         return decoded
 
+    # ================================================================
+    # 协同抢占辅助方法 (Phase 2)
+    # ================================================================
+
+    def _check_preempt_conditions(self, current_step: int) -> bool:
+        """
+        检查是否满足抢占条件（防抖动 + 最小 token 阈值）。
+
+        条件:
+        1. PIPELINE_PREEMPT_ENABLED=True
+        2. 未被禁用（_preempt_disabled=False）
+        3. 当前未在执行抢占（防嵌套）
+        4. 已生成 >= MIN_TOKENS 个 token
+        5. 距上次抢占 >= MIN_INTERVAL 秒
+        """
+        if not PIPELINE_PREEMPT_ENABLED or self._preempt_disabled:
+            return False
+        if self._preempting:  # ★ 防嵌套：Q0 内部不触发二次抢占
+            return False
+        if current_step < PIPELINE_PREEMPT_MIN_TOKENS:
+            return False
+        if self._preempt_last_time > 0:
+            if time.time() - self._preempt_last_time < PIPELINE_PREEMPT_MIN_INTERVAL:
+                return False
+        return True
+
+    def _save_preempt_state(self, *, task_id: str, generated_ids: list,
+                            full_input_ids, current_step: int,
+                            max_new_tokens: int, temperature: float,
+                            top_p: float, prompt: str,
+                            pipeline_nodes: list, first_node_id: str,
+                            _stream_callback=None) -> PreemptState:
+        """
+        保存当前 decode 循环的所有局部状态到 PreemptState。
+
+        generated_ids 做 shallow copy（list 在恢复后独立 append）。
+        full_input_ids 仅保存 tensor 引用（只读，不会被 Q0 修改）。
+        """
+        state = PreemptState(
+            task_id=task_id,
+            generated_ids=generated_ids,
+            full_input_ids=full_input_ids,
+            current_step=current_step,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            prompt=prompt,
+            pipeline_nodes=pipeline_nodes,
+            first_node_id=first_node_id,
+            _stream_callback=_stream_callback,
+        )
+        self._preempted_task = state
+        return state
+
+    def _execute_q0_inline(self, q0_task: QueueTask,
+                           preempt_state: PreemptState) -> None:
+        """
+        内联执行 Q0 抢占任务。
+
+        调用方已释放 _inference_lock 并设置 _preempting=True，本方法负责:
+        1. 标记 Q0 为 current_task（try/finally 保护恢复）
+        2. 检查节点就绪 → 获取推理锁 → 执行 Q0 → 释放推理锁
+        3. 存储 Q0 结果 + 唤醒等待的 API 线程
+        4. 恢复被抢占任务为 current_task
+        5. 重新获取推理锁（为被抢占任务继续执行）
+
+        Q0 自身异常不影响被抢占任务——错误结果照常存储并唤醒调用方。
+        """
+        q0_id = q0_task.task_id
+        preempted_id = preempt_state.task_id
+        q0_result = None
+        q0_error = None
+        lock_reacquired = False  # ★ BUG1 fix: track if lock was re-acquired in step 5
+
+        try:
+            # 1. 标记 Q0 为当前执行任务（在 try 内，异常时由外层的 except 恢复）
+            with self.pipeline_queue._lock:
+                self.pipeline_queue._current_task_id = q0_id
+                if q0_id not in self.pipeline_queue._results:
+                    self.pipeline_queue._results[q0_id] = {"status": "pending", "created_at": time.time()}
+                self.pipeline_queue._results[q0_id]["status"] = "running"
+                self.pipeline_queue._results[q0_id]["started_at"] = time.time()
+
+            t_q0_start = time.time()
+
+            # 2. 获取推理锁 → 执行 Q0（★ 含节点就绪检查与回退）
+            self._inference_lock.acquire()
+            try:
+                if not self._all_pipeline_nodes_ready():
+                    logger.warning("Q0 抢占: 流水线节点不可用，回退到全模型推理")
+                    q0_result = self._run_full_model_inference(
+                        prompt=q0_task.prompt,
+                        max_new_tokens=q0_task.max_new_tokens,
+                        temperature=q0_task.temperature,
+                        top_p=q0_task.top_p,
+                        session_id=q0_task.session_id,
+                    )
+                else:
+                    # 透传 QueueTask 中保存的额外参数（如 _stream_callback）
+                    extra = q0_task._extra_kwargs if q0_task._extra_kwargs else {}
+                    q0_result = self.run_pipeline(
+                        prompt=q0_task.prompt,
+                        max_new_tokens=q0_task.max_new_tokens,
+                        temperature=q0_task.temperature,
+                        top_p=q0_task.top_p,
+                        session_id=q0_task.session_id,
+                        **extra,
+                    )
+            except Exception as e:
+                q0_error = str(e)
+                logger.error(f"❌ Q0 抢占任务执行失败: {q0_id} — {e}")
+            finally:
+                self._inference_lock.release()
+
+            q0_elapsed = time.time() - t_q0_start
+
+            # 3. 存储 Q0 结果 + 唤醒 API 线程 + 恢复 current_task
+            with self.pipeline_queue._lock:
+                if q0_error:
+                    self.pipeline_queue._results[q0_id] = {
+                        "status": "error", "error": q0_error,
+                        "created_at": self.pipeline_queue._results.get(q0_id, {}).get("created_at", 0),
+                        "completed_at": time.time(),
+                        "elapsed_s": round(q0_elapsed, 2),
+                    }
+                else:
+                    self.pipeline_queue._results[q0_id] = {
+                        "status": "done", "result": q0_result,
+                        "created_at": self.pipeline_queue._results.get(q0_id, {}).get("created_at", 0),
+                        "started_at": self.pipeline_queue._results.get(q0_id, {}).get("started_at", 0),
+                        "completed_at": time.time(),
+                        "elapsed_s": round(q0_elapsed, 2),
+                    }
+                event = self.pipeline_queue._events.get(q0_id)
+                if event:
+                    event.set()
+                # 4. 恢复被抢占任务为 current_task
+                self.pipeline_queue._current_task_id = preempted_id
+
+            # 5. 重新获取推理锁（为被抢占任务继续）
+            self._inference_lock.acquire()
+            lock_reacquired = True  # ★ 标记：在此点之后异常需释放锁
+
+            logger.info(
+                f"✅ Q0 抢占完成: {q0_id} ({q0_elapsed:.1f}s) "
+                f"→ 恢复 {preempted_id}"
+            )
+        except Exception:
+            # ★ C2 修复: _current_task_id 损坏保护
+            with self.pipeline_queue._lock:
+                if self.pipeline_queue._current_task_id == q0_id:
+                    self.pipeline_queue._current_task_id = preempted_id
+            # ★ BUG1 修复: 若锁已被重新获取，释放它以防死锁
+            if lock_reacquired:
+                try:
+                    self._inference_lock.release()
+                except RuntimeError:
+                    pass
+            raise
+
+    def _update_preempt_stats(self, overhead_ms: float) -> None:
+        """
+        更新抢占统计。
+
+        若单次抢占开销超过 PIPELINE_PREEMPT_MAX_OVERHEAD_MS，
+        自动禁用后续抢占（防止 thrashing）。
+        统计同步到 PipelineQueue 以支持 get_queue_detail()。
+        """
+        self._preempt_count += 1
+        self._preempt_total_overhead_ms += overhead_ms
+        self._preempt_last_time = time.time()
+
+        if overhead_ms > PIPELINE_PREEMPT_MAX_OVERHEAD_MS:
+            self._preempt_disabled = True
+            logger.warning(
+                f"⚠️ 抢占开销 {overhead_ms:.1f}ms 超过阈值 "
+                f"({PIPELINE_PREEMPT_MAX_OVERHEAD_MS}ms)，已禁用后续抢占"
+            )
+
+        # 同步到 PipelineQueue（get_queue_detail 读取此处）
+        with self.pipeline_queue._lock:
+            self.pipeline_queue._preempt_count = self._preempt_count
+            self.pipeline_queue._preempt_total_overhead_ms = self._preempt_total_overhead_ms
+            self.pipeline_queue._last_preempt_time = self._preempt_last_time
+
     def run_pipeline(self, prompt: str, max_new_tokens: int = 512,
                      temperature: float = 0.7, top_p: float = 0.9,
                      session_id: str = None,
@@ -4812,6 +5149,88 @@ class Scheduler:
         full_input_ids = input_ids
 
         for step in range(max_new_tokens):
+            # ---- Phase 2: 协同抢占检查 ----
+            # 在每个 decode 步边界检测 Q0 任务，若存在则执行内联抢占。
+            # Prefill (step=0) 不抢占——此时尚未生成任何 token。
+            if (step > 0
+                    and PIPELINE_PREEMPT_ENABLED
+                    and not self._preempt_disabled
+                    and self._check_preempt_conditions(step)):
+
+                # ★ 原子检查 + 弹出（消除 TOCTOU 窗口）
+                q0_task = None
+                with self.pipeline_queue._lock:
+                    if self.pipeline_queue._q0:
+                        q0_task = self.pipeline_queue._q0.popleft()
+
+                if q0_task is not None:
+                    t_preempt = time.time()
+
+                    # 保存被抢占任务的执行状态
+                    preempt_state = self._save_preempt_state(
+                        task_id=task_id,
+                        generated_ids=generated_ids,
+                        full_input_ids=full_input_ids,
+                        current_step=step,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        prompt=prompt,
+                        pipeline_nodes=pipeline_nodes,
+                        first_node_id=pipeline_nodes[0]["node_id"],
+                        _stream_callback=_stream_callback,
+                    )
+
+                    logger.info(
+                        f"⚡ 抢占触发: step={step}, {task_id} "
+                        f"→ Q0={q0_task.task_id} "
+                        f"(已生成 {len(generated_ids)} tokens)"
+                    )
+
+                    # 释放推理锁，内联执行 Q0
+                    self._inference_lock.release()
+
+                    self._preempting = True  # ★ 防嵌套抢占
+                    try:
+                        self._execute_q0_inline(q0_task, preempt_state)
+                    except Exception as e:
+                        logger.error(
+                            f"❌ Q0 抢占异常: {e}，中止 {task_id}"
+                        )
+                        # 尝试恢复锁平衡
+                        try:
+                            self._inference_lock.acquire()
+                        except RuntimeError:
+                            pass
+                        self._broadcast_pipeline_abort(
+                            pipeline_nodes, task_id, f"抢占失败: {e}"
+                        )
+                        if task_id in self._kv_cache:
+                            del self._kv_cache[task_id]
+                        self._preempted_task = None
+                        self._preempting = False
+                        return {"response": "", "error": f"抢占失败: {e}"}
+                    finally:
+                        self._preempting = False
+
+                    # 恢复被抢占任务状态
+                    generated_ids = preempt_state.generated_ids
+                    full_input_ids = preempt_state.full_input_ids
+                    temperature = preempt_state.temperature
+                    top_p = preempt_state.top_p
+                    prompt = preempt_state.prompt
+                    _stream_callback = preempt_state._stream_callback
+                    self._preempted_task = None  # ★ M2: 清除泄漏
+
+                    overhead_ms = (time.time() - t_preempt) * 1000
+                    self._update_preempt_stats(overhead_ms)
+
+                    logger.info(
+                        f"🔄 抢占恢复: {task_id} step {step} "
+                        f"(剩余 {max_new_tokens - step} tokens)"
+                    )
+                    # ★ 循环继续，step 不变——被推迟的这一步现在执行
+
             step_start = time.time()
             logits = None
             step_error = None
@@ -5087,20 +5506,31 @@ class Scheduler:
            避免死锁：队列 worker 已设置 _current_task_id，若走 run_pipeline_safe
            会再次检测 is_busy=True → enqueue → 永久等待自己完成。
 
-        ★ 持有 _inference_lock 确保 GPU 互斥（阻塞等待）。
+        ★ 手动管理 _inference_lock：正常路径在 finally 中释放；
+           抢占路径中 run_pipeline 内部会 release/re-acquire，
+           返回时锁仍被持有，由 finally 统一释放。
         """
-        with self._inference_lock:
-            try:
-                # 检查节点是否就绪
-                if not self._all_pipeline_nodes_ready():
-                    logger.warning("流水线节点不可用，队列任务回退到全模型推理")
-                    return self._run_full_model_inference(prompt, **kwargs)
-                return self.run_pipeline(prompt, **kwargs)
-            except Exception as e:
-                logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理")
-                import traceback
-                traceback.print_exc()
+        self._inference_lock.acquire()
+        lock_held = True
+        try:
+            # 检查节点是否就绪
+            if not self._all_pipeline_nodes_ready():
+                logger.warning("流水线节点不可用，队列任务回退到全模型推理")
+                # ★ H1 修复: 保持 lock_held=True，回退推理在锁保护下执行（防止 GPU 并发）
                 return self._run_full_model_inference(prompt, **kwargs)
+            return self.run_pipeline(prompt, **kwargs)
+        except Exception as e:
+            logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理", exc_info=True)
+            # 锁可能在抢占异常路径中已被释放
+            try:
+                self._inference_lock.release()
+                lock_held = False
+            except RuntimeError:
+                lock_held = False  # 抢占路径中锁已被 release
+            return self._run_full_model_inference(prompt, **kwargs)
+        finally:
+            if lock_held:
+                self._inference_lock.release()
 
     def run_pipeline_safe(self, prompt: str, **kwargs) -> dict:
         """
@@ -5179,9 +5609,7 @@ class Scheduler:
             try:
                 return self.run_pipeline(prompt, **kwargs)
             except Exception as e:
-                logger.error(f"流水线推理失败: {e}，回退到全层主节点模式")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"流水线推理失败: {e}，回退到全层主节点模式", exc_info=True)
                 return self._run_full_model_inference(prompt, **kwargs)
         finally:
             self._inference_lock.release()
@@ -5199,6 +5627,7 @@ class Scheduler:
         回退模式：在主节点本地执行完整模型推理。
 
         当流水线节点不可用时，使用 model_manager.chat() 直接推理。
+        若调用方传入 _stream_callback，则使用 chat_stream() 逐 token 推送。
         """
         import api_server as _api
 
@@ -5206,22 +5635,52 @@ class Scheduler:
         if not mgr or not mgr.is_loaded:
             return {"response": "", "error": "模型未加载"}
 
+        _stream_callback = kwargs.pop('_stream_callback', None)
+
         try:
             messages = [{"role": "user", "content": prompt}]
-            result = mgr.chat(
-                messages=messages,
-                max_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-            )
-            return {
-                "response": result.get("content", ""),
-                "thinking": result.get("thinking_content", ""),
-                "metrics": {
+
+            if _stream_callback:
+                # 流式路径：逐 token 推送
+                full_text_parts = []
+                t0 = time.time()
+                for chunk in mgr.chat_stream(
+                    messages=messages,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                ):
+                    if chunk:
+                        full_text_parts.append(chunk)
+                        _stream_callback({"token": chunk})
+                response_text = "".join(full_text_parts)
+                elapsed = time.time() - t0
+                metrics = {
+                    "mode": "fallback_full_model_streaming",
+                    "tokens_per_second": len(full_text_parts) / elapsed if elapsed > 0 else 0,
+                    "chunks": len(full_text_parts),
+                    "elapsed_seconds": round(elapsed, 3),
+                }
+                # ★ 发送完成信号（与 run_pipeline 一致）
+                _stream_callback({"done": True, "response": response_text, "metrics": metrics})
+            else:
+                result = mgr.chat(
+                    messages=messages,
+                    max_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                response_text = result.get("content", "")
+                metrics = {
                     "mode": "fallback_full_model",
                     "tokens_per_second": result.get("tokens_per_second", 0),
                     "usage": result.get("usage", {}),
-                },
+                }
+
+            return {
+                "response": response_text,
+                "thinking": "" if _stream_callback else result.get("thinking_content", ""),
+                "metrics": metrics,
             }
         except Exception as e:
             logger.error(f"全模型回退推理失败: {e}")

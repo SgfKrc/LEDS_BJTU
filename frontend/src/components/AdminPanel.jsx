@@ -12,6 +12,8 @@ import {
   transferMasterRole, fetchTransferLogs,
   fetchSpareMaster, designateSpareMaster,
   removeSpareMaster, fetchSpareMasterLogs,
+  fetchQueue, setQueueStrategy, pauseQueue,
+  resumeQueue, clearQueue, cancelQueueTask,
 } from '../api/client';
 
 const ROLE_LABELS = { master: '主节点', client: '从节点' };
@@ -313,6 +315,10 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const [creatingReview, setCreatingReview] = useState(false);
   const [votingTicket, setVotingTicket] = useState(null);
 
+  // P3.5: 推理调度队列
+  const [queueDetail, setQueueDetail] = useState(null);
+  const [queueLoading, setQueueLoading] = useState(false);
+
   const isMaster = myRole?.is_master ?? false;
 
   // 拉取全部数据
@@ -325,7 +331,8 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
       isMaster ? fetchInviteInfo().catch(() => null) : Promise.resolve(null),
       isMaster ? fetchLayerAssignment().catch(() => null) : Promise.resolve(null),
       !isMaster ? fetchMasterHealth().catch(() => null) : Promise.resolve(null),
-    ]).then(([s, n, c, inv, layerData, mh]) => {
+      isMaster ? fetchQueue().catch(() => null) : Promise.resolve(null),
+    ]).then(([s, n, c, inv, layerData, mh, qd]) => {
       setStatus(s);
       setNodes(n);
       setConfig(c);
@@ -343,6 +350,9 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
       }
       if (c?.max_nodes && !maxNodesInput) {
         setMaxNodesInput(String(c.max_nodes));
+      }
+      if (qd) {
+        setQueueDetail(qd);
       }
     }).finally(() => setLoading(false));
   }, [isMaster]);
@@ -1815,6 +1825,120 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                     </div>
                   ))}
                 </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* ---- 推理调度队列 (Phase 3 — 仅主节点) ---- */}
+        {isMaster && (
+          <section className="admin-section">
+            <h3>📋 推理调度</h3>
+            <div className="queue-panel">
+              {/* Header: strategy + status + controls */}
+              <div className="queue-header-row">
+                <div className="queue-header-left">
+                  <span className="queue-strategy-badge">
+                    {(queueDetail?.strategy || 'mlfq').toUpperCase()}
+                  </span>
+                  <span className={`status-dot ${queueDetail?.running ? 'online' : 'offline'}`} />
+                  <span className="queue-status-text">
+                    {queueDetail?.paused ? '⏸️ 已暂停' : queueDetail?.running ? '▶️ 运行中' : '⏹️ 已停止'}
+                  </span>
+                </div>
+                <div className="queue-control-row">
+                  {queueDetail?.paused ? (
+                    <button className="btn btn-sm btn-success" onClick={async () => { await resumeQueue(); refresh(); }}>▶ 恢复</button>
+                  ) : (
+                    <button className="btn btn-sm btn-warning" onClick={async () => { await pauseQueue(); refresh(); }}>⏸ 暂停</button>
+                  )}
+                  <button className="btn btn-sm btn-danger-outline" onClick={async () => {
+                    if (window.confirm('确认清空所有排队任务？执行中任务不受影响。')) {
+                      await clearQueue(); refresh();
+                    }
+                  }}>🧹 清空</button>
+                  <select className="setting-select" style={{width:90,fontSize:12}}
+                    value={queueDetail?.strategy || 'mlfq'}
+                    onChange={async (e) => { await setQueueStrategy(e.target.value); refresh(); }}>
+                    <option value="mlfq">MLFQ</option>
+                    <option value="fifo">FIFO</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Currently running task */}
+              {queueDetail?.current_task && (
+                <div className="queue-running-card">
+                  <span className="queue-running-label">⚡ 执行中</span>
+                  <span className="queue-running-id mono">{queueDetail.current_task}</span>
+                </div>
+              )}
+
+              {/* Q0/Q1/Q2 task lists */}
+              {[
+                { key: 'q0', label: 'Q0 交互级', cls: 'queue-level-q0', desc: `≤${queueDetail?.aging_params?.q0_max_tokens || 128}tk` },
+                { key: 'q1', label: 'Q1 普通级', cls: 'queue-level-q1', desc: `≤${queueDetail?.aging_params?.q1_max_tokens || 512}tk` },
+                { key: 'q2', label: 'Q2 批量级', cls: 'queue-level-q2', desc: `>${queueDetail?.aging_params?.q1_max_tokens || 512}tk` },
+              ].map(({ key, label, cls, desc }) => {
+                const tasks = queueDetail?.[key] || [];
+                return (
+                  <div className={`queue-level-section ${cls}`} key={key}>
+                    <div className="queue-level-header">
+                      <span className="queue-level-label">{label}</span>
+                      <span className="queue-level-desc">{desc}</span>
+                      <span className="queue-level-count">{tasks.length}</span>
+                    </div>
+                    <div className="queue-task-list">
+                      {tasks.length === 0 ? (
+                        <div className="queue-empty-state">（空）</div>
+                      ) : (
+                        tasks.map((t) => (
+                          <div className={`queue-task-row ${t.is_aged ? 'aged' : ''}`} key={t.task_id}>
+                            <span className="queue-priority-badge">Q{t.priority_level}</span>
+                            <span className="queue-task-id mono">{t.task_id.slice(0, 16)}…</span>
+                            <span className="queue-task-tokens">{t.max_new_tokens}tk</span>
+                            <span className="queue-task-wait">⏳ {t.wait_seconds?.toFixed(0)}s</span>
+                            <span className="queue-task-est">~{t.estimated_duration_s?.toFixed(0)}s</span>
+                            {t.is_aged && <span className="queue-aging-badge" title="已老化提升">↑</span>}
+                            <button className="btn btn-sm btn-danger-outline"
+                              style={{padding:'1px 6px',fontSize:11}}
+                              onClick={async () => {
+                                if (window.confirm(`确认取消任务 ${t.task_id.slice(0, 16)}…？`)) {
+                                  await cancelQueueTask(t.task_id); refresh();
+                                }
+                              }}
+                              title="取消任务">×</button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Footer: stats */}
+              <div className="queue-stats-grid">
+                <div className="queue-stat-item">
+                  <span className="queue-stat-value">{queueDetail?.queue_size ?? 0}</span>
+                  <span className="queue-stat-label">排队</span>
+                </div>
+                <div className="queue-stat-item">
+                  <span className="queue-stat-value">{queueDetail?.completed_count ?? 0}</span>
+                  <span className="queue-stat-label">完成</span>
+                </div>
+                <div className="queue-stat-item">
+                  <span className="queue-stat-label">老化</span>
+                  <span className="queue-stat-value" style={{fontSize:11}}>
+                    Q1→Q0 {queueDetail?.aging_params?.q1_to_q0_s ?? 60}s &nbsp;
+                    Q2→Q1 {queueDetail?.aging_params?.q2_to_q1_s ?? 120}s
+                  </span>
+                </div>
+                {queueDetail?.preempt_stats && queueDetail.preempt_stats.count > 0 && (
+                  <div className="queue-stat-item">
+                    <span className="queue-stat-value">{queueDetail.preempt_stats.count}</span>
+                    <span className="queue-stat-label">抢占次数</span>
+                  </div>
+                )}
               </div>
             </div>
           </section>
