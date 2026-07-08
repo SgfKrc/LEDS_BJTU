@@ -236,6 +236,7 @@ class ChatRepository(
         topP: Float,
         showThinking: Boolean
     ): Result<String> {
+        QlhLogger.i(TAG, "sendViaApi: session=$sessionId message=${message.length} chars")
         val result = client.chat(
             ChatRequest(
                 message = message,
@@ -248,6 +249,7 @@ class ChatRepository(
         )
 
         return result.map { response ->
+            QlhLogger.i(TAG, "sendViaApi OK: content=${response.content.length} chars")
             val assistantMsg = MessageEntity(
                 sessionId = sessionId,
                 role = "assistant",
@@ -257,6 +259,8 @@ class ChatRepository(
             messageDao.insert(assistantMsg)
             sessionDao.updateMessageCount(sessionId, messageDao.getCount(sessionId))
             response.content
+        }.onFailure { e ->
+            QlhLogger.e(TAG, "sendViaApi failed", e)
         }
     }
 

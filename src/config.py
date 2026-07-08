@@ -50,7 +50,7 @@ RECONNECT_DELAY = 2             # 重连间隔（秒）
 # ============================================================
 MODEL_NAME = "Qwen/Qwen-1.8B-Chat"          # HuggingFace 模型标识
 MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat")       # Safetensors 格式
-GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat-Q4_K_M.gguf")  # GGUF 格式
+GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf")  # GGUF 格式
 QUANT_TYPE = "int4"                          # 量化精度: "fp16" | "int8" | "int4"
 USE_COMPILE = False                          # 算子融合（仅FP16有效，INT4下自动跳过）
 DEVICE = "cuda"                              # 推理设备: "cuda" | "cpu"
@@ -59,7 +59,7 @@ DEVICE = "cuda"                              # 推理设备: "cuda" | "cpu"
 # "auto": 自动选择 — CUDA 可用 → PyTorch + bitsandbytes, 否则 → llama.cpp + GGUF
 # "pytorch": 强制 PyTorch + Transformers（需要 CUDA 或大内存 CPU）
 # "llama_cpp": 强制 llama.cpp + GGUF（推荐 CPU / 集显设备）
-INFERENCE_ENGINE = "auto"
+INFERENCE_ENGINE = "llama_cpp"
 # GGUF 量化文件推荐 (RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf on HuggingFace):
 #   Q4_K_M (1.16 GB) — 推荐，速度/质量最佳平衡
 #   Q5_K_M (1.31 GB) — 更高质量
@@ -87,11 +87,9 @@ LAYER_STRATEGY = "dynamic"              # 分层策略: "dynamic" 动态 | "manu
 DISTRIBUTED_INFERENCE_ENABLED = True    # 分布式推理开关（主节点默认开启，从节点默认关闭）
 
 # 回退分层配置（当没有从节点注册时使用）
-DEFAULT_LAYER_CONFIG = {
-    "master":  (0, 8),                   # 主节点: Embedding + Layer 0-7
-    "client1": (8, 16),                  # 从节点1: Layer 8-15
-    "client2": (16, 24),                 # 从节点2: Layer 16-23 + LM Head
-}
+# 注意：分层现在由 compute_layer_assignment() 动态计算，此配置仅供文档参考。
+# 实际部署中不依赖硬编码的 client1/client2 槽位。
+DEFAULT_LAYER_CONFIG = {}
 
 # 显存约束：单层 Transformer 最低显存 + 量化修正系数
 # Qwen-1.8B 每层 ~70MB (FP16)，Embedding + LM Head 各 ~580MB
@@ -149,7 +147,7 @@ MAX_NODES = 3                    # 最大节点数上限（主节点可动态调
 # 主节点启动后自动检测 Tailscale/ZeroTier 组网 IP 并写入共享数据库，
 # 从节点通过 discover_master() 自动发现即可，通常无需手动配置。
 # 仅当数据库不可用时才回退到此配置值。
-CLIENT_MASTER_HOST = "192.168.x.x"   # 主节点 IP 地址（推荐用 Tailscale IP: 100.x.y.z）
+CLIENT_MASTER_HOST = "100.90.76.108"  # 主节点 IP 地址（Tailscale/ZeroTier IP）
 CLIENT_MASTER_PORT = 8888            # 主节点监听端口
 
 # SMTP 邮件告警配置（详见 src/email_notifier.py）

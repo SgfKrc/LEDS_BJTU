@@ -109,6 +109,7 @@ fun SettingsScreen(
     runtimeStatusLoading: Boolean,
     runtimeStatusError: String?,
     onRefreshRuntimeStatus: () -> Unit,
+    onConnectionTestSuccess: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val scope = rememberCoroutineScope()
@@ -166,9 +167,17 @@ fun SettingsScreen(
                         connectionResult = null
                         scope.launch {
                             val url = "http://$serverHost:$serverPort"
+                            QlhLogger.i("Settings", "测试连接: $url")
                             val client = ApiClient(url)
-                            connectionResult = client.testConnection().getOrNull()
+                            val raw = client.testConnection()
+                            connectionResult = raw.getOrDefault(false)
                             isTesting = false
+                            raw.onSuccess {
+                                QlhLogger.i("Settings", "连接测试成功: $url")
+                                onConnectionTestSuccess()
+                            }.onFailure { e ->
+                                QlhLogger.w("Settings", "连接测试失败: $url — ${e.message ?: e.javaClass.simpleName}")
+                            }
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),

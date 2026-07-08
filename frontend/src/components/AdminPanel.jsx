@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   fetchClusterStatus, fetchClusterNodes,
-  fetchClusterConfig, deregisterNode, updateMaxNodes,
+  fetchClusterConfig, deregisterNode, deleteClusterNode, updateMaxNodes,
   fetchInviteInfo, connectToMaster,
   discoverMaster, resetMasterIdentity,
   manualRegisterNode, fetchMasterHealth,
@@ -280,7 +280,10 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const [manualHostname, setManualHostname] = useState('');
   const [manualAddress, setManualAddress] = useState('');
   const [manualNetworkType, setManualNetworkType] = useState('ethernet');
+  const [manualNodeType, setManualNodeType] = useState('pc');
   const [registering, setRegistering] = useState(false);
+  const [deletingNode, setDeletingNode] = useState(null);
+  const [showOnlineOnly, setShowOnlineOnly] = useState(false);
 
   // 主节点健康状态（从节点监控）
   const [masterHealth, setMasterHealth] = useState(null);  // { master_online, stale, last_seen_seconds_ago }
@@ -377,6 +380,44 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
     }
   };
 
+  const handleDeleteNode = async (nodeId) => {
+    if (!window.confirm(`确认删除离线节点 ${nodeId}？此操作会移除节点记录。`)) return;
+    setDeletingNode(nodeId);
+    try {
+      await deleteClusterNode(nodeId);
+      onToast?.({ type: 'success', msg: `已删除节点: ${nodeId}` });
+      refresh();
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `删除失败: ${err.message}` });
+    } finally {
+      setDeletingNode(null);
+    }
+  };
+
+  const handleDeleteAllOffline = async () => {
+    const offlineNodes = (nodes?.nodes || []).filter(
+      n => n.role !== 'master' && !n.is_available
+    );
+    if (offlineNodes.length === 0) {
+      onToast?.({ type: 'info', msg: '没有可删除的离线节点' });
+      return;
+    }
+    if (!window.confirm(
+      `确认删除全部 ${offlineNodes.length} 个离线节点？\n\n此操作不可撤销。`
+    )) return;
+    let ok = 0, fail = 0;
+    for (const n of offlineNodes) {
+      try {
+        await deleteClusterNode(n.node_id);
+        ok++;
+      } catch (_) {
+        fail++;
+      }
+    }
+    onToast?.({ type: 'success', msg: `已删除 ${ok} 个，失败 ${fail} 个` });
+    refresh();
+  };
+
   const handleUpdateMaxNodes = async () => {
     const v = parseInt(maxNodesInput, 10);
     if (!v || v < 1 || v > 64) {
@@ -388,6 +429,8 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
       const result = await updateMaxNodes(v);
       if (result.status === 'ok') {
         onToast?.({ type: 'success', msg: `最大节点数已更新: ${result.max_nodes}` });
+        setConfig(prev => prev ? { ...prev, max_nodes: result.max_nodes } : prev);
+        setMaxNodesInput(String(result.max_nodes));
         refresh();
       }
     } catch (err) {
@@ -474,13 +517,16 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
     }
     // P3: 加载审查数据（主节点始终加载，投票资格由服务端检查）
     if (isMaster) {
-      import('../api/client').then(({ fetchReviewTickets, checkCanVote }) => {
+      import('../api/client').then(({ fetchReviewTickets, checkCanVote, deleteReviewTicket, deleteResolvedReviewTickets }) => {
         fetchReviewTickets('pending')
           .then(data => setReviewTickets(data.tickets || []))
           .catch(() => {});
         checkCanVote()
           .then(data => setCanVote(data.can_vote || false))
           .catch(() => {});
+        // 挂载删除函数供后续使用
+        window.__deleteReviewTicket = deleteReviewTicket;
+        window.__deleteResolvedReviewTickets = deleteResolvedReviewTickets;
       });
     }
   }, [isMaster]);
@@ -580,6 +626,34 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
       onToast?.({ type: 'error', msg: `投票失败: ${err.message}` });
     } finally {
       setVotingTicket(null);
+    }
+  };
+
+  const handleDeleteTicket = async (ticketId) => {
+    if (!window.confirm(`确定删除工单 ${ticketId}？`)) return;
+    try {
+      const fn = window.__deleteReviewTicket || (await import('../api/client')).deleteReviewTicket;
+      await fn(ticketId);
+      onToast?.({ type: 'success', msg: `工单 ${ticketId} 已删除` });
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `删除失败: ${err.message}` });
+    }
+  };
+
+  const handleDeleteResolvedTickets = async () => {
+    if (!window.confirm('确定删除所有已解决/已过期/已拒绝的审查工单？')) return;
+    try {
+      const fn = window.__deleteResolvedReviewTickets || (await import('../api/client')).deleteResolvedReviewTickets;
+      const result = await fn();
+      onToast?.({ type: 'success', msg: `已清理 ${result.count} 个工单` });
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `清理失败: ${err.message}` });
     }
   };
 
@@ -699,9 +773,10 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
         manualHostname.trim() || manualNodeId.trim(),
         manualAddress.trim(),
         manualNetworkType,
+        manualNodeType,
       );
-      if (result.status === 'registered') {
-        onToast?.({ type: 'success', msg: result.message || `节点 '${result.node_id}' 已注册` });
+      if (result.status === 'registered' || result.status === 'updated') {
+        onToast?.({ type: 'success', msg: result.message || `节点 '${result.node_id}' 已保存` });
         setManualNodeId('');
         setManualHostname('');
         setManualAddress('');
@@ -823,9 +898,9 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   }
 
   const nodeList = nodes?.nodes || [];
-  const filteredNodeList = isMaster
-    ? nodeList
-    : nodeList.filter(n => n.node_id === myRole?.node_id);
+  const filteredNodeList = (isMaster
+    ? (showOnlineOnly ? nodeList.filter(n => n.is_available) : nodeList)
+    : nodeList.filter(n => n.node_id === myRole?.node_id));
   const onlineCount = nodes?.online_count || 0;
   const offlineCount = nodes?.offline_count || 0;
   const nodesReady = status?.nodes_ready || false;
@@ -998,6 +1073,17 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                     <option value="unknown">❓ 未知</option>
                   </select>
                 </div>
+                <div className="connect-field">
+                  <label>节点类型</label>
+                  <select
+                    className="connect-input"
+                    value={manualNodeType}
+                    onChange={(e) => setManualNodeType(e.target.value)}
+                  >
+                    <option value="pc">💻 PC</option>
+                    <option value="android">📱 Android</option>
+                  </select>
+                </div>
                 <button
                   className="btn-primary connect-btn"
                   onClick={handleManualRegister}
@@ -1135,12 +1221,26 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
         {/* ---- 节点列表 ---- */}
         <section className="admin-section">
           <h3>🖥️ {isMaster ? '已注册节点' : '本节点详情'}</h3>
+          {isMaster && (
+            <div className="queue-control-row" style={{ marginBottom: 8 }}>
+              <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <input type="checkbox" checked={showOnlineOnly}
+                  onChange={(e) => setShowOnlineOnly(e.target.checked)} />
+                仅显示在线
+              </label>
+              <button className="btn btn-sm btn-danger-outline"
+                onClick={handleDeleteAllOffline}
+                title="删除所有离线节点记录"
+              >🗑 清理离线节点</button>
+            </div>
+          )}
           <div className="admin-table-wrap">
             <table className="admin-node-table">
               <thead>
                 <tr>
                   <th>节点</th>
                   <th>角色</th>
+                  <th>类型</th>
                   <th>状态</th>
                   <th>🔗 连接</th>
                   <th>⏱ 延迟</th>
@@ -1156,7 +1256,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
               <tbody>
                 {filteredNodeList.length === 0 ? (
                   <tr>
-                    <td colSpan={isMaster ? 12 : 11} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                    <td colSpan={isMaster ? 13 : 12} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
                       {isMaster ? '暂无已注册的从节点，使用上方「注册新节点」添加' : '尚未连接到主节点，请在上方输入主节点地址'}
                     </td>
                   </tr>
@@ -1202,7 +1302,11 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                         <td>
                           <span className="role-badge" data-role={node.role === 'master' ? 'master' : 'client'}>
                             {ROLE_LABELS[node.role] || node.role}
-                            {node.node_type === 'android' ? ' · 📱' : ''}
+                          </span>
+                        </td>
+                        <td>
+                          <span className="type-badge" data-type={node.node_type || 'pc'}>
+                            {typeIcon} {typeLabel}
                           </span>
                         </td>
                         <td>
@@ -1252,6 +1356,16 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                                 title="强制注销"
                               >
                                 {deregistering === node.node_id ? '⏳' : '✕'}
+                              </button>
+                            )}
+                            {!isMasterNode && isOffline && (
+                              <button
+                                className="btn-ghost btn-danger-ghost"
+                                onClick={() => handleDeleteNode(node.node_id)}
+                                disabled={deletingNode === node.node_id}
+                                title="删除节点记录"
+                              >
+                                {deletingNode === node.node_id ? '⏳' : '🗑'}
                               </button>
                             )}
                           </td>
@@ -1630,6 +1744,12 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                       <span className="ticket-expiry">
                         {formatRemaining(ticket.expires_at)}
                       </span>
+                      <button
+                        className="btn-ghost btn-danger-ghost"
+                        onClick={() => handleDeleteTicket(ticket.ticket_id)}
+                        title="删除此工单"
+                        style={{ marginLeft: 'auto', fontSize: 12, padding: '2px 6px' }}
+                      >🗑 删除</button>
                     </div>
                     {ticket.transfer_reason && (
                       <div className="ticket-reason">{ticket.transfer_reason}</div>
@@ -1668,6 +1788,15 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
               </div>
             )}
 
+            <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                className="btn btn-sm btn-danger-outline"
+                onClick={handleDeleteResolvedTickets}
+                title="删除所有已批准/已拒绝/已过期的工单"
+              >
+                🗑 清理已解决工单
+              </button>
+            </div>
             {reviewTickets.length === 0 && (
               <p className="setting-desc" style={{ marginTop: 8 }}>
                 暂无待处理的审查工单。

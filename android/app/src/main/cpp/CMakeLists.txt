@@ -8,6 +8,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Lite 版本跳过原生编译 — 仅需 HTTP thin 模式，不需要 llama.cpp
+option(QLH_LITE "Skip llama.cpp build for lite variant" OFF)
+if(QLH_LITE)
+    message(STATUS "QLH Lite — 跳过原生库编译（thin-only 模式）")
+    # 构建一个空桩 .so，防止 App 启动时 System.loadLibrary 崩溃
+    add_library(qlh_llama_jni SHARED qlh_llama_jni_stub.cpp)
+    target_link_libraries(qlh_llama_jni android log)
+    return()
+endif()
+
 if(DEFINED ANDROID_ABI)
     message(STATUS "QLH Android ABI: ${ANDROID_ABI}")
     if(NOT ANDROID_ABI STREQUAL "arm64-v8a")

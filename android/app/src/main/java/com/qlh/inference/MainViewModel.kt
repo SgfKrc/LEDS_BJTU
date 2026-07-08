@@ -1,6 +1,9 @@
 package com.qlh.inference
 
 import android.app.Application
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,6 +14,7 @@ import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.ChatRepository
+import com.qlh.inference.network.RegisterNodeRequest
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
@@ -88,6 +92,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
+    private var lastAutoRegisterKey: String = ""
+
     // ---- 仓库（根据模式动态创建 ApiClient 或使用本地引擎） ----
     private val repository = ChatRepository(
         sessionDao = database.sessionDao(),
@@ -141,6 +147,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L
             )
             QlhApplication.instance.inferenceService?.modelContextSize = contextSize
+            autoRegisterAndroidNode()
             refreshModels(showMessage = false)
             refreshRuntimeStatus()
         }
@@ -312,6 +319,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.value = _uiState.value.copy(isLoading = false, error = null)
                     refreshRuntimeStatus()
                 }.onFailure { e ->
+                    QlhLogger.e("MainViewModel", "sendMessage failed", e)
                     _uiState.value = _uiState.value.copy(
                         isLoading = false,
                         error = formatSendError(e)
@@ -349,6 +357,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.value = _uiState.value.copy(isLoading = false, error = null)
                     refreshRuntimeStatus()
                 }.onFailure { e ->
+                    QlhLogger.e("MainViewModel", "retryLastMessage failed", e)
                     _uiState.value = _uiState.value.copy(
                         isLoading = false,
                         error = formatSendError(e)
@@ -419,12 +428,87 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun autoRegisterAndroidNode(force: Boolean = false) {
+        // Lite 变体不参与分布式计算，跳过注册
+        if (BuildConfig.IS_LITE) {
+            QlhLogger.i("MainViewModel", "autoRegisterAndroidNode: lite variant, skip registration")
+            return
+        }
+        val state = _uiState.value
+        if (state.inferenceMode != "thin") return
+        val key = "${state.serverHost}:${state.serverPort}:${state.inferenceMode}"
+        if (!force && key == lastAutoRegisterKey) return
+        lastAutoRegisterKey = key
+
+        val nodeId = settings.getOrCreateAndroidNodeId()
+        val hostname = listOf(
+            android.os.Build.MANUFACTURER,
+            android.os.Build.MODEL,
+        ).filter { it.isNotBlank() }
+            .joinToString(" ")
+            .ifBlank { nodeId }
+
+        // 检测实际网络类型（wifi / mobile / ethernet）
+        val networkType = detectNetworkType()
+
+        val client = ApiClient("http://${state.serverHost}:${state.serverPort}")
+        val result = client.registerAndroidNode(
+            RegisterNodeRequest(
+                nodeId = nodeId,
+                hostname = hostname,
+                networkType = networkType,
+                nodeType = "android",
+            )
+        )
+        result.onSuccess { response ->
+            QlhLogger.i(
+                "MainViewModel",
+                "Android node registered: nodeId=$nodeId status=${response.status} networkType=$networkType host=${state.serverHost}:${state.serverPort}"
+            )
+        }.onFailure { e ->
+            QlhLogger.w(
+                "MainViewModel",
+                "Android node auto-register failed: ${e.message ?: e.javaClass.simpleName}"
+            )
+        }
+    }
+
+    /** 通过 ConnectivityManager 检测当前网络类型。 */
+    private fun detectNetworkType(): String {
+        return try {
+            val cm = getApplication<Application>()
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val network = cm?.activeNetwork ?: return "unknown"
+            val caps = cm.getNetworkCapabilities(network) ?: return "unknown"
+            when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+                else -> "other"
+            }
+        } catch (e: Exception) {
+            QlhLogger.w("MainViewModel", "detectNetworkType failed: ${e.message}")
+            "unknown"
+        }
+    }
+
+    // ==================== 连接测试回调 ====================
+
+    /** 测试连接成功后调用，补一刀自动注册（防止之前因服务端未就绪而失败）。 */
+    fun onConnectionTestSuccess() {
+        viewModelScope.launch {
+            autoRegisterAndroidNode(force = true)
+        }
+    }
+
     // ==================== 设置 ====================
 
     fun setServerHost(host: String) {
         viewModelScope.launch {
             settings.setServerHost(host)
             _uiState.value = _uiState.value.copy(serverHost = host)
+            autoRegisterAndroidNode(force = true)
         }
     }
 
@@ -432,6 +516,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.setServerPort(port)
             _uiState.value = _uiState.value.copy(serverPort = port)
+            autoRegisterAndroidNode(force = true)
         }
     }
 
@@ -440,6 +525,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.setInferenceMode(mode)
             _uiState.value = _uiState.value.copy(inferenceMode = mode)
+            autoRegisterAndroidNode(force = true)
             refreshRuntimeStatus()
         }
     }

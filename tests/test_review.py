@@ -231,12 +231,35 @@ class TestReviewWithDb:
 
     @pytest.fixture(autouse=True)
     def setup_db(self, review_mgr):
-        """确保 DB 已初始化。"""
+        """确保 DB 已初始化，测试后清理本测试创建的工单。"""
         try:
             from db import init_db
             init_db()
         except Exception:
             pytest.skip("数据库不可用")
+        # 记录测试前已存在的 ticket 数量，测试后清理新增的
+        before = set()
+        try:
+            from db import list_review_tickets
+            before = {t["ticket_id"] for t in list_review_tickets()}
+        except Exception:
+            pass
+        yield
+        # 清理本测试创建的工单
+        try:
+            from db import list_review_tickets, delete_review_ticket
+            after = {t["ticket_id"] for t in list_review_tickets()}
+            new_ids = after - before
+            for tid in new_ids:
+                try:
+                    delete_review_ticket(tid)
+                except Exception:
+                    pass
+            if new_ids:
+                import logging
+                logging.getLogger(__name__).info(f"清理了 {len(new_ids)} 个测试工单")
+        except Exception:
+            pass
 
     def test_create_and_get_ticket(self, review_mgr):
         """创建工单并读取"""

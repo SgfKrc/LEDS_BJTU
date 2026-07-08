@@ -1464,6 +1464,37 @@ def list_review_tickets(status: Optional[str] = None) -> list[dict]:
         return [_review_ticket_row_to_dict(r) for r in rows]
 
 
+def delete_review_ticket(ticket_id: str) -> bool:
+    """删除一个审查工单（所有状态均可删除）。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM review_tickets WHERE ticket_id = %s",
+                    (ticket_id,),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.warning(f"删除审查工单失败 ({ticket_id}): {e}")
+        return False
+
+
+def delete_resolved_review_tickets() -> int:
+    """删除所有已解决（approved/rejected/expired）的审查工单，返回删除数量。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM review_tickets WHERE status IN ('approved', 'rejected', 'expired')"
+                )
+                conn.commit()
+                return cur.rowcount
+    except Exception as e:
+        logger.warning(f"批量删除已解决工单失败: {e}")
+        return 0
+
+
 def _review_ticket_row_to_dict(row) -> dict:
     """将数据库行转换为 dict。
 

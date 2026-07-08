@@ -161,6 +161,7 @@ fun MainApp(
                 runtimeStatusLoading = uiState.runtimeStatusLoading,
                 runtimeStatusError = uiState.runtimeStatusError,
                 onRefreshRuntimeStatus = { viewModel.refreshRuntimeStatus() },
+                onConnectionTestSuccess = { viewModel.onConnectionTestSuccess() },
                 modifier = Modifier.padding(innerPadding)
             )
         }

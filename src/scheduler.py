@@ -83,12 +83,6 @@ class NodeRole(str, Enum):
     MASTER = "master"
     CLIENT = "client"
 
-    @staticmethod
-    def client_ids(max_nodes: int) -> list:
-        """根据最大节点数生成从节点 ID 列表 (不含 master)"""
-        return [f"client{i}" for i in range(1, max_nodes)]
-
-
 @dataclass
 class NodeInfo:
     """节点信息（分布式模式下通过 TCP 注册填充）"""
@@ -860,6 +854,9 @@ class Scheduler:
         self._preempt_disabled: bool = False   # 超过 MAX_OVERHEAD_MS 后自动禁用
         self._preempting: bool = False          # 正在执行抢占（防嵌套）
 
+        # 最大节点数（可动态调整）
+        self._max_nodes: int = MAX_NODES
+
         # 流水线请求队列（MLFQ 三级反馈队列，兼容 FIFO）
         self.pipeline_queue = PipelineQueue(
             max_size=PIPELINE_QUEUE_MAX_SIZE,
@@ -1037,10 +1034,19 @@ class Scheduler:
                 )
 
             # 从 DB 恢复所有之前注册过的从节点
+            # 跳过幽灵节点：从未连接过、无地址、无主机名（旧代码预创建的空槽位）
             for nid, row in db_nodes.items():
                 if nid == "master":
                     continue
                 node = self._node_from_db(row)
+                if (not node.address and not node.hostname
+                        and not node.connected_at and not node.last_heartbeat):
+                    logger.info(f"  跳过幽灵节点: {nid}（无连接记录），从数据库清理")
+                    try:
+                        db.delete_node(nid)
+                    except Exception:
+                        pass
+                    continue
                 if RUN_MODE == "distributed":
                     # 分布式模式：从节点尚未重连，标记为 offline
                     node.state = NodeState.OFFLINE
@@ -1075,10 +1081,12 @@ class Scheduler:
                 stored_max = db.get_config("max_nodes", "")
                 if stored_max and stored_max.isdigit():
                     new_max = int(stored_max)
-                    if new_max != MAX_NODES:
+                    if new_max != self._max_nodes:
+                        old = self._max_nodes
+                        self._max_nodes = new_max
                         import config as cfg
                         cfg.MAX_NODES = new_max
-                        logger.info(f"从数据库恢复 max_nodes: {MAX_NODES} → {new_max}")
+                        logger.info(f"从数据库恢复 max_nodes: {old} → {new_max}")
             except Exception:
                 pass
 
@@ -1150,14 +1158,22 @@ class Scheduler:
             logger.error(f"注册失败: Android 节点不能担任 master 角色")
             return False
 
-        # 如果节点不在预定义列表中但仍在 MAX_NODES 范围内，动态添加
+        # 动态添加新节点（需检查容量限制）
         if node_id not in self.nodes:
             if role == NodeRole.MASTER:
                 logger.warning(f"注册失败: 不能动态注册 master 节点")
                 return False
-            # 检查是否在 MAX_NODES 范围内
-            expected_client_ids = NodeRole.client_ids(MAX_NODES)
-            # 也允许用户在 MAX_NODES 之后添加的自定义节点
+            # 容量检查：只统计在线节点（离线/幽灵不占位）
+            online_non_master = [
+                n for n in self.nodes.values()
+                if n.role != "master" and n.is_available()
+            ]
+            if len(online_non_master) >= self._max_nodes - 1:
+                logger.warning(
+                    f"注册失败: 已达到最大在线从节点数量 "
+                    f"({len(online_non_master)}/{self._max_nodes - 1})"
+                )
+                return False
             logger.info(f"动态添加节点: {node_id} (type={node_type})")
             self.nodes[node_id] = NodeInfo(
                 node_id=node_id, role=NodeRole.CLIENT,
@@ -3447,7 +3463,7 @@ class Scheduler:
             "run_mode": RUN_MODE,
             "node_role": self._effective_role(),
             "node_id": self.get_effective_node_id(),
-            "max_nodes": MAX_NODES,
+            "max_nodes": self._max_nodes,
             "network": {
                 "server_ip": server_ip,
                 "server_port": SERVER_PORT,
@@ -3663,8 +3679,8 @@ class Scheduler:
             "master_port": port,
             "node_count": len(self.nodes),
             "online_count": sum(1 for n in self.nodes.values() if n.is_available()),
-            "max_nodes": MAX_NODES,
-            "has_capacity": len(self.nodes) < MAX_NODES,
+            "max_nodes": self._max_nodes,
+            "has_capacity": len(self.nodes) < self._max_nodes,
             "connected_clients": (
                 self._tcp_server.get_client_ids() if self._tcp_server else []
             ),
@@ -3815,7 +3831,7 @@ class Scheduler:
             "node_id": _effective_id,
             "is_master": effective_role == "master",
             "is_client": effective_role == "client",
-            "max_nodes": MAX_NODES,
+            "max_nodes": self._max_nodes,
             "run_mode": RUN_MODE,
             "my_node": my_info.to_dict() if my_info else None,
             "tcp_server_running": self._tcp_server is not None and self._tcp_server._running,
@@ -3841,7 +3857,7 @@ class Scheduler:
         """
         动态调整最大节点数量（仅 master 可调用）。
 
-        增加时自动创建新的 NodeInfo；减少时保留已注册节点（仅移除未注册的空位）。
+        仅修改容量上限，不预创建空槽位。从节点通过 TCP 注册动态加入。
 
         Args:
             new_max: 新的最大节点数 (>= 1, 包含 master)
@@ -3857,60 +3873,49 @@ class Scheduler:
         if new_max < 1:
             return {"status": "invalid", "reason": "max_nodes 至少为 1 (仅 master)"}
 
-        old_max = cfg.MAX_NODES
+        old_max = self._max_nodes
         if new_max == old_max:
             return {"status": "unchanged", "max_nodes": old_max}
 
-        added = []
-        removed = []
-
-        if new_max > old_max:
-            # 扩大：创建新的 client 节点
-            new_client_ids = [f"client{i}" for i in range(old_max, new_max)]
-            for cid in new_client_ids:
-                if cid not in self.nodes:
-                    self.nodes[cid] = NodeInfo(
-                        node_id=cid, role=NodeRole.CLIENT,
-                        state=NodeState.OFFLINE,
-                    )
-                    added.append(cid)
-        else:
-            # 缩小：移除离线且未注册的节点
-            client_ids_to_remove = [f"client{i}" for i in range(new_max, old_max)]
-            for cid in client_ids_to_remove:
-                if cid in self.nodes:
-                    node = self.nodes[cid]
-                    if node.state == NodeState.OFFLINE and not node.address:
-                        del self.nodes[cid]
-                        removed.append(cid)
-                    else:
-                        # 节点在线或已注册，不强制删除
-                        logger.warning(
-                            f"无法移除节点 {cid}: state={node.state.value}, "
-                            f"addr={node.address}，请先注销该节点"
-                        )
-
         cfg.MAX_NODES = new_max
+        self._max_nodes = new_max
+
+        # 清理残留幽灵节点（旧代码扩容时预创建的空槽位，从未连接过）
+        phantoms = []
+        for nid, node in list(self.nodes.items()):
+            if (nid != "master" and node.role != "master"
+                    and not node.address and not node.hostname
+                    and not node.connected_at and not node.last_heartbeat
+                    and node.state == NodeState.OFFLINE):
+                phantoms.append(nid)
+        for pid in phantoms:
+            del self.nodes[pid]
+            logger.info(f"  清理幽灵节点: {pid}")
+        if phantoms:
+            self._layer_config_pushed.clear()
 
         # 持久化到数据库
         db = _get_db()
         if db and _db_available:
             try:
                 db.set_config("max_nodes", str(new_max))
+                for pid in phantoms:
+                    try:
+                        db.delete_node(pid)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.warning(f"max_nodes DB 持久化失败: {e}")
 
-        logger.info(
-            f"最大节点数已更新: {old_max} → {new_max} "
-            f"(添加={added}, 移除={removed})"
-        )
+        logger.info(f"最大节点数已更新: {old_max} → {new_max}"
+                    + (f" (清理幽灵: {phantoms})" if phantoms else ""))
 
         return {
             "status": "ok",
             "max_nodes": new_max,
             "old_max": old_max,
-            "nodes_added": added,
-            "nodes_removed": removed,
+            "nodes_added": [],
+            "nodes_removed": [],
             "total_nodes": len(self.nodes),
         }
 
@@ -5895,14 +5900,36 @@ class Scheduler:
             existing = self.nodes[node_id]
             if existing.role == "master":
                 return {"status": "invalid", "reason": f"'{node_id}' 是主节点，不可覆盖"}
-            return {"status": "exists", "node_id": node_id,
-                    "message": f"节点 '{node_id}' 已存在 (state={existing.state.value})",
+            existing.hostname = hostname or existing.hostname or node_id
+            existing.address = address
+            existing.network_type = network_type
+            existing.node_type = node_type
+            db = _get_db()
+            if db and _db_available:
+                try:
+                    db.upsert_node(
+                        node_id=node_id, role="client", node_type=node_type,
+                        state=existing.state.value,
+                        address=address, hostname=existing.hostname,
+                        network_type=network_type,
+                    )
+                except Exception as e:
+                    logger.warning(f"手动更新节点 DB 持久化失败: {e}")
+            logger.info(
+                f"📝 手动注册节点已更新: {node_id} type={node_type} "
+                f"(hostname={existing.hostname}, addr={address}, state={existing.state.value})"
+            )
+            return {"status": "updated", "node_id": node_id,
+                    "message": f"节点 '{node_id}' 已更新 (state={existing.state.value})",
                     "state": existing.state.value}
 
-        # 检查容量
-        non_master = [n for n in self.nodes.values() if n.role != "master"]
-        if len(non_master) >= MAX_NODES - 1:
-            return {"status": "full", "reason": f"已达到最大从节点数量 ({MAX_NODES - 1})"}
+        # 检查容量：只统计在线/已注册节点（离线/幽灵不占位）
+        online_non_master = [
+            n for n in self.nodes.values()
+            if n.role != "master" and (n.is_available() or n.address)
+        ]
+        if len(online_non_master) >= self._max_nodes - 1:
+            return {"status": "full", "reason": f"已达到最大在册从节点数量 ({self._max_nodes - 1})"}
 
         # 创建节点（初始 offline）
         node = NodeInfo(
@@ -5936,6 +5963,44 @@ class Scheduler:
             "message": f"节点 '{node_id}' 已手动注册，等待 TCP 连接激活",
             "state": "offline",
         }
+
+    def delete_node(self, node_id: str) -> dict:
+        """
+        删除离线节点记录（不同于 deregister：deregister 仅标记 offline）。
+
+        仅允许删除非 master 且当前不在线的节点，常用于移除手动注册的
+        Android/离线占位节点。
+        """
+        if self._effective_role() != "master":
+            return {"status": "denied", "reason": "仅主节点可删除节点"}
+        if node_id == "master":
+            return {"status": "invalid", "reason": "不能删除主节点"}
+        node = self.nodes.get(node_id)
+        if node is None:
+            return {"status": "not_found", "reason": f"节点 '{node_id}' 不存在"}
+        if node.is_available():
+            return {"status": "online", "reason": "节点在线，请先注销后删除"}
+
+        old_node = self.nodes.pop(node_id)
+        self._layer_config_pushed.discard(node_id)
+
+        db = _get_db()
+        if db and _db_available:
+            try:
+                db.delete_node(node_id)
+                db.set_layer_assignments({})
+            except Exception as e:
+                logger.warning(f"删除节点 DB 持久化失败: {e}")
+
+        if self._effective_role() == "master":
+            self._push_node_update_to_all_clients(node_id, "remove", old_node)
+
+        logger.info(
+            f"🗑️ 节点已删除: {node_id} type={old_node.node_type} "
+            f"hostname={old_node.hostname}"
+        )
+        return {"status": "deleted", "node_id": node_id,
+                "message": f"节点 '{node_id}' 已删除"}
 
     def check_master_health(self) -> dict:
         """

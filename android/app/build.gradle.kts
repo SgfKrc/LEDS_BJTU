@@ -31,19 +31,6 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags += listOf("-std=c++17")
-                arguments += listOf(
-                    "-DANDROID_STL=c++_shared"
-                )
-            }
-        }
     }
 
     signingConfigs {
@@ -99,6 +86,17 @@ android {
             versionNameSuffix = ""
             buildConfigField("boolean", "IS_LITE", "false")
             signingConfig = signingConfigs.findByName("releaseFull")
+
+            ndk {
+                abiFilters += listOf("arm64-v8a")
+            }
+
+            externalNativeBuild {
+                cmake {
+                    cppFlags += listOf("-std=c++17")
+                    arguments += listOf("-DANDROID_STL=c++_shared")
+                }
+            }
         }
         create("lite") {
             dimension = "version"
@@ -106,6 +104,16 @@ android {
             versionNameSuffix = "-lite"
             buildConfigField("boolean", "IS_LITE", "true")
             signingConfig = signingConfigs.findByName("releaseLite")
+
+            ndk {
+                abiFilters += listOf("arm64-v8a")
+            }
+
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DQLH_LITE=ON")
+                }
+            }
         }
     }
 
@@ -118,16 +126,16 @@ android {
         jvmTarget = "17"
     }
 
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
             version = "3.22.1"
-        }
-    }
-
-    packaging {
-        jniLibs {
-            useLegacyPackaging = false
         }
     }
 

@@ -84,6 +84,25 @@ data class ClusterNode(
     val avgRttMs: Float = 0f
 )
 
+data class RegisterNodeRequest(
+    @SerializedName("node_id")
+    val nodeId: String,
+    val hostname: String,
+    val address: String = "",
+    @SerializedName("network_type")
+    val networkType: String = "unknown",
+    @SerializedName("node_type")
+    val nodeType: String = "android"
+)
+
+data class RegisterNodeResponse(
+    val status: String = "",
+    @SerializedName("node_id")
+    val nodeId: String? = null,
+    val message: String? = null,
+    val state: String? = null
+)
+
 // ================================================================
 // API 客户端
 // ================================================================
@@ -255,6 +274,27 @@ class ApiClient(
 
             val response = executeAsync(request)
             Result.success(response.isSuccessful)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Android 薄客户端通过 HTTP 向主节点登记自身存在（非 TCP worker 注册）。 */
+    suspend fun registerAndroidNode(request: RegisterNodeRequest): Result<RegisterNodeResponse> = withContext(Dispatchers.IO) {
+        try {
+            val body = gson.toJson(request).toRequestBody(jsonMediaType)
+            val httpRequest = Request.Builder()
+                .url("$baseUrl/api/cluster/nodes/register")
+                .post(body)
+                .header("Content-Type", "application/json")
+                .build()
+
+            val response = executeAsync(httpRequest)
+            val responseBody = response.body?.string() ?: "{}"
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
+            }
+            Result.success(gson.fromJson(responseBody, RegisterNodeResponse::class.java))
         } catch (e: Exception) {
             Result.failure(e)
         }

@@ -12,6 +12,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import java.util.UUID
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "qlh_settings")
 
@@ -21,6 +22,7 @@ class SettingsDataStore(private val context: Context) {
         // ---- 主节点连接 ----
         val KEY_SERVER_HOST = stringPreferencesKey("server_host")
         val KEY_SERVER_PORT = intPreferencesKey("server_port")
+        val KEY_ANDROID_NODE_ID = stringPreferencesKey("android_node_id")
 
         // ---- 推理模式 ----
         val KEY_INFERENCE_MODE = stringPreferencesKey("inference_mode")  // "thin" | "full"
@@ -39,7 +41,7 @@ class SettingsDataStore(private val context: Context) {
         val KEY_MODEL_STORAGE_MODE = stringPreferencesKey("model_storage_mode")
 
         // ---- 默认值 ----
-        const val DEFAULT_HOST = "192.168.1.100"
+        const val DEFAULT_HOST = "100.90.76.108"
         const val DEFAULT_PORT = 8000
         const val DEFAULT_MODE = "thin"
         const val DEFAULT_MAX_TOKENS = 512
@@ -120,6 +122,14 @@ class SettingsDataStore(private val context: Context) {
     suspend fun getSelectedModelUri(): String = context.dataStore.data.first()[KEY_SELECTED_MODEL_URI] ?: ""
     suspend fun getModelStorageMode(): String =
         context.dataStore.data.first()[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
+
+    suspend fun getOrCreateAndroidNodeId(): String {
+        val existing = context.dataStore.data.first()[KEY_ANDROID_NODE_ID]
+        if (!existing.isNullOrBlank()) return existing
+        val generated = "android-${UUID.randomUUID().toString().take(8)}"
+        context.dataStore.edit { it[KEY_ANDROID_NODE_ID] = generated }
+        return generated
+    }
 
     // ==================== 写入 ====================
 

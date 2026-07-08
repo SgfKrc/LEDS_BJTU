@@ -401,6 +401,104 @@ class TestNodeRTT:
 
 
 # ================================================================
+# Android 节点手动注册 / 删除 测试
+# ================================================================
+
+class TestAndroidNodeManagement:
+    """测试 Android 节点注册与离线删除能力。"""
+
+    @pytest.fixture
+    def sched(self):
+        s = Scheduler()
+        yield s
+        # 清理测试节点（内存 + 数据库）
+        test_ids = [nid for nid in s.nodes if nid != "master"]
+        for nid in test_ids:
+            try:
+                del s.nodes[nid]
+            except Exception:
+                pass
+            try:
+                from db import delete_node
+                delete_node(nid)
+            except Exception:
+                pass
+
+    def test_manual_register_android_node(self, sched):
+        """手动注册 Android 节点应保存 node_type=android 且初始离线。"""
+        result = sched.manual_register_node(
+            "android-test", hostname="Android Phone",
+            network_type="wifi", node_type="android",
+        )
+        assert result["status"] == "registered"
+        node = sched.nodes["android-test"]
+        assert node.node_type == "android"
+        assert node.hostname == "Android Phone"
+        assert node.network_type == "wifi"
+        assert node.state == NodeState.OFFLINE
+
+    def test_manual_register_existing_android_updates_metadata(self, sched):
+        """重复注册同一 Android 节点应更新元数据而非失败。"""
+        sched.manual_register_node("android-test", hostname="Old", node_type="android")
+        result = sched.manual_register_node(
+            "android-test", hostname="New", address="1.2.3.4:8888",
+            network_type="wifi", node_type="android",
+        )
+        assert result["status"] == "updated"
+        node = sched.nodes["android-test"]
+        assert node.hostname == "New"
+        assert node.address == "1.2.3.4:8888"
+        assert node.network_type == "wifi"
+        assert node.node_type == "android"
+
+    def test_delete_node_rejects_master_and_missing(self, sched):
+        """删除 master / 不存在节点应返回明确状态。"""
+        assert sched.delete_node("master")["status"] == "invalid"
+        assert sched.delete_node("missing")["status"] == "not_found"
+
+    def test_delete_node_rejects_online_node(self, sched):
+        """在线节点需要先注销，不能直接删除。"""
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        assert sched.delete_node("client1")["status"] == "online"
+        assert "client1" in sched.nodes
+
+    def test_delete_offline_android_node_removes_and_pushes_remove(self, sched, monkeypatch):
+        """离线 Android 节点删除后应从内存移除并广播 remove。"""
+        class DummyDb:
+            def __init__(self):
+                self.deleted = []
+                self.created = []
+                self.layer_reset = False
+            def delete_node(self, node_id):
+                self.deleted.append(node_id)
+                return True
+            def set_layer_assignments(self, assignments):
+                self.layer_reset = True
+            def upsert_node(self, **kwargs):
+                self.created.append(kwargs.get("node_id"))
+                pass
+
+        dummy = DummyDb()
+        import scheduler as scheduler_mod
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: dummy)
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+
+        sched.manual_register_node("android-test", hostname="Phone", node_type="android")
+        assert "android-test" in dummy.created
+        pushed = []
+        sched._push_node_update_to_all_clients = lambda *args: pushed.append(args)
+
+        result = sched.delete_node("android-test")
+        assert result["status"] == "deleted"
+        assert "android-test" not in sched.nodes
+        assert dummy.deleted == ["android-test"]
+        assert dummy.layer_reset is True
+        assert pushed and pushed[0][0] == "android-test" and pushed[0][1] == "remove"
+
+
+# ================================================================
 # _get_node_vram_mb / _check_vram_constraint 测试
 # ================================================================
 

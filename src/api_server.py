@@ -227,6 +227,26 @@ async def startup_device_detection():
     except Exception as e:
         logger.warning(f"邮件投票轮询器启动失败: {e}")
 
+    # P3: 启动审查工单过期检查后台线程（仅 master，每 5 分钟）
+    try:
+        if scheduler._effective_role() == "master":
+            import threading as _th2
+            def _review_expire_loop():
+                import time as _time
+                from review import ReviewManager
+                _time.sleep(120)  # 启动后等 2 分钟再开始（避免空跑）
+                while getattr(scheduler, '_running', True):
+                    try:
+                        ReviewManager().resolve_expired()
+                    except Exception:
+                        pass
+                    _time.sleep(300)  # 每 5 分钟检查一次
+            _t = _th2.Thread(target=_review_expire_loop, daemon=True, name="review-expire")
+            _t.start()
+            logger.info("⏳ 审查工单过期检查线程已启动 (master)")
+    except Exception as e:
+        logger.warning(f"审查工单过期检查启动失败: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_db():
@@ -269,8 +289,8 @@ async def shutdown_db():
 
 class LoadModelRequest(BaseModel):
     engine: str = Field(
-        default="auto",
-        description="推理引擎: auto (自动检测) | llama_cpp (GGUF) | pytorch (Safetensors)",
+        default="llama_cpp",
+        description="推理引擎: llama_cpp (GGUF, 推荐) | pytorch (Safetensors) | auto",
     )
     quant_type: str = Field(
         default="int4",
@@ -1378,7 +1398,7 @@ async def get_status():
         "run_mode": RUN_MODE,
         "node_role": scheduler._effective_role(),
         "node_id": scheduler.get_effective_node_id(),
-        "max_nodes": MAX_NODES,
+        "max_nodes": scheduler._max_nodes,
         "gpu": gpu_info,
         "kv_cache": kv_stats,
         "conversation_turns": len(_get_active_history()),
@@ -1873,15 +1893,87 @@ def _execute_chat_full(req: ChatRequest) -> dict:
         raise HTTPException(500, f"推理失败: {str(e)}")
 
 
+def _auto_load_default_model():
+    """自动加载默认模型（用于 thin client / Android 首次请求时服务端无模型的情况）。"""
+    global model_loaded, current_quant, kv_cache, conversation_stats
+
+    import config as cfg
+    import glob
+
+    # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
+    gguf_candidates = []
+    gguf_configured = cfg.GGUF_MODEL_PATH
+    if os.path.isfile(gguf_configured):
+        gguf_candidates.append(gguf_configured)
+    # 搜索 models 目录下的所有 .gguf 文件
+    models_dir = os.path.dirname(gguf_configured)
+    if os.path.isdir(models_dir):
+        for f in sorted(glob.glob(os.path.join(models_dir, "*.gguf"))):
+            if f not in gguf_candidates:
+                gguf_candidates.append(f)
+
+    if gguf_candidates:
+        gguf_path = gguf_candidates[0]
+        engine = "llama_cpp"
+        model_path = gguf_path
+        quant = "int4"
+        if len(gguf_candidates) > 1:
+            logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {os.path.basename(gguf_path)}")
+    elif os.path.isdir(cfg.MODEL_PATH):
+        # 2. 回退：Safetensors 路径 — 优先 llama.cpp（避免 transformers 兼容问题）
+        engine = "llama_cpp"  # 在 CPU 上也能运行
+        model_path = cfg.MODEL_PATH
+        quant = cfg.QUANT_TYPE
+    else:
+        raise FileNotFoundError(
+            f"未找到可自动加载的模型文件。已检查:\n"
+            f"  GGUF 配置路径: {gguf_configured}\n"
+            f"  Safetensors 路径: {cfg.MODEL_PATH}\n"
+            f"  models 目录: {models_dir}"
+        )
+
+    logger.info(f"自动加载默认模型: path={model_path}, engine={engine}")
+
+    t0 = time.time()
+    cfg.INFERENCE_ENGINE = engine
+    cfg.QUANT_TYPE = quant
+    cfg.USE_COMPILE = False
+
+    model_manager.load_model(
+        model_path=model_path,
+        quant_type=quant,
+        profile=device_profile,
+        engine=engine,
+    )
+
+    _init_kv_cache()
+    conversation_stats = {
+        "total_prompt_tokens": 0,
+        "total_generated_tokens": 0,
+        "total_time_seconds": 0.0,
+        "rounds": 0,
+    }
+    model_loaded = True
+    current_quant = quant
+    elapsed = time.time() - t0
+    logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
     发送消息并获取模型回复（多轮对话）。
 
     自动维护对话历史 + KV 缓存。
+    若模型未加载，自动尝试加载默认模型。
     """
     if not model_loaded or not model_manager.is_loaded:
-        raise HTTPException(400, "模型未加载，请先在控制面板中选择并加载模型")
+        try:
+            _auto_load_default_model()
+        except FileNotFoundError:
+            raise HTTPException(400, "模型未加载且未找到可自动加载的模型文件。请先在控制面板中加载模型。")
+        except Exception as e:
+            raise HTTPException(500, f"自动加载模型失败: {e}。请手动在控制面板中加载模型。")
 
     result = _execute_chat_full(req)
     return ChatResponse(
@@ -1926,8 +2018,11 @@ async def chat_stream(req: ChatRequest):
         # ================================================================
         if req.streaming_mode == "full":
             if not model_loaded or not model_manager.is_loaded:
-                yield f"data: {_json.dumps({'done': True, 'error': '模型未加载，请先在控制面板中选择并加载模型'}, ensure_ascii=False)}\n\n"
-                return
+                try:
+                    _auto_load_default_model()
+                except Exception as e:
+                    yield f"data: {_json.dumps({'done': True, 'error': f'自动加载模型失败: {e}'}, ensure_ascii=False)}\n\n"
+                    return
             import asyncio
             loop = asyncio.get_event_loop()
             try:
@@ -2352,6 +2447,28 @@ async def deregister_node(node_id: str):
     }
 
 
+@app.delete("/api/cluster/nodes/{node_id}")
+async def delete_cluster_node(node_id: str):
+    """
+    删除离线节点记录（区别于 deregister：deregister 仅标记离线）。
+
+    用于移除手动注册的 Android / 离线占位节点。
+    """
+    result = scheduler.delete_node(node_id)
+    status = result.get("status")
+    if status == "denied":
+        raise HTTPException(403, result.get("reason", "权限不足"))
+    if status == "invalid":
+        raise HTTPException(400, result.get("reason", "无效节点"))
+    if status == "not_found":
+        raise HTTPException(404, result.get("reason", "节点不存在"))
+    if status == "online":
+        raise HTTPException(409, result.get("reason", "节点在线，无法删除"))
+    if status != "deleted":
+        raise HTTPException(500, result.get("reason", "删除节点失败"))
+    return result
+
+
 @app.get("/api/cluster/config")
 async def get_cluster_config():
     """
@@ -2379,8 +2496,7 @@ async def update_max_nodes(req: UpdateMaxNodesRequest):
     """
     动态调整最大节点数量（仅主节点可调用）。
 
-    增加时自动创建新的 client 节点槽位；
-    减少时仅移除离线且未注册的空位，保留在线节点。
+    仅修改容量上限，不预创建空槽位。从节点通过 TCP 注册动态加入。
     """
     result = scheduler.update_max_nodes(req.max_nodes)
     if result.get("status") == "denied":
@@ -2989,6 +3105,32 @@ async def trigger_expire_check():
         return {"expired": expired, "count": len(expired)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"过期检查失败: {e}")
+
+
+@app.delete("/api/cluster/review/tickets/{ticket_id}")
+async def delete_review_ticket(ticket_id: str):
+    """删除单个审查工单（所有状态均可）。"""
+    try:
+        from review import ReviewManager
+        ok = ReviewManager().delete_ticket(ticket_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"工单 {ticket_id} 不存在或删除失败")
+        return {"status": "deleted", "ticket_id": ticket_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除工单失败: {e}")
+
+
+@app.delete("/api/cluster/review/tickets")
+async def delete_resolved_review_tickets():
+    """批量删除所有已解决（approved/rejected/expired）的审查工单。"""
+    try:
+        from review import ReviewManager
+        count = ReviewManager().delete_resolved()
+        return {"status": "deleted", "count": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量删除工单失败: {e}")
 
 
 @app.post("/api/cluster/review/mail-poll")

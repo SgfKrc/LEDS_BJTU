@@ -41,7 +41,7 @@ export async function loadModel(engine, quantType, useCompile = false, modelId =
   return request('/models/load', {
     method: 'POST',
     body: JSON.stringify({
-      engine: engine || 'auto',
+      engine: engine || 'llama_cpp',
       quant_type: quantType,
       use_compile: useCompile,
       ...(modelId ? { model_id: modelId } : {}),
@@ -227,6 +227,12 @@ export async function deregisterNode(nodeId) {
   });
 }
 
+export async function deleteClusterNode(nodeId) {
+  return request(`/cluster/nodes/${encodeURIComponent(nodeId)}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function fetchClusterConfig() {
   return request('/cluster/config');
 }
@@ -330,7 +336,13 @@ export async function resetMasterIdentity(confirm = 'reset') {
   });
 }
 
-export async function manualRegisterNode(nodeId, hostname = '', address = '', networkType = 'unknown') {
+export async function manualRegisterNode(
+  nodeId,
+  hostname = '',
+  address = '',
+  networkType = 'unknown',
+  nodeType = 'pc',
+) {
   return request('/cluster/nodes/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -338,6 +350,7 @@ export async function manualRegisterNode(nodeId, hostname = '', address = '', ne
       hostname: hostname,
       address: address,
       network_type: networkType,
+      node_type: nodeType,
     }),
   });
 }
@@ -486,6 +499,16 @@ export async function checkCanVote() {
 
 export async function expireReviewCheck() {
   return request('/cluster/review/expire-check', { method: 'POST' });
+}
+
+export async function deleteReviewTicket(ticketId) {
+  return request(`/cluster/review/tickets/${encodeURIComponent(ticketId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function deleteResolvedReviewTickets() {
+  return request('/cluster/review/tickets', { method: 'DELETE' });
 }
 
 // ---- 请求队列管理 (Phase 3) ----

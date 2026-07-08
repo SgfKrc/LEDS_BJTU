@@ -373,6 +373,32 @@ class ReviewManager:
             logger.warning(f"查找已批准工单失败: {e}")
             return None
 
+    # ---- 删除 ----
+
+    def delete_ticket(self, ticket_id: str) -> bool:
+        """删除单个工单（所有状态均可）。"""
+        try:
+            from db import delete_review_ticket
+            result = delete_review_ticket(ticket_id)
+            if result:
+                logger.info(f"审查工单已删除: {ticket_id}")
+            return result
+        except Exception as e:
+            logger.warning(f"删除工单失败 ({ticket_id}): {e}")
+            return False
+
+    def delete_resolved(self) -> int:
+        """删除所有已解决（approved/rejected/expired）的工单。"""
+        try:
+            from db import delete_resolved_review_tickets
+            count = delete_resolved_review_tickets()
+            if count > 0:
+                logger.info(f"已清理 {count} 个已解决审查工单")
+            return count
+        except Exception as e:
+            logger.warning(f"批量清理工单失败: {e}")
+            return 0
+
     # ---- 过期处理 ----
 
     def resolve_expired(self) -> list[str]:
