@@ -45,6 +45,8 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
+
 # 数据库模块（延迟导入，避免 psycopg2 未安装时直接崩溃）
 _db = None
 _db_available = False
@@ -842,8 +844,13 @@ class Scheduler:
         self._pipeline_results: dict = {}       # key → result data
         self._pipeline_events: dict = {}        # key → threading.Event
         self._pipeline_lock = threading.Lock()
+        self._nodes_lock = threading.RLock()    # Phase 2.1: 保护 self.nodes 并发读写（可重入）
+        self._kv_cache_lock = threading.Lock()   # Phase 2.2: 保护 _kv_cache 并发读写
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
         self._layer_config_pushed: set = set()  # 已成功推送层配置的从节点 ID（就绪检查用）
+        self._pipeline_accounted_tasks: set = set()  # 主节点侧：已完成记账的流水线任务
+        self._local_pipeline_counted_tasks: set = set()  # 从节点侧：已本地计数的流水线任务
+        self._local_pipeline_error_tasks: set = set()    # 从节点侧：已本地计错的流水线任务
         self._inference_lock = threading.Lock()  # GPU 推理互斥锁（防止并发执行）
 
         # ---- 协同抢占状态 (Phase 2) ----
@@ -1048,8 +1055,10 @@ class Scheduler:
                         pass
                     continue
                 if RUN_MODE == "distributed":
-                    # 分布式模式：从节点尚未重连，标记为 offline
-                    node.state = NodeState.OFFLINE
+                    # 分布式模式：PC 从节点尚未 TCP 重连，标记为 offline。
+                    # Android HTTP 薄客户端不依赖 TCP，保持 DB 中记录的状态。
+                    if node.node_type != "android":
+                        node.state = NodeState.OFFLINE
                 self.nodes[nid] = node
                 logger.info(f"  恢复从节点: {nid} (state={node.state.value})")
 
@@ -1159,42 +1168,47 @@ class Scheduler:
             return False
 
         # 动态添加新节点（需检查容量限制）
-        if node_id not in self.nodes:
-            if role == NodeRole.MASTER:
-                logger.warning(f"注册失败: 不能动态注册 master 节点")
-                return False
-            # 容量检查：只统计在线节点（离线/幽灵不占位）
-            online_non_master = [
-                n for n in self.nodes.values()
-                if n.role != "master" and n.is_available()
-            ]
-            if len(online_non_master) >= self._max_nodes - 1:
-                logger.warning(
-                    f"注册失败: 已达到最大在线从节点数量 "
-                    f"({len(online_non_master)}/{self._max_nodes - 1})"
+        # Phase 2.1+: 所有 self.nodes 读写均在 _nodes_lock 保护下
+        # Phase 5 review H4: 属性写入也纳入锁内，防止与 deregister_node TOCTOU
+        with self._nodes_lock:
+            if node_id not in self.nodes:
+                if role == NodeRole.MASTER:
+                    logger.warning(f"注册失败: 不能动态注册 master 节点")
+                    return False
+                # 容量检查：只统计在线节点（离线/幽灵不占位）
+                online_non_master = [
+                    n for n in self.nodes.values()
+                    if n.role != "master" and n.is_available()
+                ]
+                if len(online_non_master) >= self._max_nodes - 1:
+                    logger.warning(
+                        f"注册失败: 已达到最大在线从节点数量 "
+                        f"({len(online_non_master)}/{self._max_nodes - 1})"
+                    )
+                    return False
+                logger.info(f"动态添加节点: {node_id} (type={node_type})")
+                self.nodes[node_id] = NodeInfo(
+                    node_id=node_id, role=NodeRole.CLIENT,
+                    node_type=node_type,
+                    state=NodeState.OFFLINE,
                 )
+
+            node = self.nodes[node_id]
+
+            if node.role == NodeRole.MASTER:
+                logger.warning(f"注册失败: {node_id} 角色为 master，不可被注册覆盖")
                 return False
-            logger.info(f"动态添加节点: {node_id} (type={node_type})")
-            self.nodes[node_id] = NodeInfo(
-                node_id=node_id, role=NodeRole.CLIENT,
-                node_type=node_type,
-                state=NodeState.OFFLINE,
-            )
 
-        node = self.nodes[node_id]
-        if node.role == NodeRole.MASTER:
-            logger.warning(f"注册失败: {node_id} 角色为 master，不可被注册覆盖")
-            return False
-
-        node.state = NodeState.ONLINE
-        node.node_type = node_type
-        node.model_sha256 = model_sha256
-        node.address = address
-        node.hostname = hostname
-        node.device_info = device_info or {}
-        node.network_type = network_type
-        node.connected_at = time.time()
-        node.last_heartbeat = time.time()
+            # NodeInfo 字段更新
+            node.state = NodeState.ONLINE
+            node.node_type = node_type
+            node.model_sha256 = model_sha256
+            node.address = address
+            node.hostname = hostname
+            node.device_info = device_info or {}
+            node.network_type = network_type
+            node.connected_at = time.time()
+            node.last_heartbeat = time.time()
 
         # 持久化到数据库
         db = _get_db()
@@ -1241,17 +1255,18 @@ class Scheduler:
         Returns:
             注销是否成功
         """
-        if node_id not in self.nodes:
-            return False
+        with self._nodes_lock:
+            if node_id not in self.nodes:
+                return False
 
-        node = self.nodes[node_id]
-        if node.role == NodeRole.MASTER:
-            return False  # master 不可注销
+            node = self.nodes[node_id]
+            if node.role == NodeRole.MASTER:
+                return False  # master 不可注销
 
-        old_state = node.state
-        node.state = NodeState.OFFLINE
-        node.address = ""
-        node.connected_at = 0.0
+            old_state = node.state
+            node.state = NodeState.OFFLINE
+            node.address = ""
+            node.connected_at = 0.0
 
         # 持久化到数据库
         db = _get_db()
@@ -1280,54 +1295,336 @@ class Scheduler:
 
     def update_node_state(self, node_id: str, state: NodeState) -> None:
         """更新节点状态"""
-        if node_id in self.nodes:
-            old_state = self.nodes[node_id].state
-            self.nodes[node_id].state = state
-            self.nodes[node_id].last_heartbeat = time.time()
-            logger.info(f"节点 {node_id} 状态变更: {old_state.value} -> {state.value}")
-        else:
-            logger.warning(f"未知节点: {node_id}")
+        with self._nodes_lock:
+            if node_id in self.nodes:
+                old_state = self.nodes[node_id].state
+                self.nodes[node_id].state = state
+                self.nodes[node_id].last_heartbeat = time.time()
+                logger.info(f"节点 {node_id} 状态变更: {old_state.value} -> {state.value}")
+            else:
+                logger.warning(f"未知节点: {node_id}")
 
-    def record_task_complete(self, node_id: str = None, success: bool = True) -> None:
+    def record_task_complete(self, node_id: str = None, success: bool = True) -> bool:
         """
         记录一次推理任务完成。
 
         Args:
             node_id: 执行推理的节点（默认本节点）
             success: 是否成功
+
+        Returns:
+            True = 成功更新了已知节点；False = 节点未知或更新失败。
         """
         nid = node_id or self.get_effective_node_id()
-        if nid in self.nodes:
+        with self._nodes_lock:
+            if nid not in self.nodes:
+                logger.warning(
+                    f"任务计数跳过：未知节点 {nid}，"
+                    f"当前已知节点={list(self.nodes.keys())}"
+                )
+                return False
+
             if success:
                 self.nodes[nid].task_count += 1
             else:
                 self.nodes[nid].error_count += 1
             self.nodes[nid].last_heartbeat = time.time()
+            node_snapshot = self.nodes[nid]  # 锁内快照，供外部 I/O 使用
+
+        db = _get_db()
+        if db and _db_available:
+            try:
+                db.update_node_state(
+                    node_id=nid,
+                    state=node_snapshot.state.value,
+                    last_heartbeat=node_snapshot.last_heartbeat,
+                    task_count=node_snapshot.task_count,
+                    error_count=node_snapshot.error_count,
+                )
+            except Exception as e:
+                logger.debug(f"任务计数 DB 更新失败: {nid}: {e}", exc_info=True)
+
+        if self._effective_role() == "master":
+            try:
+                self._push_node_update_to_all_clients(nid, "update", node_snapshot)
+            except Exception:
+                pass
+        return True
 
     def record_task_error(self, node_id: str = None) -> None:
         """记录一次推理任务失败（便捷方法）"""
         self.record_task_complete(node_id, success=False)
 
+    def _record_local_pipeline_participation(self, task_id: str,
+                                             success: bool = True) -> bool:
+        """从节点本地记录一次流水线参与，同一 task 只记一次。"""
+        if not task_id:
+            return False
+        task_set = (self._local_pipeline_counted_tasks if success
+                    else self._local_pipeline_error_tasks)
+        if task_id in task_set:
+            return False
+        task_set.add(task_id)
+        return self.record_task_complete(success=success)
+
+    def _record_pipeline_task_accounting(self, task_id: str,
+                                         pipeline_nodes: list,
+                                         success: bool = True) -> dict:
+        """
+        主节点侧记录一次分布式流水线任务参与情况。
+
+        语义：每个完成的用户请求，master 计 1 次服务请求，每个实际参与的
+        PC worker 计 1 次参与请求。按 task_id 幂等，避免 streaming / retry 重复计数。
+        """
+        if not task_id:
+            task_id = f"anonymous_{time.time()}"
+        if task_id in self._pipeline_accounted_tasks:
+            return {
+                "task_id": task_id,
+                "deduplicated": True,
+                "counted_nodes": [],
+                "skipped_unknown_nodes": [],
+                "accounting_errors": [],
+            }
+        self._pipeline_accounted_tasks.add(task_id)
+
+        ordered_nodes = [self.get_effective_node_id()]
+        for node in pipeline_nodes or []:
+            nid = node.get("node_id") if isinstance(node, dict) else str(node)
+            if nid and nid not in ordered_nodes:
+                ordered_nodes.append(nid)
+
+        counted = []
+        skipped = []
+        errors = []
+        for nid in ordered_nodes:
+            try:
+                if self.record_task_complete(nid, success=success):
+                    counted.append(nid)
+                else:
+                    skipped.append(nid)
+            except Exception as e:
+                errors.append({"node_id": nid, "error": str(e)})
+
+        return {
+            "task_id": task_id,
+            "deduplicated": False,
+            "success": success,
+            "counted_nodes": counted,
+            "workers_counted": [nid for nid in counted if nid != self.get_effective_node_id()],
+            "skipped_unknown_nodes": skipped,
+            "accounting_errors": errors,
+        }
+
+    def register_android_client(self, node_id: str, hostname: str = "",
+                                address: str = "", network_type: str = "unknown",
+                                device_info: dict = None,
+                                client_mode: str = "thin",
+                                app_variant: str = "full",
+                                app_version: str = "",
+                                http_peer: str = "") -> dict:
+        """登记 Android HTTP 薄客户端在线状态（不是 TCP worker 注册）。"""
+        if self._effective_role() != "master":
+            return {"status": "denied", "reason": "仅主节点可登记 Android 客户端"}
+        if not node_id or node_id == "master":
+            return {"status": "invalid", "reason": "Android node_id 无效"}
+
+        now = time.time()
+        info = dict(device_info or {})
+        info.update({
+            "connection_type": "http_thin",
+            "pipeline_worker": False,
+            "client_mode": client_mode or "thin",
+            "app_variant": app_variant or "full",
+            "app_version": app_version or "",
+        })
+        if http_peer:
+            info["http_peer"] = http_peer
+
+        with self._nodes_lock:
+            existing = self.nodes.get(node_id)
+            is_new = existing is None
+            if is_new:
+                existing = NodeInfo(
+                    node_id=node_id,
+                    role=NodeRole.CLIENT,
+                    node_type="android",
+                    state=NodeState.ONLINE,
+                    connected_at=now,
+                )
+                self.nodes[node_id] = existing
+            elif existing.role == NodeRole.MASTER:
+                return {"status": "invalid", "reason": f"'{node_id}' 是主节点，不可覆盖"}
+
+            existing.node_type = "android"
+            existing.role = NodeRole.CLIENT
+            existing.state = NodeState.ONLINE
+            existing.hostname = hostname or existing.hostname or node_id
+            existing.address = address or existing.address or ""
+            existing.network_type = network_type or existing.network_type or "unknown"
+            existing.device_info = info
+            if not existing.connected_at:
+                existing.connected_at = now
+            existing.last_heartbeat = now
+
+        db = _get_db()
+        if db and _db_available:
+            try:
+                db.upsert_node(
+                    node_id=node_id,
+                    role="client",
+                    node_type="android",
+                    state="online",
+                    address=existing.address,
+                    hostname=existing.hostname,
+                    device_info=existing.device_info,
+                    network_type=existing.network_type,
+                    connected_at=existing.connected_at,
+                    last_heartbeat=existing.last_heartbeat,
+                    task_count=existing.task_count,
+                    error_count=existing.error_count,
+                    model_sha256=existing.model_sha256,
+                )
+            except Exception as e:
+                logger.warning(f"Android 客户端登记 DB 持久化失败: {e}")
+
+        if self._effective_role() == "master":
+            self._push_node_update_to_all_clients(
+                node_id, "add" if is_new else "update", existing
+            )
+
+        logger.info(
+            f"📱 Android HTTP 客户端在线: {node_id} host={existing.hostname} "
+            f"net={existing.network_type} peer={http_peer}"
+        )
+        return {
+            "status": "registered" if is_new else "updated",
+            "node_id": node_id,
+            "state": existing.state.value,
+            "message": "Android HTTP thin client online",
+        }
+
+    def _refresh_http_client_states(self, now: float = None) -> None:
+        """按 last_heartbeat 将过期的 Android HTTP 薄客户端标记为 offline。"""
+        now = now or time.time()
+        changed = []
+        with self._nodes_lock:
+            for node in self.nodes.values():
+                if node.node_type != "android":
+                    continue
+                info = node.device_info or {}
+                if info.get("connection_type") != "http_thin":
+                    continue
+                if node.state == NodeState.ONLINE and node.last_heartbeat:
+                    if now - node.last_heartbeat > ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS:
+                        node.state = NodeState.OFFLINE
+                        changed.append(node)
+
+        if not changed:
+            return
+
+        db = _get_db()
+        for node in changed:
+            if db and _db_available:
+                try:
+                    db.update_node_state(node.node_id, "offline")
+                except Exception as e:
+                    logger.warning(f"Android 客户端过期状态 DB 更新失败: {e}")
+            if self._effective_role() == "master":
+                self._push_node_update_to_all_clients(node.node_id, "update", node)
+            logger.info(f"📱 Android HTTP 客户端心跳过期: {node.node_id} → offline")
+
     def get_available_nodes(self) -> list:
         """获取所有可用节点（含状态字典）"""
-        return [n.to_dict() for n in self.nodes.values() if n.is_available()]
+        with self._nodes_lock:
+            return [n.to_dict() for n in self.nodes.values() if n.is_available()]
 
     def check_nodes_ready(self) -> bool:
-        """检查所有已注册从节点是否就绪（用于分布式模式）"""
+        """检查 PC worker 是否就绪（Android HTTP 薄客户端不参与分布式计算）。"""
         if RUN_MODE == "single":
             return True
-        # 获取所有非 master 节点
-        clients = [n for n in self.nodes.values() if n.role != NodeRole.MASTER]
-        if not clients:
-            return True  # 没有从节点也算就绪（单节点集群）
-        for n in clients:
-            if not n.is_available():
-                return False
+        self._refresh_http_client_states()
+        with self._nodes_lock:
+            clients = [
+                n for n in self.nodes.values()
+                if n.role != NodeRole.MASTER and n.node_type == "pc"
+            ]
+            if not clients:
+                return True  # 没有 PC 从节点也算就绪（单节点集群）
+            for n in clients:
+                if not n.is_available():
+                    return False
         return True
 
     # ================================================================
     # 动态模型分层
     # ================================================================
+
+    @staticmethod
+    def _gpu_is_integrated(gpu: dict) -> bool:
+        """判断 GPU 是否为集显；兼容旧画像缺少 is_integrated 字段的情况。"""
+        if not isinstance(gpu, dict):
+            return True
+        if "is_integrated" in gpu:
+            return bool(gpu.get("is_integrated"))
+        gpu_type = str(gpu.get("gpu_type", "")).lower()
+        if gpu_type == "discrete":
+            return False
+        if gpu_type == "integrated":
+            return True
+        name = str(gpu.get("name", "")).lower()
+        if gpu.get("cuda_available") and any(k in name for k in ("nvidia", "geforce", "rtx", "gtx", "tesla", "quadro")):
+            return False
+        integrated_markers = (
+            "intel", "iris", "uhd", "xe", "adreno", "mali",
+            "powervr", "video core", "videocore", "radeon graphics",
+        )
+        if any(k in name for k in integrated_markers):
+            return True
+        # 无已知标记 → 保守判为集显（如设备画像缺少字段）
+        return True
+
+    @classmethod
+    def _select_scoring_gpu(cls, device_info: dict) -> dict:
+        """
+        选择用于评分/显存约束的 GPU。
+
+        多 GPU 机器上 device_info["gpu"] 可能是当前前端选中的集显，
+        真正参与分布式推理的 CUDA 独显保存在 gpus 列表中。评分必须优先
+        选择 CUDA 独显，避免 RTX 4060 + 集显的主节点被误算成 8 分左右。
+        """
+        if not device_info:
+            return {}
+        candidates = []
+        selected = device_info.get("gpu", {})
+        if isinstance(selected, dict) and selected:
+            candidates.append(selected)
+        for g in device_info.get("gpus", []) or []:
+            if isinstance(g, dict) and g:
+                # 去重：同名同显存的 selected_gpu 不重复加入。
+                key = (g.get("name"), g.get("vram_total_gb"), g.get("cuda_available"))
+                if not any((c.get("name"), c.get("vram_total_gb"), c.get("cuda_available")) == key for c in candidates):
+                    candidates.append(g)
+        if not candidates:
+            return {}
+
+        def _vram(g: dict) -> float:
+            try:
+                return float(g.get("vram_total_gb", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # 1) CUDA 独显优先；2) 任意 CUDA；3) 非集显；4) 最大显存；5) selected_gpu。
+        cuda_discrete = [g for g in candidates if g.get("cuda_available") and not cls._gpu_is_integrated(g)]
+        if cuda_discrete:
+            return max(cuda_discrete, key=_vram)
+        cuda_any = [g for g in candidates if g.get("cuda_available")]
+        if cuda_any:
+            return max(cuda_any, key=_vram)
+        discrete_any = [g for g in candidates if not cls._gpu_is_integrated(g)]
+        if discrete_any:
+            return max(discrete_any, key=_vram)
+        return max(candidates, key=_vram)
 
     def _compute_node_weight(self, device_info: dict) -> float:
         """
@@ -1345,7 +1642,7 @@ class Scheduler:
         Returns:
             权重分数（0 ~ 115）
         """
-        gpu = device_info.get("gpu", {}) if device_info else {}
+        gpu = self._select_scoring_gpu(device_info)
         ram = device_info.get("ram", {}) if device_info else {}
         cpu = device_info.get("cpu", {}) if device_info else {}
 
@@ -1365,13 +1662,13 @@ class Scheduler:
         cpu_score = core_score + freq_score
 
         # 独显奖励：CUDA 可用 且 非集成显卡 → +15
-        cuda_avail = gpu.get("cuda_available", False)
-        is_integrated = gpu.get("is_integrated", True)
-        discrete_bonus = 15.0 if (cuda_avail and not is_integrated) else 0.0
+        cuda_avail = gpu.get("cuda_available", False) if isinstance(gpu, dict) else False
+        discrete_bonus = 15.0 if (cuda_avail and not self._gpu_is_integrated(gpu)) else 0.0
 
         weight = vram_score + ram_score + cpu_score + discrete_bonus
         logger.debug(
-            f"节点权重: VRAM={vram_score:.1f} RAM={ram_score:.1f} "
+            f"节点权重: GPU={gpu.get('name', 'unknown') if isinstance(gpu, dict) else 'unknown'} "
+            f"VRAM={vram_score:.1f} RAM={ram_score:.1f} "
             f"CPU={cpu_score:.1f} Bonus={discrete_bonus:.1f} → {weight:.1f}"
         )
         return weight
@@ -1398,10 +1695,11 @@ class Scheduler:
 
         优先级: GPU 专用显存 > 系统可用 RAM（CPU/集显模式）
         """
-        node = self.nodes.get(node_id)
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
         if not node or not node.device_info:
             return 0.0
-        gpu = node.device_info.get("gpu", {})
+        gpu = self._select_scoring_gpu(node.device_info)
         ram = node.device_info.get("ram", {})
         if isinstance(gpu, dict) and gpu.get("vram_total_gb", 0) > 0:
             return gpu["vram_total_gb"] * 1024  # GB → MB
@@ -1473,11 +1771,14 @@ class Scheduler:
 
         # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过）
         if nodes is None:
+            # Phase 2.1: 快照 self.nodes 后解锁迭代，防止 TCP 回调并发修改 dict
+            with self._nodes_lock:
+                nodes_snapshot = list(self.nodes.items())
             node_list = [
                 {"node_id": nid, "role": info.role,
                  "node_type": info.node_type,
                  "device_info": info.device_info}
-                for nid, info in self.nodes.items()
+                for nid, info in nodes_snapshot
                 if info.node_type == "pc"
             ]
         else:
@@ -1490,7 +1791,9 @@ class Scheduler:
             logger.warning("没有可用的 PC 节点参与流水线层拆分")
             return []
 
-        # 单节点：全部层给该节点
+        # 单节点：全部层给该节点。多节点时 master 也参与首段层计算，
+        # run_pipeline() 会先在 master 本地执行其层范围，再把 hidden_states
+        # 交给第一个 worker，避免浪费主节点 CUDA 独显算力。
         if len(node_list) == 1:
             n = node_list[0]
             return [{
@@ -1522,11 +1825,13 @@ class Scheduler:
                 ) * SAFE_VRAM_MARGIN
 
                 # 构建 nodes dict（GraphOrchestrator 需要的格式）
-                orch_nodes = {}
-                for n in node_list:
-                    nid = n["node_id"]
-                    if nid in self.nodes:
-                        orch_nodes[nid] = self.nodes[nid]
+                # Phase 2.1+: 锁保护，防止 in/get 之间的并发删除
+                with self._nodes_lock:
+                    orch_nodes = {}
+                    for n in node_list:
+                        nid = n["node_id"]
+                        if nid in self.nodes:
+                            orch_nodes[nid] = self.nodes[nid]
 
                 if len(orch_nodes) > GRAPH_ORCHESTRATOR_THRESHOLD:
                     orchestrator = GraphOrchestrator(
@@ -1537,8 +1842,11 @@ class Scheduler:
                     )
                     assignments = orchestrator.orchestrate()
 
-                    # 应用显存约束校验
+                    # 应用显存约束校验，并强制 master 作为首段锚点参与计算
                     assignments = self._apply_vram_constraints(assignments)
+                    assignments = self._normalize_master_anchor(
+                        assignments, node_list, total_layers
+                    )
 
                     logger.info(
                         f"🧠 图算法智能编排完成: {len(assignments)} 节点, "
@@ -1558,8 +1866,15 @@ class Scheduler:
                 )
 
         # ============================================================
-        # 回退：简单权重比例分配（节点数 ≤ 阈值）
+        # 回退：简单权重比例分配（节点数 ≤ 阈值 或 图编排器异常）
         # ============================================================
+        # 双重回退链：
+        #   1. GraphOrchestrator.orchestrate()
+        #        → _dfs_path_search 无可行路径
+        #        → 内部回退 _fallback_weight_assignment（VRAM 比例分）
+        #   2. GraphOrchestrator 顶层抛异常
+        #        → 外部回退到此 _simple_weight_assignment（算力权重分）
+        # 两层回退确保即使图算法崩溃，系统仍能降级到可用状态。
         return self._simple_weight_assignment(node_list, total_layers)
 
     def _simple_weight_assignment(self, node_list: list,
@@ -1600,7 +1915,8 @@ class Scheduler:
                     "score": 0.0,
                 })
                 cursor += count
-            return assignments
+            assignments = self._apply_vram_constraints(assignments)
+            return self._normalize_master_anchor(assignments, node_list, total_layers)
 
         # Step 2: 按比例分配全部 Transformer 层
         distributable = total_layers
@@ -1668,6 +1984,9 @@ class Scheduler:
 
         # Step 5: 显存约束校验
         assignments = self._apply_vram_constraints(assignments)
+        assignments = self._normalize_master_anchor(
+            assignments, node_list, total_layers
+        )
 
         logger.info(
             f"动态分层计算完成: {len(assignments)} 节点, "
@@ -1681,6 +2000,102 @@ class Scheduler:
             )
 
         return assignments
+
+    def _normalize_master_anchor(self, assignments: list, node_list: list,
+                                 total_layers: int) -> list:
+        """
+        统一分层不变量：master 作为首段 Embedding 锚点且至少执行 1 层。
+
+        master-first 是流水线语义约束，不表示主节点一定拿最多层；真实层数
+        仍由评分/显存决定。若 rounding 或显存后处理把 master 挤出，则从
+        最低优先级 worker 回收 1 层，保证主节点 CUDA 独显可参与首段计算。
+        """
+        if not assignments:
+            return []
+
+        def _is_master(item: dict) -> bool:
+            return item.get("node_id") == "master" or item.get("role") == "master"
+
+        def _score(item: dict) -> float:
+            try:
+                return float(item.get("score", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        master = None
+        rest = []
+        for a in assignments:
+            item = dict(a)
+            if _is_master(item) and master is None:
+                master = item
+            elif item.get("layers_count", 0) > 0:
+                rest.append(item)
+
+        if master is None:
+            master_src = next((n for n in node_list if _is_master(n)), None)
+            if master_src is None:
+                return self._resequence_assignments(
+                    [dict(a) for a in assignments if a.get("layers_count", 0) > 0]
+                )
+            master = {
+                "node_id": master_src.get("node_id", "master"),
+                "role": master_src.get("role", "master"),
+                "layers_count": 1,
+                "score": round(
+                    master_src.get("score", self._compute_node_weight(master_src.get("device_info", {}))),
+                    1,
+                ),
+            }
+        else:
+            master["layers_count"] = max(1, int(master.get("layers_count", 0) or 0))
+
+        ordered = [master] + rest
+
+        def _total() -> int:
+            return sum(int(a.get("layers_count", 0) or 0) for a in ordered)
+
+        # 若 master 被重新插入导致总层数超出，从低分 worker 优先回收。
+        while _total() > total_layers and len(ordered) > 1:
+            reducible = [a for a in ordered[1:] if a.get("layers_count", 0) > 1]
+            if reducible:
+                victim = min(reducible, key=_score)
+                victim["layers_count"] -= 1
+                continue
+            # 节点数多于层数时，移除最低分 worker（master 保留）。
+            victim = min(ordered[1:], key=_score)
+            logger.warning(
+                f"节点 {victim.get('node_id')} 层数降至 0 将被移除，"
+                f"以保留 master 首段计算锚点"
+            )
+            ordered.remove(victim)
+
+        # 若显存转移/rounding 后总层数不足，把缺口给最高分 worker；
+        # 无 worker 时给 master。
+        while _total() < total_layers and ordered:
+            receivers = ordered[1:] or ordered
+            target = max(receivers, key=_score)
+            target["layers_count"] = int(target.get("layers_count", 0) or 0) + 1
+
+        # 极端情况下仍超出（例如 total_layers=0 不会发生），最后从 master 尾部削减。
+        while _total() > total_layers and master.get("layers_count", 0) > 1:
+            master["layers_count"] -= 1
+
+        return self._resequence_assignments(ordered)
+
+    @staticmethod
+    def _resequence_assignments(assignments: list) -> list:
+        """按当前顺序重新计算连续层区间、Embedding 和 LM Head 标记。"""
+        cleaned = [a for a in assignments if a.get("layers_count", 0) > 0]
+        cursor = 0
+        for i, a in enumerate(cleaned):
+            count = int(a.get("layers_count", 0) or 0)
+            a["layers_count"] = count
+            a["start_layer"] = cursor
+            a["end_layer"] = cursor + count
+            a["has_embedding"] = (i == 0)
+            a["has_lm_head"] = (i == len(cleaned) - 1)
+            cursor += count
+        return cleaned
 
     def _apply_vram_constraints(self, assignments: list) -> list:
         """
@@ -1806,11 +2221,15 @@ class Scheduler:
         # 动态计算
         assignments = self.compute_layer_assignment()
 
-        # 判断实际使用的策略：节点数 > 阈值 → 图算法智能编排
-        total_nodes = len(self.nodes)
+        # 判断实际使用的策略：当前运行时由 PC worker 覆盖 Transformer 层，
+        # master/Android 不计入 graph_orchestrator 触发条件。
+        worker_nodes_count = sum(
+            1 for info in self.nodes.values()
+            if info.node_type == "pc" and info.node_id != "master" and info.role != "master"
+        )
         actual_strategy = (
             "graph_orchestrator"
-            if total_nodes > GRAPH_ORCHESTRATOR_THRESHOLD
+            if worker_nodes_count > GRAPH_ORCHESTRATOR_THRESHOLD
             else "dynamic"
         )
 
@@ -1829,6 +2248,43 @@ class Scheduler:
                 logger.debug(f"分层缓存失败: {e}")
 
         return result
+
+    def reset_layer_assignments(self) -> dict:
+        """
+        清除手动分层覆盖，恢复自动（dynamic）策略。
+
+        仅主节点可调用。
+
+        Returns:
+            {"status": "ok", "strategy": "dynamic"}
+        """
+        if self._effective_role() != "master":
+            return {"status": "denied", "reason": "仅主节点可重置分层配置"}
+
+        db = _get_db()
+        if db and _db_available:
+            try:
+                db.clear_layer_override()
+            except Exception as e:
+                logger.warning(f"清除层覆盖失败: {e}")
+
+        # 强制重新计算
+        assignments = self.compute_layer_assignment()
+        result = {
+            "total": assignments[-1]["end_layer"] if assignments else 24,
+            "strategy": "dynamic",
+            "assignments": assignments,
+            "computed_at": time.time(),
+        }
+
+        if db and _db_available:
+            try:
+                db.set_layer_assignments(result)
+            except Exception as e:
+                logger.debug(f"分层缓存失败: {e}")
+
+        logger.info("分层配置已重置为自动策略")
+        return {"status": "ok", "strategy": "dynamic", "assignments": result["assignments"]}
 
     def override_layer_assignments(self, assignments: list) -> dict:
         """
@@ -1863,6 +2319,10 @@ class Scheduler:
 
             if node_id not in self.nodes:
                 return {"status": "invalid", "reason": f"未知节点: {node_id}"}
+            # Phase 4.1: 阻止 Android 节点被分配层（Android 无 PyTorch 推理能力）
+            node_type = self.nodes[node_id].node_type
+            if node_type == "android":
+                return {"status": "invalid", "reason": f"Android 节点 {node_id} 不支持层前向传播"}
             if start < 0 or end > TOTAL_MODEL_LAYERS or start >= end:
                 return {
                     "status": "invalid",
@@ -1929,12 +2389,16 @@ class Scheduler:
         assignments = {}
         skipped_nodes = []
 
+        # Phase 2.1+: 快照 self.nodes，避免在循环中反复读取并被并发修改
+        with self._nodes_lock:
+            nodes_snapshot = dict(self.nodes)
+
         for a in layer_info["assignments"]:
             nid = a["node_id"]
             if nid == "master":
                 continue
 
-            node_info = self.nodes.get(nid)
+            node_info = nodes_snapshot.get(nid)
             if not node_info:
                 continue
 
@@ -1950,8 +2414,9 @@ class Scheduler:
                     skipped_nodes.append((nid, slave_sha256))
                     continue  # 不分配层给模型不一致的节点
             elif master_sha256 and not slave_sha256:
-                logger.info(
-                    f"ℹ️ 节点 {nid} 未上报模型 SHA256，跳过校验（降级放行）"
+                # Phase 4.2: 无 SHA256 的节点安全风险更高，提升为 WARNING 级别
+                logger.warning(
+                    f"⚠️ 节点 {nid} 未上报模型 SHA256，降级放行（可能存在模型不一致风险）"
                 )
 
             assignments[nid] = {
@@ -1996,26 +2461,58 @@ class Scheduler:
         if mgr and mgr.is_loaded:
             try:
                 model_path = getattr(mgr, '_model_path', '') or ''
-                if model_path and os.path.isfile(model_path):
-                    sha256_file = model_path + ".sha256"
-                    if os.path.isfile(sha256_file):
+                model_path = model_path or getattr(cfg, 'MODEL_PATH', '')
+                if model_path and os.path.exists(model_path):
+                    if os.path.isdir(model_path):
+                        # PyTorch/safetensors 模型: 对目录下所有 .safetensors 文件联合哈希
+                        import glob as _glob
+                        safetensors_files = sorted(
+                            _glob.glob(os.path.join(model_path, "*.safetensors"))
+                        )
+                        if safetensors_files:
+                            sha256_file = os.path.join(model_path, "model.sha256")
+                            if os.path.isfile(sha256_file):
+                                try:
+                                    with open(sha256_file, "r") as f:
+                                        return f.read().strip().split()[0]
+                                except Exception:
+                                    pass
+                            try:
+                                h = _hl.sha256()
+                                for sf in safetensors_files:
+                                    with open(sf, "rb") as f:
+                                        for chunk in iter(lambda: f.read(8192), b""):
+                                            h.update(chunk)
+                                result = h.hexdigest()
+                                try:
+                                    with open(sha256_file, "w") as f:
+                                        f.write(f"{result}  {os.path.basename(model_path)}\n")
+                                except Exception:
+                                    pass
+                                return result
+                            except Exception:
+                                pass
+                    elif os.path.isfile(model_path):
+                        # 单文件模型 (GGUF)
+                        sha256_file = model_path + ".sha256"
+                        if os.path.isfile(sha256_file):
+                            try:
+                                with open(sha256_file, "r") as f:
+                                    return f.read().strip().split()[0]
+                            except Exception:
+                                pass
+                        # 计算并缓存
                         try:
-                            with open(sha256_file, "r") as f:
-                                return f.read().strip().split()[0]
+                            h = _hl.sha256()
+                            with open(model_path, "rb") as f:
+                                for chunk in iter(lambda: f.read(8192), b""):
+                                    h.update(chunk)
+                            result = h.hexdigest()
+                            with open(sha256_file, "w") as f:
+                                f.write(f"{result}  {os.path.basename(model_path)}\n")
+                            return result
                         except Exception:
                             pass
-                    # 计算并缓存
-                    try:
-                        h = _hl.sha256()
-                        with open(model_path, "rb") as f:
-                            for chunk in iter(lambda: f.read(8192), b""):
-                                h.update(chunk)
-                        result = h.hexdigest()
-                        with open(sha256_file, "w") as f:
-                            f.write(f"{result}  {os.path.basename(model_path)}\n")
-                        return result
-                    except Exception:
-                        pass
             except Exception:
                 pass
 
@@ -2048,12 +2545,22 @@ class Scheduler:
         if msg_type == "register":
             data = msg.get("data", {})
             client_info = self._tcp_server.get_client_info(client_id) if self._tcp_server else {}
+            advertised_addr = (
+                client_info.get("advertised_addr")
+                or data.get("advertised_address")
+                or client_info.get("addr", "")
+            )
+            device_info = dict(data.get("device_info", {}) or {})
+            peer_addr = client_info.get("peer_addr", "")
+            if peer_addr:
+                device_info["tcp_peer_addr"] = peer_addr
+            device_info["tcp_advertised_addr"] = advertised_addr
             registered = self.register_node(
                 node_id=client_id,
                 role=data.get("role", ""),
-                address=client_info.get("addr", ""),
+                address=advertised_addr,
                 hostname=data.get("hostname", ""),
-                device_info=data.get("device_info", {}),
+                device_info=device_info,
                 network_type=data.get("network_type", client_info.get("network_type", "unknown")),
                 node_type=data.get("node_type", "pc"),
                 model_sha256=data.get("model_sha256", ""),
@@ -2069,23 +2576,26 @@ class Scheduler:
                 )
 
         elif msg_type == "heartbeat":
-            if client_id in self.nodes:
-                self.nodes[client_id].last_heartbeat = time.time()
+            with self._nodes_lock:
+                if client_id in self.nodes:
+                    self.nodes[client_id].last_heartbeat = time.time()
 
         elif msg_type == "status_res":
             # 从节点状态上报
             data = msg.get("data", {})
-            if client_id in self.nodes:
-                if "state" in data:
-                    try:
-                        self.nodes[client_id].state = NodeState(data["state"])
-                    except ValueError:
-                        pass
+            with self._nodes_lock:
+                if client_id in self.nodes:
+                    if "state" in data:
+                        try:
+                            self.nodes[client_id].state = NodeState(data["state"])
+                        except ValueError:
+                            pass
 
         elif msg_type == "error":
             data = msg.get("data", {})
-            if client_id in self.nodes:
-                self.nodes[client_id].error_count += 1
+            with self._nodes_lock:
+                if client_id in self.nodes:
+                    self.nodes[client_id].error_count += 1
             logger.error(f"节点 {client_id} 上报错误: {data.get('message', 'unknown')}")
 
         elif msg_type == "infer_forward":
@@ -2175,16 +2685,20 @@ class Scheduler:
             # ---- 从节点：流水线任务完成，清理 KV 缓存 ----
             data = msg.get("data", {})
             task_id = data.get("task_id", "")
-            if task_id and task_id in self._kv_cache:
-                del self._kv_cache[task_id]
-                logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
+            if task_id:
+                with self._kv_cache_lock:
+                    if task_id in self._kv_cache:
+                        del self._kv_cache[task_id]
+                        logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
 
         elif msg_type == "pipeline_abort":
             # ---- 从节点/主节点：流水线任务取消 ----
             data = msg.get("data", {})
             task_id = data.get("task_id", "")
-            if task_id and task_id in self._kv_cache:
-                del self._kv_cache[task_id]
+            if task_id:
+                with self._kv_cache_lock:
+                    if task_id in self._kv_cache:
+                        del self._kv_cache[task_id]
             logger.warning(f"⚠️ 流水线任务 {task_id} 已取消")
 
         elif msg_type == "pipeline_pause":
@@ -2205,20 +2719,24 @@ class Scheduler:
 
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
-        old_state = None
-        if client_id in self.nodes:
-            old_state = self.nodes[client_id].state.value
-            self.nodes[client_id].state = NodeState.OFFLINE
-            logger.info(
-                f"🔌 节点 {client_id} TCP 断开，已标记 offline "
-                f"(old_state={old_state}, role={self._effective_role()})"
-            )
-        else:
-            logger.debug(f"未知节点 {client_id} TCP 断开，跳过状态标记")
-        # 推送节点离线更新给所有连接的从节点
-        if self._effective_role() == "master":
+        with self._nodes_lock:
+            old_state = None
+            if client_id in self.nodes:
+                old_state = self.nodes[client_id].state.value
+                self.nodes[client_id].state = NodeState.OFFLINE
+                logger.info(
+                    f"🔌 节点 {client_id} TCP 断开，已标记 offline "
+                    f"(old_state={old_state}, role={self._effective_role()})"
+                )
+            else:
+                logger.debug(f"未知节点 {client_id} TCP 断开，跳过状态标记")
+            # 快照数据后释放锁，避免持锁进行 TCP 发送
+            need_push = (self._effective_role() == "master")
+            node_info = self.nodes.get(client_id)
+
+        if need_push:
             self._push_node_update_to_all_clients(
-                client_id, "update", self.nodes.get(client_id)
+                client_id, "update", node_info
             )
         self.deregister_node(client_id)
 
@@ -2238,7 +2756,9 @@ class Scheduler:
             return
         try:
             from tcp_comm import MessageType
-            nodes_data = [info.to_dict() for info in self.nodes.values()]
+            # Phase 2.1+: 快照后解锁，避免持锁进行 TCP 发送（防止锁排序问题）
+            with self._nodes_lock:
+                nodes_data = [info.to_dict() for info in self.nodes.values()]
             self._tcp_server.send_to_client(
                 client_id,
                 {"nodes": nodes_data},
@@ -2285,68 +2805,70 @@ class Scheduler:
 
         保留本地节点信息，用主节点的数据补充/覆盖其他节点。
         """
-        local_id = self.get_effective_node_id()
-        now_ts = time.time()
-        for nd in nodes_data:
-            nid = nd.get("node_id", "")
-            if nid == local_id:
-                # ★ 更新自身节点信息（主节点视角更准确: network_type, last_heartbeat 等）
-                local = self.nodes.get(local_id)
-                if local:
-                    local.network_type = nd.get("network_type", local.network_type)
-                    local.last_heartbeat = nd.get("last_heartbeat", local.last_heartbeat)
-                    local.connected_at = nd.get("connected_at", local.connected_at)
-                    local.avg_rtt_ms = nd.get("avg_rtt_ms", local.avg_rtt_ms)
-                    local.last_rtt_ms = nd.get("last_rtt_ms", local.last_rtt_ms)
-                    local.address = nd.get("address", local.address)
-                    local.hostname = nd.get("hostname", local.hostname)
-                    local.device_info = nd.get("device_info", local.device_info)
-                    local.task_count = nd.get("task_count", local.task_count)
-                    local.error_count = nd.get("error_count", local.error_count)
+        # Phase 2.1+: 全量同步需要原子修改 self.nodes，防止与心跳/消息回调并发
+        with self._nodes_lock:
+            local_id = self.get_effective_node_id()
+            now_ts = time.time()
+            for nd in nodes_data:
+                nid = nd.get("node_id", "")
+                if nid == local_id:
+                    # ★ 更新自身节点信息（主节点视角更准确: network_type, last_heartbeat 等）
+                    local = self.nodes.get(local_id)
+                    if local:
+                        local.network_type = nd.get("network_type", local.network_type)
+                        local.last_heartbeat = nd.get("last_heartbeat", local.last_heartbeat)
+                        local.connected_at = nd.get("connected_at", local.connected_at)
+                        local.avg_rtt_ms = nd.get("avg_rtt_ms", local.avg_rtt_ms)
+                        local.last_rtt_ms = nd.get("last_rtt_ms", local.last_rtt_ms)
+                        local.address = nd.get("address", local.address)
+                        local.hostname = nd.get("hostname", local.hostname)
+                        local.device_info = nd.get("device_info", local.device_info)
+                        local.task_count = nd.get("task_count", local.task_count)
+                        local.error_count = nd.get("error_count", local.error_count)
+                        try:
+                            local.state = NodeState(nd.get("state", local.state.value))
+                        except ValueError:
+                            pass
+                    continue
+                if nid in self.nodes:
+                    # 更新已有节点
+                    existing = self.nodes[nid]
+                    existing.role = nd.get("role", existing.role)
+                    existing.node_type = nd.get("node_type", existing.node_type)
+                    existing.hostname = nd.get("hostname", existing.hostname)
+                    existing.address = nd.get("address", existing.address)
+                    existing.device_info = nd.get("device_info", existing.device_info)
+                    existing.network_type = nd.get("network_type", existing.network_type)
+                    existing.avg_rtt_ms = nd.get("avg_rtt_ms", existing.avg_rtt_ms)
+                    existing.last_rtt_ms = nd.get("last_rtt_ms", existing.last_rtt_ms)
+                    existing.task_count = nd.get("task_count", existing.task_count)
+                    existing.error_count = nd.get("error_count", existing.error_count)
                     try:
-                        local.state = NodeState(nd.get("state", local.state.value))
+                        existing.state = NodeState(nd.get("state", "offline"))
                     except ValueError:
                         pass
-                continue
-            if nid in self.nodes:
-                # 更新已有节点
-                existing = self.nodes[nid]
-                existing.role = nd.get("role", existing.role)
-                existing.node_type = nd.get("node_type", existing.node_type)
-                existing.hostname = nd.get("hostname", existing.hostname)
-                existing.address = nd.get("address", existing.address)
-                existing.device_info = nd.get("device_info", existing.device_info)
-                existing.network_type = nd.get("network_type", existing.network_type)
-                existing.avg_rtt_ms = nd.get("avg_rtt_ms", existing.avg_rtt_ms)
-                existing.last_rtt_ms = nd.get("last_rtt_ms", existing.last_rtt_ms)
-                existing.task_count = nd.get("task_count", existing.task_count)
-                existing.error_count = nd.get("error_count", existing.error_count)
-                try:
-                    existing.state = NodeState(nd.get("state", "offline"))
-                except ValueError:
-                    pass
-            else:
-                # 新增节点
-                try:
-                    state = NodeState(nd.get("state", "offline"))
-                except ValueError:
-                    state = NodeState.OFFLINE
-                self.nodes[nid] = NodeInfo(
-                    node_id=nid,
-                    role=nd.get("role", "client"),
-                    node_type=nd.get("node_type", "pc"),
-                    state=state,
-                    address=nd.get("address", ""),
-                    hostname=nd.get("hostname", ""),
-                    device_info=nd.get("device_info", {}),
-                    network_type=nd.get("network_type", "unknown"),
-                    connected_at=nd.get("connected_at", now_ts),
-                    last_heartbeat=nd.get("last_heartbeat", now_ts),
-                    avg_rtt_ms=nd.get("avg_rtt_ms", 0.0),
-                    last_rtt_ms=nd.get("last_rtt_ms", 0.0),
-                    task_count=nd.get("task_count", 0),
-                    error_count=nd.get("error_count", 0),
-                )
+                else:
+                    # 新增节点
+                    try:
+                        state = NodeState(nd.get("state", "offline"))
+                    except ValueError:
+                        state = NodeState.OFFLINE
+                    self.nodes[nid] = NodeInfo(
+                        node_id=nid,
+                        role=nd.get("role", "client"),
+                        node_type=nd.get("node_type", "pc"),
+                        state=state,
+                        address=nd.get("address", ""),
+                        hostname=nd.get("hostname", ""),
+                        device_info=nd.get("device_info", {}),
+                        network_type=nd.get("network_type", "unknown"),
+                        connected_at=nd.get("connected_at", now_ts),
+                        last_heartbeat=nd.get("last_heartbeat", now_ts),
+                        avg_rtt_ms=nd.get("avg_rtt_ms", 0.0),
+                        last_rtt_ms=nd.get("last_rtt_ms", 0.0),
+                        task_count=nd.get("task_count", 0),
+                        error_count=nd.get("error_count", 0),
+                    )
 
     def _apply_node_update(self, action: str, node_data: dict) -> None:
         """
@@ -2356,48 +2878,51 @@ class Scheduler:
         if not nid:
             return
         local_id = self.get_effective_node_id()
-        if nid == local_id:
-            # ★ 更新自身节点信息（来自主节点的状态更新）
-            if action in ("add", "update"):
-                local = self.nodes.get(local_id)
-                if local:
-                    local.last_heartbeat = node_data.get("last_heartbeat", local.last_heartbeat)
-                    local.network_type = node_data.get("network_type", local.network_type)
-                    local.connected_at = node_data.get("connected_at", local.connected_at)
-                    local.avg_rtt_ms = node_data.get("avg_rtt_ms", local.avg_rtt_ms)
-                    local.last_rtt_ms = node_data.get("last_rtt_ms", local.last_rtt_ms)
-                    local.task_count = node_data.get("task_count", local.task_count)
-                    local.error_count = node_data.get("error_count", local.error_count)
-                    try:
-                        local.state = NodeState(node_data.get("state", local.state.value))
-                    except ValueError:
-                        pass
-            return
-        if action == "remove":
-            self.nodes.pop(nid, None)
-        elif action in ("add", "update"):
-            now_ts = time.time()
-            try:
-                state = NodeState(node_data.get("state", "offline"))
-            except ValueError:
-                state = NodeState.OFFLINE
-            if nid in self.nodes:
-                existing = self.nodes[nid]
-                existing.state = state
-                existing.role = node_data.get("role", existing.role)
-                existing.node_type = node_data.get("node_type", existing.node_type)
-                existing.hostname = node_data.get("hostname", existing.hostname)
-                existing.address = node_data.get("address", existing.address)
-                existing.device_info = node_data.get("device_info", existing.device_info)
-                existing.network_type = node_data.get("network_type", existing.network_type)
-                existing.avg_rtt_ms = node_data.get("avg_rtt_ms", existing.avg_rtt_ms)
-                existing.last_rtt_ms = node_data.get("last_rtt_ms", existing.last_rtt_ms)
-                existing.task_count = node_data.get("task_count", existing.task_count)
-                existing.error_count = node_data.get("error_count", existing.error_count)
-            else:
-                self.nodes[nid] = NodeInfo(
-                    node_id=nid,
-                    role=node_data.get("role", "client"),
+
+        # Phase 2.1+: 原子修改 self.nodes，防止与心跳/消息回调并发
+        with self._nodes_lock:
+            if nid == local_id:
+                # ★ 更新自身节点信息（来自主节点的状态更新）
+                if action in ("add", "update"):
+                    local = self.nodes.get(local_id)
+                    if local:
+                        local.last_heartbeat = node_data.get("last_heartbeat", local.last_heartbeat)
+                        local.network_type = node_data.get("network_type", local.network_type)
+                        local.connected_at = node_data.get("connected_at", local.connected_at)
+                        local.avg_rtt_ms = node_data.get("avg_rtt_ms", local.avg_rtt_ms)
+                        local.last_rtt_ms = node_data.get("last_rtt_ms", local.last_rtt_ms)
+                        local.task_count = node_data.get("task_count", local.task_count)
+                        local.error_count = node_data.get("error_count", local.error_count)
+                        try:
+                            local.state = NodeState(node_data.get("state", local.state.value))
+                        except ValueError:
+                            pass
+                return
+            if action == "remove":
+                self.nodes.pop(nid, None)
+            elif action in ("add", "update"):
+                now_ts = time.time()
+                try:
+                    state = NodeState(node_data.get("state", "offline"))
+                except ValueError:
+                    state = NodeState.OFFLINE
+                if nid in self.nodes:
+                    existing = self.nodes[nid]
+                    existing.state = state
+                    existing.role = node_data.get("role", existing.role)
+                    existing.node_type = node_data.get("node_type", existing.node_type)
+                    existing.hostname = node_data.get("hostname", existing.hostname)
+                    existing.address = node_data.get("address", existing.address)
+                    existing.device_info = node_data.get("device_info", existing.device_info)
+                    existing.network_type = node_data.get("network_type", existing.network_type)
+                    existing.avg_rtt_ms = node_data.get("avg_rtt_ms", existing.avg_rtt_ms)
+                    existing.last_rtt_ms = node_data.get("last_rtt_ms", existing.last_rtt_ms)
+                    existing.task_count = node_data.get("task_count", existing.task_count)
+                    existing.error_count = node_data.get("error_count", existing.error_count)
+                else:
+                    self.nodes[nid] = NodeInfo(
+                        node_id=nid,
+                        role=node_data.get("role", "client"),
                     node_type=node_data.get("node_type", "pc"),
                     state=state,
                     address=node_data.get("address", ""),
@@ -3306,9 +3831,10 @@ class Scheduler:
             self._current_task = task
 
         # 标记所有节点为忙碌
-        for nid in self.nodes:
-            if self.nodes[nid].role != NodeRole.MASTER:
-                self.update_node_state(nid, NodeState.BUSY)
+        with self._nodes_lock:
+            for nid in self.nodes:
+                if self.nodes[nid].role != NodeRole.MASTER:
+                    self.update_node_state(nid, NodeState.BUSY)
 
         logger.info(f"推理任务启动: {task_id}, prompt_len={len(prompt)}")
 
@@ -3329,9 +3855,10 @@ class Scheduler:
                 self._current_task = None
 
         # 恢复所有节点为空闲
-        for nid in self.nodes:
-            if self.nodes[nid].state == NodeState.BUSY:
-                self.update_node_state(nid, NodeState.ONLINE)
+        with self._nodes_lock:
+            for nid in self.nodes:
+                if self.nodes[nid].state == NodeState.BUSY:
+                    self.update_node_state(nid, NodeState.ONLINE)
 
         # TODO: 发送 TASK_STOP 指令给所有从节点
         # TODO: 清空所有节点 KV 缓存
@@ -3340,9 +3867,7 @@ class Scheduler:
         """
         任务完成回调。
 
-        Args:
-            result: 推理结果文本
-            metrics: 性能指标
+        NOTE: 此方法当前无调用方，为死代码（dead code），保留供未来流水线任务完成通知使用。
         """
         with self._task_lock:
             if self._current_task:
@@ -3387,9 +3912,11 @@ class Scheduler:
 
     def get_status(self) -> dict:
         """获取系统整体状态（含节点详情和 TCP 连接信息）"""
+        self._refresh_http_client_states()
         node_status = {}
-        for nid, info in self.nodes.items():
-            node_status[nid] = info.to_dict()
+        with self._nodes_lock:
+            for nid, info in self.nodes.items():
+                node_status[nid] = info.to_dict()
 
         current_task = None
         if self._current_task:
@@ -3444,7 +3971,9 @@ class Scheduler:
 
     def get_nodes(self) -> list:
         """获取所有节点详情列表"""
-        return [info.to_dict() for info in self.nodes.values()]
+        self._refresh_http_client_states()
+        with self._nodes_lock:
+            return [info.to_dict() for info in self.nodes.values()]
 
     def get_config(self) -> dict:
         """获取分布式配置信息（含当前节点角色、动态分层和实际局域网 IP）"""
@@ -3513,11 +4042,13 @@ class Scheduler:
                 node_id = f"client_{__import__('socket').gethostname()}"
             else:
                 node_id = NODE_ID
+            advertise_port = self._tcp_server.port if self._tcp_server else SERVER_PORT
             client = TCPClient(
                 server_host=master_host,
                 server_port=master_port,
                 client_id=node_id,
                 role="client",
+                advertise_port=advertise_port,
             )
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
             client.on_heartbeat = lambda: (
@@ -3525,10 +4056,11 @@ class Scheduler:
                 if node_id in self.nodes else None
             )
 
-            # 更新自身节点信息
+            # 更新自身节点状态。注意：NodeInfo.address 表示本节点可被其他节点连接的服务端点，
+            # 不能写成主节点地址；主节点地址由 tcp_client.server_host/server_port 表示。
             if node_id in self.nodes:
                 self.nodes[node_id].state = NodeState.ONLINE
-                self.nodes[node_id].address = f"{master_host}:{master_port}"
+                self.nodes[node_id].last_heartbeat = time.time()
 
             ok = client.connect(
                 on_message=lambda msg: self._on_tcp_message("master", msg)
@@ -3674,13 +4206,18 @@ class Scheduler:
             except Exception:
                 pass
 
+        # Phase 2.1+: 锁保护迭代计数，防止并发修改
+        with self._nodes_lock:
+            online_count = sum(1 for n in self.nodes.values() if n.is_available())
+            has_capacity = len(self.nodes) < self._max_nodes
+
         return {
             "master_host": lan_ip,
             "master_port": port,
             "node_count": len(self.nodes),
-            "online_count": sum(1 for n in self.nodes.values() if n.is_available()),
+            "online_count": online_count,
             "max_nodes": self._max_nodes,
-            "has_capacity": len(self.nodes) < self._max_nodes,
+            "has_capacity": has_capacity,
             "connected_clients": (
                 self._tcp_server.get_client_ids() if self._tcp_server else []
             ),
@@ -3713,7 +4250,8 @@ class Scheduler:
         cfg.NODE_ROLE = "client"
 
         # 2. 重新初始化为从节点
-        self.nodes.clear()
+        with self._nodes_lock:
+            self.nodes.clear()
         self.init_nodes()
         effective_id = self.get_effective_node_id()
         cfg.NODE_ID = effective_id
@@ -3825,7 +4363,9 @@ class Scheduler:
         """
         effective_role = self._effective_role()
         _effective_id = self.get_effective_node_id()
-        my_info = self.nodes.get(_effective_id)
+        # Phase 2.1+: 锁保护读取
+        with self._nodes_lock:
+            my_info = self.nodes.get(_effective_id)
         result = {
             "node_role": effective_role,
             "node_id": _effective_id,
@@ -3881,16 +4421,18 @@ class Scheduler:
         self._max_nodes = new_max
 
         # 清理残留幽灵节点（旧代码扩容时预创建的空槽位，从未连接过）
-        phantoms = []
-        for nid, node in list(self.nodes.items()):
-            if (nid != "master" and node.role != "master"
-                    and not node.address and not node.hostname
-                    and not node.connected_at and not node.last_heartbeat
-                    and node.state == NodeState.OFFLINE):
-                phantoms.append(nid)
-        for pid in phantoms:
-            del self.nodes[pid]
-            logger.info(f"  清理幽灵节点: {pid}")
+        # Phase 2.1+: 锁保护迭代+删除操作
+        with self._nodes_lock:
+            phantoms = []
+            for nid, node in list(self.nodes.items()):
+                if (nid != "master" and node.role != "master"
+                        and not node.address and not node.hostname
+                        and not node.connected_at and not node.last_heartbeat
+                        and node.state == NodeState.OFFLINE):
+                    phantoms.append(nid)
+            for pid in phantoms:
+                del self.nodes[pid]
+                logger.info(f"  清理幽灵节点: {pid}")
         if phantoms:
             self._layer_config_pushed.clear()
 
@@ -4213,6 +4755,12 @@ class Scheduler:
                     except Exception:
                         pass
 
+                if not metrics.get("distributed_used"):
+                    try:
+                        self.record_task_complete(success=True)
+                    except Exception:
+                        pass
+
                 self.complete_infer_task(task_id, content)
                 self._send_infer_result(
                     client_id, task_id, content, metrics,
@@ -4385,13 +4933,16 @@ class Scheduler:
 
             # ---- KV Cache: 读取缓存的 past_key_values ----
             past_kv = None
-            if use_kv_cache and task_id in self._kv_cache:
-                past_kv = self._kv_cache[task_id]
-                logger.debug(
-                    f"📦 KV cache 命中: task={task_id}, "
-                    f"layers={len(past_kv)}, "
-                    f"seq_len={past_kv[0][0].shape[2] if past_kv else 0}"
-                )
+            if use_kv_cache:
+                with self._kv_cache_lock:
+                    if task_id in self._kv_cache:
+                        past_kv = self._kv_cache[task_id]
+                if past_kv:
+                    logger.debug(
+                        f"📦 KV cache 命中: task={task_id}, "
+                        f"layers={len(past_kv)}, "
+                        f"seq_len={past_kv[0][0].shape[2] if past_kv else 0}"
+                    )
 
             # ---- 执行前向传播 ----
             t_start = time.time()
@@ -4404,10 +4955,12 @@ class Scheduler:
                 use_cache=True,  # 始终缓存 KV（prefill 构建，decode 更新）
             )
             elapsed_ms = (time.time() - t_start) * 1000
+            self._record_local_pipeline_participation(task_id, success=True)
 
             # ---- KV Cache: 存储更新后的 past_key_values ----
             if result.get("past_key_values"):
-                self._kv_cache[task_id] = result["past_key_values"]
+                with self._kv_cache_lock:
+                    self._kv_cache[task_id] = result["past_key_values"]
                 kv_seq_len = result["past_key_values"][0][0].shape[2]
                 logger.debug(
                     f"💾 KV cache 已更新: task={task_id}, "
@@ -4510,6 +5063,7 @@ class Scheduler:
                 self._send_layer_result("master", task_id, result_data=response)
 
         except Exception as e:
+            self._record_local_pipeline_participation(task_id, success=False)
             logger.error(f"层前向传播失败: task={task_id}, error={e}", exc_info=True)
             self._send_layer_result("master", task_id, error=str(e))
 
@@ -4646,9 +5200,13 @@ class Scheduler:
             logger.info("没有流水线从节点（单节点模式），跳过流水线检查")
             return False
 
+        # Phase 2.1+: 快照避免循环中并发修改
+        with self._nodes_lock:
+            nodes_snapshot = dict(self.nodes)
+
         for node in pipeline_nodes:
             node_id = node["node_id"]
-            node_info = self.nodes.get(node_id)
+            node_info = nodes_snapshot.get(node_id)
             if not node_info:
                 logger.warning(f"流水线节点 {node_id} 未注册")
                 return False
@@ -4692,9 +5250,13 @@ class Scheduler:
         if not self._tcp_server or not self._tcp_server._running:
             return False, "TCP 服务端未运行"
 
+        # Phase 2.1+: 快照避免循环中并发修改
+        with self._nodes_lock:
+            nodes_snapshot = dict(self.nodes)
+
         for node in pipeline_nodes:
             node_id = node["node_id"]
-            node_info = self.nodes.get(node_id)
+            node_info = nodes_snapshot.get(node_id)
             if not node_info:
                 return False, f"节点 {node_id} 已消失（可能被注销）"
             if not node_info.is_available():
@@ -4722,7 +5284,7 @@ class Scheduler:
 
     def _broadcast_pipeline_abort(self, pipeline_nodes: list, task_id: str,
                                    reason: str) -> None:
-        """向所有流水线节点广播 PIPELINE_ABORT（清理 KV cache）。"""
+        """向所有流水线节点广播 PIPELINE_ABORT（清理各节点 + master 本地 KV cache）。"""
         from tcp_comm import MessageType
         try:
             for n in pipeline_nodes:
@@ -4733,6 +5295,11 @@ class Scheduler:
                 )
         except Exception as e:
             logger.warning(f"广播 PIPELINE_ABORT 失败: {e}")
+        # ★ 同时清理 master 自身 KV cache（master_participates 路径会产生本地缓存）
+        if task_id:
+            with self._kv_cache_lock:
+                if task_id in self._kv_cache:
+                    del self._kv_cache[task_id]
 
     def _get_node_address(self, node_id: str) -> Optional[dict]:
         """
@@ -4740,7 +5307,8 @@ class Scheduler:
 
         返回 {"host": str, "port": int} 或 None（节点未知/离线）。
         """
-        node = self.nodes.get(node_id)
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
         if not node or not node.address:
             return None
         # address 格式: "host:port"
@@ -4780,13 +5348,13 @@ class Scheduler:
                 client_id=NODE_ID,
                 role="client",
             )
-            ok = client.connect(timeout_ms=5000)
+            ok = client.connect()
             if not ok:
                 logger.error(f"链式转发: 连接 {target_node_id} ({addr['host']}:{addr['port']}) 失败")
                 return False
 
             client.send_data(data, MessageType.CHAIN_FORWARD)
-            client.close()
+            client.disconnect()
             elapsed_ms = (time.time() - t0) * 1000
             hs_shape = data.get("hidden_shape", "?")
             logger.debug(
@@ -5102,39 +5670,86 @@ class Scheduler:
         """
         import uuid
         import api_server as _api
-        from tcp_comm import MessageType, deserialize_tensor_fast
+        from tcp_comm import MessageType, deserialize_tensor_fast, serialize_tensor_fast
 
         mgr = getattr(_api, 'model_manager', None)
         if not mgr or not mgr.tokenizer:
             return {"response": "", "error": "模型未加载"}
 
-        tokenizer = mgr.tokenizer
-        device = mgr.get_device()
-
         # ---- Step 1: 获取分层配置 ----
         layer_info = self.get_layer_assignments()
-        pipeline_nodes = [
+        assignments = [
             a for a in layer_info.get("assignments", [])
-            if a.get("node_id") != "master"
+            if a.get("layers_count", 0) > 0
         ]
-        # 按 start_layer 排序，确保流水线顺序正确
+        assignments.sort(key=lambda a: a.get("start_layer", 0))
+
+        master_ids = {"master", self.get_effective_node_id()}
+        master_assignment = next(
+            (a for a in assignments if a.get("node_id") in master_ids),
+            None,
+        )
+        master_participates = bool(
+            master_assignment and master_assignment.get("layers_count", 0) > 0
+        )
+        pipeline_nodes = [
+            a for a in assignments
+            if a.get("node_id") not in master_ids
+        ]
+        # 按 start_layer 排序，确保 worker 流水线顺序正确
         pipeline_nodes.sort(key=lambda a: a.get("start_layer", 0))
 
         if not pipeline_nodes:
             return {"response": "", "error": "没有可用的流水线从节点"}
+
+        # master 参与时，先在本地加载 Embedding + 首段 Transformer 层。
+        # 后续 step 由 master.forward_layers(input_ids) 生成 hidden_states，
+        # 再交给第一个 worker；避免 RTX 独显主节点只做调度而不计算。
+        if master_participates:
+            try:
+                ensure_layer_range = getattr(mgr, "ensure_layer_range", None)
+                if callable(ensure_layer_range):
+                    ensure_layer_range(
+                        master_assignment["start_layer"],
+                        master_assignment["end_layer"],
+                        has_embedding=master_assignment.get("has_embedding", True),
+                        has_lm_head=False,
+                    )
+                else:
+                    mgr.load_layer_range(
+                        master_assignment["start_layer"],
+                        master_assignment["end_layer"],
+                        has_embedding=master_assignment.get("has_embedding", True),
+                        has_lm_head=False,
+                    )
+            except Exception as e:
+                logger.error(f"❌ 主节点本地层范围加载失败: {e}", exc_info=True)
+                return {"response": "", "error": f"主节点本地层范围加载失败: {e}"}
+
+        tokenizer = mgr.tokenizer
+        device = mgr.get_device()
 
         # ★ 二次就绪检查（出队后 / 立即执行前）
         #   入队等待期间节点可能离线，tokenize 前最后确认。
         ok, err_msg = self._verify_pipeline_readiness(pipeline_nodes)
         if not ok:
             logger.error(f"❌ 流水线就绪检查失败: {err_msg}")
+            # Phase 5 review C3: 恢复完整模型，避免残留裁剪状态导致后续推理失败
+            if master_participates:
+                try:
+                    ensure_full = getattr(mgr, 'ensure_full_model', None)
+                    if callable(ensure_full):
+                        ensure_full()
+                except Exception as restore_err:
+                    logger.warning(f"模型恢复失败（将继续）: {restore_err}")
             return {"response": "", "error": err_msg}
 
+        full_chain = ([master_assignment] if master_participates else []) + pipeline_nodes
         logger.info(
             f"🚀 启动流水线推理: prompt_len={len(prompt)}, "
-            f"max_tokens={max_new_tokens}, 节点数={len(pipeline_nodes)}, "
-            f"顺序: {' → '.join(n['node_id'] for n in pipeline_nodes)}, "
-            f"KV Cache: ✅"
+            f"max_tokens={max_new_tokens}, worker数={len(pipeline_nodes)}, "
+            f"顺序: {' → '.join(n['node_id'] for n in full_chain)}, "
+            f"master_local={'✅' if master_participates else '❌'}, KV Cache: ✅"
         )
 
         # ---- Step 2: Tokenize ----
@@ -5146,8 +5761,24 @@ class Scheduler:
         # ---- Step 3: 自回归生成 ----
         task_id = uuid.uuid4().hex[:12]
         generated_ids = []
-        pipeline_metrics = {"steps": [], "total_time_ms": 0, "kv_cache": True,
-                            "chain_topology": True}
+        workers_used = [n["node_id"] for n in pipeline_nodes]
+        pipeline_metrics = {
+            "steps": [],
+            "total_time_ms": 0,
+            "kv_cache": True,
+            "chain_topology": True,
+            "engine": "distributed_pipeline",
+            "execution_mode": "distributed_pipeline",
+            "distributed_requested": True,
+            "distributed_used": True,
+            "fallback": False,
+            "fallback_reason": "",
+            "route": "master_pipeline",
+            "task_id": task_id,
+            "serving_node_id": self.get_effective_node_id(),
+            "workers_used": workers_used,
+            "layer_assignments": pipeline_nodes,
+        }
         t_pipeline_start = time.time()
 
         # 仅用于最终解码，不再用于发送
@@ -5210,8 +5841,6 @@ class Scheduler:
                         self._broadcast_pipeline_abort(
                             pipeline_nodes, task_id, f"抢占失败: {e}"
                         )
-                        if task_id in self._kv_cache:
-                            del self._kv_cache[task_id]
                         self._preempted_task = None
                         self._preempting = False
                         return {"response": "", "error": f"抢占失败: {e}"}
@@ -5260,7 +5889,7 @@ class Scheduler:
             last_node_id = pipeline_nodes[-1]["node_id"]
             has_chain = len(pipeline_nodes) >= 2
 
-            # ---- 构建 LAYER_FORWARD 消息（仅发给首节点）----
+            # ---- 构建 LAYER_FORWARD 消息（发给首个 worker）----
             forward_data = {
                 "task_id": task_id,
                 "step": step,
@@ -5269,29 +5898,73 @@ class Scheduler:
                 "use_kv_cache": not is_prefill,  # ★ Prefill=False, Decode=True
             }
 
-            if is_prefill:
-                # Prefill: 发送完整 prompt input_ids
-                forward_data["input_ids"] = input_ids.cpu().tolist()
-                if attention_mask is not None:
-                    forward_data["attention_mask"] = attention_mask.cpu().tolist()
+            if master_participates:
+                # master 本地首段：input_ids → Embedding + master layers → hidden_states。
+                # worker 不再需要 Embedding，因此收到的一定是 hidden_states。
+                try:
+                    past_kv = None
+                    if not is_prefill:
+                        with self._kv_cache_lock:
+                            past_kv = self._kv_cache.get(task_id)
+                    local_input_ids = input_ids if is_prefill else torch.tensor(
+                        [[new_token_id]], dtype=torch.long
+                    )
+                    local_attention_mask = attention_mask if is_prefill else None
+
+                    t_master = time.time()
+                    local_result = mgr.forward_layers(
+                        input_ids=local_input_ids,
+                        attention_mask=local_attention_mask,
+                        past_key_values=past_kv,
+                        use_cache=True,
+                    )
+                    master_elapsed_ms = (time.time() - t_master) * 1000
+                    if local_result.get("past_key_values"):
+                        with self._kv_cache_lock:
+                            self._kv_cache[task_id] = local_result["past_key_values"]
+                    if "hidden_states" not in local_result:
+                        raise RuntimeError("主节点首段未返回 hidden_states")
+                    hs_cpu = local_result["hidden_states"].detach().cpu()
+                    import base64 as _b64
+                    forward_data["hidden_states"] = _b64.b64encode(
+                        serialize_tensor_fast(hs_cpu)
+                    ).decode("ascii")
+                    forward_data["hidden_shape"] = list(hs_cpu.shape)
+                    logger.debug(
+                        f"🏠 Master 本地 Step {step}: Layer "
+                        f"{master_assignment['start_layer']}-{master_assignment['end_layer']} "
+                        f"hidden_states={list(hs_cpu.shape)}, time={master_elapsed_ms:.0f}ms"
+                    )
+                except Exception as e:
+                    step_error = f"主节点本地首段 forward 失败: {e}"
+                    logger.error(step_error, exc_info=True)
             else:
-                # Decode: 仅发送最后 1 个 token
-                forward_data["input_ids"] = [[new_token_id]]
+                if is_prefill:
+                    # 兼容旧配置：首 worker 含 Embedding，发送完整 prompt input_ids
+                    forward_data["input_ids"] = input_ids.cpu().tolist()
+                    if attention_mask is not None:
+                        forward_data["attention_mask"] = attention_mask.cpu().tolist()
+                else:
+                    # Decode: 仅发送最后 1 个 token
+                    forward_data["input_ids"] = [[new_token_id]]
 
             if has_chain:
                 # 链式拓扑：附加上下一个节点的地址信息
                 forward_data["chain_next"] = chain_info[1] if len(chain_info) > 1 else None
                 forward_data["chain_remaining"] = chain_info[2:] if len(chain_info) > 2 else []
                 logger.debug(
-                    f"🔗 Step {step} 链式路由: {' → '.join(c['node_id'] for c in chain_info)}"
+                    f"🔗 Step {step} 链式路由: "
+                    f"{'master → ' if master_participates else ''}"
+                    f"{' → '.join(c['node_id'] for c in chain_info)}"
                 )
             else:
                 forward_data["chain_next"] = None
                 forward_data["chain_remaining"] = []
 
-            # ---- 发送给首节点 ----
+            # ---- 发送给首个 worker ----
             try:
-                self._send_to_worker(first_node_id, forward_data, MessageType.LAYER_FORWARD)
+                if not step_error:
+                    self._send_to_worker(first_node_id, forward_data, MessageType.LAYER_FORWARD)
             except Exception as e:
                 step_error = f"发送到首节点 {first_node_id} 失败: {e}"
                 logger.error(step_error)
@@ -5347,7 +6020,9 @@ class Scheduler:
 
             # ---- Step 4: 从 logits 采样下一个 token ----
             # logits shape: prefill=(1, prompt_len, vocab), decode=(1, 1, vocab)
-            next_logits = logits[:, -1, :] / temperature
+            # Phase 5 review H1: clamp temperature 防止除零导致 NaN
+            safe_temperature = max(temperature, 1e-8)
+            next_logits = logits[:, -1, :] / safe_temperature
             probs = torch.softmax(next_logits, dim=-1)
 
             # top-p (nucleus) sampling
@@ -5402,6 +6077,11 @@ class Scheduler:
         except Exception as e:
             logger.warning(f"广播 PIPELINE_DONE 失败: {e}")
 
+        # ★ 清理 master 自身 KV cache（master_participates 路径会产生本地缓存）
+        with self._kv_cache_lock:
+            if task_id in self._kv_cache:
+                del self._kv_cache[task_id]
+
         # ---- Step 6: 解码结果 ----
         if generated_ids:
             full_ids = torch.cat([
@@ -5422,7 +6102,9 @@ class Scheduler:
             (time.time() - t_pipeline_start) * 1000, 1
         )
         pipeline_metrics["tokens_generated"] = len(generated_ids)
+        pipeline_metrics["generated_tokens"] = len(generated_ids)
         pipeline_metrics["nodes_used"] = len(pipeline_nodes)
+        pipeline_metrics["elapsed_seconds"] = round(pipeline_metrics["total_time_ms"] / 1000, 3)
 
         tokens_per_sec = (
             len(generated_ids) / (pipeline_metrics["total_time_ms"] / 1000)
@@ -5430,6 +6112,15 @@ class Scheduler:
             else 0
         )
         pipeline_metrics["tokens_per_second"] = round(tokens_per_sec, 1)
+
+        accounting = self._record_pipeline_task_accounting(
+            task_id=task_id,
+            pipeline_nodes=pipeline_nodes,
+            success=True,
+        )
+        pipeline_metrics["node_task_accounting"] = accounting
+        pipeline_metrics["workers_counted"] = accounting.get("workers_counted", [])
+        pipeline_metrics["counted_nodes"] = accounting.get("counted_nodes", [])
 
         logger.info(
             f"✅ 流水线推理完成: {len(generated_ids)} tokens, "
@@ -5522,7 +6213,11 @@ class Scheduler:
             if not self._all_pipeline_nodes_ready():
                 logger.warning("流水线节点不可用，队列任务回退到全模型推理")
                 # ★ H1 修复: 保持 lock_held=True，回退推理在锁保护下执行（防止 GPU 并发）
-                return self._run_full_model_inference(prompt, **kwargs)
+                return self._run_full_model_inference(
+                    prompt,
+                    _fallback_reason="queue_pipeline_nodes_not_ready",
+                    **kwargs,
+                )
             return self.run_pipeline(prompt, **kwargs)
         except Exception as e:
             logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理", exc_info=True)
@@ -5532,7 +6227,14 @@ class Scheduler:
                 lock_held = False
             except RuntimeError:
                 lock_held = False  # 抢占路径中锁已被 release
-            return self._run_full_model_inference(prompt, **kwargs)
+            # Phase 5 review H2: 回退推理需持有推理锁
+            self._inference_lock.acquire()
+            lock_held = True
+            return self._run_full_model_inference(
+                prompt,
+                _fallback_reason=f"queue_pipeline_error: {e}",
+                **kwargs,
+            )
         finally:
             if lock_held:
                 self._inference_lock.release()
@@ -5556,14 +6258,22 @@ class Scheduler:
         mgr = getattr(_api, 'model_manager', None)
         if not mgr or not mgr.is_loaded:
             logger.warning("模型未加载，无法执行流水线推理")
-            return self._run_full_model_inference(prompt, **kwargs)
+            return self._run_full_model_inference(
+                prompt,
+                _fallback_reason="model_not_loaded_for_pipeline",
+                **kwargs,
+            )
         engine_type = getattr(mgr, '_engine_type', '')
         if engine_type and engine_type != 'pytorch':
             logger.info(
                 f"引擎类型为 {engine_type}，不支持流水线层拆分，"
                 f"使用全模型推理"
             )
-            return self._run_full_model_inference(prompt, **kwargs)
+            return self._run_full_model_inference(
+                prompt,
+                _fallback_reason=f"engine {engine_type} does not support layer-split pipeline",
+                **kwargs,
+            )
 
         # ---- 自动回退：节点不可用 → 全模型推理 ----
         try:
@@ -5573,7 +6283,17 @@ class Scheduler:
 
         if not pipeline_ready:
             logger.warning("部分流水线节点未就绪，回退到全层主节点模式")
-            return self._run_full_model_inference(prompt, **kwargs)
+            # Phase 5 review C2: 若调用方未持锁，需获取推理锁防止并发 GPU 推理
+            lock_acquired = self._inference_lock.acquire(blocking=False)
+            try:
+                return self._run_full_model_inference(
+                    prompt,
+                    _fallback_reason="pipeline_nodes_not_ready",
+                    **kwargs,
+                )
+            finally:
+                if lock_acquired:
+                    self._inference_lock.release()
 
         # ---- 排队逻辑（锁内原子判断 + 入队/执行）----
         # ★ 同时检查 is_busy 和 queue_size，消除竞态缺口：
@@ -5615,7 +6335,11 @@ class Scheduler:
                 return self.run_pipeline(prompt, **kwargs)
             except Exception as e:
                 logger.error(f"流水线推理失败: {e}，回退到全层主节点模式", exc_info=True)
-                return self._run_full_model_inference(prompt, **kwargs)
+                return self._run_full_model_inference(
+                    prompt,
+                    _fallback_reason=f"pipeline_error: {e}",
+                    **kwargs,
+                )
         finally:
             self._inference_lock.release()
             # ★ 释放预留标记（无论成功/失败/回退）
@@ -5641,6 +6365,17 @@ class Scheduler:
             return {"response": "", "error": "模型未加载"}
 
         _stream_callback = kwargs.pop('_stream_callback', None)
+        fallback_reason = kwargs.pop('_fallback_reason', '') or 'pipeline_fallback_full_model'
+
+        # ★ 若 master 刚执行过流水线裁剪（layer_range != None），
+        #   需要先重新加载完整模型，否则 chat()/chat_stream() 会因
+        #   缺 Embedding/LM Head 而报错（如 RuntimeError: 缺少 lm_head）。
+        try:
+            ensure_full = getattr(mgr, 'ensure_full_model', None)
+            if callable(ensure_full):
+                ensure_full()
+        except Exception as e:
+            logger.warning(f"完整模型重载失败（将继续尝试推理）: {e}")
 
         try:
             messages = [{"role": "user", "content": prompt}]
@@ -5661,7 +6396,17 @@ class Scheduler:
                 response_text = "".join(full_text_parts)
                 elapsed = time.time() - t0
                 metrics = {
+                    "engine": getattr(mgr, '_engine_type', 'unknown') or 'unknown',
                     "mode": "fallback_full_model_streaming",
+                    "execution_mode": "fallback_full_model_streaming",
+                    "distributed_requested": True,
+                    "distributed_used": False,
+                    "fallback": True,
+                    "fallback_reason": fallback_reason,
+                    "route": "master_pipeline_fallback_full_model_streaming",
+                    "serving_node_id": self.get_effective_node_id(),
+                    "workers_used": [],
+                    "layer_assignments": [],
                     "tokens_per_second": len(full_text_parts) / elapsed if elapsed > 0 else 0,
                     "chunks": len(full_text_parts),
                     "elapsed_seconds": round(elapsed, 3),
@@ -5676,10 +6421,24 @@ class Scheduler:
                     top_p=top_p,
                 )
                 response_text = result.get("content", "")
+                usage = result.get("usage", {}) or {}
+                completion_tokens = usage.get("completion_tokens", 0)
                 metrics = {
+                    "engine": getattr(mgr, '_engine_type', 'unknown') or 'unknown',
                     "mode": "fallback_full_model",
+                    "execution_mode": "fallback_full_model",
+                    "distributed_requested": True,
+                    "distributed_used": False,
+                    "fallback": True,
+                    "fallback_reason": fallback_reason,
+                    "route": "master_pipeline_fallback_full_model",
+                    "serving_node_id": self.get_effective_node_id(),
+                    "workers_used": [],
+                    "layer_assignments": [],
                     "tokens_per_second": result.get("tokens_per_second", 0),
-                    "usage": result.get("usage", {}),
+                    "generated_tokens": completion_tokens,
+                    "completion_tokens": completion_tokens,
+                    "usage": usage,
                 }
 
             return {
@@ -5807,9 +6566,11 @@ class Scheduler:
 
         worker_status = []
         online_count = 0
+        with self._nodes_lock:
+            nodes_snapshot = dict(self.nodes)
         for w in workers:
             nid = w["node_id"]
-            node = self.nodes.get(nid)
+            node = nodes_snapshot.get(nid)
             is_online = node.is_available() if node else False
             if is_online:
                 online_count += 1
@@ -5896,52 +6657,63 @@ class Scheduler:
         if node_id == "master":
             return {"status": "invalid", "reason": "不能注册名为 'master' 的节点"}
 
-        if node_id in self.nodes:
-            existing = self.nodes[node_id]
-            if existing.role == "master":
-                return {"status": "invalid", "reason": f"'{node_id}' 是主节点，不可覆盖"}
-            existing.hostname = hostname or existing.hostname or node_id
-            existing.address = address
-            existing.network_type = network_type
-            existing.node_type = node_type
+        with self._nodes_lock:
+            if node_id in self.nodes:
+                existing = self.nodes[node_id]
+                if existing.role == "master":
+                    return {"status": "invalid", "reason": f"'{node_id}' 是主节点，不可覆盖"}
+                existing.hostname = hostname or existing.hostname or node_id
+                existing.address = address
+                existing.network_type = network_type
+                existing.node_type = node_type
+                state_value = existing.state.value
+                hostname_snapshot = existing.hostname
+            else:
+                existing = None
+
+            if existing is not None:
+                pass  # 更新路径：锁内修改完成，退出锁后写 DB
+            else:
+                # 检查容量：只统计在线/已注册节点（离线/幽灵不占位）
+                online_non_master = [
+                    n for n in self.nodes.values()
+                    if n.role != "master" and (n.is_available() or n.address)
+                ]
+                if len(online_non_master) >= self._max_nodes - 1:
+                    return {"status": "full", "reason": f"已达到最大在册从节点数量 ({self._max_nodes - 1})"}
+
+                # 创建节点（初始 offline）
+                node = NodeInfo(
+                    node_id=node_id,
+                    role=NodeRole.CLIENT,
+                    node_type=node_type,
+                    state=NodeState.OFFLINE,
+                    hostname=hostname or node_id,
+                    address=address,
+                    network_type=network_type,
+                )
+                self.nodes[node_id] = node
+
+        if existing is not None:
+            # 更新路径：锁外写 DB
             db = _get_db()
             if db and _db_available:
                 try:
                     db.upsert_node(
                         node_id=node_id, role="client", node_type=node_type,
-                        state=existing.state.value,
-                        address=address, hostname=existing.hostname,
+                        state=state_value,
+                        address=address, hostname=hostname_snapshot,
                         network_type=network_type,
                     )
                 except Exception as e:
                     logger.warning(f"手动更新节点 DB 持久化失败: {e}")
             logger.info(
                 f"📝 手动注册节点已更新: {node_id} type={node_type} "
-                f"(hostname={existing.hostname}, addr={address}, state={existing.state.value})"
+                f"(hostname={hostname_snapshot}, addr={address}, state={state_value})"
             )
             return {"status": "updated", "node_id": node_id,
-                    "message": f"节点 '{node_id}' 已更新 (state={existing.state.value})",
-                    "state": existing.state.value}
-
-        # 检查容量：只统计在线/已注册节点（离线/幽灵不占位）
-        online_non_master = [
-            n for n in self.nodes.values()
-            if n.role != "master" and (n.is_available() or n.address)
-        ]
-        if len(online_non_master) >= self._max_nodes - 1:
-            return {"status": "full", "reason": f"已达到最大在册从节点数量 ({self._max_nodes - 1})"}
-
-        # 创建节点（初始 offline）
-        node = NodeInfo(
-            node_id=node_id,
-            role=NodeRole.CLIENT,
-            node_type=node_type,
-            state=NodeState.OFFLINE,
-            hostname=hostname or node_id,
-            address=address,
-            network_type=network_type,
-        )
-        self.nodes[node_id] = node
+                    "message": f"节点 '{node_id}' 已更新 (state={state_value})",
+                    "state": state_value}
 
         # 持久化到数据库
         db = _get_db()
@@ -5975,13 +6747,16 @@ class Scheduler:
             return {"status": "denied", "reason": "仅主节点可删除节点"}
         if node_id == "master":
             return {"status": "invalid", "reason": "不能删除主节点"}
-        node = self.nodes.get(node_id)
-        if node is None:
-            return {"status": "not_found", "reason": f"节点 '{node_id}' 不存在"}
-        if node.is_available():
-            return {"status": "online", "reason": "节点在线，请先注销后删除"}
+        # Phase 2.1+: 原子化 get+检查+pop，防止并发修改
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                return {"status": "not_found", "reason": f"节点 '{node_id}' 不存在"}
+            if node.is_available():
+                return {"status": "online", "reason": "节点在线，请先注销后删除"}
 
-        old_node = self.nodes.pop(node_id)
+            old_node = self.nodes.pop(node_id)
+
         self._layer_config_pushed.discard(node_id)
 
         db = _get_db()

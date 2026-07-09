@@ -3,12 +3,36 @@
 =========================================
 测试 SMTP 配置、Y/N 投票解析、IMAP 轮询逻辑。
 实际发送测试需要真实网络连接，标记为 slow。
+
+---- SMTP 实际发送测试（test_send_test_email）----
+默认跳过，因为需要 QQ 邮箱授权码。
+
+启用方法:
+  方案A（推荐）: 在项目根目录创建 .env 文件（.gitignore 已保护），内容:
+    QLH_SMTP_SENDER=studyp4ct@qq.com
+    QLH_SMTP_PASSWORD=<你的QQ邮箱授权码>
+    QLH_SMTP_RECIPIENT=2743631775@qq.com
+    QLH_SMTP_SERVER=smtp.qq.com
+    QLH_SMTP_PORT=465
+    QLH_IMAP_SERVER=imap.qq.com
+    QLH_IMAP_PORT=993
+    然后: pip install python-dotenv
+    运行: python -c "from dotenv import load_dotenv; load_dotenv()"
+    测试: QLH_SMTP_PASSWORD=<授权码> pytest tests/test_email_notifier.py -v -k "send"
+
+  方案B: 直接设置环境变量（仅当前终端有效）:
+    export QLH_SMTP_PASSWORD=<你的QQ邮箱授权码>
+    pytest tests/test_email_notifier.py -v
+
+  授权码获取: QQ邮箱 → 设置 → 账户 → POP3/SMTP服务 → 生成授权码
 """
 
 import sys
 import os
 
-# P3修复: 邮箱凭据已移至环境变量，测试前需设置
+# P3修复: 邮箱凭据已移至环境变量 / .env 文件
+# 以下为测试默认值（含假密码，触发 send_test_email 自动跳过）
+# 要运行实际发送测试，请设置真实 QLH_SMTP_PASSWORD（见上方注释）
 for _k, _v in [
     ("QLH_SMTP_SENDER", "studyp4ct@qq.com"),
     ("QLH_SMTP_PASSWORD", "test_password"),

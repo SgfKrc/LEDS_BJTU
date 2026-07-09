@@ -53,7 +53,11 @@ MODEL_PATH = os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat")       # Safeten
 GGUF_MODEL_PATH = os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf")  # GGUF 格式
 QUANT_TYPE = "int4"                          # 量化精度: "fp16" | "int8" | "int4"
 USE_COMPILE = False                          # 算子融合（仅FP16有效，INT4下自动跳过）
-DEVICE = "cuda"                              # 推理设备: "cuda" | "cpu"
+try:
+    import torch as _torch
+    DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+except ImportError:
+    DEVICE = "cpu"  # 推理设备: torch 未安装时默认 CPU
 
 # --- 推理引擎选择 ---
 # "auto": 自动选择 — CUDA 可用 → PyTorch + bitsandbytes, 否则 → llama.cpp + GGUF

@@ -30,7 +30,7 @@ import torch
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -121,7 +121,7 @@ logger = logging.getLogger("api_server")
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.5",
+    version="0.1.7",
     description="北京交通大学 · 大学生创新创业训练计划",
 )
 
@@ -161,6 +161,12 @@ generation_config: dict = {
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: Scheduler = Scheduler()
+
+
+# ============================================================
+# SIGTERM 优雅关闭（Linux systemd / 容器环境）
+# 注意：uvicorn 内置了自己的 SIGTERM/SIGINT 处理器，在 uvicorn.run() 中
+# 自动处理优雅关闭。不在此处注册模块级信号处理器，因为会被 uvicorn 覆盖。
 
 
 # ============================================================
@@ -317,6 +323,10 @@ class ChatRequest(BaseModel):
         default="full",
         description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化）",
     )
+    client_node_id: Optional[str] = Field(default=None, description="请求来源节点 ID（Android/PC 客户端上报）")
+    client_node_type: Optional[str] = Field(default=None, description="请求来源节点类型: pc | android")
+    client_mode: Optional[str] = Field(default=None, description="请求来源模式: thin | full")
+    client_app_variant: Optional[str] = Field(default=None, description="请求来源 App variant: full | lite")
 
 
 class ChatResponse(BaseModel):
@@ -1522,6 +1532,36 @@ async def load_model(req: LoadModelRequest):
         raise HTTPException(500, f"模型加载失败: {str(e)}")
 
 
+def _chat_origin(req: ChatRequest) -> str:
+    """根据请求上报信息推断请求来源，用于 metrics 展示。"""
+    if req.client_node_type == "android":
+        return "android_http"
+    if req.client_node_type == "pc":
+        return "pc_http"
+    return "web_http"
+
+
+def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) -> dict:
+    """补齐统一聊天 metrics 字段，不覆盖调度器已给出的真实执行信息。"""
+    result = dict(metrics or {})
+    for key, value in defaults.items():
+        result.setdefault(key, value)
+    origin = _chat_origin(req)
+    result.setdefault("request_origin", origin)
+    result.setdefault("request_origin_node_id", req.client_node_id or "")
+    result.setdefault("request_origin_node_type", req.client_node_type or "")
+    result.setdefault("client_mode", req.client_mode or "")
+    result.setdefault("client_app_variant", req.client_app_variant or "")
+    result.setdefault("serving_node_id", scheduler.get_effective_node_id())
+    result.setdefault("distributed_requested", scheduler.get_distributed_inference_enabled())
+    result.setdefault("distributed_used", False)
+    result.setdefault("fallback", False)
+    result.setdefault("fallback_reason", "")
+    result.setdefault("workers_used", [])
+    result.setdefault("layer_assignments", [])
+    return result
+
+
 def _execute_chat_full(req: ChatRequest) -> dict:
     """
     执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
@@ -1565,6 +1605,13 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 history.append({"role": "user", "content": req.message})
                 response_text = result.get("content", "")
                 history.append({"role": "assistant", "content": response_text})
+                forward_metrics = _augment_chat_metrics(
+                    result.get("metrics", {}),
+                    req,
+                    engine="distributed_forward",
+                    execution_mode="forwarded_to_master",
+                    route="pc_client_forward_to_master",
+                )
 
                 db_session_id = target_session_id or "default"
                 if _db_available:
@@ -1573,7 +1620,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                         if _db_mod.get_save_history():
                             _db_mod.save_message(db_session_id, "user", req.message)
                             _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                {"engine": "distributed"})
+                                                forward_metrics)
                             _db_mod.increment_session_message_count(db_session_id)
                     except Exception:
                         pass
@@ -1581,7 +1628,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                     try:
                         _local_store.save_local_message(db_session_id, "user", req.message)
                         _local_store.save_local_message(db_session_id, "assistant", response_text,
-                                                        {"engine": "distributed"})
+                                                        forward_metrics)
                         _local_store.increment_local_session_message_count(db_session_id)
                     except Exception:
                         pass
@@ -1611,7 +1658,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 return {
                     "content": response_text,
                     "thinking_content": None,
-                    "metrics": {"engine": "distributed"},
+                    "metrics": forward_metrics,
                     "followups": followups,
                 }
             elif result.get("status") == "disconnected":
@@ -1647,15 +1694,20 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                     history.append({"role": "assistant", "content": response_text})
 
                     db_session_id = target_session_id or "default"
-                    pipeline_metrics = pipeline_result.get("metrics", {})
+                    pipeline_metrics = _augment_chat_metrics(
+                        pipeline_result.get("metrics", {}),
+                        req,
+                        engine="distributed_pipeline",
+                        execution_mode="distributed_pipeline",
+                        route="master_pipeline",
+                    )
                     if _db_available:
                         try:
                             import db as _db_mod
                             if _db_mod.get_save_history():
                                 _db_mod.save_message(db_session_id, "user", req.message)
                                 _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                    {"engine": "distributed_pipeline",
-                                                     "pipeline": pipeline_metrics})
+                                                    pipeline_metrics)
                                 _db_mod.increment_session_message_count(db_session_id)
                         except Exception:
                             pass
@@ -1664,16 +1716,17 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                             _local_store.save_local_message(db_session_id, "user", req.message)
                             _local_store.save_local_message(db_session_id, "assistant",
                                                             response_text,
-                                                            {"engine": "distributed_pipeline"})
+                                                            pipeline_metrics)
                             _local_store.increment_local_session_message_count(db_session_id)
                         except Exception:
                             pass
 
                     conversation_stats["rounds"] += 1
-                    try:
-                        scheduler.record_task_complete(success=True)
-                    except Exception:
-                        pass
+                    if not pipeline_metrics.get("distributed_used"):
+                        try:
+                            scheduler.record_task_complete(success=True)
+                        except Exception:
+                            pass
 
                     if model_manager._engine_type == "llama_cpp":
                         followups = _generate_followups_llama(history)
@@ -1691,8 +1744,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                     return {
                         "content": response_text,
                         "thinking_content": None,
-                        "metrics": {"engine": "distributed_pipeline",
-                                     "pipeline": pipeline_metrics},
+                        "metrics": pipeline_metrics,
                         "followups": followups,
                     }
         except Exception as e:
@@ -1713,6 +1765,25 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             tokens_per_sec = result.get("tokens_per_second", 0)
             usage = result.get("usage", {})
             completion_tokens = usage.get("completion_tokens", 0)
+            local_route = f"{_chat_origin(req)}_to_master_local_llama_cpp"
+            fallback_reason = ""
+            if scheduler.get_distributed_inference_enabled() and RUN_MODE == "distributed":
+                fallback_reason = "llama.cpp engine does not support layer-split pipeline"
+            metrics = _augment_chat_metrics(
+                {
+                    "engine": "llama_cpp",
+                    "execution_mode": "local_llama_cpp",
+                    "route": local_route,
+                    "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                    "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                    "generated_tokens": completion_tokens,
+                    "completion_tokens": completion_tokens,
+                    "usage": usage,
+                    "fallback": bool(fallback_reason),
+                    "fallback_reason": fallback_reason,
+                },
+                req,
+            )
 
             db_session_id = target_session_id or "default"
             followups = _generate_followups_llama(history)
@@ -1722,18 +1793,20 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                     import db as _db_mod
                     if _db_mod.get_save_history():
                         _db_mod.save_message(db_session_id, "user", req.message)
+                        save_metrics = dict(metrics)
+                        save_metrics["followups"] = followups
                         _db_mod.save_message(db_session_id, "assistant", response_text,
-                                            {"engine": "llama.cpp", "tokens_per_sec": round(tokens_per_sec, 1),
-                                             "completion_tokens": completion_tokens,
-                                             "followups": followups})
+                                            save_metrics)
                         _db_mod.increment_session_message_count(db_session_id)
                 except Exception:
                     pass
             if not _db_available:
                 try:
                     _local_store.save_local_message(db_session_id, "user", req.message)
+                    save_metrics = dict(metrics)
+                    save_metrics["followups"] = followups
                     _local_store.save_local_message(db_session_id, "assistant", response_text,
-                                                    {"engine": "llama.cpp"})
+                                                    save_metrics)
                     _local_store.increment_local_session_message_count(db_session_id)
                 except Exception:
                     pass
@@ -1748,11 +1821,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             return {
                 "content": response_text,
                 "thinking_content": None,
-                "metrics": {
-                    "engine": "llama.cpp",
-                    "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
-                    "completion_tokens": completion_tokens,
-                },
+                "metrics": metrics,
                 "followups": followups,
             }
         except Exception as e:
@@ -1814,16 +1883,23 @@ def _execute_chat_full(req: ChatRequest) -> dict:
 
         new_tokens = len(generated_ids)
         tokens_per_sec = new_tokens / elapsed if elapsed > 0 else 0
-        metrics = {
-            "prompt_tokens": prompt_len,
-            "new_tokens": new_tokens,
-            "total_tokens": prompt_len + new_tokens,
-            "elapsed_seconds": round(elapsed, 3),
-            "tokens_per_second": round(tokens_per_sec, 1),
-            "gpu_memory_mb": round(torch.cuda.memory_allocated() / (1024**2), 1)
-            if torch.cuda.is_available()
-            else 0,
-        }
+        metrics = _augment_chat_metrics(
+            {
+                "engine": "pytorch",
+                "execution_mode": "local_pytorch",
+                "route": f"{_chat_origin(req)}_to_master_local_pytorch",
+                "prompt_tokens": prompt_len,
+                "new_tokens": new_tokens,
+                "generated_tokens": new_tokens,
+                "total_tokens": prompt_len + new_tokens,
+                "elapsed_seconds": round(elapsed, 3),
+                "tokens_per_second": round(tokens_per_sec, 1),
+                "gpu_memory_mb": round(torch.cuda.memory_allocated() / (1024**2), 1)
+                if torch.cuda.is_available()
+                else 0,
+            },
+            req,
+        )
 
         db_session_id = target_session_id or "default"
 
@@ -2032,7 +2108,7 @@ async def chat_stream(req: ChatRequest):
                 yield f"data: {_json.dumps({
                     'done': True,
                     'response': result['content'],
-                    'thinking': result.get('thinking_content'),
+                    'thinking_content': result.get('thinking_content'),
                     'followups': result['followups'],
                     'metrics': result['metrics'],
                 }, ensure_ascii=False)}\n\n"
@@ -2543,6 +2619,17 @@ class ManualRegisterRequest(BaseModel):
     node_type: str = Field(default="pc", description="设备平台: pc | android")
 
 
+class AndroidPresenceRequest(BaseModel):
+    node_id: str = Field(..., min_length=1, max_length=64, description="Android 稳定节点标识")
+    hostname: str = Field(default="", description="Android 设备名")
+    address: str = Field(default="", description="HTTP 客户端地址（可选，仅展示）")
+    network_type: str = Field(default="unknown", description="网络类型: wifi | mobile | ethernet | vpn | other | unknown")
+    device_info: dict = Field(default_factory=dict, description="Android 设备画像/运行状态")
+    client_mode: str = Field(default="thin", description="客户端模式: thin | full")
+    app_variant: str = Field(default="full", description="Android flavor: full | lite")
+    app_version: str = Field(default="", description="App 版本")
+
+
 @app.post("/api/cluster/nodes/register")
 async def manual_register_node(req: ManualRegisterRequest):
     """
@@ -2570,6 +2657,34 @@ async def manual_register_node(req: ManualRegisterRequest):
     if result.get("status") == "exists":
         return result  # 已存在不报错，返回当前状态
     return result
+
+
+@app.post("/api/cluster/android/register")
+async def register_android_presence(req: AndroidPresenceRequest, request: Request):
+    """Android Full 薄客户端在线登记/心跳（不是 TCP worker 注册）。"""
+    http_peer = request.client.host if request.client else ""
+    result = scheduler.register_android_client(
+        node_id=req.node_id,
+        hostname=req.hostname,
+        address=req.address,
+        network_type=req.network_type,
+        device_info=req.device_info,
+        client_mode=req.client_mode,
+        app_variant=req.app_variant,
+        app_version=req.app_version,
+        http_peer=http_peer,
+    )
+    if result.get("status") == "denied":
+        raise HTTPException(403, result.get("reason", "仅主节点可登记 Android 客户端"))
+    if result.get("status") == "invalid":
+        raise HTTPException(400, result.get("reason", "无效 Android 节点"))
+    return result
+
+
+@app.post("/api/cluster/android/heartbeat")
+async def heartbeat_android_presence(req: AndroidPresenceRequest, request: Request):
+    """Android Full 薄客户端心跳；实现与 register 相同，重复调用会刷新 last_heartbeat。"""
+    return await register_android_presence(req, request)
 
 
 @app.get("/api/cluster/master-health")
@@ -2837,6 +2952,18 @@ async def override_layer_assignments(req: LayerOverrideRequest):
     if result.get("status") == "error":
         raise HTTPException(500, result.get("reason", "操作失败"))
     return result
+
+
+@app.delete("/api/cluster/layers")
+async def reset_layer_assignments():
+    """
+    重置分层配置，清除手动覆盖，恢复自动（dynamic）策略。
+
+    仅主节点可调用。
+    """
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可重置分层配置")
+    return scheduler.reset_layer_assignments()
 
 
 # ============================================================

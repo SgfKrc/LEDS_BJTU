@@ -11,4 +11,4 @@
 - api_server: FastAPI 后端 + React 前端一体化服务
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.7"

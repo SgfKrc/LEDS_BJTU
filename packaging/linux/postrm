@@ -1,0 +1,32 @@
+#!/bin/bash
+set -e
+
+APP_DIR="/opt/qlh-edge-inference"
+
+case "$1" in
+    remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm: 未知动作 $1，跳过。"
+        exit 0
+        ;;
+esac
+
+echo "QLH 边缘推理系统 — 卸载后清理..."
+
+# 移除 /usr/local/bin 符号链接（仅 remove/purge，upgrade 时保留）
+if [ "$1" != "upgrade" ] && [ "$1" != "failed-upgrade" ]; then
+    rm -f /usr/local/bin/qlh-launcher
+fi
+
+# purge: 完全清理（包括模型文件）
+if [ "$1" = "purge" ]; then
+    echo "purge: 完全清理 $APP_DIR ..."
+    rm -rf "$APP_DIR"
+fi
+
+echo "QLH 边缘推理系统已卸载。"
+if [ "$1" != "purge" ]; then
+    echo "注意: $APP_DIR/models 中的模型文件已保留。"
+    echo "如需完全删除，请手动运行: sudo rm -rf $APP_DIR"
+fi

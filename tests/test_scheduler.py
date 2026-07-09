@@ -209,11 +209,14 @@ class TestComputeLayerAssignment:
             cursor = a["end_layer"]
 
     def test_first_node_has_embedding(self, sched):
-        """第一个节点（master）应有 Embedding"""
+        """首节点（master）应有 Embedding 且 start_layer=0"""
         result = sched.compute_layer_assignment()
-        result.sort(key=lambda x: x["start_layer"])
-        assert result[0]["has_embedding"] is True
-        assert result[0]["start_layer"] == 0
+        executable = [a for a in result if a.get("layers_count", 0) > 0]
+        executable.sort(key=lambda x: x["start_layer"])
+        assert executable[0]["has_embedding"] is True
+        assert executable[0]["start_layer"] == 0
+        # master 参与执行时应为首位
+        assert executable[0].get("node_id") == "master" or executable[0].get("role") == "master"
 
     def test_last_node_has_lm_head(self, sched):
         """最后一个节点应有 LM Head"""
@@ -238,25 +241,44 @@ class TestComputeLayerAssignment:
                     "master 的层应排在 client 之前"
 
     def test_weight_proportional_distribution(self, sched):
-        """权重高的节点应分配更多层"""
+        """worker 节点按权重分配层；master 作为首段 Embedding 锚点至少执行 1 层"""
         result = sched.compute_layer_assignment()
 
         scores = {a["node_id"]: a["score"] for a in result}
         layers = {a["node_id"]: a["layers_count"] for a in result}
 
-        # 工作站 > 游戏本 > 轻薄本
+        # master 分数最高，作为首段锚点至少执行 1 层
         assert scores["master"] > scores["client1"] > scores["client2"], \
             f"权重排序错误: {scores}"
-        # 工作站应获得最多层
-        assert layers["master"] >= layers["client1"], \
-            f"权重高应分配更多层: {layers}"
+        assert layers["master"] >= 1, \
+            f"master 应至少执行 1 层（作为 Embedding 锚点），实际: {layers['master']}"
+        assert "coordinator_only" not in result[0], \
+            "master 不应再有 coordinator_only 标记"
+        # master 是首节点，具有 Embedding
+        assert result[0]["has_embedding"] is True
+        assert result[0]["start_layer"] == 0
+        # worker 中游戏本 > 轻薄本，应分配更多层
         assert layers["client1"] >= layers["client2"], \
-            f"权重高应分配更多层: {layers}"
+            f"worker 权重高应分配更多层: {layers}"
+        total_layers = sum(layers.values())
+        assert total_layers == 24, f"总层数应为 24，实际: {total_layers}"
 
     def test_empty_nodes_returns_empty(self, sched):
         """空节点列表应返回空"""
         result = sched.compute_layer_assignment([])
         assert result == []
+
+    def test_android_nodes_excluded_from_layer_assignment(self, sched):
+        """Android HTTP/移动节点不参与 Transformer 层间拆分。"""
+        nodes = [
+            {"node_id": "master", "role": "master", "node_type": "pc", "device_info": PROFILE_WORKSTATION},
+            {"node_id": "pc-worker", "role": "client", "node_type": "pc", "device_info": PROFILE_LAPTOP},
+            {"node_id": "android-live", "role": "client", "node_type": "android", "device_info": PROFILE_MOBILE},
+        ]
+        result = sched.compute_layer_assignment(nodes)
+        node_ids = {a["node_id"] for a in result}
+        assert "android-live" not in node_ids
+        assert node_ids == {"master", "pc-worker"}
 
     def test_all_zero_weight_equal_split(self, sched):
         """权重全为 0 时应均分"""
@@ -276,7 +298,7 @@ class TestComputeLayerAssignment:
                 f"均分时每节点应有 ~8 层，实际 {a['node_id']}: {a['layers_count']}"
 
     def test_two_nodes_continuous(self, sched):
-        """两个节点时的分层应连续"""
+        """两个节点时 master 参与首段计算，分层应连续"""
         two = [
             {"node_id": "master", "role": "master", "device_info": PROFILE_WORKSTATION},
             {"node_id": "client1", "role": "client", "device_info": PROFILE_LAPTOP},
@@ -285,11 +307,17 @@ class TestComputeLayerAssignment:
         result.sort(key=lambda x: x["start_layer"])
 
         assert len(result) == 2
-        assert result[0]["start_layer"] == 0
-        assert result[0]["end_layer"] == result[1]["start_layer"]
-        assert result[1]["end_layer"] == 24
+        assert result[0]["node_id"] == "master"
+        assert result[0]["layers_count"] >= 1, \
+            f"master 应至少 1 层，实际: {result[0]['layers_count']}"
         assert result[0]["has_embedding"] is True
-        assert result[1]["has_lm_head"] is True
+        assert result[0]["start_layer"] == 0
+        assert "coordinator_only" not in result[0]
+        worker = result[1]
+        assert worker["node_id"] == "client1"
+        assert worker["start_layer"] == result[0]["end_layer"]
+        assert worker["end_layer"] == 24
+        assert worker["has_lm_head"] is True
 
     def test_each_node_has_min_one_layer(self, sched):
         """每个节点至少分配 1 层"""
@@ -463,6 +491,63 @@ class TestAndroidNodeManagement:
         )
         assert sched.delete_node("client1")["status"] == "online"
         assert "client1" in sched.nodes
+
+    def test_android_presence_registers_online_and_expires(self, sched, monkeypatch):
+        """Android HTTP thin client presence 应在线登记，并在超时后离线。"""
+        class DummyDb:
+            def __init__(self):
+                self.upserts = []
+                self.state_updates = []
+            def upsert_node(self, **kwargs):
+                self.upserts.append(kwargs)
+                return kwargs
+            def update_node_state(self, *args, **kwargs):
+                self.state_updates.append((args, kwargs))
+                return {}
+
+        dummy = DummyDb()
+        import scheduler as scheduler_mod
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: dummy)
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+        pushed = []
+        sched._push_node_update_to_all_clients = lambda *args: pushed.append(args)
+
+        result = sched.register_android_client(
+            "android-live",
+            hostname="Game Tablet",
+            network_type="wifi",
+            device_info={"gpu": {"renderer": "Adreno"}},
+            http_peer="100.64.1.2",
+        )
+        assert result["status"] == "registered"
+        node = sched.nodes["android-live"]
+        assert node.state == NodeState.ONLINE
+        assert node.node_type == "android"
+        assert node.device_info["connection_type"] == "http_thin"
+        assert node.device_info["pipeline_worker"] is False
+        assert node.device_info["http_peer"] == "100.64.1.2"
+        assert pushed and pushed[-1][1] == "add"
+
+        first_heartbeat = node.last_heartbeat
+        result = sched.register_android_client("android-live", hostname="Game Tablet 2")
+        assert result["status"] == "updated"
+        assert sched.nodes["android-live"].last_heartbeat >= first_heartbeat
+        assert pushed[-1][1] == "update"
+
+        sched._refresh_http_client_states(now=node.last_heartbeat + 121)
+        assert sched.nodes["android-live"].state == NodeState.OFFLINE
+        assert dummy.state_updates
+
+    def test_android_offline_does_not_block_nodes_ready(self, sched):
+        """Android HTTP 客户端离线不影响 PC worker readiness。"""
+        sched.nodes["android-offline"] = NodeInfo(
+            node_id="android-offline",
+            role="client",
+            node_type="android",
+            state=NodeState.OFFLINE,
+            device_info={"connection_type": "http_thin"},
+        )
+        assert sched.check_nodes_ready() is True
 
     def test_delete_offline_android_node_removes_and_pushes_remove(self, sched, monkeypatch):
         """离线 Android 节点删除后应从内存移除并广播 remove。"""
@@ -787,6 +872,37 @@ class TestPipelineMessageDispatch:
         messages = [r.getMessage() for r in caplog.records]
         assert any("PIPELINE_PAUSE" in m for m in messages)
         assert any("PIPELINE_RESUME" in m for m in messages)
+
+    def test_on_tcp_register_uses_advertised_addr_not_peer_port(self, sched, monkeypatch):
+        """_on_tcp_message(register) 应使用 advertised_addr 注册节点。"""
+        class FakeServer:
+            _running = True
+            def get_client_info(self, cid):
+                return {
+                    "advertised_addr": "10.0.0.9:8888",
+                    "peer_addr": "10.0.0.9:51234",
+                    "network_type": "wifi",
+                }
+        sched._tcp_server = FakeServer()
+        sched.nodes["pc-worker"] = NodeInfo(
+            node_id="pc-worker", role="client", node_type="pc",
+            state=NodeState.OFFLINE,
+        )
+        msg = {
+            "type": "register",
+            "data": {
+                "role": "client",
+                "node_type": "pc",
+                "hostname": "worker",
+                "advertised_address": "10.0.0.9:8888",
+            },
+        }
+        sched._on_tcp_message("pc-worker", msg)
+        node = sched.nodes["pc-worker"]
+        assert node.state == NodeState.ONLINE
+        assert node.address == "10.0.0.9:8888"
+        assert "tcp_peer_addr" in node.device_info
+        assert node.device_info["tcp_peer_addr"] == "10.0.0.9:51234"
 
     def test_tcp_disconnect_logs_and_marks_offline(self, sched, caplog):
         """TCP 断连应记录调度器层日志并标记节点离线。"""
@@ -1549,6 +1665,75 @@ class TestSimpleWeightAssignmentEdgeCases:
 
 
 # ================================================================
+# 运行时安全分层与任务统计
+# ================================================================
+
+class TestRuntimeSafeLayerAssignmentAndAccounting:
+    """测试 master 协调节点语义与分布式任务记账。"""
+
+    def test_low_score_master_does_not_steal_worker_layers(self):
+        """低分 master 仅保留 1 层锚定 Embedding，主要层仍归高分 worker"""
+        sched = Scheduler()
+        nodes = [
+            {"node_id": "master", "role": "master", "node_type": "pc", "device_info": PROFILE_EDGE},
+            {"node_id": "worker-fast", "role": "client", "node_type": "pc", "device_info": PROFILE_WORKSTATION},
+            {"node_id": "worker-mid", "role": "client", "node_type": "pc", "device_info": PROFILE_LAPTOP},
+        ]
+        result = sched.compute_layer_assignment(nodes)
+        by_id = {a["node_id"]: a for a in result}
+
+        # master 作为 Embedding 锚点至少 1 层，不再 coordinator-only
+        assert by_id["master"]["layers_count"] >= 1, \
+            f"低分 master 应保留 1 层锚定 Embedding，实际: {by_id['master']['layers_count']}"
+        assert "coordinator_only" not in by_id["master"]
+        assert by_id["master"]["has_embedding"] is True
+        assert by_id["master"]["start_layer"] == 0
+        # 高分 worker 仍拿主要层数
+        assert by_id["worker-fast"]["layers_count"] >= 14, \
+            f"高分 worker 应拿主要层数，实际: {by_id['worker-fast']['layers_count']}"
+        assert result[-1]["end_layer"] == 24
+        assert result[-1]["has_lm_head"] is True
+        assert sum(a["layers_count"] for a in result) == 24
+
+    def test_pipeline_task_accounting_counts_master_and_workers_once(self):
+        sched = Scheduler()
+        sched.nodes = {
+            "master": NodeInfo(node_id="master", role="master", state=NodeState.ONLINE),
+            "worker1": NodeInfo(node_id="worker1", role="client", state=NodeState.ONLINE),
+            "worker2": NodeInfo(node_id="worker2", role="client", state=NodeState.ONLINE),
+        }
+        sched._effective_role = lambda: "master"
+        sched._push_node_update_to_all_clients = lambda *args, **kwargs: None
+
+        accounting = sched._record_pipeline_task_accounting(
+            "task-1",
+            [{"node_id": "worker1"}, {"node_id": "worker2"}, {"node_id": "worker1"}],
+            success=True,
+        )
+        assert accounting["counted_nodes"] == ["master", "worker1", "worker2"]
+        assert accounting["workers_counted"] == ["worker1", "worker2"]
+        assert sched.nodes["master"].task_count == 1
+        assert sched.nodes["worker1"].task_count == 1
+        assert sched.nodes["worker2"].task_count == 1
+
+        dedup = sched._record_pipeline_task_accounting(
+            "task-1", [{"node_id": "worker1"}], success=True
+        )
+        assert dedup["deduplicated"] is True
+        assert sched.nodes["worker1"].task_count == 1
+
+    def test_local_pipeline_participation_is_idempotent(self):
+        sched = Scheduler()
+        sched.nodes = {
+            "client_node": NodeInfo(node_id="client_node", role="client", state=NodeState.ONLINE),
+        }
+        sched.get_effective_node_id = lambda: "client_node"
+        assert sched._record_local_pipeline_participation("task-local", success=True) is True
+        assert sched._record_local_pipeline_participation("task-local", success=True) is False
+        assert sched.nodes["client_node"].task_count == 1
+
+
+# ================================================================
 # get_status() — tcp_client 字段（从节点视角）
 # ================================================================
 
@@ -1642,3 +1827,745 @@ class TestCheckMasterHealthTcp:
         result = sched.check_master_health()
         assert "tcp_connected" in result, \
             "check_master_health 返回值应包含 tcp_connected 字段"
+
+
+# ================================================================
+# GPU 选择与评分测试 — 多 GPU / 独显/集显混合场景
+# ================================================================
+
+
+PROFILE_IGPU_ONLY = {
+    "gpu": {
+        "name": "Intel Iris Xe Graphics",
+        "vram_total_gb": 0.5,
+        "cuda_available": False,
+        "is_integrated": True,
+        "gpu_type": "integrated",
+    },
+    "ram": {"total_gb": 16.0},
+    "cpu": {"physical_cores": 8, "freq_max_mhz": 4000},
+}
+
+PROFILE_DGPU_ONLY = {
+    "gpu": {
+        "name": "NVIDIA GeForce RTX 4060",
+        "vram_total_gb": 8.0,
+        "cuda_available": True,
+        "is_integrated": False,
+        "gpu_type": "discrete",
+    },
+    "ram": {"total_gb": 16.0},
+    "cpu": {"physical_cores": 8, "freq_max_mhz": 4000},
+}
+
+PROFILE_MULTI_GPU = {
+    "gpu": {       # ← 用户前端默认选中的"当前"GPU 被集显占领
+        "name": "Intel Iris Xe Graphics",
+        "vram_total_gb": 0.5,
+        "cuda_available": False,
+        "is_integrated": True,
+        "gpu_type": "integrated",
+    },
+    "gpus": [
+        {
+            "name": "Intel Iris Xe Graphics",
+            "vram_total_gb": 0.5,
+            "cuda_available": False,
+            "is_integrated": True,
+            "gpu_type": "integrated",
+        },
+        {
+            "name": "NVIDIA GeForce RTX 4060",
+            "vram_total_gb": 8.0,
+            "cuda_available": True,
+            "is_integrated": False,
+            "gpu_type": "discrete",
+        },
+    ],
+    "selected_gpu_index": 0,
+    "ram": {"total_gb": 16.0},
+    "cpu": {"physical_cores": 8, "freq_max_mhz": 4000},
+}
+
+PROFILE_DGPU_NO_IS_INTEGRATED_FIELD = {
+    "gpu": {
+        "name": "NVIDIA GeForce RTX 4070",
+        "vram_total_gb": 12.0,
+        "cuda_available": True,
+        "gpu_type": "discrete",
+    },
+    "ram": {"total_gb": 32.0},
+    "cpu": {"physical_cores": 12, "freq_max_mhz": 4200},
+}
+
+
+class TestGpuSelection:
+    """测试 _select_scoring_gpu() 和 _gpu_is_integrated()"""
+
+    @pytest.fixture
+    def sched(self):
+        return Scheduler()
+
+    def test_fallback_to_gpus_list_for_discrete(self, sched):
+        """多 GPU 画像 + 集显为 current → 应选中 gpus 里的 CUDA 独显"""
+        gpu = sched._select_scoring_gpu(PROFILE_MULTI_GPU)
+        assert gpu["cuda_available"] is True
+        assert "nvidia" in gpu["name"].lower() or "rtx" in gpu["name"].lower()
+
+    def test_single_gpu_works(self, sched):
+        """仅一个 GPU 且为独显 → 直接返回"""
+        gpu = sched._select_scoring_gpu(PROFILE_DGPU_ONLY)
+        assert gpu["cuda_available"] is True
+
+    def test_igpu_only_no_change(self, sched):
+        """仅集显 → 返回自身"""
+        gpu = sched._select_scoring_gpu(PROFILE_IGPU_ONLY)
+        assert gpu.get("is_integrated") is True
+        assert gpu.get("cuda_available") is False
+
+    def test_missing_is_integrated_field(self, sched):
+        """缺少 is_integrated 但 gpu_type=discrete+cuda → 判为非集显"""
+        gpu = sched._select_scoring_gpu(PROFILE_DGPU_NO_IS_INTEGRATED_FIELD)
+        assert gpu["cuda_available"] is True
+
+    def test_empty_device_info(self, sched):
+        """空画像 → 返回空 dict"""
+        assert sched._select_scoring_gpu({}) == {}
+        assert sched._select_scoring_gpu(None) == {}
+
+
+class TestGpuIsIntegrated:
+    """测试 _gpu_is_integrated() 的启发式判断（静态方法，无需实例化）"""
+
+    @staticmethod
+    def _gpu_is_integrated(gpu):
+        return Scheduler._gpu_is_integrated(gpu)
+
+    def test_explicit_false(self):
+        assert self._gpu_is_integrated({"is_integrated": False}) is False
+
+    def test_explicit_true(self):
+        assert self._gpu_is_integrated({"is_integrated": True}) is True
+
+    def test_gpu_type_discrete(self):
+        assert self._gpu_is_integrated({"gpu_type": "discrete"}) is False
+
+    def test_gpu_type_integrated(self):
+        assert self._gpu_is_integrated({"gpu_type": "integrated"}) is True
+
+    def test_nvidia_name_marker(self):
+        assert self._gpu_is_integrated({
+            "name": "NVIDIA GeForce GTX 1660", "cuda_available": True,
+        }) is False
+
+    def test_intel_uhd_name_marker(self):
+        assert self._gpu_is_integrated({"name": "Intel UHD Graphics 630"}) is True
+
+    def test_unknown_defaults_true(self):
+        """无提示 → 保守判为集显"""
+        assert self._gpu_is_integrated({"name": "Foo Bar"}) is True
+
+
+# ================================================================
+# _normalize_master_anchor 测试
+# ================================================================
+
+
+class TestNormalizeMasterAnchor:
+    """测试统一分层不变量：master 作为首段 Embedding 锚点"""
+
+    @pytest.fixture
+    def sched(self):
+        return Scheduler()
+
+    def _nl(self, items=None):
+        """便捷构造 node_list"""
+        default = [
+            {"node_id": "master", "role": "master",
+             "device_info": PROFILE_WORKSTATION},
+            {"node_id": "client1", "role": "client",
+             "device_info": PROFILE_LAPTOP},
+            {"node_id": "client2", "role": "client",
+             "device_info": PROFILE_ULTRABOOK},
+        ]
+        return items if items is not None else default
+
+    def test_master_becomes_first_with_at_least_one_layer(self, sched):
+        """master 在 assignments 中应为首位且至少 1 层"""
+        node_list = self._nl()
+        assignments = [
+            {"node_id": "client1", "start_layer": 0, "end_layer": 18,
+             "layers_count": 18, "has_embedding": True, "has_lm_head": False,
+             "score": 50, "role": "client"},
+            {"node_id": "master", "start_layer": 18, "end_layer": 24,
+             "layers_count": 6, "has_embedding": False, "has_lm_head": True,
+             "score": 100, "role": "master"},
+        ]
+        result = sched._normalize_master_anchor(assignments, node_list, 24)
+        assert result[0]["node_id"] == "master"
+        assert result[0]["has_embedding"] is True
+        assert result[0]["layers_count"] >= 1
+
+    def test_master_not_in_assignments_yet_in_node_list(self, sched):
+        """master 未在 assignments 中但在 node_list 中 → 应补入并置首"""
+        node_list = self._nl()
+        assignments = [
+            {"node_id": "client1", "start_layer": 0, "end_layer": 24,
+             "layers_count": 24, "has_embedding": True, "has_lm_head": True,
+             "score": 50, "role": "client"},
+        ]
+        result = sched._normalize_master_anchor(assignments, node_list, 24)
+        assert result[0]["node_id"] == "master"
+        assert result[0]["has_embedding"] is True
+        assert result[0]["start_layer"] == 0
+        assert result[-1]["has_lm_head"] is True
+        assert sum(a["layers_count"] for a in result) == 24
+
+    def test_no_master_in_node_list_passes_through(self, sched):
+        """node_list 中无 master → 原样返回但区间重新排序"""
+        node_list = self._nl([
+            {"node_id": "client1", "role": "client", "device_info": PROFILE_LAPTOP},
+            {"node_id": "client2", "role": "client", "device_info": PROFILE_ULTRABOOK},
+        ])
+        assignments = [
+            {"node_id": "client1", "start_layer": 0, "end_layer": 18,
+             "layers_count": 18, "has_embedding": True, "has_lm_head": False,
+             "score": 50, "role": "client"},
+            {"node_id": "client2", "start_layer": 18, "end_layer": 24,
+             "layers_count": 6, "has_embedding": False, "has_lm_head": True,
+             "score": 10, "role": "client"},
+        ]
+        result = sched._normalize_master_anchor(assignments, node_list, 24)
+        assert len(result) == 2
+        assert result[0]["has_embedding"] is True
+        assert result[-1]["has_lm_head"] is True
+        assert sum(a["layers_count"] for a in result) == 24
+
+    def test_master_gets_zero_layers_becomes_one(self, sched):
+        """master layers_count=0 → 变为 1，从低分节点回收"""
+        node_list = self._nl()
+        assignments = [
+            {"node_id": "client1", "start_layer": 0, "end_layer": 12,
+             "layers_count": 12, "has_embedding": True, "has_lm_head": False,
+             "score": 50, "role": "client"},
+            {"node_id": "master", "start_layer": 12, "end_layer": 12,
+             "layers_count": 0, "has_embedding": False, "has_lm_head": False,
+             "score": 100, "role": "master"},
+            {"node_id": "client2", "start_layer": 12, "end_layer": 24,
+             "layers_count": 12, "has_embedding": False, "has_lm_head": True,
+             "score": 10, "role": "client"},
+        ]
+        result = sched._normalize_master_anchor(assignments, node_list, 24)
+        assert result[0]["node_id"] == "master"
+        assert result[0]["layers_count"] >= 1
+        assert sum(a["layers_count"] for a in result) == 24
+
+
+# ================================================================
+# 分布式推理集成测试 — 全链路流水线编排
+# ================================================================
+
+
+class TestPipelineOrchestrationIntegration:
+    """
+    集成测试：模拟真实分布式推理场景。
+
+    覆盖关键路径：
+    1. master 在线 + 所有 worker 离线 → fallback 本地推理
+    2. master 参与流水线首段 → layer 分配正确
+    3. 多 GPU 画像 → 独显评分不被集显压低
+    4. Android 节点注册后保持在线（不被 init_nodes 强制离线）
+    """
+
+    @pytest.fixture
+    def sched_master(self, monkeypatch):
+        """创建一个"主节点" scheduler，含模拟 TCP 服务端"""
+        s = Scheduler()
+        # 伪装为主节点
+        s._role_override = "master"
+        monkeypatch.setattr(s, "_effective_role", lambda: "master")
+        # 注入假 TCP 服务端（满足就绪检查和 get_status 的属性访问）
+        fake_server = type('FakeTCPServer', (), {
+            '_running': True,
+            'host': '0.0.0.0',
+            'port': 8888,
+            'clients': {},
+            'send_to_client': lambda self, cid, data, msg_type: None,
+            'broadcast_layer_config': lambda self, assignments: None,
+            'get_client_ids': lambda self: list(self.clients.keys()),
+            'get_client_info': lambda self, cid: {},
+        })()
+        s._tcp_server = fake_server
+
+        # 注入 master 节点自身
+        s.nodes["master"] = NodeInfo(
+            node_id="master", role="master", state=NodeState.ONLINE,
+            node_type="pc", hostname="master-host",
+            device_info=PROFILE_WORKSTATION,
+        )
+        return s
+
+    @pytest.fixture
+    def sched_with_workers(self, sched_master, monkeypatch):
+        """主节点 + 2 个 PC worker 在线"""
+        s = sched_master
+        for nid, profile in [("worker1", PROFILE_LAPTOP), ("worker2", PROFILE_ULTRABOOK)]:
+            s.nodes[nid] = NodeInfo(
+                node_id=nid, role="client", state=NodeState.ONLINE,
+                node_type="pc", address=f"100.64.1.{2 if '1' in nid else 3}:8888",
+                hostname=nid, device_info=profile,
+                last_heartbeat=time.time(),
+            )
+        # 层配置标记为"已推送"
+        s._layer_config_pushed.update(["worker1", "worker2"])
+        # 模拟 TCP 服务端已知这些 client
+        s._tcp_server.clients = {"worker1": True, "worker2": True}
+        # 移除 get_layer_assignments 的 DB 依赖，直接用 compute 结果
+        monkeypatch.setattr(s, "get_layer_assignments", lambda: {
+            "total": 24,
+            "strategy": "dynamic",
+            "assignments": s.compute_layer_assignment(),
+        })
+        return s
+
+    # ----------------------------------------------------------
+    # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
+    # ----------------------------------------------------------
+
+    def test_all_workers_offline_triggers_fallback(self, sched_master, monkeypatch):
+        """无可用 worker → run_pipeline_safe 应回退到全模型推理"""
+        fallback_called = []
+        pipeline_called = []
+
+        def fake_fallback(prompt, **kw):
+            fallback_called.append((prompt, kw))
+            return {"response": "fallback_response", "metrics": {"fallback": True}}
+
+        monkeypatch.setattr(sched_master, "_run_full_model_inference", fake_fallback)
+        monkeypatch.setattr(sched_master, "run_pipeline", lambda **kw: pipeline_called.append(1) or {})
+
+        result = sched_master.run_pipeline_safe("测试 prompt")
+
+        assert len(fallback_called) == 1
+        assert len(pipeline_called) == 0
+        assert result["response"] == "fallback_response"
+        assert result["metrics"]["fallback"] is True
+
+    def test_all_workers_offline_get_status_shows_offline(self, sched_master):
+        """worker 离线时 get_status 应正确反映离线状态"""
+        sched_master.nodes["worker-x"] = NodeInfo(
+            node_id="worker-x", role="client", state=NodeState.OFFLINE,
+            node_type="pc",
+        )
+        status = sched_master.get_status()
+        nodes = status["nodes"]
+        assert nodes["master"]["is_available"] is True
+        assert nodes["worker-x"]["is_available"] is False
+
+    # ----------------------------------------------------------
+    # 场景 2：master 参与流水线 → 层分配正确
+    # ----------------------------------------------------------
+
+    def test_layer_assignment_master_has_embedding(self, sched_with_workers):
+        """master 应作为首段 Embedding 锚点参与层分配"""
+        info = sched_with_workers.get_layer_assignments()
+        assignments = info["assignments"]
+        # master 至少 1 层
+        master = [a for a in assignments if a.get("role") == "master"]
+        assert len(master) >= 1, "master 应在 assignments 中"
+        m = master[0]
+        assert m["has_embedding"] is True
+        assert m["start_layer"] == 0
+        assert m["layers_count"] >= 1
+        # worker1 分数高于 worker2 → 应拿更多层
+        workers = [a for a in assignments if a["node_id"] != "master"]
+        assert len(workers) >= 1
+        if len(workers) >= 2:
+            assert workers[0]["layers_count"] >= workers[1]["layers_count"]
+
+    def test_master_layer_range_is_contiguous_with_workers(self, sched_with_workers):
+        """master 的层范围 + worker 的层范围应连续覆盖 [0, 24)"""
+        info = sched_with_workers.get_layer_assignments()
+        assignments = info["assignments"]
+        assignments.sort(key=lambda a: a["start_layer"])
+        cursor = 0
+        for a in assignments:
+            assert a["start_layer"] == cursor, \
+                f"断点于 {a['node_id']}: 期望 {cursor}, 实际 {a['start_layer']}"
+            cursor = a["end_layer"]
+        assert cursor == 24, f"末节点 end_layer 应为 24, 实际 {cursor}"
+
+    # ----------------------------------------------------------
+    # 场景 3：多 GPU / 独显评分
+    # ----------------------------------------------------------
+
+    def test_mixed_gpu_profile_selects_discrete_for_scoring(self, sched_master):
+        """多 GPU 画像（集显 front + 独显 in gpus）→ 评分优先用独显"""
+        master = sched_master.nodes["master"]
+        # 模拟：device_info["gpu"] 是集显，但 gpus 里含独显
+        master.device_info = PROFILE_MULTI_GPU
+        # 通过 compute_layer_assignment 间接计算 weight
+        # 先 _compute_node_weight 验证
+        weight = sched_master._compute_node_weight(PROFILE_MULTI_GPU)
+        # 独显 RTX 4060: VRAM=8/24*50=16.7, RAM=16/64*30=7.5, CPU=8/16*10+4000/4000*10=15, Bonus=15 → ≈54.2
+        assert weight >= 40, f"独显评分不应被集显压低，实际: {weight:.1f}"
+
+        weight_igpu = sched_master._compute_node_weight(PROFILE_IGPU_ONLY)
+        # 集显: VRAM=0.5/24*50≈1.0, RAM=16/64*30=7.5, CPU=15, Bonus=0 → ≈23.5
+        assert weight > weight_igpu + 15, \
+            f"含独显画像评分({weight:.1f})应明显高于纯集显({weight_igpu:.1f})"
+
+    def test_vram_uses_scoring_gpu_not_frontend_gpu(self, sched_master):
+        """_get_node_vram_mb 应使用评分 GPU 而非前端选中 GPU"""
+        master = sched_master.nodes["master"]
+        master.device_info = PROFILE_MULTI_GPU
+        vram_mb = sched_master._get_node_vram_mb("master")
+        # 独显 RTX 4060: 8GB → 8192 MB
+        assert vram_mb == 8.0 * 1024, \
+            f"VRAM 应为独显的 8192MB, 实际: {vram_mb}"
+
+        master.device_info = PROFILE_IGPU_ONLY
+        vram_igpu = sched_master._get_node_vram_mb("master")
+        assert vram_igpu == 0.5 * 1024, \
+            f"纯集显 VRAM 应为 512MB, 实际: {vram_igpu}"
+
+    # ----------------------------------------------------------
+    # 场景 4：Android 节点状态管理
+    # ----------------------------------------------------------
+
+    def test_android_node_stays_online_after_register(self, sched_master):
+        """Android HTTP 客户端注册后应保持 online"""
+        sched_master.register_android_client(
+            "android-1", hostname="Pixel 7", network_type="wifi",
+        )
+        assert sched_master.nodes["android-1"].state == NodeState.ONLINE
+        assert sched_master.nodes["android-1"].node_type == "android"
+
+        # 调用 refresh（模拟心跳检查）— 不应立即标记离线
+        sched_master._refresh_http_client_states(now=time.time() + 30)
+        assert sched_master.nodes["android-1"].state == NodeState.ONLINE, \
+            "30 秒后 Android 仍应在线"
+
+    def test_android_node_offline_after_timeout(self, sched_master):
+        """Android 客户端超时后应变为 offline"""
+        sched_master.register_android_client("android-2", hostname="Tablet")
+        # 快进 121 秒（超过 120s 超时）
+        sched_master._refresh_http_client_states(now=time.time() + 121)
+        assert sched_master.nodes["android-2"].state == NodeState.OFFLINE
+
+    def test_android_node_not_forced_offline_in_init(self, sched_master, monkeypatch):
+        """Android HTTP 客户端在 init_nodes 中不应被强制 offline"""
+        import scheduler as sched_mod
+
+        now = time.time()
+        db_row = {
+            "node_id": "android-db", "role": "client", "node_type": "android",
+            "state": "online", "address": "1.2.3.4", "hostname": "Phone",
+            "device_info": {"connection_type": "http_thin"},
+            "network_type": "wifi", "connected_at": now,
+            "last_heartbeat": now, "task_count": 0, "error_count": 0,
+            "model_sha256": "", "avg_rtt_ms": 0.0, "last_rtt_ms": 0.0,
+        }
+
+        class DummyDb:
+            def get_all_nodes(self):
+                return [db_row]
+            def delete_node(self, nid):
+                pass
+            def upsert_node(self, **kw):
+                pass
+            def update_node_state(self, **kw):
+                pass
+            def get_config(self, k, d):
+                return d
+            def set_config(self, k, v):
+                pass
+
+        monkeypatch.setattr(sched_mod, "_db_available", True)
+        monkeypatch.setattr(sched_mod, "_get_db", lambda: DummyDb())
+        monkeypatch.setattr(sched_mod, "RUN_MODE", "distributed")
+
+        # 在新 scheduler 上运行 init_nodes（避免 sched_master fixture 已初始化）
+        s2 = Scheduler()
+        s2._role_override = "master"
+        monkeypatch.setattr(s2, "_effective_role", lambda: "master")
+        s2._tcp_server = sched_master._tcp_server
+        s2.init_nodes()
+
+        assert "android-db" in s2.nodes, f"Android 节点应被恢复，实际节点列表: {list(s2.nodes.keys())}"
+        android = s2.nodes["android-db"]
+        assert android.node_type == "android"
+        # ★ 关键断言：Android HTTP 节点不应被强制 offline
+        assert android.state == NodeState.ONLINE, \
+            f"Android 节点应是 ONLINE，实际: {android.state}"
+
+    # ----------------------------------------------------------
+    # 场景 5：ensure_full_model 在 fallback 中触发
+    # ----------------------------------------------------------
+
+    def test_fallback_calls_ensure_full_model(self, sched_master, monkeypatch):
+        """流水线裁剪后回退本地推理 → 必须确保模型为完整模型"""
+        import api_server as _api
+
+        ensure_calls = []
+        chat_calls = []
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+            layer_range = (0, 4)  # 模拟被裁剪过
+            _layer_has_embedding = True
+            _layer_has_lm_head = False
+            tokenizer = None
+
+            def ensure_full_model(self, **kw):
+                ensure_calls.append(kw)
+                self.layer_range = None
+                self._layer_has_lm_head = True
+
+            def chat(self, messages, **kw):
+                chat_calls.append((messages, kw))
+                return {"content": "fallback reply", "usage": {}, "tokens_per_second": 10.0}
+
+            def chat_stream(self, messages, **kw):
+                chat_calls.append(("stream", messages, kw))
+                yield "fallback"
+                yield " reply"
+
+        mock_mgr = MockModelManager()
+        monkeypatch.setattr(_api, "model_manager", mock_mgr)
+
+        result = sched_master._run_full_model_inference(
+            "test prompt", max_new_tokens=32,
+            _fallback_reason="test_fallback",
+        )
+        # 确认 ensure_full_model 被调用
+        assert len(ensure_calls) >= 1, "fallback 前应调用 ensure_full_model"
+        # 确认 chat 也被调用
+        assert len(chat_calls) >= 1
+        assert result["response"] == "fallback reply"
+        assert result["metrics"]["fallback"] is True
+        assert result["metrics"]["fallback_reason"] == "test_fallback"
+
+    # ----------------------------------------------------------
+    # 场景 6：master 参与 pipeline 时的 run_pipeline 编排
+    # ----------------------------------------------------------
+
+    def test_run_pipeline_master_loads_local_layer_range(self, sched_with_workers, monkeypatch):
+        """run_pipeline 应在 master_participates 时调用 load_layer_range"""
+        import api_server as _api
+
+        layer_loads = []
+        forward_calls = []
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+            tokenizer = None
+            layer_range = None
+            _layer_has_embedding = True
+            _layer_has_lm_head = True
+            quant_type = "int4"
+
+            def load_layer_range(self, start, end, has_embedding, has_lm_head, **kw):
+                layer_loads.append((start, end, has_embedding, has_lm_head))
+
+            def ensure_layer_range(self, start, end, has_embedding, has_lm_head, **kw):
+                layer_loads.append(("ensure", start, end, has_embedding, has_lm_head))
+
+            def forward_layers(self, **kw):
+                forward_calls.append(kw)
+                import torch
+                bs = kw.get("input_ids").shape[0] if kw.get("input_ids") is not None else 1
+                sl = kw.get("input_ids").shape[1] if kw.get("input_ids") is not None else 1
+                return {"hidden_states": torch.randn(bs, sl, 2048),
+                        "past_key_values": ((torch.randn(1, 16, sl, 64),
+                                             torch.randn(1, 16, sl, 64)),)}
+
+            def get_device(self):
+                import torch
+                return torch.device("cpu")
+
+        mock_mgr = MockModelManager()
+
+        # 构建 tokenizer mock
+        class MockTokenizer:
+            eos_token_id = 151643
+            def __call__(self, prompt, **kw):
+                import torch
+                return {"input_ids": torch.randint(0, 1000, (1, 8)),
+                        "attention_mask": torch.ones(1, 8)}
+            def decode(self, ids, **kw):
+                return "mock response"
+
+        mock_mgr.tokenizer = MockTokenizer()
+        monkeypatch.setattr(_api, "model_manager", mock_mgr)
+
+        # 也需要 mock _send_to_worker 和 _wait_for_layer_result
+        send_calls = []
+        monkeypatch.setattr(sched_with_workers, "_send_to_worker",
+                           lambda wid, data, mtype: send_calls.append((wid, data, mtype)))
+
+        # 模拟 worker 返回 logits（末节点）
+        # _wait_for_layer_result 内部已将 base64 解码为 bytes
+        import torch
+        from tcp_comm import serialize_tensor_fast
+        fake_logits = torch.randn(1, 8, 151936)
+        fake_logits_raw = serialize_tensor_fast(fake_logits)  # bytes
+
+        monkeypatch.setattr(sched_with_workers, "_wait_for_layer_result",
+                           lambda tid, nids, timeout: {
+                               "task_id": tid,
+                               "node_id": nids[-1] if isinstance(nids, list) else nids,
+                               "step": 0,
+                               "logits": fake_logits_raw,
+                           })
+
+        result = sched_with_workers.run_pipeline(
+            "hello world", max_new_tokens=3, temperature=0.7, top_p=0.9,
+        )
+
+        # 验证 master 加载了层范围
+        assert len(layer_loads) >= 1, "master 应调用 load_layer_range/ensure_layer_range"
+        # 验证 master 本地 forward 被调用
+        assert len(forward_calls) >= 1, "master 本地 forward_layers 应被调用"
+        # 验证发送了 LAYER_FORWARD 给 worker
+        layer_forwards = [c for c in send_calls if c[2] is not None]
+        assert len(layer_forwards) >= 1, "应发送 LAYER_FORWARD 给 worker"
+        # 验证返回了结果
+        assert "response" in result or "error" in result
+
+    def test_run_pipeline_safe_immediate_path_locks(self, sched_with_workers, monkeypatch):
+        """立即执行路径应正确管理 inference_lock（不产生死锁或泄漏）"""
+        import api_server as _api
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+            tokenizer = None
+            layer_range = None
+            _layer_has_embedding = True
+            _layer_has_lm_head = True
+            quant_type = "int4"
+
+            def ensure_layer_range(self, start_layer, end_layer, has_embedding, has_lm_head, **kw):
+                pass
+
+            def forward_layers(self, **kw):
+                import torch
+                bs = 1; sl = 4
+                return {"hidden_states": torch.randn(bs, sl, 2048),
+                        "past_key_values": ((torch.randn(1, 16, sl, 64),
+                                             torch.randn(1, 16, sl, 64)),)}
+
+            def get_device(self):
+                import torch
+                return torch.device("cpu")
+
+        mock_mgr = MockModelManager()
+        class MockTokenizer:
+            eos_token_id = 151643
+            def __call__(self, prompt, **kw):
+                import torch
+                return {"input_ids": torch.randint(0, 1000, (1, 4)),
+                        "attention_mask": torch.ones(1, 4)}
+            def decode(self, ids, **kw):
+                return "mock"
+
+        mock_mgr.tokenizer = MockTokenizer()
+        monkeypatch.setattr(_api, "model_manager", mock_mgr)
+        monkeypatch.setattr(sched_with_workers, "_send_to_worker",
+                           lambda wid, data, mtype: None)
+
+        import torch
+        from tcp_comm import serialize_tensor_fast
+        fake_logits = torch.randn(1, 4, 151936)
+        fake_logits_raw = serialize_tensor_fast(fake_logits)  # bytes — 模拟 _wait_for_layer_result 解码后的返回值
+        monkeypatch.setattr(sched_with_workers, "_wait_for_layer_result",
+                           lambda tid, nids, timeout: {
+                               "task_id": tid, "node_id": "worker1", "step": 0,
+                               "logits": fake_logits_raw,
+                           })
+
+        result = sched_with_workers.run_pipeline_safe("test")
+        # 验证锁已正常释放（不是死锁）
+        assert not sched_with_workers._inference_lock.locked(), \
+            "推理锁应在 run_pipeline_safe 返回后释放"
+        assert "error" not in result or result.get("response"), \
+            f"不应返回致命错误: {result.get('error', '')}"
+
+
+# ================================================================
+# Phase 7 P0: _effective_role 实现逻辑测试
+# ================================================================
+
+class TestEffectiveRole:
+    """测试 _effective_role() 的实现逻辑（非 mock）。"""
+
+    def test_default_role_from_config(self):
+        """默认角色来自 NODE_ROLE 配置。"""
+        s = Scheduler()
+        # 新 Scheduler 未设置 _role_override，直接读 NODE_ROLE
+        role = s._effective_role()
+        assert role in ("master", "client"), \
+            f"有效角色应为 master 或 client，实际: {role}"
+
+    def test_role_override_takes_precedence(self):
+        """_role_override 应优先于 NODE_ROLE。"""
+        s = Scheduler()
+        s._role_override = "client"
+        assert s._effective_role() == "client"
+
+    def test_role_override_empty_falls_through_to_config(self):
+        """空字符串 override 应回退到 NODE_ROLE（falsy 值处理）。"""
+        s = Scheduler()
+        s._role_override = ""
+        role = s._effective_role()
+        # 空字符串为 falsy → or 短路 → NODE_ROLE
+        assert role in ("master", "client")
+
+
+# ================================================================
+# Phase 7 P1: compute_layer_assignment 边界测试
+# ================================================================
+
+class TestComputeLayerAssignmentEdgeCases:
+    """测试 compute_layer_assignment 的极端情况。"""
+
+    @pytest.fixture
+    def sched(self):
+        s = Scheduler()
+        s.nodes = {}
+        return s
+
+    def test_zero_vram_node_fallback_to_min_one_layer(self, sched):
+        """0 VRAM 的节点不应崩溃，应回退到最小 1 层分配。"""
+        nodes = [
+            {"node_id": "master", "role": "master", "node_type": "pc",
+             "device_info": {"gpu": {"vram_total_gb": 0.0, "cuda_available": False},
+                             "ram": {"total_gb": 8.0}, "cpu": {"physical_cores": 4}}},
+            {"node_id": "w1", "role": "client", "node_type": "pc",
+             "device_info": {"gpu": {"vram_total_gb": 0.0, "cuda_available": False},
+                             "ram": {"total_gb": 8.0}, "cpu": {"physical_cores": 4}}},
+        ]
+        result = sched.compute_layer_assignment(nodes)
+        assert len(result) >= 1
+        total = sum(a["layers_count"] for a in result)
+        assert total == 24
+        # 验证每个节点至少分配 1 层（0-VRAM 回退保证）
+        for a in result:
+            assert a["layers_count"] >= 1, (
+                f"节点 {a['node_id']} 分配到 {a['layers_count']} 层，"
+                f"期望至少 1 层 (0-VRAM 回退)"
+            )
+
+    def test_only_android_nodes_returns_empty(self, sched):
+        """仅 Android 节点应返回空分配（Android 不参与层拆分）。"""
+        nodes = [
+            {"node_id": "android-a", "role": "client", "node_type": "android",
+             "device_info": {"platform": "android"}},
+            {"node_id": "android-b", "role": "client", "node_type": "android",
+             "device_info": {"platform": "android"}},
+        ]
+        result = sched.compute_layer_assignment(nodes)
+        assert result == []
