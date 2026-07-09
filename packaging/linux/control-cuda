@@ -1,0 +1,26 @@
+Package: qlh-edge-inference-cuda
+Version: 0.1.7
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: QLH Team <qlh@example.com>
+Homepage: https://github.com/qlh/qlh-edge-inference
+Depends: python3 (>= 3.10), python3-venv
+Recommends: tailscale, zenity, nvidia-driver-535 | nvidia-driver-545 | nvidia-driver-550 | nvidia-driver-560
+Description: 轻量化大模型分布式边缘推理系统（独显版）
+ QLH 边缘推理系统 (Quantized Lightweight Heterogeneous
+ Distributed Edge Inference System) — CUDA 版本。
+ .
+ 双引擎架构:
+   1. PyTorch + bitsandbytes INT4 — 推荐引擎 (~1.75 GB 显存)
+   2. llama.cpp + GGUF Q4_K_M — 备选引擎
+ .
+ 功能特性:
+   - 单机推理（CUDA/独显加速）
+   - 分布式流水线推理（多 PC 协同，层间拆分）
+   - Android HTTP 薄客户端支持
+   - Web 管理面板（FastAPI + React，端口 8000）
+   - Tailscale 虚拟组网（跨子网互联）
+ .
+ 注意: 本包需在 NVIDIA GPU 驱动已安装的 Ubuntu 系统上使用，
+ 此包通过 pip 安装 CUDA 版 PyTorch（自带 CUDA 12.x 共享库 .so）。

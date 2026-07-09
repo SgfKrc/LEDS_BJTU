@@ -30,7 +30,7 @@ const DEFAULT_SETTINGS = {
   maxNewTokens: 512,
   temperature: 0.7,
   topP: 0.9,
-  distributedInference: true,  // 分布式推理：主节点默认开启，从节点从服务端同步
+  distributedInference: false, // 分布式推理：启动时从服务端同步，避免默认假设导致状态不一致
   cloudSync: true,             // 云同步设置偏好：默认开启，确保跨设备设置一致
   showThinking: false,         // 深度思考展示：默认关闭
   streamingMode: 'full',       // 流式输出模式: full=完整功能（历史/追问/持久化，默认）| fast=真流式逐token
@@ -135,6 +135,7 @@ export default function App() {
   // 后台管理 Tab 是否可见
   const showAdminTab = !myRole                     // 加载中：显示（兜底）
     || myRole.is_master                           // 主节点：始终显示
+    || myRole.node_role === 'unknown'             // 未识别：显示（需手动配置连接）
     || (myRole.is_client && settings.distributedInference);  // 从节点：需开启分布式推理
 
   const toggleTheme = useCallback(() => {

@@ -56,6 +56,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.data.MessageEntity
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -234,6 +235,15 @@ private fun ChatBubble(
                         }
                     }
                 }
+            }
+
+            if (!isUser && !message.metrics.isNullOrBlank()) {
+                Text(
+                    text = formatMetrics(message.metrics),
+                    modifier = Modifier.padding(top = 4.dp, start = 4.dp, end = 4.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
 
             // 时间戳
@@ -484,4 +494,32 @@ private fun UserAvatar() {
 private fun formatTime(timestamp: Long): String {
     val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
     return sdf.format(Date(timestamp))
+}
+
+private fun formatMetrics(metricsJson: String): String {
+    return try {
+        val obj = JSONObject(metricsJson)
+        val parts = mutableListOf<String>()
+        val engine = obj.optString("engine", obj.optString("execution_mode", ""))
+        if (engine.isNotBlank()) parts += engine.replace("distributed_pipeline", "Pipeline")
+        if (obj.has("distributed_used")) {
+            parts += if (obj.optBoolean("distributed_used")) "分布式: 是" else "分布式: 否"
+        }
+        val tokens = listOf("generated_tokens", "new_tokens", "completion_tokens", "tokens_generated")
+            .firstNotNullOfOrNull { key -> obj.optInt(key, 0).takeIf { it > 0 } }
+        if (tokens != null) parts += "$tokens tokens"
+        val tps = when {
+            obj.optDouble("tokens_per_second", 0.0) > 0 -> obj.optDouble("tokens_per_second")
+            obj.optDouble("tokens_per_sec", 0.0) > 0 -> obj.optDouble("tokens_per_sec")
+            else -> 0.0
+        }
+        if (tps > 0) parts += "%.1f tok/s".format(tps)
+        val route = obj.optString("route", "")
+        if (route.isNotBlank()) parts += route
+        val fallback = obj.optString("fallback_reason", "")
+        if (fallback.isNotBlank()) parts += "回退: $fallback"
+        parts.joinToString(" · ").ifBlank { metricsJson }
+    } catch (_: Exception) {
+        metricsJson
+    }
 }

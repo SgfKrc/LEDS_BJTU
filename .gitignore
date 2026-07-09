@@ -45,5 +45,8 @@ build/
 packaging/dist/
 packaging/build/
 packaging/__pycache__/
+
+# Packaging virtual environments (CPU + CUDA, must remain separate)
 packaging/.venv-packaging/
 .venv-packaging/
+.venv-packaging-cuda/

@@ -35,7 +35,15 @@ data class ChatRequest(
     @SerializedName("session_id")
     val sessionId: String? = null,
     @SerializedName("streaming_mode")
-    val streamingMode: String = "full"    // "full" | "fast"（对应 PC 端 streaming_mode）
+    val streamingMode: String = "full",    // "full" | "fast"（对应 PC 端 streaming_mode）
+    @SerializedName("client_node_id")
+    val clientNodeId: String? = null,
+    @SerializedName("client_node_type")
+    val clientNodeType: String? = null,
+    @SerializedName("client_mode")
+    val clientMode: String? = null,
+    @SerializedName("client_app_variant")
+    val clientAppVariant: String? = null
 )
 
 data class ChatResponse(
@@ -92,7 +100,15 @@ data class RegisterNodeRequest(
     @SerializedName("network_type")
     val networkType: String = "unknown",
     @SerializedName("node_type")
-    val nodeType: String = "android"
+    val nodeType: String = "android",
+    @SerializedName("device_info")
+    val deviceInfo: Map<String, Any?> = emptyMap(),
+    @SerializedName("client_mode")
+    val clientMode: String = "thin",
+    @SerializedName("app_variant")
+    val appVariant: String = if (BuildConfig.IS_LITE) "lite" else "full",
+    @SerializedName("app_version")
+    val appVersion: String = BuildConfig.VERSION_NAME
 )
 
 data class RegisterNodeResponse(
@@ -284,7 +300,7 @@ class ApiClient(
         try {
             val body = gson.toJson(request).toRequestBody(jsonMediaType)
             val httpRequest = Request.Builder()
-                .url("$baseUrl/api/cluster/nodes/register")
+                .url("$baseUrl/api/cluster/android/register")
                 .post(body)
                 .header("Content-Type", "application/json")
                 .build()

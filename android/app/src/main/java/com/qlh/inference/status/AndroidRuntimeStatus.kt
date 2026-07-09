@@ -56,7 +56,7 @@ data class GpuStatus(
     val probeError: String? = null,
     val supportsGpuOffload: Boolean = false,
     val backendDevices: String = "",
-    val note: String = "当前 Android 构建未启用 GPU offload，推理仍走 CPU。",
+    val note: String = "当前 Android Full/Lite 版本仅探测 GPU 作为设备画像；本地推理仍使用 CPU llama.cpp。Android GPU 版将作为单独版本规划。",
 )
 
 data class BackendStatus(

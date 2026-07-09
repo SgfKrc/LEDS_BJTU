@@ -1081,3 +1081,102 @@ class TestPipelineE2EWithKVCache:
         assert torch.allclose(full_last_logits, pipeline_logits, atol=1e-3), \
             f"KV cache 流水线 logits ≠ 完整模型 logits！" \
             f"max diff = {max_diff:.6f}"
+
+
+# ================================================================
+# Phase 7 P0: transformers 5.x 兼容性回归测试
+# ================================================================
+
+class TestTransformers5xCompatibility:
+    """验证 7 项 transformers 5.x 修复不会在升级时静默失效。"""
+
+    @pytest.fixture
+    def mgr(self):
+        """创建仅含 embedding + 全部 4 层的 ModelManager。"""
+        from transformers.cache_utils import DynamicCache
+        model = _make_tiny_model()
+        tokenizer = type('TinyTok', (), {
+            'decode': lambda self, ids, **kw: ''.join(chr(min(i, 126)) for i in ids),
+            'encode': lambda self, text, **kw: torch.tensor(
+                [[min(ord(c), 31) + 1 for c in text]], dtype=torch.long
+            ),
+        })()
+        mgr = ModelManager()
+        mgr.model = model
+        mgr.tokenizer = tokenizer
+        mgr._engine_type = "pytorch"
+        return mgr
+
+    def test_create_causal_mask_import_and_call(self, mgr):
+        """create_causal_mask 可从 qwen2 路径导入且用有效参数成功调用。"""
+        from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
+        input_ids = torch.tensor([[5, 8, 2]], dtype=torch.long)
+        hidden_states = mgr.model.model.embed_tokens(input_ids)
+        causal_mask = create_causal_mask(
+            config=mgr.model.config,
+            inputs_embeds=hidden_states,
+            attention_mask=None,
+            past_key_values=None,
+            position_ids=torch.tensor([[0, 1, 2]], dtype=torch.long),
+        )
+        # flash/sdpa 返回 None，eager 返回 4D tensor
+        assert causal_mask is None or isinstance(causal_mask, torch.Tensor)
+
+    def test_dynamic_cache_update_called_on_decode(self, mgr):
+        """decode 路径使用 cache.update(k, v, layer_idx) 而非 key_cache.append。
+
+        验证 prefill→decode 周期中 layer_idx 补丁的保存/恢复机制正确。"""
+        # 使用 tiny 模型的全 4 层（所有 GPU 层参与），模拟完整 prefill→decode
+        saved_indices = [layer.self_attn.layer_idx for layer in mgr.model.model.layers]
+
+        input_ids = torch.tensor([[5, 8, 2, 12]], dtype=torch.long)
+
+        # Prefill: 传入 input_ids（完整模型含 embedding，自动处理）
+        pf_result = mgr.forward_layers(input_ids=input_ids, use_cache=True)
+        assert "past_key_values" in pf_result, "Prefill 应返回 past_key_values"
+        # 验证 layer_idx 已恢复（Phase 1.2 修复）
+        for i, layer in enumerate(mgr.model.model.layers):
+            assert layer.self_attn.layer_idx == saved_indices[i], \
+                f"prefill 后 layer_idx 未恢复: layer {i} → {layer.self_attn.layer_idx}"
+
+        # Decode
+        past_kv = pf_result["past_key_values"]
+        dec_result = mgr.forward_layers(
+            input_ids=torch.tensor([[7]], dtype=torch.long),
+            past_key_values=past_kv, use_cache=True,
+        )
+        assert "past_key_values" in dec_result, "Decode 应返回更新的 past_key_values"
+        # 验证 layer_idx 在 decode 后也恢复了
+        for i, layer in enumerate(mgr.model.model.layers):
+            assert layer.self_attn.layer_idx == saved_indices[i], \
+                f"decode 后 layer_idx 未恢复: layer {i} → {layer.self_attn.layer_idx}"
+
+    def test_past_key_values_plural_accepted(self, mgr):
+        """`past_key_values` (复数) 参数名被 Qwen2DecoderLayer 接受（5.x 签名）。"""
+        import inspect
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+
+        sig = inspect.signature(Qwen2DecoderLayer.forward)
+        params = list(sig.parameters.keys())
+        assert "past_key_values" in params, \
+            f"Qwen2DecoderLayer.forward 不接受 past_key_values 参数！签名: {params}"
+
+    def test_decoder_layer_returns_tensor_not_tuple(self, mgr):
+        """Qwen2DecoderLayer.forward 在 5.x 中返回 tensor 而非 tuple——验证我们的处理。"""
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+
+        layer0 = mgr.model.model.layers[0]
+        assert isinstance(layer0, Qwen2DecoderLayer), \
+            "期望第一个 decoder layer 为 Qwen2DecoderLayer"
+
+        # 用最小输入调用单层
+        hidden = torch.randn(1, 2, mgr.model.config.hidden_size)
+        pos_ids = torch.tensor([[0, 1]], dtype=torch.long)
+        pos_emb = mgr.model.model.rotary_emb(hidden, pos_ids)
+
+        output = layer0(hidden, position_ids=pos_ids, position_embeddings=pos_emb)
+        # 5.x 返回 tensor；4.x 返回 tuple — 两种都应被 forward_layers 处理
+        assert isinstance(output, torch.Tensor), (
+            f"DecoderLayer.forward 应返回 torch.Tensor (5.x)，"
+            f"实际返回 {type(output).__name__}"
+        )

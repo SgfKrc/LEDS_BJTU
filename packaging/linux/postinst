@@ -1,0 +1,60 @@
+#!/bin/bash
+set -e
+
+APP_DIR="/opt/qlh-edge-inference"
+
+echo "QLH 边缘推理系统 — 安装后配置..."
+
+# 创建可写目录
+mkdir -p "$APP_DIR/models" "$APP_DIR/logs"
+chmod 755 "$APP_DIR/models"
+chmod 1777 "$APP_DIR/logs"  # sticky + world-writable: DynamicUser 可写日志
+
+# 验证 venv 可用性（用 --copies 构建，通常可直接使用）
+VENV_PYTHON="$APP_DIR/venv/bin/python3"
+if [ -x "$VENV_PYTHON" ]; then
+    if ! "$VENV_PYTHON" -c "import sys; sys.exit(0)" 2>/dev/null; then
+        echo "  [警告] venv Python 不可用，请在安装后重建 venv："
+        echo "    cd $APP_DIR && python3 -m venv --copies venv"
+        echo "    $APP_DIR/venv/bin/pip install -r $APP_DIR/requirements-cpu.txt"
+    else
+        echo "  venv Python 验证通过"
+    fi
+else
+    echo "  [警告] venv 未找到 Python 解释器，可能需要重建 venv"
+fi
+
+# 设置启动器权限
+if [ -f "$APP_DIR/bin/qlh-launcher" ]; then
+    chmod 755 "$APP_DIR/bin/qlh-launcher"
+    # 创建 /usr/local/bin 符号链接
+    ln -sf "$APP_DIR/bin/qlh-launcher" /usr/local/bin/qlh-launcher
+fi
+
+# 更新桌面数据库
+if command -v update-desktop-database &> /dev/null; then
+    update-desktop-database
+fi
+
+# 更新图标缓存
+if command -v gtk-update-icon-cache &> /dev/null; then
+    gtk-update-icon-cache /usr/share/icons/hicolor || true
+fi
+
+echo ""
+echo "================================================================"
+echo "  QLH 边缘推理系统 安装完成！"
+echo "================================================================"
+echo ""
+echo "  应用目录: $APP_DIR"
+echo ""
+echo "  启动方式:"
+echo "    桌面: 在应用程序菜单中找到 QLH 边缘推理系统"
+echo "    命令行: qlh-launcher"
+echo "    无头模式: qlh-launcher --headless"
+echo ""
+echo "  首次使用前请下载模型文件（启动器会引导下载流程）"
+echo ""
+echo "  如需开机自启（无头模式），运行:"
+echo "    sudo systemctl enable --now qlh-edge-inference"
+echo "================================================================"

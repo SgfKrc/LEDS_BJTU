@@ -9,24 +9,35 @@
 
 流程:
 1. 检测 models/ 目录是否包含模型文件（GGUF 或 Safetensors）
-2. 若缺失 → 弹出 Windows 消息框引导下载
+2. 若缺失 → 弹出系统对话框引导下载（Linux: zenity, Windows: MessageBox）
 3. 引擎选择:
    - 有 CUDA → 引导下载 Safetensors
    - 无 CUDA → 引导下载 GGUF（推荐）
 4. 用户拒绝网盘 → 命令行交互式下载（ModelScope / HuggingFace）
-
-依赖: 仅 Python 标准库（ctypes 用于 Windows 消息框）
 
 集成方式: api_server.py 启动时调用 check_and_prompt_model()
 """
 
 import os
 import sys
+import shutil
 import subprocess
 import logging
-import ctypes
 
 logger = logging.getLogger(__name__)
+
+IS_LINUX = sys.platform == "linux"
+IS_WINDOWS = sys.platform == "win32"
+
+
+def _safe_input(prompt: str = "", default: str | None = None) -> str | None:
+    """input() 的安全包装，兼容 PyInstaller windowed 模式无 stdin 的场景。"""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt, RuntimeError, OSError) as e:
+        logger.warning(f"无法读取控制台输入: {e}")
+        return default
+
 
 # ================================================================
 # 路径解析（兼容开发模式 + PyInstaller 打包）
@@ -189,27 +200,61 @@ def detect_cuda_available() -> bool:
 # 交互界面
 # ================================================================
 
-def show_windows_messagebox(title: str, message: str) -> int:
+def _windows_messagebox(title: str, message: str) -> int:
+    """Windows MessageBox。返回: 6=是, 7=否, 2=取消。"""
+    import ctypes
+    MB_YESNOCANCEL = 0x00000003
+    MB_ICONQUESTION = 0x00000020
+    try:
+        return ctypes.windll.user32.MessageBoxW(
+            0, message, title,
+            MB_YESNOCANCEL | MB_ICONQUESTION,
+        )
+    except Exception:
+        return _cli_fallback(title, message)
+
+
+def _linux_zenity_dialog(title: str, message: str) -> int:
+    """Linux zenity 三按钮对话框。返回: 6=是, 7=否, 2=取消。"""
+    # 简化: zenity --question 无法表达三按钮语义，用 --info + --question 组合
+    # 先显示 info 告知内容，再用 question 询问是否打开网盘
+    try:
+        subprocess.run(
+            ["zenity", "--info", "--title", title, "--text", message,
+             "--width=500"],
+            timeout=30,
+        )
+    except Exception:
+        pass
+    # 询问: 是否打开网盘
+    try:
+        rc = subprocess.run(
+            ["zenity", "--question", "--title", "下载方式",
+             "--text=是否打开网盘链接？\n\n选择“是”= 打开网盘链接\n选择“否”= 命令行下载",
+             "--ok-label=是(网盘)", "--cancel-label=否(命令行)",
+             "--width=400"],
+            timeout=30,
+        ).returncode
+        return 6 if rc == 0 else 7  # Yes → IDYES, No → IDNO
+    except Exception:
+        pass
+    return _cli_fallback(title, message)
+
+
+def show_model_dialog(title: str, message: str) -> int:
     """
-    弹出 Windows 消息框，返回用户选择。
+    跨平台模型下载对话框。
 
     返回值:
         6 = 是 (IDYES)     → 打开网盘
         7 = 否 (IDNO)      → 命令行下载
         2 = 取消 (IDCANCEL) → 退出
     """
-    MB_YESNOCANCEL = 0x00000003
-    MB_ICONQUESTION = 0x00000020
-
-    try:
-        result = ctypes.windll.user32.MessageBoxW(
-            0,
-            message,
-            title,
-            MB_YESNOCANCEL | MB_ICONQUESTION,
-        )
-        return result
-    except Exception:
+    if IS_LINUX and shutil.which("zenity"):
+        return _linux_zenity_dialog(title, message)
+    elif IS_WINDOWS:
+        return _windows_messagebox(title, message)
+    else:
         return _cli_fallback(title, message)
 
 
@@ -227,16 +272,13 @@ def _cli_fallback(title: str, message: str) -> int:
     print(f"{'=' * 60}")
 
     while True:
-        try:
-            choice = input("请输入选项 [1/2/3]: ").strip()
-            if choice == "1":
-                return 6  # IDYES
-            elif choice == "2":
-                return 7  # IDNO
-            elif choice == "3":
-                return 2  # IDCANCEL
-        except (EOFError, KeyboardInterrupt):
-            return 2
+        choice = (_safe_input("请输入选项 [1/2/3]: ", default="3") or "3").strip()
+        if choice == "1":
+            return 6  # IDYES
+        elif choice == "2":
+            return 7  # IDNO
+        elif choice == "3":
+            return 2  # IDCANCEL
         print("无效选项，请输入 1、2 或 3")
 
 
@@ -320,10 +362,7 @@ def download_via_cli():
     print("=" * 60)
 
     while True:
-        try:
-            choice = input("请选择下载方式 [1/2/3/Q]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return
+        choice = (_safe_input("请选择下载方式 [1/2/3/Q]: ", default="q") or "q").strip().lower()
 
         if choice == "q":
             return
@@ -387,8 +426,8 @@ def _download_gguf_huggingface():
         src = os.path.join(gguf_dir, filename)
         if os.path.isfile(src) and src != dst:
             try:
-                os.rename(src, dst)
-                logger.info(f"已重命名: {filename} → qwen-1_8b-chat-Q4_K_M.gguf")
+                shutil.move(src, dst)
+                logger.info(f"已移动: {filename} → qwen-1_8b-chat-Q4_K_M.gguf")
             except OSError:
                 pass
 
@@ -460,7 +499,7 @@ def _download_safetensors_modelscope():
             return
 
     safetensors_dir = os.path.abspath(SAFETENSORS_DIR)
-    os.makedirs(os.path.dirname(safetensors_dir), exist_ok=True)
+    os.makedirs(safetensors_dir, exist_ok=True)
 
     logger.info("正在从 ModelScope 下载 Qwen-1.8B-Chat (~3.6GB)...")
     logger.info("下载进度将显示在下方（可能需要 10-30 分钟）")
@@ -512,7 +551,7 @@ def check_and_prompt_model() -> bool:
 
     logger.warning("模型文件未找到，弹出下载引导...")
 
-    result = show_windows_messagebox(title, message)
+    result = show_model_dialog(title, message)
 
     if result == 6:  # 是 → 网盘
         open_pan_links()

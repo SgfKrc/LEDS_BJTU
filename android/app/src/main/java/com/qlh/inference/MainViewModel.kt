@@ -19,6 +19,7 @@ import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -110,7 +111,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // 全有模式：返回 InferenceService 实例（由 Application 管理）
             QlhApplication.instance.inferenceService
         }
-    )
+    ).also { repo ->
+        repo.setThinClientMetadataProvider { settings.getOrCreateAndroidNodeId() }
+        repo.setThinPresenceHook { autoRegisterAndroidNode(force = true) }
+    }
 
     init {
         // 加载设置
@@ -164,6 +168,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     // 选择最近更新的会话
                     selectSession(sessions.first().id)
                 }
+            }
+        }
+
+        // Android Full 薄客户端 presence 心跳：只在 thin 模式生效，Lite 仍跳过。
+        viewModelScope.launch {
+            while (true) {
+                delay(45_000L)
+                autoRegisterAndroidNode(force = true)
             }
         }
 
@@ -451,6 +463,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 检测实际网络类型（wifi / mobile / ethernet）
         val networkType = detectNetworkType()
 
+        val deviceInfo = buildAndroidPresenceDeviceInfo()
         val client = ApiClient("http://${state.serverHost}:${state.serverPort}")
         val result = client.registerAndroidNode(
             RegisterNodeRequest(
@@ -458,6 +471,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 hostname = hostname,
                 networkType = networkType,
                 nodeType = "android",
+                deviceInfo = deviceInfo,
+                clientMode = "thin",
+                appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
+                appVersion = BuildConfig.VERSION_NAME,
             )
         )
         result.onSuccess { response ->
@@ -471,6 +488,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 "Android node auto-register failed: ${e.message ?: e.javaClass.simpleName}"
             )
         }
+    }
+
+    private fun buildAndroidPresenceDeviceInfo(): Map<String, Any?> {
+        val provider = AndroidDeviceInfoProvider(getApplication())
+        val system = provider.getSystemStatus()
+        val memory = provider.getMemoryStatus()
+        val gpu = provider.getGpuStatus()
+        val runtime = _uiState.value.runtimeStatus
+        return mapOf(
+            "connection_type" to "http_thin",
+            "pipeline_worker" to false,
+            "client_mode" to _uiState.value.inferenceMode,
+            "app_variant" to if (BuildConfig.IS_LITE) "lite" else "full",
+            "app_version" to BuildConfig.VERSION_NAME,
+            "android" to mapOf(
+                "manufacturer" to system.manufacturer,
+                "brand" to system.brand,
+                "model" to system.model,
+                "device" to system.device,
+                "hardware" to system.hardware,
+                "soc_manufacturer" to system.socManufacturer,
+                "soc_model" to system.socModel,
+                "sdk_int" to system.sdkInt,
+                "android_release" to system.androidRelease,
+                "abis" to system.abis,
+                "cpu_cores" to system.cpuCores,
+                "thermal_status" to system.thermalStatus,
+            ),
+            "memory" to mapOf(
+                "available_bytes" to memory.availableBytes,
+                "total_bytes" to memory.totalBytes,
+                "low_memory" to memory.lowMemory,
+                "low_ram_device" to memory.lowRamDevice,
+            ),
+            "gpu" to mapOf(
+                "vendor" to gpu.vendor,
+                "renderer" to gpu.renderer,
+                "version" to gpu.version,
+                "probe_error" to gpu.probeError,
+                "supports_gpu_offload" to (runtime?.gpu?.supportsGpuOffload ?: false),
+                "backend_devices" to (runtime?.gpu?.backendDevices ?: ""),
+                "note" to gpu.note,
+            ),
+            "backend" to mapOf(
+                "engine" to (runtime?.backend?.engine ?: ""),
+                "supports_gpu_offload" to (runtime?.backend?.supportsGpuOffload ?: false),
+            ),
+        )
     }
 
     /** 通过 ConnectivityManager 检测当前网络类型。 */

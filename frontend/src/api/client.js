@@ -6,9 +6,11 @@ const BASE = '/api';
 
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
+  const { signal, ...rest } = options;
   const res = await fetch(url, {
+    ...rest,                                                         // 先展开 rest，允许 headers 覆盖
     headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
+    ...(signal ? { signal } : {}),
   });
   const text = await res.text();
   let data = {};
@@ -82,10 +84,11 @@ export async function unregisterModel(modelId) {
 export async function sendMessage(message, opts = {}) {
   return request('/chat', {
     method: 'POST',
+    ...(opts.signal ? { signal: opts.signal } : {}),
     body: JSON.stringify({
       message,
       session_id: opts.sessionId || null,
-      max_new_tokens: opts.maxNewTokens || 512,
+      max_new_tokens: opts.maxNewTokens || 1024,
       temperature: opts.temperature ?? 0.7,
       top_p: opts.topP ?? 0.9,
       show_thinking: opts.showThinking || false,
@@ -108,10 +111,11 @@ export async function sendMessageStream(message, opts = {}) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: opts.signal || null,
     body: JSON.stringify({
       message,
       session_id: opts.sessionId || null,
-      max_new_tokens: opts.maxNewTokens || 512,
+      max_new_tokens: opts.maxNewTokens || 1024,
       temperature: opts.temperature ?? 0.7,
       top_p: opts.topP ?? 0.9,
       show_thinking: opts.showThinking || false,
@@ -166,7 +170,7 @@ export async function sendMessageStream(message, opts = {}) {
 
   return {
     content: finalResult.response || fullResponse,
-    thinking_content: finalResult.thinking || null,
+    thinking_content: finalResult.thinking_content || finalResult.thinking || null,
     metrics: finalResult.metrics || {},
     followups: finalResult.followups || [],
   };
@@ -387,6 +391,10 @@ export async function updateLayerAssignment(assignments) {
     method: 'PUT',
     body: JSON.stringify({ assignments }),
   });
+}
+
+export async function resetLayerAssignments() {
+  return request('/cluster/layers', { method: 'DELETE' });
 }
 
 // ---- 角色转让 ----

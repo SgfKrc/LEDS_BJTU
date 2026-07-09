@@ -346,7 +346,7 @@ def get_conn():
     conn = pool_.getconn()
     try:
         yield conn
-    except BaseException:
+    except Exception:
         try:
             conn.rollback()
         except Exception:
@@ -1021,6 +1021,11 @@ def get_layer_override() -> Optional[list]:
 def set_layer_override(overrides: list) -> None:
     """存储手动覆盖的分层配置（JSON）"""
     set_config("layer_override", json.dumps(overrides, ensure_ascii=False))
+
+
+def clear_layer_override() -> None:
+    """清除手动覆盖的分层配置，恢复自动策略"""
+    set_config("layer_override", "")
 
 
 # ================================================================

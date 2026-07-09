@@ -8,12 +8,12 @@
 ;   1. 已完成 PyInstaller 打包 → dist/QLH-Edge-Inference-CUDA/
 ;   2. 已安装 Inno Setup 6
 ;
-; 输出: dist/QLH-Edge-Inference-Setup-v0.1.5-CUDA.exe
+; 输出: dist/QLH-Edge-Inference-Setup-v0.1.7-CUDA.exe
 ; ============================================================
 
 #define MyAppName         "QLH Edge Inference (CUDA)"
 #define MyAppNameCN       "轻量化大模型分布式边缘推理系统（独显版）"
-#define MyAppVersion      "0.1.5"
+#define MyAppVersion      "0.1.7"
 #define MyAppPublisher    "北京交通大学 · 大创项目"
 #define MyAppExeName      "QLH-Edge-Inference.exe"
 #define MyAppSourceDir    "..\dist\QLH-Edge-Inference-CUDA"
@@ -30,7 +30,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 
 ; 图标
-SetupIconFile=g:\C\PYT\qlh\packaging\leds.ico
+SetupIconFile=leds.ico
 
 ; 输出
 OutputDir={#MyAppOutputDir}

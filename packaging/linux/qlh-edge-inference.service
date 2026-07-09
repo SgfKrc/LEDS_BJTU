@@ -1,0 +1,16 @@
+[Unit]
+Description=QLH Edge Inference System
+After=network.target tailscaled.service
+Wants=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/opt/qlh-edge-inference/venv/bin/python3 /opt/qlh-edge-inference/bin/qlh-launcher --headless
+WorkingDirectory=/opt/qlh-edge-inference
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

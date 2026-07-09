@@ -48,7 +48,7 @@ echo.
 
 REM ---- 编译 Inno Setup ----
 echo 开始编译安装包...
-echo 输出: dist\QLH-Edge-Inference-Setup-v0.1.5.exe
+echo 输出: dist\QLH-Edge-Inference-Setup-v0.1.7.exe
 echo 这可能需要 2-5 分钟（压缩中）...
 echo.
 
@@ -66,7 +66,7 @@ if errorlevel 1 (
 echo.
 echo ============================================
 echo   编译成功！
-echo   安装包: dist\QLH-Edge-Inference-Setup-v0.1.5.exe
+echo   安装包: dist\QLH-Edge-Inference-Setup-v0.1.7.exe
 echo ============================================
 echo.
 echo 发给用户前，请先在本机测试安装流程！

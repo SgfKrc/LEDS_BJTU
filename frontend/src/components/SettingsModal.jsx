@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import DevicePanel from './DevicePanel';
 import { TIER_PRESETS, TIER_LABELS } from '../App';
+import { updateDistributedInferenceConfig } from '../api/client';
 
 // Token 限制档位选项
 const TOKEN_OPTIONS = [
@@ -685,7 +686,20 @@ export default function SettingsModal({
               </div>
               <button
                 className={`setting-toggle-btn${settings.distributedInference ? ' on' : ''}`}
-                onClick={() => onSettingsChange({ distributedInference: !settings.distributedInference })}
+                onClick={async () => {
+                  const next = !settings.distributedInference;
+                  onSettingsChange({ distributedInference: next });
+                  try {
+                    const result = await updateDistributedInferenceConfig(next);
+                    if (result.status === 'ok') {
+                      onToast?.({ type: 'success', msg: `分布式推理已${result.enabled ? '启用' : '禁用'}` });
+                    }
+                  } catch (err) {
+                    onToast?.({ type: 'error', msg: `后端同步失败: ${err.message}` });
+                    // 回滚设置
+                    onSettingsChange({ distributedInference: !next });
+                  }
+                }}
                 title={settings.distributedInference ? '已启用 — 点击关闭' : '已关闭 — 点击启用'}
               >
                 <span className="setting-toggle-track">

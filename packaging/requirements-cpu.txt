@@ -1,48 +1,35 @@
 # ============================================================
-# 轻量化大模型分布式边缘推理优化系统 — 依赖清单
+# 轻量化大模型分布式边缘推理优化系统 — 打包依赖清单
 # ============================================================
-# 集显版本 (CPU-only) — 适用于无 NVIDIA 独显的 Windows 设备
+# 用于两个打包 venv 的共享依赖（不含 torch）。
+#
+# ★ torch 必须由各 venv 单独安装，避免 CPU/CUDA 版本互相覆盖：
+#   集显版 venv: pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   独显版 venv: pip install torch   （默认 CUDA 12.x）
+#   然后再:      pip install -r packaging/requirements-cpu.txt
 #
 # 双引擎架构:
 #   1. llama.cpp + GGUF — CPU/集显默认引擎（推荐，~1.16 GB 模型）
-#   2. PyTorch CPU — 备选引擎（FP16，~3.5 GB 模型，慢 3-5x）
+#   2. PyTorch CPU/CUDA — 备选引擎 / 独显分布式推理
 #
 # 与主 requirements.txt 的区别:
-#   - torch: CPU-only wheel（~200MB vs CUDA 版 ~2.5GB）
-#   - llama-cpp-python: CPU 优化的 GGUF 推理引擎（新增）
+#   - torch: 不包含在此文件中（各 venv 单独安装）
+#   - llama-cpp-python: CPU 优化的 GGUF 推理引擎
 #   - bitsandbytes: 保留（CPU 量化路径仍需使用）
-#   - transformers: 同主版本
-#
-# 如需 CUDA 支持，请使用项目根目录的 requirements.txt
-# 或在集显版本基础上安装 CUDA 版 PyTorch 覆盖:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
 # ============================================================
 
 # --- llama.cpp 推理引擎（CPU/集显首选）---
-# 纯 CPU 版本，无需 CUDA。Windows 预编译 wheel 自动安装。
-# 如果编译失败，从预编译 wheel 安装:
-#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 llama-cpp-python>=0.3.0
 
-# --- 核心深度学习框架（备选 — CPU-only PyTorch）---
-# ⚠️ 注意：这是 CPU-only 版本，不含 CUDA 支持
-# 安装器大小 ~800MB（CUDA 版 ~3GB+）
-# 如需独显加速，请下载「独显支持补丁」或使用完整版安装包
-
---extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.2.0
-
-# --- 其余依赖与主版本一致 ---
+# --- 模型加载与量化 ---
 transformers>=4.45.0,<5.0.0     # 4.x 系列，兼容 bitsandbytes 量化
 accelerate>=1.0.0                # 模型加载加速
-
-# --- 模型量化 ---
-bitsandbytes>=0.45.0             # CPU 量化路径
+bitsandbytes>=0.45.0             # 量化路径
 
 # --- 原生桌面窗口（替代外部浏览器）---
 pywebview>=6.0
 
-# --- Web 可视化（已移除 Streamlit，统一使用 FastAPI + React）---
+# --- Web 可视化（FastAPI + React）---
 pandas>=2.0.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0

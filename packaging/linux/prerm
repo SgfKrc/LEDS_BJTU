@@ -1,0 +1,30 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+    remove|purge|upgrade|deconfigure)
+        ;;
+    *)
+        echo "prerm: 未知动作 $1，跳过。"
+        exit 0
+        ;;
+esac
+
+echo "QLH 边缘推理系统 — 卸载前清理..."
+
+# 停止 systemd 服务（仅 remove/purge，upgrade 时保持运行）
+if [ "$1" != "upgrade" ]; then
+    if systemctl is-active --quiet qlh-edge-inference 2>/dev/null; then
+        systemctl stop qlh-edge-inference || true
+    fi
+    if systemctl is-enabled --quiet qlh-edge-inference 2>/dev/null; then
+        systemctl disable qlh-edge-inference || true
+    fi
+
+    # 停止任何仍在运行的实例
+    if command -v pkill &> /dev/null; then
+        pkill -f "uvicorn.*api_server" || true
+    fi
+fi
+
+echo "卸载前清理完成。"

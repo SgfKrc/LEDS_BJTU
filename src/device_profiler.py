@@ -670,13 +670,13 @@ class DeviceProfiler:
                                "adreno", "mali", "microsoft basic",
                                "amd radeon(tm)"]
                     is_igpu = any(kw in name_lower for kw in igpu_kw)
-                    # 独显关键词
+                    # 独显关键词（radeon pro 必须在 radeon 通用匹配之前）
                     dgpu_kw = ["nvidia", "rtx", "gtx", "geforce", "quadro",
-                               "tesla", "radeon rx", "radeon pro", "arc a"]
+                               "tesla", "radeon rx", "radeon pro", "radeon w", "arc a"]
                     is_dgpu = any(kw in name_lower for kw in dgpu_kw)
 
-                    # AMD Radeon 不带 "RX" → 可能是集显（如 Radeon Graphics on laptop APU）
-                    if "radeon" in name_lower and "rx" not in name_lower:
+                    # AMD Radeon 不带独立显卡关键词 → 集显（如 Radeon Graphics on laptop APU）
+                    if "radeon" in name_lower and not is_dgpu:
                         is_igpu = True
 
                     # 分类
@@ -703,6 +703,119 @@ class DeviceProfiler:
                     seen_names.add(name_lower)
             except Exception as e:
                 logger.debug(f"WMI GPU 检测异常: {e}")
+
+        # ---- 第 2.5 层：Linux 系统级 GPU 检测 ----
+        elif sys.platform == "linux":
+            # 2.5a: nvidia-smi（NVIDIA GPU 的权威来源）
+            try:
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 2:
+                            gpu_name = parts[0]
+                            name_lower = gpu_name.lower()
+                            if name_lower in seen_names:
+                                continue
+                            try:
+                                vram_mb = float(parts[1])
+                                vram_gb = round(vram_mb / 1024.0, 1)
+                            except (ValueError, TypeError):
+                                vram_gb = 0.0
+                            gpu = GPUInfo(
+                                name=gpu_name,
+                                vram_total_gb=vram_gb,
+                                cuda_available=True,
+                                is_integrated=False,
+                                gpu_type="discrete",
+                                index=len(all_gpus),
+                            )
+                            all_gpus.append(gpu)
+                            seen_names.add(name_lower)
+            except FileNotFoundError:
+                logger.debug("nvidia-smi 未找到，跳过 NVIDIA GPU 检测")
+            except Exception as e:
+                logger.debug(f"nvidia-smi GPU 检测异常: {e}")
+
+            # 2.5b: lspci 检测所有 VGA/3D 设备（集显 + 未安装 nvidia-smi 的独显）
+            try:
+                result = subprocess.run(
+                    ["lspci"], capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        line_lower = line.lower()
+                        if "vga" not in line_lower and "3d" not in line_lower:
+                            continue
+                        # 提取 GPU 名称: "01:00.0 VGA compatible controller: NVIDIA ..."
+                        if ":" not in line:
+                            continue
+                        # 跳过已检测到的
+                        name_part = line.split(":", 2)[-1].strip()
+                        # 去掉前缀如 "VGA compatible controller: "
+                        for prefix in ("vga compatible controller: ", "3d controller: "):
+                            if name_part.lower().startswith(prefix):
+                                name_part = name_part[len(prefix):]
+                                break
+                        gpu_name = name_part.strip()
+                        if not gpu_name or len(gpu_name) < 3:
+                            continue
+                        name_lower = gpu_name.lower()
+                        if name_lower in seen_names:
+                            continue
+
+                        # 去重：若已有 NVIDIA CUDA GPU 且 lspci 也报告 NVIDIA，则跳过
+                        # （nvidia-smi 提供了更准确的名称和 VRAM 信息）
+                        if "nvidia" in name_lower and any(
+                            "nvidia" in g.name.lower() for g in all_gpus
+                        ):
+                            continue
+
+                        # 集显关键词
+                        igpu_kw = ["intel", "uhd", "iris", "hd graphics",
+                                   "adreno", "mali", "radeon graphics",
+                                   "microsoft basic", "virtio"]
+                        is_igpu = any(kw in name_lower for kw in igpu_kw)
+                        # 独显关键词（radeon pro 必须在 radeon 通用匹配之前）
+                        dgpu_kw = ["nvidia", "rtx", "gtx", "geforce", "quadro",
+                                   "tesla", "radeon rx", "radeon pro", "radeon w",
+                                   "arc a"]
+                        is_dgpu = any(kw in name_lower for kw in dgpu_kw)
+                        # AMD Radeon 不带独立显卡关键词 → 集显
+                        if "radeon" in name_lower and not is_dgpu:
+                            is_igpu = True
+
+                        if is_igpu and not is_dgpu:
+                            gpu_type = "integrated"
+                            vram_gb = 0.0
+                        elif is_dgpu:
+                            gpu_type = "discrete"
+                            vram_gb = 0.0  # lspci 不报告 VRAM
+                        else:
+                            gpu_type = "unknown"
+                            vram_gb = 0.0
+
+                        gpu = GPUInfo(
+                            name=gpu_name,
+                            vram_total_gb=vram_gb,
+                            cuda_available=False,
+                            is_integrated=(gpu_type == "integrated"),
+                            gpu_type=gpu_type,
+                            index=len(all_gpus),
+                        )
+                        all_gpus.append(gpu)
+                        seen_names.add(name_lower)
+            except FileNotFoundError:
+                logger.debug("lspci 未找到，跳过 PCI GPU 检测")
+            except Exception as e:
+                logger.debug(f"lspci GPU 检测异常: {e}")
 
         # ---- 第 3 层：Apple Metal ----
         try:

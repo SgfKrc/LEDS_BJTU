@@ -192,7 +192,7 @@ def detect_network_type() -> str:
             addrs = psutil.net_if_addrs()
 
             wifi_keywords = ['wi-fi', 'wlan', '无线', 'wifi', 'wireless']
-            eth_keywords = ['eth', '以太', 'ethernet', 'local', 'en0', 'en']
+            eth_keywords = ['eth', '以太', 'ethernet', 'en0', 'en']
 
             has_wifi = False
             has_eth = False
@@ -250,8 +250,8 @@ def detect_network_type() -> str:
         except Exception:
             logger.debug("psutil 网络类型检测失败，回退到基本判断", exc_info=True)
 
-    # 如果 psutil 不可用或检测失败，尝试通过 Windows 命令检测
-    if detected == "unknown" and hasattr(socket, '_LOCALHOST'):
+    # 如果 psutil 不可用或检测失败，尝试通过系统命令检测
+    if detected == "unknown":
         try:
             import subprocess
             import platform
@@ -264,10 +264,25 @@ def detect_network_type() -> str:
                 if 'wi-fi' in output or 'wlan' in output:
                     detected = "wifi"
                 if 'ethernet' in output or '以太网' in output:
-                    # Windows 通常同时有WiFi和以太网，检查哪个是连接的
                     detected = "ethernet"  # 以太网优先（更稳定）
+            elif platform.system() == "Linux":
+                # 通过 /sys/class/net 检测接口类型
+                try:
+                    net_dir = "/sys/class/net"
+                    if os.path.isdir(net_dir):
+                        for iface in os.listdir(net_dir):
+                            iface_lower = iface.lower()
+                            if iface_lower.startswith("wl"):
+                                detected = "wifi"
+                                break
+                            elif (iface_lower.startswith("en")
+                                  or iface_lower.startswith("eth")):
+                                detected = "ethernet"
+                                break
+                except OSError:
+                    pass
         except Exception:
-            logger.debug("Windows netsh 网络类型检测失败", exc_info=True)
+            logger.debug("系统网络类型检测失败", exc_info=True)
 
     logger.debug(f"检测到网络类型: {detected}")
     return detected
@@ -658,12 +673,19 @@ def serialize_tensor_fast(tensor: torch.Tensor) -> bytes:
     else:
         # 大张量：numpy tobytes（零拷贝）
         import numpy as np
-        arr = tensor_cpu.numpy()
+        # Phase 5 review H3: 确保连续内存布局，避免非连续张量 .numpy() 崩溃
+        arr = tensor_cpu.contiguous().numpy()
         dtype_map = {
             np.float16: 0, np.float32: 1,
             np.int64: 2, np.int32: 3,
         }
-        dtype_code = dtype_map.get(arr.dtype.type, 1)
+        dtype_code = dtype_map.get(arr.dtype.type)
+        if dtype_code is None:
+            # Phase 5.1: 拒绝不支持的 dtype，避免静默数据损坏
+            raise ValueError(
+                f"serialize_tensor_fast 不支持的 dtype: {arr.dtype} "
+                f"(仅支持 float16/float32/int32/int64)"
+            )
         ndim = arr.ndim
         shape = arr.shape
 
@@ -698,7 +720,12 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
         }
         dtype_code = data[4]
         ndim = data[5]
-        dtype = dtype_map.get(dtype_code, np.float32)
+        dtype = dtype_map.get(dtype_code)
+        if dtype is None:
+            # Phase 5.1: 服务端拒绝未知 dtype code
+            raise ValueError(
+                f"deserialize_tensor_fast 收到未知 dtype_code: {dtype_code}"
+            )
         # 解析 shape（每个维度 4 字节）
         shape = []
         offset = 6
@@ -711,9 +738,9 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
         arr = np.frombuffer(raw, dtype=dtype).reshape(shape)
         return torch.from_numpy(arr.copy())  # copy 确保内存连续
     else:
-        # 未知格式，回退到 torch.load
+        # 未知格式，回退到 torch.load（weights_only 防 pickle 注入）
         buf = io.BytesIO(data)
-        return torch.load(buf)
+        return torch.load(buf, weights_only=True)
 
 
 # ================================================================
@@ -775,7 +802,10 @@ class ClientConn:
     """已连接客户端信息"""
     client_id: str               # 节点标识 "client1" / "client2"
     sock: socket.socket
-    addr: tuple                  # (ip, port)
+    addr: tuple                  # TCP peer endpoint: (ip, ephemeral_port)
+    advertised_host: str = ""    # 客户端自身可被其他节点连接的服务 host
+    advertised_port: int = SERVER_PORT  # 客户端自身 TCP 服务监听端口
+    advertised_address: str = "" # "host:port"，用于节点列表和链式转发
     role: str = ""               # 节点角色
     node_type: str = "pc"        # 设备平台: "pc" | "android"
     hostname: str = ""           # 客户端主机名
@@ -788,6 +818,12 @@ class ClientConn:
     def __post_init__(self):
         if self.device_info is None:
             self.device_info = {}
+        if not self.advertised_host and self.addr:
+            self.advertised_host = self.addr[0]
+        if not self.advertised_port:
+            self.advertised_port = SERVER_PORT
+        if not self.advertised_address and self.advertised_host:
+            self.advertised_address = f"{self.advertised_host}:{self.advertised_port}"
         if self.connected_at == 0.0:
             self.connected_at = time.time()
         if self.last_heartbeat == 0.0:
@@ -1019,6 +1055,25 @@ class TCPServer:
         device_info = data.get("device_info", {})
         network_type = data.get("network_type", "unknown")
 
+        advertised_host = str(data.get("advertised_host") or "").strip()
+        advertised_port_raw = data.get("advertised_port")
+        advertised_address = str(data.get("advertised_address") or "").strip()
+        if advertised_address and (not advertised_host or advertised_port_raw is None):
+            if ":" in advertised_address:
+                h, p = advertised_address.rsplit(":", 1)
+                advertised_host = advertised_host or h.strip()
+                if advertised_port_raw is None:
+                    advertised_port_raw = p.strip()
+        if advertised_host in ("", "0.0.0.0", "127.0.0.1", "localhost"):
+            advertised_host = addr[0]
+        try:
+            advertised_port = int(advertised_port_raw) if advertised_port_raw is not None else SERVER_PORT
+        except (TypeError, ValueError):
+            advertised_port = SERVER_PORT
+        if not (1 <= advertised_port <= 65535):
+            advertised_port = SERVER_PORT
+        advertised_address = f"{advertised_host}:{advertised_port}"
+
         # ★ 阶段 7：HMAC 集群认证
         auth_ok, auth_reason = verify_auth_signature(
             client_id, data.get("auth", {})
@@ -1086,6 +1141,9 @@ class TCPServer:
             client_id=client_id,
             sock=conn,
             addr=addr,
+            advertised_host=advertised_host,
+            advertised_port=advertised_port,
+            advertised_address=advertised_address,
             role=role,
             node_type=node_type,
             hostname=hostname,
@@ -1095,7 +1153,8 @@ class TCPServer:
         self._set_client(client_id, client_conn)
         logger.info(
             f"✅ 节点注册成功: {client_id} role={role} "
-            f"hostname={hostname} addr={addr[0]}:{addr[1]}"
+            f"hostname={hostname} advertised={advertised_address} "
+            f"peer={addr[0]}:{addr[1]}"
         )
 
         # 发送注册确认
@@ -1212,9 +1271,16 @@ class TCPServer:
         c = self._get_client(client_id)
         if c is None:
             return None
+        peer_addr = f"{c.addr[0]}:{c.addr[1]}"
+        advertised_addr = c.advertised_address or f"{c.advertised_host}:{c.advertised_port}"
         return {
             "client_id": c.client_id,
-            "addr": f"{c.addr[0]}:{c.addr[1]}",
+            # 兼容旧调用：addr 现在表示节点服务端点，不再是 TCP 临时源端口
+            "addr": advertised_addr,
+            "advertised_addr": advertised_addr,
+            "advertised_host": c.advertised_host,
+            "advertised_port": c.advertised_port,
+            "peer_addr": peer_addr,
             "role": c.role,
             "node_type": c.node_type,
             "hostname": c.hostname,
@@ -1253,12 +1319,16 @@ class TCPClient:
 
     def __init__(self, server_host: str = None, server_port: int = None,
                  client_id: str = None, role: str = None,
-                 node_type: str = "pc"):
+                 node_type: str = "pc",
+                 advertise_host: str = None,
+                 advertise_port: int = None):
         self.server_host = server_host or SERVER_IP
         self.server_port = server_port or SERVER_PORT
         self.client_id = client_id or f"client_{socket.gethostname()}"
         self.role = role or "client"
         self.node_type = node_type
+        self.advertise_host = advertise_host
+        self.advertise_port = advertise_port
         self.sock: Optional[socket.socket] = None
         self._running = False
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -1268,6 +1338,7 @@ class TCPClient:
         self._registered = False
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
+        self._connect_lock = threading.Lock()   # Phase 5.4: 防止并发 connect()
 
     @staticmethod
     def _compute_local_model_sha256() -> str:
@@ -1336,92 +1407,123 @@ class TCPClient:
         Returns:
             连接并注册是否成功
         """
-        self.on_message = on_message
-        for attempt in range(RECONNECT_MAX_RETRIES):
-            try:
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(HEARTBEAT_INTERVAL + 5)
-                self.sock.connect((self.server_host, self.server_port))
-                self._running = True
-                logger.info(f"已连接主节点: {self.server_host}:{self.server_port}")
-
-                # 发送注册消息（携带身份、网络类型和完整设备画像）
-                import platform as _platform
-                network_type = detect_network_type()
-                self._last_network_type = network_type  # 存储供外部查询
-                logger.info(f"检测到网络类型: {network_type}，准备向主节点注册")
-
-                # 收集完整设备画像（延迟导入避免循环依赖）
+        # Phase 5.4: 互斥锁防止并发连接导致多个 socket + 多组线程竞争
+        if not self._connect_lock.acquire(blocking=False):
+            logger.warning("connect() 已在执行中，忽略并发调用")
+            return False
+        try:
+            self.on_message = on_message
+            for attempt in range(RECONNECT_MAX_RETRIES):
                 try:
-                    from device_profiler import get_profile
-                    profiler = get_profile()
-                    _device_info = profiler.to_dict()
-                except Exception as e:
-                    logger.warning(f"设备画像收集失败，使用基础信息: {e}", exc_info=True)
-                    _device_info = {
-                        "platform": _platform.system(),
-                        "machine": _platform.machine(),
-                        "python_version": _platform.python_version(),
+                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.sock.settimeout(HEARTBEAT_INTERVAL + 5)
+                    self.sock.connect((self.server_host, self.server_port))
+                    self._running = True
+                    logger.info(f"已连接主节点: {self.server_host}:{self.server_port}")
+
+                    # 发送注册消息（携带身份、网络类型、服务端点和完整设备画像）
+                    import platform as _platform
+                    network_type = detect_network_type()
+                    self._last_network_type = network_type  # 存储供外部查询
+                    logger.info(f"检测到网络类型: {network_type}，准备向主节点注册")
+
+                    advertised_host = (self.advertise_host or "").strip()
+                    if not advertised_host:
+                        try:
+                            advertised_host = self.sock.getsockname()[0]
+                        except Exception:
+                            advertised_host = ""
+                    if advertised_host in ("", "0.0.0.0", "127.0.0.1", "localhost"):
+                        try:
+                            advertised_host = detect_lan_ip()
+                        except Exception:
+                            advertised_host = advertised_host or "127.0.0.1"
+                    advertised_port = self.advertise_port or SERVER_PORT
+                    try:
+                        advertised_port = int(advertised_port)
+                    except (TypeError, ValueError):
+                        advertised_port = SERVER_PORT
+                    if not (1 <= advertised_port <= 65535):
+                        advertised_port = SERVER_PORT
+                    advertised_address = f"{advertised_host}:{advertised_port}"
+                    logger.info(f"注册服务端点: {advertised_address}")
+
+                    # 收集完整设备画像（延迟导入避免循环依赖）
+                    try:
+                        from device_profiler import get_profile
+                        profiler = get_profile()
+                        _device_info = profiler.to_dict()
+                    except Exception as e:
+                        logger.warning(f"设备画像收集失败，使用基础信息: {e}", exc_info=True)
+                        _device_info = {
+                            "platform": _platform.system(),
+                            "machine": _platform.machine(),
+                            "python_version": _platform.python_version(),
+                        }
+
+                    reg_data = {
+                        "client_id": self.client_id,
+                        "role": self.role,
+                        "node_type": self.node_type,
+                        "hostname": _platform.node(),
+                        "network_type": network_type,
+                        "advertised_host": advertised_host,
+                        "advertised_port": advertised_port,
+                        "advertised_address": advertised_address,
+                        "device_info": _device_info,
+                        "model_sha256": self._compute_local_model_sha256(),
+                        "auth": build_auth_signature(self.client_id),
                     }
+                    self.send_data(reg_data, MessageType.REGISTER)
 
-                reg_data = {
-                    "client_id": self.client_id,
-                    "role": self.role,
-                    "node_type": self.node_type,
-                    "hostname": _platform.node(),
-                    "network_type": network_type,
-                    "device_info": _device_info,
-                    "model_sha256": self._compute_local_model_sha256(),
-                    "auth": build_auth_signature(self.client_id),
-                }
-                self.send_data(reg_data, MessageType.REGISTER)
+                    # 等待注册确认
+                    try:
+                        ack_msg = self.recv_data()
+                        if ack_msg and ack_msg.get("type") == "register":
+                            ack_data = ack_msg.get("data", {})
+                            if ack_data.get("status") == "registered":
+                                self._registered = True
+                                logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
+                    except (socket.timeout, OSError) as e:
+                        logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
-                # 等待注册确认
-                try:
-                    ack_msg = self.recv_data()
-                    if ack_msg and ack_msg.get("type") == "register":
-                        ack_data = ack_msg.get("data", {})
-                        if ack_data.get("status") == "registered":
-                            self._registered = True
-                            logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
-                except (socket.timeout, OSError) as e:
-                    logger.warning(f"注册确认等待超时: {e}", exc_info=True)
+                    # 启动心跳线程
+                    self._heartbeat_thread = threading.Thread(
+                        target=self._heartbeat_loop, daemon=True
+                    )
+                    self._heartbeat_thread.start()
 
-                # 启动心跳线程
-                self._heartbeat_thread = threading.Thread(
-                    target=self._heartbeat_loop, daemon=True
-                )
-                self._heartbeat_thread.start()
+                    # 启动接收线程
+                    self._recv_thread = threading.Thread(
+                        target=self._recv_loop, daemon=True
+                    )
+                    self._recv_thread.start()
 
-                # 启动接收线程
-                self._recv_thread = threading.Thread(
-                    target=self._recv_loop, daemon=True
-                )
-                self._recv_thread.start()
+                    return True
+                except ConnectionRefusedError:
+                    logger.warning(
+                        f"连接被拒绝 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
+                        f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
+                    )
+                    time.sleep(RECONNECT_DELAY)
+                except socket.timeout:
+                    logger.warning(
+                        f"连接超时 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
+                        f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
+                    )
+                    time.sleep(RECONNECT_DELAY)
+                except OSError as e:
+                    logger.warning(
+                        f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e} → "
+                        f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试...",
+                        exc_info=True,
+                    )
+                    time.sleep(RECONNECT_DELAY)
 
-                return True
-            except ConnectionRefusedError:
-                logger.warning(
-                    f"连接被拒绝 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
-                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
-                )
-                time.sleep(RECONNECT_DELAY)
-            except socket.timeout:
-                logger.warning(
-                    f"连接超时 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}) → "
-                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
-                )
-                time.sleep(RECONNECT_DELAY)
-            except OSError as e:
-                logger.warning(
-                    f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e} → "
-                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试...",
-                    exc_info=True,
-                )
-                time.sleep(RECONNECT_DELAY)
-
-        logger.error(f"无法连接主节点 {self.server_host}:{self.server_port}，已重试 {RECONNECT_MAX_RETRIES} 次")
-        return False
+            logger.error(f"无法连接主节点 {self.server_host}:{self.server_port}，已重试 {RECONNECT_MAX_RETRIES} 次")
+            return False
+        finally:
+            self._connect_lock.release()
 
     def _recv_loop(self) -> None:
         """接收消息循环（在独立线程中运行）"""

@@ -84,6 +84,13 @@ class UnionFind:
 # GraphOrchestrator — 智能编排
 # ================================================================
 
+# 最大算力权重分值（100 基础 + 15 独显奖励），用于 compute_delay 归一化
+_MAX_NODE_WEIGHT = 115.0
+
+# 通信延迟模型: 边延迟 = lat_u + lat_v。在路径 A→B→C 中通信总延迟 =
+# (lat_A+lat_B)+(lat_B+lat_C)，中间节点被双倍计入。这是因为缺少成对 RTT
+# 测量，用单节点延迟近似；在百节点以下集群中偏差可控。
+
 class GraphOrchestrator:
     """
     智能编排模块。
@@ -149,9 +156,16 @@ class GraphOrchestrator:
 
         # Step 3: DFS 路径搜索
         optimal_path = self._dfs_path_search(tree, graph['vertices'])
-        if not optimal_path or len(optimal_path) < 1:
+        if not optimal_path:
             logger.warning("DFS 未找到可行路径，回退到权重排序")
             return self._fallback_weight_assignment()
+
+        # 若 master 参与图算法，保持 master 作为链路首节点/Embedding 锚点。
+        # Scheduler 当前会在实际 worker pipeline 中排除 master；这里保留通用模块
+        # 的 master-first 不变量，避免直接使用 GraphOrchestrator 时把 embedding 给 worker。
+        if "master" in optimal_path and optimal_path[0] != "master":
+            optimal_path = ["master"] + [nid for nid in optimal_path if nid != "master"]
+            logger.info("图算法路径已归一化为 master-first，保证 Embedding 锚点语义")
 
         logger.info(
             f"✅ 最优流水线路径: {' → '.join(optimal_path)} "
@@ -197,7 +211,7 @@ class GraphOrchestrator:
 
             vram_mb = self._extract_vram_mb(device_info)
             weight = self._calc_node_weight(device_info)
-            compute_delay = max(0.5, (115.0 - weight) / 115.0 * 10.0)
+            compute_delay = max(0.5, (_MAX_NODE_WEIGHT - weight) / _MAX_NODE_WEIGHT * 10.0)
 
             vertices[nid] = {
                 'vram_mb': vram_mb,
@@ -213,7 +227,7 @@ class GraphOrchestrator:
                 v = node_list[j]
                 bw_u = self._estimate_bandwidth(u)
                 bw_v = self._estimate_bandwidth(v)
-                bandwidth = min(bw_u, bw_v) * 0.8
+                bandwidth = min(bw_u, bw_v) * 0.8  # 0.8 = TCP/IP 协议栈开销估算 (头部+确认帧 ~20%)
                 latency = (self._get_node_latency(u) +
                            self._get_node_latency(v))
 
@@ -558,10 +572,20 @@ class GraphOrchestrator:
                         reduced = True
                         break
                 # 所有剩余节点都已降至 1 层 → 削去最低显存节点（将被过滤移除）
+                if not raw_layers:
+                    raise RuntimeError(
+                        f"_assign_layers: 层数不足以覆盖 {len(path_nodes)} 个节点 "
+                        f"(总层数={total_layers}, 节点显存过低)"
+                    )
                 if not reduced:
                     for idx in sorted_idx:
                         if raw_layers[idx] >= 1:
+                            removed_nid = path_nodes[idx]['node_id']
                             raw_layers[idx] -= 1
+                            logger.warning(
+                                f"⚠️ 节点 {removed_nid} 层数降至 0 将被移除: "
+                                f"节点数({len(path_nodes)}) > 可用层({self.total_layers})"
+                            )
                             break
 
         # 构建分配结果（跳过层数为 0 的节点）
@@ -666,7 +690,7 @@ class GraphOrchestrator:
                 'vram_mb': self._extract_vram_mb(di),
             })
 
-        scored.sort(key=lambda x: x['score'], reverse=True)
+        scored.sort(key=lambda x: (x['role'] != 'master', -x['score']))
 
         # 复用 _assign_layers
         fake_vertices = {

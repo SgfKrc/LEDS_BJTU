@@ -4,7 +4,7 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控
 
-**v0.1.5**
+**v0.1.7**
 
 ---
 
@@ -31,10 +31,10 @@
 
 | 特性 | 说明 |
 |------|------|
-| 🧠 **智能编排** | 节点数 > 5 时自动启用图算法（最大带宽生成树 + DFS），替代纯算力权重分配 |
+| 🧠 **智能编排** | 节点数 > 5 时自动启用图算法（最大带宽生成树 + DFS），替代纯算力权重分配 → [详见分布式资源调度系统](docs/分布式资源调度系统.md) |
 | 🔗 **链式拓扑流水线** | 按最优路径排序节点，hidden states 逐节点传递，支持 KV Cache 增量解码 |
 | 🔄 **双引擎架构** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/集显)，自动切换 |
-| 📋 **请求队列** | FIFO 队列管理并发推理请求，支持队列深度监控 |
+| 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
 | 🗄️ **多会话管理** | 本地 JSON 存储 + 云 PostgreSQL 双轨，断网自动降级 |
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
@@ -84,6 +84,7 @@
 │   ├── 运行流程&异常处理.md         # 全局配置、初始化流程、推理全链路、异常处理
 │   ├── 测试与评判标准.md            # 对照实验组、评判指标、可视化形式
 │   ├── 图算法.md                   # 最大带宽生成树 + DFS 路径搜索算法设计
+│   ├── 分布式资源调度系统.md          # MLFQ 三级反馈队列 + 图算法层编排（原理与关系）
 │   ├── 分布式推理流水线实施计划.md    # 链式拓扑、LAYER_FORWARD 协议、KV Cache 方案
 │   ├── Android版本远期计划.md       # Android 端方案评估与规划
 │   ├── Android SAF模型存储方案.md   # Android SAF 外部模型目录方案
@@ -112,23 +113,24 @@
 │   ├── keystore.properties        # release 签名配置（Git 忽略，需本地生成）
 │   ├── qlh-release.jks            # release 签名密钥库（Git 忽略）
 │   └── gradlew / gradlew.bat      # Gradle Wrapper（无需 Android Studio）
-├── packaging/                     # 打包配置与脚本
+├── .venv-packaging/               # 集显版打包专用 venv（torch CPU + PyInstaller）
+├── .venv-packaging-cuda/          # 独显版打包专用 venv（torch CUDA + PyInstaller）
+├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
 │   ├── launcher.py                # 打包版启动器（Tailscale → 模型检查 → 引擎选择 → 启动）
 │   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android 安装包）
 │   ├── qlh-cpu.spec               # PyInstaller 规格文件（集显版）
 │   ├── qlh-cuda.spec              # PyInstaller 规格文件（独显版，CUDA + CPU 回退）
-│   ├── setup.iss                  # Inno Setup 安装脚本 集显版（含可选 models/ 卸载）
+│   ├── setup.iss                  # Inno Setup 安装脚本 集显版
 │   ├── setup-cuda.iss             # Inno Setup 安装脚本 独显版
-│   ├── build-cpu.bat              # 一键 PyInstaller 打包（集显）
-│   ├── build-cuda.bat             # 一键 PyInstaller 打包（独显）
-│   ├── build-installer.bat        # 一键编译安装包
+│   ├── requirements-cpu.txt       # CPU-only 依赖清单
+│   ├── dist/                      # ★ 最终安装包输出目录（Git 忽略）
 │   └── README.md                  # 打包文档
 ├── frontend/                      # React 前端（Vite + FastAPI 后端代理）
 │   └── src/
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（272 个）
+├── tests/                         # 单元测试（442 个）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -145,8 +147,9 @@
 ### 硬件拓扑（3 节点流水线示例）
 
 ```
-用户输入 → 主节点(Master) → TCP → 从节点1(Client) → TCP → 从节点2(Client) → 结果回传
-          Embed + L0-7           L8-15                L16-23 + LM Head
+用户输入 → 主节点(Master)  → TCP → 从节点1(Client) → TCP → 从节点2(Client) → 结果回传
+          Embed + L0-3          L4-14              L15-23 + LM Head
+          独显主节点参与首段计算，不再仅协调调度
 ```
 
 ### Android 客户端双模式
@@ -389,9 +392,51 @@ python src/api_server.py
 | **集显版** | `QLH-Edge-Inference-Setup-vX.X.X.exe` | ~180 MB | CPU / 集成显卡节点（从节点） |
 | **独显版** | `QLH-Edge-Inference-Setup-vX.X.X-CUDA.exe` | ~1.7 GB | NVIDIA GPU 节点（主节点），无 GPU 时自动回退 CPU |
 
-安装后双击桌面快捷方式即可启动，无需配置 Python 环境。
+**集显版 (CPU) 构建**：
 
-> 卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
+```bash
+# 0. 创建并激活集显版 venv（仅首次）
+python -m venv .venv-packaging
+.venv-packaging\Scripts\activate
+
+# 1. 安装依赖（仅首次）
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r packaging/requirements-cpu.txt
+pip install pyinstaller
+
+# 2. 构建前端
+cd frontend && npm install && npx vite build && cd ..
+
+# 3. PyInstaller 打包（★ 从项目根目录运行）
+pyinstaller packaging/qlh-cpu.spec --noconfirm
+
+# 4. Inno Setup 安装包编译
+cd packaging
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
+```
+
+**独显版 (CUDA) 构建**（需另一独立 venv）：
+
+```bash
+# 0. 创建并激活独显版 venv（仅首次）
+python -m venv .venv-packaging-cuda
+.venv-packaging-cuda\Scripts\activate
+
+# 1. 安装依赖（仅首次，先 torch 后共享依赖，不会互相覆盖）
+pip install torch                        # ★ CUDA 12.x（默认），不是 CPU 版
+pip install -r packaging/requirements-cpu.txt
+pip install pyinstaller
+
+# 2-4. 同集显版，但 spec 和 iss 分别用 qlh-cuda.spec / setup-cuda.iss
+pyinstaller packaging/qlh-cuda.spec --noconfirm
+cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
+```
+
+> ⚠️ **关键**：两个版本使用**不同的独立 venv**（`.venv-packaging/` vs `.venv-packaging-cuda/`）。
+> 不能混用——集显版 venv 必须装 CPU-only torch，独显版 venv 必须装 CUDA torch。
+> 装错会导致集显版体积从 180 MB 膨胀到 1.8 GB。
+>
+> 安装后双击桌面快捷方式即可启动，无需配置 Python 环境。卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
 >
 > 详细打包流程参见 [packaging/README.md](packaging/README.md)。
 

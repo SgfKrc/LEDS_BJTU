@@ -820,19 +820,22 @@ class TestOrchestrateFull:
         assert orch.orchestrate() == []
 
     def test_fallback_weight_assignment(self):
-        """回退方案应生成有效分配"""
+        """回退方案应生成有效分配，且 master 排在首位"""
         nodes = {
-            "A": MockNode("A", "client", PROFILE_WORKSTATION),
             "B": MockNode("B", "client", PROFILE_EDGE),
+            "master": MockNode("master", "master", PROFILE_LAPTOP),  # 低权重master
+            "A": MockNode("A", "client", PROFILE_WORKSTATION),       # 高权重client
         }
         orch = GraphOrchestrator(nodes, model_memory_mb=500, total_layers=24)
         assignments = orch._fallback_weight_assignment()
 
-        assert len(assignments) == 2
+        assert len(assignments) == 3
         total = sum(a["layers_count"] for a in assignments)
         assert total == 24
-        # 权重高的节点层数更多
-        assert assignments[0]["layers_count"] > assignments[1]["layers_count"]
+        # master 应排在第一位（无论权重高低）
+        assert assignments[0]["node_id"] == "master"
+        assert assignments[0]["has_embedding"] is True
+        assert assignments[-1]["has_lm_head"] is True
 
     def test_edge_case_identical_nodes(self):
         """全相同配置的节点：应均分"""
@@ -936,12 +939,13 @@ class TestSchedulerGraphIntegration:
         total = sum(a["layers_count"] for a in assignments)
         assert total == 24
 
-        # 所有节点都应被分配至少 1 层
+        # master 参与首段层执行，所有节点至少 1 层
         for a in assignments:
-            assert a["layers_count"] >= 1
+            assert a["layers_count"] >= 1, \
+                f"节点 {a['node_id']} 应至少 1 层，实际: {a['layers_count']}"
 
     def test_simple_weight_excluded_master_first(self, scheduler):
-        """简单权重：master 排在第一位"""
+        """简单权重：master 作为首段 Embedding 锚点排在第一位"""
         nodes = {
             "master": MockNode("master", "master", PROFILE_WORKSTATION),
             "z_client": MockNode("z_client", "client", PROFILE_HIGH_VRAM),  # 权重更高但角色为 client
@@ -952,9 +956,12 @@ class TestSchedulerGraphIntegration:
         with patch('config.GRAPH_ORCHESTRATOR_THRESHOLD', 5):
             assignments = scheduler.compute_layer_assignment()
 
-        # master 在先
+        # master 在首位，作为首段 Embedding 锚点至少执行 1 层
         assert assignments[0]["node_id"] == "master"
         assert assignments[0]["has_embedding"] is True
+        assert assignments[0]["layers_count"] >= 1, \
+            f"master 应至少执行 1 层，实际: {assignments[0]['layers_count']}"
+        assert "coordinator_only" not in assignments[0]
 
     def test_fallback_on_graph_error(self, scheduler):
         """图算法异常时应回退到简单权重分配"""
@@ -1085,3 +1092,131 @@ class TestEdgeCases:
         assert total <= 24, f"总层数 {total} 不应超过 24，节点数={len(result)}"
         # 至少应有部分节点被分配（≤ 24 个节点有层）
         assert 1 <= len(result) <= 24
+
+    def test_assign_layers_overflow_squeezes_nodes_to_zero(self):
+        """diff<0 时，最低显存节点被削减至 0 层后被正确跳过。"""
+        nodes = {}
+        for i in range(30):
+            nid = f"n{i}"
+            nodes[nid] = type('MockNode', (), {
+                'node_id': nid,
+                'role': 'client',
+                'device_info': {},
+                'avg_rtt_ms': 0.0,
+                'network_type': 'wifi',
+            })()
+
+        orch = GraphOrchestrator(nodes=nodes, model_memory_mb=1000, total_layers=24)
+        # 所有节点显存相同 → 均分 → 30节点×1层=30 超过24 → diff=-6
+        vertices = {
+            nid: {'vram_mb': 100, 'compute_weight': 10, 'compute_delay': 5.0,
+                  'role': 'client'}
+            for nid in nodes
+        }
+        path = list(nodes.keys())
+        result = orch._assign_layers(path, vertices)
+
+        total = sum(a["layers_count"] for a in result)
+        assert total == 24
+        assert result[0]["has_embedding"] is True
+        assert result[-1]["has_lm_head"] is True
+        # 应有恰好 24 个非零节点
+        assert len(result) == 24
+
+    def test_assign_layers_zero_layer_nodes_not_in_result(self):
+        """被削减至 0 层的节点不应出现在结果中。"""
+        # 3 节点，total_layers=2 → 均分 1/1/0
+        nodes = {
+            "A": type('MockNode', (), {
+                'node_id': 'A', 'role': 'client',
+                'device_info': {}, 'avg_rtt_ms': 0.0, 'network_type': 'wifi',
+            })(),
+            "B": type('MockNode', (), {
+                'node_id': 'B', 'role': 'client',
+                'device_info': {}, 'avg_rtt_ms': 0.0, 'network_type': 'wifi',
+            })(),
+            "C": type('MockNode', (), {
+                'node_id': 'C', 'role': 'client',
+                'device_info': {}, 'avg_rtt_ms': 0.0, 'network_type': 'wifi',
+            })(),
+        }
+        orch = GraphOrchestrator(nodes=nodes, model_memory_mb=1000, total_layers=2)
+        vertices = {
+            nid: {'vram_mb': 100, 'compute_weight': 10, 'compute_delay': 5.0,
+                  'role': 'client'}
+            for nid in nodes
+        }
+        path = ["A", "B", "C"]
+        result = orch._assign_layers(path, vertices)
+        assert len(result) == 2
+        node_ids = {a["node_id"] for a in result}
+        assert len(node_ids) == 2
+
+
+# ================================================================
+# GraphOrchestrator — 延迟与带宽模型 测试
+# ================================================================
+
+
+class TestLatencyBandwidthModel:
+    """测试通信图中的延迟与带宽估算模型"""
+
+    def test_compute_delay_uses_max_weight_constant(self):
+        """compute_delay 应使用 _MAX_NODE_WEIGHT (115) 归一化。"""
+        from graph_orchestrator import _MAX_NODE_WEIGHT
+        assert _MAX_NODE_WEIGHT == 115.0
+
+        nodes = {
+            "full_score": MockNode("full_score", "client", PROFILE_WORKSTATION),
+            "zero_score": MockNode("zero_score", "client", {
+                "gpu": {}, "ram": {"total_gb": 0}, "cpu": {"physical_cores": 1, "freq_max_mhz": 1000},
+            }),
+        }
+        orch = GraphOrchestrator(nodes, model_memory_mb=1000)
+        graph = orch._build_graph()
+
+        # 高分节点 → 低延迟
+        assert graph['vertices']['full_score']['compute_delay'] < 5.0
+        # 低分节点 → 接近 max_delay = 10.0
+        assert graph['vertices']['zero_score']['compute_delay'] >= 9.0
+
+    def test_edge_latency_symmetric(self):
+        """同一条边两个方向的 latency 应相等。"""
+        nodes = {
+            "A": MockNode("A", "client", PROFILE_WORKSTATION, avg_rtt_ms=10.0),
+            "B": MockNode("B", "client", PROFILE_LAPTOP, avg_rtt_ms=20.0),
+        }
+        orch = GraphOrchestrator(nodes, model_memory_mb=2000)
+        graph = orch._build_graph()
+        edge = graph['edges'][0]
+        assert edge['latency_ms'] == orch._get_node_latency("A") + orch._get_node_latency("B")
+        assert edge['latency_ms'] == 5.0 + 10.0  # RTT/2
+
+    def test_bandwidth_min_of_both_ends(self):
+        """边带宽 = min(bw_u, bw_v) × 0.8"""
+        nodes = {
+            "fast": MockNode("fast", "client", PROFILE_WORKSTATION,
+                            avg_rtt_ms=1.0, network_type="ethernet"),
+            "slow": MockNode("slow", "client", PROFILE_EDGE,
+                            avg_rtt_ms=0, network_type="wifi"),
+        }
+        orch = GraphOrchestrator(nodes, model_memory_mb=2000)
+        graph = orch._build_graph()
+        edge = graph['edges'][0]
+        bw_fast = orch._estimate_bandwidth("fast")     # from RTT: 1000/(1+1)=500
+        bw_slow = orch._estimate_bandwidth("slow")      # from network_type: 30
+        expected = round(min(bw_fast, bw_slow) * 0.8, 2)
+        assert edge['bandwidth'] == expected
+
+    def test_unknown_node_returns_defaults(self):
+        """未知节点应返回安全的默认带宽和延迟。"""
+        orch = GraphOrchestrator({}, model_memory_mb=500)
+        assert orch._estimate_bandwidth("ghost") == 10.0
+        assert orch._get_node_latency("ghost") == 50.0
+
+    def test_node_without_device_info_has_zero_vram(self):
+        """无 device_info 节点的 VRAM 应为 0。"""
+        orch = GraphOrchestrator({}, model_memory_mb=500)
+        assert orch._extract_vram_mb({}) == 0.0
+        assert orch._extract_vram_mb(None) == 0.0
+
