@@ -12,7 +12,7 @@
 
 针对边缘设备（普通笔记本）显存不足、算力有限的痛点，将 Qwen-1.8B 大语言模型按 Transformer 层拆分，部署到多台边缘设备组成分布式推理集群。配合 INT4/INT8 模型量化、算子融合、轻量化分页KV缓存三大单机优化，以及**图算法智能编排**（最大带宽生成树 + DFS 路径搜索），实现低开销、低时延的边缘端大模型推理。
 
-现已支持 **Windows PC + Android 双端**：PC 端完整支持分布式层间拆分流水线，Android 端以 llama.cpp 本地完整推理或作为薄客户端将请求转发给 PC 集群。
+现已支持 **Windows PC + Linux + Android 三端**：PC 端（Windows/Linux）完整支持分布式层间拆分流水线，Android 端以 llama.cpp 本地完整推理或作为薄客户端将请求转发给 PC 集群。
 
 ### 软件版本分级（四级四种）
 
@@ -20,8 +20,8 @@
 
 | 级别 | 软件版本 | 目标设备 | 核心能力 | 不包含/不推荐 |
 |------|----------|----------|----------|---------------|
-| 1 | **PC 集显版** | 无 NVIDIA 独显的 Windows PC / 普通笔记本 | llama.cpp + GGUF CPU/集显推理、可作为轻量节点、基础分布式能力 | 重模型实验、CUDA 专属能力 |
-| 2 | **PC 独显版** | NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、后续支持多模型/重模型实验 | Android 极简化策略 |
+| 1 | **PC 集显版** | Windows / Linux 无 NVIDIA 独显的 PC | llama.cpp + GGUF CPU/集显推理、可作为轻量节点、基础分布式能力 | 重模型实验、CUDA 专属能力 |
+| 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、后续支持多模型/重模型实验 | Android 极简化策略 |
 | 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、较完整设置、后续可研究完整任务 Worker | Transformer 层间拆分、重模型实验 |
 | 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 完整 models 目录、日志管理、Worker 接收任务、高级控制面板 |
 
@@ -37,7 +37,7 @@
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
 | 🗄️ **多会话管理** | 本地 JSON 存储 + 云 PostgreSQL 双轨，断网自动降级 |
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
-| 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
+| 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天 |
 
@@ -117,12 +117,19 @@
 ├── .venv-packaging-cuda/          # 独显版打包专用 venv（torch CUDA + PyInstaller）
 ├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
 │   ├── launcher.py                # 打包版启动器（Tailscale → 模型检查 → 引擎选择 → 启动）
-│   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android 安装包）
+│   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android + Linux 安装包）
 │   ├── qlh-cpu.spec               # PyInstaller 规格文件（集显版）
 │   ├── qlh-cuda.spec              # PyInstaller 规格文件（独显版，CUDA + CPU 回退）
 │   ├── setup.iss                  # Inno Setup 安装脚本 集显版
 │   ├── setup-cuda.iss             # Inno Setup 安装脚本 独显版
 │   ├── requirements-cpu.txt       # CPU-only 依赖清单
+│   ├── linux/                     # Linux .deb 打包
+│   │   ├── build-deb.sh           # deb 构建脚本
+│   │   ├── launcher.py            # Linux 跨平台启动器
+│   │   ├── control-cpu / control-cuda  # dpkg 元数据
+│   │   ├── postinst / prerm / postrm   # 安装/卸载脚本
+│   │   ├── qlh-edge-inference.service  # systemd 服务单元
+│   │   └── qlh-edge-inference.desktop  # 桌面入口
 │   ├── dist/                      # ★ 最终安装包输出目录（Git 忽略）
 │   └── README.md                  # 打包文档
 ├── frontend/                      # React 前端（Vite + FastAPI 后端代理）
@@ -251,8 +258,11 @@
 ### 一键安装
 
 ```bash
-# Python 依赖
+# Python 依赖（PostgreSQL 客户端可选，不装也不影响单机模式）
 pip install -r requirements.txt
+
+# 可选：PostgreSQL 数据库驱动（分布式集群节点注册/配置同步）
+pip install psycopg2-binary
 
 # 前端依赖
 cd frontend && npm install && cd ..
@@ -440,6 +450,40 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 >
 > 详细打包流程参见 [packaging/README.md](packaging/README.md)。
 
+### Linux 安装包 (.deb)
+
+提供与 Windows 集显版对应的 `.deb` 安装包，适用于 Ubuntu 22.04+ / Debian 12+：
+
+| 版本 | 安装包 | 典型大小 | 适用场景 |
+|------|--------|---------|---------|
+| **CPU 版** | `qlh-edge-inference-cpu_0.1.7_amd64.deb` | ~200 MB | CPU / 集成显卡节点 |
+| **CUDA 版** | `qlh-edge-inference-cuda_0.1.7_amd64.deb` | ~1.8 GB | NVIDIA GPU 节点 |
+
+**构建**（需 Ubuntu/Debian 环境）：
+
+```bash
+cd packaging/linux
+bash build-deb.sh cpu     # 集显版
+bash build-deb.sh cuda    # 独显版
+```
+
+**安装**：
+
+```bash
+sudo dpkg -i qlh-edge-inference-cpu_0.1.7_amd64.deb
+# 安装后自动注册 systemd 服务、桌面入口和 /usr/local/bin/qlh-launcher
+```
+
+**使用**：
+
+```bash
+qlh-launcher              # 桌面模式（浏览器打开前端）
+qlh-launcher --headless   # 无头模式（仅 API，适合服务器）
+sudo systemctl enable --now qlh-edge-inference  # 开机自启
+```
+
+> 前置依赖：`python3` (≥ 3.10)、`python3-venv`、`tailscale`（分布式模式）。安装包内置独立 venv，不污染系统 Python。
+
 ### Android 客户端
 
 > 前提：已安装 JDK 17 + Android SDK（API 34+），SDK 路径配置在 `android/local.properties`
@@ -458,15 +502,16 @@ cd android
 
 产物：
 
-| 产物 | 路径 | 典型大小 |
-|------|------|---------|
-| Debug APK | `android/app/build/outputs/apk/debug/app-debug.apk` | ~29 MB（含 llama.cpp native 后端） |
-| Release APK | `android/app/build/outputs/apk/release/app-release.apk` | ~6.6 MB（R8 + native strip） |
+| 产物 | 路径 | 典型大小 | 说明 |
+|------|------|---------|------|
+| Full Debug | `android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | 含 llama.cpp native 后端 |
+| Full Release | `android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
+| Lite Release | `android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | 纯薄客户端，不含 native 库 |
 
 **安装**：
 
 ```bash
-adb install android/app/build/outputs/apk/release/app-release.apk
+adb install android/app/build/outputs/apk/full/release/app-full-release.apk
 ```
 
 **使用**：
@@ -487,8 +532,9 @@ python serve.py
 
 首页会列出：
 
-- Windows PC 安装包
-- Android Debug / Release APK
+- Windows PC 安装包 (.exe)
+- Linux 安装包 (.deb)
+- Android Full / Lite APK
 - 模型压缩包 `models.7z`
 
 > 其他设备（包括 Android 手机）直接浏览器打开链接即可下载。

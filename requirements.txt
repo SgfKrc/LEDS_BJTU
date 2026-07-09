@@ -4,7 +4,7 @@
 # 安装: pip install -r requirements.txt
 #
 # 兼容性说明:
-#   - transformers 需保持 4.x 版本（5.x 与 bitsandbytes 量化不兼容）
+#   - transformers 推荐 4.x 系列（BitsAndBytesConfig 兼容性已验证）
 #   - bitsandbytes >= 0.45.0 支持 Windows + CUDA 12.x
 #   - PyTorch 需与 CUDA 版本匹配
 
