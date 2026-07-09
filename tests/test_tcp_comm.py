@@ -351,6 +351,60 @@ class TestFastTensorSerialization:
 class TestTCPServerConnectionManagement:
     """测试 TCPServer 注册拒绝、连接表线程安全与回调日志。"""
 
+    def test_registration_uses_advertised_endpoint_not_peer_port(self):
+        """节点服务地址应使用 advertised_address，peer_addr 保留临时源端口。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": "client1",
+                    "role": "client",
+                    "hostname": "worker",
+                    "advertised_host": "10.0.0.9",
+                    "advertised_port": 8888,
+                    "advertised_address": "10.0.0.9:8888",
+                    "auth": tcp_comm_mod.build_auth_signature("client1"),
+                },
+            }
+            client_id = server._handle_registration(
+                srv_sock, ("10.0.0.9", 54321), "pending_54321", msg
+            )
+            assert client_id == "client1"
+            info = server.get_client_info("client1")
+            assert info["advertised_addr"] == "10.0.0.9:8888"
+            assert info["addr"] == "10.0.0.9:8888"
+            assert info["peer_addr"] == "10.0.0.9:54321"
+        finally:
+            server.stop()
+            srv_sock.close()
+            cli_sock.close()
+
+    def test_legacy_registration_falls_back_to_server_port(self):
+        """旧客户端未上报 advertised_port 时应使用 peer_ip:SERVER_PORT，而不是临时端口。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": "client_legacy",
+                    "role": "client",
+                    "auth": tcp_comm_mod.build_auth_signature("client_legacy"),
+                },
+            }
+            server._handle_registration(
+                srv_sock, ("10.0.0.8", 51234), "pending_51234", msg
+            )
+            info = server.get_client_info("client_legacy")
+            assert info["advertised_addr"] == f"10.0.0.8:{tcp_comm_mod.SERVER_PORT}"
+            assert info["peer_addr"] == "10.0.0.8:51234"
+        finally:
+            server.stop()
+            srv_sock.close()
+            cli_sock.close()
+
     def test_rejected_registration_returns_ack_and_raises(self):
         """认证失败的 REGISTER 应返回 rejected ACK 并抛内部拒绝异常。"""
         server = TCPServer(host="127.0.0.1", port=0)
@@ -444,3 +498,61 @@ class TestTCPServerConnectionManagement:
         records = [r for r in caplog.records if "on_heartbeat 回调异常" in r.getMessage()]
         assert records
         assert records[0].exc_info is not None
+
+
+# ================================================================
+# Phase 7 P1: recv_exact 超时测试
+# ================================================================
+
+class TestRecvExactTimeout:
+    """测试 recv_exact 在 socket 超时和对方关闭时的行为。"""
+
+    def test_recv_exact_returns_none_on_peer_close(self):
+        """对方关闭连接时 recv_exact 应返回 None。"""
+        from tcp_comm import recv_exact
+
+        srv, cli = socket.socketpair()
+        try:
+            cli.close()  # 写端关闭
+            srv.settimeout(1.0)
+            result = recv_exact(srv, 1024)
+            assert result is None, "对方关闭时应返回 None"
+        finally:
+            srv.close()
+
+    def test_recv_exact_timeout_raises_on_blocking(self):
+        """超时时 socket 应抛出 socket.timeout（无数据到达）。"""
+        from tcp_comm import recv_exact
+
+        srv, cli = socket.socketpair()
+        try:
+            srv.settimeout(0.1)
+            # 对方不发数据 → recv 超时
+            with pytest.raises((socket.timeout, OSError)):
+                recv_exact(srv, 1024)
+        finally:
+            srv.close()
+            cli.close()
+
+    def test_serialize_deserialize_large_tensor_roundtrip(self):
+        """接近 16MB 的张量序列化→反序列化往返应正确。"""
+        from tcp_comm import serialize_tensor_fast, deserialize_tensor_fast
+
+        # 创建一个 ~4M 元素的 float32 张量 ≈ 16MB
+        shape = (1024, 1024, 4)
+        t = torch.randn(*shape, dtype=torch.float32)
+        data = serialize_tensor_fast(t)
+        assert len(data) > 0
+        t2 = deserialize_tensor_fast(data)
+        assert t2.shape == shape
+        assert torch.allclose(t, t2, atol=1e-6)
+
+    def test_serialize_tensor_fast_rejects_unsupported_dtype(self):
+        """Phase 5.1: 不支持的 dtype 应抛 ValueError 而非静默转 float32。"""
+        from tcp_comm import serialize_tensor_fast
+
+        # 需要 >= 1MB 触发 TNR0（大张量）路径；float64 不在支持的 dtype map 中
+        # float64: element_size=8, nbytes=8*250k=2MB → TNR0 路径
+        t = torch.zeros(250000, dtype=torch.float64)
+        with pytest.raises(ValueError, match="不支持"):
+            serialize_tensor_fast(t)

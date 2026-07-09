@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=QLH 边缘推理系统
+Name[zh_CN]=QLH 边缘推理系统
+Comment=轻量化大模型分布式边缘推理优化系统
+Comment[zh_CN]=轻量化大模型分布式边缘推理优化系统
+Exec=/opt/qlh-edge-inference/bin/qlh-launcher
+Icon=qlh
+Terminal=false
+Type=Application
+Categories=Utility;Network;ArtificialIntelligence;
+Keywords=AI;LLM;edge;inference;distributed;推理;大模型;边缘;
+StartupNotify=true

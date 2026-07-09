@@ -1,6 +1,8 @@
 package com.qlh.inference.network
 
 import android.util.Log
+import com.google.gson.Gson
+import com.qlh.inference.BuildConfig
 import com.qlh.inference.data.MessageDao
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.data.MessageEntity
@@ -27,6 +29,18 @@ class ChatRepository(
 ) {
     companion object {
         private const val TAG = "ChatRepository"
+    }
+
+    private val gson = Gson()
+    private var clientNodeIdProvider: (suspend () -> String?)? = null
+    private var thinPresenceHook: (suspend () -> Unit)? = null
+
+    fun setThinClientMetadataProvider(provider: suspend () -> String?) {
+        clientNodeIdProvider = provider
+    }
+
+    fun setThinPresenceHook(hook: suspend () -> Unit) {
+        thinPresenceHook = hook
     }
 
     // ==================== 会话 ====================
@@ -237,6 +251,8 @@ class ChatRepository(
         showThinking: Boolean
     ): Result<String> {
         QlhLogger.i(TAG, "sendViaApi: session=$sessionId message=${message.length} chars")
+        thinPresenceHook?.invoke()
+        val clientNodeId = clientNodeIdProvider?.invoke()
         val result = client.chat(
             ChatRequest(
                 message = message,
@@ -244,17 +260,22 @@ class ChatRepository(
                 temperature = temperature,
                 topP = topP,
                 showThinking = showThinking,
-                sessionId = sessionId.toString()
+                sessionId = sessionId.toString(),
+                clientNodeId = clientNodeId,
+                clientNodeType = "android",
+                clientMode = "thin",
+                clientAppVariant = if (BuildConfig.IS_LITE) "lite" else "full"
             )
         )
 
         return result.map { response ->
             QlhLogger.i(TAG, "sendViaApi OK: content=${response.content.length} chars")
+            thinPresenceHook?.invoke()
             val assistantMsg = MessageEntity(
                 sessionId = sessionId,
                 role = "assistant",
                 content = response.content,
-                metrics = response.metrics?.toString()
+                metrics = response.metrics?.let { gson.toJson(it) }
             )
             messageDao.insert(assistantMsg)
             sessionDao.updateMessageCount(sessionId, messageDao.getCount(sessionId))
@@ -315,7 +336,7 @@ class ChatRepository(
                         sessionId = sessionId,
                         role = msg.role,
                         content = msg.content,
-                        metrics = msg.metrics?.toString()
+                        metrics = msg.metrics?.let { gson.toJson(it) }
                     )
                 )
             }

@@ -617,3 +617,217 @@ class TestSchedulingStrategy:
         assert task is not None
         # 老化后任务级别变化
         queue._aging_max_wait = old
+
+
+# ================================================================
+# Layer assignment management (v0.1.7)
+# ================================================================
+
+class TestLayerOverrideManagement:
+    """测试分层覆盖的增删改查生命周期。"""
+
+    def test_clear_layer_override_empty(self):
+        """清除不存在的覆盖应无异常。"""
+        from db import clear_layer_override, get_layer_override
+        clear_layer_override()
+        result = get_layer_override()
+        assert result is None
+
+    def test_set_then_clear_override(self):
+        """设置覆盖后清除，应恢复到 None。"""
+        from db import set_layer_override, clear_layer_override, get_layer_override
+
+        overrides = [
+            {"node_id": "node-a", "start_layer": 0, "end_layer": 12},
+            {"node_id": "node-b", "start_layer": 12, "end_layer": 24},
+        ]
+        set_layer_override(overrides)
+        result = get_layer_override()
+        assert result is not None
+        assert len(result) == 2
+        assert result[0]["node_id"] == "node-a"
+
+        clear_layer_override()
+        result2 = get_layer_override()
+        assert result2 is None
+
+    def test_override_preserves_node_ids(self):
+        """覆盖数据应保留完整的 node_id 和层范围。"""
+        from db import set_layer_override, get_layer_override, clear_layer_override
+
+        overrides = [
+            {"node_id": "gpu-node-1", "start_layer": 0, "end_layer": 8},
+            {"node_id": "gpu-node-2", "start_layer": 8, "end_layer": 16},
+            {"node_id": "cpu-node-1", "start_layer": 16, "end_layer": 24},
+        ]
+        set_layer_override(overrides)
+        result = get_layer_override()
+        assert len(result) == 3
+        for i, node in enumerate(overrides):
+            assert result[i]["node_id"] == node["node_id"]
+            assert result[i]["start_layer"] == node["start_layer"]
+            assert result[i]["end_layer"] == node["end_layer"]
+
+        clear_layer_override()
+
+    def test_reset_layer_assignments_restores_dynamic(self, scheduler):
+        """scheduler.reset_layer_assignments() 应恢复 dynamic 策略。"""
+        from db import set_layer_override, clear_layer_override
+
+        # 先设置手动覆盖
+        set_layer_override([
+            {"node_id": "test-node", "start_layer": 0, "end_layer": 24},
+        ])
+
+        # 重置
+        result = scheduler.reset_layer_assignments()
+        assert result["status"] == "ok"
+        assert result["strategy"] == "dynamic"
+        # assignments 可能为空（无已注册节点时动态计算返回空列表）
+
+        # 清理
+        clear_layer_override()
+
+    def test_reset_without_override_still_works(self, scheduler):
+        """无手动覆盖时 reset 也应正常返回 dynamic 策略。"""
+        from db import clear_layer_override
+        clear_layer_override()
+
+        result = scheduler.reset_layer_assignments()
+        assert result["status"] == "ok"
+        assert result["strategy"] == "dynamic"
+
+    def test_set_clear_set_cycle(self):
+        """多次设置→清除→设置循环应保持数据一致。"""
+        from db import set_layer_override, clear_layer_override, get_layer_override
+
+        for i in range(3):
+            set_layer_override([
+                {"node_id": f"node-{i}", "start_layer": 0, "end_layer": 24},
+            ])
+            result = get_layer_override()
+            assert result[0]["node_id"] == f"node-{i}"
+
+            clear_layer_override()
+            assert get_layer_override() is None
+
+    def test_reset_clears_override_in_db(self, scheduler, monkeypatch):
+        """reset_layer_assignments 应清除 DB 中的手动覆盖记录。"""
+        from db import set_layer_override, get_layer_override, clear_layer_override
+        import scheduler as scheduler_mod
+
+        # 设置手动覆盖
+        set_layer_override([
+            {"node_id": "worker-1", "start_layer": 0, "end_layer": 12},
+            {"node_id": "worker-2", "start_layer": 12, "end_layer": 24},
+        ])
+        assert get_layer_override() is not None
+
+        # 重置
+        result = scheduler.reset_layer_assignments()
+        assert result["status"] == "ok"
+        assert result["strategy"] == "dynamic"
+
+        # DB 中的覆盖应被清除
+        assert get_layer_override() is None
+
+        # 清理
+        clear_layer_override()
+
+    def test_reset_layer_assignments_endpoint_exists_at_module_level(self):
+        """验证 reset_layer_assignments 函数是模块级函数（非嵌套在其他函数内）。
+
+        回归测试：此前 DELETE /api/cluster/layers 因缩进错误被嵌套在
+        override_layer_assignments 函数体内，导致 FastAPI 无法注册该路由。
+        """
+        import api_server
+        fn = getattr(api_server, 'reset_layer_assignments', None)
+        assert fn is not None, \
+            "reset_layer_assignments 未在 api_server 模块级别定义（缩进错误？）"
+        import inspect
+        assert inspect.iscoroutinefunction(fn), \
+            "reset_layer_assignments 应为 async 协程函数"
+
+    def test_reset_when_db_unavailable(self, scheduler, monkeypatch):
+        """DB 不可用时 reset 也应正常完成（不抛异常）。"""
+        import scheduler as scheduler_mod
+
+        # 模拟 DB 不可用
+        monkeypatch.setattr(scheduler_mod, "_db_available", False)
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: None)
+
+        result = scheduler.reset_layer_assignments()
+        assert result["status"] == "ok"
+        assert result["strategy"] == "dynamic"
+        assert "assignments" in result
+
+    def test_override_and_reset_sequence(self, scheduler, monkeypatch):
+        """先手动覆盖再重置：策略应正确切换 dynamic→manual→dynamic。"""
+        from db import set_layer_override, clear_layer_override
+        import scheduler as scheduler_mod
+
+        # 阶段 1: 初始状态 — 动态策略
+        initial = scheduler.get_layer_assignments()
+        assert initial["strategy"] == "dynamic"
+
+        # 模拟注册 2 个节点
+        scheduler.nodes["gpu-a"] = NodeInfo(
+            node_id="gpu-a", role="client", state=NodeState.ONLINE,
+            address="10.0.0.1:8888",
+        )
+        scheduler.nodes["gpu-b"] = NodeInfo(
+            node_id="gpu-b", role="client", state=NodeState.ONLINE,
+            address="10.0.0.2:8888",
+        )
+
+        # 阶段 2: 手动覆盖
+        overrides = [
+            {"node_id": "gpu-a", "start_layer": 0, "end_layer": 12},
+            {"node_id": "gpu-b", "start_layer": 12, "end_layer": 24},
+        ]
+        set_layer_override(overrides)
+
+        # 阶段 3: 重置 → 恢复动态
+        result = scheduler.reset_layer_assignments()
+        assert result["status"] == "ok"
+        assert result["strategy"] == "dynamic"
+
+        # 清理
+        clear_layer_override()
+        del scheduler.nodes["gpu-a"]
+        del scheduler.nodes["gpu-b"]
+
+    # ---- Phase 7 P0: 角色门控拒绝分支 ----
+
+    def test_reset_layer_assignments_denied_non_master(self, scheduler, monkeypatch):
+        """非主节点调用 reset_layer_assignments 应返回 denied。"""
+        # 模拟非 master 角色
+        monkeypatch.setattr(scheduler, "_effective_role", lambda: "client")
+        result = scheduler.reset_layer_assignments()
+        assert result["status"] == "denied"
+        assert "仅主节点" in result.get("reason", "")
+
+    def test_override_layer_assignments_denied_non_master(self, scheduler, monkeypatch):
+        """非主节点调用 override_layer_assignments 应返回 denied。"""
+        monkeypatch.setattr(scheduler, "_effective_role", lambda: "client")
+        result = scheduler.override_layer_assignments([
+            {"node_id": "w1", "start_layer": 0, "end_layer": 24},
+        ])
+        assert result["status"] == "denied"
+        assert "仅主节点" in result.get("reason", "")
+
+    def test_override_layer_assignments_rejects_android_node(self, scheduler, monkeypatch):
+        """Phase 4.1: 手动覆盖不应接受 Android 节点。"""
+        monkeypatch.setattr(scheduler, "_effective_role", lambda: "master")
+        scheduler.nodes["android-1"] = NodeInfo(
+            node_id="android-1", role="client", node_type="android",
+            state=NodeState.ONLINE, address="10.0.0.99:8888",
+        )
+        try:
+            result = scheduler.override_layer_assignments([
+                {"node_id": "android-1", "start_layer": 0, "end_layer": 24},
+            ])
+            assert result["status"] == "invalid"
+            assert "Android" in result.get("reason", "")
+        finally:
+            del scheduler.nodes["android-1"]

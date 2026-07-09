@@ -7,7 +7,7 @@ import {
   manualRegisterNode, fetchMasterHealth,
   testEmailNotification,
   fetchDistributedInferenceConfig, updateDistributedInferenceConfig,
-  fetchLayerAssignment, updateLayerAssignment,
+  fetchLayerAssignment, updateLayerAssignment, resetLayerAssignments,
   fetchConversationSyncStatus,
   transferMasterRole, fetchTransferLogs,
   fetchSpareMaster, designateSpareMaster,
@@ -18,6 +18,10 @@ import {
 
 const ROLE_LABELS = { master: '主节点', client: '从节点' };
 const ROLE_ICONS = { master: '🖥️', client: '💻' };
+
+// 动态加载的模块引用（避免 window 全局污染）
+let _deleteReviewTicketFn = null;
+let _deleteResolvedReviewTicketsFn = null;
 const TYPE_ICONS = { pc: '💻', android: '📱' };
 const TYPE_LABELS = { pc: 'PC', android: 'Android' };
 
@@ -28,12 +32,12 @@ const STATE_COLORS = {
 };
 
 const NETWORK_LABELS = {
-  wifi: '📶 WiFi', ethernet: '🔌 以太网',
-  localhost: '🏠 本地', unknown: '❓ 未知',
+  wifi: '📶 WiFi', ethernet: '🔌 以太网', mobile: '📱 移动网络',
+  vpn: '🔐 VPN', other: '🌐 其他', localhost: '🏠 本地', unknown: '❓ 未知',
 };
 const NETWORK_CLASSES = {
-  wifi: 'net-wifi', ethernet: 'net-eth',
-  localhost: 'net-local', unknown: 'net-unknown',
+  wifi: 'net-wifi', ethernet: 'net-eth', mobile: 'net-mobile',
+  vpn: 'net-vpn', other: 'net-other', localhost: 'net-local', unknown: 'net-unknown',
 };
 
 function formatTime(ts) {
@@ -336,9 +340,9 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
       !isMaster ? fetchMasterHealth().catch(() => null) : Promise.resolve(null),
       isMaster ? fetchQueue().catch(() => null) : Promise.resolve(null),
     ]).then(([s, n, c, inv, layerData, mh, qd]) => {
-      setStatus(s);
-      setNodes(n);
-      setConfig(c);
+      setStatus(s || {});
+      setNodes(n || { nodes: [] });
+      setConfig(c || {});
       setInvite(inv);
       if (layerData) {
         setLayerAssignment(layerData);
@@ -513,23 +517,23 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
     if (isMaster) {
       fetchTransferLogs()
         .then(data => setTransferLogs(data.logs || []))
-        .catch(() => {});
+        .catch(() => onToast?.({ type: 'warning', msg: '无法加载转让日志' }));
     }
     // P3: 加载审查数据（主节点始终加载，投票资格由服务端检查）
     if (isMaster) {
       import('../api/client').then(({ fetchReviewTickets, checkCanVote, deleteReviewTicket, deleteResolvedReviewTickets }) => {
         fetchReviewTickets('pending')
           .then(data => setReviewTickets(data.tickets || []))
-          .catch(() => {});
+          .catch(() => onToast?.({ type: 'warning', msg: '无法加载审查工单' }));
         checkCanVote()
           .then(data => setCanVote(data.can_vote || false))
-          .catch(() => {});
-        // 挂载删除函数供后续使用
-        window.__deleteReviewTicket = deleteReviewTicket;
-        window.__deleteResolvedReviewTickets = deleteResolvedReviewTickets;
-      });
+          .catch(() => {});  // canVote 默认 false，静默降级即可
+        // 缓存动态导入的函数引用
+        _deleteReviewTicketFn = deleteReviewTicket;
+        _deleteResolvedReviewTicketsFn = deleteResolvedReviewTickets;
+      }).catch(() => onToast?.({ type: 'warning', msg: '审查模块加载失败' }));
     }
-  }, [isMaster]);
+  }, [isMaster, onToast]);
 
   // ---- 备用主节点 ----
   const loadSpareMasterData = useCallback(() => {
@@ -632,7 +636,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const handleDeleteTicket = async (ticketId) => {
     if (!window.confirm(`确定删除工单 ${ticketId}？`)) return;
     try {
-      const fn = window.__deleteReviewTicket || (await import('../api/client')).deleteReviewTicket;
+      const fn = _deleteReviewTicketFn || (await import('../api/client')).deleteReviewTicket;
       await fn(ticketId);
       onToast?.({ type: 'success', msg: `工单 ${ticketId} 已删除` });
       const { fetchReviewTickets } = await import('../api/client');
@@ -646,7 +650,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const handleDeleteResolvedTickets = async () => {
     if (!window.confirm('确定删除所有已解决/已过期/已拒绝的审查工单？')) return;
     try {
-      const fn = window.__deleteResolvedReviewTickets || (await import('../api/client')).deleteResolvedReviewTickets;
+      const fn = _deleteResolvedReviewTicketsFn || (await import('../api/client')).deleteResolvedReviewTickets;
       const result = await fn();
       onToast?.({ type: 'success', msg: `已清理 ${result.count} 个工单` });
       const { fetchReviewTickets } = await import('../api/client');
@@ -738,10 +742,8 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
 
   const handleResetLayerStrategy = async () => {
     if (!window.confirm('确定要恢复自动分层吗？这将清除手动覆盖并重新根据硬件配置动态计算。')) return;
-    // 删除手动覆盖 → 策略回到 dynamic
     try {
-      const result = await updateDistributedInferenceConfig(distributedEnabled);  // 触发 sync
-      // 删除 layer_override + 恢复 dynamic 策略需要后端接口
+      await resetLayerAssignments();
       await fetchLayerConfig();
       onToast?.({ type: 'success', msg: '已恢复自动分层策略' });
     } catch (err) {
@@ -1264,12 +1266,13 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                   filteredNodeList.map((node) => {
                     const isOffline = node.state === 'offline';
                     const isMasterNode = node.role === 'master';
+                    const isAndroidThin = node.node_type === 'android' && node.device_info?.connection_type === 'http_thin';
                     const netLabel = NETWORK_LABELS[node.network_type] || NETWORK_LABELS.unknown;
                     const netClass = NETWORK_CLASSES[node.network_type] || NETWORK_CLASSES.unknown;
 
                     // TCP 连接状态
                     const tcpDetail = status?.tcp_server?.client_details?.[node.node_id];
-                    const tcpConnected = isTcpActive(tcpDetail);
+                    const tcpConnected = isAndroidThin ? node.state === 'online' : isTcpActive(tcpDetail);
                     const tcpMissed = tcpDetail?.heartbeat_missed || 0;
                     const isSelfMaster = isMasterNode && isMaster;
 
@@ -1281,7 +1284,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                       if (tcpDetail?.last_heartbeat) {
                         const age = Date.now() / 1000 - tcpDetail.last_heartbeat;
                         rttMs = age * 1000;
-                        rttDisplay = age < 10 ? `${(age * 1000).toFixed(0)}ms` : `${age.toFixed(0)}s`;
+                        rttDisplay = formatRTT(rttMs);
                       }
                     } else if (!isMaster && isMasterNode) {
                       // 从节点视角：显示到主节点的 RTT
@@ -1317,6 +1320,14 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                         <td>
                           {isSelfMaster ? (
                             <span className="conn-indicator conn-self" title="本机主节点">🖥️ 本地</span>
+                          ) : isAndroidThin ? (
+                            <span
+                              className={`conn-indicator ${tcpConnected ? 'conn-ok' : 'conn-bad'}`}
+                              title={`Android HTTP 薄客户端，last seen ${formatTime(node.last_heartbeat)}`}
+                            >
+                              <span className="conn-dot" />
+                              {tcpConnected ? 'HTTP 在线' : 'HTTP 离线'}
+                            </span>
                           ) : (
                             <span
                               className={`conn-indicator ${tcpConnected ? 'conn-ok' : 'conn-bad'}`}
@@ -1327,7 +1338,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                                   : '无 TCP 连接信息'}
                             >
                               <span className="conn-dot" />
-                              {tcpConnected ? '已连接' : '未连接'}
+                              {tcpConnected ? 'TCP 已连' : 'TCP 未连'}
                             </span>
                           )}
                         </td>
@@ -1337,10 +1348,12 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                           </span>
                         </td>
                         <td><span className={`network-badge ${netClass}`}>{netLabel}</span></td>
-                        <td className="mono-cell">{node.address || '—'}</td>
+                        <td className="mono-cell">
+                          {isAndroidThin ? 'HTTP thin client' : (node.address || '—')}
+                        </td>
                         <td>{node.hostname || '—'}</td>
-                        <td>{isOffline ? '—' : formatUptime(node.connected_at)}</td>
-                        <td>{node.task_count}</td>
+                        <td>{isOffline ? '—' : (isAndroidThin ? `seen ${formatTime(node.last_heartbeat)}` : formatUptime(node.connected_at))}</td>
+                        <td title={isAndroidThin ? 'Android HTTP 薄客户端请求来源，不参与 pipeline worker 计算' : '实际完成/参与的推理任务数'}>{node.task_count}</td>
                         <td>
                           <span style={{ color: node.error_count > 0 ? 'var(--danger)' : undefined }}>
                             {node.error_count}
@@ -1988,7 +2001,10 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                   }}>🧹 清空</button>
                   <select className="setting-select" style={{width:90,fontSize:12}}
                     value={queueDetail?.strategy || 'mlfq'}
-                    onChange={async (e) => { await setQueueStrategy(e.target.value); refresh(); }}>
+                    onChange={async (e) => {
+                    try { await setQueueStrategy(e.target.value); refresh(); }
+                    catch (err) { onToast?.({ type: 'error', msg: `队列策略切换失败: ${err.message}` }); }
+                  }}>
                     <option value="mlfq">MLFQ</option>
                     <option value="fifo">FIFO</option>
                   </select>

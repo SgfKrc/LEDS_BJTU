@@ -985,11 +985,13 @@ private fun RuntimeStatusCard(status: AndroidRuntimeStatus) {
                     StatusRow("GL Version", gpu.version.ifBlank { "未知" })
                 }
                 StatusRow("GPU Offload 支持", if (gpu.supportsGpuOffload) "是" else "否")
+                StatusRow("当前推理后端", if (gpu.supportsGpuOffload) "GPU offload 可用" else "CPU llama.cpp")
+                StatusRow("Android GPU 版", "计划单独构建")
                 if (gpu.backendDevices.isNotBlank()) {
                     StatusRow("GGML 后端设备", gpu.backendDevices)
                 }
                 Text(
-                    text = gpu.note.ifBlank { "当前 Android 构建未启用 GPU offload，推理仍走 CPU。" },
+                    text = gpu.note.ifBlank { "GPU 仅用于设备画像展示；当前 Android Full/Lite 版本不启用 GPU 推理，GPU 版将作为单独版本规划。" },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline
                 )

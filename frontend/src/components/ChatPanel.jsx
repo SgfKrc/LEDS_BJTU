@@ -21,6 +21,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const creatingSessionRef = useRef(false);  // 防止并发创建会话
   const clearingRef = useRef(false);         // 防止清空期间发送消息
   const currentSessionIdRef = useRef(sessionId);  // 跟踪当前活跃会话ID，跨渲染同步
+  const abortControllerRef = useRef(null);       // SSE 流式请求取消控制器
+  const streamTimerRef = useRef(null);           // P1-3: full 模式打字动画 timer，用于会话切换时清理
   currentSessionIdRef.current = sessionId;
 
   const scrollToBottom = () => {
@@ -236,6 +238,21 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const autoCreatedSessionId = useRef(null);  // handleSend 自动创建的会话 ID，仅此 ID 跳过清空
   const prevSessionIdRef = useRef(sessionId);   // 跟踪上一次 sessionId，用于日志
 
+  // ---- 组件卸载时清理所有异步资源（timer + 进行中的请求） ----
+  // Phase 1.3: 防止从 chat 切到 admin 时打字动画 interval 泄漏 + SSE 请求残留
+  useEffect(() => {
+    return () => {
+      if (streamTimerRef.current) {
+        clearInterval(streamTimerRef.current);
+        streamTimerRef.current = null;
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+    };
+  }, []);
+
   // ---- 会话切换时清空当前消息（由历史加载 effect 重新填充） ----
   useEffect(() => {
     const prevSid = prevSessionIdRef.current;
@@ -247,6 +264,17 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     });
     prevSessionIdRef.current = sessionId;
 
+    // P1-1修复: 取消进行中的 SSE/HTTP 请求，避免旧会话推理继续消耗服务器资源
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    // P1-3修复: 清除 full 模式打字动画 timer，防止 interval 泄漏
+    if (streamTimerRef.current) {
+      clearInterval(streamTimerRef.current);
+      streamTimerRef.current = null;
+    }
+
     if (sessionId && autoCreatedSessionId.current === sessionId) {
       // handleSend 刚自动创建此会话，消息已由 handleSend 添加，不清空
       console.log('[ChatPanel] session-switch: SKIP clear (auto-created session match)', { sessionId });
@@ -257,6 +285,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     console.log('[ChatPanel] session-switch: CLEAR messages', { prevAutoCreated: autoCreatedSessionId.current, newSid: sessionId });
     autoCreatedSessionId.current = null;
     setMessages([]);
+    setSending(false);  // P2-2修复: 重置发送状态，解锁新会话的发送按钮
     setLastMetrics(null);
     setUploadedFile(null);
     setExpandedThinking(new Set());
@@ -378,6 +407,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     setUploadedFile(null);
     setSending(true);
 
+    // 取消上一次未完成的 SSE 请求（会话切换等场景）
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       console.log('[ChatPanel] handleSend: sending message...', {
         effectiveSessionId,
@@ -403,6 +439,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
 
         res = await sendMessageStream(fullMessage, {
           sessionId: effectiveSessionId,
+          signal: abortController.signal,
           maxNewTokens: settings?.maxNewTokens ?? 512,
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
@@ -439,6 +476,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         // ================================================================
         res = await sendMessage(fullMessage, {
           sessionId: effectiveSessionId,
+          signal: abortController.signal,
           maxNewTokens: settings?.maxNewTokens ?? 512,
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
@@ -474,7 +512,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         const totalLen = fullContent.length;
         const baseInterval = 18;
 
-        const streamTimer = setInterval(() => {
+        // P1-3: 保存 timer 引用，会话切换时清理（见 session-switch useEffect）
+        streamTimerRef.current = setInterval(() => {
           const burst = 1 + Math.floor(Math.random() * 3);
           charIndex = Math.min(charIndex + burst, totalLen);
 
@@ -487,7 +526,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           );
 
           if (charIndex >= totalLen) {
-            clearInterval(streamTimer);
+            clearInterval(streamTimerRef.current);
+            streamTimerRef.current = null;
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === msgId ? { ...m, content: fullContent } : m
@@ -500,6 +540,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       setLastMetrics(res.metrics);
       metricsTrigger?.(res.metrics);
     } catch (err) {
+      // AbortError = 用户切换会话导致请求被取消，静默忽略
+      if (err.name === 'AbortError') {
+        setSending(false);
+        return;
+      }
+      // Phase 3.1: 移除非 AbortError 时残留的空白助手占位消息
+      setMessages((prev) => prev.filter(m => m.id !== msgId));
       const errMsg = {
         role: 'system',
         content: `错误: ${err.message}`,
@@ -547,12 +594,32 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   };
 
   // format metrics for display
+  const MODE_LABELS = {
+    distributed_pipeline: 'Pipeline 分布式',
+    forwarded_to_master: '转发→主节点',
+    local_pytorch: 'PyTorch 本地',
+    local_llama_cpp: 'llama.cpp 本地',
+    distributed_forward: '分布式转发',
+    master_pipeline: '主节点 Pipeline',
+    pipeline_fallback: '流水线回退',
+  };
   const formatMetrics = (m) => {
     if (!m) return '';
     const parts = [];
-    if (m.new_tokens) parts.push(`${m.new_tokens} tokens`);
-    if (m.tokens_per_second) parts.push(`${m.tokens_per_second} tok/s`);
-    if (m.elapsed_seconds) parts.push(`${m.elapsed_seconds.toFixed(1)}s`);
+    const engine = m.engine || m.execution_mode;
+    if (engine) parts.push(MODE_LABELS[engine] || String(engine));
+    if (typeof m.distributed_used === 'boolean') {
+      parts.push(m.distributed_used ? '分布式: 是' : '分布式: 否');
+    }
+    const tokens = m.generated_tokens ?? m.new_tokens ?? m.completion_tokens ?? m.tokens_generated;
+    if (tokens) parts.push(`${tokens} tokens`);
+    const tps = m.tokens_per_second ?? m.tokens_per_sec;
+    if (tps) parts.push(`${Number(tps).toFixed(1)} tok/s`);
+    const elapsed = m.elapsed_seconds ?? (m.total_time_ms ? m.total_time_ms / 1000 : null);
+    if (elapsed) parts.push(`${Number(elapsed).toFixed(1)}s`);
+    const workers = m.workers_used || m.worker_nodes || [];
+    if (workers.length) parts.push(`workers: ${workers.join('→')}`);
+    if (m.fallback_reason) parts.push(`回退: ${m.fallback_reason}`);
     if (m.gpu_memory_mb) parts.push(`${m.gpu_memory_mb} MB`);
     return parts.join(' · ');
   };
