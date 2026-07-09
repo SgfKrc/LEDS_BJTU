@@ -10,15 +10,21 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import json
+import logging
+import socket
 import struct
+import threading
 import pytest
 import torch
 
+import tcp_comm as tcp_comm_mod
 from tcp_comm import (
     MessageType, pack_data, unpack_header,
-    build_message, HEADER_LEN, MAX_PACKET_SIZE,
+    build_message, parse_message, recv_exact,
+    HEADER_LEN, MAX_PACKET_SIZE,
     serialize_tensor, deserialize_tensor,
     serialize_tensor_fast, deserialize_tensor_fast,
+    TCPServer, TCPClient, ClientConn,
 )
 
 
@@ -336,3 +342,105 @@ class TestFastTensorSerialization:
                 f"shape 不一致: {restored.shape} ≠ {tensor.shape}"
             assert restored.dtype == tensor.dtype, \
                 f"dtype 不一致: {restored.dtype} ≠ {tensor.dtype}"
+
+
+# ================================================================
+# TCPServer 连接管理与日志测试
+# ================================================================
+
+class TestTCPServerConnectionManagement:
+    """测试 TCPServer 注册拒绝、连接表线程安全与回调日志。"""
+
+    def test_rejected_registration_returns_ack_and_raises(self):
+        """认证失败的 REGISTER 应返回 rejected ACK 并抛内部拒绝异常。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": "client_bad",
+                    "role": "client",
+                    "auth": {"auth_timestamp": 1.0, "auth_signature": "bad"},
+                },
+            }
+            with pytest.raises(tcp_comm_mod._RegistrationRejected):
+                server._handle_registration(srv_sock, ("127.0.0.1", 54321), "pending_54321", msg)
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            assert header is not None
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["type"] == "register"
+            assert ack["data"]["status"] == "rejected"
+            assert server.get_client_ids() == []
+        finally:
+            srv_sock.close()
+            cli_sock.close()
+
+    def test_rejected_registration_does_not_call_on_message_or_leak_client(self):
+        """_handle_client 应拦截注册拒绝，不进入上层回调且不泄露 pending_*。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        called = []
+        server.on_message = lambda client_id, msg: called.append((client_id, msg))
+
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            t = threading.Thread(
+                target=server._handle_client,
+                args=(srv_sock, ("127.0.0.1", 54321), "pending_54321"),
+                daemon=True,
+            )
+            t.start()
+
+            cli_sock.sendall(build_message(MessageType.REGISTER, {
+                "client_id": "client_bad",
+                "role": "client",
+                "auth": {"auth_timestamp": 1.0, "auth_signature": "bad"},
+            }))
+
+            t.join(timeout=2)
+            assert not t.is_alive()
+            assert called == []
+            assert server.get_client_ids() == []
+            assert not any(cid.startswith("pending_") for cid in server.get_client_ids())
+        finally:
+            cli_sock.close()
+
+    def test_pop_client_is_idempotent_and_send_missing_raises_connection_error(self):
+        """重复清理连接不应 KeyError，不存在客户端发送应抛 ConnectionError。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            conn = ClientConn(client_id="client1", sock=srv_sock, addr=("127.0.0.1", 1))
+            server._set_client("client1", conn)
+            assert server._pop_client("client1") is conn
+            assert server._pop_client("client1") is None
+            with pytest.raises(ConnectionError):
+                server.send_to_client("client1", {"x": 1}, MessageType.STATUS_REQ)
+        finally:
+            srv_sock.close()
+            cli_sock.close()
+
+    def test_on_heartbeat_exception_is_logged(self, monkeypatch, caplog):
+        """on_heartbeat 回调异常应进入 DEBUG 日志且携带 exc_info。"""
+        client = TCPClient(server_host="127.0.0.1", server_port=1, client_id="client1")
+        client.sock = object()
+        client._running = True
+
+        def fake_send_data(data, msg_type):
+            client._running = False
+
+        def bad_callback():
+            raise ValueError("boom")
+
+        monkeypatch.setattr(client, "send_data", fake_send_data)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _s: None)
+        client.on_heartbeat = bad_callback
+
+        with caplog.at_level(logging.DEBUG, logger="tcp_comm"):
+            client._heartbeat_loop()
+
+        records = [r for r in caplog.records if "on_heartbeat 回调异常" in r.getMessage()]
+        assert records
+        assert records[0].exc_info is not None

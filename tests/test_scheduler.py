@@ -7,10 +7,12 @@
 
 import sys
 import os
+import logging
+import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
-from scheduler import Scheduler
+from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState
 
 
 # ================================================================
@@ -165,15 +167,15 @@ class TestComputeLayerAssignment:
         # 注入模拟节点
         s.nodes = {
             "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master',
+                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
                 'device_info': PROFILE_WORKSTATION,
             })(),
             "client1": type('NodeInfo', (), {
-                'node_id': 'client1', 'role': 'client',
+                'node_id': 'client1', 'role': 'client', 'node_type': 'pc',
                 'device_info': PROFILE_LAPTOP,
             })(),
             "client2": type('NodeInfo', (), {
-                'node_id': 'client2', 'role': 'client',
+                'node_id': 'client2', 'role': 'client', 'node_type': 'pc',
                 'device_info': PROFILE_ULTRABOOK,
             })(),
         }
@@ -326,9 +328,15 @@ class TestGetLayerAssignments:
     @pytest.fixture
     def sched(self):
         s = Scheduler()
+        # ★ 清除 DB 缓存的层分配（避免其他测试/真实运行的旧数据污染）
+        from db import set_layer_assignments as _clear_cache
+        try:
+            _clear_cache({})
+        except Exception:
+            pass
         s.nodes = {
             "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master',
+                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
                 'device_info': PROFILE_LAPTOP,
             })(),
         }
@@ -390,6 +398,104 @@ class TestNodeRTT:
         d = node.to_dict()
         assert d["avg_rtt_ms"] == 12.6
         assert d["last_rtt_ms"] == 3.1
+
+
+# ================================================================
+# Android 节点手动注册 / 删除 测试
+# ================================================================
+
+class TestAndroidNodeManagement:
+    """测试 Android 节点注册与离线删除能力。"""
+
+    @pytest.fixture
+    def sched(self):
+        s = Scheduler()
+        yield s
+        # 清理测试节点（内存 + 数据库）
+        test_ids = [nid for nid in s.nodes if nid != "master"]
+        for nid in test_ids:
+            try:
+                del s.nodes[nid]
+            except Exception:
+                pass
+            try:
+                from db import delete_node
+                delete_node(nid)
+            except Exception:
+                pass
+
+    def test_manual_register_android_node(self, sched):
+        """手动注册 Android 节点应保存 node_type=android 且初始离线。"""
+        result = sched.manual_register_node(
+            "android-test", hostname="Android Phone",
+            network_type="wifi", node_type="android",
+        )
+        assert result["status"] == "registered"
+        node = sched.nodes["android-test"]
+        assert node.node_type == "android"
+        assert node.hostname == "Android Phone"
+        assert node.network_type == "wifi"
+        assert node.state == NodeState.OFFLINE
+
+    def test_manual_register_existing_android_updates_metadata(self, sched):
+        """重复注册同一 Android 节点应更新元数据而非失败。"""
+        sched.manual_register_node("android-test", hostname="Old", node_type="android")
+        result = sched.manual_register_node(
+            "android-test", hostname="New", address="1.2.3.4:8888",
+            network_type="wifi", node_type="android",
+        )
+        assert result["status"] == "updated"
+        node = sched.nodes["android-test"]
+        assert node.hostname == "New"
+        assert node.address == "1.2.3.4:8888"
+        assert node.network_type == "wifi"
+        assert node.node_type == "android"
+
+    def test_delete_node_rejects_master_and_missing(self, sched):
+        """删除 master / 不存在节点应返回明确状态。"""
+        assert sched.delete_node("master")["status"] == "invalid"
+        assert sched.delete_node("missing")["status"] == "not_found"
+
+    def test_delete_node_rejects_online_node(self, sched):
+        """在线节点需要先注销，不能直接删除。"""
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        assert sched.delete_node("client1")["status"] == "online"
+        assert "client1" in sched.nodes
+
+    def test_delete_offline_android_node_removes_and_pushes_remove(self, sched, monkeypatch):
+        """离线 Android 节点删除后应从内存移除并广播 remove。"""
+        class DummyDb:
+            def __init__(self):
+                self.deleted = []
+                self.created = []
+                self.layer_reset = False
+            def delete_node(self, node_id):
+                self.deleted.append(node_id)
+                return True
+            def set_layer_assignments(self, assignments):
+                self.layer_reset = True
+            def upsert_node(self, **kwargs):
+                self.created.append(kwargs.get("node_id"))
+                pass
+
+        dummy = DummyDb()
+        import scheduler as scheduler_mod
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: dummy)
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+
+        sched.manual_register_node("android-test", hostname="Phone", node_type="android")
+        assert "android-test" in dummy.created
+        pushed = []
+        sched._push_node_update_to_all_clients = lambda *args: pushed.append(args)
+
+        result = sched.delete_node("android-test")
+        assert result["status"] == "deleted"
+        assert "android-test" not in sched.nodes
+        assert dummy.deleted == ["android-test"]
+        assert dummy.layer_reset is True
+        assert pushed and pushed[0][0] == "android-test" and pushed[0][1] == "remove"
 
 
 # ================================================================
@@ -667,6 +773,35 @@ class TestPipelineMessageDispatch:
         # 不应抛出异常（即使 model_manager 不存在也会优雅处理）
         sched._on_tcp_message("master", msg)
 
+    def test_unknown_message_type_logs_debug(self, sched, caplog):
+        """未知消息类型应记录 DEBUG 日志，便于排查协议不匹配。"""
+        with caplog.at_level(logging.DEBUG, logger="scheduler"):
+            sched._on_tcp_message("client1", {"type": "unknown_type"})
+        assert any("未知消息类型" in r.getMessage() for r in caplog.records)
+
+    def test_pipeline_pause_resume_logs_info(self, sched, caplog):
+        """pipeline_pause/resume 应在 INFO 级别可见。"""
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            sched._on_tcp_message("client1", {"type": "pipeline_pause"})
+            sched._on_tcp_message("client1", {"type": "pipeline_resume"})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("PIPELINE_PAUSE" in m for m in messages)
+        assert any("PIPELINE_RESUME" in m for m in messages)
+
+    def test_tcp_disconnect_logs_and_marks_offline(self, sched, caplog):
+        """TCP 断连应记录调度器层日志并标记节点离线。"""
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        sched._push_node_update_to_all_clients = lambda *args, **kwargs: None
+        sched.deregister_node = lambda _client_id: None
+
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            sched._on_tcp_disconnect("client1")
+
+        assert sched.nodes["client1"].state == NodeState.OFFLINE
+        assert any("TCP 断开" in r.getMessage() for r in caplog.records)
+
 
 # ================================================================
 # 流水线回退推理 测试
@@ -856,17 +991,21 @@ class TestPipelineQueueBasics:
         result = queue.wait_for_result("nonexistent", timeout=0.5)
         assert result["status"] == "unknown"
 
-    def test_process_error_captured(self, queue):
-        """process_fn 抛异常时应记录 error 状态"""
+    def test_process_error_captured(self, queue, caplog):
+        """process_fn 抛异常时应记录 error 状态，并带 exc_info。"""
         def failing_process(**kwargs):
             raise ValueError("模拟推理失败")
 
-        queue.start(process_fn=failing_process)
-        tid = queue.enqueue(prompt="test")
-        result = queue.wait_for_result(tid, timeout=5.0)
+        with caplog.at_level(logging.ERROR, logger="scheduler"):
+            queue.start(process_fn=failing_process)
+            tid = queue.enqueue(prompt="test")
+            result = queue.wait_for_result(tid, timeout=5.0)
 
         assert result["status"] == "error"
         assert "模拟推理失败" in result["error"]
+        records = [r for r in caplog.records if "排队任务失败" in r.getMessage()]
+        assert records
+        assert records[0].exc_info is not None
         queue.stop()
 
     def test_queue_fifo_order(self, queue):
@@ -1310,11 +1449,11 @@ class TestVramConstraintRecalculation:
         s = Scheduler()
         s.nodes = {
             "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master',
+                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
                 'device_info': PROFILE_WORKSTATION,
             })(),
             "client1": type('NodeInfo', (), {
-                'node_id': 'client1', 'role': 'client',
+                'node_id': 'client1', 'role': 'client', 'node_type': 'pc',
                 'device_info': PROFILE_EDGE,  # 显存极少
             })(),
         }

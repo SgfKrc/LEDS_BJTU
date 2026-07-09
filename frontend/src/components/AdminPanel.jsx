@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   fetchClusterStatus, fetchClusterNodes,
-  fetchClusterConfig, deregisterNode, updateMaxNodes,
+  fetchClusterConfig, deregisterNode, deleteClusterNode, updateMaxNodes,
   fetchInviteInfo, connectToMaster,
   discoverMaster, resetMasterIdentity,
   manualRegisterNode, fetchMasterHealth,
@@ -12,10 +12,14 @@ import {
   transferMasterRole, fetchTransferLogs,
   fetchSpareMaster, designateSpareMaster,
   removeSpareMaster, fetchSpareMasterLogs,
+  fetchQueue, setQueueStrategy, pauseQueue,
+  resumeQueue, clearQueue, cancelQueueTask,
 } from '../api/client';
 
 const ROLE_LABELS = { master: '主节点', client: '从节点' };
 const ROLE_ICONS = { master: '🖥️', client: '💻' };
+const TYPE_ICONS = { pc: '💻', android: '📱' };
+const TYPE_LABELS = { pc: 'PC', android: 'Android' };
 
 const STATE_LABELS = { online: '在线', busy: '忙碌', offline: '离线', error: '异常' };
 const STATE_COLORS = {
@@ -252,7 +256,7 @@ function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
 }
 
 
-export default function AdminPanel({ onToast, myRole }) {
+export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const [status, setStatus] = useState(null);
   const [nodes, setNodes] = useState(null);
   const [config, setConfig] = useState(null);
@@ -276,7 +280,10 @@ export default function AdminPanel({ onToast, myRole }) {
   const [manualHostname, setManualHostname] = useState('');
   const [manualAddress, setManualAddress] = useState('');
   const [manualNetworkType, setManualNetworkType] = useState('ethernet');
+  const [manualNodeType, setManualNodeType] = useState('pc');
   const [registering, setRegistering] = useState(false);
+  const [deletingNode, setDeletingNode] = useState(null);
+  const [showOnlineOnly, setShowOnlineOnly] = useState(false);
 
   // 主节点健康状态（从节点监控）
   const [masterHealth, setMasterHealth] = useState(null);  // { master_online, stale, last_seen_seconds_ago }
@@ -303,7 +310,19 @@ export default function AdminPanel({ onToast, myRole }) {
   const [designatingSpare, setDesignatingSpare] = useState(false);
   const [spareMasterLogs, setSpareMasterLogs] = useState([]);
 
-  const isMaster = myRole?.is_master ?? true;
+  // P3: 审查投票
+  const [reviewTickets, setReviewTickets] = useState([]);
+  const [canVote, setCanVote] = useState(false);
+  const [reviewTarget, setReviewTarget] = useState('');
+  const [reviewReason, setReviewReason] = useState('');
+  const [creatingReview, setCreatingReview] = useState(false);
+  const [votingTicket, setVotingTicket] = useState(null);
+
+  // P3.5: 推理调度队列
+  const [queueDetail, setQueueDetail] = useState(null);
+  const [queueLoading, setQueueLoading] = useState(false);
+
+  const isMaster = myRole?.is_master ?? false;
 
   // 拉取全部数据
   const refresh = useCallback(() => {
@@ -315,7 +334,8 @@ export default function AdminPanel({ onToast, myRole }) {
       isMaster ? fetchInviteInfo().catch(() => null) : Promise.resolve(null),
       isMaster ? fetchLayerAssignment().catch(() => null) : Promise.resolve(null),
       !isMaster ? fetchMasterHealth().catch(() => null) : Promise.resolve(null),
-    ]).then(([s, n, c, inv, layerData, mh]) => {
+      isMaster ? fetchQueue().catch(() => null) : Promise.resolve(null),
+    ]).then(([s, n, c, inv, layerData, mh, qd]) => {
       setStatus(s);
       setNodes(n);
       setConfig(c);
@@ -333,6 +353,9 @@ export default function AdminPanel({ onToast, myRole }) {
       }
       if (c?.max_nodes && !maxNodesInput) {
         setMaxNodesInput(String(c.max_nodes));
+      }
+      if (qd) {
+        setQueueDetail(qd);
       }
     }).finally(() => setLoading(false));
   }, [isMaster]);
@@ -357,6 +380,44 @@ export default function AdminPanel({ onToast, myRole }) {
     }
   };
 
+  const handleDeleteNode = async (nodeId) => {
+    if (!window.confirm(`确认删除离线节点 ${nodeId}？此操作会移除节点记录。`)) return;
+    setDeletingNode(nodeId);
+    try {
+      await deleteClusterNode(nodeId);
+      onToast?.({ type: 'success', msg: `已删除节点: ${nodeId}` });
+      refresh();
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `删除失败: ${err.message}` });
+    } finally {
+      setDeletingNode(null);
+    }
+  };
+
+  const handleDeleteAllOffline = async () => {
+    const offlineNodes = (nodes?.nodes || []).filter(
+      n => n.role !== 'master' && !n.is_available
+    );
+    if (offlineNodes.length === 0) {
+      onToast?.({ type: 'info', msg: '没有可删除的离线节点' });
+      return;
+    }
+    if (!window.confirm(
+      `确认删除全部 ${offlineNodes.length} 个离线节点？\n\n此操作不可撤销。`
+    )) return;
+    let ok = 0, fail = 0;
+    for (const n of offlineNodes) {
+      try {
+        await deleteClusterNode(n.node_id);
+        ok++;
+      } catch (_) {
+        fail++;
+      }
+    }
+    onToast?.({ type: 'success', msg: `已删除 ${ok} 个，失败 ${fail} 个` });
+    refresh();
+  };
+
   const handleUpdateMaxNodes = async () => {
     const v = parseInt(maxNodesInput, 10);
     if (!v || v < 1 || v > 64) {
@@ -368,6 +429,8 @@ export default function AdminPanel({ onToast, myRole }) {
       const result = await updateMaxNodes(v);
       if (result.status === 'ok') {
         onToast?.({ type: 'success', msg: `最大节点数已更新: ${result.max_nodes}` });
+        setConfig(prev => prev ? { ...prev, max_nodes: result.max_nodes } : prev);
+        setMaxNodesInput(String(result.max_nodes));
         refresh();
       }
     } catch (err) {
@@ -452,6 +515,20 @@ export default function AdminPanel({ onToast, myRole }) {
         .then(data => setTransferLogs(data.logs || []))
         .catch(() => {});
     }
+    // P3: 加载审查数据（主节点始终加载，投票资格由服务端检查）
+    if (isMaster) {
+      import('../api/client').then(({ fetchReviewTickets, checkCanVote, deleteReviewTicket, deleteResolvedReviewTickets }) => {
+        fetchReviewTickets('pending')
+          .then(data => setReviewTickets(data.tickets || []))
+          .catch(() => {});
+        checkCanVote()
+          .then(data => setCanVote(data.can_vote || false))
+          .catch(() => {});
+        // 挂载删除函数供后续使用
+        window.__deleteReviewTicket = deleteReviewTicket;
+        window.__deleteResolvedReviewTickets = deleteResolvedReviewTickets;
+      });
+    }
   }, [isMaster]);
 
   // ---- 备用主节点 ----
@@ -508,6 +585,86 @@ export default function AdminPanel({ onToast, myRole }) {
     } catch (err) {
       onToast?.({ type: 'error', msg: `取消失败: ${err.message}` });
     }
+  };
+
+  // ---- P3: 审查工单操作 ----
+
+  const handleCreateReview = async () => {
+    if (!reviewTarget.trim()) {
+      onToast?.({ type: 'error', msg: '请选择转让目标节点' });
+      return;
+    }
+    setCreatingReview(true);
+    try {
+      const { createReviewTicket } = await import('../api/client');
+      const result = await createReviewTicket(reviewTarget, reviewReason, 48);
+      onToast?.({ type: 'success', msg: `审查工单 ${result.ticket_id} 已创建` });
+      setReviewTarget('');
+      setReviewReason('');
+      // 刷新工单列表
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `创建工单失败: ${err.message}` });
+    } finally {
+      setCreatingReview(false);
+    }
+  };
+
+  const handleVote = async (ticketId, voteValue) => {
+    setVotingTicket(ticketId);
+    try {
+      const { castVote } = await import('../api/client');
+      await castVote(ticketId, voteValue);
+      onToast?.({ type: 'success', msg: `投票成功: ${voteValue > 0 ? '+' : ''}${voteValue}` });
+      // 刷新
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `投票失败: ${err.message}` });
+    } finally {
+      setVotingTicket(null);
+    }
+  };
+
+  const handleDeleteTicket = async (ticketId) => {
+    if (!window.confirm(`确定删除工单 ${ticketId}？`)) return;
+    try {
+      const fn = window.__deleteReviewTicket || (await import('../api/client')).deleteReviewTicket;
+      await fn(ticketId);
+      onToast?.({ type: 'success', msg: `工单 ${ticketId} 已删除` });
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `删除失败: ${err.message}` });
+    }
+  };
+
+  const handleDeleteResolvedTickets = async () => {
+    if (!window.confirm('确定删除所有已解决/已过期/已拒绝的审查工单？')) return;
+    try {
+      const fn = window.__deleteResolvedReviewTickets || (await import('../api/client')).deleteResolvedReviewTickets;
+      const result = await fn();
+      onToast?.({ type: 'success', msg: `已清理 ${result.count} 个工单` });
+      const { fetchReviewTickets } = await import('../api/client');
+      const data = await fetchReviewTickets('pending');
+      setReviewTickets(data.tickets || []);
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `清理失败: ${err.message}` });
+    }
+  };
+
+  const formatRemaining = (expiresAt) => {
+    if (!expiresAt) return '—';
+    const remaining = expiresAt * 1000 - Date.now();
+    if (remaining <= 0) return '已过期';
+    const hours = Math.floor(remaining / 3600000);
+    const mins = Math.floor((remaining % 3600000) / 60000);
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
   };
 
   // ---- 以太网自动填充 ----
@@ -616,9 +773,10 @@ export default function AdminPanel({ onToast, myRole }) {
         manualHostname.trim() || manualNodeId.trim(),
         manualAddress.trim(),
         manualNetworkType,
+        manualNodeType,
       );
-      if (result.status === 'registered') {
-        onToast?.({ type: 'success', msg: result.message || `节点 '${result.node_id}' 已注册` });
+      if (result.status === 'registered' || result.status === 'updated') {
+        onToast?.({ type: 'success', msg: result.message || `节点 '${result.node_id}' 已保存` });
         setManualNodeId('');
         setManualHostname('');
         setManualAddress('');
@@ -740,9 +898,9 @@ export default function AdminPanel({ onToast, myRole }) {
   }
 
   const nodeList = nodes?.nodes || [];
-  const filteredNodeList = isMaster
-    ? nodeList
-    : nodeList.filter(n => n.node_id === myRole?.node_id);
+  const filteredNodeList = (isMaster
+    ? (showOnlineOnly ? nodeList.filter(n => n.is_available) : nodeList)
+    : nodeList.filter(n => n.node_id === myRole?.node_id));
   const onlineCount = nodes?.online_count || 0;
   const offlineCount = nodes?.offline_count || 0;
   const nodesReady = status?.nodes_ready || false;
@@ -915,6 +1073,17 @@ export default function AdminPanel({ onToast, myRole }) {
                     <option value="unknown">❓ 未知</option>
                   </select>
                 </div>
+                <div className="connect-field">
+                  <label>节点类型</label>
+                  <select
+                    className="connect-input"
+                    value={manualNodeType}
+                    onChange={(e) => setManualNodeType(e.target.value)}
+                  >
+                    <option value="pc">💻 PC</option>
+                    <option value="android">📱 Android</option>
+                  </select>
+                </div>
                 <button
                   className="btn-primary connect-btn"
                   onClick={handleManualRegister}
@@ -1052,12 +1221,26 @@ export default function AdminPanel({ onToast, myRole }) {
         {/* ---- 节点列表 ---- */}
         <section className="admin-section">
           <h3>🖥️ {isMaster ? '已注册节点' : '本节点详情'}</h3>
+          {isMaster && (
+            <div className="queue-control-row" style={{ marginBottom: 8 }}>
+              <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
+                <input type="checkbox" checked={showOnlineOnly}
+                  onChange={(e) => setShowOnlineOnly(e.target.checked)} />
+                仅显示在线
+              </label>
+              <button className="btn btn-sm btn-danger-outline"
+                onClick={handleDeleteAllOffline}
+                title="删除所有离线节点记录"
+              >🗑 清理离线节点</button>
+            </div>
+          )}
           <div className="admin-table-wrap">
             <table className="admin-node-table">
               <thead>
                 <tr>
                   <th>节点</th>
                   <th>角色</th>
+                  <th>类型</th>
                   <th>状态</th>
                   <th>🔗 连接</th>
                   <th>⏱ 延迟</th>
@@ -1073,7 +1256,7 @@ export default function AdminPanel({ onToast, myRole }) {
               <tbody>
                 {filteredNodeList.length === 0 ? (
                   <tr>
-                    <td colSpan={isMaster ? 12 : 11} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                    <td colSpan={isMaster ? 13 : 12} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
                       {isMaster ? '暂无已注册的从节点，使用上方「注册新节点」添加' : '尚未连接到主节点，请在上方输入主节点地址'}
                     </td>
                   </tr>
@@ -1106,16 +1289,24 @@ export default function AdminPanel({ onToast, myRole }) {
                       rttDisplay = formatRTT(rttMs);
                     }
 
+                    const typeIcon = TYPE_ICONS[node.node_type] || TYPE_ICONS.pc;
+                    const typeLabel = TYPE_LABELS[node.node_type] || TYPE_LABELS.pc;
+
                     return (
                       <tr key={node.node_id} className={isOffline ? 'row-offline' : ''}>
                         <td>
                           <span className="node-id-cell">
-                            {ROLE_ICONS[node.role] || '❓'} {node.node_id}
+                            {typeIcon} {node.node_id}
                           </span>
                         </td>
                         <td>
                           <span className="role-badge" data-role={node.role === 'master' ? 'master' : 'client'}>
                             {ROLE_LABELS[node.role] || node.role}
+                          </span>
+                        </td>
+                        <td>
+                          <span className="type-badge" data-type={node.node_type || 'pc'}>
+                            {typeIcon} {typeLabel}
                           </span>
                         </td>
                         <td>
@@ -1165,6 +1356,16 @@ export default function AdminPanel({ onToast, myRole }) {
                                 title="强制注销"
                               >
                                 {deregistering === node.node_id ? '⏳' : '✕'}
+                              </button>
+                            )}
+                            {!isMasterNode && isOffline && (
+                              <button
+                                className="btn-ghost btn-danger-ghost"
+                                onClick={() => handleDeleteNode(node.node_id)}
+                                disabled={deletingNode === node.node_id}
+                                title="删除节点记录"
+                              >
+                                {deletingNode === node.node_id ? '⏳' : '🗑'}
                               </button>
                             )}
                           </td>
@@ -1485,6 +1686,132 @@ export default function AdminPanel({ onToast, myRole }) {
           </section>
         )}
 
+        {/* ---- 主节点转让审查（仅主节点可见） ---- */}
+        {isMaster && (
+          <section className="admin-section">
+            <h3>🗳️ 主节点转让审查</h3>
+            <p className="connect-desc">
+              主节点转让需要经过集群中 PC 独显节点的投票审查。
+              投票通过（≥ +2）后，转让操作才会生效。仅 NVIDIA CUDA 独显节点可投票。
+            </p>
+
+            {/* 创建工单 */}
+            <div className="review-create-bar">
+              <select
+                value={reviewTarget}
+                onChange={e => setReviewTarget(e.target.value)}
+                style={{ flex: 1 }}
+              >
+                <option value="">选择转让目标节点</option>
+                {(nodes?.nodes || [])
+                  .filter(n => n.role === 'client' && n.state === 'online')
+                  .map(n => (
+                    <option key={n.node_id} value={n.node_id}>
+                      {n.node_id} ({n.hostname || '—'})
+                    </option>
+                  ))}
+              </select>
+              <input
+                placeholder="转让原因（可选）"
+                value={reviewReason}
+                onChange={e => setReviewReason(e.target.value)}
+                style={{ flex: 1, marginLeft: 8 }}
+              />
+              <button
+                className="btn-primary"
+                onClick={handleCreateReview}
+                disabled={creatingReview || !reviewTarget.trim()}
+                style={{ marginLeft: 8 }}
+              >
+                {creatingReview ? '⏳ 创建中...' : '📝 创建审查工单'}
+              </button>
+            </div>
+
+            {/* 待处理工单 */}
+            {reviewTickets.length > 0 && (
+              <div className="review-ticket-list" style={{ marginTop: 12 }}>
+                {reviewTickets.map(ticket => (
+                  <div key={ticket.ticket_id} className="review-ticket-card">
+                    <div className="ticket-header">
+                      <span className="ticket-id">{ticket.ticket_id}</span>
+                      <span className="ticket-target">目标: {ticket.target_node_id}</span>
+                      <span className={`ticket-score ${
+                        ticket.score >= 2 ? 'score-approved' :
+                        ticket.score <= -2 ? 'score-rejected' : ''
+                      }`}>
+                        {ticket.score > 0 ? '+' : ''}{ticket.score} 分
+                      </span>
+                      <span className="ticket-expiry">
+                        {formatRemaining(ticket.expires_at)}
+                      </span>
+                      <button
+                        className="btn-ghost btn-danger-ghost"
+                        onClick={() => handleDeleteTicket(ticket.ticket_id)}
+                        title="删除此工单"
+                        style={{ marginLeft: 'auto', fontSize: 12, padding: '2px 6px' }}
+                      >🗑 删除</button>
+                    </div>
+                    {ticket.transfer_reason && (
+                      <div className="ticket-reason">{ticket.transfer_reason}</div>
+                    )}
+                    {(ticket.votes || []).length > 0 && (
+                      <div className="ticket-votes">
+                        {(ticket.votes || []).map((v, i) => (
+                          <span key={i} className={`vote-badge vote-${v.value >= 0 ? 'pos' : 'neg'}`}>
+                            {v.voter_node_id}: {v.value > 0 ? '+' : ''}{v.value}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {/* 投票按钮 */}
+                    {canVote && (
+                      <div className="ticket-vote-actions">
+                        <button
+                          className="setting-btn danger-ghost"
+                          onClick={() => handleVote(ticket.ticket_id, -1)}
+                          disabled={votingTicket === ticket.ticket_id}
+                        >👎 -1</button>
+                        <button
+                          className="setting-btn secondary"
+                          onClick={() => handleVote(ticket.ticket_id, 0)}
+                          disabled={votingTicket === ticket.ticket_id}
+                        >⏸️ 0</button>
+                        <button
+                          className="setting-btn primary"
+                          onClick={() => handleVote(ticket.ticket_id, 1)}
+                          disabled={votingTicket === ticket.ticket_id}
+                        >👍 +1</button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ marginTop: 8, display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                className="btn btn-sm btn-danger-outline"
+                onClick={handleDeleteResolvedTickets}
+                title="删除所有已批准/已拒绝/已过期的工单"
+              >
+                🗑 清理已解决工单
+              </button>
+            </div>
+            {reviewTickets.length === 0 && (
+              <p className="setting-desc" style={{ marginTop: 8 }}>
+                暂无待处理的审查工单。
+              </p>
+            )}
+
+            {/* 非CUDA独显提示 */}
+            {!canVote && (
+              <p className="setting-desc" style={{ marginTop: 8, color: 'var(--warning)' }}>
+                ⚠️ 当前节点不支持投票。仅 NVIDIA CUDA 独显节点可参与审查投票。
+              </p>
+            )}
+          </section>
+        )}
+
         {/* ---- 邮件告警测试（所有节点） ---- */}
         <section className="admin-section">
           <h3>📧 邮件告警测试</h3>
@@ -1627,6 +1954,120 @@ export default function AdminPanel({ onToast, myRole }) {
                     </div>
                   ))}
                 </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* ---- 推理调度队列 (Phase 3 — 仅主节点) ---- */}
+        {isMaster && (
+          <section className="admin-section">
+            <h3>📋 推理调度</h3>
+            <div className="queue-panel">
+              {/* Header: strategy + status + controls */}
+              <div className="queue-header-row">
+                <div className="queue-header-left">
+                  <span className="queue-strategy-badge">
+                    {(queueDetail?.strategy || 'mlfq').toUpperCase()}
+                  </span>
+                  <span className={`status-dot ${queueDetail?.running ? 'online' : 'offline'}`} />
+                  <span className="queue-status-text">
+                    {queueDetail?.paused ? '⏸️ 已暂停' : queueDetail?.running ? '▶️ 运行中' : '⏹️ 已停止'}
+                  </span>
+                </div>
+                <div className="queue-control-row">
+                  {queueDetail?.paused ? (
+                    <button className="btn btn-sm btn-success" onClick={async () => { await resumeQueue(); refresh(); }}>▶ 恢复</button>
+                  ) : (
+                    <button className="btn btn-sm btn-warning" onClick={async () => { await pauseQueue(); refresh(); }}>⏸ 暂停</button>
+                  )}
+                  <button className="btn btn-sm btn-danger-outline" onClick={async () => {
+                    if (window.confirm('确认清空所有排队任务？执行中任务不受影响。')) {
+                      await clearQueue(); refresh();
+                    }
+                  }}>🧹 清空</button>
+                  <select className="setting-select" style={{width:90,fontSize:12}}
+                    value={queueDetail?.strategy || 'mlfq'}
+                    onChange={async (e) => { await setQueueStrategy(e.target.value); refresh(); }}>
+                    <option value="mlfq">MLFQ</option>
+                    <option value="fifo">FIFO</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Currently running task */}
+              {queueDetail?.current_task && (
+                <div className="queue-running-card">
+                  <span className="queue-running-label">⚡ 执行中</span>
+                  <span className="queue-running-id mono">{queueDetail.current_task}</span>
+                </div>
+              )}
+
+              {/* Q0/Q1/Q2 task lists */}
+              {[
+                { key: 'q0', label: 'Q0 交互级', cls: 'queue-level-q0', desc: `≤${queueDetail?.aging_params?.q0_max_tokens || 128}tk` },
+                { key: 'q1', label: 'Q1 普通级', cls: 'queue-level-q1', desc: `≤${queueDetail?.aging_params?.q1_max_tokens || 512}tk` },
+                { key: 'q2', label: 'Q2 批量级', cls: 'queue-level-q2', desc: `>${queueDetail?.aging_params?.q1_max_tokens || 512}tk` },
+              ].map(({ key, label, cls, desc }) => {
+                const tasks = queueDetail?.[key] || [];
+                return (
+                  <div className={`queue-level-section ${cls}`} key={key}>
+                    <div className="queue-level-header">
+                      <span className="queue-level-label">{label}</span>
+                      <span className="queue-level-desc">{desc}</span>
+                      <span className="queue-level-count">{tasks.length}</span>
+                    </div>
+                    <div className="queue-task-list">
+                      {tasks.length === 0 ? (
+                        <div className="queue-empty-state">（空）</div>
+                      ) : (
+                        tasks.map((t) => (
+                          <div className={`queue-task-row ${t.is_aged ? 'aged' : ''}`} key={t.task_id}>
+                            <span className="queue-priority-badge">Q{t.priority_level}</span>
+                            <span className="queue-task-id mono">{t.task_id.slice(0, 16)}…</span>
+                            <span className="queue-task-tokens">{t.max_new_tokens}tk</span>
+                            <span className="queue-task-wait">⏳ {t.wait_seconds?.toFixed(0)}s</span>
+                            <span className="queue-task-est">~{t.estimated_duration_s?.toFixed(0)}s</span>
+                            {t.is_aged && <span className="queue-aging-badge" title="已老化提升">↑</span>}
+                            <button className="btn btn-sm btn-danger-outline"
+                              style={{padding:'1px 6px',fontSize:11}}
+                              onClick={async () => {
+                                if (window.confirm(`确认取消任务 ${t.task_id.slice(0, 16)}…？`)) {
+                                  await cancelQueueTask(t.task_id); refresh();
+                                }
+                              }}
+                              title="取消任务">×</button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Footer: stats */}
+              <div className="queue-stats-grid">
+                <div className="queue-stat-item">
+                  <span className="queue-stat-value">{queueDetail?.queue_size ?? 0}</span>
+                  <span className="queue-stat-label">排队</span>
+                </div>
+                <div className="queue-stat-item">
+                  <span className="queue-stat-value">{queueDetail?.completed_count ?? 0}</span>
+                  <span className="queue-stat-label">完成</span>
+                </div>
+                <div className="queue-stat-item">
+                  <span className="queue-stat-label">老化</span>
+                  <span className="queue-stat-value" style={{fontSize:11}}>
+                    Q1→Q0 {queueDetail?.aging_params?.q1_to_q0_s ?? 60}s &nbsp;
+                    Q2→Q1 {queueDetail?.aging_params?.q2_to_q1_s ?? 120}s
+                  </span>
+                </div>
+                {queueDetail?.preempt_stats && queueDetail.preempt_stats.count > 0 && (
+                  <div className="queue-stat-item">
+                    <span className="queue-stat-value">{queueDetail.preempt_stats.count}</span>
+                    <span className="queue-stat-label">抢占次数</span>
+                  </div>
+                )}
               </div>
             </div>
           </section>

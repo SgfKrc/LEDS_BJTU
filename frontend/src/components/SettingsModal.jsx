@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import DevicePanel from './DevicePanel';
 import { TIER_PRESETS, TIER_LABELS } from '../App';
 
@@ -38,6 +38,9 @@ export default function SettingsModal({
   settings, onSettingsChange, deviceTier, hasDedicatedGpu,
   onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
+  // P3: 多模型实验支持
+  activeModelId, availableModels, switchingModel,
+  onLoadModels, onSwitchModel, onRegisterModel, onUnregisterModel,
 }) {
   const overlayRef = useRef(null);
 
@@ -68,6 +71,120 @@ export default function SettingsModal({
       onDeviceProfileLoaded(profile);
     }
   }, [onDeviceProfileLoaded]);
+
+  // ================================================================
+  // 日志管理状态
+  // ================================================================
+  const [logFiles, setLogFiles] = useState(null);
+  const [viewingLog, setViewingLog] = useState(null);
+
+  const loadLogFiles = useCallback(async () => {
+    try {
+      const { fetchLogFiles } = await import('../api/client');
+      const data = await fetchLogFiles();
+      setLogFiles(data.files || []);
+    } catch (_) {
+      setLogFiles([]);
+    }
+  }, []);
+
+  const viewLogContent = useCallback(async (name) => {
+    try {
+      const { fetchLogContent } = await import('../api/client');
+      const data = await fetchLogContent(name);
+      setViewingLog({ name: data.name, content: data.content ?? '' });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `读取日志失败: ${e.message}` });
+    }
+  }, [onToast]);
+
+  const confirmDeleteLog = useCallback(async (name) => {
+    if (!window.confirm(`确定删除日志文件 ${name}？`)) return;
+    try {
+      const { deleteLogFile } = await import('../api/client');
+      await deleteLogFile(name);
+      setLogFiles(prev => (prev || []).filter(f => f.name !== name));
+      onToast?.({ type: 'success', msg: `已删除: ${name}` });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `删除失败: ${e.message}` });
+    }
+  }, [onToast]);
+
+  const confirmClearAllLogs = useCallback(async () => {
+    if (!window.confirm('确定删除所有日志文件？此操作不可撤销。')) return;
+    try {
+      const { deleteAllLogFiles } = await import('../api/client');
+      const result = await deleteAllLogFiles();
+      await loadLogFiles();
+      setViewingLog(null);
+      const failed = result.failed?.length || 0;
+      onToast?.({
+        type: failed ? 'warning' : 'success',
+        msg: failed ? `已清理部分日志，${failed} 个文件删除失败` : '已清理所有日志',
+      });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `清理失败: ${e.message}` });
+    }
+  }, [loadLogFiles, onToast]);
+
+  const copyAllLogs = useCallback(async () => {
+    try {
+      const { fetchLogContent } = await import('../api/client');
+      const contents = await Promise.all(
+        (logFiles || []).map(f => fetchLogContent(f.name).then(d => d.content))
+      );
+      const full = (logFiles || []).map((f, i) =>
+        `===== ${f.name} =====\n${contents[i]}`
+      ).join('\n\n');
+      await navigator.clipboard.writeText(full);
+      onToast?.({ type: 'success', msg: '已复制全部日志到剪贴板' });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `复制失败: ${e.message}` });
+    }
+  }, [logFiles, onToast]);
+
+  const formatFileSize = (bytes) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  };
+
+  // ================================================================
+  // P3: 实验模型注册表单
+  // ================================================================
+  const [showAddModel, setShowAddModel] = useState(false);
+  const [newModelForm, setNewModelForm] = useState({
+    model_id: '', name: '', model_type: 'safetensors',
+    model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
+    max_context: 4096, huggingface_id: '', description: '',
+  });
+
+  const handleAddModel = useCallback(async () => {
+    if (!newModelForm.model_id || !newModelForm.name) {
+      onToast?.({ type: 'error', msg: '模型 ID 和名称为必填项' });
+      return;
+    }
+    await onRegisterModel?.(newModelForm);
+    setShowAddModel(false);
+    setNewModelForm({
+      model_id: '', name: '', model_type: 'safetensors',
+      model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
+      max_context: 4096, huggingface_id: '', description: '',
+    });
+  }, [newModelForm, onRegisterModel, onToast]);
+
+  const handleRemoveModel = useCallback(async (modelId) => {
+    if (!window.confirm(`确定移除模型 "${modelId}" 的注册？\n不会删除磁盘上的模型文件。`)) return;
+    await onUnregisterModel?.(modelId);
+  }, [onUnregisterModel]);
+
+  // 模态框打开时自动加载日志列表 + 模型列表
+  useEffect(() => {
+    if (open) {
+      loadLogFiles();
+      onLoadModels?.();
+    }
+  }, [open, loadLogFiles, onLoadModels]);
 
   // 判断档位是否匹配当前设备
   const isCurrentTier = (tier) => deviceTier === tier;
@@ -276,6 +393,176 @@ export default function SettingsModal({
             )}
           </div>
 
+          {/* ======== 实验性模型（仅独显） ======== */}
+          {hasDedicatedGpu && (
+            <div className="sidebar-section">
+              <h3>🧪 实验性模型</h3>
+              <div className="setting-desc" style={{ marginBottom: 12 }}>
+                为具有 NVIDIA 独显的设备提供更大模型的实验性支持。
+                实验模型需手动下载，不包含在安装包内。
+              </div>
+
+              {/* 当前模型 */}
+              <div className="setting-group">
+                <div className="setting-label">当前模型</div>
+                <span className="model-badge-chip">
+                  {activeModelId || '未加载'}
+                </span>
+              </div>
+
+              {/* 模型列表 */}
+              {availableModels.length > 0 && (
+                <div className="experimental-model-list">
+                  {availableModels.map(m => (
+                    <div key={m.model_id} className="experimental-model-card">
+                      <div className="model-card-header">
+                        <strong>{m.name}</strong>
+                        {m.is_experimental && (
+                          <span className="chip-badge exp">实验性</span>
+                        )}
+                        {!m.is_experimental && (
+                          <span className="chip-badge default">默认</span>
+                        )}
+                      </div>
+                      {m.description && (
+                        <div className="model-card-desc">{m.description}</div>
+                      )}
+                      <div className="model-card-specs">
+                        <span>显存 ≥ {m.recommended_vram_gb} GB</span>
+                        <span>上下文 {m.max_context}</span>
+                        <span>类型 {m.model_type}</span>
+                      </div>
+                      <div className="model-card-actions">
+                        <button
+                          className="setting-btn secondary"
+                          onClick={() => onSwitchModel?.(m.model_id, 'int4')}
+                          disabled={switchingModel || activeModelId === m.model_id}
+                        >
+                          {activeModelId === m.model_id ? '当前模型' : switchingModel ? '切换中…' : '加载此模型'}
+                        </button>
+                        {m.is_experimental && m.location !== 'bundled' && (
+                          <button
+                            className="setting-btn danger-ghost"
+                            onClick={() => handleRemoveModel(m.model_id)}
+                          >
+                            移除
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* 添加实验模型 */}
+              {!showAddModel ? (
+                <button
+                  className="setting-btn secondary"
+                  style={{ marginTop: 8, width: '100%' }}
+                  onClick={() => setShowAddModel(true)}
+                >
+                  ＋ 添加实验性模型
+                </button>
+              ) : (
+                <div className="add-model-form">
+                  <h4>注册新模型</h4>
+                  <div className="form-row">
+                    <label>模型 ID <span className="required">*</span></label>
+                    <input
+                      placeholder="如 qwen2.5-7b"
+                      value={newModelForm.model_id}
+                      onChange={e => setNewModelForm(f => ({ ...f, model_id: e.target.value }))}
+                    />
+                  </div>
+                  <div className="form-row">
+                    <label>显示名称 <span className="required">*</span></label>
+                    <input
+                      placeholder="如 Qwen2.5-7B-Instruct"
+                      value={newModelForm.name}
+                      onChange={e => setNewModelForm(f => ({ ...f, name: e.target.value }))}
+                    />
+                  </div>
+                  <div className="form-row">
+                    <label>模型类型</label>
+                    <select
+                      value={newModelForm.model_type}
+                      onChange={e => setNewModelForm(f => ({ ...f, model_type: e.target.value }))}
+                    >
+                      <option value="safetensors">Safetensors (PyTorch)</option>
+                      <option value="gguf">GGUF (llama.cpp)</option>
+                      <option value="both">双格式</option>
+                    </select>
+                  </div>
+                  {(newModelForm.model_type === 'safetensors' || newModelForm.model_type === 'both') && (
+                    <div className="form-row">
+                      <label>Safetensors 路径</label>
+                      <input
+                        placeholder="models/qwen2.5-7b-instruct"
+                        value={newModelForm.model_path}
+                        onChange={e => setNewModelForm(f => ({ ...f, model_path: e.target.value }))}
+                      />
+                    </div>
+                  )}
+                  {(newModelForm.model_type === 'gguf' || newModelForm.model_type === 'both') && (
+                    <div className="form-row">
+                      <label>GGUF 路径</label>
+                      <input
+                        placeholder="models/qwen2.5-7b-Q4_K_M.gguf"
+                        value={newModelForm.gguf_path}
+                        onChange={e => setNewModelForm(f => ({ ...f, gguf_path: e.target.value }))}
+                      />
+                    </div>
+                  )}
+                  <div className="form-row">
+                    <label>推荐显存 (GB)</label>
+                    <input
+                      type="number" step="0.5" min="1"
+                      value={newModelForm.recommended_vram_gb}
+                      onChange={e => setNewModelForm(f => ({ ...f, recommended_vram_gb: parseFloat(e.target.value) || 0 }))}
+                    />
+                  </div>
+                  <div className="form-row">
+                    <label>最大上下文</label>
+                    <input
+                      type="number" step="512" min="512"
+                      value={newModelForm.max_context}
+                      onChange={e => setNewModelForm(f => ({ ...f, max_context: parseInt(e.target.value, 10) || 4096 }))}
+                    />
+                  </div>
+                  <div className="form-row">
+                    <label>HuggingFace ID</label>
+                    <input
+                      placeholder="Qwen/Qwen2.5-7B-Instruct"
+                      value={newModelForm.huggingface_id}
+                      onChange={e => setNewModelForm(f => ({ ...f, huggingface_id: e.target.value }))}
+                    />
+                  </div>
+                  <div className="form-row">
+                    <label>说明</label>
+                    <input
+                      placeholder="简短描述"
+                      value={newModelForm.description}
+                      onChange={e => setNewModelForm(f => ({ ...f, description: e.target.value }))}
+                    />
+                  </div>
+                  <div className="form-actions">
+                    <button className="setting-btn primary" onClick={handleAddModel}>
+                      注册
+                    </button>
+                    <button className="setting-btn secondary" onClick={() => setShowAddModel(false)}>
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 提示：模型需手动下载 */}
+              <p className="setting-desc" style={{ marginTop: 10, fontSize: 11 }}>
+                💡 实验性模型文件不会随安装包分发，需从 HuggingFace 手动下载到指定目录。
+              </p>
+            </div>
+          )}
+
           {/* ======== 对话历史 ======== */}
           <div className="sidebar-section">
             <h3>💾 对话记录</h3>
@@ -339,6 +626,49 @@ export default function SettingsModal({
                 ✅ 设置将自动同步到云数据库。在新设备登录或清除浏览器缓存后可自动恢复偏好。
               </div>
             )}
+          </div>
+
+          {/* ======== 流式输出模式 ======== */}
+          <div className="sidebar-section">
+            <h3>📡 流式输出</h3>
+            <div className="setting-toggle-row">
+              <div>
+                <div className="setting-label">
+                  流式输出模式：
+                  <strong style={{
+                    color: settings.streamingMode === 'fast' ? 'var(--accent)' : 'var(--text-primary)',
+                  }}>
+                    {settings.streamingMode === 'fast' ? '快速模式（真流式）' : '完整模式（假流式）'}
+                  </strong>
+                </div>
+                <div className="setting-desc">
+                  {settings.streamingMode === 'fast'
+                    ? '⚡ 真流式：逐 token 实时推送，首 token 延迟 &lt; 200ms，打字机效果。跳过对话历史、追问生成和 DB 持久化，专注低延迟体验。适合快速问答和弱网场景。'
+                    : '📋 假流式：先完整生成再一次性返回，保留全部功能——对话历史维护、追问建议、云端持久化。功能与普通对话完全一致，仅以 SSE 格式传输。适合需要完整上下文的场景。'}
+                </div>
+              </div>
+              <button
+                className={`setting-toggle-btn${settings.streamingMode === 'fast' ? ' on' : ''}`}
+                onClick={() => onSettingsChange({
+                  streamingMode: settings.streamingMode === 'fast' ? 'full' : 'fast',
+                })}
+                title={settings.streamingMode === 'fast' ? '快速模式 — 点击切换完整模式' : '完整模式 — 点击切换快速模式'}
+              >
+                <span className="setting-toggle-track">
+                  <span
+                    className="setting-toggle-thumb"
+                    style={{
+                      transform: settings.streamingMode === 'fast' ? 'translateX(22px)' : 'translateX(0)',
+                    }}
+                  />
+                </span>
+              </button>
+            </div>
+            <div className="setting-hint" style={{ marginTop: 8 }}>
+              {settings.streamingMode === 'fast'
+                ? '⚡ 快速模式已启用：对话不会保存到历史，刷新页面后丢失。如需完整功能（历史/追问/持久化），请切换到完整模式。'
+                : '✅ 完整模式已启用：所有功能正常工作，对话数据完整保存。'}
+            </div>
           </div>
 
           {/* ======== 分布式推理优化（所有节点可见） ======== */}
@@ -472,6 +802,77 @@ export default function SettingsModal({
             </div>
           </div>
 
+          {/* ---- 日志管理 ---- */}
+          <div className="sidebar-section" style={{ borderBottom: 'none' }}>
+            <h3>📋 日志管理</h3>
+
+            {logFiles === null ? (
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                <button className="sidebar-btn" onClick={loadLogFiles}>加载日志列表</button>
+              </div>
+            ) : logFiles.length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>暂无日志文件</div>
+            ) : (
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2 }}>
+                {logFiles.map(f => (
+                  <div key={f.name} style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    padding: '4px 0', borderBottom: '1px solid var(--border)',
+                  }}>
+                    <span style={{
+                      flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>
+                      {f.name}
+                      <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                        {formatFileSize(f.size)}
+                      </span>
+                    </span>
+                    <span style={{ display: 'flex', gap: 4 }}>
+                      <button className="sidebar-btn" onClick={() => viewLogContent(f.name)} title="查看">👁</button>
+                      <button className="sidebar-btn" onClick={() => confirmDeleteLog(f.name)} title="删除">🗑</button>
+                    </span>
+                  </div>
+                ))}
+                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <button className="sidebar-btn" onClick={copyAllLogs} style={{ flex: 1 }}>📋 复制全部</button>
+                  <button className="sidebar-btn" onClick={confirmClearAllLogs}
+                          style={{ flex: 1, color: '#e74c3c' }}>🗑 清理所有</button>
+                </div>
+              </div>
+            )}
+
+            {/* 日志内容查看弹窗 */}
+            {viewingLog !== null && (
+              <div className="log-viewer-overlay" onClick={() => setViewingLog(null)}
+                   style={{
+                     position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+                     background: 'rgba(0,0,0,0.5)', zIndex: 9999,
+                     display: 'flex', justifyContent: 'center', alignItems: 'center',
+                   }}>
+                <div onClick={e => e.stopPropagation()} style={{
+                  background: 'var(--bg-secondary)', borderRadius: 8, maxWidth: '80vw',
+                  maxHeight: '80vh', display: 'flex', flexDirection: 'column',
+                }}>
+                  <div style={{
+                    padding: '12px 16px', borderBottom: '1px solid var(--border)',
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  }}>
+                    <strong style={{ color: 'var(--text-primary)' }}>{viewingLog.name}</strong>
+                    <button onClick={() => setViewingLog(null)}
+                            style={{ cursor: 'pointer', background: 'none', border: 'none',
+                                     color: 'var(--text-muted)', fontSize: 16 }}>✕</button>
+                  </div>
+                  <pre style={{
+                    margin: 0, padding: 16, overflow: 'auto', flex: 1,
+                    fontSize: 11, lineHeight: 1.5, fontFamily: 'monospace',
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                    color: 'var(--text-primary)',
+                  }}>{viewingLog.content}</pre>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="sidebar-section" style={{ borderBottom: 'none' }}>
             <h3>📖 快捷键</h3>
             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2.2 }}>
@@ -488,7 +889,7 @@ export default function SettingsModal({
               轻量化大模型分布式边缘推理优化系统<br />
               北京交通大学 · 大学生创新创业训练计划<br />
               <span style={{ color: 'var(--text-secondary)' }}>
-                杨睿涵 · 张禄政 · 王泽远 | 指导: 高博
+                项目团队 | 指导: 高博
               </span>
             </div>
           </div>

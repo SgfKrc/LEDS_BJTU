@@ -10,7 +10,15 @@ async function request(path, options = {}) {
     headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = { detail: text };
+    }
+  }
   if (!res.ok) {
     throw new Error(data.detail || `HTTP ${res.status}`);
   }
@@ -29,10 +37,45 @@ export async function fetchAvailableModels() {
   return request('/models/available');
 }
 
-export async function loadModel(engine, quantType, useCompile = false) {
+export async function loadModel(engine, quantType, useCompile = false, modelId = null) {
   return request('/models/load', {
     method: 'POST',
-    body: JSON.stringify({ engine: engine || 'auto', quant_type: quantType, use_compile: useCompile }),
+    body: JSON.stringify({
+      engine: engine || 'llama_cpp',
+      quant_type: quantType,
+      use_compile: useCompile,
+      ...(modelId ? { model_id: modelId } : {}),
+    }),
+  });
+}
+
+// ---- P3: 多模型实验支持 ----
+
+export async function fetchModels() {
+  return request('/models');
+}
+
+export async function switchModel(modelId, quantType = 'int4', engine = 'auto') {
+  return request('/models/switch', {
+    method: 'POST',
+    body: JSON.stringify({ model_id: modelId, quant_type: quantType, engine }),
+  });
+}
+
+export async function fetchModelRegistry() {
+  return request('/models/registry');
+}
+
+export async function registerModel(config) {
+  return request('/models/registry', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
+export async function unregisterModel(modelId) {
+  return request(`/models/registry/${encodeURIComponent(modelId)}`, {
+    method: 'DELETE',
   });
 }
 
@@ -48,6 +91,85 @@ export async function sendMessage(message, opts = {}) {
       show_thinking: opts.showThinking || false,
     }),
   });
+}
+
+/**
+ * SSE 流式发送消息 — 调用 /api/chat/stream，解析 Server-Sent Events。
+ *
+ * @param {string} message - 用户消息
+ * @param {object} opts
+ * @param {string} opts.streamingMode - 'full'（默认，完整功能）| 'fast'（真流式逐token）
+ * @param {function} opts.onToken - fast 模式回调 (token: string, fullText: string)
+ * @returns {Promise<{content, thinking_content, metrics, followups}>}
+ */
+export async function sendMessageStream(message, opts = {}) {
+  const url = `${BASE}/chat/stream`;
+  const streamingMode = opts.streamingMode || 'full';
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message,
+      session_id: opts.sessionId || null,
+      max_new_tokens: opts.maxNewTokens || 512,
+      temperature: opts.temperature ?? 0.7,
+      top_p: opts.topP ?? 0.9,
+      show_thinking: opts.showThinking || false,
+      streaming_mode: streamingMode,
+    }),
+  });
+
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try { const d = await res.json(); detail = d.detail || detail; } catch (_) {}
+    throw new Error(detail);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullResponse = '';
+  let finalResult = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const event = JSON.parse(line.slice(6));
+        if (event.done) {
+          finalResult = event;
+        } else if (event.token) {
+          fullResponse += event.token;
+          if (opts.onToken) opts.onToken(event.token, fullResponse);
+        }
+      } catch (_) { /* skip incomplete chunks */ }
+    }
+  }
+
+  // 处理 buffer 中可能残留的最后一条
+  if (buffer.startsWith('data: ')) {
+    try {
+      const event = JSON.parse(buffer.slice(6));
+      if (event.done) finalResult = event;
+    } catch (_) {}
+  }
+
+  if (!finalResult) throw new Error('未收到流式响应');
+  if (finalResult.error) throw new Error(finalResult.error);
+
+  return {
+    content: finalResult.response || fullResponse,
+    thinking_content: finalResult.thinking || null,
+    metrics: finalResult.metrics || {},
+    followups: finalResult.followups || [],
+  };
 }
 
 export async function clearChat() {
@@ -102,6 +224,12 @@ export async function fetchClusterNodes() {
 export async function deregisterNode(nodeId) {
   return request(`/cluster/nodes/${encodeURIComponent(nodeId)}/deregister`, {
     method: 'POST',
+  });
+}
+
+export async function deleteClusterNode(nodeId) {
+  return request(`/cluster/nodes/${encodeURIComponent(nodeId)}`, {
+    method: 'DELETE',
   });
 }
 
@@ -208,7 +336,13 @@ export async function resetMasterIdentity(confirm = 'reset') {
   });
 }
 
-export async function manualRegisterNode(nodeId, hostname = '', address = '', networkType = 'unknown') {
+export async function manualRegisterNode(
+  nodeId,
+  hostname = '',
+  address = '',
+  networkType = 'unknown',
+  nodeType = 'pc',
+) {
   return request('/cluster/nodes/register', {
     method: 'POST',
     body: JSON.stringify({
@@ -216,6 +350,7 @@ export async function manualRegisterNode(nodeId, hostname = '', address = '', ne
       hostname: hostname,
       address: address,
       network_type: networkType,
+      node_type: nodeType,
     }),
   });
 }
@@ -305,4 +440,104 @@ export async function updateUserSettings(settings) {
 
 export async function fetchConversationSyncStatus() {
   return request('/conversations/sync-status');
+}
+
+// ---- 日志管理 ----
+
+export async function fetchLogFiles() {
+  return request('/logs');
+}
+
+export async function fetchLogContent(filename) {
+  return request(`/logs/${encodeURIComponent(filename)}`);
+}
+
+export async function deleteLogFile(filename) {
+  return request(`/logs/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+}
+
+export async function deleteAllLogFiles() {
+  return request('/logs', { method: 'DELETE' });
+}
+
+// ---- P3: 主节点转让审查 ----
+
+export async function createReviewTicket(targetNodeId, reason, timeoutHours) {
+  return request('/cluster/review/create', {
+    method: 'POST',
+    body: JSON.stringify({
+      target_node_id: targetNodeId,
+      reason: reason || '',
+      timeout_hours: timeoutHours || 48,
+    }),
+  });
+}
+
+export async function castVote(ticketId, vote, comment) {
+  return request('/cluster/review/vote', {
+    method: 'POST',
+    body: JSON.stringify({
+      ticket_id: ticketId,
+      vote,
+      comment: comment || '',
+    }),
+  });
+}
+
+export async function fetchReviewTickets(status) {
+  const params = status ? `?status=${encodeURIComponent(status)}` : '';
+  return request(`/cluster/review/tickets${params}`);
+}
+
+export async function fetchReviewTicket(ticketId) {
+  return request(`/cluster/review/tickets/${encodeURIComponent(ticketId)}`);
+}
+
+export async function checkCanVote() {
+  return request('/cluster/review/can-vote');
+}
+
+export async function expireReviewCheck() {
+  return request('/cluster/review/expire-check', { method: 'POST' });
+}
+
+export async function deleteReviewTicket(ticketId) {
+  return request(`/cluster/review/tickets/${encodeURIComponent(ticketId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function deleteResolvedReviewTickets() {
+  return request('/cluster/review/tickets', { method: 'DELETE' });
+}
+
+// ---- 请求队列管理 (Phase 3) ----
+
+export async function fetchQueue() {
+  return request('/cluster/queue');
+}
+
+export async function setQueueStrategy(strategy) {
+  return request('/cluster/queue/strategy', {
+    method: 'POST',
+    body: JSON.stringify({ strategy }),
+  });
+}
+
+export async function pauseQueue() {
+  return request('/cluster/queue/pause', { method: 'POST' });
+}
+
+export async function resumeQueue() {
+  return request('/cluster/queue/resume', { method: 'POST' });
+}
+
+export async function clearQueue() {
+  return request('/cluster/queue/clear', { method: 'POST' });
+}
+
+export async function cancelQueueTask(taskId) {
+  return request(`/cluster/queue/task/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE',
+  });
 }
