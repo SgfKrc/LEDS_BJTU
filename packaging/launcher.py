@@ -17,6 +17,22 @@ Windows 安装包的主入口点。
 
 import os
 import sys
+
+# ═══════════════════════════════════════════════════════════════════
+# ★ 静默模式：PyInstaller console=False 时，重定向 stdout/stderr 到日志文件
+# 必须在 import logging 之前执行，否则 basicConfig 的 StreamHandler 已绑定到原始 stderr
+# ═══════════════════════════════════════════════════════════════════
+if getattr(sys, 'frozen', False):
+    import datetime as _dt
+    _redirect_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "logs")
+    try:
+        os.makedirs(_redirect_dir, exist_ok=True)
+        _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sys.stdout = open(os.path.join(_redirect_dir, f"stdout_{_ts}.log"), "w", encoding="utf-8")
+        sys.stderr = open(os.path.join(_redirect_dir, f"stderr_{_ts}.log"), "w", encoding="utf-8")
+    except Exception:
+        pass
+
 import logging
 import threading
 import time

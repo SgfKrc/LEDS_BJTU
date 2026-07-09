@@ -132,6 +132,7 @@ def _init_schema() -> None:
             CREATE TABLE IF NOT EXISTS nodes (
                 node_id       VARCHAR(64) PRIMARY KEY,
                 role          VARCHAR(16) NOT NULL DEFAULT 'client',
+                node_type     VARCHAR(16) NOT NULL DEFAULT 'pc',
                 state         VARCHAR(16) NOT NULL DEFAULT 'offline',
                 address       VARCHAR(128) NOT NULL DEFAULT '',
                 hostname      VARCHAR(256) NOT NULL DEFAULT '',
@@ -193,13 +194,33 @@ def _init_schema() -> None:
             ON sessions(node_id, updated_at DESC)
         """)
 
+        # ---- 审查票表 (P3) ----
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS review_tickets (
+                ticket_id         VARCHAR(64) PRIMARY KEY,
+                status            VARCHAR(16) NOT NULL DEFAULT 'pending',
+                created_at        DOUBLE PRECISION NOT NULL,
+                created_by        VARCHAR(64) NOT NULL,
+                target_node_id    VARCHAR(64) NOT NULL,
+                transfer_reason   TEXT NOT NULL DEFAULT '',
+                votes             JSONB NOT NULL DEFAULT '[]',
+                score             INTEGER NOT NULL DEFAULT 0,
+                expires_at        DOUBLE PRECISION NOT NULL,
+                resolved_at       DOUBLE PRECISION DEFAULT NULL,
+                notification_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at        TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
         conn.commit()
 
-    # ★ 迁移：为旧版表添加 node_id 列（在事务外执行，避免回滚影响建表）
+    # ★ 迁移：为旧版表添加 node_id / node_type / model_sha256 列（在事务外执行，避免回滚影响建表）
     #    使用连接池而非独立连接，避免独立连接因网络/DNS 问题静默失败
     _migrate_add_node_id_columns()
+    _migrate_add_node_type_column()
+    _migrate_add_model_sha256_column()
 
-    logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions)")
+    logger.info("数据库表结构初始化完成 (nodes, conversations, cluster_config, sessions, review_tickets)")
 
 
 def _migrate_add_node_id_columns() -> None:
@@ -248,6 +269,72 @@ def _migrate_add_node_id_columns() -> None:
                 pass
 
 
+def _migrate_add_node_type_column() -> None:
+    """
+    为旧版 nodes 表添加 node_type 列（幂等迁移）。
+
+    旧版 nodes 表可能缺少 node_type 列（默认 'pc'）。
+    此迁移使用 ALTER TABLE ... ADD COLUMN IF NOT EXISTS。
+    """
+    pool_ = None
+    conn = None
+    try:
+        pool_ = get_pool()
+        conn = pool_.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS "
+                "node_type VARCHAR(16) NOT NULL DEFAULT 'pc'"
+            )
+            logger.info("迁移: nodes.node_type 列已就绪")
+        except Exception as e:
+            logger.warning(f"迁移 nodes.node_type 跳过: {e}")
+        cur.close()
+    except Exception as e:
+        logger.warning(f"node_type 列迁移失败（非致命）: {e}")
+    finally:
+        if conn and pool_:
+            try:
+                pool_.putconn(conn)
+            except Exception:
+                pass
+
+
+def _migrate_add_model_sha256_column() -> None:
+    """
+    为 nodes 表添加 model_sha256 列（幂等迁移，阶段 7）。
+
+    用于存储各节点上报的模型 SHA256 校验值，
+    主节点在推送分层配置前对比校验，模型不一致的节点将被排除。
+    """
+    pool_ = None
+    conn = None
+    try:
+        pool_ = get_pool()
+        conn = pool_.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS "
+                "model_sha256 VARCHAR(64) NOT NULL DEFAULT ''"
+            )
+            logger.info("迁移: nodes.model_sha256 列已就绪")
+        except Exception as e:
+            logger.warning(f"迁移 nodes.model_sha256 跳过: {e}")
+        cur.close()
+    except Exception as e:
+        logger.warning(f"model_sha256 列迁移失败（非致命）: {e}")
+    finally:
+        if conn and pool_:
+            try:
+                pool_.putconn(conn)
+            except Exception:
+                pass
+
+
 # ================================================================
 # 连接上下文管理器
 # ================================================================
@@ -259,7 +346,17 @@ def get_conn():
     conn = pool_.getconn()
     try:
         yield conn
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         pool_.putconn(conn)
 
 
@@ -268,20 +365,22 @@ def get_conn():
 # ================================================================
 
 def upsert_node(node_id: str, role: str = "client", state: str = "offline",
-                address: str = "", hostname: str = "",
+                node_type: str = "pc", address: str = "", hostname: str = "",
                 device_info: dict = None, network_type: str = "unknown",
                 connected_at: float = 0.0, last_heartbeat: float = 0.0,
-                task_count: int = 0, error_count: int = 0) -> dict:
+                task_count: int = 0, error_count: int = 0,
+                model_sha256: str = "") -> dict:
     """插入或更新节点记录，返回完整节点 dict"""
     with get_conn() as conn:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            INSERT INTO nodes (node_id, role, state, address, hostname,
+            INSERT INTO nodes (node_id, role, node_type, state, address, hostname,
                                device_info, network_type, connected_at,
-                               last_heartbeat, task_count, error_count)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               last_heartbeat, task_count, error_count, model_sha256)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (node_id) DO UPDATE SET
                 role = EXCLUDED.role,
+                node_type = EXCLUDED.node_type,
                 state = EXCLUDED.state,
                 address = EXCLUDED.address,
                 hostname = EXCLUDED.hostname,
@@ -291,13 +390,14 @@ def upsert_node(node_id: str, role: str = "client", state: str = "offline",
                 last_heartbeat = EXCLUDED.last_heartbeat,
                 task_count = EXCLUDED.task_count,
                 error_count = EXCLUDED.error_count,
+                model_sha256 = EXCLUDED.model_sha256,
                 updated_at = NOW()
             RETURNING *
         """, (
-            node_id, role, state, address, hostname,
+            node_id, role, node_type, state, address, hostname,
             json.dumps(device_info or {}),
             network_type, connected_at,
-            last_heartbeat, task_count, error_count,
+            last_heartbeat, task_count, error_count, model_sha256,
         ))
         conn.commit()
         row = cur.fetchone()
@@ -1122,6 +1222,323 @@ def get_spare_master_logs() -> list:
         logs = []
     logs.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
     return logs
+
+
+# ================================================================
+# 实验模型注册（P3: 多模型实验支持）
+# 存储: cluster_config 表，key 前缀 "experimental_model:"
+# ================================================================
+
+EXPERIMENTAL_MODEL_KEY_PREFIX = "experimental_model:"
+
+
+def save_experimental_model(model_id: str, config_json: str) -> bool:
+    """注册/更新一个实验模型配置。
+
+    Args:
+        model_id: 模型唯一标识
+        config_json: JSON 编码的模型配置 dict
+
+    Returns:
+        是否保存成功
+    """
+    key = f"{EXPERIMENTAL_MODEL_KEY_PREFIX}{model_id}"
+    try:
+        set_config(key, config_json)
+        logger.info(f"实验模型已注册: {model_id}")
+        return True
+    except Exception as e:
+        logger.error(f"注册实验模型失败 ({model_id}): {e}")
+        return False
+
+
+def get_experimental_models() -> list[dict]:
+    """获取所有用户注册的实验模型配置。
+
+    Returns:
+        模型配置 dict 列表（已解析 JSON）
+    """
+    try:
+        all_configs = get_all_configs()
+    except Exception as e:
+        logger.warning(f"读取实验模型列表失败: {e}")
+        return []
+
+    models = []
+    for key, value in all_configs.items():
+        if not key.startswith(EXPERIMENTAL_MODEL_KEY_PREFIX):
+            continue
+        try:
+            config = json.loads(value)
+            if isinstance(config, dict):
+                # P3修复: 不覆盖存储中已有的 model_id，使用单独的键
+                if "model_id" not in config:
+                    config["model_id"] = key[len(EXPERIMENTAL_MODEL_KEY_PREFIX):]
+                models.append(config)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"解析实验模型配置失败: {key}")
+            continue
+
+    return models
+
+
+def delete_experimental_model(model_id: str) -> bool:
+    """删除一个实验模型注册。
+
+    Args:
+        model_id: 模型唯一标识
+
+    Returns:
+        是否删除成功
+    """
+    key = f"{EXPERIMENTAL_MODEL_KEY_PREFIX}{model_id}"
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM cluster_config WHERE key = %s", (key,))
+            conn.commit()
+            deleted = cur.rowcount > 0
+            if deleted:
+                logger.info(f"实验模型已删除: {model_id}")
+            else:
+                logger.warning(f"实验模型不存在: {model_id}")
+            return deleted
+    except Exception as e:
+        logger.error(f"删除实验模型失败 ({model_id}): {e}")
+        return False
+
+
+def set_active_model(model_id: str) -> None:
+    """记录当前活跃的模型 ID。"""
+    set_config("active_model_id", model_id)
+
+
+def get_active_model() -> str:
+    """获取当前活跃的模型 ID（默认 qwen-1_8b）。"""
+    return get_config("active_model_id", "qwen-1_8b")
+
+
+# ================================================================
+# 审查票 CRUD (P3: 主节点转让审查)
+# ================================================================
+
+def create_review_ticket(ticket: dict) -> dict:
+    """创建审查工单。
+
+    Args:
+        ticket: 工单 dict，至少包含 ticket_id。
+
+    Returns:
+        写入的工单 dict。
+    """
+    votes_raw = ticket.get("votes")
+    if votes_raw is None:
+        votes_json = "[]"
+    elif isinstance(votes_raw, (list, dict)):
+        votes_json = json.dumps(votes_raw, ensure_ascii=False)
+    elif isinstance(votes_raw, str):
+        votes_json = votes_raw
+    else:
+        votes_json = json.dumps(votes_raw, ensure_ascii=False)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO review_tickets
+                (ticket_id, status, created_at, created_by, target_node_id,
+                 transfer_reason, votes, score, expires_at, resolved_at,
+                 notification_sent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ticket_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                votes = EXCLUDED.votes,
+                score = EXCLUDED.score,
+                updated_at = NOW()
+            RETURNING *
+        """, (
+            ticket["ticket_id"],
+            ticket.get("status", "pending"),
+            ticket.get("created_at", 0.0),
+            ticket.get("created_by", ""),
+            ticket.get("target_node_id", ""),
+            ticket.get("transfer_reason", ""),
+            votes_json,
+            ticket.get("score", 0),
+            ticket.get("expires_at", 0.0),
+            ticket.get("resolved_at"),
+            ticket.get("notification_sent", False),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        if row:
+            return _review_ticket_row_to_dict(row)
+    return None
+
+
+def get_review_ticket(ticket_id: str) -> Optional[dict]:
+    """获取单个审查工单。"""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM review_tickets WHERE ticket_id = %s",
+            (ticket_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return _review_ticket_row_to_dict(row)
+
+
+def update_review_ticket(ticket_id: str, updates: dict) -> Optional[dict]:
+    """更新审查工单的部分字段。
+
+    Args:
+        ticket_id: 工单 ID。
+        updates: 要更新的字段 dict。
+
+    Returns:
+        更新后的工单 dict，或 None（不存在时）。
+    """
+    # 构建 SET 子句
+    allowed_fields = {
+        "status", "score", "votes", "resolved_at",
+        "notification_sent", "transfer_reason", "expires_at",
+    }
+    set_clauses = []
+    values = []
+
+    for field, value in updates.items():
+        if field in allowed_fields:
+            set_clauses.append(f"{field} = %s")
+            if field == "votes" and isinstance(value, list):
+                values.append(json.dumps(value, ensure_ascii=False))
+            else:
+                values.append(value)
+
+    if not set_clauses:
+        return None
+
+    set_clauses.append("updated_at = NOW()")
+    values.append(ticket_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE review_tickets SET {', '.join(set_clauses)} WHERE ticket_id = %s",
+            values,
+        )
+        conn.commit()
+
+        if cur.rowcount == 0:
+            return None
+
+        # 返回更新后的完整记录
+        cur.execute("SELECT * FROM review_tickets WHERE ticket_id = %s", (ticket_id,))
+        row = cur.fetchone()
+        if row:
+            return _review_ticket_row_to_dict(row)
+    return None
+
+
+def list_review_tickets(status: Optional[str] = None) -> list[dict]:
+    """列出审查工单，可按状态过滤。
+
+    Args:
+        status: None（全部）或 "pending" / "approved" / "rejected" / "expired"。
+
+    Returns:
+        工单 dict 列表。
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if status:
+            cur.execute(
+                "SELECT * FROM review_tickets WHERE status = %s ORDER BY created_at DESC",
+                (status,)
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM review_tickets ORDER BY created_at DESC"
+            )
+        rows = cur.fetchall()
+        return [_review_ticket_row_to_dict(r) for r in rows]
+
+
+def delete_review_ticket(ticket_id: str) -> bool:
+    """删除一个审查工单（所有状态均可删除）。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM review_tickets WHERE ticket_id = %s",
+                    (ticket_id,),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.warning(f"删除审查工单失败 ({ticket_id}): {e}")
+        return False
+
+
+def delete_resolved_review_tickets() -> int:
+    """删除所有已解决（approved/rejected/expired）的审查工单，返回删除数量。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM review_tickets WHERE status IN ('approved', 'rejected', 'expired')"
+                )
+                conn.commit()
+                return cur.rowcount
+    except Exception as e:
+        logger.warning(f"批量删除已解决工单失败: {e}")
+        return 0
+
+
+def _review_ticket_row_to_dict(row) -> dict:
+    """将数据库行转换为 dict。
+
+    row 是 psycopg2 查询返回的 tuple（按列顺序）。
+    列顺序与 CREATE TABLE 一致:
+      ticket_id, status, created_at, created_by, target_node_id,
+      transfer_reason, votes, score, expires_at, resolved_at,
+      notification_sent, updated_at
+    """
+    idx = 0
+    ticket_id = row[idx]; idx += 1
+    status = row[idx]; idx += 1
+    created_at = row[idx]; idx += 1
+    created_by = row[idx]; idx += 1
+    target_node_id = row[idx]; idx += 1
+    transfer_reason = row[idx]; idx += 1
+    votes_raw = row[idx]; idx += 1
+    score = row[idx]; idx += 1
+    expires_at = row[idx]; idx += 1
+    resolved_at = row[idx]; idx += 1
+    notification_sent = row[idx]; idx += 1
+    # updated_at = row[idx] — not used in ReviewTicket
+
+    # Parse votes
+    votes = votes_raw
+    if isinstance(votes_raw, str):
+        try:
+            votes = json.loads(votes_raw)
+        except (json.JSONDecodeError, TypeError):
+            votes = []
+
+    return {
+        "ticket_id": ticket_id,
+        "status": status,
+        "created_at": float(created_at) if created_at else 0.0,
+        "created_by": created_by or "",
+        "target_node_id": target_node_id or "",
+        "transfer_reason": transfer_reason or "",
+        "votes": votes,
+        "score": int(score) if score is not None else 0,
+        "expires_at": float(expires_at) if expires_at else 0.0,
+        "resolved_at": float(resolved_at) if resolved_at else None,
+        "notification_sent": bool(notification_sent),
+    }
 
 
 # ================================================================

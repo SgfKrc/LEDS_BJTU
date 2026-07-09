@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- QLH 极简版图标：沿用 PC 主标识，右下角绿色 L 标记区分 lite -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M54,15 L58.44,20.29 L64.09,16.33 L67.01,22.59 L73.5,20.23 L74.7,27.03 L81.58,26.42 L80.97,33.3 L87.77,34.5 L85.41,40.99 L91.67,43.91 L87.71,49.56 L93,54 L87.71,58.44 L91.67,64.09 L85.41,67.01 L87.77,73.5 L80.97,74.7 L81.58,81.58 L74.7,80.97 L73.5,87.77 L67.01,85.41 L64.09,91.67 L58.44,87.71 L54,93 L49.56,87.71 L43.91,91.67 L40.99,85.41 L34.5,87.77 L33.3,80.97 L26.42,81.58 L27.03,74.7 L20.23,73.5 L22.59,67.01 L16.33,64.09 L20.29,58.44 L15,54 L20.29,49.56 L16.33,43.91 L22.59,40.99 L20.23,34.5 L27.03,33.3 L26.42,26.42 L33.3,27.03 L34.5,20.23 L40.99,22.59 L43.91,16.33 L49.56,20.29 Z M54,25 A29,29 0,1 0,54,83 A29,29 0,1 0,54,25" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,28 L78,76 L30,76 Z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M54,39 L43,60 L65,60 Z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M43,60 L31.5,76 L54,76 Z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M65,60 L54,76 L76.5,76 Z" />
+    <path
+        android:fillColor="#FF00C853"
+        android:pathData="M74,70 A16,16 0,1 0,74,102 A16,16 0,1 0,74,70" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M68,78 L73,78 L73,91 L82,91 L82,96 L68,96 Z" />
+</vector>

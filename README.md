@@ -4,13 +4,28 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控
 
-**v0.1.4**
+**v0.1.5**
 
 ---
 
 ## 📋 项目简介
 
 针对边缘设备（普通笔记本）显存不足、算力有限的痛点，将 Qwen-1.8B 大语言模型按 Transformer 层拆分，部署到多台边缘设备组成分布式推理集群。配合 INT4/INT8 模型量化、算子融合、轻量化分页KV缓存三大单机优化，以及**图算法智能编排**（最大带宽生成树 + DFS 路径搜索），实现低开销、低时延的边缘端大模型推理。
+
+现已支持 **Windows PC + Android 双端**：PC 端完整支持分布式层间拆分流水线，Android 端以 llama.cpp 本地完整推理或作为薄客户端将请求转发给 PC 集群。
+
+### 软件版本分级（四级四种）
+
+项目按硬件能力和使用场景划分为四种软件版本：
+
+| 级别 | 软件版本 | 目标设备 | 核心能力 | 不包含/不推荐 |
+|------|----------|----------|----------|---------------|
+| 1 | **PC 集显版** | 无 NVIDIA 独显的 Windows PC / 普通笔记本 | llama.cpp + GGUF CPU/集显推理、可作为轻量节点、基础分布式能力 | 重模型实验、CUDA 专属能力 |
+| 2 | **PC 独显版** | NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、后续支持多模型/重模型实验 | Android 极简化策略 |
+| 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、较完整设置、后续可研究完整任务 Worker | Transformer 层间拆分、重模型实验 |
+| 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 完整 models 目录、日志管理、Worker 接收任务、高级控制面板 |
+
+> Android 普通版和极简版的区别：普通版面向“完整移动客户端”，极简版面向“尽量小、尽量少设置、尽量低存储占用”的手机轻量入口。
 
 ### 核心特性
 
@@ -22,10 +37,39 @@
 | 📋 **请求队列** | FIFO 队列管理并发推理请求，支持队列深度监控 |
 | 🗄️ **多会话管理** | 本地 JSON 存储 + 云 PostgreSQL 双轨，断网自动降级 |
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
-| 📦 **一键安装包** | Windows 安装包（Inno Setup），含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
+| 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
+| 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天 |
 
 **应用场景**：智能终端 · 物联网 · 边缘计算 · 教育科研
+
+---
+
+## 🌐 Tailscale 组网（重要）
+
+分布式推理模式依赖 **Tailscale** 实现跨子网设备互联。所有参与推理的节点（PC、Android）建议先安装 Tailscale 并加入同一网络。
+
+### 安装 Tailscale
+
+**PC 端**（Windows / macOS / Linux）：
+
+> 🔗 https://tailscale.com/download
+
+安装后用同一账号登录即可自动组网。
+
+**Android 端**：
+
+> 🔗 Google Play 搜索 "Tailscale" 安装，或从 APK Mirror 侧载
+
+**验证组网**：
+
+打开 Tailscale 控制台 https://login.tailscale.com/admin/machines ，确认所有节点均在线且分配了 `100.x.x.x` 地址。
+
+### 为什么需要 Tailscale？
+
+- 校园网 / 家庭网络通常不分配公网 IP，设备间无法直接互访
+- Tailscale 基于 WireGuard 创建虚拟局域网，每个设备获得一个固定的 `100.x.x.x` 地址
+- Windows 打包版启动器会自动检查 Tailscale 是否已安装并登录
 
 ---
 
@@ -42,8 +86,9 @@
 │   ├── 图算法.md                   # 最大带宽生成树 + DFS 路径搜索算法设计
 │   ├── 分布式推理流水线实施计划.md    # 链式拓扑、LAYER_FORWARD 协议、KV Cache 方案
 │   ├── Android版本远期计划.md       # Android 端方案评估与规划
+│   ├── Android SAF模型存储方案.md   # Android SAF 外部模型目录方案
 │   └── 纯Embedding节点处理+前端连接状态列计划.md
-├── src/                           # Python 源代码
+├── src/                           # Python 源代码（PC 端）
 │   ├── config.py                  # 全局配置（网络/模型/KV/分层/运行模式/图算法阈值）
 │   ├── model_module.py            # 模型加载、量化、算子融合、层级拆分、前向推理
 │   ├── llama_engine.py            # llama.cpp 引擎封装（CPU/集显 GGUF 推理）
@@ -56,11 +101,26 @@
 │   ├── db.py                      # PostgreSQL 数据库连接池
 │   ├── local_store.py             # 本地 JSON 存储（DB 不可用时自动降级）
 │   └── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
+├── android/                       # Android 客户端（Kotlin + Jetpack Compose）
+│   ├── app/
+│   │   ├── build.gradle.kts       # Gradle 构建脚本（含 release 签名配置）
+│   │   └── src/main/java/com/qlh/inference/
+│   │       ├── data/              # Room 数据库 + DataStore 设置持久化
+│   │       ├── network/           # OkHttp API 客户端 + ChatRepository
+│   │       ├── service/           # InferenceService 前台 Service + ModelManager + LocalInferenceEngine
+│   │       └── ui/                # ChatScreen / SettingsScreen / SessionListScreen
+│   ├── keystore.properties        # release 签名配置（Git 忽略，需本地生成）
+│   ├── qlh-release.jks            # release 签名密钥库（Git 忽略）
+│   └── gradlew / gradlew.bat      # Gradle Wrapper（无需 Android Studio）
 ├── packaging/                     # 打包配置与脚本
 │   ├── launcher.py                # 打包版启动器（Tailscale → 模型检查 → 引擎选择 → 启动）
-│   ├── qlh-cpu.spec               # PyInstaller 规格文件
-│   ├── setup.iss                  # Inno Setup 安装脚本
-│   ├── build-cpu.bat              # 一键 PyInstaller 打包
+│   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android 安装包）
+│   ├── qlh-cpu.spec               # PyInstaller 规格文件（集显版）
+│   ├── qlh-cuda.spec              # PyInstaller 规格文件（独显版，CUDA + CPU 回退）
+│   ├── setup.iss                  # Inno Setup 安装脚本 集显版（含可选 models/ 卸载）
+│   ├── setup-cuda.iss             # Inno Setup 安装脚本 独显版
+│   ├── build-cpu.bat              # 一键 PyInstaller 打包（集显）
+│   ├── build-cuda.bat             # 一键 PyInstaller 打包（独显）
 │   ├── build-installer.bat        # 一键编译安装包
 │   └── README.md                  # 打包文档
 ├── frontend/                      # React 前端（Vite + FastAPI 后端代理）
@@ -75,6 +135,8 @@
 │   ├── benchmark_compile.py       # torch.compile 融合测试
 │   └── convert_to_gguf.py         # Safetensors → GGUF 转换
 ├── models/                        # 模型文件存放目录（需自行下载）
+│   ├── qwen-1_8b-chat/            # PC: Safetensors 格式
+│   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF 格式（llama.cpp 引擎）
 ├── logs/                          # 运行日志目录
 ├── requirements.txt               # Python 依赖清单
 └── README.md                      # 本文件
@@ -87,15 +149,27 @@
           Embed + L0-7           L8-15                L16-23 + LM Head
 ```
 
+### Android 客户端双模式
+
+```
+┌──────────────────────────────┬──────────────────────────────┐
+│  全有模式 (本地推理)           │  全无模式 (远程推理)           │
+│                              │                              │
+│  Android 本地 llama.cpp      │  Android 聊天 UI             │
+│  GGUF Q4_K_M (~1.16 GB)      │  HTTP → PC 主节点             │
+│  离线可用，不依赖网络          │  PC 集群分布式推理            │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
 ### 软件分层架构
 
 | 层级 | 功能 | 技术 |
 |------|------|------|
-| 应用层 | 可视化交互 & 节点管理 & 性能监控 | React + FastAPI |
+| 应用层 | 可视化交互 & 节点管理 & 性能监控 | React + Jetpack Compose (Android) |
 | 调度层 | 任务调度、指令分发、状态管理、请求队列 | Python threading + 图算法 |
 | 通信层 | TCP长连接、粘包处理、心跳、张量序列化 | Python socket + struct |
-| 推理层 | 双引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU) |
-| 存储层 | 对话持久化、节点注册、配置管理 | PostgreSQL + 本地 JSON 降级 |
+| 推理层 | 双引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU / Android) |
+| 存储层 | 对话持久化、节点注册、配置管理 | PostgreSQL + 本地 JSON 降级 + Room (Android) |
 | 基础层 | 运行环境 | Python / CUDA / bitsandbytes / llama.cpp |
 
 ---
@@ -138,6 +212,14 @@
 |------|----------|------|
 | psycopg2-binary | ≥ 2.9 | PostgreSQL 客户端（云端同步用，可选） |
 
+### 网络（分布式模式必装）
+
+| 依赖 | 版本要求 | 说明 |
+|------|----------|------|
+| **Tailscale** | 最新版 | 跨子网虚拟组网，所有分布式节点必须安装 |
+
+> 🔗 下载: https://tailscale.com/download
+
 ### 工具
 
 | 依赖 | 版本要求 | 说明 |
@@ -151,6 +233,17 @@
 |------|----------|------|
 | Node.js | ≥ 18 | 前端构建 |
 | npm | — | 包管理器 |
+
+### Android 客户端
+
+| 依赖 | 版本要求 | 说明 |
+|------|----------|------|
+| Android SDK | API 34+ | 编译目标 |
+| Gradle | 8.11+ | Wrapper 已内置，无需单独安装 |
+| Kotlin | 2.1.0 | 通过 Gradle 自动下载 |
+| Java | JDK 17 | 编译必需 |
+
+> Android 客户端**不需要 Android Studio**，有 JDK + Android SDK 命令行工具即可通过 `gradlew.bat` 构建。
 
 ### 一键安装
 
@@ -171,7 +264,7 @@ cd frontend && npm install && cd ..
 | 格式 | 引擎 | 大小 | 适用场景 |
 |------|------|------|---------|
 | **Safetensors** | PyTorch (CUDA) | ~3.5 GB | 独显推理、分布式流水线 |
-| **GGUF Q4_K_M** | llama.cpp (CPU) | ~1.16 GB | 集显/CPU、单机推理 |
+| **GGUF Q4_K_M** | llama.cpp (CPU / Android) | ~1.16 GB | 集显/CPU、单机推理、Android 本地推理 |
 
 ### Safetensors 格式（PyTorch / 分布式）
 
@@ -193,7 +286,7 @@ huggingface-cli download Qwen/Qwen-1.8B-Chat --local-dir models/qwen-1_8b-chat
 
 > 🔗 https://pan.baidu.com/s/1hAAaIN1Og-ZdeEHzxU-o4g?pwd=vtp3 | 提取码：vtp3
 
-### GGUF 格式（llama.cpp / CPU）
+### GGUF 格式（llama.cpp / PC CPU 引擎）
 
 ```bash
 # 下载推荐版本 Q4_K_M (~1.16 GB)
@@ -208,11 +301,44 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
 | Q5_K_M | ~1.31 GB | 更高质量 |
 | Q8_0 | ~1.82 GB | 近无损 |
 
+### GGUF 格式（Android 本地推理）
+
+Android 全有模式下，模型需放在**用户选择的外部目录**中（SAF `ACTION_OPEN_DOCUMENT_TREE`），**不放在应用内部存储**，这样卸载 APK 时模型会默认保留。
+
+**Android 模型存放位置**：
+
+| 推荐位置 | 说明 |
+|----------|------|
+| `Download/QLH/models/` | 手机内置的下载目录，卸载 APK 不会删除 |
+| 用户自选的外部 SD 卡目录 | 通过 SAF 授权的任意目录 |
+
+**获取方式**：
+
+1. **PC 分发**：在 PC 上启动分发服务器，Android 浏览器下载后移动到 SAF 模型目录
+
+   ```bash
+   cd packaging
+   python serve.py
+   ```
+
+2. **直接下载**：Android 浏览器访问 Hugging Face 或通过 USB 传文件
+
+3. **后续**：应用内会提供从 PC 主节点直接下载到 SAF 目录的功能
+
+**操作流程**：
+
+```text
+打开应用 → 设置 → 切换"全有模式" → 模型管理 → 选择目录
+  → 选择包含 .gguf 的目录 → 扫描 → 选中模型 → 完成
+```
+
+> 详细方案参见 [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md)
+
 ---
 
 ## 🚀 快速开始
 
-### 开发模式
+### 开发模式（PC）
 
 ```bash
 # 终端 1：启动 Python 后端（从项目根目录运行）
@@ -226,7 +352,7 @@ cd frontend && npm run dev
 - **后端直连**：`http://localhost:8000`（含前端，`npm run build` 后）
 - **开发前端**：`http://localhost:5173`（Vite 热更新，代理到 8000）
 
-### 单机模式
+### 单机模式（PC）
 
 修改 `src/config.py`：`RUN_MODE = "single"`，然后：
 
@@ -234,7 +360,9 @@ cd frontend && npm run dev
 python src/api_server.py
 ```
 
-### 分布式模式
+### 分布式模式（PC）
+
+> ⚠️ 前提：所有参与节点已安装 Tailscale 并用同一账号登录。
 
 **主节点**：
 
@@ -254,7 +382,71 @@ python src/api_server.py
 
 ### 打包版（Windows 安装包）
 
-参见 [packaging/README.md](packaging/README.md)。安装后双击桌面快捷方式即可启动，无需配置 Python 环境。
+提供两个版本，按需选择：
+
+| 版本 | 安装包 | 典型大小 | 适用场景 |
+|------|--------|---------|---------|
+| **集显版** | `QLH-Edge-Inference-Setup-vX.X.X.exe` | ~180 MB | CPU / 集成显卡节点（从节点） |
+| **独显版** | `QLH-Edge-Inference-Setup-vX.X.X-CUDA.exe` | ~1.7 GB | NVIDIA GPU 节点（主节点），无 GPU 时自动回退 CPU |
+
+安装后双击桌面快捷方式即可启动，无需配置 Python 环境。
+
+> 卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
+>
+> 详细打包流程参见 [packaging/README.md](packaging/README.md)。
+
+### Android 客户端
+
+> 前提：已安装 JDK 17 + Android SDK（API 34+），SDK 路径配置在 `android/local.properties`
+
+**编译**（无需 Android Studio）：
+
+```bash
+cd android
+
+# Debug APK（未压缩，开发用）
+./gradlew.bat assembleDebug
+
+# Release APK（R8 压缩 + 签名，分发用）
+./gradlew.bat assembleRelease
+```
+
+产物：
+
+| 产物 | 路径 | 典型大小 |
+|------|------|---------|
+| Debug APK | `android/app/build/outputs/apk/debug/app-debug.apk` | ~29 MB（含 llama.cpp native 后端） |
+| Release APK | `android/app/build/outputs/apk/release/app-release.apk` | ~6.6 MB（R8 + native strip） |
+
+**安装**：
+
+```bash
+adb install android/app/build/outputs/apk/release/app-release.apk
+```
+
+**使用**：
+
+1. 启动 App → 底部导航选择「设置」
+2. 全无模式：输入 PC 主节点 Tailscale IP 和端口 → 测试连接 → 开始对话
+3. 全有模式：切换模式 → 选择包含 `.gguf` 的 SAF 外部目录 → 扫描并选中模型 → 离线推理
+
+### 安装包分发服务器
+
+在同一 Tailscale 网络内分发安装包，让其他设备浏览器直接下载：
+
+```bash
+cd packaging
+python serve.py
+# 默认端口 9090，浏览器访问 http://<本机Tailscale IP>:9090/
+```
+
+首页会列出：
+
+- Windows PC 安装包
+- Android Debug / Release APK
+- 模型压缩包 `models.7z`
+
+> 其他设备（包括 Android 手机）直接浏览器打开链接即可下载。
 
 ---
 
@@ -281,6 +473,14 @@ python src/api_server.py
 | llama.cpp | Q4_K_M | ~1.2 GB | **~12 tok/s** | **推荐 CPU/集显** |
 
 > llama.cpp 相比 PyTorch CPU：内存 **-65%**，速度 **+300%（3-5x）**
+
+### Android 本地推理（预估）
+
+| 芯片 | 等级 | Q4_K_M tok/s | 峰值 RAM |
+|------|------|-------------|----------|
+| 骁龙 8 Gen 3 | 旗舰 | 12-18 | 1.8 GB |
+| 骁龙 8+ Gen 1 | 次旗舰 | 8-12 | 1.8 GB |
+| 骁龙 865 | 中端 | 5-8 | 1.8 GB |
 
 ---
 
@@ -310,11 +510,11 @@ python src/api_server.py
 
 ## 👥 团队分工
 
-| 成员 | 学号 | 职责 |
-|------|------|------|
-| **杨睿涵** | 23301053 | 项目负责人 — 文献调研、模型量化、算子融合、KV缓存优化 |
-| **张禄政** | 23301056 | 分布式架构设计、通信协议开发、多机调度逻辑 |
-| **王泽远** | 23301077 | Web可视化平台、性能监控模块、文档与演示材料 |
+| 小组 | 职责 |
+|------|------|
+| 模型优化组 | 文献调研、模型量化、算子融合、KV缓存优化 |
+| 分布式架构组 | 分布式架构设计、通信协议开发、多机调度逻辑 |
+| 前端与文档组 | Web可视化平台、性能监控模块、文档与演示材料 |
 
 **指导教师**：高博 副教授（北京交通大学软件学院）
 
@@ -334,7 +534,9 @@ python src/api_server.py
 
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
-- [Android 版本远期计划](docs/Android版本远期计划.md) — Android 端方案评估
+- [Android 版本远期计划](docs/Android版本远期计划.md) — Android 端方案评估、全有/全无模式
+- [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
+- [PC 与 Android 端交互体验优化计划](docs/PC与Android端交互体验优化计划.md) — 四级版本分级、交互优化、日志、Worker 与远期任务链规划
 - [纯 Embedding/LM Head 节点处理计划](docs/纯Embedding节点处理+前端连接状态列计划.md)
 
 ### 工程文档
@@ -349,4 +551,4 @@ python src/api_server.py
 
 ---
 
-© 2026 北京交通大学 · 杨睿涵 · 张禄政 · 王泽远
+© 2026 北京交通大学 · 项目团队

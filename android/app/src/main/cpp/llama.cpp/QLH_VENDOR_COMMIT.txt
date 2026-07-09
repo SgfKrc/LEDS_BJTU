@@ -1,0 +1,3 @@
+Vendored llama.cpp commit: 47e1de77aa0f06bf73cfd8c5281d95979f89fcbe
+Source: https://github.com/ggml-org/llama.cpp
+Purpose: Android full-local GGUF inference runtime for QLH.

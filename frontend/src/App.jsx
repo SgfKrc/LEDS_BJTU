@@ -33,6 +33,7 @@ const DEFAULT_SETTINGS = {
   distributedInference: true,  // 分布式推理：主节点默认开启，从节点从服务端同步
   cloudSync: true,             // 云同步设置偏好：默认开启，确保跨设备设置一致
   showThinking: false,         // 深度思考展示：默认关闭
+  streamingMode: 'full',       // 流式输出模式: full=完整功能（历史/追问/持久化，默认）| fast=真流式逐token
 };
 
 // 从 localStorage 读取主题，默认暗色
@@ -86,6 +87,11 @@ export default function App() {
   const [sessions, setSessions] = useState([]);           // 会话列表
   const [activeSessionId, setActiveSessionId] = useState(null);  // 当前活跃会话 ID
 
+  // P3: 多模型实验支持
+  const [activeModelId, setActiveModelId] = useState('qwen-1_8b');
+  const [availableModels, setAvailableModels] = useState([]);
+  const [switchingModel, setSwitchingModel] = useState(false);
+
   // 初始化主题
   useEffect(() => { applyTheme(theme); }, [theme]);
 
@@ -95,7 +101,10 @@ export default function App() {
       // 获取角色
       fetchMyRole()
         .then(setMyRole)
-        .catch(() => setMyRole({ node_role: 'master', node_id: 'master', is_master: true, is_client: false }));
+        .catch(() => {
+          console.warn('获取节点角色失败，管理功能暂不可用');
+          setMyRole({ node_role: 'unknown', node_id: 'unknown', is_master: false, is_client: false });
+        });
       // 从服务端同步分布式推理开关状态
       fetchDistributedInferenceConfig()
         .then((config) => {
@@ -257,6 +266,64 @@ export default function App() {
     }
   }, [updateSettings, showToast]);
 
+  // P3: 多模型支持 — 加载可用模型列表
+  const loadAvailableModels = useCallback(async () => {
+    if (!hasDedicatedGpu) return;
+    try {
+      const { fetchModels } = await import('./api/client');
+      const data = await fetchModels();
+      setAvailableModels(data.models || []);
+      if (data.active_model_id) {
+        setActiveModelId(data.active_model_id);
+      }
+    } catch (_) { /* 静默失败，列表为空 */ }
+  }, [hasDedicatedGpu]);
+
+  // P3: 切换模型
+  const handleSwitchModel = useCallback(async (modelId, quantType = 'int4') => {
+    setSwitchingModel(true);
+    try {
+      const { switchModel } = await import('./api/client');
+      const result = await switchModel(modelId, quantType);
+      if (result.success) {
+        setActiveModelId(result.model_id);
+        setModelLoaded(true);
+        setCurrentQuant(quantType);
+        showToast({ type: 'success', msg: `已切换到模型: ${result.model_name}` });
+        // 刷新设备状态
+        setRefreshKey(k => k + 1);
+      }
+    } catch (e) {
+      showToast({ type: 'error', msg: `模型切换失败: ${e.message}` });
+    } finally {
+      setSwitchingModel(false);
+    }
+  }, [showToast]);
+
+  // P3: 注册实验模型
+  const handleRegisterModel = useCallback(async (config) => {
+    try {
+      const { registerModel } = await import('./api/client');
+      await registerModel(config);
+      showToast({ type: 'success', msg: `已注册模型: ${config.name}` });
+      await loadAvailableModels();
+    } catch (e) {
+      showToast({ type: 'error', msg: `模型注册失败: ${e.message}` });
+    }
+  }, [showToast, loadAvailableModels]);
+
+  // P3: 取消注册实验模型
+  const handleUnregisterModel = useCallback(async (modelId) => {
+    try {
+      const { unregisterModel } = await import('./api/client');
+      await unregisterModel(modelId);
+      showToast({ type: 'success', msg: `已移除模型: ${modelId}` });
+      await loadAvailableModels();
+    } catch (e) {
+      showToast({ type: 'error', msg: `移除模型失败: ${e.message}` });
+    }
+  }, [showToast, loadAvailableModels]);
+
   // Ctrl+B to toggle sidebar
   useEffect(() => {
     const handler = (e) => {
@@ -386,7 +453,7 @@ export default function App() {
 
             <div style={{ padding: '16px 24px', marginTop: 'auto' }}>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
-                © 2026 杨睿涵 · 张禄政 · 王泽远
+                © 2026 项目团队
               </div>
             </div>
           </>
@@ -435,7 +502,7 @@ export default function App() {
             onRenameSession={handleRenameSession}
           />
         ) : (
-          <AdminPanel onToast={showToast} myRole={myRole} />
+          <AdminPanel onToast={showToast} myRole={myRole} hasDedicatedGpu={hasDedicatedGpu} />
         )}
       </main>
 
@@ -454,6 +521,13 @@ export default function App() {
         onDeviceProfileLoaded={handleDeviceProfileLoaded}
         onApplyTierPreset={applyTierPreset}
         myRole={myRole}
+        activeModelId={activeModelId}
+        availableModels={availableModels}
+        switchingModel={switchingModel}
+        onLoadModels={loadAvailableModels}
+        onSwitchModel={handleSwitchModel}
+        onRegisterModel={handleRegisterModel}
+        onUnregisterModel={handleUnregisterModel}
       />
 
       {/* Toast */}

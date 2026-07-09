@@ -21,6 +21,7 @@
 
 import logging
 import os
+import threading
 import time
 from typing import Tuple, Optional, Dict, Any, List
 
@@ -40,6 +41,8 @@ from config import (
     INFERENCE_ENGINE,
     TOTAL_MODEL_LAYERS, DEFAULT_LAYER_CONFIG,
 )
+
+import model_config as mc
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,14 @@ class ModelManager:
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
         self._engine_type: str = ""  # "pytorch" | "llama_cpp"
+
+        # P3: 多模型支持 — 当前活跃的模型 ID
+        self._active_model_id: str = mc.DEFAULT_MODEL_ID
+        self._previous_engine_type: str = ""      # 用于 rollback
+        self._previous_quant_type: Optional[str] = None
+
+        # 并发保护锁 — 防止推理与模型切换之间的数据竞争
+        self._lock = threading.RLock()
 
     @property
     def is_loaded(self) -> bool:
@@ -187,6 +198,8 @@ class ModelManager:
         model_path: str = None,
         quant_type: str = None,
         profile: dict = None,
+        model_id: str = None,
+        engine: str = None,
     ) -> None:
         """
         加载模型，自适应选择推理引擎。
@@ -199,14 +212,230 @@ class ModelManager:
             model_path: 本地模型路径，默认使用 config.MODEL_PATH
             quant_type: PyTorch 量化精度 "fp16" | "int8" | "int4"
             profile: 设备画像 dict
+            model_id: 模型唯一标识（P3多模型支持）。
+                      若提供且 model_path 未指定，从 model_config 查找路径。
         """
-        # 确定引擎
-        self._engine_type = self.select_engine(profile)
+        # P3: 多模型支持 — 根据 model_id 解析路径
+        resolved_path = model_path
+        resolved_id = model_id or mc.DEFAULT_MODEL_ID
+
+        if not resolved_path and model_id:
+            cfg = mc.get_model_config(model_id)
+            if cfg is None:
+                raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
+            # 优先使用 safetensors 路径，其次 GGUF
+            if cfg.model_path and os.path.isdir(cfg.model_path):
+                resolved_path = cfg.model_path
+            elif cfg.gguf_path and os.path.isfile(cfg.gguf_path):
+                resolved_path = cfg.gguf_path
+            else:
+                raise FileNotFoundError(
+                    f"模型 '{model_id}' 的路径不存在。\n"
+                    f"  safetensors: {cfg.model_path or '(未配置)'}\n"
+                    f"  GGUF: {cfg.gguf_path or '(未配置)'}"
+                )
+
+        # 确定引擎（尊重 model_type 约束）
+        # P3修复: 允许调用者通过 engine 参数强制选择引擎
+        if engine and engine != "auto":
+            resolved_engine = engine
+        else:
+            resolved_engine = self.select_engine(profile)
+        # model_type 强制约束：GGUF-only 模型必须用 llama.cpp；
+        # Safetensors-only 模型在 CPU 上仍需走 PyTorch（或报错）
+        if resolved_id != mc.DEFAULT_MODEL_ID:
+            cfg = mc.get_model_config(resolved_id)
+            if cfg:
+                if cfg.model_type == "gguf" and resolved_engine == "pytorch":
+                    logger.warning(
+                        f"模型 '{resolved_id}' 仅有 GGUF 格式，"
+                        f"引擎从 pytorch 切换为 llama_cpp"
+                    )
+                    resolved_engine = "llama_cpp"
+                elif cfg.model_type == "safetensors" and resolved_engine == "llama_cpp":
+                    logger.warning(
+                        f"模型 '{resolved_id}' 仅有 Safetensors 格式，"
+                        f"引擎保持 pytorch（CPU 推理）"
+                    )
+                    resolved_engine = "pytorch"
+
+        self._engine_type = resolved_engine
 
         if self._engine_type == "llama_cpp":
-            self._load_llama_cpp(model_path, profile)
+            self._load_llama_cpp(resolved_path, profile)
         else:
-            self._load_pytorch(model_path, quant_type, profile)
+            self._load_pytorch(resolved_path, quant_type, profile)
+
+        # 记录活跃模型 ID
+        self._active_model_id = resolved_id
+        self._previous_engine_type = self._engine_type
+        self._previous_quant_type = self.quant_type
+
+    def unload_model(self) -> None:
+        """
+        卸载当前加载的模型，释放 GPU 显存和系统内存。
+
+        同时清理 PyTorch 和 llama.cpp 引擎状态。
+        调用后 is_loaded 返回 False，可安全加载新模型。
+        """
+        logger.info(f"卸载模型: {self._active_model_id} (引擎={self._engine_type})")
+
+        # --- PyTorch 引擎清理 ---
+        if self.model is not None:
+            self.model = None
+
+        if self.tokenizer is not None:
+            self.tokenizer = None
+
+        self.quant_type = None
+        self.layer_range = None
+        self._model_layers = 0
+        self._total_model_layers = 0
+
+        # --- llama.cpp 引擎清理 ---
+        if self._llama_engine is not None:
+            try:
+                if hasattr(self._llama_engine, 'close'):
+                    self._llama_engine.close()
+                elif hasattr(self._llama_engine, 'unload'):
+                    self._llama_engine.unload()
+            except Exception:
+                pass
+            self._llama_engine = None
+
+        # --- GPU 显存回收 ---
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
+        # 重置引擎类型
+        self._engine_type = ""
+        self._active_model_id = ""  # P3修复: 卸载后清空活跃模型ID
+        logger.info("模型已卸载，显存已释放")
+
+    def switch_model(
+        self,
+        model_id: str,
+        quant_type: str = None,
+        profile: dict = None,
+        engine: str = None,
+    ) -> dict:
+        """
+        切换到另一个模型（P3 多模型支持）。
+
+        流程:
+          1. 保存当前模型信息（用于失败时的 best-effort rollback）
+          2. 调用 unload_model() 释放显存
+          3. 查找新模型配置
+          4. 调用 load_model() 加载新模型
+          5. 失败时尝试回滚到上一个模型
+
+        Args:
+            model_id: 目标模型唯一标识
+            quant_type: 量化精度（默认使用当前精度或 QUANT_TYPE）
+            profile: 设备画像
+            engine: 推理引擎 "pytorch" | "llama_cpp" | "auto" (None=auto)
+
+        Returns:
+            {"success": bool, "model_id": str, "model_name": str, "error": str | None}
+        """
+        with self._lock:
+            # 保存回滚信息
+            rollback_model_id = self._active_model_id
+            rollback_model_name = self._active_model_id  # 将在下面尝试获取可读名称
+            rollback_engine = self._previous_engine_type or self._engine_type
+            rollback_quant = self._previous_quant_type or quant_type or QUANT_TYPE
+            had_model = self.is_loaded
+
+            if had_model:
+                # 尝试获取回滚模型的可读名称
+                try:
+                    rollback_cfg = mc.get_model_config(rollback_model_id)
+                    if rollback_cfg:
+                        rollback_model_name = rollback_cfg.name
+                except Exception:
+                    pass
+
+            logger.info(
+                f"切换模型: {rollback_model_id} -> {model_id} "
+                f"(quant={quant_type}, engine={engine or 'auto'}, "
+                f"profile_tier={profile.get('tier', '?') if profile else '?'})"
+            )
+
+            # 步骤 1: 卸载当前模型
+            if had_model:
+                try:
+                    self.unload_model()
+                except Exception as e:
+                    logger.warning(f"卸载当前模型时出现异常（继续切换）: {e}")
+
+            # 步骤 2: 加载新模型
+            try:
+                cfg = mc.get_model_config(model_id)
+                if cfg is None:
+                    return {
+                        "success": False,
+                        "model_id": model_id,
+                        "model_name": model_id,
+                        "error": f"模型 '{model_id}' 未在注册表中找到。请先注册或下载模型文件。",
+                    }
+                self.load_model(model_id=model_id, quant_type=quant_type,
+                                profile=profile, engine=engine)
+                return {
+                    "success": True,
+                    "model_id": self._active_model_id,
+                    "model_name": cfg.name,
+                    "error": None,
+                }
+            except Exception as e:
+                logger.error(f"加载模型 '{model_id}' 失败: {e}")
+
+                # 步骤 3: best-effort 回滚（含同模型重载失败的情况）
+                if had_model and rollback_model_id:
+                    logger.info(f"尝试回滚到上一个模型: {rollback_model_id}")
+                    try:
+                        self.unload_model()
+                        self.load_model(
+                            model_id=rollback_model_id,
+                            quant_type=rollback_quant,
+                            profile=profile,
+                            engine=rollback_engine if rollback_engine else None,
+                        )
+                        return {
+                            "success": False,
+                            "model_id": rollback_model_id,
+                            "model_name": rollback_model_name,
+                            "error": f"模型 '{model_id}' 加载失败: {e}。已回滚到 '{rollback_model_name}'。",
+                        }
+                    except Exception as rollback_err:
+                        logger.error(f"回滚也失败: {rollback_err}")
+                        return {
+                            "success": False,
+                            "model_id": None,
+                            "model_name": "",
+                            "error": f"模型 '{model_id}' 加载失败: {e}。回滚也失败: {rollback_err}。",
+                        }
+
+                return {
+                    "success": False,
+                    "model_id": None,
+                    "model_name": "",
+                    "error": f"模型 '{model_id}' 加载失败: {e}",
+                }
+
+    @property
+    def active_model_id(self) -> str:
+        """当前活跃的模型 ID。"""
+        return self._active_model_id
 
     def load_layer_range(
         self,
@@ -497,6 +726,10 @@ class ModelManager:
         """统计模型的 Transformer 层数"""
         if self.model is None:
             return 0
+        # Qwen2 使用 model.model.layers
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            return len(self.model.model.layers)
+        # GPT-2 / 旧 Llama 使用 model.transformer.h
         if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
             return len(self.model.transformer.h)
         return 0
@@ -655,16 +888,63 @@ class ModelManager:
                 **kwargs,
             )
         elif self._engine_type == "pytorch":
-            # PyTorch 流式: 暂时回退到非流式（后续可用 TextStreamer 实现）
-            result = self._pytorch_chat(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                **kwargs,
+            if self.model is None or self.tokenizer is None:
+                raise RuntimeError("PyTorch 模型未加载，请先调用 load_model()")
+
+            try:
+                from transformers import TextIteratorStreamer
+            except ImportError:
+                # 降级：transformers 版本过旧，回退到非流式
+                logger.warning("TextIteratorStreamer 不可用，回退到非流式")
+                result = self._pytorch_chat(
+                    messages=messages, max_tokens=max_tokens,
+                    temperature=temperature, top_p=top_p, stop=stop, **kwargs,
+                )
+                yield result["content"]
+                return
+
+            # 构建输入
+            try:
+                input_text = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                input_text = self._build_qwen_prompt(messages)
+
+            inputs = self.tokenizer(input_text, return_tensors="pt")
+            inputs = {k: v.to(self.get_device()) for k, v in inputs.items()}
+
+            streamer = TextIteratorStreamer(
+                self.tokenizer, skip_prompt=True, skip_special_tokens=True,
             )
-            yield result["content"]
+            generation_kwargs = dict(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature if temperature > 0 else 1.0,
+                top_p=top_p,
+                do_sample=temperature > 0,
+                pad_token_id=self.tokenizer.eos_token_id,
+                streamer=streamer,
+            )
+
+            import threading
+            t0 = time.time()
+            thread = threading.Thread(
+                target=self.model.generate, kwargs=generation_kwargs,
+            )
+            thread.start()
+
+            chunk_count = 0
+            for text in streamer:
+                if text:
+                    chunk_count += 1
+                    yield text
+
+            thread.join()
+            elapsed = time.time() - t0
+            logger.info(
+                f"流式推理完成 (PyTorch): {chunk_count} chunks / {elapsed:.1f}s"
+            )
         else:
             raise RuntimeError(f"未知引擎类型: {self._engine_type}")
 
@@ -959,9 +1239,12 @@ class ModelManager:
     def get_model_info(self) -> dict:
         """获取模型基本信息，用于调试与日志（双引擎兼容）"""
         if self._engine_type == "llama_cpp" and self._llama_engine:
-            return self._llama_engine.get_model_info()
+            info = self._llama_engine.get_model_info()
+            info["model_id"] = self._active_model_id
+            return info
 
         info = {
+            "model_id": self._active_model_id,
             "engine": "pytorch",
             "model_name": MODEL_NAME,
             "model_path": MODEL_PATH,

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { sendMessage, clearChat, fetchPresets, uploadFile, fetchConversations, deleteConversations, deleteTurn, deleteSession, createSession, activateSession } from '../api/client';
+import { sendMessage, sendMessageStream, clearChat, fetchPresets, uploadFile, fetchConversations, deleteConversations, deleteTurn, deleteSession, createSession, activateSession } from '../api/client';
 
 const CHAT_HISTORY_KEY_PREFIX = 'qlh-chat-history-';
 
@@ -40,6 +40,35 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   }, []);
 
   // ---- 单轮删除 ----
+  const handleCopyMessage = useCallback(async (text) => {
+    const fallbackCopy = () => {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        const ok = document.execCommand('copy');
+        if (!ok) throw new Error('浏览器拒绝复制操作');
+      } finally {
+        document.body.removeChild(textarea);
+      }
+    };
+
+    try {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable');
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        fallbackCopy();
+      }
+      onToast?.({ type: 'success', msg: '回答已复制' });
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `复制失败: ${err.message}` });
+    }
+  }, [onToast]);
+
   const handleDeleteTurn = useCallback(async (turnIndex, msgId) => {
     setDeletingTurn(null);  // 关闭确认弹窗
     try {
@@ -354,69 +383,119 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         effectiveSessionId,
         currentSessionId: currentSessionIdRef.current,
         textPreview: text.slice(0, 30),
-      });
-      const res = await sendMessage(fullMessage, {
-        sessionId: effectiveSessionId,
-        maxNewTokens: settings?.maxNewTokens ?? 512,
-        temperature: settings?.temperature ?? 0.7,
-        topP: settings?.topP ?? 0.9,
-        showThinking: settings?.showThinking ?? false,
+        streamingMode: settings?.streamingMode || 'full',
       });
 
-      // 推理期间用户可能切换了会话——丢弃结果，不污染新会话的消息列表
-      console.log('[ChatPanel] handleSend: response received, checking session match...', {
-        currentSessionId: currentSessionIdRef.current,
-        effectiveSessionId,
-        match: currentSessionIdRef.current === effectiveSessionId,
-      });
-      if (currentSessionIdRef.current !== effectiveSessionId) {
-        console.log('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
-        return;
-      }
-
-      const fullContent = res.content;
+      const useFastStream = settings?.streamingMode === 'fast';
       const msgId = Date.now() + 1;
+      let res;
 
-      // 先插入一个 content 为空的助手消息（显示 typing 动画 → 立即开始逐字输出）
-      const assistantMsg = {
-        role: 'assistant',
-        content: '',
-        thinkingContent: res.thinking_content || '',
-        metrics: res.metrics,
-        followups: res.followups || [],
-        id: msgId,
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
+      if (useFastStream) {
+        // ================================================================
+        // ★ fast 模式：SSE 真流式，逐 token 实时推送
+        // ================================================================
+        // 先插入空的助手消息占位
+        setMessages((prev) => [...prev, {
+          role: 'assistant', content: '',
+          thinkingContent: null, metrics: {}, followups: [],
+          id: msgId,
+        }]);
 
-      // ---- 假流式：逐字符输出 ----
-      // 不再显示 typing dots，直接开始逐字填充
-      let charIndex = 0;
-      const totalLen = fullContent.length;
-      const baseInterval = 18;   // 基础间隔 ms（约 30-55 char/s，贴近真实生成速度）
+        res = await sendMessageStream(fullMessage, {
+          sessionId: effectiveSessionId,
+          maxNewTokens: settings?.maxNewTokens ?? 512,
+          temperature: settings?.temperature ?? 0.7,
+          topP: settings?.topP ?? 0.9,
+          showThinking: settings?.showThinking ?? false,
+          streamingMode: 'fast',
+          onToken: (_token, fullText) => {
+            // 会话切换检测：丢弃已推送的 token
+            if (currentSessionIdRef.current !== effectiveSessionId) return;
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msgId ? { ...m, content: fullText } : m
+              )
+            );
+          },
+        });
 
-      const streamTimer = setInterval(() => {
-        // 每次吐出 1-3 个字符，模拟不均匀生成
-        const burst = 1 + Math.floor(Math.random() * 3);
-        charIndex = Math.min(charIndex + burst, totalLen);
+        // 推理期间用户可能切换了会话——丢弃结果
+        if (currentSessionIdRef.current !== effectiveSessionId) {
+          console.log('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
+          return;
+        }
 
+        // 最终更新：填充完整内容 + 元数据
         setMessages((prev) =>
           prev.map((m) =>
             m.id === msgId
-              ? { ...m, content: fullContent.slice(0, charIndex) }
+              ? { ...m, content: res.content, thinkingContent: res.thinking_content || '', metrics: res.metrics, followups: res.followups || [] }
               : m
           )
         );
+      } else {
+        // ================================================================
+        // full 模式（默认）：使用 /api/chat，完整功能 + 客户端逐字动画
+        // ================================================================
+        res = await sendMessage(fullMessage, {
+          sessionId: effectiveSessionId,
+          maxNewTokens: settings?.maxNewTokens ?? 512,
+          temperature: settings?.temperature ?? 0.7,
+          topP: settings?.topP ?? 0.9,
+          showThinking: settings?.showThinking ?? false,
+        });
 
-        if (charIndex >= totalLen) {
-          clearInterval(streamTimer);
-          // 确保最终完整文本
+        // 推理期间用户可能切换了会话——丢弃结果，不污染新会话的消息列表
+        console.log('[ChatPanel] handleSend: response received, checking session match...', {
+          currentSessionId: currentSessionIdRef.current,
+          effectiveSessionId,
+          match: currentSessionIdRef.current === effectiveSessionId,
+        });
+        if (currentSessionIdRef.current !== effectiveSessionId) {
+          console.log('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
+          return;
+        }
+
+        const fullContent = res.content;
+
+        // 先插入一个 content 为空的助手消息（显示 typing 动画 → 立即开始逐字输出）
+        const assistantMsg = {
+          role: 'assistant',
+          content: '',
+          thinkingContent: res.thinking_content || '',
+          metrics: res.metrics,
+          followups: res.followups || [],
+          id: msgId,
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+
+        // ---- 假流式：逐字符输出 ----
+        let charIndex = 0;
+        const totalLen = fullContent.length;
+        const baseInterval = 18;
+
+        const streamTimer = setInterval(() => {
+          const burst = 1 + Math.floor(Math.random() * 3);
+          charIndex = Math.min(charIndex + burst, totalLen);
+
           setMessages((prev) =>
             prev.map((m) =>
-              m.id === msgId ? { ...m, content: fullContent } : m
+              m.id === msgId
+                ? { ...m, content: fullContent.slice(0, charIndex) }
+                : m
             )
           );
-        }
-      }, baseInterval + Math.random() * 12);  // 18-30ms 随机间隔
+
+          if (charIndex >= totalLen) {
+            clearInterval(streamTimer);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === msgId ? { ...m, content: fullContent } : m
+              )
+            );
+          }
+        }, baseInterval + Math.random() * 12);
+      }
 
       setLastMetrics(res.metrics);
       metricsTrigger?.(res.metrics);
@@ -584,8 +663,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                     </div>
                   )}
                   <div className="bubble">
-                    {/* 单轮删除按钮（仅 assistant 消息，非流式发送中） */}
-                    {msg.role === 'assistant' && msg.content && !sending && (
+                    {/* assistant 消息快捷操作 */}
+                    {msg.role === 'assistant' && msg.content && (
                       <>
                         {isConfirmingDelete ? (
                           <div className="delete-confirm-overlay">
@@ -604,13 +683,24 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                             </button>
                           </div>
                         ) : (
-                          <button
-                            className="message-delete-btn"
-                            onClick={() => setDeletingTurn({ turnIndex, msgId: msg.id })}
-                            title="删除这轮对话"
-                          >
-                            ✕
-                          </button>
+                          <div className="message-actions">
+                            <button
+                              className="message-copy-btn"
+                              onClick={() => handleCopyMessage(msg.content)}
+                              title="复制回答"
+                            >
+                              ⧉
+                            </button>
+                            {!sending && (
+                              <button
+                                className="message-delete-btn"
+                                onClick={() => setDeletingTurn({ turnIndex, msgId: msg.id })}
+                                title="删除这轮对话"
+                              >
+                                ✕
+                              </button>
+                            )}
+                          </div>
                         )}
                       </>
                     )}

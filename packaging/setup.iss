@@ -9,12 +9,12 @@
 ;   1. 已完成 PyInstaller 打包 → dist/QLH-Edge-Inference/
 ;   2. 已安装 Inno Setup 6 (默认路径 C:\Program Files (x86)\Inno Setup 6)
 ;
-; 输出: dist/QLH-Edge-Inference-Setup-v0.1.4.exe
+; 输出: dist/QLH-Edge-Inference-Setup-v0.1.5.exe
 ; ============================================================
 
 #define MyAppName         "QLH Edge Inference"
 #define MyAppNameCN       "轻量化大模型分布式边缘推理系统"
-#define MyAppVersion      "0.1.4"
+#define MyAppVersion      "0.1.5"
 #define MyAppPublisher    "北京交通大学 · 大创项目"
 #define MyAppExeName      "QLH-Edge-Inference.exe"
 #define MyAppSourceDir    "..\dist\QLH-Edge-Inference"
@@ -123,7 +123,7 @@ Filename: "{app}\{#MyAppExeName}"; \
   Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
-; 清理运行时产生的文件（卸载时删除日志和前端缓存，保留模型文件）
+; 清理运行时产生的文件（卸载时删除日志，默认保留模型文件）
 Type: files; Name: "{app}\logs\*"
 Type: dirifempty; Name: "{app}\logs"
 
@@ -165,6 +165,28 @@ begin
       Exec(RemoveQuotes(ExtractFilePath(UninstPath)),
            '/VERYSILENT /SUPPRESSMSGBOXES',
            '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+
+// ---- 卸载时可选删除 models 目录（默认不删除）----
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    if DirExists(ExpandConstant('{app}\models')) then
+    begin
+      if MsgBox(
+        '是否同时删除模型目录？' + #13#10#13#10 +
+        ExpandConstant('{app}\models') + #13#10#13#10 +
+        '注意：模型文件通常较大，重新下载会耗费时间。' + #13#10 +
+        '建议默认保留；只有在彻底清理或释放磁盘空间时选择「是」。',
+        mbConfirmation, MB_YESNO or MB_DEFBUTTON2
+      ) = IDYES then
+      begin
+        DelTree(ExpandConstant('{app}\models'), True, True, True);
+        RemoveDir(ExpandConstant('{app}'));
+      end;
     end;
   end;
 end;

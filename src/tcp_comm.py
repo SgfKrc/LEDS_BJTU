@@ -22,7 +22,10 @@ import socket
 import struct
 import threading
 import time
+import hashlib
+import hmac
 import io
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Callable
@@ -32,6 +35,7 @@ import torch
 from config import (
     SERVER_IP, SERVER_PORT, HEARTBEAT_INTERVAL,
     RECONNECT_MAX_RETRIES, RECONNECT_DELAY,
+    CLUSTER_SECRET, AUTH_TIMESTAMP_WINDOW,
 )
 
 # 尝试导入 psutil 用于网络类型检测
@@ -44,11 +48,84 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class _RegistrationRejected(Exception):
+    """客户端注册被拒绝，调用方应关闭连接且不分发给上层。"""
+
+
 # ================================================================
 # 数据包格式常量
 # ================================================================
 HEADER_LEN = 4          # 长度头字节数（大端序 uint32）
 MAX_PACKET_SIZE = 256 * 1024 * 1024  # 最大包大小 256MB（特征张量可能较大）
+
+
+# ================================================================
+# HMAC 集群认证（阶段 7 — 跨节点安全）
+# ================================================================
+
+def build_auth_signature(node_id: str, timestamp: float = None) -> dict:
+    """
+    为注册消息构建 HMAC 认证签名。
+
+    签名算法: HMAC-SHA256(cluster_secret, "{node_id}:{timestamp}")
+    防重放: timestamp 用于服务端时间窗口校验
+
+    Returns:
+        {"auth_timestamp": float, "auth_signature": str}
+    """
+    ts = timestamp or time.time()
+    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    sig = hmac.new(
+        CLUSTER_SECRET.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+    return {"auth_timestamp": ts, "auth_signature": sig}
+
+
+def verify_auth_signature(node_id: str, auth_data: dict) -> tuple:
+    """
+    验证 HMAC 认证签名。
+
+    检查:
+    1. 时间戳在允许窗口内（防重放攻击）
+    2. HMAC-SHA256 签名匹配
+
+    Args:
+        node_id: 注册节点 ID
+        auth_data: {"auth_timestamp": float, "auth_signature": str}
+
+    Returns:
+        (ok: bool, reason: str)
+    """
+    if not auth_data:
+        return False, "缺少认证签名（auth_timestamp/auth_signature）"
+
+    ts = auth_data.get("auth_timestamp")
+    sig = auth_data.get("auth_signature", "")
+
+    if ts is None:
+        return False, "缺少时间戳（auth_timestamp）"
+    if not sig:
+        return False, "缺少签名（auth_signature）"
+
+    # 1. 时间窗口校验（±5 分钟）
+    now = time.time()
+    drift = abs(now - ts)
+    if drift > AUTH_TIMESTAMP_WINDOW:
+        return False, (
+            f"时间戳偏差过大（{drift:.0f}s > {AUTH_TIMESTAMP_WINDOW}s），"
+            f"请检查系统时钟同步"
+        )
+
+    # 2. HMAC 签名校验
+    message = f"{node_id}:{ts:.6f}".encode("utf-8")
+    expected = hmac.new(
+        CLUSTER_SECRET.encode("utf-8"), message, hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, sig):
+        return False, "HMAC 签名不匹配 — 集群密钥不一致"
+
+    return True, "ok"
 
 
 class MessageType(str, Enum):
@@ -89,6 +166,8 @@ class MessageType(str, Enum):
     CHAIN_FORWARD = "chain_forward"              # 从→从：链式直连层前向转发（P2 优化）
     PIPELINE_DONE = "pipeline_done"              # 主→从：流水线任务完成（清理 KV 缓存）
     PIPELINE_ABORT = "pipeline_abort"            # 主→从：取消流水线任务
+    PIPELINE_PAUSE = "pipeline_pause"            # 主→从：暂停流水线（二期协同抢占，协议预留）
+    PIPELINE_RESUME = "pipeline_resume"          # 主→从：恢复流水线（二期协同抢占，协议预留）
 
 
 # ================================================================
@@ -159,7 +238,7 @@ def detect_network_type() -> str:
                         if detected != "unknown":
                             break
                 except Exception:
-                    pass  # 无法判断，保持 unknown
+                    logger.debug("默认路由接口检测失败，保持 unknown", exc_info=True)
             else:
                 # 无法根据名称判断，通过实际接口类型判断
                 for iface, stat in stats.items():
@@ -169,7 +248,7 @@ def detect_network_type() -> str:
                         pass  # 已在上面处理
 
         except Exception:
-            pass  # psutil 检测失败，回退到基本判断
+            logger.debug("psutil 网络类型检测失败，回退到基本判断", exc_info=True)
 
     # 如果 psutil 不可用或检测失败，尝试通过 Windows 命令检测
     if detected == "unknown" and hasattr(socket, '_LOCALHOST'):
@@ -188,7 +267,7 @@ def detect_network_type() -> str:
                     # Windows 通常同时有WiFi和以太网，检查哪个是连接的
                     detected = "ethernet"  # 以太网优先（更稳定）
         except Exception:
-            pass
+            logger.debug("Windows netsh 网络类型检测失败", exc_info=True)
 
     logger.debug(f"检测到网络类型: {detected}")
     return detected
@@ -258,7 +337,7 @@ def detect_lan_ip() -> str:
                 logger.info(f"检测到组网 IP (Tailscale/ZeroTier): {ip} (接口: {overlay_candidates[0][1]})")
                 return ip
         except Exception:
-            pass
+            logger.debug("组网 IP (Tailscale/ZeroTier) 检测失败，尝试物理网卡", exc_info=True)
 
     # ---- 策略 2: psutil 枚举物理网络接口 ----
     if _HAS_PSUTIL:
@@ -304,7 +383,7 @@ def detect_lan_ip() -> str:
                 logger.info(f"检测到局域网 IP (psutil): {ip} (接口: {candidates[0][1]})")
                 return ip
         except Exception:
-            pass
+            logger.debug("psutil 局域网 IP 检测失败，尝试 UDP 默认路由", exc_info=True)
 
     # ---- 策略 3: UDP 默认路由 IP ----
     try:
@@ -317,7 +396,7 @@ def detect_lan_ip() -> str:
             logger.info(f"检测到局域网 IP (UDP): {ip}")
             return ip
     except Exception:
-        pass
+        logger.debug("UDP 默认路由 IP 检测失败，尝试 hostname", exc_info=True)
 
     # ---- 策略 4: gethostbyname 兜底 ----
     try:
@@ -327,7 +406,7 @@ def detect_lan_ip() -> str:
             logger.info(f"检测到局域网 IP (hostname): {ip} ({hostname})")
             return ip
     except Exception:
-        pass
+        logger.debug("hostname 局域网 IP 检测失败", exc_info=True)
 
     logger.warning("无法检测局域网 IP，回退到 127.0.0.1")
     return "127.0.0.1"
@@ -433,7 +512,7 @@ def get_mac_addresses() -> list[str]:
                 logger.info(f"检测到物理网卡 MAC: {macs}")
                 return macs
         except Exception as e:
-            logger.debug(f"psutil MAC 检测失败: {e}")
+            logger.debug(f"psutil MAC 检测失败: {e}", exc_info=True)
 
     # 策略 2: uuid.getnode() 兜底（返回单一 MAC）
     try:
@@ -445,7 +524,7 @@ def get_mac_addresses() -> list[str]:
                 logger.info(f"检测到 MAC (uuid): {mac}")
                 return [mac]
     except Exception:
-        pass
+        logger.debug("uuid.getnode MAC 检测失败，尝试 Windows getmac", exc_info=True)
 
     # 策略 3: Windows subprocess 兜底
     try:
@@ -469,7 +548,7 @@ def get_mac_addresses() -> list[str]:
                 logger.info(f"检测到 MAC (getmac): {macs}")
                 return macs
     except Exception:
-        pass
+        logger.debug("Windows getmac MAC 检测失败", exc_info=True)
 
     logger.warning("无法检测到任何有效 MAC 地址")
     return []
@@ -698,6 +777,7 @@ class ClientConn:
     sock: socket.socket
     addr: tuple                  # (ip, port)
     role: str = ""               # 节点角色
+    node_type: str = "pc"        # 设备平台: "pc" | "android"
     hostname: str = ""           # 客户端主机名
     device_info: dict = None     # 客户端设备信息
     network_type: str = "unknown"  # 网络连接类型: wifi | ethernet | unknown
@@ -724,6 +804,7 @@ class TCPServer:
         self.port = port or SERVER_PORT
         self.sock: Optional[socket.socket] = None
         self.clients: dict[str, ClientConn] = {}     # client_id -> ClientConn
+        self._clients_lock = threading.RLock()       # 保护 clients 的跨线程访问
         self._running = False
         self._accept_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -760,6 +841,41 @@ class TCPServer:
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
 
+    # ---- clients 线程安全访问 ----
+
+    def _get_client(self, client_id: str) -> Optional[ClientConn]:
+        """线程安全获取客户端连接。"""
+        with self._clients_lock:
+            return self.clients.get(client_id)
+
+    def _set_client(self, client_id: str, conn: ClientConn) -> None:
+        """线程安全设置客户端连接。"""
+        with self._clients_lock:
+            self.clients[client_id] = conn
+
+    def _pop_client(self, client_id: str) -> Optional[ClientConn]:
+        """线程安全移除客户端连接；不存在时返回 None。"""
+        with self._clients_lock:
+            return self.clients.pop(client_id, None)
+
+    def _pop_client_if_same(self, client_id: str,
+                            expected: ClientConn) -> Optional[ClientConn]:
+        """仅当当前连接对象仍是 expected 时才移除，避免误删新连接。"""
+        with self._clients_lock:
+            if self.clients.get(client_id) is expected:
+                return self.clients.pop(client_id, None)
+            return None
+
+    def _client_ids_snapshot(self) -> list[str]:
+        """线程安全获取客户端 ID 快照。"""
+        with self._clients_lock:
+            return list(self.clients.keys())
+
+    def _client_items_snapshot(self) -> list[tuple[str, ClientConn]]:
+        """线程安全获取客户端连接快照。"""
+        with self._clients_lock:
+            return list(self.clients.items())
+
     # ---- Accept 循环 ----
 
     def _accept_loop(self) -> None:
@@ -781,7 +897,7 @@ class TCPServer:
                 continue  # 正常超时，继续循环
             except OSError as e:
                 if self._running:
-                    logger.error(f"Accept 异常: {e}")
+                    logger.error(f"Accept 异常: {e}", exc_info=True)
                 break
         logger.info("Accept 循环已退出")
 
@@ -831,7 +947,15 @@ class TCPServer:
                 # ---- 消息分发 ----
                 if msg_type == MessageType.REGISTER.value:
                     # 注册消息：提取客户端身份信息
-                    client_id = self._handle_registration(conn, addr, temp_id, msg)
+                    try:
+                        client_id = self._handle_registration(conn, addr, temp_id, msg)
+                    except _RegistrationRejected as e:
+                        logger.info(f"注册被拒，关闭连接: {addr[0]}:{addr[1]} — {e}")
+                        try:
+                            conn.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        break
                     # 更新 recv 线程映射
                     if temp_id in self._recv_threads:
                         del self._recv_threads[temp_id]
@@ -846,26 +970,38 @@ class TCPServer:
                     try:
                         self.on_message(client_id, msg)
                     except Exception as e:
-                        logger.error(f"消息回调异常: {e}")
+                        logger.error(f"消息回调异常: {e}", exc_info=True)
 
         except socket.timeout:
             logger.info(f"客户端 {client_id} 接收超时")
         except (ConnectionError, OSError) as e:
-            logger.warning(f"客户端 {client_id} 连接异常: {e}")
+            logger.warning(f"客户端 {client_id} 连接异常: {e}", exc_info=True)
         finally:
             # 清理
-            conn.close()
-            if client_id in self.clients:
-                logger.info(f"客户端 {client_id} 已断开: {self.clients[client_id].addr}")
-                del self.clients[client_id]
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+            removed = None
+            if client_id != temp_id:
+                current = self._get_client(client_id)
+                if current is not None and current.sock is conn:
+                    removed = self._pop_client_if_same(client_id, current)
+
+            if removed is not None:
+                logger.info(f"客户端 {client_id} 已断开: {removed.addr}")
+            else:
+                logger.debug(f"未注册或已清理连接已断开: {client_id} addr={addr}")
+
             if client_id in self._recv_threads:
                 del self._recv_threads[client_id]
-            # 通知上层断连
-            if self.on_disconnect and client_id != temp_id:
+            # 通知上层断连（仅对本线程实际移除的已注册连接通知一次）
+            if self.on_disconnect and removed is not None:
                 try:
                     self.on_disconnect(client_id)
                 except Exception as e:
-                    logger.error(f"断连回调异常: {e}")
+                    logger.error(f"断连回调异常: {e}", exc_info=True)
 
     def _handle_registration(self, conn: socket.socket, addr: tuple,
                              temp_id: str, msg: dict) -> str:
@@ -878,9 +1014,28 @@ class TCPServer:
         data = msg.get("data", {})
         client_id = data.get("client_id", temp_id)
         role = data.get("role", "unknown")
+        node_type = data.get("node_type", "pc")
         hostname = data.get("hostname", "unknown")
         device_info = data.get("device_info", {})
         network_type = data.get("network_type", "unknown")
+
+        # ★ 阶段 7：HMAC 集群认证
+        auth_ok, auth_reason = verify_auth_signature(
+            client_id, data.get("auth", {})
+        )
+        if not auth_ok:
+            logger.error(
+                f"⛔ 认证失败: {client_id}@{addr[0]}:{addr[1]} — {auth_reason}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": f"认证失败: {auth_reason}",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError as e:
+                logger.debug(f"认证失败 ACK 发送失败: {e}", exc_info=True)
+            raise _RegistrationRejected(f"认证失败: {auth_reason}")
 
         # ★ 安全：拒绝 client_id="master" 或 role="master" 的注册
         if client_id == "master":
@@ -894,9 +1049,9 @@ class TCPServer:
             })
             try:
                 conn.sendall(ack)
-            except OSError:
-                pass
-            return temp_id  # 返回临时 ID，后续会被清理
+            except OSError as e:
+                logger.debug(f"注册拒绝 ACK 发送失败: {e}", exc_info=True)
+            raise _RegistrationRejected("client_id 'master' 是保留字")
         if role == "master":
             logger.error(
                 f"⛔ 拒绝注册: 从节点不能声明 role='master'，"
@@ -908,20 +1063,36 @@ class TCPServer:
             })
             try:
                 conn.sendall(ack)
-            except OSError:
-                pass
-            return temp_id
+            except OSError as e:
+                logger.debug(f"注册拒绝 ACK 发送失败: {e}", exc_info=True)
+            raise _RegistrationRejected("从节点不能声明 role='master'")
+        # Android 节点只能作为 client
+        if node_type == "android" and role == "master":
+            logger.error(
+                f"⛔ 拒绝注册: Android 节点不能担任 master 角色，"
+                f"来源 {addr[0]}:{addr[1]}"
+            )
+            ack = build_message(MessageType.REGISTER, {
+                "status": "rejected",
+                "reason": "Android 节点不能担任 master 角色",
+            })
+            try:
+                conn.sendall(ack)
+            except OSError as e:
+                logger.debug(f"注册拒绝 ACK 发送失败: {e}", exc_info=True)
+            raise _RegistrationRejected("Android 节点不能担任 master 角色")
 
         client_conn = ClientConn(
             client_id=client_id,
             sock=conn,
             addr=addr,
             role=role,
+            node_type=node_type,
             hostname=hostname,
             device_info=device_info,
             network_type=network_type,
         )
-        self.clients[client_id] = client_conn
+        self._set_client(client_id, client_conn)
         logger.info(
             f"✅ 节点注册成功: {client_id} role={role} "
             f"hostname={hostname} addr={addr[0]}:{addr[1]}"
@@ -935,15 +1106,16 @@ class TCPServer:
         try:
             conn.sendall(ack)
         except OSError as e:
-            logger.warning(f"注册确认发送失败: {e}")
+            logger.warning(f"注册确认发送失败: {e}", exc_info=True)
 
         return client_id
 
     def _handle_heartbeat(self, client_id: str, msg: dict = None) -> None:
         """处理心跳消息：更新时间戳并回复 ACK（回显客户端时间戳用于 RTT 测量）"""
-        if client_id in self.clients:
-            self.clients[client_id].last_heartbeat = time.time()
-            self.clients[client_id].heartbeat_missed = 0
+        conn = self._get_client(client_id)
+        if conn:
+            conn.last_heartbeat = time.time()
+            conn.heartbeat_missed = 0
             # 提取客户端发送时间戳，原样回显
             echo_data = None
             if msg and isinstance(msg.get("data"), dict):
@@ -953,9 +1125,9 @@ class TCPServer:
             # 回复 ACK
             try:
                 ack = build_message(MessageType.HEARTBEAT_ACK, echo_data)
-                self.clients[client_id].sock.sendall(ack)
-            except OSError:
-                pass  # 心跳回复失败由断线检测处理
+                conn.sock.sendall(ack)
+            except OSError as e:
+                logger.debug(f"心跳 ACK 发送失败: client={client_id}, error={e}", exc_info=True)
 
     def send_to_client(self, client_id: str, data: Any,
                        msg_type: MessageType = MessageType.TENSOR) -> None:
@@ -967,22 +1139,23 @@ class TCPServer:
             data: 发送数据（dict / torch.Tensor）
             msg_type: 消息类型
         """
-        if client_id not in self.clients:
+        conn = self._get_client(client_id)
+        if conn is None:
             raise ConnectionError(f"从节点 {client_id} 未连接")
         packet = build_message(msg_type, data)
         try:
-            self.clients[client_id].sock.sendall(packet)
+            conn.sock.sendall(packet)
         except OSError as e:
             raise ConnectionError(f"向 {client_id} 发送失败: {e}")
 
     def broadcast(self, data: Any,
                   msg_type: MessageType = MessageType.TASK_START) -> None:
         """向所有从节点广播消息"""
-        for cid in list(self.clients.keys()):
+        for cid in self._client_ids_snapshot():
             try:
                 self.send_to_client(cid, data, msg_type)
             except ConnectionError as e:
-                logger.warning(f"广播跳过 {cid}: {e}")
+                logger.warning(f"广播跳过 {cid}: {e}", exc_info=True)
 
     def send_layer_config(self, client_id: str, assignment: dict) -> None:
         """向指定从节点推送分层配置"""
@@ -995,12 +1168,12 @@ class TCPServer:
         Args:
             assignments: {client_id: {start_layer, end_layer, has_embedding, has_lm_head}}
         """
-        for cid in list(self.clients.keys()):
+        for cid in self._client_ids_snapshot():
             if cid in assignments:
                 try:
                     self.send_layer_config(cid, assignments[cid])
                 except ConnectionError as e:
-                    logger.warning(f"分层配置推送跳过 {cid}: {e}")
+                    logger.warning(f"分层配置推送跳过 {cid}: {e}", exc_info=True)
 
     # ---- 心跳检测 ----
 
@@ -1009,7 +1182,7 @@ class TCPServer:
         while self._running:
             time.sleep(HEARTBEAT_INTERVAL)
             now = time.time()
-            for cid, conn in list(self.clients.items()):
+            for cid, conn in self._client_items_snapshot():
                 elapsed = now - conn.last_heartbeat
                 if elapsed > HEARTBEAT_INTERVAL * (self.MAX_HEARTBEAT_MISSED + 1):
                     conn.heartbeat_missed = self.MAX_HEARTBEAT_MISSED + 1
@@ -1022,27 +1195,28 @@ class TCPServer:
                         conn.sock.close()
                     except OSError:
                         pass
-                    del self.clients[cid]
-                    # 通知上层
-                    if self.on_disconnect:
+                    removed = self._pop_client_if_same(cid, conn)
+                    # 通知上层（仅本线程实际移除连接时通知一次）
+                    if removed is not None and self.on_disconnect:
                         try:
                             self.on_disconnect(cid)
                         except Exception as e:
-                            logger.error(f"断连回调异常: {e}")
+                            logger.error(f"断连回调异常: {e}", exc_info=True)
 
     def get_client_ids(self) -> list:
         """获取所有已连接客户端 ID 列表"""
-        return list(self.clients.keys())
+        return self._client_ids_snapshot()
 
     def get_client_info(self, client_id: str) -> Optional[dict]:
         """获取指定客户端的连接信息"""
-        if client_id not in self.clients:
+        c = self._get_client(client_id)
+        if c is None:
             return None
-        c = self.clients[client_id]
         return {
             "client_id": c.client_id,
             "addr": f"{c.addr[0]}:{c.addr[1]}",
             "role": c.role,
+            "node_type": c.node_type,
             "hostname": c.hostname,
             "device_info": c.device_info,
             "network_type": c.network_type,
@@ -1054,12 +1228,14 @@ class TCPServer:
     def stop(self) -> None:
         """停止服务端"""
         self._running = False
-        for conn in self.clients.values():
+        with self._clients_lock:
+            conns = list(self.clients.values())
+            self.clients.clear()
+        for conn in conns:
             try:
                 conn.sock.close()
             except OSError:
                 pass
-        self.clients.clear()
         if self.sock:
             try:
                 self.sock.close()
@@ -1076,11 +1252,13 @@ class TCPClient:
     """TCP 客户端：从节点使用，连接主节点"""
 
     def __init__(self, server_host: str = None, server_port: int = None,
-                 client_id: str = None, role: str = None):
+                 client_id: str = None, role: str = None,
+                 node_type: str = "pc"):
         self.server_host = server_host or SERVER_IP
         self.server_port = server_port or SERVER_PORT
         self.client_id = client_id or f"client_{socket.gethostname()}"
         self.role = role or "client"
+        self.node_type = node_type
         self.sock: Optional[socket.socket] = None
         self._running = False
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -1090,6 +1268,63 @@ class TCPClient:
         self._registered = False
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
+
+    @staticmethod
+    def _compute_local_model_sha256() -> str:
+        """
+        计算本地模型文件的 SHA256（用于注册时上报）。
+
+        优先级:
+        1. 读取已有的 .sha256 缓存文件
+        2. 计算实际模型文件的 SHA256
+        3. 无法获取时返回空字符串
+        """
+        import config as cfg
+
+        # 尝试 GGUF 模型路径
+        gguf_path = getattr(cfg, 'GGUF_MODEL_PATH', '')
+        if gguf_path and os.path.isfile(gguf_path):
+            sha256_file = gguf_path + ".sha256"
+            if os.path.isfile(sha256_file):
+                try:
+                    with open(sha256_file, "r") as f:
+                        return f.read().strip().split()[0]
+                except Exception:
+                    pass
+            # 计算并缓存
+            try:
+                h = hashlib.sha256()
+                with open(gguf_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        h.update(chunk)
+                result = h.hexdigest()
+                with open(sha256_file, "w") as f:
+                    f.write(f"{result}  {os.path.basename(gguf_path)}\n")
+                return result
+            except Exception:
+                pass
+
+        # 尝试 Safetensors 模型目录
+        model_path = getattr(cfg, 'MODEL_PATH', '')
+        if model_path and os.path.isdir(model_path):
+            # 计算目录下所有 .safetensors 文件的组合 SHA256
+            try:
+                files = sorted([
+                    f for f in os.listdir(model_path)
+                    if f.endswith('.safetensors') or f.endswith('.bin')
+                ])
+                if files:
+                    h = hashlib.sha256()
+                    for fname in files:
+                        fpath = os.path.join(model_path, fname)
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(8192), b""):
+                                h.update(chunk)
+                    return h.hexdigest()
+            except Exception:
+                pass
+
+        return ""
 
     def connect(self, on_message: Callable = None) -> bool:
         """
@@ -1122,7 +1357,7 @@ class TCPClient:
                     profiler = get_profile()
                     _device_info = profiler.to_dict()
                 except Exception as e:
-                    logger.warning(f"设备画像收集失败，使用基础信息: {e}")
+                    logger.warning(f"设备画像收集失败，使用基础信息: {e}", exc_info=True)
                     _device_info = {
                         "platform": _platform.system(),
                         "machine": _platform.machine(),
@@ -1132,9 +1367,12 @@ class TCPClient:
                 reg_data = {
                     "client_id": self.client_id,
                     "role": self.role,
+                    "node_type": self.node_type,
                     "hostname": _platform.node(),
                     "network_type": network_type,
                     "device_info": _device_info,
+                    "model_sha256": self._compute_local_model_sha256(),
+                    "auth": build_auth_signature(self.client_id),
                 }
                 self.send_data(reg_data, MessageType.REGISTER)
 
@@ -1147,7 +1385,7 @@ class TCPClient:
                             self._registered = True
                             logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
                 except (socket.timeout, OSError) as e:
-                    logger.warning(f"注册确认等待超时: {e}")
+                    logger.warning(f"注册确认等待超时: {e}", exc_info=True)
 
                 # 启动心跳线程
                 self._heartbeat_thread = threading.Thread(
@@ -1177,7 +1415,8 @@ class TCPClient:
             except OSError as e:
                 logger.warning(
                     f"连接异常 (尝试 {attempt+1}/{RECONNECT_MAX_RETRIES}): {e} → "
-                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试..."
+                    f"{self.server_host}:{self.server_port}，{RECONNECT_DELAY}s 后重试...",
+                    exc_info=True,
                 )
                 time.sleep(RECONNECT_DELAY)
 
@@ -1199,10 +1438,15 @@ class TCPClient:
                     try:
                         self.on_message(msg)
                     except Exception as e:
-                        logger.error(f"消息回调异常: {e}")
+                        logger.error(f"消息回调异常: {e}", exc_info=True)
             except socket.timeout:
                 continue
-            except (ConnectionError, OSError):
+            except (ConnectionError, OSError) as e:
+                logger.warning(
+                    f"客户端接收循环连接异常: {self.client_id} "
+                    f"→ {self.server_host}:{self.server_port}, error={e}",
+                    exc_info=True,
+                )
                 break
         logger.info(f"接收循环已退出: {self.client_id}")
 
@@ -1285,20 +1529,31 @@ class TCPClient:
                 if self.on_heartbeat:
                     try:
                         self.on_heartbeat()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"on_heartbeat 回调异常: {e}", exc_info=True)
                 time.sleep(HEARTBEAT_INTERVAL)
-            except (ConnectionError, OSError):
-                logger.warning("心跳发送失败，尝试重连...")
+            except (ConnectionError, OSError) as e:
+                logger.warning(f"心跳发送失败，尝试重连: {e}", exc_info=True)
                 self._reconnect()
 
     def _reconnect(self) -> None:
         """断线重连"""
+        logger.info(
+            f"开始重连主节点: client={self.client_id}, "
+            f"target={self.server_host}:{self.server_port}"
+        )
         self._running = False
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
             self.sock = None
-        self.connect(self.on_message)
+        ok = self.connect(self.on_message)
+        if ok:
+            logger.info(f"重连主节点成功: client={self.client_id}")
+        else:
+            logger.error(f"重连主节点失败: client={self.client_id}")
 
     @property
     def is_registered(self) -> bool:

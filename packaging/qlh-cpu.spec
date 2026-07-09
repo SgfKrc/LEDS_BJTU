@@ -158,7 +158,7 @@ a = Analysis(
         'asyncio',
     ],
     hookspath=[],
-    runtime_hooks=['packaging/pyi_rthook_ssl.py'],
+    runtime_hooks=[os.path.join(SPECPATH, 'pyi_rthook_ssl.py')],
     excludes=[
         'tkinter',
         'test',
@@ -171,15 +171,16 @@ pyz = PYZ(a.pure, a.zipped_data)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [],                    # ★ onedir: 二进制 DLL 不嵌入 EXE（由 COLLECT 放入 _internal/）
+    [],                    # ★ onedir: 数据文件不嵌入 EXE（由 COLLECT 放入 _internal/）
     [],
     name='QLH-Edge-Inference',
     icon='leds.ico',
-    console=True,
+    console=False,  # ★ 静默模式：不显示控制台窗口，日志写文件
     debug=False,
     strip=True,
     upx=False,
+    exclude_binaries=True, # ★ 关键：EXE 不包含任何二进制依赖
 )
 
 coll = COLLECT(
