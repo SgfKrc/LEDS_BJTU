@@ -1607,6 +1607,162 @@ input:focus, textarea:focus { border-color: var(--accent); }
   color: var(--accent-hover);
 }
 
+/* ================================================================
+   L3: 日志管理增强样式
+   ================================================================ */
+
+/* 日志统计摘要栏 */
+.log-stats-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* 日志子区域 */
+.log-subsection {
+  margin-top: 10px;
+}
+
+.log-subsection-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.log-subsection-header h4 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+/* Level 过滤芯片 */
+.log-level-filters {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.log-level-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.log-level-chip:hover {
+  border-color: var(--text-muted);
+}
+
+.log-level-chip.active {
+  color: #fff;
+  border-color: transparent;
+}
+
+.log-level-chip.active.level-error   { background: #e74c3c; }
+.log-level-chip.active.level-warning { background: #f39c12; color: #333; }
+.log-level-chip.active.level-info    { background: #3498db; }
+.log-level-chip.active.level-debug   { background: #7f8c8d; }
+/* 默认 active 无 level 类 = 全部 */
+.log-level-chip.active:not(.level-error):not(.level-warning):not(.level-info):not(.level-debug) {
+  background: var(--accent);
+}
+
+/* 最近日志列表 */
+.recent-logs-list {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+}
+
+.recent-log-entry {
+  display: flex;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: monospace;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.08s;
+}
+
+.recent-log-entry:last-child {
+  border-bottom: none;
+}
+
+.recent-log-entry:hover {
+  background: var(--bg-input);
+}
+
+/* Level 颜色边框指示 */
+.recent-log-entry.level-error   { border-left: 3px solid #e74c3c; }
+.recent-log-entry.level-warning { border-left: 3px solid #f39c12; }
+.recent-log-entry.level-info    { border-left: 3px solid #3498db; }
+.recent-log-entry.level-debug   { border-left: 3px solid #95a5a6; }
+
+.recent-log-level {
+  display: inline-block;
+  min-width: 44px;
+  padding: 0 4px;
+  border-radius: 3px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.6;
+  flex-shrink: 0;
+}
+
+.recent-log-level.error   { background: #fde8e8; color: #c0392b; }
+.recent-log-level.warning { background: #fef3cd; color: #856404; }
+.recent-log-level.info    { background: #d6eaf8; color: #2471a3; }
+.recent-log-level.debug   { background: #eaecee; color: #5d6d7e; }
+
+.recent-log-ts {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.recent-log-msg {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+/* 日志查看弹窗搜索框 */
+.log-search-input {
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.log-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
 /* ============================================================
    浅色主题
    ============================================================ */

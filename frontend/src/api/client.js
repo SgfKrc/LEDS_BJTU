@@ -4,6 +4,19 @@
 
 const BASE = '/api';
 
+function makeApiError(message, { status = 0, requestId = null, path = '' } = {}) {
+  const suffix = requestId ? ` (request_id: ${requestId})` : '';
+  const error = new Error(`${message}${suffix}`);
+  error.detail = message;
+  error.status = status;
+  error.requestId = requestId;
+  error.path = path;
+  if (requestId) {
+    console.error('API request failed', { path, status, requestId, detail: message });
+  }
+  return error;
+}
+
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
   const { signal, ...rest } = options;
@@ -21,8 +34,13 @@ async function request(path, options = {}) {
       data = { detail: text };
     }
   }
+  const requestId = res.headers.get('X-Request-ID') || data.request_id || null;
   if (!res.ok) {
-    throw new Error(data.detail || `HTTP ${res.status}`);
+    throw makeApiError(data.detail || `HTTP ${res.status}`, {
+      status: res.status,
+      requestId,
+      path,
+    });
   }
   return data;
 }
@@ -123,10 +141,11 @@ export async function sendMessageStream(message, opts = {}) {
     }),
   });
 
+  const requestId = res.headers.get('X-Request-ID') || null;
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try { const d = await res.json(); detail = d.detail || detail; } catch (_) {}
-    throw new Error(detail);
+    throw makeApiError(detail, { status: res.status, requestId, path: '/chat/stream' });
   }
 
   const reader = res.body.getReader();
@@ -165,8 +184,17 @@ export async function sendMessageStream(message, opts = {}) {
     } catch (_) {}
   }
 
-  if (!finalResult) throw new Error('未收到流式响应');
-  if (finalResult.error) throw new Error(finalResult.error);
+  const finalRequestId = finalResult?.request_id || finalResult?.metrics?.request_id || requestId;
+  if (!finalResult) {
+    throw makeApiError('未收到流式响应', { status: 0, requestId, path: '/chat/stream' });
+  }
+  if (finalResult.error) {
+    throw makeApiError(finalResult.error, {
+      status: 200,
+      requestId: finalRequestId,
+      path: '/chat/stream',
+    });
+  }
 
   return {
     content: finalResult.response || fullResponse,
@@ -208,9 +236,22 @@ export async function uploadFile(file) {
   formData.append('file', file);
   const url = `${BASE}/chat/upload`;
   const res = await fetch(url, { method: 'POST', body: formData });
-  const data = await res.json();
+  const text = await res.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (_) {
+      data = { detail: text };
+    }
+  }
+  const requestId = res.headers.get('X-Request-ID') || data.request_id || null;
   if (!res.ok) {
-    throw new Error(data.detail || `HTTP ${res.status}`);
+    throw makeApiError(data.detail || `HTTP ${res.status}`, {
+      status: res.status,
+      requestId,
+      path: '/chat/upload',
+    });
   }
   return data;
 }
@@ -468,6 +509,25 @@ export async function deleteAllLogFiles() {
   return request('/logs', { method: 'DELETE' });
 }
 
+export async function fetchRecentLogs(params = {}) {
+  const qs = new URLSearchParams();
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.level) qs.set('level', params.level);
+  if (params.name) qs.set('name', params.name);
+  if (params.node_id) qs.set('node_id', params.node_id);
+  if (params.request_id) qs.set('request_id', params.request_id);
+  const q = qs.toString();
+  return request(`/logs/recent${q ? '?' + q : ''}`);
+}
+
+export async function fetchLogStats() {
+  return request('/logs/stats');
+}
+
+export function getLogDownloadUrl(filename) {
+  return `${BASE}/logs/download?name=${encodeURIComponent(filename)}`;
+}
+
 // ---- P3: 主节点转让审查 ----
 
 export async function createReviewTicket(targetNodeId, reason, timeoutHours) {
@@ -523,6 +583,66 @@ export async function deleteResolvedReviewTickets() {
 
 export async function fetchQueue() {
   return request('/cluster/queue');
+}
+
+
+// ============================================================
+// L5: 前端错误上报
+// ============================================================
+
+let _errorReporterInstalled = false;
+
+/**
+ * 安装全局前端错误上报处理器。
+ * 捕获 window.onerror 和 unhandledrejection 并发送到后端诊断日志。
+ * 仅在生产环境生效（import.meta.env.PROD），且仅安装一次。
+ */
+export function installErrorReporter() {
+  if (_errorReporterInstalled) return;
+  _errorReporterInstalled = true;
+
+  // 仅在非开发模式下启用自动上报（DEV 下错误在 console 可见）
+  if (import.meta.env.DEV) return;
+
+  const sendError = (report) => {
+    const url = `${BASE}/logs/client-error`;
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: (report.message || '').slice(0, 500),
+        source: report.source || 'unknown',
+        stack: (report.stack || '').slice(0, 2000),
+        url: report.url || '',
+        line: report.line || 0,
+        col: report.col || 0,
+        user_agent: navigator.userAgent || '',
+        extra: report.extra || {},
+      }),
+    }).catch(() => { /* 上报失败不触发进一步错误 */ });
+  };
+
+  // 全局未捕获异常
+  window.addEventListener('error', (e) => {
+    sendError({
+      source: 'window.onerror',
+      message: e.message || 'Unknown error',
+      stack: e.error?.stack || '',
+      url: e.filename || window.location.href,
+      line: e.lineno || 0,
+      col: e.colno || 0,
+    });
+  });
+
+  // 未处理的 Promise 拒绝
+  window.addEventListener('unhandledrejection', (e) => {
+    sendError({
+      source: 'unhandledrejection',
+      message: e.reason?.message || String(e.reason || 'Unhandled rejection'),
+      stack: e.reason?.stack || '',
+      url: window.location.href,
+    });
+  });
 }
 
 export async function setQueueStrategy(strategy) {

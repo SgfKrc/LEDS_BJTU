@@ -95,9 +95,11 @@ export default function App() {
   // 初始化主题
   useEffect(() => { applyTheme(theme); }, [theme]);
 
-  // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复
+  // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复 + L5 错误上报
   useEffect(() => {
-    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings }) => {
+    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings, installErrorReporter }) => {
+      // L5: 安装全局前端错误上报（仅在 PROD 生效）
+      installErrorReporter();
       // 获取角色
       fetchMyRole()
         .then(setMyRole)
