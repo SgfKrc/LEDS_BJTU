@@ -238,6 +238,12 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 .model-card:hover { border-color: var(--text-muted); }
 .model-card.active { border-color: var(--accent); background: var(--accent-dim); }
+.model-card.compact { padding: 10px 12px; }
+.model-card.disabled {
+  opacity: 0.72;
+  cursor: not-allowed;
+  border-style: dashed;
+}
 .model-card .model-name {
   font-size: 14px;
   font-weight: 600;
@@ -253,6 +259,31 @@ input:focus, textarea:focus { border-color: var(--accent); }
   margin-top: 6px;
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
+}
+.model-select-row {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.model-select {
+  width: 100%;
+  min-height: 34px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+.model-unavailable-note {
+  margin-top: 8px;
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.quant-selector {
+  margin-top: 10px;
 }
 .model-card .badge {
   position: absolute;
@@ -956,6 +987,10 @@ input:focus, textarea:focus { border-color: var(--accent); }
   border-radius: 8px;
   padding: 10px 12px;
 }
+.experimental-model-card.unavailable {
+  opacity: 0.72;
+  border-style: dashed;
+}
 
 .model-card-header {
   display: flex;
@@ -987,6 +1022,15 @@ input:focus, textarea:focus { border-color: var(--accent); }
   background: var(--success);
   color: #fff;
 }
+.chip-badge.available {
+  background: var(--text-primary);
+  color: var(--bg-primary);
+}
+.chip-badge.unavailable {
+  background: var(--bg-input);
+  color: var(--warning);
+  border: 1px solid var(--border);
+}
 
 .model-card-desc {
   font-size: 11px;
@@ -994,10 +1038,14 @@ input:focus, textarea:focus { border-color: var(--accent); }
   margin-bottom: 6px;
   line-height: 1.4;
 }
+.model-card-desc.unavailable-reason {
+  color: var(--warning);
+}
 
 .model-card-specs {
   display: flex;
   gap: 12px;
+  flex-wrap: wrap;
   margin-bottom: 6px;
 }
 
@@ -1362,7 +1410,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   min-width: 64px;
 }
 
-.chip-badge {
+.setting-chip .chip-badge {
   position: absolute;
   top: -7px;
   right: -4px;
@@ -1378,7 +1426,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   z-index: 1;
 }
 
-.chip-badge.current {
+.tier-preset-header .chip-badge.current {
   background: var(--accent);
   color: var(--on-accent);
   top: auto;

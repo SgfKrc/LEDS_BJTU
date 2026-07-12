@@ -621,6 +621,36 @@ def _build_chat_prompt(messages: list[dict], system_prompt: Optional[str] = None
     return "\n".join(parts)
 
 
+def _build_model_chat_prompt(tokenizer, messages: list[dict],
+                             system_prompt: Optional[str] = None,
+                             assistant_prefill: Optional[str] = None) -> str:
+    """Build a prompt with the active tokenizer's native chat template."""
+    chat_messages = []
+    if system_prompt:
+        chat_messages.append({"role": "system", "content": system_prompt})
+    chat_messages.extend(messages)
+
+    try:
+        prompt = tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        # DeepSeek-R1-Distill templates already end with "<think>\n" when
+        # add_generation_prompt=True. Appending the legacy Chinese prefill here
+        # mixes two incompatible thinking protocols.
+        native_thinking_prompt = "<think>" in prompt[-64:].lower()
+        if assistant_prefill and not native_thinking_prompt:
+            prompt += assistant_prefill
+        return prompt
+    except Exception:
+        return _build_chat_prompt(
+            messages,
+            system_prompt=system_prompt,
+            assistant_prefill=assistant_prefill,
+        )
+
+
 # ================================================================
 # 深度思考展示
 # ================================================================
@@ -640,6 +670,45 @@ THINKING_SYSTEM_PROMPT = (
     "- 回答部分不要写标记符号\n"
     "- 不要重复输出【思考】或【思考结束】"
 )
+
+
+def _strip_native_thinking_tags(text: str) -> str:
+    """Remove native thinking/answer tags and leaked ChatML sentinels."""
+    import re as _re
+
+    if not text:
+        return text
+
+    result = _re.sub(
+        r'<\s*think\s*>.*?<\s*/\s*think\s*>',
+        '',
+        text,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+    # DeepSeek templates put "<think>\n" in the prompt. The generated completion
+    # can therefore start with "reasoning...</think>\nanswer" and contain only
+    # the closing tag. In that case, drop everything up to the closing tag.
+    result = _re.sub(
+        r'^.*?<\s*/\s*think\s*>',
+        '',
+        result,
+        count=1,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+
+    response_match = _re.search(
+        r'<\s*(?:answer|response)\s*>(.*?)(?:<\s*/\s*(?:answer|response)\s*>|$)',
+        result,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+    if response_match:
+        result = response_match.group(1)
+
+    result = _re.sub(r'<\s*/?\s*(?:think|answer|response)\s*>', '', result, flags=_re.IGNORECASE)
+    result = result.replace('<|im_end|>', '').replace('<|im_start|>', '')
+    result = _re.sub(r'<\s*\|im_(?:start|end)\|\s*>', '', result)
+    result = _re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
 
 
 def _parse_thinking_response(text: str) -> tuple:
@@ -716,9 +785,59 @@ def _parse_thinking_response(text: str) -> tuple:
                     answer = thinking
             return answer, thinking
 
-    # ---- 情况2：格式未遵循（缺少标记或标记顺序错误） ----
+    # ---- 情况2：DeepSeek-R1 / Qwen3 本地  格式 ----
+    # 这些模型通过 ChatML 原生输出  ...  包裹思考，
+    # 不依赖 THINKING_SYSTEM_PROMPT 注入的【思考】标记。
+    import re as _re2
+    native_match = _re2.search(
+        r'<\s*think\s*>(.*?)<\s*/\s*think\s*>',
+        text,
+        flags=_re2.DOTALL | _re2.IGNORECASE,
+    )
+    if native_match:
+        thinking = native_match.group(1).strip()
+        # 取  之后、</think> 之前的内容作为思考
+        answer = text[:native_match.start()].strip()
+        after_think = text[native_match.end():].strip()
+        # 去除  标记
+        after_think = _re2.sub(r'<\s*/?\s*(?:response|answer)\s*>', '', after_think, flags=_re2.IGNORECASE)
+        if after_think:
+            answer = (answer + '\n' + after_think).strip() if answer else after_think
+        # 也尝试从  标记中提取回答
+        response_match = _re2.search(
+            r'<\s*(?:response|answer)\s*>(.*)',
+            answer if answer else '',
+            flags=_re2.DOTALL | _re2.IGNORECASE,
+        )
+        if response_match:
+            answer = response_match.group(1).strip()
+        # 清理残余标签
+        answer = _re2.sub(r'<\s*/?\s*(?:think|response|answer)\s*>', '', answer, flags=_re2.IGNORECASE)
+        answer = answer.replace(THINKING_START, "").replace(THINKING_END, "")
+        answer = answer.replace('<|im_end|>', '').replace('<|im_start|>', '').strip()
+        if thinking:
+            return answer, thinking
+
+    closing_only_match = _re2.search(
+        r'^(.*?)<\s*/\s*think\s*>(.*)$',
+        text,
+        flags=_re2.DOTALL | _re2.IGNORECASE,
+    )
+    if closing_only_match:
+        thinking = closing_only_match.group(1).strip()
+        thinking = thinking.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+        answer = closing_only_match.group(2).strip()
+        answer = _re2.sub(r'<\s*/?\s*(?:response|answer)\s*>', '', answer, flags=_re2.IGNORECASE)
+        answer = answer.replace(THINKING_START, "").replace(THINKING_END, "")
+        answer = answer.replace('<|im_end|>', '').replace('<|im_start|>', '').strip()
+        if answer or thinking:
+            return answer, thinking or None
+
+    # ---- 情况3：格式未遵循（缺少标记或标记顺序错误） ----
     # 清理所有思考标记，返回干净的文本作为答案
     cleaned = text.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+    # 也清理本地格式标记
+    cleaned = _strip_native_thinking_tags(cleaned)
     # 清理常见的标题前缀
     cleaned = _re.sub(r'^分析思路[：:]\s*', '', cleaned)
     cleaned = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', cleaned, flags=_re.IGNORECASE)
@@ -780,6 +899,23 @@ def _switch_session(target_id: str) -> None:
         kv_cache.clear()
     _init_kv_cache()
     logger.info(f"已切换到会话: {target_id}")
+
+
+def _reset_runtime_conversation_state(clear_histories: bool = True) -> None:
+    """Clear in-memory conversation/KV state after a model change."""
+    global kv_cache, conversation_stats, session_histories
+
+    if kv_cache:
+        kv_cache.clear()
+    kv_cache = None
+    if clear_histories:
+        session_histories = {}
+    conversation_stats = {
+        "total_prompt_tokens": 0,
+        "total_generated_tokens": 0,
+        "total_time_seconds": 0.0,
+        "rounds": 0,
+    }
 
 
 def _auto_title_session(session_id: str, first_message: str) -> None:
@@ -888,10 +1024,14 @@ def _generate_followups(history: list[dict], tokenizer, model, device) -> list[s
     try:
         inputs = tokenizer(followup_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
         with torch.no_grad():
             outputs = model.generate(
-                input_ids,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=80,
                 temperature=0.7,
                 top_p=0.9,
@@ -1619,12 +1759,20 @@ async def get_status():
             "warnings": device_profile.get("warnings", []),
         }
 
+    active_info = {}
+    if model_loaded and model_manager.is_loaded:
+        try:
+            active_info = model_manager.get_model_info()
+        except Exception:
+            active_info = {}
+
     return {
         "model_loaded": model_loaded,
         "current_quant": current_quant,
         "use_compile": USE_COMPILE if model_loaded else False,
-        "model_name": MODEL_NAME,
-        "model_path": MODEL_PATH,
+        "model_name": active_info.get("model_name", MODEL_NAME),
+        "model_path": active_info.get("model_path", MODEL_PATH),
+        "active_model_id": active_info.get("model_id", model_manager.active_model_id if model_loaded else None),
         "run_mode": RUN_MODE,
         "node_role": scheduler._effective_role(),
         "node_id": scheduler.get_effective_node_id(),
@@ -1649,7 +1797,9 @@ async def get_current_model():
         "loaded": True,
         "model_id": model_manager.active_model_id,
         "quant_type": current_quant,
-        "model_name": MODEL_NAME,
+        "model_name": info.get("model_name", MODEL_NAME),
+        "model_path": info.get("model_path", ""),
+        "engine": info.get("engine", ""),
         "total_params": info.get("total_params", "N/A"),
         "device": info.get("device", "N/A"),
         "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
@@ -1663,6 +1813,7 @@ async def load_model(req: LoadModelRequest):
     加载/切换模型。
 
     耗时约 5-20 秒（取决于量化类型），期间会先卸载旧模型。
+    使用 switch_model 获得失败时自动回滚到上一个模型的保护。
     """
     global model_loaded, current_quant, kv_cache, conversation_stats
 
@@ -1670,82 +1821,71 @@ async def load_model(req: LoadModelRequest):
     if engine not in ("auto", "llama_cpp", "pytorch"):
         raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch")
 
-    quant = req.quant_type.lower()
-    # llama_cpp 引擎使用 GGUF 格式，不涉及 bitsandbytes 量化精度
-    # gguf / any 等占位值均合法（由 ModelManager 自动选择 GGUF 文件）
-    if engine == "llama_cpp":
-        pass  # quant_type 对 llama.cpp 无意义，放行任意值
-    elif quant not in ("fp16", "int8", "int4"):
-        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
-
-    # P3修复: 非默认模型需要 CUDA 门控
-    if req.model_id and req.model_id != mc.DEFAULT_MODEL_ID:
-        _cuda_gate()
+    _validate_model_load_request(req.model_id, engine)
+    resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
+    effective_engine = _effective_engine_for_model(req.model_id, engine)
+    quant = _normalize_quant_for_engine(req.quant_type, effective_engine)
 
     try:
         t0 = time.time()
 
-        # 卸载旧模型
-        if model_manager.is_loaded:
-            logger.info("卸载旧模型...")
-            model_manager.unload_model()
-            if kv_cache:
-                kv_cache.clear()
-            kv_cache = None
-            conversation_stats = {
-                "total_prompt_tokens": 0,
-                "total_generated_tokens": 0,
-                "total_time_seconds": 0.0,
-                "rounds": 0,
-            }
-            # 同步清空数据库对话历史
-            if _db_available:
-                try:
-                    import db as _db_mod
-                    _db_mod.clear_conversation("default")
-                except Exception:
-                    pass
-            model_loaded = False
-            if not torch.cuda.is_available():
-                import gc
-                gc.collect()
-
-        # 临时修改 config（引擎 + 量化）
+        # 临时修改 config（引擎 + 量化 + compile）
         import config as cfg
-        cfg.INFERENCE_ENGINE = engine
+        cfg.INFERENCE_ENGINE = effective_engine
         cfg.QUANT_TYPE = quant
         cfg.USE_COMPILE = req.use_compile
 
-        # 加载新模型
-        logger.info(f"加载模型: engine={engine}, quant={quant}, compile={req.use_compile}")
-        model_manager.load_model(
-            model_path=MODEL_PATH,
+        # 清空内存会话/KV/统计（新模型不能复用旧模型的上下文）
+        _reset_runtime_conversation_state(clear_histories=True)
+        # 同步清空数据库对话历史
+        if _db_available:
+            try:
+                import db as _db_mod
+                _db_mod.clear_conversation("default")
+            except Exception:
+                pass
+
+        # P3修复: 使用 switch_model 获得失败时自动回滚保护
+        logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
+        result = model_manager.switch_model(
+            model_id=req.model_id or mc.DEFAULT_MODEL_ID,
             quant_type=quant,
             profile=device_profile,
-            model_id=req.model_id,
+            engine=effective_engine if effective_engine != "auto" else None,
+            model_path=resolved_model_path,
+            db_experimental_models=_get_db_experimental_models(),
         )
 
-        # 初始化 KV 缓存
-        _init_kv_cache()
-        conversation_stats = {
-            "total_prompt_tokens": 0,
-            "total_generated_tokens": 0,
-            "total_time_seconds": 0.0,
-            "rounds": 0,
-        }
+        if result["success"]:
+            model_loaded = True
+            current_quant = quant
+            generation_config["use_compile"] = req.use_compile
 
-        model_loaded = True
-        current_quant = quant
-        generation_config["use_compile"] = req.use_compile
+            # 初始化 KV 缓存
+            _init_kv_cache()
 
-        elapsed = time.time() - t0
+            elapsed = time.time() - t0
+            status = await get_status()
+            status["load_time_seconds"] = round(elapsed, 1)
+            status["model_name"] = result.get("model_name", "")
 
-        status = await get_status()
-        status["load_time_seconds"] = round(elapsed, 1)
+            logger.info(f"模型加载完成 ({elapsed:.1f}s): {quant}")
+            return status
+        else:
+            # 切换失败 — 检查是否回滚成功
+            if model_manager.is_loaded:
+                model_loaded = True
+                current_quant = model_manager.quant_type or (
+                    "gguf" if model_manager._engine_type == "llama_cpp" else QUANT_TYPE
+                )
+                _init_kv_cache()
+            else:
+                model_loaded = False
+                current_quant = QUANT_TYPE
+            raise HTTPException(status_code=500, detail=result["error"])
 
-        logger.info(f"模型加载完成 ({elapsed:.1f}s): {quant}")
-        return status
-
+    except HTTPException:
+        raise
     except Exception as e:
         model_loaded = False
         logger.error(f"模型加载失败: {e}", exc_info=True)
@@ -1983,6 +2123,9 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 top_p=req.top_p,
             )
             response_text = result.get("content", "")
+            # P3修复: llama.cpp 路径同样需要剥离本地思考标记
+            if not req.show_thinking:
+                response_text = _strip_native_thinking_tags(response_text)
             history.append({"role": "assistant", "content": response_text})
             tokens_per_sec = result.get("tokens_per_second", 0)
             usage = result.get("usage", {})
@@ -2067,39 +2210,61 @@ def _execute_chat_full(req: ChatRequest) -> dict:
 
         history.append({"role": "user", "content": req.message})
 
+        tokenizer = model_manager.tokenizer
         thinking_prompt = THINKING_SYSTEM_PROMPT if req.show_thinking else None
         thinking_prefill = "【思考】\n" if req.show_thinking else None
-        prompt = _build_chat_prompt(history,
-                                    system_prompt=thinking_prompt,
-                                    assistant_prefill=thinking_prefill)
-
-        tokenizer = model_manager.tokenizer
+        prompt = _build_model_chat_prompt(
+            tokenizer,
+            history,
+            system_prompt=thinking_prompt,
+            assistant_prefill=thinking_prefill,
+        )
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(model_manager.get_device())
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(model_manager.get_device())
         prompt_len = input_ids.shape[1]
+        stop_sequences = model_manager._merge_stop_sequences(None)
+        generation_kwargs = {}
+        eos_token_ids = model_manager._get_generation_eos_token_ids(stop_sequences)
+        if eos_token_ids is not None:
+            generation_kwargs["eos_token_id"] = eos_token_ids
+        stop_criteria = model_manager._build_stop_criteria(stop_sequences, prompt_len)
+        if stop_criteria is not None:
+            generation_kwargs["stopping_criteria"] = stop_criteria
 
         t0 = time.time()
         with torch.no_grad():
             outputs = model_manager.model.generate(
-                input_ids,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=effective_max,
                 temperature=req.temperature if req.temperature > 0 else 1.0,
                 top_p=req.top_p,
                 do_sample=req.temperature > 0,
                 pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                **generation_kwargs,
             )
         elapsed = time.time() - t0
 
         generated_ids = outputs[0][prompt_len:]
-        raw_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        raw_text = model_manager._decode_generated_ids(generated_ids, stop_sequences).strip()
 
         thinking_content = None
         if req.show_thinking:
-            parsed_text = "【思考】\n" + raw_text
+            raw_lower = raw_text.lower()
+            if "<think" in raw_lower or "</think" in raw_lower:
+                parsed_text = raw_text
+            else:
+                parsed_text = "【思考】\n" + raw_text
             response_text, thinking_content = _parse_thinking_response(parsed_text)
         else:
-            response_text = raw_text
+            # P3修复: 移除 DeepSeek-R1 / Qwen3 本地思考标记
+            # 这些模型通过 ChatML 原生输出 ... 格式，
+            # 不依赖 THINKING_SYSTEM_PROMPT 注入。show_thinking=False 时
+            # 必须显式剥离，否则思考标记会泄露到用户可见的回答中。
+            response_text = _strip_native_thinking_tags(raw_text)
 
         history.append({"role": "assistant", "content": response_text})
 
@@ -2218,8 +2383,8 @@ def _auto_load_default_model():
         if len(gguf_candidates) > 1:
             logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {os.path.basename(gguf_path)}")
     elif os.path.isdir(cfg.MODEL_PATH):
-        # 2. 回退：Safetensors 路径 — 优先 llama.cpp（避免 transformers 兼容问题）
-        engine = "llama_cpp"  # 在 CPU 上也能运行
+        # 2. 回退：Safetensors 目录必须使用 PyTorch 后端。
+        engine = "pytorch"
         model_path = cfg.MODEL_PATH
         quant = cfg.QUANT_TYPE
     else:
@@ -2453,41 +2618,39 @@ async def clear_chat():
 @app.get("/api/models/available")
 async def list_available_models():
     """列出可选模型配置 + 可用引擎"""
-    import config as cfg
-    # 检测当前环境实际可用的引擎
+    # 检测所有已注册模型（内置 + DB 注册）的实际落盘格式。
+    # 旧逻辑只检查默认 Qwen 文件，DeepSeek/用户注册模型已下载时会漏报引擎。
+    model_payloads = [_model_api_payload(m) for m in _get_all_model_configs()]
+    engine_ids = {
+        engine
+        for payload in model_payloads
+        for engine in payload.get("supported_engines", [])
+    }
     available_engines = []
-    # llama.cpp: 有 GGUF 模型文件即可
-    from model_downloader import gguf_model_exists
-    if gguf_model_exists():
+
+    if "llama_cpp" in engine_ids:
         available_engines.append({
             "id": "llama_cpp",
             "name": "llama.cpp + GGUF",
-            "description": "CPU/集显推理，Q4_K_M ~1.16 GB，~10-15 tok/s",
-            "model_size_gb": 1.2,
+            "description": "GGUF 量化模型，适合 CPU/集显或轻量试水",
+            "model_size_gb": None,
             "requires_cuda": False,
         })
-    # PyTorch: 有 Safetensors 模型文件即可
-    from model_downloader import safetensors_model_exists
-    if safetensors_model_exists():
+
+    if "pytorch" in engine_ids:
         has_cuda = torch.cuda.is_available()
         available_engines.append({
             "id": "pytorch",
             "name": "PyTorch + Safetensors" + (" (CUDA)" if has_cuda else " (CPU)"),
             "description": "Safetensors 格式，支持 INT4/INT8/FP16 量化" + ("，GPU 加速" if has_cuda else "，CPU 模式较慢"),
-            "model_size_gb": 1.8 if has_cuda else 3.5,
+            "model_size_gb": None,
             "requires_cuda": has_cuda,
         })
-    return {
-        "models": [
-            {
-                "id": "fp16",
-                "name": "FP16 原版",
-                "description": "原始精度，显存 ~3.5 GB，速度最快 (~53 tok/s)",
-                "memory_gb": 3.5,
-                "speed_tok_s": 53,
-                "compile_support": True,
-                "engine": "pytorch",
-            },
+    # P3修复: 量化选项动态化 — 仅返回当前环境实际可用的量化精度
+    pytorch_quants = []
+    if "pytorch" in engine_ids:
+        has_cuda = torch.cuda.is_available()
+        pytorch_quants = [
             {
                 "id": "int4",
                 "name": "INT4 量化 ⭐",
@@ -2496,6 +2659,7 @@ async def list_available_models():
                 "speed_tok_s": 29,
                 "compile_support": False,
                 "engine": "pytorch",
+                "is_available": True,
             },
             {
                 "id": "int8",
@@ -2505,8 +2669,38 @@ async def list_available_models():
                 "speed_tok_s": 10,
                 "compile_support": False,
                 "engine": "pytorch",
+                "is_available": True,
             },
-        ],
+        ]
+        if has_cuda:
+            pytorch_quants.insert(0, {
+                "id": "fp16",
+                "name": "FP16 原版",
+                "description": "原始精度，显存 ~3.5 GB，速度最快 (~53 tok/s)",
+                "memory_gb": 3.5,
+                "speed_tok_s": 53,
+                "compile_support": True,
+                "engine": "pytorch",
+                "is_available": True,
+            })
+
+    gguf_quants = []
+    if "llama_cpp" in engine_ids:
+        gguf_quants = [
+            {
+                "id": "gguf",
+                "name": "GGUF 量化",
+                "description": "量化精度由 GGUF 文件决定（Q4_K_M / Q5_K_M 等），适合 CPU/集显",
+                "memory_gb": None,
+                "speed_tok_s": None,
+                "compile_support": False,
+                "engine": "llama_cpp",
+                "is_available": True,
+            },
+        ]
+
+    return {
+        "models": pytorch_quants + gguf_quants,
         "current": current_quant if model_loaded else None,
         "current_engine": (
             model_manager._engine_type
@@ -2559,6 +2753,158 @@ def _cuda_gate():
         )
 
 
+def _db_entry_to_model_config(entry: dict) -> Optional[mc.ModelConfig]:
+    """Convert a DB model entry into ModelConfig; invalid rows are ignored."""
+    mid = entry.get("model_id", "")
+    if not mid:
+        return None
+    try:
+        return mc.ModelConfig(
+            model_id=mid,
+            name=entry.get("name", mid),
+            model_type=entry.get("model_type", "safetensors"),
+            model_path=entry.get("model_path", ""),
+            gguf_path=entry.get("gguf_path", ""),
+            recommended_vram_gb=float(entry.get("recommended_vram_gb", 8.0)),
+            max_context=int(entry.get("max_context", 4096)),
+            is_experimental=True,
+            huggingface_id=entry.get("huggingface_id", ""),
+            quant_types=entry.get("quant_types", ["int4"]),
+            description=entry.get("description", ""),
+            location="external",
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_all_model_configs() -> list[mc.ModelConfig]:
+    """Return builtin + DB-registered models without hiding unavailable entries."""
+    models = mc.get_builtin_models()
+    seen = {m.model_id for m in models}
+    for entry in _get_db_experimental_models():
+        model = _db_entry_to_model_config(entry)
+        if model and model.model_id not in seen:
+            models.append(model)
+            seen.add(model.model_id)
+    return models
+
+
+def _model_api_payload(model: mc.ModelConfig) -> dict:
+    """Serialize a model config with local availability and loadability metadata."""
+    file_status = mc.get_model_file_status(model)
+    supported_engines: list[str] = []
+
+    if file_status["has_gguf"]:
+        supported_engines.append("llama_cpp")
+    if file_status["has_safetensors"]:
+        supported_engines.append("pytorch")
+
+    is_available = bool(supported_engines)
+    unavailable_reason = file_status["unavailable_reason"]
+    if file_status["is_available"] and not supported_engines:
+        unavailable_reason = "模型文件已存在，但当前设备缺少可用推理后端。"
+
+    if "pytorch" in supported_engines:
+        preferred_engine = "pytorch"
+    elif "llama_cpp" in supported_engines:
+        preferred_engine = "llama_cpp"
+    else:
+        preferred_engine = "auto"
+    default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
+
+    return {
+        "model_id": model.model_id,
+        "name": model.name,
+        "is_builtin": mc.get_builtin_model(model.model_id) is not None,
+        "model_type": model.model_type,
+        "is_experimental": model.is_experimental,
+        "recommended_vram_gb": model.recommended_vram_gb,
+        "max_context": model.max_context,
+        "quant_types": model.quant_types,
+        "description": model.description,
+        "huggingface_id": model.huggingface_id,
+        "location": model.location,
+        "model_path": model.model_path,
+        "gguf_path": model.gguf_path,
+        "is_available": is_available,
+        "unavailable_reason": unavailable_reason,
+        "available_formats": file_status["available_formats"],
+        "has_safetensors": file_status["has_safetensors"],
+        "has_gguf": file_status["has_gguf"],
+        "expected_paths": file_status["expected_paths"],
+        "supported_engines": supported_engines,
+        "preferred_engine": preferred_engine,
+        "default_quant_type": default_quant,
+        "requires_cuda": bool(
+            model.is_experimental
+            and file_status["has_safetensors"]
+            and "pytorch" not in supported_engines
+        ),
+    }
+
+
+def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
+    """Return a safe quant value for the concrete engine or raise HTTP 400."""
+    raw = str(quant_type or "").strip()
+    if engine == "llama_cpp":
+        return raw or "gguf"
+
+    quant = raw.lower()
+    if quant not in ("fp16", "int8", "int4"):
+        raise HTTPException(400, f"不支持的量化类型: {quant}，可选: fp16, int8, int4")
+    return quant
+
+
+def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
+    """Reject unavailable model loads before unloading the current model."""
+    if not model_id:
+        return
+
+    model = mc.get_model_config(model_id, _get_db_experimental_models())
+    if model is None:
+        raise HTTPException(status_code=404, detail=f"模型 '{model_id}' 未在注册表中找到。")
+
+    payload = _model_api_payload(model)
+    if not payload["is_available"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"模型 '{model.name}' 不可加载：{payload['unavailable_reason']}",
+        )
+
+    if engine == "llama_cpp" and not payload["has_gguf"]:
+        raise HTTPException(status_code=400, detail=f"模型 '{model.name}' 未配置或未下载 GGUF 文件。")
+    if engine == "pytorch":
+        if not payload["has_safetensors"]:
+            raise HTTPException(status_code=400, detail=f"模型 '{model.name}' 未配置或未下载 Safetensors 文件。")
+
+
+def _resolve_model_path_for_engine(model_id: Optional[str], engine: str) -> Optional[str]:
+    """Resolve a registered model path for the requested engine, including DB models."""
+    if not model_id:
+        return None
+    model = mc.get_model_config(model_id, _get_db_experimental_models())
+    if model is None:
+        return None
+    payload = _model_api_payload(model)
+    selected_engine = engine if engine != "auto" else payload.get("preferred_engine", "auto")
+    if selected_engine == "llama_cpp" and payload.get("has_gguf"):
+        return mc.resolve_model_path(model.gguf_path)
+    if selected_engine == "pytorch" and payload.get("has_safetensors"):
+        return mc.resolve_model_path(model.model_path)
+    return None
+
+
+def _effective_engine_for_model(model_id: Optional[str], engine: str) -> str:
+    """Return the concrete engine to pass into ModelManager."""
+    if engine != "auto" or not model_id:
+        return engine
+    model = mc.get_model_config(model_id, _get_db_experimental_models())
+    if model is None:
+        return engine
+    payload = _model_api_payload(model)
+    return payload.get("preferred_engine") or engine
+
+
 @app.get("/api/models")
 async def list_models():
     """列出所有可用模型配置（内置 + 用户注册），含 active_model_id。
@@ -2566,23 +2912,7 @@ async def list_models():
     - 实验模型仅在 CUDA 可用时返回
     - 始终包含默认 Qwen-1.8B 模型
     """
-    db_models = _get_db_experimental_models()
-    visible = mc.get_visible_models(db_models)
-
-    models_data = []
-    for m in visible:
-        models_data.append({
-            "model_id": m.model_id,
-            "name": m.name,
-            "model_type": m.model_type,
-            "is_experimental": m.is_experimental,
-            "recommended_vram_gb": m.recommended_vram_gb,
-            "max_context": m.max_context,
-            "quant_types": m.quant_types,
-            "description": m.description,
-            "huggingface_id": m.huggingface_id,
-            "location": m.location,
-        })
+    models_data = [_model_api_payload(m) for m in _get_all_model_configs()]
 
     return {
         "models": models_data,
@@ -2598,37 +2928,39 @@ async def switch_model(req: SwitchModelRequest):
     会卸载当前模型，然后加载新模型。
     仅 CUDA 环境可用（非 CUDA 返回 403）。
     """
-    _cuda_gate()
-
     global model_loaded, current_quant, kv_cache, conversation_stats
 
     # 验证 engine 参数
     engine = req.engine.lower()
     if engine not in ("auto", "llama_cpp", "pytorch"):
         raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch")
+    _validate_model_load_request(req.model_id, engine)
+    resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
+    effective_engine = _effective_engine_for_model(req.model_id, engine)
+    quant = _normalize_quant_for_engine(req.quant_type, effective_engine)
 
     try:
         # 更新全局引擎配置（P3修复: switch_model 也需要更新 config）
         import config as cfg
-        cfg.INFERENCE_ENGINE = engine if engine != "auto" else cfg.INFERENCE_ENGINE
-        cfg.QUANT_TYPE = req.quant_type
+        cfg.INFERENCE_ENGINE = effective_engine if effective_engine != "auto" else cfg.INFERENCE_ENGINE
+        cfg.QUANT_TYPE = quant
 
-        # 清空 KV 缓存（新模型需要新的 KV 空间）
-        if kv_cache:
-            kv_cache.clear()
-        kv_cache = None
-        conversation_stats["rounds"] = 0
+        # 清空内存会话/KV/统计（新模型不能复用旧模型的上下文）
+        _reset_runtime_conversation_state(clear_histories=True)
 
         result = model_manager.switch_model(
             model_id=req.model_id,
-            quant_type=req.quant_type,
+            quant_type=quant,
             profile=device_profile,
-            engine=engine if engine != "auto" else None,
+            engine=effective_engine if effective_engine != "auto" else None,
+            model_path=resolved_model_path,
+            db_experimental_models=_get_db_experimental_models(),
         )
 
         if result["success"]:
             model_loaded = True
-            current_quant = req.quant_type
+            current_quant = quant
+            _init_kv_cache()
             return result
         else:
             # 切换失败 — 检查是否回滚成功
@@ -2659,12 +2991,12 @@ async def list_model_registry():
 
 @app.post("/api/models/registry")
 async def register_model(req: RegisterModelRequest):
-    """注册一个新的实验模型配置（仅 CUDA 环境可用）。
+    """注册一个新的实验模型配置。
 
     模型文件需用户自行下载到指定路径。
     """
-    _cuda_gate()
-
+    if req.model_type not in {"safetensors", "gguf", "both"}:
+        raise HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
     if not _db_available:
         raise HTTPException(status_code=503, detail="数据库不可用，无法注册模型。")
 
@@ -2695,12 +3027,10 @@ async def register_model(req: RegisterModelRequest):
 
 @app.delete("/api/models/registry/{model_id}")
 async def unregister_model(model_id: str):
-    """删除一个用户注册的实验模型配置（仅 CUDA 环境可用）。
+    """删除一个用户注册的实验模型配置。
 
     不会删除磁盘上的模型文件，仅取消注册。
     """
-    _cuda_gate()
-
     if not _db_available:
         raise HTTPException(status_code=503, detail="数据库不可用。")
 

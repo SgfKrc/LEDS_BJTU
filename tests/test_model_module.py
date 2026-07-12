@@ -19,6 +19,7 @@ import torch.nn as nn
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
 from model_module import ModelManager
+import model_config as mc
 
 # ================================================================
 # Tiny 模型工厂
@@ -1210,18 +1211,18 @@ class TestTransformers5xCompatibility:
             assert layer.self_attn.layer_idx == saved_indices[i], \
                 f"decode 后 layer_idx 未恢复: layer {i} → {layer.self_attn.layer_idx}"
 
-    def test_past_key_values_plural_accepted(self, mgr):
-        """`past_key_values` (复数) 参数名被 Qwen2DecoderLayer 接受（5.x 签名）。"""
+    def test_cache_argument_name_is_supported(self, mgr):
+        """Qwen2DecoderLayer may use 4.x singular or 5.x plural cache argument."""
         import inspect
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
         sig = inspect.signature(Qwen2DecoderLayer.forward)
         params = list(sig.parameters.keys())
-        assert "past_key_values" in params, \
-            f"Qwen2DecoderLayer.forward 不接受 past_key_values 参数！签名: {params}"
+        assert ("past_key_value" in params) or ("past_key_values" in params), \
+            f"Qwen2DecoderLayer.forward 不接受已知 KV cache 参数！签名: {params}"
 
-    def test_decoder_layer_returns_tensor_not_tuple(self, mgr):
-        """Qwen2DecoderLayer.forward 在 5.x 中返回 tensor 而非 tuple——验证我们的处理。"""
+    def test_decoder_layer_output_shape_is_supported(self, mgr):
+        """Qwen2DecoderLayer may return a tensor (5.x) or tuple (4.x)."""
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
         layer0 = mgr.model.model.layers[0]
@@ -1234,8 +1235,318 @@ class TestTransformers5xCompatibility:
         pos_emb = mgr.model.model.rotary_emb(hidden, pos_ids)
 
         output = layer0(hidden, position_ids=pos_ids, position_embeddings=pos_emb)
-        # 5.x 返回 tensor；4.x 返回 tuple — 两种都应被 forward_layers 处理
-        assert isinstance(output, torch.Tensor), (
-            f"DecoderLayer.forward 应返回 torch.Tensor (5.x)，"
-            f"实际返回 {type(output).__name__}"
+        # 5.x returns tensor; 4.x returns tuple. forward_layers handles both.
+        if isinstance(output, tuple):
+            assert output and isinstance(output[0], torch.Tensor)
+        else:
+            assert isinstance(output, torch.Tensor)
+
+
+# ================================================================
+# select_engine 测试（P3 多模型支持 — 引擎选择逻辑）
+# ================================================================
+
+class TestSelectEngine:
+    """测试 ModelManager.select_engine() 静态方法"""
+
+    def test_manual_pytorch_override(self, monkeypatch):
+        """INFERENCE_ENGINE='pytorch' 显式指定时应返回 pytorch"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "pytorch")
+        result = ModelManager.select_engine()
+        assert result == "pytorch"
+
+    def test_manual_llama_cpp_override(self, monkeypatch):
+        """INFERENCE_ENGINE='llama_cpp' 显式指定时应返回 llama_cpp"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "llama_cpp")
+        result = ModelManager.select_engine()
+        assert result == "llama_cpp"
+
+    def test_auto_cuda_available_selects_pytorch(self, monkeypatch):
+        """CUDA 可用 + auto 模式 → pytorch"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        result = ModelManager.select_engine()
+        assert result == "pytorch"
+
+    def test_auto_no_cuda_selects_llama_cpp(self, monkeypatch):
+        """无 CUDA + auto 模式 → llama_cpp"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        result = ModelManager.select_engine()
+        assert result == "llama_cpp"
+
+    def test_edge_tier_without_cuda_selects_llama_cpp(self, monkeypatch):
+        """edge 档位 + 无 CUDA → llama_cpp"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        profile = {"tier": "edge", "gpus": []}
+        result = ModelManager.select_engine(profile)
+        assert result == "llama_cpp"
+
+    def test_mobile_tier_without_cuda_selects_llama_cpp(self, monkeypatch):
+        """mobile 档位 + 无 CUDA → llama_cpp"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        profile = {"tier": "mobile", "gpus": []}
+        result = ModelManager.select_engine(profile)
+        assert result == "llama_cpp"
+
+    def test_laptop_tier_with_cuda_gpu_selects_pytorch(self, monkeypatch):
+        """laptop 档位 + CUDA GPU → pytorch"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        profile = {
+            "tier": "laptop",
+            "gpus": [{"cuda_available": True, "name": "RTX 4060"}],
+        }
+        result = ModelManager.select_engine(profile)
+        assert result == "pytorch"
+
+    def test_any_cuda_gpu_trumps_selected_igpu(self, monkeypatch):
+        """任意 GPU 有 CUDA 即认为 CUDA 可用（游戏本双显卡场景）"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        # torch.cuda 返回 False（选集显时），但 profile 中有独显
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        profile = {
+            "tier": "laptop",
+            "gpus": [
+                {"cuda_available": False, "name": "Intel UHD"},
+                {"cuda_available": True, "name": "RTX 3050"},
+            ],
+        }
+        result = ModelManager.select_engine(profile)
+        assert result == "pytorch"
+
+
+# ================================================================
+# load_model / switch_model 测试（P3 多模型支持）
+# ================================================================
+
+class TestLoadModelWithModelId:
+    """测试 load_model() 的 model_id 参数和 DB 模型查找"""
+
+    def test_load_model_rejects_unknown_model_id_without_path(self):
+        """不存在的 model_id 且无 model_path → ValueError"""
+        mgr = ModelManager()
+        with pytest.raises(ValueError, match="未在注册表中找到"):
+            mgr.load_model(model_id="nonexistent-model-xyz")
+
+    def test_load_model_accepts_model_id_with_explicit_path(self, monkeypatch):
+        """model_id 不存在但显式提供 model_path → 放行（由路径直接加载）"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "pytorch")
+        mgr = ModelManager()
+        # 阻止实际加载
+        monkeypatch.setattr(mgr, "_load_pytorch", lambda *a, **kw: None)
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+
+        # 不应抛出异常
+        mgr.load_model(
+            model_id="custom-model",
+            model_path="/tmp/fake-model.safetensors",
+            engine="pytorch",
         )
+        assert mgr._active_model_id == "custom-model"
+        assert mgr._engine_type == "pytorch"
+
+    def test_load_model_finds_builtin_model_config(self, monkeypatch):
+        """内置 model_id → 从 model_config 解析路径和引擎约束"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        # GGUF 文件不存在，需 mock
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+
+        # qwen2.5-7b-gguf 是 GGUF-only 内置模型
+        # auto 引擎应解析为 llama_cpp
+        mgr.load_model(model_id="qwen2.5-7b-gguf")
+        assert mgr._active_model_id == "qwen2.5-7b-gguf"
+        assert mgr._engine_type == "llama_cpp"
+
+    def test_load_model_finds_db_registered_model(self, monkeypatch, tmp_path):
+        """DB 注册模型 → db_experimental_models 参数传递给 get_model_config"""
+        gguf_file = tmp_path / "db-model.Q4_K_M.gguf"
+        gguf_file.write_text("x", encoding="utf-8")
+
+        db_models = [{
+            "model_id": "db-only-model",
+            "name": "DB Only Model",
+            "model_type": "gguf",
+            "model_path": "",
+            "gguf_path": str(gguf_file),
+            "recommended_vram_gb": 4.0,
+            "max_context": 4096,
+            "quant_types": ["Q4_K_M"],
+            "description": "A DB-only registered model",
+        }]
+
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        import config as cfg
+        monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "auto")
+
+        # 不传 db_experimental_models → 找不到
+        with pytest.raises(ValueError, match="未在注册表中找到"):
+            mgr.load_model(model_id="db-only-model")
+
+        # 传 db_experimental_models → 找到（B1 修复验证）
+        mgr.load_model(
+            model_id="db-only-model",
+            db_experimental_models=db_models,
+        )
+        assert mgr._active_model_id == "db-only-model"
+
+    def test_load_model_gguf_only_enforces_llama_cpp(self, monkeypatch):
+        """GGUF-only 模型 + pytorch 引擎 → 自动修正为 llama_cpp"""
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+
+        mgr.load_model(model_id="qwen2.5-7b-gguf", engine="pytorch")
+        # 应被 model_type 约束修正
+        assert mgr._engine_type == "llama_cpp"
+
+
+class TestSwitchModel:
+    """测试 switch_model() 的切换流程和回滚行为"""
+
+    def test_switch_to_unknown_model_without_path_fails(self):
+        """切换到不存在的模型且无路径 → 返回 success=False"""
+        mgr = ModelManager()
+        result = mgr.switch_model("nonexistent-model")
+        assert result["success"] is False
+        assert "未在注册表中找到" in result["error"]
+
+    def test_switch_first_model_succeeds(self, monkeypatch):
+        """首次加载（无旧模型）→ 直接加载新模型"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+
+        result = mgr.switch_model("qwen2.5-7b-gguf")
+        assert result["success"] is True
+        assert result["model_id"] == "qwen2.5-7b-gguf"
+        assert mgr._active_model_id == "qwen2.5-7b-gguf"
+
+    def test_switch_between_models(self, monkeypatch):
+        """已加载模型 A → 切换到模型 B"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        monkeypatch.setattr(mgr, "_load_pytorch", lambda *a, **kw: None)
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+
+        # 首次加载模型 A
+        mgr.switch_model("qwen2.5-7b-gguf")
+        assert mgr._active_model_id == "qwen2.5-7b-gguf"
+
+        # 切换到模型 B（默认模型）
+        result = mgr.switch_model("qwen-1_8b")
+        assert result["success"] is True
+        assert result["model_id"] == "qwen-1_8b"
+        assert mgr._active_model_id == "qwen-1_8b"
+
+    def test_switch_rollback_on_failure(self, monkeypatch):
+        """加载新模型失败 → 回滚到旧模型"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+
+        mgr = ModelManager()
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        # 第一次加载成功（模型 A = qwen-1_8b，需同时 mock 双引擎）
+        # 注意: 必须设置 self.model 使 is_loaded 返回 True（否则 switch_model 跳过 unload/rollback）
+        def fake_load_llama(*a, **kw):
+            mgr._active_model_id = kw.get("model_id", mgr._active_model_id)
+            mgr._engine_type = "llama_cpp"
+            mgr._model_path = kw.get("model_path", "/fake/path")
+            mgr._llama_engine = True  # 使 is_loaded 返回 True
+
+        def fake_load_pytorch(*a, **kw):
+            mgr._active_model_id = kw.get("model_id", mgr._active_model_id)
+            mgr._engine_type = "pytorch"
+            mgr._model_path = kw.get("model_path", "/fake/path")
+            mgr.model = True  # 使 is_loaded 返回 True
+
+        monkeypatch.setattr(mgr, "_load_llama_cpp", fake_load_llama)
+        monkeypatch.setattr(mgr, "_load_pytorch", fake_load_pytorch)
+
+        # 首次加载模型 A
+        mgr.switch_model("qwen-1_8b")
+        assert mgr._active_model_id == "qwen-1_8b"
+
+        # 切换到模型 B — 仅让 _load_llama_cpp 抛出异常
+        # （qwen2.5-7b-gguf 是 GGUF-only，引擎会从 pytorch 修正为 llama_cpp）
+        # 回滚时用 pytorch 加载 qwen-1_8b，所以 _load_pytorch 仍需正常工作
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("模拟加载失败")))
+
+        result = mgr.switch_model("qwen2.5-7b-gguf")
+        assert result["success"] is False
+        # 应回滚到 qwen-1_8b
+        assert result["model_id"] == "qwen-1_8b"
+        assert "已回滚" in result["error"]
+
+    def test_switch_with_db_experimental_models(self, monkeypatch, tmp_path):
+        """通过 db_experimental_models 找到 DB 注册模型并切换"""
+        gguf_file = tmp_path / "db-switch-model.Q4_K_M.gguf"
+        gguf_file.write_text("x", encoding="utf-8")
+
+        db_models = [{
+            "model_id": "db-switch-target",
+            "name": "DB Switch Target",
+            "model_type": "gguf",
+            "model_path": "",
+            "gguf_path": str(gguf_file),
+            "recommended_vram_gb": 4.0,
+            "max_context": 4096,
+            "quant_types": ["Q4_K_M"],
+            "description": "test",
+        }]
+
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        import config as cfg
+        monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "auto")
+
+        # 不传 db_experimental_models → 失败（B1 修复前行为）
+        result_without = mgr.switch_model("db-switch-target")
+        assert result_without["success"] is False
+
+        # 传 db_experimental_models → 成功（B1 修复后行为）
+        result_with = mgr.switch_model(
+            "db-switch-target",
+            db_experimental_models=db_models,
+        )
+        assert result_with["success"] is True
+        assert result_with["model_id"] == "db-switch-target"
+
+    def test_switch_model_updates_active_model_id(self, monkeypatch):
+        """切换后 _active_model_id 应更新"""
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+
+        mgr = ModelManager()
+        monkeypatch.setattr(mgr, "_load_llama_cpp", lambda *a, **kw: None)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        assert mgr.active_model_id == mc.DEFAULT_MODEL_ID
+        mgr.switch_model("qwen2.5-7b-gguf")
+        assert mgr.active_model_id == "qwen2.5-7b-gguf"

@@ -336,7 +336,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   };
 
   const handleSend = async (presetText) => {
-    const text = (presetText || input).trim();
+    const text = (typeof presetText === 'string' ? presetText : input).trim();
     if (!text || sending) return;
 
     // 清空操作进行中时禁止发送，避免状态竞态
@@ -418,6 +418,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
+    let msgId = Date.now() + 1;
     try {
       debugLog('[ChatPanel] handleSend: sending message...', {
         effectiveSessionId,
@@ -427,7 +428,6 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       });
 
       const useFastStream = settings?.streamingMode === 'fast';
-      const msgId = Date.now() + 1;
       let res;
 
       if (useFastStream) {
