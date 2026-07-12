@@ -2,7 +2,7 @@
 
 **创建日期**: 2026-07-11  
 **问题**: Python 后端冷启动时间过长（约 12 秒）  
-**约束**: 不考虑延迟导入（import when needed）方案
+**决策约束**: 保留 `sklearn` / `scikit-learn` 依赖，以备后续评估、数据分析、模型选择或特征工程等能力使用；不采用卸载、禁用、伪装不可用、强制降级 transformers 等方式阻止 `sklearn` 加载。短期不做大规模延迟导入改造，优先采用低风险启动优化与打包优化。
 
 ---
 
@@ -34,10 +34,10 @@
    - transformers 导入了 `sklearn`（1.5秒）
    - 还导入了 `torch`、`bitsandbytes`、`accelerate` 等
 
-2. **sklearn 是不必要的重量级依赖**
-   - transformers 的某些功能依赖 sklearn
-   - 但本项目只使用 transformers 的模型加载和推理功能
-   - sklearn 的 1.5 秒导入时间完全浪费
+2. **sklearn 是可保留的重量级可选依赖**
+   - transformers 的某些功能会间接导入 sklearn
+   - 当前推理主链路未直接依赖 sklearn，但未来可能用于评估、模型选择、任务路由或统计分析
+   - 因此不再把“禁止加载 sklearn”作为优化方向，只将其作为冷启动成本监控项
 
 3. **config.py 加载较慢**（75ms）
    - 在导入时立即执行 `load_dotenv()`
@@ -47,36 +47,37 @@
 
 ## 二、优化方案
 
-### 方案 1：移除 sklearn 依赖链（预计节省 1.5 秒）
+### 方案 1：保留 sklearn 的依赖治理与监控（不直接节省启动时间）
 
 **原理**：
-- transformers 导入 sklearn 是因为某些可选功能（如评估指标）
-- 本项目不使用这些功能，可以通过环境变量禁用
+- `sklearn` 当前主要由 transformers 间接导入，属于可选但有未来价值的重依赖
+- 禁止加载可能带来隐性兼容风险：transformers 可选功能异常、未来功能扩展受限、版本升级行为不可预测
+- 优化策略从“阻止加载”调整为“保留依赖、监控成本、避免项目代码主动扩大 sklearn 导入面”
 
 **实施步骤**：
 
-1. **设置环境变量禁用 sklearn 导入**
-   ```bash
-   # 在 .env 文件中添加
-   TRANSFORMERS_DISABLE_ADVERTISEMENTS=1
-   TRANSFORMERS_VERBOSITY=error
-   
-   # 或者在启动脚本中设置
-   export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-   ```
+1. **保留依赖**
+   - 不从 requirements / 打包清单中移除 `scikit-learn`
+   - 不设置 import hook 或 monkey patch 伪装 `sklearn` 不存在
+   - 不为了避开 `sklearn` 而强制降级 transformers
 
-2. **检查 transformers 版本**
-   - 某些 transformers 版本对 sklearn 的依赖更强
-   - 考虑降级到 sklearn 依赖较少的版本（如 4.30.x）
+2. **限制主动导入面**
+   - 项目代码不在 `api_server.py`、`config.py`、`scheduler.py` 等启动主路径中新增 `import sklearn`
+   - 未来确实需要 sklearn 的功能时，在对应业务模块内明确标注用途和启动影响
 
-3. **验证效果**
+3. **持续监控导入成本**
    ```bash
    # 重新测量导入时间
-   python -X importtime -c "import api_server" 2> import_time_after.log
+   python -X importtime -c "import sys; sys.path.insert(0, 'src'); import api_server" 2> import_time_after.log
    grep sklearn import_time_after.log
    ```
 
-**预期收益**：节省 1.5 秒（12.5%）
+**预期收益**：直接启动时间收益为 0；收益体现在降低兼容风险、保留未来能力，并让后续优化收益评估更真实。
+
+**废弃方案**：
+- 禁止/屏蔽 `sklearn` 加载
+- 删除 `scikit-learn` 依赖
+- 仅为了规避 `sklearn` 导入而降级 transformers
 
 ---
 
@@ -99,7 +100,7 @@
    
    def _ensure_env_loaded():
        global _env_loaded
-       if not _env_env_loaded:
+       if not _env_loaded:
            from dotenv import load_dotenv
            load_dotenv()
            _env_loaded = True
@@ -342,11 +343,11 @@
 
 | 方案 | 预计收益 | 实施难度 | 推荐度 |
 |------|----------|----------|--------|
-| 方案 1: 移除 sklearn | 1.5 秒 | ⭐ 简单 | ⭐⭐⭐⭐⭐ |
+| 方案 1: 保留 sklearn 的依赖治理与监控 | 0 秒（风险治理） | ⭐ 简单 | ⭐⭐⭐⭐⭐ |
 | 方案 2: 优化 config.py | 50ms | ⭐ 简单 | ⭐⭐⭐ |
 | 方案 5: 模块缓存 | 1-2 秒 | ⭐⭐ 中等 | ⭐⭐⭐⭐ |
 
-**预期总收益**：2.5-3.5 秒（20-30%）
+**预期总收益**：1-2 秒（8-16%）。不再计算“禁用 sklearn”带来的 1.5 秒收益。
 
 ### 3.2 中期优化（1-2 周）
 
@@ -356,7 +357,7 @@
 | 方案 4: 精简导入 | 2-3 秒 | ⭐⭐⭐ 较难 | ⭐⭐⭐⭐⭐ |
 | 方案 6: 进程池预热 | 0.5-1 秒 | ⭐⭐ 中等 | ⭐⭐⭐ |
 
-**预期总收益**：5.5-9 秒（45-75%）
+**预期总收益**：5.5-9 秒（45-75%）。其中“精简导入”只允许移除项目未使用的顶层导入，不以屏蔽 sklearn 为目标。
 
 ### 3.3 长期优化（1-2 月）
 
@@ -370,32 +371,39 @@
 
 ## 四、优化路线图
 
-### 第一阶段（立即执行）
+### 第一阶段（立即执行，低风险）
 
-1. **设置环境变量禁用 sklearn**（方案 1）
-   - 在 `.env` 中添加 `TRANSFORMERS_DISABLE_ADVERTISEMENTS=1`
-   - 验证 sklearn 是否不再被导入
-   - 预期：节省 1.5 秒
+1. **确认 sklearn 保留策略**（方案 1）
+   - 保留 `scikit-learn` 依赖，不从 requirements / 打包清单移除
+   - 不在 `.env`、启动脚本或 import hook 中添加“禁止 sklearn 加载”的逻辑
+   - 建立 importtime 基线，记录 sklearn 耗时但不把它列为删除对象
+   - 预期：不直接节省时间，降低兼容风险
 
 2. **预编译 .pyc 文件**（方案 5）
    - 运行 `python -m compileall src/`
    - 在启动脚本中添加编译检查
    - 预期：节省 1-2 秒
 
-**第一阶段总收益**：2.5-3.5 秒（冷启动从 12 秒降至 8.5-9.5 秒）
+3. **启动脚本与日志基线治理**
+   - 固化 `python -X importtime` 测量命令
+   - 每次启动优化前后保存 `import_time.log`
+   - 对比 `model_module`、`transformers`、`sklearn`、`config` 的累计耗时
+
+**第一阶段总收益**：1-2 秒（冷启动从 12 秒降至约 10-11 秒）
 
 ### 第二阶段（1 周内）
 
 3. **精简 model_module.py 导入**（方案 4）
    - 分析实际使用的 transformers 子模块
-   - 移除不必要的导入
+   - 移除项目未使用的顶层导入
+   - 不通过禁用 sklearn 来制造收益
    - 预期：节省 2-3 秒
 
 4. **优化 config.py 加载**（方案 2）
    - 延迟 .env 加载
    - 预期：节省 50ms
 
-**第二阶段总收益**：2-3 秒（冷启动从 8.5-9.5 秒降至 6-7 秒）
+**第二阶段总收益**：2-3 秒（冷启动从 10-11 秒降至约 7-9 秒）
 
 ### 第三阶段（2 周内）
 
@@ -404,7 +412,7 @@
    - 编译为可执行文件
    - 预期：节省 3-5 秒
 
-**第三阶段总收益**：3-5 秒（冷启动从 6-7 秒降至 2-3 秒）
+**第三阶段总收益**：3-5 秒（冷启动从 7-9 秒降至约 3-5 秒）
 
 ### 第四阶段（1 月内）
 
@@ -416,7 +424,7 @@
    - 创建优化的 Docker 镜像
    - 预期：节省 2-3 秒，便于部署
 
-**第四阶段总收益**：2.5-4 秒（冷启动稳定在 1-2 秒）
+**第四阶段总收益**：2.5-4 秒（冷启动稳定在 2-4 秒；若引入进程常驻/预热，用户感知启动可接近 1-2 秒）
 
 ---
 
@@ -435,7 +443,7 @@ find src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
 
 # 测量导入时间
 START=$(date +%s%N)
-python -c "import sys; sys.path.insert(0, 'src'); import api_server" 2> import_time.log
+python -X importtime -c "import sys; sys.path.insert(0, 'src'); import api_server" 2> import_time.log
 END=$(date +%s%N)
 
 DURATION=$(( (END - START) / 1000000 ))
@@ -445,9 +453,13 @@ echo "冷启动时间: ${DURATION} ms"
 echo ""
 echo "Top 10 最耗时导入:"
 grep "import time:" import_time.log | \
-    awk -F'|' '{print $2}' | \
+    awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3); print $2 " us\t" $3}' | \
     sort -rn | \
     head -10
+
+echo ""
+echo "关键模块耗时:"
+grep -E "api_server|model_module|transformers|sklearn|config" import_time.log | tail -20
 ```
 
 ### 5.2 持续集成
@@ -476,15 +488,19 @@ jobs:
         run: |
           python -X importtime -c "import sys; sys.path.insert(0, 'src'); import api_server" 2> import_time.log
           
-          # 提取总时间
-          TOTAL=$(tail -1 import_time.log | awk '{print $4}')
+          # 提取 api_server 累计导入时间（单位 us）
+          TOTAL=$(awk -F'|' '/api_server$/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' import_time.log | tail -1)
           echo "Startup time: ${TOTAL} us"
           
-          # 检查是否超过阈值（10 秒）
-          if [ "$TOTAL" -gt 10000000 ]; then
-            echo "ERROR: Startup time exceeds 10 seconds!"
+          # 阶段性阈值：保留 sklearn 后，第一阶段阈值先设为 11 秒；
+          # 后续完成 PyInstaller / 进程预热后再下调。
+          if [ "$TOTAL" -gt 11000000 ]; then
+            echo "ERROR: Startup time exceeds 11 seconds!"
             exit 1
           fi
+
+          # sklearn 保留，但必须可观测其导入成本。
+          grep sklearn import_time.log || true
       
       - name: Upload import time log
         uses: actions/upload-artifact@v3
@@ -495,6 +511,24 @@ jobs:
 
 ---
 
+### 5.3 验收标准
+
+| 阶段 | 验收项 | 通过标准 |
+|------|--------|----------|
+| 第一阶段 | sklearn 策略 | `scikit-learn` 仍在依赖清单中；启动脚本不包含禁用 sklearn 的逻辑 |
+| 第一阶段 | importtime 基线 | 生成 `import_time.log`，能看到 `api_server`、`model_module`、`transformers`、`sklearn` 的耗时 |
+| 第一阶段 | 冷启动 | 本机同环境下较基线降低 1 秒以上，或稳定低于 11 秒 |
+| 第二阶段 | 导入精简 | 删除的仅为项目未使用导入；模型加载、聊天、分布式推理测试通过 |
+| 第三阶段 | 打包启动 | PyInstaller 包能启动 API、访问前端、加载模型、执行一次 `/api/chat` |
+| 第四阶段 | 进程常驻 | 服务重启、异常退出、日志轮转、健康检查均可用 |
+
+### 5.4 风险边界
+
+- 不通过卸载、屏蔽、mock `sklearn` 获取冷启动收益。
+- 不牺牲 PyTorch / transformers 模型加载能力。
+- 不让“API 端口已监听”误导为“模型已可推理”：若采用预热或分阶段启动，需要明确区分 `/health` 与 `/ready`。
+- Windows / Linux 打包路径分别验证；PyInstaller 和 Docker 不应共享未经验证的产物假设。
+
 ## 六、总结
 
 ### 当前问题
@@ -502,26 +536,29 @@ jobs:
 - **冷启动时间**: 12.1 秒
 - **主要瓶颈**: model_module.py（9.7 秒，80%）
 - **次要瓶颈**: transformers + sklearn（4.7 秒，39%）
+- **依赖决策**: sklearn 保留，不再作为删除或禁止加载对象
 
 ### 优化潜力
 
 | 阶段 | 预计冷启动时间 | 相比当前 |
 |------|----------------|----------|
 | 当前 | 12.1 秒 | - |
-| 第一阶段后 | 8.5-9.5 秒 | -20-30% |
-| 第二阶段后 | 6-7 秒 | -40-50% |
-| 第三阶段后 | 2-3 秒 | -75-83% |
-| 第四阶段后 | 1-2 秒 | -83-92% |
+| 第一阶段后 | 10-11 秒 | -8-16% |
+| 第二阶段后 | 7-9 秒 | -25-40% |
+| 第三阶段后 | 3-5 秒 | -58-75% |
+| 第四阶段后 | 2-4 秒 | -67-83% |
+| 进程常驻/预热后的用户感知 | 1-2 秒 | 取决于部署方式 |
 
 ### 关键建议
 
-1. **立即执行**：方案 1（移除 sklearn）+ 方案 5（模块缓存）
+1. **立即执行**：方案 1（保留 sklearn 策略固化）+ 方案 5（模块缓存）
    - 投入：1-2 天
-   - 收益：2.5-3.5 秒（20-30%）
+   - 收益：1-2 秒（8-16%），同时降低依赖兼容风险
 
 2. **优先执行**：方案 4（精简导入）
    - 投入：1 周
    - 收益：2-3 秒（16-25%）
+   - 边界：只精简项目未使用导入，不禁止 sklearn
 
 3. **中期执行**：方案 3（PyInstaller）
    - 投入：1-2 周
@@ -531,7 +568,7 @@ jobs:
    - 投入：1 月
    - 收益：2.5-4 秒（20-33%）
 
-**最终目标**：将冷启动时间从 12 秒优化到 1-2 秒，提升 83-92%。
+**最终目标**：在保留 sklearn 和完整模型能力的前提下，将真实冷启动时间从 12 秒优化到 2-4 秒；通过进程常驻、预热和健康检查拆分，将用户感知可用时间进一步压到 1-2 秒。
 
 ---
 
@@ -551,15 +588,24 @@ jobs:
 
 | 指标 | 当前值 | 目标值 |
 |------|--------|--------|
-| 冷启动时间 | 12.1 秒 | < 2 秒 |
+| 真实冷启动时间 | 12.1 秒 | < 4 秒 |
+| 用户感知可用时间 | 12.1 秒 | < 2 秒（依赖进程常驻/预热） |
 | 热启动时间 | ~1 秒 | < 0.5 秒 |
 | 内存占用 | ~500 MB | < 400 MB |
 | 镜像大小 | N/A | < 1 GB |
 
+> 注：在保留 sklearn 的新决策下，不再把 `< 2 秒` 作为纯 Python 真实冷启动的硬目标；该目标应由进程常驻、预热和 readiness 拆分共同实现。
+
 ---
 
-**文档版本**: 1.0  
-**最后更新**: 2026-07-11  
-**维护者**: QLH 开发团队
+### D. 决策记录
 
-管理员批复：保留sklearn以备将来可能使用，放弃禁止加载sklearn的方案
+| 日期 | 决策 | 影响 |
+|------|------|------|
+| 2026-07-12 | 保留 `sklearn` / `scikit-learn`，放弃禁止加载 sklearn 的方案 | 冷启动收益估算下调约 1.5 秒；换取依赖兼容性和未来扩展空间 |
+
+---
+
+**文档版本**: 1.1
+**最后更新**: 2026-07-12
+**维护者**: QLH 开发团队

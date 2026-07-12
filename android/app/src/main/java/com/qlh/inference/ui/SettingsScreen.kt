@@ -825,7 +825,7 @@ fun SettingsScreen(
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "版本 0.1.0 (Android)",
+                text = "版本 ${BuildConfig.VERSION_NAME} (Android)",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

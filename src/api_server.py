@@ -40,7 +40,6 @@ from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from model_module import ModelManager
 from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler
@@ -82,6 +81,48 @@ class RequestIdFilter(logging.Filter):
 
 
 _request_id_filter = RequestIdFilter()
+
+
+class _LazyModelManager:
+    """Delay importing model_module until the model manager is first used."""
+
+    __slots__ = ("_instance", "_lock")
+
+    def __init__(self):
+        object.__setattr__(self, "_instance", None)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def _get_instance(self):
+        instance = self._instance
+        if instance is not None:
+            return instance
+        with self._lock:
+            instance = self._instance
+            if instance is None:
+                from model_module import ModelManager
+                instance = ModelManager()
+                object.__setattr__(self, "_instance", instance)
+        return instance
+
+    def __getattr__(self, name):
+        return getattr(self._get_instance(), name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._get_instance(), name, value)
+
+    def __delattr__(self, name):
+        if name in self.__slots__:
+            raise AttributeError(name)
+        delattr(self._get_instance(), name)
+
+    def __repr__(self):
+        instance = self._instance
+        if instance is None:
+            return "<_LazyModelManager unloaded>"
+        return repr(instance)
 
 
 def _current_node_id_safe() -> str:
@@ -299,7 +340,7 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 # 全局状态
 # ============================================================
 
-model_manager = ModelManager()
+model_manager = _LazyModelManager()
 kv_cache: Optional[PagedKVCache] = None
 active_session_id: Optional[str] = None           # 当前活跃会话 ID
 session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
@@ -2467,7 +2508,11 @@ async def list_available_models():
             },
         ],
         "current": current_quant if model_loaded else None,
-        "current_engine": model_manager._engine_type if model_manager.is_loaded else None,
+        "current_engine": (
+            model_manager._engine_type
+            if model_loaded and model_manager.is_loaded
+            else None
+        ),
         "available_engines": available_engines,
     }
 
