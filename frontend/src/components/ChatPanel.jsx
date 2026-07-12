@@ -3,6 +3,10 @@ import { sendMessage, sendMessageStream, clearChat, fetchPresets, uploadFile, fe
 
 const CHAT_HISTORY_KEY_PREFIX = 'qlh-chat-history-';
 
+// L3: 生产构建下关闭聊天诊断日志
+const DEBUG_CHAT = import.meta.env.DEV;
+const debugLog = (...args) => { if (DEBUG_CHAT) console.log(...args); };
+
 export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsTrigger, onOpenSettings, settings, sessionId, onCreateSession, onRenameSession }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -118,7 +122,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   // 诊断日志：追踪 messages 数组变化
   useEffect(() => {
     const summary = messages.map((m) => `${m.role}(${m.content.slice(0, 20)}...)`).join(', ');
-    console.log(`[ChatPanel] messages updated: count=${messages.length}, roles=[${summary}]`);
+    debugLog(`[ChatPanel] messages updated: count=${messages.length}, roles=[${summary}]`);
   }, [messages]);
 
   // Focus input on mount
@@ -138,7 +142,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     setHistoryLoading(true);
 
     const loadHistory = async () => {
-      console.log('[ChatPanel] history-loading: fetch start', { sessionId, storageKey });
+      debugLog('[ChatPanel] history-loading: fetch start', { sessionId, storageKey });
       // ★ 先同步后端活跃会话状态（确保 session_histories 中已加载该会话）
       try {
         await activateSession(sessionId);
@@ -148,7 +152,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       // 再从服务器（数据库 / 本地文件 / 后端内存）加载完整历史（含 metrics/followups）
       try {
         const res = await fetchConversations(sessionId);
-        console.log('[ChatPanel] history-loading: server response', {
+        debugLog('[ChatPanel] history-loading: server response', {
           sessionId,
           cancelled,
           messagesCount: res?.messages?.length,
@@ -172,7 +176,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             };
           });
           if (!cancelled) {
-            console.log('[ChatPanel] history-loading: SET messages from server', { count: msgs.length, source: res?.source });
+            debugLog('[ChatPanel] history-loading: SET messages from server', { count: msgs.length, source: res?.source });
             setMessages(msgs);
             setHistoryLoading(false);
           }
@@ -182,7 +186,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         }
         // 服务器返回空 → 尝试 localStorage 缓存
       } catch (err) {
-        console.log('[ChatPanel] history-loading: server fetch failed, trying localStorage', { sessionId, error: err.message });
+        debugLog('[ChatPanel] history-loading: server fetch failed, trying localStorage', { sessionId, error: err.message });
       }
 
       // 降级：从 localStorage 加载（本地持久化主存储，或服务器不可用时的回退）
@@ -192,7 +196,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           const parsed = JSON.parse(saved);
           if (Array.isArray(parsed) && parsed.length > 0) {
             if (!cancelled) {
-              console.log('[ChatPanel] history-loading: SET messages from localStorage', { count: parsed.length });
+              debugLog('[ChatPanel] history-loading: SET messages from localStorage', { count: parsed.length });
               setMessages(parsed);
               const lastAssistant = [...parsed].reverse().find(m => m.role === 'assistant');
               if (lastAssistant?.metrics) {
@@ -207,7 +211,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
 
       // 无历史（新会话或全部清空）
       if (!cancelled) {
-        console.log('[ChatPanel] history-loading: NO history (empty session)', { sessionId });
+        debugLog('[ChatPanel] history-loading: NO history (empty session)', { sessionId });
         setHistoryLoading(false);
       }
     };
@@ -256,7 +260,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   // ---- 会话切换时清空当前消息（由历史加载 effect 重新填充） ----
   useEffect(() => {
     const prevSid = prevSessionIdRef.current;
-    console.log('[ChatPanel] session-switch effect:', {
+    debugLog('[ChatPanel] session-switch effect:', {
       prevSessionId: prevSid,
       newSessionId: sessionId,
       autoCreatedSessionId: autoCreatedSessionId.current,
@@ -277,12 +281,12 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
 
     if (sessionId && autoCreatedSessionId.current === sessionId) {
       // handleSend 刚自动创建此会话，消息已由 handleSend 添加，不清空
-      console.log('[ChatPanel] session-switch: SKIP clear (auto-created session match)', { sessionId });
+      debugLog('[ChatPanel] session-switch: SKIP clear (auto-created session match)', { sessionId });
       autoCreatedSessionId.current = null;
       return;
     }
     // 无论何种切换，始终重置此标记（防止因渲染批处理导致残留）
-    console.log('[ChatPanel] session-switch: CLEAR messages', { prevAutoCreated: autoCreatedSessionId.current, newSid: sessionId });
+    debugLog('[ChatPanel] session-switch: CLEAR messages', { prevAutoCreated: autoCreatedSessionId.current, newSid: sessionId });
     autoCreatedSessionId.current = null;
     setMessages([]);
     setSending(false);  // P2-2修复: 重置发送状态，解锁新会话的发送按钮
@@ -300,7 +304,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     } else {
       setPresets(null);
     }
-  }, [modelLoaded, messages.length === 0]);
+  }, [modelLoaded]);
 
   const handleSendRef = useRef(null);
 
@@ -345,10 +349,10 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     let effectiveSessionId = sessionId;
     let isAutoCreated = false;
     if (!effectiveSessionId) {
-      console.log('[ChatPanel] handleSend: no active session, auto-creating...');
+      debugLog('[ChatPanel] handleSend: no active session, auto-creating...');
       if (creatingSessionRef.current) {
         // 已有创建任务在进行中，避免并发创建重复会话
-        console.log('[ChatPanel] handleSend: BLOCKED by creatingSessionRef');
+        debugLog('[ChatPanel] handleSend: BLOCKED by creatingSessionRef');
         onToast?.({ type: 'info', msg: '正在创建对话，请稍候...' });
         return;
       }
@@ -359,7 +363,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         effectiveSessionId = session.id;
         isAutoCreated = true;
         autoCreatedSessionId.current = session.id;  // 抑制此 ID 的 session-switch effect
-        console.log('[ChatPanel] handleSend: auto-created session', { sessionId: session.id, title });
+        debugLog('[ChatPanel] handleSend: auto-created session', { sessionId: session.id, title });
         onCreateSession?.(session);  // 通知父组件更新会话列表
       } catch (err) {
         autoCreatedSessionId.current = null;
@@ -415,7 +419,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     abortControllerRef.current = abortController;
 
     try {
-      console.log('[ChatPanel] handleSend: sending message...', {
+      debugLog('[ChatPanel] handleSend: sending message...', {
         effectiveSessionId,
         currentSessionId: currentSessionIdRef.current,
         textPreview: text.slice(0, 30),
@@ -440,7 +444,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         res = await sendMessageStream(fullMessage, {
           sessionId: effectiveSessionId,
           signal: abortController.signal,
-          maxNewTokens: settings?.maxNewTokens ?? 512,
+          maxNewTokens: settings?.maxNewTokens ?? 1024,
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,
@@ -458,7 +462,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
 
         // 推理期间用户可能切换了会话——丢弃结果
         if (currentSessionIdRef.current !== effectiveSessionId) {
-          console.log('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
+          debugLog('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
           return;
         }
 
@@ -477,20 +481,20 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         res = await sendMessage(fullMessage, {
           sessionId: effectiveSessionId,
           signal: abortController.signal,
-          maxNewTokens: settings?.maxNewTokens ?? 512,
+          maxNewTokens: settings?.maxNewTokens ?? 1024,
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,
         });
 
         // 推理期间用户可能切换了会话——丢弃结果，不污染新会话的消息列表
-        console.log('[ChatPanel] handleSend: response received, checking session match...', {
+        debugLog('[ChatPanel] handleSend: response received, checking session match...', {
           currentSessionId: currentSessionIdRef.current,
           effectiveSessionId,
           match: currentSessionIdRef.current === effectiveSessionId,
         });
         if (currentSessionIdRef.current !== effectiveSessionId) {
-          console.log('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
+          debugLog('[ChatPanel] handleSend: ABORT — session changed during inference, discarding result');
           return;
         }
 
@@ -542,7 +546,6 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     } catch (err) {
       // AbortError = 用户切换会话导致请求被取消，静默忽略
       if (err.name === 'AbortError') {
-        setSending(false);
         return;
       }
       // Phase 3.1: 移除非 AbortError 时残留的空白助手占位消息
@@ -652,7 +655,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       </div>
 
       {/* Messages */}
-      {(() => { console.log('[ChatPanel] render decision:', { messagesLen: messages.length, historyLoading, sessionId, sending }); return null; })()}
+      {(() => { debugLog('[ChatPanel] render decision:', { messagesLen: messages.length, historyLoading, sessionId, sending }); return null; })()}
       {messages.length === 0 ? (
         historyLoading ? (
           <div className="empty-state">

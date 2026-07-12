@@ -263,7 +263,7 @@ class LocalInferenceEngine(private val context: Context) {
      */
     fun generateStream(
         prompt: String,
-        maxTokens: Int = 512,
+        maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f
     ): Flow<String> = callbackFlow {
@@ -287,7 +287,7 @@ class LocalInferenceEngine(private val context: Context) {
      */
     suspend fun generate(
         prompt: String,
-        maxTokens: Int = 512,
+        maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f
     ): Result<String> = withContext(Dispatchers.IO) {

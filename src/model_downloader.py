@@ -128,8 +128,9 @@ HUGGINGFACE_CMD_GGUF = (
 # ModelScope — GGUF（国内镜像，速度快）
 # ModelScope 上有部分 GGUF 镜像仓库
 MODELSCOPE_CMD_GGUF = (
-    "huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf "
-    "Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/"
+    'python -c "from modelscope import snapshot_download; '
+    "snapshot_download('RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf', "
+    "local_dir='models/')\""
 )
 
 

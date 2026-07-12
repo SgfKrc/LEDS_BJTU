@@ -23,6 +23,10 @@ import re
 import time
 import sys
 import os
+import threading
+import uuid
+from collections import Counter, deque
+from contextvars import ContextVar
 from typing import Optional
 
 import torch
@@ -32,11 +36,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from model_module import ModelManager
 from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler
@@ -44,7 +47,7 @@ import model_config as mc
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
     DEVICE, PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN, RUN_MODE,
-    NODE_ROLE, NODE_ID, MAX_NODES,
+    NODE_ROLE, NODE_ID, MAX_NODES, SERVER_IP, SERVER_PORT, API_PORT,
 )
 
 # 数据库模块（可选，未安装 psycopg2 时使用内存降级）
@@ -64,10 +67,125 @@ _db_available = _db_importable
 # 本地文件储存（云数据库不可用时的降级方案）
 import local_store as _local_store
 
-def _close_logging_handlers():
-    """关闭并移除 root logger 上的 handlers，避免 Windows 下日志文件被占用。"""
+_request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+_LOG_BUFFER_MAXLEN = 5000
+_log_buffer: deque[dict] = deque(maxlen=_LOG_BUFFER_MAXLEN)
+_log_buffer_lock = threading.RLock()
+_log_buffer_total_seen = 0
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_ctx.get("-")
+        return True
+
+
+_request_id_filter = RequestIdFilter()
+
+
+class _LazyModelManager:
+    """Delay importing model_module until the model manager is first used."""
+
+    __slots__ = ("_instance", "_lock")
+
+    def __init__(self):
+        object.__setattr__(self, "_instance", None)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def _get_instance(self):
+        instance = self._instance
+        if instance is not None:
+            return instance
+        with self._lock:
+            instance = self._instance
+            if instance is None:
+                from model_module import ModelManager
+                instance = ModelManager()
+                object.__setattr__(self, "_instance", instance)
+        return instance
+
+    def __getattr__(self, name):
+        return getattr(self._get_instance(), name)
+
+    def __setattr__(self, name, value):
+        if name in self.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._get_instance(), name, value)
+
+    def __delattr__(self, name):
+        if name in self.__slots__:
+            raise AttributeError(name)
+        delattr(self._get_instance(), name)
+
+    def __repr__(self):
+        instance = self._instance
+        if instance is None:
+            return "<_LazyModelManager unloaded>"
+        return repr(instance)
+
+
+def _current_node_id_safe() -> str:
+    try:
+        return scheduler.get_effective_node_id()
+    except Exception:
+        return NODE_ID
+
+
+def _current_device_ip_safe() -> str:
+    try:
+        return getattr(scheduler, "_lan_ip", "") or SERVER_IP
+    except Exception:
+        return SERVER_IP
+
+
+class MemoryLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        global _log_buffer_total_seen
+        try:
+            entry = {
+                "timestamp": time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime(record.created),
+                ),
+                "level": record.levelname,
+                "levelno": record.levelno,
+                "name": record.name,
+                "message": record.getMessage(),
+                "filename": record.filename,
+                "lineno": record.lineno,
+                "funcName": record.funcName,
+                "request_id": getattr(record, "request_id", _request_id_ctx.get("-")),
+                "node_id": _current_node_id_safe(),
+                "device_ip": _current_device_ip_safe(),
+                "thread": record.threadName,
+            }
+            if record.exc_info:
+                entry["exc_text"] = self.format(record)
+            with _log_buffer_lock:
+                _log_buffer_total_seen += 1
+                entry["seq"] = _log_buffer_total_seen
+                _log_buffer.append(entry)
+        except Exception:
+            self.handleError(record)
+
+
+def _close_logging_handlers(keep_memory: bool = False):
+    """
+    关闭并移除 root logger 上的 handlers，避免 Windows 下日志文件被占用。
+
+    Args:
+        keep_memory: 若为 True，保留 MemoryLogHandler 和 StreamHandler，
+                     仅关闭文件类 handler（RotatingFileHandler）。
+                     用于日志文件删除操作期间维持内存缓冲和终端输出。
+    """
     root = logging.getLogger()
     for handler in root.handlers[:]:
+        is_file_handler = isinstance(handler, logging.FileHandler)
+        if keep_memory and not is_file_handler and isinstance(
+            handler, (logging.StreamHandler, MemoryLogHandler)
+        ):
+            continue  # 保留终端和内存 handler，确保删除期间日志不丢失
         root.removeHandler(handler)
         try:
             handler.close()
@@ -90,7 +208,9 @@ def setup_logging():
     # 控制台 handler
     ch = logging.StreamHandler(sys.stderr)
     ch.setLevel(level)
-    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    ch.addFilter(_request_id_filter)
+    ch.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] request_id=%(request_id)s %(message)s"))
     root.addHandler(ch)
 
     # 文件 handler（按日期 + 大小滚动）
@@ -101,9 +221,18 @@ def setup_logging():
         encoding="utf-8",
     )
     fh.setLevel(level)
+    fh.addFilter(_request_id_filter)
     fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        "%(asctime)s [%(levelname)s] request_id=%(request_id)s %(name)s: %(message)s"))
     root.addHandler(fh)
+
+    # 内存环形缓冲 handler（用于 /api/logs/recent，不持有文件句柄）
+    mh = MemoryLogHandler()
+    mh.setLevel(level)
+    mh.addFilter(_request_id_filter)
+    mh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] request_id=%(request_id)s %(name)s: %(message)s"))
+    root.addHandler(mh)
 
     # uvicorn 日志也走文件
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
@@ -119,10 +248,24 @@ logger = logging.getLogger("api_server")
 # FastAPI 应用初始化
 # ============================================================
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）"""
+    # ---- startup ----
+    await _startup_device_detection()
+    yield
+    # ---- shutdown ----
+    await _shutdown_resources()
+
+
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
     version="0.1.7",
     description="北京交通大学 · 大学生创新创业训练计划",
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -134,11 +277,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _normalize_request_id(value: str | None) -> str:
+    if not value:
+        return uuid.uuid4().hex
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]", "", value.strip())
+    if not cleaned:
+        return uuid.uuid4().hex
+    return cleaned[:64]
+
+
+@app.middleware("http")
+async def request_id_logging_middleware(request: Request, call_next):
+    request_id = _normalize_request_id(request.headers.get("X-Request-ID"))
+    token = _request_id_ctx.set(request_id)
+    start = time.perf_counter()
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception:
+        logger.error(
+            "event=http_request_error request_id=%s method=%s path=%s status=%s",
+            request_id, request.method, request.url.path, status_code,
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "服务器内部错误，请查看后端日志", "request_id": request_id},
+            headers={"X-Request-ID": request_id},
+        )
+    finally:
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        logger.info(
+            "event=http_request request_id=%s method=%s path=%s status=%s duration_ms=%s",
+            request_id, request.method, request.url.path, status_code, duration_ms,
+        )
+        _request_id_ctx.reset(token)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_with_request_id(request: Request, exc: HTTPException):
+    request_id = _request_id_ctx.get("-")
+    headers = dict(exc.headers or {})
+    headers["X-Request-ID"] = request_id
+    if exc.status_code >= 500:
+        logger.error(
+            "event=http_exception request_id=%s method=%s path=%s status=%s detail=%s",
+            request_id, request.method, request.url.path, exc.status_code, exc.detail,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": request_id},
+        headers=headers,
+    )
+
 # ============================================================
 # 全局状态
 # ============================================================
 
-model_manager = ModelManager()
+model_manager = _LazyModelManager()
 kv_cache: Optional[PagedKVCache] = None
 active_session_id: Optional[str] = None           # 当前活跃会话 ID
 session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
@@ -170,11 +372,10 @@ scheduler: Scheduler = Scheduler()
 
 
 # ============================================================
-# 启动事件 — 设备检测
+# 启动事件 — 设备检测（通过 lifespan 调用）
 # ============================================================
 
-@app.on_event("startup")
-async def startup_device_detection():
+async def _startup_device_detection():
     """启动时自动检测设备能力并缓存画像，初始化调度器"""
     global device_profile, scheduler
     try:
@@ -199,6 +400,12 @@ async def startup_device_detection():
         logger.info(f"调度器已初始化: mode={RUN_MODE}")
     except Exception as e:
         logger.error(f"调度器初始化失败: {e}")
+
+    # L5: 启动日志保留策略清理线程
+    try:
+        _start_log_retention_thread()
+    except Exception as e:
+        logger.warning(f"日志保留线程启动失败: {e}")
 
     # 初始化数据库连接
     try:
@@ -254,8 +461,11 @@ async def startup_device_detection():
         logger.warning(f"审查工单过期检查启动失败: {e}")
 
 
-@app.on_event("shutdown")
-async def shutdown_db():
+# ============================================================
+# 关闭事件 — 资源清理（通过 lifespan 调用）
+# ============================================================
+
+async def _shutdown_resources():
     """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
     # 1. 停止调度器（关闭 TCP 连接，注销从节点）
     try:
@@ -370,6 +580,16 @@ class UpdateMaxNodesRequest(BaseModel):
 class ConnectToMasterRequest(BaseModel):
     master_host: str = Field(..., description="主节点 IP 地址", min_length=1)
     master_port: int = Field(8888, ge=1, le=65535, description="主节点端口")
+
+
+class FirstConnectBootstrapRequest(BaseModel):
+    node_id: Optional[str] = Field(default=None, max_length=64, description="客户端稳定节点 ID")
+    node_type: str = Field(default="pc", description="节点类型: pc | android")
+    hostname: str = Field(default="", max_length=128, description="设备名")
+    platform: str = Field(default="", max_length=64, description="平台: windows | linux | android")
+    app_variant: str = Field(default="", max_length=32, description="Android full | lite")
+    app_version: str = Field(default="", max_length=64, description="客户端版本")
+    capabilities: dict = Field(default_factory=dict, description="设备画像/能力")
 
 
 # ============================================================
@@ -1528,7 +1748,7 @@ async def load_model(req: LoadModelRequest):
 
     except Exception as e:
         model_loaded = False
-        logger.error(f"模型加载失败: {e}")
+        logger.error(f"模型加载失败: {e}", exc_info=True)
         raise HTTPException(500, f"模型加载失败: {str(e)}")
 
 
@@ -1559,6 +1779,7 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("fallback_reason", "")
     result.setdefault("workers_used", [])
     result.setdefault("layer_assignments", [])
+    result.setdefault("request_id", _request_id_ctx.get("-"))
     return result
 
 
@@ -1600,6 +1821,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 top_p=req.top_p,
                 show_thinking=req.show_thinking,
                 session_id=req.session_id,
+                request_id=_request_id_ctx.get("-"),   # L5: 链路追踪
             )
             if result.get("status") == "ok":
                 history.append({"role": "user", "content": req.message})
@@ -1829,7 +2051,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 scheduler.record_task_error()
             except Exception:
                 pass
-            logger.error(f"llama.cpp 推理失败: {e}")
+            logger.error(f"llama.cpp 推理失败: {e}", exc_info=True)
             raise HTTPException(500, f"推理失败: {str(e)}")
 
     # ---- PyTorch 引擎路径（CUDA/独显）----
@@ -1965,7 +2187,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             scheduler.record_task_error()
         except Exception:
             pass
-        logger.error(f"推理异常: {e}")
+        logger.error(f"推理异常: {e}", exc_info=True)
         raise HTTPException(500, f"推理失败: {str(e)}")
 
 
@@ -2065,7 +2287,7 @@ async def chat(req: ChatRequest):
 # ================================================================
 
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: Request):
     """
     流式聊天端点 (Server-Sent Events)。
 
@@ -2087,8 +2309,30 @@ async def chat_stream(req: ChatRequest):
         data: {"done": true, "response": "...", "followups": [...], "metrics": {...}}
     """
     import json as _json
+    request_id = _request_id_ctx.get("-")
 
     async def _generate():
+        token = _request_id_ctx.set(request_id)
+        try:
+            async for chunk in _generate_events():
+                yield chunk
+        finally:
+            _request_id_ctx.reset(token)
+
+    async def _run_with_request_id(loop, func):
+        def _runner():
+            token = _request_id_ctx.set(request_id)
+            try:
+                return func()
+            finally:
+                _request_id_ctx.reset(token)
+
+        return await loop.run_in_executor(None, _runner)
+
+    def _error_event(message: str) -> str:
+        return f"data: {_json.dumps({'done': True, 'error': message, 'request_id': request_id}, ensure_ascii=False)}\n\n"
+
+    async def _generate_events():
         # ================================================================
         # ★ full 模式：完整 chat 流程，假流式（SSE 单事件）
         # ================================================================
@@ -2097,26 +2341,26 @@ async def chat_stream(req: ChatRequest):
                 try:
                     _auto_load_default_model()
                 except Exception as e:
-                    yield f"data: {_json.dumps({'done': True, 'error': f'自动加载模型失败: {e}'}, ensure_ascii=False)}\n\n"
+                    logger.error(f"full 模式自动加载模型失败: {e}", exc_info=True)
+                    yield _error_event(f"自动加载模型失败: {e}")
                     return
             import asyncio
             loop = asyncio.get_event_loop()
             try:
-                result = await loop.run_in_executor(
-                    None, lambda: _execute_chat_full(req)
-                )
+                result = await _run_with_request_id(loop, lambda: _execute_chat_full(req))
                 yield f"data: {_json.dumps({
                     'done': True,
                     'response': result['content'],
                     'thinking_content': result.get('thinking_content'),
                     'followups': result['followups'],
                     'metrics': result['metrics'],
+                    'request_id': request_id,
                 }, ensure_ascii=False)}\n\n"
             except HTTPException as e:
-                yield f"data: {_json.dumps({'done': True, 'error': e.detail}, ensure_ascii=False)}\n\n"
+                yield _error_event(e.detail)
             except Exception as e:
-                logger.error(f"full 模式推理失败: {e}")
-                yield f"data: {_json.dumps({'done': True, 'error': str(e)}, ensure_ascii=False)}\n\n"
+                logger.error(f"full 模式推理失败: {e}", exc_info=True)
+                yield _error_event(str(e))
             return
 
         # ================================================================
@@ -2138,8 +2382,8 @@ async def chat_stream(req: ChatRequest):
                 ):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
-                logger.error(f"流式推理失败: {e}")
-                yield f"data: {_json.dumps({'done': True, 'error': str(e)}, ensure_ascii=False)}\n\n"
+                logger.error(f"流式推理失败: {e}", exc_info=True)
+                yield _error_event(str(e))
 
         # ---- 路径 2: 单机 PyTorch 流式 ----
         elif (model_manager._engine_type == "pytorch"
@@ -2154,15 +2398,15 @@ async def chat_stream(req: ChatRequest):
                 ):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
-                logger.error(f"单机流式推理失败: {e}")
-                yield f"data: {_json.dumps({'done': True, 'error': str(e)}, ensure_ascii=False)}\n\n"
+                logger.error(f"单机流式推理失败: {e}", exc_info=True)
+                yield _error_event(str(e))
 
         # ---- 路径 3: llama.cpp / 从节点 / 模型未加载 → 假流式回退 ----
         else:
             import asyncio
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
+            result = await _run_with_request_id(
+                loop,
                 lambda: scheduler.run_pipeline_safe(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
@@ -2172,7 +2416,9 @@ async def chat_stream(req: ChatRequest):
                 )
             )
             # 一次性返回完整结果（SSE 格式，单事件）
-            yield f"data: {_json.dumps({'done': True, 'response': result.get('response', ''), 'error': result.get('error'), 'metrics': result.get('metrics', {})}, ensure_ascii=False)}\n\n"
+            metrics = result.get('metrics', {}) or {}
+            metrics.setdefault("request_id", request_id)
+            yield f"data: {_json.dumps({'done': True, 'response': result.get('response', ''), 'error': result.get('error'), 'metrics': metrics, 'request_id': request_id}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         _generate(),
@@ -2180,6 +2426,7 @@ async def chat_stream(req: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Request-ID": request_id,
             "X-Accel-Buffering": "no",  # 禁用 nginx 缓冲
         },
     )
@@ -2261,7 +2508,11 @@ async def list_available_models():
             },
         ],
         "current": current_quant if model_loaded else None,
-        "current_engine": model_manager._engine_type if model_manager.is_loaded else None,
+        "current_engine": (
+            model_manager._engine_type
+            if model_loaded and model_manager.is_loaded
+            else None
+        ),
         "available_engines": available_engines,
     }
 
@@ -2593,6 +2844,95 @@ async def get_invite_info():
     return scheduler.get_invite_info()
 
 
+@app.post("/api/bootstrap/first-connect")
+async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Request):
+    """
+    首次连接自动部署。
+
+    安全边界：只接受 Tailscale / 受信 CIDR 来源。通过该接口下发集群密钥
+    和主节点连接信息，客户端持久化后再走现有 TCP HMAC 注册。
+    """
+    if os.environ.get("QLH_BOOTSTRAP_ENABLED", "true").strip().lower() in {"0", "false", "no"}:
+        raise HTTPException(403, "bootstrap disabled")
+
+    peer_host = request.client.host if request.client else ""
+    from bootstrap import is_trusted_bootstrap_source, normalize_node_id, normalize_node_type
+
+    require_trusted = os.environ.get("QLH_BOOTSTRAP_REQUIRE_TAILSCALE", "true").strip().lower()
+    if require_trusted not in {"0", "false", "no"}:
+        if not is_trusted_bootstrap_source(peer_host):
+            raise HTTPException(403, "source network is not trusted")
+
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "only master can serve bootstrap")
+
+    node_type = normalize_node_type(req.node_type)
+    node_id = normalize_node_id(req.node_id, node_type)
+    if node_id == "master":
+        raise HTTPException(400, "reserved node_id")
+
+    from node_config import ensure_local_cluster_secret
+    cluster_secret = ensure_local_cluster_secret()
+    try:
+        import config as cfg
+        cfg.CLUSTER_SECRET = cluster_secret
+    except Exception:
+        pass
+
+    api_host = request.url.hostname or peer_host
+    lan_ip = getattr(scheduler, "_lan_ip", "") or ""
+    if lan_ip and lan_ip not in {"0.0.0.0", "127.0.0.1", "localhost"}:
+        master_tcp_host = lan_ip
+    else:
+        master_tcp_host = api_host
+    master_api_host = api_host or master_tcp_host
+    master_api_port = request.url.port or API_PORT
+    master_tcp_port = scheduler.tcp_server.port if scheduler.tcp_server else SERVER_PORT
+
+    hostname = req.hostname or node_id
+    address = f"{peer_host}" if peer_host else ""
+    register_result = scheduler.manual_register_node(
+        node_id=node_id,
+        hostname=hostname,
+        address=address,
+        network_type="tailscale" if peer_host.startswith("100.") else "trusted",
+        node_type=node_type,
+    )
+    if register_result.get("status") in {"denied", "invalid", "full"}:
+        status_code = 403 if register_result.get("status") == "denied" else 400
+        raise HTTPException(status_code, register_result.get("reason", "bootstrap registration failed"))
+
+    pipeline_worker = node_type == "pc"
+    response = {
+        "status": "ok",
+        "cluster": {
+            "cluster_id": os.environ.get("QLH_CLUSTER_ID", "qlh-default"),
+            "master_api_host": master_api_host,
+            "master_api_port": master_api_port,
+            "master_tcp_host": master_tcp_host,
+            "master_tcp_port": master_tcp_port,
+            "cluster_secret": cluster_secret,
+        },
+        "node": {
+            "node_id": node_id,
+            "role": "client",
+            "node_type": node_type,
+            "pipeline_worker": pipeline_worker,
+        },
+        "android": {
+            "presence_interval_seconds": 45,
+            "pipeline_worker": False,
+            "model_manifest_url": f"http://{master_api_host}:{master_api_port}/api/models/downloadable",
+        },
+    }
+    logger.info(
+        "首次连接部署: node_id=%s type=%s peer=%s host=%s api=%s:%s tcp=%s:%s",
+        node_id, node_type, peer_host, hostname,
+        master_api_host, master_api_port, master_tcp_host, master_tcp_port,
+    )
+    return response
+
+
 @app.post("/api/cluster/connect")
 async def connect_to_master(req: ConnectToMasterRequest):
     """
@@ -2604,6 +2944,8 @@ async def connect_to_master(req: ConnectToMasterRequest):
     result = scheduler.connect_to_master(req.master_host, req.master_port)
     if result.get("status") == "denied":
         raise HTTPException(403, result.get("reason", "仅从节点可连接主节点"))
+    if result.get("status") == "bootstrap_failed":
+        raise HTTPException(400, result.get("reason", "首次连接自动部署失败"))
     if result.get("status") == "failed":
         raise HTTPException(400, result.get("reason", "连接失败"))
     if result.get("status") == "error":
@@ -2928,7 +3270,7 @@ class LayerOverrideItem(BaseModel):
 
 
 class LayerOverrideRequest(BaseModel):
-    assignments: list[LayerOverrideItem] = Field(..., min_items=1, description="分层覆盖列表")
+    assignments: list[LayerOverrideItem] = Field(..., min_length=1, description="分层覆盖列表")
 
 
 @app.put("/api/cluster/layers")
@@ -3856,6 +4198,92 @@ async def download_model_file(filename: str):
 
 
 _LOG_FILE_RE = re.compile(r"^[^/\\]+\.log(?:\.\d+)?$")
+_LOG_FILE_LOCK = threading.RLock()
+_LOCAL_LOG_CLIENTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost", "testclient"}
+
+
+def _get_request_client(request: Request) -> str:
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", "") if client else ""
+    return host or "unknown"
+
+
+def _get_effective_role_safe() -> str:
+    try:
+        return scheduler._effective_role()
+    except Exception:
+        return "unknown"
+
+
+def _require_log_api_access(request: Request) -> str:
+    """
+    L0 安全边界：日志可能包含隐私与调试细节，默认只允许本机访问。
+
+    远程管理员访问需要显式配置 QLH_LOG_ADMIN_TOKEN，并在请求头中传入
+    X-QLH-Log-Token。当前项目还没有 Web 登录态，所以不能仅凭 master
+    进程角色放行 LAN 浏览器。
+    """
+    client_host = _get_request_client(request)
+    if client_host in _LOCAL_LOG_CLIENTS:
+        return client_host
+
+    admin_token = os.environ.get("QLH_LOG_ADMIN_TOKEN", "").strip()
+    request_token = request.headers.get("X-QLH-Log-Token", "").strip()
+    if admin_token and request_token and request_token == admin_token:
+        return f"{client_host}:admin-token"
+
+    role = _get_effective_role_safe()
+    logger.warning(
+        "拒绝日志接口访问: client=%s role=%s path=%s",
+        client_host, role, request.url.path,
+    )
+    raise HTTPException(403, "日志接口仅允许本机访问；远程访问需管理员授权")
+
+
+def _log_admin_action(action: str, requester: str, target: str, status: str,
+                      error: str = "") -> None:
+    role = _get_effective_role_safe()
+    if error:
+        logger.warning(
+            "日志管理操作: action=%s requester=%s role=%s target=%s status=%s error=%s",
+            action, requester, role, target, status, error,
+        )
+    else:
+        logger.info(
+            "日志管理操作: action=%s requester=%s role=%s target=%s status=%s",
+            action, requester, role, target, status,
+        )
+
+
+def _snapshot_recent_logs() -> tuple[list[dict], int]:
+    with _log_buffer_lock:
+        return [dict(item) for item in _log_buffer], _log_buffer_total_seen
+
+
+def _normalize_log_limit(limit: int) -> int:
+    return max(1, min(int(limit or 200), 1000))
+
+
+def _filter_recent_logs(entries: list[dict], level: str = "", name: str = "",
+                        node_id: str = "", request_id: str = "") -> list[dict]:
+    level = (level or "").strip().upper()
+    name = (name or "").strip()
+    node_id = (node_id or "").strip()
+    request_id = (request_id or "").strip()
+
+    if level:
+        levelno = logging._nameToLevel.get(level)
+        if isinstance(levelno, int):
+            entries = [item for item in entries if item.get("levelno", 0) >= levelno]
+        else:
+            entries = [item for item in entries if item.get("level", "").upper() == level]
+    if name:
+        entries = [item for item in entries if name in item.get("name", "")]
+    if node_id:
+        entries = [item for item in entries if item.get("node_id") == node_id]
+    if request_id:
+        entries = [item for item in entries if item.get("request_id") == request_id]
+    return entries
 
 
 def _is_log_filename(filename: str) -> bool:
@@ -3875,101 +4303,597 @@ def _validate_log_filename(filename: str) -> str:
 
 
 @app.get("/api/logs")
-async def list_log_files():
+async def list_log_files(request: Request):
     """列出 LOG_DIR 中所有 .log 文件，按修改时间降序。"""
     from config import LOG_DIR
     from datetime import datetime
 
-    if not os.path.isdir(LOG_DIR):
-        return {"files": []}
+    _require_log_api_access(request)
 
     files = []
-    for fname in os.listdir(LOG_DIR):
-        if not _is_log_filename(fname):
-            continue
-        fpath = os.path.join(LOG_DIR, fname)
-        try:
-            st = os.stat(fpath)
-            files.append({
-                "name": fname,
-                "size": st.st_size,
-                "modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                "_mtime": st.st_mtime,
-            })
-        except OSError:
-            continue
+    with _LOG_FILE_LOCK:
+        if not os.path.isdir(LOG_DIR):
+            return {"files": []}
+
+        for fname in os.listdir(LOG_DIR):
+            if not _is_log_filename(fname):
+                continue
+            fpath = os.path.join(LOG_DIR, fname)
+            try:
+                st = os.stat(fpath)
+                files.append({
+                    "name": fname,
+                    "size": st.st_size,
+                    "modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    "_mtime": st.st_mtime,
+                })
+            except OSError:
+                continue
     files.sort(key=lambda item: item["_mtime"], reverse=True)
     for item in files:
         item.pop("_mtime", None)
     return {"files": files}
 
 
+@app.get("/api/logs/recent")
+async def get_recent_logs(
+    request: Request,
+    limit: int = 200,
+    level: str = "",
+    name: str = "",
+    node_id: str = "",
+    request_id: str = "",
+):
+    """读取内存环形缓冲中的最近日志，不读取日志文件。"""
+    _require_log_api_access(request)
+    limit = _normalize_log_limit(limit)
+    entries, total_seen = _snapshot_recent_logs()
+    filtered = _filter_recent_logs(entries, level, name, node_id, request_id)
+    result = filtered[-limit:]
+    return {
+        "logs": result,
+        "count": len(result),
+        "matched": len(filtered),
+        "limit": limit,
+        "buffer_size": len(entries),
+        "buffer_capacity": _LOG_BUFFER_MAXLEN,
+        "total_seen": total_seen,
+        "truncated": len(filtered) > limit,
+        "filters": {
+            "level": level or None,
+            "name": name or None,
+            "node_id": node_id or None,
+            "request_id": request_id or None,
+        },
+    }
+
+
+@app.get("/api/logs/stats")
+async def get_log_stats(request: Request):
+    """返回日志文件与内存缓冲区统计信息。"""
+    from config import LOG_DIR
+
+    _require_log_api_access(request)
+    entries, total_seen = _snapshot_recent_logs()
+    level_counts = Counter(item.get("level", "UNKNOWN") for item in entries)
+    logger_counts = Counter(item.get("name", "unknown") for item in entries)
+    node_counts = Counter(item.get("node_id", "unknown") for item in entries)
+
+    files = []
+    total_file_bytes = 0
+    with _LOG_FILE_LOCK:
+        if os.path.isdir(LOG_DIR):
+            for fname in os.listdir(LOG_DIR):
+                if not _is_log_filename(fname):
+                    continue
+                try:
+                    st = os.stat(os.path.join(LOG_DIR, fname))
+                    total_file_bytes += st.st_size
+                    files.append({
+                        "name": fname,
+                        "size": st.st_size,
+                        "modified": st.st_mtime,
+                    })
+                except OSError:
+                    continue
+
+    return {
+        "log_dir": LOG_DIR,
+        "files_count": len(files),
+        "files_total_bytes": total_file_bytes,
+        "buffer_size": len(entries),
+        "buffer_capacity": _LOG_BUFFER_MAXLEN,
+        "buffer_total_seen": total_seen,
+        "buffer_dropped_estimate": max(0, total_seen - len(entries)),
+        "levels": dict(level_counts),
+        "loggers": dict(logger_counts.most_common(20)),
+        "nodes": dict(node_counts),
+        "node_id": _current_node_id_safe(),
+        "device_ip": _current_device_ip_safe(),
+    }
+
+
+@app.get("/api/logs/download")
+async def download_log_file(request: Request, name: str):
+    """下载单个日志文件。"""
+    from config import LOG_DIR
+
+    _require_log_api_access(request)
+    safe_name = _validate_log_filename(name)
+    file_path = os.path.join(LOG_DIR, safe_name)
+    with _LOG_FILE_LOCK:
+        if not os.path.isfile(file_path):
+            raise HTTPException(404, "文件不存在")
+    return FileResponse(
+        file_path,
+        media_type="text/plain; charset=utf-8",
+        filename=safe_name,
+    )
+
+
+# ★ 通配路由 /api/logs/{filename:path} 移到最后，避免抢占 /api/logs/export、/api/logs/node/* 等特定路由
+
+
+@app.delete("/api/logs")
+async def delete_all_log_files(request: Request):
+    """删除 LOG_DIR 中所有 .log 文件。"""
+    from config import LOG_DIR
+
+    requester = _require_log_api_access(request)
+
+    deleted = []
+    failed = []
+    with _LOG_FILE_LOCK:
+        if not os.path.isdir(LOG_DIR):
+            return {"status": "ok", "deleted": [], "failed": []}
+
+        # 仅关闭文件 handler，保留终端+内存 handler（避免删除期间日志丢失）
+        _close_logging_handlers(keep_memory=True)
+        try:
+            for fname in os.listdir(LOG_DIR):
+                if not _is_log_filename(fname):
+                    continue
+                try:
+                    os.remove(os.path.join(LOG_DIR, fname))
+                    deleted.append(fname)
+                except OSError as e:
+                    failed.append({"name": fname, "error": str(e)})
+        finally:
+            setup_logging()
+
+    status = "ok" if not failed else "partial"
+    _log_admin_action(
+        "delete_all",
+        requester,
+        "*",
+        status,
+        "; ".join(f"{item['name']}: {item['error']}" for item in failed),
+    )
+    return {
+        "status": status,
+        "deleted": deleted,
+        "failed": failed,
+        "deleted_count": len(deleted),
+        "failed_count": len(failed),
+    }
+
+
+# ============================================================
+# L5: 日志压缩包导出
+# ============================================================
+
+@app.get("/api/logs/export")
+async def export_logs_zip(request: Request):
+    """将所有 .log 文件打包为 ZIP 并下载。"""
+    import zipfile
+    import io
+    from config import LOG_DIR
+    from datetime import datetime
+
+    _require_log_api_access(request)
+
+    # 在锁内收集文件列表，在锁外构建 ZIP（避免大 I/O 时阻塞其他日志操作）
+    with _LOG_FILE_LOCK:
+        if not os.path.isdir(LOG_DIR):
+            raise HTTPException(404, "日志目录不存在")
+        log_files = sorted(
+            f for f in os.listdir(LOG_DIR) if _is_log_filename(f)
+        )
+
+    buf = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in log_files:
+            fpath = os.path.join(LOG_DIR, fname)
+            try:
+                zf.write(fpath, fname)
+                file_count += 1
+            except OSError as e:
+                logger.warning("日志导出跳过 %s: %s", fname, e)
+
+    if file_count == 0:
+        raise HTTPException(404, "没有可导出的日志文件")
+
+    buf.seek(0)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    node_id = _current_node_id_safe() or "node"
+    filename = f"qlh-logs-{node_id}-{timestamp}.zip"
+
+    logger.info(
+        "event=log_export files_count=%d requester=%s node_id=%s",
+        file_count, _get_request_client(request), node_id,
+    )
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ============================================================
+# L5: 前端错误上报
+# ============================================================
+
+class ClientErrorReport(BaseModel):
+    message: str = ""
+    source: str = ""        # 错误来源: "window.onerror" | "unhandledrejection" | "manual"
+    stack: str = ""          # 堆栈跟踪
+    url: str = ""            # 发生错误的页面 URL
+    line: int = 0            # 行号
+    col: int = 0             # 列号
+    user_agent: str = ""     # 浏览器 UA
+    extra: dict = Field(default_factory=dict)  # 附加上下文（如 session_id、当前操作）
+
+
+def _truncate_log_field(value, limit: int) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...[truncated]"
+
+
+@app.post("/api/logs/client-error")
+async def report_client_error(report: ClientErrorReport, request: Request):
+    """接收前端错误报告并写入后端诊断日志。"""
+    client_host = _get_request_client(request)
+    request_id = str(_request_id_ctx.get("-") or "")
+    logger.error(
+        "event=client_error source=%s message=%s url=%s line=%d col=%d "
+        "client=%s ua=%s stack=%s extra=%s request_id=%s",
+        _truncate_log_field(report.source, 80),
+        _truncate_log_field(report.message, 500),
+        _truncate_log_field(report.url, 300),
+        report.line,
+        report.col,
+        client_host,
+        _truncate_log_field(report.user_agent or "-", 200),
+        _truncate_log_field(report.stack, 2000),
+        _truncate_log_field(
+            json.dumps(report.extra or {}, ensure_ascii=False, default=str),
+            500,
+        ),
+        request_id,
+    )
+    return {"status": "ok", "logged": True}
+
+
+# ============================================================
+# L5: 日志保留策略清理
+# ============================================================
+
+_log_retention_thread_started = False
+
+
+def _run_log_retention_cleanup() -> None:
+    """
+    按 config.LOG_MAX_AGE_DAYS 和 LOG_MAX_TOTAL_SIZE_MB 清理旧日志。
+
+    策略：
+    1. 先按天数删除过期文件（mtime < now - LOG_MAX_AGE_DAYS）
+    2. 再按总空间删除最旧文件（total > LOG_MAX_TOTAL_SIZE_MB）
+    3. 不会删除当天日志文件
+    """
+    from config import LOG_DIR, LOG_MAX_AGE_DAYS, LOG_MAX_TOTAL_SIZE_MB
+    from datetime import datetime, timedelta
+
+    if LOG_MAX_AGE_DAYS <= 0 and LOG_MAX_TOTAL_SIZE_MB <= 0:
+        return
+
+    with _LOG_FILE_LOCK:
+        if not os.path.isdir(LOG_DIR):
+            return
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now()
+        cutoff_time = now - timedelta(days=LOG_MAX_AGE_DAYS) if LOG_MAX_AGE_DAYS > 0 else None
+        max_bytes = LOG_MAX_TOTAL_SIZE_MB * 1024 * 1024 if LOG_MAX_TOTAL_SIZE_MB > 0 else 0
+
+        # 收集所有日志文件信息
+        files_info = []
+        for fname in os.listdir(LOG_DIR):
+            if not _is_log_filename(fname):
+                continue
+            fpath = os.path.join(LOG_DIR, fname)
+            try:
+                st = os.stat(fpath)
+                files_info.append({
+                    "name": fname,
+                    "path": fpath,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                })
+            except OSError:
+                continue
+
+        deleted_age = 0
+        deleted_size = 0
+        kept = []
+
+        # 第一阶段：按天数清理
+        for fi in files_info:
+            mtime_dt = datetime.fromtimestamp(fi["mtime"])
+            # 不删除当天日志
+            if fi["name"].startswith(f"qlh-{today_str}"):
+                kept.append(fi)
+                continue
+            if cutoff_time and mtime_dt < cutoff_time:
+                try:
+                    os.remove(fi["path"])
+                    deleted_age += 1
+                except OSError:
+                    kept.append(fi)
+            else:
+                kept.append(fi)
+
+        # 第二阶段：按总空间清理（最旧优先，但跳过当天日志）
+        if max_bytes > 0:
+            total_size = sum(f["size"] for f in kept)
+            if total_size > max_bytes:
+                # 按修改时间升序（最旧的在前）
+                kept.sort(key=lambda f: f["mtime"])
+                for fi in kept:
+                    if total_size <= max_bytes:
+                        break
+                    if fi["name"].startswith(f"qlh-{today_str}"):
+                        continue
+                    try:
+                        os.remove(fi["path"])
+                        total_size -= fi["size"]
+                        deleted_size += 1
+                    except OSError:
+                        pass
+
+        if deleted_age > 0 or deleted_size > 0:
+            remaining = len(kept) - deleted_size
+            remaining_bytes = total_size if max_bytes > 0 else sum(f["size"] for f in kept)
+            logger.info(
+                "event=log_retention_cleanup deleted_age=%d deleted_size=%d "
+                "remaining_files=%d total_size_mb=%.1f",
+                deleted_age, deleted_size,
+                remaining,
+                remaining_bytes / (1024 * 1024),
+            )
+
+
+def _start_log_retention_thread() -> None:
+    """启动日志保留策略后台线程（仅启动一次）。"""
+    global _log_retention_thread_started
+    if _log_retention_thread_started:
+        return
+
+    from config import (
+        LOG_RETENTION_CHECK_INTERVAL, LOG_MAX_AGE_DAYS, LOG_MAX_TOTAL_SIZE_MB,
+    )
+
+    # 双维度禁用时跳过启动（无清理任务可执行）
+    if LOG_MAX_AGE_DAYS <= 0 and LOG_MAX_TOTAL_SIZE_MB <= 0:
+        return
+
+    _log_retention_thread_started = True
+
+    def _retention_loop() -> None:
+        # 启动后等待 5 分钟再首次清理（避免干扰初始化）
+        time.sleep(300)
+        while True:
+            try:
+                _run_log_retention_cleanup()
+            except Exception:
+                logger.warning("日志保留清理异常", exc_info=True)
+            time.sleep(LOG_RETENTION_CHECK_INTERVAL)
+
+    t = threading.Thread(target=_retention_loop, daemon=True, name="log-retention")
+    t.start()
+    logger.info(
+        "日志保留策略已启动: max_age_days=%d max_total_mb=%d interval_s=%d",
+        LOG_MAX_AGE_DAYS, LOG_MAX_TOTAL_SIZE_MB, LOG_RETENTION_CHECK_INTERVAL,
+    )
+
+
+# ============================================================
+# L5: 多节点日志聚合 API
+# ============================================================
+
+@app.get("/api/logs/node/{node_id}/recent")
+async def get_node_recent_logs(
+    node_id: str,
+    request: Request,
+    limit: int = 100,
+    level: str = "",
+    name: str = "",
+    timeout: float = 5.0,
+):
+    """
+    从指定从节点拉取最近日志（主节点代理）。
+
+    仅主节点可调用；向该节点发送 LOG_REQUEST TCP 消息并等待响应。
+    """
+    _require_log_api_access(request)
+
+    role = _get_effective_role_safe()
+    if role != "master":
+        raise HTTPException(403, "仅主节点可拉取从节点日志")
+
+    # 如果是本节点（或查询的是自己），直接返回本地 recent logs
+    local_node_id = scheduler.get_effective_node_id()
+    if node_id == local_node_id or node_id == "master":
+        entries, _ = _snapshot_recent_logs()
+        filtered = _filter_recent_logs(entries, level, name, node_id="", request_id="")
+        result_slice = filtered[-limit:]
+        return {
+            "node_id": local_node_id,
+            "source": "local",
+            "logs": result_slice,
+            "count": len(result_slice),
+            "matched": len(filtered),
+            "buffer_size": len(entries),
+        }
+
+    # 远程节点：通过 scheduler.request_node_logs 走 TCP
+    result = scheduler.request_node_logs(
+        node_id=node_id,
+        limit=limit,
+        level=level,
+        name=name,
+        timeout=timeout,
+    )
+    if result is None:
+        raise HTTPException(
+            504,
+            f"无法从节点 {node_id} 获取日志：节点不在线或超时 ({timeout}s)",
+        )
+
+    result["source"] = "remote"
+    return result
+
+
+@app.get("/api/logs/nodes-summary")
+async def get_nodes_log_summary(request: Request):
+    """
+    返回所有在线从节点的日志概要（文件数、大小、buffer 状态）。
+
+    仅主节点可调用。不拉取完整日志内容，仅返回每个节点的统计摘要。
+    """
+    _require_log_api_access(request)
+
+    role = _get_effective_role_safe()
+    if role != "master":
+        raise HTTPException(403, "仅主节点可查看集群日志概要")
+
+    # 本地节点统计
+    local_entries, _ = _snapshot_recent_logs()
+    nodes_summary = {
+        "local": {
+            "node_id": scheduler.get_effective_node_id(),
+            "buffer_size": len(local_entries),
+            "buffer_capacity": _LOG_BUFFER_MAXLEN,
+        },
+        "workers": [],
+    }
+
+    from scheduler import NodeRole, NodeState
+
+    # 对所有在线从节点拉取统计（快速超时）
+    with scheduler._nodes_lock:
+        online_workers = [
+            (nid, info)
+            for nid, info in scheduler.nodes.items()
+            if info.role != NodeRole.MASTER
+            and info.state == NodeState.ONLINE
+        ]
+
+    for nid, _info in online_workers:
+        try:
+            result = scheduler.request_node_logs(
+                node_id=nid, limit=5, timeout=3.0,
+            )
+            if result:
+                nodes_summary["workers"].append({
+                    "node_id": nid,
+                    "buffer_size": result.get("buffer_size", 0),
+                    "sample_count": result.get("count", 0),
+                })
+            else:
+                nodes_summary["workers"].append({
+                    "node_id": nid,
+                    "buffer_size": 0,
+                    "error": "timeout",
+                })
+        except Exception as e:
+            nodes_summary["workers"].append({
+                "node_id": nid,
+                "buffer_size": 0,
+                "error": str(e)[:100],
+            })
+
+    nodes_summary["total_workers"] = len(online_workers)
+    return nodes_summary
+
+
+# ★ 通配路由必须放在所有特定 /api/logs/* 路由之后，避免抢占
+
+
 @app.get("/api/logs/{filename:path}")
-async def read_log_file(filename: str):
+async def read_log_file(filename: str, request: Request):
     """读取指定日志文件的内容（最多返回末 1 MB）。"""
     from config import LOG_DIR
 
+    _require_log_api_access(request)
     safe_name = _validate_log_filename(filename)
-    file_path = os.path.join(LOG_DIR, safe_name)
-    if not os.path.isfile(file_path):
-        raise HTTPException(404, "文件不存在")
-
     max_bytes = 1024 * 1024  # 1 MB
-    file_size = os.path.getsize(file_path)
-    truncated = file_size > max_bytes
     try:
+        file_path = os.path.join(LOG_DIR, safe_name)
+        # 锁内仅做存在性检查和大小获取，锁外读取文件内容（避免阻塞其他日志操作）
+        with _LOG_FILE_LOCK:
+            if not os.path.isfile(file_path):
+                raise HTTPException(404, "文件不存在")
+            file_size = os.path.getsize(file_path)
+
         with open(file_path, "rb") as f:
+            # 重新获取实际文件大小（锁外可能已被轮转截断）
+            f.seek(0, os.SEEK_END)
+            actual_size = f.tell()
+            truncated = actual_size > max_bytes
             if truncated:
-                f.seek(-max_bytes, os.SEEK_END)
+                f.seek(max(0, actual_size - max_bytes))
                 f.readline()  # 跳过不完整首行
+            else:
+                f.seek(0)
             content = f.read().decode("utf-8", errors="replace")
         return {"name": safe_name, "content": content, "truncated": truncated}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, f"读取失败: {e}")
 
 
 @app.delete("/api/logs/{filename:path}")
-async def delete_log_file(filename: str):
+async def delete_log_file(filename: str, request: Request):
     """删除指定的 .log 文件。"""
     from config import LOG_DIR
 
+    requester = _require_log_api_access(request)
     safe_name = _validate_log_filename(filename)
-    file_path = os.path.join(LOG_DIR, safe_name)
-    if not os.path.isfile(file_path):
-        raise HTTPException(404, "文件不存在")
+    error_msg = ""
+    with _LOG_FILE_LOCK:
+        file_path = os.path.join(LOG_DIR, safe_name)
+        if not os.path.isfile(file_path):
+            raise HTTPException(404, "文件不存在")
 
-    _close_logging_handlers()
-    try:
-        os.remove(file_path)
-        return {"status": "ok", "deleted": safe_name}
-    except Exception as e:
-        raise HTTPException(500, f"删除失败: {e}")
-    finally:
-        setup_logging()
+        # 仅关闭文件 handler，保留终端+内存 handler（避免删除期间日志丢失）
+        _close_logging_handlers(keep_memory=True)
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            error_msg = str(e)
+        finally:
+            setup_logging()
 
+    if error_msg:
+        _log_admin_action("delete", requester, safe_name, "failed", error_msg)
+        raise HTTPException(500, f"删除失败: {error_msg}")
 
-@app.delete("/api/logs")
-async def delete_all_log_files():
-    """删除 LOG_DIR 中所有 .log 文件。"""
-    from config import LOG_DIR
-
-    if not os.path.isdir(LOG_DIR):
-        return {"status": "ok", "deleted": [], "failed": []}
-
-    deleted = []
-    failed = []
-    _close_logging_handlers()
-    try:
-        for fname in os.listdir(LOG_DIR):
-            if _is_log_filename(fname):
-                try:
-                    os.remove(os.path.join(LOG_DIR, fname))
-                    deleted.append(fname)
-                except OSError:
-                    failed.append(fname)
-    finally:
-        setup_logging()
-    return {"status": "ok" if not failed else "partial", "deleted": deleted, "failed": failed}
+    _log_admin_action("delete", requester, safe_name, "ok")
+    return {"status": "ok", "deleted": safe_name, "failed": []}
 
 
 # PyInstaller 打包后前端文件在 sys._MEIPASS/frontend/dist/ 下
@@ -3996,4 +4920,4 @@ if __name__ == "__main__":
     ensure_model_or_warn()
 
     logger.info("启动 API 服务器...")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT, log_level="info")

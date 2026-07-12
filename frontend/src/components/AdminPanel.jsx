@@ -785,6 +785,8 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
         refresh();
       } else if (result.status === 'exists') {
         onToast?.({ type: 'warning', msg: result.message || `节点 '${result.node_id}' 已存在` });
+      } else if (result.status === 'conflict') {
+        onToast?.({ type: 'warning', msg: result.reason || `节点 '${result.node_id}' 已有真实连接记录，请先注销或删除后再重建` });
       }
     } catch (err) {
       onToast?.({ type: 'error', msg: `注册失败: ${err.message}` });
@@ -1817,7 +1819,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
             )}
 
             {/* 非CUDA独显提示 */}
-            {!canVote && (
+            {!canVote && reviewTickets.length > 0 && (
               <p className="setting-desc" style={{ marginTop: 8, color: 'var(--warning)' }}>
                 ⚠️ 当前节点不支持投票。仅 NVIDIA CUDA 独显节点可参与审查投票。
               </p>

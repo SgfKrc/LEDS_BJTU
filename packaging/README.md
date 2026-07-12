@@ -167,7 +167,8 @@ python serve.py
 首页会列出：
 - Windows PC 安装包（集显版 + 独显版）
 - Android APK（Full / Lite，Debug / Release）
-- 模型压缩包 `models.7z`
+- PC 模型压缩包 `models_pc.7z`
+- Android 模型压缩包 `models_android.7z`（仅包含 GGUF 模型）
 
 ## 版本号更新清单
 
@@ -251,8 +252,8 @@ packaging/linux/
 │   └── __launcher_main__.py      ← 启动器主模块
 ├── src/                          ← Python 源码
 ├── frontend/dist/                ← React 构建产物
-├── models/                       ← 模型目录 (postinst 创建, 777)
-├── logs/                         ← 日志目录
+├── models/                       ← 模型目录 (postinst 创建, 755)
+├── logs/                         ← 日志目录 (postinst 创建, 1777 sticky)
 ├── venv/                         ← Python 虚拟环境 (pip 依赖)
 /usr/share/applications/qlh-edge-inference.desktop
 /usr/share/icons/hicolor/256x256/apps/qlh.png

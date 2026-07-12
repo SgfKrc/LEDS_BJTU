@@ -4,7 +4,7 @@ import { fetchDeviceProfile, autoConfigure, selectGpu } from '../api/client';
 const TIER_COLORS = {
   workstation: '#f0a500',
   laptop: '#10b981',
-  ultrabook: '#3b82f6',
+  ultrabook: '#6b7280',
   edge: '#f97316',
   mobile: '#ef4444',
 };

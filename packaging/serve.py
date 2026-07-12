@@ -9,7 +9,8 @@
 支持分发:
 - PC 安装包: packaging/dist/*.exe
 - Android 安装包: android/app/build/outputs/**/*.apk / *.aab
-- 模型压缩包: models.7z
+- PC 模型压缩包: models_pc.7z 或 models_pc/*.7z
+- Android 模型压缩包: models_android.7z 或 models_android/*.7z
 
 Ctrl+C 停止。
 """
@@ -24,11 +25,24 @@ from functools import partial
 from urllib.parse import quote, unquote, urlparse
 
 HOST = "0.0.0.0"
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9090
+DEFAULT_PORT = 9090
 ROOT = os.path.dirname(os.path.abspath(__file__))  # packaging/
 DIST_DIR = os.path.join(ROOT, "dist")
 PROJECT_ROOT = os.path.dirname(ROOT)
-MODEL_ARCHIVE = os.path.join(PROJECT_ROOT, "models.7z")
+MODEL_ARCHIVES = {
+    "pc": {
+        "title": "PC 模型压缩包",
+        "root_file": "models_pc.7z",
+        "dir": "models_pc",
+        "url_prefix": "/models-pc/",
+    },
+    "android": {
+        "title": "Android 模型压缩包",
+        "root_file": "models_android.7z",
+        "dir": "models_android",
+        "url_prefix": "/models-android/",
+    },
+}
 ANDROID_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "android", "app", "build", "outputs")
 
 ANDROID_EXTS = (".apk", ".aab")
@@ -99,6 +113,70 @@ def _android_url(rel_path: str) -> str:
     return "/android/" + quote(rel_path, safe="/")
 
 
+def _scan_model_archives(kind: str | None = None) -> list[tuple[str, str, str, str]]:
+    """
+    扫描模型压缩包，返回 [(kind, display_name, href, absolute_path)]。
+
+    支持两种约定:
+    - 根目录固定文件: models_pc.7z / models_android.7z
+    - 分类目录文件: models_pc/*.7z / models_android/*.7z
+    """
+    entries: list[tuple[str, str, str, str]] = []
+    seen: set[str] = set()
+    items = MODEL_ARCHIVES.items() if kind is None else [(kind, MODEL_ARCHIVES[kind])]
+
+    for archive_kind, config in items:
+        root_file = os.path.join(PROJECT_ROOT, config["root_file"])
+        if os.path.isfile(root_file):
+            abs_path = os.path.abspath(root_file)
+            seen.add(abs_path)
+            entries.append((archive_kind, config["root_file"], "/" + quote(config["root_file"]), root_file))
+
+        archive_dir = os.path.join(PROJECT_ROOT, config["dir"])
+        if not os.path.isdir(archive_dir):
+            continue
+
+        for root, _dirs, files in os.walk(archive_dir):
+            for name in files:
+                if not name.lower().endswith(".7z"):
+                    continue
+                abs_path = os.path.abspath(os.path.join(root, name))
+                if abs_path in seen:
+                    continue
+                seen.add(abs_path)
+                rel_path = os.path.relpath(abs_path, archive_dir).replace(os.sep, "/")
+                display_name = f'{config["dir"]}/{rel_path}'
+                href = config["url_prefix"] + quote(rel_path, safe="/")
+                entries.append((archive_kind, display_name, href, abs_path))
+
+    return sorted(entries, key=lambda item: (item[0], item[1].lower()))
+
+
+def _resolve_model_archive_path(request_path: str) -> str | None:
+    """将模型压缩包下载 URL 映射到项目内 .7z 文件。"""
+    for archive_kind, config in MODEL_ARCHIVES.items():
+        root_url = "/" + config["root_file"]
+        if request_path == root_url:
+            candidate = os.path.abspath(os.path.join(PROJECT_ROOT, config["root_file"]))
+            return candidate if os.path.isfile(candidate) else None
+
+        prefix = config["url_prefix"]
+        if not request_path.startswith(prefix):
+            continue
+
+        rel = unquote(request_path[len(prefix):]).replace("\\", "/").lstrip("/")
+        if not rel or rel.endswith("/") or not rel.lower().endswith(".7z"):
+            return None
+
+        archive_dir = os.path.abspath(os.path.join(PROJECT_ROOT, config["dir"]))
+        candidate = os.path.abspath(os.path.join(archive_dir, rel))
+        if candidate != archive_dir and not candidate.startswith(archive_dir + os.sep):
+            return None
+        return candidate if os.path.isfile(candidate) else None
+
+    return None
+
+
 def _resolve_android_path(request_path: str) -> str | None:
     """将 /android/<rel> 映射到 Gradle 输出目录内的 apk/aab 文件。"""
     prefix = "/android/"
@@ -133,8 +211,9 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def translate_path(self, path):
         request_path = unquote(urlparse(path).path)
-        if request_path == "/models.7z":
-            return MODEL_ARCHIVE
+        model_archive_path = _resolve_model_archive_path(request_path)
+        if model_archive_path:
+            return model_archive_path
 
         android_path = _resolve_android_path(request_path)
         if android_path:
@@ -160,9 +239,14 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         for rel_path, abs_path in _scan_android_packages():
             android_entries.append((rel_path, _android_url(rel_path), _format_size(abs_path)))
 
-        model_entries = []
-        if os.path.isfile(MODEL_ARCHIVE):
-            model_entries.append(("models.7z", "models.7z", _format_size(MODEL_ARCHIVE)))
+        pc_model_entries = [
+            (display, href, _format_size(abs_path))
+            for kind, display, href, abs_path in _scan_model_archives("pc")
+        ]
+        android_model_entries = [
+            (display, href, _format_size(abs_path))
+            for kind, display, href, abs_path in _scan_model_archives("android")
+        ]
 
         def render_rows(entries: list[tuple[str, str, str]], empty_text: str) -> str:
             if not entries:
@@ -174,7 +258,11 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         pc_rows = render_rows(pc_entries, "暂无 PC 安装包（请先运行 build-installer.bat）")
         android_rows = render_rows(android_entries, "暂无 Android 安装包（请先运行 android/gradlew.bat assembleDebug）")
-        model_rows = render_rows(model_entries, "暂无模型压缩包 models.7z")
+        pc_model_rows = render_rows(pc_model_entries, "暂无 PC 模型压缩包 models_pc.7z / models_pc/*.7z")
+        android_model_rows = render_rows(
+            android_model_entries,
+            "暂无 Android 模型压缩包 models_android.7z / models_android/*.7z",
+        )
 
         body = f"""<!doctype html>
 <html lang="zh-CN">
@@ -205,14 +293,20 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     {android_rows}
   </ul>
 
-  <h2>模型压缩包</h2>
+  <h2>PC 模型压缩包</h2>
   <ul>
-    {model_rows}
+    {pc_model_rows}
+  </ul>
+
+  <h2>Android 模型压缩包</h2>
+  <ul>
+    {android_model_rows}
   </ul>
 
   <p class="hint">
     Android Debug APK 默认路径: <code>android/app/build/outputs/apk/debug/app-debug.apk</code><br>
-    PC 安装包默认路径: <code>packaging/dist/QLH-Edge-Inference-Setup-v*.exe</code>
+    PC 安装包默认路径: <code>packaging/dist/QLH-Edge-Inference-Setup-v*.exe</code><br>
+    Android 模型包仅需包含 GGUF 模型；PC 模型包可包含 PC 端需要的完整模型目录。
   </p>
 </body>
 </html>
@@ -232,55 +326,67 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         # 304 不打印
 
 
-ts_ip = _detect_tailscale_ip()
-android_packages = _scan_android_packages()
+def main(argv: list[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    port = int(argv[0]) if argv else DEFAULT_PORT
 
-print()
-print("=" * 55)
-print("  📦 QLH 文件分发服务")
-print("=" * 55)
-print()
-print(f"  本机 Tailscale IP: {ts_ip}")
-print(f"  监听: http://{HOST}:{PORT}")
-print(f"  PC 安装包目录: {DIST_DIR}")
-print(f"  Android 输出目录: {ANDROID_OUTPUT_DIR}")
-if android_packages:
-    print("  Android 安装包:")
-    for rel_path, abs_path in android_packages:
-        print(f"    /android/{rel_path} ({_format_size(abs_path)})")
-else:
-    print("  Android 安装包: 未找到（请先运行 android/gradlew.bat assembleDebug）")
-if os.path.isfile(MODEL_ARCHIVE):
-    print(f"  模型压缩包: {MODEL_ARCHIVE} ({_format_size(MODEL_ARCHIVE)})")
-else:
-    print(f"  模型压缩包: 未找到 {MODEL_ARCHIVE}")
-print()
-print("  其他设备浏览器访问:")
-if ts_ip and ts_ip != "?":
-    print(f"    http://{ts_ip}:{PORT}/")
-    for rel_path, _abs_path in android_packages:
-        print(f"    http://{ts_ip}:{PORT}{_android_url(rel_path)}")
-    if os.path.isfile(MODEL_ARCHIVE):
-        print(f"    http://{ts_ip}:{PORT}/models.7z")
-else:
-    print(f"    http://<本机IP>:{PORT}/")
-    for rel_path, _abs_path in android_packages:
-        print(f"    http://<本机IP>:{PORT}{_android_url(rel_path)}")
-    if os.path.isfile(MODEL_ARCHIVE):
-        print(f"    http://<本机IP>:{PORT}/models.7z")
-print()
-print("  按 Ctrl+C 停止服务")
-print("─" * 55)
-print()
+    ts_ip = _detect_tailscale_ip()
+    android_packages = _scan_android_packages()
+    model_archives = _scan_model_archives()
 
-server = http.server.HTTPServer(
-    (HOST, PORT),
-    partial(QuietHTTPRequestHandler, directory=DIST_DIR),
-)
-
-try:
-    server.serve_forever()
-except KeyboardInterrupt:
     print()
-    print("  服务已停止。")
-    server.server_close()
+    print("=" * 55)
+    print("  📦 QLH 文件分发服务")
+    print("=" * 55)
+    print()
+    print(f"  本机 Tailscale IP: {ts_ip}")
+    print(f"  监听: http://{HOST}:{port}")
+    print(f"  PC 安装包目录: {DIST_DIR}")
+    print(f"  Android 输出目录: {ANDROID_OUTPUT_DIR}")
+    if android_packages:
+        print("  Android 安装包:")
+        for rel_path, abs_path in android_packages:
+            print(f"    /android/{rel_path} ({_format_size(abs_path)})")
+    else:
+        print("  Android 安装包: 未找到（请先运行 android/gradlew.bat assembleDebug）")
+    if model_archives:
+        print("  模型压缩包:")
+        for kind, display, href, abs_path in model_archives:
+            title = MODEL_ARCHIVES[kind]["title"]
+            print(f"    {title}: {display} -> {href} ({_format_size(abs_path)})")
+    else:
+        print("  模型压缩包: 未找到 models_pc.7z / models_android.7z 或分类目录 .7z")
+    print()
+    print("  其他设备浏览器访问:")
+    if ts_ip and ts_ip != "?":
+        print(f"    http://{ts_ip}:{port}/")
+        for rel_path, _abs_path in android_packages:
+            print(f"    http://{ts_ip}:{port}{_android_url(rel_path)}")
+        for _kind, _display, href, _abs_path in model_archives:
+            print(f"    http://{ts_ip}:{port}{href}")
+    else:
+        print(f"    http://<本机IP>:{port}/")
+        for rel_path, _abs_path in android_packages:
+            print(f"    http://<本机IP>:{port}{_android_url(rel_path)}")
+        for _kind, _display, href, _abs_path in model_archives:
+            print(f"    http://<本机IP>:{port}{href}")
+    print()
+    print("  按 Ctrl+C 停止服务")
+    print("─" * 55)
+    print()
+
+    server = http.server.HTTPServer(
+        (HOST, port),
+        partial(QuietHTTPRequestHandler, directory=DIST_DIR),
+    )
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+        print("  服务已停止。")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

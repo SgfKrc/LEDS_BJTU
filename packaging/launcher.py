@@ -709,19 +709,19 @@ def _launch_browser(url: str):
     _safe_input("按 Enter 键退出...", default="")
 
 
-def _kill_port_8000():
+def _kill_port_8000(port: int = 8000):
     """
-    检查 8000 端口。若被占用则尝试温和释放（旧实例退出后自行释放），
+    检查 API 端口。若被占用则尝试温和释放（旧实例退出后自行释放），
     不做强行杀进程操作以避免杀软误报（netstat + taskkill /F 会触发 BITS 行为检测）。
     """
     import socket
 
     def _port_in_use() -> bool:
-        """检测 8000 端口是否被占用。"""
+        """检测 API 端口是否被占用。"""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             s.settimeout(0.5)
-            s.connect(("127.0.0.1", 8000))
+            s.connect(("127.0.0.1", port))
             return True
         except (OSError, ConnectionRefusedError):
             return False
@@ -732,17 +732,17 @@ def _kill_port_8000():
         return  # 端口空闲，一切正常
 
     # 端口已被占用 — 可能是旧实例尚未退出
-    logger.warning("端口 8000 已被占用，等待旧实例释放...")
-    print("  ⚠️  端口 8000 被占用，可能是旧实例仍在运行。")
+    logger.warning("端口 %s 已被占用，等待旧实例释放...", port)
+    print(f"  ⚠️  端口 {port} 被占用，可能是旧实例仍在运行。")
     print("     请关闭旧窗口或等待 5 秒后自动重试。")
     for i in range(5, 0, -1):
         print(f"     {i}...")
         time.sleep(1)
         if not _port_in_use():
-            logger.info("端口 8000 已释放，继续启动。")
+            logger.info("端口 %s 已释放，继续启动。", port)
             return
-    logger.error("端口 8000 仍被占用，启动可能失败。")
-    print("  ❌ 端口 8000 仍被占用。请手动关闭占用程序后重试。")
+    logger.error("端口 %s 仍被占用，启动可能失败。", port)
+    print(f"  ❌ 端口 {port} 仍被占用。请手动关闭占用程序后重试。")
 
 
 def main():
@@ -754,9 +754,10 @@ def main():
     """
     headless = "--headless" in sys.argv
     check_only = "--check-only" in sys.argv
+    from config import API_PORT
 
     # ---- 启动前清理 ----
-    _kill_port_8000()
+    _kill_port_8000(API_PORT)
 
     # ---- 确定引擎 ----
     engine = _detect_engine_preference()
@@ -848,7 +849,7 @@ def main():
             import uvicorn
             from api_server import app
             uvicorn.run(
-                app, host="0.0.0.0", port=8000,
+                app, host="0.0.0.0", port=API_PORT,
                 log_level="info",
                 log_config=None,
                 timeout_graceful_shutdown=10,
@@ -876,7 +877,7 @@ def main():
             _safe_input(default="")
             sys.exit(1)
         try:
-            resp = urllib.request.urlopen("http://localhost:8000", timeout=0.5)
+            resp = urllib.request.urlopen(f"http://localhost:{API_PORT}", timeout=0.5)
             if resp.status < 500:
                 server_ready = True
                 break
@@ -892,13 +893,13 @@ def main():
         _safe_input(default="")
         sys.exit(1)
 
-    print("API 服务器已就绪: http://localhost:8000")
+    print(f"API 服务器已就绪: http://localhost:{API_PORT}")
 
     # ---- 第 3 步：启动用户界面 ----
     if headless:
         print()
         print("🤖 无头模式: API 服务器运行中，按 Ctrl+C 退出。")
-        print("   访问 http://localhost:8000 打开 Web 界面。")
+        print(f"   访问 http://localhost:{API_PORT} 打开 Web 界面。")
         try:
             while True:
                 time.sleep(1)
@@ -908,7 +909,7 @@ def main():
         print()
         print("启动用户界面...")
         _run_ui(
-            url="http://localhost:8000",
+            url=f"http://localhost:{API_PORT}",
             title="轻量化大模型分布式边缘推理系统",
         )
 

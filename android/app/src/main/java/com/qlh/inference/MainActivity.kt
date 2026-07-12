@@ -22,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.core.content.ContextCompat
@@ -47,7 +48,15 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            QlhTheme {
+            val uiState by viewModel.uiState.collectAsState()
+            val systemDark = isSystemInDarkTheme()
+            val darkTheme = when (uiState.themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> systemDark
+            }
+
+            QlhTheme(darkTheme = darkTheme) {
                 MainApp(
                     viewModel = viewModel,
                     onChooseModelDirectory = { modelDirectoryLauncher.launch(null) },
@@ -137,6 +146,7 @@ fun MainApp(
                 topP = uiState.topP,
                 contextSize = uiState.contextSize,
                 showThinking = uiState.showThinking,
+                themeMode = uiState.themeMode,
                 onServerHostChange = { viewModel.setServerHost(it) },
                 onServerPortChange = { viewModel.setServerPort(it) },
                 onInferenceModeChange = { viewModel.setInferenceMode(it) },
@@ -145,6 +155,7 @@ fun MainApp(
                 onTopPChange = { viewModel.setTopP(it) },
                 onContextSizeChange = { viewModel.setContextSize(it) },
                 onShowThinkingChange = { /* no-op for now */ },
+                onThemeModeChange = { viewModel.setThemeMode(it) },
                 modelTreeUri = uiState.modelTreeUri,
                 selectedModelUri = uiState.selectedModelUri,
                 modelStorageMode = uiState.modelStorageMode,

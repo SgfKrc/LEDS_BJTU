@@ -10,17 +10,34 @@
 
 依赖: psycopg2-binary
 
-数据库: 8.160.161.53:5432 / postgres / WUTqw6bLkK3Hn5Va
+数据库: 通过环境变量配置 (QLH_DB_HOST, QLH_DB_PORT, QLH_DB_NAME, QLH_DB_USER, QLH_DB_PASSWORD)
 """
 
 from __future__ import annotations
 
 import logging
 import json
+import os
 import time
 import threading
 from contextlib import contextmanager
 from typing import Optional, Any
+
+# 加载 .env 文件中的环境变量
+try:
+    from dotenv import load_dotenv
+    # 尝试多个可能的 .env 文件位置
+    env_paths = [
+        os.path.join(os.path.dirname(__file__), '..', '.env'),  # src/../.env
+        os.path.join(os.path.dirname(__file__), '.env'),        # src/.env
+        '.env',                                                  # 当前目录
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=False)
+            break
+except ImportError:
+    pass  # python-dotenv 未安装，跳过
 
 import psycopg2
 from psycopg2 import pool, sql
@@ -29,16 +46,37 @@ from psycopg2.extras import RealDictCursor
 logger = logging.getLogger(__name__)
 
 # ================================================================
-# 数据库连接配置（部署时修改）
+# 数据库连接配置（通过环境变量读取，禁止硬编码凭据）
 # ================================================================
-DB_HOST = "8.160.161.53"
-DB_PORT = 5432
-DB_NAME = "qlh_edge_inference"
-DB_USER = "postgres"
-DB_PASSWORD = "WUTqw6bLkK3Hn5Va"
-DB_MIN_CONN = 2
-DB_MAX_CONN = 8
+DB_HOST = os.environ.get("QLH_DB_HOST", "localhost")
+DB_NAME = os.environ.get("QLH_DB_NAME", "qlh_edge_inference")
+DB_USER = os.environ.get("QLH_DB_USER", "postgres")
+DB_PASSWORD = os.environ.get("QLH_DB_PASSWORD", "")
 
+# 端口和连接数的安全解析
+def _safe_int(env_key: str, default: int, min_val: int = 1, max_val: int = 65535) -> int:
+    """安全解析环境变量为整数，失败时返回默认值并记录警告。"""
+    raw = os.environ.get(env_key)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+        if not (min_val <= val <= max_val):
+            logger.warning(f"环境变量 {env_key}={val} 超出范围 [{min_val}, {max_val}]，使用默认值 {default}")
+            return default
+        return val
+    except (ValueError, TypeError):
+        logger.warning(f"环境变量 {env_key}='{raw}' 不是有效整数，使用默认值 {default}")
+        return default
+
+DB_PORT = _safe_int("QLH_DB_PORT", 5432, min_val=1, max_val=65535)
+DB_MIN_CONN = _safe_int("QLH_DB_MIN_CONN", 2, min_val=1, max_val=50)
+DB_MAX_CONN = _safe_int("QLH_DB_MAX_CONN", 8, min_val=1, max_val=100)
+
+# 验证 MIN_CONN <= MAX_CONN
+if DB_MIN_CONN > DB_MAX_CONN:
+    logger.warning(f"DB_MIN_CONN({DB_MIN_CONN}) > DB_MAX_CONN({DB_MAX_CONN})，已交换")
+    DB_MIN_CONN, DB_MAX_CONN = DB_MAX_CONN, DB_MIN_CONN
 
 # ================================================================
 # 连接池管理
@@ -71,8 +109,7 @@ def get_pool() -> pool.ThreadedConnectionPool:
             password=DB_PASSWORD,
         )
         logger.info(f"数据库连接池已创建: {DB_HOST}:{DB_PORT}/{DB_NAME} "
-                     f"(min={DB_MIN_CONN}, max={DB_MAX_CONN}) "
-                     f"user={DB_USER} pwd={DB_PASSWORD[:4]}...{DB_PASSWORD[-4:]}")
+                     f"(min={DB_MIN_CONN}, max={DB_MAX_CONN}, user={DB_USER})")
 
         # 初始化表结构
         _init_schema()
@@ -1574,7 +1611,10 @@ def init_db():
 def close_db():
     """应用关闭时调用：关闭连接池"""
     global _connection_pool
-    if _connection_pool:
-        _connection_pool.closeall()
-        _connection_pool = None
-        logger.info("数据库连接池已关闭")
+    with _init_lock:
+        if _connection_pool:
+            _connection_pool.closeall()
+            _connection_pool = None
+            logger.info("数据库连接池已关闭")
+
+

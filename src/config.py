@@ -17,6 +17,29 @@
 
 import os
 import sys
+import socket
+
+# 加载 .env 文件中的环境变量（必须在读取任何环境变量之前）
+try:
+    from dotenv import load_dotenv
+    # 尝试多个可能的 .env 文件位置
+    env_paths = [
+        os.path.join(os.path.dirname(__file__), '..', '.env'),  # src/../.env
+        os.path.join(os.path.dirname(__file__), '.env'),        # src/.env
+        '.env',                                                  # 当前目录
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=False)
+            break
+except ImportError:
+    pass  # python-dotenv 未安装，跳过
+
+try:
+    from node_config import apply_node_config_to_env
+    apply_node_config_to_env()
+except Exception:
+    pass
 
 
 def _get_app_root() -> str:
@@ -36,11 +59,40 @@ def _get_app_root() -> str:
 _APP_ROOT = _get_app_root()
 
 
+def _env_int(name: str, default: int, min_val: int = 1, max_val: int = 65535) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if not (min_val <= value <= max_val):
+        return default
+    return value
+
+
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
+def _normalize_node_role(value: str) -> str:
+    role = (value or "master").strip().lower()
+    if role in {"slave", "worker", "client"}:
+        return "client"
+    return "master"
+
+
 # ============================================================
 # 1. 网络配置
 # ============================================================
-SERVER_IP = "192.168.x.x"       # 主节点监听IP（部署时改为实际IP）
-SERVER_PORT = 8888              # 主节点监听端口
+SERVER_IP = _env_first("QLH_SERVER_IP", default="0.0.0.0")  # 主节点监听IP
+SERVER_PORT = _env_int("QLH_SERVER_PORT", 8888)              # TCP 主节点监听端口
+API_PORT = _env_int("QLH_API_PORT", 8000)                    # FastAPI HTTP 端口
 HEARTBEAT_INTERVAL = 3          # 心跳包间隔（秒）
 RECONNECT_MAX_RETRIES = 5       # 断线重连最大尝试次数
 RECONNECT_DELAY = 2             # 重连间隔（秒）
@@ -142,8 +194,9 @@ PIPELINE_PREEMPT_MAX_OVERHEAD_MS = 500    # checkpoint+restore 超过此值 → 
 # ============================================================
 # 5. 节点身份配置
 # ============================================================
-NODE_ROLE = "master"             # 节点角色: "master" 主节点 | "client" 从节点
-NODE_ID = "master"               # 节点唯一标识（master 固定为 "master"，client 按 hostname 自动生成）
+NODE_ROLE = _normalize_node_role(os.environ.get("QLH_NODE_ROLE", "master"))
+_default_node_id = "master" if NODE_ROLE == "master" else f"client_{socket.gethostname()}"
+NODE_ID = _env_first("QLH_NODE_ID", default=_default_node_id)
 MAX_NODES = 3                    # 最大节点数上限（主节点可动态调整，仅限已注册节点，不含空位）
                                   # 从节点通过 TCP 注册后自动加入列表，不再预创建空槽位
 
@@ -151,8 +204,8 @@ MAX_NODES = 3                    # 最大节点数上限（主节点可动态调
 # 主节点启动后自动检测 Tailscale/ZeroTier 组网 IP 并写入共享数据库，
 # 从节点通过 discover_master() 自动发现即可，通常无需手动配置。
 # 仅当数据库不可用时才回退到此配置值。
-CLIENT_MASTER_HOST = "100.90.76.108"  # 主节点 IP 地址（Tailscale/ZeroTier IP）
-CLIENT_MASTER_PORT = 8888            # 主节点监听端口
+CLIENT_MASTER_HOST = _env_first("QLH_CLIENT_MASTER_HOST", "QLH_MASTER_HOST", default="")
+CLIENT_MASTER_PORT = _env_int("QLH_CLIENT_MASTER_PORT", _env_int("QLH_MASTER_PORT", 8888))
 
 # SMTP 邮件告警配置（详见 src/email_notifier.py）
 MASTER_DOWN_EMAIL_TIMEOUT = 180      # 主节点宕机超过此秒数（3分钟）后发送邮件告警（0=禁用）
@@ -166,12 +219,17 @@ REVIEW_REJECT_THRESHOLD = -2         # 阻止阈值: score <= -2
 # 6. 集群安全
 # ============================================================
 # 集群共享密钥 — 所有节点必须使用相同密钥才能加入集群
-# 通过环境变量 QLH_CLUSTER_SECRET 设置，不设置时使用默认值（仅限开发环境）
-# 生产部署时务必修改为随机字符串（建议 32+ 字符）
-CLUSTER_SECRET = os.environ.get(
-    "QLH_CLUSTER_SECRET",
-    "qlh-default-cluster-secret-change-me-in-production"
-)
+# 通过环境变量 QLH_CLUSTER_SECRET 设置（必须设置，否则集群通信将拒绝认证）
+# 生产部署时务必使用随机字符串（建议 32+ 字符）
+CLUSTER_SECRET = os.environ.get("QLH_CLUSTER_SECRET", "")
+if not CLUSTER_SECRET:
+    import warnings
+    warnings.warn(
+        "QLH_CLUSTER_SECRET 未设置！集群通信认证将失败。"
+        "请通过环境变量设置 32+ 字符的随机密钥。",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 # HMAC 签名时间窗口（秒）— 防重放攻击
 AUTH_TIMESTAMP_WINDOW = 300  # ±5 分钟
 
@@ -182,15 +240,20 @@ RUN_MODE = "distributed"         # "single" 单机 | "distributed" 分布式
 LOG_LEVEL = "INFO"               # 日志级别: DEBUG | INFO | WARNING | ERROR
 LOG_DIR = os.path.join(_APP_ROOT, "logs")  # 日志文件目录（绝对路径）
 
+# L5: 日志保留策略（双维度控制 — 天数 + 总空间）
+LOG_MAX_AGE_DAYS = 30                # 单个日志文件最大保留天数（0 = 不限）
+LOG_MAX_TOTAL_SIZE_MB = 200          # 日志目录总大小上限（MB，0 = 不限）
+LOG_RETENTION_CHECK_INTERVAL = 3600  # 清理检查间隔（秒），默认每小时检查一次
+
 # ============================================================
-# 6. 可视化配置（Streamlit 已移除，统一使用 FastAPI + React 前端）
+# 8. 可视化配置（Streamlit 已移除，统一使用 FastAPI + React 前端）
 # ============================================================
 # 前端静态文件由 FastAPI 在端口 8000 直接提供服务（生产模式）
 # 开发模式：Vite dev server 在 5173 端口，通过 proxy 转发 /api 到 8000
 
 
 # ============================================================
-# 7. 自适应配置（由 device_profiler 运行时生成）
+# 9. 自适应配置（由 device_profiler 运行时生成）
 # ============================================================
 
 def auto_config(profile: dict = None) -> dict:

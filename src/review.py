@@ -439,7 +439,7 @@ class ReviewManager:
 
         规则:
           - node_type 必须为 "pc"
-          - device_info.gpu.cuda_available 必须为 True
+          - device_info.gpu / device_info.gpus 中必须存在 CUDA 独显
           - Android / CPU / 集显节点不可投票
 
         Args:
@@ -452,15 +452,39 @@ class ReviewManager:
         if node_type != "pc":
             return False, "仅 PC 节点可参与审查投票"
 
-        if device_info is None:
+        if not isinstance(device_info, dict) or not device_info:
             return False, "缺少设备信息，无法验证 GPU 类型"
 
-        gpu = device_info.get("gpu", {})
-        if not isinstance(gpu, dict):
-            gpu = {}
+        def is_integrated_gpu(gpu: dict) -> bool:
+            if not isinstance(gpu, dict):
+                return True
+            if "is_integrated" in gpu:
+                return bool(gpu.get("is_integrated"))
+            gpu_type = str(gpu.get("gpu_type", "")).lower()
+            if gpu_type == "discrete":
+                return False
+            if gpu_type == "integrated":
+                return True
+            name = str(gpu.get("name", "")).lower()
+            if any(k in name for k in ("intel", "iris", "uhd", "xe", "adreno", "mali")):
+                return True
+            if gpu.get("cuda_available", False):
+                return False
+            return True
 
-        cuda_available = gpu.get("cuda_available", False)
-        if not cuda_available:
+        candidates = []
+        selected_gpu = device_info.get("gpu", {})
+        if isinstance(selected_gpu, dict) and selected_gpu:
+            candidates.append(selected_gpu)
+        for gpu in device_info.get("gpus", []) or []:
+            if isinstance(gpu, dict) and gpu:
+                candidates.append(gpu)
+
+        can_vote = any(
+            gpu.get("cuda_available", False) and not is_integrated_gpu(gpu)
+            for gpu in candidates
+        )
+        if not can_vote:
             return False, "仅 NVIDIA CUDA 独显节点可参与审查投票"
 
         return True, "ok"

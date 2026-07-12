@@ -626,6 +626,25 @@ class TestSchedulingStrategy:
 class TestLayerOverrideManagement:
     """测试分层覆盖的增删改查生命周期。"""
 
+    @pytest.fixture(autouse=True)
+    def _in_memory_layer_override_store(self, monkeypatch):
+        """Layer override tests should not depend on a real PostgreSQL server."""
+        import db as db_mod
+
+        store: dict[str, str] = {}
+
+        def get_config(key: str, default: str = "") -> str:
+            return store.get(key, default)
+
+        def set_config(key: str, value: str) -> None:
+            store[key] = str(value)
+
+        monkeypatch.setattr(db_mod, "get_config", get_config)
+        monkeypatch.setattr(db_mod, "set_config", set_config)
+        import scheduler as scheduler_mod
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: db_mod)
+
     def test_clear_layer_override_empty(self):
         """清除不存在的覆盖应无异常。"""
         from db import clear_layer_override, get_layer_override
