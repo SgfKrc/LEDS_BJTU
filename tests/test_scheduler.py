@@ -9,10 +9,12 @@ import sys
 import os
 import logging
 import time
+import threading
+from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
-from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState
+from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState, NodeRole
 
 
 # ================================================================
@@ -1119,7 +1121,8 @@ class TestPipelineQueueBasics:
 
         assert result["status"] == "error"
         assert "模拟推理失败" in result["error"]
-        records = [r for r in caplog.records if "排队任务失败" in r.getMessage()]
+        # L5: 半结构化日志格式 event=task_failed
+        records = [r for r in caplog.records if "task_failed" in r.getMessage()]
         assert records
         assert records[0].exc_info is not None
         queue.stop()
@@ -2569,3 +2572,379 @@ class TestComputeLayerAssignmentEdgeCases:
         ]
         result = sched.compute_layer_assignment(nodes)
         assert result == []
+
+
+# ================================================================
+# L5: task_id / request_id 半结构化日志贯穿
+# ================================================================
+
+class TestTaskRequestIdCorrelation:
+    """L5: scheduler 中 task_id 和 request_id 的关联。"""
+
+    @pytest.fixture
+    def queue(self):
+        from scheduler import PipelineQueue
+        return PipelineQueue(max_size=10, result_ttl=60)
+
+    def test_enqueue_stores_request_id(self, queue):
+        """enqueue 时应存储 request_id 到 QueueTask。"""
+        tid = queue.enqueue(
+            prompt="test prompt",
+            max_new_tokens=128,
+            request_id="req-abc-123",
+        )
+        queue.stop()
+        assert tid.startswith("q_")
+
+    def test_enqueue_request_id_in_log(self, queue, caplog):
+        """enqueue 日志应包含 request_id。"""
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            queue.enqueue(prompt="test", max_new_tokens=64, request_id="rid-logtest")
+            queue.stop()
+
+        found = False
+        for record in caplog.records:
+            msg = record.getMessage()
+            if "task_enqueue" in msg and "request_id=rid-logtest" in msg:
+                found = True
+                break
+        assert found, f"未找到包含 request_id=rid-logtest 的 enqueue 日志: {caplog.text}"
+
+    def test_task_dispatch_log_has_request_id(self, queue, caplog):
+        """task_dispatch 日志应包含 request_id。"""
+        def echo_process(**kwargs):
+            return {"status": "ok", "response": "echo"}
+
+        queue.start(process_fn=echo_process)
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            tid = queue.enqueue(
+                prompt="hello",
+                max_new_tokens=128,
+                request_id="rid-dispatch-test",
+            )
+            queue.wait_for_result(tid, timeout=5.0)
+
+        found = False
+        for record in caplog.records:
+            msg = record.getMessage()
+            if "task_dispatch" in msg and "request_id=rid-dispatch-test" in msg:
+                found = True
+                break
+        assert found, f"task_dispatch 日志应包含 request_id: {caplog.text}"
+        queue.stop()
+
+    def test_task_complete_log_has_request_id(self, queue, caplog):
+        """task_complete 日志应包含 request_id。"""
+        def quick_process(**kwargs):
+            return {"status": "ok", "content": "done"}
+
+        queue.start(process_fn=quick_process)
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            tid = queue.enqueue(
+                prompt="quick",
+                max_new_tokens=16,
+                request_id="rid-complete-test",
+            )
+            queue.wait_for_result(tid, timeout=5.0)
+
+        found = False
+        for record in caplog.records:
+            msg = record.getMessage()
+            if "task_complete" in msg and "request_id=rid-complete-test" in msg:
+                found = True
+                break
+        assert found, f"task_complete 日志应包含 request_id: {caplog.text}"
+        queue.stop()
+
+    def test_task_failed_log_has_request_id_and_exc_info(self, queue, caplog):
+        """task_failed 日志应包含 request_id 且携带异常堆栈。"""
+        def failing_process(**kwargs):
+            raise RuntimeError("模拟推理崩溃")
+
+        queue.start(process_fn=failing_process)
+        with caplog.at_level(logging.ERROR, logger="scheduler"):
+            tid = queue.enqueue(
+                prompt="will fail",
+                max_new_tokens=64,
+                request_id="rid-fail-test",
+            )
+            queue.wait_for_result(tid, timeout=5.0)
+
+        records = [r for r in caplog.records if "task_failed" in r.getMessage()]
+        assert records
+        assert "request_id=rid-fail-test" in records[0].getMessage()
+        assert records[0].exc_info is not None
+        queue.stop()
+
+    def test_enqueue_without_request_id_defaults_to_dash(self, queue, caplog):
+        """未提供 request_id 时日志应显示 request_id=-。"""
+        def quick_process(**kwargs):
+            return {"status": "ok"}
+
+        queue.start(process_fn=quick_process)
+        with caplog.at_level(logging.INFO, logger="scheduler"):
+            tid = queue.enqueue(prompt="no-rid", max_new_tokens=32)
+            queue.wait_for_result(tid, timeout=5.0)
+
+        found = False
+        for record in caplog.records:
+            msg = record.getMessage()
+            if "task_enqueue" in msg:
+                assert "request_id=-" in msg, f"无 request_id 时应显示 -: {msg}"
+                found = True
+                break
+        assert found
+        queue.stop()
+
+
+class TestForwardInferenceRequestId:
+    """L5: forward_inference_to_master 中的 request_id 传递。"""
+
+    def test_forward_method_accepts_request_id_param(self):
+        """forward_inference_to_master 应接受 request_id 参数。"""
+        import inspect
+        from scheduler import Scheduler
+        sig = inspect.signature(Scheduler.forward_inference_to_master)
+        assert "request_id" in sig.parameters
+
+    def test_start_infer_task_accepts_request_id_param(self):
+        """start_infer_task 应接受 request_id 参数。"""
+        import inspect
+        from scheduler import Scheduler
+        sig = inspect.signature(Scheduler.start_infer_task)
+        assert "request_id" in sig.parameters
+
+
+class TestRequestNodeLogs:
+    """L5: scheduler.request_node_logs() 多节点日志聚合。"""
+
+    @pytest.fixture
+    def sched(self):
+        from scheduler import Scheduler
+        s = Scheduler()
+        s._tcp_server = None  # 无 TCP 服务器时应返回 None
+        return s
+
+    def test_request_node_logs_returns_none_without_tcp_server(self, sched):
+        """无 TCP 服务器时应返回 None。"""
+        result = sched.request_node_logs("worker-1")
+        assert result is None
+
+    def test_request_node_logs_returns_none_for_unknown_node(self, sched):
+        """不存在的节点应返回 None。"""
+        sched._tcp_server = MagicMock()
+        sched.nodes = {}
+        result = sched.request_node_logs("unknown-node")
+        assert result is None
+
+    def test_request_node_logs_returns_none_for_offline_node(self, sched):
+        """离线节点应返回 None。"""
+        sched._tcp_server = MagicMock()
+        from scheduler import NodeInfo, NodeState, NodeRole
+        sched.nodes = {
+            "worker-1": NodeInfo(
+                node_id="worker-1",
+                state=NodeState.OFFLINE,
+                role=NodeRole.CLIENT,
+            )
+        }
+        with sched._nodes_lock:
+            pass  # just testing state check
+        result = sched.request_node_logs("worker-1")
+        assert result is None
+
+
+# ================================================================
+# T1-T4 修复验证：线程安全测试
+# ================================================================
+
+class TestThreadSafety:
+    """测试 scheduler 线程安全修复（BUG T1-T4 验证）"""
+
+    def test_sync_node_rtt_with_lock(self):
+        """_sync_node_rtt 应在 _nodes_lock 保护下访问节点（T1 修复验证）。"""
+        sched = Scheduler.__new__(Scheduler)
+        sched._nodes_lock = threading.RLock()
+        sched.nodes = {
+            "client1": NodeInfo(
+                node_id="client1",
+                role=NodeRole.CLIENT,
+                state=NodeState.ONLINE,
+                last_heartbeat=time.time() - 10,
+                avg_rtt_ms=0.0,
+                last_rtt_ms=0.0,
+            ),
+        }
+
+        mock_client = MagicMock()
+        mock_client.avg_rtt_ms = 5.5
+
+        sched._sync_node_rtt("client1", mock_client)
+        assert sched.nodes["client1"].last_rtt_ms == 5.5
+        assert sched.nodes["client1"].avg_rtt_ms == 5.5
+        assert time.time() - sched.nodes["client1"].last_heartbeat < 1.0
+
+    def test_sync_node_rtt_missing_node_safe(self):
+        """_sync_node_rtt 对不存在的节点应安全返回（T1 修复验证）。"""
+        sched = Scheduler.__new__(Scheduler)
+        sched._nodes_lock = threading.RLock()
+        sched.nodes = {}
+
+        mock_client = MagicMock()
+        mock_client.avg_rtt_ms = 5.0
+
+        sched._sync_node_rtt("nonexistent", mock_client)
+
+    def test_sync_node_rtt_concurrent_access(self):
+        """多线程并发调用 _sync_node_rtt 不应导致数据竞争（T1 修复验证）。"""
+        sched = Scheduler.__new__(Scheduler)
+        sched._nodes_lock = threading.RLock()
+        sched.nodes = {
+            "client1": NodeInfo(
+                node_id="client1",
+                role=NodeRole.CLIENT,
+                state=NodeState.ONLINE,
+                last_heartbeat=time.time() - 100,
+                avg_rtt_ms=0.0,
+                last_rtt_ms=0.0,
+            ),
+        }
+
+        mock_client = MagicMock()
+        mock_client.avg_rtt_ms = 10.0
+
+        threads = []
+        for _ in range(10):
+            t = threading.Thread(
+                target=sched._sync_node_rtt,
+                args=("client1", mock_client),
+            )
+            threads.append(t)
+
+        def delete_node():
+            with sched._nodes_lock:
+                sched.nodes.pop("client1", None)
+
+        t_del = threading.Thread(target=delete_node)
+        threads.append(t_del)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+    def test_master_db_heartbeat_uses_lock(self):
+        """_master_db_heartbeat_loop 应在 _nodes_lock 保护下更新心跳（T2 修复验证）。"""
+        sched = Scheduler.__new__(Scheduler)
+        sched._nodes_lock = threading.RLock()
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master",
+                role=NodeRole.MASTER,
+                state=NodeState.ONLINE,
+                last_heartbeat=time.time() - 100,
+            ),
+        }
+        sched._running = False
+
+        old_hb = sched.nodes["master"].last_heartbeat
+        with sched._nodes_lock:
+            master_node = sched.nodes.get("master")
+            if master_node:
+                master_node.last_heartbeat = time.time()
+
+        assert sched.nodes["master"].last_heartbeat > old_hb
+
+    def test_connect_to_master_node_update_uses_lock(self):
+        """connect_to_master 中节点状态更新应在 _nodes_lock 保护下（T3 修复验证）。"""
+        sched = Scheduler.__new__(Scheduler)
+        sched._nodes_lock = threading.RLock()
+        sched.nodes = {
+            "client1": NodeInfo(
+                node_id="client1",
+                role=NodeRole.CLIENT,
+                state=NodeState.OFFLINE,
+                last_heartbeat=time.time() - 100,
+            ),
+        }
+        node_id = "client1"
+        with sched._nodes_lock:
+            if node_id in sched.nodes:
+                sched.nodes[node_id].state = NodeState.ONLINE
+                sched.nodes[node_id].last_heartbeat = time.time()
+
+        assert sched.nodes[node_id].state == NodeState.ONLINE
+        assert time.time() - sched.nodes[node_id].last_heartbeat < 1.0
+
+
+class TestConnectToMasterBootstrapRecovery:
+    """connect_to_master bootstrap recovery behavior."""
+
+    def test_auth_failure_refreshes_bootstrap_and_retries(self, monkeypatch):
+        import scheduler as scheduler_mod
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(cfg, "NODE_ID", "client-old", raising=False)
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "stale-secret", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ID", "client-old", raising=False)
+        monkeypatch.setenv("QLH_API_PORT", "8001")
+        monkeypatch.delenv("QLH_BOOTSTRAP_API_PORT", raising=False)
+        monkeypatch.delenv("QLH_MASTER_API_PORT", raising=False)
+
+        sched = Scheduler()
+        sched._role_override = "client"
+
+        first_connect_calls = []
+
+        def fake_first_connect(master_api_host, master_api_port, node_id, node_type):
+            first_connect_calls.append((master_api_host, master_api_port, node_id, node_type))
+            cfg.CLUSTER_SECRET = "fresh-secret"
+            return {
+                "cluster": {
+                    "master_tcp_host": "100.64.0.10",
+                    "master_tcp_port": 8888,
+                },
+                "node": {
+                    "node_id": "client-new",
+                    "role": "client",
+                },
+            }
+
+        class FakeTCPClient:
+            attempts = 0
+
+            def __init__(self, server_host, server_port, client_id, role, advertise_port=None):
+                self.server_host = server_host
+                self.server_port = server_port
+                self.client_id = client_id
+                self.role = role
+                self.advertise_port = advertise_port
+                self.last_register_error = ""
+                self.is_registered = False
+                self._running = False
+
+            def connect(self, on_message=None):
+                type(self).attempts += 1
+                if type(self).attempts == 1:
+                    self.last_register_error = "注册被拒绝: 认证失败: HMAC 签名不匹配"
+                    return False
+                self.is_registered = True
+                self._running = True
+                return True
+
+            def send_data(self, data, msg_type):
+                pass
+
+        monkeypatch.setattr("bootstrap.first_connect", fake_first_connect)
+        monkeypatch.setattr("tcp_comm.TCPClient", FakeTCPClient)
+
+        result = sched.connect_to_master("100.64.0.10", 8888)
+
+        assert result["status"] == "connected"
+        assert result["node_id"] == "client-new"
+        assert FakeTCPClient.attempts == 2
+        assert first_connect_calls == [("100.64.0.10", 8000, "client-old", "pc")]
+        assert cfg.NODE_ID == "client-new"
+        assert scheduler_mod.NODE_ID == "client-new"

@@ -47,6 +47,56 @@ logger = logging.getLogger(__name__)
 
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
 
+
+def _bootstrap_api_port(default: int = 8000) -> int:
+    """Return the master API port used for first-connect bootstrap."""
+    for name in ("QLH_BOOTSTRAP_API_PORT", "QLH_MASTER_API_PORT"):
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            port = int(raw)
+        except ValueError:
+            logger.warning("%s=%r 不是有效端口，回退到 %s", name, raw, default)
+            continue
+        if 1 <= port <= 65535:
+            return port
+        logger.warning("%s=%r 超出端口范围，回退到 %s", name, raw, default)
+    return default
+
+
+def _is_auth_register_failure(reason: str) -> bool:
+    text = reason or ""
+    return any(marker in text for marker in (
+        "认证失败", "HMAC", "签名不匹配", "集群密钥"
+    ))
+
+
+def _configured_node_id() -> str:
+    try:
+        import config as cfg
+        return getattr(cfg, "NODE_ID", NODE_ID)
+    except Exception:
+        return NODE_ID
+
+
+def _sync_runtime_node_config(node_id: str = None, node_role: str = None) -> None:
+    """Keep imported scheduler constants aligned with runtime config mutations."""
+    global NODE_ID, NODE_ROLE
+    try:
+        import config as cfg
+    except Exception:
+        cfg = None
+
+    if node_id:
+        NODE_ID = str(node_id)
+        if cfg is not None:
+            cfg.NODE_ID = NODE_ID
+    if node_role:
+        NODE_ROLE = str(node_role)
+        if cfg is not None:
+            cfg.NODE_ROLE = NODE_ROLE
+
 # 数据库模块（延迟导入，避免 psycopg2 未安装时直接崩溃）
 _db = None
 _db_available = False
@@ -159,6 +209,7 @@ class QueueTask:
     temperature: float = 0.7
     top_p: float = 0.9
     session_id: Optional[str] = None
+    request_id: Optional[str] = None   # L5: API 请求 ID，用于链路追踪
     priority_level: int = 1       # 0=Q0(交互), 1=Q1(普通), 2=Q2(批量)
     created_at: float = field(default_factory=time.time)
     original_level: int = 1       # 入队时的初始级别
@@ -383,6 +434,7 @@ class PipelineQueue:
 
             # 构建 QueueTask
             max_tokens = task_data.get("max_new_tokens", 512)
+            request_id = task_data.get("request_id")   # L5: API request_id 链路追踪
             priority_level = self._classify(max_tokens)
             task = QueueTask(
                 task_id=task_id,
@@ -391,6 +443,7 @@ class PipelineQueue:
                 temperature=task_data.pop("temperature", 0.7),
                 top_p=task_data.pop("top_p", 0.9),
                 session_id=task_data.pop("session_id", None),
+                request_id=request_id,
                 priority_level=priority_level,
                 original_level=priority_level,
                 _extra_kwargs=task_data,  # 保留其余 kwargs（如 _stream_callback）
@@ -405,9 +458,9 @@ class PipelineQueue:
             }
 
         logger.info(
-            f"📥 请求已入队: task={task_id}, "
-            f"level=Q{priority_level}, max_tokens={max_tokens}, "
-            f"total_depth={total_size + 1}"
+            "event=task_enqueue task_id=%s request_id=%s priority_level=Q%d "
+            "max_tokens=%d total_depth=%d",
+            task_id, request_id or "-", priority_level, max_tokens, total_size + 1,
         )
         return task_id
 
@@ -727,8 +780,10 @@ class PipelineQueue:
                 self._results[task_id]["started_at"] = time.time()
 
             logger.info(
-                f"🚀 开始处理排队任务: {task_id} "
-                f"(Q{task.priority_level}, orig=Q{task.original_level}, wait={task.wait_seconds():.0f}s)"
+                "event=task_dispatch task_id=%s request_id=%s "
+                "Q%d orig=Q%d wait=%.0fs",
+                task_id, task.request_id or "-",
+                task.priority_level, task.original_level, task.wait_seconds(),
             )
             t_start = time.time()
 
@@ -744,7 +799,10 @@ class PipelineQueue:
                         "completed_at": time.time(),
                         "elapsed_s": round(elapsed, 2),
                     }
-                logger.info(f"✅ 排队任务完成: {task_id} ({elapsed:.1f}s)")
+                logger.info(
+                    "event=task_complete task_id=%s request_id=%s elapsed=%.1fs",
+                    task_id, task.request_id or "-", elapsed,
+                )
             except Exception as e:
                 elapsed = time.time() - t_start
                 with self._lock:
@@ -755,7 +813,11 @@ class PipelineQueue:
                         "completed_at": time.time(),
                         "elapsed_s": round(elapsed, 2),
                     }
-                logger.error(f"❌ 排队任务失败: {task_id} — {e}", exc_info=True)
+                logger.error(
+                    "event=task_failed task_id=%s request_id=%s error=%s",
+                    task_id, task.request_id or "-", str(e)[:200],
+                    exc_info=True,
+                )
             finally:
                 event = self._events.get(task_id)
                 if event:
@@ -852,6 +914,11 @@ class Scheduler:
         self._local_pipeline_counted_tasks: set = set()  # 从节点侧：已本地计数的流水线任务
         self._local_pipeline_error_tasks: set = set()    # 从节点侧：已本地计错的流水线任务
         self._inference_lock = threading.Lock()  # GPU 推理互斥锁（防止并发执行）
+
+        # ---- L5: 多节点日志聚合状态 ----
+        self._pending_log_responses: dict = {}    # node_id → response data
+        self._pending_log_events: dict = {}       # node_id → threading.Event
+        self._pending_log_lock = threading.Lock()
 
         # ---- 协同抢占状态 (Phase 2) ----
         self._preempted_task: Optional[PreemptState] = None
@@ -1002,7 +1069,12 @@ class Scheduler:
         正常情况返回 config.NODE_ROLE；若 MAC 不匹配时自动切换到
         client 模式，则返回 "client"（通过 _role_override 覆盖）。
         """
-        return getattr(self, '_role_override', None) or NODE_ROLE
+        try:
+            import config as cfg
+            configured_role = getattr(cfg, "NODE_ROLE", NODE_ROLE)
+        except Exception:
+            configured_role = NODE_ROLE
+        return getattr(self, '_role_override', None) or configured_role
 
     def init_nodes(self) -> None:
         """
@@ -1066,15 +1138,16 @@ class Scheduler:
         else:
             # ★ 安全：从节点绝不能使用 "master" 作为 node_id
             # 否则会从数据库加载主节点记录，导致后台面板显示主节点数据
-            if not NODE_ID or NODE_ID == "master":
+            configured_node_id = _configured_node_id()
+            if not configured_node_id or configured_node_id == "master":
                 node_id = f"client_{__import__('socket').gethostname()}"
-                if NODE_ID == "master":
+                if configured_node_id == "master":
                     logger.warning(
                         f"⚠️ 从节点 NODE_ID 配置错误（仍为 \"master\"），"
                         f"已自动生成: {node_id}"
                     )
             else:
-                node_id = NODE_ID
+                node_id = configured_node_id
             if node_id in db_nodes:
                 self.nodes[node_id] = self._node_from_db(db_nodes[node_id])
             else:
@@ -1680,14 +1753,15 @@ class Scheduler:
         每次心跳后调用，将 TCP 层测量的 RTT 同步到节点信息中，
         供分层算法和前端展示使用。
         """
-        if node_id not in self.nodes:
-            return
-        node = self.nodes[node_id]
-        node.last_heartbeat = time.time()
-        avg_rtt = getattr(tcp_client, 'avg_rtt_ms', 0.0)
-        if avg_rtt > 0:
-            node.last_rtt_ms = avg_rtt  # 当前 EWMA 值
-            node.avg_rtt_ms = avg_rtt
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                return
+            node.last_heartbeat = time.time()
+            avg_rtt = getattr(tcp_client, 'avg_rtt_ms', 0.0)
+            if avg_rtt > 0:
+                node.last_rtt_ms = avg_rtt  # 当前 EWMA 值
+                node.avg_rtt_ms = avg_rtt
 
     def _get_node_vram_mb(self, node_id: str) -> float:
         """
@@ -2714,6 +2788,57 @@ class Scheduler:
             data = msg.get("data", {})
             self._handle_layer_config(client_id, data)
 
+        elif msg_type == "log_request":
+            # ---- L5: 主节点拉取从节点最近日志 ----
+            data = msg.get("data", {})
+            limit = data.get("limit", 100)
+            try:
+                from api_server import _snapshot_recent_logs, _filter_recent_logs
+                entries, _ = _snapshot_recent_logs()
+                filtered = _filter_recent_logs(
+                    entries,
+                    level=data.get("level", ""),
+                    name=data.get("name", ""),
+                    node_id=data.get("node_id", ""),
+                    request_id=data.get("request_id", ""),
+                )
+                result_entries = filtered[-limit:]
+                response = {
+                    "node_id": self.get_effective_node_id(),
+                    "logs": result_entries,
+                    "count": len(result_entries),
+                    "matched": len(filtered),
+                    "buffer_size": len(entries),
+                }
+                # 从节点使用 _tcp_client.send_data 回复主节点
+                tcp_client = getattr(self, '_tcp_client', None)
+                if tcp_client:
+                    tcp_client.send_data(response, MessageType.LOG_RESPONSE)
+                    logger.debug(
+                        "event=log_aggregation_sent node_id=%s count=%d requester=%s",
+                        self.get_effective_node_id(), len(result_entries), client_id,
+                    )
+                else:
+                    logger.warning(
+                        "event=log_aggregation_send_failed node_id=%s reason=tcp_client_none",
+                        self.get_effective_node_id(),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "event=log_aggregation_error node_id=%s error=%s",
+                    self.get_effective_node_id(), str(e)[:200],
+                )
+
+        elif msg_type == "log_response":
+            # ---- L5: 主节点收到从节点日志响应 ----
+            data = msg.get("data", {})
+            worker_node_id = data.get("node_id", client_id)
+            with self._pending_log_lock:
+                self._pending_log_responses[worker_node_id] = data
+                _evt = self._pending_log_events.get(worker_node_id)
+                if _evt is not None:
+                    _evt.set()
+
         else:
             logger.debug(f"未知消息类型: {msg_type}, client={client_id}")
 
@@ -2733,6 +2858,13 @@ class Scheduler:
             # 快照数据后释放锁，避免持锁进行 TCP 发送
             need_push = (self._effective_role() == "master")
             node_info = self.nodes.get(client_id)
+
+        # L5: 清理断连节点的待处理日志聚合状态（避免残留 Event 导致超时等待）
+        with self._pending_log_lock:
+            _evt = self._pending_log_events.pop(client_id, None)
+            if _evt is not None:
+                _evt.set()  # 唤醒等待线程（将收到空结果）
+            self._pending_log_responses.pop(client_id, None)
 
         if need_push:
             self._push_node_update_to_all_clients(
@@ -3806,12 +3938,13 @@ class Scheduler:
     # 任务调度
     # ================================================================
 
-    def start_infer_task(self, prompt: str) -> str:
+    def start_infer_task(self, prompt: str, request_id: str = None) -> str:
         """
         启动一轮完整推理任务。
 
         Args:
             prompt: 用户输入文本
+            request_id: API 请求 ID（L5: 链路追踪）
 
         Returns:
             task_id: 任务唯一标识
@@ -3836,7 +3969,10 @@ class Scheduler:
                 if self.nodes[nid].role != NodeRole.MASTER:
                     self.update_node_state(nid, NodeState.BUSY)
 
-        logger.info(f"推理任务启动: {task_id}, prompt_len={len(prompt)}")
+        logger.info(
+            "event=infer_task_start task_id=%s request_id=%s prompt_len=%d",
+            task_id, request_id or "-", len(prompt),
+        )
 
         # TODO: 触发流水线推理流程
         # 1. 主节点 Prefill → 中间特征 → TCP 发送至 client1
@@ -3882,9 +4018,13 @@ class Scheduler:
                 )
 
         # 恢复节点状态
-        for nid in self.nodes:
-            if self.nodes[nid].state == NodeState.BUSY:
-                self.update_node_state(nid, NodeState.ONLINE)
+        with self._nodes_lock:
+            busy_nids = [
+                nid for nid, info in self.nodes.items()
+                if info.state == NodeState.BUSY
+            ]
+        for nid in busy_nids:
+            self.update_node_state(nid, NodeState.ONLINE)
 
         if self.on_task_complete:
             self.on_task_complete(self._current_task)
@@ -3975,6 +4115,88 @@ class Scheduler:
         with self._nodes_lock:
             return [info.to_dict() for info in self.nodes.values()]
 
+    # L5: 多节点日志聚合
+    def request_node_logs(self, node_id: str, limit: int = 100,
+                          level: str = "", name: str = "",
+                          timeout: float = 5.0) -> dict | None:
+        """
+        通过 TCP 向指定从节点拉取最近日志。
+
+        Args:
+            node_id: 目标节点 ID
+            limit: 返回条数上限
+            level: 日志级别过滤 (ERROR/WARNING/INFO/DEBUG)
+            name: logger 名称过滤
+            timeout: 等待超时秒数
+
+        Returns:
+            {node_id, logs, count, matched, buffer_size} 或 None（超时/错误）
+        """
+        import threading as _thr
+
+        from tcp_comm import MessageType
+
+        if not self._tcp_server:
+            return None
+
+        # 检查节点是否存在且在线
+        with self._nodes_lock:
+            if node_id not in self.nodes:
+                return None
+            if self.nodes[node_id].state != NodeState.ONLINE:
+                return None
+
+        # 准备信号（加锁保护，防止并发请求覆盖 Event）
+        event = _thr.Event()
+        with self._pending_log_lock:
+            if node_id in self._pending_log_events:
+                # 已有等待中的请求，避免 Event 被覆盖导致前一个请求永远超时
+                logger.debug(
+                    "event=log_aggregation_busy node_id=%s reason=pending_request",
+                    node_id,
+                )
+                return None
+            self._pending_log_events[node_id] = event
+            self._pending_log_responses.pop(node_id, None)
+
+        try:
+            # 发送 LOG_REQUEST
+            request_data = {
+                "limit": limit,
+                "level": level,
+                "name": name,
+                "node_id": node_id,
+            }
+            self._tcp_server.send_to_client(node_id, request_data, MessageType.LOG_REQUEST)
+
+            # 等待响应
+            signaled = event.wait(timeout)
+            if signaled:
+                with self._pending_log_lock:
+                    result = self._pending_log_responses.pop(node_id, {})
+                logger.info(
+                    "event=log_aggregation_recv node_id=%s count=%d",
+                    node_id, result.get("count", 0),
+                )
+                return result if result else None
+
+            logger.warning(
+                "event=log_aggregation_timeout node_id=%s timeout=%.1fs",
+                node_id, timeout,
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                "event=log_aggregation_failed node_id=%s error=%s",
+                node_id, str(e)[:200],
+            )
+            return None
+        finally:
+            with self._pending_log_lock:
+                self._pending_log_events.pop(node_id, None)
+                # H1: 超时/异常时清理可能已到达的残留响应数据
+                self._pending_log_responses.pop(node_id, None)
+
     def get_config(self) -> dict:
         """获取分布式配置信息（含当前节点角色、动态分层和实际局域网 IP）"""
         from config import (
@@ -4035,13 +4257,52 @@ class Scheduler:
             return {"status": "denied", "reason": "仅从节点可以连接主节点"}
 
         try:
-            from tcp_comm import TCPClient
+            import config as cfg
 
             # ★ 安全：从节点绝不能使用 "master" 作为 client_id
-            if not NODE_ID or NODE_ID == "master":
+            configured_node_id = _configured_node_id()
+            if not configured_node_id or configured_node_id == "master":
                 node_id = f"client_{__import__('socket').gethostname()}"
             else:
-                node_id = NODE_ID
+                node_id = configured_node_id
+
+            def _run_first_connect_bootstrap(reason: str) -> None:
+                nonlocal node_id, master_host, master_port
+                from bootstrap import first_connect
+
+                api_port = _bootstrap_api_port()
+                logger.info(
+                    "开始首次连接自动部署: reason=%s master_api=%s:%s",
+                    reason, master_host, api_port,
+                )
+                bootstrap_result = first_connect(
+                    master_api_host=master_host,
+                    master_api_port=api_port,
+                    node_id=node_id,
+                    node_type=os.environ.get("QLH_NODE_TYPE", "pc"),
+                )
+                cluster = bootstrap_result.get("cluster", {})
+                node = bootstrap_result.get("node", {})
+                node_id = node.get("node_id") or node_id
+                master_host = cluster.get("master_tcp_host") or master_host
+                master_port = int(cluster.get("master_tcp_port") or master_port)
+                logger.info(
+                    "首次连接自动部署完成: node_id=%s master=%s:%s",
+                    node_id, master_host, master_port,
+                )
+
+            if not getattr(cfg, "CLUSTER_SECRET", ""):
+                try:
+                    _run_first_connect_bootstrap("missing_secret")
+                except Exception as e:
+                    logger.error("首次连接自动部署失败: %s", e, exc_info=True)
+                    return {
+                        "status": "bootstrap_failed",
+                        "reason": f"首次连接自动部署失败: {e}",
+                    }
+
+            from tcp_comm import TCPClient
+
             advertise_port = self._tcp_server.port if self._tcp_server else SERVER_PORT
             client = TCPClient(
                 server_host=master_host,
@@ -4051,16 +4312,16 @@ class Scheduler:
                 advertise_port=advertise_port,
             )
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
-            client.on_heartbeat = lambda: (
-                self._sync_node_rtt(node_id, client)
-                if node_id in self.nodes else None
-            )
+            # _sync_node_rtt 内部已有 _nodes_lock 保护
+            client.on_heartbeat = lambda: self._sync_node_rtt(node_id, client)
 
-            # 更新自身节点状态。注意：NodeInfo.address 表示本节点可被其他节点连接的服务端点，
-            # 不能写成主节点地址；主节点地址由 tcp_client.server_host/server_port 表示。
-            if node_id in self.nodes:
-                self.nodes[node_id].state = NodeState.ONLINE
-                self.nodes[node_id].last_heartbeat = time.time()
+            def _mark_local_node_online() -> None:
+                # NodeInfo.address 表示本节点可被其他节点连接的服务端点，
+                # 不能写成主节点地址；主节点地址由 tcp_client.server_host/server_port 表示。
+                with self._nodes_lock:
+                    if node_id in self.nodes:
+                        self.nodes[node_id].state = NodeState.ONLINE
+                        self.nodes[node_id].last_heartbeat = time.time()
 
             ok = client.connect(
                 on_message=lambda msg: self._on_tcp_message("master", msg)
@@ -4068,13 +4329,13 @@ class Scheduler:
             if ok:
                 # 存储客户端引用，供分布式推理转发使用
                 self._tcp_client = client
+                _mark_local_node_online()
 
-                # 更新全局 node_id
-                import config as cfg
-                cfg.NODE_ID = node_id
+                # 更新运行时 node_id，避免 scheduler 模块导入常量滞后。
+                _sync_runtime_node_config(node_id=node_id)
                 # 若通过 activate_client_mode 切换而来，同步更新角色
                 if getattr(self, '_role_override', None) == "client":
-                    cfg.NODE_ROLE = "client"
+                    _sync_runtime_node_config(node_role="client")
 
                 # 不在此处持久化到数据库 — 主节点收到 TCP 注册消息后
                 # 会通过 _on_tcp_message → register_node() → db.upsert_node()
@@ -4095,11 +4356,54 @@ class Scheduler:
                     "master": f"{master_host}:{master_port}",
                     "message": f"已成功注册到主节点 {master_host}:{master_port}",
                 }
-            else:
-                return {
-                    "status": "failed",
-                    "reason": f"TCP 连接失败 ({master_host}:{master_port})，请检查主节点地址和端口是否正确",
-                }
+            reason = getattr(client, "last_register_error", "") or (
+                f"TCP 连接失败 ({master_host}:{master_port})，请检查主节点地址和端口是否正确"
+            )
+            if _is_auth_register_failure(reason):
+                try:
+                    logger.info("TCP 注册认证失败，尝试刷新首次连接配置后重试: %s", reason)
+                    _run_first_connect_bootstrap("auth_failed")
+                    client = TCPClient(
+                        server_host=master_host,
+                        server_port=master_port,
+                        client_id=node_id,
+                        role="client",
+                        advertise_port=advertise_port,
+                    )
+                    client.on_heartbeat = lambda: self._sync_node_rtt(node_id, client)
+                    ok = client.connect(
+                        on_message=lambda msg: self._on_tcp_message("master", msg)
+                    )
+                    if ok:
+                        self._tcp_client = client
+                        _mark_local_node_online()
+                        _sync_runtime_node_config(node_id=node_id)
+                        if getattr(self, '_role_override', None) == "client":
+                            _sync_runtime_node_config(node_role="client")
+                        try:
+                            from tcp_comm import MessageType
+                            client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
+                        except Exception:
+                            pass
+                        logger.info(
+                            "✅ 从节点 %s 刷新配置后已连接到主节点 %s:%s",
+                            node_id, master_host, master_port,
+                        )
+                        return {
+                            "status": "connected",
+                            "node_id": node_id,
+                            "master": f"{master_host}:{master_port}",
+                            "message": f"已刷新自动部署配置并注册到主节点 {master_host}:{master_port}",
+                        }
+                    reason = getattr(client, "last_register_error", "") or reason
+                except Exception as e:
+                    logger.error("刷新首次连接配置后重试失败: %s", e, exc_info=True)
+                    reason = f"{reason}; 刷新自动部署配置失败: {e}"
+
+            return {
+                "status": "failed",
+                "reason": reason,
+            }
         except Exception as e:
             logger.error(f"连接主节点 {master_host}:{master_port} 失败: {e}")
             return {"status": "error", "reason": f"{master_host}:{master_port} - {e}"}
@@ -4110,6 +4414,7 @@ class Scheduler:
                                      top_p: float = 0.9,
                                      show_thinking: bool = False,
                                      session_id: str = None,
+                                     request_id: str = None,   # L5: 链路追踪
                                      timeout: float = 120.0) -> dict:
         """
         从节点将推理请求转发给主节点，并等待结果。
@@ -4149,9 +4454,13 @@ class Scheduler:
                 "top_p": top_p,
                 "show_thinking": show_thinking,
                 "session_id": session_id,
+                "request_id": request_id,   # L5: 链路追踪
             }
             tcp_client.send_data(infer_data, MessageType.INFER_FORWARD)
-            logger.info(f"📤 推理请求已转发至主节点 (prompt_len={len(message)})")
+            logger.info(
+                "event=infer_forward task_id=n/a request_id=%s prompt_len=%d",
+                request_id or "-", len(message),
+            )
 
             # 等待结果（轮询 + 超时）
             deadline = time.time() + timeout
@@ -4247,14 +4556,14 @@ class Scheduler:
 
         # 1. 设置角色覆盖
         self._role_override = "client"
-        cfg.NODE_ROLE = "client"
+        _sync_runtime_node_config(node_role="client")
 
         # 2. 重新初始化为从节点
         with self._nodes_lock:
             self.nodes.clear()
         self.init_nodes()
         effective_id = self.get_effective_node_id()
-        cfg.NODE_ID = effective_id
+        _sync_runtime_node_config(node_id=effective_id)
 
         # 3. 启动从节点健康监控
         self._start_client_health_monitor()
@@ -4344,9 +4653,10 @@ class Scheduler:
         从节点 → 使用配置的 NODE_ID，若为 "master"（默认值）则自动生成
         """
         effective_role = self._effective_role()
-        if effective_role == "client" and (not NODE_ID or NODE_ID == "master"):
+        node_id = _configured_node_id()
+        if effective_role == "client" and (not node_id or node_id == "master"):
             return f"client_{__import__('socket').gethostname()}"
-        return NODE_ID
+        return node_id
 
     def get_my_role(self) -> dict:
         """
@@ -4590,8 +4900,10 @@ class Scheduler:
             except Exception as e:
                 logger.debug(f"数据库心跳刷新失败: {e}")
             # 同时更新主节点自身的心跳时间戳（前端在线时长/心跳列显示）
-            if "master" in self.nodes:
-                self.nodes["master"].last_heartbeat = time.time()
+            with self._nodes_lock:
+                master_node = self.nodes.get("master")
+                if master_node:
+                    master_node.last_heartbeat = time.time()
             time.sleep(30)
 
     def discover_master(self) -> dict:
@@ -4701,16 +5013,17 @@ class Scheduler:
         top_p = data.get("top_p", 0.9)
         show_thinking = data.get("show_thinking", False)
         session_id = data.get("session_id")
+        request_id = data.get("request_id")   # L5: 链路追踪
 
         import threading as _thr
 
         def _run_inference():
             try:
-                task_id = self.start_infer_task(prompt)
+                task_id = self.start_infer_task(prompt, request_id=request_id)
                 logger.info(
-                    f"📨 收到从节点 {client_id} 转发的推理请求: "
-                    f"task={task_id}, prompt_len={len(prompt)}, "
-                    f"max_tokens={max_new_tokens}, temp={temperature}"
+                    "event=infer_forward_recv task_id=%s request_id=%s "
+                    "client_id=%s prompt_len=%d max_tokens=%d",
+                    task_id, request_id or "-", client_id, len(prompt), max_new_tokens,
                 )
 
                 # ★ 统一流水线调度（替代原来的 mgr.chat() 全模型直调）
