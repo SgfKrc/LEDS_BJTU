@@ -13,6 +13,7 @@ import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.BootstrapRequest
 import com.qlh.inference.network.ChatRepository
 import com.qlh.inference.network.RegisterNodeRequest
 import com.qlh.inference.service.InferenceService
@@ -151,6 +152,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L
             )
             QlhApplication.instance.inferenceService?.modelContextSize = contextSize
+            ensureAndroidBootstrap()
             autoRegisterAndroidNode()
             refreshModels(showMessage = false)
             refreshRuntimeStatus()
@@ -440,6 +442,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun ensureAndroidBootstrap(force: Boolean = false) {
+        if (BuildConfig.IS_LITE) return
+        if (!force && settings.isBootstrapped()) return
+
+        val state = _uiState.value
+        val nodeId = settings.getOrCreateAndroidNodeId()
+        val hostname = listOf(
+            android.os.Build.MANUFACTURER,
+            android.os.Build.MODEL,
+        ).filter { it.isNotBlank() }
+            .joinToString(" ")
+            .ifBlank { nodeId }
+        val client = ApiClient("http://${state.serverHost}:${state.serverPort}")
+        val result = client.firstConnectBootstrap(
+            BootstrapRequest(
+                nodeId = nodeId,
+                hostname = hostname,
+                appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
+                appVersion = BuildConfig.VERSION_NAME,
+                capabilities = buildAndroidPresenceDeviceInfo(),
+            )
+        )
+
+        result.onSuccess { response ->
+            val cluster = response.cluster
+            val android = response.android
+            val newHost = cluster.masterApiHost.ifBlank { state.serverHost }
+            val newPort = cluster.masterApiPort.takeIf { it in 1..65535 } ?: state.serverPort
+            settings.saveBootstrapConfig(
+                serverHost = newHost,
+                serverPort = newPort,
+                masterTcpPort = cluster.masterTcpPort,
+                clusterId = cluster.clusterId,
+                nodeId = response.node.nodeId.ifBlank { nodeId },
+                modelManifestUrl = android.modelManifestUrl,
+            )
+            _uiState.value = _uiState.value.copy(
+                serverHost = newHost,
+                serverPort = newPort,
+            )
+            QlhLogger.i(
+                "MainViewModel",
+                "Android bootstrap completed: nodeId=${response.node.nodeId.ifBlank { nodeId }} host=$newHost:$newPort"
+            )
+        }.onFailure { e ->
+            QlhLogger.w(
+                "MainViewModel",
+                "Android bootstrap failed: ${e.message ?: e.javaClass.simpleName}"
+            )
+        }
+    }
+
     private suspend fun autoRegisterAndroidNode(force: Boolean = false) {
         // Lite 变体不参与分布式计算，跳过注册
         if (BuildConfig.IS_LITE) {
@@ -563,6 +617,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** 测试连接成功后调用，补一刀自动注册（防止之前因服务端未就绪而失败）。 */
     fun onConnectionTestSuccess() {
         viewModelScope.launch {
+            ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
         }
     }
@@ -572,7 +627,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setServerHost(host: String) {
         viewModelScope.launch {
             settings.setServerHost(host)
+            settings.clearBootstrapConfig()
             _uiState.value = _uiState.value.copy(serverHost = host)
+            ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
         }
     }
@@ -580,7 +637,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setServerPort(port: Int) {
         viewModelScope.launch {
             settings.setServerPort(port)
+            settings.clearBootstrapConfig()
             _uiState.value = _uiState.value.copy(serverPort = port)
+            ensureAndroidBootstrap(force = true)
             autoRegisterAndroidNode(force = true)
         }
     }

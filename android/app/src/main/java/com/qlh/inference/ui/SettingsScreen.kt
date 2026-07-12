@@ -444,6 +444,8 @@ fun SettingsScreen(
             val logFiles = remember(logRefreshKey) { QlhLogger.getLogFiles() }
             var showLogViewer by remember { mutableStateOf(false) }
             var showClearConfirm by remember { mutableStateOf(false) }
+            // L4: 日志查看器搜索状态
+            var logSearchQuery by remember { mutableStateOf("") }
 
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
@@ -451,86 +453,251 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium
                 )
                 if (logFiles.isNotEmpty()) {
+                    val totalSize = logFiles.sumOf { it.size }
                     Text(
-                        text = "最新: ${logFiles.first().name} (${formatBytes(logFiles.first().size)})",
+                        text = "总大小: ${formatBytes(totalSize)} · 最新: ${logFiles.first().name} (${formatBytes(logFiles.first().size)})",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Spacer(modifier = Modifier.height(12.dp))
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = { showLogViewer = true },
-                        modifier = Modifier.weight(1f),
-                        enabled = logFiles.isNotEmpty()
+                // L4: 极简版仅保留复制和分享，完整版提供查看+清理
+                if (isLite) {
+                    // ---- 极简版日志操作 ----
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("查看日志")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            val allLogText = buildString {
-                                QlhLogger.getLogFiles().forEach { fi ->
-                                    appendLine("===== ${fi.name} =====")
-                                    appendLine(QlhLogger.readLogFile(fi.name) ?: "(读取失败)")
-                                    appendLine()
+                        OutlinedButton(
+                            onClick = {
+                                val allLogText = buildString {
+                                    QlhLogger.getLogFiles().forEach { fi ->
+                                        appendLine("===== ${fi.name} (${formatBytes(fi.size)}) =====")
+                                        appendLine(QlhLogger.readLogFile(fi.name) ?: "(读取失败)")
+                                        appendLine()
+                                    }
                                 }
-                            }
-                            val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            clipboard.setPrimaryClip(ClipData.newPlainText("QLH Logs", allLogText))
-                        },
-                        modifier = Modifier.weight(1f),
-                        enabled = logFiles.isNotEmpty()
-                    ) {
-                        Text("复制日志")
+                                val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("QLH Logs", allLogText))
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = logFiles.isNotEmpty()
+                        ) {
+                            Text("复制日志")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                val file = QlhLogger.getLogFiles().firstOrNull() ?: return@OutlinedButton
+                                val content = QlhLogger.readLogFile(file.name) ?: return@OutlinedButton
+                                val sendIntent = Intent().apply {
+                                    action = Intent.ACTION_SEND
+                                    putExtra(Intent.EXTRA_TEXT, content)
+                                    putExtra(Intent.EXTRA_SUBJECT, "QLH 日志: ${file.name} (${formatBytes(file.size)})")
+                                    type = "text/plain"
+                                }
+                                ctx.startActivity(Intent.createChooser(sendIntent, "分享日志 — ${file.name} (${formatBytes(file.size)})"))
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = logFiles.isNotEmpty()
+                        ) {
+                            Text("分享日志")
+                        }
                     }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            val file = QlhLogger.getLogFiles().firstOrNull() ?: return@OutlinedButton
-                            val content = QlhLogger.readLogFile(file.name) ?: return@OutlinedButton
-                            val sendIntent = Intent().apply {
-                                action = Intent.ACTION_SEND
-                                putExtra(Intent.EXTRA_TEXT, content)
-                                type = "text/plain"
-                            }
-                            ctx.startActivity(Intent.createChooser(sendIntent, "分享日志"))
-                        },
-                        modifier = Modifier.weight(1f),
-                        enabled = logFiles.isNotEmpty()
+                } else {
+                    // ---- 完整版日志操作 ----
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("分享日志")
+                        Button(
+                            onClick = { showLogViewer = true },
+                            modifier = Modifier.weight(1f),
+                            enabled = logFiles.isNotEmpty()
+                        ) {
+                            Text("查看日志")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                val allLogText = buildString {
+                                    QlhLogger.getLogFiles().forEach { fi ->
+                                        appendLine("===== ${fi.name} (${formatBytes(fi.size)}) =====")
+                                        val result = QlhLogger.readLogFileWithInfo(fi.name)
+                                        if (result.content != null) {
+                                            if (result.truncated) {
+                                                appendLine("[⚠ 文件过大 (${formatBytes(result.fileSize)})，仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)}]")
+                                            }
+                                            appendLine(result.content)
+                                        } else {
+                                            appendLine("(读取失败)")
+                                        }
+                                        appendLine()
+                                    }
+                                }
+                                val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("QLH Logs", allLogText))
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = logFiles.isNotEmpty()
+                        ) {
+                            Text("复制日志")
+                        }
                     }
-                    OutlinedButton(
-                        onClick = { showClearConfirm = true },
-                        modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = MaterialTheme.colorScheme.error
-                        ),
-                        enabled = logFiles.isNotEmpty()
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("清理日志", color = MaterialTheme.colorScheme.error)
+                        OutlinedButton(
+                            onClick = {
+                                val file = QlhLogger.getLogFiles().firstOrNull() ?: return@OutlinedButton
+                                val result = QlhLogger.readLogFileWithInfo(file.name)
+                                val content = result.content ?: return@OutlinedButton
+                                val prefix = if (result.truncated) {
+                                    "[⚠ 文件截断: ${formatBytes(result.fileSize)} 仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)}]\n\n"
+                                } else ""
+                                val sendIntent = Intent().apply {
+                                    action = Intent.ACTION_SEND
+                                    putExtra(Intent.EXTRA_TEXT, prefix + content)
+                                    putExtra(Intent.EXTRA_SUBJECT, "QLH 日志: ${file.name} (${formatBytes(file.size)})")
+                                    type = "text/plain"
+                                }
+                                ctx.startActivity(Intent.createChooser(sendIntent, "分享日志 — ${file.name} (${formatBytes(file.size)})"))
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = logFiles.isNotEmpty()
+                        ) {
+                            Text("分享日志")
+                        }
+                        OutlinedButton(
+                            onClick = { showClearConfirm = true },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error
+                            ),
+                            enabled = logFiles.isNotEmpty()
+                        ) {
+                            Text("清理日志", color = MaterialTheme.colorScheme.error)
+                        }
                     }
                 }
             }
 
-            // ---- 日志查看对话框 ----
-            if (showLogViewer) {
+            // ---- L4 增强日志查看对话框（仅完整版） ----
+            if (showLogViewer && !isLite) {
+                // 构建每个文件的内容（含截断信息）
+                val fileContents = remember(showLogViewer, logRefreshKey) {
+                    QlhLogger.getLogFiles().map { fi ->
+                        val result = QlhLogger.readLogFileWithInfo(fi.name)
+                        Triple(fi, result.content, result.truncated)
+                    }
+                }
+
+                // 根据搜索词过滤
+                val filteredContents = remember(fileContents, logSearchQuery) {
+                    if (logSearchQuery.isBlank()) {
+                        fileContents
+                    } else {
+                        fileContents.mapNotNull { (fi, content, truncated) ->
+                            if (content != null && content.contains(logSearchQuery, ignoreCase = true)) {
+                                Triple(fi, content, truncated)
+                            } else if (fi.name.contains(logSearchQuery, ignoreCase = true)) {
+                                // 文件名匹配也保留
+                                Triple(fi, content, truncated)
+                            } else {
+                                null
+                            }
+                        }
+                    }
+                }
+
+                val displayText = remember(filteredContents, logSearchQuery) {
+                    if (filteredContents.isEmpty()) {
+                        if (logSearchQuery.isNotBlank()) {
+                            "没有匹配「${logSearchQuery}」的日志内容。\n"
+                        } else {
+                            "(无日志文件)\n"
+                        }
+                    } else {
+                        buildString {
+                            filteredContents.forEach { (fi, content, truncated) ->
+                                appendLine("=" .repeat(60))
+                                appendLine("  📄 ${fi.name}")
+                                appendLine("  大小: ${formatBytes(fi.size)}")
+                                if (truncated) {
+                                    appendLine("  ⚠️ 日志文件过大 (${formatBytes(fi.size)})，仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)} 内容")
+                                }
+                                appendLine("=" .repeat(60))
+                                appendLine(content ?: "(读取失败)")
+                                appendLine()
+                            }
+                        }
+                    }
+                }
+
+                AlertDialog(
+                    onDismissRequest = {
+                        showLogViewer = false
+                        logSearchQuery = ""
+                    },
+                    title = {
+                        Column {
+                            Text("日志文件 (${logFiles.size} 个)")
+                            // L4: 关键词搜索
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = logSearchQuery,
+                                onValueChange = { logSearchQuery = it },
+                                label = { Text("🔍 搜索日志内容...") },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.bodySmall
+                            )
+                            if (logSearchQuery.isNotBlank()) {
+                                Text(
+                                    text = "匹配 ${filteredContents.size}/${fileContents.size} 个文件",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    },
+                    text = {
+                        SelectionContainer {
+                            Text(
+                                text = displayText,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = MaterialTheme.typography.bodySmall.fontSize,
+                                modifier = Modifier
+                                    .horizontalScroll(rememberScrollState())
+                                    .heightIn(max = 380.dp)
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showLogViewer = false
+                            logSearchQuery = ""
+                        }) {
+                            Text("关闭")
+                        }
+                    }
+                )
+            }
+
+            // ---- 极简版日志查看对话框（保持简洁，无搜索） ----
+            if (showLogViewer && isLite) {
                 val logContent = remember(showLogViewer, logRefreshKey) {
                     buildString {
                         QlhLogger.getLogFiles().forEach { fi ->
+                            val result = QlhLogger.readLogFileWithInfo(fi.name)
                             appendLine("===== ${fi.name} (${formatBytes(fi.size)}) =====")
-                            appendLine(QlhLogger.readLogFile(fi.name) ?: "(读取失败)")
+                            if (result.truncated) {
+                                appendLine("[⚠ 文件过大，仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)}]")
+                            }
+                            appendLine(result.content ?: "(读取失败)")
                             appendLine()
                         }
                     }
@@ -564,7 +731,7 @@ fun SettingsScreen(
                 AlertDialog(
                     onDismissRequest = { showClearConfirm = false },
                     title = { Text("清理日志") },
-                    text = { Text("确定删除所有日志文件？此操作不可撤销。") },
+                    text = { Text("确定删除所有日志文件？此操作不可撤销。\n删除后当前日志会自动重新生成。") },
                     confirmButton = {
                         TextButton(
                             onClick = {

@@ -119,6 +119,61 @@ data class RegisterNodeResponse(
     val state: String? = null
 )
 
+data class BootstrapRequest(
+    @SerializedName("node_id")
+    val nodeId: String,
+    @SerializedName("node_type")
+    val nodeType: String = "android",
+    val hostname: String = "",
+    val platform: String = "android",
+    @SerializedName("app_variant")
+    val appVariant: String = if (BuildConfig.IS_LITE) "lite" else "full",
+    @SerializedName("app_version")
+    val appVersion: String = BuildConfig.VERSION_NAME,
+    val capabilities: Map<String, Any?> = emptyMap()
+)
+
+data class BootstrapCluster(
+    @SerializedName("cluster_id")
+    val clusterId: String = "",
+    @SerializedName("master_api_host")
+    val masterApiHost: String = "",
+    @SerializedName("master_api_port")
+    val masterApiPort: Int = 8000,
+    @SerializedName("master_tcp_host")
+    val masterTcpHost: String = "",
+    @SerializedName("master_tcp_port")
+    val masterTcpPort: Int = 8888,
+    @SerializedName("cluster_secret")
+    val clusterSecret: String = ""
+)
+
+data class BootstrapNode(
+    @SerializedName("node_id")
+    val nodeId: String = "",
+    val role: String = "client",
+    @SerializedName("node_type")
+    val nodeType: String = "android",
+    @SerializedName("pipeline_worker")
+    val pipelineWorker: Boolean = false
+)
+
+data class BootstrapAndroid(
+    @SerializedName("presence_interval_seconds")
+    val presenceIntervalSeconds: Int = 45,
+    @SerializedName("pipeline_worker")
+    val pipelineWorker: Boolean = false,
+    @SerializedName("model_manifest_url")
+    val modelManifestUrl: String = ""
+)
+
+data class BootstrapResponse(
+    val status: String = "",
+    val cluster: BootstrapCluster = BootstrapCluster(),
+    val node: BootstrapNode = BootstrapNode(),
+    val android: BootstrapAndroid = BootstrapAndroid()
+)
+
 // ================================================================
 // API 客户端
 // ================================================================
@@ -311,6 +366,27 @@ class ApiClient(
                 return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
             }
             Result.success(gson.fromJson(responseBody, RegisterNodeResponse::class.java))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** 首次连接自动部署：从主节点获取 Android 节点配置。 */
+    suspend fun firstConnectBootstrap(request: BootstrapRequest): Result<BootstrapResponse> = withContext(Dispatchers.IO) {
+        try {
+            val body = gson.toJson(request).toRequestBody(jsonMediaType)
+            val httpRequest = Request.Builder()
+                .url("$baseUrl/api/bootstrap/first-connect")
+                .post(body)
+                .header("Content-Type", "application/json")
+                .build()
+
+            val response = executeAsync(httpRequest)
+            val responseBody = response.body?.string() ?: "{}"
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
+            }
+            Result.success(gson.fromJson(responseBody, BootstrapResponse::class.java))
         } catch (e: Exception) {
             Result.failure(e)
         }

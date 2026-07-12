@@ -23,6 +23,10 @@ class SettingsDataStore(private val context: Context) {
         val KEY_SERVER_HOST = stringPreferencesKey("server_host")
         val KEY_SERVER_PORT = intPreferencesKey("server_port")
         val KEY_ANDROID_NODE_ID = stringPreferencesKey("android_node_id")
+        val KEY_BOOTSTRAPPED = booleanPreferencesKey("bootstrapped")
+        val KEY_CLUSTER_ID = stringPreferencesKey("cluster_id")
+        val KEY_MASTER_TCP_PORT = intPreferencesKey("master_tcp_port")
+        val KEY_MODEL_MANIFEST_URL = stringPreferencesKey("model_manifest_url")
 
         // ---- 推理模式 ----
         val KEY_INFERENCE_MODE = stringPreferencesKey("inference_mode")  // "thin" | "full"
@@ -59,6 +63,10 @@ class SettingsDataStore(private val context: Context) {
 
     val serverPort: Flow<Int> = context.dataStore.data.map { prefs ->
         prefs[KEY_SERVER_PORT] ?: DEFAULT_PORT
+    }
+
+    val bootstrapped: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[KEY_BOOTSTRAPPED] ?: false
     }
 
     val inferenceMode: Flow<String> = context.dataStore.data.map { prefs ->
@@ -112,6 +120,10 @@ class SettingsDataStore(private val context: Context) {
 
     suspend fun getServerHost(): String = context.dataStore.data.first()[KEY_SERVER_HOST] ?: DEFAULT_HOST
     suspend fun getServerPort(): Int = context.dataStore.data.first()[KEY_SERVER_PORT] ?: DEFAULT_PORT
+    suspend fun isBootstrapped(): Boolean = context.dataStore.data.first()[KEY_BOOTSTRAPPED] ?: false
+    suspend fun getClusterId(): String = context.dataStore.data.first()[KEY_CLUSTER_ID] ?: ""
+    suspend fun getMasterTcpPort(): Int = context.dataStore.data.first()[KEY_MASTER_TCP_PORT] ?: 8888
+    suspend fun getModelManifestUrl(): String = context.dataStore.data.first()[KEY_MODEL_MANIFEST_URL] ?: ""
     suspend fun getInferenceMode(): String = context.dataStore.data.first()[KEY_INFERENCE_MODE] ?: DEFAULT_MODE
     suspend fun getMaxTokens(): Int = context.dataStore.data.first()[KEY_MAX_TOKENS] ?: DEFAULT_MAX_TOKENS
     suspend fun getTemperature(): Float = context.dataStore.data.first()[KEY_TEMPERATURE] ?: DEFAULT_TEMPERATURE
@@ -131,6 +143,11 @@ class SettingsDataStore(private val context: Context) {
         return generated
     }
 
+    suspend fun setAndroidNodeId(nodeId: String) {
+        if (nodeId.isBlank()) return
+        context.dataStore.edit { it[KEY_ANDROID_NODE_ID] = nodeId }
+    }
+
     // ==================== 写入 ====================
 
     suspend fun setServerHost(host: String) {
@@ -139,6 +156,34 @@ class SettingsDataStore(private val context: Context) {
 
     suspend fun setServerPort(port: Int) {
         context.dataStore.edit { it[KEY_SERVER_PORT] = port }
+    }
+
+    suspend fun saveBootstrapConfig(
+        serverHost: String,
+        serverPort: Int,
+        masterTcpPort: Int,
+        clusterId: String,
+        nodeId: String,
+        modelManifestUrl: String,
+    ) {
+        context.dataStore.edit {
+            if (serverHost.isNotBlank()) it[KEY_SERVER_HOST] = serverHost
+            it[KEY_SERVER_PORT] = serverPort
+            it[KEY_MASTER_TCP_PORT] = masterTcpPort
+            it[KEY_CLUSTER_ID] = clusterId
+            if (nodeId.isNotBlank()) it[KEY_ANDROID_NODE_ID] = nodeId
+            if (modelManifestUrl.isNotBlank()) it[KEY_MODEL_MANIFEST_URL] = modelManifestUrl
+            it[KEY_BOOTSTRAPPED] = true
+        }
+    }
+
+    suspend fun clearBootstrapConfig() {
+        context.dataStore.edit {
+            it.remove(KEY_BOOTSTRAPPED)
+            it.remove(KEY_CLUSTER_ID)
+            it.remove(KEY_MASTER_TCP_PORT)
+            it.remove(KEY_MODEL_MANIFEST_URL)
+        }
     }
 
     suspend fun setInferenceMode(mode: String) {
