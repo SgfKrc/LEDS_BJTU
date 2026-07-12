@@ -535,7 +535,8 @@ python serve.py
 - Windows PC 安装包 (.exe)
 - Linux 安装包 (.deb)
 - Android Full / Lite APK
-- 模型压缩包 `models.7z`
+- PC 模型压缩包 `models_pc.7z`
+- Android 模型压缩包 `models_android.7z`（仅包含 GGUF 模型）
 
 > 其他设备（包括 Android 手机）直接浏览器打开链接即可下载。
 

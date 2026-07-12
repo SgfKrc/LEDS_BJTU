@@ -3,6 +3,44 @@
  */
 
 const BASE = '/api';
+const LOG_ADMIN_TOKEN_STORAGE_KEY = 'qlh_log_admin_token';
+
+function getLogTokenStorage() {
+  try {
+    if (typeof window === 'undefined') return null;
+    return window.localStorage || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+export function getLogAdminToken() {
+  try {
+    return getLogTokenStorage()?.getItem(LOG_ADMIN_TOKEN_STORAGE_KEY) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+export function setLogAdminToken(token) {
+  try {
+    const storage = getLogTokenStorage();
+    if (!storage) return;
+    const normalized = (token || '').trim();
+    if (normalized) {
+      storage.setItem(LOG_ADMIN_TOKEN_STORAGE_KEY, normalized);
+    } else {
+      storage.removeItem(LOG_ADMIN_TOKEN_STORAGE_KEY);
+    }
+  } catch (_) {
+    // Ignore storage failures; local log access still works without a token.
+  }
+}
+
+function withLogAdminHeaders(headers = {}) {
+  const token = getLogAdminToken();
+  return token ? { ...headers, 'X-QLH-Log-Token': token } : headers;
+}
 
 function makeApiError(message, { status = 0, requestId = null, path = '' } = {}) {
   const suffix = requestId ? ` (request_id: ${requestId})` : '';
@@ -494,19 +532,25 @@ export async function fetchConversationSyncStatus() {
 // ---- 日志管理 ----
 
 export async function fetchLogFiles() {
-  return request('/logs');
+  return request('/logs', { headers: withLogAdminHeaders() });
 }
 
 export async function fetchLogContent(filename) {
-  return request(`/logs/${encodeURIComponent(filename)}`);
+  return request(`/logs/${encodeURIComponent(filename)}`, { headers: withLogAdminHeaders() });
 }
 
 export async function deleteLogFile(filename) {
-  return request(`/logs/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+  return request(`/logs/${encodeURIComponent(filename)}`, {
+    method: 'DELETE',
+    headers: withLogAdminHeaders(),
+  });
 }
 
 export async function deleteAllLogFiles() {
-  return request('/logs', { method: 'DELETE' });
+  return request('/logs', {
+    method: 'DELETE',
+    headers: withLogAdminHeaders(),
+  });
 }
 
 export async function fetchRecentLogs(params = {}) {
@@ -517,15 +561,61 @@ export async function fetchRecentLogs(params = {}) {
   if (params.node_id) qs.set('node_id', params.node_id);
   if (params.request_id) qs.set('request_id', params.request_id);
   const q = qs.toString();
-  return request(`/logs/recent${q ? '?' + q : ''}`);
+  return request(`/logs/recent${q ? '?' + q : ''}`, { headers: withLogAdminHeaders() });
 }
 
 export async function fetchLogStats() {
-  return request('/logs/stats');
+  return request('/logs/stats', { headers: withLogAdminHeaders() });
 }
 
 export function getLogDownloadUrl(filename) {
   return `${BASE}/logs/download?name=${encodeURIComponent(filename)}`;
+}
+
+export async function downloadLogFileBlob(filename) {
+  const path = `/logs/download?name=${encodeURIComponent(filename)}`;
+  const res = await fetch(`${BASE}${path}`, {
+    headers: withLogAdminHeaders({ Accept: 'text/plain' }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        data = { detail: text };
+      }
+    }
+    const requestId = res.headers.get('X-Request-ID') || data.request_id || null;
+    throw makeApiError(data.detail || `HTTP ${res.status}`, {
+      status: res.status,
+      requestId,
+      path,
+    });
+  }
+
+  return {
+    blob: await res.blob(),
+    filename,
+  };
+}
+
+export async function fetchNodeRecentLogs(nodeId, params = {}) {
+  const qs = new URLSearchParams();
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.level) qs.set('level', params.level);
+  if (params.name) qs.set('name', params.name);
+  if (params.timeout) qs.set('timeout', String(params.timeout));
+  const q = qs.toString();
+  return request(`/logs/node/${encodeURIComponent(nodeId)}/recent${q ? '?' + q : ''}`, {
+    headers: withLogAdminHeaders(),
+  });
+}
+
+export async function fetchNodesLogSummary() {
+  return request('/logs/nodes-summary', { headers: withLogAdminHeaders() });
 }
 
 // ---- P3: 主节点转让审查 ----

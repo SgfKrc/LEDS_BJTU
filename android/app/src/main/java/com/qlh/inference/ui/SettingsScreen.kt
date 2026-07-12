@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -60,6 +61,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -85,6 +87,7 @@ fun SettingsScreen(
     topP: Float,
     contextSize: Int,
     showThinking: Boolean,
+    themeMode: String,
     modelTreeUri: String,
     selectedModelUri: String,
     modelStorageMode: String,
@@ -101,6 +104,7 @@ fun SettingsScreen(
     onTopPChange: (Float) -> Unit,
     onContextSizeChange: (Int) -> Unit,
     onShowThinkingChange: (Boolean) -> Unit,
+    onThemeModeChange: (String) -> Unit,
     onChooseModelDirectory: () -> Unit,
     onRefreshModels: () -> Unit,
     onModelSelected: (ModelManager.ModelDocument) -> Unit,
@@ -124,11 +128,63 @@ fun SettingsScreen(
 
     Column(
         modifier = modifier
+            .testTag("settings_screen")
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        // ---- 主节点连接 ----
+        SectionHeader(title = "外观", icon = Icons.Default.Settings)
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            )
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "主题模式",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(
+                        "system" to "跟随系统",
+                        "light" to "浅色",
+                        "dark" to "深色"
+                    ).forEach { (mode, label) ->
+                        val selected = themeMode == mode
+                        OutlinedButton(
+                            onClick = { onThemeModeChange(mode) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("settings_theme_$mode"),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = if (selected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.surface
+                                },
+                                contentColor = if (selected) {
+                                    MaterialTheme.colorScheme.onPrimary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                }
+                            )
+                        ) {
+                            Text(label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- 主节点连接 ----
         SectionHeader(title = "主节点连接", icon = Icons.Default.NetworkCheck)
 
@@ -309,7 +365,7 @@ fun SettingsScreen(
                     value = maxTokensText,
                     onValueChange = {
                         maxTokensText = it
-                        it.toIntOrNull()?.let { v -> if (v in 1..4096) onMaxTokensChange(v) }
+                        it.toIntOrNull()?.let { v -> if (v in 1..8192) onMaxTokensChange(v) }
                     },
                     label = { Text("最大 Token 数") },
                     modifier = Modifier.fillMaxWidth(),

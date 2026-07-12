@@ -75,6 +75,7 @@ data class MainUiState(
     val runtimeStatus: AndroidRuntimeStatus? = null,
     val runtimeStatusLoading: Boolean = false,
     val runtimeStatusError: String? = null,
+    val themeMode: String = SettingsDataStore.DEFAULT_THEME_MODE,
 
     // 上次发送的消息（用于重试）
     val lastSentMessage: String? = null
@@ -130,6 +131,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val modelTreeUri = settings.getModelTreeUri()
             val selectedModelUri = settings.getSelectedModelUri()
             val storageMode = settings.getModelStorageMode()
+            val themeMode = settings.getThemeMode()
             val selectedModel = modelManager.getSelectedModel()
             val sessions = database.sessionDao().getAllSessions().first()
             val initialSessionId = sessions.firstOrNull()?.id ?: repository.createSession("新对话")
@@ -148,6 +150,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 modelTreeUri = modelTreeUri,
                 selectedModelUri = selectedModelUri,
                 modelStorageMode = storageMode,
+                themeMode = themeMode,
                 selectedModelName = selectedModel?.name.orEmpty(),
                 selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L
             )
@@ -236,6 +239,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settings.contextSize.collect { size ->
                 _uiState.value = _uiState.value.copy(contextSize = size)
+            }
+        }
+        viewModelScope.launch {
+            settings.themeMode.collect { mode ->
+                _uiState.value = _uiState.value.copy(themeMode = mode)
             }
         }
     }
@@ -681,6 +689,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(contextSize = size)
             QlhApplication.instance.inferenceService?.modelContextSize = size
             refreshRuntimeStatus()
+        }
+    }
+
+    fun setThemeMode(mode: String) {
+        viewModelScope.launch {
+            settings.setThemeMode(mode)
+            _uiState.value = _uiState.value.copy(themeMode = mode)
         }
     }
 

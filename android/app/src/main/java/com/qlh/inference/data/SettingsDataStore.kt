@@ -43,16 +43,18 @@ class SettingsDataStore(private val context: Context) {
         val KEY_MODEL_TREE_URI = stringPreferencesKey("model_tree_uri")
         val KEY_SELECTED_MODEL_URI = stringPreferencesKey("selected_model_uri")
         val KEY_MODEL_STORAGE_MODE = stringPreferencesKey("model_storage_mode")
+        val KEY_THEME_MODE = stringPreferencesKey("theme_mode") // "system" | "light" | "dark"
 
         // ---- 默认值 ----
         const val DEFAULT_HOST = "100.90.76.108"
         const val DEFAULT_PORT = 8000
         const val DEFAULT_MODE = "thin"
-        const val DEFAULT_MAX_TOKENS = 512
+        const val DEFAULT_MAX_TOKENS = 1024
         const val DEFAULT_TEMPERATURE = 0.7f
         const val DEFAULT_TOP_P = 0.9f
         const val DEFAULT_CONTEXT_SIZE = 2048
         const val DEFAULT_MODEL_STORAGE_MODE = "saf_fd"
+        const val DEFAULT_THEME_MODE = "system"
     }
 
     // ==================== 流式读取 ====================
@@ -109,6 +111,10 @@ class SettingsDataStore(private val context: Context) {
         prefs[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
     }
 
+    val themeMode: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
+    }
+
     /** 获取完整的服务器 base URL */
     val baseUrl: Flow<String> = context.dataStore.data.map { prefs ->
         val host = prefs[KEY_SERVER_HOST] ?: DEFAULT_HOST
@@ -134,6 +140,7 @@ class SettingsDataStore(private val context: Context) {
     suspend fun getSelectedModelUri(): String = context.dataStore.data.first()[KEY_SELECTED_MODEL_URI] ?: ""
     suspend fun getModelStorageMode(): String =
         context.dataStore.data.first()[KEY_MODEL_STORAGE_MODE] ?: DEFAULT_MODEL_STORAGE_MODE
+    suspend fun getThemeMode(): String = context.dataStore.data.first()[KEY_THEME_MODE] ?: DEFAULT_THEME_MODE
 
     suspend fun getOrCreateAndroidNodeId(): String {
         val existing = context.dataStore.data.first()[KEY_ANDROID_NODE_ID]
@@ -220,6 +227,14 @@ class SettingsDataStore(private val context: Context) {
 
     suspend fun setModelStorageMode(mode: String) {
         context.dataStore.edit { it[KEY_MODEL_STORAGE_MODE] = mode }
+    }
+
+    suspend fun setThemeMode(mode: String) {
+        val normalized = when (mode) {
+            "light", "dark" -> mode
+            else -> DEFAULT_THEME_MODE
+        }
+        context.dataStore.edit { it[KEY_THEME_MODE] = normalized }
     }
 
     suspend fun clearSelectedModelUri() {

@@ -444,7 +444,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         res = await sendMessageStream(fullMessage, {
           sessionId: effectiveSessionId,
           signal: abortController.signal,
-          maxNewTokens: settings?.maxNewTokens ?? 512,
+          maxNewTokens: settings?.maxNewTokens ?? 1024,
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,
@@ -481,7 +481,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         res = await sendMessage(fullMessage, {
           sessionId: effectiveSessionId,
           signal: abortController.signal,
-          maxNewTokens: settings?.maxNewTokens ?? 512,
+          maxNewTokens: settings?.maxNewTokens ?? 1024,
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,

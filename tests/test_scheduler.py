@@ -481,6 +481,40 @@ class TestAndroidNodeManagement:
         assert node.network_type == "wifi"
         assert node.node_type == "android"
 
+    def test_manual_register_real_connected_node_conflict(self, sched):
+        """手动注册不应覆盖已经通过真实连接建立的节点记录。"""
+        sched.nodes["client-live"] = NodeInfo(
+            node_id="client-live", role="client", state=NodeState.OFFLINE,
+            node_type="pc", address="10.0.0.2:8888", hostname="worker",
+            network_type="ethernet", connected_at=1700000000.0,
+        )
+
+        result = sched.manual_register_node(
+            "client-live", hostname="manual", address="1.2.3.4:9999",
+            network_type="wifi", node_type="android",
+        )
+
+        assert result["status"] == "conflict"
+        node = sched.nodes["client-live"]
+        assert node.hostname == "worker"
+        assert node.address == "10.0.0.2:8888"
+        assert node.network_type == "ethernet"
+        assert node.node_type == "pc"
+
+    def test_invite_capacity_ignores_historical_offline_records(self, sched):
+        """邀请容量不应被无地址、不可用的历史离线节点占用。"""
+        sched._max_nodes = 2
+        sched.nodes["old-offline"] = NodeInfo(
+            node_id="old-offline", role="client", state=NodeState.OFFLINE,
+            hostname="", address="", connected_at=1700000000.0,
+        )
+
+        invite = sched.get_invite_info()
+
+        assert invite["has_capacity"] is True
+        assert invite["node_count"] == 1
+        assert invite["total_node_records"] >= 1
+
     def test_delete_node_rejects_master_and_missing(self, sched):
         """删除 master / 不存在节点应返回明确状态。"""
         assert sched.delete_node("master")["status"] == "invalid"
@@ -885,6 +919,9 @@ class TestPipelineMessageDispatch:
                     "peer_addr": "10.0.0.9:51234",
                     "network_type": "wifi",
                 }
+
+            def confirm_registration(self, cid):
+                return True
         sched._tcp_server = FakeServer()
         sched.nodes["pc-worker"] = NodeInfo(
             node_id="pc-worker", role="client", node_type="pc",
@@ -945,6 +982,47 @@ class TestPipelineFallback:
         assert isinstance(result, dict)
         # 可能返回 error（模型未加载）或 response
         assert "response" in result or "error" in result
+
+    def test_fallback_waits_for_inference_lock(self, sched, monkeypatch):
+        """流水线未就绪回退时也必须等待推理锁，避免并发完整模型推理。"""
+        import api_server as _api
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: False)
+
+        entered = threading.Event()
+        finished = threading.Event()
+
+        def fake_fallback(prompt, **kwargs):
+            entered.set()
+            return {"response": "fallback", "metrics": {"fallback": True}}
+
+        monkeypatch.setattr(sched, "_run_full_model_inference", fake_fallback)
+
+        assert sched._inference_lock.acquire(blocking=False)
+
+        result_holder = {}
+
+        def call_pipeline():
+            result_holder["result"] = sched.run_pipeline_safe("blocked")
+            finished.set()
+
+        t = threading.Thread(target=call_pipeline)
+        t.start()
+
+        assert not entered.wait(0.2), "推理锁未释放前不应进入本地回退推理"
+        assert not finished.is_set(), "推理锁未释放前请求不应提前完成"
+
+        sched._inference_lock.release()
+        t.join(timeout=2)
+
+        assert finished.is_set()
+        assert entered.is_set()
+        assert result_holder["result"]["response"] == "fallback"
 
 
 # ================================================================
@@ -1967,6 +2045,65 @@ class TestGpuIsIntegrated:
     def test_unknown_defaults_true(self):
         """无提示 → 保守判为集显"""
         assert self._gpu_is_integrated({"name": "Foo Bar"}) is True
+
+
+class TestReviewVoteEligibility:
+    """测试审查投票资格的本机 CUDA 独显判断。"""
+
+    @pytest.fixture
+    def sched_master(self, monkeypatch):
+        s = Scheduler()
+        monkeypatch.setattr(s, "_effective_role", lambda: "master")
+        s.nodes["master"] = NodeInfo(
+            node_id="master", role="master", state=NodeState.ONLINE,
+            node_type="pc", hostname="master-host",
+            device_info=PROFILE_WORKSTATION,
+        )
+        return s
+
+    def test_can_vote_uses_discrete_gpu_from_gpus_list(self, sched_master):
+        """current gpu 是集显时，应使用 gpus 列表里的 CUDA 独显判断投票资格。"""
+        sched_master.nodes["master"].device_info = PROFILE_MULTI_GPU
+
+        ok, reason = sched_master.can_node_vote("master")
+
+        assert ok is True, reason
+
+    def test_can_vote_accepts_custom_master_node_id(self, sched_master, monkeypatch):
+        """主节点自定义 NODE_ID 时，投票检查应回退到 master 自身记录。"""
+        monkeypatch.setattr(sched_master, "get_effective_node_id", lambda: "gaming-laptop")
+        sched_master.nodes["master"].device_info = PROFILE_LAPTOP
+
+        ok, reason = sched_master.can_node_vote("gaming-laptop")
+
+        assert ok is True, reason
+
+    def test_can_vote_uses_local_profile_when_master_profile_is_stale(self, sched_master, monkeypatch):
+        """主节点表里的旧画像只有集显时，应允许用实时本机画像兜底。"""
+        import device_profiler
+
+        class DummyProfile:
+            def to_dict(self):
+                return PROFILE_MULTI_GPU
+
+        sched_master.nodes["master"].device_info = PROFILE_IGPU_ONLY
+        monkeypatch.setattr(device_profiler, "get_profile", lambda: DummyProfile())
+
+        ok, reason = sched_master.can_node_vote("master")
+
+        assert ok is True, reason
+
+    def test_can_vote_rejects_android_node(self, sched_master):
+        sched_master.nodes["android-1"] = NodeInfo(
+            node_id="android-1", role="client", state=NodeState.ONLINE,
+            node_type="android", hostname="phone",
+            device_info=PROFILE_MULTI_GPU,
+        )
+
+        ok, reason = sched_master.can_node_vote("android-1")
+
+        assert ok is False
+        assert "PC" in reason
 
 
 # ================================================================

@@ -26,7 +26,7 @@ import kotlin.coroutines.resumeWithException
 data class ChatRequest(
     val message: String,
     @SerializedName("max_new_tokens")
-    val maxNewTokens: Int = 512,
+    val maxNewTokens: Int = 1024,
     val temperature: Float = 0.7f,
     @SerializedName("top_p")
     val topP: Float = 0.9f,

@@ -41,6 +41,21 @@ class TestCanNodeVote:
         assert ok is True
         assert reason == "ok"
 
+    def test_pc_multi_gpu_can_vote_with_discrete_cuda(self):
+        from review import ReviewManager
+        ok, reason = ReviewManager.can_node_vote(
+            "pc",
+            {
+                "gpu": {"name": "Intel Iris Xe", "cuda_available": False, "is_integrated": True},
+                "gpus": [
+                    {"name": "Intel Iris Xe", "cuda_available": False, "is_integrated": True},
+                    {"name": "NVIDIA GeForce RTX 4060", "cuda_available": True, "is_integrated": False},
+                ],
+            },
+        )
+        assert ok is True
+        assert reason == "ok"
+
     def test_android_cannot_vote(self):
         from review import ReviewManager
         ok, reason = ReviewManager.can_node_vote("android", {})

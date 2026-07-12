@@ -2639,6 +2639,19 @@ class Scheduler:
                 node_type=data.get("node_type", "pc"),
                 model_sha256=data.get("model_sha256", ""),
             )
+            if not registered:
+                reason = "节点注册被调度器拒绝：容量已满或角色无效"
+                logger.warning("event=tcp_register_rejected client_id=%s reason=%s", client_id, reason)
+                if self._tcp_server:
+                    self._tcp_server.reject_client(client_id, reason)
+                return
+
+            if self._tcp_server and not self._tcp_server.confirm_registration(client_id):
+                logger.warning("event=tcp_register_confirm_failed client_id=%s", client_id)
+                self._tcp_server.reject_client(client_id, "注册确认发送失败")
+                self.deregister_node(client_id)
+                return
+
             # 新节点注册后重新计算分层并推送
             if registered and self._effective_role() == "master":
                 self.push_layer_config_to_clients()
@@ -3411,7 +3424,7 @@ class Scheduler:
         """
         检查节点是否有审查投票资格（P3: 主节点转让审查）。
 
-        仅 node_type="pc" 且 device_info.gpu.cuda_available=True 的节点可投票。
+        仅 node_type="pc" 且具备 NVIDIA CUDA 独显的节点可投票。
 
         Args:
             node_id: 节点 ID
@@ -3419,16 +3432,71 @@ class Scheduler:
         Returns:
             (can_vote: bool, reason: str)
         """
-        if node_id not in self.nodes:
+        effective_id = self.get_effective_node_id()
+        is_local_master_query = (
+            self._effective_role() == "master"
+            and node_id in {effective_id, "master"}
+        )
+
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
+            # 主节点可能使用自定义 NODE_ID，但节点表中仍以 "master" 保存自身。
+            if node is None and is_local_master_query:
+                node = self.nodes.get("master")
+            node_type = node.node_type if node else None
+            device_info = dict(node.device_info or {}) if node else {}
+
+        if node is None and not is_local_master_query:
             return False, f"节点 '{node_id}' 未注册"
 
-        node = self.nodes[node_id]
-        if node.node_type != "pc":
+        if node_type is None and is_local_master_query:
+            node_type = "pc"
+
+        if node_type != "pc":
             return False, "仅 PC 节点可参与审查投票"
 
-        device_info = node.device_info or {}
-        gpu = device_info.get("gpu", {})
-        if not gpu.get("cuda_available", False):
+        local_profile_cache = None
+
+        def load_local_profile() -> dict:
+            nonlocal local_profile_cache
+            if local_profile_cache is not None:
+                return local_profile_cache
+            local_profile_cache = {}
+            try:
+                from device_profiler import get_profile
+                profile = get_profile()
+                if profile:
+                    local_profile_cache = profile.to_dict()
+            except Exception as e:
+                logger.debug(f"读取本机设备画像失败，无法用于投票资格兜底: {e}")
+            return local_profile_cache
+
+        def has_cuda_discrete(info: dict) -> bool:
+            gpu = self._select_scoring_gpu(info or {})
+            return bool(
+                isinstance(gpu, dict)
+                and gpu.get("cuda_available", False)
+                and not self._gpu_is_integrated(gpu)
+            )
+
+        if not device_info and is_local_master_query:
+            device_info = load_local_profile()
+
+        if has_cuda_discrete(device_info):
+            return True, "ok"
+
+        # 本地主节点的 DB/节点表可能保存了旧画像（例如只记录了集显）。
+        # 仅对当前主节点再读取实时画像兜底，避免误把本机硬件套用到远端节点。
+        if is_local_master_query:
+            local_device_info = load_local_profile()
+            if local_device_info and local_device_info != device_info:
+                if has_cuda_discrete(local_device_info):
+                    return True, "ok"
+
+        if not device_info:
+            return False, "节点缺少设备画像，无法确认 CUDA 独显"
+
+        if not has_cuda_discrete(device_info):
             return False, "仅 NVIDIA CUDA 独显节点可参与审查投票"
 
         return True, "ok"
@@ -4518,15 +4586,21 @@ class Scheduler:
         # Phase 2.1+: 锁保护迭代计数，防止并发修改
         with self._nodes_lock:
             online_count = sum(1 for n in self.nodes.values() if n.is_available())
-            has_capacity = len(self.nodes) < self._max_nodes
+            active_non_master = [
+                n for n in self.nodes.values()
+                if n.role != "master" and (n.is_available() or bool(n.address))
+            ]
+            capacity_used = 1 + len(active_non_master)
+            total_records = len(self.nodes)
 
         return {
             "master_host": lan_ip,
             "master_port": port,
-            "node_count": len(self.nodes),
+            "node_count": capacity_used,
+            "total_node_records": total_records,
             "online_count": online_count,
             "max_nodes": self._max_nodes,
-            "has_capacity": has_capacity,
+            "has_capacity": capacity_used < self._max_nodes,
             "connected_clients": (
                 self._tcp_server.get_client_ids() if self._tcp_server else []
             ),
@@ -6596,8 +6670,9 @@ class Scheduler:
 
         if not pipeline_ready:
             logger.warning("部分流水线节点未就绪，回退到全层主节点模式")
-            # Phase 5 review C2: 若调用方未持锁，需获取推理锁防止并发 GPU 推理
-            lock_acquired = self._inference_lock.acquire(blocking=False)
+            # 回退仍会执行完整模型推理，必须与其他 GPU 推理共享同一把锁。
+            # 这里阻塞等待，避免锁被占用时直接绕过互斥保护。
+            self._inference_lock.acquire()
             try:
                 return self._run_full_model_inference(
                     prompt,
@@ -6605,8 +6680,7 @@ class Scheduler:
                     **kwargs,
                 )
             finally:
-                if lock_acquired:
-                    self._inference_lock.release()
+                self._inference_lock.release()
 
         # ---- 排队逻辑（锁内原子判断 + 入队/执行）----
         # ★ 同时检查 is_busy 和 queue_size，消除竞态缺口：
@@ -6975,6 +7049,14 @@ class Scheduler:
                 existing = self.nodes[node_id]
                 if existing.role == "master":
                     return {"status": "invalid", "reason": f"'{node_id}' 是主节点，不可覆盖"}
+                if (existing.is_available() or existing.connected_at or existing.last_heartbeat
+                        or existing.device_info or existing.model_sha256):
+                    return {
+                        "status": "conflict",
+                        "node_id": node_id,
+                        "reason": "节点已通过自动注册建立真实连接记录，请先注销/删除后再手动重建",
+                        "state": existing.state.value,
+                    }
                 existing.hostname = hostname or existing.hostname or node_id
                 existing.address = address
                 existing.network_type = network_type

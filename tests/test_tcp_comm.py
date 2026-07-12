@@ -468,6 +468,111 @@ class TestTCPServerConnectionManagement:
         finally:
             cli_sock.close()
 
+    def test_scheduler_rejected_registration_returns_rejected_and_closes(self):
+        """通过协议校验但被上层调度器拒绝时，应返回 rejected 且不泄漏 clients。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+
+        def reject_in_scheduler(client_id, msg):
+            server.reject_client(client_id, "capacity full")
+
+        server.on_message = reject_in_scheduler
+        server._running = True
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            t = threading.Thread(
+                target=server._handle_client,
+                args=(srv_sock, ("127.0.0.1", 54322), "pending_54322"),
+                daemon=True,
+            )
+            t.start()
+
+            cli_sock.sendall(build_message(MessageType.REGISTER, {
+                "client_id": "client_full",
+                "role": "client",
+                "auth": tcp_comm_mod.build_auth_signature("client_full"),
+            }))
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            assert header is not None
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["type"] == "register"
+            assert ack["data"]["status"] == "rejected"
+            assert "capacity full" in ack["data"]["reason"]
+
+            t.join(timeout=2)
+            assert not t.is_alive()
+            assert server.get_client_ids() == []
+        finally:
+            cli_sock.close()
+
+    def test_scheduler_confirmed_registration_returns_registered(self):
+        """REGISTER 只有在上层调度器确认后才返回 registered。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+
+        def confirm_in_scheduler(client_id, msg):
+            assert server.get_client_info(client_id) is not None
+            server.confirm_registration(client_id)
+
+        server.on_message = confirm_in_scheduler
+        server._running = True
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            t = threading.Thread(
+                target=server._handle_client,
+                args=(srv_sock, ("127.0.0.1", 54323), "pending_54323"),
+                daemon=True,
+            )
+            t.start()
+
+            cli_sock.sendall(build_message(MessageType.REGISTER, {
+                "client_id": "client_ok",
+                "role": "client",
+                "auth": tcp_comm_mod.build_auth_signature("client_ok"),
+            }))
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            assert header is not None
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["type"] == "register"
+            assert ack["data"]["status"] == "registered"
+            assert ack["data"]["client_id"] == "client_ok"
+            assert server.get_client_ids() == ["client_ok"]
+        finally:
+            server.stop()
+            cli_sock.close()
+
+    def test_confirm_registration_send_failure_stays_unconfirmed_and_reject_cleans(self):
+        """ACK 发送失败时不应把 pending 连接标记为 registered。"""
+        class FailingSock:
+            def __init__(self):
+                self.closed = False
+                self.shutdown_called = False
+
+            def sendall(self, payload):
+                raise OSError("send failed")
+
+            def shutdown(self, how):
+                self.shutdown_called = True
+
+            def close(self):
+                self.closed = True
+
+        server = TCPServer(host="127.0.0.1", port=0)
+        sock = FailingSock()
+        conn = ClientConn(client_id="client_fail", sock=sock, addr=("127.0.0.1", 1))
+        server._set_client("client_fail", conn)
+
+        assert server.confirm_registration("client_fail") is False
+        assert conn.registration_confirmed is False
+
+        server.reject_client("client_fail", "confirm failed")
+
+        assert server.get_client_ids() == []
+        assert sock.shutdown_called is True
+        assert sock.closed is True
+
     def test_pop_client_is_idempotent_and_send_missing_raises_connection_error(self):
         """重复清理连接不应 KeyError，不存在客户端发送应抛 ConnectionError。"""
         server = TCPServer(host="127.0.0.1", port=0)

@@ -42,6 +42,7 @@ models/qwen-1_8b-chat/
 
 # Large binaries
 models/*.gguf
+models/*.sha256
 models_pc/*.7z
 models_android/*.7z
 models_pc.7z

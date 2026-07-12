@@ -829,6 +829,7 @@ class ClientConn:
     connected_at: float = 0.0    # 连接时间
     last_heartbeat: float = 0.0  # 上次心跳时间
     heartbeat_missed: int = 0    # 连续心跳丢失次数
+    registration_confirmed: bool = False  # scheduler 确认后才返回 registered ACK
 
     def __post_init__(self):
         if self.device_info is None:
@@ -927,6 +928,47 @@ class TCPServer:
         with self._clients_lock:
             return list(self.clients.items())
 
+    def _send_register_ack(self, conn: socket.socket, status: str,
+                           client_id: str = "", reason: str = "") -> None:
+        """发送 REGISTER ACK。"""
+        data = {"status": status}
+        if client_id:
+            data["client_id"] = client_id
+        if reason:
+            data["reason"] = reason
+        conn.sendall(build_message(MessageType.REGISTER, data))
+
+    def confirm_registration(self, client_id: str) -> bool:
+        """上层调度器确认注册成功后，向客户端返回 registered。"""
+        client = self._get_client(client_id)
+        if client is None:
+            return False
+        try:
+            self._send_register_ack(client.sock, "registered", client_id=client_id)
+            client.registration_confirmed = True
+            return True
+        except OSError as e:
+            logger.warning(f"注册确认发送失败: {e}", exc_info=True)
+            return False
+
+    def reject_client(self, client_id: str, reason: str) -> None:
+        """上层调度器拒绝注册时，返回 rejected 并关闭连接。"""
+        client = self._pop_client(client_id)
+        if client is None:
+            return
+        try:
+            self._send_register_ack(client.sock, "rejected", client_id=client_id, reason=reason)
+        except OSError as e:
+            logger.debug(f"注册拒绝 ACK 发送失败: {e}", exc_info=True)
+        try:
+            client.sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            client.sock.close()
+        except OSError:
+            pass
+
     # ---- Accept 循环 ----
 
     def _accept_loop(self) -> None:
@@ -994,12 +1036,14 @@ class TCPServer:
                     del msg["_needs_tensor"]
 
                 msg_type = msg.get("type", "")
+                registration_pending = False
 
                 # ---- 消息分发 ----
                 if msg_type == MessageType.REGISTER.value:
                     # 注册消息：提取客户端身份信息
                     try:
                         client_id = self._handle_registration(conn, addr, temp_id, msg)
+                        registration_pending = True
                     except _RegistrationRejected as e:
                         logger.info(f"注册被拒，关闭连接: {addr[0]}:{addr[1]} — {e}")
                         try:
@@ -1022,6 +1066,19 @@ class TCPServer:
                         self.on_message(client_id, msg)
                     except Exception as e:
                         logger.error(f"消息回调异常: {e}", exc_info=True)
+                        if registration_pending:
+                            self.reject_client(client_id, "调度器注册回调异常")
+                            break
+                elif registration_pending:
+                    self.confirm_registration(client_id)
+
+                if registration_pending:
+                    current = self._get_client(client_id)
+                    if current is None:
+                        break
+                    if not current.registration_confirmed:
+                        self.reject_client(client_id, "调度器未确认注册")
+                        break
 
         except socket.timeout:
             logger.info(f"客户端 {client_id} 接收超时")
@@ -1171,16 +1228,6 @@ class TCPServer:
             f"hostname={hostname} advertised={advertised_address} "
             f"peer={addr[0]}:{addr[1]}"
         )
-
-        # 发送注册确认
-        ack = build_message(MessageType.REGISTER, {
-            "status": "registered",
-            "client_id": client_id,
-        })
-        try:
-            conn.sendall(ack)
-        except OSError as e:
-            logger.warning(f"注册确认发送失败: {e}", exc_info=True)
 
         return client_id
 

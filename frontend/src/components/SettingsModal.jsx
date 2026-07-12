@@ -5,13 +5,13 @@ import { updateDistributedInferenceConfig } from '../api/client';
 
 // Token 限制档位选项
 const TOKEN_OPTIONS = [
-  { value: 64,   label: '64',   tiers: [] },
-  { value: 128,  label: '128',  tiers: ['mobile'] },
-  { value: 256,  label: '256',  tiers: ['mobile', 'edge'] },
-  { value: 512,  label: '512',  tiers: ['mobile', 'edge', 'ultrabook'] },
-  { value: 1024, label: '1024', tiers: ['edge', 'ultrabook', 'laptop'] },
-  { value: 2048, label: '2048', tiers: ['ultrabook', 'laptop', 'workstation'] },
-  { value: 4096, label: '4096', tiers: ['laptop', 'workstation'] },
+  { value: 128,  label: '128',  tiers: [] },
+  { value: 256,  label: '256',  tiers: ['mobile'] },
+  { value: 512,  label: '512',  tiers: ['mobile', 'edge'] },
+  { value: 1024, label: '1024', tiers: ['mobile', 'edge', 'ultrabook'] },
+  { value: 2048, label: '2048', tiers: ['edge', 'ultrabook', 'laptop'] },
+  { value: 4096, label: '4096', tiers: ['ultrabook', 'laptop', 'workstation'] },
+  { value: 8192, label: '8192', tiers: ['laptop', 'workstation'] },
 ];
 
 // Temperature 选项
@@ -36,6 +36,7 @@ const TOPP_OPTIONS = [
 
 export default function SettingsModal({
   open, onClose, deviceRefreshKey, onToast, theme, onToggleTheme,
+  themeMode = 'system', onThemeModeChange,
   settings, onSettingsChange, deviceTier, hasDedicatedGpu,
   onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
@@ -86,6 +87,8 @@ export default function SettingsModal({
   const [recentLogsAutoRefresh, setRecentLogsAutoRefresh] = useState(false);
   const recentLogsTimerRef = useRef(null);
   const [logStats, setLogStats] = useState(null);
+  const [logAdminTokenInput, setLogAdminTokenInput] = useState('');
+  const [nodesLogSummary, setNodesLogSummary] = useState(null);
 
   const loadLogFiles = useCallback(async () => {
     try {
@@ -184,18 +187,77 @@ export default function SettingsModal({
     }
   }, []);
 
+  const loadNodesLogSummary = useCallback(async () => {
+    if (!myRole?.is_master) {
+      setNodesLogSummary(null);
+      return;
+    }
+    try {
+      const { fetchNodesLogSummary } = await import('../api/client');
+      const data = await fetchNodesLogSummary();
+      setNodesLogSummary(data);
+    } catch (_) {
+      setNodesLogSummary(null);
+    }
+  }, [myRole?.is_master]);
+
+  const viewNodeRecentLogs = useCallback(async (nodeId) => {
+    try {
+      const { fetchNodeRecentLogs } = await import('../api/client');
+      const data = await fetchNodeRecentLogs(nodeId, {
+        limit: 200,
+        level: logLevelFilter,
+        timeout: 5,
+      });
+      setRecentLogs(data);
+      onToast?.({ type: 'success', msg: `已加载节点 ${nodeId} 的最近日志` });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `加载节点日志失败: ${e.message}` });
+    }
+  }, [logLevelFilter, onToast]);
+
+  const saveLogAdminToken = useCallback(async () => {
+    try {
+      const { setLogAdminToken } = await import('../api/client');
+      setLogAdminToken(logAdminTokenInput);
+      await Promise.all([
+        loadLogFiles(),
+        loadRecentLogs(),
+        loadLogStats(),
+        loadNodesLogSummary(),
+      ]);
+      onToast?.({
+        type: 'success',
+        msg: logAdminTokenInput.trim() ? '日志访问令牌已保存' : '日志访问令牌已清除',
+      });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `保存日志令牌失败: ${e.message}` });
+    }
+  }, [
+    logAdminTokenInput,
+    loadLogFiles,
+    loadRecentLogs,
+    loadLogStats,
+    loadNodesLogSummary,
+    onToast,
+  ]);
+
   // L3: 下载日志文件
-  const downloadLog = useCallback((filename) => {
-    import('../api/client').then(({ getLogDownloadUrl }) => {
+  const downloadLog = useCallback(async (filename) => {
+    try {
+      const { downloadLogFileBlob } = await import('../api/client');
+      const { blob } = await downloadLogFileBlob(filename);
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = getLogDownloadUrl(filename);
+      a.href = url;
       a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-    }).catch(() => {
-      onToast?.({ type: 'error', msg: '下载失败：无法加载 API 模块' });
-    });
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `下载失败: ${e.message}` });
+    }
   }, [onToast]);
 
   // L3: 最近日志自动刷新
@@ -259,12 +321,18 @@ export default function SettingsModal({
   // 模态框打开时自动加载日志列表 + 模型列表 + 最近日志 + 统计
   useEffect(() => {
     if (open) {
+      import('../api/client').then(({ getLogAdminToken }) => {
+        setLogAdminTokenInput(getLogAdminToken());
+      }).catch(() => {
+        setLogAdminTokenInput('');
+      });
       loadLogFiles();
       loadRecentLogs();
       loadLogStats();
+      loadNodesLogSummary();
       onLoadModels?.();
     }
-  }, [open, loadLogFiles, loadRecentLogs, loadLogStats, onLoadModels]);
+  }, [open, loadLogFiles, loadRecentLogs, loadLogStats, loadNodesLogSummary, onLoadModels]);
 
   // 判断档位是否匹配当前设备
   const isCurrentTier = (tier) => deviceTier === tier;
@@ -341,11 +409,11 @@ export default function SettingsModal({
                   className="setting-number-input"
                   value={settings.maxNewTokens}
                   min={1}
-                  max={8192}
+                  max={16384}
                   step={1}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
-                    if (v > 0 && v <= 8192) onSettingsChange({ maxNewTokens: v });
+                    if (v > 0 && v <= 16384) onSettingsChange({ maxNewTokens: v });
                   }}
                 />
                 <span className="setting-unit">tokens</span>
@@ -878,7 +946,7 @@ export default function SettingsModal({
             <h3>🎨 外观</h3>
             <div className="theme-toggle-row">
               <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                当前: {theme === 'dark' ? '🌙 暗色模式' : '☀️ 浅色模式'}
+                当前: {themeMode === 'system' ? `跟随系统 · ${theme === 'dark' ? '深色' : '浅色'}` : (theme === 'dark' ? '深色模式' : '浅色模式')}
               </span>
               <button
                 className="theme-toggle-btn"
@@ -893,11 +961,53 @@ export default function SettingsModal({
                 </span>
               </button>
             </div>
+            <div className="theme-mode-segment" role="group" aria-label="主题模式">
+              {[
+                ['system', '跟随系统'],
+                ['light', '浅色'],
+                ['dark', '深色'],
+              ].map(([mode, label]) => (
+                <button
+                  key={mode}
+                  className={themeMode === mode ? 'active' : ''}
+                  onClick={() => onThemeModeChange?.(mode)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* ---- 日志管理 ---- */}
           <div className="sidebar-section" style={{ borderBottom: 'none' }}>
             <h3>📋 日志管理</h3>
+
+            <div className="log-subsection">
+              <h4 style={{ margin: '8px 0 4px' }}>🔑 远程访问</h4>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <input
+                  type="password"
+                  value={logAdminTokenInput}
+                  onChange={e => setLogAdminTokenInput(e.target.value)}
+                  placeholder="QLH_LOG_ADMIN_TOKEN"
+                  autoComplete="off"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: '6px 8px',
+                    fontSize: 12,
+                    borderRadius: 4,
+                    border: '1px solid var(--border)',
+                    background: 'var(--bg-input)',
+                    color: 'var(--text-primary)',
+                  }}
+                />
+                <button className="sidebar-btn" onClick={saveLogAdminToken} style={{ fontSize: 11 }}>
+                  保存
+                </button>
+              </div>
+            </div>
 
             {/* L3: 日志统计摘要 */}
             {logStats && (
@@ -906,6 +1016,58 @@ export default function SettingsModal({
                 <span title="文件总大小">{formatFileSize(logStats.files_total_bytes)}</span>
                 <span title="内存缓冲 / 容量">🔄 {logStats.buffer_size}/{logStats.buffer_capacity}</span>
                 {logStats.node_id && <span title="节点 ID">🖥 {logStats.node_id}</span>}
+              </div>
+            )}
+
+            {myRole?.is_master && (
+              <div className="log-subsection">
+                <div className="log-subsection-header">
+                  <h4>🖧 节点日志</h4>
+                  <button className="sidebar-btn" onClick={loadNodesLogSummary} style={{ fontSize: 11 }}>
+                    刷新
+                  </button>
+                </div>
+                {nodesLogSummary?.workers?.length > 0 ? (
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2 }}>
+                    {nodesLogSummary.workers.map(worker => (
+                      <div
+                        key={worker.node_id}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: 8,
+                          padding: '4px 0',
+                          borderBottom: '1px solid var(--border)',
+                        }}
+                      >
+                        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {worker.node_id}
+                          <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                            buffer {worker.buffer_size || 0}
+                          </span>
+                          {worker.error && (
+                            <span style={{ marginLeft: 8, fontSize: 10, color: '#e74c3c' }}>
+                              {worker.error}
+                            </span>
+                          )}
+                        </span>
+                        <button
+                          className="sidebar-btn"
+                          onClick={() => viewNodeRecentLogs(worker.node_id)}
+                          disabled={Boolean(worker.error)}
+                          style={{ fontSize: 11 }}
+                        >
+                          查看
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    暂无在线从节点日志摘要
+                  </div>
+                )}
               </div>
             )}
 

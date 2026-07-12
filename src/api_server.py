@@ -140,7 +140,10 @@ def _close_logging_handlers(keep_memory: bool = False):
     """
     root = logging.getLogger()
     for handler in root.handlers[:]:
-        if keep_memory and isinstance(handler, (logging.StreamHandler, MemoryLogHandler)):
+        is_file_handler = isinstance(handler, logging.FileHandler)
+        if keep_memory and not is_file_handler and isinstance(
+            handler, (logging.StreamHandler, MemoryLogHandler)
+        ):
             continue  # 保留终端和内存 handler，确保删除期间日志不丢失
         root.removeHandler(handler)
         try:
@@ -4497,6 +4500,13 @@ class ClientErrorReport(BaseModel):
     extra: dict = Field(default_factory=dict)  # 附加上下文（如 session_id、当前操作）
 
 
+def _truncate_log_field(value, limit: int) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...[truncated]"
+
+
 @app.post("/api/logs/client-error")
 async def report_client_error(report: ClientErrorReport, request: Request):
     """接收前端错误报告并写入后端诊断日志。"""
@@ -4505,15 +4515,18 @@ async def report_client_error(report: ClientErrorReport, request: Request):
     logger.error(
         "event=client_error source=%s message=%s url=%s line=%d col=%d "
         "client=%s ua=%s stack=%s extra=%s request_id=%s",
-        report.source,
-        report.message,
-        report.url,
+        _truncate_log_field(report.source, 80),
+        _truncate_log_field(report.message, 500),
+        _truncate_log_field(report.url, 300),
         report.line,
         report.col,
         client_host,
-        report.user_agent[:200] if report.user_agent else "-",
-        (report.stack or "")[:2000],
-        json.dumps(report.extra or {}, ensure_ascii=False, default=str)[:500],
+        _truncate_log_field(report.user_agent or "-", 200),
+        _truncate_log_field(report.stack, 2000),
+        _truncate_log_field(
+            json.dumps(report.extra or {}, ensure_ascii=False, default=str),
+            500,
+        ),
         request_id,
     )
     return {"status": "ok", "logged": True}

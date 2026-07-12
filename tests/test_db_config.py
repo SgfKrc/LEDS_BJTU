@@ -281,7 +281,15 @@ class TestDbEnvVarConfig:
 
     def test_db_password_empty_by_default(self, monkeypatch):
         """未设置环境变量时 DB_PASSWORD 应为空字符串"""
+        real_exists = os.path.exists
+
+        def no_dotenv(path):
+            if os.path.basename(str(path)) == ".env":
+                return False
+            return real_exists(path)
+
         monkeypatch.delenv("QLH_DB_PASSWORD", raising=False)
+        monkeypatch.setattr(os.path, "exists", no_dotenv)
         import importlib
         import db as db_mod
         importlib.reload(db_mod)
