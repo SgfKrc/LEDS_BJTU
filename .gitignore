@@ -17,6 +17,7 @@ SMTP.md
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store
@@ -25,10 +26,14 @@ Thumbs.db
 # Logs
 logs/*.log
 packaging/*.log
+src/import_time.log
+android/.kotlin/
 
 # Environment
 .env
 .env.local
+node_config.json
+node_config.json.tmp
 .gitignore_bak
 
 # Model weights (downloaded separately)
@@ -37,8 +42,10 @@ models/qwen-1_8b-chat/
 
 # Large binaries
 models/*.gguf
-models/*.7z
-models.7z
+models_pc/*.7z
+models_android/*.7z
+models_pc.7z
+models_android.7z
 
 # Packaging build artifacts
 build/
