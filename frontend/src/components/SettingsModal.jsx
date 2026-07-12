@@ -304,13 +304,17 @@ export default function SettingsModal({
       onToast?.({ type: 'error', msg: '模型 ID 和名称为必填项' });
       return;
     }
-    await onRegisterModel?.(newModelForm);
-    setShowAddModel(false);
-    setNewModelForm({
-      model_id: '', name: '', model_type: 'safetensors',
-      model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
-      max_context: 4096, huggingface_id: '', description: '',
-    });
+    try {
+      await onRegisterModel?.(newModelForm);
+      setShowAddModel(false);
+      setNewModelForm({
+        model_id: '', name: '', model_type: 'safetensors',
+        model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
+        max_context: 4096, huggingface_id: '', description: '',
+      });
+    } catch (_) {
+      // Parent handler owns the toast; keep the form open so the user can fix it.
+    }
   }, [newModelForm, onRegisterModel, onToast]);
 
   const handleRemoveModel = useCallback(async (modelId) => {
@@ -541,13 +545,12 @@ export default function SettingsModal({
             )}
           </div>
 
-          {/* ======== 实验性模型（仅独显） ======== */}
-          {hasDedicatedGpu && (
+          {/* ======== 实验性模型 ======== */}
+          {
             <div className="sidebar-section">
-              <h3>🧪 实验性模型</h3>
+              <h3>🧪 模型管理</h3>
               <div className="setting-desc" style={{ marginBottom: 12 }}>
-                为具有 NVIDIA 独显的设备提供更大模型的实验性支持。
-                实验模型需手动下载，不包含在安装包内。
+                模型需手动下载，不包含在安装包内。未落盘或当前设备不支持的模型会标注为不可选。
               </div>
 
               {/* 当前模型 */}
@@ -562,7 +565,7 @@ export default function SettingsModal({
               {availableModels.length > 0 && (
                 <div className="experimental-model-list">
                   {availableModels.map(m => (
-                    <div key={m.model_id} className="experimental-model-card">
+                    <div key={m.model_id} className={`experimental-model-card${m.is_available ? '' : ' unavailable'}`}>
                       <div className="model-card-header">
                         <strong>{m.name}</strong>
                         {m.is_experimental && (
@@ -570,6 +573,11 @@ export default function SettingsModal({
                         )}
                         {!m.is_experimental && (
                           <span className="chip-badge default">默认</span>
+                        )}
+                        {m.is_available ? (
+                          <span className="chip-badge available">可用</span>
+                        ) : (
+                          <span className="chip-badge unavailable">未下载</span>
                         )}
                       </div>
                       {m.description && (
@@ -579,16 +587,24 @@ export default function SettingsModal({
                         <span>显存 ≥ {m.recommended_vram_gb} GB</span>
                         <span>上下文 {m.max_context}</span>
                         <span>类型 {m.model_type}</span>
+                        {m.available_formats?.length > 0 && (
+                          <span>{m.available_formats.join(' + ')}</span>
+                        )}
                       </div>
+                      {!m.is_available && (
+                        <div className="model-card-desc unavailable-reason">
+                          {m.unavailable_reason || '模型文件未落盘，暂不可加载。'}
+                        </div>
+                      )}
                       <div className="model-card-actions">
                         <button
                           className="setting-btn secondary"
-                          onClick={() => onSwitchModel?.(m.model_id, 'int4')}
-                          disabled={switchingModel || activeModelId === m.model_id}
+                          onClick={() => onSwitchModel?.(m.model_id, m.default_quant_type || 'int4', m.preferred_engine || 'auto')}
+                          disabled={switchingModel || activeModelId === m.model_id || !m.is_available}
                         >
                           {activeModelId === m.model_id ? '当前模型' : switchingModel ? '切换中…' : '加载此模型'}
                         </button>
-                        {m.is_experimental && m.location !== 'bundled' && (
+                        {m.is_experimental && !m.is_builtin && (
                           <button
                             className="setting-btn danger-ghost"
                             onClick={() => handleRemoveModel(m.model_id)}
@@ -709,7 +725,7 @@ export default function SettingsModal({
                 💡 实验性模型文件不会随安装包分发，需从 HuggingFace 手动下载到指定目录。
               </p>
             </div>
-          )}
+          }
 
           {/* ======== 对话历史 ======== */}
           <div className="sidebar-section">

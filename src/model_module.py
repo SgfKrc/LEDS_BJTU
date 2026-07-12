@@ -21,9 +21,22 @@
 
 import logging
 import os
+import re
 import threading
 import time
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, Union
+
+
+def _configure_huggingface_cache() -> None:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hf_home = os.path.join(project_root, ".hf-cache")
+    hf_modules_cache = os.path.join(hf_home, "modules")
+    os.makedirs(hf_modules_cache, exist_ok=True)
+    os.environ.setdefault("HF_HOME", hf_home)
+    os.environ.setdefault("HF_MODULES_CACHE", hf_modules_cache)
+
+
+_configure_huggingface_cache()
 
 import psutil
 import torch
@@ -45,6 +58,17 @@ from config import (
 import model_config as mc
 
 logger = logging.getLogger(__name__)
+
+
+CHATML_STOP_SEQUENCES = [
+    "<|im_end|>",
+    "<|im_start|>",
+    "<｜end▁of▁sentence｜>",
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<|endoftext|>",
+    "</s>",
+]
 
 
 class ModelManager:
@@ -205,6 +229,7 @@ class ModelManager:
         profile: dict = None,
         model_id: str = None,
         engine: str = None,
+        db_experimental_models: list[dict] = None,
     ) -> None:
         """
         加载模型，自适应选择推理引擎。
@@ -219,26 +244,13 @@ class ModelManager:
             profile: 设备画像 dict
             model_id: 模型唯一标识（P3多模型支持）。
                       若提供且 model_path 未指定，从 model_config 查找路径。
+            db_experimental_models: DB 注册的实验模型列表（P3修复：支持 DB 模型查找）。
         """
-        # P3: 多模型支持 — 根据 model_id 解析路径
         resolved_path = model_path
         resolved_id = model_id or mc.DEFAULT_MODEL_ID
-
-        if not resolved_path and model_id:
-            cfg = mc.get_model_config(model_id)
-            if cfg is None:
-                raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
-            # 优先使用 safetensors 路径，其次 GGUF
-            if cfg.model_path and os.path.isdir(cfg.model_path):
-                resolved_path = cfg.model_path
-            elif cfg.gguf_path and os.path.isfile(cfg.gguf_path):
-                resolved_path = cfg.gguf_path
-            else:
-                raise FileNotFoundError(
-                    f"模型 '{model_id}' 的路径不存在。\n"
-                    f"  safetensors: {cfg.model_path or '(未配置)'}\n"
-                    f"  GGUF: {cfg.gguf_path or '(未配置)'}"
-                )
+        cfg = mc.get_model_config(resolved_id, db_experimental_models) if model_id else None
+        if model_id and cfg is None and not resolved_path:
+            raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
 
         # 确定引擎（尊重 model_type 约束）
         # P3修复: 允许调用者通过 engine 参数强制选择引擎
@@ -249,7 +261,6 @@ class ModelManager:
         # model_type 强制约束：GGUF-only 模型必须用 llama.cpp；
         # Safetensors-only 模型在 CPU 上仍需走 PyTorch（或报错）
         if resolved_id != mc.DEFAULT_MODEL_ID:
-            cfg = mc.get_model_config(resolved_id)
             if cfg:
                 if cfg.model_type == "gguf" and resolved_engine == "pytorch":
                     logger.warning(
@@ -263,6 +274,24 @@ class ModelManager:
                         f"引擎保持 pytorch（CPU 推理）"
                     )
                     resolved_engine = "pytorch"
+
+        if not resolved_path and cfg:
+            safetensors_path = mc.resolve_model_path(cfg.model_path)
+            gguf_path = mc.resolve_model_path(cfg.gguf_path)
+            if resolved_engine == "llama_cpp":
+                if gguf_path and os.path.isfile(gguf_path):
+                    resolved_path = gguf_path
+                else:
+                    raise FileNotFoundError(
+                        f"模型 '{resolved_id}' 的 GGUF 文件不存在: {cfg.gguf_path or '(未配置)'}"
+                    )
+            else:
+                if safetensors_path and os.path.isdir(safetensors_path):
+                    resolved_path = safetensors_path
+                else:
+                    raise FileNotFoundError(
+                        f"模型 '{resolved_id}' 的 Safetensors 目录不存在: {cfg.model_path or '(未配置)'}"
+                    )
 
         self._engine_type = resolved_engine
 
@@ -335,6 +364,8 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         engine: str = None,
+        model_path: str = None,
+        db_experimental_models: list[dict] = None,
     ) -> dict:
         """
         切换到另一个模型（P3 多模型支持）。
@@ -351,6 +382,7 @@ class ModelManager:
             quant_type: 量化精度（默认使用当前精度或 QUANT_TYPE）
             profile: 设备画像
             engine: 推理引擎 "pytorch" | "llama_cpp" | "auto" (None=auto)
+            db_experimental_models: DB 注册的实验模型列表（P3修复：支持 DB 模型查找）。
 
         Returns:
             {"success": bool, "model_id": str, "model_name": str, "error": str | None}
@@ -361,12 +393,13 @@ class ModelManager:
             rollback_model_name = self._active_model_id  # 将在下面尝试获取可读名称
             rollback_engine = self._previous_engine_type or self._engine_type
             rollback_quant = self._previous_quant_type or quant_type or QUANT_TYPE
+            rollback_path = self._model_path
             had_model = self.is_loaded
 
             if had_model:
                 # 尝试获取回滚模型的可读名称
                 try:
-                    rollback_cfg = mc.get_model_config(rollback_model_id)
+                    rollback_cfg = mc.get_model_config(rollback_model_id, db_experimental_models)
                     if rollback_cfg:
                         rollback_model_name = rollback_cfg.name
                 except Exception:
@@ -387,20 +420,22 @@ class ModelManager:
 
             # 步骤 2: 加载新模型
             try:
-                cfg = mc.get_model_config(model_id)
-                if cfg is None:
+                cfg = mc.get_model_config(model_id, db_experimental_models)
+                if cfg is None and not model_path:
                     return {
                         "success": False,
                         "model_id": model_id,
                         "model_name": model_id,
                         "error": f"模型 '{model_id}' 未在注册表中找到。请先注册或下载模型文件。",
                     }
-                self.load_model(model_id=model_id, quant_type=quant_type,
-                                profile=profile, engine=engine)
+                self.load_model(model_id=model_id, model_path=model_path,
+                                quant_type=quant_type, profile=profile,
+                                engine=engine,
+                                db_experimental_models=db_experimental_models)
                 return {
                     "success": True,
                     "model_id": self._active_model_id,
-                    "model_name": cfg.name,
+                    "model_name": cfg.name if cfg else model_id,
                     "error": None,
                 }
             except Exception as e:
@@ -413,9 +448,11 @@ class ModelManager:
                         self.unload_model()
                         self.load_model(
                             model_id=rollback_model_id,
+                            model_path=rollback_path,
                             quant_type=rollback_quant,
                             profile=profile,
                             engine=rollback_engine if rollback_engine else None,
+                            db_experimental_models=db_experimental_models,
                         )
                         return {
                             "success": False,
@@ -755,6 +792,7 @@ class ModelManager:
 
         t0 = time.time()
 
+        logger.info(f"加载 PyTorch 模型路径: {path}")
         self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=TRUST_REMOTE_CODE)
         self.layer_range = None
@@ -893,8 +931,20 @@ class ModelManager:
             # Qwen tokenizer 的 chat_template 可能不同，手动构建
             input_text = self._build_qwen_prompt(messages)
 
+        stop_sequences = self._merge_stop_sequences(stop)
         inputs = self.tokenizer(input_text, return_tensors="pt")
         inputs = {k: v.to(self.get_device()) for k, v in inputs.items()}
+        generation_kwargs = dict(kwargs)
+        generation_kwargs.setdefault(
+            "eos_token_id",
+            self._get_generation_eos_token_ids(stop_sequences),
+        )
+        stop_criteria = self._build_stop_criteria(
+            stop_sequences,
+            inputs["input_ids"].shape[1],
+        )
+        if stop_criteria is not None:
+            generation_kwargs.setdefault("stopping_criteria", stop_criteria)
 
         with torch.no_grad():
             outputs = self.model.generate(
@@ -904,13 +954,13 @@ class ModelManager:
                 top_p=top_p,
                 do_sample=temperature > 0,
                 pad_token_id=self.tokenizer.eos_token_id,
-                **kwargs,
+                **generation_kwargs,
             )
 
         # 解码生成部分（去除输入部分）
         input_len = inputs["input_ids"].shape[1]
         generated_ids = outputs[0][input_len:]
-        content = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        content = self._decode_generated_ids(generated_ids, stop_sequences)
 
         elapsed = time.time() - t0
         completion_tokens = len(generated_ids)
@@ -920,6 +970,8 @@ class ModelManager:
             f"推理完成 (PyTorch): {completion_tokens} tokens / {elapsed:.1f}s "
             f"= {tok_per_sec:.1f} tok/s"
         )
+        cfg = mc.get_model_config(self._active_model_id) if self._active_model_id else None
+        model_name = cfg.name if cfg else (self._active_model_id or MODEL_NAME)
 
         return {
             "content": content,
@@ -928,7 +980,7 @@ class ModelManager:
                 "completion_tokens": completion_tokens,
                 "total_tokens": input_len + completion_tokens,
             },
-            "model": MODEL_NAME,
+            "model": model_name,
             "finish_reason": "stop",
             "tokens_per_second": round(tok_per_sec, 1),
         }
@@ -985,9 +1037,10 @@ class ModelManager:
 
             inputs = self.tokenizer(input_text, return_tensors="pt")
             inputs = {k: v.to(self.get_device()) for k, v in inputs.items()}
+            stop_sequences = self._merge_stop_sequences(stop)
 
             streamer = TextIteratorStreamer(
-                self.tokenizer, skip_prompt=True, skip_special_tokens=True,
+                self.tokenizer, skip_prompt=True, skip_special_tokens=False,
             )
             generation_kwargs = dict(
                 **inputs,
@@ -996,8 +1049,15 @@ class ModelManager:
                 top_p=top_p,
                 do_sample=temperature > 0,
                 pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self._get_generation_eos_token_ids(stop_sequences),
                 streamer=streamer,
             )
+            stop_criteria = self._build_stop_criteria(
+                stop_sequences,
+                inputs["input_ids"].shape[1],
+            )
+            if stop_criteria is not None:
+                generation_kwargs["stopping_criteria"] = stop_criteria
 
             import threading
             t0 = time.time()
@@ -1007,7 +1067,7 @@ class ModelManager:
             thread.start()
 
             chunk_count = 0
-            for text in streamer:
+            for text in self._iter_stream_until_stop(streamer, stop_sequences):
                 if text:
                     chunk_count += 1
                     yield text
@@ -1029,6 +1089,121 @@ class ModelManager:
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
         parts.append("<|im_start|>assistant\n")
         return "\n".join(parts)
+
+    @staticmethod
+    def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
+        """Return caller stop sequences plus ChatML sentinels, preserving order."""
+        merged: List[str] = []
+        for value in (stop or []) + CHATML_STOP_SEQUENCES:
+            if value and value not in merged:
+                merged.append(value)
+        return merged
+
+    def _get_generation_eos_token_ids(self, stop_sequences: List[str]) -> Optional[Union[List[int], int]]:
+        """Map known stop strings to token ids when the tokenizer has them."""
+        ids: List[int] = []
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+        if eos_id is not None:
+            ids.append(int(eos_id))
+        for text in stop_sequences:
+            convert = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+            if convert is None:
+                continue
+            token_id = convert(text)
+            if (
+                isinstance(token_id, int)
+                and token_id >= 0
+                and token_id != unk_id
+                and token_id not in ids
+            ):
+                ids.append(token_id)
+        if not ids:
+            return None
+        return ids if len(ids) > 1 else ids[0]
+
+    def _build_stop_criteria(self, stop_sequences: List[str], prompt_len: int):
+        """Stop generation when the new token tail matches any configured stop string."""
+        try:
+            from transformers import StoppingCriteria, StoppingCriteriaList
+        except ImportError:
+            return None
+
+        stop_token_ids: List[List[int]] = []
+        for text in stop_sequences:
+            encoded = self.tokenizer.encode(text, add_special_tokens=False)
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            if encoded and isinstance(encoded[0], list):
+                encoded = encoded[0]
+            if encoded:
+                stop_token_ids.append([int(token_id) for token_id in encoded])
+
+        if not stop_token_ids:
+            return None
+
+        class StopOnTokenSequences(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs) -> bool:
+                generated = input_ids[0, prompt_len:].tolist()
+                if not generated:
+                    return False
+                for seq in stop_token_ids:
+                    if len(generated) >= len(seq) and generated[-len(seq):] == seq:
+                        return True
+                return False
+
+        return StoppingCriteriaList([StopOnTokenSequences()])
+
+    @staticmethod
+    def _strip_known_special_tokens(text: str, trim: bool = True) -> str:
+        """Remove ChatML/control tokens that may not be registered as special tokens."""
+        if not text:
+            return text
+        result = text
+        for marker in CHATML_STOP_SEQUENCES:
+            result = result.replace(marker, "")
+        result = re.sub(r"<\s*\|im_(?:start|end)\|\s*>", "", result)
+        return result.strip() if trim else result
+
+    def _decode_generated_ids(self, generated_ids, stop_sequences: List[str]) -> str:
+        """Decode completion text, cut at stop text, then remove leaked control tokens."""
+        content = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+        cut_idx = None
+        for marker in stop_sequences:
+            idx = content.find(marker)
+            if idx != -1:
+                cut_idx = idx if cut_idx is None else min(cut_idx, idx)
+        if cut_idx is not None:
+            content = content[:cut_idx]
+        return self._strip_known_special_tokens(content)
+
+    def _iter_stream_until_stop(self, streamer, stop_sequences: List[str]):
+        """Yield streamed text while withholding enough tail to detect split stop strings."""
+        max_stop_len = max((len(s) for s in stop_sequences), default=0)
+        pending = ""
+        for text in streamer:
+            if not text:
+                continue
+            pending += text
+            cut_idx = None
+            for marker in stop_sequences:
+                idx = pending.find(marker)
+                if idx != -1:
+                    cut_idx = idx if cut_idx is None else min(cut_idx, idx)
+            if cut_idx is not None:
+                chunk = self._strip_known_special_tokens(pending[:cut_idx], trim=False)
+                if chunk:
+                    yield chunk
+                return
+            if max_stop_len and len(pending) > max_stop_len:
+                emit = pending[:-max_stop_len]
+                pending = pending[-max_stop_len:]
+                emit = self._strip_known_special_tokens(emit, trim=False)
+                if emit:
+                    yield emit
+        pending = self._strip_known_special_tokens(pending, trim=False)
+        if pending:
+            yield pending
 
     # ================================================================
     # 模型层级拆分（PyTorch 专用）
@@ -1179,6 +1354,20 @@ class ModelManager:
                 for local_idx, layer in enumerate(transformer.layers):
                     layer.self_attn.layer_idx = local_idx
 
+                import inspect
+                first_layer_forward = transformer.layers[0].forward if len(transformer.layers) else None
+                layer_forward_params = (
+                    inspect.signature(first_layer_forward).parameters
+                    if first_layer_forward is not None else {}
+                )
+                cache_arg_name = (
+                    "past_key_values"
+                    if "past_key_values" in layer_forward_params
+                    else "past_key_value"
+                    if "past_key_value" in layer_forward_params
+                    else None
+                )
+
                 if use_cache:
                     if past_key_values is not None:
                         # Decode: tuple of (k,v) → DynamicCache（本地索引 0..N-1）
@@ -1201,8 +1390,7 @@ class ModelManager:
                     cache = None
 
                 # ---- 从 cache 获取 past_seen_tokens ----
-                # transformers≥5.x: DynamicCache 使用 layers 属性替代 key_cache/value_cache
-                if cache is not None and cache.get_seq_length() > 0:
+                if cache is not None:
                     try:
                         past_seen_tokens = cache.get_seq_length()
                     except (AttributeError, TypeError, IndexError) as e:
@@ -1279,17 +1467,18 @@ class ModelManager:
                 # Step 6: Transformer 层前向传播（支持 KV cache）
                 # ============================================================
                 # DynamicCache 由 SDPA/FlashAttention 在 forward 时原地更新，
-                # 每层的 key/value 按 layer_idx 写入 cache.layers 中。
+                # 每层的 key/value 按 layer_idx 写入 DynamicCache。
                 for i, layer in enumerate(transformer.layers):
-                    layer_output = layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        past_key_values=cache,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                    )
+                    layer_kwargs = {
+                        "attention_mask": causal_mask,
+                        "position_ids": position_ids,
+                        "position_embeddings": position_embeddings,
+                        "use_cache": use_cache,
+                        "cache_position": cache_position,
+                    }
+                    if cache_arg_name is not None:
+                        layer_kwargs[cache_arg_name] = cache
+                    layer_output = layer(hidden_states, **layer_kwargs)
                     # transformers≥5.x: DecoderLayer 直接返回 tensor
                     # transformers 4.x: 返回 (hidden_states, present_key_value) 元组
                     if isinstance(layer_output, tuple):
@@ -1311,12 +1500,24 @@ class ModelManager:
                     result["hidden_states"] = hidden_states
 
                 # ---- KV Cache: 转为 tuple 存储 ----
-                # transformers≥5.x: DynamicCache.layers[i].keys/.values 替代 key_cache/value_cache
-                if use_cache and cache is not None and len(cache.layers) > 0:
-                    result["past_key_values"] = tuple(
-                        (cache.layers[i].keys, cache.layers[i].values)
-                        for i in range(len(cache.layers))
-                    )
+                if use_cache and cache is not None:
+                    cache_items = []
+                    if hasattr(cache, "layers"):
+                        for layer_cache in cache.layers:
+                            if layer_cache is None:
+                                continue
+                            keys = getattr(layer_cache, "keys", None)
+                            values = getattr(layer_cache, "values", None)
+                            if keys is not None and values is not None:
+                                cache_items.append((keys, values))
+                    else:
+                        key_cache = getattr(cache, "key_cache", [])
+                        value_cache = getattr(cache, "value_cache", [])
+                        for keys, values in zip(key_cache, value_cache):
+                            if keys is not None and values is not None:
+                                cache_items.append((keys, values))
+                    if cache_items:
+                        result["past_key_values"] = tuple(cache_items)
 
                 return result
             finally:
@@ -1353,16 +1554,20 @@ class ModelManager:
 
     def get_model_info(self) -> dict:
         """获取模型基本信息，用于调试与日志（双引擎兼容）"""
+        cfg = mc.get_model_config(self._active_model_id) if self._active_model_id else None
+        model_name = cfg.name if cfg else (self._active_model_id or MODEL_NAME)
         if self._engine_type == "llama_cpp" and self._llama_engine:
             info = self._llama_engine.get_model_info()
             info["model_id"] = self._active_model_id
+            info["model_name"] = model_name
+            info["model_path"] = self._model_path
             return info
 
         info = {
             "model_id": self._active_model_id,
             "engine": "pytorch",
-            "model_name": MODEL_NAME,
-            "model_path": MODEL_PATH,
+            "model_name": model_name,
+            "model_path": self._model_path or MODEL_PATH,
             "quant_type": self.quant_type,
             "compile": USE_COMPILE,
             "layer_range": self.layer_range,

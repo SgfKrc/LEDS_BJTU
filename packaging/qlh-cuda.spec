@@ -103,6 +103,7 @@ a = Analysis(
         'transformers',
         'transformers.models.qwen2',
         'transformers.models.auto',
+        'transformers_stream_generator',
         'torch',
         'accelerate',
         'bitsandbytes',

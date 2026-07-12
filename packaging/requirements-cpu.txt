@@ -22,8 +22,9 @@
 llama-cpp-python>=0.3.0
 
 # --- 模型加载与量化 ---
-transformers>=4.45.0,<5.0.0     # 4.x 系列，兼容 bitsandbytes 量化
+transformers>=4.47.0,<4.48.0    # Qwen remote code + DeepSeek-R1 Distill 兼容窗口
 accelerate>=1.0.0                # 模型加载加速
+transformers-stream-generator>=0.0.4  # Qwen-1.8B remote code 依赖
 bitsandbytes>=0.45.0             # 量化路径
 
 # --- 原生桌面窗口（替代外部浏览器）---

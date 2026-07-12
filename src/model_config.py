@@ -33,6 +33,13 @@ def _get_app_root() -> str:
 _APP_ROOT = _get_app_root()
 
 
+def resolve_model_path(path: str) -> str:
+    """Return an absolute path for a model file or directory."""
+    if not path:
+        return ""
+    return path if os.path.isabs(path) else os.path.join(_APP_ROOT, path)
+
+
 # ================================================================
 # ModelConfig
 # ================================================================
@@ -81,7 +88,7 @@ BUILTIN_MODELS: list[ModelConfig] = [
         name="Qwen-1.8B-Chat",
         model_type="both",
         model_path=os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat"),
-        gguf_path=os.path.join(_APP_ROOT, "models", "qwen-1_8b-chat-Q4_K_M.gguf"),
+        gguf_path=os.path.join(_APP_ROOT, "models", "Qwen-1_8B-Chat.Q4_K_M.gguf"),
         recommended_vram_gb=3.5,
         max_context=4096,
         is_experimental=False,
@@ -149,15 +156,15 @@ BUILTIN_MODELS: list[ModelConfig] = [
     ModelConfig(
         model_id="deepseek-r1-distill-qwen-7b",
         name="DeepSeek-R1-Distill-Qwen-7B",
-        model_type="safetensors",
+        model_type="both",
         model_path=os.path.join(_APP_ROOT, "models", "deepseek-r1-distill-qwen-7b"),
-        gguf_path="",
+        gguf_path=os.path.join(_APP_ROOT, "models", "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"),
         recommended_vram_gb=8.0,
         max_context=32768,
         is_experimental=True,
         huggingface_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        quant_types=["fp16", "int8", "int4"],
-        description="R1 蒸馏推理模型，基于 Qwen2.5 Dense 架构。INT4 建议 8GB+ VRAM，需手动下载 Safetensors。",
+        quant_types=["fp16", "int8", "int4", "Q4_K_M"],
+        description="R1 蒸馏推理模型，基于 Qwen2.5 Dense 架构。支持 Safetensors 与 Q4_K_M GGUF 试水。",
         location="external",
     ),
     ModelConfig(
@@ -214,6 +221,56 @@ def get_default_model() -> ModelConfig:
     if model is None:
         raise RuntimeError(f"默认模型 '{DEFAULT_MODEL_ID}' 在内置注册表中未找到")
     return model
+
+
+def has_safetensors_files(model: ModelConfig) -> bool:
+    """Return True when the model's safetensors/bin directory exists on disk."""
+    model_dir = resolve_model_path(model.model_path)
+    if not model_dir or not os.path.isdir(model_dir):
+        return False
+    try:
+        names = os.listdir(model_dir)
+    except OSError:
+        return False
+    has_config = os.path.isfile(os.path.join(model_dir, "config.json"))
+    has_weights = any(
+        name.endswith(".safetensors") or name.endswith(".bin")
+        for name in names
+    )
+    return has_config and has_weights
+
+
+def has_gguf_file(model: ModelConfig) -> bool:
+    """Return True when the model's configured GGUF file exists on disk."""
+    gguf_path = resolve_model_path(model.gguf_path)
+    return bool(gguf_path and os.path.isfile(gguf_path))
+
+
+def get_model_file_status(model: ModelConfig) -> dict:
+    """Summarize local file availability for a model configuration."""
+    has_safetensors = has_safetensors_files(model)
+    has_gguf = has_gguf_file(model)
+    formats: list[str] = []
+    if has_safetensors:
+        formats.append("safetensors")
+    if has_gguf:
+        formats.append("gguf")
+
+    expected: list[str] = []
+    if model.model_type in ("safetensors", "both"):
+        expected.append(f"Safetensors: {model.model_path or '(未配置)'}")
+    if model.model_type in ("gguf", "both"):
+        expected.append(f"GGUF: {model.gguf_path or '(未配置)'}")
+
+    is_available = bool(formats)
+    return {
+        "is_available": is_available,
+        "available_formats": formats,
+        "has_safetensors": has_safetensors,
+        "has_gguf": has_gguf,
+        "unavailable_reason": "" if is_available else "模型文件未落盘；请先下载到配置路径。",
+        "expected_paths": expected,
+    }
 
 
 def is_cuda_available() -> bool:

@@ -46,6 +46,24 @@ QUANT_FILES = {
     "Q3_K_M": "Qwen-1_8B-Chat-Q3_K_M.gguf",      # 更小 (~0.94 GB)
 }
 
+CHATML_STOP_SEQUENCES = [
+    "<|im_end|>",
+    "<|im_start|>",
+    "<｜end▁of▁sentence｜>",
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<|endoftext|>",
+    "</s>",
+]
+
+
+def _merge_stop_sequences(stop: List[str] = None) -> List[str]:
+    merged: List[str] = []
+    for value in (stop or []) + CHATML_STOP_SEQUENCES:
+        if value and value not in merged:
+            merged.append(value)
+    return merged
+
 
 class LlamaCppEngine:
     """
@@ -136,12 +154,10 @@ class LlamaCppEngine:
                 verbose=False,
             )
 
-            # chat_format: Qwen 模型必须用 ChatML 格式
-            # llama.cpp 的自动检测可能误判为 llama-2，导致对话格式错乱
             if chat_format:
                 load_kwargs["chat_format"] = chat_format
-            else:
-                # 默认使用 chatml（Qwen 家族标准）
+            elif model_path and "qwen-1_8b" in os.path.basename(model_path).lower():
+                # Qwen-1.8B GGUF metadata is not always detected reliably.
                 load_kwargs["chat_format"] = "chatml"
 
             load_kwargs.update(kwargs)
@@ -220,7 +236,7 @@ class LlamaCppEngine:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            stop=stop or [],
+            stop=_merge_stop_sequences(stop),
         )
 
         elapsed = time.time() - t0
@@ -275,7 +291,7 @@ class LlamaCppEngine:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            stop=stop or [],
+            stop=_merge_stop_sequences(stop),
             stream=True,
         )
 

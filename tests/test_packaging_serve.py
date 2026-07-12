@@ -48,3 +48,57 @@ def test_model_archive_path_resolution_rejects_legacy_and_traversal(tmp_path, mo
     assert serve._resolve_model_archive_path("/model.7z") is None
     assert serve._resolve_model_archive_path("/models-pc/../secret.7z") is None
     assert serve._resolve_model_archive_path("/models-pc/not-a-model.zip") is None
+
+
+def test_pc_installer_scan_excludes_android_packages_in_dist(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "packaging" / "dist"
+    dist_dir.mkdir(parents=True)
+    monkeypatch.setattr(serve, "DIST_DIR", str(dist_dir))
+
+    installer = dist_dir / "QLH-Edge-Inference-Setup-v0.1.7.exe"
+    full_apk = dist_dir / "QLH-Inference-v0.1.7-full-release.apk"
+    lite_apk = dist_dir / "QLH-Inference-v0.1.7-lite-release.apk"
+    installer.write_bytes(b"exe")
+    full_apk.write_bytes(b"apk")
+    lite_apk.write_bytes(b"apk")
+
+    entries = serve._scan_pc_installers()
+
+    assert entries == [
+        ("QLH-Edge-Inference-Setup-v0.1.7.exe", "/QLH-Edge-Inference-Setup-v0.1.7.exe", str(installer))
+    ]
+
+
+def test_android_download_scan_includes_dist_and_gradle_outputs(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "packaging" / "dist"
+    android_outputs = tmp_path / "android" / "app" / "build" / "outputs"
+    dist_dir.mkdir(parents=True)
+    gradle_release_dir = android_outputs / "apk" / "full" / "release"
+    gradle_debug_dir = android_outputs / "apk" / "full" / "debug"
+    gradle_release_dir.mkdir(parents=True)
+    gradle_debug_dir.mkdir(parents=True)
+    monkeypatch.setattr(serve, "DIST_DIR", str(dist_dir))
+    monkeypatch.setattr(serve, "ANDROID_OUTPUT_DIR", str(android_outputs))
+
+    full_apk = dist_dir / "QLH-Inference-v0.1.7-full-release.apk"
+    lite_apk = dist_dir / "QLH-Inference-v0.1.7-lite-release.apk"
+    gradle_apk = gradle_release_dir / "app-full-release.apk"
+    debug_apk = gradle_debug_dir / "app-full-debug.apk"
+    full_apk.write_bytes(b"full")
+    lite_apk.write_bytes(b"lite")
+    gradle_apk.write_bytes(b"gradle")
+    debug_apk.write_bytes(b"debug")
+
+    entries = serve._scan_android_downloads()
+
+    assert entries == [
+        ("QLH-Inference-v0.1.7-full-release.apk", "/QLH-Inference-v0.1.7-full-release.apk", str(full_apk)),
+        ("QLH-Inference-v0.1.7-lite-release.apk", "/QLH-Inference-v0.1.7-lite-release.apk", str(lite_apk)),
+        (
+            "android/app/build/outputs/apk/full/release/app-full-release.apk",
+            "/android/apk/full/release/app-full-release.apk",
+            str(gradle_apk),
+        ),
+    ]

@@ -134,7 +134,7 @@ export default function App() {
 
   // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复 + L5 错误上报
   useEffect(() => {
-    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings, installErrorReporter }) => {
+    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings, fetchStatus, installErrorReporter }) => {
       // L5: 安装全局前端错误上报（仅在 PROD 生效）
       installErrorReporter();
       // 获取角色
@@ -153,6 +153,15 @@ export default function App() {
         })
         .catch(() => {});  // 服务端不可用时保持本地设置
       // 从云端恢复用户偏好设置（仅在用户已开启云同步时）
+      fetchStatus()
+        .then((status) => {
+          setModelLoaded(Boolean(status?.model_loaded));
+          setCurrentQuant(status?.current_quant || null);
+          if (status?.active_model_id) {
+            setActiveModelId(status.active_model_id);
+          }
+        })
+        .catch(() => {});
       const localSettings = getInitialSettings();
       if (localSettings.cloudSync) {
         fetchUserSettings()
@@ -315,7 +324,6 @@ export default function App() {
 
   // P3: 多模型支持 — 加载可用模型列表
   const loadAvailableModels = useCallback(async () => {
-    if (!hasDedicatedGpu) return;
     try {
       const { fetchModels } = await import('./api/client');
       const data = await fetchModels();
@@ -324,14 +332,14 @@ export default function App() {
         setActiveModelId(data.active_model_id);
       }
     } catch (_) { /* 静默失败，列表为空 */ }
-  }, [hasDedicatedGpu]);
+  }, []);
 
   // P3: 切换模型
-  const handleSwitchModel = useCallback(async (modelId, quantType = 'int4') => {
+  const handleSwitchModel = useCallback(async (modelId, quantType = 'int4', engine = 'auto') => {
     setSwitchingModel(true);
     try {
       const { switchModel } = await import('./api/client');
-      const result = await switchModel(modelId, quantType);
+      const result = await switchModel(modelId, quantType, engine);
       if (result.success) {
         setActiveModelId(result.model_id);
         setModelLoaded(true);
@@ -356,6 +364,7 @@ export default function App() {
       await loadAvailableModels();
     } catch (e) {
       showToast({ type: 'error', msg: `模型注册失败: ${e.message}` });
+      throw e;
     }
   }, [showToast, loadAvailableModels]);
 
