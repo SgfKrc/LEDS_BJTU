@@ -1233,19 +1233,39 @@ class ModelManager:
                 # Step 4: causal_mask — 复用 Qwen2 内置逻辑
                 # ============================================================
                 # transformers≥5.x: _update_causal_mask 已移除，改用 create_causal_mask
+                # transformers 4.x: 无此函数，回退到手动构建因果掩码
                 # 该函数根据 attention 实现自动选择:
                 #   flash_attention_2 → None（flash 内核自行处理因果掩码）
                 #   sdpa + 纯因果 → None（SDPA is_causal 路径）
                 #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
-                from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
-
-                causal_mask = create_causal_mask(
-                    config=transformer.config,
-                    inputs_embeds=hidden_states,
-                    attention_mask=attention_mask.to(device) if attention_mask is not None else None,
-                    past_key_values=cache,
-                    position_ids=position_ids,
-                )
+                try:
+                    from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
+                    causal_mask = create_causal_mask(
+                        config=transformer.config,
+                        inputs_embeds=hidden_states,
+                        attention_mask=attention_mask.to(device) if attention_mask is not None else None,
+                        past_key_values=cache,
+                        position_ids=position_ids,
+                    )
+                except (ImportError, AttributeError):
+                    # transformers 4.x 回退：手动构建 4D 因果掩码
+                    seq_len = hidden_states.shape[1]
+                    causal_mask = torch.full(
+                        (seq_len, seq_len),
+                        float('-inf'),
+                        device=device,
+                    )
+                    causal_mask = torch.triu(causal_mask, diagonal=1)
+                    causal_mask = causal_mask[None, None, :, :].expand(
+                        hidden_states.shape[0], 1, seq_len, seq_len
+                    )
+                    if attention_mask is not None:
+                        attn_mask = attention_mask.to(device)
+                        # attn_mask shape: (batch, seq_len) → (batch, 1, 1, seq_len)
+                        attn_mask = attn_mask[:, None, None, :]
+                        causal_mask = causal_mask.masked_fill(
+                            attn_mask == 0, float('-inf')
+                        )
 
                 # ============================================================
                 # Step 5: position_embeddings — RoPE 旋转位置编码

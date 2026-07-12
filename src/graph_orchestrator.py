@@ -575,7 +575,7 @@ class GraphOrchestrator:
                 if not raw_layers:
                     raise RuntimeError(
                         f"_assign_layers: 层数不足以覆盖 {len(path_nodes)} 个节点 "
-                        f"(总层数={total_layers}, 节点显存过低)"
+                        f"(总层数={self.total_layers}, 节点显存过低)"
                     )
                 if not reduced:
                     for idx in sorted_idx:

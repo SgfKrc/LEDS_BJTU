@@ -33,3 +33,4 @@ python-multipart>=0.0.12          # 文件上传支持
 # --- 工具 ---
 tqdm>=4.65.0                     # 进度条
 psutil>=5.9.0                    # 系统资源监控（CPU/内存）
+python-dotenv>=1.0.0             # 环境变量加载（从 .env 文件）
