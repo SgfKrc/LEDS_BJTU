@@ -11,7 +11,7 @@
 
 当前系统默认模型为 Qwen-1.8B-Chat（1.8B 参数），内置实验模型仅 Qwen2.5-7B/14B。对于 CUDA 用户（尤其是 RTX 4090 24GB 等高端 GPU），Qwen 系列的能力天花板偏低。
 
-DeepSeek 系列是当前最强的国产开源大模型家族：
+DeepSeek 系列是代表性的国产开放权重大模型家族之一：
 - **DeepSeek-V3**: 671B MoE（37B 活跃参数），旗舰级推理能力
 - **DeepSeek-R1**: 强化推理链（CoT），数学/编程/逻辑任务超越 GPT-4o
 - **DeepSeek-Coder-V2**: 236B MoE（21B 活跃），代码生成领域 SOTA
@@ -26,11 +26,11 @@ DeepSeek 系列是当前最强的国产开源大模型家族：
 
 | 模型 | 总参数 | 活跃参数 | 架构 | 上下文 | 适用场景 |
 |------|--------|---------|------|--------|---------|
-| **DeepSeek-V2-Lite** | 16B MoE | 2.4B | MLA + DeepSeekMoE | 128K | 轻量实验，16GB VRAM |
+| **DeepSeek-V2-Lite** | 16B MoE | 2.4B | MLA + DeepSeekMoE | 32K | 轻量实验，16GB VRAM |
 | **DeepSeek-Coder-V2-Lite** | 16B MoE | 2.4B | MLA + DeepSeekMoE | 128K | 代码生成入门 |
 | **DeepSeek-V2** | 236B MoE | 21B | MLA + DeepSeekMoE | 128K | 综合能力强（旗舰） |
 | **DeepSeek-Coder-V2** | 236B MoE | 21B | MLA + DeepSeekMoE | 128K | 代码 SOTA |
-| **DeepSeek-V3** | 671B MoE | 37B | MLA + DeepSeekMoE + MTP | 128K | 最新旗舰（2025.3） |
+| **DeepSeek-V3** | 671B MoE | 37B | MLA + DeepSeekMoE + MTP | 128K | 旗舰 MoE 基线（2025.3 版本） |
 | **DeepSeek-R1** | 671B MoE | 37B | MLA + DeepSeekMoE + CoT | 128K | 推理特化 |
 | **DeepSeek-LLM-7B** | 7B Dense | 7B | 标准 LLaMA-like | 4K | 兼容性最佳 |
 | **DeepSeek-LLM-67B** | 67B Dense | 67B | 标准 LLaMA-like | 4K | 需多 GPU |
@@ -248,11 +248,11 @@ ModelConfig(
     model_path=os.path.join(_APP_ROOT, "models", "deepseek-v2-lite-chat"),
     gguf_path="",
     recommended_vram_gb=16.0,
-    max_context=131072,        # 128K (实际使用受 VRAM 限制)
+    max_context=32768,         # 32K (官方 V2-Lite 上下文；实际使用受 VRAM 限制)
     is_experimental=True,
     huggingface_id="deepseek-ai/DeepSeek-V2-Lite-Chat",
     quant_types=["int8", "int4"],
-    description="DeepSeek-V2-Lite 16B MoE (2.4B 活跃)。MLA + DeepSeekMoE 架构，128K 上下文。需 RTX 4090 或分布式管线。",
+    description="DeepSeek-V2-Lite 16B MoE (2.4B 活跃)。MLA + DeepSeekMoE 架构，32K 上下文。需 RTX 4090 或分布式管线。",
     location="external",
 ),
 
@@ -318,7 +318,7 @@ ModelConfig(
 | bitsandbytes 不兼容 MoE gate | 中 | 量化后模型输出乱码 | 自动检测 gate 层 + 保持 fp16 |
 | MLA `past_key_values` 序列化失败 | 低 | 分布式 KV cache 传输失败 | 测试 `torch.save/load` roundtrip |
 | transformers 版本过低不支持 DeepSeek | 低 | 加载报错 | 要求 `transformers>=4.40.0` |
-| 16B 模型 int8 + 128K 上下文 OOM | 高 | 24GB VRAM 不够 | 限制 `max_context` 到实际可用；动态 `max_page_num` |
+| 16B MoE 模型长上下文 OOM | 高 | 24GB VRAM 不够 | V2-Lite 按 32K 上限注册；Coder-V2-Lite 128K 需按显存动态限制 `max_page_num` |
 | MoE 专家路由不均衡 | 中 | 部分节点过载 | 分布式管线中按专家分布分配层 |
 
 ---
@@ -354,6 +354,158 @@ python -c "
 # 分布式管线 MoE
 # 2 节点各分配一半层，验证 MoE 专家路由在拆分后仍正常
 ```
+
+---
+
+## 9. 模型获取与依赖调研落地清单
+
+> 调研日期: 2026-07-10
+> 结论: 先支持官方 Safetensors 路径；GGUF 只在选定具体量化仓库和文件名后注册为稳定入口。全量 DeepSeek-R1/V3 不进入本地 P0/P1，优先作为 vLLM 外部服务目标。
+
+### 9.1 官方信息修正
+
+- DeepSeek-R1 全量模型为 671B 总参数、37B 激活参数、128K 上下文；官方卡片仍提示本地运行参考 DeepSeek-V3 仓库，不作为本项目 PyTorch 分层路径的首批目标。
+- R1 蒸馏模型是 Qwen2.5 / Llama 系列 Dense 架构，官方说明可按 Qwen 或 Llama 模型使用，是本项目最稳的 DeepSeek 推理能力入口。
+- DeepSeek-V2-Lite / V2-Lite-Chat 为 16B 总参数、2.4B 激活参数、32K 上下文；官方 Transformers 示例仍使用 `trust_remote_code=True`，原方案中的 128K 已修正为 32K。
+- DeepSeek-Coder-V2-Lite-Instruct 为 16B 总参数、2.4B 激活参数、128K 上下文，代码模型优先级应放在 V2-Lite Chat 跑通之后。
+- vLLM 当前支持 `DeepseekForCausalLM`、`DeepseekV2ForCausalLM`、`DeepseekV3ForCausalLM`，适合全量 V2/V3/R1 的外部服务化验证，不直接替代本项目的 PyTorch 层拆分管线。
+
+### 9.2 模型获取矩阵
+
+| 优先级 | HuggingFace 仓库 | 本地目录 / 文件 | 首选引擎 | 磁盘预估 | 许可关注 | 处理结论 |
+|--------|------------------|-----------------|----------|----------|----------|----------|
+| P0 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | `models/deepseek-r1-distill-qwen-7b/` | PyTorch | ~15GB | MIT + Qwen Apache 2.0 派生说明 | 立即注册 Safetensors；GGUF 另选量化仓库后再加 |
+| P0 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | `models/deepseek-r1-distill-qwen-14b/` | PyTorch | ~30GB | MIT + Qwen Apache 2.0 派生说明 | 高端 GPU P0；8GB 设备不默认展示 |
+| P0 | `deepseek-ai/deepseek-llm-7b-chat` | `models/deepseek-llm-7b-chat/` | PyTorch | ~14GB | DeepSeek Model License，支持商用但需保留许可证 | 保留原 P0，作为 DeepSeek Dense 基线 |
+| P1 | `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` | `models/deepseek-r1-distill-qwen-32b/` | PyTorch / 分布式 | ~65GB | MIT + Qwen Apache 2.0 派生说明 | RTX 4090 或多节点验证，不进默认推荐 |
+| P2 | `deepseek-ai/DeepSeek-V2-Lite-Chat` | `models/deepseek-v2-lite-chat/` | PyTorch 实验 / vLLM 对照 | ~32GB | DeepSeek License | 先验证 tokenizer、层数、KV cache；再谈量化 |
+| P3 | `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` | `models/deepseek-coder-v2-lite-instruct/` | PyTorch 实验 / vLLM 对照 | ~32GB | DeepSeek License | 复用 V2-Lite 适配结果，补代码场景测试 |
+| 远期 | `deepseek-ai/DeepSeek-R1` / `DeepSeek-V3` | 不建议本地落盘 | vLLM / SGLang 服务 | 600GB+ | R1 为 MIT，V3 按官方仓库许可证复核 | 只作为远程 OpenAI-compatible API 接入目标 |
+
+> 磁盘预估按 FP16/BF16 权重约 `参数量 * 2 bytes` 粗算。GGUF 体量取决于具体量化格式和仓库，不在未选仓库前写死到 `ModelConfig`。
+
+### 9.3 下载流程
+
+建议新增显式下载依赖，避免依赖 `transformers` 间接带来的 `huggingface_hub` 版本:
+
+```bash
+pip install -U "huggingface_hub>=0.32.0"
+```
+
+标准下载采用 `snapshot_download(local_dir=...)`，因为它能保留原仓库结构并支持断点续传。下载前必须先 dry-run 看体量:
+
+```bash
+hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-7B --dry-run
+hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-14B --dry-run
+hf download deepseek-ai/deepseek-llm-7b-chat --dry-run
+```
+
+落盘到项目 `models/` 的推荐脚本:
+
+```python
+from huggingface_hub import snapshot_download
+
+COMMON_PATTERNS = [
+    "*.json",
+    "*.safetensors",
+    "tokenizer*",
+    "*.model",
+    "*.txt",
+    "*.md",
+]
+
+snapshot_download(
+    repo_id="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    local_dir="models/deepseek-r1-distill-qwen-7b",
+    allow_patterns=COMMON_PATTERNS,
+)
+```
+
+Windows PowerShell 建议设置项目内缓存，避免默认缓存落到用户目录导致打包/迁移不可控:
+
+```powershell
+$env:HF_HOME = "$PWD\.hf-cache"
+hf download deepseek-ai/DeepSeek-R1-Distill-Qwen-7B --local-dir models/deepseek-r1-distill-qwen-7b
+```
+
+GGUF 获取策略:
+- 不把社区 GGUF 仓库直接写入内置注册表，先由用户或维护者选择具体仓库、文件名和量化格式。
+- 选定后使用 `hf download <repo> <file.gguf> --local-dir models/`，并将 `gguf_path` 指向单文件。
+- 每个 GGUF 文件都记录来源仓库、commit hash、量化格式、文件大小和 SHA256，写入 `models/model_manifest.json`。
+
+### 9.4 依赖版本调研
+
+当前项目依赖与 DeepSeek 实验的关系:
+
+| 依赖 | 当前配置 | 调研结论 | 建议 |
+|------|----------|----------|------|
+| `torch` | `>=2.2.0` | bitsandbytes 官方当前最低要求为 PyTorch 2.4；CUDA 重模型路径不宜继续按 2.2 验证 | DeepSeek CUDA 实验环境提升到 `torch>=2.4.0`；通用依赖是否提升需跑完整回归 |
+| `transformers` | `>=4.45.0,<5.0.0` | P0 Dense/R1-Distill 足够；V2-Lite/Coder 官方示例仍需 `trust_remote_code=True`；全量 R1/V3 仍建议走 vLLM/SGLang 服务 | 维持 `<5.0.0`，避免破坏现有兼容修复；MoE 适配单独建隔离 venv 验证最新版 4.x |
+| `accelerate` | `>=1.0.0` | PyTorch 大模型加载和 `device_map` 仍需要 | 保持，P1+ 验证 `device_map="auto"` 与本项目分层加载是否冲突 |
+| `bitsandbytes` | `>=0.45.0` | 官方支持 NVIDIA、CPU、Intel XPU/Gaudi，Windows x86-64 CUDA wheel 覆盖 CUDA 11.8-12.9；但 MoE gate/router 量化仍需项目侧保护 | P0 可以继续；P2 MoE 只允许实验开关，不默认 int4 |
+| `llama-cpp-python` | 仅 `packaging/requirements-cpu.txt` 有 `>=0.3.0` | GGUF 路径依赖该包；Windows 可选 CPU/Vulkan/CUDA wheel，不同 wheel 不能混装 | 若 PC 开发环境也要测 GGUF，把它加入可选 extras 或 dev 文档 |
+| `huggingface_hub` | 未显式列出 | 模型获取、dry-run、断点续传、`local_dir` 落盘都依赖它；0.32+ 默认整合 `hf_xet` | 在主依赖或下载脚本依赖中显式加入 `huggingface_hub>=0.32.0` |
+| `safetensors` | 未显式列出 | 大模型仓库多数使用 safetensors；transformers 会间接依赖，但校验脚本直接读取时需要明确依赖 | 在下载/校验工具依赖中显式加入 `safetensors>=0.4.5` |
+| `vllm` | 未列入 | 支持 DeepSeek/V2/V3/R1 架构，但 Windows 本地并不适合作为项目依赖 | 不加入主依赖；只写入 Linux 服务端部署文档 |
+
+建议新增一个独立重模型环境文件，避免污染普通用户安装:
+
+```text
+# packaging/requirements-heavy-models.txt
+torch>=2.4.0
+transformers>=4.45.0,<5.0.0
+accelerate>=1.0.0
+bitsandbytes>=0.45.0
+huggingface_hub>=0.32.0
+safetensors>=0.4.5
+```
+
+GGUF 开发/测试环境另列，不与 CUDA PyTorch 环境强绑定:
+
+```text
+# packaging/requirements-gguf-dev.txt
+llama-cpp-python>=0.3.0
+huggingface_hub>=0.32.0
+```
+
+### 9.5 集成任务拆分更新
+
+| 任务 | 文件 | 验收 |
+|------|------|------|
+| 注册 R1-Distill-Qwen-7B/14B/32B | `src/model_config.py` | `/api/models` 在 CUDA 环境展示；CPU 环境仍隐藏实验模型 |
+| 增加模型获取脚本 | `scripts/download_model.py` 或 `src/model_downloader.py` | 支持 `--dry-run`、`--repo-id`、`--local-dir`、`--include`、`--sha256` |
+| 增加模型 manifest | `models/model_manifest.json` | 记录 repo、revision、文件大小、SHA256、license 摘要 |
+| tokenizer 模板验证 | `tests/test_model_config.py` / 手动脚本 | `apply_chat_template()` 能处理 user-only 对话；R1 建议不注入 system prompt |
+| `trust_remote_code` 安全边界 | `src/model_module.py` / 下载脚本 | 仅官方 DeepSeek 仓库允许开启；manifest 记录 revision，避免静默拉取变更代码 |
+| 依赖矩阵验证 | CI 或手动 venv | CPU 基线不安装 CUDA-only 依赖；CUDA 重模型 venv 可导入 torch/transformers/bnb |
+| MoE 预研开关 | `src/model_module.py` | V2-Lite 默认标记 experimental；未通过 KV cache roundtrip 前不开放分布式管线 |
+
+### 9.6 最小验收路径
+
+P0 第一次落地只做 3 个模型:
+
+1. `DeepSeek-R1-Distill-Qwen-7B`: 验证推理能力、R1 输出格式、8GB/12GB 设备门槛。
+2. `DeepSeek-R1-Distill-Qwen-14B`: 验证 16GB/24GB 设备上限和分布式层拆分。
+3. `deepseek-llm-7b-chat`: 验证 DeepSeek 原生 Dense 模型与 R1 蒸馏模型的差异。
+
+通过标准:
+- 模型下载脚本 dry-run 能给出体量，实际下载后 manifest 完整。
+- `ModelConfig` 注册路径与实际落盘一致。
+- PyTorch int4/int8/fp16 至少一种加载成功，能完成 32 token smoke test。
+- 卸载模型后 VRAM 回收，无残留导致下一次切换 OOM。
+- 分布式路径先只对 Dense/R1-Distill 开启；MoE 模型必须等待 KV cache roundtrip 和层拆分验证。
+
+### 9.7 调研来源
+
+- DeepSeek-R1 官方 HuggingFace 卡片: https://huggingface.co/deepseek-ai/DeepSeek-R1
+- DeepSeek-LLM-7B-Chat 官方 HuggingFace 卡片: https://huggingface.co/deepseek-ai/deepseek-llm-7b-chat
+- DeepSeek-V2-Lite-Chat 官方 HuggingFace 卡片: https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat
+- DeepSeek-Coder-V2-Lite-Instruct 官方 HuggingFace 卡片: https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+- HuggingFace Hub 下载文档: https://huggingface.co/docs/huggingface_hub/guides/download
+- bitsandbytes 安装文档: https://huggingface.co/docs/bitsandbytes/main/en/installation
+- transformers bitsandbytes 量化文档: https://huggingface.co/docs/transformers/main/quantization/bitsandbytes
+- llama-cpp-python 安装文档: https://llama-cpp-python.readthedocs.io/en/latest/
+- vLLM 支持模型列表: https://docs.vllm.ai/en/latest/models/supported_models/
 
 ---
 

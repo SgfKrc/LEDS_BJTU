@@ -4,7 +4,8 @@
 SMTP 发送: QQ 邮箱 SMTP SSL (smtp.qq.com:465)
 IMAP 轮询: QQ 邮箱 IMAP SSL (imap.qq.com:993) — 用于管理员回复 Y/N 投票
 
-配置来源: SMTP.md（发信邮箱 studyp4ct@qq.com，授权码 vfcrzzlxbpwxcafb）
+配置来源: 环境变量 QLH_SMTP_SENDER / QLH_SMTP_PASSWORD / QLH_SMTP_RECIPIENT
+详见 SMTP.md 和 .env 配置
 """
 
 import imaplib

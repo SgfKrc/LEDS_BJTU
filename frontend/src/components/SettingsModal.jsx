@@ -5,13 +5,13 @@ import { updateDistributedInferenceConfig } from '../api/client';
 
 // Token 限制档位选项
 const TOKEN_OPTIONS = [
-  { value: 64,   label: '64',   tiers: [] },
-  { value: 128,  label: '128',  tiers: ['mobile'] },
-  { value: 256,  label: '256',  tiers: ['mobile', 'edge'] },
-  { value: 512,  label: '512',  tiers: ['mobile', 'edge', 'ultrabook'] },
-  { value: 1024, label: '1024', tiers: ['edge', 'ultrabook', 'laptop'] },
-  { value: 2048, label: '2048', tiers: ['ultrabook', 'laptop', 'workstation'] },
-  { value: 4096, label: '4096', tiers: ['laptop', 'workstation'] },
+  { value: 128,  label: '128',  tiers: [] },
+  { value: 256,  label: '256',  tiers: ['mobile'] },
+  { value: 512,  label: '512',  tiers: ['mobile', 'edge'] },
+  { value: 1024, label: '1024', tiers: ['mobile', 'edge', 'ultrabook'] },
+  { value: 2048, label: '2048', tiers: ['edge', 'ultrabook', 'laptop'] },
+  { value: 4096, label: '4096', tiers: ['ultrabook', 'laptop', 'workstation'] },
+  { value: 8192, label: '8192', tiers: ['laptop', 'workstation'] },
 ];
 
 // Temperature 选项
@@ -36,6 +36,7 @@ const TOPP_OPTIONS = [
 
 export default function SettingsModal({
   open, onClose, deviceRefreshKey, onToast, theme, onToggleTheme,
+  themeMode = 'system', onThemeModeChange,
   settings, onSettingsChange, deviceTier, hasDedicatedGpu,
   onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
@@ -78,6 +79,16 @@ export default function SettingsModal({
   // ================================================================
   const [logFiles, setLogFiles] = useState(null);
   const [viewingLog, setViewingLog] = useState(null);
+  // L3: 增强日志查看 — 搜索 / level 过滤 / 最近日志 / 统计
+  const [logSearch, setLogSearch] = useState('');
+  const [logLevelFilter, setLogLevelFilter] = useState('');
+  const [recentLogs, setRecentLogs] = useState(null);
+  const [recentLogsLoading, setRecentLogsLoading] = useState(false);
+  const [recentLogsAutoRefresh, setRecentLogsAutoRefresh] = useState(false);
+  const recentLogsTimerRef = useRef(null);
+  const [logStats, setLogStats] = useState(null);
+  const [logAdminTokenInput, setLogAdminTokenInput] = useState('');
+  const [nodesLogSummary, setNodesLogSummary] = useState(null);
 
   const loadLogFiles = useCallback(async () => {
     try {
@@ -93,26 +104,27 @@ export default function SettingsModal({
     try {
       const { fetchLogContent } = await import('../api/client');
       const data = await fetchLogContent(name);
-      setViewingLog({ name: data.name, content: data.content ?? '' });
+      setViewingLog({ name: data.name, content: data.content ?? '', truncated: data.truncated || false });
     } catch (e) {
       onToast?.({ type: 'error', msg: `读取日志失败: ${e.message}` });
     }
   }, [onToast]);
 
   const confirmDeleteLog = useCallback(async (name) => {
-    if (!window.confirm(`确定删除日志文件 ${name}？`)) return;
+    if (!window.confirm(`确定删除日志文件 ${name}？\n如果删除当前日志，系统会立即重新生成新的日志文件。`)) return;
     try {
       const { deleteLogFile } = await import('../api/client');
       await deleteLogFile(name);
-      setLogFiles(prev => (prev || []).filter(f => f.name !== name));
-      onToast?.({ type: 'success', msg: `已删除: ${name}` });
+      await loadLogFiles();
+      setViewingLog(prev => prev?.name === name ? null : prev);
+      onToast?.({ type: 'success', msg: `已删除: ${name}；当前日志会自动重新生成` });
     } catch (e) {
       onToast?.({ type: 'error', msg: `删除失败: ${e.message}` });
     }
-  }, [onToast]);
+  }, [loadLogFiles, onToast]);
 
   const confirmClearAllLogs = useCallback(async () => {
-    if (!window.confirm('确定删除所有日志文件？此操作不可撤销。')) return;
+    if (!window.confirm('确定删除所有日志文件？此操作不可撤销。\n如果包含当前日志，系统会立即重新生成新的日志文件。')) return;
     try {
       const { deleteAllLogFiles } = await import('../api/client');
       const result = await deleteAllLogFiles();
@@ -121,7 +133,7 @@ export default function SettingsModal({
       const failed = result.failed?.length || 0;
       onToast?.({
         type: failed ? 'warning' : 'success',
-        msg: failed ? `已清理部分日志，${failed} 个文件删除失败` : '已清理所有日志',
+        msg: failed ? `已清理部分日志，${failed} 个文件删除失败` : '已清理所有日志；当前日志会自动重新生成',
       });
     } catch (e) {
       onToast?.({ type: 'error', msg: `清理失败: ${e.message}` });
@@ -143,6 +155,133 @@ export default function SettingsModal({
       onToast?.({ type: 'error', msg: `复制失败: ${e.message}` });
     }
   }, [logFiles, onToast]);
+
+  // L3: 最近日志
+  const loadRecentLogs = useCallback(async (params = {}) => {
+    setRecentLogsLoading(true);
+    try {
+      const { fetchRecentLogs } = await import('../api/client');
+      const data = await fetchRecentLogs({
+        limit: params.limit || 200,
+        level: params.level || logLevelFilter,
+        name: params.name || '',
+        node_id: params.node_id || '',
+        request_id: params.request_id || '',
+      });
+      setRecentLogs(data);
+    } catch (_) {
+      setRecentLogs(null);
+    } finally {
+      setRecentLogsLoading(false);
+    }
+  }, [logLevelFilter]);
+
+  // L3: 日志统计
+  const loadLogStats = useCallback(async () => {
+    try {
+      const { fetchLogStats } = await import('../api/client');
+      const data = await fetchLogStats();
+      setLogStats(data);
+    } catch (_) {
+      setLogStats(null);
+    }
+  }, []);
+
+  const loadNodesLogSummary = useCallback(async () => {
+    if (!myRole?.is_master) {
+      setNodesLogSummary(null);
+      return;
+    }
+    try {
+      const { fetchNodesLogSummary } = await import('../api/client');
+      const data = await fetchNodesLogSummary();
+      setNodesLogSummary(data);
+    } catch (_) {
+      setNodesLogSummary(null);
+    }
+  }, [myRole?.is_master]);
+
+  const viewNodeRecentLogs = useCallback(async (nodeId) => {
+    try {
+      const { fetchNodeRecentLogs } = await import('../api/client');
+      const data = await fetchNodeRecentLogs(nodeId, {
+        limit: 200,
+        level: logLevelFilter,
+        timeout: 5,
+      });
+      setRecentLogs(data);
+      onToast?.({ type: 'success', msg: `已加载节点 ${nodeId} 的最近日志` });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `加载节点日志失败: ${e.message}` });
+    }
+  }, [logLevelFilter, onToast]);
+
+  const saveLogAdminToken = useCallback(async () => {
+    try {
+      const { setLogAdminToken } = await import('../api/client');
+      setLogAdminToken(logAdminTokenInput);
+      await Promise.all([
+        loadLogFiles(),
+        loadRecentLogs(),
+        loadLogStats(),
+        loadNodesLogSummary(),
+      ]);
+      onToast?.({
+        type: 'success',
+        msg: logAdminTokenInput.trim() ? '日志访问令牌已保存' : '日志访问令牌已清除',
+      });
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `保存日志令牌失败: ${e.message}` });
+    }
+  }, [
+    logAdminTokenInput,
+    loadLogFiles,
+    loadRecentLogs,
+    loadLogStats,
+    loadNodesLogSummary,
+    onToast,
+  ]);
+
+  // L3: 下载日志文件
+  const downloadLog = useCallback(async (filename) => {
+    try {
+      const { downloadLogFileBlob } = await import('../api/client');
+      const { blob } = await downloadLogFileBlob(filename);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) {
+      onToast?.({ type: 'error', msg: `下载失败: ${e.message}` });
+    }
+  }, [onToast]);
+
+  // L3: 最近日志自动刷新
+  const toggleRecentLogsAutoRefresh = useCallback(() => {
+    setRecentLogsAutoRefresh(prev => !prev);
+  }, []);
+
+  useEffect(() => {
+    if (recentLogsAutoRefresh && open) {
+      loadRecentLogs();
+      recentLogsTimerRef.current = setInterval(() => loadRecentLogs(), 3000);
+    } else {
+      if (recentLogsTimerRef.current) {
+        clearInterval(recentLogsTimerRef.current);
+        recentLogsTimerRef.current = null;
+      }
+    }
+    return () => {
+      if (recentLogsTimerRef.current) {
+        clearInterval(recentLogsTimerRef.current);
+        recentLogsTimerRef.current = null;
+      }
+    };
+  }, [recentLogsAutoRefresh, open, loadRecentLogs]);
 
   const formatFileSize = (bytes) => {
     if (bytes < 1024) return bytes + ' B';
@@ -179,13 +318,21 @@ export default function SettingsModal({
     await onUnregisterModel?.(modelId);
   }, [onUnregisterModel]);
 
-  // 模态框打开时自动加载日志列表 + 模型列表
+  // 模态框打开时自动加载日志列表 + 模型列表 + 最近日志 + 统计
   useEffect(() => {
     if (open) {
+      import('../api/client').then(({ getLogAdminToken }) => {
+        setLogAdminTokenInput(getLogAdminToken());
+      }).catch(() => {
+        setLogAdminTokenInput('');
+      });
       loadLogFiles();
+      loadRecentLogs();
+      loadLogStats();
+      loadNodesLogSummary();
       onLoadModels?.();
     }
-  }, [open, loadLogFiles, onLoadModels]);
+  }, [open, loadLogFiles, loadRecentLogs, loadLogStats, loadNodesLogSummary, onLoadModels]);
 
   // 判断档位是否匹配当前设备
   const isCurrentTier = (tier) => deviceTier === tier;
@@ -262,11 +409,11 @@ export default function SettingsModal({
                   className="setting-number-input"
                   value={settings.maxNewTokens}
                   min={1}
-                  max={8192}
+                  max={16384}
                   step={1}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
-                    if (v > 0 && v <= 8192) onSettingsChange({ maxNewTokens: v });
+                    if (v > 0 && v <= 16384) onSettingsChange({ maxNewTokens: v });
                   }}
                 />
                 <span className="setting-unit">tokens</span>
@@ -799,7 +946,7 @@ export default function SettingsModal({
             <h3>🎨 外观</h3>
             <div className="theme-toggle-row">
               <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                当前: {theme === 'dark' ? '🌙 暗色模式' : '☀️ 浅色模式'}
+                当前: {themeMode === 'system' ? `跟随系统 · ${theme === 'dark' ? '深色' : '浅色'}` : (theme === 'dark' ? '深色模式' : '浅色模式')}
               </span>
               <button
                 className="theme-toggle-btn"
@@ -814,74 +961,329 @@ export default function SettingsModal({
                 </span>
               </button>
             </div>
+            <div className="theme-mode-segment" role="group" aria-label="主题模式">
+              {[
+                ['system', '跟随系统'],
+                ['light', '浅色'],
+                ['dark', '深色'],
+              ].map(([mode, label]) => (
+                <button
+                  key={mode}
+                  className={themeMode === mode ? 'active' : ''}
+                  onClick={() => onThemeModeChange?.(mode)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* ---- 日志管理 ---- */}
           <div className="sidebar-section" style={{ borderBottom: 'none' }}>
             <h3>📋 日志管理</h3>
 
-            {logFiles === null ? (
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                <button className="sidebar-btn" onClick={loadLogFiles}>加载日志列表</button>
+            <div className="log-subsection">
+              <h4 style={{ margin: '8px 0 4px' }}>🔑 远程访问</h4>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <input
+                  type="password"
+                  value={logAdminTokenInput}
+                  onChange={e => setLogAdminTokenInput(e.target.value)}
+                  placeholder="QLH_LOG_ADMIN_TOKEN"
+                  autoComplete="off"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    padding: '6px 8px',
+                    fontSize: 12,
+                    borderRadius: 4,
+                    border: '1px solid var(--border)',
+                    background: 'var(--bg-input)',
+                    color: 'var(--text-primary)',
+                  }}
+                />
+                <button className="sidebar-btn" onClick={saveLogAdminToken} style={{ fontSize: 11 }}>
+                  保存
+                </button>
               </div>
-            ) : logFiles.length === 0 ? (
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>暂无日志文件</div>
-            ) : (
-              <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2 }}>
-                {logFiles.map(f => (
-                  <div key={f.name} style={{
-                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    padding: '4px 0', borderBottom: '1px solid var(--border)',
-                  }}>
-                    <span style={{
-                      flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    }}>
-                      {f.name}
-                      <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--text-muted)' }}>
-                        {formatFileSize(f.size)}
-                      </span>
-                    </span>
-                    <span style={{ display: 'flex', gap: 4 }}>
-                      <button className="sidebar-btn" onClick={() => viewLogContent(f.name)} title="查看">👁</button>
-                      <button className="sidebar-btn" onClick={() => confirmDeleteLog(f.name)} title="删除">🗑</button>
-                    </span>
-                  </div>
-                ))}
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                  <button className="sidebar-btn" onClick={copyAllLogs} style={{ flex: 1 }}>📋 复制全部</button>
-                  <button className="sidebar-btn" onClick={confirmClearAllLogs}
-                          style={{ flex: 1, color: '#e74c3c' }}>🗑 清理所有</button>
-                </div>
+            </div>
+
+            {/* L3: 日志统计摘要 */}
+            {logStats && (
+              <div className="log-stats-bar">
+                <span title="日志文件数">📁 {logStats.files_count} 个文件</span>
+                <span title="文件总大小">{formatFileSize(logStats.files_total_bytes)}</span>
+                <span title="内存缓冲 / 容量">🔄 {logStats.buffer_size}/{logStats.buffer_capacity}</span>
+                {logStats.node_id && <span title="节点 ID">🖥 {logStats.node_id}</span>}
               </div>
             )}
 
-            {/* 日志内容查看弹窗 */}
+            {myRole?.is_master && (
+              <div className="log-subsection">
+                <div className="log-subsection-header">
+                  <h4>🖧 节点日志</h4>
+                  <button className="sidebar-btn" onClick={loadNodesLogSummary} style={{ fontSize: 11 }}>
+                    刷新
+                  </button>
+                </div>
+                {nodesLogSummary?.workers?.length > 0 ? (
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2 }}>
+                    {nodesLogSummary.workers.map(worker => (
+                      <div
+                        key={worker.node_id}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: 8,
+                          padding: '4px 0',
+                          borderBottom: '1px solid var(--border)',
+                        }}
+                      >
+                        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {worker.node_id}
+                          <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                            buffer {worker.buffer_size || 0}
+                          </span>
+                          {worker.error && (
+                            <span style={{ marginLeft: 8, fontSize: 10, color: '#e74c3c' }}>
+                              {worker.error}
+                            </span>
+                          )}
+                        </span>
+                        <button
+                          className="sidebar-btn"
+                          onClick={() => viewNodeRecentLogs(worker.node_id)}
+                          disabled={Boolean(worker.error)}
+                          style={{ fontSize: 11 }}
+                        >
+                          查看
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                    暂无在线从节点日志摘要
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* L3: 最近日志（内存实时缓冲） */}
+            <div className="log-subsection">
+              <div className="log-subsection-header">
+                <h4>📡 最近日志</h4>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                    {recentLogsAutoRefresh ? '⏱ 每 3s 刷新' : '已暂停刷新'}
+                  </span>
+                  <button
+                    className={`sidebar-btn${recentLogsAutoRefresh ? ' active' : ''}`}
+                    onClick={toggleRecentLogsAutoRefresh}
+                    title={recentLogsAutoRefresh ? '暂停自动刷新' : '开启自动刷新 (3s)'}
+                    style={{ fontSize: 11 }}
+                  >
+                    {recentLogsAutoRefresh ? '⏸ 停止' : '▶ 实时'}
+                  </button>
+                  <button
+                    className="sidebar-btn"
+                    onClick={() => loadRecentLogs()}
+                    disabled={recentLogsLoading}
+                    style={{ fontSize: 11 }}
+                  >
+                    🔄
+                  </button>
+                </div>
+              </div>
+
+              {/* Level 快捷过滤 */}
+              <div className="log-level-filters">
+                {['', 'ERROR', 'WARNING', 'INFO', 'DEBUG'].map(lv => (
+                  <button
+                    key={lv || 'ALL'}
+                    className={`log-level-chip${(logLevelFilter || '') === lv ? ' active' : ''}${lv ? ` level-${lv.toLowerCase()}` : ''}`}
+                    onClick={() => {
+                      setLogLevelFilter(lv);
+                      loadRecentLogs({ level: lv });
+                    }}
+                  >
+                    {lv || '全部'}
+                  </button>
+                ))}
+              </div>
+
+              {/* 最近日志列表 */}
+              {recentLogsLoading && !recentLogs ? (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
+                  ⏳ 加载最近日志...
+                </div>
+              ) : recentLogs ? (
+                <>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>
+                    {recentLogs.truncated && '⚠ 结果已截断 · '}
+                    匹配 {recentLogs.matched} 条 · 显示最近 {recentLogs.count} 条
+                    {recentLogs.filters?.level && ` · 级别: ${recentLogs.filters.level}`}
+                  </div>
+                  <div className="recent-logs-list">
+                    {recentLogs.logs?.length > 0 ? recentLogs.logs.map((entry, i) => (
+                      <div
+                        key={i}
+                        className={`recent-log-entry level-${(entry.level || 'info').toLowerCase()}`}
+                        title={`${entry.name || ''}:${entry.lineno || ''} ${entry.funcName || ''}`}
+                        onClick={() => {
+                          // 点击条目显示详情（复制到查看弹窗）
+                          const detail = [
+                            `时间: ${entry.timestamp || '-'}`,
+                            `级别: ${entry.level || '-'}`,
+                            `模块: ${entry.name || '-'}`,
+                            `节点: ${entry.node_id || '-'}`,
+                            `位置: ${entry.filename || '-'}:${entry.lineno || '-'} ${entry.funcName || ''}`,
+                            `消息: ${entry.message || '-'}`,
+                          ].join('\n');
+                          setLogSearch('');
+                          setViewingLog({ name: `recent #${i + 1}`, content: detail, truncated: false });
+                        }}
+                      >
+                        <span className={`recent-log-level ${(entry.level || 'INFO').toLowerCase()}`}>
+                          {entry.level || 'INFO'}
+                        </span>
+                        <span className="recent-log-ts">
+                          {entry.timestamp ? entry.timestamp.slice(-8) : ''}
+                        </span>
+                        <span className="recent-log-msg">
+                          {entry.message || ''}
+                        </span>
+                      </div>
+                    )) : (
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: 4 }}>
+                        暂无匹配的日志条目
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', padding: '4px 0' }}>
+                  <button className="sidebar-btn" onClick={() => loadRecentLogs()}>
+                    加载最近日志
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* 日志文件列表 */}
+            <div className="log-subsection">
+              <h4 style={{ margin: '8px 0 4px' }}>📁 日志文件</h4>
+
+              {logFiles === null ? (
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  <button className="sidebar-btn" onClick={loadLogFiles}>加载日志列表</button>
+                </div>
+              ) : logFiles.length === 0 ? (
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>暂无日志文件</div>
+              ) : (
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2 }}>
+                  {logFiles.map(f => (
+                    <div key={f.name} style={{
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      padding: '4px 0', borderBottom: '1px solid var(--border)',
+                    }}>
+                      <span style={{
+                        flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {f.name}
+                        <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--text-muted)' }}>
+                          {formatFileSize(f.size)}
+                        </span>
+                      </span>
+                      <span style={{ display: 'flex', gap: 4 }}>
+                        <button className="sidebar-btn" onClick={() => viewLogContent(f.name)} title="查看">👁</button>
+                        <button className="sidebar-btn" onClick={() => downloadLog(f.name)} title="下载">⬇</button>
+                        <button className="sidebar-btn" onClick={() => confirmDeleteLog(f.name)} title="删除">🗑</button>
+                      </span>
+                    </div>
+                  ))}
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                    <button className="sidebar-btn" onClick={copyAllLogs} style={{ flex: 1 }}>📋 复制全部</button>
+                    <button className="sidebar-btn" onClick={confirmClearAllLogs}
+                            style={{ flex: 1, color: '#e74c3c' }}>🗑 清理所有</button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 日志内容查看弹窗（L3增强：搜索 + truncated 标记） */}
             {viewingLog !== null && (
-              <div className="log-viewer-overlay" onClick={() => setViewingLog(null)}
+              <div className="log-viewer-overlay" onClick={() => { setViewingLog(null); setLogSearch(''); }}
                    style={{
                      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
                      background: 'rgba(0,0,0,0.5)', zIndex: 9999,
                      display: 'flex', justifyContent: 'center', alignItems: 'center',
                    }}>
                 <div onClick={e => e.stopPropagation()} style={{
-                  background: 'var(--bg-secondary)', borderRadius: 8, maxWidth: '80vw',
-                  maxHeight: '80vh', display: 'flex', flexDirection: 'column',
+                  background: 'var(--bg-secondary)', borderRadius: 8, maxWidth: '85vw', width: '85vw',
+                  maxHeight: '85vh', display: 'flex', flexDirection: 'column',
                 }}>
                   <div style={{
                     padding: '12px 16px', borderBottom: '1px solid var(--border)',
-                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12,
                   }}>
-                    <strong style={{ color: 'var(--text-primary)' }}>{viewingLog.name}</strong>
-                    <button onClick={() => setViewingLog(null)}
-                            style={{ cursor: 'pointer', background: 'none', border: 'none',
-                                     color: 'var(--text-muted)', fontSize: 16 }}>✕</button>
+                    <strong style={{ color: 'var(--text-primary)', whiteSpace: 'nowrap' }}>
+                      {viewingLog.name}
+                    </strong>
+                    <div style={{ display: 'flex', gap: 8, flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
+                      {/* L3: 日志内容搜索 */}
+                      <input
+                        className="log-search-input"
+                        type="text"
+                        placeholder="🔍 搜索日志内容..."
+                        value={logSearch}
+                        onChange={e => setLogSearch(e.target.value)}
+                        onClick={e => e.stopPropagation()}
+                        style={{
+                          padding: '4px 8px', fontSize: 11, borderRadius: 4,
+                          border: '1px solid var(--border)', background: 'var(--bg-input)',
+                          color: 'var(--text-primary)', width: 180,
+                        }}
+                      />
+                      <button onClick={() => { setViewingLog(null); setLogSearch(''); }}
+                              style={{ cursor: 'pointer', background: 'none', border: 'none',
+                                       color: 'var(--text-muted)', fontSize: 16 }}>✕</button>
+                    </div>
                   </div>
+                  {/* L3: truncated 标记 */}
+                  {viewingLog.truncated && (
+                    <div style={{
+                      padding: '6px 16px', fontSize: 11,
+                      background: '#fff3cd', color: '#856404',
+                      borderBottom: '1px solid var(--border)',
+                    }}>
+                      ⚠️ 日志文件过大（&gt; 1 MB），仅显示末尾 1 MB 内容。请下载完整文件查看全部日志。
+                    </div>
+                  )}
+                  {logSearch && (
+                    <div style={{
+                      padding: '4px 16px', fontSize: 10, color: 'var(--text-muted)',
+                      borderBottom: '1px solid var(--border)',
+                    }}>
+                      搜索: "{logSearch}" — {
+                        viewingLog.content.split('\n').filter(l => l.toLowerCase().includes(logSearch.toLowerCase())).length
+                      } 行匹配
+                    </div>
+                  )}
                   <pre style={{
                     margin: 0, padding: 16, overflow: 'auto', flex: 1,
                     fontSize: 11, lineHeight: 1.5, fontFamily: 'monospace',
                     whiteSpace: 'pre-wrap', wordBreak: 'break-all',
                     color: 'var(--text-primary)',
-                  }}>{viewingLog.content}</pre>
+                  }}>{
+                    logSearch
+                      ? viewingLog.content.split('\n').filter(l =>
+                          l.toLowerCase().includes(logSearch.toLowerCase())
+                        ).join('\n')
+                      : viewingLog.content
+                  }</pre>
                 </div>
               </div>
             )}

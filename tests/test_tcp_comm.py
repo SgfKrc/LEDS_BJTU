@@ -14,6 +14,7 @@ import logging
 import socket
 import struct
 import threading
+from unittest.mock import MagicMock
 import pytest
 import torch
 
@@ -97,6 +98,12 @@ class TestMessageType:
             "spare_master_designate", "spare_master_designate_ack",
             "spare_master_activate", "spare_master_activate_ack",
             "spare_master_deactivate",
+            "node_list_sync", "node_update",
+            "layer_forward", "layer_result", "chain_forward",
+            "pipeline_done", "pipeline_abort",
+            "pipeline_pause", "pipeline_resume",
+            # L5: 多节点日志聚合
+            "log_request", "log_response",
         }
         actual = set(MessageType.__members__.keys())
         for t in expected:
@@ -461,6 +468,111 @@ class TestTCPServerConnectionManagement:
         finally:
             cli_sock.close()
 
+    def test_scheduler_rejected_registration_returns_rejected_and_closes(self):
+        """通过协议校验但被上层调度器拒绝时，应返回 rejected 且不泄漏 clients。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+
+        def reject_in_scheduler(client_id, msg):
+            server.reject_client(client_id, "capacity full")
+
+        server.on_message = reject_in_scheduler
+        server._running = True
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            t = threading.Thread(
+                target=server._handle_client,
+                args=(srv_sock, ("127.0.0.1", 54322), "pending_54322"),
+                daemon=True,
+            )
+            t.start()
+
+            cli_sock.sendall(build_message(MessageType.REGISTER, {
+                "client_id": "client_full",
+                "role": "client",
+                "auth": tcp_comm_mod.build_auth_signature("client_full"),
+            }))
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            assert header is not None
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["type"] == "register"
+            assert ack["data"]["status"] == "rejected"
+            assert "capacity full" in ack["data"]["reason"]
+
+            t.join(timeout=2)
+            assert not t.is_alive()
+            assert server.get_client_ids() == []
+        finally:
+            cli_sock.close()
+
+    def test_scheduler_confirmed_registration_returns_registered(self):
+        """REGISTER 只有在上层调度器确认后才返回 registered。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+
+        def confirm_in_scheduler(client_id, msg):
+            assert server.get_client_info(client_id) is not None
+            server.confirm_registration(client_id)
+
+        server.on_message = confirm_in_scheduler
+        server._running = True
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            t = threading.Thread(
+                target=server._handle_client,
+                args=(srv_sock, ("127.0.0.1", 54323), "pending_54323"),
+                daemon=True,
+            )
+            t.start()
+
+            cli_sock.sendall(build_message(MessageType.REGISTER, {
+                "client_id": "client_ok",
+                "role": "client",
+                "auth": tcp_comm_mod.build_auth_signature("client_ok"),
+            }))
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            assert header is not None
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["type"] == "register"
+            assert ack["data"]["status"] == "registered"
+            assert ack["data"]["client_id"] == "client_ok"
+            assert server.get_client_ids() == ["client_ok"]
+        finally:
+            server.stop()
+            cli_sock.close()
+
+    def test_confirm_registration_send_failure_stays_unconfirmed_and_reject_cleans(self):
+        """ACK 发送失败时不应把 pending 连接标记为 registered。"""
+        class FailingSock:
+            def __init__(self):
+                self.closed = False
+                self.shutdown_called = False
+
+            def sendall(self, payload):
+                raise OSError("send failed")
+
+            def shutdown(self, how):
+                self.shutdown_called = True
+
+            def close(self):
+                self.closed = True
+
+        server = TCPServer(host="127.0.0.1", port=0)
+        sock = FailingSock()
+        conn = ClientConn(client_id="client_fail", sock=sock, addr=("127.0.0.1", 1))
+        server._set_client("client_fail", conn)
+
+        assert server.confirm_registration("client_fail") is False
+        assert conn.registration_confirmed is False
+
+        server.reject_client("client_fail", "confirm failed")
+
+        assert server.get_client_ids() == []
+        assert sock.shutdown_called is True
+        assert sock.closed is True
+
     def test_pop_client_is_idempotent_and_send_missing_raises_connection_error(self):
         """重复清理连接不应 KeyError，不存在客户端发送应抛 ConnectionError。"""
         server = TCPServer(host="127.0.0.1", port=0)
@@ -556,3 +668,128 @@ class TestRecvExactTimeout:
         t = torch.zeros(250000, dtype=torch.float64)
         with pytest.raises(ValueError, match="不支持"):
             serialize_tensor_fast(t)
+
+
+# ================================================================
+# C2 修复验证：_reconnect() 重连行为测试
+# ================================================================
+
+class TestReconnectBehavior:
+    """测试 _reconnect() 的重连逻辑（BUG C2 修复验证）"""
+
+    def test_reconnect_calls_connect_once(self, monkeypatch):
+        """_reconnect 应仅调用 connect() 一次（connect 内部已有重试）。
+
+        BUG C2 修复引入了双重重试问题（外层5次 × connect内部5次 = 25次），
+        后续修复改为仅调用 connect() 一次。
+        """
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1,
+            client_id="test_reconnect", role="client",
+        )
+        connect_calls = []
+
+        def mock_connect(on_message=None):
+            connect_calls.append(1)
+            return False  # 模拟连接失败
+
+        monkeypatch.setattr(client, "connect", mock_connect)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _: None)
+        client.on_message = None
+
+        client._reconnect()
+
+        # connect() 应只被调用一次（内部已有 5 次重试）
+        assert len(connect_calls) == 1, (
+            f"_reconnect 应仅调用 connect() 一次，实际调用了 {len(connect_calls)} 次"
+        )
+
+    def test_reconnect_sets_running_true_on_failure(self, monkeypatch):
+        """connect() 失败后应设置 _running=True 以便心跳循环下次重试。"""
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1,
+            client_id="test_retry", role="client",
+        )
+
+        monkeypatch.setattr(client, "connect", lambda on_message=None: False)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _: None)
+        client.on_message = None
+
+        client._reconnect()
+
+        # _running 应为 True（允许心跳循环重试）
+        assert client._running is True, (
+            "connect() 失败后 _running 应设为 True 以便持续重连"
+        )
+
+    def test_reconnect_closes_socket_before_reconnect(self, monkeypatch):
+        """重连前应关闭旧 socket。"""
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1,
+            client_id="test_close", role="client",
+        )
+        mock_sock = MagicMock()
+        client.sock = mock_sock
+
+        monkeypatch.setattr(client, "connect", lambda on_message=None: True)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _: None)
+        client.on_message = None
+
+        client._reconnect()
+
+        mock_sock.close.assert_called_once()
+        assert client.sock is None
+
+
+class TestTCPClientRegistrationAck:
+    """Registration acknowledgement handling."""
+
+    def test_connect_returns_false_when_registration_rejected(self, monkeypatch):
+        packet = build_message(
+            MessageType.REGISTER,
+            {"status": "rejected", "reason": "bad secret"},
+        )
+
+        class FakeSocket:
+            def __init__(self, payload: bytes):
+                self._payload = bytearray(payload)
+                self.closed = False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _addr):
+                pass
+
+            def getsockname(self):
+                return ("100.64.0.2", 50000)
+
+            def sendall(self, _data):
+                pass
+
+            def recv(self, size: int):
+                chunk = self._payload[:size]
+                del self._payload[:size]
+                return bytes(chunk)
+
+            def close(self):
+                self.closed = True
+
+        fake_socket = FakeSocket(packet)
+
+        monkeypatch.setattr(tcp_comm_mod.socket, "socket", lambda *_args, **_kwargs: fake_socket)
+        monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "tailscale")
+        monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "100.64.0.2")
+
+        client = TCPClient(
+            server_host="100.64.0.1",
+            server_port=8888,
+            client_id="client-rejected",
+            role="client",
+        )
+
+        assert client.connect() is False
+        assert client.is_registered is False
+        assert "bad secret" in client.last_register_error
+        assert fake_socket.closed is True
+        assert client.sock is None

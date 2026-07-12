@@ -20,6 +20,19 @@ import java.util.concurrent.Executors
  * 同时输出到 Logcat（android.util.Log）和 filesDir/logs/ 下的日期滚动文件。
  * 写文件在单线程 executor 中完成，不阻塞调用线程。
  *
+ * ## 日志级别约定（与 PC 端 Python logging 对齐）
+ *
+ * | Android     | PC Python        | 说明 |
+ * |-------------|------------------|------|
+ * | `V` (VERBOSE) | `DEBUG` (10)   | 详细诊断信息，仅开发时启用 |
+ * | `D` (DEBUG)   | `DEBUG` (10)   | 调试信息 |
+ * | `I` (INFO)    | `INFO` (20)    | 常规运行时信息 |
+ * | `W` (WARNING)  | `WARNING` (30) | 可恢复的异常情况 |
+ * | `E` (ERROR)   | `ERROR` (40)   | 错误，需要关注 |
+ * | `crash()`     | `CRITICAL` (50)| 崩溃级，同步写入 |
+ *
+ * PC 端 `CRITICAL` (50) 在 Android 端无直接对应，使用 `e()` + `crash()` 兜底。
+ *
  * 使用方式：
  *   QlhLogger.init(context)  // Application.onCreate() 中调用一次
  *   QlhLogger.i(TAG, "message")
@@ -29,7 +42,7 @@ object QlhLogger {
 
     private const val MAX_LOG_SIZE = 5 * 1024 * 1024L   // 5 MB 滚动
     private const val BACKUP_COUNT = 5
-    private const val READ_MAX_BYTES = 500 * 1024L       // 读取上限 500 KB
+    const val READ_MAX_BYTES = 500 * 1024L              // 读取上限 500 KB（public 供 UI 截断提示用）
     private const val TAG = "QlhLogger"
     private val logFileRegex = Regex("^[^/\\\\]+\\.log(?:\\.\\d+)?$")
 
@@ -172,6 +185,13 @@ object QlhLogger {
         val modified: Date,
     )
 
+    /** 日志读取结果，包含内容与是否截断信息。 */
+    data class LogReadResult(
+        val content: String?,
+        val truncated: Boolean,
+        val fileSize: Long,
+    )
+
     /** 列出所有 .log 文件，按修改时间降序。 */
     fun getLogFiles(): List<LogFileInfo> {
         return logDir?.listFiles()
@@ -183,20 +203,52 @@ object QlhLogger {
 
     /** 读取日志文件内容（返回末 500 KB）。失败返回 null。 */
     fun readLogFile(name: String): String? {
+        return readLogFileWithInfo(name).content
+    }
+
+    /**
+     * 读取日志文件内容并返回截断信息。
+     *
+     * @param name 日志文件名
+     * @return [LogReadResult] — content 为 null 表示读取失败；
+     *         truncated=true 表示文件超过 [READ_MAX_BYTES]（500 KB），仅返回末尾部分。
+     */
+    fun readLogFileWithInfo(name: String): LogReadResult {
         val file = File(logDir, name)
-        if (!file.exists() || !isLogFile(file)) return null
+        if (!file.exists() || !isLogFile(file)) {
+            return LogReadResult(null, false, 0L)
+        }
+        val fileSize = file.length()
         return try {
-            if (file.length() > READ_MAX_BYTES) {
+            if (fileSize > READ_MAX_BYTES) {
                 val raf = RandomAccessFile(file, "r")
-                raf.seek(file.length() - READ_MAX_BYTES)
+                raf.seek(fileSize - READ_MAX_BYTES)
                 val bytes = ByteArray(READ_MAX_BYTES.toInt())
                 val n = raf.read(bytes)
                 raf.close()
-                String(bytes, 0, n, Charsets.UTF_8)
+                LogReadResult(
+                    content = String(bytes, 0, n, Charsets.UTF_8),
+                    truncated = true,
+                    fileSize = fileSize,
+                )
             } else {
-                file.readText()
+                LogReadResult(
+                    content = file.readText(),
+                    truncated = false,
+                    fileSize = fileSize,
+                )
             }
         } catch (_: Exception) {
+            LogReadResult(null, false, fileSize)
+        }
+    }
+
+    /** 获取单个日志文件的 [LogFileInfo]（含 size 信息），不存在则返回 null。 */
+    fun getLogFileInfo(name: String): LogFileInfo? {
+        val file = File(logDir, name)
+        return if (file.exists() && isLogFile(file)) {
+            LogFileInfo(file.name, file.length(), Date(file.lastModified()))
+        } else {
             null
         }
     }

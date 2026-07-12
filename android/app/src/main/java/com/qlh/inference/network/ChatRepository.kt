@@ -83,7 +83,7 @@ class ChatRepository(
     suspend fun sendMessage(
         sessionId: Long,
         message: String,
-        maxTokens: Int = 512,
+        maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f,
         showThinking: Boolean = false,
@@ -208,7 +208,7 @@ class ChatRepository(
     fun sendMessageStream(
         sessionId: Long,
         message: String,
-        maxTokens: Int = 512,
+        maxTokens: Int = 1024,
         temperature: Float = 0.7f,
         topP: Float = 0.9f
     ): Flow<String> {

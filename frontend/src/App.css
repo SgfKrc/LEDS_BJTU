@@ -1,23 +1,24 @@
 /* ============================================================
-   全局样式 — 暗色主题 · 边缘推理优化系统管理平台
+   全局样式 — 黑白灰主题 · 边缘推理优化系统管理平台
    ============================================================ */
 
 :root {
-  --bg-primary: #0f1117;
-  --bg-secondary: #1a1d27;
-  --bg-card: #212433;
-  --bg-input: #2a2d3a;
-  --border: #32364a;
-  --text-primary: #e4e6f0;
-  --text-secondary: #8b8fa8;
-  --text-muted: #5c6080;
-  --accent: #6366f1;
-  --accent-hover: #818cf8;
-  --accent-dim: #3730a3;
+  --bg-primary: #0b0b0c;
+  --bg-secondary: #141416;
+  --bg-card: #1d1d20;
+  --bg-input: #242428;
+  --border: #3a3a40;
+  --text-primary: #f5f5f5;
+  --text-secondary: #b6b6bd;
+  --text-muted: #777780;
+  --accent: #f5f5f5;
+  --accent-hover: #ffffff;
+  --accent-dim: #303036;
+  --on-accent: #0b0b0c;
   --success: #22c55e;
   --warning: #f59e0b;
   --danger: #ef4444;
-  --info: #3b82f6;
+  --info: #d4d4d8;
   --radius: 10px;
   --radius-sm: 6px;
   --shadow: 0 2px 8px rgba(0,0,0,0.3);
@@ -64,7 +65,7 @@ button:disabled {
 }
 .btn-primary {
   background: var(--accent);
-  color: white;
+  color: var(--on-accent);
 }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-danger {
@@ -139,10 +140,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .sidebar-header h1 {
   font-size: 16px;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--accent-hover), var(--info));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  color: var(--text-primary);
 }
 .sidebar-header .subtitle {
   font-size: 11px;
@@ -261,7 +259,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   top: 10px;
   right: 10px;
   background: var(--accent);
-  color: white;
+  color: var(--on-accent);
   font-size: 10px;
   padding: 2px 8px;
   border-radius: 10px;
@@ -391,7 +389,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   flex-shrink: 0;
 }
 .message.user .avatar { background: var(--accent-dim); }
-.message.assistant .avatar { background: #1e3a5f; }
+.message.assistant .avatar { background: var(--bg-input); }
 
 .message .bubble {
   background: var(--bg-card);
@@ -938,7 +936,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   font-size: 12px;
   font-weight: 600;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   padding: 2px 10px;
   border-radius: 10px;
 }
@@ -1084,7 +1082,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 
 .setting-btn.primary {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
 }
 
@@ -1382,6 +1380,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 
 .chip-badge.current {
   background: var(--accent);
+  color: var(--on-accent);
   top: auto;
   right: auto;
   position: static;
@@ -1607,38 +1606,189 @@ input:focus, textarea:focus { border-color: var(--accent); }
   color: var(--accent-hover);
 }
 
+/* ================================================================
+   L3: 日志管理增强样式
+   ================================================================ */
+
+/* 日志统计摘要栏 */
+.log-stats-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* 日志子区域 */
+.log-subsection {
+  margin-top: 10px;
+}
+
+.log-subsection-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.log-subsection-header h4 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+/* Level 过滤芯片 */
+.log-level-filters {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.log-level-chip {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.log-level-chip:hover {
+  border-color: var(--text-muted);
+}
+
+.log-level-chip.active {
+  color: #fff;
+  border-color: transparent;
+}
+
+.log-level-chip.active.level-error   { background: #e74c3c; }
+.log-level-chip.active.level-warning { background: #f39c12; color: #333; }
+.log-level-chip.active.level-info    { background: #6b7280; }
+.log-level-chip.active.level-debug   { background: #7f8c8d; }
+/* 默认 active 无 level 类 = 全部 */
+.log-level-chip.active:not(.level-error):not(.level-warning):not(.level-info):not(.level-debug) {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* 最近日志列表 */
+.recent-logs-list {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+}
+
+.recent-log-entry {
+  display: flex;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: monospace;
+  line-height: 1.5;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.08s;
+}
+
+.recent-log-entry:last-child {
+  border-bottom: none;
+}
+
+.recent-log-entry:hover {
+  background: var(--bg-input);
+}
+
+/* Level 颜色边框指示 */
+.recent-log-entry.level-error   { border-left: 3px solid #e74c3c; }
+.recent-log-entry.level-warning { border-left: 3px solid #f39c12; }
+.recent-log-entry.level-info    { border-left: 3px solid #6b7280; }
+.recent-log-entry.level-debug   { border-left: 3px solid #95a5a6; }
+
+.recent-log-level {
+  display: inline-block;
+  min-width: 44px;
+  padding: 0 4px;
+  border-radius: 3px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.6;
+  flex-shrink: 0;
+}
+
+.recent-log-level.error   { background: #fde8e8; color: #c0392b; }
+.recent-log-level.warning { background: #fef3cd; color: #856404; }
+.recent-log-level.info    { background: #e5e7eb; color: #374151; }
+.recent-log-level.debug   { background: #eaecee; color: #5d6d7e; }
+
+.recent-log-ts {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.recent-log-msg {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+/* 日志查看弹窗搜索框 */
+.log-search-input {
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.log-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
 /* ============================================================
    浅色主题
    ============================================================ */
 
 [data-theme="light"] {
-  --bg-primary: #f5f5f7;
+  --bg-primary: #f7f7f7;
   --bg-secondary: #ffffff;
-  --bg-card: #f0f0f3;
-  --bg-input: #e8e8ec;
-  --border: #d1d1d8;
-  --text-primary: #1a1a2e;
-  --text-secondary: #555570;
-  --text-muted: #8888a0;
-  --accent: #6366f1;
-  --accent-hover: #4f46e5;
-  --accent-dim: #e0e0ff;
+  --bg-card: #eeeeee;
+  --bg-input: #f4f4f4;
+  --border: #d8d8d8;
+  --text-primary: #111111;
+  --text-secondary: #4f4f4f;
+  --text-muted: #7a7a7a;
+  --accent: #111111;
+  --accent-hover: #000000;
+  --accent-dim: #e8e8e8;
+  --on-accent: #ffffff;
   --success: #16a34a;
   --warning: #d97706;
   --danger: #dc2626;
-  --info: #2563eb;
+  --info: #555555;
   --shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
 }
 
 [data-theme="light"] ::-webkit-scrollbar-thumb {
   background: #c0c0cc;
-}
-
-[data-theme="light"] .sidebar-header h1 {
-  background: linear-gradient(135deg, #4f46e5, #2563eb);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
 }
 
 [data-theme="light"] .toast.success {
@@ -1654,29 +1804,29 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 [data-theme="light"] .message.user .bubble {
-  background: #e0e0ff;
+  background: #e8e8e8;
   border-color: var(--accent);
-  color: #1a1a2e;
+  color: #111111;
 }
 
 [data-theme="light"] .thinking-toggle:hover {
-  background: rgba(99, 102, 241, 0.06);
+  background: rgba(0, 0, 0, 0.04);
 }
 
 [data-theme="light"] .thinking-content {
-  background: rgba(99, 102, 241, 0.03);
+  background: rgba(0, 0, 0, 0.03);
 }
 
 [data-theme="light"] .gpu-toggle-btn.active {
-  background: #e0e0ff;
+  background: #e8e8e8;
 }
 
 [data-theme="light"] .model-card.active {
-  background: #e0e0ff;
+  background: #e8e8e8;
 }
 
 [data-theme="light"] .file-chip {
-  background: #e0e0ff;
+  background: #e8e8e8;
 }
 
 [data-theme="light"] .settings-overlay {
@@ -1684,7 +1834,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 [data-theme="light"] .setting-chip.active {
-  background: #e0e0ff;
+  background: #e8e8e8;
 }
 
 [data-theme="light"] .setting-chip.recommended {
@@ -1692,25 +1842,25 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 [data-theme="light"] .tier-preset-card.active {
-  background: #e0e0ff;
-  color: #1a1a2e;
+  background: #e8e8e8;
+  color: #111111;
 }
 
 [data-theme="light"] .tier-preset-card.active .tier-preset-specs {
-  color: #4f46e5;
+  color: #111111;
 }
 
 [data-theme="light"] .setting-toggle-btn.on .setting-toggle-track {
-  background: #e0e0ff;
+  background: #e8e8e8;
 }
 
 [data-theme="light"] .setting-device-badge {
-  background: #e0e0ff;
-  color: #4f46e5;
+  background: #e8e8e8;
+  color: #111111;
 }
 
 [data-theme="light"] .chip-badge {
-  color: #fff;
+  color: var(--on-accent);
 }
 
 /* ============================================================
@@ -1751,8 +1901,46 @@ input:focus, textarea:focus { border-color: var(--accent); }
   width: 16px;
   height: 16px;
   background: var(--accent);
+  border: 1px solid var(--border);
   border-radius: 50%;
   transition: transform 0.2s ease;
+}
+
+[data-theme="light"] .theme-toggle-thumb {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.theme-mode-segment {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  margin-top: 10px;
+  padding: 4px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.theme-mode-segment button {
+  padding: 6px 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.theme-mode-segment button:hover {
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.theme-mode-segment button.active {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
 }
 
 /* ============================================================
@@ -1788,7 +1976,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 
 .nav-tab.active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
 
@@ -1994,8 +2182,8 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 .type-badge[data-type="pc"] {
-  background: rgba(59, 130, 246, 0.12);
-  color: #3b82f6;
+  background: var(--accent-dim);
+  color: var(--text-primary);
 }
 
 .type-badge[data-type="android"] {
@@ -2224,7 +2412,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .btn-primary {
   padding: 6px 16px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
   border-radius: var(--radius-sm);
   font-size: 12px;
@@ -2597,7 +2785,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
    ============================================================ */
 
 [data-theme="light"] .nav-tab.active {
-  color: #fff;
+  color: var(--on-accent);
 }
 
 [data-theme="light"] .admin-stat-card {
@@ -2670,12 +2858,12 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 [data-theme="light"] .discover-btn {
-  color: #4f46e5;
-  border-color: #4f46e5;
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 [data-theme="light"] .discover-btn:hover {
-  background: rgba(79, 70, 229, 0.06);
+  background: rgba(0, 0, 0, 0.04);
 }
 
 [data-theme="light"] .discovery-banner.fresh {
@@ -3011,7 +3199,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   align-items: center;
   justify-content: center;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
   border-radius: 6px;
   font-size: 16px;
@@ -3603,7 +3791,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   padding: 2px 8px;
   border-radius: 4px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.5px;

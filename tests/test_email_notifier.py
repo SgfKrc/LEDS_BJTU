@@ -240,8 +240,10 @@ class TestEmailSending:
     """测试实际邮件发送（需要网络连接）"""
 
     @pytest.mark.skipif(
-        not os.environ.get("QLH_SMTP_PASSWORD") or os.environ.get("QLH_SMTP_PASSWORD") == "test_password",
-        reason="需要真实 QQ 邮箱授权码（设置环境变量 QLH_SMTP_PASSWORD）"
+        os.environ.get("QLH_RUN_SMTP_TESTS") != "1"
+        or not os.environ.get("QLH_SMTP_PASSWORD")
+        or os.environ.get("QLH_SMTP_PASSWORD") == "test_password",
+        reason="需要显式设置 QLH_RUN_SMTP_TESTS=1 和真实 QLH_SMTP_PASSWORD"
     )
     def test_send_test_email(self):
         """发送测试邮件（需要真实 SMTP 凭据）"""

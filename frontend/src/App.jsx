@@ -9,11 +9,11 @@ import SessionList from './components/SessionList';
 
 // ---- 设备档位预设 ----
 export const TIER_PRESETS = {
-  workstation: { maxNewTokens: 2048, temperature: 0.7, topP: 0.9 },
-  laptop:      { maxNewTokens: 1024, temperature: 0.7, topP: 0.9 },
-  ultrabook:   { maxNewTokens: 512,  temperature: 0.7, topP: 0.9 },
-  edge:        { maxNewTokens: 256,  temperature: 0.7, topP: 0.9 },
-  mobile:      { maxNewTokens: 128,  temperature: 0.7, topP: 0.9 },
+  workstation: { maxNewTokens: 4096, temperature: 0.7, topP: 0.9 },
+  laptop:      { maxNewTokens: 2048, temperature: 0.7, topP: 0.9 },
+  ultrabook:   { maxNewTokens: 1024, temperature: 0.7, topP: 0.9 },
+  edge:        { maxNewTokens: 512,  temperature: 0.7, topP: 0.9 },
+  mobile:      { maxNewTokens: 256,  temperature: 0.7, topP: 0.9 },
 };
 
 export const TIER_LABELS = {
@@ -27,7 +27,7 @@ export const TIER_LABELS = {
 // 默认设置（无设备档位时使用）
 const DEFAULT_SETTINGS = {
   saveHistory: true,             // 对话历史云端持久化：默认开启，确保跨设备数据共享
-  maxNewTokens: 512,
+  maxNewTokens: 1024,
   temperature: 0.7,
   topP: 0.9,
   distributedInference: false, // 分布式推理：启动时从服务端同步，避免默认假设导致状态不一致
@@ -36,20 +36,29 @@ const DEFAULT_SETTINGS = {
   streamingMode: 'full',       // 流式输出模式: full=完整功能（历史/追问/持久化，默认）| fast=真流式逐token
 };
 
-// 从 localStorage 读取主题，默认暗色
-function getInitialTheme() {
-  try {
-    const stored = localStorage.getItem('qlh-theme');
-    if (stored === 'light' || stored === 'dark') return stored;
-  } catch (_) {}
-  // 跟随系统偏好
-  if (window.matchMedia?.('(prefers-color-scheme: light)').matches) return 'light';
-  return 'dark';
+function getSystemTheme() {
+  if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) return 'dark';
+  return 'light';
 }
 
-function applyTheme(theme) {
+function resolveTheme(themeMode) {
+  return themeMode === 'system' ? getSystemTheme() : themeMode;
+}
+
+// 从 localStorage 读取主题模式，默认跟随系统
+function getInitialThemeMode() {
+  try {
+    const stored = localStorage.getItem('qlh-theme');
+    if (stored === 'system' || stored === 'light' || stored === 'dark') return stored;
+  } catch (_) {}
+  return 'system';
+}
+
+function applyTheme(themeMode) {
+  const theme = resolveTheme(themeMode);
   document.documentElement.setAttribute('data-theme', theme);
-  try { localStorage.setItem('qlh-theme', theme); } catch (_) {}
+  document.documentElement.setAttribute('data-theme-mode', themeMode);
+  try { localStorage.setItem('qlh-theme', themeMode); } catch (_) {}
 }
 
 // 从 localStorage 读取设置
@@ -78,7 +87,8 @@ export default function App() {
   const [deviceRefreshKey, setDeviceRefreshKey] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [theme, setTheme] = useState(getInitialTheme);
+  const [themeMode, setThemeMode] = useState(getInitialThemeMode);
+  const [systemTheme, setSystemTheme] = useState(getSystemTheme);
   const [settings, setSettings] = useState(getInitialSettings);
   const [deviceTier, setDeviceTier] = useState(null);  // 由 DevicePanel 检测后回传
   const [hasDedicatedGpu, setHasDedicatedGpu] = useState(false);  // 是否有独显（用于深度思考门控）
@@ -92,12 +102,41 @@ export default function App() {
   const [availableModels, setAvailableModels] = useState([]);
   const [switchingModel, setSwitchingModel] = useState(false);
 
-  // 初始化主题
-  useEffect(() => { applyTheme(theme); }, [theme]);
+  const theme = themeMode === 'system' ? systemTheme : themeMode;
 
-  // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复
+  // 初始化主题，并在“跟随系统”时响应系统深浅色变化
   useEffect(() => {
-    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings }) => {
+    applyTheme(themeMode);
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    if (!media) return undefined;
+
+    const handler = (event) => {
+      const nextSystemTheme = event.matches ? 'dark' : 'light';
+      setSystemTheme(nextSystemTheme);
+      if (themeMode === 'system') {
+        document.documentElement.setAttribute('data-theme', nextSystemTheme);
+      }
+    };
+
+    if (media.addEventListener) {
+      media.addEventListener('change', handler);
+    } else {
+      media.addListener?.(handler);
+    }
+    return () => {
+      if (media.removeEventListener) {
+        media.removeEventListener('change', handler);
+      } else {
+        media.removeListener?.(handler);
+      }
+    };
+  }, [themeMode]);
+
+  // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复 + L5 错误上报
+  useEffect(() => {
+    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings, installErrorReporter }) => {
+      // L5: 安装全局前端错误上报（仅在 PROD 生效）
+      installErrorReporter();
       // 获取角色
       fetchMyRole()
         .then(setMyRole)
@@ -138,9 +177,16 @@ export default function App() {
     || myRole.node_role === 'unknown'             // 未识别：显示（需手动配置连接）
     || (myRole.is_client && settings.distributedInference);  // 从节点：需开启分布式推理
 
+  const setThemePreference = useCallback((mode) => {
+    const next = ['system', 'light', 'dark'].includes(mode) ? mode : 'system';
+    setThemeMode(next);
+    applyTheme(next);
+  }, []);
+
   const toggleTheme = useCallback(() => {
-    setTheme((prev) => {
-      const next = prev === 'dark' ? 'light' : 'dark';
+    setThemeMode((prev) => {
+      const current = prev === 'system' ? getSystemTheme() : prev;
+      const next = current === 'dark' ? 'light' : 'dark';
       applyTheme(next);
       return next;
     });
@@ -514,7 +560,9 @@ export default function App() {
         deviceRefreshKey={deviceRefreshKey}
         onToast={showToast}
         theme={theme}
+        themeMode={themeMode}
         onToggleTheme={toggleTheme}
+        onThemeModeChange={setThemePreference}
         settings={settings}
         onSettingsChange={updateSettings}
         deviceTier={deviceTier}
