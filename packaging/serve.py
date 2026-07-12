@@ -8,7 +8,7 @@
 
 支持分发:
 - PC 安装包: packaging/dist/*.exe
-- Android 安装包: android/app/build/outputs/**/*.apk / *.aab
+- Android 安装包: packaging/dist/*.apk / *.aab，或 android/app/build/outputs/**/*.apk / *.aab
 - PC 模型压缩包: models_pc.7z 或 models_pc/*.7z
 - Android 模型压缩包: models_android.7z 或 models_android/*.7z
 
@@ -45,6 +45,7 @@ MODEL_ARCHIVES = {
 }
 ANDROID_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "android", "app", "build", "outputs")
 
+PC_INSTALLER_EXTS = (".exe",)
 ANDROID_EXTS = (".apk", ".aab")
 
 
@@ -74,10 +75,10 @@ def _format_size(path: str) -> str:
 
 def _scan_android_packages() -> list[tuple[str, str]]:
     """
-    扫描 Android Gradle 输出目录，返回 [(display_name, absolute_path)]。
+    扫描 Android Gradle release 输出目录，返回 [(display_name, absolute_path)]。
 
     display_name 使用相对 outputs/ 的路径，避免 debug/release 同名文件冲突，
-    例如: apk/debug/app-debug.apk。
+    例如: apk/full/release/app-full-release.apk。
     """
     packages: list[tuple[str, str]] = []
     if not os.path.isdir(ANDROID_OUTPUT_DIR):
@@ -89,18 +90,19 @@ def _scan_android_packages() -> list[tuple[str, str]]:
                 continue
             abs_path = os.path.join(root, name)
             rel_path = os.path.relpath(abs_path, ANDROID_OUTPUT_DIR).replace(os.sep, "/")
+            rel_parts = rel_path.lower().split("/")
+            if "androidtest" in rel_parts or "release" not in rel_parts:
+                continue
             packages.append((rel_path, abs_path))
 
-    # 常用 debug/release apk 优先，其他按名称排序
+    # 常用 release apk 优先，其他按名称排序
     def sort_key(item: tuple[str, str]) -> tuple[int, str]:
         rel, _path = item
         lower = rel.lower()
-        if lower.endswith("app-debug.apk"):
+        if lower.endswith("app-release.apk"):
             rank = 0
-        elif lower.endswith("app-release.apk"):
-            rank = 1
         elif lower.endswith("app-release.aab"):
-            rank = 2
+            rank = 1
         else:
             rank = 9
         return (rank, lower)
@@ -111,6 +113,53 @@ def _scan_android_packages() -> list[tuple[str, str]]:
 def _android_url(rel_path: str) -> str:
     """Android 包下载 URL。"""
     return "/android/" + quote(rel_path, safe="/")
+
+
+def _scan_pc_installers() -> list[tuple[str, str, str]]:
+    """扫描 packaging/dist 内可分发的 PC 安装包。"""
+    installers: list[tuple[str, str, str]] = []
+    if not os.path.isdir(DIST_DIR):
+        return installers
+
+    for name in sorted(os.listdir(DIST_DIR), key=str.lower):
+        item_path = os.path.join(DIST_DIR, name)
+        if not os.path.isfile(item_path) or not name.lower().endswith(PC_INSTALLER_EXTS):
+            continue
+        installers.append((name, "/" + quote(name), item_path))
+    return installers
+
+
+def _scan_dist_android_packages() -> list[tuple[str, str, str]]:
+    """扫描 packaging/dist 内可直接分发的 Android 安装包。"""
+    packages: list[tuple[str, str, str]] = []
+    if not os.path.isdir(DIST_DIR):
+        return packages
+
+    for name in sorted(os.listdir(DIST_DIR), key=str.lower):
+        item_path = os.path.join(DIST_DIR, name)
+        if not os.path.isfile(item_path) or not name.lower().endswith(ANDROID_EXTS):
+            continue
+        packages.append((name, "/" + quote(name), item_path))
+    return packages
+
+
+def _scan_android_downloads() -> list[tuple[str, str, str]]:
+    """
+    扫描所有 Android 安装包下载项，返回 [(display_name, href, absolute_path)]。
+
+    packaging/dist 是对外分发目录，优先显示；Gradle 输出目录保留为构建产物备用入口。
+    """
+    entries = _scan_dist_android_packages()
+    seen_paths = {os.path.abspath(abs_path) for _display, _href, abs_path in entries}
+
+    for rel_path, abs_path in _scan_android_packages():
+        normalized = os.path.abspath(abs_path)
+        if normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        entries.append((f"android/app/build/outputs/{rel_path}", _android_url(rel_path), abs_path))
+
+    return entries
 
 
 def _scan_model_archives(kind: str | None = None) -> list[tuple[str, str, str, str]]:
@@ -225,19 +274,15 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         if os.path.abspath(path) != os.path.abspath(DIST_DIR):
             return super().list_directory(path)
 
-        pc_entries = []
-        if os.path.isdir(DIST_DIR):
-            for name in sorted(os.listdir(DIST_DIR), key=str.lower):
-                item_path = os.path.join(DIST_DIR, name)
-                display_name = name + "/" if os.path.isdir(item_path) else name
-                href = quote(display_name)
-                pc_entries.append(
-                    (display_name, href, _format_size(item_path) if os.path.isfile(item_path) else "目录")
-                )
+        pc_entries = [
+            (display, href, _format_size(abs_path))
+            for display, href, abs_path in _scan_pc_installers()
+        ]
 
-        android_entries = []
-        for rel_path, abs_path in _scan_android_packages():
-            android_entries.append((rel_path, _android_url(rel_path), _format_size(abs_path)))
+        android_entries = [
+            (display, href, _format_size(abs_path))
+            for display, href, abs_path in _scan_android_downloads()
+        ]
 
         pc_model_entries = [
             (display, href, _format_size(abs_path))
@@ -257,7 +302,7 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             )
 
         pc_rows = render_rows(pc_entries, "暂无 PC 安装包（请先运行 build-installer.bat）")
-        android_rows = render_rows(android_entries, "暂无 Android 安装包（请先运行 android/gradlew.bat assembleDebug）")
+        android_rows = render_rows(android_entries, "暂无 Android 安装包（请先运行 android/gradlew.bat assembleRelease）")
         pc_model_rows = render_rows(pc_model_entries, "暂无 PC 模型压缩包 models_pc.7z / models_pc/*.7z")
         android_model_rows = render_rows(
             android_model_entries,
@@ -304,7 +349,7 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
   </ul>
 
   <p class="hint">
-    Android Debug APK 默认路径: <code>android/app/build/outputs/apk/debug/app-debug.apk</code><br>
+    Android Release APK 默认路径: <code>android/app/build/outputs/apk/*/release/*.apk</code><br>
     PC 安装包默认路径: <code>packaging/dist/QLH-Edge-Inference-Setup-v*.exe</code><br>
     Android 模型包仅需包含 GGUF 模型；PC 模型包可包含 PC 端需要的完整模型目录。
   </p>
@@ -331,7 +376,7 @@ def main(argv: list[str] | None = None) -> None:
     port = int(argv[0]) if argv else DEFAULT_PORT
 
     ts_ip = _detect_tailscale_ip()
-    android_packages = _scan_android_packages()
+    android_packages = _scan_android_downloads()
     model_archives = _scan_model_archives()
 
     print()
@@ -345,10 +390,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Android 输出目录: {ANDROID_OUTPUT_DIR}")
     if android_packages:
         print("  Android 安装包:")
-        for rel_path, abs_path in android_packages:
-            print(f"    /android/{rel_path} ({_format_size(abs_path)})")
+        for display, href, abs_path in android_packages:
+            print(f"    {display} -> {href} ({_format_size(abs_path)})")
     else:
-        print("  Android 安装包: 未找到（请先运行 android/gradlew.bat assembleDebug）")
+        print("  Android 安装包: 未找到（请先运行 android/gradlew.bat assembleRelease）")
     if model_archives:
         print("  模型压缩包:")
         for kind, display, href, abs_path in model_archives:
@@ -360,14 +405,14 @@ def main(argv: list[str] | None = None) -> None:
     print("  其他设备浏览器访问:")
     if ts_ip and ts_ip != "?":
         print(f"    http://{ts_ip}:{port}/")
-        for rel_path, _abs_path in android_packages:
-            print(f"    http://{ts_ip}:{port}{_android_url(rel_path)}")
+        for _display, href, _abs_path in android_packages:
+            print(f"    http://{ts_ip}:{port}{href}")
         for _kind, _display, href, _abs_path in model_archives:
             print(f"    http://{ts_ip}:{port}{href}")
     else:
         print(f"    http://<本机IP>:{port}/")
-        for rel_path, _abs_path in android_packages:
-            print(f"    http://<本机IP>:{port}{_android_url(rel_path)}")
+        for _display, href, _abs_path in android_packages:
+            print(f"    http://<本机IP>:{port}{href}")
         for _kind, _display, href, _abs_path in model_archives:
             print(f"    http://<本机IP>:{port}{href}")
     print()

@@ -38,6 +38,9 @@ node_config.json.tmp
 
 # Model weights (downloaded separately)
 models/qwen-1_8b-chat/
+models/deepseek-*/
+.hf-cache/
+models/.cache/
 !models/README.md
 
 # Large binaries

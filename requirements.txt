@@ -10,8 +10,9 @@
 
 # --- 核心深度学习框架 ---
 torch>=2.2.0
-transformers>=4.45.0,<5.0.0     # 4.x 系列，兼容 bitsandbytes 量化
+transformers>=4.47.0,<4.48.0    # Qwen remote code + DeepSeek-R1 Distill 兼容窗口
 accelerate>=1.0.0                # 模型加载加速（bitsandbytes 依赖）
+transformers-stream-generator>=0.0.4  # Qwen-1.8B remote code 依赖
 
 # --- 模型量化 ---
 bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容）
