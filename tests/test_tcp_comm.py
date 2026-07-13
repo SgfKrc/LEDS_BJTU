@@ -128,6 +128,10 @@ class TestMessageType:
         """链式直连转发类型（P2 优化）"""
         assert MessageType.CHAIN_FORWARD.value == "chain_forward"
 
+    def test_chain_forward_ack_type(self):
+        """链式转发 ACK 类型"""
+        assert MessageType.CHAIN_FORWARD_ACK.value == "chain_forward_ack"
+
 
 # ================================================================
 # build_message 测试

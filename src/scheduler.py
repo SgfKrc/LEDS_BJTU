@@ -31,7 +31,7 @@ from config import (
     SERVER_IP, SERVER_PORT,
     NODE_ROLE, NODE_ID, MAX_NODES,
     MASTER_DOWN_EMAIL_TIMEOUT,
-    PIPELINE_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
+    PIPELINE_TIMEOUT, PIPELINE_STEP_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
     PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL,
     PIPELINE_SCHEDULING_STRATEGY,
     PIPELINE_Q0_MAX_TOKENS, PIPELINE_Q1_MAX_TOKENS,
@@ -905,6 +905,7 @@ class Scheduler:
         # 流水线推理状态（主节点侧）
         self._pipeline_results: dict = {}       # key → result data
         self._pipeline_events: dict = {}        # key → threading.Event
+        self._chain_ack_state: dict = {}        # task_id → step → node_id → ack/error
         self._pipeline_lock = threading.Lock()
         self._nodes_lock = threading.RLock()    # Phase 2.1: 保护 self.nodes 并发读写（可重入）
         self._kv_cache_lock = threading.Lock()   # Phase 2.2: 保护 _kv_cache 并发读写
@@ -2768,6 +2769,10 @@ class Scheduler:
             # ---- 从节点：收到另一从节点的链式直连转发（P2 优化）----
             self._handle_chain_forward(client_id, msg)
 
+        elif msg_type == "chain_forward_ack":
+            # ---- 主节点：收到链式转发每跳 ACK / 错误回报 ----
+            self._handle_chain_forward_ack(client_id, msg)
+
         elif msg_type == "pipeline_done":
             # ---- 从节点：流水线任务完成，清理 KV 缓存 ----
             data = msg.get("data", {})
@@ -2855,8 +2860,153 @@ class Scheduler:
         else:
             logger.debug(f"未知消息类型: {msg_type}, client={client_id}")
 
+    def _set_pipeline_result_error(self, task_id: str, node_id: str,
+                                   error: str, step: int = -1) -> None:
+        """主节点侧：写入节点错误并唤醒等待该节点结果的流水线线程。"""
+        if not task_id or not node_id:
+            return
+        key = f"{task_id}:{node_id}"
+        with self._pipeline_lock:
+            self._pipeline_results[key] = {
+                "task_id": task_id,
+                "node_id": node_id,
+                "error": error,
+                "step": step,
+            }
+            event = self._pipeline_events.get(key)
+            if event is not None:
+                event.set()
+
+    def _clear_pipeline_runtime_state(self, task_id: str) -> None:
+        """清理主节点侧单个流水线任务的等待结果与链路 ACK 状态。"""
+        if not task_id:
+            return
+        prefix = f"{task_id}:"
+        with self._pipeline_lock:
+            for key in list(self._pipeline_results):
+                if key.startswith(prefix):
+                    self._pipeline_results.pop(key, None)
+            for key in list(self._pipeline_events):
+                if key.startswith(prefix):
+                    self._pipeline_events.pop(key, None)
+            self._chain_ack_state.pop(task_id, None)
+
+    def _fail_pending_pipeline_results_for_node(self, node_id: str,
+                                                reason: str) -> None:
+        """节点断连/不可用时，立即失败所有正在等待该节点的流水线步骤。"""
+        if not node_id:
+            return
+        failed = []
+        with self._pipeline_lock:
+            for key, event in list(self._pipeline_events.items()):
+                try:
+                    task_id, waiting_node_id = key.split(":", 1)
+                except ValueError:
+                    continue
+                if waiting_node_id != node_id:
+                    continue
+                self._pipeline_results[key] = {
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "error": reason,
+                    "step": -1,
+                }
+                event.set()
+                failed.append(task_id)
+        if failed:
+            logger.warning(
+                "节点 %s 不可用，已唤醒 %d 个流水线等待任务: %s",
+                node_id, len(failed), ", ".join(failed),
+            )
+
+    def _handle_chain_forward_ack(self, client_id: str, msg: dict) -> None:
+        """主节点：记录链式转发每跳 ACK/错误，并在错误时立即唤醒流水线。"""
+        data = msg.get("data", {})
+        task_id = data.get("task_id", "")
+        step = data.get("step", -1)
+        status = data.get("status", "received")
+        error = data.get("error", "")
+        reporter_node_id = data.get("node_id", client_id)
+        target_node_id = data.get("target_node_id", "")
+        node_id = target_node_id if status in ("sent", "error") and target_node_id else reporter_node_id
+
+        if not task_id or not node_id:
+            return
+
+        now = time.time()
+        with self._pipeline_lock:
+            task_state = self._chain_ack_state.setdefault(task_id, {})
+            step_state = task_state.setdefault(step, {})
+            existing = step_state.get(node_id, {})
+            new_state = {
+                "status": status,
+                "error": error,
+                "from_node_id": data.get("from_node_id", reporter_node_id),
+                "target_node_id": target_node_id or node_id,
+                "reporter_node_id": reporter_node_id,
+                "updated_at": now,
+            }
+            if status == "sent":
+                new_state["sent_at"] = now
+                if existing.get("status") == "received":
+                    # 下游 ACK 可能比上游 sent 回报更早到达；不要把
+                    # received 状态倒退为 sent。
+                    new_state["status"] = "received"
+                    new_state["acked_at"] = existing.get("acked_at", existing.get("updated_at", now))
+                    new_state["error"] = existing.get("error", "")
+            elif status == "received":
+                new_state["acked_at"] = now
+                if existing.get("sent_at"):
+                    new_state["sent_at"] = existing["sent_at"]
+            step_state[node_id] = new_state
+
+        if status == "error" or error:
+            message = error or f"链式转发节点 {node_id} 返回错误 ACK"
+            logger.error(
+                "链式转发 ACK 错误: task=%s step=%s node=%s error=%s",
+                task_id, step, node_id, message,
+            )
+            self._set_pipeline_result_error(task_id, node_id, message, step)
+
+    def _get_chain_ack_failure(self, task_id: str, step: int,
+                               expected_node_ids: list,
+                               ack_timeout: float) -> Optional[dict]:
+        """检测已发送但迟迟未被下游确认接收的链式转发。"""
+        if not task_id or not expected_node_ids:
+            return None
+        now = time.time()
+        with self._pipeline_lock:
+            step_state = self._chain_ack_state.get(task_id, {}).get(step, {})
+            for node_id in expected_node_ids:
+                state = step_state.get(node_id)
+                if not state:
+                    continue
+                if state.get("status") == "error" or state.get("error"):
+                    return {
+                        "task_id": task_id,
+                        "node_id": node_id,
+                        "error": state.get("error") or f"链式转发到 {node_id} 失败",
+                        "step": step,
+                    }
+                if state.get("status") == "sent":
+                    sent_at = state.get("sent_at", state.get("updated_at", now))
+                    if now - sent_at >= ack_timeout:
+                        return {
+                            "task_id": task_id,
+                            "node_id": node_id,
+                            "error": (
+                                f"链式转发到 {node_id} 未收到接收 ACK "
+                                f"({ack_timeout:.1f}s)"
+                            ),
+                            "step": step,
+                        }
+        return None
+
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
+        self._fail_pending_pipeline_results_for_node(
+            client_id, f"节点 {client_id} TCP 连接已断开"
+        )
         with self._nodes_lock:
             old_state = None
             if client_id in self.nodes:
@@ -5422,6 +5572,13 @@ class Scheduler:
                 ok = self._send_chain_forward(chain_next["node_id"], chain_data)
                 if ok:
                     logger.debug(f"🔗 L1 直连成功: → {chain_next['node_id']}")
+                    self._send_chain_forward_ack(
+                        task_id=task_id,
+                        step=step,
+                        from_node_id=NODE_ID,
+                        target_node_id=chain_next["node_id"],
+                        status="sent",
+                    )
                 else:
                     # L2: 主节点中转（从节点 → 主节点 → 目标从节点）
                     logger.warning(
@@ -5429,21 +5586,27 @@ class Scheduler:
                         f"尝试 L2 主节点中转"
                     )
                     chain_data["_relay_to"] = chain_next["node_id"]
-                    try:
-                        self._send_layer_result("master", task_id, result_data=chain_data)
+                    sent = self._send_layer_result("master", task_id, result_data=chain_data)
+                    if sent:
                         logger.info(
                             f"🔄 L2 中转请求已发送至主节点: "
                             f"{NODE_ID} → master → {chain_next['node_id']}"
                         )
-                    except Exception as e:
-                        logger.error(
-                            f"❌ L2 中转请求发送失败: {e}，"
-                            f"回退到全模型推理"
+                    else:
+                        error_msg = (
+                            f"链式转发到 {chain_next['node_id']} 失败 "
+                            f"(L1直连失败，L2中转请求发送失败)"
                         )
-                        self._send_layer_result(
-                            "master", task_id,
-                            error=f"链式转发到 {chain_next['node_id']} 失败 "
-                                  f"(L1直连+L2中转均失败: {e})"
+                        logger.error(
+                            f"❌ {error_msg}，回退到全模型推理"
+                        )
+                        self._send_chain_forward_ack(
+                            task_id=task_id,
+                            step=step,
+                            from_node_id=NODE_ID,
+                            target_node_id=chain_next["node_id"],
+                            status="error",
+                            error=error_msg,
                         )
             else:
                 # 末节点（或无链配置）：发送 LAYER_RESULT 回主节点
@@ -5453,6 +5616,13 @@ class Scheduler:
             self._record_local_pipeline_participation(task_id, success=False)
             logger.error(f"层前向传播失败: task={task_id}, error={e}", exc_info=True)
             self._send_layer_result("master", task_id, error=str(e))
+            self._send_chain_forward_ack(
+                task_id=task_id,
+                step=step,
+                from_node_id=client_id,
+                status="error",
+                error=str(e),
+            )
 
     def _handle_chain_forward(self, client_id: str, msg: dict) -> None:
         """
@@ -5461,15 +5631,26 @@ class Scheduler:
         CHAIN_FORWARD 的消息结构与 LAYER_FORWARD 一致（均为 hidden_states + chain 信息），
         直接委托 _handle_layer_forward 处理（其内部根据 chain_next 决定下一步动作）。
         """
-        logger.info(f"🔗 收到链式转发: from={client_id}, task={msg.get('data', {}).get('task_id', '?')}")
+        data = msg.get("data", {})
+        task_id = data.get("task_id", "")
+        step = data.get("step", -1)
+        logger.info(f"🔗 收到链式转发: from={client_id}, task={task_id or '?'}")
+        self._send_chain_forward_ack(
+            task_id=task_id,
+            step=step,
+            from_node_id=client_id,
+            status="received",
+        )
         self._handle_layer_forward(client_id, msg)
 
     def _send_layer_result(self, client_id: str, task_id: str,
-                           result_data: dict = None, error: str = None) -> None:
+                           result_data: dict = None, error: str = None) -> bool:
         """从节点 → 主节点：发送层前向传播结果"""
         if not self._tcp_client or not self._tcp_client._running:
             logger.error("TCP 客户端未连接，无法发送层前向结果")
-            return
+            if error:
+                self._record_local_pipeline_participation(task_id, success=False)
+            return False
 
         from tcp_comm import MessageType
         import base64
@@ -5489,8 +5670,51 @@ class Scheduler:
 
         try:
             self._tcp_client.send_data(safe_payload, MessageType.LAYER_RESULT)
+            return True
         except Exception as e:
             logger.error(f"发送层前向结果失败: {e}")
+            self._record_local_pipeline_participation(task_id, success=False)
+            try:
+                self._tcp_client.disconnect()
+            except Exception:
+                pass
+            return False
+
+    def _send_chain_forward_ack(self, task_id: str, step: int,
+                                from_node_id: str = "",
+                                target_node_id: str = "",
+                                status: str = "received",
+                                error: str = "") -> bool:
+        """从节点 → 主节点：发送链式转发接收/错误 ACK。"""
+        if not task_id:
+            return False
+        if not self._tcp_client or not self._tcp_client._running:
+            logger.error("TCP 客户端未连接，无法发送链式转发 ACK")
+            return False
+
+        from tcp_comm import MessageType
+
+        payload = {
+            "task_id": task_id,
+            "step": step,
+            "node_id": NODE_ID,
+            "from_node_id": from_node_id,
+            "status": status,
+        }
+        if target_node_id:
+            payload["target_node_id"] = target_node_id
+        if error:
+            payload["error"] = error
+        try:
+            self._tcp_client.send_data(payload, MessageType.CHAIN_FORWARD_ACK)
+            return True
+        except Exception as e:
+            logger.error(f"发送链式转发 ACK 失败: {e}")
+            try:
+                self._tcp_client.disconnect()
+            except Exception:
+                pass
+            return False
 
     def _handle_layer_result(self, client_id: str, msg: dict) -> None:
         """
@@ -5521,6 +5745,18 @@ class Scheduler:
                 from tcp_comm import MessageType
                 self._send_to_worker(relay_target, relay_data,
                                      MessageType.CHAIN_FORWARD)
+                self._handle_chain_forward_ack(
+                    relay_target,
+                    {
+                        "data": {
+                            "task_id": task_id,
+                            "step": data.get("step", -1),
+                            "node_id": node_id,
+                            "target_node_id": relay_target,
+                            "status": "sent",
+                        }
+                    },
+                )
                 logger.info(f"✅ 中转成功: master → {relay_target}")
                 return  # 不存储结果，不唤醒 run_pipeline，链继续
             except Exception as e:
@@ -5529,16 +5765,12 @@ class Scheduler:
                     f"触发全模型回退"
                 )
                 # 中转失败 → 存储错误，唤醒 run_pipeline
-                key = f"{task_id}:{relay_target}"
-                with self._pipeline_lock:
-                    self._pipeline_results[key] = {
-                        "task_id": task_id,
-                        "node_id": relay_target,
-                        "error": f"主节点中转到 {relay_target} 失败: {e}",
-                        "step": data.get("step", -1),
-                    }
-                    if key in self._pipeline_events:
-                        self._pipeline_events[key].set()
+                self._set_pipeline_result_error(
+                    task_id,
+                    relay_target,
+                    f"主节点中转到 {relay_target} 失败: {e}",
+                    data.get("step", -1),
+                )
                 return
 
         logger.info(
@@ -5673,20 +5905,36 @@ class Scheduler:
                                    reason: str) -> None:
         """向所有流水线节点广播 PIPELINE_ABORT（清理各节点 + master 本地 KV cache）。"""
         from tcp_comm import MessageType
-        try:
-            for n in pipeline_nodes:
+        failed_nodes = []
+        for n in pipeline_nodes:
+            node_id = n.get("node_id")
+            if not node_id:
+                continue
+            try:
                 self._send_to_worker(
-                    n["node_id"],
+                    node_id,
                     {"task_id": task_id, "reason": reason},
                     MessageType.PIPELINE_ABORT,
                 )
-        except Exception as e:
-            logger.warning(f"广播 PIPELINE_ABORT 失败: {e}")
+            except Exception as e:
+                failed_nodes.append(f"{node_id}: {e}")
+                logger.warning(
+                    "PIPELINE_ABORT 发送失败: node=%s task=%s error=%s",
+                    node_id, task_id, e,
+                    exc_info=True,
+                )
+        if failed_nodes:
+            logger.warning(
+                "PIPELINE_ABORT 部分节点清理失败: task=%s failed=%s",
+                task_id, "; ".join(failed_nodes),
+            )
         # ★ 同时清理 master 自身 KV cache（master_participates 路径会产生本地缓存）
         if task_id:
             with self._kv_cache_lock:
                 if task_id in self._kv_cache:
                     del self._kv_cache[task_id]
+            with self._pipeline_lock:
+                self._chain_ack_state.pop(task_id, None)
 
     def _get_node_address(self, node_id: str) -> Optional[dict]:
         """
@@ -5764,7 +6012,10 @@ class Scheduler:
         self._tcp_server.send_to_client(worker_id, data, msg_type)
 
     def _wait_for_layer_result(self, task_id: str, node_ids,
-                               timeout: float = 30.0) -> Optional[dict]:
+                               timeout: float = 30.0,
+                               ack_node_ids: list = None,
+                               ack_step: int = None,
+                               ack_timeout: float = None) -> Optional[dict]:
         """
         主节点：等待指定节点的 LAYER_RESULT。
 
@@ -5780,18 +6031,35 @@ class Scheduler:
 
         keys = [f"{task_id}:{nid}" for nid in node_ids]
 
-        # 为每个可能的节点创建 event
+        # 先消费已经到达的结果，避免 worker 极快返回时发生
+        # "结果先写入、event 后创建" 的竞态。
         events = []
+        result = None
+        signaled_key = None
         with self._pipeline_lock:
             for key in keys:
-                event = threading.Event()
-                self._pipeline_events[key] = event
-                events.append((key, event))
+                data = self._pipeline_results.pop(key, None)
+                if data is not None:
+                    result = data
+                    signaled_key = key
+                    break
+            if result is None:
+                for key in keys:
+                    event = threading.Event()
+                    self._pipeline_events[key] = event
+                    events.append((key, event))
 
         # 等待任一 event 触发
         deadline = time.time() + timeout
-        signaled_key = None
-        while time.time() < deadline:
+        while result is None and time.time() < deadline:
+            if ack_node_ids and ack_step is not None and ack_timeout is not None:
+                ack_failure = self._get_chain_ack_failure(
+                    task_id, ack_step, ack_node_ids, ack_timeout,
+                )
+                if ack_failure is not None:
+                    result = ack_failure
+                    signaled_key = f"{task_id}:{ack_failure.get('node_id')}"
+                    break
             for key, event in events:
                 if event.is_set():
                     signaled_key = key
@@ -5805,19 +6073,18 @@ class Scheduler:
             for key, _ in events:
                 self._pipeline_events.pop(key, None)
 
-            # 查找第一个有结果或超时的 key
-            result = None
-            for key in keys:
-                data = self._pipeline_results.pop(key, None)
-                if data is not None:
-                    result = data
-                    break
-
-        if signaled_key is None:
-            logger.error(f"⏰ 等待流水线结果超时 ({timeout}s), task={task_id}")
-            return None
+            if result is None:
+                # 查找第一个有结果或超时的 key。即使 event 轮询刚好错过
+                # 最后一瞬间，也以实际结果为准。
+                for key in keys:
+                    data = self._pipeline_results.pop(key, None)
+                    if data is not None:
+                        result = data
+                        signaled_key = key
+                        break
 
         if result is None:
+            logger.error(f"⏰ 等待流水线结果超时 ({timeout}s), task={task_id}")
             return None
 
         # 解码 base64 → bytes（供调用方反序列化张量）
@@ -5831,6 +6098,30 @@ class Scheduler:
             else:
                 decoded[k] = v
         return decoded
+
+    def _wait_for_layer_result_with_ack(self, task_id: str, node_ids,
+                                        timeout: float,
+                                        ack_node_ids: list,
+                                        ack_step: int,
+                                        ack_timeout: float) -> Optional[dict]:
+        """等待流水线结果；兼容测试或旧扩展中替换掉的三参数等待函数。"""
+        try:
+            return self._wait_for_layer_result(
+                task_id,
+                node_ids,
+                timeout=timeout,
+                ack_node_ids=ack_node_ids,
+                ack_step=ack_step,
+                ack_timeout=ack_timeout,
+            )
+        except TypeError as e:
+            if "ack_node_ids" not in str(e):
+                raise
+            logger.debug(
+                "_wait_for_layer_result 不支持 ACK 参数，退回旧签名调用",
+                exc_info=True,
+            )
+            return self._wait_for_layer_result(task_id, node_ids, timeout)
 
     # ================================================================
     # 协同抢占辅助方法 (Phase 2)
@@ -6230,6 +6521,7 @@ class Scheduler:
                         )
                         self._preempted_task = None
                         self._preempting = False
+                        self._clear_pipeline_runtime_state(task_id)
                         return {"response": "", "error": f"抢占失败: {e}"}
                     finally:
                         self._preempting = False
@@ -6358,24 +6650,30 @@ class Scheduler:
 
             if step_error:
                 self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             # ---- 等待链上任一节点返回结果（末节点=成功，其他=错误）----
-            result = self._wait_for_layer_result(
+            result = self._wait_for_layer_result_with_ack(
                 task_id,
                 [n["node_id"] for n in pipeline_nodes],  # 任一节点都可能报错
-                timeout=30.0,
+                timeout=PIPELINE_STEP_TIMEOUT,
+                ack_node_ids=[n["node_id"] for n in pipeline_nodes[1:]] if has_chain else [],
+                ack_step=step,
+                ack_timeout=min(5.0, max(1.0, PIPELINE_STEP_TIMEOUT / 6)),
             )
             if result is None:
                 step_error = f"末节点 {last_node_id} 响应超时"
                 logger.error(step_error)
                 self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             if result.get("error"):
                 step_error = f"流水线错误: {result['error']}"
                 logger.error(step_error)
                 self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             # 提取 logits（链式模式下仅末节点返回 logits）
@@ -6394,15 +6692,8 @@ class Scheduler:
 
             if step_error:
                 # ★ 统一中止路径：广播 ABORT → 清理各节点 KV cache → 返回错误
-                try:
-                    for n in pipeline_nodes:
-                        self._send_to_worker(
-                            n["node_id"],
-                            {"task_id": task_id, "reason": step_error},
-                            MessageType.PIPELINE_ABORT,
-                        )
-                except Exception:
-                    pass
+                self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             # ---- Step 4: 从 logits 采样下一个 token ----
@@ -6525,6 +6816,7 @@ class Scheduler:
         if _stream_callback:
             _stream_callback({"done": True, **result})
 
+        self._clear_pipeline_runtime_state(task_id)
         return result
 
     def run_pipeline_stream(self, prompt: str, **kwargs):
@@ -6605,7 +6897,18 @@ class Scheduler:
                     _fallback_reason="queue_pipeline_nodes_not_ready",
                     **kwargs,
                 )
-            return self.run_pipeline(prompt, **kwargs)
+            result = self.run_pipeline(prompt, **kwargs)
+            if result.get("error"):
+                logger.warning(
+                    "队列任务流水线单步失败，回退到全模型推理: %s",
+                    result.get("error"),
+                )
+                return self._run_full_model_inference(
+                    prompt,
+                    _fallback_reason=f"queue_pipeline_error_result: {result.get('error')}",
+                    **kwargs,
+                )
+            return result
         except Exception as e:
             logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理", exc_info=True)
             # 锁可能在抢占异常路径中已被释放
@@ -6705,7 +7008,22 @@ class Scheduler:
                 task_id, timeout=kwargs.get('_queue_timeout', PIPELINE_TIMEOUT)
             )
             if result.get("status") == "done":
-                return result.get("result", {})
+                payload = result.get("result", {})
+                if isinstance(payload, dict) and payload.get("error"):
+                    self._inference_lock.acquire()
+                    try:
+                        logger.warning(
+                            "排队流水线任务返回错误，回退到全模型推理: %s",
+                            payload.get("error"),
+                        )
+                        return self._run_full_model_inference(
+                            prompt,
+                            _fallback_reason=f"queued_pipeline_error_result: {payload.get('error')}",
+                            **kwargs,
+                        )
+                    finally:
+                        self._inference_lock.release()
+                return payload
             elif result.get("status") == "timeout":
                 return {"response": "", "error": f"排队超时 ({PIPELINE_TIMEOUT}s)"}
             else:
@@ -6719,7 +7037,18 @@ class Scheduler:
             return {"response": "", "error": "推理引擎正忙，请稍后重试"}
         try:
             try:
-                return self.run_pipeline(prompt, **kwargs)
+                result = self.run_pipeline(prompt, **kwargs)
+                if result.get("error"):
+                    logger.warning(
+                        "流水线推理返回错误，回退到全层主节点模式: %s",
+                        result.get("error"),
+                    )
+                    return self._run_full_model_inference(
+                        prompt,
+                        _fallback_reason=f"pipeline_error_result: {result.get('error')}",
+                        **kwargs,
+                    )
+                return result
             except Exception as e:
                 logger.error(f"流水线推理失败: {e}，回退到全层主节点模式", exc_info=True)
                 return self._run_full_model_inference(

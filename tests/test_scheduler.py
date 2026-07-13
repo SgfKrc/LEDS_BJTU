@@ -1024,6 +1024,39 @@ class TestPipelineFallback:
         assert entered.is_set()
         assert result_holder["result"]["response"] == "fallback"
 
+    def test_run_pipeline_safe_fallbacks_when_pipeline_returns_error(self, sched, monkeypatch):
+        """流水线单步返回 error 时，当前请求应自动回退到全模型推理。"""
+        import api_server as _api
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched,
+            "run_pipeline",
+            lambda prompt="", **kw: {"response": "", "error": "worker step failed"},
+        )
+
+        fallback_calls = []
+
+        def fake_fallback(prompt, **kwargs):
+            fallback_calls.append(kwargs)
+            return {
+                "response": "fallback ok",
+                "metrics": {"fallback_reason": kwargs.get("_fallback_reason")},
+            }
+
+        monkeypatch.setattr(sched, "_run_full_model_inference", fake_fallback)
+
+        result = sched.run_pipeline_safe("test prompt")
+
+        assert result["response"] == "fallback ok"
+        assert fallback_calls
+        assert "worker step failed" in fallback_calls[0]["_fallback_reason"]
+
 
 # ================================================================
 # KV Cache 管理 测试 (Phase 3)
@@ -1361,6 +1394,31 @@ class TestPipelineQueueIntegration:
             sched._all_pipeline_nodes_ready = original_ready
             sched.run_pipeline = original_run
 
+    def test_process_queued_task_fallbacks_when_pipeline_returns_error(self, sched, monkeypatch):
+        """队列 worker 中流水线返回 error 时也应自动回退。"""
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched,
+            "run_pipeline",
+            lambda prompt="", **kw: {"response": "", "error": "queued worker failed"},
+        )
+
+        fallback_calls = []
+
+        def fake_fallback(prompt, **kwargs):
+            fallback_calls.append(kwargs)
+            return {"response": "queue fallback ok"}
+
+        monkeypatch.setattr(sched, "_run_full_model_inference", fake_fallback)
+
+        result = sched._process_queued_pipeline_task(
+            prompt="queued", max_new_tokens=16,
+        )
+
+        assert result["response"] == "queue fallback ok"
+        assert fallback_calls
+        assert "queued worker failed" in fallback_calls[0]["_fallback_reason"]
+
     def test_run_pipeline_safe_respects_queue_busy(self, sched):
         """
         当 pipeline_queue.is_busy=True 时，run_pipeline_safe 应将请求入队。
@@ -1487,6 +1545,29 @@ class TestChainTopology:
         finally:
             sched._send_to_worker = original
 
+    def test_broadcast_pipeline_abort_continues_after_send_failure(self, sched):
+        """单个节点 ABORT 失败不应阻断其他节点清理。"""
+        sent_to = []
+
+        def mock_send(worker_id, data, msg_type):
+            sent_to.append(worker_id)
+            if worker_id == "client1":
+                raise ConnectionError("client1 down")
+
+        original = sched._send_to_worker
+        sched._send_to_worker = mock_send
+
+        try:
+            pipeline_nodes = [
+                {"node_id": "client1"},
+                {"node_id": "client2"},
+                {"node_id": "client3"},
+            ]
+            sched._broadcast_pipeline_abort(pipeline_nodes, "task_x", "测试取消")
+            assert sent_to == ["client1", "client2", "client3"]
+        finally:
+            sched._send_to_worker = original
+
     def test_wait_for_layer_result_multi_nodes(self, sched):
         """_wait_for_layer_result 应在多个节点中有任一返回时立即唤醒"""
         import threading
@@ -1520,6 +1601,112 @@ class TestChainTopology:
         assert len(result_holder) == 1
         assert result_holder[0] is not None
         assert result_holder[0].get("node_id") == "client2"
+
+    def test_wait_for_layer_result_consumes_result_that_arrived_before_event(self, sched):
+        """结果先于 event 注册到达时不应等待到超时。"""
+        import time
+
+        with sched._pipeline_lock:
+            sched._pipeline_results["task_fast:client2"] = {
+                "task_id": "task_fast",
+                "node_id": "client2",
+            }
+
+        t0 = time.time()
+        result = sched._wait_for_layer_result(
+            "task_fast", ["client1", "client2"], timeout=5.0,
+        )
+        elapsed = time.time() - t0
+
+        assert result is not None
+        assert result["node_id"] == "client2"
+        assert elapsed < 0.5
+
+    def test_node_disconnect_wakes_pending_pipeline_waiter(self, sched):
+        """节点断连应立即唤醒等待该节点结果的流水线线程。"""
+        import threading
+        import time
+
+        result_holder = []
+
+        def waiter():
+            result_holder.append(
+                sched._wait_for_layer_result("task_down", "client2", timeout=5.0)
+            )
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.1)
+
+        t0 = time.time()
+        sched._fail_pending_pipeline_results_for_node("client2", "client2 down")
+        t.join(timeout=1.0)
+        elapsed = time.time() - t0
+
+        assert len(result_holder) == 1
+        assert result_holder[0]["node_id"] == "client2"
+        assert "client2 down" in result_holder[0]["error"]
+        assert elapsed < 0.5
+
+    def test_send_layer_result_returns_false_when_tcp_client_missing(self, sched):
+        """worker 无主节点连接时，结果发送应返回 False 而不是静默吞掉。"""
+        sched._tcp_client = None
+
+        assert sched._send_layer_result("master", "task_send", error="failed") is False
+
+    def test_send_layer_result_disconnects_on_send_failure(self, sched):
+        """结果回传 send_data 抛错时应返回 False 并断开连接促使主节点快速感知。"""
+        class FailingClient:
+            _running = True
+
+            def __init__(self):
+                self.disconnected = False
+
+            def send_data(self, data, msg_type):
+                raise OSError("broken pipe")
+
+            def disconnect(self):
+                self.disconnected = True
+                self._running = False
+
+        client = FailingClient()
+        sched._tcp_client = client
+
+        assert sched._send_layer_result("master", "task_send", error="failed") is False
+        assert client.disconnected is True
+
+    def test_chain_ack_timeout_returns_error_before_layer_timeout(self, sched):
+        """链式转发已发送但下游未 ACK 时，应在 ACK 窗口内快速失败。"""
+        import time
+
+        sched._handle_chain_forward_ack(
+            "client1",
+            {
+                "data": {
+                    "task_id": "task_ack",
+                    "step": 0,
+                    "node_id": "client1",
+                    "target_node_id": "client2",
+                    "status": "sent",
+                }
+            },
+        )
+
+        t0 = time.time()
+        result = sched._wait_for_layer_result(
+            "task_ack",
+            ["client1", "client2"],
+            timeout=5.0,
+            ack_node_ids=["client2"],
+            ack_step=0,
+            ack_timeout=0.2,
+        )
+        elapsed = time.time() - t0
+
+        assert result is not None
+        assert result["node_id"] == "client2"
+        assert "未收到接收 ACK" in result["error"]
+        assert elapsed < 1.0
 
     def test_wait_for_layer_result_timeout_multi_nodes(self, sched):
         """多节点等待超时应返回 None"""
@@ -1559,28 +1746,89 @@ class TestChainTopology:
         finally:
             sched._handle_chain_forward = original
 
+    def test_chain_forward_ack_routing(self, sched):
+        """CHAIN_FORWARD_ACK 消息应路由并记录 ACK 状态。"""
+        msg = {
+            "type": "chain_forward_ack",
+            "data": {
+                "task_id": "task_ack_route",
+                "step": 1,
+                "node_id": "client2",
+                "status": "received",
+            },
+        }
+
+        sched._on_tcp_message("client2", msg)
+
+        assert sched._chain_ack_state["task_ack_route"][1]["client2"]["status"] == "received"
+
+    def test_chain_ack_received_is_not_overwritten_by_late_sent(self, sched):
+        """下游 received ACK 先到时，后到的 sent 回报不应覆盖已确认状态。"""
+        sched._handle_chain_forward_ack(
+            "client2",
+            {
+                "data": {
+                    "task_id": "task_ack_order",
+                    "step": 0,
+                    "node_id": "client2",
+                    "status": "received",
+                }
+            },
+        )
+        sched._handle_chain_forward_ack(
+            "client1",
+            {
+                "data": {
+                    "task_id": "task_ack_order",
+                    "step": 0,
+                    "node_id": "client1",
+                    "target_node_id": "client2",
+                    "status": "sent",
+                }
+            },
+        )
+
+        state = sched._chain_ack_state["task_ack_order"][0]["client2"]
+        assert state["status"] == "received"
+
     def test_chain_forward_delegates_to_layer_forward(self, sched):
         """_handle_chain_forward 应委托给 _handle_layer_forward"""
         called_with = []
+        ack_calls = []
 
         def mock_handler(cid, msg):
             called_with.append(cid)
 
         original = sched._handle_layer_forward
+        original_ack = sched._send_chain_forward_ack
         sched._handle_layer_forward = mock_handler
+        sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
 
         try:
-            msg = {"type": "chain_forward", "data": {"task_id": "t1"}}
+            msg = {"type": "chain_forward", "data": {"task_id": "t1", "step": 2}}
             sched._handle_chain_forward("client2", msg)
             assert len(called_with) == 1
             assert called_with[0] == "client2"
+            assert ack_calls
+            assert ack_calls[0]["task_id"] == "t1"
+            assert ack_calls[0]["status"] == "received"
         finally:
             sched._handle_layer_forward = original
+            sched._send_chain_forward_ack = original_ack
 
-    def test_layer_forward_with_chain_next_forwards(self, sched):
-        """_handle_layer_forward 有 chain_next 时应调用 _send_chain_forward"""
-        # 注意: 此测试仅验证链式转发分支，不实际执行模型推理
+    def test_layer_forward_with_chain_next_forwards_and_sends_ack(self, sched, monkeypatch):
+        """_handle_layer_forward 有 chain_next 时应直连转发并发送 sent ACK。"""
+        import api_server as _api
+        import torch
+
         forward_calls = []
+        ack_calls = []
+
+        class MockModelManager:
+            is_loaded = True
+
+            def forward_layers(self, **kwargs):
+                return {"hidden_states": torch.ones(1, 2, 4)}
 
         def mock_forward(target_id, data):
             forward_calls.append((target_id, data))
@@ -1591,17 +1839,68 @@ class TestChainTopology:
 
         original_fwd = sched._send_chain_forward
         original_send = sched._send_layer_result
+        original_ack = sched._send_chain_forward_ack
         sched._send_chain_forward = mock_forward
         sched._send_layer_result = mock_send_result
+        sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_record_local_pipeline_participation", lambda *a, **kw: True)
 
         try:
-            # 构造带 chain_next 的 LAYER_FORWARD（模拟首节点场景）
-            # 实际调用会因没有 model_manager 而抛异常，此处仅验证不崩溃
-            # 完整集成测试需要真实模型环境
-            pass  # _handle_layer_forward 需要 model_manager，留待集成测试
+            msg = {
+                "data": {
+                    "task_id": "task_forward",
+                    "step": 3,
+                    "input_ids": [[1, 2]],
+                    "use_kv_cache": False,
+                    "chain_next": {"node_id": "client2"},
+                    "chain_remaining": [],
+                }
+            }
+            sched._handle_layer_forward("master", msg)
+
+            assert len(forward_calls) == 1
+            assert forward_calls[0][0] == "client2"
+            assert ack_calls
+            assert ack_calls[0]["task_id"] == "task_forward"
+            assert ack_calls[0]["step"] == 3
+            assert ack_calls[0]["target_node_id"] == "client2"
+            assert ack_calls[0]["status"] == "sent"
         finally:
             sched._send_chain_forward = original_fwd
             sched._send_layer_result = original_send
+            sched._send_chain_forward_ack = original_ack
+
+    def test_master_relay_records_chain_sent_ack(self, sched):
+        """L2 主节点中转成功后应记录发往目标节点的 sent ACK 状态。"""
+        sent = []
+
+        def mock_send(worker_id, data, msg_type):
+            sent.append((worker_id, data, msg_type))
+
+        original = sched._send_to_worker
+        sched._send_to_worker = mock_send
+
+        try:
+            sched._handle_layer_result(
+                "client1",
+                {
+                    "data": {
+                        "task_id": "task_relay",
+                        "step": 4,
+                        "node_id": "client1",
+                        "_relay_to": "client2",
+                        "hidden_states": "dGVzdA==",
+                    }
+                },
+            )
+
+            assert sent and sent[0][0] == "client2"
+            state = sched._chain_ack_state["task_relay"][4]["client2"]
+            assert state["status"] == "sent"
+            assert state["reporter_node_id"] == "client1"
+        finally:
+            sched._send_to_worker = original
 
     def test_chain_info_built_in_run_pipeline(self, sched):
         """run_pipeline 应构建链式拓扑信息"""

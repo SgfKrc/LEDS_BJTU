@@ -176,6 +176,7 @@ class MessageType(str, Enum):
     LAYER_FORWARD = "layer_forward"              # 主→从：执行层前向传播
     LAYER_RESULT = "layer_result"                # 从→主：层前向传播结果
     CHAIN_FORWARD = "chain_forward"              # 从→从：链式直连层前向转发（P2 优化）
+    CHAIN_FORWARD_ACK = "chain_forward_ack"      # 从→主：链式转发每跳接收/错误确认
     PIPELINE_DONE = "pipeline_done"              # 主→从：流水线任务完成（清理 KV 缓存）
     PIPELINE_ABORT = "pipeline_abort"            # 主→从：取消流水线任务
     PIPELINE_PAUSE = "pipeline_pause"            # 主→从：暂停流水线（二期协同抢占，协议预留）
