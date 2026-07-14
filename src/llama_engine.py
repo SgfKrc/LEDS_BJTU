@@ -230,6 +230,73 @@ class LlamaCppEngine:
             raise RuntimeError("模型未加载，请先调用 load_model()")
 
         t0 = time.time()
+        cancel_event = kwargs.pop("_cancel_event", None)
+
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "content": "",
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "model": os.path.basename(self._model_path),
+                "finish_reason": "cancelled",
+                "tokens_per_second": 0,
+                "usage_estimated": True,
+            }
+
+        # llama-cpp-python's chat API has no stopping_criteria argument. For
+        # cooperative cancellation, consume its stream and close at a token
+        # boundary; the task coordinator then discards this partial output.
+        if cancel_event is not None:
+            stream = self._model.create_chat_completion(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=_merge_stop_sequences(stop),
+                stream=True,
+            )
+            content_parts: List[str] = []
+            finish_reason = "stop"
+            try:
+                for chunk in stream:
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        choice = choices[0]
+                        text = choice.get("delta", {}).get("content", "")
+                        if text:
+                            content_parts.append(text)
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                    if cancel_event.is_set():
+                        break
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+
+            content = "".join(content_parts)
+            elapsed = time.time() - t0
+            completion_tokens = len(
+                self._model.tokenize(
+                    content.encode("utf-8"), add_bos=False, special=True,
+                )
+            ) if content else 0
+            return {
+                "content": content,
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": completion_tokens,
+                },
+                "model": os.path.basename(self._model_path),
+                "finish_reason": "cancelled" if cancel_event.is_set() else finish_reason,
+                "tokens_per_second": round(
+                    completion_tokens / elapsed if elapsed > 0 else 0, 1,
+                ),
+                "usage_estimated": True,
+            }
 
         response = self._model.create_chat_completion(
             messages=messages,

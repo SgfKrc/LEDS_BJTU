@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { sendMessage, sendMessageStream, clearChat, fetchPresets, uploadFile, fetchConversations, deleteConversations, deleteTurn, deleteSession, createSession, activateSession } from '../api/client';
+import { sendMessage, sendMessageStream, cancelChatGeneration, cancelWorkflow, clearChat, fetchPresets, fetchWorkflow, uploadFile, fetchConversations, deleteTurn, deleteSession, createSession, activateSession } from '../api/client';
+import { normalizeTaskGraphWorkflow } from '../taskGraphStatus';
 
 const CHAT_HISTORY_KEY_PREFIX = 'qlh-chat-history-';
 
@@ -7,11 +8,12 @@ const CHAT_HISTORY_KEY_PREFIX = 'qlh-chat-history-';
 const DEBUG_CHAT = import.meta.env.DEV;
 const debugLog = (...args) => { if (DEBUG_CHAT) console.log(...args); };
 
-export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsTrigger, onOpenSettings, settings, sessionId, onCreateSession, onRenameSession }) {
+export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsTrigger, onOpenSettings, settings, taskGraphCapability, sessionId, onCreateSession, onRenameSession }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [lastMetrics, setLastMetrics] = useState(null);
+  const [taskGraphRun, setTaskGraphRun] = useState(null);
   const [presets, setPresets] = useState(null);
   const [uploadedFile, setUploadedFile] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -27,7 +29,42 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const currentSessionIdRef = useRef(sessionId);  // 跟踪当前活跃会话ID，跨渲染同步
   const abortControllerRef = useRef(null);       // SSE 流式请求取消控制器
   const streamTimerRef = useRef(null);           // P1-3: full 模式打字动画 timer，用于会话切换时清理
+  const activeWorkflowIdRef = useRef(null);       // 当前任务链 ID，用于通知后端协作取消
+  const activeGenerationIdRef = useRef(null);     // 所有聊天模式共享的后端取消 ID
+  const requestSequenceRef = useRef(0);           // 隔离切换会话前后的请求清理
   currentSessionIdRef.current = sessionId;
+
+  const cancelTaskGraphEventually = useCallback(async (workflowId, attempt = 0) => {
+    if (!workflowId) return null;
+    try {
+      return await cancelWorkflow(workflowId);
+    } catch (err) {
+      if (err.status === 404 && attempt < 4) {
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, 100 * (attempt + 1));
+        });
+        return cancelTaskGraphEventually(workflowId, attempt + 1);
+      }
+      throw err;
+    }
+  }, []);
+
+  const cancelActiveGeneration = useCallback(() => {
+    const workflowId = activeWorkflowIdRef.current;
+    const generationId = activeGenerationIdRef.current;
+    activeWorkflowIdRef.current = null;
+    activeGenerationIdRef.current = null;
+    const cancellations = [];
+    if (generationId) {
+      cancellations.push(cancelChatGeneration(generationId));
+    }
+    if (workflowId) {
+      cancellations.push(cancelTaskGraphEventually(workflowId));
+    }
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    return Promise.allSettled(cancellations);
+  }, [cancelTaskGraphEventually]);
 
   const scrollToBottom = () => {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' });
@@ -129,6 +166,57 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (settings?.executionMode !== 'task_graph') {
+      setTaskGraphRun(null);
+      return;
+    }
+    if (sending) return;
+    const latest = taskGraphCapability?.workflows?.[0];
+    if (latest) {
+      setTaskGraphRun((current) => current || normalizeTaskGraphWorkflow(latest));
+    }
+  }, [settings?.executionMode, sending, taskGraphCapability]);
+
+  useEffect(() => {
+    if (settings?.executionMode !== 'task_graph' || !sending) return undefined;
+    const workflowId = activeWorkflowIdRef.current;
+    if (!workflowId) return undefined;
+    let disposed = false;
+    let requestInFlight = false;
+    const pollController = new AbortController();
+
+    const poll = async () => {
+      if (disposed || requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const workflow = await fetchWorkflow(workflowId, {
+          signal: pollController.signal,
+        });
+        if (!disposed && activeWorkflowIdRef.current === workflowId) {
+          setTaskGraphRun(normalizeTaskGraphWorkflow(workflow));
+        }
+      } catch (err) {
+        if (!disposed && err.name !== 'AbortError' && err.status !== 404) {
+          debugLog('[ChatPanel] workflow status poll failed', {
+            workflowId,
+            error: err.message,
+          });
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+
+    poll();
+    const timer = window.setInterval(poll, 400);
+    return () => {
+      disposed = true;
+      pollController.abort();
+      window.clearInterval(timer);
+    };
+  }, [settings?.executionMode, sending]);
 
   // ---- 对话历史持久化: 加载（服务器优先，localStorage 降级） ----
   useEffect(() => {
@@ -251,11 +339,10 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         streamTimerRef.current = null;
       }
       if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
+        cancelActiveGeneration();
       }
     };
-  }, []);
+  }, [cancelActiveGeneration]);
 
   // ---- 会话切换时清空当前消息（由历史加载 effect 重新填充） ----
   useEffect(() => {
@@ -268,10 +355,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     });
     prevSessionIdRef.current = sessionId;
 
-    // P1-1修复: 取消进行中的 SSE/HTTP 请求，避免旧会话推理继续消耗服务器资源
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
+    const isAutoCreatedSession = Boolean(
+      sessionId && autoCreatedSessionId.current === sessionId
+    );
+    // 自动创建会话后请求已绑定新 ID，不应被这次 props 切换反向取消。
+    if (!isAutoCreatedSession) {
+      requestSequenceRef.current += 1;
+      cancelActiveGeneration();
     }
     // P1-3修复: 清除 full 模式打字动画 timer，防止 interval 泄漏
     if (streamTimerRef.current) {
@@ -279,7 +369,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       streamTimerRef.current = null;
     }
 
-    if (sessionId && autoCreatedSessionId.current === sessionId) {
+    if (isAutoCreatedSession) {
       // handleSend 刚自动创建此会话，消息已由 handleSend 添加，不清空
       debugLog('[ChatPanel] session-switch: SKIP clear (auto-created session match)', { sessionId });
       autoCreatedSessionId.current = null;
@@ -291,9 +381,10 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     setMessages([]);
     setSending(false);  // P2-2修复: 重置发送状态，解锁新会话的发送按钮
     setLastMetrics(null);
+    setTaskGraphRun(null);
     setUploadedFile(null);
     setExpandedThinking(new Set());
-  }, [sessionId]);
+  }, [sessionId, cancelActiveGeneration]);
 
   // Fetch preset questions when model changes or chat is cleared
   useEffect(() => {
@@ -342,6 +433,14 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     // 清空操作进行中时禁止发送，避免状态竞态
     if (clearingRef.current) {
       onToast?.({ type: 'info', msg: '正在清空对话历史，请稍候...' });
+      return;
+    }
+
+    if (settings?.executionMode === 'task_graph' && !taskGraphCapability?.available) {
+      onToast?.({
+        type: 'error',
+        msg: '任务链实验当前不可用，请切换执行模式或检查主节点配置',
+      });
       return;
     }
 
@@ -417,6 +516,25 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     }
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
+    const requestSequence = ++requestSequenceRef.current;
+    const executionMode = settings?.executionMode === 'task_graph'
+      ? 'task_graph'
+      : 'auto';
+    const uniqueId = globalThis.crypto?.randomUUID?.()
+      || `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const generationId = `gen_${uniqueId}`;
+    const workflowId = executionMode === 'task_graph'
+      ? `wf_${uniqueId}`
+      : null;
+    activeGenerationIdRef.current = generationId;
+    activeWorkflowIdRef.current = workflowId;
+    if (workflowId) {
+      setTaskGraphRun(normalizeTaskGraphWorkflow({
+        workflow_id: workflowId,
+        state: 'pending_registration',
+        journal: taskGraphCapability?.journal,
+      }));
+    }
 
     let msgId = Date.now() + 1;
     try {
@@ -425,9 +543,12 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         currentSessionId: currentSessionIdRef.current,
         textPreview: text.slice(0, 30),
         streamingMode: settings?.streamingMode || 'full',
+        executionMode,
+        workflowId,
+        generationId,
       });
 
-      const useFastStream = settings?.streamingMode === 'fast';
+      const useFastStream = settings?.streamingMode === 'fast' && executionMode !== 'task_graph';
       let res;
 
       if (useFastStream) {
@@ -449,6 +570,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,
           streamingMode: 'fast',
+          executionMode,
+          workflowId,
+          generationId,
           onToken: (_token, fullText) => {
             // 会话切换检测：丢弃已推送的 token
             if (currentSessionIdRef.current !== effectiveSessionId) return;
@@ -485,6 +609,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           temperature: settings?.temperature ?? 0.7,
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,
+          executionMode,
+          workflowId,
+          generationId,
         });
 
         // 推理期间用户可能切换了会话——丢弃结果，不污染新会话的消息列表
@@ -558,8 +685,45 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       setMessages((prev) => [...prev, errMsg]);
       onToast?.({ type: 'error', msg: `推理失败: ${err.message}` });
     } finally {
-      setSending(false);
-      inputRef.current?.focus();
+      if (
+        workflowId
+        && requestSequenceRef.current === requestSequence
+        && currentSessionIdRef.current === effectiveSessionId
+      ) {
+        const finalStatusController = new AbortController();
+        const finalStatusTimeout = window.setTimeout(
+          () => finalStatusController.abort(),
+          1500,
+        );
+        try {
+          const workflow = await fetchWorkflow(workflowId, {
+            signal: finalStatusController.signal,
+          });
+          setTaskGraphRun(normalizeTaskGraphWorkflow(workflow));
+        } catch (err) {
+          if (err.name !== 'AbortError' && err.status !== 404) {
+            debugLog('[ChatPanel] final workflow status fetch failed', {
+              workflowId,
+              error: err.message,
+            });
+          }
+        } finally {
+          window.clearTimeout(finalStatusTimeout);
+        }
+      }
+      if (activeWorkflowIdRef.current === workflowId) {
+        activeWorkflowIdRef.current = null;
+      }
+      if (activeGenerationIdRef.current === generationId) {
+        activeGenerationIdRef.current = null;
+      }
+      if (abortControllerRef.current === abortController) {
+        abortControllerRef.current = null;
+      }
+      if (requestSequenceRef.current === requestSequence) {
+        setSending(false);
+        inputRef.current?.focus();
+      }
     }
   };
   handleSendRef.current = handleSend;  // 每轮渲染同步，确保 handlePresetClick 始终拿到最新引用
@@ -568,10 +732,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     clearingRef.current = true;
     setClearing(true);
     try {
-      await clearChat();
-      // 同时清除服务器端（数据库）和本地保存的历史
+      await cancelActiveGeneration();
+      await clearChat(sessionId || 'default');
       if (sessionId) {
-        try { await deleteConversations(sessionId); } catch (_) {}
         try {
           const storageKey = CHAT_HISTORY_KEY_PREFIX + sessionId;
           localStorage.removeItem(storageKey);
@@ -605,17 +768,23 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     distributed_forward: '分布式转发',
     master_pipeline: '主节点 Pipeline',
     pipeline_fallback: '流水线回退',
+    task_graph: '任务链实验',
   };
   const formatMetrics = (m) => {
     if (!m) return '';
     const parts = [];
-    const engine = m.engine || m.execution_mode;
+    const engine = m.execution_mode === 'task_graph'
+      ? m.execution_mode
+      : (m.engine || m.execution_mode);
     if (engine) parts.push(MODE_LABELS[engine] || String(engine));
+    if (m.execution_mode === 'task_graph' && m.stage_count) {
+      parts.push(`${m.stage_count} Stage`);
+    }
     if (typeof m.distributed_used === 'boolean') {
       parts.push(m.distributed_used ? '分布式: 是' : '分布式: 否');
     }
     const tokens = m.generated_tokens ?? m.new_tokens ?? m.completion_tokens ?? m.tokens_generated;
-    if (tokens) parts.push(`${tokens} tokens`);
+    if (tokens) parts.push(`${tokens} tokens${m.usage_estimated ? '（估算）' : ''}`);
     const tps = m.tokens_per_second ?? m.tokens_per_sec;
     if (tps) parts.push(`${Number(tps).toFixed(1)} tok/s`);
     const elapsed = m.elapsed_seconds ?? (m.total_time_ms ? m.total_time_ms / 1000 : null);
@@ -653,6 +822,32 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           </button>
         </div>
       </div>
+
+      {settings?.executionMode === 'task_graph' && taskGraphRun && (
+        <div
+          className={`task-graph-run-status ${taskGraphRun.tone}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="task-graph-run-primary">
+            <span className="task-graph-run-dot" aria-hidden="true" />
+            <strong>{taskGraphRun.stateLabel}</strong>
+            <span className="task-graph-run-id">{taskGraphRun.workflowId}</span>
+          </div>
+          <div className="task-graph-run-facts">
+            {taskGraphRun.resultReady && <span>等待会话提交</span>}
+            {taskGraphRun.recovered && <span>{taskGraphRun.recoveryLabel}</span>}
+            {taskGraphRun.retryCount > 0 && <span>已重派 {taskGraphRun.retryCount} 次</span>}
+            {taskGraphRun.rejectionCount > 0 && (
+              <span>{taskGraphRun.rejectionLabel} {taskGraphRun.rejectionCount} 次</span>
+            )}
+            {taskGraphRun.providers.length > 0 && (
+              <span>Provider: {taskGraphRun.providers.join(', ')}</span>
+            )}
+            {!taskGraphRun.journalAvailable && <span>Journal 不可用</span>}
+          </div>
+        </div>
+      )}
 
       {/* Messages */}
       {(() => { debugLog('[ChatPanel] render decision:', { messagesLen: messages.length, historyLoading, sessionId, sending }); return null; })()}
@@ -882,10 +1077,11 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           />
           <button
             className="btn-primary"
-            onClick={handleSend}
-            disabled={!modelLoaded || sending || clearing || (!input.trim() && !uploadedFile)}
+            onClick={sending ? cancelActiveGeneration : handleSend}
+            disabled={clearing || (!sending && (!modelLoaded || (!input.trim() && !uploadedFile)))}
+            title={sending ? '停止当前生成' : '发送消息'}
           >
-            {clearing ? '清空中...' : sending ? '生成中...' : '发送'}
+            {clearing ? '清空中...' : sending ? '停止' : '发送'}
           </button>
         </div>
       </div>

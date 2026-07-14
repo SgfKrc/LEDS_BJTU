@@ -1,0 +1,170 @@
+{
+  "fixture_version": 1,
+  "protocol": "qlh.task_worker",
+  "messages": [
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "hello",
+      "message_id": "msg_hello0001",
+      "sent_at_ms": 1700000000000,
+      "payload": {
+        "node_id": "pc-worker-01",
+        "worker_kind": "pc_full_worker",
+        "min_version": 1,
+        "max_version": 1,
+        "capabilities": {
+          "stage_types": ["full_inference", "aggregate"],
+          "engines": ["pytorch", "llama_cpp"],
+          "models": [
+            {
+              "model_id": "qwen-1_8b",
+              "engine": "pytorch",
+              "format": "safetensors",
+              "revision": "rev1",
+              "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+          ],
+          "max_concurrency": 1
+        }
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "hello_ack",
+      "message_id": "msg_helloack1",
+      "sent_at_ms": 1700000000001,
+      "payload": {
+        "coordinator_node_id": "pc-master-01",
+        "accepted": true,
+        "selected_version": 1,
+        "reason_code": ""
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "stage_offer",
+      "message_id": "msg_offer0001",
+      "sent_at_ms": 1700000000010,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "request_id": "request-fixture-01",
+        "stage_id": "candidate_a",
+        "stage_type": "full_inference",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "lease_expires_at_ms": 1700000030010,
+        "provider_id": "pc_worker_01",
+        "root_input": {"message": "fixture question"},
+        "dependencies": {},
+        "input_sha256": "aba998d4efe9bbc618282e0c9d99bc6993dffed4996673d807ee781ca53f263e"
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "stage_accept",
+      "message_id": "msg_accept001",
+      "sent_at_ms": 1700000000011,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "stage_id": "candidate_a",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "provider_id": "pc_worker_01",
+        "accepted": true,
+        "reason_code": ""
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "lease_renew",
+      "message_id": "msg_renew0001",
+      "sent_at_ms": 1700000010000,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "stage_id": "candidate_a",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "lease_expires_at_ms": 1700000040000
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "stage_result",
+      "message_id": "msg_result001",
+      "sent_at_ms": 1700000020000,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "stage_id": "candidate_a",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "provider_id": "pc_worker_01",
+        "output": {"content": "fixture answer"},
+        "output_sha256": "1f47df6a3a48d9c80aad1a4a43ca797853a3b386171fce8927bdcbfbc6b1026c",
+        "metadata": {
+          "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+          "usage_estimated": false,
+          "tokens_per_second": 4.5,
+          "model": "qwen-1_8b"
+        }
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "stage_error",
+      "message_id": "msg_error0001",
+      "sent_at_ms": 1700000021000,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "stage_id": "candidate_a",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "provider_id": "pc_worker_01",
+        "error_code": "worker_disconnected",
+        "retryable": true
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "stage_cancel",
+      "message_id": "msg_cancel001",
+      "sent_at_ms": 1700000022000,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "stage_id": "candidate_a",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "reason_code": "user_cancelled"
+      }
+    },
+    {
+      "protocol": "qlh.task_worker",
+      "version": 1,
+      "message_type": "stage_cancelled",
+      "message_id": "msg_cancelack1",
+      "sent_at_ms": 1700000022001,
+      "payload": {
+        "workflow_id": "wf_fixture001",
+        "stage_id": "candidate_a",
+        "attempt_id": "att_fixture001",
+        "lease_id": "lease_fixture001",
+        "lease_epoch": 1,
+        "provider_id": "pc_worker_01",
+        "reason_code": "user_cancelled"
+      }
+    }
+  ]
+}

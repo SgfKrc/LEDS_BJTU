@@ -38,6 +38,7 @@ export default function SettingsModal({
   open, onClose, deviceRefreshKey, onToast, theme, onToggleTheme,
   themeMode = 'system', onThemeModeChange,
   settings, onSettingsChange, deviceTier, hasDedicatedGpu,
+  taskGraphCapability,
   onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
   // P3: 多模型实验支持
@@ -813,6 +814,7 @@ export default function SettingsModal({
               </div>
               <button
                 className={`setting-toggle-btn${settings.streamingMode === 'fast' ? ' on' : ''}`}
+                disabled={settings.executionMode === 'task_graph'}
                 onClick={() => onSettingsChange({
                   streamingMode: settings.streamingMode === 'fast' ? 'full' : 'fast',
                 })}
@@ -833,6 +835,37 @@ export default function SettingsModal({
                 ? '⚡ 快速模式已启用：对话不会保存到历史，刷新页面后丢失。如需完整功能（历史/追问/持久化），请切换到完整模式。'
                 : '✅ 完整模式已启用：所有功能正常工作，对话数据完整保存。'}
             </div>
+          </div>
+
+          {/* ======== 对话执行模式 ======== */}
+          <div className="sidebar-section">
+            <h3>🧩 执行模式</h3>
+            <div className="execution-mode-segment" role="group" aria-label="对话执行模式">
+              <button
+                type="button"
+                className={settings.executionMode !== 'task_graph' ? 'active' : ''}
+                onClick={() => onSettingsChange({ executionMode: 'auto' })}
+                title="使用当前标准聊天路由"
+              >
+                标准
+              </button>
+              <button
+                type="button"
+                className={settings.executionMode === 'task_graph' ? 'active' : ''}
+                disabled={!taskGraphCapability?.available}
+                onClick={() => onSettingsChange({ executionMode: 'task_graph', streamingMode: 'full' })}
+                title={taskGraphCapability?.available
+                  ? '使用双候选校验任务链（单机实验）'
+                  : '任务链实验未在当前节点启用'}
+              >
+                任务链实验
+              </button>
+            </div>
+            {!taskGraphCapability?.available && (
+              <div className="setting-disabled-hint" style={{ marginTop: 8 }}>
+                当前节点未启用任务链实验
+              </div>
+            )}
           </div>
 
           {/* ======== 分布式推理优化（所有节点可见） ======== */}

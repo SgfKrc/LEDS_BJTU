@@ -27,7 +27,8 @@ import threading
 import uuid
 from collections import Counter, deque
 from contextvars import ContextVar
-from typing import Optional
+from functools import wraps
+from typing import Any, Literal, Optional, cast
 
 import torch
 
@@ -39,15 +40,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
-from scheduler import Scheduler
+from scheduler import Scheduler as ClusterScheduler
+from task_graph import (
+    TaskGraphCoordinator,
+    TaskGraphError,
+    TaskGraphUnavailable,
+    WorkflowCancelled,
+    WorkflowExecutionError,
+    WorkflowNotFound,
+)
+from task_journal import SQLiteTaskJournal, TaskJournalError
+from task_provider import (
+    LocalFullModelProvider,
+    ProviderError,
+    ProviderExecutor,
+    StageRequest as ProviderStageRequest,
+)
+from task_worker_protocol import worker_protocol_status
 import model_config as mc
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
     DEVICE, PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN, RUN_MODE,
     NODE_ROLE, NODE_ID, MAX_NODES, SERVER_IP, SERVER_PORT, API_PORT,
+    TASK_GRAPH_ENABLED, TASK_GRAPH_MAX_RECORDS,
+    TASK_GRAPH_MAX_PARALLEL_STAGES, TASK_GRAPH_JOURNAL_PATH,
+    TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
 )
 
 # 数据库模块（可选，未安装 psycopg2 时使用内存降级）
@@ -87,6 +108,8 @@ class _LazyModelManager:
     """Delay importing model_module until the model manager is first used."""
 
     __slots__ = ("_instance", "_lock")
+    _instance: Any
+    _lock: Any
 
     def __init__(self):
         object.__setattr__(self, "_instance", None)
@@ -364,7 +387,129 @@ generation_config: dict = {
 }
 
 # 调度器（单机 / 分布式模式共用）
-scheduler: Scheduler = Scheduler()
+scheduler: ClusterScheduler = ClusterScheduler()
+
+
+def _create_task_graph_coordinator() -> TaskGraphCoordinator:
+    if not TASK_GRAPH_ENABLED:
+        return TaskGraphCoordinator(
+            max_records=TASK_GRAPH_MAX_RECORDS,
+            max_parallel_stages=TASK_GRAPH_MAX_PARALLEL_STAGES,
+        )
+    journal = None
+    try:
+        journal = SQLiteTaskJournal(TASK_GRAPH_JOURNAL_PATH)
+        coordinator = TaskGraphCoordinator(
+            max_records=TASK_GRAPH_MAX_RECORDS,
+            journal=journal,
+            max_parallel_stages=TASK_GRAPH_MAX_PARALLEL_STAGES,
+        )
+        recovery = coordinator.recover_persisted_workflows()
+        cleanup = coordinator.cleanup_journal(
+            max_age_days=TASK_GRAPH_RETENTION_DAYS,
+            max_records=TASK_GRAPH_RETENTION_MAX_RECORDS,
+        )
+        if recovery.get("recovered_workflows", 0):
+            logger.warning("任务图启动恢复完成: %s", recovery)
+        if cleanup.get("deleted_workflows", 0):
+            logger.info("任务图 journal 保留清理完成: %s", cleanup)
+        return coordinator
+    except (TaskJournalError, TaskGraphUnavailable) as exc:
+        if journal is not None:
+            try:
+                journal.close()
+            except Exception:
+                pass
+        coordinator = TaskGraphCoordinator(
+            max_records=TASK_GRAPH_MAX_RECORDS,
+            max_parallel_stages=TASK_GRAPH_MAX_PARALLEL_STAGES,
+            availability_error=f"task journal unavailable: {exc}",
+        )
+        logger.error(
+            "任务图 journal 初始化失败，任务图已禁用: %s",
+            exc,
+            exc_info=True,
+        )
+        return coordinator
+
+
+task_graph_coordinator = _create_task_graph_coordinator()
+_task_graph_execution_slot = threading.BoundedSemaphore(1)
+_full_chat_execution_lock = threading.RLock()
+_generation_registry_lock = threading.RLock()
+_generation_cancel_events: dict[str, threading.Event] = {}
+_generation_pending_cancellations: dict[str, float] = {}
+_GENERATION_ID_PATTERN = re.compile(r"^gen_[A-Za-z0-9_-]{8,96}$")
+_GENERATION_REGISTRY_LIMIT = 512
+
+
+class ChatGenerationCancelled(RuntimeError):
+    def __init__(self, generation_id: str):
+        self.generation_id = generation_id
+        super().__init__(f"generation {generation_id} cancelled")
+
+
+def _prune_pending_generations_locked() -> None:
+    cutoff = time.time() - 300.0
+    for generation_id, created_at in list(_generation_pending_cancellations.items()):
+        if created_at < cutoff:
+            _generation_pending_cancellations.pop(generation_id, None)
+
+
+def _register_generation(generation_id: Optional[str]) -> tuple[str, threading.Event]:
+    resolved_id = generation_id or f"gen_{uuid.uuid4().hex}"
+    if not _GENERATION_ID_PATTERN.fullmatch(resolved_id):
+        raise HTTPException(400, "generation_id 格式无效")
+    event = threading.Event()
+    with _generation_registry_lock:
+        _prune_pending_generations_locked()
+        if resolved_id in _generation_cancel_events:
+            raise HTTPException(409, f"generation_id 已在执行: {resolved_id}")
+        if _generation_pending_cancellations.pop(resolved_id, None) is not None:
+            event.set()
+        _generation_cancel_events[resolved_id] = event
+    return resolved_id, event
+
+
+def _unregister_generation(generation_id: str, event: threading.Event) -> None:
+    with _generation_registry_lock:
+        if _generation_cancel_events.get(generation_id) is event:
+            _generation_cancel_events.pop(generation_id, None)
+
+
+def _request_generation_cancel(generation_id: str) -> str:
+    if not _GENERATION_ID_PATTERN.fullmatch(generation_id):
+        raise HTTPException(400, "generation_id 格式无效")
+    with _generation_registry_lock:
+        event = _generation_cancel_events.get(generation_id)
+        if event is not None:
+            event.set()
+            return "cancel_requested"
+        _prune_pending_generations_locked()
+        if len(_generation_pending_cancellations) >= _GENERATION_REGISTRY_LIMIT:
+            oldest = min(
+                _generation_pending_cancellations,
+                key=lambda item: _generation_pending_cancellations[item],
+            )
+            _generation_pending_cancellations.pop(oldest, None)
+        _generation_pending_cancellations[generation_id] = time.time()
+        return "cancel_pending"
+
+
+def _raise_if_generation_cancelled(
+    cancel_event: Optional[threading.Event], generation_id: Optional[str],
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ChatGenerationCancelled(generation_id or "gen_unknown")
+
+
+def _serialized_conversation_mutation(func):
+    """Run synchronous conversation mutations under the full-chat lock."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with _full_chat_execution_lock:
+            return func(*args, **kwargs)
+    return wrapper
 
 
 def _refresh_pipeline_layer_config() -> None:
@@ -378,17 +523,20 @@ def _refresh_pipeline_layer_config() -> None:
         logger.warning(f"模型加载后刷新流水线层配置失败: {e}", exc_info=True)
 
 
-def _run_exclusive_model_change(change):
+def _run_exclusive_model_change(change, prepare=None):
     """Block inference, invalidate old worker ACKs, then refresh the new model."""
-    with scheduler._inference_lock:
-        with scheduler._layer_config_lock:
-            scheduler._layer_config_pushed.clear()
-            scheduler._layer_config_expected.clear()
-            scheduler._layer_config_acks.clear()
-        try:
-            return change()
-        finally:
-            _refresh_pipeline_layer_config()
+    with _full_chat_execution_lock:
+        if prepare is not None:
+            prepare()
+        with scheduler._inference_lock:
+            with scheduler._layer_config_lock:
+                scheduler._layer_config_pushed.clear()
+                scheduler._layer_config_expected.clear()
+                scheduler._layer_config_acks.clear()
+            try:
+                return change()
+            finally:
+                _refresh_pipeline_layer_config()
 
 
 # ============================================================
@@ -403,14 +551,15 @@ def _run_exclusive_model_change(change):
 
 async def _startup_device_detection():
     """Start core services immediately and detect slower hardware in background."""
-    global device_profile, scheduler, _device_profile_started
+    global device_profile, _device_profile_started
+    active_scheduler: ClusterScheduler = globals()["scheduler"]
 
     def _detect_device_profile() -> None:
         global device_profile
         try:
             profiler = get_profile()
             device_profile = profiler.to_dict()
-            scheduler.update_local_device_profile(device_profile)
+            active_scheduler.update_local_device_profile(device_profile)
             logger.info(
                 f"🚀 设备检测完成: tier={profiler.tier.value} "
                 f"score={profiler.score:.1f}/100 | "
@@ -436,7 +585,7 @@ async def _startup_device_detection():
 
     # 初始化调度器（单机模式下不启动 TCP 监听）
     try:
-        scheduler.start()
+        active_scheduler.start()
         logger.info(f"调度器已初始化: mode={RUN_MODE}")
     except Exception as e:
         logger.error(f"调度器初始化失败: {e}")
@@ -448,12 +597,12 @@ async def _startup_device_detection():
         logger.warning(f"日志保留线程启动失败: {e}")
 
     # 调度器启动时已经尝试过数据库；这里复用结果，避免重复阻塞初始化。
+    import scheduler as scheduler_module
     try:
-        import scheduler as _scheduler_module
-        db_module = _scheduler_module._get_db()
+        db_module = scheduler_module._get_db()
         if db_module is None:
             raise RuntimeError(
-                _scheduler_module.get_database_status().get("last_error")
+                scheduler_module.get_database_status().get("last_error")
                 or "数据库未配置或暂不可用"
             )
         # ★ 设置数据隔离参数：conversations/sessions 将按 node_id 过滤
@@ -461,21 +610,21 @@ async def _startup_device_detection():
         # ★ MAC 不匹配自动切换：若 start() 时检测到 MAC 不匹配且有真实主节点，
         #    后台线程 _auto_switch_to_client 会在 2s 后完成切换。
         #    此处等待最多 5s，确保切换完成后再设置 node_id。
-        if (getattr(scheduler, '_master_identity_reason', '') == 'mac_mismatch'
-                and getattr(scheduler, '_role_override', None) != 'client'):
+        if (getattr(active_scheduler, '_master_identity_reason', '') == 'mac_mismatch'
+                and getattr(active_scheduler, '_role_override', None) != 'client'):
             # 自动切换尚未完成（后台线程延迟 2s），等待切换
             logger.info("⏳ 等待 MAC 不匹配自动切换到从节点模式...")
             import time as _time
             for _ in range(10):  # 最多等 5 秒 (10 × 0.5s)
                 _time.sleep(0.5)
-                if getattr(scheduler, '_role_override', None) == 'client':
+                if getattr(active_scheduler, '_role_override', None) == 'client':
                     break
-        set_active_node_id(scheduler.get_effective_node_id())
-        logger.info(f"数据库已连接，活跃节点: {scheduler.get_effective_node_id()}")
+        set_active_node_id(active_scheduler.get_effective_node_id())
+        logger.info(f"数据库已连接，活跃节点: {active_scheduler.get_effective_node_id()}")
     except Exception as e:
         global _db_available
         _db_available = False
-        runtime = _scheduler_module.get_database_status()
+        runtime = scheduler_module.get_database_status()
         if runtime.get("configured", True):
             logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
         else:
@@ -483,7 +632,7 @@ async def _startup_device_detection():
 
     # P3: 启动邮件投票轮询器（仅 master 节点，IMAP 轮询不需要 CUDA）
     try:
-        if scheduler._effective_role() == "master":
+        if active_scheduler._effective_role() == "master":
             from email_notifier import start_mail_poller
             start_mail_poller(poll_interval=60)
             logger.info("📬 邮件投票轮询器已启动 (master)")
@@ -492,13 +641,13 @@ async def _startup_device_detection():
 
     # P3: 启动审查工单过期检查后台线程（仅 master，每 5 分钟）
     try:
-        if scheduler._effective_role() == "master":
+        if active_scheduler._effective_role() == "master":
             import threading as _th2
             def _review_expire_loop():
                 import time as _time
                 from review import ReviewManager
                 _time.sleep(120)  # 启动后等 2 分钟再开始（避免空跑）
-                while getattr(scheduler, '_running', True):
+                while getattr(active_scheduler, '_running', True):
                     try:
                         ReviewManager().resolve_expired()
                     except Exception:
@@ -517,9 +666,15 @@ async def _startup_device_detection():
 
 async def _shutdown_resources():
     """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
+    active_scheduler: ClusterScheduler = globals()["scheduler"]
+    try:
+        with _full_chat_execution_lock:
+            task_graph_coordinator.close()
+    except Exception as e:
+        logger.warning(f"任务图 journal 关闭异常: {e}")
     # 1. 停止调度器（关闭 TCP 连接，注销从节点）
     try:
-        scheduler.stop()
+        active_scheduler.stop()
         logger.info("调度器已停止")
     except Exception as e:
         logger.warning(f"调度器停止异常: {e}")
@@ -587,6 +742,22 @@ class ChatRequest(BaseModel):
     client_node_type: Optional[str] = Field(default=None, description="请求来源节点类型: pc | android")
     client_mode: Optional[str] = Field(default=None, description="请求来源模式: thin | full")
     client_app_variant: Optional[str] = Field(default=None, description="请求来源 App variant: full | lite")
+    execution_mode: Literal["auto", "task_graph"] = Field(
+        default="auto",
+        description="执行模式: auto=现有聊天路由 | task_graph=固定任务链实验",
+    )
+    task_graph_template: Literal["dual_candidate"] = Field(
+        default="dual_candidate",
+        description="任务链模板；首期仅支持双候选校验",
+    )
+    workflow_id: Optional[str] = Field(
+        default=None,
+        description="客户端预生成的 wf_ 工作流 ID，用于执行期间查询和取消",
+    )
+    generation_id: Optional[str] = Field(
+        default=None,
+        description="客户端预生成的 gen_ 执行 ID，用于所有聊天模式协作取消",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -1050,7 +1221,10 @@ def _is_question(text: str) -> bool:
     return True
 
 
-def _generate_followups(history: list[dict], tokenizer, model, device) -> list[str]:
+def _generate_followups(
+    history: list[dict], tokenizer, model, device,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[str]:
     """
     根据对话上下文，让模型生成 2-3 个追问建议。
 
@@ -1058,6 +1232,8 @@ def _generate_followups(history: list[dict], tokenizer, model, device) -> list[s
     使用 few-shot prompt + 问句质量验证 + 模板兜底，适配 1.8B 小模型。
     """
     if not history or len(history) < 2:
+        return []
+    if cancel_event is not None and cancel_event.is_set():
         return []
 
     # ---- Few-shot prompt：强调只输出疑问句，给出正确和错误示例 ----
@@ -1091,6 +1267,15 @@ def _generate_followups(history: list[dict], tokenizer, model, device) -> list[s
         attention_mask = inputs.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
+        stop_criteria_kwargs = (
+            {"cancel_event": cancel_event} if cancel_event is not None else {}
+        )
+        stop_criteria = model_manager._build_stop_criteria(
+            [], input_ids.shape[1], **stop_criteria_kwargs,
+        )
+        generation_kwargs = {}
+        if stop_criteria is not None:
+            generation_kwargs["stopping_criteria"] = stop_criteria
 
         with torch.no_grad():
             outputs = model.generate(
@@ -1102,7 +1287,11 @@ def _generate_followups(history: list[dict], tokenizer, model, device) -> list[s
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
+                **generation_kwargs,
             )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return []
 
         generated = outputs[0][input_ids.shape[1]:]
         text = tokenizer.decode(generated, skip_special_tokens=True).strip()
@@ -1160,7 +1349,9 @@ def _generate_followups(history: list[dict], tokenizer, model, device) -> list[s
     return questions[:3]
 
 
-def _generate_followups_llama(history: list[dict]) -> list[str]:
+def _generate_followups_llama(
+    history: list[dict], cancel_event: Optional[threading.Event] = None,
+) -> list[str]:
     """
     使用 llama.cpp 引擎生成追问建议。
 
@@ -1169,6 +1360,8 @@ def _generate_followups_llama(history: list[dict]) -> list[str]:
     失败时回退到关键词模板兜底。
     """
     if not history or len(history) < 2:
+        return []
+    if cancel_event is not None and cancel_event.is_set():
         return []
 
     # 简化版 prompt：直接要求输出问题，不需要 Q: 前缀格式
@@ -1189,7 +1382,10 @@ def _generate_followups_llama(history: list[dict]) -> list[str]:
             max_tokens=128,
             temperature=0.8,
             top_p=0.9,
+            _cancel_event=cancel_event,
         )
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         text = result.get("content", "").strip()
 
         # 解析：每行一个追问
@@ -1901,15 +2097,15 @@ async def load_model(req: LoadModelRequest):
         cfg.QUANT_TYPE = quant
         cfg.USE_COMPILE = req.use_compile
 
-        # 清空内存会话/KV/统计（新模型不能复用旧模型的上下文）
-        _reset_runtime_conversation_state(clear_histories=True)
-        # 同步清空数据库对话历史
-        if _db_available:
-            try:
-                import db as _db_mod
-                _db_mod.clear_conversation("default")
-            except Exception:
-                pass
+        def _prepare_model_load() -> None:
+            # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
+            _reset_runtime_conversation_state(clear_histories=True)
+            if _db_available:
+                try:
+                    import db as _db_mod
+                    _db_mod.clear_conversation("default")
+                except Exception:
+                    pass
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
@@ -1921,7 +2117,8 @@ async def load_model(req: LoadModelRequest):
                 engine=effective_engine if effective_engine != "auto" else None,
                 model_path=resolved_model_path,
                 db_experimental_models=_get_db_experimental_models(),
-            )
+            ),
+            prepare=_prepare_model_load,
         )
 
         if result["success"]:
@@ -1987,10 +2184,390 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("workers_used", [])
     result.setdefault("layer_assignments", [])
     result.setdefault("request_id", _request_id_ctx.get("-"))
+    result.setdefault("generation_id", req.generation_id or "")
     return result
 
 
-def _execute_chat_full(req: ChatRequest) -> dict:
+def _execute_task_graph_chat(
+    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+) -> dict:
+    """Run the fixed local task graph without claiming multi-device execution."""
+    global conversation_stats
+
+    if not TASK_GRAPH_ENABLED:
+        raise HTTPException(
+            409,
+            "任务链实验未启用。请设置 QLH_TASK_GRAPH_ENABLED=true 后重启。",
+        )
+    journal = task_graph_coordinator.journal_status()
+    if not journal.get("available", False):
+        raise HTTPException(
+            503,
+            {
+                "message": "任务链 journal 不可用，已拒绝不可恢复执行。",
+                "reason": journal.get("error", "journal health check failed"),
+            },
+        )
+    if scheduler._effective_role() != "master":
+        raise HTTPException(409, "任务链协调器当前只允许在主节点运行。")
+
+    if not _task_graph_execution_slot.acquire(blocking=False):
+        raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
+    try:
+        with _full_chat_execution_lock:
+            return _execute_task_graph_chat_with_slot(req, cancel_event)
+    finally:
+        _task_graph_execution_slot.release()
+
+
+def _dispatch_local_task_provider(
+    request: ProviderStageRequest,
+    cancel_event: threading.Event,
+) -> dict:
+    executor = request.root_input.get("_local_provider_executor")
+    if not callable(executor):
+        raise TaskGraphError("本地任务 Provider 缺少请求执行上下文")
+    result = cast(ProviderExecutor, executor)(request, cancel_event)
+    if not isinstance(result, dict):
+        raise TaskGraphError("本地任务 Provider 返回值必须是 dict")
+    return result
+
+
+def _ensure_local_task_provider() -> None:
+    if task_graph_coordinator.has_provider("local_full_model"):
+        return
+    try:
+        task_graph_coordinator.register_provider(LocalFullModelProvider(
+            _dispatch_local_task_provider,
+            provider_id="local_full_model",
+            node_id=scheduler.get_effective_node_id(),
+            max_concurrency=1,
+        ))
+    except ProviderError:
+        if not task_graph_coordinator.has_provider("local_full_model"):
+            raise
+
+
+def _execute_task_graph_chat_with_slot(
+    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+) -> dict:
+    """Execute one workflow while the process-wide task-graph slot is held."""
+
+    target_session_id = req.session_id or active_session_id
+    if target_session_id and target_session_id != active_session_id:
+        _switch_session(target_session_id)
+    history = _get_active_history()
+    if target_session_id and len(history) == 0:
+        _auto_title_session(target_session_id, req.message)
+
+    base_messages = list(history) + [{"role": "user", "content": req.message}]
+    candidate_budget = max(1, min(req.max_new_tokens, 512))
+    final_budget = max(1, min(req.max_new_tokens, 1024))
+
+    candidate_instructions = {
+        "candidate_a": (
+            "独立分析用户问题，给出准确、可验证且简洁的候选答案。"
+            "不要提及其他候选或任务链。"
+        ),
+        "candidate_b": (
+            "从不同角度独立解决用户问题，重点检查遗漏、反例和不确定性。"
+            "输出可直接供后续汇总的候选答案。"
+        ),
+    }
+
+    def _run_model(messages: list[dict], max_tokens: int,
+                   cancel_event: threading.Event) -> dict:
+        if cancel_event.is_set():
+            return {
+                "content": "",
+                "usage": {},
+                "tokens_per_second": 0,
+                "model": model_manager.active_model_id,
+            }
+        kwargs = {"_cancel_event": cancel_event}
+        result = model_manager.chat(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            **kwargs,
+        )
+        raw_content = str(result.get("content", "") or "").strip()
+        thinking_content = None
+        if req.show_thinking:
+            content, thinking_content = _format_model_response(
+                raw_content, show_thinking=True,
+            )
+        else:
+            content = _strip_native_thinking_tags(raw_content)
+        if cancel_event.is_set():
+            return {
+                "content": content,
+                "thinking_content": thinking_content,
+                "usage": dict(result.get("usage", {}) or {}),
+                "tokens_per_second": result.get("tokens_per_second", 0),
+                "model": result.get("model", model_manager.active_model_id),
+                "usage_estimated": bool(result.get("usage_estimated", False)),
+            }
+        if not content:
+            raise TaskGraphError("本地模型返回空结果")
+        return {
+            "content": content,
+            "thinking_content": thinking_content,
+            "usage": dict(result.get("usage", {}) or {}),
+            "tokens_per_second": result.get("tokens_per_second", 0),
+            "model": result.get("model", model_manager.active_model_id),
+            "usage_estimated": bool(result.get("usage_estimated", False)),
+        }
+
+    def _execute_provider_stage(
+        stage_request: ProviderStageRequest,
+        provider_cancel_event: threading.Event,
+    ) -> dict:
+        if stage_request.stage_type == "full_inference":
+            instruction = candidate_instructions[stage_request.stage_id]
+            if req.show_thinking:
+                instruction = f"{instruction}\n\n{THINKING_SYSTEM_PROMPT}"
+            messages = [
+                {"role": "system", "content": instruction},
+                *stage_request.root_input["messages"],
+            ]
+            output = _run_model(
+                messages,
+                candidate_budget,
+                provider_cancel_event,
+            )
+        elif stage_request.stage_type == "aggregate":
+            candidate_payload = {
+                stage_id: value.get("content", "")
+                for stage_id, value in stage_request.dependencies.items()
+            }
+            aggregation_prompt = (
+                "请根据原始问题和两个独立候选，输出一个最终答案。"
+                "纠正冲突和明显错误；没有证据时明确不确定性。"
+                "只输出最终答案，不描述内部任务链。\n\n"
+                f"原始问题：{stage_request.root_input['message']}\n\n"
+                "候选：\n"
+                + json.dumps(candidate_payload, ensure_ascii=False)
+            )
+            output = _run_model(
+                ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
+                 if req.show_thinking else [])
+                + [{"role": "user", "content": aggregation_prompt}],
+                final_budget,
+                provider_cancel_event,
+            )
+        else:
+            raise TaskGraphError(
+                f"不支持的 Stage 类型: {stage_request.stage_type}"
+            )
+        return output
+
+    try:
+        _ensure_local_task_provider()
+    except ProviderError as exc:
+        raise HTTPException(
+            503,
+            {
+                "message": "本地任务 Provider 注册失败。",
+                "reason": f"{exc.code}: {exc}",
+            },
+        ) from exc
+
+    request_id = str(_request_id_ctx.get("-") or "-")
+    try:
+        final_output, workflow = task_graph_coordinator.run_template(
+            template=req.task_graph_template,
+            root_input={
+                "message": req.message,
+                "messages": base_messages,
+                "_local_provider_executor": _execute_provider_stage,
+            },
+            request_id=request_id,
+            workflow_id=req.workflow_id,
+            cancel_event=cancel_event,
+        )
+    except WorkflowCancelled as exc:
+        raise HTTPException(
+            409,
+            {"message": "任务链已取消", "workflow_id": exc.workflow_id},
+        ) from exc
+    except WorkflowExecutionError as exc:
+        raise HTTPException(
+            500,
+            {
+                "message": str(exc),
+                "workflow_id": exc.workflow_id,
+                "stage_id": exc.stage_id,
+            },
+        ) from exc
+    except TaskGraphUnavailable as exc:
+        raise HTTPException(
+            503,
+            {
+                "message": "任务链 journal 写入失败，执行已停止。",
+                "reason": str(exc),
+            },
+        ) from exc
+    except TaskGraphError as exc:
+        raise HTTPException(400, f"任务链请求无效: {exc}") from exc
+
+    response_text = str(final_output.get("content", "") or "").strip()
+    thinking_content = final_output.get("thinking_content")
+    if not response_text:
+        raise HTTPException(500, "任务链最终聚合结果为空。")
+
+    history_start = len(history)
+    try:
+        with _generation_registry_lock:
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            history.extend([
+                {"role": "user", "content": req.message},
+                {"role": "assistant", "content": response_text},
+            ])
+            if cancel_event is not None and cancel_event.is_set():
+                del history[history_start:]
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            try:
+                workflow = task_graph_coordinator.commit_result(
+                    workflow["workflow_id"],
+                )
+            except WorkflowCancelled as exc:
+                del history[history_start:]
+                raise ChatGenerationCancelled(
+                    req.generation_id or "gen_unknown",
+                ) from exc
+            except TaskGraphUnavailable:
+                del history[history_start:]
+                raise
+    except ChatGenerationCancelled:
+        try:
+            task_graph_coordinator.discard_result(workflow["workflow_id"])
+        except TaskGraphUnavailable as exc:
+            raise HTTPException(
+                503,
+                {
+                    "message": "任务链取消无法写入 journal。",
+                    "reason": str(exc),
+                },
+            ) from exc
+        raise
+    except TaskGraphUnavailable as exc:
+        raise HTTPException(
+            503,
+            {
+                "message": "任务链 journal 写入失败，结果未提交。",
+                "reason": str(exc),
+            },
+        ) from exc
+
+    attempts = [
+        attempt
+        for stage in workflow.get("stages", [])
+        for attempt in stage.get("attempts", [])
+        if attempt.get("state") == "completed"
+    ]
+    usages = [
+        dict(attempt.get("result_metadata", {}).get("usage", {}) or {})
+        for attempt in attempts
+    ]
+    prompt_tokens = sum(int(usage.get("prompt_tokens", 0) or 0) for usage in usages)
+    completion_tokens = sum(
+        int(usage.get("completion_tokens", 0) or 0) for usage in usages
+    )
+    providers = sorted({
+        str(attempt.get("provider", "") or "")
+        for attempt in attempts
+        if attempt.get("provider")
+    })
+    serving_node_id = scheduler.get_effective_node_id()
+    participating_nodes = sorted({
+        str(attempt.get("provider_node_id", "") or serving_node_id)
+        for attempt in attempts
+    }) or [serving_node_id]
+    metrics = _augment_chat_metrics(
+        {
+            "engine": model_manager._engine_type,
+            "execution_mode": "task_graph",
+            "provider": (
+                providers[0] if len(providers) == 1 else "task_graph"
+            ),
+            "orchestrator": "task_graph",
+            "subproviders": providers,
+            "workflow_id": workflow["workflow_id"],
+            "workflow_template": workflow["template"],
+            "workflow_state": workflow["state"],
+            "stage_count": workflow["stage_count"],
+            "stage_attempt_count": workflow["attempt_count"],
+            "nodes_planned": len(participating_nodes),
+            "nodes_participated": len(participating_nodes),
+            "participating_nodes": participating_nodes,
+            "distributed_used": False,
+            "distributed_kind": "task_graph_local_poc",
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "usage_estimated": any(
+                bool(attempt.get("result_metadata", {}).get(
+                    "usage_estimated", False,
+                ))
+                for attempt in attempts
+            ),
+            "elapsed_seconds": workflow["duration_seconds"],
+            "fallback": False,
+            "fallback_reason": "",
+        },
+        req,
+        route=f"{_chat_origin(req)}_to_local_task_graph",
+    )
+    followups = _fallback_followups(history, [])
+    save_metrics = dict(metrics)
+    save_metrics["followups"] = followups
+
+    db_session_id = target_session_id or "default"
+    if _db_available:
+        try:
+            import db as _db_mod
+            if _db_mod.get_save_history():
+                _db_mod.save_message(db_session_id, "user", req.message)
+                _db_mod.save_message(
+                    db_session_id, "assistant", response_text, save_metrics,
+                )
+                _db_mod.increment_session_message_count(db_session_id)
+        except Exception:
+            pass
+    if not _db_available:
+        try:
+            _local_store.save_local_message(
+                db_session_id, "user", req.message,
+            )
+            _local_store.save_local_message(
+                db_session_id, "assistant", response_text, save_metrics,
+            )
+            _local_store.increment_local_session_message_count(db_session_id)
+        except Exception:
+            pass
+
+    conversation_stats["total_prompt_tokens"] += prompt_tokens
+    conversation_stats["total_generated_tokens"] += completion_tokens
+    conversation_stats["total_time_seconds"] += workflow["duration_seconds"]
+    conversation_stats["rounds"] += 1
+    try:
+        scheduler.record_task_complete(success=True)
+    except Exception:
+        pass
+
+    return {
+        "content": response_text,
+        "thinking_content": thinking_content,
+        "metrics": metrics,
+        "followups": followups,
+    }
+
+
+def _execute_chat_full(
+    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+) -> dict:
     """
     执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
 
@@ -2005,6 +2582,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
         HTTPException: 模型未加载、OOM、推理失败
     """
     global kv_cache, conversation_stats
+    _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
     # ---- 多会话支持 ----
     target_session_id = req.session_id or active_session_id
@@ -2030,7 +2608,9 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 request_id=_request_id_ctx.get("-"),   # L5: 链路追踪
+                _cancel_event=cancel_event,
             )
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if result.get("status") == "ok":
                 history.append({"role": "user", "content": req.message})
                 response_text = result.get("content", "")
@@ -2087,7 +2667,10 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 logger.warning("分布式推理转发超时，回退到本地推理")
             else:
                 logger.warning(f"分布式推理转发失败: {result.get('error', 'unknown')}，回退到本地推理")
+        except ChatGenerationCancelled:
+            raise
         except Exception as e:
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
             logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
 
     # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
@@ -2104,7 +2687,9 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 show_thinking=req.show_thinking,
+                _cancel_event=cancel_event,
             )
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
                 logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
             else:
@@ -2164,24 +2749,35 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                         "metrics": pipeline_metrics,
                         "followups": followups,
                     }
+        except ChatGenerationCancelled:
+            raise
         except Exception as e:
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
             logger.warning(f"流水线推理异常: {e}，回退到本地推理")
 
     # ---- llama.cpp 引擎路径（CPU/集显，GGUF）----
     if model_manager._engine_type == "llama_cpp":
         try:
-            history.append({"role": "user", "content": req.message})
+            request_history = [
+                *history,
+                {"role": "user", "content": req.message},
+            ]
             result = model_manager.chat(
-                messages=list(history),
+                messages=request_history,
                 max_tokens=req.max_new_tokens,
                 temperature=req.temperature,
                 top_p=req.top_p,
+                _cancel_event=cancel_event,
             )
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
             response_text = result.get("content", "")
             # P3修复: llama.cpp 路径同样需要剥离本地思考标记
             if not req.show_thinking:
                 response_text = _strip_native_thinking_tags(response_text)
-            history.append({"role": "assistant", "content": response_text})
+            completed_history = [
+                *request_history,
+                {"role": "assistant", "content": response_text},
+            ]
             tokens_per_sec = result.get("tokens_per_second", 0)
             usage = result.get("usage", {})
             completion_tokens = usage.get("completion_tokens", 0)
@@ -2206,7 +2802,14 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             )
 
             db_session_id = target_session_id or "default"
-            followups = _generate_followups_llama(history)
+            followups = _generate_followups_llama(
+                completed_history, cancel_event,
+            )
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            history.extend([
+                {"role": "user", "content": req.message},
+                {"role": "assistant", "content": response_text},
+            ])
 
             if _db_available:
                 try:
@@ -2244,7 +2847,10 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 "metrics": metrics,
                 "followups": followups,
             }
+        except ChatGenerationCancelled:
+            raise
         except Exception as e:
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
             try:
                 scheduler.record_task_error()
             except Exception:
@@ -2264,14 +2870,17 @@ def _execute_chat_full(req: ChatRequest) -> dict:
         generation_config["temperature"] = req.temperature
         generation_config["top_p"] = req.top_p
 
-        history.append({"role": "user", "content": req.message})
+        request_history = [
+            *history,
+            {"role": "user", "content": req.message},
+        ]
 
         tokenizer = model_manager.tokenizer
         thinking_prompt = THINKING_SYSTEM_PROMPT if req.show_thinking else None
         thinking_prefill = "【思考】\n" if req.show_thinking else None
         prompt = _build_model_chat_prompt(
             tokenizer,
-            history,
+            request_history,
             system_prompt=thinking_prompt,
             assistant_prefill=thinking_prefill,
         )
@@ -2286,7 +2895,12 @@ def _execute_chat_full(req: ChatRequest) -> dict:
         eos_token_ids = model_manager._get_generation_eos_token_ids(stop_sequences)
         if eos_token_ids is not None:
             generation_kwargs["eos_token_id"] = eos_token_ids
-        stop_criteria = model_manager._build_stop_criteria(stop_sequences, prompt_len)
+        stop_criteria_kwargs = (
+            {"cancel_event": cancel_event} if cancel_event is not None else {}
+        )
+        stop_criteria = model_manager._build_stop_criteria(
+            stop_sequences, prompt_len, **stop_criteria_kwargs,
+        )
         if stop_criteria is not None:
             generation_kwargs["stopping_criteria"] = stop_criteria
 
@@ -2302,6 +2916,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 pad_token_id=tokenizer.eos_token_id,
                 **generation_kwargs,
             )
+        _raise_if_generation_cancelled(cancel_event, req.generation_id)
         elapsed = time.time() - t0
 
         generated_ids = outputs[0][prompt_len:]
@@ -2317,7 +2932,10 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             native_thinking_prompt=native_thinking_prompt,
         )
 
-        history.append({"role": "assistant", "content": response_text})
+        completed_history = [
+            *request_history,
+            {"role": "assistant", "content": response_text},
+        ]
 
         new_tokens = len(generated_ids)
         tokens_per_sec = new_tokens / elapsed if elapsed > 0 else 0
@@ -2342,8 +2960,17 @@ def _execute_chat_full(req: ChatRequest) -> dict:
         db_session_id = target_session_id or "default"
 
         followups = _generate_followups(
-            history, tokenizer, model_manager.model, model_manager.get_device()
+            completed_history,
+            tokenizer,
+            model_manager.model,
+            model_manager.get_device(),
+            cancel_event,
         )
+        _raise_if_generation_cancelled(cancel_event, req.generation_id)
+        history.extend([
+            {"role": "user", "content": req.message},
+            {"role": "assistant", "content": response_text},
+        ])
 
         if _db_available:
             try:
@@ -2386,6 +3013,8 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             "followups": followups,
         }
 
+    except ChatGenerationCancelled:
+        raise
     except torch.cuda.OutOfMemoryError:
         try:
             scheduler.record_task_error()
@@ -2405,6 +3034,14 @@ def _execute_chat_full(req: ChatRequest) -> dict:
             pass
         logger.error(f"推理异常: {e}", exc_info=True)
         raise HTTPException(500, f"推理失败: {str(e)}")
+
+
+def _execute_requested_chat(
+    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+) -> dict:
+    if req.execution_mode == "task_graph":
+        return _execute_task_graph_chat(req, cancel_event)
+    return _execute_chat_full(req, cancel_event)
 
 
 def _auto_load_default_model():
@@ -2483,15 +3120,43 @@ async def chat(req: ChatRequest):
     自动维护对话历史 + KV 缓存。
     若模型未加载，自动尝试加载默认模型。
     """
-    if not model_loaded or not model_manager.is_loaded:
-        try:
-            _auto_load_default_model()
-        except FileNotFoundError:
-            raise HTTPException(400, "模型未加载且未找到可自动加载的模型文件。请先在控制面板中加载模型。")
-        except Exception as e:
-            raise HTTPException(500, f"自动加载模型失败: {e}。请手动在控制面板中加载模型。")
+    generation_id, cancel_event = _register_generation(req.generation_id)
+    req.generation_id = generation_id
 
-    result = _execute_chat_full(req)
+    def _run_chat_request():
+        if req.execution_mode == "task_graph":
+            if not model_loaded or not model_manager.is_loaded:
+                raise HTTPException(
+                    409,
+                    "任务链实验要求先加载本地完整模型。",
+                )
+            return _execute_requested_chat(req, cancel_event)
+        with _full_chat_execution_lock:
+            if not model_loaded or not model_manager.is_loaded:
+                try:
+                    _auto_load_default_model()
+                except FileNotFoundError:
+                    raise HTTPException(
+                        400,
+                        "模型未加载且未找到可自动加载的模型文件。"
+                        "请先在控制面板中加载模型。",
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        500,
+                        f"自动加载模型失败: {exc}。请手动在控制面板中加载模型。",
+                    ) from exc
+            return _execute_requested_chat(req, cancel_event)
+
+    try:
+        result = await run_in_threadpool(_run_chat_request)
+    except ChatGenerationCancelled as exc:
+        raise HTTPException(
+            409,
+            {"message": "生成已取消", "generation_id": exc.generation_id},
+        ) from exc
+    finally:
+        _unregister_generation(generation_id, cancel_event)
     return ChatResponse(
         content=result["content"],
         thinking_content=result.get("thinking_content"),
@@ -2526,16 +3191,27 @@ async def chat_stream(req: ChatRequest, request: Request):
         data: {"token": "你"}
         data: {"done": true, "response": "...", "followups": [...], "metrics": {...}}
     """
+    import asyncio as _asyncio
     import json as _json
     request_id = _request_id_ctx.get("-")
+    generation_id, cancel_event = _register_generation(req.generation_id)
+    req.generation_id = generation_id
 
     async def _generate():
-        token = _request_id_ctx.set(request_id)
+        previous_request_id = _request_id_ctx.get("-")
+        _request_id_ctx.set(request_id)
+        completed_normally = False
         try:
             async for chunk in _generate_events():
                 yield chunk
+            completed_normally = True
         finally:
-            _request_id_ctx.reset(token)
+            if not completed_normally:
+                cancel_event.set()
+            _unregister_generation(generation_id, cancel_event)
+            # StreamingResponse may close an async generator from a different
+            # task context. ContextVar tokens cannot be reset across contexts.
+            _request_id_ctx.set(previous_request_id)
 
     async def _run_with_request_id(loop, func):
         def _runner():
@@ -2547,25 +3223,71 @@ async def chat_stream(req: ChatRequest, request: Request):
 
         return await loop.run_in_executor(None, _runner)
 
-    def _error_event(message: str) -> str:
+    def _error_event(message) -> str:
+        if isinstance(message, dict):
+            message = message.get("message") or json.dumps(
+                message, ensure_ascii=False,
+            )
         return f"data: {_json.dumps({'done': True, 'error': message, 'request_id': request_id}, ensure_ascii=False)}\n\n"
+
+    async def _iterate_sync_generator(iterable):
+        """Bridge a blocking generator without blocking the ASGI event loop."""
+        queue = _asyncio.Queue()
+        done = object()
+
+        def _pump():
+            try:
+                for item in iterable:
+                    loop.call_soon_threadsafe(queue.put_nowait, (item, None))
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, (None, exc))
+            finally:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, (done, None))
+                except RuntimeError:
+                    pass
+
+        loop = _asyncio.get_running_loop()
+        threading.Thread(
+            target=_pump,
+            name=f"chat-stream-bridge-{generation_id[-8:]}",
+            daemon=True,
+        ).start()
+        try:
+            while True:
+                item, error = await queue.get()
+                if item is done:
+                    break
+                if error is not None:
+                    raise error
+                yield item
+        finally:
+            cancel_event.set()
 
     async def _generate_events():
         # ================================================================
         # ★ full 模式：完整 chat 流程，假流式（SSE 单事件）
         # ================================================================
-        if req.streaming_mode == "full":
-            if not model_loaded or not model_manager.is_loaded:
-                try:
-                    _auto_load_default_model()
-                except Exception as e:
-                    logger.error(f"full 模式自动加载模型失败: {e}", exc_info=True)
-                    yield _error_event(f"自动加载模型失败: {e}")
-                    return
-            import asyncio
-            loop = asyncio.get_event_loop()
+        if req.streaming_mode == "full" or req.execution_mode == "task_graph":
+            loop = _asyncio.get_running_loop()
+
+            def _execute_full_stream_request():
+                if req.execution_mode == "task_graph":
+                    if not model_loaded or not model_manager.is_loaded:
+                        raise HTTPException(
+                            409,
+                            "任务链实验要求先加载本地完整模型。",
+                        )
+                    return _execute_requested_chat(req, cancel_event)
+                with _full_chat_execution_lock:
+                    if not model_loaded or not model_manager.is_loaded:
+                        _auto_load_default_model()
+                    return _execute_requested_chat(req, cancel_event)
+
             try:
-                result = await _run_with_request_id(loop, lambda: _execute_chat_full(req))
+                result = await _run_with_request_id(
+                    loop, _execute_full_stream_request,
+                )
                 yield f"data: {_json.dumps({
                     'done': True,
                     'response': result['content'],
@@ -2590,7 +3312,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 and scheduler._effective_role() == "master"
                 and model_manager._engine_type == "pytorch"):
             try:
-                for event in scheduler.run_pipeline_stream(
+                async for event in _iterate_sync_generator(scheduler.run_pipeline_stream(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.temperature,
@@ -2598,7 +3320,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     session_id=req.session_id,
                     messages=[{"role": "user", "content": req.message}],
                     show_thinking=req.show_thinking,
-                ):
+                    _cancel_event=cancel_event,
+                )):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 logger.error(f"流式推理失败: {e}", exc_info=True)
@@ -2608,7 +3331,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         elif (model_manager._engine_type == "pytorch"
                 and model_manager.is_loaded):
             try:
-                for event in scheduler._run_full_model_inference_stream(
+                async for event in _iterate_sync_generator(scheduler._run_full_model_inference_stream(
                     req.message,
                     max_new_tokens=req.max_new_tokens,
                     temperature=req.temperature,
@@ -2616,7 +3339,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     session_id=req.session_id,
                     messages=[{"role": "user", "content": req.message}],
                     show_thinking=req.show_thinking,
-                ):
+                    _cancel_event=cancel_event,
+                )):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
                 logger.error(f"单机流式推理失败: {e}", exc_info=True)
@@ -2624,8 +3348,7 @@ async def chat_stream(req: ChatRequest, request: Request):
 
         # ---- 路径 3: llama.cpp / 从节点 / 模型未加载 → 假流式回退 ----
         else:
-            import asyncio
-            loop = asyncio.get_event_loop()
+            loop = _asyncio.get_running_loop()
             result = await _run_with_request_id(
                 loop,
                 lambda: scheduler.run_pipeline_safe(
@@ -2634,6 +3357,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     session_id=req.session_id,
+                    _cancel_event=cancel_event,
                 )
             )
             # 一次性返回完整结果（SSE 格式，单事件）
@@ -2648,16 +3372,247 @@ async def chat_stream(req: ChatRequest, request: Request):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Request-ID": request_id,
+            "X-Generation-ID": generation_id,
             "X-Accel-Buffering": "no",  # 禁用 nginx 缓冲
         },
     )
 
 
+def _public_task_journal(status: dict) -> dict:
+    return {key: value for key, value in status.items() if key != "path"}
+
+
+def _workflow_safe_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _workflow_safe_timestamp(value: Any) -> float:
+    try:
+        timestamp = float(value or 0.0)
+        return timestamp if timestamp == timestamp and 0 <= timestamp <= 1e15 else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _workflow_observability(snapshot: dict) -> dict:
+    stages = snapshot.get("stages", [])
+    if not isinstance(stages, list):
+        stages = []
+    attempts = [
+        attempt
+        for stage in stages
+        if isinstance(stage, dict)
+        for attempt in stage.get("attempts", [])
+        if isinstance(attempt, dict)
+    ]
+    retry_count = _workflow_safe_count(snapshot.get("retry_count", 0))
+    if not retry_count:
+        retry_count = sum(
+            _workflow_safe_count(stage.get("retry_count", 0))
+            for stage in stages if isinstance(stage, dict)
+        )
+    rejection_count = _workflow_safe_count(
+        snapshot.get("result_rejection_count", 0)
+    )
+    if not rejection_count:
+        rejection_count = sum(
+            _workflow_safe_count(stage.get("result_rejection_count", 0))
+            for stage in stages if isinstance(stage, dict)
+        )
+    rejected_stages = sorted(
+        (
+            stage for stage in stages
+            if isinstance(stage, dict)
+            and stage.get("last_result_rejection_reason")
+        ),
+        key=lambda stage: _workflow_safe_timestamp(
+            stage.get("last_result_rejected_at", 0.0)
+        ),
+    )
+    last_rejection = rejected_stages[-1] if rejected_stages else {}
+    actual_providers = sorted({
+        str(attempt.get("provider", "") or "")
+        for attempt in attempts if attempt.get("provider")
+    })
+    actual_nodes = sorted({
+        str(attempt.get("provider_node_id", "") or "")
+        for attempt in attempts if attempt.get("provider_node_id")
+    })
+    state = str(snapshot.get("state", "unknown") or "unknown")
+    recovered_after_restart = bool(
+        snapshot.get("recovered_after_restart", False)
+    )
+    recovery_reason = str((
+        snapshot.get("recovery_reason", "")
+        or snapshot.get("error_code", "")
+    ) if recovered_after_restart else "")
+    return {
+        "state": state,
+        "result_ready": state == "result_ready",
+        "terminal": state in {"completed", "failed", "cancelled"},
+        "recovered_after_restart": recovered_after_restart,
+        "recovery_reason": recovery_reason,
+        "retry_count": retry_count,
+        "retrying": retry_count > 0 and state in {"running", "created"},
+        "result_rejection_count": rejection_count,
+        "last_result_rejection_reason": str(
+            last_rejection.get("last_result_rejection_reason", "") or ""
+        ),
+        "last_result_rejected_at": last_rejection.get(
+            "last_result_rejected_at"
+        ),
+        "winner_count": sum(
+            bool(stage.get("winner_attempt_id"))
+            for stage in stages if isinstance(stage, dict)
+        ),
+        "actual_providers": actual_providers,
+        "actual_nodes": actual_nodes,
+    }
+
+
+def _public_workflow(snapshot: dict, journal: dict) -> dict:
+    public = dict(snapshot)
+    public["observability"] = _workflow_observability(public)
+    public["journal"] = _public_task_journal(journal)
+    return public
+
+
+@app.get("/api/workflows")
+async def list_workflows(limit: int = 20):
+    role = scheduler._effective_role()
+    provider_error = ""
+    if TASK_GRAPH_ENABLED and role == "master":
+        try:
+            _ensure_local_task_provider()
+        except ProviderError as exc:
+            provider_error = f"{exc.code}: {exc}"
+    journal = task_graph_coordinator.journal_status()
+    try:
+        workflows = task_graph_coordinator.list(limit=limit)
+    except TaskGraphUnavailable:
+        journal = task_graph_coordinator.journal_status()
+        workflows = task_graph_coordinator.list(limit=limit)
+    public_journal = _public_task_journal(journal)
+    workflows = [
+        _public_workflow(workflow, journal) for workflow in workflows
+    ]
+    provider_status = task_graph_coordinator.provider_status()
+    local_provider_ready = any(
+        item.get("provider_id") == "local_full_model"
+        and bool(item.get("healthy"))
+        and bool(item.get("available"))
+        for item in provider_status
+    )
+    return {
+        "enabled": TASK_GRAPH_ENABLED,
+        "available": (
+            TASK_GRAPH_ENABLED
+            and role == "master"
+            and bool(journal.get("available", False))
+            and not provider_error
+            and local_provider_ready
+        ),
+        "role": role,
+        "templates": ["dual_candidate"],
+        "providers": task_graph_coordinator.provider_ids(),
+        "provider_status": provider_status,
+        "provider_error": provider_error,
+        "worker_protocol": worker_protocol_status(),
+        "journal": public_journal,
+        "workflows": workflows,
+    }
+
+
+@app.post("/api/workflows/journal/cleanup")
+async def cleanup_task_journal(
+    max_age_days: Optional[int] = None,
+    max_records: Optional[int] = None,
+):
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "只有主节点可以清理任务图 journal。")
+    if not TASK_GRAPH_ENABLED:
+        raise HTTPException(409, "任务链实验未启用。")
+    age_days = (
+        TASK_GRAPH_RETENTION_DAYS
+        if max_age_days is None else max(0, min(int(max_age_days), 3650))
+    )
+    records = (
+        TASK_GRAPH_RETENTION_MAX_RECORDS
+        if max_records is None else max(0, min(int(max_records), 100000))
+    )
+    try:
+        result = task_graph_coordinator.cleanup_journal(
+            max_age_days=age_days,
+            max_records=records,
+        )
+    except TaskGraphUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return {
+        "status": "completed",
+        "policy": {
+            "max_age_days": age_days,
+            "max_records": records,
+        },
+        "result": result,
+    }
+
+
+@app.post("/api/chat/generations/{generation_id}/cancel")
+async def cancel_chat_generation(generation_id: str):
+    return {
+        "status": _request_generation_cancel(generation_id),
+        "generation_id": generation_id,
+    }
+
+
+@app.get("/api/workflows/{workflow_id}")
+async def get_workflow(workflow_id: str):
+    try:
+        workflow = task_graph_coordinator.get(workflow_id)
+        journal = task_graph_coordinator.journal_status()
+        return _public_workflow(workflow, journal)
+    except WorkflowNotFound as exc:
+        raise HTTPException(404, f"工作流不存在: {workflow_id}") from exc
+    except TaskGraphUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.post("/api/workflows/{workflow_id}/cancel")
+async def cancel_workflow(workflow_id: str):
+    try:
+        workflow = task_graph_coordinator.request_cancel(workflow_id)
+    except TaskGraphUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except TaskGraphError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if workflow is None:
+        return {
+            "status": "cancel_pending",
+            "workflow": {
+                "workflow_id": workflow_id,
+                "state": "pending_registration",
+                "cancel_requested": True,
+            },
+        }
+    return {
+        "status": (
+            "cancel_requested"
+            if workflow["state"] not in {"completed", "failed", "cancelled"}
+            else workflow["state"]
+        ),
+        "workflow": workflow,
+    }
+
+
 @app.post("/api/chat/clear")
-async def clear_chat():
+@_serialized_conversation_mutation
+def clear_chat(session_id: str = "default"):
     """清空当前活跃会话的对话历史与 KV 缓存"""
     global kv_cache, conversation_stats
-    _get_active_history().clear()
+    result = delete_conversations(session_id)
     conversation_stats = {
         "total_prompt_tokens": 0,
         "total_generated_tokens": 0,
@@ -2667,8 +3622,13 @@ async def clear_chat():
     if kv_cache:
         kv_cache.clear()
     _init_kv_cache()
-    logger.info("对话历史已清空")
-    return {"status": "cleared", "conversation_turns": 0}
+    logger.info("对话历史已清空: session=%s", result["session_id"])
+    return {
+        "status": "cleared",
+        "session_id": result["session_id"],
+        "deleted_count": result.get("deleted_count", 0),
+        "conversation_turns": 0,
+    }
 
 
 @app.get("/api/models/available")
@@ -3001,8 +3961,9 @@ async def switch_model(req: SwitchModelRequest):
         cfg.INFERENCE_ENGINE = effective_engine if effective_engine != "auto" else cfg.INFERENCE_ENGINE
         cfg.QUANT_TYPE = quant
 
-        # 清空内存会话/KV/统计（新模型不能复用旧模型的上下文）
-        _reset_runtime_conversation_state(clear_histories=True)
+        def _prepare_model_switch() -> None:
+            # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
+            _reset_runtime_conversation_state(clear_histories=True)
 
         result = _run_exclusive_model_change(
             lambda: model_manager.switch_model(
@@ -3012,7 +3973,8 @@ async def switch_model(req: SwitchModelRequest):
                 engine=effective_engine if effective_engine != "auto" else None,
                 model_path=resolved_model_path,
                 db_experimental_models=_get_db_experimental_models(),
-            )
+            ),
+            prepare=_prepare_model_switch,
         )
 
         if result["success"]:
@@ -4171,34 +5133,45 @@ async def get_conversations(session_id: str = "default", limit: int = 200):
 
 
 @app.delete("/api/conversations")
-async def delete_conversations(session_id: str = "default"):
+@_serialized_conversation_mutation
+def delete_conversations(session_id: str = "default"):
     """
     清空指定会话的对话历史（数据库 + 内存同步）。
 
     单机模式下仅清空当前会话上下文；分布式模式下可跨节点同步。
     """
+    global kv_cache
+    resolved_session_id = (
+        active_session_id if session_id == "default" and active_session_id
+        else session_id
+    )
     deleted_count = 0
 
     if _db_available:
         try:
             import db as _db_mod
-            deleted_count = _db_mod.clear_conversation(session_id)
-            logger.info(f"数据库对话历史已清空: session={session_id}, {deleted_count} 条")
+            deleted_count = _db_mod.clear_conversation(resolved_session_id)
+            logger.info(f"数据库对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
         except Exception as e:
             logger.warning(f"数据库清空对话历史失败: {e}")
     if not _db_available:
         try:
-            deleted_count = _local_store.clear_local_conversation(session_id)
-            logger.info(f"本地对话历史已清空: session={session_id}, {deleted_count} 条")
+            deleted_count = _local_store.clear_local_conversation(resolved_session_id)
+            logger.info(f"本地对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
         except Exception as e:
             logger.warning(f"本地清空对话历史失败: {e}")
 
-    if session_id == active_session_id or session_id == "default":
-        _get_active_history().clear()
+    history = session_histories.get(resolved_session_id)
+    if history is not None:
+        history.clear()
+    if resolved_session_id == active_session_id:
+        if kv_cache:
+            kv_cache.clear()
+        _init_kv_cache()
     logger.info(f"对话历史已清空 (内存)")
     return {
         "status": "cleared",
-        "session_id": session_id,
+        "session_id": resolved_session_id,
         "deleted_count": deleted_count,
     }
 
@@ -4217,7 +5190,8 @@ class RenameSessionRequest(BaseModel):
 
 
 @app.post("/api/sessions")
-async def create_session(req: CreateSessionRequest = None):
+@_serialized_conversation_mutation
+def create_session(req: Optional[CreateSessionRequest] = None):
     """
     创建新会话并自动激活。
 
@@ -4372,7 +5346,8 @@ async def rename_session(session_id: str, req: RenameSessionRequest):
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str):
+@_serialized_conversation_mutation
+def delete_session(session_id: str):
     """
     删除会话及其所有对话消息。
 
@@ -4408,7 +5383,8 @@ async def delete_session(session_id: str):
 
 
 @app.post("/api/sessions/{session_id}/activate")
-async def activate_session(session_id: str):
+@_serialized_conversation_mutation
+def activate_session(session_id: str):
     """
     切换到指定会话，返回该会话的消息历史。
     """
@@ -4427,7 +5403,8 @@ async def activate_session(session_id: str):
 
 
 @app.delete("/api/sessions/{session_id}/turns/{turn_index}")
-async def delete_turn(session_id: str, turn_index: int):
+@_serialized_conversation_mutation
+def delete_turn(session_id: str, turn_index: int):
     """
     删除指定会话中的单轮对话（user + assistant 两条消息）。
 
@@ -4657,20 +5634,20 @@ async def list_gguf_models():
         sha256_file = fpath + ".sha256"
         if os.path.isfile(sha256_file):
             try:
-                with open(sha256_file, "r") as f:
-                    sha256 = f.read().strip().split()[0]
+                with open(sha256_file, "r") as checksum_file:
+                    sha256 = checksum_file.read().strip().split()[0]
             except Exception:
                 pass
         if not sha256:
             try:
-                sha256 = hashlib.sha256()
-                with open(fpath, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        sha256.update(chunk)
-                sha256 = sha256.hexdigest()
+                hasher = hashlib.sha256()
+                with open(fpath, "rb") as model_file:
+                    for chunk in iter(lambda: model_file.read(8192), b""):
+                        hasher.update(chunk)
+                sha256 = hasher.hexdigest()
                 # 缓存到 .sha256 文件
-                with open(sha256_file, "w") as f:
-                    f.write(f"{sha256}  {fname}\n")
+                with open(sha256_file, "w") as checksum_file:
+                    checksum_file.write(f"{sha256}  {fname}\n")
             except Exception:
                 sha256 = ""
 
@@ -5169,9 +6146,10 @@ def _run_log_retention_cleanup() -> None:
             else:
                 kept.append(fi)
 
+        total_size = sum(f["size"] for f in kept)
+
         # 第二阶段：按总空间清理（最旧优先，但跳过当天日志）
         if max_bytes > 0:
-            total_size = sum(f["size"] for f in kept)
             if total_size > max_bytes:
                 # 按修改时间升序（最旧的在前）
                 kept.sort(key=lambda f: f["mtime"])
@@ -5422,7 +6400,11 @@ async def delete_log_file(filename: str, request: Request):
 
 # PyInstaller 打包后前端文件在 sys._MEIPASS/frontend/dist/ 下
 if getattr(sys, 'frozen', False):
-    _frontend_dist = os.path.join(sys._MEIPASS, "frontend", "dist")
+    _frontend_dist = os.path.join(
+        getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
+        "frontend",
+        "dist",
+    )
 else:
     _frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist")
 

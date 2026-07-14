@@ -1078,7 +1078,7 @@ class Scheduler:
         self._client_health_start_lock = threading.Lock()
         self._layer_config_retry_thread: Optional[threading.Thread] = None
         self._distributed_inference_enabled: Optional[bool] = None
-        self._local_device_profile: dict = {}
+        self._local_device_profile: Optional[dict] = {}
         self._runtime_layer_override: Optional[list] = None
 
         # 流水线请求队列（MLFQ 三级反馈队列，兼容 FIFO）
@@ -5574,9 +5574,10 @@ class Scheduler:
                                      temperature: float = 0.7,
                                      top_p: float = 0.9,
                                      show_thinking: bool = False,
-                                     session_id: str = None,
+                                     session_id: Optional[str] = None,
                                      messages: list = None,
                                      request_id: str = None,   # L5: 链路追踪
+                                     _cancel_event: Optional[threading.Event] = None,
                                      timeout: float = 120.0) -> dict:
         """
         从节点将推理请求转发给主节点，并等待结果。
@@ -5633,7 +5634,26 @@ class Scheduler:
                 request_id or "-", forward_request_id, len(message),
             )
 
-            if result_event.wait(timeout=max(0.0, timeout)):
+            deadline = time.monotonic() + max(0.0, timeout)
+            result_ready = False
+            while True:
+                if _cancel_event is not None and _cancel_event.is_set():
+                    try:
+                        tcp_client.send_data(
+                            {"forward_request_id": forward_request_id},
+                            MessageType.INFER_CANCEL,
+                        )
+                    except Exception:
+                        logger.debug("发送转发推理取消失败", exc_info=True)
+                    return {"status": "cancelled", "error": "推理已取消"}
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if result_event.wait(timeout=min(0.1, remaining)):
+                    result_ready = True
+                    break
+
+            if result_ready:
                 with self._client_pending_lock:
                     result = self._client_pending_results.pop(
                         forward_request_id, None
@@ -8987,7 +9007,7 @@ class Scheduler:
         full_text_parts = []
         error_info = [None]
         metrics_info = [{}]
-        cancel_event = _thr.Event()
+        cancel_event = kwargs.pop("_cancel_event", None) or _thr.Event()
 
         def _run():
             try:

@@ -218,3 +218,8 @@ def test_qwen_runtime_dependency_is_declared_for_packaging():
         assert "'tiktoken'" in content
         assert "'tiktoken._tiktoken'" in content
         assert "'httpx'" in content
+        assert "'task_graph'" in content
+        assert "'task_journal'" in content
+        assert "'task_provider'" in content
+        assert "'task_worker_protocol'" in content
+        assert "'_sqlite3'" in content

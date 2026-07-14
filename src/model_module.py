@@ -1155,6 +1155,18 @@ class ModelManager:
             self._get_generation_eos_token_ids(stop_sequences),
         )
         cancel_event = generation_kwargs.pop("_cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "content": "",
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "model": self.active_model_id,
+                "finish_reason": "cancelled",
+                "tokens_per_second": 0,
+            }
         stop_criteria = self._build_stop_criteria(
             stop_sequences,
             inputs["input_ids"].shape[1],

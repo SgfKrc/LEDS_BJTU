@@ -10,6 +10,7 @@ import os
 import logging
 import time
 import threading
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -171,18 +172,21 @@ class TestComputeLayerAssignment:
         s = Scheduler()
         # 注入模拟节点
         s.nodes = {
-            "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
-                'device_info': PROFILE_WORKSTATION,
-            })(),
-            "client1": type('NodeInfo', (), {
-                'node_id': 'client1', 'role': 'client', 'node_type': 'pc',
-                'device_info': PROFILE_LAPTOP,
-            })(),
-            "client2": type('NodeInfo', (), {
-                'node_id': 'client2', 'role': 'client', 'node_type': 'pc',
-                'device_info': PROFILE_ULTRABOOK,
-            })(),
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                node_type="pc",
+                device_info=PROFILE_WORKSTATION,
+            ),
+            "client1": NodeInfo(
+                node_id="client1", role="client", state=NodeState.ONLINE,
+                node_type="pc",
+                device_info=PROFILE_LAPTOP,
+            ),
+            "client2": NodeInfo(
+                node_id="client2", role="client", state=NodeState.ONLINE,
+                node_type="pc",
+                device_info=PROFILE_ULTRABOOK,
+            ),
         }
         return s
 
@@ -471,11 +475,12 @@ class TestLocalDeviceProfileSync:
             def send_data(self, data, msg_type):
                 sent.append((data, msg_type.value))
 
-        sched._tcp_client = FakeClient()
+        fake_client = FakeClient()
+        monkeypatch.setattr(sched, "_tcp_client", fake_client, raising=False)
 
         sched.update_local_device_profile(PROFILE_IGPU_ONLY)
 
-        assert sched._tcp_client.device_info == PROFILE_IGPU_ONLY
+        assert fake_client.device_info == PROFILE_IGPU_ONLY
         assert sent == [(
             {"state": "online", "device_info": PROFILE_IGPU_ONLY},
             "status_res",
@@ -614,10 +619,11 @@ class TestGetLayerAssignments:
         except Exception:
             pass
         s.nodes = {
-            "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
-                'device_info': PROFILE_LAPTOP,
-            })(),
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                node_type="pc",
+                device_info=PROFILE_LAPTOP,
+            ),
         }
         return s
 
@@ -1895,8 +1901,11 @@ class TestKVCacheManagement:
         assert "task_2" in sched._kv_cache
         assert sched._kv_cache["task_2"] == "kv_2"
 
-    def test_fallback_inference_returns_error_without_model(self, sched):
+    def test_fallback_inference_returns_error_without_model(self, sched, monkeypatch):
         """无模型时 _run_full_model_inference 返回 error"""
+        import api_server as _api
+
+        monkeypatch.setattr(_api, "model_manager", None)
         result = sched._run_full_model_inference("测试")
         assert isinstance(result, dict)
         assert "error" in result
@@ -1928,6 +1937,24 @@ class TestPipelineQueueBasics:
         assert tid.startswith("q_")
         assert len(tid) > 4
         assert queue.queue_size == 1
+
+    def test_external_cancel_event_removes_queued_task(self, queue):
+        cancel_event = threading.Event()
+        task_id = queue.enqueue(
+            prompt="cancel queued",
+            max_new_tokens=32,
+            _cancel_event=cancel_event,
+        )
+
+        cancel_event.set()
+        result = queue.wait_for_result(
+            task_id,
+            timeout=1.0,
+            cancel_event=cancel_event,
+        )
+
+        assert result["status"] == "cancelled"
+        assert queue.queue_size == 0
 
     def test_enqueue_custom_task_id(self, queue):
         """enqueue 应接受自定义 task_id"""
@@ -2736,14 +2763,16 @@ class TestVramConstraintRecalculation:
     def sched(self):
         s = Scheduler()
         s.nodes = {
-            "master": type('NodeInfo', (), {
-                'node_id': 'master', 'role': 'master', 'node_type': 'pc',
-                'device_info': PROFILE_WORKSTATION,
-            })(),
-            "client1": type('NodeInfo', (), {
-                'node_id': 'client1', 'role': 'client', 'node_type': 'pc',
-                'device_info': PROFILE_EDGE,  # 显存极少
-            })(),
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                node_type="pc",
+                device_info=PROFILE_WORKSTATION,
+            ),
+            "client1": NodeInfo(
+                node_id="client1", role="client", state=NodeState.ONLINE,
+                node_type="pc",
+                device_info=PROFILE_EDGE,  # 显存极少
+            ),
         }
         return s
 
@@ -3344,7 +3373,7 @@ class TestPipelineOrchestrationIntegration:
             'get_client_ids': lambda self: list(self.clients.keys()),
             'get_client_info': lambda self, cid: {},
         })()
-        s._tcp_server = fake_server
+        monkeypatch.setattr(s, "_tcp_server", fake_server)
 
         # 注入 master 节点自身
         s.nodes["master"] = NodeInfo(
@@ -3636,7 +3665,7 @@ class TestPipelineOrchestrationIntegration:
         class MockModelManager:
             is_loaded = True
             _engine_type = "pytorch"
-            tokenizer = None
+            tokenizer: Any = None
             layer_range = None
             _layer_has_embedding = True
             _layer_has_lm_head = True
@@ -3651,8 +3680,9 @@ class TestPipelineOrchestrationIntegration:
             def forward_layers(self, **kw):
                 forward_calls.append(kw)
                 import torch
-                bs = kw.get("input_ids").shape[0] if kw.get("input_ids") is not None else 1
-                sl = kw.get("input_ids").shape[1] if kw.get("input_ids") is not None else 1
+                input_ids: Any = kw.get("input_ids")
+                bs = input_ids.shape[0] if input_ids is not None else 1
+                sl = input_ids.shape[1] if input_ids is not None else 1
                 return {"hidden_states": torch.randn(bs, sl, 2048),
                         "past_key_values": ((torch.randn(1, 16, sl, 64),
                                              torch.randn(1, 16, sl, 64)),)}
@@ -3804,7 +3834,7 @@ class TestPipelineOrchestrationIntegration:
         class MockModelManager:
             is_loaded = True
             _engine_type = "pytorch"
-            tokenizer = None
+            tokenizer: Any = None
             layer_range = None
             _layer_has_embedding = True
             _layer_has_lm_head = True
@@ -4208,7 +4238,7 @@ class TestForwardInferenceRequestId:
                     },
                 })
 
-        sched._tcp_client = FakeClient()
+        monkeypatch.setattr(sched, "_tcp_client", FakeClient(), raising=False)
         result = sched.forward_inference_to_master("hello", timeout=1)
         assert result["status"] == "error"
         assert result["error"] == "worker failed"
@@ -4229,18 +4259,48 @@ class TestForwardInferenceRequestId:
             def send_data(self, data, msg_type):
                 sent.append((data, msg_type.value))
 
-        sched._tcp_client = FakeClient()
+        monkeypatch.setattr(sched, "_tcp_client", FakeClient(), raising=False)
         result = sched.forward_inference_to_master("hello", timeout=0.01)
         assert result["status"] == "timeout"
         assert [kind for _, kind in sent] == ["infer_forward", "infer_cancel"]
         assert sent[0][0]["forward_request_id"] == sent[1][0]["forward_request_id"]
+
+    def test_forward_external_cancel_sends_cancel_and_cleans_pending(self, monkeypatch):
+        import scheduler as scheduler_mod
+
+        sched = Scheduler()
+        sched._role_override = "client"
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client")
+        sent = []
+
+        class FakeClient:
+            _running = True
+            is_registered = True
+            sock = object()
+
+            def send_data(self, data, msg_type):
+                sent.append((data, msg_type.value))
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+        monkeypatch.setattr(sched, "_tcp_client", FakeClient(), raising=False)
+        result = sched.forward_inference_to_master(
+            "hello",
+            _cancel_event=cancel_event,
+            timeout=1,
+        )
+
+        assert result["status"] == "cancelled"
+        assert [kind for _, kind in sent] == ["infer_forward", "infer_cancel"]
+        assert sched._client_pending_events == {}
+        assert sched._client_pending_results == {}
 
     def test_forwarded_success_is_sent_before_task_cleanup_regression(self):
         sched = Scheduler()
         sent = []
         finished = threading.Event()
         sched.start_infer_task = lambda *args, **kwargs: "task-demo"
-        sched.run_pipeline_safe = lambda **kwargs: {
+        sched.run_pipeline_safe = lambda prompt, **kwargs: {
             "response": "computed",
             "metrics": {"distributed_used": True},
         }
@@ -4588,7 +4648,7 @@ class TestConnectToMasterBootstrapRecovery:
         sched = Scheduler()
         current = object()
         stale = object()
-        sched._tcp_client = current
+        sched._tcp_client = cast(Any, current)
         sched._kv_cache["active"] = "kv"
 
         sched._on_master_connection_lost(stale)
@@ -4622,6 +4682,7 @@ class TestConnectToMasterBootstrapRecovery:
                 self.sock = object()
 
             def connect(self, on_message=None):
+                assert on_message is not None
                 on_message({"type": "layer_config", "data": {}})
                 return True
 
@@ -4632,7 +4693,9 @@ class TestConnectToMasterBootstrapRecovery:
         sched._role_override = "client"
 
         def observe(_client_id, _msg):
-            observed.append((sched._tcp_client.client_id, sched.get_effective_node_id()))
+            active_client = cast(Any, sched._tcp_client)
+            assert active_client is not None
+            observed.append((active_client.client_id, sched.get_effective_node_id()))
 
         monkeypatch.setattr(sched, "_on_tcp_message", observe)
         monkeypatch.setattr("tcp_comm.TCPClient", FakeTCPClient)
