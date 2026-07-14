@@ -353,6 +353,8 @@ conversation_stats: dict = {                    # 累计对话统计（实际消
 current_quant: str = QUANT_TYPE
 model_loaded: bool = False
 device_profile: Optional[dict] = None           # 设备画像缓存
+_device_profile_ready = threading.Event()
+_device_profile_started = False
 generation_config: dict = {
     "max_new_tokens": 1024,          # laptop 档默认值
     "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
@@ -363,6 +365,30 @@ generation_config: dict = {
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: Scheduler = Scheduler()
+
+
+def _refresh_pipeline_layer_config() -> None:
+    """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
+    try:
+        if scheduler._effective_role() == "master":
+            scheduler.push_layer_config_to_clients()
+    except Exception as e:
+        # 模型本身已经加载成功；同步失败时保持流水线 not-ready，后续请求
+        # 会安全回退到主节点本地推理。
+        logger.warning(f"模型加载后刷新流水线层配置失败: {e}", exc_info=True)
+
+
+def _run_exclusive_model_change(change):
+    """Block inference, invalidate old worker ACKs, then refresh the new model."""
+    with scheduler._inference_lock:
+        with scheduler._layer_config_lock:
+            scheduler._layer_config_pushed.clear()
+            scheduler._layer_config_expected.clear()
+            scheduler._layer_config_acks.clear()
+        try:
+            return change()
+        finally:
+            _refresh_pipeline_layer_config()
 
 
 # ============================================================
@@ -376,23 +402,37 @@ scheduler: Scheduler = Scheduler()
 # ============================================================
 
 async def _startup_device_detection():
-    """启动时自动检测设备能力并缓存画像，初始化调度器"""
-    global device_profile, scheduler
-    try:
-        profiler = get_profile()
-        device_profile = profiler.to_dict()
-        logger.info(
-            f"🚀 设备检测完成: tier={profiler.tier.value} "
-            f"score={profiler.score:.1f}/100 | "
-            f"CPU={profiler.cpu.physical_cores}核 RAM={profiler.ram.total_gb}GB "
-            f"GPU={profiler.gpu.name}"
-        )
-        logger.info(f"   推荐配置: {profiler.recommend_config()['description']}")
-        for warning in device_profile.get("warnings", []):
-            logger.warning(f"   {warning}")
-    except Exception as e:
-        logger.error(f"设备检测失败: {e}")
-        device_profile = None
+    """Start core services immediately and detect slower hardware in background."""
+    global device_profile, scheduler, _device_profile_started
+
+    def _detect_device_profile() -> None:
+        global device_profile
+        try:
+            profiler = get_profile()
+            device_profile = profiler.to_dict()
+            scheduler.update_local_device_profile(device_profile)
+            logger.info(
+                f"🚀 设备检测完成: tier={profiler.tier.value} "
+                f"score={profiler.score:.1f}/100 | "
+                f"CPU={profiler.cpu.physical_cores}核 RAM={profiler.ram.total_gb}GB "
+                f"GPU={profiler.gpu.name}"
+            )
+            logger.info(f"   推荐配置: {profiler.recommend_config()['description']}")
+            for warning in device_profile.get("warnings", []):
+                logger.warning(f"   {warning}")
+        except Exception as e:
+            logger.error(f"设备检测失败: {e}")
+            device_profile = None
+        finally:
+            _device_profile_ready.set()
+
+    if not _device_profile_started:
+        _device_profile_started = True
+        threading.Thread(
+            target=_detect_device_profile,
+            name="device-profile",
+            daemon=True,
+        ).start()
 
     # 初始化调度器（单机模式下不启动 TCP 监听）
     try:
@@ -407,9 +447,15 @@ async def _startup_device_detection():
     except Exception as e:
         logger.warning(f"日志保留线程启动失败: {e}")
 
-    # 初始化数据库连接
+    # 调度器启动时已经尝试过数据库；这里复用结果，避免重复阻塞初始化。
     try:
-        init_db()
+        import scheduler as _scheduler_module
+        db_module = _scheduler_module._get_db()
+        if db_module is None:
+            raise RuntimeError(
+                _scheduler_module.get_database_status().get("last_error")
+                or "数据库未配置或暂不可用"
+            )
         # ★ 设置数据隔离参数：conversations/sessions 将按 node_id 过滤
         from db import set_active_node_id
         # ★ MAC 不匹配自动切换：若 start() 时检测到 MAC 不匹配且有真实主节点，
@@ -429,7 +475,11 @@ async def _startup_device_detection():
     except Exception as e:
         global _db_available
         _db_available = False
-        logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
+        runtime = _scheduler_module.get_database_status()
+        if runtime.get("configured", True):
+            logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
+        else:
+            logger.info("数据库未配置，使用本地文件存储")
 
     # P3: 启动邮件投票轮询器（仅 master 节点，IMAP 轮询不需要 CUDA）
     try:
@@ -580,6 +630,10 @@ class UpdateMaxNodesRequest(BaseModel):
 class ConnectToMasterRequest(BaseModel):
     master_host: str = Field(..., description="主节点 IP 地址", min_length=1)
     master_port: int = Field(8888, ge=1, le=65535, description="主节点端口")
+    switch_to_client: bool = Field(
+        False,
+        description="待配置节点显式切换为从节点后加入现有集群",
+    )
 
 
 class FirstConnectBootstrapRequest(BaseModel):
@@ -842,6 +896,16 @@ def _parse_thinking_response(text: str) -> tuple:
     cleaned = _re.sub(r'^分析思路[：:]\s*', '', cleaned)
     cleaned = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', cleaned, flags=_re.IGNORECASE)
     return cleaned, None
+
+
+def _format_model_response(text: str, show_thinking: bool,
+                           native_thinking_prompt: bool = False) -> tuple[str, Optional[str]]:
+    """Format generated text without exposing unfinished native reasoning."""
+    if show_thinking:
+        return _parse_thinking_response(text)
+    if native_thinking_prompt and "</think>" not in (text or "").lower():
+        return "", None
+    return _strip_native_thinking_tags(text), None
 
 
 # ================================================================
@@ -1564,11 +1628,11 @@ async def get_device_profile():
     """
     global device_profile
     if device_profile is None:
-        try:
-            profiler = get_profile()
-            device_profile = profiler.to_dict()
-        except Exception as e:
-            raise HTTPException(500, f"设备检测失败: {e}")
+        import asyncio
+
+        await asyncio.to_thread(_device_profile_ready.wait, 15)
+        if device_profile is None:
+            raise HTTPException(503, "设备画像仍在检测中，请稍后重试")
     return device_profile
 
 
@@ -1588,6 +1652,7 @@ async def auto_configure():
             device_profile = profiler.to_dict()
         except Exception as e:
             raise HTTPException(500, f"设备检测失败: {e}")
+    scheduler.update_local_device_profile(device_profile)
 
     rec = device_profile.get("recommendations", [])
     warnings = device_profile.get("warnings", [])
@@ -1671,6 +1736,7 @@ async def select_gpu(req: SelectGpuRequest):
 
     # 更新缓存的 device_profile
     device_profile = profiler.to_dict()
+    scheduler.update_local_device_profile(device_profile)
 
     selected = gpus[req.gpu_index]
     logger.info(
@@ -1847,13 +1913,15 @@ async def load_model(req: LoadModelRequest):
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
-        result = model_manager.switch_model(
-            model_id=req.model_id or mc.DEFAULT_MODEL_ID,
-            quant_type=quant,
-            profile=device_profile,
-            engine=effective_engine if effective_engine != "auto" else None,
-            model_path=resolved_model_path,
-            db_experimental_models=_get_db_experimental_models(),
+        result = _run_exclusive_model_change(
+            lambda: model_manager.switch_model(
+                model_id=req.model_id or mc.DEFAULT_MODEL_ID,
+                quant_type=quant,
+                profile=device_profile,
+                engine=effective_engine if effective_engine != "auto" else None,
+                model_path=resolved_model_path,
+                db_experimental_models=_get_db_experimental_models(),
+            )
         )
 
         if result["success"]:
@@ -1863,7 +1931,6 @@ async def load_model(req: LoadModelRequest):
 
             # 初始化 KV 缓存
             _init_kv_cache()
-
             elapsed = time.time() - t0
             status = await get_status()
             status["load_time_seconds"] = round(elapsed, 1)
@@ -1961,6 +2028,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 top_p=req.top_p,
                 show_thinking=req.show_thinking,
                 session_id=req.session_id,
+                messages=list(history) + [{"role": "user", "content": req.message}],
                 request_id=_request_id_ctx.get("-"),   # L5: 链路追踪
             )
             if result.get("status") == "ok":
@@ -2004,22 +2072,12 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 master_followups = result.get("followups", [])
                 if master_followups:
                     followups = master_followups[:3]
-                elif model_manager._engine_type == "llama_cpp":
-                    followups = _generate_followups_llama(history)
-                elif model_manager._engine_type == "pytorch":
-                    try:
-                        followups = _generate_followups(
-                            history, model_manager.tokenizer,
-                            model_manager.model, model_manager.get_device()
-                        )
-                    except Exception:
-                        followups = _fallback_followups(history, [])
                 else:
                     followups = _fallback_followups(history, [])
 
                 return {
                     "content": response_text,
-                    "thinking_content": None,
+                    "thinking_content": result.get("thinking_content"),
                     "metrics": forward_metrics,
                     "followups": followups,
                 }
@@ -2044,6 +2102,8 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                 temperature=req.temperature,
                 top_p=req.top_p,
                 session_id=req.session_id,
+                messages=list(history) + [{"role": "user", "content": req.message}],
+                show_thinking=req.show_thinking,
             )
             if pipeline_result.get("error"):
                 logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
@@ -2093,19 +2153,14 @@ def _execute_chat_full(req: ChatRequest) -> dict:
                     if model_manager._engine_type == "llama_cpp":
                         followups = _generate_followups_llama(history)
                     elif model_manager._engine_type == "pytorch":
-                        try:
-                            followups = _generate_followups(
-                                history, model_manager.tokenizer,
-                                model_manager.model, model_manager.get_device()
-                            )
-                        except Exception:
-                            followups = _fallback_followups(history, [])
+                        # 流水线成功后主节点仍保留首段裁剪模型，不能拿它生成追问。
+                        followups = _fallback_followups(history, [])
                     else:
                         followups = _fallback_followups(history, [])
 
                     return {
                         "content": response_text,
-                        "thinking_content": None,
+                        "thinking_content": pipeline_result.get("thinking"),
                         "metrics": pipeline_metrics,
                         "followups": followups,
                     }
@@ -2199,6 +2254,7 @@ def _execute_chat_full(req: ChatRequest) -> dict:
 
     # ---- PyTorch 引擎路径（CUDA/独显）----
     try:
+        model_manager.ensure_full_model()
         tier_max = generation_config.get("tier_max_new_tokens", generation_config["max_new_tokens"])
         thinking_budget = 384 if req.show_thinking else 0
         effective_max = min(req.max_new_tokens + thinking_budget,
@@ -2251,20 +2307,15 @@ def _execute_chat_full(req: ChatRequest) -> dict:
         generated_ids = outputs[0][prompt_len:]
         raw_text = model_manager._decode_generated_ids(generated_ids, stop_sequences).strip()
 
-        thinking_content = None
-        if req.show_thinking:
-            raw_lower = raw_text.lower()
-            if "<think" in raw_lower or "</think" in raw_lower:
-                parsed_text = raw_text
-            else:
-                parsed_text = "【思考】\n" + raw_text
-            response_text, thinking_content = _parse_thinking_response(parsed_text)
-        else:
-            # P3修复: 移除 DeepSeek-R1 / Qwen3 本地思考标记
-            # 这些模型通过 ChatML 原生输出 ... 格式，
-            # 不依赖 THINKING_SYSTEM_PROMPT 注入。show_thinking=False 时
-            # 必须显式剥离，否则思考标记会泄露到用户可见的回答中。
-            response_text = _strip_native_thinking_tags(raw_text)
+        native_thinking_prompt = "<think>" in prompt[-128:].lower()
+        parsed_text = raw_text
+        if req.show_thinking and not native_thinking_prompt and "<think" not in raw_text.lower():
+            parsed_text = "【思考】\n" + raw_text
+        response_text, thinking_content = _format_model_response(
+            parsed_text,
+            req.show_thinking,
+            native_thinking_prompt=native_thinking_prompt,
+        )
 
         history.append({"role": "assistant", "content": response_text})
 
@@ -2402,11 +2453,13 @@ def _auto_load_default_model():
     cfg.QUANT_TYPE = quant
     cfg.USE_COMPILE = False
 
-    model_manager.load_model(
-        model_path=model_path,
-        quant_type=quant,
-        profile=device_profile,
-        engine=engine,
+    _run_exclusive_model_change(
+        lambda: model_manager.load_model(
+            model_path=model_path,
+            quant_type=quant,
+            profile=device_profile,
+            engine=engine,
+        )
     )
 
     _init_kv_cache()
@@ -2535,8 +2588,7 @@ async def chat_stream(req: ChatRequest, request: Request):
         if (scheduler.get_distributed_inference_enabled()
                 and RUN_MODE == "distributed"
                 and scheduler._effective_role() == "master"
-                and model_manager._engine_type == "pytorch"
-                and scheduler._all_pipeline_nodes_ready()):
+                and model_manager._engine_type == "pytorch"):
             try:
                 for event in scheduler.run_pipeline_stream(
                     req.message,
@@ -2544,6 +2596,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     session_id=req.session_id,
+                    messages=[{"role": "user", "content": req.message}],
+                    show_thinking=req.show_thinking,
                 ):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
@@ -2560,6 +2614,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     session_id=req.session_id,
+                    messages=[{"role": "user", "content": req.message}],
+                    show_thinking=req.show_thinking,
                 ):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as e:
@@ -2948,13 +3004,15 @@ async def switch_model(req: SwitchModelRequest):
         # 清空内存会话/KV/统计（新模型不能复用旧模型的上下文）
         _reset_runtime_conversation_state(clear_histories=True)
 
-        result = model_manager.switch_model(
-            model_id=req.model_id,
-            quant_type=quant,
-            profile=device_profile,
-            engine=effective_engine if effective_engine != "auto" else None,
-            model_path=resolved_model_path,
-            db_experimental_models=_get_db_experimental_models(),
+        result = _run_exclusive_model_change(
+            lambda: model_manager.switch_model(
+                model_id=req.model_id,
+                quant_type=quant,
+                profile=device_profile,
+                engine=effective_engine if effective_engine != "auto" else None,
+                model_path=resolved_model_path,
+                db_experimental_models=_get_db_experimental_models(),
+            )
         )
 
         if result["success"]:
@@ -3211,10 +3269,9 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
 
     api_host = request.url.hostname or peer_host
     lan_ip = getattr(scheduler, "_lan_ip", "") or ""
-    if lan_ip and lan_ip not in {"0.0.0.0", "127.0.0.1", "localhost"}:
-        master_tcp_host = lan_ip
-    else:
-        master_tcp_host = api_host
+    from bootstrap import select_advertised_master_host
+
+    master_tcp_host = select_advertised_master_host(api_host, lan_ip)
     master_api_host = api_host or master_tcp_host
     master_api_port = request.url.port or API_PORT
     master_tcp_port = scheduler.tcp_server.port if scheduler.tcp_server else SERVER_PORT
@@ -3263,6 +3320,24 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
     return response
 
 
+@app.get("/api/bootstrap/info")
+async def bootstrap_info(request: Request):
+    """Minimal discovery endpoint for peers already admitted to the Tailnet."""
+    peer_host = request.client.host if request.client else ""
+    from bootstrap import is_trusted_bootstrap_source
+
+    if not is_trusted_bootstrap_source(peer_host):
+        raise HTTPException(403, "source network is not trusted")
+    role = scheduler.get_my_role()
+    return {
+        "status": "ok",
+        "is_master": bool(role.get("is_master")),
+        "node_id": role.get("node_id", ""),
+        "master_api_port": API_PORT,
+        "master_tcp_port": scheduler.tcp_server.port if scheduler.tcp_server else SERVER_PORT,
+    }
+
+
 @app.post("/api/cluster/connect")
 async def connect_to_master(req: ConnectToMasterRequest):
     """
@@ -3271,7 +3346,20 @@ async def connect_to_master(req: ConnectToMasterRequest):
     调用后本节点将通过 TCP 向指定主节点发起注册，
     注册成功后主节点的节点列表中将出现本节点。
     """
-    result = scheduler.connect_to_master(req.master_host, req.master_port)
+    force_bootstrap = False
+    if scheduler._effective_role() == "master":
+        if not req.switch_to_client or not scheduler.can_join_existing_master():
+            raise HTTPException(403, "当前主节点已确认或已有从节点，不能切换为从节点")
+        switch_result = scheduler.activate_client_mode()
+        if switch_result.get("status") == "denied":
+            raise HTTPException(409, switch_result.get("reason", "无法切换为从节点"))
+        force_bootstrap = True
+
+    result = scheduler.connect_to_master(
+        req.master_host,
+        req.master_port,
+        force_bootstrap=force_bootstrap,
+    )
     if result.get("status") == "denied":
         raise HTTPException(403, result.get("reason", "仅从节点可连接主节点"))
     if result.get("status") == "bootstrap_failed":
@@ -3523,7 +3611,7 @@ async def cancel_queue_task(task_id: str):
     """
     取消指定排队任务。
 
-    执行中的任务无法取消（需通过 PIPELINE_ABORT 协议中止）。
+    执行中的流水线任务会在当前 token step 完成后通过 PIPELINE_ABORT 中止。
     仅主节点。
     """
     if not scheduler._effective_role() == "master":
@@ -3534,7 +3622,7 @@ async def cancel_queue_task(task_id: str):
     else:
         return CancelTaskResponse(
             success=False, task_id=task_id,
-            message="任务不存在或正在执行中，无法取消"
+            message="任务不存在或已经完成，无法取消"
         )
 
 
@@ -3595,8 +3683,8 @@ async def get_layer_assignments():
 
 class LayerOverrideItem(BaseModel):
     node_id: str = Field(..., description="节点标识")
-    start_layer: int = Field(..., ge=0, le=23, description="起始层（含）")
-    end_layer: int = Field(..., ge=1, le=24, description="结束层（不含）")
+    start_layer: int = Field(..., ge=0, description="起始层（含）")
+    end_layer: int = Field(..., ge=1, description="结束层（不含）")
 
 
 class LayerOverrideRequest(BaseModel):
@@ -4417,8 +4505,24 @@ async def delete_turn(session_id: str, turn_index: int):
 @app.get("/api/db/health")
 async def database_health():
     """数据库连接健康检查"""
-    if not _db_available:
-        return {"status": "unavailable", "message": "psycopg2 未安装，使用内存降级模式"}
+    if not _db_importable:
+        return {"status": "unavailable", "reason": "driver_missing", "message": "psycopg2 未安装"}
+    import scheduler as _scheduler_module
+    runtime = _scheduler_module.get_database_status()
+    if not runtime["available"]:
+        if not runtime.get("configured", True):
+            return {
+                "status": "unavailable",
+                "reason": "not_configured",
+                "message": "数据库未配置，正在使用本地文件存储",
+                "retry_in_seconds": 0,
+            }
+        return {
+            "status": "unavailable",
+            "reason": "connection_failed",
+            "message": runtime.get("last_error") or "数据库未配置或暂不可用",
+            "retry_in_seconds": runtime.get("retry_in_seconds", 0),
+        }
     return db_health()
 
 
@@ -4437,6 +4541,96 @@ async def database_health():
 _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
 if not os.path.isdir(_MODELS_DIR):
     _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+
+def _require_trusted_model_peer(request: Request) -> None:
+    from bootstrap import is_trusted_bootstrap_source
+
+    peer_host = request.client.host if request.client else ""
+    if not is_trusted_bootstrap_source(peer_host):
+        raise HTTPException(403, "source network is not trusted")
+
+
+def _active_pytorch_model() -> dict:
+    info = scheduler._get_active_pipeline_model_info()
+    if not info:
+        raise HTTPException(409, "主节点当前未加载可分层的 PyTorch 模型")
+    return info
+
+
+def _model_file_sha256(path: str) -> str:
+    from model_sync import compute_file_sha256
+
+    return compute_file_sha256(path)
+
+
+@app.get("/api/models/downloadable")
+async def downloadable_pytorch_model(request: Request, model_id: str = ""):
+    """Return the exact active PyTorch model manifest to Tailnet workers."""
+    _require_trusted_model_peer(request)
+    info = _active_pytorch_model()
+    if model_id and model_id != info["model_id"]:
+        raise HTTPException(409, "请求模型已不是主节点当前流水线模型")
+
+    root = os.path.realpath(info["model_path"])
+    files = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+        for filename in sorted(filenames):
+            if filename in {"model.sha256", "model.sha256.meta.json"} or filename.endswith(".part"):
+                continue
+            if not filename.lower().endswith((
+                ".safetensors", ".bin", ".json", ".py", ".tiktoken",
+                ".model", ".txt", ".jinja", ".spm", ".vocab",
+            )):
+                continue
+            path = os.path.realpath(os.path.join(directory, filename))
+            try:
+                if os.path.commonpath([root, path]) != root or not os.path.isfile(path):
+                    continue
+            except ValueError:
+                continue
+            relative_path = os.path.relpath(path, root).replace(os.sep, "/")
+            files.append({
+                "path": relative_path,
+                "size_bytes": os.path.getsize(path),
+                "sha256": _model_file_sha256(path),
+            })
+    return {
+        "model_id": info["model_id"],
+        "sha256": info["model_sha256"],
+        "total_layers": info["total_layers"],
+        "files": files,
+        "count": len(files),
+    }
+
+
+@app.get("/api/models/files/{model_id}/{relative_path:path}")
+async def download_pytorch_model_file(
+    model_id: str,
+    relative_path: str,
+    request: Request,
+):
+    """Stream one active-model file to an admitted Tailnet pipeline worker."""
+    _require_trusted_model_peer(request)
+    info = _active_pytorch_model()
+    if model_id != info["model_id"]:
+        raise HTTPException(409, "请求模型已不是主节点当前流水线模型")
+    root = os.path.realpath(info["model_path"])
+    path = os.path.realpath(os.path.join(root, relative_path.replace("/", os.sep)))
+    try:
+        inside_root = os.path.commonpath([root, path]) == root
+    except ValueError:
+        inside_root = False
+    if not inside_root or not os.path.isfile(path):
+        raise HTTPException(404, "模型文件不存在")
+    if os.path.basename(path) in {"model.sha256", "model.sha256.meta.json"} or path.endswith(".part"):
+        raise HTTPException(404, "模型文件不存在")
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=os.path.basename(path),
+    )
 
 
 @app.get("/api/models/gguf")

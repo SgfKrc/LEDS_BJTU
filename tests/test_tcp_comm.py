@@ -14,6 +14,7 @@ import logging
 import socket
 import struct
 import threading
+import time
 from unittest.mock import MagicMock
 import pytest
 import torch
@@ -93,7 +94,8 @@ class TestMessageType:
             "task_start", "task_stop", "task_done", "error",
             "tensor", "result",
             "status_req", "status_res",
-            "infer_forward", "infer_result", "layer_config",
+            "infer_forward", "infer_result", "infer_cancel",
+            "layer_config", "layer_config_ack",
             "role_transfer", "role_transfer_ack",
             "spare_master_designate", "spare_master_designate_ack",
             "spare_master_activate", "spare_master_activate_ack",
@@ -119,14 +121,190 @@ class TestMessageType:
         """分布式推理转发类型"""
         assert MessageType.INFER_FORWARD.value == "infer_forward"
         assert MessageType.INFER_RESULT.value == "infer_result"
+        assert MessageType.INFER_CANCEL.value == "infer_cancel"
 
     def test_layer_config_type(self):
         """分层配置推送类型"""
         assert MessageType.LAYER_CONFIG.value == "layer_config"
+        assert MessageType.LAYER_CONFIG_ACK.value == "layer_config_ack"
+
+    def test_local_model_hash_prefers_pytorch_weights(self, tmp_path, monkeypatch):
+        """流水线注册摘要必须优先取 PyTorch 权重，而不是同目录的 GGUF。"""
+        import config as cfg
+        import hashlib
+        from tcp_comm import TCPClient
+
+        model_dir = tmp_path / "qwen"
+        model_dir.mkdir()
+        weight = model_dir / "model.safetensors"
+        weight.write_bytes(b"pytorch-weights")
+        gguf = tmp_path / "qwen.gguf"
+        gguf.write_bytes(b"gguf-weights")
+
+        monkeypatch.setattr(cfg, "MODEL_PATH", str(model_dir))
+        monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(gguf))
+
+        actual = TCPClient._compute_local_model_sha256()
+        file_sha = hashlib.sha256(b"pytorch-weights").hexdigest()
+        expected = hashlib.sha256(
+            f"model.safetensors\0{weight.stat().st_size}\0{file_sha}\n".encode()
+        ).hexdigest()
+        assert actual == expected
 
     def test_chain_forward_type(self):
         """链式直连转发类型（P2 优化）"""
         assert MessageType.CHAIN_FORWARD.value == "chain_forward"
+
+    def test_chain_forward_ack_type(self):
+        """链式转发 ACK 类型"""
+        assert MessageType.CHAIN_FORWARD_ACK.value == "chain_forward_ack"
+
+
+class TestWindowsProbeSubprocesses:
+    def test_netsh_probe_is_hidden(self, monkeypatch):
+        import platform
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return type("Result", (), {"stdout": "Ethernet Connected", "returncode": 0})()
+
+        monkeypatch.setattr(tcp_comm_mod, "_HAS_PSUTIL", False)
+        monkeypatch.setattr(platform, "system", lambda: "Windows")
+        monkeypatch.setattr(tcp_comm_mod.subprocess, "run", fake_run)
+
+        assert tcp_comm_mod.detect_network_type() == "ethernet"
+        assert calls[0][1]["creationflags"] == tcp_comm_mod._WINDOWS_NO_WINDOW
+        assert calls[0][1]["encoding"] == "utf-8"
+        assert calls[0][1]["errors"] == "replace"
+
+    def test_getmac_probe_is_hidden(self, monkeypatch):
+        import platform
+        import uuid
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return type(
+                "Result",
+                (),
+                {
+                    "stdout": "Header\nEthernet,AA-BB-CC-DD-EE-FF,Connected\n",
+                    "returncode": 0,
+                },
+            )()
+
+        monkeypatch.setattr(tcp_comm_mod, "_HAS_PSUTIL", False)
+        monkeypatch.setattr(uuid, "getnode", lambda: 0)
+        monkeypatch.setattr(platform, "system", lambda: "Windows")
+        monkeypatch.setattr(tcp_comm_mod.subprocess, "run", fake_run)
+
+        assert tcp_comm_mod.get_mac_addresses() == ["aa-bb-cc-dd-ee-ff"]
+        assert calls[0][1]["creationflags"] == tcp_comm_mod._WINDOWS_NO_WINDOW
+        assert calls[0][1]["encoding"] == "utf-8"
+        assert calls[0][1]["errors"] == "replace"
+
+
+class TestLayerConfigSocketRoundTrip:
+    """Use loopback TCP to verify the layer-config and ACK wire contract."""
+
+    def test_direct_assignment_round_trips_with_ack(self, monkeypatch):
+        import config as cfg
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "test-layer-config-secret")
+        monkeypatch.setattr(
+            TCPClient, "_compute_local_model_sha256", staticmethod(lambda: "sha-qwen")
+        )
+        monkeypatch.setattr(
+            TCPClient,
+            "_heartbeat_loop",
+            lambda self, connection_generation=None: None,
+        )
+        monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
+        monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
+
+        ack_event = threading.Event()
+        received_configs = []
+        received_acks = []
+        server = TCPServer(host="127.0.0.1", port=port)
+
+        def on_server_message(client_id, msg):
+            if msg.get("type") == MessageType.REGISTER.value:
+                server.confirm_registration(client_id)
+            elif msg.get("type") == MessageType.LAYER_CONFIG_ACK.value:
+                received_acks.append((client_id, msg["data"]))
+                ack_event.set()
+
+        server.start(on_message=on_server_message)
+        client = TCPClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            client_id="worker1",
+            role="client",
+            advertise_host="127.0.0.1",
+            advertise_port=port,
+        )
+
+        def on_client_message(msg):
+            if msg.get("type") != MessageType.LAYER_CONFIG.value:
+                return
+            assignment = msg["data"]
+            received_configs.append(assignment)
+            client.send_data(
+                {
+                    "node_id": "worker1",
+                    "config_id": assignment["config_id"],
+                    "status": "ready",
+                    "start_layer": assignment["start_layer"],
+                    "end_layer": assignment["end_layer"],
+                    "model_sha256": assignment["model_sha256"],
+                    "engine": "pytorch",
+                },
+                MessageType.LAYER_CONFIG_ACK,
+            )
+
+        try:
+            assert client.connect(on_message=on_client_message) is True
+            assignment = {
+                "node_id": "worker1",
+                "config_id": "cfg-loopback",
+                "start_layer": 4,
+                "end_layer": 8,
+                "has_embedding": False,
+                "has_lm_head": True,
+                "model_id": "deepseek-r1-distill-qwen-1.5b",
+                "model_sha256": "sha-qwen",
+                "total_layers": 28,
+                "master_api_port": 8000,
+            }
+            server.send_layer_config("worker1", assignment)
+
+            assert ack_event.wait(3), "layer_config_ack timed out"
+            assert received_configs == [assignment]
+            assert received_acks == [
+                (
+                    "worker1",
+                    {
+                        "node_id": "worker1",
+                        "config_id": "cfg-loopback",
+                        "status": "ready",
+                        "start_layer": 4,
+                        "end_layer": 8,
+                        "model_sha256": "sha-qwen",
+                        "engine": "pytorch",
+                    },
+                )
+            ]
+        finally:
+            client.disconnect()
+            server.stop()
 
 
 # ================================================================
@@ -594,7 +772,7 @@ class TestTCPServerConnectionManagement:
         client.sock = object()
         client._running = True
 
-        def fake_send_data(data, msg_type):
+        def fake_send_data(data, msg_type, connection_sock=None):
             client._running = False
 
         def bad_callback():
@@ -741,8 +919,211 @@ class TestReconnectBehavior:
         assert client.sock is None
 
 
+class TestTCPSendSerialization:
+    """同一连接上的心跳、控制消息和张量帧不得交叉写入。"""
+
+    class DetectingSocket:
+        def __init__(self):
+            self.active = 0
+            self.overlap = False
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def sendall(self, _payload):
+            with self.lock:
+                if self.active:
+                    self.overlap = True
+                self.active += 1
+                self.calls += 1
+            time.sleep(0.03)
+            with self.lock:
+                self.active -= 1
+
+    def test_client_send_data_serializes_concurrent_writers(self):
+        client = TCPClient(server_host="127.0.0.1", server_port=1, client_id="client1")
+        sock = self.DetectingSocket()
+        client.sock = sock
+
+        threads = [
+            threading.Thread(
+                target=client.send_data,
+                args=({"index": index}, MessageType.HEARTBEAT),
+            )
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert sock.calls == 2
+        assert sock.overlap is False
+
+    def test_server_send_to_client_serializes_concurrent_writers(self):
+        server = TCPServer(host="127.0.0.1", port=0)
+        sock = self.DetectingSocket()
+        server._set_client(
+            "client1",
+            ClientConn(client_id="client1", sock=sock, addr=("127.0.0.1", 1)),
+        )
+
+        threads = [
+            threading.Thread(
+                target=server.send_to_client,
+                args=("client1", {"index": index}, MessageType.STATUS_RES),
+            )
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert sock.calls == 2
+        assert sock.overlap is False
+
+
 class TestTCPClientRegistrationAck:
     """Registration acknowledgement handling."""
+
+    def test_disconnect_callback_is_current_generation_and_idempotent(self):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        calls = []
+        client.on_disconnect = lambda: calls.append("lost")
+        client._connection_generation = 2
+        client._registered = True
+
+        client._notify_disconnect(1)
+        assert calls == []
+        client._notify_disconnect(2)
+        client._notify_disconnect(2)
+        assert calls == ["lost"]
+        assert client.is_registered is False
+
+    def test_recv_loop_is_bound_to_its_original_socket(self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        class FakeSocket:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        original_sock = FakeSocket()
+        replacement_sock = object()
+        received_from = []
+        client.sock = original_sock
+        client._running = True
+        client._registered = True
+        client._connection_generation = 1
+
+        def recv_data(sock=None):
+            received_from.append(sock)
+            client.sock = replacement_sock
+            return None
+
+        monkeypatch.setattr(client, "recv_data", recv_data)
+
+        client._recv_loop(1)
+
+        assert received_from == [original_sock]
+        assert client.is_registered is False
+        assert original_sock.closed is True
+        assert client.sock is replacement_sock
+
+    def test_stale_heartbeat_generation_cannot_send_on_new_connection(
+            self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        client.sock = object()
+        client._running = True
+        client._connection_generation = 2
+        monkeypatch.setattr(
+            client,
+            "send_data",
+            lambda *args, **kwargs: pytest.fail("旧心跳线程不能使用新连接"),
+        )
+
+        client._heartbeat_loop(1)
+
+    def test_heartbeat_uses_its_original_socket(self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        original_sock = object()
+        client.sock = original_sock
+        client._running = True
+        client._connection_generation = 1
+        calls = []
+
+        def send_data(data, msg_type, connection_sock=None):
+            calls.append(connection_sock)
+            client._running = False
+
+        monkeypatch.setattr(client, "send_data", send_data)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _seconds: None)
+
+        client._heartbeat_loop(1)
+
+        assert calls == [original_sock]
+
+    def test_registration_preparation_finishes_before_socket_connect(
+            self, monkeypatch):
+        packet = build_message(
+            MessageType.REGISTER,
+            {"status": "registered", "client_id": "worker1"},
+        )
+
+        class FakeSocket:
+            def __init__(self):
+                self._payload = bytearray(packet)
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _addr):
+                pass
+
+            def getsockname(self):
+                return ("100.64.0.2", 50000)
+
+            def sendall(self, _data):
+                pass
+
+            def recv(self, size):
+                chunk = self._payload[:size]
+                del self._payload[:size]
+                return bytes(chunk)
+
+            def close(self):
+                pass
+
+        client = TCPClient(
+            server_host="100.64.0.1", server_port=8888, client_id="worker1",
+        )
+        preparation_socket_states = []
+
+        def detect_network():
+            preparation_socket_states.append(client.sock)
+            return "tailscale"
+
+        def compute_model_sha():
+            preparation_socket_states.append(client.sock)
+            return "sha-model"
+
+        monkeypatch.setattr(tcp_comm_mod, "detect_network_type", detect_network)
+        monkeypatch.setattr(client, "_compute_local_model_sha256", compute_model_sha)
+        monkeypatch.setattr(tcp_comm_mod.socket, "socket", lambda *_args, **_kwargs: FakeSocket())
+        monkeypatch.setattr(client, "_heartbeat_loop", lambda _generation=None: None)
+        monkeypatch.setattr(client, "_recv_loop", lambda _generation=None: None)
+
+        assert client.connect() is True
+        assert preparation_socket_states == [None, None]
 
     def test_connect_returns_false_when_registration_rejected(self, monkeypatch):
         packet = build_message(

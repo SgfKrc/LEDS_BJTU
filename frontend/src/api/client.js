@@ -399,10 +399,14 @@ export async function fetchInviteInfo() {
   return request('/cluster/invite');
 }
 
-export async function connectToMaster(masterHost, masterPort) {
+export async function connectToMaster(masterHost, masterPort, switchToClient = false) {
   return request('/cluster/connect', {
     method: 'POST',
-    body: JSON.stringify({ master_host: masterHost, master_port: masterPort }),
+    body: JSON.stringify({
+      master_host: masterHost,
+      master_port: masterPort,
+      switch_to_client: switchToClient,
+    }),
   });
 }
 

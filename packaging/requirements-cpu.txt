@@ -25,6 +25,8 @@ llama-cpp-python>=0.3.0
 transformers>=4.47.0,<4.48.0    # Qwen remote code + DeepSeek-R1 Distill 兼容窗口
 accelerate>=1.0.0                # 模型加载加速
 transformers-stream-generator>=0.0.4  # Qwen-1.8B remote code 依赖
+einops>=0.6.0                    # Qwen-1.8B rotary embedding / rearrange
+tiktoken>=0.5.0                  # Qwen-1.8B remote tokenizer 依赖
 bitsandbytes>=0.45.0             # 量化路径
 
 # --- 原生桌面窗口（替代外部浏览器）---
@@ -35,6 +37,8 @@ pandas>=2.0.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.12
+httpx>=0.28.1,<0.29.0
+httpx2>=2.5.0,<3.0.0
 
 # --- 工具 ---
 tqdm>=4.65.0

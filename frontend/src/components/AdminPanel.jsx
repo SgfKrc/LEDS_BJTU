@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   fetchClusterStatus, fetchClusterNodes,
   fetchClusterConfig, deregisterNode, deleteClusterNode, updateMaxNodes,
-  fetchInviteInfo, connectToMaster,
+  fetchInviteInfo, connectToMaster, fetchMyRole,
   discoverMaster, resetMasterIdentity,
   manualRegisterNode, fetchMasterHealth,
   testEmailNotification,
@@ -67,7 +67,7 @@ function isTcpActive(clientInfo) {
 // 流水线拓扑子组件
 // ================================================================
 
-function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
+function PipelineTopology({ assignments, nodes, isDistributed, runMode, pipelineStatus }) {
   // 按 start_layer 排序，确保流水线顺序
   const sorted = [...assignments].sort((a, b) => (a.start_layer ?? 0) - (b.start_layer ?? 0));
 
@@ -78,6 +78,8 @@ function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
   // 检查流水线就绪状态
   const nodeMap = {};
   (nodes || []).forEach(n => { nodeMap[n.node_id] = n; });
+  const workerStatusMap = {};
+  (pipelineStatus?.workers || []).forEach(w => { workerStatusMap[w.node_id] = w; });
 
   const allWorkersOnline = pipelineNodes.every(a => {
     const n = nodeMap[a.node_id];
@@ -89,8 +91,13 @@ function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
   });
 
   const isPipelineActive = isDistributed && runMode === 'distributed' && pipelineNodes.length > 0;
-  const isPipelineHealthy = isPipelineActive && allWorkersOnline;
-  const isPipelineDegraded = isPipelineActive && anyWorkerOffline && !allWorkersOnline;
+  const isPipelineHealthy = isPipelineActive && (
+    pipelineStatus ? pipelineStatus.active : allWorkersOnline
+  );
+  const isPipelineDegraded = isPipelineActive && !isPipelineHealthy && (
+    pipelineStatus ? pipelineStatus.online_worker_count > 0 : anyWorkerOffline
+  );
+  const readinessReason = pipelineStatus?.readiness_reason || '';
 
   // 单节点模式（无从节点）
   if (pipelineNodes.length === 0) {
@@ -139,9 +146,10 @@ function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
         </span>
         <span className="pipeline-status-text">
           {!isPipelineActive ? '流水线未激活 — 请启用分布式推理并确保有从节点在线' :
-           isPipelineHealthy ? '流水线就绪 — 所有节点在线，分布式层推理正常工作' :
-           isPipelineDegraded ? '流水线降级 — 部分从节点离线，将自动回退到主节点全模型推理' :
-           '流水线不可用 — 所有从节点离线'}
+           isPipelineHealthy ? '流水线就绪 — 所有从节点已确认同款模型与分配层' :
+           readinessReason || (isPipelineDegraded
+             ? '流水线未就绪 — 请求将回退到主节点全模型推理'
+             : '流水线不可用 — 从节点尚未完成计算准备')}
         </span>
       </div>
 
@@ -152,6 +160,7 @@ function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
             <PipelineNodeCard
               node={node}
               nodeInfo={nodeMap[node.node_id]}
+              workerStatus={workerStatusMap[node.node_id]}
               isFirst={idx === 0}
               isLast={idx === fullPipeline.length - 1}
               isMaster={node._isMaster}
@@ -186,12 +195,17 @@ function PipelineTopology({ assignments, nodes, isDistributed, runMode }) {
   );
 }
 
-function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
+function PipelineNodeCard({ node, nodeInfo, workerStatus, isFirst, isLast, isMaster }) {
   const isOnline = nodeInfo?.state === 'online';
   const isOffline = nodeInfo?.state === 'offline';
   const rtt = nodeInfo?.avg_rtt_ms ?? nodeInfo?.last_rtt_ms ?? 0;
   const roleIcon = isMaster ? '🖥️' : '💻';
   const roleLabel = isMaster ? '主节点' : '从节点';
+  const workerState = !isMaster && isOnline ? workerStatus?.layer_status : '';
+  const statusText = isOffline ? '🔴 离线' : !isOnline ? '⚪ 未知' :
+    workerState === 'ready' ? '🟢 计算就绪' :
+    workerState === 'loading' ? '🟡 模型同步/层加载中' :
+    workerState === 'error' ? '🔴 层加载失败' : '🟡 在线，等待分层';
 
   return (
     <div className={`pipeline-node-card ${
@@ -207,13 +221,17 @@ function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
           isOnline ? 'status-online' :
           isOffline ? 'status-offline' : 'status-unknown'
         }`}>
-          {isOnline ? '🟢 在线' :
-           isOffline ? '🔴 离线' : '⚪ 未知'}
+          {isMaster && isOnline ? '🟢 在线' : statusText}
         </span>
       </div>
 
       {/* 节点标识 */}
       <div className="pipeline-node-id mono">{node.node_id}</div>
+      {workerStatus?.layer_error && (
+        <div className="pipeline-node-gpu" title={workerStatus.layer_error}>
+          层加载错误: {workerStatus.layer_error}
+        </div>
+      )}
 
       {/* 层范围 */}
       <div className="pipeline-node-layers">
@@ -229,7 +247,14 @@ function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
       {/* 特殊层标记 */}
       <div className="pipeline-node-flags">
         {node.has_embedding && <span className="pipeline-flag flag-embed">📥 Embedding</span>}
-        {node.has_lm_head && <span className="pipeline-flag flag-lmhead">📤 LM Head</span>}
+        {node.has_lm_head && (
+          <span
+            className="pipeline-flag flag-lmhead"
+            title={!isLast ? '尾层 hidden states 返回该节点后执行输出投影' : undefined}
+          >
+            📤 LM Head{!isLast ? '（尾层回传）' : ''}
+          </span>
+        )}
         {!node.has_embedding && !node.has_lm_head && (
           <span className="pipeline-flag flag-transformer">🔄 Transformer</span>
         )}
@@ -260,7 +285,7 @@ function PipelineNodeCard({ node, nodeInfo, isFirst, isLast, isMaster }) {
 }
 
 
-export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
+export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicatedGpu }) {
   const [status, setStatus] = useState(null);
   const [nodes, setNodes] = useState(null);
   const [config, setConfig] = useState(null);
@@ -299,6 +324,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   // 动态分层
   const [layerAssignment, setLayerAssignment] = useState(null);
   const [layerOverrides, setLayerOverrides] = useState({});  // { node_id: { start, end } }
+  const activeLayerTotal = layerAssignment?.total ?? config?.layers?.total ?? 24;
 
   // 云同步状态
   const [syncStatus, setSyncStatus] = useState(null);
@@ -327,11 +353,14 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
   const [queueLoading, setQueueLoading] = useState(false);
 
   const isMaster = myRole?.is_master ?? false;
+  const isProvisional = myRole?.is_provisional ?? false;
+  const refreshInFlight = useRef(null);
 
   // 拉取全部数据
   const refresh = useCallback(() => {
+    if (refreshInFlight.current) return refreshInFlight.current;
     setLoading(true);
-    Promise.all([
+    const pending = Promise.all([
       fetchClusterStatus().catch(() => null),
       fetchClusterNodes().catch(() => null),
       fetchClusterConfig().catch(() => null),
@@ -361,14 +390,27 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
       if (qd) {
         setQueueDetail(qd);
       }
-    }).finally(() => setLoading(false));
+    }).finally(() => {
+      refreshInFlight.current = null;
+      setLoading(false);
+    });
+    refreshInFlight.current = pending;
+    return pending;
   }, [isMaster]);
 
-  // 初始加载 + 5 秒自动刷新
+  // 初始加载；每轮完成 5 秒后再刷新，避免慢请求重叠堆积。
   useEffect(() => {
-    refresh();
-    const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
+    let cancelled = false;
+    let timer = null;
+    const poll = async () => {
+      await refresh();
+      if (!cancelled) timer = setTimeout(poll, 5000);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [refresh]);
 
   const handleDeregister = async (nodeId) => {
@@ -795,7 +837,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
     }
   };
 
-  // ---- 从节点：自动发现主节点（数据库查询） ----
+  // ---- 从节点/待配置节点：自动发现主节点（本地配置、DB、Tailnet） ----
   const handleDiscover = async (showToast = true) => {
     setDiscovering(true);
     try {
@@ -805,7 +847,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
         setMasterHost(result.master_host);
         setMasterPort(String(result.master_port || 8888));
         if (showToast) {
-          onToast?.({ type: 'success', msg: `🔍 在数据库中发现了主节点: ${result.master_host}:${result.master_port}` });
+          onToast?.({ type: 'success', msg: `🔍 已发现主节点: ${result.master_host}:${result.master_port}` });
         }
       } else if (result.found && result.stale) {
         // 找到了但心跳过期
@@ -815,7 +857,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
           onToast?.({ type: 'warning', msg: `⚠️ 主节点记录已过期 (${result.master_host}:${result.master_port})，请确认主节点在线` });
         }
       } else if (showToast) {
-        onToast?.({ type: 'error', msg: '未在数据库中发现主节点，请手动输入地址' });
+        onToast?.({ type: 'error', msg: '未发现主节点，请确认主节点在线或手动输入地址' });
       }
     } catch (err) {
       setDiscovery({ found: false });
@@ -829,7 +871,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
 
   // 从节点挂载时自动尝试发现主节点（静默）
   useEffect(() => {
-    if (!isMaster && myRole?.is_client) {
+    if (!isMaster && (myRole?.is_client || myRole?.can_join_existing_master)) {
       // 如果 master_discovery 已在 myRole 中返回（来自 get_my_role），直接使用
       if (myRole.master_discovery?.found) {
         const md = myRole.master_discovery;
@@ -843,7 +885,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
         handleDiscover(false);
       }
     }
-  }, [isMaster, myRole?.is_client]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isMaster, myRole?.is_client, myRole?.can_join_existing_master]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 从节点：周期性检查主节点健康状态（配合 5s 刷新）
   useEffect(() => {
@@ -874,9 +916,17 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
     const port = parseInt(masterPort, 10) || 8888;
     setConnecting(true);
     try {
-      const result = await connectToMaster(masterHost.trim(), port);
+      const result = await connectToMaster(
+        masterHost.trim(),
+        port,
+        Boolean(myRole?.can_join_existing_master && !myRole?.is_client),
+      );
       if (result.status === 'connected') {
         onToast?.({ type: 'success', msg: result.message || '连接成功！' });
+        const updatedRole = await fetchMyRole().catch(() => null);
+        if (updatedRole) {
+          onRoleChange?.(updatedRole);
+        }
         refresh();
         // 更新 myRole 的 node_id
         if (myRole && result.node_id) {
@@ -927,6 +977,8 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
           </span>
           {isMaster ? (
             <span className="role-badge" data-role="master">🖥️ 主节点</span>
+          ) : isProvisional ? (
+            <span className="role-badge" data-role="unknown">待配置节点</span>
           ) : (
             <span className="role-badge" data-role="client">💻 {myRole?.node_id || '从节点'}</span>
           )}
@@ -957,7 +1009,9 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
             <h3>🔗 连接主节点</h3>
             <div className="connect-panel">
               <p className="connect-desc">
-                输入主节点的 IP 地址和端口以注册到分布式推理集群。
+                {isProvisional
+                  ? '此节点尚未确认主节点身份，连接后将配置为从节点并获取集群认证信息。'
+                  : '输入主节点的 IP 地址和端口以注册到分布式推理集群。'}
                 主节点的连接信息可在主节点后台管理的「注册新节点」区域找到。
               </p>
 
@@ -967,11 +1021,15 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                   <span className="discovery-icon">{discovery.stale ? '⚠️' : '✅'}</span>
                   <span className="discovery-text">
                     {discovery.stale
-                      ? `数据库中发现主节点记录 (${discovery.master_host}:${discovery.master_port})，但心跳已过期，请确认主节点在线`
-                      : `已在数据库中自动发现主节点: ${discovery.master_host}:${discovery.master_port}`}
+                      ? `发现主节点记录 (${discovery.master_host}:${discovery.master_port})，但心跳已过期，请确认主节点在线`
+                      : `已自动发现主节点: ${discovery.master_host}:${discovery.master_port}`}
                   </span>
                   <span className="discovery-source">
-                    {discovery.source === 'database' ? '📡 数据库' : '⚙️ 配置文件'}
+                    {discovery.source === 'database'
+                      ? '📡 数据库'
+                      : discovery.source === 'tailnet'
+                        ? '🔐 Tailnet'
+                        : '⚙️ 配置文件'}
                   </span>
                 </div>
               )}
@@ -1268,6 +1326,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                   filteredNodeList.map((node) => {
                     const isOffline = node.state === 'offline';
                     const isMasterNode = node.role === 'master';
+                    const isProvisionalSelf = isProvisional && node.node_id === myRole?.node_id;
                     const isAndroidThin = node.node_type === 'android' && node.device_info?.connection_type === 'http_thin';
                     const netLabel = NETWORK_LABELS[node.network_type] || NETWORK_LABELS.unknown;
                     const netClass = NETWORK_CLASSES[node.network_type] || NETWORK_CLASSES.unknown;
@@ -1301,12 +1360,15 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                       <tr key={node.node_id} className={isOffline ? 'row-offline' : ''}>
                         <td>
                           <span className="node-id-cell">
-                            {typeIcon} {node.node_id}
+                            {typeIcon} {isProvisionalSelf ? '本机' : node.node_id}
                           </span>
                         </td>
                         <td>
-                          <span className="role-badge" data-role={node.role === 'master' ? 'master' : 'client'}>
-                            {ROLE_LABELS[node.role] || node.role}
+                          <span
+                            className="role-badge"
+                            data-role={isProvisionalSelf ? 'unknown' : (node.role === 'master' ? 'master' : 'client')}
+                          >
+                            {isProvisionalSelf ? '待配置' : (ROLE_LABELS[node.role] || node.role)}
                           </span>
                         </td>
                         <td>
@@ -2098,7 +2160,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
             <div className="layer-override-panel">
               <p className="connect-desc">
                 修改各节点的层区间将切换为手动覆盖模式。修改后自动推送到所有已连接的从节点。
-                区间必须连续且完整覆盖 0-24 层。
+                区间必须连续且完整覆盖 0-{activeLayerTotal} 层。
               </p>
               {layerAssignment.assignments.map((a) => (
                 <div className="layer-override-row" key={a.node_id}>
@@ -2107,7 +2169,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                     type="number"
                     className="setting-number-input"
                     value={layerOverrides[a.node_id]?.start ?? a.start_layer}
-                    min={0} max={23}
+                    min={0} max={Math.max(0, activeLayerTotal - 1)}
                     onChange={(e) => setLayerOverrides(prev => ({
                       ...prev,
                       [a.node_id]: { ...prev[a.node_id], start: parseInt(e.target.value) || 0 }
@@ -2119,7 +2181,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
                     type="number"
                     className="setting-number-input"
                     value={layerOverrides[a.node_id]?.end ?? a.end_layer}
-                    min={1} max={24}
+                    min={1} max={activeLayerTotal}
                     onChange={(e) => setLayerOverrides(prev => ({
                       ...prev,
                       [a.node_id]: { ...prev[a.node_id], end: parseInt(e.target.value) || 1 }
@@ -2149,6 +2211,7 @@ export default function AdminPanel({ onToast, myRole, hasDedicatedGpu }) {
               nodes={nodes?.nodes || []}
               isDistributed={distributedEnabled}
               runMode={status?.run_mode || 'single'}
+              pipelineStatus={status?.pipeline}
             />
           </section>
         )}

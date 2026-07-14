@@ -1,439 +1,512 @@
-# 五、Android 版本 — 远期部署计划
+# Android 版本远期计划
 
-> **状态**: 规划阶段  
-> **优先级**: 远期（v0.5.0+）  
-> **核心目标**: 将 QLH 边缘推理系统移植到 Android 设备  
-> **设计理念**: ⭐ **全有或全无** — 不做层间拆分
-
----
-
-## 5.1 设计理念：全有或全无
-
-### 5.1.1 为什么不做层间拆分
-
-llama.cpp 的常规 API 面向**完整模型推理**（token in → token out），内部虽然存在 GPU layer offload、tensor split、RPC backend 等机制，但都是 llama.cpp **进程内部的调度逻辑**，不暴露「输入 hidden states → 跑第 N-M 层 → 输出 hidden states」的稳定接口。
-
-要强行实现层间拆分需要：
-- Fork llama.cpp 源码，定位每层 hidden state 边界
-- 处理 KV cache 切分、position/attention mask 跨层传递
-- 保证 llama.cpp 量化张量布局与 PyTorch hidden states 格式兼容
-- 跟踪上游 llama.cpp 变更，持续维护 fork
-
-**工程量巨大，维护成本高，且与项目 PC 端的 PyTorch 层间拆分不在同一技术栈，收益有限。**
-
-### 5.1.2 全有或全无
-
-放弃层间拆分，Android 节点只有两种工作模式：
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Android 节点两种模式                        │
-├──────────────────────────┬───────────────────────────────────┤
-│  模式 A: 全有 (ALL)       │  模式 B: 全无 (NOTHING)            │
-│  Android 本地跑全部层      │  Android 只做展示，主节点全包       │
-├──────────────────────────┼───────────────────────────────────┤
-│  ┌──────────┐            │  ┌──────────┐                     │
-│  │ Android  │            │  │ Android  │  用户输入             │
-│  │ llama.cpp│            │  │ 聊天UI   │──────HTTP──────┐     │
-│  │ Q4_K_M   │            │  │ 薄客户端  │                │     │
-│  │ 1.16GB   │            │  └──────────┘                ▼     │
-│  │ 完整推理  │            │                     ┌──────────┐  │
-│  └──────────┘            │                     │ PC 主节点 │  │
-│      独立运行             │                     │ 调度+推理 │  │
-│  无需网络 (离线可用)       │                     └────┬─────┘  │
-│                          │                    分发到各PC从节点 │
-│                          │                     ← 结果汇总 ←   │
-└──────────────────────────┴───────────────────────────────────┘
-```
-
-| 维度 | 全有 (ALL) | 全无 (NOTHING) |
-|------|-----------|---------------|
-| **推理位置** | Android 本地 (llama.cpp) | PC 主节点 + 集群 |
-| **模型** | GGUF Q4_K_M (~1.16 GB) | 不需要（无模型） |
-| **计算贡献** | 全部 24 层 | 0 层 |
-| **网络依赖** | 离线可用 | 必须连接主节点 |
-| **APK 大小** | ~180 MB（含 .so） | ~15 MB（纯 UI） |
-| **适用场景** | 单机使用、网络不稳定 | 有 PC 集群、追求速度 |
-| **手机要求** | 4GB+ RAM，ARMv8.2-A+ | 任意 Android 8+ |
+> 更新日期：2026-07-14
+>
+> 状态：规划与技术预研
+>
+> 当前事实：Android Full 只能执行本机完整 llama.cpp 推理；Lite 只能把请求交给主节点；Android 不能加入现有 PC PyTorch 层间流水线
+>
+> 远期目标：完整推理 Worker -> 任务链拆分与分布式执行 -> 同一 llama.cpp/GGML 运行时的实验性跨设备拆分
+>
+> 关联文档：[Android SAF模型存储方案](Android%20SAF模型存储方案.md)、[PC与Android端交互体验优化计划](PC与Android端交互体验优化计划.md)、[分布式推理流水线实施计划](分布式推理流水线实施计划.md)、[混合分布式推理体系规划](混合分布式推理体系规划.md)、[三种分布式拆分细化实施方案](三种分布式拆分细化实施方案.md)
 
 ---
 
-## 5.2 技术架构
+## 1. 结论摘要
 
-### 5.2.1 模式 A：全有 — 技术栈
+Android 后续不再限定为“全有或全无”，但必须区分三个完全不同的分布式层级：
 
-```
-┌──────────────────────────────────────────┐
-│            Android APK (~180MB)           │
-├──────────────────────────────────────────┤
-│  📦 libllama_android.so    ← NDK 交叉编译 │
-│  📦 libggml.so             ← GGML 核心    │
-│  📦 Kotlin 业务层           ← JNI 桥接    │
-│  📦 Jetpack Compose UI     ← Material 3  │
-│  ─────────────────────────────────────── │
-│  📂 用户自行放入 / 应用内下载:             │
-│     models/qwen-1_8b-chat-Q4_K_M.gguf    │
-│     (~1.16 GB，放外部存储)                │
-└──────────────────────────────────────────┘
-```
+| 层级 | 传输边界 | Android 可行性 | 规划结论 |
+|---|---|---:|---|
+| 完整推理 Worker | prompt/messages -> 完整文本或结构化结果 | 高 | 近期主路线 |
+| 任务链/任务图拆分 | 上一阶段的文本、JSON、检索结果 -> 下一阶段 | 高 | 中期主路线 |
+| Transformer 层间拆分 | input IDs/hidden states/KV cache/logits | 当前低 | 仅限同运行时预研，不接入现有 PC PyTorch 流水线 |
 
-| 层级 | 技术 | 说明 |
-|------|------|------|
-| 推理引擎 | llama.cpp NDK | C → ARM64 .so，NEON 优化 |
-| JNI 桥接 | Kotlin/JNI | 封装 llama.cpp C API |
-| 业务逻辑 | Kotlin Coroutines + StateFlow | 推理状态管理、对话历史 |
-| UI | Jetpack Compose | Material 3，聊天界面 + 设置 |
-| 持久化 | Room (SQLite) | 对话历史、模型路径配置 |
-| 可选网络 | OkHttp + Tailscale | 注册到主节点（仅状态上报，不参与推理） |
+核心判断：
 
-**关键设计**：
-- 前台 Service + 通知栏常驻（"推理引擎运行中"），防止被系统杀死
-- Wake Lock（Wi-Fi + CPU），屏幕关闭时不断网不掉频
-- 温控策略：电池 ≥42°C 降线程 / 暂停
-- 默认仅充电时参与推理（可在设置覆盖）
-
-### 5.2.2 模式 B：全无 — 技术栈
-
-```
-┌──────────────────────────────────────────┐
-│            Android APK (~15MB)            │
-├──────────────────────────────────────────┤
-│  📦 Jetpack Compose UI     ← 聊天界面     │
-│  📦 OkHttp                 ← HTTP 客户端  │
-│  📦 Kotlin Coroutines      ← 异步请求     │
-│  📦 Room (SQLite)          ← 本地缓存     │
-│  📦 DataStore              ← 偏好设置     │
-└──────────────────────────────────────────┘
-         │ HTTP POST /api/chat
-         ▼
-┌──────────────────────────────────────────┐
-│           PC 主节点 (已有能力)             │
-│  api_server.py  ─→  scheduler.run_pipeline│
-│                  ─→  或 mgr.chat() 本地   │
-│                  ─→  返回完整响应          │
-└──────────────────────────────────────────┘
-```
-
-**极简实现**：Android 就是一个带聊天 UI 的 HTTP 客户端，调用主节点已有的 `/api/chat` 接口。主节点收到请求后，按现有逻辑执行：有从节点 → 流水线分发；无从节点 → 本地推理。
-
-**无需任何 PC 端代码改动** — 现有的 `/api/chat` 接口已经支持完整的 `ChatRequest` (message, max_new_tokens, temperature, top_p, session_id)，返回 `ChatResponse` (content, metrics, followups)。
-
-**可选增强**：
-- 主节点连接配置（IP:端口 保存到 DataStore）
-- 多会话管理（复用 `/api/sessions` 接口）
-- 流式展示（如主节点支持 SSE streaming）
+1. **当前 Android 不能做层间拆分。** 注册画像明确上报 `pipeline_worker=false`，主节点也会排除 `node_type=android`；JNI 使用 `model_params.n_gpu_layers=0`，当前仅 CPU 完整模型推理。
+2. **完整 Worker 可以落地。** Android 已经具备模型管理、前台 Service、llama.cpp JNI、完整生成和取消基础，只缺少主节点主动派发任务的长连接协议、租约、幂等、结果回传和资源准入。
+3. **任务链拆分比层间拆分更适合异构设备。** 阶段之间传递文本或结构化数据，不要求 Android 与 PC 使用同一模型格式、张量布局或执行引擎。
+4. **Android 参与“分布式推理”可以有两种含义。** 一种是完整任务在多个 Worker 间并发/串行编排；另一种才是单次生成的模型层跨设备计算。前者可产品化，后者仍是实验。
+5. **Android GPU 加速应用可以落地，但应叫 GPU 加速版，不应泛称独显版。** 主流 Android 平板使用 SoC 集成 GPU 并共享系统内存。上游 llama.cpp 已明确验证部分 Qualcomm Adreno OpenCL 设备，但这不等于所有 Android GPU 都可稳定运行。
+6. **真正带独立显存 GPU 的 Android 平板不能作为通用产品前提。** 此类设备少、Android 驱动栈和 NDK 可用计算后端不统一，只能按指定硬件/BSP 做定向版本。
 
 ---
 
-## 5.3 PC 端需要的改动
+## 2. 当前实现边界
 
-虽然模式 B（全无）不需要 PC 端改动，但为了更好地支持 Android 节点管理，建议做以下增强：
+### 2.1 已实现能力
 
-### 5.3.1 NodeInfo 增加 `node_type` 字段
+| 能力 | Full | Lite |
+|---|:---:|:---:|
+| Android 原生 UI、会话和 Room 存储 | 是 | 是 |
+| 连接 PC 主节点并转发聊天 | 是 | 是 |
+| SAF 模型目录和 GGUF 模型选择 | 是 | 否 |
+| llama.cpp JNI 完整模型生成 | 是 | 否 |
+| 前台 `InferenceService` | 是 | 仅保留必要壳层 |
+| 集群 presence 注册 | 是 | 是 |
+| 接收主节点完整推理任务 | 否 | 否 |
+| PC PyTorch 层间流水线 Worker | 否 | 否 |
+| Android GPU 计算后端 | 否 | 否 |
 
-```python
-# scheduler.py — NodeInfo 新增字段
-@dataclass
-class NodeInfo:
-    # ... 现有字段 ...
-    node_type: str = "pc"  # "pc" | "android_full" | "android_thin"
-```
+代码层面的当前约束：
 
-| node_type | 含义 | 层分配 | 参与流水线 |
-|-----------|------|--------|-----------|
-| `pc` | PC 节点（现有） | 正常分配 | ✅ |
-| `android_full` | Android 全有模式 | 0 层（自己全跑） | ❌ |
-| `android_thin` | Android 全无模式 | 0 层（不跑推理） | ❌ |
+- `MainViewModel.buildAndroidPresenceDeviceInfo()` 上报 `pipeline_worker=false`。
+- `api_server.py` 和 `scheduler.py` 将 Android 视为 presence 节点，不纳入 PC 层分配。
+- `qlh_llama_jni.cpp` 固定 `n_gpu_layers=0`。
+- Android CMake 没有启用 `GGML_OPENCL`、`GGML_VULKAN` 或 `GGML_RPC`。
+- 当前集群层间协议由 PC PyTorch 模型执行，传递 PyTorch hidden states，不是 llama.cpp/GGML RPC 协议。
 
-### 5.3.2 层分配跳过非 PC 节点
+因此前端出现“Android 已连接”不代表 Android 参与了层间推理，也不应把 Android 的 presence 或普通聊天请求统计为流水线 Worker 任务。
 
-`compute_layer_assignment()` 需要过滤 `node_type != "pc"` 的节点，不给 Android 节点分配层。
+### 2.2 为什么不能直接接入 PC 层间流水线
 
-### 5.3.3 前端节点列表显示 Android 标识
+PC 当前的层间拆分假设各计算节点具备同一套 PyTorch 模型语义：
 
-在管理面板节点列表中，Android 节点显示 🤖 图标和模式标签（"全有"/"全无"），帮助管理员区分设备类型。
+- 相同模型架构、权重版本、tokenizer 和配置。
+- 相同 hidden size、层编号、RoPE/position 规则和 attention mask 语义。
+- 可加载明确的 Transformer 层范围，并输出下一段可继续执行的 hidden states。
+- KV cache 能按当前协议创建、定位和清理。
 
-### 5.3.4 API 增强（可选）
+Android Full 使用 GGUF + llama.cpp。其公开 API 面向完整 decode，量化权重布局、计算图、KV cache 和 backend tensor 均由 GGML/llama.cpp 管理。即使模型名称相同，也不能把 PyTorch hidden states 直接送入任意 llama.cpp 层段继续计算。
 
-```python
-# api_server.py — 新增端点（可选）
-@app.get("/api/cluster/android/config")
-async def get_android_config():
-    """Android 客户端获取集群连接配置"""
-    return {
-        "master_host": scheduler.get_lan_ip(),
-        "master_port": SERVER_PORT,
-        "mode": "thin",  # 或 "full"
-    }
-```
+要跨引擎强行拆层，至少需要解决：
+
+- 在 llama.cpp 内暴露稳定的层段入口和出口。
+- 统一 hidden states 的 dtype、shape、布局、量化/反量化和端序。
+- 对齐 embedding、LM head、归一化、RoPE、attention mask 和采样状态。
+- 定义跨设备 KV cache 所有权、位置和回收协议。
+- 每个 token 传输中间张量，并处理超时、重试、取消和迟到结果。
+- 长期维护 llama.cpp fork，并跟踪上游计算图和 backend API 变化。
+
+结论是：**现有 PC PyTorch 层间协议与 Android llama.cpp 不兼容，不能仅靠放开 `pipeline_worker` 标志实现。**
 
 ---
 
-## 5.4 分阶段实施路线
+## 3. 目标架构
 
-### 阶段 0：环境验证（~2 天）
+### 3.1 节点能力模型
 
-**目标**：在 Android 设备上跑通 llama.cpp 命令行推理
+后续调度不能只按 `node_type` 判断，需上报明确能力：
 
-1. Ubuntu/WSL 配置 Android NDK r26+
-2. 交叉编译 llama.cpp → ARM64 二进制
-   ```bash
-   cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-         -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
-         -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF ..
-   make -j$(nproc)
-   ```
-3. `adb push` 模型文件 + 编译好的 binary
-4. `adb shell` 跑推理，测试性能
-
-**验收标准**：
-- 骁龙 865 ≥ 5 tok/s（Q4_K_M, 4 线程）
-- 峰值 RAM ≤ 2 GB
-- 结果与桌面端一致
-
-### 阶段 1：模式 B 先行 — 全无薄客户端（~1 周）
-
-**目标**：Android APK 可以连接 PC 主节点，发送消息并显示回复
-
-**为什么先做全无**：
-- 最简单，不需要 NDK / JNI / 模型加载
-- 可以验证 Android ↔ PC 通信链路
-- 快速产出可用的 Android 聊天客户端
-
-**核心模块**：
-
-```
-android/
-├── app/
-│   ├── src/main/java/com/qlh/inference/
-│   │   ├── MainActivity.kt          # 单 Activity 架构
-│   │   ├── ui/
-│   │   │   ├── ChatScreen.kt        # 聊天主界面（Compose）
-│   │   │   ├── SettingsScreen.kt    # 主节点连接设置
-│   │   │   ├── SessionListScreen.kt # 多会话列表
-│   │   │   └── theme/Theme.kt       # Material 3 主题
-│   │   ├── network/
-│   │   │   ├── ApiClient.kt         # OkHttp 封装，调用 /api/chat
-│   │   │   ├── ChatRepository.kt    # 消息发送 + 历史管理
-│   │   │   └── SseClient.kt         # SSE 流式接收（可选）
-│   │   ├── data/
-│   │   │   ├── AppDatabase.kt       # Room 数据库
-│   │   │   ├── MessageDao.kt        # 消息 DAO
-│   │   │   └── SettingsDataStore.kt # 连接配置持久化
-│   │   └── service/
-│   │       └── TailscaleService.kt  # Tailscale VPN 集成（可选）
-│   └── build.gradle.kts
-├── build.gradle.kts
-└── gradle.properties
-```
-
-**关键实现**：
-1. `ApiClient.kt` — POST JSON 到 `http://<master_ip>:8000/api/chat`
-2. `ChatScreen.kt` — 类微信聊天界面，消息气泡 + 打字动画
-3. 连接状态指示器（在线/离线/推理中）
-4. 对话历史本地缓存（Room），断网也能看历史
-
-### 阶段 2：模式 A — 全有本地推理（~2 周）
-
-**目标**：Android 本地加载 GGUF 模型，离线完整推理
-
-**核心模块**（在阶段 1 基础上增加）：
-
-```
-android/
-├── app/src/main/
-│   ├── cpp/
-│   │   ├── llama_bridge.cpp         # JNI: llama.cpp C API 封装
-│   │   ├── llama_bridge.h
-│   │   └── CMakeLists.txt
-│   ├── java/com/qlh/inference/
-│   │   ├── engine/
-│   │   │   ├── LlamaEngine.kt       # Kotlin 封装 JNI
-│   │   │   ├── InferenceConfig.kt   # 推理参数 (temp, top_p, max_tokens)
-│   │   │   └── ModelManager.kt      # 模型加载/卸载/状态
-│   │   ├── service/
-│   │   │   └── InferenceService.kt  # 前台 Service（推理线程）
-│   │   └── ui/
-│   │       ├── ModelDownloadScreen.kt  # 模型下载引导
-│   │       └── PerformanceMonitor.kt   # tok/s、内存、温度
-```
-
-**模型存储策略（重要）**：
-
-Android 系统卸载 APK 时不会提供应用自定义的“是否删除 models 目录”脚本选项。若模型放在应用内部目录（如 `context.filesDir/models`），卸载 APK 时会被系统自动删除，无法实现“默认保留”。
-
-因此正式版应采用以下策略之一：
-
-1. **推荐：SAF 用户选择目录** — 首次下载模型时让用户选择一个外部目录（如 `Download/QLH/models`），应用只保存 URI 权限；卸载 APK 不会删除该目录。
-2. **备选：公共 Downloads 目录** — 将模型保存到用户可见的 `Download/QLH/models`，设置页提供“删除本地模型”按钮；卸载 APK 默认保留。
-3. **不推荐：内部存储** — 适合测试，卸载 APK 会直接删除模型。
-
-**JNI 桥接核心函数**：
-
-```cpp
-// llama_bridge.cpp — 最小必要接口
-extern "C" {
-    JNIEXPORT jlong JNICALL Java_com_qlh_inference_engine_LlamaEngine_nativeInit(
-        JNIEnv*, jobject, jstring model_path, jint n_threads, jint n_ctx);
-    
-    JNIEXPORT jstring JNICALL Java_com_qlh_inference_engine_LlamaEngine_nativeGenerate(
-        JNIEnv*, jobject, jlong engine_ptr, jstring prompt, 
-        jint max_tokens, jfloat temperature, jfloat top_p);
-    
-    JNIEXPORT void JNICALL Java_com_qlh_inference_engine_LlamaEngine_nativeFree(
-        JNIEnv*, jobject, jlong engine_ptr);
-    
-    JNIEXPORT jfloat JNICALL Java_com_qlh_inference_engine_LlamaEngine_nativeGetTokPerSec(
-        JNIEnv*, jobject, jlong engine_ptr);
+```json
+{
+  "node_type": "android",
+  "capabilities": {
+    "thin_client": true,
+    "full_inference_worker": true,
+    "task_chain_worker": true,
+    "pytorch_layer_worker": false,
+    "ggml_rpc_worker": false,
+    "engine": "llama.cpp",
+    "model_format": "gguf",
+    "model_sha256": "...",
+    "backend": "cpu|opencl|vulkan",
+    "max_concurrency": 1
+  },
+  "runtime": {
+    "model_loaded": true,
+    "charging": true,
+    "battery_percent": 83,
+    "thermal_status": 1,
+    "available_memory_bytes": 4294967296
+  }
 }
 ```
 
-### 阶段 3：模式切换 + 自动注册（~1 周）
+能力必须由运行时探测和实际模型状态决定，不能仅凭设备型号推断。`full_inference_worker=true` 也不能推导出 `pytorch_layer_worker=true`。
 
-**目标**：两种模式无缝切换，可选注册到主节点
+### 3.2 三层调度结构
 
-- 设置页面切换「全有/全无」模式
-- 全有模式：可选注册到主节点（仅状态上报，不参与层分配）
-- 全无模式：自动连接主节点，显示主节点状态
-- 主节点管理面板显示 Android 节点（🤖 标识 + 模式标签）
-
-### 阶段 4：体验优化 + 发布（~1 周）
-
-- 首次启动引导（模型下载 → 模式选择 → 连接配置）
-- 通知栏快捷控制（暂停/恢复/切换模式）
-- 电量感知：≥80% 全速 / 20-80% 半速 / <20% 暂停
-- 充电检测：默认仅充电时参与推理
-- 温控降频：≥42°C 降 50% 线程
-- GitHub Release APK + Google Play（可选）
-
----
-
-## 5.5 性能预估
-
-### 5.5.1 全有模式（本地推理）
-
-| 芯片 | 等级 | 线程 | Q4_K_M tok/s | 峰值 RAM |
-|------|------|------|-------------|----------|
-| 骁龙 8 Gen 3 | 旗舰 | 4 | 12-18 | 1.8 GB |
-| 骁龙 8+ Gen 1 | 次旗舰 | 4 | 8-12 | 1.8 GB |
-| 骁龙 865 | 中端 | 4 | 5-8 | 1.8 GB |
-| 天玑 9200 | 旗舰 | 4 | 10-15 | 1.8 GB |
-| 骁龙 778G | 中低端 | 2 | 3-4 | 1.9 GB |
-| 骁龙 480 | 入门 | 2 | 1-2 | 2.0 GB |
-
-### 5.5.2 全无模式（转发给 PC 集群）
-
-Android 端几乎零开销。延迟取决于 PC 集群推理速度 + 网络 RTT：
-
-| 场景 | 单 token 延迟 | 说明 |
-|------|-------------|------|
-| PC 主节点单机 | ~50ms + 网络 | 主节点本地推理 |
-| PC 3 节点流水线 | ~200ms + 网络 | 分布式层拆分 |
-| WiFi 局域网 | +5-15ms | 同路由器 |
-| Tailscale 远程 | +30-80ms | 跨子网 |
-
----
-
-## 5.6 与现有系统的关系
-
-| 已有模块 | Android 全有模式 | Android 全无模式 |
-|----------|-----------------|-----------------|
-| `tcp_comm.py` 消息协议 | 可选：仅心跳上报 | 不涉及（用 HTTP） |
-| `scheduler.py` 分层算法 | 不参与（0 层） | 不参与（0 层） |
-| `llama_engine.py` | JNI 等效实现 | 不涉及 |
-| `api_server.py` `/api/chat` | 不涉及 | 直接复用 |
-| `api_server.py` `/api/sessions` | 不涉及 | 直接复用 |
-| Tailscale 组网 | Android 官方 App | Android 官方 App |
-| `config.py` | DataStore 等效 | DataStore 等效 |
-| 前端 React UI | 不涉及 | Android 原生 UI 替代 |
-
----
-
-## 5.7 风险与对策
-
-| 风险 | 概率 | 影响 | 对策 |
-|------|------|------|------|
-| Google Play 审核拒绝 | 中 | 无法上架 | APK 侧载（GitHub Release）|
-| 温控降频 | 高 | 推理速度骤降 | 温控策略 + 散热背夹推荐 |
-| 后台被系统杀死 | 高 | 推理中断 | 前台 Service + 电池优化白名单引导 |
-| 厂商 ROM 兼容性 | 中 | 部分手机无法运行 | 主力适配原生/类原生，MIUI/ColorOS 专项说明 |
-| ARM SVE 指令缺失 | 低 | 老芯片极慢 | 最低 ARMv8.2-A (2017+)，自动检测提示 |
-| GGUF 模型加载失败 | 低 | 模式 A 不可用 | 自动回退到模式 B |
-| Tailscale 耗电 | 中 | 待机缩短 | 仅充电时启用；按需连接模式 |
-| 网络断连（全无模式） | 中 | 推理不可用 | 自动切换到全有模式（如已下载模型） |
-
----
-
-## 5.8 时间线
-
-```
-┌──────────┬──────────┬──────────┬──────────┬──────────┐
-│  阶段 0  │  阶段 1  │  阶段 2  │  阶段 3  │  阶段 4  │
-│  环境    │  模式B   │  模式A   │  模式    │  体验    │
-│  验证    │  全无    │  全有    │  切换    │  优化    │
-│  2天     │  1周     │  2周     │  1周     │  1周     │
-└──────────┴──────────┴──────────┴──────────┴──────────┘
+```text
+请求 / 工作流
+    |
+    v
+任务图调度器：拆成可检查点恢复的 Stage / DAG
+    |
+    +-- Stage A -> Android 完整 Worker（llama.cpp CPU/GPU）
+    +-- Stage B -> PC 单机完整推理
+    +-- Stage C -> PC PyTorch 层间流水线
+    +-- Stage D -> 另一 Android/PC 完整 Worker
+    |
+    v
+聚合、校验、重试和最终响应
 ```
 
-**里程碑**：
-- **M0** (阶段 0 完成): `adb shell` 跑通 Qwen-1.8B GGUF 推理
-- **M1** (阶段 1 完成): APK 可连接 PC 主节点聊天（全无模式可用）
-- **M2** (阶段 2 完成): 离线本地推理可用（全有模式可用）
-- **M3** (阶段 3 完成): 双模式无缝切换 + 主节点识别 Android 节点
-- **M4** (阶段 4 完成): GitHub Release APK + Google Play 上架
+每个 Stage 只能选择一种执行后端：
+
+- `android_full_worker`
+- `pc_full_worker`
+- `pc_pytorch_pipeline`
+- 远期实验性的 `ggml_rpc_pool`
+
+禁止在同一 Stage 内把 PyTorch 层段和 Android GGUF 层段混在一条 hidden-state 链中。
 
 ---
 
-> **编写日期**: 2026-07-02  
-> **设计理念**: 全有或全无 — 不做层间拆分  
-> **关联文档**: [Android SAF模型存储方案](Android SAF模型存储方案.md)、[分布式推理流水线实施计划](分布式推理流水线实施计划.md)、[整体架构](整体架构.md)
+## 4. 路线 A：Android 完整推理 Worker
 
+### 4.1 定义
 
-## 5.9 Android GPU 版规划说明
+完整 Worker 接收一份自包含推理任务，在 Android 本机跑完整模型，再返回文本、usage 和运行指标：
 
-> **状态**: 调研阶段  
-> **优先级**: 远期（v0.6.0+）  
-> **核心目标**: 利用 Android 设备 GPU 加速本地 GGUF 推理  
+```text
+Master -> prompt/messages + sampling + model requirement
+Android -> accepted -> progress/heartbeat -> complete result
+```
 
-### 5.9.1 当前现状
+这不是层间拆分，但它是有效的分布式推理：主节点可以把不同用户请求、批量任务、工作流分支或重试分配给不同设备。
 
-- **Full 版** 可通过 `qlh_llama_jni.cpp` 本地推理，但 `n_gpu_layers=0`，所有层落在 CPU 上。
-- **Lite 版** 无 native 引擎，仅作 HTTP 薄客户端。
-- 两个当前 `android/app/build.gradle.kts` flavor 均未启用 Vulkan/OpenCL/NNAPI/QNN GPU 后端。
-- 游戏平板 / 高端 SoC（Adreno 740/750、Mali-G715 等）的 GPU 仅被 `AndroidDeviceInfoProvider.getGpuStatus()` 探测为设备画像，**不参与推理计算**。
-- 用户在设置页看到的 "GPU offload 支持: 否" 和 "当前推理后端: CPU llama.cpp" 反映此实际情况。
+### 4.2 连接方向
 
-### 5.9.2 不混入现有 Full/Lite
+Android 应主动连接主节点，维持受控 WebSocket 或现有集群协议的移动端变体。不要要求主节点主动访问手机监听端口，原因包括：
 
-Android GPU 版将作为**独立产品 flavor** 规划（如 `gpu`），**不混入现有 Full 或 Lite**，原因：
+- Android 后台和厂商 ROM 会限制常驻监听服务。
+- 手机网络可能处于 NAT、移动网络或地址变化状态。
+- 主动长连接更容易复用现有 Tailscale 网络和集群认证。
+- 断线检测、重连和任务租约可以统一处理。
 
-1. **APK 体积** — GPU 后端（Vulkan/OpenCL/QNN）会显著增加 native `.so` 体积。
-2. **兼容性** — 不同 GPU 后端对不同 SoC 支持不一致，需要运行时检测 + 优雅回退。
-3. **温控 / 功耗** — GPU 持续推理比 CPU 更热，对游戏平板热量和电池寿命影响较大。
-4. **维护成本** — 多后端矩阵测试负担高，独立 flavor 更方便 beta → stable 渐进式发布。
+### 4.3 最小协议
 
-### 5.9.3 候选后端与调研路线
+| 消息 | 方向 | 作用 |
+|---|---|---|
+| `WORKER_REGISTER` | Android -> Master | 能力、模型摘要、后端、温控和并发度 |
+| `TASK_OFFER` | Master -> Android | 任务摘要、模型要求、预计 token、租约 |
+| `TASK_ACCEPT/REJECT` | Android -> Master | 接受或说明电量、温度、模型不匹配等原因 |
+| `TASK_START` | Android -> Master | 已获得执行槽并开始 |
+| `TASK_PROGRESS` | Android -> Master | 心跳、token 数、速度和温度 |
+| `TASK_RESULT` | Android -> Master | 文本、metrics、模型/引擎摘要 |
+| `TASK_FAILED` | Android -> Master | 可重试错误与不可重试错误分类 |
+| `TASK_CANCEL` | Master -> Android | 协作取消 |
+| `TASK_CANCELLED` | Android -> Master | 取消确认和资源清理完成 |
 
-| 后端 | 覆盖范围 | 优势 | 风险 |
-|------|---------|------|------|
-| **llama.cpp Vulkan** | 绝大多数 Android GPU（Adreno/Mali/PowerVR） | 社区活跃，上游维护，多 GPU 架构兼容 | 需评估 Vulkan 运行时兼容性（Android 7+） |
-| **Qualcomm QNN (Qualcomm Neural Network)** | 骁龙 SoC（Adreno GPU + Hexagon NPU） | 官方 SDK，可能利用 NPU 混合加速 | 仅高通，许可条款强，APK 体积大 |
-| **NNAPI (Neural Networks API)** | Android 8.1+，硬件抽象层 | 标准 Android API，厂商优化灵活 | 委托执行，可控性低，调试困难 |
-| **OpenCL** | 较老 GPU 或 Vulkan 不可用的设备 | 兼容性广 | OpenCL 在 Android 上逐步被 Vulkan 取代 |
+每条任务必须包含全局唯一 `task_id`、`attempt_id` 和租约到期时间。主节点只能接收当前 attempt 的结果，迟到结果必须丢弃。
 
-**推荐调查顺序**: llama.cpp Vulkan → NNAPI 委托 → 需要时评估 QNN。
+### 4.4 调度准入与评分
 
-### 5.9.4 关键验收指标
+完整 Worker 使用独立评分，不复用 Transformer 层数分配权重：
 
-- **内存**：GPU offload N 层后 RAM 占用应控制在 2.5 GB 以内。
-- **速度**：GPU 加速应 ≥ 2× CPU 性能（同等 token 产出下）。
-- **温控**：连续推理 10 分钟后机身温度 ≤ 42°C。
-- **体积**：APK 增量不超过 60 MB（Vulkan 后端 .so 相对 CPU-only 的增量）。
+- 活跃模型是否匹配 `model_id + model_sha256 + tokenizer/config 摘要`。
+- 模型是否已加载，避免频繁冷加载。
+- 最近实测 prompt/decode tok/s，而不是只看 SoC 名称。
+- 当前可用 RAM、系统 low-memory 状态和上下文上限。
+- 充电状态、电量、thermal status 和连续运行时间。
+- RTT、断线率、任务成功率和队列长度。
+- CPU/OpenCL/Vulkan backend 及其设备白名单状态。
 
-### 5.9.5 实施阶段建议
+默认规则：单台 Android `max_concurrency=1`；未充电、低电量、高温、内存不足或应用不在允许的前台 Worker 模式时拒绝新任务。
 
-1. **调研验证**：在选定设备（如骁龙 8 Gen 2 Adreno 740 平板）上编译 llama.cpp + Vulkan backend 的 `libllama_android.so`，跑 Qwen-1.8B Q4_K_M 单 token 生成，对比 CPU-only。
-2. **独立 flavor**：`android/app/build.gradle.kts` 新增 `gpu` product flavor，`ndk.abiFilters += "arm64-v8a"`，CMake 开启 `-DGGML_VULKAN=ON`。
-3. **运行时检测**：启动时检查 Vulkan 可用性，不可用则提示"当前设备不支持 GPU 加速，请使用 Full 版 CPU 推理"或自动回退 CPU。
-4. **温控 / 电池**：在 InferenceService 中注入温控阈值和充电检测；GPU 推理默认需要充电 AC 供电 + 温度 < 40°C。
-5. **APK 分发**：单独 GitHub Release artifact，标注 “GPU 实验版”，不混入 Full/Lite 发布渠道。
+### 4.5 故障隔离
+
+- 主节点在租约超时后把任务重新派给其他 Worker，旧 attempt 的结果不再生效。
+- Android 断线只失败当前 Stage，不应令整条工作流永久失败。
+- 任务输入需可重放；产生外部副作用的 Stage 必须使用幂等键。
+- 模型加载错误、OOM、温控暂停、用户取消和网络断开必须使用不同错误码。
+- 任务结果应包含实际 `model_sha256` 和 backend，防止错误模型静默完成。
+
+---
+
+## 5. 路线 B：任务链/任务图拆分后的分布式推理
+
+### 5.1 含义
+
+任务链拆分不是把 Transformer 第 0-11 层和第 12-23 层拆开，而是把一个复杂请求拆成有明确输入输出契约的阶段：
+
+```text
+输入规范化
+  -> 检索/上下文选择
+  -> 候选答案生成（可并行多个 Worker）
+  -> 事实核查/评分
+  -> 修订
+  -> 最终格式化
+```
+
+阶段边界使用 UTF-8 文本、JSON、文档引用或其他稳定业务对象。这样 Android llama.cpp、PC PyTorch 和外部工具可以在同一工作流中协作，而不交换引擎内部张量。
+
+### 5.2 调度语义
+
+任务图至少要支持：
+
+- DAG 依赖和就绪队列。
+- 串行 Stage、并行分支、`fan-out/fan-in` 聚合。
+- 每阶段超时、租约、重试、取消和检查点。
+- Stage 级模型/能力约束。
+- 中间结果大小限制、摘要和持久化。
+- 幂等 attempt 与迟到结果过滤。
+- 失败分支降级，不因单节点异常让整条任务链失去恢复机会。
+
+当前 `graph_orchestrator.py` 是**通信拓扑和层分配编排器**，不是业务任务 DAG 执行器。任务链需要新的 `TaskGraphScheduler` 或等价模块，不能直接把现有 `GraphOrchestrator` 改名复用。
+
+### 5.3 Stage 内的分布式选择
+
+任务链拆分后，每个模型 Stage 可独立选择：
+
+1. Android/PC 单节点完整推理。
+2. 多个完整 Worker 并行生成候选答案。
+3. PC 节点使用现有 PyTorch 层间流水线执行一个 Stage。
+4. 远期使用同一 llama.cpp/GGML RPC 池执行一个 Stage。
+
+因此最终架构允许“任务链拆分后再分布式推理”，但分布式边界必须显式：业务 Stage 边界可以跨引擎；hidden-state 边界只能在兼容运行时内使用。
+
+### 5.4 首个验证工作流
+
+建议先实现无外部副作用的双候选评审流：
+
+```text
+用户问题
+  +-> Android Worker A 生成候选 A --+
+  +-> PC/Android Worker B 生成候选 B --+-> PC 主节点评审/合并 -> 最终回复
+```
+
+验收重点不是回答质量，而是验证：并行派发、租约、断线重派、部分失败降级、结果归属、统计和取消传播。
+
+---
+
+## 6. 路线 C：Android 层间拆分可行性调研
+
+### 6.1 路径比较
+
+| 路径 | 技术可行性 | 与现有系统兼容性 | 产品成熟度 | 结论 |
+|---|---:|---:|---:|---|
+| Android 加入现有 PC PyTorch hidden-state 流水线 | 低 | 低 | 低 | 不采用 |
+| 在 Android 打包 PyTorch/ExecuTorch 并实现同模型层段 | 中低 | 理论上较高 | 低 | 仅做小模型原型评估 |
+| llama.cpp/GGML RPC 跨设备 backend | 中 | 需要独立执行池 | 上游标记 POC | 隔离实验路线 |
+| Fork llama.cpp 暴露层段和 KV cache | 中 | 需自建新协议 | 很低 | 除非 RPC 不满足且收益明确，否则不做 |
+| 完整 Worker + 任务图 | 高 | 高 | 高 | 主路线 |
+
+### 6.2 llama.cpp/GGML RPC 能做什么
+
+当前锁定的 llama.cpp 上游文档说明：
+
+- `ggml-rpc-server` 可以暴露远端 CPU/GPU backend device。
+- 主运行时可以连接一个或多个远端 RPC device。
+- 默认会按可用内存把模型权重和 KV cache 分配到本地及远端设备。
+- 可通过 `tensor-split` 调整设备间比例。
+- 远端可使用 tensor cache 避免每次重新传输大权重。
+
+这证明 Android 作为 GGML 远端计算设备在架构上**不是不可能**。如果能为 Android NDK 编译 RPC server 与 CPU/OpenCL/Vulkan backend，并由前台 Service 安全托管，PC 或另一 Android 的 llama.cpp 主运行时可以尝试使用其算力。
+
+但上游同时明确写明 RPC 是 proof-of-concept、功能脆弱且不安全，不得暴露到开放或敏感网络。它目前不应直接进入正式集群协议，原因包括：
+
+- 没有本项目要求的任务身份、租约、取消和结果幂等语义。
+- 安全模型不足，不能只因位于 Tailnet 就忽略输入校验和服务暴露范围。
+- Android 生命周期可能在远端计算图执行期间暂停或杀死进程。
+- 跨 Wi-Fi/Tailscale 每 token 的 tensor 传输延迟可能抵消移动 GPU 收益。
+- PC PyTorch 主节点不能直接把 GGML RPC device 插入现有 PyTorch pipeline。
+- 上游 API 和协议处于实验状态，版本升级风险高。
+
+### 6.3 RPC 实验的边界
+
+若开展实验，应采用完全隔离的 `ggml_rpc_lab` 模式：
+
+- 只允许同一锁定 llama.cpp commit 和相同 GGUF 模型摘要。
+- 只在受控局域网/Tailnet 测试，RPC 端口不监听公网接口。
+- Android 使用前台 Service、充电和温控门槛。
+- 先验证 CPU RPC，再验证 OpenCL/Vulkan backend。
+- 与正式 `scheduler.py` 的 PC PyTorch 层分配、任务统计和 fallback 分开。
+- 任何 RPC 失败都回退到完整 Worker，不把未完成 tensor 任务转交不同引擎继续。
+
+进入产品路线的门槛：连续运行、断线恢复、安全封装和端到端收益全部通过；仅“成功生成一次”不算可落地。
+
+### 6.4 自定义 llama.cpp 层段 fork
+
+只有同时满足以下条件才考虑 fork：
+
+- GGML RPC 无法满足目标拓扑或资源控制。
+- 目标设备间网络实测足以承载 hidden states/KV 流量。
+- 跨设备端到端吞吐显著优于最快单节点完整推理。
+- 团队能承担固定上游版本、补丁重放和模型架构适配成本。
+
+否则自定义层段会成为长期维护负担，并可能只得到更慢、更不稳定的结果。
+
+---
+
+## 7. Android GPU 平板版可落地性
+
+### 7.1 硬件术语
+
+主流 Android 手机和平板的 Adreno、Mali、Immortalis GPU 位于 SoC 内，与 CPU 共享系统内存。它们不是 PC 语境中带独立显存的独显。
+
+所以产品命名建议为：
+
+- `Lite`：薄客户端。
+- `Full CPU`：本地 llama.cpp CPU 完整推理。
+- `Full GPU Experimental`：白名单设备的 GPU 加速完整推理/Worker。
+
+只有拿到具体硬件、Android BSP 和可用驱动栈后，才为真正独立 GPU 设备建立专用 flavor；不规划一个面向任意“独显 Android 平板”的通用 APK。
+
+### 7.2 后端调研结果
+
+调研基线为仓库内 vendored llama.cpp commit `47e1de77aa0f06bf73cfd8c5281d95979f89fcbe`：
+
+| 后端 | 上游证据 | 适合范围 | 判断 |
+|---|---|---|---|
+| CPU/Arm | 官方 Android binding 和 NDK 交叉编译文档；运行时检测 Arm 指令 | 所有当前 Full 支持设备 | 已落地 |
+| OpenCL/Adreno | 上游文档明确列出 Android 支持 Snapdragon 8 Gen 3、8 Elite，并验证 Adreno 750/830/840 等 | Qualcomm 白名单设备 | 最现实的 GPU 原型路线 |
+| Vulkan | llama.cpp 支持 Vulkan backend；Android 提供 Vulkan NDK 图形/计算接口 | 需逐设备验证驱动、算子覆盖和稳定性 | 第二实验路线，不能宣称全 Android 通用 |
+| Hexagon | 上游 Snapdragon/Hexagon backend 有 Android 构建说明，但日志标为 experimental | 指定 Snapdragon 开发平台 | 独立预研，不先进入消费版 |
+| QNN | 需要 Qualcomm SDK、许可和单独集成，当前 llama.cpp 接入链未验证 | 指定 Qualcomm 产品 | 暂不作为首选 |
+| NNAPI | 当前项目和 llama.cpp 路线没有可直接复用的层段/backend 接入 | 不明确 | 从推荐路线移除 |
+
+OpenCL 当前有最明确的上游 Android/Adreno 验证记录，因此建议优先于泛化 Vulkan 承诺。但它仍需要目标平板的驱动和 SoC 白名单。
+
+### 7.3 GPU 加速不等于显存扩容
+
+集成 GPU 与 CPU 共享 RAM。GPU offload 可能提高算力，但不会像 PC 独显那样凭空增加独立显存，甚至可能因 backend buffer、kernel 和 staging 产生额外占用。
+
+评估必须同时测量：
+
+- 模型加载峰值和稳定 RAM。
+- prefill tok/s、decode tok/s 和首 token 延迟。
+- 连续 10/30 分钟后的温控降频。
+- GPU backend 崩溃、驱动 reset 和应用恢复。
+- 不同 context size 的 KV cache 增长。
+- CPU 与 GPU 后端的功耗、充电状态和电池温升。
+- 同时作为完整 Worker 时的网络、心跳和取消响应。
+
+### 7.4 产品化门槛
+
+`Full GPU Experimental` 只面向设备白名单，并满足：
+
+- CMake 为独立 flavor 开启对应 backend，不污染 Lite。
+- 运行时列举到真实 GGML GPU backend device。
+- `llama_supports_gpu_offload()` 为真，并实际配置非零 offload。
+- 同模型、上下文和参数下，相比 CPU 有稳定端到端收益，而不只是在短基准中更快。
+- 连续 30 分钟无 native crash、无不可恢复 driver error。
+- 超温时能停止接单、完成当前安全点后降级或取消。
+- GPU 不可用时可回退 CPU Full 或 Thin，不循环崩溃。
+- 每个白名单型号保存 SoC、GPU、驱动/Android 版本和基准结果。
+
+结论：**高端 Snapdragon Android 平板上的 GPU 加速 Full/Worker 版具备落地可能；通用 Android GPU 版和所谓通用独显平板版目前不具备发布依据。**
+
+---
+
+## 8. 分阶段实施计划
+
+### P0：保持当前边界并修正文档/状态
+
+- Android 继续上报 `pipeline_worker=false`。
+- 主节点继续排除 Android 的 PyTorch 层分配。
+- UI 明确区分“已连接”“完整 Worker 可用”“参与层间流水线”。
+- 不再把全有/全无描述为永久架构限制。
+
+验收：Android 注册不会改变 PC 层配置，任务统计不误报 Android 参与层间推理。
+
+### P1：完整 Worker 协议原型
+
+- Android 主动长连接和能力注册。
+- `TASK_OFFER/ACCEPT/RESULT/CANCEL` 最小协议。
+- 模型摘要、单并发、租约和迟到结果过滤。
+- 前台 Service、充电/温控/内存准入。
+- 主节点独立 `full_worker_pool`，不进入 `compute_layer_assignment()`。
+
+验收：主节点派发一项完整推理；Android 返回结果；断网后任务能重派且旧结果被丢弃。
+
+### P2：任务链/DAG 调度
+
+- 新建业务 `TaskGraphScheduler`，与层拓扑 `GraphOrchestrator` 分离。
+- 支持 Stage 依赖、并行分支、checkpoint、重试和聚合。
+- 支持 Android Full Worker、PC Full 和 PC PyTorch pipeline 三类 Stage executor。
+- 先完成双候选评审工作流。
+
+验收：任一 Android 分支失败时仍可由另一分支或重派完成，不导致整条链不可恢复。
+
+### P3：Android GPU 加速 Worker
+
+- 首选上游已验证的 Snapdragon/Adreno OpenCL 白名单设备。
+- 建立独立 GPU experimental flavor。
+- JNI 支持 backend 枚举、offload 配置和真实指标上报。
+- 与 CPU Full 做固定模型、固定上下文的持续基准。
+- 再评估 Vulkan 设备矩阵，不预设其一定优于 OpenCL。
+
+验收：至少一款目标平板达到产品化门槛并稳定执行完整 Worker 任务。
+
+### P4：GGML RPC 隔离实验
+
+- Android NDK 构建 `GGML_RPC` + CPU backend。
+- 局域网验证相同 commit、相同 GGUF 的远端设备发现和模型执行。
+- 再组合 OpenCL/Vulkan backend。
+- 测量权重缓存、首轮加载、per-token 流量、断线和恢复。
+
+验收：只有端到端性能优于单节点且安全/稳定性可封装，才提出正式集成设计。
+
+### P5：层段 fork 决策门
+
+根据 P4 数据做 Go/No-Go。默认 No-Go；没有量化收益和维护资源时不实现自定义 llama.cpp 层间协议。
+
+---
+
+## 9. 测试矩阵
+
+| 维度 | 最低覆盖 |
+|---|---|
+| 版本 | Lite、Full CPU、GPU Experimental |
+| SoC | 一款中端 CPU 设备、一款上游 OpenCL 白名单 Snapdragon 平板 |
+| 网络 | 局域网、Tailscale、断网/重连、高 RTT/丢包 |
+| 电源 | 充电、低电量、拔电 |
+| 温控 | 正常、升温降频、系统严重温控 |
+| 内存 | 正常、low-memory、模型加载 OOM、长 context |
+| 任务 | 成功、拒绝、取消、超时、租约过期、迟到结果、应用被杀 |
+| 模型 | 摘要一致、模型缺失、摘要不一致、加载中、已热加载 |
+| 工作流 | 串行、并行分支、部分失败、聚合失败、重试耗尽 |
+
+所有分布式统计必须分别展示：完整 Worker 任务数、任务链 Stage 数、PC 层间流水线任务数。不能用一个“分布式：是/否”覆盖三种语义。
+
+---
+
+## 10. 风险与停止条件
+
+| 风险 | 对策/停止条件 |
+|---|---|
+| Android 后台被杀 | 前台 Service + 租约；仍频繁中断则只允许用户显式开启 Worker |
+| 温控导致吞吐崩溃 | 基于持续基准评分；严重温控立即停止接单 |
+| 模型不一致 | 强制摘要匹配；Stage 边界跨模型只能传业务数据 |
+| 任务链单点失败 | checkpoint、attempt、重派和部分结果降级 |
+| RPC 不安全/脆弱 | 隔离实验、限制监听、版本锁定；未满足门槛不进正式版 |
+| GPU 驱动碎片化 | 设备白名单；未验证设备自动回退 CPU/Thin |
+| GPU 加速收益低 | 以端到端持续性能为准，不因 backend 能加载就发布 |
+| 自定义 fork 维护过重 | P5 默认 No-Go，优先完整 Worker 和任务图 |
+| 把集成 GPU 当独显估算容量 | 统一按共享 RAM 实测，不使用 PC VRAM 评分公式 |
+
+---
+
+## 11. 调研依据与待验证项
+
+本次结论以项目当前源码和仓库内锁定的 llama.cpp 上游快照为主要依据：
+
+- [Android presence 能力上报](../android/app/src/main/java/com/qlh/inference/MainViewModel.kt)：当前固定上报 `pipeline_worker=false`。
+- [Android JNI 模型加载](../android/app/src/main/cpp/qlh_llama_jni.cpp)：当前固定 `n_gpu_layers=0`。
+- [Android CMake 配置](../android/app/src/main/cpp/CMakeLists.txt)：当前未启用 OpenCL、Vulkan 或 RPC backend。
+- [锁定快照的 Android 文档](../android/app/src/main/cpp/llama.cpp/docs/android.md)：Android Studio binding、NDK 交叉编译与 Arm CPU 能力。
+- [锁定快照的 OpenCL 文档](../android/app/src/main/cpp/llama.cpp/docs/backend/OPENCL.md)：Android/Adreno 支持、已验证 Snapdragon/Adreno 型号和构建方法。
+- [锁定快照的 RPC 文档](../android/app/src/main/cpp/llama.cpp/tools/rpc/README.md)：远端 GGML device、权重/KV 分布、tensor cache，以及 POC/不安全警告。
+- [Android 官方 NDK Vulkan 文档](https://developer.android.com/ndk/guides/graphics/getting-started)。
+- [Android 官方 Vulkan 设备兼容文档](https://developer.android.com/games/develop/vulkan/device-compatibility)。
+- [llama.cpp 上游 OpenCL 文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENCL.md)。
+- [llama.cpp 上游 RPC 文档](https://github.com/ggml-org/llama.cpp/blob/master/tools/rpc/README.md)。
+
+本地调研基线 commit：`47e1de77aa0f06bf73cfd8c5281d95979f89fcbe`。实施 P3/P4 前必须联网复核上游最新文档和目标设备驱动，因为 GPU backend 与 RPC 仍在快速变化。
+
+仍需通过真实设备回答的问题：
+
+1. 目标 Snapdragon 平板的 OpenCL driver/compiler 是否满足上游 backend。
+2. OpenCL 与 Vulkan 在 Qwen 1.8B GGUF 上的 prefill、decode、温控和稳定性谁更优。
+3. Android 前台 Service 被切后台、锁屏和厂商省电策略影响的中断率。
+4. GGML RPC 在 Wi-Fi/Tailscale 下每 token 的实际流量和延迟。
+5. RPC tensor cache 在 Android 存储沙箱中的路径、空间和清理策略。
+6. 真正带独立 GPU 的目标 Android 硬件是否提供 NDK 可调用且可分发的驱动/API；没有具体硬件和 BSP 前不做可落地承诺。
+
+---
+
+## 12. 最终路线
+
+```text
+当前：Lite 薄客户端 + Full CPU 本机完整推理
+  -> P1：Android 完整推理 Worker
+  -> P2：任务链/任务图拆分，Stage 选择异构执行后端
+  -> P3：白名单 Android 平板 GPU 加速完整 Worker
+  -> P4：同一 llama.cpp/GGML 运行时 RPC 隔离实验
+  -> P5：仅在收益明确时决定是否维护自定义层段 fork
+```
+
+近期目标不是让 Android 假装成 PC PyTorch 层节点，而是先让它成为可靠、可取消、可重派、可统计的完整 Worker。任务链拆分随后提供真正可维护的异构分布式推理；层间拆分则保留为有严格准入门槛的研究方向。PC、Android、GGUF stage 和张量并行执行池的统一选择规则见[混合分布式推理体系规划](混合分布式推理体系规划.md)。

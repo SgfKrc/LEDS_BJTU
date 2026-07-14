@@ -12,10 +12,14 @@
 """
 
 import collections
+import hashlib
+import json
 import logging
 import os
+import sys
 import threading
 import time
+import uuid
 from enum import Enum
 from typing import Optional, Callable
 from dataclasses import dataclass, field
@@ -31,7 +35,7 @@ from config import (
     SERVER_IP, SERVER_PORT,
     NODE_ROLE, NODE_ID, MAX_NODES,
     MASTER_DOWN_EMAIL_TIMEOUT,
-    PIPELINE_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
+    PIPELINE_TIMEOUT, PIPELINE_STEP_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
     PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL,
     PIPELINE_SCHEDULING_STRATEGY,
     PIPELINE_Q0_MAX_TOKENS, PIPELINE_Q1_MAX_TOKENS,
@@ -46,6 +50,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
+_LAYER_ASSIGNMENT_CACHE_VERSION = 2
 
 
 def _bootstrap_api_port(default: int = 8000) -> int:
@@ -100,26 +105,93 @@ def _sync_runtime_node_config(node_id: str = None, node_role: str = None) -> Non
 # 数据库模块（延迟导入，避免 psycopg2 未安装时直接崩溃）
 _db = None
 _db_available = False
+_db_attempted = False
+_db_disabled = False
+_db_retry_after = 0.0
+_db_last_error = ""
+_db_state_lock = threading.Lock()
+try:
+    _DB_RETRY_SECONDS = max(
+        5,
+        int(os.environ.get("QLH_DB_RETRY_SECONDS", "30") or 30),
+    )
+except (TypeError, ValueError):
+    _DB_RETRY_SECONDS = 30
 
 
-def _get_db():
-    """获取数据库模块，首次失败后缓存不可用状态"""
-    global _db, _db_available
+def _sync_api_db_available(available: bool) -> None:
+    api_module = sys.modules.get("api_server")
+    if api_module is not None:
+        try:
+            api_module._db_available = bool(available)
+        except Exception:
+            pass
+
+
+def _get_db(force_retry: bool = False):
+    """Return the DB module without retrying failed connections on request paths."""
+    global _db, _db_available, _db_attempted, _db_disabled
+    global _db_retry_after, _db_last_error
     if _db is not None:
         return _db
-    if _db_available is False and _db is None:
+    if _db_disabled:
+        return None
+    now = time.monotonic()
+    if _db_attempted and not force_retry and now < _db_retry_after:
+        return None
+    if not _db_state_lock.acquire(blocking=False):
+        return None
+    try:
+        if _db is not None:
+            return _db
+        now = time.monotonic()
+        if _db_attempted and not force_retry and now < _db_retry_after:
+            return None
+        _db_attempted = True
         try:
-            from db import get_pool
+            from db import DB_ENABLED, get_pool
+            if not DB_ENABLED:
+                _db_disabled = True
+                _db_available = False
+                _db_last_error = "数据库未配置，正在使用本地文件存储"
+                _db_retry_after = 0.0
+                _sync_api_db_available(False)
+                logger.info(_db_last_error)
+                return None
+            _db_disabled = False
             get_pool()  # 预热连接池
             import db as _db_mod
             _db = _db_mod
             _db_available = True
+            _db_last_error = ""
+            _db_retry_after = 0.0
+            _sync_api_db_available(True)
             logger.info("数据库已连接，节点管理将持久化到 PostgreSQL")
         except Exception as e:
             _db = None
             _db_available = False
-            logger.warning(f"数据库不可用，使用内存模式: {e}")
-    return _db
+            _db_last_error = str(e)
+            _db_retry_after = time.monotonic() + _DB_RETRY_SECONDS
+            _sync_api_db_available(False)
+            logger.warning(
+                "数据库暂不可用，已切换内存模式，%s 秒后后台重试: %s",
+                _DB_RETRY_SECONDS,
+                e,
+            )
+        return _db
+    finally:
+        _db_state_lock.release()
+
+
+def get_database_status() -> dict:
+    retry_in = max(0.0, _db_retry_after - time.monotonic())
+    return {
+        "available": bool(_db_available and _db is not None),
+        "configured": not _db_disabled,
+        "attempted": _db_attempted,
+        "last_error": _db_last_error,
+        "retry_in_seconds": round(retry_in, 1),
+    }
 
 
 class NodeState(str, Enum):
@@ -215,6 +287,7 @@ class QueueTask:
     original_level: int = 1       # 入队时的初始级别
     # 保留原始 kwargs 以便透传给 process_fn（如 _stream_callback, _queue_timeout）
     _extra_kwargs: dict = field(default_factory=dict)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def estimated_duration_seconds(self) -> float:
         """预估剩余推理时间（用于 SJF 排序）。假设 ~50ms/token。"""
@@ -315,6 +388,7 @@ class PipelineQueue:
         self._q2: collections.deque = collections.deque()  # Q2 批量级
         self._results: dict = {}           # task_id → {status, result, created_at, ...}
         self._events: dict = {}            # task_id → threading.Event
+        self._cancel_events: dict = {}     # task_id → cooperative cancellation event
         self._lock = threading.RLock()  # 可重入锁：run_pipeline_safe 在持有锁时调用 enqueue
         self._current_task_id: Optional[str] = None
         self._running = False
@@ -433,9 +507,14 @@ class PipelineQueue:
                 )
 
             # 构建 QueueTask
-            max_tokens = task_data.get("max_new_tokens", 512)
-            request_id = task_data.get("request_id")   # L5: API request_id 链路追踪
+            max_tokens = task_data.pop("max_new_tokens", 512)
+            request_id = task_data.pop("request_id", None)   # L5: API request_id 链路追踪
+            # 仅供调用方等待使用，不能透传给 run_pipeline()。
+            task_data.pop("_queue_timeout", None)
             priority_level = self._classify(max_tokens)
+            cancel_event = task_data.pop("_cancel_event", None)
+            if cancel_event is None:
+                cancel_event = threading.Event()
             task = QueueTask(
                 task_id=task_id,
                 prompt=task_data.pop("prompt", ""),
@@ -447,11 +526,13 @@ class PipelineQueue:
                 priority_level=priority_level,
                 original_level=priority_level,
                 _extra_kwargs=task_data,  # 保留其余 kwargs（如 _stream_callback）
+                cancel_event=cancel_event,
             )
 
             # 按级别入队
             self._get_queue(priority_level).append(task)
             self._events[task_id] = threading.Event()
+            self._cancel_events[task_id] = task.cancel_event
             self._results[task_id] = {
                 "status": "queued",
                 "created_at": task.created_at,
@@ -464,7 +545,8 @@ class PipelineQueue:
         )
         return task_id
 
-    def wait_for_result(self, task_id: str, timeout: float = 120.0) -> dict:
+    def wait_for_result(self, task_id: str, timeout: float = 120.0,
+                        cancel_event: threading.Event = None) -> dict:
         """
         阻塞等待任务完成。
 
@@ -480,12 +562,21 @@ class PipelineQueue:
         if event is None:
             return {"status": "unknown", "error": f"未知任务: {task_id}"}
 
-        if event.wait(timeout=timeout):
-            with self._lock:
-                result = self._results.get(task_id, {"status": "unknown"})
-                return dict(result)
-        else:
-            return {"status": "timeout", "error": f"任务 {task_id} 超时 ({timeout}s)"}
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return {"status": "timeout", "error": f"任务 {task_id} 超时 ({timeout}s)"}
+            if event.wait(timeout=min(0.1, remaining)):
+                with self._lock:
+                    result = self._results.get(task_id, {"status": "unknown"})
+                    return dict(result)
+            if cancel_event is not None and cancel_event.is_set():
+                self.cancel_task(task_id)
+                with self._lock:
+                    return dict(self._results.get(task_id, {
+                        "status": "cancelled",
+                    }))
 
     # ---- 内部分级与队列选择 ----
 
@@ -658,7 +749,7 @@ class PipelineQueue:
         取消指定任务。
 
         排队中的任务: 从队列移除，标记 cancelled。
-        执行中的任务: 不支持中途取消（需通过 abort 协议），返回 False。
+        执行中的任务: 设置协作取消信号，流水线在当前 step 完成后广播 ABORT。
         已完成的任务: 返回 False。
 
         Returns: True 表示已取消，False 表示无法取消。
@@ -681,10 +772,22 @@ class PipelineQueue:
                             event.set()
                         logger.info(f"🚫 排队任务已取消: {task_id}")
                         return True
-            # 如果是当前执行中的任务，无法取消
+            # 执行中的任务通过协作信号在当前 step 完成后中止。
             if self._current_task_id == task_id:
-                logger.warning(f"无法取消执行中的任务: {task_id}")
-                return False
+                cancel_event = self._cancel_events.get(task_id)
+                if cancel_event is None:
+                    return False
+                cancel_event.set()
+                self._results[task_id] = {
+                    "status": "cancelled",
+                    "created_at": self._results.get(task_id, {}).get("created_at", 0),
+                    "completed_at": time.time(),
+                }
+                event = self._events.get(task_id)
+                if event:
+                    event.set()
+                logger.info(f"🚫 执行中任务已请求取消: {task_id}")
+                return True
         return False
 
     def clear(self) -> int:
@@ -774,6 +877,7 @@ class PipelineQueue:
             # task 是 QueueTask 对象
             task_id = task.task_id
             task_data = task.to_task_data()
+            task_data["_cancel_event"] = task.cancel_event
 
             with self._lock:
                 self._results[task_id]["status"] = "running"
@@ -788,17 +892,20 @@ class PipelineQueue:
             t_start = time.time()
 
             try:
+                if task.cancel_event.is_set():
+                    raise RuntimeError("任务已取消")
                 result = self._process_fn(**task_data)
                 elapsed = time.time() - t_start
                 with self._lock:
-                    self._results[task_id] = {
-                        "status": "done",
-                        "result": result,
-                        "created_at": self._results.get(task_id, {}).get("created_at", 0),
-                        "started_at": self._results.get(task_id, {}).get("started_at", 0),
-                        "completed_at": time.time(),
-                        "elapsed_s": round(elapsed, 2),
-                    }
+                    if not task.cancel_event.is_set():
+                        self._results[task_id] = {
+                            "status": "done",
+                            "result": result,
+                            "created_at": self._results.get(task_id, {}).get("created_at", 0),
+                            "started_at": self._results.get(task_id, {}).get("started_at", 0),
+                            "completed_at": time.time(),
+                            "elapsed_s": round(elapsed, 2),
+                        }
                 logger.info(
                     "event=task_complete task_id=%s request_id=%s elapsed=%.1fs",
                     task_id, task.request_id or "-", elapsed,
@@ -806,13 +913,14 @@ class PipelineQueue:
             except Exception as e:
                 elapsed = time.time() - t_start
                 with self._lock:
-                    self._results[task_id] = {
-                        "status": "error",
-                        "error": str(e),
-                        "created_at": self._results.get(task_id, {}).get("created_at", 0),
-                        "completed_at": time.time(),
-                        "elapsed_s": round(elapsed, 2),
-                    }
+                    if not task.cancel_event.is_set():
+                        self._results[task_id] = {
+                            "status": "error",
+                            "error": str(e),
+                            "created_at": self._results.get(task_id, {}).get("created_at", 0),
+                            "completed_at": time.time(),
+                            "elapsed_s": round(elapsed, 2),
+                        }
                 logger.error(
                     "event=task_failed task_id=%s request_id=%s error=%s",
                     task_id, task.request_id or "-", str(e)[:200],
@@ -840,6 +948,7 @@ class PipelineQueue:
         for tid in expired:
             del self._results[tid]
             self._events.pop(tid, None)
+            self._cancel_events.pop(tid, None)
         if expired:
             logger.debug(f"清理 {len(expired)} 个过期结果")
 
@@ -892,6 +1001,7 @@ class Scheduler:
     def __init__(self):
         self.nodes: dict[str, NodeInfo] = {}
         self._current_task: Optional[InferenceTask] = None
+        self._infer_tasks: dict[str, InferenceTask] = {}
         self._task_lock = threading.Lock()
         self._running = False
         self.on_task_complete: Optional[Callable] = None
@@ -901,18 +1011,48 @@ class Scheduler:
 
         # 从节点：等待主节点推理结果
         self._client_pending_results: dict = {}
+        self._client_pending_events: dict[str, threading.Event] = {}
+        self._client_pending_lock = threading.Lock()
+
+        # 主节点：转发请求取消和并发准入。队列仍负责实际推理串行化，
+        # 信号量只限制等待队列结果的包装线程数量。
+        self._forward_cancel_events: dict[tuple[str, str], threading.Event] = {}
+        self._forward_cancel_lock = threading.Lock()
+        self._forward_infer_slots = threading.BoundedSemaphore(
+            max(1, min(PIPELINE_QUEUE_MAX_SIZE + 1, 32))
+        )
 
         # 流水线推理状态（主节点侧）
         self._pipeline_results: dict = {}       # key → result data
         self._pipeline_events: dict = {}        # key → threading.Event
+        self._pipeline_active_tasks: set[str] = set()
+        self._chain_ack_state: dict = {}        # task_id → step → node_id → ack/error
         self._pipeline_lock = threading.Lock()
         self._nodes_lock = threading.RLock()    # Phase 2.1: 保护 self.nodes 并发读写（可重入）
         self._kv_cache_lock = threading.Lock()   # Phase 2.2: 保护 _kv_cache 并发读写
         self._kv_cache: dict = {}               # task_id → past_key_values（本节点层范围的 KV cache）
-        self._layer_config_pushed: set = set()  # 已成功推送层配置的从节点 ID（就绪检查用）
+        # 节点只有完成模型层加载并返回当前 config_id 的 ACK 后才进入该集合。
+        # 保留旧字段名，避免状态接口和测试夹具发生无关改动。
+        self._layer_config_pushed: set = set()
+        self._layer_config_expected: dict[str, dict] = {}
+        self._layer_config_acks: dict[str, dict] = {}
+        self._layer_config_retry_state: dict[str, dict] = {}
+        self._layer_config_lock = threading.Lock()
+        self._layer_config_push_lock = threading.Lock()
+        self._layer_execution_lock = threading.RLock()
+        self._active_pipeline_task_ids: set[str] = set()
+        self._pending_layer_config: Optional[tuple[str, dict]] = None
+        self._layer_config_inflight: set[str] = set()
+        self._last_layer_config_ack_payload: Optional[dict] = None
+        self._local_pipeline_cancelled: set[str] = set()
+        self._local_pipeline_cancelled_order: collections.deque = collections.deque()
+        self._chain_clients: dict[str, object] = {}
+        self._chain_clients_lock = threading.Lock()
         self._pipeline_accounted_tasks: set = set()  # 主节点侧：已完成记账的流水线任务
+        self._pipeline_accounted_order: collections.deque = collections.deque()
         self._local_pipeline_counted_tasks: set = set()  # 从节点侧：已本地计数的流水线任务
         self._local_pipeline_error_tasks: set = set()    # 从节点侧：已本地计错的流水线任务
+        self._local_pipeline_accounted_order: collections.deque = collections.deque()
         self._inference_lock = threading.Lock()  # GPU 推理互斥锁（防止并发执行）
 
         # ---- L5: 多节点日志聚合状态 ----
@@ -927,9 +1067,19 @@ class Scheduler:
         self._preempt_last_time: float = 0.0
         self._preempt_disabled: bool = False   # 超过 MAX_OVERHEAD_MS 后自动禁用
         self._preempting: bool = False          # 正在执行抢占（防嵌套）
+        self._pipeline_context = threading.local()
 
         # 最大节点数（可动态调整）
         self._max_nodes: int = MAX_NODES
+        self._db_reconnect_thread: Optional[threading.Thread] = None
+        self._master_connect_lock = threading.Lock()
+        self._role_transition_lock = threading.Lock()
+        self._client_health_thread: Optional[threading.Thread] = None
+        self._client_health_start_lock = threading.Lock()
+        self._layer_config_retry_thread: Optional[threading.Thread] = None
+        self._distributed_inference_enabled: Optional[bool] = None
+        self._local_device_profile: dict = {}
+        self._runtime_layer_override: Optional[list] = None
 
         # 流水线请求队列（MLFQ 三级反馈队列，兼容 FIFO）
         self.pipeline_queue = PipelineQueue(
@@ -978,11 +1128,19 @@ class Scheduler:
             bind_host = host or "0.0.0.0"
             actual_port = port or SERVER_PORT
 
-            self._tcp_server = TCPServer(bind_host, actual_port)
-            self._tcp_server.start(
-                on_message=self._on_tcp_message,
-                on_disconnect=self._on_tcp_disconnect,
-            )
+            try:
+                self._tcp_server = TCPServer(bind_host, actual_port)
+                self._tcp_server.start(
+                    on_message=self._on_tcp_message,
+                    on_disconnect=self._on_tcp_disconnect,
+                )
+            except Exception as e:
+                self._tcp_server = None
+                logger.error(
+                    "分布式 TCP 监听启动失败 (%s:%s): %s；"
+                    "继续提供本地主节点全模型推理",
+                    bind_host, actual_port, e, exc_info=True,
+                )
 
             # 检测实际局域网 IP 和 MAC 地址
             if NODE_ROLE == "master":
@@ -1022,10 +1180,16 @@ class Scheduler:
                             f"   当前将以单机模式运行（不写入 DB 注册信息）。"
                         )
                 else:
-                    # 自动注册到数据库，供从节点发现
-                    self._register_master_in_db()
-                    # 启动数据库心跳刷新线程
-                    self._start_master_db_heartbeat()
+                    if self._tcp_server and self._tcp_server._running:
+                        # 自动注册到数据库，供从节点发现
+                        self._register_master_in_db()
+                        # 启动数据库心跳刷新线程
+                        self._start_master_db_heartbeat()
+                    else:
+                        logger.warning(
+                            "主节点 TCP 未监听，跳过数据库主节点注册；"
+                            "本地推理仍可用"
+                        )
                 # 检查是否需要向备用主节点发送接管通知（转让后新主节点启动）
                 threading.Thread(
                     target=self.deactivate_spare_master_on_startup,
@@ -1050,13 +1214,72 @@ class Scheduler:
             self.pipeline_queue.start(process_fn=self._process_queued_pipeline_task)
             logger.info("流水线请求队列已就绪")
 
+        self._start_database_reconnect_monitor()
+        # 已经是 client 的节点由上面的 auto-connect 唯一路径处理；这里只处理
+        # 尚未确认身份、可能需要从 provisional master 切换的节点。
+        if (self._effective_role() == "master"
+                and self.can_join_existing_master()):
+            threading.Thread(
+                target=self._auto_join_tailnet_master_on_startup,
+                name="tailnet-master-discovery",
+                daemon=True,
+            ).start()
+
     def stop(self) -> None:
         """停止调度器"""
         self._running = False
         self.pipeline_queue.stop()
+        tcp_client = getattr(self, "_tcp_client", None)
+        if tcp_client is not None:
+            tcp_client.on_disconnect = None
+            try:
+                tcp_client.disconnect()
+            except Exception:
+                logger.debug("停止主节点连接失败", exc_info=True)
+        with self._chain_clients_lock:
+            chain_clients = list(self._chain_clients.values())
+            self._chain_clients.clear()
+        for chain_client in chain_clients:
+            try:
+                chain_client.disconnect()
+            except Exception:
+                logger.debug("停止链式连接失败", exc_info=True)
         if self._tcp_server:
             self._tcp_server.stop()
         logger.info("调度器已停止")
+
+    def _start_database_reconnect_monitor(self) -> None:
+        if self._db_reconnect_thread and self._db_reconnect_thread.is_alive():
+            return
+        self._db_reconnect_thread = threading.Thread(
+            target=self._database_reconnect_loop,
+            name="database-reconnect",
+            daemon=True,
+        )
+        self._db_reconnect_thread.start()
+
+    def _database_reconnect_loop(self) -> None:
+        while self._running:
+            deadline = time.monotonic() + _DB_RETRY_SECONDS
+            while self._running and time.monotonic() < deadline:
+                time.sleep(0.5)
+            status = get_database_status()
+            if not self._running or status["available"] or not status["configured"]:
+                continue
+            db = _get_db(force_retry=True)
+            if db is None:
+                continue
+            try:
+                db.set_active_node_id(self.get_effective_node_id())
+            except Exception:
+                pass
+            if self._effective_role() == "master":
+                self._register_master_in_db()
+                try:
+                    # 数据库恢复时不能重新采用宕机前基于旧节点/旧画像的动态分层。
+                    db.set_layer_assignments({})
+                except Exception:
+                    logger.debug("数据库恢复后清除旧分层缓存失败", exc_info=True)
 
     # ================================================================
     # 节点管理
@@ -1157,6 +1380,20 @@ class Scheduler:
                     hostname="localhost",
                 )
 
+        # 设备检测与调度器启动并行执行。若画像先完成，在节点创建后立即补入；
+        # 若画像稍后完成，则由 update_local_device_profile() 写回。
+        if self._local_device_profile:
+            local_node_id = "master" if effective_role == "master" else self.get_effective_node_id()
+            with self._nodes_lock:
+                local_node = self.nodes.get(local_node_id)
+                if local_node is not None:
+                    local_node.device_info = dict(self._local_device_profile)
+            if db and _db_available and effective_role == "master":
+                try:
+                    db.set_layer_assignments({})
+                except Exception:
+                    logger.debug("启动时清除旧分层缓存失败", exc_info=True)
+
         # 从 DB 同步 MAX_NODES（仅主节点）
         if db and _db_available and effective_role == "master":
             try:
@@ -1192,6 +1429,94 @@ class Scheduler:
         )
         for nid, info in self.nodes.items():
             logger.info(f"  {nid}: role={info.role}, state={info.state.value}")
+
+    def _report_local_device_profile(self, tcp_client=None,
+                                     node_id: str = None) -> bool:
+        """将后台完成的完整设备画像补报给主节点。"""
+        profile = dict(self._local_device_profile or {})
+        client = tcp_client or getattr(self, "_tcp_client", None)
+        if not profile or not client or not getattr(client, "is_registered", False):
+            return False
+        if getattr(client, "device_info", None) == profile:
+            return False
+
+        local_node_id = node_id or self.get_effective_node_id()
+        with self._nodes_lock:
+            node = self.nodes.get(local_node_id)
+            state = node.state.value if node is not None else "online"
+
+        try:
+            from tcp_comm import MessageType
+            client.send_data(
+                {"state": state, "device_info": profile},
+                MessageType.STATUS_RES,
+            )
+            client.device_info = dict(profile)
+            logger.info("完整设备画像已补报主节点: node=%s", local_node_id)
+            return True
+        except Exception as e:
+            logger.warning("完整设备画像补报失败: %s", e, exc_info=True)
+            return False
+
+    def update_local_device_profile(self, profile: dict) -> None:
+        """将异步硬件检测结果写回本地节点，并使旧动态分层失效。"""
+        if not isinstance(profile, dict) or not profile:
+            return
+
+        self._local_device_profile = dict(profile)
+        effective_role = self._effective_role()
+        local_node_id = "master" if effective_role == "master" else self.get_effective_node_id()
+        node_snapshot = None
+        with self._nodes_lock:
+            node = self.nodes.get(local_node_id)
+            if node is not None:
+                node.device_info = dict(profile)
+                node_snapshot = node
+
+        if node_snapshot is None:
+            logger.debug("本地设备画像已缓存，等待节点初始化后写回: %s", local_node_id)
+        elif effective_role == "client":
+            self._report_local_device_profile(node_id=local_node_id)
+
+        if node_snapshot is None:
+            return
+
+        score = self._compute_node_weight(profile)
+        gpu = self._select_scoring_gpu(profile)
+        logger.info(
+            "本地节点设备画像已写入调度器: node=%s gpu=%s score=%.1f",
+            local_node_id,
+            gpu.get("name", "unknown") if isinstance(gpu, dict) else "unknown",
+            score,
+        )
+
+        db = _get_db()
+        if db and _db_available and effective_role == "master":
+            try:
+                db.upsert_node(
+                    node_id="master",
+                    role="master",
+                    node_type=node_snapshot.node_type,
+                    state=node_snapshot.state.value,
+                    address=node_snapshot.address,
+                    hostname=node_snapshot.hostname,
+                    device_info=node_snapshot.device_info,
+                    network_type=node_snapshot.network_type,
+                    connected_at=node_snapshot.connected_at,
+                    last_heartbeat=node_snapshot.last_heartbeat,
+                    task_count=node_snapshot.task_count,
+                    error_count=node_snapshot.error_count,
+                )
+                # 已缓存的 9/15 等动态结果基于旧画像，必须强制重新计算。
+                db.set_layer_assignments({})
+            except Exception as e:
+                logger.warning("主节点设备画像/分层缓存持久化失败: %s", e)
+
+        if effective_role == "master":
+            try:
+                self.push_layer_config_to_clients()
+            except Exception as e:
+                logger.warning("设备画像更新后重新下发分层失败: %s", e, exc_info=True)
 
     def _node_from_db(self, db_row: dict) -> NodeInfo:
         """将数据库行转换为 NodeInfo"""
@@ -1361,7 +1686,7 @@ class Scheduler:
                 except Exception:
                     pass
             # ★ 清除层配置推送记录（节点离线后需重新推送）
-            self._layer_config_pushed.discard(node_id)
+            self._clear_layer_config_state(node_id)
 
         logger.info(f"节点注销: {node_id} ({old_state.value} → offline)")
         return True
@@ -1430,14 +1755,21 @@ class Scheduler:
 
     def _record_local_pipeline_participation(self, task_id: str,
                                              success: bool = True) -> bool:
-        """从节点本地记录一次流水线参与，同一 task 只记一次。"""
+        """从节点在任务终态记账；成功/失败不能对同一 task 重复记录。"""
         if not task_id:
+            return False
+        if (task_id in self._local_pipeline_counted_tasks
+                or task_id in self._local_pipeline_error_tasks):
             return False
         task_set = (self._local_pipeline_counted_tasks if success
                     else self._local_pipeline_error_tasks)
-        if task_id in task_set:
-            return False
         task_set.add(task_id)
+        self._local_pipeline_accounted_order.append((task_id, success))
+        while len(self._local_pipeline_accounted_order) > 4096:
+            old_task_id, old_success = self._local_pipeline_accounted_order.popleft()
+            old_set = (self._local_pipeline_counted_tasks if old_success
+                       else self._local_pipeline_error_tasks)
+            old_set.discard(old_task_id)
         return self.record_task_complete(success=success)
 
     def _record_pipeline_task_accounting(self, task_id: str,
@@ -1460,6 +1792,11 @@ class Scheduler:
                 "accounting_errors": [],
             }
         self._pipeline_accounted_tasks.add(task_id)
+        self._pipeline_accounted_order.append(task_id)
+        while len(self._pipeline_accounted_order) > 4096:
+            self._pipeline_accounted_tasks.discard(
+                self._pipeline_accounted_order.popleft()
+            )
 
         ordered_nodes = [self.get_effective_node_id()]
         for node in pipeline_nodes or []:
@@ -1701,27 +2038,36 @@ class Scheduler:
 
     def _compute_node_weight(self, device_info: dict) -> float:
         """
-        根据完整设备画像计算节点的计算能力权重（满分 100 + 独显奖励）。
+        根据完整设备画像估算 PyTorch 分层执行吞吐权重。
 
         权重分配:
           - GPU 显存: 50%
           - 系统内存: 30%
           - CPU 核心+频率: 20%
-          - 独显奖励: +15（CUDA 可用且非集显）
+          - CUDA 执行后端: +60（独显可实际执行 PyTorch CUDA 层）
 
         Args:
             device_info: DeviceProfiler.to_dict() 完整输出
 
         Returns:
-            权重分数（0 ~ 115）
+            权重分数（0 ~ 160）
         """
         gpu = self._select_scoring_gpu(device_info)
         ram = device_info.get("ram", {}) if device_info else {}
         cpu = device_info.get("cpu", {}) if device_info else {}
 
-        # VRAM 得分（归一化到 0-50，上限 24GB）
+        # 专用显存只在 CUDA 独显可被当前 PyTorch 运行时使用时计分。
+        # CPU-only 包即使能通过 nvidia-smi 看见独显，也不能据此获得 CUDA 算力分。
+        cuda_discrete = bool(
+            isinstance(gpu, dict)
+            and gpu.get("cuda_available", False)
+            and not self._gpu_is_integrated(gpu)
+        )
         vram_gb = gpu.get("vram_total_gb", 0) if isinstance(gpu, dict) else 0
-        vram_score = min(vram_gb / 24.0, 1.0) * 50.0 if vram_gb > 0 else 0
+        vram_score = (
+            min(vram_gb / 24.0, 1.0) * 50.0
+            if cuda_discrete and vram_gb > 0 else 0
+        )
 
         # RAM 得分（归一化到 0-30，上限 64GB）
         ram_gb = ram.get("total_gb", 4) if isinstance(ram, dict) else 4
@@ -1734,15 +2080,15 @@ class Scheduler:
         freq_score = min(cpu_freq / 4000.0, 1.0) * 10.0
         cpu_score = core_score + freq_score
 
-        # 独显奖励：CUDA 可用 且 非集成显卡 → +15
-        cuda_avail = gpu.get("cuda_available", False) if isinstance(gpu, dict) else False
-        discrete_bonus = 15.0 if (cuda_avail and not self._gpu_is_integrated(gpu)) else 0.0
+        # CUDA 对 Transformer 矩阵计算的吞吐不能只按显存容量衡量。
+        # 该项用于区分真实 CUDA layer worker 与 CPU/集显 layer worker。
+        accelerator_score = 60.0 if cuda_discrete else 0.0
 
-        weight = vram_score + ram_score + cpu_score + discrete_bonus
+        weight = vram_score + ram_score + cpu_score + accelerator_score
         logger.debug(
             f"节点权重: GPU={gpu.get('name', 'unknown') if isinstance(gpu, dict) else 'unknown'} "
             f"VRAM={vram_score:.1f} RAM={ram_score:.1f} "
-            f"CPU={cpu_score:.1f} Bonus={discrete_bonus:.1f} → {weight:.1f}"
+            f"CPU={cpu_score:.1f} CUDA={accelerator_score:.1f} → {weight:.1f}"
         )
         return weight
 
@@ -1775,7 +2121,13 @@ class Scheduler:
             return 0.0
         gpu = self._select_scoring_gpu(node.device_info)
         ram = node.device_info.get("ram", {})
-        if isinstance(gpu, dict) and gpu.get("vram_total_gb", 0) > 0:
+        uses_dedicated_vram = bool(
+            isinstance(gpu, dict)
+            and gpu.get("cuda_available", False)
+            and not self._gpu_is_integrated(gpu)
+            and gpu.get("vram_total_gb", 0) > 0
+        )
+        if uses_dedicated_vram:
             return gpu["vram_total_gb"] * 1024  # GB → MB
         if isinstance(ram, dict):
             return ram.get("available_gb", 0) * 1024
@@ -1800,22 +2152,176 @@ class Scheduler:
         if vram_available <= 0:
             return (True, 0, 0)  # 无法判断 → 放行
 
-        # 根据量化精度计算实际单层显存
+        # 根据当前模型结构和分层加载的真实精度估算内存。Qwen2 选择性加载
+        # 当前以 FP16 materialize，不能继续套用全模型 int4/int8 的缩放系数。
         from config import (
             MIN_VRAM_PER_LAYER_MB, EMBEDDING_VRAM_MB, LM_HEAD_VRAM_MB,
             SAFE_VRAM_MARGIN, LAYER_VRAM_FACTOR, QUANT_TYPE,
         )
-        factor = LAYER_VRAM_FACTOR.get(QUANT_TYPE, 1.0)
-        layer_mb = MIN_VRAM_PER_LAYER_MB * factor
+        layer_mb, embedding_mb, lm_head_mb = self._get_layer_memory_estimate_mb(
+            node_id=node_id,
+            fallback=(MIN_VRAM_PER_LAYER_MB, EMBEDDING_VRAM_MB, LM_HEAD_VRAM_MB),
+            quant_factors=LAYER_VRAM_FACTOR,
+            configured_quant=QUANT_TYPE,
+        )
         vram_needed = layers_count * layer_mb
         if has_embedding:
-            vram_needed += EMBEDDING_VRAM_MB * factor
+            vram_needed += embedding_mb
         if has_lm_head:
-            vram_needed += LM_HEAD_VRAM_MB * factor
+            vram_needed += lm_head_mb
         vram_needed *= SAFE_VRAM_MARGIN
 
         ok = vram_available >= vram_needed
         return (ok, round(vram_needed, 1), round(vram_available, 1))
+
+    def _get_layer_memory_estimate_mb(self, node_id: str,
+                                      fallback: tuple,
+                                      quant_factors: dict,
+                                      configured_quant: str) -> tuple:
+        """Return per-layer, embedding and LM-head memory in MiB."""
+        api_module = sys.modules.get("api_server")
+        manager = getattr(api_module, "model_manager", None) if api_module else None
+        model_config = getattr(getattr(manager, "model", None), "config", None)
+
+        if model_config is None and manager is not None:
+            model_path = getattr(manager, "_model_path", "") or ""
+            config_path = os.path.join(model_path, "config.json")
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as handle:
+                        model_config = type("ConfigView", (), json.load(handle))()
+                except (OSError, TypeError, ValueError):
+                    model_config = None
+
+        if getattr(model_config, "model_type", "") == "qwen2":
+            try:
+                hidden = int(getattr(model_config, "hidden_size"))
+                intermediate = int(getattr(model_config, "intermediate_size"))
+                attention_heads = int(getattr(model_config, "num_attention_heads"))
+                kv_heads = int(getattr(model_config, "num_key_value_heads", attention_heads))
+                vocab = int(getattr(model_config, "vocab_size"))
+                head_dim = hidden // attention_heads
+                attention_params = (
+                    hidden * hidden * 2
+                    + hidden * kv_heads * head_dim * 2
+                )
+                mlp_params = hidden * intermediate * 3
+                norm_params = hidden * 2
+                mib = 1024.0 * 1024.0
+                layer_mb = (attention_params + mlp_params + norm_params) * 2 / mib
+                io_mb = vocab * hidden * 2 / mib
+                return layer_mb, io_mb, io_mb
+            except (TypeError, ValueError, ZeroDivisionError, AttributeError):
+                logger.debug("读取 Qwen2 模型结构内存参数失败，使用回退估算", exc_info=True)
+
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
+        gpu = self._select_scoring_gpu(node.device_info if node else {})
+        uses_cuda = bool(
+            gpu.get("cuda_available", False)
+            and not self._gpu_is_integrated(gpu)
+        ) if isinstance(gpu, dict) else False
+        quant = getattr(manager, "quant_type", None) or configured_quant
+        # 非 CUDA worker 的 PyTorch loader 会把 bitsandbytes int4/int8 回退到 FP16。
+        factor = quant_factors.get(quant, 1.0) if uses_cuda else 1.0
+        return tuple(float(value) * factor for value in fallback)
+
+    def _layer_assignment_cache_key(self, total_layers: int) -> str:
+        """Bind dynamic cache to executable nodes, profiles, model and algorithm."""
+        with self._nodes_lock:
+            nodes = []
+            for node_id, info in self.nodes.items():
+                if info.node_type != "pc":
+                    continue
+                if info.role != NodeRole.MASTER and not info.is_available():
+                    continue
+                nodes.append({
+                    "node_id": node_id,
+                    "role": str(info.role),
+                    "device_info": info.device_info or {},
+                })
+        api_module = sys.modules.get("api_server")
+        manager = getattr(api_module, "model_manager", None) if api_module else None
+        model_path = os.path.abspath(
+            getattr(manager, "_model_path", "") or ""
+        ) if manager else ""
+        weight_fingerprint = []
+        if model_path and os.path.isdir(model_path):
+            try:
+                for root, _dirs, files in os.walk(model_path):
+                    for name in sorted(files):
+                        if not name.lower().endswith((".safetensors", ".bin")):
+                            continue
+                        path = os.path.join(root, name)
+                        stat = os.stat(path)
+                        weight_fingerprint.append((
+                            os.path.relpath(path, model_path).replace(os.sep, "/"),
+                            stat.st_size,
+                            stat.st_mtime_ns,
+                        ))
+            except OSError:
+                weight_fingerprint = []
+        payload = {
+            "version": _LAYER_ASSIGNMENT_CACHE_VERSION,
+            "total_layers": int(total_layers),
+            "model_id": getattr(manager, "active_model_id", "") if manager else "",
+            "model_path": model_path,
+            "quant_type": getattr(manager, "quant_type", "") if manager else "",
+            "weight_fingerprint": weight_fingerprint,
+            "nodes": sorted(nodes, key=lambda item: item["node_id"]),
+        }
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _get_total_model_layers(self) -> int:
+        """Return the active PyTorch model's real decoder-layer count."""
+        from config import TOTAL_MODEL_LAYERS
+
+        api_module = sys.modules.get("api_server")
+        manager = getattr(api_module, "model_manager", None) if api_module else None
+        if manager is not None:
+            for value in (
+                getattr(manager, "_total_model_layers", 0),
+                getattr(getattr(getattr(manager, "model", None), "config", None),
+                        "num_hidden_layers", 0),
+            ):
+                try:
+                    if int(value) > 0:
+                        return int(value)
+                except (TypeError, ValueError):
+                    pass
+
+            model_path = getattr(manager, "_model_path", "") or ""
+            config_path = os.path.join(model_path, "config.json")
+            if os.path.isfile(config_path):
+                try:
+                    import json
+
+                    with open(config_path, "r", encoding="utf-8") as handle:
+                        value = int(json.load(handle).get("num_hidden_layers", 0))
+                    if value > 0:
+                        return value
+                except (OSError, TypeError, ValueError):
+                    logger.debug("读取当前模型层数失败: %s", config_path, exc_info=True)
+        return TOTAL_MODEL_LAYERS
+
+    def _get_active_pipeline_model_info(self) -> dict:
+        """Describe the exact PyTorch model that workers must load."""
+        api_module = sys.modules.get("api_server")
+        manager = getattr(api_module, "model_manager", None) if api_module else None
+        if not manager or not manager.is_loaded:
+            return {}
+        if getattr(manager, "_engine_type", "") != "pytorch":
+            return {}
+        model_path = os.path.abspath(getattr(manager, "_model_path", "") or "")
+        if not model_path or not os.path.isdir(model_path):
+            return {}
+        return {
+            "model_id": getattr(manager, "active_model_id", "") or "",
+            "model_path": model_path,
+            "model_sha256": self._get_master_model_sha256(),
+            "total_layers": self._get_total_model_layers(),
+        }
 
     def compute_layer_assignment(self, nodes: list = None) -> list:
         """
@@ -1835,13 +2341,13 @@ class Scheduler:
             [{node_id, role, start_layer, end_layer, layers_count,
               has_embedding, has_lm_head, score}]
         """
-        from config import TOTAL_MODEL_LAYERS, GRAPH_ORCHESTRATOR_THRESHOLD
+        from config import GRAPH_ORCHESTRATOR_THRESHOLD
         from config import (
             QUANT_TYPE, MIN_VRAM_PER_LAYER_MB, EMBEDDING_VRAM_MB,
             LM_HEAD_VRAM_MB, LAYER_VRAM_FACTOR, SAFE_VRAM_MARGIN,
         )
 
-        total_layers = TOTAL_MODEL_LAYERS
+        total_layers = self._get_total_model_layers()
 
         # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过）
         if nodes is None:
@@ -1854,6 +2360,11 @@ class Scheduler:
                  "device_info": info.device_info}
                 for nid, info in nodes_snapshot
                 if info.node_type == "pc"
+                and (
+                    info.role == NodeRole.MASTER
+                    or not hasattr(info, "is_available")
+                    or info.is_available()
+                )
             ]
         else:
             node_list = [
@@ -1890,12 +2401,16 @@ class Scheduler:
             try:
                 from graph_orchestrator import GraphOrchestrator
 
-                # 计算模型总显存需求
-                factor = LAYER_VRAM_FACTOR.get(QUANT_TYPE, 1.0)
+                # 图编排使用真实分层加载内存；按节点运行后端估计，
+                # 后续仍会逐节点执行精确显存约束。
+                layer_mb, embedding_mb, lm_head_mb = self._get_layer_memory_estimate_mb(
+                    node_id=node_list[0]["node_id"],
+                    fallback=(MIN_VRAM_PER_LAYER_MB, EMBEDDING_VRAM_MB, LM_HEAD_VRAM_MB),
+                    quant_factors=LAYER_VRAM_FACTOR,
+                    configured_quant=QUANT_TYPE,
+                )
                 model_memory_mb = (
-                    TOTAL_MODEL_LAYERS * MIN_VRAM_PER_LAYER_MB * factor
-                    + EMBEDDING_VRAM_MB * factor
-                    + LM_HEAD_VRAM_MB * factor
+                    total_layers * layer_mb + embedding_mb + lm_head_mb
                 ) * SAFE_VRAM_MARGIN
 
                 # 构建 nodes dict（GraphOrchestrator 需要的格式）
@@ -1912,11 +2427,14 @@ class Scheduler:
                         nodes=orch_nodes,
                         model_memory_mb=model_memory_mb,
                         total_layers=total_layers,
-                        quant_factor=factor,
+                        quant_factor=1.0,
                     )
                     assignments = orchestrator.orchestrate()
 
-                    # 应用显存约束校验，并强制 master 作为首段锚点参与计算
+                    # 先确定 master 锚点和 I/O 头归属，再按真实内存负担校验。
+                    assignments = self._normalize_master_anchor(
+                        assignments, node_list, total_layers
+                    )
                     assignments = self._apply_vram_constraints(assignments)
                     assignments = self._normalize_master_anchor(
                         assignments, node_list, total_layers
@@ -1989,6 +2507,9 @@ class Scheduler:
                     "score": 0.0,
                 })
                 cursor += count
+            assignments = self._normalize_master_anchor(
+                assignments, node_list, total_layers
+            )
             assignments = self._apply_vram_constraints(assignments)
             return self._normalize_master_anchor(assignments, node_list, total_layers)
 
@@ -2056,7 +2577,10 @@ class Scheduler:
             })
             cursor += count
 
-        # Step 5: 显存约束校验
+        # Step 5: 先决定 I/O 头归属，再按真实内存负担校验。
+        assignments = self._normalize_master_anchor(
+            assignments, node_list, total_layers
+        )
         assignments = self._apply_vram_constraints(assignments)
         assignments = self._normalize_master_anchor(
             assignments, node_list, total_layers
@@ -2158,8 +2682,21 @@ class Scheduler:
 
     @staticmethod
     def _resequence_assignments(assignments: list) -> list:
-        """按当前顺序重新计算连续层区间、Embedding 和 LM Head 标记。"""
+        """按当前顺序重算连续层区间；LM Head 跟随更强的末端执行方。"""
         cleaned = [a for a in assignments if a.get("layers_count", 0) > 0]
+        master_index = next((
+            i for i, item in enumerate(cleaned)
+            if item.get("node_id") == "master" or item.get("role") == "master"
+        ), None)
+        lm_head_index = len(cleaned) - 1
+        if master_index is not None and cleaned:
+            try:
+                master_score = float(cleaned[master_index].get("score", 0) or 0)
+                tail_score = float(cleaned[-1].get("score", 0) or 0)
+                if master_score >= tail_score:
+                    lm_head_index = master_index
+            except (TypeError, ValueError):
+                pass
         cursor = 0
         for i, a in enumerate(cleaned):
             count = int(a.get("layers_count", 0) or 0)
@@ -2167,7 +2704,7 @@ class Scheduler:
             a["start_layer"] = cursor
             a["end_layer"] = cursor + count
             a["has_embedding"] = (i == 0)
-            a["has_lm_head"] = (i == len(cleaned) - 1)
+            a["has_lm_head"] = (i == lm_head_index)
             cursor += count
         return cleaned
 
@@ -2184,66 +2721,86 @@ class Scheduler:
           - 末节点（has_lm_head）同样至少保留 1 层。
           - 若连 1 层都保不住，打 ERROR 日志并跳过转移（降级为本地推理兜底）。
         """
+        pending = []
         for a in assignments:
             ok, needed, available = self._check_vram_constraint(
                 a["node_id"], a["layers_count"],
                 a["has_embedding"], a["has_lm_head"],
             )
             if not ok and available > 0:
-                # ★ 保护：首/末节点必须保留至少 1 层与 Embedding/LM Head 共存
-                if a["has_embedding"] and a["layers_count"] <= 1:
+                max_fit = 0
+                for count in range(int(a["layers_count"]), -1, -1):
+                    fits, _needed, _available = self._check_vram_constraint(
+                        a["node_id"], count, a["has_embedding"], a["has_lm_head"]
+                    )
+                    if fits:
+                        max_fit = count
+                        break
+                minimum = 1 if (a["has_embedding"] or a["has_lm_head"]) else 0
+                if max_fit < minimum:
                     logger.error(
-                        f"❌ 首节点 {a['node_id']} 显存不足（需 {needed}MB / 可用 {available}MB），"
-                        f"但 Embedding 层不可脱离 Transformer 层独立存在。"
-                        f"建议增加该节点显存或降级为本地推理。"
+                        f"❌ 节点 {a['node_id']} 连 I/O 头和 1 层都无法容纳"
+                        f"（需 {needed}MB / 可用 {available}MB），保留原分配并由就绪检查回退。"
                     )
                     continue
-                if a["has_lm_head"] and a["layers_count"] <= 1:
-                    logger.error(
-                        f"❌ 末节点 {a['node_id']} 显存不足（需 {needed}MB / 可用 {available}MB），"
-                        f"但 LM Head 不可脱离 Transformer 层独立存在。"
-                        f"建议增加该节点显存或降级为本地推理。"
-                    )
-                    continue
+                overflow = max(0, int(a["layers_count"]) - max_fit)
+                if overflow:
+                    a["layers_count"] = max_fit
+                    pending.append((a["node_id"], overflow))
 
-                best_node = max(
-                    (other for other in assignments if other["node_id"] != a["node_id"]),
-                    key=lambda x: self._get_node_vram_mb(x["node_id"]),
-                    default=None,
-                )
-                if best_node:
-                    # ★ 只转移 Transformer 层，保留至少 1 层给 embedding/lm_head
-                    keep = 1 if (a["has_embedding"] or a["has_lm_head"]) else 0
-                    overflow = max(0, a["layers_count"] - keep)
-                    if overflow > 0:
-                        logger.warning(
-                            f"⚠️ 显存不足: {a['node_id']} 需要 {needed}MB, "
-                            f"可用 {available}MB — {overflow} 层转给 {best_node['node_id']}"
-                            + (f"（保留 {keep} 层锚定 Embedding/LM Head）" if keep > 0 else "")
-                        )
-                        best_node["layers_count"] += overflow
-                        a["layers_count"] = keep
-                    else:
-                        logger.warning(
-                            f"⚠️ 显存不足但无可转移层: {a['node_id']} "
-                            f"需要 {needed}MB, 可用 {available}MB"
-                        )
-                else:
-                    logger.error(
-                        f"❌ 显存不足且无其他节点可接手: {a['node_id']} "
-                        f"需要 {needed}MB, 可用 {available}MB"
+        for source_id, overflow in pending:
+            while overflow > 0:
+                candidates = []
+                for other in assignments:
+                    if other["node_id"] == source_id:
+                        continue
+                    fits, _, _ = self._check_vram_constraint(
+                        other["node_id"], other["layers_count"] + 1,
+                        other["has_embedding"], other["has_lm_head"],
                     )
+                    if fits:
+                        candidates.append(other)
+                if not candidates:
+                    logger.error("❌ %s 的 %s 个超额层没有节点具备剩余容量", source_id, overflow)
+                    # 保持完整覆盖，让 worker 加载失败 ACK 触发全模型回退，而不是静默丢层。
+                    source = next(a for a in assignments if a["node_id"] == source_id)
+                    source["layers_count"] += overflow
+                    break
+                target = max(
+                    candidates,
+                    key=lambda item: (
+                        self._get_node_vram_mb(item["node_id"]),
+                        float(item.get("score", 0) or 0),
+                    ),
+                )
+                target["layers_count"] += 1
+                overflow -= 1
 
         # 清除层数为 0 的节点
         assignments[:] = [a for a in assignments if a["layers_count"] > 0]
 
-        # ★ 重新计算所有节点的 layer 区间，确保 start_layer/end_layer 连续
+        # ★ 重新计算所有节点的 layer 区间，确保 start_layer/end_layer 连续。
+        # LM Head 是输出投影，不属于 Transformer 层区间；主节点可在 worker
+        # 返回尾层 hidden_states 后执行它，避免弱 worker 计算/回传全词表 logits。
+        master_index = next((
+            i for i, item in enumerate(assignments)
+            if item.get("node_id") == "master" or item.get("role") == "master"
+        ), None)
+        lm_head_index = len(assignments) - 1
+        if master_index is not None and assignments:
+            try:
+                master_score = float(assignments[master_index].get("score", 0) or 0)
+                tail_score = float(assignments[-1].get("score", 0) or 0)
+                if master_score >= tail_score:
+                    lm_head_index = master_index
+            except (TypeError, ValueError):
+                pass
         cursor = 0
         for i, a in enumerate(assignments):
             a["start_layer"] = cursor
             a["end_layer"] = cursor + a["layers_count"]
             a["has_embedding"] = (i == 0)
-            a["has_lm_head"] = (i == len(assignments) - 1)
+            a["has_lm_head"] = (i == lm_head_index)
             cursor += a["layers_count"]
 
         return assignments
@@ -2262,8 +2819,28 @@ class Scheduler:
                 "computed_at": timestamp | null,
             }
         """
-        from config import TOTAL_MODEL_LAYERS, GRAPH_ORCHESTRATOR_THRESHOLD
+        from config import GRAPH_ORCHESTRATOR_THRESHOLD
 
+        total_layers = self._get_total_model_layers()
+
+        if self._runtime_layer_override:
+            overrides = self._normalize_manual_assignments(
+                self._runtime_layer_override
+            )
+            if (
+                overrides
+                and self._manual_assignments_are_executable(overrides)
+                and max(int(item.get("end_layer", 0)) for item in overrides)
+                == total_layers
+            ):
+                return {
+                    "total": total_layers,
+                    "strategy": "manual",
+                    "assignments": overrides,
+                    "computed_at": None,
+                }
+
+        cache_key = self._layer_assignment_cache_key(total_layers)
         db = _get_db()
         if db and _db_available:
             try:
@@ -2274,9 +2851,15 @@ class Scheduler:
             if strategy == "manual":
                 try:
                     overrides = db.get_layer_override()
-                    if overrides:
+                    if (
+                        overrides
+                        and self._manual_assignments_are_executable(overrides)
+                        and max(int(item.get("end_layer", 0)) for item in overrides)
+                        == total_layers
+                    ):
+                        overrides = self._normalize_manual_assignments(overrides)
                         return {
-                            "total": TOTAL_MODEL_LAYERS,
+                            "total": total_layers,
                             "strategy": "manual",
                             "assignments": overrides,
                             "computed_at": None,
@@ -2287,7 +2870,12 @@ class Scheduler:
             # 尝试从 DB 读取缓存的计算结果
             try:
                 cached = db.get_layer_assignments()
-                if cached and cached.get("assignments"):
+                if (
+                    cached
+                    and cached.get("assignments")
+                    and int(cached.get("total", 0)) == total_layers
+                    and cached.get("cache_key") == cache_key
+                ):
                     return cached
             except Exception:
                 pass
@@ -2300,6 +2888,7 @@ class Scheduler:
         worker_nodes_count = sum(
             1 for info in self.nodes.values()
             if info.node_type == "pc" and info.node_id != "master" and info.role != "master"
+            and info.is_available()
         )
         actual_strategy = (
             "graph_orchestrator"
@@ -2308,10 +2897,11 @@ class Scheduler:
         )
 
         result = {
-            "total": TOTAL_MODEL_LAYERS,
+            "total": total_layers,
             "strategy": actual_strategy,
             "assignments": assignments,
             "computed_at": time.time(),
+            "cache_key": cache_key,
         }
 
         # 缓存到 DB
@@ -2322,6 +2912,37 @@ class Scheduler:
                 logger.debug(f"分层缓存失败: {e}")
 
         return result
+
+    def _normalize_manual_assignments(self, assignments: list) -> list:
+        """补齐手动区间的运行字段，并按节点能力放置 Embedding/LM Head。"""
+        normalized = []
+        for raw in sorted(assignments, key=lambda item: int(item.get("start_layer", 0))):
+            item = dict(raw)
+            start = int(item.get("start_layer", 0))
+            end = int(item.get("end_layer", 0))
+            node = self.nodes.get(item.get("node_id", ""))
+            item["start_layer"] = start
+            item["end_layer"] = end
+            item["layers_count"] = end - start
+            item["role"] = item.get("role") or (node.role if node else "client")
+            item["score"] = self._compute_node_weight(
+                node.device_info if node else {}
+            )
+            normalized.append(item)
+        return self._resequence_assignments(normalized)
+
+    @staticmethod
+    def _manual_assignments_are_executable(assignments: list) -> bool:
+        """The current runner always executes the master Embedding segment first."""
+        masters = [
+            item for item in assignments
+            if item.get("node_id") == "master" or item.get("role") == "master"
+        ]
+        return bool(
+            len(masters) == 1
+            and int(masters[0].get("start_layer", -1)) == 0
+            and masters[0].get("has_embedding", False)
+        )
 
     def reset_layer_assignments(self) -> dict:
         """
@@ -2335,6 +2956,8 @@ class Scheduler:
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可重置分层配置"}
 
+        self._runtime_layer_override = None
+
         db = _get_db()
         if db and _db_available:
             try:
@@ -2345,7 +2968,7 @@ class Scheduler:
         # 强制重新计算
         assignments = self.compute_layer_assignment()
         result = {
-            "total": assignments[-1]["end_layer"] if assignments else 24,
+            "total": self._get_total_model_layers(),
             "strategy": "dynamic",
             "assignments": assignments,
             "computed_at": time.time(),
@@ -2358,6 +2981,7 @@ class Scheduler:
                 logger.debug(f"分层缓存失败: {e}")
 
         logger.info("分层配置已重置为自动策略")
+        self.push_layer_config_to_clients()
         return {"status": "ok", "strategy": "dynamic", "assignments": result["assignments"]}
 
     def override_layer_assignments(self, assignments: list) -> dict:
@@ -2375,7 +2999,7 @@ class Scheduler:
         Returns:
             {status, message, current_assignments}
         """
-        from config import TOTAL_MODEL_LAYERS
+        total_layers = self._get_total_model_layers()
 
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可覆盖分层配置"}
@@ -2397,10 +3021,10 @@ class Scheduler:
             node_type = self.nodes[node_id].node_type
             if node_type == "android":
                 return {"status": "invalid", "reason": f"Android 节点 {node_id} 不支持层前向传播"}
-            if start < 0 or end > TOTAL_MODEL_LAYERS or start >= end:
+            if start < 0 or end > total_layers or start >= end:
                 return {
                     "status": "invalid",
-                    "reason": f"节点 {node_id} 区间 [{start}, {end}) 无效（范围 0-{TOTAL_MODEL_LAYERS}）",
+                    "reason": f"节点 {node_id} 区间 [{start}, {end}) 无效（范围 0-{total_layers}）",
                 }
             intervals.append((start, end, node_id))
 
@@ -2416,20 +3040,33 @@ class Scheduler:
                 }
             covered = end
 
-        if covered != TOTAL_MODEL_LAYERS:
+        if covered != total_layers:
             return {
                 "status": "invalid",
-                "reason": f"总覆盖范围 {covered} ≠ {TOTAL_MODEL_LAYERS}，分层未完整覆盖",
+                "reason": f"总覆盖范围 {covered} ≠ {total_layers}，分层未完整覆盖",
             }
 
+        master_intervals = [item for item in intervals if item[2] == "master"]
+        if len(master_intervals) != 1 or master_intervals[0][0] != 0:
+            return {
+                "status": "invalid",
+                "reason": "主节点必须且只能承担从 Layer 0 开始的首段",
+            }
+
+        normalized_assignments = self._normalize_manual_assignments([
+            {"node_id": node_id, "start_layer": start, "end_layer": end}
+            for start, end, node_id in intervals
+        ])
         # 存储到 DB + 切换策略为 manual
         db = _get_db()
         if db and _db_available:
             try:
                 db.set_layer_strategy("manual")
-                db.set_layer_override(assignments)
+                db.set_layer_override(normalized_assignments)
             except Exception as e:
                 return {"status": "error", "reason": f"DB 存储失败: {e}"}
+
+        self._runtime_layer_override = [dict(item) for item in normalized_assignments]
 
         # 推送到已连接从节点
         self.push_layer_config_to_clients()
@@ -2439,170 +3076,187 @@ class Scheduler:
             "status": "ok",
             "message": "分层配置已更新（手动模式），已推送至从节点",
             "current_assignments": {
-                "total": TOTAL_MODEL_LAYERS,
+                "total": total_layers,
                 "strategy": "manual",
-                "assignments": assignments,
+                "assignments": normalized_assignments,
                 "computed_at": None,
             },
         }
 
     def push_layer_config_to_clients(self) -> None:
+        """串行生成并下发层配置，防止多个 config_id 交错到达从节点。"""
+        with self._layer_config_push_lock:
+            self._push_layer_config_to_clients_locked()
+
+    def _push_layer_config_to_clients_locked(self) -> None:
         """
         向所有 TCP 连接的从节点推送其分层配置。
 
-        ★ 阶段 7：推送前校验从节点模型 SHA256，
-          不匹配的节点将排除出层分配，避免因模型不一致产生推理错误。
+        assignment 携带当前 PyTorch 模型身份和摘要。从节点缺少或模型不一致时
+        先从主节点同步模型，校验成功并加载层范围后再返回 ready ACK。
         """
         if not self._tcp_server or not self._tcp_server._running:
             return
+        get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
+        connected_ids = (
+            get_client_ids()
+            if callable(get_client_ids)
+            else list(getattr(self._tcp_server, "clients", {}).keys())
+        )
+        if not connected_ids:
+            return
 
-        # ★ 获取主节点的模型 SHA256 作为基准
-        master_sha256 = self._get_master_model_sha256()
+        model_info = self._get_active_pipeline_model_info()
+        master_sha256 = model_info.get("model_sha256", "")
+        model_id = model_info.get("model_id", "")
+        if not master_sha256 or not model_id:
+            with self._layer_config_lock:
+                self._layer_config_pushed.clear()
+                self._layer_config_expected.clear()
+                self._layer_config_acks.clear()
+                self._layer_config_retry_state.clear()
+            logger.warning("主节点尚未加载可校验的 PyTorch 模型，暂不推送层配置")
+            return
 
         layer_info = self.get_layer_assignments()
         assignments = {}
-        skipped_nodes = []
-
-        # Phase 2.1+: 快照 self.nodes，避免在循环中反复读取并被并发修改
-        with self._nodes_lock:
-            nodes_snapshot = dict(self.nodes)
+        config_id = uuid.uuid4().hex
+        from config import API_PORT
 
         for a in layer_info["assignments"]:
             nid = a["node_id"]
             if nid == "master":
                 continue
 
-            node_info = nodes_snapshot.get(nid)
-            if not node_info:
-                continue
-
-            # ★ 模型校验：从节点模型 SHA256 必须与主节点一致
-            slave_sha256 = node_info.model_sha256
-            if master_sha256 and slave_sha256:
-                if slave_sha256 != master_sha256:
-                    logger.warning(
-                        f"⚠️ 模型不一致: {nid} SHA256={slave_sha256[:16]}..."
-                        f" ≠ master SHA256={master_sha256[:16]}...，"
-                        f"跳过该节点的层分配"
-                    )
-                    skipped_nodes.append((nid, slave_sha256))
-                    continue  # 不分配层给模型不一致的节点
-            elif master_sha256 and not slave_sha256:
-                # Phase 4.2: 无 SHA256 的节点安全风险更高，提升为 WARNING 级别
-                logger.warning(
-                    f"⚠️ 节点 {nid} 未上报模型 SHA256，降级放行（可能存在模型不一致风险）"
-                )
+            # 新一轮配置开始后，旧 ACK 立即失效。
+            self._clear_layer_config_state(nid)
 
             assignments[nid] = {
+                "node_id": nid,
+                "config_id": config_id,
                 "start_layer": a["start_layer"],
                 "end_layer": a["end_layer"],
                 "has_embedding": a.get("has_embedding", False),
                 "has_lm_head": a.get("has_lm_head", False),
+                "model_id": model_id,
+                "model_sha256": master_sha256,
+                "total_layers": int(model_info["total_layers"]),
+                "master_api_port": API_PORT,
             }
-
-        if skipped_nodes:
-            logger.warning(
-                f"模型校验: {len(skipped_nodes)} 个节点因模型不一致被排除: "
-                + ", ".join(f"{nid}({sha[:12]}...)" for nid, sha in skipped_nodes)
-            )
 
         try:
             if assignments:
+                # 必须在发包前登记期望版本，避免快速 ACK 先于状态初始化到达。
+                with self._layer_config_lock:
+                    for nid, assignment in assignments.items():
+                        self._layer_config_pushed.discard(nid)
+                        self._layer_config_acks.pop(nid, None)
+                        self._layer_config_expected[nid] = dict(assignment)
+                        self._layer_config_retry_state[nid] = {
+                            "attempts": 1,
+                            "next_retry": time.monotonic() + 5.0,
+                        }
+                self._start_layer_config_retry_monitor()
                 self._tcp_server.broadcast_layer_config(assignments)
-                for nid in assignments:
-                    self._layer_config_pushed.add(nid)
-                logger.info(f"分层配置已推送到 {len(assignments)} 个从节点")
+                logger.info(
+                    f"分层配置已推送到 {len(assignments)} 个从节点，"
+                    f"等待加载 ACK (config_id={config_id})"
+                )
             else:
                 logger.warning("没有可用的从节点接收分层配置")
         except Exception as e:
             logger.warning(f"分层配置推送失败: {e}")
 
+    def _clear_layer_config_state(self, node_id: str) -> None:
+        """清除节点的层配置期望、ACK 和 ready 状态。"""
+        with self._layer_config_lock:
+            self._layer_config_pushed.discard(node_id)
+            self._layer_config_expected.pop(node_id, None)
+            self._layer_config_acks.pop(node_id, None)
+            self._layer_config_retry_state.pop(node_id, None)
+
+    def _start_layer_config_retry_monitor(self) -> None:
+        if (self._layer_config_retry_thread is not None
+                and self._layer_config_retry_thread.is_alive()):
+            return
+        self._layer_config_retry_thread = threading.Thread(
+            target=self._layer_config_retry_loop,
+            name="layer-config-retry",
+            daemon=True,
+        )
+        self._layer_config_retry_thread.start()
+
+    def _layer_config_retry_loop(self) -> None:
+        """重发未确认配置；节点错误或 ACK 丢失不能永久禁用流水线。"""
+        while self._running and self._effective_role() == "master":
+            self._retry_pending_layer_configs()
+            time.sleep(1.0)
+
+    def _retry_pending_layer_configs(self, now: float = None) -> int:
+        """执行一次层配置重发扫描，返回成功发出的配置数量。"""
+        now = time.monotonic() if now is None else now
+        pending = []
+        with self._layer_config_lock:
+            for node_id, expected in self._layer_config_expected.items():
+                if node_id in self._layer_config_pushed:
+                    continue
+                state = self._layer_config_retry_state.setdefault(
+                    node_id, {"attempts": 0, "next_retry": now}
+                )
+                if now < state.get("next_retry", 0):
+                    continue
+                state["attempts"] = int(state.get("attempts", 0)) + 1
+                delay = min(60.0, 5.0 * (2 ** min(state["attempts"] - 1, 4)))
+                state["next_retry"] = now + delay
+                pending.append((node_id, dict(expected), state["attempts"]))
+
+        connected = set()
+        if self._tcp_server and self._tcp_server._running:
+            try:
+                connected = set(self._tcp_server.get_client_ids())
+            except Exception:
+                logger.debug("读取层配置重试节点失败", exc_info=True)
+        sent = 0
+        for node_id, assignment, attempt in pending:
+            if node_id not in connected:
+                continue
+            try:
+                self._tcp_server.send_layer_config(node_id, assignment)
+                sent += 1
+                logger.info(
+                    "重发分层配置: node=%s config=%s attempt=%d",
+                    node_id, assignment.get("config_id", ""), attempt,
+                )
+            except Exception:
+                logger.warning(
+                    "重发分层配置失败: node=%s attempt=%d",
+                    node_id, attempt, exc_info=True,
+                )
+        return sent
+
     def _get_master_model_sha256(self) -> str:
         """
         获取主节点当前加载模型的 SHA256。
 
-        优先级:
-        1. 从 models/ 目录读取 .sha256 缓存文件
-        2. 计算实际模型文件的 SHA256
-        3. 无法获取时返回空字符串（降级放行）
+        仅对当前已加载的 PyTorch Safetensors/BIN 模型计算摘要。
+        llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准。
         """
-        import hashlib as _hl
         import api_server as _api
+        from model_sync import compute_model_sha256
 
         mgr = getattr(_api, 'model_manager', None)
+        if not mgr or not mgr.is_loaded or getattr(mgr, '_engine_type', '') != 'pytorch':
+            return ""
 
-        # 尝试从 model_manager 获取模型路径
-        if mgr and mgr.is_loaded:
-            try:
-                model_path = getattr(mgr, '_model_path', '') or ''
-                model_path = model_path or getattr(cfg, 'MODEL_PATH', '')
-                if model_path and os.path.exists(model_path):
-                    if os.path.isdir(model_path):
-                        # PyTorch/safetensors 模型: 对目录下所有 .safetensors 文件联合哈希
-                        import glob as _glob
-                        safetensors_files = sorted(
-                            _glob.glob(os.path.join(model_path, "*.safetensors"))
-                        )
-                        if safetensors_files:
-                            sha256_file = os.path.join(model_path, "model.sha256")
-                            if os.path.isfile(sha256_file):
-                                try:
-                                    with open(sha256_file, "r") as f:
-                                        return f.read().strip().split()[0]
-                                except Exception:
-                                    pass
-                            try:
-                                h = _hl.sha256()
-                                for sf in safetensors_files:
-                                    with open(sf, "rb") as f:
-                                        for chunk in iter(lambda: f.read(8192), b""):
-                                            h.update(chunk)
-                                result = h.hexdigest()
-                                try:
-                                    with open(sha256_file, "w") as f:
-                                        f.write(f"{result}  {os.path.basename(model_path)}\n")
-                                except Exception:
-                                    pass
-                                return result
-                            except Exception:
-                                pass
-                    elif os.path.isfile(model_path):
-                        # 单文件模型 (GGUF)
-                        sha256_file = model_path + ".sha256"
-                        if os.path.isfile(sha256_file):
-                            try:
-                                with open(sha256_file, "r") as f:
-                                    return f.read().strip().split()[0]
-                            except Exception:
-                                pass
-                        # 计算并缓存
-                        try:
-                            h = _hl.sha256()
-                            with open(model_path, "rb") as f:
-                                for chunk in iter(lambda: f.read(8192), b""):
-                                    h.update(chunk)
-                            result = h.hexdigest()
-                            with open(sha256_file, "w") as f:
-                                f.write(f"{result}  {os.path.basename(model_path)}\n")
-                            return result
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+        model_path = getattr(mgr, '_model_path', '') or ''
+        if not model_path or not os.path.isdir(model_path):
+            return ""
 
-        # 回退：检查 models/ 目录下的 GGUF 文件
-        import config as cfg
-        gguf_path = getattr(cfg, 'GGUF_MODEL_PATH', '')
-        if gguf_path and os.path.isfile(gguf_path):
-            sha256_file = gguf_path + ".sha256"
-            if os.path.isfile(sha256_file):
-                try:
-                    with open(sha256_file, "r") as f:
-                        return f.read().strip().split()[0]
-                except Exception:
-                    pass
-
-        return ""  # 无法获取 → 降级放行
+        try:
+            return compute_model_sha256(model_path)
+        except Exception:
+            logger.warning("计算主节点 PyTorch 模型摘要失败", exc_info=True)
+            return ""
 
     # ================================================================
     # TCP 消息处理
@@ -2618,6 +3272,11 @@ class Scheduler:
 
         if msg_type == "register":
             data = msg.get("data", {})
+            if data.get("node_type") == "pipeline_peer":
+                if self._tcp_server:
+                    self._tcp_server.confirm_registration(client_id)
+                logger.debug("节点间流水线传输连接已认证: %s", client_id)
+                return
             client_info = self._tcp_server.get_client_info(client_id) if self._tcp_server else {}
             advertised_addr = (
                 client_info.get("advertised_addr")
@@ -2670,6 +3329,7 @@ class Scheduler:
         elif msg_type == "status_res":
             # 从节点状态上报
             data = msg.get("data", {})
+            profile_changed = False
             with self._nodes_lock:
                 if client_id in self.nodes:
                     if "state" in data:
@@ -2677,6 +3337,21 @@ class Scheduler:
                             self.nodes[client_id].state = NodeState(data["state"])
                         except ValueError:
                             pass
+                    device_info = data.get("device_info")
+                    if isinstance(device_info, dict) and device_info:
+                        updated_info = dict(device_info)
+                        previous_info = dict(self.nodes[client_id].device_info or {})
+                        for key in ("tcp_peer_addr", "tcp_advertised_addr"):
+                            if key in previous_info and key not in updated_info:
+                                updated_info[key] = previous_info[key]
+                        profile_changed = previous_info != updated_info
+                        self.nodes[client_id].device_info = updated_info
+            if profile_changed and self._effective_role() == "master":
+                logger.info("从节点设备画像已更新，重新计算分层: node=%s", client_id)
+                try:
+                    self.push_layer_config_to_clients()
+                except Exception as e:
+                    logger.warning("设备画像更新后重新下发分层失败: %s", e, exc_info=True)
 
         elif msg_type == "error":
             data = msg.get("data", {})
@@ -2689,18 +3364,54 @@ class Scheduler:
             # 从节点转发推理请求给主节点
             self.handle_infer_forward(client_id, msg)
 
+        elif msg_type == "infer_cancel":
+            data = msg.get("data", {})
+            forward_request_id = str(data.get("forward_request_id", ""))
+            with self._forward_cancel_lock:
+                cancel_event = self._forward_cancel_events.get(
+                    (client_id, forward_request_id)
+                )
+            if cancel_event is not None:
+                cancel_event.set()
+                logger.info(
+                    "收到转发推理取消: client=%s request=%s",
+                    client_id, forward_request_id,
+                )
+
         elif msg_type == "infer_result":
             # 主节点返回推理结果给从节点
             data = msg.get("data", {})
+            forward_request_id = str(data.get("forward_request_id", ""))
             result_entry = {
                 "task_id": data.get("task_id", ""),
+                "forward_request_id": forward_request_id,
+                "status": data.get("status", "ok"),
                 "content": data.get("content", ""),
                 "metrics": data.get("metrics", {}),
+                "error": data.get("error", ""),
+                "thinking_content": data.get("thinking_content"),
+                "followups": data.get("followups", []),
             }
-            if not hasattr(self, "_client_pending_results"):
-                self._client_pending_results = {}
-            self._client_pending_results[data.get("task_id", "")] = result_entry
-            logger.info(f"收到推理结果: task={data.get('task_id', '')}, len={len(data.get('content', ''))}")
+            with self._client_pending_lock:
+                if not forward_request_id and len(self._client_pending_events) == 1:
+                    # 兼容尚未升级的主节点；并发时绝不猜测结果归属。
+                    forward_request_id = next(iter(self._client_pending_events))
+                    result_entry["forward_request_id"] = forward_request_id
+                event = self._client_pending_events.get(forward_request_id)
+                if event is not None:
+                    self._client_pending_results[forward_request_id] = result_entry
+                    event.set()
+            if event is None:
+                logger.warning(
+                    "丢弃无等待者的迟到推理结果: task=%s request=%s",
+                    data.get("task_id", ""), forward_request_id or "-",
+                )
+            else:
+                logger.info(
+                    "收到推理结果: task=%s request=%s len=%d",
+                    data.get("task_id", ""), forward_request_id,
+                    len(data.get("content", "")),
+                )
 
         elif msg_type == "role_transfer":
             # 从节点收到主节点转让通知
@@ -2758,7 +3469,12 @@ class Scheduler:
 
         elif msg_type == "layer_forward":
             # ---- 从节点：收到主节点的层前向传播指令 ----
-            self._handle_layer_forward(client_id, msg)
+            threading.Thread(
+                target=self._handle_layer_forward,
+                args=(client_id, msg),
+                name=f"layer-forward-{msg.get('data', {}).get('task_id', 'unknown')}",
+                daemon=True,
+            ).start()
 
         elif msg_type == "layer_result":
             # ---- 主节点：收到从节点的层前向传播结果 ----
@@ -2766,26 +3482,45 @@ class Scheduler:
 
         elif msg_type == "chain_forward":
             # ---- 从节点：收到另一从节点的链式直连转发（P2 优化）----
-            self._handle_chain_forward(client_id, msg)
+            threading.Thread(
+                target=self._handle_chain_forward,
+                args=(client_id, msg),
+                name=f"chain-forward-{msg.get('data', {}).get('task_id', 'unknown')}",
+                daemon=True,
+            ).start()
+
+        elif msg_type == "chain_forward_ack":
+            # ---- 主节点：收到链式转发每跳 ACK / 错误回报 ----
+            self._handle_chain_forward_ack(client_id, msg)
 
         elif msg_type == "pipeline_done":
             # ---- 从节点：流水线任务完成，清理 KV 缓存 ----
             data = msg.get("data", {})
             task_id = data.get("task_id", "")
             if task_id:
+                with self._layer_config_lock:
+                    self._local_pipeline_cancelled.discard(task_id)
                 with self._kv_cache_lock:
                     if task_id in self._kv_cache:
                         del self._kv_cache[task_id]
                         logger.info(f"🧹 流水线任务 {task_id} KV 缓存已清理")
+                self._record_local_pipeline_participation(task_id, success=True)
+                self._finish_local_pipeline_task(task_id)
 
         elif msg_type == "pipeline_abort":
             # ---- 从节点/主节点：流水线任务取消 ----
             data = msg.get("data", {})
             task_id = data.get("task_id", "")
             if task_id:
+                with self._layer_config_lock:
+                    participated = task_id in self._active_pipeline_task_ids
+                self._mark_local_pipeline_cancelled(task_id)
                 with self._kv_cache_lock:
                     if task_id in self._kv_cache:
                         del self._kv_cache[task_id]
+                if participated and data.get("count_error", True):
+                    self._record_local_pipeline_participation(task_id, success=False)
+                self._finish_local_pipeline_task(task_id)
             logger.warning(f"⚠️ 流水线任务 {task_id} 已取消")
 
         elif msg_type == "pipeline_pause":
@@ -2799,7 +3534,11 @@ class Scheduler:
         elif msg_type == "layer_config":
             # ---- 从节点：收到主节点推送的分层配置 ----
             data = msg.get("data", {})
-            self._handle_layer_config(client_id, data)
+            self._schedule_layer_config(client_id, data)
+
+        elif msg_type == "layer_config_ack":
+            # ---- 主节点：从节点完成模型层加载后的确认 ----
+            self._handle_layer_config_ack(client_id, msg)
 
         elif msg_type == "log_request":
             # ---- L5: 主节点拉取从节点最近日志 ----
@@ -2855,8 +3594,197 @@ class Scheduler:
         else:
             logger.debug(f"未知消息类型: {msg_type}, client={client_id}")
 
+    def _set_pipeline_result_error(self, task_id: str, node_id: str,
+                                   error: str, step: int = -1) -> None:
+        """主节点侧：写入节点错误并唤醒等待该节点结果的流水线线程。"""
+        if not task_id or not node_id:
+            return
+        key = f"{task_id}:{node_id}"
+        with self._pipeline_lock:
+            if task_id not in self._pipeline_active_tasks:
+                return
+            self._pipeline_results[key] = {
+                "task_id": task_id,
+                "node_id": node_id,
+                "error": error,
+                "step": step,
+            }
+            event = self._pipeline_events.get(key)
+            if event is not None:
+                event.set()
+
+    def _clear_pipeline_runtime_state(self, task_id: str) -> None:
+        """清理主节点侧单个流水线任务的等待结果与链路 ACK 状态。"""
+        if not task_id:
+            return
+        prefix = f"{task_id}:"
+        with self._pipeline_lock:
+            self._pipeline_active_tasks.discard(task_id)
+            for key in list(self._pipeline_results):
+                if key.startswith(prefix):
+                    self._pipeline_results.pop(key, None)
+            for key in list(self._pipeline_events):
+                if key.startswith(prefix):
+                    self._pipeline_events.pop(key, None)
+            self._chain_ack_state.pop(task_id, None)
+
+    def _begin_local_pipeline_task(self, task_id: str) -> None:
+        """Track local work so layer reconfiguration cannot replace an active model."""
+        if not task_id:
+            return
+        with self._layer_config_lock:
+            self._active_pipeline_task_ids.add(task_id)
+
+    def _finish_local_pipeline_task(self, task_id: str) -> None:
+        """Release local work state and apply the newest deferred layer config."""
+        pending = None
+        with self._layer_config_lock:
+            self._active_pipeline_task_ids.discard(task_id)
+            if not self._active_pipeline_task_ids and self._pending_layer_config is not None:
+                pending = self._pending_layer_config
+                self._pending_layer_config = None
+        if pending is not None:
+            client_id, data = pending
+            logger.info("当前流水线任务已结束，开始应用延后的分层配置")
+            self._schedule_layer_config(client_id, data)
+
+    def _mark_local_pipeline_cancelled(self, task_id: str) -> None:
+        if not task_id:
+            return
+        with self._layer_config_lock:
+            if task_id not in self._local_pipeline_cancelled:
+                self._local_pipeline_cancelled.add(task_id)
+                self._local_pipeline_cancelled_order.append(task_id)
+            while len(self._local_pipeline_cancelled_order) > 4096:
+                expired = self._local_pipeline_cancelled_order.popleft()
+                self._local_pipeline_cancelled.discard(expired)
+
+    def _fail_pending_pipeline_results_for_node(self, node_id: str,
+                                                reason: str) -> None:
+        """节点断连/不可用时，立即失败所有正在等待该节点的流水线步骤。"""
+        if not node_id:
+            return
+        failed = []
+        with self._pipeline_lock:
+            for key, event in list(self._pipeline_events.items()):
+                try:
+                    task_id, waiting_node_id = key.split(":", 1)
+                except ValueError:
+                    continue
+                if waiting_node_id != node_id:
+                    continue
+                self._pipeline_results[key] = {
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "error": reason,
+                    "step": -1,
+                }
+                event.set()
+                failed.append(task_id)
+        if failed:
+            logger.warning(
+                "节点 %s 不可用，已唤醒 %d 个流水线等待任务: %s",
+                node_id, len(failed), ", ".join(failed),
+            )
+
+    def _handle_chain_forward_ack(self, client_id: str, msg: dict) -> None:
+        """主节点：记录链式转发每跳 ACK/错误，并在错误时立即唤醒流水线。"""
+        data = msg.get("data", {})
+        task_id = data.get("task_id", "")
+        step = data.get("step", -1)
+        status = data.get("status", "received")
+        error = data.get("error", "")
+        reporter_node_id = data.get("node_id", client_id)
+        target_node_id = data.get("target_node_id", "")
+        node_id = target_node_id if status in ("sent", "error") and target_node_id else reporter_node_id
+
+        if not task_id or not node_id:
+            return
+
+        now = time.time()
+        with self._pipeline_lock:
+            if task_id not in self._pipeline_active_tasks:
+                return
+            task_state = self._chain_ack_state.setdefault(task_id, {})
+            step_state = task_state.setdefault(step, {})
+            existing = step_state.get(node_id, {})
+            new_state = {
+                "status": status,
+                "error": error,
+                "from_node_id": data.get("from_node_id", reporter_node_id),
+                "target_node_id": target_node_id or node_id,
+                "reporter_node_id": reporter_node_id,
+                "updated_at": now,
+            }
+            if status == "sent":
+                new_state["sent_at"] = now
+                if existing.get("status") == "received":
+                    # 下游 ACK 可能比上游 sent 回报更早到达；不要把
+                    # received 状态倒退为 sent。
+                    new_state["status"] = "received"
+                    new_state["acked_at"] = existing.get("acked_at", existing.get("updated_at", now))
+                    new_state["error"] = existing.get("error", "")
+            elif status == "received":
+                new_state["acked_at"] = now
+                if existing.get("sent_at"):
+                    new_state["sent_at"] = existing["sent_at"]
+            step_state[node_id] = new_state
+
+        if status == "error" or error:
+            message = error or f"链式转发节点 {node_id} 返回错误 ACK"
+            logger.error(
+                "链式转发 ACK 错误: task=%s step=%s node=%s error=%s",
+                task_id, step, node_id, message,
+            )
+            self._set_pipeline_result_error(task_id, node_id, message, step)
+
+    def _get_chain_ack_failure(self, task_id: str, step: int,
+                               expected_node_ids: list,
+                               ack_timeout: float) -> Optional[dict]:
+        """检测已发送但迟迟未被下游确认接收的链式转发。"""
+        if not task_id or not expected_node_ids:
+            return None
+        now = time.time()
+        with self._pipeline_lock:
+            step_state = self._chain_ack_state.get(task_id, {}).get(step, {})
+            for node_id in expected_node_ids:
+                state = step_state.get(node_id)
+                if not state:
+                    continue
+                if state.get("status") == "error" or state.get("error"):
+                    return {
+                        "task_id": task_id,
+                        "node_id": node_id,
+                        "error": state.get("error") or f"链式转发到 {node_id} 失败",
+                        "step": step,
+                    }
+                if state.get("status") == "sent":
+                    sent_at = state.get("sent_at", state.get("updated_at", now))
+                    if now - sent_at >= ack_timeout:
+                        return {
+                            "task_id": task_id,
+                            "node_id": node_id,
+                            "error": (
+                                f"链式转发到 {node_id} 未收到接收 ACK "
+                                f"({ack_timeout:.1f}s)"
+                            ),
+                            "step": step,
+                        }
+        return None
+
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
+        with self._forward_cancel_lock:
+            client_cancellations = [
+                event for (owner_id, _), event
+                in self._forward_cancel_events.items()
+                if owner_id == client_id
+            ]
+        for event in client_cancellations:
+            event.set()
+        self._fail_pending_pipeline_results_for_node(
+            client_id, f"节点 {client_id} TCP 连接已断开"
+        )
         with self._nodes_lock:
             old_state = None
             if client_id in self.nodes:
@@ -2884,6 +3812,49 @@ class Scheduler:
                 client_id, "update", node_info
             )
         self.deregister_node(client_id)
+        if need_push:
+            self.push_layer_config_to_clients()
+
+    def _on_master_connection_lost(self, source_client=None) -> None:
+        """Worker-side cleanup when PIPELINE_DONE/ABORT can no longer arrive."""
+        if (source_client is not None
+                and getattr(self, "_tcp_client", None) is not source_client):
+            logger.debug("忽略旧主节点连接的迟到断连回调")
+            return
+
+        with self._client_pending_lock:
+            for request_id, event in self._client_pending_events.items():
+                self._client_pending_results[request_id] = {
+                    "forward_request_id": request_id,
+                    "status": "error",
+                    "content": "",
+                    "metrics": {},
+                    "error": "与主节点的连接已断开",
+                }
+                event.set()
+        with self._chain_clients_lock:
+            chain_clients = list(self._chain_clients.values())
+            self._chain_clients.clear()
+        for chain_client in chain_clients:
+            try:
+                chain_client.disconnect()
+            except Exception:
+                logger.debug("主节点断线时关闭链式连接失败", exc_info=True)
+        with self._kv_cache_lock:
+            active_tasks = list(self._kv_cache)
+            self._kv_cache.clear()
+        with self._layer_config_lock:
+            active_tasks.extend(self._active_pipeline_task_ids)
+            active_tasks = list(dict.fromkeys(active_tasks))
+            self._active_pipeline_task_ids.clear()
+            self._pending_layer_config = None
+        for task_id in active_tasks:
+            self._record_local_pipeline_participation(task_id, success=False)
+        if active_tasks:
+            logger.warning(
+                "主节点连接中断，已清理 %d 个本地流水线任务",
+                len(active_tasks),
+            )
 
     # ================================================================
     # 节点列表同步（主 → 从）
@@ -4017,25 +4988,17 @@ class Scheduler:
         Returns:
             task_id: 任务唯一标识
 
-        Raises:
-            RuntimeError: 节点未就绪
         """
-        if not self.check_nodes_ready():
-            raise RuntimeError("从节点未全部就绪，无法启动推理任务")
-
-        task_id = f"task_{int(time.time() * 1000)}"
+        # 节点就绪与降级由 run_pipeline_safe() 统一决定。这里不能先把
+        # worker 标成 BUSY，否则 readiness 会把 BUSY 误判为离线并强制回退。
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
         task = InferenceTask(task_id=task_id, prompt=prompt)
         task.state = "running"
         task.start_time = time.time()
 
         with self._task_lock:
             self._current_task = task
-
-        # 标记所有节点为忙碌
-        with self._nodes_lock:
-            for nid in self.nodes:
-                if self.nodes[nid].role != NodeRole.MASTER:
-                    self.update_node_state(nid, NodeState.BUSY)
+            self._infer_tasks[task_id] = task
 
         logger.info(
             "event=infer_task_start task_id=%s request_id=%s prompt_len=%d",
@@ -4048,6 +5011,42 @@ class Scheduler:
         # 3. client2 计算 → Decode 循环 → 回传结果
 
         return task_id
+
+    def complete_infer_task(self, task_id: str, result: str,
+                            metrics: dict = None) -> None:
+        """完成指定的转发任务；并发任务不能清除彼此的状态。"""
+        completed = None
+        with self._task_lock:
+            current = self._infer_tasks.pop(task_id, None)
+            if current is None:
+                return
+            current.state = "done"
+            current.end_time = time.time()
+            current.result = result
+            current.metrics = metrics or {}
+            completed = current
+            if self._current_task is current:
+                self._current_task = None
+
+        logger.info(
+            "推理任务完成: %s, 耗时=%.2fs, 结果长度=%d",
+            task_id, completed.end_time - completed.start_time, len(result),
+        )
+        if self.on_task_complete:
+            self.on_task_complete(completed)
+
+    def fail_infer_task(self, task_id: str, error_msg: str) -> None:
+        """失败指定的转发任务，不影响稍后启动的其他任务。"""
+        with self._task_lock:
+            current = self._infer_tasks.pop(task_id, None)
+            if current is None:
+                return
+            current.state = "error"
+            current.end_time = time.time()
+            current.error_msg = error_msg
+            if self._current_task is current:
+                self._current_task = None
+        logger.error("推理任务异常: %s - %s", task_id, error_msg)
 
     def stop_infer_task(self) -> None:
         """强制停止推理、重置流水线"""
@@ -4074,28 +5073,9 @@ class Scheduler:
         NOTE: 此方法当前无调用方，为死代码（dead code），保留供未来流水线任务完成通知使用。
         """
         with self._task_lock:
-            if self._current_task:
-                self._current_task.state = "done"
-                self._current_task.end_time = time.time()
-                self._current_task.result = result
-                self._current_task.metrics = metrics or {}
-                elapsed = self._current_task.end_time - self._current_task.start_time
-                logger.info(
-                    f"任务完成: {self._current_task.task_id}, "
-                    f"耗时={elapsed:.2f}s, 结果长度={len(result)}"
-                )
-
-        # 恢复节点状态
-        with self._nodes_lock:
-            busy_nids = [
-                nid for nid, info in self.nodes.items()
-                if info.state == NodeState.BUSY
-            ]
-        for nid in busy_nids:
-            self.update_node_state(nid, NodeState.ONLINE)
-
-        if self.on_task_complete:
-            self.on_task_complete(self._current_task)
+            task_id = self._current_task.task_id if self._current_task else ""
+        if task_id:
+            self.complete_infer_task(task_id, result, metrics)
 
     def on_task_error(self, error_msg: str) -> None:
         """
@@ -4105,14 +5085,9 @@ class Scheduler:
             error_msg: 错误描述
         """
         with self._task_lock:
-            if self._current_task:
-                self._current_task.state = "error"
-                self._current_task.end_time = time.time()
-                self._current_task.error_msg = error_msg
-                logger.error(f"任务异常: {self._current_task.task_id} — {error_msg}")
-
-        # 重置流水线
-        self.stop_infer_task()
+            task_id = self._current_task.task_id if self._current_task else ""
+        if task_id:
+            self.fail_infer_task(task_id, error_msg)
 
     # ================================================================
     # 状态查询
@@ -4307,7 +5282,45 @@ class Scheduler:
             },
         }
 
-    def connect_to_master(self, master_host: str, master_port: int) -> dict:
+    def connect_to_master(
+        self,
+        master_host: str,
+        master_port: int,
+        *,
+        force_bootstrap: bool = False,
+    ) -> dict:
+        """串行建立唯一的主节点连接。"""
+        with self._master_connect_lock:
+            current = getattr(self, "_tcp_client", None)
+            current_connected = bool(
+                current
+                and getattr(current, "_running", False)
+                and getattr(current, "is_registered", False)
+                and getattr(current, "sock", None) is not None
+            )
+            if (current_connected
+                    and str(getattr(current, "server_host", "")) == str(master_host)
+                    and int(getattr(current, "server_port", 0)) == int(master_port)):
+                return {
+                    "status": "connected",
+                    "node_id": self.get_effective_node_id(),
+                    "master": f"{master_host}:{master_port}",
+                    "message": "已连接到该主节点",
+                    "reused": True,
+                }
+            return self._connect_to_master_locked(
+                master_host,
+                master_port,
+                force_bootstrap=force_bootstrap,
+            )
+
+    def _connect_to_master_locked(
+        self,
+        master_host: str,
+        master_port: int,
+        *,
+        force_bootstrap: bool = False,
+    ) -> dict:
         """
         从节点主动连接主节点（由前端「连接主节点」按钮触发）。
 
@@ -4359,9 +5372,11 @@ class Scheduler:
                     node_id, master_host, master_port,
                 )
 
-            if not getattr(cfg, "CLUSTER_SECRET", ""):
+            if force_bootstrap or not getattr(cfg, "CLUSTER_SECRET", ""):
                 try:
-                    _run_first_connect_bootstrap("missing_secret")
+                    _run_first_connect_bootstrap(
+                        "explicit_join" if force_bootstrap else "missing_secret"
+                    )
                 except Exception as e:
                     logger.error("首次连接自动部署失败: %s", e, exc_info=True)
                     return {
@@ -4371,6 +5386,48 @@ class Scheduler:
 
             from tcp_comm import TCPClient
 
+            previous_client = getattr(self, "_tcp_client", None)
+            previous_callback = (
+                getattr(previous_client, "on_disconnect", None)
+                if previous_client is not None else None
+            )
+
+            def _retire_previous_client() -> None:
+                if previous_client is None or previous_client is client:
+                    return
+                previous_client.on_disconnect = None
+                try:
+                    previous_client.disconnect()
+                except Exception:
+                    logger.debug("关闭旧主节点连接失败", exc_info=True)
+
+            def _discard_candidate_client(candidate) -> None:
+                candidate.on_disconnect = None
+                try:
+                    candidate.disconnect()
+                except Exception:
+                    logger.debug("关闭失败的候选主节点连接失败", exc_info=True)
+
+            def _restore_previous_client() -> None:
+                if previous_client is None:
+                    self._tcp_client = None
+                    return
+                if not (
+                    getattr(previous_client, "_running", False)
+                    and getattr(previous_client, "is_registered", False)
+                    and getattr(previous_client, "sock", None) is not None
+                ):
+                    self._tcp_client = None
+                    return
+                previous_client.on_disconnect = previous_callback
+                self._tcp_client = previous_client
+                previous_node_id = getattr(previous_client, "client_id", "")
+                if previous_node_id:
+                    _sync_runtime_node_config(
+                        node_id=previous_node_id,
+                        node_role="client",
+                    )
+
             advertise_port = self._tcp_server.port if self._tcp_server else SERVER_PORT
             client = TCPClient(
                 server_host=master_host,
@@ -4378,10 +5435,27 @@ class Scheduler:
                 client_id=node_id,
                 role="client",
                 advertise_port=advertise_port,
+                device_info=self._local_device_profile,
             )
+            # REGISTER_ACK 后主节点会立即下发层配置，接收线程可能在
+            # connect() 返回前进入回调。提前绑定连接和最终 node_id，保证
+            # 模型同步能取得主节点地址，且 ready/error ACK 能正常发回。
+            self._tcp_client = client
+            _sync_runtime_node_config(node_id=node_id, node_role="client")
             # ★ 心跳回调：更新自身节点的心跳时间 + 同步 RTT 测量值
             # _sync_node_rtt 内部已有 _nodes_lock 保护
-            client.on_heartbeat = lambda: self._sync_node_rtt(node_id, client)
+            def _bind_client_callbacks(target_client) -> None:
+                def _on_client_heartbeat() -> None:
+                    self._sync_node_rtt(node_id, target_client)
+                    self._report_local_device_profile(target_client, node_id)
+
+                target_client.on_heartbeat = _on_client_heartbeat
+                target_client.on_disconnect = (
+                    lambda bound_client=target_client:
+                    self._on_master_connection_lost(bound_client)
+                )
+
+            _bind_client_callbacks(client)
 
             def _mark_local_node_online() -> None:
                 # NodeInfo.address 表示本节点可被其他节点连接的服务端点，
@@ -4395,9 +5469,9 @@ class Scheduler:
                 on_message=lambda msg: self._on_tcp_message("master", msg)
             )
             if ok:
-                # 存储客户端引用，供分布式推理转发使用
-                self._tcp_client = client
+                _retire_previous_client()
                 _mark_local_node_online()
+                self._report_local_device_profile(client, node_id)
 
                 # 更新运行时 node_id，避免 scheduler 模块导入常量滞后。
                 _sync_runtime_node_config(node_id=node_id)
@@ -4424,6 +5498,9 @@ class Scheduler:
                     "master": f"{master_host}:{master_port}",
                     "message": f"已成功注册到主节点 {master_host}:{master_port}",
                 }
+            if getattr(self, '_tcp_client', None) is client:
+                _discard_candidate_client(client)
+                _restore_previous_client()
             reason = getattr(client, "last_register_error", "") or (
                 f"TCP 连接失败 ({master_host}:{master_port})，请检查主节点地址和端口是否正确"
             )
@@ -4437,14 +5514,18 @@ class Scheduler:
                         client_id=node_id,
                         role="client",
                         advertise_port=advertise_port,
+                        device_info=self._local_device_profile,
                     )
-                    client.on_heartbeat = lambda: self._sync_node_rtt(node_id, client)
+                    self._tcp_client = client
+                    _sync_runtime_node_config(node_id=node_id, node_role="client")
+                    _bind_client_callbacks(client)
                     ok = client.connect(
                         on_message=lambda msg: self._on_tcp_message("master", msg)
                     )
                     if ok:
-                        self._tcp_client = client
+                        _retire_previous_client()
                         _mark_local_node_online()
+                        self._report_local_device_profile(client, node_id)
                         _sync_runtime_node_config(node_id=node_id)
                         if getattr(self, '_role_override', None) == "client":
                             _sync_runtime_node_config(node_role="client")
@@ -4463,6 +5544,9 @@ class Scheduler:
                             "master": f"{master_host}:{master_port}",
                             "message": f"已刷新自动部署配置并注册到主节点 {master_host}:{master_port}",
                         }
+                    if getattr(self, '_tcp_client', None) is client:
+                        _discard_candidate_client(client)
+                        _restore_previous_client()
                     reason = getattr(client, "last_register_error", "") or reason
                 except Exception as e:
                     logger.error("刷新首次连接配置后重试失败: %s", e, exc_info=True)
@@ -4473,6 +5557,15 @@ class Scheduler:
                 "reason": reason,
             }
         except Exception as e:
+            if 'client' in locals() and getattr(self, '_tcp_client', None) is client:
+                try:
+                    _discard_candidate_client(client)
+                except Exception:
+                    pass
+                if 'previous_client' in locals() and previous_client is not None:
+                    _restore_previous_client()
+                else:
+                    self._tcp_client = None
             logger.error(f"连接主节点 {master_host}:{master_port} 失败: {e}")
             return {"status": "error", "reason": f"{master_host}:{master_port} - {e}"}
 
@@ -4482,6 +5575,7 @@ class Scheduler:
                                      top_p: float = 0.9,
                                      show_thinking: bool = False,
                                      session_id: str = None,
+                                     messages: list = None,
                                      request_id: str = None,   # L5: 链路追踪
                                      timeout: float = 120.0) -> dict:
         """
@@ -4505,14 +5599,20 @@ class Scheduler:
             return {"status": "denied", "error": "仅从节点可转发推理请求"}
 
         tcp_client = getattr(self, '_tcp_client', None)
-        if not tcp_client or not tcp_client._running:
+        if not (tcp_client
+                and getattr(tcp_client, "_running", False)
+                and getattr(tcp_client, "is_registered", False)
+                and getattr(tcp_client, "sock", None) is not None):
             return {"status": "disconnected", "error": "未连接到主节点，请先建立连接"}
+
+        forward_request_id = uuid.uuid4().hex
+        result_event = threading.Event()
+        with self._client_pending_lock:
+            self._client_pending_events[forward_request_id] = result_event
+            self._client_pending_results.pop(forward_request_id, None)
 
         try:
             from tcp_comm import MessageType
-
-            # 清空之前的结果
-            self._client_pending_results = {}
 
             # 发送推理请求
             infer_data = {
@@ -4522,39 +5622,61 @@ class Scheduler:
                 "top_p": top_p,
                 "show_thinking": show_thinking,
                 "session_id": session_id,
+                "messages": messages or [{"role": "user", "content": message}],
                 "request_id": request_id,   # L5: 链路追踪
+                "forward_request_id": forward_request_id,
             }
             tcp_client.send_data(infer_data, MessageType.INFER_FORWARD)
             logger.info(
-                "event=infer_forward task_id=n/a request_id=%s prompt_len=%d",
-                request_id or "-", len(message),
+                "event=infer_forward task_id=n/a request_id=%s forward_request_id=%s "
+                "prompt_len=%d",
+                request_id or "-", forward_request_id, len(message),
             )
 
-            # 等待结果（轮询 + 超时）
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                if self._client_pending_results:
-                    result = self._client_pending_results.popitem()[1]
-                    logger.info(
-                        f"📥 收到主节点推理结果: "
-                        f"task={result.get('task_id', '')}, "
-                        f"len={len(result.get('content', ''))}"
+            if result_event.wait(timeout=max(0.0, timeout)):
+                with self._client_pending_lock:
+                    result = self._client_pending_results.pop(
+                        forward_request_id, None
                     )
+                if result is None:
+                    return {"status": "error", "error": "主节点结果状态丢失"}
+                logger.info(
+                    "收到主节点推理结果: task=%s request=%s len=%d",
+                    result.get("task_id", ""), forward_request_id,
+                    len(result.get("content", "")),
+                )
+                if result.get("status") != "ok" or result.get("error"):
                     return {
-                        "status": "ok",
-                        "content": result.get("content", ""),
+                        "status": "error",
+                        "error": result.get("error") or "主节点推理失败",
                         "metrics": result.get("metrics", {}),
-                        "followups": result.get("followups", []),
                     }
-                time.sleep(0.5)
+                return {
+                    "status": "ok",
+                    "content": result.get("content", ""),
+                    "metrics": result.get("metrics", {}),
+                    "thinking_content": result.get("thinking_content"),
+                    "followups": result.get("followups", []),
+                }
 
             # 超时
             logger.warning(f"推理请求超时 ({timeout}s)")
+            try:
+                tcp_client.send_data(
+                    {"forward_request_id": forward_request_id},
+                    MessageType.INFER_CANCEL,
+                )
+            except Exception:
+                logger.debug("发送转发推理取消失败", exc_info=True)
             return {"status": "timeout", "error": f"等待主节点响应超时 ({timeout}s)"}
 
         except Exception as e:
             logger.error(f"转发推理请求失败: {e}")
             return {"status": "error", "error": str(e)}
+        finally:
+            with self._client_pending_lock:
+                self._client_pending_events.pop(forward_request_id, None)
+                self._client_pending_results.pop(forward_request_id, None)
 
     def get_invite_info(self) -> dict:
         """
@@ -4611,6 +5733,11 @@ class Scheduler:
         }
 
     def activate_client_mode(self, master_host: str = None, master_port: int = None) -> dict:
+        with self._role_transition_lock:
+            return self._activate_client_mode_locked(master_host, master_port)
+
+    def _activate_client_mode_locked(self, master_host: str = None,
+                                     master_port: int = None) -> dict:
         """
         从失败的主节点模式自动切换到从节点模式。
 
@@ -4627,10 +5754,34 @@ class Scheduler:
         import config as cfg
 
         logger.info("🔄 正在从失败的主节点模式切换到从节点模式...")
+        switching_from_master = self._effective_role() == "master"
+
+        if not switching_from_master:
+            self._start_client_health_monitor()
+            result = {
+                "status": "unchanged",
+                "node_id": self.get_effective_node_id(),
+                "message": "当前已经是从节点模式",
+            }
+            if master_host and master_port:
+                conn_result = self.connect_to_master(master_host, master_port)
+                result["connect_result"] = conn_result
+                if conn_result.get("status") == "connected":
+                    result["message"] += f"，已连接到主节点 {master_host}:{master_port}"
+            return result
+
+        if switching_from_master and self._tcp_server:
+            connected_clients = self._tcp_server.get_client_ids()
+            if connected_clients:
+                return {
+                    "status": "denied",
+                    "reason": "本节点已有在线从节点，不能直接切换为从节点",
+                }
 
         # 1. 设置角色覆盖
         self._role_override = "client"
         _sync_runtime_node_config(node_role="client")
+        self.pipeline_queue.stop()
 
         # 2. 重新初始化为从节点
         with self._nodes_lock:
@@ -4638,6 +5789,11 @@ class Scheduler:
         self.init_nodes()
         effective_id = self.get_effective_node_id()
         _sync_runtime_node_config(node_id=effective_id)
+        try:
+            from db import set_active_node_id
+            set_active_node_id(effective_id)
+        except Exception:
+            pass
 
         # 3. 启动从节点健康监控
         self._start_client_health_monitor()
@@ -4656,7 +5812,11 @@ class Scheduler:
         # 4. 如果提供了主节点地址，尝试自动连接
         if master_host and master_port:
             logger.info(f"🔗 尝试自动连接主节点 {master_host}:{master_port}...")
-            conn_result = self.connect_to_master(master_host, master_port)
+            conn_result = self.connect_to_master(
+                master_host,
+                master_port,
+                force_bootstrap=switching_from_master,
+            )
             result["connect_result"] = conn_result
             if conn_result.get("status") == "connected":
                 result["message"] += f"，已连接到主节点 {master_host}:{master_port}"
@@ -4668,6 +5828,38 @@ class Scheduler:
             result["message"] += "，未提供主节点地址，请手动连接"
 
         return result
+
+    def can_join_existing_master(self) -> bool:
+        """Whether this node may be explicitly converted into a client."""
+        if self._effective_role() == "client":
+            return True
+        if self._effective_role() != "master":
+            return False
+
+        if self._tcp_server:
+            try:
+                if self._tcp_server.get_client_ids():
+                    return False
+            except Exception:
+                return False
+
+        try:
+            from node_config import load_node_config
+
+            data = load_node_config()
+            node = data.get("node") if isinstance(data.get("node"), dict) else {}
+            role_confirmed = bool(
+                data.get("bootstrapped", False)
+                or node.get("role_confirmed", False)
+            )
+            if not data and os.environ.get("QLH_NODE_ROLE", "").strip() == "master":
+                role_confirmed = True
+        except Exception:
+            role_confirmed = False
+
+        identity_reason = getattr(self, "_master_identity_reason", "")
+        identity_confirmed = identity_reason in {"match", "first_run"}
+        return not role_confirmed and not identity_confirmed
 
     def _auto_switch_to_client(self, master_host: str, master_port: int) -> None:
         """
@@ -4687,6 +5879,24 @@ class Scheduler:
             logger.info(f"自动切换完成: {result.get('message', '')}")
         except Exception as e:
             logger.error(f"自动切换到从节点模式失败: {e}")
+
+    def _auto_join_tailnet_master_on_startup(self) -> None:
+        time.sleep(5)
+        if not self._running or not self.can_join_existing_master():
+            return
+        discovery = self.discover_master()
+        if not discovery.get("found"):
+            logger.info("Tailnet 自动发现未找到已确认主节点，保持待配置状态")
+            return
+        logger.info(
+            "Tailnet 自动发现主节点 %s:%s，切换为从节点并连接",
+            discovery["master_host"],
+            discovery["master_port"],
+        )
+        self.activate_client_mode(
+            discovery["master_host"],
+            int(discovery["master_port"]),
+        )
 
     def _auto_connect_on_startup(self) -> None:
         """
@@ -4714,6 +5924,13 @@ class Scheduler:
                     logger.info(f"✅ 启动自动连接成功: {host}:{port}")
                 else:
                     logger.info(f"启动自动连接失败: {result.get('reason', result.get('status'))}")
+                    alternate = self.discover_master(skip_config=True)
+                    alt_host = alternate.get("master_host", "")
+                    alt_port = int(alternate.get("master_port", 0) or 0)
+                    if (alternate.get("found")
+                            and alt_host and alt_port
+                            and (alt_host, alt_port) != (host, int(port))):
+                        self.connect_to_master(alt_host, alt_port)
             else:
                 logger.info("启动自动发现: 未找到可用主节点，稍后可通过前端手动连接")
         except Exception as e:
@@ -4760,6 +5977,19 @@ class Scheduler:
             "my_node": my_info.to_dict() if my_info else None,
             "tcp_server_running": self._tcp_server is not None and self._tcp_server._running,
         }
+
+        provisional_master = effective_role == "master" and self.can_join_existing_master()
+        if provisional_master:
+            result.update({
+                "node_role": "unknown",
+                "runtime_node_role": "master",
+                "is_master": False,
+                "is_provisional": True,
+                "can_join_existing_master": True,
+            })
+        else:
+            result["is_provisional"] = False
+            result["can_join_existing_master"] = effective_role == "client"
 
         # 主节点：附加 MAC 身份验证状态
         if effective_role == "master":
@@ -4818,7 +6048,10 @@ class Scheduler:
                 del self.nodes[pid]
                 logger.info(f"  清理幽灵节点: {pid}")
         if phantoms:
-            self._layer_config_pushed.clear()
+            with self._layer_config_lock:
+                self._layer_config_pushed.clear()
+                self._layer_config_expected.clear()
+                self._layer_config_acks.clear()
 
         # 持久化到数据库
         db = _get_db()
@@ -4868,7 +6101,10 @@ class Scheduler:
         """
         db = _get_db()
         if not db or not _db_available:
-            logger.warning("数据库不可用，跳过主节点注册（从节点将无法自动发现）")
+            if get_database_status().get("configured", True):
+                logger.warning("数据库不可用，跳过主节点数据库注册")
+            else:
+                logger.info("数据库未配置，主节点将通过 Tailnet bootstrap 提供发现")
             return
 
         lan_ip = getattr(self, '_lan_ip', '')
@@ -4922,7 +6158,10 @@ class Scheduler:
         if not db or not _db_available:
             self._master_identity_verified = True  # DB 不可用时不阻断
             self._master_identity_reason = "db_unavailable"
-            logger.warning("数据库不可用，跳过主节点身份验证")
+            if get_database_status().get("configured", True):
+                logger.warning("数据库不可用，跳过主节点身份验证")
+            else:
+                logger.info("数据库未配置，使用本地节点配置确认主节点身份")
             return
 
         local_macs = self._mac_addresses
@@ -4962,11 +6201,11 @@ class Scheduler:
         """
         t = threading.Thread(target=self._master_db_heartbeat_loop, daemon=True)
         t.start()
-        logger.info("主节点数据库心跳线程已启动（间隔 30s）")
+        logger.info("主节点状态心跳线程已启动（间隔 30s）")
 
     def _master_db_heartbeat_loop(self) -> None:
         """主节点数据库心跳循环（后台 daemon 线程）"""
-        while self._running:
+        while self._running and self._effective_role() == "master":
             try:
                 db = _get_db()
                 if db and _db_available:
@@ -4980,7 +6219,7 @@ class Scheduler:
                     master_node.last_heartbeat = time.time()
             time.sleep(30)
 
-    def discover_master(self) -> dict:
+    def discover_master(self, *, skip_config: bool = False) -> dict:
         """
         从数据库查询主节点的连接信息（供从节点自动发现）。
 
@@ -4996,6 +6235,19 @@ class Scheduler:
                 "source": "database" | "config",
             }
         """
+        # 已完成 bootstrap 的节点优先使用本地配置，状态查询不触发 DB。
+        import config as cfg
+        if (not skip_config
+                and cfg.CLIENT_MASTER_HOST
+                and cfg.CLIENT_MASTER_HOST != "192.168.x.x"):
+            return {
+                "found": True,
+                "master_host": cfg.CLIENT_MASTER_HOST,
+                "master_port": cfg.CLIENT_MASTER_PORT,
+                "stale": False,
+                "source": "config",
+            }
+
         db = _get_db()
         if db and _db_available:
             try:
@@ -5006,18 +6258,12 @@ class Scheduler:
             except Exception as e:
                 logger.warning(f"数据库查询主节点信息失败: {e}")
 
-        # 数据库不可用时回退到 config 值
-        import config as cfg
-        if cfg.CLIENT_MASTER_HOST and cfg.CLIENT_MASTER_HOST != "192.168.x.x":
-            return {
-                "found": True,
-                "master_host": cfg.CLIENT_MASTER_HOST,
-                "master_port": cfg.CLIENT_MASTER_PORT,
-                "stale": True,
-                "source": "config",
-            }
-
-        return {"found": False, "source": "none"}
+        try:
+            from bootstrap import discover_master_via_tailnet
+            return discover_master_via_tailnet(api_port=_bootstrap_api_port())
+        except Exception as e:
+            logger.debug("Tailnet 主节点发现失败: %s", e, exc_info=True)
+            return {"found": False, "source": "none"}
 
     # ================================================================
     # 分布式推理开关
@@ -5035,6 +6281,8 @@ class Scheduler:
                 return db.get_distributed_inference_enabled()
             except Exception:
                 pass
+        if self._distributed_inference_enabled is not None:
+            return self._distributed_inference_enabled
         from config import DISTRIBUTED_INFERENCE_ENABLED
         return DISTRIBUTED_INFERENCE_ENABLED
 
@@ -5055,6 +6303,7 @@ class Scheduler:
             except Exception as e:
                 return {"status": "error", "reason": f"DB 持久化失败: {e}"}
 
+        self._distributed_inference_enabled = bool(enabled)
         logger.info(f"分布式推理已{'启用' if enabled else '禁用'}")
         return {
             "status": "ok",
@@ -5087,11 +6336,28 @@ class Scheduler:
         top_p = data.get("top_p", 0.9)
         show_thinking = data.get("show_thinking", False)
         session_id = data.get("session_id")
+        messages = data.get("messages")
         request_id = data.get("request_id")   # L5: 链路追踪
+        forward_request_id = str(data.get("forward_request_id", ""))
+        cancel_key = forward_request_id or f"legacy_{uuid.uuid4().hex}"
 
         import threading as _thr
 
+        if not self._forward_infer_slots.acquire(blocking=False):
+            self._send_infer_result(
+                client_id, "", "", {},
+                forward_request_id=forward_request_id,
+                status="error",
+                error="主节点转发请求已达并发上限，请稍后重试",
+            )
+            return
+
+        cancel_event = threading.Event()
+        with self._forward_cancel_lock:
+            self._forward_cancel_events[(client_id, cancel_key)] = cancel_event
+
         def _run_inference():
+            task_id = ""
             try:
                 task_id = self.start_infer_task(prompt, request_id=request_id)
                 logger.info(
@@ -5107,13 +6373,18 @@ class Scheduler:
                     temperature=temperature,
                     top_p=top_p,
                     session_id=session_id,
+                    messages=messages,
+                    show_thinking=show_thinking,
+                    _cancel_event=cancel_event,
                 )
 
                 content = pipeline_result.get("response", "")
+                thinking_content = pipeline_result.get("thinking")
                 error = pipeline_result.get("error")
                 metrics = pipeline_result.get("metrics", {})
 
                 if error:
+                    self.fail_infer_task(task_id, error)
                     logger.warning(
                         f"⚠️ 流水线推理失败 → {client_id}: task={task_id}, "
                         f"error={error}"
@@ -5121,6 +6392,10 @@ class Scheduler:
                     self._send_infer_result(
                         client_id, task_id, content,
                         {**metrics, "error": error},
+                        thinking_content=thinking_content,
+                        forward_request_id=forward_request_id,
+                        status="error",
+                        error=error,
                     )
                     return
 
@@ -5148,9 +6423,11 @@ class Scheduler:
                     except Exception:
                         pass
 
-                self.complete_infer_task(task_id, content)
+                self.complete_infer_task(task_id, content, metrics)
                 self._send_infer_result(
                     client_id, task_id, content, metrics,
+                    thinking_content=thinking_content,
+                    forward_request_id=forward_request_id,
                 )
                 logger.info(
                     f"✅ 推理完成 → {client_id}: task={task_id}, "
@@ -5158,27 +6435,47 @@ class Scheduler:
                 )
 
             except Exception as e:
+                if task_id:
+                    self.fail_infer_task(task_id, str(e))
                 logger.error(f"转发推理执行失败: {e}", exc_info=True)
                 self._send_infer_result(
-                    client_id, "", "",
-                    {"error": str(e)}
+                    client_id, task_id, "",
+                    {"error": str(e)},
+                    forward_request_id=forward_request_id,
+                    status="error",
+                    error=str(e),
                 )
+            finally:
+                with self._forward_cancel_lock:
+                    self._forward_cancel_events.pop((client_id, cancel_key), None)
+                self._forward_infer_slots.release()
 
-        _thr.Thread(target=_run_inference, name=f"infer-{client_id}", daemon=True).start()
+        _thr.Thread(
+            target=_run_inference,
+            name=f"infer-{client_id}-{cancel_key[-8:]}",
+            daemon=True,
+        ).start()
 
     def _send_infer_result(self, client_id: str, task_id: str,
                            content: str, metrics: dict = None,
                            thinking_content: str = None,
-                           followups: list = None) -> None:
+                           followups: list = None,
+                           forward_request_id: str = "",
+                           status: str = "ok",
+                           error: str = "") -> None:
         """向从节点回传推理结果"""
         if self._tcp_server and self._tcp_server._running:
             try:
                 from tcp_comm import MessageType
                 result_data = {
                     "task_id": task_id,
+                    "forward_request_id": forward_request_id,
+                    "status": status,
                     "content": content,
                     "metrics": metrics or {},
                 }
+                if error:
+                    result_data["error"] = error
                 if thinking_content:
                     result_data["thinking_content"] = thinking_content
                 if followups:
@@ -5195,33 +6492,138 @@ class Scheduler:
     # 分布式流水线推理（阶段 3：流水线调度引擎）
     # ================================================================
 
+    def _schedule_layer_config(self, client_id: str, data: dict) -> None:
+        config_id = str(data.get("config_id", "")) if isinstance(data, dict) else ""
+        with self._layer_config_lock:
+            cached = self._last_layer_config_ack_payload
+            if (config_id and cached
+                    and cached.get("config_id") == config_id
+                    and config_id not in self._layer_config_inflight):
+                payload = dict(cached)
+            else:
+                payload = None
+            if config_id and config_id in self._layer_config_inflight:
+                return
+            if config_id and payload is None:
+                self._layer_config_inflight.add(config_id)
+
+        if payload is not None:
+            self._send_layer_config_ack(payload)
+            return
+
+        def _load() -> None:
+            try:
+                self._handle_layer_config(client_id, data)
+            finally:
+                if config_id:
+                    with self._layer_config_lock:
+                        self._layer_config_inflight.discard(config_id)
+
+        threading.Thread(
+            target=_load,
+            name=f"layer-config-{config_id[-8:] or 'legacy'}",
+            daemon=True,
+        ).start()
+
     def _handle_layer_config(self, client_id: str, data: dict) -> None:
+        with self._layer_execution_lock:
+            self._handle_layer_config_locked(client_id, data)
+
+    def _handle_layer_config_locked(self, client_id: str, data: dict) -> None:
         """
         从节点：收到主节点推送的分层配置 → 加载指定层范围。
 
-        主节点广播的 assignments 格式:
-            { "client1": {"start_layer":0, "end_layer":8, "has_embedding":true, "has_lm_head":false},
-              "client2": {"start_layer":8, "end_layer":16, ...}, ... }
-
-        从节点根据自身 node_id 取出对应配置，调用 load_layer_range() 加载层范围。
+        新版主节点只发送本节点的 assignment；同时兼容旧版
+        ``{node_id: assignment}`` 外层映射。加载结束后必须发送 ACK，
+        主节点收到当前 config_id 的成功 ACK 才会将本节点视为 ready。
         """
-        node_id = NODE_ID  # 本节点的 ID（从节点在注册时设置）
-        if node_id not in data:
-            logger.warning(f"分层配置中未找到本节点 {node_id}，跳过")
+        with self._layer_config_lock:
+            if self._active_pipeline_task_ids:
+                self._pending_layer_config = (client_id, dict(data))
+                logger.warning(
+                    "本节点仍有流水线任务执行中，分层配置已延后: active=%s",
+                    sorted(self._active_pipeline_task_ids),
+                )
+                return
+
+        node_id = self.get_effective_node_id()
+        if node_id in data and isinstance(data.get(node_id), dict):
+            cfg = dict(data[node_id])
+        elif isinstance(data, dict) and "start_layer" in data and "end_layer" in data:
+            cfg = dict(data)
+        else:
+            error = f"分层配置中未找到本节点 {node_id} 的有效 assignment"
+            logger.warning(error)
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": data.get("config_id", "") if isinstance(data, dict) else "",
+                "status": "error",
+                "error": error,
+            })
             return
 
-        cfg = data[node_id]
+        config_id = str(cfg.get("config_id", ""))
+        target_node_id = str(cfg.get("node_id", node_id))
         start = cfg.get("start_layer", 0)
         end = cfg.get("end_layer", 24)
         has_embed = cfg.get("has_embedding", False)
         has_lm = cfg.get("has_lm_head", False)
+        model_id = str(cfg.get("model_id", ""))
+        expected_sha256 = str(cfg.get("model_sha256", ""))
+        total_layers = int(cfg.get("total_layers", 0) or 0)
+        master_api_port = int(cfg.get("master_api_port", 8000) or 8000)
 
         logger.info(
             f"🔧 收到分层配置: 节点={node_id}, "
-            f"Layer {start}-{end}, embed={has_embed}, lm_head={has_lm}"
+            f"Layer {start}-{end}, embed={has_embed}, lm_head={has_lm}, "
+            f"config_id={config_id or 'legacy'}"
         )
 
         try:
+            if target_node_id != node_id:
+                raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
+
+            local_sha256 = ""
+            local_model_path = None
+            if expected_sha256:
+                from tcp_comm import TCPClient
+                if model_id:
+                    from model_sync import (
+                        ensure_model_available,
+                        resolve_worker_model_path,
+                    )
+
+                    local_model_path = resolve_worker_model_path(model_id)
+                    local_sha256 = TCPClient._compute_local_model_sha256(
+                        model_path=local_model_path,
+                        model_id=model_id,
+                    )
+                    if local_sha256 != expected_sha256:
+                        tcp_client = getattr(self, "_tcp_client", None)
+                        master_host = getattr(tcp_client, "server_host", "")
+                        if not master_host:
+                            raise RuntimeError("无法确定主节点模型下载地址")
+                        logger.info("从主节点同步流水线模型: %s", model_id)
+                        local_model_path = ensure_model_available(
+                            master_host,
+                            master_api_port,
+                            model_id,
+                            expected_sha256,
+                        )
+                        local_sha256 = TCPClient._compute_local_model_sha256(
+                            model_path=local_model_path,
+                            model_id=model_id,
+                        )
+                else:
+                    local_sha256 = TCPClient._compute_local_model_sha256()
+                if not local_sha256:
+                    raise FileNotFoundError("本节点未找到可校验的 PyTorch 模型权重")
+                if local_sha256 != expected_sha256:
+                    raise ValueError(
+                        f"模型 SHA256 不一致: local={local_sha256[:16]}... "
+                        f"master={expected_sha256[:16]}..."
+                    )
+
             import api_server as _api
             mgr = getattr(_api, 'model_manager', None)
             if mgr and mgr.is_loaded:
@@ -5231,6 +6633,9 @@ class Scheduler:
                     start, end,
                     has_embedding=has_embed,
                     has_lm_head=has_lm,
+                    model_path=local_model_path,
+                    total_layers=total_layers or None,
+                    model_id=model_id or None,
                 )
             elif mgr:
                 # 模型尚未加载，先加载层范围
@@ -5239,13 +6644,148 @@ class Scheduler:
                     start, end,
                     has_embedding=has_embed,
                     has_lm_head=has_lm,
+                    model_path=local_model_path,
+                    total_layers=total_layers or None,
+                    model_id=model_id or None,
                 )
             else:
-                logger.error("model_manager 不可用，无法加载层范围")
+                raise RuntimeError("model_manager 不可用，无法加载层范围")
+
+            actual_range = getattr(mgr, 'layer_range', None)
+            if actual_range is not None and tuple(actual_range) != (start, end):
+                raise RuntimeError(
+                    f"模型层范围加载结果不一致: actual={actual_range}, expected=({start}, {end})"
+                )
+            engine = getattr(mgr, '_engine_type', '') or 'pytorch'
+            if engine != 'pytorch':
+                raise RuntimeError(f"层拆分要求 PyTorch 引擎，实际为 {engine}")
+
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": config_id,
+                "status": "ready",
+                "layer_range": [start, end],
+                "model_sha256": local_sha256 or expected_sha256,
+                "engine": engine,
+                "timestamp": time.time(),
+            })
+            logger.info(
+                f"✅ 模型层加载完成并已确认: node={node_id}, "
+                f"Layer {start}-{end}, config_id={config_id or 'legacy'}"
+            )
         except Exception as e:
-            logger.error(f"加载层范围失败: {e}")
+            logger.error(f"加载层范围失败: {e}", exc_info=True)
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": config_id,
+                "status": "error",
+                "layer_range": [start, end],
+                "model_sha256": "",
+                "engine": "pytorch",
+                "error": str(e),
+                "timestamp": time.time(),
+            })
+
+    def _send_layer_config_ack(self, payload: dict) -> bool:
+        """从节点向主节点回传层配置加载结果。"""
+        from tcp_comm import MessageType
+
+        if payload.get("config_id") and payload.get("status") == "ready":
+            with self._layer_config_lock:
+                self._last_layer_config_ack_payload = dict(payload)
+
+        client = getattr(self, '_tcp_client', None)
+        if client is None:
+            logger.warning("TCP 客户端未连接，无法发送层配置 ACK")
+            return False
+        try:
+            client.send_data(payload, MessageType.LAYER_CONFIG_ACK)
+            return True
+        except Exception as e:
+            logger.error(f"发送层配置 ACK 失败: {e}", exc_info=True)
+            return False
+
+    def _handle_layer_config_ack(self, client_id: str, msg: dict) -> None:
+        """主节点校验从节点层加载 ACK，并更新流水线 ready 状态。"""
+        data = msg.get("data", {})
+        node_id = str(data.get("node_id", client_id))
+        config_id = str(data.get("config_id", ""))
+
+        if node_id != client_id:
+            logger.warning(
+                f"忽略节点标识不一致的层配置 ACK: connection={client_id}, payload={node_id}"
+            )
+            return
+
+        with self._layer_config_lock:
+            expected = self._layer_config_expected.get(client_id)
+            if not expected:
+                logger.warning(f"忽略未请求的层配置 ACK: node={client_id}")
+                return
+            if config_id != expected.get("config_id"):
+                logger.warning(
+                    f"忽略过期层配置 ACK: node={client_id}, config_id={config_id}, "
+                    f"expected={expected.get('config_id')}"
+                )
+                return
+
+            expected_range = [expected["start_layer"], expected["end_layer"]]
+            ready = (
+                data.get("status") == "ready"
+                and data.get("layer_range") == expected_range
+                and data.get("model_sha256") == expected.get("model_sha256")
+                and data.get("engine") == "pytorch"
+            )
+            self._layer_config_acks[client_id] = dict(data)
+            if ready:
+                self._layer_config_pushed.add(client_id)
+                self._layer_config_retry_state.pop(client_id, None)
+            else:
+                self._layer_config_pushed.discard(client_id)
+                state = self._layer_config_retry_state.setdefault(
+                    client_id, {"attempts": 0, "next_retry": 0.0}
+                )
+                state["next_retry"] = min(
+                    float(state.get("next_retry", 0.0)),
+                    time.monotonic() + 5.0,
+                )
+
+        if ready:
+            logger.info(
+                f"✅ 从节点层配置已就绪: node={client_id}, "
+                f"Layer {expected_range[0]}-{expected_range[1]}, config_id={config_id}"
+            )
+        else:
+            logger.error(
+                f"从节点层配置加载未通过: node={client_id}, "
+                f"status={data.get('status')}, error={data.get('error', '')}"
+            )
+
+    def _run_master_lm_head(self, hidden_states):
+        """在主节点对 worker 返回的尾层 hidden states 执行 Norm + LM Head。"""
+        import api_server as _api
+
+        mgr = getattr(_api, "model_manager", None)
+        if not mgr or not mgr.is_loaded or getattr(mgr, "_engine_type", "") != "pytorch":
+            raise RuntimeError("主节点 PyTorch 模型未加载，无法执行 LM Head")
+        model = getattr(mgr, "model", None)
+        transformer = getattr(model, "model", None)
+        norm = getattr(transformer, "norm", None)
+        lm_head = getattr(model, "lm_head", None)
+        if norm is None or lm_head is None:
+            raise RuntimeError("主节点当前分层不含 Norm/LM Head")
+
+        device = mgr.get_device()
+        dtype = next(model.parameters()).dtype
+        with torch.no_grad():
+            states = hidden_states.to(device=device, dtype=dtype)
+            return lm_head(norm(states))
 
     def _handle_layer_forward(self, client_id: str, msg: dict) -> None:
+        with self._layer_execution_lock:
+            self._handle_layer_forward_locked(client_id, msg)
+
+    def _handle_layer_forward_locked(self, client_id: str, msg: dict) -> None:
         """
         从节点：收到主节点的 LAYER_FORWARD → 执行本节点层前向 → 返回 LAYER_RESULT。
 
@@ -5280,6 +6820,10 @@ class Scheduler:
         )
 
         try:
+            with self._layer_config_lock:
+                if task_id in self._local_pipeline_cancelled:
+                    logger.info("忽略已取消任务的迟到层前向: task=%s", task_id)
+                    return
             import api_server as _api
             from tcp_comm import deserialize_tensor_fast
 
@@ -5332,6 +6876,7 @@ class Scheduler:
                     )
 
             # ---- 执行前向传播 ----
+            self._begin_local_pipeline_task(task_id)
             t_start = time.time()
             result = mgr.forward_layers(
                 input_ids=input_ids,
@@ -5341,9 +6886,17 @@ class Scheduler:
                 past_key_values=past_kv,
                 use_cache=True,  # 始终缓存 KV（prefill 构建，decode 更新）
             )
+            with self._layer_config_lock:
+                task_cancelled = task_id in self._local_pipeline_cancelled
+            if task_cancelled:
+                with self._kv_cache_lock:
+                    self._kv_cache.pop(task_id, None)
+                self._finish_local_pipeline_task(task_id)
+                with self._layer_config_lock:
+                    self._local_pipeline_cancelled.discard(task_id)
+                logger.info("丢弃已取消任务的迟到计算结果: task=%s", task_id)
+                return
             elapsed_ms = (time.time() - t_start) * 1000
-            self._record_local_pipeline_participation(task_id, success=True)
-
             # ---- KV Cache: 存储更新后的 past_key_values ----
             if result.get("past_key_values"):
                 with self._kv_cache_lock:
@@ -5422,6 +6975,13 @@ class Scheduler:
                 ok = self._send_chain_forward(chain_next["node_id"], chain_data)
                 if ok:
                     logger.debug(f"🔗 L1 直连成功: → {chain_next['node_id']}")
+                    self._send_chain_forward_ack(
+                        task_id=task_id,
+                        step=step,
+                        from_node_id=NODE_ID,
+                        target_node_id=chain_next["node_id"],
+                        status="sent",
+                    )
                 else:
                     # L2: 主节点中转（从节点 → 主节点 → 目标从节点）
                     logger.warning(
@@ -5429,21 +6989,27 @@ class Scheduler:
                         f"尝试 L2 主节点中转"
                     )
                     chain_data["_relay_to"] = chain_next["node_id"]
-                    try:
-                        self._send_layer_result("master", task_id, result_data=chain_data)
+                    sent = self._send_layer_result("master", task_id, result_data=chain_data)
+                    if sent:
                         logger.info(
                             f"🔄 L2 中转请求已发送至主节点: "
                             f"{NODE_ID} → master → {chain_next['node_id']}"
                         )
-                    except Exception as e:
-                        logger.error(
-                            f"❌ L2 中转请求发送失败: {e}，"
-                            f"回退到全模型推理"
+                    else:
+                        error_msg = (
+                            f"链式转发到 {chain_next['node_id']} 失败 "
+                            f"(L1直连失败，L2中转请求发送失败)"
                         )
-                        self._send_layer_result(
-                            "master", task_id,
-                            error=f"链式转发到 {chain_next['node_id']} 失败 "
-                                  f"(L1直连+L2中转均失败: {e})"
+                        logger.error(
+                            f"❌ {error_msg}，回退到全模型推理"
+                        )
+                        self._send_chain_forward_ack(
+                            task_id=task_id,
+                            step=step,
+                            from_node_id=NODE_ID,
+                            target_node_id=chain_next["node_id"],
+                            status="error",
+                            error=error_msg,
                         )
             else:
                 # 末节点（或无链配置）：发送 LAYER_RESULT 回主节点
@@ -5451,8 +7017,16 @@ class Scheduler:
 
         except Exception as e:
             self._record_local_pipeline_participation(task_id, success=False)
+            self._finish_local_pipeline_task(task_id)
             logger.error(f"层前向传播失败: task={task_id}, error={e}", exc_info=True)
             self._send_layer_result("master", task_id, error=str(e))
+            self._send_chain_forward_ack(
+                task_id=task_id,
+                step=step,
+                from_node_id=client_id,
+                status="error",
+                error=str(e),
+            )
 
     def _handle_chain_forward(self, client_id: str, msg: dict) -> None:
         """
@@ -5461,15 +7035,26 @@ class Scheduler:
         CHAIN_FORWARD 的消息结构与 LAYER_FORWARD 一致（均为 hidden_states + chain 信息），
         直接委托 _handle_layer_forward 处理（其内部根据 chain_next 决定下一步动作）。
         """
-        logger.info(f"🔗 收到链式转发: from={client_id}, task={msg.get('data', {}).get('task_id', '?')}")
+        data = msg.get("data", {})
+        task_id = data.get("task_id", "")
+        step = data.get("step", -1)
+        logger.info(f"🔗 收到链式转发: from={client_id}, task={task_id or '?'}")
+        self._send_chain_forward_ack(
+            task_id=task_id,
+            step=step,
+            from_node_id=client_id,
+            status="received",
+        )
         self._handle_layer_forward(client_id, msg)
 
     def _send_layer_result(self, client_id: str, task_id: str,
-                           result_data: dict = None, error: str = None) -> None:
+                           result_data: dict = None, error: str = None) -> bool:
         """从节点 → 主节点：发送层前向传播结果"""
         if not self._tcp_client or not self._tcp_client._running:
             logger.error("TCP 客户端未连接，无法发送层前向结果")
-            return
+            self._record_local_pipeline_participation(task_id, success=False)
+            self._finish_local_pipeline_task(task_id)
+            return False
 
         from tcp_comm import MessageType
         import base64
@@ -5489,8 +7074,52 @@ class Scheduler:
 
         try:
             self._tcp_client.send_data(safe_payload, MessageType.LAYER_RESULT)
+            return True
         except Exception as e:
             logger.error(f"发送层前向结果失败: {e}")
+            self._record_local_pipeline_participation(task_id, success=False)
+            self._finish_local_pipeline_task(task_id)
+            try:
+                self._tcp_client.disconnect()
+            except Exception:
+                pass
+            return False
+
+    def _send_chain_forward_ack(self, task_id: str, step: int,
+                                from_node_id: str = "",
+                                target_node_id: str = "",
+                                status: str = "received",
+                                error: str = "") -> bool:
+        """从节点 → 主节点：发送链式转发接收/错误 ACK。"""
+        if not task_id:
+            return False
+        if not self._tcp_client or not self._tcp_client._running:
+            logger.error("TCP 客户端未连接，无法发送链式转发 ACK")
+            return False
+
+        from tcp_comm import MessageType
+
+        payload = {
+            "task_id": task_id,
+            "step": step,
+            "node_id": NODE_ID,
+            "from_node_id": from_node_id,
+            "status": status,
+        }
+        if target_node_id:
+            payload["target_node_id"] = target_node_id
+        if error:
+            payload["error"] = error
+        try:
+            self._tcp_client.send_data(payload, MessageType.CHAIN_FORWARD_ACK)
+            return True
+        except Exception as e:
+            logger.error(f"发送链式转发 ACK 失败: {e}")
+            try:
+                self._tcp_client.disconnect()
+            except Exception:
+                pass
+            return False
 
     def _handle_layer_result(self, client_id: str, msg: dict) -> None:
         """
@@ -5504,6 +7133,15 @@ class Scheduler:
         data = msg.get("data", {})
         task_id = data.get("task_id", "")
         node_id = data.get("node_id", client_id)
+
+        with self._pipeline_lock:
+            is_active = task_id in self._pipeline_active_tasks
+        if not is_active:
+            logger.warning(
+                "丢弃非活跃流水线任务结果: task=%s node=%s",
+                task_id or "-", node_id,
+            )
+            return
 
         # ★ 中转请求：从节点直连失败 → 请主节点转发到目标节点
         relay_target = data.get("_relay_to")
@@ -5521,6 +7159,18 @@ class Scheduler:
                 from tcp_comm import MessageType
                 self._send_to_worker(relay_target, relay_data,
                                      MessageType.CHAIN_FORWARD)
+                self._handle_chain_forward_ack(
+                    relay_target,
+                    {
+                        "data": {
+                            "task_id": task_id,
+                            "step": data.get("step", -1),
+                            "node_id": node_id,
+                            "target_node_id": relay_target,
+                            "status": "sent",
+                        }
+                    },
+                )
                 logger.info(f"✅ 中转成功: master → {relay_target}")
                 return  # 不存储结果，不唤醒 run_pipeline，链继续
             except Exception as e:
@@ -5529,16 +7179,12 @@ class Scheduler:
                     f"触发全模型回退"
                 )
                 # 中转失败 → 存储错误，唤醒 run_pipeline
-                key = f"{task_id}:{relay_target}"
-                with self._pipeline_lock:
-                    self._pipeline_results[key] = {
-                        "task_id": task_id,
-                        "node_id": relay_target,
-                        "error": f"主节点中转到 {relay_target} 失败: {e}",
-                        "step": data.get("step", -1),
-                    }
-                    if key in self._pipeline_events:
-                        self._pipeline_events[key].set()
+                self._set_pipeline_result_error(
+                    task_id,
+                    relay_target,
+                    f"主节点中转到 {relay_target} 失败: {e}",
+                    data.get("step", -1),
+                )
                 return
 
         logger.info(
@@ -5565,59 +7211,144 @@ class Scheduler:
             if key in self._pipeline_events:
                 self._pipeline_events[key].set()
 
-    def _all_pipeline_nodes_ready(self) -> bool:
-        """
-        检查所有流水线节点是否就绪（预入队快速检查）：
-        1. 节点已注册
-        2. 节点在线（state == ONLINE）
-        3. TCP 连接正常
-        4. 心跳新鲜（< 10s，防止"僵尸"节点）
-        5. 层配置已成功推送
-        """
+    def _get_pipeline_readiness(self) -> dict:
+        """返回流水线 worker 的真实就绪状态和首个阻塞原因。"""
         if not self._tcp_server or not self._tcp_server._running:
-            return False
+            return {
+                "ready": False,
+                "reason_code": "tcp_server_not_running",
+                "reason": "主节点 TCP 服务未运行",
+                "workers": [],
+            }
 
         assignments = self.get_layer_assignments()
         pipeline_nodes = [
             a for a in assignments.get("assignments", [])
-            if a.get("node_id") != "master"
+            if a.get("node_id") != "master" and a.get("layers_count", 1) > 0
         ]
-
         if not pipeline_nodes:
-            logger.info("没有流水线从节点（单节点模式），跳过流水线检查")
-            return False
+            return {
+                "ready": False,
+                "reason_code": "no_pipeline_workers",
+                "reason": "未分配任何 PC 从节点参与模型层计算",
+                "workers": [],
+            }
 
-        # Phase 2.1+: 快照避免循环中并发修改
         with self._nodes_lock:
             nodes_snapshot = dict(self.nodes)
+        with self._layer_config_lock:
+            ready_nodes = set(self._layer_config_pushed)
+            expected_configs = dict(self._layer_config_expected)
+            ack_snapshot = dict(self._layer_config_acks)
+        get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
+        connected = set(
+            get_client_ids()
+            if callable(get_client_ids)
+            else getattr(self._tcp_server, "clients", {}).keys()
+        )
 
-        for node in pipeline_nodes:
-            node_id = node["node_id"]
+        first_failure = None
+        worker_status = []
+        now = time.time()
+        for assignment in pipeline_nodes:
+            node_id = assignment["node_id"]
             node_info = nodes_snapshot.get(node_id)
-            if not node_info:
-                logger.warning(f"流水线节点 {node_id} 未注册")
-                return False
-            if not node_info.is_available():
-                logger.warning(f"流水线节点 {node_id} 不在线")
-                return False
-            if node_id not in (self._tcp_server.clients if self._tcp_server else {}):
-                logger.warning(f"流水线节点 {node_id} TCP 未连接")
-                return False
-            # ★ 心跳新鲜度：超过 10 秒无心跳视为失联
-            heartbeat_age = time.time() - node_info.last_heartbeat
-            if heartbeat_age > 10:
-                logger.warning(
-                    f"流水线节点 {node_id} 心跳过期 "
-                    f"({heartbeat_age:.1f}s > 10s)，视为失联"
-                )
-                return False
-            # ★ 层配置：必须已成功推送
-            if node_id not in self._layer_config_pushed:
-                logger.warning(f"流水线节点 {node_id} 尚未收到层配置")
-                return False
+            online = bool(node_info and node_info.is_available())
+            tcp_connected = node_id in connected
+            heartbeat_age = (
+                max(0.0, now - node_info.last_heartbeat)
+                if node_info and node_info.last_heartbeat else None
+            )
+            expected = expected_configs.get(node_id, {})
+            ack = ack_snapshot.get(node_id, {})
+            expected_range = [
+                assignment.get("start_layer", 0),
+                assignment.get("end_layer", 0),
+            ]
+            layer_ready = (
+                node_id in ready_nodes
+                and ack.get("config_id") == expected.get("config_id")
+                and ack.get("layer_range") == expected_range
+                and ack.get("model_sha256") == expected.get("model_sha256")
+                and ack.get("engine") == "pytorch"
+            )
+            layer_status = "ready" if layer_ready else (
+                "error" if ack.get("status") == "error" else
+                "loading" if expected else "not_configured"
+            )
+            error = str(ack.get("error", ""))
 
-        logger.info(f"✅ 所有流水线节点就绪: {[n['node_id'] for n in pipeline_nodes]}")
-        return True
+            failure = None
+            if node_info is None:
+                failure = ("worker_not_registered", f"从节点 {node_id} 未注册")
+            elif not online:
+                failure = ("worker_offline", f"从节点 {node_id} 已离线")
+            elif not tcp_connected:
+                failure = ("worker_tcp_disconnected", f"从节点 {node_id} TCP 已断开")
+            elif heartbeat_age is None or heartbeat_age > 10:
+                age_text = "未知" if heartbeat_age is None else f"{heartbeat_age:.1f}s"
+                failure = (
+                    "worker_heartbeat_stale",
+                    f"从节点 {node_id} 心跳已过期 ({age_text})",
+                )
+            elif not layer_ready and error:
+                failure = (
+                    "worker_layer_load_failed",
+                    f"从节点 {node_id} 模型同步或层加载失败: {error}",
+                )
+            elif not layer_ready and expected:
+                failure = (
+                    "worker_layer_loading",
+                    f"从节点 {node_id} 正在同步同款 PyTorch 模型或加载分配层",
+                )
+            elif not layer_ready:
+                failure = (
+                    "worker_layer_not_configured",
+                    f"从节点 {node_id} 尚未收到模型分层配置",
+                )
+
+            if first_failure is None and failure is not None:
+                first_failure = failure
+            worker_status.append({
+                "node_id": node_id,
+                "online": online,
+                "tcp_connected": tcp_connected,
+                "heartbeat_age_seconds": (
+                    round(heartbeat_age, 1) if heartbeat_age is not None else None
+                ),
+                "layer_ready": layer_ready,
+                "layer_status": layer_status,
+                "layer_error": error,
+                "config_id": expected.get("config_id", ""),
+                "model_id": expected.get("model_id", ""),
+                "layer_range": expected_range,
+            })
+
+        if first_failure is None:
+            return {
+                "ready": True,
+                "reason_code": "ready",
+                "reason": "所有 PC 从节点已确认同款 PyTorch 模型和分配层",
+                "workers": worker_status,
+            }
+        return {
+            "ready": False,
+            "reason_code": first_failure[0],
+            "reason": first_failure[1],
+            "workers": worker_status,
+        }
+
+    def _all_pipeline_nodes_ready(self) -> bool:
+        """检查所有流水线节点是否在线并已确认模型层加载完成。"""
+        readiness = self._get_pipeline_readiness()
+        if readiness["ready"]:
+            logger.info(
+                "✅ 所有流水线节点就绪: %s",
+                [worker["node_id"] for worker in readiness["workers"]],
+            )
+            return True
+        logger.warning("流水线未就绪: %s", readiness["reason"])
+        return False
 
     def _verify_pipeline_readiness(self, pipeline_nodes: list
                                    ) -> tuple:
@@ -5648,7 +7379,13 @@ class Scheduler:
                 return False, f"节点 {node_id} 已消失（可能被注销）"
             if not node_info.is_available():
                 return False, f"节点 {node_id} 已离线 (state={node_info.state.value})"
-            if node_id not in (self._tcp_server.clients if self._tcp_server else {}):
+            get_client_ids = getattr(self._tcp_server, "get_client_ids", None)
+            connected_ids = (
+                get_client_ids()
+                if callable(get_client_ids)
+                else getattr(self._tcp_server, "clients", {}).keys()
+            )
+            if node_id not in connected_ids:
                 return False, f"节点 {node_id} TCP 连接已断开"
 
             # 心跳新鲜度
@@ -5659,9 +7396,19 @@ class Scheduler:
                     f"({heartbeat_age:.1f}s > 10s)"
                 )
 
-            # 层配置已推送
-            if node_id not in self._layer_config_pushed:
-                return False, f"节点 {node_id} 尚未收到层配置推送"
+            with self._layer_config_lock:
+                expected = self._layer_config_expected.get(node_id, {})
+                ack = self._layer_config_acks.get(node_id, {})
+                expected_range = [node.get("start_layer"), node.get("end_layer")]
+                layer_ready = (
+                    node_id in self._layer_config_pushed
+                    and ack.get("config_id") == expected.get("config_id")
+                    and ack.get("layer_range") == expected_range
+                    and ack.get("model_sha256") == expected.get("model_sha256")
+                    and ack.get("engine") == "pytorch"
+                )
+            if not layer_ready:
+                return False, f"节点 {node_id} 尚未确认层配置加载成功"
 
         logger.info(
             f"✅ 二次就绪检查通过: "
@@ -5670,23 +7417,43 @@ class Scheduler:
         return True, "ok"
 
     def _broadcast_pipeline_abort(self, pipeline_nodes: list, task_id: str,
-                                   reason: str) -> None:
+                                   reason: str, count_error: bool = True) -> None:
         """向所有流水线节点广播 PIPELINE_ABORT（清理各节点 + master 本地 KV cache）。"""
         from tcp_comm import MessageType
-        try:
-            for n in pipeline_nodes:
+        failed_nodes = []
+        for n in pipeline_nodes:
+            node_id = n.get("node_id")
+            if not node_id:
+                continue
+            try:
                 self._send_to_worker(
-                    n["node_id"],
-                    {"task_id": task_id, "reason": reason},
+                    node_id,
+                    {
+                        "task_id": task_id,
+                        "reason": reason,
+                        "count_error": count_error,
+                    },
                     MessageType.PIPELINE_ABORT,
                 )
-        except Exception as e:
-            logger.warning(f"广播 PIPELINE_ABORT 失败: {e}")
+            except Exception as e:
+                failed_nodes.append(f"{node_id}: {e}")
+                logger.warning(
+                    "PIPELINE_ABORT 发送失败: node=%s task=%s error=%s",
+                    node_id, task_id, e,
+                    exc_info=True,
+                )
+        if failed_nodes:
+            logger.warning(
+                "PIPELINE_ABORT 部分节点清理失败: task=%s failed=%s",
+                task_id, "; ".join(failed_nodes),
+            )
         # ★ 同时清理 master 自身 KV cache（master_participates 路径会产生本地缓存）
         if task_id:
             with self._kv_cache_lock:
                 if task_id in self._kv_cache:
                     del self._kv_cache[task_id]
+            with self._pipeline_lock:
+                self._chain_ack_state.pop(task_id, None)
 
     def _get_node_address(self, node_id: str) -> Optional[dict]:
         """
@@ -5729,19 +7496,44 @@ class Scheduler:
 
         try:
             t0 = time.time()
-            client = TCPClient(
-                server_host=addr["host"],
-                server_port=addr["port"],
-                client_id=NODE_ID,
-                role="client",
-            )
-            ok = client.connect()
-            if not ok:
-                logger.error(f"链式转发: 连接 {target_node_id} ({addr['host']}:{addr['port']}) 失败")
-                return False
+            target = (addr["host"], addr["port"])
+            with self._chain_clients_lock:
+                cached = self._chain_clients.get(target_node_id)
+                cached_target = (
+                    getattr(cached, "server_host", ""),
+                    getattr(cached, "server_port", 0),
+                ) if cached else None
+                cached_ready = bool(
+                    cached
+                    and cached_target == target
+                    and getattr(cached, "_running", False)
+                    and getattr(cached, "is_registered", False)
+                    and getattr(cached, "sock", None) is not None
+                )
+                if cached_ready:
+                    client = cached
+                else:
+                    if cached is not None:
+                        try:
+                            cached.disconnect()
+                        except Exception:
+                            pass
+                    client = TCPClient(
+                        server_host=addr["host"],
+                        server_port=addr["port"],
+                        client_id=self.get_effective_node_id(),
+                        role="client",
+                        node_type="pipeline_peer",
+                    )
+                    if not client.connect():
+                        logger.error(
+                            "链式转发: 连接 %s (%s:%s) 失败",
+                            target_node_id, addr["host"], addr["port"],
+                        )
+                        return False
+                    self._chain_clients[target_node_id] = client
 
             client.send_data(data, MessageType.CHAIN_FORWARD)
-            client.disconnect()
             elapsed_ms = (time.time() - t0) * 1000
             hs_shape = data.get("hidden_shape", "?")
             logger.debug(
@@ -5751,6 +7543,13 @@ class Scheduler:
             return True
         except Exception as e:
             logger.error(f"链式转发到 {target_node_id} 失败: {e}")
+            with self._chain_clients_lock:
+                failed_client = self._chain_clients.pop(target_node_id, None)
+            if failed_client is not None:
+                try:
+                    failed_client.disconnect()
+                except Exception:
+                    pass
             return False
 
     def _send_to_worker(self, worker_id: str, data: dict,
@@ -5764,7 +7563,10 @@ class Scheduler:
         self._tcp_server.send_to_client(worker_id, data, msg_type)
 
     def _wait_for_layer_result(self, task_id: str, node_ids,
-                               timeout: float = 30.0) -> Optional[dict]:
+                               timeout: float = 30.0,
+                               ack_node_ids: list = None,
+                               ack_step: int = None,
+                               ack_timeout: float = None) -> Optional[dict]:
         """
         主节点：等待指定节点的 LAYER_RESULT。
 
@@ -5780,18 +7582,35 @@ class Scheduler:
 
         keys = [f"{task_id}:{nid}" for nid in node_ids]
 
-        # 为每个可能的节点创建 event
+        # 先消费已经到达的结果，避免 worker 极快返回时发生
+        # "结果先写入、event 后创建" 的竞态。
         events = []
+        result = None
+        signaled_key = None
         with self._pipeline_lock:
             for key in keys:
-                event = threading.Event()
-                self._pipeline_events[key] = event
-                events.append((key, event))
+                data = self._pipeline_results.pop(key, None)
+                if data is not None:
+                    result = data
+                    signaled_key = key
+                    break
+            if result is None:
+                for key in keys:
+                    event = threading.Event()
+                    self._pipeline_events[key] = event
+                    events.append((key, event))
 
         # 等待任一 event 触发
         deadline = time.time() + timeout
-        signaled_key = None
-        while time.time() < deadline:
+        while result is None and time.time() < deadline:
+            if ack_node_ids and ack_step is not None and ack_timeout is not None:
+                ack_failure = self._get_chain_ack_failure(
+                    task_id, ack_step, ack_node_ids, ack_timeout,
+                )
+                if ack_failure is not None:
+                    result = ack_failure
+                    signaled_key = f"{task_id}:{ack_failure.get('node_id')}"
+                    break
             for key, event in events:
                 if event.is_set():
                     signaled_key = key
@@ -5805,19 +7624,18 @@ class Scheduler:
             for key, _ in events:
                 self._pipeline_events.pop(key, None)
 
-            # 查找第一个有结果或超时的 key
-            result = None
-            for key in keys:
-                data = self._pipeline_results.pop(key, None)
-                if data is not None:
-                    result = data
-                    break
-
-        if signaled_key is None:
-            logger.error(f"⏰ 等待流水线结果超时 ({timeout}s), task={task_id}")
-            return None
+            if result is None:
+                # 查找第一个有结果或超时的 key。即使 event 轮询刚好错过
+                # 最后一瞬间，也以实际结果为准。
+                for key in keys:
+                    data = self._pipeline_results.pop(key, None)
+                    if data is not None:
+                        result = data
+                        signaled_key = key
+                        break
 
         if result is None:
+            logger.error(f"⏰ 等待流水线结果超时 ({timeout}s), task={task_id}")
             return None
 
         # 解码 base64 → bytes（供调用方反序列化张量）
@@ -5831,6 +7649,30 @@ class Scheduler:
             else:
                 decoded[k] = v
         return decoded
+
+    def _wait_for_layer_result_with_ack(self, task_id: str, node_ids,
+                                        timeout: float,
+                                        ack_node_ids: list,
+                                        ack_step: int,
+                                        ack_timeout: float) -> Optional[dict]:
+        """等待流水线结果；兼容测试或旧扩展中替换掉的三参数等待函数。"""
+        try:
+            return self._wait_for_layer_result(
+                task_id,
+                node_ids,
+                timeout=timeout,
+                ack_node_ids=ack_node_ids,
+                ack_step=ack_step,
+                ack_timeout=ack_timeout,
+            )
+        except TypeError as e:
+            if "ack_node_ids" not in str(e):
+                raise
+            logger.debug(
+                "_wait_for_layer_result 不支持 ACK 参数，退回旧签名调用",
+                exc_info=True,
+            )
+            return self._wait_for_layer_result(task_id, node_ids, timeout)
 
     # ================================================================
     # 协同抢占辅助方法 (Phase 2)
@@ -5938,6 +7780,7 @@ class Scheduler:
                         temperature=q0_task.temperature,
                         top_p=q0_task.top_p,
                         session_id=q0_task.session_id,
+                        _cancel_event=q0_task.cancel_event,
                         **extra,
                     )
             except Exception as e:
@@ -6017,10 +7860,32 @@ class Scheduler:
             self.pipeline_queue._preempt_total_overhead_ms = self._preempt_total_overhead_ms
             self.pipeline_queue._last_preempt_time = self._preempt_last_time
 
-    def run_pipeline(self, prompt: str, max_new_tokens: int = 512,
+    def run_pipeline(self, *args, **kwargs) -> dict:
+        """Run one pipeline task and abort every task context added by this call on exceptions."""
+        stack = getattr(self._pipeline_context, "stack", None)
+        if stack is None:
+            stack = []
+            self._pipeline_context.stack = stack
+        initial_depth = len(stack)
+        try:
+            return self._run_pipeline(*args, **kwargs)
+        except Exception as exc:
+            for context in reversed(stack[initial_depth:]):
+                self._broadcast_pipeline_abort(
+                    context["pipeline_nodes"], context["task_id"], str(exc)
+                )
+                self._clear_pipeline_runtime_state(context["task_id"])
+            raise
+        finally:
+            del stack[initial_depth:]
+
+    def _run_pipeline(self, prompt: str, max_new_tokens: int = 512,
                      temperature: float = 0.7, top_p: float = 0.9,
                      session_id: str = None,
-                     _stream_callback=None) -> dict:
+                     messages: list = None,
+                     show_thinking: bool = False,
+                     _stream_callback=None,
+                     _cancel_event: threading.Event = None) -> dict:
         """
         主节点：协调多节点流水线推理。
 
@@ -6089,7 +7954,7 @@ class Scheduler:
         if not pipeline_nodes:
             return {"response": "", "error": "没有可用的流水线从节点"}
 
-        # master 参与时，先在本地加载 Embedding + 首段 Transformer 层。
+        # master 参与时，在本地保留 Embedding + 首段 Transformer + LM Head。
         # 后续 step 由 master.forward_layers(input_ids) 生成 hidden_states，
         # 再交给第一个 worker；避免 RTX 独显主节点只做调度而不计算。
         if master_participates:
@@ -6100,14 +7965,14 @@ class Scheduler:
                         master_assignment["start_layer"],
                         master_assignment["end_layer"],
                         has_embedding=master_assignment.get("has_embedding", True),
-                        has_lm_head=False,
+                        has_lm_head=master_assignment.get("has_lm_head", True),
                     )
                 else:
                     mgr.load_layer_range(
                         master_assignment["start_layer"],
                         master_assignment["end_layer"],
                         has_embedding=master_assignment.get("has_embedding", True),
-                        has_lm_head=False,
+                        has_lm_head=master_assignment.get("has_lm_head", True),
                     )
             except Exception as e:
                 logger.error(f"❌ 主节点本地层范围加载失败: {e}", exc_info=True)
@@ -6140,14 +8005,44 @@ class Scheduler:
         )
 
         # ---- Step 2: Tokenize ----
-        inputs = tokenizer(prompt, return_tensors="pt")
+        chat_messages = messages or [{"role": "user", "content": prompt}]
+        thinking_prompt = getattr(_api, "THINKING_SYSTEM_PROMPT", None) if show_thinking else None
+        thinking_prefill = "【思考】\n" if show_thinking else None
+        model_prompt = _api._build_model_chat_prompt(
+            tokenizer,
+            chat_messages,
+            system_prompt=thinking_prompt,
+            assistant_prefill=thinking_prefill,
+        )
+        inputs = tokenizer(model_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]  # (1, prompt_len)
         attention_mask = inputs.get("attention_mask")
         prompt_len = input_ids.shape[1]
 
         # ---- Step 3: 自回归生成 ----
         task_id = uuid.uuid4().hex[:12]
+        with self._pipeline_lock:
+            self._pipeline_active_tasks.add(task_id)
+        self._pipeline_context.stack.append({
+            "task_id": task_id,
+            "pipeline_nodes": pipeline_nodes,
+        })
         generated_ids = []
+        merge_stops = getattr(mgr, "_merge_stop_sequences", None)
+        stop_sequences = merge_stops(None) if callable(merge_stops) else []
+        get_eos = getattr(mgr, "_get_generation_eos_token_ids", None)
+        eos_token_ids = get_eos(stop_sequences) if callable(get_eos) else tokenizer.eos_token_id
+        if eos_token_ids is None:
+            eos_ids = {tokenizer.eos_token_id}
+        elif isinstance(eos_token_ids, int):
+            eos_ids = {eos_token_ids}
+        else:
+            eos_ids = set(eos_token_ids)
+        native_thinking_prompt = bool(
+            not show_thinking and "<think" in model_prompt[-128:].lower()
+        )
+        suppress_native_thinking = native_thinking_prompt
+        stream_buffer = ""
         workers_used = [n["node_id"] for n in pipeline_nodes]
         pipeline_metrics = {
             "steps": [],
@@ -6172,6 +8067,14 @@ class Scheduler:
         full_input_ids = input_ids
 
         for step in range(max_new_tokens):
+            if _cancel_event is not None and _cancel_event.is_set():
+                step_error = "流水线任务已取消"
+                self._broadcast_pipeline_abort(
+                    pipeline_nodes, task_id, step_error, count_error=False
+                )
+                self._clear_pipeline_runtime_state(task_id)
+                return {"response": "", "error": step_error, "cancelled": True}
+
             # ---- Phase 2: 协同抢占检查 ----
             # 在每个 decode 步边界检测 Q0 任务，若存在则执行内联抢占。
             # Prefill (step=0) 不抢占——此时尚未生成任何 token。
@@ -6216,6 +8119,14 @@ class Scheduler:
                     self._preempting = True  # ★ 防嵌套抢占
                     try:
                         self._execute_q0_inline(q0_task, preempt_state)
+                        ensure_layer_range = getattr(mgr, "ensure_layer_range", None)
+                        if callable(ensure_layer_range):
+                            ensure_layer_range(
+                                master_assignment["start_layer"],
+                                master_assignment["end_layer"],
+                                has_embedding=master_assignment.get("has_embedding", True),
+                                has_lm_head=master_assignment.get("has_lm_head", True),
+                            )
                     except Exception as e:
                         logger.error(
                             f"❌ Q0 抢占异常: {e}，中止 {task_id}"
@@ -6230,6 +8141,7 @@ class Scheduler:
                         )
                         self._preempted_task = None
                         self._preempting = False
+                        self._clear_pipeline_runtime_state(task_id)
                         return {"response": "", "error": f"抢占失败: {e}"}
                     finally:
                         self._preempting = False
@@ -6304,6 +8216,7 @@ class Scheduler:
                         attention_mask=local_attention_mask,
                         past_key_values=past_kv,
                         use_cache=True,
+                        apply_lm_head=False,
                     )
                     master_elapsed_ms = (time.time() - t_master) * 1000
                     if local_result.get("past_key_values"):
@@ -6358,27 +8271,41 @@ class Scheduler:
 
             if step_error:
                 self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             # ---- 等待链上任一节点返回结果（末节点=成功，其他=错误）----
-            result = self._wait_for_layer_result(
+            result = self._wait_for_layer_result_with_ack(
                 task_id,
                 [n["node_id"] for n in pipeline_nodes],  # 任一节点都可能报错
-                timeout=30.0,
+                timeout=PIPELINE_STEP_TIMEOUT,
+                ack_node_ids=[n["node_id"] for n in pipeline_nodes[1:]] if has_chain else [],
+                ack_step=step,
+                ack_timeout=min(5.0, max(1.0, PIPELINE_STEP_TIMEOUT / 6)),
             )
+            if _cancel_event is not None and _cancel_event.is_set():
+                step_error = "流水线任务已取消"
+                self._broadcast_pipeline_abort(
+                    pipeline_nodes, task_id, step_error, count_error=False
+                )
+                self._clear_pipeline_runtime_state(task_id)
+                return {"response": "", "error": step_error, "cancelled": True}
             if result is None:
                 step_error = f"末节点 {last_node_id} 响应超时"
                 logger.error(step_error)
                 self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             if result.get("error"):
                 step_error = f"流水线错误: {result['error']}"
                 logger.error(step_error)
                 self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
-            # 提取 logits（链式模式下仅末节点返回 logits）
+            # 提取末端输出。推荐拓扑由 worker 返回 hidden_states，主节点在
+            # CUDA 上执行 Norm + LM Head；兼容旧配置直接返回 logits。
             if "logits" in result and result["logits"] is not None:
                 logits_data = result["logits"]
                 if isinstance(logits_data, bytes):
@@ -6388,21 +8315,32 @@ class Scheduler:
                 else:
                     step_error = f"未知 logits 类型: {type(logits_data).__name__}"
                     logger.error(step_error)
+            elif "hidden_states" in result and result["hidden_states"] is not None:
+                hidden_data = result["hidden_states"]
+                if isinstance(hidden_data, bytes):
+                    final_hidden = deserialize_tensor_fast(hidden_data)
+                elif torch is not None and isinstance(hidden_data, torch.Tensor):
+                    final_hidden = hidden_data
+                else:
+                    step_error = (
+                        f"未知 hidden_states 类型: {type(hidden_data).__name__}"
+                    )
+                    logger.error(step_error)
+                    final_hidden = None
+                if final_hidden is not None:
+                    try:
+                        logits = self._run_master_lm_head(final_hidden)
+                    except Exception as e:
+                        step_error = f"主节点 LM Head 执行失败: {e}"
+                        logger.error(step_error, exc_info=True)
             else:
                 step_error = "末节点未返回 logits"
                 logger.error(step_error)
 
             if step_error:
                 # ★ 统一中止路径：广播 ABORT → 清理各节点 KV cache → 返回错误
-                try:
-                    for n in pipeline_nodes:
-                        self._send_to_worker(
-                            n["node_id"],
-                            {"task_id": task_id, "reason": step_error},
-                            MessageType.PIPELINE_ABORT,
-                        )
-                except Exception:
-                    pass
+                self._broadcast_pipeline_abort(pipeline_nodes, task_id, step_error)
+                self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
             # ---- Step 4: 从 logits 采样下一个 token ----
@@ -6424,7 +8362,7 @@ class Scheduler:
             new_token_id = sorted_indices[0, torch.multinomial(filtered_probs, 1)].item()
 
             # 检查 EOS
-            if new_token_id == tokenizer.eos_token_id:
+            if new_token_id in eos_ids:
                 logger.info(f"🏁 EOS token 生成于 step {step}")
                 break
 
@@ -6433,7 +8371,17 @@ class Scheduler:
             # ★ 流式回调：每生成一个 token 立即推送
             if _stream_callback:
                 new_token_text = tokenizer.decode([new_token_id])
-                _stream_callback({"token": new_token_text})
+                if suppress_native_thinking:
+                    stream_buffer += new_token_text
+                    marker = stream_buffer.lower().find("</think>")
+                    if marker >= 0:
+                        visible = stream_buffer[marker + len("</think>"):]
+                        suppress_native_thinking = False
+                        stream_buffer = ""
+                        if visible:
+                            _stream_callback({"token": visible})
+                else:
+                    _stream_callback({"token": new_token_text})
 
             # 更新完整序列仅用于最终解码（不再发送给首节点）
             new_token_tensor = torch.tensor([[new_token_id]], dtype=torch.long)
@@ -6454,15 +8402,18 @@ class Scheduler:
             )
 
         # ---- Step 5: 广播 PIPELINE_DONE（各节点清理 KV cache） ----
-        try:
-            for n in pipeline_nodes:
+        for n in pipeline_nodes:
+            try:
                 self._send_to_worker(
                     n["node_id"],
                     {"task_id": task_id},
                     MessageType.PIPELINE_DONE,
                 )
-        except Exception as e:
-            logger.warning(f"广播 PIPELINE_DONE 失败: {e}")
+            except Exception as e:
+                logger.warning(
+                    "发送 PIPELINE_DONE 失败: node=%s task=%s error=%s",
+                    n.get("node_id"), task_id, e,
+                )
 
         # ★ 清理 master 自身 KV cache（master_participates 路径会产生本地缓存）
         with self._kv_cache_lock:
@@ -6476,14 +8427,20 @@ class Scheduler:
                 torch.tensor(generated_ids, dtype=torch.long)
             ], dim=0)
             response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
-            new_text = tokenizer.decode(
+            raw_new_text = tokenizer.decode(
                 generated_ids, skip_special_tokens=True
             )
         else:
             response_text = tokenizer.decode(
                 input_ids.squeeze(0), skip_special_tokens=True
             )
-            new_text = ""
+            raw_new_text = ""
+
+        new_text, thinking_content = _api._format_model_response(
+            raw_new_text,
+            show_thinking,
+            native_thinking_prompt=native_thinking_prompt,
+        )
 
         pipeline_metrics["total_time_ms"] = round(
             (time.time() - t_pipeline_start) * 1000, 1
@@ -6518,6 +8475,7 @@ class Scheduler:
         result = {
             "response": new_text,
             "full_text": response_text,
+            "thinking": thinking_content,
             "metrics": pipeline_metrics,
         }
 
@@ -6525,6 +8483,7 @@ class Scheduler:
         if _stream_callback:
             _stream_callback({"done": True, **result})
 
+        self._clear_pipeline_runtime_state(task_id)
         return result
 
     def run_pipeline_stream(self, prompt: str, **kwargs):
@@ -6546,6 +8505,7 @@ class Scheduler:
 
         q = queue.Queue()
         callback_called = _thr.Event()
+        cancel_event = kwargs.pop("_cancel_event", None) or _thr.Event()
 
         def on_token(event):
             if "done" in event:
@@ -6554,8 +8514,11 @@ class Scheduler:
 
         def _run():
             try:
-                result = self.run_pipeline(
-                    prompt, _stream_callback=on_token, **kwargs
+                result = self.run_pipeline_safe(
+                    prompt,
+                    _stream_callback=on_token,
+                    _cancel_event=cancel_event,
+                    **kwargs,
                 )
                 # 错误路径：run_pipeline 直接返回了 error（未走 callback）
                 if not callback_called.is_set():
@@ -6571,15 +8534,41 @@ class Scheduler:
 
         _thr.Thread(target=_run, name="pipeline-stream", daemon=True).start()
 
-        while True:
-            event = q.get()
-            yield event
-            if "done" in event:
-                break
+        try:
+            while True:
+                event = q.get()
+                yield event
+                if "done" in event:
+                    break
+        finally:
+            if not callback_called.is_set():
+                cancel_event.set()
 
     # ================================================================
     # 流水线请求队列集成（Phase 4 — 多请求排队）
     # ================================================================
+
+    @staticmethod
+    def _stream_output_started(kwargs: dict) -> bool:
+        """返回流式调用是否已向客户端发送过正文 token。"""
+        callback = kwargs.get("_stream_callback")
+        return bool(getattr(callback, "_qlh_tokens_emitted", False))
+
+    @staticmethod
+    def _track_stream_output(kwargs: dict) -> None:
+        """包装流式回调，供失败回退判断是否会造成回答重放。"""
+        callback = kwargs.get("_stream_callback")
+        if not callable(callback) or getattr(callback, "_qlh_stream_tracker", False):
+            return
+
+        def tracked_callback(event):
+            if isinstance(event, dict) and event.get("token"):
+                tracked_callback._qlh_tokens_emitted = True
+            callback(event)
+
+        tracked_callback._qlh_stream_tracker = True
+        tracked_callback._qlh_tokens_emitted = False
+        kwargs["_stream_callback"] = tracked_callback
 
     def _process_queued_pipeline_task(self, prompt: str, **kwargs) -> dict:
         """
@@ -6605,8 +8594,32 @@ class Scheduler:
                     _fallback_reason="queue_pipeline_nodes_not_ready",
                     **kwargs,
                 )
-            return self.run_pipeline(prompt, **kwargs)
+            result = self.run_pipeline(prompt, **kwargs)
+            if result.get("error"):
+                if self._stream_output_started(kwargs):
+                    logger.warning(
+                        "流水线已输出部分内容，跳过全模型回退以避免重复回答: %s",
+                        result.get("error"),
+                    )
+                    return result
+                logger.warning(
+                    "队列任务流水线单步失败，回退到全模型推理: %s",
+                    result.get("error"),
+                )
+                return self._run_full_model_inference(
+                    prompt,
+                    _fallback_reason=f"queue_pipeline_error_result: {result.get('error')}",
+                    **kwargs,
+                )
+            return result
         except Exception as e:
+            if self._stream_output_started(kwargs):
+                logger.error(
+                    "流水线已输出部分内容后异常，跳过全模型回退: %s",
+                    e,
+                    exc_info=True,
+                )
+                return {"response": "", "error": str(e)}
             logger.error(f"队列任务流水线推理失败: {e}，回退到全模型推理", exc_info=True)
             # 锁可能在抢占异常路径中已被释放
             try:
@@ -6642,6 +8655,8 @@ class Scheduler:
         # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
         # 同时检查模型是否已加载，未加载时走回退路径（给出明确错误）。
         import api_server as _api
+        queue_timeout = kwargs.pop('_queue_timeout', PIPELINE_TIMEOUT)
+        self._track_stream_output(kwargs)
         mgr = getattr(_api, 'model_manager', None)
         if not mgr or not mgr.is_loaded:
             logger.warning("模型未加载，无法执行流水线推理")
@@ -6669,14 +8684,24 @@ class Scheduler:
             pipeline_ready = False
 
         if not pipeline_ready:
-            logger.warning("部分流水线节点未就绪，回退到全层主节点模式")
+            try:
+                readiness = self._get_pipeline_readiness()
+                readiness_reason = readiness.get("reason") or "未知原因"
+            except Exception:
+                readiness_reason = "就绪状态检查失败"
+            logger.warning(
+                "部分流水线节点未就绪，回退到全层主节点模式: %s",
+                readiness_reason,
+            )
             # 回退仍会执行完整模型推理，必须与其他 GPU 推理共享同一把锁。
             # 这里阻塞等待，避免锁被占用时直接绕过互斥保护。
             self._inference_lock.acquire()
             try:
                 return self._run_full_model_inference(
                     prompt,
-                    _fallback_reason="pipeline_nodes_not_ready",
+                    _fallback_reason=(
+                        f"pipeline_nodes_not_ready: {readiness_reason}"
+                    ),
                     **kwargs,
                 )
             finally:
@@ -6702,12 +8727,32 @@ class Scheduler:
                 f"queue_depth={self.pipeline_queue.queue_size}"
             )
             result = self.pipeline_queue.wait_for_result(
-                task_id, timeout=kwargs.get('_queue_timeout', PIPELINE_TIMEOUT)
+                task_id,
+                timeout=queue_timeout,
+                cancel_event=kwargs.get("_cancel_event"),
             )
             if result.get("status") == "done":
-                return result.get("result", {})
+                payload = result.get("result", {})
+                if isinstance(payload, dict) and payload.get("error"):
+                    if self._stream_output_started(kwargs):
+                        return payload
+                    self._inference_lock.acquire()
+                    try:
+                        logger.warning(
+                            "排队流水线任务返回错误，回退到全模型推理: %s",
+                            payload.get("error"),
+                        )
+                        return self._run_full_model_inference(
+                            prompt,
+                            _fallback_reason=f"queued_pipeline_error_result: {payload.get('error')}",
+                            **kwargs,
+                        )
+                    finally:
+                        self._inference_lock.release()
+                return payload
             elif result.get("status") == "timeout":
-                return {"response": "", "error": f"排队超时 ({PIPELINE_TIMEOUT}s)"}
+                self.pipeline_queue.cancel_task(task_id)
+                return {"response": "", "error": f"排队超时 ({queue_timeout}s)"}
             else:
                 return {"response": "", "error": result.get("error", "排队请求失败")}
 
@@ -6719,8 +8764,23 @@ class Scheduler:
             return {"response": "", "error": "推理引擎正忙，请稍后重试"}
         try:
             try:
-                return self.run_pipeline(prompt, **kwargs)
+                result = self.run_pipeline(prompt, **kwargs)
+                if result.get("error"):
+                    if self._stream_output_started(kwargs):
+                        return result
+                    logger.warning(
+                        "流水线推理返回错误，回退到全层主节点模式: %s",
+                        result.get("error"),
+                    )
+                    return self._run_full_model_inference(
+                        prompt,
+                        _fallback_reason=f"pipeline_error_result: {result.get('error')}",
+                        **kwargs,
+                    )
+                return result
             except Exception as e:
+                if self._stream_output_started(kwargs):
+                    return {"response": "", "error": str(e)}
                 logger.error(f"流水线推理失败: {e}，回退到全层主节点模式", exc_info=True)
                 return self._run_full_model_inference(
                     prompt,
@@ -6753,6 +8813,8 @@ class Scheduler:
 
         _stream_callback = kwargs.pop('_stream_callback', None)
         fallback_reason = kwargs.pop('_fallback_reason', '') or 'pipeline_fallback_full_model'
+        show_thinking = bool(kwargs.pop("show_thinking", False))
+        cancel_event = kwargs.pop("_cancel_event", None)
 
         # ★ 若 master 刚执行过流水线裁剪（layer_range != None），
         #   需要先重新加载完整模型，否则 chat()/chat_stream() 会因
@@ -6762,25 +8824,54 @@ class Scheduler:
             if callable(ensure_full):
                 ensure_full()
         except Exception as e:
-            logger.warning(f"完整模型重载失败（将继续尝试推理）: {e}")
+            logger.error(f"完整模型重载失败: {e}")
+            return {"response": "", "error": f"完整模型恢复失败: {e}"}
 
         try:
-            messages = [{"role": "user", "content": prompt}]
+            messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
+            if show_thinking and not any(item.get("role") == "system" for item in messages):
+                messages = [
+                    {"role": "system", "content": _api.THINKING_SYSTEM_PROMPT},
+                    *messages,
+                ]
+            try:
+                fallback_prompt = _api._build_model_chat_prompt(mgr.tokenizer, messages)
+                native_thinking_prompt = "<think>" in fallback_prompt[-128:].lower()
+            except Exception:
+                native_thinking_prompt = False
 
             if _stream_callback:
                 # 流式路径：逐 token 推送
                 full_text_parts = []
+                visible_buffer = ""
+                suppress_thinking = bool(native_thinking_prompt and not show_thinking)
                 t0 = time.time()
                 for chunk in mgr.chat_stream(
                     messages=messages,
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    _cancel_event=cancel_event,
                 ):
                     if chunk:
                         full_text_parts.append(chunk)
-                        _stream_callback({"token": chunk})
-                response_text = "".join(full_text_parts)
+                        if suppress_thinking:
+                            visible_buffer += chunk
+                            marker = visible_buffer.lower().find("</think>")
+                            if marker >= 0:
+                                visible = visible_buffer[marker + len("</think>"):]
+                                suppress_thinking = False
+                                visible_buffer = ""
+                                if visible:
+                                    _stream_callback({"token": visible})
+                        else:
+                            _stream_callback({"token": chunk})
+                raw_response_text = "".join(full_text_parts)
+                response_text, thinking_content = _api._format_model_response(
+                    raw_response_text,
+                    show_thinking,
+                    native_thinking_prompt=native_thinking_prompt,
+                )
                 elapsed = time.time() - t0
                 metrics = {
                     "engine": getattr(mgr, '_engine_type', 'unknown') or 'unknown',
@@ -6799,15 +8890,26 @@ class Scheduler:
                     "elapsed_seconds": round(elapsed, 3),
                 }
                 # ★ 发送完成信号（与 run_pipeline 一致）
-                _stream_callback({"done": True, "response": response_text, "metrics": metrics})
+                _stream_callback({
+                    "done": True,
+                    "response": response_text,
+                    "thinking": thinking_content,
+                    "metrics": metrics,
+                })
             else:
                 result = mgr.chat(
                     messages=messages,
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    _cancel_event=cancel_event,
                 )
-                response_text = result.get("content", "")
+                raw_response_text = result.get("content", "")
+                response_text, thinking_content = _api._format_model_response(
+                    raw_response_text,
+                    show_thinking,
+                    native_thinking_prompt=native_thinking_prompt,
+                )
                 usage = result.get("usage", {}) or {}
                 completion_tokens = usage.get("completion_tokens", 0)
                 metrics = {
@@ -6830,7 +8932,7 @@ class Scheduler:
 
             return {
                 "response": response_text,
-                "thinking": "" if _stream_callback else result.get("thinking_content", ""),
+                "thinking": thinking_content,
                 "metrics": metrics,
             }
         except Exception as e:
@@ -6860,18 +8962,35 @@ class Scheduler:
             yield {"done": True, "error": "模型未加载"}
             return
 
+        self._inference_lock.acquire()
+        try:
+            ensure_full = getattr(mgr, "ensure_full_model", None)
+            if callable(ensure_full):
+                ensure_full()
+        except Exception as e:
+            self._inference_lock.release()
+            yield {"done": True, "error": f"完整模型恢复失败: {e}"}
+            return
+
         max_new_tokens = kwargs.pop('max_new_tokens', 512)
         temperature = kwargs.pop('temperature', 0.7)
         top_p = kwargs.pop('top_p', 0.9)
+        show_thinking = bool(kwargs.pop('show_thinking', False))
+        messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
+        try:
+            model_prompt = _api._build_model_chat_prompt(mgr.tokenizer, messages)
+            native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
+        except Exception:
+            native_thinking_prompt = False
 
         q = queue.Queue()
         full_text_parts = []
         error_info = [None]
         metrics_info = [{}]
+        cancel_event = _thr.Event()
 
         def _run():
             try:
-                messages = [{"role": "user", "content": prompt}]
                 t0 = time.time()
                 token_count = 0
                 for chunk in mgr.chat_stream(
@@ -6879,6 +8998,7 @@ class Scheduler:
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    _cancel_event=cancel_event,
                 ):
                     if chunk:
                         full_text_parts.append(chunk)
@@ -6897,26 +9017,52 @@ class Scheduler:
             finally:
                 q.put(None)  # sentinel
 
-        _thr.Thread(target=_run, name="full-model-stream", daemon=True).start()
+        worker = _thr.Thread(target=_run, name="full-model-stream", daemon=True)
+        suppress_thinking = bool(native_thinking_prompt and not show_thinking)
+        visible_buffer = ""
+        try:
+            worker.start()
+            while True:
+                event = q.get()
+                if event is None:
+                    break
+                chunk = event.get("token", "")
+                if suppress_thinking:
+                    visible_buffer += chunk
+                    marker = visible_buffer.lower().find("</think>")
+                    if marker >= 0:
+                        visible = visible_buffer[marker + len("</think>"):]
+                        suppress_thinking = False
+                        visible_buffer = ""
+                        if visible:
+                            yield {"token": visible}
+                else:
+                    yield event
+        finally:
+            cancel_event.set()
+            if worker.is_alive():
+                worker.join()
+            self._inference_lock.release()
 
-        while True:
-            event = q.get()
-            if event is None:
-                break
-            yield event
-
-        response_text = "".join(full_text_parts)
+        raw_response_text = "".join(full_text_parts)
+        response_text, thinking_content = _api._format_model_response(
+            raw_response_text,
+            show_thinking,
+            native_thinking_prompt=native_thinking_prompt,
+        )
         if error_info[0]:
             yield {
                 "done": True,
                 "error": error_info[0],
                 "response": response_text,
+                "thinking": thinking_content,
                 "metrics": metrics_info[0],
             }
         else:
             yield {
                 "done": True,
                 "response": response_text,
+                "thinking": thinking_content,
                 "metrics": metrics_info[0],
             }
 
@@ -6941,7 +9087,11 @@ class Scheduler:
 
         # 检查引擎兼容性
         mgr = getattr(_api, 'model_manager', None)
-        engine_ok = mgr is not None and getattr(mgr, '_engine_type', '') == 'pytorch'
+        engine_ok = (
+            mgr is not None
+            and getattr(mgr, 'is_loaded', False)
+            and getattr(mgr, '_engine_type', '') == 'pytorch'
+        )
 
         # 获取分层配置
         layer_info = self.get_layer_assignments()
@@ -6951,6 +9101,10 @@ class Scheduler:
         ]
         workers.sort(key=lambda a: a.get("start_layer", 0))
 
+        readiness = self._get_pipeline_readiness()
+        readiness_by_node = {
+            item["node_id"]: item for item in readiness.get("workers", [])
+        }
         worker_status = []
         online_count = 0
         with self._nodes_lock:
@@ -6961,22 +9115,47 @@ class Scheduler:
             is_online = node.is_available() if node else False
             if is_online:
                 online_count += 1
+            detail = readiness_by_node.get(nid, {})
             worker_status.append({
                 "node_id": nid,
                 "online": is_online,
+                "tcp_connected": detail.get("tcp_connected", False),
+                "heartbeat_age_seconds": detail.get("heartbeat_age_seconds"),
+                "layer_ready": detail.get("layer_ready", False),
+                "layer_status": detail.get("layer_status", "not_configured"),
+                "layer_error": detail.get("layer_error", ""),
+                "model_id": detail.get("model_id", ""),
                 "layer_range": [w.get("start_layer", 0), w.get("end_layer", 24)],
                 "has_embedding": w.get("has_embedding", False),
                 "has_lm_head": w.get("has_lm_head", False),
             })
 
+        distributed_enabled = self.get_distributed_inference_enabled()
         available = (
             engine_ok
             and RUN_MODE == "distributed"
             and self._effective_role() == "master"
             and len(workers) > 0
+            and distributed_enabled
         )
-        active = available and online_count == len(workers) and online_count > 0
-        degraded = available and online_count > 0 and online_count < len(workers)
+        active = available and readiness.get("ready", False)
+        degraded = available and not active and online_count > 0
+
+        if not distributed_enabled:
+            reason_code = "distributed_disabled"
+            reason = "分布式推理开关已关闭"
+        elif RUN_MODE != "distributed":
+            reason_code = "not_distributed_mode"
+            reason = "当前不是 distributed 运行模式"
+        elif self._effective_role() != "master":
+            reason_code = "not_master"
+            reason = "当前节点不是主节点"
+        elif not engine_ok:
+            reason_code = "engine_not_pytorch"
+            reason = "主节点必须加载 PyTorch 引擎模型才能进行模型层拆分"
+        else:
+            reason_code = readiness.get("reason_code", "unknown")
+            reason = readiness.get("reason", "流水线状态未知")
 
         return {
             "available": available,
@@ -6985,6 +9164,9 @@ class Scheduler:
             "worker_count": len(workers),
             "online_worker_count": online_count,
             "engine_compatible": engine_ok,
+            "distributed_enabled": distributed_enabled,
+            "readiness_reason_code": reason_code,
+            "readiness_reason": reason,
             "workers": worker_status,
         }
 
@@ -7152,7 +9334,7 @@ class Scheduler:
 
             old_node = self.nodes.pop(node_id)
 
-        self._layer_config_pushed.discard(node_id)
+        self._clear_layer_config_state(node_id)
 
         db = _get_db()
         if db and _db_available:
@@ -7199,6 +9381,19 @@ class Scheduler:
             and getattr(tcp_client, 'is_registered', False)
             and getattr(tcp_client, 'sock', None) is not None
         )
+
+        # 活跃且已注册的 TCP 连接是当前、直接的在线证据。数据库只用于
+        # 未连接时发现主节点，不能在本地/无数据库模式下否定这个连接。
+        if self._effective_role() == "client" and tcp_connected:
+            return {
+                "master_online": True,
+                "last_seen_seconds_ago": 0.0,
+                "stale": False,
+                "master_host": getattr(tcp_client, "server_host", ""),
+                "master_port": getattr(tcp_client, "server_port", 0),
+                "source": "tcp",
+                "tcp_connected": True,
+            }
 
         db = _get_db()
         if not db or not _db_available:
@@ -7276,6 +9471,16 @@ class Scheduler:
         当宕机超过 MASTER_DOWN_EMAIL_TIMEOUT 秒时，发送邮件告警。
         当主节点恢复在线时，发送恢复通知 + 自动重连（如已配置）。
         """
+        with self._client_health_start_lock:
+            if (self._client_health_thread is not None
+                    and self._client_health_thread.is_alive()):
+                return
+
+            self._start_client_health_monitor_locked()
+
+    def _start_client_health_monitor_locked(self) -> None:
+        """在 _client_health_start_lock 内初始化并启动唯一健康线程。"""
+
         # ★ 从数据库读取主节点当前在线状态作为初始值，
         #    避免启动时 was_online=False + DB 显示在线 → 误触发 "恢复重连"
         try:
@@ -7294,8 +9499,12 @@ class Scheduler:
         # 周期性重连：当主节点在线但本地 TCP 未连接时，每隔一定时间重试
         self._client_last_reconnect_attempt = 0.0    # 上次重连尝试的时间戳
 
-        t = threading.Thread(target=self._client_health_monitor_loop, daemon=True)
-        t.start()
+        self._client_health_thread = threading.Thread(
+            target=self._client_health_monitor_loop,
+            name="client-master-health",
+            daemon=True,
+        )
+        self._client_health_thread.start()
         threshold_info = f"，宕机邮件告警阈值: {MASTER_DOWN_EMAIL_TIMEOUT}s" if MASTER_DOWN_EMAIL_TIMEOUT > 0 else "（邮件告警已禁用）"
         logger.info(f"从节点主节点健康监控已启动（间隔 15s，重连间隔 60s）{threshold_info}")
 
@@ -7381,21 +9590,24 @@ class Scheduler:
                             if result.get("status") == "connected":
                                 logger.info(f"🔄 已自动重连到主节点 {host}:{port}")
 
-                # ---- 周期性重连：主节点在线但本地 TCP 未连接时定期重试 ----
-                if (is_online
-                        and self._client_reconnect_enabled
+                # ---- 周期性重新发现 + 重连 ----
+                # TCP 已断开时 health 会立即报告 offline，不能用 is_online
+                # 作为重连前置条件，否则晚启动或换地址的主节点永远不会被发现。
+                if (self._client_reconnect_enabled
                         and self._effective_role() == "client"):
                     tcp_client = getattr(self, '_tcp_client', None)
                     tcp_connected = (tcp_client is not None
                                      and getattr(tcp_client, '_running', False)
+                                     and getattr(tcp_client, 'is_registered', False)
                                      and getattr(tcp_client, 'sock', None) is not None)
                     if not tcp_connected:
                         now = time.time()
                         last_attempt = getattr(self, '_client_last_reconnect_attempt', 0.0)
                         if now - last_attempt >= 60:  # 每 60 秒重试一次
                             self._client_last_reconnect_attempt = now
-                            host = health.get("master_host", "")
-                            port = health.get("master_port", 0)
+                            discovery = self.discover_master()
+                            host = discovery.get("master_host", "")
+                            port = int(discovery.get("master_port", 0) or 0)
                             if host and port:
                                 logger.info(
                                     f"🔄 周期性重连尝试: {host}:{port}"
@@ -7404,6 +9616,18 @@ class Scheduler:
                                 if result.get("status") == "connected":
                                     logger.info(f"✅ 周期性重连成功: {host}:{port}")
                                     self._client_last_reconnect_attempt = 0.0  # 成功后重置
+                                else:
+                                    alternate = self.discover_master(skip_config=True)
+                                    alt_host = alternate.get("master_host", "")
+                                    alt_port = int(alternate.get("master_port", 0) or 0)
+                                    if (alternate.get("found")
+                                            and alt_host and alt_port
+                                            and (alt_host, alt_port) != (host, port)):
+                                        alt_result = self.connect_to_master(
+                                            alt_host, alt_port
+                                        )
+                                        if alt_result.get("status") == "connected":
+                                            self._client_last_reconnect_attempt = 0.0
 
                 self._client_master_was_online = is_online
             except Exception as e:

@@ -2,14 +2,14 @@
 
 > **日期**: 2026-07-08  
 > **关联**: `src/model_config.py` (模型注册表), `src/model_module.py` (双引擎加载)  
-> **状态**: 规划中，待评审  
+> **状态**: 部分实施；模型注册槽位已落地，真实加载与分布式兼容仍需逐模型验收
 > **目标**: 在现有 Qwen-1.8B 默认模型基础上，支持 DeepSeek 系列大模型实验
 
 ---
 
 ## 1. 背景与动机
 
-当前系统默认模型为 Qwen-1.8B-Chat（1.8B 参数），内置实验模型仅 Qwen2.5-7B/14B。对于 CUDA 用户（尤其是 RTX 4090 24GB 等高端 GPU），Qwen 系列的能力天花板偏低。
+当前系统默认模型为 Qwen-1.8B-Chat（1.8B 参数），模型注册表已经包含 Qwen2.5 与多个 DeepSeek-R1-Distill-Qwen 实验槽位。注册项只表示可被选择和下载，不代表每个模型已经完成真实加载、量化、完整推理和分布式层流水线验收。
 
 DeepSeek 系列是代表性的国产开放权重大模型家族之一：
 - **DeepSeek-V3**: 671B MoE（37B 活跃参数），旗舰级推理能力
@@ -554,3 +554,82 @@ DeepSeek-V3/R1 (671B) 和 DeepSeek-V2/Coder-V2 (236B) **不适合消费级硬件
 | **P2** | DeepSeek-V2-Lite (GGUF) | llama.cpp MLA 支持 | ~6h | 12-16GB |
 | **P3** | DeepSeek-Coder-V2-Lite | 同 V2-Lite 架构 | ~4h | 12-16GB |
 | 远期 | DeepSeek-V2/V3/R1 (全量) | 需 vLLM + 服务器集群 | — | 160GB+ |
+
+---
+
+## 10. DeepSeek 分布式推理修复计划（2026-07-13）
+
+> 本节覆盖前文中“R1-Distill 可直接使用现有分层”的早期判断。模型架构能由
+> Transformers 加载，不等于现有多节点协议已经支持该模型。当前流水线以
+> Qwen-1.8B 的 24 层和默认模型路径为隐含前提，DeepSeek-R1-Distill-Qwen-7B
+> 实际为 28 层，必须完成以下改造后才能开放分布式模式。
+
+### 10.1 目标与边界
+
+- 首个目标模型为 `deepseek-r1-distill-qwen-7b` 的 PyTorch Safetensors 版本。
+- 仅 PC 计算节点参与层拆分；Android 和请求转发型 PC 客户端不要求落盘模型。
+- 同一流水线中的计算节点必须使用相同 `model_id`、revision、权重、config 和 tokenizer。
+- GGUF/llama.cpp 继续只支持单机推理，不与 PyTorch 层拆分混用。
+- 模型缺失、摘要缺失或加载失败一律 fail closed，回退主节点单机推理，不允许降级放行。
+
+### 10.2 P0：建立模型协商协议与就绪屏障
+
+1. 定义 `ModelManifest`：包含 `model_id`、`engine`、`revision`、权重联合 SHA-256、
+   config/tokenizer SHA-256、`num_hidden_layers`、`hidden_size`、`vocab_size` 和量化策略。
+2. 主节点从当前 `ModelManager` 的活跃模型生成 manifest，不再从默认 Qwen GGUF 路径取摘要。
+3. `LAYER_CONFIG` 对每个节点下发 manifest、层范围和配置版本；修正当前发送端传单个 assignment、
+   接收端却按 `{node_id: assignment}` 读取的消息结构不一致。
+4. 从节点先校验本地文件，再按 manifest 指定的 PyTorch 模型加载层范围，返回
+   `LAYER_CONFIG_ACK {config_version, model_sha256, layer_range, status, error}`。
+5. 主节点只有收到匹配 ACK 后才将节点标记 ready；“TCP 在线”和“消息已发送”不能代表模型已就绪。
+6. 模型切换时暂停新任务、清理各节点 KV cache、广播新配置，全部 ACK 后原子切换流水线版本；
+   超时或任一失败则回退主节点单机推理。
+
+验收：Qwen/DeepSeek 模型不一致、从节点缺模型、摘要为空、加载异常时均不得进入流水线。
+
+### 10.3 P1：移除固定 24 层假设
+
+1. 调度器从活跃模型 config/`_total_model_layers` 获取总层数，并随 manifest 下发。
+2. 将 API 的 `start_layer <= 23`、`end_layer <= 24` 改为基于活跃模型的运行时校验。
+3. 前端手动分层编辑器从 `/api/config/layers` 读取总层数，不再显示固定 `0-24`。
+4. 模型切换后使旧分层配置失效并重新计算，禁止把 Qwen 的 24 层配置复用于 DeepSeek 的 28 层。
+5. 校验相邻节点的 hidden size、dtype、vocab size 和首尾 embedding/lm_head 所有权。
+
+验收：Qwen-1.8B 完整覆盖 `[0,24)`；DeepSeek-R1-Distill-Qwen-7B 完整覆盖 `[0,28)`。
+
+### 10.4 P2：从节点模型落盘与预检
+
+1. `models_pc.7z` 只作为默认 Qwen 离线包，不继续膨胀为包含所有重模型的单一压缩包。
+2. 增加 manifest 驱动的节点预检/下载命令，明确展示缺失文件、预计体积、revision 和 SHA-256。
+3. 管理端展示每个计算节点的模型状态：`missing/downloading/verifying/loading/ready/error`。
+4. 下载完成后先校验再注册计算能力；不允许只有主节点存在 DeepSeek 时给从节点分配层。
+5. 保留人工预分发方式，避免通过控制协议直接传输 15GB 级权重。
+
+### 10.5 P3：降低分层加载峰值内存
+
+当前 `load_layer_range()` 会先完整加载模型再删除未分配层。短期内每个计算节点因此仍需完整
+Safetensors 和一次完整加载的峰值内存。后续应改为按 safetensors index 选择性加载目标层、
+embedding、norm 和 lm_head；完成前，节点预检必须按“完整模型峰值”评估内存，不能按分配层数估算。
+
+### 10.6 测试矩阵
+
+| 层级 | 场景 | 通过条件 |
+|------|------|----------|
+| 单元 | manifest 生成/摘要/协议序列化 | 字段完整、稳定、不同模型摘要不同 |
+| 协议 | config 下发与 ACK | 发送、接收、加载、ACK 形成闭环；版本不匹配被拒绝 |
+| 负向 | 缺模型/错模型/空摘要/28 层套 24 层配置 | 不进入 ready，自动回退且错误可见 |
+| 数学 | tiny Qwen2 多段前向 | 流水线 logits 与完整模型一致 |
+| 集成 | 两个本机进程经真实 TCP 跑 prefill+decode | token、KV cache、超时和清理均正确 |
+| 实机 | 2-3 台 PC 跑 Qwen 24 层和 DeepSeek 28 层 | 连续 20 次请求无串层、无旧 KV、无静默降级 |
+| 故障 | 推理中断开从节点/切换模型 | 当前任务明确失败或回退，后续任务能恢复 |
+
+### 10.7 实施顺序与完成定义
+
+实施顺序固定为：P0 协议闭环 -> P1 动态层数 -> P2 模型预检 -> Qwen 回归 -> DeepSeek 实机验证
+-> P3 选择性加载。只有同时满足以下条件才可在 UI 中标记 DeepSeek 分布式“可用”：
+
+- 所有计算节点 manifest 完全匹配并返回加载 ACK。
+- 28 层分配连续、无重叠、完整覆盖。
+- tiny 模型、真实 Qwen 和真实 DeepSeek 的前向/解码测试全部通过。
+- 节点缺模型或掉线时不会继续用错误权重计算。
+- 日志和管理面板能区分“在线”“模型已校验”“层已加载”和“流水线 ready”。
