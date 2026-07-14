@@ -558,7 +558,12 @@ export default function App() {
             onRenameSession={handleRenameSession}
           />
         ) : (
-          <AdminPanel onToast={showToast} myRole={myRole} hasDedicatedGpu={hasDedicatedGpu} />
+          <AdminPanel
+            onToast={showToast}
+            myRole={myRole}
+            onRoleChange={setMyRole}
+            hasDedicatedGpu={hasDedicatedGpu}
+          />
         )}
       </main>
 

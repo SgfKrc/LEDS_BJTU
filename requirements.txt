@@ -13,6 +13,8 @@ torch>=2.2.0
 transformers>=4.47.0,<4.48.0    # Qwen remote code + DeepSeek-R1 Distill 兼容窗口
 accelerate>=1.0.0                # 模型加载加速（bitsandbytes 依赖）
 transformers-stream-generator>=0.0.4  # Qwen-1.8B remote code 依赖
+einops>=0.6.0                    # Qwen-1.8B rotary embedding / rearrange
+tiktoken>=0.5.0                  # Qwen-1.8B remote tokenizer 依赖
 
 # --- 模型量化 ---
 bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容）
@@ -30,6 +32,8 @@ pandas>=2.0.0                    # 数据处理
 fastapi>=0.110.0                 # API 后端框架
 uvicorn[standard]>=0.29.0        # ASGI 服务器
 python-multipart>=0.0.12          # 文件上传支持
+httpx>=0.28.1,<0.29.0            # 集群仿真 / 异步 API 客户端
+httpx2>=2.5.0,<3.0.0             # Starlette 1.x TestClient 后端
 
 # --- 工具 ---
 tqdm>=4.65.0                     # 进度条

@@ -516,6 +516,17 @@ class TestQueueManagement:
         tid = queue.enqueue(prompt="ok")
         assert tid
 
+    def test_enqueue_does_not_duplicate_explicit_generation_arguments(self, queue):
+        """QueueTask 的显式字段不能再次残留在 _extra_kwargs。"""
+        tid = queue.enqueue(
+            prompt="short", max_new_tokens=64, request_id="req-1",
+        )
+        task = next(task for task in queue._q0 if task.task_id == tid)
+        assert "max_new_tokens" not in task._extra_kwargs
+        assert "request_id" not in task._extra_kwargs
+        assert task.max_new_tokens == 64
+        assert task.request_id == "req-1"
+
     def test_clear_cancels_all_queued(self, queue):
         """clear 应取消所有排队任务。"""
         tids = [queue.enqueue(prompt=f"task{i}") for i in range(5)]
@@ -533,14 +544,16 @@ class TestQueueManagement:
         r = queue.wait_for_result(tid, timeout=1)
         assert r["status"] == "cancelled"
 
-    def test_cancel_running_task_fails(self, queue):
-        """cancel_task 对执行中的任务应返回 False。"""
+    def test_cancel_running_task_signals_cooperative_cancellation(self, queue):
+        """执行中任务应收到协作取消信号并立即唤醒等待方。"""
         import threading
 
         started = threading.Event()
         finish = threading.Event()
+        seen_cancel_event = []
 
         def slow(**kw):
+            seen_cancel_event.append(kw.get("_cancel_event"))
             started.set()
             finish.wait(5)
             return {"response": "ok"}
@@ -548,7 +561,10 @@ class TestQueueManagement:
         queue.start(process_fn=slow)
         tid = queue.enqueue(prompt="running")
         started.wait(2)
-        assert not queue.cancel_task(tid)  # 执行中不可取消
+        assert queue.cancel_task(tid)
+        result = queue.wait_for_result(tid, timeout=1)
+        assert result["status"] == "cancelled"
+        assert seen_cancel_event and seen_cancel_event[0].is_set()
         finish.set()
         queue.stop()
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import sys
 import time
 import threading
 from contextlib import contextmanager
@@ -27,11 +28,17 @@ from typing import Optional, Any
 try:
     from dotenv import load_dotenv
     # 尝试多个可能的 .env 文件位置
-    env_paths = [
+    env_paths = []
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if local_app_data:
+        env_paths.append(os.path.join(local_app_data, "QLH-Edge-Inference", ".env"))
+    if getattr(sys, "frozen", False):
+        env_paths.append(os.path.join(os.path.dirname(sys.executable), ".env"))
+    env_paths.extend([
         os.path.join(os.path.dirname(__file__), '..', '.env'),  # src/../.env
         os.path.join(os.path.dirname(__file__), '.env'),        # src/.env
         '.env',                                                  # 当前目录
-    ]
+    ])
     for env_path in env_paths:
         if os.path.exists(env_path):
             load_dotenv(env_path, override=False)
@@ -52,6 +59,14 @@ DB_HOST = os.environ.get("QLH_DB_HOST", "localhost")
 DB_NAME = os.environ.get("QLH_DB_NAME", "qlh_edge_inference")
 DB_USER = os.environ.get("QLH_DB_USER", "postgres")
 DB_PASSWORD = os.environ.get("QLH_DB_PASSWORD", "")
+_db_enabled_value = os.environ.get("QLH_DB_ENABLED")
+if _db_enabled_value is None:
+    DB_ENABLED = any(
+        os.environ.get(key, "").strip()
+        for key in ("QLH_DB_HOST", "QLH_DB_NAME", "QLH_DB_USER", "QLH_DB_PASSWORD")
+    )
+else:
+    DB_ENABLED = _db_enabled_value.strip().lower() in {"1", "true", "yes", "on"}
 
 # 端口和连接数的安全解析
 def _safe_int(env_key: str, default: int, min_val: int = 1, max_val: int = 65535) -> int:
@@ -72,6 +87,11 @@ def _safe_int(env_key: str, default: int, min_val: int = 1, max_val: int = 65535
 DB_PORT = _safe_int("QLH_DB_PORT", 5432, min_val=1, max_val=65535)
 DB_MIN_CONN = _safe_int("QLH_DB_MIN_CONN", 2, min_val=1, max_val=50)
 DB_MAX_CONN = _safe_int("QLH_DB_MAX_CONN", 8, min_val=1, max_val=100)
+DB_CONNECT_TIMEOUT = _safe_int("QLH_DB_CONNECT_TIMEOUT", 3, min_val=1, max_val=30)
+DB_SSLMODE = os.environ.get("QLH_DB_SSLMODE", "prefer").strip() or "prefer"
+DB_AUTO_CREATE = os.environ.get("QLH_DB_AUTO_CREATE", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 # 验证 MIN_CONN <= MAX_CONN
 if DB_MIN_CONN > DB_MAX_CONN:
@@ -89,6 +109,10 @@ _init_lock = threading.Lock()
 def get_pool() -> pool.ThreadedConnectionPool:
     """获取数据库连接池（懒初始化，线程安全）"""
     global _connection_pool
+    if not DB_ENABLED:
+        raise RuntimeError(
+            "数据库未配置；如需启用，请设置 QLH_DB_* 环境变量或用户配置目录 .env"
+        )
     if _connection_pool is not None:
         return _connection_pool
 
@@ -96,8 +120,8 @@ def get_pool() -> pool.ThreadedConnectionPool:
         if _connection_pool is not None:
             return _connection_pool
 
-        # 尝试连接并自动创建数据库
-        _ensure_database()
+        if DB_AUTO_CREATE:
+            _ensure_database()
 
         _connection_pool = pool.ThreadedConnectionPool(
             DB_MIN_CONN,
@@ -107,6 +131,9 @@ def get_pool() -> pool.ThreadedConnectionPool:
             dbname=DB_NAME,
             user=DB_USER,
             password=DB_PASSWORD,
+            connect_timeout=DB_CONNECT_TIMEOUT,
+            sslmode=DB_SSLMODE,
+            application_name="qlh-edge-inference",
         )
         logger.info(f"数据库连接池已创建: {DB_HOST}:{DB_PORT}/{DB_NAME} "
                      f"(min={DB_MIN_CONN}, max={DB_MAX_CONN}, user={DB_USER})")
@@ -141,6 +168,9 @@ def _ensure_database() -> None:
         conn = psycopg2.connect(
             host=DB_HOST, port=DB_PORT,
             dbname="postgres", user=DB_USER, password=DB_PASSWORD,
+            connect_timeout=DB_CONNECT_TIMEOUT,
+            sslmode=DB_SSLMODE,
+            application_name="qlh-edge-inference-setup",
         )
         conn.autocommit = True
         cur = conn.cursor()
@@ -1616,5 +1646,3 @@ def close_db():
             _connection_pool.closeall()
             _connection_pool = None
             logger.info("数据库连接池已关闭")
-
-

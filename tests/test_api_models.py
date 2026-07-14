@@ -74,6 +74,17 @@ def test_build_model_chat_prompt_does_not_mix_prefill_with_native_think():
     assert "【思考】" not in prompt
 
 
+def test_unclosed_native_thinking_is_not_exposed_as_answer():
+    answer, thinking = api_server._format_model_response(
+        "internal reasoning without a closing tag",
+        show_thinking=False,
+        native_thinking_prompt=True,
+    )
+
+    assert answer == ""
+    assert thinking is None
+
+
 def test_model_payload_prefers_pytorch_when_cuda_has_both_formats(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
     payload = api_server._model_api_payload(_both_model(tmp_path))
@@ -485,6 +496,75 @@ def test_load_model_rollback_on_failure(monkeypatch):
         asyncio.run(api_server.load_model(req))
     assert exc.value.status_code == 500
     assert "已回滚" in exc.value.detail
+
+
+def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
+    import torch
+
+    ensure_calls = []
+
+    class Tokenizer:
+        eos_token_id = 2
+        unk_token_id = 0
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=True):
+            return "prompt"
+
+        def __call__(self, prompt, return_tensors=None):
+            return {"input_ids": torch.tensor([[1]])}
+
+        def convert_tokens_to_ids(self, _token):
+            return self.unk_token_id
+
+        def encode(self, _text, add_special_tokens=False):
+            return [99]
+
+        def decode(self, _ids, skip_special_tokens=False):
+            return "reply"
+
+    class Model:
+        def generate(self, **kwargs):
+            return torch.tensor([[1, 3]])
+
+    class Manager:
+        _engine_type = "pytorch"
+        tokenizer = Tokenizer()
+        model = Model()
+        layer_range = (0, 4)
+
+        def ensure_full_model(self):
+            ensure_calls.append(True)
+            self.layer_range = None
+
+        def get_device(self):
+            return torch.device("cpu")
+
+        def _merge_stop_sequences(self, _value):
+            return []
+
+        def _get_generation_eos_token_ids(self, _stops):
+            return 2
+
+        def _build_stop_criteria(self, _stops, _length):
+            return None
+
+        def _decode_generated_ids(self, _ids, _stops):
+            return "reply"
+
+    req = api_server.ChatRequest(message="hello", max_new_tokens=1)
+    monkeypatch.setattr(api_server, "model_manager", Manager())
+    monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
+    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server, "_generate_followups", lambda *a, **kw: [])
+    monkeypatch.setattr(api_server, "_db_available", False)
+    monkeypatch.setattr(api_server._local_store, "save_local_message", lambda *a, **kw: None)
+    monkeypatch.setattr(api_server._local_store, "increment_local_session_message_count", lambda *a, **kw: None)
+
+    result = api_server._execute_chat_full(req)
+
+    assert result["content"] == "reply"
+    assert ensure_calls == [True]
 
 
 # ================================================================

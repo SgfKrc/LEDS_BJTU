@@ -222,6 +222,12 @@ REVIEW_REJECT_THRESHOLD = -2         # 阻止阈值: score <= -2
 # 通过环境变量 QLH_CLUSTER_SECRET 设置（必须设置，否则集群通信将拒绝认证）
 # 生产部署时务必使用随机字符串（建议 32+ 字符）
 CLUSTER_SECRET = os.environ.get("QLH_CLUSTER_SECRET", "")
+if not CLUSTER_SECRET and NODE_ROLE == "master" and getattr(sys, "frozen", False):
+    try:
+        from node_config import ensure_local_cluster_secret
+        CLUSTER_SECRET = ensure_local_cluster_secret()
+    except Exception:
+        CLUSTER_SECRET = ""
 if not CLUSTER_SECRET:
     import warnings
     warnings.warn(

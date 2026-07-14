@@ -9,20 +9,27 @@ cd /d "%~dp0\.."
 
 REM ---- 检查 Python 环境 ----
 echo [1/5] 检查 Python 环境...
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo   [错误] 未找到 Python，请先安装 Python 3.10+
+set "PYTHON=%CD%\.venv-packaging\Scripts\python.exe"
+if not exist "%PYTHON%" (
+    echo   [错误] 未找到项目打包虚拟环境: %PYTHON%
+    echo   请先创建 .venv-packaging 并安装 packaging\requirements-cpu.txt
     pause
     exit /b 1
 )
-python --version
+"%PYTHON%" --version >nul 2>&1
+if errorlevel 1 (
+    echo   [错误] 项目打包虚拟环境不可用
+    pause
+    exit /b 1
+)
+"%PYTHON%" --version
 
 REM ---- 安装 CPU-only 依赖 ----
 echo.
 echo [2/5] 安装 CPU-only 依赖...
 echo   提示: 如果已安装 CUDA 版 PyTorch，会被替换为 CPU 版
-pip install torch --index-url https://download.pytorch.org/whl/cpu --quiet
-pip install -r packaging\requirements-cpu.txt --quiet
+"%PYTHON%" -m pip install torch --index-url https://download.pytorch.org/whl/cpu --quiet
+"%PYTHON%" -m pip install -r packaging\requirements-cpu.txt --quiet
 echo   依赖安装完成。
 
 REM ---- 构建前端 ----
@@ -52,9 +59,9 @@ REM ---- PyInstaller 打包 ----
 echo.
 echo [5/5] PyInstaller 打包...
 echo   这可能需要 5-15 分钟，请耐心等待...
-pip install pyinstaller --quiet
+"%PYTHON%" -m pip install pyinstaller --quiet
 REM ★ 从项目根目录运行，输出到 dist/QLH-Edge-Inference/
-pyinstaller packaging\qlh-cpu.spec --noconfirm
+"%PYTHON%" -m PyInstaller packaging\qlh-cpu.spec --noconfirm
 
 if exist "dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
     echo.

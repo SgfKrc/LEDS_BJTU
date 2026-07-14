@@ -96,6 +96,8 @@ a = Analysis(
         'starlette',
         'starlette.middleware',
         'starlette.middleware.cors',
+        # Remote model code may import HTTPX dynamically at runtime.
+        'httpx',
 
         # ============================================================
         # Transformers（动态模型类加载）
@@ -104,6 +106,9 @@ a = Analysis(
         'transformers.models.qwen2',
         'transformers.models.auto',
         'transformers_stream_generator',
+        'einops',
+        'tiktoken',
+        'tiktoken._tiktoken',
         'torch',
         'accelerate',
         'bitsandbytes',

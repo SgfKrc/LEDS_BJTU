@@ -11,7 +11,47 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
+import device_profiler as device_profiler_mod
 from device_profiler import DeviceProfiler, DeviceTier
+
+
+class TestWindowsProbeSubprocesses:
+    def test_startup_wmic_probes_are_hidden(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            if cmd[1:3] == ["cpu", "get"]:
+                return type("Result", (), {"stdout": "Name\nTest CPU\n", "returncode": 0})()
+            return type(
+                "Result",
+                (),
+                {
+                    "stdout": "Node,AdapterRAM,Name\nPC,0,Intel UHD Graphics\n",
+                    "returncode": 0,
+                },
+            )()
+
+        monkeypatch.setattr(device_profiler_mod.sys, "platform", "win32")
+        monkeypatch.setattr(device_profiler_mod.subprocess, "run", fake_run)
+        import torch
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        profiler = DeviceProfiler.__new__(DeviceProfiler)
+        profiler._gpus = []
+        profiler._selected_gpu_index = 0
+        profiler._detect_cpu()
+        profiler._detect_all_gpus()
+
+        assert len(calls) == 2
+        assert all(
+            kwargs["creationflags"] == device_profiler_mod._WINDOWS_NO_WINDOW
+            for _, kwargs in calls
+        )
+        assert all(
+            kwargs["encoding"] == "utf-8" and kwargs["errors"] == "replace"
+            for _, kwargs in calls
+        )
 
 
 # ================================================================

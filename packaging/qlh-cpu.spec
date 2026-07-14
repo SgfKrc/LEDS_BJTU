@@ -2,8 +2,8 @@
 # ============================================================
 # PyInstaller spec — QLH 边缘推理系统 集显版 (CPU-only)
 # ============================================================
-# 构建命令: cd packaging && pyinstaller qlh-cpu.spec --noconfirm
-# 输出目录: packaging/dist/QLH-Edge-Inference/
+# 构建命令: .venv-packaging/Scripts/python -m PyInstaller packaging/qlh-cpu.spec --noconfirm
+# 输出目录: dist/QLH-Edge-Inference/
 #
 # 双引擎架构:
 #   1. llama.cpp + GGUF  — CPU/集显默认引擎（Q4_K_M ~1.16 GB）
@@ -89,6 +89,8 @@ a = Analysis(
         'starlette',
         'starlette.middleware',
         'starlette.middleware.cors',
+        # Remote model code may import HTTPX dynamically at runtime.
+        'httpx',
 
         # ============================================================
         # Transformers（动态模型类加载）
@@ -97,6 +99,9 @@ a = Analysis(
         'transformers.models.qwen2',
         'transformers.models.auto',
         'transformers_stream_generator',
+        'einops',
+        'tiktoken',
+        'tiktoken._tiktoken',
         'torch',
         'accelerate',
         'bitsandbytes',
@@ -165,6 +170,23 @@ a = Analysis(
         'test',
         'pydoc',
     ],
+)
+
+# CPU/集显版本只保留 bitsandbytes 的 CPU 后端。Windows wheel 同时携带
+# 多套 CUDA/XPU DLL，PyInstaller hook 会默认全部收集，既无运行价值又会
+# 让程序目录额外膨胀约 168 MB。
+_bnb_accelerator_prefixes = (
+    'libbitsandbytes_cuda',
+    'libbitsandbytes_xpu',
+)
+_binary_count_before = len(a.binaries)
+a.binaries = [
+    entry for entry in a.binaries
+    if not os.path.basename(entry[0]).lower().startswith(_bnb_accelerator_prefixes)
+]
+print(
+    f"[spec] Excluded {_binary_count_before - len(a.binaries)} "
+    "bitsandbytes CUDA/XPU binaries from CPU build"
 )
 
 pyz = PYZ(a.pure, a.zipped_data)

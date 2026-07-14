@@ -46,6 +46,8 @@ import threading
 import time
 import subprocess as _sp
 
+_WINDOWS_NO_WINDOW = getattr(_sp, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+
 # ★ Windows PyInstaller: 强制在 psycopg2 之前加载 ssl，避免 OpenSSL DLL 冲突
 # psycopg2-binary 捆绑了自己的 libssl-3-x64-{hash}.dll，通过 add_dll_directory 注册后
 # 可能干扰 Python _ssl.pyd 加载 libssl-3.dll，导致"内存位置访问无效"。
@@ -88,6 +90,399 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("launcher")
+
+
+def _startup_icon_path() -> str:
+    """Return the application icon source for the native startup window."""
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return os.path.join(_launcher_dir, "leds.ico")
+
+
+class _StartupSplash:
+    """Small native Windows startup window shown before WebView is available."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = bool(enabled and IS_WINDOWS)
+        self._thread = None
+        self._ready = threading.Event()
+        self._closed = threading.Event()
+        self._lock = threading.Lock()
+        self._status = "正在启动应用..."
+        self._progress = 2
+        self._hwnd = None
+        self._status_hwnd = None
+        self._progress_hwnd = None
+        self._percent_hwnd = None
+        self._wndproc = None
+
+    @property
+    def hwnd(self):
+        return self._hwnd
+
+    def start(self):
+        if not self.enabled:
+            return self
+        self._thread = threading.Thread(
+            target=self._run_windows,
+            name="startup-splash",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait(timeout=0.8)
+        return self
+
+    def update(self, progress: int, status: str) -> None:
+        with self._lock:
+            self._progress = max(0, min(100, int(progress)))
+            self._status = str(status or "正在启动应用...")
+            progress_value = self._progress
+            status_value = self._status
+
+        if not self.enabled or not self._ready.is_set():
+            return
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            user32.SetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            user32.SendMessageW.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_size_t,
+                ctypes.c_ssize_t,
+            ]
+            if self._status_hwnd:
+                user32.SetWindowTextW(self._status_hwnd, status_value)
+            if self._progress_hwnd:
+                user32.SendMessageW(self._progress_hwnd, 0x0402, progress_value, 0)
+            if self._percent_hwnd:
+                user32.SetWindowTextW(self._percent_hwnd, f"{progress_value}%")
+        except Exception:
+            logger.debug("更新启动页失败", exc_info=True)
+
+    def close(self) -> None:
+        self._closed.set()
+        if not self.enabled:
+            return
+        try:
+            import ctypes
+
+            if self._hwnd:
+                ctypes.windll.user32.PostMessageW.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.c_size_t,
+                    ctypes.c_ssize_t,
+                ]
+                ctypes.windll.user32.PostMessageW(self._hwnd, 0x0010, 0, 0)
+        except Exception:
+            logger.debug("关闭启动页失败", exc_info=True)
+
+    def _run_windows(self) -> None:
+        user32 = None
+        gdi32 = None
+        background = None
+        icon_handle = None
+        fonts = []
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            gdi32 = ctypes.windll.gdi32
+            comctl32 = ctypes.windll.comctl32
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [
+                    ("style", wintypes.UINT),
+                    ("lpfnWndProc", ctypes.c_void_p),
+                    ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE),
+                    ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE),
+                    ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR),
+                    ("lpszClassName", wintypes.LPCWSTR),
+                ]
+
+            class INITCOMMONCONTROLSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("dwICC", wintypes.DWORD),
+                ]
+
+            user32.CreateWindowExW.argtypes = [
+                wintypes.DWORD,
+                wintypes.LPCWSTR,
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.HWND,
+                wintypes.HANDLE,
+                wintypes.HINSTANCE,
+                ctypes.c_void_p,
+            ]
+            user32.CreateWindowExW.restype = wintypes.HWND
+            user32.DefWindowProcW.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.DefWindowProcW.restype = ctypes.c_ssize_t
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+            user32.PostMessageW.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.DestroyWindow.argtypes = [wintypes.HWND]
+            user32.IsWindow.argtypes = [wintypes.HWND]
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.UpdateWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+            user32.LoadCursorW.restype = wintypes.HANDLE
+            user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+            gdi32.CreateSolidBrush.argtypes = [wintypes.DWORD]
+            gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+            gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+            gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+            gdi32.CreateFontW.restype = wintypes.HANDLE
+            user32.PrivateExtractIconsW.argtypes = [
+                wintypes.LPCWSTR,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(wintypes.HICON),
+                ctypes.POINTER(wintypes.UINT),
+                wintypes.UINT,
+                wintypes.UINT,
+            ]
+            user32.PrivateExtractIconsW.restype = wintypes.UINT
+
+            controls = INITCOMMONCONTROLSEX(
+                ctypes.sizeof(INITCOMMONCONTROLSEX), 0x00000020,
+            )
+            comctl32.InitCommonControlsEx(ctypes.byref(controls))
+
+            background = gdi32.CreateSolidBrush(0x00FAFAFA)
+            hinstance = kernel32.GetModuleHandleW(None)
+            class_name = f"QLHStartupSplash_{os.getpid()}"
+
+            WM_CLOSE = 0x0010
+            WM_DESTROY = 0x0002
+            WM_CTLCOLORSTATIC = 0x0138
+            TRANSPARENT = 1
+
+            WNDPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+
+            def window_proc(hwnd, message, wparam, lparam):
+                if message == WM_CLOSE:
+                    user32.DestroyWindow(hwnd)
+                    return 0
+                if message == WM_DESTROY:
+                    user32.PostQuitMessage(0)
+                    return 0
+                if message == WM_CTLCOLORSTATIC:
+                    gdi32.SetBkMode(wparam, TRANSPARENT)
+                    return background
+                return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+            self._wndproc = WNDPROC(window_proc)
+            window_class = WNDCLASSW()
+            window_class.style = 0x0003
+            window_class.lpfnWndProc = ctypes.cast(self._wndproc, ctypes.c_void_p).value
+            window_class.hInstance = hinstance
+            window_class.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(32512))
+            window_class.hbrBackground = background
+            window_class.lpszClassName = class_name
+            user32.RegisterClassW(ctypes.byref(window_class))
+
+            width, height = 540, 300
+            screen_width = user32.GetSystemMetrics(0)
+            screen_height = user32.GetSystemMetrics(1)
+            left = max(0, (screen_width - width) // 2)
+            top = max(0, (screen_height - height) // 2)
+            hwnd = user32.CreateWindowExW(
+                0x00040000,
+                class_name,
+                "QLH 正在启动",
+                0x80000000 | 0x00800000,
+                left,
+                top,
+                width,
+                height,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            if not hwnd:
+                raise ctypes.WinError()
+            self._hwnd = hwnd
+
+            def create_control(class_value, text, style, x, y, w, h):
+                return user32.CreateWindowExW(
+                    0,
+                    class_value,
+                    text,
+                    0x40000000 | 0x10000000 | style,
+                    x,
+                    y,
+                    w,
+                    h,
+                    hwnd,
+                    None,
+                    hinstance,
+                    None,
+                )
+
+            icon_control = create_control("STATIC", "", 0x00000043, 38, 34, 72, 72)
+            title_control = create_control(
+                "STATIC", "QLH 边缘推理系统", 0, 128, 39, 360, 40,
+            )
+            subtitle_control = create_control(
+                "STATIC", "轻量化大模型分布式边缘推理优化系统", 0,
+                130, 82, 360, 26,
+            )
+            self._status_hwnd = create_control(
+                "STATIC", self._status, 0, 40, 144, 455, 28,
+            )
+            self._progress_hwnd = create_control(
+                "msctls_progress32", "", 0x00000001, 40, 181, 455, 18,
+            )
+            self._percent_hwnd = create_control(
+                "STATIC", f"{self._progress}%", 0x00000002, 432, 208, 62, 24,
+            )
+            footer_control = create_control(
+                "STATIC", "正在准备本地服务，请稍候", 0, 40, 239, 300, 24,
+            )
+
+            title_font = gdi32.CreateFontW(
+                -27, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0,
+                "Microsoft YaHei UI",
+            )
+            text_font = gdi32.CreateFontW(
+                -16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+                "Microsoft YaHei UI",
+            )
+            small_font = gdi32.CreateFontW(
+                -14, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0,
+                "Microsoft YaHei UI",
+            )
+            fonts = [title_font, text_font, small_font]
+            user32.SendMessageW(title_control, 0x0030, title_font, True)
+            for control in (
+                subtitle_control,
+                self._status_hwnd,
+                self._percent_hwnd,
+            ):
+                user32.SendMessageW(control, 0x0030, text_font, True)
+            user32.SendMessageW(footer_control, 0x0030, small_font, True)
+
+            user32.SendMessageW(self._progress_hwnd, 0x0406, 0, 100)
+            user32.SendMessageW(self._progress_hwnd, 0x0402, self._progress, 0)
+
+            icon_handle = wintypes.HICON()
+            icon_id = wintypes.UINT()
+            try:
+                extracted = user32.PrivateExtractIconsW(
+                    _startup_icon_path(),
+                    0,
+                    64,
+                    64,
+                    ctypes.byref(icon_handle),
+                    ctypes.byref(icon_id),
+                    1,
+                    0,
+                )
+            except Exception:
+                extracted = 0
+            if extracted and icon_handle:
+                icon_value = int(icon_handle.value or 0)
+                user32.SendMessageW(icon_control, 0x0170, icon_value, 0)
+                user32.SendMessageW(hwnd, 0x0080, 1, icon_value)
+                user32.SendMessageW(hwnd, 0x0080, 0, icon_value)
+
+            try:
+                corner = ctypes.c_int(2)
+                dwmapi = ctypes.windll.dwmapi
+                dwmapi.DwmSetWindowAttribute.argtypes = [
+                    wintypes.HWND,
+                    wintypes.DWORD,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                ]
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner),
+                )
+            except Exception:
+                pass
+
+            user32.ShowWindow(hwnd, 5)
+            user32.UpdateWindow(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            self._ready.set()
+            self.update(self._progress, self._status)
+            if self._closed.is_set():
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+
+        except Exception:
+            logger.warning("原生启动页创建失败", exc_info=True)
+        finally:
+            try:
+                if user32 is not None and self._hwnd and user32.IsWindow(self._hwnd):
+                    user32.DestroyWindow(self._hwnd)
+            except Exception:
+                logger.debug("销毁启动页窗口失败", exc_info=True)
+            self._hwnd = None
+            self._status_hwnd = None
+            self._progress_hwnd = None
+            self._percent_hwnd = None
+            try:
+                if user32 is not None and icon_handle:
+                    user32.DestroyIcon(icon_handle)
+            except Exception:
+                pass
+            if gdi32 is not None:
+                for font in fonts:
+                    try:
+                        if font:
+                            gdi32.DeleteObject(font)
+                    except Exception:
+                        pass
+                try:
+                    if background:
+                        gdi32.DeleteObject(background)
+                except Exception:
+                    pass
+            self._ready.set()
 
 # ================================================================
 # Tailscale 组网配置
@@ -150,11 +545,14 @@ def _safe_pause(message: str = "按 Enter 键退出..."):
 
 
 def _show_windows_messagebox(title: str, message: str,
-                              flags: int = _MB_OK | _MB_ICONINFORMATION) -> int:
+                              flags: int = _MB_OK | _MB_ICONINFORMATION,
+                              owner_hwnd=None) -> int:
     """Windows: ctypes.windll MessageBox。"""
     try:
         import ctypes
-        return ctypes.windll.user32.MessageBoxW(0, message, title, flags)
+        return ctypes.windll.user32.MessageBoxW(
+            owner_hwnd or 0, message, title, flags
+        )
     except Exception as e:
         logger.warning(f"MessageBox 显示失败: {e}")
         return _IDCANCEL
@@ -232,7 +630,7 @@ def _cli_dialog(title: str, message: str, buttons: str = "ok") -> int:
 
 
 def _show_dialog(title: str, message: str,
-                 buttons: str = "ok") -> int:
+                 buttons: str = "ok", owner_hwnd=None) -> int:
     """跨平台对话框：Linux→zenity→CLI, Windows→MessageBox, 其他→CLI。"""
     if IS_LINUX:
         return _show_linux_dialog(title, message, buttons)
@@ -244,7 +642,7 @@ def _show_dialog(title: str, message: str,
             "yesnocancel": _MB_YESNOCANCEL | _MB_ICONQUESTION,
         }
         flags = flags_map.get(buttons, _MB_OK | _MB_ICONINFORMATION)
-        return _show_windows_messagebox(title, message, flags)
+        return _show_windows_messagebox(title, message, flags, owner_hwnd)
     else:
         return _cli_dialog(title, message, buttons)
 
@@ -363,40 +761,42 @@ def _check_tailscale_status() -> dict:
 
     errors = []
 
-    # 1) status --json：短重试，规避服务刚恢复/刚登录后的瞬时失败。
-    for attempt in range(3):
-        try:
-            r = _sp.run(
-                [exe, "status", "--json"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                import json
-                data = json.loads(r.stdout)
-                self_node = data.get("Self", {}) or {}
-                ips = self_node.get("TailscaleIPs", []) or []
-                ts_ip = next((ip for ip in ips if _is_tailscale_ip(ip)), ips[0] if ips else None)
-                result["running"] = True
-                if self_node:
-                    result["logged_in"] = True
-                    result["hostname"] = self_node.get("HostName")
-                if ts_ip:
-                    result["tailscale_ip"] = ts_ip
-                    result["source"] = "status_json"
-                    return result
-                errors.append("status json has no Tailscale IP")
-            else:
-                stderr = (r.stderr or "").strip()
-                errors.append(f"status --json rc={r.returncode}: {stderr[:160]}")
-        except Exception as e:
-            errors.append(f"status --json attempt {attempt + 1}: {e}")
-        time.sleep(0.8)
+    # 1) status --json：启动路径只做一次短探测，失败立即走 IP/网卡兜底。
+    try:
+        r = _sp.run(
+            [exe, "status", "--json"],
+            capture_output=True, text=True, timeout=2,
+            encoding="utf-8", errors="replace",
+            creationflags=_WINDOWS_NO_WINDOW,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            import json
+            data = json.loads(r.stdout)
+            self_node = data.get("Self", {}) or {}
+            ips = self_node.get("TailscaleIPs", []) or []
+            ts_ip = next((ip for ip in ips if _is_tailscale_ip(ip)), ips[0] if ips else None)
+            result["running"] = True
+            if self_node:
+                result["logged_in"] = True
+                result["hostname"] = self_node.get("HostName")
+            if ts_ip:
+                result["tailscale_ip"] = ts_ip
+                result["source"] = "status_json"
+                return result
+            errors.append("status json has no Tailscale IP")
+        else:
+            stderr = (r.stderr or "").strip()
+            errors.append(f"status --json rc={r.returncode}: {stderr[:160]}")
+    except Exception as e:
+        errors.append(f"status --json: {e}")
 
     # 2) tailscale ip -4：很多情况下 status JSON 不可用但 IP 命令可用。
     try:
         r = _sp.run(
             [exe, "ip", "-4"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=2,
+            encoding="utf-8", errors="replace",
+            creationflags=_WINDOWS_NO_WINDOW,
         )
         if r.returncode == 0 and r.stdout.strip():
             for line in r.stdout.splitlines():
@@ -491,6 +891,7 @@ def _prompt_tailscale_setup(status: dict) -> bool:
             "Tailscale 组网检查",
             message,
             "yesnocancel",
+            owner_hwnd=owner_hwnd,
         )
         if result == _IDYES:
             if not installed:
@@ -560,7 +961,7 @@ def _prompt_tailscale_setup(status: dict) -> bool:
             print("  请输入 yes、skip 或 no。")
 
 
-def _check_tailscale_requirement() -> bool:
+def _check_tailscale_requirement(owner_hwnd=None) -> bool:
     """
     检查 Tailscale 组网要求。
 
@@ -629,11 +1030,11 @@ def _has_webview() -> bool:
     try:
         import webview  # noqa: F401
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
-def _run_ui(url: str, title: str):
+def _run_ui(url: str, title: str, startup_splash: _StartupSplash | None = None):
     """
     启动用户界面（跨平台）。
 
@@ -641,12 +1042,15 @@ def _run_ui(url: str, title: str):
     Windows: 优先使用 pywebview 原生窗口，不可用时回退到外部浏览器。
     """
     if IS_LINUX or not _has_webview():
+        if startup_splash:
+            startup_splash.close()
         _launch_browser(url)
     else:
-        _run_pywebview(url, title)
+        _run_pywebview(url, title, startup_splash=startup_splash)
 
 
-def _run_pywebview(url: str, title: str):
+def _run_pywebview(url: str, title: str,
+                   startup_splash: _StartupSplash | None = None):
     """
     Windows pywebview 原生窗口。
 
@@ -654,8 +1058,10 @@ def _run_pywebview(url: str, title: str):
     """
     try:
         import webview
-    except ImportError:
+    except Exception:
         logger.warning("pywebview 未安装，回退到外部浏览器")
+        if startup_splash:
+            startup_splash.close()
         _launch_browser(url)
         return
 
@@ -673,10 +1079,16 @@ def _run_pywebview(url: str, title: str):
         def on_closed():
             logger.info("窗口已关闭，程序退出。")
 
+        def on_started():
+            if startup_splash:
+                startup_splash.close()
+
         window.events.closed += on_closed
-        webview.start(gui='edgechromium', debug=False)
+        webview.start(on_started, gui='edgechromium', debug=False)
     except Exception as e:
         logger.warning(f"pywebview 启动失败 ({e})，回退到外部浏览器")
+        if startup_splash:
+            startup_splash.close()
         _launch_browser(url)
 
 
@@ -690,7 +1102,8 @@ def _launch_browser(url: str):
     else:
         methods.append(lambda: os.startfile(url))
         methods.append(lambda: _sp.run(["cmd", "/c", "start", url],
-                                       capture_output=True, timeout=5))
+                                       capture_output=True, timeout=5,
+                                       creationflags=_WINDOWS_NO_WINDOW))
     methods.append(lambda: webbrowser.open(url))
 
     for method in methods:
@@ -709,10 +1122,29 @@ def _launch_browser(url: str):
     _safe_input("按 Enter 键退出...", default="")
 
 
-def _kill_port_8000(port: int = 8000):
+def _is_existing_qlh_instance(port: int) -> bool:
+    """Return True when the listening local API is an existing QLH instance."""
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/cluster/my-role",
+            timeout=0.8,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+        return payload.get("run_mode") in {"single", "distributed"} and bool(
+            payload.get("node_id")
+        )
+    except Exception:
+        return False
+
+
+def _kill_port_8000(port: int = 8000) -> str:
     """
-    检查 API 端口。若被占用则尝试温和释放（旧实例退出后自行释放），
-    不做强行杀进程操作以避免杀软误报（netstat + taskkill /F 会触发 BITS 行为检测）。
+    检查 API 端口并区分已有 QLH 实例与其他占用者。
+
+    Returns: ``free`` | ``qlh`` | ``occupied``
     """
     import socket
 
@@ -729,20 +1161,31 @@ def _kill_port_8000(port: int = 8000):
             s.close()
 
     if not _port_in_use():
-        return  # 端口空闲，一切正常
+        return "free"
 
-    # 端口已被占用 — 可能是旧实例尚未退出
-    logger.warning("端口 %s 已被占用，等待旧实例释放...", port)
-    print(f"  ⚠️  端口 {port} 被占用，可能是旧实例仍在运行。")
-    print("     请关闭旧窗口或等待 5 秒后自动重试。")
-    for i in range(5, 0, -1):
-        print(f"     {i}...")
-        time.sleep(1)
-        if not _port_in_use():
-            logger.info("端口 %s 已释放，继续启动。", port)
-            return
-    logger.error("端口 %s 仍被占用，启动可能失败。", port)
-    print(f"  ❌ 端口 {port} 仍被占用。请手动关闭占用程序后重试。")
+    if _is_existing_qlh_instance(port):
+        logger.info("检测到已有 QLH 实例: http://127.0.0.1:%s", port)
+        return "qlh"
+    logger.error("端口 %s 已被其他程序占用", port)
+    return "occupied"
+
+
+def _verify_pytorch_tokenizer_runtime() -> str:
+    """Load the local PyTorch tokenizer so packaging checks cover dynamic imports."""
+    from config import MODEL_PATH
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    token_ids = tokenizer.encode("QLH tokenizer runtime check")
+    if not token_ids:
+        raise RuntimeError("Qwen tokenizer returned no token IDs")
+    tokenizer_name = f"{type(tokenizer).__module__}.{type(tokenizer).__name__}"
+    logger.info("PyTorch tokenizer runtime check passed: %s", tokenizer_name)
+    return tokenizer_name
 
 
 def main():
@@ -754,12 +1197,41 @@ def main():
     """
     headless = "--headless" in sys.argv
     check_only = "--check-only" in sys.argv
+    startup_splash = _StartupSplash(
+        enabled=not headless and not check_only,
+    ).start()
+    import atexit
+    atexit.register(startup_splash.close)
+    startup_splash.update(5, "正在初始化运行环境...")
     from config import API_PORT
 
-    # ---- 启动前清理 ----
-    _kill_port_8000(API_PORT)
+    # ---- 单实例检查（环境自检不需要占用 API 端口） ----
+    if not check_only:
+        startup_splash.update(10, "正在检查应用运行状态...")
+        port_status = _kill_port_8000(API_PORT)
+        if port_status == "qlh":
+            if headless:
+                logger.info("已有 QLH 服务正在运行，无头启动直接复用")
+            else:
+                startup_splash.update(100, "正在打开应用窗口...")
+                _run_ui(
+                    url=f"http://localhost:{API_PORT}",
+                    title="轻量化大模型分布式边缘推理系统",
+                    startup_splash=startup_splash,
+                )
+            return
+        if port_status == "occupied":
+            startup_splash.close()
+            _show_dialog(
+                "端口被占用",
+                f"端口 {API_PORT} 已被其他程序占用，QLH 无法启动。\n"
+                "请关闭占用程序后重试。",
+                buttons="ok",
+            )
+            return
 
     # ---- 确定引擎 ----
+    startup_splash.update(18, "正在检测推理引擎...")
     engine = _detect_engine_preference()
     has_cuda = _detect_cuda()
 
@@ -786,7 +1258,9 @@ def main():
     print()
 
     # ---- 第 0 步：Tailscale 组网检查 ----
-    if not _check_tailscale_requirement():
+    startup_splash.update(28, "正在检查集群网络...")
+    if not _check_tailscale_requirement(owner_hwnd=startup_splash.hwnd):
+        startup_splash.close()
         print()
         print("按 Enter 键退出...")
         _safe_input(default="")
@@ -794,6 +1268,7 @@ def main():
     print()
 
     # ---- 第 1 步：检查模型文件 ----
+    startup_splash.update(42, "正在检查本地模型...")
     from model_downloader import (
         check_and_prompt_model,
         model_exists,
@@ -801,8 +1276,9 @@ def main():
         safetensors_model_exists,
     )
 
-    model_ready = check_and_prompt_model()
+    model_ready = check_and_prompt_model(owner_hwnd=startup_splash.hwnd)
     if not model_ready:
+        startup_splash.close()
         print()
         print("模型文件未就绪，程序将退出。")
         if engine == "llama_cpp":
@@ -827,11 +1303,20 @@ def main():
         logger.info("✅ Safetensors 模型就绪 (PyTorch)")
 
     # ---- 确认引擎选择 ----
+    startup_splash.update(58, "正在准备模型运行环境...")
     from model_module import ModelManager
     actual_engine = ModelManager.select_engine()
     logger.info(f"推理引擎: {actual_engine}")
 
     if check_only:
+        if has_safetensors:
+            try:
+                tokenizer_name = _verify_pytorch_tokenizer_runtime()
+            except Exception as e:
+                logger.exception("PyTorch tokenizer runtime check failed")
+                print(f"[ERROR] PyTorch tokenizer runtime check failed: {e}")
+                sys.exit(1)
+            print(f"   Tokenizer: {tokenizer_name}")
         print()
         print("✅ 环境检查通过。模型就绪，引擎已选择。")
         print(f"   引擎: {actual_engine}")
@@ -840,6 +1325,7 @@ def main():
         return
 
     # ---- 第 2 步：后台启动 API 服务器 ----
+    startup_splash.update(70, "正在启动本地服务...")
     print("正在加载 API 服务...")
     _server_error = []
 
@@ -870,7 +1356,13 @@ def main():
     server_ready = False
     for i in range(150):
         time.sleep(0.1)
+        if i % 5 == 0:
+            startup_splash.update(
+                72 + min(20, int(i / 150 * 20)),
+                "正在等待本地服务就绪...",
+            )
         if _server_error:
+            startup_splash.close()
             print("\n服务器线程崩溃，错误信息:\n")
             print(_server_error[-1])
             print("\n按 Enter 键退出...")
@@ -885,6 +1377,7 @@ def main():
             if i % 20 == 19:
                 print(f"  等待中... ({int(i * 0.1 + 1)}s)")
     if not server_ready:
+        startup_splash.close()
         if _server_error:
             print(f"\n服务器启动失败: {_server_error[0]}")
         else:
@@ -894,6 +1387,7 @@ def main():
         sys.exit(1)
 
     print(f"API 服务器已就绪: http://localhost:{API_PORT}")
+    startup_splash.update(96, "本地服务已就绪，正在加载界面...")
 
     # ---- 第 3 步：启动用户界面 ----
     if headless:
@@ -908,9 +1402,11 @@ def main():
     else:
         print()
         print("启动用户界面...")
+        startup_splash.update(100, "正在打开应用窗口...")
         _run_ui(
             url=f"http://localhost:{API_PORT}",
             title="轻量化大模型分布式边缘推理系统",
+            startup_splash=startup_splash,
         )
 
     # 窗口关闭后强制退出，避免 DB 连接池 / TCP socket 清理卡死

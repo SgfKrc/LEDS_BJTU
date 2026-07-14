@@ -95,18 +95,14 @@ class TestComputeNodeWeight:
         return Scheduler()
 
     def test_workstation_max_score(self, sched):
-        """工作站应获得最高分（接近 100 + 15 = 115）"""
+        """CUDA 工作站应获得最高执行吞吐分。"""
         weight = sched._compute_node_weight(PROFILE_WORKSTATION)
-        # VRAM: 24/24*50=50, RAM: 64/64*30=30, CPU: 16/16*10+4500/4000*10=21.25
-        # Bonus: 15 → total ≈ 116.25
-        assert 100 <= weight <= 120, f"工作站权重应在 100-120，实际: {weight:.1f}"
+        assert 145 <= weight <= 165, f"工作站权重应在 145-165，实际: {weight:.1f}"
 
     def test_laptop_moderate_score(self, sched):
-        """游戏本应获得中等分数"""
+        """CUDA 游戏本应显著高于 CPU worker。"""
         weight = sched._compute_node_weight(PROFILE_LAPTOP)
-        # VRAM: 8/24*50=16.7, RAM: 16/64*30=7.5, CPU: 8/16*10+4000/4000*10=15
-        # Bonus: 15 → total ≈ 54.2
-        assert 40 <= weight <= 70, f"游戏本权重应在 40-70，实际: {weight:.1f}"
+        assert 90 <= weight <= 110, f"游戏本权重应在 90-110，实际: {weight:.1f}"
 
     def test_ultrabook_low_score(self, sched):
         """轻薄本（集显）应获得低分"""
@@ -141,19 +137,26 @@ class TestComputeNodeWeight:
         assert 0 <= weight <= 20, f"None 设备信息权重应在 0-20，实际: {weight:.1f}"
 
     def test_discrete_gpu_bonus(self, sched):
-        """独显应获得 +15 奖励"""
+        """只有可用 CUDA 独显才应获得专用显存与执行后端分。"""
         with_gpu = PROFILE_LAPTOP  # 独显
         without_gpu = {**PROFILE_LAPTOP, "gpu": {**PROFILE_LAPTOP["gpu"], "cuda_available": False}}
         w_gpu = sched._compute_node_weight(with_gpu)
         w_no_gpu = sched._compute_node_weight(without_gpu)
-        # 独显奖励应接近 15
+        # 8GB VRAM 约 16.7 分 + CUDA 执行后端 60 分。
         bonus = w_gpu - w_no_gpu
-        assert 12 <= bonus <= 18, f"独显奖励应在 12-18，实际: {bonus:.1f}"
+        assert 70 <= bonus <= 85, f"CUDA 执行优势应在 70-85，实际: {bonus:.1f}"
 
     def test_mobile_arm_score(self, sched):
         """移动设备应有合理分数"""
         weight = sched._compute_node_weight(PROFILE_MOBILE)
         assert 0 <= weight <= 15, f"移动设备权重应在 0-15，实际: {weight:.1f}"
+
+    def test_cuda_laptop_outscores_igpu_cpu_worker(self, sched):
+        """4060 CUDA 主机评分必须显著高于同核数的集显 CPU worker。"""
+        cuda_weight = sched._compute_node_weight(PROFILE_LAPTOP)
+        igpu_weight = sched._compute_node_weight(PROFILE_IGPU_ONLY)
+
+        assert cuda_weight > igpu_weight * 2
 
 
 # ================================================================
@@ -196,6 +199,28 @@ class TestComputeLayerAssignment:
         assert result[0]["has_embedding"] is True
         assert result[0]["has_lm_head"] is True
 
+    def test_active_deepseek_layer_count_replaces_fixed_qwen_count(self, sched, monkeypatch):
+        import api_server as _api
+
+        manager = type("DeepSeekManager", (), {
+            "_total_model_layers": 28,
+            "model": None,
+            "_model_path": "",
+        })()
+        monkeypatch.setattr(_api, "model_manager", manager)
+        nodes = [{
+            "node_id": "master",
+            "role": "master",
+            "node_type": "pc",
+            "device_info": {},
+        }]
+
+        result = sched.compute_layer_assignment(nodes)
+
+        assert result[0]["start_layer"] == 0
+        assert result[0]["end_layer"] == 28
+        assert result[0]["layers_count"] == 28
+
     def test_multi_node_covers_all_layers(self, sched):
         """多节点分配应完整覆盖 0-24"""
         result = sched.compute_layer_assignment()
@@ -221,10 +246,11 @@ class TestComputeLayerAssignment:
         assert executable[0].get("node_id") == "master" or executable[0].get("role") == "master"
 
     def test_last_node_has_lm_head(self, sched):
-        """最后一个节点应有 LM Head"""
+        """强 master 应保留 LM Head，避免弱末端 worker 回传整词表 logits。"""
         result = sched.compute_layer_assignment()
         result.sort(key=lambda x: x["start_layer"])
-        assert result[-1]["has_lm_head"] is True
+        master = next(item for item in result if item["node_id"] == "master")
+        assert master["has_lm_head"] is True
         assert result[-1]["end_layer"] == 24
 
     def test_master_first_sorting(self, sched):
@@ -282,6 +308,25 @@ class TestComputeLayerAssignment:
         assert "android-live" not in node_ids
         assert node_ids == {"master", "pc-worker"}
 
+    def test_offline_pc_nodes_are_excluded_from_runtime_assignment(self):
+        """数据库恢复的历史 PC 节点离线时不能继续占用模型层。"""
+        sched = Scheduler()
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                node_type="pc", device_info=PROFILE_LAPTOP,
+            ),
+            "old-worker": NodeInfo(
+                node_id="old-worker", role="client", state=NodeState.OFFLINE,
+                node_type="pc", device_info=PROFILE_IGPU_ONLY,
+            ),
+        }
+
+        result = sched.compute_layer_assignment()
+
+        assert [item["node_id"] for item in result] == ["master"]
+        assert result[0]["layers_count"] == 24
+
     def test_all_zero_weight_equal_split(self, sched):
         """权重全为 0 时应均分"""
         nodes = [
@@ -319,7 +364,26 @@ class TestComputeLayerAssignment:
         assert worker["node_id"] == "client1"
         assert worker["start_layer"] == result[0]["end_layer"]
         assert worker["end_layer"] == 24
-        assert worker["has_lm_head"] is True
+        assert result[0]["has_lm_head"] is True
+        assert worker["has_lm_head"] is False
+
+    def test_4060_master_gets_more_layers_than_igpu_i7_worker(self, sched):
+        """主节点画像正确时，不得再出现弱 CPU worker 的层数反超 CUDA 主节点。"""
+        nodes = [
+            {"node_id": "master", "role": "master", "node_type": "pc",
+             "device_info": PROFILE_LAPTOP},
+            {"node_id": "igpu-worker", "role": "client", "node_type": "pc",
+             "device_info": PROFILE_IGPU_ONLY},
+        ]
+
+        result = sched.compute_layer_assignment(nodes)
+        by_id = {item["node_id"]: item for item in result}
+
+        assert by_id["master"]["score"] > by_id["igpu-worker"]["score"] * 2
+        assert by_id["master"]["layers_count"] > by_id["igpu-worker"]["layers_count"]
+        assert by_id["master"]["layers_count"] >= 19
+        assert by_id["master"]["has_lm_head"] is True
+        assert by_id["igpu-worker"]["has_lm_head"] is False
 
     def test_each_node_has_min_one_layer(self, sched):
         """每个节点至少分配 1 层"""
@@ -346,6 +410,191 @@ class TestComputeLayerAssignment:
             assert "has_lm_head" in a
             assert "score" in a
             assert isinstance(a["score"], (int, float))
+
+
+class TestLocalDeviceProfileSync:
+    """异步设备检测必须进入调度器评分，并清除旧动态分层。"""
+
+    def test_master_profile_updates_node_invalidates_cache_and_repushes(
+            self, monkeypatch):
+        import scheduler as scheduler_mod
+
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                device_info={},
+            ),
+        }
+        cleared = []
+        persisted = []
+        pushed = []
+
+        class FakeDb:
+            def upsert_node(self, **kwargs):
+                persisted.append(kwargs)
+
+            def set_layer_assignments(self, value):
+                cleared.append(value)
+
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda *args, **kwargs: FakeDb())
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+        monkeypatch.setattr(
+            sched, "push_layer_config_to_clients", lambda: pushed.append(True),
+        )
+
+        sched.update_local_device_profile(PROFILE_LAPTOP)
+
+        assert sched.nodes["master"].device_info["gpu"]["name"] == "NVIDIA RTX 4060 Laptop"
+        assert cleared == [{}]
+        assert persisted[0]["device_info"] == PROFILE_LAPTOP
+        assert pushed == [True]
+
+    def test_client_profile_is_reported_after_background_detection(
+            self, monkeypatch):
+        sched = Scheduler()
+        sched._role_override = "client"
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker1")
+        sched.nodes = {
+            "worker1": NodeInfo(
+                node_id="worker1", role="client", state=NodeState.ONLINE,
+                device_info={},
+            ),
+        }
+        sent = []
+
+        class FakeClient:
+            is_registered = True
+            device_info = {}
+
+            def send_data(self, data, msg_type):
+                sent.append((data, msg_type.value))
+
+        sched._tcp_client = FakeClient()
+
+        sched.update_local_device_profile(PROFILE_IGPU_ONLY)
+
+        assert sched._tcp_client.device_info == PROFILE_IGPU_ONLY
+        assert sent == [(
+            {"state": "online", "device_info": PROFILE_IGPU_ONLY},
+            "status_res",
+        )]
+
+    def test_failed_profile_report_remains_retryable(self, monkeypatch):
+        sched = Scheduler()
+        sched._role_override = "client"
+        sched._local_device_profile = PROFILE_IGPU_ONLY
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker1")
+        sched.nodes = {
+            "worker1": NodeInfo(
+                node_id="worker1", role="client", state=NodeState.ONLINE,
+                device_info=PROFILE_IGPU_ONLY,
+            ),
+        }
+
+        class FlakyClient:
+            is_registered = True
+            device_info = {}
+            attempts = 0
+
+            def send_data(self, data, msg_type):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise ConnectionError("temporary")
+
+        client = FlakyClient()
+
+        assert sched._report_local_device_profile(client, "worker1") is False
+        assert client.device_info == {}
+        assert sched._report_local_device_profile(client, "worker1") is True
+        assert client.device_info == PROFILE_IGPU_ONLY
+        assert client.attempts == 2
+
+    def test_master_profile_report_recomputes_layer_config(self, monkeypatch):
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched.nodes = {
+            "worker1": NodeInfo(
+                node_id="worker1", role="client", state=NodeState.ONLINE,
+                device_info={"platform": "Windows"},
+            ),
+        }
+        pushed = []
+        monkeypatch.setattr(
+            sched, "push_layer_config_to_clients", lambda: pushed.append(True),
+        )
+
+        sched._on_tcp_message("worker1", {
+            "type": "status_res",
+            "data": {"state": "online", "device_info": PROFILE_IGPU_ONLY},
+        })
+
+        assert sched.nodes["worker1"].device_info == PROFILE_IGPU_ONLY
+        assert pushed == [True]
+
+
+class TestManualLayerAssignmentNormalization:
+    """前端只提交区间，后端必须补齐可执行分层字段。"""
+
+    def test_manual_ranges_gain_counts_roles_scores_and_io_heads(self, monkeypatch):
+        import scheduler as scheduler_mod
+
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                device_info=PROFILE_LAPTOP,
+            ),
+            "worker": NodeInfo(
+                node_id="worker", role="client", state=NodeState.ONLINE,
+                device_info=PROFILE_IGPU_ONLY,
+            ),
+        }
+        stored = []
+
+        class FakeDb:
+            def set_layer_strategy(self, _strategy):
+                pass
+
+            def set_layer_override(self, value):
+                stored.append(value)
+
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda *args, **kwargs: FakeDb())
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+        monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
+
+        result = sched.override_layer_assignments([
+            {"node_id": "master", "start_layer": 0, "end_layer": 20},
+            {"node_id": "worker", "start_layer": 20, "end_layer": 24},
+        ])
+
+        assert result["status"] == "ok"
+        normalized = result["current_assignments"]["assignments"]
+        assert normalized[0]["layers_count"] == 20
+        assert normalized[1]["layers_count"] == 4
+        assert normalized[0]["role"] == "master"
+        assert normalized[0]["has_embedding"] is True
+        assert normalized[0]["has_lm_head"] is True
+        assert normalized[1]["has_lm_head"] is False
+        assert stored == [normalized]
+
+    def test_manual_ranges_reject_master_outside_first_segment(self, monkeypatch):
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched.nodes = {
+            "master": NodeInfo(node_id="master", role="master", state=NodeState.ONLINE),
+            "worker": NodeInfo(node_id="worker", role="client", state=NodeState.ONLINE),
+        }
+
+        result = sched.override_layer_assignments([
+            {"node_id": "worker", "start_layer": 0, "end_layer": 12},
+            {"node_id": "master", "start_layer": 12, "end_layer": 24},
+        ])
+
+        assert result["status"] == "invalid"
+        assert "主节点" in result["reason"]
 
 
 # ================================================================
@@ -389,6 +638,38 @@ class TestGetLayerAssignments:
         assert assignments[0]["end_layer"] == 24
         assert assignments[0]["has_embedding"] is True
         assert assignments[0]["has_lm_head"] is True
+
+    def test_legacy_dynamic_cache_without_runtime_signature_is_recomputed(
+            self, sched, monkeypatch):
+        import scheduler as scheduler_mod
+
+        stale = {
+            "total": 24,
+            "strategy": "dynamic",
+            "assignments": [{
+                "node_id": "old-worker", "start_layer": 0, "end_layer": 24,
+                "layers_count": 24, "has_embedding": True, "has_lm_head": True,
+            }],
+        }
+
+        class FakeDb:
+            def get_layer_strategy(self):
+                return "dynamic"
+
+            def get_layer_assignments(self):
+                return stale
+
+            def set_layer_assignments(self, value):
+                self.saved = value
+
+        fake_db = FakeDb()
+        monkeypatch.setattr(scheduler_mod, "_get_db", lambda *a, **kw: fake_db)
+        monkeypatch.setattr(scheduler_mod, "_db_available", True)
+
+        result = sched.get_layer_assignments()
+
+        assert result["assignments"][0]["node_id"] == "master"
+        assert result.get("cache_key")
 
 
 # ================================================================
@@ -632,12 +913,13 @@ class TestVRAMConstraint:
         # 注入测试节点：
         # - gpu_node: 8GB 独显
         # - cpu_node: 无独显, 4GB RAM 可用
-        # - tiny_node: 0.5GB VRAM（模拟手机）
+        # - tiny_node: 0.5GB 共享显存、1GB RAM 可用（集显/CPU 模式）
         from scheduler import NodeInfo, NodeState
         s.nodes["gpu_node"] = NodeInfo(
             node_id="gpu_node", role="client", state=NodeState.ONLINE,
             device_info={
-                "gpu": {"vram_total_gb": 8.0, "name": "RTX 3070", "is_integrated": False},
+                "gpu": {"vram_total_gb": 8.0, "name": "RTX 3070",
+                        "is_integrated": False, "cuda_available": True},
                 "ram": {"total_gb": 16.0, "available_gb": 8.0},
                 "cpu": {"physical_cores": 8, "freq_max_mhz": 4000},
             },
@@ -671,9 +953,9 @@ class TestVRAMConstraint:
         assert mb == 4.0 * 1024  # 4 GB available
 
     def test_get_vram_tiny_gpu(self, sched):
-        """小显存 GPU 节点"""
+        """集显/CPU 节点应使用系统可用内存，不使用共享显存数字。"""
         mb = sched._get_node_vram_mb("tiny_node")
-        assert mb == 0.5 * 1024  # 512 MB
+        assert mb == 1.0 * 1024
 
     def test_get_vram_unknown_node(self, sched):
         """未知节点返回 0"""
@@ -690,7 +972,7 @@ class TestVRAMConstraint:
 
     def test_vram_constraint_insufficient(self, sched):
         """显存不足 — 应返回 False"""
-        # tiny_node 仅 512MB，装不下 24 层 + Embedding + LM Head
+        # tiny_node 仅 1GB 可用内存，装不下 24 层 + Embedding + LM Head
         ok, needed, available = sched._check_vram_constraint(
             "tiny_node", layers_count=24, has_embedding=True, has_lm_head=True,
         )
@@ -713,6 +995,54 @@ class TestVRAMConstraint:
         assert ok is True  # 不能判断 → 放行
         assert needed == 0
         assert available == 0
+
+    def test_qwen2_split_memory_uses_fp16_even_when_int4_requested(
+            self, sched, monkeypatch):
+        import api_server as _api
+
+        config = type("Qwen2Config", (), {
+            "model_type": "qwen2",
+            "hidden_size": 2048,
+            "intermediate_size": 5504,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "vocab_size": 151936,
+        })()
+        manager = type("Manager", (), {
+            "model": type("Model", (), {"config": config})(),
+            "quant_type": "int4",
+        })()
+        monkeypatch.setattr(_api, "model_manager", manager)
+
+        layer_mb, embedding_mb, lm_head_mb = sched._get_layer_memory_estimate_mb(
+            node_id="gpu_node",
+            fallback=(70, 580, 580),
+            quant_factors={"fp16": 1.0, "int4": 0.35},
+            configured_quant="int4",
+        )
+
+        assert layer_mb > 50
+        assert embedding_mb > 500
+        assert lm_head_mb == embedding_mb
+
+    def test_vram_transfer_moves_only_excess_layers(self, sched, monkeypatch):
+        assignments = [
+            {"node_id": "gpu_node", "role": "master", "layers_count": 10,
+             "has_embedding": True, "has_lm_head": True, "score": 100},
+            {"node_id": "cpu_node", "role": "client", "layers_count": 2,
+             "has_embedding": False, "has_lm_head": False, "score": 20},
+        ]
+
+        def constraint(node_id, count, has_embedding=False, has_lm_head=False):
+            limits = {"gpu_node": 8, "cpu_node": 8}
+            return count <= limits[node_id], float(count), float(limits[node_id])
+
+        monkeypatch.setattr(sched, "_check_vram_constraint", constraint)
+        result = sched._apply_vram_constraints(assignments)
+        by_id = {item["node_id"]: item for item in result}
+
+        assert by_id["gpu_node"]["layers_count"] == 8
+        assert by_id["cpu_node"]["layers_count"] == 4
 
 
 # ================================================================
@@ -772,6 +1102,134 @@ class TestPipelineReadiness:
             assert sched._all_pipeline_nodes_ready() is False
         finally:
             sched.get_layer_assignments = original
+
+    def test_push_waits_for_worker_load_ack(self, sched, monkeypatch):
+        """配置发出后不能立即 ready，必须等从节点加载 ACK。"""
+        from scheduler import NodeInfo, NodeState
+
+        assignment_info = {
+            "total": 24,
+            "strategy": "dynamic",
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 8,
+                 "has_embedding": True, "has_lm_head": False},
+                {"node_id": "client1", "start_layer": 8, "end_layer": 24,
+                 "has_embedding": False, "has_lm_head": True},
+            ],
+        }
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1",
+            role="client",
+            state=NodeState.ONLINE,
+            address="100.64.1.2:8888",
+            last_heartbeat=time.time(),
+            model_sha256="",
+        )
+        sent = []
+        sched._tcp_server = type("FakeServer", (), {
+            "_running": True,
+            "clients": {"client1": object()},
+            "broadcast_layer_config": lambda self, payload: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_layer_assignments", lambda: assignment_info)
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {
+            "model_id": "qwen-1_8b",
+            "model_path": "C:/models/qwen",
+            "model_sha256": "sha-qwen",
+            "total_layers": 24,
+        })
+
+        sched.push_layer_config_to_clients()
+
+        payload = sent[0]["client1"]
+        assert payload["node_id"] == "client1"
+        assert payload["model_id"] == "qwen-1_8b"
+        assert payload["model_sha256"] == "sha-qwen"
+        assert payload["total_layers"] == 24
+        assert "client1" not in sched._layer_config_pushed
+        assert sched._all_pipeline_nodes_ready() is False
+
+        sched._on_tcp_message("client1", {
+            "type": "layer_config_ack",
+            "data": {
+                "node_id": "client1",
+                "config_id": payload["config_id"],
+                "status": "ready",
+                "layer_range": [8, 24],
+                "model_sha256": "sha-qwen",
+                "engine": "pytorch",
+            },
+        })
+        assert sched._all_pipeline_nodes_ready() is True
+
+    def test_readiness_reports_worker_layer_load_error(self, sched, monkeypatch):
+        """在线不等于可计算，层加载错误必须成为明确的阻塞原因。"""
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+            address="100.64.1.2:8888", last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("FakeServer", (), {
+            "_running": True,
+            "clients": {"client1": object()},
+        })()
+        monkeypatch.setattr(sched, "get_layer_assignments", lambda: {
+            "total": 24,
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 8,
+                 "layers_count": 8},
+                {"node_id": "client1", "start_layer": 8, "end_layer": 24,
+                 "layers_count": 16},
+            ],
+        })
+        sched._layer_config_expected["client1"] = {
+            "config_id": "cfg-1", "model_id": "deepseek-r1",
+        }
+        sched._layer_config_acks["client1"] = {
+            "status": "error", "error": "missing tokenizer.json",
+        }
+
+        readiness = sched._get_pipeline_readiness()
+
+        assert readiness["ready"] is False
+        assert readiness["reason_code"] == "worker_layer_load_failed"
+        assert "missing tokenizer.json" in readiness["reason"]
+        assert readiness["workers"][0]["layer_status"] == "error"
+
+    def test_pipeline_status_requires_layer_ready_ack(self, sched, monkeypatch):
+        """管理状态不能把仅 TCP 在线但仍在同步模型的 worker 标为 active。"""
+        import api_server as _api
+
+        sched._role_override = "master"
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+            address="100.64.1.2:8888", last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("FakeServer", (), {
+            "_running": True,
+            "clients": {"client1": object()},
+        })()
+        monkeypatch.setattr(_api, "model_manager", type("Mgr", (), {
+            "is_loaded": True, "_engine_type": "pytorch",
+        })())
+        monkeypatch.setattr(sched, "get_layer_assignments", lambda: {
+            "total": 24,
+            "assignments": [
+                {"node_id": "master", "start_layer": 0, "end_layer": 8,
+                 "layers_count": 8},
+                {"node_id": "client1", "start_layer": 8, "end_layer": 24,
+                 "layers_count": 16},
+            ],
+        })
+        sched._layer_config_expected["client1"] = {
+            "config_id": "cfg-1", "model_id": "qwen-1_8b",
+        }
+
+        status = sched._get_pipeline_status()
+
+        assert status["online_worker_count"] == 1
+        assert status["active"] is False
+        assert status["readiness_reason_code"] == "worker_layer_loading"
+        assert status["workers"][0]["layer_status"] == "loading"
 
 
 # ================================================================
@@ -841,6 +1299,7 @@ class TestPipelineMessageDispatch:
 
     def test_layer_result_stores_in_dict(self, sched):
         """_handle_layer_result 应将结果存入并触发 event"""
+        sched._pipeline_active_tasks.add("task_1")
         msg = {
             "type": "layer_result",
             "data": {
@@ -859,6 +1318,17 @@ class TestPipelineMessageDispatch:
             result = sched._pipeline_results[key]
             assert result["task_id"] == "task_1"
             assert "hidden_states" in result
+
+    def test_late_layer_result_is_discarded(self, sched):
+        """已清理任务的迟到大张量不得重新进入结果缓存。"""
+        sched._handle_layer_result("client1", {
+            "data": {
+                "task_id": "task_late",
+                "node_id": "client1",
+                "hidden_states": "dGVzdA==",
+            },
+        })
+        assert sched._pipeline_results == {}
 
     def test_pipeline_done_clears_kv_cache(self, sched):
         """PIPELINE_DONE 应清理指定 task 的 KV 缓存"""
@@ -893,6 +1363,245 @@ class TestPipelineMessageDispatch:
         }
         # 不应抛出异常（即使 model_manager 不存在也会优雅处理）
         sched._on_tcp_message("master", msg)
+
+    def test_direct_layer_config_loads_range_and_sends_ack(self, sched, monkeypatch):
+        """真实线上单 assignment 载荷应加载层范围并回传 ready ACK。"""
+        import api_server as _api
+        from tcp_comm import MessageType, TCPClient
+
+        class MockModelManager:
+            is_loaded = False
+            _engine_type = "pytorch"
+            layer_range = None
+
+            def load_layer_range(self, start, end, **kwargs):
+                self.layer_range = (start, end)
+
+        sent = []
+        sched._tcp_client = type("FakeClient", (), {
+            "send_data": lambda self, payload, msg_type: sent.append((payload, msg_type)),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "client1")
+        monkeypatch.setattr(TCPClient, "_compute_local_model_sha256", lambda: "sha-qwen")
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+
+        sched._handle_layer_config("master", {
+            "node_id": "client1",
+            "config_id": "cfg-1",
+            "start_layer": 8,
+            "end_layer": 16,
+            "has_embedding": False,
+            "has_lm_head": False,
+            "model_sha256": "sha-qwen",
+        })
+
+        assert len(sent) == 1
+        payload, msg_type = sent[0]
+        assert msg_type == MessageType.LAYER_CONFIG_ACK
+        assert payload["status"] == "ready"
+        assert payload["config_id"] == "cfg-1"
+        assert payload["layer_range"] == [8, 16]
+        assert payload["model_sha256"] == "sha-qwen"
+
+    def test_deepseek_assignment_syncs_selected_model_before_loading(self, sched, monkeypatch):
+        """缺少 DeepSeek 时应先同步指定模型，再按真实层数加载。"""
+        import api_server as _api
+        import model_sync
+        from tcp_comm import TCPClient
+
+        load_calls = []
+
+        class MockModelManager:
+            is_loaded = False
+            _engine_type = "pytorch"
+            layer_range = None
+
+            def load_layer_range(self, start, end, **kwargs):
+                load_calls.append((start, end, kwargs))
+                self.layer_range = (start, end)
+
+        sent = []
+        fake_client = type("FakeClient", (), {
+            "server_host": "100.64.0.10",
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        sched._tcp_client = fake_client
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "client1")
+        hashes = iter(["old-sha", "deepseek-sha"])
+        monkeypatch.setattr(
+            TCPClient,
+            "_compute_local_model_sha256",
+            lambda **kwargs: next(hashes),
+        )
+        monkeypatch.setattr(
+            model_sync,
+            "resolve_worker_model_path",
+            lambda model_id: "C:/models/deepseek",
+        )
+        sync_calls = []
+        monkeypatch.setattr(
+            model_sync,
+            "ensure_model_available",
+            lambda host, port, model_id, sha: (
+                sync_calls.append((host, port, model_id, sha))
+                or "C:/models/deepseek"
+            ),
+        )
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+
+        sched._handle_layer_config("master", {
+            "node_id": "client1",
+            "config_id": "cfg-deepseek",
+            "start_layer": 10,
+            "end_layer": 28,
+            "has_embedding": False,
+            "has_lm_head": True,
+            "model_id": "deepseek-r1-distill-qwen-1.5b",
+            "model_sha256": "deepseek-sha",
+            "total_layers": 28,
+            "master_api_port": 8000,
+        })
+
+        assert sync_calls == [(
+            "100.64.0.10",
+            8000,
+            "deepseek-r1-distill-qwen-1.5b",
+            "deepseek-sha",
+        )]
+        assert load_calls[0][0:2] == (10, 28)
+        assert load_calls[0][2]["model_path"] == "C:/models/deepseek"
+        assert load_calls[0][2]["model_id"] == "deepseek-r1-distill-qwen-1.5b"
+        assert load_calls[0][2]["total_layers"] == 28
+        assert sent[0]["status"] == "ready"
+
+    def test_layer_config_is_deferred_until_active_task_finishes(self, sched, monkeypatch):
+        """新分层配置不能在已有 task 的 KV cache 生命周期中替换模型。"""
+        calls = []
+        sched._active_pipeline_task_ids.add("active-task")
+
+        sched._handle_layer_config("master", {"config_id": "cfg-next"})
+        assert calls == []
+        assert sched._pending_layer_config[1]["config_id"] == "cfg-next"
+
+        monkeypatch.setattr(
+            sched,
+            "_handle_layer_config_locked",
+            lambda client_id, data: calls.append((client_id, data["config_id"])),
+        )
+        sched._finish_local_pipeline_task("active-task")
+        assert calls == [("master", "cfg-next")]
+
+    def test_master_disconnect_clears_worker_pipeline_state(self, sched, monkeypatch):
+        """主连接丢失后，worker 不得永久保留 KV cache/活动任务。"""
+        sched.nodes["client1"] = NodeInfo(
+            node_id="client1", role="client", state=NodeState.ONLINE,
+        )
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "client1")
+        sched._kv_cache["task-lost"] = ("kv",)
+        sched._active_pipeline_task_ids.add("task-lost")
+
+        sched._on_master_connection_lost()
+
+        assert sched._kv_cache == {}
+        assert sched._active_pipeline_task_ids == set()
+        assert sched.nodes["client1"].error_count == 1
+
+    def test_layer_config_model_mismatch_sends_error_ack(self, sched, monkeypatch):
+        """从节点权重摘要不一致时不得加载，并应返回 error ACK。"""
+        import api_server as _api
+        from tcp_comm import TCPClient
+
+        load_calls = []
+        manager = type("MockModelManager", (), {
+            "is_loaded": False,
+            "_engine_type": "pytorch",
+            "load_layer_range": lambda self, *args, **kwargs: load_calls.append(args),
+        })()
+        sent = []
+        sched._tcp_client = type("FakeClient", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "client1")
+        monkeypatch.setattr(TCPClient, "_compute_local_model_sha256", lambda: "local-sha")
+        monkeypatch.setattr(_api, "model_manager", manager)
+
+        sched._handle_layer_config("master", {
+            "node_id": "client1",
+            "config_id": "cfg-bad",
+            "start_layer": 8,
+            "end_layer": 16,
+            "model_sha256": "master-sha",
+        })
+
+        assert load_calls == []
+        assert sent[0]["status"] == "error"
+        assert "SHA256 不一致" in sent[0]["error"]
+
+    def test_layer_config_ack_marks_ready_only_for_current_version(self, sched):
+        """只有当前 config_id、模型和层范围完全匹配的 ACK 才能置 ready。"""
+        expected = {
+            "node_id": "client1",
+            "config_id": "cfg-current",
+            "start_layer": 8,
+            "end_layer": 16,
+            "model_sha256": "sha-qwen",
+        }
+        sched._layer_config_expected["client1"] = expected
+
+        stale = {
+            "type": "layer_config_ack",
+            "data": {
+                "node_id": "client1",
+                "config_id": "cfg-old",
+                "status": "ready",
+                "layer_range": [8, 16],
+                "model_sha256": "sha-qwen",
+                "engine": "pytorch",
+            },
+        }
+        sched._on_tcp_message("client1", stale)
+        assert "client1" not in sched._layer_config_pushed
+
+        current = dict(stale)
+        current["data"] = dict(stale["data"], config_id="cfg-current")
+        sched._on_tcp_message("client1", current)
+        assert "client1" in sched._layer_config_pushed
+
+    def test_layer_config_retry_resends_same_config_id(self, sched):
+        sent = []
+        sched._tcp_server = MagicMock()
+        sched._tcp_server._running = True
+        sched._tcp_server.get_client_ids.return_value = ["client1"]
+        sched._tcp_server.send_layer_config.side_effect = (
+            lambda node_id, data: sent.append((node_id, data))
+        )
+        sched._layer_config_expected["client1"] = {
+            "node_id": "client1",
+            "config_id": "cfg-same",
+            "start_layer": 0,
+            "end_layer": 8,
+        }
+        sched._layer_config_retry_state["client1"] = {
+            "attempts": 1,
+            "next_retry": 0.0,
+        }
+
+        assert sched._retry_pending_layer_configs(now=10.0) == 1
+        assert sent == [("client1", sched._layer_config_expected["client1"])]
+        assert sent[0][1]["config_id"] == "cfg-same"
+
+    def test_duplicate_ready_config_only_resends_cached_ack(self, sched, monkeypatch):
+        sent = []
+        sched._last_layer_config_ack_payload = {
+            "config_id": "cfg-ready",
+            "status": "ready",
+        }
+        monkeypatch.setattr(
+            sched, "_send_layer_config_ack",
+            lambda payload: sent.append(payload) or True,
+        )
+        sched._schedule_layer_config("master", {"config_id": "cfg-ready"})
+        assert sent == [{"config_id": "cfg-ready", "status": "ready"}]
 
     def test_unknown_message_type_logs_debug(self, sched, caplog):
         """未知消息类型应记录 DEBUG 日志，便于排查协议不匹配。"""
@@ -942,6 +1651,19 @@ class TestPipelineMessageDispatch:
         assert node.address == "10.0.0.9:8888"
         assert "tcp_peer_addr" in node.device_info
         assert node.device_info["tcp_peer_addr"] == "10.0.0.9:51234"
+
+    def test_pipeline_peer_registration_is_not_added_as_worker(self, sched):
+        server = MagicMock()
+        sched._tcp_server = server
+        sched._on_tcp_message("client-peer", {
+            "type": "register",
+            "data": {
+                "role": "client",
+                "node_type": "pipeline_peer",
+            },
+        })
+        server.confirm_registration.assert_called_once_with("client-peer")
+        assert "client-peer" not in sched.nodes
 
     def test_tcp_disconnect_logs_and_marks_offline(self, sched, caplog):
         """TCP 断连应记录调度器层日志并标记节点离线。"""
@@ -1023,6 +1745,94 @@ class TestPipelineFallback:
         assert finished.is_set()
         assert entered.is_set()
         assert result_holder["result"]["response"] == "fallback"
+
+    def test_run_pipeline_safe_fallbacks_when_pipeline_returns_error(self, sched, monkeypatch):
+        """流水线单步返回 error 时，当前请求应自动回退到全模型推理。"""
+        import api_server as _api
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched,
+            "run_pipeline",
+            lambda prompt="", **kw: {"response": "", "error": "worker step failed"},
+        )
+
+        fallback_calls = []
+
+        def fake_fallback(prompt, **kwargs):
+            fallback_calls.append(kwargs)
+            return {
+                "response": "fallback ok",
+                "metrics": {"fallback_reason": kwargs.get("_fallback_reason")},
+            }
+
+        monkeypatch.setattr(sched, "_run_full_model_inference", fake_fallback)
+
+        result = sched.run_pipeline_safe("test prompt")
+
+        assert result["response"] == "fallback ok"
+        assert fallback_calls
+        assert "worker step failed" in fallback_calls[0]["_fallback_reason"]
+
+    def test_run_pipeline_safe_does_not_replay_after_stream_output(
+            self, sched, monkeypatch):
+        """已发送部分正文后失败时不能从头执行全模型并重复回答。"""
+        import api_server as _api
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+
+        def failed_pipeline(prompt="", **kwargs):
+            kwargs["_stream_callback"]({"token": "partial"})
+            return {"response": "", "error": "worker disconnected"}
+
+        monkeypatch.setattr(sched, "run_pipeline", failed_pipeline)
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail("部分输出后不能从头回退"),
+        )
+        events = []
+
+        result = sched.run_pipeline_safe(
+            "test prompt", _stream_callback=events.append,
+        )
+
+        assert result["error"] == "worker disconnected"
+        assert events == [{"token": "partial"}]
+
+    def test_queued_pipeline_does_not_replay_after_stream_output(
+            self, sched, monkeypatch):
+        """队列 worker 同样不得在部分输出后触发全模型重放。"""
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        events = []
+        kwargs = {"_stream_callback": events.append}
+        sched._track_stream_output(kwargs)
+
+        def failed_pipeline(prompt="", **pipeline_kwargs):
+            pipeline_kwargs["_stream_callback"]({"token": "partial"})
+            return {"response": "", "error": "worker disconnected"}
+
+        monkeypatch.setattr(sched, "run_pipeline", failed_pipeline)
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **fallback_kwargs: pytest.fail("部分输出后不能从头回退"),
+        )
+
+        result = sched._process_queued_pipeline_task("test prompt", **kwargs)
+
+        assert result["error"] == "worker disconnected"
+        assert events == [{"token": "partial"}]
 
 
 # ================================================================
@@ -1361,6 +2171,31 @@ class TestPipelineQueueIntegration:
             sched._all_pipeline_nodes_ready = original_ready
             sched.run_pipeline = original_run
 
+    def test_process_queued_task_fallbacks_when_pipeline_returns_error(self, sched, monkeypatch):
+        """队列 worker 中流水线返回 error 时也应自动回退。"""
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched,
+            "run_pipeline",
+            lambda prompt="", **kw: {"response": "", "error": "queued worker failed"},
+        )
+
+        fallback_calls = []
+
+        def fake_fallback(prompt, **kwargs):
+            fallback_calls.append(kwargs)
+            return {"response": "queue fallback ok"}
+
+        monkeypatch.setattr(sched, "_run_full_model_inference", fake_fallback)
+
+        result = sched._process_queued_pipeline_task(
+            prompt="queued", max_new_tokens=16,
+        )
+
+        assert result["response"] == "queue fallback ok"
+        assert fallback_calls
+        assert "queued worker failed" in fallback_calls[0]["_fallback_reason"]
+
     def test_run_pipeline_safe_respects_queue_busy(self, sched):
         """
         当 pipeline_queue.is_busy=True 时，run_pipeline_safe 应将请求入队。
@@ -1487,6 +2322,29 @@ class TestChainTopology:
         finally:
             sched._send_to_worker = original
 
+    def test_broadcast_pipeline_abort_continues_after_send_failure(self, sched):
+        """单个节点 ABORT 失败不应阻断其他节点清理。"""
+        sent_to = []
+
+        def mock_send(worker_id, data, msg_type):
+            sent_to.append(worker_id)
+            if worker_id == "client1":
+                raise ConnectionError("client1 down")
+
+        original = sched._send_to_worker
+        sched._send_to_worker = mock_send
+
+        try:
+            pipeline_nodes = [
+                {"node_id": "client1"},
+                {"node_id": "client2"},
+                {"node_id": "client3"},
+            ]
+            sched._broadcast_pipeline_abort(pipeline_nodes, "task_x", "测试取消")
+            assert sent_to == ["client1", "client2", "client3"]
+        finally:
+            sched._send_to_worker = original
+
     def test_wait_for_layer_result_multi_nodes(self, sched):
         """_wait_for_layer_result 应在多个节点中有任一返回时立即唤醒"""
         import threading
@@ -1520,6 +2378,113 @@ class TestChainTopology:
         assert len(result_holder) == 1
         assert result_holder[0] is not None
         assert result_holder[0].get("node_id") == "client2"
+
+    def test_wait_for_layer_result_consumes_result_that_arrived_before_event(self, sched):
+        """结果先于 event 注册到达时不应等待到超时。"""
+        import time
+
+        with sched._pipeline_lock:
+            sched._pipeline_results["task_fast:client2"] = {
+                "task_id": "task_fast",
+                "node_id": "client2",
+            }
+
+        t0 = time.time()
+        result = sched._wait_for_layer_result(
+            "task_fast", ["client1", "client2"], timeout=5.0,
+        )
+        elapsed = time.time() - t0
+
+        assert result is not None
+        assert result["node_id"] == "client2"
+        assert elapsed < 0.5
+
+    def test_node_disconnect_wakes_pending_pipeline_waiter(self, sched):
+        """节点断连应立即唤醒等待该节点结果的流水线线程。"""
+        import threading
+        import time
+
+        result_holder = []
+
+        def waiter():
+            result_holder.append(
+                sched._wait_for_layer_result("task_down", "client2", timeout=5.0)
+            )
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.1)
+
+        t0 = time.time()
+        sched._fail_pending_pipeline_results_for_node("client2", "client2 down")
+        t.join(timeout=1.0)
+        elapsed = time.time() - t0
+
+        assert len(result_holder) == 1
+        assert result_holder[0]["node_id"] == "client2"
+        assert "client2 down" in result_holder[0]["error"]
+        assert elapsed < 0.5
+
+    def test_send_layer_result_returns_false_when_tcp_client_missing(self, sched):
+        """worker 无主节点连接时，结果发送应返回 False 而不是静默吞掉。"""
+        sched._tcp_client = None
+
+        assert sched._send_layer_result("master", "task_send", error="failed") is False
+
+    def test_send_layer_result_disconnects_on_send_failure(self, sched):
+        """结果回传 send_data 抛错时应返回 False 并断开连接促使主节点快速感知。"""
+        class FailingClient:
+            _running = True
+
+            def __init__(self):
+                self.disconnected = False
+
+            def send_data(self, data, msg_type):
+                raise OSError("broken pipe")
+
+            def disconnect(self):
+                self.disconnected = True
+                self._running = False
+
+        client = FailingClient()
+        sched._tcp_client = client
+
+        assert sched._send_layer_result("master", "task_send", error="failed") is False
+        assert client.disconnected is True
+
+    def test_chain_ack_timeout_returns_error_before_layer_timeout(self, sched):
+        """链式转发已发送但下游未 ACK 时，应在 ACK 窗口内快速失败。"""
+        import time
+
+        sched._pipeline_active_tasks.add("task_ack")
+        sched._handle_chain_forward_ack(
+            "client1",
+            {
+                "data": {
+                    "task_id": "task_ack",
+                    "step": 0,
+                    "node_id": "client1",
+                    "target_node_id": "client2",
+                    "status": "sent",
+                }
+            },
+        )
+
+        t0 = time.time()
+        result = sched._wait_for_layer_result(
+            "task_ack",
+            ["client1", "client2"],
+            timeout=5.0,
+            ack_node_ids=["client2"],
+            ack_step=0,
+            ack_timeout=0.2,
+        )
+        elapsed = time.time() - t0
+
+        assert result is not None
+        assert result["node_id"] == "client2"
+        assert "未收到接收 ACK" in result["error"]
+        assert elapsed < 1.0
 
     def test_wait_for_layer_result_timeout_multi_nodes(self, sched):
         """多节点等待超时应返回 None"""
@@ -1559,28 +2524,102 @@ class TestChainTopology:
         finally:
             sched._handle_chain_forward = original
 
+    def test_chain_forward_ack_routing(self, sched):
+        """CHAIN_FORWARD_ACK 消息应路由并记录 ACK 状态。"""
+        sched._pipeline_active_tasks.add("task_ack_route")
+        msg = {
+            "type": "chain_forward_ack",
+            "data": {
+                "task_id": "task_ack_route",
+                "step": 1,
+                "node_id": "client2",
+                "status": "received",
+            },
+        }
+
+        sched._on_tcp_message("client2", msg)
+
+        assert sched._chain_ack_state["task_ack_route"][1]["client2"]["status"] == "received"
+
+    def test_chain_ack_received_is_not_overwritten_by_late_sent(self, sched):
+        """下游 received ACK 先到时，后到的 sent 回报不应覆盖已确认状态。"""
+        sched._pipeline_active_tasks.add("task_ack_order")
+        sched._handle_chain_forward_ack(
+            "client2",
+            {
+                "data": {
+                    "task_id": "task_ack_order",
+                    "step": 0,
+                    "node_id": "client2",
+                    "status": "received",
+                }
+            },
+        )
+        sched._handle_chain_forward_ack(
+            "client1",
+            {
+                "data": {
+                    "task_id": "task_ack_order",
+                    "step": 0,
+                    "node_id": "client1",
+                    "target_node_id": "client2",
+                    "status": "sent",
+                }
+            },
+        )
+
+        state = sched._chain_ack_state["task_ack_order"][0]["client2"]
+        assert state["status"] == "received"
+
+    def test_late_chain_ack_is_discarded(self, sched):
+        sched._handle_chain_forward_ack("client2", {
+            "data": {
+                "task_id": "task-finished",
+                "step": 0,
+                "node_id": "client2",
+                "status": "received",
+            },
+        })
+        assert sched._chain_ack_state == {}
+
     def test_chain_forward_delegates_to_layer_forward(self, sched):
         """_handle_chain_forward 应委托给 _handle_layer_forward"""
         called_with = []
+        ack_calls = []
 
         def mock_handler(cid, msg):
             called_with.append(cid)
 
         original = sched._handle_layer_forward
+        original_ack = sched._send_chain_forward_ack
         sched._handle_layer_forward = mock_handler
+        sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
 
         try:
-            msg = {"type": "chain_forward", "data": {"task_id": "t1"}}
+            msg = {"type": "chain_forward", "data": {"task_id": "t1", "step": 2}}
             sched._handle_chain_forward("client2", msg)
             assert len(called_with) == 1
             assert called_with[0] == "client2"
+            assert ack_calls
+            assert ack_calls[0]["task_id"] == "t1"
+            assert ack_calls[0]["status"] == "received"
         finally:
             sched._handle_layer_forward = original
+            sched._send_chain_forward_ack = original_ack
 
-    def test_layer_forward_with_chain_next_forwards(self, sched):
-        """_handle_layer_forward 有 chain_next 时应调用 _send_chain_forward"""
-        # 注意: 此测试仅验证链式转发分支，不实际执行模型推理
+    def test_layer_forward_with_chain_next_forwards_and_sends_ack(self, sched, monkeypatch):
+        """_handle_layer_forward 有 chain_next 时应直连转发并发送 sent ACK。"""
+        import api_server as _api
+        import torch
+
         forward_calls = []
+        ack_calls = []
+
+        class MockModelManager:
+            is_loaded = True
+
+            def forward_layers(self, **kwargs):
+                return {"hidden_states": torch.ones(1, 2, 4)}
 
         def mock_forward(target_id, data):
             forward_calls.append((target_id, data))
@@ -1591,17 +2630,69 @@ class TestChainTopology:
 
         original_fwd = sched._send_chain_forward
         original_send = sched._send_layer_result
+        original_ack = sched._send_chain_forward_ack
         sched._send_chain_forward = mock_forward
         sched._send_layer_result = mock_send_result
+        sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
+        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_record_local_pipeline_participation", lambda *a, **kw: True)
 
         try:
-            # 构造带 chain_next 的 LAYER_FORWARD（模拟首节点场景）
-            # 实际调用会因没有 model_manager 而抛异常，此处仅验证不崩溃
-            # 完整集成测试需要真实模型环境
-            pass  # _handle_layer_forward 需要 model_manager，留待集成测试
+            msg = {
+                "data": {
+                    "task_id": "task_forward",
+                    "step": 3,
+                    "input_ids": [[1, 2]],
+                    "use_kv_cache": False,
+                    "chain_next": {"node_id": "client2"},
+                    "chain_remaining": [],
+                }
+            }
+            sched._handle_layer_forward("master", msg)
+
+            assert len(forward_calls) == 1
+            assert forward_calls[0][0] == "client2"
+            assert ack_calls
+            assert ack_calls[0]["task_id"] == "task_forward"
+            assert ack_calls[0]["step"] == 3
+            assert ack_calls[0]["target_node_id"] == "client2"
+            assert ack_calls[0]["status"] == "sent"
         finally:
             sched._send_chain_forward = original_fwd
             sched._send_layer_result = original_send
+            sched._send_chain_forward_ack = original_ack
+
+    def test_master_relay_records_chain_sent_ack(self, sched):
+        """L2 主节点中转成功后应记录发往目标节点的 sent ACK 状态。"""
+        sent = []
+
+        def mock_send(worker_id, data, msg_type):
+            sent.append((worker_id, data, msg_type))
+
+        original = sched._send_to_worker
+        sched._send_to_worker = mock_send
+        sched._pipeline_active_tasks.add("task_relay")
+
+        try:
+            sched._handle_layer_result(
+                "client1",
+                {
+                    "data": {
+                        "task_id": "task_relay",
+                        "step": 4,
+                        "node_id": "client1",
+                        "_relay_to": "client2",
+                        "hidden_states": "dGVzdA==",
+                    }
+                },
+            )
+
+            assert sent and sent[0][0] == "client2"
+            state = sched._chain_ack_state["task_relay"][4]["client2"]
+            assert state["status"] == "sent"
+            assert state["reporter_node_id"] == "client1"
+        finally:
+            sched._send_to_worker = original
 
     def test_chain_info_built_in_run_pipeline(self, sched):
         """run_pipeline 应构建链式拓扑信息"""
@@ -1696,7 +2787,7 @@ class TestVramConstraintRecalculation:
         result = sched._apply_vram_constraints(assignments)
         if len(result) > 0:
             assert result[0]["has_embedding"] is True
-            assert result[-1]["has_lm_head"] is True
+            assert any(item["has_lm_head"] for item in result)
 
 
 # ================================================================
@@ -1908,6 +2999,24 @@ class TestCheckMasterHealthTcp:
         result = sched.check_master_health()
         assert "tcp_connected" in result, \
             "check_master_health 返回值应包含 tcp_connected 字段"
+
+    def test_registered_tcp_is_online_without_database(self, sched):
+        """无数据库时，已注册且活跃的 TCP 连接仍必须判定主节点在线。"""
+        sched._role_override = "client"
+        sched._tcp_client = type("MockTCPClient", (), {
+            "is_registered": True,
+            "_running": True,
+            "server_host": "100.64.0.10",
+            "server_port": 8888,
+            "sock": object(),
+        })()
+
+        result = sched.check_master_health()
+
+        assert result["master_online"] is True
+        assert result["source"] == "tcp"
+        assert result["tcp_connected"] is True
+        assert result["master_host"] == "100.64.0.10"
 
 
 # ================================================================
@@ -2158,7 +3267,7 @@ class TestNormalizeMasterAnchor:
         assert result[0]["node_id"] == "master"
         assert result[0]["has_embedding"] is True
         assert result[0]["start_layer"] == 0
-        assert result[-1]["has_lm_head"] is True
+        assert result[0]["has_lm_head"] is True
         assert sum(a["layers_count"] for a in result) == 24
 
     def test_no_master_in_node_list_passes_through(self, sched):
@@ -2256,17 +3365,42 @@ class TestPipelineOrchestrationIntegration:
                 hostname=nid, device_info=profile,
                 last_heartbeat=time.time(),
             )
-        # 层配置标记为"已推送"
-        s._layer_config_pushed.update(["worker1", "worker2"])
         # 模拟 TCP 服务端已知这些 client
         s._tcp_server.clients = {"worker1": True, "worker2": True}
-        # 移除 get_layer_assignments 的 DB 依赖，直接用 compute 结果
+        assignments = s.compute_layer_assignment()
+        # 移除 get_layer_assignments 的 DB 依赖，固定同一份当前分配。
         monkeypatch.setattr(s, "get_layer_assignments", lambda: {
             "total": 24,
             "strategy": "dynamic",
-            "assignments": s.compute_layer_assignment(),
+            "assignments": assignments,
         })
+        for assignment in assignments:
+            node_id = assignment["node_id"]
+            if node_id == "master":
+                continue
+            expected = {
+                "config_id": "cfg-current",
+                "start_layer": assignment["start_layer"],
+                "end_layer": assignment["end_layer"],
+                "model_sha256": "sha-current",
+            }
+            s._layer_config_expected[node_id] = expected
+            s._layer_config_acks[node_id] = {
+                "config_id": "cfg-current",
+                "status": "ready",
+                "layer_range": [assignment["start_layer"], assignment["end_layer"]],
+                "model_sha256": "sha-current",
+                "engine": "pytorch",
+            }
+            s._layer_config_pushed.add(node_id)
         return s
+
+    def test_stale_layer_ack_does_not_make_pipeline_ready(self, sched_with_workers):
+        """当前分配变化后，旧层范围 ACK 必须立即失效。"""
+        sched_with_workers._layer_config_acks["worker1"]["layer_range"] = [0, 1]
+        readiness = sched_with_workers._get_pipeline_readiness()
+        assert readiness["ready"] is False
+        assert readiness["reason_code"] == "worker_layer_loading"
 
     # ----------------------------------------------------------
     # 场景 1：master 在线，所有 worker 离线 → fallback 本地推理
@@ -2366,8 +3500,9 @@ class TestPipelineOrchestrationIntegration:
 
         master.device_info = PROFILE_IGPU_ONLY
         vram_igpu = sched_master._get_node_vram_mb("master")
-        assert vram_igpu == 0.5 * 1024, \
-            f"纯集显 VRAM 应为 512MB, 实际: {vram_igpu}"
+        # 共享显存不能作为独立容量；若画像未提供 available_gb，则返回未知 0。
+        assert vram_igpu == 0, \
+            f"纯集显应按系统可用内存计量，缺少 available_gb 时应为未知 0，实际: {vram_igpu}"
 
     # ----------------------------------------------------------
     # 场景 4：Android 节点状态管理
@@ -2546,19 +3681,26 @@ class TestPipelineOrchestrationIntegration:
         monkeypatch.setattr(sched_with_workers, "_send_to_worker",
                            lambda wid, data, mtype: send_calls.append((wid, data, mtype)))
 
-        # 模拟 worker 返回 logits（末节点）
+        # 模拟无 LM Head 的 worker 返回尾层 hidden states，由 master 执行输出头。
         # _wait_for_layer_result 内部已将 base64 解码为 bytes
         import torch
         from tcp_comm import serialize_tensor_fast
         fake_logits = torch.randn(1, 8, 151936)
-        fake_logits_raw = serialize_tensor_fast(fake_logits)  # bytes
+        fake_hidden = torch.randn(1, 8, 2048)
+        fake_hidden_raw = serialize_tensor_fast(fake_hidden)
+        lm_head_calls = []
+        monkeypatch.setattr(
+            sched_with_workers,
+            "_run_master_lm_head",
+            lambda hidden: lm_head_calls.append(hidden.shape) or fake_logits,
+        )
 
         monkeypatch.setattr(sched_with_workers, "_wait_for_layer_result",
                            lambda tid, nids, timeout: {
                                "task_id": tid,
                                "node_id": nids[-1] if isinstance(nids, list) else nids,
                                "step": 0,
-                               "logits": fake_logits_raw,
+                               "hidden_states": fake_hidden_raw,
                            })
 
         result = sched_with_workers.run_pipeline(
@@ -2572,8 +3714,88 @@ class TestPipelineOrchestrationIntegration:
         # 验证发送了 LAYER_FORWARD 给 worker
         layer_forwards = [c for c in send_calls if c[2] is not None]
         assert len(layer_forwards) >= 1, "应发送 LAYER_FORWARD 给 worker"
-        # 验证返回了结果
-        assert "response" in result or "error" in result
+        assert lm_head_calls, "worker 尾层 hidden states 应返回 master 执行 LM Head"
+        # 验证分布式执行标记与主从任务统计来自同一条已完成流水线任务
+        assert result["metrics"]["distributed_used"] is True
+        assert set(result["metrics"]["workers_used"]) == {"worker1", "worker2"}
+        assert set(result["metrics"]["workers_counted"]) == {"worker1", "worker2"}
+        assert sched_with_workers.nodes["master"].task_count == 1
+        assert sched_with_workers.nodes["worker1"].task_count == 1
+        assert sched_with_workers.nodes["worker2"].task_count == 1
+
+    def test_run_pipeline_builds_native_prompt_from_history(
+            self, sched_with_workers, monkeypatch):
+        import api_server as _api
+        import torch
+        from tcp_comm import serialize_tensor_fast
+
+        prompts = []
+
+        class Tokenizer:
+            eos_token_id = 2
+
+            def apply_chat_template(self, messages, tokenize=False,
+                                    add_generation_prompt=True):
+                assert messages == [
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "answer"},
+                    {"role": "user", "content": "second"},
+                ]
+                return "native-history-prompt"
+
+            def __call__(self, prompt, **kwargs):
+                prompts.append(prompt)
+                return {
+                    "input_ids": torch.tensor([[1, 3]]),
+                    "attention_mask": torch.ones(1, 2, dtype=torch.long),
+                }
+
+            def decode(self, ids, **kwargs):
+                return "answer"
+
+        class Manager:
+            is_loaded = True
+            _engine_type = "pytorch"
+            tokenizer = Tokenizer()
+
+            def ensure_layer_range(self, *args, **kwargs):
+                pass
+
+            def forward_layers(self, **kwargs):
+                return {"hidden_states": torch.randn(1, 2, 8)}
+
+            def get_device(self):
+                return torch.device("cpu")
+
+            def _merge_stop_sequences(self, _value):
+                return []
+
+            def _get_generation_eos_token_ids(self, _stops):
+                return 2
+
+        monkeypatch.setattr(_api, "model_manager", Manager())
+        monkeypatch.setattr(sched_with_workers, "_send_to_worker", lambda *a, **kw: None)
+        hidden = serialize_tensor_fast(torch.randn(1, 2, 8))
+        monkeypatch.setattr(
+            sched_with_workers, "_wait_for_layer_result_with_ack",
+            lambda *a, **kw: {"hidden_states": hidden},
+        )
+        monkeypatch.setattr(
+            sched_with_workers, "_run_master_lm_head",
+            lambda _hidden: torch.tensor([[[0.0, 0.0, 100.0, 0.0]]]),
+        )
+
+        sched_with_workers.run_pipeline(
+            "second",
+            max_new_tokens=1,
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "second"},
+            ],
+        )
+
+        assert prompts == ["native-history-prompt"]
 
     def test_run_pipeline_safe_immediate_path_locks(self, sched_with_workers, monkeypatch):
         """立即执行路径应正确管理 inference_lock（不产生死锁或泄漏）"""
@@ -2634,6 +3856,59 @@ class TestPipelineOrchestrationIntegration:
         assert "error" not in result or result.get("response"), \
             f"不应返回致命错误: {result.get('error', '')}"
 
+    def test_run_pipeline_stream_uses_safe_scheduler(self, sched_master, monkeypatch):
+        """fast SSE 也必须经过排队、互斥和全模型回退入口。"""
+        calls = []
+
+        def safe(prompt, **kwargs):
+            calls.append(prompt)
+            kwargs["_stream_callback"]({
+                "done": True, "response": "ok", "metrics": {},
+            })
+            return {"response": "ok", "metrics": {}}
+
+        monkeypatch.setattr(sched_master, "run_pipeline_safe", safe)
+        monkeypatch.setattr(
+            sched_master,
+            "_run_pipeline",
+            lambda *args, **kwargs: pytest.fail("不能绕过 run_pipeline_safe"),
+        )
+
+        events = list(sched_master.run_pipeline_stream("hello"))
+        assert calls == ["hello"]
+        assert events[-1]["done"] is True
+        assert events[-1]["response"] == "ok"
+
+    def test_run_pipeline_unexpected_exception_aborts_registered_context(
+            self, sched_master, monkeypatch):
+        """采样/解码等未预期异常也必须清理所有节点 KV cache。"""
+        aborts = []
+        clears = []
+
+        def fail(*args, **kwargs):
+            sched_master._pipeline_context.stack.append({
+                "task_id": "task-exception",
+                "pipeline_nodes": [{"node_id": "worker1"}],
+            })
+            raise RuntimeError("sampling failed")
+
+        monkeypatch.setattr(sched_master, "_run_pipeline", fail)
+        monkeypatch.setattr(
+            sched_master,
+            "_broadcast_pipeline_abort",
+            lambda nodes, task_id, reason: aborts.append((nodes, task_id, reason)),
+        )
+        monkeypatch.setattr(
+            sched_master,
+            "_clear_pipeline_runtime_state",
+            lambda task_id: clears.append(task_id),
+        )
+
+        with pytest.raises(RuntimeError, match="sampling failed"):
+            sched_master.run_pipeline("hello")
+        assert aborts[0][1] == "task-exception"
+        assert clears == ["task-exception"]
+
 
 # ================================================================
 # Phase 7 P0: _effective_role 实现逻辑测试
@@ -2663,6 +3938,61 @@ class TestEffectiveRole:
         role = s._effective_role()
         # 空字符串为 falsy → or 短路 → NODE_ROLE
         assert role in ("master", "client")
+
+
+class TestProvisionalMasterRole:
+    """Fresh packaged nodes can join an existing master without DB access."""
+
+    @staticmethod
+    def _set_master_role(monkeypatch, tmp_path):
+        import config as cfg
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(cfg, "NODE_ROLE", "master", raising=False)
+        monkeypatch.setattr(cfg, "NODE_ID", "master", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "master", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ID", "master", raising=False)
+        monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
+        monkeypatch.delenv("QLH_NODE_ROLE", raising=False)
+
+    def test_unconfigured_db_unavailable_master_is_provisional(self, monkeypatch, tmp_path):
+        self._set_master_role(monkeypatch, tmp_path)
+        sched = Scheduler()
+        sched._master_identity_verified = True
+        sched._master_identity_reason = "db_unavailable"
+
+        role = sched.get_my_role()
+
+        assert role["node_role"] == "unknown"
+        assert role["runtime_node_role"] == "master"
+        assert role["is_master"] is False
+        assert role["is_provisional"] is True
+        assert role["can_join_existing_master"] is True
+
+    def test_database_verified_master_is_not_provisional(self, monkeypatch, tmp_path):
+        self._set_master_role(monkeypatch, tmp_path)
+        sched = Scheduler()
+        sched._master_identity_verified = True
+        sched._master_identity_reason = "match"
+
+        role = sched.get_my_role()
+
+        assert role["node_role"] == "master"
+        assert role["is_master"] is True
+        assert role["is_provisional"] is False
+        assert role["can_join_existing_master"] is False
+
+    def test_master_with_connected_clients_cannot_switch(self, monkeypatch, tmp_path):
+        self._set_master_role(monkeypatch, tmp_path)
+        sched = Scheduler()
+        sched._master_identity_reason = "db_unavailable"
+        sched._tcp_server = MagicMock()
+        sched._tcp_server.get_client_ids.return_value = ["client-1"]
+
+        result = sched.activate_client_mode()
+
+        assert result["status"] == "denied"
+        assert sched._effective_role() == "master"
 
 
 # ================================================================
@@ -2850,6 +4180,97 @@ class TestForwardInferenceRequestId:
         from scheduler import Scheduler
         sig = inspect.signature(Scheduler.start_infer_task)
         assert "request_id" in sig.parameters
+
+    def test_forward_result_is_correlated_and_errors_are_not_reported_as_ok(
+            self, monkeypatch):
+        import scheduler as scheduler_mod
+
+        sched = Scheduler()
+        sched._role_override = "client"
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client")
+
+        class FakeClient:
+            _running = True
+            is_registered = True
+            sock = object()
+
+            def send_data(self, data, msg_type):
+                if msg_type.value != "infer_forward":
+                    return
+                sched._on_tcp_message("master", {
+                    "type": "infer_result",
+                    "data": {
+                        "forward_request_id": data["forward_request_id"],
+                        "task_id": "task-x",
+                        "status": "error",
+                        "error": "worker failed",
+                        "metrics": {"distributed_used": False},
+                    },
+                })
+
+        sched._tcp_client = FakeClient()
+        result = sched.forward_inference_to_master("hello", timeout=1)
+        assert result["status"] == "error"
+        assert result["error"] == "worker failed"
+
+    def test_forward_timeout_sends_cancel(self, monkeypatch):
+        import scheduler as scheduler_mod
+
+        sched = Scheduler()
+        sched._role_override = "client"
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client")
+        sent = []
+
+        class FakeClient:
+            _running = True
+            is_registered = True
+            sock = object()
+
+            def send_data(self, data, msg_type):
+                sent.append((data, msg_type.value))
+
+        sched._tcp_client = FakeClient()
+        result = sched.forward_inference_to_master("hello", timeout=0.01)
+        assert result["status"] == "timeout"
+        assert [kind for _, kind in sent] == ["infer_forward", "infer_cancel"]
+        assert sent[0][0]["forward_request_id"] == sent[1][0]["forward_request_id"]
+
+    def test_forwarded_success_is_sent_before_task_cleanup_regression(self):
+        sched = Scheduler()
+        sent = []
+        finished = threading.Event()
+        sched.start_infer_task = lambda *args, **kwargs: "task-demo"
+        sched.run_pipeline_safe = lambda **kwargs: {
+            "response": "computed",
+            "metrics": {"distributed_used": True},
+        }
+        sched.complete_infer_task = lambda *args, **kwargs: None
+
+        def capture(*args, **kwargs):
+            sent.append((args, kwargs))
+            finished.set()
+
+        sched._send_infer_result = capture
+        sched.handle_infer_forward("client1", {
+            "data": {
+                "prompt": "x",
+                "forward_request_id": "forward-demo",
+            },
+        })
+        assert finished.wait(1)
+        args, kwargs = sent[0]
+        assert args[1:4] == ("task-demo", "computed", {"distributed_used": True})
+        assert kwargs["forward_request_id"] == "forward-demo"
+        assert kwargs.get("status", "ok") == "ok"
+
+    def test_start_task_does_not_mark_workers_busy(self, monkeypatch):
+        sched = Scheduler()
+        sched.nodes["worker"] = NodeInfo(
+            node_id="worker", role=NodeRole.CLIENT, state=NodeState.ONLINE,
+        )
+        task_id = sched.start_infer_task("hello")
+        assert task_id.startswith("task_")
+        assert sched.nodes["worker"].state == NodeState.ONLINE
 
 
 class TestRequestNodeLogs:
@@ -3052,12 +4473,14 @@ class TestConnectToMasterBootstrapRecovery:
         class FakeTCPClient:
             attempts = 0
 
-            def __init__(self, server_host, server_port, client_id, role, advertise_port=None):
+            def __init__(self, server_host, server_port, client_id, role,
+                         advertise_port=None, device_info=None):
                 self.server_host = server_host
                 self.server_port = server_port
                 self.client_id = client_id
                 self.role = role
                 self.advertise_port = advertise_port
+                self.device_info = dict(device_info or {})
                 self.last_register_error = ""
                 self.is_registered = False
                 self._running = False
@@ -3085,3 +4508,239 @@ class TestConnectToMasterBootstrapRecovery:
         assert first_connect_calls == [("100.64.0.10", 8000, "client-old", "pc")]
         assert cfg.NODE_ID == "client-new"
         assert scheduler_mod.NODE_ID == "client-new"
+
+    def test_existing_registered_connection_is_reused(self):
+        sched = Scheduler()
+        sched._role_override = "client"
+        existing = MagicMock()
+        existing._running = True
+        existing.is_registered = True
+        existing.sock = object()
+        existing.server_host = "100.64.0.10"
+        existing.server_port = 8888
+        sched._tcp_client = existing
+
+        result = sched.connect_to_master("100.64.0.10", 8888)
+
+        assert result["status"] == "connected"
+        assert result["reused"] is True
+        existing.disconnect.assert_not_called()
+
+    def test_failed_candidate_connection_preserves_existing_connection(
+            self, monkeypatch):
+        import scheduler as scheduler_mod
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(cfg, "NODE_ID", "client-existing", raising=False)
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "shared-secret", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(
+            scheduler_mod, "NODE_ID", "client-existing", raising=False,
+        )
+
+        class FailedTCPClient:
+            instances = []
+
+            def __init__(self, server_host, server_port, client_id, role,
+                         advertise_port=None, device_info=None):
+                self.server_host = server_host
+                self.server_port = server_port
+                self.client_id = client_id
+                self.role = role
+                self.last_register_error = "candidate unavailable"
+                self.is_registered = False
+                self._running = False
+                self.sock = None
+                self.on_disconnect = None
+                self.disconnect_calls = 0
+                type(self).instances.append(self)
+
+            def connect(self, on_message=None):
+                return False
+
+            def disconnect(self):
+                self.disconnect_calls += 1
+
+        sched = Scheduler()
+        sched._role_override = "client"
+        previous_callback = object()
+        existing = MagicMock()
+        existing._running = True
+        existing.is_registered = True
+        existing.sock = object()
+        existing.server_host = "100.64.0.10"
+        existing.server_port = 8888
+        existing.client_id = "client-existing"
+        existing.on_disconnect = previous_callback
+        sched._tcp_client = existing
+        monkeypatch.setattr("tcp_comm.TCPClient", FailedTCPClient)
+
+        result = sched.connect_to_master("100.64.0.20", 8888)
+
+        assert result["status"] == "failed"
+        assert sched._tcp_client is existing
+        assert existing.on_disconnect is previous_callback
+        existing.disconnect.assert_not_called()
+        assert FailedTCPClient.instances[0].disconnect_calls == 1
+
+    def test_stale_connection_disconnect_does_not_clear_current_state(self):
+        sched = Scheduler()
+        current = object()
+        stale = object()
+        sched._tcp_client = current
+        sched._kv_cache["active"] = "kv"
+
+        sched._on_master_connection_lost(stale)
+
+        assert sched._kv_cache == {"active": "kv"}
+
+    def test_layer_config_callback_can_use_client_before_connect_returns(self, monkeypatch):
+        """REGISTER 后立即到达的层配置必须能看到 TCP 客户端和最终 node_id。"""
+        import scheduler as scheduler_mod
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(cfg, "NODE_ID", "client-race", raising=False)
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "shared-secret", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ID", "client-race", raising=False)
+
+        observed = []
+
+        class FakeTCPClient:
+            def __init__(self, server_host, server_port, client_id, role,
+                         advertise_port=None, device_info=None):
+                self.server_host = server_host
+                self.server_port = server_port
+                self.client_id = client_id
+                self.role = role
+                self.device_info = dict(device_info or {})
+                self.last_register_error = ""
+                self.is_registered = True
+                self._running = True
+                self.sock = object()
+
+            def connect(self, on_message=None):
+                on_message({"type": "layer_config", "data": {}})
+                return True
+
+            def send_data(self, data, msg_type):
+                pass
+
+        sched = Scheduler()
+        sched._role_override = "client"
+
+        def observe(_client_id, _msg):
+            observed.append((sched._tcp_client.client_id, sched.get_effective_node_id()))
+
+        monkeypatch.setattr(sched, "_on_tcp_message", observe)
+        monkeypatch.setattr("tcp_comm.TCPClient", FakeTCPClient)
+
+        result = sched.connect_to_master("100.64.0.10", 8888)
+
+        assert result["status"] == "connected"
+        assert observed == [("client-race", "client-race")]
+
+    def test_profile_completed_during_connect_is_reported_after_registration(
+            self, monkeypatch):
+        import config as cfg
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(cfg, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(cfg, "NODE_ID", "client-profile", raising=False)
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "shared-secret", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client", raising=False)
+        monkeypatch.setattr(scheduler_mod, "NODE_ID", "client-profile", raising=False)
+        sent = []
+        sched = Scheduler()
+        sched._role_override = "client"
+        sched._local_device_profile = None
+
+        class FakeTCPClient:
+            def __init__(self, server_host, server_port, client_id, role,
+                         advertise_port=None, device_info=None):
+                self.client_id = client_id
+                self.server_host = server_host
+                self.server_port = server_port
+                self.device_info = dict(device_info or {})
+                self.is_registered = False
+                self._running = False
+                self.last_register_error = ""
+
+            def connect(self, on_message=None):
+                sched._local_device_profile = PROFILE_IGPU_ONLY
+                self.is_registered = True
+                self._running = True
+                return True
+
+            def send_data(self, data, msg_type):
+                sent.append((data, msg_type.value))
+
+        monkeypatch.setattr("tcp_comm.TCPClient", FakeTCPClient)
+
+        result = sched.connect_to_master("100.64.0.10", 8888)
+
+        assert result["status"] == "connected"
+        assert any(
+            msg_type == "status_res" and data["device_info"] == PROFILE_IGPU_ONLY
+            for data, msg_type in sent
+        )
+
+
+def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
+    import scheduler as scheduler_mod
+    import config as cfg
+
+    monkeypatch.setattr(scheduler_mod, "RUN_MODE", "distributed", raising=False)
+    monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "master", raising=False)
+    monkeypatch.setattr(cfg, "NODE_ROLE", "master", raising=False)
+
+    class FailedTCPServer:
+        def __init__(self, host, port):
+            self.host = host
+            self.port = port
+
+        def start(self, on_message=None, on_disconnect=None):
+            raise OSError("address already in use")
+
+    sched = Scheduler()
+    register_master = MagicMock()
+    monkeypatch.setattr("tcp_comm.TCPServer", FailedTCPServer)
+    monkeypatch.setattr("tcp_comm.detect_lan_ip", lambda: "100.64.0.10")
+    monkeypatch.setattr("tcp_comm.get_mac_addresses", lambda: ["001122334455"])
+    monkeypatch.setattr(sched, "init_nodes", lambda: None)
+    monkeypatch.setattr(
+        sched,
+        "_verify_master_identity",
+        lambda: setattr(sched, "_master_identity_reason", "first_run"),
+    )
+    monkeypatch.setattr(sched, "_register_master_in_db", register_master)
+    monkeypatch.setattr(sched, "_start_master_db_heartbeat", MagicMock())
+    monkeypatch.setattr(sched, "deactivate_spare_master_on_startup", lambda: None)
+    monkeypatch.setattr(sched, "_start_database_reconnect_monitor", lambda: None)
+    monkeypatch.setattr(sched, "can_join_existing_master", lambda: False)
+
+    try:
+        sched.start(host="0.0.0.0", port=8888)
+
+        assert sched._running is True
+        assert sched._tcp_server is None
+        assert sched.pipeline_queue._running is True
+        register_master.assert_not_called()
+    finally:
+        sched.stop()
+
+
+def test_distributed_toggle_survives_without_database(monkeypatch):
+    """数据库关闭时，运行时分布式开关仍应立即生效。"""
+    import scheduler as scheduler_mod
+
+    sched = Scheduler()
+    monkeypatch.setattr(scheduler_mod, "_get_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler_mod, "_db_available", False)
+
+    sched.set_distributed_inference_enabled(False)
+    assert sched.get_distributed_inference_enabled() is False
+    sched.set_distributed_inference_enabled(True)
+    assert sched.get_distributed_inference_enabled() is True

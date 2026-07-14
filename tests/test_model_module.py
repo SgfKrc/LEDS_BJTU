@@ -123,6 +123,30 @@ class TestForwardLayersInputValidation:
         with pytest.raises(RuntimeError, match="仅支持 PyTorch 引擎"):
             mgr.forward_layers(hidden_states=torch.randn(1, 4, 128))
 
+    def test_forward_layers_waits_for_model_lock(self):
+        """模型切换/分层重载持锁时，forward 不得读取半更新状态。"""
+        import threading
+        import time
+
+        mgr = ModelManager()
+        finished = threading.Event()
+
+        def call_forward():
+            with pytest.raises(RuntimeError, match="模型未加载"):
+                mgr.forward_layers(input_ids=torch.tensor([[1]]))
+            finished.set()
+
+        mgr._lock.acquire()
+        try:
+            thread = threading.Thread(target=call_forward)
+            thread.start()
+            time.sleep(0.05)
+            assert not finished.is_set()
+        finally:
+            mgr._lock.release()
+        thread.join(timeout=1)
+        assert finished.is_set()
+
 
 # ================================================================
 # forward_layers 首节点测试（含 Embedding，无 LM Head）
@@ -362,6 +386,17 @@ class TestForwardLayersMatchesFullModel:
         assert "logits" in result
         assert "hidden_states" not in result
 
+    def test_master_segment_can_defer_lm_head(self):
+        """master 保留 LM Head 时仍可先输出 hidden states 交给 worker。"""
+        result = self.mgr.forward_layers(
+            input_ids=torch.tensor([[1, 2, 3]]),
+            apply_lm_head=False,
+        )
+
+        assert "hidden_states" in result
+        assert "logits" not in result
+        assert result["hidden_states"].shape == (1, 3, TINY_CONFIG.hidden_size)
+
 
 # ================================================================
 # 端到端流水线模拟测试（首→中→末 三节点串联）
@@ -589,6 +624,26 @@ class TestLoadLayerRangeIntegration:
         assert "hidden_states" in result
         assert result["hidden_states"].shape == (1, 3, 128)
 
+    def test_ensure_layer_range_reuses_active_model_path(self, monkeypatch):
+        """DeepSeek 活动模型进入分层模式时不能回落到默认 Qwen 路径。"""
+        mgr = ModelManager()
+        mgr.model = _make_tiny_model()
+        mgr._engine_type = "pytorch"
+        mgr._model_path = "G:/models/deepseek"
+        mgr._full_model_path = "G:/models/deepseek"
+        calls = []
+        monkeypatch.setattr(
+            mgr,
+            "load_layer_range",
+            lambda *args, **kwargs: calls.append(kwargs),
+        )
+
+        mgr.ensure_layer_range(
+            0, 2, has_embedding=True, has_lm_head=True,
+        )
+
+        assert calls[0]["model_path"] == "G:/models/deepseek"
+
     def test_load_then_forward_last_node(self):
         """通过 load_layer_range 加载末节点 → forward_layers 应产出 logits"""
         mgr = ModelManager()
@@ -621,6 +676,89 @@ class TestLoadLayerRangeIntegration:
         result = mgr.forward_layers(hidden_states=hs_in)
         assert "hidden_states" in result
         assert result["hidden_states"].shape == (2, 4, 128)
+
+    def test_selective_qwen2_safetensors_loads_only_assigned_layers(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """真实 safetensors 路径不应先物化未分配层。"""
+        import model_module
+
+        source = _make_tiny_model()
+        source.save_pretrained(tmp_path, safe_serialization=True)
+        dummy_tokenizer = object()
+        monkeypatch.setattr(
+            model_module.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: dummy_tokenizer,
+        )
+
+        mgr = ModelManager()
+        mgr.load_layer_range(
+            2,
+            4,
+            has_embedding=False,
+            has_lm_head=True,
+            model_path=str(tmp_path),
+            quant_type="fp16",
+            total_layers=4,
+            model_id="tiny-qwen2",
+        )
+
+        assert mgr.layer_range == (2, 4)
+        assert len(mgr.model.model.layers) == 2
+        assert mgr.model.model.embed_tokens is None
+        assert mgr.model.lm_head is not None
+        assert mgr.tokenizer is dummy_tokenizer
+        assert mgr.active_model_id == "tiny-qwen2"
+        assert all(parameter.device.type != "meta" for parameter in mgr.model.parameters())
+
+        result = mgr.forward_layers(hidden_states=torch.randn(1, 3, 128))
+        assert result["logits"].shape == (1, 3, TINY_CONFIG.vocab_size)
+
+    def test_two_selectively_loaded_nodes_match_full_qwen2(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """两个真实选择性加载节点串联后应与完整模型 logits 一致。"""
+        import model_module
+
+        torch.manual_seed(2026)
+        source = _make_tiny_model().eval().half()
+        source.save_pretrained(tmp_path, safe_serialization=True)
+        monkeypatch.setattr(
+            model_module.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: object(),
+        )
+        first = ModelManager()
+        last = ModelManager()
+        first.load_layer_range(
+            0, 2,
+            has_embedding=True,
+            has_lm_head=False,
+            model_path=str(tmp_path),
+            quant_type="fp16",
+            total_layers=4,
+        )
+        last.load_layer_range(
+            2, 4,
+            has_embedding=False,
+            has_lm_head=True,
+            model_path=str(tmp_path),
+            quant_type="fp16",
+            total_layers=4,
+        )
+
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        with torch.no_grad():
+            full_logits = source(input_ids=input_ids).logits
+        hidden = first.forward_layers(input_ids=input_ids)["hidden_states"]
+        pipeline_logits = last.forward_layers(hidden_states=hidden)["logits"]
+
+        assert torch.allclose(full_logits, pipeline_logits, atol=1e-3, rtol=1e-3)
 
 
 # ================================================================
@@ -1240,6 +1378,18 @@ class TestTransformers5xCompatibility:
             assert output and isinstance(output[0], torch.Tensor)
         else:
             assert isinstance(output, torch.Tensor)
+
+    def test_cancel_event_stops_generation_criteria(self, mgr):
+        """排队超时/客户端断开应让完整模型生成在下一个 token step 停止。"""
+        import threading
+
+        cancel_event = threading.Event()
+        criteria = mgr._build_stop_criteria([], 1, cancel_event=cancel_event)
+        assert criteria is not None
+        input_ids = torch.tensor([[1, 2]], dtype=torch.long)
+        assert not bool(criteria(input_ids, None))
+        cancel_event.set()
+        assert bool(criteria(input_ids, None))
 
 
 # ================================================================

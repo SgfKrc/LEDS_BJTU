@@ -24,6 +24,7 @@ import os
 import re
 import threading
 import time
+from functools import wraps
 from typing import Tuple, Optional, Dict, Any, List, Union
 
 
@@ -42,6 +43,7 @@ import psutil
 import torch
 import torch.nn as nn
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -58,6 +60,24 @@ from config import (
 import model_config as mc
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized_model_access(method):
+    """Serialize model mutation and inference against the manager RLock."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+def _serialized_model_stream(method):
+    """Keep the model lock for the complete lifetime of a stream."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            yield from method(self, *args, **kwargs)
+    return wrapper
 
 
 CHATML_STOP_SEQUENCES = [
@@ -107,6 +127,9 @@ class ModelManager:
 
         # 模型路径记录（供 SHA256 一致性校验等用途）
         self._model_path: Optional[str] = None
+        # 主节点进入分层模式后，保留完整模型的加载参数供本地回退恢复。
+        self._full_model_path: Optional[str] = None
+        self._full_model_quant_type: Optional[str] = None
 
         # 并发保护锁 — 防止推理与模型切换之间的数据竞争
         self._lock = threading.RLock()
@@ -222,6 +245,7 @@ class ModelManager:
     # 模型加载（双引擎入口）
     # ================================================================
 
+    @_serialized_model_access
     def load_model(
         self,
         model_path: str = None,
@@ -304,7 +328,10 @@ class ModelManager:
         self._active_model_id = resolved_id
         self._previous_engine_type = self._engine_type
         self._previous_quant_type = self.quant_type
+        self._full_model_path = self._model_path
+        self._full_model_quant_type = self.quant_type
 
+    @_serialized_model_access
     def unload_model(self) -> None:
         """
         卸载当前加载的模型，释放 GPU 显存和系统内存。
@@ -327,6 +354,8 @@ class ModelManager:
         self._layer_has_lm_head = True
         self._model_layers = 0
         self._total_model_layers = 0
+        self._full_model_path = None
+        self._full_model_quant_type = None
 
         # --- llama.cpp 引擎清理 ---
         if self._llama_engine is not None:
@@ -481,6 +510,7 @@ class ModelManager:
         """当前活跃的模型 ID。"""
         return self._active_model_id
 
+    @_serialized_model_access
     def load_layer_range(
         self,
         start_layer: int = 0,
@@ -490,6 +520,8 @@ class ModelManager:
         model_path: str = None,
         quant_type: str = None,
         profile: dict = None,
+        total_layers: int = None,
+        model_id: str = None,
     ) -> None:
         """
         加载模型的指定层范围（分布式流水线节点专用）。
@@ -521,10 +553,24 @@ class ModelManager:
 
         # ---- 参数校验 ----
         from config import TOTAL_MODEL_LAYERS
-        if start_layer < 0 or end_layer > TOTAL_MODEL_LAYERS or start_layer >= end_layer:
+        declared_total = int(total_layers or 0)
+        if declared_total <= 0 and model_path:
+            config_path = os.path.join(model_path, "config.json")
+            if os.path.isfile(config_path):
+                try:
+                    import json
+
+                    with open(config_path, "r", encoding="utf-8") as handle:
+                        declared_total = int(
+                            json.load(handle).get("num_hidden_layers", 0)
+                        )
+                except (OSError, TypeError, ValueError):
+                    declared_total = 0
+        declared_total = declared_total or TOTAL_MODEL_LAYERS
+        if start_layer < 0 or end_layer > declared_total or start_layer >= end_layer:
             raise ValueError(
                 f"无效的层范围: [{start_layer}, {end_layer})，"
-                f"有效范围: [0, {TOTAL_MODEL_LAYERS})"
+                f"有效范围: [0, {declared_total})"
             )
 
         layers_count = end_layer - start_layer
@@ -533,8 +579,28 @@ class ModelManager:
             f"embed={has_embedding}, lm_head={has_lm_head}"
         )
 
-        # ---- 先加载完整模型 ----
-        self._load_pytorch(model_path=model_path, quant_type=quant_type, profile=profile)
+        # Qwen2/DeepSeek 从 safetensors 中只读取本节点需要的层，避免先加载
+        # 完整模型造成数倍于分层目标的内存峰值。旧 Qwen remote-code 模型
+        # 不具备统一层命名，保留完整加载后裁剪的兼容路径。
+        path = model_path or self._full_model_path or self._model_path or MODEL_PATH
+        model_config = AutoConfig.from_pretrained(
+            path,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            local_files_only=True,
+        )
+        if getattr(model_config, "model_type", "") == "qwen2":
+            self._load_qwen2_layer_range(
+                path,
+                start_layer,
+                end_layer,
+                has_embedding=has_embedding,
+                has_lm_head=has_lm_head,
+                quant_type=quant_type,
+                profile=profile,
+                model_config=model_config,
+            )
+        else:
+            self._load_pytorch(model_path=path, quant_type=quant_type, profile=profile)
         self._engine_type = "pytorch"
 
         if self.model is None:
@@ -550,6 +616,11 @@ class ModelManager:
 
         # 1. 保留指定范围的 Transformer 层
         all_layers = list(transformer.layers)
+        actual_total = len(all_layers)
+        if actual_total != declared_total:
+            raise RuntimeError(
+                f"模型层数不一致: actual={actual_total}, assignment={declared_total}"
+            )
         kept = all_layers[start_layer:end_layer]
         transformer.layers = nn.ModuleList(kept)
 
@@ -584,6 +655,9 @@ class ModelManager:
         self._layer_has_embedding = bool(has_embedding)
         self._layer_has_lm_head = bool(has_lm_head)
         self._model_layers = layers_count
+        self._total_model_layers = actual_total
+        if model_id:
+            self._active_model_id = model_id
         # _total_model_layers 在 _load_pytorch 中已设为完整模型总层数，此处不覆盖
 
         # ---- 显存统计 ----
@@ -600,6 +674,137 @@ class ModelManager:
                 f"embed={has_embedding}, lm_head={has_lm_head}"
             )
 
+    def _load_qwen2_layer_range(
+        self,
+        model_path: str,
+        start_layer: int,
+        end_layer: int,
+        *,
+        has_embedding: bool,
+        has_lm_head: bool,
+        quant_type: str = None,
+        profile: dict = None,
+        model_config=None,
+    ) -> None:
+        """Materialize only selected Qwen2 parameters from safetensors shards."""
+        import gc
+        import json
+        from collections import defaultdict
+
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
+        from safetensors import safe_open
+
+        config = model_config or AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            local_files_only=True,
+        )
+        total_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+        if total_layers <= 0:
+            raise RuntimeError("Qwen2 config 缺少 num_hidden_layers")
+
+        old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
+        keep_tokenizer = self.tokenizer if old_path == os.path.abspath(model_path) else None
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=TRUST_REMOTE_CODE,
+            )
+
+        selected_prefixes = [
+            f"model.layers.{index}."
+            for index in range(start_layer, end_layer)
+        ]
+        # model.norm is tiny and keeps parameter/device discovery valid on all segments.
+        selected_prefixes.append("model.norm.")
+        if has_embedding:
+            selected_prefixes.append("model.embed_tokens.")
+        if has_lm_head:
+            selected_prefixes.append("lm_head.")
+
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        files_to_keys = defaultdict(list)
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            for key, filename in weight_map.items():
+                if any(key.startswith(prefix) for prefix in selected_prefixes):
+                    files_to_keys[filename].append(key)
+        else:
+            safetensor_files = sorted(
+                name for name in os.listdir(model_path)
+                if name.endswith(".safetensors")
+            )
+            for filename in safetensor_files:
+                path = os.path.join(model_path, filename)
+                with safe_open(path, framework="pt", device="cpu") as handle:
+                    for key in handle.keys():
+                        if any(key.startswith(prefix) for prefix in selected_prefixes):
+                            files_to_keys[filename].append(key)
+
+        if not files_to_keys:
+            raise FileNotFoundError("Qwen2 模型目录中未找到分层 safetensors 权重")
+
+        use_cuda = torch.cuda.is_available()
+        target_device = "cuda:0" if use_cuda else "cpu"
+        target_dtype = torch.float16
+        requested_quant = quant_type or QUANT_TYPE
+        if requested_quant in {"int4", "int8"}:
+            logger.info(
+                "分层选择性加载暂以 FP16 执行（请求量化=%s），仅加载 %s-%s 层",
+                requested_quant,
+                start_layer,
+                end_layer,
+            )
+        loaded_keys = set()
+        for filename, keys in files_to_keys.items():
+            shard_path = os.path.join(model_path, filename)
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                for key in keys:
+                    tensor = handle.get_tensor(key)
+                    set_module_tensor_to_device(
+                        model,
+                        key,
+                        target_device,
+                        value=tensor,
+                        dtype=target_dtype,
+                    )
+                    loaded_keys.add(key)
+
+        required_parameter_names = {
+            name for name, _ in model.named_parameters()
+            if any(name.startswith(prefix) for prefix in selected_prefixes)
+        }
+        missing = sorted(required_parameter_names - loaded_keys)
+        if missing:
+            raise RuntimeError(
+                "Qwen2 分层权重不完整: " + ", ".join(missing[:5])
+            )
+
+        self.model = model
+        self.tokenizer = keep_tokenizer or AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            local_files_only=True,
+        )
+        self._model_path = model_path
+        self.quant_type = "fp16"
+        self._total_model_layers = total_layers
+        self._model_layers = end_layer - start_layer
+        logger.info(
+            "Qwen2 选择性权重加载完成: Layer %s-%s / %s",
+            start_layer,
+            end_layer,
+            total_layers,
+        )
+
+    @_serialized_model_access
     def ensure_layer_range(
         self,
         start_layer: int,
@@ -609,6 +814,8 @@ class ModelManager:
         model_path: str = None,
         quant_type: str = None,
         profile: dict = None,
+        total_layers: int = None,
+        model_id: str = None,
     ) -> None:
         """确保当前 PyTorch 模型已裁剪为指定层范围，避免重复重载。"""
         desired_range = (start_layer, end_layer)
@@ -625,11 +832,14 @@ class ModelManager:
             end_layer,
             has_embedding=has_embedding,
             has_lm_head=has_lm_head,
-            model_path=model_path,
+            model_path=model_path or self._full_model_path or self._model_path,
             quant_type=quant_type,
             profile=profile,
+            total_layers=total_layers,
+            model_id=model_id,
         )
 
+    @_serialized_model_access
     def ensure_full_model(self, quant_type: str = None,
                           profile: dict = None, engine: str = None) -> None:
         """确保当前模型为完整模型；流水线裁剪后回退本地推理前调用。"""
@@ -646,13 +856,15 @@ class ModelManager:
             return
 
         model_id = self._active_model_id or mc.DEFAULT_MODEL_ID
-        q = quant_type or self.quant_type or QUANT_TYPE
+        q = quant_type or self._full_model_quant_type or self.quant_type or QUANT_TYPE
+        model_path = self._full_model_path or self._model_path
         logger.info(
             f"🔄 当前为流水线裁剪模型 layer_range={self.layer_range}，"
             f"重新加载完整模型用于本地推理"
         )
         self.load_model(
             model_id=model_id,
+            model_path=model_path,
             quant_type=q,
             profile=profile,
             engine=engine or "pytorch",
@@ -857,6 +1069,7 @@ class ModelManager:
     # 对话补全（统一接口，内部委托给对应引擎）
     # ================================================================
 
+    @_serialized_model_access
     def chat(
         self,
         messages: List[Dict[str, str]],
@@ -895,6 +1108,8 @@ class ModelManager:
             # PyTorch 路径: 使用 tokenizer + model.generate()
             if self.model is None or self.tokenizer is None:
                 raise RuntimeError("PyTorch 模型未加载，请先调用 load_model()")
+
+            self.ensure_full_model()
 
             return self._pytorch_chat(
                 messages=messages,
@@ -939,9 +1154,11 @@ class ModelManager:
             "eos_token_id",
             self._get_generation_eos_token_ids(stop_sequences),
         )
+        cancel_event = generation_kwargs.pop("_cancel_event", None)
         stop_criteria = self._build_stop_criteria(
             stop_sequences,
             inputs["input_ids"].shape[1],
+            cancel_event=cancel_event,
         )
         if stop_criteria is not None:
             generation_kwargs.setdefault("stopping_criteria", stop_criteria)
@@ -985,6 +1202,7 @@ class ModelManager:
             "tokens_per_second": round(tok_per_sec, 1),
         }
 
+    @_serialized_model_stream
     def chat_stream(
         self,
         messages: List[Dict[str, str]],
@@ -1014,6 +1232,8 @@ class ModelManager:
         elif self._engine_type == "pytorch":
             if self.model is None or self.tokenizer is None:
                 raise RuntimeError("PyTorch 模型未加载，请先调用 load_model()")
+
+            self.ensure_full_model()
 
             try:
                 from transformers import TextIteratorStreamer
@@ -1052,9 +1272,11 @@ class ModelManager:
                 eos_token_id=self._get_generation_eos_token_ids(stop_sequences),
                 streamer=streamer,
             )
+            cancel_event = kwargs.pop("_cancel_event", None)
             stop_criteria = self._build_stop_criteria(
                 stop_sequences,
                 inputs["input_ids"].shape[1],
+                cancel_event=cancel_event,
             )
             if stop_criteria is not None:
                 generation_kwargs["stopping_criteria"] = stop_criteria
@@ -1067,12 +1289,15 @@ class ModelManager:
             thread.start()
 
             chunk_count = 0
-            for text in self._iter_stream_until_stop(streamer, stop_sequences):
-                if text:
-                    chunk_count += 1
-                    yield text
-
-            thread.join()
+            try:
+                for text in self._iter_stream_until_stop(streamer, stop_sequences):
+                    if text:
+                        chunk_count += 1
+                        yield text
+            finally:
+                # A disconnected stream must not release the model lock while
+                # generate() is still mutating/reading the current model.
+                thread.join()
             elapsed = time.time() - t0
             logger.info(
                 f"流式推理完成 (PyTorch): {chunk_count} chunks / {elapsed:.1f}s"
@@ -1122,7 +1347,8 @@ class ModelManager:
             return None
         return ids if len(ids) > 1 else ids[0]
 
-    def _build_stop_criteria(self, stop_sequences: List[str], prompt_len: int):
+    def _build_stop_criteria(self, stop_sequences: List[str], prompt_len: int,
+                             cancel_event: threading.Event = None):
         """Stop generation when the new token tail matches any configured stop string."""
         try:
             from transformers import StoppingCriteria, StoppingCriteriaList
@@ -1139,11 +1365,13 @@ class ModelManager:
             if encoded:
                 stop_token_ids.append([int(token_id) for token_id in encoded])
 
-        if not stop_token_ids:
+        if not stop_token_ids and cancel_event is None:
             return None
 
         class StopOnTokenSequences(StoppingCriteria):
             def __call__(self, input_ids, scores, **kwargs) -> bool:
+                if cancel_event is not None and cancel_event.is_set():
+                    return True
                 generated = input_ids[0, prompt_len:].tolist()
                 if not generated:
                     return False
@@ -1235,6 +1463,7 @@ class ModelManager:
     # 前向推理（PyTorch 分布式专用）
     # ================================================================
 
+    @_serialized_model_access
     def forward_layers(
         self,
         input_ids: torch.Tensor = None,
@@ -1243,6 +1472,7 @@ class ModelManager:
         position_ids: torch.Tensor = None,
         past_key_values: tuple = None,
         use_cache: bool = True,
+        apply_lm_head: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         执行本节点层范围的单步前向传播（分布式流水线节点专用）。
@@ -1268,6 +1498,8 @@ class ModelManager:
             position_ids: 位置 ID (batch, seq_len)，None 则自动生成
             past_key_values: 已缓存的 KV cache，tuple of (key, value) per local layer
             use_cache: 是否返回新的 KV cache（decode 阶段应为 True）
+            apply_lm_head: 当前模型含 LM Head 时是否立即执行；master 首段保留
+                LM Head 但需先把 hidden_states 发给 worker，因此传 False
 
         Returns:
             {"hidden_states": Tensor}       — 非末节点，形状 (batch, seq_len, hidden_dim)
@@ -1492,7 +1724,7 @@ class ModelManager:
                 # ============================================================
                 result: Dict[str, torch.Tensor] = {}
 
-                if has_lm_head:
+                if has_lm_head and apply_lm_head:
                     hidden_states = transformer.norm(hidden_states)
                     logits = self.model.lm_head(hidden_states)
                     result["logits"] = logits

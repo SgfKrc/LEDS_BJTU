@@ -29,14 +29,12 @@ def _run_result(returncode=0, stdout="", stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-def test_tailscale_status_json_success_after_retry(monkeypatch, launcher_module):
+def test_tailscale_status_json_success_uses_single_fast_probe(monkeypatch, launcher_module):
     monkeypatch.setattr(launcher_module, "_find_tailscale_exe", lambda: "tailscale.exe")
     calls = []
 
     def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if len(calls) == 1:
-            return _run_result(1, "", "backend not ready")
+        calls.append((cmd, kwargs))
         return _run_result(
             0,
             '{"Self":{"TailscaleIPs":["100.90.76.108"],"HostName":"pc-master"}}',
@@ -52,6 +50,16 @@ def test_tailscale_status_json_success_after_retry(monkeypatch, launcher_module)
     assert status["logged_in"] is True
     assert status["tailscale_ip"] == "100.90.76.108"
     assert status["source"] == "status_json"
+    assert len(calls) == 1
+    assert calls[0][1]["timeout"] == 2
+    assert all(
+        kwargs["creationflags"] == launcher_module._WINDOWS_NO_WINDOW
+        for _, kwargs in calls
+    )
+    assert all(
+        kwargs["encoding"] == "utf-8" and kwargs["errors"] == "replace"
+        for _, kwargs in calls
+    )
 
 
 def test_tailscale_ip_command_fallback(monkeypatch, launcher_module):
@@ -95,3 +103,118 @@ def test_tailscale_not_installed(monkeypatch, launcher_module):
     assert status["installed"] is False
     assert status["tailscale_ip"] is None
     assert status["source"] == "none"
+
+
+def test_existing_qlh_instance_is_recognized(monkeypatch, launcher_module):
+    import json
+    import urllib.request
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "run_mode": "distributed",
+                "node_id": "master",
+            }).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    assert launcher_module._is_existing_qlh_instance(8000) is True
+
+
+def test_startup_splash_is_safe_when_disabled(launcher_module):
+    splash = launcher_module._StartupSplash(enabled=False).start()
+    splash.update(150, "ready")
+    assert splash._progress == 100
+    assert splash._status == "ready"
+    splash.close()
+
+
+def test_windows_dialog_uses_splash_owner(monkeypatch, launcher_module):
+    calls = []
+
+    class User32:
+        @staticmethod
+        def MessageBoxW(owner, message, title, flags):
+            calls.append((owner, message, title, flags))
+            return 6
+
+    import ctypes
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=User32()), raising=False)
+    result = launcher_module._show_windows_messagebox(
+        "title", "message", owner_hwnd=1234,
+    )
+    assert result == 6
+    assert calls[0][0] == 1234
+
+
+def test_webview_runtime_import_failure_falls_back(monkeypatch, launcher_module):
+    monkeypatch.setattr(launcher_module, "IS_WINDOWS", True)
+    real_import = __import__
+
+    def fail_webview(name, *args, **kwargs):
+        if name == "webview":
+            raise OSError("missing WebView runtime")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail_webview)
+    assert launcher_module._has_webview() is False
+
+
+def test_startup_splash_uses_application_icon(launcher_module):
+    path = launcher_module._startup_icon_path()
+    assert path.endswith("leds.ico")
+    assert os.path.isfile(path)
+
+
+def test_pytorch_tokenizer_runtime_check_loads_local_tokenizer(
+    monkeypatch, launcher_module
+):
+    class FakeTokenizer:
+        def encode(self, text):
+            assert text
+            return [1, 2, 3]
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_path, **kwargs):
+            assert model_path == "local-qwen"
+            assert kwargs == {"trust_remote_code": True, "local_files_only": True}
+            return FakeTokenizer()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=FakeAutoTokenizer),
+    )
+    monkeypatch.setitem(sys.modules, "config", SimpleNamespace(MODEL_PATH="local-qwen"))
+
+    name = launcher_module._verify_pytorch_tokenizer_runtime()
+    assert name.endswith(".FakeTokenizer")
+
+
+def test_qwen_runtime_dependency_is_declared_for_packaging():
+    requirement_paths = [
+        os.path.join(ROOT, "requirements.txt"),
+        os.path.join(ROOT, "packaging", "requirements-cpu.txt"),
+    ]
+    spec_paths = [
+        os.path.join(ROOT, "packaging", "qlh-cpu.spec"),
+        os.path.join(ROOT, "packaging", "qlh-cuda.spec"),
+    ]
+
+    for path in requirement_paths:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+        assert "tiktoken" in content
+        assert "httpx" in content
+    for path in spec_paths:
+        with open(path, encoding="utf-8") as fh:
+            content = fh.read()
+        assert "'tiktoken'" in content
+        assert "'tiktoken._tiktoken'" in content
+        assert "'httpx'" in content

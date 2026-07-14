@@ -201,14 +201,14 @@ def detect_cuda_available() -> bool:
 # 交互界面
 # ================================================================
 
-def _windows_messagebox(title: str, message: str) -> int:
+def _windows_messagebox(title: str, message: str, owner_hwnd=None) -> int:
     """Windows MessageBox。返回: 6=是, 7=否, 2=取消。"""
     import ctypes
     MB_YESNOCANCEL = 0x00000003
     MB_ICONQUESTION = 0x00000020
     try:
         return ctypes.windll.user32.MessageBoxW(
-            0, message, title,
+            owner_hwnd or 0, message, title,
             MB_YESNOCANCEL | MB_ICONQUESTION,
         )
     except Exception:
@@ -242,7 +242,7 @@ def _linux_zenity_dialog(title: str, message: str) -> int:
     return _cli_fallback(title, message)
 
 
-def show_model_dialog(title: str, message: str) -> int:
+def show_model_dialog(title: str, message: str, owner_hwnd=None) -> int:
     """
     跨平台模型下载对话框。
 
@@ -254,7 +254,7 @@ def show_model_dialog(title: str, message: str) -> int:
     if IS_LINUX and shutil.which("zenity"):
         return _linux_zenity_dialog(title, message)
     elif IS_WINDOWS:
-        return _windows_messagebox(title, message)
+        return _windows_messagebox(title, message, owner_hwnd)
     else:
         return _cli_fallback(title, message)
 
@@ -525,7 +525,7 @@ def _download_safetensors_modelscope():
 # 主入口
 # ================================================================
 
-def check_and_prompt_model() -> bool:
+def check_and_prompt_model(owner_hwnd=None) -> bool:
     """
     检查模型是否存在，若缺失则弹窗引导下载。
 
@@ -552,7 +552,7 @@ def check_and_prompt_model() -> bool:
 
     logger.warning("模型文件未找到，弹出下载引导...")
 
-    result = show_model_dialog(title, message)
+    result = show_model_dialog(title, message, owner_hwnd)
 
     if result == 6:  # 是 → 网盘
         open_pan_links()
