@@ -36,6 +36,10 @@ import psutil
 
 logger = logging.getLogger(__name__)
 
+_WINDOWS_NO_WINDOW = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+)
+
 
 # ============================================================
 # 设备档位枚举
@@ -471,6 +475,8 @@ class DeviceProfiler:
                 result = subprocess.run(
                     ["wmic", "cpu", "get", "Name"],
                     capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
+                    creationflags=_WINDOWS_NO_WINDOW,
                 )
                 lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
                 info.model_name = lines[1] if len(lines) > 1 else platform.processor()
@@ -621,6 +627,7 @@ class DeviceProfiler:
                      "get", "Name,AdapterRAM", "/format:csv"],
                     capture_output=True, text=True, timeout=10,
                     encoding="utf-8", errors="replace",
+                    creationflags=_WINDOWS_NO_WINDOW,
                 )
                 for line in result.stdout.splitlines():
                     line = line.strip()
