@@ -169,6 +169,9 @@ TOTAL_MODEL_LAYERS = 24                  # Qwen-1.8B-Chat Transformer 层总数
 LAYER_STRATEGY = "dynamic"              # 分层策略: "dynamic" 动态 | "manual" 手动覆盖
 DISTRIBUTED_INFERENCE_ENABLED = True    # 分布式推理开关（主节点默认开启，从节点默认关闭）
 TASK_GRAPH_ENABLED = _env_bool("QLH_TASK_GRAPH_ENABLED", False)
+TASK_WORKER_EXPERIMENTAL_ENABLED = _env_bool(
+    "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED", False,
+)
 TASK_GRAPH_MAX_RECORDS = _env_int(
     "QLH_TASK_GRAPH_MAX_RECORDS", 100, min_val=10, max_val=1000,
 )

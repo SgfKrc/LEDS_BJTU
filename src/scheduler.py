@@ -13,6 +13,7 @@
 
 import collections
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -23,6 +24,43 @@ import uuid
 from enum import Enum
 from typing import Optional, Callable
 from dataclasses import dataclass, field
+
+from task_provider import (
+    ModelIdentity as TaskModelIdentity,
+    StageRequest as TaskProviderStageRequest,
+    sanitize_result_metadata as sanitize_task_result_metadata,
+)
+from task_worker_adapter import (
+    RemoteFullWorkerProvider,
+    TaskWorkerControlPlane,
+    remote_provider_id,
+)
+from task_worker_protocol import (
+    PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
+    WorkerMessage,
+    WorkerProtocolError,
+    build_message as build_task_worker_message,
+    canonical_message_bytes as task_worker_message_bytes,
+    canonical_sha256 as task_worker_sha256,
+    decode_message as decode_task_worker_message,
+    worker_protocol_status,
+)
+
+
+@dataclass
+class _TaskWorkerActiveAttempt:
+    workflow_id: str
+    stage_id: str
+    attempt_id: str
+    lease_id: str
+    lease_epoch: int
+    provider_id: str
+    lease_expires_at_ms: int
+    lease_deadline_monotonic: float
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    done_event: threading.Event = field(default_factory=threading.Event)
+    lease_expired: bool = False
+    cancel_reason: str = ""
 
 # PyTorch 可用性检查（分布式推理按需导入，避免 llama.cpp 模式下硬依赖）
 try:
@@ -45,6 +83,7 @@ from config import (
     PIPELINE_PREEMPT_MIN_INTERVAL,       # 两次抢占最小间隔（防抖动）
     PIPELINE_PREEMPT_MIN_TOKENS,         # 至少生成 N token 后才接受抢占
     PIPELINE_PREEMPT_MAX_OVERHEAD_MS,    # checkpoint 超限自动禁用
+    TASK_WORKER_EXPERIMENTAL_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -1026,6 +1065,7 @@ class Scheduler:
         self._pipeline_results: dict = {}       # key → result data
         self._pipeline_events: dict = {}        # key → threading.Event
         self._pipeline_active_tasks: set[str] = set()
+        self._pipeline_task_contracts: dict[str, dict] = {}
         self._chain_ack_state: dict = {}        # task_id → step → node_id → ack/error
         self._pipeline_lock = threading.Lock()
         self._nodes_lock = threading.RLock()    # Phase 2.1: 保护 self.nodes 并发读写（可重入）
@@ -1044,8 +1084,17 @@ class Scheduler:
         self._pending_layer_config: Optional[tuple[str, dict]] = None
         self._layer_config_inflight: set[str] = set()
         self._last_layer_config_ack_payload: Optional[dict] = None
+        self._active_layer_config: Optional[dict] = None
+        self._layer_config_generation = 0
+        self._layer_config_receive_sequence = 0
+        self._latest_layer_config_receive_sequence = 0
+        self._latest_layer_config_generation = 0
+        self._pipeline_worker_reserved = False
+        self._pipeline_worker_opted_out = False
+        self._pipeline_worker_opt_out: set[str] = set()
         self._local_pipeline_cancelled: set[str] = set()
         self._local_pipeline_cancelled_order: collections.deque = collections.deque()
+        self._local_pipeline_steps: dict[str, int] = {}
         self._chain_clients: dict[str, object] = {}
         self._chain_clients_lock = threading.Lock()
         self._pipeline_accounted_tasks: set = set()  # 主节点侧：已完成记账的流水线任务
@@ -1080,6 +1129,25 @@ class Scheduler:
         self._distributed_inference_enabled: Optional[bool] = None
         self._local_device_profile: Optional[dict] = {}
         self._runtime_layer_override: Optional[list] = None
+        self._task_worker_control = TaskWorkerControlPlane(
+            health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
+        )
+        self._task_worker_refresh_lock = threading.Lock()
+        self._task_worker_refresh_requested = False
+        self._task_worker_refresh_generation = 0
+        self._remote_task_worker_providers: dict[
+            str, RemoteFullWorkerProvider
+        ] = {}
+        self._task_worker_stage_lock = threading.RLock()
+        self._task_worker_active_attempts: dict[
+            str, _TaskWorkerActiveAttempt
+        ] = {}
+        self._task_worker_seen_messages: dict[
+            str, tuple[str, list[dict]]
+        ] = {}
+        self._task_worker_seen_order: collections.deque[str] = (
+            collections.deque()
+        )
 
         # 流水线请求队列（MLFQ 三级反馈队列，兼容 FIFO）
         self.pipeline_queue = PipelineQueue(
@@ -1687,6 +1755,8 @@ class Scheduler:
                     pass
             # ★ 清除层配置推送记录（节点离线后需重新推送）
             self._clear_layer_config_state(node_id)
+            with self._layer_config_lock:
+                self._pipeline_worker_opt_out.discard(node_id)
 
         logger.info(f"节点注销: {node_id} ({old_state.value} → offline)")
         return True
@@ -2228,10 +2298,14 @@ class Scheduler:
 
     def _layer_assignment_cache_key(self, total_layers: int) -> str:
         """Bind dynamic cache to executable nodes, profiles, model and algorithm."""
+        with self._layer_config_lock:
+            opted_out = set(self._pipeline_worker_opt_out)
         with self._nodes_lock:
             nodes = []
             for node_id, info in self.nodes.items():
                 if info.node_type != "pc":
+                    continue
+                if node_id in opted_out:
                     continue
                 if info.role != NodeRole.MASTER and not info.is_available():
                     continue
@@ -2316,10 +2390,15 @@ class Scheduler:
         model_path = os.path.abspath(getattr(manager, "_model_path", "") or "")
         if not model_path or not os.path.isdir(model_path):
             return {}
+        active_config = getattr(getattr(manager, "model", None), "config", None)
+        model_type = str(getattr(active_config, "model_type", "") or "").lower()
+        if model_type not in {"qwen", "qwen2"}:
+            return {}
         return {
             "model_id": getattr(manager, "active_model_id", "") or "",
             "model_path": model_path,
             "model_sha256": self._get_master_model_sha256(),
+            "model_type": model_type,
             "total_layers": self._get_total_model_layers(),
         }
 
@@ -2350,6 +2429,8 @@ class Scheduler:
         total_layers = self._get_total_model_layers()
 
         # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过）
+        with self._layer_config_lock:
+            opted_out = set(self._pipeline_worker_opt_out)
         if nodes is None:
             # Phase 2.1: 快照 self.nodes 后解锁迭代，防止 TCP 回调并发修改 dict
             with self._nodes_lock:
@@ -2360,6 +2441,7 @@ class Scheduler:
                  "device_info": info.device_info}
                 for nid, info in nodes_snapshot
                 if info.node_type == "pc"
+                and nid not in opted_out
                 and (
                     info.role == NodeRole.MASTER
                     or not hasattr(info, "is_available")
@@ -2370,6 +2452,7 @@ class Scheduler:
             node_list = [
                 n for n in nodes
                 if n.get("node_type", "pc") == "pc"
+                and n.get("node_id") not in opted_out
             ]
 
         if not node_list:
@@ -2822,10 +2905,15 @@ class Scheduler:
         from config import GRAPH_ORCHESTRATOR_THRESHOLD
 
         total_layers = self._get_total_model_layers()
+        with self._layer_config_lock:
+            opted_out = set(self._pipeline_worker_opt_out)
 
         if self._runtime_layer_override:
             overrides = self._normalize_manual_assignments(
-                self._runtime_layer_override
+                [
+                    item for item in self._runtime_layer_override
+                    if item.get("node_id") not in opted_out
+                ]
             )
             if (
                 overrides
@@ -2850,7 +2938,10 @@ class Scheduler:
 
             if strategy == "manual":
                 try:
-                    overrides = db.get_layer_override()
+                    overrides = [
+                        item for item in (db.get_layer_override() or [])
+                        if item.get("node_id") not in opted_out
+                    ]
                     if (
                         overrides
                         and self._manual_assignments_are_executable(overrides)
@@ -3106,21 +3197,42 @@ class Scheduler:
         if not connected_ids:
             return
 
+        with self._nodes_lock:
+            releasable_pc_ids = {
+                node_id for node_id, node in self.nodes.items()
+                if node_id in connected_ids
+                and node_id != self.get_effective_node_id()
+                and getattr(node, "node_type", "pc") == "pc"
+            }
+
+        with self._layer_config_lock:
+            self._layer_config_generation = max(
+                self._layer_config_generation + 1,
+                time.time_ns(),
+            )
+            generation = self._layer_config_generation
+        config_id = uuid.uuid4().hex
+
         model_info = self._get_active_pipeline_model_info()
         master_sha256 = model_info.get("model_sha256", "")
         model_id = model_info.get("model_id", "")
-        if not master_sha256 or not model_id:
-            with self._layer_config_lock:
-                self._layer_config_pushed.clear()
-                self._layer_config_expected.clear()
-                self._layer_config_acks.clear()
-                self._layer_config_retry_state.clear()
+        model_type = model_info.get("model_type", "")
+        if not master_sha256 or not model_id or model_type not in {"qwen", "qwen2"}:
+            releases = {
+                node_id: {
+                    "node_id": node_id,
+                    "config_id": config_id,
+                    "generation": generation,
+                    "release": True,
+                }
+                for node_id in releasable_pc_ids
+            }
+            self._publish_layer_configs(releases)
             logger.warning("主节点尚未加载可校验的 PyTorch 模型，暂不推送层配置")
             return
 
         layer_info = self.get_layer_assignments()
         assignments = {}
-        config_id = uuid.uuid4().hex
         from config import API_PORT
 
         for a in layer_info["assignments"]:
@@ -3134,38 +3246,61 @@ class Scheduler:
             assignments[nid] = {
                 "node_id": nid,
                 "config_id": config_id,
+                "generation": generation,
                 "start_layer": a["start_layer"],
                 "end_layer": a["end_layer"],
                 "has_embedding": a.get("has_embedding", False),
                 "has_lm_head": a.get("has_lm_head", False),
                 "model_id": model_id,
                 "model_sha256": master_sha256,
+                "model_type": model_type,
                 "total_layers": int(model_info["total_layers"]),
                 "master_api_port": API_PORT,
             }
 
-        try:
-            if assignments:
-                # 必须在发包前登记期望版本，避免快速 ACK 先于状态初始化到达。
-                with self._layer_config_lock:
-                    for nid, assignment in assignments.items():
-                        self._layer_config_pushed.discard(nid)
-                        self._layer_config_acks.pop(nid, None)
-                        self._layer_config_expected[nid] = dict(assignment)
-                        self._layer_config_retry_state[nid] = {
-                            "attempts": 1,
-                            "next_retry": time.monotonic() + 5.0,
-                        }
-                self._start_layer_config_retry_monitor()
-                self._tcp_server.broadcast_layer_config(assignments)
-                logger.info(
-                    f"分层配置已推送到 {len(assignments)} 个从节点，"
-                    f"等待加载 ACK (config_id={config_id})"
+        releases = {
+            node_id: {
+                    "node_id": node_id,
+                    "config_id": config_id,
+                    "generation": generation,
+                    "release": True,
+            }
+            for node_id in releasable_pc_ids
+            if node_id not in assignments
+        }
+        configs = {**assignments, **releases}
+        self._publish_layer_configs(configs)
+        if assignments:
+            logger.info(
+                f"分层配置已推送到 {len(assignments)} 个从节点，"
+                f"等待加载 ACK (config_id={config_id}, generation={generation})"
+            )
+        else:
+            logger.warning("没有可用的从节点接收分层配置")
+
+    def _publish_layer_configs(self, configs: dict[str, dict]) -> None:
+        """Register every assignment/release before sending so both are retried."""
+        if not configs:
+            return
+        with self._layer_config_lock:
+            for node_id, config in configs.items():
+                self._layer_config_pushed.discard(node_id)
+                self._layer_config_acks.pop(node_id, None)
+                self._layer_config_expected[node_id] = dict(config)
+                self._layer_config_retry_state[node_id] = {
+                    "attempts": 1,
+                    "next_retry": time.monotonic() + 5.0,
+                }
+        self._start_layer_config_retry_monitor()
+        for node_id, config in configs.items():
+            try:
+                self._tcp_server.send_layer_config(node_id, config)
+            except Exception:
+                logger.warning(
+                    "分层配置首次发送失败，将由退避线程重试: node=%s",
+                    node_id,
+                    exc_info=True,
                 )
-            else:
-                logger.warning("没有可用的从节点接收分层配置")
-        except Exception as e:
-            logger.warning(f"分层配置推送失败: {e}")
 
     def _clear_layer_config_state(self, node_id: str) -> None:
         """清除节点的层配置期望、ACK 和 ready 状态。"""
@@ -3174,6 +3309,42 @@ class Scheduler:
             self._layer_config_expected.pop(node_id, None)
             self._layer_config_acks.pop(node_id, None)
             self._layer_config_retry_state.pop(node_id, None)
+
+    def _invalidate_worker_layer_ready(
+        self, node_id: str, config_id: str, reason: str,
+    ) -> bool:
+        """Revoke one worker's ready ACK and immediately resend its generation."""
+        with self._layer_config_lock:
+            expected = self._layer_config_expected.get(node_id)
+            if not expected or expected.get("config_id") != config_id:
+                return False
+            assignment = dict(expected)
+            self._layer_config_pushed.discard(node_id)
+            self._layer_config_acks[node_id] = {
+                "node_id": node_id,
+                "config_id": config_id,
+                "status": "error",
+                "error": reason,
+            }
+            state = self._layer_config_retry_state.setdefault(
+                node_id, {"attempts": 0, "next_retry": 0.0},
+            )
+            state["attempts"] = int(state.get("attempts", 0)) + 1
+            state["next_retry"] = time.monotonic() + 5.0
+
+        try:
+            if self._tcp_server and self._tcp_server._running:
+                self._tcp_server.send_layer_config(node_id, assignment)
+                logger.warning(
+                    "worker 层配置已失效，立即重发: node=%s config=%s reason=%s",
+                    node_id, config_id, reason,
+                )
+        except Exception:
+            logger.warning(
+                "worker 层配置立即重发失败，将由退避线程重试: node=%s",
+                node_id, exc_info=True,
+            )
+        return True
 
     def _start_layer_config_retry_monitor(self) -> None:
         if (self._layer_config_retry_thread is not None
@@ -3262,6 +3433,737 @@ class Scheduler:
     # TCP 消息处理
     # ================================================================
 
+    def _task_worker_capabilities(self) -> dict:
+        """Build an honest PC Full Worker snapshot without loading a model."""
+        engines = []
+        if torch is not None:
+            engines.append("pytorch")
+        try:
+            if importlib.util.find_spec("llama_cpp") is not None:
+                engines.append("llama_cpp")
+        except (ImportError, ValueError):
+            pass
+        if not engines:
+            # The PC application currently requires the PyTorch runtime. Keeping
+            # the schema valid also makes a broken installation visible in hello.
+            engines.append("pytorch")
+
+        models = []
+        try:
+            import api_server as _api
+
+            lazy_manager = getattr(_api, "model_manager", None)
+            manager = getattr(lazy_manager, "_instance", None)
+            full_model_loaded = bool(
+                getattr(_api, "model_loaded", False)
+                and manager is not None
+                and getattr(manager, "is_loaded", False)
+                and getattr(manager, "layer_range", None) is None
+            )
+            if full_model_loaded:
+                identity = _api._active_task_graph_model_identity()
+                if identity is not None and identity.engine in engines:
+                    models.append({
+                        "model_id": identity.model_id,
+                        "engine": identity.engine,
+                        "format": identity.format,
+                        "revision": identity.revision,
+                        "sha256": identity.sha256,
+                    })
+        except Exception:
+            logger.warning(
+                "构建 PC Full Worker 模型能力快照失败，暂不上报模型",
+                exc_info=True,
+            )
+        return {
+            "stage_types": ["full_inference", "aggregate"],
+            "engines": engines,
+            "models": models,
+            "max_concurrency": 1,
+        }
+
+    def _send_task_worker_hello(
+        self, client=None, refresh_generation: int = 0,
+    ) -> bool:
+        """Send the TC-N2.0 hello after authenticated TCP registration."""
+        if (
+            self._effective_role() != "client"
+            or not TASK_WORKER_EXPERIMENTAL_ENABLED
+        ):
+            return False
+        target = client or getattr(self, "_tcp_client", None)
+        if not target or not getattr(target, "is_registered", False):
+            return False
+        try:
+            from tcp_comm import MessageType
+
+            message = self._task_worker_control.begin_worker_hello(
+                node_id=self.get_effective_node_id(),
+                capabilities=self._task_worker_capabilities(),
+            )
+            if message is None:
+                return False
+            with self._task_worker_refresh_lock:
+                self._task_worker_refresh_requested = bool(
+                    self._task_worker_refresh_generation > refresh_generation
+                )
+            target.send_data(message.snapshot(), MessageType.TASK_WORKER)
+            logger.info(
+                "event=task_worker_hello_sent node_id=%s version=%s",
+                self.get_effective_node_id(), message.version,
+            )
+            return True
+        except Exception as exc:
+            self._task_worker_control.disconnect_coordinator()
+            logger.warning(
+                "event=task_worker_hello_failed node_id=%s error=%s",
+                self.get_effective_node_id(),
+                getattr(exc, "code", type(exc).__name__),
+                exc_info=True,
+            )
+            return False
+
+    def refresh_task_worker_capabilities(self) -> bool:
+        """Refresh hello asynchronously after a local full-model change."""
+        client = getattr(self, "_tcp_client", None)
+        if (
+            self._effective_role() != "client"
+            or not TASK_WORKER_EXPERIMENTAL_ENABLED
+            or not client
+            or not getattr(client, "is_registered", False)
+        ):
+            return False
+        with self._task_worker_refresh_lock:
+            self._task_worker_refresh_requested = True
+            self._task_worker_refresh_generation += 1
+            refresh_generation = self._task_worker_refresh_generation
+        threading.Thread(
+            target=self._send_task_worker_hello,
+            args=(client, refresh_generation),
+            name="task-worker-capability-refresh",
+            daemon=True,
+        ).start()
+        return True
+
+    def _send_task_worker_to_node(
+        self, node_id: str, message: WorkerMessage,
+    ) -> None:
+        server = self._tcp_server
+        if server is None:
+            raise ConnectionError("task worker TCP server is unavailable")
+        from tcp_comm import MessageType
+
+        server.send_to_client(
+            node_id, message.snapshot(), MessageType.TASK_WORKER,
+        )
+
+    def _send_task_worker_to_master(self, message: WorkerMessage) -> None:
+        client = getattr(self, "_tcp_client", None)
+        if not client or not getattr(client, "is_registered", False):
+            raise ConnectionError("task worker is not connected to its master")
+        from tcp_comm import MessageType
+
+        client.send_data(message.snapshot(), MessageType.TASK_WORKER)
+
+    def _ensure_remote_task_worker_provider(
+        self, node_id: str,
+    ) -> RemoteFullWorkerProvider:
+        with self._task_worker_stage_lock:
+            provider = self._remote_task_worker_providers.get(node_id)
+            if provider is None:
+                provider = RemoteFullWorkerProvider(
+                    node_id=node_id,
+                    peer_snapshot=lambda bound_node=node_id: (
+                        self._task_worker_control.worker_snapshot(bound_node)
+                    ),
+                    send_message=lambda message, bound_node=node_id: (
+                        self._send_task_worker_to_node(bound_node, message)
+                    ),
+                )
+                self._remote_task_worker_providers[node_id] = provider
+            return provider
+
+    def remote_task_worker_providers(self) -> list[RemoteFullWorkerProvider]:
+        """Return stable Provider objects for explicit TaskGraph registration."""
+        with self._task_worker_stage_lock:
+            return [
+                self._remote_task_worker_providers[node_id]
+                for node_id in sorted(self._remote_task_worker_providers)
+            ]
+
+    @staticmethod
+    def _task_worker_message_digest(message: WorkerMessage) -> str:
+        return hashlib.sha256(task_worker_message_bytes(message)).hexdigest()
+
+    def _prepare_task_worker_request(
+        self, message: WorkerMessage,
+    ) -> tuple[bool, list[dict]]:
+        digest = self._task_worker_message_digest(message)
+        with self._task_worker_stage_lock:
+            cached = self._task_worker_seen_messages.get(message.message_id)
+            if cached is not None:
+                if cached[0] != digest:
+                    raise WorkerProtocolError(
+                        "message_id was reused with different Stage content",
+                        code="message_id_conflict",
+                        field="message_id",
+                    )
+                return True, [dict(response) for response in cached[1]]
+            self._task_worker_seen_messages[message.message_id] = (digest, [])
+            self._task_worker_seen_order.append(message.message_id)
+            while len(self._task_worker_seen_order) > 1024:
+                expired = self._task_worker_seen_order.popleft()
+                self._task_worker_seen_messages.pop(expired, None)
+            return False, []
+
+    def _cache_task_worker_response(
+        self, request_message_id: str, response: WorkerMessage,
+    ) -> None:
+        with self._task_worker_stage_lock:
+            cached = self._task_worker_seen_messages.get(request_message_id)
+            if cached is not None:
+                cached[1].append(response.snapshot())
+
+    def _forget_task_worker_request(self, request_message_id: str) -> None:
+        with self._task_worker_stage_lock:
+            self._task_worker_seen_messages.pop(request_message_id, None)
+            try:
+                self._task_worker_seen_order.remove(request_message_id)
+            except ValueError:
+                pass
+
+    def _send_task_worker_response(
+        self, request_message_id: str, response: WorkerMessage,
+    ) -> None:
+        self._cache_task_worker_response(request_message_id, response)
+        self._send_task_worker_to_master(response)
+
+    def _replay_task_worker_responses(self, responses: list[dict]) -> None:
+        for response in responses:
+            self._send_task_worker_to_master(
+                decode_task_worker_message(response)
+            )
+
+    @staticmethod
+    def _task_worker_active_identity_matches(
+        payload: dict, active: _TaskWorkerActiveAttempt,
+    ) -> bool:
+        return all((
+            payload.get("workflow_id") == active.workflow_id,
+            payload.get("stage_id") == active.stage_id,
+            payload.get("attempt_id") == active.attempt_id,
+            payload.get("lease_id") == active.lease_id,
+            payload.get("lease_epoch") == active.lease_epoch,
+        ))
+
+    def _watch_task_worker_lease(self, attempt_id: str) -> None:
+        while True:
+            with self._task_worker_stage_lock:
+                active = self._task_worker_active_attempts.get(attempt_id)
+                if active is None:
+                    return
+                remaining = (
+                    active.lease_deadline_monotonic - time.monotonic()
+                )
+                if remaining <= 0:
+                    active.lease_expired = True
+                    active.cancel_event.set()
+                    return
+                done_event = active.done_event
+            if done_event.wait(min(0.05, remaining)):
+                return
+
+    def _handle_task_worker_lease_renew(
+        self, message: WorkerMessage,
+    ) -> None:
+        payload = message.payload
+        attempt_id = str(payload["attempt_id"])
+        with self._task_worker_stage_lock:
+            active = self._task_worker_active_attempts.get(attempt_id)
+            if active is None:
+                raise WorkerProtocolError(
+                    "lease renewal has no active attempt",
+                    code="unknown_attempt",
+                    field="payload.attempt_id",
+                )
+            if not self._task_worker_active_identity_matches(payload, active):
+                raise WorkerProtocolError(
+                    "lease renewal identity does not match the active attempt",
+                    code="attempt_identity_mismatch",
+                    field="payload",
+                )
+            if (
+                active.lease_expired
+                or active.lease_deadline_monotonic <= time.monotonic()
+            ):
+                active.lease_expired = True
+                active.cancel_event.set()
+                raise WorkerProtocolError(
+                    "an expired Stage lease cannot be renewed",
+                    code="lease_expired",
+                    field="payload.lease_expires_at_ms",
+                )
+            deadline = int(payload["lease_expires_at_ms"])
+            if deadline <= active.lease_expires_at_ms:
+                raise WorkerProtocolError(
+                    "lease renewal must extend the active deadline",
+                    code="stale_lease",
+                    field="payload.lease_expires_at_ms",
+                )
+            active.lease_expires_at_ms = deadline
+            active.lease_deadline_monotonic = time.monotonic() + (
+                deadline - message.sent_at_ms
+            ) / 1000.0
+
+    def _handle_task_worker_stage_cancel(
+        self, message: WorkerMessage,
+    ) -> None:
+        payload = message.payload
+        attempt_id = str(payload["attempt_id"])
+        with self._task_worker_stage_lock:
+            active = self._task_worker_active_attempts.get(attempt_id)
+            if active is None:
+                raise WorkerProtocolError(
+                    "Stage cancellation has no active attempt",
+                    code="unknown_attempt",
+                    field="payload.attempt_id",
+                )
+            if not self._task_worker_active_identity_matches(payload, active):
+                raise WorkerProtocolError(
+                    "Stage cancellation identity does not match the active attempt",
+                    code="attempt_identity_mismatch",
+                    field="payload",
+                )
+            active.cancel_reason = str(payload["reason_code"])
+            active.cancel_event.set()
+            provider_id = active.provider_id
+        response_payload = self._task_worker_attempt_payload(
+            payload, provider_id=provider_id,
+        )
+        response_payload["reason_code"] = str(payload["reason_code"])
+        response = build_task_worker_message(
+            "stage_cancelled",
+            response_payload,
+            message_id=f"msg_cancelled_{uuid.uuid4().hex}",
+            sent_at_ms=int(time.time() * 1000),
+            version=TASK_WORKER_PROTOCOL_VERSION,
+        )
+        self._send_task_worker_response(message.message_id, response)
+
+    @staticmethod
+    def _task_worker_attempt_payload(
+        offer_payload: dict,
+        *,
+        provider_id: str,
+    ) -> dict:
+        return {
+            "workflow_id": offer_payload["workflow_id"],
+            "stage_id": offer_payload["stage_id"],
+            "attempt_id": offer_payload["attempt_id"],
+            "lease_id": offer_payload["lease_id"],
+            "lease_epoch": offer_payload["lease_epoch"],
+            "provider_id": provider_id,
+        }
+
+    def _send_task_worker_stage_accept(
+        self,
+        request_message_id: str,
+        offer_payload: dict,
+        *,
+        accepted: bool,
+        reason_code: str = "",
+        retryable: bool = False,
+    ) -> None:
+        payload = self._task_worker_attempt_payload(
+            offer_payload,
+            provider_id=str(offer_payload.get("provider_id", "")),
+        )
+        payload.update({
+            "accepted": bool(accepted),
+            "reason_code": "" if accepted else reason_code,
+            "retryable": False if accepted else bool(retryable),
+        })
+        response = build_task_worker_message(
+            "stage_accept",
+            payload,
+            message_id=f"msg_accept_{uuid.uuid4().hex}",
+            sent_at_ms=int(time.time() * 1000),
+            version=TASK_WORKER_PROTOCOL_VERSION,
+        )
+        self._send_task_worker_response(request_message_id, response)
+
+    def _handle_task_worker_stage_offer(
+        self, message: WorkerMessage,
+    ) -> None:
+        """Validate and execute one explicit remote Stage on a PC worker."""
+        offer = message.payload
+        attempt_id = str(offer["attempt_id"])
+        expected_provider = remote_provider_id(self.get_effective_node_id())
+        reject_reason = ""
+        reject_retryable = False
+        active: Optional[_TaskWorkerActiveAttempt] = None
+
+        coordinator = self._task_worker_control.coordinator_snapshot()
+        if not TASK_WORKER_EXPERIMENTAL_ENABLED:
+            reject_reason = "worker_experiment_disabled"
+            reject_retryable = True
+        elif not coordinator.get("manual_stage_dispatch_enabled"):
+            reject_reason = "worker_not_admitted"
+            reject_retryable = True
+        elif offer["provider_id"] != expected_provider:
+            reject_reason = "provider_identity_mismatch"
+        else:
+            capabilities = self._task_worker_capabilities()
+            if offer["stage_type"] not in capabilities["stage_types"]:
+                reject_reason = "unsupported_stage_type"
+                reject_retryable = True
+            elif offer["model_identity"] not in capabilities["models"]:
+                reject_reason = "model_identity_mismatch"
+                reject_retryable = True
+
+        with self._task_worker_stage_lock:
+            if not reject_reason and (
+                attempt_id in self._task_worker_active_attempts
+                or self._task_worker_active_attempts
+            ):
+                reject_reason = "remote_worker_busy"
+                reject_retryable = True
+            if not reject_reason:
+                active = _TaskWorkerActiveAttempt(
+                    workflow_id=str(offer["workflow_id"]),
+                    stage_id=str(offer["stage_id"]),
+                    attempt_id=attempt_id,
+                    lease_id=str(offer["lease_id"]),
+                    lease_epoch=int(offer["lease_epoch"]),
+                    provider_id=expected_provider,
+                    lease_expires_at_ms=int(offer["lease_expires_at_ms"]),
+                    lease_deadline_monotonic=time.monotonic() + (
+                        int(offer["lease_expires_at_ms"])
+                        - message.sent_at_ms
+                    ) / 1000.0,
+                )
+                self._task_worker_active_attempts[attempt_id] = active
+
+        if reject_reason:
+            try:
+                self._send_task_worker_stage_accept(
+                    message.message_id,
+                    offer,
+                    accepted=False,
+                    reason_code=reject_reason,
+                    retryable=reject_retryable,
+                )
+            except Exception:
+                self._forget_task_worker_request(message.message_id)
+                logger.warning(
+                    "event=task_worker_stage_reject_send_failed attempt_id=%s",
+                    attempt_id, exc_info=True,
+                )
+            return
+        if active is None:
+            raise RuntimeError("accepted task-worker Stage has no active record")
+
+        try:
+            self._send_task_worker_stage_accept(
+                message.message_id, offer, accepted=True,
+            )
+        except Exception:
+            with self._task_worker_stage_lock:
+                removed = self._task_worker_active_attempts.pop(
+                    attempt_id, None,
+                )
+                if removed is not None:
+                    removed.done_event.set()
+            self._forget_task_worker_request(message.message_id)
+            logger.warning(
+                "event=task_worker_stage_accept_send_failed attempt_id=%s",
+                attempt_id, exc_info=True,
+            )
+            return
+
+        threading.Thread(
+            target=self._watch_task_worker_lease,
+            args=(attempt_id,),
+            name=f"task-worker-lease-{attempt_id}",
+            daemon=True,
+        ).start()
+
+        try:
+            model_identity = TaskModelIdentity(**offer["model_identity"])
+            request = TaskProviderStageRequest(
+                workflow_id=offer["workflow_id"],
+                request_id=offer["request_id"],
+                stage_id=offer["stage_id"],
+                stage_type=offer["stage_type"],
+                provider_id=offer["provider_id"],
+                dependencies=offer["dependencies"],
+                root_input=offer["root_input"],
+                model_identity=model_identity,
+            )
+            import api_server as _api
+
+            with _api._full_chat_execution_lock:
+                with self._inference_lock:
+                    output = _api._execute_task_worker_stage(
+                        request, active.cancel_event,
+                    )
+            if not isinstance(output, dict):
+                raise RuntimeError("remote Stage executor returned non-object output")
+            with self._task_worker_stage_lock:
+                current = self._task_worker_active_attempts.get(attempt_id)
+                if current is None:
+                    raise RuntimeError("remote Stage attempt is no longer active")
+                if (
+                    current.lease_expired
+                    or current.lease_deadline_monotonic <= time.monotonic()
+                ):
+                    current.lease_expired = True
+                    current.cancel_event.set()
+                    raise RuntimeError("remote Stage lease expired")
+                if current.cancel_reason:
+                    raise RuntimeError("remote Stage was cancelled")
+            result_payload = self._task_worker_attempt_payload(
+                offer, provider_id=expected_provider,
+            )
+            result_payload.update({
+                "output": output,
+                "output_sha256": task_worker_sha256(output),
+                "metadata": sanitize_task_result_metadata(output),
+            })
+            response = build_task_worker_message(
+                "stage_result",
+                result_payload,
+                message_id=f"msg_result_{uuid.uuid4().hex}",
+                sent_at_ms=int(time.time() * 1000),
+                version=TASK_WORKER_PROTOCOL_VERSION,
+            )
+            try:
+                self._send_task_worker_response(message.message_id, response)
+            except Exception:
+                logger.warning(
+                    "event=task_worker_stage_result_send_failed attempt_id=%s",
+                    attempt_id, exc_info=True,
+                )
+                return
+            logger.info(
+                "event=task_worker_stage_result_sent workflow_id=%s stage_id=%s attempt_id=%s",
+                offer["workflow_id"], offer["stage_id"], attempt_id,
+            )
+        except Exception as exc:
+            with self._task_worker_stage_lock:
+                current = self._task_worker_active_attempts.get(attempt_id)
+                lease_expired = bool(
+                    current is not None and current.lease_expired
+                )
+                cancelled_by_coordinator = bool(
+                    current is not None and current.cancel_reason
+                )
+            if cancelled_by_coordinator and not lease_expired:
+                logger.info(
+                    "event=task_worker_stage_cancelled workflow_id=%s stage_id=%s attempt_id=%s",
+                    offer["workflow_id"], offer["stage_id"], attempt_id,
+                )
+                return
+            error_code = (
+                "lease_expired"
+                if lease_expired
+                else "provider_cancelled"
+                if active.cancel_event.is_set()
+                else "remote_stage_execution_failed"
+            )
+            error_payload = self._task_worker_attempt_payload(
+                offer, provider_id=expected_provider,
+            )
+            error_payload.update({
+                "error_code": error_code,
+                "retryable": error_code == "lease_expired",
+            })
+            try:
+                response = build_task_worker_message(
+                    "stage_error",
+                    error_payload,
+                    message_id=f"msg_error_{uuid.uuid4().hex}",
+                    sent_at_ms=int(time.time() * 1000),
+                    version=TASK_WORKER_PROTOCOL_VERSION,
+                )
+                self._send_task_worker_response(
+                    message.message_id, response,
+                )
+            except Exception:
+                logger.warning(
+                    "event=task_worker_stage_error_send_failed attempt_id=%s",
+                    attempt_id, exc_info=True,
+                )
+            logger.warning(
+                "event=task_worker_stage_execution_failed workflow_id=%s stage_id=%s attempt_id=%s reason=%s",
+                offer["workflow_id"], offer["stage_id"], attempt_id,
+                type(exc).__name__, exc_info=True,
+            )
+        finally:
+            with self._task_worker_stage_lock:
+                removed = self._task_worker_active_attempts.pop(
+                    attempt_id, None,
+                )
+                if removed is not None:
+                    removed.done_event.set()
+
+    def _handle_task_worker_message(self, client_id: str, msg: dict) -> None:
+        """Route N2.2 hello, Stage, renewal, and cancellation messages."""
+        raw = msg.get("data")
+        if not isinstance(raw, dict):
+            self._task_worker_control.record_rejection()
+            logger.warning(
+                "event=task_worker_message_rejected peer=%s reason=invalid_outer_payload",
+                client_id,
+            )
+            return
+        try:
+            message = decode_task_worker_message(raw)
+            if self._effective_role() == "master":
+                if client_id == "master":
+                    raise WorkerProtocolError(
+                        "master cannot register as its own task worker",
+                        code="invalid_message_direction",
+                        field="message_type",
+                    )
+                with self._nodes_lock:
+                    registered_node = self.nodes.get(client_id)
+                    registered_role = getattr(
+                        getattr(registered_node, "role", ""),
+                        "value",
+                        getattr(registered_node, "role", ""),
+                    )
+                    admitted_pc_worker = bool(
+                        registered_node is not None
+                        and registered_node.node_type == "pc"
+                        and registered_role == NodeRole.CLIENT.value
+                    )
+                if not admitted_pc_worker:
+                    self._task_worker_control.record_rejection()
+                    raise WorkerProtocolError(
+                        "only a registered PC client may negotiate a full worker",
+                        code="unsupported_worker_node",
+                        field="payload.worker_kind",
+                    )
+                if message.message_type == "hello":
+                    ack = self._task_worker_control.receive_on_coordinator(
+                        client_id,
+                        raw,
+                        coordinator_node_id=self.get_effective_node_id(),
+                    )
+                    self._send_task_worker_to_node(client_id, ack)
+                    if ack.payload["accepted"]:
+                        self._ensure_remote_task_worker_provider(client_id)
+                    logger.info(
+                        "event=task_worker_hello_acked node_id=%s accepted=%s version=%s",
+                        client_id,
+                        ack.payload["accepted"],
+                        ack.payload["selected_version"],
+                    )
+                elif message.message_type in {
+                    "stage_accept", "stage_result", "stage_error",
+                    "stage_cancelled",
+                }:
+                    provider = self._remote_task_worker_providers.get(client_id)
+                    if provider is None:
+                        raise WorkerProtocolError(
+                            "Stage response arrived before an accepted worker hello",
+                            code="worker_not_admitted",
+                            field="message_type",
+                        )
+                    provider.handle_message(raw)
+                else:
+                    raise WorkerProtocolError(
+                        "message is not valid in the N2.2 coordinator direction",
+                        code="invalid_message_direction",
+                        field="message_type",
+                    )
+            else:
+                if client_id != "master":
+                    raise WorkerProtocolError(
+                        "worker accepts task-worker control messages from master only",
+                        code="invalid_message_direction",
+                        field="message_type",
+                    )
+                if message.message_type == "hello_ack":
+                    accepted = self._task_worker_control.receive_on_worker(raw)
+                    logger.info(
+                        "event=task_worker_hello_ack_received coordinator=%s accepted=%s version=%s",
+                        accepted.payload["coordinator_node_id"],
+                        accepted.payload["accepted"],
+                        accepted.payload["selected_version"],
+                    )
+                    with self._task_worker_refresh_lock:
+                        refresh_requested = self._task_worker_refresh_requested
+                    if refresh_requested:
+                        self.refresh_task_worker_capabilities()
+                elif message.message_type == "stage_offer":
+                    duplicate, responses = self._prepare_task_worker_request(
+                        message
+                    )
+                    if duplicate:
+                        self._replay_task_worker_responses(responses)
+                        return
+                    threading.Thread(
+                        target=self._handle_task_worker_stage_offer,
+                        args=(message,),
+                        name=f"task-worker-stage-{message.payload['attempt_id']}",
+                        daemon=True,
+                    ).start()
+                elif message.message_type in {"lease_renew", "stage_cancel"}:
+                    duplicate, responses = self._prepare_task_worker_request(
+                        message
+                    )
+                    if duplicate:
+                        self._replay_task_worker_responses(responses)
+                        return
+                    if message.message_type == "lease_renew":
+                        self._handle_task_worker_lease_renew(message)
+                    else:
+                        self._handle_task_worker_stage_cancel(message)
+                else:
+                    raise WorkerProtocolError(
+                        "message is not valid in the N2.2 worker direction",
+                        code="invalid_message_direction",
+                        field="message_type",
+                    )
+        except (WorkerProtocolError, ConnectionError) as exc:
+            logger.warning(
+                "event=task_worker_message_rejected peer=%s reason=%s",
+                client_id,
+                getattr(exc, "code", type(exc).__name__),
+                exc_info=True,
+            )
+        except Exception as exc:
+            # A malformed control-plane message must not collapse the shared TCP
+            # receive loop or any existing inference path.
+            logger.warning(
+                "event=task_worker_message_failed peer=%s reason=%s",
+                client_id, type(exc).__name__, exc_info=True,
+            )
+
+    def get_task_worker_protocol_status(self) -> dict:
+        runtime = self._task_worker_control.status(role=self._effective_role())
+        connected = bool(runtime.get("control_plane_connected", False))
+        runtime.update({
+            "phase": "TC-N2.4",
+            "experiment_enabled": TASK_WORKER_EXPERIMENTAL_ENABLED,
+            "experimental_dispatch_enabled": bool(
+                TASK_WORKER_EXPERIMENTAL_ENABLED and connected
+            ),
+            "auto_provider_selection_enabled": bool(
+                TASK_WORKER_EXPERIMENTAL_ENABLED and connected
+            ),
+            "admission_state": (
+                "n2_4_experimental_physical_validation_pending"
+                if TASK_WORKER_EXPERIMENTAL_ENABLED and connected
+                else "n2_4_experiment_enabled_not_connected"
+                if TASK_WORKER_EXPERIMENTAL_ENABLED
+                else "n2_4_experiment_disabled"
+            ),
+        })
+        return worker_protocol_status(runtime)
+
     def _on_tcp_message(self, client_id: str, msg: dict) -> None:
         """
         TCP 消息回调（由 TCPServer 调用）。
@@ -3322,9 +4224,14 @@ class Scheduler:
                 )
 
         elif msg_type == "heartbeat":
+            if self._effective_role() == "master":
+                self._task_worker_control.mark_worker_heartbeat(client_id)
             with self._nodes_lock:
                 if client_id in self.nodes:
                     self.nodes[client_id].last_heartbeat = time.time()
+
+        elif msg_type == "task_worker":
+            self._handle_task_worker_message(client_id, msg)
 
         elif msg_type == "status_res":
             # 从节点状态上报
@@ -3500,6 +4407,7 @@ class Scheduler:
             if task_id:
                 with self._layer_config_lock:
                     self._local_pipeline_cancelled.discard(task_id)
+                    self._local_pipeline_steps.pop(task_id, None)
                 with self._kv_cache_lock:
                     if task_id in self._kv_cache:
                         del self._kv_cache[task_id]
@@ -3514,6 +4422,7 @@ class Scheduler:
             if task_id:
                 with self._layer_config_lock:
                     participated = task_id in self._active_pipeline_task_ids
+                    self._local_pipeline_steps.pop(task_id, None)
                 self._mark_local_pipeline_cancelled(task_id)
                 with self._kv_cache_lock:
                     if task_id in self._kv_cache:
@@ -3539,6 +4448,20 @@ class Scheduler:
         elif msg_type == "layer_config_ack":
             # ---- 主节点：从节点完成模型层加载后的确认 ----
             self._handle_layer_config_ack(client_id, msg)
+
+        elif msg_type == "layer_worker_opt_out":
+            # ---- 主节点：从节点明确切换为本地推理，不再分配模型层 ----
+            if self._effective_role() == "master":
+                self._handle_layer_worker_opt_out(client_id, msg)
+            else:
+                logger.warning("非主节点忽略分层 worker 退出请求: %s", client_id)
+
+        elif msg_type == "layer_worker_opt_in":
+            # ---- 主节点：从节点重新允许接收 PyTorch 分层配置 ----
+            if self._effective_role() == "master":
+                self._handle_layer_worker_opt_in(client_id, msg)
+            else:
+                logger.warning("非主节点忽略分层 worker 加入请求: %s", client_id)
 
         elif msg_type == "log_request":
             # ---- L5: 主节点拉取从节点最近日志 ----
@@ -3627,6 +4550,41 @@ class Scheduler:
                 if key.startswith(prefix):
                     self._pipeline_events.pop(key, None)
             self._chain_ack_state.pop(task_id, None)
+            self._pipeline_task_contracts.pop(task_id, None)
+
+    def has_pipeline_worker_reservation(self) -> bool:
+        """Return whether this PC is reserved for a master's layer pipeline."""
+        with self._layer_config_lock:
+            return bool(self._pipeline_worker_reserved)
+
+    def release_pipeline_worker_for_local_model(self) -> bool:
+        """Opt this client out before an explicit local model operation."""
+        with self._layer_config_lock:
+            self._pipeline_worker_reserved = False
+            self._pipeline_worker_opted_out = True
+            self._active_layer_config = None
+            self._last_layer_config_ack_payload = None
+            self._local_pipeline_steps.clear()
+        if self._effective_role() != "client":
+            return True
+        client = getattr(self, "_tcp_client", None)
+        if not client or not getattr(client, "_running", False):
+            logger.warning("本地模型切换时主节点未连接，已仅清理本地分层预留")
+            return False
+        try:
+            from tcp_comm import MessageType
+
+            client.send_data(
+                {
+                    "node_id": self.get_effective_node_id(),
+                    "reason": "explicit_local_model_change",
+                },
+                MessageType.LAYER_WORKER_OPT_OUT,
+            )
+            return True
+        except Exception:
+            logger.warning("通知主节点退出分层 worker 失败", exc_info=True)
+            return False
 
     def _begin_local_pipeline_task(self, task_id: str) -> None:
         """Track local work so layer reconfiguration cannot replace an active model."""
@@ -3640,9 +4598,14 @@ class Scheduler:
         pending = None
         with self._layer_config_lock:
             self._active_pipeline_task_ids.discard(task_id)
+            self._local_pipeline_steps.pop(task_id, None)
             if not self._active_pipeline_task_ids and self._pending_layer_config is not None:
-                pending = self._pending_layer_config
-                self._pending_layer_config = None
+                pending_config_id = str(
+                    self._pending_layer_config[1].get("config_id", "")
+                )
+                if not pending_config_id or pending_config_id not in self._layer_config_inflight:
+                    pending = self._pending_layer_config
+                    self._pending_layer_config = None
         if pending is not None:
             client_id, data = pending
             logger.info("当前流水线任务已结束，开始应用延后的分层配置")
@@ -3690,21 +4653,75 @@ class Scheduler:
     def _handle_chain_forward_ack(self, client_id: str, msg: dict) -> None:
         """主节点：记录链式转发每跳 ACK/错误，并在错误时立即唤醒流水线。"""
         data = msg.get("data", {})
-        task_id = data.get("task_id", "")
-        step = data.get("step", -1)
+        task_id = str(data.get("task_id", "") or "")
+        try:
+            step = int(data.get("step", -1))
+        except (TypeError, ValueError):
+            logger.warning("丢弃 step 无效的链式 ACK: task=%s", task_id or "-")
+            return
         status = data.get("status", "received")
         error = data.get("error", "")
-        reporter_node_id = data.get("node_id", client_id)
+        config_id = str(data.get("config_id", ""))
+        reporter_node_id = str(data.get("node_id", client_id))
         target_node_id = data.get("target_node_id", "")
         node_id = target_node_id if status in ("sent", "error") and target_node_id else reporter_node_id
 
         if not task_id or not node_id:
+            return
+        if reporter_node_id != client_id:
+            logger.warning(
+                "丢弃来源不一致的链式 ACK: connection=%s payload=%s",
+                client_id, reporter_node_id,
+            )
+            return
+        if status not in {"sent", "received", "error"}:
+            logger.warning("丢弃未知链式 ACK 状态: %s", status)
             return
 
         now = time.time()
         with self._pipeline_lock:
             if task_id not in self._pipeline_active_tasks:
                 return
+            contract = self._pipeline_task_contracts.get(task_id, {})
+            worker_ids = list(contract.get("worker_ids", []))
+            expected_nodes = set(worker_ids)
+            if (step != contract.get("current_step")
+                    or config_id != contract.get("config_id")
+                    or reporter_node_id not in expected_nodes
+                    or node_id not in expected_nodes):
+                logger.warning(
+                    "丢弃不符合执行契约的链式 ACK: task=%s step=%s "
+                    "node=%s config=%s",
+                    task_id, step, node_id, config_id,
+                )
+                return
+            if status == "sent" or (status == "error" and target_node_id):
+                reporter_index = worker_ids.index(reporter_node_id)
+                expected_target = (
+                    worker_ids[reporter_index + 1]
+                    if reporter_index + 1 < len(worker_ids) else ""
+                )
+                if not target_node_id or target_node_id != expected_target:
+                    logger.warning(
+                        "丢弃非相邻链路 %s ACK: task=%s reporter=%s "
+                        "target=%s expected=%s",
+                        status, task_id, reporter_node_id,
+                        target_node_id, expected_target,
+                    )
+                    return
+            elif status == "received":
+                receiver_index = worker_ids.index(reporter_node_id)
+                expected_source = (
+                    worker_ids[receiver_index - 1] if receiver_index > 0 else ""
+                )
+                if str(data.get("from_node_id", "")) != expected_source:
+                    logger.warning(
+                        "丢弃非相邻链路 received ACK: task=%s receiver=%s "
+                        "source=%s expected=%s",
+                        task_id, reporter_node_id,
+                        data.get("from_node_id", ""), expected_source,
+                    )
+                    return
             task_state = self._chain_ack_state.setdefault(task_id, {})
             step_state = task_state.setdefault(step, {})
             existing = step_state.get(node_id, {})
@@ -3774,6 +4791,11 @@ class Scheduler:
 
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
+        self._task_worker_control.disconnect_worker(client_id)
+        with self._task_worker_stage_lock:
+            remote_provider = self._remote_task_worker_providers.get(client_id)
+        if remote_provider is not None:
+            remote_provider.notify_disconnect()
         with self._forward_cancel_lock:
             client_cancellations = [
                 event for (owner_id, _), event
@@ -3822,6 +4844,12 @@ class Scheduler:
             logger.debug("忽略旧主节点连接的迟到断连回调")
             return
 
+        self._task_worker_control.disconnect_coordinator()
+        with self._task_worker_stage_lock:
+            for active in self._task_worker_active_attempts.values():
+                active.cancel_reason = "coordinator_disconnected"
+                active.cancel_event.set()
+
         with self._client_pending_lock:
             for request_id, event in self._client_pending_events.items():
                 self._client_pending_results[request_id] = {
@@ -3847,7 +4875,17 @@ class Scheduler:
             active_tasks.extend(self._active_pipeline_task_ids)
             active_tasks = list(dict.fromkeys(active_tasks))
             self._active_pipeline_task_ids.clear()
+            self._local_pipeline_steps.clear()
             self._pending_layer_config = None
+            self._active_layer_config = None
+            self._last_layer_config_ack_payload = None
+            self._pipeline_worker_reserved = False
+            self._layer_config_inflight.clear()
+            self._layer_config_receive_sequence += 1
+            self._latest_layer_config_receive_sequence = (
+                self._layer_config_receive_sequence
+            )
+            self._latest_layer_config_generation = 0
         for task_id in active_tasks:
             self._record_local_pipeline_participation(task_id, success=False)
         if active_tasks:
@@ -5448,6 +6486,7 @@ class Scheduler:
                 def _on_client_heartbeat() -> None:
                     self._sync_node_rtt(node_id, target_client)
                     self._report_local_device_profile(target_client, node_id)
+                    self._task_worker_control.mark_coordinator_heartbeat()
 
                 target_client.on_heartbeat = _on_client_heartbeat
                 target_client.on_disconnect = (
@@ -5490,6 +6529,7 @@ class Scheduler:
                     client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
                 except Exception:
                     pass
+                self._send_task_worker_hello(client)
 
                 logger.info(f"✅ 从节点 {node_id} 已连接到主节点 {master_host}:{master_port}")
                 return {
@@ -5534,6 +6574,7 @@ class Scheduler:
                             client.send_data({"request": "node_list"}, MessageType.NODE_LIST_SYNC)
                         except Exception:
                             pass
+                        self._send_task_worker_hello(client)
                         logger.info(
                             "✅ 从节点 %s 刷新配置后已连接到主节点 %s:%s",
                             node_id, master_host, master_port,
@@ -6324,12 +7365,33 @@ class Scheduler:
                 return {"status": "error", "reason": f"DB 持久化失败: {e}"}
 
         self._distributed_inference_enabled = bool(enabled)
+        if enabled and self._effective_role() == "client":
+            self._request_pipeline_worker_opt_in()
         logger.info(f"分布式推理已{'启用' if enabled else '禁用'}")
         return {
             "status": "ok",
             "enabled": enabled,
             "message": f"分布式推理已{'启用' if enabled else '禁用'}",
         }
+
+    def _request_pipeline_worker_opt_in(self) -> bool:
+        """Ask the master to include this client in future layer assignments."""
+        with self._layer_config_lock:
+            self._pipeline_worker_opted_out = False
+        client = getattr(self, "_tcp_client", None)
+        if not client or not getattr(client, "_running", False):
+            return False
+        try:
+            from tcp_comm import MessageType
+
+            client.send_data(
+                {"node_id": self.get_effective_node_id()},
+                MessageType.LAYER_WORKER_OPT_IN,
+            )
+            return True
+        except Exception:
+            logger.warning("通知主节点重新加入分层 worker 失败", exc_info=True)
+            return False
 
     # ================================================================
     # 任务转发（从节点 → 主节点）
@@ -6514,30 +7576,107 @@ class Scheduler:
 
     def _schedule_layer_config(self, client_id: str, data: dict) -> None:
         config_id = str(data.get("config_id", "")) if isinstance(data, dict) else ""
+        resend_opt_out = False
         with self._layer_config_lock:
-            cached = self._last_layer_config_ack_payload
-            if (config_id and cached
-                    and cached.get("config_id") == config_id
-                    and config_id not in self._layer_config_inflight):
-                payload = dict(cached)
-            else:
+            if (self._pipeline_worker_opted_out
+                    and isinstance(data, dict)
+                    and not data.get("release")):
+                resend_opt_out = True
+            if resend_opt_out:
                 payload = None
-            if config_id and config_id in self._layer_config_inflight:
+                receive_sequence = 0
+                generation = 0
+            else:
+                cached = self._last_layer_config_ack_payload
+                if (config_id and cached
+                        and cached.get("config_id") == config_id
+                        and config_id not in self._layer_config_inflight):
+                    payload = dict(cached)
+                else:
+                    payload = None
+            if resend_opt_out:
+                pass
+            elif config_id and config_id in self._layer_config_inflight:
                 return
-            if config_id and payload is None:
-                self._layer_config_inflight.add(config_id)
+            if resend_opt_out:
+                pass
+            elif payload is not None:
+                receive_sequence = 0
+                generation = 0
+            else:
+                self._layer_config_receive_sequence += 1
+                receive_sequence = self._layer_config_receive_sequence
+                try:
+                    generation = int(data.get("generation", 0) or 0)
+                except (TypeError, ValueError):
+                    generation = 0
+            if resend_opt_out:
+                pass
+            elif payload is not None:
+                pass
+            elif (self._latest_layer_config_generation
+                  and generation < self._latest_layer_config_generation):
+                logger.info(
+                    "忽略过期分层配置: config=%s generation=%s latest=%s",
+                    config_id,
+                    generation,
+                    self._latest_layer_config_generation,
+                )
+                return
+            else:
+                self._latest_layer_config_receive_sequence = receive_sequence
+                self._latest_layer_config_generation = max(
+                    self._latest_layer_config_generation,
+                    generation,
+                )
+                if isinstance(data, dict) and not data.get("release"):
+                    self._pipeline_worker_reserved = True
+                if config_id:
+                    self._layer_config_inflight.add(config_id)
 
+        if resend_opt_out:
+            logger.info(
+                "本设备已选择本地模型，拒绝分层配置并重发退出请求: config=%s",
+                config_id,
+            )
+            self.release_pipeline_worker_for_local_model()
+            return
         if payload is not None:
             self._send_layer_config_ack(payload)
             return
 
         def _load() -> None:
             try:
-                self._handle_layer_config(client_id, data)
+                self._handle_layer_config(
+                    client_id,
+                    data,
+                    receive_sequence=receive_sequence,
+                    generation=generation,
+                )
             finally:
                 if config_id:
                     with self._layer_config_lock:
                         self._layer_config_inflight.discard(config_id)
+                        pending_matches = bool(
+                            self._pending_layer_config
+                            and str(self._pending_layer_config[1].get(
+                                "config_id", ""
+                            )) == config_id
+                        )
+                    if pending_matches:
+                        with self._layer_config_lock:
+                            can_apply = not self._active_pipeline_task_ids
+                            pending = (
+                                self._pending_layer_config
+                                if can_apply else None
+                            )
+                            if pending is not None:
+                                self._pending_layer_config = None
+                        if pending is not None:
+                            pending_client_id, pending_data = pending
+                            self._schedule_layer_config(
+                                pending_client_id, pending_data
+                            )
 
         threading.Thread(
             target=_load,
@@ -6545,11 +7684,45 @@ class Scheduler:
             daemon=True,
         ).start()
 
-    def _handle_layer_config(self, client_id: str, data: dict) -> None:
+    def _handle_layer_config(
+        self,
+        client_id: str,
+        data: dict,
+        *,
+        receive_sequence: int = None,
+        generation: int = None,
+    ) -> None:
         with self._layer_execution_lock:
-            self._handle_layer_config_locked(client_id, data)
+            if receive_sequence is not None:
+                with self._layer_config_lock:
+                    if (receive_sequence
+                            != self._latest_layer_config_receive_sequence):
+                        logger.info(
+                            "跳过已被新消息取代的分层配置: config=%s sequence=%s latest=%s",
+                            data.get("config_id", ""),
+                            receive_sequence,
+                            self._latest_layer_config_receive_sequence,
+                        )
+                        return
+                    if (self._latest_layer_config_generation
+                            and generation
+                            < self._latest_layer_config_generation):
+                        return
+            self._handle_layer_config_locked(
+                client_id,
+                data,
+                receive_sequence=receive_sequence,
+                generation=generation,
+            )
 
-    def _handle_layer_config_locked(self, client_id: str, data: dict) -> None:
+    def _handle_layer_config_locked(
+        self,
+        client_id: str,
+        data: dict,
+        *,
+        receive_sequence: int = None,
+        generation: int = None,
+    ) -> None:
         """
         从节点：收到主节点推送的分层配置 → 加载指定层范围。
 
@@ -6567,6 +7740,29 @@ class Scheduler:
                 return
 
         node_id = self.get_effective_node_id()
+        if isinstance(data, dict) and data.get("release"):
+            target_node_id = str(data.get("node_id", node_id))
+            if target_node_id != node_id:
+                logger.warning(
+                    "忽略目标不匹配的分层释放: target=%s local=%s",
+                    target_node_id, node_id,
+                )
+                return
+            with self._layer_config_lock:
+                self._pipeline_worker_reserved = False
+                self._active_layer_config = None
+                self._last_layer_config_ack_payload = None
+                self._local_pipeline_steps.clear()
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": str(data.get("config_id", "")),
+                "generation": data.get("generation", 0),
+                "status": "released",
+                "release": True,
+                "timestamp": time.time(),
+            })
+            logger.info("主节点已释放本设备的分层 worker 预留")
+            return
         if node_id in data and isinstance(data.get(node_id), dict):
             cfg = dict(data[node_id])
         elif isinstance(data, dict) and "start_layer" in data and "end_layer" in data:
@@ -6590,8 +7786,24 @@ class Scheduler:
         has_lm = cfg.get("has_lm_head", False)
         model_id = str(cfg.get("model_id", ""))
         expected_sha256 = str(cfg.get("model_sha256", ""))
-        total_layers = int(cfg.get("total_layers", 0) or 0)
-        master_api_port = int(cfg.get("master_api_port", 8000) or 8000)
+        expected_model_type = str(cfg.get("model_type", "")).lower()
+        try:
+            start = int(start)
+            end = int(end)
+            total_layers = int(cfg.get("total_layers", 0) or 0)
+            master_api_port = int(cfg.get("master_api_port", 8000) or 8000)
+        except (TypeError, ValueError) as exc:
+            error = f"分层配置数字字段无效: {exc}"
+            logger.warning(error)
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": config_id,
+                "status": "error",
+                "error": error,
+            })
+            return
+        configuration_invalidated = False
+        _api = None
 
         logger.info(
             f"🔧 收到分层配置: 节点={node_id}, "
@@ -6602,6 +7814,33 @@ class Scheduler:
         try:
             if target_node_id != node_id:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
+            if expected_model_type not in {"qwen", "qwen2"}:
+                raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
+            missing_contract = [
+                name for name, value in (
+                    ("config_id", config_id),
+                    ("model_id", model_id),
+                    ("model_sha256", expected_sha256),
+                    ("total_layers", total_layers),
+                )
+                if not value
+            ]
+            if missing_contract:
+                raise ValueError(
+                    "分层配置执行契约不完整: " + ", ".join(missing_contract)
+                )
+
+            import api_server as _api
+            # A new generation supersedes the old segment immediately. If model
+            # synchronization or selective loading then fails, neither the API
+            # nor a repeated ACK may advertise the stale generation as ready.
+            with self._layer_config_lock:
+                self._pipeline_worker_reserved = True
+                self._active_layer_config = None
+                self._last_layer_config_ack_payload = None
+                self._local_pipeline_steps.clear()
+            setattr(_api, "model_loaded", False)
+            configuration_invalidated = True
 
             local_sha256 = ""
             local_model_path = None
@@ -6644,7 +7883,6 @@ class Scheduler:
                         f"master={expected_sha256[:16]}..."
                     )
 
-            import api_server as _api
             mgr = getattr(_api, 'model_manager', None)
             if mgr and mgr.is_loaded:
                 # 如果已加载完整模型，重新加载指定层范围
@@ -6679,6 +7917,48 @@ class Scheduler:
             engine = getattr(mgr, '_engine_type', '') or 'pytorch'
             if engine != 'pytorch':
                 raise RuntimeError(f"层拆分要求 PyTorch 引擎，实际为 {engine}")
+            loaded_config = getattr(getattr(mgr, "model", None), "config", None)
+            actual_model_type = str(
+                getattr(loaded_config, "model_type", "") or ""
+            ).lower()
+            if actual_model_type != expected_model_type:
+                raise RuntimeError(
+                    f"模型架构不一致: actual={actual_model_type}, "
+                    f"expected={expected_model_type}"
+                )
+
+            # Model loading can take minutes. A newer assignment/release or a
+            # master disconnect may arrive while this thread owns the execution
+            # lock; never publish the obsolete load as ready afterwards.
+            if receive_sequence is not None:
+                with self._layer_config_lock:
+                    if (receive_sequence
+                            != self._latest_layer_config_receive_sequence
+                            or (self._latest_layer_config_generation
+                                and generation
+                                < self._latest_layer_config_generation)):
+                        raise RuntimeError(
+                            "分层配置在模型加载期间已被更新代际取代"
+                        )
+
+            active_config = {
+                "node_id": node_id,
+                "config_id": config_id,
+                "model_id": model_id,
+                "model_sha256": local_sha256 or expected_sha256,
+                "model_type": actual_model_type,
+                "layer_range": [start, end],
+                "engine": engine,
+            }
+            with self._layer_config_lock:
+                self._pipeline_worker_reserved = True
+                self._active_layer_config = dict(active_config)
+                self._local_pipeline_steps.clear()
+            # Layer config may be the first model load on a clean worker. Keep the
+            # API's compatibility globals aligned so the first forwarded chat does
+            # not auto-load a full/GGUF model over this segment.
+            setattr(_api, "model_loaded", True)
+            setattr(_api, "current_quant", getattr(mgr, "quant_type", None) or "fp16")
 
             self._send_layer_config_ack({
                 "node_id": node_id,
@@ -6686,6 +7966,7 @@ class Scheduler:
                 "status": "ready",
                 "layer_range": [start, end],
                 "model_sha256": local_sha256 or expected_sha256,
+                "model_type": actual_model_type,
                 "engine": engine,
                 "timestamp": time.time(),
             })
@@ -6694,6 +7975,12 @@ class Scheduler:
                 f"Layer {start}-{end}, config_id={config_id or 'legacy'}"
             )
         except Exception as e:
+            if configuration_invalidated and _api is not None:
+                with self._layer_config_lock:
+                    self._active_layer_config = None
+                    self._last_layer_config_ack_payload = None
+                    self._local_pipeline_steps.clear()
+                setattr(_api, "model_loaded", False)
             logger.error(f"加载层范围失败: {e}", exc_info=True)
             self._send_layer_config_ack({
                 "node_id": node_id,
@@ -6701,6 +7988,7 @@ class Scheduler:
                 "status": "error",
                 "layer_range": [start, end],
                 "model_sha256": "",
+                "model_type": expected_model_type,
                 "engine": "pytorch",
                 "error": str(e),
                 "timestamp": time.time(),
@@ -6749,26 +8037,69 @@ class Scheduler:
                 )
                 return
 
-            expected_range = [expected["start_layer"], expected["end_layer"]]
-            ready = (
-                data.get("status") == "ready"
-                and data.get("layer_range") == expected_range
-                and data.get("model_sha256") == expected.get("model_sha256")
-                and data.get("engine") == "pytorch"
-            )
-            self._layer_config_acks[client_id] = dict(data)
-            if ready:
-                self._layer_config_pushed.add(client_id)
-                self._layer_config_retry_state.pop(client_id, None)
+            if expected.get("release"):
+                try:
+                    ack_generation = int(data.get("generation", 0) or 0)
+                except (TypeError, ValueError):
+                    ack_generation = -1
+                released = (
+                    data.get("status") == "released"
+                    and data.get("release") is True
+                    and ack_generation
+                    == int(expected.get("generation", 0) or 0)
+                )
+                self._layer_config_acks[client_id] = dict(data)
+                if released:
+                    self._layer_config_expected.pop(client_id, None)
+                    self._layer_config_pushed.discard(client_id)
+                    self._layer_config_retry_state.pop(client_id, None)
+                else:
+                    state = self._layer_config_retry_state.setdefault(
+                        client_id, {"attempts": 0, "next_retry": 0.0}
+                    )
+                    state["next_retry"] = min(
+                        float(state.get("next_retry", 0.0)),
+                        time.monotonic() + 5.0,
+                    )
+                ready = False
+                expected_range = []
+                release_ack = True
             else:
-                self._layer_config_pushed.discard(client_id)
-                state = self._layer_config_retry_state.setdefault(
-                    client_id, {"attempts": 0, "next_retry": 0.0}
+                release_ack = False
+
+            if not release_ack:
+                expected_range = [expected["start_layer"], expected["end_layer"]]
+                ready = (
+                    data.get("status") == "ready"
+                    and data.get("layer_range") == expected_range
+                    and data.get("model_sha256") == expected.get("model_sha256")
+                    and data.get("model_type") == expected.get("model_type")
+                    and data.get("engine") == "pytorch"
                 )
-                state["next_retry"] = min(
-                    float(state.get("next_retry", 0.0)),
-                    time.monotonic() + 5.0,
+                self._layer_config_acks[client_id] = dict(data)
+                if ready:
+                    self._layer_config_pushed.add(client_id)
+                    self._layer_config_retry_state.pop(client_id, None)
+                else:
+                    self._layer_config_pushed.discard(client_id)
+                    state = self._layer_config_retry_state.setdefault(
+                        client_id, {"attempts": 0, "next_retry": 0.0}
+                    )
+                    state["next_retry"] = min(
+                        float(state.get("next_retry", 0.0)),
+                        time.monotonic() + 5.0,
+                    )
+
+        if release_ack:
+            if released:
+                logger.info(
+                    "✅ 从节点已确认退出分层 worker: node=%s config_id=%s",
+                    client_id,
+                    config_id,
                 )
+            else:
+                logger.error("从节点分层释放 ACK 未通过: node=%s", client_id)
+            return
 
         if ready:
             logger.info(
@@ -6781,6 +8112,51 @@ class Scheduler:
                 f"status={data.get('status')}, error={data.get('error', '')}"
             )
 
+    def _handle_layer_worker_opt_out(self, client_id: str, msg: dict) -> None:
+        """Remove a connected client from future layer assignments."""
+        data = msg.get("data", {})
+        node_id = str(data.get("node_id", client_id))
+        if node_id != client_id:
+            logger.warning(
+                "忽略来源不一致的分层退出请求: connection=%s payload=%s",
+                client_id,
+                node_id,
+            )
+            return
+        with self._layer_config_lock:
+            self._pipeline_worker_opt_out.add(client_id)
+        self._clear_layer_config_state(client_id)
+        db = _get_db()
+        if db and _db_available:
+            try:
+                db.set_layer_assignments({})
+            except Exception:
+                logger.debug("worker 退出后清除分层缓存失败", exc_info=True)
+        logger.info("从节点已退出 PyTorch 分层计算: node=%s", client_id)
+        self.push_layer_config_to_clients()
+
+    def _handle_layer_worker_opt_in(self, client_id: str, msg: dict) -> None:
+        """Allow a connected client to receive layer assignments again."""
+        data = msg.get("data", {})
+        node_id = str(data.get("node_id", client_id))
+        if node_id != client_id:
+            logger.warning(
+                "忽略来源不一致的分层加入请求: connection=%s payload=%s",
+                client_id,
+                node_id,
+            )
+            return
+        with self._layer_config_lock:
+            self._pipeline_worker_opt_out.discard(client_id)
+        db = _get_db()
+        if db and _db_available:
+            try:
+                db.set_layer_assignments({})
+            except Exception:
+                logger.debug("worker 加入后清除分层缓存失败", exc_info=True)
+        logger.info("从节点已重新加入 PyTorch 分层计算: node=%s", client_id)
+        self.push_layer_config_to_clients()
+
     def _run_master_lm_head(self, hidden_states):
         """在主节点对 worker 返回的尾层 hidden states 执行 Norm + LM Head。"""
         import api_server as _api
@@ -6788,18 +8164,10 @@ class Scheduler:
         mgr = getattr(_api, "model_manager", None)
         if not mgr or not mgr.is_loaded or getattr(mgr, "_engine_type", "") != "pytorch":
             raise RuntimeError("主节点 PyTorch 模型未加载，无法执行 LM Head")
-        model = getattr(mgr, "model", None)
-        transformer = getattr(model, "model", None)
-        norm = getattr(transformer, "norm", None)
-        lm_head = getattr(model, "lm_head", None)
-        if norm is None or lm_head is None:
-            raise RuntimeError("主节点当前分层不含 Norm/LM Head")
-
-        device = mgr.get_device()
-        dtype = next(model.parameters()).dtype
-        with torch.no_grad():
-            states = hidden_states.to(device=device, dtype=dtype)
-            return lm_head(norm(states))
+        project = getattr(mgr, "forward_lm_head", None)
+        if not callable(project):
+            raise RuntimeError("当前模型管理器不支持架构感知 LM Head")
+        return project(hidden_states)
 
     def _handle_layer_forward(self, client_id: str, msg: dict) -> None:
         with self._layer_execution_lock:
@@ -6830,9 +8198,23 @@ class Scheduler:
         from tcp_comm import MessageType, serialize_tensor_fast
 
         data = msg.get("data", {})
-        task_id = data.get("task_id", "unknown")
-        step = data.get("step", 0)
+        task_id = str(data.get("task_id", "unknown") or "unknown")
+        try:
+            step = int(data.get("step", 0))
+        except (TypeError, ValueError):
+            step = -1
         use_kv_cache = data.get("use_kv_cache", False)
+        config_id = str(data.get("config_id", ""))
+        model_sha256 = str(data.get("model_sha256", ""))
+        model_type = str(data.get("model_type", "")).lower()
+        layer_config_invalid = False
+        received_chain_path = data.get("chain_path", [])
+        if not isinstance(received_chain_path, list):
+            received_chain_path = []
+        logical_predecessor = (
+            str(data.get("_chain_predecessor", "") or client_id)
+            if client_id == "master" else client_id
+        )
 
         logger.info(
             f"🔬 收到层前向指令: task={task_id}, step={step}, from={client_id}, "
@@ -6840,17 +8222,84 @@ class Scheduler:
         )
 
         try:
+            if received_chain_path:
+                normalized_path = [str(item) for item in received_chain_path]
+                if (normalized_path[-1] != logical_predecessor
+                        or self.get_effective_node_id() in normalized_path
+                        or len(normalized_path) != len(set(normalized_path))):
+                    raise RuntimeError(
+                        f"链式转发路径与 TCP 前驱不一致: "
+                        f"path={normalized_path}, predecessor={logical_predecessor}"
+                    )
+                received_chain_path = normalized_path
             with self._layer_config_lock:
                 if task_id in self._local_pipeline_cancelled:
                     logger.info("忽略已取消任务的迟到层前向: task=%s", task_id)
                     return
+                active_config = dict(self._active_layer_config or {})
+                last_step = self._local_pipeline_steps.get(task_id)
+                task_active = task_id in self._active_pipeline_task_ids
+            if not active_config:
+                layer_config_invalid = True
+                raise RuntimeError("本节点没有已确认的活动层配置")
+            for field, actual in (
+                ("config_id", config_id),
+                ("model_sha256", model_sha256),
+                ("model_type", model_type),
+            ):
+                if not actual or actual != str(active_config.get(field, "")):
+                    raise RuntimeError(
+                        f"流水线执行契约不一致: {field}={actual or '-'}, "
+                        f"expected={active_config.get(field, '-') }"
+                    )
+            if step < 0:
+                raise RuntimeError(f"无效流水线 step: {step}")
+            if step == 0:
+                if use_kv_cache:
+                    raise RuntimeError("prefill step 0 不得声明使用既有 KV cache")
+                if task_active or last_step is not None:
+                    raise RuntimeError(f"重复 prefill: task={task_id}")
+            else:
+                if not use_kv_cache:
+                    raise RuntimeError(f"decode step {step} 必须使用 KV cache")
+                if not task_active or last_step != step - 1:
+                    raise RuntimeError(
+                        f"流水线 step 越序: task={task_id}, step={step}, "
+                        f"last_step={last_step}"
+                    )
             import api_server as _api
             from tcp_comm import deserialize_tensor_fast
 
             mgr = getattr(_api, 'model_manager', None)
             if not mgr or not mgr.is_loaded:
-                self._send_layer_result(client_id, task_id, error="模型未加载")
-                return
+                layer_config_invalid = True
+                raise RuntimeError("模型未加载")
+            loaded_config = getattr(getattr(mgr, "model", None), "config", None)
+            actual_model_type = str(
+                getattr(loaded_config, "model_type", "") or ""
+            ).lower()
+            if getattr(mgr, "_engine_type", "") != "pytorch":
+                layer_config_invalid = True
+                raise RuntimeError(f"worker 引擎已变化: {getattr(mgr, '_engine_type', '')}")
+            if actual_model_type != model_type:
+                layer_config_invalid = True
+                raise RuntimeError(
+                    f"worker 模型架构已变化: actual={actual_model_type}, expected={model_type}"
+                )
+            if str(getattr(mgr, "active_model_id", "") or "") != str(
+                active_config.get("model_id", "")
+            ):
+                layer_config_invalid = True
+                raise RuntimeError(
+                    f"worker 模型 ID 已变化: actual={getattr(mgr, 'active_model_id', '')}, "
+                    f"expected={active_config.get('model_id', '')}"
+                )
+            if list(getattr(mgr, "layer_range", ()) or ()) != active_config.get("layer_range"):
+                layer_config_invalid = True
+                raise RuntimeError(
+                    f"worker 层范围已变化: actual={getattr(mgr, 'layer_range', None)}, "
+                    f"expected={active_config.get('layer_range')}"
+                )
 
             # ---- 反序列化输入 ----
             input_ids = None
@@ -6888,11 +8337,19 @@ class Scheduler:
                 with self._kv_cache_lock:
                     if task_id in self._kv_cache:
                         past_kv = self._kv_cache[task_id]
+                if past_kv is None:
+                    raise RuntimeError(
+                        f"decode step {step} 缺少本地 KV cache: task={task_id}"
+                    )
                 if past_kv:
+                    cached_shape = past_kv[0][0].shape
+                    cached_seq_len = (
+                        cached_shape[1] if model_type == "qwen" else cached_shape[2]
+                    )
                     logger.debug(
                         f"📦 KV cache 命中: task={task_id}, "
                         f"layers={len(past_kv)}, "
-                        f"seq_len={past_kv[0][0].shape[2] if past_kv else 0}"
+                        f"seq_len={cached_seq_len}"
                     )
 
             # ---- 执行前向传播 ----
@@ -6921,22 +8378,34 @@ class Scheduler:
             if result.get("past_key_values"):
                 with self._kv_cache_lock:
                     self._kv_cache[task_id] = result["past_key_values"]
-                kv_seq_len = result["past_key_values"][0][0].shape[2]
+                kv_shape = result["past_key_values"][0][0].shape
+                kv_seq_len = kv_shape[1] if model_type == "qwen" else kv_shape[2]
                 logger.debug(
                     f"💾 KV cache 已更新: task={task_id}, "
                     f"seq_len={kv_seq_len}"
                 )
+            else:
+                raise RuntimeError("分层前向未返回 KV cache")
+            with self._layer_config_lock:
+                self._local_pipeline_steps[task_id] = step
 
             # ---- 序列化输出 ----
             response = {
                 "task_id": task_id,
-                "node_id": NODE_ID,
+                "node_id": self.get_effective_node_id(),
                 "step": step,
+                "config_id": config_id,
+                "model_sha256": model_sha256,
+                "model_type": model_type,
+                "chain_path": [
+                    *[str(item) for item in received_chain_path],
+                    self.get_effective_node_id(),
+                ],
                 "metrics": {
                     "time_ms": round(elapsed_ms, 1),
                     "kv_cache": use_kv_cache,  # 标记是否使用了 KV cache
                     "kv_seq_len": (
-                        result["past_key_values"][0][0].shape[2]
+                        kv_seq_len
                         if result.get("past_key_values") else 0
                     ),
                     "memory_allocated_gb": (
@@ -6982,6 +8451,10 @@ class Scheduler:
                 chain_data = {
                     "task_id": task_id,
                     "step": step,
+                    "config_id": config_id,
+                    "model_sha256": model_sha256,
+                    "model_type": model_type,
+                    "chain_path": response["chain_path"],
                     "hidden_states": _b64.b64encode(_hs).decode("ascii") if _hs else None,
                     "hidden_shape": response.get("hidden_shape"),
                     "chain_next": chain_remaining[0] if chain_remaining else None,
@@ -6998,7 +8471,8 @@ class Scheduler:
                     self._send_chain_forward_ack(
                         task_id=task_id,
                         step=step,
-                        from_node_id=NODE_ID,
+                        config_id=config_id,
+                        from_node_id=self.get_effective_node_id(),
                         target_node_id=chain_next["node_id"],
                         status="sent",
                     )
@@ -7026,7 +8500,8 @@ class Scheduler:
                         self._send_chain_forward_ack(
                             task_id=task_id,
                             step=step,
-                            from_node_id=NODE_ID,
+                            config_id=config_id,
+                            from_node_id=self.get_effective_node_id(),
                             target_node_id=chain_next["node_id"],
                             status="error",
                             error=error_msg,
@@ -7036,13 +8511,41 @@ class Scheduler:
                 self._send_layer_result("master", task_id, result_data=response)
 
         except Exception as e:
+            with self._kv_cache_lock:
+                self._kv_cache.pop(task_id, None)
+            with self._layer_config_lock:
+                self._local_pipeline_steps.pop(task_id, None)
+                if layer_config_invalid:
+                    self._active_layer_config = None
+                    self._last_layer_config_ack_payload = None
             self._record_local_pipeline_participation(task_id, success=False)
             self._finish_local_pipeline_task(task_id)
+            if layer_config_invalid:
+                try:
+                    import api_server as _api
+                    setattr(_api, "model_loaded", False)
+                except Exception:
+                    logger.debug("worker 层配置失效后更新 API 状态失败", exc_info=True)
             logger.error(f"层前向传播失败: task={task_id}, error={e}", exc_info=True)
-            self._send_layer_result("master", task_id, error=str(e))
+            error_result = {
+                "node_id": self.get_effective_node_id(),
+                "step": step,
+                "config_id": config_id,
+                "model_sha256": model_sha256,
+                "model_type": model_type,
+            }
+            if layer_config_invalid:
+                error_result["layer_config_invalid"] = True
+            self._send_layer_result(
+                "master",
+                task_id,
+                result_data=error_result,
+                error=str(e),
+            )
             self._send_chain_forward_ack(
                 task_id=task_id,
                 step=step,
+                config_id=config_id,
                 from_node_id=client_id,
                 status="error",
                 error=str(e),
@@ -7062,7 +8565,11 @@ class Scheduler:
         self._send_chain_forward_ack(
             task_id=task_id,
             step=step,
-            from_node_id=client_id,
+            config_id=str(data.get("config_id", "")),
+            from_node_id=(
+                str(data.get("_chain_predecessor", "") or client_id)
+                if client_id == "master" else client_id
+            ),
             status="received",
         )
         self._handle_layer_forward(client_id, msg)
@@ -7106,6 +8613,7 @@ class Scheduler:
             return False
 
     def _send_chain_forward_ack(self, task_id: str, step: int,
+                                config_id: str = "",
                                 from_node_id: str = "",
                                 target_node_id: str = "",
                                 status: str = "received",
@@ -7122,7 +8630,8 @@ class Scheduler:
         payload = {
             "task_id": task_id,
             "step": step,
-            "node_id": NODE_ID,
+            "config_id": config_id,
+            "node_id": self.get_effective_node_id(),
             "from_node_id": from_node_id,
             "status": status,
         }
@@ -7152,20 +8661,63 @@ class Scheduler:
         """
         data = msg.get("data", {})
         task_id = data.get("task_id", "")
-        node_id = data.get("node_id", client_id)
+        node_id = str(data.get("node_id", client_id))
+        try:
+            step = int(data.get("step", -1))
+        except (TypeError, ValueError):
+            step = -1
+        config_id = str(data.get("config_id", ""))
+
+        if node_id != client_id:
+            logger.warning(
+                "丢弃来源不一致的层结果: connection=%s payload=%s task=%s",
+                client_id, node_id, task_id or "-",
+            )
+            return
 
         with self._pipeline_lock:
             is_active = task_id in self._pipeline_active_tasks
+            contract = dict(self._pipeline_task_contracts.get(task_id, {}))
         if not is_active:
             logger.warning(
                 "丢弃非活跃流水线任务结果: task=%s node=%s",
                 task_id or "-", node_id,
             )
             return
+        worker_ids = list(contract.get("worker_ids", []))
+        expected_nodes = set(worker_ids)
+        if (node_id not in expected_nodes
+                or step != contract.get("current_step")
+                or config_id != contract.get("config_id")
+                or data.get("model_sha256") != contract.get("model_sha256")
+                or data.get("model_type") != contract.get("model_type")):
+            logger.warning(
+                "丢弃不符合执行契约的层结果: task=%s node=%s step=%s config=%s",
+                task_id, node_id, step, config_id,
+            )
+            return
 
         # ★ 中转请求：从节点直连失败 → 请主节点转发到目标节点
         relay_target = data.get("_relay_to")
         if relay_target:
+            source_index = worker_ids.index(node_id)
+            expected_target = (
+                worker_ids[source_index + 1]
+                if source_index + 1 < len(worker_ids) else ""
+            )
+            if relay_target != expected_target:
+                error = (
+                    f"非相邻中转目标: source={node_id}, "
+                    f"target={relay_target}, expected={expected_target or '-'}"
+                )
+                logger.error(
+                    "终止非法链路中转: task=%s %s",
+                    task_id, error,
+                )
+                self._set_pipeline_result_error(
+                    task_id, node_id, error, step
+                )
+                return
             logger.info(
                 f"🔄 主节点中转: {node_id} → {relay_target} "
                 f"(task={task_id}, step={data.get('step', '?')})"
@@ -7176,15 +8728,17 @@ class Scheduler:
                     k: v for k, v in data.items()
                     if k != "_relay_to"
                 }
+                relay_data["_chain_predecessor"] = node_id
                 from tcp_comm import MessageType
                 self._send_to_worker(relay_target, relay_data,
                                      MessageType.CHAIN_FORWARD)
                 self._handle_chain_forward_ack(
-                    relay_target,
+                    node_id,
                     {
                         "data": {
                             "task_id": task_id,
-                            "step": data.get("step", -1),
+                            "step": step,
+                            "config_id": config_id,
                             "node_id": node_id,
                             "target_node_id": relay_target,
                             "status": "sent",
@@ -7206,6 +8760,32 @@ class Scheduler:
                     data.get("step", -1),
                 )
                 return
+
+        if data.get("layer_config_invalid"):
+            self._invalidate_worker_layer_ready(
+                node_id, config_id, str(data.get("error", "") or "worker 层配置失效")
+            )
+
+        if not data.get("error") and node_id != contract.get("last_node_id"):
+            logger.warning(
+                "丢弃非末节点成功结果: task=%s node=%s expected=%s",
+                task_id, node_id, contract.get("last_node_id"),
+            )
+            return
+        if (not data.get("error")
+                and data.get("chain_path") != worker_ids):
+            error = (
+                f"链路路径不完整: path={data.get('chain_path')}, "
+                f"expected={worker_ids}"
+            )
+            logger.error(
+                "终止链路路径不完整的任务: task=%s path=%s expected=%s",
+                task_id, data.get("chain_path"), worker_ids,
+            )
+            self._set_pipeline_result_error(
+                task_id, node_id, error, step
+            )
+            return
 
         logger.info(
             f"📥 收到层前向结果: task={task_id}, node={node_id}, "
@@ -7290,6 +8870,7 @@ class Scheduler:
                 and ack.get("config_id") == expected.get("config_id")
                 and ack.get("layer_range") == expected_range
                 and ack.get("model_sha256") == expected.get("model_sha256")
+                and ack.get("model_type") == expected.get("model_type")
                 and ack.get("engine") == "pytorch"
             )
             layer_status = "ready" if layer_ready else (
@@ -7425,6 +9006,7 @@ class Scheduler:
                     and ack.get("config_id") == expected.get("config_id")
                     and ack.get("layer_range") == expected_range
                     and ack.get("model_sha256") == expected.get("model_sha256")
+                    and ack.get("model_type") == expected.get("model_type")
                     and ack.get("engine") == "pytorch"
                 )
             if not layer_ready:
@@ -7586,7 +9168,8 @@ class Scheduler:
                                timeout: float = 30.0,
                                ack_node_ids: list = None,
                                ack_step: int = None,
-                               ack_timeout: float = None) -> Optional[dict]:
+                               ack_timeout: float = None,
+                               cancel_event: threading.Event = None) -> Optional[dict]:
         """
         主节点：等待指定节点的 LAYER_RESULT。
 
@@ -7623,6 +9206,14 @@ class Scheduler:
         # 等待任一 event 触发
         deadline = time.time() + timeout
         while result is None and time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                result = {
+                    "task_id": task_id,
+                    "error": "流水线任务已取消",
+                    "cancelled": True,
+                    "step": ack_step if ack_step is not None else -1,
+                }
+                break
             if ack_node_ids and ack_step is not None and ack_timeout is not None:
                 ack_failure = self._get_chain_ack_failure(
                     task_id, ack_step, ack_node_ids, ack_timeout,
@@ -7674,7 +9265,8 @@ class Scheduler:
                                         timeout: float,
                                         ack_node_ids: list,
                                         ack_step: int,
-                                        ack_timeout: float) -> Optional[dict]:
+                                        ack_timeout: float,
+                                        cancel_event: threading.Event = None) -> Optional[dict]:
         """等待流水线结果；兼容测试或旧扩展中替换掉的三参数等待函数。"""
         try:
             return self._wait_for_layer_result(
@@ -7684,9 +9276,11 @@ class Scheduler:
                 ack_node_ids=ack_node_ids,
                 ack_step=ack_step,
                 ack_timeout=ack_timeout,
+                cancel_event=cancel_event,
             )
         except TypeError as e:
-            if "ack_node_ids" not in str(e):
+            if ("ack_node_ids" not in str(e)
+                    and "cancel_event" not in str(e)):
                 raise
             logger.debug(
                 "_wait_for_layer_result 不支持 ACK 参数，退回旧签名调用",
@@ -8016,6 +9610,35 @@ class Scheduler:
                     logger.warning(f"模型恢复失败（将继续）: {restore_err}")
             return {"response": "", "error": err_msg}
 
+        # Freeze the worker configuration generation for the complete task.
+        # A topology/model refresh after this point must not be mixed into an
+        # already running token sequence.
+        worker_ids = [node["node_id"] for node in pipeline_nodes]
+        with self._layer_config_lock:
+            worker_contracts = [
+                dict(self._layer_config_expected.get(node_id, {}))
+                for node_id in worker_ids
+            ]
+        config_ids = {item.get("config_id") for item in worker_contracts if item}
+        model_hashes = {item.get("model_sha256") for item in worker_contracts if item}
+        model_types = {item.get("model_type") for item in worker_contracts if item}
+        if (len(worker_contracts) != len(worker_ids)
+                or any(not item for item in worker_contracts)
+                or len(config_ids) != 1
+                or len(model_hashes) != 1
+                or len(model_types) != 1):
+            return {"response": "", "error": "worker 层配置代际不一致，请等待重新就绪"}
+        pipeline_config_id = str(next(iter(config_ids)))
+        pipeline_model_sha256 = str(next(iter(model_hashes)))
+        pipeline_model_type = str(next(iter(model_types)))
+        master_model_type = str(
+            getattr(getattr(getattr(mgr, "model", None), "config", None), "model_type", "")
+            or ""
+        ).lower()
+        if (master_model_type != pipeline_model_type
+                or self._get_master_model_sha256() != pipeline_model_sha256):
+            return {"response": "", "error": "主节点模型已变化，请等待层配置重新同步"}
+
         full_chain = ([master_assignment] if master_participates else []) + pipeline_nodes
         logger.info(
             f"🚀 启动流水线推理: prompt_len={len(prompt)}, "
@@ -8043,6 +9666,14 @@ class Scheduler:
         task_id = uuid.uuid4().hex[:12]
         with self._pipeline_lock:
             self._pipeline_active_tasks.add(task_id)
+            self._pipeline_task_contracts[task_id] = {
+                "config_id": pipeline_config_id,
+                "model_sha256": pipeline_model_sha256,
+                "model_type": pipeline_model_type,
+                "worker_ids": worker_ids,
+                "last_node_id": pipeline_nodes[-1]["node_id"],
+                "current_step": -1,
+            }
         self._pipeline_context.stack.append({
             "task_id": task_id,
             "pipeline_nodes": pipeline_nodes,
@@ -8188,6 +9819,16 @@ class Scheduler:
             logits = None
             step_error = None
 
+            with self._pipeline_lock:
+                contract = self._pipeline_task_contracts.get(task_id)
+                if contract is None:
+                    return {"response": "", "error": "流水线任务执行契约已失效"}
+                contract["current_step"] = step
+                prefix = f"{task_id}:"
+                for stale_key in list(self._pipeline_results):
+                    if stale_key.startswith(prefix):
+                        self._pipeline_results.pop(stale_key, None)
+
             # 判断 Prefill vs Decode
             is_prefill = (step == 0)
 
@@ -8212,6 +9853,10 @@ class Scheduler:
             forward_data = {
                 "task_id": task_id,
                 "step": step,
+                "config_id": pipeline_config_id,
+                "model_sha256": pipeline_model_sha256,
+                "model_type": pipeline_model_type,
+                "chain_path": [],
                 "temperature": temperature,
                 "top_p": top_p,
                 "use_kv_cache": not is_prefill,  # ★ Prefill=False, Decode=True
@@ -8225,6 +9870,10 @@ class Scheduler:
                     if not is_prefill:
                         with self._kv_cache_lock:
                             past_kv = self._kv_cache.get(task_id)
+                        if past_kv is None:
+                            raise RuntimeError(
+                                f"主节点 decode step {step} 缺少 KV cache"
+                            )
                     local_input_ids = input_ids if is_prefill else torch.tensor(
                         [[new_token_id]], dtype=torch.long
                     )
@@ -8302,6 +9951,7 @@ class Scheduler:
                 ack_node_ids=[n["node_id"] for n in pipeline_nodes[1:]] if has_chain else [],
                 ack_step=step,
                 ack_timeout=min(5.0, max(1.0, PIPELINE_STEP_TIMEOUT / 6)),
+                cancel_event=_cancel_event,
             )
             if _cancel_event is not None and _cancel_event.is_set():
                 step_error = "流水线任务已取消"
@@ -9355,6 +11005,8 @@ class Scheduler:
             old_node = self.nodes.pop(node_id)
 
         self._clear_layer_config_state(node_id)
+        with self._layer_config_lock:
+            self._pipeline_worker_opt_out.discard(node_id)
 
         db = _get_db()
         if db and _db_available:

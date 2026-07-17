@@ -11,9 +11,9 @@ from typing import Any, Mapping
 
 
 PROTOCOL_NAME = "qlh.task_worker"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MIN_PROTOCOL_VERSION = 1
-MAX_PROTOCOL_VERSION = 1
+MAX_PROTOCOL_VERSION = 2
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
 MESSAGE_TYPES = frozenset({
@@ -69,6 +69,11 @@ _PAYLOAD_FIELDS = {
     "stage_cancelled": _IDENTITY_FIELDS | {
         "provider_id", "reason_code",
     },
+}
+_PAYLOAD_FIELDS_V2 = {
+    **_PAYLOAD_FIELDS,
+    "stage_offer": _PAYLOAD_FIELDS["stage_offer"] | {"model_identity"},
+    "stage_accept": _PAYLOAD_FIELDS["stage_accept"] | {"retryable"},
 }
 
 
@@ -221,6 +226,12 @@ def negotiate_protocol_version(
     local_min, local_max = _validate_version_range(
         local_min_version, local_max_version, prefix="local"
     )
+    if local_min < MIN_PROTOCOL_VERSION or local_max > MAX_PROTOCOL_VERSION:
+        raise _error(
+            "invalid_version_range",
+            "local",
+            "local range includes an unimplemented protocol version",
+        )
     selected = min(remote_max, local_max)
     if selected < max(remote_min, local_min):
         raise _error(
@@ -237,6 +248,25 @@ def _validate_identity(payload: dict[str, Any]) -> None:
     _require_string(payload["attempt_id"], "payload.attempt_id", pattern=_ATTEMPT_ID)
     _require_string(payload["lease_id"], "payload.lease_id", pattern=_LEASE_ID)
     _require_int(payload["lease_epoch"], "payload.lease_epoch", minimum=1)
+
+
+def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
+    model = _require_object(value, field)
+    _require_exact_fields(
+        model,
+        {"model_id", "engine", "format", "revision", "sha256"},
+        field,
+    )
+    _require_string(model["model_id"], f"{field}.model_id", pattern=_SAFE_ID)
+    if model["engine"] not in {"pytorch", "llama_cpp"}:
+        raise _error(
+            "invalid_model_identity", f"{field}.engine",
+            "model engine is unsupported",
+        )
+    _require_string(model["format"], f"{field}.format", pattern=_SAFE_ID)
+    _require_string(model["revision"], f"{field}.revision", pattern=_SAFE_ID)
+    _require_string(model["sha256"], f"{field}.sha256", pattern=_SHA256)
+    return model
 
 
 def _validate_capabilities(value: Any) -> None:
@@ -284,20 +314,13 @@ def _validate_capabilities(value: Any) -> None:
     model_ids = []
     for index, model in enumerate(models):
         field = f"payload.capabilities.models[{index}]"
-        model = _require_object(model, field)
-        _require_exact_fields(
-            model, {"model_id", "engine", "format", "revision", "sha256"}, field,
-        )
-        _require_string(model["model_id"], f"{field}.model_id", pattern=_SAFE_ID)
+        model = _validate_model_identity(model, field)
         model_ids.append(model["model_id"])
         if model["engine"] not in engines:
             raise _error(
                 "invalid_capabilities", f"{field}.engine",
                 "model engine was not declared by the worker",
             )
-        _require_string(model["format"], f"{field}.format", pattern=_SAFE_ID)
-        _require_string(model["revision"], f"{field}.revision", pattern=_SAFE_ID)
-        _require_string(model["sha256"], f"{field}.sha256", pattern=_SHA256)
     if len(model_ids) != len(set(model_ids)):
         raise _error(
             "invalid_capabilities", "payload.capabilities.models",
@@ -356,8 +379,13 @@ def _validate_metadata(value: Any) -> None:
             _require_int(item, f"payload.metadata.usage.{key}", minimum=0)
 
 
-def _validate_payload(message_type: str, payload: dict[str, Any]) -> None:
-    _require_exact_fields(payload, _PAYLOAD_FIELDS[message_type], "payload")
+def _validate_payload(
+    message_type: str,
+    payload: dict[str, Any],
+    version: int,
+) -> None:
+    fields = _PAYLOAD_FIELDS_V2 if version >= 2 else _PAYLOAD_FIELDS
+    _require_exact_fields(payload, fields[message_type], "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
         if payload["worker_kind"] != "pc_full_worker":
@@ -383,7 +411,7 @@ def _validate_payload(message_type: str, payload: dict[str, Any]) -> None:
             payload["reason_code"], "payload.reason_code", pattern=_SAFE_CODE,
             allow_empty=True, max_length=64,
         )
-        if accepted and selected != PROTOCOL_VERSION:
+        if accepted and selected != version:
             raise _error(
                 "invalid_selected_version", "payload.selected_version",
                 "accepted negotiation must select the supported version",
@@ -426,6 +454,10 @@ def _validate_payload(message_type: str, payload: dict[str, Any]) -> None:
                 "input_digest_mismatch", "payload.input_sha256",
                 "stage input digest does not match payload",
             )
+        if version >= 2:
+            _validate_model_identity(
+                payload["model_identity"], "payload.model_identity",
+            )
     elif message_type == "stage_accept":
         accepted = _require_bool(payload["accepted"], "payload.accepted")
         reason = _require_string(
@@ -437,6 +469,15 @@ def _validate_payload(message_type: str, payload: dict[str, Any]) -> None:
                 "invalid_acceptance_result", "payload",
                 "accepted offers require no reason; rejected offers require one",
             )
+        if version >= 2:
+            retryable = _require_bool(
+                payload["retryable"], "payload.retryable",
+            )
+            if accepted and retryable:
+                raise _error(
+                    "invalid_acceptance_result", "payload.retryable",
+                    "accepted offers cannot be retryable failures",
+                )
     elif message_type == "lease_renew":
         _require_int(
             payload["lease_expires_at_ms"], "payload.lease_expires_at_ms",
@@ -474,7 +515,7 @@ def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
     if protocol != PROTOCOL_NAME:
         raise _error("unsupported_protocol", "protocol", "unsupported protocol")
     version = _require_int(value["version"], "version", minimum=1)
-    if version != PROTOCOL_VERSION:
+    if version < MIN_PROTOCOL_VERSION or version > MAX_PROTOCOL_VERSION:
         raise _error(
             "unsupported_protocol_version", "version",
             "unsupported protocol version",
@@ -492,7 +533,7 @@ def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
     )
     sent_at_ms = _require_int(value["sent_at_ms"], "sent_at_ms", minimum=0)
     payload = _require_object(value["payload"], "payload")
-    _validate_payload(message_type, payload)
+    _validate_payload(message_type, payload, version)
     if message_type in {"stage_offer", "lease_renew"} and (
         payload["lease_expires_at_ms"] <= sent_at_ms
     ):
@@ -508,7 +549,13 @@ def validate_message(value: Mapping[str, Any]) -> WorkerMessage:
         sent_at_ms=sent_at_ms,
         _payload_json=canonical_json(payload),
     )
-    if len(canonical_message_bytes(message)) > MAX_MESSAGE_BYTES:
+    try:
+        message_size = len(canonical_message_bytes(message))
+    except UnicodeEncodeError as exc:
+        raise _error(
+            "invalid_encoding", "message", "message must be valid UTF-8"
+        ) from exc
+    if message_size > MAX_MESSAGE_BYTES:
         raise _error(
             "message_too_large", "message", "message exceeds maximum size"
         )
@@ -546,7 +593,13 @@ def decode_message(raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
                 "invalid_encoding", "message", "message must be UTF-8"
             ) from exc
     if isinstance(raw, str):
-        if len(raw.encode("utf-8")) > MAX_MESSAGE_BYTES:
+        try:
+            raw_size = len(raw.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise _error(
+                "invalid_encoding", "message", "message must be valid UTF-8"
+            ) from exc
+        if raw_size > MAX_MESSAGE_BYTES:
             raise _error(
                 "message_too_large", "message", "message exceeds maximum size"
             )
@@ -565,15 +618,26 @@ def canonical_message_bytes(message: WorkerMessage) -> bytes:
     return canonical_json(message.snapshot()).encode("utf-8")
 
 
-def worker_protocol_status() -> dict[str, Any]:
-    """Report protocol readiness without claiming a network adapter exists."""
+def worker_protocol_status(
+    adapter_status: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Report schema readiness and optional TC-N2 adapter runtime state."""
+    runtime = dict(adapter_status or {})
     return {
         "protocol": PROTOCOL_NAME,
         "min_version": MIN_PROTOCOL_VERSION,
         "max_version": MAX_PROTOCOL_VERSION,
         "fixture_version": 1,
+        "preferred_version": PROTOCOL_VERSION,
         "schema_ready": True,
-        "adapter_connected": False,
-        "transport": "not_implemented",
-        "admission_state": "protocol_frozen_adapter_not_connected",
+        # TC-N2.4 adds an explicit experimental gate. Physical-device
+        # validation and production admission remain fenced.
+        "adapter_connected": bool(runtime.get("adapter_connected", False)),
+        "transport": runtime.get(
+            "transport", "existing_tcp_length_prefixed"
+        ),
+        "admission_state": runtime.get(
+            "admission_state", "n2_4_experiment_disabled"
+        ),
+        **runtime,
     }

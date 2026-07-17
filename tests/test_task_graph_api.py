@@ -13,7 +13,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import api_server
 from task_graph import TaskGraphCoordinator, TaskGraphUnavailable
 from task_journal import JournalEvent, SQLiteTaskJournal
-from task_provider import LocalFullModelProvider, ProviderRegistry
+from task_provider import (
+    LocalFullModelProvider,
+    ModelIdentity,
+    ProviderBusy,
+    ProviderRegistry,
+)
+from task_worker_adapter import RemoteFullWorkerProvider
+from task_worker_protocol import build_message, canonical_sha256
 
 
 class FakeTaskGraphModelManager:
@@ -56,6 +63,12 @@ def task_graph_api(monkeypatch):
     monkeypatch.setattr(api_server, "model_manager", manager)
     monkeypatch.setattr(api_server, "model_loaded", True)
     monkeypatch.setattr(api_server, "TASK_GRAPH_ENABLED", True)
+    monkeypatch.setattr(api_server, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+    monkeypatch.setattr(
+        sys.modules["scheduler"],
+        "TASK_WORKER_EXPERIMENTAL_ENABLED",
+        True,
+    )
     monkeypatch.setattr(api_server, "task_graph_coordinator", coordinator)
     monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
     monkeypatch.setattr(
@@ -97,6 +110,101 @@ def task_graph_api(monkeypatch):
         },
     )
     return manager, coordinator
+
+
+def _remote_worker_provider(
+    identity: ModelIdentity,
+    node_id: str,
+    *,
+    content: str = "remote candidate",
+    error_code: str = "",
+) -> RemoteFullWorkerProvider:
+    holder = {}
+
+    def peer_snapshot():
+        return {
+            "node_id": node_id,
+            "healthy": True,
+            "selected_version": 2,
+            "manual_stage_dispatch_enabled": True,
+            "capabilities": {
+                "stage_types": ["full_inference", "aggregate"],
+                "engines": [identity.engine],
+                "models": [identity.snapshot()],
+                "max_concurrency": 1,
+            },
+        }
+
+    def respond(message):
+        if message.message_type != "stage_offer":
+            return
+        offer = message.payload
+        response_identity = {
+            key: offer[key]
+            for key in (
+                "workflow_id", "stage_id", "attempt_id", "lease_id",
+                "lease_epoch", "provider_id",
+            )
+        }
+        provider = holder["provider"]
+        provider.handle_message(build_message(
+            "stage_accept",
+            {
+                **response_identity,
+                "accepted": True,
+                "reason_code": "",
+                "retryable": False,
+            },
+            message_id=f"msg_accept_{node_id}_{offer['attempt_id']}",
+            sent_at_ms=int(time.time() * 1000),
+            version=2,
+        ).snapshot())
+        if error_code:
+            provider.handle_message(build_message(
+                "stage_error",
+                {
+                    **response_identity,
+                    "error_code": error_code,
+                    "retryable": True,
+                },
+                message_id=f"msg_error_{node_id}_{offer['attempt_id']}",
+                sent_at_ms=int(time.time() * 1000),
+                version=2,
+            ).snapshot())
+            return
+        output = {
+            "content": f"{content}:{offer['stage_id']}",
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6,
+            },
+            "model": identity.model_id,
+        }
+        provider.handle_message(build_message(
+            "stage_result",
+            {
+                **response_identity,
+                "output": output,
+                "output_sha256": canonical_sha256(output),
+                "metadata": {
+                    "usage": output["usage"],
+                    "usage_estimated": False,
+                    "model": identity.model_id,
+                },
+            },
+            message_id=f"msg_result_{node_id}_{offer['attempt_id']}",
+            sent_at_ms=int(time.time() * 1000),
+            version=2,
+        ).snapshot())
+
+    provider = RemoteFullWorkerProvider(
+        node_id=node_id,
+        peer_snapshot=peer_snapshot,
+        send_message=respond,
+    )
+    holder["provider"] = provider
+    return provider
 
 
 def test_task_graph_chat_runs_three_local_stages_with_honest_metrics(task_graph_api):
@@ -149,6 +257,544 @@ def test_task_graph_chat_runs_three_local_stages_with_honest_metrics(task_graph_
     ]
 
 
+def test_task_graph_manual_remote_stage_uses_explicit_provider_without_fallback(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="3" * 64,
+    )
+    provider_holder = {}
+
+    def peer_snapshot():
+        return {
+            "node_id": "worker_01",
+            "healthy": True,
+            "selected_version": 2,
+            "manual_stage_dispatch_enabled": True,
+            "capabilities": {
+                "stage_types": ["full_inference", "aggregate"],
+                "engines": ["llama_cpp"],
+                "models": [identity.snapshot()],
+                "max_concurrency": 1,
+            },
+        }
+
+    def respond(message):
+        offer = message.payload
+        response_identity = {
+            key: offer[key]
+            for key in (
+                "workflow_id", "stage_id", "attempt_id", "lease_id",
+                "lease_epoch", "provider_id",
+            )
+        }
+        provider = provider_holder["provider"]
+        provider.handle_message(build_message(
+            "stage_accept",
+            {
+                **response_identity,
+                "accepted": True,
+                "reason_code": "",
+                "retryable": False,
+            },
+            message_id="msg_apiaccept01",
+            sent_at_ms=int(time.time() * 1000),
+            version=2,
+        ).snapshot())
+        output = {
+            "content": "remote candidate",
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6,
+            },
+            "model": "fake-model",
+        }
+        provider.handle_message(build_message(
+            "stage_result",
+            {
+                **response_identity,
+                "output": output,
+                "output_sha256": canonical_sha256(output),
+                "metadata": {
+                    "usage": output["usage"],
+                    "usage_estimated": False,
+                    "model": "fake-model",
+                },
+            },
+            message_id="msg_apiresult01",
+            sent_at_ms=int(time.time() * 1000),
+            version=2,
+        ).snapshot())
+
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=peer_snapshot,
+        send_message=respond,
+    )
+    provider_holder["provider"] = provider
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+    req = api_server.ChatRequest(
+        message="question",
+        session_id="task-session",
+        max_new_tokens=64,
+        execution_mode="task_graph",
+        workflow_id="wf_apiremote01",
+        task_graph_remote_stage="candidate_a",
+        task_graph_remote_provider_id=provider.provider_id,
+    )
+
+    response = asyncio.run(api_server.chat(req))
+
+    assert len(manager.calls) == 2
+    assert response.metrics["distributed_requested"] is True
+    assert response.metrics["distributed_used"] is True
+    assert response.metrics["distributed_kind"] == "task_graph_remote_manual"
+    assert response.metrics["workers_used"] == ["worker_01"]
+    assert response.metrics["nodes_planned"] == 2
+    assert response.metrics["nodes_participated"] == 2
+    assert response.metrics["manual_remote_stage"] == "candidate_a"
+    assert response.metrics["fallback"] is False
+    workflow = coordinator.get("wf_apiremote01")
+    candidate = next(
+        stage for stage in workflow["stages"]
+        if stage["stage_id"] == "candidate_a"
+    )
+    assert candidate["requested_provider"] == provider.provider_id
+    assert candidate["fallback_providers"] == []
+    assert candidate["attempts"][0]["provider_node_id"] == "worker_01"
+
+
+def test_task_graph_manual_remote_stage_rejects_wrong_model_before_run(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    active_identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="a" * 64,
+    )
+    wrong_identity = ModelIdentity(
+        model_id="other-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-other",
+        sha256="b" * 64,
+    )
+    provider = _remote_worker_provider(wrong_identity, "worker_01")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_active_task_graph_model_identity",
+        lambda: active_identity,
+    )
+    request = api_server.ChatRequest(
+        message="wrong manual model",
+        session_id="task-session",
+        execution_mode="task_graph",
+        workflow_id="wf_manualwrongmodel01",
+        task_graph_remote_stage="candidate_a",
+        task_graph_remote_provider_id=provider.provider_id,
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(request))
+
+    assert captured.value.status_code == 409
+    assert captured.value.detail["reason_code"] == "model_identity_mismatch"
+    assert captured.value.detail["provider_id"] == provider.provider_id
+    assert manager.calls == []
+    assert coordinator.list() == []
+
+
+def test_task_graph_manual_remote_stage_requires_both_explicit_fields(
+    task_graph_api,
+):
+    req = api_server.ChatRequest(
+        message="question",
+        execution_mode="task_graph",
+        task_graph_remote_stage="candidate_a",
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(req))
+
+    assert captured.value.status_code == 400
+    assert "同时指定" in str(captured.value.detail)
+
+
+def test_registered_remote_provider_is_never_selected_without_explicit_fields(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="4" * 64,
+    )
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: {
+            "node_id": "worker_01",
+            "healthy": True,
+            "selected_version": 2,
+            "manual_stage_dispatch_enabled": True,
+            "capabilities": {
+                "stage_types": ["full_inference", "aggregate"],
+                "engines": ["llama_cpp"],
+                "models": [identity.snapshot()],
+                "max_concurrency": 1,
+            },
+        },
+        send_message=lambda _message: pytest.fail(
+            "remote Provider must not receive automatic Stage work"
+        ),
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    listed = asyncio.run(api_server.list_workflows(limit=5))
+    assert provider.provider_id in listed["providers"]
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="local only",
+        session_id="task-session",
+        execution_mode="task_graph",
+        workflow_id="wf_noautoremt01",
+    )))
+
+    assert response.metrics["distributed_used"] is False
+    assert response.metrics["subproviders"] == ["local_full_model"]
+    assert len(manager.calls) == 3
+    workflow = coordinator.get("wf_noautoremt01")
+    assert {
+        attempt["provider"]
+        for stage in workflow["stages"]
+        for attempt in stage["attempts"]
+    } == {"local_full_model"}
+
+
+def test_task_graph_auto_remote_splits_one_candidate_to_one_worker(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="5" * 64,
+    )
+    provider = _remote_worker_provider(identity, "worker_01")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="auto split",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_autooneworker01",
+    )))
+
+    assert len(manager.calls) == 2
+    assert response.metrics["distributed_requested"] is True
+    assert response.metrics["distributed_used"] is True
+    assert response.metrics["distributed_kind"] == "task_graph_remote_auto"
+    assert response.metrics["workers_used"] == ["worker_01"]
+    assert response.metrics["auto_remote_enabled"] is True
+    assert response.metrics["auto_remote_providers"] == [provider.provider_id]
+    assert response.metrics["fallback"] is False
+    workflow = coordinator.get("wf_autooneworker01")
+    stages = {stage["stage_id"]: stage for stage in workflow["stages"]}
+    assert stages["candidate_a"]["requested_provider"] == provider.provider_id
+    assert stages["candidate_a"]["fallback_providers"] == [
+        "local_full_model"
+    ]
+    assert stages["candidate_a"]["pure"] is True
+    assert stages["candidate_b"]["requested_provider"] == "local_full_model"
+    assert stages["candidate_b"]["pure"] is True
+    assert stages["aggregate"]["requested_provider"] == "local_full_model"
+    assert stages["aggregate"]["pure"] is False
+
+
+def test_task_graph_auto_remote_distributes_candidates_across_two_workers(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="6" * 64,
+    )
+    providers = [
+        _remote_worker_provider(identity, "worker_01", content="one"),
+        _remote_worker_provider(identity, "worker_02", content="two"),
+    ]
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: providers,
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="auto two workers",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_autotwoworkers01",
+    )))
+
+    assert len(manager.calls) == 1
+    assert response.metrics["workers_used"] == ["worker_01", "worker_02"]
+    assert response.metrics["nodes_participated"] == 3
+    assert response.metrics["fallback"] is False
+    workflow = coordinator.get("wf_autotwoworkers01")
+    stages = {stage["stage_id"]: stage for stage in workflow["stages"]}
+    candidate_a = stages["candidate_a"]
+    candidate_b = stages["candidate_b"]
+    assert candidate_a["requested_provider"] == providers[0].provider_id
+    assert candidate_b["requested_provider"] == providers[1].provider_id
+    assert candidate_a["attempts"][0]["provider_node_id"] == "worker_01"
+    assert candidate_b["attempts"][0]["provider_node_id"] == "worker_02"
+
+
+def test_task_graph_auto_remote_retries_pure_stage_on_local_provider(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="7" * 64,
+    )
+    provider = _remote_worker_provider(
+        identity,
+        "worker_01",
+        error_code="remote_worker_disconnected",
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="fallback locally",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_autofallback01",
+    )))
+
+    assert len(manager.calls) == 3
+    assert response.metrics["distributed_requested"] is True
+    assert response.metrics["distributed_used"] is False
+    assert response.metrics["distributed_kind"] == "task_graph_local_fallback"
+    assert response.metrics["nodes_planned"] == 2
+    assert response.metrics["nodes_participated"] == 1
+    assert response.metrics["fallback"] is True
+    assert response.metrics["fallback_reason"] == "remote_worker_disconnected"
+    workflow = coordinator.get("wf_autofallback01")
+    candidate = next(
+        stage for stage in workflow["stages"]
+        if stage["stage_id"] == "candidate_a"
+    )
+    assert candidate["retry_count"] == 1
+    assert candidate["last_retry_error_code"] == "remote_worker_disconnected"
+    assert [attempt["provider"] for attempt in candidate["attempts"]] == [
+        provider.provider_id, "local_full_model",
+    ]
+    assert candidate["attempts"][-1]["state"] == "completed"
+
+
+def test_task_graph_auto_remote_reports_reservation_fallback_reason(
+    task_graph_api, monkeypatch,
+):
+    manager, _coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="a" * 64,
+    )
+    provider = _remote_worker_provider(identity, "worker_01")
+
+    def reject_reservation(_request):
+        raise ProviderBusy(
+            "worker became busy",
+            code="remote_worker_busy",
+            provider_id=provider.provider_id,
+            retryable=True,
+        )
+
+    monkeypatch.setattr(provider, "reserve", reject_reservation)
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="reservation fallback",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_autoreservefail01",
+    )))
+
+    assert len(manager.calls) == 3
+    assert response.metrics["fallback"] is True
+    assert response.metrics["fallback_reason"] == "remote_worker_busy"
+
+
+def test_task_graph_auto_remote_filters_wrong_model_and_falls_back_local(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    active_identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="8" * 64,
+    )
+    wrong_identity = ModelIdentity(
+        model_id="other-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-other",
+        sha256="9" * 64,
+    )
+    provider = _remote_worker_provider(wrong_identity, "worker_01")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server,
+        "_active_task_graph_model_identity",
+        lambda: active_identity,
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="wrong model",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_autowrongmodel01",
+    )))
+
+    assert len(manager.calls) == 3
+    assert response.metrics["distributed_used"] is False
+    assert response.metrics["fallback"] is True
+    assert response.metrics["fallback_reason"] == (
+        "no_eligible_remote_provider"
+    )
+    assert response.metrics["auto_remote_providers"] == []
+    workflow = coordinator.get("wf_autowrongmodel01")
+    assert {
+        attempt["provider"]
+        for stage in workflow["stages"]
+        for attempt in stage["attempts"]
+    } == {"local_full_model"}
+
+
+def test_task_graph_auto_remote_rejects_manual_remote_fields(task_graph_api):
+    req = api_server.ChatRequest(
+        message="conflicting policy",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        task_graph_remote_stage="candidate_a",
+        task_graph_remote_provider_id="remote_worker_01",
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(req))
+
+    assert captured.value.status_code == 400
+    assert "不能与" in str(captured.value.detail)
+
+
+def test_task_worker_experiment_gate_falls_back_auto_and_rejects_manual(
+    task_graph_api, monkeypatch,
+):
+    manager, _coordinator = task_graph_api
+    monkeypatch.setattr(api_server, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
+
+    automatic = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="gate disabled auto",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_gateautooff01",
+    )))
+
+    assert len(manager.calls) == 3
+    assert automatic.metrics["distributed_requested"] is True
+    assert automatic.metrics["distributed_used"] is False
+    assert automatic.metrics["fallback"] is True
+    assert automatic.metrics["fallback_reason"] == (
+        "task_worker_experiment_disabled"
+    )
+
+    manual = api_server.ChatRequest(
+        message="gate disabled manual",
+        execution_mode="task_graph",
+        task_graph_remote_stage="candidate_a",
+        task_graph_remote_provider_id="remote_worker_01",
+    )
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(manual))
+    assert captured.value.status_code == 409
+    assert "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED" in str(
+        captured.value.detail
+    )
+
+
 def test_task_graph_mode_is_rejected_while_feature_flag_is_disabled(
     task_graph_api, monkeypatch,
 ):
@@ -173,7 +819,10 @@ def test_local_provider_dispatch_validates_runtime_return_type():
         stage_type="full_inference",
         provider_id="local_full_model",
         dependencies={},
-        root_input={"_local_provider_executor": lambda *args: object()},
+        root_input={},
+        runtime_context={
+            "local_provider_executor": lambda *args: object(),
+        },
     )
 
     with pytest.raises(api_server.TaskGraphError, match="必须是 dict"):
@@ -431,6 +1080,7 @@ def test_workflow_query_list_and_cancel_api(task_graph_api):
         "dual_candidate",
         {"message": "question"},
         execute,
+        session_id="session-a",
         workflow_id="wf_query123",
     )
     coordinator.commit_result("wf_query123")
@@ -446,11 +1096,17 @@ def test_workflow_query_list_and_cancel_api(task_graph_api):
     assert listed["worker_protocol"]["schema_ready"] is True
     assert listed["worker_protocol"]["adapter_connected"] is False
     assert listed["worker_protocol"]["admission_state"] == (
-        "protocol_frozen_adapter_not_connected"
+        "n2_4_experiment_enabled_not_connected"
     )
+    assert listed["worker_protocol"]["experiment_enabled"] is True
+    assert listed["worker_protocol"]["experimental_dispatch_enabled"] is False
+    assert listed["worker_protocol"]["control_plane_ready"] is True
+    assert listed["worker_protocol"]["task_dispatch_enabled"] is False
+    assert listed["worker_protocol"]["manual_stage_dispatch_enabled"] is False
     assert listed["journal"]["backend"] == "memory"
     assert listed["journal"]["available"] is True
     assert listed["workflows"][0]["workflow_id"] == "wf_query123"
+    assert listed["workflows"][0]["session_id"] == "session-a"
     assert listed["workflows"][0]["observability"] == {
         "state": "completed",
         "result_ready": False,
@@ -472,6 +1128,21 @@ def test_workflow_query_list_and_cancel_api(task_graph_api):
     assert fetched["state"] == "completed"
     assert fetched["observability"]["winner_count"] == 3
     assert fetched["journal"]["available"] is True
+
+    coordinator.run_template(
+        "dual_candidate",
+        {"message": "other"},
+        execute,
+        session_id="session-b",
+        workflow_id="wf_queryother",
+    )
+    coordinator.commit_result("wf_queryother")
+    filtered = asyncio.run(api_server.list_workflows(
+        limit=5, session_id="session-a",
+    ))
+    assert [item["workflow_id"] for item in filtered["workflows"]] == [
+        "wf_query123",
+    ]
 
     cancelled = asyncio.run(api_server.cancel_workflow("wf_query123"))
     assert cancelled["status"] == "completed"

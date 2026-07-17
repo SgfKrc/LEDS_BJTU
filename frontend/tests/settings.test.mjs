@@ -14,6 +14,7 @@ test('task graph mode always uses full streaming semantics', () => {
       executionMode: 'task_graph',
       streamingMode: 'full',
       temperature: 0.7,
+      taskGraphRemoteMode: 'local',
     },
   );
 });
@@ -25,5 +26,13 @@ test('standard execution preserves the selected streaming mode', () => {
       streamingMode: 'fast',
     }).streamingMode,
     'fast',
+  );
+});
+
+test('invalid task graph remote policy falls back to local', () => {
+  assert.equal(
+    normalizeExecutionSettings({ taskGraphRemoteMode: 'unexpected' })
+      .taskGraphRemoteMode,
+    'local',
   );
 });

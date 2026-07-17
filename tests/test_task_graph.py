@@ -211,6 +211,30 @@ def test_registry_prunes_old_terminal_workflows():
     }
 
 
+def test_workflow_list_filters_by_session():
+    coordinator = TaskGraphCoordinator()
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        return {"content": stage.stage_id}
+
+    for workflow_id, session_id in (
+        ("wf_sessiona1", "session-a"),
+        ("wf_sessionb1", "session-b"),
+    ):
+        coordinator.run_template(
+            "dual_candidate",
+            {"message": "question"},
+            execute,
+            session_id=session_id,
+            workflow_id=workflow_id,
+        )
+        coordinator.commit_result(workflow_id)
+
+    workflows = coordinator.list(limit=10, session_id="session-a")
+    assert [item["workflow_id"] for item in workflows] == ["wf_sessiona1"]
+    coordinator.close()
+
+
 def test_cancel_during_final_stage_wins_over_completed_state():
     coordinator = TaskGraphCoordinator()
 

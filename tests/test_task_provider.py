@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import time
 
 import pytest
 
@@ -73,6 +74,41 @@ def test_registry_enforces_unique_identity_and_stage_capabilities():
     registry.release(reservation.reservation_id)
     assert registry.unregister("local_full_model") is True
     assert registry.unregister("local_full_model") is False
+    registry.close()
+
+
+def test_reservation_accept_timeout_does_not_block_registry_or_leak_slot():
+    release_accept = threading.Event()
+    late_release = threading.Event()
+
+    class SlowAcceptProvider(LocalFullModelProvider):
+        def reserve(self, request):
+            release_accept.wait()
+            return super().reserve(request)
+
+        def release(self, reservation_id):
+            super().release(reservation_id)
+            late_release.set()
+
+    registry = ProviderRegistry()
+    provider = SlowAcceptProvider(
+        lambda request, cancel_event: {"content": "unused"},
+    )
+    registry.register(provider)
+
+    started = time.perf_counter()
+    with pytest.raises(ProviderReservationError) as captured:
+        registry.reserve(_request(), timeout_seconds=0.03)
+    assert captured.value.code == "provider_accept_timeout"
+    assert time.perf_counter() - started < 0.5
+
+    status_started = time.perf_counter()
+    assert registry.inspect()[0]["healthy"] is True
+    assert time.perf_counter() - status_started < 0.5
+
+    release_accept.set()
+    assert late_release.wait(1.0)
+    assert provider.inspect().active_reservations == 0
     registry.close()
 
 

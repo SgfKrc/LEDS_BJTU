@@ -17,8 +17,10 @@ from task_journal import JournalEvent, TaskJournal, TaskJournalError
 from task_provider import (
     CallbackExecutionProvider,
     ExecutionProvider,
+    ModelIdentity,
     PROVIDER_ID_PATTERN,
     ProviderError,
+    ProviderExecutionError,
     ProviderRegistry,
     Reservation,
     StageAttempt as ProviderStageAttempt,
@@ -95,6 +97,7 @@ class StageSpec:
     provider: str = "local_full_model"
     fallback_providers: tuple[str, ...] = ()
     pure: bool = False
+    accept_timeout_seconds: float = 10.0
     lease_timeout_seconds: float = 300.0
 
 
@@ -157,6 +160,7 @@ class StageRecord:
     winner_attempt_id: str = ""
     output_digest: str = ""
     retry_count: int = 0
+    last_retry_error_code: str = ""
     result_rejection_count: int = 0
     last_result_rejection_reason: str = ""
     last_result_rejected_at: Optional[float] = None
@@ -192,10 +196,12 @@ class StageRecord:
             "fallback_providers": list(self.spec.fallback_providers),
             "selected_provider": self.selected_provider(),
             "pure": self.spec.pure,
+            "accept_timeout_seconds": self.spec.accept_timeout_seconds,
             "lease_timeout_seconds": self.spec.lease_timeout_seconds,
             "lease_epoch": self.lease_epoch,
             "winner_attempt_id": self.winner_attempt_id,
             "retry_count": self.retry_count,
+            "last_retry_error_code": self.last_retry_error_code,
             "result_rejection_count": self.result_rejection_count,
             "last_result_rejection_reason": (
                 self.last_result_rejection_reason
@@ -220,6 +226,9 @@ class WorkflowRecord:
     template: str
     final_stage_id: str
     stages: dict[str, StageRecord]
+    session_id: str = ""
+    model_identity: Optional[ModelIdentity] = None
+    runtime_context: dict = field(default_factory=dict, repr=False)
     state: str = "created"
     last_sequence: int = 0
     created_at: float = field(default_factory=time.time)
@@ -230,6 +239,7 @@ class WorkflowRecord:
     cancel_event: threading.Event = field(
         default_factory=threading.Event, repr=False,
     )
+    cancel_recorded: bool = field(default=False, repr=False)
     lock: threading.RLock = field(
         default_factory=threading.RLock, repr=False,
     )
@@ -252,6 +262,11 @@ class WorkflowRecord:
             return {
                 "workflow_id": self.workflow_id,
                 "request_id": self.request_id,
+                "session_id": self.session_id,
+                "model_identity": (
+                    self.model_identity.snapshot()
+                    if self.model_identity is not None else None
+                ),
                 "template": self.template,
                 "state": self.state,
                 "last_sequence": self.last_sequence,
@@ -281,6 +296,7 @@ StageExecutor = Callable[
 ]
 
 WORKFLOW_ID_PATTERN = re.compile(r"^wf_[A-Za-z0-9_-]{8,96}$")
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 def dual_candidate_template() -> tuple[list[StageSpec], str]:
@@ -918,9 +934,11 @@ class TaskGraphCoordinator:
             raise TaskGraphError("Stage is not eligible for Provider fallback")
         previous_index = stage.provider_index
         previous_retry_count = stage.retry_count
+        previous_retry_error = stage.last_retry_error_code
         previous_provider = stage.selected_provider()
         stage.provider_index += 1
         stage.retry_count += 1
+        stage.last_retry_error_code = error_code
         try:
             self._record_event_locked(
                 workflow,
@@ -938,6 +956,7 @@ class TaskGraphCoordinator:
         except Exception:
             stage.provider_index = previous_index
             stage.retry_count = previous_retry_count
+            stage.last_retry_error_code = previous_retry_error
             raise
 
     def _retire_stage_attempt_locked(
@@ -973,6 +992,7 @@ class TaskGraphCoordinator:
             stage.error,
             stage.provider_index,
             stage.retry_count,
+            stage.last_retry_error_code,
         )
         previous_attempt = (
             attempt.state,
@@ -990,6 +1010,7 @@ class TaskGraphCoordinator:
         if retry:
             stage.provider_index += 1
             stage.retry_count += 1
+            stage.last_retry_error_code = error_code
         try:
             self._record_event_locked(
                 workflow,
@@ -1021,6 +1042,7 @@ class TaskGraphCoordinator:
                 stage.error,
                 stage.provider_index,
                 stage.retry_count,
+                stage.last_retry_error_code,
             ) = previous_stage
             (
                 attempt.state,
@@ -1330,8 +1352,14 @@ class TaskGraphCoordinator:
         for workflow in workflows:
             with workflow.lock:
                 if workflow.state not in TERMINAL_WORKFLOW_STATES:
-                    workflow.cancel_event.set()
-                    self._cancel_active_provider_attempts_locked(workflow)
+                    try:
+                        self._request_cancel_locked(
+                            workflow,
+                            "coordinator closed before result commit",
+                        )
+                    except Exception:
+                        workflow.cancel_event.set()
+                        self._cancel_active_provider_attempts_locked(workflow)
         with self._executor_lock:
             executor = self._stage_executor
             self._stage_executor = None
@@ -1364,10 +1392,20 @@ class TaskGraphCoordinator:
             if active is None:
                 continue
             registry, provider_id = active
-            try:
-                registry.cancel(provider_id, attempt_id)
-            except Exception:
-                pass
+            self._cancel_provider_attempt(
+                registry, provider_id, attempt_id,
+            )
+
+    @staticmethod
+    def _cancel_provider_attempt(
+        registry: ProviderRegistry,
+        provider_id: str,
+        attempt_id: str,
+    ) -> None:
+        try:
+            registry.cancel(provider_id, attempt_id)
+        except Exception:
+            pass
 
     def _request_cancel_locked(
         self,
@@ -1378,7 +1416,6 @@ class TaskGraphCoordinator:
             return
         was_set = workflow.cancel_event.is_set()
         workflow.cancel_event.set()
-        self._cancel_active_provider_attempts_locked(workflow)
         try:
             if workflow.state == "result_ready":
                 self._transition_workflow_locked(
@@ -1386,9 +1423,8 @@ class TaskGraphCoordinator:
                     "cancelled",
                     error=reason,
                 )
-            elif was_set:
-                return
-            else:
+                workflow.cancel_recorded = True
+            elif not workflow.cancel_recorded:
                 self._record_event_locked(
                     workflow,
                     entity_type="workflow",
@@ -1396,10 +1432,12 @@ class TaskGraphCoordinator:
                     event_type="workflow_cancel_requested",
                     payload={"state": workflow.state},
                 )
+                workflow.cancel_recorded = True
         except Exception:
             if not was_set:
                 workflow.cancel_event.clear()
             raise
+        self._cancel_active_provider_attempts_locked(workflow)
 
     @staticmethod
     def validate(stages: Iterable[StageSpec], final_stage_id: str) -> list[StageSpec]:
@@ -1429,6 +1467,20 @@ class TaskGraphCoordinator:
             if not isinstance(spec.pure, bool):
                 raise TaskGraphError(
                     f"stage {spec.stage_id} pure must be a bool"
+                )
+            try:
+                accept_timeout = float(spec.accept_timeout_seconds)
+            except (TypeError, ValueError) as exc:
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} accept timeout must be numeric"
+                ) from exc
+            if (
+                not accept_timeout > 0
+                or not accept_timeout < float("inf")
+                or accept_timeout > 300.0
+            ):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} accept timeout must be in (0, 300]"
                 )
             try:
                 lease_timeout = float(spec.lease_timeout_seconds)
@@ -1574,9 +1626,20 @@ class TaskGraphCoordinator:
             isinstance(error, (TaskGraphUnavailable, WorkflowCancelled))
             for error in errors.values()
         ):
+            cleanup_errors = []
             for _stage, _request, reservation in prepared:
-                provider_registry.release(reservation.reservation_id)
-            self._raise_ready_batch_error(ready, errors)
+                try:
+                    provider_registry.release(reservation.reservation_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            try:
+                self._raise_ready_batch_error(ready, errors)
+            except Exception as original:
+                for cleanup_exc in cleanup_errors:
+                    original.add_note(
+                        f"reservation cleanup also failed: {cleanup_exc}"
+                    )
+                raise
 
         if len(prepared) == 1:
             stage, request, reservation = prepared[0]
@@ -1596,8 +1659,16 @@ class TaskGraphCoordinator:
         try:
             executor = self._get_stage_executor() if prepared else None
         except Exception as exc:
+            cleanup_errors = []
             for _stage, _request, reservation in prepared:
-                provider_registry.release(reservation.reservation_id)
+                try:
+                    provider_registry.release(reservation.reservation_id)
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            for cleanup_exc in cleanup_errors:
+                exc.add_note(
+                    f"reservation cleanup also failed: {cleanup_exc}"
+                )
             if workflow.cancel_event.is_set():
                 raise WorkflowCancelled(workflow.workflow_id) from exc
             raise
@@ -1619,9 +1690,14 @@ class TaskGraphCoordinator:
                 errors[stage.spec.stage_id] = exc
                 break
 
-        for _stage, _request, reservation in prepared:
+        for prepared_stage, _request, reservation in prepared:
             if reservation.reservation_id not in submitted_reservations:
-                provider_registry.release(reservation.reservation_id)
+                try:
+                    provider_registry.release(reservation.reservation_id)
+                except Exception as cleanup_exc:
+                    errors.setdefault(
+                        prepared_stage.spec.stage_id, cleanup_exc,
+                    )
 
         for future in as_completed(futures):
             stage = futures[future]
@@ -1674,6 +1750,9 @@ class TaskGraphCoordinator:
         root_input: dict,
         execute_stage: Optional[StageExecutor] = None,
         request_id: str = "",
+        session_id: str = "",
+        model_identity: Optional[ModelIdentity] = None,
+        runtime_context: Optional[dict] = None,
         workflow_id: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> tuple[dict, dict]:
@@ -1686,6 +1765,9 @@ class TaskGraphCoordinator:
             root_input=root_input,
             execute_stage=execute_stage,
             request_id=request_id,
+            session_id=session_id,
+            model_identity=model_identity,
+            runtime_context=runtime_context,
             template=template,
             workflow_id=workflow_id,
             cancel_event=cancel_event,
@@ -1698,6 +1780,9 @@ class TaskGraphCoordinator:
         root_input: dict,
         execute_stage: Optional[StageExecutor] = None,
         request_id: str = "",
+        session_id: str = "",
+        model_identity: Optional[ModelIdentity] = None,
+        runtime_context: Optional[dict] = None,
         template: str = "custom",
         workflow_id: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -1708,12 +1793,25 @@ class TaskGraphCoordinator:
             raise TaskGraphError(
                 "workflow_id must start with wf_ and contain 8-96 safe characters"
             )
+        resolved_session_id = str(session_id or "")
+        if (
+            resolved_session_id
+            and SESSION_ID_PATTERN.fullmatch(resolved_session_id) is None
+        ):
+            raise TaskGraphError("session_id contains unsupported characters")
+        if model_identity is not None and not isinstance(
+            model_identity, ModelIdentity,
+        ):
+            raise TaskGraphError("model_identity must be a ModelIdentity")
         workflow = WorkflowRecord(
             workflow_id=resolved_workflow_id,
             request_id=request_id,
             template=template,
             final_stage_id=final_stage_id,
             stages={spec.stage_id: StageRecord(spec=spec) for spec in specs},
+            session_id=resolved_session_id,
+            model_identity=model_identity,
+            runtime_context=dict(runtime_context or {}),
             cancel_event=cancel_event or threading.Event(),
         )
         with self._lock:
@@ -1908,9 +2006,15 @@ class TaskGraphCoordinator:
             provider_id=selected_provider,
             dependencies=dependencies,
             root_input=root_input,
+            model_identity=workflow.model_identity,
+            runtime_context=workflow.runtime_context,
         )
         try:
-            reservation = provider_registry.reserve(provider_request)
+            reservation = provider_registry.reserve(
+                provider_request,
+                timeout_seconds=stage.spec.accept_timeout_seconds,
+                cancel_event=workflow.cancel_event,
+            )
         except ProviderError as exc:
             with workflow.lock:
                 if workflow.cancel_event.is_set():
@@ -1943,6 +2047,108 @@ class TaskGraphCoordinator:
                     raise WorkflowCancelled(workflow.workflow_id)
         return provider_request, reservation
 
+    def _execute_provider_attempt(
+        self,
+        workflow: WorkflowRecord,
+        stage: StageRecord,
+        attempt: AttemptRecord,
+        provider_attempt: ProviderStageAttempt,
+        provider_registry: ProviderRegistry,
+        reservation: Reservation,
+        lease_timeout_seconds: float,
+    ) -> ProviderStageResult:
+        if attempt.lease_expires_at <= 0:
+            return provider_registry.execute(
+                provider_attempt, reservation, workflow.cancel_event,
+            )
+
+        done = threading.Event()
+        outcome: dict = {}
+
+        def execute_provider() -> None:
+            try:
+                outcome["result"] = provider_registry.execute(
+                    provider_attempt, reservation, workflow.cancel_event,
+                )
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                outcome["received_at"] = time.time()
+                done.set()
+
+        threading.Thread(
+            target=execute_provider,
+            name=f"provider-execute-{attempt.attempt_id}",
+            daemon=True,
+        ).start()
+        lease_duration = max(
+            0.001, min(float(lease_timeout_seconds), 3599.0)
+        )
+        renew_window = max(0.05, min(30.0, lease_duration / 3.0))
+        renewal_supported = True
+        while True:
+            if done.is_set():
+                error = outcome.get("error")
+                if isinstance(error, BaseException):
+                    raise error
+                result = outcome.get("result")
+                if not isinstance(result, ProviderStageResult):
+                    raise ProviderExecutionError(
+                        "provider execution returned no result",
+                        code="invalid_provider_result",
+                        provider_id=attempt.provider,
+                    )
+                return result
+            if workflow.cancel_event.is_set():
+                self._cancel_provider_attempt(
+                    provider_registry, attempt.provider, attempt.attempt_id,
+                )
+                raise WorkflowCancelled(workflow.workflow_id)
+            with workflow.lock:
+                deadline = attempt.lease_expires_at
+            now = time.time()
+            remaining = deadline - now
+            if remaining <= 0:
+                self._cancel_provider_attempt(
+                    provider_registry, attempt.provider, attempt.attempt_id,
+                )
+                raise ProviderExecutionError(
+                    "provider execution lease expired",
+                    code="lease_expired",
+                    provider_id=attempt.provider,
+                    retryable=True,
+                )
+            if renewal_supported and remaining <= renew_window:
+                renewed_deadline = time.time() + lease_duration
+                try:
+                    renewal_supported = provider_registry.renew_lease(
+                        attempt.provider,
+                        attempt.attempt_id,
+                        attempt.lease_id,
+                        attempt.lease_epoch,
+                        renewed_deadline,
+                    )
+                    if renewal_supported:
+                        with workflow.lock:
+                            self._renew_stage_lease_locked(
+                                workflow,
+                                stage,
+                                attempt,
+                                attempt.lease_id,
+                                attempt.lease_epoch,
+                                renewed_deadline,
+                            )
+                        continue
+                except Exception:
+                    self._cancel_provider_attempt(
+                        provider_registry,
+                        attempt.provider,
+                        attempt.attempt_id,
+                    )
+                    raise
+            if not done.wait(min(0.05, remaining)):
+                continue
+
     def _run_stage(
         self,
         workflow: WorkflowRecord,
@@ -1969,21 +2175,8 @@ class TaskGraphCoordinator:
                     reservation_id=reservation.reservation_id,
                     lease_id=f"lease_{uuid.uuid4().hex}",
                     lease_epoch=lease_epoch,
-                    lease_expires_at=(
-                        started_at + float(stage.spec.lease_timeout_seconds)
-                        if reservation.provider_kind
-                        not in {"local_full_model", "callback_compatibility"}
-                        else 0.0
-                    ),
+                    lease_expires_at=0.0,
                     started_at=started_at,
-                )
-                provider_attempt = ProviderStageAttempt(
-                    attempt_id=attempt.attempt_id,
-                    request=provider_request,
-                    provider_id=reservation.provider_id,
-                    lease_id=attempt.lease_id,
-                    lease_epoch=attempt.lease_epoch,
-                    lease_expires_at=attempt.lease_expires_at,
                 )
                 stage.lease_epoch = lease_epoch
                 try:
@@ -1995,15 +2188,34 @@ class TaskGraphCoordinator:
                     raise
                 self._append_attempt_locked(workflow, stage, attempt)
                 attempt_started = True
+                if reservation.provider_kind not in {
+                    "local_full_model", "callback_compatibility",
+                }:
+                    attempt.lease_expires_at = (
+                        time.time() + float(stage.spec.lease_timeout_seconds)
+                    )
+                provider_attempt = ProviderStageAttempt(
+                    attempt_id=attempt.attempt_id,
+                    request=provider_request,
+                    provider_id=reservation.provider_id,
+                    lease_id=attempt.lease_id,
+                    lease_epoch=attempt.lease_epoch,
+                    lease_expires_at=attempt.lease_expires_at,
+                    accept_timeout_seconds=stage.spec.accept_timeout_seconds,
+                )
             with self._provider_activity_lock:
                 self._active_provider_attempts[attempt.attempt_id] = (
                     provider_registry,
                     reservation.provider_id,
                 )
-            result = provider_registry.execute(
+            result = self._execute_provider_attempt(
+                workflow,
+                stage,
+                attempt,
                 cast(ProviderStageAttempt, provider_attempt),
+                provider_registry,
                 reservation,
-                workflow.cancel_event,
+                stage.spec.lease_timeout_seconds,
             )
             self._raise_if_cancelled(workflow)
             with workflow.lock:
@@ -2099,6 +2311,20 @@ class TaskGraphCoordinator:
                     if isinstance(exc, ProviderError)
                     else str(exc)
                 )
+                if error_code == "lease_expired":
+                    self._reject_stage_result_locked(
+                        workflow,
+                        stage,
+                        ProviderStageResult(
+                            output={},
+                            provider_id=attempt.provider,
+                            attempt_id=attempt.attempt_id,
+                            lease_epoch=attempt.lease_epoch,
+                        ),
+                        reason="lease_expired",
+                        result_digest="",
+                        now=time.time(),
+                    )
                 self._retire_stage_attempt_locked(
                     workflow,
                     stage,
@@ -2216,6 +2442,94 @@ class TaskGraphCoordinator:
                 self._transition_workflow_locked(workflow, "completed")
                 return workflow.snapshot()
 
+    def renew_stage_lease(
+        self,
+        workflow_id: str,
+        stage_id: str,
+        attempt_id: str,
+        lease_id: str,
+        lease_epoch: int,
+        lease_expires_at: float,
+    ) -> dict:
+        """Extend one running attempt lease through the Coordinator state machine."""
+        with self._lock:
+            workflow = self._workflows.get(workflow_id)
+            if workflow is None:
+                raise WorkflowNotFound(workflow_id)
+            with workflow.lock:
+                stage = workflow.stages.get(stage_id)
+                if stage is None:
+                    raise TaskGraphError(f"stage does not exist: {stage_id}")
+                attempt = next(
+                    (
+                        item for item in stage.attempts
+                        if item.attempt_id == attempt_id
+                    ),
+                    None,
+                )
+                if attempt is None:
+                    raise TaskGraphError(
+                        f"attempt does not exist: {attempt_id}"
+                    )
+                return self._renew_stage_lease_locked(
+                    workflow,
+                    stage,
+                    attempt,
+                    lease_id,
+                    lease_epoch,
+                    lease_expires_at,
+                )
+
+    def _renew_stage_lease_locked(
+        self,
+        workflow: WorkflowRecord,
+        stage: StageRecord,
+        attempt: AttemptRecord,
+        lease_id: str,
+        lease_epoch: int,
+        lease_expires_at: float,
+    ) -> dict:
+        if (
+            stage.state != "running"
+            or attempt.state != "running"
+            or attempt.lease_id != lease_id
+            or attempt.lease_epoch != int(lease_epoch)
+            or stage.lease_epoch != int(lease_epoch)
+        ):
+            raise TaskGraphError("lease identity is stale or not running")
+        now = time.time()
+        deadline = float(lease_expires_at)
+        if (
+            not deadline > now
+            or not deadline < float("inf")
+            or deadline <= attempt.lease_expires_at
+            or deadline > now + 3600.0
+        ):
+            raise TaskGraphError(
+                "renewed lease deadline must extend the current lease "
+                "within 3600 seconds"
+            )
+        previous_deadline = attempt.lease_expires_at
+        attempt.lease_expires_at = deadline
+        try:
+            self._record_event_locked(
+                workflow,
+                entity_type="stage_attempt",
+                entity_id=f"{stage.spec.stage_id}:{attempt.attempt_id}",
+                event_type="stage_attempt_lease_renewed",
+                payload={
+                    "stage_id": stage.spec.stage_id,
+                    "attempt_id": attempt.attempt_id,
+                    "lease_id": lease_id,
+                    "lease_epoch": int(lease_epoch),
+                    "lease_expires_at": deadline,
+                },
+            )
+        except Exception:
+            attempt.lease_expires_at = previous_deadline
+            raise
+        return attempt.snapshot()
+
     def submit_stage_result(
         self,
         workflow_id: str,
@@ -2279,22 +2593,29 @@ class TaskGraphCoordinator:
                 raise WorkflowNotFound(workflow_id)
             return snapshot
 
-    def list(self, limit: int = 20) -> list[dict]:
+    def list(self, limit: int = 20, session_id: str = "") -> list[dict]:
         safe_limit = max(1, min(int(limit), self._max_records))
+        session_filter = str(session_id or "")
         with self._lock:
             by_id = {
                 snapshot["workflow_id"]: snapshot
                 for snapshot in (
                     []
                     if self._journal_error
-                    else self._journal_snapshots(safe_limit)
+                    else self._journal_snapshots(
+                        self._max_records if session_filter else safe_limit
+                    )
                 )
             }
             for workflow in self._workflows.values():
                 snapshot = workflow.snapshot()
                 by_id[snapshot["workflow_id"]] = snapshot
             workflows = sorted(
-                by_id.values(),
+                (
+                    workflow for workflow in by_id.values()
+                    if not session_filter
+                    or workflow.get("session_id", "") == session_filter
+                ),
                 key=lambda workflow: float(workflow.get("created_at", 0.0)),
                 reverse=True,
             )

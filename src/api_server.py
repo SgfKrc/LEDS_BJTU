@@ -27,6 +27,7 @@ import threading
 import uuid
 from collections import Counter, deque
 from contextvars import ContextVar
+from dataclasses import replace
 from functools import wraps
 from typing import Any, Literal, Optional, cast
 
@@ -46,21 +47,23 @@ from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler as ClusterScheduler
 from task_graph import (
+    StageSpec,
     TaskGraphCoordinator,
     TaskGraphError,
     TaskGraphUnavailable,
     WorkflowCancelled,
     WorkflowExecutionError,
     WorkflowNotFound,
+    dual_candidate_template,
 )
 from task_journal import SQLiteTaskJournal, TaskJournalError
 from task_provider import (
     LocalFullModelProvider,
+    ModelIdentity,
     ProviderError,
     ProviderExecutor,
     StageRequest as ProviderStageRequest,
 )
-from task_worker_protocol import worker_protocol_status
 import model_config as mc
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -69,6 +72,7 @@ from config import (
     TASK_GRAPH_ENABLED, TASK_GRAPH_MAX_RECORDS,
     TASK_GRAPH_MAX_PARALLEL_STAGES, TASK_GRAPH_JOURNAL_PATH,
     TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
+    TASK_WORKER_EXPERIMENTAL_ENABLED,
 )
 
 # 数据库模块（可选，未安装 psycopg2 时使用内存降级）
@@ -523,20 +527,36 @@ def _refresh_pipeline_layer_config() -> None:
         logger.warning(f"模型加载后刷新流水线层配置失败: {e}", exc_info=True)
 
 
-def _run_exclusive_model_change(change, prepare=None):
+def _run_exclusive_model_change(
+    change, prepare=None, *, release_worker_reservation: bool = False,
+):
     """Block inference, invalidate old worker ACKs, then refresh the new model."""
     with _full_chat_execution_lock:
         if prepare is not None:
             prepare()
         with scheduler._inference_lock:
-            with scheduler._layer_config_lock:
-                scheduler._layer_config_pushed.clear()
-                scheduler._layer_config_expected.clear()
-                scheduler._layer_config_acks.clear()
-            try:
-                return change()
-            finally:
-                _refresh_pipeline_layer_config()
+            with scheduler._layer_execution_lock:
+                with scheduler._layer_config_lock:
+                    scheduler._layer_config_pushed.clear()
+                    scheduler._layer_config_expected.clear()
+                    scheduler._layer_config_acks.clear()
+                    scheduler._active_layer_config = None
+                    scheduler._last_layer_config_ack_payload = None
+                    scheduler._local_pipeline_steps.clear()
+                if release_worker_reservation:
+                    release = getattr(
+                        scheduler,
+                        "release_pipeline_worker_for_local_model",
+                        None,
+                    )
+                    if callable(release):
+                        release()
+                    else:
+                        scheduler._pipeline_worker_reserved = False
+                try:
+                    return change()
+                finally:
+                    _refresh_pipeline_layer_config()
 
 
 # ============================================================
@@ -749,6 +769,21 @@ class ChatRequest(BaseModel):
     task_graph_template: Literal["dual_candidate"] = Field(
         default="dual_candidate",
         description="任务链模板；首期仅支持双候选校验",
+    )
+    task_graph_remote_stage: Literal[
+        "", "candidate_a", "candidate_b", "aggregate"
+    ] = Field(
+        default="",
+        description="N2.1 手动指定唯一远端 Stage；为空时全部本地执行",
+    )
+    task_graph_remote_provider_id: str = Field(
+        default="",
+        max_length=64,
+        description="N2.1 显式远端 Provider ID；不参与自动选择",
+    )
+    task_graph_auto_remote: bool = Field(
+        default=False,
+        description="N2.3 自动为无副作用候选 Stage 选择 PC Full Worker，并允许受控回退本地",
     )
     workflow_id: Optional[str] = Field(
         default=None,
@@ -2119,6 +2154,7 @@ async def load_model(req: LoadModelRequest):
                 db_experimental_models=_get_db_experimental_models(),
             ),
             prepare=_prepare_model_load,
+            release_worker_reservation=True,
         )
 
         if result["success"]:
@@ -2128,6 +2164,7 @@ async def load_model(req: LoadModelRequest):
 
             # 初始化 KV 缓存
             _init_kv_cache()
+            scheduler.refresh_task_worker_capabilities()
             elapsed = time.time() - t0
             status = await get_status()
             status["load_time_seconds"] = round(elapsed, 1)
@@ -2224,7 +2261,7 @@ def _dispatch_local_task_provider(
     request: ProviderStageRequest,
     cancel_event: threading.Event,
 ) -> dict:
-    executor = request.root_input.get("_local_provider_executor")
+    executor = request.runtime_context.get("local_provider_executor")
     if not callable(executor):
         raise TaskGraphError("本地任务 Provider 缺少请求执行上下文")
     result = cast(ProviderExecutor, executor)(request, cancel_event)
@@ -2248,69 +2285,140 @@ def _ensure_local_task_provider() -> None:
             raise
 
 
-def _execute_task_graph_chat_with_slot(
-    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
-) -> dict:
-    """Execute one workflow while the process-wide task-graph slot is held."""
+def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
+    if not model_loaded or not model_manager.is_loaded:
+        return None
+    engine = str(getattr(model_manager, "_engine_type", "") or "")
+    model_path = str(getattr(model_manager, "_model_path", "") or "")
+    model_id = str(getattr(model_manager, "active_model_id", "") or "")
+    if engine not in {"pytorch", "llama_cpp"} or not model_id or not model_path:
+        return None
+    try:
+        from model_sync import compute_file_sha256, compute_model_sha256
 
-    target_session_id = req.session_id or active_session_id
-    if target_session_id and target_session_id != active_session_id:
-        _switch_session(target_session_id)
-    history = _get_active_history()
-    if target_session_id and len(history) == 0:
-        _auto_title_session(target_session_id, req.message)
+        if engine == "pytorch":
+            digest = compute_model_sha256(model_path)
+            model_format = "safetensors"
+        else:
+            digest = compute_file_sha256(model_path)
+            model_format = "gguf"
+    except Exception:
+        logger.warning("无法计算任务链当前模型摘要", exc_info=True)
+        return None
+    if len(digest) != 64:
+        return None
+    return ModelIdentity(
+        model_id=model_id,
+        engine=engine,
+        format=model_format,
+        revision=f"local-{digest[:12]}",
+        sha256=digest,
+    )
 
-    base_messages = list(history) + [{"role": "user", "content": req.message}]
-    candidate_budget = max(1, min(req.max_new_tokens, 512))
-    final_budget = max(1, min(req.max_new_tokens, 1024))
 
-    candidate_instructions = {
-        "candidate_a": (
-            "独立分析用户问题，给出准确、可验证且简洁的候选答案。"
-            "不要提及其他候选或任务链。"
-        ),
-        "candidate_b": (
-            "从不同角度独立解决用户问题，重点检查遗漏、反例和不确定性。"
-            "输出可直接供后续汇总的候选答案。"
-        ),
+def _sync_remote_task_worker_providers() -> list[str]:
+    """Register stable remote Provider objects without changing request policy."""
+    registered = []
+    for provider in scheduler.remote_task_worker_providers():
+        if not task_graph_coordinator.has_provider(provider.provider_id):
+            try:
+                task_graph_coordinator.register_provider(provider)
+            except ProviderError:
+                if not task_graph_coordinator.has_provider(provider.provider_id):
+                    raise
+        registered.append(provider.provider_id)
+    return sorted(registered)
+
+
+def _eligible_remote_task_worker_provider_ids(
+    model_identity: ModelIdentity,
+    stage_type: str,
+    *,
+    limit: int = 4,
+) -> list[str]:
+    """Return healthy exact-model Workers in deterministic least-loaded order."""
+    if not TASK_WORKER_EXPERIMENTAL_ENABLED:
+        return []
+    providers = {
+        provider.provider_id: provider
+        for provider in scheduler.remote_task_worker_providers()
     }
+    _sync_remote_task_worker_providers()
+    statuses = {
+        str(item.get("provider_id", "")): item
+        for item in task_graph_coordinator.provider_status()
+    }
+    eligible = []
+    for provider_id, provider in providers.items():
+        status = statuses.get(provider_id, {})
+        if (
+            status.get("provider_kind") != "remote_full_worker"
+            or not status.get("healthy")
+            or not status.get("available")
+            or stage_type not in status.get("supported_stage_types", [])
+            or not provider.supports_model_identity(model_identity, stage_type)
+        ):
+            continue
+        max_concurrency = max(1, int(status.get("max_concurrency", 1) or 1))
+        active = max(0, int(status.get("active_reservations", 0) or 0))
+        eligible.append((
+            active / max_concurrency,
+            active,
+            provider_id,
+        ))
+    eligible.sort()
+    return [item[2] for item in eligible[:max(0, int(limit))]]
 
-    def _run_model(messages: list[dict], max_tokens: int,
-                   cancel_event: threading.Event) -> dict:
-        if cancel_event.is_set():
+
+def _execute_task_worker_stage(
+    stage_request: ProviderStageRequest,
+    provider_cancel_event: threading.Event,
+) -> dict:
+    """Execute the shared local/remote Stage contract on a full model."""
+    root_input = stage_request.root_input
+    options = root_input.get("task_options", {})
+    if not isinstance(options, dict):
+        raise TaskGraphError("任务 Stage 缺少有效执行参数")
+    try:
+        candidate_budget = max(
+            1, min(int(options.get("candidate_max_tokens", 512)), 512)
+        )
+        final_budget = max(
+            1, min(int(options.get("final_max_tokens", 1024)), 1024)
+        )
+        temperature = max(
+            0.0, min(float(options.get("temperature", 0.7)), 2.0)
+        )
+        top_p = max(0.0, min(float(options.get("top_p", 0.9)), 1.0))
+    except (TypeError, ValueError) as exc:
+        raise TaskGraphError("任务 Stage 执行参数无效") from exc
+    show_thinking = bool(options.get("show_thinking", False))
+
+    def run_model(messages: list[dict], max_tokens: int) -> dict:
+        if provider_cancel_event.is_set():
             return {
                 "content": "",
                 "usage": {},
                 "tokens_per_second": 0,
                 "model": model_manager.active_model_id,
             }
-        kwargs = {"_cancel_event": cancel_event}
         result = model_manager.chat(
             messages=messages,
             max_tokens=max_tokens,
-            temperature=req.temperature,
-            top_p=req.top_p,
-            **kwargs,
+            temperature=temperature,
+            top_p=top_p,
+            _cancel_event=provider_cancel_event,
         )
         raw_content = str(result.get("content", "") or "").strip()
         thinking_content = None
-        if req.show_thinking:
+        if show_thinking:
             content, thinking_content = _format_model_response(
                 raw_content, show_thinking=True,
             )
         else:
             content = _strip_native_thinking_tags(raw_content)
-        if cancel_event.is_set():
-            return {
-                "content": content,
-                "thinking_content": thinking_content,
-                "usage": dict(result.get("usage", {}) or {}),
-                "tokens_per_second": result.get("tokens_per_second", 0),
-                "model": result.get("model", model_manager.active_model_id),
-                "usage_estimated": bool(result.get("usage_estimated", False)),
-            }
-        if not content:
-            raise TaskGraphError("本地模型返回空结果")
+        if not content and not provider_cancel_event.is_set():
+            raise TaskGraphError("完整模型返回空 Stage 结果")
         return {
             "content": content,
             "thinking_content": thinking_content,
@@ -2320,48 +2428,96 @@ def _execute_task_graph_chat_with_slot(
             "usage_estimated": bool(result.get("usage_estimated", False)),
         }
 
-    def _execute_provider_stage(
-        stage_request: ProviderStageRequest,
-        provider_cancel_event: threading.Event,
-    ) -> dict:
-        if stage_request.stage_type == "full_inference":
-            instruction = candidate_instructions[stage_request.stage_id]
-            if req.show_thinking:
-                instruction = f"{instruction}\n\n{THINKING_SYSTEM_PROMPT}"
-            messages = [
-                {"role": "system", "content": instruction},
-                *stage_request.root_input["messages"],
-            ]
-            output = _run_model(
-                messages,
-                candidate_budget,
-                provider_cancel_event,
-            )
-        elif stage_request.stage_type == "aggregate":
-            candidate_payload = {
-                stage_id: value.get("content", "")
-                for stage_id, value in stage_request.dependencies.items()
-            }
-            aggregation_prompt = (
-                "请根据原始问题和两个独立候选，输出一个最终答案。"
-                "纠正冲突和明显错误；没有证据时明确不确定性。"
-                "只输出最终答案，不描述内部任务链。\n\n"
-                f"原始问题：{stage_request.root_input['message']}\n\n"
-                "候选：\n"
-                + json.dumps(candidate_payload, ensure_ascii=False)
-            )
-            output = _run_model(
-                ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
-                 if req.show_thinking else [])
-                + [{"role": "user", "content": aggregation_prompt}],
-                final_budget,
-                provider_cancel_event,
-            )
-        else:
-            raise TaskGraphError(
-                f"不支持的 Stage 类型: {stage_request.stage_type}"
-            )
-        return output
+    if stage_request.stage_type == "full_inference":
+        candidate_instructions = {
+            "candidate_a": (
+                "独立分析用户问题，给出准确、可验证且简洁的候选答案。"
+                "不要提及其他候选或任务链。"
+            ),
+            "candidate_b": (
+                "从不同角度独立解决用户问题，重点检查遗漏、反例和不确定性。"
+                "输出可直接供后续汇总的候选答案。"
+            ),
+        }
+        instruction = candidate_instructions.get(stage_request.stage_id)
+        messages = root_input.get("messages")
+        if instruction is None or not isinstance(messages, list):
+            raise TaskGraphError("完整推理 Stage 输入无效")
+        if show_thinking:
+            instruction = f"{instruction}\n\n{THINKING_SYSTEM_PROMPT}"
+        return run_model(
+            [{"role": "system", "content": instruction}, *messages],
+            candidate_budget,
+        )
+    if stage_request.stage_type == "aggregate":
+        message = str(root_input.get("message", "") or "")
+        if not message:
+            raise TaskGraphError("聚合 Stage 缺少原始问题")
+        candidate_payload = {
+            stage_id: value.get("content", "")
+            for stage_id, value in stage_request.dependencies.items()
+            if isinstance(value, dict)
+        }
+        aggregation_prompt = (
+            "请根据原始问题和两个独立候选，输出一个最终答案。"
+            "纠正冲突和明显错误；没有证据时明确不确定性。"
+            "只输出最终答案，不描述内部任务链。\n\n"
+            f"原始问题：{message}\n\n候选：\n"
+            + json.dumps(candidate_payload, ensure_ascii=False)
+        )
+        return run_model(
+            ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
+             if show_thinking else [])
+            + [{"role": "user", "content": aggregation_prompt}],
+            final_budget,
+        )
+    raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+
+
+def _execute_task_graph_chat_with_slot(
+    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+) -> dict:
+    """Execute one workflow while the process-wide task-graph slot is held."""
+
+    remote_stage_id = str(req.task_graph_remote_stage or "")
+    remote_provider_id = str(req.task_graph_remote_provider_id or "")
+    auto_remote = bool(req.task_graph_auto_remote)
+    if bool(remote_stage_id) != bool(remote_provider_id):
+        raise HTTPException(
+            400,
+            "N2.1 手动远端执行必须同时指定 Stage 和 Provider ID。",
+        )
+    if auto_remote and remote_stage_id:
+        raise HTTPException(
+            400,
+            "N2.3 自动 Worker 选择不能与 N2.1 手动远端 Stage 同时启用。",
+        )
+    if remote_stage_id and not TASK_WORKER_EXPERIMENTAL_ENABLED:
+        raise HTTPException(
+            409,
+            "PC Full Worker 实验调度未启用。请设置 "
+            "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
+        )
+
+    target_session_id = req.session_id or active_session_id
+    if target_session_id and target_session_id != active_session_id:
+        _switch_session(target_session_id)
+    history = _get_active_history()
+    if target_session_id and len(history) == 0:
+        _auto_title_session(target_session_id, req.message)
+
+    base_messages = list(history) + [{"role": "user", "content": req.message}]
+    root_input = {
+        "message": req.message,
+        "messages": base_messages,
+        "task_options": {
+            "candidate_max_tokens": max(1, min(req.max_new_tokens, 512)),
+            "final_max_tokens": max(1, min(req.max_new_tokens, 1024)),
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "show_thinking": req.show_thinking,
+        },
+    }
 
     try:
         _ensure_local_task_provider()
@@ -2374,19 +2530,146 @@ def _execute_task_graph_chat_with_slot(
             },
         ) from exc
 
+    model_identity = None
+    stages: Optional[list[StageSpec]] = None
+    final_stage_id = ""
+    auto_provider_ids: list[str] = []
+    auto_fallback_reason = ""
+    if remote_stage_id:
+        remote_providers = {
+            provider.provider_id: provider
+            for provider in scheduler.remote_task_worker_providers()
+        }
+        _sync_remote_task_worker_providers()
+        remote_provider = remote_providers.get(remote_provider_id)
+        if remote_provider is None:
+            raise HTTPException(
+                404, "The selected remote PC Full Worker does not exist."
+            )
+        remote_status = next((
+            item for item in task_graph_coordinator.provider_status()
+            if item.get("provider_id") == remote_provider_id
+            and item.get("provider_kind") == "remote_full_worker"
+        ), None)
+        if remote_status is None:
+            raise HTTPException(404, "指定的远端 PC Full Worker Provider 不存在。")
+        if not remote_status.get("healthy") or not remote_status.get("available"):
+            raise HTTPException(503, "指定的远端 PC Full Worker 当前不可用或正忙。")
+        model_identity = _active_task_graph_model_identity()
+        if model_identity is None:
+            raise HTTPException(409, "手动远端 Stage 要求主节点先加载完整模型并生成精确身份。")
+        template_stages, final_stage_id = dual_candidate_template()
+        selected_stage = next((
+            stage for stage in template_stages
+            if stage.stage_id == remote_stage_id
+        ), None)
+        if (
+            selected_stage is None
+            or not remote_provider.supports_model_identity(
+                model_identity, selected_stage.stage_type,
+            )
+        ):
+            raise HTTPException(
+                409,
+                {
+                    "message": (
+                        "The selected remote PC Full Worker does not have "
+                        "the exact active model required by this Stage."
+                    ),
+                    "reason_code": "model_identity_mismatch",
+                    "provider_id": remote_provider_id,
+                    "stage_id": remote_stage_id,
+                },
+            )
+        stages = [
+            replace(
+                stage,
+                provider=remote_provider_id,
+                fallback_providers=(),
+                pure=False,
+            )
+            if stage.stage_id == remote_stage_id else stage
+            for stage in template_stages
+        ]
+    elif auto_remote:
+        if not TASK_WORKER_EXPERIMENTAL_ENABLED:
+            auto_fallback_reason = "task_worker_experiment_disabled"
+        else:
+            model_identity = _active_task_graph_model_identity()
+        if TASK_WORKER_EXPERIMENTAL_ENABLED and model_identity is None:
+            auto_fallback_reason = "model_identity_unavailable"
+        elif TASK_WORKER_EXPERIMENTAL_ENABLED:
+            auto_provider_ids = _eligible_remote_task_worker_provider_ids(
+                model_identity,
+                "full_inference",
+            )
+            if not auto_provider_ids:
+                auto_fallback_reason = "no_eligible_remote_provider"
+            else:
+                template_stages, final_stage_id = dual_candidate_template()
+                candidate_index = 0
+                planned_stages = []
+                for stage in template_stages:
+                    if stage.stage_type != "full_inference":
+                        planned_stages.append(stage)
+                        continue
+                    if candidate_index >= len(auto_provider_ids):
+                        planned_stages.append(replace(
+                            stage,
+                            provider="local_full_model",
+                            fallback_providers=(),
+                            pure=True,
+                        ))
+                        candidate_index += 1
+                        continue
+                    primary = auto_provider_ids[candidate_index]
+                    other_remotes = [
+                        provider_id for provider_id in auto_provider_ids
+                        if provider_id != primary
+                    ][:3]
+                    planned_stages.append(replace(
+                        stage,
+                        provider=primary,
+                        fallback_providers=tuple(
+                            [*other_remotes, "local_full_model"]
+                        ),
+                        pure=True,
+                    ))
+                    candidate_index += 1
+                stages = planned_stages
+
     request_id = str(_request_id_ctx.get("-") or "-")
+    runtime_context = {
+        "local_provider_executor": _execute_task_worker_stage,
+        "task_graph_remote_policy": (
+            "manual" if remote_stage_id else "auto" if auto_remote else "local"
+        ),
+    }
     try:
-        final_output, workflow = task_graph_coordinator.run_template(
-            template=req.task_graph_template,
-            root_input={
-                "message": req.message,
-                "messages": base_messages,
-                "_local_provider_executor": _execute_provider_stage,
-            },
-            request_id=request_id,
-            workflow_id=req.workflow_id,
-            cancel_event=cancel_event,
-        )
+        if stages is None:
+            final_output, workflow = task_graph_coordinator.run_template(
+                template=req.task_graph_template,
+                root_input=root_input,
+                request_id=request_id,
+                session_id=target_session_id or "default",
+                model_identity=model_identity,
+                runtime_context=runtime_context,
+                workflow_id=req.workflow_id,
+                cancel_event=cancel_event,
+            )
+        else:
+            final_output, workflow = task_graph_coordinator.run(
+                stages=stages,
+                final_stage_id=final_stage_id,
+                template=req.task_graph_template,
+                root_input=root_input,
+                request_id=request_id,
+                session_id=target_session_id or "default",
+                model_identity=model_identity,
+                runtime_context=runtime_context,
+                workflow_id=req.workflow_id,
+                cancel_event=cancel_event,
+            )
     except WorkflowCancelled as exc:
         raise HTTPException(
             409,
@@ -2485,6 +2768,42 @@ def _execute_task_graph_chat_with_slot(
         str(attempt.get("provider_node_id", "") or serving_node_id)
         for attempt in attempts
     }) or [serving_node_id]
+    remote_attempts = [
+        attempt for attempt in attempts
+        if attempt.get("provider_kind") == "remote_full_worker"
+    ]
+    remote_nodes = sorted({
+        str(attempt.get("provider_node_id", "") or "")
+        for attempt in remote_attempts
+        if attempt.get("provider_node_id")
+    })
+    remote_used = bool(remote_attempts)
+    provider_status_by_id = {
+        str(item.get("provider_id", "")): item
+        for item in task_graph_coordinator.provider_status()
+    }
+    planned_remote_nodes = sorted({
+        str(provider_status_by_id.get(provider_id, {}).get("node_id", "") or "")
+        for provider_id in auto_provider_ids
+        if provider_status_by_id.get(provider_id, {}).get("node_id")
+    })
+    retried_stages = [
+        stage for stage in workflow.get("stages", [])
+        if int(stage.get("retry_count", 0) or 0) > 0
+    ]
+    retry_error_codes = [
+        str(stage.get("last_retry_error_code", "") or "")
+        for stage in retried_stages
+        if stage.get("last_retry_error_code")
+    ]
+    fallback_used = bool(retried_stages) or bool(
+        auto_remote and not auto_provider_ids
+    )
+    fallback_reason = (
+        retry_error_codes[0]
+        if retry_error_codes
+        else auto_fallback_reason
+    )
     metrics = _augment_chat_metrics(
         {
             "engine": model_manager._engine_type,
@@ -2499,11 +2818,28 @@ def _execute_task_graph_chat_with_slot(
             "workflow_state": workflow["state"],
             "stage_count": workflow["stage_count"],
             "stage_attempt_count": workflow["attempt_count"],
-            "nodes_planned": len(participating_nodes),
+            "nodes_planned": (
+                1 + len(planned_remote_nodes)
+                if auto_remote else len(participating_nodes)
+            ),
             "nodes_participated": len(participating_nodes),
             "participating_nodes": participating_nodes,
-            "distributed_used": False,
-            "distributed_kind": "task_graph_local_poc",
+            "distributed_requested": bool(remote_stage_id or auto_remote),
+            "distributed_used": remote_used,
+            "distributed_kind": (
+                "task_graph_remote_manual"
+                if remote_used and remote_stage_id
+                else "task_graph_remote_auto"
+                if remote_used and auto_remote
+                else "task_graph_local_fallback"
+                if auto_remote
+                else "task_graph_local_poc"
+            ),
+            "workers_used": remote_nodes,
+            "manual_remote_stage": remote_stage_id,
+            "manual_remote_provider": remote_provider_id,
+            "auto_remote_enabled": auto_remote,
+            "auto_remote_providers": auto_provider_ids,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
@@ -2514,11 +2850,17 @@ def _execute_task_graph_chat_with_slot(
                 for attempt in attempts
             ),
             "elapsed_seconds": workflow["duration_seconds"],
-            "fallback": False,
-            "fallback_reason": "",
+            "fallback": fallback_used,
+            "fallback_reason": fallback_reason,
         },
         req,
-        route=f"{_chat_origin(req)}_to_local_task_graph",
+        route=(
+            f"{_chat_origin(req)}_to_task_graph_manual_remote"
+            if remote_stage_id
+            else f"{_chat_origin(req)}_to_task_graph_auto_remote"
+            if auto_remote
+            else f"{_chat_origin(req)}_to_local_task_graph"
+        ),
     )
     followups = _fallback_followups(history, [])
     save_metrics = dict(metrics)
@@ -2672,6 +3014,22 @@ def _execute_chat_full(
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
+
+        if _pipeline_worker_is_reserved():
+            raise HTTPException(
+                503,
+                "本设备正作为 PyTorch 分层从节点，"
+                "当前无法转发到主节点，已拒绝覆盖分层模型。",
+            )
+        if not model_loaded or not model_manager.is_loaded:
+            _auto_load_default_model()
+
+    if _pipeline_worker_is_reserved():
+        raise HTTPException(
+            503,
+            "本设备正作为 PyTorch 分层从节点，"
+            "请先断开主节点或明确切换本地模型。",
+        )
 
     # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
     if (scheduler.get_distributed_inference_enabled()
@@ -3044,6 +3402,33 @@ def _execute_requested_chat(
     return _execute_chat_full(req, cancel_event)
 
 
+def _should_forward_chat_to_master() -> bool:
+    return bool(
+        scheduler.get_distributed_inference_enabled()
+        and RUN_MODE == "distributed"
+        and scheduler._effective_role() == "client"
+    )
+
+
+def _pipeline_worker_is_reserved() -> bool:
+    check = getattr(scheduler, "has_pipeline_worker_reservation", None)
+    return bool(callable(check) and check())
+
+
+def _ensure_chat_model_or_forwarding() -> None:
+    """Load a local model only when this request cannot be master-forwarded."""
+    if _should_forward_chat_to_master():
+        return
+    if _pipeline_worker_is_reserved():
+        raise HTTPException(
+            503,
+            "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
+        )
+    if model_loaded and model_manager.is_loaded:
+        return
+    _auto_load_default_model()
+
+
 def _auto_load_default_model():
     """自动加载默认模型（用于 thin client / Android 首次请求时服务端无模型的情况）。"""
     global model_loaded, current_quant, kv_cache, conversation_stats
@@ -3108,6 +3493,7 @@ def _auto_load_default_model():
     }
     model_loaded = True
     current_quant = quant
+    scheduler.refresh_task_worker_capabilities()
     elapsed = time.time() - t0
     logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
 
@@ -3134,7 +3520,7 @@ async def chat(req: ChatRequest):
         with _full_chat_execution_lock:
             if not model_loaded or not model_manager.is_loaded:
                 try:
-                    _auto_load_default_model()
+                    _ensure_chat_model_or_forwarding()
                 except FileNotFoundError:
                     raise HTTPException(
                         400,
@@ -3281,7 +3667,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     return _execute_requested_chat(req, cancel_event)
                 with _full_chat_execution_lock:
                     if not model_loaded or not model_manager.is_loaded:
-                        _auto_load_default_model()
+                        _ensure_chat_model_or_forwarding()
                     return _execute_requested_chat(req, cancel_event)
 
             try:
@@ -3306,6 +3692,59 @@ async def chat_stream(req: ChatRequest, request: Request):
         # ================================================================
         # fast 模式：真流式，跳过历史/追问/DB 持久化（低延迟）
         # ================================================================
+        # ---- 路径 0: 分布式 client 优先转发主节点 ----
+        # A pipeline worker may already hold a valid PyTorch segment. It must
+        # never enter the local PyTorch streaming branch, which restores the
+        # full model and invalidates the master's ready ACK.
+        if _should_forward_chat_to_master():
+            loop = _asyncio.get_running_loop()
+            result = await _run_with_request_id(
+                loop,
+                lambda: scheduler.forward_inference_to_master(
+                    message=req.message,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    show_thinking=req.show_thinking,
+                    session_id=req.session_id,
+                    messages=[{"role": "user", "content": req.message}],
+                    request_id=request_id,
+                    _cancel_event=cancel_event,
+                ),
+            )
+            if result.get("status") == "ok":
+                metrics = result.get("metrics", {}) or {}
+                metrics.setdefault("request_id", request_id)
+                yield f"data: {_json.dumps({
+                    'done': True,
+                    'response': result.get('content', ''),
+                    'thinking_content': result.get('thinking_content'),
+                    'metrics': metrics,
+                    'request_id': request_id,
+                }, ensure_ascii=False)}\n\n"
+                return
+            if _pipeline_worker_is_reserved():
+                yield _error_event(
+                    result.get("error")
+                    or "本设备正作为 PyTorch 分层从节点，无法转发到主节点。"
+                )
+                return
+
+        if _pipeline_worker_is_reserved():
+            yield _error_event(
+                "本设备正作为 PyTorch 分层从节点，"
+                "请先断开主节点或明确切换本地模型。"
+            )
+            return
+
+        if not model_loaded or not model_manager.is_loaded:
+            loop = _asyncio.get_running_loop()
+            try:
+                await _run_with_request_id(loop, _auto_load_default_model)
+            except Exception as exc:
+                yield _error_event(f"本地回退模型加载失败: {exc}")
+                return
+
         # ---- 路径 1: 分布式流水线流式 ----
         if (scheduler.get_distributed_inference_enabled()
                 and RUN_MODE == "distributed"
@@ -3481,20 +3920,25 @@ def _public_workflow(snapshot: dict, journal: dict) -> dict:
 
 
 @app.get("/api/workflows")
-async def list_workflows(limit: int = 20):
+async def list_workflows(limit: int = 20, session_id: str = ""):
     role = scheduler._effective_role()
     provider_error = ""
     if TASK_GRAPH_ENABLED and role == "master":
         try:
             _ensure_local_task_provider()
+            _sync_remote_task_worker_providers()
         except ProviderError as exc:
             provider_error = f"{exc.code}: {exc}"
     journal = task_graph_coordinator.journal_status()
     try:
-        workflows = task_graph_coordinator.list(limit=limit)
+        workflows = task_graph_coordinator.list(
+            limit=limit, session_id=session_id,
+        )
     except TaskGraphUnavailable:
         journal = task_graph_coordinator.journal_status()
-        workflows = task_graph_coordinator.list(limit=limit)
+        workflows = task_graph_coordinator.list(
+            limit=limit, session_id=session_id,
+        )
     public_journal = _public_task_journal(journal)
     workflows = [
         _public_workflow(workflow, journal) for workflow in workflows
@@ -3520,7 +3964,7 @@ async def list_workflows(limit: int = 20):
         "providers": task_graph_coordinator.provider_ids(),
         "provider_status": provider_status,
         "provider_error": provider_error,
-        "worker_protocol": worker_protocol_status(),
+        "worker_protocol": scheduler.get_task_worker_protocol_status(),
         "journal": public_journal,
         "workflows": workflows,
     }
@@ -3975,12 +4419,14 @@ async def switch_model(req: SwitchModelRequest):
                 db_experimental_models=_get_db_experimental_models(),
             ),
             prepare=_prepare_model_switch,
+            release_worker_reservation=True,
         )
 
         if result["success"]:
             model_loaded = True
             current_quant = quant
             _init_kv_cache()
+            scheduler.refresh_task_worker_capabilities()
             return result
         else:
             # 切换失败 — 检查是否回滚成功

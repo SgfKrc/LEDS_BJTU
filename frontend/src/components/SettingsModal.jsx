@@ -866,6 +866,29 @@ export default function SettingsModal({
                 当前节点未启用任务链实验
               </div>
             )}
+            {settings.executionMode === 'task_graph' && taskGraphCapability?.available && (
+              <div className="execution-mode-segment" role="group" aria-label="任务链 Provider 策略" style={{ marginTop: 10 }}>
+                <button
+                  type="button"
+                  className={settings.taskGraphRemoteMode !== 'auto' ? 'active' : ''}
+                  onClick={() => onSettingsChange({ taskGraphRemoteMode: 'local' })}
+                  title="所有任务链 Stage 仅在主节点执行"
+                >
+                  仅本地
+                </button>
+                <button
+                  type="button"
+                  className={settings.taskGraphRemoteMode === 'auto' ? 'active' : ''}
+                  disabled={!taskGraphCapability?.worker_protocol?.experiment_enabled}
+                  onClick={() => onSettingsChange({ taskGraphRemoteMode: 'auto' })}
+                  title={taskGraphCapability?.worker_protocol?.experiment_enabled
+                    ? '为无副作用候选 Stage 自动选择健康的 PC Full Worker'
+                    : '主节点未开启 PC Full Worker 实验调度'}
+                >
+                  自动 Worker
+                </button>
+              </div>
+            )}
           </div>
 
           {/* ======== 分布式推理优化（所有节点可见） ======== */}

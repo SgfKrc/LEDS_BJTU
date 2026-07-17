@@ -13,6 +13,30 @@ from typing import Callable, Optional, Protocol
 
 PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 RESERVATION_ID_PATTERN = re.compile(r"^res_[A-Za-z0-9_-]{8,96}$")
+MODEL_IDENTITY_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+MODEL_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+class _CombinedCancelEvent(threading.Event):
+    def __init__(self, workflow_event: threading.Event):
+        super().__init__()
+        self._workflow_event = workflow_event
+
+    def is_set(self) -> bool:
+        return super().is_set() or self._workflow_event.is_set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                return False
+            super().wait(
+                0.05 if remaining is None else min(0.05, remaining)
+            )
+        return True
 
 
 class ProviderError(RuntimeError):
@@ -83,6 +107,35 @@ class ProviderCapabilities:
 
 
 @dataclass(frozen=True)
+class ModelIdentity:
+    model_id: str
+    engine: str
+    format: str
+    revision: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.engine not in {"pytorch", "llama_cpp"}:
+            raise ValueError("model identity engine is unsupported")
+        if any(
+            MODEL_IDENTITY_VALUE_PATTERN.fullmatch(value) is None
+            for value in (self.model_id, self.format, self.revision)
+        ):
+            raise ValueError("model identity contains an invalid value")
+        if MODEL_SHA256_PATTERN.fullmatch(self.sha256) is None:
+            raise ValueError("model identity sha256 is invalid")
+
+    def snapshot(self) -> dict:
+        return {
+            "model_id": self.model_id,
+            "engine": self.engine,
+            "format": self.format,
+            "revision": self.revision,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
 class StageRequest:
     workflow_id: str
     request_id: str
@@ -91,6 +144,8 @@ class StageRequest:
     provider_id: str
     dependencies: dict[str, dict]
     root_input: dict
+    model_identity: Optional[ModelIdentity] = None
+    runtime_context: dict = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -113,6 +168,7 @@ class StageAttempt:
     lease_id: str = ""
     lease_epoch: int = 0
     lease_expires_at: float = 0.0
+    accept_timeout_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -135,6 +191,13 @@ class ExecutionProvider(Protocol):
         reservation: Reservation,
         cancel_event: threading.Event,
     ) -> StageResult: ...
+    def renew_lease(
+        self,
+        attempt_id: str,
+        lease_id: str,
+        lease_epoch: int,
+        lease_expires_at: float,
+    ) -> bool: ...
     def cancel(self, attempt_id: str) -> None: ...
     def release(self, reservation_id: str) -> None: ...
     def close(self) -> None: ...
@@ -281,6 +344,11 @@ class LocalFullModelProvider:
         reservation: Reservation,
         cancel_event: threading.Event,
     ) -> StageResult:
+        attempt_cancel_event = (
+            cancel_event
+            if self._provider_kind == "callback_compatibility"
+            else _CombinedCancelEvent(cancel_event)
+        )
         with self._lock:
             owned = self._reservations.get(reservation.reservation_id)
             if owned != reservation:
@@ -307,9 +375,9 @@ class LocalFullModelProvider:
                     provider_id=self.provider_id,
                 )
             self._executed_reservations.add(reservation.reservation_id)
-            self._active_attempts[attempt.attempt_id] = cancel_event
+            self._active_attempts[attempt.attempt_id] = attempt_cancel_event
         try:
-            output = self._executor(attempt.request, cancel_event)
+            output = self._executor(attempt.request, attempt_cancel_event)
             if not isinstance(output, dict):
                 raise ProviderExecutionError(
                     "provider output must be a dict",
@@ -340,6 +408,16 @@ class LocalFullModelProvider:
             event = self._active_attempts.get(attempt_id)
             if event is not None:
                 event.set()
+
+    def renew_lease(
+        self,
+        attempt_id: str,
+        lease_id: str,
+        lease_epoch: int,
+        lease_expires_at: float,
+    ) -> bool:
+        del attempt_id, lease_id, lease_epoch, lease_expires_at
+        return False
 
     def release(self, reservation_id: str) -> None:
         with self._lock:
@@ -613,32 +691,36 @@ class ProviderRegistry:
                     retryable=True,
                 )
             self._providers.pop(provider_id)
-            provider.close()
-            return True
+        provider.close()
+        return True
 
     def inspect(self) -> list[dict]:
         with self._lock:
-            statuses = []
-            for provider_id in sorted(self._providers):
-                try:
-                    capabilities = self._providers[provider_id].inspect()
-                    if capabilities.provider_id != provider_id:
-                        raise ValueError("provider identity mismatch")
-                    statuses.append(capabilities.snapshot())
-                except Exception:
-                    statuses.append({
-                        "provider_id": provider_id,
-                        "provider_kind": "unknown",
-                        "supported_stage_types": [],
-                        "max_concurrency": 0,
-                        "active_reservations": 0,
-                        "healthy": False,
-                        "available": False,
-                        "node_id": "",
-                        "updated_at": time.time(),
-                        "error_code": "provider_inspection_failed",
-                    })
-            return statuses
+            providers = [
+                (provider_id, self._providers[provider_id])
+                for provider_id in sorted(self._providers)
+            ]
+        statuses = []
+        for provider_id, provider in providers:
+            try:
+                capabilities = provider.inspect()
+                if capabilities.provider_id != provider_id:
+                    raise ValueError("provider identity mismatch")
+                statuses.append(capabilities.snapshot())
+            except Exception:
+                statuses.append({
+                    "provider_id": provider_id,
+                    "provider_kind": "unknown",
+                    "supported_stage_types": [],
+                    "max_concurrency": 0,
+                    "active_reservations": 0,
+                    "healthy": False,
+                    "available": False,
+                    "node_id": "",
+                    "updated_at": time.time(),
+                    "error_code": "provider_inspection_failed",
+                })
+        return statuses
 
     @staticmethod
     def _supports(capabilities: ProviderCapabilities, stage_type: str) -> bool:
@@ -669,7 +751,12 @@ class ProviderRegistry:
             )
         return capabilities
 
-    def reserve(self, request: StageRequest) -> Reservation:
+    def _reserve_once(
+        self,
+        request: StageRequest,
+        abandoned: threading.Event,
+        operation: dict,
+    ) -> Reservation:
         with self._lock:
             if self._closed:
                 raise ProviderUnavailable(
@@ -689,72 +776,175 @@ class ProviderRegistry:
                 candidates = [
                     self._providers[key] for key in sorted(self._providers)
                 ]
-            compatible = []
-            inspection_errors = []
-            for provider in candidates:
-                try:
-                    capabilities = self._inspect_for_selection(provider)
-                except ProviderUnavailable as exc:
-                    inspection_errors.append(exc)
-                    continue
-                if self._supports(capabilities, request.stage_type):
-                    compatible.append((provider, capabilities))
-            if not compatible:
-                if request.provider_id and inspection_errors:
-                    raise inspection_errors[0]
-                raise ProviderUnavailable(
-                    f"no provider supports stage type {request.stage_type}",
-                    code="no_compatible_provider",
-                    provider_id=request.provider_id,
-                )
-            healthy = [item for item in compatible if item[1].healthy]
-            if not healthy:
-                raise ProviderUnavailable(
-                    "all compatible providers are unhealthy",
-                    code="all_providers_unhealthy",
+
+        compatible = []
+        inspection_errors = []
+        for provider in candidates:
+            if abandoned.is_set():
+                raise ProviderReservationError(
+                    "provider reservation acceptance timed out",
+                    code="provider_accept_timeout",
                     provider_id=request.provider_id,
                     retryable=True,
                 )
-            available = [item for item in healthy if item[1].available]
-            if not available:
-                raise ProviderBusy(
-                    "all compatible providers are busy or unhealthy",
-                    code="all_providers_busy",
-                    provider_id=request.provider_id,
-                    retryable=True,
-                )
-            provider = available[0][0]
-            reservation = provider.reserve(request)
-            if (
-                not RESERVATION_ID_PATTERN.fullmatch(
-                    reservation.reservation_id,
-                )
-                or reservation.provider_id != provider.provider_id
-                or reservation.workflow_id != request.workflow_id
-                or reservation.stage_id != request.stage_id
-            ):
-                try:
-                    provider.release(reservation.reservation_id)
-                finally:
-                    raise ProviderReservationError(
-                        "provider returned a reservation for a different request",
-                        code="reservation_identity_mismatch",
-                        provider_id=provider.provider_id,
-                    )
-            if reservation.reservation_id in self._reservations:
-                try:
-                    provider.release(reservation.reservation_id)
-                finally:
-                    raise ProviderReservationError(
-                        "provider returned a duplicate reservation_id",
-                        code="duplicate_reservation_id",
-                        provider_id=provider.provider_id,
-                    )
-            self._reservations[reservation.reservation_id] = (
-                provider,
-                reservation,
+            try:
+                capabilities = self._inspect_for_selection(provider)
+            except ProviderUnavailable as exc:
+                inspection_errors.append(exc)
+                continue
+            if self._supports(capabilities, request.stage_type):
+                compatible.append((provider, capabilities))
+        if not compatible:
+            if request.provider_id and inspection_errors:
+                raise inspection_errors[0]
+            raise ProviderUnavailable(
+                f"no provider supports stage type {request.stage_type}",
+                code="no_compatible_provider",
+                provider_id=request.provider_id,
             )
-            return reservation
+        healthy = [item for item in compatible if item[1].healthy]
+        if not healthy:
+            raise ProviderUnavailable(
+                "all compatible providers are unhealthy",
+                code="all_providers_unhealthy",
+                provider_id=request.provider_id,
+                retryable=True,
+            )
+        available = [item for item in healthy if item[1].available]
+        if not available:
+            raise ProviderBusy(
+                "all compatible providers are busy or unhealthy",
+                code="all_providers_busy",
+                provider_id=request.provider_id,
+                retryable=True,
+            )
+        provider = available[0][0]
+        reservation = provider.reserve(request)
+        rejection: Optional[ProviderReservationError] = None
+        if (
+            not RESERVATION_ID_PATTERN.fullmatch(reservation.reservation_id)
+            or reservation.provider_id != provider.provider_id
+            or reservation.workflow_id != request.workflow_id
+            or reservation.stage_id != request.stage_id
+        ):
+            rejection = ProviderReservationError(
+                "provider returned a reservation for a different request",
+                code="reservation_identity_mismatch",
+                provider_id=provider.provider_id,
+            )
+        with self._lock:
+            if rejection is None and abandoned.is_set():
+                rejection = ProviderReservationError(
+                    "provider reservation acceptance timed out",
+                    code="provider_accept_timeout",
+                    provider_id=provider.provider_id,
+                    retryable=True,
+                )
+            if rejection is None and (
+                self._closed
+                or self._providers.get(provider.provider_id) is not provider
+            ):
+                rejection = ProviderReservationError(
+                    "provider registry changed while accepting reservation",
+                    code="provider_registry_changed",
+                    provider_id=provider.provider_id,
+                    retryable=True,
+                )
+            if (
+                rejection is None
+                and reservation.reservation_id in self._reservations
+            ):
+                rejection = ProviderReservationError(
+                    "provider returned a duplicate reservation_id",
+                    code="duplicate_reservation_id",
+                    provider_id=provider.provider_id,
+                )
+            if rejection is None:
+                self._reservations[reservation.reservation_id] = (
+                    provider,
+                    reservation,
+                )
+                operation["reservation"] = reservation
+                return reservation
+        if rejection is None:
+            raise ProviderReservationError(
+                "provider reservation could not be committed",
+                code="reservation_commit_failed",
+                provider_id=provider.provider_id,
+            )
+        try:
+            provider.release(reservation.reservation_id)
+        except Exception as cleanup_exc:
+            rejection.add_note(
+                f"late reservation cleanup also failed: {cleanup_exc}"
+            )
+        raise rejection
+
+    def reserve(
+        self,
+        request: StageRequest,
+        timeout_seconds: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Reservation:
+        abandoned = threading.Event()
+        operation: dict = {}
+        if timeout_seconds is None:
+            return self._reserve_once(request, abandoned, operation)
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        done = threading.Event()
+        result: dict = {}
+
+        def accept_reservation() -> None:
+            try:
+                result["reservation"] = self._reserve_once(
+                    request, abandoned, operation,
+                )
+            except BaseException as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=accept_reservation,
+            name=f"provider-accept-{request.stage_id}",
+            daemon=True,
+        ).start()
+        deadline = time.monotonic() + timeout
+        timeout_code = "provider_accept_timeout"
+        while True:
+            remaining = deadline - time.monotonic()
+            if done.wait(max(0.0, min(0.05, remaining))):
+                error = result.get("error")
+                if isinstance(error, BaseException):
+                    raise error
+                reservation = result.get("reservation")
+                if isinstance(reservation, Reservation):
+                    return reservation
+                raise ProviderReservationError(
+                    "provider reservation returned no result",
+                    code="invalid_reservation_result",
+                    provider_id=request.provider_id,
+                )
+            if cancel_event is not None and cancel_event.is_set():
+                timeout_code = "provider_accept_cancelled"
+                break
+            if remaining <= 0:
+                timeout_code = "provider_accept_timeout"
+                break
+        with self._lock:
+            committed = operation.get("reservation")
+            if committed is None:
+                abandoned.set()
+        if isinstance(committed, Reservation):
+            return committed
+        raise ProviderReservationError(
+            "provider reservation acceptance did not complete",
+            code=timeout_code,
+            provider_id=request.provider_id,
+            retryable=timeout_code == "provider_accept_timeout",
+        )
 
     def execute(
         self,
@@ -823,57 +1013,79 @@ class ProviderRegistry:
     def cancel(self, provider_id: str, attempt_id: str) -> None:
         with self._lock:
             provider = self._providers.get(provider_id)
-            if provider is None:
-                return
+        if provider is not None:
             provider.cancel(attempt_id)
+
+    def renew_lease(
+        self,
+        provider_id: str,
+        attempt_id: str,
+        lease_id: str,
+        lease_epoch: int,
+        lease_expires_at: float,
+    ) -> bool:
+        """Ask a Provider to extend a lease on its transport, if supported."""
+        with self._lock:
+            provider = self._providers.get(provider_id)
+        if provider is None:
+            raise ProviderNotFound(
+                f"provider not found: {provider_id}",
+                code="provider_not_found",
+                provider_id=provider_id,
+            )
+        renew = getattr(provider, "renew_lease", None)
+        if not callable(renew):
+            return False
+        return bool(renew(
+            attempt_id,
+            lease_id,
+            int(lease_epoch),
+            float(lease_expires_at),
+        ))
 
     def release(self, reservation_id: str) -> None:
         with self._lock:
-            entry = self._reservations.get(reservation_id)
+            entry = self._reservations.pop(reservation_id, None)
             if entry is None:
                 return
             provider, _reservation = entry
-            try:
-                provider.release(reservation_id)
-            except ProviderError:
-                raise
-            except Exception as exc:
-                raise ProviderReservationError(
-                    f"provider {provider.provider_id} failed to release reservation",
-                    code="provider_release_failed",
-                    provider_id=provider.provider_id,
-                ) from exc
-            finally:
-                self._reservations.pop(reservation_id, None)
-                self._executed_reservations.discard(reservation_id)
+            self._executed_reservations.discard(reservation_id)
+        try:
+            provider.release(reservation_id)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderReservationError(
+                f"provider {provider.provider_id} failed to release reservation",
+                code="provider_release_failed",
+                provider_id=provider.provider_id,
+            ) from exc
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            first_error: Optional[Exception] = None
-            for reservation_id, (provider, _reservation) in list(
-                self._reservations.items()
-            ):
-                try:
-                    provider.release(reservation_id)
-                except Exception as exc:
-                    if first_error is None:
-                        first_error = exc
-                finally:
-                    self._reservations.pop(reservation_id, None)
-                    self._executed_reservations.discard(reservation_id)
-            for provider in self._providers.values():
-                try:
-                    provider.close()
-                except Exception as exc:
-                    if first_error is None:
-                        first_error = exc
+            reservations = list(self._reservations.items())
+            providers = list(self._providers.values())
+            self._reservations.clear()
             self._providers.clear()
             self._executed_reservations.clear()
-            if first_error is not None:
-                raise ProviderReservationError(
-                    "provider registry close encountered a cleanup error",
-                    code="provider_close_failed",
-                ) from first_error
+        first_error: Optional[Exception] = None
+        for reservation_id, (provider, _reservation) in reservations:
+            try:
+                provider.release(reservation_id)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        for provider in providers:
+            try:
+                provider.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise ProviderReservationError(
+                "provider registry close encountered a cleanup error",
+                code="provider_close_failed",
+            ) from first_error

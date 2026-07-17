@@ -150,6 +150,7 @@ a = Analysis(
         'task_journal',
         'task_provider',
         'task_worker_protocol',
+        'task_worker_adapter',
         'sqlite3',
         '_sqlite3',
 

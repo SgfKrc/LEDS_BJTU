@@ -174,10 +174,11 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     }
     if (sending) return;
     const latest = taskGraphCapability?.workflows?.[0];
-    if (latest) {
+    const expectedSessionId = sessionId || 'default';
+    if (latest?.session_id === expectedSessionId) {
       setTaskGraphRun((current) => current || normalizeTaskGraphWorkflow(latest));
     }
-  }, [settings?.executionMode, sending, taskGraphCapability]);
+  }, [settings?.executionMode, sending, taskGraphCapability, sessionId]);
 
   useEffect(() => {
     if (settings?.executionMode !== 'task_graph' || !sending) return undefined;
@@ -571,6 +572,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           showThinking: settings?.showThinking ?? false,
           streamingMode: 'fast',
           executionMode,
+          taskGraphAutoRemote: executionMode === 'task_graph'
+            && settings?.taskGraphRemoteMode === 'auto',
           workflowId,
           generationId,
           onToken: (_token, fullText) => {
@@ -610,6 +613,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           topP: settings?.topP ?? 0.9,
           showThinking: settings?.showThinking ?? false,
           executionMode,
+          taskGraphAutoRemote: executionMode === 'task_graph'
+            && settings?.taskGraphRemoteMode === 'auto',
           workflowId,
           generationId,
         });

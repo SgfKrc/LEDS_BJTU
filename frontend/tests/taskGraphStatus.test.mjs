@@ -2,6 +2,29 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { normalizeTaskGraphWorkflow } from '../src/taskGraphStatus.js';
+import { fetchTaskGraphStatus } from '../src/api/client.js';
+
+test('task graph capability query is scoped to the active session', async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    requested.push(url);
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => '{"workflows":[]}',
+    };
+  };
+  try {
+    await fetchTaskGraphStatus('session/a');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requested, [
+    '/api/workflows?limit=1&session_id=session%2Fa',
+  ]);
+});
 
 test('result_ready is distinct from completed', () => {
   const status = normalizeTaskGraphWorkflow({

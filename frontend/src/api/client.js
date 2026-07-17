@@ -159,6 +159,7 @@ export async function sendMessage(message, opts = {}) {
       show_thinking: opts.showThinking || false,
       execution_mode: opts.executionMode || 'auto',
       task_graph_template: opts.taskGraphTemplate || 'dual_candidate',
+      task_graph_auto_remote: opts.taskGraphAutoRemote === true,
       workflow_id: opts.workflowId || null,
       generation_id: opts.generationId || null,
     }),
@@ -191,6 +192,7 @@ export async function sendMessageStream(message, opts = {}) {
       streaming_mode: streamingMode,
       execution_mode: opts.executionMode || 'auto',
       task_graph_template: opts.taskGraphTemplate || 'dual_candidate',
+      task_graph_auto_remote: opts.taskGraphAutoRemote === true,
       workflow_id: opts.workflowId || null,
       generation_id: opts.generationId || null,
     }),
@@ -268,8 +270,10 @@ export async function clearChat(sessionId = 'default') {
   });
 }
 
-export async function fetchTaskGraphStatus() {
-  return request('/workflows?limit=1');
+export async function fetchTaskGraphStatus(sessionId = '') {
+  const query = new URLSearchParams({ limit: '1' });
+  if (sessionId) query.set('session_id', sessionId);
+  return request(`/workflows?${query.toString()}`);
 }
 
 export async function fetchWorkflow(workflowId, options = {}) {

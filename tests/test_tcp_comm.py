@@ -96,6 +96,8 @@ class TestMessageType:
             "status_req", "status_res",
             "infer_forward", "infer_result", "infer_cancel",
             "layer_config", "layer_config_ack",
+            "layer_worker_opt_out", "layer_worker_opt_in",
+            "task_worker",
             "role_transfer", "role_transfer_ack",
             "spare_master_designate", "spare_master_designate_ack",
             "spare_master_activate", "spare_master_activate_ack",
@@ -436,6 +438,56 @@ class TestPacketSizeLimit:
     def test_header_len_is_4(self):
         """长度头固定 4 字节"""
         assert HEADER_LEN == 4
+
+    def test_client_rejects_oversized_payload_before_receiving_body(self):
+        sock = _ChunkSocket([
+            struct.pack(">I", MAX_PACKET_SIZE + 1),
+        ])
+        client = TCPClient(client_id="packet_limit_client")
+
+        with pytest.raises(ConnectionError, match="invalid packet length"):
+            client.recv_data(sock)
+
+        assert sock.recv_sizes == [HEADER_LEN]
+
+    def test_client_rejects_oversized_tensor_before_receiving_body(
+        self, monkeypatch,
+    ):
+        payload = b"{}"
+        sock = _ChunkSocket([
+            struct.pack(">I", len(payload)),
+            payload,
+            struct.pack(">I", MAX_PACKET_SIZE + 1),
+        ])
+        client = TCPClient(client_id="tensor_limit_client")
+        monkeypatch.setattr(
+            tcp_comm_mod,
+            "parse_message",
+            lambda _payload: {"_needs_tensor": True},
+        )
+
+        with pytest.raises(
+            ConnectionError, match="invalid tensor packet length",
+        ):
+            client.recv_data(sock)
+
+        assert sock.recv_sizes == [HEADER_LEN, len(payload), HEADER_LEN]
+
+
+class _ChunkSocket:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.recv_sizes = []
+
+    def recv(self, size):
+        self.recv_sizes.append(size)
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if len(chunk) <= size:
+            return chunk
+        self.chunks.insert(0, chunk[size:])
+        return chunk[:size]
 
 
 # ================================================================

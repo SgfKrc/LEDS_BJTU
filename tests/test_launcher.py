@@ -222,4 +222,5 @@ def test_qwen_runtime_dependency_is_declared_for_packaging():
         assert "'task_journal'" in content
         assert "'task_provider'" in content
         assert "'task_worker_protocol'" in content
+        assert "'task_worker_adapter'" in content
         assert "'_sqlite3'" in content

@@ -33,6 +33,7 @@ const DEFAULT_SETTINGS = {
   topP: 0.9,
   distributedInference: false, // 分布式推理：启动时从服务端同步，避免默认假设导致状态不一致
   executionMode: 'auto',       // auto=标准聊天路由 | task_graph=单机任务链实验
+  taskGraphRemoteMode: 'local', // local=任务链仅本地 | auto=显式允许自动 Full Worker
   cloudSync: true,             // 云同步设置偏好：默认开启，确保跨设备设置一致
   showThinking: false,         // 深度思考展示：默认关闭
   streamingMode: 'full',       // 流式输出模式: full=完整功能（历史/追问/持久化，默认）| fast=真流式逐token
@@ -159,7 +160,7 @@ export default function App() {
           }
         })
         .catch(() => {});  // 服务端不可用时保持本地设置
-      fetchTaskGraphStatus()
+      fetchTaskGraphStatus(activeSessionId || '')
         .then((capability) => {
           setTaskGraphCapability(capability);
         })
@@ -198,13 +199,18 @@ export default function App() {
   useEffect(() => {
     if (!myRole) return;
     import('./api/client').then(({ fetchTaskGraphStatus }) => {
-      fetchTaskGraphStatus()
+      fetchTaskGraphStatus(activeSessionId || '')
         .then(setTaskGraphCapability)
         .catch(() => {
           setTaskGraphCapability({ enabled: false, available: false, role: 'unknown' });
         });
     });
-  }, [myRole?.node_role, myRole?.is_master, myRole?.is_client]);
+  }, [
+    myRole?.node_role,
+    myRole?.is_master,
+    myRole?.is_client,
+    activeSessionId,
+  ]);
 
   // 后台管理 Tab 是否可见
   const showAdminTab = !myRole                     // 加载中：显示（兜底）
