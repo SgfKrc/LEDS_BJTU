@@ -20,6 +20,8 @@ from task_worker_protocol import (
     stage_input_sha256,
 )
 from task_provider import (
+    CallbackExecutionProvider,
+    DEPENDENCY_FAILURES_KEY,
     ModelIdentity,
     ProviderExecutionError,
     ProviderUnavailable,
@@ -338,6 +340,109 @@ def test_remote_provider_requires_exact_model_and_returns_fenced_identity():
     with pytest.raises(ProviderUnavailable) as mismatch:
         provider.reserve(wrong_model_request)
     assert mismatch.value.code == "model_identity_mismatch"
+
+
+def test_remote_v2_provider_rejects_partial_dependencies_before_offer():
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    request = StageRequest(
+        workflow_id="wf_partialremote1",
+        request_id="request-partial-remote",
+        stage_id="aggregate",
+        stage_type="aggregate",
+        provider_id=provider.provider_id,
+        dependencies={
+            "candidate_a": {"content": "surviving candidate"},
+            DEPENDENCY_FAILURES_KEY: {
+                "candidate_b": {
+                    "state": "failed",
+                    "error_code": "provider_execution_failed",
+                },
+            },
+        },
+        root_input={"message": "hello", "messages": []},
+        model_identity=_model_identity(),
+    )
+
+    with pytest.raises(ProviderUnavailable) as captured:
+        provider.reserve(request)
+
+    assert captured.value.code == "partial_dependencies_not_supported"
+    assert captured.value.retryable is True
+    assert sent == []
+    assert provider.inspect().active_reservations == 0
+
+
+def test_partial_dependencies_fallback_from_v2_remote_to_local_provider():
+    from task_graph import StageSpec, TaskGraphCoordinator
+
+    coordinator_control, _worker_control = _admitted_control_plane()
+    sent = []
+    provider = RemoteFullWorkerProvider(
+        node_id="worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("worker_01"),
+        send_message=sent.append,
+    )
+    coordinator = TaskGraphCoordinator()
+    coordinator.register_provider(provider)
+
+    def execute(request, cancel_event):
+        if request.stage_id == "candidate_b":
+            raise RuntimeError("candidate failed")
+        if request.stage_type == "aggregate":
+            assert DEPENDENCY_FAILURES_KEY in request.dependencies
+            return {
+                "content": request.dependencies["candidate_a"]["content"]
+            }
+        return {"content": "surviving candidate"}
+
+    coordinator.register_provider(CallbackExecutionProvider(
+        provider_id="local_full_model",
+        executor=execute,
+        supported_stage_types=("full_inference", "aggregate"),
+    ))
+
+    try:
+        output, snapshot = coordinator.run(
+            [
+                StageSpec("candidate_a", "full_inference"),
+                StageSpec("candidate_b", "full_inference"),
+                StageSpec(
+                    "aggregate",
+                    "aggregate",
+                    depends_on=("candidate_a", "candidate_b"),
+                    provider=provider.provider_id,
+                    fallback_providers=("local_full_model",),
+                    pure=True,
+                    minimum_successful_dependencies=1,
+                ),
+            ],
+            "aggregate",
+            {"message": "question"},
+            model_identity=_model_identity(),
+            workflow_id="wf_partialfallback1",
+        )
+    finally:
+        coordinator.close()
+
+    aggregate = next(
+        stage for stage in snapshot["stages"]
+        if stage["stage_id"] == "aggregate"
+    )
+    assert output == {"content": "surviving candidate"}
+    assert snapshot["partial_result"] is True
+    assert aggregate["retry_count"] == 1
+    assert aggregate["same_provider_retry_count"] == 0
+    assert aggregate["last_retry_error_code"] == (
+        "partial_dependencies_not_supported"
+    )
+    assert aggregate["attempts"][0]["provider"] == "local_full_model"
+    assert sent == []
 
 
 def test_remote_provider_rejects_wrong_epoch_without_waking_attempt():

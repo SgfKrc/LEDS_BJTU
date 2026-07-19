@@ -89,7 +89,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
-_LAYER_ASSIGNMENT_CACHE_VERSION = 2
+_LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
 
 def _bootstrap_api_port(default: int = 8000) -> int:
@@ -2222,8 +2222,8 @@ class Scheduler:
         if vram_available <= 0:
             return (True, 0, 0)  # 无法判断 → 放行
 
-        # 根据当前模型结构和分层加载的真实精度估算内存。Qwen2 选择性加载
-        # 当前以 FP16 materialize，不能继续套用全模型 int4/int8 的缩放系数。
+        # 根据当前模型结构和分层加载的真实精度估算内存。CUDA 分层使用
+        # FP16，CPU/集显分层使用 FP32，都不能套用全模型 int4/int8 缩放系数。
         from config import (
             MIN_VRAM_PER_LAYER_MB, EMBEDDING_VRAM_MB, LM_HEAD_VRAM_MB,
             SAFE_VRAM_MARGIN, LAYER_VRAM_FACTOR, QUANT_TYPE,
@@ -2253,6 +2253,15 @@ class Scheduler:
         manager = getattr(api_module, "model_manager", None) if api_module else None
         model_config = getattr(getattr(manager, "model", None), "config", None)
 
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
+        gpu = self._select_scoring_gpu(node.device_info if node else {})
+        uses_cuda = bool(
+            gpu.get("cuda_available", False)
+            and not self._gpu_is_integrated(gpu)
+        ) if isinstance(gpu, dict) else False
+        bytes_per_parameter = 2 if uses_cuda else 4
+
         if model_config is None and manager is not None:
             model_path = getattr(manager, "_model_path", "") or ""
             config_path = os.path.join(model_path, "config.json")
@@ -2278,22 +2287,17 @@ class Scheduler:
                 mlp_params = hidden * intermediate * 3
                 norm_params = hidden * 2
                 mib = 1024.0 * 1024.0
-                layer_mb = (attention_params + mlp_params + norm_params) * 2 / mib
-                io_mb = vocab * hidden * 2 / mib
+                layer_mb = (
+                    attention_params + mlp_params + norm_params
+                ) * bytes_per_parameter / mib
+                io_mb = vocab * hidden * bytes_per_parameter / mib
                 return layer_mb, io_mb, io_mb
             except (TypeError, ValueError, ZeroDivisionError, AttributeError):
                 logger.debug("读取 Qwen2 模型结构内存参数失败，使用回退估算", exc_info=True)
 
-        with self._nodes_lock:
-            node = self.nodes.get(node_id)
-        gpu = self._select_scoring_gpu(node.device_info if node else {})
-        uses_cuda = bool(
-            gpu.get("cuda_available", False)
-            and not self._gpu_is_integrated(gpu)
-        ) if isinstance(gpu, dict) else False
         quant = getattr(manager, "quant_type", None) or configured_quant
-        # 非 CUDA worker 的 PyTorch loader 会把 bitsandbytes int4/int8 回退到 FP16。
-        factor = quant_factors.get(quant, 1.0) if uses_cuda else 1.0
+        # CPU workers materialize FP32 weights; fallback constants use FP16 as baseline.
+        factor = quant_factors.get(quant, 1.0) if uses_cuda else 2.0
         return tuple(float(value) * factor for value in fallback)
 
     def _layer_assignment_cache_key(self, total_layers: int) -> str:

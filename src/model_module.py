@@ -62,6 +62,13 @@ import model_config as mc
 logger = logging.getLogger(__name__)
 
 
+def _select_layer_runtime() -> Tuple[str, torch.dtype]:
+    """Choose a stable dtype for selectively loaded pipeline layers."""
+    if torch.cuda.is_available():
+        return "cuda:0", torch.float16
+    return "cpu", torch.float32
+
+
 def _serialized_model_access(method):
     """Serialize model mutation and inference against the manager RLock."""
     @wraps(method)
@@ -783,13 +790,13 @@ class ModelManager:
         if not files_to_keys:
             raise FileNotFoundError("Qwen2 模型目录中未找到分层 safetensors 权重")
 
-        use_cuda = torch.cuda.is_available()
-        target_device = "cuda:0" if use_cuda else "cpu"
-        target_dtype = torch.float16
+        target_device, target_dtype = _select_layer_runtime()
+        runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE
-        if requested_quant in {"int4", "int8"}:
+        if requested_quant != runtime_quant:
             logger.info(
-                "分层选择性加载暂以 FP16 执行（请求量化=%s），仅加载 %s-%s 层",
+                "分层选择性加载以 %s 执行（请求量化=%s），仅加载 %s-%s 层",
+                runtime_quant.upper(),
                 requested_quant,
                 start_layer,
                 end_layer,
@@ -827,7 +834,7 @@ class ModelManager:
             local_files_only=True,
         )
         self._model_path = model_path
-        self.quant_type = "fp16"
+        self.quant_type = runtime_quant
         self._total_model_layers = total_layers
         self._model_layers = end_layer - start_layer
         logger.info(
@@ -867,11 +874,23 @@ class ModelManager:
         if total_layers <= 0:
             raise RuntimeError("Qwen config 缺少 num_hidden_layers")
 
-        # 原版 Qwen 会在构造时按机器能力自动切换精度和 FlashAttention。
-        # 分布式工件固定为 FP16，避免 CUDA 主节点和 CPU worker 产生不同模型。
+        target_device, target_dtype = _select_layer_runtime()
+        use_cuda = target_device.startswith("cuda")
+        runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
+        requested_quant = quant_type or QUANT_TYPE
+        if requested_quant != runtime_quant:
+            logger.info(
+                "分层选择性加载以 %s 执行（请求量化=%s），仅加载 %s-%s 层",
+                runtime_quant.upper(),
+                requested_quant,
+                start_layer,
+                end_layer,
+            )
+        # Original Qwen reads these flags while constructing its remote-code model.
+        # CPU workers use FP32; hidden states are cast at each pipeline boundary.
         config.bf16 = False
-        config.fp16 = True
-        config.fp32 = False
+        config.fp16 = use_cuda
+        config.fp32 = not use_cuda
         config.use_flash_attn = False
 
         old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
@@ -920,8 +939,6 @@ class ModelManager:
         if not files_to_keys:
             raise FileNotFoundError("Qwen 模型目录中未找到分层 safetensors 权重")
 
-        target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        target_dtype = torch.float16
         loaded_keys = set()
         for filename, keys in files_to_keys.items():
             shard_path = os.path.join(model_path, filename)
@@ -955,7 +972,7 @@ class ModelManager:
             local_files_only=True,
         )
         self._model_path = model_path
-        self.quant_type = "fp16"
+        self.quant_type = runtime_quant
         self._total_model_layers = total_layers
         self._model_layers = end_layer - start_layer
         logger.info(
@@ -1088,9 +1105,10 @@ class ModelManager:
         profile: dict = None,
     ) -> None:
         """
-        加载 PyTorch + Transformers 模型（CUDA 路径）。
+        加载 PyTorch + Transformers 模型。
 
         核心逻辑:
+        - CPU: 使用 torch.float32，规避半精度 CPU 算子不兼容
         - fp16: 直接以 torch.float16 加载，显存 ~3.5 GB
         - int8: bitsandbytes 8-bit 量化加载，显存 ~2.3 GB
         - int4: bitsandbytes 4-bit NF4 双重量化加载，显存 ~1.8 GB
@@ -1129,13 +1147,18 @@ class ModelManager:
         if not use_cuda:
             if self.quant_type in ("int4", "int8"):
                 logger.warning(
-                    f"⚠️ bitsandbytes {self.quant_type} 量化不支持 CPU，回退到 FP16 CPU 推理"
+                    f"⚠️ bitsandbytes {self.quant_type} 量化不支持 CPU，回退到 FP32 CPU 推理"
                 )
                 logger.warning(
                     f"💡 建议切换引擎为 llama.cpp (设置 INFERENCE_ENGINE='llama_cpp') "
                     f"以获得更好的 CPU 推理性能（3-5x 加速）"
                 )
-                self.quant_type = "fp16"
+            elif self.quant_type != "fp32":
+                logger.info(
+                    "CPU PyTorch 推理将请求精度 %s 调整为 FP32，以保证算子兼容性",
+                    self.quant_type,
+                )
+            self.quant_type = "fp32"
 
             cpu_cores = profile.get("cpu", {}).get("physical_cores", 4) if profile else 4
             omp_threads = max(2, cpu_cores // 2)
@@ -1146,7 +1169,7 @@ class ModelManager:
             load_kwargs: Dict[str, Any] = dict(
                 device_map={"": "cpu"},
                 trust_remote_code=TRUST_REMOTE_CODE,
-                torch_dtype=torch.float16,
+                torch_dtype=torch.float32,
             )
         else:
             # ---- CUDA 路径 ----
@@ -1965,11 +1988,21 @@ class ModelManager:
                 #   flash_attention_2 → None（flash 内核自行处理因果掩码）
                 #   sdpa + 纯因果 → None（SDPA is_causal 路径）
                 #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
+                mask_fallback_error: Optional[Exception] = None
+                mask_parameters = {}
                 try:
                     from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
-                    mask_parameters = inspect.signature(
-                        create_causal_mask
-                    ).parameters
+                except (ImportError, AttributeError) as exc:
+                    mask_fallback_error = exc
+                else:
+                    try:
+                        mask_parameters = inspect.signature(
+                            create_causal_mask
+                        ).parameters
+                    except (TypeError, ValueError) as exc:
+                        mask_fallback_error = exc
+
+                if mask_fallback_error is None:
                     mask_kwargs = {
                         "config": transformer.config,
                         "attention_mask": (
@@ -1984,20 +2017,32 @@ class ModelManager:
                     elif "inputs_embeds" in mask_parameters:
                         mask_kwargs["inputs_embeds"] = hidden_states
                     else:
-                        raise RuntimeError(
+                        mask_fallback_error = TypeError(
                             "create_causal_mask 缺少已知的输入张量参数"
                         )
-                    if "cache_position" in mask_parameters:
+                    if (
+                        mask_fallback_error is None
+                        and "cache_position" in mask_parameters
+                    ):
                         mask_kwargs["cache_position"] = cache_position
-                    causal_mask = create_causal_mask(**mask_kwargs)
-                except (ImportError, AttributeError):
+                    if mask_fallback_error is None:
+                        # Runtime input/cache failures are not version mismatches.
+                        causal_mask = create_causal_mask(**mask_kwargs)
+
+                if mask_fallback_error is not None:
                     # transformers 4.x 回退：手动构建 4D 因果掩码
+                    logger.debug(
+                        "create_causal_mask unavailable or incompatible; "
+                        "using manual mask: %s",
+                        mask_fallback_error,
+                    )
                     query_len = hidden_states.shape[1]
                     target_len = past_seen_tokens + query_len
                     causal_mask = torch.full(
                         (query_len, target_len),
                         float('-inf'),
                         device=device,
+                        dtype=hidden_states.dtype,
                     )
                     causal_mask = torch.triu(
                         causal_mask, diagonal=past_seen_tokens + 1

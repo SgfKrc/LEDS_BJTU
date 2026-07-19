@@ -16,6 +16,7 @@ from task_journal import (
     TaskJournalError,
     TaskJournalInUse,
 )
+from task_provider import ProviderExecutionError
 import config
 
 
@@ -399,6 +400,8 @@ def test_restart_recovery_expires_attempts_and_terminalizes_workflow(tmp_path):
         "skipped_stages": 1,
     }
     assert recovered["state"] == "failed"
+    assert recovered["partial_result"] is False
+    assert recovered["skipped_stage_count"] == 1
     assert recovered["last_sequence"] == 2
     assert recovered["recovery_pending"] is False
     assert recovered["runtime_status"] == "terminal"
@@ -456,6 +459,49 @@ def test_result_ready_recovery_fails_without_replaying_completed_model_work(tmp_
     assert recovered["stages"][0]["state"] == "completed"
     assert recovered["stages"][0]["attempts"][0]["state"] == "completed"
     coordinator.close()
+
+
+def test_partial_result_and_retry_counters_persist_without_error_text(tmp_path):
+    path = str(tmp_path / "partial-result.sqlite3")
+    coordinator = TaskGraphCoordinator(journal=SQLiteTaskJournal(path))
+    aggregate_calls = 0
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        nonlocal aggregate_calls
+        if stage.stage_id == "candidate_b":
+            raise RuntimeError("private candidate failure")
+        if stage.stage_type == "aggregate":
+            aggregate_calls += 1
+            if aggregate_calls == 1:
+                raise ProviderExecutionError(
+                    "private aggregate retry detail",
+                    code="provider_execution_failed",
+                    same_provider_retryable=True,
+                )
+            return {"content": dependencies["candidate_a"]["content"]}
+        return {"content": "surviving candidate"}
+
+    coordinator.run_template(
+        "dual_candidate",
+        {"message": "question"},
+        execute,
+        workflow_id="wf_partialpersist",
+    )
+    coordinator.commit_result("wf_partialpersist")
+    coordinator.close()
+
+    reopened = TaskGraphCoordinator(journal=SQLiteTaskJournal(path))
+    try:
+        snapshot = reopened.get("wf_partialpersist")
+        assert snapshot["state"] == "completed"
+        assert snapshot["partial_result"] is True
+        assert snapshot["failed_stage_count"] == 1
+        assert snapshot["same_provider_retry_count"] == 1
+        encoded = str(snapshot)
+        assert "private candidate failure" not in encoded
+        assert "private aggregate retry detail" not in encoded
+    finally:
+        reopened.close()
 
 
 def test_terminal_cleanup_by_age_never_deletes_nonterminal_workflows(tmp_path):

@@ -841,8 +841,14 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           </div>
           <div className="task-graph-run-facts">
             {taskGraphRun.resultReady && <span>等待会话提交</span>}
+            {taskGraphRun.partialResult && <span>部分候选失败，已降级汇总</span>}
             {taskGraphRun.recovered && <span>{taskGraphRun.recoveryLabel}</span>}
-            {taskGraphRun.retryCount > 0 && <span>已重派 {taskGraphRun.retryCount} 次</span>}
+            {taskGraphRun.sameProviderRetryCount > 0 && (
+              <span>同 Provider 重试 {taskGraphRun.sameProviderRetryCount} 次</span>
+            )}
+            {taskGraphRun.reassignmentCount > 0 && (
+              <span>已重派 {taskGraphRun.reassignmentCount} 次</span>
+            )}
             {taskGraphRun.rejectionCount > 0 && (
               <span>{taskGraphRun.rejectionLabel} {taskGraphRun.rejectionCount} 次</span>
             )}

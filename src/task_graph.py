@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Optional, cast
 from task_journal import JournalEvent, TaskJournal, TaskJournalError
 from task_provider import (
     CallbackExecutionProvider,
+    DEPENDENCY_FAILURES_KEY,
     ExecutionProvider,
     ModelIdentity,
     PROVIDER_ID_PATTERN,
@@ -99,6 +100,9 @@ class StageSpec:
     pure: bool = False
     accept_timeout_seconds: float = 10.0
     lease_timeout_seconds: float = 300.0
+    minimum_successful_dependencies: Optional[int] = None
+    max_same_provider_retries: int = 0
+    retry_safe: bool = False
 
 
 @dataclass
@@ -160,6 +164,7 @@ class StageRecord:
     winner_attempt_id: str = ""
     output_digest: str = ""
     retry_count: int = 0
+    same_provider_retry_count: int = 0
     last_retry_error_code: str = ""
     result_rejection_count: int = 0
     last_result_rejection_reason: str = ""
@@ -171,6 +176,10 @@ class StageRecord:
     def selected_provider(self) -> str:
         candidates = self.provider_candidates()
         return candidates[min(self.provider_index, len(candidates) - 1)]
+
+    def minimum_successful_dependencies(self) -> int:
+        configured = self.spec.minimum_successful_dependencies
+        return len(self.spec.depends_on) if configured is None else configured
 
     def snapshot(self) -> dict:
         output_digest = ""
@@ -198,9 +207,15 @@ class StageRecord:
             "pure": self.spec.pure,
             "accept_timeout_seconds": self.spec.accept_timeout_seconds,
             "lease_timeout_seconds": self.spec.lease_timeout_seconds,
+            "minimum_successful_dependencies": (
+                self.minimum_successful_dependencies()
+            ),
+            "max_same_provider_retries": self.spec.max_same_provider_retries,
+            "retry_safe": self.spec.retry_safe,
             "lease_epoch": self.lease_epoch,
             "winner_attempt_id": self.winner_attempt_id,
             "retry_count": self.retry_count,
+            "same_provider_retry_count": self.same_provider_retry_count,
             "last_retry_error_code": self.last_retry_error_code,
             "result_rejection_count": self.result_rejection_count,
             "last_result_rejection_reason": (
@@ -253,11 +268,28 @@ class WorkflowRecord:
             stages = [stage.snapshot() for stage in self.stages.values()]
             completed = sum(stage["state"] == "completed" for stage in stages)
             failed = sum(stage["state"] == "failed" for stage in stages)
+            skipped = sum(stage["state"] == "skipped" for stage in stages)
             cancelled = sum(stage["state"] == "cancelled" for stage in stages)
             attempts = sum(len(stage["attempts"]) for stage in stages)
             retries = sum(int(stage["retry_count"]) for stage in stages)
+            same_provider_retries = sum(
+                int(stage["same_provider_retry_count"])
+                for stage in stages
+            )
             rejections = sum(
                 int(stage["result_rejection_count"]) for stage in stages
+            )
+            final_dependency_ids: set[str] = set()
+            pending = [self.final_stage_id]
+            while pending:
+                stage_id = pending.pop()
+                if stage_id in final_dependency_ids:
+                    continue
+                final_dependency_ids.add(stage_id)
+                pending.extend(self.stages[stage_id].spec.depends_on)
+            final_path_incomplete = any(
+                self.stages[stage_id].state in {"failed", "skipped"}
+                for stage_id in final_dependency_ids
             )
             return {
                 "workflow_id": self.workflow_id,
@@ -280,9 +312,15 @@ class WorkflowRecord:
                 "stage_count": len(stages),
                 "completed_stage_count": completed,
                 "failed_stage_count": failed,
+                "skipped_stage_count": skipped,
+                "partial_result": bool(
+                    self.state in {"result_ready", "completed"}
+                    and final_path_incomplete
+                ),
                 "cancelled_stage_count": cancelled,
                 "attempt_count": attempts,
                 "retry_count": retries,
+                "same_provider_retry_count": same_provider_retries,
                 "result_rejection_count": rejections,
                 "cancel_requested": (
                     self.cancel_event.is_set() and self.state != "completed"
@@ -297,8 +335,6 @@ StageExecutor = Callable[
 
 WORKFLOW_ID_PATTERN = re.compile(r"^wf_[A-Za-z0-9_-]{8,96}$")
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-
-
 def dual_candidate_template() -> tuple[list[StageSpec], str]:
     """Return the first fixed workflow: two candidates followed by aggregation."""
     return [
@@ -308,6 +344,9 @@ def dual_candidate_template() -> tuple[list[StageSpec], str]:
             "aggregate",
             "aggregate",
             depends_on=("candidate_a", "candidate_b"),
+            minimum_successful_dependencies=1,
+            max_same_provider_retries=1,
+            retry_safe=True,
         ),
     ], "aggregate"
 
@@ -923,6 +962,24 @@ class TaskGraphCoordinator:
             and stage.provider_index + 1 < len(stage.provider_candidates())
         )
 
+    @staticmethod
+    def _can_retry_same_provider(
+        stage: StageRecord,
+        attempt: Optional[AttemptRecord] = None,
+    ) -> bool:
+        return (
+            stage.spec.retry_safe
+            and not stage.winner_attempt_id
+            and stage.same_provider_retry_count
+            < stage.spec.max_same_provider_retries
+            and (
+                attempt is None
+                or attempt.provider_kind in {
+                    "local_full_model", "callback_compatibility",
+                }
+            )
+        )
+
     def _advance_ready_stage_provider_locked(
         self,
         workflow: WorkflowRecord,
@@ -967,10 +1024,17 @@ class TaskGraphCoordinator:
         *,
         attempt_state: str,
         retry: bool,
+        retry_same_provider: bool = False,
         error_code: str,
         error: str,
         now: Optional[float] = None,
     ) -> None:
+        if (
+            retry
+            and retry_same_provider
+            and not self._can_retry_same_provider(stage, attempt)
+        ):
+            raise TaskGraphError("Stage is not eligible for same-Provider retry")
         stage_next_state = "ready" if retry else "failed"
         self._require_transition(
             "stage",
@@ -992,6 +1056,7 @@ class TaskGraphCoordinator:
             stage.error,
             stage.provider_index,
             stage.retry_count,
+            stage.same_provider_retry_count,
             stage.last_retry_error_code,
         )
         previous_attempt = (
@@ -1008,7 +1073,10 @@ class TaskGraphCoordinator:
         attempt.finished_at = changed_at
         attempt.error = error
         if retry:
-            stage.provider_index += 1
+            if retry_same_provider:
+                stage.same_provider_retry_count += 1
+            else:
+                stage.provider_index += 1
             stage.retry_count += 1
             stage.last_retry_error_code = error_code
         try:
@@ -1031,6 +1099,7 @@ class TaskGraphCoordinator:
                     "to_provider": (
                         stage.selected_provider() if retry else ""
                     ),
+                    "same_provider": bool(retry and retry_same_provider),
                     "error_code": error_code,
                     "retry": retry,
                 },
@@ -1042,6 +1111,7 @@ class TaskGraphCoordinator:
                 stage.error,
                 stage.provider_index,
                 stage.retry_count,
+                stage.same_provider_retry_count,
                 stage.last_retry_error_code,
             ) = previous_stage
             (
@@ -1246,6 +1316,10 @@ class TaskGraphCoordinator:
         recovered["failed_stage_count"] = sum(
             stage.get("state") == "failed" for stage in stages
         )
+        recovered["skipped_stage_count"] = sum(
+            stage.get("state") == "skipped" for stage in stages
+        )
+        recovered["partial_result"] = False
         recovered["cancelled_stage_count"] = sum(
             stage.get("state") == "cancelled" for stage in stages
         )
@@ -1447,6 +1521,8 @@ class TaskGraphCoordinator:
         ids = [stage.stage_id for stage in specs]
         if any(not stage_id for stage_id in ids):
             raise TaskGraphError("stage_id must not be empty")
+        if DEPENDENCY_FAILURES_KEY in ids:
+            raise TaskGraphError("stage_id uses a reserved task-graph key")
         if any(
             not isinstance(provider_id, str)
             or not PROVIDER_ID_PATTERN.fullmatch(provider_id)
@@ -1467,6 +1543,45 @@ class TaskGraphCoordinator:
             if not isinstance(spec.pure, bool):
                 raise TaskGraphError(
                     f"stage {spec.stage_id} pure must be a bool"
+                )
+            if not isinstance(spec.retry_safe, bool):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} retry_safe must be a bool"
+                )
+            dependency_count = len(spec.depends_on)
+            minimum_successful = spec.minimum_successful_dependencies
+            if minimum_successful is None:
+                minimum_successful = dependency_count
+            if (
+                isinstance(minimum_successful, bool)
+                or not isinstance(minimum_successful, int)
+                or minimum_successful < 0
+                or minimum_successful > dependency_count
+                or (dependency_count > 0 and minimum_successful == 0)
+            ):
+                valid_range = (
+                    "0" if dependency_count == 0
+                    else f"[1, {dependency_count}]"
+                )
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} minimum successful dependencies "
+                    f"must be {valid_range}"
+                )
+            same_provider_retries = spec.max_same_provider_retries
+            if (
+                isinstance(same_provider_retries, bool)
+                or not isinstance(same_provider_retries, int)
+                or same_provider_retries < 0
+                or same_provider_retries > 3
+            ):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} same-Provider retries must be "
+                    "an integer in [0, 3]"
+                )
+            if same_provider_retries > 0 and not spec.retry_safe:
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} same-Provider retries require "
+                    "retry_safe=true"
                 )
             try:
                 accept_timeout = float(spec.accept_timeout_seconds)
@@ -1633,7 +1748,7 @@ class TaskGraphCoordinator:
                 except Exception as cleanup_exc:
                     cleanup_errors.append(cleanup_exc)
             try:
-                self._raise_ready_batch_error(ready, errors)
+                self._raise_ready_batch_error(workflow, ready, errors)
             except Exception as original:
                 for cleanup_exc in cleanup_errors:
                     original.add_note(
@@ -1653,7 +1768,7 @@ class TaskGraphCoordinator:
                 )
             except Exception as exc:
                 errors[stage.spec.stage_id] = exc
-            self._raise_ready_batch_error(ready, errors)
+            self._raise_ready_batch_error(workflow, ready, errors)
             return
 
         try:
@@ -1711,10 +1826,11 @@ class TaskGraphCoordinator:
                 ):
                     workflow.cancel_event.set()
 
-        self._raise_ready_batch_error(ready, errors)
+        self._raise_ready_batch_error(workflow, ready, errors)
 
-    @staticmethod
     def _raise_ready_batch_error(
+        self,
+        workflow: WorkflowRecord,
         ready: list[StageRecord],
         errors: dict[str, Exception],
     ) -> None:
@@ -1741,8 +1857,56 @@ class TaskGraphCoordinator:
             raise cancelled
         for stage in ready:
             error = errors.get(stage.spec.stage_id)
-            if error is not None:
+            if (
+                error is not None
+                and not self._can_continue_after_stage_failure(
+                    workflow, stage.spec.stage_id,
+                )
+            ):
                 raise error
+
+    @staticmethod
+    def _can_continue_after_stage_failure(
+        workflow: WorkflowRecord,
+        failed_stage_id: str,
+    ) -> bool:
+        """Return true when the failed Stage does not make the final path impossible."""
+        with workflow.lock:
+            failed_stage = workflow.stages.get(failed_stage_id)
+            if failed_stage is None or failed_stage.state != "failed":
+                return False
+
+            final_dependencies: set[str] = set()
+            pending = [workflow.final_stage_id]
+            while pending:
+                stage_id = pending.pop()
+                if stage_id in final_dependencies:
+                    continue
+                final_dependencies.add(stage_id)
+                pending.extend(workflow.stages[stage_id].spec.depends_on)
+            if failed_stage_id not in final_dependencies:
+                return True
+
+            possible: dict[str, bool] = {}
+
+            def can_complete(stage_id: str) -> bool:
+                cached = possible.get(stage_id)
+                if cached is not None:
+                    return cached
+                candidate = workflow.stages[stage_id]
+                if candidate.state == "completed":
+                    result = True
+                elif candidate.state in TERMINAL_STAGE_STATES:
+                    result = False
+                else:
+                    result = sum(
+                        can_complete(dependency_id)
+                        for dependency_id in candidate.spec.depends_on
+                    ) >= candidate.minimum_successful_dependencies()
+                possible[stage_id] = result
+                return result
+
+            return can_complete(workflow.final_stage_id)
 
     def run_template(
         self,
@@ -1912,18 +2076,30 @@ class TaskGraphCoordinator:
                                 workflow.stages[dependency]
                                 for dependency in stage.spec.depends_on
                             ]
-                            if any(
-                                dependency.state in {
-                                    "failed", "skipped", "cancelled",
-                                }
+                            dependency_terminal = all(
+                                dependency.state in TERMINAL_STAGE_STATES
                                 for dependency in dependencies
-                            ):
-                                self._transition_stage_locked(
-                                    workflow, stage, "skipped",
-                                )
-                            elif all(
+                            )
+                            successful_dependencies = sum(
                                 dependency.state == "completed"
                                 for dependency in dependencies
+                            )
+                            required_successes = (
+                                stage.minimum_successful_dependencies()
+                            )
+                            if (
+                                dependency_terminal
+                                and successful_dependencies < required_successes
+                            ):
+                                self._transition_stage_locked(
+                                    workflow,
+                                    stage,
+                                    "skipped",
+                                    error="insufficient_successful_dependencies",
+                                )
+                            elif (
+                                dependency_terminal
+                                and successful_dependencies >= required_successes
                             ):
                                 self._transition_stage_locked(
                                     workflow, stage, "ready",
@@ -1995,8 +2171,35 @@ class TaskGraphCoordinator:
         with workflow.lock:
             dependencies: dict[str, dict] = {}
             for dependency in stage.spec.depends_on:
-                dependency_output = workflow.stages[dependency].output
-                dependencies[dependency] = cast(dict, dependency_output)
+                dependency_stage = workflow.stages[dependency]
+                if (
+                    dependency_stage.state == "completed"
+                    and dependency_stage.output is not None
+                ):
+                    dependencies[dependency] = cast(
+                        dict, dependency_stage.output,
+                    )
+            failed_dependencies = {}
+            for dependency in stage.spec.depends_on:
+                dependency_stage = workflow.stages[dependency]
+                if dependency_stage.state == "completed":
+                    continue
+                candidate_code = str(
+                    dependency_stage.error.partition(":")[0]
+                    or dependency_stage.last_retry_error_code
+                    or "stage_failed"
+                )
+                error_code = (
+                    candidate_code
+                    if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate_code)
+                    else "stage_failed"
+                )
+                failed_dependencies[dependency] = {
+                    "state": dependency_stage.state,
+                    "error_code": error_code,
+                }
+            if failed_dependencies:
+                dependencies[DEPENDENCY_FAILURES_KEY] = failed_dependencies
             selected_provider = stage.selected_provider()
         provider_request = StageRequest(
             workflow_id=workflow.workflow_id,
@@ -2296,11 +2499,18 @@ class TaskGraphCoordinator:
                     return
                 if attempt.state != "running" or stage.state != "running":
                     raise
-                retry = (
+                retry_next_provider = (
                     isinstance(exc, ProviderError)
                     and exc.retryable
                     and self._can_retry_stage(stage)
                 )
+                retry_same_provider = (
+                    not retry_next_provider
+                    and isinstance(exc, ProviderError)
+                    and exc.same_provider_retryable
+                    and self._can_retry_same_provider(stage, attempt)
+                )
+                retry = retry_next_provider or retry_same_provider
                 error_code = (
                     exc.code
                     if isinstance(exc, ProviderError)
@@ -2329,8 +2539,11 @@ class TaskGraphCoordinator:
                     workflow,
                     stage,
                     attempt,
-                    attempt_state="expired" if retry else "failed",
+                    attempt_state=(
+                        "expired" if retry_next_provider else "failed"
+                    ),
                     retry=retry,
+                    retry_same_provider=retry_same_provider,
                     error_code=error_code,
                     error=error,
                 )

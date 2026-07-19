@@ -47,6 +47,7 @@ from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler as ClusterScheduler
 from task_graph import (
+    DEPENDENCY_FAILURES_KEY,
     StageSpec,
     TaskGraphCoordinator,
     TaskGraphError,
@@ -61,6 +62,7 @@ from task_provider import (
     LocalFullModelProvider,
     ModelIdentity,
     ProviderError,
+    ProviderExecutionError,
     ProviderExecutor,
     StageRequest as ProviderStageRequest,
 )
@@ -2159,7 +2161,7 @@ async def load_model(req: LoadModelRequest):
 
         if result["success"]:
             model_loaded = True
-            current_quant = quant
+            current_quant = getattr(model_manager, "quant_type", None) or quant
             generation_config["use_compile"] = req.use_compile
 
             # 初始化 KV 缓存
@@ -2394,7 +2396,12 @@ def _execute_task_worker_stage(
         raise TaskGraphError("任务 Stage 执行参数无效") from exc
     show_thinking = bool(options.get("show_thinking", False))
 
-    def run_model(messages: list[dict], max_tokens: int) -> dict:
+    def run_model(
+        messages: list[dict],
+        max_tokens: int,
+        *,
+        retry_empty_on_same_provider: bool = False,
+    ) -> dict:
         if provider_cancel_event.is_set():
             return {
                 "content": "",
@@ -2418,6 +2425,13 @@ def _execute_task_worker_stage(
         else:
             content = _strip_native_thinking_tags(raw_content)
         if not content and not provider_cancel_event.is_set():
+            if retry_empty_on_same_provider:
+                raise ProviderExecutionError(
+                    "complete model returned an empty aggregate result",
+                    code="empty_provider_output",
+                    provider_id=stage_request.provider_id,
+                    same_provider_retryable=True,
+                )
             raise TaskGraphError("完整模型返回空 Stage 结果")
         return {
             "content": content,
@@ -2456,21 +2470,45 @@ def _execute_task_worker_stage(
         candidate_payload = {
             stage_id: value.get("content", "")
             for stage_id, value in stage_request.dependencies.items()
-            if isinstance(value, dict)
+            if stage_id != DEPENDENCY_FAILURES_KEY
+            and isinstance(value, dict)
+            and str(value.get("content", "") or "").strip()
         }
+        if not candidate_payload:
+            raise TaskGraphError("聚合 Stage 没有可用候选")
+        failure_payload = stage_request.dependencies.get(
+            DEPENDENCY_FAILURES_KEY, {},
+        )
         aggregation_prompt = (
-            "请根据原始问题和两个独立候选，输出一个最终答案。"
+            "请根据原始问题和可用的独立候选，输出一个最终答案。"
             "纠正冲突和明显错误；没有证据时明确不确定性。"
             "只输出最终答案，不描述内部任务链。\n\n"
             f"原始问题：{message}\n\n候选：\n"
             + json.dumps(candidate_payload, ensure_ascii=False)
+            + (
+                "\n\n未完成候选摘要：\n"
+                + json.dumps(failure_payload, ensure_ascii=False)
+                if isinstance(failure_payload, dict) and failure_payload
+                else ""
+            )
         )
-        return run_model(
-            ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
-             if show_thinking else [])
-            + [{"role": "user", "content": aggregation_prompt}],
-            final_budget,
-        )
+        try:
+            return run_model(
+                ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
+                 if show_thinking else [])
+                + [{"role": "user", "content": aggregation_prompt}],
+                final_budget,
+                retry_empty_on_same_provider=True,
+            )
+        except ProviderError:
+            raise
+        except (TimeoutError, ConnectionError) as exc:
+            raise ProviderExecutionError(
+                "transient aggregate model execution failed",
+                code="provider_execution_failed",
+                provider_id=stage_request.provider_id,
+                same_provider_retryable=True,
+            ) from exc
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
 
 
@@ -2587,6 +2625,7 @@ def _execute_task_graph_chat_with_slot(
                 provider=remote_provider_id,
                 fallback_providers=(),
                 pure=False,
+                max_same_provider_retries=0,
             )
             if stage.stage_id == remote_stage_id else stage
             for stage in template_stages
@@ -2796,13 +2835,23 @@ def _execute_task_graph_chat_with_slot(
         for stage in retried_stages
         if stage.get("last_retry_error_code")
     ]
-    fallback_used = bool(retried_stages) or bool(
+    same_provider_retry_count = sum(
+        int(stage.get("same_provider_retry_count", 0) or 0)
+        for stage in retried_stages
+    )
+    total_retry_count = sum(
+        int(stage.get("retry_count", 0) or 0)
+        for stage in retried_stages
+    )
+    reassignment_count = max(
+        0, total_retry_count - same_provider_retry_count,
+    )
+    fallback_used = reassignment_count > 0 or bool(
         auto_remote and not auto_provider_ids
     )
+    retry_reason = retry_error_codes[0] if retry_error_codes else ""
     fallback_reason = (
-        retry_error_codes[0]
-        if retry_error_codes
-        else auto_fallback_reason
+        retry_reason if reassignment_count > 0 else auto_fallback_reason
     )
     metrics = _augment_chat_metrics(
         {
@@ -2816,6 +2865,11 @@ def _execute_task_graph_chat_with_slot(
             "workflow_id": workflow["workflow_id"],
             "workflow_template": workflow["template"],
             "workflow_state": workflow["state"],
+            "partial_result": bool(workflow.get("partial_result", False)),
+            "stage_retry_count": total_retry_count,
+            "same_provider_retry_count": same_provider_retry_count,
+            "reassignment_count": reassignment_count,
+            "retry_reason": retry_reason,
             "stage_count": workflow["stage_count"],
             "stage_attempt_count": workflow["attempt_count"],
             "nodes_planned": (
@@ -3492,7 +3546,7 @@ def _auto_load_default_model():
         "rounds": 0,
     }
     model_loaded = True
-    current_quant = quant
+    current_quant = getattr(model_manager, "quant_type", None) or quant
     scheduler.refresh_task_worker_capabilities()
     elapsed = time.time() - t0
     logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
@@ -3853,6 +3907,14 @@ def _workflow_observability(snapshot: dict) -> dict:
             _workflow_safe_count(stage.get("retry_count", 0))
             for stage in stages if isinstance(stage, dict)
         )
+    same_provider_retry_count = _workflow_safe_count(
+        snapshot.get("same_provider_retry_count", 0)
+    )
+    if not same_provider_retry_count:
+        same_provider_retry_count = sum(
+            _workflow_safe_count(stage.get("same_provider_retry_count", 0))
+            for stage in stages if isinstance(stage, dict)
+        )
     rejection_count = _workflow_safe_count(
         snapshot.get("result_rejection_count", 0)
     )
@@ -3892,9 +3954,14 @@ def _workflow_observability(snapshot: dict) -> dict:
         "state": state,
         "result_ready": state == "result_ready",
         "terminal": state in {"completed", "failed", "cancelled"},
+        "partial_result": bool(snapshot.get("partial_result", False)),
         "recovered_after_restart": recovered_after_restart,
         "recovery_reason": recovery_reason,
         "retry_count": retry_count,
+        "same_provider_retry_count": same_provider_retry_count,
+        "reassignment_count": max(
+            0, retry_count - same_provider_retry_count,
+        ),
         "retrying": retry_count > 0 and state in {"running", "created"},
         "result_rejection_count": rejection_count,
         "last_result_rejection_reason": str(
@@ -4424,7 +4491,7 @@ async def switch_model(req: SwitchModelRequest):
 
         if result["success"]:
             model_loaded = True
-            current_quant = quant
+            current_quant = getattr(model_manager, "quant_type", None) or quant
             _init_kv_cache()
             scheduler.refresh_task_worker_capabilities()
             return result

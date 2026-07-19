@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 from task_provider import (
+    DEPENDENCY_FAILURES_KEY,
     ModelIdentity,
     ProviderBusy,
     ProviderCapabilities,
@@ -589,6 +590,13 @@ class RemoteFullWorkerProvider:
                 "stage request targets a different remote provider",
                 code="provider_request_mismatch",
                 provider_id=self.provider_id,
+            )
+        if DEPENDENCY_FAILURES_KEY in request.dependencies:
+            raise ProviderUnavailable(
+                "protocol v2 remote workers do not support partial dependency input",
+                code="partial_dependencies_not_supported",
+                provider_id=self.provider_id,
+                retryable=True,
             )
         if request.stage_type not in status.supported_stage_types:
             raise ProviderUnavailable(

@@ -15,6 +15,7 @@ PROVIDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 RESERVATION_ID_PATTERN = re.compile(r"^res_[A-Za-z0-9_-]{8,96}$")
 MODEL_IDENTITY_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MODEL_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+DEPENDENCY_FAILURES_KEY = "__qlh_failed_dependencies__"
 
 
 class _CombinedCancelEvent(threading.Event):
@@ -49,10 +50,12 @@ class ProviderError(RuntimeError):
         code: str,
         provider_id: str = "",
         retryable: bool = False,
+        same_provider_retryable: bool = False,
     ):
         self.code = code
         self.provider_id = provider_id
         self.retryable = retryable
+        self.same_provider_retryable = same_provider_retryable
         super().__init__(message)
 
 
