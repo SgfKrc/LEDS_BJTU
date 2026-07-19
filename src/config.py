@@ -18,6 +18,7 @@
 import os
 import sys
 import socket
+import hashlib
 
 # 加载 .env 文件中的环境变量（必须在读取任何环境变量之前）
 try:
@@ -59,6 +60,25 @@ def _get_app_root() -> str:
 _APP_ROOT = _get_app_root()
 
 
+def _get_state_dir() -> str:
+    """Return a user-writable state directory, never the install directory."""
+    configured = os.environ.get("QLH_STATE_DIR", "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        if not base:
+            base = os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, "QLH-Edge-Inference", "state")
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "qlh-edge-inference")
+
+
+STATE_DIR = _get_state_dir()
+
+
 def _env_int(name: str, default: int, min_val: int = 1, max_val: int = 65535) -> int:
     raw = os.environ.get(name)
     if raw is None or str(raw).strip() == "":
@@ -78,6 +98,13 @@ def _env_first(*names: str, default: str = "") -> str:
         if value is not None and value.strip():
             return value.strip()
     return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _normalize_node_role(value: str) -> str:
@@ -141,6 +168,22 @@ MAX_SEQ_LEN = 4096               # 最大序列长度（Qwen-1.8B 原生 8K，la
 TOTAL_MODEL_LAYERS = 24                  # Qwen-1.8B-Chat Transformer 层总数
 LAYER_STRATEGY = "dynamic"              # 分层策略: "dynamic" 动态 | "manual" 手动覆盖
 DISTRIBUTED_INFERENCE_ENABLED = True    # 分布式推理开关（主节点默认开启，从节点默认关闭）
+TASK_GRAPH_ENABLED = _env_bool("QLH_TASK_GRAPH_ENABLED", False)
+TASK_WORKER_EXPERIMENTAL_ENABLED = _env_bool(
+    "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED", False,
+)
+TASK_GRAPH_MAX_RECORDS = _env_int(
+    "QLH_TASK_GRAPH_MAX_RECORDS", 100, min_val=10, max_val=1000,
+)
+TASK_GRAPH_MAX_PARALLEL_STAGES = _env_int(
+    "QLH_TASK_GRAPH_MAX_PARALLEL_STAGES", 4, min_val=1, max_val=32,
+)
+TASK_GRAPH_RETENTION_DAYS = _env_int(
+    "QLH_TASK_GRAPH_RETENTION_DAYS", 30, min_val=0, max_val=3650,
+)
+TASK_GRAPH_RETENTION_MAX_RECORDS = _env_int(
+    "QLH_TASK_GRAPH_RETENTION_MAX_RECORDS", 1000, min_val=0, max_val=100000,
+)
 
 # 回退分层配置（当没有从节点注册时使用）
 # 注意：分层现在由 compute_layer_assignment() 动态计算，此配置仅供文档参考。
@@ -197,6 +240,29 @@ PIPELINE_PREEMPT_MAX_OVERHEAD_MS = 500    # checkpoint+restore 超过此值 → 
 NODE_ROLE = _normalize_node_role(os.environ.get("QLH_NODE_ROLE", "master"))
 _default_node_id = "master" if NODE_ROLE == "master" else f"client_{socket.gethostname()}"
 NODE_ID = _env_first("QLH_NODE_ID", default=_default_node_id)
+_default_app_variant = (
+    "cuda" if "cuda" in os.path.basename(_APP_ROOT).lower() else "cpu"
+)
+APP_VARIANT = _env_first("QLH_APP_VARIANT", default=_default_app_variant)
+TASK_GRAPH_INSTANCE_ID = _env_first(
+    "QLH_TASK_GRAPH_INSTANCE_ID",
+    default=f"{APP_VARIANT}-{NODE_ID}",
+)
+_task_graph_instance_segment = "".join(
+    character
+    if character.isascii()
+    and (character.isalnum() or character in {"-", "_", "."})
+    else "_"
+    for character in TASK_GRAPH_INSTANCE_ID
+).strip("._")[:48] or "default"
+_task_graph_instance_digest = hashlib.sha256(
+    TASK_GRAPH_INSTANCE_ID.encode("utf-8")
+).hexdigest()[:12]
+TASK_GRAPH_JOURNAL_PATH = os.path.join(
+    STATE_DIR,
+    "task_graph",
+    f"instance-{_task_graph_instance_segment}-{_task_graph_instance_digest}.sqlite3",
+)
 MAX_NODES = 3                    # 最大节点数上限（主节点可动态调整，仅限已注册节点，不含空位）
                                   # 从节点通过 TCP 注册后自动加入列表，不再预创建空槽位
 

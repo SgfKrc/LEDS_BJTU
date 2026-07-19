@@ -167,6 +167,9 @@ class MessageType(str, Enum):
     INFER_CANCEL = "infer_cancel"    # 从节点 → 主节点：取消转发推理请求
     LAYER_CONFIG = "layer_config"    # 主节点 → 从节点：推送分层配置
     LAYER_CONFIG_ACK = "layer_config_ack"  # 从节点 → 主节点：模型层加载结果
+    LAYER_WORKER_OPT_OUT = "layer_worker_opt_out"  # 从节点 → 主节点：退出分层计算
+    LAYER_WORKER_OPT_IN = "layer_worker_opt_in"  # 从节点 → 主节点：重新加入分层计算
+    TASK_WORKER = "task_worker"      # PC Full Worker v2 控制面/后续 Stage envelope
     # 角色转让
     ROLE_TRANSFER = "role_transfer"          # 主节点 → 从节点：转让主节点身份
     ROLE_TRANSFER_ACK = "role_transfer_ack"  # 从节点 → 主节点：确认接收转让
@@ -1043,6 +1046,11 @@ class TCPServer:
                     if tensor_header is None:
                         break
                     tensor_len = unpack_header(tensor_header)
+                    if tensor_len <= 0 or tensor_len > MAX_PACKET_SIZE:
+                        logger.warning(
+                            f"非法张量包长度: {tensor_len}，断开 {addr}"
+                        )
+                        break
                     tensor_data = recv_exact(conn, tensor_len)
                     if tensor_data is None:
                         break
@@ -1751,6 +1759,8 @@ class TCPClient:
         if header is None:
             return None
         payload_len = unpack_header(header)
+        if payload_len <= 0 or payload_len > MAX_PACKET_SIZE:
+            raise ConnectionError(f"invalid packet length: {payload_len}")
 
         # 接收数据体
         payload = recv_exact(active_sock, payload_len)
@@ -1765,6 +1775,10 @@ class TCPClient:
             if tensor_header is None:
                 return None
             tensor_len = unpack_header(tensor_header)
+            if tensor_len <= 0 or tensor_len > MAX_PACKET_SIZE:
+                raise ConnectionError(
+                    f"invalid tensor packet length: {tensor_len}"
+                )
             tensor_data = recv_exact(active_sock, tensor_len)
             if tensor_data is None:
                 return None

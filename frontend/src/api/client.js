@@ -55,6 +55,15 @@ function makeApiError(message, { status = 0, requestId = null, path = '' } = {})
   return error;
 }
 
+function normalizeErrorDetail(detail, fallback) {
+  if (typeof detail === 'string' && detail) return detail;
+  if (detail && typeof detail === 'object') {
+    if (typeof detail.message === 'string' && detail.message) return detail.message;
+    try { return JSON.stringify(detail); } catch (_) {}
+  }
+  return fallback;
+}
+
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
   const { signal, ...rest } = options;
@@ -74,7 +83,7 @@ async function request(path, options = {}) {
   }
   const requestId = res.headers.get('X-Request-ID') || data.request_id || null;
   if (!res.ok) {
-    throw makeApiError(data.detail || `HTTP ${res.status}`, {
+    throw makeApiError(normalizeErrorDetail(data.detail, `HTTP ${res.status}`), {
       status: res.status,
       requestId,
       path,
@@ -148,6 +157,11 @@ export async function sendMessage(message, opts = {}) {
       temperature: opts.temperature ?? 0.7,
       top_p: opts.topP ?? 0.9,
       show_thinking: opts.showThinking || false,
+      execution_mode: opts.executionMode || 'auto',
+      task_graph_template: opts.taskGraphTemplate || 'dual_candidate',
+      task_graph_auto_remote: opts.taskGraphAutoRemote === true,
+      workflow_id: opts.workflowId || null,
+      generation_id: opts.generationId || null,
     }),
   });
 }
@@ -176,13 +190,21 @@ export async function sendMessageStream(message, opts = {}) {
       top_p: opts.topP ?? 0.9,
       show_thinking: opts.showThinking || false,
       streaming_mode: streamingMode,
+      execution_mode: opts.executionMode || 'auto',
+      task_graph_template: opts.taskGraphTemplate || 'dual_candidate',
+      task_graph_auto_remote: opts.taskGraphAutoRemote === true,
+      workflow_id: opts.workflowId || null,
+      generation_id: opts.generationId || null,
     }),
   });
 
   const requestId = res.headers.get('X-Request-ID') || null;
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
-    try { const d = await res.json(); detail = d.detail || detail; } catch (_) {}
+    try {
+      const d = await res.json();
+      detail = normalizeErrorDetail(d.detail, detail);
+    } catch (_) {}
     throw makeApiError(detail, { status: res.status, requestId, path: '/chat/stream' });
   }
 
@@ -242,8 +264,32 @@ export async function sendMessageStream(message, opts = {}) {
   };
 }
 
-export async function clearChat() {
-  return request('/chat/clear', { method: 'POST' });
+export async function clearChat(sessionId = 'default') {
+  return request(`/chat/clear?session_id=${encodeURIComponent(sessionId || 'default')}`, {
+    method: 'POST',
+  });
+}
+
+export async function fetchTaskGraphStatus(sessionId = '') {
+  const query = new URLSearchParams({ limit: '1' });
+  if (sessionId) query.set('session_id', sessionId);
+  return request(`/workflows?${query.toString()}`);
+}
+
+export async function fetchWorkflow(workflowId, options = {}) {
+  return request(`/workflows/${encodeURIComponent(workflowId)}`, options);
+}
+
+export async function cancelWorkflow(workflowId) {
+  return request(`/workflows/${encodeURIComponent(workflowId)}/cancel`, {
+    method: 'POST',
+  });
+}
+
+export async function cancelChatGeneration(generationId) {
+  return request(`/chat/generations/${encodeURIComponent(generationId)}/cancel`, {
+    method: 'POST',
+  });
 }
 
 export async function healthCheck() {
