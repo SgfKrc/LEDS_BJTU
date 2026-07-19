@@ -12,6 +12,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import copy
+import types
 import pytest
 import torch
 import torch.nn as nn
@@ -70,6 +71,65 @@ def _make_last_node_model():
     del model.model.embed_tokens
     model.model.embed_tokens = None
     return model
+
+
+class _TinyQwenRotary(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._ntk_alpha_cached_list = [1.0]
+
+    def forward(self, seq_len, ntk_alpha=1.0):
+        return [torch.zeros(1, seq_len, 1, 1)]
+
+
+class _TinyQwenBlock(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(scale))
+
+    def forward(self, hidden_states, layer_past=None, use_cache=False, **_kwargs):
+        output = hidden_states * (1.0 + self.scale)
+        present = None
+        if use_cache:
+            current = hidden_states.unsqueeze(2)
+            if layer_past is not None:
+                key = torch.cat((layer_past[0], current), dim=1)
+                value = torch.cat((layer_past[1], current), dim=1)
+            else:
+                key = current
+                value = current
+            present = (key, value)
+        return output, present
+
+
+class _TinyOriginalQwen(nn.Module):
+    def __init__(self, hidden_size=8, vocab_size=16, layer_count=4):
+        super().__init__()
+        transformer = nn.Module()
+        transformer.wte = nn.Embedding(vocab_size, hidden_size)
+        transformer.drop = nn.Identity()
+        transformer.h = nn.ModuleList([
+            _TinyQwenBlock((index + 1) / 100.0)
+            for index in range(layer_count)
+        ])
+        transformer.ln_f = nn.LayerNorm(hidden_size)
+        transformer.rotary_emb = _TinyQwenRotary()
+        transformer.use_dynamic_ntk = False
+        transformer.use_cache_quantization = False
+        transformer.get_ntk_alpha = lambda _seq_len: 1.0
+        self.transformer = transformer
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.config = types.SimpleNamespace(model_type="qwen")
+        self.eval()
+
+
+def _make_original_qwen_manager(model, layer_range):
+    manager = ModelManager()
+    manager.model = model
+    manager._engine_type = "pytorch"
+    manager._layer_architecture = "qwen"
+    manager.layer_range = layer_range
+    return manager
 
 
 # ================================================================
@@ -644,6 +704,58 @@ class TestLoadLayerRangeIntegration:
 
         assert calls[0]["model_path"] == "G:/models/deepseek"
 
+    def test_load_layer_range_uses_active_deepseek_layer_count(self, monkeypatch):
+        """DeepSeek 主节点未显式传 path/total 时仍应按 28 层校验。"""
+        import model_module
+
+        config = type("Config", (), {
+            "model_type": "qwen2",
+            "num_hidden_layers": 28,
+        })()
+        monkeypatch.setattr(
+            model_module.AutoConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: config,
+        )
+        mgr = ModelManager()
+        mgr._full_model_path = "G:/models/deepseek"
+        fake_layers = nn.ModuleList([nn.Linear(1, 1) for _ in range(28)])
+        fake_model = nn.Module()
+        fake_model.model = nn.Module()
+        fake_model.model.layers = fake_layers
+        fake_model.model.embed_tokens = nn.Embedding(2, 1)
+        fake_model.lm_head = nn.Linear(1, 2)
+
+        def install_fake_model(*args, **kwargs):
+            mgr.model = fake_model
+
+        monkeypatch.setattr(mgr, "_load_qwen2_layer_range", install_fake_model)
+
+        mgr.load_layer_range(0, 28, has_embedding=True, has_lm_head=True)
+
+        assert mgr.layer_range == (0, 28)
+        assert len(mgr.model.model.layers) == 28
+        assert mgr._total_model_layers == 28
+
+    def test_load_layer_range_rejects_declared_total_mismatch(self, monkeypatch):
+        """worker assignment 不得用错误总层数掩盖模型配置。"""
+        import model_module
+
+        config = type("Config", (), {
+            "model_type": "qwen2",
+            "num_hidden_layers": 28,
+        })()
+        monkeypatch.setattr(
+            model_module.AutoConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: config,
+        )
+        mgr = ModelManager()
+        mgr._full_model_path = "G:/models/deepseek"
+
+        with pytest.raises(ValueError, match="assignment=24, model=28"):
+            mgr.load_layer_range(0, 24, total_layers=24)
+
     def test_load_then_forward_last_node(self):
         """通过 load_layer_range 加载末节点 → forward_layers 应产出 logits"""
         mgr = ModelManager()
@@ -758,7 +870,91 @@ class TestLoadLayerRangeIntegration:
         hidden = first.forward_layers(input_ids=input_ids)["hidden_states"]
         pipeline_logits = last.forward_layers(hidden_states=hidden)["logits"]
 
-        assert torch.allclose(full_logits, pipeline_logits, atol=1e-3, rtol=1e-3)
+        assert torch.allclose(
+            full_logits.detach().cpu(),
+            pipeline_logits.detach().cpu(),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+class TestOriginalQwenLayerPipeline:
+    """Qwen-1.8B ``transformer.h`` path must coexist with Qwen2/DeepSeek."""
+
+    def _split_managers(self):
+        torch.manual_seed(77)
+        full = _TinyOriginalQwen()
+        first_model = copy.deepcopy(full)
+        last_model = copy.deepcopy(full)
+        first_model.transformer.h = nn.ModuleList(
+            list(first_model.transformer.h)[:2]
+        )
+        first_model.lm_head = None
+        last_model.transformer.h = nn.ModuleList(
+            list(last_model.transformer.h)[2:]
+        )
+        last_model.transformer.wte = None
+        return (
+            full,
+            _make_original_qwen_manager(first_model, (0, 2)),
+            _make_original_qwen_manager(last_model, (2, 4)),
+        )
+
+    def test_prefill_split_matches_full_original_qwen(self):
+        full, first, last = self._split_managers()
+        input_ids = torch.tensor([[1, 2, 3]])
+
+        with torch.no_grad():
+            hidden = full.transformer.wte(input_ids)
+            for block in full.transformer.h:
+                hidden = block(hidden)[0]
+            expected = full.lm_head(full.transformer.ln_f(hidden))
+
+        first_result = first.forward_layers(input_ids=input_ids, use_cache=True)
+        last_result = last.forward_layers(
+            hidden_states=first_result["hidden_states"], use_cache=True,
+        )
+
+        assert torch.allclose(last_result["logits"], expected, atol=1e-6)
+        assert len(first_result["past_key_values"]) == 2
+        assert len(last_result["past_key_values"]) == 2
+
+    def test_decode_original_qwen_cache_grows_and_matches_full_sequence(self):
+        full, first, last = self._split_managers()
+        prompt = torch.tensor([[1, 2, 3]])
+        first_prefill = first.forward_layers(input_ids=prompt, use_cache=True)
+        last_prefill = last.forward_layers(
+            hidden_states=first_prefill["hidden_states"], use_cache=True,
+        )
+
+        first_decode = first.forward_layers(
+            input_ids=torch.tensor([[4]]),
+            past_key_values=first_prefill["past_key_values"],
+            use_cache=True,
+        )
+        last_decode = last.forward_layers(
+            hidden_states=first_decode["hidden_states"],
+            past_key_values=last_prefill["past_key_values"],
+            use_cache=True,
+        )
+
+        assert first_decode["past_key_values"][0][0].shape[1] == 4
+        assert last_decode["past_key_values"][0][0].shape[1] == 4
+        assert last_decode["logits"].shape == (1, 1, 16)
+
+    def test_architecture_aware_lm_head_supports_qwen_and_qwen2(self):
+        full, _first, last = self._split_managers()
+        states = torch.randn(1, 2, 8)
+        expected_qwen = last.model.lm_head(last.model.transformer.ln_f(states))
+        assert torch.allclose(last.forward_lm_head(states), expected_qwen)
+
+        qwen2 = ModelManager()
+        qwen2.model = _make_tiny_model()
+        qwen2._engine_type = "pytorch"
+        qwen2.layer_range = (0, 4)
+        qwen2_states = torch.randn(1, 2, 128)
+        expected_qwen2 = qwen2.model.lm_head(qwen2.model.model.norm(qwen2_states))
+        assert torch.allclose(qwen2.forward_lm_head(qwen2_states), expected_qwen2)
 
 
 # ================================================================
@@ -839,6 +1035,20 @@ class TestForwardLayersKVCache:
         self.mgr.model = self.model
         self.mgr._engine_type = "pytorch"
         self.mgr.layer_range = (0, 4)
+
+    def test_qwen2_decode_rejects_cache_layer_count_mismatch(self):
+        """错误 KV 层数必须中止，不得静默丢失上下文重新起算。"""
+        bad_cache = ((
+            torch.zeros(1, 2, 2, 32),
+            torch.zeros(1, 2, 2, 32),
+        ),)
+
+        with pytest.raises(RuntimeError, match="Qwen2 KV cache 层数不匹配"):
+            self.mgr.forward_layers(
+                input_ids=torch.tensor([[7]]),
+                past_key_values=bad_cache,
+                use_cache=True,
+            )
 
     def test_prefill_without_kv_cache_returns_no_past_key_values(self):
         """use_cache=False → 不返回 past_key_values"""
@@ -1248,19 +1458,28 @@ class TestTransformers5xCompatibility:
 
     def test_create_causal_mask_import_and_call(self, mgr):
         """create_causal_mask 可从 qwen2 路径导入且用有效参数成功调用。"""
+        import inspect
+
         try:
             from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
         except (ImportError, AttributeError):
             pytest.skip("create_causal_mask 不可用（transformers < 5.x）")
         input_ids = torch.tensor([[5, 8, 2]], dtype=torch.long)
         hidden_states = mgr.model.model.embed_tokens(input_ids)
-        causal_mask = create_causal_mask(
-            config=mgr.model.config,
-            inputs_embeds=hidden_states,
-            attention_mask=None,
-            past_key_values=None,
-            position_ids=torch.tensor([[0, 1, 2]], dtype=torch.long),
-        )
+        parameters = inspect.signature(create_causal_mask).parameters
+        kwargs = {
+            "config": mgr.model.config,
+            "attention_mask": None,
+            "past_key_values": None,
+            "position_ids": torch.tensor([[0, 1, 2]], dtype=torch.long),
+        }
+        if "input_embeds" in parameters:
+            kwargs["input_embeds"] = hidden_states
+        else:
+            kwargs["inputs_embeds"] = hidden_states
+        if "cache_position" in parameters:
+            kwargs["cache_position"] = torch.arange(3)
+        causal_mask = create_causal_mask(**kwargs)
         # flash/sdpa 返回 None，eager 返回 4D tensor
         assert causal_mask is None or isinstance(causal_mask, torch.Tensor)
 

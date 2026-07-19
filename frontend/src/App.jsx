@@ -6,6 +6,7 @@ import ChatPanel from './components/ChatPanel';
 import AdminPanel from './components/AdminPanel';
 import SettingsModal from './components/SettingsModal';
 import SessionList from './components/SessionList';
+import { normalizeExecutionSettings } from './settings';
 
 // ---- 设备档位预设 ----
 export const TIER_PRESETS = {
@@ -31,6 +32,8 @@ const DEFAULT_SETTINGS = {
   temperature: 0.7,
   topP: 0.9,
   distributedInference: false, // 分布式推理：启动时从服务端同步，避免默认假设导致状态不一致
+  executionMode: 'auto',       // auto=标准聊天路由 | task_graph=单机任务链实验
+  taskGraphRemoteMode: 'local', // local=任务链仅本地 | auto=显式允许自动 Full Worker
   cloudSync: true,             // 云同步设置偏好：默认开启，确保跨设备设置一致
   showThinking: false,         // 深度思考展示：默认关闭
   streamingMode: 'full',       // 流式输出模式: full=完整功能（历史/追问/持久化，默认）| fast=真流式逐token
@@ -68,7 +71,7 @@ function getInitialSettings() {
     if (stored) {
       const parsed = JSON.parse(stored);
       // 合并默认值以兼容新增字段
-      return { ...DEFAULT_SETTINGS, ...parsed };
+      return normalizeExecutionSettings({ ...DEFAULT_SETTINGS, ...parsed });
     }
   } catch (_) {}
   return { ...DEFAULT_SETTINGS };
@@ -90,6 +93,11 @@ export default function App() {
   const [themeMode, setThemeMode] = useState(getInitialThemeMode);
   const [systemTheme, setSystemTheme] = useState(getSystemTheme);
   const [settings, setSettings] = useState(getInitialSettings);
+  const [taskGraphCapability, setTaskGraphCapability] = useState({
+    enabled: false,
+    available: false,
+    role: 'unknown',
+  });
   const [deviceTier, setDeviceTier] = useState(null);  // 由 DevicePanel 检测后回传
   const [hasDedicatedGpu, setHasDedicatedGpu] = useState(false);  // 是否有独显（用于深度思考门控）
   const [activeView, setActiveView] = useState('chat'); // 'chat' | 'admin'
@@ -134,7 +142,7 @@ export default function App() {
 
   // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复 + L5 错误上报
   useEffect(() => {
-    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchUserSettings, fetchStatus, installErrorReporter }) => {
+    import('./api/client').then(({ fetchMyRole, fetchDistributedInferenceConfig, fetchTaskGraphStatus, fetchUserSettings, fetchStatus, installErrorReporter }) => {
       // L5: 安装全局前端错误上报（仅在 PROD 生效）
       installErrorReporter();
       // 获取角色
@@ -152,6 +160,13 @@ export default function App() {
           }
         })
         .catch(() => {});  // 服务端不可用时保持本地设置
+      fetchTaskGraphStatus(activeSessionId || '')
+        .then((capability) => {
+          setTaskGraphCapability(capability);
+        })
+        .catch(() => {
+          setTaskGraphCapability({ enabled: false, available: false, role: 'unknown' });
+        });
       // 从云端恢复用户偏好设置（仅在用户已开启云同步时）
       fetchStatus()
         .then((status) => {
@@ -169,7 +184,7 @@ export default function App() {
             if (res && res.settings && Object.keys(res.settings).length > 0) {
               setSettings((prev) => {
                 // localStorage 优先（最新用户意图），云端补充缺失字段
-                const merged = { ...res.settings, ...prev };
+                const merged = normalizeExecutionSettings({ ...res.settings, ...prev });
                 saveSettings(merged);
                 return merged;
               });
@@ -179,6 +194,23 @@ export default function App() {
       }
     });
   }, []);
+
+  // 节点角色可在后台运行时切换，任务链 capability 必须随角色刷新。
+  useEffect(() => {
+    if (!myRole) return;
+    import('./api/client').then(({ fetchTaskGraphStatus }) => {
+      fetchTaskGraphStatus(activeSessionId || '')
+        .then(setTaskGraphCapability)
+        .catch(() => {
+          setTaskGraphCapability({ enabled: false, available: false, role: 'unknown' });
+        });
+    });
+  }, [
+    myRole?.node_role,
+    myRole?.is_master,
+    myRole?.is_client,
+    activeSessionId,
+  ]);
 
   // 后台管理 Tab 是否可见
   const showAdminTab = !myRole                     // 加载中：显示（兜底）
@@ -204,7 +236,7 @@ export default function App() {
   // 更新设置（自动持久化到 localStorage，云同步需手动开启）
   const updateSettings = useCallback((partial) => {
     setSettings((prev) => {
-      const next = { ...prev, ...partial };
+      const next = normalizeExecutionSettings({ ...prev, ...partial });
       saveSettings(next);
       // 仅当用户手动开启「云同步设置」时才推送到云数据库
       if (next.cloudSync) {
@@ -553,6 +585,7 @@ export default function App() {
             metricsTrigger={handleInferMetrics}
             onOpenSettings={() => setSettingsOpen(true)}
             settings={settings}
+            taskGraphCapability={taskGraphCapability}
             sessionId={activeSessionId}
             onCreateSession={handleCreateSession}
             onRenameSession={handleRenameSession}
@@ -578,6 +611,7 @@ export default function App() {
         onToggleTheme={toggleTheme}
         onThemeModeChange={setThemePreference}
         settings={settings}
+        taskGraphCapability={taskGraphCapability}
         onSettingsChange={updateSettings}
         deviceTier={deviceTier}
         hasDedicatedGpu={hasDedicatedGpu}

@@ -17,6 +17,10 @@ import model_config as mc
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _WEIGHT_SUFFIXES = (".safetensors", ".bin")
+_ARTIFACT_SUFFIXES = (
+    ".safetensors", ".bin", ".json", ".py", ".tiktoken",
+    ".model", ".txt", ".jinja", ".spm", ".vocab",
+)
 _HASH_META_NAME = "model.sha256.meta.json"
 _FILE_HASH_CACHE: dict[tuple[str, int, int], str] = {}
 
@@ -39,18 +43,24 @@ def compute_file_sha256(path: str | Path) -> str:
 
 
 def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
-    """Hash all PyTorch weight shards in stable relative-path order."""
+    """Hash every executable PyTorch model artifact in stable path order."""
     root = Path(model_path)
     if not root.is_dir():
         return ""
 
     cache_path = root / "model.sha256"
     metadata_path = root / _HASH_META_NAME
-    weight_files = sorted(
+    artifact_files = sorted(
         path for path in root.rglob("*")
-        if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES)
+        if (
+            path.is_file()
+            and path.name not in {"model.sha256", _HASH_META_NAME}
+            and not path.name.endswith(".part")
+            and path.name.lower().endswith(_ARTIFACT_SUFFIXES)
+            and not any(part.startswith(".") for part in path.relative_to(root).parts)
+        )
     )
-    if not weight_files:
+    if not artifact_files:
         return ""
 
     fingerprint = [
@@ -59,7 +69,7 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
             "size": path.stat().st_size,
             "mtime_ns": path.stat().st_mtime_ns,
         }
-        for path in weight_files
+        for path in artifact_files
     ]
     if use_cache and cache_path.is_file() and metadata_path.is_file():
         try:
@@ -71,7 +81,7 @@ def compute_model_sha256(model_path: str, *, use_cache: bool = True) -> str:
             pass
 
     digest = hashlib.sha256()
-    for path in weight_files:
+    for path in artifact_files:
         relative = path.relative_to(root).as_posix()
         file_sha = compute_file_sha256(path)
         digest.update(
@@ -204,24 +214,28 @@ def ensure_model_available(
     # The worker directory is an exact mirror of the active model. Old shards
     # left by a previous revision participate in the aggregate digest and can
     # otherwise make synchronization fail forever.
-    manifest_weights = {
+    manifest_artifacts = {
         str(entry.get("path", "")).replace("\\", "/").lstrip("/")
         for entry in files
-        if str(entry.get("path", "")).lower().endswith(_WEIGHT_SUFFIXES)
+        if str(entry.get("path", "")).lower().endswith(_ARTIFACT_SUFFIXES)
     }
-    for local_weight in destination_root.rglob("*"):
-        if not local_weight.is_file() or not local_weight.name.lower().endswith(_WEIGHT_SUFFIXES):
+    for local_artifact in destination_root.rglob("*"):
+        relative_path = local_artifact.relative_to(destination_root)
+        if (not local_artifact.is_file()
+                or local_artifact.name in {"model.sha256", _HASH_META_NAME}
+                or not local_artifact.name.lower().endswith(_ARTIFACT_SUFFIXES)
+                or any(part.startswith(".") for part in relative_path.parts)):
             continue
-        relative = local_weight.relative_to(destination_root).as_posix()
-        if relative not in manifest_weights:
-            local_weight.unlink()
+        relative = relative_path.as_posix()
+        if relative not in manifest_artifacts:
+            local_artifact.unlink()
 
     expected = expected_sha256 or manifest_sha256
     actual_sha256 = compute_model_sha256(str(destination_root), use_cache=False)
     if expected and actual_sha256 != expected:
-        # Same-size partial/corrupt weight files are uncommon but must not be trusted.
+        # A file may have changed after the first validation pass; force an exact mirror.
         for entry in files:
-            if str(entry.get("path", "")).lower().endswith(_WEIGHT_SUFFIXES):
+            if str(entry.get("path", "")).lower().endswith(_ARTIFACT_SUFFIXES):
                 _sync_entry(entry, force=True)
         actual_sha256 = compute_model_sha256(str(destination_root), use_cache=False)
     if expected and actual_sha256 != expected:

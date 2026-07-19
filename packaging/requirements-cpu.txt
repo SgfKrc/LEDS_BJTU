@@ -39,6 +39,7 @@ uvicorn[standard]>=0.29.0
 python-multipart>=0.0.12
 httpx>=0.28.1,<0.29.0
 httpx2>=2.5.0,<3.0.0
+psycopg2-binary>=2.9.0,<3.0.0  # 安装包集群发现/配置同步；与 spec hiddenimports 对齐
 
 # --- 工具 ---
 tqdm>=4.65.0

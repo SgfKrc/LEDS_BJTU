@@ -153,6 +153,13 @@ a = Analysis(
         # 本地存储（DB 不可用时自动降级）
         # ============================================================
         'local_store',
+        'task_graph',
+        'task_journal',
+        'task_provider',
+        'task_worker_protocol',
+        'task_worker_adapter',
+        'sqlite3',
+        '_sqlite3',
 
         # ============================================================
         # 智能编排

@@ -316,6 +316,25 @@ def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch):
 # /api/models/load 端点测试
 # ================================================================
 
+
+def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "release_pipeline_worker_for_local_model",
+        lambda: calls.append("released") or True,
+    )
+    monkeypatch.setattr(api_server, "_refresh_pipeline_layer_config", lambda: None)
+
+    result = api_server._run_exclusive_model_change(
+        lambda: {"success": True},
+        release_worker_reservation=True,
+    )
+
+    assert result == {"success": True}
+    assert calls == ["released"]
+
+
 def test_load_model_rejects_invalid_engine(monkeypatch):
     """无效 engine 参数 → 400"""
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
@@ -565,6 +584,40 @@ def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
 
     assert result["content"] == "reply"
     assert ensure_calls == [True]
+
+
+def test_reserved_worker_forward_failure_does_not_restore_full_model(monkeypatch):
+    ensure_calls = []
+
+    class SegmentManager:
+        is_loaded = True
+        _engine_type = "pytorch"
+
+        def ensure_full_model(self):
+            ensure_calls.append(True)
+
+    req = api_server.ChatRequest(message="hello", max_new_tokens=1)
+    monkeypatch.setattr(api_server, "model_manager", SegmentManager())
+    monkeypatch.setattr(api_server, "RUN_MODE", "distributed")
+    monkeypatch.setattr(
+        api_server.scheduler, "get_distributed_inference_enabled", lambda: True,
+    )
+    monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "client")
+    monkeypatch.setattr(
+        api_server.scheduler, "has_pipeline_worker_reservation", lambda: True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "forward_inference_to_master",
+        lambda **kwargs: {"status": "disconnected", "error": "master offline"},
+    )
+    monkeypatch.setattr(api_server, "active_session_id", None)
+
+    with pytest.raises(api_server.HTTPException) as exc_info:
+        api_server._execute_chat_full(req)
+
+    assert exc_info.value.status_code == 503
+    assert ensure_calls == []
 
 
 # ================================================================

@@ -22,9 +22,11 @@ def test_missing_deepseek_model_is_downloaded_and_verified(tmp_path, monkeypatch
         "model.safetensors": b"deepseek-test-weights",
     }
     weight_sha = hashlib.sha256(source_files["model.safetensors"]).hexdigest()
-    model_sha = hashlib.sha256(
-        f"model.safetensors\0{len(source_files['model.safetensors'])}\0{weight_sha}\n".encode()
-    ).hexdigest()
+    digest = hashlib.sha256()
+    for name, content in sorted(source_files.items()):
+        file_sha = hashlib.sha256(content).hexdigest()
+        digest.update(f"{name}\0{len(content)}\0{file_sha}\n".encode())
+    model_sha = digest.hexdigest()
     manifest = {
         "model_id": model_id,
         "sha256": model_sha,
@@ -116,6 +118,32 @@ def test_model_digest_uses_verified_weight_content(tmp_path):
         f"{weight.name}\0{weight.stat().st_size}\0{content_sha}\n".encode("utf-8")
     ).hexdigest()
     assert value == expected
+
+
+def test_model_digest_changes_with_config_tokenizer_and_remote_code(tmp_path):
+    import model_sync
+
+    root = tmp_path / "qwen"
+    root.mkdir()
+    (root / "model.safetensors").write_bytes(b"weights")
+    (root / "config.json").write_text('{"model_type":"qwen"}', encoding="utf-8")
+    (root / "qwen.tiktoken").write_bytes(b"tokenizer-v1")
+    (root / "modeling_qwen.py").write_text("VERSION = 1\n", encoding="utf-8")
+
+    baseline = model_sync.compute_model_sha256(str(root), use_cache=False)
+    for name, content in (
+        ("config.json", '{"model_type":"qwen2"}'),
+        ("qwen.tiktoken", b"tokenizer-v2"),
+        ("modeling_qwen.py", "VERSION = 2\n"),
+    ):
+        path = root / name
+        original = path.read_bytes()
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+        assert model_sync.compute_model_sha256(str(root), use_cache=False) != baseline
+        path.write_bytes(original)
 
 
 def test_same_size_corrupt_weight_is_redownloaded(tmp_path, monkeypatch):

@@ -115,6 +115,7 @@ class ModelManager:
         self._layer_has_lm_head: bool = True
         self._model_layers: int = 0          # 当前加载的层数（range 或 full）
         self._total_model_layers: int = 0    # 完整模型的总层数（加载时记录，load_layer_range 不覆盖）
+        self._layer_architecture: str = ""   # "qwen" | "qwen2"，用于分层前向契约
 
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
@@ -354,6 +355,7 @@ class ModelManager:
         self._layer_has_lm_head = True
         self._model_layers = 0
         self._total_model_layers = 0
+        self._layer_architecture = ""
         self._full_model_path = None
         self._full_model_quant_type = None
 
@@ -551,22 +553,25 @@ class ModelManager:
         """
         import torch.nn as nn
 
+        # Resolve the active model before validating the assignment. DeepSeek
+        # has 28 layers while the legacy Qwen project default has 24, and the
+        # master normally reuses ``_full_model_path`` without passing a path.
+        path = model_path or self._full_model_path or self._model_path or MODEL_PATH
+        model_config = AutoConfig.from_pretrained(
+            path,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            local_files_only=True,
+        )
+
         # ---- 参数校验 ----
         from config import TOTAL_MODEL_LAYERS
-        declared_total = int(total_layers or 0)
-        if declared_total <= 0 and model_path:
-            config_path = os.path.join(model_path, "config.json")
-            if os.path.isfile(config_path):
-                try:
-                    import json
-
-                    with open(config_path, "r", encoding="utf-8") as handle:
-                        declared_total = int(
-                            json.load(handle).get("num_hidden_layers", 0)
-                        )
-                except (OSError, TypeError, ValueError):
-                    declared_total = 0
-        declared_total = declared_total or TOTAL_MODEL_LAYERS
+        config_total = int(getattr(model_config, "num_hidden_layers", 0) or 0)
+        declared_total = int(total_layers or config_total or TOTAL_MODEL_LAYERS)
+        if total_layers and config_total and int(total_layers) != config_total:
+            raise ValueError(
+                f"层配置总数与模型不一致: "
+                f"assignment={int(total_layers)}, model={config_total}"
+            )
         if start_layer < 0 or end_layer > declared_total or start_layer >= end_layer:
             raise ValueError(
                 f"无效的层范围: [{start_layer}, {end_layer})，"
@@ -579,16 +584,10 @@ class ModelManager:
             f"embed={has_embedding}, lm_head={has_lm_head}"
         )
 
-        # Qwen2/DeepSeek 从 safetensors 中只读取本节点需要的层，避免先加载
-        # 完整模型造成数倍于分层目标的内存峰值。旧 Qwen remote-code 模型
-        # 不具备统一层命名，保留完整加载后裁剪的兼容路径。
-        path = model_path or self._full_model_path or self._model_path or MODEL_PATH
-        model_config = AutoConfig.from_pretrained(
-            path,
-            trust_remote_code=TRUST_REMOTE_CODE,
-            local_files_only=True,
-        )
-        if getattr(model_config, "model_type", "") == "qwen2":
+        # Qwen-1.8B 与 Qwen2/DeepSeek 分别使用 transformer.h 和
+        # model.layers，两种架构都从 safetensors 中只物化本节点需要的权重。
+        model_type = str(getattr(model_config, "model_type", "") or "").lower()
+        if model_type == "qwen2":
             self._load_qwen2_layer_range(
                 path,
                 start_layer,
@@ -599,30 +598,45 @@ class ModelManager:
                 profile=profile,
                 model_config=model_config,
             )
+        elif model_type == "qwen":
+            self._load_qwen_layer_range(
+                path,
+                start_layer,
+                end_layer,
+                has_embedding=has_embedding,
+                has_lm_head=has_lm_head,
+                quant_type=quant_type,
+                profile=profile,
+                model_config=model_config,
+            )
         else:
-            self._load_pytorch(model_path=path, quant_type=quant_type, profile=profile)
+            raise RuntimeError(
+                f"当前 PyTorch 层流水线不支持模型架构: {model_type or 'unknown'}"
+            )
         self._engine_type = "pytorch"
 
         if self.model is None:
             raise RuntimeError("模型加载失败，无法进行层范围裁剪")
 
         # ---- 裁剪 Transformer 层 ----
-        # Qwen2ForCausalLM 结构:
-        #   model.model.embed_tokens   → Embedding
-        #   model.model.layers         → nn.ModuleList([24× Qwen2DecoderLayer])
-        #   model.model.norm           → RMSNorm
-        #   model.lm_head              → Linear(2048, 151936)
-        transformer = self.model.model  # Qwen2Model
+        if model_type == "qwen2":
+            transformer = self.model.model
+            layers_attr = "layers"
+            embedding_attr = "embed_tokens"
+        else:
+            transformer = self.model.transformer
+            layers_attr = "h"
+            embedding_attr = "wte"
 
         # 1. 保留指定范围的 Transformer 层
-        all_layers = list(transformer.layers)
+        all_layers = list(getattr(transformer, layers_attr))
         actual_total = len(all_layers)
         if actual_total != declared_total:
             raise RuntimeError(
                 f"模型层数不一致: actual={actual_total}, assignment={declared_total}"
             )
         kept = all_layers[start_layer:end_layer]
-        transformer.layers = nn.ModuleList(kept)
+        setattr(transformer, layers_attr, nn.ModuleList(kept))
 
         # 释放被裁剪层的引用，帮助 GC 回收显存
         for layer in all_layers[:start_layer]:
@@ -633,15 +647,32 @@ class ModelManager:
 
         # 2. 根据需要保留 Embedding
         if not has_embedding:
-            if hasattr(transformer, 'embed_tokens'):
-                del transformer.embed_tokens
-                transformer.embed_tokens = None
+            if hasattr(transformer, embedding_attr):
+                delattr(transformer, embedding_attr)
+                setattr(transformer, embedding_attr, None)
 
         # 3. 根据需要保留 LM Head
         if not has_lm_head:
             if hasattr(self.model, 'lm_head'):
                 del self.model.lm_head
                 self.model.lm_head = None
+
+        # 选择性构造时未选中的参数仍为 meta；裁剪完成后，剩余参数必须全部
+        # 已物化，并将 rotary/logn 等非持久 buffer 移到同一设备。
+        materialized_parameters = list(self.model.parameters())
+        if not materialized_parameters:
+            raise RuntimeError("分层模型没有可用参数")
+        meta_parameters = [
+            name for name, parameter in self.model.named_parameters()
+            if parameter.device.type == "meta"
+        ]
+        if meta_parameters:
+            raise RuntimeError(
+                "分层模型仍有未物化参数: " + ", ".join(meta_parameters[:5])
+            )
+        target_device = materialized_parameters[0].device
+        self.model.to(device=target_device)
+        self.model.eval()
 
         # 4. 清理显存
         import gc
@@ -654,6 +685,7 @@ class ModelManager:
         self.layer_range = (start_layer, end_layer)
         self._layer_has_embedding = bool(has_embedding)
         self._layer_has_lm_head = bool(has_lm_head)
+        self._layer_architecture = model_type
         self._model_layers = layers_count
         self._total_model_layers = actual_total
         if model_id:
@@ -787,6 +819,7 @@ class ModelManager:
                 "Qwen2 分层权重不完整: " + ", ".join(missing[:5])
             )
 
+        model.eval()
         self.model = model
         self.tokenizer = keep_tokenizer or AutoTokenizer.from_pretrained(
             model_path,
@@ -799,6 +832,134 @@ class ModelManager:
         self._model_layers = end_layer - start_layer
         logger.info(
             "Qwen2 选择性权重加载完成: Layer %s-%s / %s",
+            start_layer,
+            end_layer,
+            total_layers,
+        )
+
+    def _load_qwen_layer_range(
+        self,
+        model_path: str,
+        start_layer: int,
+        end_layer: int,
+        *,
+        has_embedding: bool,
+        has_lm_head: bool,
+        quant_type: str = None,
+        profile: dict = None,
+        model_config=None,
+    ) -> None:
+        """Materialize one original Qwen-1.8B ``transformer.h`` segment."""
+        import gc
+        import json
+        from collections import defaultdict
+
+        from accelerate import init_empty_weights
+        from accelerate.utils import set_module_tensor_to_device
+        from safetensors import safe_open
+
+        config = model_config or AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            local_files_only=True,
+        )
+        total_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+        if total_layers <= 0:
+            raise RuntimeError("Qwen config 缺少 num_hidden_layers")
+
+        # 原版 Qwen 会在构造时按机器能力自动切换精度和 FlashAttention。
+        # 分布式工件固定为 FP16，避免 CUDA 主节点和 CPU worker 产生不同模型。
+        config.bf16 = False
+        config.fp16 = True
+        config.fp32 = False
+        config.use_flash_attn = False
+
+        old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
+        keep_tokenizer = self.tokenizer if old_path == os.path.abspath(model_path) else None
+        self.model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=TRUST_REMOTE_CODE,
+            )
+
+        selected_prefixes = [
+            f"transformer.h.{index}."
+            for index in range(start_layer, end_layer)
+        ]
+        selected_prefixes.append("transformer.ln_f.")
+        if has_embedding:
+            selected_prefixes.append("transformer.wte.")
+        if has_lm_head:
+            selected_prefixes.append("lm_head.")
+
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        files_to_keys = defaultdict(list)
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            for key, filename in weight_map.items():
+                if any(key.startswith(prefix) for prefix in selected_prefixes):
+                    files_to_keys[filename].append(key)
+        else:
+            safetensor_files = sorted(
+                name for name in os.listdir(model_path)
+                if name.endswith(".safetensors")
+            )
+            for filename in safetensor_files:
+                shard_path = os.path.join(model_path, filename)
+                with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                    for key in handle.keys():
+                        if any(key.startswith(prefix) for prefix in selected_prefixes):
+                            files_to_keys[filename].append(key)
+
+        if not files_to_keys:
+            raise FileNotFoundError("Qwen 模型目录中未找到分层 safetensors 权重")
+
+        target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        target_dtype = torch.float16
+        loaded_keys = set()
+        for filename, keys in files_to_keys.items():
+            shard_path = os.path.join(model_path, filename)
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                for key in keys:
+                    tensor = handle.get_tensor(key)
+                    set_module_tensor_to_device(
+                        model,
+                        key,
+                        target_device,
+                        value=tensor,
+                        dtype=target_dtype,
+                    )
+                    loaded_keys.add(key)
+
+        required_parameter_names = {
+            name for name, _ in model.named_parameters()
+            if any(name.startswith(prefix) for prefix in selected_prefixes)
+        }
+        missing = sorted(required_parameter_names - loaded_keys)
+        if missing:
+            raise RuntimeError(
+                "Qwen 分层权重不完整: " + ", ".join(missing[:5])
+            )
+
+        model.eval()
+        self.model = model
+        self.tokenizer = keep_tokenizer or AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=TRUST_REMOTE_CODE,
+            local_files_only=True,
+        )
+        self._model_path = model_path
+        self.quant_type = "fp16"
+        self._total_model_layers = total_layers
+        self._model_layers = end_layer - start_layer
+        logger.info(
+            "Qwen 选择性权重加载完成: Layer %s-%s / %s",
             start_layer,
             end_layer,
             total_layers,
@@ -1155,6 +1316,18 @@ class ModelManager:
             self._get_generation_eos_token_ids(stop_sequences),
         )
         cancel_event = generation_kwargs.pop("_cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "content": "",
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "model": self.active_model_id,
+                "finish_reason": "cancelled",
+                "tokens_per_second": 0,
+            }
         stop_criteria = self._build_stop_criteria(
             stop_sequences,
             inputs["input_ids"].shape[1],
@@ -1463,6 +1636,126 @@ class ModelManager:
     # 前向推理（PyTorch 分布式专用）
     # ================================================================
 
+    def _forward_qwen_layers(
+        self,
+        *,
+        input_ids: torch.Tensor = None,
+        hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        position_ids: torch.Tensor = None,
+        past_key_values: tuple = None,
+        use_cache: bool = True,
+        apply_lm_head: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Run one original Qwen ``transformer.h`` segment."""
+        transformer = self.model.transformer
+        layers = transformer.h
+        has_embed = getattr(transformer, "wte", None) is not None
+        has_lm_head = getattr(self.model, "lm_head", None) is not None
+        device = self.get_device()
+        dtype = next(self.model.parameters()).dtype
+
+        with torch.no_grad():
+            if input_ids is not None:
+                if not has_embed:
+                    raise RuntimeError("当前 Qwen 分层不含 Embedding，请传入 hidden_states")
+                input_ids = input_ids.to(device)
+                batch_size, seq_len = input_ids.shape
+                hidden_states = transformer.wte(input_ids).to(dtype=dtype)
+                hidden_states = transformer.drop(hidden_states)
+            else:
+                batch_size, seq_len = hidden_states.shape[:2]
+                hidden_states = hidden_states.to(device=device, dtype=dtype)
+
+            local_layer_count = len(layers)
+            if past_key_values is not None and len(past_key_values) != local_layer_count:
+                raise RuntimeError(
+                    f"Qwen KV cache 层数不匹配: cache={len(past_key_values)}, "
+                    f"local={local_layer_count}"
+                )
+            local_past = (
+                tuple(past_key_values)
+                if past_key_values is not None
+                else tuple([None] * local_layer_count)
+            )
+
+            past_length = 0
+            first_past = next((item for item in local_past if item is not None), None)
+            if first_past is not None:
+                if getattr(transformer, "use_cache_quantization", False):
+                    past_length = int(first_past[0][0].shape[2])
+                else:
+                    past_length = int(first_past[0].shape[1])
+            kv_seq_len = past_length + seq_len
+
+            prepared_mask = None
+            if attention_mask is not None:
+                prepared_mask = attention_mask.to(device).view(batch_size, -1)
+                prepared_mask = prepared_mask[:, None, None, :].to(dtype=dtype)
+                prepared_mask = (1.0 - prepared_mask) * torch.finfo(dtype).min
+
+            if transformer.training or not transformer.use_dynamic_ntk:
+                ntk_alpha_list = [1.0]
+            elif past_length > 0:
+                ntk_alpha_list = list(
+                    getattr(transformer.rotary_emb, "_ntk_alpha_cached_list", None)
+                    or [transformer.get_ntk_alpha(kv_seq_len)]
+                )
+            else:
+                ntk_alpha_list = [transformer.get_ntk_alpha(kv_seq_len)]
+            transformer.rotary_emb._ntk_alpha_cached_list = ntk_alpha_list
+            rotary_pos_emb_list = [
+                transformer.rotary_emb(kv_seq_len, ntk_alpha=ntk_alpha)
+                for ntk_alpha in ntk_alpha_list
+            ]
+
+            presents = []
+            for block, layer_past in zip(layers, local_past):
+                outputs = block(
+                    hidden_states,
+                    rotary_pos_emb_list=rotary_pos_emb_list,
+                    layer_past=layer_past,
+                    attention_mask=prepared_mask,
+                    head_mask=None,
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
+                hidden_states = outputs[0]
+                if use_cache:
+                    presents.append(outputs[1])
+
+            result: Dict[str, torch.Tensor] = {}
+            if has_lm_head and apply_lm_head:
+                result["logits"] = self.model.lm_head(transformer.ln_f(hidden_states))
+            else:
+                result["hidden_states"] = hidden_states
+            if use_cache:
+                result["past_key_values"] = tuple(presents)
+            return result
+
+    @_serialized_model_access
+    def forward_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the active architecture's final norm and language-model head."""
+        if self.model is None or self._engine_type != "pytorch":
+            raise RuntimeError("PyTorch 模型未加载，无法执行 LM Head")
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is None:
+            raise RuntimeError("当前分层不含 LM Head")
+        model_type = str(getattr(self.model.config, "model_type", "") or "").lower()
+        if model_type == "qwen2":
+            norm = getattr(self.model.model, "norm", None)
+        elif model_type == "qwen":
+            norm = getattr(self.model.transformer, "ln_f", None)
+        else:
+            norm = None
+        if norm is None:
+            raise RuntimeError(f"模型架构 {model_type or 'unknown'} 缺少最终 Norm")
+        device = self.get_device()
+        dtype = next(self.model.parameters()).dtype
+        with torch.no_grad():
+            states = hidden_states.to(device=device, dtype=dtype)
+            return lm_head(norm(states))
+
     @_serialized_model_access
     def forward_layers(
         self,
@@ -1518,6 +1811,22 @@ class ModelManager:
             raise ValueError("必须提供 input_ids 或 hidden_states 之一")
         if input_ids is not None and hidden_states is not None:
             raise ValueError("input_ids 和 hidden_states 不能同时提供")
+
+        model_type = str(getattr(self.model.config, "model_type", "") or "").lower()
+        if model_type == "qwen":
+            return self._forward_qwen_layers(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                apply_lm_head=apply_lm_head,
+            )
+        if model_type != "qwen2":
+            raise RuntimeError(
+                f"forward_layers 不支持模型架构: {model_type or 'unknown'}"
+            )
 
         device = self.get_device()
         transformer = self.model.model  # Qwen2Model
@@ -1606,15 +1915,13 @@ class ModelManager:
                         # Phase 4.3: 验证缓存层数与本地层数一致
                         n_local = len(transformer.layers)
                         if len(past_key_values) != n_local:
-                            logger.warning(
-                                f"KV cache 层数不匹配: 缓存 {len(past_key_values)} 层, "
-                                f"本地 {n_local} 层 — 丢弃不匹配的缓存"
+                            raise RuntimeError(
+                                f"Qwen2 KV cache 层数不匹配: "
+                                f"cache={len(past_key_values)}, local={n_local}"
                             )
-                            cache = DynamicCache()
-                        else:
-                            cache = DynamicCache()
-                            for layer_idx, (k, v) in enumerate(past_key_values):
-                                cache.update(k, v, layer_idx)
+                        cache = DynamicCache()
+                        for layer_idx, (k, v) in enumerate(past_key_values):
+                            cache.update(k, v, layer_idx)
                     else:
                         # Prefill: 创建空 DynamicCache
                         cache = DynamicCache()
@@ -1660,24 +1967,43 @@ class ModelManager:
                 #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
                 try:
                     from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
-                    causal_mask = create_causal_mask(
-                        config=transformer.config,
-                        inputs_embeds=hidden_states,
-                        attention_mask=attention_mask.to(device) if attention_mask is not None else None,
-                        past_key_values=cache,
-                        position_ids=position_ids,
-                    )
+                    mask_parameters = inspect.signature(
+                        create_causal_mask
+                    ).parameters
+                    mask_kwargs = {
+                        "config": transformer.config,
+                        "attention_mask": (
+                            attention_mask.to(device)
+                            if attention_mask is not None else None
+                        ),
+                        "past_key_values": cache,
+                        "position_ids": position_ids,
+                    }
+                    if "input_embeds" in mask_parameters:
+                        mask_kwargs["input_embeds"] = hidden_states
+                    elif "inputs_embeds" in mask_parameters:
+                        mask_kwargs["inputs_embeds"] = hidden_states
+                    else:
+                        raise RuntimeError(
+                            "create_causal_mask 缺少已知的输入张量参数"
+                        )
+                    if "cache_position" in mask_parameters:
+                        mask_kwargs["cache_position"] = cache_position
+                    causal_mask = create_causal_mask(**mask_kwargs)
                 except (ImportError, AttributeError):
                     # transformers 4.x 回退：手动构建 4D 因果掩码
-                    seq_len = hidden_states.shape[1]
+                    query_len = hidden_states.shape[1]
+                    target_len = past_seen_tokens + query_len
                     causal_mask = torch.full(
-                        (seq_len, seq_len),
+                        (query_len, target_len),
                         float('-inf'),
                         device=device,
                     )
-                    causal_mask = torch.triu(causal_mask, diagonal=1)
+                    causal_mask = torch.triu(
+                        causal_mask, diagonal=past_seen_tokens + 1
+                    )
                     causal_mask = causal_mask[None, None, :, :].expand(
-                        hidden_states.shape[0], 1, seq_len, seq_len
+                        hidden_states.shape[0], 1, query_len, target_len
                     )
                     if attention_mask is not None:
                         attn_mask = attention_mask.to(device)
@@ -1781,7 +2107,13 @@ class ModelManager:
     def get_device(self) -> torch.device:
         """获取当前模型所在设备（PyTorch 引擎）"""
         if self.model is not None:
-            return self.model.device
+            model_device = getattr(self.model, "device", None)
+            if model_device is not None:
+                return torch.device(model_device)
+            try:
+                return next(self.model.parameters()).device
+            except StopIteration:
+                pass
         return torch.device(DEVICE)
 
     def get_model_info(self) -> dict:
