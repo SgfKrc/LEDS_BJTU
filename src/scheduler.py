@@ -89,7 +89,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
-_LAYER_ASSIGNMENT_CACHE_VERSION = 2
+_LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
 
 def _bootstrap_api_port(default: int = 8000) -> int:
@@ -1047,6 +1047,10 @@ class Scheduler:
 
         # TCP 服务端（分布式模式下启动）
         self._tcp_server = None  # 延迟导入，避免循环依赖
+        # TCP 客户端（从节点连接主节点后创建）。必须在此默认初始化，
+        # 否则从未连接过主节点的实例在错误路径直接访问
+        # self._tcp_client 会抛 AttributeError 而不是优雅返回 False
+        self._tcp_client = None
 
         # 从节点：等待主节点推理结果
         self._client_pending_results: dict = {}
@@ -2106,21 +2110,32 @@ class Scheduler:
             return max(discrete_any, key=_vram)
         return max(candidates, key=_vram)
 
+    @staticmethod
+    def _node_is_island_gateway(device_info: dict) -> bool:
+        """节点是否为 TP 孤岛网关（画像含 island.enabled=true）。"""
+        if not isinstance(device_info, dict):
+            return False
+        island = device_info.get("island")
+        return bool(isinstance(island, dict) and island.get("enabled"))
+
     def _compute_node_weight(self, device_info: dict) -> float:
         """
-        根据完整设备画像估算 PyTorch 分层执行吞吐权重。
+        根据完整设备画像估算节点算力权重（分层分配 + 节点排序共用）。
 
         权重分配:
           - GPU 显存: 50%
           - 系统内存: 30%
           - CPU 核心+频率: 20%
           - CUDA 执行后端: +60（独显可实际执行 PyTorch CUDA 层）
+          - TP 孤岛聚合能力: 按声明的 gpu_count/vram_gb 比例加权
+            （孤岛网关节点承担整请求推理，需在排序中体现聚合算力；
+             但孤岛节点不参与层拆分，见 compute_layer_assignment 的过滤）
 
         Args:
             device_info: DeviceProfiler.to_dict() 完整输出
 
         Returns:
-            权重分数（0 ~ 160）
+            权重分数（无孤岛时 0 ~ 160；孤岛网关按聚合能力上浮）
         """
         gpu = self._select_scoring_gpu(device_info)
         ram = device_info.get("ram", {}) if device_info else {}
@@ -2154,11 +2169,32 @@ class Scheduler:
         # 该项用于区分真实 CUDA layer worker 与 CPU/集显 layer worker。
         accelerator_score = 60.0 if cuda_discrete else 0.0
 
-        weight = vram_score + ram_score + cpu_score + accelerator_score
+        # TP 孤岛聚合能力加权：网关无法探测孤岛内部硬件，按部署者声明的
+        # gpu_count / vram_gb 比例加分，使主节点将孤岛网关排在前列。
+        # 公式: min(聚合显存, 96GB)/24GB × 50 + min(GPU 数, 8) × 5 + 60（加速器项）
+        island_score = 0.0
+        island = device_info.get("island", {}) if device_info else {}
+        if isinstance(island, dict) and island.get("enabled"):
+            try:
+                island_vram_gb = float(island.get("vram_gb", 0) or 0)
+            except (TypeError, ValueError):
+                island_vram_gb = 0.0
+            try:
+                island_gpu_count = int(island.get("gpu_count", 1) or 1)
+            except (TypeError, ValueError):
+                island_gpu_count = 1
+            island_score = (
+                min(island_vram_gb, 96.0) / 24.0 * 50.0
+                + min(max(island_gpu_count, 1), 8) * 5.0
+                + 60.0
+            )
+
+        weight = vram_score + ram_score + cpu_score + accelerator_score + island_score
         logger.debug(
             f"节点权重: GPU={gpu.get('name', 'unknown') if isinstance(gpu, dict) else 'unknown'} "
             f"VRAM={vram_score:.1f} RAM={ram_score:.1f} "
-            f"CPU={cpu_score:.1f} CUDA={accelerator_score:.1f} → {weight:.1f}"
+            f"CPU={cpu_score:.1f} CUDA={accelerator_score:.1f} "
+            f"孤岛={island_score:.1f} → {weight:.1f}"
         )
         return weight
 
@@ -2222,8 +2258,8 @@ class Scheduler:
         if vram_available <= 0:
             return (True, 0, 0)  # 无法判断 → 放行
 
-        # 根据当前模型结构和分层加载的真实精度估算内存。Qwen2 选择性加载
-        # 当前以 FP16 materialize，不能继续套用全模型 int4/int8 的缩放系数。
+        # 根据当前模型结构和分层加载的真实精度估算内存。CUDA 分层使用
+        # FP16，CPU/集显分层使用 FP32，都不能套用全模型 int4/int8 缩放系数。
         from config import (
             MIN_VRAM_PER_LAYER_MB, EMBEDDING_VRAM_MB, LM_HEAD_VRAM_MB,
             SAFE_VRAM_MARGIN, LAYER_VRAM_FACTOR, QUANT_TYPE,
@@ -2253,6 +2289,15 @@ class Scheduler:
         manager = getattr(api_module, "model_manager", None) if api_module else None
         model_config = getattr(getattr(manager, "model", None), "config", None)
 
+        with self._nodes_lock:
+            node = self.nodes.get(node_id)
+        gpu = self._select_scoring_gpu(node.device_info if node else {})
+        uses_cuda = bool(
+            gpu.get("cuda_available", False)
+            and not self._gpu_is_integrated(gpu)
+        ) if isinstance(gpu, dict) else False
+        bytes_per_parameter = 2 if uses_cuda else 4
+
         if model_config is None and manager is not None:
             model_path = getattr(manager, "_model_path", "") or ""
             config_path = os.path.join(model_path, "config.json")
@@ -2278,22 +2323,17 @@ class Scheduler:
                 mlp_params = hidden * intermediate * 3
                 norm_params = hidden * 2
                 mib = 1024.0 * 1024.0
-                layer_mb = (attention_params + mlp_params + norm_params) * 2 / mib
-                io_mb = vocab * hidden * 2 / mib
+                layer_mb = (
+                    attention_params + mlp_params + norm_params
+                ) * bytes_per_parameter / mib
+                io_mb = vocab * hidden * bytes_per_parameter / mib
                 return layer_mb, io_mb, io_mb
             except (TypeError, ValueError, ZeroDivisionError, AttributeError):
                 logger.debug("读取 Qwen2 模型结构内存参数失败，使用回退估算", exc_info=True)
 
-        with self._nodes_lock:
-            node = self.nodes.get(node_id)
-        gpu = self._select_scoring_gpu(node.device_info if node else {})
-        uses_cuda = bool(
-            gpu.get("cuda_available", False)
-            and not self._gpu_is_integrated(gpu)
-        ) if isinstance(gpu, dict) else False
         quant = getattr(manager, "quant_type", None) or configured_quant
-        # 非 CUDA worker 的 PyTorch loader 会把 bitsandbytes int4/int8 回退到 FP16。
-        factor = quant_factors.get(quant, 1.0) if uses_cuda else 1.0
+        # CPU workers materialize FP32 weights; fallback constants use FP16 as baseline.
+        factor = quant_factors.get(quant, 1.0) if uses_cuda else 2.0
         return tuple(float(value) * factor for value in fallback)
 
     def _layer_assignment_cache_key(self, total_layers: int) -> str:
@@ -2306,6 +2346,9 @@ class Scheduler:
                 if info.node_type != "pc":
                     continue
                 if node_id in opted_out:
+                    continue
+                # 孤岛网关不参与层拆分，缓存键同步排除保持一致
+                if self._node_is_island_gateway(info.device_info):
                     continue
                 if info.role != NodeRole.MASTER and not info.is_available():
                     continue
@@ -2428,7 +2471,8 @@ class Scheduler:
 
         total_layers = self._get_total_model_layers()
 
-        # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过）
+        # 收集节点数据（仅 PC 节点参与层拆分，Android 节点跳过；
+        # TP 孤岛网关承担整请求推理，与 llama_cpp 节点一样排除在层拆分之外）
         with self._layer_config_lock:
             opted_out = set(self._pipeline_worker_opt_out)
         if nodes is None:
@@ -2442,6 +2486,7 @@ class Scheduler:
                 for nid, info in nodes_snapshot
                 if info.node_type == "pc"
                 and nid not in opted_out
+                and not self._node_is_island_gateway(info.device_info)
                 and (
                     info.role == NodeRole.MASTER
                     or not hasattr(info, "is_available")
@@ -2453,6 +2498,7 @@ class Scheduler:
                 n for n in nodes
                 if n.get("node_type", "pc") == "pc"
                 and n.get("node_id") not in opted_out
+                and not self._node_is_island_gateway(n.get("device_info", {}))
             ]
 
         if not node_list:
@@ -3443,6 +3489,23 @@ class Scheduler:
                 engines.append("llama_cpp")
         except (ImportError, ValueError):
             pass
+        # TP 孤岛网关：以 island 引擎承担整请求推理（配置启用即上报能力）
+        try:
+            import config as _island_cfg
+            if (getattr(_island_cfg, "ISLAND_ENABLED", False)
+                    and getattr(_island_cfg, "ISLAND_BASE_URL", "")):
+                engines.append("island")
+        except Exception:
+            pass
+        # 外部推理服务（路线 B）：以 external_api 引擎承担整请求推理。
+        # 仅声明能力，实际外发仍受数据作用域门控约束（默认 opt_in 不出集群）。
+        try:
+            import config as _external_cfg
+            if (getattr(_external_cfg, "EXTERNAL_ENABLED", False)
+                    and getattr(_external_cfg, "EXTERNAL_BASE_URL", "")):
+                engines.append("external_api")
+        except Exception:
+            pass
         if not engines:
             # The PC application currently requires the PyTorch runtime. Keeping
             # the schema valid also makes a broken installation visible in hello.
@@ -4179,7 +4242,13 @@ class Scheduler:
                     self._tcp_server.confirm_registration(client_id)
                 logger.debug("节点间流水线传输连接已认证: %s", client_id)
                 return
-            client_info = self._tcp_server.get_client_info(client_id) if self._tcp_server else {}
+            # get_client_info 对未知 client_id 返回 None（如从节点收到主节点的
+            # register 拒绝回执、或注册与断开竞态），必须兜底为空 dict，
+            # 否则回调崩溃会杀死接收循环、触发无限重连
+            client_info = (
+                self._tcp_server.get_client_info(client_id)
+                if self._tcp_server else {}
+            ) or {}
             advertised_addr = (
                 client_info.get("advertised_addr")
                 or data.get("advertised_address")
@@ -5395,9 +5464,10 @@ class Scheduler:
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client.sock:
             try:
-                from tcp_comm import build_message, MessageType
-                packet = build_message(MessageType.ROLE_TRANSFER_ACK, ack_payload)
-                tcp_client.sock.sendall(packet)
+                from tcp_comm import MessageType
+                # 走 send_data 的 _send_lock 发送通道，避免与心跳线程并发
+                # 写同一 TCP 字节流导致帧交叉损坏
+                tcp_client.send_data(ack_payload, MessageType.ROLE_TRANSFER_ACK)
                 logger.info(f"已发送角色转让确认: transfer_id={transfer_id}")
             except Exception as e:
                 logger.warning(f"发送 ACK 失败: {e}")
@@ -5720,9 +5790,10 @@ class Scheduler:
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client.sock:
             try:
-                from tcp_comm import build_message, MessageType
-                packet = build_message(MessageType.SPARE_MASTER_DESIGNATE_ACK, ack_payload)
-                tcp_client.sock.sendall(packet)
+                from tcp_comm import MessageType
+                # 走 send_data 的 _send_lock 发送通道，避免与心跳线程并发
+                # 写同一 TCP 字节流导致帧交叉损坏
+                tcp_client.send_data(ack_payload, MessageType.SPARE_MASTER_DESIGNATE_ACK)
                 logger.info(f"已发送备用主节点指定确认: designate_id={designate_id}")
             except Exception as e:
                 logger.warning(f"发送备用 ACK 失败: {e}")
@@ -5804,9 +5875,10 @@ class Scheduler:
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client.sock:
             try:
-                from tcp_comm import build_message, MessageType
-                packet = build_message(MessageType.SPARE_MASTER_ACTIVATE_ACK, ack_payload)
-                tcp_client.sock.sendall(packet)
+                from tcp_comm import MessageType
+                # 走 send_data 的 _send_lock 发送通道，避免与心跳线程并发
+                # 写同一 TCP 字节流导致帧交叉损坏
+                tcp_client.send_data(ack_payload, MessageType.SPARE_MASTER_ACTIVATE_ACK)
                 logger.info(f"已发送备用主节点激活确认: activate_id={activate_id}")
             except Exception as e:
                 logger.warning(f"发送激活 ACK 失败: {e}")
@@ -7763,6 +7835,26 @@ class Scheduler:
             })
             logger.info("主节点已释放本设备的分层 worker 预留")
             return
+        # TP 孤岛网关节点不参与 PyTorch 层拆分：直接拒绝分层配置并退出
+        # 分层 worker 池（与 llama_cpp 全模型节点的语义一致，防止孤岛引擎
+        # 被 load_layer_range 覆盖为 PyTorch 层段）。
+        try:
+            import config as _island_cfg
+            island_gateway = bool(getattr(_island_cfg, "ISLAND_ENABLED", False))
+        except Exception:
+            island_gateway = False
+        if island_gateway:
+            error = "本设备为 TP 孤岛网关节点，不参与 PyTorch 层拆分"
+            logger.info(error)
+            self._send_layer_config_ack({
+                "node_id": node_id,
+                "config_id": str(data.get("config_id", "")) if isinstance(data, dict) else "",
+                "status": "error",
+                "error": error,
+            })
+            self.release_pipeline_worker_for_local_model()
+            return
+
         if node_id in data and isinstance(data.get(node_id), dict):
             cfg = dict(data[node_id])
         elif isinstance(data, dict) and "start_layer" in data and "end_layer" in data:
@@ -11228,6 +11320,10 @@ class Scheduler:
 
                 # ---- 检测主节点恢复 ----
                 if not was_online and is_online:
+                    # 是否真正观察到过宕机：监控线程启动早于 TCP 注册完成时，
+                    # 首轮循环会出现 was_online=False → is_online=True 的
+                    # 假"恢复"跳变（链路其实一直健康），此时不应打恢复日志
+                    observed_down = self._client_master_down_since > 0
                     total_downtime = time.time() - self._client_master_down_since if self._client_master_down_since > 0 else 0
 
                     # 发送恢复通知邮件（仅在本轮曾发送过宕机告警时）
@@ -11249,12 +11345,18 @@ class Scheduler:
                     self._client_master_down_since = 0.0
                     self._client_master_down_email_sent = False
 
-                    logger.info(
-                        f"✅ 主节点已恢复在线 "
-                        f"({health.get('master_host')}:{health.get('master_port')})"
-                    )
-                    # 如果已有连接配置，尝试自动重连
-                    if self._client_reconnect_enabled:
+                    if observed_down:
+                        logger.info(
+                            f"✅ 主节点已恢复在线 "
+                            f"({health.get('master_host')}:{health.get('master_port')})"
+                        )
+                    # 如果已有连接配置，尝试自动重连。
+                    # ★ 仅在本地 TCP 确实未连接时才重连：监控线程启动早于
+                    #   TCP 注册完成时，首轮循环会出现 was_online=False →
+                    #   is_online=True 的假"恢复"跳变，此时链路本来就是
+                    #   健康的，不应重连、更不应打"已自动重连"日志
+                    if (self._client_reconnect_enabled
+                            and not health.get("tcp_connected")):
                         host = health.get("master_host", "")
                         port = health.get("master_port", 0)
                         if host and port:

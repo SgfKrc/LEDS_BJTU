@@ -628,20 +628,35 @@ def unpack_header(header: bytes) -> int:
     return struct.unpack(">I", header)[0]
 
 
-def recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+def recv_exact(sock: socket.socket, n: int, mid_frame: bool = False) -> Optional[bytes]:
     """
     精确接收 n 字节数据（处理 TCP 粘包/拆包）。
 
     Args:
         sock: socket 对象
         n: 需要接收的字节数
+        mid_frame: 本次读取是否处于一帧的中间（前面的长度头/数据体已被消费）。
+                   为 True 时任何超时都视为字节流失步，抛出 ConnectionError；
+                   为 False 时仅在已读到部分字节后超时才抛出 ConnectionError，
+                   空闲超时（尚未读到任何字节）原样抛出 socket.timeout。
 
     Returns:
         接收到的字节流，连接断开时返回 None
     """
     data = b""
     while len(data) < n:
-        chunk = sock.recv(n - len(data))
+        try:
+            chunk = sock.recv(n - len(data))
+        except socket.timeout:
+            if data or mid_frame:
+                # 帧中途超时：部分字节已被消费，字节流已失去同步，
+                # 继续接收只会把后续数据错当长度头。按连接故障处理，
+                # 由上层走断开/重连路径恢复。
+                raise ConnectionError(
+                    f"接收超时导致帧不完整（已收 {len(data)}/{n} 字节），"
+                    f"字节流失去同步"
+                ) from None
+            raise
         if not chunk:
             return None
         data += chunk
@@ -1019,6 +1034,7 @@ class TCPServer:
 
         在独立线程中运行，持续接收消息直到连接断开。
         """
+        # 注册完成前使用较短超时，防止握手阶段挂死；注册成功后再放宽
         conn.settimeout(HEARTBEAT_INTERVAL + 2)
         client_id = temp_id
 
@@ -1034,7 +1050,7 @@ class TCPServer:
                     logger.warning(f"非法包长度: {payload_len}，断开 {addr}")
                     break
 
-                payload = recv_exact(conn, payload_len)
+                payload = recv_exact(conn, payload_len, mid_frame=True)
                 if payload is None:
                     break
 
@@ -1042,7 +1058,7 @@ class TCPServer:
 
                 # 处理张量附加数据
                 if msg.get("_needs_tensor"):
-                    tensor_header = recv_exact(conn, HEADER_LEN)
+                    tensor_header = recv_exact(conn, HEADER_LEN, mid_frame=True)
                     if tensor_header is None:
                         break
                     tensor_len = unpack_header(tensor_header)
@@ -1051,7 +1067,7 @@ class TCPServer:
                             f"非法张量包长度: {tensor_len}，断开 {addr}"
                         )
                         break
-                    tensor_data = recv_exact(conn, tensor_len)
+                    tensor_data = recv_exact(conn, tensor_len, mid_frame=True)
                     if tensor_data is None:
                         break
                     msg["tensor"] = deserialize_tensor(tensor_data)
@@ -1077,6 +1093,12 @@ class TCPServer:
                     if temp_id in self._recv_threads:
                         del self._recv_threads[temp_id]
                     self._recv_threads[client_id] = threading.current_thread()
+                    # 注册完成后放宽接收超时：离线判定交给心跳巡检
+                    # （允许连续丢失 MAX_HEARTBEAT_MISSED 次心跳），
+                    # 避免单次卡顿（模型加载/磁盘 IO/GC）就被误判离线踢出
+                    conn.settimeout(
+                        HEARTBEAT_INTERVAL * (self.MAX_HEARTBEAT_MISSED + 1) + 2
+                    )
 
                 elif msg_type == MessageType.HEARTBEAT.value:
                     # 心跳：回显客户端时间戳并回复 ACK
@@ -1549,10 +1571,6 @@ class TCPClient:
                     self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     self.sock.settimeout(HEARTBEAT_INTERVAL + 5)
                     self.sock.connect((self.server_host, self.server_port))
-                    with self._disconnect_callback_lock:
-                        self._connection_generation += 1
-                        connection_generation = self._connection_generation
-                        self._disconnect_notified = False
                     self._running = True
                     logger.info(f"已连接主节点: {self.server_host}:{self.server_port}")
 
@@ -1630,6 +1648,14 @@ class TCPClient:
                         )
                         return False
 
+                    # 注册成功后才推进连接代数：若 TCP 连上但注册失败，
+                    # 代数保持不变，旧心跳线程不会因代数失配而退出，
+                    # 可以继续驱动 _reconnect() 持续重连
+                    with self._disconnect_callback_lock:
+                        self._connection_generation += 1
+                        connection_generation = self._connection_generation
+                        self._disconnect_notified = False
+
                     # 启动心跳线程
                     self._heartbeat_thread = threading.Thread(
                         target=self._heartbeat_loop,
@@ -1675,48 +1701,62 @@ class TCPClient:
     def _recv_loop(self, connection_generation: int = None) -> None:
         """接收消息循环（在独立线程中运行）"""
         connection_sock = self.sock
-        while self._running and connection_sock:
-            with self._disconnect_callback_lock:
-                if (connection_generation is not None
-                        and connection_generation != self._connection_generation):
-                    break
-            try:
-                msg = self.recv_data(connection_sock)
-                if msg is None:
-                    break  # 连接断开
-                # 内部处理：HEARTBEAT_ACK → 计算 RTT
-                if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
-                    self._handle_heartbeat_ack(msg)
-                    continue  # 不向上层转发
-                if self.on_message:
-                    try:
-                        self.on_message(msg)
-                    except Exception as e:
-                        logger.error(f"消息回调异常: {e}", exc_info=True)
-            except socket.timeout:
-                continue
-            except (ConnectionError, OSError) as e:
-                if not self._running:
-                    break
-                logger.warning(
-                    f"客户端接收循环连接异常: {self.client_id} "
-                    f"→ {self.server_host}:{self.server_port}, error={e}",
-                    exc_info=True,
-                )
-                break
-        with self._disconnect_callback_lock:
-            is_current = (
-                connection_generation is None
-                or connection_generation == self._connection_generation
-            )
-            if is_current and self.sock is connection_sock:
-                self.sock = None
         try:
-            connection_sock.close()
-        except OSError:
-            pass
-        self._notify_disconnect(connection_generation)
-        logger.info(f"接收循环已退出: {self.client_id}")
+            while self._running and connection_sock:
+                with self._disconnect_callback_lock:
+                    if (connection_generation is not None
+                            and connection_generation != self._connection_generation):
+                        break
+                try:
+                    msg = self.recv_data(connection_sock)
+                    if msg is None:
+                        break  # 连接断开
+                    # 内部处理：HEARTBEAT_ACK → 计算 RTT
+                    if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
+                        self._handle_heartbeat_ack(msg)
+                        continue  # 不向上层转发
+                    if self.on_message:
+                        try:
+                            self.on_message(msg)
+                        except Exception as e:
+                            logger.error(f"消息回调异常: {e}", exc_info=True)
+                except socket.timeout:
+                    continue
+                except (ConnectionError, OSError) as e:
+                    if not self._running:
+                        break
+                    logger.warning(
+                        f"客户端接收循环连接异常: {self.client_id} "
+                        f"→ {self.server_host}:{self.server_port}, error={e}",
+                        exc_info=True,
+                    )
+                    break
+                except Exception as e:
+                    # 帧解析/张量反序列化等未预期异常：不能让接收线程
+                    # 静默死亡（否则连接成为僵尸），按连接故障断开处理
+                    logger.error(
+                        f"客户端接收循环未预期异常，按断连处理: {self.client_id} "
+                        f"→ {self.server_host}:{self.server_port}, error={e}",
+                        exc_info=True,
+                    )
+                    break
+        finally:
+            # 无论以何种方式退出循环，都必须完成清理并通知断连，
+            # 否则上层健康监控无法感知断开、不会触发重连
+            with self._disconnect_callback_lock:
+                is_current = (
+                    connection_generation is None
+                    or connection_generation == self._connection_generation
+                )
+                if is_current and self.sock is connection_sock:
+                    self.sock = None
+            if connection_sock is not None:
+                try:
+                    connection_sock.close()
+                except OSError:
+                    pass
+            self._notify_disconnect(connection_generation)
+            logger.info(f"接收循环已退出: {self.client_id}")
 
     def _notify_disconnect(self, connection_generation: int = None) -> None:
         with self._disconnect_callback_lock:
@@ -1763,7 +1803,7 @@ class TCPClient:
             raise ConnectionError(f"invalid packet length: {payload_len}")
 
         # 接收数据体
-        payload = recv_exact(active_sock, payload_len)
+        payload = recv_exact(active_sock, payload_len, mid_frame=True)
         if payload is None:
             return None
 
@@ -1771,7 +1811,7 @@ class TCPClient:
 
         # 如果消息携带张量，继续接收张量数据
         if msg.get("_needs_tensor"):
-            tensor_header = recv_exact(active_sock, HEADER_LEN)
+            tensor_header = recv_exact(active_sock, HEADER_LEN, mid_frame=True)
             if tensor_header is None:
                 return None
             tensor_len = unpack_header(tensor_header)
@@ -1779,7 +1819,7 @@ class TCPClient:
                 raise ConnectionError(
                     f"invalid tensor packet length: {tensor_len}"
                 )
-            tensor_data = recv_exact(active_sock, tensor_len)
+            tensor_data = recv_exact(active_sock, tensor_len, mid_frame=True)
             if tensor_data is None:
                 return None
             msg["tensor"] = deserialize_tensor(tensor_data)
@@ -1858,14 +1898,15 @@ class TCPClient:
                 pass
             self.sock = None
 
-        # connect() 内部已有 5 次重试 + 指数退避
+        # connect() 内部对 TCP 连接失败最多重试 RECONNECT_MAX_RETRIES 次；
+        # 注册失败（被拒绝/等待确认超时）则立即返回 False
         ok = self.connect(self.on_message)
         if ok:
             logger.info(f"重连主节点成功: client={self.client_id}")
         else:
             logger.error(
-                f"重连主节点失败（connect 已重试 {RECONNECT_MAX_RETRIES} 次）: "
-                f"client={self.client_id}，将在下次心跳时重新尝试"
+                f"重连主节点失败: client={self.client_id}，"
+                f"将在下次心跳时重新尝试"
             )
             # 设置 _running=True 使心跳循环继续，下次 send_data 失败
             # 时会再次触发 _reconnect()，实现持续重连

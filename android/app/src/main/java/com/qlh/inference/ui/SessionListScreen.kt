@@ -3,6 +3,7 @@ package com.qlh.inference.ui
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -13,18 +14,22 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -38,6 +43,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.data.SessionEntity
+import com.qlh.inference.ui.components.EmptyState
+import com.qlh.inference.ui.components.QlhTopBar
+import com.qlh.inference.ui.components.StatusChip
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -59,69 +67,66 @@ fun SessionListScreen(
 
     Scaffold(
         floatingActionButton = {
-            FloatingActionButton(
+            ExtendedFloatingActionButton(
                 onClick = onCreateSession,
-                containerColor = MaterialTheme.colorScheme.primary
-            ) {
-                Icon(
-                    Icons.Default.Add,
-                    contentDescription = "新建会话",
-                    tint = MaterialTheme.colorScheme.onPrimary
-                )
-            }
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                icon = {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = null
+                    )
+                },
+                text = { Text("新建会话") }
+            )
         },
+        containerColor = MaterialTheme.colorScheme.background,
         modifier = modifier
     ) { padding ->
-        if (sessions.isEmpty()) {
-            // 空状态
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        text = "💬",
-                        style = MaterialTheme.typography.headlineLarge
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "暂无会话",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "点击右下角 + 创建新会话",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.outline
-                    )
-                }
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(
-                    horizontal = 16.dp,
-                    vertical = 8.dp
-                ),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(sessions, key = { it.id }) { session ->
-                    SessionCard(
-                        session = session,
-                        isCurrent = session.id == currentSessionId,
-                        onClick = { onSessionClick(session.id) },
-                        onDelete = { deleteTarget = session }
-                    )
-                }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+        ) {
+            QlhTopBar(
+                title = "会话",
+                subtitle = if (sessions.isEmpty()) "暂无会话" else "共 ${sessions.size} 个会话"
+            )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
 
-                // 底部留白（FAB 不遮挡最后一项）
-                item(key = "spacer") {
-                    Spacer(modifier = Modifier.height(72.dp))
+            if (sessions.isEmpty()) {
+                // 空状态
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 32.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    EmptyState(
+                        icon = Icons.Default.Forum,
+                        title = "暂无会话",
+                        subtitle = "点击右下角「新建会话」开始第一段对话"
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(
+                        start = 16.dp,
+                        end = 16.dp,
+                        top = 12.dp,
+                        bottom = 96.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(sessions, key = { it.id }) { session ->
+                        SessionCard(
+                            session = session,
+                            isCurrent = session.id == currentSessionId,
+                            onClick = { onSessionClick(session.id) },
+                            onDelete = { deleteTarget = session }
+                        )
+                    }
                 }
             }
         }
@@ -173,48 +178,80 @@ private fun SessionCard(
     Card(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
         colors = CardDefaults.cardColors(
             containerColor = if (isCurrent) {
-                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                MaterialTheme.colorScheme.primaryContainer
             } else {
-                MaterialTheme.colorScheme.surface
+                MaterialTheme.colorScheme.surfaceContainer
             }
         ),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (isCurrent) 2.dp else 0.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 14.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // 图标
-            Icon(
-                Icons.AutoMirrored.Filled.Chat,
-                contentDescription = null,
-                modifier = Modifier.size(24.dp),
-                tint = if (isCurrent) {
+            // 会话图标（圆角底色）
+            Surface(
+                modifier = Modifier.size(40.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = if (isCurrent) {
                     MaterialTheme.colorScheme.primary
                 } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
+                    MaterialTheme.colorScheme.secondaryContainer
                 }
-            )
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Chat,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = if (isCurrent) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            MaterialTheme.colorScheme.onSecondaryContainer
+                        }
+                    )
+                }
+            }
             Spacer(modifier = Modifier.width(12.dp))
 
             // 标题和信息
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = session.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Spacer(modifier = Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = session.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium,
+                        color = if (isCurrent) {
+                            MaterialTheme.colorScheme.onPrimaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (isCurrent) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        StatusChip(
+                            text = "当前",
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            showDot = false
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(3.dp))
                 Text(
                     text = buildInfoText(session),
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
 

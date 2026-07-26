@@ -161,6 +161,71 @@ class DeviceProfile:
     recommendations: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     android_ready: bool = False
+    # TP 孤岛聚合能力段（网关节点专用，随注册 device_info 上报主节点；
+    # None = 非孤岛网关节点，旧版本节点无感）
+    island: Optional[Dict[str, Any]] = None
+
+
+# ============================================================
+# TP 孤岛环境变量读取（保持本模块零项目内部依赖，直接读 QLH_ISLAND_*）
+# ============================================================
+
+def _island_env_bool(name: str) -> bool:
+    raw = os.environ.get(name, "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _island_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, "").strip() or default)
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _island_env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "").strip() or default)
+        return value if value >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _mask_island_base_url(url: str) -> str:
+    """脱敏孤岛端点：去除内嵌账号密码与查询串。"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        parts = urlsplit(url)
+        netloc = parts.netloc
+        if "@" in netloc:
+            netloc = netloc.rsplit("@", 1)[-1]
+        return urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
+    except (ValueError, AttributeError):
+        return "<无效 URL>"
+
+
+def detect_island_profile() -> Optional[Dict[str, Any]]:
+    """
+    读取 TP 孤岛聚合能力配置（QLH_ISLAND_* 环境变量）。
+
+    网关无法探测孤岛内部硬件，聚合 GPU 数 / 显存 / 并行度由部署者声明。
+    未启用时返回 None（画像中不出现 island 段，旧节点/主节点无感）。
+    """
+    if not _island_env_bool("QLH_ISLAND_ENABLED"):
+        return None
+    return {
+        "enabled": True,
+        "backend": os.environ.get("QLH_ISLAND_BACKEND", "").strip() or "openai-compatible",
+        "base_url": _mask_island_base_url(
+            os.environ.get("QLH_ISLAND_BASE_URL", "").strip()
+        ),
+        "model": os.environ.get("QLH_ISLAND_MODEL", "").strip(),
+        "tp_size": _island_env_int("QLH_ISLAND_TP_SIZE", 1),
+        "gpu_count": _island_env_int("QLH_ISLAND_GPU_COUNT", 1),
+        "vram_gb": _island_env_float("QLH_ISLAND_VRAM_GB", 0.0),
+    }
 
 
 # ============================================================
@@ -368,6 +433,7 @@ class DeviceProfiler:
             recommendations=[],
             warnings=[],
             android_ready=self._check_android_ready(),
+            island=detect_island_profile(),
         )
 
         # 生成建议
@@ -897,11 +963,14 @@ class DeviceProfiler:
 
     def _compute_scores(self) -> Dict[str, float]:
         """
-        计算设备加权评分 (0-100)。
+        计算设备加权评分 (0-100，孤岛网关按聚合能力上浮)。
 
         GPU 50% — 有独显+显存 → 高分，集显 → 中分，无 → 0
         RAM 30% — 越大越好，封顶 64GB
         CPU 20% — 核心数+频率综合
+        island — TP 孤岛聚合能力附加项（网关节点专用）:
+                 min(50, 聚合显存GB/24 × 50) + min(GPU数-1, 4) × 2.5
+                 与 GPU 评分同刻度（24GB 单卡 = 50 分），多卡按数量加成
         """
         scores = {}
 
@@ -955,6 +1024,19 @@ class DeviceProfiler:
             cpu_score = 5.0
         scores["cpu"] = round(cpu_score, 1)
 
+        # --- TP 孤岛聚合能力附加分（网关节点专用） ---
+        # 孤岛内部硬件对网关不可见，按部署者声明的 gpu_count/vram_gb 计算，
+        # 使主节点排序反映"单个逻辑高算力节点"的聚合能力（调研方案 §2.1）。
+        island = detect_island_profile()
+        if island:
+            vram_gb_total = float(island.get("vram_gb", 0.0) or 0.0)
+            gpu_count = int(island.get("gpu_count", 1) or 1)
+            island_score = (
+                min(50.0, vram_gb_total / 24.0 * 50.0)
+                + min(max(gpu_count, 1) - 1, 4) * 2.5
+            )
+            scores["island"] = round(island_score, 1)
+
         return scores
 
     def _classify_tier(self) -> DeviceTier:
@@ -974,6 +1056,11 @@ class DeviceProfiler:
         7. GPU VRAM 4-8GB → LAPTOP
         8. GPU VRAM ≥ 8GB + RAM ≥ 32GB → WORKSTATION
         """
+        # 规则 0: TP 孤岛网关 → WORKSTATION
+        # 网关对集群呈现孤岛的聚合算力，档位按聚合能力而非本机硬件判定
+        if detect_island_profile():
+            return DeviceTier.WORKSTATION
+
         ram = self._ram
         plat = self._platform
         is_arm = plat and plat.machine in ("aarch64", "armv7l", "arm64")

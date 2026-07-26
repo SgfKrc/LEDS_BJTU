@@ -60,6 +60,8 @@ test('retry and late result rejection remain visible after completion', () => {
     observability: {
       state: 'completed',
       retry_count: 2,
+      same_provider_retry_count: 1,
+      reassignment_count: 1,
       result_rejection_count: 1,
       last_result_rejection_reason: 'winner_already_committed',
       actual_providers: ['worker-a', 'worker-b'],
@@ -67,9 +69,24 @@ test('retry and late result rejection remain visible after completion', () => {
   });
 
   assert.equal(status.retryCount, 2);
+  assert.equal(status.sameProviderRetryCount, 1);
+  assert.equal(status.reassignmentCount, 1);
   assert.equal(status.rejectionCount, 1);
   assert.equal(status.rejectionLabel, '迟到结果已拒绝');
   assert.deepEqual(status.providers, ['worker-a', 'worker-b']);
+  assert.equal(status.tone, 'warning');
+});
+
+test('partial task graph completion stays visible as a warning', () => {
+  const status = normalizeTaskGraphWorkflow({
+    workflow_id: 'wf_partialdone1',
+    state: 'completed',
+    partial_result: true,
+    observability: { state: 'completed', partial_result: true },
+  });
+
+  assert.equal(status.partialResult, true);
+  assert.equal(status.terminal, true);
   assert.equal(status.tone, 'warning');
 });
 

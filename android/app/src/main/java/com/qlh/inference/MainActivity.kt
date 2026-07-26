@@ -14,6 +14,7 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -105,13 +106,16 @@ fun MainApp(
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         bottomBar = {
-            NavigationBar {
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer
+            ) {
                 bottomNavItems.forEach { item ->
                     NavigationBarItem(
                         selected = uiState.currentTab == item.route,
                         onClick = { viewModel.selectTab(item.route) },
                         icon = { Icon(item.icon, contentDescription = item.label) },
-                        label = { Text(item.label) }
+                        label = { Text(item.label) },
+                        alwaysShowLabel = true
                     )
                 }
             }
@@ -127,7 +131,8 @@ fun MainApp(
                 onSendMessage = { viewModel.sendMessage(it) },
                 onRetry = { viewModel.retryLastMessage() },
                 onClearError = { viewModel.clearError() },
-                modifier = Modifier.padding(innerPadding)
+                modifier = Modifier.padding(innerPadding),
+                inferenceMode = uiState.inferenceMode
             )
             "sessions" -> SessionListScreen(
                 sessions = uiState.sessions,

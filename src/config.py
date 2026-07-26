@@ -107,6 +107,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float, min_val: float = 0.0,
+               max_val: float = 1e9) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not (min_val <= value <= max_val):
+        return default
+    return value
+
+
 def _normalize_node_role(value: str) -> str:
     role = (value or "master").strip().lower()
     if role in {"slave", "worker", "client"}:
@@ -149,6 +163,102 @@ INFERENCE_ENGINE = "llama_cpp"
 #   Q8_0   (1.82 GB) — 近无损
 
 TRUST_REMOTE_CODE = True                     # Qwen 模型需要自定义代码
+
+# --- TP 孤岛接入（路线 A PoC，详见 docs/TP孤岛接入指南.md）---
+# 网关节点将同构 GPU 子集群（vLLM/SGLang/llama.cpp rpc-server 张量并行孤岛）
+# 的 OpenAI 兼容端点封装为 "island" 引擎，对集群呈现为单个逻辑高算力节点。
+# 孤岛节点承担整请求推理，不参与 PyTorch 层拆分（行为与 llama_cpp 节点一致）。
+ISLAND_ENABLED = _env_bool("QLH_ISLAND_ENABLED", False)     # 孤岛引擎总开关
+ISLAND_BASE_URL = _env_first("QLH_ISLAND_BASE_URL", default="")  # 如 http://10.0.0.2:8000
+ISLAND_API_KEY = os.environ.get("QLH_ISLAND_API_KEY", "")   # 可选 Bearer 凭据（日志脱敏）
+ISLAND_MODEL = _env_first("QLH_ISLAND_MODEL", default="")   # 为空时自动取 /v1/models 首个模型
+ISLAND_TIMEOUT = _env_int("QLH_ISLAND_TIMEOUT", 120, min_val=1, max_val=3600)  # 请求超时（秒）
+ISLAND_CONNECT_TIMEOUT = _env_int("QLH_ISLAND_CONNECT_TIMEOUT", 5, min_val=1, max_val=300)  # 连接超时（秒）
+# 聚合能力画像（网关无法探测孤岛内部硬件，由部署者显式声明；
+# 用于设备画像 island 段与主节点排序加权，防止孤岛节点被低估）
+ISLAND_GPU_COUNT = _env_int("QLH_ISLAND_GPU_COUNT", 1, min_val=1, max_val=64)   # 孤岛 GPU 总数
+ISLAND_VRAM_GB = _env_float("QLH_ISLAND_VRAM_GB", 0.0, min_val=0.0, max_val=8192.0)  # 聚合显存（GB）
+ISLAND_TP_SIZE = _env_int("QLH_ISLAND_TP_SIZE", 1, min_val=1, max_val=64)       # 张量并行度
+ISLAND_BACKEND = _env_first("QLH_ISLAND_BACKEND", default="openai-compatible")  # 后端标签，如 "vllm-tp2"
+
+
+def _normalize_external_data_scope(value: str) -> str:
+    """数据作用域档位归一化。
+
+    未设置（空值）→ 默认 opt_in；设置了但取值非法（如误写 "denied"/"off"）
+    → 一律回落 deny 而不是 opt_in。作用域是安全边界，配置写错时必须
+    fail-closed：宁可挡住合法请求，也不能让本想禁用出网的配置反而放行。
+    """
+    scope = (value or "").strip().lower()
+    if not scope:
+        return "opt_in"
+    if scope in {"deny", "opt_in", "allow_all"}:
+        return scope
+    # 非法取值：打印到 stderr（config 在 logging 初始化前导入，不能用 logger）
+    sys.stderr.write(
+        "[QLH][WARN] QLH_EXTERNAL_DATA_SCOPE 取值非法: "
+        + repr(value)
+        + "，已回落为 deny（禁止一切外部路由）。合法取值: deny / opt_in / allow_all\n"
+    )
+    return "deny"
+
+
+# --- 外部推理服务接入（路线 B PoC，详见 docs/外部推理服务Provider接入指南.md）---
+# 集群把"整条请求"作为路由决策交给一个外部 OpenAI 兼容端点（租用 GPU 盒子、
+# 实验室服务器、云 API 等），不要求对方运行任何 QLH 代码，也无专职网关节点。
+# 与 TP 孤岛（路线 A，集群内的逻辑节点）不同：外部端点在集群信任域之外，
+# 因此数据作用域门控是硬约束——默认 opt_in，未显式授权的请求绝不离开集群。
+EXTERNAL_ENABLED = _env_bool("QLH_EXTERNAL_ENABLED", False)      # 外部推理服务总开关
+EXTERNAL_BASE_URL = _env_first("QLH_EXTERNAL_BASE_URL", default="")  # 如 https://gpu-box.example.com:8000
+EXTERNAL_API_KEY = os.environ.get("QLH_EXTERNAL_API_KEY", "")    # 可选 Bearer 凭据（日志脱敏）
+EXTERNAL_MODEL = _env_first("QLH_EXTERNAL_MODEL", default="")    # 为空时自动取 /v1/models 首个模型
+EXTERNAL_TIMEOUT = _env_int("QLH_EXTERNAL_TIMEOUT", 120, min_val=1, max_val=3600)  # 请求超时（秒）
+EXTERNAL_CONNECT_TIMEOUT = _env_int("QLH_EXTERNAL_CONNECT_TIMEOUT", 5, min_val=1, max_val=300)  # 连接超时（秒）
+# 数据作用域门控（安全边界，不是性能开关，见调研方案 §2.2）:
+#   "deny"      硬禁用——即使请求携带 allow_external 也拒绝出集群
+#   "opt_in"    默认——仅携带 allow_external=true 的请求可路由到外部端点
+#   "allow_all" 全部请求均可外部路由（仅限自有/可信端点，慎用）
+EXTERNAL_DATA_SCOPE = _normalize_external_data_scope(
+    os.environ.get("QLH_EXTERNAL_DATA_SCOPE", "opt_in")
+)
+# 长上下文卸载启发式：作用域放行后，提示词字符数 ≥ 此阈值的请求优先走外部
+# （0 = 关闭，仅 prefer_external 显式触发）
+EXTERNAL_MIN_PROMPT_CHARS = _env_int(
+    "QLH_EXTERNAL_MIN_PROMPT_CHARS", 0, min_val=0, max_val=1000000,
+)
+EXTERNAL_LABEL = _env_first("QLH_EXTERNAL_LABEL", default="外部推理服务")  # 展示名
+
+# --- 投机解码外部辅助（路线 C-1 阶段 0-1 探索性 PoC，
+#     详见 docs/投机解码外部辅助实施说明.md）---
+# 本地小模型每轮生成 γ 个草稿 token，外部大模型一次前向并行校验，接受则一次
+# 前进 k+1 个 token。输出分布严格等于 verify 模型（标准投机采样性质），
+# 因此语义是"以本地小模型加速外部大模型"，质量对齐外部端。
+# 前提：外部端必须支持 /v1/completions 的 per-token logprobs（纯 chat 接口不够），
+# 且 top_logprobs 的 key 可还原为 token id（vLLM --return-tokens-as-token-ids）。
+# ★ 数据作用域**不另设开关**：本路径把用户内容派生的草稿 token 送出集群，
+#   与路线 B 完全同一风险面，因此共用 QLH_EXTERNAL_DATA_SCOPE 硬门控。
+SPEC_ENABLED = _env_bool("QLH_SPEC_ENABLED", False)          # 投机解码总开关（默认关）
+SPEC_GAMMA = _env_int("QLH_SPEC_GAMMA", 4, min_val=1, max_val=16)   # 每轮草稿 token 数 γ
+SPEC_MAX_ROUNDS = _env_int("QLH_SPEC_MAX_ROUNDS", 64, min_val=1, max_val=4096)  # 单会话最大轮数
+SPEC_MAX_NEW_TOKENS = _env_int(
+    "QLH_SPEC_MAX_NEW_TOKENS", 128, min_val=1, max_val=4096,
+)                                                            # 单会话最大新 token 数
+# verify 端点：留空则回落到 QLH_EXTERNAL_* 同名配置，一个外部端点同时服务 B 与 C。
+# 凭据回落有额外约束：只有 BASE_URL 也是回落来的（B/C 同端点）才复用
+# EXTERNAL_API_KEY，避免把 B 的凭据发给另一台 verify 主机（见 speculative.py）。
+SPEC_VERIFY_BASE_URL = _env_first("QLH_SPEC_VERIFY_BASE_URL", default="")
+SPEC_VERIFY_API_KEY = os.environ.get("QLH_SPEC_VERIFY_API_KEY", "")
+SPEC_VERIFY_MODEL = _env_first("QLH_SPEC_VERIFY_MODEL", default="")
+SPEC_TIMEOUT = _env_int("QLH_SPEC_TIMEOUT", 60, min_val=1, max_val=3600)  # 单轮校验超时（秒）
+SPEC_CONNECT_TIMEOUT = _env_int("QLH_SPEC_CONNECT_TIMEOUT", 5, min_val=1, max_val=300)
+# 采样温度：0 = 贪心模式（接受当且仅当草稿 token == verify argmax）
+SPEC_TEMPERATURE = _env_float("QLH_SPEC_TEMPERATURE", 0.7, min_val=0.0, max_val=2.0)
+# 每个位置请求的 top-k logprobs：残差重采样的支撑集大小，越大越接近真实分布
+SPEC_TOP_LOGPROBS = _env_int("QLH_SPEC_TOP_LOGPROBS", 20, min_val=1, max_val=100)
+# 外部端是否为会话维护 KV / 已开前缀缓存（vLLM --enable-prefix-caching）。
+# 仅影响通信量指标口径（bytes_up vs bytes_up_ideal_stateful），不改变协议。
+SPEC_STATEFUL_VERIFY = _env_bool("QLH_SPEC_STATEFUL_VERIFY", False)
+SPEC_LABEL = _env_first("QLH_SPEC_LABEL", default="投机解码外部辅助")  # 展示名
 
 # --- 多模型实验支持 (P3) ---
 ACTIVE_MODEL_ID = "qwen-1_8b"            # 当前活跃的模型 ID

@@ -17,7 +17,9 @@ from task_provider import (
     LocalFullModelProvider,
     ModelIdentity,
     ProviderBusy,
+    ProviderExecutionError,
     ProviderRegistry,
+    StageRequest,
 )
 from task_worker_adapter import RemoteFullWorkerProvider
 from task_worker_protocol import build_message, canonical_sha256
@@ -229,6 +231,7 @@ def test_task_graph_chat_runs_three_local_stages_with_honest_metrics(task_graph_
     assert metrics["subproviders"] == ["local_full_model"]
     assert metrics["workflow_id"] == "wf_api12345"
     assert metrics["workflow_state"] == "completed"
+    assert metrics["partial_result"] is False
     assert metrics["stage_count"] == 3
     assert metrics["stage_attempt_count"] == 3
     assert metrics["nodes_planned"] == 1
@@ -255,6 +258,154 @@ def test_task_graph_chat_runs_three_local_stages_with_honest_metrics(task_graph_
         {"role": "user", "content": "question"},
         {"role": "assistant", "content": "final answer"},
     ]
+
+
+def test_task_graph_chat_reports_partial_candidate_degradation(
+    task_graph_api,
+    monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    prompts = []
+
+    def partial_chat(messages, max_tokens, temperature, top_p, **kwargs):
+        prompts.append(messages)
+        call_no = len(prompts)
+        if call_no == 1:
+            raise RuntimeError("candidate A failed with private detail")
+        content = "candidate B" if call_no == 2 else "partial final answer"
+        return {
+            "content": content,
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            },
+            "tokens_per_second": 2.5,
+            "model": "fake-model",
+        }
+
+    monkeypatch.setattr(manager, "chat", partial_chat)
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="question",
+        session_id="task-session",
+        max_new_tokens=64,
+        execution_mode="task_graph",
+        workflow_id="wf_apipartial1",
+    )))
+
+    assert response.content == "partial final answer"
+    assert response.metrics["partial_result"] is True
+    assert response.metrics["workflow_state"] == "completed"
+    assert "未完成候选摘要" in prompts[-1][-1]["content"]
+    assert "private detail" not in prompts[-1][-1]["content"]
+    workflow = coordinator.get("wf_apipartial1")
+    assert workflow["state"] == "completed"
+    assert workflow["partial_result"] is True
+    assert workflow["failed_stage_count"] == 1
+    assert workflow["completed_stage_count"] == 2
+
+
+def test_task_graph_aggregate_retry_is_not_reported_as_fallback(
+    task_graph_api,
+    monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    calls = 0
+
+    def retry_aggregate(messages, max_tokens, temperature, top_p, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise TimeoutError("transient aggregate timeout")
+        content = (
+            "candidate A" if calls == 1
+            else "candidate B" if calls == 2
+            else "recovered final answer"
+        )
+        return {
+            "content": content,
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+            },
+            "tokens_per_second": 2.5,
+            "model": "fake-model",
+        }
+
+    monkeypatch.setattr(manager, "chat", retry_aggregate)
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="question",
+        session_id="task-session",
+        max_new_tokens=64,
+        execution_mode="task_graph",
+        workflow_id="wf_apiaggretry",
+    )))
+
+    assert response.content == "recovered final answer"
+    assert response.metrics["fallback"] is False
+    assert response.metrics["fallback_reason"] == ""
+    assert response.metrics["stage_retry_count"] == 1
+    assert response.metrics["same_provider_retry_count"] == 1
+    assert response.metrics["reassignment_count"] == 0
+    assert response.metrics["retry_reason"] == "provider_execution_failed"
+    workflow = coordinator.get("wf_apiaggretry")
+    assert workflow["partial_result"] is False
+    assert workflow["same_provider_retry_count"] == 1
+
+
+def test_aggregate_runtime_error_is_not_marked_for_same_provider_retry(
+    task_graph_api,
+    monkeypatch,
+):
+    manager, _coordinator = task_graph_api
+    monkeypatch.setattr(
+        manager,
+        "chat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("permanent aggregate runtime failure")
+        ),
+    )
+    request = StageRequest(
+        workflow_id="wf_apipermanent1",
+        request_id="request-api-permanent",
+        stage_id="aggregate",
+        stage_type="aggregate",
+        provider_id="local_full_model",
+        dependencies={"candidate_a": {"content": "candidate"}},
+        root_input={"message": "question", "task_options": {}},
+    )
+
+    with pytest.raises(RuntimeError, match="permanent aggregate runtime failure"):
+        api_server._execute_task_worker_stage(request, threading.Event())
+
+
+def test_empty_aggregate_output_is_explicitly_same_provider_retryable(
+    task_graph_api,
+    monkeypatch,
+):
+    manager, _coordinator = task_graph_api
+    monkeypatch.setattr(
+        manager,
+        "chat",
+        lambda *args, **kwargs: {"content": "", "usage": {}},
+    )
+    request = StageRequest(
+        workflow_id="wf_apiemptyagg1",
+        request_id="request-api-empty-aggregate",
+        stage_id="aggregate",
+        stage_type="aggregate",
+        provider_id="local_full_model",
+        dependencies={"candidate_a": {"content": "candidate"}},
+        root_input={"message": "question", "task_options": {}},
+    )
+
+    with pytest.raises(ProviderExecutionError) as captured:
+        api_server._execute_task_worker_stage(request, threading.Event())
+
+    assert captured.value.code == "empty_provider_output"
+    assert captured.value.retryable is False
+    assert captured.value.same_provider_retryable is True
 
 
 def test_task_graph_manual_remote_stage_uses_explicit_provider_without_fallback(
@@ -1111,9 +1262,12 @@ def test_workflow_query_list_and_cancel_api(task_graph_api):
         "state": "completed",
         "result_ready": False,
         "terminal": True,
+        "partial_result": False,
         "recovered_after_restart": False,
         "recovery_reason": "",
         "retry_count": 0,
+        "same_provider_retry_count": 0,
+        "reassignment_count": 0,
         "retrying": False,
         "result_rejection_count": 0,
         "last_result_rejection_reason": "",
@@ -1153,7 +1307,9 @@ def test_workflow_observability_reports_retry_and_result_rejection():
     observability = api_server._workflow_observability({
         "state": "result_ready",
         "retry_count": 1,
+        "same_provider_retry_count": 1,
         "result_rejection_count": 1,
+        "partial_result": True,
         "stages": [
             {
                 "retry_count": 1,
@@ -1171,7 +1327,10 @@ def test_workflow_observability_reports_retry_and_result_rejection():
 
     assert observability["result_ready"] is True
     assert observability["terminal"] is False
+    assert observability["partial_result"] is True
     assert observability["retry_count"] == 1
+    assert observability["same_provider_retry_count"] == 1
+    assert observability["reassignment_count"] == 0
     assert observability["result_rejection_count"] == 1
     assert observability["last_result_rejection_reason"] == (
         "winner_already_committed"

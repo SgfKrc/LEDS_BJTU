@@ -479,6 +479,45 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     assert result["status"] == "ok"
 
 
+def test_load_model_reports_effective_cpu_quant(monkeypatch):
+    """CPU loader 归一为 FP32 后，API 状态不能继续上报请求的 FP16。"""
+    class FakeManager:
+        active_model_id = ""
+        is_loaded = False
+        _engine_type = "pytorch"
+        quant_type = None
+
+        def switch_model(self, **kwargs):
+            self.is_loaded = True
+            self.active_model_id = kwargs.get("model_id", "")
+            self.quant_type = "fp32"
+            return {
+                "success": True,
+                "model_id": self.active_model_id,
+                "model_name": "CPU PyTorch Model",
+                "error": None,
+            }
+
+    async def fake_get_status():
+        return {"current_quant": api_server.current_quant}
+
+    monkeypatch.setattr(api_server, "model_manager", FakeManager())
+    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(api_server, "current_quant", "int4")
+    monkeypatch.setattr(api_server, "kv_cache", None)
+    monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
+    monkeypatch.setattr(api_server, "get_status", fake_get_status)
+    monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
+
+    result = asyncio.run(api_server.load_model(api_server.LoadModelRequest(
+        engine="pytorch",
+        quant_type="fp16",
+    )))
+
+    assert api_server.current_quant == "fp32"
+    assert result["current_quant"] == "fp32"
+
+
 def test_load_model_rollback_on_failure(monkeypatch):
     """加载失败时 switch_model 应触发回滚，/api/models/load 应正确报告"""
     class FakeManager:
