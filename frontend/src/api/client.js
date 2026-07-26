@@ -162,6 +162,9 @@ export async function sendMessage(message, opts = {}) {
       task_graph_auto_remote: opts.taskGraphAutoRemote === true,
       workflow_id: opts.workflowId || null,
       generation_id: opts.generationId || null,
+      // 路线 B：外部推理服务按请求授权（缺省 false，数据不出集群）
+      allow_external: opts.allowExternal === true,
+      prefer_external: opts.preferExternal === true,
     }),
   });
 }
@@ -195,6 +198,9 @@ export async function sendMessageStream(message, opts = {}) {
       task_graph_auto_remote: opts.taskGraphAutoRemote === true,
       workflow_id: opts.workflowId || null,
       generation_id: opts.generationId || null,
+      // 路线 B：外部推理服务按请求授权（缺省 false，数据不出集群）
+      allow_external: opts.allowExternal === true,
+      prefer_external: opts.preferExternal === true,
     }),
   });
 

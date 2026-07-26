@@ -2,55 +2,99 @@ package com.qlh.inference.ui.theme
 
 import android.app.Activity
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 
 private val LightColorScheme = lightColorScheme(
-    primary = Ink,
-    onPrimary = Paper,
-    primaryContainer = Gray90,
-    onPrimaryContainer = Ink,
-    secondary = Gray40,
-    onSecondary = Paper,
-    secondaryContainer = SurfaceVariantLight,
-    onSecondaryContainer = Ink,
-    tertiary = Gray60,
-    background = Gray95,
-    onBackground = Ink,
+    primary = PrimaryLight,
+    onPrimary = OnPrimaryLight,
+    primaryContainer = PrimaryContainerLight,
+    onPrimaryContainer = OnPrimaryContainerLight,
+    secondary = SecondaryLight,
+    onSecondary = OnSecondaryLight,
+    secondaryContainer = SecondaryContainerLight,
+    onSecondaryContainer = OnSecondaryContainerLight,
+    tertiary = TertiaryLight,
+    onTertiary = OnTertiaryLight,
+    tertiaryContainer = TertiaryContainerLight,
+    onTertiaryContainer = OnTertiaryContainerLight,
+    error = ErrorLight,
+    onError = OnErrorLight,
+    errorContainer = ErrorContainerLight,
+    onErrorContainer = OnErrorContainerLight,
+    background = BackgroundLight,
+    onBackground = OnBackgroundLight,
     surface = SurfaceLight,
-    onSurface = Ink,
+    onSurface = OnSurfaceLight,
     surfaceVariant = SurfaceVariantLight,
-    onSurfaceVariant = Gray40,
-    outline = Gray80,
-    error = ErrorRed,
-    errorContainer = ErrorRedLight
+    onSurfaceVariant = OnSurfaceVariantLight,
+    outline = OutlineLight,
+    outlineVariant = OutlineVariantLight,
+    inverseSurface = InverseSurfaceLight,
+    inverseOnSurface = InverseOnSurfaceLight,
+    inversePrimary = InversePrimaryLight,
+    surfaceDim = SurfaceDimLight,
+    surfaceBright = SurfaceBrightLight,
+    surfaceContainerLowest = SurfaceContainerLowestLight,
+    surfaceContainerLow = SurfaceContainerLowLight,
+    surfaceContainer = SurfaceContainerLight,
+    surfaceContainerHigh = SurfaceContainerHighLight,
+    surfaceContainerHighest = SurfaceContainerHighestLight
 )
 
 private val DarkColorScheme = darkColorScheme(
-    primary = Paper,
-    onPrimary = PaperDark,
-    primaryContainer = Gray30,
-    onPrimaryContainer = Paper,
-    secondary = Gray80,
-    onSecondary = PaperDark,
-    secondaryContainer = SurfaceVariantDark,
-    onSecondaryContainer = Paper,
-    tertiary = Gray90,
-    background = PaperDark,
-    onBackground = Gray95,
+    primary = PrimaryDark,
+    onPrimary = OnPrimaryDark,
+    primaryContainer = PrimaryContainerDark,
+    onPrimaryContainer = OnPrimaryContainerDark,
+    secondary = SecondaryDark,
+    onSecondary = OnSecondaryDark,
+    secondaryContainer = SecondaryContainerDark,
+    onSecondaryContainer = OnSecondaryContainerDark,
+    tertiary = TertiaryDark,
+    onTertiary = OnTertiaryDark,
+    tertiaryContainer = TertiaryContainerDark,
+    onTertiaryContainer = OnTertiaryContainerDark,
+    error = ErrorDark,
+    onError = OnErrorDark,
+    errorContainer = ErrorContainerDark,
+    onErrorContainer = OnErrorContainerDark,
+    background = BackgroundDark,
+    onBackground = OnBackgroundDark,
     surface = SurfaceDark,
-    onSurface = Gray95,
+    onSurface = OnSurfaceDark,
     surfaceVariant = SurfaceVariantDark,
-    onSurfaceVariant = Gray80,
-    outline = Gray40,
-    error = ErrorRed,
-    errorContainer = Gray30
+    onSurfaceVariant = OnSurfaceVariantDark,
+    outline = OutlineDark,
+    outlineVariant = OutlineVariantDark,
+    inverseSurface = InverseSurfaceDark,
+    inverseOnSurface = InverseOnSurfaceDark,
+    inversePrimary = InversePrimaryDark,
+    surfaceDim = SurfaceDimDark,
+    surfaceBright = SurfaceBrightDark,
+    surfaceContainerLowest = SurfaceContainerLowestDark,
+    surfaceContainerLow = SurfaceContainerLowDark,
+    surfaceContainer = SurfaceContainerDark,
+    surfaceContainerHigh = SurfaceContainerHighDark,
+    surfaceContainerHighest = SurfaceContainerHighestDark
+)
+
+// 统一圆角体系：小控件 8dp，普通卡片 16dp，大容器 20dp+
+private val QlhShapes = Shapes(
+    extraSmall = RoundedCornerShape(8.dp),
+    small = RoundedCornerShape(12.dp),
+    medium = RoundedCornerShape(16.dp),
+    large = RoundedCornerShape(20.dp),
+    extraLarge = RoundedCornerShape(28.dp)
 )
 
 @Composable
@@ -74,6 +118,7 @@ fun QlhTheme(
     MaterialTheme(
         colorScheme = colorScheme,
         typography = QlhTypography,
+        shapes = QlhShapes,
         content = content
     )
 }

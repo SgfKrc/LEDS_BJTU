@@ -2,9 +2,12 @@
 
 **面向异构边缘设备的多引擎、可演进分布式大模型推理系统**
 
-模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控
+模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.7**
+**v0.1.8**（更新于 2026-07-26）
+
+> 📌 当前进度、能力边界与下一步计划：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
+> 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 
 ---
 
@@ -39,7 +42,11 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
-| 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天 |
+| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用，可直管远程 Tailscale 主节点 → [用法](#tui-管理菜单终端版跨平台) |
+| 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
+| 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
+| ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
+| 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
 
 **应用场景**：智能终端 · 物联网 · 边缘计算 · 教育科研
 
@@ -91,11 +98,20 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── 三种分布式拆分细化实施方案.md  # 层间待测试、任务链与张量并行实施方案
 │   ├── Android版本远期计划.md       # Android 端方案评估与规划
 │   ├── Android SAF模型存储方案.md   # Android SAF 外部模型目录方案
-│   └── Android llama.cpp Submodule迁移方案.md
+│   ├── Android llama.cpp Submodule迁移方案.md
+│   ├── 项目进展与下一步计划.md       # ★ 进度快照、能力边界、P0/P1/P2 下一步清单
+│   ├── 张量并行外部辅助与混合拆分调研方案.md  # ★ mesh 内 TP 不可行的量化论证 + 三条外部辅助路线
+│   ├── TP孤岛接入指南.md            # ★ 路线 A：孤岛=单逻辑高算力节点（PoC）
+│   ├── 外部推理服务Provider接入指南.md # ★ 路线 B：整请求外部路由 + 数据作用域门控（PoC）
+│   └── 投机解码外部辅助实施说明.md   # ★ 路线 C：draft-verify（默认关闭的实验路径）
 ├── src/                           # Python 源代码（PC 端）
 │   ├── config.py                  # 全局配置（网络/模型/KV/分层/运行模式/图算法阈值）
 │   ├── model_module.py            # 模型加载、量化、算子融合、层级拆分、前向推理
 │   ├── llama_engine.py            # llama.cpp 引擎封装（CPU/集显 GGUF 推理）
+│   ├── island_engine.py           # ★ TP 孤岛引擎（OpenAI 兼容端点 → 单逻辑节点，路线 A）
+│   ├── external_provider.py       # ★ 外部推理服务 Provider + 数据作用域门控（路线 B）
+│   ├── speculative.py             # ★ draft-verify 投机解码（默认关闭的实验路径，路线 C）
+│   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
 │   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存页管理、动态分配）
 │   ├── tcp_comm.py                # TCP主从通信（长连接、心跳、封包解包、张量序列化）
 │   ├── scheduler.py               # 任务调度（节点管理、层分配、流水线控制、请求队列）
@@ -140,7 +156,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（442 个）
+├── tests/                         # 单元测试（约 1051 个用例）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -178,10 +194,11 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 
 | 层级 | 功能 | 技术 |
 |------|------|------|
-| 应用层 | 可视化交互 & 节点管理 & 性能监控 | React + Jetpack Compose (Android) |
+| 应用层 | 可视化交互 & 节点管理 & 性能监控 | React + TUI（标准库）+ Jetpack Compose (Android) |
 | 调度层 | 任务调度、指令分发、状态管理、请求队列 | Python threading + 图算法 |
 | 通信层 | TCP长连接、粘包处理、心跳、张量序列化 | Python socket + struct |
-| 推理层 | 双引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU / Android) |
+| 推理层 | 多引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU / Android) / island *(PoC)* |
+| 外部辅助层 *(PoC)* | 整请求外发的路由与数据作用域门控、投机解码校验 | OpenAI 兼容 HTTP（vLLM / SGLang 等） |
 | 存储层 | 对话持久化、节点注册、配置管理 | PostgreSQL + 本地 JSON 降级 + Room (Android) |
 | 基础层 | 运行环境 | Python / CUDA / bitsandbytes / llama.cpp |
 
@@ -193,7 +210,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
-| Python | ≥ 3.10 | 开发环境: 3.12.10 |
+| Python | ≥ 3.10 | 开发环境 3.12.10；源码已核对可在 3.10 / 3.11 / 3.12 解析 |
 | PyTorch | ≥ 2.2.0 | CUDA 版本用于独显；CPU 版本用于集成显卡 |
 | **transformers** | **≥ 4.45, < 5.0** | ⚠️ 必须保持 4.x！5.x 移除了 `load_in_4bit`/`load_in_8bit` |
 | accelerate | ≥ 1.0.0 | 模型加载加速（bitsandbytes 依赖） |
@@ -395,6 +412,45 @@ python src/api_server.py
 ```
 
 > 系统会自动完成：节点注册 → 设备画像上报 → 层分配计算 → 分层配置推送。
+
+### TUI 管理菜单（终端版，跨平台）
+
+无浏览器环境（SSH、服务器、树莓派等）可用终端版管理菜单，功能对应 Web 管理面板（系统总览 / 节点管理 / 分布式与分层 / 请求队列 / 设备画像 / 日志 / 设置），纯 Python 标准库实现，支持 Windows 10+ / Linux / macOS：
+
+```bash
+# 先启动后端: python src/api_server.py，再运行（Windows 双击 start_tui.bat 亦可）
+./start_tui.sh                              # Linux / macOS
+start_tui.bat                               # Windows (自动 chcp 65001)
+python src/tui_admin.py --host 100.x.x.x    # 直接管理远程 Tailscale 主节点
+python src/tui_admin.py --plain             # 老终端/管道降级为纯文本编号菜单
+```
+
+### 外部算力辅助（三条路线，均默认关闭）
+
+张量并行在本项目的异构 Tailscale mesh 内不可行（每 token 需 48 次 all-reduce，20ms RTT 下仅同步开销就 ≥960ms/token，量化论证见[调研方案](docs/张量并行外部辅助与混合拆分调研方案.md) §1）。因此 TP 只留在集群**之外**的快速互联内，通过三条路线借力：
+
+| 路线 | 形态 | 开关 | 状态 |
+|------|------|------|------|
+| **A · TP 孤岛** | 集群外同构 GPU 子集群跑 TP，对集群呈现为**单个逻辑高算力节点**，承担整请求推理（不参与层拆分） | `QLH_ISLAND_ENABLED=1` + `QLH_ISLAND_BASE_URL` | 阶段 1 PoC，已验证 |
+| **B · 外部推理服务** | 整条请求按策略路由到集群外 OpenAI 兼容端点；**默认不出集群** | `QLH_EXTERNAL_ENABLED=1` + `QLH_EXTERNAL_DATA_SCOPE` | 阶段 1 PoC，已验证 |
+| **C · 投机解码** | 本地小模型起草 γ 个 token，外部大模型一次校验；跨慢网只传 token id | `QLH_SPEC_ENABLED=1`（默认关闭时实验端点 404） | 阶段 0-1 探索，**未接生产解码循环** |
+
+```bash
+# 路线 A：孤岛侧（多卡机/同 LAN 同构 GPU 组）
+vllm serve Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size 2 --host 0.0.0.0 --port 8000
+# 网关侧（跑 QLH，再照常连主节点即可）
+set QLH_ISLAND_ENABLED=1 && set QLH_ISLAND_BASE_URL=http://10.0.0.2:8000
+set QLH_ISLAND_GPU_COUNT=2 && set QLH_ISLAND_VRAM_GB=48 && set QLH_ISLAND_TP_SIZE=2
+python src/api_server.py
+
+# 路线 B：默认 opt_in —— 只有显式带 allow_external 的请求才可能出集群
+set QLH_EXTERNAL_ENABLED=1 && set QLH_EXTERNAL_BASE_URL=https://gpu-box.example.com:8000
+set QLH_EXTERNAL_DATA_SCOPE=opt_in
+curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
+     -d "{\"message\":\"...\",\"allow_external\":true,\"prefer_external\":true}"
+```
+
+> ⚠️ **数据边界**：路线 B / C 会把用户内容（含投机解码的草稿 token）送出集群。作用域档位 `deny` / `opt_in`（默认）/ `allow_all` 是安全边界而非性能开关，取值写错会 fail-closed 回落 `deny`。放开前请确认合规要求。
 
 ### 打包版（Windows 安装包）
 
@@ -619,6 +675,7 @@ python serve.py
 
 ### 设计文档
 
+- [项目进展与下一步计划](docs/项目进展与下一步计划.md) — **进度快照与决策入口**：能力总表、能力边界、P0/P1/P2 下一步清单
 - [项目技术说明（新人入门）](docs/项目技术说明.md) — KV、算子融合、模型量化、分布式架构、并发调度与通信协议
 - [文档状态与维护规则](docs/文档状态与清理清单.md) — 文档状态定义与后续维护规则
 - [整体架构](docs/整体架构.md)
@@ -635,6 +692,13 @@ python serve.py
 - [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分可行性
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
 - [Android llama.cpp Submodule 迁移方案](docs/Android%20llama.cpp%20Submodule迁移方案.md) — 锁定上游版本、离线缓存与维护窗口方案
+
+### 外部算力辅助（张量并行在异构 mesh 内不可行，改走集群外辅助）
+
+- [张量并行外部辅助与混合拆分调研方案](docs/张量并行外部辅助与混合拆分调研方案.md) — 为什么 mesh 内 TP 必死的通信量化、三条外部辅助路线、与层间流水线的组合可行性、RQ/实验/里程碑
+- [TP 孤岛接入指南](docs/TP孤岛接入指南.md) *(路线 A，PoC)* — 孤岛部署（vLLM/SGLang/llama.cpp rpc）、网关配置、验证与排障
+- [外部推理服务 Provider 接入指南](docs/外部推理服务Provider接入指南.md) *(路线 B，PoC)* — 数据作用域门控、按请求路由、故障回退
+- [投机解码外部辅助实施说明](docs/投机解码外部辅助实施说明.md) *(路线 C，实验)* — draft-verify 原理、分布等价性与已知偏差、接生产前的阻塞项
 
 ### 工程文档
 

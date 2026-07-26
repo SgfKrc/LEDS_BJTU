@@ -19,6 +19,9 @@ SMTP.md
 .idea/
 .claude/
 
+# Local-only documentation
+local_docs/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -61,3 +64,6 @@ packaging/__pycache__/
 packaging/.venv-packaging/
 .venv-packaging/
 .venv-packaging-cuda/
+
+# Temp / to-delete
+_to_delete/
