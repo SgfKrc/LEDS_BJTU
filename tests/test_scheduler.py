@@ -1031,6 +1031,39 @@ class TestVRAMConstraint:
         assert embedding_mb > 500
         assert lm_head_mb == embedding_mb
 
+        cpu_layer_mb, cpu_embedding_mb, cpu_lm_head_mb = (
+            sched._get_layer_memory_estimate_mb(
+                node_id="cpu_node",
+                fallback=(70, 580, 580),
+                quant_factors={"fp16": 1.0, "int4": 0.35},
+                configured_quant="int4",
+            )
+        )
+        assert cpu_layer_mb == pytest.approx(layer_mb * 2)
+        assert cpu_embedding_mb == pytest.approx(embedding_mb * 2)
+        assert cpu_lm_head_mb == pytest.approx(lm_head_mb * 2)
+
+    def test_original_qwen_cpu_split_memory_uses_fp32_baseline(
+            self, sched, monkeypatch):
+        import api_server as _api
+
+        manager = type("Manager", (), {
+            "model": type("Model", (), {
+                "config": type("QwenConfig", (), {"model_type": "qwen"})(),
+            })(),
+            "quant_type": "int4",
+        })()
+        monkeypatch.setattr(_api, "model_manager", manager)
+
+        estimate = sched._get_layer_memory_estimate_mb(
+            node_id="cpu_node",
+            fallback=(70, 580, 580),
+            quant_factors={"fp16": 1.0, "int4": 0.35},
+            configured_quant="int4",
+        )
+
+        assert estimate == (140.0, 1160.0, 1160.0)
+
     def test_vram_transfer_moves_only_excess_layers(self, sched, monkeypatch):
         assignments = [
             {"node_id": "gpu_node", "role": "master", "layers_count": 10,

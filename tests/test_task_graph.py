@@ -7,12 +7,14 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from task_graph import (
+    DEPENDENCY_FAILURES_KEY,
     StageSpec,
     TaskGraphCoordinator,
     TaskGraphError,
     WorkflowCancelled,
     WorkflowExecutionError,
 )
+from task_provider import ProviderExecutionError
 
 
 def test_dual_candidate_template_executes_dependencies_in_order():
@@ -66,6 +68,25 @@ def test_dual_candidate_template_executes_dependencies_in_order():
             "a",
             "acyclic",
         ),
+        (
+            [StageSpec("a", "x", minimum_successful_dependencies=1)],
+            "a",
+            "minimum successful dependencies",
+        ),
+        (
+            [StageSpec(
+                "a", "x", max_same_provider_retries=4,
+            )],
+            "a",
+            "same-Provider retries",
+        ),
+        (
+            [StageSpec(
+                "a", "x", max_same_provider_retries=1,
+            )],
+            "a",
+            "retry_safe=true",
+        ),
     ],
 )
 def test_validate_rejects_invalid_graphs(stages, final_stage, message):
@@ -73,7 +94,7 @@ def test_validate_rejects_invalid_graphs(stages, final_stage, message):
         TaskGraphCoordinator.validate(stages, final_stage)
 
 
-def test_stage_failure_marks_downstream_skipped_and_workflow_failed():
+def test_strict_dependency_failure_marks_downstream_skipped_and_workflow_failed():
     coordinator = TaskGraphCoordinator()
 
     def execute(stage, dependencies, root_input, cancel_event):
@@ -82,10 +103,19 @@ def test_stage_failure_marks_downstream_skipped_and_workflow_failed():
         return {"content": stage.stage_id}
 
     with pytest.raises(WorkflowExecutionError) as exc_info:
-        coordinator.run_template(
-            "dual_candidate",
+        coordinator.run(
+            [
+                StageSpec("candidate_a", "full_inference"),
+                StageSpec("candidate_b", "full_inference"),
+                StageSpec(
+                    "aggregate",
+                    "aggregate",
+                    depends_on=("candidate_a", "candidate_b"),
+                ),
+            ],
+            "aggregate",
             {"message": "question"},
-            execute,
+            execute_stage=execute,
             workflow_id="wf_failure1",
         )
 
@@ -96,6 +126,264 @@ def test_stage_failure_marks_downstream_skipped_and_workflow_failed():
     assert by_id["candidate_b"]["state"] == "failed"
     assert by_id["aggregate"]["state"] == "skipped"
     assert by_id["candidate_b"]["attempts"][0]["state"] == "failed"
+
+
+def test_dual_candidate_partial_failure_runs_aggregate_with_safe_summary():
+    coordinator = TaskGraphCoordinator()
+    aggregate_inputs = []
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        if stage.stage_id == "candidate_b":
+            raise RuntimeError("sensitive candidate failure detail")
+        if stage.stage_type == "aggregate":
+            aggregate_inputs.append(dependencies)
+            return {"content": dependencies["candidate_a"]["content"]}
+        return {"content": "surviving candidate"}
+
+    output, workflow = coordinator.run_template(
+        "dual_candidate",
+        {"message": "question"},
+        execute,
+        workflow_id="wf_partialok1",
+    )
+
+    assert output == {"content": "surviving candidate"}
+    assert workflow["state"] == "result_ready"
+    assert workflow["partial_result"] is True
+    assert workflow["completed_stage_count"] == 2
+    assert workflow["failed_stage_count"] == 1
+    assert aggregate_inputs == [{
+        "candidate_a": {"content": "surviving candidate"},
+        DEPENDENCY_FAILURES_KEY: {
+            "candidate_b": {
+                "state": "failed",
+                "error_code": "provider_execution_failed",
+            },
+        },
+    }]
+    assert "sensitive candidate failure detail" not in str(aggregate_inputs)
+    committed = coordinator.commit_result("wf_partialok1")
+    assert committed["state"] == "completed"
+    assert committed["partial_result"] is True
+    coordinator.close()
+
+
+def test_dual_candidate_both_fail_still_fails_without_aggregate():
+    coordinator = TaskGraphCoordinator()
+    calls = []
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        calls.append(stage.stage_id)
+        if stage.stage_type == "full_inference":
+            raise RuntimeError("candidate failed")
+        return {"content": "must not run"}
+
+    with pytest.raises(WorkflowExecutionError):
+        coordinator.run_template(
+            "dual_candidate",
+            {"message": "question"},
+            execute,
+            workflow_id="wf_partialno1",
+        )
+
+    snapshot = coordinator.get("wf_partialno1")
+    stages = {stage["stage_id"]: stage for stage in snapshot["stages"]}
+    assert snapshot["state"] == "failed"
+    assert snapshot["partial_result"] is False
+    assert stages["candidate_a"]["state"] == "failed"
+    assert stages["candidate_b"]["state"] == "failed"
+    assert stages["aggregate"]["state"] == "skipped"
+    assert "aggregate" not in calls
+    coordinator.close()
+
+
+def test_dual_candidate_aggregate_retries_once_on_same_local_provider():
+    coordinator = TaskGraphCoordinator()
+    aggregate_calls = 0
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        nonlocal aggregate_calls
+        if stage.stage_type == "aggregate":
+            aggregate_calls += 1
+            if aggregate_calls == 1:
+                raise ProviderExecutionError(
+                    "transient aggregate failure",
+                    code="provider_execution_failed",
+                    same_provider_retryable=True,
+                )
+            return {"content": "recovered aggregate"}
+        return {"content": stage.stage_id}
+
+    output, workflow = coordinator.run_template(
+        "dual_candidate",
+        {"message": "question"},
+        execute,
+        workflow_id="wf_aggretry1",
+    )
+
+    aggregate = next(
+        stage for stage in workflow["stages"]
+        if stage["stage_id"] == "aggregate"
+    )
+    assert output == {"content": "recovered aggregate"}
+    assert aggregate_calls == 2
+    assert aggregate["retry_count"] == 1
+    assert aggregate["same_provider_retry_count"] == 1
+    assert workflow["retry_count"] == 1
+    assert workflow["same_provider_retry_count"] == 1
+    assert [attempt["state"] for attempt in aggregate["attempts"]] == [
+        "failed", "completed",
+    ]
+    assert [attempt["lease_epoch"] for attempt in aggregate["attempts"]] == [
+        1, 2,
+    ]
+    coordinator.close()
+
+
+def test_same_provider_retry_rejects_permanent_provider_output_error():
+    coordinator = TaskGraphCoordinator()
+    aggregate_calls = 0
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        nonlocal aggregate_calls
+        if stage.stage_type == "aggregate":
+            aggregate_calls += 1
+            return "invalid provider output"
+        return {"content": stage.stage_id}
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        coordinator.run_template(
+            "dual_candidate",
+            {"message": "question"},
+            execute,
+            workflow_id="wf_noretrypermanent",
+        )
+
+    assert captured.value.stage_id == "aggregate"
+    snapshot = coordinator.get("wf_noretrypermanent")
+    aggregate = next(
+        stage for stage in snapshot["stages"]
+        if stage["stage_id"] == "aggregate"
+    )
+    assert aggregate_calls == 1
+    assert aggregate["retry_count"] == 0
+    assert len(aggregate["attempts"]) == 1
+    coordinator.close()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("permanent runtime failure"),
+        ProviderExecutionError(
+            "explicit permanent provider failure",
+            code="provider_execution_failed",
+            retryable=False,
+        ),
+        ProviderExecutionError(
+            "cross-provider-only failure",
+            code="provider_execution_failed",
+            retryable=True,
+            same_provider_retryable=False,
+        ),
+    ],
+)
+def test_same_provider_retry_requires_explicit_error_marker(failure):
+    coordinator = TaskGraphCoordinator()
+    aggregate_calls = 0
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        nonlocal aggregate_calls
+        if stage.stage_type == "aggregate":
+            aggregate_calls += 1
+            raise failure
+        return {"content": stage.stage_id}
+
+    with pytest.raises(WorkflowExecutionError):
+        coordinator.run_template(
+            "dual_candidate",
+            {"message": "question"},
+            execute,
+            workflow_id="wf_explicitretryflag",
+        )
+
+    aggregate = next(
+        stage for stage in coordinator.get("wf_explicitretryflag")["stages"]
+        if stage["stage_id"] == "aggregate"
+    )
+    assert aggregate_calls == 1
+    assert aggregate["retry_count"] == 0
+    assert len(aggregate["attempts"]) == 1
+    coordinator.close()
+
+
+def test_tolerant_side_branch_does_not_mask_strict_final_path_failure():
+    coordinator = TaskGraphCoordinator()
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        if stage.stage_id == "source_a":
+            raise RuntimeError("strict source failed")
+        return {"content": stage.stage_id}
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        coordinator.run(
+            [
+                StageSpec("source_a", "full_inference"),
+                StageSpec("source_b", "full_inference"),
+                StageSpec(
+                    "tolerant_side",
+                    "aggregate",
+                    depends_on=("source_a", "source_b"),
+                    minimum_successful_dependencies=1,
+                ),
+                StageSpec(
+                    "strict_path", "aggregate", depends_on=("source_a",),
+                ),
+                StageSpec(
+                    "final", "aggregate", depends_on=("strict_path",),
+                ),
+            ],
+            "final",
+            {"message": "question"},
+            execute_stage=execute,
+            workflow_id="wf_strictpathfailure",
+        )
+
+    assert captured.value.stage_id == "source_a"
+    assert "strict source failed" in str(captured.value)
+    assert "final stage did not complete" not in str(captured.value)
+    coordinator.close()
+
+
+def test_unrelated_tolerated_failure_does_not_mark_final_result_partial():
+    coordinator = TaskGraphCoordinator()
+
+    def execute(stage, dependencies, root_input, cancel_event):
+        if stage.stage_id == "side_failure":
+            raise RuntimeError("side branch failed")
+        return {"content": stage.stage_id}
+
+    output, snapshot = coordinator.run(
+        [
+            StageSpec("side_failure", "full_inference"),
+            StageSpec("final", "full_inference"),
+            StageSpec(
+                "side_join",
+                "aggregate",
+                depends_on=("side_failure", "final"),
+                minimum_successful_dependencies=1,
+            ),
+        ],
+        "final",
+        {"message": "question"},
+        execute_stage=execute,
+        workflow_id="wf_unrelatedfailure",
+    )
+
+    assert output == {"content": "final"}
+    assert snapshot["failed_stage_count"] == 1
+    assert snapshot["partial_result"] is False
+    coordinator.close()
 
 
 def test_cancel_running_workflow_discards_stage_result():
@@ -237,9 +525,12 @@ def test_workflow_list_filters_by_session():
 
 def test_cancel_during_final_stage_wins_over_completed_state():
     coordinator = TaskGraphCoordinator()
+    aggregate_calls = 0
 
     def execute(stage, dependencies, root_input, cancel_event):
+        nonlocal aggregate_calls
         if stage.stage_id == "aggregate":
+            aggregate_calls += 1
             cancel_event.set()
         return {"content": stage.stage_id}
 
@@ -254,6 +545,7 @@ def test_cancel_during_final_stage_wins_over_completed_state():
     snapshot = coordinator.get("wf_finalcancel")
     assert snapshot["state"] == "cancelled"
     assert snapshot["stages"][-1]["output_available"] is False
+    assert aggregate_calls == 1
 
 
 def test_provider_error_after_cancel_is_reported_as_cancelled():

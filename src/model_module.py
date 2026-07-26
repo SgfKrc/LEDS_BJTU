@@ -10,9 +10,10 @@
 6. 模型前向推理入口
 
 引擎选择逻辑:
+  - TP 孤岛启用 (QLH_ISLAND_ENABLED) → island（OpenAI 兼容端点整请求转发）
   - CUDA 可用 → PyTorch + bitsandbytes（INT4 量化，显存 ~1.75 GB）
   - CPU / 集显 → llama.cpp + GGUF（Q4_K_M 量化，内存 ~1.2 GB）
-  - 手动覆盖: config.INFERENCE_ENGINE = "pytorch" | "llama_cpp"
+  - 手动覆盖: config.INFERENCE_ENGINE = "pytorch" | "llama_cpp" | "island"
 
 依赖:
   PyTorch 栈: torch, transformers, bitsandbytes
@@ -60,6 +61,13 @@ from config import (
 import model_config as mc
 
 logger = logging.getLogger(__name__)
+
+
+def _select_layer_runtime() -> Tuple[str, torch.dtype]:
+    """Choose a stable dtype for selectively loaded pipeline layers."""
+    if torch.cuda.is_available():
+        return "cuda:0", torch.float16
+    return "cpu", torch.float32
 
 
 def _serialized_model_access(method):
@@ -119,7 +127,9 @@ class ModelManager:
 
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
-        self._engine_type: str = ""  # "pytorch" | "llama_cpp"
+        # TP 孤岛引擎（延迟导入；OpenAI 兼容端点整请求转发）
+        self._island_engine = None  # IslandEngine 实例
+        self._engine_type: str = ""  # "pytorch" | "llama_cpp" | "island"
 
         # P3: 多模型支持 — 当前活跃的模型 ID
         self._active_model_id: str = mc.DEFAULT_MODEL_ID
@@ -137,9 +147,11 @@ class ModelManager:
 
     @property
     def is_loaded(self) -> bool:
-        """模型是否已加载（兼容 PyTorch 和 llama.cpp 双引擎）。"""
+        """模型是否已加载（兼容 PyTorch / llama.cpp / 孤岛三引擎）。"""
         if self._engine_type == "llama_cpp":
             return self._llama_engine is not None
+        if self._engine_type == "island":
+            return self._island_engine is not None
         return self.model is not None
 
     # ================================================================
@@ -152,8 +164,11 @@ class ModelManager:
         根据硬件环境和配置选择推理引擎。
 
         决策优先级:
-          1. config.INFERENCE_ENGINE 显式指定（"pytorch" / "llama_cpp"）
-          2. "auto" → 检测 CUDA 可用性
+          1. config.INFERENCE_ENGINE == "island" 显式指定孤岛引擎
+          2. QLH_ISLAND_ENABLED + QLH_ISLAND_BASE_URL → "island"
+             （孤岛网关节点整机作为孤岛前端，覆盖本地引擎默认值）
+          3. config.INFERENCE_ENGINE 显式指定（"pytorch" / "llama_cpp"）
+          4. "auto" → 检测 CUDA 可用性
              - CUDA 可用 → "pytorch"
              - CUDA 不可用 → "llama_cpp"
 
@@ -161,8 +176,19 @@ class ModelManager:
             profile: 设备画像 dict（可选，用于更精确的判断）
 
         Returns:
-            "pytorch" 或 "llama_cpp"
+            "pytorch" / "llama_cpp" / "island"
         """
+        # 动态读取 config（api_server 会在运行时改写 config 模块属性）
+        import config as _cfg
+
+        # TP 孤岛：显式指定或已启用即优先（网关节点专用，详见调研方案 §2.1）
+        if getattr(_cfg, "INFERENCE_ENGINE", INFERENCE_ENGINE) == "island":
+            logger.info("引擎: island (手动指定)")
+            return "island"
+        if getattr(_cfg, "ISLAND_ENABLED", False) and getattr(_cfg, "ISLAND_BASE_URL", ""):
+            logger.info("引擎: island (QLH_ISLAND_ENABLED 已启用)")
+            return "island"
+
         # 手动覆盖
         if INFERENCE_ENGINE == "pytorch":
             logger.info("引擎: PyTorch (手动指定)")
@@ -274,8 +300,6 @@ class ModelManager:
         resolved_path = model_path
         resolved_id = model_id or mc.DEFAULT_MODEL_ID
         cfg = mc.get_model_config(resolved_id, db_experimental_models) if model_id else None
-        if model_id and cfg is None and not resolved_path:
-            raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
 
         # 确定引擎（尊重 model_type 约束）
         # P3修复: 允许调用者通过 engine 参数强制选择引擎
@@ -283,6 +307,22 @@ class ModelManager:
             resolved_engine = engine
         else:
             resolved_engine = self.select_engine(profile)
+
+        # ---- TP 孤岛引擎：无本地模型文件，"加载" = 健康检查 + 解析后端模型名 ----
+        # 孤岛模型不进本地注册表（无落盘 artifact），跳过注册表/文件校验。
+        if resolved_engine == "island":
+            self._engine_type = "island"
+            self._load_island(profile)
+            self._active_model_id = resolved_id
+            self._previous_engine_type = self._engine_type
+            self._previous_quant_type = self.quant_type
+            # 孤岛节点没有可回退的本地完整模型
+            self._full_model_path = None
+            self._full_model_quant_type = None
+            return
+
+        if model_id and cfg is None and not resolved_path:
+            raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
         # model_type 强制约束：GGUF-only 模型必须用 llama.cpp；
         # Safetensors-only 模型在 CPU 上仍需走 PyTorch（或报错）
         if resolved_id != mc.DEFAULT_MODEL_ID:
@@ -370,6 +410,14 @@ class ModelManager:
                 pass
             self._llama_engine = None
 
+        # --- 孤岛引擎清理（断开 HTTP 客户端）---
+        if self._island_engine is not None:
+            try:
+                self._island_engine.unload()
+            except Exception:
+                pass
+            self._island_engine = None
+
         # --- GPU 显存回收 ---
         try:
             import gc
@@ -412,7 +460,7 @@ class ModelManager:
             model_id: 目标模型唯一标识
             quant_type: 量化精度（默认使用当前精度或 QUANT_TYPE）
             profile: 设备画像
-            engine: 推理引擎 "pytorch" | "llama_cpp" | "auto" (None=auto)
+            engine: 推理引擎 "pytorch" | "llama_cpp" | "island" | "auto" (None=auto)
             db_experimental_models: DB 注册的实验模型列表（P3修复：支持 DB 模型查找）。
 
         Returns:
@@ -783,13 +831,13 @@ class ModelManager:
         if not files_to_keys:
             raise FileNotFoundError("Qwen2 模型目录中未找到分层 safetensors 权重")
 
-        use_cuda = torch.cuda.is_available()
-        target_device = "cuda:0" if use_cuda else "cpu"
-        target_dtype = torch.float16
+        target_device, target_dtype = _select_layer_runtime()
+        runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE
-        if requested_quant in {"int4", "int8"}:
+        if requested_quant != runtime_quant:
             logger.info(
-                "分层选择性加载暂以 FP16 执行（请求量化=%s），仅加载 %s-%s 层",
+                "分层选择性加载以 %s 执行（请求量化=%s），仅加载 %s-%s 层",
+                runtime_quant.upper(),
                 requested_quant,
                 start_layer,
                 end_layer,
@@ -827,7 +875,7 @@ class ModelManager:
             local_files_only=True,
         )
         self._model_path = model_path
-        self.quant_type = "fp16"
+        self.quant_type = runtime_quant
         self._total_model_layers = total_layers
         self._model_layers = end_layer - start_layer
         logger.info(
@@ -867,11 +915,23 @@ class ModelManager:
         if total_layers <= 0:
             raise RuntimeError("Qwen config 缺少 num_hidden_layers")
 
-        # 原版 Qwen 会在构造时按机器能力自动切换精度和 FlashAttention。
-        # 分布式工件固定为 FP16，避免 CUDA 主节点和 CPU worker 产生不同模型。
+        target_device, target_dtype = _select_layer_runtime()
+        use_cuda = target_device.startswith("cuda")
+        runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
+        requested_quant = quant_type or QUANT_TYPE
+        if requested_quant != runtime_quant:
+            logger.info(
+                "分层选择性加载以 %s 执行（请求量化=%s），仅加载 %s-%s 层",
+                runtime_quant.upper(),
+                requested_quant,
+                start_layer,
+                end_layer,
+            )
+        # Original Qwen reads these flags while constructing its remote-code model.
+        # CPU workers use FP32; hidden states are cast at each pipeline boundary.
         config.bf16 = False
-        config.fp16 = True
-        config.fp32 = False
+        config.fp16 = use_cuda
+        config.fp32 = not use_cuda
         config.use_flash_attn = False
 
         old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
@@ -920,8 +980,6 @@ class ModelManager:
         if not files_to_keys:
             raise FileNotFoundError("Qwen 模型目录中未找到分层 safetensors 权重")
 
-        target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        target_dtype = torch.float16
         loaded_keys = set()
         for filename, keys in files_to_keys.items():
             shard_path = os.path.join(model_path, filename)
@@ -955,7 +1013,7 @@ class ModelManager:
             local_files_only=True,
         )
         self._model_path = model_path
-        self.quant_type = "fp16"
+        self.quant_type = runtime_quant
         self._total_model_layers = total_layers
         self._model_layers = end_layer - start_layer
         logger.info(
@@ -1006,7 +1064,8 @@ class ModelManager:
         """确保当前模型为完整模型；流水线裁剪后回退本地推理前调用。"""
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
-        if self._engine_type == "llama_cpp":
+        # llama.cpp / 孤岛引擎始终是"完整模型"语义，不存在层裁剪
+        if self._engine_type in ("llama_cpp", "island"):
             return
         if (
             self._engine_type == "pytorch"
@@ -1029,6 +1088,27 @@ class ModelManager:
             quant_type=q,
             profile=profile,
             engine=engine or "pytorch",
+        )
+
+    def _load_island(self, profile: dict = None) -> None:
+        """
+        连接 TP 孤岛引擎（OpenAI 兼容端点）。
+
+        无本地模型文件："加载" = GET /v1/models 健康检查 + 解析后端模型名。
+        端点/凭据/超时均取自 config.QLH_ISLAND_* 配置。
+        """
+        from island_engine import IslandEngine
+
+        engine = IslandEngine()
+        engine.load_model()
+        self._island_engine = engine
+        # model_path 记录脱敏后的端点，供状态上报/日志展示（不含凭据）
+        self._model_path = engine.masked_base_url
+        self.quant_type = None
+
+        logger.info(
+            f"✅ 孤岛引擎就绪 (整请求转发): endpoint={engine.masked_base_url}, "
+            f"model={engine.model_name}"
         )
 
     def _load_llama_cpp(self, model_path: str = None, profile: dict = None) -> None:
@@ -1088,9 +1168,10 @@ class ModelManager:
         profile: dict = None,
     ) -> None:
         """
-        加载 PyTorch + Transformers 模型（CUDA 路径）。
+        加载 PyTorch + Transformers 模型。
 
         核心逻辑:
+        - CPU: 使用 torch.float32，规避半精度 CPU 算子不兼容
         - fp16: 直接以 torch.float16 加载，显存 ~3.5 GB
         - int8: bitsandbytes 8-bit 量化加载，显存 ~2.3 GB
         - int4: bitsandbytes 4-bit NF4 双重量化加载，显存 ~1.8 GB
@@ -1129,13 +1210,18 @@ class ModelManager:
         if not use_cuda:
             if self.quant_type in ("int4", "int8"):
                 logger.warning(
-                    f"⚠️ bitsandbytes {self.quant_type} 量化不支持 CPU，回退到 FP16 CPU 推理"
+                    f"⚠️ bitsandbytes {self.quant_type} 量化不支持 CPU，回退到 FP32 CPU 推理"
                 )
                 logger.warning(
                     f"💡 建议切换引擎为 llama.cpp (设置 INFERENCE_ENGINE='llama_cpp') "
                     f"以获得更好的 CPU 推理性能（3-5x 加速）"
                 )
-                self.quant_type = "fp16"
+            elif self.quant_type != "fp32":
+                logger.info(
+                    "CPU PyTorch 推理将请求精度 %s 调整为 FP32，以保证算子兼容性",
+                    self.quant_type,
+                )
+            self.quant_type = "fp32"
 
             cpu_cores = profile.get("cpu", {}).get("physical_cores", 4) if profile else 4
             omp_threads = max(2, cpu_cores // 2)
@@ -1146,7 +1232,7 @@ class ModelManager:
             load_kwargs: Dict[str, Any] = dict(
                 device_map={"": "cpu"},
                 trust_remote_code=TRUST_REMOTE_CODE,
-                torch_dtype=torch.float16,
+                torch_dtype=torch.float32,
             )
         else:
             # ---- CUDA 路径 ----
@@ -1257,6 +1343,18 @@ class ModelManager:
             if self._llama_engine is None:
                 raise RuntimeError("llama.cpp 引擎未加载，请先调用 load_model()")
             return self._llama_engine.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            )
+
+        elif self._engine_type == "island":
+            if self._island_engine is None:
+                raise RuntimeError("孤岛引擎未连接，请先调用 load_model()")
+            return self._island_engine.chat(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -1395,6 +1493,17 @@ class ModelManager:
             if self._llama_engine is None:
                 raise RuntimeError("llama.cpp 引擎未加载")
             yield from self._llama_engine.chat_stream(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            )
+        elif self._engine_type == "island":
+            if self._island_engine is None:
+                raise RuntimeError("孤岛引擎未连接")
+            yield from self._island_engine.chat_stream(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -1965,11 +2074,21 @@ class ModelManager:
                 #   flash_attention_2 → None（flash 内核自行处理因果掩码）
                 #   sdpa + 纯因果 → None（SDPA is_causal 路径）
                 #   eager / 含填充 → 4D (batch,1,seq,seq) 因果掩码
+                mask_fallback_error: Optional[Exception] = None
+                mask_parameters = {}
                 try:
                     from transformers.models.qwen2.modeling_qwen2 import create_causal_mask
-                    mask_parameters = inspect.signature(
-                        create_causal_mask
-                    ).parameters
+                except (ImportError, AttributeError) as exc:
+                    mask_fallback_error = exc
+                else:
+                    try:
+                        mask_parameters = inspect.signature(
+                            create_causal_mask
+                        ).parameters
+                    except (TypeError, ValueError) as exc:
+                        mask_fallback_error = exc
+
+                if mask_fallback_error is None:
                     mask_kwargs = {
                         "config": transformer.config,
                         "attention_mask": (
@@ -1984,20 +2103,32 @@ class ModelManager:
                     elif "inputs_embeds" in mask_parameters:
                         mask_kwargs["inputs_embeds"] = hidden_states
                     else:
-                        raise RuntimeError(
+                        mask_fallback_error = TypeError(
                             "create_causal_mask 缺少已知的输入张量参数"
                         )
-                    if "cache_position" in mask_parameters:
+                    if (
+                        mask_fallback_error is None
+                        and "cache_position" in mask_parameters
+                    ):
                         mask_kwargs["cache_position"] = cache_position
-                    causal_mask = create_causal_mask(**mask_kwargs)
-                except (ImportError, AttributeError):
+                    if mask_fallback_error is None:
+                        # Runtime input/cache failures are not version mismatches.
+                        causal_mask = create_causal_mask(**mask_kwargs)
+
+                if mask_fallback_error is not None:
                     # transformers 4.x 回退：手动构建 4D 因果掩码
+                    logger.debug(
+                        "create_causal_mask unavailable or incompatible; "
+                        "using manual mask: %s",
+                        mask_fallback_error,
+                    )
                     query_len = hidden_states.shape[1]
                     target_len = past_seen_tokens + query_len
                     causal_mask = torch.full(
                         (query_len, target_len),
                         float('-inf'),
                         device=device,
+                        dtype=hidden_states.dtype,
                     )
                     causal_mask = torch.triu(
                         causal_mask, diagonal=past_seen_tokens + 1
@@ -2104,6 +2235,11 @@ class ModelManager:
         """是否使用 PyTorch 引擎。"""
         return self._engine_type == "pytorch"
 
+    @property
+    def is_island(self) -> bool:
+        """是否使用 TP 孤岛引擎。"""
+        return self._engine_type == "island"
+
     def get_device(self) -> torch.device:
         """获取当前模型所在设备（PyTorch 引擎）"""
         if self.model is not None:
@@ -2127,6 +2263,14 @@ class ModelManager:
             info["model_path"] = self._model_path
             return info
 
+        if self._engine_type == "island" and self._island_engine:
+            info = self._island_engine.get_model_info()
+            info["model_id"] = self._active_model_id
+            # 孤岛节点对外展示后端模型名（凭据已在 base_url 中脱敏）
+            info["model_name"] = info.get("model") or model_name
+            info["model_path"] = info.get("base_url", "")
+            return info
+
         info = {
             "model_id": self._active_model_id,
             "engine": "pytorch",
@@ -2145,9 +2289,11 @@ class ModelManager:
         return info
 
     def get_memory_usage(self) -> dict:
-        """获取当前显存/内存占用，用于性能监控（双引擎兼容）"""
+        """获取当前显存/内存占用，用于性能监控（多引擎兼容）"""
         if self._engine_type == "llama_cpp" and self._llama_engine:
             return self._llama_engine.get_memory_usage()
+        if self._engine_type == "island" and self._island_engine:
+            return self._island_engine.get_memory_usage()
 
         result = {}
         if torch.cuda.is_available():
@@ -2157,9 +2303,11 @@ class ModelManager:
         return result
 
     def reset_kv_cache(self) -> None:
-        """清空 KV 缓存（双引擎兼容）"""
+        """清空 KV 缓存（多引擎兼容）"""
         if self._engine_type == "llama_cpp" and self._llama_engine:
             self._llama_engine.reset_kv_cache()
+        if self._engine_type == "island" and self._island_engine:
+            self._island_engine.reset_kv_cache()
         # PyTorch: KV cache 由 transformers generate() 内部管理，每次调用自动重置
 
     # ================================================================

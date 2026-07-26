@@ -805,6 +805,7 @@ class TestLoadLayerRangeIntegration:
             "from_pretrained",
             lambda *args, **kwargs: dummy_tokenizer,
         )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
         mgr = ModelManager()
         mgr.load_layer_range(
@@ -824,10 +825,17 @@ class TestLoadLayerRangeIntegration:
         assert mgr.model.lm_head is not None
         assert mgr.tokenizer is dummy_tokenizer
         assert mgr.active_model_id == "tiny-qwen2"
+        assert mgr.quant_type == "fp32"
         assert all(parameter.device.type != "meta" for parameter in mgr.model.parameters())
+        assert all(parameter.dtype == torch.float32 for parameter in mgr.model.parameters())
 
-        result = mgr.forward_layers(hidden_states=torch.randn(1, 3, 128))
+        # CUDA 主节点经网络送来的 FP16 hidden state 必须在 CPU worker
+        # 边界转换为本地模型的 FP32，不能把半精度继续送入 CPU 算子。
+        result = mgr.forward_layers(
+            hidden_states=torch.randn(1, 3, 128, dtype=torch.float16)
+        )
         assert result["logits"].shape == (1, 3, TINY_CONFIG.vocab_size)
+        assert result["logits"].dtype == torch.float32
 
     def test_two_selectively_loaded_nodes_match_full_qwen2(
         self,
@@ -838,13 +846,14 @@ class TestLoadLayerRangeIntegration:
         import model_module
 
         torch.manual_seed(2026)
-        source = _make_tiny_model().eval().half()
+        source = _make_tiny_model().eval()
         source.save_pretrained(tmp_path, safe_serialization=True)
         monkeypatch.setattr(
             model_module.AutoTokenizer,
             "from_pretrained",
             lambda *args, **kwargs: object(),
         )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
         first = ModelManager()
         last = ModelManager()
         first.load_layer_range(
@@ -1483,6 +1492,78 @@ class TestTransformers5xCompatibility:
         # flash/sdpa 返回 None，eager 返回 4D tensor
         assert causal_mask is None or isinstance(causal_mask, torch.Tensor)
 
+    def test_fp16_manual_causal_mask_matches_attention_dtype(self, mgr):
+        """The transformers 4.x fallback mask must match FP16 Q/K tensors."""
+        mgr.model.half()
+
+        result = mgr.forward_layers(
+            input_ids=torch.tensor([[5, 8, 2]], dtype=torch.long),
+            use_cache=True,
+        )
+
+        assert result["logits"].dtype == torch.float16
+
+    @pytest.mark.parametrize(
+        "runtime_error",
+        [
+            TypeError("simulated runtime type failure"),
+            ValueError("simulated invalid cache state"),
+        ],
+    )
+    def test_create_causal_mask_runtime_error_propagates(
+        self, mgr, monkeypatch, runtime_error,
+    ):
+        """Runtime input/cache failures must not be mistaken for API drift."""
+        from transformers.models.qwen2 import modeling_qwen2
+
+        def incompatible_mask(
+            config,
+            attention_mask,
+            past_key_values,
+            position_ids,
+            inputs_embeds,
+            cache_position=None,
+        ):
+            raise runtime_error
+
+        monkeypatch.setattr(
+            modeling_qwen2,
+            "create_causal_mask",
+            incompatible_mask,
+            raising=False,
+        )
+
+        with pytest.raises(type(runtime_error), match=str(runtime_error)):
+            mgr.forward_layers(
+                input_ids=torch.tensor([[5, 8, 2]], dtype=torch.long),
+                use_cache=True,
+            )
+
+    def test_create_causal_mask_unknown_signature_falls_back(
+        self,
+        mgr,
+        monkeypatch,
+    ):
+        """未来版本更改输入参数名时应降级到手动掩码。"""
+        import transformers.models.qwen2.modeling_qwen2 as qwen2_module
+
+        def incompatible_mask(config, attention_mask, past_key_values):
+            raise AssertionError("签名不兼容时不应调用该函数")
+
+        monkeypatch.setattr(
+            qwen2_module,
+            "create_causal_mask",
+            incompatible_mask,
+            raising=False,
+        )
+
+        result = mgr.forward_layers(
+            input_ids=torch.tensor([[1, 2, 3]]),
+            use_cache=False,
+        )
+
+        assert result["logits"].shape == (1, 3, TINY_CONFIG.vocab_size)
+
     def test_causal_mask_fallback_on_import_error(self, mgr):
         """transformers 4.x 无 create_causal_mask 时应回退到手动构建（BUG C1 修复验证）。"""
         input_ids = torch.tensor([[5, 8, 2]], dtype=torch.long)
@@ -1517,6 +1598,7 @@ class TestTransformers5xCompatibility:
                     (seq_len, seq_len),
                     float('-inf'),
                     device=device,
+                    dtype=hidden_states.dtype,
                 )
                 causal_mask = torch.triu(causal_mask, diagonal=1)
                 causal_mask = causal_mask[None, None, :, :].expand(
@@ -1529,6 +1611,7 @@ class TestTransformers5xCompatibility:
                 )
                 # 验证回退生成的因果掩码
                 assert causal_mask.shape == (1, 1, seq_len, seq_len)
+                assert causal_mask.dtype == hidden_states.dtype
                 # 上三角应为 -inf（因果约束）
                 assert torch.isinf(causal_mask[0, 0, 0, 1])
                 # 对角线及以下应为 0（可 attending）
@@ -1614,6 +1697,59 @@ class TestTransformers5xCompatibility:
 # ================================================================
 # select_engine 测试（P3 多模型支持 — 引擎选择逻辑）
 # ================================================================
+
+class TestLayerRuntimeSelection:
+    def test_cpu_layers_use_float32(self, monkeypatch):
+        import model_module
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        assert model_module._select_layer_runtime() == ("cpu", torch.float32)
+
+    def test_cuda_layers_use_float16(self, monkeypatch):
+        import model_module
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+        assert model_module._select_layer_runtime() == ("cuda:0", torch.float16)
+
+    @pytest.mark.parametrize("requested_quant", ["fp16", "fp32", "int4", "int8"])
+    def test_full_cpu_pytorch_load_uses_float32(
+        self,
+        monkeypatch,
+        requested_quant,
+    ):
+        """分层 worker 回退完整模型时，状态与实际 CPU dtype 必须一致。"""
+        import model_module
+
+        captured = {}
+        fake_model = _make_tiny_model()
+
+        def fake_from_pretrained(*args, **kwargs):
+            captured.update(kwargs)
+            return fake_model
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(model_module, "USE_COMPILE", False)
+        monkeypatch.setattr(
+            model_module.AutoModelForCausalLM,
+            "from_pretrained",
+            fake_from_pretrained,
+        )
+        monkeypatch.setattr(
+            model_module.AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: object(),
+        )
+
+        mgr = ModelManager()
+        mgr._load_pytorch("unused-model", quant_type=requested_quant)
+
+        assert captured["device_map"] == {"": "cpu"}
+        assert captured["torch_dtype"] == torch.float32
+        assert mgr.quant_type == "fp32"
+        assert next(mgr.model.parameters()).dtype == torch.float32
+
 
 class TestSelectEngine:
     """测试 ModelManager.select_engine() 静态方法"""

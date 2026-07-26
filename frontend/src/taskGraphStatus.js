@@ -41,6 +41,15 @@ export function normalizeTaskGraphWorkflow(workflow) {
   const retryCount = safeCount(
     observability.retry_count ?? workflow.retry_count ?? sumStages(stages, 'retry_count'),
   );
+  const sameProviderRetryCount = safeCount(
+    observability.same_provider_retry_count
+      ?? workflow.same_provider_retry_count
+      ?? sumStages(stages, 'same_provider_retry_count'),
+  );
+  const reassignmentCount = safeCount(
+    observability.reassignment_count
+      ?? Math.max(0, retryCount - sameProviderRetryCount),
+  );
   const rejectionCount = safeCount(
     observability.result_rejection_count
       ?? workflow.result_rejection_count
@@ -64,9 +73,12 @@ export function normalizeTaskGraphWorkflow(workflow) {
   const providers = Array.isArray(observability.actual_providers)
     ? observability.actual_providers.filter(Boolean)
     : [];
+  const partialResult = Boolean(
+    observability.partial_result || workflow.partial_result,
+  );
   const tone = recovered || state === 'failed'
     ? 'error'
-    : (state === 'result_ready' || retryCount > 0 || rejectionCount > 0 ? 'warning' : (state === 'completed' ? 'success' : 'active'));
+    : (state === 'result_ready' || partialResult || retryCount > 0 || rejectionCount > 0 ? 'warning' : (state === 'completed' ? 'success' : 'active'));
 
   return {
     workflowId: String(workflow.workflow_id || ''),
@@ -74,11 +86,14 @@ export function normalizeTaskGraphWorkflow(workflow) {
     stateLabel: STATE_LABELS[state] || state,
     tone,
     resultReady: state === 'result_ready',
+    partialResult,
     terminal: ['completed', 'failed', 'cancelled'].includes(state),
     recovered,
     recoveryReason,
     recoveryLabel: RECOVERY_LABELS[recoveryReason] || (recovered ? '重启恢复失败' : ''),
     retryCount,
+    sameProviderRetryCount,
+    reassignmentCount,
     rejectionCount,
     rejectionReason,
     rejectionLabel: REJECTION_LABELS[rejectionReason] || (rejectionCount > 0 ? '结果已拒绝' : ''),

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import task_graph as task_graph_module
 from task_graph import (
+    StageSpec,
     TaskGraphCoordinator,
     WorkflowCancelled,
     WorkflowExecutionError,
@@ -358,13 +359,14 @@ def test_release_failure_does_not_hide_the_primary_execution_error():
     coordinator = TaskGraphCoordinator(provider_registry=registry)
 
     with pytest.raises(WorkflowExecutionError) as captured:
-        coordinator.run_template(
-            "dual_candidate",
+        coordinator.run(
+            [StageSpec("answer", "full_inference")],
+            "answer",
             {"message": "question"},
             workflow_id="wf_releasefail",
         )
 
-    assert captured.value.stage_id == "candidate_a"
+    assert captured.value.stage_id == "answer"
     assert "primary execution failure" in str(captured.value)
     assert any(
         "reservation cleanup also failed" in note

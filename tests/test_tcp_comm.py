@@ -674,6 +674,10 @@ class TestTCPServerConnectionManagement:
         server = TCPServer(host="127.0.0.1", port=0)
         called = []
         server.on_message = lambda client_id, msg: called.append((client_id, msg))
+        # _handle_client 的接收循环以 _running 为条件：不置位则线程立即退出并
+        # 关闭 socket，下面的 sendall 会抛 BrokenPipeError（与本用例意图无关的
+        # 夹具缺陷）。对齐同类用例 test_scheduler_rejected_registration_* 的写法。
+        server._running = True
 
         srv_sock, cli_sock = socket.socketpair()
         try:

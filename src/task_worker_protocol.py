@@ -36,6 +36,15 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
+# 受支持的推理引擎标识（与 task_provider.ModelIdentity 的校验集保持一致）:
+#   pytorch / llama_cpp   本地引擎
+#   island                TP 孤岛（路线 A，指纹为端点摘要）
+#   external_api          外部推理服务（路线 B，指纹为外部端点摘要）
+#   speculative_assisted  投机解码（路线 C-1，本地 draft + 外部 verify）
+_SUPPORTED_ENGINES = frozenset({
+    "pytorch", "llama_cpp", "island", "external_api", "speculative_assisted",
+})
+
 _ENVELOPE_FIELDS = {
     "protocol", "version", "message_type", "message_id", "sent_at_ms",
     "payload",
@@ -258,7 +267,10 @@ def _validate_model_identity(value: Any, field: str) -> dict[str, Any]:
         field,
     )
     _require_string(model["model_id"], f"{field}.model_id", pattern=_SAFE_ID)
-    if model["engine"] not in {"pytorch", "llama_cpp"}:
+    # "island": TP 孤岛引擎（网关整请求转发，指纹为端点摘要）
+    # "external_api": 外部推理服务（路线 B，指纹为外部端点摘要）
+    # "speculative_assisted": 投机解码（路线 C-1，本地 draft + 外部 verify）
+    if model["engine"] not in _SUPPORTED_ENGINES:
         raise _error(
             "invalid_model_identity", f"{field}.engine",
             "model engine is unsupported",
@@ -294,7 +306,8 @@ def _validate_capabilities(value: Any) -> None:
         )
     engines = capabilities["engines"]
     if not isinstance(engines, list) or not engines or any(
-        value not in {"pytorch", "llama_cpp"} for value in engines
+        value not in _SUPPORTED_ENGINES
+        for value in engines
     ):
         raise _error(
             "invalid_capabilities", "payload.capabilities.engines",

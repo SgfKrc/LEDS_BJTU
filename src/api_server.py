@@ -47,6 +47,7 @@ from paged_kv_cache import PagedKVCache
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler as ClusterScheduler
 from task_graph import (
+    DEPENDENCY_FAILURES_KEY,
     StageSpec,
     TaskGraphCoordinator,
     TaskGraphError,
@@ -61,6 +62,7 @@ from task_provider import (
     LocalFullModelProvider,
     ModelIdentity,
     ProviderError,
+    ProviderExecutionError,
     ProviderExecutor,
     StageRequest as ProviderStageRequest,
 )
@@ -731,7 +733,7 @@ async def _shutdown_resources():
 class LoadModelRequest(BaseModel):
     engine: str = Field(
         default="llama_cpp",
-        description="推理引擎: llama_cpp (GGUF, 推荐) | pytorch (Safetensors) | auto",
+        description="推理引擎: llama_cpp (GGUF, 推荐) | pytorch (Safetensors) | island (TP 孤岛) | auto",
     )
     quant_type: str = Field(
         default="int4",
@@ -792,6 +794,20 @@ class ChatRequest(BaseModel):
     generation_id: Optional[str] = Field(
         default=None,
         description="客户端预生成的 gen_ 执行 ID，用于所有聊天模式协作取消",
+    )
+    allow_external: bool = Field(
+        default=False,
+        description=(
+            "路线 B 数据作用域按请求授权：允许本请求路由到外部推理服务"
+            "（QLH_EXTERNAL_*）。缺省 False——旧客户端行为不变，数据不出集群。"
+        ),
+    )
+    prefer_external: bool = Field(
+        default=False,
+        description=(
+            "路线 B：优先使用外部推理服务（仍受 QLH_EXTERNAL_DATA_SCOPE "
+            "作用域门控约束；deny 档位下即使置 true 也不外发）。"
+        ),
     )
 
 
@@ -2063,6 +2079,60 @@ async def get_status():
         except Exception:
             active_info = {}
 
+    # ---- TP 孤岛状态（启用时上报，端点已脱敏）----
+    import config as _cfg
+    island_status = None
+    if getattr(_cfg, "ISLAND_ENABLED", False):
+        from island_engine import mask_island_url
+        island_status = {
+            "enabled": True,
+            "backend": getattr(_cfg, "ISLAND_BACKEND", ""),
+            "base_url": mask_island_url(getattr(_cfg, "ISLAND_BASE_URL", "")),
+            "model": active_info.get("model", "") if active_info.get("engine") == "island" else getattr(_cfg, "ISLAND_MODEL", ""),
+            "tp_size": getattr(_cfg, "ISLAND_TP_SIZE", 1),
+            "gpu_count": getattr(_cfg, "ISLAND_GPU_COUNT", 1),
+            "vram_gb": getattr(_cfg, "ISLAND_VRAM_GB", 0.0),
+        }
+
+    # ---- 路线 B：外部推理服务状态（启用时上报，端点已脱敏）----
+    external_status = None
+    if getattr(_cfg, "EXTERNAL_ENABLED", False):
+        from external_provider import (
+            check_external_reachable,
+            get_external_chat_client,
+            mask_external_url,
+        )
+        _ext_client = get_external_chat_client()
+        external_status = {
+            "enabled": True,
+            "label": getattr(_cfg, "EXTERNAL_LABEL", ""),
+            "base_url": mask_external_url(
+                getattr(_cfg, "EXTERNAL_BASE_URL", "")
+            ),
+            "model": (
+                _ext_client.model_name
+                or getattr(_cfg, "EXTERNAL_MODEL", "")
+            ),
+            "data_scope": getattr(_cfg, "EXTERNAL_DATA_SCOPE", "opt_in"),
+            "min_prompt_chars": getattr(_cfg, "EXTERNAL_MIN_PROMPT_CHARS", 0),
+            # 轻量健康检查结果，external_provider 内部缓存 ~30s，
+            # 不会在每次 /api/status 调用时都探活外部端点。
+            # 探活是同步阻塞 IO（外部端点黑洞时最长 connect_timeout 秒），
+            # 必须放到线程池，否则整个事件循环停摆、所有 SSE 流一起卡住。
+            "reachable": await run_in_threadpool(check_external_reachable),
+        }
+
+    # ---- 路线 C-1：投机解码外部辅助状态（启用时上报，端点已脱敏）----
+    # 刻意不做端点探活：路线 B 曾因在 /api/status 里同步探活堵死事件循环
+    # （后来用 run_in_threadpool 修掉），投机段直接不引入任何出网请求。
+    speculative_status = None
+    if getattr(_cfg, "SPEC_ENABLED", False):
+        try:
+            from speculative import speculative_status_section
+            speculative_status = speculative_status_section()
+        except Exception as exc:      # 实验特性不得拖垮 /api/status
+            speculative_status = {"enabled": True, "error": str(exc)[:200]}
+
     return {
         "model_loaded": model_loaded,
         "current_quant": current_quant,
@@ -2070,6 +2140,10 @@ async def get_status():
         "model_name": active_info.get("model_name", MODEL_NAME),
         "model_path": active_info.get("model_path", MODEL_PATH),
         "active_model_id": active_info.get("model_id", model_manager.active_model_id if model_loaded else None),
+        "engine": active_info.get("engine", "") if model_loaded else "",
+        "island": island_status,
+        "external": external_status,
+        "speculative": speculative_status,
         "run_mode": RUN_MODE,
         "node_role": scheduler._effective_role(),
         "node_id": scheduler.get_effective_node_id(),
@@ -2115,8 +2189,8 @@ async def load_model(req: LoadModelRequest):
     global model_loaded, current_quant, kv_cache, conversation_stats
 
     engine = req.engine.lower()
-    if engine not in ("auto", "llama_cpp", "pytorch"):
-        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch")
+    if engine not in ("auto", "llama_cpp", "pytorch", "island"):
+        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island")
 
     _validate_model_load_request(req.model_id, engine)
     resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
@@ -2159,7 +2233,7 @@ async def load_model(req: LoadModelRequest):
 
         if result["success"]:
             model_loaded = True
-            current_quant = quant
+            current_quant = getattr(model_manager, "quant_type", None) or quant
             generation_config["use_compile"] = req.use_compile
 
             # 初始化 KV 缓存
@@ -2177,7 +2251,9 @@ async def load_model(req: LoadModelRequest):
             if model_manager.is_loaded:
                 model_loaded = True
                 current_quant = model_manager.quant_type or (
-                    "gguf" if model_manager._engine_type == "llama_cpp" else QUANT_TYPE
+                    "gguf" if model_manager._engine_type == "llama_cpp"
+                    else "island" if model_manager._engine_type == "island"
+                    else QUANT_TYPE
                 )
                 _init_kv_cache()
             else:
@@ -2223,6 +2299,320 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
     result.setdefault("request_id", _request_id_ctx.get("-"))
     result.setdefault("generation_id", req.generation_id or "")
     return result
+
+
+# ================================================================
+# 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）
+# ================================================================
+
+def _external_route_decision(req: ChatRequest):
+    """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
+    import config as _cfg
+    from external_provider import decide_external_route
+
+    return decide_external_route(
+        enabled=bool(getattr(_cfg, "EXTERNAL_ENABLED", False)),
+        base_url=str(getattr(_cfg, "EXTERNAL_BASE_URL", "") or ""),
+        data_scope=str(getattr(_cfg, "EXTERNAL_DATA_SCOPE", "opt_in")),
+        allow_external=bool(req.allow_external),
+        prefer_external=bool(req.prefer_external),
+        prompt_chars=len(req.message or ""),
+        min_prompt_chars=int(getattr(_cfg, "EXTERNAL_MIN_PROMPT_CHARS", 0) or 0),
+    )
+
+
+def _maybe_log_external_scope_denial(req: ChatRequest, decision) -> None:
+    """请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次，不记正文）。"""
+    if not (req.allow_external or req.prefer_external):
+        return
+    if decision.eligible or not str(decision.reason).startswith("scope"):
+        return
+    import config as _cfg
+
+    logger.info(
+        "数据作用域拒绝外部路由: reason=%s, scope=%s, generation_id=%s"
+        "（消息正文未发送、不落日志）",
+        decision.reason,
+        getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
+        req.generation_id or "-",
+    )
+
+
+def _execute_external_chat(
+    req: ChatRequest,
+    history: list,
+    target_session_id: Optional[str],
+    cancel_event: Optional[threading.Event] = None,
+) -> dict:
+    """整请求路由到外部推理服务（与 llama.cpp/孤岛整请求路径同构）。"""
+    global conversation_stats
+    import config as _cfg
+    from external_provider import get_external_chat_client
+
+    client = get_external_chat_client()
+    client.ensure_connected()
+    request_history = [
+        *history,
+        {"role": "user", "content": req.message},
+    ]
+    # 作用域门控在 client.chat 内部强制执行（外发前最后一道关口）
+    result = client.chat(
+        request_history,
+        max_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        allow_external=req.allow_external,
+        cancel_event=cancel_event,
+    )
+    _raise_if_generation_cancelled(cancel_event, req.generation_id)
+    response_text = result.get("content", "")
+    if not req.show_thinking:
+        response_text = _strip_native_thinking_tags(response_text)
+    completed_history = [
+        *request_history,
+        {"role": "assistant", "content": response_text},
+    ]
+    tokens_per_sec = result.get("tokens_per_second", 0)
+    usage = result.get("usage", {})
+    completion_tokens = usage.get("completion_tokens", 0)
+    metrics = _augment_chat_metrics(
+        {
+            "engine": "external_api",
+            "execution_mode": "external_api",
+            "route": f"{_chat_origin(req)}_to_external_api",
+            "provider": "external_openai",
+            "external_label": getattr(_cfg, "EXTERNAL_LABEL", ""),
+            "external_base_url": client.masked_base_url,
+            "data_scope": getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
+            "model": result.get("model", "") or client.model_name,
+            "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+            "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+            "generated_tokens": completion_tokens,
+            "completion_tokens": completion_tokens,
+            "usage": usage,
+            "usage_estimated": bool(result.get("usage_estimated", False)),
+            "fallback": False,
+            "fallback_reason": "",
+        },
+        req,
+    )
+
+    db_session_id = target_session_id or "default"
+    # 追问生成不再二次外发（少一次数据出集群 + 少一次计费），用模板兜底
+    followups = _fallback_followups(completed_history, [])
+    history.extend([
+        {"role": "user", "content": req.message},
+        {"role": "assistant", "content": response_text},
+    ])
+
+    if _db_available:
+        try:
+            import db as _db_mod
+            if _db_mod.get_save_history():
+                _db_mod.save_message(db_session_id, "user", req.message)
+                save_metrics = dict(metrics)
+                save_metrics["followups"] = followups
+                _db_mod.save_message(db_session_id, "assistant", response_text,
+                                    save_metrics)
+                _db_mod.increment_session_message_count(db_session_id)
+        except Exception:
+            pass
+    if not _db_available:
+        try:
+            _local_store.save_local_message(db_session_id, "user", req.message)
+            save_metrics = dict(metrics)
+            save_metrics["followups"] = followups
+            _local_store.save_local_message(db_session_id, "assistant",
+                                            response_text, save_metrics)
+            _local_store.increment_local_session_message_count(db_session_id)
+        except Exception:
+            pass
+
+    conversation_stats["total_generated_tokens"] += completion_tokens
+    conversation_stats["rounds"] += 1
+    try:
+        scheduler.record_task_complete(success=True)
+    except Exception:
+        pass
+
+    logger.info(
+        f"外部推理完成: {completion_tokens} tokens, "
+        f"endpoint={client.masked_base_url}"
+    )
+    return {
+        "content": response_text,
+        "thinking_content": None,
+        "metrics": metrics,
+        "followups": followups,
+    }
+
+
+def _external_stream_events(
+    req: ChatRequest, cancel_event: Optional[threading.Event] = None,
+):
+    """
+    外部推理服务真流式事件生成器（fast 模式）。
+
+    逐 chunk 产出 {"token": ...}，结束时产出 done 事件；
+    取消 = chunk 边界断流 + 关闭连接（best-effort，外部端可能继续算）。
+    """
+    import config as _cfg
+    from external_provider import get_external_chat_client
+
+    client = get_external_chat_client()
+    client.ensure_connected()
+    parts: list[str] = []
+    t0 = time.time()
+    for chunk in client.chat_stream(
+        [{"role": "user", "content": req.message}],
+        max_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        allow_external=req.allow_external,
+        cancel_event=cancel_event,
+    ):
+        parts.append(chunk)
+        yield {"token": chunk}
+    elapsed = time.time() - t0
+    cancelled = bool(cancel_event is not None and cancel_event.is_set())
+    metrics = _augment_chat_metrics(
+        {
+            "engine": "external_api",
+            "execution_mode": "external_api",
+            "route": f"{_chat_origin(req)}_to_external_api",
+            "provider": "external_openai",
+            "external_label": getattr(_cfg, "EXTERNAL_LABEL", ""),
+            "external_base_url": client.masked_base_url,
+            "data_scope": getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
+            "model": client.model_name,
+            # fast 模式无 usage 事件透传：以 chunk 数估算生成 token 数
+            "generated_tokens": len(parts),
+            "completion_tokens": len(parts),
+            "usage_estimated": True,
+            "elapsed_seconds": round(elapsed, 3),
+            "cancelled": cancelled,
+            "fallback": False,
+            "fallback_reason": "",
+        },
+        req,
+    )
+    yield {
+        "done": True,
+        "response": "".join(parts),
+        "metrics": metrics,
+        "request_id": _request_id_ctx.get("-"),
+    }
+
+
+# ================================================================
+# 路线 C-1（实验）：投机解码 draft-verify —— 独立实验端点，默认关闭
+# ================================================================
+# 接入方式的选择（调研方案 §2.3 要求"必须以独立 execution_mode 门控，默认关闭"）:
+#
+#   本 PoC **不**把投机解码接进 /api/chat 主聊天路径，而是单开一个实验端点。
+#   理由:
+#     1. §2.3 的接入点是**本地解码循环**（model_module 的 generate/decode），
+#        主聊天路径只是它的调用方。在聊天路径里插分支既到不了真正的接入点，
+#        又要把 execution_mode 的 Literal、回退链、指标、取消、持久化
+#        全部改一遍——那是"改动量中～大"的部分，风险落在最核心路径上。
+#     2. 主路径必须"QLH_SPEC_ENABLED=false 时逐字节不变"。独立端点天然满足：
+#        本段代码在开关关闭时只会返回 404，不参与任何既有请求的处理。
+#     3. 真实 draft 模型需要 PyTorch 解码运行时；PoC 环境没有。实验端点可以
+#        显式声明 draft 来源（stub / 注入），聊天路径不能。
+#   代价：本端点不写会话历史、不做追问、不入 conversation_stats——它是
+#   实验测量入口，不是产品路径。接产品前的剩余工作见实施说明文档。
+
+class SpeculativeExperimentRequest(BaseModel):
+    """投机解码实验请求（仅 /api/experimental/speculative 使用）。"""
+    message: str = Field(default="", max_length=8192)
+    execution_mode: Literal["speculative_assisted"] = Field(
+        default="speculative_assisted",
+        description="仅接受 speculative_assisted —— 本端点就是该模式的实验入口",
+    )
+    allow_external: bool = Field(
+        default=False,
+        description=(
+            "数据作用域按请求授权：草稿 token 由用户内容派生，本路径确实"
+            "把数据送出集群，与路线 B 共用 QLH_EXTERNAL_DATA_SCOPE 门控。"
+        ),
+    )
+    max_new_tokens: int = Field(default=64, ge=1, le=1024)
+    gamma: int = Field(default=0, ge=0, le=16, description="每轮草稿数；0=用 QLH_SPEC_GAMMA")
+    max_rounds: int = Field(default=0, ge=0, le=1024, description="0=用 QLH_SPEC_MAX_ROUNDS")
+    temperature: float = Field(
+        default=-1.0, ge=-1.0, le=2.0,
+        description="<0 = 用 QLH_SPEC_TEMPERATURE；0 = 贪心模式",
+    )
+    seed: int = Field(default=0, ge=0, le=2147483647, description="RNG 种子，保证可复现")
+    draft_hint: str = Field(
+        default="", max_length=2048,
+        description="PoC 假 draft 模型的提示序列：命中则接受率高，用于演示接受率对比",
+    )
+
+
+def _run_speculative_experiment(req: SpeculativeExperimentRequest) -> dict:
+    """同步执行一次投机解码会话（阻塞 HTTP，调用方须放线程池）。"""
+    from speculative import run_speculative_chat
+
+    return run_speculative_chat(
+        req.message,
+        allow_external=bool(req.allow_external),
+        max_new_tokens=int(req.max_new_tokens),
+        gamma=(int(req.gamma) if req.gamma > 0 else None),
+        max_rounds=(int(req.max_rounds) if req.max_rounds > 0 else None),
+        temperature=(float(req.temperature) if req.temperature >= 0 else None),
+        seed=int(req.seed),
+        draft_hint=req.draft_hint or "",
+    )
+
+
+@app.post("/api/experimental/speculative")
+async def experimental_speculative_chat(req: SpeculativeExperimentRequest):
+    """
+    投机解码 draft-verify 实验端点（路线 C-1，阶段 0-1 探索性 PoC）。
+
+    仅在 QLH_SPEC_ENABLED=true 时存在；关闭时一律 404，主聊天路径不受影响。
+    数据作用域与路线 B 共用 QLH_EXTERNAL_DATA_SCOPE（deny 档位一个包都不发）。
+    """
+    import config as _cfg
+
+    if not getattr(_cfg, "SPEC_ENABLED", False):
+        raise HTTPException(
+            404,
+            "投机解码实验未启用。请设置 QLH_SPEC_ENABLED=true 并配置 "
+            "QLH_SPEC_VERIFY_BASE_URL（或复用 QLH_EXTERNAL_BASE_URL）后重启。",
+        )
+
+    from external_provider import ExternalScopeDeniedError
+    from speculative import (
+        SpeculativeCapabilityError,
+        SpeculativeConfigError,
+        SpeculativeError,
+    )
+
+    try:
+        result = await run_in_threadpool(_run_speculative_experiment, req)
+    except ExternalScopeDeniedError as exc:
+        logger.info(
+            "数据作用域拒绝投机解码外部校验: scope=%s（消息正文未发送）",
+            getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
+        )
+        raise HTTPException(403, str(exc)) from None
+    except SpeculativeConfigError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except SpeculativeCapabilityError as exc:
+        # 前提条件不满足时大声失败：静默降级会让输出分布不再等于 verify 模型
+        raise HTTPException(502, str(exc)) from None
+    except SpeculativeError as exc:
+        raise HTTPException(502, str(exc)) from None
+
+    return {
+        "content": result["content"],
+        "finish_reason": result["finish_reason"],
+        "metrics": result["metrics"],
+        "rounds": result["rounds"],
+        "request_id": _request_id_ctx.get("-"),
+    }
 
 
 def _execute_task_graph_chat(
@@ -2291,8 +2681,26 @@ def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
     engine = str(getattr(model_manager, "_engine_type", "") or "")
     model_path = str(getattr(model_manager, "_model_path", "") or "")
     model_id = str(getattr(model_manager, "active_model_id", "") or "")
-    if engine not in {"pytorch", "llama_cpp"} or not model_id or not model_path:
+    if engine not in {"pytorch", "llama_cpp", "island"} or not model_id or not model_path:
         return None
+    if engine == "island":
+        # 孤岛模型无本地 artifact：以"端点指纹 + 后端模型名"替代文件摘要，
+        # 统计中如实标注为外部端点（不伪装成本地文件，见调研方案 §2.2）。
+        island_engine = getattr(model_manager, "_island_engine", None)
+        backend_model = str(getattr(island_engine, "model_name", "") or "")
+        masked_url = str(getattr(island_engine, "masked_base_url", "") or model_path)
+        if not backend_model:
+            return None
+        digest = hashlib.sha256(
+            f"{masked_url}::{backend_model}".encode("utf-8")
+        ).hexdigest()
+        return ModelIdentity(
+            model_id=model_id,
+            engine="island",
+            format="openai_api",
+            revision=f"island-{digest[:12]}",
+            sha256=digest,
+        )
     try:
         from model_sync import compute_file_sha256, compute_model_sha256
 
@@ -2394,7 +2802,12 @@ def _execute_task_worker_stage(
         raise TaskGraphError("任务 Stage 执行参数无效") from exc
     show_thinking = bool(options.get("show_thinking", False))
 
-    def run_model(messages: list[dict], max_tokens: int) -> dict:
+    def run_model(
+        messages: list[dict],
+        max_tokens: int,
+        *,
+        retry_empty_on_same_provider: bool = False,
+    ) -> dict:
         if provider_cancel_event.is_set():
             return {
                 "content": "",
@@ -2418,6 +2831,13 @@ def _execute_task_worker_stage(
         else:
             content = _strip_native_thinking_tags(raw_content)
         if not content and not provider_cancel_event.is_set():
+            if retry_empty_on_same_provider:
+                raise ProviderExecutionError(
+                    "complete model returned an empty aggregate result",
+                    code="empty_provider_output",
+                    provider_id=stage_request.provider_id,
+                    same_provider_retryable=True,
+                )
             raise TaskGraphError("完整模型返回空 Stage 结果")
         return {
             "content": content,
@@ -2456,21 +2876,45 @@ def _execute_task_worker_stage(
         candidate_payload = {
             stage_id: value.get("content", "")
             for stage_id, value in stage_request.dependencies.items()
-            if isinstance(value, dict)
+            if stage_id != DEPENDENCY_FAILURES_KEY
+            and isinstance(value, dict)
+            and str(value.get("content", "") or "").strip()
         }
+        if not candidate_payload:
+            raise TaskGraphError("聚合 Stage 没有可用候选")
+        failure_payload = stage_request.dependencies.get(
+            DEPENDENCY_FAILURES_KEY, {},
+        )
         aggregation_prompt = (
-            "请根据原始问题和两个独立候选，输出一个最终答案。"
+            "请根据原始问题和可用的独立候选，输出一个最终答案。"
             "纠正冲突和明显错误；没有证据时明确不确定性。"
             "只输出最终答案，不描述内部任务链。\n\n"
             f"原始问题：{message}\n\n候选：\n"
             + json.dumps(candidate_payload, ensure_ascii=False)
+            + (
+                "\n\n未完成候选摘要：\n"
+                + json.dumps(failure_payload, ensure_ascii=False)
+                if isinstance(failure_payload, dict) and failure_payload
+                else ""
+            )
         )
-        return run_model(
-            ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
-             if show_thinking else [])
-            + [{"role": "user", "content": aggregation_prompt}],
-            final_budget,
-        )
+        try:
+            return run_model(
+                ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
+                 if show_thinking else [])
+                + [{"role": "user", "content": aggregation_prompt}],
+                final_budget,
+                retry_empty_on_same_provider=True,
+            )
+        except ProviderError:
+            raise
+        except (TimeoutError, ConnectionError) as exc:
+            raise ProviderExecutionError(
+                "transient aggregate model execution failed",
+                code="provider_execution_failed",
+                provider_id=stage_request.provider_id,
+                same_provider_retryable=True,
+            ) from exc
     raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
 
 
@@ -2587,6 +3031,7 @@ def _execute_task_graph_chat_with_slot(
                 provider=remote_provider_id,
                 fallback_providers=(),
                 pure=False,
+                max_same_provider_retries=0,
             )
             if stage.stage_id == remote_stage_id else stage
             for stage in template_stages
@@ -2796,13 +3241,23 @@ def _execute_task_graph_chat_with_slot(
         for stage in retried_stages
         if stage.get("last_retry_error_code")
     ]
-    fallback_used = bool(retried_stages) or bool(
+    same_provider_retry_count = sum(
+        int(stage.get("same_provider_retry_count", 0) or 0)
+        for stage in retried_stages
+    )
+    total_retry_count = sum(
+        int(stage.get("retry_count", 0) or 0)
+        for stage in retried_stages
+    )
+    reassignment_count = max(
+        0, total_retry_count - same_provider_retry_count,
+    )
+    fallback_used = reassignment_count > 0 or bool(
         auto_remote and not auto_provider_ids
     )
+    retry_reason = retry_error_codes[0] if retry_error_codes else ""
     fallback_reason = (
-        retry_error_codes[0]
-        if retry_error_codes
-        else auto_fallback_reason
+        retry_reason if reassignment_count > 0 else auto_fallback_reason
     )
     metrics = _augment_chat_metrics(
         {
@@ -2816,6 +3271,11 @@ def _execute_task_graph_chat_with_slot(
             "workflow_id": workflow["workflow_id"],
             "workflow_template": workflow["template"],
             "workflow_state": workflow["state"],
+            "partial_result": bool(workflow.get("partial_result", False)),
+            "stage_retry_count": total_retry_count,
+            "same_provider_retry_count": same_provider_retry_count,
+            "reassignment_count": reassignment_count,
+            "retry_reason": retry_reason,
             "stage_count": workflow["stage_count"],
             "stage_attempt_count": workflow["attempt_count"],
             "nodes_planned": (
@@ -2936,6 +3396,43 @@ def _execute_chat_full(
     if target_session_id and len(history) == 0:
         _auto_title_session(target_session_id, req.message)
 
+    # ---- 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）----
+    # 决策为纯函数（external_provider.decide_external_route）；不满足条件时
+    # use_external=False，直接落回下方既有本地/流水线逻辑，行为完全不变。
+    # （作用域拒绝的 INFO 日志由端点入口统一记录，每请求一次）
+    external_fallback_reason = ""
+    _ext_decision = _external_route_decision(req)
+    if _ext_decision.use_external:
+        try:
+            return _execute_external_chat(
+                req, history, target_session_id, cancel_event,
+            )
+        except ChatGenerationCancelled:
+            raise
+        except Exception as exc:
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            if not model_loaded or not model_manager.is_loaded:
+                if req.prefer_external:
+                    raise HTTPException(
+                        502,
+                        f"外部推理服务调用失败，且本地无可用推理引擎：{exc}",
+                    ) from exc
+                try:
+                    # 回退必须复用统一约束：转发型从节点不加载本地模型（落到
+                    # 下方转发分支），被预约的 PyTorch 流水线从节点原样上抛 503。
+                    # 直接调 _auto_load_default_model 会绕过这两条不变量。
+                    _ensure_chat_model_or_forwarding()
+                except HTTPException:
+                    raise
+                except Exception as load_exc:
+                    raise HTTPException(
+                        502,
+                        f"外部推理服务调用失败（{exc}），"
+                        f"且本地模型加载失败：{load_exc}",
+                    ) from exc
+            external_fallback_reason = f"external_api_failed: {exc}"
+            logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
+
     # ---- 分布式推理路由：从节点转发给主节点 ----
     if (scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
@@ -2964,6 +3461,11 @@ def _execute_chat_full(
                     execution_mode="forwarded_to_master",
                     route="pc_client_forward_to_master",
                 )
+                if external_fallback_reason and not forward_metrics.get(
+                    "fallback_reason",
+                ):
+                    forward_metrics["fallback"] = True
+                    forward_metrics["fallback_reason"] = external_fallback_reason
 
                 db_session_id = target_session_id or "default"
                 if _db_available:
@@ -3066,6 +3568,13 @@ def _execute_chat_full(
                         execution_mode="distributed_pipeline",
                         route="master_pipeline",
                     )
+                    if external_fallback_reason and not pipeline_metrics.get(
+                        "fallback_reason",
+                    ):
+                        pipeline_metrics["fallback"] = True
+                        pipeline_metrics["fallback_reason"] = (
+                            external_fallback_reason
+                        )
                     if _db_available:
                         try:
                             import db as _db_mod
@@ -3093,7 +3602,7 @@ def _execute_chat_full(
                         except Exception:
                             pass
 
-                    if model_manager._engine_type == "llama_cpp":
+                    if model_manager._engine_type in ("llama_cpp", "island"):
                         followups = _generate_followups_llama(history)
                     elif model_manager._engine_type == "pytorch":
                         # 流水线成功后主节点仍保留首段裁剪模型，不能拿它生成追问。
@@ -3113,9 +3622,10 @@ def _execute_chat_full(
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             logger.warning(f"流水线推理异常: {e}，回退到本地推理")
 
-    # ---- llama.cpp 引擎路径（CPU/集显，GGUF）----
-    if model_manager._engine_type == "llama_cpp":
+    # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
+    if model_manager._engine_type in ("llama_cpp", "island"):
         try:
+            engine_name = model_manager._engine_type
             request_history = [
                 *history,
                 {"role": "user", "content": req.message},
@@ -3129,7 +3639,7 @@ def _execute_chat_full(
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             response_text = result.get("content", "")
-            # P3修复: llama.cpp 路径同样需要剥离本地思考标记
+            # P3修复: llama.cpp/孤岛路径同样需要剥离本地思考标记
             if not req.show_thinking:
                 response_text = _strip_native_thinking_tags(response_text)
             completed_history = [
@@ -3139,14 +3649,20 @@ def _execute_chat_full(
             tokens_per_sec = result.get("tokens_per_second", 0)
             usage = result.get("usage", {})
             completion_tokens = usage.get("completion_tokens", 0)
-            local_route = f"{_chat_origin(req)}_to_master_local_llama_cpp"
+            local_route = f"{_chat_origin(req)}_to_master_local_{engine_name}"
             fallback_reason = ""
-            if scheduler.get_distributed_inference_enabled() and RUN_MODE == "distributed":
-                fallback_reason = "llama.cpp engine does not support layer-split pipeline"
+            if external_fallback_reason:
+                # 路线 B 外部路由失败后的本地回退（原因优先展示外部失败）
+                fallback_reason = external_fallback_reason
+            elif scheduler.get_distributed_inference_enabled() and RUN_MODE == "distributed":
+                if engine_name == "island":
+                    fallback_reason = "island engine delegates whole-request inference to the TP island"
+                else:
+                    fallback_reason = "llama.cpp engine does not support layer-split pipeline"
             metrics = _augment_chat_metrics(
                 {
-                    "engine": "llama_cpp",
-                    "execution_mode": "local_llama_cpp",
+                    "engine": engine_name,
+                    "execution_mode": f"local_{engine_name}",
                     "route": local_route,
                     "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
                     "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
@@ -3213,7 +3729,13 @@ def _execute_chat_full(
                 scheduler.record_task_error()
             except Exception:
                 pass
-            logger.error(f"llama.cpp 推理失败: {e}", exc_info=True)
+            # 孤岛路径的失败不应记成 llama.cpp（llama_cpp 路径日志保持原样）
+            _engine_label = (
+                "孤岛引擎"
+                if getattr(model_manager, "_engine_type", "") == "island"
+                else "llama.cpp"
+            )
+            logger.error(f"{_engine_label} 推理失败: {e}", exc_info=True)
             raise HTTPException(500, f"推理失败: {str(e)}")
 
     # ---- PyTorch 引擎路径（CUDA/独显）----
@@ -3313,6 +3835,8 @@ def _execute_chat_full(
                 else 0,
             },
             req,
+            fallback=bool(external_fallback_reason),
+            fallback_reason=external_fallback_reason,
         )
 
         db_session_id = target_session_id or "default"
@@ -3415,8 +3939,12 @@ def _pipeline_worker_is_reserved() -> bool:
     return bool(callable(check) and check())
 
 
-def _ensure_chat_model_or_forwarding() -> None:
+def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
     """Load a local model only when this request cannot be master-forwarded."""
+    if req is not None and _external_route_decision(req).use_external:
+        # 路线 B：本请求将整体路由到外部推理服务，无需本地模型。
+        # 外部失败时的本地回退在 _execute_chat_full 内按需加载模型。
+        return
     if _should_forward_chat_to_master():
         return
     if _pipeline_worker_is_reserved():
@@ -3435,6 +3963,36 @@ def _auto_load_default_model():
 
     import config as cfg
     import glob
+
+    # 0. TP 孤岛引擎优先（启用即为孤岛网关节点，无本地文件依赖）
+    if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
+        from island_engine import mask_island_url
+
+        logger.info(
+            f"自动加载孤岛引擎: endpoint={mask_island_url(cfg.ISLAND_BASE_URL)}"
+        )
+        t0 = time.time()
+        cfg.INFERENCE_ENGINE = "island"
+        cfg.QUANT_TYPE = "island"
+        cfg.USE_COMPILE = False
+        _run_exclusive_model_change(
+            lambda: model_manager.load_model(
+                profile=device_profile,
+                engine="island",
+            )
+        )
+        _init_kv_cache()
+        conversation_stats = {
+            "total_prompt_tokens": 0,
+            "total_generated_tokens": 0,
+            "total_time_seconds": 0.0,
+            "rounds": 0,
+        }
+        model_loaded = True
+        current_quant = "island"
+        scheduler.refresh_task_worker_capabilities()
+        logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
+        return
 
     # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
     gguf_candidates = []
@@ -3492,7 +4050,7 @@ def _auto_load_default_model():
         "rounds": 0,
     }
     model_loaded = True
-    current_quant = quant
+    current_quant = getattr(model_manager, "quant_type", None) or quant
     scheduler.refresh_task_worker_capabilities()
     elapsed = time.time() - t0
     logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
@@ -3508,6 +4066,8 @@ async def chat(req: ChatRequest):
     """
     generation_id, cancel_event = _register_generation(req.generation_id)
     req.generation_id = generation_id
+    # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
+    _maybe_log_external_scope_denial(req, _external_route_decision(req))
 
     def _run_chat_request():
         if req.execution_mode == "task_graph":
@@ -3520,7 +4080,7 @@ async def chat(req: ChatRequest):
         with _full_chat_execution_lock:
             if not model_loaded or not model_manager.is_loaded:
                 try:
-                    _ensure_chat_model_or_forwarding()
+                    _ensure_chat_model_or_forwarding(req)
                 except FileNotFoundError:
                     raise HTTPException(
                         400,
@@ -3651,6 +4211,8 @@ async def chat_stream(req: ChatRequest, request: Request):
             cancel_event.set()
 
     async def _generate_events():
+        # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
+        _maybe_log_external_scope_denial(req, _external_route_decision(req))
         # ================================================================
         # ★ full 模式：完整 chat 流程，假流式（SSE 单事件）
         # ================================================================
@@ -3667,21 +4229,22 @@ async def chat_stream(req: ChatRequest, request: Request):
                     return _execute_requested_chat(req, cancel_event)
                 with _full_chat_execution_lock:
                     if not model_loaded or not model_manager.is_loaded:
-                        _ensure_chat_model_or_forwarding()
+                        _ensure_chat_model_or_forwarding(req)
                     return _execute_requested_chat(req, cancel_event)
 
             try:
                 result = await _run_with_request_id(
                     loop, _execute_full_stream_request,
                 )
-                yield f"data: {_json.dumps({
+                _done_payload = _json.dumps({
                     'done': True,
                     'response': result['content'],
                     'thinking_content': result.get('thinking_content'),
                     'followups': result['followups'],
                     'metrics': result['metrics'],
                     'request_id': request_id,
-                }, ensure_ascii=False)}\n\n"
+                }, ensure_ascii=False)
+                yield f"data: {_done_payload}\n\n"
             except HTTPException as e:
                 yield _error_event(e.detail)
             except Exception as e:
@@ -3692,6 +4255,46 @@ async def chat_stream(req: ChatRequest, request: Request):
         # ================================================================
         # fast 模式：真流式，跳过历史/追问/DB 持久化（低延迟）
         # ================================================================
+        # ---- 路线 B: 外部推理服务真流式（数据作用域门控，默认不出集群）----
+        external_fallback_reason = ""
+        _ext_decision = _external_route_decision(req)
+        if _ext_decision.use_external:
+            loop = _asyncio.get_running_loop()
+            ext_events = _external_stream_events(req, cancel_event)
+            first_event = None
+            external_error = None
+            try:
+                # 首个事件同步拉取：失败发生在任何 SSE 数据发出之前，
+                # 可以干净地回退到下方既有本地路径
+                first_event = await _run_with_request_id(
+                    loop, lambda: next(ext_events, None),
+                )
+            except Exception as exc:
+                external_error = exc
+            if external_error is None:
+                if first_event is not None:
+                    yield f"data: {_json.dumps(first_event, ensure_ascii=False)}\n\n"
+                    if not first_event.get("done"):
+                        try:
+                            async for event in _iterate_sync_generator(ext_events):
+                                yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
+                        except Exception as e:
+                            logger.error(f"外部推理服务流式失败: {e}")
+                            yield _error_event(str(e))
+                return
+            # 外部失败 → 与 /api/chat 同语义：优先回退本地路径
+            if req.prefer_external and not (
+                model_loaded and model_manager.is_loaded
+            ):
+                yield _error_event(
+                    f"外部推理服务调用失败，且本地无可用推理引擎：{external_error}"
+                )
+                return
+            external_fallback_reason = f"external_api_failed: {external_error}"
+            logger.warning(
+                f"外部推理服务流式调用失败: {external_error}，回退到本地路径"
+            )
+
         # ---- 路径 0: 分布式 client 优先转发主节点 ----
         # A pipeline worker may already hold a valid PyTorch segment. It must
         # never enter the local PyTorch streaming branch, which restores the
@@ -3715,13 +4318,14 @@ async def chat_stream(req: ChatRequest, request: Request):
             if result.get("status") == "ok":
                 metrics = result.get("metrics", {}) or {}
                 metrics.setdefault("request_id", request_id)
-                yield f"data: {_json.dumps({
+                _done_payload = _json.dumps({
                     'done': True,
                     'response': result.get('content', ''),
                     'thinking_content': result.get('thinking_content'),
                     'metrics': metrics,
                     'request_id': request_id,
-                }, ensure_ascii=False)}\n\n"
+                }, ensure_ascii=False)
+                yield f"data: {_done_payload}\n\n"
                 return
             if _pipeline_worker_is_reserved():
                 yield _error_event(
@@ -3802,6 +4406,9 @@ async def chat_stream(req: ChatRequest, request: Request):
             # 一次性返回完整结果（SSE 格式，单事件）
             metrics = result.get('metrics', {}) or {}
             metrics.setdefault("request_id", request_id)
+            if external_fallback_reason and not metrics.get("fallback_reason"):
+                metrics["fallback"] = True
+                metrics["fallback_reason"] = external_fallback_reason
             yield f"data: {_json.dumps({'done': True, 'response': result.get('response', ''), 'error': result.get('error'), 'metrics': metrics, 'request_id': request_id}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
@@ -3853,6 +4460,14 @@ def _workflow_observability(snapshot: dict) -> dict:
             _workflow_safe_count(stage.get("retry_count", 0))
             for stage in stages if isinstance(stage, dict)
         )
+    same_provider_retry_count = _workflow_safe_count(
+        snapshot.get("same_provider_retry_count", 0)
+    )
+    if not same_provider_retry_count:
+        same_provider_retry_count = sum(
+            _workflow_safe_count(stage.get("same_provider_retry_count", 0))
+            for stage in stages if isinstance(stage, dict)
+        )
     rejection_count = _workflow_safe_count(
         snapshot.get("result_rejection_count", 0)
     )
@@ -3892,9 +4507,14 @@ def _workflow_observability(snapshot: dict) -> dict:
         "state": state,
         "result_ready": state == "result_ready",
         "terminal": state in {"completed", "failed", "cancelled"},
+        "partial_result": bool(snapshot.get("partial_result", False)),
         "recovered_after_restart": recovered_after_restart,
         "recovery_reason": recovery_reason,
         "retry_count": retry_count,
+        "same_provider_retry_count": same_provider_retry_count,
+        "reassignment_count": max(
+            0, retry_count - same_provider_retry_count,
+        ),
         "retrying": retry_count > 0 and state in {"running", "created"},
         "result_rejection_count": rejection_count,
         "last_result_rejection_reason": str(
@@ -4159,8 +4779,67 @@ async def list_available_models():
             },
         ]
 
+    # ---- TP 孤岛引擎（无本地模型文件，启用即可选）----
+    island_quants = []
+    import config as _cfg
+    if getattr(_cfg, "ISLAND_ENABLED", False) and getattr(_cfg, "ISLAND_BASE_URL", ""):
+        from island_engine import mask_island_url
+        _island_url_masked = mask_island_url(getattr(_cfg, "ISLAND_BASE_URL", ""))
+        available_engines.append({
+            "id": "island",
+            "name": f"TP 孤岛 ({getattr(_cfg, 'ISLAND_BACKEND', 'openai-compatible')})",
+            "description": f"整请求转发到孤岛端点 {_island_url_masked}，量化/并行由孤岛后端决定",
+            "model_size_gb": None,
+            "requires_cuda": False,
+        })
+        island_quants = [
+            {
+                "id": "island",
+                "name": "孤岛后端",
+                "description": f"由孤岛后端决定（{getattr(_cfg, 'ISLAND_BACKEND', '')}，TP={getattr(_cfg, 'ISLAND_TP_SIZE', 1)}）",
+                "memory_gb": None,
+                "speed_tok_s": None,
+                "compile_support": False,
+                "engine": "island",
+                "is_available": True,
+            },
+        ]
+
+    # ---- 外部推理服务（路线 B，按请求路由，不占用本地显存）----
+    external_quants = []
+    if getattr(_cfg, "EXTERNAL_ENABLED", False) and getattr(_cfg, "EXTERNAL_BASE_URL", ""):
+        from external_provider import mask_external_url
+        _external_url_masked = mask_external_url(getattr(_cfg, "EXTERNAL_BASE_URL", ""))
+        _external_scope = getattr(_cfg, "EXTERNAL_DATA_SCOPE", "opt_in")
+        available_engines.append({
+            "id": "external_api",
+            "name": f"外部推理服务 ({getattr(_cfg, 'EXTERNAL_LABEL', '')})",
+            "description": (
+                f"整请求路由到外部端点 {_external_url_masked}"
+                f"（数据作用域: {_external_scope}，按请求 allow_external 授权，"
+                f"非本地引擎，无需加载）"
+            ),
+            "model_size_gb": None,
+            "requires_cuda": False,
+        })
+        external_quants = [
+            {
+                "id": "external_api",
+                "name": "外部服务后端",
+                "description": (
+                    f"由外部端点决定（{getattr(_cfg, 'EXTERNAL_LABEL', '')}，"
+                    f"作用域 {_external_scope}）"
+                ),
+                "memory_gb": None,
+                "speed_tok_s": None,
+                "compile_support": False,
+                "engine": "external_api",
+                "is_available": True,
+            },
+        ]
+
     return {
-        "models": pytorch_quants + gguf_quants,
+        "models": pytorch_quants + gguf_quants + island_quants + external_quants,
         "current": current_quant if model_loaded else None,
         "current_engine": (
             model_manager._engine_type
@@ -4308,6 +4987,9 @@ def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
     raw = str(quant_type or "").strip()
     if engine == "llama_cpp":
         return raw or "gguf"
+    if engine == "island":
+        # 孤岛引擎量化精度由后端决定，网关侧仅作展示标签
+        return "island"
 
     quant = raw.lower()
     if quant not in ("fp16", "int8", "int4"):
@@ -4317,6 +4999,15 @@ def _normalize_quant_for_engine(quant_type: str, engine: str) -> str:
 
 def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
     """Reject unavailable model loads before unloading the current model."""
+    if engine == "island":
+        # 孤岛引擎无本地文件依赖；端点可达性在加载时由健康检查校验
+        import config as cfg
+        if not getattr(cfg, "ISLAND_BASE_URL", ""):
+            raise HTTPException(
+                status_code=400,
+                detail="孤岛引擎未配置端点：请设置 QLH_ISLAND_BASE_URL 后重试。",
+            )
+        return
     if not model_id:
         return
 
@@ -4392,8 +5083,8 @@ async def switch_model(req: SwitchModelRequest):
 
     # 验证 engine 参数
     engine = req.engine.lower()
-    if engine not in ("auto", "llama_cpp", "pytorch"):
-        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch")
+    if engine not in ("auto", "llama_cpp", "pytorch", "island"):
+        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island")
     _validate_model_load_request(req.model_id, engine)
     resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
     effective_engine = _effective_engine_for_model(req.model_id, engine)
@@ -4424,7 +5115,7 @@ async def switch_model(req: SwitchModelRequest):
 
         if result["success"]:
             model_loaded = True
-            current_quant = quant
+            current_quant = getattr(model_manager, "quant_type", None) or quant
             _init_kv_cache()
             scheduler.refresh_task_worker_capabilities()
             return result
@@ -4434,7 +5125,9 @@ async def switch_model(req: SwitchModelRequest):
                 model_loaded = True
                 # P3修复: llama_cpp 引擎无 quant_type（GGUF 自带量化），回退到 "gguf"
                 current_quant = model_manager.quant_type or (
-                    "gguf" if model_manager._engine_type == "llama_cpp" else QUANT_TYPE
+                    "gguf" if model_manager._engine_type == "llama_cpp"
+                    else "island" if model_manager._engine_type == "island"
+                    else QUANT_TYPE
                 )
             else:
                 model_loaded = False
@@ -4758,12 +5451,16 @@ async def connect_to_master(req: ConnectToMasterRequest):
     if scheduler._effective_role() == "master":
         if not req.switch_to_client or not scheduler.can_join_existing_master():
             raise HTTPException(403, "当前主节点已确认或已有从节点，不能切换为从节点")
-        switch_result = scheduler.activate_client_mode()
+        # 角色切换可能阻塞在角色迁移锁上，放入线程池避免卡死事件循环
+        switch_result = await run_in_threadpool(scheduler.activate_client_mode)
         if switch_result.get("status") == "denied":
             raise HTTPException(409, switch_result.get("reason", "无法切换为从节点"))
         force_bootstrap = True
 
-    result = scheduler.connect_to_master(
+    # connect_to_master 内部含多次 TCP 重试（最长可达数十秒），
+    # 必须放入线程池执行，否则会阻塞事件循环冻结所有 HTTP 接口
+    result = await run_in_threadpool(
+        scheduler.connect_to_master,
         req.master_host,
         req.master_port,
         force_bootstrap=force_bootstrap,
@@ -4936,7 +5633,8 @@ async def test_email_notification():
     """
     try:
         from email_notifier import send_test_email
-        ok = send_test_email()
+        # SMTP 发送为同步网络操作（可阻塞数秒），放入线程池执行
+        ok = await run_in_threadpool(send_test_email)
         if ok:
             return {"status": "ok", "message": "测试邮件已发送，请检查目标邮箱"}
         else:
@@ -5158,7 +5856,10 @@ async def transfer_master_role(req: TransferMasterRequest):
       - 原主节点重启后以从节点模式运行
       - 新主节点重启后以主节点模式运行
     """
-    result = scheduler.transfer_master_role(req.target_node_id)
+    # 内部同步等待从节点 ACK（最长 15s），放入线程池避免阻塞事件循环
+    result = await run_in_threadpool(
+        scheduler.transfer_master_role, req.target_node_id
+    )
     if result.get("status") == "denied":
         raise HTTPException(403, result.get("reason", "权限不足"))
     if result.get("status") == "invalid":
@@ -5214,7 +5915,10 @@ async def designate_spare_master(req: SpareMasterRequest):
     Returns:
         { status, message, spare_master, ... }
     """
-    result = scheduler.designate_spare_master(req.target_node_id)
+    # 内部同步等待从节点 ACK（最长 15s），放入线程池避免阻塞事件循环
+    result = await run_in_threadpool(
+        scheduler.designate_spare_master, req.target_node_id
+    )
     if result.get("status") == "denied":
         raise HTTPException(403, result.get("reason", "权限不足"))
     if result.get("status") == "invalid":
@@ -5292,7 +5996,10 @@ async def create_review_ticket(req: CreateReviewRequest):
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        ticket = review_mgr.create_ticket(
+        # create_ticket 内部会同步发送 SMTP 邮件通知（可阻塞数秒），
+        # 放入线程池避免阻塞事件循环
+        ticket = await run_in_threadpool(
+            review_mgr.create_ticket,
             created_by=scheduler.get_effective_node_id(),
             target_node_id=req.target_node_id,
             reason=req.reason,
@@ -5331,7 +6038,10 @@ async def cast_review_vote(req: CastVoteRequest):
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        ticket = review_mgr.cast_vote(
+        # 达到阈值时 cast_vote 会同步发送 SMTP 结果通知（可阻塞数秒），
+        # 放入线程池避免阻塞事件循环
+        ticket = await run_in_threadpool(
+            review_mgr.cast_vote,
             ticket_id=req.ticket_id,
             voter_node_id=node_id,
             vote_value=req.vote,
@@ -5396,7 +6106,8 @@ async def trigger_expire_check():
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        expired = review_mgr.resolve_expired()
+        # 过期工单会同步发送 SMTP 结果通知（可阻塞数秒），放入线程池执行
+        expired = await run_in_threadpool(review_mgr.resolve_expired)
         return {"expired": expired, "count": len(expired)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"过期检查失败: {e}")
@@ -5433,7 +6144,8 @@ async def trigger_mail_poll():
     """手动触发邮件投票轮询（用于测试 / 调试）。"""
     try:
         from email_notifier import poll_mail_once
-        result = poll_mail_once()
+        # IMAP 轮询为同步网络操作（可阻塞数秒），放入线程池执行
+        result = await run_in_threadpool(poll_mail_once)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"邮件轮询失败: {e}")

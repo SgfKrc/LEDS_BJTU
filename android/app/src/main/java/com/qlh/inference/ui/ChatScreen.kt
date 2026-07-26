@@ -16,7 +16,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -25,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -48,14 +49,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.data.MessageEntity
+import com.qlh.inference.ui.components.EmptyState
+import com.qlh.inference.ui.components.QlhTopBar
+import com.qlh.inference.ui.components.StatusChip
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -75,7 +79,8 @@ fun ChatScreen(
     onSendMessage: (String) -> Unit,
     onRetry: () -> Unit,
     onClearError: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    inferenceMode: String = ""
 ) {
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
@@ -105,14 +110,37 @@ fun ChatScreen(
             .fillMaxSize()
             .imePadding()
     ) {
+        // ---- 顶栏：会话标题 + 模式角标 ----
+        QlhTopBar(
+            title = sessionTitle.ifBlank { "对话" },
+            actions = {
+                if (inferenceMode.isNotBlank()) {
+                    if (inferenceMode == "thin") {
+                        StatusChip(
+                            text = "远程推理",
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                    } else {
+                        StatusChip(
+                            text = "本地推理",
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                }
+            }
+        )
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
         // ---- 消息列表 ----
         LazyColumn(
             state = listState,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             if (messages.isEmpty() && !isLoading) {
                 item(key = "empty") {
@@ -144,7 +172,7 @@ fun ChatScreen(
 
             // 底部留白，避免被输入框遮挡
             item(key = "spacer") {
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(4.dp))
             }
         }
 
@@ -179,43 +207,41 @@ private fun ChatBubble(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
     ) {
-        // 助手头像（左侧）
-        if (!isUser) {
-            AssistantAvatar()
-            Spacer(modifier = Modifier.width(8.dp))
+        // 对侧留白，气泡最大宽度约 85%
+        if (isUser) {
+            Spacer(modifier = Modifier.width(48.dp))
         }
 
         Column(
-            modifier = Modifier.widthIn(max = 300.dp),
+            modifier = Modifier.weight(1f, fill = false),
             horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
         ) {
             Surface(
                 shape = RoundedCornerShape(
-                    topStart = 16.dp,
-                    topEnd = 16.dp,
-                    bottomStart = if (isUser) 16.dp else 4.dp,
-                    bottomEnd = if (isUser) 4.dp else 16.dp
+                    topStart = 20.dp,
+                    topEnd = 20.dp,
+                    bottomStart = if (isUser) 20.dp else 6.dp,
+                    bottomEnd = if (isUser) 6.dp else 20.dp
                 ),
                 color = if (isUser) {
                     MaterialTheme.colorScheme.primary
                 } else {
-                    MaterialTheme.colorScheme.surfaceVariant
-                },
-                shadowElevation = 1.dp
+                    MaterialTheme.colorScheme.surfaceContainerHigh
+                }
             ) {
                 Box {
                     Text(
                         text = message.content,
                         modifier = Modifier.padding(
-                            start = 12.dp,
-                            top = 12.dp,
-                            end = if (!isUser && message.content.isNotBlank()) 42.dp else 12.dp,
-                            bottom = 12.dp
+                            start = 14.dp,
+                            top = 10.dp,
+                            end = if (!isUser && message.content.isNotBlank()) 44.dp else 14.dp,
+                            bottom = 10.dp
                         ),
                         color = if (isUser) {
                             MaterialTheme.colorScheme.onPrimary
                         } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
+                            MaterialTheme.colorScheme.onSurface
                         },
                         style = MaterialTheme.typography.bodyLarge
                     )
@@ -229,7 +255,7 @@ private fun ChatBubble(
                             Icon(
                                 imageVector = Icons.Default.ContentCopy,
                                 contentDescription = "复制回答",
-                                modifier = Modifier.size(16.dp),
+                                modifier = Modifier.size(15.dp),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
@@ -237,12 +263,13 @@ private fun ChatBubble(
                 }
             }
 
+            // 生成指标（引擎 / tok/s 等）— 弱化为小标签
             if (!isUser && !message.metrics.isNullOrBlank()) {
                 Text(
                     text = formatMetrics(message.metrics),
                     modifier = Modifier.padding(top = 4.dp, start = 4.dp, end = 4.dp),
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
@@ -255,10 +282,8 @@ private fun ChatBubble(
             )
         }
 
-        // 用户头像（右侧）
-        if (isUser) {
-            Spacer(modifier = Modifier.width(8.dp))
-            UserAvatar()
+        if (!isUser) {
+            Spacer(modifier = Modifier.width(48.dp))
         }
     }
 }
@@ -273,11 +298,14 @@ private fun LoadingBubble() {
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Start
     ) {
-        AssistantAvatar()
-        Spacer(modifier = Modifier.width(8.dp))
         Surface(
-            shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp),
-            color = MaterialTheme.colorScheme.surfaceVariant
+            shape = RoundedCornerShape(
+                topStart = 20.dp,
+                topEnd = 20.dp,
+                bottomStart = 6.dp,
+                bottomEnd = 20.dp
+            ),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
@@ -288,7 +316,7 @@ private fun LoadingBubble() {
                     strokeWidth = 2.dp,
                     color = MaterialTheme.colorScheme.primary
                 )
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(10.dp))
                 Text(
                     text = "思考中…",
                     style = MaterialTheme.typography.bodyMedium,
@@ -310,7 +338,7 @@ private fun ErrorBubble(error: String, onRetry: () -> Unit) {
         horizontalArrangement = Arrangement.Center
     ) {
         Surface(
-            shape = RoundedCornerShape(12.dp),
+            shape = MaterialTheme.shapes.medium,
             color = MaterialTheme.colorScheme.errorContainer
         ) {
             Row(
@@ -320,20 +348,21 @@ private fun ErrorBubble(error: String, onRetry: () -> Unit) {
                 Icon(
                     imageVector = Icons.Default.ErrorOutline,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.error,
+                    tint = MaterialTheme.colorScheme.onErrorContainer,
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = "发送失败",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error
+                    color = MaterialTheme.colorScheme.onErrorContainer
                 )
-                Spacer(modifier = Modifier.width(8.dp))
+                Spacer(modifier = Modifier.width(12.dp))
                 Button(
                     onClick = onRetry,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
                     ),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
                 ) {
@@ -359,29 +388,14 @@ private fun EmptyChatHint() {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 64.dp),
+            .padding(horizontal = 32.dp, vertical = 72.dp),
         contentAlignment = Alignment.Center
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                text = "🧠",
-                style = MaterialTheme.typography.headlineLarge
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = "开始与 Qwen-1.8B 对话",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = "输入消息后发送，AI 将为你生成回复",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.outline,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = 32.dp)
-            )
-        }
+        EmptyState(
+            icon = Icons.AutoMirrored.Filled.Chat,
+            title = "开始新的对话",
+            subtitle = "输入消息后发送，AI 将为你生成回复"
+        )
     }
 }
 
@@ -398,31 +412,37 @@ private fun ChatInputBar(
 ) {
     Surface(
         modifier = Modifier.navigationBarsPadding(),
-        shadowElevation = 8.dp,
-        color = MaterialTheme.colorScheme.surface
+        color = MaterialTheme.colorScheme.surfaceContainerLow
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.Bottom
         ) {
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("输入消息…") },
+                placeholder = {
+                    Text(
+                        "输入消息…",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                },
                 maxLines = 4,
                 enabled = enabled,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
-                shape = RoundedCornerShape(20.dp),
+                shape = RoundedCornerShape(24.dp),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                    unfocusedBorderColor = Color.Transparent,
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh
                 )
             )
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(10.dp))
             IconButton(
                 onClick = onSend,
                 enabled = enabled && text.isNotBlank(),
@@ -433,7 +453,7 @@ private fun ChatInputBar(
                         if (text.isNotBlank() && enabled) {
                             MaterialTheme.colorScheme.primary
                         } else {
-                            MaterialTheme.colorScheme.surfaceVariant
+                            MaterialTheme.colorScheme.surfaceContainerHighest
                         }
                     )
             ) {
@@ -447,42 +467,6 @@ private fun ChatInputBar(
                     }
                 )
             }
-        }
-    }
-}
-
-// ================================================================
-// 头像
-// ================================================================
-
-@Composable
-private fun AssistantAvatar() {
-    Surface(
-        modifier = Modifier.size(36.dp),
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.primaryContainer
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = "🧠",
-                style = MaterialTheme.typography.labelLarge
-            )
-        }
-    }
-}
-
-@Composable
-private fun UserAvatar() {
-    Surface(
-        modifier = Modifier.size(36.dp),
-        shape = CircleShape,
-        color = MaterialTheme.colorScheme.secondaryContainer
-    ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = "👤",
-                style = MaterialTheme.typography.labelLarge
-            )
         }
     }
 }
