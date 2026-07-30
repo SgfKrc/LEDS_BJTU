@@ -28,6 +28,7 @@ Thumbs.db
 
 # Logs
 logs/*.log
+logs/sd15/
 packaging/*.log
 src/import_time.log
 android/.kotlin/
@@ -42,6 +43,7 @@ node_config.json.tmp
 # Model weights (downloaded separately)
 models/qwen-1_8b-chat/
 models/deepseek-*/
+models/sd15-*/
 .hf-cache/
 models/.cache/
 !models/README.md

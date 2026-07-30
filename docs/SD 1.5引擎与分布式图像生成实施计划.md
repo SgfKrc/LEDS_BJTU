@@ -1,6 +1,6 @@
 # SD 1.5 引擎与分布式图像生成实施计划
 
-> 文档状态：规划（`Candidate`，由《总体下一步计划》L4-SD1.5 管理优先级）
+> 文档状态：部分实施（`L4 Candidate`；只有 SD-N1 本地单机基线已验证，仍由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
 >
@@ -8,7 +8,19 @@
 >
 > 总计划入口：[总体下一步计划](总体下一步计划.md)
 
-本文只定义计划，不代表 QLH 当前已经支持 Stable Diffusion。任何阶段只有完成对应自动化、真实模型、真实 GPU、跨设备和安装包验收后，才能把状态改为“已实现”。
+本文同时记录计划与已验证边界。任何阶段只有完成对应自动化、真实模型、真实 GPU、跨设备和安装包验收后，才能把状态改为“已实现”。当前不得因为单机基线通过而宣称已支持分布式图像生成。
+
+## 0. 2026-07-30 实施状态
+
+| 范围 | 状态 | 已验证证据 |
+|---|---|---|
+| `SD-N0` 资产识别与固定下载 | 验证中 | 固定 `stable-diffusion-v1-5/stable-diffusion-v1-5@451f4fe16113bff5a5d2269ed5ad43b0592e9a14`；仅下载 SD 1.5 FP16 推理所需文件，完整快照为 2,742,233,847 bytes，Inspector 识别为可加载 `sd15_pipeline`。完整 single-file checkpoint 的离线结构初始化和全部资产 fixture 仍待完成。 |
+| `SD-N1` 本地单机文生图 | 基线与稳定性已验证，阶段未完成 | RTX 4060 Laptop GPU（8,188 MiB）/ 16 GB RAM、`torch 2.5.1+cu121`、`diffusers 0.35.2`、`transformers 4.47.1`：固定 seed `19950101` 起的 10 次连续 512x512/28 steps 均实际生成成功，耗时 6.909–11.778 s（平均 8.844 s）；每轮 allocated 显存固定为 617,904,128 bytes，reserved 为 643,825,664–648,019,968 bytes，峰值 allocated/reserved 为 2,684,823,040/2,866,806,784 bytes，十张图片尺寸和像素均正常。CUDA 打包 venv 内的 LLM `model_module` 导入也已通过。`diffusers 0.38.0` 会要求本项目兼容窗口外的 DINOv2 配置，故不作为打包组合。真实取消、资产注册/API 和真实 LLM 模型切换回归仍待完成。 |
+| single-file checkpoint、LoRA、ControlNet | 未实施 | Inspector 可以拒绝把 ControlNet 当完整模型；实际加载和组合仍未接入。 |
+| API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 未实施 | 不得显示为分布式，不得计入分布式任务统计。 |
+| Android SD 推理 | 未实施 | Android 仍不承担完整 SD Worker 或层间拆分。 |
+
+本轮运行脚本为 `scripts/smoke_sd15.py`，可复现实测；运行时只接受已下载的本地完整 Diffusers SD 1.5 目录，不会在推理路径访问 Hub。模型下载器和推理侧车仅安装进 CUDA 打包虚拟环境，尚未进入 PC/Android 发布产物。
 
 ---
 
@@ -276,7 +288,7 @@ src/diffusion/
 
 首轮兼容性 spike 使用项目现有 CUDA 虚拟环境，新增独立可选依赖清单，不先污染 CPU/集显包：
 
-- `diffusers`：版本通过 SD 1.5、ControlNet single-file、现有 `transformers==4.47.x` 和 PyTorch 环境矩阵后锁定；候选模型导出版本为 `0.34.0.dev0`，只作兼容线索，不直接使用 dev 版本。
+- `diffusers`：锁定为 `0.35.2`。实测 `0.38.0` 在导入阶段需要 `transformers 4.47.x` 不具备的 `Dinov2WithRegistersConfig`，不能进入本项目打包环境；候选模型导出版本为 `0.34.0.dev0`，只作兼容线索，不直接使用 dev 版本。
 - `Pillow`：输入/输出图片。
 - `safetensors`、`accelerate`、`transformers`、`torch`：复用 CUDA 环境，锁定已验证组合。
 - `xformers`：一期不设为必需；先以 PyTorch SDPA 建立正确性基线，确认 wheel/CUDA 兼容和收益后再作为可选优化。
@@ -447,7 +459,7 @@ validate_input
 
 ### SD-N0：依赖与资产识别 spike
 
-**状态：** `Candidate`
+**状态：** `In Progress`（已完成固定下载、目录 Inspector、ControlNet 防误识别与 CUDA 侧车共存实测；其余完成判据未满足）
 
 **工作：**
 
@@ -459,6 +471,8 @@ validate_input
 **完成判据：** 六类资产识别正确；ControlNet 不被认成 full checkpoint；完整 checkpoint 离线加载到 CPU 完成结构初始化；无网络时错误可解释；输出兼容矩阵与依赖锁。
 
 ### SD-N1：本地原版 SD 1.5 引擎
+
+**状态：** `In Progress`（已在与 LLM 相同 `transformers 4.47.1` 兼容窗口中完成本地加载/卸载、文生图、step 回调、基础取消单测和同一 pipeline 10 轮稳定性；尚未完成注册/API、真实取消与真实 LLM 模型切换回归）。
 
 **依赖：** SD-N0。
 
