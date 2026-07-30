@@ -1,8 +1,8 @@
 # Android 版本远期计划
 
-> 更新日期：2026-07-26
+> 更新日期：2026-07-28
 >
-> 状态：规划与技术预研（分布式部分全部未实施；UI 层已于 2026-07-26 完成重构，见 §2.3）
+> 状态：规划与技术预研（分布式部分全部未实施；UI 层已完成重构并通过 Full Debug Kotlin 编译，见 §2.3）
 >
 > 适用范围：Android Full/Lite 的当前能力边界，以及完整 Worker、任务链、GPU 后端与层段拆分的远期路线；除 §2.1 与 §2.3 外均为未实施规划
 >
@@ -84,7 +84,7 @@ Android Full 使用 GGUF + llama.cpp。其公开 API 面向完整 decode，量�
 
 结论是：**现有 PC PyTorch 层间协议与 Android llama.cpp 不兼容，不能仅靠放开 `pipeline_worker` 标志实现。**
 
-### 2.3 UI 重构（2026-07-26，已完成，未编译验证）
+### 2.3 UI 重构（2026-07-28，已实施并编译验证）
 
 本次改动**只涉及 UI 层**，ViewModel、网络层与服务层零改动，Full/Lite 两个 flavor 通用；它不改变本章任何分布式边界结论。
 
@@ -98,7 +98,7 @@ Android Full 使用 GGUF + llama.cpp。其公开 API 面向完整 decode，量�
 
 详细逐页说明见 [Android UI 改进说明](../android/UI改进说明.md)。
 
-**⚠ 验收状态：未编译验证。** 实施环境无 Android SDK，本次改动未经构建。合入前必须在本地执行 `gradlew.bat assembleFullDebug`，并目视核对暗色模式对比度与长消息气泡限宽。在此之前不得把它记为已验收能力。
+**验收状态：已编译，未运行验收。** 2026-07-28 已执行 `gradlew.bat :app:compileFullDebugKotlin` 并成功通过资源处理、KSP 与 Kotlin 编译。仍须执行 `assembleFullDebug`、安装 APK，并目视核对暗色模式对比度与长消息气泡限宽；在此之前不得把它记为 UI 已验收能力。
 
 新增的 `StatusChip` 用于展示“本地推理 / 远程推理”，这是**执行位置**的展示，不是分布式参与度的展示；§2.1 与 §9 关于“不能把 presence 或普通聊天请求统计为流水线 Worker 任务”的要求不受本次 UI 改动影响。
 
@@ -413,7 +413,7 @@ OpenCL 当前有最明确的上游 Android/Adreno 验证记录，因此建议优
 
 验收：Android 注册不会改变 PC 层配置，任务统计不误报 Android 参与层间推理。
 
-进度（2026-07-26）：P0 的边界约束继续成立（`pipeline_worker=false`、主节点仍排除 Android 层分配）。本次完成的是 §2.3 的 UI 层重构，属于 P0 中“UI 明确区分状态”的配套改造，**未编译验证**；P1–P5 全部未开始。
+进度（2026-07-28）：P0 的边界约束继续成立（`pipeline_worker=false`、主节点仍排除 Android 层分配）。§2.3 的 UI 层重构已通过 Full Debug Kotlin 编译，属于 P0 中“UI 明确区分状态”的配套改造，但尚未安装与目视验收；P1–P5 全部未开始。
 
 ### P1：完整 Worker 协议原型
 

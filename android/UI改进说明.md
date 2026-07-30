@@ -1,5 +1,9 @@
 # QLH Android UI 改进说明
 
+> 复核日期：2026-07-28
+>
+> 验证状态：`gradlew.bat :app:compileFullDebugKotlin` 已通过；APK 组装、安装与真机目视验收待完成。
+
 本次改动仅涉及 UI 层（`ui/` 目录、`MainActivity.kt` 的导航样式），不改变任何
 ViewModel 状态字段、回调、数据层与服务层逻辑。Full / Lite 两个 flavor 通用。
 
