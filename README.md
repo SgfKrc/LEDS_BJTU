@@ -332,7 +332,7 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
 
 | 量化 | 大小 | 说明 |
 |------|------|------|
-| Q3_K_M | ~0.94 GB | 低质量，极限内存 |
+| Q3_K_M | ~0.94 GB | 实验档；14B+ 容量验证或小模型链路 smoke，小模型日常不推荐 |
 | **Q4_K_M** ⭐ | **~1.16 GB** | **推荐 — 速度/质量最佳平衡** |
 | Q5_K_M | ~1.31 GB | 更高质量 |
 | Q8_0 | ~1.82 GB | 近无损 |
@@ -684,6 +684,7 @@ python serve.py
 - [文档状态与维护规则](docs/文档状态与清理清单.md) — 文档状态定义与后续维护规则
 - [整体架构](docs/整体架构.md)
 - [核心技术原理](docs/核心技术原理.md)
+- [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
 
