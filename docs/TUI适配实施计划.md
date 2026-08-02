@@ -204,9 +204,10 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - 测试桩 `gateway/test/fake-scheduler.ts`：§2.2 字段对齐 + 真实 DELETE 语义（queue/task 不存在 → 200 success:false；nodes/{id} 不存在 → 404 detail，对齐 `api_server.py:5715-5732/:5266-5285`）。
   - 验收：用例 4-32、39 转绿（34 passed / 10 skipped）；`contract_diff.py` 双网关对比留待阶段 2 整体验收（旧网关尚未部署）。
 
-- [ ] **T4 设备画像端点代理（#33-35）**
-  - 代理到 scheduler-svc（采集库留 Python）。
-  - 验收：T1 对应用例转绿；画像字段（tier/score/gpus）与旧网关一致。
+- [x] **T4 设备画像端点代理（#33-35）** ✅ 2026-08-02
+  - `gateway/src/modules/device/device.controller.ts`：与 cluster 同模式的 `@All('device/*')` 透传代理到 scheduler-svc（采集库 device_profiler 留 Python，见 §3.2 决策）。
+  - fake-scheduler 补 3 条 device 路由（profile 含 os/cpu/ram/memory/disk/gpus/tier/score 全字段，数值字段 number）。
+  - 验收：用例 33-35 转绿（37 passed / 7 skipped）。
 
 - [ ] **T5 状态聚合端点（#1-3）**
   - `/api/health` 内嵌；`/api/status` 聚合 scheduler+inference+本机；`/api/models/current` 代理 inference-svc。

@@ -66,6 +66,24 @@ const routes: Array<{ method: string; match: RegExp; handler: Handler }> = [
   { method: 'POST', match: /^\/cluster\/queue\/clear$/, handler: () => json(200, { success: true, cleared: 3 }) },
   // 对齐 api_server.py:5715-5732：不存在任务返回 200 + success:false（非 404）
   { method: 'DELETE', match: /^\/cluster\/queue\/task\/[^/]+$/, handler: () => json(200, { success: false, task_id: 'nonexistent-task', message: '任务不存在或已经完成，无法取消' }) },
+  // ---- device 域（TUI §2.2 #33-35；画像采集留 Python，字段对齐旧网关） ----
+  { method: 'GET', match: /^\/device\/profile$/, handler: () => json(200, {
+    os: { system: 'Windows', release: '10.0.22631' },
+    hostname: 'test-pc',
+    cpu: { model: 'Intel(R) Core(TM) i5-12400F', brand: 'Intel', physical_cores: 6, logical_cores: 12 },
+    ram: { total_gb: 16.0, available_gb: 8.5 },
+    memory: { total_gb: 16.0, available_gb: 8.5 },
+    disk: { free_gb: 100.0, total_gb: 512.0 },
+    gpus: [{ name: 'NVIDIA GeForce RTX 3060', gpu_type: 'nvidia', cuda_available: true, vram_total_gb: 12.0 }],
+    selected_gpu_index: 0,
+    tier_label: 'laptop',
+    tier: 2,
+    score_total: 85.5,
+    recommendations: ['推荐使用 INT4 量化档位'],
+    warnings: [],
+  }) },
+  { method: 'POST', match: /^\/device\/select-gpu$/, handler: () => json(200, { selected_gpu: { name: 'NVIDIA GeForce RTX 3060' }, selected_gpu_index: 0, warning: '' }) },
+  { method: 'POST', match: /^\/device\/auto-configure$/, handler: () => json(200, { applied_config: { description: 'laptop 档配置已应用' }, tier: 2, score: 85.5 }) },
 ];
 
 export async function startFakeScheduler(): Promise<FakeScheduler> {

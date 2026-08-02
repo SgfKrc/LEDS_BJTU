@@ -9,7 +9,7 @@
  *   T2（已完成）：用例 1、41、43（用例 41 的 logs 段当前由 catch-all 404 JSON 兜底，
  *        T6 打开真端点后补 status=200 断言）
  *   T3（已完成）：用例 4-32、39（scheduler-svc 测试桩 fake-scheduler.ts）
- *   T4（device 代理）：用例 33-35
+ *   T4（已完成）：用例 33-35（device 透传代理，画像采集留 Python）
  *   T5（状态聚合）：用例 2、3、40、42（用例 40 断言跨 /status、/models/current、
  *        /cluster/nodes、/cluster/queue 四个端点，按"不允许部分断言"整体归 T5）
  *   T6（logs 代理）：用例 36-38、41(logs 段补充 status 断言)
@@ -283,7 +283,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.text).not.toBe(''); // 禁止 204 空体
     });
 
-    it.skip('用例 33: GET /api/device/profile 画像字段（T4）', async () => {
+    it('用例 33: GET /api/device/profile 画像字段（T4）', async () => {
       const res = await request(server()).get('/api/device/profile');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('hostname');
@@ -291,14 +291,14 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('score_total');
     });
 
-    it.skip('用例 34: POST /api/device/select-gpu（T4）', async () => {
+    it('用例 34: POST /api/device/select-gpu（T4）', async () => {
       const res = await request(server())
         .post('/api/device/select-gpu')
         .send({ gpu_index: 0 });
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 35: POST /api/device/auto-configure（T4）', async () => {
+    it('用例 35: POST /api/device/auto-configure（T4）', async () => {
       const res = await request(server()).post('/api/device/auto-configure');
       expect(res.status).toBe(200);
     });

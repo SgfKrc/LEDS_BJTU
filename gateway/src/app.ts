@@ -15,6 +15,7 @@ import { JsonDetailFilter } from './common/json-detail.filter';
 import { RequestIdInterceptor } from './common/request-id';
 import { SchedulerClient } from './clients/scheduler.client';
 import { ClusterController } from './modules/cluster/cluster.controller';
+import { DeviceController } from './modules/device/device.controller';
 import { HealthController } from './modules/health/health.controller';
 
 @Controller()
@@ -28,7 +29,7 @@ export class CatchAllController {
 }
 
 @Module({
-  controllers: [HealthController, ClusterController, CatchAllController],
+  controllers: [HealthController, ClusterController, DeviceController, CatchAllController],
   providers: [SchedulerClient],
 })
 export class AppModule {}
