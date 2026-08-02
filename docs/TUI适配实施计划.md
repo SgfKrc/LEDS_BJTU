@@ -190,11 +190,11 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
 
 > 执行顺序：契约测试先行（TDD），再实现网关适配，最后双网关对比与 TUI 实测。每任务完成后 commit。
 
-- [ ] **T1 建立契约测试骨架**
+- [x] **T1 建立契约测试骨架** ✅ 2026-08-02
   - 新建 `gateway/test/tui-contract.e2e-spec.ts`，按 §4.1 列出 43 个用例（未实现网关适配前允许 skip 标记）。
   - 验收：`npm test -- tui-contract` 可运行（允许 fail/skip），测试清单与 §2.2 全表一一对应（人工核对 38 项）。
 
-- [ ] **T2 网关基础设施（若主计划 2.1 已完成则跳过）**
+- [x] **T2 网关基础设施（若主计划 2.1 已完成则跳过）** ✅ 2026-08-02
   - NestJS + Fastify adapter、`/api` 前缀挂载、request-id 中间件、异常过滤器输出 JSON `detail`（对齐 `api_server.py:319-366`）。
   - 验收：`curl -H "Accept: application/json" localhost:8000/api/health` 返回 `{"status":"ok"}`；未匹配路由返回 JSON 404 `{"detail": ...}`。
 
