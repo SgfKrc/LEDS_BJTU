@@ -7,9 +7,10 @@
  *
  * 打开规则：T1 提交时全部保持 skip（网关适配未实现）；按任务逐个打开——
  *   T2（基础设施）：用例 1、41(health)、43
- *   T3（cluster/queue/layers 代理）：用例 4-32、39(cluster 部分)、40(cluster 部分)
+ *   T3（cluster/queue/layers 代理）：用例 4-32、39(cluster 部分)
  *   T4（device 代理）：用例 33-35
- *   T5（状态聚合）：用例 2、3、40(status)、42
+ *   T5（状态聚合）：用例 2、3、40、42（用例 40 断言跨 /status、/models/current、
+ *        /cluster/nodes、/cluster/queue 四个端点，按"不允许部分断言"整体归 T5）
  *   T6（logs 代理）：用例 36-38、41(logs 部分)、39(logs 不适用)
  * 打开一个用例即要求其断言全绿，不允许部分断言。
  */
@@ -263,7 +264,9 @@ describe('TUI 契约（阶段 2 网关）', () => {
       const res = await request(server()).delete(
         '/api/cluster/queue/task/nonexistent-task',
       );
-      expect(res.status).toBe(404); // 或 200，视 scheduler 语义
+      // T3 打开时先与 scheduler 实际语义对齐：不存在任务应 404 或 200（视实现），
+      // 打开前需确认并写死实际值；本断言为占位，同时是"禁止 204 空体"的强制点。
+      expect(res.status).toBe(404);
       expect(res.headers['content-type']).toContain('application/json');
       expect(res.text).not.toBe(''); // 禁止 204 空体
     });
@@ -348,7 +351,8 @@ describe('TUI 契约（阶段 2 网关）', () => {
       }
 
       const current = await request(server()).get('/api/models/current');
-      if (current.body.gpu_allocated_gb !== null) {
+      // 用 != null 同时放行 null 与 undefined（字段缺失时 JSON.stringify 会省略）
+      if (current.body.gpu_allocated_gb != null) {
         expect(typeof current.body.gpu_allocated_gb).toBe('number');
       }
     });

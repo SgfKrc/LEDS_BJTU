@@ -20,6 +20,8 @@ import {
 
 @Controller()
 export class CatchAllController {
+  // find-my-way 匹配优先级：静态路由 > 参数路由 > 通配符，
+  // 因此 T2 起注册的 /api/health 等真实路由不会被本控制器抢匹配。
   @All('*')
   notFound(@Req() req: any): never {
     throw new NotFoundException(`Route ${req.method}:${req.url} not found`);
