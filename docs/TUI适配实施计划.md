@@ -209,9 +209,11 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - fake-scheduler 补 3 条 device 路由（profile 含 os/cpu/ram/memory/disk/gpus/tier/score 全字段，数值字段 number）。
   - 验收：用例 33-35 转绿（37 passed / 7 skipped）。
 
-- [ ] **T5 状态聚合端点（#1-3）**
-  - `/api/health` 内嵌；`/api/status` 聚合 scheduler+inference+本机；`/api/models/current` 代理 inference-svc。
-  - 验收：T1 用例 1/2/3、40、42 转绿。
+- [x] **T5 状态聚合端点（#1-3）** ✅ 2026-08-02
+  - `gateway/src/clients/forward-client.ts`：公共转发基类（SchedulerClient/InferenceClient 继承，消除复制）；`inference.client.ts` 新增（QLH_INFERENCE_URL，默认 :8010）。
+  - `gateway/src/modules/status/status.controller.ts`：GET /api/status 并行聚合 scheduler `/cluster/status`（run_mode/node_role/node_id/max_nodes）+ inference `/v1/status`（model/gpu/kv_cache）+ `/device/profile`（device 摘要），单源失败回落默认值不 500（网关先行语义）；`modules/models/models.controller.ts`：/api/models/current 透传 inference `/v1/models/current`。
+  - fake-inference.ts 测试桩（/v1/status、/v1/models/current，数值字段 number）；fake-scheduler 补 /cluster/status。
+  - 验收：用例 2、3、40、42 转绿（41 passed / 3 skipped）。
 
 - [ ] **T6 日志端点代理（#36-38）**
   - 搭建 legacy-control 进程（从 api_server 剥离控制面路由，端口 8040；若主计划阶段 2 已含此进程则复用）。

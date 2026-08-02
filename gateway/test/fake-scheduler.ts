@@ -23,6 +23,8 @@ function json(status: number, data: unknown): { status: number; data: unknown } 
 }
 
 const routes: Array<{ method: string; match: RegExp; handler: Handler }> = [
+  // ---- status 域（T5 聚合：/api/status 的节点/角色/模式部分） ----
+  { method: 'GET', match: /^\/cluster\/status$/, handler: () => json(200, { run_mode: 'distributed', node_role: 'master', node_id: 'test-master', max_nodes: 8 }) },
   { method: 'GET', match: /^\/cluster\/my-role$/, handler: () => json(200, { is_master: true, is_provisional: false, runtime_node_role: 'master', node_role: 'master', node_id: 'test-master' }) },
   { method: 'GET', match: /^\/cluster\/nodes$/, handler: () => json(200, {
     count: 2, online_count: 1, offline_count: 1,

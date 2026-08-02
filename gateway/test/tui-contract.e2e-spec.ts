@@ -10,8 +10,8 @@
  *        T6 打开真端点后补 status=200 断言）
  *   T3（已完成）：用例 4-32、39（scheduler-svc 测试桩 fake-scheduler.ts）
  *   T4（已完成）：用例 33-35（device 透传代理，画像采集留 Python）
- *   T5（状态聚合）：用例 2、3、40、42（用例 40 断言跨 /status、/models/current、
- *        /cluster/nodes、/cluster/queue 四个端点，按"不允许部分断言"整体归 T5）
+ *   T5（已完成）：用例 2、3、40、42（/api/status 聚合 scheduler+inference+device，
+ *        /api/models/current 代理 inference-svc；fake-inference.ts 测试桩）
  *   T6（logs 代理）：用例 36-38、41(logs 段补充 status 断言)
  * 打开一个用例即要求其断言全绿，不允许部分断言。
  */
@@ -20,14 +20,19 @@ import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { startFakeScheduler } from './fake-scheduler';
 import type { FakeScheduler } from './fake-scheduler';
+import { startFakeInference } from './fake-inference';
+import type { FakeInference } from './fake-inference';
 
 describe('TUI 契约（阶段 2 网关）', () => {
   let app: NestFastifyApplication | undefined;
   let fake: FakeScheduler | undefined;
+  let fakeInf: FakeInference | undefined;
 
   beforeAll(async () => {
     fake = await startFakeScheduler();
+    fakeInf = await startFakeInference();
     process.env.QLH_SCHEDULER_URL = `http://127.0.0.1:${fake.port}`;
+    process.env.QLH_INFERENCE_URL = `http://127.0.0.1:${fakeInf.port}`;
     app = await createApp();
     await app.init();
     // fastify 的 preReady（fourOhFour 404 context 的 hooks 初始化）在 ready() 时完成；
@@ -39,9 +44,11 @@ describe('TUI 契约（阶段 2 网关）', () => {
 
   afterAll(async () => {
     delete process.env.QLH_SCHEDULER_URL;
+    delete process.env.QLH_INFERENCE_URL;
     // 可选链：beforeAll 失败时避免级联崩溃（fake/app 可能未初始化）
     await app?.close();
     await fake?.close();
+    await fakeInf?.close();
   });
 
   const server = () => app!.getHttpServer();
@@ -67,7 +74,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body.status).toBe('ok');
     });
 
-    it.skip('用例 2: GET /api/status 聚合字段齐全（T5）', async () => {
+    it('用例 2: GET /api/status 聚合字段齐全（T5）', async () => {
       const res = await request(server()).get('/api/status');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('run_mode');
@@ -75,9 +82,12 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('model_loaded');
     });
 
-    it.skip('用例 3: GET /api/models/current（T5）', async () => {
+    it('用例 3: GET /api/models/current', async () => {
       const res = await request(server()).get('/api/models/current');
       expect(res.status).toBe(200);
+      // 对齐 api_server.py:2159-2178 返回形状
+      expect(res.body).toHaveProperty('loaded');
+      expect(res.body).toHaveProperty('engine');
     });
 
     it('用例 4: GET /api/cluster/my-role（T3）', async () => {
@@ -357,7 +367,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       }
     });
 
-    it.skip('用例 40: 数值字段类型必须为 number（T3/T5）', async () => {
+    it('用例 40: 数值字段类型必须为 number', async () => {
       const status = await request(server()).get('/api/status');
       expect(typeof status.body.gpu?.utilization).toBe('number');
       expect(typeof status.body.device?.score).toBe('number');
@@ -395,7 +405,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(logs.headers['content-type']).toContain('application/json');
     });
 
-    it.skip('用例 42: /api/status 含 gpu/kv_cache/device 嵌套对象（T5）', async () => {
+    it('用例 42: /api/status 含 gpu/kv_cache/device 嵌套对象', async () => {
       const res = await request(server()).get('/api/status');
       expect(res.body.gpu).toBeDefined();
       expect(res.body.kv_cache).toBeDefined();
