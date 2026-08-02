@@ -10,7 +10,8 @@ import { Controller, Get } from '@nestjs/common';
 @Controller('health')
 export class HealthController {
   @Get()
-  health(): { status: string } {
-    return { status: 'ok' };
+  health(): { status: string; timestamp: number } {
+    // 对齐 api_server.py:1667-1670：status + timestamp（time.time()）
+    return { status: 'ok', timestamp: Date.now() / 1000 };
   }
 }
