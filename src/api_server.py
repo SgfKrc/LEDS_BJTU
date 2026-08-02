@@ -87,9 +87,8 @@ except ImportError:
     close_db = lambda: None
     db_health = lambda: {"status": "unavailable", "message": "psycopg2 未安装"}
 
-# _db_available 动态追踪实际连接状态：启动时尝试连接，失败则标记 False
+# model_host._db_available 动态追踪实际连接状态：启动时尝试连接，失败则标记 False
 # _db_importable 仅表示 psycopg2 已安装（静态）
-_db_available = _db_importable
 
 # 本地文件储存（云数据库不可用时的降级方案）
 import local_store as _local_store
@@ -110,55 +109,16 @@ class RequestIdFilter(logging.Filter):
 _request_id_filter = RequestIdFilter()
 
 
-class _LazyModelManager:
-    """Delay importing model_module until the model manager is first used."""
-
-    __slots__ = ("_instance", "_lock")
-    _instance: Any
-    _lock: Any
-
-    def __init__(self):
-        object.__setattr__(self, "_instance", None)
-        object.__setattr__(self, "_lock", threading.RLock())
-
-    def _get_instance(self):
-        instance = self._instance
-        if instance is not None:
-            return instance
-        with self._lock:
-            instance = self._instance
-            if instance is None:
-                from model_module import ModelManager
-                instance = ModelManager()
-                object.__setattr__(self, "_instance", instance)
-        return instance
-
-    def __getattr__(self, name):
-        return getattr(self._get_instance(), name)
-
-    def __setattr__(self, name, value):
-        if name in self.__slots__:
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._get_instance(), name, value)
-
-    def __delattr__(self, name):
-        if name in self.__slots__:
-            raise AttributeError(name)
-        delattr(self._get_instance(), name)
-
-    def __repr__(self):
-        instance = self._instance
-        if instance is None:
-            return "<_LazyModelManager unloaded>"
-        return repr(instance)
-
 
 def _current_node_id_safe() -> str:
     try:
         return scheduler.get_effective_node_id()
     except Exception:
-        return NODE_ID
+        try:
+            from node_runtime import node_runtime
+            return node_runtime.get_node_id()
+        except Exception:
+            return NODE_ID
 
 
 def _current_device_ip_safe() -> str:
@@ -369,7 +329,11 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 # 全局状态
 # ============================================================
 
-model_manager = _LazyModelManager()
+# 推理宿主单例（阶段 0.2/0.4：api_server 与 scheduler 共享；model_manager 为
+# 兼容名，属性读写代理到内部 ModelManager）
+from model_host import model_host
+
+model_manager = model_host
 kv_cache: Optional[PagedKVCache] = None
 active_session_id: Optional[str] = None           # 当前活跃会话 ID
 session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
@@ -379,18 +343,9 @@ conversation_stats: dict = {                    # 累计对话统计（实际消
     "total_time_seconds": 0.0,
     "rounds": 0,
 }
-current_quant: str = QUANT_TYPE
-model_loaded: bool = False
 device_profile: Optional[dict] = None           # 设备画像缓存
 _device_profile_ready = threading.Event()
 _device_profile_started = False
-generation_config: dict = {
-    "max_new_tokens": 1024,          # laptop 档默认值
-    "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "do_sample": True,
-}
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
@@ -441,7 +396,6 @@ def _create_task_graph_coordinator() -> TaskGraphCoordinator:
 
 task_graph_coordinator = _create_task_graph_coordinator()
 _task_graph_execution_slot = threading.BoundedSemaphore(1)
-_full_chat_execution_lock = threading.RLock()
 _generation_registry_lock = threading.RLock()
 _generation_cancel_events: dict[str, threading.Event] = {}
 _generation_pending_cancellations: dict[str, float] = {}
@@ -513,7 +467,7 @@ def _serialized_conversation_mutation(func):
     """Run synchronous conversation mutations under the full-chat lock."""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with _full_chat_execution_lock:
+        with model_host.full_chat_execution_lock:
             return func(*args, **kwargs)
     return wrapper
 
@@ -533,7 +487,7 @@ def _run_exclusive_model_change(
     change, prepare=None, *, release_worker_reservation: bool = False,
 ):
     """Block inference, invalidate old worker ACKs, then refresh the new model."""
-    with _full_chat_execution_lock:
+    with model_host.full_chat_execution_lock:
         if prepare is not None:
             prepare()
         with scheduler._inference_lock:
@@ -644,8 +598,7 @@ async def _startup_device_detection():
         set_active_node_id(active_scheduler.get_effective_node_id())
         logger.info(f"数据库已连接，活跃节点: {active_scheduler.get_effective_node_id()}")
     except Exception as e:
-        global _db_available
-        _db_available = False
+        model_host._db_available = False
         runtime = scheduler_module.get_database_status()
         if runtime.get("configured", True):
             logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
@@ -690,7 +643,7 @@ async def _shutdown_resources():
     """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
     try:
-        with _full_chat_execution_lock:
+        with model_host.full_chat_execution_lock:
             task_graph_coordinator.close()
     except Exception as e:
         logger.warning(f"任务图 journal 关闭异常: {e}")
@@ -1164,7 +1117,7 @@ def _switch_session(target_id: str) -> None:
     # 如果目标会话不在内存中，尝试从 DB 或本地文件加载
     if target_id not in session_histories:
         messages = []
-        if _db_available:
+        if model_host._db_available:
             try:
                 import db as _db_mod
                 rows = _db_mod.get_conversation(target_id)
@@ -1209,7 +1162,7 @@ def _auto_title_session(session_id: str, first_message: str) -> None:
     title = first_message.strip()[:30]
     if len(first_message.strip()) > 30:
         title += "..."
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             _db_mod.update_session_title(session_id, title)
@@ -1683,10 +1636,10 @@ async def get_presets():
     """
     # 根据当前加载的量化类型估算速度
     speed_map = {"fp16": 53, "int8": 10, "int4": 29}
-    tok_s = speed_map.get(current_quant if model_loaded else "int4", 29)
+    tok_s = speed_map.get(model_host.current_quant if model_host.model_loaded else "int4", 29)
 
     # 从设备画像获取档位，调整预估
-    max_tokens = generation_config.get("max_new_tokens", 512)
+    max_tokens = model_host.generation_config.get("max_new_tokens", 512)
 
     presets = [
         {
@@ -1754,7 +1707,7 @@ async def get_presets():
     return {
         "presets": presets,
         "current_speed_tok_s": tok_s,
-        "current_quant": current_quant if model_loaded else None,
+        "model_host.current_quant": model_host.current_quant if model_host.model_loaded else None,
         "max_new_tokens": max_tokens,
     }
 
@@ -1891,7 +1844,7 @@ async def auto_configure():
     更新 KV 缓存大小、序列长度、生成参数等运行时配置。
     不重新加载模型（如需切换量化精度，请手动调用 /api/models/load）。
     """
-    global kv_cache, device_profile, generation_config
+    global kv_cache, device_profile
 
     if device_profile is None:
         try:
@@ -1918,11 +1871,11 @@ async def auto_configure():
     cfg.MAX_SEQ_LEN = config["max_seq_len"]
 
     # 更新生成配置（设置档位上限）
-    generation_config["max_new_tokens"] = config["max_new_tokens"]
-    generation_config["tier_max_new_tokens"] = config["max_new_tokens"]
+    model_host.generation_config["max_new_tokens"] = config["max_new_tokens"]
+    model_host.generation_config["tier_max_new_tokens"] = config["max_new_tokens"]
 
     # 如果 KV 缓存已存在，重建
-    if kv_cache and model_loaded:
+    if kv_cache and model_host.model_loaded:
         kv_cache.clear()
         from paged_kv_cache import PagedKVCache
         kv_cache = PagedKVCache(
@@ -1962,7 +1915,7 @@ async def select_gpu(req: SelectGpuRequest):
 
     游戏本默认使用独显（CUDA 加速），用户可手动切换到集显（低功耗）。
     """
-    global device_profile, model_loaded
+    global device_profile
 
     if device_profile is None:
         raise HTTPException(400, "设备画像未就绪，请先调用 GET /api/device/profile")
@@ -2003,7 +1956,7 @@ async def select_gpu(req: SelectGpuRequest):
         "device": profiler.recommend_config()["device"],
         "warning": (
             "切换 GPU 后需要重新加载模型才能生效。"
-            if model_loaded
+            if model_host.model_loaded
             else None
         ),
     }
@@ -2073,7 +2026,7 @@ async def get_status():
         }
 
     active_info = {}
-    if model_loaded and model_manager.is_loaded:
+    if model_host.model_loaded and model_manager.is_loaded:
         try:
             active_info = model_manager.get_model_info()
         except Exception:
@@ -2134,13 +2087,13 @@ async def get_status():
             speculative_status = {"enabled": True, "error": str(exc)[:200]}
 
     return {
-        "model_loaded": model_loaded,
-        "current_quant": current_quant,
-        "use_compile": USE_COMPILE if model_loaded else False,
+        "model_loaded": model_host.model_loaded,
+        "model_host.current_quant": model_host.current_quant,
+        "use_compile": USE_COMPILE if model_host.model_loaded else False,
         "model_name": active_info.get("model_name", MODEL_NAME),
         "model_path": active_info.get("model_path", MODEL_PATH),
-        "active_model_id": active_info.get("model_id", model_manager.active_model_id if model_loaded else None),
-        "engine": active_info.get("engine", "") if model_loaded else "",
+        "active_model_id": active_info.get("model_id", model_manager.active_model_id if model_host.model_loaded else None),
+        "engine": active_info.get("engine", "") if model_host.model_loaded else "",
         "island": island_status,
         "external": external_status,
         "speculative": speculative_status,
@@ -2151,7 +2104,7 @@ async def get_status():
         "gpu": gpu_info,
         "kv_cache": kv_stats,
         "conversation_turns": len(_get_active_history()),
-        "generation_config": generation_config,
+        "generation_config": model_host.generation_config,
         "device": device_summary,
     }
 
@@ -2159,7 +2112,7 @@ async def get_status():
 @app.get("/api/models/current")
 async def get_current_model():
     """当前模型信息"""
-    if not model_loaded:
+    if not model_host.model_loaded:
         return {"loaded": False, "quant_type": None, "model_id": None}
 
     info = model_manager.get_model_info()
@@ -2167,7 +2120,7 @@ async def get_current_model():
     return {
         "loaded": True,
         "model_id": model_manager.active_model_id,
-        "quant_type": current_quant,
+        "quant_type": model_host.current_quant,
         "model_name": info.get("model_name", MODEL_NAME),
         "model_path": info.get("model_path", ""),
         "engine": info.get("engine", ""),
@@ -2186,7 +2139,7 @@ async def load_model(req: LoadModelRequest):
     耗时约 5-20 秒（取决于量化类型），期间会先卸载旧模型。
     使用 switch_model 获得失败时自动回滚到上一个模型的保护。
     """
-    global model_loaded, current_quant, kv_cache, conversation_stats
+    global kv_cache, conversation_stats
 
     engine = req.engine.lower()
     if engine not in ("auto", "llama_cpp", "pytorch", "island"):
@@ -2209,7 +2162,7 @@ async def load_model(req: LoadModelRequest):
         def _prepare_model_load() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _reset_runtime_conversation_state(clear_histories=True)
-            if _db_available:
+            if model_host._db_available:
                 try:
                     import db as _db_mod
                     _db_mod.clear_conversation("default")
@@ -2232,9 +2185,9 @@ async def load_model(req: LoadModelRequest):
         )
 
         if result["success"]:
-            model_loaded = True
-            current_quant = getattr(model_manager, "quant_type", None) or quant
-            generation_config["use_compile"] = req.use_compile
+            model_host.model_loaded = True
+            model_host.current_quant = getattr(model_manager, "quant_type", None) or quant
+            model_host.generation_config["use_compile"] = req.use_compile
 
             # 初始化 KV 缓存
             _init_kv_cache()
@@ -2249,22 +2202,22 @@ async def load_model(req: LoadModelRequest):
         else:
             # 切换失败 — 检查是否回滚成功
             if model_manager.is_loaded:
-                model_loaded = True
-                current_quant = model_manager.quant_type or (
+                model_host.model_loaded = True
+                model_host.current_quant = model_manager.quant_type or (
                     "gguf" if model_manager._engine_type == "llama_cpp"
                     else "island" if model_manager._engine_type == "island"
                     else QUANT_TYPE
                 )
                 _init_kv_cache()
             else:
-                model_loaded = False
-                current_quant = QUANT_TYPE
+                model_host.model_loaded = False
+                model_host.current_quant = QUANT_TYPE
             raise HTTPException(status_code=500, detail=result["error"])
 
     except HTTPException:
         raise
     except Exception as e:
-        model_loaded = False
+        model_host.model_loaded = False
         logger.error(f"模型加载失败: {e}", exc_info=True)
         raise HTTPException(500, f"模型加载失败: {str(e)}")
 
@@ -2405,7 +2358,7 @@ def _execute_external_chat(
         {"role": "assistant", "content": response_text},
     ])
 
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             if _db_mod.get_save_history():
@@ -2417,7 +2370,7 @@ def _execute_external_chat(
                 _db_mod.increment_session_message_count(db_session_id)
         except Exception:
             pass
-    if not _db_available:
+    if not model_host._db_available:
         try:
             _local_store.save_local_message(db_session_id, "user", req.message)
             save_metrics = dict(metrics)
@@ -2641,7 +2594,7 @@ def _execute_task_graph_chat(
     if not _task_graph_execution_slot.acquire(blocking=False):
         raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
     try:
-        with _full_chat_execution_lock:
+        with model_host.full_chat_execution_lock:
             return _execute_task_graph_chat_with_slot(req, cancel_event)
     finally:
         _task_graph_execution_slot.release()
@@ -2676,7 +2629,7 @@ def _ensure_local_task_provider() -> None:
 
 
 def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
-    if not model_loaded or not model_manager.is_loaded:
+    if not model_host.model_loaded or not model_manager.is_loaded:
         return None
     engine = str(getattr(model_manager, "_engine_type", "") or "")
     model_path = str(getattr(model_manager, "_model_path", "") or "")
@@ -3327,7 +3280,7 @@ def _execute_task_graph_chat_with_slot(
     save_metrics["followups"] = followups
 
     db_session_id = target_session_id or "default"
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             if _db_mod.get_save_history():
@@ -3338,7 +3291,7 @@ def _execute_task_graph_chat_with_slot(
                 _db_mod.increment_session_message_count(db_session_id)
         except Exception:
             pass
-    if not _db_available:
+    if not model_host._db_available:
         try:
             _local_store.save_local_message(
                 db_session_id, "user", req.message,
@@ -3411,7 +3364,7 @@ def _execute_chat_full(
             raise
         except Exception as exc:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            if not model_loaded or not model_manager.is_loaded:
+            if not model_host.model_loaded or not model_manager.is_loaded:
                 if req.prefer_external:
                     raise HTTPException(
                         502,
@@ -3468,7 +3421,7 @@ def _execute_chat_full(
                     forward_metrics["fallback_reason"] = external_fallback_reason
 
                 db_session_id = target_session_id or "default"
-                if _db_available:
+                if model_host._db_available:
                     try:
                         import db as _db_mod
                         if _db_mod.get_save_history():
@@ -3478,7 +3431,7 @@ def _execute_chat_full(
                             _db_mod.increment_session_message_count(db_session_id)
                     except Exception:
                         pass
-                if not _db_available:
+                if not model_host._db_available:
                     try:
                         _local_store.save_local_message(db_session_id, "user", req.message)
                         _local_store.save_local_message(db_session_id, "assistant", response_text,
@@ -3523,7 +3476,7 @@ def _execute_chat_full(
                 "本设备正作为 PyTorch 分层从节点，"
                 "当前无法转发到主节点，已拒绝覆盖分层模型。",
             )
-        if not model_loaded or not model_manager.is_loaded:
+        if not model_host.model_loaded or not model_manager.is_loaded:
             _auto_load_default_model()
 
     if _pipeline_worker_is_reserved():
@@ -3575,7 +3528,7 @@ def _execute_chat_full(
                         pipeline_metrics["fallback_reason"] = (
                             external_fallback_reason
                         )
-                    if _db_available:
+                    if model_host._db_available:
                         try:
                             import db as _db_mod
                             if _db_mod.get_save_history():
@@ -3585,7 +3538,7 @@ def _execute_chat_full(
                                 _db_mod.increment_session_message_count(db_session_id)
                         except Exception:
                             pass
-                    if not _db_available:
+                    if not model_host._db_available:
                         try:
                             _local_store.save_local_message(db_session_id, "user", req.message)
                             _local_store.save_local_message(db_session_id, "assistant",
@@ -3685,7 +3638,7 @@ def _execute_chat_full(
                 {"role": "assistant", "content": response_text},
             ])
 
-            if _db_available:
+            if model_host._db_available:
                 try:
                     import db as _db_mod
                     if _db_mod.get_save_history():
@@ -3697,7 +3650,7 @@ def _execute_chat_full(
                         _db_mod.increment_session_message_count(db_session_id)
                 except Exception:
                     pass
-            if not _db_available:
+            if not model_host._db_available:
                 try:
                     _local_store.save_local_message(db_session_id, "user", req.message)
                     save_metrics = dict(metrics)
@@ -3741,14 +3694,14 @@ def _execute_chat_full(
     # ---- PyTorch 引擎路径（CUDA/独显）----
     try:
         model_manager.ensure_full_model()
-        tier_max = generation_config.get("tier_max_new_tokens", generation_config["max_new_tokens"])
+        tier_max = model_host.generation_config.get("tier_max_new_tokens", model_host.generation_config["max_new_tokens"])
         thinking_budget = 384 if req.show_thinking else 0
         effective_max = min(req.max_new_tokens + thinking_budget,
                             tier_max + thinking_budget,
                             4096)
-        generation_config["max_new_tokens"] = effective_max
-        generation_config["temperature"] = req.temperature
-        generation_config["top_p"] = req.top_p
+        model_host.generation_config["max_new_tokens"] = effective_max
+        model_host.generation_config["temperature"] = req.temperature
+        model_host.generation_config["top_p"] = req.top_p
 
         request_history = [
             *history,
@@ -3854,7 +3807,7 @@ def _execute_chat_full(
             {"role": "assistant", "content": response_text},
         ])
 
-        if _db_available:
+        if model_host._db_available:
             try:
                 import db as _db_mod
                 if _db_mod.get_save_history():
@@ -3865,7 +3818,7 @@ def _execute_chat_full(
                     _db_mod.increment_session_message_count(db_session_id)
             except Exception:
                 pass
-        if not _db_available:
+        if not model_host._db_available:
             try:
                 save_metrics = dict(metrics)
                 save_metrics["followups"] = followups
@@ -3952,14 +3905,14 @@ def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
             503,
             "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
         )
-    if model_loaded and model_manager.is_loaded:
+    if model_host.model_loaded and model_manager.is_loaded:
         return
     _auto_load_default_model()
 
 
 def _auto_load_default_model():
     """自动加载默认模型（用于 thin client / Android 首次请求时服务端无模型的情况）。"""
-    global model_loaded, current_quant, kv_cache, conversation_stats
+    global kv_cache, conversation_stats
 
     import config as cfg
     import glob
@@ -3988,8 +3941,8 @@ def _auto_load_default_model():
             "total_time_seconds": 0.0,
             "rounds": 0,
         }
-        model_loaded = True
-        current_quant = "island"
+        model_host.model_loaded = True
+        model_host.current_quant = "island"
         scheduler.refresh_task_worker_capabilities()
         logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
         return
@@ -4049,8 +4002,8 @@ def _auto_load_default_model():
         "total_time_seconds": 0.0,
         "rounds": 0,
     }
-    model_loaded = True
-    current_quant = getattr(model_manager, "quant_type", None) or quant
+    model_host.model_loaded = True
+    model_host.current_quant = getattr(model_manager, "quant_type", None) or quant
     scheduler.refresh_task_worker_capabilities()
     elapsed = time.time() - t0
     logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
@@ -4071,14 +4024,14 @@ async def chat(req: ChatRequest):
 
     def _run_chat_request():
         if req.execution_mode == "task_graph":
-            if not model_loaded or not model_manager.is_loaded:
+            if not model_host.model_loaded or not model_manager.is_loaded:
                 raise HTTPException(
                     409,
                     "任务链实验要求先加载本地完整模型。",
                 )
             return _execute_requested_chat(req, cancel_event)
-        with _full_chat_execution_lock:
-            if not model_loaded or not model_manager.is_loaded:
+        with model_host.full_chat_execution_lock:
+            if not model_host.model_loaded or not model_manager.is_loaded:
                 try:
                     _ensure_chat_model_or_forwarding(req)
                 except FileNotFoundError:
@@ -4221,14 +4174,14 @@ async def chat_stream(req: ChatRequest, request: Request):
 
             def _execute_full_stream_request():
                 if req.execution_mode == "task_graph":
-                    if not model_loaded or not model_manager.is_loaded:
+                    if not model_host.model_loaded or not model_manager.is_loaded:
                         raise HTTPException(
                             409,
                             "任务链实验要求先加载本地完整模型。",
                         )
                     return _execute_requested_chat(req, cancel_event)
-                with _full_chat_execution_lock:
-                    if not model_loaded or not model_manager.is_loaded:
+                with model_host.full_chat_execution_lock:
+                    if not model_host.model_loaded or not model_manager.is_loaded:
                         _ensure_chat_model_or_forwarding(req)
                     return _execute_requested_chat(req, cancel_event)
 
@@ -4284,7 +4237,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 return
             # 外部失败 → 与 /api/chat 同语义：优先回退本地路径
             if req.prefer_external and not (
-                model_loaded and model_manager.is_loaded
+                model_host.model_loaded and model_manager.is_loaded
             ):
                 yield _error_event(
                     f"外部推理服务调用失败，且本地无可用推理引擎：{external_error}"
@@ -4341,7 +4294,7 @@ async def chat_stream(req: ChatRequest, request: Request):
             )
             return
 
-        if not model_loaded or not model_manager.is_loaded:
+        if not model_host.model_loaded or not model_manager.is_loaded:
             loop = _asyncio.get_running_loop()
             try:
                 await _run_with_request_id(loop, _auto_load_default_model)
@@ -4840,10 +4793,10 @@ async def list_available_models():
 
     return {
         "models": pytorch_quants + gguf_quants + island_quants + external_quants,
-        "current": current_quant if model_loaded else None,
+        "current": model_host.current_quant if model_host.model_loaded else None,
         "current_engine": (
             model_manager._engine_type
-            if model_loaded and model_manager.is_loaded
+            if model_host.model_loaded and model_manager.is_loaded
             else None
         ),
         "available_engines": available_engines,
@@ -4875,7 +4828,7 @@ class RegisterModelRequest(BaseModel):
 def _get_db_experimental_models() -> list[dict]:
     """从 DB 读取用户注册的实验模型（安全包装）。"""
     try:
-        if _db_available:
+        if model_host._db_available:
             from db import get_experimental_models
             return get_experimental_models()
     except Exception:
@@ -5067,7 +5020,7 @@ async def list_models():
 
     return {
         "models": models_data,
-        "active_model_id": model_manager.active_model_id if model_loaded else None,
+        "active_model_id": model_manager.active_model_id if model_host.model_loaded else None,
     }
 
 
@@ -5079,7 +5032,7 @@ async def switch_model(req: SwitchModelRequest):
     会卸载当前模型，然后加载新模型。
     仅 CUDA 环境可用（非 CUDA 返回 403）。
     """
-    global model_loaded, current_quant, kv_cache, conversation_stats
+    global kv_cache, conversation_stats
 
     # 验证 engine 参数
     engine = req.engine.lower()
@@ -5114,24 +5067,24 @@ async def switch_model(req: SwitchModelRequest):
         )
 
         if result["success"]:
-            model_loaded = True
-            current_quant = getattr(model_manager, "quant_type", None) or quant
+            model_host.model_loaded = True
+            model_host.current_quant = getattr(model_manager, "quant_type", None) or quant
             _init_kv_cache()
             scheduler.refresh_task_worker_capabilities()
             return result
         else:
             # 切换失败 — 检查是否回滚成功
             if model_manager.is_loaded:
-                model_loaded = True
+                model_host.model_loaded = True
                 # P3修复: llama_cpp 引擎无 quant_type（GGUF 自带量化），回退到 "gguf"
-                current_quant = model_manager.quant_type or (
+                model_host.current_quant = model_manager.quant_type or (
                     "gguf" if model_manager._engine_type == "llama_cpp"
                     else "island" if model_manager._engine_type == "island"
                     else QUANT_TYPE
                 )
             else:
-                model_loaded = False
-                current_quant = QUANT_TYPE
+                model_host.model_loaded = False
+                model_host.current_quant = QUANT_TYPE
             raise HTTPException(status_code=500, detail=result["error"])
 
     except HTTPException:
@@ -5156,7 +5109,7 @@ async def register_model(req: RegisterModelRequest):
     """
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
-    if not _db_available:
+    if not model_host._db_available:
         raise HTTPException(status_code=503, detail="数据库不可用，无法注册模型。")
 
     config = {
@@ -5190,7 +5143,7 @@ async def unregister_model(model_id: str):
 
     不会删除磁盘上的模型文件，仅取消注册。
     """
-    if not _db_available:
+    if not model_host._db_available:
         raise HTTPException(status_code=503, detail="数据库不可用。")
 
     # 不允许删除内置模型
@@ -6163,7 +6116,7 @@ async def get_user_settings():
     返回完整的 settings JSON，与 localStorage 格式一致。
     如果数据库不可用，返回空 dict（前端使用 localStorage 值）。
     """
-    if not _db_available:
+    if not model_host._db_available:
         return {"settings": {}, "source": "none"}
     try:
         import db as _db_mod
@@ -6186,7 +6139,7 @@ async def update_user_settings(req: UserSettingsRequest):
     前端在更新 localStorage 后调用此接口同步到云端。
     同时同步 save_history 和 distributed_inference 到各自的专用键。
     """
-    if not _db_available:
+    if not model_host._db_available:
         return {"status": "skipped", "reason": "数据库不可用"}
     try:
         import db as _db_mod
@@ -6219,7 +6172,7 @@ async def get_conversation_sync_status():
     获取对话历史云同步状态。
     """
     save_history = False
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             save_history = _db_mod.get_save_history()
@@ -6228,10 +6181,10 @@ async def get_conversation_sync_status():
 
     return {
         "save_history": save_history,
-        "db_connected": _db_available,
+        "db_connected": model_host._db_available,
         "local_save_enabled": True,  # localStorage 始终可用
         "local_store_enabled": True,  # 本地文件降级始终可用
-        "cloud_sync_enabled": save_history and _db_available,
+        "cloud_sync_enabled": save_history and model_host._db_available,
     }
 
 
@@ -6247,7 +6200,7 @@ async def get_conversations(session_id: str = "default", limit: int = 200):
     如果数据库不可用，回退到内存中的对话历史（按 session_id 过滤）。
     """
     # ---- 加载顺序: 数据库 → 本地文件 → 内存 ----
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             messages = _db_mod.get_conversation(session_id, limit)
@@ -6305,14 +6258,14 @@ def delete_conversations(session_id: str = "default"):
     )
     deleted_count = 0
 
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             deleted_count = _db_mod.clear_conversation(resolved_session_id)
             logger.info(f"数据库对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
         except Exception as e:
             logger.warning(f"数据库清空对话历史失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             deleted_count = _local_store.clear_local_conversation(resolved_session_id)
             logger.info(f"本地对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
@@ -6368,13 +6321,13 @@ def create_session(req: Optional[CreateSessionRequest] = None):
         title = req.title
 
     # 持久化到数据库（或本地文件降级）
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             _db_mod.create_session(session_id, title)
         except Exception as e:
             logger.warning(f"数据库创建会话失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             _local_store.create_local_session(session_id, title)
         except Exception as e:
@@ -6398,7 +6351,7 @@ async def list_sessions(limit: int = 50, offset: int = 0):
     """
     获取所有会话列表（按 updated_at DESC 排序）。
     """
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             db_sessions = _db_mod.get_all_sessions(limit, offset)
@@ -6454,7 +6407,7 @@ async def list_sessions(limit: int = 50, offset: int = 0):
 @app.get("/api/sessions/{session_id}")
 async def get_session_info(session_id: str):
     """获取单个会话的元数据"""
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             session = _db_mod.get_session(session_id)
@@ -6485,7 +6438,7 @@ async def get_session_info(session_id: str):
 @app.put("/api/sessions/{session_id}")
 async def rename_session(session_id: str, req: RenameSessionRequest):
     """重命名会话"""
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             updated = _db_mod.update_session_title(session_id, req.title)
@@ -6493,7 +6446,7 @@ async def rename_session(session_id: str, req: RenameSessionRequest):
                 return updated
         except Exception as e:
             logger.warning(f"数据库重命名会话失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             updated = _local_store.update_local_session_title(session_id, req.title)
             if updated:
@@ -6514,13 +6467,13 @@ def delete_session(session_id: str):
     global active_session_id
 
     deleted = 0
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             deleted = _db_mod.delete_session(session_id)
         except Exception as e:
             logger.warning(f"数据库删除会话失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             deleted = _local_store.delete_local_session(session_id)
         except Exception as e:
@@ -6574,7 +6527,7 @@ def delete_turn(session_id: str, turn_index: int):
     history = session_histories.get(session_id, [])
     if not history:
         # 尝试从 DB 或本地文件加载
-        if _db_available:
+        if model_host._db_available:
             try:
                 import db as _db_mod
                 rows = _db_mod.get_conversation(session_id)
@@ -6598,14 +6551,14 @@ def delete_turn(session_id: str, turn_index: int):
 
     # 从 DB 或本地文件删除
     deleted_count = 0
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             deleted_count = _db_mod.delete_message_range(session_id, turn_index)
             _db_mod.decrement_session_message_count(session_id, 2)
         except Exception as e:
             logger.warning(f"数据库删除消息失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             deleted_count = _local_store.delete_local_message_range(session_id, turn_index)
             _local_store.decrement_local_session_message_count(session_id, 2)
@@ -7575,6 +7528,19 @@ else:
 # ============================================================
 # 启动入口
 # ============================================================
+
+# ============================================================
+# 阶段 0.2：向 model_host 挂载 scheduler 需要的回调（消除 scheduler
+# 对 api_server 的运行时反向 import）
+# ============================================================
+model_host.attach("_execute_task_worker_stage", _execute_task_worker_stage)
+model_host.attach("_active_task_graph_model_identity", _active_task_graph_model_identity)
+model_host.attach("_build_model_chat_prompt", _build_model_chat_prompt)
+model_host.attach("THINKING_SYSTEM_PROMPT", THINKING_SYSTEM_PROMPT)
+model_host.attach("_snapshot_recent_logs", _snapshot_recent_logs)
+model_host.attach("_filter_recent_logs", _filter_recent_logs)
+model_host.attach("_format_model_response", _format_model_response)
+
 
 if __name__ == "__main__":
     import uvicorn

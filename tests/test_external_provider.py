@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from model_host import model_host
 
 import external_provider as ep
 from external_provider import (
@@ -698,8 +699,8 @@ def api_env(monkeypatch, tmp_path):
         mock_sched.get_distributed_inference_enabled.return_value = False
         mock_sched.has_pipeline_worker_reservation.return_value = False
         mock_sched._max_nodes = 3
-        monkeypatch.setattr(api_server, "model_loaded", False)
-        monkeypatch.setattr(api_server, "_db_available", False)
+        monkeypatch.setattr(model_host, "model_loaded", False)
+        monkeypatch.setattr(model_host, "_db_available", False)
         monkeypatch.setattr(api_server, "_local_store", MagicMock())
         # 本地无可自动加载的模型（指向空目录）
         monkeypatch.setattr(
@@ -857,7 +858,7 @@ def test_chat_falls_back_to_local_on_backend_down(monkeypatch, api_env):
         timeout=2,
     )
     api_server = api_env["api_server"]
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "model_manager", _FakeLocalLlamaManager())
     response = api_env["client"].post("/api/chat", json={
         "message": "触发长上下文外发的消息",

@@ -68,15 +68,15 @@ async def monitor_cluster_metrics(
                 # 提取关键指标
                 metrics = {
                     "timestamp": time.time(),
-                    "mode": status.get("mode", "unknown"),
+                    "mode": status.get("run_mode", status.get("mode", "unknown")),
                     "master_state": status.get("master", {}).get("state", "unknown"),
-                    "slave_count": len(status.get("slaves", [])),
+                    "slave_count": len(list(status.get("nodes", {}).values())),
                     "online_slaves": sum(
-                        1 for s in status.get("slaves", [])
+                        1 for s in list(status.get("nodes", {}).values())
                         if s.get("state") == "online"
                     ),
                     "busy_slaves": sum(
-                        1 for s in status.get("slaves", [])
+                        1 for s in list(status.get("nodes", {}).values())
                         if s.get("state") == "busy"
                     ),
                     "total_tasks": status.get("total_tasks", 0),
@@ -212,10 +212,10 @@ async def test_distributed_inference(
 
             # 检查集群状态
             status = await sender.get_cluster_status()
-            mode = status.get("mode", "unknown")
-            actual_slave_count = len(status.get("slaves", []))
+            mode = status.get("run_mode", status.get("mode", "unknown"))
+            actual_slave_count = len(list(status.get("nodes", {}).values()))
             online_slaves = sum(
-                1 for s in status.get("slaves", [])
+                1 for s in list(status.get("nodes", {}).values())
                 if s.get("state") == "online"
             )
 

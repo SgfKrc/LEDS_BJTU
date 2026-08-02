@@ -266,10 +266,10 @@ async def test_stress(
 
         async with RequestSender() as sender:
             status = await sender.get_cluster_status()
-            mode = status.get("mode", "unknown")
-            actual_slave_count = len(status.get("slaves", []))
+            mode = status.get("run_mode", status.get("mode", "unknown"))
+            actual_slave_count = len(list(status.get("nodes", {}).values()))
             online_slaves = sum(
-                1 for s in status.get("slaves", [])
+                1 for s in list(status.get("nodes", {}).values())
                 if s.get("state") == "online"
             )
 

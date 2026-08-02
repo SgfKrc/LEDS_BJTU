@@ -227,10 +227,20 @@ def apply_runtime_config(response: dict[str, Any]) -> None:
         if cluster.get("master_tcp_port"):
             cfg.CLIENT_MASTER_PORT = int(cluster["master_tcp_port"])
         if node.get("node_id"):
-            cfg.NODE_ID = str(node["node_id"])
-            _sync_loaded_module_attr("scheduler", "NODE_ID", cfg.NODE_ID)
+            _node_id = str(node["node_id"])
+            try:
+                from node_runtime import node_runtime
+                node_runtime.set_node_id(_node_id)
+            except Exception:
+                pass
+            _sync_loaded_module_attr("scheduler", "NODE_ID", _node_id)
         if node.get("role"):
-            cfg.NODE_ROLE = str(node["role"])
-            _sync_loaded_module_attr("scheduler", "NODE_ROLE", cfg.NODE_ROLE)
+            _role = str(node["role"])
+            try:
+                from node_runtime import node_runtime
+                node_runtime.set_node_role(_role)
+            except Exception:
+                pass
+            _sync_loaded_module_attr("scheduler", "NODE_ROLE", _role)
     except Exception:
         pass

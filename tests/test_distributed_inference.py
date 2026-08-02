@@ -24,6 +24,9 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+# 加载 api_server 以执行 model_host.attach(...)（阶段 0.2：scheduler 回调挂载）
+import api_server  # noqa: F401,E402
+
 from transformers import Qwen2Config, Qwen2ForCausalLM
 from transformers import AutoTokenizer
 
@@ -106,17 +109,17 @@ def scheduler():
 @pytest.fixture
 def mgr(tiny_model):
     """创建 ModelManager 并注入 tiny 模型 + mock tokenizer。"""
-    import api_server as _api
+    from model_host import model_host as _host
 
-    _api.model_manager = None
+    _host._manager = None
     tokenizer = MockTokenizer()
     mgr = ModelManager()
     mgr.model = tiny_model
     mgr.tokenizer = tokenizer
     mgr._engine_type = "pytorch"
-    _api.model_manager = mgr
+    _host._manager = mgr
     yield mgr
-    _api.model_manager = None
+    _host._manager = None
 
 
 # ================================================================
