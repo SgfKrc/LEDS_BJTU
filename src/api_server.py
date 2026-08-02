@@ -1707,7 +1707,7 @@ async def get_presets():
     return {
         "presets": presets,
         "current_speed_tok_s": tok_s,
-        "model_host.current_quant": model_host.current_quant if model_host.model_loaded else None,
+        "current_quant": model_host.current_quant if model_host.model_loaded else None,
         "max_new_tokens": max_tokens,
     }
 
@@ -2088,7 +2088,7 @@ async def get_status():
 
     return {
         "model_loaded": model_host.model_loaded,
-        "model_host.current_quant": model_host.current_quant,
+        "current_quant": model_host.current_quant,
         "use_compile": USE_COMPILE if model_host.model_loaded else False,
         "model_name": active_info.get("model_name", MODEL_NAME),
         "model_path": active_info.get("model_path", MODEL_PATH),

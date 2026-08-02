@@ -131,11 +131,12 @@ class ModelHost:
         object.__setattr__(self, name, value)
 
     def __getattr__(self, name):
-        # manager 缺失（测试注入 None / 未初始化）时返回 None，
-        # 兼容原 scheduler 侧 getattr(_api, "model_manager", None) 短路语义
-        if self._manager is None:
-            return None
-        return getattr(self._manager, name)
+        # object.__getattribute__ 直接取 _manager，避免 _manager 被 del 后
+        # 经 __getattr__ 访问自身导致无限递归
+        mgr = object.__getattribute__(self, "_manager")
+        if mgr is None:
+            return None  # manager 缺失（测试注入 None）时模拟原 getattr(..., None) 语义
+        return getattr(mgr, name)
 
     def __setattr__(self, name, value):
         if name in _OWN_ATTRS:

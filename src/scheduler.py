@@ -3519,13 +3519,12 @@ class Scheduler:
 
         models = []
         try:
-            lazy_manager = self._host
-            manager = getattr(getattr(self._host, "_manager", None), "_instance", None)
+            # 阶段 0.2：完整模型判定直接走 host 代理（不依赖内部 manager 容器
+            # 的 _instance 结构，阶段 1 替换远程 host 适配器后依然成立）
             full_model_loaded = bool(
                 getattr(self._host, "model_loaded", False)
-                and manager is not None
-                and getattr(manager, "is_loaded", False)
-                and getattr(manager, "layer_range", None) is None
+                and getattr(self._host, "is_loaded", False)
+                and getattr(self._host, "layer_range", None) is None
             )
             if full_model_loaded:
                 identity = self._host._active_task_graph_model_identity()
