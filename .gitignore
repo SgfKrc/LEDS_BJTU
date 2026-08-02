@@ -69,3 +69,6 @@ packaging/.venv-packaging/
 
 # Temp / to-delete
 _to_delete/
+
+# Reasonix local tool config
+reasonix.toml
