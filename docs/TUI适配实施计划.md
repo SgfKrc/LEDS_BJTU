@@ -221,10 +221,12 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - 测试：jest 直接 spawn Python 桩（真实网关→Python 链路）；用例 36-38 打开；用例 41 补 logs 段 status=200 + 带 token 透传断言。
   - 验收：**44/44 全部用例通过（0 skipped）**。
 
-- [ ] **T7 TUI 实测（验收主体）**
-  - 主节点角色：7 屏全走查（总览/节点/分布式/队列/画像/日志/设置），动作面全执行一遍（连接、注册、注销、分层覆盖、队列策略、备用主节点设置等）。
+- [x] **T7 TUI 实测（验收主体）** ✅ 2026-08-02（自动化走查通过）
+  - 主节点角色：7 屏全走查（总览/节点/分布式/队列/画像/日志/设置），动作面全执行一遍（连接、注册、注销、删除、分层覆盖、队列策略、备用主节点设置等）。
   - 从节点视角：`tui_admin.py --host <主节点> --port 8000`（或 Tailscale IP），重点验证 `/cluster/master-health`（#8）与远程日志（#36-38）。
   - 验收：**tui_admin.py 零改动**，7 屏 × 2 角色全部通过；无"内部错误"屏（数值字段类型问题会在此暴露）。
+  - **自动化走查**：`scripts/tui_walkthrough.py --mode master|client`（驱动 `tui_admin.py --plain`，喂入全动作输入序列，断言屏幕齐全 + 无错误屏 + 动作结果全出现）。配套 `scripts/dev_stubs.py --client-mode`（模拟从节点身份）。实测：master 7 屏 × 23 动作全通过；client 从节点视角（Dashboard + Nodes master-health 分支 + 远程日志）通过。
+  - 排障记录：① TUI 对 `distributed-inference`/`layers`/`max-nodes` 用 **PUT**（act_toggle/act_override/act_max_nodes），桩补 PUT 路由；② `act_connect` 在主节点身份下有隐藏 confirm（切换为从节点），走查序列需补输入；③ 日志屏渲染桩日志 ERROR 级记录为 `[错误] 20xx-...` 行，属合法日志内容，错误屏断言需排除时间戳格式行。
 
 - [ ] **T8 回归与收尾**
   - `pytest -q`（Python 侧回归）；前端 9/9（确认网关改动未破坏 Web 面）。
