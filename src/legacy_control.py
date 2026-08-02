@@ -36,6 +36,57 @@ SAMPLE_LOGS = [
     {"level": "INFO", "time": "2026-08-02 10:03:00", "name": "api_server", "message": "chat 请求完成 duration_ms=1234"},
 ]
 
+# ---- 控制面端点桩（阶段 2 过渡：legacy-control 承载控制面域） ----
+# 阶段 3 由 control-svc(TS) 实现真实逻辑；此处返回契约形状的空数据/默认值。
+# 覆盖域：sessions / conversations / settings / review / workflows / bootstrap /
+#         models registry / downloadable / gguf / files / download
+CONTROL_EMPTY = {
+    "sessions": [],
+    "conversations": [],
+    "workflows": [],
+    "review/tickets": [],
+    "models/registry": [],
+    "models/downloadable": [],
+    "models/gguf": [],
+}
+
+
+def _control_response(path: str, method: str):
+    """控制面端点的桩响应：GET 列表类返回空结构，其余返回操作成功确认。"""
+    if method == "GET":
+        for key in ("models/registry", "models/downloadable", "models/gguf"):
+            if path.startswith("/" + key):
+                return {"status": "ok", key.split("/")[-1]: []}
+        if path.startswith("/review/tickets"):
+            return {"tickets": []}
+        if path.startswith("/sessions"):
+            return {"sessions": []}
+        if path.startswith("/conversations"):
+            return {"conversations": [], "sync_status": {"dirty": False}}
+        if path.startswith("/workflows"):
+            return {"workflows": []}
+        if path.startswith("/settings"):
+            return {"settings": {}}
+        if path.startswith("/bootstrap/info"):
+            return {"available": True, "identity_verified": False}
+        if path.startswith("/review/can-vote"):
+            return {"can_vote": True}
+        return {"status": "ok"}
+    # POST/PUT/DELETE：操作确认（空体场景禁止 204）
+    if path.startswith("/bootstrap/first-connect"):
+        return {"status": "ok", "identity_verified": True}
+    if path.startswith("/sessions"):
+        return {"session_id": "stub-session", "status": "ok"}
+    if path.startswith("/review"):
+        return {"ticket_id": "stub-ticket", "status": "ok"}
+    if path.startswith("/workflows"):
+        return {"workflow_id": "stub-workflow", "status": "ok"}
+    if path.startswith("/models/registry"):
+        return {"model_id": "stub-model", "status": "ok"}
+    if path.startswith("/models/download/"):
+        return {"status": "ok", "downloaded": True}
+    return {"status": "ok"}
+
 
 def _list_log_files(log_dir: str) -> list:
     files = []
@@ -105,12 +156,47 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"files": _list_log_files(self.log_dir)})
         elif path == "/logs/stats":
             self._send(200, _stats(self.log_dir))
+        elif path.startswith(("/sessions", "/conversations", "/settings",
+                              "/review", "/workflows", "/bootstrap",
+                              "/models/registry", "/models/downloadable",
+                              "/models/gguf", "/models/files")):
+            self._send(200, _control_response(path, "GET"))
         else:
             self._send(404, {"detail": f"Route GET:{path} not found"})
+
+    def _handle_write(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        Handler.seen_requests.append({"method": method, "path": path, "token": self.headers.get("X-QLH-Log-Token", "")})
+        if path.startswith(("/sessions", "/conversations", "/settings",
+                            "/review", "/workflows", "/bootstrap",
+                            "/models/registry", "/models/downloadable",
+                            "/models/download/", "/models/gguf")):
+            self._send(200, _control_response(path, method))
+        else:
+            self._send(404, {"detail": f"Route {method}:{path} not found"})
 
     def do_GET(self) -> None:
         try:
             self._handle_get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self) -> None:
+        try:
+            self._handle_write("POST")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_PUT(self) -> None:
+        try:
+            self._handle_write("PUT")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_DELETE(self) -> None:
+        try:
+            self._handle_write("DELETE")
         except (BrokenPipeError, ConnectionResetError):
             pass
 

@@ -1,9 +1,10 @@
 /**
- * inference-svc 测试桩（T5 契约测试用）
+ * inference-svc 测试桩（T5/T6 + 阶段 2 其余域用）
  *
  * 内部契约对齐 docs/微服务架构改造计划.md §4.1：
- *   GET /v1/status → 模型/GPU/KV 缓存状态（数值字段 number）
- *   GET /v1/models/current → 对外形状对齐 api_server.py:2159-2178
+ *   GET  /v1/status、/v1/models/current、/v1/models/available
+ *   POST /v1/chat、/v1/chat/stream(SSE)、/v1/chat/cancel、/v1/chat/clear、
+ *        /v1/models/load、/v1/models/switch、/v1/speculative/run
  */
 import http from 'http';
 import type { AddressInfo } from 'net';
@@ -13,6 +14,15 @@ export interface FakeInference {
   requests: Array<{ method: string; path: string; body?: unknown }>;
   close(): Promise<void>;
 }
+
+const SSE_BODY = [
+  'data: {"delta":"你"}',
+  '',
+  'data: {"delta":"好"}',
+  '',
+  'data: [DONE]',
+  '',
+].join('\n');
 
 const routes: Array<{ method: string; match: RegExp; data: unknown }> = [
   {
@@ -61,6 +71,46 @@ const routes: Array<{ method: string; match: RegExp; data: unknown }> = [
       gpu_reserved_gb: 2.0,
     },
   },
+  {
+    method: 'GET',
+    match: /^\/v1\/models\/available$/,
+    data: {
+      models: [
+        { model_id: 'qwen-1_8b-chat', name: 'Qwen 1.8B Chat', engine: 'torch' },
+        { model_id: 'qwen-1_8b-chat-gguf', name: 'Qwen 1.8B Chat GGUF', engine: 'llama_cpp' },
+      ],
+    },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/chat$/,
+    data: { reply: '桩回复：你好，我是 QLH。', session_id: 'stub-session' },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/chat\/clear$/,
+    data: { cleared: true },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/chat\/cancel$/,
+    data: { status: 'cancelled', generation_id: 'stub-gen' },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/models\/load$/,
+    data: { status: 'loaded', model_id: 'qwen-1_8b-chat', engine: 'torch' },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/models\/switch$/,
+    data: { status: 'switched', model_id: 'qwen-1_8b-chat-gguf', engine: 'llama_cpp' },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/speculative\/run$/,
+    data: { accepted: 0, drafted: 0, verified: 1, note: 'stub' },
+  },
 ];
 
 export async function startFakeInference(): Promise<FakeInference> {
@@ -78,6 +128,17 @@ export async function startFakeInference(): Promise<FakeInference> {
     const path = (req.url || '/').split('?')[0];
     const method = req.method || 'GET';
     requests.push({ method, path, body });
+
+    // SSE 流式端点：text/event-stream 逐行透传
+    if (method === 'POST' && path === '/v1/chat/stream') {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+      res.end(SSE_BODY);
+      return;
+    }
 
     const route = routes.find((r) => r.method === method && r.match.test(path));
     const status = route ? 200 : 404;

@@ -13,4 +13,23 @@ export class InferenceClient extends ForwardClient {
       timeoutMs,
     );
   }
+
+  /**
+   * SSE 流式 chat 原始转发（/api/chat/stream → /v1/chat/stream）。
+   * 返回未消费的 fetch Response，由控制器管道到客户端响应；支持中断。
+   */
+  async chatStreamRaw(
+    body: unknown,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    return fetch(this.baseUrl + '/v1/chat/stream', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify(body ?? {}),
+      signal,
+    });
+  }
 }

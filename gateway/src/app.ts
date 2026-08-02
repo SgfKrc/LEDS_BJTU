@@ -17,7 +17,10 @@ import { InferenceClient } from './clients/inference.client';
 import { LegacyControlClient } from './clients/legacy.client';
 import { SchedulerClient } from './clients/scheduler.client';
 import { ClusterController } from './modules/cluster/cluster.controller';
+import { ChatController } from './modules/chat/chat.controller';
+import { ControlController } from './modules/control/control.controller';
 import { DeviceController } from './modules/device/device.controller';
+import { ExperimentalController } from './modules/experimental/experimental.controller';
 import { HealthController } from './modules/health/health.controller';
 import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
@@ -41,6 +44,9 @@ export class CatchAllController {
     StatusController,
     ModelsController,
     LogsController,
+    ChatController,
+    ControlController,
+    ExperimentalController,
     CatchAllController,
   ],
   providers: [SchedulerClient, InferenceClient, LegacyControlClient],
