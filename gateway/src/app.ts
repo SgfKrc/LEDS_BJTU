@@ -14,10 +14,12 @@ import {
 import { JsonDetailFilter } from './common/json-detail.filter';
 import { RequestIdInterceptor } from './common/request-id';
 import { InferenceClient } from './clients/inference.client';
+import { LegacyControlClient } from './clients/legacy.client';
 import { SchedulerClient } from './clients/scheduler.client';
 import { ClusterController } from './modules/cluster/cluster.controller';
 import { DeviceController } from './modules/device/device.controller';
 import { HealthController } from './modules/health/health.controller';
+import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
 import { StatusController } from './modules/status/status.controller';
 
@@ -38,9 +40,10 @@ export class CatchAllController {
     DeviceController,
     StatusController,
     ModelsController,
+    LogsController,
     CatchAllController,
   ],
-  providers: [SchedulerClient, InferenceClient],
+  providers: [SchedulerClient, InferenceClient, LegacyControlClient],
 })
 export class AppModule {}
 

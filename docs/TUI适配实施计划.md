@@ -215,10 +215,11 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - fake-inference.ts 测试桩（/v1/status、/v1/models/current，数值字段 number）；fake-scheduler 补 /cluster/status。
   - 验收：用例 2、3、40、42 转绿（41 passed / 3 skipped）。
 
-- [ ] **T6 日志端点代理（#36-38）**
-  - 搭建 legacy-control 进程（从 api_server 剥离控制面路由，端口 8040；若主计划阶段 2 已含此进程则复用）。
-  - 网关 `/api/logs/*` 反向代理，透传 `X-QLH-Log-Token`，允许无 token。
-  - 验收：T1 用例 36-38、41 转绿；远程模式（`tui_admin.py --host <主节点> --port 8000`）日志屏可读。
+- [x] **T6 日志端点代理（#36-38）** ✅ 2026-08-02
+  - **legacy-control Python 桩**：`src/legacy_control.py`（纯标准库零依赖，未来 legacy-control 进程原型；`/logs/recent`、`/logs`、`/logs/stats`，X-QLH-Log-Token 可选，stdout 探活 `LEGACY_CONTROL_LISTENING:<port>`）。
+  - 网关 `gateway/src/modules/logs/logs.controller.ts`：`/api/logs` 与 `/api/logs/*` 均透传 legacy-control（拆两个方法——fastify adapter 下同一方法叠加多个 @All 会覆盖）；`ForwardClient` 增加 `extraHeaders` 参数透传 X-QLH-Log-Token；`clients/legacy.client.ts`（QLH_LEGACY_CONTROL_URL，默认 :8040）。
+  - 测试：jest 直接 spawn Python 桩（真实网关→Python 链路）；用例 36-38 打开；用例 41 补 logs 段 status=200 + 带 token 透传断言。
+  - 验收：**44/44 全部用例通过（0 skipped）**。
 
 - [ ] **T7 TUI 实测（验收主体）**
   - 主节点角色：7 屏全走查（总览/节点/分布式/队列/画像/日志/设置），动作面全执行一遍（连接、注册、注销、分层覆盖、队列策略、备用主节点设置等）。
