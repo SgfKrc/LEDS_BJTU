@@ -15,7 +15,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import type { FastifyReply } from 'fastify';
-import type { RequestWithRequestId } from './request-id';
+import { normalizeRequestId, RequestWithRequestId } from './request-id';
 
 @Catch()
 export class JsonDetailFilter implements ExceptionFilter {
@@ -25,7 +25,11 @@ export class JsonDetailFilter implements ExceptionFilter {
     const ctx = host.switchToHttp();
     const res = ctx.getResponse<FastifyReply>();
     const req = ctx.getRequest<RequestWithRequestId>();
-    const requestId = req.requestId || '-';
+    // 拦截器未执行时（fastify 层提前拒绝：malformed JSON body、body 过大等），
+    // req.requestId 为 undefined —— 对齐 Python 中间件（call_next 外层生成 uuid），
+    // 此处 fallback 生成真实 request_id，而非回写 '-'
+    // （api_server.py:319-341 在 call_next 外层 try/finally 中回写 X-Request-ID）。
+    const requestId = req.requestId || normalizeRequestId(undefined);
 
     let status = 500;
     let detail: unknown = '服务器内部错误，请查看后端日志';
