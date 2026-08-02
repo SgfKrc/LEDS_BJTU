@@ -20,6 +20,7 @@ import time
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -31,6 +32,7 @@ from island_engine import (
     IslandStreamInterruptedError,
     IslandTimeoutError,
     IslandUnreachableError,
+    _classify_httpx_error,
     mask_island_url,
 )
 
@@ -49,11 +51,14 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         behavior = self.server.behavior
@@ -111,9 +116,12 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         "finish_reason": None,
                     }],
                 }
-                self.wfile.write(
-                    ("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode("utf-8")
-                )
+                try:
+                    self.wfile.write(
+                        ("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode("utf-8")
+                    )
+                except (BrokenPipeError, ConnectionResetError):
+                    return
             if behavior.get("truncate_stream"):
                 return  # 不发 finish_reason / [DONE]，模拟流中断
             final = {
@@ -127,10 +135,13 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                     "total_tokens": 12 + len(chunks),
                 },
             }
-            self.wfile.write(
-                ("data: " + json.dumps(final, ensure_ascii=False) + "\n\n").encode("utf-8")
-            )
-            self.wfile.write(b"data: [DONE]\n\n")
+            try:
+                self.wfile.write(
+                    ("data: " + json.dumps(final, ensure_ascii=False) + "\n\n").encode("utf-8")
+                )
+                self.wfile.write(b"data: [DONE]\n\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self._send_json({
                 "id": "chatcmpl-mock",
@@ -286,16 +297,35 @@ def _closed_port() -> int:
     return port
 
 
-def test_backend_down_raises_clean_unreachable_error():
+def test_transport_error_classification_is_platform_independent():
+    unreachable = _classify_httpx_error(
+        httpx.ConnectError("connection refused"),
+        "http://127.0.0.1:1",
+    )
+    timeout = _classify_httpx_error(
+        httpx.ConnectTimeout("timed out"),
+        "http://127.0.0.1:1",
+    )
+
+    assert isinstance(unreachable, IslandUnreachableError)
+    assert "孤岛后端不可达" in str(unreachable)
+    assert isinstance(timeout, IslandTimeoutError)
+    assert "孤岛后端超时" in str(timeout)
+
+
+def test_backend_down_raises_clean_transport_error():
     engine = IslandEngine()
-    with pytest.raises(IslandUnreachableError) as excinfo:
+    with pytest.raises((IslandUnreachableError, IslandTimeoutError)) as excinfo:
         engine.load_model(
             base_url=f"http://127.0.0.1:{_closed_port()}",
             timeout=3,
             connect_timeout=1,
         )
     message = str(excinfo.value)
-    assert "孤岛后端不可达" in message
+    if isinstance(excinfo.value, IslandUnreachableError):
+        assert "孤岛后端不可达" in message
+    else:
+        assert "孤岛后端超时" in message
     # 错误消息不应泄露原始 traceback / 内部异常 repr
     assert "Traceback" not in message
     assert "ConnectError(" not in message

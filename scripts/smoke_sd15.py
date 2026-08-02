@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from diffusion import SD15Engine, SD15GenerationRequest, get_preset
+from diffusion import SD15Engine, SD15EngineConfig, SD15GenerationRequest, get_preset
 
 
 def _cuda_memory_snapshot() -> dict[str, int]:
@@ -39,17 +39,48 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--output-dir", default="logs/sd15")
     parser.add_argument("--repeat", type=int, default=1, help="Continuous runs on one loaded pipeline")
+    parser.add_argument(
+        "--quantization",
+        choices=("none", "bitsandbytes_8bit_unet"),
+        default="none",
+        help="Quantize only the SD U-Net; this selects resident CUDA execution.",
+    )
+    parser.add_argument(
+        "--qkv-fusion",
+        action="store_true",
+        help="Use Diffusers fused Q/K/V attention projections on the U-Net.",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Compile the resident CUDA U-Net; the first run includes compilation time.",
+    )
+    parser.add_argument("--torch-compile-mode", default="reduce-overhead")
     args = parser.parse_args()
     if args.repeat < 1 or args.repeat > 20:
         raise SystemExit("--repeat 必须在 1-20 之间")
 
     preset = get_preset(args.preset)
-    engine = SD15Engine()
+    resident_unet = args.quantization != "none" or args.torch_compile
+    engine = SD15Engine(
+        SD15EngineConfig(
+            quantization=args.quantization,
+            enable_qkv_fusion=args.qkv_fusion,
+            enable_attention_slicing=not args.qkv_fusion,
+            enable_torch_compile=args.torch_compile,
+            torch_compile_mode=args.torch_compile_mode,
+            enable_model_cpu_offload=not resident_unet,
+        )
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     runs = []
+    capabilities = {}
+    runtime_device = "cpu"
     try:
         artifact = engine.load(args.model_path)
+        capabilities = engine.capabilities
+        runtime_device = engine.device
         for index in range(args.repeat):
             request = SD15GenerationRequest(
                 prompt=preset.prompt,
@@ -79,11 +110,12 @@ def main() -> int:
         "elapsed_seconds": runs[0]["elapsed_seconds"],
         "metadata": {
             "engine": "diffusers_sd15",
-            "device": engine.device,
+            "device": runtime_device,
             "width": preset.width,
             "height": preset.height,
             "steps": args.steps,
             "guidance_scale": preset.guidance_scale,
+            "capabilities": capabilities,
         },
         "runs": runs,
     }

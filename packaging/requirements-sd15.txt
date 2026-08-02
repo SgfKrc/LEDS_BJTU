@@ -9,3 +9,6 @@ Pillow>=10.0.0
 safetensors>=0.4.5
 accelerate>=1.0.0
 huggingface_hub>=0.32.0
+# Needed only for SD15EngineConfig.quantization=bitsandbytes_8bit_unet.
+# It stays in the CUDA sidecar and outside LLM/global packaging environments.
+bitsandbytes>=0.49.0,<0.50.0

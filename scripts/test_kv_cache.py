@@ -225,9 +225,40 @@ def test_exact_page_boundary():
     cache.clear()
 
 
+def test_truncate_and_reuse():
+    """尾部回滚: 跨页截断、尾页 used 回退与空页复用"""
+    logger.info("--- 1.8 尾部回滚与页面复用 ---")
+    cache = PagedKVCache(page_size=16, max_pages=MAX_PAGES, device=DEVICE)
+
+    original_k, original_v = random_kv(50)
+    cache.append_kv(original_k, original_v)
+    check(cache.allocated_page_count == 4, "回滚前分配4页")
+
+    cache.truncate(19)
+    check(cache.total_tokens == 31, "回滚后token=31")
+    check(cache.allocated_page_count == 2, "完整空出的2页已回收")
+    check(cache.free_page_count == 2, "空闲池新增2页")
+    check(cache._current_page.used == 15, "尾页used回退到15")
+
+    tail_k, tail_v = random_kv(20)
+    cache.append_kv(tail_k, tail_v)
+    all_k, all_v = cache.get_all_kv()
+    expected_k = torch.cat((original_k[:, :31, :], tail_k), dim=1)
+    expected_v = torch.cat((original_v[:, :31, :], tail_v), dim=1)
+    check(torch.allclose(all_k, expected_k, atol=1e-5), "回滚再追加K往返一致")
+    check(torch.allclose(all_v, expected_v, atol=1e-5), "回滚再追加V往返一致")
+    check(cache.allocated_page_count == 4, "追加后复用回收页")
+    check(cache.free_page_count == 0, "复用后空闲池无残留")
+
+    cache.truncate(cache.total_tokens)
+    check(cache.total_tokens == 0, "全量回滚后token=0")
+    check(cache.allocated_page_count == 0, "全量回滚后无活跃页")
+    check(cache.free_page_count == 4, "全量回滚后4页全部可复用")
+
+
 def test_max_capacity():
     """边界: 达到最大容量限制"""
-    logger.info("--- 1.8 最大容量限制 ---")
+    logger.info("--- 1.9 最大容量限制 ---")
     tiny_max = 3  # 只允许3页
     cache = PagedKVCache(page_size=16, max_pages=tiny_max, device=DEVICE)
 
@@ -422,6 +453,7 @@ def main():
     test_get_kv_window()
     test_empty_cache()
     test_exact_page_boundary()
+    test_truncate_and_reuse()
     test_max_capacity()
     test_device_dtype()
     test_stats()

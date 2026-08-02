@@ -1,6 +1,6 @@
 # SD 1.5 引擎与分布式图像生成实施计划
 
-> 文档状态：部分实施（`L4 Candidate`；只有 SD-N1 本地单机基线已验证，仍由《总体下一步计划》L4-SD1.5 管理优先级）
+> 文档状态：部分实施（`L4 Candidate`；SD-N1 本地单机基线、8-bit U-Net Linear 量化和 QKV 融合已验证，仍由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
 >
@@ -15,12 +15,23 @@
 | 范围 | 状态 | 已验证证据 |
 |---|---|---|
 | `SD-N0` 资产识别与固定下载 | 验证中 | 固定 `stable-diffusion-v1-5/stable-diffusion-v1-5@451f4fe16113bff5a5d2269ed5ad43b0592e9a14`；仅下载 SD 1.5 FP16 推理所需文件，完整快照为 2,742,233,847 bytes，Inspector 识别为可加载 `sd15_pipeline`。完整 single-file checkpoint 的离线结构初始化和全部资产 fixture 仍待完成。 |
-| `SD-N1` 本地单机文生图 | 基线与稳定性已验证，阶段未完成 | RTX 4060 Laptop GPU（8,188 MiB）/ 16 GB RAM、`torch 2.5.1+cu121`、`diffusers 0.35.2`、`transformers 4.47.1`：固定 seed `19950101` 起的 10 次连续 512x512/28 steps 均实际生成成功，耗时 6.909–11.778 s（平均 8.844 s）；每轮 allocated 显存固定为 617,904,128 bytes，reserved 为 643,825,664–648,019,968 bytes，峰值 allocated/reserved 为 2,684,823,040/2,866,806,784 bytes，十张图片尺寸和像素均正常。CUDA 打包 venv 内的 LLM `model_module` 导入也已通过。`diffusers 0.38.0` 会要求本项目兼容窗口外的 DINOv2 配置，故不作为打包组合。真实取消、资产注册/API 和真实 LLM 模型切换回归仍待完成。 |
+| `SD-N1` 本地单机文生图 | 基线与优化已验证，阶段未完成 | RTX 4060 Laptop GPU（8,188 MiB）/ 16 GB RAM、`torch 2.5.1+cu121`、`diffusers 0.35.2`、`transformers 4.47.1`：固定 seed `19950101` 起的 10 次连续 512x512/28 steps FP16 baseline 均实际生成成功，耗时 6.909–11.778 s（平均 8.844 s）；另以 8-bit U-Net Linear 量化 + QKV 融合组合完成 512x512/28 steps，耗时 10.030 s，峰值 reserved 显存 3,735,027,712 bytes。CUDA 打包 venv 内的 LLM `model_module` 导入也已通过。`diffusers 0.38.0` 会要求本项目兼容窗口外的 DINOv2 配置，故不作为打包组合。真实取消、资产注册/API、分布式 Worker 和真实 LLM 模型切换回归仍待完成。 |
 | single-file checkpoint、LoRA、ControlNet | 未实施 | Inspector 可以拒绝把 ControlNet 当完整模型；实际加载和组合仍未接入。 |
 | API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 未实施 | 不得显示为分布式，不得计入分布式任务统计。 |
 | Android SD 推理 | 未实施 | Android 仍不承担完整 SD Worker 或层间拆分。 |
 
 本轮运行脚本为 `scripts/smoke_sd15.py`，可复现实测；运行时只接受已下载的本地完整 Diffusers SD 1.5 目录，不会在推理路径访问 Hub。模型下载器和推理侧车仅安装进 CUDA 打包虚拟环境，尚未进入 PC/Android 发布产物。
+
+### 0.1 单机优化能力边界
+
+| 能力 | 状态 | 实现与实测边界 |
+|---|---|---|
+| U-Net 8-bit 量化 | 已验证 | `bitsandbytes 0.49.2` 只替换 U-Net 的 184 个 `torch.nn.Linear` 为 `Linear8bitLt`，卷积、CLIP、VAE 和 safety checker 仍为 FP16。512x512/28 steps 实机出图成功，耗时 9.629 s，峰值 reserved 显存为 3,409,969,152 bytes。量化 U-Net 为常驻 CUDA 路径，代码禁止与 CPU offload 混用。 |
+| Attention QKV 算子融合 | 已验证 | 通过 Diffusers `fuse_qkv_projections(unet=True, vae=False)`。512x512/8 steps 实机出图成功；与 8-bit U-Net 组合后 512x512/28 steps 也成功，单次耗时 10.030 s，峰值 reserved 显存为 3,735,027,712 bytes。同一已加载 pipeline 以三个不同 seed 连续运行 28 steps，峰值 reserved 显存均保持为该值；耗时会受 GPU 背景负载波动，不能据此宣称融合提升吞吐。它与 attention slicing 不能同时启用，QKV profile 保留 VAE slicing。 |
+| `torch.compile` / Inductor | 当前不可用，显式拒绝 | 当前 CUDA sidecar 没有可工作的 Triton，首次真实调用会失败。引擎在加载模型前检查并给出短错误，不会等到去噪首步才抛出长异常；不为了该可选优化把未验证的 Triton 依赖加入侧车。 |
+| LLM `PagedKVCache` | 不适用，非缺陷 | SD 1.5 U-Net 的每一步输入 latent 都会变化，没有可跨去噪步复用的自回归 KV Cache。不得将文本引擎的 token KV 分页标为 SD 优化；SD 的受支持显存分块手段是 Diffusers attention slicing。 |
+
+这些优化全部位于 `src/diffusion/sd15_engine.py` 的延迟导入侧车中。它们不导入或改写 LLM `ModelManager`、文本 Worker 契约、集显包、Android 依赖和既有全局解释器；SD 仍未注册为 Worker，因此不能显示为分布式推理或计入分布式任务统计。真正进入分布式前仍须完成 SD-N3 的图像 Stage/blob/Worker 协议和资源准入，避免与已加载的 LLM 争用同一块 GPU 显存。
 
 ---
 
