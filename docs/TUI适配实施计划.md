@@ -14,7 +14,7 @@
 
 ### 1.1 背景
 
-`tui_admin.py`（70KB，纯标准库）是 QLH 的终端管理面，经 HTTP 操作集群，覆盖 7 个屏幕。主计划承诺"TUI 零改动"——TS 网关替换 FastAPI 后 TUI 照常运行。2026-08-02 已完成 TUI 依赖面审计（35 处调用点 / 25 个唯一端点），结论：
+`tui_admin.py`（70KB，纯标准库）是 QLH 的终端管理面，经 HTTP 操作集群，覆盖 7 个屏幕。主计划承诺"TUI 零改动"——TS 网关替换 FastAPI 后 TUI 照常运行。2026-08-02 已完成 TUI 依赖面审计（38 处调用点 / 25 个唯一端点），结论：
 
 - **可行性高**：全部同步 JSON、零流式/SSE/WebSocket、零 cookie、错误解析只依赖 JSON `detail` 且有容错。
 - **3 类真实风险**：① 网关若按 §4.2 内部契约实现则 TUI 端点大面积 404（内部契约 ≠ 对外契约）；② DELETE 空响应/204 致 TUI 误报；③ 数值字段类型、`/api` 前缀、`X-QLH-Log-Token` 语义必须原样保留。
@@ -23,7 +23,7 @@
 
 1. 网关对外端点按 **api_server 现有路径/方法/字段** 原样实现，覆盖 TUI 全部 25 个唯一端点。
 2. `tui_admin.py` **零改动**跑通 7 屏 × 2 角色（主节点 / 从节点视角）。
-3. 以 TUI 35 个调用点为用例建立**契约测试**，纳入阶段 2 Go/No-Go 验收。
+3. 以 TUI 38 个调用点为用例建立**契约测试**，纳入阶段 2 Go/No-Go 验收。
 
 ### 1.3 非目标
 
@@ -47,7 +47,7 @@
 | 6 | 空响应返回 `{}`；非 JSON 回退 `{"detail": text}` | :254-259 | 空响应会使 TUI 显示"—"，不崩但功能退化；**DELETE 必须返回 JSON** |
 | 7 | 3s 轮询 3 个屏幕（Dashboard/Nodes/Queue） | :552、:599、:675、:992 | 网关不得引入 429/限流（urllib 无重试，直接报错） |
 
-### 2.2 端点依赖全表（35 调用点 → 25 唯一端点）
+### 2.2 端点依赖全表（38 调用点 → 25 唯一端点）
 
 > 行号以 2026-08-02 源码为准。`*` 标注的端点路径参数经 `urllib.parse.quote` 编码（:800、:809、:1076）。
 
@@ -253,13 +253,23 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
 | 5 | 聚合 `/status` 延迟影响轮询 | 聚合只读内存态/轻接口；若 scheduler `/v1/status` 慢，加 500ms 本地缓存，字段仍以 §2.2 #2 为准 |
 | 6 | 从节点角色访问主节点端点被 CORS/鉴权拦截 | 网关不引入新鉴权（现无）；`master-health` 等从节点视角端点按旧语义放行 |
 
+### 7.1 已知技术坑（2026-08-02 T1 排障记录）
+
+> 完整排障链与验证方式见 [gateway/README.md](../gateway/README.md)。任何改动 fastify 版本、
+> beforeAll 初始化或 404 处理的 PR 必须先跑 `npm run test:tui`。
+
+| # | 坑 | 根因 | 修复 |
+|---|----|------|------|
+| 1 | `@nestjs/platform-fastify@11.1.28` 硬编码 `fastify@5.10.0`（精确版本），npm 嵌套安装两个 fastify | platform-fastify 的 `dependencies` 是精确版本，无法 dedupe | `package.json` 加 `"overrides": { "fastify": "^5.11.0" }` 统一 |
+| 2 | supertest 首个请求崩溃 `Cannot read properties of undefined (reading 'length')`，且 jest `did not exit` | NestJS `app.init()` 不等待 fastify `ready()`；fourOhFour 404 context 的 hooks 在 `preReady` 才初始化，ready 前 `context.preParsing` 为 undefined 而非 null | 测试 `beforeAll` 中 `await (app.getHttpAdapter().getInstance() as any).ready()`（**T2-T6 每个测试文件都必须带**）；生产 `app.listen()` 内部会等 ready，不受影响 |
+
 ---
 
 ## 八、决策记录
 
 | 日期 | 决策 | 理由 |
 |------|------|------|
-| 2026-08-02 | 网关对外端点以 api_server 现有路径/方法/字段为准，§4.2 内部契约不承担对外适配 | TUI 35 调用点审计证明对外面是唯一可信契约；内部端点形态由各服务自定 |
+| 2026-08-02 | 网关对外端点以 api_server 现有路径/方法/字段为准，§4.2 内部契约不承担对外适配 | TUI 38 调用点审计证明对外面是唯一可信契约；内部端点形态由各服务自定 |
 | 2026-08-02 | `/logs/*` 阶段 2 由 legacy-control 承载、网关代理；阶段 3 切 control-svc | `buffer_*` 是进程内内存统计，TS 复刻成本高；代理保持契约不变 |
 | 2026-08-02 | 5 项细节（§3.1）以契约测试固化，不做口头约定 | 防止网关实现漂移；用例 39-42 进阶段 2 Go/No-Go |
 | 2026-08-02 | TUI 零改动为硬验收（`git diff` 为空） | TUI 是纯 urllib 客户端，改动任何一处都意味着契约已破坏 |
