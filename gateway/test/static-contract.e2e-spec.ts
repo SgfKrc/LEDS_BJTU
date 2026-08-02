@@ -75,7 +75,8 @@ describe('阶段 2.3 静态前端托管', () => {
     if (!hasDist()) return;
     const res = await request(server()).get('/api/health');
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: 'ok' });
+    expect(res.body.status).toBe('ok');
+    expect(typeof res.body.timestamp).toBe('number'); // 对齐 api_server health
   });
 
   it('GET /api/未匹配路由 → JSON 404 detail（API 语义不被 SPA 回退破坏）', async () => {

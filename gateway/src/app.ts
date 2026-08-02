@@ -72,6 +72,24 @@ export async function createApp(): Promise<NestFastifyApplication> {
     wildcard: false,
     serve: false,
   });
+  // 对齐 FastAPI 语义：带 application/json 头的空 body 请求（如无 body 的
+  // DELETE/POST）按 {} 解析而非 400（Fastify 默认报
+  // "Body cannot be empty when content-type is set to 'application/json'"）。
+  // 经 adapter.useBodyParser 注册——它会标记 _isParserRegistered，Nest init
+  // 时 registerParserMiddleware 跳过，避免 "parser already present"。
+  const adapter = app.getHttpAdapter() as import('@nestjs/platform-fastify').FastifyAdapter;
+  adapter.useBodyParser(
+    'application/json',
+    false,
+    {},
+    (_req: unknown, body: Buffer, done: (err: Error | null, value?: unknown) => void) => {
+      try {
+        done(null, body && body.length ? JSON.parse(body.toString('utf8')) : {});
+      } catch (err) {
+        done(err as Error, undefined);
+      }
+    },
+  );
   // TUI 客户端硬编码 base_url + "/api" + path（tui_admin.py:218），前缀不可配置。
   app.setGlobalPrefix('api');
   app.useGlobalInterceptors(new RequestIdInterceptor());
