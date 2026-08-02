@@ -959,7 +959,7 @@ def test_scheduler_does_not_advertise_a_layer_partition_as_full_model(
             "a layer partition must not compute or advertise full model identity"
         ),
     )
-    monkeypatch.setitem(sys.modules, "api_server", fake_api)
+    monkeypatch.setattr(scheduler, "_host", fake_api)
 
     capabilities = scheduler._task_worker_capabilities()
 
@@ -1001,8 +1001,8 @@ def test_scheduler_worker_gate_blocks_hello_and_rejects_stale_offer(
         "worker_01", hello.snapshot(), coordinator_node_id="master",
     )
     scheduler._task_worker_control.receive_on_worker(ack.snapshot())
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=lambda *args: pytest.fail(
             "a disabled worker must not execute a Stage"
         ),
@@ -1074,14 +1074,14 @@ def test_scheduler_worker_executes_one_admitted_stage_and_returns_result(
 
     scheduler._tcp_client = Client()
     fake_api = SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=lambda request, cancel_event: {
             "content": f"remote:{request.stage_id}",
             "usage": {"total_tokens": 3},
             "model": "qwen-1_8b",
         },
     )
-    monkeypatch.setitem(sys.modules, "api_server", fake_api)
+    monkeypatch.setattr(scheduler, "_host", fake_api)
     root_input = {"message": "hello", "messages": []}
     dependencies = {}
     now_ms = int(time.time() * 1000)
@@ -1624,8 +1624,8 @@ def test_scheduler_worker_replays_duplicate_offer_without_second_execution(
         calls.append(request.stage_id)
         return {"content": "once"}
 
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=execute,
     ))
     now_ms = int(time.time() * 1000)
@@ -1704,8 +1704,8 @@ def test_scheduler_worker_lease_renew_extends_active_execution(monkeypatch):
                 raise RuntimeError("cancelled")
         return {"content": "renewed worker result"}
 
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=execute,
     ))
     now_ms = int(time.time() * 1000)
@@ -1803,8 +1803,8 @@ def test_scheduler_worker_cancel_ack_is_replayed_without_stage_error(
         assert cancel_event.wait(2)
         return {"content": "must not be committed"}
 
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=execute,
     ))
     now_ms = int(time.time() * 1000)
@@ -1897,8 +1897,8 @@ def test_scheduler_worker_replays_cached_result_after_send_failure(monkeypatch):
         calls.append(request.stage_id)
         return {"content": "cached result"}
 
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=execute,
     ))
     now_ms = int(time.time() * 1000)
@@ -1981,8 +1981,8 @@ def test_scheduler_worker_does_not_resurrect_an_expired_lease(monkeypatch):
                 completed.set()
 
     scheduler._tcp_client = Client()
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=lambda request, cancel_event: (
             time.sleep(0.3) or {"content": "too late"}
         ),
@@ -2067,8 +2067,8 @@ def test_scheduler_worker_lease_uses_duration_across_wall_clock_skew(
                 completed.set()
 
     scheduler._tcp_client = Client()
-    monkeypatch.setitem(sys.modules, "api_server", SimpleNamespace(
-        _full_chat_execution_lock=threading.RLock(),
+    monkeypatch.setattr(scheduler, "_host", SimpleNamespace(
+        full_chat_execution_lock=threading.RLock(),
         _execute_task_worker_stage=lambda request, cancel_event: {
             "content": "clock independent"
         },

@@ -119,6 +119,10 @@ class TestResult:
 class BackendManager:
     """后端服务管理器"""
 
+    def _backend_log_path(self) -> str:
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "qlh_simulation_backend.log")
+
     def __init__(self):
         self.master_process: Optional[subprocess.Popen] = None
         self.slave_processes: List[subprocess.Popen] = []
@@ -155,9 +159,10 @@ class BackendManager:
             [sys.executable, str(api_server_path)],
             env=env,
             cwd=str(self.project_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            # Windows 匿名管道缓冲仅 4KB：后端启动日志（~10KB UTF-8）会填满
+            # PIPE 阻塞 uvicorn 启动，故输出重定向到文件而非 PIPE
+            stdout=open(self._backend_log_path(), "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
         )
 
         # 等待启动完成
@@ -171,7 +176,7 @@ class BackendManager:
 
     async def start_slave(
         self,
-        master_host: str = "localhost",
+        master_host: str = "127.0.0.1",
         master_port: int = 8888,
         slave_api_port: int = 8001,
         startup_timeout: int = 30,
@@ -201,9 +206,10 @@ class BackendManager:
             [sys.executable, str(api_server_path)],
             env=env,
             cwd=str(self.project_root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            # Windows 匿名管道缓冲仅 4KB：后端启动日志（~10KB UTF-8）会填满
+            # PIPE 阻塞 uvicorn 启动，故输出重定向到文件而非 PIPE
+            stdout=open(self._backend_log_path(), "a", encoding="utf-8"),
+            stderr=subprocess.STDOUT,
         )
 
         self.slave_processes.append(process)
@@ -232,7 +238,7 @@ class BackendManager:
             timeout: 超时时间（秒）
         """
         start_time = time.time()
-        health_url = f"http://localhost:{port}/api/health"
+        health_url = f"http://127.0.0.1:{port}/api/health"
 
         while time.time() - start_time < timeout:
             if process is not None and process.poll() is not None:
@@ -342,7 +348,7 @@ class BackendManager:
 class RequestSender:
     """HTTP 请求发送器"""
 
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
         self.base_url = base_url
         self.session: Optional[httpx.AsyncClient] = None
 
@@ -748,7 +754,7 @@ class TestOrchestrator:
             for i in range(config.slave_count):
                 slave_api_port = config.slave_api_port_start + i
                 await self.backend_manager.start_slave(
-                    master_host="localhost",
+                    master_host="127.0.0.1",
                     master_port=config.master_tcp_port,
                     slave_api_port=slave_api_port,
                     startup_timeout=config.startup_timeout,
@@ -806,7 +812,7 @@ class TestOrchestrator:
         # 启动新的从节点
         target_port = slave_api_port or (self.config.slave_api_port_start + slave_index)
         await self.backend_manager.start_slave(
-            master_host="localhost",
+            master_host="127.0.0.1",
             master_port=self.config.master_tcp_port,
             slave_api_port=target_port,
             startup_timeout=self.config.startup_timeout,

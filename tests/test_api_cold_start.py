@@ -8,6 +8,8 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import api_server
+import model_host as model_host_module
+from model_host import model_host
 
 
 def test_lazy_model_manager_defers_construction(monkeypatch):
@@ -23,7 +25,7 @@ def test_lazy_model_manager_defers_construction(monkeypatch):
     fake_module.ModelManager = FakeModelManager
     monkeypatch.setitem(sys.modules, "model_module", fake_module)
 
-    proxy = api_server._LazyModelManager()
+    proxy = model_host_module._LazyModelManager()
 
     assert calls == []
     assert repr(proxy) == "<_LazyModelManager unloaded>"
@@ -41,7 +43,7 @@ def test_available_models_does_not_touch_model_manager_when_unloaded(monkeypatch
 
     monkeypatch.setattr(model_downloader, "gguf_model_exists", lambda: False)
     monkeypatch.setattr(model_downloader, "safetensors_model_exists", lambda: False)
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "model_manager", BombModelManager())
 
     result = asyncio.run(api_server.list_available_models())
@@ -58,8 +60,8 @@ def test_frontend_bootstrap_endpoints_keep_model_manager_lazy(monkeypatch):
 
     fake_module.__getattr__ = fail_on_model_manager_access
     monkeypatch.setitem(sys.modules, "model_module", fake_module)
-    monkeypatch.setattr(api_server, "model_loaded", False)
-    monkeypatch.setattr(api_server, "model_manager", api_server._LazyModelManager())
+    monkeypatch.setattr(model_host, "model_loaded", False)
+    monkeypatch.setattr(api_server, "model_manager", model_host_module._LazyModelManager())
 
     class FakeScheduler:
         _max_nodes = 3
@@ -89,7 +91,7 @@ def test_reserved_pipeline_worker_does_not_auto_load_full_model(monkeypatch):
     class UnloadedManager:
         is_loaded = False
 
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "model_manager", UnloadedManager())
     monkeypatch.setattr(
         api_server.scheduler, "get_distributed_inference_enabled", lambda: True,
@@ -113,7 +115,7 @@ def test_reserved_worker_rejects_local_model_even_when_already_loaded(monkeypatc
     class SegmentManager:
         is_loaded = True
 
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "model_manager", SegmentManager())
     monkeypatch.setattr(
         api_server.scheduler, "get_distributed_inference_enabled", lambda: False,

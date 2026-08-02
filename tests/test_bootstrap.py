@@ -188,8 +188,10 @@ def test_apply_runtime_config_syncs_loaded_scheduler(monkeypatch):
         },
     })
 
-    assert cfg.NODE_ID == "client-runtime"
-    assert cfg.NODE_ROLE == "client"
+    # 阶段 0.3：运行时身份写入 node_runtime（cfg 不再被写回）
+    import node_runtime as node_runtime_mod
+    assert node_runtime_mod.node_runtime.get_node_id() == "client-runtime"
+    assert node_runtime_mod.node_runtime.get_node_role() == "client"
     assert scheduler_mod.NODE_ID == "client-runtime"
     assert scheduler_mod.NODE_ROLE == "client"
     assert os.environ["QLH_CLUSTER_SECRET"] == "secret-456"
