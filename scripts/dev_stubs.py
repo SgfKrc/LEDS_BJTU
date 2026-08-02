@@ -60,6 +60,9 @@ SCHEDULER_ROUTES: list = [
     }),
     ("POST", r"^/cluster/connect$", {"status": "connected", "message": "已连接主节点"}),
     ("POST", r"^/cluster/nodes/register$", {"status": "registered", "reason": "", "message": "注册成功"}),
+    ("POST", r"^/cluster/android/register$", {"status": "registered", "node_id": "android-dev-1", "message": "Android 注册成功"}),
+    ("POST", r"^/cluster/android/heartbeat$", {"status": "ok", "node_id": "android-dev-1"}),
+    ("GET", r"^/cluster/spare-master/logs$", {"count": 0, "logs": []}),
     ("POST", r"^/cluster/nodes/[^/]+/deregister$", {"status": "deregistered"}),
     ("POST", r"^/cluster/transfer-master$", {"status": "transferred", "message": "主节点身份已转让"}),
     ("POST", r"^/cluster/spare-master$", {"status": "set", "message": "已设置备用主节点"}),
@@ -105,6 +108,10 @@ INFERENCE_ROUTES: list = [
     ("GET", r"^/v1/models/available$", {"models": [
         {"model_id": "qwen-1_8b-chat", "name": "Qwen 1.8B Chat", "engine": "torch"},
         {"model_id": "qwen-1_8b-chat-gguf", "name": "Qwen 1.8B Chat GGUF", "engine": "llama_cpp"}]}),
+    ("GET", r"^/v1/models$", {"models": [
+        {"model_id": "qwen-1_8b-chat", "name": "Qwen 1.8B Chat", "engine": "torch"},
+        {"model_id": "qwen-1_8b-chat-gguf", "name": "Qwen 1.8B Chat GGUF", "engine": "llama_cpp"}],
+        "active_model_id": "qwen-1_8b-chat"}),
     ("POST", r"^/v1/chat$", {"reply": "桩回复：你好，我是 QLH。", "session_id": "stub-session"}),
     ("POST", r"^/v1/chat/clear$", {"cleared": True}),
     ("POST", r"^/v1/chat/cancel$", {"status": "cancelled", "generation_id": "stub-gen"}),

@@ -144,6 +144,13 @@ describe('阶段 2 其余域契约', () => {
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.models)).toBe(true);
     });
+
+    it('GET /api/models 模型配置列表（前端 fetchModels 依赖，含 active_model_id）', async () => {
+      const res = await request(server()).get('/api/models');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.models)).toBe(true);
+      expect(res.body).toHaveProperty('active_model_id');
+    });
   });
 
   describe('experimental 域', () => {
@@ -197,6 +204,35 @@ describe('阶段 2 其余域契约', () => {
     it('GET /api/bootstrap/info', async () => {
       const res = await request(server()).get('/api/bootstrap/info');
       expect(res.status).toBe(200);
+    });
+
+    it('GET /api/presets 预设列表（前端 ChatPanel 依赖）', async () => {
+      const res = await request(server()).get('/api/presets');
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.presets)).toBe(true);
+      expect(res.body.presets[0]).toHaveProperty('label');
+      expect(res.body.presets[0]).toHaveProperty('question');
+      expect(res.body).toHaveProperty('current_speed_tok_s');
+    });
+
+    it('GET /api/user/settings（数据库不可用时空 settings）', async () => {
+      const res = await request(server()).get('/api/user/settings');
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('settings');
+    });
+
+    it('PUT /api/user/settings 保存设置', async () => {
+      const res = await request(server())
+        .put('/api/user/settings')
+        .send({ settings: { theme: 'dark' } });
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('status');
+    });
+
+    it('GET /api/db/health 数据库健康', async () => {
+      const res = await request(server()).get('/api/db/health');
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('status');
     });
 
     it('GET /api/models/registry 空列表', async () => {

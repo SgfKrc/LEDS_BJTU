@@ -2,6 +2,9 @@
  * cluster 域控制器（TUI 契约用例 4-32、39）
  *
  * 1:1 透传代理：对外 /api/cluster/* → scheduler-svc /cluster/*（去 /api 前缀）。
+ * 例外：/api/cluster/review/* 属控制面（审查票状态机，review.py），阶段 2 由
+ * legacy-control 承载（对齐主计划 §2.2 "review → 阶段 3 前暂代理 FastAPI 遗留"），
+ * 阶段 3 迁 control-svc。
  * 用 @All('cluster/*') 通配覆盖全部子路径与 HTTP 方法：
  *   - 静态路由优先级高于通配符（find-my-way），已注册的具体路由不会被抢
  *   - scheduler-svc 未来新增端点无需改动网关
@@ -9,13 +12,36 @@
  */
 import { All, Controller, NotFoundException, Req } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
+import { LegacyControlClient } from '../../clients/legacy.client';
 import { SchedulerClient } from '../../clients/scheduler.client';
 
 const CLUSTER_PREFIX = '/api/cluster';
 
 @Controller()
 export class ClusterController {
-  constructor(private readonly scheduler: SchedulerClient) {}
+  constructor(
+    private readonly scheduler: SchedulerClient,
+    private readonly legacy: LegacyControlClient,
+  ) {}
+
+  // /api/cluster/review 与 /api/cluster/review/* → legacy-control /cluster/review/*
+  // （find-my-way 具体度优先于下方 @All('cluster/*') 通配）
+  @All('cluster/review')
+  reviewRoot(@Req() req: FastifyRequest): Promise<unknown> {
+    return this.forwardLegacy(req);
+  }
+
+  @All('cluster/review/*')
+  reviewSub(@Req() req: FastifyRequest): Promise<unknown> {
+    return this.forwardLegacy(req);
+  }
+
+  private forwardLegacy(req: FastifyRequest): Promise<unknown> {
+    const full = req.url;
+    const subPath = full.slice('/api'.length); // /cluster/review/...
+    const body = (req as { body?: unknown }).body;
+    return this.legacy.request(req.method, subPath, body);
+  }
 
   @All('cluster/*')
   async proxy(@Req() req: FastifyRequest): Promise<unknown> {

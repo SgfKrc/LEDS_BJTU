@@ -12,6 +12,12 @@ import { InferenceClient } from '../../clients/inference.client';
 export class ModelsController {
   constructor(private readonly inference: InferenceClient) {}
 
+  @Get()
+  list(): Promise<unknown> {
+    // 对齐 api_server.py:5059-5070 list_models：全部模型配置 + active_model_id
+    return this.inference.request('GET', '/v1/models');
+  }
+
   @Get('current')
   current(): Promise<unknown> {
     return this.inference.request('GET', '/v1/models/current');

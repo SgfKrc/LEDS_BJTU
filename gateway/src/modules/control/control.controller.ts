@@ -39,6 +39,10 @@ export class ControlController {
   @All('bootstrap') bootstrapRoot(@Req() r: FastifyRequest) { return this.forward(r); }
   @All('bootstrap/*') bootstrapSub(@Req() r: FastifyRequest) { return this.forward(r); }
 
+  @All('presets') presetsRoot(@Req() r: FastifyRequest) { return this.forward(r); }
+  @All('user/settings') userSettings(@Req() r: FastifyRequest) { return this.forward(r); }
+  @All('db/health') dbHealth(@Req() r: FastifyRequest) { return this.forward(r); }
+
   @All('models/registry') registryRoot(@Req() r: FastifyRequest) { return this.forward(r); }
   @All('models/registry/*') registrySub(@Req() r: FastifyRequest) { return this.forward(r); }
 
