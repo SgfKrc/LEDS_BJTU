@@ -198,10 +198,11 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - NestJS + Fastify adapter、`/api` 前缀挂载、request-id 中间件、异常过滤器输出 JSON `detail`（对齐 `api_server.py:319-366`）。
   - 验收：`curl -H "Accept: application/json" localhost:8000/api/health` 返回 `{"status":"ok"}`；未匹配路由返回 JSON 404 `{"detail": ...}`。
 
-- [ ] **T3 集群/队列/分层端点代理（#4-32）**
-  - 实现 scheduler-svc 客户端模块（`gateway/src/clients/scheduler.client.ts`，含类型定义 `SchedulerApiTypes`，数值字段用 `number | null`）。
-  - 注册 cluster/queue/layers 控制器，逐端点代理；保留 PUT/DELETE 方法语义。
-  - 验收：T1 中对应用例转绿；`contract_diff.py` 对 `/api/cluster/*`、`/api/queue/*` 双网关对比 = 0。
+- [x] **T3 集群/队列/分层端点代理（#4-32）** ✅ 2026-08-02
+  - 实现 scheduler-svc 客户端模块 `gateway/src/clients/scheduler.client.ts`（透传 + 502 兜底 + 非 2xx 转 HttpException）；`gateway/src/modules/cluster/cluster.controller.ts`（`@All('cluster/*')` 泛化转发，保留 PUT/DELETE 方法语义）。
+  - **实现方式：1:1 透传代理**——内部端点 = 对外路径去掉 `/api` 前缀（见主计划 §4.2 落地决策）；scheduler-svc 未来实现按此 + §2.2 字段对齐。
+  - 测试桩 `gateway/test/fake-scheduler.ts`：§2.2 字段对齐 + 真实 DELETE 语义（queue/task 不存在 → 200 success:false；nodes/{id} 不存在 → 404 detail，对齐 `api_server.py:5715-5732/:5266-5285`）。
+  - 验收：用例 4-32、39 转绿（34 passed / 10 skipped）；`contract_diff.py` 双网关对比留待阶段 2 整体验收（旧网关尚未部署）。
 
 - [ ] **T4 设备画像端点代理（#33-35）**
   - 代理到 scheduler-svc（采集库留 Python）。
