@@ -8,7 +8,7 @@
  * 打开规则：按任务逐个打开——
  *   T2（已完成）：用例 1、41、43（用例 41 的 logs 段当前由 catch-all 404 JSON 兜底，
  *        T6 打开真端点后补 status=200 断言）
- *   T3（cluster/queue/layers 代理）：用例 4-32、39(cluster 部分)
+ *   T3（已完成）：用例 4-32、39（scheduler-svc 测试桩 fake-scheduler.ts）
  *   T4（device 代理）：用例 33-35
  *   T5（状态聚合）：用例 2、3、40、42（用例 40 断言跨 /status、/models/current、
  *        /cluster/nodes、/cluster/queue 四个端点，按"不允许部分断言"整体归 T5）
@@ -18,11 +18,16 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
+import { startFakeScheduler } from './fake-scheduler';
+import type { FakeScheduler } from './fake-scheduler';
 
 describe('TUI 契约（阶段 2 网关）', () => {
   let app: NestFastifyApplication;
+  let fake: FakeScheduler;
 
   beforeAll(async () => {
+    fake = await startFakeScheduler();
+    process.env.QLH_SCHEDULER_URL = `http://127.0.0.1:${fake.port}`;
     app = await createApp();
     await app.init();
     // fastify 的 preReady（fourOhFour 404 context 的 hooks 初始化）在 ready() 时完成；
@@ -33,7 +38,9 @@ describe('TUI 契约（阶段 2 网关）', () => {
   });
 
   afterAll(async () => {
+    delete process.env.QLH_SCHEDULER_URL;
     await app.close();
+    await fake.close();
   });
 
   const server = () => app.getHttpServer();
@@ -72,14 +79,14 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 4: GET /api/cluster/my-role（T3）', async () => {
+    it('用例 4: GET /api/cluster/my-role（T3）', async () => {
       const res = await request(server()).get('/api/cluster/my-role');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('is_master');
       expect(res.body).toHaveProperty('node_id');
     });
 
-    it.skip('用例 5: GET /api/cluster/nodes 节点统计与列表（T3）', async () => {
+    it('用例 5: GET /api/cluster/nodes 节点统计与列表（T3）', async () => {
       const res = await request(server()).get('/api/cluster/nodes');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('count');
@@ -88,45 +95,45 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(Array.isArray(res.body.nodes)).toBe(true);
     });
 
-    it.skip('用例 6: GET /api/cluster/invite（T3）', async () => {
+    it('用例 6: GET /api/cluster/invite（T3）', async () => {
       const res = await request(server()).get('/api/cluster/invite');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('master_host');
       expect(res.body).toHaveProperty('max_nodes');
     });
 
-    it.skip('用例 7: GET /api/cluster/spare-master（T3）', async () => {
+    it('用例 7: GET /api/cluster/spare-master（T3）', async () => {
       const res = await request(server()).get('/api/cluster/spare-master');
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 8: GET /api/cluster/master-health（T3，从节点视角）', async () => {
+    it('用例 8: GET /api/cluster/master-health（T3，从节点视角）', async () => {
       const res = await request(server()).get('/api/cluster/master-health');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('master_online');
     });
 
-    it.skip('用例 9: GET /api/cluster/discover（T3）', async () => {
+    it('用例 9: GET /api/cluster/discover（T3）', async () => {
       const res = await request(server()).get('/api/cluster/discover');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('found');
     });
 
-    it.skip('用例 10: POST /api/cluster/connect（T3）', async () => {
+    it('用例 10: POST /api/cluster/connect（T3）', async () => {
       const res = await request(server())
         .post('/api/cluster/connect')
         .send({ host: '127.0.0.1', port: 8888 });
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 11: POST /api/cluster/nodes/register（T3）', async () => {
+    it('用例 11: POST /api/cluster/nodes/register（T3）', async () => {
       const res = await request(server())
         .post('/api/cluster/nodes/register')
         .send({});
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 12: POST /api/cluster/nodes/:id/deregister（T3，路径参数须 quote 兼容）', async () => {
+    it('用例 12: POST /api/cluster/nodes/:id/deregister（T3，路径参数须 quote 兼容）', async () => {
       const res = await request(server()).post(
         '/api/cluster/nodes/test-node/deregister',
       );
@@ -134,35 +141,38 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('status');
     });
 
-    it.skip('用例 13: DELETE /api/cluster/nodes/:id 返回 JSON（T3）', async () => {
+    it('用例 13: DELETE /api/cluster/nodes/:id 返回 JSON 非空体', async () => {
       const res = await request(server()).delete(
         '/api/cluster/nodes/test-node',
       );
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('status');
+      // 对齐 api_server.py:5266-5285：节点不存在 → 404 + detail（JSON 非空体，禁止 204）
+      expect(res.status).toBe(404);
+      expect(res.body).toHaveProperty('detail');
+      expect(res.headers['content-type']).toContain('application/json');
+      expect(res.text).not.toBe('');
     });
 
-    it.skip('用例 14: POST /api/cluster/transfer-master（T3）', async () => {
+    it('用例 14: POST /api/cluster/transfer-master（T3）', async () => {
       const res = await request(server())
         .post('/api/cluster/transfer-master')
         .send({ target_node_id: 'test-node' });
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 15: POST /api/cluster/spare-master（T3）', async () => {
+    it('用例 15: POST /api/cluster/spare-master（T3）', async () => {
       const res = await request(server())
         .post('/api/cluster/spare-master')
         .send({ node_id: 'test-node' });
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 16: DELETE /api/cluster/spare-master 返回 JSON（T3）', async () => {
+    it('用例 16: DELETE /api/cluster/spare-master 返回 JSON（T3）', async () => {
       const res = await request(server()).delete('/api/cluster/spare-master');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('status');
     });
 
-    it.skip('用例 17: PUT /api/cluster/config/max-nodes（T3）', async () => {
+    it('用例 17: PUT /api/cluster/config/max-nodes（T3）', async () => {
       const res = await request(server())
         .put('/api/cluster/config/max-nodes')
         .send({ max_nodes: 8 });
@@ -170,22 +180,22 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('status');
     });
 
-    it.skip('用例 18: GET /api/cluster/transfer-logs（T3）', async () => {
+    it('用例 18: GET /api/cluster/transfer-logs（T3）', async () => {
       const res = await request(server()).get('/api/cluster/transfer-logs');
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 19: POST /api/cluster/email-test（T3）', async () => {
+    it('用例 19: POST /api/cluster/email-test（T3）', async () => {
       const res = await request(server()).post('/api/cluster/email-test');
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 20: POST /api/cluster/reset-identity（T3）', async () => {
+    it('用例 20: POST /api/cluster/reset-identity（T3）', async () => {
       const res = await request(server()).post('/api/cluster/reset-identity');
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 21: GET /api/cluster/config/distributed-inference（T3）', async () => {
+    it('用例 21: GET /api/cluster/config/distributed-inference（T3）', async () => {
       const res = await request(server()).get(
         '/api/cluster/config/distributed-inference',
       );
@@ -193,7 +203,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('enabled');
     });
 
-    it.skip('用例 22: PUT /api/cluster/config/distributed-inference（T3）', async () => {
+    it('用例 22: PUT /api/cluster/config/distributed-inference（T3）', async () => {
       const res = await request(server())
         .put('/api/cluster/config/distributed-inference')
         .send({ enabled: true });
@@ -201,33 +211,33 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('status');
     });
 
-    it.skip('用例 23: GET /api/cluster/layers 层分配（T3）', async () => {
+    it('用例 23: GET /api/cluster/layers 层分配（T3）', async () => {
       const res = await request(server()).get('/api/cluster/layers');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('assignments');
     });
 
-    it.skip('用例 24: PUT /api/cluster/layers 手工分层覆盖（T3）', async () => {
+    it('用例 24: PUT /api/cluster/layers 手工分层覆盖（T3）', async () => {
       const res = await request(server())
         .put('/api/cluster/layers')
         .send({ assignment: [] });
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 25: DELETE /api/cluster/layers 返回 JSON（T3）', async () => {
+    it('用例 25: DELETE /api/cluster/layers 返回 JSON（T3）', async () => {
       const res = await request(server()).delete('/api/cluster/layers');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('status');
     });
 
-    it.skip('用例 26: GET /api/cluster/config（T3）', async () => {
+    it('用例 26: GET /api/cluster/config（T3）', async () => {
       const res = await request(server()).get('/api/cluster/config');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('network');
       expect(res.body).toHaveProperty('model');
     });
 
-    it.skip('用例 27: GET /api/cluster/queue MLFQ 队列快照（T3）', async () => {
+    it('用例 27: GET /api/cluster/queue MLFQ 队列快照（T3）', async () => {
       const res = await request(server()).get('/api/cluster/queue');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('paused');
@@ -237,7 +247,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(Array.isArray(res.body.q2)).toBe(true);
     });
 
-    it.skip('用例 28: POST /api/cluster/queue/strategy（T3）', async () => {
+    it('用例 28: POST /api/cluster/queue/strategy（T3）', async () => {
       const res = await request(server())
         .post('/api/cluster/queue/strategy')
         .send({ strategy: 'mlfq' });
@@ -245,29 +255,30 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body).toHaveProperty('strategy');
     });
 
-    it.skip('用例 29: POST /api/cluster/queue/pause（T3，响应不读字段但须 JSON）', async () => {
+    it('用例 29: POST /api/cluster/queue/pause（T3，响应不读字段但须 JSON）', async () => {
       const res = await request(server()).post('/api/cluster/queue/pause');
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 30: POST /api/cluster/queue/resume（T3，响应不读字段但须 JSON）', async () => {
+    it('用例 30: POST /api/cluster/queue/resume（T3，响应不读字段但须 JSON）', async () => {
       const res = await request(server()).post('/api/cluster/queue/resume');
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 31: POST /api/cluster/queue/clear（T3）', async () => {
+    it('用例 31: POST /api/cluster/queue/clear（T3）', async () => {
       const res = await request(server()).post('/api/cluster/queue/clear');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('cleared');
     });
 
-    it.skip('用例 32: DELETE /api/cluster/queue/task/:id 返回 JSON 非空体（T3）', async () => {
+    it('用例 32: DELETE /api/cluster/queue/task/:id 返回 JSON 非空体', async () => {
       const res = await request(server()).delete(
         '/api/cluster/queue/task/nonexistent-task',
       );
-      // T3 打开时先与 scheduler 实际语义对齐：不存在任务应 404 或 200（视实现），
-      // 打开前需确认并写死实际值；本断言为占位，同时是"禁止 204 空体"的强制点。
-      expect(res.status).toBe(404);
+      // 对齐 api_server.py:5715-5732：不存在任务返回 200 + {success:false, message}（非 404）
+      expect(res.status).toBe(200);
+      expect(res.body).toHaveProperty('success');
+      expect(res.body).toHaveProperty('message');
       expect(res.headers['content-type']).toContain('application/json');
       expect(res.text).not.toBe(''); // 禁止 204 空体
     });
@@ -318,7 +329,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
   // 用例 39-43：5 项细节断言 + 错误契约
   // ============================================================
   describe('5 项细节断言', () => {
-    it.skip('用例 39: 四个 DELETE 端点均返回 JSON 非空体（T3）', async () => {
+    it('用例 39: 四个 DELETE 端点均返回 JSON 非空体（T3）', async () => {
       const paths = [
         '/api/cluster/queue/task/x',
         '/api/cluster/nodes/x',
