@@ -1,6 +1,6 @@
 # TUI 适配实施计划（阶段 2 网关专项）
 
-> **状态**：计划（待评审）
+> **状态**：现行（T1-T8 全部完成，2026-08-02 验收通过：契约测试 44/44 + TUI 7 屏 × 2 角色自动化走查 + Python 回归 1086 passed / 3 skipped + 前端 9/9）
 >
 > **更新日期**：2026-08-02
 >
@@ -228,10 +228,11 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - **自动化走查**：`scripts/tui_walkthrough.py --mode master|client`（驱动 `tui_admin.py --plain`，喂入全动作输入序列，断言屏幕齐全 + 无错误屏 + 动作结果全出现）。配套 `scripts/dev_stubs.py --client-mode`（模拟从节点身份）。实测：master 7 屏 × 23 动作全通过；client 从节点视角（Dashboard + Nodes master-health 分支 + 远程日志）通过。
   - 排障记录：① TUI 对 `distributed-inference`/`layers`/`max-nodes` 用 **PUT**（act_toggle/act_override/act_max_nodes），桩补 PUT 路由；② `act_connect` 在主节点身份下有隐藏 confirm（切换为从节点），走查序列需补输入；③ 日志屏渲染桩日志 ERROR 级记录为 `[错误] 20xx-...` 行，属合法日志内容，错误屏断言需排除时间戳格式行。
 
-- [ ] **T8 回归与收尾**
+- [x] **T8 回归与收尾** ✅ 2026-08-02
   - `pytest -q`（Python 侧回归）；前端 9/9（确认网关改动未破坏 Web 面）。
   - 更新 [微服务架构改造计划](微服务架构改造计划.md) §2.4 勾选状态与本文档状态为"现行"。
   - 验收：全部测试绿，提交。
+  - 2026-08-02 实测：Python 全量回归 **1086 passed / 3 skipped**（112.6s）；前端 `npm test` **9/9** + 生产构建成功；网关契约测试 **63/63**（tui-contract + rest-contract）；TUI 7 屏 × 2 角色自动化走查通过（`scripts/tui_walkthrough.py`）。已提交。
 
 ---
 
