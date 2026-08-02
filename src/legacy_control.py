@@ -59,6 +59,26 @@ def _control_response(path: str, method: str):
                 return {"status": "ok", key.split("/")[-1]: []}
         if path.startswith("/review/tickets"):
             return {"tickets": []}
+        if path.startswith("/review/can-vote"):
+            return {"can_vote": True}
+        # /cluster/review/*（审查票在 cluster 路径下，api_server 无独立 /api/review）
+        if path.startswith("/cluster/review/tickets"):
+            return {"tickets": []}
+        if path.startswith("/cluster/review/can-vote"):
+            return {"can_vote": True}
+        # /logs 扩展端点（export/download/node/nodes-summary/单文件）
+        if path.startswith("/logs/nodes-summary"):
+            return {"nodes": {}, "count": 0}
+        if path.startswith("/logs/node/"):
+            return {"count": 0, "logs": [], "node_id": path.split("/")[-2]}
+        if path.startswith("/logs/export"):
+            return {"status": "ok", "archive": "qlh-logs.zip", "files": 0}
+        if path.startswith("/logs/download"):
+            return {"status": "ok", "filename": "qlh.log", "size": 0}
+        if path.startswith("/logs/"):
+            return {"status": "ok", "filename": path.split("/")[-1], "size": 0}
+        if path.startswith("/models/download/"):
+            return {"status": "ok", "filename": path.split("/")[-1], "size": 0}
         if path.startswith("/sessions"):
             return {"sessions": []}
         if path.startswith("/conversations"):
@@ -71,8 +91,43 @@ def _control_response(path: str, method: str):
             return {"available": True, "identity_verified": False}
         if path.startswith("/review/can-vote"):
             return {"can_vote": True}
+        if path == "/presets":
+            return {
+                "presets": [
+                    {"id": "intro", "icon": "👋", "label": "自我介绍",
+                     "question": "请简单介绍一下你自己，你能做什么？",
+                     "estimated_prompt_tokens": 25, "estimated_response_tokens": 120,
+                     "estimated_memory_mb": 13.6, "estimated_seconds": 4.1},
+                    {"id": "edge_computing", "icon": "🌐", "label": "边缘计算科普",
+                     "question": "什么是边缘计算？它和云计算有什么区别？",
+                     "estimated_prompt_tokens": 35, "estimated_response_tokens": 200,
+                     "estimated_memory_mb": 22.0, "estimated_seconds": 6.9},
+                ],
+                "current_speed_tok_s": 29,
+                "current_quant": "int4",
+                "max_new_tokens": 512,
+            }
+        if path == "/user/settings":
+            return {"settings": {}, "source": "none"}
+        if path == "/db/health":
+            return {"status": "ok", "database": "postgresql",
+                    "message": "数据库连接正常", "retry_in_seconds": 0}
         return {"status": "ok"}
     # POST/PUT/DELETE：操作确认（空体场景禁止 204）
+    if path.startswith("/cluster/review/mail-poll"):
+        return {"status": "ok", "polled": 0}
+    if path.startswith("/cluster/review/expire-check"):
+        return {"status": "ok", "expired": 0}
+    if path.startswith("/cluster/review/vote"):
+        return {"status": "ok"}
+    if path.startswith("/cluster/review/create"):
+        return {"ticket_id": "stub-ticket", "status": "ok"}
+    if path.startswith("/cluster/review/tickets"):
+        return {"status": "deleted", "count": 0}
+    if path.startswith("/logs/client-error"):
+        return {"status": "ok", "received": 1}
+    if path.startswith("/logs"):
+        return {"status": "ok", "deleted": 0}
     if path.startswith("/bootstrap/first-connect"):
         return {"status": "ok", "identity_verified": True}
     if path.startswith("/sessions"):
@@ -159,7 +214,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith(("/sessions", "/conversations", "/settings",
                               "/review", "/workflows", "/bootstrap",
                               "/models/registry", "/models/downloadable",
-                              "/models/gguf", "/models/files")):
+                              "/models/gguf", "/models/files", "/models/download",
+                              "/presets", "/user", "/db",
+                              "/cluster/review", "/logs")):
             self._send(200, _control_response(path, "GET"))
         else:
             self._send(404, {"detail": f"Route GET:{path} not found"})
@@ -171,7 +228,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith(("/sessions", "/conversations", "/settings",
                             "/review", "/workflows", "/bootstrap",
                             "/models/registry", "/models/downloadable",
-                            "/models/download/", "/models/gguf")):
+                            "/models/download/", "/models/gguf", "/user", "/db",
+                            "/cluster/review", "/logs")):
             self._send(200, _control_response(path, method))
         else:
             self._send(404, {"detail": f"Route {method}:{path} not found"})

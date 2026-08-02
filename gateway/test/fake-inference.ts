@@ -82,6 +82,17 @@ const routes: Array<{ method: string; match: RegExp; data: unknown }> = [
     },
   },
   {
+    method: 'GET',
+    match: /^\/v1\/models$/,
+    data: {
+      models: [
+        { model_id: 'qwen-1_8b-chat', name: 'Qwen 1.8B Chat', engine: 'torch' },
+        { model_id: 'qwen-1_8b-chat-gguf', name: 'Qwen 1.8B Chat GGUF', engine: 'llama_cpp' },
+      ],
+      active_model_id: 'qwen-1_8b-chat',
+    },
+  },
+  {
     method: 'POST',
     match: /^\/v1\/chat$/,
     data: { reply: '桩回复：你好，我是 QLH。', session_id: 'stub-session' },
