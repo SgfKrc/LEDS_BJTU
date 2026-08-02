@@ -14,8 +14,16 @@ export abstract class ForwardClient {
     protected readonly timeoutMs = 15000,
   ) {}
 
-  async request(method: string, path: string, body?: unknown): Promise<unknown> {
-    const headers: Record<string, string> = { accept: 'application/json' };
+  async request(
+    method: string,
+    path: string,
+    body?: unknown,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<unknown> {
+    const headers: Record<string, string> = {
+      accept: 'application/json',
+      ...extraHeaders,
+    };
     let payload: string | undefined;
     if (body !== undefined) {
       payload = JSON.stringify(body);

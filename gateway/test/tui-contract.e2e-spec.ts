@@ -12,10 +12,13 @@
  *   T4（已完成）：用例 33-35（device 透传代理，画像采集留 Python）
  *   T5（已完成）：用例 2、3、40、42（/api/status 聚合 scheduler+inference+device，
  *        /api/models/current 代理 inference-svc；fake-inference.ts 测试桩）
- *   T6（logs 代理）：用例 36-38、41(logs 段补充 status 断言)
- * 打开一个用例即要求其断言全绿，不允许部分断言。
+ *   T6（已完成）：用例 36-38、41 logs 段（/api/logs/* 透传 legacy-control
+ *        src/legacy_control.py Python 桩，X-QLH-Log-Token 透传，允许无 token）
+ * 全部用例已打开。
  */
 import request from 'supertest';
+import { spawn, type ChildProcess } from 'child_process';
+import path from 'path';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { startFakeScheduler } from './fake-scheduler';
@@ -23,16 +26,64 @@ import type { FakeScheduler } from './fake-scheduler';
 import { startFakeInference } from './fake-inference';
 import type { FakeInference } from './fake-inference';
 
+const REPO_ROOT = path.resolve(__dirname, '..', '..');
+
+/** 启动 src/legacy_control.py（纯标准库 Python 桩，stdout 探活） */
+async function startLegacyControl(): Promise<{
+  port: number;
+  close(): Promise<void>;
+}> {
+  const port = 20000 + Math.floor(Math.random() * 30000);
+  const proc: ChildProcess = spawn(
+    'python',
+    ['src/legacy_control.py', '--port', String(port)],
+    { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const actualPort = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('legacy-control 启动超时（15s）')),
+      15000,
+    );
+    let buf = '';
+    proc.stdout?.on('data', (d: Buffer) => {
+      buf += d.toString();
+      const m = buf.match(/LEGACY_CONTROL_LISTENING:(\d+)/);
+      if (m) {
+        clearTimeout(timer);
+        resolve(m[1]);
+      }
+    });
+    proc.on('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`legacy-control 提前退出 code=${code}`));
+    });
+    proc.stderr?.on('data', (d: Buffer) => {
+      buf += d.toString();
+    });
+  });
+  return {
+    port: Number(actualPort),
+    close: () =>
+      new Promise<void>((resolve) => {
+        proc.kill();
+        proc.on('exit', () => resolve());
+      }),
+  };
+}
+
 describe('TUI 契约（阶段 2 网关）', () => {
   let app: NestFastifyApplication | undefined;
   let fake: FakeScheduler | undefined;
   let fakeInf: FakeInference | undefined;
+  let legacy: { port: number; close(): Promise<void> } | undefined;
 
   beforeAll(async () => {
     fake = await startFakeScheduler();
     fakeInf = await startFakeInference();
+    legacy = await startLegacyControl();
     process.env.QLH_SCHEDULER_URL = `http://127.0.0.1:${fake.port}`;
     process.env.QLH_INFERENCE_URL = `http://127.0.0.1:${fakeInf.port}`;
+    process.env.QLH_LEGACY_CONTROL_URL = `http://127.0.0.1:${legacy.port}`;
     app = await createApp();
     await app.init();
     // fastify 的 preReady（fourOhFour 404 context 的 hooks 初始化）在 ready() 时完成；
@@ -45,10 +96,12 @@ describe('TUI 契约（阶段 2 网关）', () => {
   afterAll(async () => {
     delete process.env.QLH_SCHEDULER_URL;
     delete process.env.QLH_INFERENCE_URL;
+    delete process.env.QLH_LEGACY_CONTROL_URL;
     // 可选链：beforeAll 失败时避免级联崩溃（fake/app 可能未初始化）
     await app?.close();
     await fake?.close();
     await fakeInf?.close();
+    await legacy?.close();
   });
 
   const server = () => app!.getHttpServer();
@@ -326,7 +379,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.status).toBe(200);
     });
 
-    it.skip('用例 36: GET /api/logs/recent?limit&level（T6，允许无 token）', async () => {
+    it('用例 36: GET /api/logs/recent?limit&level（允许无 token）', async () => {
       const res = await request(server()).get(
         '/api/logs/recent?limit=50&level=INFO',
       );
@@ -335,13 +388,13 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(Array.isArray(res.body.logs)).toBe(true);
     });
 
-    it.skip('用例 37: GET /api/logs 文件列表（T6）', async () => {
+    it('用例 37: GET /api/logs 文件列表', async () => {
       const res = await request(server()).get('/api/logs');
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.files)).toBe(true);
     });
 
-    it.skip('用例 38: GET /api/logs/stats（T6）', async () => {
+    it('用例 38: GET /api/logs/stats', async () => {
       const res = await request(server()).get('/api/logs/stats');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('log_dir');
@@ -394,15 +447,22 @@ describe('TUI 契约（阶段 2 网关）', () => {
     });
 
     it('用例 41: /api/health JSON ok；无 token 日志请求返回 JSON 而非 302', async () => {
-      // logs 段当前由 catch-all 404 JSON 兜底（非 302 + JSON 即过）；
-      // T6 打开真端点后补 status=200 断言。
       const health = await request(server()).get('/api/health');
       expect(health.status).toBe(200);
       expect(health.body.status).toBe('ok');
 
+      // 无 token：200 JSON（legacy-control 允许无 token，对齐 tui_admin.py:228-229）
       const logs = await request(server()).get('/api/logs/recent').redirects(0);
-      expect(logs.status).not.toBe(302);
+      expect(logs.status).toBe(200);
       expect(logs.headers['content-type']).toContain('application/json');
+
+      // 带 token：200 JSON（X-QLH-Log-Token 透传到 legacy-control）
+      const withToken = await request(server())
+        .get('/api/logs/recent')
+        .set('X-QLH-Log-Token', 'test-token')
+        .redirects(0);
+      expect(withToken.status).toBe(200);
+      expect(withToken.headers['content-type']).toContain('application/json');
     });
 
     it('用例 42: /api/status 含 gpu/kv_cache/device 嵌套对象', async () => {
