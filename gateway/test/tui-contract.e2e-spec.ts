@@ -22,8 +22,8 @@ import { startFakeScheduler } from './fake-scheduler';
 import type { FakeScheduler } from './fake-scheduler';
 
 describe('TUI 契约（阶段 2 网关）', () => {
-  let app: NestFastifyApplication;
-  let fake: FakeScheduler;
+  let app: NestFastifyApplication | undefined;
+  let fake: FakeScheduler | undefined;
 
   beforeAll(async () => {
     fake = await startFakeScheduler();
@@ -39,11 +39,12 @@ describe('TUI 契约（阶段 2 网关）', () => {
 
   afterAll(async () => {
     delete process.env.QLH_SCHEDULER_URL;
-    await app.close();
-    await fake.close();
+    // 可选链：beforeAll 失败时避免级联崩溃（fake/app 可能未初始化）
+    await app?.close();
+    await fake?.close();
   });
 
-  const server = () => app.getHttpServer();
+  const server = () => app!.getHttpServer();
 
   // ============================================================
   // T0 骨架 smoke（非契约用例，T1 起常绿）
@@ -133,23 +134,29 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.status).toBe(200);
     });
 
-    it('用例 12: POST /api/cluster/nodes/:id/deregister（T3，路径参数须 quote 兼容）', async () => {
+    it('用例 12: POST /api/cluster/nodes/:id/deregister（路径参数须 quote 兼容）', async () => {
+      // TUI 用 urllib.parse.quote 编码路径参数（tui_admin.py:800），含空格 id 必须可转发
       const res = await request(server()).post(
-        '/api/cluster/nodes/test-node/deregister',
+        '/api/cluster/nodes/node%20a/deregister',
       );
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('status');
+      expect(fake?.requests.at(-1)?.path).toContain('/cluster/nodes/');
     });
 
     it('用例 13: DELETE /api/cluster/nodes/:id 返回 JSON 非空体', async () => {
-      const res = await request(server()).delete(
-        '/api/cluster/nodes/test-node',
+      // 成功删除：200 + status（fake 特判 id delete-ok）
+      const ok = await request(server()).delete('/api/cluster/nodes/delete-ok');
+      expect(ok.status).toBe(200);
+      expect(ok.body).toHaveProperty('status');
+      // 节点不存在 → 404 + detail（对齐 api_server.py:5266-5285；JSON 非空体，禁止 204）
+      const missing = await request(server()).delete(
+        '/api/cluster/nodes/missing-node',
       );
-      // 对齐 api_server.py:5266-5285：节点不存在 → 404 + detail（JSON 非空体，禁止 204）
-      expect(res.status).toBe(404);
-      expect(res.body).toHaveProperty('detail');
-      expect(res.headers['content-type']).toContain('application/json');
-      expect(res.text).not.toBe('');
+      expect(missing.status).toBe(404);
+      expect(missing.body).toHaveProperty('detail');
+      expect(missing.headers['content-type']).toContain('application/json');
+      expect(missing.text).not.toBe('');
     });
 
     it('用例 14: POST /api/cluster/transfer-master（T3）', async () => {
@@ -272,15 +279,21 @@ describe('TUI 契约（阶段 2 网关）', () => {
     });
 
     it('用例 32: DELETE /api/cluster/queue/task/:id 返回 JSON 非空体', async () => {
-      const res = await request(server()).delete(
-        '/api/cluster/queue/task/nonexistent-task',
+      // 成功取消：200 + success:true（fake 特判 id cancel-ok）
+      const ok = await request(server()).delete(
+        '/api/cluster/queue/task/cancel-ok',
       );
-      // 对齐 api_server.py:5715-5732：不存在任务返回 200 + {success:false, message}（非 404）
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('success');
-      expect(res.body).toHaveProperty('message');
-      expect(res.headers['content-type']).toContain('application/json');
-      expect(res.text).not.toBe(''); // 禁止 204 空体
+      expect(ok.status).toBe(200);
+      expect(ok.body.success).toBe(true);
+      // 任务不存在：200 + success:false（对齐 api_server.py:5715-5732，非 404；禁止 204 空体）
+      const missing = await request(server())
+        .delete('/api/cluster/queue/task/nonexistent-task')
+        .redirects(0);
+      expect(missing.status).toBe(200);
+      expect(missing.body).toHaveProperty('success');
+      expect(missing.body).toHaveProperty('message');
+      expect(missing.headers['content-type']).toContain('application/json');
+      expect(missing.text).not.toBe('');
     });
 
     it('用例 33: GET /api/device/profile 画像字段（T4）', async () => {
@@ -337,7 +350,8 @@ describe('TUI 契约（阶段 2 网关）', () => {
         '/api/cluster/layers',
       ];
       for (const p of paths) {
-        const res = await request(server()).delete(p);
+        // redirects(0)：禁止跟随重定向，302/3xx 会显式暴露而非假绿
+        const res = await request(server()).delete(p).redirects(0);
         expect(res.headers['content-type']).toContain('application/json');
         expect(res.text).not.toBe('');
       }
@@ -376,7 +390,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(health.status).toBe(200);
       expect(health.body.status).toBe('ok');
 
-      const logs = await request(server()).get('/api/logs/recent');
+      const logs = await request(server()).get('/api/logs/recent').redirects(0);
       expect(logs.status).not.toBe(302);
       expect(logs.headers['content-type']).toContain('application/json');
     });
