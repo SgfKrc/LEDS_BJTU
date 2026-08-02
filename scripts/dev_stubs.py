@@ -64,10 +64,13 @@ SCHEDULER_ROUTES: list = [
     ("POST", r"^/cluster/transfer-master$", {"status": "transferred", "message": "主节点身份已转让"}),
     ("POST", r"^/cluster/spare-master$", {"status": "set", "message": "已设置备用主节点"}),
     ("POST", r"^/cluster/config/max-nodes$", {"status": "updated"}),
+    ("PUT", r"^/cluster/config/max-nodes$", {"status": "updated"}),
     ("POST", r"^/cluster/email-test$", {"message": "测试邮件已发送", "status": "sent"}),
     ("POST", r"^/cluster/reset-identity$", {"status": "reset"}),
     ("POST", r"^/cluster/config/distributed-inference$", {"status": "updated"}),
+    ("PUT", r"^/cluster/config/distributed-inference$", {"status": "updated"}),
     ("POST", r"^/cluster/layers$", {"status": "applied", "message": "已应用分层"}),
+    ("PUT", r"^/cluster/layers$", {"status": "applied", "message": "已应用分层"}),
     ("POST", r"^/cluster/queue/strategy$", {"strategy": "mlfq"}),
     ("POST", r"^/cluster/queue/pause$", {"paused": True}),
     ("POST", r"^/cluster/queue/resume$", {"paused": False}),
@@ -169,14 +172,37 @@ def _make_handler(routes, sse_paths=None):
     return Handler
 
 
+def _build_scheduler_routes(client_mode: bool) -> list:
+    """构造 scheduler 路由表；--client-mode 时 /cluster/my-role 模拟从节点身份。"""
+    if not client_mode:
+        return list(SCHEDULER_ROUTES)
+    my_role = {
+        "is_master": False,
+        "is_provisional": False,
+        "runtime_node_role": "client",
+        "node_role": "client",
+        "node_id": "test-client",
+    }
+    out = []
+    for route in SCHEDULER_ROUTES:
+        method, pattern, data = route[0], route[1], route[2]
+        rest = route[3:]
+        if pattern == r"^/cluster/my-role$":
+            data = my_role
+        out.append((method, pattern, data, *rest))
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="QLH 开发实测桩")
     parser.add_argument("--scheduler-port", type=int, default=8020)
     parser.add_argument("--inference-port", type=int, default=8010)
+    parser.add_argument("--client-mode", action="store_true",
+                        help="模拟从节点身份（/cluster/my-role 返回 is_master=False）")
     args = parser.parse_args()
 
     sched_server = HTTPServer(("127.0.0.1", args.scheduler_port),
-                              _make_handler(SCHEDULER_ROUTES))
+                              _make_handler(_build_scheduler_routes(args.client_mode)))
     inf_server = HTTPServer(("127.0.0.1", args.inference_port),
                             _make_handler(INFERENCE_ROUTES,
                                           {"POST": (re.compile(r"^/v1/chat/stream$"), SSE_BODY)}))
