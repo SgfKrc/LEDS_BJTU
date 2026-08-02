@@ -38,6 +38,8 @@ const routes: Array<{ method: string; match: RegExp; handler: Handler }> = [
   { method: 'POST', match: /^\/cluster\/connect$/, handler: () => json(200, { status: 'connected', message: '已连接主节点' }) },
   { method: 'POST', match: /^\/cluster\/nodes\/register$/, handler: () => json(200, { status: 'registered', reason: '', message: '注册成功' }) },
   { method: 'POST', match: /^\/cluster\/nodes\/[^/]+\/deregister$/, handler: () => json(200, { status: 'deregistered' }) },
+  // 对齐 api_server.py:5266-5285：节点不存在 → 404；特判 delete-ok 模拟成功删除（200 + status）
+  { method: 'DELETE', match: /^\/cluster\/nodes\/delete-ok$/, handler: () => json(200, { status: 'deleted' }) },
   { method: 'DELETE', match: /^\/cluster\/nodes\/[^/]+$/, handler: () => json(404, { detail: '节点不存在' }) },
   { method: 'POST', match: /^\/cluster\/transfer-master$/, handler: () => json(200, { status: 'transferred', message: '主节点身份已转让' }) },
   { method: 'POST', match: /^\/cluster\/spare-master$/, handler: () => json(200, { status: 'set', message: '已设置备用主节点' }) },
@@ -64,7 +66,8 @@ const routes: Array<{ method: string; match: RegExp; handler: Handler }> = [
   { method: 'POST', match: /^\/cluster\/queue\/pause$/, handler: () => json(200, { paused: true }) },
   { method: 'POST', match: /^\/cluster\/queue\/resume$/, handler: () => json(200, { paused: false }) },
   { method: 'POST', match: /^\/cluster\/queue\/clear$/, handler: () => json(200, { success: true, cleared: 3 }) },
-  // 对齐 api_server.py:5715-5732：不存在任务返回 200 + success:false（非 404）
+  // 对齐 api_server.py:5715-5732：不存在任务返回 200 + success:false（非 404）；特判 cancel-ok 模拟成功取消
+  { method: 'DELETE', match: /^\/cluster\/queue\/task\/cancel-ok$/, handler: () => json(200, { success: true, task_id: 'cancel-ok', message: '任务已取消' }) },
   { method: 'DELETE', match: /^\/cluster\/queue\/task\/[^/]+$/, handler: () => json(200, { success: false, task_id: 'nonexistent-task', message: '任务不存在或已经完成，无法取消' }) },
   // ---- device 域（TUI §2.2 #33-35；画像采集留 Python，字段对齐旧网关） ----
   { method: 'GET', match: /^\/device\/profile$/, handler: () => json(200, {
