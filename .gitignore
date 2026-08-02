@@ -72,3 +72,4 @@ _to_delete/
 
 # Reasonix local tool config
 reasonix.toml
+tests/simulation/results/
