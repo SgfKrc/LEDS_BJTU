@@ -5,13 +5,14 @@
  *   - 用例 1-38：tui_admin.py 全部 HTTP 调用点（§2.2 全表）
  *   - 用例 39-43：5 项细节断言 + 错误契约
  *
- * 打开规则：T1 提交时全部保持 skip（网关适配未实现）；按任务逐个打开——
- *   T2（基础设施）：用例 1、41(health)、43
+ * 打开规则：按任务逐个打开——
+ *   T2（已完成）：用例 1、41、43（用例 41 的 logs 段当前由 catch-all 404 JSON 兜底，
+ *        T6 打开真端点后补 status=200 断言）
  *   T3（cluster/queue/layers 代理）：用例 4-32、39(cluster 部分)
  *   T4（device 代理）：用例 33-35
  *   T5（状态聚合）：用例 2、3、40、42（用例 40 断言跨 /status、/models/current、
  *        /cluster/nodes、/cluster/queue 四个端点，按"不允许部分断言"整体归 T5）
- *   T6（logs 代理）：用例 36-38、41(logs 部分)、39(logs 不适用)
+ *   T6（logs 代理）：用例 36-38、41(logs 段补充 status 断言)
  * 打开一个用例即要求其断言全绿，不允许部分断言。
  */
 import request from 'supertest';
@@ -52,7 +53,7 @@ describe('TUI 契约（阶段 2 网关）', () => {
   // 用例 1-38：§2.2 端点全表（38 个调用点）
   // ============================================================
   describe('端点全表', () => {
-    it.skip('用例 1: GET /api/health 返回 200 且 status=ok（T2）', async () => {
+    it('用例 1: GET /api/health 返回 200 且 status=ok', async () => {
       const res = await request(server()).get('/api/health');
       expect(res.status).toBe(200);
       expect(res.body.status).toBe('ok');
@@ -357,7 +358,9 @@ describe('TUI 契约（阶段 2 网关）', () => {
       }
     });
 
-    it.skip('用例 41: /api/health JSON ok；无 token 日志请求返回 JSON 而非 302（T2/T6）', async () => {
+    it('用例 41: /api/health JSON ok；无 token 日志请求返回 JSON 而非 302', async () => {
+      // logs 段当前由 catch-all 404 JSON 兜底（非 302 + JSON 即过）；
+      // T6 打开真端点后补 status=200 断言。
       const health = await request(server()).get('/api/health');
       expect(health.status).toBe(200);
       expect(health.body.status).toBe('ok');
@@ -374,11 +377,13 @@ describe('TUI 契约（阶段 2 网关）', () => {
       expect(res.body.device).toBeDefined();
     });
 
-    it.skip('用例 43: 错误响应体必须为 JSON detail（T2）', async () => {
+    it('用例 43: 错误响应体必须为 JSON detail', async () => {
       const res = await request(server()).get('/api/nonexistent-route');
       expect(res.status).toBe(404);
       expect(res.headers['content-type']).toContain('application/json');
       expect(res.body).toHaveProperty('detail');
+      // 前端 client.js:84 读取 X-Request-ID 响应头（对齐 FastAPI request_id 中间件）
+      expect(res.headers['x-request-id']).toBeDefined();
     });
   });
 });
