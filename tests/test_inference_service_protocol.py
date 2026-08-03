@@ -1475,3 +1475,100 @@ def test_scheduler_svc_host_selection(monkeypatch):
     from model_host import ModelHost
 
     assert isinstance(sched2._host, ModelHost)
+
+
+# ----------------------------------------------------------------------
+# 17.5 scheduler-svc HTTP 壳（§4.2 透传路径契约，阶段 2 起点实现）
+# ----------------------------------------------------------------------
+@pytest.fixture()
+def sched_http_client():
+    """真实 Scheduler 实例 + HTTP 壳应用（不启动 TCP，TestClient 直连）。"""
+    import scheduler as sched_mod
+    import scheduler_svc_http as http_mod
+
+    sched = sched_mod.Scheduler()
+    app = http_mod.build_scheduler_app(sched)
+    return TestClient(app), sched
+
+
+def test_sched_http_status(sched_http_client):
+    """GET /cluster/status：run_mode/node_role/node_id/max_nodes 字段。"""
+    client, _ = sched_http_client
+    r = client.get("/cluster/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert "run_mode" in body and "node_role" in body
+    assert "node_id" in body and "max_nodes" in body
+
+
+def test_sched_http_nodes(sched_http_client):
+    """GET /cluster/nodes：nodes/count/online_count/offline_count。"""
+    client, _ = sched_http_client
+    r = client.get("/cluster/nodes")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) == {"nodes", "count", "online_count", "offline_count"}
+    assert isinstance(body["count"], int)
+
+
+def test_sched_http_my_role(sched_http_client):
+    client, _ = sched_http_client
+    r = client.get("/cluster/my-role")
+    assert r.status_code == 200
+    body = r.json()
+    assert "is_master" in body and "node_role" in body and "node_id" in body
+
+
+def test_sched_http_queue_lifecycle(sched_http_client):
+    """queue 域：detail/strategy/pause/resume/clear。"""
+    client, _ = sched_http_client
+    r = client.get("/cluster/queue")
+    assert r.status_code == 200
+    body = r.json()
+    for key in ("paused", "strategy", "queue_size", "max_size", "q0", "q1", "q2"):
+        assert key in body, f"queue 缺字段 {key}"
+
+    r = client.post("/cluster/queue/strategy", json={"strategy": "mlfq"})
+    assert r.status_code == 200
+    assert r.json()["strategy"] == "mlfq"
+
+    r = client.post("/cluster/queue/pause")
+    assert r.status_code == 200 and r.json()["paused"] is True
+    r = client.post("/cluster/queue/resume")
+    assert r.status_code == 200 and r.json()["paused"] is False
+    r = client.post("/cluster/queue/clear")
+    assert r.status_code == 200 and "cleared" in r.json()
+
+
+def test_sched_http_config_and_layers(sched_http_client):
+    client, _ = sched_http_client
+    r = client.get("/cluster/config")
+    assert r.status_code == 200
+    assert "run_mode" in r.json() and "max_nodes" in r.json()
+
+    r = client.get("/cluster/layers")
+    assert r.status_code == 200
+    body = r.json()
+    assert "total" in body and "assignments" in body
+
+    r = client.get("/cluster/config/distributed-inference")
+    assert r.status_code == 200
+    assert "enabled" in r.json()
+
+
+def test_sched_http_nodes_deregister_404(sched_http_client):
+    """deregister 不存在节点 → 404（对齐 api_server 语义）。"""
+    client, _ = sched_http_client
+    r = client.post("/cluster/nodes/nope/deregister")
+    assert r.status_code == 404
+    assert "detail" in r.json()
+
+
+def test_sched_http_queue_task_cancel_404_semantics(sched_http_client):
+    """cancel 不存在任务 → 200 + success:false（对齐 api_server.py:5715-5732）。"""
+    client, _ = sched_http_client
+    r = client.delete("/cluster/queue/task/nonexistent-task")
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("success") is False
+    assert "message" in body
