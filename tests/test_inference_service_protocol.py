@@ -347,11 +347,12 @@ def test_layers_forward_unknown_kv_ref(client):
 # ----------------------------------------------------------------------
 # 7. 实验端点门控
 # ----------------------------------------------------------------------
-def test_speculative_run_not_implemented(client):
+def test_speculative_run_gated_off(client):
+    """SPEC_ENABLED 未启用（默认）→ 404 门控（复制 api_server 语义）。"""
     resp = client.post(
         "/v1/speculative/run", json={"prompt": "你好"}
     )
-    assert resp.status_code == 501
+    assert resp.status_code == 404
     assert "detail" in resp.json()
 
 
@@ -500,3 +501,86 @@ def test_aux_parse_thinking_response():
     answer, thinking = parse("无标记直接回答")
     assert answer == "无标记直接回答"
     assert thinking is None
+
+
+# ----------------------------------------------------------------------
+# 12. 1.2b 追问生成（复制自 api_server._generate_followups_llama +
+#     _is_question / _fallback_followups）
+# ----------------------------------------------------------------------
+def test_followups_history_too_short():
+    host = FakeEngineHost()
+    assert host.generate_followups_llama([]) == []
+    assert host.generate_followups_llama([{"role": "user", "content": "hi"}]) == []
+
+
+def test_followups_cancel_event():
+    host = FakeEngineHost()
+    cancel = threading.Event()
+    cancel.set()
+    history = [
+        {"role": "user", "content": "什么是量化？"},
+        {"role": "assistant", "content": "量化是模型压缩技术。"},
+    ]
+    assert host.generate_followups_llama(history, cancel) == []
+
+
+def test_followups_model_generates_valid_questions():
+    host = FakeEngineHost()
+
+    class ChatModel(FakeModel):
+        def chat(self, messages, **_kw):
+            return {"content": "1. 量化有哪些方法？\n2. INT8量化相比INT4有哪些优势？\n3. 陈述句不是问题"}
+
+    host._host = ChatModel()
+    history = [
+        {"role": "user", "content": "什么是量化？"},
+        {"role": "assistant", "content": "量化是模型压缩技术。"},
+    ]
+    questions = host.generate_followups_llama(history)
+    assert "量化有哪些方法？" in questions
+    assert "INT8量化相比INT4有哪些优势？" in questions
+    assert "陈述句不是问题" not in questions
+    assert len(questions) <= 3
+
+
+def test_followups_fallback_on_garbage():
+    host = FakeEngineHost()
+
+    class GarbageModel(FakeModel):
+        def chat(self, messages, **_kw):
+            return {"content": "完全不相关的内容没有问号"}
+
+    host._host = GarbageModel()
+    history = [
+        {"role": "user", "content": "什么是量化？"},
+        {"role": "assistant", "content": "量化是模型压缩技术。"},
+    ]
+    questions = host.generate_followups_llama(history)
+    assert len(questions) >= 2  # 关键词模板兜底
+    assert any("量化" in q or "模型" in q for q in questions)
+
+
+def test_followups_generation_failure_non_fatal():
+    host = FakeEngineHost()
+
+    class BrokenModel(FakeModel):
+        def chat(self, messages, **_kw):
+            raise RuntimeError("模型调用失败")
+
+    host._host = BrokenModel()
+    history = [
+        {"role": "user", "content": "什么是量化？"},
+        {"role": "assistant", "content": "量化是模型压缩技术。"},
+    ]
+    questions = host.generate_followups_llama(history)
+    assert len(questions) >= 2  # 异常非致命 → 模板兜底
+
+
+def test_is_question_aux():
+    from inference_service.engine_host import _is_question
+    assert _is_question("量化有哪些方法？")
+    assert _is_question("为什么？")
+    assert not _is_question("量化很重要")  # 无问号
+    assert not _is_question("有以下几点：")  # 陈述句式
+    assert not _is_question("1. 首先")  # 列举开头
+    assert not _is_question("")
