@@ -120,6 +120,52 @@ describe('阶段 2 其余域契约', () => {
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('status');
     });
+
+    it('POST /api/chat/upload 文本文件解析（txt）', async () => {
+      const res = await request(server())
+        .post('/api/chat/upload')
+        .attach('file', Buffer.from('第一行\n第二行\n第三行'), 'demo.txt');
+      expect(res.status).toBe(200);
+      expect(res.body.filename).toBe('demo.txt');
+      expect(res.body.extension).toBe('.txt');
+      expect(res.body.language).toBe('plaintext');
+      expect(res.body.content).toBe('第一行\n第二行\n第三行');
+      expect(res.body.line_count).toBe(3);
+      expect(res.body.total_lines).toBe(3);
+      expect(res.body.truncated).toBe(false);
+      expect(res.body.size_bytes).toBeGreaterThan(0);
+    });
+
+    it('POST /api/chat/upload 语言检测（py → python）', async () => {
+      const res = await request(server())
+        .post('/api/chat/upload')
+        .attach('file', Buffer.from('def main():\n    pass\n'), 'main.py');
+      expect(res.status).toBe(200);
+      expect(res.body.language).toBe('python');
+      expect(res.body.extension).toBe('.py');
+    });
+
+    it('POST /api/chat/upload 不支持扩展名 → 400', async () => {
+      const res = await request(server())
+        .post('/api/chat/upload')
+        .attach('file', Buffer.from('x'), 'demo.exe');
+      expect(res.status).toBe(400);
+      expect(res.body.detail).toContain('不支持的文件类型');
+    });
+
+    it('POST /api/chat/upload 超 5000 行截断', async () => {
+      const content = Array.from({ length: 5100 }, (_, i) => `line-${i}`).join(
+        '\n',
+      );
+      const res = await request(server())
+        .post('/api/chat/upload')
+        .attach('file', Buffer.from(content), 'big.log');
+      expect(res.status).toBe(200);
+      expect(res.body.truncated).toBe(true);
+      expect(res.body.line_count).toBe(5000);
+      expect(res.body.total_lines).toBe(5100);
+      expect(res.body.truncated_lines).toBe(100);
+    });
   });
 
   describe('models 域', () => {

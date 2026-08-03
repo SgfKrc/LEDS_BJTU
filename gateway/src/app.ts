@@ -12,6 +12,7 @@ import {
   NestFastifyApplication,
 } from '@nestjs/platform-fastify';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import fastifyMultipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import { JsonDetailFilter } from './common/json-detail.filter';
 import { RequestIdInterceptor } from './common/request-id';
@@ -71,6 +72,10 @@ export async function createApp(): Promise<NestFastifyApplication> {
     root: resolveFrontendDist(),
     wildcard: false,
     serve: false,
+  });
+  // 阶段 2.6：POST /api/chat/upload（multipart，对齐 FastAPI UploadFile 语义）
+  await app.register(fastifyMultipart, {
+    limits: { fileSize: 5 * 1024 * 1024, files: 1 },
   });
   // 对齐 FastAPI 语义：带 application/json 头的空 body 请求（如无 body 的
   // DELETE/POST）按 {} 解析而非 400（Fastify 默认报
