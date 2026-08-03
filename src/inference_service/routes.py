@@ -59,6 +59,15 @@ def _kv_host(request: Request):
     return host
 
 
+def _require_master_role(request: Request) -> None:
+    """1.3 角色感知：client 角色（从节点）无完整模型，chat 端点 404。"""
+    if getattr(request.app.state, "node_role", "master") == "client":
+        raise HTTPException(
+            status_code=404,
+            detail="client 角色不提供 chat 接口（从节点无完整模型）",
+        )
+
+
 # ----------------------------------------------------------------------
 # SSE 序列化（对齐 api_server 事件格式）
 # ----------------------------------------------------------------------
@@ -144,6 +153,7 @@ async def models_current(request: Request):
 @router.post("/chat")
 async def chat(req: ChatRequest, request: Request):
     """完整对话（JSON；1.2c 已接入 _execute_chat_full 完整复制）。"""
+    _require_master_role(request)
     host = _engine_host(request)
     request_id = request.headers.get("X-QLH-Request-ID", "-")
     generation_id, cancel_event = host.register_generation(req.generation_id)
@@ -162,6 +172,7 @@ async def chat(req: ChatRequest, request: Request):
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request):
     """SSE 流式（事件格式与 api_server /api/chat/stream 一致）。"""
+    _require_master_role(request)
     host = _engine_host(request)
     request_id = request.headers.get("X-QLH-Request-ID", "-")
     generation_id, cancel_event = host.register_generation(req.generation_id)
@@ -212,6 +223,7 @@ async def chat_stream(req: ChatRequest, request: Request):
 
 @router.post("/chat/cancel")
 async def chat_cancel(req: ChatCancelRequest, request: Request):
+    _require_master_role(request)
     host = _engine_host(request)
     if not host.cancel_generation(req.generation_id):
         raise HTTPException(
@@ -227,6 +239,7 @@ async def chat_cancel(req: ChatCancelRequest, request: Request):
 async def speculative_run(req: SpeculativeRunRequest, request: Request):
     """投机解码 draft-verify 实验端点（1.2b 接入真实实现；
     门控/异常映射复制自 api_server.experimental_speculative_chat）。"""
+    _require_master_role(request)
     import config as _cfg
 
     host = _engine_host(request)

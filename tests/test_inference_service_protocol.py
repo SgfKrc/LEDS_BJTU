@@ -854,3 +854,52 @@ def test_chat_full_pytorch_path(monkeypatch):
     assert len(result["followups"]) >= 2
     # 会话历史追加
     assert host._session_histories["s1"][-1]["role"] == "assistant"
+
+
+# ----------------------------------------------------------------------
+# 15. 1.3 服务入口：build_app + 角色感知门控
+# ----------------------------------------------------------------------
+def test_build_app_master_role():
+    from inference_svc_main import build_app
+
+    app = build_app("master")
+    assert app.state.engine_host.role == "master"
+    assert app.state.node_role == "master"
+    with TestClient(app) as c:
+        assert c.get("/v1/health").status_code == 200
+        # master 角色放行 chat（无模型文件环境返回 500 模型未加载；有模型则 200）
+        assert c.post("/v1/chat", json={"message": "你好"}).status_code in (200, 500, 507)
+
+
+def test_build_app_client_role_gates_chat():
+    from inference_svc_main import build_app
+
+    app = build_app("client")
+    assert app.state.engine_host.role == "client"
+    with TestClient(app) as c:
+        # client 角色：chat 端点 404，层段/KV 端点仍可用
+        assert c.post("/v1/chat", json={"message": "你好"}).status_code == 404
+        assert c.post("/v1/chat/stream", json={"message": "你好"}).status_code == 404
+        assert c.get("/v1/health").status_code == 200
+        assert c.post("/v1/kv/init", json={}).status_code == 200
+        r = c.post("/v1/layers/load", json={"layer_range": "0-12"})
+        assert r.status_code in (200, 500)  # FakeModel 桩可加载
+
+
+def test_entry_module_no_heavy_imports():
+    """1.3 验收：入口顶层不 import model_module/transformers/sklearn。"""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.path.insert(0, 'src'); import inference_svc_main; "
+        "mods = set(sys.modules); "
+        "heavy = [m for m in ('model_module', 'transformers', 'sklearn', 'pandas') "
+        "         if any(k == m or k.startswith(m + '.') for k in mods)]; "
+        "print('HEAVY:', heavy)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert "HEAVY: []" in result.stdout, f"顶层拉入了重依赖: {result.stdout} {result.stderr}"
