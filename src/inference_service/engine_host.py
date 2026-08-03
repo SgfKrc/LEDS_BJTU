@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import threading
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
@@ -190,9 +191,72 @@ def _format_model_response(text: str, show_thinking: bool,
     return _strip_native_thinking_tags(text), None
 
 
+# ---- 复制自 api_server.py:2225-2232（纯函数，保真不变） ----
+def _chat_origin(req: "ChatRequest") -> str:
+    """根据请求上报信息推断请求来源，用于 metrics 展示。"""
+    if req.client_node_type == "android":
+        return "android_http"
+    if req.client_node_type == "pc":
+        return "pc_http"
+    return "web_http"
+
+
+# ---- 复制自 api_server.py:2234-2259（宿主适配：scheduler 全局 → 参数注入） ----
+def _augment_chat_metrics(
+    metrics: Optional[dict],
+    req: "ChatRequest",
+    *,
+    serving_node_id: str = "",
+    distributed_enabled: bool = False,
+    **defaults,
+) -> dict:
+    """补齐统一聊天 metrics 字段，不覆盖调度器已给出的真实执行信息。
+
+    （api_server 版从 scheduler 全局取 serving_node_id / 分布式开关；
+    本进程由 EngineHost 持有，经参数注入。）
+    """
+    result = dict(metrics or {})
+    for key, value in defaults.items():
+        result.setdefault(key, value)
+    origin = _chat_origin(req)
+    result.setdefault("request_origin", origin)
+    result.setdefault("request_origin_node_id", req.client_node_id or "")
+    result.setdefault("request_origin_node_type", req.client_node_type or "")
+    result.setdefault("client_mode", req.client_mode or "")
+    result.setdefault("client_app_variant", req.client_app_variant or "")
+    result.setdefault("serving_node_id", serving_node_id)
+    result.setdefault("distributed_requested", distributed_enabled)
+    result.setdefault("distributed_used", False)
+    result.setdefault("fallback", False)
+    result.setdefault("fallback_reason", "")
+    result.setdefault("workers_used", [])
+    result.setdefault("layer_assignments", [])
+    result.setdefault("request_id", _request_id_ctx.get("-"))
+    result.setdefault("generation_id", req.generation_id or "")
+    return result
+
+
 from .protocol import ChatRequest  # noqa: E402（置于辅助函数后保持文档头清晰）
 
 logger = logging.getLogger("inference_service.engine_host")
+
+# ---- 复制自 api_server.py:96（请求 ID 上下文，与 api_server 同机制） ----
+_request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+# ---- 复制自 api_server.py:406-410（异常，保真不变） ----
+class ChatGenerationCancelled(RuntimeError):
+    def __init__(self, generation_id: str):
+        self.generation_id = generation_id
+        super().__init__(f"generation {generation_id} cancelled")
+
+
+# ---- 复制自 api_server.py:459-464（纯函数，保真不变） ----
+def _raise_if_generation_cancelled(
+    cancel_event: Optional[threading.Event], generation_id: Optional[str],
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ChatGenerationCancelled(generation_id or "gen_unknown")
 
 
 # ---- 复制自 api_server.py:1178-1226（纯函数，保真不变） ----
@@ -387,6 +451,16 @@ class EngineHost:
         self._layers: List[str] = []  # 已加载层段（1.2 与 model 侧真实状态对齐）
         self._gen_lock = threading.RLock()
         self._generations: Dict[str, threading.Event] = {}
+        # 1.2c 宿主适配状态（api_server 全局 → 实例属性）
+        self._conversation_stats: Dict[str, int] = {
+            "total_generated_tokens": 0,
+            "rounds": 0,
+        }
+        # 1.4 注入：scheduler-svc 侧任务完成回调（当前 no-op，进程内基线）
+        self._on_task_complete = None
+        # 1.4 注入：scheduler-svc 下发的节点身份/分布式开关（metrics 用）
+        self._serving_node_id = ""
+        self._distributed_enabled = False
 
     # ------------------------------------------------------------------
     # 模型生命周期（委托 ModelHost / ModelManager）
@@ -805,6 +879,122 @@ class EngineHost:
                     same_provider_retryable=True,
                 ) from exc
         raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+
+    # ------------------------------------------------------------------
+    # 外部推理整请求路由（1.2c 复制自 api_server._execute_external_chat
+    # api_server.py:2294-2400；宿主适配：conversation_stats → 实例属性、
+    # model_host._db_available → self._host、scheduler.record_task_complete
+    # → self._on_task_complete 回调（1.4 注入））
+    # ------------------------------------------------------------------
+    def execute_external_chat(
+        self,
+        req: ChatRequest,
+        history: list,
+        target_session_id: Optional[str],
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
+        """整请求路由到外部推理服务（与 llama.cpp/孤岛整请求路径同构）。"""
+        import config as _cfg
+        from external_provider import get_external_chat_client
+
+        client = get_external_chat_client()
+        client.ensure_connected()
+        request_history = [
+            *history,
+            {"role": "user", "content": req.message},
+        ]
+        result = client.chat(
+            request_history,
+            max_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+            allow_external=req.allow_external,
+            cancel_event=cancel_event,
+        )
+        _raise_if_generation_cancelled(cancel_event, req.generation_id)
+        response_text = result.get("content", "")
+        if not req.show_thinking:
+            response_text = _strip_native_thinking_tags(response_text)
+        completed_history = [
+            *request_history,
+            {"role": "assistant", "content": response_text},
+        ]
+        tokens_per_sec = result.get("tokens_per_second", 0)
+        usage = result.get("usage", {})
+        completion_tokens = usage.get("completion_tokens", 0)
+        metrics = _augment_chat_metrics(
+            {
+                "engine": "external_api",
+                "execution_mode": "external_api",
+                "route": f"{_chat_origin(req)}_to_external_api",
+                "provider": "external_openai",
+                "external_label": getattr(_cfg, "EXTERNAL_LABEL", ""),
+                "external_base_url": client.masked_base_url,
+                "data_scope": getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
+                "model": result.get("model", "") or client.model_name,
+                "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                "generated_tokens": completion_tokens,
+                "completion_tokens": completion_tokens,
+                "usage": usage,
+                "usage_estimated": bool(result.get("usage_estimated", False)),
+                "fallback": False,
+                "fallback_reason": "",
+            },
+            req,
+            serving_node_id=self._serving_node_id,
+            distributed_enabled=self._distributed_enabled,
+        )
+
+        db_session_id = target_session_id or "default"
+        followups = _fallback_followups(completed_history, [])
+        history.extend([
+            {"role": "user", "content": req.message},
+            {"role": "assistant", "content": response_text},
+        ])
+
+        if getattr(self._host, "_db_available", False):
+            try:
+                import db as _db_mod
+                if _db_mod.get_save_history():
+                    _db_mod.save_message(db_session_id, "user", req.message)
+                    save_metrics = dict(metrics)
+                    save_metrics["followups"] = followups
+                    _db_mod.save_message(db_session_id, "assistant", response_text,
+                                        save_metrics)
+                    _db_mod.increment_session_message_count(db_session_id)
+            except Exception:
+                pass
+        else:
+            try:
+                import local_store as _local_store
+                _local_store.save_local_message(db_session_id, "user", req.message)
+                save_metrics = dict(metrics)
+                save_metrics["followups"] = followups
+                _local_store.save_local_message(db_session_id, "assistant",
+                                                response_text, save_metrics)
+                _local_store.increment_local_session_message_count(db_session_id)
+            except Exception:
+                pass
+
+        self._conversation_stats["total_generated_tokens"] += completion_tokens
+        self._conversation_stats["rounds"] += 1
+        if self._on_task_complete is not None:
+            try:
+                self._on_task_complete(success=True)
+            except Exception:
+                pass
+
+        logger.info(
+            f"外部推理完成: {completion_tokens} tokens, "
+            f"endpoint={client.masked_base_url}"
+        )
+        return {
+            "content": response_text,
+            "thinking_content": None,
+            "metrics": metrics,
+            "followups": followups,
+        }
 
     # ------------------------------------------------------------------
     # generation 注册表（取消语义，对齐 api_server._register_generation）

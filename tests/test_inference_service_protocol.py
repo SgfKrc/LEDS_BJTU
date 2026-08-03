@@ -584,3 +584,79 @@ def test_is_question_aux():
     assert not _is_question("有以下几点：")  # 陈述句式
     assert not _is_question("1. 首先")  # 列举开头
     assert not _is_question("")
+
+
+# ----------------------------------------------------------------------
+# 13. 1.2c 外部推理整请求路由（复制自 api_server._execute_external_chat）
+# ----------------------------------------------------------------------
+class FakeExternalClient:
+    masked_base_url = "https://***"
+    model_name = "gpt-4o-mini"
+
+    def __init__(self):
+        self.last = None
+
+    def ensure_connected(self):
+        pass
+
+    def chat(self, history, **kw):
+        self.last = (list(history), kw)
+        return {
+            "content": "外部回答",
+            "usage": {"completion_tokens": 3},
+            "tokens_per_second": 9.0,
+            "model": "gpt-4o-mini",
+        }
+
+
+def test_external_chat_routes_and_persists(monkeypatch):
+    import db
+    import external_provider
+
+    fake_client = FakeExternalClient()
+    monkeypatch.setattr(external_provider, "get_external_chat_client", lambda: fake_client)
+    monkeypatch.setattr(db, "get_save_history", lambda: False)  # 测试不落盘
+
+    host = FakeEngineHost()
+    host._host._db_available = True  # 避免走 local_store 落盘分支
+
+    req = ChatRequest(message="你好", allow_external=True, client_node_type="pc")
+    result = host.execute_external_chat(
+        req,
+        [{"role": "user", "content": "之前的问题"}],
+        target_session_id="s1",
+    )
+    assert result["content"] == "外部回答"
+    assert result["metrics"]["engine"] == "external_api"
+    assert result["metrics"]["request_origin"] == "pc_http"
+    assert result["metrics"]["completion_tokens"] == 3
+    assert host._conversation_stats["rounds"] == 1
+    assert host._conversation_stats["total_generated_tokens"] == 3
+    # 请求历史 = 原历史 + 新消息
+    assert fake_client.last[0][-1] == {"role": "user", "content": "你好"}
+    assert fake_client.last[1]["allow_external"] is True
+
+
+def test_external_chat_strips_thinking_when_disabled(monkeypatch):
+    import db
+    import external_provider
+
+    class ThinkingClient(FakeExternalClient):
+        def chat(self, history, **kw):
+            return {"content": "<think>内部</think>外部回答"}
+
+    monkeypatch.setattr(external_provider, "get_external_chat_client", lambda: ThinkingClient())
+    monkeypatch.setattr(db, "get_save_history", lambda: False)
+
+    host = FakeEngineHost()
+    host._host._db_available = True
+    req = ChatRequest(message="hi", allow_external=True, show_thinking=False)
+    result = host.execute_external_chat(req, [], "s2")
+    assert "内部" not in result["content"]
+
+
+def test_chat_origin_aux():
+    from inference_service.engine_host import _chat_origin
+    assert _chat_origin(ChatRequest(message="x", client_node_type="android")) == "android_http"
+    assert _chat_origin(ChatRequest(message="x", client_node_type="pc")) == "pc_http"
+    assert _chat_origin(ChatRequest(message="x")) == "web_http"
