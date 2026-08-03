@@ -1039,13 +1039,6 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
     host._active_session_id = "s1"
     host._session_histories["s1"] = []
 
-    class FakeIdentity:
-        model_id = "qwen-1.8b"
-        engine = "llama_cpp"
-        format = "gguf"
-        revision = "local-abc123"
-        sha256 = "a" * 64
-
     class FakeCoordinator:
         def __init__(self):
             self.providers = []
@@ -1090,11 +1083,10 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
         EngineHost, "_ensure_task_graph_coordinator",
         lambda self: FakeCoordinator(),
     )
-    # 有模型身份（self._host 引用路径真实执行）
-    monkeypatch.setattr(
-        EngineHost, "_active_task_graph_model_identity",
-        lambda self: FakeIdentity(),
-    )
+    # 不 stub _active_task_graph_model_identity：真实执行方法体
+    # （FakeModel 有 _engine_type/active_model_id 但缺 _model_path →
+    # 返回 None → model_identity_unavailable → 本地降级；修复前 1597
+    # 行裸 model_manager 在此路径 NameError）
 
     req = ChatRequest(
         message="hi", session_id="s1", execution_mode="task_graph",
@@ -1106,6 +1098,7 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
     assert result["metrics"]["fallback"] is True
     assert result["metrics"]["auto_remote_enabled"] is True
     assert result["metrics"]["auto_remote_providers"] == []
+    assert result["metrics"]["fallback_reason"] == "model_identity_unavailable"
 
 
 def test_chat_full_llama_cpp_path(monkeypatch):
