@@ -143,15 +143,18 @@ async def models_current(request: Request):
 # ----------------------------------------------------------------------
 @router.post("/chat")
 async def chat(req: ChatRequest, request: Request):
-    """完整对话（JSON；1.1 薄实现，1.2 替换为 _execute_chat_full 副本）。"""
+    """完整对话（JSON；1.2c 已接入 _execute_chat_full 完整复制）。"""
     host = _engine_host(request)
     request_id = request.headers.get("X-QLH-Request-ID", "-")
+    generation_id, cancel_event = host.register_generation(req.generation_id)
     try:
-        result = host.chat_full(req)
+        result = host.chat_full(req, cancel_event)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        host.unregister_generation(generation_id)
     result["request_id"] = request_id
     return result
 
@@ -166,7 +169,7 @@ async def chat_stream(req: ChatRequest, request: Request):
     if req.streaming_mode == "full":
         # full：完整功能，推理完成后一次性返回单个 done 事件（SSE 格式）
         try:
-            result = host.chat_full(req)
+            result = host.chat_full(req, cancel_event)
         except HTTPException as e:
             return StreamingResponse(
                 iter([_sse_error(e.detail, request_id)]),

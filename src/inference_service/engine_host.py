@@ -236,6 +236,59 @@ def _augment_chat_metrics(
     return result
 
 
+# ---- 复制自 api_server.py:828-901（纯函数，保真不变） ----
+def _build_chat_prompt(
+    messages: list[dict],
+    system_prompt: Optional[str] = None,
+    assistant_prefill: Optional[str] = None,
+) -> str:
+    """
+    使用 Qwen 的 chat template 构建对话 prompt。
+    Qwen-1.8B-Chat 使用 <|im_start|>/<|im_end|> 格式。
+    """
+    parts = []
+    if system_prompt:
+        parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>")
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    parts.append("<|im_start|>assistant\n")
+    if assistant_prefill:
+        parts.append(assistant_prefill)
+    return "\n".join(parts)
+
+
+def _build_model_chat_prompt(
+    tokenizer,
+    messages: list[dict],
+    system_prompt: Optional[str] = None,
+    assistant_prefill: Optional[str] = None,
+) -> str:
+    """Build a prompt with the active tokenizer's native chat template."""
+    chat_messages = []
+    if system_prompt:
+        chat_messages.append({"role": "system", "content": system_prompt})
+    chat_messages.extend(messages)
+
+    try:
+        prompt = tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        native_thinking_prompt = "<think>" in prompt[-64:].lower()
+        if assistant_prefill and not native_thinking_prompt:
+            prompt += assistant_prefill
+        return prompt
+    except Exception:
+        return _build_chat_prompt(
+            messages,
+            system_prompt=system_prompt,
+            assistant_prefill=assistant_prefill,
+        )
+
+
 from .protocol import ChatRequest  # noqa: E402（置于辅助函数后保持文档头清晰）
 
 logger = logging.getLogger("inference_service.engine_host")
@@ -453,7 +506,9 @@ class EngineHost:
         self._generations: Dict[str, threading.Event] = {}
         # 1.2c 宿主适配状态（api_server 全局 → 实例属性）
         self._conversation_stats: Dict[str, int] = {
+            "total_prompt_tokens": 0,
             "total_generated_tokens": 0,
+            "total_time_seconds": 0.0,
             "rounds": 0,
         }
         # 1.4 注入：scheduler-svc 侧任务完成回调（当前 no-op，进程内基线）
@@ -461,6 +516,16 @@ class EngineHost:
         # 1.4 注入：scheduler-svc 下发的节点身份/分布式开关（metrics 用）
         self._serving_node_id = ""
         self._distributed_enabled = False
+        # 1.2c 会话管理状态（api_server 全局 → 实例属性）
+        self._active_session_id: Optional[str] = None
+        self._session_histories: Dict[str, list] = {}
+        self._kv_cache: Any = None  # PagedKVCache 单例（惰性，_init_kv_cache）
+        self._device_profile: Optional[dict] = None  # 惰性探测（_ensure_device_profile）
+        self._device_profile_started = False
+        # 1.4 注入：scheduler-svc 客户端接口（None = 单机基线：分布式/流水线禁用）
+        self._scheduler: Any = None
+        self._run_mode: str = "standalone"  # 对齐 api_server.RUN_MODE
+        self._on_task_error = None  # 1.4 注入：任务失败回调
 
     # ------------------------------------------------------------------
     # 模型生命周期（委托 ModelHost / ModelManager）
@@ -592,31 +657,565 @@ class EngineHost:
     # 对话（1.1 薄实现：本地模型 chat/chat_stream；
     # 1.2 替换为 _execute_chat_full / fast 模式副本，含历史/追问/持久化）
     # ------------------------------------------------------------------
-    def chat_full(self, req: ChatRequest) -> Dict[str, Any]:
-        """完整对话响应（对齐 api_server /api/chat 响应形状）。"""
-        messages = [{"role": "user", "content": req.message}]
-        result = self._host.chat(
-            messages=messages,
-            max_tokens=req.max_new_tokens,
-            temperature=req.temperature,
-            top_p=req.top_p,
+    # ------------------------------------------------------------------
+    # 完整聊天流程（1.2c 复制自 api_server._execute_chat_full
+    # api_server.py:3323-3872；宿主适配：kv_cache/conversation_stats/
+    # 会话状态 → 实例属性、model_manager/model_host → self._host、
+    # scheduler → self._scheduler 注入点（None=单机基线）、
+    # RUN_MODE → self._run_mode）
+    # ------------------------------------------------------------------
+    def chat_full(
+        self, req: ChatRequest, cancel_event: Optional[threading.Event] = None
+    ) -> Dict[str, Any]:
+        """
+        执行完整聊天流程 — 从 /api/chat 提取的共用核心逻辑。
+
+        处理: 会话切换、自动标题、客户端转发、流水线推理、
+              llama.cpp、PyTorch、历史维护、DB 持久化、追问生成。
+
+        Returns:
+            {"content": str, "thinking_content": str|None,
+             "metrics": dict, "followups": list[str]}
+
+        Raises:
+            HTTPException: 模型未加载、OOM、推理失败
+        """
+        import time as _time
+        import torch as _torch
+        from fastapi import HTTPException
+
+        _raise_if_generation_cancelled(cancel_event, req.generation_id)
+
+        # ---- 多会话支持 ----
+        target_session_id = req.session_id or self._active_session_id
+        if target_session_id and target_session_id != self._active_session_id:
+            self._switch_session(target_session_id)
+
+        # ---- 首条消息自动生成标题 ----
+        history = self._get_active_history()
+        if target_session_id and len(history) == 0:
+            self._auto_title_session(target_session_id, req.message)
+
+        # ---- 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）----
+        external_fallback_reason = ""
+        _ext_decision = self._external_route_decision(req)
+        if _ext_decision.use_external:
+            try:
+                return self.execute_external_chat(
+                    req, history, target_session_id, cancel_event,
+                )
+            except ChatGenerationCancelled:
+                raise
+            except Exception as exc:
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if not self._host.model_loaded or not getattr(self._host, "is_loaded", False):
+                    if req.prefer_external:
+                        raise HTTPException(
+                            502,
+                            f"外部推理服务调用失败，且本地无可用推理引擎：{exc}",
+                        ) from exc
+                    try:
+                        self._ensure_chat_model_or_forwarding()
+                    except HTTPException:
+                        raise
+                    except Exception as load_exc:
+                        raise HTTPException(
+                            502,
+                            f"外部推理服务调用失败（{exc}），"
+                            f"且本地模型加载失败：{load_exc}",
+                        ) from exc
+                external_fallback_reason = f"external_api_failed: {exc}"
+                logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
+
+        # ---- 分布式推理路由：从节点转发给主节点 ----
+        sched = self._scheduler
+        distributed_enabled = bool(
+            sched is not None and sched.get_distributed_inference_enabled()
         )
-        if isinstance(result, dict):
-            response = result.get("content") or result.get("response") or str(result)
-            metrics = {
-                k: result[k]
-                for k in ("tokens_per_second", "usage")
-                if k in result
+        if (distributed_enabled
+                and self._run_mode == "distributed"
+                and sched._effective_role() == "client"):
+            try:
+                result = sched.forward_inference_to_master(
+                    message=req.message,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    show_thinking=req.show_thinking,
+                    session_id=req.session_id,
+                    messages=list(history) + [{"role": "user", "content": req.message}],
+                    request_id=_request_id_ctx.get("-"),
+                    _cancel_event=cancel_event,
+                )
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if result.get("status") == "ok":
+                    history.append({"role": "user", "content": req.message})
+                    response_text = result.get("content", "")
+                    history.append({"role": "assistant", "content": response_text})
+                    forward_metrics = _augment_chat_metrics(
+                        result.get("metrics", {}),
+                        req,
+                        serving_node_id=self._serving_node_id,
+                        distributed_enabled=distributed_enabled,
+                        engine="distributed_forward",
+                        execution_mode="forwarded_to_master",
+                        route="pc_client_forward_to_master",
+                    )
+                    if external_fallback_reason and not forward_metrics.get(
+                        "fallback_reason",
+                    ):
+                        forward_metrics["fallback"] = True
+                        forward_metrics["fallback_reason"] = external_fallback_reason
+
+                    db_session_id = target_session_id or "default"
+                    if getattr(self._host, "_db_available", False):
+                        try:
+                            import db as _db_mod
+                            if _db_mod.get_save_history():
+                                _db_mod.save_message(db_session_id, "user", req.message)
+                                _db_mod.save_message(db_session_id, "assistant", response_text,
+                                                    forward_metrics)
+                                _db_mod.increment_session_message_count(db_session_id)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            import local_store as _local_store
+                            _local_store.save_local_message(db_session_id, "user", req.message)
+                            _local_store.save_local_message(db_session_id, "assistant", response_text,
+                                                            forward_metrics)
+                            _local_store.increment_local_session_message_count(db_session_id)
+                        except Exception:
+                            pass
+
+                    self._conversation_stats["rounds"] += 1
+                    self._record_task_complete()
+
+                    master_followups = result.get("followups", [])
+                    if master_followups:
+                        followups = master_followups[:3]
+                    else:
+                        followups = _fallback_followups(history, [])
+
+                    return {
+                        "content": response_text,
+                        "thinking_content": result.get("thinking_content"),
+                        "metrics": forward_metrics,
+                        "followups": followups,
+                    }
+                elif result.get("status") == "disconnected":
+                    logger.warning("分布式推理转发失败（未连接主节点），回退到本地推理")
+                elif result.get("status") == "timeout":
+                    logger.warning("分布式推理转发超时，回退到本地推理")
+                else:
+                    logger.warning(f"分布式推理转发失败: {result.get('error', 'unknown')}，回退到本地推理")
+            except ChatGenerationCancelled:
+                raise
+            except Exception as e:
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
+
+            if self._pipeline_worker_is_reserved():
+                raise HTTPException(
+                    503,
+                    "本设备正作为 PyTorch 分层从节点，"
+                    "当前无法转发到主节点，已拒绝覆盖分层模型。",
+                )
+            if not self._host.model_loaded or not getattr(self._host, "is_loaded", False):
+                self._auto_load_default_model()
+
+        if self._pipeline_worker_is_reserved():
+            raise HTTPException(
+                503,
+                "本设备正作为 PyTorch 分层从节点，"
+                "请先断开主节点或明确切换本地模型。",
+            )
+
+        # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
+        if (distributed_enabled
+                and self._run_mode == "distributed"
+                and sched._effective_role() == "master"
+                and getattr(self._host, "_engine_type", None) == "pytorch"):
+            try:
+                pipeline_result = sched.run_pipeline_safe(
+                    req.message,
+                    max_new_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    session_id=req.session_id,
+                    messages=list(history) + [{"role": "user", "content": req.message}],
+                    show_thinking=req.show_thinking,
+                    _cancel_event=cancel_event,
+                )
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if pipeline_result.get("error"):
+                    logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
+                else:
+                    response_text = pipeline_result.get("response", "")
+                    if not response_text:
+                        logger.warning("流水线返回空响应，回退到本地推理")
+                    else:
+                        history.append({"role": "user", "content": req.message})
+                        history.append({"role": "assistant", "content": response_text})
+
+                        db_session_id = target_session_id or "default"
+                        pipeline_metrics = _augment_chat_metrics(
+                            pipeline_result.get("metrics", {}),
+                            req,
+                            serving_node_id=self._serving_node_id,
+                            distributed_enabled=distributed_enabled,
+                            engine="distributed_pipeline",
+                            execution_mode="distributed_pipeline",
+                            route="master_pipeline",
+                        )
+                        if external_fallback_reason and not pipeline_metrics.get(
+                            "fallback_reason",
+                        ):
+                            pipeline_metrics["fallback"] = True
+                            pipeline_metrics["fallback_reason"] = (
+                                external_fallback_reason
+                            )
+                        if getattr(self._host, "_db_available", False):
+                            try:
+                                import db as _db_mod
+                                if _db_mod.get_save_history():
+                                    _db_mod.save_message(db_session_id, "user", req.message)
+                                    _db_mod.save_message(db_session_id, "assistant", response_text,
+                                                        pipeline_metrics)
+                                    _db_mod.increment_session_message_count(db_session_id)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                import local_store as _local_store
+                                _local_store.save_local_message(db_session_id, "user", req.message)
+                                _local_store.save_local_message(db_session_id, "assistant",
+                                                                response_text,
+                                                                pipeline_metrics)
+                                _local_store.increment_local_session_message_count(db_session_id)
+                            except Exception:
+                                pass
+
+                        self._conversation_stats["rounds"] += 1
+                        if not pipeline_metrics.get("distributed_used"):
+                            self._record_task_complete()
+
+                        if getattr(self._host, "_engine_type", None) in ("llama_cpp", "island"):
+                            followups = self.generate_followups_llama(history)
+                        elif getattr(self._host, "_engine_type", None) == "pytorch":
+                            followups = _fallback_followups(history, [])
+                        else:
+                            followups = _fallback_followups(history, [])
+
+                        return {
+                            "content": response_text,
+                            "thinking_content": pipeline_result.get("thinking"),
+                            "metrics": pipeline_metrics,
+                            "followups": followups,
+                        }
+            except ChatGenerationCancelled:
+                raise
+            except Exception as e:
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                logger.warning(f"流水线推理异常: {e}，回退到本地推理")
+
+        model_manager = self._host
+        # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
+        if getattr(model_manager, "_engine_type", None) in ("llama_cpp", "island"):
+            try:
+                engine_name = model_manager._engine_type
+                request_history = [
+                    *history,
+                    {"role": "user", "content": req.message},
+                ]
+                result = model_manager.chat(
+                    messages=request_history,
+                    max_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    _cancel_event=cancel_event,
+                )
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                response_text = result.get("content", "")
+                if not req.show_thinking:
+                    response_text = _strip_native_thinking_tags(response_text)
+                completed_history = [
+                    *request_history,
+                    {"role": "assistant", "content": response_text},
+                ]
+                tokens_per_sec = result.get("tokens_per_second", 0)
+                usage = result.get("usage", {})
+                completion_tokens = usage.get("completion_tokens", 0)
+                local_route = f"{_chat_origin(req)}_to_master_local_{engine_name}"
+                fallback_reason = ""
+                if external_fallback_reason:
+                    fallback_reason = external_fallback_reason
+                elif distributed_enabled and self._run_mode == "distributed":
+                    if engine_name == "island":
+                        fallback_reason = "island engine delegates whole-request inference to the TP island"
+                    else:
+                        fallback_reason = "llama.cpp engine does not support layer-split pipeline"
+                metrics = _augment_chat_metrics(
+                    {
+                        "engine": engine_name,
+                        "execution_mode": f"local_{engine_name}",
+                        "route": local_route,
+                        "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                        "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
+                        "generated_tokens": completion_tokens,
+                        "completion_tokens": completion_tokens,
+                        "usage": usage,
+                        "fallback": bool(fallback_reason),
+                        "fallback_reason": fallback_reason,
+                    },
+                    req,
+                    serving_node_id=self._serving_node_id,
+                    distributed_enabled=distributed_enabled,
+                )
+
+                db_session_id = target_session_id or "default"
+                followups = self.generate_followups_llama(
+                    completed_history, cancel_event,
+                )
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                history.extend([
+                    {"role": "user", "content": req.message},
+                    {"role": "assistant", "content": response_text},
+                ])
+
+                if getattr(self._host, "_db_available", False):
+                    try:
+                        import db as _db_mod
+                        if _db_mod.get_save_history():
+                            _db_mod.save_message(db_session_id, "user", req.message)
+                            save_metrics = dict(metrics)
+                            save_metrics["followups"] = followups
+                            _db_mod.save_message(db_session_id, "assistant", response_text,
+                                                save_metrics)
+                            _db_mod.increment_session_message_count(db_session_id)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        import local_store as _local_store
+                        _local_store.save_local_message(db_session_id, "user", req.message)
+                        save_metrics = dict(metrics)
+                        save_metrics["followups"] = followups
+                        _local_store.save_local_message(db_session_id, "assistant", response_text,
+                                                        save_metrics)
+                        _local_store.increment_local_session_message_count(db_session_id)
+                    except Exception:
+                        pass
+
+                self._conversation_stats["total_generated_tokens"] += completion_tokens
+                self._conversation_stats["rounds"] += 1
+                self._record_task_complete()
+
+                return {
+                    "content": response_text,
+                    "thinking_content": None,
+                    "metrics": metrics,
+                    "followups": followups,
+                }
+            except ChatGenerationCancelled:
+                raise
+            except Exception as e:
+                _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                self._record_task_error()
+                _engine_label = (
+                    "孤岛引擎"
+                    if getattr(model_manager, "_engine_type", "") == "island"
+                    else "llama.cpp"
+                )
+                logger.error(f"{_engine_label} 推理失败: {e}", exc_info=True)
+                raise HTTPException(500, f"推理失败: {str(e)}")
+
+        # ---- PyTorch 引擎路径（CUDA/独显）----
+        try:
+            model_manager.ensure_full_model()
+            tier_max = self._host.generation_config.get("tier_max_new_tokens", self._host.generation_config["max_new_tokens"])
+            thinking_budget = 384 if req.show_thinking else 0
+            effective_max = min(req.max_new_tokens + thinking_budget,
+                                tier_max + thinking_budget,
+                                4096)
+            self._host.generation_config["max_new_tokens"] = effective_max
+            self._host.generation_config["temperature"] = req.temperature
+            self._host.generation_config["top_p"] = req.top_p
+
+            request_history = [
+                *history,
+                {"role": "user", "content": req.message},
+            ]
+
+            tokenizer = model_manager.tokenizer
+            thinking_prompt = THINKING_SYSTEM_PROMPT if req.show_thinking else None
+            thinking_prefill = "【思考】\n" if req.show_thinking else None
+            prompt = _build_model_chat_prompt(
+                tokenizer,
+                request_history,
+                system_prompt=thinking_prompt,
+                assistant_prefill=thinking_prefill,
+            )
+            inputs = tokenizer(prompt, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(model_manager.get_device())
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(model_manager.get_device())
+            prompt_len = input_ids.shape[1]
+            stop_sequences = model_manager._merge_stop_sequences(None)
+            generation_kwargs = {}
+            eos_token_ids = model_manager._get_generation_eos_token_ids(stop_sequences)
+            if eos_token_ids is not None:
+                generation_kwargs["eos_token_id"] = eos_token_ids
+            stop_criteria_kwargs = (
+                {"cancel_event": cancel_event} if cancel_event is not None else {}
+            )
+            stop_criteria = model_manager._build_stop_criteria(
+                stop_sequences, prompt_len, **stop_criteria_kwargs,
+            )
+            if stop_criteria is not None:
+                generation_kwargs["stopping_criteria"] = stop_criteria
+
+            t0 = _time.time()
+            with _torch.no_grad():
+                outputs = model_manager.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=effective_max,
+                    temperature=req.temperature if req.temperature > 0 else 1.0,
+                    top_p=req.top_p,
+                    do_sample=req.temperature > 0,
+                    pad_token_id=tokenizer.eos_token_id,
+                    **generation_kwargs,
+                )
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            elapsed = _time.time() - t0
+
+            generated_ids = outputs[0][prompt_len:]
+            raw_text = model_manager._decode_generated_ids(generated_ids, stop_sequences).strip()
+
+            native_thinking_prompt = "<think>" in prompt[-128:].lower()
+            parsed_text = raw_text
+            if req.show_thinking and not native_thinking_prompt and "<think" not in raw_text.lower():
+                parsed_text = "【思考】\n" + raw_text
+            response_text, thinking_content = _format_model_response(
+                parsed_text,
+                req.show_thinking,
+                native_thinking_prompt=native_thinking_prompt,
+            )
+
+            completed_history = [
+                *request_history,
+                {"role": "assistant", "content": response_text},
+            ]
+
+            new_tokens = len(generated_ids)
+            tokens_per_sec = new_tokens / elapsed if elapsed > 0 else 0
+            metrics = _augment_chat_metrics(
+                {
+                    "engine": "pytorch",
+                    "execution_mode": "local_pytorch",
+                    "route": f"{_chat_origin(req)}_to_master_local_pytorch",
+                    "prompt_tokens": prompt_len,
+                    "new_tokens": new_tokens,
+                    "generated_tokens": new_tokens,
+                    "total_tokens": prompt_len + new_tokens,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "tokens_per_second": round(tokens_per_sec, 1),
+                    "gpu_memory_mb": round(_torch.cuda.memory_allocated() / (1024**2), 1)
+                    if _torch.cuda.is_available()
+                    else 0,
+                },
+                req,
+                serving_node_id=self._serving_node_id,
+                distributed_enabled=distributed_enabled,
+                fallback=bool(external_fallback_reason),
+                fallback_reason=external_fallback_reason,
+            )
+
+            db_session_id = target_session_id or "default"
+
+            followups = self._generate_followups(
+                completed_history,
+                tokenizer,
+                model_manager.model,
+                model_manager.get_device(),
+                cancel_event,
+            )
+            _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            history.extend([
+                {"role": "user", "content": req.message},
+                {"role": "assistant", "content": response_text},
+            ])
+
+            if getattr(self._host, "_db_available", False):
+                try:
+                    import db as _db_mod
+                    if _db_mod.get_save_history():
+                        _db_mod.save_message(db_session_id, "user", req.message)
+                        save_metrics = dict(metrics)
+                        save_metrics["followups"] = followups
+                        _db_mod.save_message(db_session_id, "assistant", response_text, save_metrics)
+                        _db_mod.increment_session_message_count(db_session_id)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import local_store as _local_store
+                    save_metrics = dict(metrics)
+                    save_metrics["followups"] = followups
+                    _local_store.save_local_message(db_session_id, "user", req.message)
+                    _local_store.save_local_message(db_session_id, "assistant", response_text, save_metrics)
+                    _local_store.increment_local_session_message_count(db_session_id)
+                except Exception:
+                    pass
+
+            self._conversation_stats["total_prompt_tokens"] += prompt_len
+            self._conversation_stats["total_generated_tokens"] += new_tokens
+            self._conversation_stats["total_time_seconds"] += elapsed
+            self._conversation_stats["rounds"] += 1
+            self._record_task_complete()
+
+            logger.info(
+                f"推理完成: {new_tokens} tokens / {elapsed:.2f}s = {tokens_per_sec:.1f} tok/s"
+            )
+
+            return {
+                "content": response_text,
+                "thinking_content": thinking_content,
+                "metrics": metrics,
+                "followups": followups,
             }
-        else:
-            response = str(result)
-            metrics = {}
-        return {
-            "response": response,
-            "followups": [],
-            "metrics": metrics,
-            "request_id": "-",
-        }
+
+        except ChatGenerationCancelled:
+            raise
+        except _torch.cuda.OutOfMemoryError:
+            self._record_task_error()
+            if self._kv_cache:
+                self._kv_cache.clear()
+            self._get_active_history().clear()
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+            raise HTTPException(507, "GPU 显存不足（OOM），已自动清空对话历史。请缩短消息后重试。")
+
+        except Exception as e:
+            self._record_task_error()
+            logger.error(f"推理异常: {e}", exc_info=True)
+            raise HTTPException(500, f"推理失败: {str(e)}")
+
+    def _record_task_complete(self) -> None:
+        if self._on_task_complete is not None:
+            try:
+                self._on_task_complete(success=True)
+            except Exception:
+                pass
+
+    def _record_task_error(self) -> None:
+        if self._on_task_error is not None:
+            try:
+                self._on_task_error()
+            except Exception:
+                pass
 
     def chat_stream_events(self, req: ChatRequest, cancel_event: Optional[threading.Event]):
         """SSE 事件序列（1.1 薄实现；1.2 替换为 fast 模式副本）。
@@ -879,6 +1478,463 @@ class EngineHost:
                     same_provider_retryable=True,
                 ) from exc
         raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
+
+    # ------------------------------------------------------------------
+    # 会话管理（1.2c 复制自 api_server.py:1090-1175，全局 → 实例属性）
+    # ------------------------------------------------------------------
+    def _get_active_history(self) -> list:
+        """
+        获取当前活跃会话的对话历史列表。
+
+        如果没有活跃会话，返回空列表（不自动创建会话）。
+        返回的列表对象可被原地修改（append、clear 等）。
+        """
+        if self._active_session_id is None:
+            return []
+        if self._active_session_id not in self._session_histories:
+            self._session_histories[self._active_session_id] = []
+        return self._session_histories[self._active_session_id]
+
+    def _ensure_device_profile(self) -> Optional[dict]:
+        """惰性设备画像探测（api_server 启动事件等价物，同步版）。"""
+        if self._device_profile_started:
+            return self._device_profile
+        self._device_profile_started = True
+        try:
+            from device_profiler import get_profile
+            profiler = get_profile()
+            self._device_profile = profiler.to_dict()
+            logger.info(
+                f"🚀 设备检测完成: tier={profiler.tier.value} "
+                f"score={profiler.score:.1f}/100"
+            )
+        except Exception as e:
+            logger.error(f"设备检测失败: {e}")
+            self._device_profile = None
+        return self._device_profile
+
+    def _init_kv_cache(self):
+        """初始化分页 KV 缓存（根据设备画像自适应大小）。"""
+        import torch as _torch
+        from paged_kv_cache import PagedKVCache
+
+        num_heads = 16      # Qwen-1.8B: 16 attention heads
+        head_dim = 64
+        mgr = self._host
+        if getattr(mgr, "model", None) is not None:
+            try:
+                cfg = mgr.model.config
+                num_heads = cfg.num_attention_heads
+                head_dim = cfg.hidden_size // num_heads
+            except Exception:
+                pass
+
+        device = str(mgr.get_device()) if callable(getattr(mgr, "get_device", None)) else "cpu"
+        self._ensure_device_profile()
+        if self._device_profile:
+            self._kv_cache = PagedKVCache.from_profile(
+                profile=self._device_profile,
+                device=device,
+                dtype=_torch.float16,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+            logger.info(
+                f"🧠 KV 缓存已初始化 (profile): num_heads={num_heads}, "
+                f"head_dim={head_dim}, device={device}"
+            )
+        else:
+            self._kv_cache = PagedKVCache(
+                device=device,
+                dtype=_torch.float16,
+            )
+            logger.info(
+                f"🧠 KV 缓存已初始化 (default): device={device}"
+            )
+        return self._kv_cache
+
+    def _switch_session(self, target_id: str) -> None:
+        """
+        切换到目标会话：暂存当前历史 → 加载目标历史 → 清 KV Cache。
+        """
+        if self._active_session_id == target_id:
+            return
+        self._active_session_id = target_id
+        if target_id not in self._session_histories:
+            messages = []
+            if getattr(self._host, "_db_available", False):
+                try:
+                    import db as _db_mod
+                    rows = _db_mod.get_conversation(target_id)
+                    messages = [{"role": r["role"], "content": r["content"]} for r in rows]
+                except Exception:
+                    pass
+            if not messages:
+                try:
+                    import local_store as _local_store
+                    local_rows = _local_store.load_local_conversation(target_id)
+                    messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
+                except Exception:
+                    pass
+            self._session_histories[target_id] = messages
+        if self._kv_cache:
+            self._kv_cache.clear()
+        self._init_kv_cache()
+        logger.info(f"已切换到会话: {target_id}")
+
+    def _reset_runtime_conversation_state(self, clear_histories: bool = True) -> None:
+        """Clear in-memory conversation/KV state after a model change."""
+        if self._kv_cache:
+            self._kv_cache.clear()
+        self._kv_cache = None
+        if clear_histories:
+            self._session_histories = {}
+        self._conversation_stats = {
+            "total_prompt_tokens": 0,
+            "total_generated_tokens": 0,
+            "total_time_seconds": 0.0,
+            "rounds": 0,
+        }
+
+    def _auto_title_session(self, session_id: str, first_message: str) -> None:
+        """用首条用户消息自动生成会话标题（截取前30字）"""
+        title = first_message.strip()[:30]
+        if len(first_message.strip()) > 30:
+            title += "..."
+        if getattr(self._host, "_db_available", False):
+            try:
+                import db as _db_mod
+                _db_mod.update_session_title(session_id, title)
+            except Exception:
+                pass
+        else:
+            try:
+                import local_store as _local_store
+                _local_store.update_local_session_title(session_id, title)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # 追问生成（1.2c 复制自 api_server.py:1228-1354，PyTorch 路径）
+    # ------------------------------------------------------------------
+    def _generate_followups(
+        self,
+        history: list,
+        tokenizer,
+        model,
+        device,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[str]:
+        """
+        根据对话上下文，让模型生成 2-3 个追问建议。
+        """
+        import torch as _torch
+
+        if not history or len(history) < 2:
+            return []
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
+        system_prompt = (
+            "根据对话历史，生成3个用户可能追问的疑问句。\n"
+            "严格规则：\n"
+            "1. 每个输出必须以 Q: 开头，单独一行\n"
+            "2. 每个输出必须是疑问句（以？结尾），严禁输出陈述句\n"
+            "3. 不要输出解释、列举、定义等陈述性内容\n"
+            "正确示例:\n"
+            "Q: 深度学习与机器学习有什么区别？\n"
+            "Q: 能推荐一些入门学习资源吗？\n"
+            "Q: 这个概念在实际中有哪些应用？\n"
+            "错误示例（严禁输出）:\n"
+            "Q: 机器学习和深度学习有以下几点区别：\n"
+            "Q: 深度学习是机器学习的一个分支\n"
+            "Q: 1. 监督学习 2. 无监督学习"
+        )
+        followup_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        recent = history[-6:]
+        for msg in recent:
+            followup_prompt += f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n"
+        followup_prompt += "<|im_start|>assistant\n"
+
+        questions = []
+
+        try:
+            inputs = tokenizer(followup_prompt, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            stop_criteria_kwargs = (
+                {"cancel_event": cancel_event} if cancel_event is not None else {}
+            )
+            stop_criteria = self._host._build_stop_criteria(
+                [], input_ids.shape[1], **stop_criteria_kwargs,
+            )
+            generation_kwargs = {}
+            if stop_criteria is not None:
+                generation_kwargs["stopping_criteria"] = stop_criteria
+
+            with _torch.no_grad():
+                outputs = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=80,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    **generation_kwargs,
+                )
+
+            if cancel_event is not None and cancel_event.is_set():
+                return []
+
+            generated = outputs[0][input_ids.shape[1]:]
+            text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.upper().startswith("Q:") or line.upper().startswith("Q：") or line.startswith("问："):
+                    q = line.split(":", 1)[-1].split("：", 1)[-1].strip()
+                else:
+                    q = re.sub(r'^[\d]+[\.\、\)）\s\-]+', '', line).strip()
+                if q and len(q) >= 5 and len(q) <= 80 and _is_question(q):
+                    questions.append(q)
+
+            hallucination_patterns = [
+                "通义千问", "千问", "ChatGPT", "Claude", "GPT-", "文心一言",
+                "讯飞星火", "豆包", "Kimi", "Copilot", "Bard", "Gemini",
+                "百川", "智谱", "ChatGLM", "混元",
+            ]
+            questions = [
+                q for q in questions
+                if not any(p in q for p in hallucination_patterns)
+            ]
+
+            filtered = []
+            seen_words = set()
+            for q in questions:
+                words = frozenset(q[:10])
+                if words not in seen_words:
+                    seen_words.add(words)
+                    filtered.append(q)
+            questions = filtered
+
+            logger.info(f"模型追问生成: {len(questions)} 条 → {questions}")
+
+        except Exception as e:
+            logger.warning(f"追问生成失败（非致命）: {e}")
+            questions = []
+
+        if len(questions) < 2:
+            fallback = _fallback_followups(history, questions)
+            questions = fallback
+
+        return questions[:3]
+
+    # ------------------------------------------------------------------
+    # 路由决策与模型加载（1.2c 复制自 api_server.py:2261-2293 / 3882-3911 /
+    # 3913-4011；scheduler 依赖 → self._scheduler 注入点，None=单机基线）
+    # ------------------------------------------------------------------
+    def _external_route_decision(self, req: "ChatRequest"):
+        """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
+        import config as _cfg
+        from external_provider import decide_external_route
+
+        return decide_external_route(
+            enabled=bool(getattr(_cfg, "EXTERNAL_ENABLED", False)),
+            base_url=str(getattr(_cfg, "EXTERNAL_BASE_URL", "") or ""),
+            data_scope=str(getattr(_cfg, "EXTERNAL_DATA_SCOPE", "opt_in")),
+            allow_external=bool(req.allow_external),
+            prefer_external=bool(req.prefer_external),
+            prompt_chars=len(req.message or ""),
+            min_prompt_chars=int(getattr(_cfg, "EXTERNAL_MIN_PROMPT_CHARS", 0) or 0),
+        )
+
+    def _should_forward_chat_to_master(self) -> bool:
+        sched = self._scheduler
+        return bool(
+            sched is not None
+            and sched.get_distributed_inference_enabled()
+            and self._run_mode == "distributed"
+            and sched._effective_role() == "client"
+        )
+
+    def _pipeline_worker_is_reserved(self) -> bool:
+        sched = self._scheduler
+        check = getattr(sched, "has_pipeline_worker_reservation", None) if sched else None
+        return bool(callable(check) and check())
+
+    def _run_exclusive_model_change(
+        self, change, prepare=None, *, release_worker_reservation: bool = False,
+    ):
+        """Block inference, invalidate old worker ACKs, then refresh the new model.
+
+        （api_server 版嵌套 scheduler 锁；本进程无 scheduler 时仅持
+        ModelHost 执行锁，等价单机拓扑。）
+        """
+        with self._host.full_chat_execution_lock:
+            if prepare is not None:
+                prepare()
+            sched = self._scheduler
+            if sched is not None:
+                with sched._inference_lock:
+                    with sched._layer_execution_lock:
+                        with sched._layer_config_lock:
+                            sched._layer_config_pushed.clear()
+                            sched._layer_config_expected.clear()
+                            sched._layer_config_acks.clear()
+                            sched._active_layer_config = None
+                            sched._last_layer_config_ack_payload = None
+                            sched._local_pipeline_steps.clear()
+                        if release_worker_reservation:
+                            release = getattr(
+                                sched,
+                                "release_pipeline_worker_for_local_model",
+                                None,
+                            )
+                            if callable(release):
+                                release()
+                            else:
+                                sched._pipeline_worker_reserved = False
+            try:
+                return change()
+            finally:
+                if sched is not None:
+                    self._refresh_pipeline_layer_config(sched)
+
+    def _refresh_pipeline_layer_config(self, sched) -> None:
+        """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
+        try:
+            if sched._effective_role() == "master":
+                sched.push_layer_config_to_clients()
+        except Exception:
+            pass
+
+    def _auto_load_default_model(self):
+        """自动加载默认模型（thin client / 首次请求时服务端无模型的情况）。"""
+        import config as cfg
+        import glob
+        import os as _os
+        import time as _time
+
+        # 0. TP 孤岛引擎优先（启用即为孤岛网关节点，无本地文件依赖）
+        if getattr(cfg, "ISLAND_ENABLED", False) and getattr(cfg, "ISLAND_BASE_URL", ""):
+            from island_engine import mask_island_url
+
+            logger.info(
+                f"自动加载孤岛引擎: endpoint={mask_island_url(cfg.ISLAND_BASE_URL)}"
+            )
+            t0 = _time.time()
+            cfg.INFERENCE_ENGINE = "island"
+            cfg.QUANT_TYPE = "island"
+            cfg.USE_COMPILE = False
+            self._run_exclusive_model_change(
+                lambda: self._host.load_model(
+                    profile=self._ensure_device_profile(),
+                    engine="island",
+                )
+            )
+            self._init_kv_cache()
+            self._reset_runtime_conversation_state(clear_histories=False)
+            self._conversation_stats = {
+                "total_prompt_tokens": 0,
+                "total_generated_tokens": 0,
+                "total_time_seconds": 0.0,
+                "rounds": 0,
+            }
+            self._host.model_loaded = True
+            self._host.current_quant = "island"
+            if self._scheduler is not None:
+                try:
+                    self._scheduler.refresh_task_worker_capabilities()
+                except Exception:
+                    pass
+            logger.info(f"✅ 孤岛引擎自动连接完成 ({_time.time() - t0:.1f}s)")
+            return
+
+        # 1. 优先查找 GGUF 文件（llama.cpp 引擎，不依赖 transformers/bitsandbytes）
+        gguf_candidates = []
+        gguf_configured = cfg.GGUF_MODEL_PATH
+        if _os.path.isfile(gguf_configured):
+            gguf_candidates.append(gguf_configured)
+        models_dir = _os.path.dirname(gguf_configured)
+        if _os.path.isdir(models_dir):
+            for f in sorted(glob.glob(_os.path.join(models_dir, "*.gguf"))):
+                if f not in gguf_candidates:
+                    gguf_candidates.append(f)
+
+        if gguf_candidates:
+            gguf_path = gguf_candidates[0]
+            engine = "llama_cpp"
+            model_path = gguf_path
+            quant = "int4"
+            if len(gguf_candidates) > 1:
+                logger.info(f"发现 {len(gguf_candidates)} 个 GGUF 文件，选择: {_os.path.basename(gguf_path)}")
+        elif _os.path.isdir(cfg.MODEL_PATH):
+            engine = "pytorch"
+            model_path = cfg.MODEL_PATH
+            quant = cfg.QUANT_TYPE
+        else:
+            raise FileNotFoundError(
+                f"未找到可自动加载的模型文件。已检查:\n"
+                f"  GGUF 配置路径: {gguf_configured}\n"
+                f"  Safetensors 路径: {cfg.MODEL_PATH}\n"
+                f"  models 目录: {models_dir}"
+            )
+
+        logger.info(f"自动加载默认模型: path={model_path}, engine={engine}")
+
+        t0 = _time.time()
+        cfg.INFERENCE_ENGINE = engine
+        cfg.QUANT_TYPE = quant
+        cfg.USE_COMPILE = False
+
+        self._run_exclusive_model_change(
+            lambda: self._host.load_model(
+                model_path=model_path,
+                quant_type=quant,
+                profile=self._ensure_device_profile(),
+                engine=engine,
+            )
+        )
+
+        self._init_kv_cache()
+        self._reset_runtime_conversation_state(clear_histories=False)
+        self._conversation_stats = {
+            "total_prompt_tokens": 0,
+            "total_generated_tokens": 0,
+            "total_time_seconds": 0.0,
+            "rounds": 0,
+        }
+        self._host.model_loaded = True
+        self._host.current_quant = getattr(self._host, "quant_type", None) or quant
+        if self._scheduler is not None:
+            try:
+                self._scheduler.refresh_task_worker_capabilities()
+            except Exception:
+                pass
+        elapsed = _time.time() - t0
+        logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
+
+    def _ensure_chat_model_or_forwarding(self, req: Optional["ChatRequest"] = None) -> None:
+        """Load a local model only when this request cannot be master-forwarded."""
+        if req is not None and self._external_route_decision(req).use_external:
+            return
+        if self._should_forward_chat_to_master():
+            return
+        if self._pipeline_worker_is_reserved():
+            from fastapi import HTTPException
+            raise HTTPException(
+                503,
+                "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
+            )
+        if self._host.model_loaded and getattr(self._host, "is_loaded", False):
+            return
+        self._auto_load_default_model()
 
     # ------------------------------------------------------------------
     # 外部推理整请求路由（1.2c 复制自 api_server._execute_external_chat
