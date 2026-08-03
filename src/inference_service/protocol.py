@@ -109,6 +109,21 @@ class ChatCancelRequest(BaseModel):
     generation_id: str = Field(..., description="由 /v1/chat(/stream) 返回的生成 ID")
 
 
+class WorkerStageRequest(BaseModel):
+    """task-worker Stage 请求（ProviderStageRequest 的 JSON 传输形，
+    1.4 InferenceClient 经 /v1/worker/stage 远程执行时使用）。"""
+
+    workflow_id: str = ""
+    request_id: str = ""
+    stage_id: str = ""
+    stage_type: str = ""
+    provider_id: str = ""
+    dependencies: Dict[str, Any] = Field(default_factory=dict)
+    root_input: Dict[str, Any] = Field(default_factory=dict)
+    model_identity: Optional[Dict[str, Any]] = None
+    runtime_context: Dict[str, Any] = Field(default_factory=dict)
+
+
 class SpeculativeRunRequest(BaseModel):
     """投机解码实验端点（QLH_SPEC_ENABLED 门控沿用，§4.1）。"""
 

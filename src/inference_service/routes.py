@@ -34,6 +34,7 @@ from .protocol import (
     SpeculativeRunRequest,
     SwitchModelRequest,
     UnloadModelRequest,
+    WorkerStageRequest,
 )
 from .tensor_transport import deserialize_tensor, serialize_tensor
 
@@ -346,6 +347,42 @@ async def layers_lm_head(req: LMHeadRequest, request: Request):
     except NotImplementedError:
         raise HTTPException(status_code=501, detail="lm_head 段未接入（1.2）")
     return {"output_ref": _encode_tensor(result)}
+
+
+# ----------------------------------------------------------------------
+# task-worker Stage 执行（1.4：scheduler-svc 注入 InferenceClient 使用；
+# 1.2d 随 task_graph 执行段复制完成后为完整实现）
+# ----------------------------------------------------------------------
+@router.post("/worker/stage")
+async def worker_stage(req: WorkerStageRequest, request: Request):
+    """远程 Stage 执行（scheduler._host._execute_task_worker_stage 的 HTTP 化）。
+
+    body 为 ProviderStageRequest 的 JSON 序列化（dataclasses.asdict 兼容）；
+    cancel 通过 request_id 关联的 generation 取消事件实现。
+    """
+    host = _engine_host(request)
+    request_id = request.headers.get("X-QLH-Request-ID", "-")
+    _, cancel_event = host.register_generation(req.request_id or None)
+
+    from dataclasses import fields
+    from task_provider import StageRequest as ProviderStageRequest
+
+    kwargs = {f.name: getattr(req, f.name) for f in fields(ProviderStageRequest)
+              if hasattr(req, f.name)}
+    if kwargs.get("model_identity") is None:
+        kwargs["model_identity"] = None
+    stage_request = ProviderStageRequest(**kwargs)
+
+    try:
+        result = host.execute_task_worker_stage(stage_request, cancel_event)
+    except Exception as e:
+        from task_graph import TaskGraphError
+        if isinstance(e, TaskGraphError):
+            raise HTTPException(status_code=422, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        host.unregister_generation(request_id or "-")
+    return result
 
 
 # ----------------------------------------------------------------------
