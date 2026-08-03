@@ -89,6 +89,20 @@ class ChatRequest(BaseModel):
     execution_mode: Literal["auto", "task_graph"] = Field(default="auto")
     workflow_id: Optional[str] = None
     generation_id: Optional[str] = None
+    allow_external: bool = Field(
+        default=False,
+        description=(
+            "路线 B 数据作用域按请求授权：允许本请求路由到外部推理服务"
+            "（QLH_EXTERNAL_*）。缺省 False——旧客户端行为不变，数据不出集群。"
+        ),
+    )
+    prefer_external: bool = Field(
+        default=False,
+        description=(
+            "路线 B：优先使用外部推理服务（仍受 QLH_EXTERNAL_DATA_SCOPE "
+            "作用域门控约束；deny 档位下即使置 true 也不外发）。"
+        ),
+    )
 
 
 class ChatCancelRequest(BaseModel):
