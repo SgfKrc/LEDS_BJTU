@@ -3,6 +3,7 @@
 > 文档状态：部分实施（`L4 Candidate`；SD-N1 本地单机基线、8-bit U-Net Linear 量化和 QKV 融合已验证，仍由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
+> 更新日期：2026-07-30
 >
 > 适用范围：Windows CUDA PC 上的 Stable Diffusion 1.5 本地推理、可选 ControlNet 图生图，以及基于现有 TaskGraph/PC Full Worker 的跨 PC 图像批次分布式展示
 >
