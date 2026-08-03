@@ -55,6 +55,24 @@ def main() -> None:
         f"(QLH_MONOLITH={os.environ.get('QLH_MONOLITH', '0')})"
     )
 
+    # ---- §4.2 HTTP 壳（:8020，QLH_SCHEDULER_HTTP_PORT；1.7 顺延至阶段 2 起点）----
+    http_thread = None
+    http_port = int(os.environ.get("QLH_SCHEDULER_HTTP_PORT", "8020"))
+    try:
+        import uvicorn
+        from scheduler_svc_http import build_scheduler_app
+
+        http_app = build_scheduler_app(scheduler)
+        cfg = uvicorn.Config(
+            http_app, host="127.0.0.1", port=http_port, log_level="warning",
+        )
+        server = uvicorn.Server(cfg)
+        http_thread = threading.Thread(target=server.run, daemon=True)
+        http_thread.start()
+        logger.info(f"scheduler-svc HTTP 壳已启动: http://127.0.0.1:{http_port}/cluster/*")
+    except Exception as exc:
+        logger.warning(f"scheduler-svc HTTP 壳启动失败（继续 TCP 模式）: {exc}")
+
     # start() 启动 TCP 服务端后返回；本进程保持存活直到收到退出信号
     stop_event = threading.Event()
 
