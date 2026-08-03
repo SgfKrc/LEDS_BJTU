@@ -4,12 +4,13 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8**（文档复核于 2026-07-30）
+**v0.1.8**（更新日期：2026-08-03，文档复核于 2026-08-03）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
+> 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
-> 2026-07-31 复核：Python 全量回归收集 1089 项，`1066 passed / 23 skipped`。关闭端口跨平台错误分类和 `PagedKVCache.truncate(n)` 已完成；后者尚未接入生产投机解码循环。SD 1.5 侧车已验证 U-Net Linear 8-bit 量化与 QKV 融合，但尚未注册为分布式 Worker。前端最近证据仍为 `9/9` 且生产构建成功；Android Full Debug Kotlin 编译成功，APK 安装与目视验收待完成。
+> 2026-08-03 复核：Python 全量回归 **`1112 passed / 3 skipped`**（141.5s）。Android Full/Lite Debug 变体构建成功（`app-full-debug.apk` ~29.9 MB、`app-lite-debug.apk` ~18.4 MB），APK 安装与真机目视验收待完成。TUI 网关契约 44/44、7 屏 × 2 角色走查通过；`bjtu` 全局命令（自动启动后端+TUI）已交付。历史复核链：2026-07-31 `1066 passed / 23 skipped`（关闭端口跨平台错误分类与 `PagedKVCache.truncate(n)` 收口）；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。SD 1.5 侧车已验证 U-Net Linear 8-bit 量化与 QKV 融合，尚未注册为分布式 Worker；前端最近证据仍为 `9/9` 且生产构建成功。
 
 ---
 
@@ -44,7 +45,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
-| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用，可直管远程 Tailscale 主节点 → [用法](#tui-管理菜单终端版跨平台) |
+| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点 → [使用指南](docs/TUI使用指南.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
@@ -159,7 +160,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（当前收集 1056 个用例）
+├── tests/                         # 单元测试（2026-08-03 全量回归 1112 passed / 3 skipped）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -418,15 +419,27 @@ python src/api_server.py
 
 ### TUI 管理菜单（终端版，跨平台）
 
-无浏览器环境（SSH、服务器、树莓派等）可用终端版管理菜单，功能对应 Web 管理面板（系统总览 / 节点管理 / 分布式与分层 / 请求队列 / 设备画像 / 日志 / 设置），纯 Python 标准库实现，支持 Windows 10+ / Linux / macOS：
+无浏览器环境（SSH、服务器、树莓派等）可用终端版管理菜单，功能对应 Web 管理面板（系统总览 / 节点管理 / 分布式与分层 / 请求队列 / 设备画像 / 日志 / 设置），纯 Python 标准库实现，支持 Windows 10+ / Linux / macOS。
+
+**一键启动**（自动启动后端 + 等待就绪 + 进入 TUI，退出 TUI 后后端继续运行）：
 
 ```bash
-# 先启动后端: python src/api_server.py，再运行（Windows 双击 start_tui.bat 亦可）
-./start_tui.sh                              # Linux / macOS
-start_tui.bat                               # Windows (自动 chcp 65001)
+bjtu                                        # 全局命令：任意终端输入即启动（安装见下）
+./start_tui.sh                              # Linux / macOS（无需安装）
+start_tui.bat                               # Windows（双击或命令行）
+```
+
+**安装全局 `bjtu` 命令**（推荐）：Windows 把项目根加入 PATH（`setx PATH "%PATH%;<项目根>"` 或图形界面）；Linux/macOS `sudo ln -s <项目根>/bjtu.sh /usr/local/bin/bjtu`。
+
+**手动/高级用法**（后端未运行时先 `python src/api_server.py`）：
+
+```bash
 python src/tui_admin.py --host 100.x.x.x    # 直接管理远程 Tailscale 主节点
 python src/tui_admin.py --plain             # 老终端/管道降级为纯文本编号菜单
+python src/tui_admin.py --host 100.x.x.x --log-token xxx   # 远程模式带日志 token
 ```
+
+完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（现行·Active，2026-08-03 复核 44/44 + 双角色走查 PASS）。
 
 ### 外部算力辅助（三条路线，均默认关闭）
 
@@ -707,6 +720,7 @@ python serve.py
 
 ### 工程文档
 
+- [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
 
 ---
