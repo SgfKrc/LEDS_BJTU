@@ -32,6 +32,15 @@ class FakeModel:
     """假模型宿主：有 chat / active_model_id，行为可断言。"""
 
     active_model_id = "qwen-1.8b"
+    _engine_type = "llama_cpp"
+    model_loaded = True
+    is_loaded = True
+    generation_config = {
+        "max_new_tokens": 1024,
+        "tier_max_new_tokens": 1024,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
 
     def __init__(self):
         self.calls = []
@@ -73,7 +82,7 @@ class FakeEngineHost(EngineHost):
     def current_model(self):
         return {"loaded": True, "engine": "pytorch", "model_id": "qwen-1.8b"}
 
-    def chat_full(self, req):
+    def chat_full(self, req, cancel_event=None):
         return {
             "response": "你好，我是 QLH。",
             "followups": [],
@@ -660,3 +669,188 @@ def test_chat_origin_aux():
     assert _chat_origin(ChatRequest(message="x", client_node_type="android")) == "android_http"
     assert _chat_origin(ChatRequest(message="x", client_node_type="pc")) == "pc_http"
     assert _chat_origin(ChatRequest(message="x")) == "web_http"
+
+
+def make_full_host(fake_model_cls=FakeModel):
+    """真实 EngineHost + 假模型注入（测试 chat_full 复制实现本体）。"""
+    host = EngineHost()
+    host._host = fake_model_cls()
+    host._host._db_available = True
+    return host
+
+
+# ----------------------------------------------------------------------
+# 14. 1.2c 完整聊天流程（复制自 api_server._execute_chat_full）
+# ----------------------------------------------------------------------
+def test_chat_full_llama_cpp_path(monkeypatch):
+    """llama.cpp 引擎整请求路径：历史维护 + metrics + followups 兜底。"""
+    import db
+
+    monkeypatch.setattr(db, "get_save_history", lambda: False)  # 不落盘
+
+    host = make_full_host()
+    host._active_session_id = "s1"
+    host._session_histories["s1"] = [
+        {"role": "user", "content": "之前的问题"},
+        {"role": "assistant", "content": "之前的回答"},
+    ]
+
+    req = ChatRequest(message="新问题", session_id="s1")
+    result = host.chat_full(req)
+
+    assert result["content"] == "候选答案内容"
+    assert result["metrics"]["engine"] == "llama_cpp"
+    assert result["metrics"]["execution_mode"] == "local_llama_cpp"
+    assert result["metrics"]["request_origin"] == "web_http"
+    # 历史已追加两轮
+    assert host._session_histories["s1"][-2:] == [
+        {"role": "user", "content": "新问题"},
+        {"role": "assistant", "content": "候选答案内容"},
+    ]
+    # followups：模型无合格问句 → 模板兜底 ≥2
+    assert len(result["followups"]) >= 2
+    assert host._conversation_stats["rounds"] == 1
+
+
+def test_chat_full_session_switch(monkeypatch):
+    """session_id 切换 → _switch_session 加载目标会话。"""
+    import db
+
+    monkeypatch.setattr(db, "get_save_history", lambda: False)
+
+    host = make_full_host()
+    host._active_session_id = "s_old"
+    host._session_histories["s_old"] = [{"role": "user", "content": "旧会话"}]
+
+    req = ChatRequest(message="hello", session_id="s_new")
+    result = host.chat_full(req)
+    assert host._active_session_id == "s_new"
+    assert result["content"] == "候选答案内容"
+    # 新会话历史 = 本次对话
+    assert host._session_histories["s_new"][-1]["role"] == "assistant"
+
+
+def test_chat_full_first_message_auto_title(monkeypatch):
+    """首条消息自动标题：截取前 30 字。"""
+    import db
+
+    monkeypatch.setattr(db, "get_save_history", lambda: False)
+    monkeypatch.setattr(db, "update_session_title",
+                        lambda sid, title: titles.append((sid, title)))
+    titles = []
+
+    host = make_full_host()
+    long_msg = "这是一个非常非常非常非常非常非常非常非常非常非常长的首条消息啊"
+    req = ChatRequest(message=long_msg, session_id="s_title")
+    host.chat_full(req)
+    assert titles and titles[0][0] == "s_title"
+    assert titles[0][1].endswith("...")
+
+
+def test_chat_full_external_fallback(monkeypatch):
+    """外部路由失败（无本地模型）→ prefer_external 时 502。"""
+    import config as _cfg
+    import db
+    import external_provider
+
+    monkeypatch.setattr(db, "get_save_history", lambda: False)
+    _cfg.EXTERNAL_ENABLED = True
+    _cfg.EXTERNAL_BASE_URL = "https://example.com/v1"
+    _cfg.EXTERNAL_DATA_SCOPE = "opt_in"
+
+    class FailingClient(FakeExternalClient):
+        def chat(self, history, **kw):
+            raise RuntimeError("external down")
+
+    monkeypatch.setattr(external_provider, "get_external_chat_client", lambda: FailingClient())
+
+    host = make_full_host()
+    host._host.model_loaded = False
+    host._host.is_loaded = False
+
+    from fastapi import HTTPException
+    req = ChatRequest(message="hi", session_id="s1",
+                      allow_external=True, prefer_external=True)
+    with pytest.raises(HTTPException) as exc:
+        host.chat_full(req)
+    assert exc.value.status_code == 502
+
+
+class FakeTokenizer:
+    eos_token_id = 151643
+
+    def __call__(self, prompt, return_tensors="pt"):
+        import torch
+        return {"input_ids": torch.zeros(1, 8, dtype=torch.long),
+                "attention_mask": torch.ones(1, 8, dtype=torch.long)}
+
+    def apply_chat_template(self, messages, tokenize=False, **kw):
+        return "fake prompt"
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "PyTorch本地回答"
+
+
+class FakePyTorchModel(FakeModel):
+    """PyTorch 引擎：带 tokenizer + model.generate 的假实现。"""
+
+    _engine_type = "pytorch"
+    tokenizer = FakeTokenizer()
+
+    def __init__(self):
+        super().__init__()
+        import torch
+        self._model = torch.nn.Linear(4, 4)  # 仅占位
+        self.device_str = "cpu"
+
+    @property
+    def model(self):
+        return self
+
+    def ensure_full_model(self):
+        return None
+
+    def get_device(self):
+        return "cpu"
+
+    def _merge_stop_sequences(self, seqs):
+        return None
+
+    def _get_generation_eos_token_ids(self, stop_sequences):
+        return None
+
+    def _build_stop_criteria(self, seqs, prompt_len, **kw):
+        return None
+
+    def _decode_generated_ids(self, ids, stop_sequences):
+        return "PyTorch本地回答"
+
+    def generate(self, input_ids=None, attention_mask=None, **kw):
+        self.generate_called = True
+        return input_ids  # 形状 [1, prompt_len] → generated_ids 为空
+
+
+def test_chat_full_pytorch_path(monkeypatch):
+    """PyTorch 引擎路径：generate + 解码 + 追问 + 持久化。"""
+    import db
+
+    monkeypatch.setattr(db, "get_save_history", lambda: False)
+
+    host = make_full_host(FakePyTorchModel)
+    host._active_session_id = "s1"
+    host._session_histories["s1"] = [
+        {"role": "user", "content": "什么是量化？"},
+        {"role": "assistant", "content": "量化是模型压缩。"},
+    ]
+
+    req = ChatRequest(message="详细讲讲", session_id="s1")
+    result = host.chat_full(req)
+
+    assert result["content"] == "PyTorch本地回答"
+    assert result["metrics"]["engine"] == "pytorch"
+    assert result["metrics"]["execution_mode"] == "local_pytorch"
+    assert host._conversation_stats["rounds"] == 1
+    # followups 走 PyTorch 追问路径（模型无问句 → 兜底）
+    assert len(result["followups"]) >= 2
+    # 会话历史追加
+    assert host._session_histories["s1"][-1]["role"] == "assistant"
