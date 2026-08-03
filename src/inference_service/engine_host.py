@@ -9,12 +9,186 @@ model_module，未加载模型时冷启动成本 <100ms（§2.3：model_module �
 1.2：把 api_server 数据面执行段（_execute_chat_full 等 8 函数）与
 scheduler 流水线段（_run_pipeline 等）复制为本宿主方法，源文件保持
 不动（复制迁移，禁改源）。
+
+1.2a（已复制）：
+  - _execute_task_worker_stage（含嵌套 run_model 闭包）→
+    EngineHost.execute_task_worker_stage
+  - 辅助纯函数：_format_model_response / _parse_thinking_response /
+    _strip_native_thinking_tags（api_server.py:904-1088 复制，零改动）
 """
+import json
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from .protocol import ChatRequest
+# ---- 复制自 api_server.py:887-904（常量，保真不变） ----
+THINKING_START = "【思考】"
+THINKING_END = "【思考结束】"
+THINKING_SYSTEM_PROMPT = (
+    "你是一个善于深度思考的AI助手。回答前先进行推理分析，再给出答案。\n\n"
+    "严格按以下格式输出：\n"
+    "【思考】\n"
+    "（你的推理过程，2-3句话即可）\n"
+    "【思考结束】\n"
+    "（你的最终回答）\n\n"
+    "注意：\n"
+    "- 必须在【思考结束】之后写回答内容\n"
+    "- 回答部分不要写标记符号\n"
+    "- 不要重复输出【思考】或【思考结束】"
+)
+
+
+# ---- 复制自 api_server.py:904-941（纯函数，保真不变） ----
+def _strip_native_thinking_tags(text: str) -> str:
+    """Remove native thinking/answer tags and leaked ChatML sentinels."""
+    import re as _re
+
+    if not text:
+        return text
+
+    result = _re.sub(
+        r'<\s*think\s*>.*?<\s*/\s*think\s*>',
+        '',
+        text,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+    result = _re.sub(
+        r'^.*?<\s*/\s*think\s*>',
+        '',
+        result,
+        count=1,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+
+    response_match = _re.search(
+        r'<\s*(?:answer|response)\s*>(.*?)(?:<\s*/\s*(?:answer|response)\s*>|$)',
+        result,
+        flags=_re.DOTALL | _re.IGNORECASE,
+    )
+    if response_match:
+        result = response_match.group(1)
+
+    result = _re.sub(r'<\s*/?\s*(?:think|answer|response)\s*>', '', result, flags=_re.IGNORECASE)
+    result = result.replace('<|im_end|>', '').replace('<|im_start|>', '')
+    result = _re.sub(r'<\s*\|im_(?:start|end)\|\s*>', '', result)
+    result = _re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+
+
+# ---- 复制自 api_server.py:943-1074（纯函数，保真不变） ----
+def _parse_thinking_response(text: str) -> tuple:
+    """
+    解析模型输出，分离思考内容和最终答案。
+
+    （复制自 api_server._parse_thinking_response，含容错逻辑：
+    缺少结束标记 → 智能分割；答案为空 → 提取思考最后一段；
+    重复标记 → 使用第一次出现的有效标记对。）
+
+    Returns:
+        (answer_content, thinking_content)
+    """
+    import re as _re
+
+    if not text:
+        return "", None
+
+    start_idx = text.find(THINKING_START)
+    end_idx = text.find(THINKING_END)
+
+    # ---- 情况1：标记成对且顺序正确 ----
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        thinking = text[start_idx + len(THINKING_START):end_idx].strip()
+        answer = text[end_idx + len(THINKING_END):].strip()
+
+        thinking = _re.sub(r'^分析思路[：:]\s*', '', thinking)
+
+        answer = _re.sub(r'^【最终答案】[：:]?\s*', '', answer)
+        answer = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', answer, flags=_re.IGNORECASE)
+        for _pat in [r'^\[你的最终回答[^\]]*\]\s*', r'^\[你的推理过程[^\]]*\]\s*',
+                     r'^（推理内容）\s*', r'^（答案内容）\s*',
+                     r'^（给用户的答案[^）]*）\s*']:
+            answer = _re.sub(_pat, '', answer)
+
+        answer = answer.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+
+        prefix = text[:start_idx].strip()
+        if prefix:
+            answer = prefix + ("\n" + answer if answer else "")
+
+        if thinking:
+            if not answer and thinking:
+                paragraphs = thinking.split("\n")
+                for p in reversed(paragraphs):
+                    p = p.strip()
+                    if p and len(p) > 10:
+                        answer = p
+                        break
+                if not answer:
+                    answer = thinking
+            return answer, thinking
+
+    # ---- 情况2：DeepSeek-R1 / Qwen3 本地格式 ----
+    import re as _re2
+    native_match = _re2.search(
+        r'<\s*think\s*>(.*?)<\s*/\s*think\s*>',
+        text,
+        flags=_re2.DOTALL | _re2.IGNORECASE,
+    )
+    if native_match:
+        thinking = native_match.group(1).strip()
+        answer = text[:native_match.start()].strip()
+        after_think = text[native_match.end():].strip()
+        after_think = _re2.sub(r'<\s*/?\s*(?:response|answer)\s*>', '', after_think, flags=_re2.IGNORECASE)
+        if after_think:
+            answer = (answer + '\n' + after_think).strip() if answer else after_think
+        response_match = _re2.search(
+            r'<\s*(?:response|answer)\s*>(.*)',
+            answer if answer else '',
+            flags=_re2.DOTALL | _re2.IGNORECASE,
+        )
+        if response_match:
+            answer = response_match.group(1).strip()
+        answer = _re2.sub(r'<\s*/?\s*(?:think|response|answer)\s*>', '', answer, flags=_re2.IGNORECASE)
+        answer = answer.replace(THINKING_START, "").replace(THINKING_END, "")
+        answer = answer.replace('<|im_end|>', '').replace('<|im_start|>', '').strip()
+        if thinking:
+            return answer, thinking
+
+    closing_only_match = _re2.search(
+        r'^(.*?)<\s*/\s*think\s*>(.*)$',
+        text,
+        flags=_re2.DOTALL | _re2.IGNORECASE,
+    )
+    if closing_only_match:
+        thinking = closing_only_match.group(1).strip()
+        thinking = thinking.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+        answer = closing_only_match.group(2).strip()
+        answer = _re2.sub(r'<\s*/?\s*(?:response|answer)\s*>', '', answer, flags=_re2.IGNORECASE)
+        answer = answer.replace(THINKING_START, "").replace(THINKING_END, "")
+        answer = answer.replace('<|im_end|>', '').replace('<|im_start|>', '').strip()
+        if answer or thinking:
+            return answer, thinking or None
+
+    # ---- 情况3：格式未遵循 ----
+    cleaned = text.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+    cleaned = _strip_native_thinking_tags(cleaned)
+    cleaned = _re.sub(r'^分析思路[：:]\s*', '', cleaned)
+    cleaned = _re.sub(r'^(最终答案|回答|Answer)[：:]\s*', '', cleaned, flags=_re.IGNORECASE)
+    return cleaned, None
+
+
+# ---- 复制自 api_server.py:1076-1088（纯函数，保真不变） ----
+def _format_model_response(text: str, show_thinking: bool,
+                           native_thinking_prompt: bool = False) -> tuple[str, Optional[str]]:
+    """Format generated text without exposing unfinished native reasoning."""
+    if show_thinking:
+        return _parse_thinking_response(text)
+    if native_thinking_prompt and "</think>" not in (text or "").lower():
+        return "", None
+    return _strip_native_thinking_tags(text), None
+
+
+from .protocol import ChatRequest  # noqa: E402（置于辅助函数后保持文档头清晰）
 
 
 class EngineHost:
@@ -207,6 +381,154 @@ class EngineHost:
     def speculative_run(self, req) -> Dict[str, Any]:
         """投机解码实验端点（1.2 复制 _run_speculative_experiment 后接入真实实现）。"""
         raise NotImplementedError("speculative 实验端点随 1.2 执行段复制接入")
+
+    # ------------------------------------------------------------------
+    # task-worker 数据面执行段（1.2a 复制自 api_server._execute_task_worker_stage
+    # api_server.py:2734-2872，源文件保持不动；宿主适配：model_manager → self._host）
+    # ------------------------------------------------------------------
+    def execute_task_worker_stage(
+        self,
+        stage_request,
+        provider_cancel_event: threading.Event,
+    ) -> Dict[str, Any]:
+        """Execute the shared local/remote Stage contract on a full model."""
+        from task_graph import DEPENDENCY_FAILURES_KEY, TaskGraphError
+        from task_provider import ProviderError, ProviderExecutionError
+
+        root_input = stage_request.root_input
+        options = root_input.get("task_options", {})
+        if not isinstance(options, dict):
+            raise TaskGraphError("任务 Stage 缺少有效执行参数")
+        try:
+            candidate_budget = max(
+                1, min(int(options.get("candidate_max_tokens", 512)), 512)
+            )
+            final_budget = max(
+                1, min(int(options.get("final_max_tokens", 1024)), 1024)
+            )
+            temperature = max(
+                0.0, min(float(options.get("temperature", 0.7)), 2.0)
+            )
+            top_p = max(0.0, min(float(options.get("top_p", 0.9)), 1.0))
+        except (TypeError, ValueError) as exc:
+            raise TaskGraphError("任务 Stage 执行参数无效") from exc
+        show_thinking = bool(options.get("show_thinking", False))
+        model_manager = self._host
+
+        def run_model(
+            messages: list[dict],
+            max_tokens: int,
+            *,
+            retry_empty_on_same_provider: bool = False,
+        ) -> dict:
+            if provider_cancel_event.is_set():
+                return {
+                    "content": "",
+                    "usage": {},
+                    "tokens_per_second": 0,
+                    "model": model_manager.active_model_id,
+                }
+            result = model_manager.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                _cancel_event=provider_cancel_event,
+            )
+            raw_content = str(result.get("content", "") or "").strip()
+            thinking_content = None
+            if show_thinking:
+                content, thinking_content = _format_model_response(
+                    raw_content, show_thinking=True,
+                )
+            else:
+                content = _strip_native_thinking_tags(raw_content)
+            if not content and not provider_cancel_event.is_set():
+                if retry_empty_on_same_provider:
+                    raise ProviderExecutionError(
+                        "complete model returned an empty aggregate result",
+                        code="empty_provider_output",
+                        provider_id=stage_request.provider_id,
+                        same_provider_retryable=True,
+                    )
+                raise TaskGraphError("完整模型返回空 Stage 结果")
+            return {
+                "content": content,
+                "thinking_content": thinking_content,
+                "usage": dict(result.get("usage", {}) or {}),
+                "tokens_per_second": result.get("tokens_per_second", 0),
+                "model": result.get("model", model_manager.active_model_id),
+                "usage_estimated": bool(result.get("usage_estimated", False)),
+            }
+
+        if stage_request.stage_type == "full_inference":
+            candidate_instructions = {
+                "candidate_a": (
+                    "独立分析用户问题，给出准确、可验证且简洁的候选答案。"
+                    "不要提及其他候选或任务链。"
+                ),
+                "candidate_b": (
+                    "从不同角度独立解决用户问题，重点检查遗漏、反例和不确定性。"
+                    "输出可直接供后续汇总的候选答案。"
+                ),
+            }
+            instruction = candidate_instructions.get(stage_request.stage_id)
+            messages = root_input.get("messages")
+            if instruction is None or not isinstance(messages, list):
+                raise TaskGraphError("完整推理 Stage 输入无效")
+            if show_thinking:
+                instruction = f"{instruction}\n\n{THINKING_SYSTEM_PROMPT}"
+            return run_model(
+                [{"role": "system", "content": instruction}, *messages],
+                candidate_budget,
+            )
+        if stage_request.stage_type == "aggregate":
+            message = str(root_input.get("message", "") or "")
+            if not message:
+                raise TaskGraphError("聚合 Stage 缺少原始问题")
+            candidate_payload = {
+                stage_id: value.get("content", "")
+                for stage_id, value in stage_request.dependencies.items()
+                if stage_id != DEPENDENCY_FAILURES_KEY
+                and isinstance(value, dict)
+                and str(value.get("content", "") or "").strip()
+            }
+            if not candidate_payload:
+                raise TaskGraphError("聚合 Stage 没有可用候选")
+            failure_payload = stage_request.dependencies.get(
+                DEPENDENCY_FAILURES_KEY, {},
+            )
+            aggregation_prompt = (
+                "请根据原始问题和可用的独立候选，输出一个最终答案。"
+                "纠正冲突和明显错误；没有证据时明确不确定性。"
+                "只输出最终答案，不描述内部任务链。\n\n"
+                f"原始问题：{message}\n\n候选：\n"
+                + json.dumps(candidate_payload, ensure_ascii=False)
+                + (
+                    "\n\n未完成候选摘要：\n"
+                    + json.dumps(failure_payload, ensure_ascii=False)
+                    if isinstance(failure_payload, dict) and failure_payload
+                    else ""
+                )
+            )
+            try:
+                return run_model(
+                    ([{"role": "system", "content": THINKING_SYSTEM_PROMPT}]
+                     if show_thinking else [])
+                    + [{"role": "user", "content": aggregation_prompt}],
+                    final_budget,
+                    retry_empty_on_same_provider=True,
+                )
+            except ProviderError:
+                raise
+            except (TimeoutError, ConnectionError) as exc:
+                raise ProviderExecutionError(
+                    "transient aggregate model execution failed",
+                    code="provider_execution_failed",
+                    provider_id=stage_request.provider_id,
+                    same_provider_retryable=True,
+                ) from exc
+        raise TaskGraphError(f"不支持的 Stage 类型: {stage_request.stage_type}")
 
     # ------------------------------------------------------------------
     # generation 注册表（取消语义，对齐 api_server._register_generation）
