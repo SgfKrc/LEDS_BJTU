@@ -86,7 +86,12 @@ def request_json(base: str, method: str, path: str):
 
 
 def fingerprint(node, depth: int = 0) -> object:
-    """响应结构指纹：dict→排序 key 列表映射，list→元素指纹(去重)，忽略具体值。"""
+    """响应结构指纹：dict→排序 key 列表映射，list→元素指纹(去重)，忽略具体值。
+
+    int/float 统一为 "num"（2026-08-03 修复）：JSON 语义上二者等价——
+    Python json 保留 0.0（float），JS JSON.stringify(0.0) 输出 0（int），
+    双网关对同一数值产生不同类型是编码差异而非契约差异。
+    """
     if depth > 6:
         return "…"
     if isinstance(node, dict):
@@ -99,6 +104,10 @@ def fingerprint(node, depth: int = 0) -> object:
             return []
         return sorted({json.dumps(fingerprint(x, depth + 1), ensure_ascii=False)
                        for x in node[:3]})
+    if isinstance(node, bool):
+        return "bool"
+    if isinstance(node, (int, float)):
+        return "num"
     return type(node).__name__
 
 
