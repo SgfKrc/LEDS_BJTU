@@ -1012,3 +1012,164 @@ def test_inference_client_kv_and_cancel(live_inference_svc):
     # 未知 generation cancel → 404 → RuntimeError
     with pytest.raises(RuntimeError):
         client.cancel_generation("gen_nonexistent")
+
+
+# ----------------------------------------------------------------------
+# 17. 1.5 从节点 PeerClient（复制自 scheduler client 分支）
+# ----------------------------------------------------------------------
+class FakeTCPClient:
+    def __init__(self):
+        self.sent = []
+        self._running = True
+        self.device_info = {}
+        self.server_host = "127.0.0.1"
+        self.server_port = 8888
+        self.is_registered = True
+        self.sock = object()
+
+    def send_data(self, payload, msg_type):
+        self.sent.append((msg_type, dict(payload)))
+
+
+def make_peer():
+    from inference_service.peer import PeerClient
+
+    peer = PeerClient(master_host="127.0.0.1", master_port=8888,
+                      node_id="test_client")
+    fake = FakeModel()
+    fake.forward_layers_called = []
+
+    def _forward_layers(input_ids=None, hidden_states=None, attention_mask=None,
+                        position_ids=None, past_key_values=None, use_cache=True,
+                        apply_lm_head=False, **_kw):
+        fake.forward_layers_called.append(
+            (input_ids, hidden_states, past_key_values, apply_lm_head))
+        hs = hidden_states if hidden_states is not None else torch.zeros(1, 8, 128)
+        pkv = (torch.zeros(1, 2, 8, 64), torch.zeros(1, 2, 8, 64))
+        out = {"hidden_states": hs}
+        if apply_lm_head:
+            out["logits"] = torch.zeros(1, 8, 32000)
+        if use_cache:
+            out["past_key_values"] = pkv
+        return out
+
+    fake.forward_layers = _forward_layers
+    fake.load_model = lambda **kw: {"success": True}
+    fake.is_loaded = True
+    fake._engine_type = "pytorch"
+    fake.model = type("M", (), {"config": type("C", (), {"model_type": "qwen"})()})()
+    peer._host._host = fake
+    peer._client = FakeTCPClient()
+    return peer
+
+
+def test_peer_layer_config_new_format(monkeypatch):
+    peer = make_peer()
+    monkeypatch.setattr("model_sync.resolve_worker_model_path", lambda mid: "/fake/path")
+    monkeypatch.setattr("model_sync.ensure_model_available", lambda mid: None)
+
+    peer._handle_layer_config({
+        "config_id": "cfg-1",
+        "node_id": "test_client",
+        "start_layer": 0, "end_layer": 12,
+        "has_embedding": True, "has_lm_head": False,
+        "model_id": "qwen-1.8b", "model_sha256": "abc123",
+        "model_type": "qwen", "total_layers": 24,
+    })
+    ack = [p for t, p in peer._client.sent if t.value == "layer_config_ack"]
+    assert ack and ack[0]["status"] == "ready"
+    assert ack[0]["config_id"] == "cfg-1"
+    assert peer._active_layer_config["config_id"] == "cfg-1"
+
+
+def test_peer_layer_config_missing_contract(monkeypatch):
+    peer = make_peer()
+    peer._handle_layer_config({
+        "config_id": "cfg-x", "node_id": "test_client",
+        "start_layer": 0, "end_layer": 12,
+        "model_id": "", "model_sha256": "", "model_type": "qwen",
+        "total_layers": 24,
+    })
+    ack = [p for t, p in peer._client.sent if t.value == "layer_config_ack"]
+    assert ack and ack[0]["status"] == "error"
+
+
+def test_peer_layer_forward_prefill_and_decode():
+    from tcp_comm import MessageType
+
+    peer = make_peer()
+    peer._active_layer_config = {
+        "config_id": "cfg-1", "model_sha256": "abc123",
+        "model_type": "qwen", "model_id": "qwen-1.8b",
+    }
+    # prefill step 0
+    peer._handle_layer_forward({
+        "task_id": "t1", "step": 0, "use_kv_cache": False,
+        "config_id": "cfg-1", "model_sha256": "abc123", "model_type": "qwen",
+        "input_ids": [1, 2, 3], "apply_lm_head": False,
+    })
+    results = [p for t, p in peer._client.sent if t == MessageType.LAYER_RESULT]
+    assert results and "error" not in results[0]
+    assert results[0]["step"] == 0
+    assert "hidden_states" in results[0]  # base64 序列化
+    # decode step 1（用 KV cache）
+    peer._client.sent.clear()
+    peer._handle_layer_forward({
+        "task_id": "t1", "step": 1, "use_kv_cache": True,
+        "config_id": "cfg-1", "model_sha256": "abc123", "model_type": "qwen",
+        "hidden_states": None, "apply_lm_head": True,
+    })
+    results = [p for t, p in peer._client.sent if t == MessageType.LAYER_RESULT]
+    assert results and "error" not in results[0]
+    assert "logits" in results[0]
+
+
+def test_peer_layer_forward_step_out_of_order():
+    from tcp_comm import MessageType
+
+    peer = make_peer()
+    peer._active_layer_config = {
+        "config_id": "cfg-1", "model_sha256": "abc123",
+        "model_type": "qwen", "model_id": "qwen-1.8b",
+    }
+    # 直接 decode step 2（无 prefill）→ 越序错误
+    peer._handle_layer_forward({
+        "task_id": "t9", "step": 2, "use_kv_cache": True,
+        "config_id": "cfg-1", "model_sha256": "abc123", "model_type": "qwen",
+    })
+    results = [p for t, p in peer._client.sent if t == MessageType.LAYER_RESULT]
+    assert results and "error" in results[0]
+
+
+def test_peer_pipeline_done_abort_cleanup():
+    peer = make_peer()
+    peer._kv_cache["t1"] = object()
+    peer._local_pipeline_steps["t1"] = 3
+    peer._handle_pipeline_done({"task_id": "t1"})
+    assert "t1" not in peer._kv_cache
+    assert "t1" not in peer._local_pipeline_steps
+
+    peer._kv_cache["t2"] = object()
+    peer._handle_pipeline_abort({"task_id": "t2"})
+    assert "t2" not in peer._kv_cache
+    assert "t2" in peer._local_pipeline_cancelled
+
+
+def test_peer_client_no_heavy_imports():
+    """1.5 验收：peer 路径不 import fastapi/scheduler/api_server。"""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.path.insert(0, 'src'); "
+        "import inference_service.peer; "
+        "mods = set(sys.modules); "
+        "bad = [m for m in ('fastapi', 'scheduler', 'api_server', 'uvicorn') "
+        "       if any(k == m or k.startswith(m + '.') for k in mods)]; "
+        "print('BAD:', bad)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert "BAD: []" in result.stdout, f"从节点入口拉入了重依赖: {result.stdout} {result.stderr}"
