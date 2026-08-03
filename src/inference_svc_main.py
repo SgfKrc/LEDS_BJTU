@@ -64,6 +64,17 @@ def main() -> None:
     t_start = time.time()
 
     node_role = os.environ.get("QLH_NODE_ROLE", "master")
+
+    if node_role == "client":
+        # 1.5 从节点入口：不 import fastapi/uvicorn，直接起 peer
+        from inference_service.peer import run_peer
+
+        logger.info(
+            f"从节点模式启动（{time.time() - t_start:.2f}s 内完成 import），连接主节点"
+        )
+        run_peer()
+        return
+
     host = os.environ.get("QLH_INFERENCE_HOST", "127.0.0.1")
     port = int(os.environ.get("QLH_INFERENCE_PORT", "8010"))
 
