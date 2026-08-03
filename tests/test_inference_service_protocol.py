@@ -1173,3 +1173,24 @@ def test_peer_client_no_heavy_imports():
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
     assert "BAD: []" in result.stdout, f"从节点入口拉入了重依赖: {result.stdout} {result.stderr}"
+
+
+# ----------------------------------------------------------------------
+# 18. 1.7 scheduler-svc 入口（QLH_MONOLITH 回退选择）
+# ----------------------------------------------------------------------
+def test_scheduler_svc_host_selection(monkeypatch):
+    import scheduler_svc_main
+
+    # 微服务模式：host=InferenceClient
+    monkeypatch.setenv("QLH_MONOLITH", "0")
+    sched = scheduler_svc_main.build_scheduler()
+    from inference_client import InferenceClient
+
+    assert isinstance(sched._host, InferenceClient)
+
+    # 回退模式：host=进程内 model_host（一键回单进程）
+    monkeypatch.setenv("QLH_MONOLITH", "1")
+    sched2 = scheduler_svc_main.build_scheduler()
+    from model_host import ModelHost
+
+    assert isinstance(sched2._host, ModelHost)
