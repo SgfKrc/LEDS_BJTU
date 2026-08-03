@@ -903,3 +903,112 @@ def test_entry_module_no_heavy_imports():
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
     assert "HEAVY: []" in result.stdout, f"顶层拉入了重依赖: {result.stdout} {result.stderr}"
+
+
+# ----------------------------------------------------------------------
+# 16. 1.4 InferenceClient（HTTP 客户端，真实 uvicorn + FakeEngineHost）
+# ----------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def live_inference_svc():
+    """起真实 inference-svc（随机端口），engine_host 换为 FakeEngineHost。"""
+    import socket
+    import threading
+
+    import uvicorn
+
+    from inference_svc_main import build_app
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    app = build_app("master")
+    app.state.engine_host = FakeEngineHost()
+    app.state.node_role = "master"
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    # 等待就绪
+    import time
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            requests.get(f"http://127.0.0.1:{port}/v1/health", timeout=1)
+            break
+        except Exception:
+            time.sleep(0.1)
+    yield f"http://127.0.0.1:{port}"
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_inference_client_lifecycle(live_inference_svc):
+    from inference_client import InferenceClient
+
+    client = InferenceClient(base_url=live_inference_svc, timeout=30)
+    # 模型生命周期
+    r = client.load_model(engine="pytorch")
+    assert r["success"] is True
+    assert client.model_loaded is True  # 状态缓存
+    r = client.unload_model()
+    assert r["success"] is True
+
+
+def test_inference_client_chat(live_inference_svc):
+    from inference_client import InferenceClient
+
+    client = InferenceClient(base_url=live_inference_svc, timeout=30)
+    result = client.chat([{"role": "user", "content": "你好"}])
+    assert result["content"] == "你好，我是 QLH。"
+    assert result["metrics"]["tokens_per_second"] == 42.0
+
+
+def test_inference_client_chat_stream(live_inference_svc):
+    from inference_client import InferenceClient
+
+    client = InferenceClient(base_url=live_inference_svc, timeout=30)
+    events = list(client.chat_stream([{"role": "user", "content": "你好"}]))
+    tokens = [e["token"] for e in events if "token" in e]
+    assert "".join(tokens) == "你好"
+    assert events[-1]["done"] is True
+
+
+def test_inference_client_forward_layers_loopback(live_inference_svc):
+    from inference_client import InferenceClient
+
+    client = InferenceClient(base_url=live_inference_svc, timeout=30)
+    hidden = torch.randn(2, 2048, dtype=torch.float16)
+    out = client.forward_layers("0-12", hidden)
+    torch.testing.assert_close(out, hidden)  # FakeEngineHost identity
+
+
+def test_inference_client_worker_stage(live_inference_svc):
+    from inference_client import InferenceClient
+    from task_provider import StageRequest as ProviderStageRequest
+
+    client = InferenceClient(base_url=live_inference_svc, timeout=30)
+    stage = ProviderStageRequest(
+        workflow_id="w1", request_id="r1", stage_id="candidate_a",
+        stage_type="full_inference", provider_id="local-full-model",
+        dependencies={},
+        root_input={"messages": [{"role": "user", "content": "1+1=?"}],
+                    "task_options": {}},
+    )
+    result = client._execute_task_worker_stage(stage)
+    assert result["content"] == "候选答案内容"
+
+
+def test_inference_client_kv_and_cancel(live_inference_svc):
+    from inference_client import InferenceClient
+
+    client = InferenceClient(base_url=live_inference_svc, timeout=30)
+    r = client.kv_init(task_id="t_remote")
+    assert r["task_id"] == "t_remote"
+    r = client.kv_free(task_id="t_remote")
+    assert r["freed"] is True
+    # 未知 generation cancel → 404 → RuntimeError
+    with pytest.raises(RuntimeError):
+        client.cancel_generation("gen_nonexistent")
