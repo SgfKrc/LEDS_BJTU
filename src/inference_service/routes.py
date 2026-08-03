@@ -13,6 +13,7 @@ SSE 事件格式对齐 api_server /api/chat/stream（2026-08-03 基线）：
 """
 import base64
 import json
+import logging
 from typing import Any, Dict, Iterator, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -37,6 +38,8 @@ from .protocol import (
 from .tensor_transport import deserialize_tensor, serialize_tensor
 
 router = APIRouter(prefix="/v1")
+
+logger = logging.getLogger("inference_service.routes")
 
 
 # ----------------------------------------------------------------------
@@ -219,15 +222,48 @@ async def chat_cancel(req: ChatCancelRequest, request: Request):
 # ----------------------------------------------------------------------
 @router.post("/speculative/run")
 async def speculative_run(req: SpeculativeRunRequest, request: Request):
+    """投机解码 draft-verify 实验端点（1.2b 接入真实实现；
+    门控/异常映射复制自 api_server.experimental_speculative_chat）。"""
+    import config as _cfg
+
     host = _engine_host(request)
+    if not getattr(_cfg, "SPEC_ENABLED", False):
+        raise HTTPException(
+            404,
+            "投机解码实验未启用。请设置 QLH_SPEC_ENABLED=true 并配置 "
+            "QLH_SPEC_VERIFY_BASE_URL（或复用 QLH_EXTERNAL_BASE_URL）后重启。",
+        )
+    from external_provider import ExternalScopeDeniedError
+    from speculative import (
+        SpeculativeCapabilityError,
+        SpeculativeConfigError,
+        SpeculativeError,
+    )
+
     try:
         result = host.speculative_run(req)
     except NotImplementedError:
-        raise HTTPException(
-            status_code=501,
-            detail="speculative 实验端点未接入（1.2 执行段复制后可用）",
+        raise HTTPException(status_code=501, detail="speculative 实验端点未接入")
+    except ExternalScopeDeniedError as exc:
+        logger.info(
+            "数据作用域拒绝投机解码外部校验: scope=%s（消息正文未发送）",
+            getattr(_cfg, "EXTERNAL_DATA_SCOPE", ""),
         )
-    return result
+        raise HTTPException(403, str(exc)) from None
+    except SpeculativeConfigError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except SpeculativeCapabilityError as exc:
+        raise HTTPException(502, str(exc)) from None
+    except SpeculativeError as exc:
+        raise HTTPException(502, str(exc)) from None
+
+    return {
+        "content": result["content"],
+        "finish_reason": result["finish_reason"],
+        "metrics": result["metrics"],
+        "rounds": result["rounds"],
+        "request_id": request.headers.get("X-QLH-Request-ID", "-"),
+    }
 
 
 # ----------------------------------------------------------------------

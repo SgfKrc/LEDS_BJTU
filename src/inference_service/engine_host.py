@@ -17,6 +17,8 @@ scheduler 流水线段（_run_pipeline 等）复制为本宿主方法，源文�
     _strip_native_thinking_tags（api_server.py:904-1088 复制，零改动）
 """
 import json
+import logging
+import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -189,6 +191,189 @@ def _format_model_response(text: str, show_thinking: bool,
 
 
 from .protocol import ChatRequest  # noqa: E402（置于辅助函数后保持文档头清晰）
+
+logger = logging.getLogger("inference_service.engine_host")
+
+
+# ---- 复制自 api_server.py:1178-1226（纯函数，保真不变） ----
+def _is_question(text: str) -> bool:
+    """
+    判断文本是否为真正的疑问句，而非陈述句。
+
+    （复制自 api_server._is_question：必须以问号结尾 + 含疑问指示词
+    + 拒绝陈述句式关键词 + 拒绝列举开头。）
+    """
+    text = text.strip()
+    if not text:
+        return False
+
+    if not (text.endswith('？') or text.endswith('?')):
+        return False
+
+    question_indicators = [
+        '吗', '呢',
+        '什么', '怎么', '如何', '为何',
+        '哪些', '哪个', '哪种', '哪位',
+        '有没有', '能否', '是否', '可否',
+        '能不能', '会不会', '可不可以',
+        '多少', '几',
+        '谁', '哪', '何时', '怎样',
+        '可以', '能帮', '推荐', '介绍',
+    ]
+    has_indicator = any(ind in text for ind in question_indicators)
+    if not has_indicator:
+        return False
+
+    statement_patterns = [
+        '有以下', '包括以下', '如下',
+        '例如', '比如',
+        '这是', '以下是', '下面是',
+        '区别在于', '不同之处', '特点有',
+        '首先', '其次', '然后', '最后',
+        '第一', '第二', '第三',
+        '步骤', '流程', '方法有',
+    ]
+    if any(p in text for p in statement_patterns):
+        return False
+
+    if re.match(r'^[\d]+[\.\、\)）]', text):
+        return False
+
+    return True
+
+
+# ---- 复制自 api_server.py:1438-1573（纯函数，保真不变） ----
+def _fallback_followups(history: list, existing: list[str]) -> list[str]:
+    """
+    基于对话关键词匹配的追问模板兜底。
+
+    （复制自 api_server._fallback_followups：关键词 → 追问模板映射，
+    按优先级排序，去重后补足至 3 条。）
+    """
+    last_assistant = ""
+    last_user = ""
+    for msg in reversed(history):
+        if msg["role"] == "assistant" and not last_assistant:
+            last_assistant = msg["content"]
+        if msg["role"] == "user" and not last_user:
+            last_user = msg["content"]
+
+    combined = (last_user + " " + last_assistant).lower()
+
+    templates = []
+
+    if any(kw in combined for kw in ["量化", "quant", "int4", "int8", "fp16", "精度"]):
+        templates.extend([
+            "INT4和INT8量化在实际应用中如何选择？",
+            "量化会对模型推理能力造成多大影响？",
+            "除了量化还有哪些模型压缩方法？",
+        ])
+
+    if any(kw in combined for kw in ["边缘计算", "边缘", "edge", "分布式", "推理"]):
+        templates.extend([
+            "边缘推理和云端推理各有什么优缺点？",
+            "分布式推理中的通信开销如何优化？",
+            "边缘设备的算力瓶颈通常在哪里？",
+        ])
+
+    if any(kw in combined for kw in ["python", "代码", "编程", "写一个", "函数", "算法"]):
+        templates.extend([
+            "这段代码的时间复杂度是多少？",
+            "有没有更高效的实现方式？",
+            "能解释一下这段代码的核心逻辑吗？",
+        ])
+
+    if any(kw in combined for kw in ["模型", "训练", "微调", "lora", "参数"]):
+        templates.extend([
+            "这个模型的训练数据来源是什么？",
+            "如何在特定领域数据上微调模型？",
+            "LoRA微调相比全参数微调有哪些优势？",
+        ])
+
+    if any(kw in combined for kw in ["transformer", "注意力", "attention", "架构"]):
+        templates.extend([
+            "Transformer相比RNN有哪些优势？",
+            "自注意力机制的计算复杂度如何？",
+            "多头注意力的作用是什么？",
+        ])
+
+    if any(kw in combined for kw in ["token", "tokenizer", "分词", "词表"]):
+        templates.extend([
+            "不同的分词方法对模型性能有影响吗？",
+            "中文分词和英文分词的主要区别是什么？",
+            "BPE分词算法的原理是什么？",
+        ])
+
+    if any(kw in combined for kw in ["显存", "gpu", "内存", "oom", "优化", "加速"]):
+        templates.extend([
+            "还有哪些降低推理显存占用的方法？",
+            "CPU推理在什么场景下比GPU更合适？",
+            "KV Cache的显存占用如何估算？",
+        ])
+
+    if any(kw in combined for kw in ["应用", "场景", "实际", "落地", "工业"]):
+        templates.extend([
+            "当前这个技术还有哪些落地挑战？",
+            "业界有哪些成功的应用案例可以参考？",
+            "这项技术的商业化前景如何？",
+        ])
+
+    if any(kw in combined for kw in ["hello", "你好", "介绍", "你是谁", "能做什么"]):
+        templates.extend([
+            "你能帮我写代码吗？",
+            "你的知识截止到什么时候？",
+            "你擅长哪些类型的任务？",
+        ])
+
+    if any(kw in combined for kw in ["学习", "入门", "新手", "教程", "怎么学"]):
+        templates.extend([
+            "有哪些推荐的学习资源或课程？",
+            "学习这个需要什么前置知识？",
+            "从入门到精通大概需要多久？",
+        ])
+
+    if any(kw in combined for kw in ["区别", "对比", "比较", "不同", "差异", "选择"]):
+        templates.extend([
+            "在选择时应该考虑哪些关键因素？",
+            "有没有具体的场景举例说明？",
+            "未来哪个方向更有发展前景？",
+        ])
+
+    if any(kw in combined for kw in ["安全", "隐私", "加密", "攻击", "漏洞"]):
+        templates.extend([
+            "这种攻击的防御措施有哪些？",
+            "业界有哪些典型的安全事件？",
+            "如何在性能和安全性之间平衡？",
+        ])
+
+    if any(kw in combined for kw in ["数据", "dataset", "数据集", "预处理", "清洗"]):
+        templates.extend([
+            "数据质量对模型效果的影响有多大？",
+            "有哪些常用的数据增强方法？",
+            "如何处理数据中的类别不平衡问题？",
+        ])
+
+    default_templates = [
+        "能再详细解释一下吗？",
+        "这个结论有什么前提条件或局限性？",
+        "有没有相关的参考资料或论文推荐？",
+        "实际应用中需要注意哪些细节？",
+        "能举一个具体的例子说明吗？",
+    ]
+
+    result = list(existing)
+    candidate_pool = templates + default_templates
+    for q in candidate_pool:
+        if q not in result and len(result) < 3:
+            result.append(q)
+
+    if len(result) < 2:
+        for q in default_templates:
+            if q not in result and len(result) < 3:
+                result.append(q)
+
+    logger.info(f"追问兜底: 模型生成了 {len(existing)} 条，模板补充至 {len(result)} 条")
+    return result
 
 
 class EngineHost:
@@ -379,8 +564,99 @@ class EngineHost:
         yield {"done": True, "response": "", "followups": [], "metrics": {}, "request_id": "-"}
 
     def speculative_run(self, req) -> Dict[str, Any]:
-        """投机解码实验端点（1.2 复制 _run_speculative_experiment 后接入真实实现）。"""
-        raise NotImplementedError("speculative 实验端点随 1.2 执行段复制接入")
+        """投机解码实验端点（1.2b 复制自 api_server._run_speculative_experiment
+        api_server.py:2506-2519；SPEC_ENABLED 门控与异常映射在 routes 层）。"""
+        from speculative import run_speculative_chat
+
+        return run_speculative_chat(
+            req.message,
+            allow_external=bool(req.allow_external),
+            max_new_tokens=int(req.max_new_tokens),
+            gamma=(int(req.gamma) if req.gamma > 0 else None),
+            max_rounds=(int(req.max_rounds) if req.max_rounds > 0 else None),
+            temperature=(float(req.temperature) if req.temperature >= 0 else None),
+            seed=int(req.seed),
+            draft_hint=req.draft_hint or "",
+        )
+
+    # ------------------------------------------------------------------
+    # 追问生成（1.2b 复制自 api_server._generate_followups_llama
+    # api_server.py:1356-1435；宿主适配：model_manager → self._host）
+    # ------------------------------------------------------------------
+    def generate_followups_llama(
+        self,
+        history: list,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[str]:
+        """
+        使用 llama.cpp 引擎生成追问建议。
+
+        通过 model_host.chat() 调用（llama.cpp 路径），失败时回退到
+        关键词模板兜底（_fallback_followups）。
+        """
+        if not history or len(history) < 2:
+            return []
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
+        system_prompt = (
+            "根据对话内容，生成2-3个你会追问的问题。每个问题一行，以？结尾。"
+        )
+        followup_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"根据以下对话，生成我想追问的问题：\n"
+             f"用户：{history[-2]['content'][:200]}\n"
+             f"助手：{history[-1]['content'][:300]}"},
+        ]
+
+        questions = []
+        try:
+            result = self._host.chat(
+                messages=followup_messages,
+                max_tokens=128,
+                temperature=0.8,
+                top_p=0.9,
+                _cancel_event=cancel_event,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return []
+            text = result.get("content", "").strip()
+
+            for line in text.split("\n"):
+                line = line.strip()
+                line = re.sub(r'^[\d]+[\.\、\)）\s\-]+', '', line).strip()
+                if line.upper().startswith("Q:") or line.upper().startswith("Q："):
+                    line = line.split(":", 1)[-1].split("：", 1)[-1].strip()
+                if line and len(line) >= 5 and len(line) <= 80 and _is_question(line):
+                    questions.append(line)
+
+            hallucination_patterns = [
+                "通义千问", "千问", "ChatGPT", "Claude", "GPT-", "文心一言",
+                "讯飞星火", "豆包", "Kimi", "Copilot", "Bard", "Gemini",
+                "百川", "智谱", "ChatGLM", "混元",
+            ]
+            questions = [q for q in questions if not any(p in q for p in hallucination_patterns)]
+
+            filtered = []
+            seen = set()
+            for q in questions:
+                key = q[:15]
+                if key not in seen:
+                    seen.add(key)
+                    filtered.append(q)
+            questions = filtered
+
+            logger.info(f"llama.cpp 追问生成: {len(questions)} 条 → {questions}")
+
+        except Exception as e:
+            logger.warning(f"llama.cpp 追问生成失败（非致命）: {e}")
+            questions = []
+
+        if len(questions) < 2:
+            fallback = _fallback_followups(history, questions)
+            questions = fallback
+
+        return questions[:3]
 
     # ------------------------------------------------------------------
     # task-worker 数据面执行段（1.2a 复制自 api_server._execute_task_worker_stage
