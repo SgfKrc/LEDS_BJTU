@@ -11,12 +11,15 @@ SSE 事件格式对齐 api_server /api/chat/stream（2026-08-03 基线）：
   data: {"done": true, "error": "...", "request_id": "..."}     # 错误事件
 无 event: 行，纯 data 事件（前端 EventSource 依赖逐字节保真）。
 """
+import asyncio
 import base64
 import json
 import logging
+import threading
 from typing import Any, Dict, Iterator, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
@@ -41,6 +44,39 @@ from .tensor_transport import deserialize_tensor, serialize_tensor
 router = APIRouter(prefix="/v1")
 
 logger = logging.getLogger("inference_service.routes")
+
+
+async def _iterate_sync_generator(iterable):
+    """桥接阻塞式生成器而不阻塞 ASGI 事件循环（复制自
+    api_server.py:4132 的等价实现；生成期间 /v1/chat/cancel、/v1/health
+    仍可被处理——取消功能依赖此桥接）。"""
+    queue: asyncio.Queue = asyncio.Queue()
+    done = object()
+
+    def _pump():
+        try:
+            for item in iterable:
+                loop.call_soon_threadsafe(queue.put_nowait, (item, None))
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, (None, exc))
+        finally:
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, (done, None))
+            except RuntimeError:
+                pass
+
+    loop = asyncio.get_running_loop()
+    threading.Thread(target=_pump, name="inference-svc-stream-bridge", daemon=True).start()
+    try:
+        while True:
+            item, error = await queue.get()
+            if item is done:
+                break
+            if error is not None:
+                raise error
+            yield item
+    finally:
+        queue = None
 
 
 # ----------------------------------------------------------------------
@@ -152,8 +188,10 @@ async def models_current(request: Request):
 # 对话
 # ----------------------------------------------------------------------
 @router.post("/chat")
-async def chat(req: ChatRequest, request: Request):
-    """完整对话（JSON；1.2c 已接入 _execute_chat_full 完整复制）。"""
+def chat(req: ChatRequest, request: Request):
+    """完整对话（JSON；1.2c 已接入 _execute_chat_full 完整复制）。
+    同步 def：chat_full 是 CPU/推理阻塞调用，交给 FastAPI 线程池执行，
+    不阻塞事件循环（对齐 api_server run_in_threadpool 语义）。"""
     _require_master_role(request)
     host = _engine_host(request)
     request_id = request.headers.get("X-QLH-Request-ID", "-")
@@ -167,6 +205,7 @@ async def chat(req: ChatRequest, request: Request):
     finally:
         host.unregister_generation(generation_id)
     result["request_id"] = request_id
+    result["generation_id"] = generation_id
     return result
 
 
@@ -179,9 +218,10 @@ async def chat_stream(req: ChatRequest, request: Request):
     generation_id, cancel_event = host.register_generation(req.generation_id)
 
     if req.streaming_mode == "full":
-        # full：完整功能，推理完成后一次性返回单个 done 事件（SSE 格式）
+        # full：完整功能，推理完成后一次性返回单个 done 事件（SSE 格式）；
+        # chat_full 阻塞调用放线程池（api_server run_in_threadpool 语义）
         try:
-            result = host.chat_full(req, cancel_event)
+            result = await run_in_threadpool(host.chat_full, req, cancel_event)
         except HTTPException as e:
             return StreamingResponse(
                 iter([_sse_error(e.detail, request_id)]),
@@ -196,20 +236,28 @@ async def chat_stream(req: ChatRequest, request: Request):
             host.unregister_generation(generation_id)
         payload = {
             "done": True,
-            "response": result.get("response", ""),
+            "response": result.get("content", ""),
+            "thinking_content": result.get("thinking_content"),
             "followups": result.get("followups", []),
             "metrics": result.get("metrics", {}),
+            "generation_id": generation_id,
             "request_id": request_id,
         }
         return StreamingResponse(
             iter([_sse_event(payload)]), media_type="text/event-stream"
         )
 
-    # fast：真流式逐 token
+    # fast：真流式逐 token（同步生成器经线程桥接，不阻塞事件循环）
     async def _generate():
         completed_normally = False
         try:
-            for event in host.chat_stream_events(req, cancel_event):
+            async for event in _iterate_sync_generator(
+                host.chat_stream_events(req, cancel_event)
+            ):
+                if event.get("done"):
+                    # engine_host 薄实现的 done 事件带 "-" 占位，此处覆盖为真实值
+                    event["request_id"] = request_id
+                    event["generation_id"] = generation_id
                 yield _sse_event(event)
             completed_normally = True
         except Exception as e:
@@ -237,9 +285,10 @@ async def chat_cancel(req: ChatCancelRequest, request: Request):
 # 实验端点
 # ----------------------------------------------------------------------
 @router.post("/speculative/run")
-async def speculative_run(req: SpeculativeRunRequest, request: Request):
+def speculative_run(req: SpeculativeRunRequest, request: Request):
     """投机解码 draft-verify 实验端点（1.2b 接入真实实现；
-    门控/异常映射复制自 api_server.experimental_speculative_chat）。"""
+    门控/异常映射复制自 api_server.experimental_speculative_chat）。
+    同步 def：run_speculative_chat 阻塞，交线程池执行。"""
     _require_master_role(request)
     import config as _cfg
 
@@ -354,15 +403,18 @@ async def layers_lm_head(req: LMHeadRequest, request: Request):
 # 1.2d 随 task_graph 执行段复制完成后为完整实现）
 # ----------------------------------------------------------------------
 @router.post("/worker/stage")
-async def worker_stage(req: WorkerStageRequest, request: Request):
+def worker_stage(req: WorkerStageRequest, request: Request):
     """远程 Stage 执行（scheduler._host._execute_task_worker_stage 的 HTTP 化）。
 
     body 为 ProviderStageRequest 的 JSON 序列化（dataclasses.asdict 兼容）；
     cancel 通过 request_id 关联的 generation 取消事件实现。
+    同步 def：execute_task_worker_stage 阻塞，交线程池执行。
     """
     host = _engine_host(request)
     request_id = request.headers.get("X-QLH-Request-ID", "-")
-    _, cancel_event = host.register_generation(req.request_id or None)
+    # 用 register 返回的 gid 做注销：req.request_id 可能为空（默认 ""），
+    # 若用其注销会导致注册表条目泄漏且该 generation 永远无法 cancel
+    generation_id, cancel_event = host.register_generation(req.request_id or None)
 
     from dataclasses import fields
     from task_provider import StageRequest as ProviderStageRequest
@@ -381,7 +433,7 @@ async def worker_stage(req: WorkerStageRequest, request: Request):
             raise HTTPException(status_code=422, detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        host.unregister_generation(request_id or "-")
+        host.unregister_generation(generation_id)
     return result
 
 

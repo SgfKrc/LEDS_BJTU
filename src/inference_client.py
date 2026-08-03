@@ -151,10 +151,9 @@ class InferenceClient:
 
         tensor_ref = base64.b64encode(serialize_tensor(hidden)).decode("ascii")
         payload = {"layer_range": layer_range, "tensor_ref": tensor_ref}
-        if past_key_values is not None:
-            payload["past_key_values_ref"] = getattr(
-                past_key_values, "task_id", None,
-            ) or getattr(past_key_values, "task_id", "task_remote")
+        task_id = getattr(past_key_values, "task_id", None)
+        if task_id is not None:
+            payload["past_key_values_ref"] = task_id
         result = self._post("/v1/layers/forward", payload)
         from inference_service.tensor_transport import deserialize_tensor
 
@@ -166,11 +165,12 @@ class InferenceClient:
     # InferenceHost Protocol：chat
     # ------------------------------------------------------------------
     def chat(self, messages: List[dict], **kw) -> dict:
-        """完整对话（JSON，非流式）。messages 取最后一条作为 message。"""
+        """完整对话（JSON，非流式）。messages 取最后一条作为 message；
+        session_id 透传保证多轮历史/追问语义与进程内 model_host 一致。"""
         message = messages[-1]["content"] if messages else ""
-        history = messages[:-1] if len(messages) > 1 else []
         payload = {
             "message": message,
+            "session_id": kw.get("session_id"),
             "max_new_tokens": kw.get("max_tokens", kw.get("max_new_tokens", 1024)),
             "temperature": kw.get("temperature", 0.7),
             "top_p": kw.get("top_p", 0.9),
@@ -192,6 +192,7 @@ class InferenceClient:
         message = messages[-1]["content"] if messages else ""
         payload = {
             "message": message,
+            "session_id": kw.get("session_id"),
             "max_new_tokens": kw.get("max_tokens", kw.get("max_new_tokens", 1024)),
             "temperature": kw.get("temperature", 0.7),
             "top_p": kw.get("top_p", 0.9),

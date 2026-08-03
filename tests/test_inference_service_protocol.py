@@ -83,8 +83,11 @@ class FakeEngineHost(EngineHost):
         return {"loaded": True, "engine": "pytorch", "model_id": "qwen-1.8b"}
 
     def chat_full(self, req, cancel_event=None):
+        # 返回结构与真实 EngineHost.chat_full 一致（content 而非 response，
+        # 见 engine_host.py:678）：routes 取 result["content"]
         return {
-            "response": "你好，我是 QLH。",
+            "content": "你好，我是 QLH。",
+            "thinking_content": None,
             "followups": [],
             "metrics": {"tokens_per_second": 42.0},
         }
@@ -99,6 +102,7 @@ class FakeEngineHost(EngineHost):
             "response": "你好",
             "followups": [],
             "metrics": {},
+            "request_id": "-",
         }
 
     def forward_layers(self, layer_range, hidden, past_key_values=None, **kw):
@@ -224,7 +228,10 @@ def test_chat_json(client):
     resp = client.post("/v1/chat", json={"message": "你好"})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["response"] == "你好，我是 QLH。"
+    # 真实 EngineHost.chat_full 返回 content（对齐 api_server）
+    assert body["content"] == "你好，我是 QLH。"
+    assert body["request_id"] == "-"
+    assert body["generation_id"].startswith("gen_")
     assert "followups" in body
     assert "metrics" in body
 
@@ -247,6 +254,9 @@ def test_chat_stream_fast_event_format(client):
     assert "token" in events[0]
     assert events[-1]["done"] is True
     assert "response" in events[-1]
+    # 薄实现 done 事件的 "-" 占位被 routes 覆盖为真实 request_id/generation_id
+    assert events[-1]["request_id"] == "-"  # 无 X-QLH-Request-ID 头时默认 "-"
+    assert events[-1]["generation_id"].startswith("gen_")
 
 
 def test_chat_stream_full_single_done(client):
@@ -261,7 +271,10 @@ def test_chat_stream_full_single_done(client):
     ]
     assert len(events) == 1
     assert events[0]["done"] is True
+    # 真实 chat_full 返回 content（修复前取 response 恒为空）
     assert events[0]["response"] == "你好，我是 QLH。"
+    assert events[0]["thinking_content"] is None
+    assert events[0]["generation_id"].startswith("gen_")
 
 
 def test_chat_cancel_semantics(client):
@@ -276,6 +289,81 @@ def test_chat_cancel_semantics(client):
     assert resp.status_code == 200
     assert ev.is_set()
     host.unregister_generation(gid)
+
+
+def test_chat_cancel_during_stream(monkeypatch):
+    """生成期间 cancel 可命中（threadpool/线程桥接后事件循环不被阻塞）。
+
+    修复前：async 端点内同步迭代生成器，流式生成期间 /v1/chat/cancel
+    得不到处理（事件循环被占），取消功能实际失效。"""
+    import time as _time
+
+    host = FakeEngineHost()
+    app = make_app(engine_host=host)
+    # TestClient 单 portal 不支持并发：流式与 cancel 各用独立 TestClient，
+    # 共享同一 app 实例（app.state.engine_host 是同一个 host）
+    stream_client = TestClient(app)
+    cancel_client = TestClient(app)
+
+    def _slow_stream(self, req, cancel_event):
+        for i in range(50):
+            if cancel_event is not None and cancel_event.is_set():
+                yield {"token": "[cancelled]"}
+                return
+            yield {"token": f"t{i}"}
+            _time.sleep(0.05)  # 模拟慢生成：期间事件循环必须仍可服务 cancel
+        yield {"done": True, "response": "ok", "followups": [], "metrics": {}}
+
+    # FakeEngineHost 自带 chat_stream_events 覆盖基类，patch 必须作用于子类
+    monkeypatch.setattr(FakeEngineHost, "chat_stream_events", _slow_stream)
+
+    tokens = []
+    statuses = []
+    cancelled_ok = []
+    errors = []
+
+    def _consumer():
+        try:
+            with stream_client.stream(
+                "POST",
+                "/v1/chat/stream",
+                json={"message": "hi", "streaming_mode": "fast"},
+            ) as resp:
+                statuses.append(resp.status_code)
+                for line in resp.iter_lines():
+                    if line.startswith("data: "):
+                        ev = json.loads(line[6:])
+                        tokens.append(ev)
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    t = threading.Thread(target=_consumer, daemon=True)
+    t.start()
+    # 等生成开始（已注册 gid）：轮询而非固定 sleep（TestClient 启动有开销）
+    gids = []
+    deadline = _time.time() + 5.0
+    while _time.time() < deadline:
+        with host._gen_lock:
+            gids = list(host._generations.keys())
+        if gids:
+            break
+        _time.sleep(0.02)
+    assert len(gids) == 1, (
+        f"流式期间应有 1 个已注册 generation，实际: {gids}；"
+        f"consumer 线程存活: {t.is_alive()}；statuses: {statuses}；"
+        f"tokens: {tokens}；errors: {errors}"
+    )
+    resp = cancel_client.post("/v1/chat/cancel", json={"generation_id": gids[0]})
+    cancelled_ok.append(resp.status_code)
+    t.join(timeout=10)
+    assert not errors
+    assert cancelled_ok == [200], f"cancel 应 200，实际 {cancelled_ok}"
+    # 流被 cancel 中断：出现 [cancelled] 且没有正常 done
+    assert any(ev.get("token") == "[cancelled]" for ev in tokens)
+    assert not any(ev.get("done") for ev in tokens)
+    # 注册表已清空（无泄漏）
+    with host._gen_lock:
+        assert host._generations == {}
 
 
 # ----------------------------------------------------------------------
@@ -359,10 +447,62 @@ def test_layers_forward_unknown_kv_ref(client):
 def test_speculative_run_gated_off(client):
     """SPEC_ENABLED 未启用（默认）→ 404 门控（复制 api_server 语义）。"""
     resp = client.post(
-        "/v1/speculative/run", json={"prompt": "你好"}
+        "/v1/speculative/run", json={"message": "你好"}
     )
     assert resp.status_code == 404
     assert "detail" in resp.json()
+
+
+def test_speculative_run_enabled_path(client, monkeypatch):
+    """SPEC_ENABLED=true 时启用路径：真实 SpeculativeRunRequest 全字段
+    透传到 host.speculative_run（修复前协议缺字段 → AttributeError 500）。"""
+    import config as _cfg
+
+    monkeypatch.setattr(_cfg, "SPEC_ENABLED", True)
+
+    captured = {}
+
+    def _fake_speculative_run(self, req):
+        captured["message"] = req.message
+        captured["gamma"] = req.gamma
+        captured["max_rounds"] = req.max_rounds
+        captured["seed"] = req.seed
+        captured["draft_hint"] = req.draft_hint
+        captured["allow_external"] = req.allow_external
+        captured["max_new_tokens"] = req.max_new_tokens
+        return {
+            "content": "草稿验证结果",
+            "finish_reason": "stop",
+            "metrics": {},
+            "rounds": 1,
+        }
+
+    from inference_service.engine_host import EngineHost
+
+    monkeypatch.setattr(EngineHost, "speculative_run", _fake_speculative_run)
+    resp = client.post(
+        "/v1/speculative/run",
+        json={
+            "message": "你好",
+            "gamma": 4,
+            "max_rounds": 2,
+            "seed": 42,
+            "draft_hint": "你好，",
+            "allow_external": True,
+            "max_new_tokens": 32,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["content"] == "草稿验证结果"
+    assert captured == {
+        "message": "你好",
+        "gamma": 4,
+        "max_rounds": 2,
+        "seed": 42,
+        "draft_hint": "你好，",
+        "allow_external": True,
+        "max_new_tokens": 32,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -467,6 +607,46 @@ def test_worker_stage_cancel_stops_inference():
     result = host.execute_task_worker_stage(req, cancel)
     assert result["content"] == ""
     assert host._host.calls == []  # 未触发模型调用
+
+
+def test_worker_stage_route_generation_no_leak(monkeypatch):
+    """路由级：/v1/worker/stage 结束时 generation 注册表无泄漏。
+    （修复前：req.request_id 默认空时 finally 用 header 默认值 "-" 注销，
+    注册表条目永不释放，且该 generation 永远无法 cancel。）"""
+    from inference_service.engine_host import EngineHost
+
+    host = FakeEngineHost()
+    app = make_app(engine_host=host)
+    client = TestClient(app)
+    captured = {}
+
+    def _fake_execute(self, stage_request, provider_cancel_event):
+        captured["cancel_event"] = provider_cancel_event
+        captured["stage_type"] = stage_request.stage_type
+        return {"success": True, "content": "ok"}
+
+    monkeypatch.setattr(EngineHost, "execute_task_worker_stage", _fake_execute)
+    resp = client.post(
+        "/v1/worker/stage",
+        json={
+            "workflow_id": "wf-1",
+            "request_id": "",  # 空 request_id：注册表用自动生成 gid
+            "stage_id": "s1",
+            "stage_type": "candidate_a",
+            "provider_id": "local",
+            "dependencies": {},
+            "root_input": {"task_options": {}},
+            "model_identity": None,
+            "runtime_context": {},
+        },
+    )
+    assert resp.status_code == 200
+    assert captured["stage_type"] == "candidate_a"
+    # 请求结束后注册表必须清空（无泄漏）
+    with host._gen_lock:
+        assert host._generations == {}
+    # 且注册期间 cancel 可命中（用注册时的 gid）
+    assert captured["cancel_event"] is not None
 
 
 # ----------------------------------------------------------------------
@@ -957,11 +1137,28 @@ def test_inference_client_lifecycle(live_inference_svc):
     assert r["success"] is True
 
 
-def test_inference_client_chat(live_inference_svc):
+def test_inference_client_chat(live_inference_svc, monkeypatch):
     from inference_client import InferenceClient
 
+    # 验证 session_id 透传（修复前丢 session_id → 多轮历史语义漂移）
+    captured = {}
+
+    def _chat_full(self, req, cancel_event=None):
+        captured["session_id"] = req.session_id
+        return {
+            "content": "你好，我是 QLH。",
+            "thinking_content": None,
+            "followups": [],
+            "metrics": {"tokens_per_second": 42.0},
+        }
+
+    # FakeEngineHost 自带 chat_full 覆盖基类，patch 必须作用于子类
+    monkeypatch.setattr(FakeEngineHost, "chat_full", _chat_full)
     client = InferenceClient(base_url=live_inference_svc, timeout=30)
-    result = client.chat([{"role": "user", "content": "你好"}])
+    result = client.chat(
+        [{"role": "user", "content": "你好"}], session_id="sess-1"
+    )
+    assert captured["session_id"] == "sess-1"
     assert result["content"] == "你好，我是 QLH。"
     assert result["metrics"]["tokens_per_second"] == 42.0
 
