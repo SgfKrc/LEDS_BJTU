@@ -67,14 +67,13 @@ async def _iterate_sync_generator(iterable):
 
     loop = asyncio.get_running_loop()
     threading.Thread(target=_pump, name="inference-svc-stream-bridge", daemon=True).start()
-    try:
-        while True:
-            item, error = await queue.get()
-            if item is done:
-                break
-            if error is not None:
-                raise error
-            yield item
+    while True:
+        item, error = await queue.get()
+        if item is done:
+            break
+        if error is not None:
+            raise error
+        yield item
 
 
 # ----------------------------------------------------------------------
