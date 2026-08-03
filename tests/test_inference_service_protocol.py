@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -27,8 +28,38 @@ from inference_service.routes import router
 from inference_service.tensor_transport import deserialize_tensor, serialize_tensor
 
 
+class FakeModel:
+    """假模型宿主：有 chat / active_model_id，行为可断言。"""
+
+    active_model_id = "qwen-1.8b"
+
+    def __init__(self):
+        self.calls = []
+
+    def chat(self, messages, max_tokens=None, temperature=None, top_p=None,
+             **_kw):
+        self.calls.append(
+            (list(messages), max_tokens, temperature, top_p)
+        )
+        return {
+            "content": "候选答案内容",
+            "usage": {"total_tokens": 8},
+            "tokens_per_second": 12.5,
+            "model": "qwen-1.8b",
+        }
+
+    def load_layer_range(self, start_layer=0, end_layer=24,
+                         has_embedding=False, has_lm_head=False):
+        """层段加载桩：1.2 复制完成后接入真实实现。"""
+        return None
+
+
 class FakeEngineHost(EngineHost):
-    """轻量假宿主：只覆盖对话/加载方法，取消注册表等继承真实实现。"""
+    """轻量假宿主：注入 FakeModel 替代真实 ModelHost（不触发 model_module）。"""
+
+    def __init__(self):
+        super().__init__()
+        self._host = FakeModel()  # 替换真实 ModelHost
 
     def load_model(self, engine=None, quant_type=None, use_compile=False, model_id=None):
         return {"success": True, "engine": engine or "pytorch", "model_id": model_id}
@@ -339,3 +370,133 @@ def test_layers_load_unload(client):
     assert resp.status_code == 200
     r = client.get("/v1/status")
     assert "0-12" not in r.json()["layers"]
+
+
+# ----------------------------------------------------------------------
+# 9. 1.2a 数据面执行段：task-worker Stage（复制自 api_server
+#    _execute_task_worker_stage；宿主适配 model_manager → self._host）
+# ----------------------------------------------------------------------
+from task_provider import StageRequest as ProviderStageRequest
+from task_graph import TaskGraphError
+
+
+def _stage(stage_type, stage_id, root_input, dependencies=None):
+    return ProviderStageRequest(
+        workflow_id="w1",
+        request_id="r1",
+        stage_id=stage_id,
+        stage_type=stage_type,
+        provider_id="local-full-model",
+        dependencies=dependencies or {},
+        root_input=root_input,
+    )
+
+
+def test_worker_stage_full_inference():
+    host = FakeEngineHost()
+    req = _stage(
+        "full_inference", "candidate_a",
+        {"messages": [{"role": "user", "content": "1+1=?"}],
+         "task_options": {"candidate_max_tokens": 128, "temperature": 0.5}},
+    )
+    result = host.execute_task_worker_stage(req, threading.Event())
+    assert result["content"] == "候选答案内容"
+    assert result["tokens_per_second"] == 12.5
+    assert result["model"] == "qwen-1.8b"
+    # 系统提示注入 + 用户消息
+    messages = host._host.calls[0][0]
+    assert messages[0]["role"] == "system"
+    assert messages[-1]["content"] == "1+1=?"
+    assert host._host.calls[0][1] == 128  # candidate_budget
+    assert host._host.calls[0][2] == 0.5  # temperature
+
+
+def test_worker_stage_aggregate():
+    host = FakeEngineHost()
+    req = _stage(
+        "aggregate", "aggregate",
+        {"message": "原始问题", "task_options": {"final_max_tokens": 256}},
+        dependencies={
+            "candidate_a": {"content": "候选一"},
+            "candidate_b": {"content": "候选二"},
+        },
+    )
+    result = host.execute_task_worker_stage(req, threading.Event())
+    assert result["content"] == "候选答案内容"
+    messages = host._host.calls[0][0]
+    assert "候选一" in messages[-1]["content"]
+    assert "候选二" in messages[-1]["content"]
+
+
+def test_worker_stage_unsupported_type():
+    host = FakeEngineHost()
+    req = _stage("bogus", "x", {"task_options": {}})
+    with pytest.raises(TaskGraphError):
+        host.execute_task_worker_stage(req, threading.Event())
+
+
+def test_worker_stage_invalid_options():
+    host = FakeEngineHost()
+    req = _stage(
+        "full_inference", "candidate_a",
+        {"messages": [], "task_options": {"temperature": "不是数字"}},
+    )
+    with pytest.raises(TaskGraphError):
+        host.execute_task_worker_stage(req, threading.Event())
+
+
+def test_worker_stage_cancel_stops_inference():
+    host = FakeEngineHost()
+    cancel = threading.Event()
+    cancel.set()  # 已取消 → run_model 直接返回空
+    req = _stage(
+        "full_inference", "candidate_a",
+        {"messages": [{"role": "user", "content": "hi"}],
+         "task_options": {}},
+    )
+    result = host.execute_task_worker_stage(req, cancel)
+    assert result["content"] == ""
+    assert host._host.calls == []  # 未触发模型调用
+
+
+# ----------------------------------------------------------------------
+# 10. 1.2a KV from_profile（复制自 api_server._init_kv_cache 自适应逻辑）
+# ----------------------------------------------------------------------
+def test_kv_from_profile_tier_sizing():
+    kv = KVHost()
+    edge = kv.from_profile(profile={"tier": "edge", "gpu": {}})
+    assert edge["reused"] is False
+    edge_pages = edge["max_pages"]
+
+    kv2 = KVHost()
+    workstation = kv2.from_profile(profile={"tier": "workstation", "gpu": {}})
+    assert workstation["max_pages"] > edge_pages  # 工作站档位更大
+
+
+def test_kv_from_profile_with_model_heads():
+    kv = KVHost()
+    r = kv.from_profile(profile={"tier": "laptop", "gpu": {}},
+                        num_heads=16, head_dim=64)
+    assert r["total_pages"] == 0  # 初始未分配页
+    assert r["max_pages"] > 0
+
+
+# ----------------------------------------------------------------------
+# 11. 1.2a 辅助纯函数行为（复制自 api_server，等价性由一次性对比脚本验证）
+# ----------------------------------------------------------------------
+def test_aux_strip_thinking_tags():
+    from inference_service.engine_host import _strip_native_thinking_tags as strip
+    assert strip("答案<think>思考</think>") == "答案"
+    assert strip("<think>仅思考</think>") == ""
+    assert strip("a\n\n\n\nb") == "a\n\nb"
+    assert strip("") == ""
+
+
+def test_aux_parse_thinking_response():
+    from inference_service.engine_host import _parse_thinking_response as parse
+    answer, thinking = parse("【思考】推理过程\n【思考结束】最终答案")
+    assert thinking == "推理过程"
+    assert answer == "最终答案"
+    answer, thinking = parse("无标记直接回答")
+    assert answer == "无标记直接回答"
+    assert thinking is None

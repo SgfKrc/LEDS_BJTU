@@ -62,6 +62,51 @@ class KVHost:
                 pass
             return {"task_id": task_id, "freed": True}
 
+    def from_profile(
+        self,
+        task_id: Optional[str] = None,
+        profile: Optional[Dict[str, Any]] = None,
+        device: Optional[str] = None,
+        dtype: Any = None,
+        num_heads: int = 16,
+        head_dim: int = 64,
+    ) -> Dict[str, Any]:
+        """按设备画像自适应初始化 KV 缓存（1.2a 复制自 api_server._init_kv_cache
+        api_server.py:1575-1618 的自适应逻辑；源文件保持不动）。
+
+        与 init() 的差异：page_size/max_pages 由 PagedKVCache.from_profile
+        按设备档位决定，而非调用方显式指定。num_heads/head_dim 由宿主
+        （EngineHost）从已加载模型的 config 读取后传入。
+        """
+        import torch as _torch
+
+        if dtype is None:
+            dtype = _torch.float16
+        with self._lock:
+            self._counter += 1
+            tid = task_id or f"task_{self._counter}"
+            existing = self._caches.get(tid)
+            if existing is not None:
+                return {
+                    "task_id": tid,
+                    "reused": True,
+                    "total_pages": existing.allocated_page_count,
+                }
+            cache = PagedKVCache.from_profile(
+                profile=profile or {},
+                device=device,
+                dtype=dtype,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+            self._caches[tid] = cache
+            return {
+                "task_id": tid,
+                "reused": False,
+                "total_pages": cache.allocated_page_count,
+                "max_pages": cache.max_pages,
+            }
+
     def get(self, task_id: str) -> Optional[PagedKVCache]:
         with self._lock:
             return self._caches.get(task_id)
