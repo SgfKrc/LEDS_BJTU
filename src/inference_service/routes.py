@@ -75,8 +75,6 @@ async def _iterate_sync_generator(iterable):
             if error is not None:
                 raise error
             yield item
-    finally:
-        queue = None
 
 
 # ----------------------------------------------------------------------
