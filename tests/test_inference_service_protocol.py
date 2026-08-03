@@ -860,8 +860,92 @@ def make_full_host(fake_model_cls=FakeModel):
 
 
 # ----------------------------------------------------------------------
-# 14. 1.2c 完整聊天流程（复制自 api_server._execute_chat_full）
+# 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
+#      + _execute_task_graph_chat_with_slot + 5 个辅助函数）
 # ----------------------------------------------------------------------
+def test_task_graph_gate_off():
+    """TASK_GRAPH_ENABLED 默认关闭 → chat_full(task_graph) 409 门控
+    （对齐 api_server 语义；不加载模型、不创建 journal）。"""
+    # 真实 EngineHost（FakeEngineHost 覆盖了基类 chat_full，分支不会触发）
+    host = EngineHost()
+    req = ChatRequest(message="hi", execution_mode="task_graph")
+    with pytest.raises(Exception) as excinfo:
+        host.chat_full(req)
+    assert excinfo.value.status_code == 409
+    assert "任务链实验未启用" in str(excinfo.value.detail)
+
+
+def test_task_graph_chat_full_dispatches(monkeypatch):
+    """execution_mode=task_graph → chat_full 分派到 execute_task_graph_chat
+    （对齐 api_server._execute_requested_chat）。"""
+    from inference_service.engine_host import EngineHost
+
+    import config as _cfg
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
+    host = EngineHost()  # 真实 EngineHost：基类 chat_full 才有 task_graph 分支
+    captured = {}
+
+    def _fake_execute(self, req, cancel_event=None):
+        captured["mode"] = req.execution_mode
+        return {"content": "task-graph-ok", "thinking_content": None,
+                "metrics": {"execution_mode": "task_graph"}, "followups": []}
+
+    monkeypatch.setattr(EngineHost, "execute_task_graph_chat", _fake_execute)
+    req = ChatRequest(message="hi", execution_mode="task_graph")
+    result = host.chat_full(req)
+    assert captured["mode"] == "task_graph"
+    assert result["content"] == "task-graph-ok"
+
+
+def test_task_graph_slot_exclusive(monkeypatch):
+    """task_graph 执行槽互斥：占用中再来 → 429（对齐 api_server 语义）。"""
+    from inference_service.engine_host import EngineHost
+
+    import config as _cfg
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
+    host = EngineHost()
+    captured = []
+
+    def _fake_execute(self, req, cancel_event=None):
+        captured.append("entered")
+        return {"content": "ok", "thinking_content": None,
+                "metrics": {}, "followups": []}
+
+    monkeypatch.setattr(EngineHost, "execute_task_graph_chat_with_slot", _fake_execute)
+    # gate 的 journal 检查需 available：伪造 coordinator
+    class _FakeCoordinator:
+        def journal_status(self):
+            return {"available": True}
+
+    monkeypatch.setattr(EngineHost, "_ensure_task_graph_coordinator",
+                        lambda self: _FakeCoordinator())
+    # 先占用槽位
+    assert host._task_graph_execution_slot.acquire(blocking=False) is True
+    req = ChatRequest(message="hi", execution_mode="task_graph")
+    with pytest.raises(Exception) as excinfo:
+        host.chat_full(req)
+    assert excinfo.value.status_code == 429
+    assert captured == []  # 未进入执行体
+    host._task_graph_execution_slot.release()
+
+
+def test_task_graph_coordinator_lazy_idempotent():
+    """_ensure_task_graph_coordinator 惰性创建且幂等（单实例缓存）。"""
+    host = FakeEngineHost()
+    c1 = host._ensure_task_graph_coordinator()
+    c2 = host._ensure_task_graph_coordinator()
+    assert c1 is c2
+
+
+def test_task_graph_active_identity_none_without_model():
+    """未加载模型 → _active_task_graph_model_identity 返回 None。"""
+    host = EngineHost()  # 真实 ModelHost：model_loaded=False
+    assert host._active_task_graph_model_identity() is None
+
+
+
 def test_chat_full_llama_cpp_path(monkeypatch):
     """llama.cpp 引擎整请求路径：历史维护 + metrics + followups 兜底。"""
     import db
