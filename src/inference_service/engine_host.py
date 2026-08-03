@@ -526,6 +526,7 @@ class EngineHost:
         self._scheduler: Any = None
         self._run_mode: str = "standalone"  # 对齐 api_server.RUN_MODE
         self._on_task_error = None  # 1.4 注入：任务失败回调
+        self.role: str = "master"  # master / client（1.3 角色感知，1.5 peer 使用）
 
     # ------------------------------------------------------------------
     # 模型生命周期（委托 ModelHost / ModelManager）
