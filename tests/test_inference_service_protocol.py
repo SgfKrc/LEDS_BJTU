@@ -945,6 +945,168 @@ def test_task_graph_active_identity_none_without_model():
     assert host._active_task_graph_model_identity() is None
 
 
+def test_task_graph_with_slot_real_execution(monkeypatch):
+    """真实执行 execute_task_graph_chat_with_slot 主体（不 monkeypatch
+    执行体）：本地模板分支全链路——会话切换/历史维护/run_template/
+    持久化/metrics。修复前此路径 6 处 NameError 必崩。"""
+    import config as _cfg
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
+    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
+
+    host = make_full_host()  # 真实 EngineHost + FakeModel（_db_available=True）
+    host._host._db_available = False  # 走 local_store 分支
+    host._host.full_chat_execution_lock = threading.RLock()  # FakeModel 缺锁
+    host._active_session_id = "s1"
+    host._session_histories["s1"] = []
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.providers = []
+
+        def journal_status(self):
+            return {"available": True}
+
+        def has_provider(self, pid):
+            return pid in self.providers
+
+        def register_provider(self, provider):
+            self.providers.append(provider.provider_id)
+
+        def run_template(self, **kw):
+            captured["run_template"] = kw
+            return (
+                {"content": "任务链答案", "thinking_content": None},
+                {
+                    "workflow_id": "wf-1",
+                    "template": "dual_candidate",
+                    "state": "completed",
+                    "partial_result": False,
+                    "stages": [],
+                    "stage_count": 0,
+                    "attempt_count": 0,
+                    "duration_seconds": 0.5,
+                },
+            )
+
+        def commit_result(self, workflow_id):
+            return {"workflow_id": workflow_id, "stages": [],
+                    "template": "dual_candidate", "state": "completed",
+                    "partial_result": False, "stage_count": 0,
+                    "attempt_count": 0, "duration_seconds": 0.5}
+
+        def discard_result(self, workflow_id):
+            return None
+
+        def provider_status(self):
+            return []
+
+    fake_coord = FakeCoordinator()
+    captured = {}
+    monkeypatch.setattr(
+        EngineHost, "_ensure_task_graph_coordinator",
+        lambda self: fake_coord,
+    )
+
+    req = ChatRequest(message="hi", session_id="s1", execution_mode="task_graph")
+    result = host.chat_full(req)
+
+    assert result["content"] == "任务链答案"
+    assert result["metrics"]["execution_mode"] == "task_graph"
+    assert result["metrics"]["workflow_id"] == "wf-1"
+    # run_template 收到正确入参（root_input 带消息与历史）
+    assert captured["run_template"]["root_input"]["message"] == "hi"
+    assert captured["run_template"]["session_id"] == "s1"
+    # 历史已追加（user + assistant）
+    assert len(host._session_histories["s1"]) == 2
+    assert host._session_histories["s1"][0]["role"] == "user"
+    assert host._session_histories["s1"][1]["role"] == "assistant"
+    # 本地 provider 注册成功（self._dispatch_local_task_provider 引用有效）
+    assert "local_full_model" in fake_coord.providers
+
+
+def test_task_graph_auto_remote_identity_path(monkeypatch):
+    """auto_remote 分支调用 _active_task_graph_model_identity（修复前
+    1597 行裸 model_manager NameError）：无可用远端 → 本地降级执行。"""
+    import config as _cfg
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
+    monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+
+    host = make_full_host()
+    host._host._db_available = False
+    host._host.full_chat_execution_lock = threading.RLock()
+    host._active_session_id = "s1"
+    host._session_histories["s1"] = []
+
+    class FakeIdentity:
+        model_id = "qwen-1.8b"
+        engine = "llama_cpp"
+        format = "gguf"
+        revision = "local-abc123"
+        sha256 = "a" * 64
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.providers = []
+
+        def journal_status(self):
+            return {"available": True}
+
+        def has_provider(self, pid):
+            return pid in self.providers
+
+        def register_provider(self, provider):
+            self.providers.append(provider.provider_id)
+
+        def run_template(self, **kw):
+            return (
+                {"content": "远端不可用本地降级", "thinking_content": None},
+                {
+                    "workflow_id": "wf-2",
+                    "template": "dual_candidate",
+                    "state": "completed",
+                    "partial_result": False,
+                    "stages": [],
+                    "stage_count": 0,
+                    "attempt_count": 0,
+                    "duration_seconds": 0.3,
+                },
+            )
+
+        def commit_result(self, workflow_id):
+            return {"workflow_id": workflow_id, "stages": [],
+                    "template": "dual_candidate", "state": "completed",
+                    "partial_result": False, "stage_count": 0,
+                    "attempt_count": 0, "duration_seconds": 0.3}
+
+        def discard_result(self, workflow_id):
+            return None
+
+        def provider_status(self):
+            return []
+
+    monkeypatch.setattr(
+        EngineHost, "_ensure_task_graph_coordinator",
+        lambda self: FakeCoordinator(),
+    )
+    # 有模型身份（self._host 引用路径真实执行）
+    monkeypatch.setattr(
+        EngineHost, "_active_task_graph_model_identity",
+        lambda self: FakeIdentity(),
+    )
+
+    req = ChatRequest(
+        message="hi", session_id="s1", execution_mode="task_graph",
+        task_graph_auto_remote=True,
+    )
+    result = host.chat_full(req)
+    assert result["content"] == "远端不可用本地降级"
+    # 无可用远端 → 降级标记
+    assert result["metrics"]["fallback"] is True
+    assert result["metrics"]["auto_remote_enabled"] is True
+    assert result["metrics"]["auto_remote_providers"] == []
+
 
 def test_chat_full_llama_cpp_path(monkeypatch):
     """llama.cpp 引擎整请求路径：历史维护 + metrics + followups 兜底。"""
@@ -1488,7 +1650,8 @@ def sched_http_client():
 
     sched = sched_mod.Scheduler()
     app = http_mod.build_scheduler_app(sched)
-    return TestClient(app), sched
+    yield TestClient(app), sched
+    http_mod.reset_scheduler()  # 测试隔离：清空注入实例
 
 
 def test_sched_http_status(sched_http_client):

@@ -1574,7 +1574,7 @@ class EngineHost:
             return
         try:
             self._ensure_task_graph_coordinator().register_provider(LocalFullModelProvider(
-                _dispatch_local_task_provider,
+                self._dispatch_local_task_provider,
                 provider_id="local_full_model",
                 node_id=(self._scheduler.get_effective_node_id() if self._scheduler is not None else ""),
                 max_concurrency=1,
@@ -1594,15 +1594,15 @@ class EngineHost:
         from task_provider import ModelIdentity
         if not self._host.model_loaded or not self._host.is_loaded:
             return None
-        engine = str(getattr(model_manager, "_engine_type", "") or "")
-        model_path = str(getattr(model_manager, "_model_path", "") or "")
-        model_id = str(getattr(model_manager, "active_model_id", "") or "")
+        engine = str(getattr(self._host, "_engine_type", "") or "")
+        model_path = str(getattr(self._host, "_model_path", "") or "")
+        model_id = str(getattr(self._host, "active_model_id", "") or "")
         if engine not in {"pytorch", "llama_cpp", "island"} or not model_id or not model_path:
             return None
         if engine == "island":
             # 孤岛模型无本地 artifact：以"端点指纹 + 后端模型名"替代文件摘要，
             # 统计中如实标注为外部端点（不伪装成本地文件，见调研方案 §2.2）。
-            island_engine = getattr(model_manager, "_island_engine", None)
+            island_engine = getattr(self._host, "_island_engine", None)
             backend_model = str(getattr(island_engine, "model_name", "") or "")
             masked_url = str(getattr(island_engine, "masked_base_url", "") or model_path)
             if not backend_model:
@@ -1717,9 +1717,6 @@ class EngineHost:
         self._scheduler（None = 单机基线视为 master）。"""
         import config as _cfg
         from fastapi import HTTPException
-        """Run the fixed local task graph without claiming multi-device execution."""
-        global conversation_stats
-
         if not _cfg.TASK_GRAPH_ENABLED:
             raise HTTPException(
                 409,
@@ -1741,7 +1738,7 @@ class EngineHost:
             raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
         try:
             with self._host.full_chat_execution_lock:
-                return _execute_task_graph_chat_with_slot(req, cancel_event)
+                return self.execute_task_graph_chat_with_slot(req, cancel_event)
         finally:
             self._task_graph_execution_slot.release()
 
@@ -1759,8 +1756,17 @@ class EngineHost:
         record_task_complete → self._record_task_complete()。"""
         import config as _cfg
         import local_store as _local_store
+        from dataclasses import replace
         from fastapi import HTTPException
-        """Execute one workflow while the process-wide task-graph slot is held."""
+        from task_graph import (
+            StageSpec,
+            TaskGraphError,
+            TaskGraphUnavailable,
+            WorkflowCancelled,
+            WorkflowExecutionError,
+            dual_candidate_template,
+        )
+        from task_provider import ProviderError
 
         remote_stage_id = str(req.task_graph_remote_stage or "")
         remote_provider_id = str(req.task_graph_remote_provider_id or "")
@@ -1779,15 +1785,15 @@ class EngineHost:
             raise HTTPException(
                 409,
                 "PC Full Worker 实验调度未启用。请设置 "
-                "QLH__cfg.TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
+                "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
             )
 
         target_session_id = req.session_id or self._active_session_id
         if target_session_id and target_session_id != self._active_session_id:
-            _switch_session(target_session_id)
-        history = _get_active_history()
+            self._switch_session(target_session_id)
+        history = self._get_active_history()
         if target_session_id and len(history) == 0:
-            _auto_title_session(target_session_id, req.message)
+            self._auto_title_session(target_session_id, req.message)
 
         base_messages = list(history) + [{"role": "user", "content": req.message}]
         root_input = {

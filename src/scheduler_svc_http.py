@@ -59,6 +59,13 @@ def set_scheduler(scheduler) -> None:
         _scheduler_holder = scheduler
 
 
+def reset_scheduler() -> None:
+    """清空注入实例（测试隔离；多实例/并行测试互不串扰）。"""
+    global _scheduler_holder
+    with _scheduler_lock:
+        _scheduler_holder = None
+
+
 # ---- device 画像缓存（壳内惰性检测，与 api_server 的 device_profile 等价） ----
 _device_profile_cache: Optional[dict] = None
 
