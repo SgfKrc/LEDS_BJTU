@@ -544,17 +544,30 @@ class EngineHost:
         use_compile: bool = False,
         model_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # use_compile 走进程内 config 全局开关（对齐 api_server.py:2236
+        # cfg.USE_COMPILE = req.use_compile）；ModelManager.load_model 签名
+        # 无此参数（2026-08-05 真实加载复测暴露 TypeError）
+        import config as _cfg
+
+        _cfg.USE_COMPILE = bool(use_compile)
         result = self._host.load_model(
             engine=engine,
             quant_type=quant_type,
-            use_compile=use_compile,
             model_id=model_id,
+        )
+        # 对齐 api_server.py:2264-2265：load 成功后显式置位运行时状态
+        # （ModelHost.model_loaded 不自更新；2026-08-05 真实加载复测暴露
+        # /v1/status 恒 model_loaded:false）
+        self._host.model_loaded = True
+        self._host.current_quant = quant_type or getattr(
+            self._host, "current_quant", "int4"
         )
         return result if isinstance(result, dict) else {"success": True, "data": result}
 
     def unload_model(self) -> Dict[str, Any]:
         self._host.unload_model()
         self._layers.clear()
+        self._host.model_loaded = False
         return {"success": True, "message": "模型已卸载"}
 
     def switch_model(self, model_id: str, engine: Optional[str] = None) -> Dict[str, Any]:
