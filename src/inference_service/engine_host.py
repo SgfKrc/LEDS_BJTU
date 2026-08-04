@@ -562,20 +562,265 @@ class EngineHost:
         return result if isinstance(result, dict) else {"success": True, "data": result}
 
     def current_model(self) -> Dict[str, Any]:
-        """当前模型信息（/v1/models/current）。"""
+        """当前模型信息（/v1/models/current，对齐 api_server.py:2188-2207 完整字段）。"""
         loaded = bool(getattr(self._host, "model_loaded", False))
         mgr = self._host
         if not loaded:
-            return {"loaded": False}
+            return {"loaded": False, "quant_type": None, "model_id": None}
+        info: Dict[str, Any] = {}
+        mem: Dict[str, Any] = {}
         try:
-            model_id = mgr.active_model_id() if callable(getattr(mgr, "active_model_id", None)) else None
+            info = mgr.get_model_info()
         except Exception:
-            model_id = None
+            pass
+        try:
+            mem = mgr.get_memory_usage()
+        except Exception:
+            pass
         return {
             "loaded": True,
-            "engine": getattr(mgr, "_engine_type", None),
-            "model_id": model_id,
+            "model_id": getattr(mgr, "active_model_id", None),
             "quant_type": getattr(self._host, "current_quant", None),
+            "model_name": info.get("model_name", getattr(mgr, "active_model_id", "")),
+            "model_path": info.get("model_path", ""),
+            "engine": info.get("engine", ""),
+            "total_params": info.get("total_params", "N/A"),
+            "device": info.get("device", "N/A"),
+            "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
+            "gpu_reserved_gb": mem.get("gpu_reserved_gb", 0),
+        }
+
+    def list_models(self) -> Dict[str, Any]:
+        """模型注册表 + 文件状态（/v1/models，对齐 api_server.py:5088-5099）。
+
+        DB 注册的实验模型由 control-svc /models/registry 承载（阶段 3.2），
+        此处仅返回内置模型；active_model_id 取当前加载状态。
+        """
+        import model_config as mc
+
+        models = [self._model_api_payload(m) for m in mc.get_builtin_models()]
+        active = None
+        if bool(getattr(self._host, "model_loaded", False)):
+            try:
+                active = getattr(self._host, "active_model_id", None)
+            except Exception:
+                active = None
+        return {"models": models, "active_model_id": active}
+
+    def available_models(self) -> Dict[str, Any]:
+        """可选模型配置 + 可用引擎（/v1/models/available，对齐 api_server.py:4727-4879）。
+
+        torch 延迟 import（保持冷启动不加载 model_module 的优化，仅首次
+        调用本端点时支付 ~1.8s）。"""
+        import model_config as mc
+
+        model_payloads = [self._model_api_payload(m) for m in mc.get_builtin_models()]
+        engine_ids = {
+            engine
+            for payload in model_payloads
+            for engine in payload.get("supported_engines", [])
+        }
+        available_engines: List[Dict[str, Any]] = []
+
+        if "llama_cpp" in engine_ids:
+            available_engines.append({
+                "id": "llama_cpp",
+                "name": "llama.cpp + GGUF",
+                "description": "GGUF 量化模型，适合 CPU/集显或轻量试水",
+                "model_size_gb": None,
+                "requires_cuda": False,
+            })
+
+        has_cuda = False
+        pytorch_quants: List[Dict[str, Any]] = []
+        if "pytorch" in engine_ids:
+            try:
+                import torch  # 延迟：保持冷启动优化
+                has_cuda = torch.cuda.is_available()
+            except Exception:
+                has_cuda = False
+            available_engines.append({
+                "id": "pytorch",
+                "name": "PyTorch + Safetensors" + (" (CUDA)" if has_cuda else " (CPU)"),
+                "description": "Safetensors 格式，支持 INT4/INT8/FP16 量化" + ("，GPU 加速" if has_cuda else "，CPU 模式较慢"),
+                "model_size_gb": None,
+                "requires_cuda": has_cuda,
+            })
+            pytorch_quants = [
+                {
+                    "id": "int4",
+                    "name": "INT4 量化 ⭐",
+                    "description": "4-bit 量化，显存 ~1.8 GB，速度 ~29 tok/s（推荐边缘设备）",
+                    "memory_gb": 1.8,
+                    "speed_tok_s": 29,
+                    "compile_support": False,
+                    "engine": "pytorch",
+                    "is_available": True,
+                },
+                {
+                    "id": "int8",
+                    "name": "INT8 量化",
+                    "description": "8-bit 量化，显存 ~2.3 GB，速度 ~10 tok/s",
+                    "memory_gb": 2.3,
+                    "speed_tok_s": 10,
+                    "compile_support": False,
+                    "engine": "pytorch",
+                    "is_available": True,
+                },
+            ]
+            if has_cuda:
+                pytorch_quants.insert(0, {
+                    "id": "fp16",
+                    "name": "FP16 原版",
+                    "description": "原始精度，显存 ~3.5 GB，速度最快 (~53 tok/s)",
+                    "memory_gb": 3.5,
+                    "speed_tok_s": 53,
+                    "compile_support": True,
+                    "engine": "pytorch",
+                    "is_available": True,
+                })
+
+        gguf_quants: List[Dict[str, Any]] = []
+        if "llama_cpp" in engine_ids:
+            gguf_quants = [{
+                "id": "gguf",
+                "name": "GGUF 量化",
+                "description": "量化精度由 GGUF 文件决定（Q4_K_M / Q5_K_M 等），适合 CPU/集显",
+                "memory_gb": None,
+                "speed_tok_s": None,
+                "compile_support": False,
+                "engine": "llama_cpp",
+                "is_available": True,
+            }]
+
+        # ---- TP 孤岛引擎（配置启用即可选，延迟 import 保持冷启动优化） ----
+        island_quants: List[Dict[str, Any]] = []
+        try:
+            import config as _cfg
+            if getattr(_cfg, "ISLAND_ENABLED", False) and getattr(_cfg, "ISLAND_BASE_URL", ""):
+                from island_engine import mask_island_url
+                _island_url_masked = mask_island_url(getattr(_cfg, "ISLAND_BASE_URL", ""))
+                available_engines.append({
+                    "id": "island",
+                    "name": f"TP 孤岛 ({getattr(_cfg, 'ISLAND_BACKEND', 'openai-compatible')})",
+                    "description": f"整请求转发到孤岛端点 {_island_url_masked}，量化/并行由孤岛后端决定",
+                    "model_size_gb": None,
+                    "requires_cuda": False,
+                })
+                island_quants = [{
+                    "id": "island",
+                    "name": "孤岛后端",
+                    "description": f"由孤岛后端决定（{getattr(_cfg, 'ISLAND_BACKEND', '')}，TP={getattr(_cfg, 'ISLAND_TP_SIZE', 1)}）",
+                    "memory_gb": None,
+                    "speed_tok_s": None,
+                    "compile_support": False,
+                    "engine": "island",
+                    "is_available": True,
+                }]
+        except Exception:
+            pass
+
+        # ---- 外部推理服务（路线 B） ----
+        external_quants: List[Dict[str, Any]] = []
+        try:
+            import config as _cfg2
+            if getattr(_cfg2, "EXTERNAL_ENABLED", False) and getattr(_cfg2, "EXTERNAL_BASE_URL", ""):
+                from external_provider import mask_external_url
+                _external_url_masked = mask_external_url(getattr(_cfg2, "EXTERNAL_BASE_URL", ""))
+                _external_scope = getattr(_cfg2, "EXTERNAL_DATA_SCOPE", "opt_in")
+                available_engines.append({
+                    "id": "external_api",
+                    "name": f"外部推理服务 ({getattr(_cfg2, 'EXTERNAL_LABEL', '')})",
+                    "description": (
+                        f"整请求路由到外部端点 {_external_url_masked}"
+                        f"（数据作用域: {_external_scope}，按请求 allow_external 授权，"
+                        f"非本地引擎，无需加载）"
+                    ),
+                    "model_size_gb": None,
+                    "requires_cuda": False,
+                })
+                external_quants = [{
+                    "id": "external_api",
+                    "name": "外部服务后端",
+                    "description": (
+                        f"由外部端点决定（{getattr(_cfg2, 'EXTERNAL_LABEL', '')}，"
+                        f"作用域 {_external_scope}）"
+                    ),
+                    "memory_gb": None,
+                    "speed_tok_s": None,
+                    "compile_support": False,
+                    "engine": "external_api",
+                    "is_available": True,
+                }]
+        except Exception:
+            pass
+
+        loaded = bool(getattr(self._host, "model_loaded", False))
+        current = getattr(self._host, "current_quant", None) if loaded else None
+        current_engine = None
+        if loaded:
+            try:
+                mgr = self._host
+                if bool(getattr(mgr, "is_loaded", False)):
+                    current_engine = getattr(mgr, "_engine_type", None)
+            except Exception:
+                current_engine = None
+        return {
+            "models": pytorch_quants + gguf_quants + island_quants + external_quants,
+            "current": current,
+            "current_engine": current_engine,
+            "available_engines": available_engines,
+        }
+
+    def _model_api_payload(self, model) -> Dict[str, Any]:
+        """序列化模型配置 + 落盘可用性（对齐 api_server.py:4960-5010）。"""
+        import model_config as mc
+
+        file_status = mc.get_model_file_status(model)
+        supported_engines: List[str] = []
+        if file_status["has_gguf"]:
+            supported_engines.append("llama_cpp")
+        if file_status["has_safetensors"]:
+            supported_engines.append("pytorch")
+        is_available = bool(supported_engines)
+        unavailable_reason = file_status["unavailable_reason"]
+        if file_status["is_available"] and not supported_engines:
+            unavailable_reason = "模型文件已存在，但当前设备缺少可用推理后端。"
+        if "pytorch" in supported_engines:
+            preferred_engine = "pytorch"
+        elif "llama_cpp" in supported_engines:
+            preferred_engine = "llama_cpp"
+        else:
+            preferred_engine = "auto"
+        default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
+        return {
+            "model_id": model.model_id,
+            "name": model.name,
+            "is_builtin": mc.get_builtin_model(model.model_id) is not None,
+            "model_type": model.model_type,
+            "is_experimental": model.is_experimental,
+            "recommended_vram_gb": model.recommended_vram_gb,
+            "max_context": model.max_context,
+            "quant_types": model.quant_types,
+            "description": model.description,
+            "huggingface_id": model.huggingface_id,
+            "location": model.location,
+            "model_path": model.model_path,
+            "gguf_path": model.gguf_path,
+            "is_available": is_available,
+            "unavailable_reason": unavailable_reason,
+            "available_formats": file_status["available_formats"],
+            "has_safetensors": file_status["has_safetensors"],
+            "has_gguf": file_status["has_gguf"],
+            "expected_paths": file_status["expected_paths"],
+            "supported_engines": supported_engines,
+            "preferred_engine": preferred_engine,
+            "default_quant_type": default_quant,
+            "requires_cuda": bool(
+                model.is_experimental
+                and file_status["has_safetensors"]
+                and "pytorch" not in supported_engines
+            ),
         }
 
     # ------------------------------------------------------------------

@@ -80,7 +80,19 @@ class FakeEngineHost(EngineHost):
         return {"success": True, "model_id": model_id, "engine": engine}
 
     def current_model(self):
-        return {"loaded": True, "engine": "pytorch", "model_id": "qwen-1.8b"}
+        # 对齐真实 EngineHost.current_model 完整字段（10 字段 loaded 形状）
+        return {
+            "loaded": True,
+            "model_id": "qwen-1.8b",
+            "quant_type": "int4",
+            "model_name": "Qwen-1.8B-Chat",
+            "model_path": "models/qwen-1_8b-chat",
+            "engine": "pytorch",
+            "total_params": "N/A",
+            "device": "cpu",
+            "gpu_allocated_gb": 0,
+            "gpu_reserved_gb": 0,
+        }
 
     def chat_full(self, req, cancel_event=None):
         # 返回结构与真实 EngineHost.chat_full 一致（content 而非 response，
@@ -1906,3 +1918,73 @@ def test_sched_http_device_select_gpu_ok(sched_http_client, monkeypatch):
     assert body["selected_gpu"]["gpu_type"] == "discrete"
     assert body["device"] == "cuda:0"
     assert fake.selected == 0
+
+
+# ----------------------------------------------------------------------
+# 17.7 /v1/models 注册表 / available / current 完整契约（推理面缺口修复）
+# ----------------------------------------------------------------------
+
+def test_v1_models_registry_shape(live_inference_svc):
+    """GET /v1/models：内置模型 + 文件状态 payload + active_model_id。"""
+    import requests
+    r = requests.get(f"{live_inference_svc}/v1/models", timeout=15)
+    assert r.status_code == 200
+    body = r.json()
+    assert "models" in body and "active_model_id" in body
+    assert isinstance(body["models"], list) and len(body["models"]) >= 1
+    m = body["models"][0]
+    # payload 完整字段（对齐 api_server _model_api_payload）
+    for key in (
+        "model_id", "name", "is_builtin", "model_type", "is_experimental",
+        "recommended_vram_gb", "max_context", "quant_types", "description",
+        "huggingface_id", "location", "model_path", "gguf_path",
+        "is_available", "unavailable_reason", "available_formats",
+        "has_safetensors", "has_gguf", "expected_paths",
+        "supported_engines", "preferred_engine", "default_quant_type",
+        "requires_cuda",
+    ):
+        assert key in m, f"payload 缺字段 {key}"
+    # 至少一个内置模型 is_builtin
+    assert any(x["is_builtin"] for x in body["models"])
+
+
+def test_v1_models_available_shape(live_inference_svc):
+    """GET /v1/models/available：quant 选项 + available_engines。"""
+    import requests
+    r = requests.get(f"{live_inference_svc}/v1/models/available", timeout=30)
+    assert r.status_code == 200
+    body = r.json()
+    assert "models" in body and "available_engines" in body
+    assert "current" in body and "current_engine" in body
+    for quant in body["models"]:
+        for key in ("id", "name", "engine", "is_available", "memory_gb",
+                    "speed_tok_s", "compile_support", "description"):
+            assert key in quant, f"quant 缺字段 {key}"
+    for engine in body["available_engines"]:
+        for key in ("id", "name", "description", "model_size_gb", "requires_cuda"):
+            assert key in engine, f"engine 缺字段 {key}"
+
+
+def test_v1_models_current_loaded_shape(live_inference_svc):
+    """GET /v1/models/current 已加载：完整 10 字段（FakeEngineHost 对齐新契约）。"""
+    import requests
+    r = requests.get(f"{live_inference_svc}/v1/models/current", timeout=15)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["loaded"] is True
+    for key in (
+        "model_id", "quant_type", "model_name", "model_path", "engine",
+        "total_params", "device", "gpu_allocated_gb", "gpu_reserved_gb",
+    ):
+        assert key in body, f"current 缺字段 {key}"
+
+
+def test_v1_models_current_unloaded_shape_real_host():
+    """真实 EngineHost 未加载：{loaded:False, quant_type:None, model_id:None}
+    （不触发模型加载，EngineHost.__init__ 仅 import model_host）。"""
+    from inference_service.engine_host import EngineHost
+
+    host = EngineHost()
+    assert host.current_model() == {
+        "loaded": False, "quant_type": None, "model_id": None,
+    }

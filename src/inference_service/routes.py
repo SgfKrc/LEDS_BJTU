@@ -181,6 +181,19 @@ async def models_current(request: Request):
     return _engine_host(request).current_model()
 
 
+@router.get("/models")
+async def models_list(request: Request):
+    """模型注册表 + 文件状态（对齐 api_server /api/models；DB 实验模型
+    由 control-svc /models/registry 承载，此处仅内置模型）。"""
+    return _engine_host(request).list_models()
+
+
+@router.get("/models/available")
+async def models_available(request: Request):
+    """可选模型配置 + 可用引擎（对齐 api_server /api/models/available）。"""
+    return _engine_host(request).available_models()
+
+
 # ----------------------------------------------------------------------
 # 对话
 # ----------------------------------------------------------------------
