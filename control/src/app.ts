@@ -14,7 +14,9 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { JsonDetailFilter } from './common/json-detail.filter';
 import { RequestIdInterceptor } from './common/request-id';
 import { ConfigDao } from './data/config-dao';
+import { SessionStore } from './data/session-store';
 import { HealthController } from './modules/health/health.controller';
+import { SessionsController } from './modules/sessions/sessions.controller';
 import { SettingsController } from './modules/settings/settings.controller';
 
 @Controller()
@@ -26,8 +28,8 @@ export class CatchAllController {
 }
 
 @Module({
-  controllers: [HealthController, SettingsController, CatchAllController],
-  providers: [ConfigDao],
+  controllers: [HealthController, SettingsController, SessionsController, CatchAllController],
+  providers: [ConfigDao, SessionStore],
 })
 export class AppModule {}
 
