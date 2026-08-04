@@ -231,7 +231,7 @@ describe('control-svc sessions/conversations 域（阶段 3.2 首迁）', () => 
     expect(res.json().detail).toBe('会话不存在: nope');
   });
 
-  it('PUT /sessions/:id 空 title → 400（pydantic 1-256 校验对齐）', async () => {
+  it('PUT /sessions/:id 空 title → 422（pydantic 1-256 校验对齐）', async () => {
     app = await createTestApp();
     const created = await app.inject({ method: 'POST', url: '/sessions' });
     const id = created.json().id;
@@ -240,8 +240,20 @@ describe('control-svc sessions/conversations 域（阶段 3.2 首迁）', () => 
       url: `/sessions/${id}`,
       payload: { title: '' },
     });
-    expect(res.statusCode).toBe(400);
+    expect(res.statusCode).toBe(422);
     expect(typeof res.json().detail).toBe('string');
+  });
+
+  it('PUT /sessions/:id title 超 256 字符 → 422', async () => {
+    app = await createTestApp();
+    const created = await app.inject({ method: 'POST', url: '/sessions' });
+    const id = created.json().id;
+    const res = await app.inject({
+      method: 'PUT',
+      url: `/sessions/${id}`,
+      payload: { title: '长'.repeat(257) },
+    });
+    expect(res.statusCode).toBe(422);
   });
 
   // ---------- DELETE /sessions/:id ----------
@@ -432,6 +444,53 @@ describe('control-svc sessions/conversations 域（阶段 3.2 首迁）', () => 
     });
     expect(res.statusCode).toBe(404);
     expect(res.json().detail).toBe('会话不存在或无消息: nomsg');
+  });
+
+  it('DELETE turns 非整数索引 → 422（FastAPI 路径参数 int 校验对齐）', async () => {
+    app = await createTestApp();
+    const created = await app.inject({ method: 'POST', url: '/sessions' });
+    const id = created.json().id;
+    store.saveMessage(id, 'user', 'q1');
+    store.saveMessage(id, 'assistant', 'a1');
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/sessions/${id}/turns/abc`,
+    });
+    expect(res.statusCode).toBe(422);
+  });
+
+  // ---------- 路径穿越防护 ----------
+
+  it('session_id 穿越 → 400，目录外 .json 不受影响', async () => {
+    const outside = path.join(os.tmpdir(), `probe-${Date.now()}.json`);
+    fs.writeFileSync(outside, JSON.stringify([{ role: 'user', content: 'topsecret' }]), 'utf-8');
+    try {
+      app = await createTestApp();
+      const probe = `../${path.basename(outside, '.json')}`;
+      const encoded = encodeURIComponent(probe);
+      // 读：拒绝
+      const read = await app.inject({ method: 'GET', url: `/conversations?session_id=${encoded}` });
+      expect(read.statusCode).toBe(400);
+      expect(read.json().detail).toBe(`无效的会话 id: ${probe}`);
+      // 清空：拒绝，文件未被覆盖
+      const clear = await app.inject({ method: 'DELETE', url: `/conversations?session_id=${encoded}` });
+      expect(clear.statusCode).toBe(400);
+      expect(JSON.parse(fs.readFileSync(outside, 'utf-8'))[0].content).toBe('topsecret');
+      // 路径参数：拒绝，文件未被删除
+      const del = await app.inject({ method: 'DELETE', url: `/sessions/${encoded}` });
+      expect(del.statusCode).toBe(400);
+      expect(fs.existsSync(outside)).toBe(true);
+    } finally {
+      fs.rmSync(outside, { force: true });
+    }
+  });
+
+  it('合法会话 id 不受影响（default/短 id/uuid 均通过）', async () => {
+    app = await createTestApp();
+    const res = await app.inject({ method: 'GET', url: '/conversations?session_id=default' });
+    expect(res.statusCode).toBe(200);
+    const res2 = await app.inject({ method: 'GET', url: '/conversations?session_id=a1' });
+    expect(res2.statusCode).toBe(200);
   });
 
   // ---------- 旧数据兼容（硬验收） ----------

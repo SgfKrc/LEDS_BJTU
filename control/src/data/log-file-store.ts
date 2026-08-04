@@ -96,7 +96,7 @@ export class LogFileStore {
     return { files: files.map(({ _mtime, ...rest }) => rest) };
   }
 
-  /** 文件统计（对齐 get_log_stats 的文件部分：size 为原始 mtime 数值） */
+  /** 文件统计（对齐 get_log_stats 的文件部分：size 为文件字节数） */
   fileStats(): { files: { name: string; size: number }[]; totalBytes: number } {
     if (!this.isDir()) return { files: [], totalBytes: 0 };
     const files: { name: string; size: number }[] = [];
@@ -179,14 +179,16 @@ export class LogFileStore {
     return { deleted, failed };
   }
 
-  /** 打包全部 .log 为 ZIP（对齐 export_logs_zip；无文件返回 null） */
-  async exportZip(): Promise<Buffer | null> {
+  /**
+   * 打包全部 .log 为 ZIP（对齐 export_logs_zip）。
+   * 目录不存在 → null（404）；目录存在但无 .log → 空 ZIP（200，对齐 Python）。
+   */
+  async exportZip(): Promise<{ zip: Buffer; empty: boolean } | null> {
     if (!this.isDir()) return null;
     const logFiles = fs
       .readdirSync(this.logDir)
       .filter((f) => isLogFilename(f))
       .sort();
-    if (logFiles.length === 0) return null;
     const zip = new JSZip();
     let added = 0;
     for (const fname of logFiles) {
@@ -197,10 +199,10 @@ export class LogFileStore {
         console.warn(`[control-svc] 日志导出跳过 ${fname}: ${String(err)}`);
       }
     }
-    if (added === 0) return null;
-    return zip.generateAsync({
+    const buf = await zip.generateAsync({
       type: 'nodebuffer',
       compression: 'DEFLATE',
     });
+    return { zip: buf, empty: logFiles.length === 0 || added === 0 };
   }
 }

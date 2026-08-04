@@ -126,16 +126,17 @@ export class LogsController {
 
   @Get('logs/export')
   async exportZip(@Res() reply: FastifyReply): Promise<void> {
-    const zip = await this.store.exportZip();
-    if (!zip) {
-      throw new HttpException('没有可导出的日志文件', 404);
+    const result = await this.store.exportZip();
+    if (!result) {
+      // 对齐 Python：仅日志目录不存在时 404；存在但无 .log 返回空 ZIP 200
+      throw new HttpException('日志目录不存在', 404);
     }
     const timestamp = tsStamp();
     const filename = `qlh-logs-${nodeIdOf() || 'node'}-${timestamp}.zip`;
     reply
       .header('Content-Type', 'application/zip')
       .header('Content-Disposition', `attachment; filename="${filename}"`)
-      .send(zip);
+      .send(result.zip);
   }
 
   // ---------- 多节点（降级：本地直读，远程聚合未迁移） ----------

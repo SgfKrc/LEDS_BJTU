@@ -25,6 +25,15 @@ export interface SessionMeta {
   message_count: number;
 }
 
+/**
+ * 会话 id 白名单：uuid4、'default' 及字母数字 id（对齐日志域的 isLogFilename 模式）。
+ * 防御 path traversal——sessionId 来自 query/path 参数，可被远程控制；
+ * Python local_store.py 同样存在此缺陷，但 TS 侧新代码必须加固。
+ */
+export function isValidSessionId(id: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(id);
+}
+
 export interface ChatMessage {
   role: string;
   content: string;
@@ -65,6 +74,9 @@ export class SessionStore {
   }
 
   private messagesPath(sessionId: string): string {
+    if (!isValidSessionId(sessionId)) {
+      throw new Error(`非法会话 id: ${sessionId}`);
+    }
     return path.join(this.dir, `${sessionId}.json`);
   }
 

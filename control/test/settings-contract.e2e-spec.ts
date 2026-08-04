@@ -112,6 +112,19 @@ describe('control-svc settings 域（阶段 3.2 首迁）', () => {
     expect(res.json().status).toBe('skipped');
   });
 
+  it('GET /user/settings DB 可用但读失败 → {settings:{}, source:error}', async () => {
+    const fakeDao = {
+      dbEnabled: () => true,
+      getUserSettings: async () => {
+        throw new Error('boom');
+      },
+    } as unknown as ConfigDao;
+    app = await createAppWithDao(fakeDao);
+    const res = await app.inject({ method: 'GET', url: '/user/settings' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ settings: {}, source: 'error' });
+  });
+
   it('GET /health 探活', async () => {
     app = await createApp();
     const res = await app.inject({ method: 'GET', url: '/health' });

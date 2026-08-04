@@ -48,6 +48,11 @@ describe('control-svc logs 域（阶段 3.2）', () => {
   beforeEach(() => {
     tmpLogDir = fs.mkdtempSync(path.join(os.tmpdir(), 'control-logs-'));
     buffer = new LogBuffer();
+    // 隔离环境变量：避免开发机/CI 的 QLH_NODE_ID/QLH_DEVICE_IP/QLH_LOG_DIR
+    // 影响 node_id/device_ip/log_dir 断言
+    delete process.env.QLH_NODE_ID;
+    delete process.env.QLH_DEVICE_IP;
+    delete process.env.QLH_LOG_DIR;
   });
 
   afterEach(async () => {
@@ -76,7 +81,9 @@ describe('control-svc logs 域（阶段 3.2）', () => {
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);
     const { JsonDetailFilter } = require('../src/common/json-detail.filter');
+    const { RequestIdInterceptor } = require('../src/common/request-id');
     testApp.useGlobalFilters(new JsonDetailFilter());
+    testApp.useGlobalInterceptors(new RequestIdInterceptor()); // 对齐 createApp()：client-error 依赖 req.requestId
     await testApp.init();
     await testApp.getHttpAdapter().getInstance().ready();
     return testApp;
@@ -147,6 +154,17 @@ describe('control-svc logs 域（阶段 3.2）', () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it('本机 IP + 错误 token → 本机优先放行（对齐 Python 先查本机）', async () => {
+    process.env.QLH_LOG_ADMIN_TOKEN = 'secret-token';
+    app = await createTestApp();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/logs',
+      headers: { 'x-qlh-log-token': 'wrong' },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
   it('client-error 无鉴权：远程无 token → 200', async () => {
     delete process.env.QLH_LOG_ADMIN_TOKEN;
     app = await createTestApp();
@@ -157,6 +175,17 @@ describe('control-svc logs 域（阶段 3.2）', () => {
       payload: { message: '前端炸了' },
     });
     expect(res.statusCode).toBe(200);
+  });
+
+  it('QLH_NODE_ID 环境变量覆盖 node_id（stats + nodes-summary）', async () => {
+    process.env.QLH_NODE_ID = 'my-node';
+    app = await createTestApp();
+    const stats = await app.inject({ method: 'GET', url: '/logs/stats' });
+    expect(stats.json().node_id).toBe('my-node');
+    const summary = await app.inject({ method: 'GET', url: '/logs/nodes-summary' });
+    expect(summary.json().local.node_id).toBe('my-node');
+    const local = await app.inject({ method: 'GET', url: '/logs/node/my-node/recent' });
+    expect(local.json().source).toBe('local');
   });
 
   // ---------- GET /logs ----------
@@ -239,6 +268,16 @@ describe('control-svc logs 域（阶段 3.2）', () => {
     expect(byRid.json().logs[0].message).toBe('推理失败');
   });
 
+  it('GET /logs/recent node_id 精确过滤', async () => {
+    app = await createTestApp();
+    seedBuffer();
+    buffer.append({ level: 'INFO', levelno: 20, name: 'worker', message: 'worker 日志', node_id: 'worker-1' });
+    const res = await app.inject({ method: 'GET', url: '/logs/recent?node_id=worker-1' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().matched).toBe(1);
+    expect(res.json().logs[0].message).toBe('worker 日志');
+  });
+
   it('GET /logs/recent limit clamp 1-1000，非法值回退默认 200', async () => {
     app = await createTestApp();
     seedBuffer();
@@ -309,6 +348,29 @@ describe('control-svc logs 域（阶段 3.2）', () => {
     expect(missing.statusCode).toBe(404);
   });
 
+  it('GET /logs/{filename} 大文件 → 跳过不完整首行（对齐 Python f.readline()）', async () => {
+    app = await createTestApp();
+    const big = 'A'.repeat(1024 * 1024) + '\n' + 'B'.repeat(100); // 总长 > 1MB
+    writeLogFile('big.log', big);
+    const res = await app.inject({ method: 'GET', url: '/logs/big.log' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.truncated).toBe(true);
+    expect(body.content).toBe('B'.repeat(100)); // 半行 'A' 被跳过
+  });
+
+  it('LogBuffer 容量满时丢弃最旧条目', () => {
+    const b = new LogBuffer(3);
+    b.append({ level: 'INFO', levelno: 20, message: 'a' });
+    b.append({ level: 'INFO', levelno: 20, message: 'b' });
+    b.append({ level: 'INFO', levelno: 20, message: 'c' });
+    b.append({ level: 'INFO', levelno: 20, message: 'd' });
+    expect(b.size()).toBe(3);
+    expect(b.snapshot().entries[0].message).toBe('b');
+    expect(b.stats().buffer_total_seen).toBe(4);
+    expect(b.stats().buffer_dropped_estimate).toBe(1);
+  });
+
   it('GET /logs/{filename} 大文件 → 末 1MB + truncated 标记', async () => {
     app = await createTestApp();
     const big = 'x'.repeat(1024 * 1024 + 1000); // 1MB + 1000
@@ -362,10 +424,13 @@ describe('control-svc logs 域（阶段 3.2）', () => {
     expect(await zip.file('a.log')!.async('string')).toBe('content-a');
   });
 
-  it('GET /logs/export 无 .log 文件 → 404', async () => {
+  it('GET /logs/export 无 .log 文件 → 空 ZIP 200（对齐 Python）', async () => {
     app = await createTestApp();
     const res = await app.inject({ method: 'GET', url: '/logs/export' });
-    expect(res.statusCode).toBe(404);
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('application/zip');
+    const zip = await JSZip.loadAsync(res.rawPayload as Buffer);
+    expect(Object.keys(zip.files).filter((f) => !f.endsWith('/'))).toEqual([]);
   });
 
   // ---------- POST /logs/client-error ----------
@@ -389,11 +454,42 @@ describe('control-svc logs 域（阶段 3.2）', () => {
     expect(buffer.size()).toBe(before + 1);
   });
 
+  it('POST /logs/client-error 超长字段 → 截断 + [truncated] 后缀', async () => {
+    app = await createTestApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/logs/client-error',
+      payload: { message: 'e'.repeat(600) },
+    });
+    expect(res.statusCode).toBe(200);
+    const { entries } = buffer.snapshot();
+    const entry = entries[entries.length - 1];
+    expect(entry.message).toContain('message=');
+    // message 字段截 500 字符后仍有 request_id= 后缀，故用 toContain
+    expect(entry.message).toContain('...[truncated]');
+    // message= 字段截 500 字符：前缀 + 500 + 后缀，总长有界
+    expect(entry.message.length).toBeLessThan(600 + '...[truncated]'.length + 300);
+  });
+
   it('POST /logs/client-error 空 body 也接受（全部字段有默认值）', async () => {
     app = await createTestApp();
     const res = await app.inject({ method: 'POST', url: '/logs/client-error' });
     expect(res.statusCode).toBe(200);
     expect(res.json().logged).toBe(true);
+  });
+
+  it('POST /logs/client-error 写入 request_id（可被 recent?request_id 关联）', async () => {
+    app = await createTestApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/logs/client-error',
+      payload: { message: '带请求id的错误' },
+      headers: { 'x-request-id': 'client-err-1' },
+    });
+    expect(res.statusCode).toBe(200);
+    const recent = await app.inject({ method: 'GET', url: '/logs/recent?request_id=client-err-1' });
+    expect(recent.json().matched).toBe(1);
+    expect(recent.json().logs[0].message).toContain('request_id=client-err-1');
   });
 
   // ---------- 多节点（降级） ----------
