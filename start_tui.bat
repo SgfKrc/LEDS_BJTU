@@ -33,7 +33,9 @@ if %errorlevel%==0 (
     echo [1/3] 检测到后端已在端口 %BACKEND_PORT% 运行，跳过启动。
 ) else (
     echo [1/3] 后端未运行，正在新窗口启动 API 服务器（port %BACKEND_PORT%）...
-    start "QLH 后端 API" cmd /k "chcp 65001>nul && cd /d ""%~dp0"" && (if exist ".venv\Scripts\activate.bat" call ".venv\Scripts\activate.bat") && %PYTHON_CMD% -m uvicorn src.api_server:app --host 0.0.0.0 --port %BACKEND_PORT%"
+    rem 用 python src/api_server.py 启动（而非 -m uvicorn），使
+    rem POST /api/system/shutdown 能触发跨平台优雅退出（资源清理）。
+    start "QLH 后端 API" cmd /k "chcp 65001>nul && cd /d ""%~dp0"" && (if exist ".venv\Scripts\activate.bat" call ".venv\Scripts\activate.bat") && set QLH_BACKEND_PORT=%BACKEND_PORT% && %PYTHON_CMD% src\api_server.py"
 )
 
 rem ---- [2/3] 等待后端就绪（最多 120 秒）----

@@ -28,4 +28,18 @@ if [ ! -f "src/api_server.py" ]; then
     exit 1
 fi
 
+# ---- help: 仅打印命令集与参数帮助，不启动后端 ----
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    PY=""
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
+        PY=python3
+    elif command -v python >/dev/null 2>&1; then
+        PY=python
+    else
+        echo "[错误] 未找到可用的 python3 / python。"
+        exit 1
+    fi
+    exec "$PY" "$PROJECT_ROOT/src/tui_admin.py" --help
+fi
+
 exec bash start_tui.sh "$@"

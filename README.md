@@ -437,6 +437,22 @@ start_tui.bat                               # Windows（双击或命令行）
 python src/tui_admin.py --host 100.x.x.x    # 直接管理远程 Tailscale 主节点
 python src/tui_admin.py --plain             # 老终端/管道降级为纯文本编号菜单
 python src/tui_admin.py --host 100.x.x.x --log-token xxx   # 远程模式带日志 token
+bjtu --help                                 # 查看完整命令集与启动参数（不启动后端）
+```
+
+**TUI 命令集**（任意界面输入 `/` 开头命令后 Enter 执行，ESC 取消；`--plain` 模式同样可用）：模型/量化/引擎切换、GPU 选择、分布式开关、队列控制、日志、设置与优雅退出等常用操作无需进入菜单：
+
+```bash
+/help                     # 命令集帮助（TUI 内）
+/status  /models  /model  # 状态与模型信息
+/switch <模型ID> [--quant 精度] [--engine 引擎]   # 切换模型（失败自动回滚）
+/quant  <int4|int8|fp16|gguf>                    # 量化切换（重载当前模型）
+/engine <auto|llama_cpp|pytorch|island>          # 引擎切换（重载当前模型）
+/gpu <序号>  /device auto                        # GPU 选择 / 设备自动配置
+/dist on|off  /queue pause|resume|clear          # 分布式开关 / 队列控制
+/logs  /host <主机> [端口]  /interval <秒>        # 日志 / 设置
+/quit                     # 退出 TUI（后端保持运行）
+/shutdown                 # 优雅退出：后端清理资源后退出，TUI 随后退出
 ```
 
 完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（现行·Active，2026-08-03 复核 44/44 + 双角色走查 PASS）。
