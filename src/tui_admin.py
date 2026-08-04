@@ -1550,9 +1550,12 @@ def cmd_screen(app, args, opts):
 
 
 def cmd_refresh(app, args, opts):
-    if app.current is not None:
-        app.current.refresh(force=True)
-        return ("已刷新: %s" % app.current.name, "ok")
+    # plain 模式无 current 属性（仅 InteractiveApp 维护）；getattr 兜底
+    # （2026-08-05 复核：plain 模式下 /refresh 此前 AttributeError 崩溃）
+    cur = getattr(app, "current", None)
+    if cur is not None:
+        cur.refresh(force=True)
+        return ("已刷新: %s" % cur.name, "ok")
     return ("当前不在任何屏幕中", "warn")
 
 

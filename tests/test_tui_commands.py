@@ -50,7 +50,22 @@ class FakeApi:
                     "q0_depth": 0, "q1_depth": 0, "q2_depth": 0}
         if path == "/device/profile":
             return {"gpus": [{"name": "RTX 4060"}, {"name": "Tesla T4"}],
-                    "selected_gpu_index": 0, "tier_label": "laptop"}
+                    "selected_gpu_index": 0, "tier_label": "laptop",
+                    "tier": "laptop", "score_total": 58.8,
+                    "recommendations": [{"description": "推荐 INT4 量化"}],
+                    "warnings": []}
+        if path == "/presets":
+            return {"presets": [
+                {"id": "intro", "icon": "👋", "label": "自我介绍",
+                 "question": "你好？", "estimated_prompt_tokens": 10,
+                 "estimated_response_tokens": 20, "estimated_memory_mb": 1.0,
+                 "estimated_seconds": 1.0},
+                {"id": "code", "icon": "💻", "label": "代码助手",
+                 "question": "写个函数", "estimated_prompt_tokens": 5,
+                 "estimated_response_tokens": 30, "estimated_memory_mb": 2.0,
+                 "estimated_seconds": 2.0},
+            ], "current_quant": "int4",
+               "current_speed_tok_s": 29, "max_new_tokens": 512}
         if path == "/cluster/nodes":
             return {"count": 1, "online_count": 1,
                     "nodes": [{"node_id": "n1"}]}
@@ -279,3 +294,144 @@ class TestScreenAndMisc:
         msg, style = app.exec_command("/chat clear")
         assert style == "ok"
         assert ("POST", "/chat/clear", None) in app.api.calls
+
+
+class TestStatusRefreshScreen:
+    """/status、/refresh、/screen 无参数分支"""
+
+    def test_status_opens_screen1(self, app):
+        msg, style = app.exec_command("/status")
+        assert style == "ok"
+        assert "系统状态总览" in msg
+
+    def test_status_alias_st(self, app):
+        msg, style = app.exec_command("/st")
+        assert style == "ok"
+        assert "系统状态总览" in msg
+
+    def test_refresh_no_current_screen_warn(self, app):
+        # plain 模式 open_screen 不设置 current → 恒 warn 分支
+        msg, style = app.exec_command("/refresh")
+        assert style == "warn"
+        assert "不在任何屏幕" in msg
+
+    def test_screen_no_args_usage_warn(self, app):
+        # /screen 注册了 min_args=1：无参数走参数校验分支（cmd_screen 内部
+        # 的无参数列表分支为不可达代码，行为以 min_args 为准）
+        msg, style = app.exec_command("/screen")
+        assert style == "warn"
+        assert "参数不足" in msg
+
+
+class TestModelInfoCommands:
+    """/model、/models、/presets 只读信息命令"""
+
+    def test_model_loaded_details(self, app):
+        msg, style = app.exec_command("/model")
+        assert style == "ok"
+        assert "Qwen" in msg
+        assert "int4" in "\n".join(app.out)
+
+    def test_model_not_loaded_warn(self, app):
+        class NoModelApi(FakeApi):
+            def get(self, path, params=None, with_log_token=False):
+                if path == "/models/current":
+                    return {"loaded": False}
+                return super().get(path)
+        msg, style = FakeApp(NoModelApi()).exec_command("/model")
+        assert style == "warn"
+        assert "未加载" in msg
+
+    def test_models_list(self, app):
+        msg, style = app.exec_command("/models")
+        assert style == "ok"
+        assert "共 1 个模型配置" in msg
+        assert "qwen-1.8b" in "\n".join(app.out)
+        assert "INT4" in "\n".join(app.out)  # /models/available 选项
+
+    def test_presets(self, app):
+        msg, style = app.exec_command("/presets")
+        assert style == "ok"
+        assert "共 2 个预设" in msg
+        out = "\n".join(app.out)
+        assert "自我介绍" in out and "预估" in out
+
+
+class TestDeviceAndNodesCommands:
+    """/device（auto/profile/非法）、/nodes"""
+
+    def test_device_auto(self, app):
+        msg, style = app.exec_command("/device auto")
+        assert style == "ok"
+        assert "自动配置完成" in msg
+
+    def test_device_profile(self, app):
+        msg, style = app.exec_command("/device profile")
+        assert style == "ok"
+        assert "laptop" in msg
+        assert "58.8" in "\n".join(app.out)  # score_total
+        assert "推荐 INT4" in "\n".join(app.out)  # recommendations
+
+    def test_device_invalid_subcommand(self, app):
+        msg, style = app.exec_command("/device bogus")
+        assert style == "err"
+        assert "用法" in msg
+
+    def test_nodes(self, app):
+        msg, style = app.exec_command("/nodes")
+        assert style == "ok"
+        assert "节点 1 个" in msg
+        assert "n1" in "\n".join(app.out)
+
+    def test_nodes_shows_role(self, app):
+        msg, style = app.exec_command("/nodes")
+        assert "从节点" in "\n".join(app.out)  # FakeApi /cluster/my-role → client
+
+
+class TestLogCommands:
+    """/logs（行数校验）、/log（filter/token/用法）"""
+
+    def test_logs_default(self, app):
+        msg, style = app.exec_command("/logs")
+        assert style == "ok"
+        assert "日志查看" in msg
+
+    def test_logs_lines(self, app):
+        msg, style = app.exec_command("/logs 50")
+        assert style == "ok"
+
+    def test_logs_invalid_lines(self, app):
+        msg, style = app.exec_command("/logs abc")
+        assert style == "err"
+        assert "行数无效" in msg
+
+    def test_log_filter(self, app):
+        msg, style = app.exec_command("/log filter ERROR")
+        assert style == "ok"
+        assert "ERROR" in msg
+
+    def test_log_filter_all(self, app):
+        msg, style = app.exec_command("/log filter")
+        assert style == "ok"
+        assert "全部" in msg
+
+    def test_log_filter_invalid_level(self, app):
+        msg, style = app.exec_command("/log filter TRACE")
+        assert style == "err"
+        assert "级别无效" in msg
+
+    def test_log_token(self, app):
+        msg, style = app.exec_command("/log token secret")
+        assert style == "ok"
+        assert app.api.log_token == "secret"
+
+    def test_log_token_clear(self, app):
+        app.api.log_token = "old"
+        msg, style = app.exec_command("/log token")
+        assert style == "ok"
+        assert app.api.log_token == ""
+
+    def test_log_usage(self, app):
+        msg, style = app.exec_command("/log bogus")
+        assert style == "err"
+        assert "用法" in msg
