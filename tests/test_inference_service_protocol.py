@@ -1728,3 +1728,181 @@ def test_sched_http_queue_task_cancel_404_semantics(sched_http_client):
     body = r.json()
     assert body.get("success") is False
     assert "message" in body
+
+
+# ----------------------------------------------------------------------
+# 17.6 scheduler-svc device 域（画像 profile / auto-configure / select-gpu）
+# ----------------------------------------------------------------------
+
+FAKE_DEVICE_PROFILE = {
+    "tier": "laptop",
+    "tier_label": "笔记本",
+    "tier_icon": "💻",
+    "score_total": 85.5,
+    "score_breakdown": {"gpu": 50.0, "ram": 24.0, "cpu": 11.5},
+    "cpu": {
+        "model_name": "Intel(R) Core(TM) i5-12400F",
+        "physical_cores": 6,
+        "logical_cores": 12,
+        "freq_mhz": 2496.0,
+        "freq_max_mhz": 4400.0,
+        "architecture": "x86_64",
+        "usage_percent": 3.2,
+    },
+    "ram": {"total_gb": 16.0, "available_gb": 8.5, "used_gb": 7.5, "percent_used": 46.9},
+    "gpu": None,
+    "gpus": [{
+        "name": "NVIDIA GeForce RTX 3060",
+        "vram_total_gb": 12.0,
+        "vram_free_gb": 10.0,
+        "cuda_available": True,
+        "compute_capability": "8.6",
+        "is_integrated": False,
+        "gpu_type": "discrete",
+        "driver_version": "566.36",
+        "mps_available": False,
+        "index": 0,
+    }],
+    "selected_gpu_index": 0,
+    "disk": {"free_gb": 100.0, "total_gb": 512.0},
+    "platform": {
+        "os": "Windows",
+        "os_version": "10.0.22631",
+        "architecture": "AMD64",
+        "machine": "AMD64",
+        "hostname": "test-pc",
+        "python_version": "3.12.10",
+    },
+    "recommendations": ["推荐使用 INT4 量化档位"],
+    "warnings": [],
+    "android_ready": False,
+    "island": False,
+}
+
+
+def test_sched_http_device_profile(sched_http_client, monkeypatch):
+    """GET /device/profile：真实 to_dict 字段 + TUI 兼容别名字段。"""
+    import scheduler_svc_http as http_mod
+
+    client, _ = sched_http_client
+    monkeypatch.setattr(http_mod, "_device_profile_cache", FAKE_DEVICE_PROFILE)
+    r = client.get("/device/profile")
+    assert r.status_code == 200
+    body = r.json()
+    # 真实字段（device_profiler.to_dict 形状）
+    assert body["tier"] == "laptop"
+    assert body["score_total"] == 85.5
+    assert body["platform"]["hostname"] == "test-pc"
+    assert body["cpu"]["model_name"] == "Intel(R) Core(TM) i5-12400F"
+    assert body["gpus"][0]["gpu_type"] == "discrete"
+    # 兼容字段（TUI tui_admin.py:1141-1151 消费）
+    assert body["hostname"] == "test-pc"
+    assert body["os"] == {"system": "Windows", "release": "10.0.22631"}
+    assert body["cpu"]["model"] == "Intel(R) Core(TM) i5-12400F"
+    assert body["cpu"]["brand"] == "Intel(R) Core(TM) i5-12400F"
+    assert body["memory"]["total_gb"] == 16.0
+
+
+def test_sched_http_device_profile_detect_failure(sched_http_client, monkeypatch):
+    """GET /device/profile：检测失败 → 500。"""
+    import scheduler_svc_http as http_mod
+
+    client, _ = sched_http_client
+    monkeypatch.setattr(http_mod, "_device_profile_cache", None)
+
+    def _boom():
+        raise RuntimeError("detect failed")
+
+    monkeypatch.setattr(http_mod, "_detect_device_profile", _boom)
+    r = client.get("/device/profile")
+    assert r.status_code == 500
+    assert "设备检测失败" in r.json()["detail"]
+
+
+def test_sched_http_device_auto_configure(sched_http_client, monkeypatch):
+    """POST /device/auto-configure：应用推荐配置。"""
+    import scheduler_svc_http as http_mod
+
+    client, _ = sched_http_client
+    monkeypatch.setattr(http_mod, "_device_profile_cache", FAKE_DEVICE_PROFILE)
+
+    class FakeProfiler:
+        def recommend_config(self):
+            return {
+                "quant_type": "int4",
+                "page_size": 128,
+                "max_pages": 256,
+                "max_seq_len": 2048,
+                "max_new_tokens": 512,
+                "use_compile": False,
+                "device": "cuda:0",
+                "description": "笔记本档：INT4 量化 + 中等上下文",
+            }
+
+    monkeypatch.setattr("device_profiler.get_profile", lambda: FakeProfiler())
+    r = client.post("/device/auto-configure")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "configured"
+    assert body["tier"] == "laptop"
+    assert body["score"] == 85.5
+    assert body["applied_config"]["page_size"] == 128
+    assert body["recommendations"] == ["推荐使用 INT4 量化档位"]
+    assert body["warnings"] == []
+
+
+def test_sched_http_device_select_gpu_not_ready(sched_http_client, monkeypatch):
+    """POST /device/select-gpu：画像未就绪 → 400。"""
+    import scheduler_svc_http as http_mod
+
+    client, _ = sched_http_client
+    monkeypatch.setattr(http_mod, "_device_profile_cache", None)
+    r = client.post("/device/select-gpu", json={"gpu_index": 0})
+    assert r.status_code == 400
+    assert "未就绪" in r.json()["detail"]
+
+
+def test_sched_http_device_select_gpu_out_of_range(sched_http_client, monkeypatch):
+    """POST /device/select-gpu：序号越界 → 400。"""
+    import scheduler_svc_http as http_mod
+
+    client, _ = sched_http_client
+    monkeypatch.setattr(http_mod, "_device_profile_cache", FAKE_DEVICE_PROFILE)
+    r = client.post("/device/select-gpu", json={"gpu_index": 5})
+    assert r.status_code == 400
+    assert "无效的 GPU 序号" in r.json()["detail"]
+    assert "0-0" in r.json()["detail"]
+
+
+def test_sched_http_device_select_gpu_ok(sched_http_client, monkeypatch):
+    """POST /device/select-gpu：正常切换 → 200 switched。"""
+    import scheduler_svc_http as http_mod
+
+    client, _ = sched_http_client
+    monkeypatch.setattr(http_mod, "_device_profile_cache", FAKE_DEVICE_PROFILE)
+
+    class FakeProfiler:
+        def __init__(self):
+            self.selected = None
+
+        def select_gpu(self, index):
+            self.selected = index
+            return True
+
+        def to_dict(self):
+            return FAKE_DEVICE_PROFILE
+
+        def recommend_config(self):
+            return {"device": "cuda:0", "description": "x"}
+
+    fake = FakeProfiler()
+    monkeypatch.setattr("device_profiler.get_profile", lambda: fake)
+    r = client.post("/device/select-gpu", json={"gpu_index": 0})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "switched"
+    assert body["selected_gpu_index"] == 0
+    assert body["selected_gpu"]["name"] == "NVIDIA GeForce RTX 3060"
+    assert body["selected_gpu"]["gpu_type"] == "discrete"
+    assert body["device"] == "cuda:0"
+    assert fake.selected == 0

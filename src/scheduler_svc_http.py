@@ -77,6 +77,40 @@ def _detect_device_profile() -> dict:
     return profiler.to_dict()
 
 
+def _with_compat_device_fields(profile: dict) -> dict:
+    """补 TUI/前端兼容别名字段（不改 device_profiler 本体，api_server 路径不受影响）。
+
+    消费方按以下形状读取（tui_admin.py:1141-1151、tui-contract 用例 33）：
+      - 顶层 hostname            ← platform.hostname
+      - os.system / os.release   ← platform.os / platform.os_version
+      - cpu.model / cpu.brand    ← cpu.model_name
+      - memory                   ← ram（同值别名）
+    真实 to_dict() 中这些值在 platform/cpu 内层，字段名也不同；此处做
+    只增不改的兼容包装，保持 device_profiler 共享库冻结不动。
+    """
+    result = dict(profile)
+    platform = profile.get("platform") or {}
+    if "hostname" not in result:
+        result["hostname"] = platform.get("hostname", "")
+    if "os" not in result:
+        result["os"] = {
+            "system": platform.get("os", ""),
+            "release": platform.get("os_version", ""),
+        }
+    cpu = profile.get("cpu")
+    if isinstance(cpu, dict):
+        cpu_compat = dict(cpu)
+        if "model" not in cpu_compat and "model_name" in cpu_compat:
+            cpu_compat["model"] = cpu_compat["model_name"]
+        if "brand" not in cpu_compat and "model_name" in cpu_compat:
+            cpu_compat["brand"] = cpu_compat["model_name"]
+        result["cpu"] = cpu_compat
+    ram = profile.get("ram")
+    if "memory" not in result and isinstance(ram, dict):
+        result["memory"] = ram
+    return result
+
+
 # =====================================================================
 # cluster 域（复制自 api_server.py:5169-5928 薄壳端点，scheduler → 注入）
 # =====================================================================
@@ -775,7 +809,7 @@ async def get_device_profile():
                 pass
         except Exception as exc:
             raise HTTPException(500, f"设备检测失败: {exc}")
-    return _device_profile_cache
+    return _with_compat_device_fields(_device_profile_cache)
 
 
 @router.post("/device/auto-configure")

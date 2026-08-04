@@ -362,9 +362,19 @@ describe('TUI 契约（阶段 2 网关）', () => {
     it('用例 33: GET /api/device/profile 画像字段（T4）', async () => {
       const res = await request(server()).get('/api/device/profile');
       expect(res.status).toBe(200);
+      // 兼容字段（TUI 消费 + 顶层断言）
       expect(res.body).toHaveProperty('hostname');
       expect(res.body).toHaveProperty('tier');
       expect(res.body).toHaveProperty('score_total');
+      expect(res.body.os).toHaveProperty('system');
+      expect(res.body.cpu).toHaveProperty('model');
+      expect(res.body.memory).toHaveProperty('total_gb');
+      // 真实 device_profiler.to_dict() 字段（tier 字符串、platform 内层、gpu_type）
+      expect(typeof res.body.tier).toBe('string');
+      expect(res.body.platform).toHaveProperty('hostname');
+      expect(res.body.platform).toHaveProperty('os');
+      expect(res.body.cpu).toHaveProperty('model_name');
+      expect(res.body.gpus[0].gpu_type).toBe('discrete');
     });
 
     it('用例 34: POST /api/device/select-gpu（T4）', async () => {
