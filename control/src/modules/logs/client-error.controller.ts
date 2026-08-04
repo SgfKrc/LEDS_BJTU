@@ -5,7 +5,7 @@
  * 字段截断语义对齐 _truncate_log_field：超限时截断 + "...[truncated]"。
  */
 import { Body, Controller, HttpCode, Post, Req } from '@nestjs/common';
-import type { FastifyRequest } from 'fastify';
+import { RequestWithRequestId } from '../../common/request-id';
 import { LogBuffer } from '../../data/log-buffer';
 import { deviceIpOf, nodeIdOf } from '../../data/log-file-store';
 
@@ -33,10 +33,13 @@ export class ClientErrorController {
   @HttpCode(200)
   reportClientError(
     @Body() report: ClientErrorReport | undefined,
-    @Req() req: FastifyRequest,
+    @Req() req: RequestWithRequestId,
   ): Record<string, unknown> {
     const r: ClientErrorReport = report && typeof report === 'object' ? report : {};
     const clientHost = req.ip || 'unknown';
+    // RequestIdInterceptor 已在控制器执行前写入 req.requestId（对齐 Python
+    // api_server.py:7247 的 request_id=%s 输出）
+    const requestId = req.requestId || '';
     const message =
       'event=client_error' +
       ` source=${truncateField(r.source, 80)}` +
@@ -47,7 +50,8 @@ export class ClientErrorController {
       ` client=${clientHost}` +
       ` ua=${truncateField(r.user_agent || '-', 200)}` +
       ` stack=${truncateField(r.stack, 2000)}` +
-      ` extra=${truncateField(JSON.stringify(r.extra ?? {}), 500)}`;
+      ` extra=${truncateField(JSON.stringify(r.extra ?? {}), 500)}` +
+      ` request_id=${requestId}`;
     console.error(`[client-error] ${message}`);
     this.buffer.append({
       level: 'ERROR',
@@ -57,7 +61,7 @@ export class ClientErrorController {
       filename: '',
       lineno: 0,
       funcName: 'report_client_error',
-      request_id: '',
+      request_id: requestId,
       node_id: nodeIdOf(),
       device_ip: deviceIpOf(),
       thread: '',

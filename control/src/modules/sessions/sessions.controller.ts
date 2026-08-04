@@ -23,7 +23,7 @@ import {
   Query,
 } from '@nestjs/common';
 import { ConfigDao } from '../../data/config-dao';
-import { ChatMessage, SessionMeta, SessionStore } from '../../data/session-store';
+import { ChatMessage, isValidSessionId, SessionMeta, SessionStore } from '../../data/session-store';
 
 interface CreateSessionRequest {
   title?: string;
@@ -62,6 +62,7 @@ export class SessionsController {
     @Query('session_id') sessionId = 'default',
     @Query('limit') limitRaw?: string,
   ): Record<string, unknown> {
+    this.validateSessionId(sessionId);
     const limit = this.parseLimit(limitRaw);
     const messages = this.store.loadMessages(sessionId, limit);
     return {
@@ -74,6 +75,7 @@ export class SessionsController {
   @Delete('conversations')
   @HttpCode(200)
   clearConversations(@Query('session_id') sessionId = 'default'): Record<string, unknown> {
+    this.validateSessionId(sessionId);
     // 对齐 api_server.py:6331-6334：default 时解析为活跃会话
     const resolved =
       sessionId === 'default' && this.store.activeSessionId
@@ -134,6 +136,7 @@ export class SessionsController {
 
   @Get('sessions/:id')
   getSession(@Param('id') sessionId: string): Record<string, unknown> {
+    this.validateSessionId(sessionId);
     const meta = this.store.getSession(sessionId);
     if (meta) {
       // 对齐 api_server.py:6498-6500：用实际消息数优先（本地文件真实条数）
@@ -161,10 +164,12 @@ export class SessionsController {
     @Param('id') sessionId: string,
     @Body() body: RenameSessionRequest,
   ): SessionMeta {
+    this.validateSessionId(sessionId);
     const title = body?.title;
     if (typeof title !== 'string' || title.length < 1 || title.length > 256) {
       // 对齐 pydantic RenameSessionRequest(min_length=1, max_length=256) 校验失败
-      throw new HttpException('title 必须为 1-256 字符的字符串', 400);
+      // （FastAPI 对 body 校验失败返回 422）
+      throw new HttpException('title 必须为 1-256 字符的字符串', 422);
     }
     const updated = this.store.renameSession(sessionId, title);
     if (!updated) {
@@ -176,6 +181,7 @@ export class SessionsController {
   @Delete('sessions/:id')
   @HttpCode(200)
   deleteSession(@Param('id') sessionId: string): Record<string, unknown> {
+    this.validateSessionId(sessionId);
     this.store.deleteSession(sessionId);
     if (this.store.activeSessionId === sessionId) {
       this.store.activeSessionId = null;
@@ -186,6 +192,7 @@ export class SessionsController {
   @Post('sessions/:id/activate')
   @HttpCode(200)
   activateSession(@Param('id') sessionId: string): Record<string, unknown> {
+    this.validateSessionId(sessionId);
     // 对齐 api_server.py:6578-6589：切换活跃会话并返回消息历史
     this.store.activeSessionId = sessionId;
     const history = this.store.loadMessages(sessionId, 0);
@@ -202,13 +209,19 @@ export class SessionsController {
     @Param('id') sessionId: string,
     @Param('turnIndex') turnIndexRaw: string,
   ): Record<string, unknown> {
+    this.validateSessionId(sessionId);
     const turnIndex = Number(turnIndexRaw);
     const messages = this.store.loadMessages(sessionId, 0);
     if (!messages.length) {
       throw new HttpException(`会话不存在或无消息: ${sessionId}`, 404);
     }
     const maxTurn = Math.floor(messages.length / 2) - 1;
-    if (!Number.isInteger(turnIndex) || turnIndex < 0 || turnIndex > maxTurn) {
+    if (!Number.isInteger(turnIndex)) {
+      // 对齐 FastAPI 路径参数 int 校验失败 422
+      throw new HttpException(`无效的轮次索引: ${turnIndexRaw}`, 422);
+    }
+    if (turnIndex < 0 || turnIndex > maxTurn) {
+      // 范围越界对齐 api_server.py:6626 的 400
       throw new HttpException(
         `无效的轮次索引: ${turnIndex}（有效范围: 0-${maxTurn}）`,
         400,
@@ -227,6 +240,12 @@ export class SessionsController {
   }
 
   // ---------- 工具 ----------
+
+  private validateSessionId(sessionId: string): void {
+    if (!isValidSessionId(sessionId)) {
+      throw new HttpException(`无效的会话 id: ${sessionId}`, 400);
+    }
+  }
 
   private parseLimit(raw?: string): number {
     const limit = this.parseInt(raw, 200);
