@@ -71,24 +71,54 @@ const routes: Array<{ method: string; match: RegExp; handler: Handler }> = [
   // 对齐 api_server.py:5715-5732：不存在任务返回 200 + success:false（非 404）；特判 cancel-ok 模拟成功取消
   { method: 'DELETE', match: /^\/cluster\/queue\/task\/cancel-ok$/, handler: () => json(200, { success: true, task_id: 'cancel-ok', message: '任务已取消' }) },
   { method: 'DELETE', match: /^\/cluster\/queue\/task\/[^/]+$/, handler: () => json(200, { success: false, task_id: 'nonexistent-task', message: '任务不存在或已经完成，无法取消' }) },
-  // ---- device 域（TUI §2.2 #33-35；画像采集留 Python，字段对齐旧网关） ----
+  // ---- device 域（TUI §2.2 #33-35；画像采集留 Python，字段 = 真实
+  // device_profiler.to_dict() + scheduler_svc_http._with_compat_device_fields 兼容字段） ----
   { method: 'GET', match: /^\/device\/profile$/, handler: () => json(200, {
-    os: { system: 'Windows', release: '10.0.22631' },
-    hostname: 'test-pc',
-    cpu: { model: 'Intel(R) Core(TM) i5-12400F', brand: 'Intel', physical_cores: 6, logical_cores: 12 },
-    ram: { total_gb: 16.0, available_gb: 8.5 },
-    memory: { total_gb: 16.0, available_gb: 8.5 },
-    disk: { free_gb: 100.0, total_gb: 512.0 },
-    gpus: [{ name: 'NVIDIA GeForce RTX 3060', gpu_type: 'nvidia', cuda_available: true, vram_total_gb: 12.0 }],
-    selected_gpu_index: 0,
-    tier_label: 'laptop',
-    tier: 2,
+    tier: 'laptop',
+    tier_label: '笔记本',
+    tier_icon: '💻',
     score_total: 85.5,
+    score_breakdown: { gpu: 50.0, ram: 24.0, cpu: 11.5 },
+    cpu: {
+      model_name: 'Intel(R) Core(TM) i5-12400F',
+      model: 'Intel(R) Core(TM) i5-12400F', // 兼容别名（TUI 读取）
+      brand: 'Intel(R) Core(TM) i5-12400F', // 兼容别名
+      physical_cores: 6,
+      logical_cores: 12,
+    },
+    ram: { total_gb: 16.0, available_gb: 8.5, used_gb: 7.5, percent_used: 46.9 },
+    memory: { total_gb: 16.0, available_gb: 8.5, used_gb: 7.5, percent_used: 46.9 }, // 兼容别名
+    disk: { free_gb: 100.0, total_gb: 512.0 },
+    gpus: [{
+      name: 'NVIDIA GeForce RTX 3060',
+      gpu_type: 'discrete',
+      cuda_available: true,
+      vram_total_gb: 12.0,
+      vram_free_gb: 10.0,
+      compute_capability: '8.6',
+      is_integrated: false,
+      driver_version: '566.36',
+      mps_available: false,
+      index: 0,
+    }],
+    selected_gpu_index: 0,
+    platform: {
+      os: 'Windows',
+      os_version: '10.0.22631',
+      architecture: 'AMD64',
+      machine: 'AMD64',
+      hostname: 'test-pc',
+      python_version: '3.12.10',
+    },
+    hostname: 'test-pc', // 兼容别名（tui-contract 用例 33 顶层断言）
+    os: { system: 'Windows', release: '10.0.22631' }, // 兼容别名（TUI 读取）
     recommendations: ['推荐使用 INT4 量化档位'],
     warnings: [],
+    android_ready: false,
+    island: false,
   }) },
-  { method: 'POST', match: /^\/device\/select-gpu$/, handler: () => json(200, { selected_gpu: { name: 'NVIDIA GeForce RTX 3060' }, selected_gpu_index: 0, warning: '' }) },
-  { method: 'POST', match: /^\/device\/auto-configure$/, handler: () => json(200, { applied_config: { description: 'laptop 档配置已应用' }, tier: 2, score: 85.5 }) },
+  { method: 'POST', match: /^\/device\/select-gpu$/, handler: () => json(200, { selected_gpu: { name: 'NVIDIA GeForce RTX 3060', gpu_type: 'discrete', cuda_available: true, vram_total_gb: 12.0 }, selected_gpu_index: 0, device: 'cuda:0', warning: '切换 GPU 后需要重新加载模型才能生效。', status: 'switched' }) },
+  { method: 'POST', match: /^\/device\/auto-configure$/, handler: () => json(200, { applied_config: { description: '笔记本档：INT4 量化 + 中等上下文', page_size: 128, max_pages: 256, max_seq_len: 2048 }, tier: 'laptop', score: 85.5, status: 'configured', recommendations: ['推荐使用 INT4 量化档位'], warnings: [] }) },
 ];
 
 export async function startFakeScheduler(): Promise<FakeScheduler> {
