@@ -47,6 +47,14 @@ export abstract class ForwardClient {
       );
     }
 
+    // 二进制透传：2xx 且非 JSON（logs/export、logs/download、models/download 等
+    // 文件流端点）→ 返回 Buffer，由 Fastify 直接作为响应体发送，避免被
+    // JSON 包装成 {detail: ...} 破坏文件内容（2026-08-05 contract_diff 复测暴露）
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && !contentType.includes('application/json')) {
+      return Buffer.from(await res.arrayBuffer());
+    }
+
     const text = await res.text();
     let data: unknown = {};
     if (text) {
