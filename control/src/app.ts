@@ -16,11 +16,13 @@ import { RequestIdInterceptor } from './common/request-id';
 import { ConfigDao } from './data/config-dao';
 import { LogBuffer } from './data/log-buffer';
 import { LogFileStore } from './data/log-file-store';
-import { SessionStore } from './data/session-store';
+import { ModelRegistryStore } from './data/model-registry-store';
 import { ReviewStore } from './data/review-store';
+import { SessionStore } from './data/session-store';
 import { HealthController } from './modules/health/health.controller';
 import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
+import { ModelsController } from './modules/models/models.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
@@ -42,6 +44,7 @@ export class CatchAllController {
     LogsController,
     ClientErrorController,
     ReviewController,
+    ModelsController,
     CatchAllController,
   ],
   providers: [
@@ -51,6 +54,7 @@ export class CatchAllController {
     LogFileStore,
     ReviewStore,
     ReviewService,
+    ModelRegistryStore,
   ],
 })
 export class AppModule {}
