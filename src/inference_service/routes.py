@@ -189,7 +189,7 @@ async def models_load(req: LoadModelRequest, request: Request):
     _check_model_registered(req.model_id, engine)
     host = _engine_host(request)
     result = host.load_model(
-        engine=req.engine,
+        engine=engine,
         quant_type=req.quant_type,
         use_compile=req.use_compile,
         model_id=req.model_id,
@@ -208,7 +208,7 @@ async def models_unload(req: UnloadModelRequest, request: Request):
 async def models_switch(req: SwitchModelRequest, request: Request):
     engine = _check_load_engine(req.engine)
     _check_model_registered(req.model_id, engine)
-    return _engine_host(request).switch_model(model_id=req.model_id, engine=req.engine)
+    return _engine_host(request).switch_model(model_id=req.model_id, engine=engine)
 
 
 @router.get("/models/current")

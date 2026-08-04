@@ -557,10 +557,12 @@ class EngineHost:
         )
         # 对齐 api_server.py:2264-2265：load 成功后显式置位运行时状态
         # （ModelHost.model_loaded 不自更新；2026-08-05 真实加载复测暴露
-        # /v1/status 恒 model_loaded:false）
+        # /v1/status 恒 model_loaded:false）。current_quant 优先取 manager
+        # 实际生效值（对齐 api_server getattr(model_manager, 'quant_type')
+        # or quant），避免请求值与引擎归一化值不一致（如 GGUF 引擎忽略 int4）
         self._host.model_loaded = True
-        self._host.current_quant = quant_type or getattr(
-            self._host, "current_quant", "int4"
+        self._host.current_quant = (
+            getattr(self._host, "quant_type", None) or quant_type or "int4"
         )
         return result if isinstance(result, dict) else {"success": True, "data": result}
 
@@ -572,6 +574,15 @@ class EngineHost:
 
     def switch_model(self, model_id: str, engine: Optional[str] = None) -> Dict[str, Any]:
         result = self._host.switch_model(model_id=model_id, engine=engine)
+        # 对齐 api_server.py:5146-5147：切换成功置位运行时状态
+        # （api_server 在 result['success'] 分支设置）
+        if isinstance(result, dict) and result.get("success"):
+            self._host.model_loaded = True
+            self._host.current_quant = (
+                getattr(self._host, "quant_type", None)
+                or result.get("quant_type")
+                or getattr(self._host, "current_quant", "int4")
+            )
         return result if isinstance(result, dict) else {"success": True, "data": result}
 
     def current_model(self) -> Dict[str, Any]:
