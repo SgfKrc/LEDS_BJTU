@@ -7,6 +7,7 @@
  * 分支未迁移——沿用降级语义，清理阶段切换时再迁数据）。
  * 并发：Node 单线程 + 原子写（tmp + rename）。
  */
+import { Injectable, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -49,10 +50,11 @@ export function resolveRegistryFile(env: NodeJS.ProcessEnv = process.env): strin
   );
 }
 
+@Injectable()
 export class ModelRegistryStore {
   private readonly file: string;
 
-  constructor(file?: string) {
+  constructor(@Optional() file?: string) {
     this.file = file ?? resolveRegistryFile();
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
   }

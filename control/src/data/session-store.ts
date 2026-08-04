@@ -13,6 +13,7 @@
  * ensure_ascii=False + indent=2 + default=str，时间 "%Y-%m-%dT%H:%M:%S"）。
  * 并发：Node 单线程 + 原子写（tmp + rename），对齐 Python 的 threading.Lock 语义。
  */
+import { Injectable, Optional } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -56,13 +57,14 @@ function nowStr(): string {
   );
 }
 
+@Injectable()
 export class SessionStore {
   /** 进程内活跃会话（对齐 api_server 模块级 active_session_id；重启后为 null） */
   activeSessionId: string | null = null;
 
   private readonly dir: string;
 
-  constructor(dir?: string) {
+  constructor(@Optional() dir?: string) {
     this.dir = dir ?? resolveChatHistoryDir();
     fs.mkdirSync(this.dir, { recursive: true });
   }

@@ -12,6 +12,7 @@
  */
 import { All, Controller, NotFoundException, Req } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
+import { ControlClient } from '../../clients/control.client';
 import { LegacyControlClient } from '../../clients/legacy.client';
 import { SchedulerClient } from '../../clients/scheduler.client';
 
@@ -22,25 +23,32 @@ export class ClusterController {
   constructor(
     private readonly scheduler: SchedulerClient,
     private readonly legacy: LegacyControlClient,
+    private readonly control: ControlClient,
   ) {}
 
-  // /api/cluster/review 与 /api/cluster/review/* → legacy-control /cluster/review/*
+  // /api/cluster/review 与 /api/cluster/review/* → control-svc（设置 QLH_CONTROL_URL 时）
+  // 否则 legacy-control /cluster/review/*（并行共存基线）
   // （find-my-way 具体度优先于下方 @All('cluster/*') 通配）
   @All('cluster/review')
   reviewRoot(@Req() req: FastifyRequest): Promise<unknown> {
-    return this.forwardLegacy(req);
+    return this.forwardReview(req);
   }
 
   @All('cluster/review/*')
   reviewSub(@Req() req: FastifyRequest): Promise<unknown> {
-    return this.forwardLegacy(req);
+    return this.forwardReview(req);
   }
 
-  private forwardLegacy(req: FastifyRequest): Promise<unknown> {
+  private forwardReview(req: FastifyRequest): Promise<unknown> {
     const full = req.url;
     const subPath = full.slice('/api'.length); // /cluster/review/...
     const body = (req as { body?: unknown }).body;
-    return this.legacy.request(req.method, subPath, body);
+    // 阶段 3.2 review 域已迁 control-svc（路径 /cluster/review/* 一致）
+    const target =
+      process.env.QLH_CONTROL_URL
+        ? this.control
+        : this.legacy;
+    return target.request(req.method, subPath, body);
   }
 
   @All('cluster/*')

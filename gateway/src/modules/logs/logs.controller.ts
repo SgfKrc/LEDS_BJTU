@@ -8,13 +8,17 @@
  */
 import { All, Controller, NotFoundException, Req } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
+import { ControlClient } from '../../clients/control.client';
 import { LegacyControlClient } from '../../clients/legacy.client';
 
 const LOGS_PREFIX = '/api/logs';
 
 @Controller()
 export class LogsController {
-  constructor(private readonly legacy: LegacyControlClient) {}
+  constructor(
+    private readonly legacy: LegacyControlClient,
+    private readonly control: ControlClient,
+  ) {}
 
   // /api/logs 与 /api/logs/* 都命中（TUI 调用 /api/logs 本身，tui_admin.py:1198）；
   // 同一方法叠加多个 @All 在 fastify adapter 下会被覆盖，故拆两个方法共享 proxyInner
@@ -42,6 +46,11 @@ export class LogsController {
       extraHeaders['x-qlh-log-token'] = token;
     }
     const body = (req as { body?: unknown }).body;
-    return this.legacy.request(req.method, subPath, body, extraHeaders);
+    // 阶段 3.2 日志域已迁 control-svc；设置 QLH_CONTROL_URL 后改走 control-svc
+    const target =
+      process.env.QLH_CONTROL_URL
+        ? this.control
+        : this.legacy;
+    return target.request(req.method, subPath, body, extraHeaders);
   }
 }
