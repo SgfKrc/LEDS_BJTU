@@ -8,6 +8,7 @@
  *
  * 环境变量（与 db.py 一致）：QLH_DB_HOST/PORT/NAME/USER/PASSWORD/ENABLED/SSLMODE。
  */
+import { Injectable, Optional } from '@nestjs/common';
 import { Client } from 'pg';
 
 export interface DbConfig {
@@ -37,11 +38,12 @@ export function loadDbConfig(env: NodeJS.ProcessEnv = process.env): DbConfig {
   };
 }
 
+@Injectable()
 export class ConfigDao {
   private cfg: DbConfig;
 
-  constructor(cfg: DbConfig = loadDbConfig()) {
-    this.cfg = cfg;
+  constructor(@Optional() cfg?: DbConfig) {
+    this.cfg = cfg ?? loadDbConfig();
   }
 
   private async connect(): Promise<Client> {

@@ -9,6 +9,7 @@
  * 投票资格（can_node_vote GPU 检查）依赖 Python device_profiler，未迁移：
  * 降级为放行（can-vote 端点恒 true），记录于计划文档。
  */
+import { Injectable, Optional } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { ReviewStore, ReviewTicket, TicketStatus, nowEpoch, ticketToDict } from '../../data/review-store';
 
@@ -40,13 +41,14 @@ export const APPROVE_THRESHOLD = 2;
 export const REJECT_THRESHOLD = -2;
 export const DEFAULT_TIMEOUT_HOURS = 48;
 
+@Injectable()
 export class ReviewService {
   private readonly store: ReviewStore;
   private readonly mailer: ReviewMailer;
 
-  constructor(store: ReviewStore, mailer: ReviewMailer = new NoopReviewMailer()) {
+  constructor(store: ReviewStore, @Optional() mailer?: ReviewMailer) {
     this.store = store;
-    this.mailer = mailer;
+    this.mailer = mailer ?? new NoopReviewMailer();
   }
 
   // ---- 创建工单（对齐 create_ticket :149-207） ----

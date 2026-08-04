@@ -14,6 +14,8 @@
  * （服务内部 append）；Python api_server 的内存缓冲由它自己的 handler 填充。
  * 并行共存期间两者各自独立；清理阶段切换后由 control-svc 统一承载。
  */
+import { Injectable, Optional } from '@nestjs/common';
+
 export interface LogEntry {
   timestamp: string;
   level: string;
@@ -51,12 +53,13 @@ function nowStr(): string {
     `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+@Injectable()
 export class LogBuffer {
   private entries: LogEntry[] = [];
   private totalSeen = 0;
   private seq = 0;
 
-  constructor(private readonly capacity: number = LOG_BUFFER_CAPACITY) {}
+  constructor(@Optional() private readonly capacity: number = LOG_BUFFER_CAPACITY) {}
 
   /** 追加一条日志（对齐 MemoryLogHandler.emit 的入队语义） */
   append(

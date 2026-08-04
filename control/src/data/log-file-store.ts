@@ -13,6 +13,7 @@
  *  - 删除/清空/导出不依赖 Python 的 logging handlers（TS 无文件句柄占用，
  *    无需 _close_logging_handlers/setup_logging 循环）
  */
+import { Injectable, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import JSZip from 'jszip';
@@ -55,10 +56,11 @@ export function isoLocal(d: Date = new Date()): string {
   );
 }
 
+@Injectable()
 export class LogFileStore {
   readonly logDir: string;
 
-  constructor(logDir?: string) {
+  constructor(@Optional() logDir?: string) {
     this.logDir = logDir ?? resolveLogDir();
   }
 

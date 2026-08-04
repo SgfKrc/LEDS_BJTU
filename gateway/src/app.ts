@@ -16,6 +16,7 @@ import fastifyMultipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
 import { JsonDetailFilter } from './common/json-detail.filter';
 import { RequestIdInterceptor } from './common/request-id';
+import { ControlClient } from './clients/control.client';
 import { InferenceClient } from './clients/inference.client';
 import { LegacyControlClient } from './clients/legacy.client';
 import { SchedulerClient } from './clients/scheduler.client';
@@ -55,7 +56,7 @@ export class CatchAllController {
     ExperimentalController,
     CatchAllController,
   ],
-  providers: [SchedulerClient, InferenceClient, LegacyControlClient, StaticService],
+  providers: [SchedulerClient, InferenceClient, LegacyControlClient, ControlClient, StaticService],
 })
 export class AppModule {}
 

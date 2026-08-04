@@ -10,6 +10,7 @@
  * 并发：Node 单线程 + 原子写（tmp + rename），对齐 Python 端
  * cast_vote 的"3 次重试防并发读改写"效果（TS 天然串行）。
  */
+import { Injectable, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -66,10 +67,11 @@ export function resolveReviewFile(env: NodeJS.ProcessEnv = process.env): string 
   return env.QLH_REVIEW_STORE?.trim() || path.join(process.cwd(), 'review_tickets.json');
 }
 
+@Injectable()
 export class ReviewStore {
   private readonly file: string;
 
-  constructor(file?: string) {
+  constructor(@Optional() file?: string) {
     this.file = file ?? resolveReviewFile();
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
   }

@@ -9,6 +9,7 @@
  * journal，真实数据读取需清理阶段 SQLite 桥或执行段上报改造，见计划文档）。
  * 并发：Node 单线程 + 原子写（tmp + rename）。
  */
+import { Injectable, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -120,10 +121,11 @@ export function resolveJournalFile(env: NodeJS.ProcessEnv = process.env): string
   );
 }
 
+@Injectable()
 export class WorkflowJournalStore {
   private readonly file: string;
 
-  constructor(file?: string) {
+  constructor(@Optional() file?: string) {
     this.file = file ?? resolveJournalFile();
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
   }
