@@ -290,15 +290,23 @@ def test_chat_stream_full_single_done(client):
 
 
 def test_chat_cancel_semantics(client):
-    # 未知 generation_id → 404 JSON detail
-    resp = client.post("/v1/chat/cancel", json={"generation_id": "gen_nope"})
-    assert resp.status_code == 404
+    # 格式无效 → 400（对齐 api_server generation_id 格式校验）
+    resp = client.post("/v1/chat/cancel", json={"generation_id": "bad!"})
+    assert resp.status_code == 400
     assert "detail" in resp.json()
-    # 已注册 → 200
-    host = client.app.state.engine_host
-    gid, ev = host.register_generation("gen_test_1")
-    resp = client.post("/v1/chat/cancel", json={"generation_id": "gen_test_1"})
+    # 未知但格式合法 → 200 cancel_pending（对齐 api_server，不 404）
+    resp = client.post("/v1/chat/cancel", json={"generation_id": "gen_nope_12345678"})
     assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "cancel_pending",
+        "generation_id": "gen_nope_12345678",
+    }
+    # 已注册 → 200 cancel_requested
+    host = client.app.state.engine_host
+    gid, ev = host.register_generation("gen_test_123456")
+    resp = client.post("/v1/chat/cancel", json={"generation_id": "gen_test_123456"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancel_requested"
     assert ev.is_set()
     host.unregister_generation(gid)
 
@@ -1457,9 +1465,9 @@ def test_inference_client_kv_and_cancel(live_inference_svc):
     assert r["task_id"] == "t_remote"
     r = client.kv_free(task_id="t_remote")
     assert r["freed"] is True
-    # 未知 generation cancel → 404 → RuntimeError
-    with pytest.raises(RuntimeError):
-        client.cancel_generation("gen_nonexistent")
+    # 未知 generation cancel → 200 cancel_pending（对齐 api_server 语义，2026-08-05）
+    r = client.cancel_generation("gen_nonexistent")
+    assert r["status"] == "cancel_pending"
 
 
 # ----------------------------------------------------------------------

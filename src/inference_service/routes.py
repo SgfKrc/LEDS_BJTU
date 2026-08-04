@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import threading
 from typing import Any, Dict, Iterator, Optional
 
@@ -152,8 +153,40 @@ async def status(request: Request):
 # ----------------------------------------------------------------------
 # 模型生命周期
 # ----------------------------------------------------------------------
+_VALID_ENGINES = ("auto", "llama_cpp", "pytorch", "island")
+_GENERATION_ID_PATTERN = re.compile(r"^gen_[A-Za-z0-9_-]{8,96}$")
+
+
+def _check_load_engine(engine: Optional[str]) -> str:
+    """对齐 api_server.py:2220-2222 的引擎白名单校验（400）。"""
+    e = (engine or "auto").lower()
+    if e not in _VALID_ENGINES:
+        raise HTTPException(
+            400, f"不支持的引擎: {e}，可选: auto, llama_cpp, pytorch, island"
+        )
+    return e
+
+
+def _check_model_registered(model_id: Optional[str], engine: str) -> None:
+    """对齐 api_server.py:5029-5051 _validate_model_load_request 的注册校验。
+
+    island 引擎无本地文件依赖；model_id 为空直接放行（对齐 api_server）。
+    inference-svc 模型域仅内置模型（DB 实验模型由 control-svc 承载），
+    故 get_model_config 的 db_models 参数恒传空 dict。
+    """
+    if engine == "island" or not model_id:
+        return
+    import model_config as mc
+
+    model = mc.get_model_config(model_id, {})
+    if model is None:
+        raise HTTPException(404, f"模型 '{model_id}' 未在注册表中找到。")
+
+
 @router.post("/models/load")
 async def models_load(req: LoadModelRequest, request: Request):
+    engine = _check_load_engine(req.engine)
+    _check_model_registered(req.model_id, engine)
     host = _engine_host(request)
     result = host.load_model(
         engine=req.engine,
@@ -173,6 +206,8 @@ async def models_unload(req: UnloadModelRequest, request: Request):
 
 @router.post("/models/switch")
 async def models_switch(req: SwitchModelRequest, request: Request):
+    engine = _check_load_engine(req.engine)
+    _check_model_registered(req.model_id, engine)
     return _engine_host(request).switch_model(model_id=req.model_id, engine=req.engine)
 
 
@@ -283,12 +318,21 @@ async def chat_stream(req: ChatRequest, request: Request):
 @router.post("/chat/cancel")
 async def chat_cancel(req: ChatCancelRequest, request: Request):
     _require_master_role(request)
+    # 格式校验对齐 api_server.py:441-442（400 语义）
+    if not _GENERATION_ID_PATTERN.fullmatch(req.generation_id or ""):
+        raise HTTPException(400, "generation_id 格式无效")
     host = _engine_host(request)
     if not host.cancel_generation(req.generation_id):
-        raise HTTPException(
-            status_code=404, detail=f"未知 generation_id: {req.generation_id}"
-        )
-    return {"success": True, "message": "已请求取消", "generation_id": req.generation_id}
+        # 未注册的合法 id → cancel_pending（对齐 api_server.py:449-456，
+        # 不返回 404；contract_diff 2026-08-05 复测暴露 404 语义偏差）
+        return {
+            "status": "cancel_pending",
+            "generation_id": req.generation_id,
+        }
+    return {
+        "status": "cancel_requested",
+        "generation_id": req.generation_id,
+    }
 
 
 # ----------------------------------------------------------------------
