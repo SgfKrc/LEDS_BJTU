@@ -2,7 +2,7 @@
  * 模型注册表控制器 — 阶段 3.2 模型注册表域（语义对齐 api_server.py:5173-5238、
  * 6800-6880）
  *
- * 端点（5 个，全部纯控制面；推理面 /models/load|switch|current|available
+ * 端点（6 个，全部纯控制面；推理面 /models/load|switch|current|available
  * 已由网关转发 inference-svc :8010）：
  *   GET    /models/registry            → {models: RegisteredModel[]}
  *   POST   /models/registry            → {status:'registered', model_id}；
@@ -13,9 +13,15 @@
  *                                       sha256,download_url}], directory, exists, count}
  *   GET    /models/download/*          → 文件流（application/octet-stream +
  *                                       attachment），Range 断点续传
+ *   GET    /presets                    → {presets:[6 项], current_speed_tok_s,
+ *                                       current_quant, max_new_tokens}（对齐
+ *                                       api_server.py:1698-1790；运行态恒降级
+ *                                       int4 29 tok/s + 512 + null）
  *
  * 降级说明（已记录计划文档）：DB 分支（cluster_config experimental_model:）
- * 未迁移——JSON 存储恒可用，不返回 503；CUDA 门控未迁移。
+ * 未迁移——JSON 存储恒可用，不返回 503；CUDA 门控未迁移；presets 运行态
+ * 指标（量化/速度/max_new_tokens）恒默认值；集群模型分发
+ * （/models/downloadable + /models/files）随集群面处理，不在本服务。
  * 模型目录：QLH_MODELS_DIR 优先，否则 <cwd>/models（对齐 api_server _MODELS_DIR）。
  */
 import {
@@ -113,6 +119,88 @@ export class ModelsController {
       throw new HttpException(`模型 '${modelId}' 未注册`, 404);
     }
     return { status: 'deleted', model_id: modelId };
+  }
+
+  // ---------- 预设问题（对齐 api_server.py:1698-1790；运行态降级） ----------
+  //
+  // 降级说明：current_speed_tok_s / max_new_tokens / current_quant 依赖推理
+  // 运行态（model_host.current_quant、generation_config），运行态在
+  // inference-svc :8010；此处恒用默认值（int4 29 tok/s、max_new_tokens 512、
+  // current_quant null——对齐 api_server model_loaded=false 分支）。
+
+  @Get('presets')
+  presets(): Record<string, unknown> {
+    const tokS = 29; // int4 默认速度
+    const maxTokens = 512;
+    const presets = [
+      {
+        id: 'intro',
+        icon: '👋',
+        label: '自我介绍',
+        question: '请简单介绍一下你自己，你能做什么？',
+        estimated_prompt_tokens: 25,
+        estimated_response_tokens: 120,
+        estimated_memory_mb: Math.round((145 * 96 / 1024) * 10) / 10,
+        estimated_seconds: Math.round((120 / tokS) * 10) / 10,
+      },
+      {
+        id: 'edge_computing',
+        icon: '🌐',
+        label: '边缘计算科普',
+        question: '什么是边缘计算？它和云计算有什么区别？',
+        estimated_prompt_tokens: 35,
+        estimated_response_tokens: 200,
+        estimated_memory_mb: Math.round((235 * 96 / 1024) * 10) / 10,
+        estimated_seconds: Math.round((200 / tokS) * 10) / 10,
+      },
+      {
+        id: 'model_quantization',
+        icon: '⚡',
+        label: '模型量化原理',
+        question: '大模型的INT4量化是怎么做到的？精度损失大吗？',
+        estimated_prompt_tokens: 40,
+        estimated_response_tokens: 250,
+        estimated_memory_mb: Math.round((290 * 96 / 1024) * 10) / 10,
+        estimated_seconds: Math.round((250 / tokS) * 10) / 10,
+      },
+      {
+        id: 'code_assist',
+        icon: '💻',
+        label: 'Python 代码助手',
+        question: '用Python写一个函数，计算两个大文件的MD5哈希并比较是否相同',
+        estimated_prompt_tokens: 45,
+        estimated_response_tokens: 300,
+        estimated_memory_mb: Math.round((345 * 96 / 1024) * 10) / 10,
+        estimated_seconds: Math.round((300 / tokS) * 10) / 10,
+      },
+      {
+        id: 'creative',
+        icon: '✨',
+        label: '创意写作',
+        question: '以「边缘设备上的AI觉醒」为题，写一个300字的科幻微小说',
+        estimated_prompt_tokens: 50,
+        estimated_response_tokens: 400,
+        estimated_memory_mb: Math.round((450 * 96 / 1024) * 10) / 10,
+        estimated_seconds: Math.round((400 / tokS) * 10) / 10,
+      },
+      {
+        id: 'reasoning',
+        icon: '🧩',
+        label: '逻辑推理',
+        question: 'A说B撒谎，B说C撒谎，C说A和B都在撒谎。请问谁说的是真话？',
+        estimated_prompt_tokens: 55,
+        estimated_response_tokens: 350,
+        estimated_memory_mb: Math.round((405 * 96 / 1024) * 10) / 10,
+        estimated_seconds: Math.round((350 / tokS) * 10) / 10,
+      },
+    ];
+    return {
+      presets,
+      current_speed_tok_s: tokS,
+      // 对齐 api_server：模型未加载时 current_quant 为 null
+      current_quant: null,
+      max_new_tokens: maxTokens,
+    };
   }
 
   // ---------- GGUF 扫描（对齐 api_server.py:6800-6854） ----------

@@ -69,6 +69,25 @@ export class ConfigDao {
     return this.cfg.enabled;
   }
 
+  /** 连接信息（对齐 db_health 的 host/port/db 输出） */
+  getConnectionInfo(): { host: string; port: number; db: string } {
+    return { host: this.cfg.host, port: this.cfg.port, db: this.cfg.name };
+  }
+
+  /** 探测连接（对齐 db.py db_health 的 SELECT 1）；失败返回错误消息 */
+  async ping(): Promise<{ ok: boolean; error?: string }> {
+    let client: Client | null = null;
+    try {
+      client = await this.connect();
+      await client.query('SELECT 1');
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    } finally {
+      if (client) await client.end().catch(() => undefined);
+    }
+  }
+
   /** 读配置项（对齐 db.py get_config：无记录返回默认值） */
   async getConfig(key: string, def = ''): Promise<string> {
     if (!this.isDbUsable()) return def;
