@@ -21,6 +21,7 @@ import { ReviewStore } from './data/review-store';
 import { SessionStore } from './data/session-store';
 import { WorkflowJournalStore } from './data/workflow-journal-store';
 import { HealthController } from './modules/health/health.controller';
+import { BootstrapController } from './modules/bootstrap/bootstrap.controller';
 import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
@@ -48,6 +49,7 @@ export class CatchAllController {
     ReviewController,
     ModelsController,
     WorkflowsController,
+    BootstrapController,
     CatchAllController,
   ],
   providers: [
