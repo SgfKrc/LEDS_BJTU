@@ -680,6 +680,82 @@ async def _shutdown_resources():
 
 
 # ============================================================
+# 优雅退出（TUI / 外部命令触发）
+#
+# 优先级：
+#   1. 通过 `python src/api_server.py` 启动时注册的 uvicorn.Server 实例
+#      → 设置 should_exit，触发 uvicorn 内置优雅关闭（lifespan shutdown
+#        会执行 _shutdown_resources，跨平台可靠）
+#   2. POSIX：os.kill(SIGTERM) → uvicorn 信号处理器触发同样的优雅关闭
+#   3. Windows 兜底（`python -m uvicorn` 直启、无 server 引用）：
+#      直接执行资源清理后退出进程
+# ============================================================
+
+_uvicorn_server = None            # 通过 register_uvicorn_server() 注册
+_SHUTDOWN_TOKEN = os.environ.get("QLH_SHUTDOWN_TOKEN", "") or ""
+
+
+def register_uvicorn_server(server) -> None:
+    """供 `python src/api_server.py` 入口注册 uvicorn.Server 实例。"""
+    global _uvicorn_server
+    _uvicorn_server = server
+
+
+def _graceful_exit() -> None:
+    """在后台线程中触发后端优雅退出（先等响应返回）。"""
+    time.sleep(0.5)
+    server = _uvicorn_server
+    if server is not None:
+        server.should_exit = True
+        logger.info("event=system_shutdown trigger=uvicorn_should_exit")
+        return
+    if os.name != "nt":
+        import signal
+        os.kill(os.getpid(), signal.SIGTERM)
+        logger.info("event=system_shutdown trigger=signal_sigterm")
+        return
+    # Windows 兜底：直接清理资源（uvicorn 主循环不感知，需自行收尾）
+    import asyncio
+    logger.warning("event=system_shutdown trigger=direct_cleanup (未注册 uvicorn server)")
+    try:
+        asyncio.run(_shutdown_resources())
+    except Exception as e:
+        logger.warning(f"优雅退出清理异常: {e}")
+    os._exit(0)
+
+
+class SystemShutdownRequest(BaseModel):
+    reason: str = Field(default="", description="退出原因说明（写入日志）")
+
+
+@app.post("/api/system/shutdown")
+async def system_shutdown(req: SystemShutdownRequest, request: Request):
+    """
+    优雅退出后端服务（资源清理 → 调度器/数据库/TCP 全部关闭后退出进程）。
+
+    安全防护：
+      - 仅允许本机来源（127.0.0.1 / ::1）直接调用；
+      - 远程调用必须携带 X-QLH-Shutdown-Token，且需在启动前设置
+        环境变量 QLH_SHUTDOWN_TOKEN（未设置时远程调用一律拒绝）。
+    """
+    client_host = (request.client.host if request.client else "") or ""
+    is_local = client_host in ("127.0.0.1", "::1", "localhost", "")
+    if not is_local:
+        if not _SHUTDOWN_TOKEN:
+            raise HTTPException(
+                status_code=403,
+                detail="远程关闭被拒绝：服务端未配置 QLH_SHUTDOWN_TOKEN。",
+            )
+        token = request.headers.get("X-QLH-Shutdown-Token", "")
+        if token != _SHUTDOWN_TOKEN:
+            raise HTTPException(status_code=403, detail="关闭令牌无效。")
+    reason = (req.reason or "").strip()
+    logger.warning(f"event=system_shutdown_requested source={client_host or 'unknown'} reason={reason or 'unspecified'}")
+    threading.Thread(target=_graceful_exit, daemon=True, name="graceful-exit").start()
+    return {"ok": True, "message": "后端正在优雅退出…"}
+
+
+# ============================================================
 # Pydantic 模型
 # ============================================================
 
@@ -7549,5 +7625,18 @@ if __name__ == "__main__":
     from model_downloader import ensure_model_or_warn
     ensure_model_or_warn()
 
+    # 自建 uvicorn.Server 并注册，使 POST /api/system/shutdown 能触发
+    # 跨平台优雅关闭（should_exit → lifespan shutdown → _shutdown_resources）。
+    # 支持 start_tui 脚本的 QLH_BACKEND_HOST / QLH_BACKEND_PORT 覆盖。
     logger.info("启动 API 服务器...")
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT, log_level="info")
+    _backend_host = os.environ.get("QLH_BACKEND_HOST", "0.0.0.0")
+    _backend_port = int(os.environ.get("QLH_BACKEND_PORT") or API_PORT)
+    _uvicorn_config = uvicorn.Config(
+        app,
+        host=_backend_host,
+        port=_backend_port,
+        log_level="info",
+    )
+    _uvicorn_server = uvicorn.Server(_uvicorn_config)
+    register_uvicorn_server(_uvicorn_server)
+    _uvicorn_server.run()

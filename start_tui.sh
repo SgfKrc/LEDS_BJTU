@@ -49,7 +49,9 @@ then
 else
     echo "[1/3] 后端未运行，正在后台启动 API 服务器 (port $BACKEND_PORT) ..."
     mkdir -p logs
-    nohup "$PY" -m uvicorn src.api_server:app --host 0.0.0.0 --port "$BACKEND_PORT" \
+    # 用 python src/api_server.py 启动（而非 -m uvicorn），使
+    # POST /api/system/shutdown 能触发跨平台优雅退出（资源清理）。
+    QLH_BACKEND_PORT="$BACKEND_PORT" nohup "$PY" src/api_server.py \
         >> logs/backend_tui.log 2>&1 &
     echo $! > logs/backend_tui.pid
 fi
