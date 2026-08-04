@@ -66,10 +66,13 @@ export class ControlController {
   @All('models/gguf') gguf(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('models/download/*') downloadSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
 
-  // ---- 未迁移域（仍走 legacy-control） ----
+  // ---- 已迁移域补（presets / db-health，阶段 3.2 末两域） ----
 
   @All('presets') presetsRoot(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('db/health') dbHealth(@Req() r: FastifyRequest) { return this.forward(r, true); }
+
+  // ---- 未迁移域（仍走 legacy-control；集群模型分发，tailnet 鉴权，随集群面处理） ----
+
   @All('models/downloadable') downloadable(@Req() r: FastifyRequest) { return this.forward(r, false); }
   @All('models/files/*') filesSub(@Req() r: FastifyRequest) { return this.forward(r, false); }
 }

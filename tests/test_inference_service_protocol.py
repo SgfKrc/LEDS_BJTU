@@ -1996,3 +1996,108 @@ def test_v1_models_current_unloaded_shape_real_host():
     assert host.current_model() == {
         "loaded": False, "quant_type": None, "model_id": None,
     }
+
+
+# ----------------------------------------------------------------------
+# 14.7 模型生命周期校验（contract_diff 2026-08-05 复测修复回归）
+#    - /v1/models/load：引擎白名单 400（此前 500）
+#    - /v1/models/switch：未注册模型 404 detail（此前 200 success:false）
+#    - 引擎大小写经 _check_load_engine 归一化后执行（校验与执行同值）
+# ----------------------------------------------------------------------
+def test_models_load_invalid_engine_400(client):
+    resp = client.post("/v1/models/load", json={
+        "engine": "torch", "model_id": "qwen-1_8b"})
+    assert resp.status_code == 400
+    assert "不支持的引擎" in resp.json()["detail"]
+
+
+def test_models_load_engine_case_normalized(client):
+    """大写的 LLAMA_CPP：白名单校验用小写归一化，执行侧也必须用小写
+    （修复前校验通过但执行传原始大小写会走错引擎分支）。"""
+    resp = client.post("/v1/models/load", json={
+        "engine": "LLAMA_CPP", "model_id": "qwen-1_8b"})
+    assert resp.status_code == 200
+
+
+def test_models_switch_invalid_engine_400(client):
+    resp = client.post("/v1/models/switch", json={
+        "model_id": "qwen-1_8b", "engine": "tensorrt"})
+    assert resp.status_code == 400
+    assert "不支持的引擎" in resp.json()["detail"]
+
+
+def test_models_switch_unregistered_404(client):
+    resp = client.post("/v1/models/switch", json={
+        "model_id": "no-such-model", "engine": "llama_cpp"})
+    assert resp.status_code == 404
+    assert "未在注册表中找到" in resp.json()["detail"]
+
+
+def test_models_load_unregistered_404(client):
+    resp = client.post("/v1/models/load", json={
+        "model_id": "no-such-model", "engine": "llama_cpp"})
+    assert resp.status_code == 404
+
+
+class _FakeLoadHost:
+    """记录 load/switch 调用的假宿主（无 ModelHost 依赖）。"""
+
+    def __init__(self):
+        self.model_loaded = False
+        self.current_quant = "int4"
+        self.quant_type = None
+        self.load_calls = []
+        self.switch_calls = []
+
+    def load_model(self, engine=None, quant_type=None, use_compile=False,
+                   model_id=None):
+        self.load_calls.append((engine, quant_type, use_compile, model_id))
+        # 模拟 manager 归一化：llama_cpp 引擎忽略请求量化（GGUF 自带）
+        self.quant_type = "gguf" if engine == "llama_cpp" else (quant_type or "int4")
+        return None
+
+    def switch_model(self, model_id=None, engine=None):
+        self.switch_calls.append((model_id, engine))
+        self.quant_type = "int8"
+        return {"success": True, "model_id": model_id, "quant_type": "int8"}
+
+    def unload_model(self):
+        self.model_loaded = False
+
+
+def test_engine_host_load_sets_runtime_state():
+    """load 成功后 model_loaded=True 且 current_quant 取 manager 生效值
+    （对齐 api_server.py:2264-2265；2026-08-05 真实加载复测暴露 status
+    恒 false）。"""
+    host = EngineHost()
+    fake = _FakeLoadHost()
+    host._host = fake
+    host.load_model(engine="pytorch", quant_type="int4", model_id="qwen-1_8b")
+    assert fake.model_loaded is True
+    assert fake.current_quant == "int4"  # manager.quant_type 优先
+    # 请求值与 manager 归一化值不一致时取 manager（GGUF 引擎忽略 int4 场景）
+    fake2 = _FakeLoadHost()
+    host._host = fake2
+    host.load_model(engine="llama_cpp", quant_type="int4", model_id="qwen-1_8b")
+    assert fake2.current_quant == "gguf"
+
+
+def test_engine_host_switch_sets_runtime_state():
+    """switch 成功（result.success）后置位 model_loaded/current_quant
+    （对齐 api_server.py:5146-5147；修复前 switch 路径漏置位）。"""
+    host = EngineHost()
+    fake = _FakeLoadHost()
+    host._host = fake
+    r = host.switch_model(model_id="qwen-1_8b", engine="llama_cpp")
+    assert r["success"] is True
+    assert fake.model_loaded is True
+    assert fake.current_quant == "int8"
+
+
+def test_engine_host_unload_clears_state():
+    host = EngineHost()
+    fake = _FakeLoadHost()
+    fake.model_loaded = True
+    host._host = fake
+    host.unload_model()
+    assert fake.model_loaded is False
