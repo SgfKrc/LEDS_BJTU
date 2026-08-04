@@ -8,8 +8,9 @@
  * 渐进切换（并行共存）：默认全部走 legacy-control（QLH_LEGACY_CONTROL_URL，
  * 基线不变）；显式设置 QLH_CONTROL_URL 后，已迁移域（阶段 3.2 完成：
  * sessions/conversations/settings/review/workflows/bootstrap/models
- * registry/gguf/download）改走 control-svc，未迁移域（presets / db/health /
- * models downloadable/files）仍走 legacy。
+ * registry/gguf/download/presets/db-health）改走 control-svc，未迁移域
+ * （models downloadable/files——集群模型分发，tailnet 鉴权，随集群面处理）
+ * 仍走 legacy。
  * 注：fastify adapter 下同一方法叠加多个 @All 会覆盖，故每域拆根/子两个方法。
  */
 import { All, Controller, Req } from '@nestjs/common';
@@ -67,8 +68,8 @@ export class ControlController {
 
   // ---- 未迁移域（仍走 legacy-control） ----
 
-  @All('presets') presetsRoot(@Req() r: FastifyRequest) { return this.forward(r, false); }
-  @All('db/health') dbHealth(@Req() r: FastifyRequest) { return this.forward(r, false); }
+  @All('presets') presetsRoot(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('db/health') dbHealth(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('models/downloadable') downloadable(@Req() r: FastifyRequest) { return this.forward(r, false); }
   @All('models/files/*') filesSub(@Req() r: FastifyRequest) { return this.forward(r, false); }
 }

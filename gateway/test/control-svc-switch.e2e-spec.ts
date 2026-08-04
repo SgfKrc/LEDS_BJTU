@@ -216,24 +216,33 @@ describe('控制面域渐进切换（QLH_CONTROL_URL → control-svc）', () => 
         ),
       ).toBe(true);
     });
+
+    it('GET /api/presets → control-svc（6 项降级默认值）', async () => {
+      const res = await request(server()).get('/api/presets');
+      expect(res.status).toBe(200);
+      expect(res.body.presets).toHaveLength(6);
+      expect(res.body.current_speed_tok_s).toBe(29);
+      expect(res.body.current_quant).toBeNull();
+      expect(res.body.max_new_tokens).toBe(512);
+    });
+
+    it('GET /api/db/health → control-svc（QLH_DB_ENABLED=0 → not_configured）', async () => {
+      const res = await request(server()).get('/api/db/health');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        status: 'unavailable',
+        reason: 'not_configured',
+        message: '数据库未配置，正在使用本地文件存储',
+        retry_in_seconds: 0,
+      });
+    });
   });
 
   describe('未迁移域 → legacy-control 桩（基线不变）', () => {
-    it('GET /api/presets → legacy 桩', async () => {
-      const res = await request(server()).get('/api/presets');
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('presets');
-    });
-
     it('GET /api/models/downloadable → legacy 桩', async () => {
       const res = await request(server()).get('/api/models/downloadable');
       expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('downloadable');
-    });
-
-    it('GET /api/db/health → legacy 桩', async () => {
-      const res = await request(server()).get('/api/db/health');
-      expect(res.status).toBe(200);
     });
   });
 });

@@ -327,4 +327,44 @@ describe('control-svc models 域（阶段 3.2 模型注册表）', () => {
     expect(missing.statusCode).toBe(404);
     expect(missing.json().detail).toBe('模型文件不存在: nope.gguf');
   });
+
+  // ---------- 预设问题（对齐 api_server.py:1698-1790，运行态降级） ----------
+
+  it('GET /presets → 6 项 + 降级默认值（int4 29 tok/s、512、current_quant null）', async () => {
+    app = await createTestApp();
+    const res = await app.inject({ method: 'GET', url: '/presets' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.presets).toHaveLength(6);
+    expect(body.current_speed_tok_s).toBe(29);
+    expect(body.current_quant).toBeNull();
+    expect(body.max_new_tokens).toBe(512);
+    // 数值对齐 api_server round(x, 1)（int4 速度档）
+    const ids = body.presets.map((p: { id: string }) => p.id);
+    expect(ids).toEqual([
+      'intro',
+      'edge_computing',
+      'model_quantization',
+      'code_assist',
+      'creative',
+      'reasoning',
+    ]);
+    const intro = body.presets[0];
+    expect(intro.estimated_memory_mb).toBe(13.6); // 145*96/1024
+    expect(intro.estimated_seconds).toBe(4.1); // 120/29
+    const reasoning = body.presets[5];
+    expect(reasoning.estimated_memory_mb).toBe(38.0); // 405*96/1024
+    expect(reasoning.estimated_seconds).toBe(12.1); // 350/29
+    // 每个 preset 契约字段完整
+    for (const p of body.presets) {
+      expect(typeof p.id).toBe('string');
+      expect(typeof p.icon).toBe('string');
+      expect(typeof p.label).toBe('string');
+      expect(typeof p.question).toBe('string');
+      expect(typeof p.estimated_prompt_tokens).toBe('number');
+      expect(typeof p.estimated_response_tokens).toBe('number');
+      expect(typeof p.estimated_memory_mb).toBe('number');
+      expect(typeof p.estimated_seconds).toBe('number');
+    }
+  });
 });
