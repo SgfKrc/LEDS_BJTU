@@ -48,6 +48,11 @@ export async function createApp(): Promise<NestFastifyApplication> {
   app.useGlobalInterceptors(new RequestIdInterceptor());
   app.useGlobalFilters(new JsonDetailFilter());
 
+  // 显式 init：NestFactory.create() 只构建不注册路由（app.listen() 内部
+  // 会 init，但 Test/直连场景不会）——不 init 则所有路由 404（fastify
+  // 原生 404，非 JsonDetailFilter 的 detail 结构）。
+  await app.init();
+
   // 关键：触发 fastify ready（context 的 preParsing 等 hooks 在 avvio
   // preReady 事件中构建）。Nest app.init() 不触发 fastify ready——
   // 生产 app.listen() 会，但测试/直连 server.listen() 不会 → 请求时
