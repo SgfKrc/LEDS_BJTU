@@ -100,6 +100,78 @@ MASTER_INPUTS = [
     "q",           # 退出
 ]
 
+# 真实微服务拓扑走查序列（--real）：
+# 与桩序列的差异（真实 API 语义）：
+#  - c 连接：真实 discover 无记录 → 默认 IP 为空会直接取消；显式输入
+#    IP 并选 n（保持主节点身份），避免真切换角色破坏后续 master 走查
+#  - x 删除：真实用注册过的 test-node2（桩契约节点 delete-ok 不存在）
+#  - t/s/z/o（转让/指定备用/重置身份/手动分层覆盖）：真实单机无备用
+#    节点、重置需 DB（隔离环境禁 DB）、分层需真实节点 ID → 不在真实
+#    单机走查范围（桩环境已覆盖）
+REAL_MASTER_INPUTS = [
+    "1",           # 屏 1 系统状态总览
+    "",            #   返回
+    "2",           # 屏 2 节点管理
+    "v",           #   自动发现（真实：无记录 → "数据库中未发现主节点记录"）
+    "l",           #   转让日志（真实：暂无 → "暂无角色转让日志"）
+    "c",           #   连接主节点
+    "127.0.0.1",   #     主节点 IP（真实网关本机）
+    "",            #     主节点端口（默认 8888）
+    "n",           #     保持主节点身份（不切换，避免破坏后续 master 走查）
+    "a",           #   注册节点
+    "test-node2",  #     node_id（真实 scheduler 接受）
+    "",            #     hostname
+    "",            #     address
+    "",            #     network（默认 unknown）
+    "",            #     node_type（默认 pc）
+    "d",           #   注销节点
+    "test-node2",
+    "y",
+    "x",           #   删除节点记录（真实：test-node2 已注销 → 删除成功）
+    "test-node2",
+    "y",
+    "u",           #   移除备用主节点（真实：无记录 → 已清除）
+    "y",
+    "m",           #   最大节点数
+    "16",
+    "e",           #   邮件测试（真实：scheduler-svc email-test → ok）
+    "y",
+    "",            #   返回
+    "3",           # 屏 3 分布式与分层
+    "t",           #   切换分布式推理开关
+    "y",
+    "R",           #   重置分层为自动（真实：恢复 dynamic）
+    "y",
+    "",            #   返回
+    "4",           # 屏 4 请求队列
+    "s",           #   切换调度策略
+    "fifo",
+    "p",           #   暂停队列
+    "u",           #   恢复队列
+    "C",           #   清空队列
+    "y",
+    "k",           #   取消任务（真实：无任务 → "任务不存在或已经完成"）
+    "task-1",
+    "y",
+    "",            #   返回
+    "5",           # 屏 5 设备画像
+    "g",           #   切换 GPU
+    "0",
+    "y",
+    "A",           #   自动配置
+    "y",
+    "",            #   返回
+    "6",           # 屏 6 日志查看
+    "2",           #   后端最近日志
+    "4",           #   日志统计
+    "3",           #   日志文件列表
+    "",            #   返回
+    "7",           # 屏 7 设置
+    "T",           #   测试后端连通
+    "",            #   返回
+    "q",           # 退出
+]
+
 CLIENT_INPUTS = [
     "1",           # 屏 1 系统状态总览（从节点视角）
     "",
@@ -123,9 +195,9 @@ SCREEN_TITLES = [
 ]
 
 
-def run_tui(host: str, port: int, mode: str, log_token: str = "") -> str:
+def run_tui(host: str, port: int, mode: str, log_token: str = "", real: bool = False) -> str:
     """启动 tui_admin.py --plain 并喂入输入序列，返回完整 stdout。"""
-    inputs = MASTER_INPUTS if mode == "master" else CLIENT_INPUTS
+    inputs = (REAL_MASTER_INPUTS if real else MASTER_INPUTS) if mode == "master" else CLIENT_INPUTS
     feed = "\n".join(inputs) + "\n"
     cmd = [
         sys.executable, "src/tui_admin.py",
@@ -146,16 +218,19 @@ def run_tui(host: str, port: int, mode: str, log_token: str = "") -> str:
     return proc.stdout.decode("utf-8", errors="replace")
 
 
-def check(output: str, mode: str) -> list:
+def check(output: str, mode: str, real: bool = False) -> list:
     """返回失败项列表（空 = 通过）。"""
     import re
     fails = []
     # 1. 无"内部错误"屏 / 操作失败（排除日志内容行：桩日志含 ERROR 级别记录，
-    #    渲染为 "[错误] 2026-08-02 ... ERROR ..."，属合法日志内容而非错误屏）
+    #    渲染为 "[错误] 2026-08-02 ... ERROR ..."，属合法日志内容而非错误屏；
+    #    real 模式另排除 "[错误] 主节点健康: 离线/失联"——从节点未连主节点的
+    #    真实状态展示，非 TUI 故障）
     err_lines = [
         ln for ln in output.splitlines()
         if (ln.startswith("[错误]") or "操作失败" in ln)
         and not re.match(r"^\[错误\] \d{4}-\d{2}-\d{2} ", ln)
+        and not (real and ln.startswith("[错误] 主节点健康:"))
     ]
     if err_lines:
         fails.append("出现错误行: %s" % err_lines[:5])
@@ -192,6 +267,31 @@ def check(output: str, mode: str) -> list:
             "自动配置完成",      # A 自动配置
             "连接正常",          # T 连通测试
         ]
+        if real:
+            # 真实拓扑：连接保持主节点身份；转让/指定/重置/分层覆盖
+            # 属真实集群语义（无备用节点/需 DB/需真实节点），不在单机
+            # 真实走查范围（桩环境已覆盖）
+            expected = [
+                "发现主节点",        # v（"数据库中未发现主节点记录"）
+                "转让日志",          # l（"暂无角色转让日志"）
+                "保持主节点身份",    # c（真实：n 不切换）
+                "注册结果",          # a
+                "已注销",            # d
+                "删除结果",          # x
+                "移除结果",          # u（真实：无记录 → 已清除）
+                "容量更新",          # m
+                "邮件测试",          # e
+                "分布式推理已",      # t
+                "分层已重置",        # R
+                "策略已切换",        # s
+                "队列已暂停",        # p
+                "队列已恢复",        # u
+                "已清空",            # C
+                "取消",              # k
+                "已切换到 GPU",      # g
+                "自动配置完成",      # A
+                "连接正常",          # T
+            ]
         for key in expected:
             if key not in output:
                 fails.append("缺少动作结果: %s" % key)
@@ -200,6 +300,8 @@ def check(output: str, mode: str) -> list:
         for key in ["系统状态总览", "节点管理", "日志查看",
                     "主节点健康",          # master-health 渲染（桩: 在线 100.64.0.1:8888）
                     "节点注册成功"]:       # 远程日志内容（legacy_control SAMPLE_LOGS）
+            if real and key == "节点注册成功":
+                continue  # 桩样本日志；真实 control-svc 日志 buffer 无此内容
             if key not in output:
                 fails.append("缺少从节点内容: %s" % key)
     return fails
@@ -213,10 +315,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--mode", choices=["master", "client"], default="master")
     parser.add_argument("--log-token", default="")
+    parser.add_argument("--real", action="store_true",
+                        help="真实微服务拓扑模式：用真实 API 语义的输入序列/期望（默认桩模式）")
     args = parser.parse_args()
 
     print("== T7 走查: mode=%s gateway=http://%s:%d ==" % (args.mode, args.host, args.port))
-    output = run_tui(args.host, args.port, args.mode, args.log_token)
+    output = run_tui(args.host, args.port, args.mode, args.log_token, real=args.real)
     with open(os.path.join(tempfile.gettempdir(), "t7_walkthrough_%s.log" % args.mode),
               "w", encoding="utf-8") as f:
         f.write(output)
@@ -230,7 +334,7 @@ def main() -> int:
                 or ln.startswith("  运行模式") or ln.startswith("  节点角色")):
             print(ln)
 
-    fails = check(output, args.mode)
+    fails = check(output, args.mode, real=args.real)
     if fails:
         print("\n[T7 %s] FAIL:" % args.mode)
         for f in fails:

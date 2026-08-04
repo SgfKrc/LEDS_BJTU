@@ -96,6 +96,22 @@ class InferenceClient:
         return bool(self._status().get("model_loaded", False))
 
     @property
+    def _model_path(self) -> str:
+        """scheduler 层分配缓存键读取面（scheduler.py:2367 getattr 兜底）。
+
+        推理进程内模型路径在微服务边界不可直读；返回不存在的路径，
+        使 _layer_assignment_cache_key 的 os.walk 文件指纹分支跳过——
+        否则 abspath('') = cwd，会遍历整个仓库目录（2026-08-05 实测
+        /cluster/status 4.5s，TUI 5s 超时告警的根因）。
+        """
+        return "remote-model"
+
+    @property
+    def _total_model_layers(self) -> int:
+        """推理进程内真实层数不可直读；返回 0 走 config.TOTAL_MODEL_LAYERS 兜底。"""
+        return 0
+
+    @property
     def current_quant(self) -> Optional[str]:
         return self._status().get("quant_type")
 
