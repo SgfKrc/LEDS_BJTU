@@ -19,6 +19,7 @@ import { LogFileStore } from './data/log-file-store';
 import { ModelRegistryStore } from './data/model-registry-store';
 import { ReviewStore } from './data/review-store';
 import { SessionStore } from './data/session-store';
+import { WorkflowJournalStore } from './data/workflow-journal-store';
 import { HealthController } from './modules/health/health.controller';
 import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
@@ -27,6 +28,7 @@ import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
 import { SettingsController } from './modules/settings/settings.controller';
+import { WorkflowsController } from './modules/workflows/workflows.controller';
 
 @Controller()
 export class CatchAllController {
@@ -45,6 +47,7 @@ export class CatchAllController {
     ClientErrorController,
     ReviewController,
     ModelsController,
+    WorkflowsController,
     CatchAllController,
   ],
   providers: [
@@ -55,6 +58,7 @@ export class CatchAllController {
     ReviewStore,
     ReviewService,
     ModelRegistryStore,
+    WorkflowJournalStore,
   ],
 })
 export class AppModule {}
