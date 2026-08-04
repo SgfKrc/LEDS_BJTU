@@ -17,9 +17,12 @@ import { ConfigDao } from './data/config-dao';
 import { LogBuffer } from './data/log-buffer';
 import { LogFileStore } from './data/log-file-store';
 import { SessionStore } from './data/session-store';
+import { ReviewStore } from './data/review-store';
 import { HealthController } from './modules/health/health.controller';
 import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
+import { ReviewController } from './modules/review/review.controller';
+import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
 import { SettingsController } from './modules/settings/settings.controller';
 
@@ -38,9 +41,17 @@ export class CatchAllController {
     SessionsController,
     LogsController,
     ClientErrorController,
+    ReviewController,
     CatchAllController,
   ],
-  providers: [ConfigDao, SessionStore, LogBuffer, LogFileStore],
+  providers: [
+    ConfigDao,
+    SessionStore,
+    LogBuffer,
+    LogFileStore,
+    ReviewStore,
+    ReviewService,
+  ],
 })
 export class AppModule {}
 
