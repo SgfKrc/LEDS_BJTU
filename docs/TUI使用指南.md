@@ -48,6 +48,19 @@ bjtu --host 100.x.x.x               # 启动后端后，TUI 管理远程主节�
 bjtu --plain                        # 纯文本编号菜单
 ```
 
+**单命令模式**（执行一条 TUI 命令后立即退出，**不会自动启动后端**；后端未运行时提示"后端未在运行"并以退出码 1 结束）：
+
+```bash
+bjtu shutdown                       # 优雅关闭后端（等价 /shutdown，别名 halt）
+bjtu /shutdown                      # 也支持带斜杠形式
+bjtu status                         # 打开系统状态总览后退出
+bjtu models                         # 列出可用模型/量化/引擎后退出
+bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
+```
+
+> 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名/别名清单与 TUI 内 `/` 命令集一致（见 [TUI指令集.md](TUI指令集.md)）。
+> ⚠️ 命令必须是**第一个参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）会被当作交互模式（可能启动后端）。
+
 行为与 `start_tui.bat` / `start_tui.sh` 完全相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行（Windows 关闭"QLH 后端 API"窗口停止；Linux/macOS `kill "$(cat logs/backend_tui.pid)"`）。
 
 ## 三、一键启动（start_tui.bat / start_tui.sh）
@@ -69,7 +82,14 @@ start_tui.bat
 3. 轮询 `/api/health` 直至就绪（上限 120 秒）。
 4. 在当前窗口进入 TUI，原样透传命令行参数。
 
-退出 TUI 后**后端继续运行**（适合作为常驻服务）。停止后端：关闭"QLH 后端 API"窗口，或在该窗口按 `Ctrl+C`。
+退出 TUI 的方式与后端命运：
+
+- **`q`（主菜单）或 `/shutdown`**：**优雅退出**——请求后端保存/清理资源后关闭后端，再退出 TUI（Windows 无需再关"QLH 后端 API"窗口）；
+- **`Esc`（主菜单）或 `/quit`**：仅退出 TUI 界面，**后端保持运行**（适合作为常驻服务，下次 `bjtu` 直接进入）；
+- 屏幕内按 `q`：ANSI 交互模式返回主菜单（导航）；纯文本模式是优雅退出整个 TUI（该模式无 `Esc` 概念，`q` 是退出快捷方式）；
+- 若后端已停止/请求失败，按 `q` 会提示原因并**仍退出 TUI**（后端保持运行；与 `/shutdown` 命令"失败则不退出、可继续操作"的行为不同）。
+
+停止后端（未走优雅退出时）：Windows 关闭"QLH 后端 API"窗口或在该窗口按 `Ctrl+C`；Linux/macOS 见下节。
 
 ### Linux / macOS
 
