@@ -2134,6 +2134,7 @@ class InteractiveApp(BaseApp):
         self.message_at = 0.0
         self.cmd_mode = False     # True=正在输入 / 命令
         self.cmd_buf = ""
+        self.exit_message = None  # 退出时附加消息（如 q 优雅退出失败原因）
 
     # ---- 主循环 ----
     def run(self) -> int:
@@ -2245,7 +2246,7 @@ class InteractiveApp(BaseApp):
         self.term.write(frame)
 
     def _menu_lines(self):
-        lines = [("", ""), ("head", "  请选择管理功能（↑↓ 移动，Enter 进入，数字直达，q 退出）"), ("", "")]
+        lines = [("", ""), ("head", "  请选择管理功能（↑↓ 移动，Enter 进入，数字直达，q 优雅退出）"), ("", "")]
         for i, s in enumerate(self.screens):
             marker = "»" if i == self.menu_idx else " "
             text = "  %s %d. %s" % (marker, i + 1, s.name)
@@ -2258,7 +2259,7 @@ class InteractiveApp(BaseApp):
         if self.cmd_mode:
             return " 输入命令: Enter 执行   ESC 取消   Backspace 删除   按 /help 查看命令集"
         if self.current is None:
-            return " ↑/↓ 选择   Enter 进入   1-%d 直达   / 命令   q 退出" % len(self.screens)
+            return " ↑/↓ 选择   Enter 进入   1-%d 直达   / 命令   q 优雅退出   Esc 仅退出界面" % len(self.screens)
         acts = self.current.actions()
         parts = ["Esc 返回", "r 刷新", "↑/↓ 滚动", "/ 命令"]
         parts.extend("%s %s" % (k, label) for k, label, _ in acts)
@@ -2266,8 +2267,22 @@ class InteractiveApp(BaseApp):
 
     # ---- 按键 ----
     def handle_menu_key(self, key) -> bool:
-        if key in ("q", "Q", "ESC"):
+        if key in ("q", "Q"):
+            # 优雅退出：等同 /shutdown（请求后端保存/清理资源后退出），
+            # 与 /quit 的“仅退出 TUI、后端保持运行”语义区分。
+            try:
+                msg, style = self.exec_command("/shutdown")
+            except ApiError as e:
+                msg, style = str(e), "err"
+            except Exception as e:
+                msg, style = "命令失败: %s" % e, "err"
+            if style == "err":
+                # 关闭请求失败：仍退出 TUI（后端保持），并把原因带给 main() 输出
+                self.exit_message = msg
+                self.exit_requested = True   # 名义不变量：q 后 TUI 必然退出
             return False
+        if key == "ESC":
+            return False   # 仅退出界面，后端保持运行（/quit 同义）
         if key == "UP":
             self.menu_idx = (self.menu_idx - 1) % len(self.screens)
         elif key == "DOWN":
@@ -2379,9 +2394,19 @@ class PlainApp(BaseApp):
         print("---- 主菜单 ----")
         for i, s in enumerate(self.screens):
             print("  %d. %s" % (i + 1, s.name))
-        print("  q. 退出")
+        print("  q. 优雅退出（关闭后端）")
         choice = input("选择> ").strip().lower()
         if choice in ("q", "0", "exit", "quit"):
+            # 优雅退出：等同 /shutdown；请求失败则仅退出 TUI（后端保持）
+            if not self.exit_requested:
+                try:
+                    msg, style = self.exec_command("/shutdown")
+                except ApiError as e:
+                    msg, style = str(e), "err"
+                except Exception as e:
+                    msg, style = "命令失败: %s" % e, "err"
+                if style == "err":
+                    print("[错误] " + msg)
             return False
         if not choice:
             return True
@@ -2421,12 +2446,22 @@ class PlainApp(BaseApp):
                     print(prefix + text)
             acts = scr.actions()
             print()
-            parts = ["r=刷新"] + ["%s=%s" % (k, label) for k, label, _ in acts] + ["回车/b=返回", "q=退出"]
+            parts = ["r=刷新"] + ["%s=%s" % (k, label) for k, label, _ in acts] + ["回车/b=返回", "q=优雅退出"]
             print("操作: " + "  ".join(parts))
             choice = input("> ").strip()
             if choice in ("", "b", "B", "0"):
                 return
             if choice in ("q", "Q"):
+                # 优雅退出后离开整个 TUI（等同 /shutdown）
+                try:
+                    msg, style = self.exec_command("/shutdown")
+                except ApiError as e:
+                    print("[错误] %s" % e)
+                except Exception as e:
+                    print("[错误] 命令失败: %s" % e)
+                else:
+                    if msg:
+                        print(("» " if style != "err" else "[错误] ") + msg)
                 raise EOFError
             if choice.startswith("/"):
                 try:
@@ -2489,7 +2524,70 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-color", action="store_true", help="关闭彩色输出")
     p.add_argument("--version", action="version",
                    version="qlh-tui-admin %s" % TUI_VERSION)
+    p.add_argument("command", nargs="?", default=None, metavar="命令",
+                   help="直接执行一条 TUI 命令后退出（如 shutdown、status、/switch qwen-1.8b），"
+                        "不进入交互界面；后端未运行时仅报错退出、不会自动启动后端")
     return p
+
+
+def _force_utf8_stdout():
+    """stdout/stderr 强制 UTF-8 编码。
+
+    Windows 管道/重定向下 Python 默认用 GBK（locale），»、emoji 等字符
+    会抛 UnicodeEncodeError；交互终端场景 reconfigure 无害（chcp 65001
+    时显示正确）。所有可能打印 »/emoji 的路径（单命令、--plain、降级）
+    都应先调用本函数。
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def run_single_command(api: ApiClient, interval: float, command: str) -> int:
+    """单命令模式：直接执行一条 TUI 命令后退出（bjtu shutdown / bjtu status …）。
+
+    与交互模式不同：单命令模式只负责“处理”、不负责“启动”——
+    后端未运行时直接报错退出，避免像交互模式那样先拉起后端再做处理。
+    """
+    text = (command or "").strip()
+    if not text.startswith("/"):
+        text = "/" + text
+    _force_utf8_stdout()
+    # 后端必须已在运行
+    try:
+        api.get("/health")
+    except ApiError as e:
+        print("后端未在运行（%s）。" % api.base_url)
+        print("  单命令模式不自动启动后端，请先运行 bjtu（交互模式）启动后端后再执行。")
+        print("  详情: %s" % e)
+        return 1
+    app = BaseApp(api, interval, is_plain=True)
+    try:
+        msg, style = app.exec_command(text)
+    except ApiError as e:
+        print("[错误] %s" % e)
+        return 1
+    except Exception as e:
+        print("[错误] 命令失败: %s" % e)
+        return 1
+    if msg:
+        print(("[错误] " if style == "err" else "» ") + msg)
+    # 退出码是自动化调用的唯一信号：err（未知命令/失败）与 warn（参数不足/过多）
+    # 都表示命令未成功执行，应非零退出；仅 ok 返回 0。
+    return 0 if style not in ("err", "warn") else 1
+
+
+def _is_single_command(argv: list, command) -> bool:
+    """单命令模式判定：命令必须是第一个非选项参数。
+
+    与 start_tui.bat / start_tui.sh 的判定对齐——选项在前
+    （bjtu --port 9000 shutdown）一律按交互模式处理，避免
+    "启动脚本启动后端、python 又执行单命令"的语义分裂。
+    """
+    first_non_option = next((a for a in argv if not a.startswith("-")), None)
+    return bool(command) and first_non_option == command
 
 
 def main(argv=None) -> int:
@@ -2497,6 +2595,11 @@ def main(argv=None) -> int:
     api = ApiClient(host=args.host, port=args.port,
                     timeout=max(1.0, args.timeout), log_token=args.log_token)
     interval = max(1.0, args.interval)
+
+    # 单命令模式：直接执行一条命令后退出（不启动后端、不进入交互界面）
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if _is_single_command(argv_list, args.command):
+        return run_single_command(api, interval, args.command)
 
     if not args.plain:
         term = AnsiTerm(color=not args.no_color)
@@ -2507,13 +2610,17 @@ def main(argv=None) -> int:
                 if app.shutdown_backend:
                     print("后端已优雅退出，所有资源已清理。")
                 else:
+                    if app.exit_message:
+                        print(app.exit_message)
                     print("TUI 已退出（后端保持运行，随时可重新运行 bjtu 进入）。")
                 return rc
         except TermNotCapable as e:
+            _force_utf8_stdout()          # 降级纯文本模式：管道/重定向下防 GBK 崩溃
             print("[提示] 交互模式不可用（%s），自动切换纯文本模式。" % e)
         except KeyboardInterrupt:
             return 0
 
+    _force_utf8_stdout()                  # --plain 管道/重定向下防 »/emoji GBK 崩溃
     try:
         return PlainApp(api, interval).run()
     except (EOFError, KeyboardInterrupt):

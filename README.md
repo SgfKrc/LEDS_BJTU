@@ -737,6 +737,7 @@ python serve.py
 ### 工程文档
 
 - [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
+- [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
 
 ---

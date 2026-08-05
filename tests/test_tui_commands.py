@@ -4,6 +4,7 @@
 不依赖真实后端与终端。
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -435,3 +436,215 @@ class TestLogCommands:
         msg, style = app.exec_command("/log bogus")
         assert style == "err"
         assert "用法" in msg
+
+
+class DownApi(FakeApi):
+    """后端不可达时的 API 桩（GET/POST 均连接失败）。"""
+
+    def get(self, path, params=None, with_log_token=False):
+        self.calls.append(("GET", path))
+        raise t.ApiError("无法连接后端 http://127.0.0.1:8000 (Connection refused)")
+
+    def post(self, path, body=None, params=None):
+        self.calls.append(("POST", path, body))
+        raise t.ApiError("无法连接后端 http://127.0.0.1:8000 (Connection refused)")
+
+
+class TestSingleCommandMode:
+    """单命令模式（bjtu shutdown / bjtu status …）：
+    后端未运行时只报错退出，绝不自动启动后端。"""
+
+    def test_backend_down_returns_error(self, capsys):
+        rc = t.run_single_command(DownApi(), 3.0, "shutdown")
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "后端未在运行" in out
+        assert "不自动启动后端" in out
+
+    def test_backend_up_runs_command(self, capsys):
+        rc = t.run_single_command(FakeApi(), 3.0, "status")
+        assert rc == 0
+        assert "»" in capsys.readouterr().out
+
+    def test_slash_and_bare_command_equivalent(self, capsys):
+        rc1 = t.run_single_command(FakeApi(), 3.0, "status")
+        rc2 = t.run_single_command(FakeApi(), 3.0, "/status")
+        assert rc1 == rc2 == 0
+
+    def test_shutdown_posts_to_backend(self, capsys):
+        api = FakeApi()
+        rc = t.run_single_command(api, 3.0, "shutdown")
+        assert rc == 0
+        assert ("GET", "/health") in api.calls
+        assert any(call[0] == "POST" and call[1] == "/system/shutdown"
+                   for call in api.calls)
+        out = capsys.readouterr().out
+        assert "已请求后端优雅退出" in out
+
+    def test_unknown_command_reports_error(self, capsys):
+        rc = t.run_single_command(FakeApi(), 3.0, "bogus")
+        assert rc == 1
+        assert "未知命令" in capsys.readouterr().out
+
+    def test_missing_args_warn_returns_nonzero(self, capsys):
+        # 参数不足（warn）也算命令未成功执行：退出码必须非零
+        rc = t.run_single_command(FakeApi(), 3.0, "switch")
+        assert rc == 1
+        assert "参数不足" in capsys.readouterr().out
+
+    def test_command_with_positional_args(self, capsys):
+        # 带位置参数的命令透传：switch qwen-1.8b --quant int8
+        api = FakeApi()
+        rc = t.run_single_command(api, 3.0, "switch qwen-1.8b --quant int8")
+        assert rc == 0
+        assert any(call[0] == "POST" and call[1] == "/models/switch"
+                   and call[2].get("model_id") == "qwen-1.8b"
+                   for call in api.calls)
+
+    def test_parser_accepts_bare_command(self):
+        args = t.build_parser().parse_args(["shutdown"])
+        assert args.command == "shutdown"
+        args = t.build_parser().parse_args(["--port", "9000", "/status"])
+        assert args.command == "/status"
+        assert args.port == 9000
+        args = t.build_parser().parse_args([])
+        assert args.command is None
+
+    def test_single_command_detection_matches_launcher(self):
+        # 与 start_tui.bat/.sh 判定一致：命令必须是第一个非选项参数
+        assert t._is_single_command(["shutdown"], "shutdown") is True
+        assert t._is_single_command(["/shutdown"], "/shutdown") is True
+        assert t._is_single_command(["status", "--port", "9000"], "status") is True
+        # 选项在前 → 交互模式（不触发单命令）
+        assert t._is_single_command(["--port", "9000", "shutdown"], "shutdown") is False
+        assert t._is_single_command(["--host", "10.0.0.1", "status"], "status") is False
+        # 无命令 / 空串
+        assert t._is_single_command([], None) is False
+        assert t._is_single_command([""], "") is False
+
+
+class TestLauncherScriptSync:
+    """start_tui.bat / start_tui.sh 的单命令清单必须与 COMMANDS 注册表同步，
+    防止新增 / 命令后启动脚本忘记更新导致命令行直调失效。"""
+
+    ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
+    @staticmethod
+    def expected_names() -> set:
+        names = set()
+        for c in t.COMMANDS:
+            names.add(c["name"].lstrip("/"))
+            for a in c.get("aliases", []):
+                names.add(a.lstrip("/"))
+        return names
+
+    def _read(self, name: str) -> str:
+        with open(os.path.join(self.ROOT, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_bat_list_in_sync(self):
+        text = self._read("start_tui.bat")
+        m = re.search(r"for %%c in \(([^)]+)\) do", text)
+        assert m, "start_tui.bat 中未找到单命令清单（for %%c in (...)）"
+        listed = set(m.group(1).split())
+        assert listed == self.expected_names()
+
+    def test_sh_list_in_sync(self):
+        text = self._read("start_tui.sh")
+        m = re.search(r"/\*\|([^\n]+)\)", text)
+        assert m, "start_tui.sh 中未找到单命令清单（case /*|...）"
+        listed = set(m.group(1).split("|"))
+        assert listed == self.expected_names()
+
+
+class TestQuitSemantics:
+    """TUI 退出语义：q = 优雅退出（等同 /shutdown，关闭后端）；
+    ESC / /quit = 仅退出界面（后端保持运行）；后端请求失败时仍可退出。"""
+
+    def make_interactive(self, api=None):
+        return t.InteractiveApp(api or FakeApi(), 3.0, None)
+
+    # ---- ANSI 交互模式 ----
+
+    def test_interactive_q_requests_shutdown_and_exits(self):
+        api = FakeApi()
+        app = self.make_interactive(api)
+        assert app.handle_menu_key("q") is False
+        assert app.shutdown_backend is True
+        assert app.exit_requested is True
+        assert any(c[0] == "POST" and c[1] == "/system/shutdown" for c in api.calls)
+
+    def test_interactive_q_uppercase_same_as_lower(self):
+        api = FakeApi()
+        app = self.make_interactive(api)
+        assert app.handle_menu_key("Q") is False
+        assert app.shutdown_backend is True
+
+    def test_interactive_esc_exits_without_shutdown(self):
+        api = FakeApi()
+        app = self.make_interactive(api)
+        assert app.handle_menu_key("ESC") is False
+        assert app.shutdown_backend is False
+        assert not any(c[0] == "POST" and c[1] == "/system/shutdown" for c in api.calls)
+
+    def test_interactive_q_failure_still_exits(self):
+        api = DownApi()
+        app = self.make_interactive(api)
+        assert app.handle_menu_key("q") is False
+        assert app.shutdown_backend is False
+        assert app.exit_message and "失败" in app.exit_message
+
+    def test_interactive_screen_q_returns_menu(self):
+        # 屏幕内 q 是导航（返回主菜单），不是退出
+        api = FakeApi()
+        app = self.make_interactive(api)
+        app.current = app.screens[0]
+        app.handle_screen_key("q")
+        assert app.current is None
+        assert not any(c[0] == "POST" and c[1] == "/system/shutdown" for c in api.calls)
+
+    # ---- 纯文本模式 ----
+
+    def test_plain_menu_q_requests_shutdown(self, monkeypatch, capsys):
+        api = FakeApi()
+        app = t.PlainApp(api, 3.0)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "q")
+        assert app._main_menu() is False
+        assert app.shutdown_backend is True
+        assert any(c[0] == "POST" and c[1] == "/system/shutdown" for c in api.calls)
+
+    def test_plain_menu_q_failure_exits_without_shutdown(self, monkeypatch, capsys):
+        api = DownApi()
+        app = t.PlainApp(api, 3.0)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "q")
+        assert app._main_menu() is False
+        assert app.shutdown_backend is False
+        out = capsys.readouterr().out
+        assert "失败" in out
+
+    def test_plain_screen_q_requests_shutdown_and_exits(self, monkeypatch, capsys):
+        api = FakeApi()
+        app = t.PlainApp(api, 3.0)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "q")
+        with pytest.raises(EOFError):
+            app._screen_loop(app.screens[0])
+        assert app.shutdown_backend is True
+        assert any(c[0] == "POST" and c[1] == "/system/shutdown" for c in api.calls)
+
+    def test_plain_screen_q_failure_still_exits(self, monkeypatch, capsys):
+        api = DownApi()
+        app = t.PlainApp(api, 3.0)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "q")
+        with pytest.raises(EOFError):
+            app._screen_loop(app.screens[0])
+        assert app.shutdown_backend is False
+        out = capsys.readouterr().out
+        assert "失败" in out
+
+    def test_plain_screen_b_returns_without_shutdown(self, monkeypatch, capsys):
+        api = FakeApi()
+        app = t.PlainApp(api, 3.0)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "b")
+        app._screen_loop(app.screens[0])   # 不应抛异常
+        assert app.shutdown_backend is False
+        assert not any(c[0] == "POST" and c[1] == "/system/shutdown" for c in api.calls)

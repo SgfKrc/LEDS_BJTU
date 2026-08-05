@@ -1,18 +1,18 @@
-# TUI 适配实施计划（阶段 2 网关专项）
+# TUI 适配与聊天页实施计划
 
-> **状态**：现行（T1-T8 全部完成，2026-08-02 验收通过：契约测试 44/44 + TUI 7 屏 × 2 角色自动化走查 + Python 回归 1086 passed / 3 skipped + 前端 9/9）
+> **状态**：部分实施（T1-T8 管理 TUI 已完成；T9 简化聊天页面为 `L4 Candidate`，尚未实施）
 >
-> **生命周期**：Active（在用）——本文档描述的网关 TUI 契约与测试为当前在用事实；2026-08-03 复核：`npm run test:tui` 44/44、`scripts/tui_walkthrough.py` master/client 双角色 PASS、`tui_admin.py` 零改动依旧成立
+> **生命周期**：Active（T1-T8 在用）+ Candidate（T9 规划）——现有 7 屏管理 TUI 与网关契约继续作为稳定基线；聊天页未通过 T9 验收前不得写成当前能力
 >
-> **更新日期**：2026-08-03
+> **更新日期**：2026-08-05
 >
-> **适用范围**：TUI 网关适配（端点依赖表、契约测试、legacy-control 日志代理）与验收记录；日常使用见 [TUI 使用指南](TUI使用指南.md)
+> **适用范围**：T1-T8 管理 TUI 网关适配与验收记录，以及 T9 简化聊天页面、流式会话、本地/分布式路由展示和可选依赖环境计划；当前日常使用见 [TUI 使用指南](TUI使用指南.md)
 >
-> **使用入口**：日常使用与启动方式见 [TUI 使用指南](TUI使用指南.md)（一键启动 `start_tui.bat` / `start_tui.sh` 自动带后端）；本文只讲网关适配与契约
+> **使用入口**：当前日常使用与启动方式见 [TUI 使用指南](TUI使用指南.md)；规划中的 `bjtu chat` 尚不存在
 >
-> **关联文档**：[微服务架构改造计划](微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md)
+> **关联文档**：[总体下一步计划](总体下一步计划.md) · [微服务架构改造计划](微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md) · [TUI 指令集](TUI指令集.md)
 >
-> **前置条件**：主计划阶段 1 完成（scheduler-svc / inference-svc 进程化）；阶段 2 网关工程初始化（2.1/2.2 按域迁移）进行中。本文档为 **TUI 相关适配**的专项细化，其他网关域（chat / models / sessions 等）见主计划 §2.2，不在此展开。
+> **前置条件**：T1-T8 已完成。T9 原型可在现有网关上开始；正式接线必须先冻结 chat SSE、会话持久化和请求级路由契约。分布式真机验收依赖《总体下一步计划》L1-1/L1-2/L1-3。
 
 ---
 
@@ -31,7 +31,9 @@
 2. `tui_admin.py` **零改动**跑通 7 屏 × 2 角色（主节点 / 从节点视角）。
 3. 以 TUI 38 个调用点为用例建立**契约测试**，纳入阶段 2 Go/No-Go 验收。
 
-### 1.3 非目标
+### 1.3 T1-T8 基线非目标（历史边界）
+
+以下条目只约束已经完成的 T1-T8 网关适配阶段，不约束本文新增的 T9：
 
 - 不改 `tui_admin.py` 代码（零改动是验收项，不是可选项）。
 - 不实现 TUI 未调用的端点（如 chat/stream、models/download 等按主计划其他域处理）。
@@ -242,7 +244,7 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
 
 ---
 
-## 六、验收标准（Go/No-Go）
+## 六、T1-T8 验收标准（Go/No-Go）
 
 | # | 项 | 通过标准 |
 |---|----|----------|
@@ -287,9 +289,254 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
 | 2026-08-02 | `/logs/*` 阶段 2 由 legacy-control 承载、网关代理；阶段 3 切 control-svc | `buffer_*` 是进程内内存统计，TS 复刻成本高；代理保持契约不变 |
 | 2026-08-02 | 5 项细节（§3.1）以契约测试固化，不做口头约定 | 防止网关实现漂移；用例 39-42 进阶段 2 Go/No-Go |
 | 2026-08-02 | TUI 零改动为硬验收（`git diff` 为空） | TUI 是纯 urllib 客户端，改动任何一处都意味着契约已破坏 |
+| 2026-08-05 | 保留纯标准库管理 TUI，另建可选依赖聊天前端 | 管理端需要极低部署门槛；聊天端需要异步 SSE、Markdown、长文本滚动和多行输入，不应继续手写完整终端框架 |
+| 2026-08-05 | T9 先统一真流式与会话提交契约，再做视觉页面 | 当前 `full` 有完整会话但只发最终事件，`fast` 真流式但语义较轻；客户端不能用重复推理补持久化 |
 
 ---
 
-**文档版本**：1.0
+## 九、下一阶段 T9：简化聊天页面（规划）
+
+### 9.1 定位
+
+T9 在现有 7 屏管理能力之外增加第 8 个“对话”入口，交互风格参考 Claude Code 的终端会话，但只吸收适合 QLH 的部分：
+
+- 键盘优先、持续可滚动的对话 transcript。
+- 固定在底部的多行输入区，发送后响应原位真流式增长。
+- `/` 命令、历史导航、会话新建/恢复和明确的取消操作。
+- 顶部/底部状态条展示连接、模型、请求路由和生成状态。
+- 终端重绘后保留输入与对话，不因窗口缩放丢状态。
+
+T9 不是 Claude Code 的代码 Agent 复刻。首期不实现 shell 执行、文件编辑、工具权限确认、子 Agent、Git 操作、后台 Bash 或自动读取当前仓库；这些能力既不是 QLH 推理系统的必要条件，也会显著扩大安全面。
+
+官方交互参考：
+
+- [Claude Code Interactive mode](https://code.claude.com/docs/en/interactive-mode)：快捷键、多行输入、命令历史、`Ctrl+R`、transcript 和屏幕重绘。
+- [Claude Code Common workflows](https://code.claude.com/docs/en/common-workflows)：恢复历史会话和并行会话工作流。
+
+### 9.2 页面布局
+
+```text
+┌ QLH Chat ─ 会话: 调试流水线 ─ 模型: Qwen ─ 连接: master@100.x ┐
+│                                                                  │
+│ You                                                              │
+│   为什么这个请求没有走从节点？                                   │
+│                                                                  │
+│ Assistant                                                        │
+│   正在生成的 Markdown / code block / 普通文本……                  │
+│                                                                  │
+│   Pipeline 分布式 · master -> worker-01 · 42 tokens · 18.3 tok/s │
+│                                                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ > 多行输入区                                                     │
+│   Enter 发送 · Alt+Enter/Ctrl+J 换行 · Ctrl+C 停止               │
+├──────────────────────────────────────────────────────────────────┤
+│ route:auto  dist:on  history:on  /help  /sessions  /status       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+布局要求：
+
+- Transcript 为主要区域，不把每条消息包成装饰性卡片；角色、正文和每轮指标按稳定行距排列。
+- 输入区高度随内容在 1-8 行内增长，超过后内部滚动，不能挤掉状态栏。
+- 终端宽度不足时指标换行；最小支持 60×18，低于下限时显示明确提示并允许退回管理 TUI。
+- 中文、宽字符、emoji、Markdown code fence 和 ANSI 转义必须正确计算显示宽度。
+- 生成期间只更新最后一条 assistant 消息，不整页闪烁，不因 token 到达改变输入焦点。
+
+### 9.3 技术路线
+
+建议采用“双入口、共享客户端”而不是直接重写当前稳定管理端：
+
+| 层 | 方案 | 说明 |
+|---|---|---|
+| 当前管理入口 | 保留 `src/tui_admin.py` | 纯标准库、7 屏、`--plain` 和单命令模式继续可用 |
+| 新聊天入口 | 新建 `src/tui_chat.py`，成熟后拆为 `src/tui/` 包 | 首期命令为 `bjtu chat`；验收完成前不替换 `bjtu` 默认入口 |
+| 终端框架 | 首选 Textual | 使用 App/Screen/Widget、异步 worker、Markdown/滚动容器和 TextArea，避免继续手写复杂流式布局 |
+| HTTP/SSE | `httpx.AsyncClient` | 处理 POST SSE、连接超时、取消、重连和请求 ID；按行解析现有 `data:` 事件 |
+| 共享层 | `TuiApiClient`、命令注册与格式化函数 | 管理/聊天入口共享模型、会话、路由和 metrics 解析，不复制端点字符串 |
+
+引入第三方依赖是有意决策，但必须隔离：
+
+1. 新增 `packaging/requirements-tui.txt`，锁定与项目 Python 3.10-3.12、现有 `httpx` 兼容的 Textual 版本。
+2. 源码用户使用项目内 `.venv-tui` 或已有项目虚拟环境；禁止静默写入系统/全局 Python。
+3. `bjtu chat` 缺依赖时只显示检测结果和明确命令，可在用户确认后调用 `scripts/setup_tui_env.py` 创建 `.venv-tui`。
+4. 安装引导尊重 `HTTPS_PROXY`、`PIP_INDEX_URL` 和用户指定镜像；网络失败保留重试命令，不让启动器循环弹窗。
+5. Windows/Linux 正式安装包直接携带 TUI 运行依赖，不要求最终用户首次启动联网安装。
+6. 可提供 wheelhouse 离线安装路径；无 Textual 时当前管理 TUI 和 `--plain` 不受影响。
+
+### 9.4 聊天与会话契约
+
+复用现有接口：
+
+| 接口 | T9 用途 |
+|---|---|
+| `POST /api/chat/stream` | 发送消息与 SSE token/done/error 事件 |
+| `POST /api/chat/generations/{id}/cancel` | `Ctrl+C` 或 `/cancel` 取消当前生成 |
+| `GET/POST/PUT/DELETE /api/sessions*` | 会话列表、新建、重命名、切换和删除 |
+| `GET/DELETE /api/conversations` | 恢复/清空当前会话消息 |
+| `GET /api/models/current` | 顶栏模型与引擎 |
+| `GET /api/cluster/config/distributed-inference` | 显示集群全局分布式开关，不作为实际参与证据 |
+
+正式实现前必须升级 chat stream 契约：
+
+1. 增加版本化 `interactive` 流式模式，或让 `full` 同时支持逐 token 与完成时事务提交历史；不能先调 `fast` 再重复调用 `full`。
+2. 客户端先生成合法 `generation_id` 并随请求发送，因此在收到第一个 token 前也能可靠取消。
+3. SSE 至少定义 `start`、`token`、`done`、`error`、`cancelled` 语义；保持对旧纯 `data:` 客户端兼容。
+4. `done` 必须包含最终正文、`metrics`、`generation_id`、`request_id`、会话提交结果和可选 followups。
+5. 客户端断开后服务端触发取消；迟到 token 不得写入已切换会话。
+6. 历史提交必须是 user + assistant 一次事务；取消时保留用户消息与已生成 partial 的策略必须先冻结，不能由客户端猜测。
+
+TUI SSE parser 必须处理 TCP chunk 任意切分、一个 chunk 多事件、UTF-8 多字节拆分、尾部无空行、keepalive、错误事件和服务端提前关闭。
+
+### 9.5 本地与分布式推理选择
+
+当前全局 `distributedInference` 开关不足以表达单次请求意图。T9 计划给 `ChatRequest` 增加向后兼容的请求级字段：
+
+```text
+routing_preference = auto | local_only | distributed_preferred | distributed_required
+```
+
+语义：
+
+| TUI 选择 | 后端行为 |
+|---|---|
+| `auto` | 沿用集群配置和 scheduler 决策 |
+| `local_only` | 本请求只在服务主节点本地完整引擎执行，不临时修改全局分布式开关 |
+| `distributed_preferred` | 优先选择合格分布式路径；不可用时允许本地回退并给出原因 |
+| `distributed_required` | 没有合格分布式 Provider/Worker 时明确失败，不静默回退 |
+
+“分布式”仍可能对应 PyTorch 层流水线、完整 Worker、任务链或后续其他 Provider。TUI 不根据开关、节点在线数或请求来源推断结果，只读取完成事件 metrics：
+
+- `distributed_requested`
+- `distributed_used`
+- `execution_mode` / `route`
+- `workers_used` / `layer_assignments`
+- `actual_providers`
+- `fallback` / `fallback_reason`
+- `serving_node_id`
+
+显示规则：
+
+- `distributed_used=true`：展示实际执行模式和参与节点，例如 `Pipeline 分布式 · master -> worker-01`。
+- 请求了分布式但 `distributed_used=false`：黄色显示 `已请求分布式，实际本地` 和后端原因。
+- `fallback=true`：即使最终成功，也必须展示 fallback reason。
+- 只有主节点本地执行时显示具体引擎，例如 `PyTorch 本地` 或 `llama.cpp 本地`，不显示模糊的“分布式：否”。
+- 从节点 TUI 若连接的是从节点 API，应引导切换到当前主节点 endpoint；聊天请求不绕过网关直打本地模型。
+
+### 9.6 输入、快捷键与命令
+
+基础快捷键：
+
+| 操作 | 默认键 | 说明 |
+|---|---|---|
+| 发送 | `Enter` | 输入为空时不发送 |
+| 换行 | `Alt+Enter` 或 `Ctrl+J` | `Shift+Enter` 仅在终端协议能可靠区分时作为别名 |
+| 停止生成 | `Ctrl+C` | 第一次取消当前 generation；空闲时不直接杀后端 |
+| 退出聊天页 | `Esc` | 返回管理主菜单，后端保持运行 |
+| 新会话 | `Ctrl+N` | 未提交输入先确认 |
+| 历史搜索 | `Ctrl+R` | 搜索本地已加载的输入历史；不在每次按键时请求后端 |
+| 重绘 | `Ctrl+L` | 修复终端残影，不清会话 |
+| 滚动 | `PgUp/PgDn`、鼠标滚轮 | 新 token 到达时仅在用户位于底部才自动跟随 |
+
+聊天输入框复用 `/` 命令体系，并新增：
+
+- `/new`：创建并切换新会话。
+- `/sessions`：打开会话选择器。
+- `/resume <session_id>`：恢复历史会话。
+- `/rename <title>`、`/delete-session`：会话管理。
+- `/route auto|local|distributed|required`：设置请求级路由偏好。
+- `/cancel`：取消当前 generation。
+- `/clear`：清空当前会话，必须确认。
+- `/thinking on|off`：控制是否请求/展示 thinking 内容。
+
+现有 `/model`、`/models`、`/switch`、`/quant`、`/engine`、`/dist`、`/status`、`/nodes`、`/help`、`/quit` 继续可用。模型切换和会话切换期间必须先取消当前生成，禁止旧请求结果落入新模型或新会话。
+
+### 9.7 内容渲染边界
+
+首期支持：
+
+- CommonMark 常用子集：段落、标题、列表、引用、行内代码、代码块和链接文本。
+- 代码块保留空格与横向滚动，不执行内容。
+- 思考内容默认折叠；只有请求 `show_thinking=true` 且后端确实返回时才可展开。
+- 大响应使用虚拟化/增量追加，设置单条和会话显示上限；完整历史仍由后端持久化。
+- 控制字符、终端 escape 和不可见字符必须转义，模型输出不能注入 ANSI 指令或改变终端标题。
+
+首期不支持图片内联、富媒体、文件拖放、语音输入、工具调用 UI 和任意 HTML 渲染。项目已有 `/api/chat/upload`，待基本聊天稳定后再规划文本附件选择器。
+
+### 9.8 实施步骤
+
+- [ ] **T9.0 契约冻结与 PoC**
+  - 冻结 `routing_preference`、interactive SSE 事件和会话取消/提交语义。
+  - 用 Textual + fake SSE 做单页 PoC，验证 Windows Terminal、PowerShell、Linux SSH 的中文、多行输入和逐 token 更新。
+  - 验收：无真实模型也能重放固定 SSE fixture；当前管理 TUI 零回归。
+
+- [ ] **T9.1 可选依赖与启动引导**
+  - 新增 `requirements-tui.txt`、环境检测、`.venv-tui` 创建脚本和 `bjtu chat` 启动路由。
+  - 增加代理、国内镜像、离线 wheelhouse 和失败恢复文案。
+  - 验收：干净 Windows/Linux 用户环境不污染全局解释器；拒绝安装仍可使用旧管理 TUI。
+
+- [ ] **T9.2 聊天页面与命令复用**
+  - 实现 transcript、Markdown、输入区、状态栏、滚动和第 8 屏入口。
+  - 抽取共享 API client、命令注册和 metrics formatter，不直接 import `tui_admin.py` 的交互主循环。
+  - 验收：80×24、120×30、窄终端与 CJK/emoji/code block 布局通过截图/快照测试。
+
+- [ ] **T9.3 真流式、取消与错误恢复**
+  - 接入 interactive SSE、预生成 generation ID、取消、断线和重连。
+  - 保留未发送输入；生成失败只结束当前 assistant 占位，不清空 transcript。
+  - 验收：首 token、连续 token、取消临界区、网络断开、服务端 error、空响应全部有确定状态。
+
+- [ ] **T9.4 会话与历史**
+  - 新建、恢复、重命名、删除会话；启动时恢复最近会话或由用户选择。
+  - 会话切换先取消生成，使用 epoch 丢弃迟到事件。
+  - 验收：主节点重启、远端数据库断开和本地存储模式下历史行为一致。
+
+- [ ] **T9.5 本地/分布式路由与真实指标**
+  - 接入请求级 `routing_preference` 和完成 metrics。
+  - 本机单模型验证 local；物理从节点可用后验证 distributed preferred/required、真实参与和 fallback。
+  - 验收：TUI、Web 前端和任务统计对同一 request_id 的执行模式、参与节点和回退原因一致。
+
+- [ ] **T9.6 打包、回归与默认入口决策**
+  - Windows/Linux 包包含聊天依赖；源码模式提供环境引导。
+  - 保持 `tui_admin.py --plain`、单命令和 7 屏管理契约回归。
+  - 经过真实使用窗口后再决定 `bjtu` 默认进入聊天还是继续进入管理菜单；在此之前 `bjtu chat` 显式启动。
+
+### 9.9 测试矩阵
+
+| 层 | 必测项 |
+|---|---|
+| SSE parser | 任意 chunk 切分、UTF-8、多个事件、done/error/cancelled、尾部残留 |
+| UI | 输入焦点、滚动跟随、缩放、CJK、Markdown、超长 code block、ANSI 注入 |
+| 会话 | new/resume/rename/delete、切换竞态、重启恢复、迟到 token fencing |
+| 推理 | local_only、distributed_preferred、distributed_required、分布式回退 |
+| 指标 | execution mode、workers、provider、fallback 与 Web/后端一致 |
+| 故障 | 网关 502、SSE 中断、模型未加载、OOM、取消超时、主节点切换 |
+| 环境 | 干净 venv、缺 Textual、代理、离线 wheelhouse、Windows/Linux 安装包 |
+| 回归 | T1-T8 契约、7 管理屏、`--plain`、单命令、优雅退出 |
+
+### 9.10 T9 发布门
+
+以下全部满足前，聊天页不得成为默认入口：
+
+1. 真流式与历史持久化是一次请求、一次生成、一次事务提交。
+2. `Ctrl+C` 能在首 token 前后取消，且不会把迟到结果写入其他会话。
+3. local 与 distributed 都经过真实模型验证；分布式参与以 metrics 和任务统计为证据。
+4. 请求分布式但实际回退时，页面明确显示原因。
+5. TUI 依赖安装不修改全局解释器；正式安装包首次运行不依赖联网下载。
+6. 现有管理 TUI 的 T1-T8 契约和低依赖回退入口保持可用。
+
+### 9.11 主要风险
+
+| 风险 | 处理 |
+|---|---|
+| Textual 与现有手写 ANSI 主循环互相干扰 | 两个进程入口，不在同一事件循环混用 |
+| full/fast 两种模式导致流式和历史二选一 | 先实现 interactive 契约，不做双请求补丁 |
+| Shift+Enter 在不同终端不可区分 | Alt+Enter/Ctrl+J 为稳定换行键，Shift+Enter 仅作能力别名 |
+| 模型输出包含 ANSI 控制序列 | 渲染前过滤/转义，Markdown renderer 禁止原始 HTML/escape |
+| 用户看到分布式开关就误以为从节点参与 | 只以完成 metrics 和实际 Worker 列表下结论 |
+| 切换会话/模型时旧流继续到达 | generation ID + session/model epoch fencing |
+| 新依赖让轻量 TUI 不再可用 | 保留 `tui_admin.py` 和 `--plain`，聊天环境为显式可选组件 |
+
+---
+
+**文档版本**：1.1
 **维护者**：QLH 开发团队
-**下次复核触发**：T6 完成（日志代理）、T7 完成（TUI 实测）各一次
+**下次复核触发**：T9.0 契约/PoC 结论，或 chat stream 契约发生变化时

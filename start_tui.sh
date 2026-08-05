@@ -31,6 +31,18 @@ echo "  QLH 分布式边缘推理 — TUI 管理菜单"
 echo "============================================"
 echo
 
+# ---- 单命令模式：bjtu shutdown / bjtu /shutdown / bjtu status ...
+#      直接执行一条 TUI 命令后退出，不启动/不等待后端（后端必须已在运行）。
+#      命令名/别名清单与 src/tui_admin.py 的 COMMANDS 注册表保持一致。
+#      注意：命令必须是第一个参数（bjtu status --port 9000）；
+#      选项在前（bjtu --port 9000 status）会回退为交互模式。
+FIRST_ARG="$1"
+case "$FIRST_ARG" in
+    /*|help|h|quit|q|exit|shutdown|halt|status|st|screen|goto|refresh|r|model|models|switch|load|quant|engine|presets|gpu|device|nodes|connect|dist|queue|logs|log|host|interval|timeout|token|chat|cancel)
+        exec "$PY" src/tui_admin.py "$@"
+        ;;
+esac
+
 # ---- [1/3] 检查后端是否已运行 ----
 if "$PY" - "$BACKEND_PORT" <<'EOF'
 import socket, sys
