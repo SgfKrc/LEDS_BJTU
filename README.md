@@ -4,7 +4,7 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8**（更新日期：2026-08-03，文档复核于 2026-08-03）
+**v0.1.8**（更新日期：2026-08-06，文档复核于 2026-08-06）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
@@ -716,6 +716,10 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1 Completed、SD-N2 In Progress、img2img 已实现待真实 GPU 验收）
+- [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
+- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 内容寻址模型仓库、跨节点部署与多集群档案（L4 Candidate）
+- [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
 
 ### 专项文档
 
@@ -726,6 +730,10 @@ python serve.py
 - [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分可行性
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
 - [Android llama.cpp Submodule 迁移方案](docs/Android%20llama.cpp%20Submodule迁移方案.md) — 锁定上游版本、离线缓存与维护窗口方案
+- [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC Full Worker v2（TC-N2.4 物理设备准入未过）
+- [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
+- [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
+- [数据库测试指南](docs/数据库测试指南.md) — PostgreSQL 依赖用例的运行方式与跳过条件
 
 ### 外部算力辅助（张量并行在异构 mesh 内不可行，改走集群外辅助）
 
@@ -737,6 +745,8 @@ python serve.py
 ### 工程文档
 
 - [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
+- [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9 简化聊天页规划（L4 Candidate）
+- [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
 

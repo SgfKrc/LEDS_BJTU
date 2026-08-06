@@ -1,9 +1,9 @@
 # SD 1.5 引擎与分布式图像生成实施计划
 
-> 文档状态：部分实施（`L4 Candidate`；SD-N1 已完成，SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；当前产品只支持文生图，图生图、局部重绘、指令式编辑、双人审核、发布包和分布式阶段均未完成，仍由《总体下一步计划》L4-SD1.5 管理优先级）
+> 文档状态：部分实施（`L4 Candidate`；SD-N1 已完成，SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；img2img 图生图后端全链路与前端工作区已实现待真实 GPU 验收；局部重绘、指令式编辑、双人审核、发布包和分布式阶段均未完成，仍由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
-> 更新日期：2026-08-05
+> 更新日期：2026-08-06
 >
 > 适用范围：Windows CUDA PC 上的 Stable Diffusion 1.5 本地文生图，以及后续图生图、局部重绘、指令式编辑和基于现有 TaskGraph/PC Full Worker 的跨 PC 图像批次分布式展示
 >
@@ -19,7 +19,7 @@
 | `SD-N1` 本地单机文生图 | `Completed`（2026-08-05） | RTX 4060 Laptop GPU（8,188 MiB）/ 16 GB RAM、`torch 2.5.1+cu121`、`diffusers 0.35.2`、`transformers 4.47.1`：固定 seed `19950101` 起的 10 次连续 512x512/28 steps FP16 baseline 均实际生成成功，耗时 6.909–11.778 s（平均 8.844 s）；另以 8-bit U-Net Linear 量化 + QKV 融合组合完成 512x512/28 steps，耗时 10.030 s，峰值 reserved 显存 3,735,027,712 bytes。新增本地资产登记、加载/卸载、异步 job、step 取消、结果查询/删除和有界内存 PNG blob，并接通单体 FastAPI、inference-svc 与 Nest 网关；自动化覆盖 LLM/SD 双向生命周期互斥、加载失败及取消/编码竞态。真实 inference-svc 路由验收完成 512x512/4 steps PNG（542,085 bytes），取消在第 1/50 步后 0.244 秒收敛且无 blob；SD 卸载后 Qwen 1.8B GGUF 在 5.471 秒内重载并完成最短对话。SD 卸载后仅余约 20 MiB CUDA 上下文 reserved，不残留模型显存。`diffusers 0.38.0` 会要求本项目兼容窗口外的 DINOv2 配置，故不作为打包组合。前端、发布包和分布式 Worker 属于后续阶段。 |
 | `SD-N2` 本地图像工作区 | `In Progress`（2026-08-05） | Web 主节点已接通本机 Diffusers 检查/登记、profile 加载、LLM/SD 显式互斥切换、原版/90s preset、异步 step 进度、取消和 PNG 生命周期。DreamBooth `aa8a082c...` 及逐权重 SHA 已冻结，4,874,690,864-byte 固定下载集合已实际下载、完整校验并生成 16 文件 manifest；独立脚本下载后服务端也能在目录刷新时自动发现并注册。90s 组合资产固定原版 SD 1.5 safety checker，组件缺失时 fail-closed。第二轮固定十种子自动门 10/10 通过：10 个唯一 PNG、0 个 safety flag、最小熵 7.855、最小文件 446,750 bytes，总耗时 111.712 s。双人目视与许可复核、正式离线发布包仍未完成，因此 SD-N2 不得标记完成。 |
 | single-file checkpoint、LoRA、ControlNet | 未实施 | Inspector 可以拒绝把 ControlNet 当完整模型；实际加载和组合仍未接入。 |
-| 图生图、局部重绘、指令式编辑 | 规划（`SD-N5`） | 当前 `/api/diffusion/generate` 和 Web 工作区只接受文本参数，没有输入图片上传、mask、`strength` 或编辑 pipeline；三条路线的共享 blob/API/生命周期和分阶段计划见 §6.4、§8。 |
+| 图生图 img2img、局部重绘、指令式编辑 | img2img 已实现待验收；其余未实施 | **img2img（2026-08-06）**：引擎 `SD15Engine.edit()` 复用已加载组件（`StableDiffusionImg2ImgPipeline.from_pipe`/`components`）、服务层 `submit_edit`/`validate_edit`（blob 租约、源图/mask 维度校验、strength 0.05–1.0）、单体 FastAPI 与 inference-svc 路由（`POST /api/diffusion/blobs` 上传、`POST /api/diffusion/edit`）、Nest 网关 multipart 转发与 Web 工作区（文生图/图生图模式、源图上传预览、strength、结果“继续编辑”）均已落地，自动化覆盖 79 passed；**尚未在真实 GPU 端到端验收，不得标记完成**。`inpaint`/`instruction` 模式后端显式拒绝（`DiffusionUnsupportedError`）。三条路线的共享 blob/API/生命周期和分阶段计划见 §6.4、§8。 |
 | API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 本地 API/UI/临时 blob 已实现，其余未实施 | 资产登记和 PNG 结果当前仅驻留本进程内存：最多 16 项、64 MiB、TTL 30 分钟；服务重启即丢失，不是 SD-N3 的跨节点 blob 协议。UI 固定显示“本地”，尚无 TaskGraph Stage、完整 Worker 或跨 PC 调度，不得计入分布式任务统计。 |
 | Android SD 推理 | 未实施 | Android 仍不承担完整 SD Worker 或层间拆分。 |
 
