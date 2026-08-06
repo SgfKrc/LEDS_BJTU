@@ -23,7 +23,11 @@ def main() -> int:
     parser.add_argument(
         "--asset-id",
         default="sd15_original_v1",
-        choices=("sd15_original_v1", "sd15_90s_retrovers_v1"),
+        choices=(
+            "sd15_original_v1",
+            "sd15_90s_retrovers_v1",
+            "sd15_ip_adapter_v1",
+        ),
     )
     parser.add_argument(
         "--accept-license",
@@ -71,10 +75,13 @@ def main() -> int:
     if status["state"] != "completed":
         return 1
     print(f"SD asset ready: {target}")
-    print(
-        "Next: python scripts/quality_gate_sd15.py "
-        f"--asset-id {args.asset_id}"
-    )
+    if spec.artifact_kind == "sd15_pipeline":
+        print(
+            "Next: python scripts/quality_gate_sd15.py "
+            f"--asset-id {args.asset_id}"
+        )
+    else:
+        print("Next: run the SD15 IP-Adapter reference-image GPU gate")
     return 0
 
 

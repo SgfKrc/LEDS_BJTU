@@ -93,6 +93,8 @@ def main() -> int:
     parser.add_argument("--profile", default="balanced")
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--cancel-steps", type=int, default=50)
+    parser.add_argument("--img2img-strength", type=float, default=0.55)
+    parser.add_argument("--skip-img2img", action="store_true")
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--llm-model-id", default="qwen-1_8b")
     parser.add_argument("--skip-llm", action="store_true")
@@ -103,6 +105,10 @@ def main() -> int:
         raise SystemExit(f"SD model directory not found: {model_path}")
     if args.steps <= 0 or args.cancel_steps <= args.steps:
         raise SystemExit("--cancel-steps must be greater than --steps, both positive")
+    if not 0.05 <= args.img2img_strength <= 1.0:
+        raise SystemExit("--img2img-strength must be between 0.05 and 1.0")
+    if not args.skip_img2img and int(args.steps * args.img2img_strength) < 1:
+        raise SystemExit("steps * img2img strength must produce at least one denoising step")
 
     report: dict[str, Any] = {
         "model_path": str(model_path),
@@ -188,6 +194,71 @@ def main() -> int:
             "image_size": list(image_size),
             "image_extrema": image_extrema,
         }
+
+        if not args.skip_img2img:
+            edit_started = time.perf_counter()
+            edited = _expect(
+                client.post(
+                    "/v1/diffusion/edit",
+                    json={
+                        "mode": "img2img",
+                        "source_blob_id": blob_id,
+                        "prompt": "keep the composition and add warm sunset lighting",
+                        "negative_prompt": "blurry, distorted, low quality",
+                        "seed": 19950103,
+                        "steps": args.steps,
+                        "strength": args.img2img_strength,
+                    },
+                ),
+                202,
+            )
+            edit_completed = _wait_job(
+                client,
+                edited["job_id"],
+                {"completed", "failed"},
+                timeout=args.timeout,
+            )
+            if edit_completed["state"] != "completed":
+                raise RuntimeError(f"img2img failed: {edit_completed}")
+            edit_blob_id = edit_completed["blob"]["blob_id"]
+            edit_blob = client.get(f"/v1/diffusion/blobs/{edit_blob_id}")
+            if (
+                edit_blob.status_code != 200
+                or edit_blob.headers.get("content-type") != "image/png"
+            ):
+                raise RuntimeError(
+                    f"invalid img2img blob response: {edit_blob.status_code} "
+                    f"{edit_blob.headers}"
+                )
+            with Image.open(io.BytesIO(edit_blob.content)) as edit_image:
+                edit_image.load()
+                edit_size = edit_image.size
+                if edit_image.convert("RGB").getbbox() is None:
+                    raise RuntimeError("img2img pipeline returned an all-black image")
+
+            referenced_delete = client.delete(f"/v1/diffusion/blobs/{blob_id}")
+            if referenced_delete.status_code != 409:
+                raise RuntimeError(
+                    "source result deletion should be blocked while the edit result references it: "
+                    f"{referenced_delete.status_code} {referenced_delete.text[:500]}"
+                )
+            _expect(client.delete(f"/v1/diffusion/blobs/{edit_blob_id}"), 200)
+            _expect(client.delete(f"/v1/diffusion/blobs/{blob_id}"), 200)
+            report["img2img"] = {
+                "job_id": edited["job_id"],
+                "source_blob_id": blob_id,
+                "output_blob_id": edit_blob_id,
+                "source_delete_while_referenced_status": referenced_delete.status_code,
+                "strength": args.img2img_strength,
+                "progress": edit_completed.get("progress"),
+                "elapsed_seconds": edit_completed.get("metrics", {}).get(
+                    "elapsed_seconds"
+                ),
+                "lifecycle_seconds": round(time.perf_counter() - edit_started, 3),
+                "blob_bytes": len(edit_blob.content),
+                "blob_sha256": hashlib.sha256(edit_blob.content).hexdigest(),
+                "image_size": list(edit_size),
+            }
 
         cancellable = _expect(
             client.post(
