@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "profile_id": "prof_bad",
+  "name": "坏档案",
+  "cluster_id": "cluster_x",
+  "master_endpoint": {
+    "scheme": "ftp",
+    "host": "10.0.0.1",
+    "port": 99999
+  },
+  "status": "active",
+  "key_ref": "",
+  "node_role": "master"
+}

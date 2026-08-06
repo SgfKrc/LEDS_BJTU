@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "artifact_id": "not-a-digest",
+  "source": {
+    "provider": "huggingface",
+    "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+    "requested_revision": "main",
+    "resolved_revision": "abc"
+  },
+  "format": "safetensors",
+  "engine": "pytorch_transformers",
+  "family": "qwen2",
+  "files": [],
+  "capabilities": {
+    "full_worker": true,
+    "pytorch_layer_pipeline": false,
+    "llama_cpp": false,
+    "task_stage": true
+  },
+  "requirements": {"runtime_profile": "llm-cuda-v1"},
+  "license": {"id": "apache-2.0", "acceptance_required": false}
+}
