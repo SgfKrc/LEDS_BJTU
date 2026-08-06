@@ -98,13 +98,13 @@ class _Engine:
             metadata={"engine": "fake_sd15"},
         )
 
-    def edit(self, request, *, image, callback=None):
+    def edit(self, request, *, image, adapter=None, callback=None):
         self.started.set()
-        for step in range(request.steps):
+        for step in range(request.denoising_steps):
             if self.cancelled.is_set():
                 raise GenerationCancelled('cancelled')
             if callback:
-                callback(step + 1, request.steps)
+                callback(step + 1, request.denoising_steps)
         return SimpleNamespace(
             image=_Image(b'edited-png'),
             seed=request.seed,
@@ -177,11 +177,12 @@ def _wait_for_state(service, job_id, expected, timeout=2.0):
     raise AssertionError(f"job did not reach {expected}: {service.get_job(job_id)}")
 
 
-def _loaded_service(tmp_path, *, block=False, fail=False):
+def _loaded_service(tmp_path, *, block=False, fail=False, blob_store=None):
     factory = _EngineFactory(block=block, fail=fail)
     service = DiffusionService(
         inspector=_Inspector(),
         engine_factory=factory,
+        blob_store=blob_store,
     )
     registered = service.register_artifact(str(tmp_path), artifact_id="sd-test")
     service.load(registered.artifact_id, SD15EngineConfig(device="cpu", dtype="float32"))
@@ -336,6 +337,18 @@ def test_unknown_artifact_is_not_registered(tmp_path):
     try:
         with pytest.raises(ValueError, match="unknown fixture"):
             service.register_artifact(str(tmp_path))
+        assert service.list_artifacts() == []
+    finally:
+        service.close()
+
+
+def test_incomplete_ip_adapter_is_not_registered(tmp_path):
+    service = DiffusionService(
+        inspector=_Inspector('sd15_ip_adapter', loadable=False)
+    )
+    try:
+        with pytest.raises(ValueError, match='incomplete'):
+            service.register_artifact(str(tmp_path), artifact_id='ip-adapter')
         assert service.list_artifacts() == []
     finally:
         service.close()
@@ -538,11 +551,177 @@ def test_edit_contract_validates_blob_purpose_owner_and_mask_dimensions(tmp_path
         submitted = service.submit_edit(valid)
         assert submitted['kind'] == 'edit'
         assert submitted['input_blob_ids'] == [source.blob_id]
+        assert submitted['parameters']['denoising_steps'] == 21
+        assert submitted['progress']['total'] == 21
         assert store.get(source.blob_id).lease_count == 1
         completed = _wait_for_state(service, submitted['job_id'], 'completed')
         assert completed['blob']['parent_blob_ids'] == [source.blob_id]
         assert completed['blob']['metadata']['edit_mode'] == 'img2img'
         assert completed['blob']['metadata']['source_sha256'] == source.sha256
         assert store.get(source.blob_id).lease_count == 0
+        assert completed['progress'] == {'step': 21, 'total': 21}
+    finally:
+        service.close()
+
+
+def test_edit_request_rejects_zero_effective_denoising_steps():
+    request = SD15EditRequest(
+        mode='img2img',
+        source_blob_id='img_source',
+        prompt='change the lighting',
+        steps=2,
+        strength=0.35,
+        width=512,
+        height=512,
+    )
+
+    with pytest.raises(DiffusionInputError, match='at least one denoising step'):
+        request.validate()
+
+
+def test_reference_edit_requires_registered_ip_adapter_and_tracks_metadata(tmp_path):
+    store = MemoryImageBlobStore()
+    source = store.put_upload(
+        _encoded_image(size=(16, 16)),
+        purpose='input_image',
+        owner_scope='local',
+    )
+    service, _factory = _loaded_service(tmp_path, blob_store=store)
+    request = SD15EditRequest(
+        mode='reference',
+        source_blob_id=source.blob_id,
+        prompt='keep the same character in a new scene',
+        edit_adapter_id='ip-adapter',
+        ip_adapter_scale=0.6,
+        width=512,
+        height=512,
+        steps=2,
+    )
+    try:
+        with pytest.raises(DiffusionNotFoundError, match='ip-adapter'):
+            service.validate_edit(request)
+
+        service._inspector = _Inspector('sd15_ip_adapter', loadable=True)
+        service.register_artifact(
+            str(tmp_path / 'ip-adapter'),
+            artifact_id='ip-adapter',
+        )
+        validated = service.validate_edit(request)
+        assert validated['edit_adapter']['artifact_id'] == 'ip-adapter'
+        assert validated['edit_adapter']['artifact']['sha256'] == 'a' * 64
+
+        submitted = service.submit_edit(request)
+        completed = _wait_for_state(service, submitted['job_id'], 'completed')
+
+        assert completed['progress'] == {'step': 2, 'total': 2}
+        assert completed['blob']['metadata']['edit_mode'] == 'reference'
+        assert completed['blob']['metadata']['edit_adapter_id'] == 'ip-adapter'
+        assert completed['blob']['metadata']['ip_adapter_scale'] == 0.6
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('scale', [-0.1, 2.1, float('nan')])
+def test_reference_edit_rejects_invalid_ip_adapter_scale(scale):
+    request = SD15EditRequest(
+        mode='reference',
+        source_blob_id='img_reference',
+        prompt='same character',
+        edit_adapter_id='ip-adapter',
+        ip_adapter_scale=scale,
+        width=512,
+        height=512,
+    )
+
+    with pytest.raises(DiffusionInputError, match='ip_adapter_scale'):
+        request.validate()
+
+
+def test_reference_edit_rejects_unvalidated_profile_before_queueing(tmp_path):
+    factory = _EngineFactory()
+    service = DiffusionService(
+        inspector=_Inspector(),
+        engine_factory=factory,
+    )
+    service.register_artifact(str(tmp_path), artifact_id='sd-test')
+    config = SD15EngineConfig(
+        device='cpu',
+        dtype='float32',
+        enable_attention_slicing=False,
+        enable_qkv_fusion=True,
+    )
+    service.load('sd-test', config)
+    source = service._blob_store.put_upload(
+        _encoded_image(size=(16, 16)),
+        purpose='input_image',
+        owner_scope='local',
+    )
+    service._inspector = _Inspector('sd15_ip_adapter', loadable=True)
+    service.register_artifact(str(tmp_path / 'ip-adapter'), artifact_id='ip-adapter')
+    request = SD15EditRequest(
+        mode='reference',
+        source_blob_id=source.blob_id,
+        prompt='same character',
+        edit_adapter_id='ip-adapter',
+        ip_adapter_scale=0.6,
+        width=512,
+        height=512,
+    )
+    try:
+        with pytest.raises(DiffusionUnsupportedError, match='non-quantized'):
+            service.submit_edit(request)
+        assert service.snapshot()['jobs'] == 0
+        assert service.snapshot()['active_job'] is None
+    finally:
+        service.close()
+
+
+def test_output_blob_can_be_reused_for_edit_with_the_same_owner(tmp_path):
+    store = MemoryImageBlobStore()
+    source = store.put_png(
+        _encoded_image(size=(16, 16)),
+        purpose='output',
+        owner_scope='inference-local',
+        width=16,
+        height=16,
+    )
+    service, _factory = _loaded_service(tmp_path, blob_store=store)
+    request = SD15EditRequest(
+        mode='img2img',
+        source_blob_id=source.blob_id,
+        prompt='continue editing the generated image',
+        width=512,
+        height=512,
+        steps=2,
+    )
+    try:
+        with pytest.raises(DiffusionNotFoundError):
+            service.validate_edit(request, owner_scope='local')
+
+        submitted = service.submit_edit(
+            request,
+            owner_scope='inference-local',
+        )
+        completed = _wait_for_state(service, submitted['job_id'], 'completed')
+
+        assert completed['owner_scope'] == 'inference-local'
+        assert completed['blob']['owner_scope'] == 'inference-local'
+        assert completed['blob']['parent_blob_ids'] == [source.blob_id]
+        assert store.get(source.blob_id).reference_count == 1
+    finally:
+        service.close()
+
+
+def test_generation_preserves_explicit_owner_scope(tmp_path):
+    service, _factory = _loaded_service(tmp_path)
+    try:
+        submitted = service.submit_generation(
+            SD15GenerationRequest(prompt='owned output', steps=1),
+            owner_scope='inference-local',
+        )
+        completed = _wait_for_state(service, submitted['job_id'], 'completed')
+
+        assert completed['owner_scope'] == 'inference-local'
+        assert completed['blob']['owner_scope'] == 'inference-local'
     finally:
         service.close()

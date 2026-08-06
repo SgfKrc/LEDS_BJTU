@@ -230,6 +230,18 @@ export async function startFakeInference(): Promise<FakeInference> {
     }
 
     if (method === 'POST' && path === '/v1/diffusion/edit') {
+      const mode = body && typeof body === 'object'
+        ? (body as { mode?: unknown }).mode
+        : undefined;
+      if (mode === 'img2img') {
+        res.writeHead(202, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          job_id: 'sdedit_test',
+          state: 'queued',
+          kind: 'edit',
+        }));
+        return;
+      }
       res.writeHead(501, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         detail: {

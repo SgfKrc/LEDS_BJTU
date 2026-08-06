@@ -41,6 +41,9 @@ class _ConfigurableFakePipeline:
     def enable_attention_slicing(self):
         self.calls.append("attention_slicing")
 
+    def set_progress_bar_config(self, **kwargs):
+        self.calls.append(("progress", kwargs))
+
     def fuse_qkv_projections(self, *, unet, vae):
         self.calls.append(("qkv_fusion", unet, vae))
 
@@ -180,10 +183,12 @@ def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
 
     class _Img2ImgPipeline:
         created_from = None
+        created_dtype = None
 
         @classmethod
-        def from_pipe(cls, pipeline):
+        def from_pipe(cls, pipeline, *, torch_dtype=None):
             cls.created_from = pipeline
+            cls.created_dtype = torch_dtype
             return cls()
 
         def enable_attention_slicing(self):
@@ -195,12 +200,13 @@ def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
         def __call__(self, *, image, strength, callback_on_step_end, num_inference_steps, **_kwargs):
             assert image.size == (512, 512)
             assert strength == 0.4
-            for step in range(num_inference_steps):
+            for step in range(int(num_inference_steps * strength)):
                 callback_on_step_end(self, step, None, {})
             return SimpleNamespace(images=['edited-image'])
 
     monkeypatch.setattr(diffusers, 'StableDiffusionImg2ImgPipeline', _Img2ImgPipeline)
     engine = _loaded_fake_engine()
+    engine._pipeline.dtype = 'float16'
     request = SD15EditRequest(
         mode='img2img',
         source_blob_id='img_source',
@@ -208,7 +214,7 @@ def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
         strength=0.4,
         width=512,
         height=512,
-        steps=2,
+        steps=3,
     )
     progress = []
     result = engine.edit(
@@ -218,10 +224,225 @@ def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
     )
 
     assert result.image == 'edited-image'
-    assert progress == [(1, 2), (2, 2)]
+    assert progress == [(1, 1)]
     assert result.metadata['engine'] == 'diffusers_sd15_img2img'
     assert result.metadata['strength'] == 0.4
     assert _Img2ImgPipeline.created_from is engine._pipeline
+    assert _Img2ImgPipeline.created_dtype == 'float16'
+
+
+def test_reference_mode_loads_local_ip_adapter_and_reports_identity(monkeypatch):
+    class _ReferencePipeline(_FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.loaded = []
+            self.scales = []
+            self.calls = []
+
+        def disable_attention_slicing(self):
+            self.calls.append(('attention_slicing', 'disabled'))
+
+        def enable_attention_slicing(self):
+            self.calls.append(('attention_slicing', 'enabled'))
+
+        def load_ip_adapter(self, path, **kwargs):
+            self.loaded.append((path, kwargs))
+
+        def set_ip_adapter_scale(self, scale):
+            self.scales.append(scale)
+
+        def unload_ip_adapter(self):
+            self.loaded.append(('unloaded', {}))
+
+        def __call__(self, *, callback_on_step_end, num_inference_steps, ip_adapter_image=None, **kwargs):
+            if ip_adapter_image is not None:
+                self.calls.append((ip_adapter_image.size, kwargs))
+            for step in range(num_inference_steps):
+                callback_on_step_end(self, step, None, {})
+            return SimpleNamespace(
+                images=['reference-image' if ip_adapter_image is not None else 'generated-image']
+            )
+
+    monkeypatch.setattr(
+        'diffusion.sd15_engine.resolve_sd15_ip_adapter_layout',
+        lambda _path: {
+            'root': 'C:/models/ip-adapter',
+            'subfolder': 'models',
+            'weight_name': 'ip-adapter_sd15.safetensors',
+            'image_encoder_folder': 'models/image_encoder',
+        },
+    )
+    engine = SD15Engine()
+    engine._pipeline = _ReferencePipeline()
+    engine._diffusers_logging = _FakeDiffusersLogging()
+    engine._device = 'cpu'
+    adapter = DiffusionArtifact(
+        path='C:/models/ip-adapter',
+        artifact_kind='sd15_ip_adapter',
+        precision='fp16',
+        sha256='b' * 64,
+        loadable=True,
+    )
+    request = SD15EditRequest(
+        mode='reference',
+        source_blob_id='img_reference',
+        prompt='same character in a city',
+        edit_adapter_id='ip-adapter',
+        ip_adapter_scale=0.65,
+        width=512,
+        height=512,
+        steps=2,
+    )
+
+    result = engine.edit(
+        request,
+        image=Image.new('RGB', (16, 16), 127),
+        adapter=adapter,
+    )
+
+    assert result.image == 'reference-image'
+    assert result.metadata['engine'] == 'diffusers_sd15_ip_adapter'
+    assert result.metadata['ip_adapter_scale'] == 0.65
+    assert result.metadata['ip_adapter_sha256'] == 'b' * 64
+    assert engine._pipeline.scales == [0.65]
+    assert engine._pipeline.loaded[0][1]['local_files_only'] is True
+    assert engine._pipeline.calls[0] == ('attention_slicing', 'disabled')
+    assert engine._pipeline.calls[1][0] == (16, 16)
+
+    engine.generate(SD15GenerationRequest(prompt='plain generation', steps=1))
+
+    assert ('attention_slicing', 'enabled') in engine._pipeline.calls
+    assert engine._ip_adapter_identity is None
+
+
+def test_reference_mode_refreshes_cuda_cpu_offload_hooks_after_load_and_unload(monkeypatch):
+    class _OffloadedReferencePipeline(_FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.offload_devices = []
+            self.lifecycle = []
+
+        def disable_attention_slicing(self):
+            return None
+
+        def enable_attention_slicing(self):
+            return None
+
+        def load_ip_adapter(self, _path, **_kwargs):
+            return None
+
+        def set_ip_adapter_scale(self, _scale):
+            return None
+
+        def unload_ip_adapter(self):
+            self.lifecycle.append('unload_adapter')
+
+        def remove_all_hooks(self):
+            self.lifecycle.append('remove_hooks')
+
+        def enable_model_cpu_offload(self, *, device):
+            self.offload_devices.append(device)
+
+    monkeypatch.setattr(
+        'diffusion.sd15_engine.resolve_sd15_ip_adapter_layout',
+        lambda _path: {
+            'root': 'C:/models/ip-adapter',
+            'subfolder': 'models',
+            'weight_name': 'ip-adapter_sd15.safetensors',
+            'image_encoder_folder': 'models/image_encoder',
+        },
+    )
+    engine = SD15Engine()
+    engine._pipeline = _OffloadedReferencePipeline()
+    engine._device = 'cuda'
+    adapter = DiffusionArtifact(
+        path='C:/models/ip-adapter',
+        artifact_kind='sd15_ip_adapter',
+        sha256='c' * 64,
+        loadable=True,
+    )
+
+    engine._ensure_ip_adapter(engine._pipeline, adapter, scale=0.6)
+    engine._unload_ip_adapter(engine._pipeline)
+
+    assert engine._pipeline.offload_devices == ['cuda', 'cuda']
+    assert engine._pipeline.lifecycle == ['remove_hooks', 'unload_adapter']
+
+
+def test_img2img_rebinds_cuda_cpu_offload_to_shared_edit_pipeline(monkeypatch):
+    class _OffloadedImg2ImgPipeline:
+        def __init__(self):
+            self.offload_devices = []
+
+        def enable_model_cpu_offload(self, *, device):
+            self.offload_devices.append(device)
+
+        def __call__(
+            self,
+            *,
+            callback_on_step_end,
+            num_inference_steps,
+            image,
+            strength,
+            **_kwargs,
+        ):
+            assert image.size == (512, 512)
+            assert strength == 0.55
+            callback_on_step_end(self, 0, None, {})
+            return SimpleNamespace(images=['edited-image'])
+
+    engine = SD15Engine()
+    engine._pipeline = _FakePipeline()
+    engine._diffusers_logging = _FakeDiffusersLogging()
+    engine._device = 'cuda'
+    edit_pipeline = _OffloadedImg2ImgPipeline()
+    monkeypatch.setattr(engine, '_get_img2img_pipeline', lambda _pipeline: edit_pipeline)
+    request = SD15EditRequest(
+        mode='img2img',
+        source_blob_id='img_source',
+        prompt='change the lighting',
+        strength=0.55,
+        width=512,
+        height=512,
+        steps=2,
+    )
+
+    result = engine.edit(
+        request,
+        image=Image.new('RGB', (16, 16), 127),
+    )
+
+    assert result.image == 'edited-image'
+    assert edit_pipeline.offload_devices == ['cuda']
+
+
+def test_reference_mode_rejects_unvalidated_qkv_profile():
+    engine = SD15Engine(
+        SD15EngineConfig(enable_attention_slicing=False, enable_qkv_fusion=True)
+    )
+    engine._pipeline = _FakePipeline()
+    engine._diffusers_logging = _FakeDiffusersLogging()
+    adapter = DiffusionArtifact(
+        path='C:/models/ip-adapter',
+        artifact_kind='sd15_ip_adapter',
+        loadable=True,
+    )
+    request = SD15EditRequest(
+        mode='reference',
+        source_blob_id='img_reference',
+        prompt='same character',
+        edit_adapter_id='ip-adapter',
+        ip_adapter_scale=0.6,
+        width=512,
+        height=512,
+    )
+
+    with pytest.raises(RuntimeError, match='QKV-fused'):
+        engine.edit(
+            request,
+            image=Image.new('RGB', (16, 16), 127),
+            adapter=adapter,
+        )
 
 
 def test_unrelated_pipeline_type_error_is_not_misreported_as_old_diffusers():
@@ -307,6 +528,7 @@ def test_configure_pipeline_applies_fusion_and_compile_to_resident_unet():
 
     assert configured is pipeline
     assert pipeline.calls == [
+        ("progress", {"disable": True}),
         "vae_slicing",
         ("qkv_fusion", True, False),
         ("to", "cuda"),
@@ -323,7 +545,12 @@ def test_default_pipeline_strategy_keeps_the_tested_cpu_offload_path():
     configured = engine._configure_pipeline(pipeline, use_cuda=True, torch=_FakeTorch())
 
     assert configured is pipeline
-    assert pipeline.calls == ["attention_slicing", "vae_slicing", "cpu_offload"]
+    assert pipeline.calls == [
+        ("progress", {"disable": True}),
+        "attention_slicing",
+        "vae_slicing",
+        "cpu_offload",
+    ]
 
 
 def test_fp32_dreambooth_snapshot_does_not_request_a_missing_fp16_variant():

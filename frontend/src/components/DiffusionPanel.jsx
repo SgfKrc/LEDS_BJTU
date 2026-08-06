@@ -22,6 +22,7 @@ import {
 } from '../api/client';
 import {
   buildEditRequest,
+  buildReferenceRequest,
   canUseLocalDiffusion,
   loadedArtifactId,
   normalizeDiffusionJob,
@@ -103,6 +104,7 @@ export default function DiffusionPanel({
   const [assetCatalog, setAssetCatalog] = useState([]);
   const [acceptedLicenses, setAcceptedLicenses] = useState({});
   const [selectedArtifactId, setSelectedArtifactId] = useState('');
+  const [selectedIpAdapterId, setSelectedIpAdapterId] = useState('');
   const [modelPath, setModelPath] = useState(getInitialModelPath);
   const [inspection, setInspection] = useState(null);
   const [profile, setProfile] = useState('balanced');
@@ -130,11 +132,24 @@ export default function DiffusionPanel({
     () => artifacts.find(item => item.artifact_id === selectedArtifactId) || null,
     [artifacts, selectedArtifactId],
   );
+  const modelArtifacts = useMemo(
+    () => artifacts.filter(item => item.artifact?.artifact_kind === 'sd15_pipeline'),
+    [artifacts],
+  );
+  const ipAdapterArtifacts = useMemo(
+    () => artifacts.filter(item => item.artifact?.artifact_kind === 'sd15_ip_adapter' && item.artifact?.loadable),
+    [artifacts],
+  );
   const normalizedJob = job ? normalizeDiffusionJob(job) : null;
   const jobActive = Boolean(normalizedJob && !normalizedJob.terminal);
   const missingDependencies = capabilities?.missing_dependencies
     || REQUIRED_DEPENDENCIES.filter(name => capabilities?.dependencies?.[name] !== true);
   const dependenciesReady = Boolean(capabilities && missingDependencies.length === 0);
+  const referenceProfileSupported = !capabilities?.engine_config
+    || (
+      capabilities.engine_config.quantization === 'none'
+      && capabilities.engine_config.qkv_fusion !== true
+    );
 
   const replaceResult = useCallback((next) => {
     const previous = resultRef.current;
@@ -165,12 +180,18 @@ export default function DiffusionPanel({
     setArtifacts(nextArtifacts);
     setAssetCatalog(assetData.assets || []);
     setSelectedArtifactId(previous => {
-      if (previous && nextArtifacts.some(item => item.artifact_id === previous)) {
+      if (previous && nextArtifacts.some(item => item.artifact_id === previous && item.artifact?.artifact_kind === 'sd15_pipeline')) {
         return previous;
       }
       return nextCapabilities.loaded_artifact?.artifact_id
-        || nextArtifacts[0]?.artifact_id
+        || nextArtifacts.find(item => item.artifact?.artifact_kind === 'sd15_pipeline')?.artifact_id
         || '';
+    });
+    setSelectedIpAdapterId(previous => {
+      if (previous && nextArtifacts.some(item => item.artifact_id === previous && item.artifact?.artifact_kind === 'sd15_ip_adapter' && item.artifact?.loadable)) {
+        return previous;
+      }
+      return nextArtifacts.find(item => item.artifact?.artifact_kind === 'sd15_ip_adapter' && item.artifact?.loadable)?.artifact_id || '';
     });
     setForm(previous => (
       previous.presetId
@@ -226,16 +247,20 @@ export default function DiffusionPanel({
     try {
       const inspected = await inspectDiffusionArtifact(path, false);
       setInspection(inspected);
-      if (inspected.artifact_kind !== 'sd15_pipeline' || !inspected.loadable) {
-        throw new Error(inspected.warnings?.join('；') || '该路径不是完整的 SD 1.5 Diffusers 目录');
+      if (!['sd15_pipeline', 'sd15_ip_adapter'].includes(inspected.artifact_kind) || !inspected.loadable) {
+        throw new Error(inspected.warnings?.join('；') || '该路径不是完整的 SD 1.5 模型或 IP-Adapter 目录');
       }
       const registered = await registerDiffusionArtifact(path, {
         name: path.split(/[\\/]/).filter(Boolean).at(-1) || 'SD 1.5',
       });
       try { localStorage.setItem('qlh-sd-model-path', path); } catch (_) {}
       await refresh();
-      setSelectedArtifactId(registered.artifact_id);
-      onToast?.({ type: 'success', msg: `已登记图像模型: ${registered.name}` });
+      if (inspected.artifact_kind === 'sd15_ip_adapter') {
+        setSelectedIpAdapterId(registered.artifact_id);
+      } else {
+        setSelectedArtifactId(registered.artifact_id);
+      }
+      onToast?.({ type: 'success', msg: `已登记图像资产: ${registered.name}` });
     } catch (err) {
       setError(err.message);
       onToast?.({ type: 'error', msg: `模型登记失败: ${err.message}` });
@@ -280,7 +305,11 @@ export default function DiffusionPanel({
         throw new Error(completed.error || '图像模型下载失败');
       }
       await refresh();
-      setSelectedArtifactId(asset.artifact_id);
+      if (asset.artifact_kind === 'sd15_ip_adapter') {
+        setSelectedIpAdapterId(asset.artifact_id);
+      } else {
+        setSelectedArtifactId(asset.artifact_id);
+      }
       onToast?.({ type: 'success', msg: `图像模型已校验并登记: ${asset.name}` });
     } catch (err) {
       setError(err.message);
@@ -302,7 +331,11 @@ export default function DiffusionPanel({
         acceptedLicenses[asset.asset_id] === true,
       );
       await refresh();
-      setSelectedArtifactId(asset.artifact_id);
+      if (asset.artifact_kind === 'sd15_ip_adapter') {
+        setSelectedIpAdapterId(asset.artifact_id);
+      } else {
+        setSelectedArtifactId(asset.artifact_id);
+      }
       onToast?.({ type: 'success', msg: `离线资产包校验通过: ${asset.name}` });
     } catch (err) {
       setError(err.message);
@@ -381,9 +414,10 @@ export default function DiffusionPanel({
           blobId: snapshot.blob.blob_id,
           url: URL.createObjectURL(fetched.blob),
           sizeBytes: fetched.blob.size,
-          mode: requestSnapshot.mode === 'img2img' ? 'img2img' : 'txt2img',
+          mode: ['img2img', 'reference'].includes(requestSnapshot.mode) ? requestSnapshot.mode : 'txt2img',
           strength: requestSnapshot.mode === 'img2img' ? requestSnapshot.strength : null,
-          sourceBlobId: requestSnapshot.mode === 'img2img' ? requestSnapshot.source_blob_id : null,
+          ipAdapterScale: requestSnapshot.mode === 'reference' ? requestSnapshot.ip_adapter_scale : null,
+          sourceBlobId: ['img2img', 'reference'].includes(requestSnapshot.mode) ? requestSnapshot.source_blob_id : null,
           seed: snapshot.parameters?.seed,
           width: snapshot.parameters?.width,
           height: snapshot.parameters?.height,
@@ -478,7 +512,9 @@ export default function DiffusionPanel({
     setAction('edit');
     setError('');
     try {
-      const requestSnapshot = buildEditRequest(form, sourceBlob.blobId);
+      const requestSnapshot = editMode === 'reference'
+        ? buildReferenceRequest(form, sourceBlob.blobId, selectedIpAdapterId)
+        : buildEditRequest(form, sourceBlob.blobId);
       const submitted = await editDiffusionImage(requestSnapshot);
       setJob(normalizeDiffusionJob(submitted));
       const token = pollTokenRef.current + 1;
@@ -491,7 +527,7 @@ export default function DiffusionPanel({
       });
     } catch (err) {
       setError(err.message);
-      onToast?.({ type: 'error', msg: `图生图失败: ${err.message}` });
+      onToast?.({ type: 'error', msg: `${editMode === 'reference' ? '参考图生成' : '图生图'}失败: ${err.message}` });
     } finally {
       setAction('');
     }
@@ -567,7 +603,7 @@ export default function DiffusionPanel({
   }
 
   return (
-    <section className="diffusion-workspace">
+    <section className="diffusion-workspace" data-testid="diffusion-workspace">
       <header className="diffusion-header">
         <div>
           <h2>图像生成</h2>
@@ -584,7 +620,12 @@ export default function DiffusionPanel({
             ↻
           </button>
           {capabilities?.loaded && (
-            <button className="btn-danger" onClick={handleUnload} disabled={Boolean(action)}>
+            <button
+              className="btn-danger"
+              data-testid="diffusion-unload"
+              onClick={handleUnload}
+              disabled={Boolean(action)}
+            >
               {action === 'unload' ? '卸载中...' : '卸载图像模型'}
             </button>
           )}
@@ -604,7 +645,7 @@ export default function DiffusionPanel({
             <section className="diffusion-section">
               <div className="diffusion-section-heading">
                 <h3>模型</h3>
-                <span>{artifacts.length} 个资产</span>
+                <span>{modelArtifacts.length} 个模型 · {ipAdapterArtifacts.length} 个适配器</span>
               </div>
               <div className="diffusion-asset-catalog">
                 {assetCatalog.map(asset => {
@@ -671,13 +712,19 @@ export default function DiffusionPanel({
               </div>
               <div className="path-register-row">
                 <input
+                  data-testid="diffusion-model-path"
                   value={modelPath}
                   onChange={event => setModelPath(event.target.value)}
-                  placeholder="本机 Diffusers 模型目录"
+                  placeholder="本机 Diffusers 模型或 IP-Adapter 目录"
                   disabled={Boolean(action)}
                   aria-label="本机 Diffusers 模型目录"
                 />
-                <button className="btn-ghost" onClick={handleInspectAndRegister} disabled={Boolean(action) || !modelPath.trim()}>
+                <button
+                  className="btn-ghost"
+                  data-testid="diffusion-register"
+                  onClick={handleInspectAndRegister}
+                  disabled={Boolean(action) || !modelPath.trim()}
+                >
                   {action === 'register' ? '检查中...' : '检查并登记'}
                 </button>
               </div>
@@ -692,12 +739,13 @@ export default function DiffusionPanel({
                 <label>
                   <span>已登记模型</span>
                   <select
+                    data-testid="diffusion-artifact-select"
                     value={selectedArtifactId}
                     onChange={event => setSelectedArtifactId(event.target.value)}
-                    disabled={Boolean(action) || artifacts.length === 0}
+                    disabled={Boolean(action) || modelArtifacts.length === 0}
                   >
-                    {artifacts.length === 0 && <option value="">尚无可用资产</option>}
-                    {artifacts.map(artifact => (
+                    {modelArtifacts.length === 0 && <option value="">尚无可用模型</option>}
+                    {modelArtifacts.map(artifact => (
                       <option key={artifact.artifact_id} value={artifact.artifact_id}>
                         {artifact.name} · {artifact.artifact.precision?.toUpperCase() || 'UNKNOWN'}
                       </option>
@@ -706,7 +754,12 @@ export default function DiffusionPanel({
                 </label>
                 <label>
                   <span>加载配置</span>
-                  <select value={profile} onChange={event => setProfile(event.target.value)} disabled={Boolean(action)}>
+                  <select
+                    data-testid="diffusion-profile"
+                    value={profile}
+                    onChange={event => setProfile(event.target.value)}
+                    disabled={Boolean(action)}
+                  >
                     {PROFILE_OPTIONS.map(option => (
                       <option key={option.id} value={option.id}>{option.label} · {option.detail}</option>
                     ))}
@@ -725,6 +778,7 @@ export default function DiffusionPanel({
               )}
               <button
                 className="btn-primary diffusion-load-button"
+                data-testid="diffusion-load"
                 onClick={handleLoad}
                 disabled={Boolean(action) || !selectedArtifactId || !dependenciesReady || (capabilities?.loaded && loadedId === selectedArtifactId)}
               >
@@ -748,6 +802,7 @@ export default function DiffusionPanel({
               <div className="mode-segment" role="group" aria-label="图像生成模式">
                 <button
                   type="button"
+                  data-testid="diffusion-mode-txt2img"
                   className={editMode === 'txt2img' ? 'active' : ''}
                   onClick={() => setEditMode('txt2img')}
                   disabled={Boolean(action) || jobActive}
@@ -756,18 +811,32 @@ export default function DiffusionPanel({
                 </button>
                 <button
                   type="button"
+                  data-testid="diffusion-mode-img2img"
                   className={editMode === 'img2img' ? 'active' : ''}
                   onClick={() => setEditMode('img2img')}
                   disabled={Boolean(action) || jobActive}
                 >
                   图生图
                 </button>
+                <button
+                  type="button"
+                  data-testid="diffusion-mode-reference"
+                  className={editMode === 'reference' ? 'active' : ''}
+                  onClick={() => setEditMode('reference')}
+                  disabled={Boolean(action) || jobActive}
+                >
+                  参考图
+                </button>
               </div>
-              {editMode === 'img2img' && (
+              {['img2img', 'reference'].includes(editMode) && (
                 <div className="edit-source-box">
                   {sourceBlob ? (
-                    <div className="edit-source-preview">
-                      <img src={sourceBlob.url} alt="图生图源图预览" />
+                    <div
+                      className="edit-source-preview"
+                      data-testid="diffusion-source-preview"
+                      data-blob-id={sourceBlob.blobId}
+                    >
+                      <img src={sourceBlob.url} alt={editMode === 'reference' ? '参考图预览' : '图生图源图预览'} />
                       <div className="edit-source-meta">
                         <span>{sourceBlob.name}</span>
                         <span>{formatBytes(sourceBlob.sizeBytes)}</span>
@@ -783,26 +852,65 @@ export default function DiffusionPanel({
                   ) : (
                     <label className="edit-source-upload">
                       <input
+                        data-testid="diffusion-source-input"
                         type="file"
                         accept="image/*"
                         onChange={handleSourceUpload}
                         disabled={Boolean(action) || jobActive || !capabilities?.loaded}
                       />
-                      <span>{action === 'upload' ? '上传中...' : '选择源图上传'}</span>
+                      <span>{action === 'upload' ? '上传中...' : editMode === 'reference' ? '选择人物参考图' : '选择源图上传'}</span>
                     </label>
                   )}
-                  <label className="stacked-field">
-                    <span>Strength（重绘幅度）</span>
-                    <input
-                      type="number"
-                      min="0.05"
-                      max="1"
-                      step="0.05"
-                      value={form.strength}
-                      onChange={event => updateForm('strength', event.target.value)}
-                      disabled={Boolean(action) || jobActive}
-                    />
-                  </label>
+                  {editMode === 'img2img' ? (
+                    <label className="stacked-field">
+                      <span>Strength（重绘幅度）</span>
+                      <input
+                        data-testid="diffusion-strength"
+                        type="number"
+                        min="0.05"
+                        max="1"
+                        step="0.05"
+                        value={form.strength}
+                        onChange={event => updateForm('strength', event.target.value)}
+                        disabled={Boolean(action) || jobActive}
+                      />
+                    </label>
+                  ) : (
+                    <>
+                      <label className="stacked-field">
+                        <span>IP-Adapter</span>
+                        <select
+                          data-testid="diffusion-ip-adapter-select"
+                          value={selectedIpAdapterId}
+                          onChange={event => setSelectedIpAdapterId(event.target.value)}
+                          disabled={Boolean(action) || jobActive || ipAdapterArtifacts.length === 0}
+                        >
+                          {ipAdapterArtifacts.length === 0 && <option value="">尚未登记适配器</option>}
+                          {ipAdapterArtifacts.map(artifact => (
+                            <option key={artifact.artifact_id} value={artifact.artifact_id}>{artifact.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="stacked-field">
+                        <span>参考图强度</span>
+                        <input
+                          data-testid="diffusion-ip-adapter-scale"
+                          type="number"
+                          min="0"
+                          max="2"
+                          step="0.05"
+                          value={form.ipAdapterScale}
+                          onChange={event => updateForm('ipAdapterScale', event.target.value)}
+                          disabled={Boolean(action) || jobActive}
+                        />
+                      </label>
+                      {!referenceProfileSupported && (
+                        <div className="diffusion-alert warning">
+                          当前加载配置尚未通过 IP-Adapter 兼容性门，请切换平衡或常驻 FP16 配置。
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
               <div className="preset-segment" role="group" aria-label="图像生成预设">
@@ -819,35 +927,47 @@ export default function DiffusionPanel({
               </div>
               <label className="stacked-field">
                 <span>Prompt</span>
-                <textarea value={form.prompt} onChange={event => updateForm('prompt', event.target.value)} rows={4} maxLength={4000} />
+                <textarea
+                  data-testid="diffusion-prompt"
+                  value={form.prompt}
+                  onChange={event => updateForm('prompt', event.target.value)}
+                  rows={4}
+                  maxLength={4000}
+                />
               </label>
               <label className="stacked-field">
                 <span>Negative prompt</span>
                 <textarea value={form.negativePrompt} onChange={event => updateForm('negativePrompt', event.target.value)} rows={2} maxLength={4000} />
               </label>
               <div className="parameter-grid">
-                <label><span>Seed</span><input type="number" value={form.seed} onChange={event => updateForm('seed', event.target.value)} /></label>
-                <label><span>Steps</span><input type="number" min="1" max="100" value={form.steps} onChange={event => updateForm('steps', event.target.value)} /></label>
+                <label><span>Seed</span><input data-testid="diffusion-seed" type="number" value={form.seed} onChange={event => updateForm('seed', event.target.value)} /></label>
+                <label><span>Steps</span><input data-testid="diffusion-steps" type="number" min="1" max="100" value={form.steps} onChange={event => updateForm('steps', event.target.value)} /></label>
                 <label><span>CFG</span><input type="number" min="0" max="30" step="0.5" value={form.guidanceScale} onChange={event => updateForm('guidanceScale', event.target.value)} /></label>
                 <label><span>宽度</span><input type="number" min="256" max="1024" step="8" value={form.width} onChange={event => updateForm('width', event.target.value)} /></label>
                 <label><span>高度</span><input type="number" min="256" max="1024" step="8" value={form.height} onChange={event => updateForm('height', event.target.value)} /></label>
               </div>
               <button
                 className="btn-primary generate-button"
-                onClick={jobActive ? handleCancel : (editMode === 'img2img' ? handleEdit : handleGenerate)}
-                disabled={Boolean(action) || (!jobActive && (!capabilities?.loaded || !form.prompt.trim() || (editMode === 'img2img' && !sourceBlob)))}
+                data-testid="diffusion-submit"
+                onClick={jobActive ? handleCancel : (['img2img', 'reference'].includes(editMode) ? handleEdit : handleGenerate)}
+                disabled={Boolean(action) || (!jobActive && (!capabilities?.loaded || !form.prompt.trim() || (['img2img', 'reference'].includes(editMode) && !sourceBlob) || (editMode === 'reference' && (!selectedIpAdapterId || !referenceProfileSupported))))}
               >
                 {jobActive
                   ? action === 'cancel' || normalizedJob?.cancel_requested ? '正在取消...' : '停止生成'
                   : action === 'generate' || action === 'edit' ? '提交中...'
-                    : editMode === 'img2img' ? '生成编辑图片' : '生成图片'}
+                    : editMode === 'img2img' ? '生成编辑图片' : editMode === 'reference' ? '按参考图生成' : '生成图片'}
               </button>
             </section>
           </div>
 
           <div className="diffusion-output">
             {normalizedJob && (
-              <div className={`generation-status job-${normalizedJob.state}`}>
+              <div
+                className={`generation-status job-${normalizedJob.state}`}
+                data-testid="diffusion-job-status"
+                data-job-id={normalizedJob.job_id}
+                data-job-state={normalizedJob.state}
+              >
                 <div className="generation-status-row">
                   <strong>{JOB_STATE_LABELS[normalizedJob.state] || normalizedJob.state}</strong>
                   <span>{normalizedJob.progress.step} / {normalizedJob.progress.total} steps</span>
@@ -859,19 +979,28 @@ export default function DiffusionPanel({
             )}
 
             {result ? (
-              <figure className="diffusion-result">
+              <figure
+                className="diffusion-result"
+                data-testid="diffusion-result"
+                data-blob-id={result.blobId}
+              >
                 <div className="diffusion-image-frame">
-                  <img src={result.url} alt={`Stable Diffusion 生成结果，seed ${result.seed}`} />
+                  <img
+                    data-testid="diffusion-result-image"
+                    src={result.url}
+                    alt={`Stable Diffusion 生成结果，seed ${result.seed}`}
+                  />
                 </div>
                 <figcaption>
                   <div className="result-facts">
                     <span className={`result-mode mode-${result.mode}`}>
-                      {result.mode === 'img2img' ? '图生图' : '文生图'}
+                      {result.mode === 'img2img' ? '图生图' : result.mode === 'reference' ? '参考图' : '文生图'}
                     </span>
                     <span>Seed {result.seed}</span>
                     <span>{result.width} × {result.height}</span>
                     <span>{result.steps} steps</span>
                     {result.strength != null && <span>Strength {result.strength}</span>}
+                    {result.ipAdapterScale != null && <span>参考强度 {result.ipAdapterScale}</span>}
                     <span>{formatSeconds(result.elapsedSeconds)}</span>
                     <span>{formatBytes(result.sizeBytes)}</span>
                     <span>本地</span>
@@ -879,6 +1008,7 @@ export default function DiffusionPanel({
                   <div className="result-actions">
                     <button
                       className="btn-ghost"
+                      data-testid="diffusion-continue-edit"
                       onClick={handleContinueEdit}
                       disabled={Boolean(action) || jobActive}
                       title="把当前结果作为源图进行图生图"
@@ -888,7 +1018,13 @@ export default function DiffusionPanel({
                     <a className="btn-primary result-download" href={result.url} download={`qlh-sd15-seed-${result.seed}.png`}>
                       ↓ 下载 PNG
                     </a>
-                    <button className="btn-danger" onClick={handleDeleteResult}>删除</button>
+                    <button
+                      className="btn-danger"
+                      data-testid="diffusion-delete-result"
+                      onClick={handleDeleteResult}
+                    >
+                      删除
+                    </button>
                   </div>
                 </figcaption>
               </figure>

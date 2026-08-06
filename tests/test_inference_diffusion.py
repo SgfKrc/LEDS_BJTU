@@ -23,6 +23,7 @@ class _DiffusionStub:
 
     def __init__(self):
         self.generated = None
+        self.generated_owner_scope = None
         self.loaded = None
         self.asset_downloads = []
         self.uploaded = None
@@ -71,8 +72,9 @@ class _DiffusionStub:
     def unload(self):
         return {"state": "unloaded", "loaded": False}
 
-    def submit_generation(self, generation):
+    def submit_generation(self, generation, *, owner_scope='local'):
         self.generated = generation
+        self.generated_owner_scope = owner_scope
         return {"job_id": "sdjob_test", "state": "queued"}
 
     def put_input_blob(self, data, *, purpose, owner_scope):
@@ -88,7 +90,9 @@ class _DiffusionStub:
 
     def submit_edit(self, edit_request, *, owner_scope):
         self.edit_request = (edit_request, owner_scope)
-        raise DiffusionUnsupportedError('edit executor is not installed')
+        if edit_request.mode not in {'img2img', 'reference'}:
+            raise DiffusionUnsupportedError('edit executor is not installed')
+        return {"job_id": "sdedit_test", "state": "queued", "kind": "edit"}
 
     def get_job(self, job_id):
         return {"job_id": job_id, "state": "completed", "blob": {"blob_id": "img_test"}}
@@ -157,6 +161,7 @@ def test_inference_diffusion_lifecycle_and_generation_contract():
     assert host._diffusion.generated.seed == 17
     assert host._diffusion.generated.steps == 3
     assert host._diffusion.generated.scheduler == "PNDMScheduler"
+    assert host._diffusion.generated_owner_scope == 'inference-local'
 
     assert client.get("/v1/diffusion/jobs/sdjob_test").status_code == 200
     assert client.post("/v1/diffusion/jobs/sdjob_test/cancel").status_code == 200
@@ -182,6 +187,33 @@ def test_inference_diffusion_upload_and_edit_contract():
         'input_image',
         'inference-local',
     )
+
+    img2img = client.post(
+        '/v1/diffusion/edit',
+        json={
+            'mode': 'img2img',
+            'source_blob_id': 'img_input',
+            'prompt': 'change the lighting',
+            'strength': 0.6,
+        },
+    )
+    assert img2img.status_code == 202
+    assert img2img.json()['job_id'] == 'sdedit_test'
+    assert host._diffusion.edit_request[1] == 'inference-local'
+
+    reference = client.post(
+        '/v1/diffusion/edit',
+        json={
+            'mode': 'reference',
+            'source_blob_id': 'img_input',
+            'prompt': 'same person in a city',
+            'edit_adapter_id': 'ip-adapter',
+            'ip_adapter_scale': 0.65,
+        },
+    )
+    assert reference.status_code == 202
+    assert host._diffusion.edit_request[0].mode == 'reference'
+    assert host._diffusion.edit_request[0].ip_adapter_scale == 0.65
 
     edited = client.post(
         '/v1/diffusion/edit',

@@ -55,6 +55,7 @@ class DiffusionAssetSpec:
     model_card_url: str
     preset_id: str
     files: tuple[DiffusionAssetFile, ...]
+    artifact_kind: str = "sd15_pipeline"
     safety_checker_required: bool = True
     composed: bool = False
     notes: tuple[str, ...] = ()
@@ -71,6 +72,8 @@ ORIGINAL_REPO = "stable-diffusion-v1-5/stable-diffusion-v1-5"
 ORIGINAL_REVISION = "451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
 RETRO_REPO = "Aleksandra11/90style_anime_face_model"
 RETRO_REVISION = "aa8a082c6a12d66ed995cca1ccb491bb171b9713"
+IP_ADAPTER_REPO = "h94/IP-Adapter"
+IP_ADAPTER_REVISION = "018e402774aeeddd60609b4ecdb7e298259dc729"
 
 
 def _file(
@@ -164,6 +167,30 @@ _RETRO_FILES = (
     ),
 )
 
+_IP_ADAPTER_FILES = (
+    _file(
+        "models/image_encoder/config.json",
+        560,
+        sha256="625d37b31afbf2f0792a87846b3654ee23f20568409e35b78a1f795b04e1a7a1",
+        repo=IP_ADAPTER_REPO,
+        revision=IP_ADAPTER_REVISION,
+    ),
+    _file(
+        "models/image_encoder/model.safetensors",
+        2528373448,
+        sha256="6ca9667da1ca9e0b0f75e46bb030f7e011f44f86cbfb8d5a36590fcd7507b030",
+        repo=IP_ADAPTER_REPO,
+        revision=IP_ADAPTER_REVISION,
+    ),
+    _file(
+        "models/ip-adapter_sd15.safetensors",
+        44642768,
+        sha256="289b45f16d043d0bf542e45831f971dcdaabe18b656f11e86d9dfba7e9ee3369",
+        repo=IP_ADAPTER_REPO,
+        revision=IP_ADAPTER_REVISION,
+    ),
+)
+
 
 ASSET_CATALOG: Dict[str, DiffusionAssetSpec] = {
     "sd15_original_v1": DiffusionAssetSpec(
@@ -193,6 +220,24 @@ ASSET_CATALOG: Dict[str, DiffusionAssetSpec] = {
         notes=(
             "DreamBooth repository has no safety checker; QLH composes the pinned SD 1.5 safety checker.",
             "Community validation is limited; complete the ten-seed and two-reviewer quality gate before demos.",
+        ),
+    ),
+    "sd15_ip_adapter_v1": DiffusionAssetSpec(
+        asset_id="sd15_ip_adapter_v1",
+        artifact_id="sd15_ip_adapter_v1",
+        name="IP-Adapter for Stable Diffusion 1.5",
+        repo_id=IP_ADAPTER_REPO,
+        revision=IP_ADAPTER_REVISION,
+        local_dir="models/sd15-ip-adapter-v1",
+        license_id="apache-2.0",
+        model_card_url=f"https://huggingface.co/{IP_ADAPTER_REPO}",
+        preset_id="",
+        files=_IP_ADAPTER_FILES,
+        artifact_kind="sd15_ip_adapter",
+        safety_checker_required=False,
+        notes=(
+            "Reference-image conditioning component; requires a separately loaded SD 1.5 base pipeline.",
+            "The first GPU gate only enables non-quantized, non-QKV SD15 profiles.",
         ),
     ),
 }
@@ -319,13 +364,14 @@ def verify_asset_directory(
         and not size_mismatches
         and not hash_mismatches
         and not composition_errors
-        and artifact.artifact_kind == "sd15_pipeline"
+        and artifact.artifact_kind == spec.artifact_kind
         and artifact.loadable
     )
     return {
         "asset_id": asset_id,
         "valid": valid,
         "path": str(root),
+        "artifact_sha256": _artifact_set_sha256(file_records),
         "artifact": artifact.to_dict(include_path=False),
         "missing": missing,
         "size_mismatches": size_mismatches,
@@ -338,9 +384,31 @@ def verify_asset_directory(
     }
 
 
+def _artifact_set_sha256(files: Iterable[Dict[str, Any]]) -> str:
+    records = [
+        {
+            "path": str(item.get("path", "")),
+            "size_bytes": int(item.get("size_bytes", 0)),
+            "sha256": str(item.get("sha256", "")),
+            "source_repo": str(item.get("source_repo", "")),
+            "source_revision": str(item.get("source_revision", "")),
+        }
+        for item in files
+    ]
+    payload = json.dumps(
+        sorted(records, key=lambda item: item["path"]),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _write_manifest(path: Path, spec: DiffusionAssetSpec, report: Dict[str, Any]) -> None:
+    artifact_sha256 = _artifact_set_sha256(report["files"])
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "artifact_sha256": artifact_sha256,
         "asset": {
             "asset_id": spec.asset_id,
             "artifact_id": spec.artifact_id,
@@ -350,6 +418,7 @@ def _write_manifest(path: Path, spec: DiffusionAssetSpec, report: Dict[str, Any]
             "license_id": spec.license_id,
             "model_card_url": spec.model_card_url,
             "preset_id": spec.preset_id,
+            "artifact_kind": spec.artifact_kind,
             "safety_checker_required": spec.safety_checker_required,
             "composed": spec.composed,
         },
@@ -436,6 +505,7 @@ class DiffusionAssetManager:
                     "license_id": spec.license_id,
                     "model_card_url": spec.model_card_url,
                     "preset_id": spec.preset_id,
+                    "artifact_kind": spec.artifact_kind,
                     "download_bytes": spec.download_bytes,
                     "present_bytes": _present_bytes(spec, target),
                     "installed": self._installed(spec),
@@ -654,6 +724,8 @@ __all__ = [
     "DiffusionAssetFile",
     "DiffusionAssetManager",
     "DiffusionAssetSpec",
+    "IP_ADAPTER_REPO",
+    "IP_ADAPTER_REVISION",
     "LOCAL_PROXY_FALLBACK",
     "MANIFEST_NAME",
     "get_asset_spec",

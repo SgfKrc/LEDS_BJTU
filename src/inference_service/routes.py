@@ -552,6 +552,7 @@ async def diffusion_edit(req: DiffusionEditRequest, request: Request):
             edit_adapter_id=req.edit_adapter_id,
             conditioning_scale=req.conditioning_scale,
             image_guidance_scale=req.image_guidance_scale,
+            ip_adapter_scale=req.ip_adapter_scale,
         )
         return _engine_host(request).diffusion_edit(
             edit_request,

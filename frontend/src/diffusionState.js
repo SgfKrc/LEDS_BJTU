@@ -5,6 +5,7 @@ export const DIFFUSION_TERMINAL_STATES = new Set([
 ]);
 
 export const EDIT_STRENGTH_DEFAULT = 0.75;
+export const IP_ADAPTER_SCALE_DEFAULT = 0.6;
 
 export function canUseLocalDiffusion(role) {
   return Boolean(role?.is_master || role?.runtime_node_role === 'master');
@@ -22,6 +23,7 @@ export function presetToForm(preset) {
       steps: 28,
       guidanceScale: 7.5,
       strength: EDIT_STRENGTH_DEFAULT,
+      ipAdapterScale: IP_ADAPTER_SCALE_DEFAULT,
       scheduler: '',
     };
   }
@@ -35,6 +37,7 @@ export function presetToForm(preset) {
     steps: Number(preset.steps ?? 28),
     guidanceScale: Number(preset.guidance_scale ?? 7.5),
     strength: EDIT_STRENGTH_DEFAULT,
+    ipAdapterScale: IP_ADAPTER_SCALE_DEFAULT,
     scheduler: preset.scheduler || '',
   };
 }
@@ -74,6 +77,27 @@ export function buildEditRequest(form, sourceBlobId) {
     strength: Number.isFinite(strength)
       ? Math.min(1, Math.max(0.05, strength))
       : EDIT_STRENGTH_DEFAULT,
+    scheduler: form.scheduler || null,
+  };
+}
+
+export function buildReferenceRequest(form, sourceBlobId, adapterId) {
+  const scale = Number(form?.ipAdapterScale ?? IP_ADAPTER_SCALE_DEFAULT);
+  return {
+    mode: 'reference',
+    preset_id: form.presetId || null,
+    source_blob_id: String(sourceBlobId || '').trim(),
+    edit_adapter_id: String(adapterId || '').trim(),
+    ip_adapter_scale: Number.isFinite(scale)
+      ? Math.min(2, Math.max(0, scale))
+      : IP_ADAPTER_SCALE_DEFAULT,
+    prompt: String(form.prompt || '').trim(),
+    negative_prompt: String(form.negativePrompt || '').trim(),
+    seed: Number(form.seed),
+    width: Number(form.width),
+    height: Number(form.height),
+    steps: Number(form.steps),
+    guidance_scale: Number(form.guidanceScale),
     scheduler: form.scheduler || null,
   };
 }

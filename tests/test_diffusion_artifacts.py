@@ -90,3 +90,69 @@ def test_invalid_diffusers_directory_reports_missing_components(tmp_path):
         "tokenizer",
         "scheduler",
     }
+
+
+def test_sd15_ip_adapter_directory_requires_adapter_and_image_encoder(tmp_path):
+    root = tmp_path / "ip-adapter"
+    models = root / "models"
+    image_encoder = models / "image_encoder"
+    image_encoder.mkdir(parents=True)
+    _write_safetensors_header(
+        models / "ip-adapter_sd15.safetensors",
+        {
+            "image_proj.proj.weight": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            },
+            "ip_adapter.1.to_k_ip.weight": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [2, 4],
+            },
+        },
+    )
+    (image_encoder / "config.json").write_text("{}", encoding="utf-8")
+    _write_safetensors_header(
+        image_encoder / "model.safetensors",
+        {
+            "vision_model.weight": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            }
+        },
+    )
+
+    artifact = DiffusionArtifactInspector().inspect(str(root), compute_hash=True)
+
+    assert artifact.artifact_kind == "sd15_ip_adapter"
+    assert artifact.loadable is True
+    assert artifact.precision == "fp16"
+    assert len(artifact.sha256) == 64
+
+
+def test_sd15_ip_adapter_without_image_encoder_fails_closed(tmp_path):
+    root = tmp_path / "ip-adapter"
+    root.mkdir()
+    _write_safetensors_header(
+        root / "ip-adapter_sd15.safetensors",
+        {
+            "image_proj.weight": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [0, 2],
+            },
+            "ip_adapter.weight": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [2, 4],
+            },
+        },
+    )
+
+    artifact = DiffusionArtifactInspector().inspect(str(root))
+
+    assert artifact.artifact_kind == "sd15_ip_adapter"
+    assert artifact.loadable is False
+    assert "image_encoder" in artifact.missing_components
