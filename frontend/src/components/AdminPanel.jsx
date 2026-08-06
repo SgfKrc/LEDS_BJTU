@@ -6,6 +6,7 @@ import {
   discoverMaster, resetMasterIdentity,
   manualRegisterNode, fetchMasterHealth,
   testEmailNotification,
+  fetchEmailConfig, updateEmailConfig,
   fetchDistributedInferenceConfig, updateDistributedInferenceConfig,
   fetchLayerAssignment, updateLayerAssignment, resetLayerAssignments,
   fetchConversationSyncStatus,
@@ -314,6 +315,13 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
   const [deletingNode, setDeletingNode] = useState(null);
   const [showOnlineOnly, setShowOnlineOnly] = useState(false);
 
+  // 管理员收件邮箱配置
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminEmailInput, setAdminEmailInput] = useState('');
+  const [emailSaving, setEmailSaving] = useState(false);
+  const [smtpConfigured, setSmtpConfigured] = useState(false);
+  const [emailSource, setEmailSource] = useState('');
+
   // 主节点健康状态（从节点监控）
   const [masterHealth, setMasterHealth] = useState(null);  // { master_online, stale, last_seen_seconds_ago }
 
@@ -497,6 +505,41 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
       }
     } catch (err) {
       onToast?.({ type: 'error', msg: `重置失败: ${err.message}` });
+    }
+  };
+
+  // ---- 管理员收件邮箱配置 ----
+  useEffect(() => {
+    let cancelled = false;
+    fetchEmailConfig()
+      .then((config) => {
+        if (cancelled) return;
+        setAdminEmail(config.recipient || '');
+        setAdminEmailInput(config.recipient || '');
+        setSmtpConfigured(Boolean(config.smtp_configured));
+        setEmailSource(config.source || '');
+      })
+      .catch(() => { /* 后端不支持或非主节点时静默，保持默认空态 */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleEmailConfigSave = async () => {
+    const email = adminEmailInput.trim();
+    if (!email) {
+      onToast?.({ type: 'error', msg: '请输入管理员收件邮箱' });
+      return;
+    }
+    setEmailSaving(true);
+    try {
+      const result = await updateEmailConfig(email);
+      setAdminEmail(result.recipient || '');
+      setAdminEmailInput(result.recipient || '');
+      setEmailSource('node_config');
+      onToast?.({ type: 'success', msg: `管理员收件邮箱已更新: ${result.recipient}` });
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `保存邮箱配置失败: ${err.message}` });
+    } finally {
+      setEmailSaving(false);
     }
   };
 
@@ -1889,14 +1932,47 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
           </section>
         )}
 
-        {/* ---- 邮件告警测试（所有节点） ---- */}
+        {/* ---- 邮件告警配置与测试（所有节点） ---- */}
         <section className="admin-section">
-          <h3>📧 邮件告警测试</h3>
+          <h3>📧 邮件告警</h3>
           <div className="identity-management">
             <p className="connect-desc">
               当从节点检测到主节点宕机超过 {180}s 时，将自动向管理员发送告警邮件。
-              恢复后也会发送恢复通知。点击下方按钮验证 SMTP 邮件配置是否正确。
+              恢复后也会发送恢复通知。收件邮箱可在此修改，保存后立即生效（写入本机
+              node_config.json，无需重启）。
             </p>
+            <div className="email-config-row">
+              <label className="email-config-label" htmlFor="admin-email-input">
+                管理员收件邮箱
+              </label>
+              <input
+                id="admin-email-input"
+                type="email"
+                value={adminEmailInput}
+                onChange={event => setAdminEmailInput(event.target.value)}
+                placeholder="admin@example.com"
+                disabled={emailSaving}
+              />
+              <button
+                className="btn-primary"
+                onClick={handleEmailConfigSave}
+                disabled={emailSaving}
+                style={{ fontSize: 13 }}
+              >
+                {emailSaving ? '⏳ 保存中...' : '💾 保存'}
+              </button>
+            </div>
+            <p className="setting-desc">
+              当前生效：{adminEmail ? <strong>{adminEmail}</strong> : '未配置'}
+              {emailSource === 'node_config' && '（本机配置）'}
+              {emailSource === 'env' && '（环境变量 QLH_SMTP_RECIPIENT）'}
+            </p>
+            {!smtpConfigured && (
+              <p className="setting-desc" style={{ color: 'var(--warning)' }}>
+                ⚠️ SMTP 发件账号未配置（需环境变量 QLH_SMTP_SENDER / QLH_SMTP_PASSWORD），
+                测试邮件将无法发送。
+              </p>
+            )}
             <div className="identity-actions">
               <button
                 className="btn-primary"

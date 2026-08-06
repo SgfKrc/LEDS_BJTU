@@ -11,6 +11,8 @@ import {
 import {
   fetchDiffusionBlob,
   fetchDiffusionJob,
+  fetchEmailConfig,
+  updateEmailConfig,
   editDiffusionImage,
   generateDiffusionImage,
   registerDiffusionArtifact,
@@ -169,6 +171,30 @@ test('diffusion blob API preserves binary PNG responses', async () => {
   assert.equal(requested.url, '/api/diffusion/blobs/image%2Fa');
   assert.equal(requested.options.headers.Accept, 'image/png');
 });
+
+test('email config API reads without secrets and posts the recipient', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    return new Response('{"ok":true}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    await fetchEmailConfig();
+    await updateEmailConfig('ops@example.com');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(requests[0].url, '/api/cluster/email-config');
+  assert.equal(requests[1].url, '/api/cluster/email-config');
+  assert.equal(requests[1].options.method, 'POST');
+  assert.deepEqual(JSON.parse(requests[1].options.body), { recipient: 'ops@example.com' });
+});
+
 
 test('diffusion upload leaves multipart boundaries to fetch and edit stays JSON', async () => {
   const originalFetch = globalThis.fetch;

@@ -48,10 +48,13 @@ for _k, _v in [
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
+import email_notifier
 from email_notifier import (
     SMTP_SERVER, SMTP_PORT, IMAP_SERVER, IMAP_PORT,
     SMTP_SENDER, SMTP_RECIPIENT,
     send_test_email, MailPoller,
+    get_admin_email, set_admin_email, admin_email_config,
+    get_mail_poller, _send_email,
 )
 
 
@@ -91,6 +94,81 @@ class TestSmtpConfig:
 # ================================================================
 # 邮件发送测试（需要真实网络）
 # ================================================================
+
+# ================================================================
+# 管理员收件邮箱配置（node_config 优先，回退环境变量）
+# ================================================================
+
+@pytest.fixture
+def isolated_node_config(tmp_path, monkeypatch):
+    """把 node_config 指向临时文件，并重置全局轮询器单例，隔离测试。"""
+    import node_config
+    config_path = tmp_path / "node_config.json"
+    monkeypatch.setattr(node_config, "get_node_config_path", lambda: config_path)
+    monkeypatch.setattr("email_notifier._mail_poller", None)
+    return config_path
+
+
+class TestAdminEmailConfig:
+    """测试 get/set_admin_email 的优先级、持久化与校验。"""
+
+    def test_falls_back_to_env_recipient(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env-admin@example.com")
+        assert get_admin_email() == "env-admin@example.com"
+        assert admin_email_config() == {
+            "recipient": "env-admin@example.com",
+            "source": "env",
+        }
+
+    def test_node_config_takes_priority(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env-admin@example.com")
+        set_admin_email("custom@example.com")
+        assert get_admin_email() == "custom@example.com"
+        assert admin_email_config()["source"] == "node_config"
+
+    def test_set_persists_and_normalizes(self, isolated_node_config):
+        set_admin_email("Ops@Example.com")
+        assert get_admin_email() == "ops@example.com"
+        # 模拟重启：重新读 node_config 仍生效
+        assert email_notifier._node_config_admin_email() == "ops@example.com"
+
+    def test_clear_removes_override(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env-admin@example.com")
+        set_admin_email("custom@example.com")
+        set_admin_email("")
+        assert get_admin_email() == "env-admin@example.com"
+        assert admin_email_config()["source"] == "env"
+
+    def test_invalid_email_rejected(self, isolated_node_config):
+        with pytest.raises(ValueError):
+            set_admin_email("not-an-email")
+
+    def test_send_email_uses_dynamic_recipient(self, isolated_node_config, monkeypatch):
+        captured = {}
+
+        def fake_send(subject, body, to_addr):
+            captured["to"] = to_addr
+            return True
+
+        monkeypatch.setattr("email_notifier._send_email_to", fake_send)
+        set_admin_email("alerts@example.com")
+        assert _send_email("subject", "body") is True
+        assert captured["to"] == "alerts@example.com"
+
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env@example.com")
+        set_admin_email("")
+        assert _send_email("subject", "body") is True
+        assert captured["to"] == "env@example.com"
+
+    def test_mail_poller_singleton_follows_updates(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env@example.com")
+        poller = get_mail_poller()
+        assert poller._admin_email == "env@example.com"
+        set_admin_email("custom@example.com")
+        assert poller._admin_email == "custom@example.com"
+        poller.set_admin_email("manual@example.com")
+        assert poller._admin_email == "manual@example.com"
+
 
 # ================================================================
 # P3: Y/N 投票解析测试（不需要网络）

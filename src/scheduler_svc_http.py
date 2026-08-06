@@ -442,7 +442,7 @@ async def test_email_notification():
     """
     发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
 
-    邮件将发送到 SMTP.md 中配置的目标邮箱。
+    邮件将发送到当前配置的管理员收件邮箱（node_config 优先，回退环境变量）。
     任何节点均可调用（主节点和从节点均可测试邮件发送）。
     """
     try:
@@ -457,6 +457,53 @@ async def test_email_notification():
         raise HTTPException(500, f"邮件模块导入失败: {e}")
     except Exception as e:
         raise HTTPException(500, f"邮件发送异常: {e}")
+
+
+class EmailConfigRequest(BaseModel):
+    # 允许空串：传空表示清除自定义配置、回退环境变量（set_admin_email 校验）
+    recipient: str = Field(..., max_length=320, description="管理员收件邮箱（空串=清除自定义配置）")
+
+
+@router.get("/cluster/email-config")
+async def get_email_config():
+    """
+    查询管理员收件邮箱配置（不返回任何 SMTP 凭据）。
+
+    Returns:
+        recipient: 当前生效收件邮箱（可能为空）
+        source: node_config | env | none
+        smtp_configured: 发件账号是否已配置
+    """
+    try:
+        from email_notifier import admin_email_config
+        from email_notifier import SMTP_SENDER, SMTP_PASSWORD
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    config = admin_email_config()
+    return {
+        "recipient": config["recipient"],
+        "source": config["source"],
+        "smtp_configured": bool(SMTP_SENDER and SMTP_PASSWORD),
+    }
+
+
+@router.post("/cluster/email-config")
+async def update_email_config(req: EmailConfigRequest):
+    """
+    设置管理员收件邮箱并持久化到 node_config.json，运行中立即生效。
+
+    传空字符串可清除自定义配置，回退到环境变量 QLH_SMTP_RECIPIENT。
+    """
+    try:
+        from email_notifier import set_admin_email
+        recipient = await run_in_threadpool(set_admin_email, req.recipient)
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"保存邮箱配置失败: {e}")
+    return {"status": "ok", "recipient": recipient}
 
 
 # ============================================================
