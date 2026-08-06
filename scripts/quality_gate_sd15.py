@@ -40,6 +40,37 @@ def _parse_reviewer(value: str) -> dict[str, str]:
     return {"name": name, "decision": decision}
 
 
+def _apply_manual_reviews(
+    report: dict[str, Any],
+    reviews: list[dict[str, str]],
+) -> str:
+    """登记人工审核结论（不重跑推理）；两名不同 pass 且无 fail → passed。"""
+    existing = list(report.get("manual_gate", {}).get("reviews", []))
+    by_name = {item["name"]: item for item in existing if item.get("name")}
+    for review in reviews:
+        by_name[review["name"]] = review
+    normalized = list(by_name.values())
+    failures = [item for item in normalized if item["decision"] == "fail"]
+    passes = {item["name"] for item in normalized if item["decision"] == "pass"}
+    manual_pass = len(passes) >= 2 and not failures
+    automatic_pass = bool(report.get("automatic_gate", {}).get("passed"))
+    status = (
+        "failed"
+        if not automatic_pass or failures
+        else "passed"
+        if manual_pass
+        else "pending_manual_review"
+    )
+    report["manual_gate"] = {
+        "passed": manual_pass,
+        "required_reviewers": 2,
+        "reviews": normalized,
+        "updated_at": time.time(),
+    }
+    report["status"] = status
+    return status
+
+
 def _image_metrics(image: Any, path: Path) -> dict[str, Any]:
     from PIL import ImageStat
 
@@ -76,8 +107,32 @@ def main() -> int:
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--reviewer", action="append", type=_parse_reviewer, default=[])
+    parser.add_argument(
+        "--review-report",
+        default="",
+        help="append manual reviewer decisions without rerunning inference",
+    )
     parser.add_argument("--require-manual", action="store_true")
     args = parser.parse_args()
+
+    # 登记模式：不重跑推理，只把审核结论写入既有报告
+    if args.review_report:
+        if not args.reviewer:
+            raise SystemExit("--review-report requires at least one --reviewer NAME=pass|fail")
+        report_path = Path(args.review_report).expanduser().resolve()
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read quality report: {report_path}: {exc}") from exc
+        if "automatic_gate" not in report:
+            raise SystemExit("--review-report must point to an SD 1.5 quality report")
+        status = _apply_manual_reviews(report, args.reviewer)
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"status": status, "report": str(report_path)}, ensure_ascii=False))
+        return 0 if status == "passed" else 2 if status == "pending_manual_review" else 1
 
     spec = get_asset_spec(args.asset_id)
     model_path = (
