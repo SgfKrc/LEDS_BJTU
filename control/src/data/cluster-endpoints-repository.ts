@@ -49,7 +49,7 @@ export class ClusterEndpointsRepository {
     ).all() as unknown as ClusterEndpointRow[];
   }
 
-  /** 幂等 upsert；同 cluster_id 只保留一条（endpoint 变更走 update）。 */
+  /** 幂等 upsert；cluster_id UNIQUE——同 cluster_id 更新 endpoint（不重复建群）。 */
   upsert(entry: ClusterEndpointInput): ClusterEndpointRow {
     const now = new Date().toISOString();
     this.store.prepare(
@@ -57,7 +57,8 @@ export class ClusterEndpointsRepository {
          (endpoint_id, cluster_id, name, scheme, host, port, status,
           last_verified_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(endpoint_id) DO UPDATE SET
+       ON CONFLICT(cluster_id) DO UPDATE SET
+         endpoint_id = excluded.endpoint_id,
          name = excluded.name, scheme = excluded.scheme,
          host = excluded.host, port = excluded.port,
          status = excluded.status, last_verified_at = excluded.last_verified_at`,

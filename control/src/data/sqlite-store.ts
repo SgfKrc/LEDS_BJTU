@@ -52,7 +52,7 @@ function migrateV1(db: DatabaseSync): void {
     );
     CREATE TABLE IF NOT EXISTS cluster_endpoints (
       endpoint_id TEXT PRIMARY KEY,
-      cluster_id TEXT NOT NULL,
+      cluster_id TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
       scheme TEXT NOT NULL,
       host TEXT NOT NULL,
@@ -185,13 +185,20 @@ export class SqliteStore {
     let writable = false;
     try {
       db.prepare('SELECT 1').get();
-      // 可写性：临时事务写回滚
       db.exec('BEGIN');
-      db.exec('INSERT INTO cluster_settings(key, value, updated_at) '
-        + "VALUES('__health_probe__', '1', 'epoch') "
-        + "ON CONFLICT(key) DO UPDATE SET value='1';");
-      db.exec('ROLLBACK');
-      writable = true;
+      try {
+        db.exec('INSERT INTO cluster_settings(key, value, updated_at) '
+          + "VALUES('__health_probe__', '1', 'epoch') "
+          + "ON CONFLICT(key) DO UPDATE SET value='1';");
+        db.exec('ROLLBACK');
+        writable = true;
+      } catch (probeErr) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // 连接层失败时回滚也失败，交由上层报只读故障
+        }
+      }
     } catch (err) {
       writable = false;
     }
@@ -202,6 +209,24 @@ export class SqliteStore {
       path: this.filePath,
       schema_version: this.schemaVersion,
     };
+  }
+
+  /** 单事务执行：业务行 + outbox 事件同事务（BEGIN/COMMIT/ROLLBACK）。 */
+  transaction<T>(fn: () => T): T {
+    const db = this.requireDb();
+    db.exec('BEGIN');
+    try {
+      const result = fn();
+      db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // 回滚失败时保持原异常
+      }
+      throw err;
+    }
   }
 
   /** SQLite backup API（在线备份到目标文件；模块级 backup(source, path)）。 */

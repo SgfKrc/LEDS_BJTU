@@ -64,26 +64,31 @@ export class SettingsController {
       return { status: 'skipped', reason: '数据库不可用' };
     }
     try {
-      // M1：本地事实源写入 + outbox 事件
-      this.localSettings.set('user_settings', JSON.stringify(settings));
-      if (typeof settings['saveHistory'] === 'boolean') {
-        this.localSettings.set(
-          'save_history', settings['saveHistory'] ? 'true' : 'false',
-        );
-      }
-      if (typeof settings['distributedInference'] === 'boolean') {
-        this.localSettings.set(
-          'distributed_inference_enabled',
-          settings['distributedInference'] ? 'true' : 'false',
-        );
-      }
-      this.outbox.enqueue('cluster_settings', 'updated', {
-        keys: SETTINGS_KEYS,
-        payload: settings,
+      // M1：本地事实源写入 + outbox 事件（同事务：域行与事件原子提交）
+      this.localSettings.transaction(() => {
+        this.localSettings.set('user_settings', JSON.stringify(settings));
+        if (typeof settings['saveHistory'] === 'boolean') {
+          this.localSettings.set(
+            'save_history', settings['saveHistory'] ? 'true' : 'false',
+          );
+        }
+        if (typeof settings['distributedInference'] === 'boolean') {
+          this.localSettings.set(
+            'distributed_inference_enabled',
+            settings['distributedInference'] ? 'true' : 'false',
+          );
+        }
+        this.outbox.enqueue('cluster_settings', 'updated', {
+          keys: SETTINGS_KEYS,
+          payload: settings,
+        });
       });
-      // 投影 pg（失败不阻断：远端为可选投影）
+      // 投影 pg（失败不阻断：远端为可选投影，但必须留痕）
       try {
-        await this.dao.setUserSettings(settings);
+        const projected = await this.dao.setUserSettings(settings);
+        if (!projected) {
+          this.logWarn('pg 投影失败（setUserSettings 返回 false）', '本地已写入');
+        }
       } catch (projectErr) {
         this.logWarn(projectErr, 'pg 投影失败（本地已写入，不阻断）');
       }

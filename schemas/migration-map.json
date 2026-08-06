@@ -20,7 +20,8 @@
           "huggingface_id": "source.repo_id",
           "quant_types": "quantizations",
           "is_experimental": "is_experimental",
-          "location": "origin"
+          "location": "origin",
+          "说明": "seed 整行 JSON 存入 catalog_models.payload（catalog seed 导出脚本已按此 field_map 生成）"
         }
       }
     },
@@ -31,14 +32,20 @@
       "id_field": "model_id",
       "idempotency": "model_id 唯一；迁移前先按文件 sha256 汇总，相同摘要只注册一次",
       "target": {
-        "table": "user_registry",
+        "table": "model_registry",
         "field_map": {
           "model_id": "model_id",
           "name": "name",
-          "model_path": "local_path",
+          "model_type": "model_type",
+          "model_path": "model_path",
           "gguf_path": "gguf_path",
-          "quant_type": "quantization",
-          "sha256": "files[0].sha256"
+          "recommended_vram_gb": "recommended_vram_gb",
+          "max_context": "max_context",
+          "huggingface_id": "huggingface_id",
+          "description": "description",
+          "quant_types": "quant_types",
+          "sha256": "sha256（可空；无摘要以 NULL 入库，M2 inspector 补齐）",
+          "其余字段": "payload JSON 整行保存（模型注册表 payload 模式）"
         }
       }
     },
@@ -59,7 +66,7 @@
   ],
   "target_tables": [
     "catalog_models",
-    "user_registry",
+    "model_registry",
     "cluster_settings",
     "cluster_profiles",
     "pull_jobs",

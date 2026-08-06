@@ -15,6 +15,11 @@ export interface ClusterSetting {
 export class ClusterSettingsRepository {
   constructor(private readonly store: SqliteStore) {}
 
+  /** 单事务执行（业务行 + outbox 同事务）。 */
+  transaction<T>(fn: () => T): T {
+    return this.store.transaction(fn);
+  }
+
   get(key: string): ClusterSetting | null {
     const row = this.store.prepare(
       'SELECT key, value, updated_at FROM cluster_settings WHERE key = ?',
