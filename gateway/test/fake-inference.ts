@@ -233,7 +233,7 @@ export async function startFakeInference(): Promise<FakeInference> {
       const mode = body && typeof body === 'object'
         ? (body as { mode?: unknown }).mode
         : undefined;
-      if (mode === 'img2img') {
+      if (mode === 'img2img' || mode === 'inpaint') {
         res.writeHead(202, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
           job_id: 'sdedit_test',

@@ -4,6 +4,7 @@ import hashlib
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -98,8 +99,14 @@ class _Engine:
             metadata={"engine": "fake_sd15"},
         )
 
-    def edit(self, request, *, image, adapter=None, callback=None):
+    def edit(self, request, *, image, mask=None, adapter=None, callback=None):
         self.started.set()
+        self.last_edit = {
+            'request': request,
+            'image': image,
+            'mask': mask,
+            'adapter': adapter,
+        }
         for step in range(request.denoising_steps):
             if self.cancelled.is_set():
                 raise GenerationCancelled('cancelled')
@@ -560,6 +567,77 @@ def test_edit_contract_validates_blob_purpose_owner_and_mask_dimensions(tmp_path
         assert completed['blob']['metadata']['source_sha256'] == source.sha256
         assert store.get(source.blob_id).lease_count == 0
         assert completed['progress'] == {'step': 21, 'total': 21}
+    finally:
+        service.close()
+
+
+def test_inpaint_queues_source_and_mask_with_a_dedicated_pipeline(tmp_path):
+    base_path = tmp_path / 'base'
+    inpaint_path = tmp_path / 'inpaint'
+    base_path.mkdir()
+    inpaint_path.mkdir()
+
+    class _KindByPathInspector:
+        def inspect(self, path, *, compute_hash=False):
+            is_inpaint = Path(path).name == 'inpaint'
+            return DiffusionArtifact(
+                path=str(path),
+                artifact_kind=(
+                    'sd15_inpaint_pipeline' if is_inpaint else 'sd15_pipeline'
+                ),
+                precision='fp16',
+                sha256=('b' * 64 if is_inpaint else 'a' * 64) if compute_hash else '',
+                loadable=True,
+            )
+
+    store = MemoryImageBlobStore()
+    source = store.put_upload(
+        _encoded_image(size=(16, 16)),
+        purpose='input_image',
+        owner_scope='local',
+    )
+    mask = store.put_upload(
+        _encoded_image(size=(16, 16), mode='L'),
+        purpose='mask',
+        owner_scope='local',
+    )
+    factory = _EngineFactory()
+    service = DiffusionService(
+        inspector=_KindByPathInspector(),
+        engine_factory=factory,
+        blob_store=store,
+    )
+    service.register_artifact(str(base_path), artifact_id='sd-base')
+    service.register_artifact(str(inpaint_path), artifact_id='sd-inpaint')
+    service.load(
+        'sd-base',
+        SD15EngineConfig(device='cpu', dtype='float32'),
+    )
+    request = SD15EditRequest(
+        mode='inpaint',
+        source_blob_id=source.blob_id,
+        mask_blob_id=mask.blob_id,
+        prompt='replace the selected window',
+        edit_adapter_id='sd-inpaint',
+        width=512,
+        height=512,
+        steps=2,
+        strength=0.5,
+    )
+    try:
+        submitted = service.submit_edit(request)
+        completed = _wait_for_state(service, submitted['job_id'], 'completed')
+
+        assert submitted['input_blob_ids'] == [source.blob_id, mask.blob_id]
+        assert completed['progress'] == {'step': 1, 'total': 1}
+        assert completed['blob']['parent_blob_ids'] == [source.blob_id, mask.blob_id]
+        assert completed['blob']['metadata']['edit_mode'] == 'inpaint'
+        assert completed['blob']['metadata']['mask_sha256'] == mask.sha256
+        assert completed['blob']['metadata']['edit_adapter_id'] == 'sd-inpaint'
+        assert factory.instances[0].last_edit['mask'].mode == 'L'
+        assert factory.instances[0].last_edit['adapter'].artifact_kind == 'sd15_inpaint_pipeline'
+        assert store.get(source.blob_id).lease_count == 0
+        assert store.get(mask.blob_id).lease_count == 0
     finally:
         service.close()
 

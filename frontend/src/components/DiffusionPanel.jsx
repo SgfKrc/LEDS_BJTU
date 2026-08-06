@@ -22,6 +22,7 @@ import {
 } from '../api/client';
 import {
   buildEditRequest,
+  buildInpaintRequest,
   buildReferenceRequest,
   canUseLocalDiffusion,
   loadedArtifactId,
@@ -105,12 +106,18 @@ export default function DiffusionPanel({
   const [acceptedLicenses, setAcceptedLicenses] = useState({});
   const [selectedArtifactId, setSelectedArtifactId] = useState('');
   const [selectedIpAdapterId, setSelectedIpAdapterId] = useState('');
+  const [selectedInpaintId, setSelectedInpaintId] = useState('');
   const [modelPath, setModelPath] = useState(getInitialModelPath);
   const [inspection, setInspection] = useState(null);
   const [profile, setProfile] = useState('balanced');
   const [form, setForm] = useState(() => presetToForm(null));
   const [editMode, setEditMode] = useState('txt2img');
   const [sourceBlob, setSourceBlob] = useState(null);
+  const [maskBlob, setMaskBlob] = useState(null);
+  const [maskBrush, setMaskBrush] = useState(48);
+  const [maskTool, setMaskTool] = useState('draw');
+  const [maskZoom, setMaskZoom] = useState(1);
+  const [maskHistoryVersion, setMaskHistoryVersion] = useState(0);
   const [job, setJob] = useState(null);
   const [result, setResult] = useState(null);
   const [action, setAction] = useState('');
@@ -120,6 +127,11 @@ export default function DiffusionPanel({
   const mountedRef = useRef(true);
   const resultRef = useRef(null);
   const sourceBlobRef = useRef(null);
+  const maskBlobRef = useRef(null);
+  const maskCanvasRef = useRef(null);
+  const maskDrawingRef = useRef(false);
+  const maskHistoryRef = useRef([]);
+  const maskHistoryIndexRef = useRef(-1);
 
   const isMaster = canUseLocalDiffusion(myRole);
   const roleResolved = Boolean(myRole);
@@ -140,6 +152,10 @@ export default function DiffusionPanel({
     () => artifacts.filter(item => item.artifact?.artifact_kind === 'sd15_ip_adapter' && item.artifact?.loadable),
     [artifacts],
   );
+  const inpaintArtifacts = useMemo(
+    () => artifacts.filter(item => item.artifact?.artifact_kind === 'sd15_inpaint_pipeline' && item.artifact?.loadable),
+    [artifacts],
+  );
   const normalizedJob = job ? normalizeDiffusionJob(job) : null;
   const jobActive = Boolean(normalizedJob && !normalizedJob.terminal);
   const missingDependencies = capabilities?.missing_dependencies
@@ -150,6 +166,9 @@ export default function DiffusionPanel({
       capabilities.engine_config.quantization === 'none'
       && capabilities.engine_config.qkv_fusion !== true
     );
+  const canUndoMask = maskHistoryVersion >= 0 && maskHistoryIndexRef.current > 0;
+  const canRedoMask = maskHistoryVersion >= 0
+    && maskHistoryIndexRef.current < maskHistoryRef.current.length - 1;
 
   const replaceResult = useCallback((next) => {
     const previous = resultRef.current;
@@ -165,6 +184,15 @@ export default function DiffusionPanel({
     }
     sourceBlobRef.current = next;
     if (mountedRef.current) setSourceBlob(next);
+  }, []);
+
+  const replaceMaskBlob = useCallback((next) => {
+    const previous = maskBlobRef.current;
+    if (previous?.url && !(next && previous.blobId === next.blobId)) {
+      URL.revokeObjectURL(previous.url);
+    }
+    maskBlobRef.current = next;
+    if (mountedRef.current) setMaskBlob(next);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -193,6 +221,12 @@ export default function DiffusionPanel({
       }
       return nextArtifacts.find(item => item.artifact?.artifact_kind === 'sd15_ip_adapter' && item.artifact?.loadable)?.artifact_id || '';
     });
+    setSelectedInpaintId(previous => {
+      if (previous && nextArtifacts.some(item => item.artifact_id === previous && item.artifact?.artifact_kind === 'sd15_inpaint_pipeline' && item.artifact?.loadable)) {
+        return previous;
+      }
+      return nextArtifacts.find(item => item.artifact?.artifact_kind === 'sd15_inpaint_pipeline' && item.artifact?.loadable)?.artifact_id || '';
+    });
     setForm(previous => (
       previous.presetId
         ? previous
@@ -208,6 +242,7 @@ export default function DiffusionPanel({
       pollTokenRef.current += 1;
       if (resultRef.current?.url) URL.revokeObjectURL(resultRef.current.url);
       if (sourceBlobRef.current?.url) URL.revokeObjectURL(sourceBlobRef.current.url);
+      if (maskBlobRef.current?.url) URL.revokeObjectURL(maskBlobRef.current.url);
     };
   }, []);
 
@@ -247,7 +282,7 @@ export default function DiffusionPanel({
     try {
       const inspected = await inspectDiffusionArtifact(path, false);
       setInspection(inspected);
-      if (!['sd15_pipeline', 'sd15_ip_adapter'].includes(inspected.artifact_kind) || !inspected.loadable) {
+      if (!['sd15_pipeline', 'sd15_ip_adapter', 'sd15_inpaint_pipeline'].includes(inspected.artifact_kind) || !inspected.loadable) {
         throw new Error(inspected.warnings?.join('；') || '该路径不是完整的 SD 1.5 模型或 IP-Adapter 目录');
       }
       const registered = await registerDiffusionArtifact(path, {
@@ -257,6 +292,8 @@ export default function DiffusionPanel({
       await refresh();
       if (inspected.artifact_kind === 'sd15_ip_adapter') {
         setSelectedIpAdapterId(registered.artifact_id);
+      } else if (inspected.artifact_kind === 'sd15_inpaint_pipeline') {
+        setSelectedInpaintId(registered.artifact_id);
       } else {
         setSelectedArtifactId(registered.artifact_id);
       }
@@ -307,6 +344,8 @@ export default function DiffusionPanel({
       await refresh();
       if (asset.artifact_kind === 'sd15_ip_adapter') {
         setSelectedIpAdapterId(asset.artifact_id);
+      } else if (asset.artifact_kind === 'sd15_inpaint_pipeline') {
+        setSelectedInpaintId(asset.artifact_id);
       } else {
         setSelectedArtifactId(asset.artifact_id);
       }
@@ -333,6 +372,8 @@ export default function DiffusionPanel({
       await refresh();
       if (asset.artifact_kind === 'sd15_ip_adapter') {
         setSelectedIpAdapterId(asset.artifact_id);
+      } else if (asset.artifact_kind === 'sd15_inpaint_pipeline') {
+        setSelectedInpaintId(asset.artifact_id);
       } else {
         setSelectedArtifactId(asset.artifact_id);
       }
@@ -414,10 +455,10 @@ export default function DiffusionPanel({
           blobId: snapshot.blob.blob_id,
           url: URL.createObjectURL(fetched.blob),
           sizeBytes: fetched.blob.size,
-          mode: ['img2img', 'reference'].includes(requestSnapshot.mode) ? requestSnapshot.mode : 'txt2img',
-          strength: requestSnapshot.mode === 'img2img' ? requestSnapshot.strength : null,
+          mode: ['img2img', 'reference', 'inpaint'].includes(requestSnapshot.mode) ? requestSnapshot.mode : 'txt2img',
+          strength: ['img2img', 'inpaint'].includes(requestSnapshot.mode) ? requestSnapshot.strength : null,
           ipAdapterScale: requestSnapshot.mode === 'reference' ? requestSnapshot.ip_adapter_scale : null,
-          sourceBlobId: ['img2img', 'reference'].includes(requestSnapshot.mode) ? requestSnapshot.source_blob_id : null,
+          sourceBlobId: ['img2img', 'reference', 'inpaint'].includes(requestSnapshot.mode) ? requestSnapshot.source_blob_id : null,
           seed: snapshot.parameters?.seed,
           width: snapshot.parameters?.width,
           height: snapshot.parameters?.height,
@@ -488,11 +529,22 @@ export default function DiffusionPanel({
     setError('');
     try {
       const uploaded = await uploadDiffusionBlob(file, 'input_image');
+      const previousMask = maskBlobRef.current;
+      replaceMaskBlob(null);
+      maskHistoryRef.current = [];
+      maskHistoryIndexRef.current = -1;
+      setMaskHistoryVersion(value => value + 1);
+      setMaskZoom(1);
+      if (previousMask?.blobId) {
+        await deleteDiffusionBlob(previousMask.blobId).catch(() => {});
+      }
       replaceSourceBlob({
         blobId: uploaded.blob_id,
         url: URL.createObjectURL(file),
         name: file.name,
         sizeBytes: file.size,
+        width: uploaded.width,
+        height: uploaded.height,
       });
       onToast?.({ type: 'success', msg: `源图已上传: ${file.name}` });
     } catch (err) {
@@ -504,7 +556,170 @@ export default function DiffusionPanel({
   };
 
   const handleRemoveSource = () => {
+    const previousMask = maskBlobRef.current;
+    replaceMaskBlob(null);
+    maskHistoryRef.current = [];
+    maskHistoryIndexRef.current = -1;
+    setMaskHistoryVersion(value => value + 1);
+    if (previousMask?.blobId) {
+      deleteDiffusionBlob(previousMask.blobId).catch(() => {});
+    }
     replaceSourceBlob(null);
+  };
+
+  const pushMaskHistory = () => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas) return;
+    const snapshot = canvas.toDataURL('image/png');
+    const next = maskHistoryRef.current.slice(0, maskHistoryIndexRef.current + 1);
+    next.push(snapshot);
+    if (next.length > 20) next.shift();
+    maskHistoryRef.current = next;
+    maskHistoryIndexRef.current = next.length - 1;
+    setMaskHistoryVersion(value => value + 1);
+  };
+
+  const restoreMaskHistory = (nextIndex) => {
+    const snapshot = maskHistoryRef.current[nextIndex];
+    const canvas = maskCanvasRef.current;
+    if (!snapshot || !canvas) return;
+    const image = new window.Image();
+    image.onload = () => {
+      const context = canvas.getContext('2d');
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      maskHistoryIndexRef.current = nextIndex;
+      setMaskHistoryVersion(value => value + 1);
+      persistMask();
+    };
+    image.src = snapshot;
+  };
+
+  const initializeMaskCanvas = (event) => {
+    if (editMode !== 'inpaint') return;
+    const image = event.currentTarget;
+    const canvas = maskCanvasRef.current;
+    if (!canvas || !image.naturalWidth || !image.naturalHeight) return;
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#000';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    if (maskBlobRef.current?.url) {
+      const existingMask = new window.Image();
+      existingMask.onload = () => {
+        context.drawImage(existingMask, 0, 0, canvas.width, canvas.height);
+        if (maskHistoryRef.current.length === 0) pushMaskHistory();
+      };
+      existingMask.src = maskBlobRef.current.url;
+    } else if (maskHistoryRef.current.length === 0) {
+      pushMaskHistory();
+    }
+  };
+
+  const maskPoint = (event) => {
+    const canvas = maskCanvasRef.current;
+    const bounds = canvas.getBoundingClientRect();
+    return {
+      x: ((event.clientX - bounds.left) / bounds.width) * canvas.width,
+      y: ((event.clientY - bounds.top) / bounds.height) * canvas.height,
+    };
+  };
+
+  const drawMaskPoint = (event, begin = false) => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext('2d');
+    const point = maskPoint(event);
+    context.strokeStyle = maskTool === 'erase' ? '#000' : '#fff';
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    context.lineWidth = Math.max(1, Number(maskBrush));
+    if (begin) {
+      context.beginPath();
+      context.moveTo(point.x, point.y);
+      context.lineTo(point.x, point.y);
+    } else {
+      context.lineTo(point.x, point.y);
+    }
+    context.stroke();
+  };
+
+  const persistMask = async () => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas) return;
+    setAction('mask-upload');
+    setError('');
+    try {
+      const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob(value => (
+          value ? resolve(value) : reject(new Error('遮罩 PNG 编码失败'))
+        ), 'image/png');
+      });
+      const file = new File([blob], 'inpaint-mask.png', { type: 'image/png' });
+      const uploaded = await uploadDiffusionBlob(file, 'mask');
+      const previous = maskBlobRef.current;
+      replaceMaskBlob({
+        blobId: uploaded.blob_id,
+        url: URL.createObjectURL(blob),
+        sizeBytes: blob.size,
+      });
+      if (previous?.blobId && previous.blobId !== uploaded.blob_id) {
+        await deleteDiffusionBlob(previous.blobId).catch(() => {});
+      }
+    } catch (err) {
+      setError(err.message);
+      onToast?.({ type: 'error', msg: `遮罩上传失败: ${err.message}` });
+    } finally {
+      setAction('');
+    }
+  };
+
+  const handleMaskPointerDown = (event) => {
+    if (jobActive || action || maskTool === 'pan') return;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    maskDrawingRef.current = true;
+    drawMaskPoint(event, true);
+  };
+
+  const handleMaskPointerMove = (event) => {
+    if (!maskDrawingRef.current) return;
+    drawMaskPoint(event);
+  };
+
+  const handleMaskPointerUp = (event) => {
+    if (!maskDrawingRef.current) return;
+    drawMaskPoint(event);
+    maskDrawingRef.current = false;
+    pushMaskHistory();
+    persistMask();
+  };
+
+  const handleClearMask = () => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas || jobActive || action) return;
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#000';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    pushMaskHistory();
+    persistMask();
+  };
+
+  const handleInvertMask = () => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas || jobActive || action) return;
+    const context = canvas.getContext('2d');
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    for (let index = 0; index < imageData.data.length; index += 4) {
+      const value = 255 - imageData.data[index];
+      imageData.data[index] = value;
+      imageData.data[index + 1] = value;
+      imageData.data[index + 2] = value;
+      imageData.data[index + 3] = 255;
+    }
+    context.putImageData(imageData, 0, 0);
+    pushMaskHistory();
+    persistMask();
   };
 
   const handleEdit = async () => {
@@ -514,7 +729,14 @@ export default function DiffusionPanel({
     try {
       const requestSnapshot = editMode === 'reference'
         ? buildReferenceRequest(form, sourceBlob.blobId, selectedIpAdapterId)
-        : buildEditRequest(form, sourceBlob.blobId);
+        : editMode === 'inpaint'
+          ? buildInpaintRequest(
+            form,
+            sourceBlob.blobId,
+            maskBlob?.blobId,
+            selectedInpaintId,
+          )
+          : buildEditRequest(form, sourceBlob.blobId);
       const submitted = await editDiffusionImage(requestSnapshot);
       setJob(normalizeDiffusionJob(submitted));
       const token = pollTokenRef.current + 1;
@@ -527,7 +749,8 @@ export default function DiffusionPanel({
       });
     } catch (err) {
       setError(err.message);
-      onToast?.({ type: 'error', msg: `${editMode === 'reference' ? '参考图生成' : '图生图'}失败: ${err.message}` });
+      const label = editMode === 'reference' ? '参考图生成' : editMode === 'inpaint' ? '局部重绘' : '图生图';
+      onToast?.({ type: 'error', msg: `${label}失败: ${err.message}` });
     } finally {
       setAction('');
     }
@@ -538,6 +761,15 @@ export default function DiffusionPanel({
     if (!current?.blobId) return;
     setAction('continue-edit');
     try {
+      const previousMask = maskBlobRef.current;
+      replaceMaskBlob(null);
+      maskHistoryRef.current = [];
+      maskHistoryIndexRef.current = -1;
+      setMaskHistoryVersion(value => value + 1);
+      setMaskZoom(1);
+      if (previousMask?.blobId) {
+        await deleteDiffusionBlob(previousMask.blobId).catch(() => {});
+      }
       let copiedUrl = current.url;
       try {
         const copied = await fetch(current.url).then(res => res.blob());
@@ -550,6 +782,8 @@ export default function DiffusionPanel({
         url: copiedUrl,
         name: `result-${current.blobId}.png`,
         sizeBytes: current.sizeBytes,
+        width: current.width,
+        height: current.height,
       });
       setEditMode('img2img');
       onToast?.({ type: 'info', msg: '已把当前结果作为源图，调整参数后可继续编辑' });
@@ -827,8 +1061,17 @@ export default function DiffusionPanel({
                 >
                   参考图
                 </button>
+                <button
+                  type="button"
+                  data-testid="diffusion-mode-inpaint"
+                  className={editMode === 'inpaint' ? 'active' : ''}
+                  onClick={() => setEditMode('inpaint')}
+                  disabled={Boolean(action) || jobActive}
+                >
+                  局部重绘
+                </button>
               </div>
-              {['img2img', 'reference'].includes(editMode) && (
+              {['img2img', 'reference', 'inpaint'].includes(editMode) && (
                 <div className="edit-source-box">
                   {sourceBlob ? (
                     <div
@@ -861,7 +1104,8 @@ export default function DiffusionPanel({
                       <span>{action === 'upload' ? '上传中...' : editMode === 'reference' ? '选择人物参考图' : '选择源图上传'}</span>
                     </label>
                   )}
-                  {editMode === 'img2img' ? (
+                  {editMode !== 'reference' ? (
+                    <>
                     <label className="stacked-field">
                       <span>Strength（重绘幅度）</span>
                       <input
@@ -875,6 +1119,141 @@ export default function DiffusionPanel({
                         disabled={Boolean(action) || jobActive}
                       />
                     </label>
+                    {editMode === 'inpaint' && (
+                      <>
+                        <label className="stacked-field">
+                          <span>Inpaint pipeline</span>
+                          <select
+                            data-testid="diffusion-inpaint-select"
+                            value={selectedInpaintId}
+                            onChange={event => setSelectedInpaintId(event.target.value)}
+                            disabled={Boolean(action) || jobActive || inpaintArtifacts.length === 0}
+                          >
+                            {inpaintArtifacts.length === 0 && <option value="">尚未登记专用重绘模型</option>}
+                            {inpaintArtifacts.map(artifact => (
+                              <option key={artifact.artifact_id} value={artifact.artifact_id}>{artifact.name}</option>
+                            ))}
+                          </select>
+                        </label>
+                        {sourceBlob && (
+                          <div className="inpaint-mask-editor" data-testid="diffusion-mask-editor">
+                            <div
+                              className="inpaint-mask-viewport"
+                              style={{ aspectRatio: `${sourceBlob.width || form.width} / ${sourceBlob.height || form.height}` }}
+                            >
+                              <div
+                                className="inpaint-mask-stage"
+                                style={{
+                                  aspectRatio: `${sourceBlob.width || form.width} / ${sourceBlob.height || form.height}`,
+                                  width: `${maskZoom * 100}%`,
+                                }}
+                              >
+                                <img
+                                  src={sourceBlob.url}
+                                  alt="局部重绘源图"
+                                  onLoad={initializeMaskCanvas}
+                                />
+                                <canvas
+                                  ref={maskCanvasRef}
+                                  className={maskTool === 'pan' ? 'pan' : ''}
+                                  data-testid="diffusion-mask-canvas"
+                                  onPointerDown={handleMaskPointerDown}
+                                  onPointerMove={handleMaskPointerMove}
+                                  onPointerUp={handleMaskPointerUp}
+                                  onPointerCancel={handleMaskPointerUp}
+                                />
+                              </div>
+                            </div>
+                            <div className="inpaint-mask-controls">
+                              <div className="mask-tool-segment" role="group" aria-label="遮罩工具">
+                                <button
+                                  type="button"
+                                  className={maskTool === 'draw' ? 'active' : ''}
+                                  onClick={() => setMaskTool('draw')}
+                                  disabled={Boolean(action) || jobActive}
+                                >
+                                  画笔
+                                </button>
+                                <button
+                                  type="button"
+                                  className={maskTool === 'erase' ? 'active' : ''}
+                                  onClick={() => setMaskTool('erase')}
+                                  disabled={Boolean(action) || jobActive}
+                                >
+                                  橡皮
+                                </button>
+                                <button
+                                  type="button"
+                                  className={maskTool === 'pan' ? 'active' : ''}
+                                  onClick={() => setMaskTool('pan')}
+                                  disabled={Boolean(action) || jobActive}
+                                >
+                                  平移
+                                </button>
+                              </div>
+                              <label>
+                                <span>大小</span>
+                                <input
+                                  type="range"
+                                  min="8"
+                                  max="192"
+                                  step="4"
+                                  value={maskBrush}
+                                  onChange={event => setMaskBrush(event.target.value)}
+                                  disabled={Boolean(action) || jobActive}
+                                />
+                              </label>
+                              <label>
+                                <span>缩放</span>
+                                <input
+                                  type="range"
+                                  min="1"
+                                  max="2"
+                                  step="0.1"
+                                  value={maskZoom}
+                                  onChange={event => setMaskZoom(Number(event.target.value))}
+                                  disabled={Boolean(action) || jobActive}
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                className="btn-ghost"
+                                onClick={() => restoreMaskHistory(maskHistoryIndexRef.current - 1)}
+                                disabled={Boolean(action) || jobActive || !canUndoMask}
+                              >
+                                撤销
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost"
+                                onClick={() => restoreMaskHistory(maskHistoryIndexRef.current + 1)}
+                                disabled={Boolean(action) || jobActive || !canRedoMask}
+                              >
+                                重做
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost"
+                                onClick={handleInvertMask}
+                                disabled={Boolean(action) || jobActive}
+                              >
+                                反转
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost"
+                                onClick={handleClearMask}
+                                disabled={Boolean(action) || jobActive}
+                              >
+                                清空遮罩
+                              </button>
+                              <span>{maskBlob ? '遮罩已同步' : '白色区域将被重绘'}</span>
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                    </>
                   ) : (
                     <>
                       <label className="stacked-field">
@@ -949,13 +1328,13 @@ export default function DiffusionPanel({
               <button
                 className="btn-primary generate-button"
                 data-testid="diffusion-submit"
-                onClick={jobActive ? handleCancel : (['img2img', 'reference'].includes(editMode) ? handleEdit : handleGenerate)}
-                disabled={Boolean(action) || (!jobActive && (!capabilities?.loaded || !form.prompt.trim() || (['img2img', 'reference'].includes(editMode) && !sourceBlob) || (editMode === 'reference' && (!selectedIpAdapterId || !referenceProfileSupported))))}
+                onClick={jobActive ? handleCancel : (['img2img', 'reference', 'inpaint'].includes(editMode) ? handleEdit : handleGenerate)}
+                disabled={Boolean(action) || (!jobActive && (!capabilities?.loaded || !form.prompt.trim() || (['img2img', 'reference', 'inpaint'].includes(editMode) && !sourceBlob) || (editMode === 'reference' && (!selectedIpAdapterId || !referenceProfileSupported)) || (editMode === 'inpaint' && (!selectedInpaintId || !maskBlob))))}
               >
                 {jobActive
                   ? action === 'cancel' || normalizedJob?.cancel_requested ? '正在取消...' : '停止生成'
                   : action === 'generate' || action === 'edit' ? '提交中...'
-                    : editMode === 'img2img' ? '生成编辑图片' : editMode === 'reference' ? '按参考图生成' : '生成图片'}
+                    : editMode === 'img2img' ? '生成编辑图片' : editMode === 'reference' ? '按参考图生成' : editMode === 'inpaint' ? '生成局部重绘' : '生成图片'}
               </button>
             </section>
           </div>
@@ -994,7 +1373,7 @@ export default function DiffusionPanel({
                 <figcaption>
                   <div className="result-facts">
                     <span className={`result-mode mode-${result.mode}`}>
-                      {result.mode === 'img2img' ? '图生图' : result.mode === 'reference' ? '参考图' : '文生图'}
+                      {result.mode === 'img2img' ? '图生图' : result.mode === 'reference' ? '参考图' : result.mode === 'inpaint' ? '局部重绘' : '文生图'}
                     </span>
                     <span>Seed {result.seed}</span>
                     <span>{result.width} × {result.height}</span>

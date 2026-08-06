@@ -74,6 +74,8 @@ RETRO_REPO = "Aleksandra11/90style_anime_face_model"
 RETRO_REVISION = "aa8a082c6a12d66ed995cca1ccb491bb171b9713"
 IP_ADAPTER_REPO = "h94/IP-Adapter"
 IP_ADAPTER_REVISION = "018e402774aeeddd60609b4ecdb7e298259dc729"
+INPAINT_REPO = "stable-diffusion-v1-5/stable-diffusion-inpainting"
+INPAINT_REVISION = "8a4288a76071f7280aedbdb3253bdb9e9d5d84bb"
 
 
 def _file(
@@ -191,6 +193,49 @@ _IP_ADAPTER_FILES = (
     ),
 )
 
+_INPAINT_FILES = (
+    _file("README.md", 15107, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("model_index.json", 548, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("feature_extractor/preprocessor_config.json", 342, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("scheduler/scheduler_config.json", 313, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("text_encoder/config.json", 617, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file(
+        "text_encoder/model.fp16.safetensors",
+        246144864,
+        sha256="77795e2023adcf39bc29a884661950380bd093cf0750a966d473d1718dc9ef4e",
+        repo=INPAINT_REPO,
+        revision=INPAINT_REVISION,
+    ),
+    _file("tokenizer/merges.txt", 524619, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("tokenizer/special_tokens_map.json", 472, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("tokenizer/tokenizer_config.json", 806, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("tokenizer/vocab.json", 1059962, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file("unet/config.json", 748, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file(
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        1719154104,
+        sha256="24b788b4a777748377cc20364eea4ae113c8c42f4468c16bc8c02fdae5492af9",
+        repo=INPAINT_REPO,
+        revision=INPAINT_REVISION,
+    ),
+    _file("vae/config.json", 552, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file(
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+        167335342,
+        sha256="4fbcf0ebe55a0984f5a5e00d8c4521d52359af7229bb4d81890039d2aa16dd7c",
+        repo=INPAINT_REPO,
+        revision=INPAINT_REVISION,
+    ),
+    _file("safety_checker/config.json", 4777, repo=INPAINT_REPO, revision=INPAINT_REVISION),
+    _file(
+        "safety_checker/model.fp16.safetensors",
+        608018440,
+        sha256="08902f19b1cfebd7c989f152fc0507bef6898c706a91d666509383122324b511",
+        repo=INPAINT_REPO,
+        revision=INPAINT_REVISION,
+    ),
+)
+
 
 ASSET_CATALOG: Dict[str, DiffusionAssetSpec] = {
     "sd15_original_v1": DiffusionAssetSpec(
@@ -238,6 +283,23 @@ ASSET_CATALOG: Dict[str, DiffusionAssetSpec] = {
         notes=(
             "Reference-image conditioning component; requires a separately loaded SD 1.5 base pipeline.",
             "The first GPU gate only enables non-quantized, non-QKV SD15 profiles.",
+        ),
+    ),
+    "sd15_inpaint_v1": DiffusionAssetSpec(
+        asset_id="sd15_inpaint_v1",
+        artifact_id="sd15_inpaint_v1",
+        name="Stable Diffusion 1.5 Inpainting",
+        repo_id=INPAINT_REPO,
+        revision=INPAINT_REVISION,
+        local_dir="models/sd15-inpaint-v1",
+        license_id="creativeml-openrail-m",
+        model_card_url=f"https://huggingface.co/{INPAINT_REPO}",
+        preset_id="",
+        files=_INPAINT_FILES,
+        artifact_kind="sd15_inpaint_pipeline",
+        notes=(
+            "Dedicated 9-channel inpainting U-Net; never load it through the base txt2img path.",
+            "White mask pixels are redrawn and black mask pixels are preserved.",
         ),
     ),
 }
@@ -726,6 +788,8 @@ __all__ = [
     "DiffusionAssetSpec",
     "IP_ADAPTER_REPO",
     "IP_ADAPTER_REVISION",
+    "INPAINT_REPO",
+    "INPAINT_REVISION",
     "LOCAL_PROXY_FALLBACK",
     "MANIFEST_NAME",
     "get_asset_spec",

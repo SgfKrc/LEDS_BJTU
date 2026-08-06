@@ -203,3 +203,116 @@ test('real Edge img2img upload and result continuation', async ({ browserName, p
     );
   }
 });
+
+test('real Edge inpaint canvas uploads a mask and completes an edit', async ({ browserName, page, request }) => {
+  test.skip(browserName !== 'chromium', 'The real gate uses the installed Edge channel.');
+  await fs.access(MODEL_PATH);
+  await fs.access(SOURCE_IMAGE);
+  await fs.mkdir(OUTPUT_DIR, { recursive: true });
+
+  const cleanupBlobIds = [];
+  const report = {
+    schema_version: 1,
+    status: 'running',
+    model_path: MODEL_PATH,
+    inpaint_artifact_id: 'sd15_inpaint_v1',
+    source_image: SOURCE_IMAGE,
+    browser: null,
+    timings: {},
+  };
+
+  try {
+    report.browser = await page.context().browser().version();
+    await page.goto('/?view=image');
+    await expect(page.getByTestId('diffusion-workspace')).toBeVisible();
+    await page.getByTestId('diffusion-model-path').fill(MODEL_PATH);
+    await page.getByTestId('diffusion-register').click();
+    await expect(page.getByTestId('diffusion-artifact-select').locator('option')).not.toHaveCount(0);
+    await page.getByTestId('diffusion-profile').selectOption('balanced');
+    await page.getByTestId('diffusion-load').click();
+    await expect(page.getByTestId('diffusion-load')).toContainText('图像模型已就绪');
+
+    await page.getByTestId('diffusion-mode-inpaint').click();
+    await page.getByTestId('diffusion-steps').fill('4');
+    await page.getByTestId('diffusion-strength').fill('1');
+
+    const sourceResponsePromise = page.waitForResponse(response => (
+      response.url().endsWith('/api/diffusion/blobs')
+      && response.request().method() === 'POST'
+    ));
+    await page.getByTestId('diffusion-source-input').setInputFiles(SOURCE_IMAGE);
+    const sourceResponse = await sourceResponsePromise;
+    expect(sourceResponse.status()).toBe(201);
+    const sourceBlob = await sourceResponse.json();
+    cleanupBlobIds.push(sourceBlob.blob_id);
+
+    await expect(page.getByTestId('diffusion-inpaint-select')).toHaveValue('sd15_inpaint_v1');
+    const canvas = page.getByTestId('diffusion-mask-canvas');
+    await expect(canvas).toBeVisible();
+    const bounds = await canvas.boundingBox();
+    expect(bounds).not.toBeNull();
+    const maskResponsePromise = page.waitForResponse(response => (
+      response.url().endsWith('/api/diffusion/blobs')
+      && response.request().method() === 'POST'
+    ));
+    await page.mouse.move(bounds.x + bounds.width * 0.35, bounds.y + bounds.height * 0.35);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + bounds.width * 0.65, bounds.y + bounds.height * 0.65, { steps: 8 });
+    await page.mouse.up();
+    const maskResponse = await maskResponsePromise;
+    expect(maskResponse.status()).toBe(201);
+    const maskBlob = await maskResponse.json();
+    expect(maskBlob.purpose).toBe('mask');
+    cleanupBlobIds.push(maskBlob.blob_id);
+    await expect(page.getByTestId('diffusion-submit')).toBeEnabled();
+
+    const editStarted = performance.now();
+    const editResponsePromise = page.waitForResponse(response => (
+      response.url().endsWith('/api/diffusion/edit')
+      && response.request().method() === 'POST'
+    ));
+    await page.getByTestId('diffusion-submit').click();
+    const editResponse = await editResponsePromise;
+    expect(editResponse.status()).toBe(202);
+    const queued = await editResponse.json();
+    await expect(page.getByTestId('diffusion-job-status')).toHaveAttribute(
+      'data-job-state',
+      'completed',
+    );
+    const completed = await completedJob(request, queued.job_id);
+    cleanupBlobIds.push(completed.blob.blob_id);
+    expect(completed.parameters).toMatchObject({
+      mode: 'inpaint',
+      source_blob_id: sourceBlob.blob_id,
+      mask_blob_id: maskBlob.blob_id,
+      edit_adapter_id: 'sd15_inpaint_v1',
+    });
+    expect(completed.metrics.engine).toBe('diffusers_sd15_inpaint');
+    const resultImage = page.getByTestId('diffusion-result-image');
+    const statistics = await imageStatistics(resultImage);
+    expect(statistics).toMatchObject({ width: 512, height: 512 });
+    expect(statistics.sampledRange).toBeGreaterThan(10);
+
+    report.status = 'passed';
+    report.timings.edit_seconds = (performance.now() - editStarted) / 1000;
+    report.job = {
+      job_id: queued.job_id,
+      blob_id: completed.blob.blob_id,
+      source_blob_id: sourceBlob.blob_id,
+      mask_blob_id: maskBlob.blob_id,
+      elapsed_seconds: completed.metrics.elapsed_seconds,
+    };
+    report.screenshot = path.join(OUTPUT_DIR, 'inpaint-result.png');
+    await page.screenshot({ path: report.screenshot, fullPage: true });
+  } finally {
+    for (const blobId of cleanupBlobIds.reverse()) {
+      await request.delete(`/api/diffusion/blobs/${blobId}`).catch(() => {});
+    }
+    await request.post('/api/diffusion/unload').catch(() => {});
+    await fs.writeFile(
+      path.join(OUTPUT_DIR, 'inpaint-browser-report.json'),
+      `${JSON.stringify(report, null, 2)}\n`,
+      'utf8',
+    );
+  }
+});

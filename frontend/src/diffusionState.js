@@ -101,3 +101,25 @@ export function buildReferenceRequest(form, sourceBlobId, adapterId) {
     scheduler: form.scheduler || null,
   };
 }
+
+export function buildInpaintRequest(form, sourceBlobId, maskBlobId, pipelineId) {
+  const strength = Number(form?.strength ?? EDIT_STRENGTH_DEFAULT);
+  return {
+    mode: 'inpaint',
+    preset_id: form.presetId || null,
+    source_blob_id: String(sourceBlobId || '').trim(),
+    mask_blob_id: String(maskBlobId || '').trim(),
+    edit_adapter_id: String(pipelineId || '').trim(),
+    prompt: String(form.prompt || '').trim(),
+    negative_prompt: String(form.negativePrompt || '').trim(),
+    seed: Number(form.seed),
+    width: Number(form.width),
+    height: Number(form.height),
+    steps: Number(form.steps),
+    guidance_scale: Number(form.guidanceScale),
+    strength: Number.isFinite(strength)
+      ? Math.min(1, Math.max(0.05, strength))
+      : EDIT_STRENGTH_DEFAULT,
+    scheduler: form.scheduler || null,
+  };
+}

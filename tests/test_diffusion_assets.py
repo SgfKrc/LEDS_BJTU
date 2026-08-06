@@ -14,6 +14,8 @@ from diffusion.assets import (
     MANIFEST_NAME,
     IP_ADAPTER_REPO,
     IP_ADAPTER_REVISION,
+    INPAINT_REPO,
+    INPAINT_REVISION,
     ORIGINAL_REPO,
     ORIGINAL_REVISION,
     RETRO_REVISION,
@@ -87,6 +89,22 @@ def test_ip_adapter_catalog_freezes_complete_sd15_safetensors_layout():
         "models/ip-adapter_sd15.safetensors",
     }
     assert all(item.sha256 for item in spec.files)
+
+
+def test_inpaint_catalog_freezes_the_dedicated_nine_channel_pipeline():
+    spec = ASSET_CATALOG["sd15_inpaint_v1"]
+
+    assert spec.repo_id == INPAINT_REPO
+    assert spec.revision == INPAINT_REVISION
+    assert spec.artifact_kind == "sd15_inpaint_pipeline"
+    assert spec.license_id == "creativeml-openrail-m"
+    assert spec.download_bytes == 2742261613
+    assert {item.path for item in spec.files if item.sha256} == {
+        "text_encoder/model.fp16.safetensors",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+        "safety_checker/model.fp16.safetensors",
+    }
 
 
 def test_verifier_rejects_same_size_weight_with_wrong_hash(tmp_path, monkeypatch):

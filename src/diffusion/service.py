@@ -247,15 +247,16 @@ class SD15EditRequest:
         if self.mode == 'reference':
             if not normalized_adapter_id:
                 raise DiffusionInputError(
-                    'edit_adapter_id is required for reference mode'
+                    f'edit_adapter_id is required for {self.mode} mode'
                 )
+        if self.mode == 'reference':
             if self.ip_adapter_scale is None:
                 raise DiffusionInputError(
                     'ip_adapter_scale is required for reference mode'
                 )
-        elif normalized_adapter_id and self.mode != 'instruction':
+        elif normalized_adapter_id and self.mode not in {'instruction', 'inpaint'}:
             raise DiffusionInputError(
-                'edit_adapter_id is only valid for reference or instruction mode'
+                'edit_adapter_id is only valid for reference, inpaint, or instruction mode'
             )
         if self.mode != 'reference' and self.ip_adapter_scale is not None:
             raise DiffusionInputError(
@@ -765,12 +766,12 @@ class DiffusionService:
         _trusted_sha256: Optional[str] = None,
     ) -> RegisteredDiffusionArtifact:
         artifact = self.inspect(path, compute_hash=compute_hash)
-        if artifact.artifact_kind == 'sd15_ip_adapter' and not artifact.loadable:
-            reason = '; '.join(artifact.warnings) or 'incomplete SD1.5 IP-Adapter directory'
+        if artifact.artifact_kind in {'sd15_ip_adapter', 'sd15_inpaint_pipeline'} and not artifact.loadable:
+            reason = '; '.join(artifact.warnings) or f'incomplete {artifact.artifact_kind} directory'
             raise ValueError(reason)
         if _trusted_sha256:
             artifact = replace(artifact, sha256=_trusted_sha256)
-        if artifact.artifact_kind == 'sd15_ip_adapter' and not artifact.sha256:
+        if artifact.artifact_kind in {'sd15_ip_adapter', 'sd15_inpaint_pipeline'} and not artifact.sha256:
             # Adapter identity participates in every result manifest.  A path
             # alone is not stable enough when users replace local weights.
             artifact = self.inspect(path, compute_hash=True)
@@ -1038,6 +1039,20 @@ class DiffusionService:
                 raise DiffusionInputError(
                     'edit_adapter_id must reference a complete SD1.5 IP-Adapter directory'
                 )
+        elif request.mode == 'inpaint':
+            if not (request.edit_adapter_id or '').strip():
+                raise DiffusionInputError(
+                    'edit_adapter_id is required for inpaint mode'
+                )
+            with self._lock:
+                adapter = self._get_artifact_locked(request.edit_adapter_id or '')
+            if (
+                adapter.artifact.artifact_kind != 'sd15_inpaint_pipeline'
+                or not adapter.artifact.loadable
+            ):
+                raise DiffusionInputError(
+                    'edit_adapter_id must reference a complete SD1.5 inpaint pipeline directory'
+                )
         return {
             'request': request.snapshot(),
             'source_blob': source.descriptor(),
@@ -1054,7 +1069,7 @@ class DiffusionService:
         owner_scope: str = 'local',
     ) -> Dict[str, Any]:
         self.validate_edit(request, owner_scope=owner_scope)
-        if request.mode not in {'img2img', 'reference'}:
+        if request.mode not in {'img2img', 'reference', 'inpaint'}:
             raise DiffusionUnsupportedError(
                 f'{request.mode} edit executor is not installed yet'
             )
@@ -1065,13 +1080,21 @@ class DiffusionService:
                 raise DiffusionConflictError('SD15 engine is not loaded')
             if self._state != 'loaded' or self._active_job_id is not None:
                 raise DiffusionConflictError('another SD15 edit is active')
-            if request.mode == 'reference' and self._engine_config is not None:
+            if request.mode in {'reference', 'inpaint'} and self._engine_config is not None:
                 if (
                     self._engine_config.quantization != 'none'
                     or self._engine_config.enable_qkv_fusion
                 ):
                     raise DiffusionUnsupportedError(
-                        'IP-Adapter requires a validated non-quantized, non-QKV SD15 profile'
+                        'IP-Adapter and inpaint require a validated non-quantized, non-QKV SD15 profile'
+                    )
+                if (
+                    request.mode == 'inpaint'
+                    and self._engine_config.device.startswith('cuda')
+                    and not self._engine_config.enable_model_cpu_offload
+                ):
+                    raise DiffusionUnsupportedError(
+                        'inpaint currently requires the balanced CPU-offload profile on CUDA'
                     )
             artifact_id = self._loaded_artifact_id
             if not artifact_id:
@@ -1164,7 +1187,7 @@ class DiffusionService:
             if job.kind == 'edit':
                 source_blob = self._blob_store.get(job.request.source_blob_id)
                 adapter_artifact = None
-                if job.request.mode == 'reference':
+                if job.request.mode in {'reference', 'inpaint'}:
                     with self._lock:
                         registered_adapter = self._get_artifact_locked(
                             job.request.edit_adapter_id or ''
@@ -1174,12 +1197,24 @@ class DiffusionService:
 
                 with Image.open(io.BytesIO(source_blob.data)) as source_image:
                     source_image.load()
-                    result = engine.edit(
-                        job.request,
-                        image=source_image,
-                        adapter=adapter_artifact,
-                        callback=_progress,
-                    )
+                    if job.request.mask_blob_id:
+                        mask_blob = self._blob_store.get(job.request.mask_blob_id)
+                        with Image.open(io.BytesIO(mask_blob.data)) as mask_image:
+                            mask_image.load()
+                            result = engine.edit(
+                                job.request,
+                                image=source_image,
+                                mask=mask_image,
+                                adapter=adapter_artifact,
+                                callback=_progress,
+                            )
+                    else:
+                        result = engine.edit(
+                            job.request,
+                            image=source_image,
+                            adapter=adapter_artifact,
+                            callback=_progress,
+                        )
             else:
                 result = engine.generate(job.request, callback=_progress)
             with self._lock:

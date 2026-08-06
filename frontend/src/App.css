@@ -4462,7 +4462,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
   border-radius: 6px;
   background: var(--bg-input);
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
 }
 
@@ -4545,6 +4545,90 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .edit-source-box .stacked-field input {
   width: 100%;
   padding: 9px 8px;
+}
+
+.inpaint-mask-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inpaint-mask-viewport {
+  width: min(100%, 420px);
+  align-self: center;
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: #050505;
+  touch-action: pan-x pan-y;
+}
+
+.inpaint-mask-stage {
+  position: relative;
+  min-width: 100%;
+  overflow: hidden;
+  background: #050505;
+  touch-action: none;
+}
+
+.inpaint-mask-stage img,
+.inpaint-mask-stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.inpaint-mask-stage canvas.pan {
+  cursor: grab;
+  touch-action: pan-x pan-y;
+}
+
+.inpaint-mask-stage canvas {
+  opacity: 0.48;
+  cursor: crosshair;
+}
+
+.inpaint-mask-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.inpaint-mask-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.inpaint-mask-controls input[type='range'] {
+  width: 140px;
+}
+
+.mask-tool-segment {
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(52px, 1fr));
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-input);
+}
+
+.mask-tool-segment button {
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.mask-tool-segment button.active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .result-mode {

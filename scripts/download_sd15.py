@@ -27,6 +27,7 @@ def main() -> int:
             "sd15_original_v1",
             "sd15_90s_retrovers_v1",
             "sd15_ip_adapter_v1",
+            "sd15_inpaint_v1",
         ),
     )
     parser.add_argument(
@@ -80,8 +81,10 @@ def main() -> int:
             "Next: python scripts/quality_gate_sd15.py "
             f"--asset-id {args.asset_id}"
         )
-    else:
+    elif spec.artifact_kind == "sd15_ip_adapter":
         print("Next: run the SD15 IP-Adapter reference-image GPU gate")
+    else:
+        print("Next: run the SD15 inpaint source/mask GPU gate")
     return 0
 
 

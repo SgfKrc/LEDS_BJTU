@@ -231,6 +231,104 @@ def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
     assert _Img2ImgPipeline.created_dtype == 'float16'
 
 
+def test_inpaint_loads_a_dedicated_pipeline_and_reuses_it(monkeypatch, tmp_path):
+    diffusers = pytest.importorskip("diffusers")
+
+    class _InpaintPipeline:
+        load_calls = []
+
+        def __init__(self):
+            self.safety_checker = object()
+            self.scheduler = SimpleNamespace()
+            self.vae = SimpleNamespace(enable_slicing=lambda: None)
+
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            cls.load_calls.append((Path(path), kwargs))
+            return cls()
+
+        def set_progress_bar_config(self, **_kwargs):
+            return None
+
+        def enable_attention_slicing(self):
+            return None
+
+        def to(self, _device):
+            return self
+
+        def __call__(
+            self,
+            *,
+            image,
+            mask_image,
+            strength,
+            callback_on_step_end,
+            num_inference_steps,
+            **_kwargs,
+        ):
+            assert image.mode == 'RGB'
+            assert image.size == (512, 512)
+            assert mask_image.mode == 'L'
+            assert mask_image.size == (512, 512)
+            assert strength == 0.5
+            for step in range(int(num_inference_steps * strength)):
+                callback_on_step_end(self, step, None, {})
+            return SimpleNamespace(images=['inpainted-image'])
+
+    monkeypatch.setattr(diffusers, 'StableDiffusionInpaintPipeline', _InpaintPipeline)
+    engine = SD15Engine(
+        SD15EngineConfig(
+            device='cpu',
+            dtype='float32',
+            enable_model_cpu_offload=False,
+        )
+    )
+    engine._pipeline = _FakePipeline()
+    engine._diffusers_logging = _FakeDiffusersLogging()
+    engine._device = 'cpu'
+    artifact = DiffusionArtifact(
+        path=str(tmp_path),
+        artifact_kind='sd15_inpaint_pipeline',
+        precision='fp16',
+        sha256='d' * 64,
+        loadable=True,
+    )
+    request = SD15EditRequest(
+        mode='inpaint',
+        source_blob_id='img_source',
+        mask_blob_id='img_mask',
+        prompt='replace the selected window',
+        edit_adapter_id='sd15-inpaint',
+        strength=0.5,
+        width=512,
+        height=512,
+        steps=4,
+    )
+    progress = []
+
+    first = engine.edit(
+        request,
+        image=Image.new('RGB', (16, 16), 127),
+        mask=Image.new('L', (16, 16), 255),
+        adapter=artifact,
+        callback=lambda step, total: progress.append((step, total)),
+    )
+    second = engine.edit(
+        request,
+        image=Image.new('RGB', (16, 16), 127),
+        mask=Image.new('L', (16, 16), 255),
+        adapter=artifact,
+    )
+
+    assert first.image == second.image == 'inpainted-image'
+    assert first.metadata['engine'] == 'diffusers_sd15_inpaint'
+    assert first.metadata['inpaint_sha256'] == 'd' * 64
+    assert first.metadata['mask_semantics'] == 'white=redraw, black=preserve'
+    assert progress == [(1, 2), (2, 2)]
+    assert len(_InpaintPipeline.load_calls) == 1
+    assert _InpaintPipeline.load_calls[0][1]['local_files_only'] is True
+
+
 def test_reference_mode_loads_local_ip_adapter_and_reports_identity(monkeypatch):
     class _ReferencePipeline(_FakePipeline):
         def __init__(self):
