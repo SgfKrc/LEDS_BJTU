@@ -4,13 +4,13 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8**（更新日期：2026-08-06，文档复核于 2026-08-06）
+**v0.1.9**（更新日期：2026-08-06，文档复核于 2026-08-06）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
-> 2026-08-03 复核：Python 全量回归 **`1112 passed / 3 skipped`**（141.5s）。Android Full/Lite Debug 变体构建成功（`app-full-debug.apk` ~29.9 MB、`app-lite-debug.apk` ~18.4 MB），APK 安装与真机目视验收待完成。TUI 网关契约 44/44、7 屏 × 2 角色走查通过；`bjtu` 全局命令（自动启动后端+TUI）已交付。历史复核链：2026-07-31 `1066 passed / 23 skipped`（关闭端口跨平台错误分类与 `PagedKVCache.truncate(n)` 收口）；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。SD 1.5 侧车已验证 U-Net Linear 8-bit 量化与 QKV 融合，尚未注册为分布式 Worker；前端最近证据仍为 `9/9` 且生产构建成功。
+> 2026-08-06 复核：Python 全量回归 **`1416 passed / 4 skipped`**（约 3 min），control-svc 微服务套件 **205 passed**（含 MODEL-FLEET M0-M4：契约/本地事实源/工件库/一键 pull/多集群档案），SD 质量门与 T9 聊天页相关测试全绿。SD 1.5 图像工作区（文生图/图生图/IP-Adapter reference）自动门与**双人目视审核均通过**（2026-08-06，Siegfried Kkm./浅草爱音，5 份报告 status=passed）；`bjtu chat` T9 聊天页 T9.0-T9.5 完成（终端走查 54/54）；微服务改造阶段 3.2 完成（control-svc 136/136）。2026-08-05 复核：Python 全量回归 **`1303 passed / 23 skipped`**（1326 项），SD/API 专项 155/155、前端 15/15、网关 100/100；90s DreamBooth 十种子自动门 10/10。历史复核链：2026-08-03 `1112 passed / 3 skipped`（Android Full/Lite 构建成功、TUI 契约 44/44）；2026-07-31 `1066 passed / 23 skipped`；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。
 
 ---
 
@@ -27,7 +27,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 级别 | 软件版本 | 目标设备 | 核心能力 | 不包含/不推荐 |
 |------|----------|----------|----------|---------------|
 | 1 | **PC 集显版** | Windows / Linux 无 NVIDIA 独显的 PC | llama.cpp + GGUF CPU/集显推理、集群接入与远程请求转发 | 当前 PyTorch 层流水线、重模型实验、CUDA 专属能力 |
-| 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、后续支持多模型/重模型实验 | Android 极简化策略 |
+| 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、**SD 1.5 图像生成侧车（文生图/图生图/参考图）**、后续支持多模型/重模型实验 | Android 极简化策略 |
 | 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、较完整设置、后续可研究完整任务 Worker | Transformer 层间拆分、重模型实验 |
 | 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 完整 models 目录、日志管理、Worker 接收任务、高级控制面板 |
 
@@ -41,11 +41,12 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔗 **PyTorch 层流水线** | 兼容的 Safetensors 模型按连续层段分配，hidden states 逐节点传递，支持 KV Cache 增量解码 |
 | 🔄 **双引擎架构** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/集显)，自动切换 |
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
-| 🗄️ **多会话管理** | 本地 JSON 存储 + 云 PostgreSQL 双轨，断网自动降级 |
+| 🗄️ **多会话与本地事实源** | 会话/设置/模型注册由 control-svc 本地 SQLite 事实源承载（outbox 单向投影远端 PostgreSQL），旧数据自动迁移；断网本地不中断 |
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（可选依赖 Textual，见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
+| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、图生图（img2img）、参考图一致性（IP-Adapter `reference`），固定 DreamBooth 90s 预设、step 进度、取消与结果“继续编辑”；固定资产下载/校验、十种子与双模型自动质量门 + 双人目视已通过（2026-08-06）→ [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
@@ -116,6 +117,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── external_provider.py       # ★ 外部推理服务 Provider + 数据作用域门控（路线 B）
 │   ├── speculative.py             # ★ draft-verify 投机解码（默认关闭的实验路径，路线 C）
 │   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
+│   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx，可选依赖）
+│   ├── tui_sse.py / tui_shared.py # T9 SSE 增量解析器与共享层（端点/命令/metrics）
 │   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存页管理、动态分配）
 │   ├── tcp_comm.py                # TCP主从通信（长连接、心跳、封包解包、张量序列化）
 │   ├── scheduler.py               # 任务调度（节点管理、层分配、流水线控制、请求队列）
@@ -124,7 +127,17 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── api_server.py              # FastAPI 服务端（REST API + WebSocket）
 │   ├── db.py                      # PostgreSQL 数据库连接池
 │   ├── local_store.py             # 本地 JSON 存储（DB 不可用时自动降级）
-│   └── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
+│   ├── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
+│   ├── model_host.py              # 模型生命周期宿主（管理器统一持有、LLM/SD 互斥锁）
+│   ├── email_notifier.py          # SMTP 告警 + IMAP 投票（收件邮箱 node_config 可配置）
+│   ├── scheduler_svc_http.py      # scheduler-svc 微服务 HTTP 壳（透传契约）
+│   ├── diffusion/                 # ★ SD 1.5 侧车（引擎/资产/服务，独立 CUDA venv）
+│   ├── inference_service/         # ★ inference-svc 微服务（engine_host/协议/路由）
+│   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）
+├── control/                       # ★ control-svc 微服务（NestJS：控制面 9 域 + SQLite 本地事实源）
+├── gateway/                       # ★ api-gateway（NestJS + Fastify 网关，96+ 端点透传）
+├── schemas/                       # ★ MODEL-FLEET 冻结契约（artifact/pull-job/deployment/profile JSON Schema）
+├── fixtures/                      # 测试与走查 fixture（SD SSE 事件流、模型门样例）
 ├── android/                       # Android 客户端（Kotlin + Jetpack Compose）
 │   ├── app/
 │   │   ├── build.gradle.kts       # Gradle 构建脚本（含 release 签名配置）
@@ -160,7 +173,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-03 全量回归 1112 passed / 3 skipped）
+├── tests/                         # 单元测试（2026-08-06 全量回归 1416 passed / 4 skipped）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -230,6 +243,15 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
 | llama-cpp-python | ≥ 0.3.0 | CPU 优化 GGUF 推理，3-5x 快于 PyTorch CPU |
+
+### SD 1.5 图像侧车（独显版可选）
+
+| 依赖 | 版本要求 | 说明 |
+|------|----------|------|
+| diffusers | 0.35.2（锁） | 图像工作区 pipeline；0.38+ 需 DINOv2 配置，超出兼容窗口 |
+| transformers | 4.47.1（锁） | 与 LLM 侧同库但独立 CUDA venv（`packaging/requirements-sd15.txt`） |
+
+> SD 侧车安装在独立 CUDA venv（`.venv-packaging-cuda` 侧），不导入或升级全局解释器；`torch.compile`/Inductor 因无 Triton 显式拒绝。
 
 ### Web 可视化
 
@@ -337,6 +359,30 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
 | **Q4_K_M** ⭐ | **~1.16 GB** | **推荐 — 速度/质量最佳平衡** |
 | Q5_K_M | ~1.31 GB | 更高质量 |
 | Q8_0 | ~1.82 GB | 近无损 |
+
+### SD 1.5 图像模型（可选，独显版）
+
+图像工作区使用固定 revision 的本地 Diffusers 资产（推理全程离线，不访问 Hub）：
+
+| 资产 | 固定来源 | 大小 | 用途 |
+|------|----------|------|------|
+| **原版 SD 1.5** | `stable-diffusion-v1-5@451f4fe1…` | ~2.74 GB 快照 | 文生图/图生图基线（CreativeML OpenRAIL-M） |
+| **90s DreamBooth** | `aa8a082c…`（组合原版 safety checker） | ~4.87 GB 固定集合 | 90 年代日式动漫 preset（openrail，双人目视通过） |
+| **IP-Adapter reference** | `h94/IP-Adapter@018e4027…`（稳定 SHA `671c7452…`） | ~2.57 GB | 参考图一致性（人物主要要素保持，非精确身份锁定） |
+
+获取与验证：
+
+```bash
+# 一键下载（固定 revision + 逐文件 SHA 校验 + manifest）
+python scripts/download_sd15.py --asset-id sd15_90s_retrovers_v1 --accept-license
+# 十种子自动质量门（黑图/低熵/损坏/重复拒绝 + 双人目视登记）
+python scripts/quality_gate_sd15.py --asset-id sd15_90s_retrovers_v1
+# img2img / IP-Adapter 完整矩阵门（源图 SHA + strength/scale 矩阵 + 显存门）
+python scripts/quality_gate_sd15_img2img.py --review-report build/sd15-img2img-quality/full-90s/quality-report.json --reviewer 审核者=pass
+python scripts/quality_gate_sd15_ip_adapter.py --review-report build/sd15-ip-adapter-quality/sd15_90s_retrovers_v1-v2/quality-report.json --reviewer 审核者=pass
+```
+
+也可以在 Web 图像工作区直接下载/导入（资产目录刷新自动发现）。许可证与 gated 状态在下载前展示；正式离线资产包（含许可副本+模型卡）尚未发布。
 
 ### GGUF 格式（Android 本地推理）
 
@@ -455,7 +501,7 @@ bjtu --help                                 # 查看完整命令集与启动参�
 /shutdown                 # 优雅退出：后端清理资源后退出，TUI 随后退出
 ```
 
-完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（现行·Active，2026-08-03 复核 44/44 + 双角色走查 PASS）。
+完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（T1-T8 现行·Active；T9 简化聊天页 T9.0-T9.5 已完成 2026-08-06：interactive 契约、routing_preference、Textual UI、会话管理与错误恢复，终端走查 54/54；T9.6 打包与默认入口决策未实施）。
 
 ### 外部算力辅助（三条路线，均默认关闭）
 
@@ -536,6 +582,8 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 > ⚠️ **关键**：两个版本使用**不同的独立 venv**（`.venv-packaging/` vs `.venv-packaging-cuda/`）。
 > 不能混用——集显版 venv 必须装 CPU-only torch，独显版 venv 必须装 CUDA torch。
 > 装错会导致集显版体积从 180 MB 膨胀到 1.8 GB。
+>
+> **SD 1.5 图像侧车**：独显版额外安装 `pip install -r packaging/requirements-sd15.txt`（锁 diffusers 0.35.2 / transformers 4.47.1，独立侧车不污染 LLM 推理环境）；图像模型资产不进入安装包，由 Web 工作区/脚本按固定 revision 下载。正式离线资产包（含许可副本+模型卡）尚未发布。
 >
 > 安装后双击桌面快捷方式即可启动，无需配置 Python 环境。卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
 >
@@ -716,7 +764,7 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1 Completed、SD-N2/SD-N5.1 In Progress；真实 Edge 续编与双模型完整自动质量/显存门通过，仅双人目视待完成）
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1 Completed、SD-N2/SD-N5.1/SD-N5.1A In Progress；img2img 与 IP-Adapter 自动质量/显存门及双人目视均通过 2026-08-06，剩余正式离线发布包）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
 - [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 内容寻址模型仓库、跨节点部署与多集群档案（L4 Candidate）
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
