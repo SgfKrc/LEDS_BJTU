@@ -145,6 +145,21 @@ EXPECTED_ENDPOINTS = [
     ("POST", "/v1/models/unload"),
     ("POST", "/v1/models/switch"),
     ("GET", "/v1/models/current"),
+    ("GET", "/v1/diffusion/capabilities"),
+    ("POST", "/v1/diffusion/artifacts/inspect"),
+    ("POST", "/v1/diffusion/artifacts/register"),
+    ("GET", "/v1/diffusion/artifacts"),
+    ("GET", "/v1/diffusion/assets/catalog"),
+    ("GET", "/v1/diffusion/assets/{asset_id}/status"),
+    ("POST", "/v1/diffusion/assets/{asset_id}/download"),
+    ("POST", "/v1/diffusion/assets/import"),
+    ("POST", "/v1/diffusion/load"),
+    ("POST", "/v1/diffusion/unload"),
+    ("POST", "/v1/diffusion/generate"),
+    ("GET", "/v1/diffusion/jobs/{job_id}"),
+    ("POST", "/v1/diffusion/jobs/{job_id}/cancel"),
+    ("GET", "/v1/diffusion/blobs/{blob_id}"),
+    ("DELETE", "/v1/diffusion/blobs/{blob_id}"),
     ("POST", "/v1/chat"),
     ("POST", "/v1/chat/stream"),
     ("POST", "/v1/chat/cancel"),
@@ -160,8 +175,8 @@ EXPECTED_ENDPOINTS = [
 
 
 def test_contract_endpoint_existence():
-    app = make_app()
-    paths = {r.path for r in app.routes}
+    # FastAPI 0.139 keeps included routers as lazy containers on app.routes.
+    paths = {route.path for route in router.routes}
     for method, path in EXPECTED_ENDPOINTS:
         assert path in paths, f"缺少端点 {method} {path}"
 
@@ -1353,6 +1368,7 @@ def live_inference_svc():
     import socket
     import threading
 
+    import requests
     import uvicorn
 
     from inference_svc_main import build_app
@@ -1362,9 +1378,7 @@ def live_inference_svc():
     port = sock.getsockname()[1]
     sock.close()
 
-    app = build_app("master")
-    app.state.engine_host = FakeEngineHost()
-    app.state.node_role = "master"
+    app = build_app("master", engine_host=FakeEngineHost())
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
@@ -1373,12 +1387,21 @@ def live_inference_svc():
     # 等待就绪
     import time
     deadline = time.time() + 15
+    last_error = None
     while time.time() < deadline:
         try:
-            requests.get(f"http://127.0.0.1:{port}/v1/health", timeout=1)
+            response = requests.get(
+                f"http://127.0.0.1:{port}/v1/health", timeout=1
+            )
+            response.raise_for_status()
             break
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             time.sleep(0.1)
+    else:
+        server.should_exit = True
+        thread.join(timeout=5)
+        pytest.fail(f"inference-svc 未在 15 秒内就绪: {last_error}")
     yield f"http://127.0.0.1:{port}"
     server.should_exit = True
     thread.join(timeout=5)

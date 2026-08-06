@@ -114,6 +114,11 @@ const routes: Array<{ method: string; match: RegExp; data: unknown }> = [
   },
   {
     method: 'POST',
+    match: /^\/v1\/models\/unload$/,
+    data: { success: true, loaded: false, unloaded: true, message: '模型已卸载' },
+  },
+  {
+    method: 'POST',
     match: /^\/v1\/models\/switch$/,
     data: { status: 'switched', model_id: 'qwen-1_8b-chat-gguf', engine: 'llama_cpp' },
   },
@@ -121,6 +126,56 @@ const routes: Array<{ method: string; match: RegExp; data: unknown }> = [
     method: 'POST',
     match: /^\/v1\/speculative\/run$/,
     data: { accepted: 0, drafted: 0, verified: 1, note: 'stub' },
+  },
+  {
+    method: 'GET',
+    match: /^\/v1\/diffusion\/capabilities$/,
+    data: { state: 'unloaded', loaded: false, presets: [{ preset_id: 'sd15_original_v1' }] },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/diffusion\/artifacts\/inspect$/,
+    data: { path: 'C:/models/sd15', artifact_kind: 'sd15_pipeline', loadable: true },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/diffusion\/artifacts\/register$/,
+    data: { artifact_id: 'sd-local', name: 'SD local', artifact: { artifact_kind: 'sd15_pipeline' } },
+  },
+  {
+    method: 'GET',
+    match: /^\/v1\/diffusion\/artifacts$/,
+    data: { artifacts: [{ artifact_id: 'sd-local', artifact: { artifact_kind: 'sd15_pipeline' } }] },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/diffusion\/load$/,
+    data: { state: 'loaded', loaded: true },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/diffusion\/unload$/,
+    data: { state: 'unloaded', loaded: false },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/diffusion\/generate$/,
+    data: { job_id: 'sdjob_test', state: 'queued' },
+  },
+  {
+    method: 'GET',
+    match: /^\/v1\/diffusion\/jobs\/sdjob_test$/,
+    data: { job_id: 'sdjob_test', state: 'completed', blob: { blob_id: 'img_test' } },
+  },
+  {
+    method: 'POST',
+    match: /^\/v1\/diffusion\/jobs\/sdjob_test\/cancel$/,
+    data: { accepted: true, job: { job_id: 'sdjob_test', state: 'running' } },
+  },
+  {
+    method: 'DELETE',
+    match: /^\/v1\/diffusion\/blobs\/img_test$/,
+    data: { deleted: true, blob_id: 'img_test' },
   },
 ];
 
@@ -148,6 +203,40 @@ export async function startFakeInference(): Promise<FakeInference> {
         connection: 'keep-alive',
       });
       res.end(SSE_BODY);
+      return;
+    }
+
+    if (method === 'GET' && path === '/v1/diffusion/blobs/img_test') {
+      res.writeHead(200, {
+        'content-type': 'image/png',
+        'cache-control': 'private, no-store',
+        etag: '"fake-image"',
+      });
+      res.end(Buffer.from('fake-png'));
+      return;
+    }
+
+    if (method === 'POST' && path === '/v1/diffusion/blobs') {
+      res.writeHead(201, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        blob_id: 'img_input',
+        purpose: 'input_image',
+        content_type: 'image/png',
+        size_bytes: 8,
+        width: 8,
+        height: 8,
+      }));
+      return;
+    }
+
+    if (method === 'POST' && path === '/v1/diffusion/edit') {
+      res.writeHead(501, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        detail: {
+          code: 'DIFFUSION_UNSUPPORTED',
+          message: 'edit executor is not installed',
+        },
+      }));
       return;
     }
 

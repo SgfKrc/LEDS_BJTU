@@ -15,7 +15,9 @@ def test_sd15_presets_are_deterministic_and_512_safe():
     assert "sd15_original_v1" in presets
     assert "sd15_retrovers_space_courier_v1" in presets
     assert all(preset.width == 512 and preset.height == 512 for preset in presets.values())
-    assert all(preset.seeds for preset in presets.values())
+    assert all(len(preset.seeds) == 10 for preset in presets.values())
+    assert len({preset.seeds for preset in presets.values()}) == 1
+    assert all(preset.scheduler == "DPMSolverMultistepScheduler" for preset in presets.values())
 
 
 def test_preset_can_be_reduced_to_one_worker_seed():

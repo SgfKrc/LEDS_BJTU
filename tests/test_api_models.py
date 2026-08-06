@@ -105,11 +105,17 @@ def test_model_payload_prefers_pytorch_without_cuda_when_safetensors_exists(tmp_
 
 
 def test_available_models_scans_all_registered_model_formats(tmp_path, monkeypatch):
+    import config as runtime_config
+
     cfg = _both_model(tmp_path)
     monkeypatch.setattr(api_server, "_get_all_model_configs", lambda: [cfg])
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
     monkeypatch.setattr(api_server.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(model_host, "model_loaded", False)
+    # This test isolates local artifact scanning. A developer's .env may enable
+    # optional external routing, which is orthogonal to the asserted engine set.
+    monkeypatch.setattr(runtime_config, "EXTERNAL_ENABLED", False)
+    monkeypatch.setattr(runtime_config, "EXTERNAL_BASE_URL", "")
 
     result = asyncio.run(api_server.list_available_models())
     engine_ids = {engine["id"] for engine in result["available_engines"]}
@@ -265,6 +271,26 @@ def test_model_payload_marks_builtin_slots(monkeypatch):
 
     assert builtin_payload["is_builtin"] is True
     assert custom_payload["is_builtin"] is False
+
+
+def test_diffusion_capabilities_detects_manager_loaded_when_host_flag_is_stale(monkeypatch):
+    class LoadedManager:
+        is_loaded = True
+
+    host = types.SimpleNamespace(
+        model_loaded=False,
+        has_loaded_model=lambda: False,
+    )
+    monkeypatch.setattr(api_server, "model_host", host)
+    monkeypatch.setattr(api_server, "model_manager", LoadedManager())
+    service = types.SimpleNamespace(
+        snapshot=lambda: {"state": "unloaded", "loaded": False},
+    )
+    monkeypatch.setattr(api_server, "diffusion_service", service)
+
+    result = asyncio.run(api_server.get_diffusion_capabilities())
+
+    assert result["local_llm_loaded"] is True
 
 
 def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):

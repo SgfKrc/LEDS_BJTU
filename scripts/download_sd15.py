@@ -1,66 +1,80 @@
-"""Download a pinned Stable Diffusion 1.5 Diffusers snapshot.
-
-The model is an external asset and is ignored by Git.  Use ``--proxy
-http://127.0.0.1:7897`` when the direct Hugging Face route is unavailable.
-"""
+"""Download a pinned, verified Stable Diffusion asset outside the installer."""
 
 from __future__ import annotations
 
 import argparse
-import os
+import json
+import sys
+import time
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-DEFAULT_REPO = "stable-diffusion-v1-5/stable-diffusion-v1-5"
-DEFAULT_REVISION = "451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
+from diffusion import (  # noqa: E402
+    DiffusionAssetManager,
+    LOCAL_PROXY_FALLBACK,
+    get_asset_spec,
+)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Download pinned SD1.5 Diffusers assets")
-    parser.add_argument("--repo-id", default=DEFAULT_REPO)
-    parser.add_argument("--revision", default=DEFAULT_REVISION)
-    parser.add_argument("--local-dir", default="models/sd15-original-v1")
-    parser.add_argument("--proxy", default="", help="HTTP(S) proxy, e.g. http://127.0.0.1:7897")
+    parser = argparse.ArgumentParser(description="Download a pinned QLH SD 1.5 asset")
+    parser.add_argument(
+        "--asset-id",
+        default="sd15_original_v1",
+        choices=("sd15_original_v1", "sd15_90s_retrovers_v1"),
+    )
+    parser.add_argument(
+        "--accept-license",
+        action="store_true",
+        help="Confirm that the model card and declared OpenRAIL license were reviewed",
+    )
+    parser.add_argument(
+        "--proxy-fallback",
+        default=LOCAL_PROXY_FALLBACK,
+        help="Loopback proxy used only after the direct route fails; pass an empty value to disable",
+    )
+    parser.add_argument(
+        "--local-dir",
+        default="",
+        help="Compatibility check only; catalog assets always use their pinned models/ directory",
+    )
     args = parser.parse_args()
 
-    if args.proxy:
-        os.environ["HTTP_PROXY"] = args.proxy
-        os.environ["HTTPS_PROXY"] = args.proxy
-        os.environ["http_proxy"] = args.proxy
-        os.environ["https_proxy"] = args.proxy
+    spec = get_asset_spec(args.asset_id)
+    target = spec.target_path(ROOT).resolve()
+    if args.local_dir and Path(args.local_dir).expanduser().resolve() != target:
+        parser.error(f"{args.asset_id} has a fixed target directory: {target}")
+    if not args.accept_license:
+        parser.error("--accept-license is required")
 
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        raise SystemExit(
-            "缺少 huggingface_hub，请先安装 packaging/requirements-sd15.txt"
-        ) from exc
-
-    local_dir = Path(args.local_dir).expanduser()
-    local_dir.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=args.repo_id,
-        revision=args.revision,
-        local_dir=str(local_dir),
-        allow_patterns=[
-            "model_index.json",
-            "scheduler/*.json",
-            "text_encoder/config.json",
-            "text_encoder/model.fp16.safetensors",
-            "tokenizer/*",
-            "unet/config.json",
-            "unet/diffusion_pytorch_model.fp16.safetensors",
-            "vae/config.json",
-            "vae/diffusion_pytorch_model.fp16.safetensors",
-            "safety_checker/config.json",
-            "safety_checker/model.fp16.safetensors",
-            "feature_extractor/preprocessor_config.json",
-            "README.md",
-            "LICENSE*",
-        ],
+    manager = DiffusionAssetManager(root=ROOT)
+    status = manager.start_download(
+        args.asset_id,
+        license_accepted=True,
+        proxy_fallback=args.proxy_fallback,
     )
-    print(f"SD15 snapshot ready: {local_dir.resolve()}")
-    print("下一步: python -m pytest tests/test_diffusion_artifacts.py tests/test_diffusion_presets.py -q")
+    last_line = ""
+    while status["state"] not in manager.TERMINAL_STATES:
+        line = (
+            f"{status['state']}: {status['progress_percent']}% "
+            f"({status['present_bytes']}/{status['download_bytes']} bytes)"
+        )
+        if line != last_line:
+            print(line, flush=True)
+            last_line = line
+        time.sleep(1)
+        status = manager.status(args.asset_id)
+
+    print(json.dumps(status, ensure_ascii=False, indent=2))
+    if status["state"] != "completed":
+        return 1
+    print(f"SD asset ready: {target}")
+    print(
+        "Next: python scripts/quality_gate_sd15.py "
+        f"--asset-id {args.asset_id}"
+    )
     return 0
 
 

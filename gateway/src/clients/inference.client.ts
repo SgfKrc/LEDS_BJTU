@@ -32,4 +32,16 @@ export class InferenceClient extends ForwardClient {
       signal,
     });
   }
+
+  /** Binary-preserving fetch used by diffusion image blobs. */
+  async diffusionBlobRaw(blobId: string): Promise<Response> {
+    return fetch(
+      this.baseUrl + `/v1/diffusion/blobs/${encodeURIComponent(blobId)}`,
+      {
+        method: 'GET',
+        headers: { accept: 'image/png' },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      },
+    );
+  }
 }

@@ -6,6 +6,7 @@ import ChatPanel from './components/ChatPanel';
 import AdminPanel from './components/AdminPanel';
 import SettingsModal from './components/SettingsModal';
 import SessionList from './components/SessionList';
+import DiffusionPanel from './components/DiffusionPanel';
 import { normalizeExecutionSettings } from './settings';
 
 // ---- 设备档位预设 ----
@@ -81,6 +82,15 @@ function saveSettings(settings) {
   try { localStorage.setItem('qlh-settings', JSON.stringify(settings)); } catch (_) {}
 }
 
+function getInitialView() {
+  try {
+    const requested = new URLSearchParams(window.location.search).get('view');
+    return ['chat', 'image', 'admin'].includes(requested) ? requested : 'chat';
+  } catch (_) {
+    return 'chat';
+  }
+}
+
 export default function App() {
   const [modelLoaded, setModelLoaded] = useState(false);
   const [currentQuant, setCurrentQuant] = useState(null);
@@ -100,7 +110,8 @@ export default function App() {
   });
   const [deviceTier, setDeviceTier] = useState(null);  // 由 DevicePanel 检测后回传
   const [hasDedicatedGpu, setHasDedicatedGpu] = useState(false);  // 是否有独显（用于深度思考门控）
-  const [activeView, setActiveView] = useState('chat'); // 'chat' | 'admin'
+  const [activeView, setActiveView] = useState(getInitialView); // 'chat' | 'image' | 'admin'
+  const [diffusionLoaded, setDiffusionLoaded] = useState(false);
   const [myRole, setMyRole] = useState(null);  // { node_role, node_id, is_master, is_client, ... }
   const [sessions, setSessions] = useState([]);           // 会话列表
   const [activeSessionId, setActiveSessionId] = useState(null);  // 当前活跃会话 ID
@@ -217,6 +228,15 @@ export default function App() {
     || myRole.is_master                           // 主节点：始终显示
     || myRole.node_role === 'unknown'             // 未识别：显示（需手动配置连接）
     || (myRole.is_client && settings.distributedInference);  // 从节点：需开启分布式推理
+  const showDiffusionTab = !myRole
+    || myRole.is_master
+    || myRole.node_role === 'unknown';
+
+  useEffect(() => {
+    if (activeView === 'image' && !showDiffusionTab) {
+      setActiveView('chat');
+    }
+  }, [activeView, showDiffusionTab]);
 
   const setThemePreference = useCallback((mode) => {
     const next = ['system', 'light', 'dark'].includes(mode) ? mode : 'system';
@@ -478,6 +498,12 @@ export default function App() {
     setRefreshKey((k) => k + 1);
   }, []);
 
+  const handleLlmUnloadedForDiffusion = useCallback(() => {
+    setModelLoaded(false);
+    setCurrentQuant(null);
+    setRefreshKey((key) => key + 1);
+  }, []);
+
   return (
     <div className="app-layout">
       {/* Sidebar */}
@@ -505,6 +531,14 @@ export default function App() {
                 >
                   💬 对话
                 </button>
+                {showDiffusionTab && (
+                  <button
+                    className={`nav-tab ${activeView === 'image' ? 'active' : ''}`}
+                    onClick={() => setActiveView('image')}
+                  >
+                    图像
+                  </button>
+                )}
                 {showAdminTab && (
                   <button
                     className={`nav-tab ${activeView === 'admin' ? 'active' : ''}`}
@@ -523,21 +557,34 @@ export default function App() {
 
         {!sidebarCollapsed ? (
           <>
-            <SessionList
-              sessions={sessions}
-              activeSessionId={activeSessionId}
-              onSelectSession={handleSelectSession}
-              onCreateSession={handleCreateSession}
-              onDeleteSession={handleDeleteSession}
-              onRenameSession={handleRenameSession}
-            />
+            {activeView === 'image' ? (
+              <div className="sidebar-section diffusion-sidebar-status">
+                <h3>图像引擎</h3>
+                <div className="diffusion-sidebar-model">
+                  <strong>Stable Diffusion 1.5</strong>
+                  <span>{diffusionLoaded ? '本地模型已加载' : '本地模型未加载'}</span>
+                </div>
+                <div className="diffusion-sidebar-mode">执行模式：本地</div>
+              </div>
+            ) : (
+              <>
+                <SessionList
+                  sessions={sessions}
+                  activeSessionId={activeSessionId}
+                  onSelectSession={handleSelectSession}
+                  onCreateSession={handleCreateSession}
+                  onDeleteSession={handleDeleteSession}
+                  onRenameSession={handleRenameSession}
+                />
 
-            <ModelSelector onModelChange={handleModelChange} onToast={showToast} />
+                <ModelSelector onModelChange={handleModelChange} onToast={showToast} />
 
-            <MetricsPanel
-              refreshTrigger={refreshKey}
-              lastInferMetrics={lastInferMetrics}
-            />
+                <MetricsPanel
+                  refreshTrigger={refreshKey}
+                  lastInferMetrics={lastInferMetrics}
+                />
+              </>
+            )}
 
             <div style={{ padding: '16px 24px', marginTop: 'auto' }}>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
@@ -555,6 +602,15 @@ export default function App() {
             >
               💬
             </button>
+            {showDiffusionTab && (
+              <button
+                className="sidebar-icon-btn"
+                onClick={() => { setSidebarCollapsed(false); setActiveView('image'); }}
+                title="图像生成"
+              >
+                ◫
+              </button>
+            )}
             {showAdminTab && (
               <button
                 className="sidebar-icon-btn"
@@ -577,26 +633,36 @@ export default function App() {
 
       {/* Main Area */}
       <main className="main-area">
-        {activeView === 'chat' || !showAdminTab ? (
-          <ChatPanel
-            modelLoaded={modelLoaded}
-            currentQuant={currentQuant}
-            onToast={showToast}
-            metricsTrigger={handleInferMetrics}
-            onOpenSettings={() => setSettingsOpen(true)}
-            settings={settings}
-            taskGraphCapability={taskGraphCapability}
-            sessionId={activeSessionId}
-            onCreateSession={handleCreateSession}
-            onRenameSession={handleRenameSession}
-          />
-        ) : (
-          <AdminPanel
-            onToast={showToast}
+        <div className="workspace-view" hidden={activeView !== 'image'}>
+          <DiffusionPanel
             myRole={myRole}
-            onRoleChange={setMyRole}
-            hasDedicatedGpu={hasDedicatedGpu}
+            onToast={showToast}
+            onLlmUnloaded={handleLlmUnloadedForDiffusion}
+            onDiffusionStateChange={setDiffusionLoaded}
           />
+        </div>
+        {activeView !== 'image' && (
+          activeView === 'chat' || !showAdminTab ? (
+            <ChatPanel
+              modelLoaded={modelLoaded}
+              currentQuant={currentQuant}
+              onToast={showToast}
+              metricsTrigger={handleInferMetrics}
+              onOpenSettings={() => setSettingsOpen(true)}
+              settings={settings}
+              taskGraphCapability={taskGraphCapability}
+              sessionId={activeSessionId}
+              onCreateSession={handleCreateSession}
+              onRenameSession={handleRenameSession}
+            />
+          ) : (
+            <AdminPanel
+              onToast={showToast}
+              myRole={myRole}
+              onRoleChange={setMyRole}
+              hasDedicatedGpu={hasDedicatedGpu}
+            />
+          )
         )}
       </main>
 

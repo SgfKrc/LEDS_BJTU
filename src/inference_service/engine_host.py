@@ -24,6 +24,15 @@ from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from diffusion import (
+    DiffusionConflictError,
+    DiffusionService,
+    LOCAL_PROXY_FALLBACK,
+    SD15EditRequest,
+    SD15EngineConfig,
+    SD15GenerationRequest,
+)
+
 # ---- 复制自 api_server.py:887-904（常量，保真不变） ----
 THINKING_START = "【思考】"
 THINKING_END = "【思考结束】"
@@ -501,6 +510,8 @@ class EngineHost:
         from model_host import ModelHost
 
         self._host: ModelHost = ModelHost()
+        self._diffusion = DiffusionService()
+        self._model_change_lock = threading.RLock()
         self._layers: List[str] = []  # 已加载层段（1.2 与 model 侧真实状态对齐）
         self._gen_lock = threading.RLock()
         self._generations: Dict[str, threading.Event] = {}
@@ -534,6 +545,27 @@ class EngineHost:
     # ------------------------------------------------------------------
     # 模型生命周期（委托 ModelHost / ModelManager）
     # ------------------------------------------------------------------
+    def _model_lifecycle_lock(self):
+        return getattr(
+            self._host,
+            "full_chat_execution_lock",
+            self._model_change_lock,
+        )
+
+    def _reject_if_diffusion_active(self) -> None:
+        if self._diffusion.is_loaded or self._diffusion.is_busy:
+            raise DiffusionConflictError(
+                "SD 1.5 local engine owns the model lifecycle; unload SD first"
+            )
+
+    def _llm_is_loaded(self) -> bool:
+        checker = getattr(self._host, "has_loaded_model", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(getattr(self._host, "model_loaded", False)) or bool(
+            getattr(self._host, "is_loaded", False)
+        )
+
     def select_engine(self, profile=None) -> str:
         return self._host.select_engine(profile)
 
@@ -547,43 +579,155 @@ class EngineHost:
         # use_compile 走进程内 config 全局开关（对齐 api_server.py:2236
         # cfg.USE_COMPILE = req.use_compile）；ModelManager.load_model 签名
         # 无此参数（2026-08-05 真实加载复测暴露 TypeError）
-        import config as _cfg
+        with self._model_lifecycle_lock():
+            self._reject_if_diffusion_active()
+            import config as _cfg
 
-        _cfg.USE_COMPILE = bool(use_compile)
-        result = self._host.load_model(
-            engine=engine,
-            quant_type=quant_type,
-            model_id=model_id,
-        )
-        # 对齐 api_server.py:2264-2265：load 成功后显式置位运行时状态
-        # （ModelHost.model_loaded 不自更新；2026-08-05 真实加载复测暴露
-        # /v1/status 恒 model_loaded:false）。current_quant 优先取 manager
-        # 实际生效值（对齐 api_server getattr(model_manager, 'quant_type')
-        # or quant），避免请求值与引擎归一化值不一致（如 GGUF 引擎忽略 int4）
-        self._host.model_loaded = True
-        self._host.current_quant = (
-            getattr(self._host, "quant_type", None) or quant_type or "int4"
-        )
-        return result if isinstance(result, dict) else {"success": True, "data": result}
-
-    def unload_model(self) -> Dict[str, Any]:
-        self._host.unload_model()
-        self._layers.clear()
-        self._host.model_loaded = False
-        return {"success": True, "message": "模型已卸载"}
-
-    def switch_model(self, model_id: str, engine: Optional[str] = None) -> Dict[str, Any]:
-        result = self._host.switch_model(model_id=model_id, engine=engine)
-        # 对齐 api_server.py:5146-5147：切换成功置位运行时状态
-        # （api_server 在 result['success'] 分支设置）
-        if isinstance(result, dict) and result.get("success"):
+            _cfg.USE_COMPILE = bool(use_compile)
+            result = self._host.load_model(
+                engine=engine,
+                quant_type=quant_type,
+                model_id=model_id,
+            )
+            # 对齐 api_server.py:2264-2265：load 成功后显式置位运行时状态
+            # （ModelHost.model_loaded 不自更新；2026-08-05 真实加载复测暴露
+            # /v1/status 恒 model_loaded:false）。current_quant 优先取 manager
+            # 实际生效值（对齐 api_server getattr(model_manager, 'quant_type')
+            # or quant），避免请求值与引擎归一化值不一致（如 GGUF 引擎忽略 int4）
             self._host.model_loaded = True
             self._host.current_quant = (
-                getattr(self._host, "quant_type", None)
-                or result.get("quant_type")
-                or getattr(self._host, "current_quant", "int4")
+                getattr(self._host, "quant_type", None) or quant_type or "int4"
             )
-        return result if isinstance(result, dict) else {"success": True, "data": result}
+            return result if isinstance(result, dict) else {"success": True, "data": result}
+
+    def unload_model(self) -> Dict[str, Any]:
+        with self._model_lifecycle_lock():
+            if self._llm_is_loaded():
+                self._host.unload_model()
+            self._layers.clear()
+            self._host.model_loaded = False
+            return {"success": True, "message": "模型已卸载"}
+
+    def switch_model(self, model_id: str, engine: Optional[str] = None) -> Dict[str, Any]:
+        with self._model_lifecycle_lock():
+            self._reject_if_diffusion_active()
+            result = self._host.switch_model(model_id=model_id, engine=engine)
+            # 对齐 api_server.py:5146-5147：切换成功置位运行时状态
+            # （api_server 在 result['success'] 分支设置）
+            if isinstance(result, dict) and result.get("success"):
+                self._host.model_loaded = True
+                self._host.current_quant = (
+                    getattr(self._host, "quant_type", None)
+                    or result.get("quant_type")
+                    or getattr(self._host, "current_quant", "int4")
+                )
+            return result if isinstance(result, dict) else {"success": True, "data": result}
+
+    # ------------------------------------------------------------------
+    # Stable Diffusion 1.5 local sidecar lifecycle
+    # ------------------------------------------------------------------
+    def diffusion_status(self) -> Dict[str, Any]:
+        result = self._diffusion.snapshot()
+        result["local_llm_loaded"] = bool(getattr(self._host, "model_loaded", False))
+        return result
+
+    def diffusion_inspect(self, path: str, *, compute_hash: bool = False):
+        return self._diffusion.inspect(path, compute_hash=compute_hash)
+
+    def diffusion_register(self, path: str, **kwargs):
+        return self._diffusion.register_artifact(path, **kwargs)
+
+    def diffusion_artifacts(self) -> list[Dict[str, Any]]:
+        return self._diffusion.list_artifacts(include_path=False)
+
+    def diffusion_asset_catalog(self) -> list[Dict[str, Any]]:
+        return self._diffusion.asset_catalog()
+
+    def diffusion_asset_status(self, asset_id: str) -> Dict[str, Any]:
+        return self._diffusion.asset_status(asset_id)
+
+    def diffusion_asset_download(
+        self,
+        asset_id: str,
+        *,
+        license_accepted: bool,
+        use_local_proxy_fallback: bool,
+    ) -> Dict[str, Any]:
+        return self._diffusion.download_asset(
+            asset_id,
+            license_accepted=license_accepted,
+            proxy_fallback=(
+                LOCAL_PROXY_FALLBACK if use_local_proxy_fallback else ""
+            ),
+        )
+
+    def diffusion_asset_import(
+        self,
+        asset_id: str,
+        path: str,
+        *,
+        license_accepted: bool,
+    ) -> Dict[str, Any]:
+        return self._diffusion.import_asset(
+            asset_id,
+            path,
+            license_accepted=license_accepted,
+        )
+
+    def diffusion_load(
+        self,
+        artifact_id: str,
+        config: SD15EngineConfig,
+    ) -> Dict[str, Any]:
+        with self._model_lifecycle_lock():
+            if self._llm_is_loaded():
+                raise DiffusionConflictError(
+                    "本地 LLM 已加载；请先显式卸载 LLM，再加载 SD 1.5"
+                )
+            return self._diffusion.load(artifact_id, config)
+
+    def diffusion_unload(self) -> Dict[str, Any]:
+        with self._model_lifecycle_lock():
+            return self._diffusion.unload()
+
+    def diffusion_generate(self, request: SD15GenerationRequest) -> Dict[str, Any]:
+        return self._diffusion.submit_generation(request)
+
+    def diffusion_put_blob(
+        self,
+        data: bytes,
+        *,
+        purpose: str,
+        owner_scope: str,
+    ) -> Dict[str, Any]:
+        return self._diffusion.put_input_blob(
+            data,
+            purpose=purpose,
+            owner_scope=owner_scope,
+        )
+
+    def diffusion_edit(
+        self,
+        request: SD15EditRequest,
+        *,
+        owner_scope: str,
+    ) -> Dict[str, Any]:
+        return self._diffusion.submit_edit(request, owner_scope=owner_scope)
+
+    def diffusion_job(self, job_id: str) -> Dict[str, Any]:
+        return self._diffusion.get_job(job_id)
+
+    def diffusion_cancel(self, job_id: str) -> Dict[str, Any]:
+        return self._diffusion.cancel_job(job_id)
+
+    def diffusion_blob(self, blob_id: str):
+        return self._diffusion.get_blob(blob_id)
+
+    def diffusion_delete_blob(self, blob_id: str) -> bool:
+        return self._diffusion.delete_blob(blob_id)
+
+    def close(self) -> None:
+        self._diffusion.close()
 
     def current_model(self) -> Dict[str, Any]:
         """当前模型信息（/v1/models/current，对齐 api_server.py:2188-2207 完整字段）。"""
@@ -2780,6 +2924,7 @@ class EngineHost:
         ModelHost 执行锁，等价单机拓扑。）
         """
         with self._host.full_chat_execution_lock:
+            self._reject_if_diffusion_active()
             if prepare is not None:
                 prepare()
             sched = self._scheduler

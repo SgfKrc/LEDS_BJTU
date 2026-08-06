@@ -90,6 +90,7 @@ def main() -> int:
                 height=preset.height,
                 steps=args.steps,
                 guidance_scale=preset.guidance_scale,
+                scheduler=preset.scheduler,
             )
             result = engine.generate(request)
             output_path = output_dir / f"{preset.preset_id}_seed{result.seed}.png"
