@@ -236,6 +236,7 @@ class TestImapConfig:
 # ================================================================
 
 @pytest.mark.slow
+@pytest.mark.external
 class TestEmailSending:
     """测试实际邮件发送（需要网络连接）"""
 
