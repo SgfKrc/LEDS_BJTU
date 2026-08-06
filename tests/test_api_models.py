@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 
 import api_server
+from model_host import model_host
 import model_config as mc
 from model_module import ModelManager
 
@@ -104,11 +105,17 @@ def test_model_payload_prefers_pytorch_without_cuda_when_safetensors_exists(tmp_
 
 
 def test_available_models_scans_all_registered_model_formats(tmp_path, monkeypatch):
+    import config as runtime_config
+
     cfg = _both_model(tmp_path)
     monkeypatch.setattr(api_server, "_get_all_model_configs", lambda: [cfg])
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
     monkeypatch.setattr(api_server.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
+    # This test isolates local artifact scanning. A developer's .env may enable
+    # optional external routing, which is orthogonal to the asserted engine set.
+    monkeypatch.setattr(runtime_config, "EXTERNAL_ENABLED", False)
+    monkeypatch.setattr(runtime_config, "EXTERNAL_BASE_URL", "")
 
     result = asyncio.run(api_server.list_available_models())
     engine_ids = {engine["id"] for engine in result["available_engines"]}
@@ -231,7 +238,7 @@ def test_api_switch_model_resolves_db_registered_gguf(tmp_path, monkeypatch):
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
     monkeypatch.setattr(api_server, "kv_cache", None)
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
 
     req = api_server.SwitchModelRequest(
@@ -266,6 +273,26 @@ def test_model_payload_marks_builtin_slots(monkeypatch):
     assert custom_payload["is_builtin"] is False
 
 
+def test_diffusion_capabilities_detects_manager_loaded_when_host_flag_is_stale(monkeypatch):
+    class LoadedManager:
+        is_loaded = True
+
+    host = types.SimpleNamespace(
+        model_loaded=False,
+        has_loaded_model=lambda: False,
+    )
+    monkeypatch.setattr(api_server, "model_host", host)
+    monkeypatch.setattr(api_server, "model_manager", LoadedManager())
+    service = types.SimpleNamespace(
+        snapshot=lambda: {"state": "unloaded", "loaded": False},
+    )
+    monkeypatch.setattr(api_server, "diffusion_service", service)
+
+    result = asyncio.run(api_server.get_diffusion_capabilities())
+
+    assert result["local_llm_loaded"] is True
+
+
 def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
     saved = []
     fake_db = types.SimpleNamespace(
@@ -273,7 +300,7 @@ def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
     )
 
     monkeypatch.setitem(sys.modules, "db", fake_db)
-    monkeypatch.setattr(api_server, "_db_available", True)
+    monkeypatch.setattr(model_host, "_db_available", True)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     req = api_server.RegisterModelRequest(
@@ -296,7 +323,7 @@ def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch):
     )
 
     monkeypatch.setitem(sys.modules, "db", fake_db)
-    monkeypatch.setattr(api_server, "_db_available", True)
+    monkeypatch.setattr(model_host, "_db_available", True)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     req = api_server.RegisterModelRequest(
@@ -459,7 +486,7 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
             }
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
@@ -499,11 +526,11 @@ def test_load_model_reports_effective_cpu_quant(monkeypatch):
             }
 
     async def fake_get_status():
-        return {"current_quant": api_server.current_quant}
+        return {"current_quant": model_host.current_quant}
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", False)
-    monkeypatch.setattr(api_server, "current_quant", "int4")
+    monkeypatch.setattr(model_host, "model_loaded", False)
+    monkeypatch.setattr(model_host, "current_quant", "int4")
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server, "get_status", fake_get_status)
@@ -514,7 +541,7 @@ def test_load_model_reports_effective_cpu_quant(monkeypatch):
         quant_type="fp16",
     )))
 
-    assert api_server.current_quant == "fp32"
+    assert model_host.current_quant == "fp32"
     assert result["current_quant"] == "fp32"
 
 
@@ -537,7 +564,7 @@ def test_load_model_rollback_on_failure(monkeypatch):
             }
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
     # 绕过 _validate_model_load_request（model_id "new-model" 不在注册表中）
@@ -615,7 +642,7 @@ def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
     monkeypatch.setattr(api_server, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups", lambda *a, **kw: [])
-    monkeypatch.setattr(api_server, "_db_available", False)
+    monkeypatch.setattr(model_host, "_db_available", False)
     monkeypatch.setattr(api_server._local_store, "save_local_message", lambda *a, **kw: None)
     monkeypatch.setattr(api_server._local_store, "increment_local_session_message_count", lambda *a, **kw: None)
 
@@ -669,7 +696,7 @@ def test_list_models_includes_active_model_id(monkeypatch):
         active_model_id = "qwen-1_8b"
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     result = asyncio.run(api_server.list_models())
@@ -688,7 +715,7 @@ def test_list_models_returns_null_when_not_loaded(monkeypatch):
         active_model_id = ""
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     result = asyncio.run(api_server.list_models())
@@ -701,7 +728,7 @@ def test_list_models_returns_null_when_not_loaded(monkeypatch):
 
 def test_current_model_when_not_loaded(monkeypatch):
     """模型未加载时 → loaded=False"""
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     result = asyncio.run(api_server.get_current_model())
     assert result["loaded"] is False
     assert result["model_id"] is None
@@ -727,8 +754,8 @@ def test_current_model_when_loaded(monkeypatch):
             return {"gpu_allocated_gb": 1.8, "gpu_reserved_gb": 2.0}
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", True)
-    monkeypatch.setattr(api_server, "current_quant", "int4")
+    monkeypatch.setattr(model_host, "model_loaded", True)
+    monkeypatch.setattr(model_host, "current_quant", "int4")
 
     result = asyncio.run(api_server.get_current_model())
     assert result["loaded"] is True
@@ -776,7 +803,7 @@ def test_switch_model_calls_manager_switch(monkeypatch):
             }
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
     # 绕过 _validate_model_load_request（GGUF 文件实际不存在）
@@ -855,7 +882,7 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
             }
 
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "kv_cache", FakeKvCache())
     monkeypatch.setattr(
         api_server,
@@ -942,7 +969,7 @@ def test_register_model_passes_db_experimental_models_to_switch(monkeypatch, tmp
 
     monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [db_entry])
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "model_loaded", False)
+    monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "kv_cache", None)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)

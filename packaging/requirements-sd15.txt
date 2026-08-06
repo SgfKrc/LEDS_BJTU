@@ -1,0 +1,14 @@
+# Optional Stable Diffusion 1.5 sidecar dependencies.
+# Install into the CUDA venv only; do not add these to the集显/Android package.
+# 0.36+ imports DINOv2 symbols absent from the project's transformers 4.47.x.
+# Pin the real-SD-verified version instead of allowing a silent incompatible upgrade.
+diffusers==0.35.2
+# Keep the optional SD sidecar aligned with the project's Qwen/DeepSeek window.
+transformers>=4.47.0,<4.48.0
+Pillow>=10.0.0
+safetensors>=0.4.5
+accelerate>=1.0.0
+huggingface_hub>=0.32.0
+# Needed only for SD15EngineConfig.quantization=bitsandbytes_8bit_unet.
+# It stays in the CUDA sidecar and outside LLM/global packaging environments.
+bitsandbytes>=0.49.0,<0.50.0

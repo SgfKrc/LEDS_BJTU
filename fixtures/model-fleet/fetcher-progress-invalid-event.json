@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "event": "teleported",
+  "job_id": "pull_bad",
+  "phase": "done",
+  "at": "2026-08-06T12:00:00Z",
+  "downloaded_bytes": -5
+}

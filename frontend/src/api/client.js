@@ -42,13 +42,14 @@ function withLogAdminHeaders(headers = {}) {
   return token ? { ...headers, 'X-QLH-Log-Token': token } : headers;
 }
 
-function makeApiError(message, { status = 0, requestId = null, path = '' } = {}) {
+function makeApiError(message, { status = 0, requestId = null, path = '', code = null } = {}) {
   const suffix = requestId ? ` (request_id: ${requestId})` : '';
   const error = new Error(`${message}${suffix}`);
   error.detail = message;
   error.status = status;
   error.requestId = requestId;
   error.path = path;
+  error.code = code;
   if (requestId) {
     console.error('API request failed', { path, status, requestId, detail: message });
   }
@@ -67,9 +68,12 @@ function normalizeErrorDetail(detail, fallback) {
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
   const { signal, ...rest } = options;
+  const isFormData = typeof FormData !== 'undefined' && rest.body instanceof FormData;
   const res = await fetch(url, {
     ...rest,                                                         // 先展开 rest，允许 headers 覆盖
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: isFormData
+      ? { ...options.headers }
+      : { 'Content-Type': 'application/json', ...options.headers },
     ...(signal ? { signal } : {}),
   });
   const text = await res.text();
@@ -83,10 +87,14 @@ async function request(path, options = {}) {
   }
   const requestId = res.headers.get('X-Request-ID') || data.request_id || null;
   if (!res.ok) {
+    const errorCode = data.detail && typeof data.detail === 'object'
+      ? data.detail.code || null
+      : null;
     throw makeApiError(normalizeErrorDetail(data.detail, `HTTP ${res.status}`), {
       status: res.status,
       requestId,
       path,
+      code: errorCode,
     });
   }
   return data;
@@ -114,6 +122,159 @@ export async function loadModel(engine, quantType, useCompile = false, modelId =
       ...(modelId ? { model_id: modelId } : {}),
     }),
   });
+}
+
+export async function unloadModel() {
+  return request('/models/unload', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+// ---- Stable Diffusion 1.5 local workspace ----
+
+export async function fetchDiffusionCapabilities() {
+  return request('/diffusion/capabilities');
+}
+
+export async function inspectDiffusionArtifact(path, computeHash = false) {
+  return request('/diffusion/artifacts/inspect', {
+    method: 'POST',
+    body: JSON.stringify({ path, compute_hash: computeHash }),
+  });
+}
+
+export async function registerDiffusionArtifact(path, options = {}) {
+  return request('/diffusion/artifacts/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      path,
+      compute_hash: options.computeHash === true,
+      ...(options.artifactId ? { artifact_id: options.artifactId } : {}),
+      ...(options.name ? { name: options.name } : {}),
+    }),
+  });
+}
+
+export async function fetchDiffusionArtifacts() {
+  return request('/diffusion/artifacts');
+}
+
+export async function fetchDiffusionAssetCatalog() {
+  return request('/diffusion/assets/catalog');
+}
+
+export async function fetchDiffusionAssetStatus(assetId, options = {}) {
+  return request(
+    `/diffusion/assets/${encodeURIComponent(assetId)}/status`,
+    options,
+  );
+}
+
+export async function downloadDiffusionAsset(assetId, options = {}) {
+  return request(`/diffusion/assets/${encodeURIComponent(assetId)}/download`, {
+    method: 'POST',
+    body: JSON.stringify({
+      license_accepted: options.licenseAccepted === true,
+      use_local_proxy_fallback: options.useLocalProxyFallback !== false,
+    }),
+  });
+}
+
+export async function importDiffusionAsset(assetId, path, licenseAccepted) {
+  return request('/diffusion/assets/import', {
+    method: 'POST',
+    body: JSON.stringify({
+      asset_id: assetId,
+      path,
+      license_accepted: licenseAccepted === true,
+    }),
+  });
+}
+
+export async function loadDiffusionArtifact(artifactId, profile = 'balanced', safetyCheckerRequired = true) {
+  return request('/diffusion/load', {
+    method: 'POST',
+    body: JSON.stringify({
+      artifact_id: artifactId,
+      profile,
+      safety_checker_required: safetyCheckerRequired,
+    }),
+  });
+}
+
+export async function unloadDiffusionArtifact() {
+  return request('/diffusion/unload', { method: 'POST' });
+}
+
+export async function generateDiffusionImage(parameters) {
+  return request('/diffusion/generate', {
+    method: 'POST',
+    body: JSON.stringify(parameters),
+  });
+}
+
+export async function uploadDiffusionBlob(file, purpose = 'input_image') {
+  const body = new FormData();
+  body.append('purpose', purpose);
+  body.append('file', file);
+  return request('/diffusion/blobs', {
+    method: 'POST',
+    body,
+  });
+}
+
+export async function editDiffusionImage(parameters) {
+  return request('/diffusion/edit', {
+    method: 'POST',
+    body: JSON.stringify(parameters),
+  });
+}
+
+export async function fetchDiffusionJob(jobId, options = {}) {
+  return request(`/diffusion/jobs/${encodeURIComponent(jobId)}`, options);
+}
+
+export async function cancelDiffusionJob(jobId) {
+  return request(`/diffusion/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+  });
+}
+
+export async function deleteDiffusionBlob(blobId) {
+  return request(`/diffusion/blobs/${encodeURIComponent(blobId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function fetchDiffusionBlob(blobId, options = {}) {
+  const path = `/diffusion/blobs/${encodeURIComponent(blobId)}`;
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { Accept: 'image/png' },
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let data = {};
+    if (text) {
+      try { data = JSON.parse(text); } catch (_) { data = { detail: text }; }
+    }
+    const requestId = res.headers.get('X-Request-ID') || data.request_id || null;
+    const errorCode = data.detail && typeof data.detail === 'object'
+      ? data.detail.code || null
+      : null;
+    throw makeApiError(normalizeErrorDetail(data.detail, `HTTP ${res.status}`), {
+      status: res.status,
+      requestId,
+      path,
+      code: errorCode,
+    });
+  }
+  return {
+    blob: await res.blob(),
+    contentType: res.headers.get('content-type') || 'image/png',
+    etag: res.headers.get('etag') || '',
+  };
 }
 
 // ---- P3: 多模型实验支持 ----
@@ -500,6 +661,17 @@ export async function fetchMasterHealth() {
 
 export async function testEmailNotification() {
   return request('/cluster/email-test', { method: 'POST' });
+}
+
+export async function fetchEmailConfig() {
+  return request('/cluster/email-config');
+}
+
+export async function updateEmailConfig(recipient) {
+  return request('/cluster/email-config', {
+    method: 'POST',
+    body: JSON.stringify({ recipient }),
+  });
 }
 
 // ---- 分布式推理开关 ----

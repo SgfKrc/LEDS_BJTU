@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "deployment_id": "dep_001",
+  "artifact_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "node_id": "node_worker_01",
+  "status": "active",
+  "epoch": 2,
+  "digest_verified": true,
+  "prepared_at": "2026-08-06T12:10:00Z",
+  "activated_at": "2026-08-06T12:12:00Z",
+  "error": null
+}

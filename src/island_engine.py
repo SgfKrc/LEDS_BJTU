@@ -208,7 +208,7 @@ class IslandEngine:
                 "若后端校验的是 API Key，请从 base_url 中去掉 user:pass。"
             )
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         self._client = httpx.Client(
             timeout=httpx.Timeout(self._timeout, connect=self._connect_timeout),
             auth=(
@@ -243,7 +243,7 @@ class IslandEngine:
 
         self._loaded = True
         logger.info(
-            f"孤岛引擎就绪 ({time.time() - t0:.1f}s): "
+            f"孤岛引擎就绪 ({time.perf_counter() - t0:.1f}s): "
             f"endpoint={masked}, model={self._model_name}"
         )
 
@@ -368,7 +368,7 @@ class IslandEngine:
         if not self.is_loaded:
             raise RuntimeError("孤岛引擎未连接，请先调用 load_model()")
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         cancel_event = kwargs.pop("_cancel_event", None)
 
         if cancel_event is not None and cancel_event.is_set():
@@ -415,7 +415,7 @@ class IslandEngine:
                 cancelled = True
 
             content = "".join(content_parts)
-            elapsed = time.time() - t0
+            elapsed = time.perf_counter() - t0
             # 无本地 tokenizer：取消场景用 chunk 数估算生成 token 数
             completion_tokens = int(usage.get("completion_tokens", 0) or chunk_count)
             return {
@@ -473,7 +473,7 @@ class IslandEngine:
                 f"返回内容无法按 OpenAI 格式解析。"
             ) from None
 
-        elapsed = time.time() - t0
+        elapsed = time.perf_counter() - t0
         completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         # tok/s 优先取后端计时（llama.cpp server 的 timings.predicted_per_second），
         # 否则用 usage / 本地耗时计算

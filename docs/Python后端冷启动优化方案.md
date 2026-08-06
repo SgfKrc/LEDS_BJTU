@@ -1,8 +1,9 @@
 # Python 后端冷启动性能优化方案
 
-> **状态**：历史测量 + 持续优化参考
+> **状态**：历史测量 + 持续优化参考（2026-08-03 已更新：微服务阶段 1 新拓扑指标入附录 C/D）
 >
-> **更新日期**：2026-07-14
+> **更新日期**：2026-08-03
+> **适用范围**：Python 后端启动路径（api_server 导入链、打包启动器）的耗时测量与优化参考
 >
 > 文中的 12.1 秒和各模块耗时是创建时环境的测量快照，不代表当前源码或安装包性能；每次依赖、spec 或启动器变更后必须重新测量。
 
@@ -602,6 +603,16 @@ jobs:
 
 > 注：在保留 sklearn 的新决策下，不再把 `< 2 秒` 作为纯 Python 真实冷启动的硬目标；该目标应由进程常驻、预热和 readiness 拆分共同实现。
 
+**2026-08-03 实测（微服务阶段 1 新拓扑，见 [微服务架构改造计划](微服务架构改造计划.md) §1.8）**：
+
+| 拓扑 | 入口 | import 耗时 | 应用构建 | 说明 |
+|------|------|-------------|----------|------|
+| 单体（旧基线） | `src.api_server.py` | 12.1 秒（2026-07-11 快照） | — | model_module 顶层 import transformers（9.7s） |
+| inference-svc（新） | `src/inference_svc_main.py` | **0.04 秒** | 3.85 秒（build_app） | model_module 延迟至首次 load 请求（config→torch 1.8s） |
+| inference-svc client 角色 | `src/inference_svc_main.py` | 0.03 秒 | — | 无 fastapi/scheduler/api_server 顶层 import（瘦身验收） |
+
+> 阶段 1 验收记录：`python -X importtime` 验证 inference-svc 入口无 `fastapi`/`scheduler` 顶层 import；`QLH_MONOLITH=1` 回退冒烟通过（scheduler-svc 走进程内 model_host）。双节点实测与本地双引擎推理实测待真实环境（列入阶段 1.8 待办）。
+
 ---
 
 ### D. 决策记录
@@ -609,6 +620,7 @@ jobs:
 | 日期 | 决策 | 影响 |
 |------|------|------|
 | 2026-07-12 | 保留 `sklearn` / `scikit-learn`，放弃禁止加载 sklearn 的方案 | 冷启动收益估算下调约 1.5 秒；换取依赖兼容性和未来扩展空间 |
+| 2026-08-03 | inference-svc 顶层不再 import model_module，首次 load 请求时才 import（微服务架构改造计划 §1.3） | import 冷启动 12.1s → 0.04s；transformers 6s 从"启动成本"变为"首次加载成本" |
 
 ---
 

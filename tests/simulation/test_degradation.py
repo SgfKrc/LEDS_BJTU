@@ -40,8 +40,8 @@ def validate_cluster_status(
 ) -> ValidationResult:
     errors = []
     warnings = []
-    mode = status.get("mode", "unknown")
-    slaves = status.get("slaves", [])
+    mode = status.get("run_mode", status.get("mode", "unknown"))
+    slaves = list(status.get("nodes", {}).values())
     online_slaves = sum(1 for s in slaves if s.get("state") == "online")
 
     if expected_mode and mode != expected_mode:
@@ -170,10 +170,10 @@ async def test_graceful_degradation(
 
         async with RequestSender() as sender:
             status = await sender.get_cluster_status()
-            mode = status.get("mode", "unknown")
-            slave_count = len(status.get("slaves", []))
+            mode = status.get("run_mode", status.get("mode", "unknown"))
+            slave_count = len(list(status.get("nodes", {}).values()))
             online_slaves = sum(
-                1 for s in status.get("slaves", [])
+                1 for s in list(status.get("nodes", {}).values())
                 if s.get("state") == "online"
             )
 
@@ -251,10 +251,10 @@ async def test_graceful_degradation(
 
             # 检查集群状态
             status = await sender.get_cluster_status()
-            mode = status.get("mode", "unknown")
-            slave_count = len(status.get("slaves", []))
+            mode = status.get("run_mode", status.get("mode", "unknown"))
+            slave_count = len(list(status.get("nodes", {}).values()))
             online_slaves = sum(
-                1 for s in status.get("slaves", [])
+                1 for s in list(status.get("nodes", {}).values())
                 if s.get("state") == "online"
             )
 
@@ -327,10 +327,10 @@ async def test_graceful_degradation(
 
             # 检查集群状态
             status = await sender.get_cluster_status()
-            mode = status.get("mode", "unknown")
-            slave_count = len(status.get("slaves", []))
+            mode = status.get("run_mode", status.get("mode", "unknown"))
+            slave_count = len(list(status.get("nodes", {}).values()))
             online_slaves = sum(
-                1 for s in status.get("slaves", [])
+                1 for s in list(status.get("nodes", {}).values())
                 if s.get("state") == "online"
             )
 

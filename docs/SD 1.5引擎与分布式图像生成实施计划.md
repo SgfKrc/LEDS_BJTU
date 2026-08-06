@@ -1,14 +1,40 @@
 # SD 1.5 引擎与分布式图像生成实施计划
 
-> 文档状态：规划（`Candidate`，由《总体下一步计划》L4-SD1.5 管理优先级）
+> 文档状态：部分实施（`L4 Candidate`；SD-N1 已完成，SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；img2img 与 IP-Adapter `reference` 的后端、前端和双模型完整自动质量/显存门均已通过，双人目视审核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，5 份报告均 passed）；局部重绘、指令式编辑、发布包和分布式阶段均未完成，仍由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
+> 更新日期：2026-08-06
 >
-> 适用范围：Windows CUDA PC 上的 Stable Diffusion 1.5 本地推理、可选 ControlNet 图生图，以及基于现有 TaskGraph/PC Full Worker 的跨 PC 图像批次分布式展示
+> 适用范围：Windows CUDA PC 上的 Stable Diffusion 1.5 本地文生图，以及后续图生图、局部重绘、指令式编辑和基于现有 TaskGraph/PC Full Worker 的跨 PC 图像批次分布式展示
 >
 > 总计划入口：[总体下一步计划](总体下一步计划.md)
 
-本文只定义计划，不代表 QLH 当前已经支持 Stable Diffusion。任何阶段只有完成对应自动化、真实模型、真实 GPU、跨设备和安装包验收后，才能把状态改为“已实现”。
+本文同时记录计划与已验证边界。任何阶段只有完成对应自动化、真实模型、真实 GPU、跨设备和安装包验收后，才能把状态改为“已实现”。当前不得因为单机基线通过而宣称已支持分布式图像生成。
+
+## 0. 2026-08-06 实施状态
+
+| 范围 | 状态 | 已验证证据 |
+|---|---|---|
+| `SD-N0` 资产识别与固定下载 | 验证中 | 固定 `stable-diffusion-v1-5/stable-diffusion-v1-5@451f4fe16113bff5a5d2269ed5ad43b0592e9a14`；仅下载 SD 1.5 FP16 推理所需文件，完整快照为 2,742,233,847 bytes，Inspector 识别为可加载 `sd15_pipeline`。完整 single-file checkpoint 的离线结构初始化和全部资产 fixture 仍待完成。 |
+| `SD-N1` 本地单机文生图 | `Completed`（2026-08-05） | RTX 4060 Laptop GPU（8,188 MiB）/ 16 GB RAM、`torch 2.5.1+cu121`、`diffusers 0.35.2`、`transformers 4.47.1`：固定 seed `19950101` 起的 10 次连续 512x512/28 steps FP16 baseline 均实际生成成功，耗时 6.909–11.778 s（平均 8.844 s）；另以 8-bit U-Net Linear 量化 + QKV 融合组合完成 512x512/28 steps，耗时 10.030 s，峰值 reserved 显存 3,735,027,712 bytes。新增本地资产登记、加载/卸载、异步 job、step 取消、结果查询/删除和有界内存 PNG blob，并接通单体 FastAPI、inference-svc 与 Nest 网关；自动化覆盖 LLM/SD 双向生命周期互斥、加载失败及取消/编码竞态。真实 inference-svc 路由验收完成 512x512/4 steps PNG（542,085 bytes），取消在第 1/50 步后 0.244 秒收敛且无 blob；SD 卸载后 Qwen 1.8B GGUF 在 5.471 秒内重载并完成最短对话。SD 卸载后仅余约 20 MiB CUDA 上下文 reserved，不残留模型显存。`diffusers 0.38.0` 会要求本项目兼容窗口外的 DINOv2 配置，故不作为打包组合。前端、发布包和分布式 Worker 属于后续阶段。 |
+| `SD-N2` 本地图像工作区 | `In Progress`（2026-08-05） | Web 主节点已接通本机 Diffusers 检查/登记、profile 加载、LLM/SD 显式互斥切换、原版/90s preset、异步 step 进度、取消和 PNG 生命周期。DreamBooth `aa8a082c...` 及逐权重 SHA 已冻结，4,874,690,864-byte 固定下载集合已实际下载、完整校验并生成 16 文件 manifest；独立脚本下载后服务端也能在目录刷新时自动发现并注册。90s 组合资产固定原版 SD 1.5 safety checker，组件缺失时 fail-closed。第二轮固定十种子自动门 10/10 通过：10 个唯一 PNG、0 个 safety flag、最小熵 7.855、最小文件 446,750 bytes，总耗时 111.712 s。**双人目视与许可复核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，十种子报告 status=passed）**。正式离线发布包仍未完成，因此 SD-N2 不得标记完成。 |
+| single-file checkpoint、LoRA、ControlNet | 未实施 | Inspector 可以拒绝把 ControlNet 当完整模型；实际加载和组合仍未接入。 |
+| 图生图 img2img、参考图一致性、局部重绘、指令式编辑 | img2img 与 IP-Adapter `In Progress`，自动门完成、待双人目视；其余未实施 | **img2img（2026-08-06）**：引擎 `SD15Engine.edit()` 复用已加载组件（`StableDiffusionImg2ImgPipeline.from_pipe`/`components`）、服务层 `submit_edit`/`validate_edit`（blob 租约、源图/mask 维度校验、strength 0.05–1.0）、单体 FastAPI 与 inference-svc 路由、Nest 网关 multipart 转发与 Web 工作区均已落地。已修复生成结果续编的 `purpose`/`owner_scope` 契约，并完成真实 inference-svc `文生图 → output Blob 图生图 → 引用删除 → 取消 → 卸载` 快速门：512×512/4 steps 文生图 6.739 s，strength 0.55 图生图 7.428 s，源 Blob 被结果引用时删除正确返回 409，取消在第 1/20 step 后 0.054 s 收敛。真实 Edge 150 浏览器门完成“上传源图 → img2img → 继续编辑 → 再次 img2img → 卸载”，两轮引擎耗时 5.998/4.842 s、像素采样范围 245/239。源图 SHA-256 固定为 `a6fd131b...e93264`；原版 28 steps 与 90s 40 steps 各完成 10 seed × 0.25/0.55/0.85 共 30 张，均 30/30 自动通过且 30 张唯一，耗时 291.993/361.291 s，连续 allocated/reserved span 均为 0，卸载后 allocated 增量 8,519,680 bytes。两份报告均为 `pending_manual_review`。**IP-Adapter（2026-08-06）**：冻结并下载 `h94/IP-Adapter@018e4027...` 的 2,573,016,776-byte 离线资产，稳定 artifact SHA-256 为 `671c7452...e94c4`；Inspector、服务/API、Web `reference` 模式和真实 GPU 生命周期均已通过。修复 adapter 后注册的 2.5 GB image encoder 未进入 Accelerate CPU-offload hook 的性能缺陷，并在 pipeline 级关闭 tqdm，4-step 回归为 4.537 s、无 `[Errno 22]`。固定人物参考图 SHA-256 为 `3271580f...fe38f`；原版 28 steps 完成 36/36 有效图，90s 40 steps 完成 35 张有效图并正确保留 1 张 safety 黑图证据，三档 scale 有效数为 11/12/12；两轮峰值 reserved 均为 2,789,212,160 bytes，显存门通过，报告均为 `pending_manual_review`。**img2img（2 份）与 IP-Adapter（2 份）报告于 2026-08-06 双人目视签字完成（Siegfried Kkm./浅草爱音，均 status=passed），目视门已满足；IP-Adapter 只承诺人物主要要素保持，不承诺精确身份锁定。** `inpaint`/`instruction` 继续显式拒绝。 |
+| API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 本地 API/UI/临时 blob 已实现，其余未实施 | 资产登记和 PNG 结果当前仅驻留本进程内存：最多 16 项、64 MiB、TTL 30 分钟；服务重启即丢失，不是 SD-N3 的跨节点 blob 协议。UI 固定显示“本地”，尚无 TaskGraph Stage、完整 Worker 或跨 PC 调度，不得计入分布式任务统计。 |
+| Android SD 推理 | 未实施 | Android 仍不承担完整 SD Worker 或层间拆分。 |
+
+单引擎基准由 `scripts/smoke_sd15.py` 复现；真实 HTTP 文生图/续编/取消生命周期由 `scripts/validate_sd15_api_lifecycle.py` 复现；固定资产下载由 `scripts/download_sd15.py --asset-id ... --accept-license` 复现；文生图十种子门由 `scripts/quality_gate_sd15.py` 复现，图生图三 strength/多 seed 门由 `scripts/quality_gate_sd15_img2img.py` 复现，IP-Adapter 三 scale/多 seed 门由 `scripts/quality_gate_sd15_ip_adapter.py` 复现，真实浏览器门由 `frontend npm run test:e2e:sd15` 复现。图生图和 IP-Adapter 完整门都必须显式传入固定源图的 `--source-sha256`；快速/改参运行只会得到 `partial_pass`。IP-Adapter 完整门每档固定生成 12 个 seed，至少 10 个未被 safety 拦截的有效结果才计为通过；被拦截黑图保留在报告中，不计入质量和唯一性。推理路径只接受已下载的本地完整 Diffusers 目录，不会在加载或生成途中访问 Hub。下载器和推理侧车只使用 CUDA 可选虚拟环境，不安装或升级全局解释器依赖，尚未进入 PC/Android 发布产物。
+
+### 0.1 单机优化能力边界
+
+| 能力 | 状态 | 实现与实测边界 |
+|---|---|---|
+| U-Net 8-bit 量化 | 已验证 | `bitsandbytes 0.49.2` 只替换 U-Net 的 184 个 `torch.nn.Linear` 为 `Linear8bitLt`，卷积、CLIP、VAE 和 safety checker 仍为 FP16。512x512/28 steps 实机出图成功，耗时 9.629 s，峰值 reserved 显存为 3,409,969,152 bytes。量化 U-Net 为常驻 CUDA 路径，代码禁止与 CPU offload 混用。 |
+| Attention QKV 算子融合 | 已验证 | 通过 Diffusers `fuse_qkv_projections(unet=True, vae=False)`。512x512/8 steps 实机出图成功；与 8-bit U-Net 组合后 512x512/28 steps 也成功，单次耗时 10.030 s，峰值 reserved 显存为 3,735,027,712 bytes。同一已加载 pipeline 以三个不同 seed 连续运行 28 steps，峰值 reserved 显存均保持为该值；耗时会受 GPU 背景负载波动，不能据此宣称融合提升吞吐。它与 attention slicing 不能同时启用，QKV profile 保留 VAE slicing。 |
+| `torch.compile` / Inductor | 当前不可用，显式拒绝 | 当前 CUDA sidecar 没有可工作的 Triton，首次真实调用会失败。引擎在加载模型前检查并给出短错误，不会等到去噪首步才抛出长异常；不为了该可选优化把未验证的 Triton 依赖加入侧车。 |
+| LLM `PagedKVCache` | 不适用，非缺陷 | SD 1.5 U-Net 的每一步输入 latent 都会变化，没有可跨去噪步复用的自回归 KV Cache。不得将文本引擎的 token KV 分页标为 SD 优化；SD 的受支持显存分块手段是 Diffusers attention slicing。 |
+
+这些优化全部位于 `src/diffusion/sd15_engine.py` 的延迟导入侧车中，本地生命周期由 `src/diffusion/service.py` 托管。它们不导入或改写 LLM `ModelManager`、文本 Worker 契约、集显包、Android 依赖和既有全局解释器；SD 与 LLM 当前通过同一模型生命周期锁显式互斥，SD 仍未注册为 Worker，因此不能显示为分布式推理或计入分布式任务统计。真正进入分布式前仍须完成 SD-N3 的图像 Stage/blob/Worker 协议和资源准入。
 
 ---
 
@@ -87,6 +113,7 @@ Diffusers 官方分布式推理指南把“每个进程持有完整 pipeline、�
 - 将图片请求纳入现有 Workflow/Stage/Attempt、reservation、lease、fencing、取消和统计体系。
 - 至少两台物理 PC 完成多 seed fan-out/fan-in，UI 明确显示每张图片的实际执行节点。
 - 在一期稳定后，支持本地 ControlNet IP2P 图像编辑。
+- 在不改变现有文生图请求契约的前提下，依次提供图生图、局部重绘和指令式编辑；三种模式复用同一异步 job、取消、blob 与安全边界。
 - 在相同模型、参数和图片数量下，对比单节点串行与多节点并行 wall time，给出真实吞吐收益。
 
 ### 2.2 非目标
@@ -99,6 +126,8 @@ Diffusers 官方分布式推理指南把“每个进程持有完整 pipeline、�
 - 不自动扫描全盘寻找模型；用户必须明确选择文件或目录。
 - 不把主节点绝对模型路径发送给从节点；每个节点独立映射同一逻辑资产 ID。
 - 不因 UI 选择“分布式”就统计为分布式，必须有至少一个远端已完成 attempt。
+- SD-N5 不实现 Photoshop 类图层、PSD 工程、滤镜栈、自由变形、自动抠图或跨多次编辑的无限历史；第一阶段只保存当前源图、mask、参数和结果引用。
+- 不把普通图生图包装成“理解自然语言指令”；无法确认专用 InstructPix2Pix/ControlNet 资产和参数时，指令式编辑必须显示不可用或降级原因。
 
 ---
 
@@ -200,18 +229,19 @@ SD pipeline 不是单个 LLM 权重，因此把现有单一 `ModelIdentity` 扩�
 | 触发词 | `retrovers` |
 | pipeline | `StableDiffusionPipeline` |
 | 文件形态 | 完整 Diffusers 目录，包含 text encoder、U-Net、VAE Safetensors |
-| revision | 调研时 `aa8a082c6a12d66ed995cca1ccb491bb171b9713` |
+| revision | 已冻结 `aa8a082c6a12d66ed995cca1ccb491bb171b9713` |
 | 许可 | Hugging Face 元数据为 `openrail` |
-| 风险 | 下载量和社区验证较少，且模型自身 `requires_safety_checker=false` |
+| 推理体积 | DreamBooth 核心文件 4,266,667,701 bytes；组合原版 safety checker 后固定下载集合 4,874,690,864 bytes |
+| 风险 | 下载量仅 8、社区验证很少，且模型自身 `requires_safety_checker=false` |
 
 因此该候选只有完成以下门槛后才成为正式演示资产：
 
-1. 固定 revision 可完整下载并离线重载。
-2. 许可证原文与基础模型许可经人工复核，资产包附副本。
-3. 10 个固定 seed 均能生成有效图像，无黑图、NaN 或明显模型损坏。
-4. 由至少两人目视确认触发词确实产生目标风格，而非只相信仓库标签。
-5. 应用加载独立安全检查组件或输出门控；不能因为 fine-tune 没带 safety checker 就默认公开未过滤结果。
-6. 完整 snapshot 和每个文件 SHA-256 写入 manifest。
+1. **已实测：** 固定 revision 断点下载、直接连接失败后可回退 `127.0.0.1:7897`；4,874,690,864-byte 下载集合已落到 `models/sd15-90s-retrovers-v1`，完整哈希校验通过，推理全程离线加载。
+2. **已完成（2026-08-06）：** 许可证原文与基础模型许可复核（Siegfried Kkm./浅草爱音 确认 `openrail` 许可与 CreativeML OpenRAIL-M 基础模型条款允许演示分发并附副本）；正式离线资产包仍须附许可副本和模型卡。
+3. **已实测：** `scripts/quality_gate_sd15.py` 固定 10 seed，自动拒绝黑图、低熵图、损坏图和重复输出；当前固定集合 10/10 自动通过，报告位于 `build/sd15-quality/sd15_90s_retrovers_v1/quality-report.json`（status=passed，2026-08-06 双人目视签字）。
+4. **已完成（2026-08-06）：** 至少两名不同审核者（Siegfried Kkm./浅草爱音）确认触发词产生目标风格，并把 `NAME=pass` 写入质量报告（status=passed）。
+5. **已实现：** QLH 把固定原版 SD 1.5 safety checker 权重组合进 90s 资产，`safety_checker_required=true` 时 pipeline 实际缺组件会拒绝加载。
+6. **已实现：** 大权重按 Hugging Face LFS SHA-256 验证；下载/导入成功后生成 `.qlh-sd-asset.json` 全文件清单。该清单证明本地完整性，不等同发布者数字签名。
 
 备选 `nitrosocke/classic-anim-diffusion` 是 OpenRAIL-M、DreamBooth、触发词 `classic disney style`，但它描述的是经典动画工作室风格，并非严格的“90 年代日式动漫”，只能在首选验收失败后作为“经典动画”备选，UI 名称不得写错。
 
@@ -227,10 +257,12 @@ width: 512
 height: 512
 num_inference_steps: 40
 guidance_scale: 7.5
-scheduler: PNDMScheduler（完整配置写入 manifest）
-seeds: [19950101, 19950102, 19950103, 19950104]
-num_images: 4
+scheduler: DPMSolverMultistepScheduler
+seeds: [19950101, ..., 19950108, 19950110, 19950111]
+num_images: 10（UI 单图使用首个 seed；质量门使用全部 seed）
 ```
+
+首次真实十种子运行中 `19950109` 被组合 safety checker 标记并替换为黑图，自动门因此正确失败；固定集合改用已单独验证未触发安全门的 `19950111`，不通过关闭 safety checker 绕过该结果。
 
 原版 SD 1.5 对照 preset 使用同一主题、negative prompt、尺寸、scheduler、步数、CFG 和 seeds，只去掉 `retrovers`，由此展示“引擎一致、模型资产可切换”，不是用不同参数人为制造风格差异。
 
@@ -249,6 +281,15 @@ num_images: 4
 1. **默认方式：一键下载固定 snapshot。** 下载器显示仓库、revision、许可证、预计空间，支持断点续传和最终 SHA 校验。
 2. **离线方式：独立演示资产包。** 模型不进入主安装包，资产包包含 manifest、许可证、模型卡、哈希和导入说明。
 3. **已有模型：本地目录映射。** 用户选择电脑其他位置的模型，由 Inspector 校验后注册。
+
+当前 Web 图像页已经提供前两类入口的执行面：目录下载不进入 Git 或安装包，下载期间以已落盘文件计算真实进度；离线导入对固定目录做逐文件大小和权重 SHA 校验，不能用任意“同名目录”冒充已冻结资产。CLI 与 API 共用 `src/diffusion/assets.py` 的同一份目录事实源：
+
+```powershell
+.\.venv-packaging-cuda\Scripts\python.exe scripts\download_sd15.py --asset-id sd15_90s_retrovers_v1 --accept-license
+.\.venv-packaging-cuda\Scripts\python.exe scripts\quality_gate_sd15.py --asset-id sd15_90s_retrovers_v1
+```
+
+质量报告自动门通过后仍是 `pending_manual_review`。至少两人审图后用两个 `--reviewer NAME=pass` 重跑或登记审核，才允许成为正式演示资产。模型卡链接和许可标识会在下载前显示；正式离线压缩包附带许可原文的发布流程仍未完成。
 
 不得自动重新分发一个来源或许可不清楚的社区 checkpoint；不得把 ControlNet 文件当作“已经提供完整 SD”。
 
@@ -276,7 +317,7 @@ src/diffusion/
 
 首轮兼容性 spike 使用项目现有 CUDA 虚拟环境，新增独立可选依赖清单，不先污染 CPU/集显包：
 
-- `diffusers`：版本通过 SD 1.5、ControlNet single-file、现有 `transformers==4.47.x` 和 PyTorch 环境矩阵后锁定；候选模型导出版本为 `0.34.0.dev0`，只作兼容线索，不直接使用 dev 版本。
+- `diffusers`：锁定为 `0.35.2`。实测 `0.38.0` 在导入阶段需要 `transformers 4.47.x` 不具备的 `Dinov2WithRegistersConfig`，不能进入本项目打包环境；候选模型导出版本为 `0.34.0.dev0`，只作兼容线索，不直接使用 dev 版本。
 - `Pillow`：输入/输出图片。
 - `safetensors`、`accelerate`、`transformers`、`torch`：复用 CUDA 环境，锁定已验证组合。
 - `xformers`：一期不设为必需；先以 PyTorch SDPA 建立正确性基线，确认 wheel/CUDA 兼容和收益后再作为可选优化。
@@ -303,6 +344,7 @@ src/diffusion/
 - width/height，必须是 8 的倍数并受 512 默认/最大值限制；
 - steps、CFG、seed、batch size；
 - pipeline kind 和可选 control image；
+- 对编辑请求使用不可变 input/mask blob descriptor，而不是本机路径或 JSON Base64；
 - attempt cancel event。
 
 取消通过 Diffusers step-end callback 在去噪步边界检查。取消后：
@@ -330,7 +372,8 @@ src/diffusion/
 | `GET /api/diffusion/artifacts` | 列出本机可用资产/preset |
 | `POST /api/diffusion/load` | 加载资产集合并建立 ready 状态 |
 | `POST /api/diffusion/generate` | 本地单图或分布式批次任务 |
-| `POST /api/diffusion/edit` | 二期 ControlNet IP2P |
+| `POST /api/diffusion/blobs` | 二期以 `multipart/form-data` 上传源图或 mask，返回不可变 blob descriptor |
+| `POST /api/diffusion/edit` | 二期统一提交 `img2img`、`inpaint`、`instruction` 异步编辑任务 |
 | `GET /api/diffusion/jobs/{id}` | 查询 Workflow/Stage/Attempt 与图片结果 |
 | `POST /api/diffusion/jobs/{id}/cancel` | 协作取消 |
 | `GET /api/diffusion/blobs/{id}` | 读取有权限、未过期的图片 blob |
@@ -356,7 +399,7 @@ Worker v2 目前是严格 JSON 信封，Stage 类型仅允许 `full_inference`/`
 
 新增“图像生成”工作区，而不是把十几个参数塞进聊天输入框：
 
-- 模式 tabs：文生图 / 图像编辑（二期）。
+- 模式 segmented control：文生图 / 图生图 / 局部重绘 / 指令编辑；未实施模式不得提前显示为可用。
 - 模型选择：原版 SD 1.5 / 90s anime demo / 本地模型。
 - 文件或目录选择、资产类型、哈希与缺失组件提示。
 - 固定演示 preset 一键填入且参数可只读展开。
@@ -366,6 +409,137 @@ Worker v2 目前是严格 JSON 信封，Stage 类型仅允许 `full_inference`/`
 - 进度来自 `step/total_steps` 或 Workflow 状态，不用假进度条。
 - 取消、单图下载、整组 ZIP、复制参数与重新生成。
 - 只有完成的远端 attempt 才显示“分布式：是”；一张图本地生成后不能冒充多节点。
+
+### 6.4 本地图像编辑扩展计划
+
+#### 6.4.1 目标、顺序与共同边界
+
+三个方向共用一套输入资产、作业状态、取消和结果协议，但按风险从低到高实施：
+
+| 模式 | 用户输入 | 首选 Diffusers pipeline | 第一阶段定位 |
+|---|---|---|---|
+| `img2img` | 源图 + prompt + `strength` | `StableDiffusionImg2ImgPipeline` | 先落地；验证输入 blob 和组件复用的最小闭环 |
+| `inpaint` | 源图 + mask + prompt + `strength` | `StableDiffusionInpaintPipeline` | 第二步；优先使用 SD 1.5 专用 9-channel inpainting U-Net |
+| `instruction` | 源图 + 自然语言编辑指令 | 专用 InstructPix2Pix pipeline，或兼容 SD 1.5 base 的 ControlNet IP2P 组合 | 第三步；以资产能力声明选择 pipeline，不承诺任意指令都能像素级准确执行 |
+
+共同目标：
+
+- 保持现有 `POST /api/diffusion/generate` 文生图调用、preset 和响应结构向后兼容。
+- 输入图、mask 和输出图全部通过 blob ID 引用；API、journal、任务图和 Worker 信封不携带图片正文或本机绝对路径。
+- 三种模式都使用现有单活动作业、step 边界取消和模型生命周期锁；不得绕开 LLM/SD 显式互斥。
+- 一个完成结果可被显式“作为新源图继续编辑”，形成有界版本链；不自动永久保留整条历史。
+- 本地能力先验收，再接 SD-N3/N4 的跨进程 blob 和完整 Worker。没有远端完成 attempt 时始终报告 `distributed=false`。
+
+共同非目标：第一阶段不做训练、LoRA 在线合并、多人协同画布、实时逐笔扩散、视频编辑、语义分割服务或单张图跨节点 U-Net 拆分。
+
+#### 6.4.2 API 与 blob 契约
+
+新增输入上传端点，使用受控 multipart，不把 Base64 放进 JSON：
+
+```http
+POST /api/diffusion/blobs
+Content-Type: multipart/form-data
+
+purpose=input_image|mask
+file=<PNG/JPEG/WebP bytes>
+```
+
+成功返回现有 descriptor 的兼容超集：
+
+```json
+{
+  "blob_id": "img_...",
+  "purpose": "input_image",
+  "content_type": "image/png",
+  "size_bytes": 123456,
+  "sha256": "...",
+  "width": 512,
+  "height": 512,
+  "created_at": 0,
+  "expires_at": 0
+}
+```
+
+上传时必须按 magic bytes 解码，不信任文件名/MIME/EXIF；应用 EXIF orientation 后重新编码为规范 PNG，剥离路径、账户名和非必要元数据。mask 规范化为与源图同尺寸的 8-bit 灰度 PNG，固定 **白色表示重绘、黑色表示保留**，拒绝空尺寸、超像素、动画、多页和解压炸弹。
+
+统一编辑入口：
+
+```json
+POST /api/diffusion/edit
+{
+  "mode": "img2img|inpaint|instruction",
+  "preset_id": "sd15_original_v1",
+  "source_blob_id": "img_source",
+  "mask_blob_id": null,
+  "prompt": "...",
+  "negative_prompt": "...",
+  "seed": 19950101,
+  "width": 512,
+  "height": 512,
+  "steps": 28,
+  "guidance_scale": 7.5,
+  "strength": 0.65,
+  "instruction": null,
+  "edit_adapter_id": null,
+  "conditioning_scale": null,
+  "image_guidance_scale": null
+}
+```
+
+校验规则：
+
+- `source_blob_id` 三种模式必填；`mask_blob_id` 仅 `inpaint` 必填，其他模式携带时拒绝而不是忽略。
+- `strength` 仅在 pipeline 声明支持时允许，建议 UI 范围 `0.05–1.0`；服务端使用冻结硬上限，不接受 NaN/Inf。较低值偏向保留原图，较高值允许更大改动，UI 不承诺线性效果。
+- `instruction` 仅 `instruction` 模式必填；普通 `prompt` 与指令的映射由固定 preset 定义，Worker 不接受任意 Python 类名或远程 config URL。
+- 请求中的 width/height 是规范化工作尺寸。默认保持源图宽高比并缩放到受支持的 8 倍数；任何裁剪、填充或拉伸都必须在提交前由前端明确展示，并写入 job 参数。
+- `edit_adapter_id` 只能引用本机已登记且 manifest 匹配的 InstructPix2Pix/ControlNet 资产。base、adapter、VAE、scheduler、dtype 和 runtime 共同组成 artifact-set identity。
+- 响应继续返回 `202 + job snapshot`；`GET /jobs/{id}` 增加 `mode`、去敏后的输入 blob descriptors、编辑参数和实际 pipeline/adapter identity，不返回图片正文。
+
+为兼容现有调用，输入 blob 与结果 blob 使用同一存储接口和 descriptor，但增加 `purpose`、`owner_scope`、`parent_blob_ids`、`lease_count` 元数据。`GET`/`DELETE` 行为保持一致；删除仍被活动 job 租用的输入时返回冲突或标记延迟删除，不得让运行中的 pipeline 读到半删除数据。
+
+#### 6.4.3 引擎与 pipeline 设计
+
+`SD15Engine` 不变成包含大量模式分支的单函数。新增强类型编辑请求，并由 pipeline factory 按 artifact-set capability 构造执行器：
+
+```text
+DiffusionService
+  -> TextToImageExecutor       # 现有行为
+  -> Img2ImgExecutor           # base components + source image
+  -> InpaintExecutor           # dedicated inpaint bundle + source + mask
+  -> InstructionEditExecutor  # InstructPix2Pix 或 base + ControlNet IP2P
+```
+
+- 图生图优先从已加载 SD 1.5 pipeline 的 `components` 构造 `StableDiffusionImg2ImgPipeline`，避免同一 base 权重重复常驻。组件复用必须有单元测试证明 scheduler/config 不被跨 job 污染。
+- 局部重绘正式 preset 使用 SD 1.5 兼容的专用 inpainting checkpoint。普通 4-channel base 的兼容/旧式重绘只可作为标记清楚的实验路径，未过质量门不得自动回退。
+- 指令式编辑首先评估专用 InstructPix2Pix full pipeline；已有 `control_v11e_sd15_ip2p_fp16.safetensors` 走“SD 1.5 base + ControlNet IP2P + source image”组合。两者输入字段和 guidance 语义不同，必须由 asset capability 显式区分，不能用一个模糊的 `scale` 猜测。
+- pipeline bundle 同时只保留一个活动执行组合。模式切换可复用共享组件，但新增 ControlNet/inpaint U-Net 前先做显存预算；预计超限则在排队前拒绝或要求用户切换已验证 offload profile，不在生成中途偷偷降级。
+- 所有 pipeline 都保持 `local_files_only`、侧车延迟导入、Diffusers 进度输出隔离、`torch.inference_mode()` 和 step callback 取消；不得安装或升级全局 Python 解释器。
+- source/mask 在进入 pipeline 前完成 RGB/L 规范化并冻结；pipeline 不得原地修改 blob store 中的对象。每次 job 使用独立 generator 和 scheduler 状态，保证相同工件、输入哈希、参数和 seed 可复测。
+
+#### 6.4.4 前端交互
+
+在现有 `DiffusionPanel` 中增加模式 segmented control：文生图 / 图生图 / 局部重绘 / 指令编辑。模式切换只改变相关控件，不卸载当前兼容模型；不支持的模式显示具体缺失资产或显存原因。
+
+- 图生图：支持文件选择、拖放和剪贴板粘贴；显示规范化后的尺寸/裁剪预览；使用 slider 设置 `strength`，保留 seed、steps、CFG 和 negative prompt。
+- 局部重绘：在稳定尺寸画布上提供画笔/橡皮、画笔大小、撤销、重做、清空和反转 mask；遮罩叠层颜色只用于显示，提交时转换为黑白 mask。画布必须支持缩放/平移，鼠标和触控坐标都映射到源图像素。
+- 指令编辑：以一条主指令为核心，按所选 pipeline 显示 `conditioning_scale` 或 `image_guidance_scale`，不同时暴露无效参数；提供原图/结果并排或拖动对比。
+- 通用：提交后锁定本次参数快照，显示真实 step；取消沿用当前 job API。结果提供下载、删除、“作为新源图继续编辑”和复制参数；替换结果时撤销旧 `ObjectURL`，服务端 blob 删除失败不阻断 UI 回收本地 URL。
+- 刷新能力或切换模型时保留尚未提交的本地表单，但若 blob 已过期必须提示重新上传，不保留失效 ID 后继续提交。
+
+#### 6.4.5 安全、资源隔离与生命周期
+
+- 输入图可能包含隐私信息。默认只保存在本机受控 blob store，日志和 journal 仅记录 descriptor/hash；不写 EXIF、原始文件名、浏览器路径或图片正文。
+- 输入/结果 blob 使用 owner/session scope 和不可猜测 ID；ID 不是授权凭据。远程访问仍须经过现有集群认证，后续跨节点下载使用 attempt 范围短 TTL 签名。
+- job 提交时为 source/mask 增加租约；`completed`、`failed`、`cancelled` 后在 finally 中释放。取消后不发布半成品结果，已编码但尚未 commit 的 PNG 立即回收。
+- 默认输入与 mask TTL 至少覆盖最长 job 超时和排队窗口；活动租约期间不做容量淘汰。无租约 blob 按 TTL/LRU 清理，版本链只保存父 ID/hash，不阻止父 blob 正常过期。
+- 一个侧车仍只并发一个扩散 job。图片预处理可以在受限 CPU executor 中进行，但不能占用文本任务的全局线程池或通过并发预处理绕过图片像素/内存预算。
+- 输出继续经过 safety checker 或等价门控。公开服务中安全组件缺失、输入解码异常、mask 不匹配、ControlNet manifest 不一致或显存预算失败都 fail-closed，并返回稳定错误码而非底层 traceback。
+
+#### 6.4.6 分布式接入边界
+
+本地三模式完成前不扩 Worker 协议。进入分布式后，`image_edit` Stage 只携带不可变 descriptor；主节点上传一次 source/mask，各 attempt 按短租约读取，结果仍按 winner/fencing 提交。调度硬约束增加 `pipeline_kinds`、所需 adapter manifest、最大输入像素和预估峰值显存。
+
+同一源图多 seed/多指令可以任务级 fan-out；单张编辑的去噪循环仍不跨节点拆分。远端全部不可用时，只有请求显式允许才回退本地，并在 job 中记录 `distributed=false`、`fallback_reason` 和实际 provider。
 
 ---
 
@@ -398,7 +572,7 @@ validate_input
 | Stage | 输入 | 输出 | 推荐 Provider |
 |---|---|---|---|
 | `image_generate` | prompt、negative、seed、尺寸、steps、CFG、scheduler、artifact set | image blob descriptor + metrics | 完整 SD CUDA Worker |
-| `image_edit` | 上述参数 + input blob + ControlNet identity/scale | image blob descriptor + metrics | 完整 SD+ControlNet Worker |
+| `image_edit` | 上述参数 + mode + source/mask blob + edit artifact identity + 模式专用参数 | image blob descriptor + metrics | 声明对应 pipeline capability 的完整 SD Worker |
 | `image_grid` | 有序 image descriptors | grid blob + ordered result descriptors | 主节点轻量 Provider |
 
 所有数值做上下限和有限值校验，prompt 长度、总像素、steps 和图片数在建图前冻结预算。Worker 不接受任意 Python pipeline 类名、任意 config URL 或任意本地路径。
@@ -447,7 +621,7 @@ validate_input
 
 ### SD-N0：依赖与资产识别 spike
 
-**状态：** `Candidate`
+**状态：** `In Progress`（已完成固定下载、目录 Inspector、ControlNet 防误识别与 CUDA 侧车共存实测；其余完成判据未满足）
 
 **工作：**
 
@@ -460,17 +634,21 @@ validate_input
 
 ### SD-N1：本地原版 SD 1.5 引擎
 
+**状态：** `Completed`（2026-08-05；在与 LLM 相同 `transformers 4.47.1` 兼容窗口中完成本地加载/卸载、文生图、step 回调、同一 pipeline 10 轮稳定性、资产登记、异步 job、临时 PNG blob 和三层 HTTP API；自动化覆盖加载失败、并发拒绝、取消/编码竞态与 LLM/SD 双向互斥，真实 inference-svc 路由完成取消及 `SD → Qwen GGUF` 模型切换回归）。
+
 **依赖：** SD-N0。
 
-**工作：** `DiffusionEngine`、本地资产注册、加载/卸载、文生图、step 取消、指标、API 单元测试。
+**工作：** `DiffusionEngine`、本地资产注册、加载/卸载、文生图、step 取消、指标、API 单元测试和真实 GPU API 生命周期验收均已完成。后续新增 UI、DreamBooth 资产或跨节点 Worker 时不得回写改变本阶段已冻结的本地 job/blob 契约。
 
 **完成判据：** RTX 4060 Laptop 或目标 CUDA 设备上用原版 SD 1.5 固定 preset 连续生成 10 轮；无 NaN/黑图/显存持续增长；取消在下一去噪步收敛；切换回 LLM 后显存和模型状态正确。
 
 ### SD-N2：90s DreamBooth 演示资产与前端
 
+**状态：** `In Progress`（2026-08-05；本地 Web 工作区、固定 revision/SHA 目录、一键下载、外置目录校验导入、组合 safety checker 和 10 seed 自动门均已接通并完成真实 DreamBooth 实测；两人目视/许可复核和正式离线压缩包尚未完成）。
+
 **依赖：** SD-N1、模型许可/样例人工验收。
 
-**工作：** 固定 `retrovers` preset、原版对照 preset、一键下载/离线资产包、图像生成 UI、结果参数卡和下载。
+**工作：** 固定 `retrovers`/原版 preset、图像生成 UI、结果参数、step 进度、取消、PNG 回收、固定资产获取和外置导入已实现。4.87 GB 组合资产与十种子自动门已实测通过；下一步完成两人目视和许可证复核，再制作正式离线资产包。人工门通过前不把 SD-N2 标记完成，也不进入 SD-N3 实施。
 
 **完成判据：** 固定 revision 和 SHA 可重建；10 seed 质量门通过；原版和 fine-tune 均可选择；无模型时 UI 不假装可用；安装包不内置大权重但能导入外置模型。
 
@@ -478,7 +656,7 @@ validate_input
 
 **依赖：** SD-N1、TC-N2.4 状态机/Worker 故障边界保持稳定。
 
-**工作：** blob store、受控传输、图像 Stage schema、artifact manifest、v3 能力协商、RemoteDiffusionProvider、取消/lease/fencing。
+**工作：** 在现有单进程有界内存结果 store 之外，实现可持久/跨进程的 blob store、受控传输、图像 Stage schema、artifact manifest、v3 能力协商、RemoteDiffusionProvider、取消/lease/fencing。
 
 **完成判据：** 本机双进程能完成单 `image_generate` Stage；恶意尺寸、错误 MIME、哈希不符、断传、重复上传、迟到结果和路径探测全部 fail-closed；v2 文本 Worker 全量回归不变。
 
@@ -497,13 +675,63 @@ validate_input
 - 拔网、Worker OOM、重连、主节点重启、单 seed 失败和用户取消均无假成功、重复图或 blob 泄漏。
 - 页面明确写“分布式批次/多图吞吐”，不写“单图已加速”。
 
-### SD-N5：ControlNet IP2P
+### SD-N5：本地图像编辑四方向分期
 
-**依赖：** SD-N2、本地 blob 安全路径；分布式支持可在 SD-N4 后接入。
+**总依赖：** SD-N2、本地输入 blob 安全路径；分布式支持可在 SD-N3/N4 后接入。SD-N5 各阶段只能逐项推进，不因图生图完成就宣称已支持局部重绘或指令式编辑。
 
-**工作：** 加载本地 `control_v11e_sd15_ip2p_fp16.safetensors` 及本地 config；输入图上传/选择；固定编辑 prompt；ControlNet scale；结果对照。
+#### SD-N5.0：输入 blob 与编辑公共契约
 
-**完成判据：** 原图、prompt、base、ControlNet、seed 和参数均写入 manifest/结果元数据；缺 base/config/input image 时在执行前拒绝；本地 10 轮无泄漏；若进入分布式，输入只上传一次并由 blob 引用复用。
+**实施进度（2026-08-06）：`Completed`。** 单体 API 与 inference-svc 的 multipart 输入 Blob、PNG/JPEG/WebP 解码、EXIF 方向归一化、RGB/灰度 mask 规范化、字节/像素上限、owner/TTL/lease/父引用、重复删除冲突、统一编辑请求模型、稳定错误码和前端客户端契约均已完成。相同 owner 下的输入 Blob 与生成结果 `output` Blob 都可作为后续编辑源；生成和编辑结果继承调用面的 owner scope。活动租约或父引用存在时删除 fail-closed，子结果删除后父引用释放。`img2img` 进入真实 executor，`inpaint`/`instruction` 仍返回 `DIFFUSION_UNSUPPORTED`。
+
+**工作：** 增加 multipart 输入上传、图片/mask 规范化、owner/lease/TTL、`POST /api/diffusion/edit` 强类型 schema、编辑 job snapshot 和稳定错误码；保持现有 `/generate` 不变。
+
+**完成判据：** PNG/JPEG/WebP、EXIF orientation、错误 MIME、解压炸弹、像素上限、重复删除、活动租约删除、取消/编码竞态和服务关闭全部自动化通过；job/journal/log 不含图片正文和原始路径。
+
+#### SD-N5.1：图生图
+
+**实施进度（2026-08-06）：`In Progress`，自动门与双人目视完成。** 引擎、服务、单体/inference API、网关和 Web 工作区已接通；结果“继续编辑”的 Blob purpose/owner 契约及回归已修复。真实 inference-svc 已完成原版 SD 1.5 的连续编辑、引用回收、取消和卸载快速门；Edge 150 已完成上传、两轮结果续编和卸载的点击链路。独立质量脚本现在以源图 SHA、preset 参数、完整 seed/strength 矩阵和显存上限共同判定 full gate。原版与 90s 各 30 张的自动完整性、唯一性、安全标记和连续显存门均通过，两份报告准确停在 `pending_manual_review`。双人目视签字已于 2026-08-06 完成（Siegfried Kkm./浅草爱音，两份报告均 passed）。
+
+固定源图 SHA-256 为 `a6fd131b5008b77f3c39f01d4a073529cf8225a8a204997d4f01de9217e93264`。复现完整门时分别使用 `--asset-id sd15_original_v1` 与 `--asset-id sd15_90s_retrovers_v1`，并同时传入 `--source-image logs/sd15/sd15_original_v1_seed19950101.png --source-sha256 <上述完整值>`；审核者无需重复推理，可直接登记已有报告：`python scripts/quality_gate_sd15_img2img.py --review-report build/sd15-img2img-quality/full-original/quality-report.json --reviewer Alice=pass --reviewer Bob=pass`。两个不同姓名均通过且无人失败后，报告状态才会变为 `passed`。
+
+**工作：** 接入 `StableDiffusionImg2ImgPipeline`，复用已加载 base components；加入 source image、`strength`、规范化尺寸和结果“继续编辑”入口。
+
+**完成判据：** 原版 SD 1.5 与 90s full fine-tune 各完成固定输入 × 10 seed；低/中/高三个 strength 档均能生成有效 PNG，输入哈希和所有参数进入结果元数据；取消在下一 step 收敛；连续模式切换无显存持续增长，文生图回归不变。
+
+#### SD-N5.1A：IP-Adapter 参考图一致性
+
+**实施进度（2026-08-06）：`In Progress`，完整自动门与双人目视完成。** 首期采用 SD 1.5 兼容 IP-Adapter，把“参考人物/外观”与普通 img2img 的 source latent、ControlNet 的姿势/结构约束、InstructPix2Pix 的自然语言编辑分开。通用 VLM 只保留为后续可选提示词助手，不能替代图像条件或宣称精确身份保持。本地 Safetensors 目录识别、`reference` 请求、按需加载/卸载、适配器 scale、结果元数据、Web 入口、冻结资产、真实 GPU 和双 base 自动质量/显存门均已完成；两份完整报告于 2026-08-06 双人目视签字完成（Siegfried Kkm./浅草爱音，均 status=passed）。
+
+**工作：**
+
+- 冻结一个 SD 1.5 兼容 IP-Adapter revision、逐文件 SHA、许可证和本地离线目录；适配器权重与 CLIP image encoder 必须同时就绪，禁止运行期访问 Hub。
+- `reference` 模式使用 `source_blob_id` 作为参考图、`edit_adapter_id` 绑定本地适配器、`ip_adapter_scale` 控制图像条件强度；它走完整文生图去噪步，不复用 img2img 的 `strength` 语义。
+- 适配器按需装载到当前 base pipeline；切回 txt2img/img2img 时显式卸载，避免图像条件泄漏到下一任务。base、adapter、image encoder、dtype、runtime 和 scale 全部进入结果身份/元数据。
+- 8 GB 首期只开放完成实测的 FP16 profile。8-bit U-Net、QKV fusion、多适配器叠加和 FaceID 在各自兼容/显存门通过前 fail-closed；FaceID 若引入额外人脸编码器，继续放在独立 CUDA 侧车依赖中。
+- 第二阶段可组合 ControlNet OpenPose/Depth/Canny，分别约束姿势、几何和轮廓；不得把 IP-Adapter 单独描述为像素级身份锁定。
+
+**已验证证据：** `h94/IP-Adapter@018e402774aeeddd60609b4ecdb7e298259dc729` 以 Apache-2.0 许可冻结，下载集合 2,573,016,776 bytes，包含 `models/ip-adapter_sd15.safetensors` 与完整 ViT-H image encoder；逐文件校验生成稳定 artifact SHA-256 `671c7452e97ce26faaf3e25dbdb11e2d78e3560d1d6fe7b6fbf7a59c3ebe94c4`。真实 RTX 4060 Laptop GPU 上修复了 adapter 动态注册后 image encoder 未进入 model CPU-offload hook 的缺陷；4-step `reference` 回归耗时 4.537 s，峰值 reserved 2,789,212,160 bytes，卸载后 allocated 增量 8,519,680 bytes。固定参考图 `3271580f...fe38f` 下，原版 SD1.5 28 steps 的 36 张均有效，完整门耗时 260.533 s；90s base 40 steps 生成 36 张，其中 35 张有效、1 张被 safety checker 正确替换为黑图，各 scale 有效数 11/12/12，完整门耗时 343.724 s。两轮连续 allocated span 为 0、reserved span 为 2,097,152 bytes，自动门均通过。目视抽查显示三档 scale 均保留金发、眼睛、脸型与蓝色外套等主要要素，`0.8` 更接近参考外观，但发型和表情仍会随 seed 改变。生命周期复核还发现 Diffusers 0.35.2 的 `from_pipe()` 默认会把共享组件转为 FP32；现已显式继承 base dtype，并在动态组件移除前拆除旧 offload hooks。修复后真实 `reference → txt2img → img2img → reference` 耗时依次为 6.985/2.338/2.177/2.991 s，adapter 与 attention slicing 状态按模式正确翻转，峰值 reserved 3,034,578,944 bytes，最终卸载后 allocated/reserved 为 8,519,680/20,971,520 bytes。
+
+**完成判据：** Inspector 能区分完整 IP-Adapter 目录、单独 adapter 权重、缺 image encoder 和伪造 Safetensors；无网络时加载与生成成功且不会回退下载；固定人物参考图 × 原版/90s base × 至少 10 seed × 三档 scale 通过自动完整性、安全、唯一性和显存门，并由两名独立审核者评价人物主要要素保持；切换 `reference → txt2img → img2img → reference` 无条件泄漏、显存持续增长或参数串线；缺 adapter/encoder、错误 base family、QKV/量化未验组合在排队前稳定拒绝。
+
+#### SD-N5.2：局部重绘
+
+**工作：** 登记并加载固定 revision/SHA 的 SD 1.5 inpainting 资产；接入 source + mask；前端完成触控/鼠标遮罩画布和黑白 mask 导出。
+
+**完成判据：** mask 尺寸/方向/黑白语义稳定；全黑 mask 基本保留、局部白 mask 只开放目标区域、全白 mask 按重绘处理；至少 10 轮无资源泄漏；专用 inpaint 资产缺失时执行前拒绝，不静默改走普通 img2img。
+
+#### SD-N5.3：指令式编辑
+
+**工作：** 对专用 InstructPix2Pix 与 `control_v11e_sd15_ip2p_fp16.safetensors` 两条兼容路线做真实 GPU/质量/显存对照；冻结一条默认 preset，另一条保留为可选能力。UI 只展示所选 pipeline 有效的 guidance 参数。
+
+**完成判据：** base、adapter/full pipeline、输入哈希、指令、seed 和 guidance 全部进入 artifact manifest/结果元数据；缺 base/config/input/adapter 时执行前拒绝；固定 10 条编辑指令由自动完整性门 + 双人目视门通过；不支持的指令有明确能力说明，不用普通 img2img 冒充成功理解。
+
+#### SD-N5.4：编辑任务分布式接入
+
+**依赖：** SD-N3、SD-N4，以及对应本地阶段完成。
+
+**工作：** 把已验收模式加入 `image_edit` Stage 和 Worker capability；输入 blob 只上传一次，attempt 通过 descriptor/短租约复用；纳入 reservation、lease、winner、fencing、取消和实际节点统计。
+
+**完成判据：** 至少两个物理 PC 对同一输入完成多 seed 或多指令 fan-out；断传、迟到结果、节点掉线和用户取消无假成功、重复 blob 或租约泄漏；单张编辑不宣称跨机加速。
 
 ### SD-N6：细粒度分布式可行性研究
 
@@ -531,7 +759,11 @@ validate_input
 | 路径 | 外置盘、空格/中文、文件移动、权限拒绝、UNC、路径越界、远程 API 路径探测 |
 | 参数 | seed 边界、NaN/Inf、尺寸倍数、steps/CFG 上限、prompt 长度、总像素预算 |
 | Engine | load/unload、切换、取消、OOM、offload、重复调用、异常后可恢复 |
-| Blob | MIME、magic bytes、尺寸炸弹、SHA、分块中断、TTL、并发读写、journal 不含正文 |
+| Blob | 输入/结果 purpose、MIME、magic bytes、EXIF orientation、尺寸炸弹、像素上限、SHA、分块中断、owner、活动 lease、TTL、并发读写、journal 不含正文 |
+| 图生图 | source 必填、strength 边界、尺寸规范化、组件复用、相同输入/seed 可复测、结果继续编辑 |
+| IP-Adapter | 完整目录/缺 image encoder 识别、adapter id/scale 边界、离线加载、按需卸载、模式切换不串条件、未验 profile 拒绝 |
+| 局部重绘 | mask 必填、尺寸一致、黑白语义、空/全黑/全白 mask、触控坐标映射、专用模型缺失拒绝 |
+| 指令编辑 | pipeline capability、adapter manifest、guidance 字段互斥、缺组件拒绝、禁止静默退化为普通 img2img |
 | TaskGraph | fan-out/fan-in、稳定排序、部分成功阈值、重派、winner、fencing、恢复 |
 | 协议 | v2 兼容、v3 协商、未知 engine/stage 拒绝、manifest 不一致 |
 | API/UI | 本地/分布式真实元数据、进度、取消、下载、回退原因、未加载状态 |
@@ -546,7 +778,10 @@ validate_input
 | 原版 SD 1.5 Diffusers 目录 | 本地目录、冷/热加载 |
 | 90s DreamBooth | 固定 preset、10 seed、许可证/manifest |
 | 用户外置完整模型 | 项目外绝对路径、重启后恢复 |
-| ControlNet IP2P | 原图编辑、错误 base、错误 config、输入复用 |
+| SD 1.5 img2img | 原版/90s 各固定输入 × 10 seed、三个 strength 档、连续切换 |
+| SD 1.5 IP-Adapter | 固定人物参考图、原版/90s base、三档 scale、10 seed、模式切换、8 GB 显存与双人目视一致性门 |
+| SD 1.5 inpainting | 专用 inpaint 工件、三类 mask、边缘一致性、错误尺寸/方向 |
+| InstructPix2Pix / ControlNet IP2P | 固定指令集、错误 base/config/adapter、输入复用、自动门 + 双人目视 |
 | 两物理 Worker | 四 seed 扇出、掉线、OOM、重连、取消 |
 
 ### 9.3 性能记录
@@ -572,6 +807,7 @@ validate_input
 - 社区模型卡声称的许可不自动解决训练数据、角色或风格相关权利风险；公开展示使用原创 prompt，不模仿在世艺术家，不使用真实人物和受保护角色。
 - safety checker 或等价输出门控必须成为公开服务的发布门；演示模型缺 checker 时从固定 SD 1.5 安全组件补齐并纳入 artifact manifest。
 - 图片包含 prompt、seed、模型、节点等元数据时，不写本机绝对路径、用户账户名或集群密钥。
+- 用户上传的源图和 mask 视为敏感本地数据；剥离 EXIF/文件名，日志和 journal 只保存 blob descriptor/hash，默认不发送到未被本次请求授权的远端 Worker。
 - 模型权重不写入 Git、不默认写入安装目录、不通过普通 Stage payload 同步。
 - 发布清单包含依赖锁、支持的 pipeline、外置资产说明、许可证、固定 revision、SHA 和已知限制。
 
@@ -589,6 +825,10 @@ validate_input
 | 图片传输吃掉收益 | 使用 blob、一次传输和缩略图；基准若网络占比过高，限制远端图片数或只返回压缩预览 |
 | 不同硬件像素不一致 | 固定输入并记录环境；质量用结构/感知门，不要求跨 GPU 文件哈希一致 |
 | ControlNet 被误识别为 full model | Inspector 硬分类、组件 schema 和回归 fixture 三层阻止 |
+| 图生图 strength 被误解为精确相似度 | UI 解释为去噪强度并提供预览；质量门覆盖低/中/高档，不承诺线性对应 |
+| mask 方向、尺寸或颜色语义错误 | 上传时规范化并固定白改黑留；前后端共用 fixture，任何隐式 resize/crop 都写入参数 |
+| 普通图生图冒充指令理解 | pipeline capability 硬约束；无专用 InstructPix2Pix/ControlNet 资产时拒绝或显式降级，不改变模式标签 |
+| 输入图片隐私或 blob 泄漏 | owner scope、短 TTL、活动 lease、finally 释放、日志去敏和跨节点请求级授权 |
 | 安全检查缺失 | 公开入口 fail-closed；仅本地开发模式也明确显示未启用，不静默绕过 |
 
 触发以下任一条件时，细粒度分布式路线转 `Frozen`，但本地 SD 与批次 fan-out 不受影响：
@@ -612,6 +852,9 @@ validate_input
 - 一期分布式是固定多 seed 的完整 Worker fan-out/fan-in。
 - 原版 SD 1.5 与 90s DreamBooth 均支持。
 - 图片走 blob descriptor，不进 Stage JSON/journal 正文。
+- 文生图继续使用 `/api/diffusion/generate`；三类编辑统一使用 `/api/diffusion/edit`，输入通过 multipart blob 上传，不在 JSON 中内嵌 Base64。
+- mask 固定白色表示重绘、黑色表示保留；局部重绘正式路径优先专用 SD 1.5 inpainting 工件。
+- 指令式编辑必须由专用 InstructPix2Pix 或明确的 base + ControlNet IP2P artifact-set 提供，不用普通 img2img 冒充。
 - 远端 Worker 按 artifact manifest 匹配，不按路径匹配。
 - 分布式展示以真实节点统计和热模型 wall time 为准。
 
@@ -624,6 +867,8 @@ validate_input
 - Worker 协议直接升 v3，还是 v2 feature negotiation + 独立 blob API；不得静默扩展 v2 schema。
 - safety checker 资产来源、revision 与输出门控策略。
 - CPU/集显是否只展示“不支持”，还是保留极慢的显式实验模式。
+- 指令式编辑默认采用专用 InstructPix2Pix，还是 base + ControlNet IP2P；以真实质量、显存和许可门结果冻结。
+- 输入 blob 的 owner/session 映射、默认 TTL 和版本链最大保留深度。
 
 ---
 
@@ -632,6 +877,9 @@ validate_input
 - [Diffusers：Distributed inference](https://huggingface.co/docs/diffusers/main/en/training/distributed_inference)
 - [Diffusers：Single files](https://huggingface.co/docs/diffusers/main/en/api/loaders/single_file)
 - [Diffusers：Pipeline loading and device placement](https://huggingface.co/docs/diffusers/main/en/using-diffusers/loading)
+- [Diffusers：Image-to-image](https://huggingface.co/docs/diffusers/main/en/using-diffusers/img2img)
+- [Diffusers：Inpainting](https://huggingface.co/docs/diffusers/main/en/using-diffusers/inpaint)
+- [Diffusers：InstructPix2Pix](https://huggingface.co/docs/diffusers/main/en/api/pipelines/pix2pix)
 - [SD 1.5 当前 Hugging Face 镜像](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5)
 - [ControlNet v1.1 IP2P 模型卡](https://huggingface.co/lllyasviel/control_v11e_sd15_ip2p)
 - [90style Anime Face DreamBooth 候选](https://huggingface.co/Aleksandra11/90style_anime_face_model)

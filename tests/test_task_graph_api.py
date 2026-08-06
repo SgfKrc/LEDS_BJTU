@@ -11,6 +11,7 @@ from fastapi import HTTPException
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import api_server
+from model_host import model_host
 from task_graph import TaskGraphCoordinator, TaskGraphUnavailable
 from task_journal import JournalEvent, SQLiteTaskJournal
 from task_provider import (
@@ -63,7 +64,7 @@ def task_graph_api(monkeypatch):
     manager = FakeTaskGraphModelManager()
     coordinator = TaskGraphCoordinator(max_records=20)
     monkeypatch.setattr(api_server, "model_manager", manager)
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "TASK_GRAPH_ENABLED", True)
     monkeypatch.setattr(api_server, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
     monkeypatch.setattr(
@@ -82,7 +83,7 @@ def task_graph_api(monkeypatch):
     monkeypatch.setattr(
         api_server.scheduler, "record_task_complete", lambda **kwargs: True,
     )
-    monkeypatch.setattr(api_server, "_db_available", False)
+    monkeypatch.setattr(model_host, "_db_available", False)
     monkeypatch.setattr(api_server, "_auto_title_session", lambda *a, **k: None)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server, "kv_cache", None)

@@ -4,12 +4,13 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8**（文档复核于 2026-07-28）
+**v0.1.8**（更新日期：2026-08-06，文档复核于 2026-08-06）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
+> 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
-> 2026-07-28 复核：Python 全量回归收集 1056 项，`1030 passed / 23 skipped / 3 failed`（3 项均为关闭端口时“不可达/超时”错误分类差异）；前端 `9/9` 且生产构建成功；Android Full Debug Kotlin 编译成功，APK 安装与目视验收待完成。
+> 2026-08-03 复核：Python 全量回归 **`1112 passed / 3 skipped`**（141.5s）。Android Full/Lite Debug 变体构建成功（`app-full-debug.apk` ~29.9 MB、`app-lite-debug.apk` ~18.4 MB），APK 安装与真机目视验收待完成。TUI 网关契约 44/44、7 屏 × 2 角色走查通过；`bjtu` 全局命令（自动启动后端+TUI）已交付。历史复核链：2026-07-31 `1066 passed / 23 skipped`（关闭端口跨平台错误分类与 `PagedKVCache.truncate(n)` 收口）；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。SD 1.5 侧车已验证 U-Net Linear 8-bit 量化与 QKV 融合，尚未注册为分布式 Worker；前端最近证据仍为 `9/9` 且生产构建成功。
 
 ---
 
@@ -44,7 +45,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
-| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用，可直管远程 Tailscale 主节点 → [用法](#tui-管理菜单终端版跨平台) |
+| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（可选依赖 Textual，见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
@@ -159,7 +160,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（当前收集 1056 个用例）
+├── tests/                         # 单元测试（2026-08-03 全量回归 1112 passed / 3 skipped）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -332,7 +333,7 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
 
 | 量化 | 大小 | 说明 |
 |------|------|------|
-| Q3_K_M | ~0.94 GB | 低质量，极限内存 |
+| Q3_K_M | ~0.94 GB | 实验档；14B+ 容量验证或小模型链路 smoke，小模型日常不推荐 |
 | **Q4_K_M** ⭐ | **~1.16 GB** | **推荐 — 速度/质量最佳平衡** |
 | Q5_K_M | ~1.31 GB | 更高质量 |
 | Q8_0 | ~1.82 GB | 近无损 |
@@ -418,15 +419,43 @@ python src/api_server.py
 
 ### TUI 管理菜单（终端版，跨平台）
 
-无浏览器环境（SSH、服务器、树莓派等）可用终端版管理菜单，功能对应 Web 管理面板（系统总览 / 节点管理 / 分布式与分层 / 请求队列 / 设备画像 / 日志 / 设置），纯 Python 标准库实现，支持 Windows 10+ / Linux / macOS：
+无浏览器环境（SSH、服务器、树莓派等）可用终端版管理菜单，功能对应 Web 管理面板（系统总览 / 节点管理 / 分布式与分层 / 请求队列 / 设备画像 / 日志 / 设置），纯 Python 标准库实现，支持 Windows 10+ / Linux / macOS。
+
+**一键启动**（自动启动后端 + 等待就绪 + 进入 TUI，退出 TUI 后后端继续运行）：
 
 ```bash
-# 先启动后端: python src/api_server.py，再运行（Windows 双击 start_tui.bat 亦可）
-./start_tui.sh                              # Linux / macOS
-start_tui.bat                               # Windows (自动 chcp 65001)
+bjtu                                        # 全局命令：任意终端输入即启动（安装见下）
+./start_tui.sh                              # Linux / macOS（无需安装）
+start_tui.bat                               # Windows（双击或命令行）
+```
+
+**安装全局 `bjtu` 命令**（推荐）：Windows 把项目根加入 PATH（`setx PATH "%PATH%;<项目根>"` 或图形界面）；Linux/macOS `sudo ln -s <项目根>/bjtu.sh /usr/local/bin/bjtu`。
+
+**手动/高级用法**（后端未运行时先 `python src/api_server.py`）：
+
+```bash
 python src/tui_admin.py --host 100.x.x.x    # 直接管理远程 Tailscale 主节点
 python src/tui_admin.py --plain             # 老终端/管道降级为纯文本编号菜单
+python src/tui_admin.py --host 100.x.x.x --log-token xxx   # 远程模式带日志 token
+bjtu --help                                 # 查看完整命令集与启动参数（不启动后端）
 ```
+
+**TUI 命令集**（任意界面输入 `/` 开头命令后 Enter 执行，ESC 取消；`--plain` 模式同样可用）：模型/量化/引擎切换、GPU 选择、分布式开关、队列控制、日志、设置与优雅退出等常用操作无需进入菜单：
+
+```bash
+/help                     # 命令集帮助（TUI 内）
+/status  /models  /model  # 状态与模型信息
+/switch <模型ID> [--quant 精度] [--engine 引擎]   # 切换模型（失败自动回滚）
+/quant  <int4|int8|fp16|gguf>                    # 量化切换（重载当前模型）
+/engine <auto|llama_cpp|pytorch|island>          # 引擎切换（重载当前模型）
+/gpu <序号>  /device auto                        # GPU 选择 / 设备自动配置
+/dist on|off  /queue pause|resume|clear          # 分布式开关 / 队列控制
+/logs  /host <主机> [端口]  /interval <秒>        # 日志 / 设置
+/quit                     # 退出 TUI（后端保持运行）
+/shutdown                 # 优雅退出：后端清理资源后退出，TUI 随后退出
+```
+
+完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（现行·Active，2026-08-03 复核 44/44 + 双角色走查 PASS）。
 
 ### 外部算力辅助（三条路线，均默认关闭）
 
@@ -684,8 +713,13 @@ python serve.py
 - [文档状态与维护规则](docs/文档状态与清理清单.md) — 文档状态定义与后续维护规则
 - [整体架构](docs/整体架构.md)
 - [核心技术原理](docs/核心技术原理.md)
+- [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1 Completed、SD-N2/SD-N5.1 In Progress；真实 Edge 续编与双模型完整自动质量/显存门通过，仅双人目视待完成）
+- [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
+- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 内容寻址模型仓库、跨节点部署与多集群档案（L4 Candidate）
+- [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
 
 ### 专项文档
 
@@ -696,6 +730,10 @@ python serve.py
 - [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分可行性
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
 - [Android llama.cpp Submodule 迁移方案](docs/Android%20llama.cpp%20Submodule迁移方案.md) — 锁定上游版本、离线缓存与维护窗口方案
+- [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC Full Worker v2（TC-N2.4 物理设备准入未过）
+- [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
+- [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
+- [数据库测试指南](docs/数据库测试指南.md) — PostgreSQL 依赖用例的运行方式与跳过条件
 
 ### 外部算力辅助（张量并行在异构 mesh 内不可行，改走集群外辅助）
 
@@ -706,6 +744,10 @@ python serve.py
 
 ### 工程文档
 
+- [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
+- [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9 简化聊天页：T9.0-T9.5 已完成（interactive 契约/routing_preference/Textual UI/会话管理），`bjtu chat` 可用，T9.6 打包与默认入口决策未实施（L4 Candidate）
+- [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
+- [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
 
 ---

@@ -31,14 +31,24 @@ from dataclasses import replace
 from functools import wraps
 from typing import Any, Literal, Optional, cast
 
+try:
+    from runtime_env import maybe_reexec_sd_runtime
+except ImportError:  # package import: uvicorn src.api_server:app
+    from .runtime_env import maybe_reexec_sd_runtime
+
+# Direct development launches may come from a global Python that intentionally
+# lacks optional SD packages. Switch only API-server invocations with installed
+# managed SD assets; imports from tests/tools and LLM-only launches are untouched.
+maybe_reexec_sd_runtime()
+
 import torch
 
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -66,6 +76,24 @@ from task_provider import (
     ProviderExecutor,
     StageRequest as ProviderStageRequest,
 )
+from diffusion import (
+    DiffusionBlobInUseError,
+    DiffusionBlobReferencedError,
+    DiffusionConflictError,
+    DiffusionInputError,
+    DiffusionNotFoundError,
+    DiffusionService,
+    DiffusionServiceError,
+    DiffusionUnsupportedError,
+    DIFFUSION_MAX_UPLOAD_BYTES,
+    LOCAL_PROXY_FALLBACK,
+    SD15EngineConfig,
+    SD15EditRequest,
+    SD15GenerationRequest,
+    build_sd15_engine_config,
+    build_sd15_generation_request,
+    list_presets as list_diffusion_presets,
+)
 import model_config as mc
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -87,9 +115,8 @@ except ImportError:
     close_db = lambda: None
     db_health = lambda: {"status": "unavailable", "message": "psycopg2 未安装"}
 
-# _db_available 动态追踪实际连接状态：启动时尝试连接，失败则标记 False
+# model_host._db_available 动态追踪实际连接状态：启动时尝试连接，失败则标记 False
 # _db_importable 仅表示 psycopg2 已安装（静态）
-_db_available = _db_importable
 
 # 本地文件储存（云数据库不可用时的降级方案）
 import local_store as _local_store
@@ -110,55 +137,16 @@ class RequestIdFilter(logging.Filter):
 _request_id_filter = RequestIdFilter()
 
 
-class _LazyModelManager:
-    """Delay importing model_module until the model manager is first used."""
-
-    __slots__ = ("_instance", "_lock")
-    _instance: Any
-    _lock: Any
-
-    def __init__(self):
-        object.__setattr__(self, "_instance", None)
-        object.__setattr__(self, "_lock", threading.RLock())
-
-    def _get_instance(self):
-        instance = self._instance
-        if instance is not None:
-            return instance
-        with self._lock:
-            instance = self._instance
-            if instance is None:
-                from model_module import ModelManager
-                instance = ModelManager()
-                object.__setattr__(self, "_instance", instance)
-        return instance
-
-    def __getattr__(self, name):
-        return getattr(self._get_instance(), name)
-
-    def __setattr__(self, name, value):
-        if name in self.__slots__:
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._get_instance(), name, value)
-
-    def __delattr__(self, name):
-        if name in self.__slots__:
-            raise AttributeError(name)
-        delattr(self._get_instance(), name)
-
-    def __repr__(self):
-        instance = self._instance
-        if instance is None:
-            return "<_LazyModelManager unloaded>"
-        return repr(instance)
-
 
 def _current_node_id_safe() -> str:
     try:
         return scheduler.get_effective_node_id()
     except Exception:
-        return NODE_ID
+        try:
+            from node_runtime import node_runtime
+            return node_runtime.get_node_id()
+        except Exception:
+            return NODE_ID
 
 
 def _current_device_ip_safe() -> str:
@@ -369,7 +357,12 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 # 全局状态
 # ============================================================
 
-model_manager = _LazyModelManager()
+# 推理宿主单例（阶段 0.2/0.4：api_server 与 scheduler 共享；model_manager 为
+# 兼容名，属性读写代理到内部 ModelManager）
+from model_host import model_host
+
+model_manager = model_host
+diffusion_service = DiffusionService()
 kv_cache: Optional[PagedKVCache] = None
 active_session_id: Optional[str] = None           # 当前活跃会话 ID
 session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
@@ -379,18 +372,9 @@ conversation_stats: dict = {                    # 累计对话统计（实际消
     "total_time_seconds": 0.0,
     "rounds": 0,
 }
-current_quant: str = QUANT_TYPE
-model_loaded: bool = False
 device_profile: Optional[dict] = None           # 设备画像缓存
 _device_profile_ready = threading.Event()
 _device_profile_started = False
-generation_config: dict = {
-    "max_new_tokens": 1024,          # laptop 档默认值
-    "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "do_sample": True,
-}
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
@@ -441,7 +425,6 @@ def _create_task_graph_coordinator() -> TaskGraphCoordinator:
 
 task_graph_coordinator = _create_task_graph_coordinator()
 _task_graph_execution_slot = threading.BoundedSemaphore(1)
-_full_chat_execution_lock = threading.RLock()
 _generation_registry_lock = threading.RLock()
 _generation_cancel_events: dict[str, threading.Event] = {}
 _generation_pending_cancellations: dict[str, float] = {}
@@ -513,7 +496,7 @@ def _serialized_conversation_mutation(func):
     """Run synchronous conversation mutations under the full-chat lock."""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with _full_chat_execution_lock:
+        with model_host.full_chat_execution_lock:
             return func(*args, **kwargs)
     return wrapper
 
@@ -533,7 +516,12 @@ def _run_exclusive_model_change(
     change, prepare=None, *, release_worker_reservation: bool = False,
 ):
     """Block inference, invalidate old worker ACKs, then refresh the new model."""
-    with _full_chat_execution_lock:
+    with model_host.full_chat_execution_lock:
+        if diffusion_service.is_loaded or diffusion_service.is_busy:
+            raise HTTPException(
+                status_code=409,
+                detail="SD 1.5 本地引擎正在占用模型生命周期；请先卸载 SD 模型",
+            )
         if prepare is not None:
             prepare()
         with scheduler._inference_lock:
@@ -644,8 +632,7 @@ async def _startup_device_detection():
         set_active_node_id(active_scheduler.get_effective_node_id())
         logger.info(f"数据库已连接，活跃节点: {active_scheduler.get_effective_node_id()}")
     except Exception as e:
-        global _db_available
-        _db_available = False
+        model_host._db_available = False
         runtime = scheduler_module.get_database_status()
         if runtime.get("configured", True):
             logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
@@ -690,7 +677,12 @@ async def _shutdown_resources():
     """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
     try:
-        with _full_chat_execution_lock:
+        await run_in_threadpool(diffusion_service.close)
+        logger.info("SD 1.5 本地引擎已停止")
+    except Exception as e:
+        logger.warning(f"SD 1.5 本地引擎停止异常: {e}")
+    try:
+        with model_host.full_chat_execution_lock:
             task_graph_coordinator.close()
     except Exception as e:
         logger.warning(f"任务图 journal 关闭异常: {e}")
@@ -727,6 +719,82 @@ async def _shutdown_resources():
 
 
 # ============================================================
+# 优雅退出（TUI / 外部命令触发）
+#
+# 优先级：
+#   1. 通过 `python src/api_server.py` 启动时注册的 uvicorn.Server 实例
+#      → 设置 should_exit，触发 uvicorn 内置优雅关闭（lifespan shutdown
+#        会执行 _shutdown_resources，跨平台可靠）
+#   2. POSIX：os.kill(SIGTERM) → uvicorn 信号处理器触发同样的优雅关闭
+#   3. Windows 兜底（`python -m uvicorn` 直启、无 server 引用）：
+#      直接执行资源清理后退出进程
+# ============================================================
+
+_uvicorn_server = None            # 通过 register_uvicorn_server() 注册
+_SHUTDOWN_TOKEN = os.environ.get("QLH_SHUTDOWN_TOKEN", "") or ""
+
+
+def register_uvicorn_server(server) -> None:
+    """供 `python src/api_server.py` 入口注册 uvicorn.Server 实例。"""
+    global _uvicorn_server
+    _uvicorn_server = server
+
+
+def _graceful_exit() -> None:
+    """在后台线程中触发后端优雅退出（先等响应返回）。"""
+    time.sleep(0.5)
+    server = _uvicorn_server
+    if server is not None:
+        server.should_exit = True
+        logger.info("event=system_shutdown trigger=uvicorn_should_exit")
+        return
+    if os.name != "nt":
+        import signal
+        os.kill(os.getpid(), signal.SIGTERM)
+        logger.info("event=system_shutdown trigger=signal_sigterm")
+        return
+    # Windows 兜底：直接清理资源（uvicorn 主循环不感知，需自行收尾）
+    import asyncio
+    logger.warning("event=system_shutdown trigger=direct_cleanup (未注册 uvicorn server)")
+    try:
+        asyncio.run(_shutdown_resources())
+    except Exception as e:
+        logger.warning(f"优雅退出清理异常: {e}")
+    os._exit(0)
+
+
+class SystemShutdownRequest(BaseModel):
+    reason: str = Field(default="", description="退出原因说明（写入日志）")
+
+
+@app.post("/api/system/shutdown")
+async def system_shutdown(req: SystemShutdownRequest, request: Request):
+    """
+    优雅退出后端服务（资源清理 → 调度器/数据库/TCP 全部关闭后退出进程）。
+
+    安全防护：
+      - 仅允许本机来源（127.0.0.1 / ::1）直接调用；
+      - 远程调用必须携带 X-QLH-Shutdown-Token，且需在启动前设置
+        环境变量 QLH_SHUTDOWN_TOKEN（未设置时远程调用一律拒绝）。
+    """
+    client_host = (request.client.host if request.client else "") or ""
+    is_local = client_host in ("127.0.0.1", "::1", "localhost", "")
+    if not is_local:
+        if not _SHUTDOWN_TOKEN:
+            raise HTTPException(
+                status_code=403,
+                detail="远程关闭被拒绝：服务端未配置 QLH_SHUTDOWN_TOKEN。",
+            )
+        token = request.headers.get("X-QLH-Shutdown-Token", "")
+        if token != _SHUTDOWN_TOKEN:
+            raise HTTPException(status_code=403, detail="关闭令牌无效。")
+    reason = (req.reason or "").strip()
+    logger.warning(f"event=system_shutdown_requested source={client_host or 'unknown'} reason={reason or 'unspecified'}")
+    threading.Thread(target=_graceful_exit, daemon=True, name="graceful-exit").start()
+    return {"ok": True, "message": "后端正在优雅退出…"}
+
+
+# ============================================================
 # Pydantic 模型
 # ============================================================
 
@@ -749,6 +817,72 @@ class LoadModelRequest(BaseModel):
     )
 
 
+class DiffusionArtifactInspectRequest(BaseModel):
+    path: str = Field(..., min_length=1, max_length=2048)
+    compute_hash: bool = Field(default=False)
+
+
+class DiffusionArtifactRegisterRequest(DiffusionArtifactInspectRequest):
+    artifact_id: Optional[str] = Field(default=None, max_length=80)
+    name: Optional[str] = Field(default=None, max_length=120)
+
+
+class DiffusionAssetDownloadRequest(BaseModel):
+    license_accepted: bool = Field(default=False)
+    use_local_proxy_fallback: bool = Field(default=True)
+
+
+class DiffusionAssetImportRequest(BaseModel):
+    asset_id: str = Field(..., min_length=1, max_length=80)
+    path: str = Field(..., min_length=1, max_length=2048)
+    license_accepted: bool = Field(default=False)
+
+
+class DiffusionLoadRequest(BaseModel):
+    artifact_id: str = Field(..., min_length=1, max_length=80)
+    profile: Literal[
+        "balanced",
+        "resident_fp16",
+        "qkv_fp16",
+        "unet_8bit",
+        "unet_8bit_qkv",
+    ] = Field(default="balanced")
+    safety_checker_required: bool = Field(default=True)
+
+
+class DiffusionGenerateRequest(BaseModel):
+    preset_id: Optional[str] = Field(default=None, max_length=100)
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    negative_prompt: Optional[str] = Field(default=None, max_length=4000)
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    scheduler: Optional[str] = Field(default=None, max_length=80)
+
+
+class DiffusionEditRequest(BaseModel):
+    mode: Literal['img2img', 'reference', 'inpaint', 'instruction']
+    preset_id: Optional[str] = Field(default=None, max_length=100)
+    source_blob_id: str = Field(..., min_length=1, max_length=100)
+    mask_blob_id: Optional[str] = Field(default=None, max_length=100)
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    negative_prompt: Optional[str] = Field(default=None, max_length=4000)
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    scheduler: Optional[str] = Field(default=None, max_length=80)
+    strength: float = 0.75
+    instruction: Optional[str] = Field(default=None, max_length=4000)
+    edit_adapter_id: Optional[str] = Field(default=None, max_length=120)
+    conditioning_scale: Optional[float] = None
+    image_guidance_scale: Optional[float] = None
+    ip_adapter_scale: Optional[float] = None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息", min_length=1)
     session_id: Optional[str] = Field(default=None, description="会话ID，为空时使用当前活跃会话")
@@ -758,7 +892,13 @@ class ChatRequest(BaseModel):
     show_thinking: bool = Field(default=False, description="启用深度思考展示")
     streaming_mode: str = Field(
         default="full",
-        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化）",
+        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化） | interactive=真流式逐token + 完成时会话事务提交（T9 聊天页）",
+    )
+    routing_preference: Literal[
+        "auto", "local_only", "distributed_preferred", "distributed_required"
+    ] = Field(
+        default="auto",
+        description="请求级路由偏好（T9 契约）: auto=沿用集群配置与 scheduler 决策 | local_only=仅主节点本地执行 | distributed_preferred=优先分布式，不可用允许本地回退 | distributed_required=无合格分布式路径时明确失败",
     )
     client_node_id: Optional[str] = Field(default=None, description="请求来源节点 ID（Android/PC 客户端上报）")
     client_node_type: Optional[str] = Field(default=None, description="请求来源节点类型: pc | android")
@@ -871,6 +1011,141 @@ class FirstConnectBootstrapRequest(BaseModel):
 # ============================================================
 # 辅助函数
 # ============================================================
+
+_LOCAL_DIFFUSION_PATH_CLIENTS = {
+    "",
+    "127.0.0.1",
+    "::1",
+    "::ffff:127.0.0.1",
+    "localhost",
+    "testclient",
+}
+
+
+def _require_local_diffusion_path_access(request: Request) -> None:
+    """Keep arbitrary server-path inspection behind a local desktop boundary."""
+
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host not in _LOCAL_DIFFUSION_PATH_CLIENTS:
+        raise HTTPException(
+            status_code=403,
+            detail="SD 模型路径检查和登记仅允许在主节点本机执行",
+        )
+
+
+def _diffusion_http_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, DiffusionInputError):
+        return HTTPException(
+            status_code=400,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionUnsupportedError):
+        return HTTPException(
+            status_code=501,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, (DiffusionBlobInUseError, DiffusionBlobReferencedError)):
+        return HTTPException(
+            status_code=409,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionNotFoundError):
+        return HTTPException(
+            status_code=404,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, (ValueError, OSError)):
+        return HTTPException(
+            status_code=400,
+            detail={'code': 'DIFFUSION_INVALID_INPUT', 'message': str(exc)},
+        )
+    if isinstance(exc, ImportError):
+        return HTTPException(
+            status_code=503,
+            detail={'code': 'DIFFUSION_DEPENDENCY_MISSING', 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionServiceError):
+        return HTTPException(
+            status_code=500,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    return HTTPException(
+        status_code=500,
+        detail={
+            'code': 'DIFFUSION_EXECUTION_FAILED',
+            'message': f"SD 1.5 本地引擎失败: {str(exc)[:500]}",
+        },
+    )
+
+
+def _diffusion_engine_config(req: DiffusionLoadRequest) -> SD15EngineConfig:
+    return build_sd15_engine_config(
+        req.profile,
+        safety_checker_required=req.safety_checker_required,
+    )
+
+
+def _diffusion_generation_request(req: DiffusionGenerateRequest) -> SD15GenerationRequest:
+    return build_sd15_generation_request(
+        preset_id=req.preset_id,
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        seed=req.seed,
+        width=req.width,
+        height=req.height,
+        steps=req.steps,
+        guidance_scale=req.guidance_scale,
+        scheduler=req.scheduler,
+    )
+
+
+def _diffusion_edit_request(req: DiffusionEditRequest) -> SD15EditRequest:
+    generation = build_sd15_generation_request(
+        preset_id=req.preset_id,
+        prompt=(req.prompt if req.prompt is not None else req.instruction),
+        negative_prompt=req.negative_prompt,
+        seed=req.seed,
+        width=req.width,
+        height=req.height,
+        steps=req.steps,
+        guidance_scale=req.guidance_scale,
+        scheduler=req.scheduler,
+    )
+    return SD15EditRequest(
+        mode=req.mode,
+        source_blob_id=req.source_blob_id,
+        mask_blob_id=req.mask_blob_id,
+        prompt=generation.prompt,
+        negative_prompt=generation.negative_prompt,
+        seed=generation.seed,
+        width=generation.width,
+        height=generation.height,
+        steps=generation.steps,
+        guidance_scale=generation.guidance_scale,
+        scheduler=generation.scheduler,
+        strength=req.strength,
+        instruction=req.instruction,
+        edit_adapter_id=req.edit_adapter_id,
+        conditioning_scale=req.conditioning_scale,
+        image_guidance_scale=req.image_guidance_scale,
+        ip_adapter_scale=req.ip_adapter_scale,
+    )
+
+
+def _local_llm_is_loaded() -> bool:
+    """Inspect LLM ownership without materializing the lazy manager."""
+
+    checker = getattr(model_host, "has_loaded_model", None)
+    if model_manager is model_host and callable(checker):
+        return bool(checker())
+    return bool(model_host.model_loaded) or bool(
+        getattr(model_manager, "is_loaded", False)
+    )
 
 def _build_chat_prompt(messages: list[dict], system_prompt: Optional[str] = None,
                        assistant_prefill: Optional[str] = None) -> str:
@@ -1164,7 +1439,7 @@ def _switch_session(target_id: str) -> None:
     # 如果目标会话不在内存中，尝试从 DB 或本地文件加载
     if target_id not in session_histories:
         messages = []
-        if _db_available:
+        if model_host._db_available:
             try:
                 import db as _db_mod
                 rows = _db_mod.get_conversation(target_id)
@@ -1209,7 +1484,7 @@ def _auto_title_session(session_id: str, first_message: str) -> None:
     title = first_message.strip()[:30]
     if len(first_message.strip()) > 30:
         title += "..."
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             _db_mod.update_session_title(session_id, title)
@@ -1683,10 +1958,10 @@ async def get_presets():
     """
     # 根据当前加载的量化类型估算速度
     speed_map = {"fp16": 53, "int8": 10, "int4": 29}
-    tok_s = speed_map.get(current_quant if model_loaded else "int4", 29)
+    tok_s = speed_map.get(model_host.current_quant if model_host.model_loaded else "int4", 29)
 
     # 从设备画像获取档位，调整预估
-    max_tokens = generation_config.get("max_new_tokens", 512)
+    max_tokens = model_host.generation_config.get("max_new_tokens", 512)
 
     presets = [
         {
@@ -1754,9 +2029,240 @@ async def get_presets():
     return {
         "presets": presets,
         "current_speed_tok_s": tok_s,
-        "current_quant": current_quant if model_loaded else None,
+        "current_quant": model_host.current_quant if model_host.model_loaded else None,
         "max_new_tokens": max_tokens,
     }
+
+
+@app.get("/api/diffusion/capabilities")
+async def get_diffusion_capabilities():
+    status = diffusion_service.snapshot()
+    status["local_llm_loaded"] = _local_llm_is_loaded()
+    status["presets"] = [
+        {
+            "preset_id": preset.preset_id,
+            "model_id": preset.model_id,
+            "prompt": preset.prompt,
+            "negative_prompt": preset.negative_prompt,
+            "width": preset.width,
+            "height": preset.height,
+            "steps": preset.steps,
+            "guidance_scale": preset.guidance_scale,
+            "scheduler": preset.scheduler,
+            "seeds": list(preset.seeds),
+            "safety_checker_required": preset.safety_checker_required,
+        }
+        for preset in list_diffusion_presets()
+    ]
+    return status
+
+
+@app.post("/api/diffusion/artifacts/inspect")
+async def inspect_diffusion_artifact(
+    req: DiffusionArtifactInspectRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        artifact = await run_in_threadpool(
+            diffusion_service.inspect,
+            req.path,
+            compute_hash=req.compute_hash,
+        )
+        return artifact.to_dict(include_path=True)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/artifacts/register")
+async def register_diffusion_artifact(
+    req: DiffusionArtifactRegisterRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        artifact = await run_in_threadpool(
+            diffusion_service.register_artifact,
+            req.path,
+            artifact_id=req.artifact_id,
+            name=req.name,
+            compute_hash=req.compute_hash,
+        )
+        return artifact.snapshot(include_path=False)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.get("/api/diffusion/artifacts")
+async def list_diffusion_artifacts():
+    return {"artifacts": diffusion_service.list_artifacts(include_path=False)}
+
+
+@app.get("/api/diffusion/assets/catalog")
+async def list_diffusion_asset_catalog():
+    return {"assets": await run_in_threadpool(diffusion_service.asset_catalog)}
+
+
+@app.get("/api/diffusion/assets/{asset_id}/status")
+async def get_diffusion_asset_status(asset_id: str):
+    try:
+        return await run_in_threadpool(diffusion_service.asset_status, asset_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/assets/{asset_id}/download", status_code=202)
+async def download_diffusion_asset(
+    asset_id: str,
+    req: DiffusionAssetDownloadRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        return diffusion_service.download_asset(
+            asset_id,
+            license_accepted=req.license_accepted,
+            proxy_fallback=(
+                LOCAL_PROXY_FALLBACK if req.use_local_proxy_fallback else ""
+            ),
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/assets/import")
+async def import_diffusion_asset(
+    req: DiffusionAssetImportRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        return await run_in_threadpool(
+            diffusion_service.import_asset,
+            req.asset_id,
+            req.path,
+            license_accepted=req.license_accepted,
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/load")
+async def load_diffusion_artifact(req: DiffusionLoadRequest):
+    config = _diffusion_engine_config(req)
+
+    def _load() -> dict:
+        with model_host.full_chat_execution_lock:
+            if _local_llm_is_loaded():
+                raise DiffusionConflictError(
+                    "本地 LLM 已加载；请先显式卸载 LLM，再加载 SD 1.5"
+                )
+            return diffusion_service.load(req.artifact_id, config)
+
+    try:
+        return await run_in_threadpool(_load)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/unload")
+async def unload_diffusion_artifact():
+    try:
+        return await run_in_threadpool(_unload_diffusion_under_model_lock)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+def _unload_diffusion_under_model_lock() -> dict:
+    with model_host.full_chat_execution_lock:
+        return diffusion_service.unload()
+
+
+@app.post('/api/diffusion/generate', status_code=202)
+async def generate_diffusion_image(req: DiffusionGenerateRequest):
+    try:
+        generation = _diffusion_generation_request(req)
+        return diffusion_service.submit_generation(
+            generation,
+            owner_scope='local',
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post('/api/diffusion/blobs', status_code=201)
+async def upload_diffusion_blob(
+    purpose: str = Form(...),
+    file: UploadFile = File(...),
+):
+    try:
+        data = await file.read(DIFFUSION_MAX_UPLOAD_BYTES + 1)
+        return await run_in_threadpool(
+            lambda: diffusion_service.put_input_blob(
+                data,
+                purpose=purpose,
+                owner_scope='local',
+            )
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+    finally:
+        await file.close()
+
+
+@app.post('/api/diffusion/edit', status_code=202)
+async def edit_diffusion_image(req: DiffusionEditRequest):
+    try:
+        return diffusion_service.submit_edit(
+            _diffusion_edit_request(req),
+            owner_scope='local',
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.get("/api/diffusion/jobs/{job_id}")
+async def get_diffusion_job(job_id: str):
+    try:
+        return diffusion_service.get_job(job_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/jobs/{job_id}/cancel")
+async def cancel_diffusion_job(job_id: str):
+    try:
+        return diffusion_service.cancel_job(job_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.get("/api/diffusion/blobs/{blob_id}")
+async def get_diffusion_blob(blob_id: str):
+    try:
+        blob = diffusion_service.get_blob(blob_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+    return Response(
+        content=blob.data,
+        media_type=blob.content_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "ETag": f'"{blob.sha256}"',
+            "Content-Disposition": f'inline; filename="{blob.blob_id}.png"',
+        },
+    )
+
+
+@app.delete("/api/diffusion/blobs/{blob_id}")
+async def delete_diffusion_blob(blob_id: str):
+    try:
+        deleted = diffusion_service.delete_blob(blob_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"image blob not found: {blob_id}")
+    return {"deleted": True, "blob_id": blob_id}
 
 
 # ---- 支持的文件类型 ----
@@ -1891,7 +2397,7 @@ async def auto_configure():
     更新 KV 缓存大小、序列长度、生成参数等运行时配置。
     不重新加载模型（如需切换量化精度，请手动调用 /api/models/load）。
     """
-    global kv_cache, device_profile, generation_config
+    global kv_cache, device_profile
 
     if device_profile is None:
         try:
@@ -1918,11 +2424,11 @@ async def auto_configure():
     cfg.MAX_SEQ_LEN = config["max_seq_len"]
 
     # 更新生成配置（设置档位上限）
-    generation_config["max_new_tokens"] = config["max_new_tokens"]
-    generation_config["tier_max_new_tokens"] = config["max_new_tokens"]
+    model_host.generation_config["max_new_tokens"] = config["max_new_tokens"]
+    model_host.generation_config["tier_max_new_tokens"] = config["max_new_tokens"]
 
     # 如果 KV 缓存已存在，重建
-    if kv_cache and model_loaded:
+    if kv_cache and model_host.model_loaded:
         kv_cache.clear()
         from paged_kv_cache import PagedKVCache
         kv_cache = PagedKVCache(
@@ -1962,7 +2468,7 @@ async def select_gpu(req: SelectGpuRequest):
 
     游戏本默认使用独显（CUDA 加速），用户可手动切换到集显（低功耗）。
     """
-    global device_profile, model_loaded
+    global device_profile
 
     if device_profile is None:
         raise HTTPException(400, "设备画像未就绪，请先调用 GET /api/device/profile")
@@ -2003,7 +2509,7 @@ async def select_gpu(req: SelectGpuRequest):
         "device": profiler.recommend_config()["device"],
         "warning": (
             "切换 GPU 后需要重新加载模型才能生效。"
-            if model_loaded
+            if model_host.model_loaded
             else None
         ),
     }
@@ -2073,7 +2579,7 @@ async def get_status():
         }
 
     active_info = {}
-    if model_loaded and model_manager.is_loaded:
+    if model_host.model_loaded and model_manager.is_loaded:
         try:
             active_info = model_manager.get_model_info()
         except Exception:
@@ -2134,13 +2640,13 @@ async def get_status():
             speculative_status = {"enabled": True, "error": str(exc)[:200]}
 
     return {
-        "model_loaded": model_loaded,
-        "current_quant": current_quant,
-        "use_compile": USE_COMPILE if model_loaded else False,
+        "model_loaded": model_host.model_loaded,
+        "current_quant": model_host.current_quant,
+        "use_compile": USE_COMPILE if model_host.model_loaded else False,
         "model_name": active_info.get("model_name", MODEL_NAME),
         "model_path": active_info.get("model_path", MODEL_PATH),
-        "active_model_id": active_info.get("model_id", model_manager.active_model_id if model_loaded else None),
-        "engine": active_info.get("engine", "") if model_loaded else "",
+        "active_model_id": active_info.get("model_id", model_manager.active_model_id if model_host.model_loaded else None),
+        "engine": active_info.get("engine", "") if model_host.model_loaded else "",
         "island": island_status,
         "external": external_status,
         "speculative": speculative_status,
@@ -2151,7 +2657,7 @@ async def get_status():
         "gpu": gpu_info,
         "kv_cache": kv_stats,
         "conversation_turns": len(_get_active_history()),
-        "generation_config": generation_config,
+        "generation_config": model_host.generation_config,
         "device": device_summary,
     }
 
@@ -2159,7 +2665,7 @@ async def get_status():
 @app.get("/api/models/current")
 async def get_current_model():
     """当前模型信息"""
-    if not model_loaded:
+    if not model_host.model_loaded:
         return {"loaded": False, "quant_type": None, "model_id": None}
 
     info = model_manager.get_model_info()
@@ -2167,7 +2673,7 @@ async def get_current_model():
     return {
         "loaded": True,
         "model_id": model_manager.active_model_id,
-        "quant_type": current_quant,
+        "quant_type": model_host.current_quant,
         "model_name": info.get("model_name", MODEL_NAME),
         "model_path": info.get("model_path", ""),
         "engine": info.get("engine", ""),
@@ -2178,6 +2684,54 @@ async def get_current_model():
     }
 
 
+def _unload_model_under_model_lock() -> dict:
+    """Unload the local LLM without materializing the lazy manager when idle.
+
+    Model and SD lifecycles share ``full_chat_execution_lock``. Keeping the
+    reset here makes the explicit UI unload path equivalent to a model switch
+    and invalidates stale worker state before the next engine is loaded.
+    """
+    loaded = _local_llm_is_loaded()
+
+    def _change() -> bool:
+        if loaded:
+            unload = getattr(model_manager, "unload_model", None)
+            if not callable(unload):
+                raise HTTPException(status_code=500, detail="当前推理引擎不支持卸载模型")
+            unload()
+        _reset_runtime_conversation_state(clear_histories=True)
+        model_host.model_loaded = False
+        model_host.current_quant = None
+        return loaded
+
+    unloaded = _run_exclusive_model_change(
+        _change,
+        release_worker_reservation=True,
+    )
+    try:
+        scheduler.refresh_task_worker_capabilities()
+    except Exception as exc:
+        logger.warning("卸载模型后刷新 Worker 能力失败: %s", exc)
+    return {
+        "success": True,
+        "loaded": False,
+        "unloaded": unloaded,
+        "message": "模型已卸载" if unloaded else "当前没有已加载的模型",
+    }
+
+
+@app.post("/api/models/unload")
+async def unload_model():
+    """Explicitly release the local LLM before loading another engine."""
+    try:
+        return await run_in_threadpool(_unload_model_under_model_lock)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("模型卸载失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"模型卸载失败: {exc}") from exc
+
+
 @app.post("/api/models/load")
 async def load_model(req: LoadModelRequest):
     """
@@ -2186,7 +2740,7 @@ async def load_model(req: LoadModelRequest):
     耗时约 5-20 秒（取决于量化类型），期间会先卸载旧模型。
     使用 switch_model 获得失败时自动回滚到上一个模型的保护。
     """
-    global model_loaded, current_quant, kv_cache, conversation_stats
+    global kv_cache, conversation_stats
 
     engine = req.engine.lower()
     if engine not in ("auto", "llama_cpp", "pytorch", "island"):
@@ -2209,7 +2763,7 @@ async def load_model(req: LoadModelRequest):
         def _prepare_model_load() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _reset_runtime_conversation_state(clear_histories=True)
-            if _db_available:
+            if model_host._db_available:
                 try:
                     import db as _db_mod
                     _db_mod.clear_conversation("default")
@@ -2232,9 +2786,9 @@ async def load_model(req: LoadModelRequest):
         )
 
         if result["success"]:
-            model_loaded = True
-            current_quant = getattr(model_manager, "quant_type", None) or quant
-            generation_config["use_compile"] = req.use_compile
+            model_host.model_loaded = True
+            model_host.current_quant = getattr(model_manager, "quant_type", None) or quant
+            model_host.generation_config["use_compile"] = req.use_compile
 
             # 初始化 KV 缓存
             _init_kv_cache()
@@ -2249,22 +2803,22 @@ async def load_model(req: LoadModelRequest):
         else:
             # 切换失败 — 检查是否回滚成功
             if model_manager.is_loaded:
-                model_loaded = True
-                current_quant = model_manager.quant_type or (
+                model_host.model_loaded = True
+                model_host.current_quant = model_manager.quant_type or (
                     "gguf" if model_manager._engine_type == "llama_cpp"
                     else "island" if model_manager._engine_type == "island"
                     else QUANT_TYPE
                 )
                 _init_kv_cache()
             else:
-                model_loaded = False
-                current_quant = QUANT_TYPE
+                model_host.model_loaded = False
+                model_host.current_quant = QUANT_TYPE
             raise HTTPException(status_code=500, detail=result["error"])
 
     except HTTPException:
         raise
     except Exception as e:
-        model_loaded = False
+        model_host.model_loaded = False
         logger.error(f"模型加载失败: {e}", exc_info=True)
         raise HTTPException(500, f"模型加载失败: {str(e)}")
 
@@ -2305,8 +2859,44 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
 # 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）
 # ================================================================
 
+def _distributed_path_available() -> bool:
+    """当前是否有可用的分布式执行路径（T9.5 路由偏好判断）。
+
+    判定口径：分布式全局启用时，主节点可协调流水线/Worker；从节点可
+    转发主节点（由主节点协调执行）。两者都计为“合格分布式路径”。
+    """
+    try:
+        if not (scheduler.get_distributed_inference_enabled()
+                and RUN_MODE == "distributed"):
+            return False
+        role = scheduler._effective_role()
+        return role in ("master", "client")
+    except Exception:
+        return False
+
+
+def _routing_gate_error(req: ChatRequest) -> Optional[str]:
+    """路由偏好预检（T9.5）：返回拒绝原因，None 表示允许继续。
+
+    - distributed_required：没有合格分布式路径时明确失败，不静默回退；
+    - local_only / auto / distributed_preferred：始终允许（回退语义由执行路径处理）。
+    """
+    if req.routing_preference == "distributed_required":
+        if not _distributed_path_available():
+            return (
+                "distributed_required 但当前没有可用的分布式路径"
+                "（分布式未启用或本节点不是主节点）"
+            )
+    return None
+
+
 def _external_route_decision(req: ChatRequest):
     """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
+    if req.routing_preference == "local_only":
+        # T9.5：local_only 覆盖一切外部路由意图，数据不出集群
+        from types import SimpleNamespace as _SN
+        return _SN(use_external=False, eligible=False,
+                   reason="local_only_override")
     import config as _cfg
     from external_provider import decide_external_route
 
@@ -2405,7 +2995,7 @@ def _execute_external_chat(
         {"role": "assistant", "content": response_text},
     ])
 
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             if _db_mod.get_save_history():
@@ -2417,7 +3007,7 @@ def _execute_external_chat(
                 _db_mod.increment_session_message_count(db_session_id)
         except Exception:
             pass
-    if not _db_available:
+    if not model_host._db_available:
         try:
             _local_store.save_local_message(db_session_id, "user", req.message)
             save_metrics = dict(metrics)
@@ -2641,7 +3231,7 @@ def _execute_task_graph_chat(
     if not _task_graph_execution_slot.acquire(blocking=False):
         raise HTTPException(429, "已有任务链正在执行，请稍后重试。")
     try:
-        with _full_chat_execution_lock:
+        with model_host.full_chat_execution_lock:
             return _execute_task_graph_chat_with_slot(req, cancel_event)
     finally:
         _task_graph_execution_slot.release()
@@ -2676,7 +3266,7 @@ def _ensure_local_task_provider() -> None:
 
 
 def _active_task_graph_model_identity() -> Optional[ModelIdentity]:
-    if not model_loaded or not model_manager.is_loaded:
+    if not model_host.model_loaded or not model_manager.is_loaded:
         return None
     engine = str(getattr(model_manager, "_engine_type", "") or "")
     model_path = str(getattr(model_manager, "_model_path", "") or "")
@@ -3327,7 +3917,7 @@ def _execute_task_graph_chat_with_slot(
     save_metrics["followups"] = followups
 
     db_session_id = target_session_id or "default"
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             if _db_mod.get_save_history():
@@ -3338,7 +3928,7 @@ def _execute_task_graph_chat_with_slot(
                 _db_mod.increment_session_message_count(db_session_id)
         except Exception:
             pass
-    if not _db_available:
+    if not model_host._db_available:
         try:
             _local_store.save_local_message(
                 db_session_id, "user", req.message,
@@ -3384,6 +3974,10 @@ def _execute_chat_full(
         HTTPException: 模型未加载、OOM、推理失败
     """
     global kv_cache, conversation_stats
+    # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
+    routing_gate = _routing_gate_error(req)
+    if routing_gate:
+        raise HTTPException(400, routing_gate)
     _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
     # ---- 多会话支持 ----
@@ -3411,7 +4005,7 @@ def _execute_chat_full(
             raise
         except Exception as exc:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            if not model_loaded or not model_manager.is_loaded:
+            if not model_host.model_loaded or not model_manager.is_loaded:
                 if req.prefer_external:
                     raise HTTPException(
                         502,
@@ -3433,8 +4027,9 @@ def _execute_chat_full(
             external_fallback_reason = f"external_api_failed: {exc}"
             logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
 
-    # ---- 分布式推理路由：从节点转发给主节点 ----
-    if (scheduler.get_distributed_inference_enabled()
+    # ---- 分布式推理路由：从节点转发给主节点（local_only 强制本地）----
+    if (req.routing_preference != "local_only"
+            and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "client"):
         try:
@@ -3468,7 +4063,7 @@ def _execute_chat_full(
                     forward_metrics["fallback_reason"] = external_fallback_reason
 
                 db_session_id = target_session_id or "default"
-                if _db_available:
+                if model_host._db_available:
                     try:
                         import db as _db_mod
                         if _db_mod.get_save_history():
@@ -3478,7 +4073,7 @@ def _execute_chat_full(
                             _db_mod.increment_session_message_count(db_session_id)
                     except Exception:
                         pass
-                if not _db_available:
+                if not model_host._db_available:
                     try:
                         _local_store.save_local_message(db_session_id, "user", req.message)
                         _local_store.save_local_message(db_session_id, "assistant", response_text,
@@ -3523,7 +4118,7 @@ def _execute_chat_full(
                 "本设备正作为 PyTorch 分层从节点，"
                 "当前无法转发到主节点，已拒绝覆盖分层模型。",
             )
-        if not model_loaded or not model_manager.is_loaded:
+        if not model_host.model_loaded or not model_manager.is_loaded:
             _auto_load_default_model()
 
     if _pipeline_worker_is_reserved():
@@ -3533,8 +4128,9 @@ def _execute_chat_full(
             "请先断开主节点或明确切换本地模型。",
         )
 
-    # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
-    if (scheduler.get_distributed_inference_enabled()
+    # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用；local_only 跳过）----
+    if (req.routing_preference != "local_only"
+            and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "master"
             and model_manager._engine_type == "pytorch"):
@@ -3575,7 +4171,7 @@ def _execute_chat_full(
                         pipeline_metrics["fallback_reason"] = (
                             external_fallback_reason
                         )
-                    if _db_available:
+                    if model_host._db_available:
                         try:
                             import db as _db_mod
                             if _db_mod.get_save_history():
@@ -3585,7 +4181,7 @@ def _execute_chat_full(
                                 _db_mod.increment_session_message_count(db_session_id)
                         except Exception:
                             pass
-                    if not _db_available:
+                    if not model_host._db_available:
                         try:
                             _local_store.save_local_message(db_session_id, "user", req.message)
                             _local_store.save_local_message(db_session_id, "assistant",
@@ -3685,7 +4281,7 @@ def _execute_chat_full(
                 {"role": "assistant", "content": response_text},
             ])
 
-            if _db_available:
+            if model_host._db_available:
                 try:
                     import db as _db_mod
                     if _db_mod.get_save_history():
@@ -3697,7 +4293,7 @@ def _execute_chat_full(
                         _db_mod.increment_session_message_count(db_session_id)
                 except Exception:
                     pass
-            if not _db_available:
+            if not model_host._db_available:
                 try:
                     _local_store.save_local_message(db_session_id, "user", req.message)
                     save_metrics = dict(metrics)
@@ -3741,14 +4337,14 @@ def _execute_chat_full(
     # ---- PyTorch 引擎路径（CUDA/独显）----
     try:
         model_manager.ensure_full_model()
-        tier_max = generation_config.get("tier_max_new_tokens", generation_config["max_new_tokens"])
+        tier_max = model_host.generation_config.get("tier_max_new_tokens", model_host.generation_config["max_new_tokens"])
         thinking_budget = 384 if req.show_thinking else 0
         effective_max = min(req.max_new_tokens + thinking_budget,
                             tier_max + thinking_budget,
                             4096)
-        generation_config["max_new_tokens"] = effective_max
-        generation_config["temperature"] = req.temperature
-        generation_config["top_p"] = req.top_p
+        model_host.generation_config["max_new_tokens"] = effective_max
+        model_host.generation_config["temperature"] = req.temperature
+        model_host.generation_config["top_p"] = req.top_p
 
         request_history = [
             *history,
@@ -3854,7 +4450,7 @@ def _execute_chat_full(
             {"role": "assistant", "content": response_text},
         ])
 
-        if _db_available:
+        if model_host._db_available:
             try:
                 import db as _db_mod
                 if _db_mod.get_save_history():
@@ -3865,7 +4461,7 @@ def _execute_chat_full(
                     _db_mod.increment_session_message_count(db_session_id)
             except Exception:
                 pass
-        if not _db_available:
+        if not model_host._db_available:
             try:
                 save_metrics = dict(metrics)
                 save_metrics["followups"] = followups
@@ -3926,6 +4522,44 @@ def _execute_requested_chat(
     return _execute_chat_full(req, cancel_event)
 
 
+def _commit_interactive_history(
+    session_id: Optional[str],
+    user_message: str,
+    response_text: str,
+    metrics: dict,
+) -> bool:
+    """interactive 模式完成时的一次性会话事务提交（user + assistant）。
+
+    与 full 模式同一持久化语义（db.save_message / local_store 等价），
+    但只调用一次、一次写入两条消息，供 done 事件上报 history_committed。
+    返回是否实际写入。
+    """
+    db_session_id = session_id or "default"
+    if model_host._db_available:
+        try:
+            import db as _db_mod
+            if _db_mod.get_save_history():
+                _db_mod.save_message(db_session_id, "user", user_message)
+                _db_mod.save_message(
+                    db_session_id, "assistant", response_text, metrics,
+                )
+                _db_mod.increment_session_message_count(db_session_id)
+                return True
+        except Exception:
+            pass
+    else:
+        try:
+            _local_store.save_local_message(db_session_id, "user", user_message)
+            _local_store.save_local_message(
+                db_session_id, "assistant", response_text, metrics,
+            )
+            _local_store.increment_local_session_message_count(db_session_id)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 def _should_forward_chat_to_master() -> bool:
     return bool(
         scheduler.get_distributed_inference_enabled()
@@ -3945,21 +4579,25 @@ def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
         # 路线 B：本请求将整体路由到外部推理服务，无需本地模型。
         # 外部失败时的本地回退在 _execute_chat_full 内按需加载模型。
         return
-    if _should_forward_chat_to_master():
+    if req is not None and req.routing_preference == "local_only":
+        # T9.5：local_only 强制本地执行，从节点也不转发（能力不足时由下方
+        # 检查给出明确错误，而不是绕过网关转发）。
+        pass
+    elif _should_forward_chat_to_master():
         return
     if _pipeline_worker_is_reserved():
         raise HTTPException(
             503,
             "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
         )
-    if model_loaded and model_manager.is_loaded:
+    if model_host.model_loaded and model_manager.is_loaded:
         return
     _auto_load_default_model()
 
 
 def _auto_load_default_model():
     """自动加载默认模型（用于 thin client / Android 首次请求时服务端无模型的情况）。"""
-    global model_loaded, current_quant, kv_cache, conversation_stats
+    global kv_cache, conversation_stats
 
     import config as cfg
     import glob
@@ -3988,8 +4626,8 @@ def _auto_load_default_model():
             "total_time_seconds": 0.0,
             "rounds": 0,
         }
-        model_loaded = True
-        current_quant = "island"
+        model_host.model_loaded = True
+        model_host.current_quant = "island"
         scheduler.refresh_task_worker_capabilities()
         logger.info(f"✅ 孤岛引擎自动连接完成 ({time.time() - t0:.1f}s)")
         return
@@ -4049,8 +4687,8 @@ def _auto_load_default_model():
         "total_time_seconds": 0.0,
         "rounds": 0,
     }
-    model_loaded = True
-    current_quant = getattr(model_manager, "quant_type", None) or quant
+    model_host.model_loaded = True
+    model_host.current_quant = getattr(model_manager, "quant_type", None) or quant
     scheduler.refresh_task_worker_capabilities()
     elapsed = time.time() - t0
     logger.info(f"默认模型自动加载完成 ({elapsed:.1f}s)")
@@ -4071,14 +4709,14 @@ async def chat(req: ChatRequest):
 
     def _run_chat_request():
         if req.execution_mode == "task_graph":
-            if not model_loaded or not model_manager.is_loaded:
+            if not model_host.model_loaded or not model_manager.is_loaded:
                 raise HTTPException(
                     409,
                     "任务链实验要求先加载本地完整模型。",
                 )
             return _execute_requested_chat(req, cancel_event)
-        with _full_chat_execution_lock:
-            if not model_loaded or not model_manager.is_loaded:
+        with model_host.full_chat_execution_lock:
+            if not model_host.model_loaded or not model_manager.is_loaded:
                 try:
                     _ensure_chat_model_or_forwarding(req)
                 except FileNotFoundError:
@@ -4213,6 +4851,200 @@ async def chat_stream(req: ChatRequest, request: Request):
     async def _generate_events():
         # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
         _maybe_log_external_scope_denial(req, _external_route_decision(req))
+        # T9.5：distributed_required 无分布式路径时明确失败（interactive/fast 共用）
+        routing_gate = _routing_gate_error(req)
+        if routing_gate:
+            yield _error_event(routing_gate)
+            return
+        # ================================================================
+        # ★ interactive 模式（T9 聊天页契约）：真流式逐 token +
+        #    完成时会话事务提交（user + assistant 一次写入）
+        # ================================================================
+        if req.streaming_mode == "interactive":
+            target_session_id = req.session_id or active_session_id
+            if target_session_id and target_session_id != active_session_id:
+                try:
+                    _switch_session(target_session_id)
+                except Exception:
+                    pass
+            history = _get_active_history()
+            if target_session_id and len(history) == 0:
+                try:
+                    _auto_title_session(target_session_id, req.message)
+                except Exception:
+                    pass
+
+            yield f"data: {_json.dumps({'start': True, 'generation_id': generation_id, 'request_id': request_id, 'session_id': target_session_id, 'routing_preference': req.routing_preference}, ensure_ascii=False)}\n\n"
+
+            response_parts: list[str] = []
+            thinking_parts: list[str] = []
+            metrics: dict = {}
+            error: Optional[str] = None
+            cancelled = False
+            distributed_used = False
+
+            def _append_event(event: dict) -> None:
+                nonlocal metrics, error
+                if event.get("token"):
+                    response_parts.append(str(event["token"]))
+                if event.get("thinking"):
+                    thinking_parts.append(str(event["thinking"]))
+                if isinstance(event.get("metrics"), dict):
+                    metrics.update(event["metrics"])
+                if event.get("error"):
+                    error = str(event["error"])
+
+            loop = _asyncio.get_running_loop()
+
+            def _token_frame(event: dict) -> Optional[str]:
+                """token 事件 → SSE 帧；非 token 事件返回 None。"""
+                if event.get("token") is not None:
+                    return f"data: {_json.dumps({'token': event['token']}, ensure_ascii=False)}\n\n"
+                return None
+
+            try:
+                # ---- 外部路由（数据作用域门控，与 fast/full 同语义）----
+                _ext_decision = _external_route_decision(req)
+                if _ext_decision.use_external:
+                    async for event in _iterate_sync_generator(
+                        _external_stream_events(req, cancel_event),
+                    ):
+                        _append_event(event)
+                        frame = _token_frame(event)
+                        if frame:
+                            yield frame
+                        if event.get("done"):
+                            break
+                elif (req.routing_preference != "local_only"
+                      and _should_forward_chat_to_master()):
+                    # 计划 §9.5：聊天请求不绕过网关直打本地模型；从节点
+                    # interactive 明确失败并引导连接主节点，不静默降级。
+                    error = (
+                        "interactive 模式要求连接主节点；当前节点是从节点，"
+                        "请用 --host 指定主节点 endpoint 后重试"
+                    )
+                elif _pipeline_worker_is_reserved():
+                    error = (
+                        "本设备正作为 PyTorch 分层从节点，interactive 模式不可用；"
+                        "请连接主节点"
+                    )
+                else:
+                    if not model_host.model_loaded or not model_manager.is_loaded:
+                        try:
+                            await _run_with_request_id(loop, _auto_load_default_model)
+                        except Exception as exc:
+                            error = f"本地回退模型加载失败: {exc}"
+                    if error is None:
+                        distributed_used = False
+                        # 路径 1: 分布式流水线流式（master；local_only 强制跳过）
+                        if (req.routing_preference != "local_only"
+                                and scheduler.get_distributed_inference_enabled()
+                                and RUN_MODE == "distributed"
+                                and scheduler._effective_role() == "master"
+                                and model_manager._engine_type == "pytorch"):
+                            distributed_used = True
+                            async for event in _iterate_sync_generator(scheduler.run_pipeline_stream(
+                                req.message,
+                                max_new_tokens=req.max_new_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                session_id=req.session_id,
+                                messages=[{"role": "user", "content": req.message}],
+                                show_thinking=req.show_thinking,
+                                _cancel_event=cancel_event,
+                            )):
+                                _append_event(event)
+                                frame = _token_frame(event)
+                                if frame:
+                                    yield frame
+                        # 路径 2: 单机 PyTorch 流式
+                        elif (model_manager._engine_type == "pytorch"
+                                and model_manager.is_loaded):
+                            async for event in _iterate_sync_generator(scheduler._run_full_model_inference_stream(
+                                req.message,
+                                max_new_tokens=req.max_new_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                session_id=req.session_id,
+                                messages=[{"role": "user", "content": req.message}],
+                                show_thinking=req.show_thinking,
+                                _cancel_event=cancel_event,
+                            )):
+                                _append_event(event)
+                                frame = _token_frame(event)
+                                if frame:
+                                    yield frame
+                        # 路径 3: llama.cpp / 其他 → 假流式回退（整段作为单 token 事件）
+                        else:
+                            result = await _run_with_request_id(
+                                loop,
+                                lambda: scheduler.run_pipeline_safe(
+                                    req.message,
+                                    max_new_tokens=req.max_new_tokens,
+                                    temperature=req.temperature,
+                                    top_p=req.top_p,
+                                    session_id=req.session_id,
+                                    _cancel_event=cancel_event,
+                                ),
+                            )
+                            if isinstance(result.get("metrics"), dict):
+                                metrics.update(result["metrics"])
+                            response = result.get("response", "")
+                            if response:
+                                response_parts.append(str(response))
+                                yield f"data: {_json.dumps({'token': str(response)}, ensure_ascii=False)}\n\n"
+                            if result.get("error"):
+                                error = str(result["error"])
+            except ChatGenerationCancelled:
+                cancelled = True
+            except HTTPException as exc:
+                error = exc.detail
+            except Exception as exc:
+                logger.error(f"interactive 模式推理失败: {exc}", exc_info=True)
+                error = str(exc)
+
+            if cancelled:
+                partial = "".join(response_parts)
+                yield f"data: {_json.dumps({'cancelled': True, 'generation_id': generation_id, 'request_id': request_id, 'session_id': target_session_id, 'partial': partial}, ensure_ascii=False)}\n\n"
+                return
+            if error:
+                yield _error_event(error)
+                return
+
+            response_text = "".join(response_parts)
+            metrics.setdefault("request_id", request_id)
+            metrics["generation_id"] = generation_id
+            metrics["routing_preference"] = req.routing_preference
+            metrics["distributed_requested"] = req.routing_preference in (
+                "distributed_preferred", "distributed_required",
+            )
+            metrics["distributed_used"] = distributed_used
+            if (req.routing_preference in ("distributed_preferred",
+                                           "distributed_required")
+                    and not distributed_used):
+                # 请求分布式但实际本地：必须展示回退原因（计划 §9.5）
+                metrics.setdefault("fallback", True)
+                metrics.setdefault(
+                    "fallback_reason",
+                    "distributed_unavailable_fallback_to_local",
+                )
+            committed = _commit_interactive_history(
+                target_session_id, req.message, response_text, metrics,
+            )
+            done_payload = {
+                "done": True,
+                "response": response_text,
+                "thinking_content": "".join(thinking_parts) or None,
+                "followups": [],
+                "metrics": metrics,
+                "generation_id": generation_id,
+                "request_id": request_id,
+                "session_id": target_session_id,
+                "history_committed": committed,
+            }
+            yield f"data: {_json.dumps(done_payload, ensure_ascii=False)}\n\n"
+            return
+
         # ================================================================
         # ★ full 模式：完整 chat 流程，假流式（SSE 单事件）
         # ================================================================
@@ -4221,14 +5053,14 @@ async def chat_stream(req: ChatRequest, request: Request):
 
             def _execute_full_stream_request():
                 if req.execution_mode == "task_graph":
-                    if not model_loaded or not model_manager.is_loaded:
+                    if not model_host.model_loaded or not model_manager.is_loaded:
                         raise HTTPException(
                             409,
                             "任务链实验要求先加载本地完整模型。",
                         )
                     return _execute_requested_chat(req, cancel_event)
-                with _full_chat_execution_lock:
-                    if not model_loaded or not model_manager.is_loaded:
+                with model_host.full_chat_execution_lock:
+                    if not model_host.model_loaded or not model_manager.is_loaded:
                         _ensure_chat_model_or_forwarding(req)
                     return _execute_requested_chat(req, cancel_event)
 
@@ -4284,7 +5116,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                 return
             # 外部失败 → 与 /api/chat 同语义：优先回退本地路径
             if req.prefer_external and not (
-                model_loaded and model_manager.is_loaded
+                model_host.model_loaded and model_manager.is_loaded
             ):
                 yield _error_event(
                     f"外部推理服务调用失败，且本地无可用推理引擎：{external_error}"
@@ -4299,7 +5131,9 @@ async def chat_stream(req: ChatRequest, request: Request):
         # A pipeline worker may already hold a valid PyTorch segment. It must
         # never enter the local PyTorch streaming branch, which restores the
         # full model and invalidates the master's ready ACK.
-        if _should_forward_chat_to_master():
+        # T9.5: local_only 强制不走转发，仅本地执行
+        if (req.routing_preference != "local_only"
+                and _should_forward_chat_to_master()):
             loop = _asyncio.get_running_loop()
             result = await _run_with_request_id(
                 loop,
@@ -4341,7 +5175,7 @@ async def chat_stream(req: ChatRequest, request: Request):
             )
             return
 
-        if not model_loaded or not model_manager.is_loaded:
+        if not model_host.model_loaded or not model_manager.is_loaded:
             loop = _asyncio.get_running_loop()
             try:
                 await _run_with_request_id(loop, _auto_load_default_model)
@@ -4349,8 +5183,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield _error_event(f"本地回退模型加载失败: {exc}")
                 return
 
-        # ---- 路径 1: 分布式流水线流式 ----
-        if (scheduler.get_distributed_inference_enabled()
+        # ---- 路径 1: 分布式流水线流式（local_only 强制跳过，走单机）----
+        if (req.routing_preference != "local_only"
+                and scheduler.get_distributed_inference_enabled()
                 and RUN_MODE == "distributed"
                 and scheduler._effective_role() == "master"
                 and model_manager._engine_type == "pytorch"):
@@ -4840,10 +5675,10 @@ async def list_available_models():
 
     return {
         "models": pytorch_quants + gguf_quants + island_quants + external_quants,
-        "current": current_quant if model_loaded else None,
+        "current": model_host.current_quant if model_host.model_loaded else None,
         "current_engine": (
             model_manager._engine_type
-            if model_loaded and model_manager.is_loaded
+            if model_host.model_loaded and model_manager.is_loaded
             else None
         ),
         "available_engines": available_engines,
@@ -4875,7 +5710,7 @@ class RegisterModelRequest(BaseModel):
 def _get_db_experimental_models() -> list[dict]:
     """从 DB 读取用户注册的实验模型（安全包装）。"""
     try:
-        if _db_available:
+        if model_host._db_available:
             from db import get_experimental_models
             return get_experimental_models()
     except Exception:
@@ -5067,7 +5902,7 @@ async def list_models():
 
     return {
         "models": models_data,
-        "active_model_id": model_manager.active_model_id if model_loaded else None,
+        "active_model_id": model_manager.active_model_id if model_host.model_loaded else None,
     }
 
 
@@ -5079,7 +5914,7 @@ async def switch_model(req: SwitchModelRequest):
     会卸载当前模型，然后加载新模型。
     仅 CUDA 环境可用（非 CUDA 返回 403）。
     """
-    global model_loaded, current_quant, kv_cache, conversation_stats
+    global kv_cache, conversation_stats
 
     # 验证 engine 参数
     engine = req.engine.lower()
@@ -5114,24 +5949,24 @@ async def switch_model(req: SwitchModelRequest):
         )
 
         if result["success"]:
-            model_loaded = True
-            current_quant = getattr(model_manager, "quant_type", None) or quant
+            model_host.model_loaded = True
+            model_host.current_quant = getattr(model_manager, "quant_type", None) or quant
             _init_kv_cache()
             scheduler.refresh_task_worker_capabilities()
             return result
         else:
             # 切换失败 — 检查是否回滚成功
             if model_manager.is_loaded:
-                model_loaded = True
+                model_host.model_loaded = True
                 # P3修复: llama_cpp 引擎无 quant_type（GGUF 自带量化），回退到 "gguf"
-                current_quant = model_manager.quant_type or (
+                model_host.current_quant = model_manager.quant_type or (
                     "gguf" if model_manager._engine_type == "llama_cpp"
                     else "island" if model_manager._engine_type == "island"
                     else QUANT_TYPE
                 )
             else:
-                model_loaded = False
-                current_quant = QUANT_TYPE
+                model_host.model_loaded = False
+                model_host.current_quant = QUANT_TYPE
             raise HTTPException(status_code=500, detail=result["error"])
 
     except HTTPException:
@@ -5156,7 +5991,7 @@ async def register_model(req: RegisterModelRequest):
     """
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
-    if not _db_available:
+    if not model_host._db_available:
         raise HTTPException(status_code=503, detail="数据库不可用，无法注册模型。")
 
     config = {
@@ -5190,7 +6025,7 @@ async def unregister_model(model_id: str):
 
     不会删除磁盘上的模型文件，仅取消注册。
     """
-    if not _db_available:
+    if not model_host._db_available:
         raise HTTPException(status_code=503, detail="数据库不可用。")
 
     # 不允许删除内置模型
@@ -5628,7 +6463,7 @@ async def test_email_notification():
     """
     发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
 
-    邮件将发送到 SMTP.md 中配置的目标邮箱。
+    邮件将发送到当前配置的管理员收件邮箱（node_config 优先，回退环境变量）。
     任何节点均可调用（主节点和从节点均可测试邮件发送）。
     """
     try:
@@ -5643,6 +6478,53 @@ async def test_email_notification():
         raise HTTPException(500, f"邮件模块导入失败: {e}")
     except Exception as e:
         raise HTTPException(500, f"邮件发送异常: {e}")
+
+
+class EmailConfigRequest(BaseModel):
+    # 允许空串：传空表示清除自定义配置、回退环境变量（set_admin_email 校验）
+    recipient: str = Field(..., max_length=320, description="管理员收件邮箱（空串=清除自定义配置）")
+
+
+@app.get("/api/cluster/email-config")
+async def get_email_config():
+    """
+    查询管理员收件邮箱配置（不返回任何 SMTP 凭据）。
+
+    Returns:
+        recipient: 当前生效收件邮箱（可能为空）
+        source: node_config | env | none
+        smtp_configured: 发件账号是否已配置
+    """
+    try:
+        from email_notifier import admin_email_config
+        from email_notifier import SMTP_SENDER, SMTP_PASSWORD
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    config = admin_email_config()
+    return {
+        "recipient": config["recipient"],
+        "source": config["source"],
+        "smtp_configured": bool(SMTP_SENDER and SMTP_PASSWORD),
+    }
+
+
+@app.post("/api/cluster/email-config")
+async def update_email_config(req: EmailConfigRequest):
+    """
+    设置管理员收件邮箱并持久化到 node_config.json，运行中立即生效。
+
+    传空字符串可清除自定义配置，回退到环境变量 QLH_SMTP_RECIPIENT。
+    """
+    try:
+        from email_notifier import set_admin_email
+        recipient = await run_in_threadpool(set_admin_email, req.recipient)
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"保存邮箱配置失败: {e}")
+    return {"status": "ok", "recipient": recipient}
 
 
 # ============================================================
@@ -6163,7 +7045,7 @@ async def get_user_settings():
     返回完整的 settings JSON，与 localStorage 格式一致。
     如果数据库不可用，返回空 dict（前端使用 localStorage 值）。
     """
-    if not _db_available:
+    if not model_host._db_available:
         return {"settings": {}, "source": "none"}
     try:
         import db as _db_mod
@@ -6186,7 +7068,7 @@ async def update_user_settings(req: UserSettingsRequest):
     前端在更新 localStorage 后调用此接口同步到云端。
     同时同步 save_history 和 distributed_inference 到各自的专用键。
     """
-    if not _db_available:
+    if not model_host._db_available:
         return {"status": "skipped", "reason": "数据库不可用"}
     try:
         import db as _db_mod
@@ -6219,7 +7101,7 @@ async def get_conversation_sync_status():
     获取对话历史云同步状态。
     """
     save_history = False
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             save_history = _db_mod.get_save_history()
@@ -6228,10 +7110,10 @@ async def get_conversation_sync_status():
 
     return {
         "save_history": save_history,
-        "db_connected": _db_available,
+        "db_connected": model_host._db_available,
         "local_save_enabled": True,  # localStorage 始终可用
         "local_store_enabled": True,  # 本地文件降级始终可用
-        "cloud_sync_enabled": save_history and _db_available,
+        "cloud_sync_enabled": save_history and model_host._db_available,
     }
 
 
@@ -6247,7 +7129,7 @@ async def get_conversations(session_id: str = "default", limit: int = 200):
     如果数据库不可用，回退到内存中的对话历史（按 session_id 过滤）。
     """
     # ---- 加载顺序: 数据库 → 本地文件 → 内存 ----
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             messages = _db_mod.get_conversation(session_id, limit)
@@ -6305,14 +7187,14 @@ def delete_conversations(session_id: str = "default"):
     )
     deleted_count = 0
 
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             deleted_count = _db_mod.clear_conversation(resolved_session_id)
             logger.info(f"数据库对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
         except Exception as e:
             logger.warning(f"数据库清空对话历史失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             deleted_count = _local_store.clear_local_conversation(resolved_session_id)
             logger.info(f"本地对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
@@ -6368,13 +7250,13 @@ def create_session(req: Optional[CreateSessionRequest] = None):
         title = req.title
 
     # 持久化到数据库（或本地文件降级）
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             _db_mod.create_session(session_id, title)
         except Exception as e:
             logger.warning(f"数据库创建会话失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             _local_store.create_local_session(session_id, title)
         except Exception as e:
@@ -6398,7 +7280,7 @@ async def list_sessions(limit: int = 50, offset: int = 0):
     """
     获取所有会话列表（按 updated_at DESC 排序）。
     """
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             db_sessions = _db_mod.get_all_sessions(limit, offset)
@@ -6454,7 +7336,7 @@ async def list_sessions(limit: int = 50, offset: int = 0):
 @app.get("/api/sessions/{session_id}")
 async def get_session_info(session_id: str):
     """获取单个会话的元数据"""
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             session = _db_mod.get_session(session_id)
@@ -6485,7 +7367,7 @@ async def get_session_info(session_id: str):
 @app.put("/api/sessions/{session_id}")
 async def rename_session(session_id: str, req: RenameSessionRequest):
     """重命名会话"""
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             updated = _db_mod.update_session_title(session_id, req.title)
@@ -6493,7 +7375,7 @@ async def rename_session(session_id: str, req: RenameSessionRequest):
                 return updated
         except Exception as e:
             logger.warning(f"数据库重命名会话失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             updated = _local_store.update_local_session_title(session_id, req.title)
             if updated:
@@ -6514,13 +7396,13 @@ def delete_session(session_id: str):
     global active_session_id
 
     deleted = 0
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             deleted = _db_mod.delete_session(session_id)
         except Exception as e:
             logger.warning(f"数据库删除会话失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             deleted = _local_store.delete_local_session(session_id)
         except Exception as e:
@@ -6574,7 +7456,7 @@ def delete_turn(session_id: str, turn_index: int):
     history = session_histories.get(session_id, [])
     if not history:
         # 尝试从 DB 或本地文件加载
-        if _db_available:
+        if model_host._db_available:
             try:
                 import db as _db_mod
                 rows = _db_mod.get_conversation(session_id)
@@ -6598,14 +7480,14 @@ def delete_turn(session_id: str, turn_index: int):
 
     # 从 DB 或本地文件删除
     deleted_count = 0
-    if _db_available:
+    if model_host._db_available:
         try:
             import db as _db_mod
             deleted_count = _db_mod.delete_message_range(session_id, turn_index)
             _db_mod.decrement_session_message_count(session_id, 2)
         except Exception as e:
             logger.warning(f"数据库删除消息失败: {e}")
-    if not _db_available:
+    if not model_host._db_available:
         try:
             deleted_count = _local_store.delete_local_message_range(session_id, turn_index)
             _local_store.decrement_local_session_message_count(session_id, 2)
@@ -7576,6 +8458,19 @@ else:
 # 启动入口
 # ============================================================
 
+# ============================================================
+# 阶段 0.2：向 model_host 挂载 scheduler 需要的回调（消除 scheduler
+# 对 api_server 的运行时反向 import）
+# ============================================================
+model_host.attach("_execute_task_worker_stage", _execute_task_worker_stage)
+model_host.attach("_active_task_graph_model_identity", _active_task_graph_model_identity)
+model_host.attach("_build_model_chat_prompt", _build_model_chat_prompt)
+model_host.attach("THINKING_SYSTEM_PROMPT", THINKING_SYSTEM_PROMPT)
+model_host.attach("_snapshot_recent_logs", _snapshot_recent_logs)
+model_host.attach("_filter_recent_logs", _filter_recent_logs)
+model_host.attach("_format_model_response", _format_model_response)
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -7583,5 +8478,18 @@ if __name__ == "__main__":
     from model_downloader import ensure_model_or_warn
     ensure_model_or_warn()
 
+    # 自建 uvicorn.Server 并注册，使 POST /api/system/shutdown 能触发
+    # 跨平台优雅关闭（should_exit → lifespan shutdown → _shutdown_resources）。
+    # 支持 start_tui 脚本的 QLH_BACKEND_HOST / QLH_BACKEND_PORT 覆盖。
     logger.info("启动 API 服务器...")
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT, log_level="info")
+    _backend_host = os.environ.get("QLH_BACKEND_HOST", "0.0.0.0")
+    _backend_port = int(os.environ.get("QLH_BACKEND_PORT") or API_PORT)
+    _uvicorn_config = uvicorn.Config(
+        app,
+        host=_backend_host,
+        port=_backend_port,
+        log_level="info",
+    )
+    _uvicorn_server = uvicorn.Server(_uvicorn_config)
+    register_uvicorn_server(_uvicorn_server)
+    _uvicorn_server.run()

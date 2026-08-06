@@ -49,7 +49,7 @@ else:
     import tty
 
 APP_TITLE = "QLH 分布式边缘推理 · TUI 管理菜单"
-TUI_VERSION = "1.0.0"
+TUI_VERSION = "1.1.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 BACKEND_HINT = "请先在项目根目录启动后端: python src/api_server.py （或在「设置」中修改后端地址）"
@@ -367,6 +367,7 @@ class AnsiTerm:
         codes = {
             "title": "1;36", "ok": "32", "err": "1;31", "warn": "33",
             "dim": "2", "sel": "7", "head": "1;37", "key": "36",
+            "input": "36", "cmd": "1;33",
         }
         code = codes.get(style)
         if not code:
@@ -492,6 +493,51 @@ class AnsiTerm:
         finally:
             self._raw_input_mode()
             self.write("\x1b[?25l")
+
+    # ---- 分页文本输出（命令大结果 / 帮助，恢复行模式打印） ----
+    def show_lines(self, lines: list, title: str = ""):
+        """临时退出全屏输出多行文本，超出屏幕分页；q/ESC 提前返回。"""
+        if not lines:
+            lines = ["（无输出）"]
+        w, h = self.size()
+        page = max(h - 4, 5)
+        self._restore_input()
+        self.write("\x1b[?25h")
+        try:
+            pos = 0
+            total = len(lines)
+            while True:
+                self.write("\x1b[2J\x1b[H")
+                if title:
+                    sys.stdout.write(title + "\n")
+                chunk = lines[pos:pos + page]
+                sys.stdout.write("\n".join(chunk))
+                if chunk:
+                    sys.stdout.write("\n")
+                if pos + page < total:
+                    sys.stdout.write(
+                        "\n-- 第 %d-%d / %d 行：任意键下一页，q/ESC 返回 --\n"
+                        % (pos + 1, pos + len(chunk), total))
+                    sys.stdout.flush()
+                    key = self._wait_any_key()
+                    if key in ("q", "Q", "ESC"):
+                        break
+                    pos += page
+                else:
+                    sys.stdout.write("\n-- 已到末尾，按任意键返回 --\n")
+                    sys.stdout.flush()
+                    self._wait_any_key()
+                    break
+        finally:
+            self._raw_input_mode()
+            self.write("\x1b[?25l")
+
+    def _wait_any_key(self) -> str:
+        """阻塞等待任意按键（分页提示用，无操作超时后继续等待）。"""
+        while True:
+            key = self.get_key(300)
+            if key is not None:
+                return key
 
 
 # ============================================================
@@ -1417,6 +1463,579 @@ SCREEN_CLASSES = [
 
 
 # ============================================================
+# 六·五、TUI 命令系统（/ 开头，任意界面可用）
+#
+# 每条命令: name / aliases / usage / summary / handler(app, args, opts)
+# handler 返回 (消息, 样式)；样式 ∈ ok|err|warn（用于底部消息行）。
+# 大输出用 app.show_output(lines, title=...) 分页展示。
+# ============================================================
+
+def _split_cmd_args(argv: list) -> tuple:
+    """拆分命令参数：位置参数 + --flag value / --flag=value / --flag。"""
+    positional, opts = [], {}
+    i = 0
+    n = len(argv)
+    while i < n:
+        a = argv[i]
+        if a.startswith("--"):
+            name = a[2:].strip()
+            if "=" in name:
+                k, v = name.split("=", 1)
+                opts[k] = v
+            elif i + 1 < n and not argv[i + 1].startswith("--"):
+                opts[name] = argv[i + 1]
+                i += 1
+            else:
+                opts[name] = True
+        else:
+            positional.append(a)
+        i += 1
+    return positional, opts
+
+
+def _model_summary(resp: dict) -> str:
+    """从模型接口响应中提取 model/quant/engine 摘要。"""
+    parts = []
+    for key in ("model_name", "model_id", "model"):
+        if resp.get(key):
+            parts.append(str(resp[key]))
+            break
+    for key in ("quant_type", "current_quant", "quant"):
+        if resp.get(key):
+            parts.append(str(resp[key]))
+            break
+    for key in ("engine", "engine_type"):
+        if resp.get(key):
+            parts.append(str(resp[key]))
+            break
+    return " ".join(parts) or "—"
+
+
+# ---- 命令实现 ----
+
+def cmd_help(app, args, opts):
+    app.show_output(COMMAND_HELP_LINES, title="QLH TUI 命令集（%d 条命令）" % len(COMMANDS))
+    return ("共 %d 条命令（详见上方列表）" % len(COMMANDS), "ok")
+
+
+def cmd_quit(app, args, opts):
+    app.exit_requested = True
+    app.shutdown_backend = False
+    return ("TUI 正在退出（后端保持运行）…", "ok")
+
+
+def cmd_shutdown(app, args, opts):
+    reason = " ".join(args) or "TUI /shutdown"
+    try:
+        app.api.post("/system/shutdown", {"reason": reason})
+    except ApiError as e:
+        return ("后端关闭请求失败（%s）。若后端已停止，请用 /quit 退出 TUI。" % e, "err")
+    app.exit_requested = True
+    app.shutdown_backend = True
+    return ("已请求后端优雅退出（保存状态并清理资源）…", "ok")
+
+
+def cmd_status(app, args, opts):
+    return (app.open_screen("1"), "ok")
+
+
+def cmd_screen(app, args, opts):
+    if not args:
+        names = "  ".join("%d.%s" % (i + 1, s.name) for i, s in enumerate(app.screens))
+        return ("可用屏幕: %s" % names, "ok")
+    msg = app.open_screen(args[0])
+    if msg is None:
+        return ("未找到屏幕: %s（数字 1-%d 或名称关键字）" % (args[0], len(app.screens)), "err")
+    return (msg, "ok")
+
+
+def cmd_refresh(app, args, opts):
+    # plain 模式无 current 属性（仅 InteractiveApp 维护）；getattr 兜底
+    # （2026-08-05 复核：plain 模式下 /refresh 此前 AttributeError 崩溃）
+    cur = getattr(app, "current", None)
+    if cur is not None:
+        cur.refresh(force=True)
+        return ("已刷新: %s" % cur.name, "ok")
+    return ("当前不在任何屏幕中", "warn")
+
+
+def cmd_model(app, args, opts):
+    cur = app.api.get("/models/current")
+    if not cur.get("loaded"):
+        return ("模型未加载。可用: /models 查看列表，/load <模型ID> 加载", "warn")
+    lines = [
+        "模型标识    : %s" % cur.get("model_id", "—"),
+        "名称        : %s" % cur.get("model_name", "—"),
+        "量化精度    : %s" % cur.get("quant_type", "—"),
+        "推理引擎    : %s" % cur.get("engine", "—"),
+        "设备        : %s" % cur.get("device", "—"),
+        "参数量      : %s" % cur.get("total_params", "—"),
+        "GPU 显存    : %.2f GB" % float(cur.get("gpu_allocated_gb") or 0),
+        "模型路径    : %s" % cur.get("model_path", "—"),
+    ]
+    app.show_output(lines, title="◆ 当前模型")
+    return ("当前模型: %s (%s)" % (cur.get("model_name", "—"), cur.get("quant_type", "—")), "ok")
+
+
+def cmd_models(app, args, opts):
+    try:
+        avail = app.api.get("/models/available")
+    except ApiError as e:
+        return (str(e), "err")
+    models = []
+    try:
+        models = (app.api.get("/models") or {}).get("models") or []
+    except ApiError:
+        pass
+    lines = ["可用模型:"]
+    for m in models:
+        engines = ",".join(m.get("supported_engines") or [])
+        lines.append("  %-16s %s  [%s]  %s" % (
+            m.get("model_id", "—"), m.get("name", ""), engines,
+            m.get("description", "")))
+    if not models:
+        lines.append("  （无可用模型）")
+    lines.append("")
+    lines.append("量化/引擎选项:")
+    for q in (avail.get("models") or []):
+        lines.append("  %-10s %-22s %s" % (
+            q.get("id", ""), q.get("name", ""), q.get("description", "")))
+    lines.append("")
+    lines.append("当前: quant=%s  engine=%s" % (
+        avail.get("current") or "—", avail.get("current_engine") or "—"))
+    app.show_output(lines, title="◆ 模型 / 量化 / 引擎")
+    return ("共 %d 个模型配置" % len(models), "ok")
+
+
+def _do_model_change(app, path, args, opts):
+    model_id = args[0] if args else None
+    body = {
+        "model_id": model_id,
+        "quant_type": opts.get("quant", "int4"),
+        "engine": opts.get("engine", "auto"),
+        "use_compile": bool(opts.get("compile")),
+    }
+    verb = "切换" if path.endswith("/switch") else "加载"
+    resp = app.api.post(path, body)
+    summary = _model_summary(resp)
+    return ("模型%s完成: %s" % (verb, summary or "OK"), "ok")
+
+
+def cmd_switch(app, args, opts):
+    return _do_model_change(app, "/models/switch", args, opts)
+
+
+def cmd_load(app, args, opts):
+    return _do_model_change(app, "/models/load", args, opts)
+
+
+def cmd_quant(app, args, opts):
+    q = args[0].lower()
+    cur = app.api.get("/models/current")
+    if not cur.get("loaded"):
+        return ("当前未加载模型，请先 /load <模型ID> 或 /switch <模型ID>", "warn")
+    mid = cur.get("model_id") or ""
+    engine = cur.get("engine") or "auto"
+    if engine == "llama_cpp":
+        engine = "auto"          # 交给后端按文件类型解析
+    resp = app.api.post("/models/switch", {
+        "model_id": mid, "quant_type": q, "engine": engine})
+    return ("量化已切换为 %s: %s" % (q, _model_summary(resp)), "ok")
+
+
+def cmd_engine(app, args, opts):
+    engine = args[0].lower()
+    if engine not in ("auto", "llama_cpp", "pytorch", "island"):
+        return ("引擎无效: %s（可选 auto|llama_cpp|pytorch|island）" % engine, "err")
+    cur = app.api.get("/models/current")
+    if not cur.get("loaded"):
+        return ("当前未加载模型，请先 /load <模型ID> 或 /switch <模型ID>", "warn")
+    mid = cur.get("model_id") or ""
+    quant = opts.get("quant") or cur.get("quant_type") or "int4"
+    resp = app.api.post("/models/switch", {
+        "model_id": mid, "quant_type": quant, "engine": engine})
+    return ("引擎已切换为 %s: %s" % (engine, _model_summary(resp)), "ok")
+
+
+def cmd_presets(app, args, opts):
+    try:
+        data = app.api.get("/presets")
+    except ApiError as e:
+        return (str(e), "err")
+    lines = ["当前量化: %s    速度估算: %s tok/s    max_tokens: %s" % (
+        data.get("current_quant") or "—", data.get("current_speed_tok_s", "—"),
+        data.get("max_new_tokens", "—"))]
+    lines.append("")
+    for p in (data.get("presets") or []):
+        lines.append("  %s %s" % (p.get("icon", ""), p.get("label", "")))
+        lines.append("      %s" % p.get("question", ""))
+        lines.append("      预估: prompt %s tok / 回复 %s tok / 显存 %s MB / %s 秒" % (
+            p.get("estimated_prompt_tokens", "—"), p.get("estimated_response_tokens", "—"),
+            p.get("estimated_memory_mb", "—"), p.get("estimated_seconds", "—")))
+    app.show_output(lines, title="◆ 预设问题")
+    return ("共 %d 个预设" % len(data.get("presets") or []), "ok")
+
+
+def cmd_gpu(app, args, opts):
+    if not args:
+        prof = app.api.get("/device/profile")
+        gpus = prof.get("gpus") or []
+        sel = prof.get("selected_gpu_index", 0)
+        lines = []
+        for i, g in enumerate(gpus):
+            mark = "»" if i == sel else " "
+            lines.append("  %s #%d  %s  已用 %s/%s MB (%.0f%%)" % (
+                mark, i, g.get("name", "—"),
+                g.get("used_mb", g.get("allocated_mb", 0)),
+                g.get("total_mb", 0), float(g.get("utilization") or 0)))
+        if not gpus:
+            lines.append("  （未检测到 GPU）")
+        app.show_output(lines, title="◆ GPU 列表（当前 #%s）" % sel)
+        return ("共 %d 块 GPU（/gpu <序号> 切换）" % len(gpus), "ok")
+    try:
+        n = int(args[0])
+    except ValueError:
+        return ("无效 GPU 序号: %s" % args[0], "err")
+    r = app.api.post("/device/select-gpu", {"gpu_index": n})
+    g = r.get("selected_gpu") or {}
+    warn = "（" + r["warning"] + "）" if r.get("warning") else ""
+    return ("已切换到 GPU #%s %s%s" % (r.get("selected_gpu_index", n), g.get("name", ""), warn), "ok")
+
+
+def cmd_device(app, args, opts):
+    sub = args[0].lower() if args else "profile"
+    if sub == "auto":
+        r = app.api.post("/device/auto-configure")
+        cfg = r.get("applied_config") or {}
+        return ("自动配置完成: 档位 %s 评分 %s %s" % (
+            r.get("tier", "—"), r.get("score", "—"), cfg.get("description", "")), "ok")
+    if sub == "profile":
+        prof = app.api.get("/device/profile")
+        lines = [
+            "档位    : %s (%s)" % (prof.get("tier_label", "—"), prof.get("tier", "—")),
+            "评分    : %s/100" % prof.get("score_total", "—"),
+            "推荐配置: %s" % ((prof.get("recommendations") or [{}])[0].get("description", "—")),
+        ]
+        for w in (prof.get("warnings") or []):
+            lines.append("警告    : %s" % w)
+        app.show_output(lines, title="◆ 设备画像")
+        return ("设备档位: %s" % prof.get("tier_label", "—"), "ok")
+    return ("用法: /device auto | /device profile", "err")
+
+
+def cmd_nodes(app, args, opts):
+    nd = app.api.get("/cluster/nodes") or {}
+    role = {}
+    try:
+        role = app.api.get("/cluster/my-role") or {}
+    except ApiError:
+        pass
+    lines = ["本机角色: %s (%s)    节点 %s / 在线 %s / 离线 %s" % (
+        role_cn(role.get("node_role", "—")), role.get("node_id", "—"),
+        nd.get("count", 0), nd.get("online_count", 0), nd.get("offline_count", 0))]
+    lines.append("")
+    rows = []
+    for n in (nd.get("nodes") or []):
+        rows.append([
+            n.get("node_id", ""), role_cn(n.get("role", "")), n.get("node_type", ""),
+            state_cn(n.get("state", "")), n.get("address", "") or "—",
+            n.get("network_type", ""), n.get("task_count", 0),
+            n.get("error_count", 0), fmt_age(n.get("last_heartbeat")),
+        ])
+    if rows:
+        lines.extend(make_table(["节点ID", "角色", "类型", "状态", "地址", "网络", "任务", "错误", "心跳"],
+                                rows, max_width=shutil.get_terminal_size(fallback=(100, 30)).columns - 2))
+    else:
+        lines.append("（暂无节点记录）")
+    app.show_output(lines, title="◆ 节点列表")
+    return ("节点 %s 个（在线 %s）" % (nd.get("count", 0), nd.get("online_count", 0)), "ok")
+
+
+def cmd_connect(app, args, opts):
+    host = args[0]
+    port = 8888
+    if len(args) > 1:
+        try:
+            port = int(args[1])
+        except ValueError:
+            return ("端口无效: %s" % args[1], "err")
+    switch = bool(opts.get("switch"))
+    role = {}
+    try:
+        role = app.api.get("/cluster/my-role") or {}
+    except ApiError:
+        pass
+    is_master = (role.get("runtime_node_role") == "master"
+                 or role.get("is_provisional") or role.get("is_master"))
+    if is_master and not switch:
+        return ("本机当前为主节点：确认放弃主节点身份加入 %s:%s 请加 --switch" % (host, port), "warn")
+    r = app.api.post("/cluster/connect", {
+        "master_host": host, "master_port": port, "switch_to_client": switch})
+    return ("连接结果: %s %s" % (r.get("status", "ok"), r.get("message", "")), "ok")
+
+
+def cmd_dist(app, args, opts):
+    act = args[0].lower() if args else "status"
+    try:
+        cur = app.api.get("/cluster/config/distributed-inference") or {}
+    except ApiError as e:
+        return (str(e), "err")
+    enabled = bool(cur.get("enabled"))
+    if act == "status":
+        return ("分布式推理: %s" % ("开启" if enabled else "关闭"), "ok")
+    if act == "on":
+        target = True
+    elif act == "off":
+        target = False
+    elif act == "toggle":
+        target = not enabled
+    else:
+        return ("用法: /dist on|off|toggle|status", "err")
+    r = app.api.put("/cluster/config/distributed-inference", {"enabled": target})
+    return ("分布式推理已%s (%s)" % ("启用" if target else "停用", r.get("status", "ok")), "ok")
+
+
+def cmd_queue(app, args, opts):
+    sub = args[0].lower() if args else "status"
+    if sub == "status":
+        q = app.api.get("/cluster/queue") or {}
+        lines = ["策略: %s    状态: %s    执行中: %s    排队: %s/%s" % (
+            str(q.get("strategy", "—")).upper(),
+            "已暂停" if q.get("paused") else "接收中",
+            q.get("current_task") or "无",
+            q.get("queue_size", 0), q.get("max_size", "—"))]
+        lines.append("Q0交互: %s   Q1普通: %s   Q2批量: %s   已完成: %s" % (
+            q.get("q0_depth", 0), q.get("q1_depth", 0), q.get("q2_depth", 0),
+            q.get("completed_count", 0)))
+        rows = []
+        for level in ("q0", "q1", "q2"):
+            for t in (q.get(level) or []):
+                rows.append([
+                    t.get("task_id", ""), level.upper(),
+                    "%.0fs" % float(t.get("wait_seconds") or 0),
+                    t.get("max_new_tokens", "—"),
+                    "是" if t.get("is_aged") else "",
+                    (t.get("session_id") or "")[:12],
+                ])
+        lines.append("")
+        if rows:
+            lines.extend(make_table(["任务ID", "级别", "等待", "tokens", "老化", "会话"], rows,
+                                    max_width=shutil.get_terminal_size(fallback=(100, 30)).columns - 2))
+        else:
+            lines.append("（队列为空）")
+        app.show_output(lines, title="◆ 请求队列 (MLFQ)")
+        return ("队列: %s 个任务" % q.get("queue_size", 0), "ok")
+    if sub == "strategy":
+        s = args[1].lower() if len(args) > 1 else ""
+        if s not in ("fifo", "mlfq"):
+            return ("用法: /queue strategy <fifo|mlfq>", "err")
+        r = app.api.post("/cluster/queue/strategy", {"strategy": s})
+        return ("策略已切换为 %s" % r.get("strategy", s), "ok")
+    if sub == "pause":
+        app.api.post("/cluster/queue/pause")
+        return ("队列已暂停（不再接收新请求）", "ok")
+    if sub == "resume":
+        app.api.post("/cluster/queue/resume")
+        return ("队列已恢复", "ok")
+    if sub == "clear":
+        r = app.api.post("/cluster/queue/clear")
+        return ("已清空 %s 个排队任务" % r.get("cleared", 0), "ok")
+    if sub == "cancel":
+        if len(args) < 2:
+            return ("用法: /queue cancel <任务ID>", "err")
+        tid = urllib.parse.quote(args[1])
+        r = app.api.delete("/cluster/queue/task/%s" % tid)
+        return ("已取消任务 %s: %s" % (args[1], r.get("status", "ok")), "ok")
+    return ("用法: /queue [status|strategy|pause|resume|clear|cancel]", "err")
+
+
+def cmd_logs(app, args, opts):
+    scr = app.find_screen("日志")
+    if scr is None:
+        return ("日志屏幕不可用", "err")
+    if args:
+        try:
+            scr.tail_lines = max(10, min(500, int(args[0])))
+        except ValueError:
+            return ("行数无效: %s" % args[0], "err")
+    if not app.is_plain and opts.get("remote"):
+        scr.mode = "recent"
+    return (app.open_screen("日志"), "ok")
+
+
+def cmd_log(app, args, opts):
+    sub = args[0].lower() if args else ""
+    scr = app.find_screen("日志")
+    if sub == "filter":
+        level = args[1].upper() if len(args) > 1 else ""
+        if level and level not in ("ERROR", "WARNING", "INFO", "DEBUG"):
+            return ("级别无效: %s（ERROR/WARNING/INFO/DEBUG）" % level, "err")
+        if scr is not None:
+            scr.level_filter = level
+            scr.refresh(force=True)
+        return ("日志级别过滤: %s" % (level or "全部"), "ok")
+    if sub == "token":
+        token = args[1] if len(args) > 1 else ""
+        app.api.log_token = token.strip()
+        return ("日志 Token 已" + ("设置" if app.api.log_token else "清除"), "ok")
+    return ("用法: /log filter <级别> | /log token <令牌>", "err")
+
+
+def cmd_host(app, args, opts):
+    host = args[0]
+    port = getattr(app.api, "port", DEFAULT_PORT)
+    if len(args) > 1:
+        try:
+            port = int(args[1])
+        except ValueError:
+            return ("端口无效: %s" % args[1], "err")
+    app.api.host = host
+    app.api.port = port
+    app.reset_screens()
+    return ("后端地址已更新: %s" % app.api.base_url, "ok")
+
+
+def cmd_interval(app, args, opts):
+    try:
+        t = float(args[0])
+    except (TypeError, ValueError, IndexError):
+        return ("用法: /interval <秒>", "err")
+    app.interval = max(1.0, min(t, 60.0))
+    return ("自动刷新间隔: %.0f 秒" % app.interval, "ok")
+
+
+def cmd_timeout(app, args, opts):
+    try:
+        t = float(args[0])
+    except (TypeError, ValueError, IndexError):
+        return ("用法: /timeout <秒>", "err")
+    app.api.timeout = max(1.0, min(t, 120.0))
+    return ("请求超时: %.0f 秒" % app.api.timeout, "ok")
+
+
+def cmd_token(app, args, opts):
+    token = args[0] if args else ""
+    app.api.log_token = token.strip()
+    return ("日志 Token 已" + ("设置" if app.api.log_token else "清除"), "ok")
+
+
+def cmd_chat(app, args, opts):
+    sub = args[0].lower() if args else ""
+    if sub == "clear":
+        app.api.post("/chat/clear")
+        return ("对话历史已清空", "ok")
+    return ("用法: /chat clear", "err")
+
+
+def cmd_cancel(app, args, opts):
+    tid = args[0] if args else ""
+    if not tid:
+        return ("用法: /cancel <任务ID>", "err")
+    from urllib.parse import quote
+    try:
+        r = app.api.post("/chat/generations/%s/cancel" % quote(tid))
+        return ("已取消生成任务 %s" % tid, "ok")
+    except ApiError:
+        pass
+    try:
+        r = app.api.post("/workflows/%s/cancel" % quote(tid))
+        return ("已取消工作流 %s" % tid, "ok")
+    except ApiError as e:
+        return ("取消失败（生成与工作流均未找到）: %s" % e, "err")
+
+
+# ---- 注册表 ----
+
+COMMANDS = [
+    # (name, aliases, usage, summary, handler, min_args, max_args)
+    {"name": "/help", "aliases": ["/h"], "usage": "/help",
+     "summary": "显示命令集帮助", "handler": cmd_help},
+    {"name": "/quit", "aliases": ["/q", "/exit"], "usage": "/quit",
+     "summary": "退出 TUI（后端保持运行）", "handler": cmd_quit},
+    {"name": "/shutdown", "aliases": ["/halt"], "usage": "/shutdown [原因]",
+     "summary": "优雅退出：后端保存/清理资源后退出，随后 TUI 退出", "handler": cmd_shutdown},
+    {"name": "/status", "aliases": ["/st"], "usage": "/status",
+     "summary": "打开系统状态总览", "handler": cmd_status},
+    {"name": "/screen", "aliases": ["/goto"], "usage": "/screen <编号|名称>",
+     "summary": "跳转管理屏幕（1-7 或 名称关键字）", "handler": cmd_screen, "min_args": 1},
+    {"name": "/refresh", "aliases": ["/r"], "usage": "/refresh",
+     "summary": "立即刷新当前屏幕", "handler": cmd_refresh},
+    {"name": "/model", "aliases": [], "usage": "/model",
+     "summary": "当前模型详情", "handler": cmd_model},
+    {"name": "/models", "aliases": [], "usage": "/models",
+     "summary": "列出可用模型 / 量化 / 引擎", "handler": cmd_models},
+    {"name": "/switch", "aliases": [], "usage": "/switch <模型ID> [--quant 精度] [--engine 引擎] [--compile]",
+     "summary": "切换模型（失败自动回滚）", "handler": cmd_switch, "min_args": 1, "max_args": 1},
+    {"name": "/load", "aliases": [], "usage": "/load <模型ID> [--quant 精度] [--engine 引擎] [--compile]",
+     "summary": "加载模型（缺省模型ID 使用默认 Qwen）", "handler": cmd_load, "max_args": 1},
+    {"name": "/quant", "aliases": [], "usage": "/quant <int4|int8|fp16|gguf>",
+     "summary": "切换量化精度（重载当前模型）", "handler": cmd_quant, "min_args": 1, "max_args": 1},
+    {"name": "/engine", "aliases": [], "usage": "/engine <auto|llama_cpp|pytorch|island>",
+     "summary": "切换推理引擎（重载当前模型）", "handler": cmd_engine, "min_args": 1, "max_args": 1},
+    {"name": "/presets", "aliases": [], "usage": "/presets",
+     "summary": "预设问题与 Token/显存估算", "handler": cmd_presets},
+    {"name": "/gpu", "aliases": [], "usage": "/gpu [序号]",
+     "summary": "列出 GPU；带序号则切换推理 GPU", "handler": cmd_gpu, "max_args": 1},
+    {"name": "/device", "aliases": [], "usage": "/device <auto|profile>",
+     "summary": "设备自动配置 / 查看设备画像", "handler": cmd_device, "min_args": 1, "max_args": 1},
+    {"name": "/nodes", "aliases": [], "usage": "/nodes",
+     "summary": "节点列表与状态", "handler": cmd_nodes},
+    {"name": "/connect", "aliases": [], "usage": "/connect <IP> [端口] [--switch]",
+     "summary": "连接主节点（--switch 放弃本机主节点身份）", "handler": cmd_connect, "min_args": 1, "max_args": 2},
+    {"name": "/dist", "aliases": [], "usage": "/dist <on|off|toggle|status>",
+     "summary": "分布式推理开关", "handler": cmd_dist, "max_args": 1},
+    {"name": "/queue", "aliases": [], "usage": "/queue [status|strategy <fifo|mlfq>|pause|resume|clear|cancel <任务ID>]",
+     "summary": "请求队列状态与控制", "handler": cmd_queue},
+    {"name": "/logs", "aliases": [], "usage": "/logs [行数] [--remote]",
+     "summary": "打开日志查看（可指定行数）", "handler": cmd_logs, "max_args": 1},
+    {"name": "/log", "aliases": [], "usage": "/log <filter <级别>|token <令牌>>",
+     "summary": "日志级别过滤 / 设置日志 Token", "handler": cmd_log},
+    {"name": "/host", "aliases": [], "usage": "/host <主机> [端口]",
+     "summary": "切换后端地址", "handler": cmd_host, "min_args": 1, "max_args": 2},
+    {"name": "/interval", "aliases": [], "usage": "/interval <秒>",
+     "summary": "自动刷新间隔", "handler": cmd_interval, "min_args": 1, "max_args": 1},
+    {"name": "/timeout", "aliases": [], "usage": "/timeout <秒>",
+     "summary": "HTTP 请求超时", "handler": cmd_timeout, "min_args": 1, "max_args": 1},
+    {"name": "/token", "aliases": [], "usage": "/token <令牌>",
+     "summary": "设置日志访问 Token（留空清除）", "handler": cmd_token, "max_args": 1},
+    {"name": "/chat", "aliases": [], "usage": "/chat <clear>",
+     "summary": "清空对话历史", "handler": cmd_chat, "min_args": 1, "max_args": 1},
+    {"name": "/cancel", "aliases": [], "usage": "/cancel <任务ID>",
+     "summary": "取消生成 / 工作流任务", "handler": cmd_cancel, "min_args": 1, "max_args": 1},
+]
+
+
+def _build_command_help_lines() -> list:
+    """生成命令集帮助文本行（/help 与 --help 共用）。"""
+    lines = []
+    groups = [
+        ("系统", ["/help", "/status", "/screen", "/refresh", "/quit", "/shutdown"]),
+        ("模型 / 量化 / 引擎", ["/model", "/models", "/switch", "/load", "/quant", "/engine", "/presets"]),
+        ("设备", ["/gpu", "/device"]),
+        ("集群 / 队列", ["/nodes", "/connect", "/dist", "/queue"]),
+        ("日志", ["/logs", "/log"]),
+        ("设置", ["/host", "/interval", "/timeout", "/token"]),
+        ("会话", ["/chat", "/cancel"]),
+    ]
+    by_name = {c["name"]: c for c in COMMANDS}
+    for title, names in groups:
+        lines.append("── %s ──" % title)
+        for name in names:
+            c = by_name[name]
+            alias = ("  别名: %s" % " ".join(c["aliases"])) if c.get("aliases") else ""
+            lines.append("  %-58s %s%s" % (c["usage"], c["summary"], alias))
+        lines.append("")
+    return lines
+
+
+COMMAND_HELP_LINES = _build_command_help_lines()
+COMMAND_HELP_TEXT = (
+    "TUI 命令集：任意界面输入 / 开头命令后按 Enter 执行，ESC 取消。\n"
+    "模型切换 / 量化切换 / 引擎切换等操作无需进入菜单，直接输入命令即可。\n\n"
+    + "\n".join(COMMAND_HELP_LINES))
+
+
+# ============================================================
 # 七、应用主体（ANSI 交互模式）
 # ============================================================
 
@@ -1426,6 +2045,8 @@ class BaseApp:
         self.interval = interval
         self.is_plain = is_plain
         self.screens = [cls(self) for cls in SCREEN_CLASSES]
+        self.exit_requested = False     # True 时主循环退出
+        self.shutdown_backend = False   # 退出前是否已请求后端优雅关闭
 
     def reset_screens(self):
         """后端地址变化后清除各屏幕缓存数据。"""
@@ -1433,6 +2054,70 @@ class BaseApp:
             s.data = None
             s.error = None
             s.last_fetch = 0.0
+
+    # ---- 命令系统 ----
+    def find_screen(self, key: str):
+        """按编号（1-N）或名称关键字查找屏幕。"""
+        key = (key or "").strip()
+        if key.isdigit():
+            n = int(key)
+            if 1 <= n <= len(self.screens):
+                return self.screens[n - 1]
+            return None
+        low = key.lower()
+        for s in self.screens:
+            if low in s.name.lower():
+                return s
+        return None
+
+    def open_screen(self, key: str):
+        """打开屏幕：交互模式切换当前屏，纯文本模式打印内容。失败返回 None。"""
+        scr = self.find_screen(key)
+        if scr is None:
+            return None
+        scr.refresh(force=True)
+        if self.is_plain:
+            w = shutil.get_terminal_size(fallback=(100, 30)).columns
+            out = []
+            if scr.error:
+                out.append("[错误] %s" % scr.error)
+            else:
+                for style, text in _norm_lines(scr.lines(w)):
+                    prefix = "[错误] " if style == "err" else ("[注意] " if style == "warn" else "")
+                    out.append(prefix + text)
+            self.show_output(out, title="==== %s ====" % scr.name)
+            return "已打开: %s" % scr.name
+        self.current = scr
+        self.offset = 0
+        return "已打开: %s" % scr.name
+
+    def exec_command(self, line: str) -> tuple:
+        """解析并执行一条 / 命令，返回 (消息, 样式)。"""
+        text = (line or "").strip()
+        if not text.startswith("/"):
+            return ("命令必须以 / 开头（输入 /help 查看命令集）", "err")
+        parts = text[1:].split()
+        if not parts:
+            return ("输入 /help 查看命令集", "warn")
+        name = parts[0].lower()
+        args, opts = _split_cmd_args(parts[1:])
+        cmd = None
+        for c in COMMANDS:
+            if name == c["name"].lstrip("/") or name in (a.lstrip("/") for a in c.get("aliases", [])):
+                cmd = c
+                break
+        if cmd is None:
+            return ("未知命令: /%s（输入 /help 查看命令集）" % name, "err")
+        if len(args) < cmd.get("min_args", 0):
+            return ("参数不足。用法: %s" % cmd["usage"], "warn")
+        if cmd.get("max_args") is not None and len(args) > cmd["max_args"]:
+            return ("参数过多。用法: %s" % cmd["usage"], "warn")
+        return cmd["handler"](self, args, opts)
+
+    def show_output(self, lines: list, title: str = ""):
+        """大结果输出（子类实现：交互分页 / 纯文本直接打印）。"""
+        for ln in lines:
+            print(ln)
 
 
 class InteractiveApp(BaseApp):
@@ -1447,10 +2132,13 @@ class InteractiveApp(BaseApp):
         self.message = None
         self.message_style = "ok"
         self.message_at = 0.0
+        self.cmd_mode = False     # True=正在输入 / 命令
+        self.cmd_buf = ""
+        self.exit_message = None  # 退出时附加消息（如 q 优雅退出失败原因）
 
     # ---- 主循环 ----
     def run(self) -> int:
-        while True:
+        while not self.exit_requested:
             if self.current is not None:
                 self.current.refresh()
             self.render()
@@ -1462,11 +2150,55 @@ class InteractiveApp(BaseApp):
                 continue
             if key == "EOF":
                 return 0
-            if self.current is None:
+            if self.cmd_mode:
+                self._handle_cmd_key(key)
+            elif key == "/":
+                self.cmd_mode = True
+                self.cmd_buf = ""
+            elif self.current is None:
                 if not self.handle_menu_key(key):
                     return 0
             else:
                 self.handle_screen_key(key)
+        return 0
+
+    # ---- 命令输入 ----
+    def _handle_cmd_key(self, key):
+        if key == "ESC":
+            self.cmd_mode = False
+            self.cmd_buf = ""
+            return
+        if key == "ENTER":
+            line = "/" + self.cmd_buf
+            self.cmd_mode = False
+            self.cmd_buf = ""
+            self._run_command(line)
+            return
+        if key in ("\x08", "\x7f", "BACKSPACE"):
+            self.cmd_buf = self.cmd_buf[:-1]
+            return
+        if isinstance(key, str) and len(key) == 1:
+            self.cmd_buf += key
+
+    def _run_command(self, line: str):
+        self._say("正在执行: %s …" % line, "cmd")
+        self.render()
+        try:
+            msg, style = self.exec_command(line)
+        except ApiError as e:
+            msg, style = str(e), "err"
+        except (EOFError, KeyboardInterrupt):
+            msg, style = "命令已取消", "warn"
+        except Exception as e:
+            msg, style = "命令失败: %s" % e, "err"
+        if self.current is not None:
+            self.current.refresh(force=True)
+        if msg:
+            self._say(msg, style)
+        self.term.write("\x1b[2J")     # 命令输出可能弄脏屏幕，整屏重绘
+
+    def show_output(self, lines: list, title: str = ""):
+        self.term.show_lines(lines, title=title)
 
     # ---- 渲染 ----
     def render(self):
@@ -1495,8 +2227,10 @@ class InteractiveApp(BaseApp):
         while len(body) < body_h:
             body.append(("", ""))
         rows.extend(body[:body_h])
-        # 消息行
-        if self.message and time.monotonic() - self.message_at < 8:
+        # 消息行 / 命令输入行
+        if self.cmd_mode:
+            rows.append(("input", truncate_display("命令: /%s▌" % self.cmd_buf, w)))
+        elif self.message and time.monotonic() - self.message_at < 8:
             rows.append((self.message_style, truncate_display("» " + self.message, w)))
         else:
             rows.append(("", ""))
@@ -1512,7 +2246,7 @@ class InteractiveApp(BaseApp):
         self.term.write(frame)
 
     def _menu_lines(self):
-        lines = [("", ""), ("head", "  请选择管理功能（↑↓ 移动，Enter 进入，数字直达，q 退出）"), ("", "")]
+        lines = [("", ""), ("head", "  请选择管理功能（↑↓ 移动，Enter 进入，数字直达，q 优雅退出）"), ("", "")]
         for i, s in enumerate(self.screens):
             marker = "»" if i == self.menu_idx else " "
             text = "  %s %d. %s" % (marker, i + 1, s.name)
@@ -1522,17 +2256,33 @@ class InteractiveApp(BaseApp):
         return lines
 
     def _hints(self):
+        if self.cmd_mode:
+            return " 输入命令: Enter 执行   ESC 取消   Backspace 删除   按 /help 查看命令集"
         if self.current is None:
-            return " ↑/↓ 选择   Enter 进入   1-%d 直达   q 退出" % len(self.screens)
+            return " ↑/↓ 选择   Enter 进入   1-%d 直达   / 命令   q 优雅退出   Esc 仅退出界面" % len(self.screens)
         acts = self.current.actions()
-        parts = ["Esc 返回", "r 刷新", "↑/↓ 滚动"]
+        parts = ["Esc 返回", "r 刷新", "↑/↓ 滚动", "/ 命令"]
         parts.extend("%s %s" % (k, label) for k, label, _ in acts)
         return " " + "   ".join(parts)
 
     # ---- 按键 ----
     def handle_menu_key(self, key) -> bool:
-        if key in ("q", "Q", "ESC"):
+        if key in ("q", "Q"):
+            # 优雅退出：等同 /shutdown（请求后端保存/清理资源后退出），
+            # 与 /quit 的“仅退出 TUI、后端保持运行”语义区分。
+            try:
+                msg, style = self.exec_command("/shutdown")
+            except ApiError as e:
+                msg, style = str(e), "err"
+            except Exception as e:
+                msg, style = "命令失败: %s" % e, "err"
+            if style == "err":
+                # 关闭请求失败：仍退出 TUI（后端保持），并把原因带给 main() 输出
+                self.exit_message = msg
+                self.exit_requested = True   # 名义不变量：q 后 TUI 必然退出
             return False
+        if key == "ESC":
+            return False   # 仅退出界面，后端保持运行（/quit 同义）
         if key == "UP":
             self.menu_idx = (self.menu_idx - 1) % len(self.screens)
         elif key == "DOWN":
@@ -1620,6 +2370,7 @@ class PlainApp(BaseApp):
         print("=" * 64)
         print(APP_TITLE + "  v" + TUI_VERSION + "  (纯文本模式)")
         print("后端: " + self.api.base_url)
+        print("输入 / 开头的命令（如 /help /quant int4）可直接操作")
         print("=" * 64)
         try:
             while True:
@@ -1627,19 +2378,49 @@ class PlainApp(BaseApp):
                     break
         except (EOFError, KeyboardInterrupt):
             print()
+        if self.shutdown_backend:
+            print("后端已请求优雅退出，本进程即将结束。")
         print("再见！")
         return 0
+
+    def show_output(self, lines: list, title: str = ""):
+        if title:
+            print(title)
+        for ln in lines:
+            print(ln)
 
     def _main_menu(self) -> bool:
         print()
         print("---- 主菜单 ----")
         for i, s in enumerate(self.screens):
             print("  %d. %s" % (i + 1, s.name))
-        print("  q. 退出")
+        print("  q. 优雅退出（关闭后端）")
         choice = input("选择> ").strip().lower()
         if choice in ("q", "0", "exit", "quit"):
+            # 优雅退出：等同 /shutdown；请求失败则仅退出 TUI（后端保持）
+            if not self.exit_requested:
+                try:
+                    msg, style = self.exec_command("/shutdown")
+                except ApiError as e:
+                    msg, style = str(e), "err"
+                except Exception as e:
+                    msg, style = "命令失败: %s" % e, "err"
+                if style == "err":
+                    print("[错误] " + msg)
             return False
         if not choice:
+            return True
+        if choice.startswith("/"):
+            try:
+                msg, style = self.exec_command(choice)
+            except ApiError as e:
+                msg, style = str(e), "err"
+            except Exception as e:
+                msg, style = "命令失败: %s" % e, "err"
+            if msg:
+                print(("[错误] " if style == "err" else "» ") + msg)
+            if self.exit_requested:
+                return False
             return True
         if choice.isdigit() and 1 <= int(choice) <= len(self.screens):
             self._screen_loop(self.screens[int(choice) - 1])
@@ -1665,13 +2446,35 @@ class PlainApp(BaseApp):
                     print(prefix + text)
             acts = scr.actions()
             print()
-            parts = ["r=刷新"] + ["%s=%s" % (k, label) for k, label, _ in acts] + ["回车/b=返回", "q=退出"]
+            parts = ["r=刷新"] + ["%s=%s" % (k, label) for k, label, _ in acts] + ["回车/b=返回", "q=优雅退出"]
             print("操作: " + "  ".join(parts))
             choice = input("> ").strip()
             if choice in ("", "b", "B", "0"):
                 return
             if choice in ("q", "Q"):
+                # 优雅退出后离开整个 TUI（等同 /shutdown）
+                try:
+                    msg, style = self.exec_command("/shutdown")
+                except ApiError as e:
+                    print("[错误] %s" % e)
+                except Exception as e:
+                    print("[错误] 命令失败: %s" % e)
+                else:
+                    if msg:
+                        print(("» " if style != "err" else "[错误] ") + msg)
                 raise EOFError
+            if choice.startswith("/"):
+                try:
+                    msg, style = self.exec_command(choice)
+                except ApiError as e:
+                    msg, style = str(e), "err"
+                except Exception as e:
+                    msg, style = "命令失败: %s" % e, "err"
+                if msg:
+                    print(("[错误] " if style == "err" else "» ") + msg)
+                if self.exit_requested:
+                    raise EOFError
+                continue
             if choice in ("r", "R") and not any(k == choice for k, _, _ in acts):
                 continue
             matched = False
@@ -1699,9 +2502,12 @@ class PlainApp(BaseApp):
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="tui_admin.py",
-        description="QLH 分布式边缘推理 TUI 管理菜单（跨平台终端版后台管理，纯标准库实现）",
-        epilog="示例: python src/tui_admin.py --host 100.64.0.8 --port 8000",
+        prog="bjtu",
+        description="QLH 分布式边缘推理 TUI 管理菜单（跨平台终端版后台管理，纯标准库实现）\n"
+                    "任意界面输入 / 开头命令即可操作：模型/量化/引擎切换、GPU 选择、\n"
+                    "分布式开关、队列控制、日志、优雅退出等，无需进入菜单。",
+        epilog=COMMAND_HELP_TEXT,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--host", default=DEFAULT_HOST,
                    help="后端 API 主机（默认 %s，可填 Tailscale IP）" % DEFAULT_HOST)
@@ -1718,7 +2524,70 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-color", action="store_true", help="关闭彩色输出")
     p.add_argument("--version", action="version",
                    version="qlh-tui-admin %s" % TUI_VERSION)
+    p.add_argument("command", nargs="?", default=None, metavar="命令",
+                   help="直接执行一条 TUI 命令后退出（如 shutdown、status、/switch qwen-1.8b），"
+                        "不进入交互界面；后端未运行时仅报错退出、不会自动启动后端")
     return p
+
+
+def _force_utf8_stdout():
+    """stdout/stderr 强制 UTF-8 编码。
+
+    Windows 管道/重定向下 Python 默认用 GBK（locale），»、emoji 等字符
+    会抛 UnicodeEncodeError；交互终端场景 reconfigure 无害（chcp 65001
+    时显示正确）。所有可能打印 »/emoji 的路径（单命令、--plain、降级）
+    都应先调用本函数。
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def run_single_command(api: ApiClient, interval: float, command: str) -> int:
+    """单命令模式：直接执行一条 TUI 命令后退出（bjtu shutdown / bjtu status …）。
+
+    与交互模式不同：单命令模式只负责“处理”、不负责“启动”——
+    后端未运行时直接报错退出，避免像交互模式那样先拉起后端再做处理。
+    """
+    text = (command or "").strip()
+    if not text.startswith("/"):
+        text = "/" + text
+    _force_utf8_stdout()
+    # 后端必须已在运行
+    try:
+        api.get("/health")
+    except ApiError as e:
+        print("后端未在运行（%s）。" % api.base_url)
+        print("  单命令模式不自动启动后端，请先运行 bjtu（交互模式）启动后端后再执行。")
+        print("  详情: %s" % e)
+        return 1
+    app = BaseApp(api, interval, is_plain=True)
+    try:
+        msg, style = app.exec_command(text)
+    except ApiError as e:
+        print("[错误] %s" % e)
+        return 1
+    except Exception as e:
+        print("[错误] 命令失败: %s" % e)
+        return 1
+    if msg:
+        print(("[错误] " if style == "err" else "» ") + msg)
+    # 退出码是自动化调用的唯一信号：err（未知命令/失败）与 warn（参数不足/过多）
+    # 都表示命令未成功执行，应非零退出；仅 ok 返回 0。
+    return 0 if style not in ("err", "warn") else 1
+
+
+def _is_single_command(argv: list, command) -> bool:
+    """单命令模式判定：命令必须是第一个非选项参数。
+
+    与 start_tui.bat / start_tui.sh 的判定对齐——选项在前
+    （bjtu --port 9000 shutdown）一律按交互模式处理，避免
+    "启动脚本启动后端、python 又执行单命令"的语义分裂。
+    """
+    first_non_option = next((a for a in argv if not a.startswith("-")), None)
+    return bool(command) and first_non_option == command
 
 
 def main(argv=None) -> int:
@@ -1727,16 +2596,31 @@ def main(argv=None) -> int:
                     timeout=max(1.0, args.timeout), log_token=args.log_token)
     interval = max(1.0, args.interval)
 
+    # 单命令模式：直接执行一条命令后退出（不启动后端、不进入交互界面）
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if _is_single_command(argv_list, args.command):
+        return run_single_command(api, interval, args.command)
+
     if not args.plain:
         term = AnsiTerm(color=not args.no_color)
         try:
             with term:
-                return InteractiveApp(api, interval, term).run()
+                app = InteractiveApp(api, interval, term)
+                rc = app.run()
+                if app.shutdown_backend:
+                    print("后端已优雅退出，所有资源已清理。")
+                else:
+                    if app.exit_message:
+                        print(app.exit_message)
+                    print("TUI 已退出（后端保持运行，随时可重新运行 bjtu 进入）。")
+                return rc
         except TermNotCapable as e:
+            _force_utf8_stdout()          # 降级纯文本模式：管道/重定向下防 GBK 崩溃
             print("[提示] 交互模式不可用（%s），自动切换纯文本模式。" % e)
         except KeyboardInterrupt:
             return 0
 
+    _force_utf8_stdout()                  # --plain 管道/重定向下防 »/emoji GBK 崩溃
     try:
         return PlainApp(api, interval).run()
     except (EOFError, KeyboardInterrupt):

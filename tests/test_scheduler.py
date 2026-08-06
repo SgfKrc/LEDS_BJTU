@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
+# 加载 api_server 以执行 model_host.attach(...)（阶段 0.2：scheduler 回调挂载）
+import api_server  # noqa: F401,E402
+import node_runtime as node_runtime_mod
 from scheduler import Scheduler, PipelineQueue, NodeInfo, NodeState, NodeRole
 
 
@@ -204,14 +207,14 @@ class TestComputeLayerAssignment:
         assert result[0]["has_lm_head"] is True
 
     def test_active_deepseek_layer_count_replaces_fixed_qwen_count(self, sched, monkeypatch):
-        import api_server as _api
+        from model_host import model_host as _host
 
         manager = type("DeepSeekManager", (), {
             "_total_model_layers": 28,
             "model": None,
             "_model_path": "",
         })()
-        monkeypatch.setattr(_api, "model_manager", manager)
+        monkeypatch.setattr(_host, "_manager", manager)
         nodes = [{
             "node_id": "master",
             "role": "master",
@@ -1004,7 +1007,7 @@ class TestVRAMConstraint:
 
     def test_qwen2_split_memory_uses_fp16_even_when_int4_requested(
             self, sched, monkeypatch):
-        import api_server as _api
+        from model_host import model_host as _host
 
         config = type("Qwen2Config", (), {
             "model_type": "qwen2",
@@ -1018,7 +1021,7 @@ class TestVRAMConstraint:
             "model": type("Model", (), {"config": config})(),
             "quant_type": "int4",
         })()
-        monkeypatch.setattr(_api, "model_manager", manager)
+        monkeypatch.setattr(_host, "_manager", manager)
 
         layer_mb, embedding_mb, lm_head_mb = sched._get_layer_memory_estimate_mb(
             node_id="gpu_node",
@@ -1045,7 +1048,7 @@ class TestVRAMConstraint:
 
     def test_original_qwen_cpu_split_memory_uses_fp32_baseline(
             self, sched, monkeypatch):
-        import api_server as _api
+        from model_host import model_host as _host
 
         manager = type("Manager", (), {
             "model": type("Model", (), {
@@ -1053,7 +1056,7 @@ class TestVRAMConstraint:
             })(),
             "quant_type": "int4",
         })()
-        monkeypatch.setattr(_api, "model_manager", manager)
+        monkeypatch.setattr(_host, "_manager", manager)
 
         estimate = sched._get_layer_memory_estimate_mb(
             node_id="cpu_node",
@@ -1240,7 +1243,7 @@ class TestPipelineReadiness:
 
     def test_pipeline_status_requires_layer_ready_ack(self, sched, monkeypatch):
         """管理状态不能把仅 TCP 在线但仍在同步模型的 worker 标为 active。"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         sched._role_override = "master"
         sched.nodes["client1"] = NodeInfo(
@@ -1251,7 +1254,7 @@ class TestPipelineReadiness:
             "_running": True,
             "clients": {"client1": object()},
         })()
-        monkeypatch.setattr(_api, "model_manager", type("Mgr", (), {
+        monkeypatch.setattr(_host, "_manager", type("Mgr", (), {
             "is_loaded": True, "_engine_type": "pytorch",
         })())
         monkeypatch.setattr(sched, "get_layer_assignments", lambda: {
@@ -1466,7 +1469,7 @@ class TestPipelineMessageDispatch:
 
     def test_direct_layer_config_loads_range_and_sends_ack(self, sched, monkeypatch):
         """真实线上单 assignment 载荷应加载层范围并回传 ready ACK。"""
-        import api_server as _api
+        from model_host import model_host as _host
         from tcp_comm import MessageType, TCPClient
 
         class MockModelManager:
@@ -1490,8 +1493,8 @@ class TestPipelineMessageDispatch:
         monkeypatch.setattr(
             TCPClient, "_compute_local_model_sha256", lambda **kwargs: "sha-qwen",
         )
-        monkeypatch.setattr(_api, "model_manager", MockModelManager())
-        monkeypatch.setattr(_api, "model_loaded", False)
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(_host, "model_loaded", False)
 
         sched._handle_layer_config("master", {
             "node_id": "client1",
@@ -1513,8 +1516,8 @@ class TestPipelineMessageDispatch:
         assert payload["config_id"] == "cfg-1"
         assert payload["layer_range"] == [8, 16]
         assert payload["model_sha256"] == "sha-qwen"
-        assert _api.model_loaded is True
-        assert _api.current_quant == "fp16"
+        assert _host.model_loaded is True
+        assert _host.current_quant == "fp16"
         assert sched._active_layer_config == {
             "node_id": "client1",
             "config_id": "cfg-1",
@@ -1527,7 +1530,7 @@ class TestPipelineMessageDispatch:
 
     def test_deepseek_assignment_syncs_selected_model_before_loading(self, sched, monkeypatch):
         """缺少 DeepSeek 时应先同步指定模型，再按真实层数加载。"""
-        import api_server as _api
+        from model_host import model_host as _host
         import model_sync
         from tcp_comm import TCPClient
 
@@ -1574,8 +1577,8 @@ class TestPipelineMessageDispatch:
                 or "C:/models/deepseek"
             ),
         )
-        monkeypatch.setattr(_api, "model_manager", MockModelManager())
-        monkeypatch.setattr(_api, "model_loaded", False)
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(_host, "model_loaded", False)
 
         sched._handle_layer_config("master", {
             "node_id": "client1",
@@ -1662,7 +1665,7 @@ class TestPipelineMessageDispatch:
 
     def test_layer_config_model_mismatch_sends_error_ack(self, sched, monkeypatch):
         """从节点权重摘要不一致时不得加载，并应返回 error ACK。"""
-        import api_server as _api
+        from model_host import model_host as _host
         import model_sync
         from tcp_comm import TCPClient
 
@@ -1686,7 +1689,7 @@ class TestPipelineMessageDispatch:
             "ensure_model_available",
             lambda *args, **kwargs: "C:/models/qwen-test",
         )
-        monkeypatch.setattr(_api, "model_manager", manager)
+        monkeypatch.setattr(_host, "_manager", manager)
 
         sched._handle_layer_config("master", {
             "node_id": "client1",
@@ -1706,7 +1709,7 @@ class TestPipelineMessageDispatch:
     def test_failed_new_layer_config_invalidates_old_ready_state(
             self, sched, monkeypatch):
         """新模型配置失败后不得继续宣称旧 Qwen 分层就绪。"""
-        import api_server as _api
+        from model_host import model_host as _host
         from tcp_comm import TCPClient
 
         sent = []
@@ -1729,8 +1732,8 @@ class TestPipelineMessageDispatch:
         monkeypatch.setattr(
             TCPClient, "_compute_local_model_sha256", lambda **kwargs: "sha-deepseek",
         )
-        monkeypatch.setattr(_api, "model_manager", manager)
-        monkeypatch.setattr(_api, "model_loaded", True)
+        monkeypatch.setattr(_host, "_manager", manager)
+        monkeypatch.setattr(_host, "model_loaded", True)
 
         sched._handle_layer_config("master", {
             "node_id": "client1",
@@ -1747,7 +1750,7 @@ class TestPipelineMessageDispatch:
         assert sched._active_layer_config is None
         assert sched._last_layer_config_ack_payload is None
         assert sched._local_pipeline_steps == {}
-        assert _api.model_loaded is False
+        assert _host.model_loaded is False
 
     def test_layer_config_ack_marks_ready_only_for_current_version(self, sched):
         """只有当前 config_id、模型和层范围完全匹配的 ACK 才能置 ready。"""
@@ -1921,13 +1924,13 @@ class TestPipelineFallback:
 
     def test_fallback_waits_for_inference_lock(self, sched, monkeypatch):
         """流水线未就绪回退时也必须等待推理锁，避免并发完整模型推理。"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         class MockModelManager:
             is_loaded = True
             _engine_type = "pytorch"
 
-        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
         monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: False)
 
         entered = threading.Event()
@@ -1962,13 +1965,13 @@ class TestPipelineFallback:
 
     def test_run_pipeline_safe_fallbacks_when_pipeline_returns_error(self, sched, monkeypatch):
         """流水线单步返回 error 时，当前请求应自动回退到全模型推理。"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         class MockModelManager:
             is_loaded = True
             _engine_type = "pytorch"
 
-        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
         monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
         monkeypatch.setattr(
             sched,
@@ -1996,13 +1999,13 @@ class TestPipelineFallback:
     def test_run_pipeline_safe_does_not_replay_after_stream_output(
             self, sched, monkeypatch):
         """已发送部分正文后失败时不能从头执行全模型并重复回答。"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         class MockModelManager:
             is_loaded = True
             _engine_type = "pytorch"
 
-        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
         monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
 
         def failed_pipeline(prompt="", **kwargs):
@@ -2111,9 +2114,9 @@ class TestKVCacheManagement:
 
     def test_fallback_inference_returns_error_without_model(self, sched, monkeypatch):
         """无模型时 _run_full_model_inference 返回 error"""
-        import api_server as _api
+        from model_host import model_host as _host
 
-        monkeypatch.setattr(_api, "model_manager", None)
+        monkeypatch.setattr(_host, "_manager", None)
         result = sched._run_full_model_inference("测试")
         assert isinstance(result, dict)
         assert "error" in result
@@ -2862,7 +2865,7 @@ class TestChainTopology:
 
     def test_layer_forward_with_chain_next_forwards_and_sends_ack(self, sched, monkeypatch):
         """_handle_layer_forward 有 chain_next 时应直连转发并发送 sent ACK。"""
-        import api_server as _api
+        from model_host import model_host as _host
         import torch
 
         forward_calls = []
@@ -2898,7 +2901,7 @@ class TestChainTopology:
         sched._send_chain_forward = mock_forward
         sched._send_layer_result = mock_send_result
         sched._send_chain_forward_ack = lambda **kwargs: ack_calls.append(kwargs) or True
-        monkeypatch.setattr(_api, "model_manager", MockModelManager())
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
         monkeypatch.setattr(sched, "_record_local_pipeline_participation", lambda *a, **kw: True)
         sched._active_layer_config = {
             "config_id": "cfg-forward",
@@ -2940,7 +2943,7 @@ class TestChainTopology:
     def test_qwen_layer_forward_uses_original_cache_layout(
             self, sched, monkeypatch):
         """Qwen-1.8B KV 为 (batch, seq, heads, dim)，不得按 Qwen2 解析。"""
-        import api_server as _api
+        from model_host import model_host as _host
         import torch
 
         class QwenManager:
@@ -2962,7 +2965,7 @@ class TestChainTopology:
                 }
 
         results = []
-        monkeypatch.setattr(_api, "model_manager", QwenManager())
+        monkeypatch.setattr(_host, "_manager", QwenManager())
         monkeypatch.setattr(
             sched,
             "_send_layer_result",
@@ -2998,7 +3001,7 @@ class TestChainTopology:
 
     def test_layer_forward_rejects_stale_config_and_missing_decode_cache(
             self, sched, monkeypatch):
-        import api_server as _api
+        from model_host import model_host as _host
 
         errors = []
         manager = type("Manager", (), {
@@ -3010,7 +3013,7 @@ class TestChainTopology:
                 "config": type("Config", (), {"model_type": "qwen2"})(),
             })(),
         })()
-        monkeypatch.setattr(_api, "model_manager", manager)
+        monkeypatch.setattr(_host, "_manager", manager)
         monkeypatch.setattr(
             sched,
             "_send_layer_result",
@@ -3609,6 +3612,7 @@ class TestRuntimeSafeLayerAssignmentAndAccounting:
         }
         sched._effective_role = lambda: "master"
         sched._push_node_update_to_all_clients = lambda *args, **kwargs: None
+        sched.get_effective_node_id = lambda: 'master'
 
         accounting = sched._record_pipeline_task_accounting(
             "task-1",
@@ -4316,7 +4320,7 @@ class TestPipelineOrchestrationIntegration:
 
     def test_fallback_calls_ensure_full_model(self, sched_master, monkeypatch):
         """流水线裁剪后回退本地推理 → 必须确保模型为完整模型"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         ensure_calls = []
         chat_calls = []
@@ -4344,7 +4348,7 @@ class TestPipelineOrchestrationIntegration:
                 yield " reply"
 
         mock_mgr = MockModelManager()
-        monkeypatch.setattr(_api, "model_manager", mock_mgr)
+        monkeypatch.setattr(_host, "_manager", mock_mgr)
 
         result = sched_master._run_full_model_inference(
             "test prompt", max_new_tokens=32,
@@ -4364,7 +4368,7 @@ class TestPipelineOrchestrationIntegration:
 
     def test_run_pipeline_master_loads_local_layer_range(self, sched_with_workers, monkeypatch):
         """run_pipeline 应在 master_participates 时调用 load_layer_range"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         layer_loads = []
         forward_calls = []
@@ -4414,7 +4418,7 @@ class TestPipelineOrchestrationIntegration:
                 return "mock response"
 
         mock_mgr.tokenizer = MockTokenizer()
-        monkeypatch.setattr(_api, "model_manager", mock_mgr)
+        monkeypatch.setattr(_host, "_manager", mock_mgr)
 
         # 也需要 mock _send_to_worker 和 _wait_for_layer_result
         send_calls = []
@@ -4465,7 +4469,7 @@ class TestPipelineOrchestrationIntegration:
 
     def test_run_pipeline_builds_native_prompt_from_history(
             self, sched_with_workers, monkeypatch):
-        import api_server as _api
+        from model_host import model_host as _host
         import torch
         from tcp_comm import serialize_tensor_fast
 
@@ -4516,7 +4520,7 @@ class TestPipelineOrchestrationIntegration:
             def _get_generation_eos_token_ids(self, _stops):
                 return 2
 
-        monkeypatch.setattr(_api, "model_manager", Manager())
+        monkeypatch.setattr(_host, "_manager", Manager())
         monkeypatch.setattr(sched_with_workers, "_send_to_worker", lambda *a, **kw: None)
         hidden = serialize_tensor_fast(torch.randn(1, 2, 8))
         monkeypatch.setattr(
@@ -4542,7 +4546,7 @@ class TestPipelineOrchestrationIntegration:
 
     def test_run_pipeline_safe_immediate_path_locks(self, sched_with_workers, monkeypatch):
         """立即执行路径应正确管理 inference_lock（不产生死锁或泄漏）"""
-        import api_server as _api
+        from model_host import model_host as _host
 
         class MockModelManager:
             is_loaded = True
@@ -4581,7 +4585,7 @@ class TestPipelineOrchestrationIntegration:
                 return "mock"
 
         mock_mgr.tokenizer = MockTokenizer()
-        monkeypatch.setattr(_api, "model_manager", mock_mgr)
+        monkeypatch.setattr(_host, "_manager", mock_mgr)
         monkeypatch.setattr(sched_with_workers, "_send_to_worker",
                            lambda wid, data, mtype: None)
 
@@ -4595,7 +4599,7 @@ class TestPipelineOrchestrationIntegration:
                                "logits": fake_logits_raw,
                            })
 
-        result = sched_with_workers.run_pipeline_safe("test")
+        result = sched_with_workers.run_pipeline_safe("test", max_new_tokens=1)
         # 验证锁已正常释放（不是死锁）
         assert not sched_with_workers._inference_lock.locked(), \
             "推理锁应在 run_pipeline_safe 返回后释放"
@@ -5223,6 +5227,8 @@ class TestConnectToMasterBootstrapRecovery:
         monkeypatch.setattr(cfg, "CLUSTER_SECRET", "stale-secret", raising=False)
         monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client", raising=False)
         monkeypatch.setattr(scheduler_mod, "NODE_ID", "client-old", raising=False)
+        monkeypatch.setattr(node_runtime_mod.node_runtime, "_node_id", "client-old", raising=False)
+        monkeypatch.setattr(node_runtime_mod.node_runtime, "_node_role", "client", raising=False)
         monkeypatch.setenv("QLH_API_PORT", "8001")
         monkeypatch.delenv("QLH_BOOTSTRAP_API_PORT", raising=False)
         monkeypatch.delenv("QLH_MASTER_API_PORT", raising=False)
@@ -5282,7 +5288,8 @@ class TestConnectToMasterBootstrapRecovery:
         assert result["node_id"] == "client-new"
         assert FakeTCPClient.attempts == 2
         assert first_connect_calls == [("100.64.0.10", 8000, "client-old", "pc")]
-        assert cfg.NODE_ID == "client-new"
+        # 阶段 0.3：运行时身份写入 node_runtime（cfg 不再被写回）
+        assert node_runtime_mod.node_runtime.get_node_id() == "client-new"
         assert scheduler_mod.NODE_ID == "client-new"
 
     def test_existing_registered_connection_is_reused(self):
@@ -5381,6 +5388,8 @@ class TestConnectToMasterBootstrapRecovery:
         monkeypatch.setattr(cfg, "CLUSTER_SECRET", "shared-secret", raising=False)
         monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "client", raising=False)
         monkeypatch.setattr(scheduler_mod, "NODE_ID", "client-race", raising=False)
+        monkeypatch.setattr(node_runtime_mod.node_runtime, "_node_id", "client-race", raising=False)
+        monkeypatch.setattr(node_runtime_mod.node_runtime, "_node_role", "client", raising=False)
 
         observed = []
 

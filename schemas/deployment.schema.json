@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://qlh.dev/schemas/deployment.schema.json",
+  "title": "QLH 节点部署记录（M0 冻结，2026-08-06）",
+  "description": "单节点部署状态。partial/failed 不得伪报该节点参与；激活失败走 alias epoch 回滚。",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "deployment_id",
+    "artifact_id",
+    "node_id",
+    "status",
+    "epoch"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "deployment_id": { "type": "string", "minLength": 1 },
+    "artifact_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "node_id": { "type": "string", "minLength": 1 },
+    "status": {
+      "enum": [
+        "planned",
+        "preparing",
+        "distributing",
+        "ready",
+        "active",
+        "failed",
+        "partial",
+        "rolled_back"
+      ]
+    },
+    "epoch": { "type": "integer", "minimum": 0 },
+    "digest_verified": { "type": "boolean" },
+    "prepared_at": { "type": ["string", "null"], "format": "date-time" },
+    "activated_at": { "type": ["string", "null"], "format": "date-time" },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

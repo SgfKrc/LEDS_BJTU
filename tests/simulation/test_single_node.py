@@ -141,7 +141,7 @@ async def test_single_node_inference(
 
             # 检查集群状态
             status = await sender.get_cluster_status()
-            mode = status.get("mode", "unknown")
+            mode = status.get("run_mode", status.get("mode", "unknown"))
             slave_count = status.get("slave_count", 0)
 
             print(f"[OK] 运行模式: {mode}")

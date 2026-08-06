@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "artifact_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source": {
+    "provider": "huggingface",
+    "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+    "requested_revision": "main",
+    "resolved_revision": "9f5e8a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+  },
+  "format": "safetensors",
+  "engine": "pytorch_transformers",
+  "family": "qwen2",
+  "quantization": null,
+  "context_length": 32768,
+  "chat_template": "chatml",
+  "files": [
+    {"path": "config.json", "size": 1024, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+    {"path": "model-00001-of-00002.safetensors", "size": 4096, "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
+  ],
+  "capabilities": {
+    "full_worker": true,
+    "pytorch_layer_pipeline": false,
+    "llama_cpp": false,
+    "task_stage": true
+  },
+  "requirements": {
+    "min_ram_bytes": 8589934592,
+    "min_vram_bytes": 0,
+    "disk_bytes": 17179869184,
+    "runtime_profile": "llm-cuda-v1"
+  },
+  "license": {
+    "id": "apache-2.0",
+    "acceptance_required": false
+  },
+  "trust_policy": {
+    "trust_remote_code": false
+  }
+}

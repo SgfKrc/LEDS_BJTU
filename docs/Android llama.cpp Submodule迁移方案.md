@@ -1,8 +1,8 @@
 # Android llama.cpp Submodule 迁移方案
 
-> 日期：2026-07-14
+> 更新日期：2026-07-14
 > 状态：方案已确定，等待空闲维护窗口实施
-> 范围：`android/app/src/main/cpp/llama.cpp/` 及 Android Full 原生构建链
+> 适用范围：`android/app/src/main/cpp/llama.cpp/` 及 Android Full 原生构建链
 > 不包含：本次仅形成文档，不修改 Git 索引、CMake、Gradle、CI 或打包脚本
 
 ## 1. 背景

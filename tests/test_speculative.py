@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from model_host import model_host
 
 import speculative as spec
 from external_provider import ExternalScopeDeniedError
@@ -645,11 +646,14 @@ class MockVerifyHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         behavior = self.server.behavior
@@ -1147,8 +1151,8 @@ def api_env(monkeypatch, tmp_path):
         mock_sched.get_distributed_inference_enabled.return_value = False
         mock_sched.has_pipeline_worker_reservation.return_value = False
         mock_sched._max_nodes = 3
-        monkeypatch.setattr(api_server, "model_loaded", False)
-        monkeypatch.setattr(api_server, "_db_available", False)
+        monkeypatch.setattr(model_host, "model_loaded", False)
+        monkeypatch.setattr(model_host, "_db_available", False)
         monkeypatch.setattr(api_server, "_local_store", MagicMock())
         monkeypatch.setattr(
             config, "GGUF_MODEL_PATH", str(tmp_path / "no-model.gguf"),

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "event": "progress",
+  "job_id": "pull_001",
+  "phase": "downloading",
+  "at": "2026-08-06T12:05:30Z",
+  "resolved_revision": "9f5e8a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8",
+  "total_bytes": 17179869184,
+  "downloaded_bytes": 4294967296,
+  "files_total": 8,
+  "files_done": 3,
+  "current_file": "model-00004-of-00008.safetensors",
+  "disk_required_bytes": 17179869184,
+  "error": null
+}

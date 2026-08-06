@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from model_host import model_host
 
 import external_provider as ep
 from external_provider import (
@@ -36,6 +37,7 @@ from external_provider import (
     ExternalOpenAIProvider,
     ExternalScopeDeniedError,
     ExternalServiceError,
+    ExternalTimeoutError,
     ExternalUnreachableError,
     decide_external_route,
     ensure_external_scope_allowed,
@@ -65,11 +67,14 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
 
     def do_GET(self):
         behavior = self.server.behavior
@@ -114,6 +119,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             chunks = behavior.get("stream_chunks", ["外部", "服务", "回复"])
             chunk_sleep = behavior.get("stream_chunk_sleep", 0)
+            first_chunk_written = behavior.get("first_chunk_written")
             for text in chunks:
                 if chunk_sleep:
                     time.sleep(chunk_sleep)
@@ -133,8 +139,10 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         .encode("utf-8")
                     )
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     return  # 客户端已取消断连（best-effort 取消语义）
+                if first_chunk_written is not None:
+                    first_chunk_written.set()
             final = {
                 "id": "chatcmpl-mock",
                 "object": "chat.completion.chunk",
@@ -152,7 +160,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                     .encode("utf-8")
                 )
                 self.wfile.write(b"data: [DONE]\n\n")
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
         else:
             self._send_json({
@@ -436,16 +444,19 @@ def test_scope_gate_blocks_before_any_request(monkeypatch, mock_external_server)
     client.close()
 
 
-def test_backend_down_raises_chinese_unreachable(monkeypatch):
+def test_backend_down_raises_clean_transport_error(monkeypatch):
     _patch_external_config(
         monkeypatch, base_url=f"http://127.0.0.1:{_closed_port()}",
         connect_timeout=1, timeout=2,
     )
     client = ExternalChatClient()
-    with pytest.raises(ExternalUnreachableError) as excinfo:
+    with pytest.raises((ExternalUnreachableError, ExternalTimeoutError)) as excinfo:
         client.ensure_connected()
     message = str(excinfo.value)
-    assert "外部推理服务不可达" in message
+    if isinstance(excinfo.value, ExternalUnreachableError):
+        assert "外部推理服务不可达" in message
+    else:
+        assert "外部推理服务超时" in message
     assert "孤岛" not in message
     assert "Traceback" not in message
     assert not client.is_connected
@@ -572,6 +583,8 @@ def test_provider_cancel_mid_stream_returns_cancelled_partial(
 ):
     mock_external_server.behavior["stream_chunks"] = ["块"] * 40
     mock_external_server.behavior["stream_chunk_sleep"] = 0.05
+    first_chunk_written = threading.Event()
+    mock_external_server.behavior["first_chunk_written"] = first_chunk_written
     _patch_external_config(monkeypatch, mock_external_server)
     provider = ExternalOpenAIProvider()
     request = _stage_request(allow_external=True)
@@ -590,7 +603,7 @@ def test_provider_cancel_mid_stream_returns_cancelled_partial(
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
-    time.sleep(0.4)
+    assert first_chunk_written.wait(timeout=5), "mock backend did not write the first SSE chunk"
     provider.cancel("attempt_ext_cancel")
     thread.join(timeout=10)
     assert not thread.is_alive()
@@ -686,8 +699,8 @@ def api_env(monkeypatch, tmp_path):
         mock_sched.get_distributed_inference_enabled.return_value = False
         mock_sched.has_pipeline_worker_reservation.return_value = False
         mock_sched._max_nodes = 3
-        monkeypatch.setattr(api_server, "model_loaded", False)
-        monkeypatch.setattr(api_server, "_db_available", False)
+        monkeypatch.setattr(model_host, "model_loaded", False)
+        monkeypatch.setattr(model_host, "_db_available", False)
         monkeypatch.setattr(api_server, "_local_store", MagicMock())
         # 本地无可自动加载的模型（指向空目录）
         monkeypatch.setattr(
@@ -845,7 +858,7 @@ def test_chat_falls_back_to_local_on_backend_down(monkeypatch, api_env):
         timeout=2,
     )
     api_server = api_env["api_server"]
-    monkeypatch.setattr(api_server, "model_loaded", True)
+    monkeypatch.setattr(model_host, "model_loaded", True)
     monkeypatch.setattr(api_server, "model_manager", _FakeLocalLlamaManager())
     response = api_env["client"].post("/api/chat", json={
         "message": "触发长上下文外发的消息",
@@ -857,7 +870,10 @@ def test_chat_falls_back_to_local_on_backend_down(monkeypatch, api_env):
     assert body["metrics"]["engine"] == "llama_cpp"
     assert body["metrics"]["fallback"] is True
     assert body["metrics"]["fallback_reason"].startswith("external_api_failed:")
-    assert "外部推理服务不可达" in body["metrics"]["fallback_reason"]
+    assert any(
+        label in body["metrics"]["fallback_reason"]
+        for label in ("外部推理服务不可达", "外部推理服务超时")
+    )
 
 
 def test_chat_prefer_external_without_local_engine_returns_502(

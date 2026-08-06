@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://qlh.dev/schemas/cluster-profile.schema.json",
+  "title": "QLH 集群档案（M0 冻结，2026-08-06）",
+  "description": "Tailscale 主节点档案。只保存密钥引用，不保存密钥/密码明文；endpoint 变更保留 cluster_id，不得创建重复集群。",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "profile_id",
+    "name",
+    "cluster_id",
+    "master_endpoint",
+    "status",
+    "key_ref"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile_id": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "cluster_id": { "type": "string", "minLength": 1 },
+    "master_endpoint": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["scheme", "host", "port"],
+      "properties": {
+        "scheme": { "enum": ["http", "https"] },
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "status": {
+      "enum": ["active", "pending_verification", "unreachable"]
+    },
+    "key_ref": { "type": "string", "minLength": 1 },
+    "node_role": {
+      "enum": ["master", "client", "unknown"]
+    },
+    "last_verified_at": { "type": ["string", "null"], "format": "date-time" },
+    "created_at": { "type": ["string", "null"], "format": "date-time" }
+  }
+}

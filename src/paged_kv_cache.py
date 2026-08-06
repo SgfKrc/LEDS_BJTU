@@ -4,7 +4,7 @@
 功能职责:
 1. 内存页管理、页表映射
 2. KV 动态分配、追加写入
-3. 会话结束页面回收、清空缓存
+3. 尾部回滚、会话结束页面回收、清空缓存
 4. 适配 Prefill / Decode 双阶段
 
 设计原理:
@@ -16,6 +16,7 @@
 核心优化:
 - get_all_kv(): O(n) 单趟扫描，按物理页连续区间批量切片，避免逐 token cat
 - append_kv_single(): Decode 单 token 快速路径，跳过循环逻辑
+- truncate(n): 回滚尾部 n 个 token，回收完整空页并保留尾页复用
 - 支持 device / dtype 参数，张量在正确设备上分配
 
 依赖: torch
@@ -120,6 +121,8 @@ class PagedKVCache:
         self._append_call_count: int = 0
         self._total_appended_tokens: int = 0
         self._get_all_kv_call_count: int = 0
+        self._truncate_call_count: int = 0
+        self._total_truncated_tokens: int = 0
 
         max_tokens = self.page_size * self.max_pages
         logger.info(
@@ -264,6 +267,14 @@ class PagedKVCache:
         num_new = new_k.shape[1]
         if num_new == 0:
             return self._total_tokens
+
+        max_tokens = self.page_size * self.max_pages
+        if self._total_tokens + num_new > max_tokens:
+            raise RuntimeError(
+                f"追加 {num_new} 个 token 将超过缓存容量 {max_tokens} "
+                f"（当前 {self._total_tokens}）。请增大 config.MAX_PAGE_NUM "
+                f"或先调用 truncate()/clear() 回收。"
+            )
 
         num_heads, _, head_dim = new_k.shape
 
@@ -465,6 +476,67 @@ class PagedKVCache:
     # 缓存管理
     # ================================================================
 
+    def truncate(self, num_tokens: int) -> int:
+        """
+        从缓存尾部回滚指定数量的 token。
+
+        完整移除的尾页会进入空闲池；仍保留部分 token 的尾页会同步回退
+        ``used``，并成为下一次 append 的当前写页。已回滚位置的张量无需
+        清零，因为 ``used`` 和页表共同限定可读范围，后续写入会覆盖它们。
+
+        Args:
+            num_tokens: 要从尾部移除的 token 数，范围为
+                        ``0 <= num_tokens <= total_tokens``。
+
+        Returns:
+            回滚后缓存中的总 token 数。
+
+        Raises:
+            TypeError: ``num_tokens`` 不是整数或是 bool。
+            ValueError: 数量为负数或超过当前 token 数。
+        """
+        if isinstance(num_tokens, bool) or not isinstance(num_tokens, int):
+            raise TypeError("num_tokens 必须是整数")
+        if num_tokens < 0:
+            raise ValueError("num_tokens 不能为负数")
+        if num_tokens > self._total_tokens:
+            raise ValueError(
+                f"无法回滚 {num_tokens} 个 token：缓存当前只有 "
+                f"{self._total_tokens} 个 token"
+            )
+        if num_tokens == 0:
+            return self._total_tokens
+
+        remaining = num_tokens
+        del self.page_table[-num_tokens:]
+
+        while remaining > 0:
+            page = self._current_page
+            if page is None or not self.allocated_pages:
+                raise RuntimeError("KV 缓存内部状态损坏：页表与已分配页面不一致")
+
+            if remaining < page.used:
+                page.used -= remaining
+                remaining = 0
+                break
+
+            remaining -= page.used
+            released = self.allocated_pages.pop()
+            if released is not page:
+                raise RuntimeError("KV 缓存内部状态损坏：当前页不是分配序列尾页")
+            self._page_index.pop(page.page_id, None)
+            page.used = 0
+            page.is_free = True
+            self.free_pages.append(page)
+            self._current_page = (
+                self.allocated_pages[-1] if self.allocated_pages else None
+            )
+
+        self._total_tokens -= num_tokens
+        self._truncate_call_count += 1
+        self._total_truncated_tokens += num_tokens
+        return self._total_tokens
+
     def clear(self) -> None:
         """清空当前会话缓存，回收所有页面至空闲池（零释放，可复用）"""
         for page in self.allocated_pages:
@@ -505,6 +577,9 @@ class PagedKVCache:
             return (p.k.shape[0], 0, p.k.shape[2])
         if self._current_page is not None:
             return (self._current_page.k.shape[0], 0, self._current_page.k.shape[2])
+        if self.free_pages:
+            p = self.free_pages[0]
+            return (p.k.shape[0], 0, p.k.shape[2])
         return (0,)
 
     # ================================================================
@@ -544,6 +619,8 @@ class PagedKVCache:
                 "append_call_count": append 调用次数,
                 "total_appended_tokens": 累计写入 token 数,
                 "get_all_kv_call_count": get_all_kv 调用次数,
+                "truncate_call_count": truncate 调用次数,
+                "total_truncated_tokens": 累计回滚 token 数,
             }
         """
         total_slots = self.max_pages * self.page_size
@@ -571,4 +648,6 @@ class PagedKVCache:
             "append_call_count": self._append_call_count,
             "total_appended_tokens": self._total_appended_tokens,
             "get_all_kv_call_count": self._get_all_kv_call_count,
+            "truncate_call_count": self._truncate_call_count,
+            "total_truncated_tokens": self._total_truncated_tokens,
         }

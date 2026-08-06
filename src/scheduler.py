@@ -22,8 +22,13 @@ import threading
 import time
 import uuid
 from enum import Enum
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
 from dataclasses import dataclass, field
+
+if TYPE_CHECKING:
+    from model_host import InferenceHost
+
+from model_host import get_model_host
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -118,28 +123,32 @@ def _is_auth_register_failure(reason: str) -> bool:
 
 def _configured_node_id() -> str:
     try:
-        import config as cfg
-        return getattr(cfg, "NODE_ID", NODE_ID)
+        from node_runtime import node_runtime
+        return node_runtime.get_node_id()
     except Exception:
         return NODE_ID
 
 
 def _sync_runtime_node_config(node_id: str = None, node_role: str = None) -> None:
-    """Keep imported scheduler constants aligned with runtime config mutations."""
+    """Keep runtime node identity aligned with runtime config mutations.
+
+    阶段 0.3：运行时状态由 node_runtime 单例持有（config.py 不再被写回）；
+    模块级 NODE_ID/NODE_ROLE 同步更新以保持本模块内既有读取行为不变。
+    """
     global NODE_ID, NODE_ROLE
     try:
-        import config as cfg
+        from node_runtime import node_runtime
     except Exception:
-        cfg = None
+        node_runtime = None
 
     if node_id:
         NODE_ID = str(node_id)
-        if cfg is not None:
-            cfg.NODE_ID = NODE_ID
+        if node_runtime is not None:
+            node_runtime.set_node_id(NODE_ID)
     if node_role:
         NODE_ROLE = str(node_role)
-        if cfg is not None:
-            cfg.NODE_ROLE = NODE_ROLE
+        if node_runtime is not None:
+            node_runtime.set_node_role(NODE_ROLE)
 
 # 数据库模块（延迟导入，避免 psycopg2 未安装时直接崩溃）
 _db = None
@@ -159,12 +168,11 @@ except (TypeError, ValueError):
 
 
 def _sync_api_db_available(available: bool) -> None:
-    api_module = sys.modules.get("api_server")
-    if api_module is not None:
-        try:
-            api_module._db_available = bool(available)
-        except Exception:
-            pass
+    try:
+        from model_host import get_model_host
+        get_model_host()._db_available = bool(available)
+    except Exception:
+        pass
 
 
 def _get_db(force_retry: bool = False):
@@ -1037,7 +1045,10 @@ class Scheduler:
     - 流水线请求队列（PipelineQueue）
     """
 
-    def __init__(self):
+    def __init__(self, host: Optional["InferenceHost"] = None):
+        # 推理宿主（阶段 0.2 注入）：默认使用全局单例（api_server 构造时
+        # 可显式传入，阶段 1 起可替换为远程 inference-svc 适配器）
+        self._host = host if host is not None else get_model_host()
         self.nodes: dict[str, NodeInfo] = {}
         self._current_task: Optional[InferenceTask] = None
         self._infer_tasks: dict[str, InferenceTask] = {}
@@ -2285,8 +2296,7 @@ class Scheduler:
                                       quant_factors: dict,
                                       configured_quant: str) -> tuple:
         """Return per-layer, embedding and LM-head memory in MiB."""
-        api_module = sys.modules.get("api_server")
-        manager = getattr(api_module, "model_manager", None) if api_module else None
+        manager = self._host
         model_config = getattr(getattr(manager, "model", None), "config", None)
 
         with self._nodes_lock:
@@ -2357,8 +2367,7 @@ class Scheduler:
                     "role": str(info.role),
                     "device_info": info.device_info or {},
                 })
-        api_module = sys.modules.get("api_server")
-        manager = getattr(api_module, "model_manager", None) if api_module else None
+        manager = self._host
         model_path = os.path.abspath(
             getattr(manager, "_model_path", "") or ""
         ) if manager else ""
@@ -2394,8 +2403,7 @@ class Scheduler:
         """Return the active PyTorch model's real decoder-layer count."""
         from config import TOTAL_MODEL_LAYERS
 
-        api_module = sys.modules.get("api_server")
-        manager = getattr(api_module, "model_manager", None) if api_module else None
+        manager = self._host
         if manager is not None:
             for value in (
                 getattr(manager, "_total_model_layers", 0),
@@ -2424,8 +2432,7 @@ class Scheduler:
 
     def _get_active_pipeline_model_info(self) -> dict:
         """Describe the exact PyTorch model that workers must load."""
-        api_module = sys.modules.get("api_server")
-        manager = getattr(api_module, "model_manager", None) if api_module else None
+        manager = self._host
         if not manager or not manager.is_loaded:
             return {}
         if getattr(manager, "_engine_type", "") != "pytorch":
@@ -3458,10 +3465,9 @@ class Scheduler:
         仅对当前已加载的 PyTorch Safetensors/BIN 模型计算摘要。
         llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准。
         """
-        import api_server as _api
         from model_sync import compute_model_sha256
 
-        mgr = getattr(_api, 'model_manager', None)
+        mgr = self._host
         if not mgr or not mgr.is_loaded or getattr(mgr, '_engine_type', '') != 'pytorch':
             return ""
 
@@ -3513,18 +3519,15 @@ class Scheduler:
 
         models = []
         try:
-            import api_server as _api
-
-            lazy_manager = getattr(_api, "model_manager", None)
-            manager = getattr(lazy_manager, "_instance", None)
+            # 阶段 0.2：完整模型判定直接走 host 代理（不依赖内部 manager 容器
+            # 的 _instance 结构，阶段 1 替换远程 host 适配器后依然成立）
             full_model_loaded = bool(
-                getattr(_api, "model_loaded", False)
-                and manager is not None
-                and getattr(manager, "is_loaded", False)
-                and getattr(manager, "layer_range", None) is None
+                getattr(self._host, "model_loaded", False)
+                and getattr(self._host, "is_loaded", False)
+                and getattr(self._host, "layer_range", None) is None
             )
             if full_model_loaded:
-                identity = _api._active_task_graph_model_identity()
+                identity = self._host._active_task_graph_model_identity()
                 if identity is not None and identity.engine in engines:
                     models.append({
                         "model_id": identity.model_id,
@@ -3963,11 +3966,9 @@ class Scheduler:
                 root_input=offer["root_input"],
                 model_identity=model_identity,
             )
-            import api_server as _api
-
-            with _api._full_chat_execution_lock:
+            with self._host.full_chat_execution_lock:
                 with self._inference_lock:
-                    output = _api._execute_task_worker_stage(
+                    output = self._host._execute_task_worker_stage(
                         request, active.cancel_event,
                     )
             if not isinstance(output, dict):
@@ -4537,9 +4538,8 @@ class Scheduler:
             data = msg.get("data", {})
             limit = data.get("limit", 100)
             try:
-                from api_server import _snapshot_recent_logs, _filter_recent_logs
-                entries, _ = _snapshot_recent_logs()
-                filtered = _filter_recent_logs(
+                entries, _ = self._host._snapshot_recent_logs()
+                filtered = self._host._filter_recent_logs(
                     entries,
                     level=data.get("level", ""),
                     name=data.get("name", ""),
@@ -7895,7 +7895,6 @@ class Scheduler:
             })
             return
         configuration_invalidated = False
-        _api = None
 
         logger.info(
             f"🔧 收到分层配置: 节点={node_id}, "
@@ -7922,7 +7921,6 @@ class Scheduler:
                     "分层配置执行契约不完整: " + ", ".join(missing_contract)
                 )
 
-            import api_server as _api
             # A new generation supersedes the old segment immediately. If model
             # synchronization or selective loading then fails, neither the API
             # nor a repeated ACK may advertise the stale generation as ready.
@@ -7931,7 +7929,7 @@ class Scheduler:
                 self._active_layer_config = None
                 self._last_layer_config_ack_payload = None
                 self._local_pipeline_steps.clear()
-            setattr(_api, "model_loaded", False)
+            self._host.model_loaded = False
             configuration_invalidated = True
 
             local_sha256 = ""
@@ -7975,7 +7973,7 @@ class Scheduler:
                         f"master={expected_sha256[:16]}..."
                     )
 
-            mgr = getattr(_api, 'model_manager', None)
+            mgr = self._host
             if mgr and mgr.is_loaded:
                 # 如果已加载完整模型，重新加载指定层范围
                 logger.info(f"🔄 重新加载模型层范围: {start}-{end}")
@@ -8049,8 +8047,8 @@ class Scheduler:
             # Layer config may be the first model load on a clean worker. Keep the
             # API's compatibility globals aligned so the first forwarded chat does
             # not auto-load a full/GGUF model over this segment.
-            setattr(_api, "model_loaded", True)
-            setattr(_api, "current_quant", getattr(mgr, "quant_type", None) or "fp16")
+            self._host.model_loaded = True
+            self._host.current_quant = getattr(mgr, "quant_type", None) or "fp16"
 
             self._send_layer_config_ack({
                 "node_id": node_id,
@@ -8067,12 +8065,12 @@ class Scheduler:
                 f"Layer {start}-{end}, config_id={config_id or 'legacy'}"
             )
         except Exception as e:
-            if configuration_invalidated and _api is not None:
+            if configuration_invalidated:
                 with self._layer_config_lock:
                     self._active_layer_config = None
                     self._last_layer_config_ack_payload = None
                     self._local_pipeline_steps.clear()
-                setattr(_api, "model_loaded", False)
+                self._host.model_loaded = False
             logger.error(f"加载层范围失败: {e}", exc_info=True)
             self._send_layer_config_ack({
                 "node_id": node_id,
@@ -8251,9 +8249,7 @@ class Scheduler:
 
     def _run_master_lm_head(self, hidden_states):
         """在主节点对 worker 返回的尾层 hidden states 执行 Norm + LM Head。"""
-        import api_server as _api
-
-        mgr = getattr(_api, "model_manager", None)
+        mgr = self._host
         if not mgr or not mgr.is_loaded or getattr(mgr, "_engine_type", "") != "pytorch":
             raise RuntimeError("主节点 PyTorch 模型未加载，无法执行 LM Head")
         project = getattr(mgr, "forward_lm_head", None)
@@ -8359,10 +8355,9 @@ class Scheduler:
                         f"流水线 step 越序: task={task_id}, step={step}, "
                         f"last_step={last_step}"
                     )
-            import api_server as _api
             from tcp_comm import deserialize_tensor_fast
 
-            mgr = getattr(_api, 'model_manager', None)
+            mgr = self._host
             if not mgr or not mgr.is_loaded:
                 layer_config_invalid = True
                 raise RuntimeError("模型未加载")
@@ -8614,8 +8609,7 @@ class Scheduler:
             self._finish_local_pipeline_task(task_id)
             if layer_config_invalid:
                 try:
-                    import api_server as _api
-                    setattr(_api, "model_loaded", False)
+                    self._host.model_loaded = False
                 except Exception:
                     logger.debug("worker 层配置失效后更新 API 状态失败", exc_info=True)
             logger.error(f"层前向传播失败: task={task_id}, error={e}", exc_info=True)
@@ -9627,10 +9621,9 @@ class Scheduler:
             {"response": str, "thinking": str, "metrics": dict, ...}
         """
         import uuid
-        import api_server as _api
         from tcp_comm import MessageType, deserialize_tensor_fast, serialize_tensor_fast
 
-        mgr = getattr(_api, 'model_manager', None)
+        mgr = self._host
         if not mgr or not mgr.tokenizer:
             return {"response": "", "error": "模型未加载"}
 
@@ -9741,9 +9734,9 @@ class Scheduler:
 
         # ---- Step 2: Tokenize ----
         chat_messages = messages or [{"role": "user", "content": prompt}]
-        thinking_prompt = getattr(_api, "THINKING_SYSTEM_PROMPT", None) if show_thinking else None
+        thinking_prompt = getattr(self._host, "THINKING_SYSTEM_PROMPT", None) if show_thinking else None
         thinking_prefill = "【思考】\n" if show_thinking else None
-        model_prompt = _api._build_model_chat_prompt(
+        model_prompt = self._host._build_model_chat_prompt(
             tokenizer,
             chat_messages,
             system_prompt=thinking_prompt,
@@ -10198,7 +10191,7 @@ class Scheduler:
             )
             raw_new_text = ""
 
-        new_text, thinking_content = _api._format_model_response(
+        new_text, thinking_content = self._host._format_model_response(
             raw_new_text,
             show_thinking,
             native_thinking_prompt=native_thinking_prompt,
@@ -10416,10 +10409,9 @@ class Scheduler:
         # ---- 引擎检查：流水线仅支持 PyTorch 引擎 ----
         # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
         # 同时检查模型是否已加载，未加载时走回退路径（给出明确错误）。
-        import api_server as _api
         queue_timeout = kwargs.pop('_queue_timeout', PIPELINE_TIMEOUT)
         self._track_stream_output(kwargs)
-        mgr = getattr(_api, 'model_manager', None)
+        mgr = self._host
         if not mgr or not mgr.is_loaded:
             logger.warning("模型未加载，无法执行流水线推理")
             return self._run_full_model_inference(
@@ -10567,9 +10559,7 @@ class Scheduler:
         当流水线节点不可用时，使用 model_manager.chat() 直接推理。
         若调用方传入 _stream_callback，则使用 chat_stream() 逐 token 推送。
         """
-        import api_server as _api
-
-        mgr = getattr(_api, 'model_manager', None)
+        mgr = self._host
         if not mgr or not mgr.is_loaded:
             return {"response": "", "error": "模型未加载"}
 
@@ -10593,11 +10583,11 @@ class Scheduler:
             messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
             if show_thinking and not any(item.get("role") == "system" for item in messages):
                 messages = [
-                    {"role": "system", "content": _api.THINKING_SYSTEM_PROMPT},
+                    {"role": "system", "content": self._host.THINKING_SYSTEM_PROMPT},
                     *messages,
                 ]
             try:
-                fallback_prompt = _api._build_model_chat_prompt(mgr.tokenizer, messages)
+                fallback_prompt = self._host._build_model_chat_prompt(mgr.tokenizer, messages)
                 native_thinking_prompt = "<think>" in fallback_prompt[-128:].lower()
             except Exception:
                 native_thinking_prompt = False
@@ -10629,7 +10619,7 @@ class Scheduler:
                         else:
                             _stream_callback({"token": chunk})
                 raw_response_text = "".join(full_text_parts)
-                response_text, thinking_content = _api._format_model_response(
+                response_text, thinking_content = self._host._format_model_response(
                     raw_response_text,
                     show_thinking,
                     native_thinking_prompt=native_thinking_prompt,
@@ -10667,7 +10657,7 @@ class Scheduler:
                     _cancel_event=cancel_event,
                 )
                 raw_response_text = result.get("content", "")
-                response_text, thinking_content = _api._format_model_response(
+                response_text, thinking_content = self._host._format_model_response(
                     raw_response_text,
                     show_thinking,
                     native_thinking_prompt=native_thinking_prompt,
@@ -10717,9 +10707,8 @@ class Scheduler:
         """
         import queue
         import threading as _thr
-        import api_server as _api
 
-        mgr = getattr(_api, 'model_manager', None)
+        mgr = self._host
         if not mgr or not mgr.is_loaded:
             yield {"done": True, "error": "模型未加载"}
             return
@@ -10740,7 +10729,7 @@ class Scheduler:
         show_thinking = bool(kwargs.pop('show_thinking', False))
         messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
         try:
-            model_prompt = _api._build_model_chat_prompt(mgr.tokenizer, messages)
+            model_prompt = self._host._build_model_chat_prompt(mgr.tokenizer, messages)
             native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
         except Exception:
             native_thinking_prompt = False
@@ -10807,7 +10796,7 @@ class Scheduler:
             self._inference_lock.release()
 
         raw_response_text = "".join(full_text_parts)
-        response_text, thinking_content = _api._format_model_response(
+        response_text, thinking_content = self._host._format_model_response(
             raw_response_text,
             show_thinking,
             native_thinking_prompt=native_thinking_prompt,
@@ -10845,10 +10834,8 @@ class Scheduler:
                 ],
             }
         """
-        import api_server as _api
-
         # 检查引擎兼容性
-        mgr = getattr(_api, 'model_manager', None)
+        mgr = self._host
         engine_ok = (
             mgr is not None
             and getattr(mgr, 'is_loaded', False)

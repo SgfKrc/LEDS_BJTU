@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "deployment_id": "dep_bad",
+  "artifact_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "node_id": "node_worker_01",
+  "status": "everyone-happy",
+  "epoch": 0
+}

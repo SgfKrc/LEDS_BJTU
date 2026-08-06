@@ -1,0 +1,23 @@
+data: {"start": true, "generation_id": "gen_fixture_001", "request_id": "req_fixture_001", "session_id": "sess_fixture", "routing_preference": "auto"}
+
+data: {"token": "你好"}
+
+data: {"token": "，欢迎使用"}
+
+data: {"token": "QLH T9 聊天页。"}
+
+data: {"token": "\n\n这是一个 **fixture 重放** 的示例流："}
+
+data: {"token": "\n\n```python\ndef hello():\n    print(\"来自 SSE fixture\")\n```"}
+
+data: {"token": "\n\n逐 token 增量渲染由 Textual Markdown 组件完成。"}
+
+data: {"done": true, "response": "你好，欢迎使用 QLH T9 聊天页。\n\n这是一个 **fixture 重放** 的示例流：\n\n```python\ndef hello():\n    print(\"来自 SSE fixture\")\n```\n\n逐 token 增量渲染由 Textual Markdown 组件完成。", "thinking_content": null, "followups": [], "metrics": {"engine": "fixture", "execution_mode": "local", "tokens_generated": 8, "tok_per_sec": 12.5, "request_id": "req_fixture_001", "generation_id": "gen_fixture_001"}, "generation_id": "gen_fixture_001", "request_id": "req_fixture_001", "session_id": "sess_fixture", "history_committed": true}
+
+data: {"start": true, "generation_id": "gen_fixture_002", "request_id": "req_fixture_002", "session_id": "sess_fixture", "routing_preference": "distributed_preferred"}
+
+data: {"token": "取消示例："}
+
+data: {"token": "这条流会被 Ctrl+C 中断"}
+
+data: {"cancelled": true, "generation_id": "gen_fixture_002", "request_id": "req_fixture_002", "session_id": "sess_fixture", "partial": "取消示例：这条流会被 Ctrl+C 中断"}
