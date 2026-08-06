@@ -144,8 +144,14 @@ class ChatRequest(BaseModel):
     show_thinking: bool = Field(default=False, description="启用深度思考展示")
     streaming_mode: str = Field(
         default="full",
-        pattern="^(full|fast)$",
-        description="full=完整功能（历史/追问/持久化）| fast=真流式逐 token",
+        pattern="^(full|fast|interactive)$",
+        description="full=完整功能（历史/追问/持久化）| fast=真流式逐 token（跳过持久化）| interactive=真流式逐 token + 完成时事务提交（T9 契约）",
+    )
+    routing_preference: Literal[
+        "auto", "local_only", "distributed_preferred", "distributed_required"
+    ] = Field(
+        default="auto",
+        description="请求级路由偏好（T9 契约）: auto=沿用集群配置 | local_only=仅本地 | distributed_preferred=优先分布式可回退 | distributed_required=无分布式路径则失败",
     )
     client_node_id: Optional[str] = None
     client_node_type: Optional[str] = None

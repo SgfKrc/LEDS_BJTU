@@ -1,6 +1,6 @@
 # TUI 适配与聊天页实施计划
 
-> **状态**：部分实施（T1-T8 管理 TUI 已完成；T9 简化聊天页面为 `L4 Candidate`，尚未实施）
+> **状态**：部分实施（T1-T8 管理 TUI 已完成；T9.0-T9.4 已完成，T9.5 local 部分已完成（分布式真机验收待物理从节点），2026-08-06；T9.6 未实施）
 >
 > **生命周期**：Active（T1-T8 在用）+ Candidate（T9 规划）——现有 7 屏管理 TUI 与网关契约继续作为稳定基线；聊天页未通过 T9 验收前不得写成当前能力
 >
@@ -387,6 +387,32 @@ T9 不是 Claude Code 的代码 Agent 复刻。首期不实现 shell 执行、�
 
 TUI SSE parser 必须处理 TCP chunk 任意切分、一个 chunk 多事件、UTF-8 多字节拆分、尾部无空行、keepalive、错误事件和服务端提前关闭。
 
+### 9.4.1 interactive 事件契约（T9.0 冻结，2026-08-06）
+
+`streaming_mode=interactive` 已落地（`src/api_server.py` chat_stream；`ChatRequest` 增加 `routing_preference`，两处协议：`api_server.ChatRequest` 与 `inference_service/protocol.ChatRequest` 同步）。事件序列固定为：
+
+```text
+start -> token* -> done | error | cancelled
+```
+
+| 事件 | 字段 | 语义 |
+|---|---|---|
+| `start` | `start=true`、`generation_id`、`request_id`、`session_id`、`routing_preference` | 流开始；客户端可据此显示请求级路由意图 |
+| `token` | `token=<delta>` | 增量文本，客户端原位 append；不携带累计全文 |
+| `done` | `done=true`、`response`（全文）、`thinking_content`、`followups`、`metrics`（含 `generation_id`/`request_id`/`routing_preference`/`distributed_requested`）、`session_id`、`history_committed` | 生成完成；user+assistant 已按一次事务提交（`history_committed=false` 表示持久化跳过/失败，客户端可提示） |
+| `error` | `error=<message>`、`request_id` | 失败；不提交历史 |
+| `cancelled` | `cancelled=true`、`generation_id`、`request_id`、`session_id`、`partial` | 取消（含首 token 前）；不提交历史 |
+
+规则：
+
+1. `generation_id` 由客户端预生成（`gen_[a-f0-9]{12}` 格式已兼容），首 token 前即可用 `POST /api/chat/generations/{id}/cancel` 取消。
+2. 从节点请求 interactive 返回 `error` 并引导连接主节点，不静默降级转发（聊天请求不绕过网关直打本地模型）。
+3. 执行路径与 fast 一致：外部路由 → 流水线逐 token → 单机 PyTorch 逐 token → llama.cpp 假流式（整段作为单 token 事件）。
+4. `routing_preference` 语义见 §9.5；当前版本把 `distributed_preferred`/`distributed_required` 回显到 `metrics.distributed_requested`，实际调度影响在 T9.5 落地。
+5. 兼容性：`full`/`fast` 行为与事件格式不变；旧客户端不感知新字段。
+
+测试证据：`tests/test_chat_interactive.py`（8 用例：事件序列/取消/错误/事务提交/路由偏好/从节点引导/真实 local_store 提交）、`tests/test_tui_sse.py`（13 用例：chunk 切分/UTF-8/多事件/keepalive/残帧）、`tests/test_tui_chat.py`（6 用例：Textual headless fixture 重放与命令）。
+
 ### 9.5 本地与分布式推理选择
 
 当前全局 `distributedInference` 开关不足以表达单次请求意图。T9 计划给 `ChatRequest` 增加向后兼容的请求级字段：
@@ -464,35 +490,40 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
 
 ### 9.8 实施步骤
 
-- [ ] **T9.0 契约冻结与 PoC**
-  - 冻结 `routing_preference`、interactive SSE 事件和会话取消/提交语义。
-  - 用 Textual + fake SSE 做单页 PoC，验证 Windows Terminal、PowerShell、Linux SSH 的中文、多行输入和逐 token 更新。
-  - 验收：无真实模型也能重放固定 SSE fixture；当前管理 TUI 零回归。
+- [x] **T9.0 契约冻结与 PoC** ✅ 2026-08-06
+  - 冻结 `routing_preference`、interactive SSE 事件和会话取消/提交语义（§9.4.1）。
+  - `src/tui_chat.py`（Textual + httpx）单页 PoC：fixture 重放与真实后端双模式、Enter 发送/Alt+Enter 换行、Ctrl+C 取消、epoch 迟到事件 fencing、metrics 状态行。
+  - 验收：`tests/test_chat_interactive.py` 8 + `tests/test_tui_sse.py` 13 + `tests/test_tui_chat.py` 6 全绿；管理 TUI 回归 `tests/test_tui_commands.py` 无回归（245 项相关回归全绿）。
+  - 环境：`packaging/requirements-tui.txt`、`scripts/setup_tui_env.py`、`bjtu chat` / `bjtu.sh chat` 启动路由（缺依赖只提示不污染全局解释器）。
 
-- [ ] **T9.1 可选依赖与启动引导**
-  - 新增 `requirements-tui.txt`、环境检测、`.venv-tui` 创建脚本和 `bjtu chat` 启动路由。
-  - 增加代理、国内镜像、离线 wheelhouse 和失败恢复文案。
-  - 验收：干净 Windows/Linux 用户环境不污染全局解释器；拒绝安装仍可使用旧管理 TUI。
+- [x] **T9.1 可选依赖与启动引导** ✅ 2026-08-06（主体完成）
+  - `packaging/requirements-tui.txt`（textual==8.2.8 + httpx）、`scripts/setup_tui_env.py`（创建 `.venv-tui`、幂等、尊重代理/镜像、`--wheelhouse` 离线安装、失败保留重试命令）。
+  - `bjtu chat` / `bjtu.sh chat` 启动路由：缺依赖只显示检测结果与安装命令并 exit 2，不污染全局解释器；管理 TUI 与 `--plain` 不受影响。
+  - 待办：Windows/Linux 安装包携带依赖（T9.6）；干净环境实测截图。
 
-- [ ] **T9.2 聊天页面与命令复用**
-  - 实现 transcript、Markdown、输入区、状态栏、滚动和第 8 屏入口。
-  - 抽取共享 API client、命令注册和 metrics formatter，不直接 import `tui_admin.py` 的交互主循环。
-  - 验收：80×24、120×30、窄终端与 CJK/emoji/code block 布局通过截图/快照测试。
+- [x] **T9.2 聊天页面与命令复用**（主体完成 2026-08-06；T9.6 打包前复查）
+  - transcript（Markdown 增量渲染）、输入区（Enter 发送 / Alt+Enter、Ctrl+J 换行）、状态栏、滚动与第 8 屏入口（`bjtu chat`）。
+  - 共享层 `src/tui_shared.py`：API_PATHS 端点常量、`build_interactive_request`、`format_metrics`、`parse_session_line`、命令注册表 `COMMAND_SPECS`/`help_text`、`resolve_route_arg`；纯标准库可导入（管理 TUI 亦可复用）；聊天页不再散落端点字符串。
+  - 待办：80×24 / 120×30 / 窄终端与 CJK/emoji/code block 的截图快照验收（需真终端）。
 
-- [ ] **T9.3 真流式、取消与错误恢复**
-  - 接入 interactive SSE、预生成 generation ID、取消、断线和重连。
-  - 保留未发送输入；生成失败只结束当前 assistant 占位，不清空 transcript。
-  - 验收：首 token、连续 token、取消临界区、网络断开、服务端 error、空响应全部有确定状态。
+- [x] **T9.3 真流式、取消与错误恢复** ✅ 2026-08-06
+  - interactive SSE、预生成 generation ID、Ctrl+C 取消（首 token 前后均可）与 epoch fencing（取消/切换会话时迟到事件丢弃）已落地。
+  - 错误恢复状态机：`done`/`error`/`cancelled` 为终止事件；网络断开（Read/Connect/Timeout）显示“连接中断”并保留已生成 partial；连接正常关闭但无终止事件（空响应/服务端提前关闭）显示“流意外结束/连接意外结束”；生成失败只结束当前 assistant 占位，不清空 transcript。
+  - 修复：Markdown widget 在 mount 完成前 update 会被构造参数覆盖（Textual 8 行为）——消息追加链 async 化（`await transcript.mount(md)` 完成后再 update）；Ctrl+C 在 TextArea 内拦截转发（内部 copy 绑定优先于 App binding）。
+  - 验收：`tests/test_tui_chat.py` 11 用例（含空响应/error 保留 partial/断线/取消 partial/输入清空）+ 全量 T9 回归 120 passed。
 
-- [ ] **T9.4 会话与历史**
-  - 新建、恢复、重命名、删除会话；启动时恢复最近会话或由用户选择。
-  - 会话切换先取消生成，使用 epoch 丢弃迟到事件。
-  - 验收：主节点重启、远端数据库断开和本地存储模式下历史行为一致。
+- [x] **T9.4 会话与历史** ✅ 2026-08-06
+  - 新建（POST /api/sessions）、恢复（POST /api/sessions/{id}/activate 返回历史）、重命名（PUT /api/sessions/{id}）、删除（DELETE /api/sessions/{id}）与 `/new` `/resume` `/rename` `/delete-session` 命令落地。
+  - 启动时自动恢复最近活跃会话（`active_session_id` + activate 加载历史）。
+  - 会话/模型切换先自动取消当前生成（不再拒绝切换）；epoch fencing 丢弃迟到事件，切换后旧流 token 不污染新会话。
+  - 修复：parse_session_line 兼容后端 `id`/`session_id` 字段；`_clear_transcript` 全量清空避免重复 widget id。
+  - 验收：`tests/test_tui_chat.py` 17 用例（含 new/resume/rename/delete/启动恢复/切换竞态）+ 全量 T9 回归 126 passed；主节点重启与 DB 断开的历史行为依赖真实环境（T9.6 前复查）。
 
-- [ ] **T9.5 本地/分布式路由与真实指标**
-  - 接入请求级 `routing_preference` 和完成 metrics。
-  - 本机单模型验证 local；物理从节点可用后验证 distributed preferred/required、真实参与和 fallback。
-  - 验收：TUI、Web 前端和任务统计对同一 request_id 的执行模式、参与节点和回退原因一致。
+- [x] **T9.5 本地/分布式路由与真实指标**（local 部分完成 2026-08-06；分布式真机验收待物理从节点）
+  - 请求级 `routing_preference` 接入执行路径（api_server 单体）：`local_only` 强制本地（跳过外部路由/主节点转发/分布式流水线，含 full 与 interactive/fast）；`distributed_required` 无分布式路径时明确失败（interactive/fast 发 error 事件、full 走既有 SSE error 语义），不静默回退；`distributed_preferred` 不可用时本地回退并标注 `fallback=true` + `fallback_reason`。
+  - metrics 补全：`distributed_used`（实际走流水线时 true）、`fallback`/`fallback_reason`（请求分布式但本地执行）。
+  - 验收：`tests/test_chat_interactive.py` 17 用例（local_only 客户端/主节点、required 失败/放行、preferred 回退 metrics、full 模式 local_only/required）+ 全量相关回归 263 passed。
+  - 待办：inference-svc（engine_host）执行段同步（并行共存契约复测时一并落地）；物理从节点可用后验证真实参与节点与 fallback 跨端一致（TUI/Web/任务统计）。
 
 - [ ] **T9.6 打包、回归与默认入口决策**
   - Windows/Linux 包包含聊天依赖；源码模式提供环境引导。

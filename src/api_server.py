@@ -891,7 +891,13 @@ class ChatRequest(BaseModel):
     show_thinking: bool = Field(default=False, description="启用深度思考展示")
     streaming_mode: str = Field(
         default="full",
-        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化）",
+        description="流式模式（仅 /api/chat/stream 生效）: full=假流式完整功能（含历史/追问/持久化，默认） | fast=真流式逐token（低延迟，跳过持久化） | interactive=真流式逐token + 完成时会话事务提交（T9 聊天页）",
+    )
+    routing_preference: Literal[
+        "auto", "local_only", "distributed_preferred", "distributed_required"
+    ] = Field(
+        default="auto",
+        description="请求级路由偏好（T9 契约）: auto=沿用集群配置与 scheduler 决策 | local_only=仅主节点本地执行 | distributed_preferred=优先分布式，不可用允许本地回退 | distributed_required=无合格分布式路径时明确失败",
     )
     client_node_id: Optional[str] = Field(default=None, description="请求来源节点 ID（Android/PC 客户端上报）")
     client_node_type: Optional[str] = Field(default=None, description="请求来源节点类型: pc | android")
@@ -2848,8 +2854,44 @@ def _augment_chat_metrics(metrics: dict | None, req: ChatRequest, **defaults) ->
 # 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）
 # ================================================================
 
+def _distributed_path_available() -> bool:
+    """当前是否有可用的分布式执行路径（T9.5 路由偏好判断）。
+
+    判定口径：分布式全局启用时，主节点可协调流水线/Worker；从节点可
+    转发主节点（由主节点协调执行）。两者都计为“合格分布式路径”。
+    """
+    try:
+        if not (scheduler.get_distributed_inference_enabled()
+                and RUN_MODE == "distributed"):
+            return False
+        role = scheduler._effective_role()
+        return role in ("master", "client")
+    except Exception:
+        return False
+
+
+def _routing_gate_error(req: ChatRequest) -> Optional[str]:
+    """路由偏好预检（T9.5）：返回拒绝原因，None 表示允许继续。
+
+    - distributed_required：没有合格分布式路径时明确失败，不静默回退；
+    - local_only / auto / distributed_preferred：始终允许（回退语义由执行路径处理）。
+    """
+    if req.routing_preference == "distributed_required":
+        if not _distributed_path_available():
+            return (
+                "distributed_required 但当前没有可用的分布式路径"
+                "（分布式未启用或本节点不是主节点）"
+            )
+    return None
+
+
 def _external_route_decision(req: ChatRequest):
     """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
+    if req.routing_preference == "local_only":
+        # T9.5：local_only 覆盖一切外部路由意图，数据不出集群
+        from types import SimpleNamespace as _SN
+        return _SN(use_external=False, eligible=False,
+                   reason="local_only_override")
     import config as _cfg
     from external_provider import decide_external_route
 
@@ -3927,6 +3969,10 @@ def _execute_chat_full(
         HTTPException: 模型未加载、OOM、推理失败
     """
     global kv_cache, conversation_stats
+    # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
+    routing_gate = _routing_gate_error(req)
+    if routing_gate:
+        raise HTTPException(400, routing_gate)
     _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
     # ---- 多会话支持 ----
@@ -3976,8 +4022,9 @@ def _execute_chat_full(
             external_fallback_reason = f"external_api_failed: {exc}"
             logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
 
-    # ---- 分布式推理路由：从节点转发给主节点 ----
-    if (scheduler.get_distributed_inference_enabled()
+    # ---- 分布式推理路由：从节点转发给主节点（local_only 强制本地）----
+    if (req.routing_preference != "local_only"
+            and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "client"):
         try:
@@ -4076,8 +4123,9 @@ def _execute_chat_full(
             "请先断开主节点或明确切换本地模型。",
         )
 
-    # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
-    if (scheduler.get_distributed_inference_enabled()
+    # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用；local_only 跳过）----
+    if (req.routing_preference != "local_only"
+            and scheduler.get_distributed_inference_enabled()
             and RUN_MODE == "distributed"
             and scheduler._effective_role() == "master"
             and model_manager._engine_type == "pytorch"):
@@ -4469,6 +4517,44 @@ def _execute_requested_chat(
     return _execute_chat_full(req, cancel_event)
 
 
+def _commit_interactive_history(
+    session_id: Optional[str],
+    user_message: str,
+    response_text: str,
+    metrics: dict,
+) -> bool:
+    """interactive 模式完成时的一次性会话事务提交（user + assistant）。
+
+    与 full 模式同一持久化语义（db.save_message / local_store 等价），
+    但只调用一次、一次写入两条消息，供 done 事件上报 history_committed。
+    返回是否实际写入。
+    """
+    db_session_id = session_id or "default"
+    if model_host._db_available:
+        try:
+            import db as _db_mod
+            if _db_mod.get_save_history():
+                _db_mod.save_message(db_session_id, "user", user_message)
+                _db_mod.save_message(
+                    db_session_id, "assistant", response_text, metrics,
+                )
+                _db_mod.increment_session_message_count(db_session_id)
+                return True
+        except Exception:
+            pass
+    else:
+        try:
+            _local_store.save_local_message(db_session_id, "user", user_message)
+            _local_store.save_local_message(
+                db_session_id, "assistant", response_text, metrics,
+            )
+            _local_store.increment_local_session_message_count(db_session_id)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 def _should_forward_chat_to_master() -> bool:
     return bool(
         scheduler.get_distributed_inference_enabled()
@@ -4488,7 +4574,11 @@ def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
         # 路线 B：本请求将整体路由到外部推理服务，无需本地模型。
         # 外部失败时的本地回退在 _execute_chat_full 内按需加载模型。
         return
-    if _should_forward_chat_to_master():
+    if req is not None and req.routing_preference == "local_only":
+        # T9.5：local_only 强制本地执行，从节点也不转发（能力不足时由下方
+        # 检查给出明确错误，而不是绕过网关转发）。
+        pass
+    elif _should_forward_chat_to_master():
         return
     if _pipeline_worker_is_reserved():
         raise HTTPException(
@@ -4756,6 +4846,200 @@ async def chat_stream(req: ChatRequest, request: Request):
     async def _generate_events():
         # 路线 B：请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次）
         _maybe_log_external_scope_denial(req, _external_route_decision(req))
+        # T9.5：distributed_required 无分布式路径时明确失败（interactive/fast 共用）
+        routing_gate = _routing_gate_error(req)
+        if routing_gate:
+            yield _error_event(routing_gate)
+            return
+        # ================================================================
+        # ★ interactive 模式（T9 聊天页契约）：真流式逐 token +
+        #    完成时会话事务提交（user + assistant 一次写入）
+        # ================================================================
+        if req.streaming_mode == "interactive":
+            target_session_id = req.session_id or active_session_id
+            if target_session_id and target_session_id != active_session_id:
+                try:
+                    _switch_session(target_session_id)
+                except Exception:
+                    pass
+            history = _get_active_history()
+            if target_session_id and len(history) == 0:
+                try:
+                    _auto_title_session(target_session_id, req.message)
+                except Exception:
+                    pass
+
+            yield f"data: {_json.dumps({'start': True, 'generation_id': generation_id, 'request_id': request_id, 'session_id': target_session_id, 'routing_preference': req.routing_preference}, ensure_ascii=False)}\n\n"
+
+            response_parts: list[str] = []
+            thinking_parts: list[str] = []
+            metrics: dict = {}
+            error: Optional[str] = None
+            cancelled = False
+            distributed_used = False
+
+            def _append_event(event: dict) -> None:
+                nonlocal metrics, error
+                if event.get("token"):
+                    response_parts.append(str(event["token"]))
+                if event.get("thinking"):
+                    thinking_parts.append(str(event["thinking"]))
+                if isinstance(event.get("metrics"), dict):
+                    metrics.update(event["metrics"])
+                if event.get("error"):
+                    error = str(event["error"])
+
+            loop = _asyncio.get_running_loop()
+
+            def _token_frame(event: dict) -> Optional[str]:
+                """token 事件 → SSE 帧；非 token 事件返回 None。"""
+                if event.get("token") is not None:
+                    return f"data: {_json.dumps({'token': event['token']}, ensure_ascii=False)}\n\n"
+                return None
+
+            try:
+                # ---- 外部路由（数据作用域门控，与 fast/full 同语义）----
+                _ext_decision = _external_route_decision(req)
+                if _ext_decision.use_external:
+                    async for event in _iterate_sync_generator(
+                        _external_stream_events(req, cancel_event),
+                    ):
+                        _append_event(event)
+                        frame = _token_frame(event)
+                        if frame:
+                            yield frame
+                        if event.get("done"):
+                            break
+                elif (req.routing_preference != "local_only"
+                      and _should_forward_chat_to_master()):
+                    # 计划 §9.5：聊天请求不绕过网关直打本地模型；从节点
+                    # interactive 明确失败并引导连接主节点，不静默降级。
+                    error = (
+                        "interactive 模式要求连接主节点；当前节点是从节点，"
+                        "请用 --host 指定主节点 endpoint 后重试"
+                    )
+                elif _pipeline_worker_is_reserved():
+                    error = (
+                        "本设备正作为 PyTorch 分层从节点，interactive 模式不可用；"
+                        "请连接主节点"
+                    )
+                else:
+                    if not model_host.model_loaded or not model_manager.is_loaded:
+                        try:
+                            await _run_with_request_id(loop, _auto_load_default_model)
+                        except Exception as exc:
+                            error = f"本地回退模型加载失败: {exc}"
+                    if error is None:
+                        distributed_used = False
+                        # 路径 1: 分布式流水线流式（master；local_only 强制跳过）
+                        if (req.routing_preference != "local_only"
+                                and scheduler.get_distributed_inference_enabled()
+                                and RUN_MODE == "distributed"
+                                and scheduler._effective_role() == "master"
+                                and model_manager._engine_type == "pytorch"):
+                            distributed_used = True
+                            async for event in _iterate_sync_generator(scheduler.run_pipeline_stream(
+                                req.message,
+                                max_new_tokens=req.max_new_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                session_id=req.session_id,
+                                messages=[{"role": "user", "content": req.message}],
+                                show_thinking=req.show_thinking,
+                                _cancel_event=cancel_event,
+                            )):
+                                _append_event(event)
+                                frame = _token_frame(event)
+                                if frame:
+                                    yield frame
+                        # 路径 2: 单机 PyTorch 流式
+                        elif (model_manager._engine_type == "pytorch"
+                                and model_manager.is_loaded):
+                            async for event in _iterate_sync_generator(scheduler._run_full_model_inference_stream(
+                                req.message,
+                                max_new_tokens=req.max_new_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                                session_id=req.session_id,
+                                messages=[{"role": "user", "content": req.message}],
+                                show_thinking=req.show_thinking,
+                                _cancel_event=cancel_event,
+                            )):
+                                _append_event(event)
+                                frame = _token_frame(event)
+                                if frame:
+                                    yield frame
+                        # 路径 3: llama.cpp / 其他 → 假流式回退（整段作为单 token 事件）
+                        else:
+                            result = await _run_with_request_id(
+                                loop,
+                                lambda: scheduler.run_pipeline_safe(
+                                    req.message,
+                                    max_new_tokens=req.max_new_tokens,
+                                    temperature=req.temperature,
+                                    top_p=req.top_p,
+                                    session_id=req.session_id,
+                                    _cancel_event=cancel_event,
+                                ),
+                            )
+                            if isinstance(result.get("metrics"), dict):
+                                metrics.update(result["metrics"])
+                            response = result.get("response", "")
+                            if response:
+                                response_parts.append(str(response))
+                                yield f"data: {_json.dumps({'token': str(response)}, ensure_ascii=False)}\n\n"
+                            if result.get("error"):
+                                error = str(result["error"])
+            except ChatGenerationCancelled:
+                cancelled = True
+            except HTTPException as exc:
+                error = exc.detail
+            except Exception as exc:
+                logger.error(f"interactive 模式推理失败: {exc}", exc_info=True)
+                error = str(exc)
+
+            if cancelled:
+                partial = "".join(response_parts)
+                yield f"data: {_json.dumps({'cancelled': True, 'generation_id': generation_id, 'request_id': request_id, 'session_id': target_session_id, 'partial': partial}, ensure_ascii=False)}\n\n"
+                return
+            if error:
+                yield _error_event(error)
+                return
+
+            response_text = "".join(response_parts)
+            metrics.setdefault("request_id", request_id)
+            metrics["generation_id"] = generation_id
+            metrics["routing_preference"] = req.routing_preference
+            metrics["distributed_requested"] = req.routing_preference in (
+                "distributed_preferred", "distributed_required",
+            )
+            metrics["distributed_used"] = distributed_used
+            if (req.routing_preference in ("distributed_preferred",
+                                           "distributed_required")
+                    and not distributed_used):
+                # 请求分布式但实际本地：必须展示回退原因（计划 §9.5）
+                metrics.setdefault("fallback", True)
+                metrics.setdefault(
+                    "fallback_reason",
+                    "distributed_unavailable_fallback_to_local",
+                )
+            committed = _commit_interactive_history(
+                target_session_id, req.message, response_text, metrics,
+            )
+            done_payload = {
+                "done": True,
+                "response": response_text,
+                "thinking_content": "".join(thinking_parts) or None,
+                "followups": [],
+                "metrics": metrics,
+                "generation_id": generation_id,
+                "request_id": request_id,
+                "session_id": target_session_id,
+                "history_committed": committed,
+            }
+            yield f"data: {_json.dumps(done_payload, ensure_ascii=False)}\n\n"
+            return
+
         # ================================================================
         # ★ full 模式：完整 chat 流程，假流式（SSE 单事件）
         # ================================================================
@@ -4842,7 +5126,9 @@ async def chat_stream(req: ChatRequest, request: Request):
         # A pipeline worker may already hold a valid PyTorch segment. It must
         # never enter the local PyTorch streaming branch, which restores the
         # full model and invalidates the master's ready ACK.
-        if _should_forward_chat_to_master():
+        # T9.5: local_only 强制不走转发，仅本地执行
+        if (req.routing_preference != "local_only"
+                and _should_forward_chat_to_master()):
             loop = _asyncio.get_running_loop()
             result = await _run_with_request_id(
                 loop,
@@ -4892,8 +5178,9 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield _error_event(f"本地回退模型加载失败: {exc}")
                 return
 
-        # ---- 路径 1: 分布式流水线流式 ----
-        if (scheduler.get_distributed_inference_enabled()
+        # ---- 路径 1: 分布式流水线流式（local_only 强制跳过，走单机）----
+        if (req.routing_preference != "local_only"
+                and scheduler.get_distributed_inference_enabled()
                 and RUN_MODE == "distributed"
                 and scheduler._effective_role() == "master"
                 and model_manager._engine_type == "pytorch"):
@@ -6171,7 +6458,7 @@ async def test_email_notification():
     """
     发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
 
-    邮件将发送到 SMTP.md 中配置的目标邮箱。
+    邮件将发送到当前配置的管理员收件邮箱（node_config 优先，回退环境变量）。
     任何节点均可调用（主节点和从节点均可测试邮件发送）。
     """
     try:
@@ -6186,6 +6473,53 @@ async def test_email_notification():
         raise HTTPException(500, f"邮件模块导入失败: {e}")
     except Exception as e:
         raise HTTPException(500, f"邮件发送异常: {e}")
+
+
+class EmailConfigRequest(BaseModel):
+    # 允许空串：传空表示清除自定义配置、回退环境变量（set_admin_email 校验）
+    recipient: str = Field(..., max_length=320, description="管理员收件邮箱（空串=清除自定义配置）")
+
+
+@app.get("/api/cluster/email-config")
+async def get_email_config():
+    """
+    查询管理员收件邮箱配置（不返回任何 SMTP 凭据）。
+
+    Returns:
+        recipient: 当前生效收件邮箱（可能为空）
+        source: node_config | env | none
+        smtp_configured: 发件账号是否已配置
+    """
+    try:
+        from email_notifier import admin_email_config
+        from email_notifier import SMTP_SENDER, SMTP_PASSWORD
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    config = admin_email_config()
+    return {
+        "recipient": config["recipient"],
+        "source": config["source"],
+        "smtp_configured": bool(SMTP_SENDER and SMTP_PASSWORD),
+    }
+
+
+@app.post("/api/cluster/email-config")
+async def update_email_config(req: EmailConfigRequest):
+    """
+    设置管理员收件邮箱并持久化到 node_config.json，运行中立即生效。
+
+    传空字符串可清除自定义配置，回退到环境变量 QLH_SMTP_RECIPIENT。
+    """
+    try:
+        from email_notifier import set_admin_email
+        recipient = await run_in_threadpool(set_admin_email, req.recipient)
+    except ImportError as e:
+        raise HTTPException(500, f"邮件模块导入失败: {e}")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"保存邮箱配置失败: {e}")
+    return {"status": "ok", "recipient": recipient}
 
 
 # ============================================================

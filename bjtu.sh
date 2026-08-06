@@ -42,4 +42,26 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     exec "$PY" "$PROJECT_ROOT/src/tui_admin.py" --help
 fi
 
+# ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
+if [ "$1" = "chat" ]; then
+    PY=""
+    if [ -x "$PROJECT_ROOT/.venv-tui/bin/python" ]; then
+        PY="$PROJECT_ROOT/.venv-tui/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PY=python3
+    else
+        PY=python
+    fi
+    if ! "$PY" -c "import textual, httpx" >/dev/null 2>&1; then
+        echo "[T9] 聊天页缺少可选依赖 Textual/httpx。"
+        echo "     安装: python3 scripts/setup_tui_env.py"
+        echo "     或:   pip install -r packaging/requirements-tui.txt"
+        echo "     管理 TUI（bjtu / start_tui.sh）不受影响。"
+        exit 2
+    fi
+    shift
+    export PYTHONIOENCODING=utf-8
+    exec "$PY" "$PROJECT_ROOT/src/tui_chat.py" "$@"
+fi
+
 exec bash start_tui.sh "$@"
