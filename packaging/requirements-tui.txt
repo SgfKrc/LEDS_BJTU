@@ -1,0 +1,10 @@
+# T9 简化聊天页（src/tui_chat.py）可选依赖
+# 只服务于聊天入口；管理 TUI（tui_admin.py，纯标准库）与 --plain 不受影响。
+# 安装方式：
+#   python scripts/setup_tui_env.py          # 创建 .venv-tui 并安装
+#   pip install -r packaging/requirements-tui.txt   # 或装入现有环境
+#
+# 版本窗口：Python 3.10-3.12；Textual 8.x 已在本仓库测试（8.2.8）。
+# 升级 Textual 主版本前必须重跑 tests/test_tui_chat.py 与 tests/test_tui_sse.py。
+textual==8.2.8
+httpx>=0.27,<1.0
