@@ -14,7 +14,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional
 
-from .artifacts import DiffusionArtifact, DiffusionArtifactInspector
+from .artifacts import (
+    DiffusionArtifact,
+    DiffusionArtifactInspector,
+    resolve_sd15_ip_adapter_layout,
+)
 
 
 class GenerationCancelled(RuntimeError):
@@ -104,6 +108,8 @@ class SD15Engine:
         self._cancel_event = threading.Event()
         self._quantized_linear_count = 0
         self._diffusers_logging: Any = None
+        self._ip_adapter_identity: Optional[str] = None
+        self._ip_adapter_scale: Optional[float] = None
 
     @staticmethod
     @contextmanager
@@ -153,13 +159,31 @@ class SD15Engine:
                 "reason": "SD1.5 U-Net has no reusable autoregressive KV cache across denoising steps",
             },
             "attention_memory": {
-                "enabled": self.config.enable_attention_slicing,
-                "strategy": "diffusers_attention_slicing" if self.config.enable_attention_slicing else "none",
+                "configured": self.config.enable_attention_slicing,
+                "enabled": (
+                    self.config.enable_attention_slicing
+                    and self._ip_adapter_identity is None
+                ),
+                "strategy": (
+                    "temporarily_disabled_for_ip_adapter"
+                    if self.config.enable_attention_slicing
+                    and self._ip_adapter_identity is not None
+                    else "diffusers_attention_slicing"
+                    if self.config.enable_attention_slicing
+                    else "none"
+                ),
             },
             "operator_fusion": {
                 "qkv_projection": self.config.enable_qkv_fusion,
                 "torch_compile_unet": self.config.enable_torch_compile,
                 "torch_compile_mode": self.config.torch_compile_mode if self.config.enable_torch_compile else None,
+            },
+            "reference_image": {
+                "supported": True,
+                "strategy": "sd15_ip_adapter",
+                "adapter_loaded": self._ip_adapter_identity is not None,
+                "adapter_identity": self._ip_adapter_identity,
+                "scale": self._ip_adapter_scale,
             },
         }
 
@@ -306,6 +330,12 @@ class SD15Engine:
     def _configure_pipeline(self, pipeline: Any, *, use_cuda: bool, torch: Any) -> Any:
         """Apply mutually validated memory and execution strategies."""
 
+        set_progress = getattr(pipeline, "set_progress_bar_config", None)
+        if callable(set_progress):
+            # Diffusers 0.35 imports tqdm directly in pipeline_utils, so its
+            # global logging switch does not suppress denoising progress. A
+            # detached Windows build needs this pipeline-level switch.
+            set_progress(disable=True)
         if self.config.enable_attention_slicing:
             pipeline.enable_attention_slicing()
         if self.config.enable_vae_slicing:
@@ -450,6 +480,8 @@ class SD15Engine:
             self._quantized_linear_count = 0
             self._device = "cpu"
             self._diffusers_logging = None
+            self._ip_adapter_identity = None
+            self._ip_adapter_scale = None
             if pipeline is not None:
                 del pipeline
             try:
@@ -501,9 +533,19 @@ class SD15Engine:
         from diffusers import StableDiffusionImg2ImgPipeline
 
         if hasattr(StableDiffusionImg2ImgPipeline, "from_pipe"):
-            edit_pipeline = StableDiffusionImg2ImgPipeline.from_pipe(pipeline)
+            # Diffusers 0.35 defaults from_pipe(torch_dtype=...) to FP32 and
+            # converts the shared components in place. Preserve the loaded
+            # pipeline dtype or reference/img2img switching doubles memory and
+            # also mutates the base pipeline precision.
+            edit_pipeline = StableDiffusionImg2ImgPipeline.from_pipe(
+                pipeline,
+                torch_dtype=getattr(pipeline, "dtype", None),
+            )
         else:
             edit_pipeline = StableDiffusionImg2ImgPipeline(**pipeline.components)
+        set_progress = getattr(edit_pipeline, "set_progress_bar_config", None)
+        if callable(set_progress):
+            set_progress(disable=True)
         if (
             self.config.enable_attention_slicing
             and hasattr(edit_pipeline, "enable_attention_slicing")
@@ -513,6 +555,118 @@ class SD15Engine:
             edit_pipeline.enable_vae_slicing()
         pipeline._qlh_img2img_pipeline = edit_pipeline
         return edit_pipeline
+
+    def _unload_ip_adapter(self, pipeline: Any) -> None:
+        if self._ip_adapter_identity is None:
+            return
+        self._remove_model_cpu_offload_hooks(pipeline)
+        unload = getattr(pipeline, "unload_ip_adapter", None)
+        if not callable(unload):
+            raise RuntimeError("current Diffusers pipeline cannot unload IP-Adapter")
+        unload()
+        self._ip_adapter_identity = None
+        self._ip_adapter_scale = None
+        if self.config.enable_attention_slicing:
+            enable_slicing = getattr(pipeline, "enable_attention_slicing", None)
+            if not callable(enable_slicing):
+                raise RuntimeError(
+                    "current Diffusers pipeline cannot restore attention slicing"
+                )
+            enable_slicing()
+        self._refresh_model_cpu_offload(pipeline)
+
+    def _remove_model_cpu_offload_hooks(self, pipeline: Any) -> None:
+        """Detach hooks while dynamically registered modules are still visible."""
+
+        if not (
+            self.config.enable_model_cpu_offload
+            and self._device.startswith("cuda")
+        ):
+            return
+        remove_hooks = getattr(pipeline, "remove_all_hooks", None)
+        if not callable(remove_hooks):
+            raise RuntimeError(
+                "current Diffusers pipeline cannot detach model CPU offload hooks"
+            )
+        remove_hooks()
+
+    def _refresh_model_cpu_offload(self, pipeline: Any) -> None:
+        """Rebuild Accelerate hooks after optional pipeline modules change.
+
+        Diffusers installs model-offload hooks before an IP-Adapter image
+        encoder exists.  Loading the adapter later registers that 2.5 GB
+        encoder on CPU, so reference encoding otherwise runs entirely on the
+        host.  Rebuilding hooks is the supported Diffusers operation and also
+        drops stale hooks after the adapter is unloaded.
+        """
+
+        if not (
+            self.config.enable_model_cpu_offload
+            and self._device.startswith("cuda")
+        ):
+            return
+        enable_offload = getattr(pipeline, "enable_model_cpu_offload", None)
+        if not callable(enable_offload):
+            raise RuntimeError(
+                "current Diffusers pipeline cannot refresh model CPU offload"
+            )
+        enable_offload(device=self._device)
+
+    def _ensure_ip_adapter(
+        self,
+        pipeline: Any,
+        artifact: DiffusionArtifact,
+        *,
+        scale: float,
+    ) -> None:
+        if artifact.artifact_kind != "sd15_ip_adapter" or not artifact.loadable:
+            raise ValueError("reference mode requires a complete local SD1.5 IP-Adapter directory")
+        if self.config.quantization != "none" or self.config.enable_qkv_fusion:
+            raise RuntimeError(
+                "IP-Adapter is not enabled for quantized or QKV-fused SD15 profiles before GPU validation"
+            )
+        identity = artifact.sha256 or artifact.path
+        if self._ip_adapter_identity != identity:
+            self._unload_ip_adapter(pipeline)
+            layout = resolve_sd15_ip_adapter_layout(artifact.path)
+            slicing_suspended = False
+            try:
+                if self.config.enable_attention_slicing:
+                    disable_slicing = getattr(
+                        pipeline,
+                        "disable_attention_slicing",
+                        None,
+                    )
+                    if not callable(disable_slicing):
+                        raise RuntimeError(
+                            "current Diffusers pipeline cannot suspend attention slicing for IP-Adapter"
+                        )
+                    disable_slicing()
+                    slicing_suspended = True
+                pipeline.load_ip_adapter(
+                    layout["root"],
+                    subfolder=layout["subfolder"],
+                    weight_name=layout["weight_name"],
+                    image_encoder_folder=layout["image_encoder_folder"],
+                    local_files_only=True,
+                )
+                self._refresh_model_cpu_offload(pipeline)
+            except Exception:
+                try:
+                    pipeline.unload_ip_adapter()
+                except Exception:
+                    pass
+                if slicing_suspended:
+                    try:
+                        pipeline.enable_attention_slicing()
+                    except Exception:
+                        pass
+                self._ip_adapter_identity = None
+                self._ip_adapter_scale = None
+                raise
+            self._ip_adapter_identity = identity
+        pipeline.set_ip_adapter_scale(scale)
+        self._ip_adapter_scale = scale
 
     def generate(
         self,
@@ -526,6 +680,7 @@ class SD15Engine:
             if pipeline is None:
                 raise RuntimeError("SD15 引擎尚未加载模型")
             self._cancel_event.clear()
+            self._unload_ip_adapter(pipeline)
 
             import torch
 
@@ -597,13 +752,14 @@ class SD15Engine:
         request: Any,
         *,
         image: Any,
+        adapter: Optional[DiffusionArtifact] = None,
         callback: Optional[Callable[[int, int], None]] = None,
     ) -> SD15GenerationResult:
-        '''Run the supported local img2img edit using shared SD components.'''
+        '''Run local img2img or IP-Adapter reference generation.'''
 
         mode = getattr(request, 'mode', '')
-        if mode != 'img2img':
-            raise RuntimeError('SD15 img2img executor does not support this edit mode yet')
+        if mode not in {'img2img', 'reference'}:
+            raise RuntimeError('SD15 engine does not support this edit mode yet')
         request.validate()
         with self._lock:
             pipeline = self._pipeline
@@ -623,31 +779,61 @@ class SD15Engine:
                 if self._cancel_event.is_set():
                     raise GenerationCancelled('SD15 edit cancelled')
                 if callback:
-                    callback(step + 1, request.steps)
+                    callback(step + 1, request.denoising_steps)
                 return kwargs
 
-            edit_pipeline = self._get_img2img_pipeline(pipeline)
+            if mode == 'reference':
+                if adapter is None:
+                    raise ValueError('reference mode requires an IP-Adapter artifact')
+                self._ensure_ip_adapter(
+                    pipeline,
+                    adapter,
+                    scale=float(request.ip_adapter_scale),
+                )
+                edit_pipeline = pipeline
+            else:
+                self._unload_ip_adapter(pipeline)
+                edit_pipeline = self._get_img2img_pipeline(pipeline)
+                # from_pipe shares model modules with the base pipeline, but
+                # Accelerate's hook chain belongs to one pipeline instance at
+                # a time. Rebind it before img2img so shared modules do not
+                # silently execute on CPU after a reference-mode transition.
+                self._refresh_model_cpu_offload(edit_pipeline)
 
             try:
                 from PIL import Image
                 source_image = image.convert('RGB') if hasattr(image, 'convert') else image
-                source_image = source_image.resize((request.width, request.height), Image.Resampling.LANCZOS)
+                if mode == 'img2img':
+                    source_image = source_image.resize(
+                        (request.width, request.height),
+                        Image.Resampling.LANCZOS,
+                    )
                 started = time.perf_counter()
                 diffusers_logging = self._diffusers_logging
                 if diffusers_logging is None:
                     from diffusers.utils import logging as diffusers_logging
                 with self._request_scheduler(edit_pipeline, request):
                     with self._suspended_diffusers_progress(diffusers_logging):
-                        output = edit_pipeline(
-                            prompt=request.prompt,
-                            negative_prompt=request.negative_prompt or None,
-                            image=source_image,
-                            strength=request.strength,
-                            num_inference_steps=request.steps,
-                            guidance_scale=request.guidance_scale,
-                            generator=generator,
-                            callback_on_step_end=on_step_end,
-                        )
+                        call_kwargs = {
+                            'prompt': request.prompt,
+                            'negative_prompt': request.negative_prompt or None,
+                            'num_inference_steps': request.steps,
+                            'guidance_scale': request.guidance_scale,
+                            'generator': generator,
+                            'callback_on_step_end': on_step_end,
+                        }
+                        if mode == 'reference':
+                            call_kwargs.update({
+                                'ip_adapter_image': source_image,
+                                'height': request.height,
+                                'width': request.width,
+                            })
+                        else:
+                            call_kwargs.update({
+                                'image': source_image,
+                                'strength': request.strength,
+                            })
+                        output = edit_pipeline(**call_kwargs)
             except TypeError as exc:
                 message = str(exc)
                 if 'callback_on_step_end' in message and (
@@ -667,9 +853,19 @@ class SD15Engine:
                 seed=int(request.seed),
                 elapsed_seconds=elapsed,
                 metadata={
-                    'engine': 'diffusers_sd15_img2img',
-                    'edit_mode': 'img2img',
-                    'strength': request.strength,
+                    'engine': (
+                        'diffusers_sd15_ip_adapter'
+                        if mode == 'reference'
+                        else 'diffusers_sd15_img2img'
+                    ),
+                    'edit_mode': mode,
+                    'strength': request.strength if mode == 'img2img' else None,
+                    'ip_adapter_scale': (
+                        request.ip_adapter_scale if mode == 'reference' else None
+                    ),
+                    'ip_adapter_sha256': (
+                        adapter.sha256 if mode == 'reference' and adapter else None
+                    ),
                     'artifact_sha256': self._artifact.sha256 if self._artifact else '',
                     'device': self._device,
                     'width': request.width,

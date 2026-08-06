@@ -271,7 +271,7 @@ describe('阶段 2 其余域契约', () => {
       expect(deleted.body.deleted).toBe(true);
     });
 
-    it('multipart 输入 blob 与编辑错误原样经过网关', async () => {
+    it('multipart 输入 blob、img2img 成功与未实现编辑错误经过网关', async () => {
       const uploaded = await request(server())
         .post('/api/diffusion/blobs')
         .field('purpose', 'input_image')
@@ -297,8 +297,22 @@ describe('阶段 2 其余域契约', () => {
           source_blob_id: 'img_input',
           prompt: 'sketch',
         });
-      expect(edit.status).toBe(501);
-      expect(edit.body.detail).toMatchObject({
+      expect(edit.status).toBe(202);
+      expect(edit.body).toMatchObject({
+        job_id: 'sdedit_test',
+        kind: 'edit',
+      });
+
+      const unsupported = await request(server())
+        .post('/api/diffusion/edit')
+        .send({
+          mode: 'inpaint',
+          source_blob_id: 'img_input',
+          mask_blob_id: 'img_mask',
+          prompt: 'repair the selected area',
+        });
+      expect(unsupported.status).toBe(501);
+      expect(unsupported.body.detail).toMatchObject({
         code: 'DIFFUSION_UNSUPPORTED',
       });
     });

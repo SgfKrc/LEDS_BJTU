@@ -27,6 +27,7 @@ class _ApiService:
     def __init__(self):
         self.load_calls = []
         self.generation = None
+        self.generation_owner_scope = None
         self.cancelled = []
         self.asset_downloads = []
         self.artifact = DiffusionArtifact(
@@ -86,8 +87,9 @@ class _ApiService:
     def unload(self):
         return {"state": "unloaded", "loaded": False}
 
-    def submit_generation(self, generation):
+    def submit_generation(self, generation, *, owner_scope='local'):
         self.generation = generation
+        self.generation_owner_scope = owner_scope
         return {"job_id": "sdjob_test", "state": "queued"}
 
     def put_input_blob(self, data, *, purpose, owner_scope):
@@ -103,7 +105,9 @@ class _ApiService:
 
     def submit_edit(self, request, *, owner_scope):
         self.edit_request = (request, owner_scope)
-        raise DiffusionUnsupportedError('edit executor is not installed')
+        if request.mode not in {'img2img', 'reference'}:
+            raise DiffusionUnsupportedError('edit executor is not installed')
+        return {"job_id": "sdedit_test", "state": "queued", "kind": "edit"}
 
     def get_job(self, job_id):
         if job_id == "missing":
@@ -238,6 +242,7 @@ def test_generate_preset_returns_job_and_blob_contract(diffusion_api):
     assert generated.json() == {"job_id": "sdjob_test", "state": "queued"}
     assert service.generation.seed == 9
     assert service.generation.steps == 2
+    assert service.generation_owner_scope == 'local'
 
     job = client.get("/api/diffusion/jobs/sdjob_test")
     assert job.status_code == 200
@@ -271,10 +276,36 @@ def test_diffusion_api_upload_and_edit_contract(diffusion_api):
             'strength': 0.6,
         },
     )
-    assert edit.status_code == 501
-    assert edit.json()['detail']['code'] == 'DIFFUSION_UNSUPPORTED'
+    assert edit.status_code == 202
+    assert edit.json()['job_id'] == 'sdedit_test'
     assert service.edit_request[0].strength == 0.6
     assert service.edit_request[1] == 'local'
+
+    reference = client.post(
+        '/api/diffusion/edit',
+        json={
+            'mode': 'reference',
+            'source_blob_id': 'img_input',
+            'prompt': 'same person in a city',
+            'edit_adapter_id': 'ip-adapter',
+            'ip_adapter_scale': 0.65,
+        },
+    )
+    assert reference.status_code == 202
+    assert service.edit_request[0].mode == 'reference'
+    assert service.edit_request[0].edit_adapter_id == 'ip-adapter'
+    assert service.edit_request[0].ip_adapter_scale == 0.65
+
+    unsupported = client.post(
+        '/api/diffusion/edit',
+        json={
+            'mode': 'instruction',
+            'source_blob_id': 'img_input',
+            'instruction': 'turn it into a sketch',
+        },
+    )
+    assert unsupported.status_code == 501
+    assert unsupported.json()['detail']['code'] == 'DIFFUSION_UNSUPPORTED'
 
 
 def test_diffusion_upload_uses_magic_bytes_instead_of_declared_mime(monkeypatch):

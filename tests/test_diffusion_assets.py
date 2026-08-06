@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from diffusion.assets import (
     ASSET_CATALOG,
     MANIFEST_NAME,
+    IP_ADAPTER_REPO,
+    IP_ADAPTER_REVISION,
     ORIGINAL_REPO,
     ORIGINAL_REVISION,
     RETRO_REVISION,
@@ -70,6 +72,23 @@ def test_retro_catalog_freezes_revision_and_composes_pinned_safety_checker():
     assert all(item.sha256 for item in safety_files if item.path.endswith(".safetensors"))
 
 
+def test_ip_adapter_catalog_freezes_complete_sd15_safetensors_layout():
+    spec = ASSET_CATALOG["sd15_ip_adapter_v1"]
+
+    assert spec.repo_id == IP_ADAPTER_REPO
+    assert spec.revision == IP_ADAPTER_REVISION
+    assert spec.artifact_kind == "sd15_ip_adapter"
+    assert spec.license_id == "apache-2.0"
+    assert spec.preset_id == ""
+    assert spec.download_bytes == 2573016776
+    assert {item.path for item in spec.files} == {
+        "models/image_encoder/config.json",
+        "models/image_encoder/model.safetensors",
+        "models/ip-adapter_sd15.safetensors",
+    }
+    assert all(item.sha256 for item in spec.files)
+
+
 def test_verifier_rejects_same_size_weight_with_wrong_hash(tmp_path, monkeypatch):
     model_index = _pipeline_index()
     spec = _tiny_spec(model_index, b"good")
@@ -125,6 +144,18 @@ def test_background_download_requires_license_writes_manifest_and_calls_ready(
     assert status["state"] == "completed", status
     assert status["installed"] is True
     assert (tmp_path / "models" / "tiny" / MANIFEST_NAME).is_file()
+    manifest = json.loads(
+        (tmp_path / "models" / "tiny" / MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 2
+    assert len(manifest["artifact_sha256"]) == 64
+    assert manifest["asset"]["artifact_kind"] == "sd15_pipeline"
+    verification = verify_asset_directory(
+        tmp_path / "models" / "tiny",
+        "tiny",
+        full_hash=True,
+    )
+    assert verification["artifact_sha256"] == manifest["artifact_sha256"]
     assert ready and ready[0][0].artifact_id == "tiny"
 
 

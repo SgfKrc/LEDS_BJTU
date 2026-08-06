@@ -691,7 +691,10 @@ class EngineHost:
             return self._diffusion.unload()
 
     def diffusion_generate(self, request: SD15GenerationRequest) -> Dict[str, Any]:
-        return self._diffusion.submit_generation(request)
+        return self._diffusion.submit_generation(
+            request,
+            owner_scope='inference-local',
+        )
 
     def diffusion_put_blob(
         self,

@@ -863,7 +863,7 @@ class DiffusionGenerateRequest(BaseModel):
 
 
 class DiffusionEditRequest(BaseModel):
-    mode: Literal['img2img', 'inpaint', 'instruction']
+    mode: Literal['img2img', 'reference', 'inpaint', 'instruction']
     preset_id: Optional[str] = Field(default=None, max_length=100)
     source_blob_id: str = Field(..., min_length=1, max_length=100)
     mask_blob_id: Optional[str] = Field(default=None, max_length=100)
@@ -880,6 +880,7 @@ class DiffusionEditRequest(BaseModel):
     edit_adapter_id: Optional[str] = Field(default=None, max_length=120)
     conditioning_scale: Optional[float] = None
     image_guidance_scale: Optional[float] = None
+    ip_adapter_scale: Optional[float] = None
 
 
 class ChatRequest(BaseModel):
@@ -1132,6 +1133,7 @@ def _diffusion_edit_request(req: DiffusionEditRequest) -> SD15EditRequest:
         edit_adapter_id=req.edit_adapter_id,
         conditioning_scale=req.conditioning_scale,
         image_guidance_scale=req.image_guidance_scale,
+        ip_adapter_scale=req.ip_adapter_scale,
     )
 
 
@@ -2180,7 +2182,10 @@ def _unload_diffusion_under_model_lock() -> dict:
 async def generate_diffusion_image(req: DiffusionGenerateRequest):
     try:
         generation = _diffusion_generation_request(req)
-        return diffusion_service.submit_generation(generation)
+        return diffusion_service.submit_generation(
+            generation,
+            owner_scope='local',
+        )
     except Exception as exc:
         raise _diffusion_http_exception(exc) from exc
 

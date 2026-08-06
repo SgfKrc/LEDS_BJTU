@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import json
 import math
 import threading
 import time
@@ -18,7 +19,7 @@ from typing import Any, Callable, Dict, Optional
 from runtime_env import sd_runtime_diagnostics
 
 from .artifacts import DiffusionArtifact, DiffusionArtifactInspector
-from .assets import DiffusionAssetManager, DiffusionAssetSpec
+from .assets import MANIFEST_NAME, DiffusionAssetManager, DiffusionAssetSpec
 from .presets import get_preset
 from .sd15_engine import (
     GenerationCancelled,
@@ -215,10 +216,17 @@ class SD15EditRequest:
     edit_adapter_id: Optional[str] = None
     conditioning_scale: Optional[float] = None
     image_guidance_scale: Optional[float] = None
+    ip_adapter_scale: Optional[float] = None
     scheduler: str = ''
 
+    @property
+    def denoising_steps(self) -> int:
+        if self.mode in {'img2img', 'inpaint'}:
+            return int(self.steps * self.strength)
+        return self.steps
+
     def validate(self) -> None:
-        if self.mode not in {'img2img', 'inpaint', 'instruction'}:
+        if self.mode not in {'img2img', 'reference', 'inpaint', 'instruction'}:
             raise DiffusionInputError('unsupported edit mode')
         if not self.source_blob_id.strip():
             raise DiffusionInputError('source_blob_id is required')
@@ -235,10 +243,32 @@ class SD15EditRequest:
                 raise DiffusionInputError('instruction is required for instruction mode')
         elif normalized_instruction:
             raise DiffusionInputError('instruction is only valid for instruction mode')
+        normalized_adapter_id = (self.edit_adapter_id or '').strip()
+        if self.mode == 'reference':
+            if not normalized_adapter_id:
+                raise DiffusionInputError(
+                    'edit_adapter_id is required for reference mode'
+                )
+            if self.ip_adapter_scale is None:
+                raise DiffusionInputError(
+                    'ip_adapter_scale is required for reference mode'
+                )
+        elif normalized_adapter_id and self.mode != 'instruction':
+            raise DiffusionInputError(
+                'edit_adapter_id is only valid for reference or instruction mode'
+            )
+        if self.mode != 'reference' and self.ip_adapter_scale is not None:
+            raise DiffusionInputError(
+                'ip_adapter_scale is only valid for reference mode'
+            )
         if not math.isfinite(self.strength) or not 0.05 <= self.strength <= 1.0:
             raise DiffusionInputError('strength must be finite and between 0.05 and 1.0')
         if self.steps < 1 or self.steps > 100:
             raise DiffusionInputError('steps must be between 1 and 100')
+        if self.mode in {'img2img', 'inpaint'} and self.denoising_steps < 1:
+            raise DiffusionInputError(
+                'steps and strength must produce at least one denoising step'
+            )
         if self.scheduler not in {'', 'PNDMScheduler', 'DPMSolverMultistepScheduler'}:
             raise DiffusionInputError('unsupported SD15 scheduler')
         if not math.isfinite(self.guidance_scale) or self.guidance_scale < 0:
@@ -246,9 +276,12 @@ class SD15EditRequest:
         for name, value in (
             ('conditioning_scale', self.conditioning_scale),
             ('image_guidance_scale', self.image_guidance_scale),
+            ('ip_adapter_scale', self.ip_adapter_scale),
         ):
             if value is not None and (not math.isfinite(value) or value < 0):
                 raise DiffusionInputError(f'{name} must be finite and non-negative')
+        if self.ip_adapter_scale is not None and self.ip_adapter_scale > 2:
+            raise DiffusionInputError('ip_adapter_scale must not exceed 2')
         for name, value in (('width', self.width), ('height', self.height)):
             if value is not None and (value < 64 or value > 768 or value % 8):
                 raise DiffusionInputError(f'{name} must be a multiple of 8 between 64 and 768')
@@ -264,11 +297,13 @@ class SD15EditRequest:
             'width': self.width,
             'height': self.height,
             'steps': self.steps,
+            'denoising_steps': self.denoising_steps,
             'guidance_scale': self.guidance_scale,
             'strength': self.strength,
             'edit_adapter_id': self.edit_adapter_id,
             'conditioning_scale': self.conditioning_scale,
             'image_guidance_scale': self.image_guidance_scale,
+            'ip_adapter_scale': self.ip_adapter_scale,
             'instruction': self.instruction,
             'scheduler': self.scheduler,
         }
@@ -727,8 +762,18 @@ class DiffusionService:
         artifact_id: Optional[str] = None,
         name: Optional[str] = None,
         compute_hash: bool = False,
+        _trusted_sha256: Optional[str] = None,
     ) -> RegisteredDiffusionArtifact:
         artifact = self.inspect(path, compute_hash=compute_hash)
+        if artifact.artifact_kind == 'sd15_ip_adapter' and not artifact.loadable:
+            reason = '; '.join(artifact.warnings) or 'incomplete SD1.5 IP-Adapter directory'
+            raise ValueError(reason)
+        if _trusted_sha256:
+            artifact = replace(artifact, sha256=_trusted_sha256)
+        if artifact.artifact_kind == 'sd15_ip_adapter' and not artifact.sha256:
+            # Adapter identity participates in every result manifest.  A path
+            # alone is not stable enough when users replace local weights.
+            artifact = self.inspect(path, compute_hash=True)
         if artifact.artifact_kind == "unknown":
             reason = "; ".join(artifact.warnings) or "unrecognized SD artifact"
             raise ValueError(reason)
@@ -758,11 +803,25 @@ class DiffusionService:
         return [item.snapshot(include_path=include_path) for item in values]
 
     def _register_catalog_asset(self, spec: DiffusionAssetSpec, path: Path) -> None:
+        trusted_sha256 = ''
+        try:
+            manifest = json.loads((path / MANIFEST_NAME).read_text(encoding='utf-8'))
+            candidate = str(manifest.get('artifact_sha256', ''))
+            manifest_kind = str(manifest.get('asset', {}).get('artifact_kind', ''))
+            if (
+                len(candidate) == 64
+                and all(char in '0123456789abcdef' for char in candidate.lower())
+                and manifest_kind == spec.artifact_kind
+            ):
+                trusted_sha256 = candidate.lower()
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
         self.register_artifact(
             str(path),
             artifact_id=spec.artifact_id,
             name=spec.name,
             compute_hash=False,
+            _trusted_sha256=trusted_sha256 or None,
         )
 
     def asset_catalog(self) -> list[Dict[str, Any]]:
@@ -891,8 +950,14 @@ class DiffusionService:
                 self._state = "unloaded"
         return self.snapshot()
 
-    def submit_generation(self, request: SD15GenerationRequest) -> Dict[str, Any]:
+    def submit_generation(
+        self,
+        request: SD15GenerationRequest,
+        *,
+        owner_scope: str = 'local',
+    ) -> Dict[str, Any]:
         request.validate()
+        normalized_owner = owner_scope.strip()[:128] or 'local'
         with self._lock:
             self._ensure_open_locked()
             if self._engine is None or not self._engine.is_loaded:
@@ -906,7 +971,7 @@ class DiffusionService:
                 job_id=f"sdjob_{uuid.uuid4().hex}",
                 artifact_id=artifact_id,
                 request=request,
-                owner_scope='local',
+                owner_scope=normalized_owner,
                 created_at=self._clock(),
                 progress_total=request.steps,
             )
@@ -946,8 +1011,10 @@ class DiffusionService:
     ) -> Dict[str, Any]:
         request.validate()
         source = self._blob_store.get(request.source_blob_id)
-        if source.purpose != 'input_image':
-            raise DiffusionInputError('source_blob_id must reference an input_image blob')
+        if source.purpose not in {'input_image', 'output'}:
+            raise DiffusionInputError(
+                'source_blob_id must reference an input_image or output blob'
+            )
         normalized_owner = owner_scope.strip()[:128] or 'local'
         if source.owner_scope != normalized_owner:
             raise DiffusionNotFoundError(f'image blob not found: {request.source_blob_id}')
@@ -960,10 +1027,24 @@ class DiffusionService:
                 raise DiffusionNotFoundError(f'image blob not found: {request.mask_blob_id}')
             if (source.width, source.height) != (mask.width, mask.height):
                 raise DiffusionInputError('mask dimensions must match the source image')
+        adapter = None
+        if request.mode == 'reference':
+            with self._lock:
+                adapter = self._get_artifact_locked(request.edit_adapter_id or '')
+            if (
+                adapter.artifact.artifact_kind != 'sd15_ip_adapter'
+                or not adapter.artifact.loadable
+            ):
+                raise DiffusionInputError(
+                    'edit_adapter_id must reference a complete SD1.5 IP-Adapter directory'
+                )
         return {
             'request': request.snapshot(),
             'source_blob': source.descriptor(),
             'mask_blob': mask.descriptor() if mask else None,
+            'edit_adapter': (
+                adapter.snapshot(include_path=False) if adapter else None
+            ),
         }
 
     def submit_edit(
@@ -973,7 +1054,7 @@ class DiffusionService:
         owner_scope: str = 'local',
     ) -> Dict[str, Any]:
         self.validate_edit(request, owner_scope=owner_scope)
-        if request.mode != 'img2img':
+        if request.mode not in {'img2img', 'reference'}:
             raise DiffusionUnsupportedError(
                 f'{request.mode} edit executor is not installed yet'
             )
@@ -984,6 +1065,14 @@ class DiffusionService:
                 raise DiffusionConflictError('SD15 engine is not loaded')
             if self._state != 'loaded' or self._active_job_id is not None:
                 raise DiffusionConflictError('another SD15 edit is active')
+            if request.mode == 'reference' and self._engine_config is not None:
+                if (
+                    self._engine_config.quantization != 'none'
+                    or self._engine_config.enable_qkv_fusion
+                ):
+                    raise DiffusionUnsupportedError(
+                        'IP-Adapter requires a validated non-quantized, non-QKV SD15 profile'
+                    )
             artifact_id = self._loaded_artifact_id
             if not artifact_id:
                 raise DiffusionServiceError('loaded SD artifact identity is missing')
@@ -1009,7 +1098,7 @@ class DiffusionService:
                     source_blob_ids=tuple(source_ids),
                     owner_scope=normalized_owner,
                     created_at=self._clock(),
-                    progress_total=request.steps,
+                    progress_total=request.denoising_steps,
                 )
                 self._jobs[job.job_id] = job
                 self._active_job_id = job.job_id
@@ -1074,6 +1163,13 @@ class DiffusionService:
         try:
             if job.kind == 'edit':
                 source_blob = self._blob_store.get(job.request.source_blob_id)
+                adapter_artifact = None
+                if job.request.mode == 'reference':
+                    with self._lock:
+                        registered_adapter = self._get_artifact_locked(
+                            job.request.edit_adapter_id or ''
+                        )
+                    adapter_artifact = registered_adapter.artifact
                 from PIL import Image
 
                 with Image.open(io.BytesIO(source_blob.data)) as source_image:
@@ -1081,6 +1177,7 @@ class DiffusionService:
                     result = engine.edit(
                         job.request,
                         image=source_image,
+                        adapter=adapter_artifact,
                         callback=_progress,
                     )
             else:
@@ -1110,6 +1207,8 @@ class DiffusionService:
                         'source_blob_id': source_blob.blob_id,
                         'source_sha256': source_blob.sha256,
                         'instruction': job.request.instruction,
+                        'edit_adapter_id': job.request.edit_adapter_id,
+                        'ip_adapter_scale': job.request.ip_adapter_scale,
                     })
                     if job.request.mask_blob_id:
                         mask_blob = self._blob_store.get(job.request.mask_blob_id)
@@ -1128,7 +1227,7 @@ class DiffusionService:
                 )
                 job.state = "completed"
                 job.completed_at = self._clock()
-                job.progress_step = job.request.steps
+                job.progress_step = job.progress_total
                 job.blob = blob.descriptor()
                 job.metrics = {
                     "elapsed_seconds": result.elapsed_seconds,
