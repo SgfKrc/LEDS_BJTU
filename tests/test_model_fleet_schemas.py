@@ -25,6 +25,8 @@ SCHEMA_FILES = {
     "pull-job": "pull-job.schema.json",
     "deployment": "deployment.schema.json",
     "cluster-profile": "cluster-profile.schema.json",
+    "migration-map": "migration-map.schema.json",
+    "fetcher-progress": "fetcher-progress.schema.json",
 }
 
 _VALIDATORS = {}
@@ -66,6 +68,7 @@ _VALID = [
     "pull-job-valid.json",
     "deployment-valid.json",
     "cluster-profile-valid.json",
+    "fetcher-progress-valid.json",
 ]
 _INVALID = [
     "artifact-manifest-invalid-bad-digest.json",
@@ -73,6 +76,7 @@ _INVALID = [
     "pull-job-invalid-state.json",
     "deployment-invalid-status.json",
     "cluster-profile-invalid-endpoint.json",
+    "fetcher-progress-invalid-event.json",
 ]
 
 
@@ -99,3 +103,34 @@ def test_capability_enum_is_frozen():
         "full_worker", "pytorch_layer_pipeline", "llama_cpp", "task_stage",
     }
     assert schema["properties"]["capabilities"]["additionalProperties"] is False
+
+
+def test_migration_map_data_validates_against_schema():
+    """migration-map.json 数据文件自身必须通过 migration-map schema。"""
+    data = json.loads((SCHEMAS / "migration-map.json").read_text(encoding="utf-8"))
+    errors = list(_validator("migration-map").iter_errors(data))
+    assert errors == [], f"migration-map.json 应通过校验: {[e.message for e in errors]}"
+
+
+def test_migration_map_is_self_consistent():
+    """迁移映射清单自洽：目标表已登记、源 id 唯一、幂等键与字段映射非空。"""
+    data = json.loads((SCHEMAS / "migration-map.json").read_text(encoding="utf-8"))
+    target_tables = set(data["target_tables"])
+    source_ids = []
+    for source in data["sources"]:
+        source_ids.append(source["source_id"])
+        assert source["target"]["table"] in target_tables, (
+            f"{source['source_id']} 的目标表未登记: {source['target']['table']}"
+        )
+        assert source["idempotency"].strip()
+        assert source["target"]["field_map"]
+        assert source["id_field"].strip()
+    assert len(source_ids) == len(set(source_ids)), "source_id 必须唯一"
+    assert len(data["rules"]) >= 1
+
+
+def test_migration_map_prescribes_no_duplicate_artifacts():
+    """验收口径：迁移不产生重复 artifact（摘要去重规则存在）。"""
+    data = json.loads((SCHEMAS / "migration-map.json").read_text(encoding="utf-8"))
+    joined = " ".join(data["rules"])
+    assert "重复" in joined and "sha256" in joined

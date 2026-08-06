@@ -19,6 +19,8 @@ const SCHEMA_FILES: Record<string, string> = {
   'pull-job': 'pull-job.schema.json',
   'deployment': 'deployment.schema.json',
   'cluster-profile': 'cluster-profile.schema.json',
+  'migration-map': 'migration-map.schema.json',
+  'fetcher-progress': 'fetcher-progress.schema.json',
 };
 
 const VALID_FIXTURES = [
@@ -27,6 +29,7 @@ const VALID_FIXTURES = [
   'pull-job-valid.json',
   'deployment-valid.json',
   'cluster-profile-valid.json',
+  'fetcher-progress-valid.json',
 ];
 
 const INVALID_FIXTURES = [
@@ -35,6 +38,7 @@ const INVALID_FIXTURES = [
   'pull-job-invalid-state.json',
   'deployment-invalid-status.json',
   'cluster-profile-invalid-endpoint.json',
+  'fetcher-progress-invalid-event.json',
 ];
 
 function loadJson(rel: string): unknown {
@@ -97,5 +101,34 @@ describe('M0 model fleet schemas (TS)', () => {
       'task_stage',
     ]);
     expect(cap.additionalProperties).toBe(false);
+  });
+
+  it('migration-map data validates against its schema', () => {
+    const data = loadJson(join('schemas', 'migration-map.json'));
+    const validate = validatorFor('migration-map');
+    const ok = validate(data);
+    if (!ok) {
+      throw new Error(`migration-map.json 应通过校验: ${JSON.stringify(validate.errors)}`);
+    }
+  });
+
+  it('migration map is self-consistent', () => {
+    const data = loadJson(join('schemas', 'migration-map.json')) as any;
+    const tables = new Set<string>(data.target_tables);
+    const ids = new Set<string>();
+    for (const source of data.sources) {
+      expect(tables.has(source.target.table)).toBe(true);
+      expect(source.idempotency.trim().length).toBeGreaterThan(0);
+      expect(Object.keys(source.target.field_map).length).toBeGreaterThan(0);
+      expect(ids.has(source.source_id)).toBe(false);
+      ids.add(source.source_id);
+    }
+    expect(data.rules.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('migration map prescribes no duplicate artifacts', () => {
+    const data = loadJson(join('schemas', 'migration-map.json')) as any;
+    const joined = data.rules.join(' ');
+    expect(joined).toContain('sha256');
   });
 });
