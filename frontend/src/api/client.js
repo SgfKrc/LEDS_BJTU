@@ -663,6 +663,17 @@ export async function testEmailNotification() {
   return request('/cluster/email-test', { method: 'POST' });
 }
 
+export async function fetchEmailConfig() {
+  return request('/cluster/email-config');
+}
+
+export async function updateEmailConfig(recipient) {
+  return request('/cluster/email-config', {
+    method: 'POST',
+    body: JSON.stringify({ recipient }),
+  });
+}
+
 // ---- 分布式推理开关 ----
 
 export async function fetchDistributedInferenceConfig() {

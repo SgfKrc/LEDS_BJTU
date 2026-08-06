@@ -2916,6 +2916,31 @@ input:focus, textarea:focus { border-color: var(--accent); }
   flex-wrap: wrap;
 }
 
+.email-config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  flex-wrap: wrap;
+}
+
+.email-config-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.email-config-row input {
+  flex: 1;
+  min-width: 180px;
+  max-width: 320px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+
 .identity-current {
   display: flex;
   align-items: center;

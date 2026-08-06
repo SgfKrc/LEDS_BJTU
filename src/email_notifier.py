@@ -4,7 +4,8 @@
 SMTP 发送: QQ 邮箱 SMTP SSL (smtp.qq.com:465)
 IMAP 轮询: QQ 邮箱 IMAP SSL (imap.qq.com:993) — 用于管理员回复 Y/N 投票
 
-配置来源: 环境变量 QLH_SMTP_SENDER / QLH_SMTP_PASSWORD / QLH_SMTP_RECIPIENT
+配置来源: 环境变量 QLH_SMTP_SENDER / QLH_SMTP_PASSWORD；收件邮箱
+优先 node_config.json 的 admin_email（UI 可配置），回退 QLH_SMTP_RECIPIENT。
 详见 SMTP.md 和 .env 配置
 """
 
@@ -33,6 +34,69 @@ IMAP_PORT = int(os.environ.get("QLH_IMAP_PORT", "993"))
 SMTP_SENDER = os.environ.get("QLH_SMTP_SENDER", "")
 SMTP_PASSWORD = os.environ.get("QLH_SMTP_PASSWORD", "")  # QQ 邮箱授权码
 SMTP_RECIPIENT = os.environ.get("QLH_SMTP_RECIPIENT", "")
+
+# node_config.json 中管理员收件邮箱的键名（优先于环境变量 QLH_SMTP_RECIPIENT）
+ADMIN_EMAIL_CONFIG_KEY = "admin_email"
+_ADMIN_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+# ============================================================
+# 管理员收件邮箱（运行时可配置，优先 node_config，回退环境变量）
+# ============================================================
+
+def _node_config_admin_email() -> str:
+    """读取 node_config.json 中的管理员邮箱；异常时返回空串。"""
+    try:
+        from node_config import load_node_config
+        value = load_node_config().get(ADMIN_EMAIL_CONFIG_KEY, "")
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+def get_admin_email() -> str:
+    """返回当前生效的管理员收件邮箱：node_config 优先，回退环境变量。"""
+    configured = _node_config_admin_email()
+    if configured:
+        return configured
+    return SMTP_RECIPIENT.strip()
+
+
+def admin_email_config() -> dict:
+    """返回收件邮箱配置详情：recipient + source（node_config | env | none）。"""
+    configured = _node_config_admin_email()
+    if configured:
+        return {"recipient": configured, "source": "node_config"}
+    if SMTP_RECIPIENT.strip():
+        return {"recipient": SMTP_RECIPIENT.strip(), "source": "env"}
+    return {"recipient": "", "source": "none"}
+
+
+def set_admin_email(email: str) -> str:
+    """校验并持久化管理员收件邮箱到 node_config.json，运行中立即生效。
+
+    Args:
+        email: 合法邮箱地址（传空串可清除自定义配置，回退环境变量）。
+
+    Returns:
+        持久化后生效的收件邮箱。
+
+    Raises:
+        ValueError: 邮箱格式非法。
+    """
+    normalized = (email or "").strip().lower()
+    if normalized and not _ADMIN_EMAIL_RE.match(normalized):
+        raise ValueError(f"非法邮箱地址: {email!r}")
+    from node_config import load_node_config, write_node_config
+    data = load_node_config()
+    data[ADMIN_EMAIL_CONFIG_KEY] = normalized
+    write_node_config(data)
+    # 运行中同步已创建轮询器单例的投票过滤地址
+    poller = _mail_poller
+    if poller is not None:
+        poller.set_admin_email(normalized)
+    logger.info(f"📧 管理员收件邮箱已更新: {normalized or '(回退环境变量)'}")
+    return get_admin_email()
 
 # 邮件投票轮询间隔（秒）
 MAIL_POLL_INTERVAL = 60
@@ -320,16 +384,20 @@ class MailPoller:
         imap_port: int = IMAP_PORT,
         username: str = SMTP_SENDER,
         password: str = SMTP_PASSWORD,
-        admin_email: str = SMTP_RECIPIENT,
+        admin_email: Optional[str] = None,
     ):
         self._imap_server = imap_server
         self._imap_port = imap_port
         self._username = username
         self._password = password
-        self._admin_email = admin_email.lower()
+        self._admin_email = (admin_email or get_admin_email() or "").lower()
         self._running = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def set_admin_email(self, email: str) -> None:
+        """运行时更新投票过滤地址（不影响 IMAP/SMTP 连接参数）。"""
+        self._admin_email = (email or "").strip().lower()
 
     # ---- 公开 API ----
 
@@ -791,5 +859,5 @@ def _send_email_to(subject: str, body: str, to_addr: str) -> bool:
 
 
 def _send_email(subject: str, body: str) -> bool:
-    """向默认管理员发送邮件。"""
-    return _send_email_to(subject, body, SMTP_RECIPIENT)
+    """向当前生效的管理员邮箱发送邮件。"""
+    return _send_email_to(subject, body, get_admin_email())
