@@ -3612,6 +3612,7 @@ class TestRuntimeSafeLayerAssignmentAndAccounting:
         }
         sched._effective_role = lambda: "master"
         sched._push_node_update_to_all_clients = lambda *args, **kwargs: None
+        sched.get_effective_node_id = lambda: 'master'
 
         accounting = sched._record_pipeline_task_accounting(
             "task-1",
@@ -4598,7 +4599,7 @@ class TestPipelineOrchestrationIntegration:
                                "logits": fake_logits_raw,
                            })
 
-        result = sched_with_workers.run_pipeline_safe("test")
+        result = sched_with_workers.run_pipeline_safe("test", max_new_tokens=1)
         # 验证锁已正常释放（不是死锁）
         assert not sched_with_workers._inference_lock.locked(), \
             "推理锁应在 run_pipeline_safe 返回后释放"

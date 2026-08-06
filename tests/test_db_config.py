@@ -36,6 +36,8 @@ requires_db = pytest.mark.skipif(not DB_AVAILABLE, reason="PostgreSQL 不可用"
 # ================================================================
 
 @pytest.mark.skipif(not DB_AVAILABLE, reason="PostgreSQL 不可用")
+@pytest.mark.requires_db
+@pytest.mark.external
 class TestClusterConfig:
     """测试 cluster_config 表的 CRUD 操作"""
 
@@ -104,6 +106,8 @@ class TestClusterConfig:
 # ================================================================
 
 @pytest.mark.skipif(not DB_AVAILABLE, reason="PostgreSQL 不可用")
+@pytest.mark.requires_db
+@pytest.mark.external
 class TestUserSettings:
     """测试用户设置的 JSON 存储"""
 
@@ -176,6 +180,8 @@ class TestUserSettings:
 # ================================================================
 
 @pytest.mark.skipif(not DB_AVAILABLE, reason="PostgreSQL 不可用")
+@pytest.mark.requires_db
+@pytest.mark.external
 class TestDedicatedKeys:
     """测试 save_history 和 distributed_inference_enabled 专用键"""
 

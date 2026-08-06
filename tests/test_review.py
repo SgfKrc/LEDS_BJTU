@@ -241,6 +241,8 @@ class TestStateMachine:
 # ================================================================
 
 @pytest.mark.slow
+@pytest.mark.requires_db
+@pytest.mark.external
 class TestReviewWithDb:
     """需要数据库连接的审查票测试"""
 

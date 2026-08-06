@@ -73,7 +73,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
     def do_GET(self):
@@ -139,7 +139,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         .encode("utf-8")
                     )
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     return  # 客户端已取消断连（best-effort 取消语义）
                 if first_chunk_written is not None:
                     first_chunk_written.set()
@@ -160,7 +160,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                     .encode("utf-8")
                 )
                 self.wfile.write(b"data: [DONE]\n\n")
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
         else:
             self._send_json({
