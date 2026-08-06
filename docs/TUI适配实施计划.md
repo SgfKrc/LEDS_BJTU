@@ -501,16 +501,16 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - `bjtu chat` / `bjtu.sh chat` 启动路由：缺依赖只显示检测结果与安装命令并 exit 2，不污染全局解释器；管理 TUI 与 `--plain` 不受影响。
   - 待办：Windows/Linux 安装包携带依赖（T9.6）；干净环境实测截图。
 
-- [x] **T9.2 聊天页面与命令复用**（主体完成 2026-08-06；T9.6 打包前复查）
+- [x] **T9.2 聊天页面与命令复用** ✅ 2026-08-06（含终端布局快照验收）
   - transcript（Markdown 增量渲染）、输入区（Enter 发送 / Alt+Enter、Ctrl+J 换行）、状态栏、滚动与第 8 屏入口（`bjtu chat`）。
   - 共享层 `src/tui_shared.py`：API_PATHS 端点常量、`build_interactive_request`、`format_metrics`、`parse_session_line`、命令注册表 `COMMAND_SPECS`/`help_text`、`resolve_route_arg`；纯标准库可导入（管理 TUI 亦可复用）；聊天页不再散落端点字符串。
-  - 待办：80×24 / 120×30 / 窄终端与 CJK/emoji/code block 的截图快照验收（需真终端）。
+  - 布局快照验收（2026-08-06）：`scripts/tui_chat_walkthrough.py` 在 80×24 / 120×30 / 60×18（窄终端下限）三尺寸 headless 驱动真实聊天页，18 项断言 × 3 尺寸 = 54/54 通过（布局/中文+emoji/代码块/流式完成/路由命令/帮助/新会话/取消 partial/退出），SVG 截图证据存 `build/tui-chat/`。
 
 - [x] **T9.3 真流式、取消与错误恢复** ✅ 2026-08-06
   - interactive SSE、预生成 generation ID、Ctrl+C 取消（首 token 前后均可）与 epoch fencing（取消/切换会话时迟到事件丢弃）已落地。
   - 错误恢复状态机：`done`/`error`/`cancelled` 为终止事件；网络断开（Read/Connect/Timeout）显示“连接中断”并保留已生成 partial；连接正常关闭但无终止事件（空响应/服务端提前关闭）显示“流意外结束/连接意外结束”；生成失败只结束当前 assistant 占位，不清空 transcript。
   - 修复：Markdown widget 在 mount 完成前 update 会被构造参数覆盖（Textual 8 行为）——消息追加链 async 化（`await transcript.mount(md)` 完成后再 update）；Ctrl+C 在 TextArea 内拦截转发（内部 copy 绑定优先于 App binding）。
-  - 验收：`tests/test_tui_chat.py` 11 用例（含空响应/error 保留 partial/断线/取消 partial/输入清空）+ 全量 T9 回归 120 passed。
+  - 验收：`tests/test_tui_chat.py` 17 用例（含空响应/error 保留 partial/断线/取消 partial/输入清空）+ 全量 T9 回归 126 passed + 终端走查 54/54（见 T9.2）。
 
 - [x] **T9.4 会话与历史** ✅ 2026-08-06
   - 新建（POST /api/sessions）、恢复（POST /api/sessions/{id}/activate 返回历史）、重命名（PUT /api/sessions/{id}）、删除（DELETE /api/sessions/{id}）与 `/new` `/resume` `/rename` `/delete-session` 命令落地。
