@@ -7,7 +7,8 @@
  * 3.1 骨架：/health + settings 域（首迁域，cluster_config 表语义对齐 db.py）
  * 3.2 逐域迁移：sessions/conversations/logs/review/models/workflows/bootstrap
  */
-import { All, Controller, Module, NotFoundException, Req } from '@nestjs/common';
+import { All, Controller, Module, NotFoundException, OnApplicationBootstrap, Req } from '@nestjs/common';
+import * as path from 'path';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -16,7 +17,6 @@ import { RequestIdInterceptor } from './common/request-id';
 import { ConfigDao } from './data/config-dao';
 import { LogBuffer } from './data/log-buffer';
 import { LogFileStore } from './data/log-file-store';
-import { ModelRegistryStore } from './data/model-registry-store';
 import { ReviewStore } from './data/review-store';
 import { SessionStore } from './data/session-store';
 import { WorkflowJournalStore } from './data/workflow-journal-store';
@@ -71,7 +71,6 @@ export class CatchAllController {
     LogFileStore,
     ReviewStore,
     ReviewService,
-    ModelRegistryStore,
     WorkflowJournalStore,
     // M1：本地 SQLite 事实源（唯一写者，惰性打开）+ outbox + 投影
     {
@@ -88,7 +87,24 @@ export class CatchAllController {
     LegacyMigration,
   ],
 })
-export class AppModule {}
+export class AppModule implements OnApplicationBootstrap {
+  constructor(
+    private readonly migration: LegacyMigration,
+  ) {}
+
+  /** 启动时自动执行旧源一次性迁移（幂等；源不存在/为空则无操作）。 */
+  async onApplicationBootstrap(): Promise<void> {
+    const cwd = process.cwd();
+    await this.migration.run({
+      // catalog seed 由 scripts/export_model_catalog.py 生成（build/ 为忽略产物）
+      catalogSeedPath: process.env.QLH_CATALOG_SEED_PATH
+        || path.join(cwd, '..', 'build', 'model-fleet', 'catalog-seed.json'),
+      // 旧 control-svc JSON 注册表（ModelRegistryStore 默认路径）
+      registryJsonPath: process.env.QLH_LEGACY_REGISTRY_PATH
+        || path.join(cwd, 'model_registry.json'),
+    });
+  }
+}
 
 export async function createApp(): Promise<NestFastifyApplication> {
   const app = await NestFactory.create<NestFastifyApplication>(

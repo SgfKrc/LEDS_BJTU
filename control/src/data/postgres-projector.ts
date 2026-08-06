@@ -17,12 +17,14 @@ export interface ProjectorOptions {
   baseIntervalMs?: number;
   /** 失败退避上限（毫秒）。 */
   maxIntervalMs?: number;
+  /** 测试注入：自定义 pg Client 工厂（缺省 new Client）。 */
+  clientFactory?: () => Client;
 }
 
-const DEFAULT_OPTIONS: Required<ProjectorOptions> = {
+const DEFAULT_OPTIONS = {
   baseIntervalMs: 5_000,
   maxIntervalMs: 60_000,
-};
+} as const;
 
 @Injectable()
 export class PostgresProjector {
@@ -66,18 +68,21 @@ export class PostgresProjector {
     if (!this.configDao.dbEnabled()) {
       return { projected: 0, skipped: this.outbox.pendingCount(), error: 'not_configured' };
     }
+    const factory = this.options.clientFactory;
     let client: Client | null = null;
     let projected = 0;
     let skipped = 0;
     try {
-      client = new Client({
-        host: this.configDao.getConnectionInfo().host,
-        port: this.configDao.getConnectionInfo().port,
-        database: this.configDao.getConnectionInfo().db,
-        user: process.env.QLH_DB_USER,
-        password: process.env.QLH_DB_PASSWORD,
-        connectionTimeoutMillis: 3000,
-      });
+      client = factory
+        ? factory()
+        : new Client({
+            host: this.configDao.getConnectionInfo().host,
+            port: this.configDao.getConnectionInfo().port,
+            database: this.configDao.getConnectionInfo().db,
+            user: process.env.QLH_DB_USER,
+            password: process.env.QLH_DB_PASSWORD,
+            connectionTimeoutMillis: 3000,
+          });
       await client.connect();
       await client.query(`
         CREATE TABLE IF NOT EXISTS outbox_projection (
@@ -126,7 +131,7 @@ export class PostgresProjector {
   private backoff(): void {
     const max = this.options.maxIntervalMs ?? DEFAULT_OPTIONS.maxIntervalMs;
     this.currentIntervalMs = Math.min(
-      Math.max(this.currentIntervalMs * 2, this.options.baseIntervalMs ?? 5_000),
+      this.currentIntervalMs * 2,
       max,
     );
   }
