@@ -38,15 +38,32 @@ describe('ModelRegistryRepository', () => {
     const repo = new ModelRegistryRepository(store);
     const digestA = 'a'.repeat(64);
     const digestB = 'b'.repeat(64);
-    repo.upsert({ model_id: 'm1', name: 'M1', model_path: '/x', sha256: digestA });
-    repo.upsert({ model_id: 'm2', name: 'M2', model_path: '/y', sha256: digestB });
+    repo.upsert({
+      model_id: 'm1', name: 'M1', model_type: 'safetensors',
+      model_path: '/x', gguf_path: '', recommended_vram_gb: 8,
+      max_context: 4096, huggingface_id: '', description: '',
+      quant_types: ['fp16'], sha256: digestA,
+    });
+    repo.upsert({
+      model_id: 'm2', name: 'M2', model_type: 'gguf',
+      model_path: '/y', gguf_path: '', recommended_vram_gb: 8,
+      max_context: 4096, huggingface_id: '', description: '',
+      quant_types: ['Q4_K_M'], sha256: digestB,
+    });
     // 同摘要的新 model_id 应被标记为重复
     expect(repo.existsDigest(digestA, 'm3')).toBe(true);
     expect(repo.existsDigest(digestA, 'm1')).toBe(false); // 排除自身
     // 覆盖更新
-    repo.upsert({ model_id: 'm1', name: 'M1v2', model_path: '/x2', sha256: digestA });
+    repo.upsert({
+      model_id: 'm1', name: 'M1v2', model_type: 'safetensors',
+      model_path: '/x2', gguf_path: '', recommended_vram_gb: 8,
+      max_context: 4096, huggingface_id: '', description: '',
+      quant_types: ['fp16'], sha256: digestA,
+    });
     expect(repo.get('m1')?.name).toBe('M1v2');
     expect(repo.list().length).toBe(2);
+    expect(repo.delete('m2')).toBe(true);
+    expect(repo.delete('m2')).toBe(false);
     store.close();
   });
 });
@@ -96,7 +113,7 @@ describe('LegacyMigration', () => {
       writeFileSync(registryPath, JSON.stringify([
         { model_id: 'user-model', name: 'U', model_path: '/u', sha256: digest },
         { model_id: 'user-model-copy', name: 'U2', model_path: '/u2', sha256: digest },
-        { model_id: 'no-digest', name: 'X', model_path: '/x' }, // 摘要缺失拒绝
+        { model_id: 'no-digest', name: 'X', model_path: '/x' }, // 无摘要 → NULL 入库
       ]), 'utf-8');
 
       const store = tempStore();
@@ -112,7 +129,7 @@ describe('LegacyMigration', () => {
         registryJsonPath: registryPath,
       });
       expect(first.catalog_imported).toBe(2);
-      expect(first.registry_imported).toBe(1);      // 只有 user-model
+      expect(first.registry_imported).toBe(2);      // user-model + no-digest（NULL 摘要）
       expect(first.registry_skipped_digest).toBe(1); // user-model-copy 同摘要
       expect(first.settings_skipped).toBe(1);        // 无 loader
 
@@ -128,7 +145,7 @@ describe('LegacyMigration', () => {
         'SELECT COUNT(*) AS c FROM model_registry',
       ).get() as { c: number }).c;
       expect(catalogCount).toBe(2);
-      expect(registryCount).toBe(1);
+      expect(registryCount).toBe(2);
       expect(second.registry_skipped_digest).toBe(1);
       store.close();
     } finally {

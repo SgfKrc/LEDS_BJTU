@@ -65,7 +65,7 @@ export class LegacyMigration {
       }
     }
 
-    // 2) 用户注册表（旧 JSON，sha256 去重）
+    // 2) 用户注册表（旧 JSON；有摘要去重，无摘要以 NULL 入库待 M2 补摘要）
     if (sources.registryJsonPath && fs.existsSync(sources.registryJsonPath)) {
       const rows = JSON.parse(
         fs.readFileSync(sources.registryJsonPath, 'utf-8'),
@@ -73,18 +73,25 @@ export class LegacyMigration {
       for (const row of rows) {
         const modelId = String(row.model_id ?? '');
         const digest = String(row.sha256 ?? row.file_sha256 ?? '');
-        if (!modelId || !digest) continue; // 摘要缺失拒绝注册
-        if (this.registry.existsDigest(digest, modelId)) {
+        if (!modelId) continue;
+        if (digest && this.registry.existsDigest(digest, modelId)) {
           result.registry_skipped_digest += 1;
           continue; // 同摘要只注册一次
         }
         this.registry.upsert({
           model_id: modelId,
           name: String(row.name ?? modelId),
+          model_type: String(row.model_type ?? 'safetensors'),
           model_path: String(row.model_path ?? ''),
-          gguf_path: row.gguf_path ? String(row.gguf_path) : null,
-          quantization: row.quant_type ? String(row.quant_type) : null,
-          sha256: digest,
+          gguf_path: String(row.gguf_path ?? ''),
+          recommended_vram_gb: Number(row.recommended_vram_gb) || 8.0,
+          max_context: Number(row.max_context) || 4096,
+          huggingface_id: String(row.huggingface_id ?? ''),
+          description: String(row.description ?? ''),
+          quant_types: Array.isArray(row.quant_types)
+            ? row.quant_types.map(String)
+            : [],
+          sha256: digest || null,
         });
         result.registry_imported += 1;
       }
