@@ -80,3 +80,4 @@ _to_delete/
 reasonix.toml
 tests/simulation/results/
 .venv-tui/
+control/qlh-control.sqlite3*
