@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildEditRequest,
+  buildReferenceRequest,
   canUseLocalDiffusion,
   loadedArtifactId,
   normalizeDiffusionJob,
@@ -117,6 +118,20 @@ test('preset form carries a default strength usable by the edit flow', () => {
   assert.equal(form.strength, 0.75);
   const fromPreset = presetToForm({ preset_id: 'p', prompt: 'x' });
   assert.equal(fromPreset.strength, 0.75);
+});
+
+test('reference request carries adapter identity and clamps its scale', () => {
+  const form = presetToForm(null);
+  form.prompt = 'same character in a new scene';
+  form.ipAdapterScale = '2.5';
+
+  const request = buildReferenceRequest(form, 'img_reference', 'ip-adapter');
+
+  assert.equal(request.mode, 'reference');
+  assert.equal(request.source_blob_id, 'img_reference');
+  assert.equal(request.edit_adapter_id, 'ip-adapter');
+  assert.equal(request.ip_adapter_scale, 2);
+  assert.equal(request.strength, undefined);
 });
 
 test('diffusion JSON API keeps encoded identifiers and request payloads', async () => {
