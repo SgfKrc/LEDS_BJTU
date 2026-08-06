@@ -110,6 +110,8 @@ class SD15Engine:
         self._diffusers_logging: Any = None
         self._ip_adapter_identity: Optional[str] = None
         self._ip_adapter_scale: Optional[float] = None
+        self._inpaint_pipeline: Any = None
+        self._inpaint_identity: Optional[str] = None
 
     @staticmethod
     @contextmanager
@@ -185,6 +187,12 @@ class SD15Engine:
                 "adapter_identity": self._ip_adapter_identity,
                 "scale": self._ip_adapter_scale,
             },
+            "inpaint": {
+                "supported": True,
+                "strategy": "sd15_inpaint_pipeline",
+                "pipeline_loaded": self._inpaint_identity is not None,
+                "pipeline_identity": self._inpaint_identity,
+            },
         }
 
     def _require_quantization_backend(self) -> Any:
@@ -222,6 +230,8 @@ class SD15Engine:
         self._quantized_linear_count = 0
         self._device = "cpu"
         self._diffusers_logging = None
+        self._inpaint_pipeline = None
+        self._inpaint_identity = None
         try:
             import gc
             import torch
@@ -327,7 +337,14 @@ class SD15Engine:
                 replaced += SD15Engine._replace_linear_with_8bit_modules(child, torch=torch, bnb=bnb)
         return replaced
 
-    def _configure_pipeline(self, pipeline: Any, *, use_cuda: bool, torch: Any) -> Any:
+    def _configure_pipeline(
+        self,
+        pipeline: Any,
+        *,
+        use_cuda: bool,
+        torch: Any,
+        track_quantization: bool = True,
+    ) -> Any:
         """Apply mutually validated memory and execution strategies."""
 
         set_progress = getattr(pipeline, "set_progress_bar_config", None)
@@ -354,13 +371,15 @@ class SD15Engine:
             unet = getattr(pipeline, "unet", None)
             if unet is None:
                 raise RuntimeError("SD15 pipeline has no U-Net to quantize")
-            self._quantized_linear_count = self._replace_linear_with_8bit_modules(
+            quantized_count = self._replace_linear_with_8bit_modules(
                 unet,
                 torch=torch,
                 bnb=bnb,
             )
-            if self._quantized_linear_count == 0:
+            if quantized_count == 0:
                 raise RuntimeError("SD15 U-Net has no Linear layers eligible for 8-bit quantization")
+            if track_quantization:
+                self._quantized_linear_count = quantized_count
 
         if use_cuda and self.config.enable_model_cpu_offload:
             # Accelerate moves one component at a time and keeps baseline SD1.5
@@ -482,8 +501,13 @@ class SD15Engine:
             self._diffusers_logging = None
             self._ip_adapter_identity = None
             self._ip_adapter_scale = None
+            inpaint_pipeline = self._inpaint_pipeline
+            self._inpaint_pipeline = None
+            self._inpaint_identity = None
             if pipeline is not None:
                 del pipeline
+            if inpaint_pipeline is not None:
+                del inpaint_pipeline
             try:
                 import gc
                 import torch
@@ -555,6 +579,77 @@ class SD15Engine:
             edit_pipeline.enable_vae_slicing()
         pipeline._qlh_img2img_pipeline = edit_pipeline
         return edit_pipeline
+
+    def _get_inpaint_pipeline(self, artifact: DiffusionArtifact) -> Any:
+        """Load one pinned inpaint pipeline lazily and reuse it across edits."""
+
+        if artifact.artifact_kind != "sd15_inpaint_pipeline" or not artifact.loadable:
+            raise ValueError("inpaint mode requires a complete SD1.5 inpaint pipeline")
+        identity = artifact.sha256 or artifact.path
+        if self._inpaint_pipeline is not None and self._inpaint_identity == identity:
+            return self._inpaint_pipeline
+        if self.config.quantization != "none" or self.config.enable_qkv_fusion:
+            raise RuntimeError(
+                "SD15 inpaint has not passed the quantized or QKV-fused compatibility gate"
+            )
+        if self._device.startswith("cuda") and not self.config.enable_model_cpu_offload:
+            raise RuntimeError(
+                "SD15 inpaint currently requires model CPU offload to avoid two resident pipelines"
+            )
+
+        from pathlib import Path
+
+        import torch
+        from diffusers import StableDiffusionInpaintPipeline
+        from diffusers.utils import logging as diffusers_logging
+
+        model_path = Path(artifact.path).expanduser()
+        if not model_path.is_dir():
+            raise ValueError("inpaint artifact must be a local Diffusers directory")
+
+        use_cuda = self._device.startswith("cuda") and torch.cuda.is_available()
+        dtype = (
+            torch.float16
+            if use_cuda and self.config.dtype == "float16"
+            else torch.float32
+        )
+        replacement: Any = None
+        try:
+            with self._suspended_diffusers_progress(diffusers_logging):
+                load_kwargs = self._pipeline_load_kwargs(
+                    dtype=dtype,
+                    artifact=artifact,
+                )
+                load_kwargs.update(
+                    self._mixed_precision_safety_overrides(
+                        model_path=model_path,
+                        artifact=artifact,
+                        dtype=dtype,
+                    )
+                )
+                replacement = StableDiffusionInpaintPipeline.from_pretrained(
+                    model_path,
+                    **load_kwargs,
+                )
+                self._validate_pipeline_safety(replacement)
+                replacement = self._configure_pipeline(
+                    replacement,
+                    use_cuda=use_cuda,
+                    torch=torch,
+                    track_quantization=False,
+                )
+        except Exception:
+            if replacement is not None:
+                del replacement
+            raise
+
+        previous = self._inpaint_pipeline
+        self._inpaint_pipeline = replacement
+        self._inpaint_identity = identity
+        if previous is not None:
+            self._remove_model_cpu_offload_hooks(previous)
+            del previous
+        return replacement
 
     def _unload_ip_adapter(self, pipeline: Any) -> None:
         if self._ip_adapter_identity is None:
@@ -752,13 +847,14 @@ class SD15Engine:
         request: Any,
         *,
         image: Any,
+        mask: Any = None,
         adapter: Optional[DiffusionArtifact] = None,
         callback: Optional[Callable[[int, int], None]] = None,
     ) -> SD15GenerationResult:
-        '''Run local img2img or IP-Adapter reference generation.'''
+        '''Run local img2img, inpaint, or IP-Adapter reference generation.'''
 
         mode = getattr(request, 'mode', '')
-        if mode not in {'img2img', 'reference'}:
+        if mode not in {'img2img', 'reference', 'inpaint'}:
             raise RuntimeError('SD15 engine does not support this edit mode yet')
         request.validate()
         with self._lock:
@@ -791,6 +887,13 @@ class SD15Engine:
                     scale=float(request.ip_adapter_scale),
                 )
                 edit_pipeline = pipeline
+            elif mode == 'inpaint':
+                if adapter is None:
+                    raise ValueError('inpaint mode requires a dedicated inpaint artifact')
+                if mask is None:
+                    raise ValueError('inpaint mode requires a mask image')
+                self._unload_ip_adapter(pipeline)
+                edit_pipeline = self._get_inpaint_pipeline(adapter)
             else:
                 self._unload_ip_adapter(pipeline)
                 edit_pipeline = self._get_img2img_pipeline(pipeline)
@@ -803,10 +906,17 @@ class SD15Engine:
             try:
                 from PIL import Image
                 source_image = image.convert('RGB') if hasattr(image, 'convert') else image
-                if mode == 'img2img':
+                if mode in {'img2img', 'inpaint'}:
                     source_image = source_image.resize(
                         (request.width, request.height),
                         Image.Resampling.LANCZOS,
+                    )
+                mask_image = None
+                if mode == 'inpaint':
+                    mask_image = mask.convert('L') if hasattr(mask, 'convert') else mask
+                    mask_image = mask_image.resize(
+                        (request.width, request.height),
+                        Image.Resampling.NEAREST,
                     )
                 started = time.perf_counter()
                 diffusers_logging = self._diffusers_logging
@@ -825,6 +935,14 @@ class SD15Engine:
                         if mode == 'reference':
                             call_kwargs.update({
                                 'ip_adapter_image': source_image,
+                                'height': request.height,
+                                'width': request.width,
+                            })
+                        elif mode == 'inpaint':
+                            call_kwargs.update({
+                                'image': source_image,
+                                'mask_image': mask_image,
+                                'strength': request.strength,
                                 'height': request.height,
                                 'width': request.width,
                             })
@@ -856,10 +974,18 @@ class SD15Engine:
                     'engine': (
                         'diffusers_sd15_ip_adapter'
                         if mode == 'reference'
+                        else 'diffusers_sd15_inpaint'
+                        if mode == 'inpaint'
                         else 'diffusers_sd15_img2img'
                     ),
                     'edit_mode': mode,
-                    'strength': request.strength if mode == 'img2img' else None,
+                    'strength': request.strength if mode in {'img2img', 'inpaint'} else None,
+                    'mask_semantics': (
+                        'white=redraw, black=preserve' if mode == 'inpaint' else None
+                    ),
+                    'inpaint_sha256': (
+                        adapter.sha256 if mode == 'inpaint' and adapter else None
+                    ),
                     'ip_adapter_scale': (
                         request.ip_adapter_scale if mode == 'reference' else None
                     ),
@@ -872,7 +998,7 @@ class SD15Engine:
                     'height': request.height,
                     'steps': request.steps,
                     'guidance_scale': request.guidance_scale,
-                    'scheduler': request.scheduler or type(getattr(pipeline, 'scheduler', None)).__name__,
+                    'scheduler': request.scheduler or type(getattr(edit_pipeline, 'scheduler', None)).__name__,
                     'safety_flagged': bool(nsfw_flags and nsfw_flags[0]),
                     'capabilities': self.capabilities,
                 },

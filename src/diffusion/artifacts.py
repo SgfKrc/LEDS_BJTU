@@ -287,7 +287,12 @@ class DiffusionArtifactInspector:
         for component in required:
             if not (path / component).exists():
                 missing.append(component)
-        kind = "sd15_pipeline" if not missing else "unknown"
+        if not missing and class_name == "StableDiffusionInpaintPipeline":
+            # Inpainting U-Nets use a 9-channel latent input and cannot be
+            # loaded through the ordinary StableDiffusionPipeline path.
+            kind = "sd15_inpaint_pipeline"
+        else:
+            kind = "sd15_pipeline" if not missing else "unknown"
         if missing:
             warnings.append("Diffusers pipeline 缺少必要组件: " + ", ".join(missing))
         if class_name == "StableDiffusionControlNetPipeline" and not (path / "controlnet").exists():
@@ -301,7 +306,7 @@ class DiffusionArtifactInspector:
             precision=self._directory_precision(path),
             sha256=sha256,
             size_bytes=size_bytes,
-            loadable=kind == "sd15_pipeline",
+            loadable=kind in {"sd15_pipeline", "sd15_inpaint_pipeline"},
             missing_components=missing,
             warnings=warnings,
         )

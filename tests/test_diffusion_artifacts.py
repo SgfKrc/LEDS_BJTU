@@ -38,6 +38,26 @@ def test_diffusers_directory_is_recognized_without_loading_weights(tmp_path):
     assert artifact.missing_components == []
 
 
+def test_inpaint_directory_has_a_dedicated_non_base_artifact_kind(tmp_path):
+    root = tmp_path / "sd15-inpaint"
+    for component in ("unet", "vae", "text_encoder", "tokenizer", "scheduler"):
+        (root / component).mkdir(parents=True, exist_ok=True)
+    (root / "model_index.json").write_text(
+        json.dumps({"_class_name": "StableDiffusionInpaintPipeline"}),
+        encoding="utf-8",
+    )
+    _write_safetensors_header(
+        root / "unet" / "diffusion_pytorch_model.safetensors",
+        {"conv_in.weight": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}},
+    )
+
+    artifact = DiffusionArtifactInspector().inspect(str(root), compute_hash=True)
+
+    assert artifact.artifact_kind == "sd15_inpaint_pipeline"
+    assert artifact.loadable is True
+    assert artifact.precision == "fp16"
+
+
 def test_controlnet_single_file_is_not_treated_as_a_full_checkpoint(tmp_path):
     path = tmp_path / "control_v11e_sd15_ip2p_fp16.safetensors"
     _write_safetensors_header(

@@ -1,9 +1,9 @@
 # SD 1.5 引擎与分布式图像生成实施计划
 
-> 文档状态：部分实施（`L4 Candidate`；SD-N1 已完成，SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；img2img 与 IP-Adapter `reference` 的后端、前端和双模型完整自动质量/显存门均已通过，双人目视审核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，5 份报告均 passed）；局部重绘、指令式编辑、发布包和分布式阶段均未完成，仍由《总体下一步计划》L4-SD1.5 管理优先级）
+> 文档状态：部分实施（`L4 Candidate`；SD-N1 与 SD-N5.2 已完成；SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；img2img 与 IP-Adapter `reference` 的后端、前端和双模型完整自动质量/显存门均已通过，双人目视审核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，5 份报告均 passed）；指令式编辑、发布包和分布式阶段仍未完成，继续由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
-> 更新日期：2026-08-06
+> 更新日期：2026-08-07
 >
 > 适用范围：Windows CUDA PC 上的 Stable Diffusion 1.5 本地文生图，以及后续图生图、局部重绘、指令式编辑和基于现有 TaskGraph/PC Full Worker 的跨 PC 图像批次分布式展示
 >
@@ -11,7 +11,7 @@
 
 本文同时记录计划与已验证边界。任何阶段只有完成对应自动化、真实模型、真实 GPU、跨设备和安装包验收后，才能把状态改为“已实现”。当前不得因为单机基线通过而宣称已支持分布式图像生成。
 
-## 0. 2026-08-06 实施状态
+## 0. 2026-08-07 实施状态
 
 | 范围 | 状态 | 已验证证据 |
 |---|---|---|
@@ -19,11 +19,11 @@
 | `SD-N1` 本地单机文生图 | `Completed`（2026-08-05） | RTX 4060 Laptop GPU（8,188 MiB）/ 16 GB RAM、`torch 2.5.1+cu121`、`diffusers 0.35.2`、`transformers 4.47.1`：固定 seed `19950101` 起的 10 次连续 512x512/28 steps FP16 baseline 均实际生成成功，耗时 6.909–11.778 s（平均 8.844 s）；另以 8-bit U-Net Linear 量化 + QKV 融合组合完成 512x512/28 steps，耗时 10.030 s，峰值 reserved 显存 3,735,027,712 bytes。新增本地资产登记、加载/卸载、异步 job、step 取消、结果查询/删除和有界内存 PNG blob，并接通单体 FastAPI、inference-svc 与 Nest 网关；自动化覆盖 LLM/SD 双向生命周期互斥、加载失败及取消/编码竞态。真实 inference-svc 路由验收完成 512x512/4 steps PNG（542,085 bytes），取消在第 1/50 步后 0.244 秒收敛且无 blob；SD 卸载后 Qwen 1.8B GGUF 在 5.471 秒内重载并完成最短对话。SD 卸载后仅余约 20 MiB CUDA 上下文 reserved，不残留模型显存。`diffusers 0.38.0` 会要求本项目兼容窗口外的 DINOv2 配置，故不作为打包组合。前端、发布包和分布式 Worker 属于后续阶段。 |
 | `SD-N2` 本地图像工作区 | `In Progress`（2026-08-05） | Web 主节点已接通本机 Diffusers 检查/登记、profile 加载、LLM/SD 显式互斥切换、原版/90s preset、异步 step 进度、取消和 PNG 生命周期。DreamBooth `aa8a082c...` 及逐权重 SHA 已冻结，4,874,690,864-byte 固定下载集合已实际下载、完整校验并生成 16 文件 manifest；独立脚本下载后服务端也能在目录刷新时自动发现并注册。90s 组合资产固定原版 SD 1.5 safety checker，组件缺失时 fail-closed。第二轮固定十种子自动门 10/10 通过：10 个唯一 PNG、0 个 safety flag、最小熵 7.855、最小文件 446,750 bytes，总耗时 111.712 s。**双人目视与许可复核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，十种子报告 status=passed）**。正式离线发布包仍未完成，因此 SD-N2 不得标记完成。 |
 | single-file checkpoint、LoRA、ControlNet | 未实施 | Inspector 可以拒绝把 ControlNet 当完整模型；实际加载和组合仍未接入。 |
-| 图生图 img2img、参考图一致性、局部重绘、指令式编辑 | img2img 与 IP-Adapter `In Progress`，自动门完成、待双人目视；其余未实施 | **img2img（2026-08-06）**：引擎 `SD15Engine.edit()` 复用已加载组件（`StableDiffusionImg2ImgPipeline.from_pipe`/`components`）、服务层 `submit_edit`/`validate_edit`（blob 租约、源图/mask 维度校验、strength 0.05–1.0）、单体 FastAPI 与 inference-svc 路由、Nest 网关 multipart 转发与 Web 工作区均已落地。已修复生成结果续编的 `purpose`/`owner_scope` 契约，并完成真实 inference-svc `文生图 → output Blob 图生图 → 引用删除 → 取消 → 卸载` 快速门：512×512/4 steps 文生图 6.739 s，strength 0.55 图生图 7.428 s，源 Blob 被结果引用时删除正确返回 409，取消在第 1/20 step 后 0.054 s 收敛。真实 Edge 150 浏览器门完成“上传源图 → img2img → 继续编辑 → 再次 img2img → 卸载”，两轮引擎耗时 5.998/4.842 s、像素采样范围 245/239。源图 SHA-256 固定为 `a6fd131b...e93264`；原版 28 steps 与 90s 40 steps 各完成 10 seed × 0.25/0.55/0.85 共 30 张，均 30/30 自动通过且 30 张唯一，耗时 291.993/361.291 s，连续 allocated/reserved span 均为 0，卸载后 allocated 增量 8,519,680 bytes。两份报告均为 `pending_manual_review`。**IP-Adapter（2026-08-06）**：冻结并下载 `h94/IP-Adapter@018e4027...` 的 2,573,016,776-byte 离线资产，稳定 artifact SHA-256 为 `671c7452...e94c4`；Inspector、服务/API、Web `reference` 模式和真实 GPU 生命周期均已通过。修复 adapter 后注册的 2.5 GB image encoder 未进入 Accelerate CPU-offload hook 的性能缺陷，并在 pipeline 级关闭 tqdm，4-step 回归为 4.537 s、无 `[Errno 22]`。固定人物参考图 SHA-256 为 `3271580f...fe38f`；原版 28 steps 完成 36/36 有效图，90s 40 steps 完成 35 张有效图并正确保留 1 张 safety 黑图证据，三档 scale 有效数为 11/12/12；两轮峰值 reserved 均为 2,789,212,160 bytes，显存门通过，报告均为 `pending_manual_review`。**img2img（2 份）与 IP-Adapter（2 份）报告于 2026-08-06 双人目视签字完成（Siegfried Kkm./浅草爱音，均 status=passed），目视门已满足；IP-Adapter 只承诺人物主要要素保持，不承诺精确身份锁定。** `inpaint`/`instruction` 继续显式拒绝。 |
+| 图生图 img2img、参考图一致性、局部重绘、指令式编辑 | img2img 与 IP-Adapter `In Progress`（自动门和双人目视已完成）；inpaint `Completed`（2026-08-07）；instruction 未实施 | **img2img（2026-08-06）**：引擎 `SD15Engine.edit()` 复用已加载组件（`StableDiffusionImg2ImgPipeline.from_pipe`/`components`）、服务层 `submit_edit`/`validate_edit`（blob 租约、源图/mask 维度校验、strength 0.05–1.0）、单体 FastAPI 与 inference-svc 路由、Nest 网关 multipart 转发与 Web 工作区均已落地。已修复生成结果续编的 `purpose`/`owner_scope` 契约，并完成真实 inference-svc `文生图 → output Blob 图生图 → 引用删除 → 取消 → 卸载` 快速门：512×512/4 steps 文生图 6.739 s，strength 0.55 图生图 7.428 s，源 Blob 被结果引用时删除正确返回 409，取消在第 1/20 step 后 0.054 s 收敛。真实 Edge 150 浏览器门完成“上传源图 → img2img → 继续编辑 → 再次 img2img → 卸载”，两轮引擎耗时 5.998/4.842 s、像素采样范围 245/239。源图 SHA-256 固定为 `a6fd131b...e93264`；原版 28 steps 与 90s 40 steps 各完成 10 seed × 0.25/0.55/0.85 共 30 张，均 30/30 自动通过且 30 张唯一，耗时 291.993/361.291 s，连续 allocated/reserved span 均为 0，卸载后 allocated 增量 8,519,680 bytes。两份报告均为 `pending_manual_review`。**IP-Adapter（2026-08-06）**：冻结并下载 `h94/IP-Adapter@018e4027...` 的 2,573,016,776-byte 离线资产，稳定 artifact SHA-256 为 `671c7452...e94c4`；Inspector、服务/API、Web `reference` 模式和真实 GPU 生命周期均已通过。修复 adapter 后注册的 2.5 GB image encoder 未进入 Accelerate CPU-offload hook 的性能缺陷，并在 pipeline 级关闭 tqdm，4-step 回归为 4.537 s、无 `[Errno 22]`。固定人物参考图 SHA-256 为 `3271580f...fe38f`；原版 28 steps 完成 36/36 有效图，90s 40 steps 完成 35 张有效图并正确保留 1 张 safety 黑图证据，三档 scale 有效数为 11/12/12；两轮峰值 reserved 均为 2,789,212,160 bytes，显存门通过，报告均为 `pending_manual_review`。**img2img（2 份）与 IP-Adapter（2 份）报告于 2026-08-06 双人目视签字完成（Siegfried Kkm./浅草爱音，均 status=passed），目视门已满足；IP-Adapter 只承诺人物主要要素保持，不承诺精确身份锁定。** **inpaint（2026-08-07）**：固定 `stable-diffusion-v1-5/stable-diffusion-inpainting@8a4288a...` 的 2,742,261,613-byte FP16 下载集合，专用 9-channel U-Net 识别为 `sd15_inpaint_pipeline`，稳定 artifact SHA-256 为 `ddd6d69a...1c605`。引擎按需加载并复用专用 pipeline，服务/API/网关接通 source + mask 双租约，Web 提供鼠标/触控画笔、橡皮、撤销/重做、反转、缩放/平移和黑白 PNG 导出；缺专用资产或非 balanced CUDA profile 时排队前拒绝。固定源图 SHA `a6fd131b...e93264` 的 10 seed × 20 steps 完整门 10/10 通过：全黑 mask MAE 4.16–4.98，局部白 mask 外侧 MAE 4.59–5.03、内外差 20.16–30.01，全白 mask MAE 82.04–85.57；0 safety flag、10 张唯一，连续 allocated span 为 0，峰值 reserved 3,649,044,480 bytes，卸载后 allocated/reserved 为 8,519,680/20,971,520 bytes。Edge 150 真实画布上传与 inpaint 任务通过，4-step 引擎/浏览器链路耗时 4.683/7.015 s。** `instruction` 继续显式拒绝。 |
 | API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 本地 API/UI/临时 blob 已实现，其余未实施 | 资产登记和 PNG 结果当前仅驻留本进程内存：最多 16 项、64 MiB、TTL 30 分钟；服务重启即丢失，不是 SD-N3 的跨节点 blob 协议。UI 固定显示“本地”，尚无 TaskGraph Stage、完整 Worker 或跨 PC 调度，不得计入分布式任务统计。 |
 | Android SD 推理 | 未实施 | Android 仍不承担完整 SD Worker 或层间拆分。 |
 
-单引擎基准由 `scripts/smoke_sd15.py` 复现；真实 HTTP 文生图/续编/取消生命周期由 `scripts/validate_sd15_api_lifecycle.py` 复现；固定资产下载由 `scripts/download_sd15.py --asset-id ... --accept-license` 复现；文生图十种子门由 `scripts/quality_gate_sd15.py` 复现，图生图三 strength/多 seed 门由 `scripts/quality_gate_sd15_img2img.py` 复现，IP-Adapter 三 scale/多 seed 门由 `scripts/quality_gate_sd15_ip_adapter.py` 复现，真实浏览器门由 `frontend npm run test:e2e:sd15` 复现。图生图和 IP-Adapter 完整门都必须显式传入固定源图的 `--source-sha256`；快速/改参运行只会得到 `partial_pass`。IP-Adapter 完整门每档固定生成 12 个 seed，至少 10 个未被 safety 拦截的有效结果才计为通过；被拦截黑图保留在报告中，不计入质量和唯一性。推理路径只接受已下载的本地完整 Diffusers 目录，不会在加载或生成途中访问 Hub。下载器和推理侧车只使用 CUDA 可选虚拟环境，不安装或升级全局解释器依赖，尚未进入 PC/Android 发布产物。
+单引擎基准由 `scripts/smoke_sd15.py` 复现；真实 HTTP 文生图/续编/取消生命周期由 `scripts/validate_sd15_api_lifecycle.py` 复现；固定资产下载由 `scripts/download_sd15.py --asset-id ... --accept-license` 复现；文生图十种子门由 `scripts/quality_gate_sd15.py` 复现，图生图三 strength/多 seed 门由 `scripts/quality_gate_sd15_img2img.py` 复现，IP-Adapter 三 scale/多 seed 门由 `scripts/quality_gate_sd15_ip_adapter.py` 复现，inpaint 黑/局部白/全白十轮语义门由 `scripts/quality_gate_sd15_inpaint.py` 复现，真实浏览器门由 `frontend npm run test:e2e:sd15` 复现。图生图、IP-Adapter 和 inpaint 完整门都必须显式传入固定源图的 `--source-sha256`；快速/改参运行只会得到 `partial_pass`。IP-Adapter 完整门每档固定生成 12 个 seed，至少 10 个未被 safety 拦截的有效结果才计为通过；被拦截黑图保留在报告中，不计入质量和唯一性。inpaint 完整门固定执行 3 次全黑、4 次局部白和 3 次全白 mask，以像素 MAE 和显存跨度同时判定。推理路径只接受已下载的本地完整 Diffusers 目录，不会在加载或生成途中访问 Hub。下载器和推理侧车只使用 CUDA 可选虚拟环境，不安装或升级全局解释器依赖，尚未进入 PC/Android 发布产物。
 
 ### 0.1 单机优化能力边界
 
@@ -681,7 +681,7 @@ validate_input
 
 #### SD-N5.0：输入 blob 与编辑公共契约
 
-**实施进度（2026-08-06）：`Completed`。** 单体 API 与 inference-svc 的 multipart 输入 Blob、PNG/JPEG/WebP 解码、EXIF 方向归一化、RGB/灰度 mask 规范化、字节/像素上限、owner/TTL/lease/父引用、重复删除冲突、统一编辑请求模型、稳定错误码和前端客户端契约均已完成。相同 owner 下的输入 Blob 与生成结果 `output` Blob 都可作为后续编辑源；生成和编辑结果继承调用面的 owner scope。活动租约或父引用存在时删除 fail-closed，子结果删除后父引用释放。`img2img` 进入真实 executor，`inpaint`/`instruction` 仍返回 `DIFFUSION_UNSUPPORTED`。
+**实施进度（2026-08-06）：`Completed`。** 单体 API 与 inference-svc 的 multipart 输入 Blob、PNG/JPEG/WebP 解码、EXIF 方向归一化、RGB/灰度 mask 规范化、字节/像素上限、owner/TTL/lease/父引用、重复删除冲突、统一编辑请求模型、稳定错误码和前端客户端契约均已完成。相同 owner 下的输入 Blob 与生成结果 `output` Blob 都可作为后续编辑源；生成和编辑结果继承调用面的 owner scope。活动租约或父引用存在时删除 fail-closed，子结果删除后父引用释放。`img2img`、`reference` 与 `inpaint` 已进入真实 executor，`instruction` 仍返回 `DIFFUSION_UNSUPPORTED`。
 
 **工作：** 增加 multipart 输入上传、图片/mask 规范化、owner/lease/TTL、`POST /api/diffusion/edit` 强类型 schema、编辑 job snapshot 和稳定错误码；保持现有 `/generate` 不变。
 
@@ -714,6 +714,10 @@ validate_input
 **完成判据：** Inspector 能区分完整 IP-Adapter 目录、单独 adapter 权重、缺 image encoder 和伪造 Safetensors；无网络时加载与生成成功且不会回退下载；固定人物参考图 × 原版/90s base × 至少 10 seed × 三档 scale 通过自动完整性、安全、唯一性和显存门，并由两名独立审核者评价人物主要要素保持；切换 `reference → txt2img → img2img → reference` 无条件泄漏、显存持续增长或参数串线；缺 adapter/encoder、错误 base family、QKV/量化未验组合在排队前稳定拒绝。
 
 #### SD-N5.2：局部重绘
+
+**实施进度（2026-08-07）：`Completed`。** 固定并下载 `stable-diffusion-v1-5/stable-diffusion-inpainting@8a4288a76071f7280aedbdb3253bdb9e9d5d84bb` 的 16 文件 FP16 集合，逐权重 SHA 校验后得到稳定 artifact SHA-256 `ddd6d69af8e9324f38074e8624452f49c907cce380add8de2caf97ca0661c605`。Inspector 将其 9-channel U-Net 单独识别为 `sd15_inpaint_pipeline`，普通文生图加载路径明确拒绝；引擎在 balanced CPU-offload profile 下按需加载并复用专用 pipeline，量化/QKV/双常驻未验组合在排队前拒绝。source/mask 双租约、父引用、结果哈希与 `white=redraw, black=preserve` 元数据已贯通单体 API、inference-svc、Nest 网关和 Web 工作区。前端支持鼠标/触控画笔、橡皮、大小、撤销/重做、清空、反转、缩放/平移和黑白 PNG 上传。
+
+**已验证证据：** 固定源图 SHA-256 `a6fd131b5008b77f3c39f01d4a073529cf8225a8a204997d4f01de9217e93264` 的 10 seed × 20 steps 完整门通过，mask 序列为 3 次全黑、4 次局部白、3 次全白。全黑整图 MAE 4.16–4.98；局部白外侧 MAE 4.59–5.03、内侧相对外侧增加 20.16–30.01；全白整图 MAE 82.04–85.57。10 张结果均唯一、0 safety flag；连续 allocated span 为 0，峰值 reserved 3,649,044,480 bytes，卸载后 allocated/reserved 为 8,519,680/20,971,520 bytes。真实 Edge 150 完成“选择 inpaint → 上传源图 → 画布绘制 → mask multipart 上传 → 4-step inpaint → PNG 展示”，引擎耗时 4.683 s、浏览器链路 7.015 s。报告位于 `build/sd15-inpaint-quality/full-original/quality-report.json` 与 `build/sd15-browser-e2e/inpaint-browser-report.json`（构建证据目录不进入 Git）。
 
 **工作：** 登记并加载固定 revision/SHA 的 SD 1.5 inpainting 资产；接入 source + mask；前端完成触控/鼠标遮罩画布和黑白 mask 导出。
 
