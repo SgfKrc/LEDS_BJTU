@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "artifact_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source": {
+    "provider": "gguf_huggingface",
+    "repo_id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+    "requested_revision": "main",
+    "resolved_revision": "abc123"
+  },
+  "format": "gguf",
+  "engine": "llama_cpp",
+  "family": "qwen2",
+  "quantization": "Q4_K_M",
+  "context_length": 32768,
+  "files": [
+    {"path": "qwen2.5-1.5b-instruct-q4_k_m.gguf", "size": 1073741824, "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}
+  ],
+  "capabilities": {
+    "full_worker": false,
+    "pytorch_layer_pipeline": false,
+    "llama_cpp": true,
+    "task_stage": false
+  },
+  "requirements": {
+    "min_ram_bytes": 2147483648,
+    "runtime_profile": "llm-cpu-v1"
+  },
+  "license": {
+    "id": "apache-2.0",
+    "acceptance_required": false
+  },
+  "trust_policy": {
+    "trust_remote_code": false
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "job_id": "pull_001",
+  "idempotency_key": "pull-qwen-7b-main-20260806",
+  "state": "downloading",
+  "source": {
+    "provider": "huggingface",
+    "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+    "requested_revision": "main",
+    "resolved_revision": "9f5e8a1c"
+  },
+  "cancel_policy": "keep_partial",
+  "progress": {
+    "total_bytes": 17179869184,
+    "downloaded_bytes": 4294967296,
+    "files_total": 8,
+    "files_done": 3,
+    "current_file": "model-00004-of-00008.safetensors"
+  },
+  "artifact_id": null,
+  "error": null,
+  "created_at": "2026-08-06T12:00:00Z",
+  "updated_at": "2026-08-06T12:05:30Z"
+}

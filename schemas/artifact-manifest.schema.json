@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://qlh.dev/schemas/artifact-manifest.schema.json",
+  "title": "QLH 模型工件清单（M0 冻结，2026-08-06）",
+  "description": "不可变 artifact manifest。运行与调度只信 artifact_id（聚合摘要），不按 model_type 推导分布式能力。",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "source",
+    "format",
+    "engine",
+    "family",
+    "files",
+    "capabilities",
+    "requirements",
+    "license"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "artifact_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["provider", "requested_revision", "resolved_revision"],
+      "properties": {
+        "provider": {
+          "enum": ["huggingface", "gguf_huggingface", "local_directory", "modelscope"]
+        },
+        "repo_id": { "type": "string" },
+        "requested_revision": { "type": "string" },
+        "resolved_revision": { "type": "string" }
+      }
+    },
+    "format": {
+      "enum": ["safetensors", "gguf", "diffusers"]
+    },
+    "engine": {
+      "enum": ["pytorch_transformers", "llama_cpp", "diffusers_sd15"]
+    },
+    "family": { "type": "string", "minLength": 1 },
+    "quantization": { "type": ["string", "null"] },
+    "context_length": { "type": ["integer", "null"], "minimum": 0 },
+    "chat_template": { "type": ["string", "null"] },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["path", "size", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "size": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["full_worker", "pytorch_layer_pipeline", "llama_cpp", "task_stage"],
+      "properties": {
+        "full_worker": { "type": "boolean" },
+        "pytorch_layer_pipeline": { "type": "boolean" },
+        "llama_cpp": { "type": "boolean" },
+        "task_stage": { "type": "boolean" }
+      }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["runtime_profile"],
+      "properties": {
+        "min_ram_bytes": { "type": "integer", "minimum": 0 },
+        "min_vram_bytes": { "type": "integer", "minimum": 0 },
+        "disk_bytes": { "type": "integer", "minimum": 0 },
+        "runtime_profile": { "type": "string" }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "acceptance_required"],
+      "properties": {
+        "id": { "type": "string" },
+        "acceptance_required": { "type": "boolean" }
+      }
+    },
+    "trust_policy": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["trust_remote_code"],
+      "properties": {
+        "trust_remote_code": { "type": "boolean" }
+      }
+    }
+  }
+}
