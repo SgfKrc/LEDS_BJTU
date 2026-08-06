@@ -69,6 +69,7 @@ function migrateV1(db: DatabaseSync): void {
       status TEXT NOT NULL,
       key_ref TEXT NOT NULL,
       node_role TEXT NOT NULL,
+      last_verified_at TEXT,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS catalog_models (

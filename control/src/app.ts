@@ -35,6 +35,7 @@ import { PullJobService } from './data/pull-job.service';
 import { PullJobExecutor } from './data/pull-job-executor';
 import { HfResolver } from './data/hf-resolver';
 import { HfDownloader } from './data/hf-downloader';
+import { ClusterProfileRepository } from './data/cluster-profile-repository';
 import { HealthController } from './modules/health/health.controller';
 import { DbController } from './modules/db/db.controller';
 import { StorageHealthController } from './modules/db/storage-health.controller';
@@ -43,6 +44,7 @@ import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
 import { PullJobController } from './modules/models/pull-job.controller';
+import { ClusterProfilesController } from './modules/cluster/cluster-profiles.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
@@ -68,6 +70,7 @@ export class CatchAllController {
     ReviewController,
     ModelsController,
     PullJobController,
+    ClusterProfilesController,
     WorkflowsController,
     BootstrapController,
     StorageHealthController,
@@ -103,6 +106,8 @@ export class CatchAllController {
     HfResolver,
     HfDownloader,
     PullJobExecutor,
+    // M4：多集群档案
+    ClusterProfileRepository,
   ],
 })
 export class AppModule implements OnApplicationBootstrap {
