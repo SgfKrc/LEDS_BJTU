@@ -20,8 +20,13 @@ import { ModelRegistryStore } from './data/model-registry-store';
 import { ReviewStore } from './data/review-store';
 import { SessionStore } from './data/session-store';
 import { WorkflowJournalStore } from './data/workflow-journal-store';
+import { SqliteStore } from './data/sqlite-store';
+import { OutboxService } from './data/outbox.service';
+import { StorageHealthService } from './data/storage-health';
+import { PostgresProjector } from './data/postgres-projector';
 import { HealthController } from './modules/health/health.controller';
 import { DbController } from './modules/db/db.controller';
+import { StorageHealthController } from './modules/db/storage-health.controller';
 import { BootstrapController } from './modules/bootstrap/bootstrap.controller';
 import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
@@ -52,6 +57,7 @@ export class CatchAllController {
     ModelsController,
     WorkflowsController,
     BootstrapController,
+    StorageHealthController,
     CatchAllController,
   ],
   providers: [
@@ -63,6 +69,14 @@ export class CatchAllController {
     ReviewService,
     ModelRegistryStore,
     WorkflowJournalStore,
+    // M1：本地 SQLite 事实源（唯一写者，惰性打开）+ outbox + 投影
+    {
+      provide: SqliteStore,
+      useFactory: () => new SqliteStore(),
+    },
+    OutboxService,
+    StorageHealthService,
+    PostgresProjector,
   ],
 })
 export class AppModule {}
