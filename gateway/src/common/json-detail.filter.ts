@@ -40,7 +40,8 @@ export class JsonDetailFilter implements ExceptionFilter {
         detail = body;
       } else if (body && typeof body === 'object') {
         const msg = (body as { message?: unknown }).message;
-        detail = msg ?? body;
+        const code = (body as { code?: unknown }).code;
+        detail = code !== undefined ? body : msg ?? body;
       }
     }
 

@@ -24,6 +24,7 @@ import { ClusterController } from './modules/cluster/cluster.controller';
 import { ChatController } from './modules/chat/chat.controller';
 import { ControlController } from './modules/control/control.controller';
 import { DeviceController } from './modules/device/device.controller';
+import { DiffusionController } from './modules/diffusion/diffusion.controller';
 import { ExperimentalController } from './modules/experimental/experimental.controller';
 import { HealthController } from './modules/health/health.controller';
 import { LogsController } from './modules/logs/logs.controller';
@@ -48,6 +49,7 @@ export class CatchAllController {
     HealthController,
     ClusterController,
     DeviceController,
+    DiffusionController,
     StatusController,
     ModelsController,
     LogsController,
@@ -76,7 +78,9 @@ export async function createApp(): Promise<NestFastifyApplication> {
   });
   // 阶段 2.6：POST /api/chat/upload（multipart，对齐 FastAPI UploadFile 语义）
   await app.register(fastifyMultipart, {
-    limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+    // Keep this equal to diffusion.DIFFUSION_MAX_UPLOAD_BYTES.  The proxy
+    // must reject oversized images before buffering them into a Node Buffer.
+    limits: { fileSize: 16 * 1024 * 1024, files: 1 },
   });
   // 对齐 FastAPI 语义：带 application/json 头的空 body 请求（如无 body 的
   // DELETE/POST）按 {} 解析而非 400（Fastify 默认报

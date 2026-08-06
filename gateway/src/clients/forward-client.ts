@@ -19,6 +19,7 @@ export abstract class ForwardClient {
     path: string,
     body?: unknown,
     extraHeaders: Record<string, string> = {},
+    timeoutMs: number = this.timeoutMs,
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       accept: 'application/json',
@@ -36,7 +37,7 @@ export abstract class ForwardClient {
         method,
         headers,
         body: payload,
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       throw new HttpException(
@@ -69,6 +70,62 @@ export abstract class ForwardClient {
         (data as { detail?: unknown } | null)?.detail ??
         `upstream ${res.status}`;
       throw new HttpException(detail, res.status);
+    }
+    return data;
+  }
+
+  async requestMultipart(
+    method: string,
+    path: string,
+    fields: Record<string, string>,
+    file: { data: Buffer; filename: string; contentType?: string },
+    timeoutMs: number = this.timeoutMs,
+  ): Promise<unknown> {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) {
+      form.append(key, value);
+    }
+    form.append(
+      'file',
+      new Blob([Uint8Array.from(file.data)], {
+        type: file.contentType || 'application/octet-stream',
+      }),
+      file.filename,
+    );
+    let res: Response;
+    try {
+      res = await fetch(this.baseUrl + path, {
+        method,
+        headers: { accept: 'application/json' },
+        body: form,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      throw new HttpException(
+        `涓婃父鏈嶅姟涓嶅彲杈撅紙${this.baseUrl}锛? $${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        502,
+      );
+    }
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && !contentType.includes('application/json')) {
+      return Buffer.from(await res.arrayBuffer());
+    }
+    const text = await res.text();
+    let data: unknown = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { detail: text };
+      }
+    }
+    if (!res.ok) {
+      const detail =
+        (data as { detail?: unknown } | null)?.detail ??
+        `upstream ${res.status}`;
+      throw new HttpException(detail as string, res.status);
     }
     return data;
   }

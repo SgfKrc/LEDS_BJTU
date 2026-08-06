@@ -130,6 +130,22 @@ class ModelHost:
         _OWN_ATTRS.add(name)
         object.__setattr__(self, name, value)
 
+    def peek_manager(self) -> Any:
+        """Return an already-created manager without triggering lazy import."""
+
+        manager = object.__getattribute__(self, "_manager")
+        if isinstance(manager, _LazyModelManager):
+            return object.__getattribute__(manager, "_instance")
+        return manager
+
+    def has_loaded_model(self) -> bool:
+        """Check LLM ownership without materializing the lazy manager."""
+
+        if bool(object.__getattribute__(self, "model_loaded")):
+            return True
+        manager = self.peek_manager()
+        return bool(manager is not None and getattr(manager, "is_loaded", False))
+
     def __getattr__(self, name):
         # object.__getattribute__ 直接取 _manager，避免 _manager 被 del 后
         # 经 __getattr__ 访问自身导致无限递归

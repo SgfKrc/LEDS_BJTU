@@ -65,6 +65,71 @@ class SwitchModelRequest(BaseModel):
     engine: Optional[str] = None
 
 
+class DiffusionArtifactInspectRequest(BaseModel):
+    path: str = Field(..., min_length=1, max_length=2048)
+    compute_hash: bool = False
+
+
+class DiffusionArtifactRegisterRequest(DiffusionArtifactInspectRequest):
+    artifact_id: Optional[str] = Field(default=None, max_length=80)
+    name: Optional[str] = Field(default=None, max_length=120)
+
+
+class DiffusionAssetDownloadRequest(BaseModel):
+    license_accepted: bool = False
+    use_local_proxy_fallback: bool = True
+
+
+class DiffusionAssetImportRequest(BaseModel):
+    asset_id: str = Field(..., min_length=1, max_length=80)
+    path: str = Field(..., min_length=1, max_length=2048)
+    license_accepted: bool = False
+
+
+class DiffusionLoadRequest(BaseModel):
+    artifact_id: str = Field(..., min_length=1, max_length=80)
+    profile: Literal[
+        "balanced",
+        "resident_fp16",
+        "qkv_fp16",
+        "unet_8bit",
+        "unet_8bit_qkv",
+    ] = "balanced"
+    safety_checker_required: bool = True
+
+
+class DiffusionGenerateRequest(BaseModel):
+    preset_id: Optional[str] = Field(default=None, max_length=100)
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    negative_prompt: Optional[str] = Field(default=None, max_length=4000)
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    scheduler: Optional[str] = Field(default=None, max_length=80)
+
+
+class DiffusionEditRequest(BaseModel):
+    mode: Literal['img2img', 'inpaint', 'instruction']
+    preset_id: Optional[str] = Field(default=None, max_length=100)
+    source_blob_id: str = Field(..., min_length=1, max_length=100)
+    mask_blob_id: Optional[str] = Field(default=None, max_length=100)
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    negative_prompt: Optional[str] = Field(default=None, max_length=4000)
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    scheduler: Optional[str] = Field(default=None, max_length=80)
+    strength: float = 0.75
+    instruction: Optional[str] = Field(default=None, max_length=4000)
+    edit_adapter_id: Optional[str] = Field(default=None, max_length=120)
+    conditioning_scale: Optional[float] = None
+    image_guidance_scale: Optional[float] = None
+
+
 class ChatRequest(BaseModel):
     """对齐 api_server.ChatRequest 核心字段（2026-08-03 基线）。
 

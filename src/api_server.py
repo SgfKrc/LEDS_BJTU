@@ -31,14 +31,24 @@ from dataclasses import replace
 from functools import wraps
 from typing import Any, Literal, Optional, cast
 
+try:
+    from runtime_env import maybe_reexec_sd_runtime
+except ImportError:  # package import: uvicorn src.api_server:app
+    from .runtime_env import maybe_reexec_sd_runtime
+
+# Direct development launches may come from a global Python that intentionally
+# lacks optional SD packages. Switch only API-server invocations with installed
+# managed SD assets; imports from tests/tools and LLM-only launches are untouched.
+maybe_reexec_sd_runtime()
+
 import torch
 
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -65,6 +75,24 @@ from task_provider import (
     ProviderExecutionError,
     ProviderExecutor,
     StageRequest as ProviderStageRequest,
+)
+from diffusion import (
+    DiffusionBlobInUseError,
+    DiffusionBlobReferencedError,
+    DiffusionConflictError,
+    DiffusionInputError,
+    DiffusionNotFoundError,
+    DiffusionService,
+    DiffusionServiceError,
+    DiffusionUnsupportedError,
+    DIFFUSION_MAX_UPLOAD_BYTES,
+    LOCAL_PROXY_FALLBACK,
+    SD15EngineConfig,
+    SD15EditRequest,
+    SD15GenerationRequest,
+    build_sd15_engine_config,
+    build_sd15_generation_request,
+    list_presets as list_diffusion_presets,
 )
 import model_config as mc
 from config import (
@@ -334,6 +362,7 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 from model_host import model_host
 
 model_manager = model_host
+diffusion_service = DiffusionService()
 kv_cache: Optional[PagedKVCache] = None
 active_session_id: Optional[str] = None           # 当前活跃会话 ID
 session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
@@ -488,6 +517,11 @@ def _run_exclusive_model_change(
 ):
     """Block inference, invalidate old worker ACKs, then refresh the new model."""
     with model_host.full_chat_execution_lock:
+        if diffusion_service.is_loaded or diffusion_service.is_busy:
+            raise HTTPException(
+                status_code=409,
+                detail="SD 1.5 本地引擎正在占用模型生命周期；请先卸载 SD 模型",
+            )
         if prepare is not None:
             prepare()
         with scheduler._inference_lock:
@@ -643,6 +677,11 @@ async def _shutdown_resources():
     """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
     try:
+        await run_in_threadpool(diffusion_service.close)
+        logger.info("SD 1.5 本地引擎已停止")
+    except Exception as e:
+        logger.warning(f"SD 1.5 本地引擎停止异常: {e}")
+    try:
         with model_host.full_chat_execution_lock:
             task_graph_coordinator.close()
     except Exception as e:
@@ -778,6 +817,71 @@ class LoadModelRequest(BaseModel):
     )
 
 
+class DiffusionArtifactInspectRequest(BaseModel):
+    path: str = Field(..., min_length=1, max_length=2048)
+    compute_hash: bool = Field(default=False)
+
+
+class DiffusionArtifactRegisterRequest(DiffusionArtifactInspectRequest):
+    artifact_id: Optional[str] = Field(default=None, max_length=80)
+    name: Optional[str] = Field(default=None, max_length=120)
+
+
+class DiffusionAssetDownloadRequest(BaseModel):
+    license_accepted: bool = Field(default=False)
+    use_local_proxy_fallback: bool = Field(default=True)
+
+
+class DiffusionAssetImportRequest(BaseModel):
+    asset_id: str = Field(..., min_length=1, max_length=80)
+    path: str = Field(..., min_length=1, max_length=2048)
+    license_accepted: bool = Field(default=False)
+
+
+class DiffusionLoadRequest(BaseModel):
+    artifact_id: str = Field(..., min_length=1, max_length=80)
+    profile: Literal[
+        "balanced",
+        "resident_fp16",
+        "qkv_fp16",
+        "unet_8bit",
+        "unet_8bit_qkv",
+    ] = Field(default="balanced")
+    safety_checker_required: bool = Field(default=True)
+
+
+class DiffusionGenerateRequest(BaseModel):
+    preset_id: Optional[str] = Field(default=None, max_length=100)
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    negative_prompt: Optional[str] = Field(default=None, max_length=4000)
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    scheduler: Optional[str] = Field(default=None, max_length=80)
+
+
+class DiffusionEditRequest(BaseModel):
+    mode: Literal['img2img', 'inpaint', 'instruction']
+    preset_id: Optional[str] = Field(default=None, max_length=100)
+    source_blob_id: str = Field(..., min_length=1, max_length=100)
+    mask_blob_id: Optional[str] = Field(default=None, max_length=100)
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    negative_prompt: Optional[str] = Field(default=None, max_length=4000)
+    seed: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    scheduler: Optional[str] = Field(default=None, max_length=80)
+    strength: float = 0.75
+    instruction: Optional[str] = Field(default=None, max_length=4000)
+    edit_adapter_id: Optional[str] = Field(default=None, max_length=120)
+    conditioning_scale: Optional[float] = None
+    image_guidance_scale: Optional[float] = None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息", min_length=1)
     session_id: Optional[str] = Field(default=None, description="会话ID，为空时使用当前活跃会话")
@@ -900,6 +1004,140 @@ class FirstConnectBootstrapRequest(BaseModel):
 # ============================================================
 # 辅助函数
 # ============================================================
+
+_LOCAL_DIFFUSION_PATH_CLIENTS = {
+    "",
+    "127.0.0.1",
+    "::1",
+    "::ffff:127.0.0.1",
+    "localhost",
+    "testclient",
+}
+
+
+def _require_local_diffusion_path_access(request: Request) -> None:
+    """Keep arbitrary server-path inspection behind a local desktop boundary."""
+
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host not in _LOCAL_DIFFUSION_PATH_CLIENTS:
+        raise HTTPException(
+            status_code=403,
+            detail="SD 模型路径检查和登记仅允许在主节点本机执行",
+        )
+
+
+def _diffusion_http_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, DiffusionInputError):
+        return HTTPException(
+            status_code=400,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionUnsupportedError):
+        return HTTPException(
+            status_code=501,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, (DiffusionBlobInUseError, DiffusionBlobReferencedError)):
+        return HTTPException(
+            status_code=409,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionNotFoundError):
+        return HTTPException(
+            status_code=404,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionConflictError):
+        return HTTPException(
+            status_code=409,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    if isinstance(exc, (ValueError, OSError)):
+        return HTTPException(
+            status_code=400,
+            detail={'code': 'DIFFUSION_INVALID_INPUT', 'message': str(exc)},
+        )
+    if isinstance(exc, ImportError):
+        return HTTPException(
+            status_code=503,
+            detail={'code': 'DIFFUSION_DEPENDENCY_MISSING', 'message': str(exc)},
+        )
+    if isinstance(exc, DiffusionServiceError):
+        return HTTPException(
+            status_code=500,
+            detail={'code': exc.code, 'message': str(exc)},
+        )
+    return HTTPException(
+        status_code=500,
+        detail={
+            'code': 'DIFFUSION_EXECUTION_FAILED',
+            'message': f"SD 1.5 本地引擎失败: {str(exc)[:500]}",
+        },
+    )
+
+
+def _diffusion_engine_config(req: DiffusionLoadRequest) -> SD15EngineConfig:
+    return build_sd15_engine_config(
+        req.profile,
+        safety_checker_required=req.safety_checker_required,
+    )
+
+
+def _diffusion_generation_request(req: DiffusionGenerateRequest) -> SD15GenerationRequest:
+    return build_sd15_generation_request(
+        preset_id=req.preset_id,
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        seed=req.seed,
+        width=req.width,
+        height=req.height,
+        steps=req.steps,
+        guidance_scale=req.guidance_scale,
+        scheduler=req.scheduler,
+    )
+
+
+def _diffusion_edit_request(req: DiffusionEditRequest) -> SD15EditRequest:
+    generation = build_sd15_generation_request(
+        preset_id=req.preset_id,
+        prompt=(req.prompt if req.prompt is not None else req.instruction),
+        negative_prompt=req.negative_prompt,
+        seed=req.seed,
+        width=req.width,
+        height=req.height,
+        steps=req.steps,
+        guidance_scale=req.guidance_scale,
+        scheduler=req.scheduler,
+    )
+    return SD15EditRequest(
+        mode=req.mode,
+        source_blob_id=req.source_blob_id,
+        mask_blob_id=req.mask_blob_id,
+        prompt=generation.prompt,
+        negative_prompt=generation.negative_prompt,
+        seed=generation.seed,
+        width=generation.width,
+        height=generation.height,
+        steps=generation.steps,
+        guidance_scale=generation.guidance_scale,
+        scheduler=generation.scheduler,
+        strength=req.strength,
+        instruction=req.instruction,
+        edit_adapter_id=req.edit_adapter_id,
+        conditioning_scale=req.conditioning_scale,
+        image_guidance_scale=req.image_guidance_scale,
+    )
+
+
+def _local_llm_is_loaded() -> bool:
+    """Inspect LLM ownership without materializing the lazy manager."""
+
+    checker = getattr(model_host, "has_loaded_model", None)
+    if model_manager is model_host and callable(checker):
+        return bool(checker())
+    return bool(model_host.model_loaded) or bool(
+        getattr(model_manager, "is_loaded", False)
+    )
 
 def _build_chat_prompt(messages: list[dict], system_prompt: Optional[str] = None,
                        assistant_prefill: Optional[str] = None) -> str:
@@ -1788,6 +2026,234 @@ async def get_presets():
     }
 
 
+@app.get("/api/diffusion/capabilities")
+async def get_diffusion_capabilities():
+    status = diffusion_service.snapshot()
+    status["local_llm_loaded"] = _local_llm_is_loaded()
+    status["presets"] = [
+        {
+            "preset_id": preset.preset_id,
+            "model_id": preset.model_id,
+            "prompt": preset.prompt,
+            "negative_prompt": preset.negative_prompt,
+            "width": preset.width,
+            "height": preset.height,
+            "steps": preset.steps,
+            "guidance_scale": preset.guidance_scale,
+            "scheduler": preset.scheduler,
+            "seeds": list(preset.seeds),
+            "safety_checker_required": preset.safety_checker_required,
+        }
+        for preset in list_diffusion_presets()
+    ]
+    return status
+
+
+@app.post("/api/diffusion/artifacts/inspect")
+async def inspect_diffusion_artifact(
+    req: DiffusionArtifactInspectRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        artifact = await run_in_threadpool(
+            diffusion_service.inspect,
+            req.path,
+            compute_hash=req.compute_hash,
+        )
+        return artifact.to_dict(include_path=True)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/artifacts/register")
+async def register_diffusion_artifact(
+    req: DiffusionArtifactRegisterRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        artifact = await run_in_threadpool(
+            diffusion_service.register_artifact,
+            req.path,
+            artifact_id=req.artifact_id,
+            name=req.name,
+            compute_hash=req.compute_hash,
+        )
+        return artifact.snapshot(include_path=False)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.get("/api/diffusion/artifacts")
+async def list_diffusion_artifacts():
+    return {"artifacts": diffusion_service.list_artifacts(include_path=False)}
+
+
+@app.get("/api/diffusion/assets/catalog")
+async def list_diffusion_asset_catalog():
+    return {"assets": await run_in_threadpool(diffusion_service.asset_catalog)}
+
+
+@app.get("/api/diffusion/assets/{asset_id}/status")
+async def get_diffusion_asset_status(asset_id: str):
+    try:
+        return await run_in_threadpool(diffusion_service.asset_status, asset_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/assets/{asset_id}/download", status_code=202)
+async def download_diffusion_asset(
+    asset_id: str,
+    req: DiffusionAssetDownloadRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        return diffusion_service.download_asset(
+            asset_id,
+            license_accepted=req.license_accepted,
+            proxy_fallback=(
+                LOCAL_PROXY_FALLBACK if req.use_local_proxy_fallback else ""
+            ),
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/assets/import")
+async def import_diffusion_asset(
+    req: DiffusionAssetImportRequest,
+    request: Request,
+):
+    _require_local_diffusion_path_access(request)
+    try:
+        return await run_in_threadpool(
+            diffusion_service.import_asset,
+            req.asset_id,
+            req.path,
+            license_accepted=req.license_accepted,
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/load")
+async def load_diffusion_artifact(req: DiffusionLoadRequest):
+    config = _diffusion_engine_config(req)
+
+    def _load() -> dict:
+        with model_host.full_chat_execution_lock:
+            if _local_llm_is_loaded():
+                raise DiffusionConflictError(
+                    "本地 LLM 已加载；请先显式卸载 LLM，再加载 SD 1.5"
+                )
+            return diffusion_service.load(req.artifact_id, config)
+
+    try:
+        return await run_in_threadpool(_load)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/unload")
+async def unload_diffusion_artifact():
+    try:
+        return await run_in_threadpool(_unload_diffusion_under_model_lock)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+def _unload_diffusion_under_model_lock() -> dict:
+    with model_host.full_chat_execution_lock:
+        return diffusion_service.unload()
+
+
+@app.post('/api/diffusion/generate', status_code=202)
+async def generate_diffusion_image(req: DiffusionGenerateRequest):
+    try:
+        generation = _diffusion_generation_request(req)
+        return diffusion_service.submit_generation(generation)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post('/api/diffusion/blobs', status_code=201)
+async def upload_diffusion_blob(
+    purpose: str = Form(...),
+    file: UploadFile = File(...),
+):
+    try:
+        data = await file.read(DIFFUSION_MAX_UPLOAD_BYTES + 1)
+        return await run_in_threadpool(
+            lambda: diffusion_service.put_input_blob(
+                data,
+                purpose=purpose,
+                owner_scope='local',
+            )
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+    finally:
+        await file.close()
+
+
+@app.post('/api/diffusion/edit', status_code=202)
+async def edit_diffusion_image(req: DiffusionEditRequest):
+    try:
+        return diffusion_service.submit_edit(
+            _diffusion_edit_request(req),
+            owner_scope='local',
+        )
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.get("/api/diffusion/jobs/{job_id}")
+async def get_diffusion_job(job_id: str):
+    try:
+        return diffusion_service.get_job(job_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.post("/api/diffusion/jobs/{job_id}/cancel")
+async def cancel_diffusion_job(job_id: str):
+    try:
+        return diffusion_service.cancel_job(job_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+
+
+@app.get("/api/diffusion/blobs/{blob_id}")
+async def get_diffusion_blob(blob_id: str):
+    try:
+        blob = diffusion_service.get_blob(blob_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+    return Response(
+        content=blob.data,
+        media_type=blob.content_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "ETag": f'"{blob.sha256}"',
+            "Content-Disposition": f'inline; filename="{blob.blob_id}.png"',
+        },
+    )
+
+
+@app.delete("/api/diffusion/blobs/{blob_id}")
+async def delete_diffusion_blob(blob_id: str):
+    try:
+        deleted = diffusion_service.delete_blob(blob_id)
+    except Exception as exc:
+        raise _diffusion_http_exception(exc) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"image blob not found: {blob_id}")
+    return {"deleted": True, "blob_id": blob_id}
+
+
 # ---- 支持的文件类型 ----
 ALLOWED_TEXT_EXTENSIONS = {
     ".txt", ".md", ".csv", ".py", ".json", ".log",
@@ -2205,6 +2671,54 @@ async def get_current_model():
         "gpu_allocated_gb": mem.get("gpu_allocated_gb", 0),
         "gpu_reserved_gb": mem.get("gpu_reserved_gb", 0),
     }
+
+
+def _unload_model_under_model_lock() -> dict:
+    """Unload the local LLM without materializing the lazy manager when idle.
+
+    Model and SD lifecycles share ``full_chat_execution_lock``. Keeping the
+    reset here makes the explicit UI unload path equivalent to a model switch
+    and invalidates stale worker state before the next engine is loaded.
+    """
+    loaded = _local_llm_is_loaded()
+
+    def _change() -> bool:
+        if loaded:
+            unload = getattr(model_manager, "unload_model", None)
+            if not callable(unload):
+                raise HTTPException(status_code=500, detail="当前推理引擎不支持卸载模型")
+            unload()
+        _reset_runtime_conversation_state(clear_histories=True)
+        model_host.model_loaded = False
+        model_host.current_quant = None
+        return loaded
+
+    unloaded = _run_exclusive_model_change(
+        _change,
+        release_worker_reservation=True,
+    )
+    try:
+        scheduler.refresh_task_worker_capabilities()
+    except Exception as exc:
+        logger.warning("卸载模型后刷新 Worker 能力失败: %s", exc)
+    return {
+        "success": True,
+        "loaded": False,
+        "unloaded": unloaded,
+        "message": "模型已卸载" if unloaded else "当前没有已加载的模型",
+    }
+
+
+@app.post("/api/models/unload")
+async def unload_model():
+    """Explicitly release the local LLM before loading another engine."""
+    try:
+        return await run_in_threadpool(_unload_model_under_model_lock)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("模型卸载失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"模型卸载失败: {exc}") from exc
 
 
 @app.post("/api/models/load")

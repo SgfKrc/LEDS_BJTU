@@ -29,6 +29,12 @@ export class ModelsController {
     return this.inference.request('POST', '/v1/models/load', body);
   }
 
+  @Post('unload')
+  @HttpCode(200)
+  unload(): Promise<unknown> {
+    return this.inference.request('POST', '/v1/models/unload', undefined, {}, 30_000);
+  }
+
   @Post('switch')
   @HttpCode(200)
   switchModel(@Body() body: unknown): Promise<unknown> {

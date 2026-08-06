@@ -35,24 +35,39 @@ def _setup_logging() -> None:
     )
 
 
-def build_app(node_role: str = "master"):
+def build_app(node_role: str = "master", *, engine_host=None, kv_host=None):
     """组装 FastAPI 应用（routes + EngineHost + KVHost）。
 
     node_role: "master"（默认，全部端点）/ "client"（仅层段/KV/流水线）。
+    engine_host / kv_host: 可选依赖注入入口；默认仍创建生产宿主，测试可直接
+    注入轻量实现，避免先构造真实宿主再覆盖。
     顶层 import 仅 fastapi 与 inference_service 包自身，不触发
     model_module / torch（EngineHost 构造只 import model_host 与 config）。
     """
+    from contextlib import asynccontextmanager
+
     from fastapi import FastAPI
 
-    from inference_service.engine_host import EngineHost
     from inference_service.kv_host import KVHost
     from inference_service.routes import router
 
-    app = FastAPI(title="inference-svc", version="0.1.0")
-    host = EngineHost()
+    host = engine_host
+    if host is None:
+        from inference_service.engine_host import EngineHost
+
+        host = EngineHost()
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        yield
+        import asyncio
+
+        await asyncio.to_thread(host.close)
+
+    app = FastAPI(title="inference-svc", version="0.1.0", lifespan=lifespan)
     host.role = node_role
     app.state.engine_host = host
-    app.state.kv_host = KVHost()
+    app.state.kv_host = kv_host if kv_host is not None else KVHost()
     app.state.node_role = node_role
     app.include_router(router)
     return app

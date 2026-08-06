@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 from .artifacts import DiffusionArtifact, DiffusionArtifactInspector
 
@@ -66,6 +67,7 @@ class SD15GenerationRequest:
     height: int = 512
     steps: int = 28
     guidance_scale: float = 7.5
+    scheduler: str = ""
 
     def validate(self) -> None:
         if not self.prompt.strip():
@@ -78,6 +80,8 @@ class SD15GenerationRequest:
             raise ValueError("steps 必须在 1-100 之间")
         if self.guidance_scale < 0:
             raise ValueError("guidance_scale 不能为负数")
+        if self.scheduler not in {"", "PNDMScheduler", "DPMSolverMultistepScheduler"}:
+            raise ValueError(f"unsupported SD15 scheduler: {self.scheduler}")
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,20 @@ class SD15Engine:
         self._lock = threading.RLock()
         self._cancel_event = threading.Event()
         self._quantized_linear_count = 0
+        self._diffusers_logging: Any = None
+
+    @staticmethod
+    @contextmanager
+    def _suspended_diffusers_progress(diffusers_logging: Any) -> Iterator[None]:
+        """Avoid invalid console handles in windowed or detached Windows runs."""
+
+        was_enabled = bool(diffusers_logging.is_progress_bar_enabled())
+        diffusers_logging.disable_progress_bar()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                diffusers_logging.enable_progress_bar()
 
     @property
     def is_loaded(self) -> bool:
@@ -179,6 +197,7 @@ class SD15Engine:
         self._artifact = None
         self._quantized_linear_count = 0
         self._device = "cpu"
+        self._diffusers_logging = None
         try:
             import gc
             import torch
@@ -188,6 +207,69 @@ class SD15Engine:
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+    def _pipeline_load_kwargs(self, *, dtype: Any, artifact: DiffusionArtifact) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "torch_dtype": dtype,
+            "local_files_only": True,
+            "use_safetensors": self.config.use_safetensors,
+        }
+        # Community DreamBooth snapshots are often stored as unqualified
+        # FP32 safetensors. Asking Diffusers for an fp16 filename variant then
+        # fails before torch_dtype can convert the weights.
+        if self.config.variant and artifact.precision == "fp16":
+            kwargs["variant"] = self.config.variant
+        if not self.config.safety_checker_required:
+            kwargs["safety_checker"] = None
+        return kwargs
+
+    def _validate_pipeline_safety(self, pipeline: Any) -> None:
+        if (
+            self.config.safety_checker_required
+            and getattr(pipeline, "safety_checker", None) is None
+        ):
+            raise RuntimeError(
+                "SD15 safety checker is required but missing from the local pipeline"
+            )
+
+    def _mixed_precision_safety_overrides(
+        self,
+        *,
+        model_path: Any,
+        artifact: DiffusionArtifact,
+        dtype: Any,
+    ) -> Dict[str, Any]:
+        """Load an fp16-only safety component for an unqualified FP32 pipeline."""
+
+        if not self.config.safety_checker_required or artifact.precision == "fp16":
+            return {}
+        safety_path = model_path / "safety_checker"
+        fp16_weight = safety_path / "model.fp16.safetensors"
+        standard_weights = (
+            safety_path / "model.safetensors",
+            safety_path / "pytorch_model.bin",
+        )
+        if not fp16_weight.is_file() or any(path.is_file() for path in standard_weights):
+            return {}
+
+        from diffusers.pipelines.stable_diffusion.safety_checker import (
+            StableDiffusionSafetyChecker,
+        )
+        from transformers import CLIPImageProcessor
+
+        return {
+            "safety_checker": StableDiffusionSafetyChecker.from_pretrained(
+                safety_path,
+                local_files_only=True,
+                torch_dtype=dtype,
+                use_safetensors=True,
+                variant="fp16",
+            ),
+            "feature_extractor": CLIPImageProcessor.from_pretrained(
+                model_path / "feature_extractor",
+                local_files_only=True,
+            ),
+        }
 
     @staticmethod
     def _replace_linear_with_8bit_modules(module: Any, *, torch: Any, bnb: Any) -> int:
@@ -318,6 +400,7 @@ class SD15Engine:
 
             try:
                 from diffusers import StableDiffusionPipeline
+                from diffusers.utils import logging as diffusers_logging
             except ImportError as exc:
                 raise ImportError(
                     "SD15 sidecar 未安装，请使用当前 CUDA venv 安装 "
@@ -326,21 +409,29 @@ class SD15Engine:
 
             self._device = "cuda" if use_cuda else "cpu"
             dtype = torch.float16 if use_cuda and self.config.dtype == "float16" else torch.float32
-            load_kwargs: Dict[str, Any] = {
-                "torch_dtype": dtype,
-                "local_files_only": True,
-                "use_safetensors": self.config.use_safetensors,
-            }
-            if self.config.variant:
-                load_kwargs["variant"] = self.config.variant
-            if not self.config.safety_checker_required:
-                load_kwargs["safety_checker"] = None
-            if revision:
-                load_kwargs["revision"] = revision
             pipeline: Any = None
             try:
-                pipeline = StableDiffusionPipeline.from_pretrained(local_model_path, **load_kwargs)
-                pipeline = self._configure_pipeline(pipeline, use_cuda=use_cuda, torch=torch)
+                with self._suspended_diffusers_progress(diffusers_logging):
+                    load_kwargs = self._pipeline_load_kwargs(dtype=dtype, artifact=inspected)
+                    load_kwargs.update(
+                        self._mixed_precision_safety_overrides(
+                            model_path=local_model_path,
+                            artifact=inspected,
+                            dtype=dtype,
+                        )
+                    )
+                    if revision:
+                        load_kwargs["revision"] = revision
+                    pipeline = StableDiffusionPipeline.from_pretrained(
+                        local_model_path,
+                        **load_kwargs,
+                    )
+                    self._validate_pipeline_safety(pipeline)
+                    pipeline = self._configure_pipeline(
+                        pipeline,
+                        use_cuda=use_cuda,
+                        torch=torch,
+                    )
             except Exception:
                 if pipeline is not None:
                     del pipeline
@@ -348,6 +439,7 @@ class SD15Engine:
                 raise
             self._pipeline = pipeline
             self._artifact = inspected
+            self._diffusers_logging = diffusers_logging
             return inspected
 
     def unload(self) -> None:
@@ -357,6 +449,7 @@ class SD15Engine:
             self._artifact = None
             self._quantized_linear_count = 0
             self._device = "cpu"
+            self._diffusers_logging = None
             if pipeline is not None:
                 del pipeline
             try:
@@ -371,6 +464,55 @@ class SD15Engine:
 
     def cancel(self) -> None:
         self._cancel_event.set()
+
+    @contextmanager
+    def _request_scheduler(self, pipeline: Any, request: Any) -> Iterator[None]:
+        """Use a fresh request scheduler without leaking it into the next job."""
+
+        requested = getattr(request, "scheduler", "")
+        if not requested:
+            yield
+            return
+
+        from diffusers import DPMSolverMultistepScheduler, PNDMScheduler
+
+        scheduler_types = {
+            "DPMSolverMultistepScheduler": DPMSolverMultistepScheduler,
+            "PNDMScheduler": PNDMScheduler,
+        }
+        scheduler_type = scheduler_types[requested]
+        original_scheduler = getattr(pipeline, "scheduler", None)
+        if original_scheduler is None:
+            raise RuntimeError("SD15 pipeline has no scheduler")
+        replacement_scheduler = scheduler_type.from_config(original_scheduler.config)
+        pipeline.scheduler = replacement_scheduler
+        try:
+            yield
+        finally:
+            pipeline.scheduler = original_scheduler
+
+    def _get_img2img_pipeline(self, pipeline: Any) -> Any:
+        """Create the edit pipeline once while keeping the base weights shared."""
+
+        edit_pipeline = getattr(pipeline, "_qlh_img2img_pipeline", None)
+        if edit_pipeline is not None:
+            return edit_pipeline
+
+        from diffusers import StableDiffusionImg2ImgPipeline
+
+        if hasattr(StableDiffusionImg2ImgPipeline, "from_pipe"):
+            edit_pipeline = StableDiffusionImg2ImgPipeline.from_pipe(pipeline)
+        else:
+            edit_pipeline = StableDiffusionImg2ImgPipeline(**pipeline.components)
+        if (
+            self.config.enable_attention_slicing
+            and hasattr(edit_pipeline, "enable_attention_slicing")
+        ):
+            edit_pipeline.enable_attention_slicing()
+        if self.config.enable_vae_slicing and hasattr(edit_pipeline, "enable_vae_slicing"):
+            edit_pipeline.enable_vae_slicing()
+        pipeline._qlh_img2img_pipeline = edit_pipeline
+        return edit_pipeline
 
     def generate(
         self,
@@ -398,16 +540,22 @@ class SD15Engine:
 
             started = time.perf_counter()
             try:
-                output = pipeline(
-                    prompt=request.prompt,
-                    negative_prompt=request.negative_prompt or None,
-                    height=request.height,
-                    width=request.width,
-                    num_inference_steps=request.steps,
-                    guidance_scale=request.guidance_scale,
-                    generator=generator,
-                    callback_on_step_end=on_step_end,
-                )
+                diffusers_logging = self._diffusers_logging
+                if diffusers_logging is None:
+                    from diffusers.utils import logging as diffusers_logging
+
+                with self._request_scheduler(pipeline, request):
+                    with self._suspended_diffusers_progress(diffusers_logging):
+                        output = pipeline(
+                            prompt=request.prompt,
+                            negative_prompt=request.negative_prompt or None,
+                            height=request.height,
+                            width=request.width,
+                            num_inference_steps=request.steps,
+                            guidance_scale=request.guidance_scale,
+                            generator=generator,
+                            callback_on_step_end=on_step_end,
+                        )
             except TypeError as exc:
                 message = str(exc)
                 if "callback_on_step_end" in message and (
@@ -423,6 +571,7 @@ class SD15Engine:
             images = getattr(output, "images", None) or []
             if not images:
                 raise RuntimeError("SD15 pipeline 返回空图像")
+            nsfw_flags = getattr(output, "nsfw_content_detected", None)
             return SD15GenerationResult(
                 image=images[0],
                 seed=int(request.seed),
@@ -435,7 +584,101 @@ class SD15Engine:
                     "height": request.height,
                     "steps": request.steps,
                     "guidance_scale": request.guidance_scale,
+                    "scheduler": request.scheduler or type(
+                        getattr(pipeline, "scheduler", None)
+                    ).__name__,
+                    "safety_flagged": bool(nsfw_flags and nsfw_flags[0]),
                     "capabilities": self.capabilities,
+                },
+            )
+
+    def edit(
+        self,
+        request: Any,
+        *,
+        image: Any,
+        callback: Optional[Callable[[int, int], None]] = None,
+    ) -> SD15GenerationResult:
+        '''Run the supported local img2img edit using shared SD components.'''
+
+        mode = getattr(request, 'mode', '')
+        if mode != 'img2img':
+            raise RuntimeError('SD15 img2img executor does not support this edit mode yet')
+        request.validate()
+        with self._lock:
+            pipeline = self._pipeline
+            if pipeline is None:
+                raise RuntimeError('SD15 engine is not loaded')
+            self._cancel_event.clear()
+            import torch
+
+            generator = torch.Generator(device='cpu').manual_seed(int(request.seed))
+
+            def on_step_end(
+                _pipeline: Any,
+                step: int,
+                _timestep: Any,
+                kwargs: Dict[str, Any],
+            ) -> Dict[str, Any]:
+                if self._cancel_event.is_set():
+                    raise GenerationCancelled('SD15 edit cancelled')
+                if callback:
+                    callback(step + 1, request.steps)
+                return kwargs
+
+            edit_pipeline = self._get_img2img_pipeline(pipeline)
+
+            try:
+                from PIL import Image
+                source_image = image.convert('RGB') if hasattr(image, 'convert') else image
+                source_image = source_image.resize((request.width, request.height), Image.Resampling.LANCZOS)
+                started = time.perf_counter()
+                diffusers_logging = self._diffusers_logging
+                if diffusers_logging is None:
+                    from diffusers.utils import logging as diffusers_logging
+                with self._request_scheduler(edit_pipeline, request):
+                    with self._suspended_diffusers_progress(diffusers_logging):
+                        output = edit_pipeline(
+                            prompt=request.prompt,
+                            negative_prompt=request.negative_prompt or None,
+                            image=source_image,
+                            strength=request.strength,
+                            num_inference_steps=request.steps,
+                            guidance_scale=request.guidance_scale,
+                            generator=generator,
+                            callback_on_step_end=on_step_end,
+                        )
+            except TypeError as exc:
+                message = str(exc)
+                if 'callback_on_step_end' in message and (
+                    'unexpected keyword' in message or 'got an unexpected' in message
+                ):
+                    raise RuntimeError(
+                        'current Diffusers version lacks cancellable SD15 callbacks'
+                    ) from exc
+                raise
+            elapsed = time.perf_counter() - started
+            images = getattr(output, 'images', None) or []
+            if not images:
+                raise RuntimeError('SD15 pipeline returned no image')
+            nsfw_flags = getattr(output, 'nsfw_content_detected', None)
+            return SD15GenerationResult(
+                image=images[0],
+                seed=int(request.seed),
+                elapsed_seconds=elapsed,
+                metadata={
+                    'engine': 'diffusers_sd15_img2img',
+                    'edit_mode': 'img2img',
+                    'strength': request.strength,
+                    'artifact_sha256': self._artifact.sha256 if self._artifact else '',
+                    'device': self._device,
+                    'width': request.width,
+                    'height': request.height,
+                    'steps': request.steps,
+                    'guidance_scale': request.guidance_scale,
+                    'scheduler': request.scheduler or type(getattr(pipeline, 'scheduler', None)).__name__,
+                    'safety_flagged': bool(nsfw_flags and nsfw_flags[0]),
+                    'capabilities': self.capabilities,
                 },
             )
 

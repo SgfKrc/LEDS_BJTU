@@ -197,6 +197,111 @@ describe('阶段 2 其余域契约', () => {
       expect(Array.isArray(res.body.models)).toBe(true);
       expect(res.body).toHaveProperty('active_model_id');
     });
+
+    it('POST /api/models/unload 显式释放本地 LLM', async () => {
+      const res = await request(server()).post('/api/models/unload');
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ success: true, loaded: false });
+      expect(fakeInf?.requests.some(item => item.path === '/v1/models/unload')).toBe(true);
+    });
+  });
+
+  describe('diffusion 域', () => {
+    it('GET capabilities 与 assets 走 inference-svc', async () => {
+      const capabilities = await request(server()).get('/api/diffusion/capabilities');
+      expect(capabilities.status).toBe(200);
+      expect(capabilities.body.loaded).toBe(false);
+
+      const artifacts = await request(server()).get('/api/diffusion/artifacts');
+      expect(artifacts.status).toBe(200);
+      expect(Array.isArray(artifacts.body.artifacts)).toBe(true);
+    });
+
+    it('本机可检查并登记 SD 路径', async () => {
+      const inspected = await request(server())
+        .post('/api/diffusion/artifacts/inspect')
+        .send({ path: 'C:/models/sd15' });
+      expect(inspected.status).toBe(200);
+      expect(inspected.body.artifact_kind).toBe('sd15_pipeline');
+
+      const registered = await request(server())
+        .post('/api/diffusion/artifacts/register')
+        .send({ path: 'C:/models/sd15', artifact_id: 'sd-local' });
+      expect(registered.status).toBe(200);
+      expect(registered.body.artifact_id).toBe('sd-local');
+    });
+
+    it('load/generate/job/cancel/unload 保持状态码和 JSON 契约', async () => {
+      const loaded = await request(server())
+        .post('/api/diffusion/load')
+        .send({ artifact_id: 'sd-local', profile: 'balanced' });
+      expect(loaded.status).toBe(200);
+      expect(loaded.body.loaded).toBe(true);
+
+      const generated = await request(server())
+        .post('/api/diffusion/generate')
+        .send({ preset_id: 'sd15_original_v1', seed: 9 });
+      expect(generated.status).toBe(202);
+      expect(generated.body.job_id).toBe('sdjob_test');
+
+      const job = await request(server()).get('/api/diffusion/jobs/sdjob_test');
+      expect(job.status).toBe(200);
+      expect(job.body.state).toBe('completed');
+
+      const cancelled = await request(server()).post(
+        '/api/diffusion/jobs/sdjob_test/cancel',
+      );
+      expect(cancelled.status).toBe(200);
+      expect(cancelled.body.accepted).toBe(true);
+
+      const unloaded = await request(server()).post('/api/diffusion/unload');
+      expect(unloaded.status).toBe(200);
+      expect(unloaded.body.loaded).toBe(false);
+    });
+
+    it('PNG blob 保留二进制内容和 content-type', async () => {
+      const blob = await request(server()).get('/api/diffusion/blobs/img_test');
+      expect(blob.status).toBe(200);
+      expect(blob.headers['content-type']).toContain('image/png');
+      expect(Buffer.isBuffer(blob.body)).toBe(true);
+      expect(blob.body.toString()).toBe('fake-png');
+
+      const deleted = await request(server()).delete('/api/diffusion/blobs/img_test');
+      expect(deleted.status).toBe(200);
+      expect(deleted.body.deleted).toBe(true);
+    });
+
+    it('multipart 输入 blob 与编辑错误原样经过网关', async () => {
+      const uploaded = await request(server())
+        .post('/api/diffusion/blobs')
+        .field('purpose', 'input_image')
+        .attach('file', Buffer.from('png-body'), {
+          filename: 'source.png',
+          contentType: 'image/png',
+        });
+      expect(uploaded.status).toBe(201);
+      expect(uploaded.body).toMatchObject({
+        blob_id: 'img_input',
+        purpose: 'input_image',
+      });
+      const uploadRequest = fakeInf?.requests.find(
+        item => item.method === 'POST' && item.path === '/v1/diffusion/blobs',
+      );
+      expect(String(uploadRequest?.body)).toContain('name="purpose"');
+      expect(String(uploadRequest?.body)).toContain('input_image');
+
+      const edit = await request(server())
+        .post('/api/diffusion/edit')
+        .send({
+          mode: 'img2img',
+          source_blob_id: 'img_input',
+          prompt: 'sketch',
+        });
+      expect(edit.status).toBe(501);
+      expect(edit.body.detail).toMatchObject({
+        code: 'DIFFUSION_UNSUPPORTED',
+      });
+    });
   });
 
   describe('experimental 域', () => {

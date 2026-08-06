@@ -17,7 +17,18 @@ class DiffusionPreset:
     steps: int = 28
     guidance_scale: float = 7.5
     scheduler: str = "DPMSolverMultistepScheduler"
-    seeds: tuple[int, ...] = (19950101, 19950102, 19950103, 19950104)
+    seeds: tuple[int, ...] = (
+        19950101,
+        19950102,
+        19950103,
+        19950104,
+        19950105,
+        19950106,
+        19950107,
+        19950108,
+        19950110,
+        19950111,
+    )
     safety_checker_required: bool = True
 
     def __post_init__(self) -> None:
