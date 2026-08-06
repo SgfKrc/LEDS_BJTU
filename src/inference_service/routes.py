@@ -642,6 +642,15 @@ async def chat_stream(req: ChatRequest, request: Request):
     request_id = request.headers.get("X-QLH-Request-ID", "-")
     generation_id, cancel_event = host.register_generation(req.generation_id)
 
+    # T9.5：distributed_required 无分布式路径时明确失败（所有模式）
+    routing_gate = host._routing_gate_error(req)
+    if routing_gate:
+        host.unregister_generation(generation_id)
+        return StreamingResponse(
+            iter([_sse_error(routing_gate, request_id)]),
+            media_type="text/event-stream",
+        )
+
     if req.streaming_mode == "full":
         # full：完整功能，推理完成后一次性返回单个 done 事件（SSE 格式）；
         # chat_full 阻塞调用放线程池（api_server run_in_threadpool 语义）
@@ -670,6 +679,43 @@ async def chat_stream(req: ChatRequest, request: Request):
         }
         return StreamingResponse(
             iter([_sse_event(payload)]), media_type="text/event-stream"
+        )
+
+    # interactive：start → token* → done | error | cancelled（T9 契约 §9.4.1；
+    # engine_host 薄实现不提交历史，history_committed 如实上报 false）
+    if req.streaming_mode == "interactive":
+        async def _generate_interactive():
+            yield _sse_event({
+                "start": True,
+                "generation_id": generation_id,
+                "request_id": request_id,
+                "session_id": req.session_id,
+                "routing_preference": req.routing_preference,
+            })
+            completed_normally = False
+            try:
+                async for event in _iterate_sync_generator(
+                    host.chat_stream_events(req, cancel_event)
+                ):
+                    if event.get("done"):
+                        event["request_id"] = request_id
+                        event["generation_id"] = generation_id
+                        event["session_id"] = req.session_id
+                        event["history_committed"] = False
+                        metrics = event.setdefault("metrics", {})
+                        metrics["routing_preference"] = req.routing_preference
+                        metrics["distributed_used"] = False
+                    yield _sse_event(event)
+                completed_normally = True
+            except Exception as e:
+                yield _sse_error(str(e), request_id)
+            finally:
+                if not completed_normally:
+                    cancel_event.set()
+                host.unregister_generation(generation_id)
+
+        return StreamingResponse(
+            _generate_interactive(), media_type="text/event-stream"
         )
 
     # fast：真流式逐 token（同步生成器经线程桥接，不阻塞事件循环）

@@ -1105,6 +1105,12 @@ class EngineHost:
         if req.execution_mode == "task_graph":
             return self.execute_task_graph_chat(req, cancel_event)
 
+        # T9.5：distributed_required 无分布式路径时明确失败（full 模式）
+        routing_gate = self._routing_gate_error(req)
+        if routing_gate:
+            from fastapi import HTTPException as _HE
+            raise _HE(400, routing_gate)
+
         _raise_if_generation_cancelled(cancel_event, req.generation_id)
 
         # ---- 多会话支持 ----
@@ -1148,12 +1154,13 @@ class EngineHost:
                 external_fallback_reason = f"external_api_failed: {exc}"
                 logger.warning(f"外部推理服务调用失败: {exc}，回退到本地推理路径")
 
-        # ---- 分布式推理路由：从节点转发给主节点 ----
+        # ---- 分布式推理路由：从节点转发给主节点（local_only 强制本地）----
         sched = self._scheduler
         distributed_enabled = bool(
             sched is not None and sched.get_distributed_inference_enabled()
         )
-        if (distributed_enabled
+        if (req.routing_preference != "local_only"
+                and distributed_enabled
                 and self._run_mode == "distributed"
                 and sched._effective_role() == "client"):
             try:
@@ -1252,8 +1259,9 @@ class EngineHost:
                 "请先断开主节点或明确切换本地模型。",
             )
 
-        # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用）----
-        if (distributed_enabled
+        # ---- 分布式流水线推理路径（主节点 + PyTorch 引擎 + 从节点可用；local_only 跳过）----
+        if (req.routing_preference != "local_only"
+                and distributed_enabled
                 and self._run_mode == "distributed"
                 and sched._effective_role() == "master"
                 and getattr(self._host, "_engine_type", None) == "pytorch"):
@@ -2886,8 +2894,38 @@ class EngineHost:
     # 路由决策与模型加载（1.2c 复制自 api_server.py:2261-2293 / 3882-3911 /
     # 3913-4011；scheduler 依赖 → self._scheduler 注入点，None=单机基线）
     # ------------------------------------------------------------------
+    def _distributed_path_available(self) -> bool:
+        """当前是否有可用的分布式执行路径（T9.5 同步 api_server 口径）。
+
+        主节点可协调流水线/Worker；从节点可转发主节点；两者都计为合格路径。
+        """
+        sched = self._scheduler
+        try:
+            if not (sched is not None
+                    and sched.get_distributed_inference_enabled()
+                    and self._run_mode == "distributed"):
+                return False
+            return sched._effective_role() in ("master", "client")
+        except Exception:
+            return False
+
+    def _routing_gate_error(self, req: "ChatRequest") -> Optional[str]:
+        """路由偏好预检（T9.5）：返回拒绝原因，None 表示允许继续。"""
+        if req.routing_preference == "distributed_required":
+            if not self._distributed_path_available():
+                return (
+                    "distributed_required 但当前没有可用的分布式路径"
+                    "（分布式未启用或本节点不是主节点）"
+                )
+        return None
+
     def _external_route_decision(self, req: "ChatRequest"):
         """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
+        if req.routing_preference == "local_only":
+            # T9.5：local_only 覆盖一切外部路由意图，数据不出集群
+            from types import SimpleNamespace as _SN
+            return _SN(use_external=False, eligible=False,
+                       reason="local_only_override")
         import config as _cfg
         from external_provider import decide_external_route
 
@@ -3072,7 +3110,10 @@ class EngineHost:
         """Load a local model only when this request cannot be master-forwarded."""
         if req is not None and self._external_route_decision(req).use_external:
             return
-        if self._should_forward_chat_to_master():
+        if req is not None and req.routing_preference == "local_only":
+            # T9.5：local_only 强制本地执行，从节点也不转发
+            pass
+        elif self._should_forward_chat_to_master():
             return
         if self._pipeline_worker_is_reserved():
             from fastapi import HTTPException
