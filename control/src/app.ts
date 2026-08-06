@@ -31,6 +31,10 @@ import { LegacyMigration } from './data/legacy-migration';
 import { ArtifactStore } from './data/artifact-store';
 import { ModelInspector } from './data/model-inspector';
 import { ModelImportService } from './data/model-import-service';
+import { PullJobService } from './data/pull-job.service';
+import { PullJobExecutor } from './data/pull-job-executor';
+import { HfResolver } from './data/hf-resolver';
+import { HfDownloader } from './data/hf-downloader';
 import { HealthController } from './modules/health/health.controller';
 import { DbController } from './modules/db/db.controller';
 import { StorageHealthController } from './modules/db/storage-health.controller';
@@ -38,6 +42,7 @@ import { BootstrapController } from './modules/bootstrap/bootstrap.controller';
 import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
+import { PullJobController } from './modules/models/pull-job.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
@@ -62,6 +67,7 @@ export class CatchAllController {
     ClientErrorController,
     ReviewController,
     ModelsController,
+    PullJobController,
     WorkflowsController,
     BootstrapController,
     StorageHealthController,
@@ -92,6 +98,11 @@ export class CatchAllController {
     ArtifactStore,
     ModelInspector,
     ModelImportService,
+    // M3：pull job + HF resolve/下载
+    PullJobService,
+    HfResolver,
+    HfDownloader,
+    PullJobExecutor,
   ],
 })
 export class AppModule implements OnApplicationBootstrap {
