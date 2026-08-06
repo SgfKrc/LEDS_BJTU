@@ -42,11 +42,11 @@ import * as path from 'path';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import {
   BUILTIN_MODEL_IDS,
-  ModelRegistryStore,
   quantTypesFor,
   RegisteredModel,
   RegisteredModelType,
 } from '../../data/model-registry-store';
+import { ModelRegistryRepository } from '../../data/model-registry-repository';
 
 interface RegisterModelRequest {
   model_id?: string;
@@ -66,7 +66,7 @@ export function resolveModelsDir(env: NodeJS.ProcessEnv = process.env): string {
 
 @Controller()
 export class ModelsController {
-  constructor(private readonly registry: ModelRegistryStore) {}
+  constructor(private readonly registry: ModelRegistryRepository) {}
 
   // ---------- 注册表 CRUD（对齐 api_server.py:5173-5238） ----------
 

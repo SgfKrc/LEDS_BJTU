@@ -21,13 +21,14 @@ import * as path from 'path';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { ConfigDao } from '../src/data/config-dao';
-import { ModelRegistryStore } from '../src/data/model-registry-store';
+import { SqliteStore } from '../src/data/sqlite-store';
 
-describe('control-svc models 域（阶段 3.2 模型注册表）', () => {
+describe('control-svc models 域（阶段 3.2 模型注册表；M1 读路径切 SQLite）', () => {
   let app: NestFastifyApplication | null = null;
   let tmpBase: string;
   let tmpModelsDir: string;
-  let registryFile: string;
+  let sqlitePath: string;
+  let sqliteStore: SqliteStore | null = null;
 
   const dbDisabledDao = new ConfigDao({
     host: 'localhost',
@@ -43,7 +44,9 @@ describe('control-svc models 域（阶段 3.2 模型注册表）', () => {
     tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'control-models-'));
     tmpModelsDir = path.join(tmpBase, 'models');
     fs.mkdirSync(tmpModelsDir, { recursive: true });
-    registryFile = path.join(tmpBase, 'registry.json');
+    sqlitePath = path.join(tmpBase, 'registry.sqlite3');
+    sqliteStore = new SqliteStore(sqlitePath);
+    sqliteStore.open();
     process.env.QLH_MODELS_DIR = tmpModelsDir;
   });
 
@@ -51,6 +54,10 @@ describe('control-svc models 域（阶段 3.2 模型注册表）', () => {
     if (app) {
       await app.close();
       app = null;
+    }
+    if (sqliteStore) {
+      sqliteStore.close();
+      sqliteStore = null;
     }
     delete process.env.QLH_MODELS_DIR;
     fs.rmSync(tmpBase, { recursive: true, force: true });
@@ -62,8 +69,8 @@ describe('control-svc models 域（阶段 3.2 模型注册表）', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
     })
-      .overrideProvider(ModelRegistryStore)
-      .useValue(new ModelRegistryStore(registryFile))
+      .overrideProvider(SqliteStore)
+      .useValue(sqliteStore as SqliteStore)
       .overrideProvider(ConfigDao)
       .useValue(dbDisabledDao)
       .compile();
@@ -124,8 +131,10 @@ describe('control-svc models 域（阶段 3.2 模型注册表）', () => {
     expect(m.huggingface_id).toBe('');
     // quant_types 服务端生成（safetensors → torch 三档）
     expect(m.quant_types).toEqual(['fp16', 'int8', 'int4']);
-    // 持久化文件
-    expect(fs.existsSync(registryFile)).toBe(true);
+    // 持久化到 SQLite（M1 读路径切换后的事实源）
+    expect((sqliteStore as SqliteStore).prepare(
+      'SELECT COUNT(*) AS c FROM model_registry',
+    ).get() as { c: number }).toEqual({ c: 1 });
   });
 
   it('POST quant_types 按 model_type 生成（gguf → Q4_K_M，both → torch 三档）', async () => {

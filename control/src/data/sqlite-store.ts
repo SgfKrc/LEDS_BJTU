@@ -46,7 +46,8 @@ function migrateV1(db: DatabaseSync): void {
       model_path TEXT NOT NULL,
       gguf_path TEXT,
       quantization TEXT,
-      sha256 TEXT NOT NULL,
+      sha256 TEXT,
+      payload TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS cluster_endpoints (
