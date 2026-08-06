@@ -16,15 +16,34 @@
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { ConfigDao } from '../src/data/config-dao';
+import { SqliteStore } from '../src/data/sqlite-store';
 
-describe('control-svc settings 域（阶段 3.2 首迁）', () => {
+let sqliteStore: SqliteStore | null = null;
+let tmpBase: string;
+
+describe('control-svc settings 域（阶段 3.2 首迁；M1 SQLite 本地事实源）', () => {
   let app: NestFastifyApplication | null = null;
+
+  beforeEach(() => {
+    const { mkdtempSync } = require('fs') as typeof import('fs');
+    const { tmpdir } = require('os') as typeof import('os');
+    const { join } = require('path') as typeof import('path');
+    tmpBase = mkdtempSync(join(tmpdir(), 'control-settings-'));
+    sqliteStore = new SqliteStore(join(tmpBase, 'settings.sqlite3'));
+    sqliteStore.open();
+  });
 
   afterEach(async () => {
     if (app) {
       await app.close();
       app = null;
     }
+    if (sqliteStore) {
+      sqliteStore.close();
+      sqliteStore = null;
+    }
+    const { rmSync } = require('fs') as typeof import('fs');
+    rmSync(tmpBase, { recursive: true, force: true });
   });
 
   it('GET /user/settings DB 禁用 → {settings:{}, source:none}', async () => {
@@ -97,10 +116,10 @@ describe('control-svc settings 域（阶段 3.2 首迁）', () => {
     expect(saved).toEqual({ theme: 'dark', maxNewTokens: 512 });
   });
 
-  it('PUT /user/settings 写入失败（返回 false）→ {status:skipped}', async () => {
+  it('PUT /user/settings pg 投影失败 → 本地事实源成功（M1 语义）', async () => {
     const fakeDao = {
       dbEnabled: () => true,
-      setUserSettings: async () => false,
+      setUserSettings: async () => false, // pg 投影失败
     } as unknown as ConfigDao;
     app = await createAppWithDao(fakeDao);
     const res = await app.inject({
@@ -109,7 +128,13 @@ describe('control-svc settings 域（阶段 3.2 首迁）', () => {
       payload: { settings: { theme: 'dark' } },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json().status).toBe('skipped');
+    expect(res.json().status).toBe('ok');
+    // 本地事实源已落库（pg 失败不阻断）
+    const row = (sqliteStore as SqliteStore).prepare(
+      "SELECT value FROM cluster_settings WHERE key = 'user_settings'",
+    ).get() as { value: string } | undefined;
+    expect(row).toBeTruthy();
+    expect(JSON.parse(row!.value)).toEqual({ theme: 'dark' });
   });
 
   it('GET /user/settings DB 可用但读失败 → {settings:{}, source:error}', async () => {
@@ -150,6 +175,8 @@ async function createAppWithDao(dao: ConfigDao): Promise<NestFastifyApplication>
   })
     .overrideProvider(ConfigDao)
     .useValue(dao)
+    .overrideProvider(SqliteStore)
+    .useValue(sqliteStore as SqliteStore)
     .compile();
   const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
   const testApp = moduleRef.createNestApplication(fastifyAdapter);
