@@ -29,6 +29,7 @@ import {
   normalizeNodeType,
   resolveTrustedCidrs,
 } from '../../common/bootstrap-trust';
+import { ClusterEndpointsRepository } from '../../data/cluster-endpoints-repository';
 
 interface FirstConnectBootstrapRequest {
   node_id?: string;
@@ -54,6 +55,10 @@ function envInt(env: NodeJS.ProcessEnv, key: string, def: number): number {
 
 @Controller()
 export class BootstrapController {
+  constructor(
+    private readonly endpoints: ClusterEndpointsRepository,
+  ) {}
+
   @Post('bootstrap/first-connect')
   @HttpCode(200)
   firstConnect(
@@ -88,10 +93,30 @@ export class BootstrapController {
     const pipelineWorker = nodeType === 'pc';
     const hostname = body?.hostname || nodeId;
     const address = peerHost;
+
+    // M1：登记主节点 endpoint 到本地 SQLite 事实源（cluster_id 保留不重复）
+    const clusterId = process.env.QLH_CLUSTER_ID?.trim() || 'qlh-default';
+    try {
+      this.endpoints.upsert({
+        endpoint_id: `ep_${clusterId}`,
+        cluster_id: clusterId,
+        name: 'bootstrap-registered',
+        scheme: 'http',
+        host: apiHost,
+        port: apiPort,
+        status: 'active',
+        last_verified_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      // 登记失败不阻断首连响应（本地事实源尽力写入）
+      // eslint-disable-next-line no-console
+      console.warn(`[control-svc] endpoint 登记失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
     return {
       status: 'ok',
       cluster: {
-        cluster_id: process.env.QLH_CLUSTER_ID?.trim() || 'qlh-default',
+        cluster_id: clusterId,
         master_api_host: apiHost,
         master_api_port: apiPort,
         master_tcp_host: apiHost,
