@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildEditRequest,
+  buildInpaintRequest,
   buildReferenceRequest,
   canUseLocalDiffusion,
   loadedArtifactId,
@@ -132,6 +133,25 @@ test('reference request carries adapter identity and clamps its scale', () => {
   assert.equal(request.edit_adapter_id, 'ip-adapter');
   assert.equal(request.ip_adapter_scale, 2);
   assert.equal(request.strength, undefined);
+});
+
+test('inpaint request binds source, mask, and dedicated pipeline identities', () => {
+  const form = presetToForm(null);
+  form.prompt = 'replace the selected window';
+  form.strength = '0.6';
+
+  const request = buildInpaintRequest(
+    form,
+    'img_source',
+    'img_mask',
+    'sd15_inpaint_v1',
+  );
+
+  assert.equal(request.mode, 'inpaint');
+  assert.equal(request.source_blob_id, 'img_source');
+  assert.equal(request.mask_blob_id, 'img_mask');
+  assert.equal(request.edit_adapter_id, 'sd15_inpaint_v1');
+  assert.equal(request.strength, 0.6);
 });
 
 test('diffusion JSON API keeps encoded identifiers and request payloads', async () => {
