@@ -24,6 +24,10 @@ import { SqliteStore } from './data/sqlite-store';
 import { OutboxService } from './data/outbox.service';
 import { StorageHealthService } from './data/storage-health';
 import { PostgresProjector } from './data/postgres-projector';
+import { ClusterSettingsRepository } from './data/cluster-settings-repository';
+import { ModelRegistryRepository } from './data/model-registry-repository';
+import { ClusterEndpointsRepository } from './data/cluster-endpoints-repository';
+import { LegacyMigration } from './data/legacy-migration';
 import { HealthController } from './modules/health/health.controller';
 import { DbController } from './modules/db/db.controller';
 import { StorageHealthController } from './modules/db/storage-health.controller';
@@ -77,6 +81,11 @@ export class CatchAllController {
     OutboxService,
     StorageHealthService,
     PostgresProjector,
+    // M1 任务 2：三域 repository + 旧源迁移执行器
+    ClusterSettingsRepository,
+    ModelRegistryRepository,
+    ClusterEndpointsRepository,
+    LegacyMigration,
   ],
 })
 export class AppModule {}
