@@ -716,7 +716,7 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1 Completed、SD-N2 In Progress、img2img 已实现待真实 GPU 验收）
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1 Completed、SD-N2/SD-N5.1 In Progress；真实 Edge 续编与双模型完整自动质量/显存门通过，仅双人目视待完成）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
 - [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 内容寻址模型仓库、跨节点部署与多集群档案（L4 Candidate）
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
