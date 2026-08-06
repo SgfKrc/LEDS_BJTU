@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "source_id": "python_builtin_models",
+      "location": "src/model_config.py:BUILTIN_MODELS（代码内嵌 dataclass 列表）",
+      "role": "curated_catalog_seed",
+      "id_field": "model_id",
+      "idempotency": "model_id 唯一；同 id 已存在时跳过并记录，不覆盖",
+      "target": {
+        "table": "catalog_models",
+        "field_map": {
+          "model_id": "model_id",
+          "name": "name",
+          "model_type": "format",
+          "model_path": "local_path",
+          "gguf_path": "gguf_path",
+          "recommended_vram_gb": "min_vram_bytes_approx_gb",
+          "max_context": "context_length",
+          "huggingface_id": "source.repo_id",
+          "quant_types": "quantizations",
+          "is_experimental": "is_experimental",
+          "location": "origin"
+        }
+      }
+    },
+    {
+      "source_id": "control_ts_json",
+      "location": "control/src/data/model-registry-store.ts -> <cwd>/model_registry.json",
+      "role": "user_registry",
+      "id_field": "model_id",
+      "idempotency": "model_id 唯一；迁移前先按文件 sha256 汇总，相同摘要只注册一次",
+      "target": {
+        "table": "user_registry",
+        "field_map": {
+          "model_id": "model_id",
+          "name": "name",
+          "model_path": "local_path",
+          "gguf_path": "gguf_path",
+          "quant_type": "quantization",
+          "sha256": "files[0].sha256"
+        }
+      }
+    },
+    {
+      "source_id": "postgres_cluster_config",
+      "location": "src/db.py:cluster_config(key, value) 表",
+      "role": "cluster_settings",
+      "id_field": "key",
+      "idempotency": "key 唯一；按 key 幂等写入，不重复插入",
+      "target": {
+        "table": "cluster_settings",
+        "field_map": {
+          "key": "key",
+          "value": "value"
+        }
+      }
+    }
+  ],
+  "target_tables": [
+    "catalog_models",
+    "user_registry",
+    "cluster_settings",
+    "cluster_profiles",
+    "pull_jobs",
+    "artifacts",
+    "deployments"
+  ],
+  "rules": [
+    "迁移可重复执行：同一幂等键冲突时跳过并记录，不产生重复 artifact",
+    "相同内容摘要（sha256）只注册一次；文件名变化不覆盖旧 digest",
+    "迁移为只读：不修改 Python 内置列表与 model_registry.json 源文件",
+    "迁移完成后由 control-svc SQLite 作为唯一写者，其他服务只读 API"
+  ]
+}
