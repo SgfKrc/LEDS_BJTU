@@ -523,7 +523,7 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - 请求级 `routing_preference` 接入执行路径（api_server 单体）：`local_only` 强制本地（跳过外部路由/主节点转发/分布式流水线，含 full 与 interactive/fast）；`distributed_required` 无分布式路径时明确失败（interactive/fast 发 error 事件、full 走既有 SSE error 语义），不静默回退；`distributed_preferred` 不可用时本地回退并标注 `fallback=true` + `fallback_reason`。
   - metrics 补全：`distributed_used`（实际走流水线时 true）、`fallback`/`fallback_reason`（请求分布式但本地执行）。
   - 验收：`tests/test_chat_interactive.py` 17 用例（local_only 客户端/主节点、required 失败/放行、preferred 回退 metrics、full 模式 local_only/required）+ 全量相关回归 263 passed。
-  - 待办：inference-svc（engine_host）执行段同步（并行共存契约复测时一并落地）；物理从节点可用后验证真实参与节点与 fallback 跨端一致（TUI/Web/任务统计）。
+  - 待办：inference-svc 的 interactive 历史事务提交（engine_host 薄实现 `history_committed=false` 如实上报）；物理从节点可用后验证真实参与节点与 fallback 跨端一致（TUI/Web/任务统计）。
 
 - [ ] **T9.6 打包、回归与默认入口决策**
   - Windows/Linux 包包含聊天依赖；源码模式提供环境引导。
