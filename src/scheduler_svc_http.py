@@ -442,9 +442,11 @@ async def test_email_notification():
     """
     发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
 
-    邮件将发送到当前配置的管理员收件邮箱（node_config 优先，回退环境变量）。
-    任何节点均可调用（主节点和从节点均可测试邮件发送）。
+    邮件将发送到当前配置的管理员收件邮箱（集群配置优先，回退环境变量）。
+    仅主节点可调用（管理员邮箱为集群级配置，见 docs/已知问题记录.md 问题 #1）。
     """
+    if _scheduler()._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
     try:
         from email_notifier import send_test_email
         # SMTP 发送为同步网络操作（可阻塞数秒），放入线程池执行
@@ -469,11 +471,15 @@ async def get_email_config():
     """
     查询管理员收件邮箱配置（不返回任何 SMTP 凭据）。
 
+    仅主节点可调用；从节点不显示该配置条目（见 docs/已知问题记录.md 问题 #1）。
+
     Returns:
         recipient: 当前生效收件邮箱（可能为空）
-        source: node_config | env | none
+        source: cluster | env | node_config | none
         smtp_configured: 发件账号是否已配置
     """
+    if _scheduler()._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
     try:
         from email_notifier import admin_email_config
         from email_notifier import SMTP_SENDER, SMTP_PASSWORD
@@ -490,10 +496,12 @@ async def get_email_config():
 @router.post("/cluster/email-config")
 async def update_email_config(req: EmailConfigRequest):
     """
-    设置管理员收件邮箱并持久化到 node_config.json，运行中立即生效。
+    设置管理员收件邮箱并持久化为集群级配置，运行中立即生效。
 
-    传空字符串可清除自定义配置，回退到环境变量 QLH_SMTP_RECIPIENT。
+    仅主节点可调用；传空字符串可清除集群配置，回退到环境变量 QLH_SMTP_RECIPIENT。
     """
+    if _scheduler()._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
     try:
         from email_notifier import set_admin_email
         recipient = await run_in_threadpool(set_admin_email, req.recipient)

@@ -1932,14 +1932,15 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
           </section>
         )}
 
-        {/* ---- 邮件告警配置与测试（所有节点） ---- */}
+        {/* ---- 邮件告警配置与测试（仅主节点；管理员邮箱为集群级配置） ---- */}
+        {isMaster && (
         <section className="admin-section">
           <h3>📧 邮件告警</h3>
           <div className="identity-management">
             <p className="connect-desc">
               当从节点检测到主节点宕机超过 {180}s 时，将自动向管理员发送告警邮件。
-              恢复后也会发送恢复通知。收件邮箱可在此修改，保存后立即生效（写入本机
-              node_config.json，无需重启）。
+              恢复后也会发送恢复通知。收件邮箱为集群级配置（仅主节点可修改），
+              保存后立即生效并同步给全部节点，无需重启。
             </p>
             <div className="email-config-row">
               <label className="email-config-label" htmlFor="admin-email-input">
@@ -1964,6 +1965,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
             </div>
             <p className="setting-desc">
               当前生效：{adminEmail ? <strong>{adminEmail}</strong> : '未配置'}
+              {emailSource === 'cluster' && '（集群配置，全节点生效）'}
               {emailSource === 'node_config' && '（本机配置）'}
               {emailSource === 'env' && '（环境变量 QLH_SMTP_RECIPIENT）'}
             </p>
@@ -1985,6 +1987,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
             </div>
           </div>
         </section>
+        )}
 
         {/* ---- 分布式推理开关（所有节点可见） ---- */}
         <section className="admin-section">

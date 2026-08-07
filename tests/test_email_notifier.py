@@ -112,6 +112,12 @@ def isolated_node_config(tmp_path, monkeypatch):
 class TestAdminEmailConfig:
     """测试 get/set_admin_email 的优先级、持久化与校验。"""
 
+    @pytest.fixture(autouse=True)
+    def _no_cluster_db(self, monkeypatch):
+        """默认隔离共享 DB：无集群配置、写入失败（单机/无 DB 场景）。"""
+        monkeypatch.setattr("email_notifier._cluster_config_admin_email", lambda: "")
+        monkeypatch.setattr("email_notifier._persist_cluster_admin_email", lambda email: False)
+
     def test_falls_back_to_env_recipient(self, isolated_node_config, monkeypatch):
         monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env-admin@example.com")
         assert get_admin_email() == "env-admin@example.com"
@@ -120,16 +126,46 @@ class TestAdminEmailConfig:
             "source": "env",
         }
 
-    def test_node_config_takes_priority(self, isolated_node_config, monkeypatch):
-        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env-admin@example.com")
+    def test_node_config_fallback_when_no_cluster_and_env(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "")
         set_admin_email("custom@example.com")
         assert get_admin_email() == "custom@example.com"
         assert admin_email_config()["source"] == "node_config"
 
-    def test_set_persists_and_normalizes(self, isolated_node_config):
+    def test_cluster_config_takes_priority_over_env(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr(
+            "email_notifier._cluster_config_admin_email",
+            lambda: "cluster@example.com",
+        )
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "env@example.com")
+        assert get_admin_email() == "cluster@example.com"
+        assert admin_email_config() == {
+            "recipient": "cluster@example.com",
+            "source": "cluster",
+        }
+
+    def test_cluster_config_takes_priority_over_node_config(self, isolated_node_config, monkeypatch):
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "")
+        set_admin_email("local@example.com")
+        monkeypatch.setattr(
+            "email_notifier._cluster_config_admin_email",
+            lambda: "cluster@example.com",
+        )
+        # 集群级配置（主节点写入）优先于本机 node_config 残留
+        assert get_admin_email() == "cluster@example.com"
+        assert admin_email_config()["source"] == "cluster"
+
+    def test_set_persists_cluster_and_normalizes(self, isolated_node_config, monkeypatch):
+        captured = {}
+
+        def fake_persist(email):
+            captured["email"] = email
+            return True
+
+        monkeypatch.setattr("email_notifier._persist_cluster_admin_email", fake_persist)
         set_admin_email("Ops@Example.com")
-        assert get_admin_email() == "ops@example.com"
-        # 模拟重启：重新读 node_config 仍生效
+        assert captured["email"] == "ops@example.com"
+        # 模拟重启：重新读 node_config 仍生效（单机/无 DB 兜底）
         assert email_notifier._node_config_admin_email() == "ops@example.com"
 
     def test_clear_removes_override(self, isolated_node_config, monkeypatch):
@@ -151,6 +187,7 @@ class TestAdminEmailConfig:
             return True
 
         monkeypatch.setattr("email_notifier._send_email_to", fake_send)
+        monkeypatch.setattr("email_notifier.SMTP_RECIPIENT", "")  # 先清空环境变量
         set_admin_email("alerts@example.com")
         assert _send_email("subject", "body") is True
         assert captured["to"] == "alerts@example.com"
