@@ -16,6 +16,8 @@ from diffusion.assets import (
     IP_ADAPTER_REVISION,
     INPAINT_REPO,
     INPAINT_REVISION,
+    INSTRUCTION_REPO,
+    INSTRUCTION_REVISION,
     ORIGINAL_REPO,
     ORIGINAL_REVISION,
     RETRO_REVISION,
@@ -99,6 +101,22 @@ def test_inpaint_catalog_freezes_the_dedicated_nine_channel_pipeline():
     assert spec.artifact_kind == "sd15_inpaint_pipeline"
     assert spec.license_id == "creativeml-openrail-m"
     assert spec.download_bytes == 2742261613
+    assert {item.path for item in spec.files if item.sha256} == {
+        "text_encoder/model.fp16.safetensors",
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+        "safety_checker/model.fp16.safetensors",
+    }
+
+
+def test_instruction_catalog_freezes_the_dedicated_instruct_pix2pix_pipeline():
+    spec = ASSET_CATALOG["sd15_instruct_pix2pix_v1"]
+
+    assert spec.repo_id == INSTRUCTION_REPO
+    assert spec.revision == INSTRUCTION_REVISION
+    assert spec.artifact_kind == "sd15_instruction_pipeline"
+    assert spec.license_id == "mit"
+    assert spec.download_bytes == 2742242939
     assert {item.path for item in spec.files if item.sha256} == {
         "text_encoder/model.fp16.safetensors",
         "unet/diffusion_pytorch_model.fp16.safetensors",

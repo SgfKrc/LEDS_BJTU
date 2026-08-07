@@ -112,6 +112,8 @@ class SD15Engine:
         self._ip_adapter_scale: Optional[float] = None
         self._inpaint_pipeline: Any = None
         self._inpaint_identity: Optional[str] = None
+        self._instruction_pipeline: Any = None
+        self._instruction_identity: Optional[str] = None
 
     @staticmethod
     @contextmanager
@@ -193,6 +195,13 @@ class SD15Engine:
                 "pipeline_loaded": self._inpaint_identity is not None,
                 "pipeline_identity": self._inpaint_identity,
             },
+            "instruction_edit": {
+                "supported": True,
+                "strategy": "sd15_instruct_pix2pix_pipeline",
+                "pipeline_loaded": self._instruction_identity is not None,
+                "pipeline_identity": self._instruction_identity,
+                "controlnet_ip2p": "experimental_not_exposed",
+            },
         }
 
     def _require_quantization_backend(self) -> Any:
@@ -232,6 +241,8 @@ class SD15Engine:
         self._diffusers_logging = None
         self._inpaint_pipeline = None
         self._inpaint_identity = None
+        self._instruction_pipeline = None
+        self._instruction_identity = None
         try:
             import gc
             import torch
@@ -504,10 +515,15 @@ class SD15Engine:
             inpaint_pipeline = self._inpaint_pipeline
             self._inpaint_pipeline = None
             self._inpaint_identity = None
+            instruction_pipeline = self._instruction_pipeline
+            self._instruction_pipeline = None
+            self._instruction_identity = None
             if pipeline is not None:
                 del pipeline
             if inpaint_pipeline is not None:
                 del inpaint_pipeline
+            if instruction_pipeline is not None:
+                del instruction_pipeline
             try:
                 import gc
                 import torch
@@ -597,6 +613,8 @@ class SD15Engine:
                 "SD15 inpaint currently requires model CPU offload to avoid two resident pipelines"
             )
 
+        self._release_instruction_pipeline()
+
         from pathlib import Path
 
         import torch
@@ -650,6 +668,104 @@ class SD15Engine:
             self._remove_model_cpu_offload_hooks(previous)
             del previous
         return replacement
+
+    def _get_instruction_pipeline(self, artifact: DiffusionArtifact) -> Any:
+        """Load the pinned InstructPix2Pix pipeline without mutating the base."""
+
+        if artifact.artifact_kind != "sd15_instruction_pipeline" or not artifact.loadable:
+            raise ValueError(
+                "instruction mode requires a complete InstructPix2Pix pipeline"
+            )
+        identity = artifact.sha256 or artifact.path
+        if (
+            self._instruction_pipeline is not None
+            and self._instruction_identity == identity
+        ):
+            return self._instruction_pipeline
+        if self.config.quantization != "none" or self.config.enable_qkv_fusion:
+            raise RuntimeError(
+                "InstructPix2Pix has not passed the quantized or QKV-fused compatibility gate"
+            )
+        if self._device.startswith("cuda") and not self.config.enable_model_cpu_offload:
+            raise RuntimeError(
+                "InstructPix2Pix currently requires model CPU offload to avoid two resident pipelines"
+            )
+
+        self._release_inpaint_pipeline()
+
+        from pathlib import Path
+
+        import torch
+        from diffusers import StableDiffusionInstructPix2PixPipeline
+        from diffusers.utils import logging as diffusers_logging
+
+        model_path = Path(artifact.path).expanduser()
+        if not model_path.is_dir():
+            raise ValueError(
+                "instruction artifact must be a local Diffusers directory"
+            )
+
+        use_cuda = self._device.startswith("cuda") and torch.cuda.is_available()
+        dtype = (
+            torch.float16
+            if use_cuda and self.config.dtype == "float16"
+            else torch.float32
+        )
+        replacement: Any = None
+        try:
+            with self._suspended_diffusers_progress(diffusers_logging):
+                load_kwargs = self._pipeline_load_kwargs(
+                    dtype=dtype,
+                    artifact=artifact,
+                )
+                load_kwargs.update(
+                    self._mixed_precision_safety_overrides(
+                        model_path=model_path,
+                        artifact=artifact,
+                        dtype=dtype,
+                    )
+                )
+                replacement = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                    model_path,
+                    **load_kwargs,
+                )
+                self._validate_pipeline_safety(replacement)
+                replacement = self._configure_pipeline(
+                    replacement,
+                    use_cuda=use_cuda,
+                    torch=torch,
+                    track_quantization=False,
+                )
+        except Exception:
+            if replacement is not None:
+                del replacement
+            raise
+
+        previous = self._instruction_pipeline
+        self._instruction_pipeline = replacement
+        self._instruction_identity = identity
+        if previous is not None:
+            self._remove_model_cpu_offload_hooks(previous)
+            del previous
+        return replacement
+
+    def _release_inpaint_pipeline(self) -> None:
+        pipeline = self._inpaint_pipeline
+        if pipeline is None:
+            return
+        self._remove_model_cpu_offload_hooks(pipeline)
+        self._inpaint_pipeline = None
+        self._inpaint_identity = None
+        del pipeline
+
+    def _release_instruction_pipeline(self) -> None:
+        pipeline = self._instruction_pipeline
+        if pipeline is None:
+            return
+        self._remove_model_cpu_offload_hooks(pipeline)
+        self._instruction_pipeline = None
+        self._instruction_identity = None
+        del pipeline
 
     def _unload_ip_adapter(self, pipeline: Any) -> None:
         if self._ip_adapter_identity is None:
@@ -776,6 +892,8 @@ class SD15Engine:
                 raise RuntimeError("SD15 引擎尚未加载模型")
             self._cancel_event.clear()
             self._unload_ip_adapter(pipeline)
+            self._release_inpaint_pipeline()
+            self._release_instruction_pipeline()
 
             import torch
 
@@ -851,10 +969,10 @@ class SD15Engine:
         adapter: Optional[DiffusionArtifact] = None,
         callback: Optional[Callable[[int, int], None]] = None,
     ) -> SD15GenerationResult:
-        '''Run local img2img, inpaint, or IP-Adapter reference generation.'''
+        '''Run local image editing with one explicitly matched pipeline.'''
 
         mode = getattr(request, 'mode', '')
-        if mode not in {'img2img', 'reference', 'inpaint'}:
+        if mode not in {'img2img', 'reference', 'inpaint', 'instruction'}:
             raise RuntimeError('SD15 engine does not support this edit mode yet')
         request.validate()
         with self._lock:
@@ -881,6 +999,8 @@ class SD15Engine:
             if mode == 'reference':
                 if adapter is None:
                     raise ValueError('reference mode requires an IP-Adapter artifact')
+                self._release_inpaint_pipeline()
+                self._release_instruction_pipeline()
                 self._ensure_ip_adapter(
                     pipeline,
                     adapter,
@@ -894,8 +1014,17 @@ class SD15Engine:
                     raise ValueError('inpaint mode requires a mask image')
                 self._unload_ip_adapter(pipeline)
                 edit_pipeline = self._get_inpaint_pipeline(adapter)
+            elif mode == 'instruction':
+                if adapter is None:
+                    raise ValueError(
+                        'instruction mode requires an InstructPix2Pix artifact'
+                    )
+                self._unload_ip_adapter(pipeline)
+                edit_pipeline = self._get_instruction_pipeline(adapter)
             else:
                 self._unload_ip_adapter(pipeline)
+                self._release_inpaint_pipeline()
+                self._release_instruction_pipeline()
                 edit_pipeline = self._get_img2img_pipeline(pipeline)
                 # from_pipe shares model modules with the base pipeline, but
                 # Accelerate's hook chain belongs to one pipeline instance at
@@ -906,7 +1035,7 @@ class SD15Engine:
             try:
                 from PIL import Image
                 source_image = image.convert('RGB') if hasattr(image, 'convert') else image
-                if mode in {'img2img', 'inpaint'}:
+                if mode in {'img2img', 'inpaint', 'instruction'}:
                     source_image = source_image.resize(
                         (request.width, request.height),
                         Image.Resampling.LANCZOS,
@@ -925,7 +1054,11 @@ class SD15Engine:
                 with self._request_scheduler(edit_pipeline, request):
                     with self._suspended_diffusers_progress(diffusers_logging):
                         call_kwargs = {
-                            'prompt': request.prompt,
+                            'prompt': (
+                                request.instruction
+                                if mode == 'instruction'
+                                else request.prompt
+                            ),
                             'negative_prompt': request.negative_prompt or None,
                             'num_inference_steps': request.steps,
                             'guidance_scale': request.guidance_scale,
@@ -945,6 +1078,11 @@ class SD15Engine:
                                 'strength': request.strength,
                                 'height': request.height,
                                 'width': request.width,
+                            })
+                        elif mode == 'instruction':
+                            call_kwargs.update({
+                                'image': source_image,
+                                'image_guidance_scale': request.image_guidance_scale,
                             })
                         else:
                             call_kwargs.update({
@@ -976,6 +1114,8 @@ class SD15Engine:
                         if mode == 'reference'
                         else 'diffusers_sd15_inpaint'
                         if mode == 'inpaint'
+                        else 'diffusers_sd15_instruct_pix2pix'
+                        if mode == 'instruction'
                         else 'diffusers_sd15_img2img'
                     ),
                     'edit_mode': mode,
@@ -985,6 +1125,19 @@ class SD15Engine:
                     ),
                     'inpaint_sha256': (
                         adapter.sha256 if mode == 'inpaint' and adapter else None
+                    ),
+                    'instruction': (
+                        request.instruction if mode == 'instruction' else None
+                    ),
+                    'image_guidance_scale': (
+                        request.image_guidance_scale
+                        if mode == 'instruction'
+                        else None
+                    ),
+                    'instruction_pipeline_sha256': (
+                        adapter.sha256
+                        if mode == 'instruction' and adapter
+                        else None
                     ),
                     'ip_adapter_scale': (
                         request.ip_adapter_scale if mode == 'reference' else None

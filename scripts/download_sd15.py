@@ -28,6 +28,7 @@ def main() -> int:
             "sd15_90s_retrovers_v1",
             "sd15_ip_adapter_v1",
             "sd15_inpaint_v1",
+            "sd15_instruct_pix2pix_v1",
         ),
     )
     parser.add_argument(
@@ -83,8 +84,10 @@ def main() -> int:
         )
     elif spec.artifact_kind == "sd15_ip_adapter":
         print("Next: run the SD15 IP-Adapter reference-image GPU gate")
-    else:
+    elif spec.artifact_kind == "sd15_inpaint_pipeline":
         print("Next: run the SD15 inpaint source/mask GPU gate")
+    else:
+        print("Next: run the SD15 InstructPix2Pix instruction-edit GPU gate")
     return 0
 
 

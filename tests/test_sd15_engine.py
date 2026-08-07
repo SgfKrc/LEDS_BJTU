@@ -329,6 +329,114 @@ def test_inpaint_loads_a_dedicated_pipeline_and_reuses_it(monkeypatch, tmp_path)
     assert _InpaintPipeline.load_calls[0][1]['local_files_only'] is True
 
 
+def test_instruction_mode_loads_instruct_pix2pix_and_uses_image_guidance(
+    monkeypatch,
+    tmp_path,
+):
+    diffusers = pytest.importorskip("diffusers")
+
+    class _InstructionPipeline:
+        load_calls = []
+
+        def __init__(self):
+            self.safety_checker = object()
+            self.scheduler = SimpleNamespace()
+            self.vae = SimpleNamespace(enable_slicing=lambda: None)
+
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            cls.load_calls.append((Path(path), kwargs))
+            return cls()
+
+        def set_progress_bar_config(self, **_kwargs):
+            return None
+
+        def enable_attention_slicing(self):
+            return None
+
+        def to(self, _device):
+            return self
+
+        def __call__(
+            self,
+            *,
+            prompt,
+            image,
+            image_guidance_scale,
+            callback_on_step_end,
+            num_inference_steps,
+            **kwargs,
+        ):
+            assert prompt == 'make it a snowy winter day'
+            assert image.mode == 'RGB'
+            assert image.size == (512, 512)
+            assert image_guidance_scale == 1.0
+            assert 'strength' not in kwargs
+            for step in range(num_inference_steps):
+                callback_on_step_end(self, step, None, {})
+            return SimpleNamespace(images=['instruction-image'])
+
+    monkeypatch.setattr(
+        diffusers,
+        'StableDiffusionInstructPix2PixPipeline',
+        _InstructionPipeline,
+    )
+    engine = SD15Engine(
+        SD15EngineConfig(
+            device='cpu',
+            dtype='float32',
+            enable_model_cpu_offload=False,
+        )
+    )
+    engine._pipeline = _FakePipeline()
+    engine._diffusers_logging = _FakeDiffusersLogging()
+    engine._device = 'cpu'
+    artifact = DiffusionArtifact(
+        path=str(tmp_path),
+        artifact_kind='sd15_instruction_pipeline',
+        precision='fp16',
+        sha256='e' * 64,
+        loadable=True,
+    )
+    request = SD15EditRequest(
+        mode='instruction',
+        source_blob_id='img_source',
+        prompt='make it a snowy winter day',
+        instruction='make it a snowy winter day',
+        edit_adapter_id='instruction-pipeline',
+        image_guidance_scale=1.0,
+        width=512,
+        height=512,
+        steps=2,
+    )
+    progress = []
+
+    first = engine.edit(
+        request,
+        image=Image.new('RGB', (16, 16), 127),
+        adapter=artifact,
+        callback=lambda step, total: progress.append((step, total)),
+    )
+    second = engine.edit(
+        request,
+        image=Image.new('RGB', (16, 16), 127),
+        adapter=artifact,
+    )
+
+    assert first.image == second.image == 'instruction-image'
+    assert first.metadata['engine'] == 'diffusers_sd15_instruct_pix2pix'
+    assert first.metadata['instruction_pipeline_sha256'] == 'e' * 64
+    assert first.metadata['image_guidance_scale'] == 1.0
+    assert progress == [(1, 2), (2, 2)]
+    assert len(_InstructionPipeline.load_calls) == 1
+    assert _InstructionPipeline.load_calls[0][1]['local_files_only'] is True
+    assert engine._instruction_pipeline is not None
+
+    engine.generate(SD15GenerationRequest(prompt='plain generation', steps=1))
+
+    assert engine._instruction_pipeline is None
+
+
 def test_reference_mode_loads_local_ip_adapter_and_reports_identity(monkeypatch):
     class _ReferencePipeline(_FakePipeline):
         def __init__(self):

@@ -699,6 +699,92 @@ def test_reference_edit_requires_registered_ip_adapter_and_tracks_metadata(tmp_p
         service.close()
 
 
+def test_instruction_edit_requires_dedicated_pipeline_and_tracks_guidance(tmp_path):
+    store = MemoryImageBlobStore()
+    source = store.put_upload(
+        _encoded_image(size=(16, 16)),
+        purpose='input_image',
+        owner_scope='local',
+    )
+    service, factory = _loaded_service(tmp_path, blob_store=store)
+    service._inspector = _Inspector('sd15_instruction_pipeline', loadable=True)
+    service.register_artifact(
+        str(tmp_path / 'instruct-pix2pix'),
+        artifact_id='instruction-pipeline',
+    )
+    request = SD15EditRequest(
+        mode='instruction',
+        source_blob_id=source.blob_id,
+        prompt='make it a snowy winter day',
+        instruction='make it a snowy winter day',
+        edit_adapter_id='instruction-pipeline',
+        image_guidance_scale=1.0,
+        width=512,
+        height=512,
+        steps=2,
+    )
+    try:
+        validated = service.validate_edit(request)
+        assert validated['edit_adapter']['artifact_id'] == 'instruction-pipeline'
+
+        submitted = service.submit_edit(request)
+        completed = _wait_for_state(service, submitted['job_id'], 'completed')
+
+        assert completed['progress'] == {'step': 2, 'total': 2}
+        assert completed['blob']['metadata']['edit_mode'] == 'instruction'
+        assert completed['blob']['metadata']['instruction'] == request.instruction
+        assert completed['blob']['metadata']['image_guidance_scale'] == 1.0
+        assert completed['blob']['metadata']['edit_adapter_id'] == 'instruction-pipeline'
+        assert factory.instances[0].last_edit['adapter'].artifact_kind == 'sd15_instruction_pipeline'
+        assert store.get(source.blob_id).lease_count == 0
+    finally:
+        service.close()
+
+
+def test_instruction_edit_rejects_controlnet_parameters_for_default_pipeline():
+    request = SD15EditRequest(
+        mode='instruction',
+        source_blob_id='img_source',
+        prompt='make it winter',
+        instruction='make it winter',
+        edit_adapter_id='instruction-pipeline',
+        image_guidance_scale=1.0,
+        conditioning_scale=0.8,
+        width=512,
+        height=512,
+    )
+
+    with pytest.raises(DiffusionInputError, match='conditioning_scale'):
+        request.validate()
+
+
+@pytest.mark.parametrize(
+    ('prompt', 'image_guidance_scale', 'message'),
+    [
+        ('describe a new target', 1.0, 'prompt must match instruction'),
+        ('make it winter', 4.1, 'image_guidance_scale'),
+    ],
+)
+def test_instruction_edit_rejects_ambiguous_prompt_or_excessive_guidance(
+    prompt,
+    image_guidance_scale,
+    message,
+):
+    request = SD15EditRequest(
+        mode='instruction',
+        source_blob_id='img_source',
+        prompt=prompt,
+        instruction='make it winter',
+        edit_adapter_id='instruction-pipeline',
+        image_guidance_scale=image_guidance_scale,
+        width=512,
+        height=512,
+    )
+
+    with pytest.raises(DiffusionInputError, match=message):
+        request.validate()
+
+
 @pytest.mark.parametrize('scale', [-0.1, 2.1, float('nan')])
 def test_reference_edit_rejects_invalid_ip_adapter_scale(scale):
     request = SD15EditRequest(

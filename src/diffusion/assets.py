@@ -76,6 +76,8 @@ IP_ADAPTER_REPO = "h94/IP-Adapter"
 IP_ADAPTER_REVISION = "018e402774aeeddd60609b4ecdb7e298259dc729"
 INPAINT_REPO = "stable-diffusion-v1-5/stable-diffusion-inpainting"
 INPAINT_REVISION = "8a4288a76071f7280aedbdb3253bdb9e9d5d84bb"
+INSTRUCTION_REPO = "timbrooks/instruct-pix2pix"
+INSTRUCTION_REVISION = "31519b5cb02a7fd89b906d88731cd4d6a7bbf88d"
 
 
 def _file(
@@ -236,6 +238,49 @@ _INPAINT_FILES = (
     ),
 )
 
+_INSTRUCTION_FILES = (
+    _file("README.md", 1291, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("model_index.json", 616, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("feature_extractor/preprocessor_config.json", 518, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("scheduler/scheduler_config.json", 569, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("text_encoder/config.json", 617, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file(
+        "text_encoder/model.fp16.safetensors",
+        246144864,
+        sha256="77795e2023adcf39bc29a884661950380bd093cf0750a966d473d1718dc9ef4e",
+        repo=INSTRUCTION_REPO,
+        revision=INSTRUCTION_REVISION,
+    ),
+    _file("tokenizer/merges.txt", 524619, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("tokenizer/special_tokens_map.json", 472, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("tokenizer/tokenizer_config.json", 806, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("tokenizer/vocab.json", 1059962, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file("unet/config.json", 1021, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file(
+        "unet/diffusion_pytorch_model.fp16.safetensors",
+        1719148344,
+        sha256="0d6bbc0a95dd125196d327a660b43d24c56f433eb30d2776f1327fb86bd38f78",
+        repo=INSTRUCTION_REPO,
+        revision=INSTRUCTION_REVISION,
+    ),
+    _file("vae/config.json", 553, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file(
+        "vae/diffusion_pytorch_model.fp16.safetensors",
+        167335342,
+        sha256="4fbcf0ebe55a0984f5a5e00d8c4521d52359af7229bb4d81890039d2aa16dd7c",
+        repo=INSTRUCTION_REPO,
+        revision=INSTRUCTION_REVISION,
+    ),
+    _file("safety_checker/config.json", 4905, repo=INSTRUCTION_REPO, revision=INSTRUCTION_REVISION),
+    _file(
+        "safety_checker/model.fp16.safetensors",
+        608018440,
+        sha256="08902f19b1cfebd7c989f152fc0507bef6898c706a91d666509383122324b511",
+        repo=INSTRUCTION_REPO,
+        revision=INSTRUCTION_REVISION,
+    ),
+)
+
 
 ASSET_CATALOG: Dict[str, DiffusionAssetSpec] = {
     "sd15_original_v1": DiffusionAssetSpec(
@@ -300,6 +345,23 @@ ASSET_CATALOG: Dict[str, DiffusionAssetSpec] = {
         notes=(
             "Dedicated 9-channel inpainting U-Net; never load it through the base txt2img path.",
             "White mask pixels are redrawn and black mask pixels are preserved.",
+        ),
+    ),
+    "sd15_instruct_pix2pix_v1": DiffusionAssetSpec(
+        asset_id="sd15_instruct_pix2pix_v1",
+        artifact_id="sd15_instruct_pix2pix_v1",
+        name="InstructPix2Pix for Stable Diffusion 1.5",
+        repo_id=INSTRUCTION_REPO,
+        revision=INSTRUCTION_REVISION,
+        local_dir="models/sd15-instruct-pix2pix-v1",
+        license_id="mit",
+        model_card_url=f"https://huggingface.co/{INSTRUCTION_REPO}",
+        preset_id="",
+        files=_INSTRUCTION_FILES,
+        artifact_kind="sd15_instruction_pipeline",
+        notes=(
+            "Dedicated instruction-editing pipeline; the prompt is an edit command, not a target caption.",
+            "The validated default uses image_guidance_scale and keeps ControlNet IP2P as an experimental alternative.",
         ),
     ),
 }
@@ -790,6 +852,8 @@ __all__ = [
     "IP_ADAPTER_REVISION",
     "INPAINT_REPO",
     "INPAINT_REVISION",
+    "INSTRUCTION_REPO",
+    "INSTRUCTION_REVISION",
     "LOCAL_PROXY_FALLBACK",
     "MANIFEST_NAME",
     "get_asset_spec",

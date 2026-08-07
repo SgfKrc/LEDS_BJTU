@@ -1107,7 +1107,11 @@ def _diffusion_generation_request(req: DiffusionGenerateRequest) -> SD15Generati
 def _diffusion_edit_request(req: DiffusionEditRequest) -> SD15EditRequest:
     generation = build_sd15_generation_request(
         preset_id=req.preset_id,
-        prompt=(req.prompt if req.prompt is not None else req.instruction),
+        prompt=(
+            req.instruction
+            if req.mode == 'instruction'
+            else req.prompt
+        ),
         negative_prompt=req.negative_prompt,
         seed=req.seed,
         width=req.width,
