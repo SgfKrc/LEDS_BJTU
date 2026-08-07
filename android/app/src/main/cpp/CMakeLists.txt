@@ -25,6 +25,14 @@ if(DEFINED ANDROID_ABI)
     endif()
 endif()
 
+# ---- llama.cpp submodule 前置检查（Full 构建必需；Lite 已在上面提前返回） ----
+set(QLH_LLAMA_CPP_DIR "${CMAKE_CURRENT_LIST_DIR}/llama.cpp")
+if(NOT EXISTS "${QLH_LLAMA_CPP_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "llama.cpp submodule is not initialized. Run: "
+        "git submodule update --init --recursive")
+endif()
+
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build llama.cpp as static libs" FORCE)
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "Do not build llama common utils" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "Do not build llama tests" FORCE)
