@@ -23,6 +23,11 @@ import scheduler_svc_http
 class TestEmailConfigApi:
     """单体 api_server 的 /api/cluster/email-config 端点。"""
 
+    @pytest.fixture(autouse=True)
+    def _master_role(self, monkeypatch):
+        """默认以主节点角色调用（管理员邮箱为集群级配置，仅主节点可读写）。"""
+        monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
+
     def test_get_returns_config_without_secrets(self, monkeypatch):
         monkeypatch.setattr(
             email_notifier,
@@ -84,16 +89,45 @@ class TestEmailConfigApi:
         assert captured["email"] == ""
         assert res.json() == {"status": "ok", "recipient": "env@example.com"}
 
+    # ---- 问题 #1 修复：仅主节点可配置管理员邮箱 ----
+
+    def test_slave_get_email_config_forbidden(self, monkeypatch):
+        monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "client")
+        with TestClient(api_server.app) as client:
+            res = client.get("/api/cluster/email-config")
+        assert res.status_code == 403
+        assert "仅主节点" in res.json()["detail"]
+
+    def test_slave_post_email_config_forbidden(self, monkeypatch):
+        monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "client")
+        with TestClient(api_server.app) as client:
+            res = client.post(
+                "/api/cluster/email-config",
+                json={"recipient": "x@example.com"},
+            )
+        assert res.status_code == 403
+
+    def test_slave_email_test_forbidden(self, monkeypatch):
+        monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "client")
+        with TestClient(api_server.app) as client:
+            res = client.post("/api/cluster/email-test")
+        assert res.status_code == 403
+
 
 class TestSchedulerSvcEmailConfigApi:
     """scheduler-svc 微服务版 /cluster/email-config 端点。"""
 
     @pytest.fixture
-    def svc_client(self):
+    def svc_client(self, monkeypatch):
         app = FastAPI()
         app.include_router(scheduler_svc_http.router)
+        class _FakeScheduler:
+            def _effective_role(self):
+                return "master"
+        scheduler_svc_http.set_scheduler(_FakeScheduler())
         with TestClient(app) as client:
             yield client
+        scheduler_svc_http.reset_scheduler()
 
     def test_get_and_post_agree_with_monolith(self, svc_client, monkeypatch):
         monkeypatch.setattr(
@@ -118,3 +152,25 @@ class TestSchedulerSvcEmailConfigApi:
         )
         assert res.status_code == 200
         assert res.json()["recipient"] == "svc-ops@example.com"
+
+    # ---- 问题 #1 修复：仅主节点可配置管理员邮箱 ----
+
+    def test_slave_get_forbidden(self, svc_client, monkeypatch):
+        class _SlaveScheduler:
+            def _effective_role(self):
+                return "client"
+        scheduler_svc_http.set_scheduler(_SlaveScheduler())
+        res = svc_client.get("/cluster/email-config")
+        assert res.status_code == 403
+        assert "仅主节点" in res.json()["detail"]
+
+    def test_slave_post_forbidden(self, svc_client, monkeypatch):
+        class _SlaveScheduler:
+            def _effective_role(self):
+                return "client"
+        scheduler_svc_http.set_scheduler(_SlaveScheduler())
+        res = svc_client.post(
+            "/cluster/email-config",
+            json={"recipient": "x@example.com"},
+        )
+        assert res.status_code == 403
