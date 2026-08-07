@@ -154,7 +154,12 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 ├── .venv-packaging/               # 集显版打包专用 venv（torch CPU + PyInstaller）
 ├── .venv-packaging-cuda/          # 独显版打包专用 venv（torch CUDA + PyInstaller）
 ├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
-│   ├── launcher.py                # 打包版启动器（Tailscale → 模型检查 → 引擎选择 → 启动）
+│   ├── launcher.py                # 主应用启动载荷（Tailscale → 模型检查 → 引擎选择 → 启动）
+│   ├── qlh_launcher.py            # ★ 独立 Bootstrap（GUI/TUI/更新，不导入推理依赖）
+│   ├── updater.py                 # 更新 CLI
+│   ├── update_core.py             # 清单、版本、下载与 SHA-256 核心
+│   ├── qlh-launcher.spec          # 独立 Launcher PyInstaller 规格
+│   ├── setup-launcher.iss         # 独立 Launcher Setup
 │   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android + Linux 安装包）
 │   ├── qlh-cpu.spec               # PyInstaller 规格文件（集显版）
 │   ├── qlh-cuda.spec              # PyInstaller 规格文件（独显版，CUDA + CPU 回退）
@@ -624,12 +629,13 @@ sudo dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 **使用**：
 
 ```bash
-qlh-launcher              # 桌面模式（浏览器打开前端）
+qlh-launcher --gui        # 独立图形启动器（普通界面 / TUI / 更新）
+qlh-launcher app-ui       # 直接启动普通界面
 qlh-launcher --headless   # 无头模式（仅 API，适合服务器）
 sudo systemctl enable --now qlh-edge-inference  # 开机自启
 ```
 
-> 前置依赖：`python3` (≥ 3.10)、`python3-venv`、`tailscale`（分布式模式）。安装包内置独立 venv，不污染系统 Python。
+> 前置依赖：`python3` (≥ 3.10)、`python3-venv`、`python3-tk`（图形 Launcher，推荐）、`tailscale`（分布式模式）。安装包内置独立 venv，不污染系统 Python。
 
 ### Android 客户端
 
@@ -807,6 +813,7 @@ python serve.py
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
+- [独立安装包启动器与自动更新方案](docs/安装包自动更新引导器方案.md) — 独立 Bootstrap、GUI/TUI、清单下载、校验与后续签名/回滚计划
 
 ---
 
