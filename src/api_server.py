@@ -325,7 +325,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.7",
+    version="0.1.8",
     description="北京交通大学 · 大学生创新创业训练计划",
     lifespan=_lifespan,
 )
