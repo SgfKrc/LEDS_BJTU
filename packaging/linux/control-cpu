@@ -6,7 +6,7 @@ Architecture: amd64
 Maintainer: QLH Team <qlh@example.com>
 Homepage: https://github.com/qlh/qlh-edge-inference
 Depends: python3 (>= 3.10), python3-venv
-Recommends: tailscale, zenity, python3-gi, gir1.2-gtk-3.0
+Recommends: tailscale, zenity, python3-tk, python3-gi, gir1.2-gtk-3.0
 Description: 轻量化大模型分布式边缘推理系统（集显版）
  QLH 边缘推理系统 (Quantized Lightweight Heterogeneous
  Distributed Edge Inference System) — CPU-only 版本。

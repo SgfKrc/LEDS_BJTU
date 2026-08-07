@@ -6,7 +6,7 @@ Architecture: amd64
 Maintainer: QLH Team <qlh@example.com>
 Homepage: https://github.com/qlh/qlh-edge-inference
 Depends: python3 (>= 3.10), python3-venv
-Recommends: tailscale, zenity, nvidia-driver-535 | nvidia-driver-545 | nvidia-driver-550 | nvidia-driver-560
+Recommends: tailscale, zenity, python3-tk, nvidia-driver-535 | nvidia-driver-545 | nvidia-driver-550 | nvidia-driver-560
 Description: 轻量化大模型分布式边缘推理系统（独显版）
  QLH 边缘推理系统 (Quantized Lightweight Heterogeneous
  Distributed Edge Inference System) — CUDA 版本。

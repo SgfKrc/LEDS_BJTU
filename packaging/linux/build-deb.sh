@@ -73,11 +73,16 @@ mkdir -p "$BUILD_DIR/usr/local/bin"
 echo "[3/6] 复制应用文件..."
 cp -r "$SRC_DIR"/* "$BUILD_DIR/opt/qlh-edge-inference/src/"
 cp -r "$FRONTEND_DIR/dist"/* "$BUILD_DIR/opt/qlh-edge-inference/frontend/dist/"
-cp "$SCRIPT_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
+cp "$SCRIPT_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
+chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
+cp "$PACKAGING_DIR/qlh_launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
+cp "$PACKAGING_DIR/update_core.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/update_core.py"
+cp "$PACKAGING_DIR/updater.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/updater.py"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 cp "$SCRIPT_DIR/bjtu" "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
-# 将 launcher.py 复制为启动器包装器引用的模块
+printf '%s\n' "$VERSION" > "$BUILD_DIR/opt/qlh-edge-inference/version.txt"
+# 将旧 launcher.py 复制为应用包装器引用的模块；新 qlh-launcher 仅负责 bootstrap
 cp "$PACKAGING_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/__launcher_main__.py"
 
 # 复制 requirements 文件（供 postinst 重建 venv 参考）

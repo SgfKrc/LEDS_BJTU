@@ -82,6 +82,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#MyAppSourceDir}\*"; DestDir: "{app}"; \
   Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 Source: "..\bjtu.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 ; ---- 项目文档 ----
 Source: "..\README.md"; DestDir: "{app}\docs"; Flags: ignoreversion
