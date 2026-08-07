@@ -171,6 +171,100 @@ def test_startup_splash_uses_application_icon(launcher_module):
     assert os.path.isfile(path)
 
 
+def test_startup_timeout_is_configurable_and_has_lower_bound(monkeypatch, launcher_module):
+    monkeypatch.setenv("QLH_STARTUP_TIMEOUT", "90")
+    assert launcher_module._startup_timeout_seconds() == 90.0
+    monkeypatch.setenv("QLH_STARTUP_TIMEOUT", "bad")
+    assert launcher_module._startup_timeout_seconds() == 60.0
+    monkeypatch.setenv("QLH_STARTUP_TIMEOUT", "1")
+    assert launcher_module._startup_timeout_seconds() == 15.0
+
+
+def test_requested_launch_mode_supports_bjtu_aliases(launcher_module):
+    assert launcher_module._requested_launch_mode([]) == "launcher"
+    assert launcher_module._requested_launch_mode(["--ui"]) == "ui"
+    assert launcher_module._requested_launch_mode(["--web"]) == "ui"
+    assert launcher_module._requested_launch_mode(["--tui"]) == "tui"
+    with pytest.raises(ValueError, match="不能同时"):
+        launcher_module._requested_launch_mode(["--ui", "--tui"])
+
+
+def test_terminal_launcher_defaults_without_interactive_stdin(
+    monkeypatch, launcher_module,
+):
+    monkeypatch.setattr(launcher_module, "_has_interactive_stdin", lambda: False)
+    assert launcher_module._choose_terminal_launch_mode(default="tui") == "tui"
+
+
+def test_startup_failure_keeps_error_visible_for_windows_splash(
+    monkeypatch, launcher_module
+):
+    calls = []
+
+    class Splash:
+        enabled = True
+        hwnd = 123
+
+        def update(self, progress, status):
+            calls.append(("update", progress, status))
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(launcher_module, "_show_dialog", lambda *args, **kwargs: calls.append(("dialog", args, kwargs)))
+    launcher_module._show_startup_failure("标题", "详情", Splash())
+    assert calls[0] == ("update", 100, "启动失败，请查看错误信息")
+    assert calls[1][0] == "dialog"
+    assert calls[-1] == ("close",)
+
+
+def test_pywebview_closes_splash_after_page_loaded(monkeypatch, launcher_module):
+    handlers = {}
+
+    class Event:
+        def __init__(self, name):
+            self.name = name
+
+        def __iadd__(self, handler):
+            handlers[self.name] = handler
+            return self
+
+    window = SimpleNamespace(
+        events=SimpleNamespace(loaded=Event("loaded"), closed=Event("closed"))
+    )
+
+    def start(callback, **kwargs):
+        callback()
+        assert splash.closed == 0
+        handlers["loaded"]()
+
+    fake_webview = SimpleNamespace(
+        create_window=lambda **kwargs: window,
+        start=start,
+    )
+
+    class Timer:
+        daemon = False
+
+        def __init__(self, delay, callback):
+            self.callback = callback
+
+        def start(self):
+            pass
+
+    class Splash:
+        closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    splash = Splash()
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+    monkeypatch.setattr(launcher_module.threading, "Timer", Timer)
+    launcher_module._run_pywebview("http://localhost:8000", "QLH", splash)
+    assert splash.closed == 1
+
+
 def test_pytorch_tokenizer_runtime_check_loads_local_tokenizer(
     monkeypatch, launcher_module
 ):

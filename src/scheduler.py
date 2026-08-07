@@ -104,6 +104,44 @@ ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
 
+def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
+    """Sample one token with the same zero-temperature semantics as local inference."""
+    if torch is None:
+        raise RuntimeError("PyTorch 不可用，无法执行流水线采样")
+    if logits is None or logits.ndim != 3 or logits.shape[0] != 1:
+        shape = getattr(logits, "shape", None)
+        raise ValueError(f"流水线 logits 形状无效: {shape}")
+
+    # Local ModelManager uses do_sample=False when temperature <= 0. Keeping
+    # that exact contract also avoids dividing fp16/bf16 logits by 1e-8,
+    # which can create infinities and poison the CUDA context in multinomial.
+    next_logits = logits[:, -1, :].float()
+    if float(temperature) <= 0:
+        return int(torch.argmax(next_logits, dim=-1).item())
+
+    scaled_logits = next_logits / max(float(temperature), 1e-5)
+    if not bool(torch.isfinite(scaled_logits).all().item()):
+        raise RuntimeError("流水线 logits 包含 NaN/Inf，拒绝执行采样")
+    probs = torch.softmax(scaled_logits, dim=-1)
+    if not bool(torch.isfinite(probs).all().item()):
+        raise RuntimeError("流水线采样概率包含 NaN/Inf")
+
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    nucleus = min(1.0, max(0.0, float(top_p)))
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    cutoff = cumsum > nucleus
+    cutoff[..., 1:] = cutoff[..., :-1].clone()
+    cutoff[..., 0] = False
+    filtered_probs = sorted_probs.masked_fill(cutoff, 0.0)
+    probability_sum = filtered_probs.sum(dim=-1, keepdim=True)
+    if (not bool(torch.isfinite(probability_sum).all().item())
+            or bool((probability_sum <= 0).any().item())):
+        raise RuntimeError("流水线采样概率无有效候选 token")
+    filtered_probs = filtered_probs / probability_sum
+    sampled_rank = torch.multinomial(filtered_probs, 1)
+    return int(sorted_indices.gather(-1, sampled_rank)[0, 0].item())
+
+
 def _bootstrap_api_port(default: int = 8000) -> int:
     """Return the master API port used for first-connect bootstrap."""
     for name in ("QLH_BOOTSTRAP_API_PORT", "QLH_MASTER_API_PORT"):
@@ -10595,23 +10633,12 @@ class Scheduler:
                 self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
-            # ---- Step 4: 从 logits 采样下一个 token ----
-            # logits shape: prefill=(1, prompt_len, vocab), decode=(1, 1, vocab)
-            # Phase 5 review H1: clamp temperature 防止除零导致 NaN
-            safe_temperature = max(temperature, 1e-8)
-            next_logits = logits[:, -1, :] / safe_temperature
-            probs = torch.softmax(next_logits, dim=-1)
-
-            # top-p (nucleus) sampling
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-            cumsum = torch.cumsum(sorted_probs, dim=-1)
-            cutoff = (cumsum > top_p).float()
-            cutoff[..., 1:] = cutoff[..., :-1].clone()  # 右移一位
-            cutoff[..., 0] = 0  # 始终保留概率最高的 token
-            filtered_probs = sorted_probs * (1 - cutoff)
-            filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
-
-            new_token_id = sorted_indices[0, torch.multinomial(filtered_probs, 1)].item()
+            # ---- Step 4: 从 logits 选择下一个 token ----
+            # temperature=0 与单机路径一致采用贪心解码；正温度才执行
+            # FP32 top-p 采样并在进入 CUDA multinomial 前校验概率。
+            new_token_id = _sample_pipeline_token_id(
+                logits, temperature=temperature, top_p=top_p,
+            )
 
             # 检查 EOS
             if new_token_id in eos_ids:

@@ -1,5 +1,5 @@
 Package: qlh-edge-inference-cuda
-Version: 0.1.8
+Version: 0.1.8.1
 Section: utils
 Priority: optional
 Architecture: amd64
