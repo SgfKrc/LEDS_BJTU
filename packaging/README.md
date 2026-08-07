@@ -11,7 +11,13 @@
 │   └── QLH-Edge-Inference-CUDA/   #   独显版（CUDA torch）
 │
 ├── packaging/                     # 打包配置 + 分发服务器（不再在此目录执行打包命令）
-│   ├── launcher.py               # 打包版启动器（Tailscale 检查 → 模型下载 → 启动服务）
+│   ├── launcher.py               # 主应用启动载荷（Tailscale 检查 → 模型下载 → 启动服务）
+│   ├── qlh_launcher.py           # 独立 Bootstrap（GUI/TUI/更新，不导入推理依赖）
+│   ├── updater.py                # 更新 CLI
+│   ├── update_core.py            # 清单、版本、下载与 SHA-256 核心
+│   ├── qlh-launcher.spec         # 独立 Launcher PyInstaller 规格
+│   ├── setup-launcher.iss        # 独立 Launcher Setup
+│   ├── build-launcher.bat        # 独立 Launcher 构建脚本
 │   ├── qlh-cpu.spec              # PyInstaller 规格文件（集显版）
 │   ├── qlh-cuda.spec             # PyInstaller 规格文件（独显版）
 │   ├── setup.iss                 # Inno Setup 安装脚本 — 集显版
@@ -36,14 +42,21 @@
 
 ---
 
-## 两大产物
+## 三类产物
 
 | 步骤 | 工具 | 输入 | 输出 |
 |------|------|------|------|
 | **1. 程序打包** | PyInstaller | `qlh-cpu.spec` / `qlh-cuda.spec` + `launcher.py` + `src/` + `frontend/dist/` | `dist/QLH-Edge-Inference/` 或 `dist/QLH-Edge-Inference-CUDA/` |
 | **2. 安装包编译** | Inno Setup 6 | `setup.iss` / `setup-cuda.iss` + `dist/` 中的 PyInstaller 输出 | `packaging/dist/QLH-Edge-Inference-Setup-vX.X.X.exe` |
+| **3. 独立引导器** | PyInstaller + Inno Setup 6 | `qlh-launcher.spec` + `setup-launcher.iss` | `dist/QLH-Launcher/` + `packaging/dist/QLH-Launcher-Setup-vX.X.X.exe` |
 
 > PyInstaller 始终从**项目根目录**运行，输出到根目录 `dist/`。Inno Setup 从 `packaging/` 运行对应的 `.iss` 文件，通过 `..\dist\` 引用 PyInstaller 输出。
+
+独立引导器可单独构建，不需要 CUDA 环境，也不会修改项目全局解释器：
+
+```powershell
+packaging\build-launcher.bat
+```
 
 ---
 
@@ -146,7 +159,20 @@ PyInstaller 会自动追踪 venv 中的 torch，不需要修改 spec 来切换 C
 
 两个版本使用不同的 AppId 和安装路径，可以在同一台机器上共存。
 
-### `launcher.py` — 打包版启动器
+### `qlh_launcher.py` — 独立 Bootstrap Launcher
+
+该入口只依赖 Python 标准库和 Windows 自带 Tk（Linux 无 GUI 时回退 TUI），不加载 torch、transformers、FastAPI 或模型。它发现已安装的主应用后启动 `QLH-Edge-Inference.exe` / `qlh-app`，也提供 `check`、`download`、`install` 更新命令。
+
+```powershell
+python packaging/qlh_launcher.py --gui
+python packaging/qlh_launcher.py --tui
+python packaging/qlh_launcher.py check --json
+python packaging/qlh_launcher.py download --variant cpu
+```
+
+`packaging/setup-launcher.iss` 生成独立的 `QLH-Launcher-Setup-v0.1.8.1.exe`。它与 CPU/CUDA 主应用 Setup 使用不同 AppId，可单独安装、升级和卸载。
+
+### `launcher.py` — 主应用启动载荷
 
 与开发模式不同，打包版启动器负责：
 
@@ -172,6 +198,8 @@ python serve.py
 - PC 模型压缩包 `models_pc.7z`
 - Android 模型压缩包 `models_android.7z`（仅包含 GGUF 模型）
 
+分发服务器同时提供 `GET /latest.json`。清单只包含当前 `src.__version__` 对应的 PC/Android 资产，并生成大小与 SHA-256；Launcher 默认并行查询多个源，单源超时不会串行拖慢启动器。
+
 ## 版本号更新清单
 
 每次发新版本时，以下文件中的版本号需要同步更新：
@@ -182,7 +210,10 @@ python serve.py
 | `src/api_server.py` | `version=` | `"0.1.8.1"` |
 | `packaging/setup.iss` | `MyAppVersion` | `"0.1.8.1"` |
 | `packaging/setup-cuda.iss` | `MyAppVersion` | `"0.1.8.1"` |
+| `packaging/setup-launcher.iss` | `MyAppVersion` | `"0.1.8.1"` |
+| `packaging/qlh_launcher.py` / `updater.py` | `LAUNCHER_VERSION` | `"0.1.8.1"` |
 | `packaging/build-installer.bat` | 安装包文件名 | `v0.1.8.1` |
+| `packaging/version.txt` | Launcher/清单默认版本 | `0.1.8.1` |
 | `packaging/linux/build-deb.sh` | `VERSION=` | `0.1.8.1` |
 | `packaging/linux/control-cpu` | `Version:` | `0.1.8.1` |
 | `packaging/linux/control-cuda` | `Version:` | `0.1.8.1` |
@@ -251,8 +282,10 @@ packaging/linux/
 /opt/qlh-edge-inference/
 ├── bin/
 │   ├── qlh-launcher              ← Python 3 包装器
-│   ├── bjtu                      ← BJTU 统一入口（launcher/ui/tui）
-│   └── __launcher_main__.py      ← 启动器主模块
+│   ├── qlh-app                   ← 主应用启动载荷
+│   ├── update_core.py / updater.py ← 独立更新核心与 CLI
+│   ├── bjtu                      ← BJTU 统一入口（launcher/ui/tui/update/version）
+│   └── __launcher_main__.py      ← 旧主应用启动模块
 ├── src/                          ← Python 源码
 ├── frontend/dist/                ← React 构建产物
 ├── models/                       ← 模型目录 (postinst 创建, 755)
@@ -269,7 +302,7 @@ packaging/linux/
 
 **前置条件** (Ubuntu 22.04/24.04):
 ```bash
-sudo apt install python3 python3-venv python3-pip dpkg-dev zenity
+sudo apt install python3 python3-venv python3-pip python3-tk dpkg-dev zenity
 ```
 
 **构建集显版 .deb**:
@@ -293,8 +326,11 @@ chmod +x build-deb.sh
 sudo dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 sudo apt-get install -f   # 修复可能未满足的依赖
 
-# 运行 (桌面)
-qlh-launcher
+# 运行独立图形 Launcher
+qlh-launcher --gui
+
+# 直接运行普通界面
+qlh-launcher app-ui
 
 # 运行 (无头模式)
 qlh-launcher --headless
@@ -305,7 +341,7 @@ bjtu ui
 bjtu tui
 
 # 可选: 开机自启
-systemctl --user enable --now qlh-edge-inference
+sudo systemctl enable --now qlh-edge-inference
 
 # 卸载 (保留模型文件)
 sudo dpkg -r qlh-edge-inference-cpu
