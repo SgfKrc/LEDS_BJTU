@@ -1,7 +1,7 @@
 # Android llama.cpp Submodule 迁移方案
 
 > 更新日期：2026-08-08
-> 状态：方案已确定，等待空闲维护窗口实施
+> 状态：已实施（2026-08-08 迁移完成，Gitlink 47e1de77；Full/Lite 构建验证进行中，真机回归待做）
 > 适用范围：`android/app/src/main/cpp/llama.cpp/` 及 Android Full 原生构建链
 > 不包含：本次仅形成文档，不修改 Git 索引、CMake、Gradle、CI 或打包脚本
 
@@ -282,3 +282,11 @@ git revert <submodule-migration-commit>
 在此之前继续使用当前 vendored 源码，不改为 `FetchContent`，也不在打包脚本中增加自动 clone。
 
 > **现状约束（2026-08-08 更新）**：校园网环境 UDP 被阻断，GitHub 上游仓库当前不可达（443 连接超时）。§4 前置条件"能访问上游 Git 仓库，或已准备可信本地镜像"目前不满足，且 submodule 迁移本身需要一次携带 submodule 的远端 push（`git push --recurse-submodules`），在远端不可达时无法完成。因此迁移窗口需待网络恢复（自建 DERP 组网可用、GitHub 可达，见[抗弱网通信协议专项计划](抗弱网通信协议专项计划.md)）或准备好上游 llama.cpp 的本地镜像后再安排；在此期间 vendored 方式保持不变。
+
+> **实施记录（2026-08-08，本段覆盖上方"现状约束"）**：经本地代理（127.0.0.1:7897）访问 GitHub 成功，上述阻塞解除，迁移已按 §5 执行完成：
+>
+> - 差异校验：vendored 源码与上游 `47e1de77` 完全一致（排除项目版本说明与本地 `.gradle` 缓存），无定制代码。
+> - `QLH_VENDOR_COMMIT.txt` → `android/app/src/main/cpp/LLAMA_CPP_VERSION.md`（补全版本说明）。
+> - vendored 目录替换为 submodule：gitlink `160000 → 47e1de77`，`.gitmodules` 指向官方上游，`git submodule absorbgitdirs` 标准布局。
+> - CMake 已加 §5.4 前置检查（Full 缺失 submodule 时 FATAL_ERROR，Lite 不受影响）。
+> - 验证：Full/Lite Release 构建 + 真机回归结果补记于 `LLAMA_CPP_VERSION.md`。

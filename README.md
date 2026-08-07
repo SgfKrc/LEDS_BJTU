@@ -640,6 +640,12 @@ sudo systemctl enable --now qlh-edge-inference  # 开机自启
 ### Android 客户端
 
 > 前提：已安装 JDK 17 + Android SDK（API 34+），SDK 路径配置在 `android/local.properties`
+>
+> 新克隆仓库后需先初始化 llama.cpp submodule（Full 变体原生构建必需，Lite 不需要）：
+
+```bash
+git submodule update --init --recursive
+```
 
 **编译**（无需 Android Studio）：
 
