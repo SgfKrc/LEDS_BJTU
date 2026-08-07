@@ -82,6 +82,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 - Tailscale 基于 WireGuard 创建虚拟局域网，每个设备获得一个固定的 `100.x.x.x` 地址
 - Windows 打包版启动器会自动检查 Tailscale 是否已安装并登录
 
+> 当前校园网实测会阻断 UDP，Tailscale 因此无法建立直连并经自建 DERP 的 HTTPS/TCP 443 中继。自建 DERP 已解决基本可达性，但路径观测、备用中继、主节点直连 WSS 数据面和分块续传仍在规划/实施中；诊断边界与阶段计划见[抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md)。
+
 ---
 
 ## 🏗️ 项目架构
@@ -778,6 +780,7 @@ python serve.py
 
 ### 专项文档
 
+- [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
