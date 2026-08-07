@@ -271,7 +271,7 @@ describe('阶段 2 其余域契约', () => {
       expect(deleted.body.deleted).toBe(true);
     });
 
-    it('multipart 输入 blob、img2img、inpaint 与未实现编辑错误经过网关', async () => {
+    it('multipart 输入 blob、img2img、inpaint 与 instruction 经过网关', async () => {
       const uploaded = await request(server())
         .post('/api/diffusion/blobs')
         .field('purpose', 'input_image')
@@ -315,17 +315,17 @@ describe('阶段 2 其余域契约', () => {
       expect(inpaint.status).toBe(202);
       expect(inpaint.body).toMatchObject({ kind: 'edit' });
 
-      const unsupported = await request(server())
+      const instruction = await request(server())
         .post('/api/diffusion/edit')
         .send({
           mode: 'instruction',
           source_blob_id: 'img_input',
           instruction: 'turn the car red',
+          edit_adapter_id: 'sd15_instruct_pix2pix_v1',
+          image_guidance_scale: 1.0,
         });
-      expect(unsupported.status).toBe(501);
-      expect(unsupported.body.detail).toMatchObject({
-        code: 'DIFFUSION_UNSUPPORTED',
-      });
+      expect(instruction.status).toBe(202);
+      expect(instruction.body).toMatchObject({ kind: 'edit' });
     });
   });
 

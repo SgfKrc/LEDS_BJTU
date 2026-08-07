@@ -105,7 +105,7 @@ class _ApiService:
 
     def submit_edit(self, request, *, owner_scope):
         self.edit_request = (request, owner_scope)
-        if request.mode not in {'img2img', 'reference'}:
+        if request.mode not in {'img2img', 'reference', 'inpaint', 'instruction'}:
             raise DiffusionUnsupportedError('edit executor is not installed')
         return {"job_id": "sdedit_test", "state": "queued", "kind": "edit"}
 
@@ -296,16 +296,21 @@ def test_diffusion_api_upload_and_edit_contract(diffusion_api):
     assert service.edit_request[0].edit_adapter_id == 'ip-adapter'
     assert service.edit_request[0].ip_adapter_scale == 0.65
 
-    unsupported = client.post(
+    instruction = client.post(
         '/api/diffusion/edit',
         json={
             'mode': 'instruction',
             'source_blob_id': 'img_input',
+            'prompt': 'this target caption must not override the edit command',
             'instruction': 'turn it into a sketch',
+            'edit_adapter_id': 'sd15_instruct_pix2pix_v1',
+            'image_guidance_scale': 1.0,
         },
     )
-    assert unsupported.status_code == 501
-    assert unsupported.json()['detail']['code'] == 'DIFFUSION_UNSUPPORTED'
+    assert instruction.status_code == 202
+    assert service.edit_request[0].mode == 'instruction'
+    assert service.edit_request[0].prompt == 'turn it into a sketch'
+    assert service.edit_request[0].image_guidance_scale == 1.0
 
 
 def test_diffusion_upload_uses_magic_bytes_instead_of_declared_mime(monkeypatch):

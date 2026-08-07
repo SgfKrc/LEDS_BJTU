@@ -4,11 +4,14 @@ import test from 'node:test';
 import {
   buildEditRequest,
   buildInpaintRequest,
+  buildInstructionRequest,
   buildReferenceRequest,
   canUseLocalDiffusion,
   loadedArtifactId,
   normalizeDiffusionJob,
   presetToForm,
+  profileIdFromEngineConfig,
+  supportsDedicatedEditProfile,
 } from '../src/diffusionState.js';
 import {
   fetchDiffusionBlob,
@@ -84,6 +87,48 @@ test('only master nodes can use the local diffusion UI', () => {
   assert.equal(loadedArtifactId({ loaded_artifact: null }), '');
 });
 
+test('dedicated edit support follows the loaded engine instead of the pending selector', () => {
+  assert.equal(supportsDedicatedEditProfile(null, 'balanced'), true);
+  assert.equal(supportsDedicatedEditProfile(null, 'resident_fp16'), false);
+  assert.equal(supportsDedicatedEditProfile({
+    quantization: 'none',
+    qkv_fusion: false,
+    model_cpu_offload: false,
+  }, 'balanced'), false);
+  assert.equal(supportsDedicatedEditProfile({
+    quantization: 'none',
+    qkv_fusion: false,
+    model_cpu_offload: true,
+  }, 'resident_fp16'), true);
+});
+
+test('loaded engine configuration maps back to the visible profile', () => {
+  assert.equal(profileIdFromEngineConfig(null), '');
+  assert.equal(profileIdFromEngineConfig({
+    quantization: 'none',
+    qkv_fusion: false,
+    model_cpu_offload: true,
+  }), 'balanced');
+  assert.equal(profileIdFromEngineConfig({
+    quantization: 'none',
+    qkv_fusion: false,
+    model_cpu_offload: false,
+  }), 'resident_fp16');
+  assert.equal(profileIdFromEngineConfig({
+    quantization: 'none',
+    qkv_fusion: true,
+    model_cpu_offload: true,
+  }), 'qkv_fp16');
+  assert.equal(profileIdFromEngineConfig({
+    quantization: 'bitsandbytes_8bit_unet',
+    qkv_fusion: false,
+  }), 'unet_8bit');
+  assert.equal(profileIdFromEngineConfig({
+    quantization: 'bitsandbytes_8bit_unet',
+    qkv_fusion: true,
+  }), 'unet_8bit_qkv');
+});
+
 test('edit request carries the source blob and clamps strength into the valid range', () => {
   const form = {
     presetId: 'sd15_original_v1',
@@ -152,6 +197,26 @@ test('inpaint request binds source, mask, and dedicated pipeline identities', ()
   assert.equal(request.mask_blob_id, 'img_mask');
   assert.equal(request.edit_adapter_id, 'sd15_inpaint_v1');
   assert.equal(request.strength, 0.6);
+});
+
+test('instruction request separates the edit command and image guidance', () => {
+  const form = presetToForm(null);
+  form.prompt = '  make it a snowy winter day  ';
+  form.imageGuidanceScale = '5';
+
+  const request = buildInstructionRequest(
+    form,
+    'img_source',
+    'sd15_instruct_pix2pix_v1',
+  );
+
+  assert.equal(request.mode, 'instruction');
+  assert.equal(request.source_blob_id, 'img_source');
+  assert.equal(request.edit_adapter_id, 'sd15_instruct_pix2pix_v1');
+  assert.equal(request.prompt, 'make it a snowy winter day');
+  assert.equal(request.instruction, 'make it a snowy winter day');
+  assert.equal(request.image_guidance_scale, 4);
+  assert.equal(request.strength, undefined);
 });
 
 test('diffusion JSON API keeps encoded identifiers and request payloads', async () => {

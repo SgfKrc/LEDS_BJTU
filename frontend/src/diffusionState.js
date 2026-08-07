@@ -6,9 +6,28 @@ export const DIFFUSION_TERMINAL_STATES = new Set([
 
 export const EDIT_STRENGTH_DEFAULT = 0.75;
 export const IP_ADAPTER_SCALE_DEFAULT = 0.6;
+export const IMAGE_GUIDANCE_SCALE_DEFAULT = 1.0;
 
 export function canUseLocalDiffusion(role) {
   return Boolean(role?.is_master || role?.runtime_node_role === 'master');
+}
+
+export function supportsDedicatedEditProfile(engineConfig, requestedProfile = 'balanced') {
+  if (!engineConfig) return requestedProfile === 'balanced';
+  return (
+    engineConfig.quantization === 'none'
+    && engineConfig.qkv_fusion !== true
+    && engineConfig.model_cpu_offload === true
+  );
+}
+
+export function profileIdFromEngineConfig(engineConfig) {
+  if (!engineConfig) return '';
+  if (engineConfig.quantization !== 'none') {
+    return engineConfig.qkv_fusion === true ? 'unet_8bit_qkv' : 'unet_8bit';
+  }
+  if (engineConfig.qkv_fusion === true) return 'qkv_fp16';
+  return engineConfig.model_cpu_offload === true ? 'balanced' : 'resident_fp16';
 }
 
 export function presetToForm(preset) {
@@ -24,6 +43,7 @@ export function presetToForm(preset) {
       guidanceScale: 7.5,
       strength: EDIT_STRENGTH_DEFAULT,
       ipAdapterScale: IP_ADAPTER_SCALE_DEFAULT,
+      imageGuidanceScale: IMAGE_GUIDANCE_SCALE_DEFAULT,
       scheduler: '',
     };
   }
@@ -38,6 +58,7 @@ export function presetToForm(preset) {
     guidanceScale: Number(preset.guidance_scale ?? 7.5),
     strength: EDIT_STRENGTH_DEFAULT,
     ipAdapterScale: IP_ADAPTER_SCALE_DEFAULT,
+    imageGuidanceScale: IMAGE_GUIDANCE_SCALE_DEFAULT,
     scheduler: preset.scheduler || '',
   };
 }
@@ -120,6 +141,31 @@ export function buildInpaintRequest(form, sourceBlobId, maskBlobId, pipelineId) 
     strength: Number.isFinite(strength)
       ? Math.min(1, Math.max(0.05, strength))
       : EDIT_STRENGTH_DEFAULT,
+    scheduler: form.scheduler || null,
+  };
+}
+
+export function buildInstructionRequest(form, sourceBlobId, pipelineId) {
+  const imageGuidanceScale = Number(
+    form?.imageGuidanceScale ?? IMAGE_GUIDANCE_SCALE_DEFAULT,
+  );
+  const instruction = String(form?.prompt || '').trim();
+  return {
+    mode: 'instruction',
+    preset_id: form.presetId || null,
+    source_blob_id: String(sourceBlobId || '').trim(),
+    edit_adapter_id: String(pipelineId || '').trim(),
+    prompt: instruction,
+    instruction,
+    negative_prompt: String(form.negativePrompt || '').trim(),
+    seed: Number(form.seed),
+    width: Number(form.width),
+    height: Number(form.height),
+    steps: Number(form.steps),
+    guidance_scale: Number(form.guidanceScale),
+    image_guidance_scale: Number.isFinite(imageGuidanceScale)
+      ? Math.min(4, Math.max(0, imageGuidanceScale))
+      : IMAGE_GUIDANCE_SCALE_DEFAULT,
     scheduler: form.scheduler || null,
   };
 }
