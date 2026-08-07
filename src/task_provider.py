@@ -679,6 +679,54 @@ class ProviderRegistry:
                 )
             self._providers[provider_id] = provider
 
+    def replace(self, provider: ExecutionProvider) -> None:
+        """Replace an idle Provider while preserving its stable identity."""
+        provider_id = str(getattr(provider, "provider_id", "") or "")
+        if not PROVIDER_ID_PATTERN.fullmatch(provider_id):
+            raise ProviderRegistrationError(
+                "provider_id contains unsupported characters",
+                code="invalid_provider_id",
+                provider_id=provider_id,
+            )
+        try:
+            capabilities = provider.inspect()
+        except Exception as exc:
+            raise ProviderRegistrationError(
+                f"provider {provider_id} capability inspection failed",
+                code="provider_inspection_failed",
+                provider_id=provider_id,
+            ) from exc
+        if capabilities.provider_id != provider_id:
+            raise ProviderRegistrationError(
+                "provider capability identity does not match provider_id",
+                code="provider_identity_mismatch",
+                provider_id=provider_id,
+            )
+        previous = None
+        with self._lock:
+            if self._closed:
+                raise ProviderRegistrationError(
+                    "provider registry is closed",
+                    code="provider_registry_closed",
+                    provider_id=provider_id,
+                )
+            previous = self._providers.get(provider_id)
+            if previous is provider:
+                return
+            if any(
+                reservation.provider_id == provider_id
+                for _owner, reservation in self._reservations.values()
+            ):
+                raise ProviderBusy(
+                    f"provider {provider_id} still owns active reservations",
+                    code="provider_has_active_reservations",
+                    provider_id=provider_id,
+                    retryable=True,
+                )
+            self._providers[provider_id] = provider
+        if previous is not None:
+            previous.close()
+
     def has_provider(self, provider_id: str) -> bool:
         with self._lock:
             return provider_id in self._providers

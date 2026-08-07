@@ -362,6 +362,26 @@ def test_exclusive_local_model_change_opts_out_pipeline_worker(monkeypatch):
     assert calls == ["released"]
 
 
+def test_master_model_refresh_requests_authoritative_layer_sync(monkeypatch):
+    """主节点加载模型后应以权威配置重新接管在线分层 worker。"""
+    calls = []
+    monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "master")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "request_authoritative_layer_sync",
+        lambda: calls.append("authoritative") or True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "push_layer_config_to_clients",
+        lambda: pytest.fail("新调度器不应退回普通层配置推送"),
+    )
+
+    api_server._refresh_pipeline_layer_config()
+
+    assert calls == ["authoritative"]
+
+
 def test_load_model_rejects_invalid_engine(monkeypatch):
     """无效 engine 参数 → 400"""
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)

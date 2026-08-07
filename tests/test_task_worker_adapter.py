@@ -12,6 +12,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import tcp_comm as tcp_comm_mod
+from diffusion.worker_adapter import (
+    DiffusionExecutionResult,
+    DiffusionWorkerAdapter,
+)
 from task_worker_adapter import TaskWorkerControlPlane
 from task_worker_protocol import (
     WorkerProtocolError,
@@ -63,6 +67,97 @@ def _capabilities():
         }],
         "max_concurrency": 1,
     }
+
+
+def _diffusion_manifest():
+    body = {
+        "artifact_id": "artifact_sd15",
+        "pipeline_kind": "sd15_pipeline",
+        "revision": "revision_20260807",
+        "components": [{
+            "artifact_id": "base_unet",
+            "artifact_kind": "unet",
+            "sha256": "b" * 64,
+        }],
+    }
+    return {**body, "sha256": canonical_sha256(body)}
+
+
+def _diffusion_capabilities():
+    return {
+        "stage_types": ["image_generate", "image_edit", "image_grid"],
+        "engines": ["diffusers_sd15"],
+        "models": [],
+        "max_concurrency": 1,
+        "image": {
+            "pipeline_kinds": ["sd15_pipeline"],
+            "dtypes": ["float16"],
+            "max_width": 768,
+            "max_height": 768,
+            "max_pixels": 768 * 768,
+            "max_batch": 1,
+            "supports_controlnet": False,
+            "supports_step_cancel": True,
+            "artifact_manifests": [_diffusion_manifest()],
+        },
+    }
+
+
+def _diffusion_hello(node_id="worker_01"):
+    return build_message(
+        "hello",
+        {
+            "node_id": node_id,
+            "worker_kind": "pc_diffusion_worker",
+            "min_version": 3,
+            "max_version": 3,
+            "capabilities": _diffusion_capabilities(),
+        },
+        message_id="msg_diffhello_worker01",
+        sent_at_ms=1_000,
+        version=3,
+    )
+
+
+def _diffusion_offer(*, now_ms=None):
+    manifest = _diffusion_manifest()
+    root_input = {
+        "prompt": "a mountain cabin",
+        "negative_prompt": "",
+        "seed": 19950101,
+        "width": 512,
+        "height": 512,
+        "steps": 20,
+        "guidance_scale": 7.5,
+        "scheduler": "PNDMScheduler",
+        "artifact_manifest_sha256": manifest["sha256"],
+    }
+    transfer_plan = {"base_url": None, "downloads": []}
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    return build_message(
+        "stage_offer",
+        {
+            "workflow_id": "wf_diffworker01",
+            "stage_id": "image_stage_1",
+            "attempt_id": "att_diffworker01",
+            "lease_id": "lease_diffworker01",
+            "lease_epoch": 1,
+            "request_id": "request_diffworker01",
+            "stage_type": "image_generate",
+            "provider_id": "remote_diffusion_worker_01",
+            "lease_expires_at_ms": now + 60_000,
+            "root_input": root_input,
+            "dependencies": {},
+            "input_sha256": stage_input_sha256(
+                root_input, {}, transfer_plan,
+            ),
+            "artifact_manifest": manifest,
+            "transfer_plan": transfer_plan,
+        },
+        message_id="msg_diffoffer_worker01",
+        sent_at_ms=now,
+        version=3,
+    )
 
 
 def _admitted_control_plane():
@@ -868,6 +963,366 @@ def test_scheduler_binds_full_worker_hello_to_registered_pc_client(monkeypatch):
     assert scheduler.get_task_worker_protocol_status()[
         "connected_worker_count"
     ] == 1
+
+
+def test_scheduler_routes_opted_in_diffusion_hello_over_shared_tcp(monkeypatch):
+    import scheduler as scheduler_mod
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    monkeypatch.setattr(
+        scheduler_mod, "DIFFUSION_WORKER_EXPERIMENTAL_ENABLED", True,
+    )
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "_running": False,
+        "send_to_client": lambda self, node_id, data, message_type: sent.append(
+            (node_id, data, message_type)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+
+    scheduler._handle_task_worker_message(
+        "worker_01", {"data": _diffusion_hello().snapshot()},
+    )
+
+    assert len(sent) == 1
+    assert sent[0][0] == "worker_01"
+    assert sent[0][2] == MessageType.TASK_WORKER
+    assert sent[0][1]["message_type"] == "hello_ack"
+    assert sent[0][1]["payload"]["accepted"] is True
+    assert sent[0][1]["payload"]["selected_version"] == 3
+    assert scheduler.remote_task_worker_providers() == []
+
+    status = scheduler.get_diffusion_worker_protocol_status()
+    assert status["experiment_enabled"] is True
+    assert status["transport_routing_enabled"] is True
+    assert status["task_dispatch_enabled"] is False
+    assert status["admission_state"] == "n3_3_transport_only"
+    assert status["control_plane_connected"] is True
+    assert status["workers"][0]["node_id"] == "worker_01"
+    assert status["workers"][0]["healthy"] is True
+
+    stage_cancel = build_message(
+        "stage_cancel",
+        {
+            "workflow_id": "wf_diffworker01",
+            "stage_id": "image_stage_1",
+            "attempt_id": "att_diffworker01",
+            "lease_id": "lease_diffworker01",
+            "lease_epoch": 1,
+            "reason_code": "coordinator_cancelled",
+        },
+        message_id="msg_diffcancel_worker01",
+        sent_at_ms=1_001,
+        version=3,
+    )
+    scheduler._handle_task_worker_message(
+        "worker_01", {"data": stage_cancel.snapshot()},
+    )
+    assert len(sent) == 1
+    assert scheduler.get_diffusion_worker_protocol_status()[
+        "rejected_message_count"
+    ] == 1
+
+    scheduler._on_tcp_disconnect("worker_01")
+    disconnected = scheduler.get_diffusion_worker_protocol_status()
+    assert disconnected["control_plane_connected"] is False
+    assert disconnected["workers"][0]["connected"] is False
+    assert disconnected["workers"][0]["healthy"] is False
+
+
+def test_scheduler_keeps_diffusion_transport_disabled_by_default(monkeypatch):
+    import scheduler as scheduler_mod
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    monkeypatch.setattr(
+        scheduler_mod, "DIFFUSION_WORKER_EXPERIMENTAL_ENABLED", False,
+    )
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "send_to_client": lambda self, *args: sent.append(args),
+    })()
+
+    scheduler._handle_task_worker_message(
+        "worker_01", {"data": _diffusion_hello().snapshot()},
+    )
+
+    status = scheduler.get_diffusion_worker_protocol_status()
+    assert sent == []
+    assert status["experiment_enabled"] is False
+    assert status["transport_routing_enabled"] is False
+    assert status["task_dispatch_enabled"] is False
+    assert status["admission_state"] == "n3_3_experiment_disabled"
+    assert status["workers"] == []
+    assert status["rejected_message_count"] == 1
+    assert scheduler.remote_task_worker_providers() == []
+
+
+def test_scheduler_client_routes_v3_control_to_installed_adapter(monkeypatch):
+    import scheduler as scheduler_mod
+    from scheduler import Scheduler
+
+    monkeypatch.setattr(
+        scheduler_mod, "DIFFUSION_WORKER_EXPERIMENTAL_ENABLED", True,
+    )
+    scheduler = Scheduler()
+    scheduler._role_override = "client"
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "worker_01")
+    sent = []
+    scheduler._tcp_client = type("Client", (), {
+        "is_registered": True,
+        "send_data": lambda self, data, message_type: sent.append(
+            (data, message_type)
+        ),
+    })()
+    started = threading.Event()
+
+    def _executor(_offer, cancel_event):
+        started.set()
+        assert cancel_event.wait(1.0)
+        return DiffusionExecutionResult(
+            output={
+                "image": {
+                    "blob_id": "img_1234567890abcdef",
+                    "sha256": "c" * 64,
+                    "size_bytes": 128,
+                    "content_type": "image/png",
+                    "width": 512,
+                    "height": 512,
+                    "purpose": "output",
+                },
+                "metrics": {"elapsed_seconds": 0.1, "seed": 19950101},
+            },
+            metadata={
+                "node_id": "worker_01",
+                "provider_kind": "pc_diffusion_worker",
+                "elapsed_seconds": 0.1,
+                "seed": 19950101,
+                "artifact_manifest_sha256": _diffusion_manifest()["sha256"],
+                "distributed": True,
+            },
+            transfer_plan={"base_url": None, "downloads": []},
+        )
+
+    assert scheduler.configure_diffusion_worker(
+        capabilities=_diffusion_capabilities(), executor=_executor,
+    ) is True
+    assert sent[0][1] == MessageType.TASK_WORKER
+    assert sent[0][0]["message_type"] == "hello"
+
+    hello_ack = build_message(
+        "hello_ack",
+        {
+            "coordinator_node_id": "master",
+            "accepted": True,
+            "selected_version": 3,
+            "reason_code": "",
+        },
+        message_id="msg_diffhelloack_worker01",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    )
+    scheduler._handle_task_worker_message(
+        "master", {"data": hello_ack.snapshot()},
+    )
+    status = scheduler.get_diffusion_worker_protocol_status()
+    assert status["worker_adapter_registered"] is True
+    assert status["control_plane_connected"] is True
+    assert status["adapter_connected"] is False
+    assert status["task_dispatch_enabled"] is False
+
+    offer = _diffusion_offer()
+    scheduler._handle_task_worker_message("master", {"data": offer.snapshot()})
+    assert started.wait(1.0)
+    assert _wait_until(
+        lambda: any(data["message_type"] == "stage_accept" for data, _ in sent)
+    )
+
+    cancel = build_message(
+        "stage_cancel",
+        {
+            "workflow_id": "wf_diffworker01",
+            "stage_id": "image_stage_1",
+            "attempt_id": "att_diffworker01",
+            "lease_id": "lease_diffworker01",
+            "lease_epoch": 1,
+            "reason_code": "coordinator_cancelled",
+        },
+        message_id="msg_diffcancel_worker02",
+        sent_at_ms=int(time.time() * 1000),
+        version=3,
+    )
+    scheduler._handle_task_worker_message("master", {"data": cancel.snapshot()})
+    assert _wait_until(
+        lambda: any(data["message_type"] == "stage_cancelled" for data, _ in sent)
+    )
+    assert _wait_until(
+        lambda: not scheduler.get_diffusion_worker_protocol_status()["active_stage"]
+    )
+
+    scheduler._on_master_connection_lost(scheduler._tcp_client)
+    assert scheduler.get_diffusion_worker_protocol_status()[
+        "control_plane_connected"
+    ] is False
+
+
+def test_scheduler_coordinator_routes_v3_stage_result_to_admitted_provider(
+    monkeypatch,
+):
+    import scheduler as scheduler_mod
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    monkeypatch.setattr(
+        scheduler_mod, "DIFFUSION_WORKER_EXPERIMENTAL_ENABLED", True,
+    )
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    ingested = []
+
+    def _ingest(attempt, output, transfer_plan):
+        ingested.append((attempt.attempt_id, dict(output), dict(transfer_plan)))
+        return {
+            "image": {
+                **output["image"],
+                "blob_id": "img_local1234567890",
+            },
+            "metrics": dict(output["metrics"]),
+        }
+
+    assert scheduler.configure_diffusion_coordinator(
+        result_ingestor=_ingest,
+    ) is True
+
+    def _execute(_payload, cancel_event):
+        assert not cancel_event.is_set()
+        return DiffusionExecutionResult(
+            output={
+                "image": {
+                    "blob_id": "img_1234567890abcdef",
+                    "sha256": "c" * 64,
+                    "size_bytes": 128,
+                    "content_type": "image/png",
+                    "width": 512,
+                    "height": 512,
+                    "purpose": "output",
+                },
+                "metrics": {"elapsed_seconds": 0.1, "seed": 19950101},
+            },
+            metadata={
+                "node_id": "worker_01",
+                "provider_kind": "pc_diffusion_worker",
+                "elapsed_seconds": 0.1,
+                "seed": 19950101,
+                "artifact_manifest_sha256": _diffusion_manifest()["sha256"],
+                "distributed": True,
+            },
+            transfer_plan={
+                "base_url": "http://100.64.0.2:8000",
+                "downloads": [{
+                    "blob_id": "img_1234567890abcdef",
+                    "lease_id": "bls_1234567890abcdef",
+                    "grant": "a" * 32 + "." + "b" * 43,
+                }],
+            },
+        )
+
+    worker = DiffusionWorkerAdapter(
+        node_id="worker_01",
+        capabilities=_diffusion_capabilities(),
+        executor=_execute,
+        send_message=lambda message: scheduler._handle_task_worker_message(
+            "worker_01", {"data": message.snapshot()},
+        ),
+    )
+
+    def _send_to_worker(_self, node_id, data, message_type):
+        assert node_id == "worker_01"
+        assert message_type == MessageType.TASK_WORKER
+        if data["message_type"] == "hello_ack":
+            worker.receive_hello_ack(data)
+        elif data["message_type"] == "stage_offer":
+            worker.receive_offer(data)
+        elif data["message_type"] == "lease_renew":
+            worker.receive_lease_renew(data)
+        elif data["message_type"] == "stage_cancel":
+            worker.receive_cancel(data)
+        else:
+            pytest.fail(f"unexpected v3 coordinator message: {data['message_type']}")
+
+    scheduler._tcp_server = type("Server", (), {
+        "send_to_client": _send_to_worker,
+    })()
+    hello = worker.begin_hello()
+    assert hello is not None
+    scheduler._handle_task_worker_message(
+        "worker_01", {"data": hello.snapshot()},
+    )
+    provider = scheduler.remote_diffusion_providers()[0]
+    manifest = _diffusion_manifest()
+    request = StageRequest(
+        workflow_id="wf_diffworker01",
+        request_id="request_diffworker01",
+        stage_id="image_stage_1",
+        stage_type="image_generate",
+        provider_id=provider.provider_id,
+        dependencies={},
+        root_input={
+            "prompt": "a mountain cabin",
+            "negative_prompt": "",
+            "seed": 19950101,
+            "width": 512,
+            "height": 512,
+            "steps": 20,
+            "guidance_scale": 7.5,
+            "scheduler": "PNDMScheduler",
+            "artifact_manifest_sha256": manifest["sha256"],
+        },
+        runtime_context={"diffusion_artifact_manifest": manifest},
+    )
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_diffworker01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_diffworker01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5.0,
+    )
+
+    result = provider.execute(attempt, reservation, threading.Event())
+
+    assert result.output["image"]["blob_id"] == "img_local1234567890"
+    assert len(ingested) == 1
+    assert ingested[0][2]["downloads"][0]["grant"]
+    assert "grant" not in result.metadata
+    status = scheduler.get_diffusion_worker_protocol_status()
+    assert status["stage_response_routing_enabled"] is True
+    assert status["admitted_provider_ids"] == [provider.provider_id]
+    assert status["task_dispatch_enabled"] is False
+    provider.release(reservation.reservation_id)
 
 
 def test_scheduler_experimental_gate_reports_physical_validation_pending(

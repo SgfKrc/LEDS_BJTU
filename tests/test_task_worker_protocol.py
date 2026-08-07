@@ -59,11 +59,11 @@ def test_negotiation_selects_highest_common_version():
 
 def test_negotiation_rejects_non_overlapping_or_invalid_ranges():
     with pytest.raises(WorkerProtocolError) as unsupported:
-        negotiate_protocol_version(3, 4)
+        negotiate_protocol_version(4, 5)
     assert unsupported.value.code == "unsupported_protocol_version"
 
     with pytest.raises(WorkerProtocolError) as invalid:
-        negotiate_protocol_version(3, 2)
+        negotiate_protocol_version(4, 3)
     assert invalid.value.code == "invalid_version_range"
 
 
@@ -71,7 +71,7 @@ def test_negotiation_rejects_non_overlapping_or_invalid_ranges():
     ("field", "value", "code"),
     [
         ("protocol", "other.protocol", "unsupported_protocol"),
-        ("version", 3, "unsupported_protocol_version"),
+        ("version", 4, "unsupported_protocol_version"),
         ("message_type", "unknown", "unsupported_message_type"),
         ("message_id", "unsafe", "invalid_identifier"),
     ],
@@ -168,6 +168,10 @@ def test_protocol_status_exposes_n2_transport_without_claiming_stage_readiness()
     assert status["adapter_connected"] is False
     assert status["transport"] == "existing_tcp_length_prefixed"
     assert status["preferred_version"] == 2
+    assert status["max_version"] == 3
+    assert status["image_v3_schema_ready"] is True
+    assert status["image_v3_adapter_connected"] is False
+    assert status["image_v3_data_plane"] == "not_enabled"
     assert status["admission_state"] == "n2_4_experiment_disabled"
 
 

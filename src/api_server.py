@@ -94,6 +94,17 @@ from diffusion import (
     build_sd15_generation_request,
     list_presets as list_diffusion_presets,
 )
+from diffusion.data_plane import (
+    DiffusionDataPlaneRuntime,
+    router as diffusion_data_plane_router,
+)
+from diffusion.distributed import (
+    BlobAuthorizationError,
+    BlobNotFound,
+    DistributedBlobError,
+)
+from diffusion.worker_runtime import DiffusionWorkerRuntime
+from diffusion.coordinator_runtime import DiffusionCoordinatorRuntime
 import model_config as mc
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -103,6 +114,8 @@ from config import (
     TASK_GRAPH_MAX_PARALLEL_STAGES, TASK_GRAPH_JOURNAL_PATH,
     TASK_GRAPH_RETENTION_DAYS, TASK_GRAPH_RETENTION_MAX_RECORDS,
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+    DIFFUSION_WORKER_DATA_PLANE_BASE_URL,
 )
 
 # 数据库模块（可选，未安装 psycopg2 时使用内存降级）
@@ -271,16 +284,48 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """FastAPI lifespan 上下文管理器（替代废弃的 @app.on_event）"""
-    # ---- startup ----
-    await _startup_device_detection()
-    yield
-    # ---- shutdown ----
-    await _shutdown_resources()
+    import config as runtime_config
+
+    data_plane = None
+    secret = str(getattr(runtime_config, "CLUSTER_SECRET", "") or "")
+    if len(secret.encode("utf-8")) >= 32:
+        try:
+            data_plane = DiffusionDataPlaneRuntime.create(
+                state_dir=runtime_config.STATE_DIR,
+                cluster_secret=secret,
+            )
+            app.state.diffusion_data_plane = data_plane
+            app.state.diffusion_data_plane_reason = "ready"
+            logger.info("SD 分布式 Blob 数据面已初始化")
+        except Exception as exc:
+            app.state.diffusion_data_plane = None
+            app.state.diffusion_data_plane_reason = "initialization_failed"
+            logger.error("SD 分布式 Blob 数据面初始化失败: %s", exc)
+    else:
+        app.state.diffusion_data_plane = None
+        app.state.diffusion_data_plane_reason = "cluster_secret_missing_or_short"
+        logger.info("SD 分布式 Blob 数据面未启用：集群密钥不足 32 字节")
+
+    try:
+        # ---- startup ----
+        _sync_diffusion_coordinator(data_plane)
+        await _startup_device_detection()
+        _sync_local_diffusion_worker(data_plane)
+        yield
+    finally:
+        # ---- shutdown ----
+        await _shutdown_resources()
+        if data_plane is not None:
+            try:
+                await run_in_threadpool(data_plane.close)
+                logger.info("SD 分布式 Blob 数据面已停止")
+            except Exception as exc:
+                logger.warning("SD 分布式 Blob 数据面停止异常: %s", exc)
 
 
 app = FastAPI(
     title="轻量化大模型分布式边缘推理优化系统",
-    version="0.1.7",
+    version="0.1.8.1",
     description="北京交通大学 · 大学生创新创业训练计划",
     lifespan=_lifespan,
 )
@@ -293,6 +338,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(diffusion_data_plane_router)
 
 
 def _normalize_request_id(value: str | None) -> str:
@@ -378,6 +425,83 @@ _device_profile_started = False
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
+
+
+def _sync_local_diffusion_worker(
+    data_plane: DiffusionDataPlaneRuntime | None = None,
+) -> bool:
+    """Attach a loaded SD sidecar to Scheduler only under explicit opt-in."""
+    if (
+        not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+        or scheduler._effective_role() != "client"
+    ):
+        scheduler.clear_diffusion_worker()
+        return False
+    runtime_plane = data_plane or getattr(
+        app.state, "diffusion_data_plane", None,
+    )
+    if not isinstance(runtime_plane, DiffusionDataPlaneRuntime):
+        scheduler.clear_diffusion_worker()
+        return False
+    if not DIFFUSION_WORKER_DATA_PLANE_BASE_URL.strip():
+        scheduler.clear_diffusion_worker()
+        logger.warning(
+            "SD image Worker is enabled but has no data-plane base URL"
+        )
+        return False
+    try:
+        runtime = DiffusionWorkerRuntime(
+            service=diffusion_service,
+            data_plane=runtime_plane,
+            node_id=scheduler.get_effective_node_id(),
+            data_plane_base_url=DIFFUSION_WORKER_DATA_PLANE_BASE_URL,
+        )
+        capabilities = runtime.capabilities()
+        if capabilities is None:
+            scheduler.clear_diffusion_worker()
+            return False
+        return scheduler.configure_diffusion_worker(
+            capabilities=capabilities,
+            executor=runtime.execute,
+        )
+    except Exception:
+        scheduler.clear_diffusion_worker()
+        logger.warning(
+            "SD image Worker synchronization failed; local SD remains available",
+            exc_info=True,
+        )
+        return False
+
+
+def _sync_diffusion_coordinator(
+    data_plane: DiffusionDataPlaneRuntime | None = None,
+) -> bool:
+    """Install the verified v3 result ingestor on an opted-in master only."""
+    if (
+        not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+        or scheduler._effective_role() != "master"
+    ):
+        scheduler.clear_diffusion_coordinator()
+        return False
+    runtime_plane = data_plane or getattr(
+        app.state, "diffusion_data_plane", None,
+    )
+    if not isinstance(runtime_plane, DiffusionDataPlaneRuntime):
+        scheduler.clear_diffusion_coordinator()
+        return False
+    try:
+        runtime = DiffusionCoordinatorRuntime(data_plane=runtime_plane)
+        return scheduler.configure_diffusion_coordinator(
+            result_ingestor=runtime.ingest_result,
+            dispatch_enabled=TASK_GRAPH_ENABLED,
+        )
+    except Exception:
+        scheduler.clear_diffusion_coordinator()
+        logger.warning(
+            "SD image coordinator synchronization failed; v3 response routing stays closed",
+            exc_info=True,
+        )
+        return False
 
 
 def _create_task_graph_coordinator() -> TaskGraphCoordinator:
@@ -505,7 +629,13 @@ def _refresh_pipeline_layer_config() -> None:
     """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
     try:
         if scheduler._effective_role() == "master":
-            scheduler.push_layer_config_to_clients()
+            request_sync = getattr(
+                scheduler, "request_authoritative_layer_sync", None,
+            )
+            if callable(request_sync):
+                request_sync()
+            else:
+                scheduler.push_layer_config_to_clients()
     except Exception as e:
         # 模型本身已经加载成功；同步失败时保持流水线 not-ready，后续请求
         # 会安全回退到主节点本地推理。
@@ -677,6 +807,8 @@ async def _shutdown_resources():
     """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
     try:
+        active_scheduler.clear_diffusion_worker()
+        active_scheduler.clear_diffusion_coordinator()
         await run_in_threadpool(diffusion_service.close)
         logger.info("SD 1.5 本地引擎已停止")
     except Exception as e:
@@ -860,6 +992,14 @@ class DiffusionGenerateRequest(BaseModel):
     steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     scheduler: Optional[str] = Field(default=None, max_length=80)
+
+
+class DiffusionDistributedGenerateRequest(DiffusionGenerateRequest):
+    """Experimental one-remote-Worker image Stage request."""
+
+    artifact_id: Optional[str] = Field(default=None, max_length=128)
+    provider_id: Optional[str] = Field(default=None, max_length=128)
+    workflow_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class DiffusionEditRequest(BaseModel):
@@ -1107,7 +1247,11 @@ def _diffusion_generation_request(req: DiffusionGenerateRequest) -> SD15Generati
 def _diffusion_edit_request(req: DiffusionEditRequest) -> SD15EditRequest:
     generation = build_sd15_generation_request(
         preset_id=req.preset_id,
-        prompt=(req.prompt if req.prompt is not None else req.instruction),
+        prompt=(
+            req.instruction
+            if req.mode == 'instruction'
+            else req.prompt
+        ),
         negative_prompt=req.negative_prompt,
         seed=req.seed,
         width=req.width,
@@ -2038,6 +2182,13 @@ async def get_presets():
 async def get_diffusion_capabilities():
     status = diffusion_service.snapshot()
     status["local_llm_loaded"] = _local_llm_is_loaded()
+    status["distributed_workflow"] = {
+        "enabled": bool(
+            TASK_GRAPH_ENABLED and DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+        ),
+        "role": scheduler._effective_role(),
+        "status": scheduler.get_diffusion_worker_protocol_status(),
+    }
     status["presets"] = [
         {
             "preset_id": preset.preset_id,
@@ -2160,7 +2311,9 @@ async def load_diffusion_artifact(req: DiffusionLoadRequest):
             return diffusion_service.load(req.artifact_id, config)
 
     try:
-        return await run_in_threadpool(_load)
+        loaded = await run_in_threadpool(_load)
+        _sync_local_diffusion_worker()
+        return loaded
     except Exception as exc:
         raise _diffusion_http_exception(exc) from exc
 
@@ -2175,6 +2328,7 @@ async def unload_diffusion_artifact():
 
 def _unload_diffusion_under_model_lock() -> dict:
     with model_host.full_chat_execution_lock:
+        scheduler.clear_diffusion_worker()
         return diffusion_service.unload()
 
 
@@ -2188,6 +2342,67 @@ async def generate_diffusion_image(req: DiffusionGenerateRequest):
         )
     except Exception as exc:
         raise _diffusion_http_exception(exc) from exc
+
+
+@app.post('/api/diffusion/distributed/generate')
+async def generate_distributed_diffusion_image(
+    req: DiffusionDistributedGenerateRequest,
+):
+    """Experimental single-remote-Worker TaskGraph image workflow.
+
+    This endpoint intentionally waits for one Stage so the first bridge keeps
+    the existing cancellation and journal semantics easy to inspect.  It is
+    disabled unless both the TaskGraph and SD v3 Worker flags are enabled.
+    """
+    return await run_in_threadpool(_run_distributed_diffusion_generation, req)
+
+
+@app.get('/api/diffusion/distributed/workflows/{workflow_id}/blobs/{blob_id}')
+async def get_distributed_diffusion_blob(workflow_id: str, blob_id: str):
+    data_plane = getattr(app.state, "diffusion_data_plane", None)
+    if not isinstance(data_plane, DiffusionDataPlaneRuntime):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DIFFUSION_DATA_PLANE_UNAVAILABLE",
+                "message": "持久 Blob data plane 不可用",
+            },
+        )
+    try:
+        workflow = task_graph_coordinator.get(workflow_id)
+        if workflow.get("state") != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "DIFFUSION_WORKFLOW_NOT_COMPLETED",
+                    "workflow_id": workflow_id,
+                },
+            )
+        descriptor, data = await run_in_threadpool(
+            DiffusionCoordinatorRuntime(data_plane=data_plane).read_result,
+            workflow_id=workflow_id,
+            blob_id=blob_id,
+        )
+    except HTTPException:
+        raise
+    except WorkflowNotFound as exc:
+        raise HTTPException(status_code=404, detail="workflow not found") from exc
+    except (BlobNotFound, BlobAuthorizationError) as exc:
+        raise HTTPException(status_code=404, detail="distributed image blob not found") from exc
+    except DistributedBlobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskGraphUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(
+        content=data,
+        media_type=descriptor["content_type"],
+        headers={
+            "Cache-Control": "private, no-store",
+            "ETag": f'"{descriptor["sha256"]}"',
+            "Content-Length": str(descriptor["size_bytes"]),
+            "Content-Disposition": f'inline; filename="{descriptor["blob_id"]}.png"',
+        },
+    )
 
 
 @app.post('/api/diffusion/blobs', status_code=201)
@@ -3326,6 +3541,224 @@ def _sync_remote_task_worker_providers() -> list[str]:
                     raise
         registered.append(provider.provider_id)
     return sorted(registered)
+
+
+def _sync_remote_diffusion_worker_providers() -> list[str]:
+    """Register the currently admitted v3 image Providers for TaskGraph."""
+    if (
+        not TASK_GRAPH_ENABLED
+        or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+        or scheduler._effective_role() != "master"
+    ):
+        return []
+    registered = []
+    for provider in scheduler.remote_diffusion_providers():
+        try:
+            # A Scheduler re-negotiation can replace the provider object while
+            # retaining its stable ID.  Replacing an idle object avoids a
+            # closed Provider being reused after a data-plane restart.
+            task_graph_coordinator.replace_provider(provider)
+        except ProviderError:
+            # A replacement can be ignored only for the same object, which
+            # ProviderRegistry.replace already handles without raising.  Any
+            # other error (especially an active reservation) must reach the
+            # caller instead of silently keeping a stale closed Provider.
+            raise
+        registered.append(provider.provider_id)
+    return sorted(registered)
+
+
+def _diffusion_worker_manifest_candidates(
+    req: DiffusionDistributedGenerateRequest,
+) -> tuple[Any, dict[str, Any]]:
+    """Select one healthy Worker and one exact immutable SD manifest."""
+    try:
+        _sync_remote_diffusion_worker_providers()
+    except ProviderError as exc:
+        raise HTTPException(
+            status_code=409 if getattr(exc, "retryable", False) else 503,
+            detail={
+                "code": getattr(exc, "code", "DIFFUSION_PROVIDER_SYNC_FAILED"),
+                "message": str(exc),
+            },
+        ) from exc
+    statuses = {
+        str(item.get("provider_id", "")): item
+        for item in task_graph_coordinator.provider_status()
+    }
+    candidates = []
+    for provider in scheduler.remote_diffusion_providers():
+        if req.provider_id and provider.provider_id != req.provider_id:
+            continue
+        status = statuses.get(provider.provider_id, {})
+        if (
+            status.get("provider_kind") != "remote_diffusion_worker"
+            or not status.get("healthy")
+            or not status.get("available")
+            or "image_generate" not in status.get("supported_stage_types", [])
+        ):
+            continue
+        manifests = provider.artifact_manifests()
+        for manifest in manifests:
+            if req.artifact_id and manifest.get("artifact_id") != req.artifact_id:
+                continue
+            if manifest.get("pipeline_kind") != "sd15_pipeline":
+                continue
+            candidates.append((provider, manifest))
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DIFFUSION_REMOTE_WORKER_UNAVAILABLE",
+                "message": (
+                    "没有健康且已加载匹配 SD 1.5 工件的远端 Worker；"
+                    "请先在 Worker 上加载模型并完成 v3 hello"
+                ),
+            },
+        )
+    if not req.artifact_id:
+        manifest_digests = {str(manifest.get("sha256", "")) for _, manifest in candidates}
+        if len(manifest_digests) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "DIFFUSION_ARTIFACT_SELECTION_REQUIRED",
+                    "message": "多个远端 SD 工件可用，请显式指定 artifact_id",
+                    "artifact_ids": sorted({
+                        str(manifest.get("artifact_id", ""))
+                        for _, manifest in candidates
+                    }),
+                },
+            )
+    candidates.sort(key=lambda item: item[0].provider_id)
+    return candidates[0]
+
+
+def _run_distributed_diffusion_generation(
+    req: DiffusionDistributedGenerateRequest,
+) -> dict[str, Any]:
+    if not TASK_GRAPH_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "实验性分布式图像 workflow 未启用；请设置 "
+                "QLH_TASK_GRAPH_ENABLED=true 后重启"
+            ),
+        )
+    if not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "SD v3 Worker 未启用；请设置 "
+                "QLH_DIFFUSION_WORKER_EXPERIMENTAL_ENABLED=true 后重启"
+            ),
+        )
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="只有主节点可以提交分布式图像 workflow")
+    data_plane = getattr(app.state, "diffusion_data_plane", None)
+    if not isinstance(data_plane, DiffusionDataPlaneRuntime):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DIFFUSION_DATA_PLANE_UNAVAILABLE",
+                "message": "持久 Blob data plane 不可用，分布式图像 workflow 已拒绝",
+            },
+        )
+    provider, manifest = _diffusion_worker_manifest_candidates(req)
+    generation = _diffusion_generation_request(req)
+    root_input = {
+        "prompt": generation.prompt,
+        "negative_prompt": generation.negative_prompt,
+        "seed": generation.seed,
+        "width": generation.width,
+        "height": generation.height,
+        "steps": generation.steps,
+        "guidance_scale": generation.guidance_scale,
+        "scheduler": generation.scheduler,
+        "artifact_manifest_sha256": manifest["sha256"],
+    }
+    workflow_id = req.workflow_id or None
+    request_id = _request_id_ctx.get("") or uuid.uuid4().hex
+    try:
+        output, _snapshot = task_graph_coordinator.run(
+            stages=[StageSpec(
+                stage_id="image_generate",
+                stage_type="image_generate",
+                provider=provider.provider_id,
+                lease_timeout_seconds=600.0,
+            )],
+            final_stage_id="image_generate",
+            root_input=root_input,
+            request_id=request_id,
+            template="image_generate_v1",
+            workflow_id=workflow_id,
+            runtime_context={"diffusion_artifact_manifest": manifest},
+        )
+        if (
+            not isinstance(output, dict)
+            or not isinstance(output.get("image"), dict)
+            or not isinstance(output.get("metrics"), dict)
+            or not str(output["image"].get("blob_id", ""))
+        ):
+            try:
+                task_graph_coordinator.discard_result(_snapshot["workflow_id"])
+            except Exception:
+                logger.warning(
+                    "failed to discard malformed distributed image result",
+                    exc_info=True,
+                )
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "DIFFUSION_WORKFLOW_INVALID_RESULT"},
+            )
+        committed = task_graph_coordinator.commit_result(
+            _snapshot["workflow_id"],
+        )
+    except WorkflowCancelled as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "DIFFUSION_WORKFLOW_CANCELLED", "workflow_id": exc.workflow_id},
+        ) from exc
+    except TaskGraphError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "DIFFUSION_WORKFLOW_INVALID",
+                "message": str(exc),
+                "workflow_id": workflow_id,
+            },
+        ) from exc
+    except WorkflowExecutionError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DIFFUSION_WORKFLOW_FAILED",
+                "message": str(exc),
+                "workflow_id": workflow_id,
+            },
+        ) from exc
+    image = dict(output["image"])
+    image["url"] = (
+        f"/api/diffusion/distributed/workflows/"
+        f"{committed['workflow_id']}/blobs/{image.get('blob_id', '')}"
+    )
+    journal = task_graph_coordinator.journal_status()
+    return {
+        "status": "completed",
+        "distributed": True,
+        "workflow": _public_workflow(committed, journal),
+        "result": {
+            "image": image,
+            "metrics": dict(output.get("metrics") or {}),
+        },
+        "provider_id": provider.provider_id,
+        "node_id": provider.node_id,
+        "artifact_manifest_sha256": manifest["sha256"],
+        "cancellation": {
+            "endpoint": f"/api/workflows/{committed['workflow_id']}/cancel",
+            "supported_during_execution": True,
+        },
+    }
 
 
 def _eligible_remote_task_worker_provider_ids(
@@ -5378,12 +5811,15 @@ def _public_workflow(snapshot: dict, journal: dict) -> dict:
 async def list_workflows(limit: int = 20, session_id: str = ""):
     role = scheduler._effective_role()
     provider_error = ""
+    image_provider_error = ""
     if TASK_GRAPH_ENABLED and role == "master":
         try:
             _ensure_local_task_provider()
             _sync_remote_task_worker_providers()
+            _sync_remote_diffusion_worker_providers()
         except ProviderError as exc:
             provider_error = f"{exc.code}: {exc}"
+            image_provider_error = provider_error
     journal = task_graph_coordinator.journal_status()
     try:
         workflows = task_graph_coordinator.list(
@@ -5420,6 +5856,30 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
         "provider_status": provider_status,
         "provider_error": provider_error,
         "worker_protocol": scheduler.get_task_worker_protocol_status(),
+        "image_worker_protocol": scheduler.get_diffusion_worker_protocol_status(),
+        "image_workflow": {
+            "enabled": bool(
+                TASK_GRAPH_ENABLED and DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+            ),
+            "template": "image_generate_v1",
+            "providers": [
+                provider.provider_id
+                for provider in scheduler.remote_diffusion_providers()
+            ],
+            "provider_error": image_provider_error,
+            "available": bool(
+                TASK_GRAPH_ENABLED
+                and DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                and role == "master"
+                and scheduler.get_diffusion_worker_protocol_status().get(
+                    "task_dispatch_enabled", False,
+                )
+                and scheduler.get_diffusion_worker_protocol_status().get(
+                    "task_dispatch_available", False,
+                )
+                and not image_provider_error
+            ),
+        },
         "journal": public_journal,
         "workflows": workflows,
     }
@@ -6463,9 +6923,11 @@ async def test_email_notification():
     """
     发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
 
-    邮件将发送到当前配置的管理员收件邮箱（node_config 优先，回退环境变量）。
-    任何节点均可调用（主节点和从节点均可测试邮件发送）。
+    邮件将发送到当前配置的管理员收件邮箱（集群配置优先，回退环境变量）。
+    仅主节点可调用（管理员邮箱为集群级配置，见 docs/已知问题记录.md 问题 #1）。
     """
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
     try:
         from email_notifier import send_test_email
         # SMTP 发送为同步网络操作（可阻塞数秒），放入线程池执行
@@ -6490,11 +6952,15 @@ async def get_email_config():
     """
     查询管理员收件邮箱配置（不返回任何 SMTP 凭据）。
 
+    仅主节点可调用；从节点不显示该配置条目（见 docs/已知问题记录.md 问题 #1）。
+
     Returns:
         recipient: 当前生效收件邮箱（可能为空）
-        source: node_config | env | none
+        source: cluster | env | node_config | none
         smtp_configured: 发件账号是否已配置
     """
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
     try:
         from email_notifier import admin_email_config
         from email_notifier import SMTP_SENDER, SMTP_PASSWORD
@@ -6511,10 +6977,12 @@ async def get_email_config():
 @app.post("/api/cluster/email-config")
 async def update_email_config(req: EmailConfigRequest):
     """
-    设置管理员收件邮箱并持久化到 node_config.json，运行中立即生效。
+    设置管理员收件邮箱并持久化为集群级配置，运行中立即生效。
 
-    传空字符串可清除自定义配置，回退到环境变量 QLH_SMTP_RECIPIENT。
+    仅主节点可调用；传空字符串可清除集群配置，回退到环境变量 QLH_SMTP_RECIPIENT。
     """
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
     try:
         from email_notifier import set_admin_email
         recipient = await run_in_threadpool(set_admin_email, req.recipient)

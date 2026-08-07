@@ -76,6 +76,7 @@ a = Analysis(
         'llama_cpp._internals',
         'llama_cpp.llama_cpp',
         'llama_engine',
+        'tui_admin',
 
         # ============================================================
         # uvicorn 子模块（动态导入）

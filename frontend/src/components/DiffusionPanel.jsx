@@ -23,11 +23,14 @@ import {
 import {
   buildEditRequest,
   buildInpaintRequest,
+  buildInstructionRequest,
   buildReferenceRequest,
   canUseLocalDiffusion,
   loadedArtifactId,
   normalizeDiffusionJob,
   presetToForm,
+  profileIdFromEngineConfig,
+  supportsDedicatedEditProfile,
 } from '../diffusionState';
 
 const PROFILE_OPTIONS = [
@@ -107,6 +110,7 @@ export default function DiffusionPanel({
   const [selectedArtifactId, setSelectedArtifactId] = useState('');
   const [selectedIpAdapterId, setSelectedIpAdapterId] = useState('');
   const [selectedInpaintId, setSelectedInpaintId] = useState('');
+  const [selectedInstructionId, setSelectedInstructionId] = useState('');
   const [modelPath, setModelPath] = useState(getInitialModelPath);
   const [inspection, setInspection] = useState(null);
   const [profile, setProfile] = useState('balanced');
@@ -156,6 +160,10 @@ export default function DiffusionPanel({
     () => artifacts.filter(item => item.artifact?.artifact_kind === 'sd15_inpaint_pipeline' && item.artifact?.loadable),
     [artifacts],
   );
+  const instructionArtifacts = useMemo(
+    () => artifacts.filter(item => item.artifact?.artifact_kind === 'sd15_instruction_pipeline' && item.artifact?.loadable),
+    [artifacts],
+  );
   const normalizedJob = job ? normalizeDiffusionJob(job) : null;
   const jobActive = Boolean(normalizedJob && !normalizedJob.terminal);
   const missingDependencies = capabilities?.missing_dependencies
@@ -166,6 +174,10 @@ export default function DiffusionPanel({
       capabilities.engine_config.quantization === 'none'
       && capabilities.engine_config.qkv_fusion !== true
     );
+  const dedicatedEditProfileSupported = supportsDedicatedEditProfile(
+    capabilities?.engine_config,
+    profile,
+  );
   const canUndoMask = maskHistoryVersion >= 0 && maskHistoryIndexRef.current > 0;
   const canRedoMask = maskHistoryVersion >= 0
     && maskHistoryIndexRef.current < maskHistoryRef.current.length - 1;
@@ -205,6 +217,8 @@ export default function DiffusionPanel({
     if (!mountedRef.current) return;
     const nextArtifacts = artifactData.artifacts || [];
     setCapabilities(nextCapabilities);
+    const activeProfile = profileIdFromEngineConfig(nextCapabilities.engine_config);
+    if (nextCapabilities.loaded && activeProfile) setProfile(activeProfile);
     setArtifacts(nextArtifacts);
     setAssetCatalog(assetData.assets || []);
     setSelectedArtifactId(previous => {
@@ -226,6 +240,12 @@ export default function DiffusionPanel({
         return previous;
       }
       return nextArtifacts.find(item => item.artifact?.artifact_kind === 'sd15_inpaint_pipeline' && item.artifact?.loadable)?.artifact_id || '';
+    });
+    setSelectedInstructionId(previous => {
+      if (previous && nextArtifacts.some(item => item.artifact_id === previous && item.artifact?.artifact_kind === 'sd15_instruction_pipeline' && item.artifact?.loadable)) {
+        return previous;
+      }
+      return nextArtifacts.find(item => item.artifact?.artifact_kind === 'sd15_instruction_pipeline' && item.artifact?.loadable)?.artifact_id || '';
     });
     setForm(previous => (
       previous.presetId
@@ -282,7 +302,7 @@ export default function DiffusionPanel({
     try {
       const inspected = await inspectDiffusionArtifact(path, false);
       setInspection(inspected);
-      if (!['sd15_pipeline', 'sd15_ip_adapter', 'sd15_inpaint_pipeline'].includes(inspected.artifact_kind) || !inspected.loadable) {
+      if (!['sd15_pipeline', 'sd15_ip_adapter', 'sd15_inpaint_pipeline', 'sd15_instruction_pipeline'].includes(inspected.artifact_kind) || !inspected.loadable) {
         throw new Error(inspected.warnings?.join('；') || '该路径不是完整的 SD 1.5 模型或 IP-Adapter 目录');
       }
       const registered = await registerDiffusionArtifact(path, {
@@ -294,6 +314,8 @@ export default function DiffusionPanel({
         setSelectedIpAdapterId(registered.artifact_id);
       } else if (inspected.artifact_kind === 'sd15_inpaint_pipeline') {
         setSelectedInpaintId(registered.artifact_id);
+      } else if (inspected.artifact_kind === 'sd15_instruction_pipeline') {
+        setSelectedInstructionId(registered.artifact_id);
       } else {
         setSelectedArtifactId(registered.artifact_id);
       }
@@ -346,6 +368,8 @@ export default function DiffusionPanel({
         setSelectedIpAdapterId(asset.artifact_id);
       } else if (asset.artifact_kind === 'sd15_inpaint_pipeline') {
         setSelectedInpaintId(asset.artifact_id);
+      } else if (asset.artifact_kind === 'sd15_instruction_pipeline') {
+        setSelectedInstructionId(asset.artifact_id);
       } else {
         setSelectedArtifactId(asset.artifact_id);
       }
@@ -374,6 +398,8 @@ export default function DiffusionPanel({
         setSelectedIpAdapterId(asset.artifact_id);
       } else if (asset.artifact_kind === 'sd15_inpaint_pipeline') {
         setSelectedInpaintId(asset.artifact_id);
+      } else if (asset.artifact_kind === 'sd15_instruction_pipeline') {
+        setSelectedInstructionId(asset.artifact_id);
       } else {
         setSelectedArtifactId(asset.artifact_id);
       }
@@ -455,10 +481,11 @@ export default function DiffusionPanel({
           blobId: snapshot.blob.blob_id,
           url: URL.createObjectURL(fetched.blob),
           sizeBytes: fetched.blob.size,
-          mode: ['img2img', 'reference', 'inpaint'].includes(requestSnapshot.mode) ? requestSnapshot.mode : 'txt2img',
+          mode: ['img2img', 'reference', 'inpaint', 'instruction'].includes(requestSnapshot.mode) ? requestSnapshot.mode : 'txt2img',
           strength: ['img2img', 'inpaint'].includes(requestSnapshot.mode) ? requestSnapshot.strength : null,
           ipAdapterScale: requestSnapshot.mode === 'reference' ? requestSnapshot.ip_adapter_scale : null,
-          sourceBlobId: ['img2img', 'reference', 'inpaint'].includes(requestSnapshot.mode) ? requestSnapshot.source_blob_id : null,
+          imageGuidanceScale: requestSnapshot.mode === 'instruction' ? requestSnapshot.image_guidance_scale : null,
+          sourceBlobId: ['img2img', 'reference', 'inpaint', 'instruction'].includes(requestSnapshot.mode) ? requestSnapshot.source_blob_id : null,
           seed: snapshot.parameters?.seed,
           width: snapshot.parameters?.width,
           height: snapshot.parameters?.height,
@@ -736,6 +763,12 @@ export default function DiffusionPanel({
             maskBlob?.blobId,
             selectedInpaintId,
           )
+          : editMode === 'instruction'
+            ? buildInstructionRequest(
+              form,
+              sourceBlob.blobId,
+              selectedInstructionId,
+            )
           : buildEditRequest(form, sourceBlob.blobId);
       const submitted = await editDiffusionImage(requestSnapshot);
       setJob(normalizeDiffusionJob(submitted));
@@ -749,7 +782,13 @@ export default function DiffusionPanel({
       });
     } catch (err) {
       setError(err.message);
-      const label = editMode === 'reference' ? '参考图生成' : editMode === 'inpaint' ? '局部重绘' : '图生图';
+      const label = editMode === 'reference'
+        ? '参考图生成'
+        : editMode === 'inpaint'
+          ? '局部重绘'
+          : editMode === 'instruction'
+            ? '指令编辑'
+            : '图生图';
       onToast?.({ type: 'error', msg: `${label}失败: ${err.message}` });
     } finally {
       setAction('');
@@ -992,7 +1031,7 @@ export default function DiffusionPanel({
                     data-testid="diffusion-profile"
                     value={profile}
                     onChange={event => setProfile(event.target.value)}
-                    disabled={Boolean(action)}
+                    disabled={Boolean(action) || Boolean(capabilities?.loaded)}
                   >
                     {PROFILE_OPTIONS.map(option => (
                       <option key={option.id} value={option.id}>{option.label} · {option.detail}</option>
@@ -1070,8 +1109,17 @@ export default function DiffusionPanel({
                 >
                   局部重绘
                 </button>
+                <button
+                  type="button"
+                  data-testid="diffusion-mode-instruction"
+                  className={editMode === 'instruction' ? 'active' : ''}
+                  onClick={() => setEditMode('instruction')}
+                  disabled={Boolean(action) || jobActive}
+                >
+                  指令编辑
+                </button>
               </div>
-              {['img2img', 'reference', 'inpaint'].includes(editMode) && (
+              {['img2img', 'reference', 'inpaint', 'instruction'].includes(editMode) && (
                 <div className="edit-source-box">
                   {sourceBlob ? (
                     <div
@@ -1079,7 +1127,7 @@ export default function DiffusionPanel({
                       data-testid="diffusion-source-preview"
                       data-blob-id={sourceBlob.blobId}
                     >
-                      <img src={sourceBlob.url} alt={editMode === 'reference' ? '参考图预览' : '图生图源图预览'} />
+                      <img src={sourceBlob.url} alt={editMode === 'reference' ? '参考图预览' : '编辑源图预览'} />
                       <div className="edit-source-meta">
                         <span>{sourceBlob.name}</span>
                         <span>{formatBytes(sourceBlob.sizeBytes)}</span>
@@ -1106,7 +1154,7 @@ export default function DiffusionPanel({
                   )}
                   {editMode !== 'reference' ? (
                     <>
-                    <label className="stacked-field">
+                    {editMode !== 'instruction' && <label className="stacked-field">
                       <span>Strength（重绘幅度）</span>
                       <input
                         data-testid="diffusion-strength"
@@ -1118,7 +1166,7 @@ export default function DiffusionPanel({
                         onChange={event => updateForm('strength', event.target.value)}
                         disabled={Boolean(action) || jobActive}
                       />
-                    </label>
+                    </label>}
                     {editMode === 'inpaint' && (
                       <>
                         <label className="stacked-field">
@@ -1253,6 +1301,42 @@ export default function DiffusionPanel({
                         )}
                       </>
                     )}
+                    {editMode === 'instruction' && (
+                      <>
+                        <label className="stacked-field">
+                          <span>InstructPix2Pix pipeline</span>
+                          <select
+                            data-testid="diffusion-instruction-select"
+                            value={selectedInstructionId}
+                            onChange={event => setSelectedInstructionId(event.target.value)}
+                            disabled={Boolean(action) || jobActive || instructionArtifacts.length === 0}
+                          >
+                            {instructionArtifacts.length === 0 && <option value="">尚未登记指令编辑模型</option>}
+                            {instructionArtifacts.map(artifact => (
+                              <option key={artifact.artifact_id} value={artifact.artifact_id}>{artifact.name}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="stacked-field">
+                          <span>源图保持强度</span>
+                          <input
+                            data-testid="diffusion-image-guidance-scale"
+                            type="number"
+                            min="0"
+                            max="4"
+                            step="0.1"
+                            value={form.imageGuidanceScale}
+                            onChange={event => updateForm('imageGuidanceScale', event.target.value)}
+                            disabled={Boolean(action) || jobActive}
+                          />
+                        </label>
+                        {!dedicatedEditProfileSupported && (
+                          <div className="diffusion-alert warning">
+                            指令编辑需要平衡 FP16 配置。
+                          </div>
+                        )}
+                      </>
+                    )}
                     </>
                   ) : (
                     <>
@@ -1305,7 +1389,7 @@ export default function DiffusionPanel({
                 ))}
               </div>
               <label className="stacked-field">
-                <span>Prompt</span>
+                <span>{editMode === 'instruction' ? 'Edit instruction' : 'Prompt'}</span>
                 <textarea
                   data-testid="diffusion-prompt"
                   value={form.prompt}
@@ -1328,13 +1412,13 @@ export default function DiffusionPanel({
               <button
                 className="btn-primary generate-button"
                 data-testid="diffusion-submit"
-                onClick={jobActive ? handleCancel : (['img2img', 'reference', 'inpaint'].includes(editMode) ? handleEdit : handleGenerate)}
-                disabled={Boolean(action) || (!jobActive && (!capabilities?.loaded || !form.prompt.trim() || (['img2img', 'reference', 'inpaint'].includes(editMode) && !sourceBlob) || (editMode === 'reference' && (!selectedIpAdapterId || !referenceProfileSupported)) || (editMode === 'inpaint' && (!selectedInpaintId || !maskBlob))))}
+                onClick={jobActive ? handleCancel : (['img2img', 'reference', 'inpaint', 'instruction'].includes(editMode) ? handleEdit : handleGenerate)}
+                disabled={Boolean(action) || (!jobActive && (!capabilities?.loaded || !form.prompt.trim() || (['img2img', 'reference', 'inpaint', 'instruction'].includes(editMode) && !sourceBlob) || (editMode === 'reference' && (!selectedIpAdapterId || !referenceProfileSupported)) || (editMode === 'inpaint' && (!selectedInpaintId || !maskBlob)) || (editMode === 'instruction' && (!selectedInstructionId || !dedicatedEditProfileSupported))))}
               >
                 {jobActive
                   ? action === 'cancel' || normalizedJob?.cancel_requested ? '正在取消...' : '停止生成'
                   : action === 'generate' || action === 'edit' ? '提交中...'
-                    : editMode === 'img2img' ? '生成编辑图片' : editMode === 'reference' ? '按参考图生成' : editMode === 'inpaint' ? '生成局部重绘' : '生成图片'}
+                    : editMode === 'img2img' ? '生成编辑图片' : editMode === 'reference' ? '按参考图生成' : editMode === 'inpaint' ? '生成局部重绘' : editMode === 'instruction' ? '执行指令编辑' : '生成图片'}
               </button>
             </section>
           </div>
@@ -1373,13 +1457,14 @@ export default function DiffusionPanel({
                 <figcaption>
                   <div className="result-facts">
                     <span className={`result-mode mode-${result.mode}`}>
-                      {result.mode === 'img2img' ? '图生图' : result.mode === 'reference' ? '参考图' : result.mode === 'inpaint' ? '局部重绘' : '文生图'}
+                      {result.mode === 'img2img' ? '图生图' : result.mode === 'reference' ? '参考图' : result.mode === 'inpaint' ? '局部重绘' : result.mode === 'instruction' ? '指令编辑' : '文生图'}
                     </span>
                     <span>Seed {result.seed}</span>
                     <span>{result.width} × {result.height}</span>
                     <span>{result.steps} steps</span>
                     {result.strength != null && <span>Strength {result.strength}</span>}
                     {result.ipAdapterScale != null && <span>参考强度 {result.ipAdapterScale}</span>}
+                    {result.imageGuidanceScale != null && <span>源图强度 {result.imageGuidanceScale}</span>}
                     <span>{formatSeconds(result.elapsedSeconds)}</span>
                     <span>{formatBytes(result.sizeBytes)}</span>
                     <span>本地</span>

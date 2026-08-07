@@ -3,7 +3,7 @@ chcp 65001 >nul
 rem ============================================================
 rem  QLH global bjtu command (Windows)
 rem
-rem  Usage: bjtu [tui_admin.py args...]
+rem  Usage: bjtu [launcher|ui|tui|chat|tui_admin.py args...]
 rem         bjtu --help       查看 TUI 命令集与启动参数（不启动后端）
 rem
 rem  One-click launch: start backend (if not running), wait until
@@ -17,6 +17,7 @@ rem ============================================================
 cd /d "%~dp0"
 
 if not exist "src\api_server.py" (
+    if exist "QLH-Edge-Inference.exe" goto :packaged_launcher
     echo [ERROR] bjtu.bat must be placed in the QLH project root.
     echo         Current dir: %~dp0
     pause
@@ -29,8 +30,68 @@ if /i "%~1"=="-h" goto :help
 
 rem ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
 if /i "%~1"=="chat" goto :chat
+if /i "%~1"=="update" goto :update
+if /i "%~1"=="version" goto :version
+
+rem ---- unified launcher modes ----
+if /i "%~1"=="launcher" goto :launcher
+if /i "%~1"=="ui" goto :ui
+if /i "%~1"=="tui" goto :tui
 
 call start_tui.bat %*
+exit /b %errorlevel%
+
+:packaged_launcher
+if /i "%~1"=="--help" goto :help
+if /i "%~1"=="-h" goto :help
+if /i "%~1"=="chat" (
+    echo [ERROR] 当前安装包未携带 Textual 聊天页，请使用项目环境中的 bjtu chat。
+    exit /b 2
+)
+set "QLH_LAUNCHER_EXE="
+if exist "QLH-Launcher.exe" set "QLH_LAUNCHER_EXE=%CD%\QLH-Launcher.exe"
+if not defined QLH_LAUNCHER_EXE if exist "%LOCALAPPDATA%\Programs\QLH-Launcher\QLH-Launcher.exe" set "QLH_LAUNCHER_EXE=%LOCALAPPDATA%\Programs\QLH-Launcher\QLH-Launcher.exe"
+if not defined QLH_LAUNCHER_EXE if exist "%ProgramFiles%\QLH-Launcher\QLH-Launcher.exe" set "QLH_LAUNCHER_EXE=%ProgramFiles%\QLH-Launcher\QLH-Launcher.exe"
+if not defined QLH_LAUNCHER_EXE goto :legacy_packaged_launcher
+if /i "%~1"=="update" (
+    "%QLH_LAUNCHER_EXE%" check %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+if /i "%~1"=="version" (
+    if exist "version.txt" type version.txt
+    if not exist "version.txt" echo unknown
+    exit /b 0
+)
+if /i "%~1"=="tui" (
+    "%QLH_LAUNCHER_EXE%" app-tui %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+if /i "%~1"=="ui" (
+    "%QLH_LAUNCHER_EXE%" app-ui %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+"%QLH_LAUNCHER_EXE%" %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:legacy_packaged_launcher
+if /i "%~1"=="update" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu update。
+    exit /b 2
+)
+if /i "%~1"=="version" (
+    if exist "version.txt" type version.txt
+    if not exist "version.txt" echo unknown
+    exit /b 0
+)
+if /i "%~1"=="tui" (
+    QLH-Edge-Inference.exe --tui %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+if /i "%~1"=="ui" (
+    QLH-Edge-Inference.exe --ui %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+QLH-Edge-Inference.exe --tui %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :chat
@@ -48,7 +109,45 @@ set PYTHONIOENCODING=utf-8
 %PYTHON_CMD% src\tui_chat.py %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
+:launcher
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\qlh_launcher.py --gui %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:ui
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\qlh_launcher.py app-ui %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:tui
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\qlh_launcher.py app-tui %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:update
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\qlh_launcher.py check %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:version
+if exist "version.txt" type version.txt
+if not exist "version.txt" echo launcher/app version is managed by the installed package.
+exit /b 0
+
 :help
+echo QLH BJTU 统一入口:
+echo   bjtu launcher   启动选择页（普通界面 / TUI）
+echo   bjtu ui         直接启动普通 Web/原生界面
+echo   bjtu tui        启动后端并进入 TUI 管理界面
+echo   bjtu chat       进入终端对话页
+echo   bjtu update     检查更新源中的匹配安装包
+echo   bjtu version    显示当前应用版本
+echo   bjtu status     执行 TUI 单命令（不自动启动后端）
+echo.
 set "PYTHON_CMD=python"
 where python >nul 2>nul
 if not %errorlevel%==0 (

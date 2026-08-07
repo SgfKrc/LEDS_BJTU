@@ -1,6 +1,6 @@
 # Android llama.cpp Submodule 迁移方案
 
-> 更新日期：2026-07-14
+> 更新日期：2026-08-08
 > 状态：方案已确定，等待空闲维护窗口实施
 > 适用范围：`android/app/src/main/cpp/llama.cpp/` 及 Android Full 原生构建链
 > 不包含：本次仅形成文档，不修改 Git 索引、CMake、Gradle、CI 或打包脚本
@@ -280,3 +280,5 @@ git revert <submodule-migration-commit>
 - 能将迁移、测试和必要修正放在同一维护窗口内完成。
 
 在此之前继续使用当前 vendored 源码，不改为 `FetchContent`，也不在打包脚本中增加自动 clone。
+
+> **现状约束（2026-08-08 更新）**：校园网环境 UDP 被阻断，GitHub 上游仓库当前不可达（443 连接超时）。§4 前置条件"能访问上游 Git 仓库，或已准备可信本地镜像"目前不满足，且 submodule 迁移本身需要一次携带 submodule 的远端 push（`git push --recurse-submodules`），在远端不可达时无法完成。因此迁移窗口需待网络恢复（自建 DERP 组网可用、GitHub 可达，见[抗弱网通信协议专项计划](抗弱网通信协议专项计划.md)）或准备好上游 llama.cpp 的本地镜像后再安排；在此期间 vendored 方式保持不变。

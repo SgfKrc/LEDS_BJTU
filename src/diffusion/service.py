@@ -241,10 +241,14 @@ class SD15EditRequest:
         if self.mode == 'instruction':
             if not normalized_instruction:
                 raise DiffusionInputError('instruction is required for instruction mode')
+            if self.prompt.strip() != normalized_instruction:
+                raise DiffusionInputError(
+                    'prompt must match instruction for instruction mode'
+                )
         elif normalized_instruction:
             raise DiffusionInputError('instruction is only valid for instruction mode')
         normalized_adapter_id = (self.edit_adapter_id or '').strip()
-        if self.mode == 'reference':
+        if self.mode in {'reference', 'instruction'}:
             if not normalized_adapter_id:
                 raise DiffusionInputError(
                     f'edit_adapter_id is required for {self.mode} mode'
@@ -261,6 +265,23 @@ class SD15EditRequest:
         if self.mode != 'reference' and self.ip_adapter_scale is not None:
             raise DiffusionInputError(
                 'ip_adapter_scale is only valid for reference mode'
+            )
+        if self.mode == 'instruction':
+            if self.image_guidance_scale is None:
+                raise DiffusionInputError(
+                    'image_guidance_scale is required for instruction mode'
+                )
+            if self.conditioning_scale is not None:
+                raise DiffusionInputError(
+                    'conditioning_scale is not valid for the InstructPix2Pix pipeline'
+                )
+        elif self.image_guidance_scale is not None:
+            raise DiffusionInputError(
+                'image_guidance_scale is only valid for instruction mode'
+            )
+        elif self.conditioning_scale is not None:
+            raise DiffusionInputError(
+                'conditioning_scale is only valid for a ControlNet instruction pipeline'
             )
         if not math.isfinite(self.strength) or not 0.05 <= self.strength <= 1.0:
             raise DiffusionInputError('strength must be finite and between 0.05 and 1.0')
@@ -283,6 +304,8 @@ class SD15EditRequest:
                 raise DiffusionInputError(f'{name} must be finite and non-negative')
         if self.ip_adapter_scale is not None and self.ip_adapter_scale > 2:
             raise DiffusionInputError('ip_adapter_scale must not exceed 2')
+        if self.image_guidance_scale is not None and self.image_guidance_scale > 4:
+            raise DiffusionInputError('image_guidance_scale must not exceed 4')
         for name, value in (('width', self.width), ('height', self.height)):
             if value is not None and (value < 64 or value > 768 or value % 8):
                 raise DiffusionInputError(f'{name} must be a multiple of 8 between 64 and 768')
@@ -766,12 +789,20 @@ class DiffusionService:
         _trusted_sha256: Optional[str] = None,
     ) -> RegisteredDiffusionArtifact:
         artifact = self.inspect(path, compute_hash=compute_hash)
-        if artifact.artifact_kind in {'sd15_ip_adapter', 'sd15_inpaint_pipeline'} and not artifact.loadable:
+        if artifact.artifact_kind in {
+            'sd15_ip_adapter',
+            'sd15_inpaint_pipeline',
+            'sd15_instruction_pipeline',
+        } and not artifact.loadable:
             reason = '; '.join(artifact.warnings) or f'incomplete {artifact.artifact_kind} directory'
             raise ValueError(reason)
         if _trusted_sha256:
             artifact = replace(artifact, sha256=_trusted_sha256)
-        if artifact.artifact_kind in {'sd15_ip_adapter', 'sd15_inpaint_pipeline'} and not artifact.sha256:
+        if artifact.artifact_kind in {
+            'sd15_ip_adapter',
+            'sd15_inpaint_pipeline',
+            'sd15_instruction_pipeline',
+        } and not artifact.sha256:
             # Adapter identity participates in every result manifest.  A path
             # alone is not stable enough when users replace local weights.
             artifact = self.inspect(path, compute_hash=True)
@@ -1053,6 +1084,16 @@ class DiffusionService:
                 raise DiffusionInputError(
                     'edit_adapter_id must reference a complete SD1.5 inpaint pipeline directory'
                 )
+        elif request.mode == 'instruction':
+            with self._lock:
+                adapter = self._get_artifact_locked(request.edit_adapter_id or '')
+            if (
+                adapter.artifact.artifact_kind != 'sd15_instruction_pipeline'
+                or not adapter.artifact.loadable
+            ):
+                raise DiffusionInputError(
+                    'edit_adapter_id must reference a complete InstructPix2Pix pipeline directory'
+                )
         return {
             'request': request.snapshot(),
             'source_blob': source.descriptor(),
@@ -1069,7 +1110,7 @@ class DiffusionService:
         owner_scope: str = 'local',
     ) -> Dict[str, Any]:
         self.validate_edit(request, owner_scope=owner_scope)
-        if request.mode not in {'img2img', 'reference', 'inpaint'}:
+        if request.mode not in {'img2img', 'reference', 'inpaint', 'instruction'}:
             raise DiffusionUnsupportedError(
                 f'{request.mode} edit executor is not installed yet'
             )
@@ -1080,21 +1121,21 @@ class DiffusionService:
                 raise DiffusionConflictError('SD15 engine is not loaded')
             if self._state != 'loaded' or self._active_job_id is not None:
                 raise DiffusionConflictError('another SD15 edit is active')
-            if request.mode in {'reference', 'inpaint'} and self._engine_config is not None:
+            if request.mode in {'reference', 'inpaint', 'instruction'} and self._engine_config is not None:
                 if (
                     self._engine_config.quantization != 'none'
                     or self._engine_config.enable_qkv_fusion
                 ):
                     raise DiffusionUnsupportedError(
-                        'IP-Adapter and inpaint require a validated non-quantized, non-QKV SD15 profile'
+                        'IP-Adapter, inpaint, and instruction editing require a validated non-quantized, non-QKV SD15 profile'
                     )
                 if (
-                    request.mode == 'inpaint'
+                    request.mode in {'inpaint', 'instruction'}
                     and self._engine_config.device.startswith('cuda')
                     and not self._engine_config.enable_model_cpu_offload
                 ):
                     raise DiffusionUnsupportedError(
-                        'inpaint currently requires the balanced CPU-offload profile on CUDA'
+                        'inpaint and instruction editing currently require the balanced CPU-offload profile on CUDA'
                     )
             artifact_id = self._loaded_artifact_id
             if not artifact_id:
@@ -1187,7 +1228,7 @@ class DiffusionService:
             if job.kind == 'edit':
                 source_blob = self._blob_store.get(job.request.source_blob_id)
                 adapter_artifact = None
-                if job.request.mode in {'reference', 'inpaint'}:
+                if job.request.mode in {'reference', 'inpaint', 'instruction'}:
                     with self._lock:
                         registered_adapter = self._get_artifact_locked(
                             job.request.edit_adapter_id or ''
@@ -1238,11 +1279,17 @@ class DiffusionService:
                     source_blob = self._blob_store.get(job.request.source_blob_id)
                     metadata.update({
                         'edit_mode': job.request.mode,
-                        'strength': job.request.strength,
+                        'strength': (
+                            job.request.strength
+                            if job.request.mode in {'img2img', 'inpaint'}
+                            else None
+                        ),
                         'source_blob_id': source_blob.blob_id,
                         'source_sha256': source_blob.sha256,
                         'instruction': job.request.instruction,
                         'edit_adapter_id': job.request.edit_adapter_id,
+                        'conditioning_scale': job.request.conditioning_scale,
+                        'image_guidance_scale': job.request.image_guidance_scale,
                         'ip_adapter_scale': job.request.ip_adapter_scale,
                     })
                     if job.request.mask_blob_id:

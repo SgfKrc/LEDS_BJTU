@@ -21,6 +21,7 @@ _PIPELINE_CLASSES = {
     "StableDiffusionPipeline",
     "StableDiffusionImg2ImgPipeline",
     "StableDiffusionInpaintPipeline",
+    "StableDiffusionInstructPix2PixPipeline",
     "StableDiffusionControlNetPipeline",
 }
 _CONTROLNET_MARKERS = (
@@ -291,6 +292,10 @@ class DiffusionArtifactInspector:
             # Inpainting U-Nets use a 9-channel latent input and cannot be
             # loaded through the ordinary StableDiffusionPipeline path.
             kind = "sd15_inpaint_pipeline"
+        elif not missing and class_name == "StableDiffusionInstructPix2PixPipeline":
+            # InstructPix2Pix has its own image-conditioned U-Net contract and
+            # guidance parameters. It must not enter the base txt2img loader.
+            kind = "sd15_instruction_pipeline"
         else:
             kind = "sd15_pipeline" if not missing else "unknown"
         if missing:
@@ -306,7 +311,11 @@ class DiffusionArtifactInspector:
             precision=self._directory_precision(path),
             sha256=sha256,
             size_bytes=size_bytes,
-            loadable=kind in {"sd15_pipeline", "sd15_inpaint_pipeline"},
+            loadable=kind in {
+                "sd15_pipeline",
+                "sd15_inpaint_pipeline",
+                "sd15_instruction_pipeline",
+            },
             missing_components=missing,
             warnings=warnings,
         )

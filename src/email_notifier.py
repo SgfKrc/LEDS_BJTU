@@ -35,14 +35,37 @@ SMTP_SENDER = os.environ.get("QLH_SMTP_SENDER", "")
 SMTP_PASSWORD = os.environ.get("QLH_SMTP_PASSWORD", "")  # QQ 邮箱授权码
 SMTP_RECIPIENT = os.environ.get("QLH_SMTP_RECIPIENT", "")
 
-# node_config.json 中管理员收件邮箱的键名（优先于环境变量 QLH_SMTP_RECIPIENT）
+# node_config.json 中管理员收件邮箱的键名（单机/无共享 DB 兜底）
 ADMIN_EMAIL_CONFIG_KEY = "admin_email"
+# 共享 DB cluster_config 中的集群级管理员邮箱键名（主节点写入，全集群生效）
+CLUSTER_ADMIN_EMAIL_KEY = "admin_email"
 _ADMIN_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ============================================================
-# 管理员收件邮箱（运行时可配置，优先 node_config，回退环境变量）
+# 管理员收件邮箱（集群级配置，仅主节点可写）
+# 优先级：共享 DB cluster_config → 环境变量 → 本机 node_config 兜底
 # ============================================================
+
+def _cluster_config_admin_email() -> str:
+    """读取共享 DB cluster_config 中的集群级管理员邮箱；异常/未配置时返回空串。"""
+    try:
+        from db import get_config
+        value = get_config(CLUSTER_ADMIN_EMAIL_KEY, "")
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+def _persist_cluster_admin_email(email: str) -> bool:
+    """写入共享 DB cluster_config（集群级，仅主节点调用）；失败返回 False。"""
+    try:
+        from db import set_config
+        set_config(CLUSTER_ADMIN_EMAIL_KEY, email)
+        return True
+    except Exception:
+        return False
+
 
 def _node_config_admin_email() -> str:
     """读取 node_config.json 中的管理员邮箱；异常时返回空串。"""
@@ -55,28 +78,42 @@ def _node_config_admin_email() -> str:
 
 
 def get_admin_email() -> str:
-    """返回当前生效的管理员收件邮箱：node_config 优先，回退环境变量。"""
-    configured = _node_config_admin_email()
-    if configured:
-        return configured
-    return SMTP_RECIPIENT.strip()
+    """返回当前生效的管理员收件邮箱。
+
+    优先级：共享 DB cluster_config（集群级，主节点写入）→ 环境变量
+    QLH_SMTP_RECIPIENT → 本机 node_config（单机/无共享 DB 兜底）。
+    从节点本地 node_config 的残留配置不再优先于环境变量，集群收件人
+    由主节点统一决定（见 docs/已知问题记录.md 问题 #1）。
+    """
+    cluster = _cluster_config_admin_email()
+    if cluster:
+        return cluster
+    if SMTP_RECIPIENT.strip():
+        return SMTP_RECIPIENT.strip()
+    return _node_config_admin_email()
 
 
 def admin_email_config() -> dict:
-    """返回收件邮箱配置详情：recipient + source（node_config | env | none）。"""
-    configured = _node_config_admin_email()
-    if configured:
-        return {"recipient": configured, "source": "node_config"}
+    """返回收件邮箱配置详情：recipient + source（cluster | env | node_config | none）。"""
+    cluster = _cluster_config_admin_email()
+    if cluster:
+        return {"recipient": cluster, "source": "cluster"}
     if SMTP_RECIPIENT.strip():
         return {"recipient": SMTP_RECIPIENT.strip(), "source": "env"}
+    node = _node_config_admin_email()
+    if node:
+        return {"recipient": node, "source": "node_config"}
     return {"recipient": "", "source": "none"}
 
 
 def set_admin_email(email: str) -> str:
-    """校验并持久化管理员收件邮箱到 node_config.json，运行中立即生效。
+    """校验并持久化管理员收件邮箱（服务端负责仅主节点可调用的角色校验）。
+
+    持久化到共享 DB cluster_config（集群级，全节点生效），同时写入本机
+    node_config.json 作为单机/无共享 DB 场景的兜底。运行中立即生效。
 
     Args:
-        email: 合法邮箱地址（传空串可清除自定义配置，回退环境变量）。
+        email: 合法邮箱地址（传空串可清除集群配置，回退环境变量）。
 
     Returns:
         持久化后生效的收件邮箱。
@@ -87,6 +124,7 @@ def set_admin_email(email: str) -> str:
     normalized = (email or "").strip().lower()
     if normalized and not _ADMIN_EMAIL_RE.match(normalized):
         raise ValueError(f"非法邮箱地址: {email!r}")
+    cluster_ok = _persist_cluster_admin_email(normalized)
     from node_config import load_node_config, write_node_config
     data = load_node_config()
     data[ADMIN_EMAIL_CONFIG_KEY] = normalized
@@ -95,7 +133,10 @@ def set_admin_email(email: str) -> str:
     poller = _mail_poller
     if poller is not None:
         poller.set_admin_email(normalized)
-    logger.info(f"📧 管理员收件邮箱已更新: {normalized or '(回退环境变量)'}")
+    logger.info(
+        f"📧 管理员收件邮箱已更新: {normalized or '(回退环境变量)'}"
+        f"{'（集群配置已同步）' if cluster_ok else '（共享 DB 不可用，仅本机兜底）'}"
+    )
     return get_admin_email()
 
 # 邮件投票轮询间隔（秒）

@@ -90,7 +90,7 @@ class _DiffusionStub:
 
     def submit_edit(self, edit_request, *, owner_scope):
         self.edit_request = (edit_request, owner_scope)
-        if edit_request.mode not in {'img2img', 'reference'}:
+        if edit_request.mode not in {'img2img', 'reference', 'inpaint', 'instruction'}:
             raise DiffusionUnsupportedError('edit executor is not installed')
         return {"job_id": "sdedit_test", "state": "queued", "kind": "edit"}
 
@@ -220,12 +220,16 @@ def test_inference_diffusion_upload_and_edit_contract():
         json={
             'mode': 'instruction',
             'source_blob_id': 'img_input',
+            'prompt': 'this target caption must not override the edit command',
             'instruction': 'turn it into a sketch',
+            'edit_adapter_id': 'sd15_instruct_pix2pix_v1',
+            'image_guidance_scale': 1.0,
         },
     )
-    assert edited.status_code == 501
-    assert edited.json()['detail']['code'] == 'DIFFUSION_UNSUPPORTED'
+    assert edited.status_code == 202
     assert host._diffusion.edit_request[0].mode == 'instruction'
+    assert host._diffusion.edit_request[0].prompt == 'turn it into a sketch'
+    assert host._diffusion.edit_request[0].image_guidance_scale == 1.0
 
 
 def test_inference_diffusion_asset_contract_uses_pinned_proxy_policy():

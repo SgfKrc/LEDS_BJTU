@@ -1,0 +1,42 @@
+#!/bin/sh
+# QLH BJTU unified launcher for installed Linux packages.
+set -eu
+
+case "${1:-tui}" in
+    launcher|--launcher)
+        [ "$#" -gt 0 ] && shift
+        exec /usr/local/bin/qlh-launcher "$@"
+        ;;
+    ui|web|--ui|--web)
+        [ "$#" -gt 0 ] && shift
+        exec /usr/local/bin/qlh-launcher app-ui "$@"
+        ;;
+    tui|--tui)
+        [ "$#" -gt 0 ] && shift
+        exec /usr/local/bin/qlh-launcher app-tui "$@"
+        ;;
+    chat)
+        echo "[错误] 当前安装包未携带 Textual 聊天页，请使用项目环境中的 bjtu chat。" >&2
+        exit 2
+        ;;
+    update)
+        shift
+        exec /usr/local/bin/qlh-launcher check "$@"
+        ;;
+    version)
+        cat /opt/qlh-edge-inference/version.txt 2>/dev/null || printf '%s\n' unknown
+        ;;
+    --help|-h)
+        printf '%s\n' \
+            'QLH BJTU 统一入口:' \
+            '  bjtu launcher   启动选择页（普通界面 / TUI）' \
+            '  bjtu ui         直接启动普通界面' \
+            '  bjtu tui        启动后端并进入 TUI 管理界面' \
+            '  bjtu chat       需要项目环境中的可选聊天依赖' \
+            '  bjtu update     检查更新源中的匹配安装包' \
+            '  bjtu version    显示当前应用版本'
+        ;;
+    *)
+        exec /usr/local/bin/qlh-launcher app-tui "$@"
+        ;;
+esac

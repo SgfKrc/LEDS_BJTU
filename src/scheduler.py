@@ -40,6 +40,11 @@ from task_worker_adapter import (
     TaskWorkerControlPlane,
     remote_provider_id,
 )
+from diffusion.worker_adapter import (
+    DiffusionCoordinatorControlPlane,
+    DiffusionWorkerAdapter,
+    RemoteDiffusionProvider,
+)
 from task_worker_protocol import (
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
     WorkerMessage,
@@ -78,7 +83,8 @@ from config import (
     SERVER_IP, SERVER_PORT,
     NODE_ROLE, NODE_ID, MAX_NODES,
     MASTER_DOWN_EMAIL_TIMEOUT,
-    PIPELINE_TIMEOUT, PIPELINE_STEP_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
+    PIPELINE_TIMEOUT, PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_STEP_TIMEOUT,
+    PIPELINE_QUEUE_POLL_INTERVAL,
     PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL,
     PIPELINE_SCHEDULING_STRATEGY,
     PIPELINE_Q0_MAX_TOKENS, PIPELINE_Q1_MAX_TOKENS,
@@ -89,12 +95,51 @@ from config import (
     PIPELINE_PREEMPT_MIN_TOKENS,         # 至少生成 N token 后才接受抢占
     PIPELINE_PREEMPT_MAX_OVERHEAD_MS,    # checkpoint 超限自动禁用
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
 
 ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
+
+
+def _sample_pipeline_token_id(logits, temperature: float, top_p: float) -> int:
+    """Sample one token with the same zero-temperature semantics as local inference."""
+    if torch is None:
+        raise RuntimeError("PyTorch 不可用，无法执行流水线采样")
+    if logits is None or logits.ndim != 3 or logits.shape[0] != 1:
+        shape = getattr(logits, "shape", None)
+        raise ValueError(f"流水线 logits 形状无效: {shape}")
+
+    # Local ModelManager uses do_sample=False when temperature <= 0. Keeping
+    # that exact contract also avoids dividing fp16/bf16 logits by 1e-8,
+    # which can create infinities and poison the CUDA context in multinomial.
+    next_logits = logits[:, -1, :].float()
+    if float(temperature) <= 0:
+        return int(torch.argmax(next_logits, dim=-1).item())
+
+    scaled_logits = next_logits / max(float(temperature), 1e-5)
+    if not bool(torch.isfinite(scaled_logits).all().item()):
+        raise RuntimeError("流水线 logits 包含 NaN/Inf，拒绝执行采样")
+    probs = torch.softmax(scaled_logits, dim=-1)
+    if not bool(torch.isfinite(probs).all().item()):
+        raise RuntimeError("流水线采样概率包含 NaN/Inf")
+
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    nucleus = min(1.0, max(0.0, float(top_p)))
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    cutoff = cumsum > nucleus
+    cutoff[..., 1:] = cutoff[..., :-1].clone()
+    cutoff[..., 0] = False
+    filtered_probs = sorted_probs.masked_fill(cutoff, 0.0)
+    probability_sum = filtered_probs.sum(dim=-1, keepdim=True)
+    if (not bool(torch.isfinite(probability_sum).all().item())
+            or bool((probability_sum <= 0).any().item())):
+        raise RuntimeError("流水线采样概率无有效候选 token")
+    filtered_probs = filtered_probs / probability_sum
+    sampled_rank = torch.multinomial(filtered_probs, 1)
+    return int(sorted_indices.gather(-1, sampled_rank)[0, 0].item())
 
 
 def _bootstrap_api_port(default: int = 8000) -> int:
@@ -1107,6 +1152,9 @@ class Scheduler:
         self._pipeline_worker_reserved = False
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
+        # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
+        # 布尔值，避免前一个请求结束时把后一个请求降级为普通推送。
+        self._authoritative_layer_sync_requests = 0
         self._local_pipeline_cancelled: set[str] = set()
         self._local_pipeline_cancelled_order: collections.deque = collections.deque()
         self._local_pipeline_steps: dict[str, int] = {}
@@ -1147,6 +1195,14 @@ class Scheduler:
         self._task_worker_control = TaskWorkerControlPlane(
             health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
         )
+        self._diffusion_worker_control = DiffusionCoordinatorControlPlane(
+            health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
+        )
+        self._diffusion_worker_lock = threading.RLock()
+        self._diffusion_worker_adapter: Optional[DiffusionWorkerAdapter] = None
+        self._diffusion_result_ingestor: Optional[Callable] = None
+        self._diffusion_task_dispatch_enabled = False
+        self._remote_diffusion_providers: dict[str, RemoteDiffusionProvider] = {}
         self._task_worker_refresh_lock = threading.Lock()
         self._task_worker_refresh_requested = False
         self._task_worker_refresh_generation = 0
@@ -2450,6 +2506,7 @@ class Scheduler:
             "model_sha256": self._get_master_model_sha256(),
             "model_type": model_type,
             "total_layers": self._get_total_model_layers(),
+            "quant_type": getattr(manager, "quant_type", "") or "",
         }
 
     def compute_layer_assignment(self, nodes: list = None) -> list:
@@ -3232,6 +3289,26 @@ class Scheduler:
         with self._layer_config_push_lock:
             self._push_layer_config_to_clients_locked()
 
+    def request_authoritative_layer_sync(self) -> bool:
+        """让在线 PC 从节点服从主节点当前模型和分层配置。
+
+        从节点显式执行本地模型操作后会暂时退出分层 worker。主节点模型
+        加载完成或收到新的分布式请求时，通过这个一次性标记重新取得
+        配置权威；普通拓扑刷新仍尊重从节点的临时退出状态。
+        """
+        if self._effective_role() != "master":
+            return False
+        with self._layer_config_lock:
+            self._authoritative_layer_sync_requests += 1
+        try:
+            self.push_layer_config_to_clients()
+        finally:
+            with self._layer_config_lock:
+                self._authoritative_layer_sync_requests = max(
+                    0, self._authoritative_layer_sync_requests - 1,
+                )
+        return True
+
     def _push_layer_config_to_clients_locked(self) -> None:
         """
         向所有 TCP 连接的从节点推送其分层配置。
@@ -3257,6 +3334,22 @@ class Scheduler:
                 and node_id != self.get_effective_node_id()
                 and getattr(node, "node_type", "pc") == "pc"
             }
+
+        with self._layer_config_lock:
+            authoritative_sync = bool(
+                self._authoritative_layer_sync_requests
+            )
+            reenabled_nodes = (
+                self._pipeline_worker_opt_out & releasable_pc_ids
+                if authoritative_sync else set()
+            )
+            if reenabled_nodes:
+                self._pipeline_worker_opt_out.difference_update(reenabled_nodes)
+        if reenabled_nodes:
+            logger.info(
+                "主节点权威模型同步重新启用分层 worker: %s",
+                sorted(reenabled_nodes),
+            )
 
         with self._layer_config_lock:
             self._layer_config_generation = max(
@@ -3308,6 +3401,12 @@ class Scheduler:
                 "model_sha256": master_sha256,
                 "model_type": model_type,
                 "total_layers": int(model_info["total_layers"]),
+                "master_quant_type": model_info.get("quant_type", ""),
+                "engine": "pytorch",
+                "sync_policy": (
+                    "master_authoritative" if authoritative_sync else "normal"
+                ),
+                "authoritative_sync": authoritative_sync,
                 "master_api_port": API_PORT,
             }
 
@@ -3547,6 +3646,139 @@ class Scheduler:
             "models": models,
             "max_concurrency": 1,
         }
+
+    def configure_diffusion_worker(
+        self, *, capabilities: dict, executor: Callable,
+    ) -> bool:
+        """Install an explicitly provided v3 image executor on a PC client.
+
+        Scheduler owns only TCP lifecycle here.  The caller supplies the
+        sidecar-backed executor, so importing Scheduler never loads Diffusers
+        or changes the LLM model lifecycle.
+        """
+        if self._effective_role() != "client":
+            return False
+        adapter = DiffusionWorkerAdapter(
+            node_id=self.get_effective_node_id(),
+            capabilities=dict(capabilities),
+            executor=executor,
+            send_message=self._send_task_worker_to_master,
+        )
+        with self._diffusion_worker_lock:
+            previous = self._diffusion_worker_adapter
+            self._diffusion_worker_adapter = adapter
+        if previous is not None:
+            previous.disconnect_coordinator()
+        return self._send_diffusion_worker_hello()
+
+    def clear_diffusion_worker(self) -> None:
+        """Remove the optional image worker before its local sidecar unloads."""
+        with self._diffusion_worker_lock:
+            adapter = self._diffusion_worker_adapter
+            self._diffusion_worker_adapter = None
+        if adapter is not None:
+            adapter.disconnect_coordinator()
+
+    def configure_diffusion_coordinator(
+        self, *, result_ingestor: Callable, dispatch_enabled: bool = False,
+    ) -> bool:
+        """Enable verified v3 response routing on a configured coordinator.
+
+        The callback owns Blob transfer and persistence.  Scheduler retains no
+        grant; API code may register the admitted Provider with TaskGraph when
+        ``dispatch_enabled`` is explicitly enabled.
+        """
+        if self._effective_role() != "master":
+            return False
+        with self._diffusion_worker_lock:
+            stale = list(self._remote_diffusion_providers.values())
+            self._remote_diffusion_providers.clear()
+            self._diffusion_result_ingestor = result_ingestor
+            self._diffusion_task_dispatch_enabled = bool(dispatch_enabled)
+        for provider in stale:
+            provider.close()
+        return True
+
+    def clear_diffusion_coordinator(self) -> None:
+        """Fence all optional v3 Providers before closing their data plane."""
+        with self._diffusion_worker_lock:
+            providers = list(self._remote_diffusion_providers.values())
+            self._remote_diffusion_providers.clear()
+            self._diffusion_result_ingestor = None
+            self._diffusion_task_dispatch_enabled = False
+        for provider in providers:
+            provider.close()
+
+    def _ensure_remote_diffusion_provider(
+        self, node_id: str,
+    ) -> RemoteDiffusionProvider | None:
+        with self._diffusion_worker_lock:
+            provider = self._remote_diffusion_providers.get(node_id)
+            if provider is not None:
+                return provider
+            ingestor = self._diffusion_result_ingestor
+            if ingestor is None or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+                return None
+            provider = RemoteDiffusionProvider(
+                node_id=node_id,
+                peer_snapshot=lambda bound_node=node_id: (
+                    self._diffusion_worker_control.worker_snapshot(bound_node)
+                ),
+                send_message=lambda message, bound_node=node_id: (
+                    self._send_task_worker_to_node(bound_node, message)
+                ),
+                result_ingestor=ingestor,
+                # The isolated Provider remains directly testable.  Product
+                # dispatch is controlled separately by TaskGraph registration
+                # and reported through _diffusion_task_dispatch_enabled.
+                dispatch_enabled=True,
+            )
+            self._remote_diffusion_providers[node_id] = provider
+            return provider
+
+    def remote_diffusion_providers(self) -> list[RemoteDiffusionProvider]:
+        """Return explicitly admitted v3 image Providers for a later graph bridge."""
+        with self._diffusion_worker_lock:
+            return [
+                self._remote_diffusion_providers[node_id]
+                for node_id in sorted(self._remote_diffusion_providers)
+            ]
+
+    def _send_diffusion_worker_hello(self, client=None) -> bool:
+        """Negotiate v3 only after a client has authenticated its TCP link."""
+        if (
+            self._effective_role() != "client"
+            or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+        ):
+            return False
+        target = client or getattr(self, "_tcp_client", None)
+        if not target or not getattr(target, "is_registered", False):
+            return False
+        with self._diffusion_worker_lock:
+            adapter = self._diffusion_worker_adapter
+        if adapter is None:
+            return False
+        try:
+            from tcp_comm import MessageType
+
+            message = adapter.begin_hello()
+            if message is None:
+                return False
+            target.send_data(message.snapshot(), MessageType.TASK_WORKER)
+            logger.info(
+                "event=diffusion_worker_hello_sent node_id=%s version=%s",
+                self.get_effective_node_id(), message.version,
+            )
+            return True
+        except Exception as exc:
+            adapter.disconnect_coordinator()
+            logger.warning(
+                "event=diffusion_worker_hello_failed node_id=%s error=%s",
+                self.get_effective_node_id(),
+                getattr(exc, "code", type(exc).__name__),
+                exc_info=True,
+            )
+            return False
 
     def _send_task_worker_hello(
         self, client=None, refresh_generation: int = 0,
@@ -4083,6 +4315,9 @@ class Scheduler:
             return
         try:
             message = decode_task_worker_message(raw)
+            if message.version == 3:
+                self._handle_diffusion_worker_message(client_id, message)
+                return
             if self._effective_role() == "master":
                 if client_id == "master":
                     raise WorkerProtocolError(
@@ -4206,6 +4441,120 @@ class Scheduler:
                 client_id, type(exc).__name__, exc_info=True,
             )
 
+    def _handle_diffusion_worker_message(
+        self, client_id: str, message: WorkerMessage,
+    ) -> None:
+        """Route v3 image control without enabling image Stage dispatch."""
+        if not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "v3 image worker transport is disabled by configuration",
+                code="image_worker_experiment_disabled",
+                field="message_type",
+            )
+        if self._effective_role() == "client":
+            if client_id != "master":
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "image worker accepts control messages from master only",
+                    code="invalid_message_direction",
+                    field="message_type",
+                )
+            with self._diffusion_worker_lock:
+                adapter = self._diffusion_worker_adapter
+            if adapter is None:
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "no local image worker adapter is installed",
+                    code="image_worker_adapter_unconfigured",
+                    field="message_type",
+                )
+            raw = message.snapshot()
+            if message.message_type == "hello_ack":
+                adapter.receive_hello_ack(raw)
+            elif message.message_type == "stage_offer":
+                adapter.receive_offer(raw)
+            elif message.message_type == "lease_renew":
+                adapter.receive_lease_renew(raw)
+            elif message.message_type == "stage_cancel":
+                adapter.receive_cancel(raw)
+            else:
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "message is not valid in the image worker direction",
+                    code="invalid_message_direction",
+                    field="message_type",
+                )
+            return
+        if self._effective_role() != "master":
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "v3 image worker transport is not configured on this client",
+                code="image_worker_adapter_unconfigured",
+                field="message_type",
+            )
+        if client_id == "master":
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "master cannot register as its own image worker",
+                code="invalid_message_direction",
+                field="message_type",
+            )
+        with self._nodes_lock:
+            registered_node = self.nodes.get(client_id)
+            registered_role = getattr(
+                getattr(registered_node, "role", ""),
+                "value", getattr(registered_node, "role", ""),
+            )
+            admitted_pc_worker = bool(
+                registered_node is not None
+                and registered_node.node_type == "pc"
+                and registered_role == NodeRole.CLIENT.value
+            )
+        if not admitted_pc_worker:
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "only a registered PC client may negotiate an image worker",
+                code="unsupported_worker_node",
+                field="payload.worker_kind",
+            )
+        if message.message_type == "hello":
+            ack = self._diffusion_worker_control.receive_hello(
+                client_id,
+                message.snapshot(),
+                coordinator_node_id=self.get_effective_node_id(),
+            )
+            self._send_task_worker_to_node(client_id, ack)
+            if ack.payload["accepted"]:
+                self._ensure_remote_diffusion_provider(client_id)
+            logger.info(
+                "event=diffusion_worker_hello_acked node_id=%s accepted=%s enabled=%s",
+                client_id,
+                ack.payload["accepted"],
+                DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+            )
+            return
+        if message.message_type in {
+            "stage_accept", "stage_result", "stage_error", "stage_cancelled",
+        }:
+            with self._diffusion_worker_lock:
+                provider = self._remote_diffusion_providers.get(client_id)
+            if provider is None:
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "v3 image Stage response arrived before coordinator admission",
+                    code="image_worker_dispatch_disabled",
+                    field="message_type",
+                )
+            provider.handle_message(message.snapshot())
+            return
+        self._diffusion_worker_control.record_rejection()
+        raise WorkerProtocolError(
+            "message is not valid in the image coordinator direction",
+            code="invalid_message_direction",
+            field="message_type",
+        )
+
     def get_task_worker_protocol_status(self) -> dict:
         runtime = self._task_worker_control.status(role=self._effective_role())
         connected = bool(runtime.get("control_plane_connected", False))
@@ -4227,6 +4576,64 @@ class Scheduler:
             ),
         })
         return worker_protocol_status(runtime)
+
+    def get_diffusion_worker_protocol_status(self) -> dict:
+        """Report v3 image control routing without claiming dispatch support."""
+        with self._diffusion_worker_lock:
+            adapter = self._diffusion_worker_adapter
+            providers = list(self._remote_diffusion_providers.values())
+            provider_ids = sorted(provider.provider_id for provider in providers)
+            result_ingestor_ready = self._diffusion_result_ingestor is not None
+            dispatch_enabled = self._diffusion_task_dispatch_enabled
+        dispatch_available = False
+        for provider in providers:
+            try:
+                capabilities = provider.inspect()
+            except Exception:
+                continue
+            if capabilities.healthy and capabilities.available:
+                dispatch_available = True
+                break
+        if self._effective_role() == "client" and adapter is not None:
+            runtime = adapter.status()
+            runtime["worker_adapter_registered"] = True
+        else:
+            runtime = self._diffusion_worker_control.status()
+            runtime["worker_adapter_registered"] = False
+        runtime.update({
+            "phase": "SD-N3.4",
+            "experiment_enabled": DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+            "transport_routing_enabled": DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+            "stage_response_routing_enabled": bool(
+                DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                and self._effective_role() == "master"
+                and result_ingestor_ready
+            ),
+            "coordinator_result_ingestor_ready": bool(
+                self._effective_role() == "master" and result_ingestor_ready
+            ),
+            "admitted_provider_ids": provider_ids,
+            "task_dispatch_enabled": bool(
+                DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                and self._effective_role() == "master"
+                and result_ingestor_ready
+                and dispatch_enabled
+            ),
+            "task_dispatch_available": dispatch_available,
+            "adapter_connected": False,
+            "admission_state": (
+                "n3_4_provider_bridge_ready"
+                if (
+                    DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                    and self._effective_role() == "master"
+                    and result_ingestor_ready
+                )
+                else "n3_3_transport_only"
+                if DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                else "n3_3_experiment_disabled"
+            ),
+        })
+        return runtime
 
     def _on_tcp_message(self, client_id: str, msg: dict) -> None:
         """
@@ -4296,6 +4703,7 @@ class Scheduler:
         elif msg_type == "heartbeat":
             if self._effective_role() == "master":
                 self._task_worker_control.mark_worker_heartbeat(client_id)
+                self._diffusion_worker_control.mark_heartbeat(client_id)
             with self._nodes_lock:
                 if client_id in self.nodes:
                     self.nodes[client_id].last_heartbeat = time.time()
@@ -4861,6 +5269,11 @@ class Scheduler:
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
         self._task_worker_control.disconnect_worker(client_id)
+        self._diffusion_worker_control.disconnect_worker(client_id)
+        with self._diffusion_worker_lock:
+            diffusion_provider = self._remote_diffusion_providers.get(client_id)
+        if diffusion_provider is not None:
+            diffusion_provider.notify_disconnect()
         with self._task_worker_stage_lock:
             remote_provider = self._remote_task_worker_providers.get(client_id)
         if remote_provider is not None:
@@ -4914,6 +5327,10 @@ class Scheduler:
             return
 
         self._task_worker_control.disconnect_coordinator()
+        with self._diffusion_worker_lock:
+            diffusion_adapter = self._diffusion_worker_adapter
+        if diffusion_adapter is not None:
+            diffusion_adapter.disconnect_coordinator()
         with self._task_worker_stage_lock:
             for active in self._task_worker_active_attempts.values():
                 active.cancel_reason = "coordinator_disconnected"
@@ -6602,6 +7019,7 @@ class Scheduler:
                 except Exception:
                     pass
                 self._send_task_worker_hello(client)
+                self._send_diffusion_worker_hello(client)
 
                 logger.info(f"✅ 从节点 {node_id} 已连接到主节点 {master_host}:{master_port}")
                 return {
@@ -6647,6 +7065,7 @@ class Scheduler:
                         except Exception:
                             pass
                         self._send_task_worker_hello(client)
+                        self._send_diffusion_worker_hello(client)
                         logger.info(
                             "✅ 从节点 %s 刷新配置后已连接到主节点 %s:%s",
                             node_id, master_host, master_port,
@@ -7648,8 +8067,20 @@ class Scheduler:
 
     def _schedule_layer_config(self, client_id: str, data: dict) -> None:
         config_id = str(data.get("config_id", "")) if isinstance(data, dict) else ""
+        authoritative_sync = bool(
+            isinstance(data, dict) and data.get("authoritative_sync")
+        )
         resend_opt_out = False
+        authoritative_opt_in = False
         with self._layer_config_lock:
+            if (
+                authoritative_sync
+                and self._pipeline_worker_opted_out
+                and isinstance(data, dict)
+                and not data.get("release")
+            ):
+                self._pipeline_worker_opted_out = False
+                authoritative_opt_in = True
             if (self._pipeline_worker_opted_out
                     and isinstance(data, dict)
                     and not data.get("release")):
@@ -7706,6 +8137,11 @@ class Scheduler:
                 if config_id:
                     self._layer_config_inflight.add(config_id)
 
+        if authoritative_opt_in:
+            logger.info(
+                "收到主节点权威模型配置，自动重新加入分层 worker: config=%s",
+                config_id,
+            )
         if resend_opt_out:
             logger.info(
                 "本设备已选择本地模型，拒绝分层配置并重发退出请求: config=%s",
@@ -7879,6 +8315,8 @@ class Scheduler:
         model_id = str(cfg.get("model_id", ""))
         expected_sha256 = str(cfg.get("model_sha256", ""))
         expected_model_type = str(cfg.get("model_type", "")).lower()
+        expected_engine = str(cfg.get("engine", "pytorch") or "pytorch").lower()
+        master_quant_type = str(cfg.get("master_quant_type", "") or "")
         try:
             start = int(start)
             end = int(end)
@@ -7907,6 +8345,10 @@ class Scheduler:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
             if expected_model_type not in {"qwen", "qwen2"}:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
+            if expected_engine != "pytorch":
+                raise ValueError(
+                    f"分层配置引擎必须为 pytorch，实际为 {expected_engine}"
+                )
             missing_contract = [
                 name for name, value in (
                     ("config_id", config_id),
@@ -7982,6 +8424,7 @@ class Scheduler:
                     has_embedding=has_embed,
                     has_lm_head=has_lm,
                     model_path=local_model_path,
+                    quant_type=master_quant_type or None,
                     total_layers=total_layers or None,
                     model_id=model_id or None,
                 )
@@ -7993,6 +8436,7 @@ class Scheduler:
                     has_embedding=has_embed,
                     has_lm_head=has_lm,
                     model_path=local_model_path,
+                    quant_type=master_quant_type or None,
                     total_layers=total_layers or None,
                     model_id=model_id or None,
                 )
@@ -8039,6 +8483,8 @@ class Scheduler:
                 "model_type": actual_model_type,
                 "layer_range": [start, end],
                 "engine": engine,
+                "master_quant_type": master_quant_type,
+                "runtime_quant_type": getattr(mgr, "quant_type", "") or "",
             }
             with self._layer_config_lock:
                 self._pipeline_worker_reserved = True
@@ -8058,6 +8504,8 @@ class Scheduler:
                 "model_sha256": local_sha256 or expected_sha256,
                 "model_type": actual_model_type,
                 "engine": engine,
+                "master_quant_type": master_quant_type,
+                "runtime_quant_type": getattr(mgr, "quant_type", "") or "",
                 "timestamp": time.time(),
             })
             logger.info(
@@ -9036,6 +9484,93 @@ class Scheduler:
             return True
         logger.warning("流水线未就绪: %s", readiness["reason"])
         return False
+
+    def _connected_pc_worker_ids(self) -> list[str]:
+        """Return online PC clients that can receive an authoritative config."""
+        server = self._tcp_server
+        if not server or not getattr(server, "_running", False):
+            return []
+        get_client_ids = getattr(server, "get_client_ids", None)
+        connected = set(
+            get_client_ids()
+            if callable(get_client_ids)
+            else getattr(server, "clients", {}).keys()
+        )
+        local_node_id = self.get_effective_node_id()
+        with self._nodes_lock:
+            return sorted(
+                node_id for node_id, node in self.nodes.items()
+                if node_id in connected
+                and node_id != local_node_id
+                and getattr(node, "node_type", "pc") == "pc"
+                and node.is_available()
+                and not self._node_is_island_gateway(node.device_info)
+            )
+
+    def _synchronize_pipeline_workers_for_request(
+        self, timeout: float = PIPELINE_MODEL_SYNC_TIMEOUT,
+    ) -> dict:
+        """Synchronize worker model segments before falling back to the master."""
+        readiness = self._get_pipeline_readiness()
+        if readiness.get("ready"):
+            return readiness
+
+        worker_ids = self._connected_pc_worker_ids()
+        if not worker_ids:
+            return readiness
+
+        recoverable = {
+            "no_pipeline_workers",
+            "worker_layer_not_configured",
+            "worker_layer_loading",
+            "worker_layer_load_failed",
+        }
+        if readiness.get("reason_code") not in recoverable:
+            return readiness
+
+        # An existing loading generation should finish without being superseded.
+        # Other recoverable states need a fresh authoritative generation.
+        if readiness.get("reason_code") != "worker_layer_loading":
+            logger.info(
+                "分布式请求触发主节点权威模型同步: workers=%s reason=%s",
+                worker_ids,
+                readiness.get("reason", ""),
+            )
+            self.request_authoritative_layer_sync()
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            readiness = self._get_pipeline_readiness()
+            if readiness.get("ready"):
+                logger.info(
+                    "主从模型配置同步完成，流水线已就绪: workers=%s",
+                    worker_ids,
+                )
+                return readiness
+            # 旧安装包不认识 authoritative_sync，会再次发送 opt-out。
+            # 这是明确的不可恢复信号；不应让本次推理无谓等待完整同步
+            # 超时，直接按既有安全路径回退到主节点。
+            with self._layer_config_lock:
+                opted_out = sorted(
+                    set(worker_ids) & self._pipeline_worker_opt_out
+                )
+            if opted_out:
+                logger.warning(
+                    "从节点拒绝主节点权威模型同步，立即回退: workers=%s",
+                    opted_out,
+                )
+                return readiness
+            if readiness.get("reason_code") not in recoverable:
+                return readiness
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "等待主从模型配置同步超时: timeout=%.1fs reason=%s",
+                    float(timeout),
+                    readiness.get("reason", ""),
+                )
+                return readiness
+            time.sleep(min(0.1, remaining))
 
     def _verify_pipeline_readiness(self, pipeline_nodes: list
                                    ) -> tuple:
@@ -10098,23 +10633,12 @@ class Scheduler:
                 self._clear_pipeline_runtime_state(task_id)
                 return {"response": "", "error": step_error}
 
-            # ---- Step 4: 从 logits 采样下一个 token ----
-            # logits shape: prefill=(1, prompt_len, vocab), decode=(1, 1, vocab)
-            # Phase 5 review H1: clamp temperature 防止除零导致 NaN
-            safe_temperature = max(temperature, 1e-8)
-            next_logits = logits[:, -1, :] / safe_temperature
-            probs = torch.softmax(next_logits, dim=-1)
-
-            # top-p (nucleus) sampling
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
-            cumsum = torch.cumsum(sorted_probs, dim=-1)
-            cutoff = (cumsum > top_p).float()
-            cutoff[..., 1:] = cutoff[..., :-1].clone()  # 右移一位
-            cutoff[..., 0] = 0  # 始终保留概率最高的 token
-            filtered_probs = sorted_probs * (1 - cutoff)
-            filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
-
-            new_token_id = sorted_indices[0, torch.multinomial(filtered_probs, 1)].item()
+            # ---- Step 4: 从 logits 选择下一个 token ----
+            # temperature=0 与单机路径一致采用贪心解码；正温度才执行
+            # FP32 top-p 采样并在进入 CUDA multinomial 前校验概率。
+            new_token_id = _sample_pipeline_token_id(
+                logits, temperature=temperature, top_p=top_p,
+            )
 
             # 检查 EOS
             if new_token_id in eos_ids:
@@ -10410,6 +10934,9 @@ class Scheduler:
         # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
         # 同时检查模型是否已加载，未加载时走回退路径（给出明确错误）。
         queue_timeout = kwargs.pop('_queue_timeout', PIPELINE_TIMEOUT)
+        model_sync_timeout = kwargs.pop(
+            '_pipeline_model_sync_timeout', PIPELINE_MODEL_SYNC_TIMEOUT,
+        )
         self._track_stream_output(kwargs)
         mgr = self._host
         if not mgr or not mgr.is_loaded:
@@ -10432,14 +10959,24 @@ class Scheduler:
             )
 
         # ---- 自动回退：节点不可用 → 全模型推理 ----
+        readiness = None
         try:
             pipeline_ready = self._all_pipeline_nodes_ready()
+            if not pipeline_ready:
+                readiness = self._synchronize_pipeline_workers_for_request(
+                    timeout=model_sync_timeout,
+                )
+                pipeline_ready = bool(readiness.get("ready"))
         except Exception:
+            logger.warning(
+                "请求前主从模型配置同步失败，将按未就绪处理",
+                exc_info=True,
+            )
             pipeline_ready = False
 
         if not pipeline_ready:
             try:
-                readiness = self._get_pipeline_readiness()
+                readiness = readiness or self._get_pipeline_readiness()
                 readiness_reason = readiness.get("reason") or "未知原因"
             except Exception:
                 readiness_reason = "就绪状态检查失败"

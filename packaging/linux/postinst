@@ -30,6 +30,10 @@ if [ -f "$APP_DIR/bin/qlh-launcher" ]; then
     # 创建 /usr/local/bin 符号链接
     ln -sf "$APP_DIR/bin/qlh-launcher" /usr/local/bin/qlh-launcher
 fi
+if [ -f "$APP_DIR/bin/bjtu" ]; then
+    chmod 755 "$APP_DIR/bin/bjtu"
+    ln -sf "$APP_DIR/bin/bjtu" /usr/local/bin/bjtu
+fi
 
 # 更新桌面数据库
 if command -v update-desktop-database &> /dev/null; then
@@ -50,7 +54,10 @@ echo "  应用目录: $APP_DIR"
 echo ""
 echo "  启动方式:"
 echo "    桌面: 在应用程序菜单中找到 QLH 边缘推理系统"
-echo "    命令行: qlh-launcher"
+echo "    图形 Launcher: qlh-launcher --gui"
+echo "    终端 Launcher: qlh-launcher --tui"
+echo "    普通界面: bjtu ui"
+echo "    TUI 管理: bjtu tui"
 echo "    无头模式: qlh-launcher --headless"
 echo ""
 echo "  首次使用前请下载模型文件（启动器会引导下载流程）"

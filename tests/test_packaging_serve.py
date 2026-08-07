@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 from pathlib import Path
 
 
@@ -56,9 +57,9 @@ def test_pc_installer_scan_excludes_android_packages_in_dist(tmp_path, monkeypat
     dist_dir.mkdir(parents=True)
     monkeypatch.setattr(serve, "DIST_DIR", str(dist_dir))
 
-    installer = dist_dir / "QLH-Edge-Inference-Setup-v0.1.7.exe"
-    full_apk = dist_dir / "QLH-Inference-v0.1.7-full-release.apk"
-    lite_apk = dist_dir / "QLH-Inference-v0.1.7-lite-release.apk"
+    installer = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.1.exe"
+    full_apk = dist_dir / "QLH-Inference-v0.1.8.1-full-release.apk"
+    lite_apk = dist_dir / "QLH-Inference-v0.1.8.1-lite-release.apk"
     installer.write_bytes(b"exe")
     full_apk.write_bytes(b"apk")
     lite_apk.write_bytes(b"apk")
@@ -66,7 +67,7 @@ def test_pc_installer_scan_excludes_android_packages_in_dist(tmp_path, monkeypat
     entries = serve._scan_pc_installers()
 
     assert entries == [
-        ("QLH-Edge-Inference-Setup-v0.1.7.exe", "/QLH-Edge-Inference-Setup-v0.1.7.exe", str(installer))
+        ("QLH-Edge-Inference-Setup-v0.1.8.1.exe", "/QLH-Edge-Inference-Setup-v0.1.8.1.exe", str(installer))
     ]
 
 
@@ -82,8 +83,8 @@ def test_android_download_scan_includes_dist_and_gradle_outputs(tmp_path, monkey
     monkeypatch.setattr(serve, "DIST_DIR", str(dist_dir))
     monkeypatch.setattr(serve, "ANDROID_OUTPUT_DIR", str(android_outputs))
 
-    full_apk = dist_dir / "QLH-Inference-v0.1.7-full-release.apk"
-    lite_apk = dist_dir / "QLH-Inference-v0.1.7-lite-release.apk"
+    full_apk = dist_dir / "QLH-Inference-v0.1.8.1-full-release.apk"
+    lite_apk = dist_dir / "QLH-Inference-v0.1.8.1-lite-release.apk"
     gradle_apk = gradle_release_dir / "app-full-release.apk"
     debug_apk = gradle_debug_dir / "app-full-debug.apk"
     full_apk.write_bytes(b"full")
@@ -94,11 +95,36 @@ def test_android_download_scan_includes_dist_and_gradle_outputs(tmp_path, monkey
     entries = serve._scan_android_downloads()
 
     assert entries == [
-        ("QLH-Inference-v0.1.7-full-release.apk", "/QLH-Inference-v0.1.7-full-release.apk", str(full_apk)),
-        ("QLH-Inference-v0.1.7-lite-release.apk", "/QLH-Inference-v0.1.7-lite-release.apk", str(lite_apk)),
+        ("QLH-Inference-v0.1.8.1-full-release.apk", "/QLH-Inference-v0.1.8.1-full-release.apk", str(full_apk)),
+        ("QLH-Inference-v0.1.8.1-lite-release.apk", "/QLH-Inference-v0.1.8.1-lite-release.apk", str(lite_apk)),
         (
             "android/app/build/outputs/apk/full/release/app-full-release.apk",
             "/android/apk/full/release/app-full-release.apk",
             str(gradle_apk),
         ),
     ]
+
+
+def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    current = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.1.exe"
+    old = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.exe"
+    full = dist_dir / "QLH-Inference-v0.1.8.1-full-release.apk"
+    current.write_bytes(b"current")
+    old.write_bytes(b"old")
+    full.write_bytes(b"full")
+    monkeypatch.setattr(serve, "_project_version", lambda: "0.1.8.1")
+    serve._SHA256_CACHE.clear()
+
+    manifest = serve.build_update_manifest(str(dist_dir))
+
+    assert manifest["schema_version"] == 1
+    assert manifest["tag"] == "0.1.8.1"
+    assert [item["name"] for item in manifest["assets"]] == [
+        current.name, full.name,
+    ]
+    assert manifest["assets"][0]["variant"] == "cpu"
+    assert manifest["assets"][0]["sha256"] == hashlib.sha256(b"current").hexdigest()
+    assert manifest["assets"][1]["variant"] == "full"
