@@ -1188,6 +1188,10 @@ class TaskGraphCoordinator:
     def register_provider(self, provider: ExecutionProvider) -> None:
         self._provider_registry.register(provider)
 
+    def replace_provider(self, provider: ExecutionProvider) -> None:
+        """Install a refreshed Provider object when no attempt is using it."""
+        self._provider_registry.replace(provider)
+
     def has_provider(self, provider_id: str) -> bool:
         return self._provider_registry.has_provider(provider_id)
 

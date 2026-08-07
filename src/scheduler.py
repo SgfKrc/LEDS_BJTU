@@ -40,6 +40,11 @@ from task_worker_adapter import (
     TaskWorkerControlPlane,
     remote_provider_id,
 )
+from diffusion.worker_adapter import (
+    DiffusionCoordinatorControlPlane,
+    DiffusionWorkerAdapter,
+    RemoteDiffusionProvider,
+)
 from task_worker_protocol import (
     PROTOCOL_VERSION as TASK_WORKER_PROTOCOL_VERSION,
     WorkerMessage,
@@ -89,6 +94,7 @@ from config import (
     PIPELINE_PREEMPT_MIN_TOKENS,         # 至少生成 N token 后才接受抢占
     PIPELINE_PREEMPT_MAX_OVERHEAD_MS,    # checkpoint 超限自动禁用
     TASK_WORKER_EXPERIMENTAL_ENABLED,
+    DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -1147,6 +1153,14 @@ class Scheduler:
         self._task_worker_control = TaskWorkerControlPlane(
             health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
         )
+        self._diffusion_worker_control = DiffusionCoordinatorControlPlane(
+            health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
+        )
+        self._diffusion_worker_lock = threading.RLock()
+        self._diffusion_worker_adapter: Optional[DiffusionWorkerAdapter] = None
+        self._diffusion_result_ingestor: Optional[Callable] = None
+        self._diffusion_task_dispatch_enabled = False
+        self._remote_diffusion_providers: dict[str, RemoteDiffusionProvider] = {}
         self._task_worker_refresh_lock = threading.Lock()
         self._task_worker_refresh_requested = False
         self._task_worker_refresh_generation = 0
@@ -3548,6 +3562,139 @@ class Scheduler:
             "max_concurrency": 1,
         }
 
+    def configure_diffusion_worker(
+        self, *, capabilities: dict, executor: Callable,
+    ) -> bool:
+        """Install an explicitly provided v3 image executor on a PC client.
+
+        Scheduler owns only TCP lifecycle here.  The caller supplies the
+        sidecar-backed executor, so importing Scheduler never loads Diffusers
+        or changes the LLM model lifecycle.
+        """
+        if self._effective_role() != "client":
+            return False
+        adapter = DiffusionWorkerAdapter(
+            node_id=self.get_effective_node_id(),
+            capabilities=dict(capabilities),
+            executor=executor,
+            send_message=self._send_task_worker_to_master,
+        )
+        with self._diffusion_worker_lock:
+            previous = self._diffusion_worker_adapter
+            self._diffusion_worker_adapter = adapter
+        if previous is not None:
+            previous.disconnect_coordinator()
+        return self._send_diffusion_worker_hello()
+
+    def clear_diffusion_worker(self) -> None:
+        """Remove the optional image worker before its local sidecar unloads."""
+        with self._diffusion_worker_lock:
+            adapter = self._diffusion_worker_adapter
+            self._diffusion_worker_adapter = None
+        if adapter is not None:
+            adapter.disconnect_coordinator()
+
+    def configure_diffusion_coordinator(
+        self, *, result_ingestor: Callable, dispatch_enabled: bool = False,
+    ) -> bool:
+        """Enable verified v3 response routing on a configured coordinator.
+
+        The callback owns Blob transfer and persistence.  Scheduler retains no
+        grant; API code may register the admitted Provider with TaskGraph when
+        ``dispatch_enabled`` is explicitly enabled.
+        """
+        if self._effective_role() != "master":
+            return False
+        with self._diffusion_worker_lock:
+            stale = list(self._remote_diffusion_providers.values())
+            self._remote_diffusion_providers.clear()
+            self._diffusion_result_ingestor = result_ingestor
+            self._diffusion_task_dispatch_enabled = bool(dispatch_enabled)
+        for provider in stale:
+            provider.close()
+        return True
+
+    def clear_diffusion_coordinator(self) -> None:
+        """Fence all optional v3 Providers before closing their data plane."""
+        with self._diffusion_worker_lock:
+            providers = list(self._remote_diffusion_providers.values())
+            self._remote_diffusion_providers.clear()
+            self._diffusion_result_ingestor = None
+            self._diffusion_task_dispatch_enabled = False
+        for provider in providers:
+            provider.close()
+
+    def _ensure_remote_diffusion_provider(
+        self, node_id: str,
+    ) -> RemoteDiffusionProvider | None:
+        with self._diffusion_worker_lock:
+            provider = self._remote_diffusion_providers.get(node_id)
+            if provider is not None:
+                return provider
+            ingestor = self._diffusion_result_ingestor
+            if ingestor is None or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+                return None
+            provider = RemoteDiffusionProvider(
+                node_id=node_id,
+                peer_snapshot=lambda bound_node=node_id: (
+                    self._diffusion_worker_control.worker_snapshot(bound_node)
+                ),
+                send_message=lambda message, bound_node=node_id: (
+                    self._send_task_worker_to_node(bound_node, message)
+                ),
+                result_ingestor=ingestor,
+                # The isolated Provider remains directly testable.  Product
+                # dispatch is controlled separately by TaskGraph registration
+                # and reported through _diffusion_task_dispatch_enabled.
+                dispatch_enabled=True,
+            )
+            self._remote_diffusion_providers[node_id] = provider
+            return provider
+
+    def remote_diffusion_providers(self) -> list[RemoteDiffusionProvider]:
+        """Return explicitly admitted v3 image Providers for a later graph bridge."""
+        with self._diffusion_worker_lock:
+            return [
+                self._remote_diffusion_providers[node_id]
+                for node_id in sorted(self._remote_diffusion_providers)
+            ]
+
+    def _send_diffusion_worker_hello(self, client=None) -> bool:
+        """Negotiate v3 only after a client has authenticated its TCP link."""
+        if (
+            self._effective_role() != "client"
+            or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+        ):
+            return False
+        target = client or getattr(self, "_tcp_client", None)
+        if not target or not getattr(target, "is_registered", False):
+            return False
+        with self._diffusion_worker_lock:
+            adapter = self._diffusion_worker_adapter
+        if adapter is None:
+            return False
+        try:
+            from tcp_comm import MessageType
+
+            message = adapter.begin_hello()
+            if message is None:
+                return False
+            target.send_data(message.snapshot(), MessageType.TASK_WORKER)
+            logger.info(
+                "event=diffusion_worker_hello_sent node_id=%s version=%s",
+                self.get_effective_node_id(), message.version,
+            )
+            return True
+        except Exception as exc:
+            adapter.disconnect_coordinator()
+            logger.warning(
+                "event=diffusion_worker_hello_failed node_id=%s error=%s",
+                self.get_effective_node_id(),
+                getattr(exc, "code", type(exc).__name__),
+                exc_info=True,
+            )
+            return False
+
     def _send_task_worker_hello(
         self, client=None, refresh_generation: int = 0,
     ) -> bool:
@@ -4083,6 +4230,9 @@ class Scheduler:
             return
         try:
             message = decode_task_worker_message(raw)
+            if message.version == 3:
+                self._handle_diffusion_worker_message(client_id, message)
+                return
             if self._effective_role() == "master":
                 if client_id == "master":
                     raise WorkerProtocolError(
@@ -4206,6 +4356,120 @@ class Scheduler:
                 client_id, type(exc).__name__, exc_info=True,
             )
 
+    def _handle_diffusion_worker_message(
+        self, client_id: str, message: WorkerMessage,
+    ) -> None:
+        """Route v3 image control without enabling image Stage dispatch."""
+        if not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "v3 image worker transport is disabled by configuration",
+                code="image_worker_experiment_disabled",
+                field="message_type",
+            )
+        if self._effective_role() == "client":
+            if client_id != "master":
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "image worker accepts control messages from master only",
+                    code="invalid_message_direction",
+                    field="message_type",
+                )
+            with self._diffusion_worker_lock:
+                adapter = self._diffusion_worker_adapter
+            if adapter is None:
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "no local image worker adapter is installed",
+                    code="image_worker_adapter_unconfigured",
+                    field="message_type",
+                )
+            raw = message.snapshot()
+            if message.message_type == "hello_ack":
+                adapter.receive_hello_ack(raw)
+            elif message.message_type == "stage_offer":
+                adapter.receive_offer(raw)
+            elif message.message_type == "lease_renew":
+                adapter.receive_lease_renew(raw)
+            elif message.message_type == "stage_cancel":
+                adapter.receive_cancel(raw)
+            else:
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "message is not valid in the image worker direction",
+                    code="invalid_message_direction",
+                    field="message_type",
+                )
+            return
+        if self._effective_role() != "master":
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "v3 image worker transport is not configured on this client",
+                code="image_worker_adapter_unconfigured",
+                field="message_type",
+            )
+        if client_id == "master":
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "master cannot register as its own image worker",
+                code="invalid_message_direction",
+                field="message_type",
+            )
+        with self._nodes_lock:
+            registered_node = self.nodes.get(client_id)
+            registered_role = getattr(
+                getattr(registered_node, "role", ""),
+                "value", getattr(registered_node, "role", ""),
+            )
+            admitted_pc_worker = bool(
+                registered_node is not None
+                and registered_node.node_type == "pc"
+                and registered_role == NodeRole.CLIENT.value
+            )
+        if not admitted_pc_worker:
+            self._diffusion_worker_control.record_rejection()
+            raise WorkerProtocolError(
+                "only a registered PC client may negotiate an image worker",
+                code="unsupported_worker_node",
+                field="payload.worker_kind",
+            )
+        if message.message_type == "hello":
+            ack = self._diffusion_worker_control.receive_hello(
+                client_id,
+                message.snapshot(),
+                coordinator_node_id=self.get_effective_node_id(),
+            )
+            self._send_task_worker_to_node(client_id, ack)
+            if ack.payload["accepted"]:
+                self._ensure_remote_diffusion_provider(client_id)
+            logger.info(
+                "event=diffusion_worker_hello_acked node_id=%s accepted=%s enabled=%s",
+                client_id,
+                ack.payload["accepted"],
+                DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+            )
+            return
+        if message.message_type in {
+            "stage_accept", "stage_result", "stage_error", "stage_cancelled",
+        }:
+            with self._diffusion_worker_lock:
+                provider = self._remote_diffusion_providers.get(client_id)
+            if provider is None:
+                self._diffusion_worker_control.record_rejection()
+                raise WorkerProtocolError(
+                    "v3 image Stage response arrived before coordinator admission",
+                    code="image_worker_dispatch_disabled",
+                    field="message_type",
+                )
+            provider.handle_message(message.snapshot())
+            return
+        self._diffusion_worker_control.record_rejection()
+        raise WorkerProtocolError(
+            "message is not valid in the image coordinator direction",
+            code="invalid_message_direction",
+            field="message_type",
+        )
+
     def get_task_worker_protocol_status(self) -> dict:
         runtime = self._task_worker_control.status(role=self._effective_role())
         connected = bool(runtime.get("control_plane_connected", False))
@@ -4227,6 +4491,64 @@ class Scheduler:
             ),
         })
         return worker_protocol_status(runtime)
+
+    def get_diffusion_worker_protocol_status(self) -> dict:
+        """Report v3 image control routing without claiming dispatch support."""
+        with self._diffusion_worker_lock:
+            adapter = self._diffusion_worker_adapter
+            providers = list(self._remote_diffusion_providers.values())
+            provider_ids = sorted(provider.provider_id for provider in providers)
+            result_ingestor_ready = self._diffusion_result_ingestor is not None
+            dispatch_enabled = self._diffusion_task_dispatch_enabled
+        dispatch_available = False
+        for provider in providers:
+            try:
+                capabilities = provider.inspect()
+            except Exception:
+                continue
+            if capabilities.healthy and capabilities.available:
+                dispatch_available = True
+                break
+        if self._effective_role() == "client" and adapter is not None:
+            runtime = adapter.status()
+            runtime["worker_adapter_registered"] = True
+        else:
+            runtime = self._diffusion_worker_control.status()
+            runtime["worker_adapter_registered"] = False
+        runtime.update({
+            "phase": "SD-N3.4",
+            "experiment_enabled": DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+            "transport_routing_enabled": DIFFUSION_WORKER_EXPERIMENTAL_ENABLED,
+            "stage_response_routing_enabled": bool(
+                DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                and self._effective_role() == "master"
+                and result_ingestor_ready
+            ),
+            "coordinator_result_ingestor_ready": bool(
+                self._effective_role() == "master" and result_ingestor_ready
+            ),
+            "admitted_provider_ids": provider_ids,
+            "task_dispatch_enabled": bool(
+                DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                and self._effective_role() == "master"
+                and result_ingestor_ready
+                and dispatch_enabled
+            ),
+            "task_dispatch_available": dispatch_available,
+            "adapter_connected": False,
+            "admission_state": (
+                "n3_4_provider_bridge_ready"
+                if (
+                    DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                    and self._effective_role() == "master"
+                    and result_ingestor_ready
+                )
+                else "n3_3_transport_only"
+                if DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+                else "n3_3_experiment_disabled"
+            ),
+        })
+        return runtime
 
     def _on_tcp_message(self, client_id: str, msg: dict) -> None:
         """
@@ -4296,6 +4618,7 @@ class Scheduler:
         elif msg_type == "heartbeat":
             if self._effective_role() == "master":
                 self._task_worker_control.mark_worker_heartbeat(client_id)
+                self._diffusion_worker_control.mark_heartbeat(client_id)
             with self._nodes_lock:
                 if client_id in self.nodes:
                     self.nodes[client_id].last_heartbeat = time.time()
@@ -4861,6 +5184,11 @@ class Scheduler:
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
         self._task_worker_control.disconnect_worker(client_id)
+        self._diffusion_worker_control.disconnect_worker(client_id)
+        with self._diffusion_worker_lock:
+            diffusion_provider = self._remote_diffusion_providers.get(client_id)
+        if diffusion_provider is not None:
+            diffusion_provider.notify_disconnect()
         with self._task_worker_stage_lock:
             remote_provider = self._remote_task_worker_providers.get(client_id)
         if remote_provider is not None:
@@ -4914,6 +5242,10 @@ class Scheduler:
             return
 
         self._task_worker_control.disconnect_coordinator()
+        with self._diffusion_worker_lock:
+            diffusion_adapter = self._diffusion_worker_adapter
+        if diffusion_adapter is not None:
+            diffusion_adapter.disconnect_coordinator()
         with self._task_worker_stage_lock:
             for active in self._task_worker_active_attempts.values():
                 active.cancel_reason = "coordinator_disconnected"
@@ -6602,6 +6934,7 @@ class Scheduler:
                 except Exception:
                     pass
                 self._send_task_worker_hello(client)
+                self._send_diffusion_worker_hello(client)
 
                 logger.info(f"✅ 从节点 {node_id} 已连接到主节点 {master_host}:{master_port}")
                 return {
@@ -6647,6 +6980,7 @@ class Scheduler:
                         except Exception:
                             pass
                         self._send_task_worker_hello(client)
+                        self._send_diffusion_worker_hello(client)
                         logger.info(
                             "✅ 从节点 %s 刷新配置后已连接到主节点 %s:%s",
                             node_id, master_host, master_port,
