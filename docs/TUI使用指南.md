@@ -6,7 +6,7 @@
 >
 > **生命周期**：Active（在用）
 >
-> **更新日期**：2026-08-03
+> **更新日期**：2026-08-08
 >
 > **适用范围**：QLH 终端版管理菜单（`src/tui_admin.py`）与全局 `bjtu` 命令的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
 
@@ -20,7 +20,7 @@ TUI 是**纯 HTTP 客户端**：所有数据来自后端 API（默认 `http://12
 
 ## 二、全局 `bjtu` 命令（推荐）
 
-把一键启动封装为全局命令 `bjtu`：**在任何目录的终端输入 `bjtu` 即可自动启动后端 + TUI**（无需先进入项目目录）。
+把一键启动封装为全局命令 `bjtu`：**在任何目录的终端输入 `bjtu` 即可自动启动后端 + TUI**（无需先进入项目目录）。新增的 `bjtu launcher` 是统一选择入口，启动器和 TUI 使用同一套深色信息层级、后端健康检查、模型检查与错误处理；没有图形环境时自动降级为终端选择页。
 
 ### 安装（一次性）
 
@@ -43,10 +43,15 @@ sudo ln -s /path/to/qlh/bjtu.sh /usr/local/bin/bjtu
 ### 用法
 
 ```bash
-bjtu                                # 启动后端 + TUI（等价 start_tui 一键启动）
+bjtu                                # 启动后端 + TUI（保持原有默认行为）
+bjtu launcher                       # 显式打开统一选择页
+bjtu ui                             # 直接启动普通 Web/Windows 原生界面
+bjtu tui                            # 启动后端并进入 TUI 管理界面
 bjtu --host 100.x.x.x               # 启动后端后，TUI 管理远程主节点
 bjtu --plain                        # 纯文本编号菜单
 ```
+
+`bjtu launcher` 在 Windows 安装包中显示原生选择页，按钮选择后继续使用同一启动进度页；Linux、SSH、旧终端或无图形环境显示编号选择页。`bjtu ui` 与 `bjtu tui` 是脚本/自动化场景使用的确定性入口，不依赖人工选择。
 
 **单命令模式**（执行一条 TUI 命令后立即退出，**不会自动启动后端**；后端未运行时提示"后端未在运行"并以退出码 1 结束）：
 
@@ -61,7 +66,7 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 > 单命令模式与交互模式的区别：交互模式负责"启动后端 + 进入 TUI"；单命令模式只做"处理"，后端必须已在运行（可用 `bjtu` 交互模式或 `start_tui.bat` 先启动）。命令名/别名清单与 TUI 内 `/` 命令集一致（见 [TUI指令集.md](TUI指令集.md)）。
 > ⚠️ 命令必须是**第一个参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）会被当作交互模式（可能启动后端）。
 
-行为与 `start_tui.bat` / `start_tui.sh` 完全相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行（Windows 关闭"QLH 后端 API"窗口停止；Linux/macOS `kill "$(cat logs/backend_tui.pid)"`）。
+`bjtu tui` 的后端生命周期行为与 `start_tui.bat` / `start_tui.sh` 相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行。`bjtu ui` 则在相同检查完成后打开普通界面。
 
 ## 三、一键启动（start_tui.bat / start_tui.sh）
 

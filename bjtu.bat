@@ -3,7 +3,7 @@ chcp 65001 >nul
 rem ============================================================
 rem  QLH global bjtu command (Windows)
 rem
-rem  Usage: bjtu [tui_admin.py args...]
+rem  Usage: bjtu [launcher|ui|tui|chat|tui_admin.py args...]
 rem         bjtu --help       查看 TUI 命令集与启动参数（不启动后端）
 rem
 rem  One-click launch: start backend (if not running), wait until
@@ -17,6 +17,7 @@ rem ============================================================
 cd /d "%~dp0"
 
 if not exist "src\api_server.py" (
+    if exist "QLH-Edge-Inference.exe" goto :packaged_launcher
     echo [ERROR] bjtu.bat must be placed in the QLH project root.
     echo         Current dir: %~dp0
     pause
@@ -30,7 +31,30 @@ if /i "%~1"=="-h" goto :help
 rem ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
 if /i "%~1"=="chat" goto :chat
 
+rem ---- unified launcher modes ----
+if /i "%~1"=="launcher" goto :launcher
+if /i "%~1"=="ui" goto :ui
+if /i "%~1"=="tui" goto :tui
+
 call start_tui.bat %*
+exit /b %errorlevel%
+
+:packaged_launcher
+if /i "%~1"=="--help" goto :help
+if /i "%~1"=="-h" goto :help
+if /i "%~1"=="chat" (
+    echo [ERROR] 当前安装包未携带 Textual 聊天页，请使用项目环境中的 bjtu chat。
+    exit /b 2
+)
+if /i "%~1"=="tui" (
+    QLH-Edge-Inference.exe --tui %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+if /i "%~1"=="ui" (
+    QLH-Edge-Inference.exe --ui %2 %3 %4 %5 %6
+    exit /b %errorlevel%
+)
+QLH-Edge-Inference.exe --tui %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :chat
@@ -48,7 +72,32 @@ set PYTHONIOENCODING=utf-8
 %PYTHON_CMD% src\tui_chat.py %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
+:launcher
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\launcher.py --launcher %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:ui
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\launcher.py --ui %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:tui
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\launcher.py --tui %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
 :help
+echo QLH BJTU 统一入口:
+echo   bjtu launcher   启动选择页（普通界面 / TUI）
+echo   bjtu ui         直接启动普通 Web/原生界面
+echo   bjtu tui        启动后端并进入 TUI 管理界面
+echo   bjtu chat       进入终端对话页
+echo   bjtu status     执行 TUI 单命令（不自动启动后端）
+echo.
 set "PYTHON_CMD=python"
 where python >nul 2>nul
 if not %errorlevel%==0 (

@@ -601,8 +601,8 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 
 | 版本 | 安装包 | 典型大小 | 适用场景 |
 |------|--------|---------|---------|
-| **CPU 版** | `qlh-edge-inference-cpu_0.1.7_amd64.deb` | ~200 MB | CPU / 集成显卡节点 |
-| **CUDA 版** | `qlh-edge-inference-cuda_0.1.7_amd64.deb` | ~1.8 GB | NVIDIA GPU 节点 |
+| **CPU 版** | `qlh-edge-inference-cpu_0.1.8.1_amd64.deb` | ~200 MB | CPU / 集成显卡节点 |
+| **CUDA 版** | `qlh-edge-inference-cuda_0.1.8.1_amd64.deb` | ~1.8 GB | NVIDIA GPU 节点 |
 
 **构建**（需 Ubuntu/Debian 环境）：
 
@@ -615,7 +615,7 @@ bash build-deb.sh cuda    # 独显版
 **安装**：
 
 ```bash
-sudo dpkg -i qlh-edge-inference-cpu_0.1.7_amd64.deb
+sudo dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 # 安装后自动注册 systemd 服务、桌面入口和 /usr/local/bin/qlh-launcher
 ```
 

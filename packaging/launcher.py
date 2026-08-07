@@ -90,6 +90,61 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("launcher")
+_ACTIVE_STARTUP_SPLASH = None
+
+
+def _startup_timeout_seconds() -> float:
+    """Return the API startup timeout, tolerating an invalid environment value."""
+    raw_value = os.environ.get("QLH_STARTUP_TIMEOUT", "60")
+    try:
+        return max(15.0, float(raw_value))
+    except (TypeError, ValueError):
+        logger.warning("忽略无效的 QLH_STARTUP_TIMEOUT=%r", raw_value)
+        return 60.0
+
+
+def _launcher_log_hint() -> str:
+    base_dir = (
+        os.path.dirname(os.path.abspath(sys.executable))
+        if getattr(sys, "frozen", False)
+        else os.path.abspath(os.path.join(_launcher_dir, ".."))
+    )
+    return os.path.join(base_dir, "logs")
+
+
+def _requested_launch_mode(argv: list[str]) -> str:
+    """Resolve the public launcher flags while rejecting ambiguous modes."""
+    aliases = {
+        "--launcher": "launcher",
+        "--ui": "ui",
+        "--web": "ui",
+        "--tui": "tui",
+    }
+    requested = {aliases[arg] for arg in argv if arg in aliases}
+    if len(requested) > 1:
+        raise ValueError("--launcher、--ui/--web 与 --tui 不能同时使用")
+    return next(iter(requested), "launcher")
+
+
+def _choose_terminal_launch_mode(default: str = "ui") -> str | None:
+    """Text fallback for Linux, old Windows, SSH and redirected sessions."""
+    print("=" * 60)
+    print("  QLH 边缘推理系统 · BJTU")
+    print("  轻量化大模型分布式边缘推理优化系统")
+    print("-" * 60)
+    print("  [1] 普通界面    Web / 原生窗口")
+    print("  [2] TUI 管理    终端集群管理")
+    print("  [Q] 退出")
+    print("=" * 60)
+    if not _has_interactive_stdin():
+        logger.info("当前终端不可交互，自动选择 %s", default)
+        return default
+    choice = (_safe_input("请选择启动方式 [1]: ", default="1") or "1").strip().lower()
+    if choice in {"2", "tui"}:
+        return "tui"
+    if choice in {"q", "quit", "exit"}:
+        return None
+    return "ui"
 
 
 def _startup_icon_path() -> str:
@@ -100,16 +155,21 @@ def _startup_icon_path() -> str:
 
 
 class _StartupSplash:
-    """Small native Windows startup window shown before WebView is available."""
+    """Native Windows launcher/boot window shared by Web UI and TUI."""
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, select_mode: bool = False):
         self.enabled = bool(enabled and IS_WINDOWS)
+        self.select_mode = bool(select_mode)
         self._thread = None
         self._ready = threading.Event()
         self._closed = threading.Event()
+        self._mode_selected = threading.Event()
         self._lock = threading.Lock()
-        self._status = "正在启动应用..."
+        self._status = (
+            "请选择启动方式" if self.select_mode else "正在启动应用..."
+        )
         self._progress = 2
+        self._selected_mode = None
         self._hwnd = None
         self._status_hwnd = None
         self._progress_hwnd = None
@@ -131,6 +191,15 @@ class _StartupSplash:
         self._thread.start()
         self._ready.wait(timeout=0.8)
         return self
+
+    def choose_mode(self, default: str = "ui") -> str | None:
+        """Wait for the native mode picker or use a terminal fallback."""
+        if not self.select_mode:
+            return default
+        if self.enabled and self._ready.is_set():
+            self._mode_selected.wait()
+            return self._selected_mode
+        return _choose_terminal_launch_mode(default=default)
 
     def update(self, progress: int, status: str) -> None:
         with self._lock:
@@ -280,12 +349,14 @@ class _StartupSplash:
             )
             comctl32.InitCommonControlsEx(ctypes.byref(controls))
 
-            background = gdi32.CreateSolidBrush(0x00FAFAFA)
+            # Keep the launcher visually aligned with the React/TUI dark shell.
+            background = gdi32.CreateSolidBrush(0x000C0B0B)
             hinstance = kernel32.GetModuleHandleW(None)
             class_name = f"QLHStartupSplash_{os.getpid()}"
 
             WM_CLOSE = 0x0010
             WM_DESTROY = 0x0002
+            WM_CTLCOLORBTN = 0x0135
             WM_CTLCOLORSTATIC = 0x0138
             TRANSPARENT = 1
 
@@ -297,15 +368,35 @@ class _StartupSplash:
                 wintypes.LPARAM,
             )
 
+            ui_button = None
+            tui_button = None
+
             def window_proc(hwnd, message, wparam, lparam):
+                if message == 0x0111:  # WM_COMMAND
+                    command_id = int(wparam) & 0xFFFF
+                    if command_id in (1001, 1002):
+                        self._selected_mode = "ui" if command_id == 1001 else "tui"
+                        self._mode_selected.set()
+                        if ui_button:
+                            user32.ShowWindow(ui_button, 0)
+                        if tui_button:
+                            user32.ShowWindow(tui_button, 0)
+                        if self._progress_hwnd:
+                            user32.ShowWindow(self._progress_hwnd, 5)
+                        if self._percent_hwnd:
+                            user32.ShowWindow(self._percent_hwnd, 5)
+                        self.update(5, "正在初始化运行环境...")
+                        return 0
                 if message == WM_CLOSE:
                     user32.DestroyWindow(hwnd)
                     return 0
                 if message == WM_DESTROY:
+                    self._mode_selected.set()
                     user32.PostQuitMessage(0)
                     return 0
-                if message == WM_CTLCOLORSTATIC:
+                if message in (WM_CTLCOLORSTATIC, WM_CTLCOLORBTN):
                     gdi32.SetBkMode(wparam, TRANSPARENT)
+                    gdi32.SetTextColor(wparam, 0x00F5F5F5)
                     return background
                 return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
@@ -327,7 +418,7 @@ class _StartupSplash:
             hwnd = user32.CreateWindowExW(
                 0x00040000,
                 class_name,
-                "QLH 正在启动",
+                "QLH · BJTU 启动器",
                 0x80000000 | 0x00800000,
                 left,
                 top,
@@ -342,7 +433,9 @@ class _StartupSplash:
                 raise ctypes.WinError()
             self._hwnd = hwnd
 
-            def create_control(class_value, text, style, x, y, w, h):
+            def create_control(
+                class_value, text, style, x, y, w, h, control_id=0,
+            ):
                 return user32.CreateWindowExW(
                     0,
                     class_value,
@@ -353,7 +446,7 @@ class _StartupSplash:
                     w,
                     h,
                     hwnd,
-                    None,
+                    control_id,
                     hinstance,
                     None,
                 )
@@ -376,8 +469,24 @@ class _StartupSplash:
                 "STATIC", f"{self._progress}%", 0x00000002, 432, 208, 62, 24,
             )
             footer_control = create_control(
-                "STATIC", "正在准备本地服务，请稍候", 0, 40, 239, 300, 24,
+                "STATIC",
+                (
+                    "也可使用 bjtu ui 或 bjtu tui 直接启动"
+                    if self.select_mode
+                    else "正在准备本地服务，请稍候"
+                ),
+                0, 40, 239, 420, 24,
             )
+            if self.select_mode:
+                ui_button = create_control(
+                    "BUTTON", "普通界面", 0x00000001, 40, 176, 215, 48,
+                    1001,
+                )
+                tui_button = create_control(
+                    "BUTTON", "TUI 管理", 0, 280, 176, 215, 48, 1002,
+                )
+                user32.ShowWindow(self._progress_hwnd, 0)
+                user32.ShowWindow(self._percent_hwnd, 0)
 
             title_font = gdi32.CreateFontW(
                 -27, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0,
@@ -399,10 +508,22 @@ class _StartupSplash:
                 self._percent_hwnd,
             ):
                 user32.SendMessageW(control, 0x0030, text_font, True)
+            for control in (ui_button, tui_button):
+                if control:
+                    user32.SendMessageW(control, 0x0030, text_font, True)
             user32.SendMessageW(footer_control, 0x0030, small_font, True)
 
             user32.SendMessageW(self._progress_hwnd, 0x0406, 0, 100)
             user32.SendMessageW(self._progress_hwnd, 0x0402, self._progress, 0)
+            user32.SendMessageW(self._progress_hwnd, 0x0409, 0, 0x00F5F5F5)
+            user32.SendMessageW(self._progress_hwnd, 0x2001, 0, 0x00363030)
+            try:
+                uxtheme = ctypes.windll.uxtheme
+                for control in (ui_button, tui_button, self._progress_hwnd):
+                    if control:
+                        uxtheme.SetWindowTheme(control, "DarkMode_Explorer", None)
+            except Exception:
+                pass
 
             icon_handle = wintypes.HICON()
             icon_id = wintypes.UINT()
@@ -427,6 +548,7 @@ class _StartupSplash:
 
             try:
                 corner = ctypes.c_int(2)
+                dark_mode = ctypes.c_int(1)
                 dwmapi = ctypes.windll.dwmapi
                 dwmapi.DwmSetWindowAttribute.argtypes = [
                     wintypes.HWND,
@@ -436,6 +558,9 @@ class _StartupSplash:
                 ]
                 dwmapi.DwmSetWindowAttribute(
                     hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner),
+                )
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, 20, ctypes.byref(dark_mode), ctypes.sizeof(dark_mode),
                 )
             except Exception:
                 pass
@@ -465,6 +590,7 @@ class _StartupSplash:
             self._status_hwnd = None
             self._progress_hwnd = None
             self._percent_hwnd = None
+            self._mode_selected.set()
             try:
                 if user32 is not None and icon_handle:
                     user32.DestroyIcon(icon_handle)
@@ -645,6 +771,27 @@ def _show_dialog(title: str, message: str,
         return _show_windows_messagebox(title, message, flags, owner_hwnd)
     else:
         return _cli_dialog(title, message, buttons)
+
+
+def _show_startup_failure(
+    title: str,
+    message: str,
+    startup_splash: _StartupSplash | None = None,
+) -> None:
+    """Keep startup failures visible in windowed PyInstaller builds."""
+    if startup_splash:
+        startup_splash.update(100, "启动失败，请查看错误信息")
+    logger.error("%s: %s", title, message)
+    if startup_splash and startup_splash.enabled:
+        _show_dialog(title, message, buttons="ok", owner_hwnd=startup_splash.hwnd)
+    elif not getattr(sys, "frozen", False) or _has_interactive_stdin():
+        _safe_pause(f"{title}: {message}\n按 Enter 键退出...")
+    else:
+        # A headless packaged process cannot display a dialog; the log remains
+        # the durable diagnostic channel and the process exits deterministically.
+        print(f"{title}: {message}", file=sys.stderr)
+    if startup_splash:
+        startup_splash.close()
 
 
 def _open_url(url: str):
@@ -1076,13 +1223,31 @@ def _run_pywebview(url: str, title: str,
             confirm_close=False,
         )
 
-        def on_closed():
-            logger.info("窗口已关闭，程序退出。")
+        splash_closed = threading.Event()
 
-        def on_started():
-            if startup_splash:
+        def close_startup_splash(*_args):
+            if startup_splash and not splash_closed.is_set():
+                splash_closed.set()
                 startup_splash.close()
 
+        def on_started():
+            # The GUI loop being ready does not mean the page has rendered. Keep
+            # the startup window until pywebview reports a completed page load.
+            timer = threading.Timer(20.0, close_startup_splash)
+            timer.daemon = True
+            timer.start()
+
+        if hasattr(window.events, "loaded"):
+            window.events.loaded += close_startup_splash
+        else:
+            logger.warning("pywebview 不提供 loaded 事件，使用启动页超时兜底")
+
+        def on_closed():
+            close_startup_splash()
+            logger.info("窗口已关闭，程序退出。")
+
+        # Override the earlier handler so closing a window during navigation also
+        # tears down the splash immediately.
         window.events.closed += on_closed
         webview.start(on_started, gui='edgechromium', debug=False)
     except Exception as e:
@@ -1090,6 +1255,63 @@ def _run_pywebview(url: str, title: str,
         if startup_splash:
             startup_splash.close()
         _launch_browser(url)
+
+
+def _ensure_tui_console() -> bool:
+    """Attach a console for a windowed Windows build before entering TUI."""
+    if _has_interactive_stdin():
+        return True
+    if not IS_WINDOWS or not getattr(sys, "frozen", False):
+        return False
+    try:
+        import ctypes
+
+        if not ctypes.windll.kernel32.AllocConsole():
+            return False
+        sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        sys.stdout = open(
+            "CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1,
+        )
+        sys.stderr = open(
+            "CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1,
+        )
+        ctypes.windll.kernel32.SetConsoleTitleW("QLH · BJTU TUI 管理")
+        return True
+    except Exception:
+        logger.exception("无法为 TUI 创建控制台")
+        return False
+
+
+def _run_tui(
+    api_port: int, startup_splash: _StartupSplash | None = None,
+) -> int:
+    """Enter the existing management TUI after the shared backend is ready."""
+    if startup_splash:
+        startup_splash.close()
+    if not _ensure_tui_console():
+        _show_dialog(
+            "TUI 无法启动",
+            "当前环境没有可交互终端。请在终端运行 bjtu tui，"
+            "或改用普通界面。",
+            buttons="ok",
+        )
+        return 1
+    from tui_admin import main as tui_main
+
+    print("QLH 服务已就绪，正在进入 BJTU TUI 管理界面……")
+    return int(tui_main(["--port", str(api_port)]) or 0)
+
+
+def _run_selected_interface(
+    mode: str, url: str, title: str, startup_splash: _StartupSplash | None = None,
+) -> int:
+    if mode == "tui":
+        from urllib.parse import urlparse
+
+        api_port = urlparse(url).port or 8000
+        return _run_tui(api_port, startup_splash=startup_splash)
+    _run_ui(url=url, title=title, startup_splash=startup_splash)
+    return 0
 
 
 def _launch_browser(url: str):
@@ -1192,16 +1414,32 @@ def main():
     """启动器主入口（跨平台）。
 
     CLI 参数:
+      --launcher    显示统一入口选择页（普通界面 / TUI）
+      --ui          直接打开普通 Web/原生界面
+      --tui         启动后端后进入终端管理界面
       --headless    跳过浏览器/窗口，仅后台运行 API 服务器（适合 systemd / 无头部署）
       --check-only  仅检查环境，打印状态后退出（CI/测试用）
     """
     headless = "--headless" in sys.argv
     check_only = "--check-only" in sys.argv
+    try:
+        launch_mode = _requested_launch_mode(sys.argv[1:])
+    except ValueError as exc:
+        _show_dialog("启动参数冲突", str(exc), buttons="ok")
+        return
+    if headless or check_only:
+        launch_mode = "headless"
     startup_splash = _StartupSplash(
         enabled=not headless and not check_only,
+        select_mode=launch_mode == "launcher",
     ).start()
     import atexit
     atexit.register(startup_splash.close)
+    if launch_mode == "launcher":
+        launch_mode = startup_splash.choose_mode(default="ui")
+        if launch_mode is None:
+            startup_splash.close()
+            return
     startup_splash.update(5, "正在初始化运行环境...")
     from config import API_PORT
 
@@ -1214,7 +1452,8 @@ def main():
                 logger.info("已有 QLH 服务正在运行，无头启动直接复用")
             else:
                 startup_splash.update(100, "正在打开应用窗口...")
-                _run_ui(
+                _run_selected_interface(
+                    launch_mode,
                     url=f"http://localhost:{API_PORT}",
                     title="轻量化大模型分布式边缘推理系统",
                     startup_splash=startup_splash,
@@ -1350,23 +1589,27 @@ def main():
     server_thread = threading.Thread(target=run_server, daemon=True, name="uvicorn")
     server_thread.start()
 
-    # 等待服务器就绪（最多 15 秒）
+    # 等待服务器就绪。首次导入 torch/transformers 时可能超过 15 秒；
+    # 启动页持续显示阶段，超时后给出可见错误而不是静默退出。
     print("等待 API 服务器就绪...")
     import urllib.request
     server_ready = False
-    for i in range(150):
+    startup_timeout = _startup_timeout_seconds()
+    poll_interval = 0.1
+    poll_count = max(1, int(startup_timeout / poll_interval))
+    for i in range(poll_count):
         time.sleep(0.1)
         if i % 5 == 0:
             startup_splash.update(
-                72 + min(20, int(i / 150 * 20)),
+                72 + min(20, int(i / poll_count * 20)),
                 "正在等待本地服务就绪...",
             )
         if _server_error:
-            startup_splash.close()
-            print("\n服务器线程崩溃，错误信息:\n")
-            print(_server_error[-1])
-            print("\n按 Enter 键退出...")
-            _safe_input(default="")
+            _show_startup_failure(
+                "QLH 服务启动失败",
+                f"{_server_error[0]}\n\n详细日志目录：{_launcher_log_hint()}",
+                startup_splash,
+            )
             sys.exit(1)
         try:
             resp = urllib.request.urlopen(f"http://localhost:{API_PORT}", timeout=0.5)
@@ -1377,13 +1620,18 @@ def main():
             if i % 20 == 19:
                 print(f"  等待中... ({int(i * 0.1 + 1)}s)")
     if not server_ready:
-        startup_splash.close()
         if _server_error:
-            print(f"\n服务器启动失败: {_server_error[0]}")
+            detail = _server_error[0]
         else:
-            print("\n服务器启动超时（15秒）。")
-        print("按 Enter 键退出...")
-        _safe_input(default="")
+            detail = (
+                f"本地服务在 {startup_timeout:.0f} 秒内没有响应。"
+                "\n可能仍在加载模型或数据库，请查看日志后重试。"
+            )
+        _show_startup_failure(
+            "QLH 服务启动超时",
+            f"{detail}\n\n详细日志目录：{_launcher_log_hint()}",
+            startup_splash,
+        )
         sys.exit(1)
 
     print(f"API 服务器已就绪: http://localhost:{API_PORT}")
@@ -1403,7 +1651,8 @@ def main():
         print()
         print("启动用户界面...")
         startup_splash.update(100, "正在打开应用窗口...")
-        _run_ui(
+        _run_selected_interface(
+            launch_mode,
             url=f"http://localhost:{API_PORT}",
             title="轻量化大模型分布式边缘推理系统",
             startup_splash=startup_splash,

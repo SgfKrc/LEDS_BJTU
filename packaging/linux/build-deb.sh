@@ -13,14 +13,14 @@
 #   4. dpkg-deb 可用
 #
 # 输出:
-#   packaging/linux/qlh-edge-inference-cpu_0.1.8_amd64.deb
-#   packaging/linux/qlh-edge-inference-cuda_0.1.8_amd64.deb
+#   packaging/linux/qlh-edge-inference-cpu_0.1.8.1_amd64.deb
+#   packaging/linux/qlh-edge-inference-cuda_0.1.8.1_amd64.deb
 # ================================================================
 
 set -euo pipefail
 
 VARIANT="${1:-cpu}"
-VERSION="0.1.8"
+VERSION="0.1.8.1"
 ARCH="amd64"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -75,6 +75,8 @@ cp -r "$SRC_DIR"/* "$BUILD_DIR/opt/qlh-edge-inference/src/"
 cp -r "$FRONTEND_DIR/dist"/* "$BUILD_DIR/opt/qlh-edge-inference/frontend/dist/"
 cp "$SCRIPT_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
+cp "$SCRIPT_DIR/bjtu" "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
+chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
 # 将 launcher.py 复制为启动器包装器引用的模块
 cp "$PACKAGING_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/__launcher_main__.py"
 

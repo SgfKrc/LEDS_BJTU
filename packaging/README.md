@@ -178,15 +178,15 @@ python serve.py
 
 | 文件 | 字段 | 示例 |
 |------|------|------|
-| `src/__init__.py` | `__version__` | `"0.1.7"` |
-| `src/api_server.py` | `version=` | `"0.1.7"` |
-| `packaging/setup.iss` | `MyAppVersion` | `"0.1.7"` |
-| `packaging/setup-cuda.iss` | `MyAppVersion` | `"0.1.7"` |
-| `packaging/build-installer.bat` | 安装包文件名 | `v0.1.7` |
-| `packaging/linux/build-deb.sh` | `VERSION=` | `0.1.7` |
-| `packaging/linux/control-cpu` | `Version:` | `0.1.7` |
-| `packaging/linux/control-cuda` | `Version:` | `0.1.7` |
-| `android/app/build.gradle.kts` | `versionName` / `versionCode` | `"0.1.7"` / `3` |
+| `src/__init__.py` | `__version__` | `"0.1.8.1"` |
+| `src/api_server.py` | `version=` | `"0.1.8.1"` |
+| `packaging/setup.iss` | `MyAppVersion` | `"0.1.8.1"` |
+| `packaging/setup-cuda.iss` | `MyAppVersion` | `"0.1.8.1"` |
+| `packaging/build-installer.bat` | 安装包文件名 | `v0.1.8.1` |
+| `packaging/linux/build-deb.sh` | `VERSION=` | `0.1.8.1` |
+| `packaging/linux/control-cpu` | `Version:` | `0.1.8.1` |
+| `packaging/linux/control-cuda` | `Version:` | `0.1.8.1` |
+| `android/app/build.gradle.kts` | `versionName` / `versionCode` | `"0.1.8.1"` / `5` |
 
 ## 杀软误报处理
 
@@ -227,7 +227,7 @@ A: 先确认卸载了旧版并手动删除了安装目录，再重新安装。�
 
 ---
 
-## Ubuntu Linux .deb 打包（v0.1.7 新增）
+## Ubuntu Linux .deb 打包（v0.1.8.1）
 
 ### 目录结构
 
@@ -251,6 +251,7 @@ packaging/linux/
 /opt/qlh-edge-inference/
 ├── bin/
 │   ├── qlh-launcher              ← Python 3 包装器
+│   ├── bjtu                      ← BJTU 统一入口（launcher/ui/tui）
 │   └── __launcher_main__.py      ← 启动器主模块
 ├── src/                          ← Python 源码
 ├── frontend/dist/                ← React 构建产物
@@ -261,6 +262,7 @@ packaging/linux/
 /usr/share/icons/hicolor/256x256/apps/qlh.png
 /usr/lib/systemd/user/qlh-edge-inference.service
 /usr/local/bin/qlh-launcher → ../../opt/qlh-edge-inference/bin/qlh-launcher
+/usr/local/bin/bjtu → ../../opt/qlh-edge-inference/bin/bjtu
 ```
 
 ### 快速开始
@@ -275,20 +277,20 @@ sudo apt install python3 python3-venv python3-pip dpkg-dev zenity
 cd packaging/linux
 chmod +x build-deb.sh
 ./build-deb.sh cpu
-# 输出: qlh-edge-inference-cpu_0.1.7_amd64.deb
+# 输出: qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 ```
 
 **构建独显版 .deb**:
 ```bash
 ./build-deb.sh cuda
-# 输出: qlh-edge-inference-cuda_0.1.7_amd64.deb
+# 输出: qlh-edge-inference-cuda_0.1.8.1_amd64.deb
 ```
 
 ### 安装与卸载
 
 ```bash
 # 安装
-sudo dpkg -i qlh-edge-inference-cpu_0.1.7_amd64.deb
+sudo dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 sudo apt-get install -f   # 修复可能未满足的依赖
 
 # 运行 (桌面)
@@ -296,6 +298,11 @@ qlh-launcher
 
 # 运行 (无头模式)
 qlh-launcher --headless
+
+# BJTU 统一入口
+bjtu launcher
+bjtu ui
+bjtu tui
 
 # 可选: 开机自启
 systemctl --user enable --now qlh-edge-inference

@@ -2027,6 +2027,7 @@ class TestPipelineFallback:
         assert result["response"] == "distributed"
         assert sync_timeouts == [3]
 
+
     def test_fallback_waits_for_inference_lock(self, sched, monkeypatch):
         """流水线未就绪回退时也必须等待推理锁，避免并发完整模型推理。"""
         from model_host import model_host as _host
@@ -2131,6 +2132,50 @@ class TestPipelineFallback:
 
         assert result["error"] == "worker disconnected"
         assert events == [{"token": "partial"}]
+
+
+class TestPipelineSampling:
+    @pytest.fixture
+    def sched(self):
+        return Scheduler()
+
+    def test_zero_temperature_is_greedy_without_multinomial(self, monkeypatch):
+        import scheduler as scheduler_module
+        import torch
+
+        monkeypatch.setattr(
+            torch,
+            "multinomial",
+            lambda *args, **kwargs: pytest.fail(
+                "temperature=0 不得进入随机采样"
+            ),
+        )
+        logits = torch.tensor([[[1.0, 5.0, 3.0]]], dtype=torch.float16)
+
+        token_id = scheduler_module._sample_pipeline_token_id(
+            logits, temperature=0.0, top_p=1.0,
+        )
+
+        assert token_id == 1
+
+    def test_non_finite_logits_are_rejected_before_multinomial(
+            self, monkeypatch):
+        import scheduler as scheduler_module
+        import torch
+
+        monkeypatch.setattr(
+            torch,
+            "multinomial",
+            lambda *args, **kwargs: pytest.fail(
+                "非有限概率不得进入 CUDA multinomial"
+            ),
+        )
+        logits = torch.tensor([[[1.0, float("inf"), 3.0]]])
+
+        with pytest.raises(RuntimeError, match="NaN/Inf"):
+            scheduler_module._sample_pipeline_token_id(
+                logits, temperature=0.7, top_p=0.9,
+            )
 
     def test_queued_pipeline_does_not_replay_after_stream_output(
             self, sched, monkeypatch):

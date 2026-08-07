@@ -2,7 +2,7 @@
 # ============================================================
 #  QLH 全局 bjtu 命令 (Linux / macOS)
 #
-#  用法: bjtu [tui_admin.py 参数...]
+#  用法: bjtu [launcher|ui|tui|chat|tui_admin.py 参数...]
 #
 #  一键启动: 自动启动后端(若未运行) -> 等待就绪 -> 进入 TUI。
 #  退出 TUI 后后端继续运行; 停止后端:
@@ -30,6 +30,13 @@ fi
 
 # ---- help: 仅打印命令集与参数帮助，不启动后端 ----
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    echo "QLH BJTU 统一入口:"
+    echo "  bjtu launcher   启动选择页（普通界面 / TUI）"
+    echo "  bjtu ui         直接启动普通 Web/原生界面"
+    echo "  bjtu tui        启动后端并进入 TUI 管理界面"
+    echo "  bjtu chat       进入终端对话页"
+    echo "  bjtu status     执行 TUI 单命令（不自动启动后端）"
+    echo
     PY=""
     if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
         PY=python3
@@ -40,6 +47,28 @@ if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
         exit 1
     fi
     exec "$PY" "$PROJECT_ROOT/src/tui_admin.py" --help
+fi
+
+# ---- unified launcher modes ----
+if [ "$1" = "launcher" ] || [ "$1" = "ui" ] || [ "$1" = "tui" ]; then
+    MODE="$1"
+    shift
+    PY=""
+    if [ -x "$PROJECT_ROOT/.venv-packaging/bin/python" ]; then
+        PY="$PROJECT_ROOT/.venv-packaging/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PY=python3
+    else
+        PY=python
+    fi
+    export PYTHONIOENCODING=utf-8
+    if [ "$MODE" = "launcher" ]; then
+        exec "$PY" "$PROJECT_ROOT/packaging/launcher.py" --launcher "$@"
+    elif [ "$MODE" = "ui" ]; then
+        exec "$PY" "$PROJECT_ROOT/packaging/launcher.py" --ui "$@"
+    else
+        exec "$PY" "$PROJECT_ROOT/packaging/launcher.py" --tui "$@"
+    fi
 fi
 
 # ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
