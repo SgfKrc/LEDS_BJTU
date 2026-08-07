@@ -1191,6 +1191,8 @@ class TestPipelineReadiness:
         assert payload["model_id"] == "qwen-1_8b"
         assert payload["model_sha256"] == "sha-qwen"
         assert payload["total_layers"] == 24
+        assert payload["authoritative_sync"] is False
+        assert payload["sync_policy"] == "normal"
         assert "client1" not in sched._layer_config_pushed
         assert sched._all_pipeline_nodes_ready() is False
 
@@ -1526,6 +1528,8 @@ class TestPipelineMessageDispatch:
             "model_type": "qwen2",
             "layer_range": [8, 16],
             "engine": "pytorch",
+            "master_quant_type": "",
+            "runtime_quant_type": "fp16",
         }
 
     def test_deepseek_assignment_syncs_selected_model_before_loading(self, sched, monkeypatch):
@@ -1921,6 +1925,107 @@ class TestPipelineFallback:
         assert isinstance(result, dict)
         # 可能返回 error（模型未加载）或 response
         assert "response" in result or "error" in result
+
+    def test_request_sync_waits_for_authoritative_worker_ready(
+            self, sched, monkeypatch):
+        """分布式请求应先等待强制同步，而不是立即回退主节点。"""
+        sched._role_override = "master"
+        sched.nodes["worker1"] = NodeInfo(
+            node_id="worker1", role=NodeRole.CLIENT, state=NodeState.ONLINE,
+            node_type="pc", device_info={"tier": "ultrabook"},
+            last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "clients": {"worker1": object()},
+        })()
+        states = iter([
+            {"ready": False, "reason_code": "no_pipeline_workers",
+             "reason": "未分配任何 PC 从节点参与模型层计算", "workers": []},
+            {"ready": False, "reason_code": "worker_layer_loading",
+             "reason": "worker loading", "workers": []},
+            {"ready": True, "reason_code": "ready", "reason": "ok",
+             "workers": ["worker1"]},
+        ])
+        monkeypatch.setattr(sched, "_get_pipeline_readiness", lambda: next(states))
+        sync_calls = []
+        monkeypatch.setattr(
+            sched,
+            "request_authoritative_layer_sync",
+            lambda: sync_calls.append(True) or True,
+        )
+
+        result = sched._synchronize_pipeline_workers_for_request(timeout=1)
+
+        assert result["ready"] is True
+        assert sync_calls == [True]
+
+    def test_request_sync_stops_when_worker_reopts_out(
+            self, sched, monkeypatch):
+        """旧从节点拒绝权威配置时不能等待完整同步超时。"""
+        sched._role_override = "master"
+        sched.nodes["worker1"] = NodeInfo(
+            node_id="worker1", role=NodeRole.CLIENT, state=NodeState.ONLINE,
+            node_type="pc", device_info={"tier": "ultrabook"},
+            last_heartbeat=time.time(),
+        )
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "clients": {"worker1": object()},
+        })()
+        not_ready = {
+            "ready": False,
+            "reason_code": "no_pipeline_workers",
+            "reason": "未分配任何 PC 从节点参与模型层计算",
+            "workers": [],
+        }
+        monkeypatch.setattr(
+            sched, "_get_pipeline_readiness", lambda: dict(not_ready),
+        )
+        monkeypatch.setattr(
+            sched,
+            "request_authoritative_layer_sync",
+            lambda: sched._pipeline_worker_opt_out.add("worker1") or True,
+        )
+
+        result = sched._synchronize_pipeline_workers_for_request(timeout=60)
+
+        assert result == not_ready
+
+    def test_run_pipeline_safe_uses_ready_worker_after_sync(
+            self, sched, monkeypatch):
+        """请求前同步成功后，当前请求必须走流水线而非本地回退。"""
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: False)
+        sync_timeouts = []
+        monkeypatch.setattr(
+            sched,
+            "_synchronize_pipeline_workers_for_request",
+            lambda timeout: sync_timeouts.append(timeout) or {"ready": True},
+        )
+        monkeypatch.setattr(
+            sched, "run_pipeline", lambda prompt, **kwargs: {
+                "response": "distributed", "metrics": {"distributed": True},
+            },
+        )
+        monkeypatch.setattr(
+            sched,
+            "_run_full_model_inference",
+            lambda *args, **kwargs: pytest.fail("同步成功后不应回退本地推理"),
+        )
+
+        result = sched.run_pipeline_safe(
+            "测试", _pipeline_model_sync_timeout=3,
+        )
+
+        assert result["response"] == "distributed"
+        assert sync_timeouts == [3]
 
     def test_fallback_waits_for_inference_lock(self, sched, monkeypatch):
         """流水线未就绪回退时也必须等待推理锁，避免并发完整模型推理。"""
@@ -3301,6 +3406,84 @@ class TestChainTopology:
 
         assert calls == ["opt-out"]
         assert sched._layer_config_inflight == set()
+
+    def test_authoritative_assignment_reenables_opted_out_worker(
+            self, sched, monkeypatch):
+        sched._pipeline_worker_opted_out = True
+        started = []
+        monkeypatch.setattr(
+            threading.Thread,
+            "start",
+            lambda self: started.append(self),
+        )
+
+        sched._schedule_layer_config("master", {
+            "config_id": "cfg-authoritative",
+            "generation": 5,
+            "start_layer": 8,
+            "end_layer": 16,
+            "authoritative_sync": True,
+        })
+
+        assert sched._pipeline_worker_opted_out is False
+        assert len(started) == 1
+        assert "cfg-authoritative" in sched._layer_config_inflight
+
+    def test_master_authoritative_sync_clears_worker_opt_out(
+            self, sched, monkeypatch):
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                node_type="pc", device_info=PROFILE_WORKSTATION,
+            ),
+            "client1": NodeInfo(
+                node_id="client1", role="client", state=NodeState.ONLINE,
+                node_type="pc", device_info=PROFILE_ULTRABOOK,
+            ),
+        }
+        sched._role_override = "master"
+        sent = []
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "clients": {"client1": object()},
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, payload)
+            ),
+        })()
+        sched._pipeline_worker_opt_out.add("client1")
+        monkeypatch.setattr(sched, "get_layer_assignments", lambda: {
+            "total": 24,
+            "strategy": "dynamic",
+            "assignments": [
+                {
+                    "node_id": "master", "start_layer": 0,
+                    "end_layer": 21, "has_embedding": True,
+                    "has_lm_head": True,
+                },
+                {
+                    "node_id": "client1", "start_layer": 21,
+                    "end_layer": 24, "has_embedding": False,
+                    "has_lm_head": False,
+                },
+            ],
+        })
+        monkeypatch.setattr(sched, "_get_active_pipeline_model_info", lambda: {
+            "model_id": "qwen-1_8b",
+            "model_path": "C:/models/qwen",
+            "model_sha256": "sha-qwen",
+            "model_type": "qwen",
+            "total_layers": 24,
+            "quant_type": "int4",
+        })
+
+        assert sched.request_authoritative_layer_sync() is True
+
+        assert "client1" not in sched._pipeline_worker_opt_out
+        assert sent[0][0] == "client1"
+        assert sent[0][1]["authoritative_sync"] is True
+        assert sent[0][1]["sync_policy"] == "master_authoritative"
+        assert sent[0][1]["master_quant_type"] == "int4"
+        assert sched._authoritative_layer_sync_requests == 0
 
     def test_master_opt_out_excludes_worker_from_assignment(self, sched, monkeypatch):
         sched.nodes = {

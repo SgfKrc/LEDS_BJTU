@@ -324,6 +324,9 @@ GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5
 
 # 流水线推理超时与并发控制
 PIPELINE_TIMEOUT = 120                   # 流水线单步超时（秒），含网络传输 + 前向计算
+PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
+    "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
+)                                           # 等待从节点同步模型和分层 ACK
 PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行）
 PIPELINE_STEP_TIMEOUT = 30               # 单个节点前向传播超时（秒）
 PIPELINE_QUEUE_MAX_SIZE = 100            # 请求队列最大容量（超出返回 503）
