@@ -16,11 +16,15 @@ Ctrl+C 停止。
 """
 
 import http.server
+import hashlib
 import html
 import io
+import json
 import os
+import re
 import socket
 import sys
+from datetime import datetime, timezone
 from functools import partial
 from urllib.parse import quote, unquote, urlparse
 
@@ -47,6 +51,86 @@ ANDROID_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "android", "app", "build", "outp
 
 PC_INSTALLER_EXTS = (".exe",)
 ANDROID_EXTS = (".apk", ".aab")
+UPDATE_MANIFEST_PATH = "/latest.json"
+_VERSION_RE = re.compile(r"(?<!\d)v?(\d+\.\d+\.\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)
+_SHA256_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
+def _project_version() -> str:
+    override = os.environ.get("QLH_RELEASE_TAG", "").strip().lstrip("vV")
+    if override:
+        return override
+    init_path = os.path.join(PROJECT_ROOT, "src", "__init__.py")
+    try:
+        with open(init_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+    except OSError:
+        return "0.0.0"
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+    return match.group(1) if match else "0.0.0"
+
+
+def _sha256_cached(path: str) -> str:
+    stat = os.stat(path)
+    key = os.path.abspath(path)
+    cached = _SHA256_CACHE.get(key)
+    identity = (stat.st_mtime_ns, stat.st_size)
+    if cached and cached[:2] == identity:
+        return cached[2]
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    result = digest.hexdigest()
+    _SHA256_CACHE[key] = (identity[0], identity[1], result)
+    return result
+
+
+def _classify_update_asset(name: str) -> tuple[str, str, str] | None:
+    lower = name.lower()
+    if lower.endswith(".exe") and "qlh-edge-inference-setup" in lower:
+        return "windows", "cuda" if "cuda" in lower else "cpu", "x86_64"
+    if lower.endswith((".apk", ".aab")) and "qlh-inference" in lower:
+        if "lite" in lower:
+            return "android", "lite", "any"
+        if "full" in lower:
+            return "android", "full", "any"
+    if lower.endswith(".deb") and "qlh-edge-inference" in lower:
+        return "linux", "cuda" if "cuda" in lower else "cpu", "x86_64"
+    return None
+
+
+def build_update_manifest(dist_dir: str = DIST_DIR) -> dict:
+    """Build a deterministic v1 update manifest from current release assets."""
+    tag = _project_version()
+    assets: list[dict] = []
+    if os.path.isdir(dist_dir):
+        for name in sorted(os.listdir(dist_dir), key=str.lower):
+            path = os.path.join(dist_dir, name)
+            classification = _classify_update_asset(name)
+            if not os.path.isfile(path) or classification is None:
+                continue
+            version_match = _VERSION_RE.search(name)
+            if version_match and version_match.group(1) != tag:
+                continue
+            target_platform, variant, arch = classification
+            assets.append({
+                "name": name,
+                "url": "/" + quote(name),
+                "size": os.path.getsize(path),
+                "sha256": _sha256_cached(path),
+                "platform": target_platform,
+                "variant": variant,
+                "arch": arch,
+                "kind": "installer",
+            })
+    return {
+        "schema_version": 1,
+        "tag": tag,
+        "channel": os.environ.get("QLH_RELEASE_CHANNEL", "stable"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "assets": assets,
+    }
 
 
 def _detect_tailscale_ip() -> str:
@@ -257,6 +341,20 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         ".aab": "application/octet-stream",
         ".7z": "application/x-7z-compressed",
     }
+
+    def do_GET(self):
+        if unquote(urlparse(self.path).path) == UPDATE_MANIFEST_PATH:
+            encoded = json.dumps(
+                build_update_manifest(), ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+        super().do_GET()
 
     def translate_path(self, path):
         request_path = unquote(urlparse(path).path)
