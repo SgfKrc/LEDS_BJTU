@@ -51,7 +51,7 @@ bjtu --host 100.x.x.x               # 启动后端后，TUI 管理远程主节�
 bjtu --plain                        # 纯文本编号菜单
 ```
 
-`bjtu launcher` 在 Windows 安装包中显示原生选择页，按钮选择后继续使用同一启动进度页；Linux、SSH、旧终端或无图形环境显示编号选择页。`bjtu ui` 与 `bjtu tui` 是脚本/自动化场景使用的确定性入口，不依赖人工选择。
+`bjtu launcher` 在 Windows 显示独立 Launcher GUI，在 Linux 图形入口使用同一 GUI，SSH/无图形环境可用 `qlh-launcher --tui` 编号选择页。Launcher 负责应用发现、CPU/CUDA 变体和更新检查；选择应用后仍由主应用启动载荷显示模型/网络初始化进度。`bjtu ui` 与 `bjtu tui` 是脚本/自动化场景使用的确定性入口，不依赖人工选择。
 
 **单命令模式**（执行一条 TUI 命令后立即退出，**不会自动启动后端**；后端未运行时提示"后端未在运行"并以退出码 1 结束）：
 

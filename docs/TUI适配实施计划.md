@@ -1,14 +1,14 @@
 # TUI 适配与聊天页实施计划
 
-> **状态**：部分实施（T1-T8 管理 TUI 已完成；T9.0-T9.4 已完成，T9.5 local 部分已完成（分布式真机验收待物理从节点），2026-08-06；T9.6 未实施）
+> **状态**：部分实施（T1-T8 管理 TUI 与 T9.0-T9.5 聊天页已完成；T9.6 的独立 Launcher/BJTU 接线完成，聊天依赖入包、默认入口和分布式真机验收未完成）
 >
 > **生命周期**：Active（T1-T8 在用）+ Candidate（T9 规划）——现有 7 屏管理 TUI 与网关契约继续作为稳定基线；聊天页未通过 T9 验收前不得写成当前能力
 >
-> **更新日期**：2026-08-05
+> **更新日期**：2026-08-08
 >
 > **适用范围**：T1-T8 管理 TUI 网关适配与验收记录，以及 T9 简化聊天页面、流式会话、本地/分布式路由展示和可选依赖环境计划；当前日常使用见 [TUI 使用指南](TUI使用指南.md)
 >
-> **使用入口**：当前日常使用与启动方式见 [TUI 使用指南](TUI使用指南.md)；规划中的 `bjtu chat` 尚不存在
+> **使用入口**：当前日常使用与启动方式见 [TUI 使用指南](TUI使用指南.md)；`bjtu chat` 已存在，`bjtu launcher/ui/tui/update/version` 由独立 Bootstrap 接线
 >
 > **关联文档**：[总体下一步计划](总体下一步计划.md) · [微服务架构改造计划](微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md) · [TUI 指令集](TUI指令集.md)
 >
@@ -525,8 +525,9 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - 验收：`tests/test_chat_interactive.py` 17 用例（local_only 客户端/主节点、required 失败/放行、preferred 回退 metrics、full 模式 local_only/required）+ 全量相关回归 263 passed。
   - 待办：inference-svc 的 interactive 历史事务提交（engine_host 薄实现 `history_committed=false` 如实上报）；物理从节点可用后验证真实参与节点与 fallback 跨端一致（TUI/Web/任务统计）。
 
-- [ ] **T9.6 打包、回归与默认入口决策**
-  - Windows/Linux 包包含聊天依赖；源码模式提供环境引导。
+- [ ] **T9.6 打包、回归与默认入口决策**（Launcher/BJTU 子项完成 2026-08-08）
+  - [x] 独立 `QLH Launcher` 建立 GUI/TUI 双入口，`bjtu launcher/ui/tui/update/version` 接线；Linux 将 Bootstrap `qlh-launcher` 与主应用载荷 `qlh-app` 分开。
+  - [ ] Windows/Linux 主应用包包含聊天依赖；源码模式环境引导已存在，但正式包仍需构建和干净机验收。
   - 保持 `tui_admin.py --plain`、单命令和 7 屏管理契约回归。
   - 经过真实使用窗口后再决定 `bjtu` 默认进入聊天还是继续进入管理菜单；在此之前 `bjtu chat` 显式启动。
 
