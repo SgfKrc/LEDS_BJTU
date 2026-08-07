@@ -1,7 +1,13 @@
 # Android llama.cpp Submodule 迁移方案
 
+> **文档生命周期**：废弃（待手动删除）——迁移已于 2026-08-08 完成并推送（commit `46ee263`），方案使命结束，不再维护
+>
+> **替代入口**：`android/app/src/main/cpp/LLAMA_CPP_VERSION.md`（固定 commit 与验证记录）、`.gitmodules`（submodule 配置）；升级/维护流程见 README「Android 客户端」节
+>
+> **废弃原因**：本文档为一次性迁移方案，目标状态已达成（vendored → gitlink `47e1de77`），保留内容仅为历史记录
+>
 > 更新日期：2026-08-08
-> 状态：已实施（2026-08-08 迁移完成，Gitlink 47e1de77；Full/Lite 构建验证进行中，真机回归待做）
+> 状态：已实施（历史记录，保留至批量清理）
 > 适用范围：`android/app/src/main/cpp/llama.cpp/` 及 Android Full 原生构建链
 > 不包含：本次仅形成文档，不修改 Git 索引、CMake、Gradle、CI 或打包脚本
 
