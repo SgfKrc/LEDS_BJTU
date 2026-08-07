@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 from pathlib import Path
 
 
@@ -102,3 +103,28 @@ def test_android_download_scan_includes_dist_and_gradle_outputs(tmp_path, monkey
             str(gradle_apk),
         ),
     ]
+
+
+def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    current = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.1.exe"
+    old = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.exe"
+    full = dist_dir / "QLH-Inference-v0.1.8.1-full-release.apk"
+    current.write_bytes(b"current")
+    old.write_bytes(b"old")
+    full.write_bytes(b"full")
+    monkeypatch.setattr(serve, "_project_version", lambda: "0.1.8.1")
+    serve._SHA256_CACHE.clear()
+
+    manifest = serve.build_update_manifest(str(dist_dir))
+
+    assert manifest["schema_version"] == 1
+    assert manifest["tag"] == "0.1.8.1"
+    assert [item["name"] for item in manifest["assets"]] == [
+        current.name, full.name,
+    ]
+    assert manifest["assets"][0]["variant"] == "cpu"
+    assert manifest["assets"][0]["sha256"] == hashlib.sha256(b"current").hexdigest()
+    assert manifest["assets"][1]["variant"] == "full"
