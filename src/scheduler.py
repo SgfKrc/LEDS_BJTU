@@ -83,7 +83,8 @@ from config import (
     SERVER_IP, SERVER_PORT,
     NODE_ROLE, NODE_ID, MAX_NODES,
     MASTER_DOWN_EMAIL_TIMEOUT,
-    PIPELINE_TIMEOUT, PIPELINE_STEP_TIMEOUT, PIPELINE_QUEUE_POLL_INTERVAL,
+    PIPELINE_TIMEOUT, PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_STEP_TIMEOUT,
+    PIPELINE_QUEUE_POLL_INTERVAL,
     PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL,
     PIPELINE_SCHEDULING_STRATEGY,
     PIPELINE_Q0_MAX_TOKENS, PIPELINE_Q1_MAX_TOKENS,
@@ -1113,6 +1114,9 @@ class Scheduler:
         self._pipeline_worker_reserved = False
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
+        # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
+        # 布尔值，避免前一个请求结束时把后一个请求降级为普通推送。
+        self._authoritative_layer_sync_requests = 0
         self._local_pipeline_cancelled: set[str] = set()
         self._local_pipeline_cancelled_order: collections.deque = collections.deque()
         self._local_pipeline_steps: dict[str, int] = {}
@@ -2464,6 +2468,7 @@ class Scheduler:
             "model_sha256": self._get_master_model_sha256(),
             "model_type": model_type,
             "total_layers": self._get_total_model_layers(),
+            "quant_type": getattr(manager, "quant_type", "") or "",
         }
 
     def compute_layer_assignment(self, nodes: list = None) -> list:
@@ -3246,6 +3251,26 @@ class Scheduler:
         with self._layer_config_push_lock:
             self._push_layer_config_to_clients_locked()
 
+    def request_authoritative_layer_sync(self) -> bool:
+        """让在线 PC 从节点服从主节点当前模型和分层配置。
+
+        从节点显式执行本地模型操作后会暂时退出分层 worker。主节点模型
+        加载完成或收到新的分布式请求时，通过这个一次性标记重新取得
+        配置权威；普通拓扑刷新仍尊重从节点的临时退出状态。
+        """
+        if self._effective_role() != "master":
+            return False
+        with self._layer_config_lock:
+            self._authoritative_layer_sync_requests += 1
+        try:
+            self.push_layer_config_to_clients()
+        finally:
+            with self._layer_config_lock:
+                self._authoritative_layer_sync_requests = max(
+                    0, self._authoritative_layer_sync_requests - 1,
+                )
+        return True
+
     def _push_layer_config_to_clients_locked(self) -> None:
         """
         向所有 TCP 连接的从节点推送其分层配置。
@@ -3271,6 +3296,22 @@ class Scheduler:
                 and node_id != self.get_effective_node_id()
                 and getattr(node, "node_type", "pc") == "pc"
             }
+
+        with self._layer_config_lock:
+            authoritative_sync = bool(
+                self._authoritative_layer_sync_requests
+            )
+            reenabled_nodes = (
+                self._pipeline_worker_opt_out & releasable_pc_ids
+                if authoritative_sync else set()
+            )
+            if reenabled_nodes:
+                self._pipeline_worker_opt_out.difference_update(reenabled_nodes)
+        if reenabled_nodes:
+            logger.info(
+                "主节点权威模型同步重新启用分层 worker: %s",
+                sorted(reenabled_nodes),
+            )
 
         with self._layer_config_lock:
             self._layer_config_generation = max(
@@ -3322,6 +3363,12 @@ class Scheduler:
                 "model_sha256": master_sha256,
                 "model_type": model_type,
                 "total_layers": int(model_info["total_layers"]),
+                "master_quant_type": model_info.get("quant_type", ""),
+                "engine": "pytorch",
+                "sync_policy": (
+                    "master_authoritative" if authoritative_sync else "normal"
+                ),
+                "authoritative_sync": authoritative_sync,
                 "master_api_port": API_PORT,
             }
 
@@ -7982,8 +8029,20 @@ class Scheduler:
 
     def _schedule_layer_config(self, client_id: str, data: dict) -> None:
         config_id = str(data.get("config_id", "")) if isinstance(data, dict) else ""
+        authoritative_sync = bool(
+            isinstance(data, dict) and data.get("authoritative_sync")
+        )
         resend_opt_out = False
+        authoritative_opt_in = False
         with self._layer_config_lock:
+            if (
+                authoritative_sync
+                and self._pipeline_worker_opted_out
+                and isinstance(data, dict)
+                and not data.get("release")
+            ):
+                self._pipeline_worker_opted_out = False
+                authoritative_opt_in = True
             if (self._pipeline_worker_opted_out
                     and isinstance(data, dict)
                     and not data.get("release")):
@@ -8040,6 +8099,11 @@ class Scheduler:
                 if config_id:
                     self._layer_config_inflight.add(config_id)
 
+        if authoritative_opt_in:
+            logger.info(
+                "收到主节点权威模型配置，自动重新加入分层 worker: config=%s",
+                config_id,
+            )
         if resend_opt_out:
             logger.info(
                 "本设备已选择本地模型，拒绝分层配置并重发退出请求: config=%s",
@@ -8213,6 +8277,8 @@ class Scheduler:
         model_id = str(cfg.get("model_id", ""))
         expected_sha256 = str(cfg.get("model_sha256", ""))
         expected_model_type = str(cfg.get("model_type", "")).lower()
+        expected_engine = str(cfg.get("engine", "pytorch") or "pytorch").lower()
+        master_quant_type = str(cfg.get("master_quant_type", "") or "")
         try:
             start = int(start)
             end = int(end)
@@ -8241,6 +8307,10 @@ class Scheduler:
                 raise ValueError(f"层配置目标节点 {target_node_id} 与本节点 {node_id} 不一致")
             if expected_model_type not in {"qwen", "qwen2"}:
                 raise ValueError(f"不支持的流水线模型架构: {expected_model_type or 'unknown'}")
+            if expected_engine != "pytorch":
+                raise ValueError(
+                    f"分层配置引擎必须为 pytorch，实际为 {expected_engine}"
+                )
             missing_contract = [
                 name for name, value in (
                     ("config_id", config_id),
@@ -8316,6 +8386,7 @@ class Scheduler:
                     has_embedding=has_embed,
                     has_lm_head=has_lm,
                     model_path=local_model_path,
+                    quant_type=master_quant_type or None,
                     total_layers=total_layers or None,
                     model_id=model_id or None,
                 )
@@ -8327,6 +8398,7 @@ class Scheduler:
                     has_embedding=has_embed,
                     has_lm_head=has_lm,
                     model_path=local_model_path,
+                    quant_type=master_quant_type or None,
                     total_layers=total_layers or None,
                     model_id=model_id or None,
                 )
@@ -8373,6 +8445,8 @@ class Scheduler:
                 "model_type": actual_model_type,
                 "layer_range": [start, end],
                 "engine": engine,
+                "master_quant_type": master_quant_type,
+                "runtime_quant_type": getattr(mgr, "quant_type", "") or "",
             }
             with self._layer_config_lock:
                 self._pipeline_worker_reserved = True
@@ -8392,6 +8466,8 @@ class Scheduler:
                 "model_sha256": local_sha256 or expected_sha256,
                 "model_type": actual_model_type,
                 "engine": engine,
+                "master_quant_type": master_quant_type,
+                "runtime_quant_type": getattr(mgr, "quant_type", "") or "",
                 "timestamp": time.time(),
             })
             logger.info(
@@ -9370,6 +9446,93 @@ class Scheduler:
             return True
         logger.warning("流水线未就绪: %s", readiness["reason"])
         return False
+
+    def _connected_pc_worker_ids(self) -> list[str]:
+        """Return online PC clients that can receive an authoritative config."""
+        server = self._tcp_server
+        if not server or not getattr(server, "_running", False):
+            return []
+        get_client_ids = getattr(server, "get_client_ids", None)
+        connected = set(
+            get_client_ids()
+            if callable(get_client_ids)
+            else getattr(server, "clients", {}).keys()
+        )
+        local_node_id = self.get_effective_node_id()
+        with self._nodes_lock:
+            return sorted(
+                node_id for node_id, node in self.nodes.items()
+                if node_id in connected
+                and node_id != local_node_id
+                and getattr(node, "node_type", "pc") == "pc"
+                and node.is_available()
+                and not self._node_is_island_gateway(node.device_info)
+            )
+
+    def _synchronize_pipeline_workers_for_request(
+        self, timeout: float = PIPELINE_MODEL_SYNC_TIMEOUT,
+    ) -> dict:
+        """Synchronize worker model segments before falling back to the master."""
+        readiness = self._get_pipeline_readiness()
+        if readiness.get("ready"):
+            return readiness
+
+        worker_ids = self._connected_pc_worker_ids()
+        if not worker_ids:
+            return readiness
+
+        recoverable = {
+            "no_pipeline_workers",
+            "worker_layer_not_configured",
+            "worker_layer_loading",
+            "worker_layer_load_failed",
+        }
+        if readiness.get("reason_code") not in recoverable:
+            return readiness
+
+        # An existing loading generation should finish without being superseded.
+        # Other recoverable states need a fresh authoritative generation.
+        if readiness.get("reason_code") != "worker_layer_loading":
+            logger.info(
+                "分布式请求触发主节点权威模型同步: workers=%s reason=%s",
+                worker_ids,
+                readiness.get("reason", ""),
+            )
+            self.request_authoritative_layer_sync()
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            readiness = self._get_pipeline_readiness()
+            if readiness.get("ready"):
+                logger.info(
+                    "主从模型配置同步完成，流水线已就绪: workers=%s",
+                    worker_ids,
+                )
+                return readiness
+            # 旧安装包不认识 authoritative_sync，会再次发送 opt-out。
+            # 这是明确的不可恢复信号；不应让本次推理无谓等待完整同步
+            # 超时，直接按既有安全路径回退到主节点。
+            with self._layer_config_lock:
+                opted_out = sorted(
+                    set(worker_ids) & self._pipeline_worker_opt_out
+                )
+            if opted_out:
+                logger.warning(
+                    "从节点拒绝主节点权威模型同步，立即回退: workers=%s",
+                    opted_out,
+                )
+                return readiness
+            if readiness.get("reason_code") not in recoverable:
+                return readiness
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "等待主从模型配置同步超时: timeout=%.1fs reason=%s",
+                    float(timeout),
+                    readiness.get("reason", ""),
+                )
+                return readiness
+            time.sleep(min(0.1, remaining))
 
     def _verify_pipeline_readiness(self, pipeline_nodes: list
                                    ) -> tuple:
@@ -10744,6 +10907,9 @@ class Scheduler:
         # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
         # 同时检查模型是否已加载，未加载时走回退路径（给出明确错误）。
         queue_timeout = kwargs.pop('_queue_timeout', PIPELINE_TIMEOUT)
+        model_sync_timeout = kwargs.pop(
+            '_pipeline_model_sync_timeout', PIPELINE_MODEL_SYNC_TIMEOUT,
+        )
         self._track_stream_output(kwargs)
         mgr = self._host
         if not mgr or not mgr.is_loaded:
@@ -10766,14 +10932,24 @@ class Scheduler:
             )
 
         # ---- 自动回退：节点不可用 → 全模型推理 ----
+        readiness = None
         try:
             pipeline_ready = self._all_pipeline_nodes_ready()
+            if not pipeline_ready:
+                readiness = self._synchronize_pipeline_workers_for_request(
+                    timeout=model_sync_timeout,
+                )
+                pipeline_ready = bool(readiness.get("ready"))
         except Exception:
+            logger.warning(
+                "请求前主从模型配置同步失败，将按未就绪处理",
+                exc_info=True,
+            )
             pipeline_ready = False
 
         if not pipeline_ready:
             try:
-                readiness = self._get_pipeline_readiness()
+                readiness = readiness or self._get_pipeline_readiness()
                 readiness_reason = readiness.get("reason") or "未知原因"
             except Exception:
                 readiness_reason = "就绪状态检查失败"

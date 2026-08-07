@@ -2999,7 +2999,13 @@ class EngineHost:
         """主节点模型变化后重新下发层配置，并使旧 ACK 失效。"""
         try:
             if sched._effective_role() == "master":
-                sched.push_layer_config_to_clients()
+                request_sync = getattr(
+                    sched, "request_authoritative_layer_sync", None,
+                )
+                if callable(request_sync):
+                    request_sync()
+                else:
+                    sched.push_layer_config_to_clients()
         except Exception:
             pass
 
