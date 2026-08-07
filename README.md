@@ -27,7 +27,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 级别 | 软件版本 | 目标设备 | 核心能力 | 不包含/不推荐 |
 |------|----------|----------|----------|---------------|
 | 1 | **PC 集显版** | Windows / Linux 无 NVIDIA 独显的 PC | llama.cpp + GGUF CPU/集显推理、集群接入与远程请求转发 | 当前 PyTorch 层流水线、重模型实验、CUDA 专属能力 |
-| 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、**SD 1.5 图像生成侧车（文生图/图生图/参考图/局部重绘）**、后续支持多模型/重模型实验 | Android 极简化策略 |
+| 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、**SD 1.5 图像生成侧车（文生图/图生图/参考图/局部重绘/指令编辑）**、后续支持多模型/重模型实验 | Android 极简化策略 |
 | 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、较完整设置、后续可研究完整任务 Worker | Transformer 层间拆分、重模型实验 |
 | 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 完整 models 目录、日志管理、Worker 接收任务、高级控制面板 |
 
@@ -46,7 +46,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（可选依赖 Textual，见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
-| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、图生图（img2img）、参考图一致性（IP-Adapter `reference`）与专用 9-channel inpaint 局部重绘，固定 DreamBooth 90s 预设、step 进度、取消与结果“继续编辑”；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 十轮 mask 语义/显存门与 Edge 真实画布链路已通过（2026-08-07）→ [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
+| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门与 Edge 链路已通过、双人目视待完成（2026-08-07）→ [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
@@ -318,6 +318,8 @@ cd frontend && npm install && cd ..
 
 ## 🤖 模型下载
 
+> **默认源**：一键部署/下载的模型地址与源由开发团队提供默认源（ModelScope、Hugging Face 官方与百度网盘备用，国内优先 ModelScope），开箱即用；也允许用户自行更换源（如 HF 国内镜像），机制见 [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1。
+
 项目默认示例模型是 **Qwen-1.8B-Chat**，并通过模型注册表提供其他 Qwen/DeepSeek 实验槽位。下面仅说明默认模型的两种格式，不代表系统只支持该模型：
 
 | 格式 | 引擎 | 大小 | 适用场景 |
@@ -370,6 +372,7 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
 | **90s DreamBooth** | `aa8a082c…`（组合原版 safety checker） | ~4.87 GB 固定集合 | 90 年代日式动漫 preset（openrail，双人目视通过） |
 | **IP-Adapter reference** | `h94/IP-Adapter@018e4027…`（稳定 SHA `671c7452…`） | ~2.57 GB | 参考图一致性（人物主要要素保持，非精确身份锁定） |
 | **SD 1.5 Inpainting** | `stable-diffusion-inpainting@8a4288a7…`（稳定 SHA `ddd6d69a…`） | ~2.74 GB | 9-channel U-Net 局部重绘（白色 mask 重绘、黑色保留） |
+| **InstructPix2Pix** | `timbrooks/instruct-pix2pix@31519b5c…`（稳定 SHA `a6626f7f…`） | ~2.74 GB | 自然语言指令编辑（MIT；完整自动门通过，双人目视待完成） |
 
 获取与验证：
 
@@ -381,6 +384,8 @@ python scripts/quality_gate_sd15.py --asset-id sd15_90s_retrovers_v1
 # img2img / IP-Adapter 完整矩阵门（源图 SHA + strength/scale 矩阵 + 显存门）
 python scripts/quality_gate_sd15_img2img.py --review-report build/sd15-img2img-quality/full-90s/quality-report.json --reviewer 审核者=pass
 python scripts/quality_gate_sd15_ip_adapter.py --review-report build/sd15-ip-adapter-quality/sd15_90s_retrovers_v1-v2/quality-report.json --reviewer 审核者=pass
+# InstructPix2Pix 十条固定指令门；自动门后需两名独立审核者登记
+python scripts/quality_gate_sd15_instruction.py
 ```
 
 也可以在 Web 图像工作区直接下载/导入（资产目录刷新自动发现）。许可证与 gated 状态在下载前展示；正式离线资产包（含许可副本+模型卡）尚未发布。
@@ -765,7 +770,7 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint 工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed，SD-N2/SD-N5.1/SD-N5.1A In Progress；img2img/IP-Adapter 自动门与双人目视通过 2026-08-06，inpaint 十轮语义/显存门和 Edge 画布通过 2026-08-07，剩余正式离线发布包与指令编辑）
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.3 自动门与 Edge 链路通过、双人目视待完成；剩余正式离线发布包与分布式接入）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
 - [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 内容寻址模型仓库、跨节点部署与多集群档案（L4 Candidate）
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
