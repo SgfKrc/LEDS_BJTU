@@ -13,14 +13,14 @@
 #   4. dpkg-deb 可用
 #
 # 输出:
-#   packaging/linux/qlh-edge-inference-cpu_0.1.7_amd64.deb
-#   packaging/linux/qlh-edge-inference-cuda_0.1.7_amd64.deb
+#   packaging/linux/qlh-edge-inference-cpu_0.1.8_amd64.deb
+#   packaging/linux/qlh-edge-inference-cuda_0.1.8_amd64.deb
 # ================================================================
 
 set -euo pipefail
 
 VARIANT="${1:-cpu}"
-VERSION="0.1.7"
+VERSION="0.1.8"
 ARCH="amd64"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
