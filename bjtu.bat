@@ -32,6 +32,15 @@ rem ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
 if /i "%~1"=="chat" goto :chat
 if /i "%~1"=="update" goto :update
 if /i "%~1"=="version" goto :version
+if /i "%~1"=="launcher-status" goto :launcher_n4
+if /i "%~1"=="launcher-check" goto :launcher_n4
+if /i "%~1"=="launcher-download" goto :launcher_n4
+if /i "%~1"=="launcher-install" goto :launcher_n4
+if /i "%~1"=="launcher-stage" goto :launcher_n4
+if /i "%~1"=="launcher-activate" goto :launcher_n4
+if /i "%~1"=="launcher-rollback" goto :launcher_n4
+if /i "%~1"=="launcher-recover" goto :launcher_n4
+if /i "%~1"=="diagnostics" goto :launcher_n4
 
 rem ---- unified launcher modes ----
 if /i "%~1"=="launcher" goto :launcher
@@ -57,6 +66,15 @@ if /i "%~1"=="update" (
     "%QLH_LAUNCHER_EXE%" check %2 %3 %4 %5 %6
     exit /b %errorlevel%
 )
+if /i "%~1"=="launcher-status" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-check" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-download" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-install" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-stage" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-activate" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-rollback" goto :packaged_launcher_n4
+if /i "%~1"=="launcher-recover" goto :packaged_launcher_n4
+if /i "%~1"=="diagnostics" goto :packaged_launcher_n4
 if /i "%~1"=="version" (
     if exist "version.txt" type version.txt
     if not exist "version.txt" echo unknown
@@ -131,6 +149,16 @@ exit /b %errorlevel%
 set "PYTHON_CMD=python"
 if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
 %PYTHON_CMD% packaging\qlh_launcher.py check %2 %3 %4 %5 %6
+exit /b %errorlevel%
+
+:launcher_n4
+set "PYTHON_CMD=python"
+if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% packaging\qlh_launcher.py %*
+exit /b %errorlevel%
+
+:packaged_launcher_n4
+"%QLH_LAUNCHER_EXE%" %*
 exit /b %errorlevel%
 
 :version

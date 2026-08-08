@@ -317,7 +317,10 @@ def select_asset(
     exact = [
         asset for asset in manifest.assets
         if asset.platform == platform
-        and asset.variant == variant
+        # Shared artifacts such as the standalone Launcher are deliberately
+        # published once as variant=any.  A device-specific asset still wins
+        # below, so this never makes a CUDA build consume a CPU installer.
+        and asset.variant in {variant, "any"}
         and asset.kind == kind
         and asset.arch in {"any", arch}
     ]
@@ -325,7 +328,13 @@ def select_asset(
         raise UpdateError(
             f"no matching {kind}: platform={platform}, variant={variant}, arch={arch}"
         )
-    exact.sort(key=lambda item: (item.arch != arch, item.name.lower()))
+    exact.sort(
+        key=lambda item: (
+            item.variant != variant,
+            item.arch != arch,
+            item.name.lower(),
+        )
+    )
     return exact[0]
 
 
