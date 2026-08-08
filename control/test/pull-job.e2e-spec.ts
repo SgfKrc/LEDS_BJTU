@@ -18,6 +18,7 @@ import { ClusterSettingsRepository } from '../src/data/cluster-settings-reposito
 import { ArtifactStore } from '../src/data/artifact-store';
 import { ModelInspector } from '../src/data/model-inspector';
 import { CURATED_RECIPES } from '../src/data/curated-catalog';
+import { ArtifactRuntimeStatus } from '../src/data/artifact-runtime-repository';
 
 function tempStore(): { dir: string; store: SqliteStore } {
   const dir = mkdtempSync(join(tmpdir(), 'qlh-m3-'));
@@ -121,6 +122,7 @@ describe('PullJobService（M3）', () => {
 describe('PullJobExecutor（M3）', () => {
   function makeExecutor(store: SqliteStore, dir: string, files: Array<{ name: string; content: Buffer }>, opts: {
     failDigest?: boolean;
+    runtimeStatus?: ArtifactRuntimeStatus;
   } = {}) {
     const jobs = new PullJobService(store);
     const fetchFn = mockFetch(files, opts);
@@ -139,11 +141,28 @@ describe('PullJobExecutor（M3）', () => {
     const licenses = new ModelLicenseAcceptanceRepository(
       new ClusterSettingsRepository(store),
     );
+    const runtimeChecks = {
+      checkManifest: jest.fn(async (manifest: Record<string, unknown>, nodeId: string) => ({
+        schema_version: 1 as const,
+        artifact_id: String(manifest.artifact_id),
+        node_id: nodeId,
+        runtime_profile: 'llm-cpu-v1',
+        status: opts.runtimeStatus ?? 'ready',
+        checked_at: new Date().toISOString(),
+        engine: String(manifest.engine),
+        loader_version: 'fixture/1',
+        runtime_fingerprint: `sha256:${'c'.repeat(64)}`,
+        load_ms: 1,
+        details: {},
+        error: opts.runtimeStatus && opts.runtimeStatus !== 'ready'
+          ? { code: 'fixture_rejected', message: 'fixture' } : null,
+      })),
+    };
     const executor = new PullJobExecutor(
       jobs, resolver, downloader, artifactStore, new ModelInspector(),
-      credentials, licenses,
+      credentials, licenses, runtimeChecks as any,
     );
-    return { jobs, executor, artifactStore };
+    return { jobs, executor, artifactStore, runtimeChecks };
   }
 
   it('全流程：resolve → 下载 → 校验 → 注册（manifest 与工件库）', async () => {
@@ -154,7 +173,7 @@ describe('PullJobExecutor（M3）', () => {
       (() => { const t = Buffer.alloc(8); t.writeBigUInt64LE(0n); return t; })(),
       (() => { const k = Buffer.alloc(8); k.writeBigUInt64LE(0n); return k; })(),
     ]);
-    const { jobs, executor, artifactStore } = makeExecutor(store, dir, [
+    const { jobs, executor, artifactStore, runtimeChecks } = makeExecutor(store, dir, [
       { name: 'model.gguf', content: gguf },
     ]);
     const job = jobs.create({
@@ -171,6 +190,8 @@ describe('PullJobExecutor（M3）', () => {
     const final = jobs.get(job.job_id);
     expect(final?.state).toBe('registered');
     expect(final?.artifact_id).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(final?.runtime_check?.status).toBe('ready');
+    expect(runtimeChecks.checkManifest).toHaveBeenCalledTimes(1);
     expect(final?.source.resolved_revision).toBe('a'.repeat(40));
     // manifest 存在且引用 blob
     const manifest = artifactStore.readManifest('hub', 'm', 'aaaaaaaaaaaa');
@@ -217,6 +238,35 @@ describe('PullJobExecutor（M3）', () => {
     jobs.cancel(job.job_id);
     const state = jobs.get(job.job_id)?.state;
     expect(['cancelled', 'registered']).toContain(state);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps a verified artifact registered when runtime admission rejects it', async () => {
+    const { dir, store } = tempStore();
+    const gguf = Buffer.concat([
+      Buffer.from('GGUF'),
+      (() => { const v = Buffer.alloc(4); v.writeUInt32LE(3); return v; })(),
+      Buffer.alloc(16),
+    ]);
+    const { jobs, executor, artifactStore, runtimeChecks } = makeExecutor(store, dir, [
+      { name: 'model.gguf', content: gguf },
+    ], { runtimeStatus: 'resource_rejected' });
+    const job = jobs.create({
+      idempotencyKey: 'pull-runtime-rejected',
+      source: { provider: 'gguf_huggingface', repo_id: 'r/rejected', requested_revision: 'main' },
+    });
+    executor.start(job.job_id);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (jobs.get(job.job_id)?.state === 'registered') break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const final = jobs.get(job.job_id);
+    expect(final?.state).toBe('registered');
+    expect(final?.runtime_check?.status).toBe('resource_rejected');
+    expect(final?.artifact_id).toMatch(/^sha256:/);
+    expect(artifactStore.readManifest('hub', 'rejected', 'aaaaaaaaaaaa')).not.toBeNull();
     store.close();
     rmSync(dir, { recursive: true, force: true });
   });

@@ -77,7 +77,7 @@ describe('storage/health 契约（M1 双健康）', () => {
       backend: 'sqlite',
       writable: true,
       path: join(tmpBase, 'qlh-control.sqlite3'),
-      schema_version: 1,
+      schema_version: 2,
     });
     expect(body.remote).toEqual({ status: 'not_configured', backend: 'postgresql' });
     expect(body.projection.pending_events).toBe(0);

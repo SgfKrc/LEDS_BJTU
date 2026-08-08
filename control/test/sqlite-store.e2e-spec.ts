@@ -6,7 +6,7 @@ import { mkdtempSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { DatabaseSync } from 'node:sqlite';
-import { SqliteStore } from '../src/data/sqlite-store';
+import { MIGRATIONS, SqliteStore } from '../src/data/sqlite-store';
 import { OutboxService } from '../src/data/outbox.service';
 import { StorageHealthService } from '../src/data/storage-health';
 import { PostgresProjector } from '../src/data/postgres-projector';
@@ -30,10 +30,10 @@ class FakeConfigDao {
 }
 
 describe('SqliteStore (M1)', () => {
-  it('opens with WAL and migrates to schema v1', () => {
+  it('opens with WAL and migrates to schema v2', () => {
     const store = tempStore();
     store.open();
-    expect(store.schemaVersion).toBe(1);
+    expect(store.schemaVersion).toBe(2);
     const db = new DatabaseSync(store.filePath);
     const mode = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
     db.close();
@@ -44,11 +44,11 @@ describe('SqliteStore (M1)', () => {
   it('reopen is idempotent and does not re-run migrations', () => {
     const store = tempStore();
     store.open();
-    expect(store.schemaVersion).toBe(1);
+    expect(store.schemaVersion).toBe(2);
     store.close();
     // 重新打开：迁移器跳过已应用版本
     store.open();
-    expect(store.schemaVersion).toBe(1);
+    expect(store.schemaVersion).toBe(2);
     store.close();
     store.open();
     store.close();
@@ -61,7 +61,32 @@ describe('SqliteStore (M1)', () => {
     expect(health.status).toBe('ok');
     expect(health.backend).toBe('sqlite');
     expect(health.writable).toBe(true);
-    expect(health.schema_version).toBe(1);
+    expect(health.schema_version).toBe(2);
+    store.close();
+  });
+
+  it('upgrades an existing v1 database to v2 without losing data', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlh-m1-upgrade-'));
+    const dbPath = join(dir, 'control.sqlite3');
+    const legacy = new DatabaseSync(dbPath);
+    MIGRATIONS[0].up(legacy);
+    legacy.exec('PRAGMA user_version = 1');
+    legacy.prepare(
+      'INSERT INTO cluster_settings(key, value, updated_at) VALUES (?, ?, ?)',
+    ).run('preserved', 'yes', '2026-08-08T00:00:00Z');
+    legacy.close();
+
+    const store = new SqliteStore(dbPath);
+    store.open();
+    expect(store.schemaVersion).toBe(2);
+    const preserved = store.prepare(
+      'SELECT value FROM cluster_settings WHERE key = ?',
+    ).get('preserved') as { value: string };
+    expect(preserved.value).toBe('yes');
+    const table = store.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_runtime_checks'",
+    ).get() as { name: string };
+    expect(table.name).toBe('artifact_runtime_checks');
     store.close();
   });
 

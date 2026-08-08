@@ -21,7 +21,7 @@ describe('MODEL-FLEET M3 model-http-client', () => {
 
     it('rejects non-URL, non-http(s), embedded credentials and path/query', () => {
       expect(() => normalizeModelProxyUrl('not a url'))
-        .toThrow('QLH_HTTP_PROXY is not a valid URL');
+        .toThrow('model proxy is not a valid URL');
       expect(() => normalizeModelProxyUrl('ftp://proxy.example'))
         .toThrow('must use http:// or https://');
       expect(() => normalizeModelProxyUrl('http://user:pass@proxy.example:8080'))
@@ -55,7 +55,7 @@ describe('MODEL-FLEET M3 model-http-client', () => {
     });
     expect(client.proxyStatus()).toEqual({
       configured: false,
-      source: 'QLH_HTTP_PROXY',
+      source: 'direct',
       endpoint: null,
     });
   });

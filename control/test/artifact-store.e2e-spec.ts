@@ -132,12 +132,12 @@ describe('ArtifactStore（M2）', () => {
 describe('ModelInspector（M2）', () => {
   it('解析合法 GGUF：架构/量化/上下文/能力判定', () => {
     const dir = tempDir();
-    const gguf = writeGguf(dir, 'model.gguf', buildGguf('qwen2', 12, 4096));
+    const gguf = writeGguf(dir, 'model.gguf', buildGguf('qwen2', 15, 4096));
     const result = new ModelInspector().inspectGguf(gguf);
     expect(result.ok).toBe(true);
     expect(result.architecture).toBe('qwen2');
     expect(result.family).toBe('qwen2');
-    expect(result.quantization).toBe('q4_k');
+    expect(result.quantization).toBe('q4_k_m');
     expect(result.context_length).toBe(4096);
     expect(result.capabilities.llama_cpp).toBe(true);
     expect(result.capabilities.pytorch_layer_pipeline).toBe(false);
@@ -210,14 +210,14 @@ describe('ModelImportService（M2）', () => {
 
   it('单 GGUF 导入：llama_cpp 能力与量化', () => {
     const root = tempDir();
-    const ggufPath = writeGguf(root, 'qwen.gguf', buildGguf('qwen2', 12));
+    const ggufPath = writeGguf(root, 'qwen.gguf', buildGguf('qwen2', 15));
     const store = new ArtifactStore(join(root, 'store'));
     const service = new ModelImportService(store, new ModelInspector());
     const report = service.importLocal(ggufPath, { name: 'qwen-gguf' });
     expect(report.failed).toBe(0);
     const manifest = store.readManifest('user', 'qwen-gguf', 'latest');
     expect(manifest?.format).toBe('gguf');
-    expect(manifest?.quantization).toBe('q4_k');
+    expect(manifest?.quantization).toBe('q4_k_m');
     expect((manifest?.capabilities as Record<string, boolean>).llama_cpp).toBe(true);
     rmSync(root, { recursive: true, force: true });
   });
