@@ -788,7 +788,7 @@ python serve.py
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
 - [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：M2 8 条目迁移/runtime sidecar/准入接线、M3 Windows 安全门与真实小工件续传均已完成；DeepSeek 7B GGUF `ready` 且部署 prepare 通过，Safetensors `resource_rejected`；下一票为本地模型管理控制面/UI（不需代理），真实模型权重完整 pull、PG/Tailscale/跨 PC 分发仍受外部或硬件门约束
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
-- [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 全自动优化实验脚本：固定提示词集/seed/工件、串并行调度、统一数据 schema 与报告汇总（L4 Candidate，尚未实施）
+- [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 全自动优化实验流水线：固定提示词集/seed/工件、串并行调度与资源互斥、统一 schema 与对照表报告（EX-N0/EX-N1 已完成，`scripts/run_experiments.py`）
 
 ### 专项文档
 
