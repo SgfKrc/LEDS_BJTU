@@ -18,6 +18,7 @@ import { HfResolver } from '../src/data/hf-resolver';
 import { ModelHttpClient } from '../src/data/model-http-client';
 import { ModelInspector } from '../src/data/model-inspector';
 import { ModelLicenseAcceptanceRepository } from '../src/data/model-license-acceptance';
+import { ModelProxyConfigRepository } from '../src/data/model-proxy-config-repository';
 import { ModelDiskBudget } from '../src/data/model-disk-budget';
 import { PullJobExecutor } from '../src/data/pull-job-executor';
 import { PullJobService } from '../src/data/pull-job.service';
@@ -91,19 +92,22 @@ describe('MODEL-FLEET M3 credential and network security', () => {
 
   itOnWindows('round-trips through Windows DPAPI without plaintext on disk', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlh-mf-dpapi-'));
-    const vault = new ModelCredentialStore({
-      rootDir: join(dir, 'credentials'),
-      protector: new WindowsDpapiProtector(),
-    });
-    const secret = 'dpapi_fixture_secret_456';
-    await vault.set('os:qlh/dpapi-smoke', secret);
-    expect(await vault.get('os:qlh/dpapi-smoke')).toBe(secret);
-    const raw = readdirSync(vault.root).map(
-      (name) => readFileSync(join(vault.root, name), 'utf-8'),
-    ).join('\n');
-    expect(raw).not.toContain(secret);
-    rmSync(dir, { recursive: true, force: true });
-  });
+    try {
+      const vault = new ModelCredentialStore({
+        rootDir: join(dir, 'credentials'),
+        protector: new WindowsDpapiProtector(),
+      });
+      const secret = 'dpapi_fixture_secret_456';
+      await vault.set('os:qlh/dpapi-smoke', secret);
+      expect(await vault.get('os:qlh/dpapi-smoke')).toBe(secret);
+      const raw = readdirSync(vault.root).map(
+        (name) => readFileSync(join(vault.root, name), 'utf-8'),
+      ).join('\n');
+      expect(raw).not.toContain(secret);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 
   it('uses only explicit QLH_HTTP_PROXY and injects authorization per request', async () => {
     let captured: RequestInit & { dispatcher?: unknown } = {};
@@ -130,6 +134,37 @@ describe('MODEL-FLEET M3 credential and network security', () => {
       proxyUrl: 'http://user:password@proxy.example:8080',
     })).toThrow('must not contain embedded credentials');
     await client.onApplicationShutdown();
+  });
+
+  it('uses Git-like proxy precedence: environment, saved user config, direct', () => {
+    const { dir, store } = tempStore('qlh-mf-proxy-config-');
+    const proxy = new ModelProxyConfigRepository(
+      new ClusterSettingsRepository(store),
+    );
+    const env: NodeJS.ProcessEnv = {};
+    const client = new ModelHttpClient({
+      env,
+      proxyProvider: () => {
+        const current = proxy.get();
+        return current ? { url: current.url, source: 'user' } : null;
+      },
+    });
+    expect(client.proxyStatus()).toEqual({
+      configured: false, source: 'direct', endpoint: null,
+    });
+    proxy.set('http://127.0.0.1:7897');
+    expect(client.proxyStatus()).toEqual({
+      configured: true, source: 'user', endpoint: 'http://127.0.0.1:7897',
+    });
+    env.QLH_HTTP_PROXY = 'http://127.0.0.1:8899';
+    expect(client.proxyStatus()).toEqual({
+      configured: true, source: 'QLH_HTTP_PROXY', endpoint: 'http://127.0.0.1:8899',
+    });
+    delete env.QLH_HTTP_PROXY;
+    expect(proxy.clear()).toBe(true);
+    expect(client.proxyStatus().source).toBe('direct');
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it('returns gated preflight states until credential and license gates pass', async () => {
@@ -217,10 +252,19 @@ describe('MODEL-FLEET M3 credential and network security', () => {
       },
     });
     const artifactStore = new ArtifactStore(join(dir, 'artifacts'));
+    const runtimeChecks = {
+      checkManifest: async (manifest: Record<string, unknown>, nodeId: string) => ({
+        schema_version: 1 as const, artifact_id: String(manifest.artifact_id),
+        node_id: nodeId, runtime_profile: 'llm-cpu-v1', status: 'ready' as const,
+        checked_at: new Date().toISOString(), engine: String(manifest.engine),
+        loader_version: 'fixture/1', runtime_fingerprint: `sha256:${'c'.repeat(64)}`,
+        load_ms: 1, details: {}, error: null,
+      }),
+    };
     const executor = new PullJobExecutor(
       jobs, new HfResolver(http),
       new HfDownloader(http, { progressThrottleMs: 0 }),
-      artifactStore, new ModelInspector(), vault, licenses,
+      artifactStore, new ModelInspector(), vault, licenses, runtimeChecks as any,
     );
     const source = {
       provider: 'gguf_huggingface' as const,
@@ -258,14 +302,22 @@ describe('MODEL-FLEET M3 credential and network security', () => {
   it('exposes credential status and explicit license acceptance without echoing secrets', async () => {
     const { dir, store } = tempStore('qlh-mf-security-api-');
     const vault = credentials(dir);
+    const proxy = new ModelProxyConfigRepository(
+      new ClusterSettingsRepository(store),
+    );
     const http = new ModelHttpClient({
-      proxyUrl: 'http://proxy.example:8080',
+      env: {},
+      proxyProvider: () => {
+        const current = proxy.get();
+        return current ? { url: current.url, source: 'user' } : null;
+      },
       fetchFn: async () => new Response('{}'),
     });
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(store)
       .overrideProvider(ModelCredentialStore).useValue(vault)
       .overrideProvider(ModelHttpClient).useValue(http)
+      .overrideProvider(ModelProxyConfigRepository).useValue(proxy)
       .overrideProvider(ConfigDao).useValue({
         enabled: false, dbEnabled: () => false,
         getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
@@ -302,12 +354,29 @@ describe('MODEL-FLEET M3 credential and network security', () => {
         payload: { repo_id: 'org/gated-model', license_id: 'llama3', accepted: true },
       });
       expect(accepted.statusCode).toBe(200);
+      const remoteProxy = await app.inject({
+        method: 'PUT', url: '/models/network/proxy',
+        remoteAddress: '192.0.2.10', payload: { url: 'http://127.0.0.1:7897' },
+      });
+      expect(remoteProxy.statusCode).toBe(403);
+      const savedProxy = await app.inject({
+        method: 'PUT', url: '/models/network/proxy',
+        payload: { url: 'http://127.0.0.1:7897' },
+      });
+      expect(savedProxy.statusCode).toBe(200);
+      expect(savedProxy.json().effective_proxy.source).toBe('user');
       const network = await app.inject({ method: 'GET', url: '/models/network' });
       expect(network.json().proxy).toEqual({
-        configured: true, source: 'QLH_HTTP_PROXY',
-        endpoint: 'http://proxy.example:8080',
+        configured: true, source: 'user',
+        endpoint: 'http://127.0.0.1:7897',
       });
+      expect(network.json().user_proxy.url).toBe('http://127.0.0.1:7897');
       expect(network.body).not.toContain(secret);
+      const clearedProxy = await app.inject({
+        method: 'DELETE', url: '/models/network/proxy',
+      });
+      expect(clearedProxy.statusCode).toBe(200);
+      expect(clearedProxy.json().effective_proxy.source).toBe('direct');
       const rawCredentials = readdirSync(vault.root).map(
         (name) => readFileSync(join(vault.root, name), 'utf-8'),
       ).join('\n');
