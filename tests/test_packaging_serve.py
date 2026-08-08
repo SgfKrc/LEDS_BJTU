@@ -105,6 +105,21 @@ def test_android_download_scan_includes_dist_and_gradle_outputs(tmp_path, monkey
     ]
 
 
+def test_reconfigure_utf8_converts_gbk_streams_without_crashing():
+    """serve.py 在 Windows GBK 控制台输出 emoji 曾直接崩溃（回归）。"""
+    import io
+
+    serve = _load_serve_module()
+    out = io.TextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict")
+    err = io.TextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict")
+    serve._reconfigure_utf8((out, err))
+    assert out.encoding.lower() == "utf-8"
+    assert err.encoding.lower() == "utf-8"
+    # GBK 无法编码的字符在 UTF-8 下可正常写出
+    out.write("📦 QLH 文件分发服务\n")
+    out.flush()
+
+
 def test_serve_dist_dir_matches_launcher_zip_output():
     """serve.py 扫描目录必须与 build-launcher.bat 的 ZIP 落点一致。"""
     serve = _load_serve_module()
