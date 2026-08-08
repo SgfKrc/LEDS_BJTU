@@ -1221,6 +1221,341 @@ input:focus, textarea:focus { border-color: var(--accent); }
 }
 
 /* ============================================================
+   MODEL-FLEET: local artifact workspace
+   ============================================================ */
+
+.model-fleet-workspace {
+  padding-top: 14px;
+}
+
+.fleet-section-header,
+.fleet-artifact-title,
+.fleet-job-title,
+.fleet-row-actions,
+.fleet-network-status {
+  display: flex;
+  align-items: center;
+}
+
+.fleet-section-header {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.fleet-section-header h3 {
+  margin: 0;
+}
+
+.fleet-icon-button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+  cursor: pointer;
+}
+
+.fleet-icon-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.fleet-icon-button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.fleet-tabs {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  margin: 10px 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.fleet-tab {
+  min-width: 0;
+  min-height: 30px;
+  padding: 4px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fleet-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-input);
+}
+
+.fleet-tab.active {
+  color: var(--on-accent);
+  background: var(--accent);
+}
+
+.fleet-panel {
+  min-width: 0;
+}
+
+.fleet-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  padding: 0 0 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.fleet-summary .ready { color: var(--success); }
+.fleet-summary .attention { color: var(--warning); }
+
+.fleet-artifact-list,
+.fleet-job-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.fleet-artifact-row,
+.fleet-job-row {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px;
+  background: var(--bg-primary);
+}
+
+.fleet-artifact-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.fleet-artifact-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.fleet-artifact-title,
+.fleet-job-title {
+  min-width: 0;
+  gap: 6px;
+  justify-content: space-between;
+}
+
+.fleet-artifact-title strong,
+.fleet-job-title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.fleet-status {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--text-secondary);
+  background: var(--bg-input);
+}
+
+.fleet-status.ready,
+.fleet-status.job-registered { color: #0c6a46; background: #d7f2e4; }
+.fleet-status.load_failed,
+.fleet-status.resource_rejected,
+.fleet-status.job-failed,
+.fleet-status.job-rejected,
+.fleet-status.job-quarantined { color: #9f2430; background: #fde1e4; }
+.fleet-status.stale,
+.fleet-status.unchecked,
+.fleet-status.job-cancelled { color: #805400; background: #fff0c6; }
+.fleet-status.job-queued,
+.fleet-status.job-resolving,
+.fleet-status.job-downloading,
+.fleet-status.job-verifying,
+.fleet-status.job-adapting { color: #0c577a; background: #d9effa; }
+
+.fleet-artifact-meta,
+.fleet-job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 5px;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.fleet-artifact-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.fleet-artifact-detail {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.fleet-row-actions {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
+.fleet-row-actions .setting-btn {
+  min-height: 26px;
+  padding: 3px 7px;
+  font-size: 10px;
+}
+
+.fleet-empty,
+.fleet-error {
+  padding: 10px 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.fleet-error {
+  margin-bottom: 8px;
+  color: var(--danger);
+}
+
+.fleet-acquire {
+  display: grid;
+  gap: 14px;
+}
+
+.fleet-form {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.fleet-form:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.fleet-form h4 {
+  margin: 0 0 2px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.fleet-form label {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.fleet-form input,
+.fleet-form select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-primary);
+  background: var(--bg-input);
+  font-size: 12px;
+}
+
+.fleet-form input:focus,
+.fleet-form select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.fleet-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.fleet-form-grid > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.fleet-form .setting-btn {
+  justify-self: start;
+  min-height: 29px;
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+.fleet-progress-track {
+  height: 5px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--bg-input);
+}
+
+.fleet-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.fleet-network-status {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 7px;
+  margin-bottom: 12px;
+  padding: 8px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.fleet-network-status strong { color: var(--text-primary); }
+
+.fleet-network-status code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 520px) {
+  .fleet-artifact-row { flex-direction: column; }
+  .fleet-row-actions { justify-content: flex-start; }
+  .fleet-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fleet-form-grid > div:last-child { grid-column: span 2; }
+  .fleet-network-status { grid-template-columns: auto 1fr; }
+  .fleet-network-status code { grid-column: span 2; text-align: left; }
+}
+
+/* ============================================================
    GPU 选择器 — 集显/独显切换
    ============================================================ */
 
