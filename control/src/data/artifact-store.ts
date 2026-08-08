@@ -90,6 +90,21 @@ export class ArtifactStore {
     return target;
   }
 
+  /** Copy a source file without loading the whole model into memory. */
+  stageCopyFile(jobId: string, relPath: string, sourcePath: string): string {
+    const target = path.join(this.stagingDir(jobId), relPath);
+    if (!target.startsWith(this.stagingDir(jobId) + path.sep)) {
+      throw new Error(`非法 staging 相对路径: ${relPath}`);
+    }
+    const source = path.resolve(sourcePath);
+    if (!fs.statSync(source).isFile()) {
+      throw new Error(`源文件不是普通文件: ${source}`);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    return target;
+  }
+
   listStaging(jobId: string): string[] {
     const dir = this.stagingDir(jobId);
     if (!fs.existsSync(dir)) return [];
@@ -133,20 +148,19 @@ export class ArtifactStore {
     if (!fs.existsSync(source)) {
       throw new Error(`staging 文件缺失: ${relPath}`);
     }
-    const data = fs.readFileSync(source);
-    const digest = sha256Hex(data);
+    const size = fs.statSync(source).size;
+    const digest = this.sha256File(source);
     const target = this.blobPath(digest);
     if (fs.existsSync(target)) {
       fs.rmSync(source, { force: true });
-      return { digest, size: data.length, path: target, deduped: true };
+      return { digest, size, path: target, deduped: true };
     }
     fs.mkdirSync(path.dirname(target), { recursive: true });
     // 原子性：先写临时再 rename（rename 同一文件系统内原子）
     const tmp = `${target}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, data);
+    fs.renameSync(source, tmp);
     fs.renameSync(tmp, target);
-    fs.rmSync(source, { force: true });
-    return { digest, size: data.length, path: target, deduped: false };
+    return { digest, size, path: target, deduped: false };
   }
 
   readBlob(digest: string): Buffer | null {
@@ -236,5 +250,23 @@ export class ArtifactStore {
   /** 清理 staging 残留（成功提交后调用；失败留 quarantine 不清理）。 */
   cleanupStaging(jobId: string): void {
     fs.rmSync(this.stagingDir(jobId), { recursive: true, force: true });
+  }
+
+  private sha256File(filePath: string): string {
+    const hash = crypto.createHash('sha256');
+    const fd = fs.openSync(filePath, 'r');
+    const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);
+    try {
+      let position = 0;
+      while (true) {
+        const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        hash.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return hash.digest('hex');
   }
 }

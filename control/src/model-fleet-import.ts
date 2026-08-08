@@ -1,12 +1,17 @@
-/** CLI for MF-N3 batch import. Build first, then run with --source. */
+/** CLI for M2 batch and catalog migration reports. */
+import * as fs from 'fs';
 import * as path from 'path';
 import { ArtifactStore } from './data/artifact-store';
-import { ModelBatchImporter } from './data/model-batch-import';
+import {
+  CatalogImportCandidate,
+  ModelBatchImporter,
+} from './data/model-batch-import';
 import { ModelImportService } from './data/model-import-service';
 import { ModelInspector } from './data/model-inspector';
 
 interface CliOptions {
-  source: string;
+  source?: string;
+  catalog?: string;
   store?: string;
   report?: string;
   namespace?: string;
@@ -16,6 +21,7 @@ interface CliOptions {
 function usage(): string {
   return [
     'Usage: node dist/model-fleet-import.js --source <models-dir> [options]',
+    '   or: node dist/model-fleet-import.js --catalog <catalog.json> [options]',
     '',
     'Options:',
     '  --store <dir>       Content-addressed store (default: QLH_MODEL_STORE)',
@@ -29,19 +35,21 @@ function parseArgs(argv: string[]): CliOptions {
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (key === '--help' || key === '-h') {
-      throw new Error('help');
-    }
+    if (key === '--help' || key === '-h') throw new Error('help');
     if (!key.startsWith('--') || index + 1 >= argv.length) {
-      throw new Error(`无效参数: ${key}`);
+      throw new Error(`invalid argument: ${key}`);
     }
     values.set(key.slice(2), argv[index + 1]);
     index += 1;
   }
   const source = values.get('source');
-  if (!source) throw new Error('缺少 --source');
+  const catalog = values.get('catalog');
+  if ((!source && !catalog) || (source && catalog)) {
+    throw new Error('provide exactly one of --source or --catalog');
+  }
   return {
     source,
+    catalog,
     store: values.get('store'),
     report: values.get('report'),
     namespace: values.get('namespace'),
@@ -66,7 +74,24 @@ export function run(argv: string[]): number {
     const importer = new ModelBatchImporter(
       new ModelImportService(store, new ModelInspector()),
     );
-    const report = importer.importDirectory(path.resolve(options.source), {
+    if (options.catalog) {
+      const catalogPath = path.resolve(options.catalog);
+      const candidates = JSON.parse(
+        fs.readFileSync(catalogPath, 'utf-8'),
+      ) as CatalogImportCandidate[];
+      if (!Array.isArray(candidates)) throw new Error('catalog must be an array');
+      const report = importer.importCatalog(catalogPath, candidates, {
+        namespace: options.namespace,
+        tag: options.tag,
+      });
+      const reportPath = options.report
+        ? path.resolve(options.report)
+        : path.join(store.root, 'reports', `catalog-migration-${Date.now()}.json`);
+      importer.writeCatalogReport(report, reportPath);
+      process.stdout.write(`${JSON.stringify({ ...report.totals, report: reportPath })}\n`);
+      return report.totals.missing_sources + report.totals.failed_sources > 0 ? 1 : 0;
+    }
+    const report = importer.importDirectory(path.resolve(options.source as string), {
       namespace: options.namespace,
       tag: options.tag,
     });
@@ -78,7 +103,7 @@ export function run(argv: string[]): number {
     return report.totals.failed > 0 ? 1 : 0;
   } catch (error) {
     process.stderr.write(
-      `批量导入失败: ${error instanceof Error ? error.message : String(error)}\n`,
+      `batch import failed: ${error instanceof Error ? error.message : String(error)}\n`,
     );
     return 1;
   }

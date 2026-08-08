@@ -95,7 +95,9 @@ export class ModelInspector {
         return result;
       }
       let offset = 24;
-      const budget = 1024 * 1024; // 只读元数据区
+      // Real-world GGUF files can carry multi-megabyte tokenizer metadata;
+      // keep parsing bounded without rejecting valid bundled models.
+      const budget = 64 * 1024 * 1024;
       for (let i = 0; i < kvCount; i++) {
         if (offset > budget) {
           result.errors.push('元数据区超过预算（可能损坏）');

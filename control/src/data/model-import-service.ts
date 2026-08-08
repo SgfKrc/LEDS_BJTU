@@ -55,9 +55,7 @@ export class ModelImportService {
       if (stat.isDirectory()) {
         this.copyDirToStaging(sourcePath, jobId, report);
       } else {
-        this.store.stageWrite(
-          jobId, path.basename(sourcePath), fs.readFileSync(sourcePath),
-        );
+        this.store.stageCopyFile(jobId, path.basename(sourcePath), sourcePath);
       }
 
       // 2) 静态检查（对 staging 副本，隔离于源）
@@ -155,7 +153,7 @@ export class ModelImportService {
         if (entry.isDirectory()) {
           if (!SKIP_FILES.has(entry.name)) walk(full, nextRel);
         } else if (!SKIP_FILES.has(entry.name)) {
-          this.store.stageWrite(jobId, nextRel, fs.readFileSync(full));
+          this.store.stageCopyFile(jobId, nextRel, full);
         }
       }
     };

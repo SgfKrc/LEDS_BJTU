@@ -11,11 +11,13 @@ import * as path from 'path';
 import {
   PullJobService, PullJob,
 } from './pull-job.service';
-import { HfResolver } from './hf-resolver';
+import { HfResolver, ResolveResult } from './hf-resolver';
 import { HfDownloader } from './hf-downloader';
 import { ArtifactStore, sha256Hex } from './artifact-store';
 import { ModelInspector } from './model-inspector';
 import { ModelDiskBudget } from './model-disk-budget';
+import { ModelCredentialStore } from './model-credential-store';
+import { ModelLicenseAcceptanceRepository } from './model-license-acceptance';
 
 @Injectable()
 export class PullJobExecutor {
@@ -27,6 +29,8 @@ export class PullJobExecutor {
     private readonly downloader: HfDownloader,
     private readonly store: ArtifactStore,
     private readonly inspector: ModelInspector,
+    private readonly credentials: ModelCredentialStore,
+    private readonly licenses: ModelLicenseAcceptanceRepository,
     private readonly diskBudget: ModelDiskBudget = new ModelDiskBudget(),
   ) {}
 
@@ -76,10 +80,45 @@ export class PullJobExecutor {
 
     // ---- resolving ----
     this.jobs.transition(jobId, 'resolving');
-    const resolved = await this.resolver.resolve(
-      repoId, job.source.requested_revision, job.source.allow_patterns,
-      job.source.endpoint,
-    );
+    const token = await this.credentials.get(job.source.credential_ref);
+    let resolved: ResolveResult;
+    try {
+      resolved = await this.resolver.resolve(
+        repoId, job.source.requested_revision, job.source.allow_patterns,
+        job.source.endpoint, { token },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith('HF credential ')) {
+        this.jobs.transition(jobId, 'rejected', {
+          error: { code: 'credential_unavailable', message },
+        });
+        return;
+      }
+      throw error;
+    }
+    const licenseId = resolved.license ?? 'unknown';
+    const acceptance = resolved.gated && resolved.license
+      ? this.licenses.get(repoId, licenseId)
+      : null;
+    if (resolved.gated && !token) {
+      this.jobs.transition(jobId, 'rejected', {
+        error: {
+          code: 'credential_required',
+          message: `gated repository requires credential_ref: ${repoId}`,
+        },
+      });
+      return;
+    }
+    if (resolved.gated && !acceptance) {
+      this.jobs.transition(jobId, 'rejected', {
+        error: {
+          code: 'license_acceptance_required',
+          message: `license acceptance required: ${repoId} (${licenseId})`,
+        },
+      });
+      return;
+    }
     const disk = this.diskBudget.evaluate(resolved.files, this.store);
     if (!disk.sufficient) {
       this.jobs.transition(jobId, 'rejected', {
@@ -117,6 +156,7 @@ export class PullJobExecutor {
           signal,
           expectedSize: file.size,
           apiBase: job.source.endpoint,
+          token,
           onProgress: (p) => {
             this.jobs.updateProgress(jobId, {
               downloaded_bytes: bytes + p.bytesDownloaded,
@@ -199,6 +239,7 @@ export class PullJobExecutor {
         resolved_revision: resolved.resolvedRevision,
         source_id: job.source.source_id ?? null,
         endpoint: job.source.endpoint ?? null,
+        credential_ref: job.source.credential_ref ?? null,
       },
       format: inspection ? 'gguf' : 'safetensors',
       engine: inspection ? 'llama_cpp' : 'pytorch_transformers',
@@ -213,7 +254,11 @@ export class PullJobExecutor {
       requirements: {
         runtime_profile: inspection ? 'llm-cpu-v1' : 'llm-cuda-v1',
       },
-      license: { id: 'unknown', acceptance_required: false },
+      license: {
+        id: licenseId,
+        acceptance_required: resolved.gated,
+        accepted_at: acceptance?.accepted_at ?? null,
+      },
       trust_policy: { trust_remote_code: false },
     };
     const manifestPath = this.store.writeManifest(manifest);
