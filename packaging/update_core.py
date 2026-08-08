@@ -2,8 +2,8 @@
 
 The core deliberately does not start installers.  It only parses a manifest,
 selects a matching artifact, downloads it atomically, and verifies its size
-and SHA-256.  A signed-manifest verifier can be added without changing the
-frontends or download transaction.
+and SHA-256.  Manifest signatures (UP-N2) are verified against the bundled
+pubkeys directory via packaging/signing.py; the core stays frontend-free.
 """
 
 from __future__ import annotations
@@ -153,6 +153,9 @@ class UpdateManifest:
     source_url: str = ""
     signature_present: bool = False
     signature_verified: bool = False
+    signature_key_id: str = ""
+    signature_signed_at: str = ""
+    signature_error: str = ""
 
     @classmethod
     def from_mapping(
@@ -182,6 +185,8 @@ class UpdateManifest:
             # A signature field is only metadata until a trusted-key verifier
             # has validated it.  Never promote presence to trust.
             signature_verified=False,
+            signature_key_id=str(value.get("key_id", "")),
+            signature_signed_at=str(value.get("signed_at", "")),
         )
 
 
@@ -216,9 +221,28 @@ def fetch_manifest(
     *,
     timeout: float = 8.0,
     opener: Callable[..., Any] | None = None,
+    trusted_keys_dir: str | os.PathLike[str] | None = None,
 ) -> UpdateManifest:
-    """Fetch and parse one manifest, resolving relative asset URLs."""
+    """Fetch and parse one manifest, resolving relative asset URLs.
+
+    When ``trusted_keys_dir`` is provided (or set via QLH_TRUSTED_KEYS_DIR),
+    a present ``signature`` field is verified against the trusted Ed25519
+    key set; verification failure only ever leaves
+    ``signature_verified=False`` with a reason in ``signature_error``.
+    """
     raw = _read_json_url(url, timeout=timeout, opener=opener)
+    # Verify the signature against the raw manifest body BEFORE any URL
+    # resolution rewrites it; the signature binds the bytes the publisher
+    # actually signed.
+    from signing import default_trusted_keys_dir, verify_manifest_signature
+
+    signature_error = ""
+    signature_verified = False
+    if raw.get("signature"):
+        trusted = trusted_keys_dir or default_trusted_keys_dir()
+        signature_verified, signature_error = verify_manifest_signature(
+            raw, trusted_keys_dir=trusted,
+        )
     resolved = dict(raw)
     assets = []
     raw_assets = raw.get("assets", [])
@@ -230,7 +254,17 @@ def fetch_manifest(
             copied["url"] = urllib.parse.urljoin(url, str(copied.get("url", "")))
             assets.append(copied)
         resolved["assets"] = assets
-    return UpdateManifest.from_mapping(resolved, source_url=url)
+    manifest = UpdateManifest.from_mapping(resolved, source_url=url)
+    if raw.get("signature"):
+        from dataclasses import replace
+
+        if not signature_verified:
+            manifest = replace(
+                manifest, signature_verified=False, signature_error=signature_error,
+            )
+        else:
+            manifest = replace(manifest, signature_verified=True)
+    return manifest
 
 
 def fetch_latest(
