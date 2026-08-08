@@ -368,6 +368,65 @@ export async function clearModelProxy() {
   return request('/models/network/proxy', { method: 'DELETE' });
 }
 
+export async function fetchModelSources() {
+  return request('/models/sources');
+}
+
+export async function saveModelSource(sourceId, payload) {
+  return request(`/models/sources/${encodeURIComponent(sourceId)}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteModelSource(sourceId) {
+  return request(`/models/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' });
+}
+
+export async function resetModelSources() {
+  return request('/models/sources/reset', { method: 'POST' });
+}
+
+export async function resolveModelPull(payload) {
+  return request('/models/resolve', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchModelCredentials() {
+  return request('/models/credentials');
+}
+
+export async function saveModelCredential(credentialId, secret) {
+  return request(`/models/credentials/${encodeURIComponent(credentialId)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ secret }),
+  });
+}
+
+export async function deleteModelCredential(credentialId) {
+  return request(`/models/credentials/${encodeURIComponent(credentialId)}`, { method: 'DELETE' });
+}
+
+export async function fetchModelLicenseAcceptances() {
+  return request('/models/licenses/acceptances');
+}
+
+export async function acceptModelLicense(payload) {
+  return request('/models/licenses/acceptances', {
+    method: 'POST',
+    body: JSON.stringify({ ...payload, accepted: true }),
+  });
+}
+
+export async function revokeModelLicense(payload) {
+  return request('/models/licenses/acceptances', {
+    method: 'DELETE',
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function sendMessage(message, opts = {}) {
   return request('/chat', {
     method: 'POST',

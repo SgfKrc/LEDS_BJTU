@@ -1,0 +1,87 @@
+{
+  "plan_id": "plan-quant-qwen-1.8b-v1",
+  "title": "Qwen 1.8B 量化/编译对照（EX-N2 首批）",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11",
+    "cpu": "x86_64",
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop 8GB",
+    "ram_gb": 32,
+    "engine": "transformers 4.47.1",
+    "torch": "2.13.0+cu126",
+    "cuda": "12.6"
+  },
+  "defaults": {
+    "runs": 5,
+    "timeout_s": 1500,
+    "max_retries": 0,
+    "resources": {"gpu": "gpu0", "model_slot": "qwen-1_8b"},
+    "command": [
+      "python", "scripts/experiment_llm_unit.py",
+      "--prompt-set-dir", "{prompt_set_dir}",
+      "--result-file", "{out_dir}/{experiment_id}.result.json",
+      "--runs", "5", "--max-prompts", "6", "--max-new-tokens", "50"
+    ]
+  },
+  "units": [
+    {
+      "experiment_id": "exp-0001",
+      "name": "qwen-1_8b fp16（基线）",
+      "command": ["python", "scripts/experiment_llm_unit.py", "--quant", "fp16", "--compile", "0",
+                  "--prompt-set-dir", "{prompt_set_dir}",
+                  "--result-file", "{out_dir}/{experiment_id}.result.json",
+                  "--runs", "5", "--max-prompts", "6", "--max-new-tokens", "50"],
+      "params": {"seed": null, "temperature": null, "top_p": null,
+                 "max_new_tokens": 50, "stream": false, "concurrency": 1,
+                 "independent_variable": {"quant_family": "fp16", "compile": false}},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "fp16", "tokenizer": "qwen", "context": 8192},
+      "gate": {"metric": "decode_tok_s", "op": ">=", "threshold": 10.0}
+    },
+    {
+      "experiment_id": "exp-0002",
+      "name": "qwen-1_8b fp16 + torch.compile",
+      "command": ["python", "-X", "utf8", "scripts/experiment_llm_unit.py", "--quant", "fp16", "--compile", "1",
+                  "--prompt-set-dir", "{prompt_set_dir}",
+                  "--result-file", "{out_dir}/{experiment_id}.result.json",
+                  "--runs", "5", "--max-prompts", "6", "--max-new-tokens", "50"],
+      "params": {"seed": null, "temperature": null, "top_p": null,
+                 "max_new_tokens": 50, "stream": false, "concurrency": 1,
+                 "independent_variable": {"quant_family": "fp16", "compile": true}},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "fp16", "tokenizer": "qwen", "context": 8192},
+      "baseline_experiment_id": "exp-0001",
+      "gate": {"metric": "decode_tok_s", "op": ">=", "baseline_ratio": 0.8}
+    },
+    {
+      "experiment_id": "exp-0003",
+      "name": "qwen-1_8b int8",
+      "command": ["python", "scripts/experiment_llm_unit.py", "--quant", "int8", "--compile", "0",
+                  "--prompt-set-dir", "{prompt_set_dir}",
+                  "--result-file", "{out_dir}/{experiment_id}.result.json",
+                  "--runs", "5", "--max-prompts", "6", "--max-new-tokens", "50"],
+      "params": {"seed": null, "temperature": null, "top_p": null,
+                 "max_new_tokens": 50, "stream": false, "concurrency": 1,
+                 "independent_variable": {"quant_family": "int8", "compile": false}},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "int8", "tokenizer": "qwen", "context": 8192},
+      "baseline_experiment_id": "exp-0001",
+      "gate": {"metric": "decode_tok_s", "op": ">=", "baseline_ratio": 0.8}
+    },
+    {
+      "experiment_id": "exp-0004",
+      "name": "qwen-1_8b int4 (NF4)",
+      "command": ["python", "scripts/experiment_llm_unit.py", "--quant", "int4", "--compile", "0",
+                  "--prompt-set-dir", "{prompt_set_dir}",
+                  "--result-file", "{out_dir}/{experiment_id}.result.json",
+                  "--runs", "5", "--max-prompts", "6", "--max-new-tokens", "50"],
+      "params": {"seed": null, "temperature": null, "top_p": null,
+                 "max_new_tokens": 50, "stream": false, "concurrency": 1,
+                 "independent_variable": {"quant_family": "nf4", "compile": false}},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "nf4", "effective_bpw": 4.0,
+                "tokenizer": "qwen", "context": 8192},
+      "baseline_experiment_id": "exp-0001",
+      "gate": {"metric": "decode_tok_s", "op": ">=", "baseline_ratio": 0.8}
+    }
+  ]
+}

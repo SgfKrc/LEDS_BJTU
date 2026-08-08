@@ -678,7 +678,7 @@ def test_model_identity_external_api_accepted(monkeypatch, mock_external_server)
         "engines": ["external_api"],
         "models": [identity.snapshot()],
         "max_concurrency": 2,
-    })
+    }, version=2)
 
 
 # ================================================================
