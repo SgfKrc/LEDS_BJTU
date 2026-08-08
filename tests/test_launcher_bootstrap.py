@@ -81,6 +81,16 @@ def test_windows_application_discovery_prefers_requested_variant(tmp_path, monke
     ]
 
 
+def test_build_launcher_bat_is_crlf_with_gitattributes_contract():
+    """cmd.exe 对 LF-only 批处理的 for/f 块解析崩溃；必须 CRLF + 属性强制。"""
+    raw = (PROJECT_ROOT / "packaging" / "build-launcher.bat").read_bytes()
+    assert raw.count(b"\r\n") > 0
+    assert raw.replace(b"\r\n", b"").count(b"\n") == 0
+    attrs = (PROJECT_ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "build-launcher.bat" in attrs
+    assert "eol=crlf" in attrs
+
+
 def test_linux_deb_build_keeps_bootstrap_and_venv_fallback_contract():
     script = (PROJECT_ROOT / "packaging" / "linux" / "build-deb.sh").read_text(
         encoding="utf-8"

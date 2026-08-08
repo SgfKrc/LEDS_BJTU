@@ -27,6 +27,7 @@ import sys
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+from typing import Any, Iterable
 from urllib.parse import quote, unquote, urlparse
 
 HOST = "0.0.0.0"
@@ -518,15 +519,20 @@ def _load_signer() -> "Signer | None":
     return Signer(env)
 
 
-def main(argv: list[str] | None = None) -> None:
-    global _SIGNER
-    # Windows 控制台默认 GBK 无法输出 emoji/部分中文，重配为 UTF-8。
-    for stream in (sys.stdout, sys.stderr):
+def _reconfigure_utf8(streams: Iterable[Any] | None = None) -> None:
+    """Reconfigure console streams to UTF-8 (Windows GBK cannot emit emoji)."""
+    for stream in streams if streams is not None else (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 pass
+
+
+def main(argv: list[str] | None = None) -> None:
+    global _SIGNER
+    # Windows 控制台默认 GBK 无法输出 emoji/部分中文，重配为 UTF-8。
+    _reconfigure_utf8()
     argv = sys.argv[1:] if argv is None else argv
     port = int(argv[0]) if argv else DEFAULT_PORT
     try:
