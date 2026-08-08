@@ -79,6 +79,7 @@ async function startControlSvc(dataDir: string): Promise<{ port: number; close()
       QLH_MODELS_DIR: path.join(dataDir, 'models'),
       QLH_MODEL_STORE: path.join(dataDir, 'model-store'),
       QLH_SQLITE_PATH: path.join(dataDir, 'control.sqlite3'),
+      QLH_CREDENTIAL_STORE_DIR: path.join(dataDir, 'credentials'),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -227,6 +228,30 @@ describe('控制面域渐进切换（QLH_CONTROL_URL → control-svc）', () => 
       const cleared = await request(server()).delete('/api/models/network/proxy');
       expect(cleared.status).toBe(200);
       expect(cleared.body.status).toBe('cleared');
+    });
+
+    it('模型来源、凭据状态与许可经网关进入 control-svc', async () => {
+      const sources = await request(server()).get('/api/models/sources');
+      expect(sources.status).toBe(200);
+      expect(sources.body.sources).toEqual(expect.arrayContaining([
+        expect.objectContaining({ source_id: 'hf-official', provider: 'huggingface' }),
+      ]));
+
+      const credentials = await request(server()).get('/api/models/credentials');
+      expect(credentials.status).toBe(200);
+      expect(credentials.body).toEqual({ credentials: [] });
+
+      const accepted = await request(server())
+        .post('/api/models/licenses/acceptances')
+        .send({ repo_id: 'org/gated-model', license_id: 'llama3', accepted: true });
+      expect(accepted.status).toBe(200);
+      expect(accepted.body.acceptance).toMatchObject({
+        repo_id: 'org/gated-model', license_id: 'llama3', accepted_by: 'local_user',
+      });
+
+      const acceptances = await request(server()).get('/api/models/licenses/acceptances');
+      expect(acceptances.status).toBe(200);
+      expect(acceptances.body.acceptances).toHaveLength(1);
     });
 
     it('POST /api/sessions 创建 → control-svc 真实 uuid 会话', async () => {
