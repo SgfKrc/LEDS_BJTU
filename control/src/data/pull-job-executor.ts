@@ -18,6 +18,7 @@ import { ModelInspector } from './model-inspector';
 import { ModelDiskBudget } from './model-disk-budget';
 import { ModelCredentialStore } from './model-credential-store';
 import { ModelLicenseAcceptanceRepository } from './model-license-acceptance';
+import { ModelRuntimeCheckService } from './model-runtime-check.service';
 
 @Injectable()
 export class PullJobExecutor {
@@ -31,6 +32,7 @@ export class PullJobExecutor {
     private readonly inspector: ModelInspector,
     private readonly credentials: ModelCredentialStore,
     private readonly licenses: ModelLicenseAcceptanceRepository,
+    private readonly runtimeChecks: ModelRuntimeCheckService,
     private readonly diskBudget: ModelDiskBudget = new ModelDiskBudget(),
   ) {}
 
@@ -264,9 +266,22 @@ export class PullJobExecutor {
     const manifestPath = this.store.writeManifest(manifest);
     this.store.cleanupStaging(jobId);
 
-    // ---- registered ----
+    // ---- adapting: isolated runtime admission; artifact remains stored on failure ----
+    this.jobs.transition(jobId, 'adapting', { artifact_id: artifactId });
+    const runtimeCheck = await this.runtimeChecks.checkManifest(
+      manifest,
+      process.env.QLH_NODE_ID?.trim() || 'local',
+      { signal },
+    );
+    if (signal.aborted) {
+      this.jobs.transition(jobId, 'cancelled', { runtime_check: runtimeCheck });
+      return;
+    }
+
+    // ---- registered: stored artifact; runtime_check decides deploy eligibility ----
     this.jobs.transition(jobId, 'registered', {
       artifact_id: artifactId,
+      runtime_check: runtimeCheck,
       error: null,
     });
     void manifestPath;

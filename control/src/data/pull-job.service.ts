@@ -11,6 +11,7 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { SqliteStore } from './sqlite-store';
+import { ArtifactRuntimeRecord } from './artifact-runtime-repository';
 
 export type PullJobState =
   | 'queued' | 'resolving' | 'downloading' | 'verifying' | 'adapting'
@@ -41,6 +42,7 @@ export interface PullJob {
     current_file: string | null;
   };
   artifact_id?: string | null;
+  runtime_check?: ArtifactRuntimeRecord | null;
   error?: { code: string; message: string } | null;
   created_at: string;
   updated_at: string;
@@ -122,6 +124,7 @@ export class PullJobService {
         current_file: null,
       },
       artifact_id: null,
+      runtime_check: null,
       error: null,
       created_at: now,
       updated_at: now,

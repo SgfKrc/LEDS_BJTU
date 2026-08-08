@@ -13,11 +13,12 @@ export interface ModelHttpClientOptions {
   fetchFn?: ModelFetchFn;
   env?: NodeJS.ProcessEnv;
   proxyUrl?: string | null;
+  proxyProvider?: () => { url: string; source: 'user' } | null;
 }
 
 export interface ModelProxyStatus {
   configured: boolean;
-  source: 'QLH_HTTP_PROXY';
+  source: 'QLH_HTTP_PROXY' | 'user' | 'direct';
   endpoint: string | null;
 }
 
@@ -28,16 +29,16 @@ export function normalizeModelProxyUrl(raw: string | null | undefined): string |
   try {
     url = new URL(value);
   } catch {
-    throw new Error('QLH_HTTP_PROXY is not a valid URL');
+    throw new Error('model proxy is not a valid URL');
   }
   if (!['http:', 'https:'].includes(url.protocol)) {
-    throw new Error('QLH_HTTP_PROXY must use http:// or https://');
+    throw new Error('model proxy must use http:// or https://');
   }
   if (url.username || url.password) {
-    throw new Error('QLH_HTTP_PROXY must not contain embedded credentials');
+    throw new Error('model proxy must not contain embedded credentials');
   }
   if ((url.pathname && url.pathname !== '/') || url.search || url.hash) {
-    throw new Error('QLH_HTTP_PROXY must be an origin without path/query/fragment');
+    throw new Error('model proxy must be an origin without path/query/fragment');
   }
   return url.origin;
 }
@@ -45,23 +46,27 @@ export function normalizeModelProxyUrl(raw: string | null | undefined): string |
 @Injectable()
 export class ModelHttpClient implements OnApplicationShutdown {
   private readonly fetchFn: ModelFetchFn;
-  private readonly proxyUrl: string | null;
-  private proxyAgent: ProxyAgent | null = null;
+  private readonly env: NodeJS.ProcessEnv;
+  private readonly explicitProxyUrl: string | null | undefined;
+  private readonly proxyProvider?: ModelHttpClientOptions['proxyProvider'];
+  private readonly proxyAgents = new Map<string, ProxyAgent>();
 
   constructor(@Optional() options: ModelHttpClientOptions = {}) {
     this.fetchFn = options.fetchFn
       ?? (undiciFetch as unknown as ModelFetchFn);
-    const configured = options.proxyUrl !== undefined
-      ? options.proxyUrl
-      : (options.env ?? process.env).QLH_HTTP_PROXY;
-    this.proxyUrl = normalizeModelProxyUrl(configured);
+    this.env = options.env ?? process.env;
+    this.explicitProxyUrl = options.proxyUrl === undefined
+      ? undefined
+      : normalizeModelProxyUrl(options.proxyUrl);
+    this.proxyProvider = options.proxyProvider;
   }
 
   proxyStatus(): ModelProxyStatus {
+    const selected = this.selectProxy();
     return {
-      configured: this.proxyUrl !== null,
-      source: 'QLH_HTTP_PROXY',
-      endpoint: this.proxyUrl,
+      configured: selected !== null,
+      source: selected?.source ?? 'direct',
+      endpoint: selected?.url ?? null,
     };
   }
 
@@ -73,15 +78,36 @@ export class ModelHttpClient implements OnApplicationShutdown {
     const headers = new Headers(init.headers);
     if (auth.token) headers.set('authorization', `Bearer ${auth.token}`);
     const request: ModelRequestInit = { ...init, headers };
-    if (this.proxyUrl) {
-      this.proxyAgent ??= new ProxyAgent(this.proxyUrl);
-      request.dispatcher = this.proxyAgent;
+    const selected = this.selectProxy();
+    if (selected) {
+      let agent = this.proxyAgents.get(selected.url);
+      if (!agent) {
+        agent = new ProxyAgent(selected.url);
+        this.proxyAgents.set(selected.url, agent);
+      }
+      request.dispatcher = agent;
     }
     return this.fetchFn(input, request);
   }
 
   async onApplicationShutdown(): Promise<void> {
-    if (this.proxyAgent) await this.proxyAgent.close();
-    this.proxyAgent = null;
+    await Promise.all([...this.proxyAgents.values()].map((agent) => agent.close()));
+    this.proxyAgents.clear();
+  }
+
+  private selectProxy(): { url: string; source: 'QLH_HTTP_PROXY' | 'user' } | null {
+    if (this.explicitProxyUrl !== undefined) {
+      return this.explicitProxyUrl
+        ? { url: this.explicitProxyUrl, source: 'QLH_HTTP_PROXY' }
+        : null;
+    }
+    const environmentUrl = normalizeModelProxyUrl(this.env.QLH_HTTP_PROXY);
+    if (environmentUrl) {
+      return { url: environmentUrl, source: 'QLH_HTTP_PROXY' };
+    }
+    const user = this.proxyProvider?.() ?? null;
+    if (!user) return null;
+    const url = normalizeModelProxyUrl(user.url);
+    return url ? { url, source: 'user' } : null;
   }
 }

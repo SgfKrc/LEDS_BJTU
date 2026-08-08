@@ -34,6 +34,12 @@
       ]
     },
     "epoch": { "type": "integer", "minimum": 0 },
+    "runtime_profile": { "type": "string", "minLength": 1 },
+    "runtime_fingerprint": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "runtime_checked_at": { "type": ["string", "null"], "format": "date-time" },
     "digest_verified": { "type": "boolean" },
     "prepared_at": { "type": ["string", "null"], "format": "date-time" },
     "activated_at": { "type": ["string", "null"], "format": "date-time" },
