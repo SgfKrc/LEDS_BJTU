@@ -7,6 +7,7 @@ import {
 } from '../../data/model-credential-store';
 import { ModelHttpClient } from '../../data/model-http-client';
 import { ModelLicenseAcceptanceRepository } from '../../data/model-license-acceptance';
+import { ModelProxyConfigRepository } from '../../data/model-proxy-config-repository';
 
 class CredentialRequest {
   secret?: string;
@@ -18,12 +19,17 @@ class LicenseAcceptanceRequest {
   accepted?: boolean;
 }
 
+class ProxyRequest {
+  url?: string;
+}
+
 @Controller('models')
 export class ModelSecurityController {
   constructor(
     private readonly credentials: ModelCredentialStore,
     private readonly licenses: ModelLicenseAcceptanceRepository,
     private readonly http: ModelHttpClient,
+    private readonly proxy: ModelProxyConfigRepository,
   ) {}
 
   @Put('credentials/:credentialId')
@@ -79,7 +85,40 @@ export class ModelSecurityController {
 
   @Get('network')
   network(): Record<string, unknown> {
-    return { proxy: this.http.proxyStatus() };
+    return {
+      proxy: this.http.proxyStatus(),
+      user_proxy: this.proxy.get(),
+    };
+  }
+
+  @Put('network/proxy')
+  putProxy(
+    @Body() body: ProxyRequest,
+    @Req() request: FastifyRequest,
+  ): Record<string, unknown> {
+    this.assertLocal(request);
+    try {
+      const saved = this.proxy.set(body?.url ?? '');
+      return {
+        status: 'saved',
+        user_proxy: saved,
+        effective_proxy: this.http.proxyStatus(),
+      };
+    } catch (error) {
+      throw new HttpException(
+        error instanceof Error ? error.message : String(error), 422,
+      );
+    }
+  }
+
+  @Delete('network/proxy')
+  @HttpCode(200)
+  clearProxy(@Req() request: FastifyRequest): Record<string, unknown> {
+    this.assertLocal(request);
+    return {
+      status: this.proxy.clear() ? 'cleared' : 'not_found',
+      effective_proxy: this.http.proxyStatus(),
+    };
   }
 
   @Get('licenses/acceptances')

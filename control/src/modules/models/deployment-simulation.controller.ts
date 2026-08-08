@@ -7,6 +7,7 @@ import {
 
 class SimulationRequest {
   artifact_id?: string;
+  runtime_profile?: string;
   required_capabilities?: string[];
   nodes?: SimulationNode[];
 }
@@ -19,13 +20,14 @@ export class DeploymentSimulationController {
   @HttpCode(201)
   create(@Body() body: SimulationRequest): Record<string, unknown> {
     try {
-      if (!body?.artifact_id || !body.nodes) {
-        throw new Error('artifact_id and nodes are required');
+      if (!body?.artifact_id || !body.nodes || !body.runtime_profile) {
+        throw new Error('artifact_id, runtime_profile and nodes are required');
       }
       return {
         status: 'created',
         plan: this.simulator.createPlan({
           artifactId: body.artifact_id,
+          runtimeProfile: body.runtime_profile,
           nodes: body.nodes,
           requiredCapabilities: body.required_capabilities,
         }),

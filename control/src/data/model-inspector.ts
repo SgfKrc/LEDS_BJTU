@@ -46,9 +46,13 @@ enum GgufType {
 }
 
 const GGUF_FILE_TYPES: Record<number, string> = {
-  0: 'f32', 1: 'f16', 2: 'q4_0', 3: 'q4_1', 6: 'q5_0', 7: 'q5_1',
-  8: 'q8_0', 10: 'q2_k', 11: 'q3_k', 12: 'q4_k', 13: 'q5_k',
-  14: 'q6_k', 15: 'q8_k', 16: 'iq2_xxs', 17: 'iq2_xs', 18: 'iq3_xxs',
+  0: 'f32', 1: 'f16', 2: 'q4_0', 3: 'q4_1', 7: 'q8_0', 8: 'q5_0',
+  9: 'q5_1', 10: 'q2_k', 11: 'q3_k_s', 12: 'q3_k_m', 13: 'q3_k_l',
+  14: 'q4_k_s', 15: 'q4_k_m', 16: 'q5_k_s', 17: 'q5_k_m', 18: 'q6_k',
+  19: 'iq2_xxs', 20: 'iq2_xs', 21: 'q2_k_s', 22: 'iq3_xs',
+  23: 'iq3_xxs', 24: 'iq1_s', 25: 'iq4_nl', 26: 'iq3_s', 27: 'iq3_m',
+  28: 'iq2_s', 29: 'iq2_m', 30: 'iq4_xs', 31: 'iq1_m', 32: 'bf16',
+  36: 'tq1_0', 37: 'tq2_0', 38: 'mxfp4_moe', 39: 'nvfp4', 40: 'q1_0',
 };
 
 function familyForArchitecture(arch: string): string | null {
@@ -223,6 +227,9 @@ export class ModelInspector {
         if (String(value).length > 0) result.has_tokenizer = true;
         break;
       default:
+        if (key.endsWith('.context_length')) {
+          result.context_length = Number(value) || result.context_length;
+        }
         break;
     }
   }

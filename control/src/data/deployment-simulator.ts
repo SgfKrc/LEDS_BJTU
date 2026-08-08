@@ -1,6 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { SqliteStore } from './sqlite-store';
+import {
+  ArtifactRuntimeRecord, ArtifactRuntimeRepository,
+} from './artifact-runtime-repository';
 
 export type SimulationStatus =
   | 'planned' | 'preparing' | 'distributing' | 'ready' | 'active'
@@ -10,6 +13,7 @@ export interface SimulationNode {
   node_id: string;
   artifact_ids: string[];
   capabilities: string[];
+  runtime_fingerprint: string;
   available?: boolean;
 }
 
@@ -21,6 +25,9 @@ export interface DeploymentRecord {
   status: SimulationStatus;
   epoch: number;
   digest_verified: boolean;
+  runtime_profile: string;
+  runtime_fingerprint: string | null;
+  runtime_checked_at: string | null;
   prepared_at: string | null;
   activated_at: string | null;
   error: { code: string; message: string } | null;
@@ -30,6 +37,7 @@ export interface DeploymentSimulationPlan {
   schema_version: 1;
   plan_id: string;
   artifact_id: string;
+  runtime_profile: string;
   required_capabilities: string[];
   target_nodes: string[];
   actual_nodes: string[];
@@ -42,17 +50,27 @@ export interface DeploymentSimulationPlan {
 
 @Injectable()
 export class DeploymentSimulator {
-  constructor(private readonly store: SqliteStore) {}
+  constructor(
+    private readonly store: SqliteStore,
+    private readonly runtimeChecks: ArtifactRuntimeRepository,
+  ) {}
 
   createPlan(input: {
     artifactId: string;
     nodes: SimulationNode[];
+    runtimeProfile: string;
     requiredCapabilities?: string[];
   }): DeploymentSimulationPlan {
     if (!/^sha256:[0-9a-f]{64}$/.test(input.artifactId)) {
       throw new Error('artifact_id must be a sha256 digest');
     }
     if (input.nodes.length === 0) throw new Error('at least one node is required');
+    if (!/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(input.runtimeProfile)) {
+      throw new Error('runtime_profile is required and must be valid');
+    }
+    if (input.nodes.some((node) => !/^sha256:[0-9a-f]{64}$/.test(node.runtime_fingerprint))) {
+      throw new Error('each node must provide a runtime_fingerprint');
+    }
     const targetNodes = input.nodes.map((node) => node.node_id);
     if (new Set(targetNodes).size !== targetNodes.length) {
       throw new Error('node_id must be unique in a plan');
@@ -62,6 +80,7 @@ export class DeploymentSimulator {
       schema_version: 1,
       plan_id: `sim_${randomUUID().slice(0, 12)}`,
       artifact_id: input.artifactId,
+      runtime_profile: input.runtimeProfile,
       required_capabilities: [...(input.requiredCapabilities ?? [])],
       target_nodes: targetNodes,
       actual_nodes: [],
@@ -75,6 +94,9 @@ export class DeploymentSimulator {
         status: 'planned',
         epoch: 0,
         digest_verified: false,
+        runtime_profile: input.runtimeProfile,
+        runtime_fingerprint: null,
+        runtime_checked_at: null,
         prepared_at: null,
         activated_at: null,
         error: null,
@@ -99,6 +121,7 @@ export class DeploymentSimulator {
       schema_version: 1,
       plan_id: first.plan_id,
       artifact_id: first.artifact_id,
+      runtime_profile: first.runtime_profile,
       required_capabilities: first.required_capabilities,
       target_nodes: first.target_nodes,
       actual_nodes: first.actual_nodes,
@@ -133,10 +156,18 @@ export class DeploymentSimulator {
       if (missing.length > 0) {
         return this.failed(record, 'capability_mismatch', `missing capabilities: ${missing.join(',')}`);
       }
+      const runtime = this.runtimeChecks.get(
+        plan.artifact_id, record.node_id, plan.runtime_profile,
+      );
+      const runtimeFailure = this.runtimeFailure(record, node, runtime);
+      if (runtimeFailure) return runtimeFailure;
       return {
         ...record,
         status: 'ready' as const,
         digest_verified: true,
+        runtime_profile: plan.runtime_profile,
+        runtime_fingerprint: runtime?.runtime_fingerprint ?? null,
+        runtime_checked_at: runtime?.checked_at ?? null,
         prepared_at: now,
         error: null,
       };
@@ -153,18 +184,33 @@ export class DeploymentSimulator {
 
   activate(planId: string): DeploymentSimulationPlan {
     const plan = this.require(planId);
-    const ready = plan.records.filter((record) => record.status === 'ready');
-    if (ready.length === 0) throw new Error('no prepared node can be activated');
+    const prepared = plan.records.filter((record) => record.status === 'ready');
+    if (prepared.length === 0) throw new Error('no prepared node can be activated');
     const now = new Date().toISOString();
     const epoch = plan.epoch + 1;
-    const records = plan.records.map((record) => record.status === 'ready'
-      ? { ...record, status: 'active' as const, epoch, activated_at: now }
-      : record);
+    const records = plan.records.map((record) => {
+      if (record.status !== 'ready') return record;
+      const runtime = this.runtimeChecks.get(
+        plan.artifact_id, record.node_id, plan.runtime_profile,
+      );
+      if (!runtime || runtime.status !== 'ready'
+          || runtime.runtime_fingerprint !== record.runtime_fingerprint) {
+        return this.runtimeFailed(
+          record,
+          'runtime_admission_changed',
+          'runtime admission changed after prepare; run prepare again',
+          runtime,
+        );
+      }
+      return { ...record, status: 'active' as const, epoch, activated_at: now };
+    });
+    const active = records.filter((record) => record.status === 'active');
     return this.saveAndReturn({
       ...plan,
       records,
-      actual_nodes: ready.map((record) => record.node_id),
-      status: ready.length === records.length ? 'active' : 'partial',
+      actual_nodes: active.map((record) => record.node_id),
+      status: active.length === 0 ? 'failed'
+        : active.length === records.length ? 'active' : 'partial',
       epoch,
       updated_at: now,
     }, []);
@@ -198,6 +244,48 @@ export class DeploymentSimulator {
     };
   }
 
+  private runtimeFailure(
+    record: DeploymentRecord,
+    node: SimulationNode,
+    runtime: ArtifactRuntimeRecord | null,
+  ): DeploymentRecord | null {
+    if (!runtime) {
+      return this.runtimeFailed(
+        record, 'runtime_unchecked',
+        'artifact has no runtime check for this node and profile', null,
+      );
+    }
+    if (runtime.status !== 'ready') {
+      return this.runtimeFailed(
+        record, 'runtime_not_ready', `runtime status is ${runtime.status}`, runtime,
+      );
+    }
+    if (!runtime.runtime_fingerprint
+        || runtime.runtime_fingerprint !== node.runtime_fingerprint) {
+      return this.runtimeFailed(
+        record, 'runtime_context_changed',
+        'node runtime fingerprint differs from the checked runtime', runtime,
+      );
+    }
+    return null;
+  }
+
+  private runtimeFailed(
+    record: DeploymentRecord,
+    code: string,
+    message: string,
+    runtime: ArtifactRuntimeRecord | null,
+  ): DeploymentRecord {
+    return {
+      ...record,
+      status: 'failed',
+      digest_verified: true,
+      runtime_fingerprint: runtime?.runtime_fingerprint ?? null,
+      runtime_checked_at: runtime?.checked_at ?? null,
+      error: { code, message },
+    };
+  }
+
   private require(planId: string): DeploymentSimulationPlan {
     const plan = this.get(planId);
     if (!plan) throw new Error(`deployment simulation not found: ${planId}`);
@@ -226,6 +314,7 @@ export class DeploymentSimulator {
           created_at: plan.created_at,
           updated_at: plan.updated_at,
           artifact_id: plan.artifact_id,
+          runtime_profile: plan.runtime_profile,
           node_id: record.node_id,
           record,
           node: byId.get(record.node_id) ?? null,
@@ -258,6 +347,7 @@ interface PersistedRecord {
   created_at: string;
   updated_at: string;
   artifact_id: string;
+  runtime_profile: string;
   node_id: string;
   record: DeploymentRecord;
   node: SimulationNode | null;

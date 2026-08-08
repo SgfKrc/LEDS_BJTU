@@ -42,7 +42,12 @@ import { PullPreflightService } from './data/pull-preflight.service';
 import { ModelCredentialStore } from './data/model-credential-store';
 import { ModelHttpClient } from './data/model-http-client';
 import { ModelLicenseAcceptanceRepository } from './data/model-license-acceptance';
+import { ModelProxyConfigRepository } from './data/model-proxy-config-repository';
 import { DeploymentSimulator } from './data/deployment-simulator';
+import { ArtifactRuntimeRepository } from './data/artifact-runtime-repository';
+import { ModelRuntimeSidecar } from './data/model-runtime-sidecar';
+import { ModelRuntimeCheckService } from './data/model-runtime-check.service';
+import { ModelImportAdmissionService } from './data/model-import-admission.service';
 import { ClusterProfileRepository } from './data/cluster-profile-repository';
 import { ClusterProfileSelectionService } from './data/cluster-profile-selection';
 import { ClusterDiscoveryService } from './data/cluster-discovery.service';
@@ -58,6 +63,7 @@ import { ModelSourcesController } from './modules/models/model-sources.controlle
 import { ModelSecurityController } from './modules/models/model-security.controller';
 import { DeploymentSimulationController } from './modules/models/deployment-simulation.controller';
 import { ClusterProfilesController } from './modules/cluster/cluster-profiles.controller';
+import { RuntimeAdmissionController } from './modules/models/runtime-admission.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
@@ -86,6 +92,7 @@ export class CatchAllController {
     ModelSourcesController,
     ModelSecurityController,
     DeploymentSimulationController,
+    RuntimeAdmissionController,
     ClusterProfilesController,
     WorkflowsController,
     BootstrapController,
@@ -124,12 +131,30 @@ export class CatchAllController {
     HfDownloader,
     ModelDiskBudget,
     ModelCredentialStore,
-    ModelHttpClient,
+    ModelProxyConfigRepository,
+    {
+      provide: ModelHttpClient,
+      inject: [ModelProxyConfigRepository],
+      useFactory: (proxy: ModelProxyConfigRepository) => new ModelHttpClient({
+        proxyProvider: () => {
+          const current = proxy.get();
+          return current ? { url: current.url, source: 'user' as const } : null;
+        },
+      }),
+    },
     ModelLicenseAcceptanceRepository,
     ModelSourceRepository,
     PullPreflightService,
     PullJobExecutor,
     DeploymentSimulator,
+    ArtifactRuntimeRepository,
+    {
+      provide: ModelRuntimeSidecar,
+      inject: [ArtifactStore],
+      useFactory: (store: ArtifactStore) => new ModelRuntimeSidecar(store),
+    },
+    ModelRuntimeCheckService,
+    ModelImportAdmissionService,
     // M4：多集群档案
     ClusterProfileRepository,
     ClusterProfileSelectionService,

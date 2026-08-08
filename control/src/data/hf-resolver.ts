@@ -50,7 +50,11 @@ export class HfResolver {
     auth: { token?: string | null } = {},
   ): Promise<ResolveResult> {
     const apiBase = (apiBaseOverride ?? this.apiBase).replace(/\/+$/, '');
-    const url = `${apiBase}/api/models/${repoId}?revision=${encodeURIComponent(requestedRevision)}`;
+    const query = new URLSearchParams({
+      revision: requestedRevision,
+      blobs: 'true',
+    });
+    const url = `${apiBase}/api/models/${repoId}?${query.toString()}`;
     const response = await this.http.fetch(url, {
       headers: { accept: 'application/json' },
       signal: AbortSignal.timeout(30_000),
@@ -76,16 +80,27 @@ export class HfResolver {
         rfilename: string;
         size?: number;
         sha256?: string | null;
+        lfs?: {
+          size?: number;
+          sha256?: string | null;
+        };
       }>;
     };
     if (!data.sha) {
       throw new Error(`HF resolve response is missing sha: ${repoId}@${requestedRevision}`);
     }
-    let files: ResolvedFile[] = (data.siblings ?? []).map((file) => ({
-      rfilename: file.rfilename,
-      size: Number(file.size ?? 0),
-      sha256: file.sha256 ?? null,
-    }));
+    let files: ResolvedFile[] = (data.siblings ?? []).map((file) => {
+      const rawSize = file.size ?? file.lfs?.size;
+      const size = Number(rawSize);
+      if (rawSize === undefined || !Number.isSafeInteger(size) || size < 0) {
+        throw new Error(`HF resolve file size is invalid: ${file.rfilename}`);
+      }
+      return {
+        rfilename: file.rfilename,
+        size,
+        sha256: file.sha256 ?? file.lfs?.sha256 ?? null,
+      };
+    });
     if (allowPatterns && allowPatterns.length > 0) {
       files = files.filter((file) => allowPatterns.some(
         (pattern) => globMatch(pattern, file.rfilename),
