@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qlh-experiment-record-schema-v1",
+  "title": "QLH 实验记录（EX-N1 schema v1，2026-08-09 冻结）",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "experiment_id", "experiment_name", "plan_id", "timestamp",
+    "commit", "env", "model", "prompt_set", "params", "runs",
+    "metrics", "gate", "artifacts"
+  ],
+  "properties": {
+    "experiment_id": { "type": "string", "pattern": "^exp-[0-9]{4}$" },
+    "experiment_name": { "type": "string" },
+    "plan_id": { "type": "string" },
+    "timestamp": { "type": "string" },
+    "commit": { "type": "string" },
+    "env": {
+      "type": "object",
+      "properties": {
+        "os": { "type": "string" },
+        "cpu": { "type": "string" },
+        "gpu": { "type": "string" },
+        "ram_gb": { "type": ["number", "null"] },
+        "engine": { "type": "string" },
+        "torch": { "type": "string" },
+        "cuda": { "type": "string" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "artifact_sha256": { "type": ["string", "null"] },
+        "quant_family": { "type": ["string", "null"] },
+        "effective_bpw": { "type": ["number", "null"] },
+        "tokenizer": { "type": ["string", "null"] },
+        "context": { "type": ["number", "null"] }
+      }
+    },
+    "prompt_set": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sha256": { "type": "string" },
+        "count": { "type": "number" }
+      }
+    },
+    "params": {
+      "type": "object",
+      "properties": {
+        "seed": { "type": ["number", "null"] },
+        "temperature": { "type": ["number", "null"] },
+        "top_p": { "type": ["number", "null"] },
+        "max_new_tokens": { "type": ["number", "null"] },
+        "stream": { "type": "boolean" },
+        "concurrency": { "type": "number" },
+        "independent_variable": { "type": "object" }
+      }
+    },
+    "runs": { "type": "number", "minimum": 1 },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "ttft_ms": { "type": ["number", "null"] },
+        "decode_tok_s": { "type": ["number", "null"] },
+        "e2e_ms": { "type": ["number", "null"] },
+        "peak_vram_gb": { "type": ["number", "null"] },
+        "load_s": { "type": ["number", "null"] },
+        "success": { "type": "number" },
+        "failed": { "type": "number" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "properties": {
+        "correct_rate": { "type": ["number", "null"] },
+        "format_rate": { "type": ["number", "null"] }
+      }
+    },
+    "baseline_experiment_id": { "type": ["string", "null"] },
+    "gate": {
+      "type": "object",
+      "properties": {
+        "metric": { "type": "string" },
+        "threshold": { "type": "string" },
+        "status": { "enum": ["passed", "failed", "invalid"] }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "raw_log": { "type": "string" },
+        "outputs": { "type": "string" },
+        "result_file": { "type": ["string", "null"] }
+      }
+    },
+    "retries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "attempt": { "type": "number" },
+          "exit_code": { "type": ["number", "null"] },
+          "reason": { "type": "string" },
+          "log": { "type": "string" }
+        }
+      }
+    }
+  }
+}

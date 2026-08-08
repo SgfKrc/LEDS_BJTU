@@ -1,0 +1,30 @@
+{"id": "zh-001", "category": "zh_qa", "prompt": "请用中文详细介绍一下北京交通大学的办学特色和优势专业。", "prompt_token_estimate": 28}
+{"id": "zh-002", "category": "zh_qa", "prompt": "解释什么是分布式系统，并举两个现实中的例子说明其优缺点。", "prompt_token_estimate": 32}
+{"id": "zh-003", "category": "zh_qa", "prompt": "写一段话向小学生解释大语言模型是如何工作的。", "prompt_token_estimate": 24}
+{"id": "zh-004", "category": "zh_qa", "prompt": "简述 TCP 三次握手的过程，并说明为什么需要第三次握手。", "prompt_token_estimate": 27}
+{"id": "zh-005", "category": "zh_qa", "prompt": "介绍机器学习的三种主要类型，并各举一个应用场景。", "prompt_token_estimate": 26}
+{"id": "en-001", "category": "en_qa", "prompt": "Explain the difference between TCP and UDP in one short paragraph.", "prompt_token_estimate": 14}
+{"id": "en-002", "category": "en_qa", "prompt": "Summarize the key ideas of the paper 'Attention Is All You Need' in two sentences.", "prompt_token_estimate": 18}
+{"id": "en-003", "category": "en_qa", "prompt": "What are the main advantages of edge computing over cloud computing?", "prompt_token_estimate": 14}
+{"id": "en-004", "category": "en_qa", "prompt": "Write a short definition of a hash function and name one practical use.", "prompt_token_estimate": 16}
+{"id": "en-005", "category": "en_qa", "prompt": "Describe the concept of a vector database and when you would use it.", "prompt_token_estimate": 16}
+{"id": "code-001", "category": "code", "prompt": "Write a Python function that checks whether a string is a valid IPv4 address. Return True or False.", "prompt_token_estimate": 22}
+{"id": "code-002", "category": "code", "prompt": "Implement a function in Python that merges two sorted lists into one sorted list without using the built-in sort.", "prompt_token_estimate": 24}
+{"id": "code-003", "category": "code", "prompt": "Write a Python function to find the longest common prefix of a list of strings.", "prompt_token_estimate": 18}
+{"id": "code-004", "category": "code", "prompt": "Fix the bug in this code: it should return the sum of even numbers in a list but returns 0 for empty input.", "prompt_token_estimate": 26}
+{"id": "code-005", "category": "code", "prompt": "Write a SQL query that returns the top 5 customers by total order amount from two tables.", "prompt_token_estimate": 21}
+{"id": "math-001", "category": "math_reasoning", "prompt": "A train leaves Beijing at 8:00 traveling at 120 km/h. Another leaves Shanghai at 9:00 traveling at 100 km/h toward it. Distance is 1200 km. When do they meet?", "prompt_token_estimate": 36}
+{"id": "math-002", "category": "math_reasoning", "prompt": "If 3 machines can produce 60 widgets in 5 hours, how many widgets can 5 machines produce in 8 hours?", "prompt_token_estimate": 22}
+{"id": "math-003", "category": "math_reasoning", "prompt": "Prove that the sum of the first n odd numbers equals n squared.", "prompt_token_estimate": 18}
+{"id": "math-004", "category": "math_reasoning", "prompt": "There are 12 coins, one is counterfeit and lighter. Using a balance scale, how many weighings are needed in the worst case? Explain.", "prompt_token_estimate": 26}
+{"id": "math-005", "category": "math_reasoning", "prompt": "Solve for x: 2^(x+1) = 8^x. Show your reasoning step by step.", "prompt_token_estimate": 18}
+{"id": "long-001", "category": "long_context", "prompt": "请对以下长篇文档进行总结，输出三个要点并各用一句话解释。文档内容：多段技术说明文字（此处由 runner 注入固定长文）。", "prompt_token_estimate": 48}
+{"id": "long-002", "category": "long_context", "prompt": "阅读下面这段 2000 字左右的文章，找出其中提到的所有技术名词，并用列表形式输出。", "prompt_token_estimate": 36}
+{"id": "long-003", "category": "long_context", "prompt": "从以下会议纪要中提取行动项、负责人和截止日期，按表格输出。", "prompt_token_estimate": 24}
+{"id": "long-004", "category": "long_context", "prompt": "请把下面这段约 1500 字的英文技术文档翻译成中文，保持术语准确。", "prompt_token_estimate": 22}
+{"id": "long-005", "category": "long_context", "prompt": "针对以下长文档的第三节内容，回答：作者提出的三个论点分别是什么？", "prompt_token_estimate": 26}
+{"id": "fmt-001", "category": "format", "prompt": "输出一个 JSON 对象，包含 name、age、tags 三个字段，其中 tags 是字符串数组，不要输出其他内容。", "prompt_token_estimate": 30}
+{"id": "fmt-002", "category": "format", "prompt": "用 Markdown 表格列出 2026 年 1 月到 6 月的月份名称和每个月的天数。", "prompt_token_estimate": 22}
+{"id": "fmt-003", "category": "format", "prompt": "输出一个 Python 字典字面量，键为 a、b、c，值分别为 1、2、3，只输出代码。", "prompt_token_estimate": 20}
+{"id": "fmt-004", "category": "format", "prompt": "生成一个包含三个步骤的 numbered list，每步一句话，步骤之间不要有空行。", "prompt_token_estimate": 20}
+{"id": "fmt-005", "category": "format", "prompt": "输出 CSV 格式的三行数据，表头为 id,name,score，值自拟，不要输出额外文字。", "prompt_token_estimate": 20}
