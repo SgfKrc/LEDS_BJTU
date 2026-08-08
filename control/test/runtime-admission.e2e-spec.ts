@@ -137,6 +137,30 @@ describe('MODEL-FLEET runtime admission API', () => {
     expect(invalidated.json().runtime_checks[0].invalidation_reason).toBe('loader-upgraded');
   });
 
+  it('summarizes artifact aliases, storage, and the latest local admission state', async () => {
+    const manifest = createManifest('inventory-model');
+    await app.inject({
+      method: 'POST', url: '/models/runtime-checks/retry',
+      payload: { namespace: 'user', name: 'inventory-model', tag: 'latest' },
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/models/artifacts' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().node_id).toBe('local-api');
+    expect(response.json().summary).toMatchObject({ total: 1, ready: 1, unchecked: 0 });
+    expect(response.json().artifacts[0]).toMatchObject({
+      artifact_id: manifest.artifact_id,
+      reference: { namespace: 'user', name: 'inventory-model', tag: 'latest' },
+      format: 'gguf',
+      engine: 'llama_cpp',
+      runnable: true,
+      storage: { file_count: 1 },
+      runtime_check: { status: 'ready', node_id: 'local-api' },
+    });
+    expect(response.json().artifacts[0].storage.total_bytes).toBeGreaterThan(0);
+    expect(response.json().artifacts[0].runtime_check.details.stderr_tail).toBeUndefined();
+  });
+
   it('imports a local model and runs admission before returning', async () => {
     const modelPath = join(root, 'local-qwen.gguf');
     writeFileSync(modelPath, qwenGguf());
