@@ -10,7 +10,7 @@
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
-> 最新复核（2026-08-08）：当前仓库正式 Python 基线仍为 1650 项中的 `1641 passed / 7 skipped / 2 failed`；两个失败固定为 v2 测试调用 `_validate_capabilities()` 缺少 `version`，L0-5 尚未关闭。临时补齐 `version=2` 后可验证 `1643 passed / 7 skipped / 0 failed`，但修复尚未落地。control-svc 全量 **`250/250 passed`**（含 MODEL-FLEET M2 catalog 实跑、M3 Windows 安全门、用户代理和真实小工件续传），gateway `101 passed`；DPAPI、代理优先级、gated 双重门、公开小工件 download/Range/受控中断恢复和生产依赖 0 vulnerability 已验证。真实模型权重完整 pull、gated 账号、PG 长时、Tailscale/PC Worker、runtime sidecar、主应用干净机发布和 Android 真机回归仍待完成。
+> 最新复核（2026-08-08）：当前仓库正式 Python 基线仍为 1650 项中的 `1641 passed / 7 skipped / 2 failed`；两个失败固定为 v2 测试调用 `_validate_capabilities()` 缺少 `version`，L0-5 尚未关闭。临时补齐 `version=2` 后可验证 `1643 passed / 7 skipped / 0 failed`，但修复尚未落地。control-svc 全量 **`264/264 passed`**（含 MODEL-FLEET M2 catalog/runtime sidecar/准入接线实跑、M3 Windows 安全门、用户代理和真实小工件续传），gateway `101 passed`；DeepSeek 7B GGUF 已由本地 API 重试得到带运行时指纹的 `ready` 并通过部署 prepare，Safetensors 因本机资源安全余量不足为 `resource_rejected`；pull/import 后置准入、状态查询/重试/失效、部署指纹过滤、DPAPI、代理优先级、gated 双重门、公开小工件 download/Range/受控中断恢复和生产依赖 0 vulnerability 已验证。真实模型权重完整 pull、Safetensors 适配主机、gated 账号、PG 长时、Tailscale/PC Worker、主应用干净机发布和 Android 真机回归仍待完成。
 > 2026-08-06 复核：Python 全量回归 **`1416 passed / 4 skipped`**（约 3 min），control-svc 微服务套件 **205 passed**（含 MODEL-FLEET M0-M4：契约/本地事实源/工件库/一键 pull/多集群档案），SD 质量门与 T9 聊天页相关测试全绿。SD 1.5 图像工作区（文生图/图生图/IP-Adapter reference）自动门与**双人目视审核均通过**（2026-08-06，Siegfried Kkm./浅草爱音，5 份报告 status=passed）；`bjtu chat` T9 聊天页 T9.0-T9.5 完成（终端走查 54/54）；微服务改造阶段 3.2 完成（control-svc 136/136）。2026-08-05 复核：Python 全量回归 **`1303 passed / 23 skipped`**（1326 项），SD/API 专项 155/155、前端 15/15、网关 100/100；90s DreamBooth 十种子自动门 10/10。历史复核链：2026-08-03 `1112 passed / 3 skipped`（Android Full/Lite 构建成功、TUI 契约 44/44）；2026-07-31 `1066 passed / 23 skipped`；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。
 
 ---
@@ -786,7 +786,7 @@ python serve.py
 - [测试与评判标准](docs/测试与评判标准.md)
 - [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.1/5.1A/5.3 本地门与双人目视完成；剩余正式离线发布包、真实 Diffusers Worker 与分布式接入）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
-- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：M2 8 条目实际迁移、M3 Windows 安全门与真实小工件续传均已完成（阶段报告已归档废弃，结论见计划 §16）；下一票为 DeepSeek 7B runtime sidecar，真实模型权重完整 pull、PG/Tailscale/跨 PC 分发仍受外部或硬件门约束
+- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：M2 8 条目迁移/runtime sidecar/准入接线、M3 Windows 安全门与真实小工件续传均已完成；DeepSeek 7B GGUF `ready` 且部署 prepare 通过，Safetensors `resource_rejected`；下一票为本地模型管理控制面/UI（不需代理），真实模型权重完整 pull、PG/Tailscale/跨 PC 分发仍受外部或硬件门约束
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
 - [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 全自动优化实验脚本：固定提示词集/seed/工件、串并行调度、统一数据 schema 与报告汇总（L4 Candidate，尚未实施）
 
