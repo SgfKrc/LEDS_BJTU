@@ -13,7 +13,7 @@
 - 2 个模型 ID、4 个实际来源迁移成功，共提交 46 个 blob 和 4 份 manifest；
 - 6 个模型 ID 的本地源路径不存在，按 `missing` 登记，未创建伪工件、未进入 quarantine；
 - 最终报告中 `failed_sources=0`、`quarantined_sources=0`；首轮两个 GGUF 因 1 MiB 元数据预算过小被隔离，解析预算保持有界并提升到 64 MiB 后重试成功；
-- 本次完成的是 M2“8 条目实际运行并登记报告”证据，不代表 8 个模型权重已全部具备，也不代表 runtime sidecar 试加载已经通过。
+- 本次完成的是 M2“8 条目实际运行并登记报告”证据，不代表 8 个模型权重已全部具备；后续 runtime sidecar 结论见 [M2 运行时侧车报告](MODEL-FLEET-M2运行时侧车报告-20260808.md)：DeepSeek 7B GGUF 已 `ready`，Safetensors 为资源拒绝而非加载成功。
 
 最终本地报告：`build/model-fleet/catalog-migration-20260808-final.json`。首轮与 GGUF 重试报告分别为 `build/model-fleet/catalog-migration-20260808.json`、`build/model-fleet/catalog-gguf-retry-20260808.json`。`build/` 是本机生成目录，不作为发布包或 Git 工件。
 
@@ -56,6 +56,7 @@ node dist/model-fleet-import.js --catalog ..\build\model-fleet\catalog-seed.json
 
 ## 4. 下一步
 
-1. M2 runtime sidecar 对 DeepSeek 7B 的 Safetensors 与 GGUF 各做一次隔离试加载；Qwen 1.8B 在专用 legacy adapter/远程代码信任策略完成前保持 inspection only。
-2. M3 Windows 安全门已在后续批次完成，见 [M3 凭据、代理与 gated 许可安全门](MODEL-FLEET-M3安全门报告-20260808.md)；真实 Hub/代理/gated 账号仍待外部环境。
-3. 六个缺失模型仅在权重真实到位后重跑 catalog；不得把 `missing` 改写成已迁移或已部署。
+1. runtime sidecar 基础与本机门已完成，见 [M2 运行时侧车报告](MODEL-FLEET-M2运行时侧车报告-20260808.md)；下一步把运行时终态接入 pull/import 准入和部署过滤。Qwen 1.8B 在专用 legacy adapter/远程代码信任策略完成前保持 inspection only。
+2. DeepSeek 7B Safetensors 仅在资源安全余量满足后重试；当前 `resource_rejected` 不得改写成 `ready`。
+3. M3 Windows 安全门已在后续批次完成，见 [M3 凭据、代理与 gated 许可安全门](MODEL-FLEET-M3安全门报告-20260808.md)；真实 Hub/代理/gated 账号仍待外部环境。
+4. 六个缺失模型仅在权重真实到位后重跑 catalog；不得把 `missing` 改写成已迁移或已部署。
