@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "schema_version": 1,
+      "event": "started",
+      "job_id": "pull_sequence_001",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:00Z"
+    },
+    {
+      "schema_version": 1,
+      "event": "resolved",
+      "job_id": "pull_sequence_001",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:01Z",
+      "resolved_revision": "9f5e8a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+    },
+    {
+      "schema_version": 1,
+      "event": "progress",
+      "job_id": "pull_sequence_001",
+      "phase": "downloading",
+      "at": "2026-08-08T10:00:02Z",
+      "total_bytes": 1024,
+      "downloaded_bytes": 512,
+      "files_total": 2,
+      "files_done": 1,
+      "current_file": "model-00002-of-00002.safetensors"
+    },
+    {
+      "schema_version": 1,
+      "event": "verified",
+      "job_id": "pull_sequence_001",
+      "phase": "verifying",
+      "at": "2026-08-08T10:00:03Z",
+      "resolved_revision": "9f5e8a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8",
+      "total_bytes": 1024,
+      "downloaded_bytes": 1024,
+      "files_total": 2,
+      "files_done": 2
+    },
+    {
+      "schema_version": 1,
+      "event": "completed",
+      "job_id": "pull_sequence_001",
+      "phase": "done",
+      "at": "2026-08-08T10:00:04Z"
+    }
+  ]
+}

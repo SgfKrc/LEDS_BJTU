@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "schema_version": 1,
+      "event": "started",
+      "job_id": "pull_sequence_regression",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:00Z"
+    },
+    {
+      "schema_version": 1,
+      "event": "resolved",
+      "job_id": "pull_sequence_regression",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:01Z",
+      "resolved_revision": "9f5e8a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+    },
+    {
+      "schema_version": 1,
+      "event": "progress",
+      "job_id": "pull_sequence_regression",
+      "phase": "downloading",
+      "at": "2026-08-08T10:00:02Z",
+      "total_bytes": 1024,
+      "downloaded_bytes": 768,
+      "files_total": 2,
+      "files_done": 1
+    },
+    {
+      "schema_version": 1,
+      "event": "progress",
+      "job_id": "pull_sequence_regression",
+      "phase": "downloading",
+      "at": "2026-08-08T10:00:03Z",
+      "total_bytes": 1024,
+      "downloaded_bytes": 256,
+      "files_total": 2,
+      "files_done": 0
+    },
+    {
+      "schema_version": 1,
+      "event": "failed",
+      "job_id": "pull_sequence_regression",
+      "phase": "downloading",
+      "at": "2026-08-08T10:00:04Z",
+      "error": {
+        "code": "download_failed",
+        "message": "fixture failure"
+      }
+    }
+  ]
+}
