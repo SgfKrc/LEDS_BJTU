@@ -21,11 +21,4 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
   },
-  webServer: {
-    command: 'npm run dev -- --host 127.0.0.1 --port 15173',
-    cwd: HERE,
-    url: 'http://127.0.0.1:15173',
-    timeout: 30_000,
-    reuseExistingServer: false,
-  },
 });

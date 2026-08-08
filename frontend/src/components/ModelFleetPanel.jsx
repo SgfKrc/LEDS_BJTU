@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   buildLocalImportRequest,
   buildModelPullRequest,
+  buildModelResolveRequest,
+  buildModelSourceRequest,
+  credentialIdFromRef,
   isModelPullActive,
+  modelPullRequestKey,
   modelPullProgressPercent,
   modelRuntimeLabel,
 } from '../modelFleetState';
@@ -11,6 +15,7 @@ const TABS = [
   ['artifacts', '工件'],
   ['acquire', '导入与拉取'],
   ['jobs', '任务'],
+  ['security', '来源与凭据'],
   ['network', '网络'],
 ];
 
@@ -19,6 +24,14 @@ const EMPTY_INVENTORY = {
   artifacts: [],
   summary: { total: 0, ready: 0, stale: 0, attention: 0, unchecked: 0, total_bytes: 0 },
 };
+
+const EMPTY_SOURCE_FORM = {
+  sourceId: '', name: '', provider: 'huggingface', endpoint: 'https://huggingface.co',
+  credentialRef: '', priority: 100, enabled: true,
+};
+
+const EMPTY_CREDENTIAL_FORM = { credentialId: '', secret: '' };
+const EMPTY_LICENSE_FORM = { repoId: '', licenseId: '' };
 
 function formatBytes(value) {
   const bytes = Number(value || 0);
@@ -44,10 +57,22 @@ function runtimeClass(runtimeCheck) {
   return runtimeCheck?.status || 'unchecked';
 }
 
+function preflightLabel(status) {
+  return ({
+    ready: '可以拉取',
+    insufficient_storage: '磁盘不足',
+    credential_required: '需要凭据',
+    license_required: '需要许可',
+  })[status] || status || '未解析';
+}
+
 export default function ModelFleetPanel({ onToast }) {
   const [tab, setTab] = useState('artifacts');
   const [inventory, setInventory] = useState(EMPTY_INVENTORY);
   const [jobs, setJobs] = useState([]);
+  const [sources, setSources] = useState([]);
+  const [credentials, setCredentials] = useState([]);
+  const [acceptances, setAcceptances] = useState([]);
   const [network, setNetwork] = useState({ proxy: { source: 'direct', endpoint: null }, user_proxy: null });
   const [proxyDraft, setProxyDraft] = useState('');
   const [loading, setLoading] = useState(true);
@@ -57,8 +82,12 @@ export default function ModelFleetPanel({ onToast }) {
     sourcePath: '', namespace: 'user', name: '', tag: 'latest',
   });
   const [pullForm, setPullForm] = useState({
-    provider: 'gguf_huggingface', repoId: '', revision: 'main', allowPatterns: '*.gguf',
+    sourceId: '', provider: 'gguf_huggingface', repoId: '', revision: 'main', allowPatterns: '*.gguf',
   });
+  const [preflight, setPreflight] = useState(null);
+  const [sourceForm, setSourceForm] = useState(EMPTY_SOURCE_FORM);
+  const [credentialForm, setCredentialForm] = useState(EMPTY_CREDENTIAL_FORM);
+  const [licenseForm, setLicenseForm] = useState(EMPTY_LICENSE_FORM);
 
   const refresh = useCallback(async ({ preserveProxy = false, quiet = false } = {}) => {
     if (!quiet) setLoading(true);
@@ -67,6 +96,9 @@ export default function ModelFleetPanel({ onToast }) {
       api.fetchModelArtifacts(),
       api.fetchModelPullJobs(),
       api.fetchModelNetwork(),
+      api.fetchModelSources(),
+      api.fetchModelCredentials(),
+      api.fetchModelLicenseAcceptances(),
     ]);
     const failures = [];
     if (results[0].status === 'fulfilled') setInventory(results[0].value);
@@ -79,13 +111,32 @@ export default function ModelFleetPanel({ onToast }) {
     } else {
       failures.push(results[2].reason);
     }
-    setError(failures.length === 3 ? (failures[0]?.message || '模型控制面不可用') : '');
+    if (results[3].status === 'fulfilled') {
+      const nextSources = results[3].value.sources || [];
+      setSources(nextSources);
+      setPullForm((value) => {
+        const currentAvailable = nextSources.some(
+          (source) => source.source_id === value.sourceId && source.enabled && source.provider === 'huggingface',
+        );
+        if (currentAvailable) return value;
+        const preferred = nextSources.find((source) => source.enabled && source.provider === 'huggingface');
+        return { ...value, sourceId: preferred?.source_id || '' };
+      });
+    } else failures.push(results[3].reason);
+    if (results[4].status === 'fulfilled') setCredentials(results[4].value.credentials || []);
+    else failures.push(results[4].reason);
+    if (results[5].status === 'fulfilled') setAcceptances(results[5].value.acceptances || []);
+    else failures.push(results[5].reason);
+    setError(failures.length === results.length ? (failures[0]?.message || '模型控制面不可用') : '');
     if (!quiet) setLoading(false);
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
 
   const hasActiveJobs = useMemo(() => jobs.some(isModelPullActive), [jobs]);
+  const preflightReady = useMemo(() => (
+    preflight?.request_key === modelPullRequestKey(pullForm) && preflight?.status === 'ready'
+  ), [preflight, pullForm]);
   useEffect(() => {
     if (!hasActiveJobs) return undefined;
     const timer = window.setInterval(() => refresh({ preserveProxy: true, quiet: true }), 2000);
@@ -126,8 +177,12 @@ export default function ModelFleetPanel({ onToast }) {
   const submitPull = async (event) => {
     event.preventDefault();
     const payload = buildModelPullRequest(pullForm);
-    if (!payload.source.repo_id) {
-      onToast?.({ type: 'error', msg: '仓库 ID 为必填项' });
+    if (!payload.source_id || !payload.source.repo_id) {
+      onToast?.({ type: 'error', msg: '来源和仓库 ID 为必填项' });
+      return;
+    }
+    if (!preflightReady) {
+      onToast?.({ type: 'error', msg: '当前来源与文件清单尚未通过解析检查' });
       return;
     }
     const result = await run('pull', async () => {
@@ -136,6 +191,122 @@ export default function ModelFleetPanel({ onToast }) {
     }, (value) => `拉取任务已进入 ${value?.state || '队列'}`);
     if (result) setTab('jobs');
   };
+
+  const updatePullForm = (patch) => {
+    setPullForm((value) => ({ ...value, ...patch }));
+    setPreflight(null);
+  };
+
+  const resolvePull = async () => {
+    const payload = buildModelResolveRequest(pullForm);
+    if (!payload.source_id || !payload.repo_id) {
+      onToast?.({ type: 'error', msg: '来源和仓库 ID 为必填项' });
+      return;
+    }
+    const requestKey = modelPullRequestKey(pullForm);
+    const result = await run('resolve', async () => {
+      const api = await import('../api/client');
+      return api.resolveModelPull(payload);
+    }, (value) => `解析结果：${preflightLabel(value?.status)}`, { warning: true });
+    if (result) setPreflight({ ...result, request_key: requestKey });
+  };
+
+  const submitSource = async (event) => {
+    event.preventDefault();
+    const request = buildModelSourceRequest(sourceForm);
+    if (!request.source_id || !request.payload.name || !request.payload.endpoint) {
+      onToast?.({ type: 'error', msg: '来源 ID、名称和地址为必填项' });
+      return;
+    }
+    const result = await run('source-save', async () => {
+      const api = await import('../api/client');
+      return api.saveModelSource(request.source_id, request.payload);
+    }, () => '模型来源已保存');
+    if (result) {
+      setSourceForm({ ...EMPTY_SOURCE_FORM });
+      setPreflight(null);
+    }
+  };
+
+  const editSource = (source) => setSourceForm({
+    sourceId: source.source_id,
+    name: source.name,
+    provider: source.provider,
+    endpoint: source.endpoint,
+    credentialRef: source.credential_ref || '',
+    priority: source.priority,
+    enabled: source.enabled,
+  });
+
+  const deleteSource = (source) => run(`source-delete:${source.source_id}`, async () => {
+    const api = await import('../api/client');
+    return api.deleteModelSource(source.source_id);
+  }, () => source.builtin ? '内置来源已禁用' : '模型来源已删除').then((result) => {
+    if (result) {
+      setSourceForm({ ...EMPTY_SOURCE_FORM });
+      setPreflight(null);
+    }
+  });
+
+  const resetSources = () => run('source-reset', async () => {
+    const api = await import('../api/client');
+    return api.resetModelSources();
+  }, () => '模型来源已恢复默认').then((result) => {
+    if (result) {
+      setSourceForm({ ...EMPTY_SOURCE_FORM });
+      setPreflight(null);
+    }
+  });
+
+  const submitCredential = async (event) => {
+    event.preventDefault();
+    const credentialId = credentialForm.credentialId.trim();
+    if (!credentialId || !credentialForm.secret) {
+      onToast?.({ type: 'error', msg: '凭据 ID 和密钥为必填项' });
+      return;
+    }
+    const result = await run('credential-save', async () => {
+      const api = await import('../api/client');
+      return api.saveModelCredential(credentialId, credentialForm.secret);
+    }, () => '凭据已写入操作系统安全存储');
+    if (result) setCredentialForm({ credentialId, secret: '' });
+  };
+
+  const deleteCredential = (credential) => {
+    const credentialId = credentialIdFromRef(credential.credential_ref);
+    if (!credentialId) return;
+    run(`credential-delete:${credentialId}`, async () => {
+      const api = await import('../api/client');
+      return api.deleteModelCredential(credentialId);
+    }, () => '凭据已删除');
+  };
+
+  const submitLicense = async (event) => {
+    event.preventDefault();
+    const payload = {
+      repo_id: licenseForm.repoId.trim(), license_id: licenseForm.licenseId.trim(),
+    };
+    if (!payload.repo_id || !payload.license_id) {
+      onToast?.({ type: 'error', msg: '仓库 ID 和许可 ID 为必填项' });
+      return;
+    }
+    const result = await run('license-accept', async () => {
+      const api = await import('../api/client');
+      return api.acceptModelLicense(payload);
+    }, () => '模型许可已接受');
+    if (result) setLicenseForm({ ...EMPTY_LICENSE_FORM });
+  };
+
+  const revokeLicense = (acceptance) => run(
+    `license-revoke:${acceptance.repo_id}:${acceptance.license_id}`,
+    async () => {
+      const api = await import('../api/client');
+      return api.revokeModelLicense({
+        repo_id: acceptance.repo_id, license_id: acceptance.license_id,
+      });
+    },
+    () => '模型许可接受记录已撤销',
+  );
 
   const retryRuntime = (artifact) => run(`retry:${artifact.artifact_id}`, async () => {
     const api = await import('../api/client');
@@ -288,19 +459,37 @@ export default function ModelFleetPanel({ onToast }) {
             <h4>远端拉取</h4>
             <div className="fleet-form-grid">
               <div>
+                <label htmlFor="fleet-pull-source">来源</label>
+                <select id="fleet-pull-source" data-testid="fleet-pull-source" value={pullForm.sourceId} onChange={(event) => updatePullForm({ sourceId: event.target.value })}>
+                  <option value="">选择来源</option>
+                  {sources.filter((source) => source.enabled && source.provider === 'huggingface').map((source) => (
+                    <option key={source.source_id} value={source.source_id}>{source.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
                 <label htmlFor="fleet-pull-provider">格式</label>
-                <select id="fleet-pull-provider" value={pullForm.provider} onChange={(event) => setPullForm((value) => ({ ...value, provider: event.target.value }))}>
+                <select id="fleet-pull-provider" value={pullForm.provider} onChange={(event) => updatePullForm({ provider: event.target.value })}>
                   <option value="gguf_huggingface">GGUF</option>
                   <option value="huggingface">Safetensors</option>
                 </select>
               </div>
-              <div><label htmlFor="fleet-pull-revision">Revision</label><input id="fleet-pull-revision" value={pullForm.revision} onChange={(event) => setPullForm((value) => ({ ...value, revision: event.target.value }))} /></div>
+              <div><label htmlFor="fleet-pull-revision">Revision</label><input id="fleet-pull-revision" value={pullForm.revision} onChange={(event) => updatePullForm({ revision: event.target.value })} /></div>
             </div>
             <label htmlFor="fleet-pull-repo">仓库 ID</label>
-            <input id="fleet-pull-repo" data-testid="fleet-pull-repo" placeholder="org/repository" value={pullForm.repoId} onChange={(event) => setPullForm((value) => ({ ...value, repoId: event.target.value }))} />
+            <input id="fleet-pull-repo" data-testid="fleet-pull-repo" placeholder="org/repository" value={pullForm.repoId} onChange={(event) => updatePullForm({ repoId: event.target.value })} />
             <label htmlFor="fleet-pull-patterns">文件匹配</label>
-            <input id="fleet-pull-patterns" value={pullForm.allowPatterns} onChange={(event) => setPullForm((value) => ({ ...value, allowPatterns: event.target.value }))} />
-            <button type="submit" className="setting-btn primary" disabled={Boolean(busy)}>{busy === 'pull' ? '创建中…' : '开始拉取'}</button>
+            <input id="fleet-pull-patterns" value={pullForm.allowPatterns} onChange={(event) => updatePullForm({ allowPatterns: event.target.value })} />
+            {preflight && (
+              <div className={`fleet-preflight ${preflight.status}`} data-testid="fleet-preflight">
+                <div><strong>{preflightLabel(preflight.status)}</strong><span>{preflight.source?.source_id}</span></div>
+                <div><span>{preflight.files?.length || 0} 文件</span><span>{formatBytes(preflight.total_bytes)}</span><span>{preflight.resolved_revision?.slice(0, 12)}</span></div>
+              </div>
+            )}
+            <div className="fleet-row-actions fleet-form-actions">
+              <button type="button" className="setting-btn secondary" onClick={resolvePull} disabled={Boolean(busy)}>{busy === 'resolve' ? '解析中…' : '解析检查'}</button>
+              <button type="submit" className="setting-btn primary" disabled={Boolean(busy) || !preflightReady}>{busy === 'pull' ? '创建中…' : '确认拉取'}</button>
+            </div>
           </form>
         </div>
       )}
@@ -331,6 +520,109 @@ export default function ModelFleetPanel({ onToast }) {
               })}
             </div>
           ) : <div className="fleet-empty">没有拉取任务</div>}
+        </div>
+      )}
+
+      {tab === 'security' && (
+        <div className="fleet-panel fleet-security" role="tabpanel">
+          <section className="fleet-subsection">
+            <div className="fleet-subsection-header">
+              <h4>模型来源</h4>
+              <button type="button" className="setting-btn secondary" onClick={resetSources} disabled={Boolean(busy)}>{busy === 'source-reset' ? '恢复中…' : '恢复默认'}</button>
+            </div>
+            <div className="fleet-source-list">
+              {sources.map((source) => (
+                <div className="fleet-source-row" key={source.source_id}>
+                  <div className="fleet-source-main">
+                    <div className="fleet-artifact-title">
+                      <strong>{source.name}</strong>
+                      <span className={`fleet-status ${source.enabled ? 'ready' : 'unchecked'}`}>{source.enabled ? '启用' : '停用'}</span>
+                    </div>
+                    <div className="fleet-artifact-meta">
+                      <span>{source.source_id}</span><span>{source.provider}</span><span>优先级 {source.priority}</span>
+                    </div>
+                    <div className="fleet-artifact-detail">{source.endpoint} · {source.credential_ref || '无凭据'}</div>
+                  </div>
+                  <div className="fleet-row-actions">
+                    <button type="button" className="setting-btn secondary" onClick={() => editSource(source)} disabled={Boolean(busy)}>编辑</button>
+                    <button type="button" className="setting-btn danger-ghost" onClick={() => deleteSource(source)} disabled={Boolean(busy)}>{source.builtin ? '禁用' : '删除'}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <form className="fleet-form" onSubmit={submitSource}>
+              <div className="fleet-form-grid">
+                <div><label htmlFor="fleet-source-id">来源 ID</label><input id="fleet-source-id" data-testid="fleet-source-id" value={sourceForm.sourceId} onChange={(event) => setSourceForm((value) => ({ ...value, sourceId: event.target.value }))} /></div>
+                <div><label htmlFor="fleet-source-name">名称</label><input id="fleet-source-name" data-testid="fleet-source-name" value={sourceForm.name} onChange={(event) => setSourceForm((value) => ({ ...value, name: event.target.value }))} /></div>
+                <div>
+                  <label htmlFor="fleet-source-provider">Provider</label>
+                  <select id="fleet-source-provider" value={sourceForm.provider} onChange={(event) => setSourceForm((value) => ({ ...value, provider: event.target.value }))}>
+                    <option value="huggingface">Hugging Face</option><option value="modelscope">ModelScope</option>
+                  </select>
+                </div>
+              </div>
+              <label htmlFor="fleet-source-endpoint">Endpoint</label>
+              <input id="fleet-source-endpoint" data-testid="fleet-source-endpoint" value={sourceForm.endpoint} onChange={(event) => setSourceForm((value) => ({ ...value, endpoint: event.target.value }))} />
+              <div className="fleet-form-grid fleet-form-grid-compact">
+                <div>
+                  <label htmlFor="fleet-source-credential">凭据</label>
+                  <select id="fleet-source-credential" value={sourceForm.credentialRef} onChange={(event) => setSourceForm((value) => ({ ...value, credentialRef: event.target.value }))}>
+                    <option value="">无凭据</option>
+                    {sourceForm.credentialRef && !credentials.some((item) => item.credential_ref === sourceForm.credentialRef) && <option value={sourceForm.credentialRef}>{sourceForm.credentialRef}（不可用）</option>}
+                    {credentials.map((credential) => <option key={credential.credential_ref} value={credential.credential_ref}>{credential.credential_ref}</option>)}
+                  </select>
+                </div>
+                <div><label htmlFor="fleet-source-priority">优先级</label><input id="fleet-source-priority" type="number" min="0" step="1" value={sourceForm.priority} onChange={(event) => setSourceForm((value) => ({ ...value, priority: event.target.value }))} /></div>
+                <label className="fleet-checkbox" htmlFor="fleet-source-enabled"><input id="fleet-source-enabled" type="checkbox" checked={sourceForm.enabled} onChange={(event) => setSourceForm((value) => ({ ...value, enabled: event.target.checked }))} />启用</label>
+              </div>
+              <div className="fleet-row-actions fleet-form-actions">
+                <button type="submit" className="setting-btn primary" disabled={Boolean(busy)}>{busy === 'source-save' ? '保存中…' : '保存来源'}</button>
+                <button type="button" className="setting-btn secondary" onClick={() => setSourceForm({ ...EMPTY_SOURCE_FORM })} disabled={Boolean(busy)}>新建</button>
+              </div>
+            </form>
+          </section>
+
+          <section className="fleet-subsection">
+            <h4>安全凭据</h4>
+            {credentials.length ? (
+              <div className="fleet-credential-list">
+                {credentials.map((credential) => (
+                  <div className="fleet-credential-row" key={credential.credential_ref}>
+                    <div><strong>{credential.credential_ref}</strong><span>{credential.protection} · {formatTime(credential.updated_at)}</span></div>
+                    <button type="button" className="setting-btn danger-ghost" onClick={() => deleteCredential(credential)} disabled={Boolean(busy)}>删除</button>
+                  </div>
+                ))}
+              </div>
+            ) : <div className="fleet-empty">没有已保存凭据</div>}
+            <form className="fleet-form" onSubmit={submitCredential}>
+              <div className="fleet-form-grid fleet-form-grid-compact">
+                <div><label htmlFor="fleet-credential-id">凭据 ID</label><input id="fleet-credential-id" data-testid="fleet-credential-id" autoComplete="off" value={credentialForm.credentialId} onChange={(event) => setCredentialForm((value) => ({ ...value, credentialId: event.target.value }))} /></div>
+                <div className="fleet-grid-span-2"><label htmlFor="fleet-credential-secret">密钥</label><input id="fleet-credential-secret" data-testid="fleet-credential-secret" type="password" autoComplete="new-password" value={credentialForm.secret} onChange={(event) => setCredentialForm((value) => ({ ...value, secret: event.target.value }))} /></div>
+              </div>
+              <button type="submit" className="setting-btn primary" disabled={Boolean(busy)}>{busy === 'credential-save' ? '写入中…' : '保存凭据'}</button>
+            </form>
+          </section>
+
+          <section className="fleet-subsection">
+            <h4>许可接受</h4>
+            {acceptances.length ? (
+              <div className="fleet-credential-list">
+                {acceptances.map((acceptance) => (
+                  <div className="fleet-credential-row" key={`${acceptance.repo_id}:${acceptance.license_id}`}>
+                    <div><strong>{acceptance.repo_id}</strong><span>{acceptance.license_id} · {formatTime(acceptance.accepted_at)}</span></div>
+                    <button type="button" className="setting-btn danger-ghost" onClick={() => revokeLicense(acceptance)} disabled={Boolean(busy)}>撤销</button>
+                  </div>
+                ))}
+              </div>
+            ) : <div className="fleet-empty">没有许可接受记录</div>}
+            <form className="fleet-form" onSubmit={submitLicense}>
+              <div className="fleet-form-grid fleet-form-grid-compact">
+                <div className="fleet-grid-span-2"><label htmlFor="fleet-license-repo">仓库 ID</label><input id="fleet-license-repo" data-testid="fleet-license-repo" placeholder="org/repository" value={licenseForm.repoId} onChange={(event) => setLicenseForm((value) => ({ ...value, repoId: event.target.value }))} /></div>
+                <div><label htmlFor="fleet-license-id">许可 ID</label><input id="fleet-license-id" data-testid="fleet-license-id" value={licenseForm.licenseId} onChange={(event) => setLicenseForm((value) => ({ ...value, licenseId: event.target.value }))} /></div>
+              </div>
+              <button type="submit" className="setting-btn primary" disabled={Boolean(busy)}>{busy === 'license-accept' ? '记录中…' : '接受许可'}</button>
+            </form>
+          </section>
         </div>
       )}
 
