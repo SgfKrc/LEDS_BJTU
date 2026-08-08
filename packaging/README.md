@@ -168,6 +168,7 @@ python packaging/qlh_launcher.py --gui
 python packaging/qlh_launcher.py --tui
 python packaging/qlh_launcher.py check --json
 python packaging/qlh_launcher.py download --variant cpu
+python packaging/qlh_launcher.py version-status --json
 ```
 
 `packaging/setup-launcher.iss` 生成独立的 `QLH-Launcher-Setup-v0.1.8.1.exe`。它与 CPU/CUDA 主应用 Setup 使用不同 AppId，可单独安装、升级和卸载。
@@ -206,6 +207,43 @@ python packaging/signing.py verify --manifest latest.json --trusted-keys-dir pac
 ```
 
 依赖：`signing.py` 使用 `cryptography` 库（打包 Launcher 的 `.venv-packaging` 需要安装；运行时 Launcher 内置 pubkeys，无需在目标机额外安装）。
+
+### 原子版本与回滚（UP-N3）— version_store.py
+
+UP-N3 不直接覆盖正在运行的安装目录。版本目录先进入独立 store，健康门通过后才原子切换
+current.json，旧版本保存在 previous.json。当前支持目录、ZIP 和 tar 包；包根目录必须包含
+发布者生成的 health.ok 标记。普通 Inno Setup/.deb 仍由系统安装器处理，不会被强行当作可热替换目录。
+
+命令示例：
+  python packaging/updater.py version-status --json
+  python packaging/updater.py version-stage --version-store .qlh-version-store --bundle ./QLH-Edge-Inference-0.1.9-cpu --version 0.1.9 --variant cpu
+  python packaging/updater.py version-activate --version-store .qlh-version-store --version 0.1.9 --variant cpu
+  python packaging/updater.py version-rollback --version-store .qlh-version-store
+  python packaging/updater.py version-recover --version-store .qlh-version-store
+
+QLH_VERSION_STORE 可指定默认 store 位置；Launcher 发现 active 版本后会优先启动其中的主应用，
+找不到或指针损坏时才回退到传统安装目录。模型、配置和日志不进入版本目录。
+
+### Launcher 自更新、修复与诊断（UP-N4）
+
+独立 Launcher 安装目录是稳定入口，不会被活动槽覆盖。Launcher ZIP 由构建脚本生成
+`packaging/dist/QLH-Launcher-v<version>.zip`（与 `serve.py` 扫描目录一致，版本号读取 `packaging/version.txt`），
+包根目录包含 `QLH-Launcher.exe` 和 `health.ok`。
+更新先进入 `launcher-slots/slots/a|b` 的非活动槽，随后运行隔离的 `--health-check`；只有健康探针成功才写入
+`current.json`。普通 GUI/TUI 命令委托活动槽，维护命令始终由稳定入口处理。
+
+```powershell
+python packaging/qlh_launcher.py launcher-status --json
+python packaging/qlh_launcher.py launcher-check --source http://127.0.0.1:9090/latest.json --json
+python packaging/qlh_launcher.py launcher-install --source http://127.0.0.1:9090/latest.json --yes
+python packaging/qlh_launcher.py launcher-stage --launcher-store .qlh-launcher-slots --bundle .\packaging\dist\QLH-Launcher-v0.1.8.1.zip --version 0.1.8.1
+python packaging/qlh_launcher.py launcher-activate --launcher-store .qlh-launcher-slots --version 0.1.8.1
+python packaging/qlh_launcher.py launcher-rollback --launcher-store .qlh-launcher-slots
+python packaging/qlh_launcher.py launcher-recover --launcher-store .qlh-launcher-slots
+python packaging/qlh_launcher.py diagnostics --diagnostics-output .\launcher-diagnostics.zip
+```
+
+`launcher-install` 仍要求清单签名通过；`--allow-unsigned` 只能作为显式人工调试选项。诊断包只包含槽指针和有限日志文本，并脱敏 token、secret、password、authorization 等字段，不包含模型、私钥或完整环境变量。
 
 ### `launcher.py` — 主应用启动载荷
 
