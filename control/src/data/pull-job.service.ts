@@ -176,6 +176,9 @@ export class PullJobService {
       resolving: 'resolved',
       registered: 'registered',
       failed: 'failed',
+      rejected: 'failed',
+      quarantined: 'failed',
+      rolled_back: 'failed',
       cancelled: 'cancelled',
     };
     const event = eventMap[state] ?? 'progress';

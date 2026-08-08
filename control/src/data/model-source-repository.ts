@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ClusterSettingsRepository } from './cluster-settings-repository';
+import { normalizeCredentialRef } from './model-credential-store';
 
 export type ModelSourceProvider = 'huggingface' | 'modelscope';
 
@@ -127,6 +128,9 @@ export class ModelSourceRepository {
     if (url.protocol !== 'https:') {
       throw new Error('source endpoint must use HTTPS');
     }
+    if (url.username || url.password) {
+      throw new Error('source endpoint must not contain credentials');
+    }
     if (!Number.isInteger(input.priority) || input.priority < 0) {
       throw new Error('source priority must be a non-negative integer');
     }
@@ -136,7 +140,9 @@ export class ModelSourceRepository {
       name,
       provider: input.provider,
       endpoint,
-      credential_ref: input.credential_ref?.trim() || null,
+      credential_ref: input.credential_ref
+        ? normalizeCredentialRef(input.credential_ref)
+        : null,
       priority: input.priority,
       enabled: input.enabled,
       builtin: DEFAULT_MODEL_SOURCES.some(

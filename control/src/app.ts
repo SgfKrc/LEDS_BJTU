@@ -39,6 +39,9 @@ import { HfDownloader } from './data/hf-downloader';
 import { ModelDiskBudget } from './data/model-disk-budget';
 import { ModelSourceRepository } from './data/model-source-repository';
 import { PullPreflightService } from './data/pull-preflight.service';
+import { ModelCredentialStore } from './data/model-credential-store';
+import { ModelHttpClient } from './data/model-http-client';
+import { ModelLicenseAcceptanceRepository } from './data/model-license-acceptance';
 import { DeploymentSimulator } from './data/deployment-simulator';
 import { ClusterProfileRepository } from './data/cluster-profile-repository';
 import { ClusterProfileSelectionService } from './data/cluster-profile-selection';
@@ -52,6 +55,7 @@ import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
 import { PullJobController } from './modules/models/pull-job.controller';
 import { ModelSourcesController } from './modules/models/model-sources.controller';
+import { ModelSecurityController } from './modules/models/model-security.controller';
 import { DeploymentSimulationController } from './modules/models/deployment-simulation.controller';
 import { ClusterProfilesController } from './modules/cluster/cluster-profiles.controller';
 import { ReviewController } from './modules/review/review.controller';
@@ -80,6 +84,7 @@ export class CatchAllController {
     ModelsController,
     PullJobController,
     ModelSourcesController,
+    ModelSecurityController,
     DeploymentSimulationController,
     ClusterProfilesController,
     WorkflowsController,
@@ -118,6 +123,9 @@ export class CatchAllController {
     HfResolver,
     HfDownloader,
     ModelDiskBudget,
+    ModelCredentialStore,
+    ModelHttpClient,
+    ModelLicenseAcceptanceRepository,
     ModelSourceRepository,
     PullPreflightService,
     PullJobExecutor,

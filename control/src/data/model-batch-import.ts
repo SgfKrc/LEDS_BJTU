@@ -38,6 +38,43 @@ export interface BatchImportOptions {
   tag?: string;
 }
 
+export interface CatalogImportCandidate {
+  model_id: string;
+  name: string;
+  format: 'safetensors' | 'gguf' | 'both';
+  local_path?: string;
+  gguf_path?: string;
+}
+
+export interface CatalogMigrationEntry {
+  model_id: string;
+  model_name: string;
+  format: 'safetensors' | 'gguf';
+  source_path: string;
+  status: 'succeeded' | 'missing' | 'failed';
+  reason?: string;
+  report: ImportReport | null;
+}
+
+export interface CatalogMigrationReport {
+  schema_version: 1;
+  catalog_path: string;
+  started_at: string;
+  completed_at: string;
+  totals: {
+    models: number;
+    expected_sources: number;
+    succeeded_models: number;
+    partial_models: number;
+    missing_sources: number;
+    failed_sources: number;
+    quarantined_sources: number;
+    imported_blobs: number;
+    deduped_blobs: number;
+  };
+  entries: CatalogMigrationEntry[];
+}
+
 @Injectable()
 export class ModelBatchImporter {
   constructor(private readonly importer: ModelImportService) {}
@@ -95,6 +132,92 @@ export class ModelBatchImporter {
   }
 
   writeReport(report: BatchImportReport, targetPath: string): string {
+    return this.writeJsonReport(report, targetPath);
+  }
+
+  writeCatalogReport(report: CatalogMigrationReport, targetPath: string): string {
+    return this.writeJsonReport(report, targetPath);
+  }
+
+  importCatalog(
+    catalogPath: string,
+    candidates: CatalogImportCandidate[],
+    options: BatchImportOptions = {},
+  ): CatalogMigrationReport {
+    const startedAt = new Date().toISOString();
+    const entries: CatalogMigrationEntry[] = [];
+    for (const candidate of candidates) {
+      const sources: Array<{ format: 'safetensors' | 'gguf'; sourcePath: string }> = [];
+      if (candidate.format === 'safetensors' || candidate.format === 'both') {
+        sources.push({ format: 'safetensors', sourcePath: candidate.local_path ?? '' });
+      }
+      if (candidate.format === 'gguf' || candidate.format === 'both') {
+        sources.push({ format: 'gguf', sourcePath: candidate.gguf_path ?? '' });
+      }
+      for (const source of sources) {
+        const sourcePath = source.sourcePath ? path.resolve(source.sourcePath) : '';
+        if (!sourcePath || !fs.existsSync(sourcePath)) {
+          entries.push({
+            model_id: candidate.model_id,
+            model_name: candidate.name,
+            format: source.format,
+            source_path: sourcePath,
+            status: 'missing',
+            reason: sourcePath ? 'source path does not exist' : 'catalog path is empty',
+            report: null,
+          });
+          continue;
+        }
+        const report = this.importer.importLocal(sourcePath, {
+          jobId: `catalog_${crypto.randomUUID().slice(0, 12)}`,
+          namespace: options.namespace ?? 'migration',
+          name: `${candidate.model_id}-${source.format}`,
+          tag: options.tag ?? 'catalog-imported',
+        });
+        entries.push({
+          model_id: candidate.model_id,
+          model_name: candidate.name,
+          format: source.format,
+          source_path: sourcePath,
+          status: report.failed === 0 ? 'succeeded' : 'failed',
+          reason: report.failed === 0 ? undefined : report.warnings.join('; '),
+          report,
+        });
+      }
+    }
+    const modelIds = [...new Set(candidates.map((candidate) => candidate.model_id))];
+    const completeModels = modelIds.filter((modelId) => {
+      const modelEntries = entries.filter((entry) => entry.model_id === modelId);
+      return modelEntries.length > 0 && modelEntries.every((entry) => entry.status === 'succeeded');
+    });
+    return {
+      schema_version: 1,
+      catalog_path: path.resolve(catalogPath),
+      started_at: startedAt,
+      completed_at: new Date().toISOString(),
+      totals: {
+        models: modelIds.length,
+        expected_sources: entries.length,
+        succeeded_models: completeModels.length,
+        partial_models: modelIds.length - completeModels.length,
+        missing_sources: entries.filter((entry) => entry.status === 'missing').length,
+        failed_sources: entries.filter((entry) => entry.status === 'failed').length,
+        quarantined_sources: entries.reduce(
+          (total, entry) => total + (entry.report?.quarantined ?? 0), 0,
+        ),
+        imported_blobs: entries.reduce(
+          (total, entry) => total + (entry.report?.imported ?? 0), 0,
+        ),
+        deduped_blobs: entries.reduce(
+          (total, entry) => total + (entry.report?.deduped ?? 0),
+          0,
+        ),
+      },
+      entries,
+    };
+  }
+
+  private writeJsonReport(report: object, targetPath: string): string {
     const target = path.resolve(targetPath);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const temp = `${target}.tmp-${process.pid}`;

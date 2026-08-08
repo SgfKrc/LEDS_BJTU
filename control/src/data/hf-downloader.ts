@@ -7,6 +7,7 @@
 import { Injectable, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import { HfResolver } from './hf-resolver';
+import { ModelHttpClient } from './model-http-client';
 
 export interface DownloadProgress {
   bytesDownloaded: number;
@@ -14,7 +15,6 @@ export interface DownloadProgress {
 }
 
 export interface DownloaderOptions {
-  fetchFn?: typeof fetch;
   apiBase?: string;
   /** 进度回调节流间隔（毫秒）。 */
   progressThrottleMs?: number;
@@ -22,12 +22,15 @@ export interface DownloaderOptions {
 
 @Injectable()
 export class HfDownloader {
-  private readonly fetchFn: typeof fetch;
+  private readonly http: ModelHttpClient;
   private readonly apiBase: string;
   private readonly throttleMs: number;
 
-  constructor(@Optional() options: DownloaderOptions = {}) {
-    this.fetchFn = options.fetchFn ?? globalThis.fetch;
+  constructor(
+    @Optional() http?: ModelHttpClient,
+    @Optional() options: DownloaderOptions = {},
+  ) {
+    this.http = http ?? new ModelHttpClient();
     this.apiBase = options.apiBase ?? 'https://huggingface.co';
     this.throttleMs = options.progressThrottleMs ?? 250;
   }
@@ -57,6 +60,7 @@ export class HfDownloader {
       startBytes?: number;
       expectedSize?: number;
       apiBase?: string;
+      token?: string | null;
     } = {},
   ): Promise<void> {
     fs.mkdirSync(require('path').dirname(destPath), { recursive: true });
@@ -69,12 +73,12 @@ export class HfDownloader {
 
     const headers: Record<string, string> = {};
     if (startBytes > 0) headers['range'] = `bytes=${startBytes}-`;
-    const response = await this.fetchFn(this.fileUrl(
+    const response = await this.http.fetch(this.fileUrl(
       repoId, revision, filename, opts.apiBase,
     ), {
       headers,
       signal: opts.signal,
-    });
+    }, { token: opts.token });
     if (response.status !== 200 && response.status !== 206) {
       throw new Error(
         `HF 下载失败 (${response.status}): ${filename}（${await response.text().catch(() => '')}）`,
