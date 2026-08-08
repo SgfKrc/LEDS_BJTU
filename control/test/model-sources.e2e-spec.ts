@@ -6,6 +6,10 @@ import { FastifyAdapter } from '@nestjs/platform-fastify';
 import { ArtifactStore } from '../src/data/artifact-store';
 import { ConfigDao } from '../src/data/config-dao';
 import { HfResolver } from '../src/data/hf-resolver';
+import { ModelHttpClient } from '../src/data/model-http-client';
+import { ModelCredentialStore } from '../src/data/model-credential-store';
+import { ModelLicenseAcceptanceRepository } from '../src/data/model-license-acceptance';
+import { ClusterSettingsRepository } from '../src/data/cluster-settings-repository';
 import { ModelDiskBudget } from '../src/data/model-disk-budget';
 import { ModelSourceRepository } from '../src/data/model-source-repository';
 import { PullPreflightService } from '../src/data/pull-preflight.service';
@@ -22,8 +26,8 @@ function tempStore(): { dir: string; store: SqliteStore } {
 function resolverFixture(): HfResolver {
   const content = Buffer.from('model-bytes');
   const digest = require('crypto').createHash('sha256').update(content).digest('hex');
-  return new HfResolver({
-    apiBase: 'https://default.invalid',
+  return new HfResolver(new ModelHttpClient({
+    proxyUrl: null,
     fetchFn: async (url: RequestInfo | URL) => {
       const target = String(url);
       if (!target.includes('/api/models/')) return new Response('not found', { status: 404 });
@@ -32,7 +36,26 @@ function resolverFixture(): HfResolver {
         siblings: [{ rfilename: 'model.gguf', size: content.length, sha256: digest }],
       }), { status: 200 });
     },
-  });
+  }), 'https://default.invalid');
+}
+
+function securityDeps(dir: string, store: SqliteStore): {
+  credentials: ModelCredentialStore;
+  licenses: ModelLicenseAcceptanceRepository;
+} {
+  const protector = {
+    name: 'test-protector',
+    protect: async (secret: string) => Buffer.from(secret).toString('base64'),
+    unprotect: async (ciphertext: string) => Buffer.from(ciphertext, 'base64').toString(),
+  };
+  return {
+    credentials: new ModelCredentialStore({
+      rootDir: join(dir, 'credentials'), protector,
+    }),
+    licenses: new ModelLicenseAcceptanceRepository(
+      new ClusterSettingsRepository(store),
+    ),
+  };
 }
 
 describe('MODEL-FLEET sources and dry-run (MF-N4)', () => {
@@ -54,6 +77,8 @@ describe('MODEL-FLEET sources and dry-run (MF-N4)', () => {
     expect(JSON.stringify(sources.list())).not.toContain('plain-secret');
 
     const storeArtifacts = new ArtifactStore(join(dir, 'model-store'));
+    const security = securityDeps(dir, store);
+    await security.credentials.set('os:qlh/team-mirror', 'fixture-token');
     const diskBudget = {
       evaluate: () => ({
         total_bytes: 11,
@@ -65,6 +90,7 @@ describe('MODEL-FLEET sources and dry-run (MF-N4)', () => {
     };
     const preflight = new PullPreflightService(
       resolverFixture(), diskBudget as any, storeArtifacts,
+      security.credentials, security.licenses,
     );
     const first = await preflight.resolve({
       source: mirror,
@@ -100,6 +126,7 @@ describe('MODEL-FLEET sources and dry-run (MF-N4)', () => {
     };
     const preflight = new PullPreflightService(
       resolverFixture(), budget as any, new ArtifactStore(join(dir, 'store')),
+      securityDeps(dir, store).credentials, securityDeps(dir, store).licenses,
     );
     const result = await preflight.resolve({
       source: sources.preferred('huggingface')!,

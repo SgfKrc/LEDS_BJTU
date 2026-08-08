@@ -10,7 +10,7 @@
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
-> 最新复核（2026-08-08）：当前仓库正式 Python 基线仍为 1650 项中的 `1641 passed / 7 skipped / 2 failed`；两个失败固定为 v2 测试调用 `_validate_capabilities()` 缺少 `version`，L0-5 尚未关闭。临时补齐 `version=2` 后可验证 `1643 passed / 7 skipped / 0 failed`，但修复尚未落地。control-svc 全量 **`225/225 passed`**（含 MODEL-FLEET MF-N1-M5.0 无硬件本地门），gateway `101 passed`；批量模型导入、pull dry-run/来源切换、cluster profile 选择/发现、三节点部署模拟器均已通过本地证据。真实 Hub/PG 长时/Tailscale/PC Worker、主应用干净机发布和 Android 真机回归仍待完成。
+> 最新复核（2026-08-08）：当前仓库正式 Python 基线仍为 1650 项中的 `1641 passed / 7 skipped / 2 failed`；两个失败固定为 v2 测试调用 `_validate_capabilities()` 缺少 `version`，L0-5 尚未关闭。临时补齐 `version=2` 后可验证 `1643 passed / 7 skipped / 0 failed`，但修复尚未落地。control-svc 全量 **`232/232 passed`**（含 MODEL-FLEET M2 catalog 实跑与 M3 Windows 安全门），gateway `101 passed`；DPAPI、`QLH_HTTP_PROXY`、gated 双重门和生产依赖 0 vulnerability 已验证。真实 Hub/代理/gated、PG 长时、Tailscale/PC Worker、runtime sidecar、主应用干净机发布和 Android 真机回归仍待完成。
 > 2026-08-06 复核：Python 全量回归 **`1416 passed / 4 skipped`**（约 3 min），control-svc 微服务套件 **205 passed**（含 MODEL-FLEET M0-M4：契约/本地事实源/工件库/一键 pull/多集群档案），SD 质量门与 T9 聊天页相关测试全绿。SD 1.5 图像工作区（文生图/图生图/IP-Adapter reference）自动门与**双人目视审核均通过**（2026-08-06，Siegfried Kkm./浅草爱音，5 份报告 status=passed）；`bjtu chat` T9 聊天页 T9.0-T9.5 完成（终端走查 54/54）；微服务改造阶段 3.2 完成（control-svc 136/136）。2026-08-05 复核：Python 全量回归 **`1303 passed / 23 skipped`**（1326 项），SD/API 专项 155/155、前端 15/15、网关 100/100；90s DreamBooth 十种子自动门 10/10。历史复核链：2026-08-03 `1112 passed / 3 skipped`（Android Full/Lite 构建成功、TUI 契约 44/44）；2026-07-31 `1066 passed / 23 skipped`；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。
 
 ---
@@ -325,7 +325,7 @@ cd frontend && npm install && cd ..
 
 ## 🤖 模型下载
 
-> **默认源**：当前 control-svc 内置并启用 Hugging Face 官方源，同时登记 HF 镜像与 ModelScope 端点描述（后两者默认关闭，待对应 adapter/真实网络验收）；支持通过来源管理设置优先级、启停和 `credential_ref`，明文 token 不进入数据库或日志。机制见 [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1。
+> **默认源**：当前 control-svc 内置并启用 Hugging Face 官方源，同时登记 HF 镜像与 ModelScope 端点描述（后两者默认关闭，待对应 adapter/真实网络验收）；支持来源优先级、启停和 `credential_ref`。Windows token 由当前用户 DPAPI 保护，模型网络只显式读取 `QLH_HTTP_PROXY`，gated 仓库必须先登记凭据并显式接受许可证；明文不进入 SQLite/job/manifest/响应。机制见 [专项计划](docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1 与 [M3 安全门报告](docs/MODEL-FLEET-M3安全门报告-20260808.md)。
 
 项目默认示例模型是 **Qwen-1.8B-Chat**，并通过模型注册表提供其他 Qwen/DeepSeek 实验槽位。下面仅说明默认模型的两种格式，不代表系统只支持该模型：
 
@@ -786,7 +786,7 @@ python serve.py
 - [测试与评判标准](docs/测试与评判标准.md)
 - [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.1/5.1A/5.3 本地门与双人目视完成；剩余正式离线发布包、真实 Diffusers Worker 与分布式接入）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
-- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：MF-N1-M5.0 无硬件控制面本地门已完成；真实 PG/Hub/Tailscale 与跨 PC 分发仍受外部/硬件门约束
+- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：[M2 8 条目实际迁移](docs/MODEL-FLEET-M2迁移报告-20260808.md)与 [M3 Windows 安全门](docs/MODEL-FLEET-M3安全门报告-20260808.md)已完成；下一票为公开 Hub/代理 smoke 与 DeepSeek 7B sidecar，真实 PG/Tailscale/跨 PC 分发仍受外部或硬件门约束
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
 - [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 全自动优化实验脚本：固定提示词集/seed/工件、串并行调度、统一数据 schema 与报告汇总（L4 Candidate，尚未实施）
 
