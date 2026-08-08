@@ -1121,7 +1121,7 @@ def test_speculative_model_identity_accepted_by_validators(monkeypatch):
         "engines": ["speculative_assisted"],
         "models": [identity.snapshot()],
         "max_concurrency": 1,
-    })
+    }, version=2)
 
 
 def test_check_speculative_available(monkeypatch, mock_verify_server):
