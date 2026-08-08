@@ -66,6 +66,19 @@ export class ControlController {
   @All('models/gguf') gguf(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('models/download/*') downloadSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
 
+  // MODEL-FLEET local control plane. These paths are intentionally exact so
+  // inference-owned /api/models/current|load|switch routes remain untouched.
+  @All('models/artifacts') modelArtifacts(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/imports') modelImports(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/runtime-checks') runtimeChecks(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/runtime-checks/*') runtimeChecksSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/pull') modelPull(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/pull/*') modelPullSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/network') modelNetwork(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/network/*') modelNetworkSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/sources') modelSources(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/sources/*') modelSourcesSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+
   // ---- 已迁移域补（presets / db-health，阶段 3.2 末两域） ----
 
   @All('presets') presetsRoot(@Req() r: FastifyRequest) { return this.forward(r, true); }

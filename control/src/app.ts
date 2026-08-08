@@ -64,6 +64,7 @@ import { ModelSecurityController } from './modules/models/model-security.control
 import { DeploymentSimulationController } from './modules/models/deployment-simulation.controller';
 import { ClusterProfilesController } from './modules/cluster/cluster-profiles.controller';
 import { RuntimeAdmissionController } from './modules/models/runtime-admission.controller';
+import { ArtifactInventoryController } from './modules/models/artifact-inventory.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
@@ -93,6 +94,7 @@ export class CatchAllController {
     ModelSecurityController,
     DeploymentSimulationController,
     RuntimeAdmissionController,
+    ArtifactInventoryController,
     ClusterProfilesController,
     WorkflowsController,
     BootstrapController,

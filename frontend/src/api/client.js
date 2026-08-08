@@ -307,6 +307,67 @@ export async function unregisterModel(modelId) {
   });
 }
 
+// ---- MODEL-FLEET local artifact control plane ----
+
+export async function fetchModelArtifacts() {
+  return request('/models/artifacts');
+}
+
+export async function fetchModelPullJobs() {
+  return request('/models/pull');
+}
+
+export async function createModelPull(payload) {
+  return request('/models/pull', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function cancelModelPull(jobId) {
+  return request(`/models/pull/${encodeURIComponent(jobId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function importLocalModel(payload) {
+  return request('/models/imports', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function retryModelRuntimeCheck(reference) {
+  return request('/models/runtime-checks/retry', {
+    method: 'POST',
+    body: JSON.stringify(reference),
+  });
+}
+
+export async function invalidateModelRuntimeCheck({ artifactId, nodeId, runtimeProfile, reason }) {
+  const query = new URLSearchParams();
+  if (artifactId) query.set('artifact_id', artifactId);
+  if (nodeId) query.set('node_id', nodeId);
+  if (runtimeProfile) query.set('runtime_profile', runtimeProfile);
+  if (reason) query.set('reason', reason);
+  return request(`/models/runtime-checks?${query.toString()}`, { method: 'DELETE' });
+}
+
+export async function fetchModelNetwork() {
+  return request('/models/network');
+}
+
+export async function saveModelProxy(url) {
+  return request('/models/network/proxy', {
+    method: 'PUT',
+    body: JSON.stringify({ url }),
+  });
+}
+
+export async function clearModelProxy() {
+  return request('/models/network/proxy', { method: 'DELETE' });
+}
+
 export async function sendMessage(message, opts = {}) {
   return request('/chat', {
     method: 'POST',

@@ -44,6 +44,15 @@ export interface ImportReport {
   manifest_path: string | null;
 }
 
+export interface StoredArtifactManifest {
+  reference: {
+    namespace: string;
+    name: string;
+    tag: string;
+  };
+  manifest: Record<string, unknown>;
+}
+
 export function sha256Hex(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
@@ -195,6 +204,46 @@ export class ArtifactStore {
     } catch {
       return null;
     }
+  }
+
+  /** Enumerate valid JSON manifests using their on-disk alias as the canonical reference. */
+  listManifests(): StoredArtifactManifest[] {
+    const manifestsRoot = path.join(this.root, 'manifests');
+    if (!fs.existsSync(manifestsRoot)) return [];
+    const result: StoredArtifactManifest[] = [];
+    const walk = (base: string): void => {
+      for (const entry of fs.readdirSync(base, { withFileTypes: true })) {
+        const full = path.join(base, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!entry.name.endsWith('.json')) continue;
+        const parts = path.relative(manifestsRoot, full).split(path.sep);
+        if (parts.length !== 3) continue;
+        try {
+          const manifest = JSON.parse(
+            fs.readFileSync(full, 'utf-8'),
+          ) as Record<string, unknown>;
+          result.push({
+            reference: {
+              namespace: parts[0],
+              name: parts[1],
+              tag: path.basename(parts[2], '.json'),
+            },
+            manifest,
+          });
+        } catch {
+          // A damaged manifest is ignored here and remains on disk for diagnosis.
+        }
+      }
+    };
+    walk(manifestsRoot);
+    return result.sort((a, b) => {
+      const left = `${a.reference.namespace}/${a.reference.name}:${a.reference.tag}`;
+      const right = `${b.reference.namespace}/${b.reference.name}:${b.reference.tag}`;
+      return left.localeCompare(right);
+    });
   }
 
   /** manifest 中引用 blob 的 digest 集合（去重；null 摘要 manifest 忽略）。 */

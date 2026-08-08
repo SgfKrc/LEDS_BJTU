@@ -36,6 +36,11 @@ export class PullJobController {
     private readonly sources: ModelSourceRepository,
   ) {}
 
+  @Get()
+  list(): Record<string, unknown> {
+    return { jobs: this.jobs.list() };
+  }
+
   @Post()
   @HttpCode(202)
   create(@Body() body: CreatePullRequest): Record<string, unknown> {
