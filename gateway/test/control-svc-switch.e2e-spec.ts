@@ -77,6 +77,8 @@ async function startControlSvc(dataDir: string): Promise<{ port: number; close()
       QLH_MODEL_REGISTRY_FILE: path.join(dataDir, 'model_registry.json'),
       QLH_WORKFLOW_JOURNAL_FILE: path.join(dataDir, 'workflow_journal.json'),
       QLH_MODELS_DIR: path.join(dataDir, 'models'),
+      QLH_MODEL_STORE: path.join(dataDir, 'model-store'),
+      QLH_SQLITE_PATH: path.join(dataDir, 'control.sqlite3'),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -200,6 +202,31 @@ describe('控制面域渐进切换（QLH_CONTROL_URL → control-svc）', () => 
       const res = await request(server()).get('/api/models/registry');
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ models: [] });
+    });
+
+    it('GET /api/models/artifacts 与 pull → MODEL-FLEET 控制面', async () => {
+      const artifacts = await request(server()).get('/api/models/artifacts');
+      expect(artifacts.status).toBe(200);
+      expect(artifacts.body).toMatchObject({
+        artifacts: [],
+        summary: { total: 0, ready: 0, attention: 0, unchecked: 0 },
+      });
+
+      const pulls = await request(server()).get('/api/models/pull');
+      expect(pulls.status).toBe(200);
+      expect(pulls.body).toEqual({ jobs: [] });
+    });
+
+    it('模型代理设置经网关保存并清除', async () => {
+      const saved = await request(server())
+        .put('/api/models/network/proxy')
+        .send({ url: 'http://127.0.0.1:7897' });
+      expect(saved.status).toBe(200);
+      expect(saved.body.user_proxy.url).toBe('http://127.0.0.1:7897');
+
+      const cleared = await request(server()).delete('/api/models/network/proxy');
+      expect(cleared.status).toBe(200);
+      expect(cleared.body.status).toBe('cleared');
     });
 
     it('POST /api/sessions 创建 → control-svc 真实 uuid 会话', async () => {
