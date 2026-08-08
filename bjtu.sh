@@ -71,6 +71,21 @@ if [ "$1" = "launcher" ] || [ "$1" = "ui" ] || [ "$1" = "tui" ]; then
     fi
 fi
 
+# UP-N4 Launcher maintenance always runs through the stable Bootstrap.
+case "${1:-}" in
+    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics)
+        if [ -x "$PROJECT_ROOT/.venv-packaging/bin/python" ]; then
+            PY="$PROJECT_ROOT/.venv-packaging/bin/python"
+        elif command -v python3 >/dev/null 2>&1; then
+            PY=python3
+        else
+            PY=python
+        fi
+        export PYTHONIOENCODING=utf-8
+        exec "$PY" "$PROJECT_ROOT/packaging/qlh_launcher.py" "$@"
+        ;;
+esac
+
 # ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
 if [ "$1" = "chat" ]; then
     PY=""

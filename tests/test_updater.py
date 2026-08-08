@@ -77,6 +77,19 @@ def test_select_asset_prefers_exact_arch_over_any():
     assert selected.name == "exact.exe"
 
 
+def test_select_asset_accepts_shared_variant_for_launcher_bundle():
+    shared = _asset("QLH-Launcher-v0.1.9.zip")
+    shared["variant"] = "any"
+    shared["kind"] = "launcher"
+    manifest = update_core.UpdateManifest.from_mapping({
+        "schema_version": 1, "tag": "0.1.9", "assets": [shared],
+    })
+    selected = update_core.select_asset(
+        manifest, platform="windows", variant="cpu", arch="amd64", kind="launcher",
+    )
+    assert selected.name == shared["name"]
+
+
 def test_download_is_atomic_and_reuses_verified_file(tmp_path):
     payload = b"verified installer"
     asset = update_core.UpdateAsset.from_mapping(_asset("setup.exe", payload))

@@ -105,6 +105,17 @@ def test_android_download_scan_includes_dist_and_gradle_outputs(tmp_path, monkey
     ]
 
 
+def test_serve_dist_dir_matches_launcher_zip_output():
+    """serve.py 扫描目录必须与 build-launcher.bat 的 ZIP 落点一致。"""
+    serve = _load_serve_module()
+    expected = str(Path(__file__).resolve().parents[1] / "packaging" / "dist")
+    assert serve.DIST_DIR.replace("/", "\\") == expected.replace("/", "\\")
+    bat = (Path(__file__).resolve().parents[1] / "packaging" / "build-launcher.bat").read_text(
+        encoding="utf-8"
+    )
+    assert 'LAUNCHER_ZIP=packaging\\dist\\QLH-Launcher-v' in bat
+
+
 def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_path, monkeypatch):
     serve = _load_serve_module()
     dist_dir = tmp_path / "dist"
@@ -112,9 +123,11 @@ def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_
     current = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.1.exe"
     old = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.exe"
     full = dist_dir / "QLH-Inference-v0.1.8.1-full-release.apk"
+    launcher = dist_dir / "QLH-Launcher-v0.1.8.1.zip"
     current.write_bytes(b"current")
     old.write_bytes(b"old")
     full.write_bytes(b"full")
+    launcher.write_bytes(b"launcher")
     monkeypatch.setattr(serve, "_project_version", lambda: "0.1.8.1")
     serve._SHA256_CACHE.clear()
 
@@ -123,8 +136,10 @@ def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_
     assert manifest["schema_version"] == 1
     assert manifest["tag"] == "0.1.8.1"
     assert [item["name"] for item in manifest["assets"]] == [
-        current.name, full.name,
+        current.name, full.name, launcher.name,
     ]
     assert manifest["assets"][0]["variant"] == "cpu"
     assert manifest["assets"][0]["sha256"] == hashlib.sha256(b"current").hexdigest()
     assert manifest["assets"][1]["variant"] == "full"
+    assert manifest["assets"][2]["kind"] == "launcher"
+    assert manifest["assets"][2]["variant"] == "any"

@@ -110,17 +110,19 @@ def _sha256_cached(path: str) -> str:
     return result
 
 
-def _classify_update_asset(name: str) -> tuple[str, str, str] | None:
+def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
     lower = name.lower()
+    if lower.endswith(".zip") and "qlh-launcher" in lower:
+        return "windows", "any", "x86_64", "launcher"
     if lower.endswith(".exe") and "qlh-edge-inference-setup" in lower:
-        return "windows", "cuda" if "cuda" in lower else "cpu", "x86_64"
+        return "windows", "cuda" if "cuda" in lower else "cpu", "x86_64", "installer"
     if lower.endswith((".apk", ".aab")) and "qlh-inference" in lower:
         if "lite" in lower:
-            return "android", "lite", "any"
+            return "android", "lite", "any", "installer"
         if "full" in lower:
-            return "android", "full", "any"
+            return "android", "full", "any", "installer"
     if lower.endswith(".deb") and "qlh-edge-inference" in lower:
-        return "linux", "cuda" if "cuda" in lower else "cpu", "x86_64"
+        return "linux", "cuda" if "cuda" in lower else "cpu", "x86_64", "installer"
     return None
 
 
@@ -143,7 +145,7 @@ def build_update_manifest(
             version_match = _VERSION_RE.search(name)
             if version_match and version_match.group(1) != tag:
                 continue
-            target_platform, variant, arch = classification
+            target_platform, variant, arch, kind = classification
             assets.append({
                 "name": name,
                 "url": "/" + quote(name),
@@ -152,7 +154,7 @@ def build_update_manifest(
                 "platform": target_platform,
                 "variant": variant,
                 "arch": arch,
-                "kind": "installer",
+                "kind": kind,
             })
     manifest = {
         "schema_version": 1,
