@@ -190,6 +190,15 @@ export class ModelCredentialStore {
     return this.toStatus(record);
   }
 
+  listStatuses(): CredentialStatus[] {
+    if (!fs.existsSync(this.root)) return [];
+    return fs.readdirSync(this.root, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+      .map((entry) => this.readRecordFile(path.join(this.root, entry.name)))
+      .map((record) => this.toStatus(record))
+      .sort((a, b) => a.credential_ref.localeCompare(b.credential_ref));
+  }
+
   delete(credentialRef: string): boolean {
     const ref = normalizeCredentialRef(credentialRef);
     const target = this.recordPath(ref);
@@ -206,10 +215,21 @@ export class ModelCredentialStore {
   private readRecord(credentialRef: string): CredentialRecord | null {
     const target = this.recordPath(credentialRef);
     if (!fs.existsSync(target)) return null;
+    const record = this.readRecordFile(target);
+    if (record.credential_ref !== credentialRef) {
+      throw new Error('credential record is invalid');
+    }
+    return record;
+  }
+
+  private readRecordFile(target: string): CredentialRecord {
     try {
       const record = JSON.parse(fs.readFileSync(target, 'utf-8')) as CredentialRecord;
-      if (record.schema_version !== 1 || record.credential_ref !== credentialRef
-          || !record.ciphertext || !record.updated_at) {
+      if (record.schema_version !== 1
+          || normalizeCredentialRef(record.credential_ref) !== record.credential_ref
+          || typeof record.protection !== 'string' || !record.protection
+          || typeof record.ciphertext !== 'string' || !record.ciphertext
+          || typeof record.updated_at !== 'string' || !record.updated_at) {
         throw new Error('invalid credential record');
       }
       return record;

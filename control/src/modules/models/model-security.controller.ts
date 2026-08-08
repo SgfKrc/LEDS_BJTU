@@ -32,6 +32,11 @@ export class ModelSecurityController {
     private readonly proxy: ModelProxyConfigRepository,
   ) {}
 
+  @Get('credentials')
+  listCredentials(): Record<string, unknown> {
+    return { credentials: this.credentials.listStatuses() };
+  }
+
   @Put('credentials/:credentialId')
   async putCredential(
     @Param('credentialId') credentialId: string,

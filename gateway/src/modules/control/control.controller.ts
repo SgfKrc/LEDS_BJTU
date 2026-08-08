@@ -78,6 +78,11 @@ export class ControlController {
   @All('models/network/*') modelNetworkSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('models/sources') modelSources(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('models/sources/*') modelSourcesSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/resolve') modelResolve(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/credentials') modelCredentials(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/credentials/*') modelCredentialsSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/licenses') modelLicenses(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/licenses/*') modelLicensesSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
 
   // ---- 已迁移域补（presets / db-health，阶段 3.2 末两域） ----
 

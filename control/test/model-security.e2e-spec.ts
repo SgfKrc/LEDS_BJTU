@@ -344,6 +344,18 @@ describe('MODEL-FLEET M3 credential and network security', () => {
       });
       expect(status.json().credential.exists).toBe(true);
       expect(status.body).not.toContain(secret);
+      const listedCredentials = await app.inject({
+        method: 'GET', url: '/models/credentials',
+      });
+      expect(listedCredentials.statusCode).toBe(200);
+      expect(listedCredentials.json().credentials).toEqual([
+        expect.objectContaining({
+          credential_ref: 'os:qlh/hf-main',
+          exists: true,
+          protection: 'test-protector',
+        }),
+      ]);
+      expect(listedCredentials.body).not.toContain(secret);
       const refused = await app.inject({
         method: 'POST', url: '/models/licenses/acceptances',
         payload: { repo_id: 'org/gated-model', license_id: 'llama3', accepted: false },
