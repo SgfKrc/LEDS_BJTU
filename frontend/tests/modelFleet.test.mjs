@@ -4,21 +4,36 @@ import test from 'node:test';
 import {
   buildLocalImportRequest,
   buildModelPullRequest,
+  buildModelResolveRequest,
+  buildModelSourceRequest,
+  credentialIdFromRef,
   isModelPullActive,
+  modelPullRequestKey,
   modelPullProgressPercent,
   modelRuntimeLabel,
 } from '../src/modelFleetState.js';
 import {
   cancelModelPull,
+  acceptModelLicense,
   clearModelProxy,
   createModelPull,
+  deleteModelCredential,
+  deleteModelSource,
   fetchModelArtifacts,
+  fetchModelCredentials,
+  fetchModelLicenseAcceptances,
   fetchModelNetwork,
   fetchModelPullJobs,
+  fetchModelSources,
   importLocalModel,
   invalidateModelRuntimeCheck,
+  resetModelSources,
+  resolveModelPull,
+  revokeModelLicense,
   retryModelRuntimeCheck,
+  saveModelCredential,
   saveModelProxy,
+  saveModelSource,
 } from '../src/api/client.js';
 
 test('model fleet state bounds progress and distinguishes terminal jobs', () => {
@@ -37,14 +52,35 @@ test('model fleet request builders normalize local import and pull fields', () =
     source_path: 'C:/models/demo.gguf', namespace: 'local', name: 'demo', tag: 'v1',
   });
   assert.deepEqual(buildModelPullRequest({
-    provider: 'gguf_huggingface', repoId: ' org/demo ', revision: ' main ', allowPatterns: '*.gguf, *.json\n',
+    sourceId: ' hf-official ', provider: 'gguf_huggingface', repoId: ' org/demo ', revision: ' main ', allowPatterns: '*.gguf, *.json\n',
   }), {
+    source_id: 'hf-official',
     source: {
       provider: 'gguf_huggingface', repo_id: 'org/demo', requested_revision: 'main',
       allow_patterns: ['*.gguf', '*.json'],
     },
     cancel_policy: 'keep_partial',
   });
+  const resolveForm = {
+    sourceId: 'hf-official', repoId: ' org/demo ', revision: ' main ', allowPatterns: '*.json',
+  };
+  assert.deepEqual(buildModelResolveRequest(resolveForm), {
+    source_id: 'hf-official', repo_id: 'org/demo', requested_revision: 'main',
+    allow_patterns: ['*.json'],
+  });
+  assert.equal(modelPullRequestKey(resolveForm), JSON.stringify(buildModelResolveRequest(resolveForm)));
+  assert.deepEqual(buildModelSourceRequest({
+    sourceId: ' team ', name: ' Team Mirror ', provider: 'huggingface',
+    endpoint: ' https://mirror.example/ ', credentialRef: ' os:qlh/team ', priority: '5', enabled: true,
+  }), {
+    source_id: 'team',
+    payload: {
+      name: 'Team Mirror', provider: 'huggingface', endpoint: 'https://mirror.example',
+      credential_ref: 'os:qlh/team', priority: 5, enabled: true,
+    },
+  });
+  assert.equal(credentialIdFromRef('os:qlh/team'), 'team');
+  assert.equal(credentialIdFromRef('os:other/team'), '');
 });
 
 test('model fleet API client uses the control-plane routes and query encoding', async () => {
@@ -67,6 +103,17 @@ test('model fleet API client uses the control-plane routes and query encoding', 
     await fetchModelNetwork();
     await saveModelProxy('http://127.0.0.1:7897');
     await clearModelProxy();
+    await fetchModelSources();
+    await saveModelSource('team/source', { name: 'Team' });
+    await deleteModelSource('team/source');
+    await resetModelSources();
+    await resolveModelPull({ source_id: 'team', repo_id: 'org/demo' });
+    await fetchModelCredentials();
+    await saveModelCredential('hf/main', 'secret');
+    await deleteModelCredential('hf/main');
+    await fetchModelLicenseAcceptances();
+    await acceptModelLicense({ repo_id: 'org/demo', license_id: 'apache-2.0' });
+    await revokeModelLicense({ repo_id: 'org/demo', license_id: 'apache-2.0' });
   } finally {
     global.fetch = originalFetch;
   }
@@ -82,7 +129,22 @@ test('model fleet API client uses the control-plane routes and query encoding', 
     ['GET', '/api/models/network'],
     ['PUT', '/api/models/network/proxy'],
     ['DELETE', '/api/models/network/proxy'],
+    ['GET', '/api/models/sources'],
+    ['PUT', '/api/models/sources/team%2Fsource'],
+    ['DELETE', '/api/models/sources/team%2Fsource'],
+    ['POST', '/api/models/sources/reset'],
+    ['POST', '/api/models/resolve'],
+    ['GET', '/api/models/credentials'],
+    ['PUT', '/api/models/credentials/hf%2Fmain'],
+    ['DELETE', '/api/models/credentials/hf%2Fmain'],
+    ['GET', '/api/models/licenses/acceptances'],
+    ['POST', '/api/models/licenses/acceptances'],
+    ['DELETE', '/api/models/licenses/acceptances'],
   ]);
   assert.deepEqual(JSON.parse(requests[2].body), { source: { repo_id: 'org/demo' } });
   assert.deepEqual(JSON.parse(requests[8].body), { url: 'http://127.0.0.1:7897' });
+  assert.deepEqual(JSON.parse(requests[16].body), { secret: 'secret' });
+  assert.deepEqual(JSON.parse(requests[19].body), {
+    repo_id: 'org/demo', license_id: 'apache-2.0', accepted: true,
+  });
 });

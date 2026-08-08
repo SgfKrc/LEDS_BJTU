@@ -35,17 +35,57 @@ export function buildLocalImportRequest(form) {
 }
 
 export function buildModelPullRequest(form) {
-  const allowPatterns = String(form?.allowPatterns || '')
-    .split(/[\n,]/)
-    .map((value) => value.trim())
-    .filter(Boolean);
+  const allowPatterns = normalizeAllowPatterns(form?.allowPatterns);
   return {
+    source_id: String(form?.sourceId || '').trim(),
     source: {
       provider: form?.provider === 'huggingface' ? 'huggingface' : 'gguf_huggingface',
       repo_id: String(form?.repoId || '').trim(),
       requested_revision: String(form?.revision || 'main').trim() || 'main',
-      allow_patterns: allowPatterns.length > 0 ? allowPatterns : null,
+      allow_patterns: allowPatterns,
     },
     cancel_policy: 'keep_partial',
   };
+}
+
+export function buildModelResolveRequest(form) {
+  return {
+    source_id: String(form?.sourceId || '').trim(),
+    repo_id: String(form?.repoId || '').trim(),
+    requested_revision: String(form?.revision || 'main').trim() || 'main',
+    allow_patterns: normalizeAllowPatterns(form?.allowPatterns),
+  };
+}
+
+export function modelPullRequestKey(form) {
+  return JSON.stringify(buildModelResolveRequest(form));
+}
+
+export function buildModelSourceRequest(form) {
+  const credentialRef = String(form?.credentialRef || '').trim();
+  const parsedPriority = Number(form?.priority);
+  return {
+    source_id: String(form?.sourceId || '').trim(),
+    payload: {
+      name: String(form?.name || '').trim(),
+      provider: form?.provider === 'modelscope' ? 'modelscope' : 'huggingface',
+      endpoint: String(form?.endpoint || '').trim().replace(/\/+$/, ''),
+      credential_ref: credentialRef || null,
+      priority: Number.isInteger(parsedPriority) && parsedPriority >= 0 ? parsedPriority : 100,
+      enabled: form?.enabled !== false,
+    },
+  };
+}
+
+export function credentialIdFromRef(credentialRef) {
+  const value = String(credentialRef || '').trim();
+  return value.startsWith('os:qlh/') ? value.slice('os:qlh/'.length) : '';
+}
+
+function normalizeAllowPatterns(value) {
+  const allowPatterns = String(value || '')
+    .split(/[\n,]/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return allowPatterns.length > 0 ? allowPatterns : null;
 }
