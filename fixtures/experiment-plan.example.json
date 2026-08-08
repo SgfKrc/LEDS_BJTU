@@ -1,0 +1,49 @@
+{
+  "plan_id": "plan-example-v1",
+  "title": "示例实验计划：命令模板与资源声明",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11",
+    "cpu": "x86_64",
+    "gpu": "RTX 4060 Laptop 8GB",
+    "ram_gb": 32,
+    "engine": "transformers 4.47.1",
+    "torch": "2.5.1+cu121",
+    "cuda": "12.1"
+  },
+  "defaults": {
+    "runs": 5,
+    "timeout_s": 300,
+    "max_retries": 2,
+    "command": [
+      "python", "scripts/benchmark_all.py",
+      "--prompt-set-dir", "{prompt_set_dir}",
+      "--result-file", "{out_dir}/{experiment_id}.result.json",
+      "--log-file", "{out_dir}/{experiment_id}.log"
+    ]
+  },
+  "units": [
+    {
+      "experiment_id": "exp-0001",
+      "name": "qwen-1_8b fp16 decode tok/s（基线）",
+      "command": ["python", "scripts/example_runner.py", "--quant", "fp16", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "resources": {"gpu": "gpu0", "model_slot": "qwen-1_8b"},
+      "params": {"seed": 42, "temperature": null, "top_p": null, "max_new_tokens": 50, "stream": false, "concurrency": 1},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "fp16"},
+      "gate": {"metric": "decode_tok_s", "op": ">=", "threshold": 10.0}
+    },
+    {
+      "experiment_id": "exp-0002",
+      "name": "qwen-1_8b int4 decode tok/s（实验组）",
+      "command": ["python", "scripts/example_runner.py", "--quant", "int4", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "resources": {"gpu": "gpu0", "model_slot": "qwen-1_8b"},
+      "params": {"seed": 42, "temperature": null, "top_p": null, "max_new_tokens": 50, "stream": false, "concurrency": 1},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "nf4"},
+      "baseline_experiment_id": "exp-0001",
+      "gate": {"metric": "decode_tok_s", "op": ">=", "baseline_ratio": 0.9}
+    }
+  ]
+}
