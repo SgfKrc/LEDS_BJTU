@@ -44,4 +44,11 @@ export class ClusterSettingsRepository {
     ).run(key, value, now);
     return { key, value, updated_at: now };
   }
+
+  delete(key: string): boolean {
+    const result = this.store.prepare(
+      'DELETE FROM cluster_settings WHERE key = ?',
+    ).run(key);
+    return Number(result.changes) > 0;
+  }
 }

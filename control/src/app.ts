@@ -31,11 +31,18 @@ import { LegacyMigration } from './data/legacy-migration';
 import { ArtifactStore } from './data/artifact-store';
 import { ModelInspector } from './data/model-inspector';
 import { ModelImportService } from './data/model-import-service';
+import { ModelBatchImporter } from './data/model-batch-import';
 import { PullJobService } from './data/pull-job.service';
 import { PullJobExecutor } from './data/pull-job-executor';
 import { HfResolver } from './data/hf-resolver';
 import { HfDownloader } from './data/hf-downloader';
+import { ModelDiskBudget } from './data/model-disk-budget';
+import { ModelSourceRepository } from './data/model-source-repository';
+import { PullPreflightService } from './data/pull-preflight.service';
+import { DeploymentSimulator } from './data/deployment-simulator';
 import { ClusterProfileRepository } from './data/cluster-profile-repository';
+import { ClusterProfileSelectionService } from './data/cluster-profile-selection';
+import { ClusterDiscoveryService } from './data/cluster-discovery.service';
 import { HealthController } from './modules/health/health.controller';
 import { DbController } from './modules/db/db.controller';
 import { StorageHealthController } from './modules/db/storage-health.controller';
@@ -44,6 +51,8 @@ import { ClientErrorController } from './modules/logs/client-error.controller';
 import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
 import { PullJobController } from './modules/models/pull-job.controller';
+import { ModelSourcesController } from './modules/models/model-sources.controller';
+import { DeploymentSimulationController } from './modules/models/deployment-simulation.controller';
 import { ClusterProfilesController } from './modules/cluster/cluster-profiles.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
@@ -70,6 +79,8 @@ export class CatchAllController {
     ReviewController,
     ModelsController,
     PullJobController,
+    ModelSourcesController,
+    DeploymentSimulationController,
     ClusterProfilesController,
     WorkflowsController,
     BootstrapController,
@@ -101,18 +112,26 @@ export class CatchAllController {
     ArtifactStore,
     ModelInspector,
     ModelImportService,
+    ModelBatchImporter,
     // M3：pull job + HF resolve/下载
     PullJobService,
     HfResolver,
     HfDownloader,
+    ModelDiskBudget,
+    ModelSourceRepository,
+    PullPreflightService,
     PullJobExecutor,
+    DeploymentSimulator,
     // M4：多集群档案
     ClusterProfileRepository,
+    ClusterProfileSelectionService,
+    ClusterDiscoveryService,
   ],
 })
 export class AppModule implements OnApplicationBootstrap {
   constructor(
     private readonly migration: LegacyMigration,
+    private readonly pullExecutor: PullJobExecutor,
   ) {}
 
   /** 启动时自动执行旧源一次性迁移（幂等；源不存在/为空则无操作）。 */
@@ -126,6 +145,7 @@ export class AppModule implements OnApplicationBootstrap {
       registryJsonPath: process.env.QLH_LEGACY_REGISTRY_PATH
         || path.join(cwd, 'model_registry.json'),
     });
+    this.pullExecutor.resumeActive();
   }
 }
 
