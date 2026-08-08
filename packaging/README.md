@@ -96,7 +96,7 @@ pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
 # 2. 构建前端（★ 从项目根目录）
-cd frontend && npm install && npx vite build && cd ..
+cd frontend && npm ci && npx vite build && cd ..
 
 # 3. PyInstaller 打包（★ 从项目根目录，使用集显版 venv）
 pyinstaller packaging/qlh-cpu.spec --noconfirm
@@ -121,7 +121,7 @@ pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
 # 2. 构建前端（★ 从项目根目录，如已构建可跳过）
-cd frontend && npm install && npx vite build && cd ..
+cd frontend && npm ci && npx vite build && cd ..
 
 # 3. PyInstaller 打包（★ 从项目根目录，使用独显版 venv）
 pyinstaller packaging/qlh-cuda.spec --noconfirm
@@ -171,6 +171,41 @@ python packaging/qlh_launcher.py download --variant cpu
 ```
 
 `packaging/setup-launcher.iss` 生成独立的 `QLH-Launcher-Setup-v0.1.8.1.exe`。它与 CPU/CUDA 主应用 Setup 使用不同 AppId，可单独安装、升级和卸载。
+
+### 发布签名（UP-N2 可信发布）— `signing.py` + `pubkeys/`
+
+更新清单 `/latest.json` 的 Ed25519 签名（详情见 [安装包自动更新引导器方案](../docs/安装包自动更新引导器方案.md) §6/§8）：
+
+- **信任集**：`packaging/pubkeys/`（随 Launcher 和 Linux `.deb` 打包）——`root.pub.json`（离线根，自信任）+ `release-*.pub.json`（由上一级 key 授权，授权链必须可追溯到 root）。
+- **私钥**：只存在于发布者本机 `packaging/.signing-keys/`（gitignore，绝不入库/进构建产物）。
+- **验签门控**：`update_core.fetch_manifest` 在解析前对原始正文验签；验签通过才允许免 `--allow-unsigned` 安装，篡改/未知 key/伪造授权/过期 key 一律 fail-closed。
+
+首次生成密钥对并授权：
+
+```bash
+# 1. 生成离线根密钥（私钥保留在安全环境）
+python packaging/signing.py keygen --output-dir .signing-keys --key-id root --role root
+# 2. 生成发布密钥
+python packaging/signing.py keygen --output-dir .signing-keys --key-id release-YYYYMMDD
+# 3. 用根私钥授权发布密钥（写入 .pub.json）
+python packaging/signing.py authorize --key .signing-keys/release-YYYYMMDD.pub.json \
+    --issuer-key .signing-keys/root.key --issuer-id root
+# 4. 把授权后的 .pub.json 复制到 packaging/pubkeys/ 并提交
+```
+
+轮换：生成新发布密钥后，用**旧发布密钥**（或 root）授权并入库；旧 key 过期可加 `valid_until` 字段。
+
+签名 `/latest.json` 两种方式：
+
+```bash
+# 方式 A：serve.py 自动签名（私钥路径通过环境变量传入）
+QLH_SIGNING_KEY=.signing-keys/release-YYYYMMDD.key python packaging/serve.py
+# 方式 B：离线签名（配合静态服务器）
+python packaging/signing.py sign --manifest latest.json --key .signing-keys/release-YYYYMMDD.key
+python packaging/signing.py verify --manifest latest.json --trusted-keys-dir packaging/pubkeys
+```
+
+依赖：`signing.py` 使用 `cryptography` 库（打包 Launcher 的 `.venv-packaging` 需要安装；运行时 Launcher 内置 pubkeys，无需在目标机额外安装）。
 
 ### `launcher.py` — 主应用启动载荷
 
@@ -271,8 +306,9 @@ packaging/linux/
 ├── prerm                         ← 卸载前脚本
 ├── postrm                        ← 卸载后脚本
 ├── qlh-edge-inference.desktop    ← 桌面快捷方式
-├── qlh-edge-inference.service    ← systemd 用户服务
-├── launcher.sh                   ← /usr/local/bin 包装器
+├── qlh-edge-inference.service    ← systemd 系统服务
+├── launcher.py                   ← qlh-app 主应用包装器
+├── bjtu                          ← /usr/local/bin/bjtu 的统一入口
 └── qlh.png                       ← 应用图标 (需从 leds.ico 转换)
 ```
 
@@ -293,10 +329,14 @@ packaging/linux/
 ├── venv/                         ← Python 虚拟环境 (pip 依赖)
 /usr/share/applications/qlh-edge-inference.desktop
 /usr/share/icons/hicolor/256x256/apps/qlh.png
-/usr/lib/systemd/user/qlh-edge-inference.service
+/lib/systemd/system/qlh-edge-inference.service
 /usr/local/bin/qlh-launcher → ../../opt/qlh-edge-inference/bin/qlh-launcher
 /usr/local/bin/bjtu → ../../opt/qlh-edge-inference/bin/bjtu
 ```
+
+`qlh-launcher` 本身只包含 Bootstrap/更新逻辑。发现已安装的 Linux 主应用后，它优先以
+`/opt/qlh-edge-inference/venv/bin/python` 运行 `qlh-app`，确保推理依赖只从包内 venv 加载；
+旧包缺少该解释器时才退回 `qlh-app` 的 shebang。
 
 ### 快速开始
 
@@ -304,6 +344,10 @@ packaging/linux/
 ```bash
 sudo apt install python3 python3-venv python3-pip python3-tk dpkg-dev zenity
 ```
+
+> 📌 **Windows + WSL2 环境构建**：详见 `packaging/linux/WSL-BUILD-NOTES.md`
+> （/tmp tmpfs 清空、缺 ensurepip、llama-cpp-python 无 wheel、Windows node.exe
+> 不可用、lockfile 一致性、pyc 残留等踩坑与绕行方案）。
 
 **构建集显版 .deb**:
 ```bash
