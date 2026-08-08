@@ -6,8 +6,13 @@ import os
 a = Analysis(
     [os.path.join(SPECPATH, "qlh_launcher.py")],
     pathex=[SPECPATH],
-    datas=[(os.path.join(SPECPATH, "leds.ico"), ".")],
-    hiddenimports=["tkinter", "tkinter.ttk"],
+    datas=[(os.path.join(SPECPATH, "leds.ico"), "."), (os.path.join(SPECPATH, "pubkeys"), "pubkeys")],
+    hiddenimports=[
+        "tkinter",
+        "tkinter.ttk",
+        "cryptography",
+        "cryptography.hazmat.primitives.asymmetric.ed25519",
+    ],
     hookspath=[],
     runtime_hooks=[],
     excludes=["torch", "transformers", "fastapi", "uvicorn"],

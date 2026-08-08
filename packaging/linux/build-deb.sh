@@ -52,7 +52,8 @@ mkdir -p "$BUILD_DIR"
 # ---- 1. 构建前端 ----
 echo "[1/6] 构建前端..."
 cd "$FRONTEND_DIR"
-npm install --silent
+# 发布构建必须遵循已提交的 lockfile，不能在不同 npm 版本间重写它。
+npm ci --silent
 npx vite build
 cd "$PROJECT_ROOT"
 
@@ -71,14 +72,23 @@ mkdir -p "$BUILD_DIR/usr/local/bin"
 
 # ---- 3. 复制源码和前端 ----
 echo "[3/6] 复制应用文件..."
-cp -r "$SRC_DIR"/* "$BUILD_DIR/opt/qlh-edge-inference/src/"
+# 用 tar 管道排除 __pycache__ / *.pyc（避免带入 Windows 侧的 cpython-312 缓存）
+( cd "$SRC_DIR" && tar cf - --exclude='__pycache__' --exclude='*.pyc' . ) | \
+    ( cd "$BUILD_DIR/opt/qlh-edge-inference/src/" && tar xf - )
 cp -r "$FRONTEND_DIR/dist"/* "$BUILD_DIR/opt/qlh-edge-inference/frontend/dist/"
 cp "$SCRIPT_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
 cp "$PACKAGING_DIR/qlh_launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 cp "$PACKAGING_DIR/update_core.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/update_core.py"
 cp "$PACKAGING_DIR/updater.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/updater.py"
+cp "$PACKAGING_DIR/version_store.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/version_store.py"
+cp "$PACKAGING_DIR/launcher_slots.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/launcher_slots.py"
+# UP-N2 可信发布：验签器与内置信任集必须随 Launcher 分发
+cp "$PACKAGING_DIR/signing.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/signing.py"
+cp -r "$PACKAGING_DIR/pubkeys" "$BUILD_DIR/opt/qlh-edge-inference/bin/pubkeys"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
+# Desktop and bjtu invoke qlh-launcher through its shebang; force the package venv.
+sed -i '1c#!/opt/qlh-edge-inference/venv/bin/python3' "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 cp "$SCRIPT_DIR/bjtu" "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
 printf '%s\n' "$VERSION" > "$BUILD_DIR/opt/qlh-edge-inference/version.txt"
@@ -102,8 +112,35 @@ fi
 
 # ---- 4. 创建虚拟环境并安装依赖 ----
 echo "[4/6] 安装 Python 依赖..."
-python3 -m venv --copies "$BUILD_DIR/opt/qlh-edge-inference/venv"
-VENV_PIP="$BUILD_DIR/opt/qlh-edge-inference/venv/bin/pip"
+VENV_DIR="$BUILD_DIR/opt/qlh-edge-inference/venv"
+if ! command -v python3 &> /dev/null; then
+    echo "错误: 未找到 python3。请安装 Python 3 和 python3-venv。"
+    exit 1
+fi
+
+# --without-pip 只能绕开 ensurepip；若 Python 没有 venv 模块，无法在用户态创建 venv。
+if ! python3 -c 'import venv' &> /dev/null; then
+    echo "错误: 当前 Python 缺少 venv 模块。"
+    echo "  有 sudo: sudo apt install python3-venv"
+    echo "  无 sudo: 请使用自带 venv 模块的用户态 Python 发行版后重试。"
+    exit 1
+fi
+
+if ! python3 -m venv --copies "$VENV_DIR" 2>/dev/null; then
+    # 仅兼容 ensurepip 不可用的 Python；venv 模块已在上方确认存在。
+    echo "  [兼容] ensurepip 不可用，改用 --without-pip + get-pip.py 引导 venv"
+    rm -rf "$VENV_DIR"
+    python3 -m venv --copies --without-pip "$VENV_DIR"
+    GETPIP_FILE="$BUILD_DIR/get-pip.py"
+    if ! command -v curl &> /dev/null; then
+        echo "错误: ensurepip 不可用且未找到 curl，无法下载 get-pip.py。"
+        echo "  请安装 curl，或使用包含 ensurepip 的 Python。"
+        exit 1
+    fi
+    curl -fsSL --retry 3 https://bootstrap.pypa.io/get-pip.py -o "$GETPIP_FILE"
+    "$VENV_DIR/bin/python" "$GETPIP_FILE" -q
+fi
+VENV_PIP="$VENV_DIR/bin/pip"
 
 if [ "$VARIANT" == "cuda" ]; then
     echo "  安装 CUDA 版 PyTorch..."

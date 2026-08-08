@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "schema_version": 1,
+      "event": "started",
+      "job_id": "pull_sequence_after_terminal",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:00Z"
+    },
+    {
+      "schema_version": 1,
+      "event": "failed",
+      "job_id": "pull_sequence_after_terminal",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:01Z",
+      "error": {
+        "code": "resolve_failed",
+        "message": "fixture failure"
+      }
+    },
+    {
+      "schema_version": 1,
+      "event": "progress",
+      "job_id": "pull_sequence_after_terminal",
+      "phase": "downloading",
+      "at": "2026-08-08T10:00:02Z",
+      "total_bytes": 1024,
+      "downloaded_bytes": 512,
+      "files_total": 1,
+      "files_done": 0
+    }
+  ]
+}

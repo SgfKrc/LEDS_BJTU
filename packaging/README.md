@@ -96,7 +96,7 @@ pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
 # 2. 构建前端（★ 从项目根目录）
-cd frontend && npm install && npx vite build && cd ..
+cd frontend && npm ci && npx vite build && cd ..
 
 # 3. PyInstaller 打包（★ 从项目根目录，使用集显版 venv）
 pyinstaller packaging/qlh-cpu.spec --noconfirm
@@ -121,7 +121,7 @@ pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
 # 2. 构建前端（★ 从项目根目录，如已构建可跳过）
-cd frontend && npm install && npx vite build && cd ..
+cd frontend && npm ci && npx vite build && cd ..
 
 # 3. PyInstaller 打包（★ 从项目根目录，使用独显版 venv）
 pyinstaller packaging/qlh-cuda.spec --noconfirm
@@ -168,9 +168,82 @@ python packaging/qlh_launcher.py --gui
 python packaging/qlh_launcher.py --tui
 python packaging/qlh_launcher.py check --json
 python packaging/qlh_launcher.py download --variant cpu
+python packaging/qlh_launcher.py version-status --json
 ```
 
 `packaging/setup-launcher.iss` 生成独立的 `QLH-Launcher-Setup-v0.1.8.1.exe`。它与 CPU/CUDA 主应用 Setup 使用不同 AppId，可单独安装、升级和卸载。
+
+### 发布签名（UP-N2 可信发布）— `signing.py` + `pubkeys/`
+
+更新清单 `/latest.json` 的 Ed25519 签名（详情见 [安装包自动更新引导器方案](../docs/安装包自动更新引导器方案.md) §6/§8）：
+
+- **信任集**：`packaging/pubkeys/`（随 Launcher 和 Linux `.deb` 打包）——`root.pub.json`（离线根，自信任）+ `release-*.pub.json`（由上一级 key 授权，授权链必须可追溯到 root）。
+- **私钥**：只存在于发布者本机 `packaging/.signing-keys/`（gitignore，绝不入库/进构建产物）。
+- **验签门控**：`update_core.fetch_manifest` 在解析前对原始正文验签；验签通过才允许免 `--allow-unsigned` 安装，篡改/未知 key/伪造授权/过期 key 一律 fail-closed。
+
+首次生成密钥对并授权：
+
+```bash
+# 1. 生成离线根密钥（私钥保留在安全环境）
+python packaging/signing.py keygen --output-dir .signing-keys --key-id root --role root
+# 2. 生成发布密钥
+python packaging/signing.py keygen --output-dir .signing-keys --key-id release-YYYYMMDD
+# 3. 用根私钥授权发布密钥（写入 .pub.json）
+python packaging/signing.py authorize --key .signing-keys/release-YYYYMMDD.pub.json \
+    --issuer-key .signing-keys/root.key --issuer-id root
+# 4. 把授权后的 .pub.json 复制到 packaging/pubkeys/ 并提交
+```
+
+轮换：生成新发布密钥后，用**旧发布密钥**（或 root）授权并入库；旧 key 过期可加 `valid_until` 字段。
+
+签名 `/latest.json` 两种方式：
+
+```bash
+# 方式 A：serve.py 自动签名（私钥路径通过环境变量传入）
+QLH_SIGNING_KEY=.signing-keys/release-YYYYMMDD.key python packaging/serve.py
+# 方式 B：离线签名（配合静态服务器）
+python packaging/signing.py sign --manifest latest.json --key .signing-keys/release-YYYYMMDD.key
+python packaging/signing.py verify --manifest latest.json --trusted-keys-dir packaging/pubkeys
+```
+
+依赖：`signing.py` 使用 `cryptography` 库（打包 Launcher 的 `.venv-packaging` 需要安装；运行时 Launcher 内置 pubkeys，无需在目标机额外安装）。
+
+### 原子版本与回滚（UP-N3）— version_store.py
+
+UP-N3 不直接覆盖正在运行的安装目录。版本目录先进入独立 store，健康门通过后才原子切换
+current.json，旧版本保存在 previous.json。当前支持目录、ZIP 和 tar 包；包根目录必须包含
+发布者生成的 health.ok 标记。普通 Inno Setup/.deb 仍由系统安装器处理，不会被强行当作可热替换目录。
+
+命令示例：
+  python packaging/updater.py version-status --json
+  python packaging/updater.py version-stage --version-store .qlh-version-store --bundle ./QLH-Edge-Inference-0.1.9-cpu --version 0.1.9 --variant cpu
+  python packaging/updater.py version-activate --version-store .qlh-version-store --version 0.1.9 --variant cpu
+  python packaging/updater.py version-rollback --version-store .qlh-version-store
+  python packaging/updater.py version-recover --version-store .qlh-version-store
+
+QLH_VERSION_STORE 可指定默认 store 位置；Launcher 发现 active 版本后会优先启动其中的主应用，
+找不到或指针损坏时才回退到传统安装目录。模型、配置和日志不进入版本目录。
+
+### Launcher 自更新、修复与诊断（UP-N4）
+
+独立 Launcher 安装目录是稳定入口，不会被活动槽覆盖。Launcher ZIP 由构建脚本生成
+`packaging/dist/QLH-Launcher-v<version>.zip`（与 `serve.py` 扫描目录一致，版本号读取 `packaging/version.txt`），
+包根目录包含 `QLH-Launcher.exe` 和 `health.ok`。
+更新先进入 `launcher-slots/slots/a|b` 的非活动槽，随后运行隔离的 `--health-check`；只有健康探针成功才写入
+`current.json`。普通 GUI/TUI 命令委托活动槽，维护命令始终由稳定入口处理。
+
+```powershell
+python packaging/qlh_launcher.py launcher-status --json
+python packaging/qlh_launcher.py launcher-check --source http://127.0.0.1:9090/latest.json --json
+python packaging/qlh_launcher.py launcher-install --source http://127.0.0.1:9090/latest.json --yes
+python packaging/qlh_launcher.py launcher-stage --launcher-store .qlh-launcher-slots --bundle .\packaging\dist\QLH-Launcher-v0.1.8.1.zip --version 0.1.8.1
+python packaging/qlh_launcher.py launcher-activate --launcher-store .qlh-launcher-slots --version 0.1.8.1
+python packaging/qlh_launcher.py launcher-rollback --launcher-store .qlh-launcher-slots
+python packaging/qlh_launcher.py launcher-recover --launcher-store .qlh-launcher-slots
+python packaging/qlh_launcher.py diagnostics --diagnostics-output .\launcher-diagnostics.zip
+```
+
+`launcher-install` 仍要求清单签名通过；`--allow-unsigned` 只能作为显式人工调试选项。诊断包只包含槽指针和有限日志文本，并脱敏 token、secret、password、authorization 等字段，不包含模型、私钥或完整环境变量。
 
 ### `launcher.py` — 主应用启动载荷
 
@@ -271,8 +344,9 @@ packaging/linux/
 ├── prerm                         ← 卸载前脚本
 ├── postrm                        ← 卸载后脚本
 ├── qlh-edge-inference.desktop    ← 桌面快捷方式
-├── qlh-edge-inference.service    ← systemd 用户服务
-├── launcher.sh                   ← /usr/local/bin 包装器
+├── qlh-edge-inference.service    ← systemd 系统服务
+├── launcher.py                   ← qlh-app 主应用包装器
+├── bjtu                          ← /usr/local/bin/bjtu 的统一入口
 └── qlh.png                       ← 应用图标 (需从 leds.ico 转换)
 ```
 
@@ -293,10 +367,14 @@ packaging/linux/
 ├── venv/                         ← Python 虚拟环境 (pip 依赖)
 /usr/share/applications/qlh-edge-inference.desktop
 /usr/share/icons/hicolor/256x256/apps/qlh.png
-/usr/lib/systemd/user/qlh-edge-inference.service
+/lib/systemd/system/qlh-edge-inference.service
 /usr/local/bin/qlh-launcher → ../../opt/qlh-edge-inference/bin/qlh-launcher
 /usr/local/bin/bjtu → ../../opt/qlh-edge-inference/bin/bjtu
 ```
+
+`qlh-launcher` 本身只包含 Bootstrap/更新逻辑。发现已安装的 Linux 主应用后，它优先以
+`/opt/qlh-edge-inference/venv/bin/python` 运行 `qlh-app`，确保推理依赖只从包内 venv 加载；
+旧包缺少该解释器时才退回 `qlh-app` 的 shebang。
 
 ### 快速开始
 
@@ -304,6 +382,10 @@ packaging/linux/
 ```bash
 sudo apt install python3 python3-venv python3-pip python3-tk dpkg-dev zenity
 ```
+
+> 📌 **Windows + WSL2 环境构建**：详见 `packaging/linux/WSL-BUILD-NOTES.md`
+> （/tmp tmpfs 清空、缺 ensurepip、llama-cpp-python 无 wheel、Windows node.exe
+> 不可用、lockfile 一致性、pyc 残留等踩坑与绕行方案）。
 
 **构建集显版 .deb**:
 ```bash

@@ -66,7 +66,10 @@ models_android.7z
 build/
 packaging/dist/
 packaging/build/
+packaging/linux/*.deb
 packaging/__pycache__/
+# 发布签名私钥（UP-N2 可信发布）：只存在于发布者本机，绝不进入仓库或构建产物
+packaging/.signing-keys/
 
 # Packaging virtual environments (CPU + CUDA, must remain separate)
 packaging/.venv-packaging/

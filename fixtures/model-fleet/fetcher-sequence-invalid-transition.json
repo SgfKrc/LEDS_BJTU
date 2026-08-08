@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "schema_version": 1,
+      "event": "started",
+      "job_id": "pull_sequence_bad_transition",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:00Z"
+    },
+    {
+      "schema_version": 1,
+      "event": "verified",
+      "job_id": "pull_sequence_bad_transition",
+      "phase": "verifying",
+      "at": "2026-08-08T10:00:01Z",
+      "resolved_revision": "9f5e8a1c2b3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8",
+      "total_bytes": 1024,
+      "downloaded_bytes": 1024,
+      "files_total": 1,
+      "files_done": 1
+    },
+    {
+      "schema_version": 1,
+      "event": "completed",
+      "job_id": "pull_sequence_bad_transition",
+      "phase": "done",
+      "at": "2026-08-08T10:00:02Z"
+    }
+  ]
+}

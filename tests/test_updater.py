@@ -77,6 +77,51 @@ def test_select_asset_prefers_exact_arch_over_any():
     assert selected.name == "exact.exe"
 
 
+def test_select_asset_accepts_shared_variant_for_launcher_bundle():
+    shared = _asset("QLH-Launcher-v0.1.9.zip")
+    shared["variant"] = "any"
+    shared["kind"] = "launcher"
+    manifest = update_core.UpdateManifest.from_mapping({
+        "schema_version": 1, "tag": "0.1.9", "assets": [shared],
+    })
+    selected = update_core.select_asset(
+        manifest, platform="windows", variant="cpu", arch="amd64", kind="launcher",
+    )
+    assert selected.name == shared["name"]
+
+
+def test_check_launcher_updates_selects_shared_launcher_asset(monkeypatch):
+    import updater
+
+    def fake_fetch(url, timeout):
+        return update_core.UpdateManifest.from_mapping(
+            {
+                "schema_version": 1, "tag": "0.1.9",
+                "assets": [
+                    _asset("setup.exe"),
+                    {**_asset("QLH-Launcher-v0.1.9.zip"),
+                     "variant": "any", "kind": "launcher"},
+                ],
+            },
+            source_url=url,
+        )
+
+    monkeypatch.setattr(
+        updater, "_manifest_for_request",
+        lambda *args, **kwargs: (fake_fetch(args[0], 1), ()),
+    )
+    result = updater.check_launcher_updates(
+        ["https://example.invalid/latest.json"],
+        profile={"platform": "windows", "arch": "x86_64", "variant": "cpu"},
+        current_version="0.1.8",
+    )
+    assert result["asset_kind"] == "launcher"
+    assert result["update_available"] is True
+    assert result["asset"]["name"] == "QLH-Launcher-v0.1.9.zip"
+    # 设备安装包（installer）不会被 launcher 检查选中
+    assert result["asset"]["url"].endswith(".zip")
+
+
 def test_download_is_atomic_and_reuses_verified_file(tmp_path):
     payload = b"verified installer"
     asset = update_core.UpdateAsset.from_mapping(_asset("setup.exe", payload))

@@ -15,6 +15,7 @@ import { HfResolver } from './hf-resolver';
 import { HfDownloader } from './hf-downloader';
 import { ArtifactStore, sha256Hex } from './artifact-store';
 import { ModelInspector } from './model-inspector';
+import { ModelDiskBudget } from './model-disk-budget';
 
 @Injectable()
 export class PullJobExecutor {
@@ -26,6 +27,7 @@ export class PullJobExecutor {
     private readonly downloader: HfDownloader,
     private readonly store: ArtifactStore,
     private readonly inspector: ModelInspector,
+    private readonly diskBudget: ModelDiskBudget = new ModelDiskBudget(),
   ) {}
 
   isRunning(jobId: string): boolean {
@@ -39,6 +41,11 @@ export class PullJobExecutor {
   /** 启动执行（异步，不阻塞请求）。 */
   start(jobId: string): void {
     if (this.active.has(jobId)) return;
+    const persisted = this.jobs.get(jobId);
+    if (!persisted || [
+      'registered', 'failed', 'cancelled', 'rejected', 'quarantined', 'rolled_back',
+    ].includes(persisted.state)) return;
+    if (persisted.state !== 'queued') this.jobs.requeue(jobId);
     const controller = new AbortController();
     this.active.set(jobId, controller);
     this.execute(jobId, controller.signal)
@@ -55,6 +62,12 @@ export class PullJobExecutor {
       .finally(() => this.active.delete(jobId));
   }
 
+  resumeActive(): number {
+    const active = this.jobs.listActive();
+    for (const job of active) this.start(job.job_id);
+    return active.length;
+  }
+
   private async execute(jobId: string, signal: AbortSignal): Promise<void> {
     const job = this.jobs.get(jobId);
     if (!job) throw new Error(`job 不存在: ${jobId}`);
@@ -65,7 +78,18 @@ export class PullJobExecutor {
     this.jobs.transition(jobId, 'resolving');
     const resolved = await this.resolver.resolve(
       repoId, job.source.requested_revision, job.source.allow_patterns,
+      job.source.endpoint,
     );
+    const disk = this.diskBudget.evaluate(resolved.files, this.store);
+    if (!disk.sufficient) {
+      this.jobs.transition(jobId, 'rejected', {
+        error: {
+          code: 'insufficient_storage',
+          message: `required=${disk.disk_required_bytes}, available=${disk.disk_available_bytes}`,
+        },
+      });
+      return;
+    }
     this.jobs.transition(jobId, 'downloading', {
       source: { ...job.source, resolved_revision: resolved.resolvedRevision },
       progress: {
@@ -92,6 +116,7 @@ export class PullJobExecutor {
         repoId, resolved.resolvedRevision, file.rfilename, dest, {
           signal,
           expectedSize: file.size,
+          apiBase: job.source.endpoint,
           onProgress: (p) => {
             this.jobs.updateProgress(jobId, {
               downloaded_bytes: bytes + p.bytesDownloaded,
@@ -172,6 +197,8 @@ export class PullJobExecutor {
         repo_id: repoId,
         requested_revision: job.source.requested_revision,
         resolved_revision: resolved.resolvedRevision,
+        source_id: job.source.source_id ?? null,
+        endpoint: job.source.endpoint ?? null,
       },
       format: inspection ? 'gguf' : 'safetensors',
       engine: inspection ? 'llama_cpp' : 'pytorch_transformers',

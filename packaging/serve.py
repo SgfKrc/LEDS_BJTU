@@ -26,6 +26,8 @@ import socket
 import sys
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
+from typing import Any, Iterable
 from urllib.parse import quote, unquote, urlparse
 
 HOST = "0.0.0.0"
@@ -52,8 +54,31 @@ ANDROID_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "android", "app", "build", "outp
 PC_INSTALLER_EXTS = (".exe",)
 ANDROID_EXTS = (".apk", ".aab")
 UPDATE_MANIFEST_PATH = "/latest.json"
+_SIGNER = None  # set by main() when QLH_SIGNING_KEY is configured
 _VERSION_RE = re.compile(r"(?<!\d)v?(\d+\.\d+\.\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)
 _SHA256_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
+class Signer:
+    """Signs update manifests with a release private key (UP-N2).
+
+    The private key is never bundled; it lives only on the publisher's
+    machine (or a signing host) and is selected via QLH_SIGNING_KEY.
+    """
+
+    def __init__(self, private_key_path: str):
+        from signing import sign_manifest
+
+        self._sign_manifest = sign_manifest
+        self._private_key_path = private_key_path
+        self._key_id = Path(private_key_path).stem
+
+    def sign(self, manifest: dict) -> dict:
+        return self._sign_manifest(
+            manifest,
+            private_key_path=self._private_key_path,
+            key_id=self._key_id,
+        )
 
 
 def _project_version() -> str:
@@ -86,22 +111,30 @@ def _sha256_cached(path: str) -> str:
     return result
 
 
-def _classify_update_asset(name: str) -> tuple[str, str, str] | None:
+def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
     lower = name.lower()
+    if lower.endswith(".zip") and "qlh-launcher" in lower:
+        return "windows", "any", "x86_64", "launcher"
     if lower.endswith(".exe") and "qlh-edge-inference-setup" in lower:
-        return "windows", "cuda" if "cuda" in lower else "cpu", "x86_64"
+        return "windows", "cuda" if "cuda" in lower else "cpu", "x86_64", "installer"
     if lower.endswith((".apk", ".aab")) and "qlh-inference" in lower:
         if "lite" in lower:
-            return "android", "lite", "any"
+            return "android", "lite", "any", "installer"
         if "full" in lower:
-            return "android", "full", "any"
+            return "android", "full", "any", "installer"
     if lower.endswith(".deb") and "qlh-edge-inference" in lower:
-        return "linux", "cuda" if "cuda" in lower else "cpu", "x86_64"
+        return "linux", "cuda" if "cuda" in lower else "cpu", "x86_64", "installer"
     return None
 
 
-def build_update_manifest(dist_dir: str = DIST_DIR) -> dict:
-    """Build a deterministic v1 update manifest from current release assets."""
+def build_update_manifest(
+    dist_dir: str = DIST_DIR, *, signer: "Signer | None" = None,
+) -> dict:
+    """Build a deterministic v1 update manifest from current release assets.
+
+    When ``signer`` is provided the manifest is signed in place with
+    key_id/signed_at/signature (UP-N2 trusted publishing).
+    """
     tag = _project_version()
     assets: list[dict] = []
     if os.path.isdir(dist_dir):
@@ -113,7 +146,7 @@ def build_update_manifest(dist_dir: str = DIST_DIR) -> dict:
             version_match = _VERSION_RE.search(name)
             if version_match and version_match.group(1) != tag:
                 continue
-            target_platform, variant, arch = classification
+            target_platform, variant, arch, kind = classification
             assets.append({
                 "name": name,
                 "url": "/" + quote(name),
@@ -122,15 +155,18 @@ def build_update_manifest(dist_dir: str = DIST_DIR) -> dict:
                 "platform": target_platform,
                 "variant": variant,
                 "arch": arch,
-                "kind": "installer",
+                "kind": kind,
             })
-    return {
+    manifest = {
         "schema_version": 1,
         "tag": tag,
         "channel": os.environ.get("QLH_RELEASE_CHANNEL", "stable"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "assets": assets,
     }
+    if signer is not None:
+        manifest = signer.sign(manifest)
+    return manifest
 
 
 def _detect_tailscale_ip() -> str:
@@ -345,7 +381,7 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if unquote(urlparse(self.path).path) == UPDATE_MANIFEST_PATH:
             encoded = json.dumps(
-                build_update_manifest(), ensure_ascii=False, separators=(",", ":"),
+                build_update_manifest(signer=_SIGNER), ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -469,9 +505,43 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         # 304 不打印
 
 
+def _load_signer() -> "Signer | None":
+    """Load the publisher signing key from QLH_SIGNING_KEY, fail-closed.
+
+    When the variable is set the private key must exist and be loadable;
+    silently serving an unsigned manifest would bypass the trusted gate.
+    """
+    env = os.environ.get("QLH_SIGNING_KEY", "").strip()
+    if not env:
+        return None
+    if not os.path.isfile(env):
+        raise RuntimeError(f"QLH_SIGNING_KEY 指向的私钥不存在: {env}")
+    return Signer(env)
+
+
+def _reconfigure_utf8(streams: Iterable[Any] | None = None) -> None:
+    """Reconfigure console streams to UTF-8 (Windows GBK cannot emit emoji)."""
+    for stream in streams if streams is not None else (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> None:
+    global _SIGNER
+    # Windows 控制台默认 GBK 无法输出 emoji/部分中文，重配为 UTF-8。
+    _reconfigure_utf8()
     argv = sys.argv[1:] if argv is None else argv
     port = int(argv[0]) if argv else DEFAULT_PORT
+    try:
+        _SIGNER = _load_signer()
+    except RuntimeError as exc:
+        print(f"启动失败: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    if _SIGNER is not None:
+        print(f"  发布签名: 已启用（key_id={_SIGNER._key_id}）")
 
     ts_ip = _detect_tailscale_ip()
     android_packages = _scan_android_downloads()

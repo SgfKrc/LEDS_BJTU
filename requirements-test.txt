@@ -1,5 +1,6 @@
 # Test-only dependencies. Keep this file separate from runtime and packaging
 # requirements so installing it cannot change the application's model stack.
 -r requirements.txt
+cryptography>=42.0.0,<47.0.0
 pytest>=8.0,<10
 pytest-xdist>=3.6,<4

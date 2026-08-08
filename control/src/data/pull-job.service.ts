@@ -28,6 +28,9 @@ export interface PullJob {
     requested_revision: string;
     resolved_revision?: string | null;
     allow_patterns?: string[] | null;
+    source_id?: string;
+    endpoint?: string;
+    credential_ref?: string | null;
   };
   cancel_policy: 'keep_partial' | 'cleanup';
   progress: {
@@ -53,6 +56,20 @@ export interface PullJobEvent {
 const TERMINAL_STATES = new Set<PullJobState>([
   'registered', 'failed', 'cancelled', 'rejected', 'quarantined', 'rolled_back',
 ]);
+
+const ALLOWED_TRANSITIONS: Record<PullJobState, ReadonlySet<PullJobState>> = {
+  queued: new Set(['resolving', 'cancelled', 'failed', 'rejected']),
+  resolving: new Set(['downloading', 'cancelled', 'failed', 'rejected']),
+  downloading: new Set(['verifying', 'cancelled', 'failed', 'quarantined']),
+  verifying: new Set(['adapting', 'registered', 'failed', 'quarantined']),
+  adapting: new Set(['registered', 'failed', 'quarantined']),
+  registered: new Set(),
+  failed: new Set(),
+  cancelled: new Set(),
+  rejected: new Set(),
+  quarantined: new Set(),
+  rolled_back: new Set(),
+};
 
 @Injectable()
 export class PullJobService {
@@ -150,6 +167,9 @@ export class PullJobService {
       if (job.state === state) return job;
       throw new Error(`job 已终止（${job.state}），不能迁移到 ${state}`);
     }
+    if (!ALLOWED_TRANSITIONS[job.state].has(state)) {
+      throw new Error(`非法 job 状态迁移: ${job.state} -> ${state}`);
+    }
     const next: PullJob = { ...job, ...patch, state, updated_at: new Date().toISOString() };
     this.persist(next);
     const eventMap: Record<string, PullJobEvent['event']> = {
@@ -187,6 +207,26 @@ export class PullJobService {
     return this.transition(jobId, 'cancelled', {
       cancel_policy: policy ?? job.cancel_policy,
     });
+  }
+
+  /** Restart recovery always re-resolves the source before reusing partial data. */
+  requeue(jobId: string): PullJob {
+    const job = this.get(jobId);
+    if (!job) throw new Error(`job 不存在: ${jobId}`);
+    if (job.state === 'queued') return job;
+    if (TERMINAL_STATES.has(job.state)) {
+      throw new Error(`job 已终止（${job.state}），不能恢复`);
+    }
+    const next: PullJob = {
+      ...job,
+      state: 'queued',
+      source: { ...job.source, resolved_revision: null },
+      progress: { ...job.progress, current_file: null },
+      error: null,
+      updated_at: new Date().toISOString(),
+    };
+    this.persist(next);
+    return next;
   }
 
   private persist(job: PullJob): void {

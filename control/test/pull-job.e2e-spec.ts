@@ -78,6 +78,7 @@ describe('PullJobService（M3）', () => {
     jobs.transition(job.job_id, 'downloading', {
       progress: { total_bytes: 100, downloaded_bytes: 10, files_total: 1, files_done: 0, current_file: 'a.bin' },
     });
+    jobs.transition(job.job_id, 'verifying');
     jobs.transition(job.job_id, 'registered', { artifact_id: 'sha256:abc' });
     expect(jobs.get(job.job_id)?.state).toBe('registered');
     expect(jobs.listActive().length).toBe(0);
@@ -87,6 +88,7 @@ describe('PullJobService（M3）', () => {
       idempotencyKey: 'k2',
       source: { provider: 'huggingface', repo_id: 'r/m2', requested_revision: 'main' },
     });
+    jobs.transition(job2.job_id, 'resolving');
     jobs.transition(job2.job_id, 'downloading');
     const fresh = new PullJobService(store); // 模拟重启
     const active = fresh.listActive();

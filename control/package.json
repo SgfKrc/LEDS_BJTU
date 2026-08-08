@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "model-fleet:import": "node dist/model-fleet-import.js"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",
