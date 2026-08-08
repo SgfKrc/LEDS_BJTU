@@ -11,6 +11,10 @@ import { PullJobService } from '../src/data/pull-job.service';
 import { PullJobExecutor } from '../src/data/pull-job-executor';
 import { HfResolver, globMatch } from '../src/data/hf-resolver';
 import { HfDownloader } from '../src/data/hf-downloader';
+import { ModelHttpClient } from '../src/data/model-http-client';
+import { ModelCredentialStore } from '../src/data/model-credential-store';
+import { ModelLicenseAcceptanceRepository } from '../src/data/model-license-acceptance';
+import { ClusterSettingsRepository } from '../src/data/cluster-settings-repository';
 import { ArtifactStore } from '../src/data/artifact-store';
 import { ModelInspector } from '../src/data/model-inspector';
 import { CURATED_RECIPES } from '../src/data/curated-catalog';
@@ -120,11 +124,24 @@ describe('PullJobExecutor（M3）', () => {
   } = {}) {
     const jobs = new PullJobService(store);
     const fetchFn = mockFetch(files, opts);
-    const resolver = new HfResolver({ fetchFn });
-    const downloader = new HfDownloader({ fetchFn, progressThrottleMs: 0 });
+    const http = new ModelHttpClient({ fetchFn, proxyUrl: null });
+    const resolver = new HfResolver(http);
+    const downloader = new HfDownloader(http, { progressThrottleMs: 0 });
     const artifactStore = new ArtifactStore(join(dir, 'store'));
+    const protector = {
+      name: 'test-protector',
+      protect: async (secret: string) => Buffer.from(secret).toString('base64'),
+      unprotect: async (ciphertext: string) => Buffer.from(ciphertext, 'base64').toString(),
+    };
+    const credentials = new ModelCredentialStore({
+      rootDir: join(dir, 'credentials'), protector,
+    });
+    const licenses = new ModelLicenseAcceptanceRepository(
+      new ClusterSettingsRepository(store),
+    );
     const executor = new PullJobExecutor(
       jobs, resolver, downloader, artifactStore, new ModelInspector(),
+      credentials, licenses,
     );
     return { jobs, executor, artifactStore };
   }
