@@ -89,6 +89,10 @@ def app_command(mode: str, variant_override: str | None = None) -> list[str]:
     else:
         installed_app = root / "bin" / "qlh-app"
         if installed_app.is_file():
+            # Linux 包内 venv 是主应用的唯一依赖边界；仅旧包缺失时才回退 shebang。
+            venv_python = root / "venv" / "bin" / "python"
+            if venv_python.is_file():
+                return [str(venv_python), str(installed_app), f"--{mode}"]
             return [str(installed_app), f"--{mode}"]
     legacy = root / "packaging" / "launcher.py"
     if legacy.is_file():
@@ -126,7 +130,8 @@ def _render_update_result(result: dict) -> str:
     if result.get("asset_error"):
         return f"发现 {result.get('latest_version')}，但没有匹配当前设备的安装包。"
     if result.get("update_available"):
-        return f"发现新版本 {result.get('latest_version')}：{result['asset']['name']}"
+        signed = "已验签" if result.get("signature_verified") else "未验签"
+        return f"发现新版本 {result.get('latest_version')}（{signed}）：{result['asset']['name']}"
     return f"当前已是最新版本 {result.get('current_version')}。"
 
 
@@ -181,7 +186,10 @@ class LauncherController:
         return 2
 
     def install_update(self) -> int:
-        forwarded = ["install", "--yes", "--allow-unsigned"]
+        # UP-N2: install only proceeds when the manifest signature verifies.
+        # No --allow-unsigned here: unsigned manifests must fail closed, and
+        # the GUI/TUI flows never get a chance to bypass the gate.
+        forwarded = ["install", "--yes"]
         if self.variant_override:
             forwarded.extend(("--variant", self.variant_override))
         for source in self.sources or configured_sources():
@@ -228,9 +236,15 @@ def run_tui(controller: LauncherController | None = None) -> int:
             print(_render_update_result(controller.check_update()))
             continue
         if choice in {"4", "install"}:
-            answer = input(
-                "更新包会校验大小和 SHA-256，但发布签名尚未接入。继续？ [y/N] "
-            ).strip().lower()
+            result = controller.check_update()
+            if result.get("signature_verified"):
+                prompt = "更新包会校验大小、SHA-256 与发布签名。继续？ [y/N] "
+            else:
+                prompt = (
+                    "更新包会校验大小和 SHA-256，但发布签名未验证"
+                    "（或清单未签名），安装会被拒绝。继续？ [y/N] "
+                )
+            answer = input(prompt).strip().lower()
             if answer in {"y", "yes"}:
                 return controller.install_update()
             continue
@@ -360,7 +374,7 @@ def run_gui(controller: LauncherController | None = None) -> int:
     def install() -> None:
         if not messagebox.askyesno(
             "确认更新",
-            "更新包会校验大小和 SHA-256，但发布者签名尚未接入。\n"
+            "更新包会校验大小、SHA-256 与发布签名。\n"
             "确认下载并启动系统安装器吗？",
             parent=root,
         ):
