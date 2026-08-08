@@ -85,6 +85,13 @@ def load_completed(out_dir: Path) -> dict[str, dict]:
     return completed
 
 
+def _record_status(record: dict) -> str | None:
+    gate = record.get("gate")
+    if isinstance(gate, dict):
+        return gate.get("status")
+    return record.get("status")
+
+
 def execute_plan(
     plan: PlanManifest,
     *,
@@ -98,7 +105,8 @@ def execute_plan(
     """执行计划全部单元。
 
     run_fn(unit) -> UnitOutcome：真正执行单元（由 CLI 注入，便于测试替换）。
-    resume=True 时跳过 records.jsonl 中 status != invalid 的已完成单元。
+    resume=True 时跳过 gate.status == passed 的已完成单元；failed/invalid
+    允许重跑（断点续跑不掩盖失败）。
     """
     if parallel < 1:
         raise ConflictError("--parallel 必须 >= 1")
@@ -110,7 +118,7 @@ def execute_plan(
     remaining = [
         unit for unit in plan.units
         if unit.experiment_id not in completed
-        or completed[unit.experiment_id].get("status") == "invalid"
+        or _record_status(completed[unit.experiment_id]) != "passed"
     ]
     outcomes: dict[str, UnitOutcome] = {}
     lock = threading.Lock()

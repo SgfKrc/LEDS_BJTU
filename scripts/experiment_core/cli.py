@@ -80,7 +80,17 @@ def main(argv: list[str] | None = None) -> int:
         missing = validate_record(record)
         if missing:
             print(f"  {unit.experiment_id}: 记录缺少字段 {missing}", file=sys.stderr)
-        append_record(records_path, record)
+        if unit.experiment_id in records:
+            # 断点续跑重跑（failed/invalid）：替换旧记录，避免 records.jsonl 重复行
+            lines = [
+                json.dumps(record, ensure_ascii=False)
+                for rid, record in records.items()
+                if rid != unit.experiment_id
+            ]
+            lines.append(json.dumps(record, ensure_ascii=False))
+            records_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        else:
+            append_record(records_path, record)
         records[unit.experiment_id] = record
         status = record["gate"].get("status", "?")
         metric = record["gate"].get("metric", "")

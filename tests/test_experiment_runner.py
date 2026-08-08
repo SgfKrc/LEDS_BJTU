@@ -261,13 +261,18 @@ def test_execute_plan_resume_skips_completed(tmp_path):
         "experiment_id": "exp-0001", "status": "passed",
         "metrics": {"decode_tok_s": 1.0}, "timestamp": "t",
     })
+    # failed 的旧记录必须重跑
+    collector.append_record(out_dir / "records.jsonl", {
+        "experiment_id": "exp-0002", "status": "failed",
+        "metrics": {}, "timestamp": "t",
+    })
     ran: list[str] = []
     execute_plan(
         plan, out_dir=out_dir, prompt_set_dir=tmp_path,
         run_fn=lambda unit: ran.append(unit.experiment_id),
         resume=True,
     )
-    assert ran == ["exp-0002"]
+    assert ran == ["exp-0002"]  # passed 跳过、failed 重跑
     assert load_completed(out_dir)["exp-0001"]["status"] == "passed"
 
 
