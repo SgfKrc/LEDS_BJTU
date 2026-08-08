@@ -520,6 +520,13 @@ def _load_signer() -> "Signer | None":
 
 def main(argv: list[str] | None = None) -> None:
     global _SIGNER
+    # Windows 控制台默认 GBK 无法输出 emoji/部分中文，重配为 UTF-8。
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
     argv = sys.argv[1:] if argv is None else argv
     port = int(argv[0]) if argv else DEFAULT_PORT
     try:
