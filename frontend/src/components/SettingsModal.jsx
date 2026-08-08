@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import DevicePanel from './DevicePanel';
+import ModelFleetPanel from './ModelFleetPanel';
 import { TIER_PRESETS, TIER_LABELS } from '../App';
 import { updateDistributedInferenceConfig } from '../api/client';
 
@@ -365,6 +366,8 @@ export default function SettingsModal({
             onToast={onToast}
             onProfileLoaded={handleDeviceProfile}
           />
+
+          <ModelFleetPanel onToast={onToast} />
 
           {/* ======== 推理参数设置 ======== */}
           <div className="sidebar-section">

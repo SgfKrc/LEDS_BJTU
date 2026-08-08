@@ -66,6 +66,21 @@
       "type": ["string", "null"],
       "pattern": "^sha256:[0-9a-f]{64}$"
     },
+    "runtime_check": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "status": {
+          "enum": ["ready", "load_failed", "resource_rejected", "stale"]
+        },
+        "node_id": { "type": "string" },
+        "runtime_profile": { "type": "string" },
+        "runtime_fingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
     "error": {
       "type": ["object", "null"],
       "additionalProperties": true,

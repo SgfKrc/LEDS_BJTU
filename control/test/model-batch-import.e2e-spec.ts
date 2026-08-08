@@ -106,4 +106,34 @@ describe('MODEL-FLEET batch model import (MF-N3)', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('records catalog source status without turning missing paths into imports', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlh-mf-catalog-'));
+    const present = join(dir, 'present');
+    safetensorsModel(present);
+    const store = new ArtifactStore(join(dir, 'store'));
+    const batch = new ModelBatchImporter(
+      new ModelImportService(store, new ModelInspector()),
+    );
+    const report = batch.importCatalog(join(dir, 'catalog.json'), [
+      {
+        model_id: 'present-model', name: 'Present', format: 'safetensors',
+        local_path: present,
+      },
+      {
+        model_id: 'missing-model', name: 'Missing', format: 'both',
+        local_path: join(dir, 'missing-dir'), gguf_path: join(dir, 'missing.gguf'),
+      },
+    ], { namespace: 'migration', tag: 'catalog-test' });
+    expect(report.totals).toMatchObject({
+      models: 2, expected_sources: 3, succeeded_models: 1,
+      partial_models: 1, missing_sources: 2, failed_sources: 0,
+    });
+    expect(report.entries.map((entry) => entry.status)).toEqual([
+      'succeeded', 'missing', 'missing',
+    ]);
+    const reportPath = batch.writeCatalogReport(report, join(dir, 'reports', 'catalog.json'));
+    expect(existsSync(reportPath)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

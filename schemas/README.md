@@ -19,6 +19,14 @@ Python（jsonschema）与 TS（ajv）两侧使用同一批 fixture 验证，结�
 `model-fleet-compatibility.json` 是版本演进和未知字段策略的机器可读索引；它本身不是业务
 payload schema，不替代六个文件的字段校验。
 
+## 运行时准入兼容扩展（2026-08-08）
+
+`pull-job` 与 `deployment` 根对象允许兼容新增可选字段。本轮增加：
+
+- `pull-job.runtime_check`：节点/profile 的 `ready / load_failed / resource_rejected / stale` 终态与运行时指纹；`registered` 只代表工件已保留，不自动代表可部署；
+- `deployment.runtime_profile / runtime_fingerprint / runtime_checked_at`：prepare/activate 对 runtime record 做 fail-closed 过滤；
+- 未携带这些字段的旧 payload 仍可通过 v1 schema，但新部署计划必须由当前控制面补齐运行时事实后才可激活。
+
 ## 能力枚举（禁止用 model_type 推导能力）
 
 `artifact-manifest` 的 `capabilities` 是**冻结枚举**（`additionalProperties: false`），

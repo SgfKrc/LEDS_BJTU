@@ -39,7 +39,15 @@ import { HfDownloader } from './data/hf-downloader';
 import { ModelDiskBudget } from './data/model-disk-budget';
 import { ModelSourceRepository } from './data/model-source-repository';
 import { PullPreflightService } from './data/pull-preflight.service';
+import { ModelCredentialStore } from './data/model-credential-store';
+import { ModelHttpClient } from './data/model-http-client';
+import { ModelLicenseAcceptanceRepository } from './data/model-license-acceptance';
+import { ModelProxyConfigRepository } from './data/model-proxy-config-repository';
 import { DeploymentSimulator } from './data/deployment-simulator';
+import { ArtifactRuntimeRepository } from './data/artifact-runtime-repository';
+import { ModelRuntimeSidecar } from './data/model-runtime-sidecar';
+import { ModelRuntimeCheckService } from './data/model-runtime-check.service';
+import { ModelImportAdmissionService } from './data/model-import-admission.service';
 import { ClusterProfileRepository } from './data/cluster-profile-repository';
 import { ClusterProfileSelectionService } from './data/cluster-profile-selection';
 import { ClusterDiscoveryService } from './data/cluster-discovery.service';
@@ -52,8 +60,11 @@ import { LogsController } from './modules/logs/logs.controller';
 import { ModelsController } from './modules/models/models.controller';
 import { PullJobController } from './modules/models/pull-job.controller';
 import { ModelSourcesController } from './modules/models/model-sources.controller';
+import { ModelSecurityController } from './modules/models/model-security.controller';
 import { DeploymentSimulationController } from './modules/models/deployment-simulation.controller';
 import { ClusterProfilesController } from './modules/cluster/cluster-profiles.controller';
+import { RuntimeAdmissionController } from './modules/models/runtime-admission.controller';
+import { ArtifactInventoryController } from './modules/models/artifact-inventory.controller';
 import { ReviewController } from './modules/review/review.controller';
 import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
@@ -80,7 +91,10 @@ export class CatchAllController {
     ModelsController,
     PullJobController,
     ModelSourcesController,
+    ModelSecurityController,
     DeploymentSimulationController,
+    RuntimeAdmissionController,
+    ArtifactInventoryController,
     ClusterProfilesController,
     WorkflowsController,
     BootstrapController,
@@ -118,10 +132,31 @@ export class CatchAllController {
     HfResolver,
     HfDownloader,
     ModelDiskBudget,
+    ModelCredentialStore,
+    ModelProxyConfigRepository,
+    {
+      provide: ModelHttpClient,
+      inject: [ModelProxyConfigRepository],
+      useFactory: (proxy: ModelProxyConfigRepository) => new ModelHttpClient({
+        proxyProvider: () => {
+          const current = proxy.get();
+          return current ? { url: current.url, source: 'user' as const } : null;
+        },
+      }),
+    },
+    ModelLicenseAcceptanceRepository,
     ModelSourceRepository,
     PullPreflightService,
     PullJobExecutor,
     DeploymentSimulator,
+    ArtifactRuntimeRepository,
+    {
+      provide: ModelRuntimeSidecar,
+      inject: [ArtifactStore],
+      useFactory: (store: ArtifactStore) => new ModelRuntimeSidecar(store),
+    },
+    ModelRuntimeCheckService,
+    ModelImportAdmissionService,
     // M4：多集群档案
     ClusterProfileRepository,
     ClusterProfileSelectionService,

@@ -115,7 +115,27 @@ function migrateV1(db: DatabaseSync): void {
   `);
 }
 
-export const MIGRATIONS: Migration[] = [{ version: 1, up: migrateV1 }];
+/** v2: local runtime trial-load results, separate from immutable manifests. */
+function migrateV2(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS artifact_runtime_checks (
+      artifact_id TEXT NOT NULL,
+      node_id TEXT NOT NULL,
+      runtime_profile TEXT NOT NULL,
+      status TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      checked_at TEXT NOT NULL,
+      PRIMARY KEY (artifact_id, node_id, runtime_profile)
+    );
+    CREATE INDEX IF NOT EXISTS idx_artifact_runtime_checks_status
+      ON artifact_runtime_checks(status, checked_at);
+  `);
+}
+
+export const MIGRATIONS: Migration[] = [
+  { version: 1, up: migrateV1 },
+  { version: 2, up: migrateV2 },
+];
 
 export class SqliteStore {
   private db: DatabaseSync | null = null;
