@@ -4,12 +4,13 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.9**（更新日期：2026-08-06，文档复核于 2026-08-06）
+**v0.1.8.1**（更新日期：2026-08-08，文档复核于 2026-08-08）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
+> 最新复核（2026-08-08）：当前仓库正式 Python 基线仍为 1650 项中的 `1641 passed / 7 skipped / 2 failed`；两个失败固定为 v2 测试调用 `_validate_capabilities()` 缺少 `version`，L0-5 尚未关闭。临时补齐 `version=2` 后可验证 `1643 passed / 7 skipped / 0 failed`，但修复尚未落地。control-svc 全量 **`225/225 passed`**（含 MODEL-FLEET MF-N1-M5.0 无硬件本地门），gateway `101 passed`；批量模型导入、pull dry-run/来源切换、cluster profile 选择/发现、三节点部署模拟器均已通过本地证据。真实 Hub/PG 长时/Tailscale/PC Worker、主应用干净机发布和 Android 真机回归仍待完成。
 > 2026-08-06 复核：Python 全量回归 **`1416 passed / 4 skipped`**（约 3 min），control-svc 微服务套件 **205 passed**（含 MODEL-FLEET M0-M4：契约/本地事实源/工件库/一键 pull/多集群档案），SD 质量门与 T9 聊天页相关测试全绿。SD 1.5 图像工作区（文生图/图生图/IP-Adapter reference）自动门与**双人目视审核均通过**（2026-08-06，Siegfried Kkm./浅草爱音，5 份报告 status=passed）；`bjtu chat` T9 聊天页 T9.0-T9.5 完成（终端走查 54/54）；微服务改造阶段 3.2 完成（control-svc 136/136）。2026-08-05 复核：Python 全量回归 **`1303 passed / 23 skipped`**（1326 项），SD/API 专项 155/155、前端 15/15、网关 100/100；90s DreamBooth 十种子自动门 10/10。历史复核链：2026-08-03 `1112 passed / 3 skipped`（Android Full/Lite 构建成功、TUI 契约 44/44）；2026-07-31 `1066 passed / 23 skipped`；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。
 
 ---
@@ -46,7 +47,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（可选依赖 Textual，见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
-| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门与 Edge 链路已通过、双人目视待完成（2026-08-07）→ [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
+| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门、Edge 链路与双人目视均已通过（2026-08-07）；正式离线资产包和分布式图像仍待完成 → [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
@@ -104,8 +105,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── 三种分布式拆分细化实施方案.md  # 层间待测试、任务链与张量并行实施方案
 │   ├── Android版本远期计划.md       # Android 端方案评估与规划
 │   ├── Android SAF模型存储方案.md   # Android SAF 外部模型目录方案
-│   ├── Android llama.cpp Submodule迁移方案.md
-│   ├── 总体下一步计划.md             # ★ 唯一总计划入口：L0-L4、生命周期、依赖与发布门
+│   ├── 总体下一步计划.md             # ★ 唯一总计划入口：L0-L5、生命周期、依赖与发布门
 │   ├── 项目进展与下一步计划.md       # ★ 能力、证据与原 P0/P1/P2 快照
 │   ├── 张量并行外部辅助与混合拆分调研方案.md  # ★ mesh 内 TP 不可行的量化论证 + 三条外部辅助路线
 │   ├── TP孤岛接入指南.md            # ★ 路线 A：孤岛=单逻辑高算力节点（PoC）
@@ -325,7 +325,7 @@ cd frontend && npm install && cd ..
 
 ## 🤖 模型下载
 
-> **默认源**：一键部署/下载的模型地址与源由开发团队提供默认源（ModelScope、Hugging Face 官方与百度网盘备用，国内优先 ModelScope），开箱即用；也允许用户自行更换源（如 HF 国内镜像），机制见 [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1。
+> **默认源**：当前 control-svc 内置并启用 Hugging Face 官方源，同时登记 HF 镜像与 ModelScope 端点描述（后两者默认关闭，待对应 adapter/真实网络验收）；支持通过来源管理设置优先级、启停和 `credential_ref`，明文 token 不进入数据库或日志。机制见 [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1。
 
 项目默认示例模型是 **Qwen-1.8B-Chat**，并通过模型注册表提供其他 Qwen/DeepSeek 实验槽位。下面仅说明默认模型的两种格式，不代表系统只支持该模型：
 
@@ -379,7 +379,7 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf \
 | **90s DreamBooth** | `aa8a082c…`（组合原版 safety checker） | ~4.87 GB 固定集合 | 90 年代日式动漫 preset（openrail，双人目视通过） |
 | **IP-Adapter reference** | `h94/IP-Adapter@018e4027…`（稳定 SHA `671c7452…`） | ~2.57 GB | 参考图一致性（人物主要要素保持，非精确身份锁定） |
 | **SD 1.5 Inpainting** | `stable-diffusion-inpainting@8a4288a7…`（稳定 SHA `ddd6d69a…`） | ~2.74 GB | 9-channel U-Net 局部重绘（白色 mask 重绘、黑色保留） |
-| **InstructPix2Pix** | `timbrooks/instruct-pix2pix@31519b5c…`（稳定 SHA `a6626f7f…`） | ~2.74 GB | 自然语言指令编辑（MIT；完整自动门通过，双人目视待完成） |
+| **InstructPix2Pix** | `timbrooks/instruct-pix2pix@31519b5c…`（稳定 SHA `a6626f7f…`） | ~2.74 GB | 自然语言指令编辑（MIT；自动门、Edge 链路与双人目视均通过，正式离线资产包待发布） |
 
 获取与验证：
 
@@ -514,7 +514,7 @@ bjtu --help                                 # 查看完整命令集与启动参�
 /shutdown                 # 优雅退出：后端清理资源后退出，TUI 随后退出
 ```
 
-完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（T1-T8 现行·Active；T9 简化聊天页 T9.0-T9.5 已完成 2026-08-06：interactive 契约、routing_preference、Textual UI、会话管理与错误恢复，终端走查 54/54；T9.6 打包与默认入口决策未实施）。
+完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（T1-T8 现行·Active；T9.0-T9.5 已完成，终端走查 54/54；T9.6 Launcher/BJTU 接线已完成，主应用聊天依赖、分布式真机验收与默认入口仍待）。
 
 ### 外部算力辅助（三条路线，均默认关闭）
 
@@ -784,9 +784,9 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.3 自动门与 Edge 链路通过、双人目视待完成；剩余正式离线发布包与分布式接入）
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.1/5.1A/5.3 本地门与双人目视完成；剩余正式离线发布包、真实 Diffusers Worker 与分布式接入）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
-- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 内容寻址模型仓库、跨节点部署与多集群档案（L4 Candidate）
+- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：MF-N1-M5.0 无硬件控制面本地门已完成；真实 PG/Hub/Tailscale 与跨 PC 分发仍受外部/硬件门约束
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
 - [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 全自动优化实验脚本：固定提示词集/seed/工件、串并行调度、统一数据 schema 与报告汇总（L4 Candidate，尚未实施）
 
@@ -799,7 +799,7 @@ python serve.py
 - [三种分布式拆分细化实施方案](docs/三种分布式拆分细化实施方案.md) — PyTorch 层间待测试项、任务链和张量并行的协议、容错与实施阶段
 - [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分可行性
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
-- [Android llama.cpp Submodule 迁移方案](docs/Android%20llama.cpp%20Submodule迁移方案.md) — 锁定上游版本、离线缓存与维护窗口方案
+- Android llama.cpp 已迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并待手动删除
 - [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC Full Worker v2（TC-N2.4 物理设备准入未过）
 - [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
@@ -815,11 +815,11 @@ python serve.py
 ### 工程文档
 
 - [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
-- [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9 简化聊天页：T9.0-T9.5 已完成（interactive 契约/routing_preference/Textual UI/会话管理），`bjtu chat` 可用，T9.6 打包与默认入口决策未实施（L4 Candidate）
+- [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5 已完成，终端走查 54/54，`bjtu chat` 可用，T9.6 Launcher/BJTU 接线已完成；主应用聊天依赖、分布式真机验收与默认入口仍待（L4 Candidate）
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
-- [独立安装包启动器与自动更新方案](docs/安装包自动更新引导器方案.md) — 独立 Bootstrap、GUI/TUI、清单下载、校验、Ed25519 发布签名（UP-N2 已验收）与回滚计划
+- [独立安装包启动器与自动更新方案](docs/安装包自动更新引导器方案.md) — 独立 Bootstrap、GUI/TUI、清单下载、Ed25519 验签/key rotation、UP-N3 原子版本与 UP-N4 A/B 自更新回滚；Launcher ZIP 发布链路已实测，Windows/Linux 干净机与 Android 更新仍待
 
 ---
 
