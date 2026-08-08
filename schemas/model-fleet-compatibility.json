@@ -1,0 +1,84 @@
+{
+  "policy_version": 1,
+  "schemas": {
+    "artifact-manifest": {
+      "file": "artifact-manifest.schema.json",
+      "schema_version": 1,
+      "root_unknown_fields": "allow"
+    },
+    "pull-job": {
+      "file": "pull-job.schema.json",
+      "schema_version": 1,
+      "root_unknown_fields": "allow"
+    },
+    "deployment": {
+      "file": "deployment.schema.json",
+      "schema_version": 1,
+      "root_unknown_fields": "allow"
+    },
+    "cluster-profile": {
+      "file": "cluster-profile.schema.json",
+      "schema_version": 1,
+      "root_unknown_fields": "allow"
+    },
+    "migration-map": {
+      "file": "migration-map.schema.json",
+      "schema_version": 1,
+      "root_unknown_fields": "reject"
+    },
+    "fetcher-progress": {
+      "file": "fetcher-progress.schema.json",
+      "schema_version": 1,
+      "root_unknown_fields": "reject"
+    }
+  },
+  "evolution": {
+    "compatible_changes": [
+      "add_optional_property_to_open_object",
+      "widen_non_identity_numeric_range",
+      "clarify_description_without_behavior_change"
+    ],
+    "version_bump_required_for": [
+      "remove_property",
+      "add_required_property",
+      "rename_property",
+      "change_enum_members",
+      "narrow_value_constraint",
+      "change_unknown_field_policy",
+      "change_state_transition"
+    ]
+  },
+  "fixtures": {
+    "valid_pattern": "<kind>-valid*.json",
+    "invalid_pattern": "<kind>-invalid-<reason>.json",
+    "sequence_valid_pattern": "fetcher-sequence-valid*.json",
+    "sequence_invalid_pattern": "fetcher-sequence-invalid-<reason>.json"
+  },
+  "fetcher_progress_v1": {
+    "start_event": "started",
+    "terminal_events": ["completed", "failed"],
+    "event_phases": {
+      "started": ["resolving"],
+      "resolved": ["resolving"],
+      "progress": ["downloading"],
+      "verified": ["verifying"],
+      "completed": ["done"],
+      "failed": ["resolving", "downloading", "verifying"]
+    },
+    "transitions": {
+      "started": ["resolved", "failed"],
+      "resolved": ["progress", "verified", "failed"],
+      "progress": ["progress", "verified", "failed"],
+      "verified": ["completed", "failed"],
+      "completed": [],
+      "failed": []
+    },
+    "required_fields": {
+      "resolved": ["resolved_revision"],
+      "progress": ["total_bytes", "downloaded_bytes", "files_total", "files_done"],
+      "verified": ["resolved_revision", "total_bytes", "downloaded_bytes", "files_total", "files_done"],
+      "failed": ["error"]
+    },
+    "monotonic_fields": ["downloaded_bytes", "files_done"]
+  }
+}

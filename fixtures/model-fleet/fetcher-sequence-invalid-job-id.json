@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "schema_version": 1,
+      "event": "started",
+      "job_id": "pull_sequence_job_a",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:00Z"
+    },
+    {
+      "schema_version": 1,
+      "event": "failed",
+      "job_id": "pull_sequence_job_b",
+      "phase": "resolving",
+      "at": "2026-08-08T10:00:01Z",
+      "error": {
+        "code": "resolve_failed",
+        "message": "fixture failure"
+      }
+    }
+  ]
+}
