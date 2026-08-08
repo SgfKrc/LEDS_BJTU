@@ -60,7 +60,7 @@ export class ClusterProfileRepository {
       row.profile_id, row.cluster_id, row.name, row.master_endpoint,
       row.status, row.key_ref, row.node_role, row.created_at,
     );
-    return row;
+    return this.getByCluster(row.cluster_id) ?? row;
   }
 
   get(profileId: string): ClusterProfileRow | null {

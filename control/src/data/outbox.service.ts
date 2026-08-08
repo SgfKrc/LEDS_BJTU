@@ -32,8 +32,14 @@ export class OutboxService {
     payload: unknown,
     aggregateVersion?: number,
   ): OutboxEvent {
-    const version =
-      aggregateVersion ?? this.nextVersion(aggregate);
+    const nextVersion = this.nextVersion(aggregate);
+    if (aggregateVersion !== undefined && aggregateVersion < nextVersion) {
+      throw new Error(
+        `outbox aggregate_version 已过期: ${aggregate} `
+        + `${aggregateVersion} < ${nextVersion}`,
+      );
+    }
+    const version = aggregateVersion ?? nextVersion;
     const event: OutboxEvent = {
       event_id: randomUUID(),
       aggregate,
@@ -70,7 +76,7 @@ export class OutboxService {
   pending(limit = 200): OutboxEvent[] {
     return this.store.prepare(
       'SELECT * FROM outbox WHERE projected_at IS NULL '
-      + 'ORDER BY created_at ASC LIMIT ?',
+      + 'ORDER BY created_at ASC, rowid ASC LIMIT ?',
     ).all(limit) as unknown as OutboxEvent[];
   }
 

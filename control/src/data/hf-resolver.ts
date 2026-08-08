@@ -54,8 +54,10 @@ export class HfResolver {
     repoId: string,
     requestedRevision = 'main',
     allowPatterns?: string[] | null,
+    apiBaseOverride?: string,
   ): Promise<ResolveResult> {
-    const url = `${this.apiBase}/api/models/${repoId}?revision=${encodeURIComponent(requestedRevision)}`;
+    const apiBase = (apiBaseOverride ?? this.apiBase).replace(/\/+$/, '');
+    const url = `${apiBase}/api/models/${repoId}?revision=${encodeURIComponent(requestedRevision)}`;
     const response = await this.fetchFn(url, {
       headers: { accept: 'application/json' },
       signal: AbortSignal.timeout(30_000),

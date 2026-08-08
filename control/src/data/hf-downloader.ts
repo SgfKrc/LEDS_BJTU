@@ -32,8 +32,14 @@ export class HfDownloader {
     this.throttleMs = options.progressThrottleMs ?? 250;
   }
 
-  fileUrl(repoId: string, revision: string, filename: string): string {
-    return `${this.apiBase}/${repoId}/resolve/${encodeURIComponent(revision)}/${filename}`;
+  fileUrl(
+    repoId: string,
+    revision: string,
+    filename: string,
+    apiBaseOverride?: string,
+  ): string {
+    const apiBase = (apiBaseOverride ?? this.apiBase).replace(/\/+$/, '');
+    return `${apiBase}/${repoId}/resolve/${encodeURIComponent(revision)}/${filename}`;
   }
 
   /**
@@ -50,6 +56,7 @@ export class HfDownloader {
       signal?: AbortSignal;
       startBytes?: number;
       expectedSize?: number;
+      apiBase?: string;
     } = {},
   ): Promise<void> {
     fs.mkdirSync(require('path').dirname(destPath), { recursive: true });
@@ -62,7 +69,9 @@ export class HfDownloader {
 
     const headers: Record<string, string> = {};
     if (startBytes > 0) headers['range'] = `bytes=${startBytes}-`;
-    const response = await this.fetchFn(this.fileUrl(repoId, revision, filename), {
+    const response = await this.fetchFn(this.fileUrl(
+      repoId, revision, filename, opts.apiBase,
+    ), {
       headers,
       signal: opts.signal,
     });
