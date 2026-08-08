@@ -13,6 +13,7 @@ import {
 import { Observable, Subject } from 'rxjs';
 import { PullJobService, PullJob, PullJobEvent } from '../../data/pull-job.service';
 import { PullJobExecutor } from '../../data/pull-job-executor';
+import { ModelSourceRepository } from '../../data/model-source-repository';
 
 class CreatePullRequest {
   idempotency_key?: string;
@@ -23,6 +24,8 @@ class CreatePullRequest {
     allow_patterns?: string[];
   };
   cancel_policy?: 'keep_partial' | 'cleanup';
+  source_id?: string;
+  token?: string;
 }
 
 @Controller('models/pull')
@@ -30,6 +33,7 @@ export class PullJobController {
   constructor(
     private readonly jobs: PullJobService,
     private readonly executor: PullJobExecutor,
+    private readonly sources: ModelSourceRepository,
   ) {}
 
   @Post()
@@ -38,19 +42,36 @@ export class PullJobController {
     const source = body?.source;
     const repoId = source?.repo_id?.trim() ?? '';
     const provider = source?.provider ?? 'huggingface';
+    if (body?.token || (body as Record<string, unknown>)['access_token']) {
+      throw new HttpException('token 明文禁止进入请求；请使用 credential_ref', 422);
+    }
     if (!repoId) {
       throw new HttpException('source.repo_id 必填', 422);
     }
     if (!['huggingface', 'gguf_huggingface'].includes(provider)) {
       throw new HttpException('provider 仅支持 huggingface/gguf_huggingface', 400);
     }
+    const selectedSource = body?.source_id
+      ? this.sources.get(body.source_id)
+      : this.sources.preferred('huggingface');
+    if (!selectedSource || !selectedSource.enabled) {
+      throw new HttpException('model source 不存在或已禁用', 422);
+    }
+    if (selectedSource.provider !== 'huggingface') {
+      throw new HttpException('当前仅实现 Hugging Face 来源', 400);
+    }
+    const requestedRevision = source?.requested_revision?.trim() || 'main';
     const job = this.jobs.create({
-      idempotencyKey: body?.idempotency_key ?? `pull:${repoId}:${source?.requested_revision ?? 'main'}`,
+      idempotencyKey: body?.idempotency_key
+        ?? `pull:${selectedSource.source_id}:${repoId}:${requestedRevision}`,
       source: {
         provider: provider as 'huggingface' | 'gguf_huggingface',
         repo_id: repoId,
-        requested_revision: source?.requested_revision?.trim() || 'main',
+        requested_revision: requestedRevision,
         allow_patterns: source?.allow_patterns ?? null,
+        source_id: selectedSource.source_id,
+        endpoint: selectedSource.endpoint,
+        credential_ref: selectedSource.credential_ref,
       },
       cancelPolicy: body?.cancel_policy ?? 'keep_partial',
     });

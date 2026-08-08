@@ -10,10 +10,12 @@
  * verify 不写任何状态（无副作用）；保存/更新经 repository（幂等）。
  */
 import {
-  Body, Controller, Delete, Get, HttpCode, HttpException, Param, Post,
+  Body, Controller, Delete, Get, HttpCode, HttpException, Param, Post, Query,
 } from '@nestjs/common';
 import { ClusterProfileRepository, ClusterProfileRow } from '../../data/cluster-profile-repository';
 import { ClusterEndpointsRepository } from '../../data/cluster-endpoints-repository';
+import { ClusterProfileSelectionService } from '../../data/cluster-profile-selection';
+import { ClusterDiscoveryService } from '../../data/cluster-discovery.service';
 
 class VerifyProfileRequest {
   name?: string;
@@ -45,6 +47,8 @@ export class ClusterProfilesController {
   constructor(
     private readonly profiles: ClusterProfileRepository,
     private readonly endpoints: ClusterEndpointsRepository,
+    private readonly selection: ClusterProfileSelectionService,
+    private readonly discovery: ClusterDiscoveryService,
   ) {}
 
   /** 无副作用探测：只读主节点 /bootstrap/info，不写任何状态。 */
@@ -95,12 +99,28 @@ export class ClusterProfilesController {
       master_endpoint: endpoint,
       node_role: body?.node_role,
     });
-    return { status: 'created', profile: row };
+    return { status: 'created', profile: this.dto(row) };
   }
 
   @Get('profiles')
   list(): Record<string, unknown> {
-    return { profiles: this.profiles.list() };
+    return { profiles: this.profiles.list().map((row) => this.dto(row)) };
+  }
+
+  @Post('profiles/:profileId/activate')
+  @HttpCode(200)
+  activate(@Param('profileId') profileId: string): Record<string, unknown> {
+    try {
+      return { status: 'active', profile: this.dto(this.selection.activate(profileId)) };
+    } catch (error) {
+      throw new HttpException(error instanceof Error ? error.message : String(error), 404);
+    }
+  }
+
+  @Get('profiles/current')
+  current(): Record<string, unknown> {
+    const profile = this.selection.current();
+    return { profile: profile ? this.dto(profile) : null };
   }
 
   @Delete('profiles/:profileId')
@@ -109,7 +129,22 @@ export class ClusterProfilesController {
     if (!this.profiles.delete(profileId)) {
       throw new HttpException(`档案不存在: ${profileId}`, 404);
     }
+    this.selection.clearIf(profileId);
     return { status: 'deleted', profile_id: profileId };
+  }
+
+  @Get('discovery/candidates')
+  discoveryCandidates(@Query('tailscale_peers') peers?: string): Record<string, unknown> {
+    const tailscalePeers = peers
+      ? peers.split(',').map((peer) => peer.trim()).filter(Boolean)
+      : [];
+    return {
+      candidates: this.discovery.candidates({
+        current: this.selection.current(),
+        envHost: process.env.QLH_MASTER_HOST ?? null,
+        tailscalePeers,
+      }),
+    };
   }
 
   @Get('endpoints')
@@ -135,6 +170,29 @@ export class ClusterProfilesController {
       detail = err instanceof Error ? err.message : String(err);
     }
     return { endpoint: `${scheme}://${host}:${port}`, reachable, detail };
+  }
+
+  private dto(row: ClusterProfileRow): Record<string, unknown> {
+    const normalized = row.master_endpoint.startsWith('http')
+      ? row.master_endpoint
+      : `http://${row.master_endpoint}`;
+    const parsed = new URL(normalized);
+    return {
+      schema_version: 1,
+      profile_id: row.profile_id,
+      name: row.name,
+      cluster_id: row.cluster_id,
+      master_endpoint: {
+        scheme: parsed.protocol.replace(':', ''),
+        host: parsed.hostname,
+        port: Number(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80),
+      },
+      status: row.status,
+      key_ref: row.key_ref,
+      node_role: row.node_role,
+      last_verified_at: row.last_verified_at,
+      created_at: row.created_at,
+    };
   }
 }
 
