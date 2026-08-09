@@ -9,6 +9,7 @@
     "test": "jest --runInBand",
     "model-fleet:import": "node dist/model-fleet-import.js",
     "model-fleet:network-smoke": "node dist/model-fleet-network-smoke.js",
+    "model-fleet:recovery-smoke": "node dist/model-fleet-recovery-smoke.js",
     "model-fleet:runtime-check": "node dist/model-fleet-runtime-check.js"
   },
   "dependencies": {
