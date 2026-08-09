@@ -1,114 +1,77 @@
-/**
- * control-svc db/health 域契约测试（阶段 3.2 db-health 域）
- *
- * 语义对齐 api_server.py:6669-6700：
- *  - GET /db/health → 三态：
- *    - enabled=false（QLH_DB_ENABLED=0）→ not_configured
- *    - enabled=true 但连接失败 → connection_failed（message 含驱动错误）
- *    - 连接成功（SELECT 1）→ {status:'ok', host, port, db}
- *
- * 说明：ok 分支无真实 PostgreSQL，用 stub ConfigDao（ping 恒 ok）验证
- * 响应形状；connection_failed 用真实 ConfigDao + 无效端口（连接超时 3s 内
- * 失败）；driver_missing 分支 TS 侧不存在（pg 为编译期依赖，见控制器注释）。
- */
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
+/** M1.3 compatibility contract for GET /db/health. */
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
+import { Test } from '@nestjs/testing';
+import { AppModule } from '../src/app';
+import { SqliteStore } from '../src/data/sqlite-store';
 
-describe('control-svc db/health 域（阶段 3.2 db-health）', () => {
+describe('control-svc db/health local SQLite contract', () => {
   let app: NestFastifyApplication | null = null;
+  let store: SqliteStore;
   let tmpBase: string;
 
   beforeEach(() => {
-    tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'control-db-'));
+    tmpBase = mkdtempSync(join(tmpdir(), 'control-db-'));
+    store = new SqliteStore(join(tmpBase, 'control.sqlite3'));
+    store.open();
   });
 
   afterEach(async () => {
-    if (app) {
-      await app.close();
-      app = null;
-    }
-    fs.rmSync(tmpBase, { recursive: true, force: true });
+    if (app) await app.close();
+    store.close();
+    rmSync(tmpBase, { recursive: true, force: true });
+    delete process.env.QLH_DB_ENABLED;
+    delete process.env.QLH_DB_HOST;
   });
 
-  async function createTestApp(dao: unknown): Promise<NestFastifyApplication> {
-    const { Test } = require('@nestjs/testing');
-    const { AppModule } = require('../src/app');
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
-    })
-      .overrideProvider(ConfigDao)
-      .useValue(dao)
+  async function createTestApp(): Promise<NestFastifyApplication> {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(SqliteStore)
+      .useValue(store)
       .compile();
-    const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
-    const testApp = moduleRef.createNestApplication(fastifyAdapter);
-    const { JsonDetailFilter } = require('../src/common/json-detail.filter');
-    const { RequestIdInterceptor } = require('../src/common/request-id');
-    testApp.useGlobalFilters(new JsonDetailFilter());
-    testApp.useGlobalInterceptors(new RequestIdInterceptor());
+    const fastify = new (require('@nestjs/platform-fastify').FastifyAdapter)();
+    const testApp = moduleRef.createNestApplication(fastify) as NestFastifyApplication;
     await testApp.init();
     await testApp.getHttpAdapter().getInstance().ready();
     return testApp;
   }
 
-  it('GET /db/health 未配置（QLH_DB_ENABLED=0）→ not_configured', async () => {
-    const dao = new ConfigDao({
-      host: 'localhost',
-      port: 5432,
-      name: 'qlh_edge_inference',
-      user: 'postgres',
-      password: '',
-      enabled: false,
-      sslmode: 'prefer',
-    });
-    app = await createTestApp(dao);
-    const res = await app.inject({ method: 'GET', url: '/db/health' });
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({
-      status: 'unavailable',
-      reason: 'not_configured',
-      message: '数据库未配置，正在使用本地文件存储',
-      retry_in_seconds: 0,
-    });
-  });
-
-  it('GET /db/health 已配置但连接失败 → connection_failed（含驱动错误消息）', async () => {
-    const dao = new ConfigDao({
-      host: '127.0.0.1',
-      port: 59999, // 必然不可达端口
-      name: 'x',
-      user: 'postgres',
-      password: '',
-      enabled: true,
-      sslmode: 'disable',
-    });
-    app = await createTestApp(dao);
-    const res = await app.inject({ method: 'GET', url: '/db/health' });
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.status).toBe('unavailable');
-    expect(body.reason).toBe('connection_failed');
-    expect(typeof body.message).toBe('string');
-    expect(body.message.length).toBeGreaterThan(0);
-    expect(body.retry_in_seconds).toBe(0);
-  });
-
-  it('GET /db/health 连接成功 → {status:ok, host, port, db}', async () => {
-    const dao = {
-      dbEnabled: () => true,
-      ping: async () => ({ ok: true }),
-      getConnectionInfo: () => ({ host: 'db.example', port: 5432, db: 'qlh_edge_inference' }),
-    };
-    app = await createTestApp(dao);
+  it('reports the user-owned SQLite database as healthy', async () => {
+    app = await createTestApp();
     const res = await app.inject({ method: 'GET', url: '/db/health' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({
       status: 'ok',
-      host: 'db.example',
-      port: 5432,
-      db: 'qlh_edge_inference',
+      backend: 'sqlite',
+      mode: 'local_only',
+      path: store.filePath,
+      schema_version: 7,
+      legacy_remote: 'disabled',
     });
+  });
+
+  it('does not contact PostgreSQL even when legacy environment values remain', async () => {
+    process.env.QLH_DB_ENABLED = '1';
+    process.env.QLH_DB_HOST = '203.0.113.254';
+    app = await createTestApp();
+    const started = Date.now();
+    const res = await app.inject({ method: 'GET', url: '/db/health' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().backend).toBe('sqlite');
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  it('reports a completed legacy retirement without changing local health', async () => {
+    store.prepare(
+      `INSERT INTO storage_retirement
+         (retirement_id, status, manifest_version, backup_sha256, manifest_sha256,
+          prepared_at, retired_at, removed_outbox_events, details)
+       VALUES (1, 'retired', 1, ?, ?, ?, ?, 0, '{}')`,
+    ).run('a'.repeat(64), 'b'.repeat(64), '2026-08-09T00:00:00Z', '2026-08-09T00:01:00Z');
+    app = await createTestApp();
+    const res = await app.inject({ method: 'GET', url: '/db/health' });
+    expect(res.json()).toMatchObject({ status: 'ok', legacy_remote: 'retired' });
   });
 });

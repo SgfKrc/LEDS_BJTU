@@ -7,6 +7,9 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "test": "jest --runInBand",
+    "storage:backup": "node dist/storage-backup.js",
+    "storage:probe": "node dist/storage-environment-probe.js",
+    "storage:retire-postgres": "node dist/storage-retirement.js",
     "model-fleet:import": "node dist/model-fleet-import.js",
     "model-fleet:network-smoke": "node dist/model-fleet-network-smoke.js",
     "model-fleet:recovery-smoke": "node dist/model-fleet-recovery-smoke.js",
@@ -18,7 +21,6 @@
     "@nestjs/platform-fastify": "^11.0.0",
     "fastify": "5.11.0",
     "jszip": "^3.10.1",
-    "pg": "^8.13.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "undici": "^8.10.0"
@@ -32,6 +34,7 @@
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "jest": "^29.7.0",
+    "pg": "^8.13.0",
     "supertest": "^7.0.0",
     "ts-jest": "^29.2.5",
     "typescript": "^5.7.0"

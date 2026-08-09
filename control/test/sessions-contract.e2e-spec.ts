@@ -384,7 +384,7 @@ describe('control-svc sessions/conversations 域（阶段 3.2 首迁）', () => 
     const res = await app.inject({ method: 'GET', url: '/conversations/sync-status' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({
-      save_history: false,
+      save_history: true,
       db_connected: false,
       local_save_enabled: true,
       local_store_enabled: true,
