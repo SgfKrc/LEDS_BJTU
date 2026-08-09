@@ -15,10 +15,14 @@
  *    引用的工件（本实现以引用计数 + 显式保留集为边界）；
  *  - 模型目录必须位于本地文件系统；不信任文件名，先读 manifest 再核对摘要。
  */
-import { Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import {
+  ArtifactManifestIntegrity,
+  ArtifactManifestRepository,
+} from './artifact-manifest-repository';
 
 export function resolveModelStorePath(): string {
   const override = process.env.QLH_MODEL_STORE?.trim();
@@ -53,15 +57,50 @@ export interface StoredArtifactManifest {
   manifest: Record<string, unknown>;
 }
 
+export interface ArtifactReindexResult {
+  registered: number;
+  failed: number;
+  errors: string[];
+}
+
+export interface ArtifactManifestRestoreResult {
+  restored: number;
+  unchanged: number;
+  failed: number;
+  errors: string[];
+}
+
 export function sha256Hex(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+export function sha256FileHex(filePath: string): string {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);
+  try {
+    let position = 0;
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 @Injectable()
 export class ArtifactStore {
   readonly root: string;
 
-  constructor(@Optional() root?: string) {
+  constructor(
+    @Optional() root?: string,
+    @Optional() @Inject(ArtifactManifestRepository)
+    private readonly manifestRepository?: ArtifactManifestRepository,
+  ) {
     this.root = root ?? resolveModelStorePath();
   }
 
@@ -114,6 +153,31 @@ export class ArtifactStore {
     return target;
   }
 
+  /** Reuse a verified content-addressed blob without copying model bytes. */
+  stageExistingBlob(
+    jobId: string,
+    relPath: string,
+    digest: string,
+    expectedSize: number,
+  ): string {
+    const normalizedDigest = digest.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(normalizedDigest)) {
+      throw new Error(`invalid blob digest: ${digest}`);
+    }
+    const source = this.blobPath(normalizedDigest);
+    const sourceStat = fs.statSync(source);
+    if (!sourceStat.isFile() || sourceStat.size !== expectedSize) {
+      throw new Error(`existing blob size mismatch: ${normalizedDigest}`);
+    }
+    const target = path.join(this.stagingDir(jobId), relPath);
+    if (!target.startsWith(this.stagingDir(jobId) + path.sep)) {
+      throw new Error(`闈炴硶 staging 鐩稿璺緞: ${relPath}`);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.linkSync(source, target);
+    return target;
+  }
+
   listStaging(jobId: string): string[] {
     const dir = this.stagingDir(jobId);
     if (!fs.existsSync(dir)) return [];
@@ -158,7 +222,7 @@ export class ArtifactStore {
       throw new Error(`staging 文件缺失: ${relPath}`);
     }
     const size = fs.statSync(source).size;
-    const digest = this.sha256File(source);
+    const digest = sha256FileHex(source);
     const target = this.blobPath(digest);
     if (fs.existsSync(target)) {
       fs.rmSync(source, { force: true });
@@ -189,10 +253,30 @@ export class ArtifactStore {
     const name = String(manifest['name'] ?? manifest['artifact_id'] ?? 'model');
     const tag = String(manifest['tag'] ?? 'latest');
     const target = this.manifestPath(ns, name, tag);
+    let integrity: ArtifactManifestIntegrity | undefined;
+    if (this.manifestRepository) {
+      integrity = this.manifestRepository.validate(
+        manifest,
+        (digest) => this.blobExists(digest),
+      );
+      if (!integrity.ok) {
+        throw new Error(`artifact manifest integrity failed: ${integrity.errors.join('; ')}`);
+      }
+    }
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const tmp = `${target}.tmp-${process.pid}`;
+    const previous = fs.existsSync(target) ? fs.readFileSync(target) : null;
     fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + '\n', 'utf-8');
     fs.renameSync(tmp, target);
+    if (this.manifestRepository && integrity) {
+      try {
+        this.manifestRepository.register(manifest, target, integrity);
+      } catch (err) {
+        if (previous) fs.writeFileSync(target, previous);
+        else fs.rmSync(target, { force: true });
+        throw err;
+      }
+    }
     return target;
   }
 
@@ -244,6 +328,80 @@ export class ArtifactStore {
       const right = `${b.reference.namespace}/${b.reference.name}:${b.reference.tag}`;
       return left.localeCompare(right);
     });
+  }
+
+  /** 将既有文件系统 manifest 幂等登记进主节点 SQLite 索引。 */
+  reindexManifests(): ArtifactReindexResult {
+    const result: ArtifactReindexResult = { registered: 0, failed: 0, errors: [] };
+    if (!this.manifestRepository) return result;
+    for (const entry of this.listManifests()) {
+      const key = `${entry.reference.namespace}/${entry.reference.name}:${entry.reference.tag}`;
+      try {
+        const integrity = this.manifestRepository.validate(
+          entry.manifest,
+          (digest) => this.blobExists(digest),
+        );
+        if (!integrity.ok) {
+          throw new Error(integrity.errors.join('; '));
+        }
+        this.manifestRepository.register(
+          entry.manifest,
+          this.manifestPath(
+            entry.reference.namespace,
+            entry.reference.name,
+            entry.reference.tag,
+          ),
+          integrity,
+        );
+        result.registered += 1;
+      } catch (err) {
+        result.failed += 1;
+        result.errors.push(`${key}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return result;
+  }
+
+  /** 用 SQLite 中的 manifest payload 重建缺失/损坏的文件系统索引。 */
+  restoreIndexedManifests(): ArtifactManifestRestoreResult {
+    const result: ArtifactManifestRestoreResult = {
+      restored: 0,
+      unchanged: 0,
+      failed: 0,
+      errors: [],
+    };
+    if (!this.manifestRepository) return result;
+    for (const record of this.manifestRepository.list()) {
+      try {
+        const integrity = this.manifestRepository.validate(
+          record.manifest,
+          (digest) => this.blobExists(digest),
+        );
+        if (!integrity.ok) throw new Error(integrity.errors.join('; '));
+        const target = this.manifestPath(record.namespace, record.name, record.tag);
+        let unchanged = false;
+        if (fs.existsSync(target)) {
+          try {
+            const current = JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+            unchanged = JSON.stringify(current) === JSON.stringify(record.manifest);
+          } catch {
+            unchanged = false;
+          }
+        }
+        if (unchanged) {
+          result.unchanged += 1;
+          continue;
+        }
+        this.writeManifest(record.manifest);
+        result.restored += 1;
+      } catch (err) {
+        result.failed += 1;
+        result.errors.push(
+          `${record.manifest_key}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return result;
   }
 
   /** manifest 中引用 blob 的 digest 集合（去重；null 摘要 manifest 忽略）。 */
@@ -301,21 +459,4 @@ export class ArtifactStore {
     fs.rmSync(this.stagingDir(jobId), { recursive: true, force: true });
   }
 
-  private sha256File(filePath: string): string {
-    const hash = crypto.createHash('sha256');
-    const fd = fs.openSync(filePath, 'r');
-    const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);
-    try {
-      let position = 0;
-      while (true) {
-        const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, position);
-        if (bytesRead === 0) break;
-        hash.update(buffer.subarray(0, bytesRead));
-        position += bytesRead;
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-    return hash.digest('hex');
-  }
 }

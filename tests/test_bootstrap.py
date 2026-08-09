@@ -20,10 +20,23 @@ def test_tailscale_cidr_is_trusted():
     assert not is_trusted_bootstrap_source("192.168.1.10")
 
 
+def test_tailscale_ipv6_ula_is_trusted():
+    """Tailscale IPv6 ULA（fd7a:115c:a1e0::/48）应被信任，供纯 v6 组网发现。"""
+    from bootstrap import is_trusted_bootstrap_source
+
+    assert is_trusted_bootstrap_source("fd7a:115c:a1e0:ab12::1")
+    assert is_trusted_bootstrap_source("fd7a:115c:a1e0::1")
+    assert not is_trusted_bootstrap_source("fe80::1")      # 链路本地不信任
+    assert not is_trusted_bootstrap_source("2001:db8::1")  # 文档段不信任
+
+
 def test_tailnet_join_does_not_advertise_unroutable_lan_address():
     from bootstrap import select_advertised_master_host
 
     assert select_advertised_master_host("100.90.1.2", "192.168.1.20") == "100.90.1.2"
+    assert select_advertised_master_host(
+        "fd7a:115c:a1e0::10", "192.168.1.20"
+    ) == "fd7a:115c:a1e0::10"
     assert select_advertised_master_host("master.example.ts.net", "192.168.1.20") == "master.example.ts.net"
     assert select_advertised_master_host("203.0.113.10", "192.168.1.20") == "192.168.1.20"
 
@@ -66,6 +79,76 @@ def test_normalize_node_id_rejects_master():
 
     assert normalize_node_id("master", "pc").startswith("client_")
     assert normalize_node_id("android phone/1", "android") == "android_phone_1"
+
+
+def test_tailnet_ipv6_discovery_uses_brackets_only_in_url(monkeypatch):
+    import json
+    import bootstrap
+
+    seen = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"is_master": True}).encode("utf-8")
+
+    monkeypatch.setattr(
+        bootstrap, "get_tailnet_peer_ips", lambda: ["fd7a:115c:a1e0::10"]
+    )
+
+    def fake_urlopen(url, timeout):
+        seen.append(str(url))
+        return Response()
+
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", fake_urlopen)
+
+    result = bootstrap.discover_master_via_tailnet(api_port=8000)
+
+    assert seen == ["http://[fd7a:115c:a1e0::10]:8000/api/bootstrap/info"]
+    assert result["master_host"] == "fd7a:115c:a1e0::10"
+
+
+def test_first_connect_builds_valid_ipv6_url(monkeypatch):
+    import json
+    import bootstrap
+
+    seen = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "status": "ok",
+                "cluster": {
+                    "master_tcp_host": "fd7a:115c:a1e0::10",
+                    "master_tcp_port": 8888,
+                },
+                "node": {"node_id": "client-v6", "role": "client"},
+            }).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        seen.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bootstrap, "persist_bootstrap_response", lambda data: None)
+    monkeypatch.setattr(bootstrap, "apply_runtime_config", lambda data: None)
+
+    bootstrap.first_connect("fd7a:115c:a1e0::10", 8000, node_id="client-v6")
+
+    assert seen == [
+        "http://[fd7a:115c:a1e0::10]:8000/api/bootstrap/first-connect"
+    ]
 
 
 def test_persist_bootstrap_response_writes_node_config(tmp_path, monkeypatch):
@@ -196,3 +279,29 @@ def test_apply_runtime_config_syncs_loaded_scheduler(monkeypatch):
     assert scheduler_mod.NODE_ROLE == "client"
     assert os.environ["QLH_CLUSTER_SECRET"] == "secret-456"
     assert os.environ["QLH_NODE_ROLE"] == "client"
+
+
+def test_tailnet_peer_ips_includes_ipv6(monkeypatch, tmp_path):
+    """在线 Tailnet 对等点的 IPv6 ULA 地址应被纳入发现候选（问题 #5 回归）。"""
+    import json
+    from types import SimpleNamespace
+    import bootstrap
+
+    fake_exe = tmp_path / "tailscale.exe"
+    fake_exe.write_bytes(b"")
+    monkeypatch.setattr(bootstrap, "_find_tailscale_executable", lambda: str(fake_exe))
+    monkeypatch.setattr(bootstrap.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"Peer": {
+            "peer1": {"Online": True, "TailscaleIPs": ["100.90.1.2", "fd7a:115c:a1e0:ab12::1"]},
+            "peer2": {"Online": True, "TailscaleIPs": ["fd7a:115c:a1e0:ab12::2"]},
+            "peer3": {"Online": False, "TailscaleIPs": ["100.90.1.3"]},
+        }}),
+    ))
+
+    peers = bootstrap.get_tailnet_peer_ips()
+
+    assert "100.90.1.2" in peers
+    assert "fd7a:115c:a1e0:ab12::1" in peers
+    assert "fd7a:115c:a1e0:ab12::2" in peers
+    assert "100.90.1.3" not in peers  # 离线对等点排除

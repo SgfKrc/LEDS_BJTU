@@ -1,0 +1,330 @@
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  HttpException,
+  Param,
+  Patch,
+  Post,
+  Req,
+} from '@nestjs/common';
+import type { FastifyRequest } from 'fastify';
+import {
+  AuthService,
+  AuthServiceError,
+  AuthenticatedSession,
+} from '../../data/auth-service';
+import { LocalUserRole } from '../../data/auth-asset-repository';
+
+interface BootstrapRequest {
+  username?: string;
+  display_name?: string;
+}
+
+interface TotpVerifyRequest {
+  user_id?: string;
+  authenticator_id?: string;
+  code?: string;
+}
+
+interface LoginRequest {
+  username?: string;
+  code?: string;
+  recovery_code?: string;
+}
+
+interface UserRequest {
+  username?: string;
+  display_name?: string;
+  role?: LocalUserRole;
+  expected_version?: number;
+  status?: 'active' | 'suspended' | 'revoked';
+}
+
+interface RecoveryRotateRequest {
+  code?: string;
+}
+
+interface TailscalePrepareRequest {
+  user_id?: string;
+  authorization_method?: 'tailscale_cli' | 'local_status' | 'oauth_app';
+  credential_ref?: string | null;
+}
+
+interface TailscaleConfirmRequest {
+  tailnet_id?: string;
+  tailscale_user_id?: string;
+  node_id?: string | null;
+}
+
+function bearerToken(req: FastifyRequest): string | null {
+  const raw = req.headers.authorization;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!value) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(value.trim());
+  return match ? match[1].trim() : null;
+}
+
+@Controller('auth')
+export class AuthController {
+  constructor(private readonly auth: AuthService) {}
+
+  @Post('bootstrap')
+  @HttpCode(201)
+  async bootstrap(@Body() body: BootstrapRequest): Promise<Record<string, unknown>> {
+    return this.run(async () => {
+      if (!body?.username) throw new AuthServiceError(422, 'username 必填');
+      const provisioning = await this.auth.bootstrapOwner({
+        username: body.username,
+        display_name: body.display_name,
+      });
+      return { status: 'pending', provisioning };
+    });
+  }
+
+  @Post('totp/verify')
+  @HttpCode(200)
+  async verifyTotp(@Body() body: TotpVerifyRequest): Promise<Record<string, unknown>> {
+    return this.run(async () => {
+      if (!body?.user_id || !body.authenticator_id || !body.code) {
+        throw new AuthServiceError(422, 'user_id、authenticator_id 和 code 必填');
+      }
+      const result = await this.auth.verifyProvisioning({
+        user_id: body.user_id,
+        authenticator_id: body.authenticator_id,
+        code: body.code,
+      });
+      return { status: 'active', user: result.user, recovery_codes: result.recovery_codes };
+    });
+  }
+
+  @Post('login')
+  @HttpCode(200)
+  async login(@Body() body: LoginRequest): Promise<Record<string, unknown>> {
+    return this.run(async () => {
+      if (!body?.username || (!body.code && !body.recovery_code)) {
+        throw new AuthServiceError(422, 'username 以及 code 或 recovery_code 必填');
+      }
+      return { ...await this.auth.login({
+        username: body.username,
+        code: body.code,
+        recovery_code: body.recovery_code,
+      }) };
+    });
+  }
+
+  @Get('session')
+  session(@Req() req: FastifyRequest): Record<string, unknown> {
+    const current = this.currentSession(req);
+    return { session_id: current.session_id, expires_at: current.expires_at, user: current.user };
+  }
+
+  @Post('logout')
+  @HttpCode(200)
+  logout(@Req() req: FastifyRequest): Record<string, string> {
+    this.auth.logout(bearerToken(req));
+    return { status: 'logged_out' };
+  }
+
+  @Post('recovery-codes/rotate')
+  @HttpCode(200)
+  async rotateRecoveryCodes(@Req() req: FastifyRequest, @Body() body: RecoveryRotateRequest): Promise<Record<string, unknown>> {
+    const current = this.currentSession(req);
+    return this.run(async () => {
+      if (!body?.code) throw new AuthServiceError(422, 'code 必填');
+      return { status: 'rotated', recovery_codes: await this.auth.rotateRecoveryCodes(current, body.code) };
+    });
+  }
+
+  @Get('tailscale/bindings')
+  listTailscaleBindings(@Req() req: FastifyRequest): Record<string, unknown> {
+    return this.runSync(() => ({ bindings: this.auth.listTailscaleBindings(this.currentSession(req)) }));
+  }
+
+  @Post('tailscale/bindings')
+  @HttpCode(201)
+  prepareTailscaleBinding(@Req() req: FastifyRequest, @Body() body: TailscalePrepareRequest): Record<string, unknown> {
+    return this.runSync(() => ({
+      status: 'pending',
+      binding: this.auth.prepareTailscaleBinding(this.currentSession(req), {
+        user_id: body?.user_id,
+        authorization_method: body?.authorization_method,
+        credential_ref: body?.credential_ref,
+      }),
+    }));
+  }
+
+  @Post('tailscale/bindings/:bindingId/confirm')
+  @HttpCode(200)
+  confirmTailscaleBinding(@Req() req: FastifyRequest, @Param('bindingId') bindingId: string, @Body() body: TailscaleConfirmRequest): Record<string, unknown> {
+    return this.runSync(() => {
+      if (!body?.tailnet_id || !body.tailscale_user_id) {
+        throw new AuthServiceError(422, 'tailnet_id 和 tailscale_user_id 必填');
+      }
+      return {
+        status: 'active',
+        binding: this.auth.confirmTailscaleBinding(this.currentSession(req), bindingId, {
+          tailnet_id: body.tailnet_id,
+          tailscale_user_id: body.tailscale_user_id,
+          node_id: body.node_id,
+        }),
+      };
+    });
+  }
+
+  @Post('tailscale/bindings/:bindingId/revoke')
+  @HttpCode(200)
+  revokeTailscaleBinding(@Req() req: FastifyRequest, @Param('bindingId') bindingId: string): Record<string, unknown> {
+    return this.runSync(() => ({
+      status: 'revoked',
+      binding: this.auth.revokeTailscaleBinding(this.currentSession(req), bindingId),
+    }));
+  }
+
+  @Get('users/:userId/tailscale')
+  listUserTailscaleBindings(@Req() req: FastifyRequest, @Param('userId') userId: string): Record<string, unknown> {
+    return this.runSync(() => ({ bindings: this.auth.listTailscaleBindings(this.currentSession(req), userId) }));
+  }
+
+  @Post('users/:userId/tailscale')
+  @HttpCode(201)
+  prepareUserTailscaleBinding(@Req() req: FastifyRequest, @Param('userId') userId: string, @Body() body: TailscalePrepareRequest): Record<string, unknown> {
+    return this.runSync(() => ({
+      status: 'pending',
+      binding: this.auth.prepareTailscaleBinding(this.currentSession(req), {
+        user_id: userId,
+        authorization_method: body?.authorization_method,
+        credential_ref: body?.credential_ref,
+      }),
+    }));
+  }
+
+  @Post('users/:userId/totp')
+  @HttpCode(201)
+  async createUserTotp(@Req() req: FastifyRequest, @Param('userId') userId: string): Promise<Record<string, unknown>> {
+    const current = this.currentSession(req);
+    return this.run(async () => {
+      if (current.user.role !== 'owner' && current.user.role !== 'admin') {
+        throw new AuthServiceError(403, '需要 owner 或 admin 权限');
+      }
+      return { status: 'pending', provisioning: await this.auth.createProvisioningForUser(userId) };
+    });
+  }
+
+  private currentSession(req: FastifyRequest): AuthenticatedSession {
+    try {
+      return this.auth.authenticateToken(bearerToken(req));
+    } catch (error) {
+      throw this.httpError(error);
+    }
+  }
+
+  private async run<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (error) {
+      throw this.httpError(error);
+    }
+  }
+
+  private runSync<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (error) {
+      throw this.httpError(error);
+    }
+  }
+
+  private httpError(error: unknown): HttpException {
+    if (error instanceof AuthServiceError) return new HttpException(error.message, error.status);
+    const message = error instanceof Error ? error.message : String(error);
+    if (/UNIQUE constraint|constraint failed|already exists/i.test(message)) {
+      return new HttpException('本地用户已存在或状态冲突', 409);
+    }
+    if (/credential|OS credential/i.test(message)) {
+      return new HttpException('OS credential store 不可用', 503);
+    }
+    return new HttpException('认证操作失败', 500);
+  }
+}
+
+@Controller('users')
+export class UsersController {
+  constructor(private readonly auth: AuthService) {}
+
+  @Get()
+  list(@Req() req: FastifyRequest): Record<string, unknown> {
+    return this.runSync(() => ({ users: this.auth.listUsers(this.currentSession(req)) }));
+  }
+
+  @Post()
+  @HttpCode(201)
+  create(@Req() req: FastifyRequest, @Body() body: UserRequest): Record<string, unknown> {
+    return this.runSync(() => {
+      if (!body?.username) throw new AuthServiceError(422, 'username 必填');
+      const user = this.auth.createUser(this.currentSession(req), {
+        username: body.username,
+        display_name: body.display_name,
+        role: body.role,
+      });
+      return { status: 'created', user };
+    });
+  }
+
+  @Patch(':userId')
+  @HttpCode(200)
+  update(@Req() req: FastifyRequest, @Param('userId') userId: string, @Body() body: UserRequest): Record<string, unknown> {
+    return this.runSync(() => {
+      if (!Number.isInteger(body?.expected_version) || Number(body.expected_version) < 1) {
+        throw new AuthServiceError(422, 'expected_version 必须为正整数');
+      }
+      const user = this.auth.updateUser(this.currentSession(req), userId, Number(body.expected_version), {
+        display_name: body.display_name,
+        role: body.role,
+        status: body.status,
+      });
+      return { status: 'updated', user };
+    });
+  }
+
+  @Delete(':userId')
+  @HttpCode(200)
+  revoke(@Req() req: FastifyRequest, @Param('userId') userId: string, @Body() body: UserRequest): Record<string, unknown> {
+    return this.runSync(() => {
+      if (!Number.isInteger(body?.expected_version) || Number(body.expected_version) < 1) {
+        throw new AuthServiceError(422, 'expected_version 必须为正整数');
+      }
+      const user = this.auth.updateUser(this.currentSession(req), userId, Number(body.expected_version), {
+        status: 'revoked',
+      });
+      return { status: 'revoked', user };
+    });
+  }
+
+  private currentSession(req: FastifyRequest): AuthenticatedSession {
+    try {
+      return this.auth.authenticateToken(bearerToken(req));
+    } catch (error) {
+      throw this.httpError(error);
+    }
+  }
+
+  private runSync<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (error) {
+      throw this.httpError(error);
+    }
+  }
+
+  private httpError(error: unknown): HttpException {
+    if (error instanceof AuthServiceError) return new HttpException(error.message, error.status);
+    const message = error instanceof Error ? error.message : String(error);
+    if (/UNIQUE constraint|constraint failed|already exists/i.test(message)) {
+      return new HttpException('本地用户已存在或状态冲突', 409);
+    }
+    return new HttpException('用户管理操作失败', 500);
+  }
+}

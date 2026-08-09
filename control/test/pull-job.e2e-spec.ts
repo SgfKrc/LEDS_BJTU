@@ -31,7 +31,12 @@ function tempStore(): { dir: string; store: SqliteStore } {
 function mockFetch(files: Array<{ name: string; content: Buffer }>, opts: {
   failDigest?: boolean;
   hang?: boolean;
+  downloadRequests?: string[];
+  downloadStarts?: number[];
+  interruptFirstDownloadAt?: number;
+  failDownloads?: boolean;
 } = {}) {
+  let interrupted = false;
   const digest = (data: Buffer): string =>
     require('crypto').createHash('sha256').update(data).digest('hex');
   return async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -47,18 +52,42 @@ function mockFetch(files: Array<{ name: string; content: Buffer }>, opts: {
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (target.includes('/resolve/')) {
+      if (opts.failDownloads) throw new TypeError('simulated proxy unavailable');
       const name = decodeURIComponent(target.split('/resolve/')[1].split('/').slice(1).join('/'));
+      opts.downloadRequests?.push(name);
       const file = files.find((f) => f.name === name);
       if (!file) return new Response('not found', { status: 404 });
+      const range = new Headers(init?.headers).get('range');
+      const start = range ? Number(/^bytes=(\d+)-$/.exec(range)?.[1]) : 0;
+      opts.downloadStarts?.push(start);
+      let deliveredPartial = false;
       const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(new Uint8Array(file.content));
+        pull(controller) {
+          if (!interrupted && opts.interruptFirstDownloadAt
+              && start === 0 && opts.interruptFirstDownloadAt < file.content.length) {
+            interrupted = true;
+            deliveredPartial = true;
+            controller.enqueue(new Uint8Array(
+              file.content.subarray(0, opts.interruptFirstDownloadAt),
+            ));
+            return;
+          }
+          if (deliveredPartial) {
+            controller.error(new Error('simulated proxy disconnect'));
+            return;
+          }
+          controller.enqueue(new Uint8Array(file.content.subarray(start)));
           controller.close();
         },
       });
       return new Response(stream, {
-        status: 200,
-        headers: { 'content-length': String(file.content.length) },
+        status: start > 0 ? 206 : 200,
+        headers: {
+          'content-length': String(file.content.length - start),
+          ...(start > 0
+            ? { 'content-range': `bytes ${start}-${file.content.length - 1}/${file.content.length}` }
+            : {}),
+        },
       });
     }
     return new Response('unexpected', { status: 500 });
@@ -123,12 +152,19 @@ describe('PullJobExecutor（M3）', () => {
   function makeExecutor(store: SqliteStore, dir: string, files: Array<{ name: string; content: Buffer }>, opts: {
     failDigest?: boolean;
     runtimeStatus?: ArtifactRuntimeStatus;
+    downloadRequests?: string[];
+    downloadStarts?: number[];
+    interruptFirstDownloadAt?: number;
+    failDownloads?: boolean;
   } = {}) {
     const jobs = new PullJobService(store);
     const fetchFn = mockFetch(files, opts);
     const http = new ModelHttpClient({ fetchFn, proxyUrl: null });
     const resolver = new HfResolver(http);
-    const downloader = new HfDownloader(http, { progressThrottleMs: 0 });
+    const downloader = new HfDownloader(http, {
+      progressThrottleMs: 0,
+      retryBaseDelayMs: 0,
+    });
     const artifactStore = new ArtifactStore(join(dir, 'store'));
     const protector = {
       name: 'test-protector',
@@ -267,6 +303,166 @@ describe('PullJobExecutor（M3）', () => {
     expect(final?.runtime_check?.status).toBe('resource_rejected');
     expect(final?.artifact_id).toMatch(/^sha256:/);
     expect(artifactStore.readManifest('hub', 'rejected', 'aaaaaaaaaaaa')).not.toBeNull();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restarts a non-terminal job and resumes the persisted staging partial', async () => {
+    const { dir, store } = tempStore();
+    const gguf = Buffer.concat([
+      Buffer.from('GGUF'),
+      (() => { const v = Buffer.alloc(4); v.writeUInt32LE(3); return v; })(),
+      Buffer.alloc(16),
+      Buffer.alloc(128, 7),
+    ]);
+    const beforeRestart = new PullJobService(store);
+    const job = beforeRestart.create({
+      idempotencyKey: 'pull-restart-partial',
+      source: {
+        provider: 'gguf_huggingface', repo_id: 'r/restart',
+        requested_revision: 'main', allow_patterns: ['*.gguf'],
+      },
+    });
+    beforeRestart.transition(job.job_id, 'resolving');
+    beforeRestart.transition(job.job_id, 'downloading');
+    const partialBytes = 61;
+    new ArtifactStore(join(dir, 'store')).stageWrite(
+      job.job_id, 'model.gguf', gguf.subarray(0, partialBytes),
+    );
+
+    const starts: number[] = [];
+    const { jobs, executor } = makeExecutor(store, dir, [
+      { name: 'model.gguf', content: gguf },
+    ], { downloadStarts: starts });
+    expect(executor.resumeActive()).toBe(1);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && jobs.get(job.job_id)?.state !== 'registered') {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const recovered = jobs.get(job.job_id);
+    expect(recovered?.state).toBe('registered');
+    expect(recovered?.progress.restart_count).toBe(1);
+    expect(recovered?.progress.resumed_bytes).toBe(partialBytes);
+    expect(starts).toEqual([partialBytes]);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('recovers a transient proxy disconnect on the same job and records the retry', async () => {
+    const { dir, store } = tempStore();
+    const gguf = Buffer.concat([
+      Buffer.from('GGUF'),
+      (() => { const v = Buffer.alloc(4); v.writeUInt32LE(3); return v; })(),
+      Buffer.alloc(16),
+      Buffer.alloc(128, 9),
+    ]);
+    const starts: number[] = [];
+    const interruptedAt = 73;
+    const { jobs, executor } = makeExecutor(store, dir, [
+      { name: 'model.gguf', content: gguf },
+    ], {
+      downloadStarts: starts,
+      interruptFirstDownloadAt: interruptedAt,
+    });
+    const job = jobs.create({
+      idempotencyKey: 'pull-proxy-recovery',
+      source: {
+        provider: 'gguf_huggingface', repo_id: 'r/proxy',
+        requested_revision: 'main', allow_patterns: ['*.gguf'],
+      },
+    });
+    executor.start(job.job_id);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && jobs.get(job.job_id)?.state !== 'registered') {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const recovered = jobs.get(job.job_id);
+    expect(recovered?.state).toBe('registered');
+    expect(recovered?.progress.transfer_attempt).toBe(2);
+    expect(recovered?.progress.transfer_retry_count).toBe(1);
+    expect(recovered?.progress.resumed_bytes).toBe(interruptedAt);
+    expect(recovered?.progress.last_retry_error).toBe('download_stream_interrupted');
+    expect(starts).toEqual([0, interruptedAt]);
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails deterministically after bounded proxy retries are exhausted', async () => {
+    const { dir, store } = tempStore();
+    const gguf = Buffer.concat([
+      Buffer.from('GGUF'),
+      (() => { const v = Buffer.alloc(4); v.writeUInt32LE(3); return v; })(),
+      Buffer.alloc(16),
+    ]);
+    const { jobs, executor } = makeExecutor(store, dir, [
+      { name: 'model.gguf', content: gguf },
+    ], { failDownloads: true });
+    const job = jobs.create({
+      idempotencyKey: 'pull-proxy-exhausted',
+      source: {
+        provider: 'gguf_huggingface', repo_id: 'r/proxy-offline',
+        requested_revision: 'main', allow_patterns: ['*.gguf'],
+      },
+    });
+    executor.start(job.job_id);
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && jobs.get(job.job_id)?.state !== 'failed') {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const failed = jobs.get(job.job_id);
+    expect(failed?.state).toBe('failed');
+    expect(failed?.error?.code).toBe('transfer_unavailable');
+    expect(failed?.progress.transfer_attempt).toBe(4);
+    expect(failed?.progress.transfer_retry_count).toBe(3);
+    expect(failed?.progress.last_retry_error).toBe('download_transport_unavailable');
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('inspects Safetensors pulls and reuses verified blobs on a later job', async () => {
+    const { dir, store } = tempStore();
+    const downloads: string[] = [];
+    const files = [
+      {
+        name: 'config.json',
+        content: Buffer.from(JSON.stringify({
+          model_type: 'qwen2',
+          architectures: ['Qwen2ForCausalLM'],
+          max_position_embeddings: 32768,
+        })),
+      },
+      { name: 'model.safetensors', content: Buffer.from('fixture-weights') },
+      { name: 'tokenizer.json', content: Buffer.from('{}') },
+    ];
+    const { jobs, executor, artifactStore } = makeExecutor(store, dir, files, {
+      downloadRequests: downloads,
+    });
+
+    const run = async (idempotencyKey: string): Promise<void> => {
+      const job = jobs.create({
+        idempotencyKey,
+        source: {
+          provider: 'huggingface', repo_id: 'r/qwen', requested_revision: 'main',
+        },
+      });
+      executor.start(job.job_id);
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && jobs.get(job.job_id)?.state !== 'registered') {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(jobs.get(job.job_id)?.state).toBe('registered');
+    };
+
+    await run('pull-safetensors-1');
+    const manifest = artifactStore.readManifest('hub', 'qwen', 'aaaaaaaaaaaa');
+    expect(manifest?.format).toBe('safetensors');
+    expect(manifest?.engine).toBe('pytorch_transformers');
+    expect(manifest?.family).toBe('qwen2');
+    expect((manifest?.capabilities as Record<string, boolean>).full_worker).toBe(true);
+    expect(downloads).toHaveLength(files.length);
+
+    await run('pull-safetensors-2');
+    expect(downloads).toHaveLength(files.length);
     store.close();
     rmSync(dir, { recursive: true, force: true });
   });

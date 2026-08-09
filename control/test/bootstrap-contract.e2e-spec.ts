@@ -6,7 +6,8 @@
  *    * QLH_BOOTSTRAP_ENABLED=false → 403 'bootstrap disabled'
  *    * 信任校验（QLH_BOOTSTRAP_REQUIRE_TAILSCALE 默认 true）：非信任
  *      来源 → 403 'source network is not trusted'；默认信任集
- *      100.64.0.0/10、127.0.0.0/8、::1/128，QLH_TRUSTED_BOOTSTRAP_CIDRS 可覆盖
+ *      100.64.0.0/10、127.0.0.0/8、::1/128、fd7a:115c:a1e0::/48，
+ *      QLH_TRUSTED_BOOTSTRAP_CIDRS 可覆盖
  *    * node_id 归一化（非法字符 → '_'、64 截断、空/'master' → client_<host>）
  *    * 响应结构 {status:'ok', cluster{cluster_id, master_api_host/port,
  *      master_tcp_host/port, cluster_secret}, node{node_id, role:'client',
@@ -99,6 +100,8 @@ describe('control-svc bootstrap 域（阶段 3.2）', () => {
     expect(isTrustedBootstrapSource('127.0.0.1')).toBe(true);
     expect(isTrustedBootstrapSource('100.64.1.2')).toBe(true);
     expect(isTrustedBootstrapSource('::1')).toBe(true);
+    expect(isTrustedBootstrapSource('fd7a:115c:a1e0::1')).toBe(true);
+    expect(isTrustedBootstrapSource('::ffff:127.0.0.1')).toBe(true);
     expect(isTrustedBootstrapSource('192.168.1.5')).toBe(false);
     expect(isTrustedBootstrapSource('localhost')).toBe(false); // hostname 非 IP
     expect(isTrustedBootstrapSource('')).toBe(false);
@@ -142,6 +145,22 @@ describe('control-svc bootstrap 域（阶段 3.2）', () => {
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().detail).toBe('source network is not trusted');
+  });
+
+  it('first-connect Tailscale IPv6 → 裸 host + 合法方括号 URL', async () => {
+    app = await createTestApp();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/bootstrap/first-connect',
+      remoteAddress: 'fd7a:115c:a1e0::10',
+      headers: { host: '[fd7a:115c:a1e0::1]:8030' },
+      payload: { node_id: 'node-v6', node_type: 'android' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().cluster.master_api_host).toBe('fd7a:115c:a1e0::1');
+    expect(res.json().android.model_manifest_url).toBe(
+      'http://[fd7a:115c:a1e0::1]:8000/api/models/downloadable',
+    );
   });
 
   it('first-connect QLH_TRUSTED_BOOTSTRAP_CIDRS 覆盖 → 远程放行', async () => {

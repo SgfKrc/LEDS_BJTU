@@ -6,13 +6,24 @@
 import { mkdirSync, mkdtempSync, writeFileSync, existsSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { ArtifactStore, sha256Hex } from '../src/data/artifact-store';
+import { ArtifactStore, sha256FileHex, sha256Hex } from '../src/data/artifact-store';
 import { ModelInspector } from '../src/data/model-inspector';
 import { ModelImportService } from '../src/data/model-import-service';
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'qlh-m2-'));
 }
+
+describe('sha256FileHex', () => {
+  it('streams a file spanning multiple hash buffers', () => {
+    const root = tempDir();
+    const filePath = join(root, 'large.bin');
+    const content = Buffer.alloc(17 * 1024 * 1024, 0x5a);
+    writeFileSync(filePath, content);
+    expect(sha256FileHex(filePath)).toBe(sha256Hex(content));
+    rmSync(root, { recursive: true, force: true });
+  });
+});
 
 // ---------- GGUF fixture 构造 ----------
 

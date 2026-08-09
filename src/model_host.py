@@ -105,12 +105,7 @@ class ModelHost:
         except Exception:
             _initial_quant = "int4"
         object.__setattr__(self, "current_quant", _initial_quant)
-        try:
-            import db as _db_mod  # noqa: F401 —— 探测 psycopg2 可用性
-            _db_importable = True
-        except Exception:
-            _db_importable = False
-        object.__setattr__(self, "_db_available", _db_importable)
+        object.__setattr__(self, "_db_available", False)
         object.__setattr__(self, "generation_config", {
             "max_new_tokens": 1024,          # laptop 档默认值
             "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）

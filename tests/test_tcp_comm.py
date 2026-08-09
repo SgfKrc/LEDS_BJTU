@@ -27,6 +27,7 @@ from tcp_comm import (
     serialize_tensor, deserialize_tensor,
     serialize_tensor_fast, deserialize_tensor_fast,
     TCPServer, TCPClient, ClientConn,
+    parse_host_port, format_host_port,
 )
 
 
@@ -1230,3 +1231,136 @@ class TestTCPClientRegistrationAck:
         assert "bad secret" in client.last_register_error
         assert fake_socket.closed is True
         assert client.sock is None
+
+
+# ================================================================
+# IPv4/IPv6 双栈测试（问题 #5 回归）
+# ================================================================
+
+def _ipv6_supported() -> bool:
+    """本机是否支持 IPv6 回环连接。"""
+    if not socket.has_ipv6:
+        return False
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class TestDualStackUtils:
+    """parse_host_port / format_host_port 对 v4/v6 字面量的处理。"""
+
+    def test_parse_host_port_v4(self):
+        assert parse_host_port("1.2.3.4:8888") == ("1.2.3.4", 8888)
+        assert parse_host_port("1.2.3.4") == ("1.2.3.4", None)
+        assert parse_host_port("1.2.3.4:notaport") == ("1.2.3.4", None)
+
+    def test_parse_host_port_v6(self):
+        assert parse_host_port("[fe80::1]:8888") == ("fe80::1", 8888)
+        assert parse_host_port("[fe80::1]") == ("fe80::1", None)
+        assert parse_host_port("fe80::1") == ("fe80::1", None)
+        assert parse_host_port("[fe80::1]:abc") == ("fe80::1", None)
+
+    def test_parse_host_port_hostname(self):
+        assert parse_host_port("myhost:8000") == ("myhost", 8000)
+        assert parse_host_port("myhost") == ("myhost", None)
+
+    def test_format_host_port(self):
+        assert format_host_port("1.2.3.4", 8888) == "1.2.3.4:8888"
+        assert format_host_port("fe80::1", 8888) == "[fe80::1]:8888"
+        assert format_host_port("[fe80::1]", 8888) == "[fe80::1]:8888"
+
+    def test_wildcard_and_ipv6_literal_helpers(self):
+        assert tcp_comm_mod._is_wildcard_host("0.0.0.0")
+        assert tcp_comm_mod._is_wildcard_host("::")
+        assert tcp_comm_mod._is_wildcard_host("")
+        assert not tcp_comm_mod._is_wildcard_host("127.0.0.1")
+        assert tcp_comm_mod._ipv6_literal("fe80::1")
+        assert not tcp_comm_mod._ipv6_literal("[fe80::1]")
+        assert not tcp_comm_mod._ipv6_literal("1.2.3.4")
+
+
+class TestDualStackServer:
+    """TCPServer 双栈监听：通配地址同时接受 v4/v6 连接。"""
+
+    def test_wildcard_bind_creates_v4_and_v6_sockets(self):
+        socks = TCPServer._create_listen_sockets("0.0.0.0", 0)
+        try:
+            assert len(socks) == 2
+            names = sorted(s.getsockname()[0] for s in socks)
+            assert "0.0.0.0" in names and "::" in names
+            # IPv6 socket 必须 V6ONLY=1，避免与 v4 socket 端口冲突
+            v6_sock = next(s for s in socks if s.getsockname()[0] == "::")
+            assert v6_sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_specific_v4_bind_single_socket(self):
+        socks = TCPServer._create_listen_sockets("127.0.0.1", 0)
+        try:
+            assert len(socks) == 1
+            assert socks[0].getsockname()[0] == "127.0.0.1"
+        finally:
+            for s in socks:
+                s.close()
+
+    @pytest.mark.skipif(not _ipv6_supported(), reason="本机不支持 IPv6")
+    def test_v4_and_v6_clients_both_connect(self):
+        server = TCPServer(host="0.0.0.0", port=_free_port())
+        server.start()
+        try:
+            port = server.sock.getsockname()[1]
+            c4 = socket.create_connection(("127.0.0.1", port), timeout=3)
+            c4.close()
+            c6 = socket.create_connection(("::1", port), timeout=3)
+            c6.close()
+            # 服务端应已 accept 两个连接（等待 accept 线程处理）
+            deadline = time.time() + 3
+            while time.time() < deadline and not server._client_ids_snapshot():
+                time.sleep(0.05)
+        finally:
+            server.stop()
+
+
+class TestDualStackClient:
+    """TCPClient._connect_socket 自动选择 v4/v6。"""
+
+    def test_connect_socket_v4(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            sock = TCPClient._connect_socket("127.0.0.1", port)
+            conn, _ = listener.accept()
+            sock.close()
+            conn.close()
+        finally:
+            listener.close()
+
+    @pytest.mark.skipif(not _ipv6_supported(), reason="本机不支持 IPv6")
+    def test_connect_socket_v6_literal_and_bracketed(self):
+        listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        listener.bind(("::1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            for target in ("::1", "[::1]"):
+                sock = TCPClient._connect_socket(target, port)
+                conn, _ = listener.accept()
+                sock.close()
+                conn.close()
+        finally:
+            listener.close()

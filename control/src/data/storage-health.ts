@@ -1,30 +1,13 @@
-/**
- * M1 存储健康 — 本地/远端双健康结构（一键模型部署计划 §12.3）。
- *
- * effective_mode 语义：
- *  - local_primary：本地可写、远端在线且 outbox 无积压；
- *  - local_primary_pending：本地可写、远端在线但 outbox 有积压（或远端刚恢复）；
- *  - readonly_failure：本地 SQLite 不可写——控制面只读故障，禁止假成功。
- *  - local_only：本地可写、远端未配置/不可达（远端为可选投影）。
- */
+/** M1.3 存储健康：主节点 SQLite 是唯一生产事实源。 */
 import { Injectable } from '@nestjs/common';
 import { SqliteStore, LocalStorageHealth } from './sqlite-store';
-import { ConfigDao } from './config-dao';
-import { OutboxService } from './outbox.service';
 
-export type EffectiveMode =
-  | 'local_primary'
-  | 'local_primary_pending'
-  | 'local_only'
-  | 'readonly_failure';
+export type EffectiveMode = 'local_only' | 'readonly_failure';
 
 export interface RemoteStorageHealth {
-  status: 'ok' | 'unavailable' | 'not_configured';
+  status: 'retired' | 'disabled';
   backend: 'postgresql';
-  host?: string;
-  port?: number;
-  db?: string;
-  error?: string;
+  mode: 'retired' | 'legacy_cleanup_pending';
 }
 
 export interface ProjectionHealth {
@@ -32,31 +15,43 @@ export interface ProjectionHealth {
   oldest_event_age_seconds: number | null;
 }
 
+export interface LegacyExportHealth {
+  pending_items: number;
+  oldest_item_age_seconds: number | null;
+}
+
 export interface StorageHealth {
   local: LocalStorageHealth;
   remote: RemoteStorageHealth;
   projection: ProjectionHealth;
+  export: LegacyExportHealth;
   effective_mode: EffectiveMode;
+  retirement: {
+    status: 'not_prepared' | 'prepared' | 'retired';
+    prepared_at: string | null;
+    retired_at: string | null;
+  };
 }
 
 @Injectable()
 export class StorageHealthService {
-  constructor(
-    private readonly store: SqliteStore,
-    private readonly configDao: ConfigDao,
-    private readonly outbox: OutboxService,
-  ) {}
+  constructor(private readonly store: SqliteStore) {}
 
   async snapshot(): Promise<StorageHealth> {
     const local = this.localHealth();
-    const remote = await this.remoteHealth();
+    const retirement = this.retirementHealth();
+    const remote = this.remoteHealth(retirement.status);
     const projection = this.projectionHealth();
-    const effectiveMode = this.computeMode(local, remote, projection);
     return {
       local,
       remote,
       projection,
-      effective_mode: effectiveMode,
+      export: {
+        pending_items: projection.pending_events,
+        oldest_item_age_seconds: projection.oldest_event_age_seconds,
+      },
+      effective_mode: local.writable ? 'local_only' : 'readonly_failure',
+      retirement,
     };
   }
 
@@ -64,42 +59,41 @@ export class StorageHealthService {
     return this.store.health();
   }
 
-  async remoteHealth(): Promise<RemoteStorageHealth> {
-    if (!this.configDao.dbEnabled()) {
-      return { status: 'not_configured', backend: 'postgresql' };
-    }
-    const { ok, error } = await this.configDao.ping();
-    if (!ok) {
-      return {
-        status: 'unavailable',
-        backend: 'postgresql',
-        error: error || 'postgresql 连接失败',
-      };
-    }
-    const info = this.configDao.getConnectionInfo();
-    return { status: 'ok', backend: 'postgresql', ...info };
+  remoteHealth(status: 'not_prepared' | 'prepared' | 'retired'): RemoteStorageHealth {
+    return status === 'retired'
+      ? { status: 'retired', backend: 'postgresql', mode: 'retired' }
+      : { status: 'disabled', backend: 'postgresql', mode: 'legacy_cleanup_pending' };
   }
 
   projectionHealth(): ProjectionHealth {
-    const pending = this.outbox.pendingCount();
-    let oldest: number | null = null;
-    if (pending > 0) {
-      oldest = this.outbox.oldestPendingAgeSeconds();
-    }
+    const exists = this.store.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'",
+    ).get() as { name: string } | undefined;
+    if (!exists) return { pending_events: 0, oldest_event_age_seconds: null };
+    const row = this.store.prepare(
+      `SELECT COUNT(*) AS pending, MIN(created_at) AS oldest
+       FROM outbox WHERE projected_at IS NULL`,
+    ).get() as { pending: number; oldest: string | null };
+    const pending = Number(row.pending);
+    const oldest = row.oldest
+      ? Math.max(0, Math.floor((Date.now() - new Date(row.oldest).getTime()) / 1000))
+      : null;
     return { pending_events: pending, oldest_event_age_seconds: oldest };
   }
 
-  computeMode(
-    local: LocalStorageHealth,
-    remote: RemoteStorageHealth,
-    projection: ProjectionHealth,
-  ): EffectiveMode {
-    if (!local.writable) return 'readonly_failure';
-    if (remote.status === 'ok') {
-      return projection.pending_events > 0
-        ? 'local_primary_pending'
-        : 'local_primary';
-    }
-    return 'local_only';
+  retirementHealth(): StorageHealth['retirement'] {
+    const exists = this.store.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='storage_retirement'",
+    ).get() as { name: string } | undefined;
+    if (!exists) return { status: 'not_prepared', prepared_at: null, retired_at: null };
+    const row = this.store.prepare(
+      `SELECT status, prepared_at, retired_at FROM storage_retirement
+       WHERE retirement_id = 1`,
+    ).get() as {
+      status: 'prepared' | 'retired';
+      prepared_at: string;
+      retired_at: string | null;
+    } | undefined;
+    return row ?? { status: 'not_prepared', prepared_at: null, retired_at: null };
   }
 }

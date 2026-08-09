@@ -14,21 +14,20 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { JsonDetailFilter } from './common/json-detail.filter';
 import { RequestIdInterceptor } from './common/request-id';
-import { ConfigDao } from './data/config-dao';
 import { LogBuffer } from './data/log-buffer';
 import { LogFileStore } from './data/log-file-store';
 import { ReviewStore } from './data/review-store';
 import { SessionStore } from './data/session-store';
 import { WorkflowJournalStore } from './data/workflow-journal-store';
 import { SqliteStore } from './data/sqlite-store';
-import { OutboxService } from './data/outbox.service';
 import { StorageHealthService } from './data/storage-health';
-import { PostgresProjector } from './data/postgres-projector';
 import { ClusterSettingsRepository } from './data/cluster-settings-repository';
 import { ModelRegistryRepository } from './data/model-registry-repository';
 import { ClusterEndpointsRepository } from './data/cluster-endpoints-repository';
 import { LegacyMigration } from './data/legacy-migration';
 import { ArtifactStore } from './data/artifact-store';
+import { ArtifactManifestRepository } from './data/artifact-manifest-repository';
+import { AuthAssetRepository } from './data/auth-asset-repository';
 import { ModelInspector } from './data/model-inspector';
 import { ModelImportService } from './data/model-import-service';
 import { ModelBatchImporter } from './data/model-batch-import';
@@ -70,6 +69,8 @@ import { ReviewService } from './modules/review/review.service';
 import { SessionsController } from './modules/sessions/sessions.controller';
 import { SettingsController } from './modules/settings/settings.controller';
 import { WorkflowsController } from './modules/workflows/workflows.controller';
+import { AuthController, UsersController } from './modules/auth/auth.controller';
+import { AuthService } from './data/auth-service';
 
 @Controller()
 export class CatchAllController {
@@ -99,30 +100,32 @@ export class CatchAllController {
     WorkflowsController,
     BootstrapController,
     StorageHealthController,
+    AuthController,
+    UsersController,
     CatchAllController,
   ],
   providers: [
-    ConfigDao,
     SessionStore,
     LogBuffer,
     LogFileStore,
     ReviewStore,
     ReviewService,
     WorkflowJournalStore,
-    // M1：本地 SQLite 事实源（唯一写者，惰性打开）+ outbox + 投影
+    // M1.3：本地 SQLite 是唯一事实源；生产启动图不再包含 pg/outbox/projector。
     {
       provide: SqliteStore,
       useFactory: () => new SqliteStore(),
     },
-    OutboxService,
     StorageHealthService,
-    PostgresProjector,
     // M1 任务 2：三域 repository + 旧源迁移执行器
     ClusterSettingsRepository,
     ModelRegistryRepository,
     ClusterEndpointsRepository,
     LegacyMigration,
     // M2：内容寻址工件库 + 静态 inspector + 本地导入
+    ArtifactManifestRepository,
+    AuthAssetRepository,
+    AuthService,
     ArtifactStore,
     ModelInspector,
     ModelImportService,
@@ -167,6 +170,7 @@ export class AppModule implements OnApplicationBootstrap {
   constructor(
     private readonly migration: LegacyMigration,
     private readonly pullExecutor: PullJobExecutor,
+    private readonly artifactStore: ArtifactStore,
   ) {}
 
   /** 启动时自动执行旧源一次性迁移（幂等；源不存在/为空则无操作）。 */
@@ -180,6 +184,22 @@ export class AppModule implements OnApplicationBootstrap {
       registryJsonPath: process.env.QLH_LEGACY_REGISTRY_PATH
         || path.join(cwd, 'model_registry.json'),
     });
+    const artifactRestore = this.artifactStore.restoreIndexedManifests();
+    if (artifactRestore.failed > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[control-svc] artifact manifest 恢复失败 ${artifactRestore.failed}: `
+        + artifactRestore.errors.join('; '),
+      );
+    }
+    const artifactIndex = this.artifactStore.reindexManifests();
+    if (artifactIndex.failed > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[control-svc] artifact manifest 索引失败 ${artifactIndex.failed}: `
+        + artifactIndex.errors.join('; '),
+      );
+    }
     this.pullExecutor.resumeActive();
   }
 }

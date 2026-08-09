@@ -6,14 +6,13 @@
  */
 import { Injectable } from '@nestjs/common';
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
 import {
   PullJobService, PullJob,
 } from './pull-job.service';
 import { HfResolver, ResolveResult } from './hf-resolver';
-import { HfDownloader } from './hf-downloader';
-import { ArtifactStore, sha256Hex } from './artifact-store';
+import { HfDownloader, HfDownloadTransportError } from './hf-downloader';
+import { ArtifactStore, sha256FileHex, sha256Hex } from './artifact-store';
 import { ModelInspector } from './model-inspector';
 import { ModelDiskBudget } from './model-disk-budget';
 import { ModelCredentialStore } from './model-credential-store';
@@ -59,7 +58,11 @@ export class PullJobExecutor {
         try {
           const message = err instanceof Error ? err.message : String(err);
           this.jobs.transition(jobId, 'failed', {
-            error: { code: 'executor_error', message },
+            error: {
+              code: err instanceof HfDownloadTransportError
+                ? 'transfer_unavailable' : 'executor_error',
+              message,
+            },
           });
         } catch {
           // 已终止则忽略
@@ -70,7 +73,10 @@ export class PullJobExecutor {
 
   resumeActive(): number {
     const active = this.jobs.listActive();
-    for (const job of active) this.start(job.job_id);
+    for (const job of active) {
+      this.jobs.requeue(job.job_id, { recoveredAfterRestart: true });
+      this.start(job.job_id);
+    }
     return active.length;
   }
 
@@ -134,11 +140,13 @@ export class PullJobExecutor {
     this.jobs.transition(jobId, 'downloading', {
       source: { ...job.source, resolved_revision: resolved.resolvedRevision },
       progress: {
+        ...job.progress,
         total_bytes: resolved.files.reduce((s, f) => s + f.size, 0),
         downloaded_bytes: 0,
         files_total: resolved.files.length,
         files_done: 0,
         current_file: null,
+        transfer_attempt: 1,
       },
     });
 
@@ -153,20 +161,49 @@ export class PullJobExecutor {
       }
       const rel = file.rfilename;
       const dest = path.join(this.store.stagingDir(jobId), rel);
-      await this.downloader.downloadFile(
-        repoId, resolved.resolvedRevision, file.rfilename, dest, {
-          signal,
-          expectedSize: file.size,
-          apiBase: job.source.endpoint,
-          token,
-          onProgress: (p) => {
-            this.jobs.updateProgress(jobId, {
-              downloaded_bytes: bytes + p.bytesDownloaded,
-              current_file: rel,
-            });
+      const digest = file.sha256?.toLowerCase() ?? null;
+      const reusable = digest && /^[0-9a-f]{64}$/.test(digest)
+        && this.store.blobExists(digest);
+      if (reusable) {
+        this.store.stageExistingBlob(jobId, rel, digest, file.size);
+      } else {
+        const retryBase = this.jobs.get(jobId)?.progress.transfer_retry_count ?? 0;
+        await this.downloader.downloadFile(
+          repoId, resolved.resolvedRevision, file.rfilename, dest, {
+            signal,
+            expectedSize: file.size,
+            apiBase: job.source.endpoint,
+            token,
+            onResponse: (response) => {
+              const current = this.jobs.get(jobId)?.progress;
+              this.jobs.updateProgress(jobId, {
+                transfer_attempt: response.attempt,
+                resumed_bytes: Math.max(
+                  current?.resumed_bytes ?? 0,
+                  response.requestedStartBytes,
+                ),
+              });
+            },
+            onRetry: (retry) => {
+              this.jobs.updateProgress(jobId, {
+                transfer_attempt: retry.nextAttempt,
+                transfer_retry_count: retryBase + retry.retryCount,
+                resumed_bytes: Math.max(
+                  this.jobs.get(jobId)?.progress.resumed_bytes ?? 0,
+                  retry.resumedBytes,
+                ),
+                last_retry_error: retry.errorCode,
+              });
+            },
+            onProgress: (p) => {
+              this.jobs.updateProgress(jobId, {
+                downloaded_bytes: bytes + p.bytesDownloaded,
+                current_file: rel,
+              });
+            },
           },
-        },
-      );
+        );
+      }
       bytes += file.size;
       done += 1;
       staged.push({ rel, size: file.size, sha256: file.sha256 ?? null });
@@ -186,7 +223,7 @@ export class PullJobExecutor {
     const verified: Array<{ rel: string; size: number; sha256: string }> = [];
     for (const entry of staged) {
       const filePath = path.join(this.store.stagingDir(jobId), entry.rel);
-      const actual = sha256Hex(fs.readFileSync(filePath));
+      const actual = sha256FileHex(filePath);
       if (entry.sha256 && entry.sha256 !== actual) {
         this.jobs.transition(jobId, 'quarantined', {
           error: {
@@ -201,22 +238,21 @@ export class PullJobExecutor {
     }
 
     // ---- 静态检查（staging 副本）----
-    const ggufFiles = verified.filter((f) => f.rel.endsWith('.gguf'));
-    let inspection = null;
-    if (ggufFiles.length > 0) {
-      inspection = this.inspector.inspectGguf(
+    const ggufFiles = verified.filter((f) => f.rel.toLowerCase().endsWith('.gguf'));
+    const inspection = ggufFiles.length > 0
+      ? this.inspector.inspectGguf(
         path.join(this.store.stagingDir(jobId), ggufFiles[0].rel),
-      );
-      if (!inspection.ok) {
-        this.jobs.transition(jobId, 'quarantined', {
-          error: {
-            code: 'inspection_failed',
-            message: inspection.errors.join('; '),
-          },
-        });
-        this.store.quarantine(jobId, 'inspection_failed');
-        return;
-      }
+      )
+      : this.inspector.inspectSafetensorsDir(this.store.stagingDir(jobId));
+    if (!inspection.ok) {
+      this.jobs.transition(jobId, 'quarantined', {
+        error: {
+          code: 'inspection_failed',
+          message: inspection.errors.join('; '),
+        },
+      });
+      this.store.quarantine(jobId, 'inspection_failed');
+      return;
     }
 
     // ---- 提交工件库（原子 rename + 去重）----
@@ -243,18 +279,15 @@ export class PullJobExecutor {
         endpoint: job.source.endpoint ?? null,
         credential_ref: job.source.credential_ref ?? null,
       },
-      format: inspection ? 'gguf' : 'safetensors',
-      engine: inspection ? 'llama_cpp' : 'pytorch_transformers',
-      family: inspection?.family ?? null,
-      quantization: inspection?.quantization ?? null,
-      context_length: inspection?.context_length ?? null,
+      format: inspection.format,
+      engine: inspection.format === 'gguf' ? 'llama_cpp' : 'pytorch_transformers',
+      family: inspection.family,
+      quantization: inspection.quantization,
+      context_length: inspection.context_length,
       files: sorted,
-      capabilities: inspection?.capabilities ?? {
-        full_worker: false, pytorch_layer_pipeline: false,
-        llama_cpp: false, task_stage: false,
-      },
+      capabilities: inspection.capabilities,
       requirements: {
-        runtime_profile: inspection ? 'llm-cpu-v1' : 'llm-cuda-v1',
+        runtime_profile: inspection.format === 'gguf' ? 'llm-cpu-v1' : 'llm-cuda-v1',
       },
       license: {
         id: licenseId,

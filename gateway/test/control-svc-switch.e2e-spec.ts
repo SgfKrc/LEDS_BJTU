@@ -5,7 +5,7 @@
  *  - 已迁移域（sessions / conversations / user/settings / logs / workflows /
  *    bootstrap / models registry / gguf / download / cluster/review）→
  *    control-svc 真实响应
- *  - 未迁移域（presets / db/health / models downloadable / files）→
+ *  - 未迁移域（models downloadable / files）→
  *    legacy-control 桩（并行共存基线）
  * 不设置 QLH_CONTROL_URL 的行为由 rest-contract/tui-contract 既有测试锁定。
  *
@@ -70,7 +70,7 @@ async function startControlSvc(dataDir: string): Promise<{ port: number; close()
     env: {
       ...process.env,
       QLH_CONTROL_PORT: String(port),
-      QLH_DB_ENABLED: '0', // ConfigDao 默认启用 DB；测试隔离强制降级路径
+      QLH_DB_ENABLED: '0', // 遗留变量不会触发远端连接；保留用于退场兼容门禁
       QLH_CHAT_HISTORY_DIR: path.join(dataDir, 'chat_history'),
       QLH_LOG_DIR: path.join(dataDir, 'logs'),
       QLH_REVIEW_STORE: path.join(dataDir, 'review_tickets.json'),
@@ -99,7 +99,7 @@ async function startControlSvc(dataDir: string): Promise<{ port: number; close()
     });
     proc.on('exit', (code) => {
       clearTimeout(timer);
-      reject(new Error(`control-svc 提前退出 code=${code}`));
+      reject(new Error(`control-svc 提前退出 code=${code}: ${buf.trim()}`));
     });
     proc.stderr?.on('data', (d: Buffer) => {
       buf += d.toString();
@@ -155,10 +155,10 @@ describe('控制面域渐进切换（QLH_CONTROL_URL → control-svc）', () => 
   const server = () => app!.getHttpServer();
 
   describe('已迁移域 → control-svc 真实响应', () => {
-    it('GET /api/user/settings → control-svc（DB 禁用 → source:none）', async () => {
+    it('GET /api/user/settings → control-svc（local_only → source:local）', async () => {
       const res = await request(server()).get('/api/user/settings');
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({ settings: {}, source: 'none' });
+      expect(res.body).toEqual({ settings: {}, source: 'local' });
     });
 
     it('GET /api/sessions → control-svc 空列表结构', async () => {
@@ -261,12 +261,8 @@ describe('控制面域渐进切换（QLH_CONTROL_URL → control-svc）', () => 
       expect(res.status).toBe(200);
       expect(res.body.title).toBe('切换测试');
       expect(res.body.id).toMatch(/^[0-9a-f-]{36}$/);
-      // 数据落 control-svc 的隔离目录
-      expect(
-        fs.existsSync(
-          path.join(dataDir, 'chat_history', '_sessions.json'),
-        ),
-      ).toBe(true);
+      // 数据落 control-svc 隔离目录的主节点 SQLite
+      expect(fs.existsSync(path.join(dataDir, 'control.sqlite3'))).toBe(true);
     });
 
     it('GET /api/presets → control-svc（6 项降级默认值）', async () => {
@@ -278,15 +274,17 @@ describe('控制面域渐进切换（QLH_CONTROL_URL → control-svc）', () => 
       expect(res.body.max_new_tokens).toBe(512);
     });
 
-    it('GET /api/db/health → control-svc（QLH_DB_ENABLED=0 → not_configured）', async () => {
+    it('GET /api/db/health → control-svc 主节点 SQLite', async () => {
       const res = await request(server()).get('/api/db/health');
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({
-        status: 'unavailable',
-        reason: 'not_configured',
-        message: '数据库未配置，正在使用本地文件存储',
-        retry_in_seconds: 0,
+      expect(res.body).toMatchObject({
+        status: 'ok',
+        backend: 'sqlite',
+        mode: 'local_only',
+        schema_version: 7,
+        legacy_remote: 'disabled',
       });
+      expect(res.body.path).toBe(path.join(dataDir, 'control.sqlite3'));
     });
   });
 

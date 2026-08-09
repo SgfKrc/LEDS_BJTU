@@ -267,6 +267,7 @@ python serve.py
 
 首页会列出：
 - Windows PC 安装包（集显版 + 独显版）
+- QLH 启动器（`QLH-Launcher-Setup-v*.exe` 安装包 + `QLH-Launcher-v*.zip` 自更新资产）
 - Android APK（Full / Lite，Debug / Release）
 - PC 模型压缩包 `models_pc.7z`
 - Android 模型压缩包 `models_android.7z`（仅包含 GGUF 模型）

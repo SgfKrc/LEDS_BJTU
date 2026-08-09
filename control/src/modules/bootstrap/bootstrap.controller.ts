@@ -30,6 +30,7 @@ import {
   resolveTrustedCidrs,
 } from '../../common/bootstrap-trust';
 import { ClusterEndpointsRepository } from '../../data/cluster-endpoints-repository';
+import { buildEndpointUrl, canonicalHost } from '../../common/network-address';
 
 interface FirstConnectBootstrapRequest {
   node_id?: string;
@@ -84,7 +85,7 @@ export class BootstrapController {
     }
 
     // 主节点地址（对齐 :5400-5407；hostname 取请求 Host，端口取本地监听端口）
-    const apiHost = req.hostname || peerHost;
+    const apiHost = canonicalHost(req.hostname || peerHost);
     const apiPort = req.socket.localPort || envInt(process.env, 'QLH_MASTER_API_PORT', 8000);
     const tcpPort = envInt(process.env, 'QLH_MASTER_TCP_PORT', 8888);
     const clusterSecret =
@@ -132,7 +133,9 @@ export class BootstrapController {
       android: {
         presence_interval_seconds: 45,
         pipeline_worker: false,
-        model_manifest_url: `http://${apiHost}:${apiPort}/api/models/downloadable`,
+        model_manifest_url: buildEndpointUrl(
+          'http', apiHost, apiPort, '/api/models/downloadable',
+        ),
       },
     };
   }

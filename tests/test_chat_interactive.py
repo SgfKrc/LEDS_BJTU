@@ -403,6 +403,7 @@ class TestCommitFunction:
         saved = []
 
         fake_store = SimpleNamespace(
+            get_local_save_history=lambda: True,
             save_local_message=lambda sid, role, content, metrics=None:
                 saved.append((sid, role, content)),
             increment_local_session_message_count=lambda sid:

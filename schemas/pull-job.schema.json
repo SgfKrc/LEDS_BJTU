@@ -59,7 +59,12 @@
         "downloaded_bytes": { "type": "integer", "minimum": 0 },
         "files_total": { "type": "integer", "minimum": 0 },
         "files_done": { "type": "integer", "minimum": 0 },
-        "current_file": { "type": ["string", "null"] }
+        "current_file": { "type": ["string", "null"] },
+        "restart_count": { "type": "integer", "minimum": 0 },
+        "transfer_attempt": { "type": "integer", "minimum": 0 },
+        "transfer_retry_count": { "type": "integer", "minimum": 0 },
+        "resumed_bytes": { "type": "integer", "minimum": 0 },
+        "last_retry_error": { "type": ["string", "null"] }
       }
     },
     "artifact_id": {

@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import io
 import os
+import select
 import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
@@ -345,7 +346,7 @@ def detect_lan_ip() -> str:
             _TAILSCALE_LO = 0x64400000   # 100.64.0.0
             _TAILSCALE_HI = 0x647FFFFF   # 100.127.255.255
 
-            overlay_candidates = []  # [(ip, iface, is_up)]
+            overlay_candidates = []  # [(ip, iface, is_up, family)]
 
             for iface, addr_list in addrs.items():
                 iface_lower = iface.lower()
@@ -356,25 +357,30 @@ def detect_lan_ip() -> str:
                 is_up = stat.isup if stat else False
 
                 for addr in addr_list:
-                    if addr.family != _sock.AF_INET:
+                    if addr.family not in (_sock.AF_INET, _sock.AF_INET6):
                         continue
                     ip = addr.address
-                    if ip.startswith("127."):
+                    if ip.startswith("127.") or ip == "::1":
                         continue
-                    # 100.64.0.0/10 范围的 IP 也视为 overlay（即使接口名不匹配）
-                    try:
-                        octets = [int(o) for o in ip.split(".")]
-                        ip_int = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
-                        in_tailscale_range = _TAILSCALE_LO <= ip_int <= _TAILSCALE_HI
-                    except (ValueError, IndexError):
-                        in_tailscale_range = False
+                    # 100.64.0.0/10 范围的 IP 也视为 overlay（即使接口名不匹配）；
+                    # Tailscale 还分配 fd7a:115c:a1e0::/48 的 IPv6 ULA，随接口名识别
+                    in_tailscale_range = False
+                    if addr.family == _sock.AF_INET:
+                        try:
+                            octets = [int(o) for o in ip.split(".")]
+                            ip_int = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+                            in_tailscale_range = _TAILSCALE_LO <= ip_int <= _TAILSCALE_HI
+                        except (ValueError, IndexError):
+                            in_tailscale_range = False
 
                     if is_overlay or in_tailscale_range:
-                        overlay_candidates.append((ip, iface, is_up))
+                        overlay_candidates.append((ip, iface, is_up, addr.family))
 
             if overlay_candidates:
-                # 优先启用的接口
-                overlay_candidates.sort(key=lambda c: (0 if c[2] else 1))
+                # 优先 IPv4，其次启用的接口
+                overlay_candidates.sort(
+                    key=lambda c: (0 if c[3] == _sock.AF_INET else 1, 0 if c[2] else 1)
+                )
                 ip = overlay_candidates[0][0]
                 logger.info(f"检测到组网 IP (Tailscale/ZeroTier): {ip} (接口: {overlay_candidates[0][1]})")
                 return ip
@@ -393,7 +399,7 @@ def detect_lan_ip() -> str:
                              'tun', 'tap', 'wg', 'utun', 'anpi', 'bluetooth',
                              'tailscale', 'zerotier', 'zt')
 
-            candidates = []  # [(ip, iface, is_up, is_wifi)]
+            candidates = []  # [(ip, iface, is_up, is_wifi, family)]
 
             for iface, addr_list in addrs.items():
                 iface_lower = iface.lower()
@@ -407,18 +413,22 @@ def detect_lan_ip() -> str:
                               ('wi-fi', 'wlan', '无线', 'wifi', 'wireless'))
 
                 for addr in addr_list:
-                    if addr.family == _sock.AF_INET and not addr.address.startswith("127."):
-                        candidates.append((addr.address, iface, is_up, is_wifi))
+                    if addr.family not in (_sock.AF_INET, _sock.AF_INET6):
+                        continue
+                    ip = addr.address
+                    if (addr.family == _sock.AF_INET and ip.startswith("127.")) or ip == "::1":
+                        continue
+                    candidates.append((ip, iface, is_up, is_wifi, addr.family))
 
             if candidates:
-                # 优先级: 启用 + 以太网 > 启用 + WiFi > 启用 > 其他
+                # 优先级: IPv4 > IPv6；启用 + 以太网 > 启用 + WiFi > 启用 > 其他
                 def _priority(c):
-                    _, _, up, wifi = c
-                    if up and not wifi:
-                        return 0
-                    if up and wifi:
-                        return 1
-                    return 2
+                    _, _, up, wifi, family = c
+                    return (
+                        0 if family == _sock.AF_INET else 1,
+                        0 if up else 1,
+                        0 if not wifi else 1,
+                    )
 
                 candidates.sort(key=_priority)
                 ip = candidates[0][0]
@@ -439,6 +449,19 @@ def detect_lan_ip() -> str:
             return ip
     except Exception:
         logger.debug("UDP 默认路由 IP 检测失败，尝试 hostname", exc_info=True)
+
+    # ---- 策略 3b: UDP IPv6 默认路由（纯 IPv6 网络兜底）----
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        s.connect(("2001:4860:4860::8888", 53))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and ip != "::1":
+            logger.info(f"检测到局域网 IP (UDP v6): {ip}")
+            return ip
+    except Exception:
+        logger.debug("UDP IPv6 默认路由 IP 检测失败，尝试 hostname", exc_info=True)
 
     # ---- 策略 4: gethostbyname 兜底 ----
     try:
@@ -837,6 +860,59 @@ def parse_message(raw: bytes) -> dict:
 
 
 # ================================================================
+# IPv4/IPv6 双栈工具
+# ================================================================
+
+def parse_host_port(value: str, default_port: Optional[int] = None) -> tuple[str, Optional[int]]:
+    """
+    解析 "host:port" / "[fe80::1]:8888" / "fe80::1" / "host" 形式的地址。
+
+    IPv6 字面量必须用方括号包裹才可携带端口（RFC 3986）；裸 IPv6
+    字面量（含多个冒号）视为无端口地址。
+    """
+    value = (value or "").strip()
+    if not value:
+        return "", default_port
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return value, default_port
+        host = value[1:end]
+        rest = value[end + 1:]
+        if rest.startswith(":"):
+            port_str = rest[1:]
+            if port_str.isdigit():
+                return host, int(port_str)
+        return host, default_port
+    if value.count(":") == 1:
+        host, _, port_str = value.rpartition(":")
+        if host:
+            if port_str.isdigit():
+                return host, int(port_str)
+            return host, default_port
+    return value, default_port
+
+
+def format_host_port(host: str, port: int) -> str:
+    """格式化 "host:port"；IPv6 字面量自动加方括号。"""
+    host = (host or "").strip()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
+def _is_wildcard_host(host: str) -> bool:
+    """是否为通配监听地址（0.0.0.0 / :: / 空）。"""
+    return (host or "").strip() in ("", "0.0.0.0", "::")
+
+
+def _ipv6_literal(host: str) -> bool:
+    """是否为 IPv6 字面量（含冒号且未被方括号包裹）。"""
+    host = (host or "").strip()
+    return ":" in host and not host.startswith("[")
+
+
+# ================================================================
 # TCP 服务端（主节点）
 # ================================================================
 
@@ -870,7 +946,7 @@ class ClientConn:
         if not self.advertised_port:
             self.advertised_port = SERVER_PORT
         if not self.advertised_address and self.advertised_host:
-            self.advertised_address = f"{self.advertised_host}:{self.advertised_port}"
+            self.advertised_address = format_host_port(self.advertised_host, self.advertised_port)
         if self.connected_at == 0.0:
             self.connected_at = time.time()
         if self.last_heartbeat == 0.0:
@@ -885,7 +961,8 @@ class TCPServer:
     def __init__(self, host: str = None, port: int = None):
         self.host = host or SERVER_IP
         self.port = port or SERVER_PORT
-        self.sock: Optional[socket.socket] = None
+        self.sock: Optional[socket.socket] = None    # 主监听 socket（兼容旧引用）
+        self._socks: list[socket.socket] = []        # 双栈监听 socket 列表
         self.clients: dict[str, ClientConn] = {}     # client_id -> ClientConn
         self._clients_lock = threading.RLock()       # 保护 clients 的跨线程访问
         self._running = False
@@ -908,13 +985,13 @@ class TCPServer:
         """
         self.on_message = on_message
         self.on_disconnect = on_disconnect
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.host, self.port))
-        self.sock.listen(2)  # 两台从节点
-        self.sock.settimeout(1.0)  # accept 超时 1s，以便检查 _running
+        self._socks = self._create_listen_sockets(self.host, self.port)
+        self.sock = self._socks[0] if self._socks else None
         self._running = True
-        logger.info(f"TCP服务端启动: {self.host}:{self.port}")
+        bind_desc = ", ".join(
+            f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in self._socks
+        )
+        logger.info(f"TCP服务端启动: {self.host}:{self.port}（监听 {bind_desc}）")
 
         # 启动 accept 循环线程
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
@@ -923,6 +1000,39 @@ class TCPServer:
         # 启动心跳检测线程
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
+
+    # ---- 双栈监听 ----
+
+    @staticmethod
+    def _resolve_bind_hosts(host: str) -> list[str]:
+        """通配地址展开为 v4+v6 双栈；具体地址原样返回。"""
+        if _is_wildcard_host(host):
+            return ["0.0.0.0", "::"]
+        return [(host or "").strip()]
+
+    @classmethod
+    def _create_listen_sockets(cls, host: str, port: int) -> list[socket.socket]:
+        """创建监听 socket 列表（IPv6 socket 显式 V6ONLY=1，与 v4 socket 同端口共存）。"""
+        socks: list[socket.socket] = []
+        for bind_host in cls._resolve_bind_hosts(host):
+            if bind_host == "::" or _ipv6_literal(bind_host):
+                family = socket.AF_INET6
+            else:
+                family = socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except OSError:
+                    pass
+            sock.bind((bind_host, port))
+            sock.listen(2)  # 两台从节点
+            sock.settimeout(1.0)  # accept 超时 1s，以便检查 _running
+            socks.append(sock)
+        if not socks:
+            raise OSError(f"无法创建监听 socket: {host}:{port}")
+        return socks
 
     # ---- clients 线程安全访问 ----
 
@@ -1004,26 +1114,36 @@ class TCPServer:
     # ---- Accept 循环 ----
 
     def _accept_loop(self) -> None:
-        """在独立线程中循环 accept 客户端连接"""
+        """在独立线程中循环 accept 客户端连接（双栈多 socket 轮询）"""
         logger.info("Accept 循环已启动，等待客户端连接...")
         while self._running:
+            socks = list(self._socks)
+            if not socks:
+                break
             try:
-                conn, addr = self.sock.accept()
-                logger.info(f"新连接: {addr}")
-                # 启动消息接收线程（暂时以 addr 为临时 ID，注册后更新）
-                temp_id = f"pending_{addr[1]}"
-                t = threading.Thread(
-                    target=self._handle_client,
-                    args=(conn, addr, temp_id),
-                    daemon=True,
-                )
-                t.start()
-            except socket.timeout:
-                continue  # 正常超时，继续循环
+                readable, _, _ = select.select(socks, [], [], 1.0)
             except OSError as e:
                 if self._running:
-                    logger.error(f"Accept 异常: {e}", exc_info=True)
+                    logger.error(f"Accept select 异常: {e}", exc_info=True)
                 break
+            for sock in readable:
+                try:
+                    conn, addr = sock.accept()
+                    logger.info(f"新连接: {addr}")
+                    # 启动消息接收线程（暂时以 addr 为临时 ID，注册后更新）
+                    temp_id = f"pending_{addr[1]}"
+                    t = threading.Thread(
+                        target=self._handle_client,
+                        args=(conn, addr, temp_id),
+                        daemon=True,
+                    )
+                    t.start()
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    if self._running:
+                        logger.error(f"Accept 异常: {e}", exc_info=True)
+                    break
         logger.info("Accept 循环已退出")
 
     # ---- 客户端消息处理 ----
@@ -1177,13 +1297,14 @@ class TCPServer:
         advertised_host = str(data.get("advertised_host") or "").strip()
         advertised_port_raw = data.get("advertised_port")
         advertised_address = str(data.get("advertised_address") or "").strip()
-        if advertised_address and (not advertised_host or advertised_port_raw is None):
-            if ":" in advertised_address:
-                h, p = advertised_address.rsplit(":", 1)
-                advertised_host = advertised_host or h.strip()
-                if advertised_port_raw is None:
-                    advertised_port_raw = p.strip()
-        if advertised_host in ("", "0.0.0.0", "127.0.0.1", "localhost"):
+        if advertised_address:
+            # 支持 "[fe80::1]:8888" / "fe80::1" / "1.2.3.4:8888" / "1.2.3.4"
+            parsed_host, parsed_port = parse_host_port(advertised_address)
+            if parsed_host:
+                advertised_host = advertised_host or parsed_host
+            if advertised_port_raw is None and parsed_port is not None:
+                advertised_port_raw = parsed_port
+        if advertised_host in ("", "0.0.0.0", "127.0.0.1", "::", "::1", "localhost"):
             advertised_host = addr[0]
         try:
             advertised_port = int(advertised_port_raw) if advertised_port_raw is not None else SERVER_PORT
@@ -1191,7 +1312,7 @@ class TCPServer:
             advertised_port = SERVER_PORT
         if not (1 <= advertised_port <= 65535):
             advertised_port = SERVER_PORT
-        advertised_address = f"{advertised_host}:{advertised_port}"
+        advertised_address = format_host_port(advertised_host, advertised_port)
 
         # ★ 阶段 7：HMAC 集群认证
         auth_ok, auth_reason = verify_auth_signature(
@@ -1419,6 +1540,12 @@ class TCPServer:
                 conn.sock.close()
             except OSError:
                 pass
+        for sock in list(getattr(self, "_socks", []) or []):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._socks = []
         if self.sock:
             try:
                 self.sock.close()
@@ -1523,6 +1650,41 @@ class TCPClient:
 
         return ""
 
+    @staticmethod
+    def _connect_socket(server_host: str, server_port: int) -> socket.socket:
+        """
+        建立到主节点的 TCP 连接（自动选择 IPv4/IPv6）。
+
+        使用 getaddrinfo 解析目标（支持域名、v4/v6 字面量、[v6] 方括号形式），
+        优先尝试 IPv4 再尝试 IPv6（与旧行为一致，避免双栈下意外改走 v6）。
+        全部失败时抛出最后一个异常。
+        """
+        host = (server_host or "").strip()
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        infos = socket.getaddrinfo(
+            host, server_port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP,
+        )
+        infos.sort(key=lambda info: 0 if info[0] == socket.AF_INET else 1)
+        last_error: Optional[OSError] = None
+        for family, _socktype, _proto, _canonname, sockaddr in infos:
+            sock: Optional[socket.socket] = None
+            try:
+                sock = socket.socket(family, socket.SOCK_STREAM)
+                sock.settimeout(HEARTBEAT_INTERVAL + 5)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as e:
+                last_error = e
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        if last_error is not None:
+            raise last_error
+        raise OSError(f"无法解析主节点地址: {server_host}")
+
     def connect(self, on_message: Callable = None) -> bool:
         """
         连接主节点并完成注册。
@@ -1568,9 +1730,7 @@ class TCPClient:
 
             for attempt in range(RECONNECT_MAX_RETRIES):
                 try:
-                    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.sock.settimeout(HEARTBEAT_INTERVAL + 5)
-                    self.sock.connect((self.server_host, self.server_port))
+                    self.sock = self._connect_socket(self.server_host, self.server_port)
                     self._running = True
                     logger.info(f"已连接主节点: {self.server_host}:{self.server_port}")
 
@@ -1595,7 +1755,7 @@ class TCPClient:
                         advertised_port = SERVER_PORT
                     if not (1 <= advertised_port <= 65535):
                         advertised_port = SERVER_PORT
-                    advertised_address = f"{advertised_host}:{advertised_port}"
+                    advertised_address = format_host_port(advertised_host, advertised_port)
                     logger.info(f"注册服务端点: {advertised_address}")
 
                     reg_data = {

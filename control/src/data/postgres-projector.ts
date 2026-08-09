@@ -1,5 +1,5 @@
 /**
- * M1 PostgreSQL projector — 带退避的后台投影器（远端连接探测移出请求关键路径）。
+ * M1 legacy PostgreSQL projector — 仅在用户显式开启兼容出口时运行。
  *
  * 设计（一键模型部署计划 §16 M1 任务 5）：
  *  - setInterval 后台轮询；pg 不可用时长退避（×2，上限 60s），恢复后重置；
@@ -8,7 +8,7 @@
  *  - 远端不可达时本地事务继续，UI 不阻塞（只读 storage/health 反映积压）。
  */
 import { Injectable, Optional } from '@nestjs/common';
-import { Client } from 'pg';
+import type { Client as PgClient } from 'pg';
 import { ConfigDao } from './config-dao';
 import { OutboxService } from './outbox.service';
 
@@ -18,7 +18,7 @@ export interface ProjectorOptions {
   /** 失败退避上限（毫秒）。 */
   maxIntervalMs?: number;
   /** 测试注入：自定义 pg Client 工厂（缺省 new Client）。 */
-  clientFactory?: () => Client;
+  clientFactory?: () => PgClient;
 }
 
 const DEFAULT_OPTIONS = {
@@ -50,7 +50,8 @@ export class PostgresProjector {
   }
 
   start(): void {
-    if (this.running) return;
+    // M1.2：干净安装不得启动远端轮询器；local_only 没有隐藏连接尝试。
+    if (this.running || !this.configDao.dbEnabled()) return;
     this.running = true;
     this.schedule();
   }
@@ -69,13 +70,15 @@ export class PostgresProjector {
       return { projected: 0, skipped: this.outbox.pendingCount(), error: 'not_configured' };
     }
     const factory = this.options.clientFactory;
-    let client: Client | null = null;
+    let client: PgClient | null = null;
     let projected = 0;
     let skipped = 0;
     try {
-      client = factory
-        ? factory()
-        : new Client({
+      if (factory) {
+        client = factory();
+      } else {
+        const { Client } = await import('pg');
+        client = new Client({
             host: this.configDao.getConnectionInfo().host,
             port: this.configDao.getConnectionInfo().port,
             database: this.configDao.getConnectionInfo().db,
@@ -83,6 +86,7 @@ export class PostgresProjector {
             password: process.env.QLH_DB_PASSWORD,
             connectionTimeoutMillis: 3000,
           });
+      }
       await client.connect();
       await client.query(`
         CREATE TABLE IF NOT EXISTS outbox_projection (

@@ -14,8 +14,7 @@
   - 超时: 48h 默认 → EXPIRED
 
 持久化:
-  - 通过 db.py 的 review_tickets 表存储
-  - 依赖 db.py 的 create_review_ticket / get_review_ticket / update_review_ticket / list_review_tickets
+  - 通过主节点 SQLite 的 review_tickets 表存储
 
 不依赖 scheduler.py（避免循环引用）。
 """
@@ -137,7 +136,7 @@ class ReviewTicket:
 class ReviewManager:
     """审查票状态机 + 持久化。
 
-    线程安全：所有 DB 操作通过 db.py 的连接池，psycopg2 自带线程安全。
+    线程安全：所有持久化操作通过本地 SQLite store 的短事务完成。
     """
 
     APPROVE_THRESHOLD: int = 2     # score >= +2 → APPROVED
@@ -315,8 +314,8 @@ class ReviewManager:
     def get_ticket(self, ticket_id: str) -> Optional[ReviewTicket]:
         """获取单个工单。"""
         try:
-            from db import get_review_ticket
-            row = get_review_ticket(ticket_id)
+            import local_store
+            row = local_store.get_local_review_ticket(ticket_id)
             if row is None:
                 return None
             return ReviewTicket.from_dict(row)
@@ -334,8 +333,8 @@ class ReviewManager:
             ReviewTicket 列表，按 created_at 降序。
         """
         try:
-            from db import list_review_tickets
-            rows = list_review_tickets(status)
+            import local_store
+            rows = local_store.list_local_review_tickets(status)
             tickets = []
             for row in (rows or []):
                 try:
@@ -355,8 +354,8 @@ class ReviewManager:
         批准后的有效期与工单原始超时时间一致。
         """
         try:
-            from db import list_review_tickets
-            rows = list_review_tickets("approved")
+            import local_store
+            rows = local_store.list_local_review_tickets("approved")
             for row in (rows or []):
                 if row.get("target_node_id") == target_node_id:
                     ticket = ReviewTicket.from_dict(row)
@@ -378,8 +377,8 @@ class ReviewManager:
     def delete_ticket(self, ticket_id: str) -> bool:
         """删除单个工单（所有状态均可）。"""
         try:
-            from db import delete_review_ticket
-            result = delete_review_ticket(ticket_id)
+            import local_store
+            result = local_store.delete_local_review_ticket(ticket_id)
             if result:
                 logger.info(f"审查工单已删除: {ticket_id}")
             return result
@@ -390,8 +389,8 @@ class ReviewManager:
     def delete_resolved(self) -> int:
         """删除所有已解决（approved/rejected/expired）的工单。"""
         try:
-            from db import delete_resolved_review_tickets
-            count = delete_resolved_review_tickets()
+            import local_store
+            count = local_store.delete_local_resolved_review_tickets()
             if count > 0:
                 logger.info(f"已清理 {count} 个已解决审查工单")
             return count
@@ -411,13 +410,13 @@ class ReviewManager:
         expired_ids = []
 
         try:
-            from db import list_review_tickets, update_review_ticket
-            rows = list_review_tickets("pending")
+            import local_store
+            rows = local_store.list_local_review_tickets("pending")
             for row in (rows or []):
                 expires_at = row.get("expires_at", 0)
                 if expires_at > 0 and now > expires_at:
                     tid = row["ticket_id"]
-                    update_review_ticket(tid, {
+                    local_store.update_local_review_ticket(tid, {
                         "status": "expired",
                         "resolved_at": now,
                     })
@@ -499,16 +498,10 @@ class ReviewManager:
             False 如果 DB 不可用或写入失败。
         """
         try:
-            from db import update_review_ticket, create_review_ticket
+            import local_store
             data = ticket.to_dict()
-            data["votes"] = json.dumps(data["votes"], ensure_ascii=False)
-            # 先尝试 update（投票后工单已存在）
-            result = update_review_ticket(ticket.ticket_id, data)
-            if result is not None:
-                return True
-            # ticket 不存在 → create（使用 ON CONFLICT DO UPDATE 确保不丢数据）
-            created = create_review_ticket(data)
-            return created is not None
+            local_store.upsert_local_review_ticket(data)
+            return True
         except Exception as e:
             logger.error(f"持久化工单失败 ({ticket.ticket_id}): {e}")
             return False

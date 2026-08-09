@@ -16,6 +16,11 @@ import { ClusterProfileRepository, ClusterProfileRow } from '../../data/cluster-
 import { ClusterEndpointsRepository } from '../../data/cluster-endpoints-repository';
 import { ClusterProfileSelectionService } from '../../data/cluster-profile-selection';
 import { ClusterDiscoveryService } from '../../data/cluster-discovery.service';
+import {
+  buildEndpointUrl,
+  canonicalHost,
+  normalizeHttpEndpoint,
+} from '../../common/network-address';
 
 class VerifyProfileRequest {
   name?: string;
@@ -59,8 +64,17 @@ export class ClusterProfilesController {
     if (!endpoint) {
       throw new HttpException('master_endpoint 必填（Tailscale IP 或 MagicDNS）', 422);
     }
-    const normalized = endpoint.startsWith('http') ? endpoint : `http://${endpoint}`;
-    const url = `${normalized.replace(/\/+$/, '')}/bootstrap/info`;
+    let normalized: URL;
+    try {
+      normalized = normalizeHttpEndpoint(endpoint);
+    } catch (err) {
+      throw new HttpException(
+        err instanceof Error ? err.message : String(err),
+        422,
+      );
+    }
+    normalized.pathname = `${normalized.pathname.replace(/\/+$/, '')}/bootstrap/info`;
+    const url = normalized.toString();
     let info: BootstrapInfo;
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -71,13 +85,13 @@ export class ClusterProfilesController {
     } catch (err) {
       return {
         status: 'unreachable',
-        master_endpoint: normalized,
+        master_endpoint: normalized.origin,
         error: err instanceof Error ? err.message : String(err),
       };
     }
     return {
       status: 'ok',
-      master_endpoint: normalized,
+      master_endpoint: normalized.origin,
       cluster_id: info.cluster_id ?? null,
       version: info.version ?? null,
       master_node_id: info.master?.node_id ?? null,
@@ -159,7 +173,7 @@ export class ClusterProfilesController {
     const scheme = body?.scheme ?? 'http';
     const host = body?.host ?? '127.0.0.1';
     const port = Number(body?.port) || 8000;
-    const url = `${scheme}://${host}:${port}/health`;
+    const url = buildEndpointUrl(scheme, host, port, '/health');
     let reachable = false;
     let detail = '';
     try {
@@ -169,14 +183,11 @@ export class ClusterProfilesController {
     } catch (err) {
       detail = err instanceof Error ? err.message : String(err);
     }
-    return { endpoint: `${scheme}://${host}:${port}`, reachable, detail };
+    return { endpoint: buildEndpointUrl(scheme, host, port), reachable, detail };
   }
 
   private dto(row: ClusterProfileRow): Record<string, unknown> {
-    const normalized = row.master_endpoint.startsWith('http')
-      ? row.master_endpoint
-      : `http://${row.master_endpoint}`;
-    const parsed = new URL(normalized);
+    const parsed = normalizeHttpEndpoint(row.master_endpoint);
     return {
       schema_version: 1,
       profile_id: row.profile_id,
@@ -184,7 +195,7 @@ export class ClusterProfilesController {
       cluster_id: row.cluster_id,
       master_endpoint: {
         scheme: parsed.protocol.replace(':', ''),
-        host: parsed.hostname,
+        host: canonicalHost(parsed.hostname),
         port: Number(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80),
       },
       status: row.status,

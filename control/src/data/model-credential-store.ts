@@ -1,5 +1,5 @@
 import { Injectable, Optional } from '@nestjs/common';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -9,6 +9,8 @@ export interface CredentialProtector {
   readonly name: string;
   protect(secret: string): Promise<string>;
   unprotect(ciphertext: string): Promise<string>;
+  remove?(ciphertext: string): Promise<void>;
+  removeSync?(ciphertext: string): void;
 }
 
 export interface CredentialStoreOptions {
@@ -103,6 +105,153 @@ export class WindowsDpapiProtector implements CredentialProtector {
   }
 }
 
+export type SecretServiceCommandRunner = (
+  args: string[],
+  stdin: string | null,
+  timeoutMs: number,
+) => Promise<string>;
+
+export type SecretServiceSyncCommandRunner = (
+  args: string[],
+  stdin: string | null,
+  timeoutMs: number,
+) => void;
+
+export interface LinuxSecretServiceProtectorOptions {
+  command?: string;
+  env?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  runCommand?: SecretServiceCommandRunner;
+  runCommandSync?: SecretServiceSyncCommandRunner;
+}
+
+/**
+ * Linux Secret Service adapter. The JSON record stores only a random handle;
+ * the secret itself stays in the user's session keyring via secret-tool.
+ */
+export class LinuxSecretServiceProtector implements CredentialProtector {
+  readonly name = 'linux-secret-service';
+  private readonly command: string;
+  private readonly env: NodeJS.ProcessEnv;
+  private readonly timeoutMs: number;
+  private readonly runCommandFn: SecretServiceCommandRunner;
+  private readonly runCommandSyncFn: SecretServiceSyncCommandRunner;
+
+  constructor(options: LinuxSecretServiceProtectorOptions = {}) {
+    this.command = options.command ?? 'secret-tool';
+    this.env = options.env ?? process.env;
+    this.timeoutMs = options.timeoutMs ?? 10_000;
+    this.runCommandFn = options.runCommand ?? ((args, stdin, timeoutMs) => (
+      this.runCommand(args, stdin, timeoutMs)
+    ));
+    this.runCommandSyncFn = options.runCommandSync ?? ((args, stdin, timeoutMs) => (
+      this.runCommandSync(args, stdin, timeoutMs)
+    ));
+  }
+
+  async protect(secret: string): Promise<string> {
+    const handle = crypto.randomUUID();
+    await this.runCommandFn(
+      this.storeArgs(handle), secret, this.timeoutMs,
+    );
+    return handle;
+  }
+
+  async unprotect(ciphertext: string): Promise<string> {
+    const handle = this.normalizeHandle(ciphertext);
+    const output = await this.runCommandFn(
+      this.lookupArgs(handle), null, this.timeoutMs,
+    );
+    return output.replace(/\r?\n$/, '');
+  }
+
+  async remove(ciphertext: string): Promise<void> {
+    const handle = this.normalizeHandle(ciphertext);
+    await this.runCommandFn(this.clearArgs(handle), null, this.timeoutMs);
+  }
+
+  removeSync(ciphertext: string): void {
+    const handle = this.normalizeHandle(ciphertext);
+    this.runCommandSyncFn(this.clearArgs(handle), null, this.timeoutMs);
+  }
+
+  private normalizeHandle(value: string): string {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+      throw new Error('Linux Secret Service credential handle is invalid');
+    }
+    return value;
+  }
+
+  private storeArgs(handle: string): string[] {
+    return ['store', '--label=QLH credential', 'application', 'qlh', 'credential', handle];
+  }
+
+  private lookupArgs(handle: string): string[] {
+    return ['lookup', 'application', 'qlh', 'credential', handle];
+  }
+
+  private clearArgs(handle: string): string[] {
+    return ['clear', 'application', 'qlh', 'credential', handle];
+  }
+
+  private runCommand(args: string[], stdin: string | null, timeoutMs: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.command, args, {
+        env: this.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      const stdout: Buffer[] = [];
+      let outputBytes = 0;
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.kill();
+        reject(new Error('Linux Secret Service command timed out'));
+      }, timeoutMs);
+      child.stdout.on('data', (chunk: Buffer) => {
+        outputBytes += chunk.length;
+        if (outputBytes <= 128 * 1024) stdout.push(chunk);
+      });
+      child.stderr.resume();
+      child.on('error', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('Linux Secret Service is unavailable'));
+      });
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (code !== 0 || outputBytes > 128 * 1024) {
+          reject(new Error('Linux Secret Service command failed'));
+          return;
+        }
+        resolve(Buffer.concat(stdout).toString('utf-8'));
+      });
+      child.stdin.on('error', () => undefined);
+      if (stdin === null) child.stdin.end();
+      else child.stdin.end(stdin, 'utf-8');
+    });
+  }
+
+  private runCommandSync(args: string[], stdin: string | null, timeoutMs: number): void {
+    const result = spawnSync(this.command, args, {
+      env: this.env,
+      input: stdin ?? undefined,
+      encoding: 'utf-8',
+      timeout: timeoutMs,
+      windowsHide: true,
+      maxBuffer: 128 * 1024,
+    });
+    if (result.error || result.status !== 0) {
+      throw new Error('Linux Secret Service command failed');
+    }
+  }
+}
+
 class UnsupportedCredentialProtector implements CredentialProtector {
   readonly name = 'unavailable';
 
@@ -137,11 +286,7 @@ export class ModelCredentialStore {
     this.root = options.rootDir
       ? path.resolve(options.rootDir)
       : defaultCredentialRoot(env);
-    this.protector = options.protector ?? (
-      process.platform === 'win32'
-        ? new WindowsDpapiProtector()
-        : new UnsupportedCredentialProtector()
-    );
+    this.protector = options.protector ?? defaultCredentialProtector(process.platform, env);
   }
 
   async set(credentialRef: string, secret: string): Promise<CredentialStatus> {
@@ -149,6 +294,7 @@ export class ModelCredentialStore {
     if (!secret || Buffer.byteLength(secret, 'utf-8') > 64 * 1024) {
       throw new Error('credential secret must contain 1-65536 UTF-8 bytes');
     }
+    const previous = this.readRecord(ref);
     const updatedAt = new Date().toISOString();
     const record: CredentialRecord = {
       schema_version: 1,
@@ -162,6 +308,14 @@ export class ModelCredentialStore {
     const temp = `${target}.tmp-${process.pid}-${crypto.randomUUID().slice(0, 8)}`;
     fs.writeFileSync(temp, `${JSON.stringify(record)}\n`, { encoding: 'utf-8', mode: 0o600 });
     fs.renameSync(temp, target);
+    if (previous && previous.protection === this.protector.name
+        && previous.ciphertext !== record.ciphertext && this.protector.remove) {
+      try {
+        await this.protector.remove(previous.ciphertext);
+      } catch {
+        // A stale keyring item must not make the newly stored credential unusable.
+      }
+    }
     return this.toStatus(record);
   }
 
@@ -203,6 +357,15 @@ export class ModelCredentialStore {
     const ref = normalizeCredentialRef(credentialRef);
     const target = this.recordPath(ref);
     if (!fs.existsSync(target)) return false;
+    const record = this.readRecord(ref);
+    if (record && record.protection === this.protector.name) {
+      try {
+        if (this.protector.removeSync) this.protector.removeSync(record.ciphertext);
+        else if (this.protector.remove) void this.protector.remove(record.ciphertext).catch(() => undefined);
+      } catch {
+        // The local index is still removed; a failed keyring cleanup is not a secret disclosure.
+      }
+    }
     fs.rmSync(target, { force: true });
     return true;
   }
@@ -246,4 +409,16 @@ export class ModelCredentialStore {
       updated_at: record.updated_at,
     };
   }
+}
+
+export function defaultCredentialProtector(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): CredentialProtector {
+  if (platform === 'win32') return new WindowsDpapiProtector();
+  if (platform === 'linux') return new LinuxSecretServiceProtector({
+    command: env.QLH_SECRET_TOOL?.trim() || undefined,
+    env,
+  });
+  return new UnsupportedCredentialProtector();
 }

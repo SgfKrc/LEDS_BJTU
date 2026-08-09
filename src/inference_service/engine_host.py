@@ -24,6 +24,8 @@ from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+import local_store as _local_store
+
 from diffusion import (
     DiffusionConflictError,
     DiffusionService,
@@ -565,6 +567,31 @@ class EngineHost:
         return bool(getattr(self._host, "model_loaded", False)) or bool(
             getattr(self._host, "is_loaded", False)
         )
+
+    def initialize_storage(self) -> str:
+        """Validate the shared main-node SQLite before serving requests."""
+        return _local_store.initialize_local_store()
+
+    def _persist_conversation_turn(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_message: str,
+        metrics: Optional[dict] = None,
+    ) -> bool:
+        try:
+            if not _local_store.get_local_save_history():
+                return False
+            _local_store.save_local_message(session_id, "user", user_message)
+            _local_store.save_local_message(
+                session_id, "assistant", assistant_message, metrics,
+            )
+            _local_store.increment_local_session_message_count(session_id)
+        except Exception as exc:
+            logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
+            return False
+
+        return True
 
     def select_engine(self, profile=None) -> str:
         return self._host.select_engine(profile)
@@ -1199,25 +1226,9 @@ class EngineHost:
                         forward_metrics["fallback_reason"] = external_fallback_reason
 
                     db_session_id = target_session_id or "default"
-                    if getattr(self._host, "_db_available", False):
-                        try:
-                            import db as _db_mod
-                            if _db_mod.get_save_history():
-                                _db_mod.save_message(db_session_id, "user", req.message)
-                                _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                    forward_metrics)
-                                _db_mod.increment_session_message_count(db_session_id)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            import local_store as _local_store
-                            _local_store.save_local_message(db_session_id, "user", req.message)
-                            _local_store.save_local_message(db_session_id, "assistant", response_text,
-                                                            forward_metrics)
-                            _local_store.increment_local_session_message_count(db_session_id)
-                        except Exception:
-                            pass
+                    self._persist_conversation_turn(
+                        db_session_id, req.message, response_text, forward_metrics,
+                    )
 
                     self._conversation_stats["rounds"] += 1
                     self._record_task_complete()
@@ -1307,26 +1318,9 @@ class EngineHost:
                             pipeline_metrics["fallback_reason"] = (
                                 external_fallback_reason
                             )
-                        if getattr(self._host, "_db_available", False):
-                            try:
-                                import db as _db_mod
-                                if _db_mod.get_save_history():
-                                    _db_mod.save_message(db_session_id, "user", req.message)
-                                    _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                        pipeline_metrics)
-                                    _db_mod.increment_session_message_count(db_session_id)
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                import local_store as _local_store
-                                _local_store.save_local_message(db_session_id, "user", req.message)
-                                _local_store.save_local_message(db_session_id, "assistant",
-                                                                response_text,
-                                                                pipeline_metrics)
-                                _local_store.increment_local_session_message_count(db_session_id)
-                            except Exception:
-                                pass
+                        self._persist_conversation_turn(
+                            db_session_id, req.message, response_text, pipeline_metrics,
+                        )
 
                         self._conversation_stats["rounds"] += 1
                         if not pipeline_metrics.get("distributed_used"):
@@ -1415,29 +1409,11 @@ class EngineHost:
                     {"role": "assistant", "content": response_text},
                 ])
 
-                if getattr(self._host, "_db_available", False):
-                    try:
-                        import db as _db_mod
-                        if _db_mod.get_save_history():
-                            _db_mod.save_message(db_session_id, "user", req.message)
-                            save_metrics = dict(metrics)
-                            save_metrics["followups"] = followups
-                            _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                save_metrics)
-                            _db_mod.increment_session_message_count(db_session_id)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        import local_store as _local_store
-                        _local_store.save_local_message(db_session_id, "user", req.message)
-                        save_metrics = dict(metrics)
-                        save_metrics["followups"] = followups
-                        _local_store.save_local_message(db_session_id, "assistant", response_text,
-                                                        save_metrics)
-                        _local_store.increment_local_session_message_count(db_session_id)
-                    except Exception:
-                        pass
+                save_metrics = dict(metrics)
+                save_metrics["followups"] = followups
+                self._persist_conversation_turn(
+                    db_session_id, req.message, response_text, save_metrics,
+                )
 
                 self._conversation_stats["total_generated_tokens"] += completion_tokens
                 self._conversation_stats["rounds"] += 1
@@ -1580,27 +1556,11 @@ class EngineHost:
                 {"role": "assistant", "content": response_text},
             ])
 
-            if getattr(self._host, "_db_available", False):
-                try:
-                    import db as _db_mod
-                    if _db_mod.get_save_history():
-                        _db_mod.save_message(db_session_id, "user", req.message)
-                        save_metrics = dict(metrics)
-                        save_metrics["followups"] = followups
-                        _db_mod.save_message(db_session_id, "assistant", response_text, save_metrics)
-                        _db_mod.increment_session_message_count(db_session_id)
-                except Exception:
-                    pass
-            else:
-                try:
-                    import local_store as _local_store
-                    save_metrics = dict(metrics)
-                    save_metrics["followups"] = followups
-                    _local_store.save_local_message(db_session_id, "user", req.message)
-                    _local_store.save_local_message(db_session_id, "assistant", response_text, save_metrics)
-                    _local_store.increment_local_session_message_count(db_session_id)
-                except Exception:
-                    pass
+            save_metrics = dict(metrics)
+            save_metrics["followups"] = followups
+            self._persist_conversation_turn(
+                db_session_id, req.message, response_text, save_metrics,
+            )
 
             self._conversation_stats["total_prompt_tokens"] += prompt_len
             self._conversation_stats["total_generated_tokens"] += new_tokens
@@ -2596,28 +2556,9 @@ class EngineHost:
         save_metrics["followups"] = followups
 
         db_session_id = target_session_id or "default"
-        if self._host._db_available:
-            try:
-                import db as _db_mod
-                if _db_mod.get_save_history():
-                    _db_mod.save_message(db_session_id, "user", req.message)
-                    _db_mod.save_message(
-                        db_session_id, "assistant", response_text, save_metrics,
-                    )
-                    _db_mod.increment_session_message_count(db_session_id)
-            except Exception:
-                pass
-        if not self._host._db_available:
-            try:
-                _local_store.save_local_message(
-                    db_session_id, "user", req.message,
-                )
-                _local_store.save_local_message(
-                    db_session_id, "assistant", response_text, save_metrics,
-                )
-                _local_store.increment_local_session_message_count(db_session_id)
-            except Exception:
-                pass
+        self._persist_conversation_turn(
+            db_session_id, req.message, response_text, save_metrics,
+        )
 
         self._conversation_stats["total_prompt_tokens"] += prompt_tokens
         self._conversation_stats["total_generated_tokens"] += completion_tokens
@@ -2720,20 +2661,11 @@ class EngineHost:
         self._active_session_id = target_id
         if target_id not in self._session_histories:
             messages = []
-            if getattr(self._host, "_db_available", False):
-                try:
-                    import db as _db_mod
-                    rows = _db_mod.get_conversation(target_id)
-                    messages = [{"role": r["role"], "content": r["content"]} for r in rows]
-                except Exception:
-                    pass
-            if not messages:
-                try:
-                    import local_store as _local_store
-                    local_rows = _local_store.load_local_conversation(target_id)
-                    messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-                except Exception:
-                    pass
+            try:
+                local_rows = _local_store.load_local_conversation(target_id)
+                messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
+            except Exception as exc:
+                logger.error("SQLite 切换会话加载失败: session=%s: %s", target_id, exc)
             self._session_histories[target_id] = messages
         if self._kv_cache:
             self._kv_cache.clear()
@@ -2759,18 +2691,10 @@ class EngineHost:
         title = first_message.strip()[:30]
         if len(first_message.strip()) > 30:
             title += "..."
-        if getattr(self._host, "_db_available", False):
-            try:
-                import db as _db_mod
-                _db_mod.update_session_title(session_id, title)
-            except Exception:
-                pass
-        else:
-            try:
-                import local_store as _local_store
-                _local_store.update_local_session_title(session_id, title)
-            except Exception:
-                pass
+        try:
+            _local_store.update_local_session_title(session_id, title)
+        except Exception as exc:
+            logger.warning("SQLite 自动标题更新失败: session=%s: %s", session_id, exc)
 
     # ------------------------------------------------------------------
     # 追问生成（1.2c 复制自 api_server.py:1228-1354，PyTorch 路径）
@@ -3207,29 +3131,11 @@ class EngineHost:
             {"role": "assistant", "content": response_text},
         ])
 
-        if getattr(self._host, "_db_available", False):
-            try:
-                import db as _db_mod
-                if _db_mod.get_save_history():
-                    _db_mod.save_message(db_session_id, "user", req.message)
-                    save_metrics = dict(metrics)
-                    save_metrics["followups"] = followups
-                    _db_mod.save_message(db_session_id, "assistant", response_text,
-                                        save_metrics)
-                    _db_mod.increment_session_message_count(db_session_id)
-            except Exception:
-                pass
-        else:
-            try:
-                import local_store as _local_store
-                _local_store.save_local_message(db_session_id, "user", req.message)
-                save_metrics = dict(metrics)
-                save_metrics["followups"] = followups
-                _local_store.save_local_message(db_session_id, "assistant",
-                                                response_text, save_metrics)
-                _local_store.increment_local_session_message_count(db_session_id)
-            except Exception:
-                pass
+        save_metrics = dict(metrics)
+        save_metrics["followups"] = followups
+        self._persist_conversation_turn(
+            db_session_id, req.message, response_text, save_metrics,
+        )
 
         self._conversation_stats["total_generated_tokens"] += completion_tokens
         self._conversation_stats["rounds"] += 1

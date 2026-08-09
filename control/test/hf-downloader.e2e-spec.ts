@@ -4,7 +4,7 @@ import {
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
-  DownloadResponseInfo, HfDownloader,
+  DownloadResponseInfo, DownloadRetryInfo, HfDownloader,
 } from '../src/data/hf-downloader';
 import { ModelHttpClient } from '../src/data/model-http-client';
 
@@ -35,6 +35,7 @@ describe('MODEL-FLEET M3 strict Range downloader', () => {
     });
     expect(readFileSync(file, 'utf-8')).toBe('abcdef');
     expect(info).toEqual({
+      attempt: 1,
       status: 206,
       requestedStartBytes: 3,
       contentRange: 'bytes 3-5/6',
@@ -46,15 +47,20 @@ describe('MODEL-FLEET M3 strict Range downloader', () => {
   it('rejects a server that ignores Range instead of appending a full 200 body', async () => {
     const { dir, file } = tempFile();
     writeFileSync(file, 'abc');
+    let requests = 0;
     const http = new ModelHttpClient({
       proxyUrl: null,
-      fetchFn: async () => new Response('abcdef', { status: 200 }),
+      fetchFn: async () => {
+        requests += 1;
+        return new Response('abcdef', { status: 200 });
+      },
     });
-    const downloader = new HfDownloader(http);
+    const downloader = new HfDownloader(http, { maxAttempts: 4, retryBaseDelayMs: 0 });
     await expect(downloader.downloadFile(
       'org/model', 'revision', 'artifact.bin', file, { expectedSize: 6 },
     )).rejects.toThrow('续传请求未返回 206');
     expect(readFileSync(file, 'utf-8')).toBe('abc');
+    expect(requests).toBe(1);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -68,7 +74,7 @@ describe('MODEL-FLEET M3 strict Range downloader', () => {
         headers: { 'content-range': 'bytes 2-4/6' },
       }),
     });
-    const downloader = new HfDownloader(http);
+    const downloader = new HfDownloader(http, { maxAttempts: 1 });
     await expect(downloader.downloadFile(
       'org/model', 'revision', 'artifact.bin', file, { expectedSize: 6 },
     )).rejects.toThrow('续传响应范围错位');
@@ -86,10 +92,10 @@ describe('MODEL-FLEET M3 strict Range downloader', () => {
         headers: { 'content-range': 'bytes 3-5/6' },
       }),
     });
-    const downloader = new HfDownloader(http);
+    const downloader = new HfDownloader(http, { maxAttempts: 1 });
     await expect(downloader.downloadFile(
       'org/model', 'revision', 'artifact.bin', file, { expectedSize: 6 },
-    )).rejects.toThrow('续传响应体长度不匹配');
+    )).rejects.toThrow('续传响应体提前结束');
     expect(readFileSync(file, 'utf-8')).toBe('abcde');
     rmSync(dir, { recursive: true, force: true });
   });
@@ -130,6 +136,114 @@ describe('MODEL-FLEET M3 strict Range downloader', () => {
     expect(existsSync(file)).toBe(true);
     expect(readFileSync(file).length).toBe(0);
     expect(requests).toBe(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('retries an interrupted stream from the persisted file length with strict Range', async () => {
+    const { dir, file } = tempFile();
+    const starts: number[] = [];
+    const retries: DownloadRetryInfo[] = [];
+    let requests = 0;
+    const http = new ModelHttpClient({
+      proxyUrl: null,
+      fetchFn: async (_url, init) => {
+        requests += 1;
+        const range = new Headers(init?.headers).get('range');
+        starts.push(range ? Number(/^bytes=(\d+)-$/.exec(range)?.[1]) : 0);
+        if (requests === 1) {
+          let pullCount = 0;
+          const stream = new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (pullCount === 0) {
+                pullCount += 1;
+                controller.enqueue(new TextEncoder().encode('abc'));
+                return;
+              }
+              controller.error(new Error('simulated proxy disconnect'));
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: { 'content-length': '6' },
+          });
+        }
+        return new Response('def', {
+          status: 206,
+          headers: {
+            'content-length': '3',
+            'content-range': 'bytes 3-5/6',
+          },
+        });
+      },
+    });
+    const downloader = new HfDownloader(http, {
+      maxAttempts: 3,
+      retryBaseDelayMs: 0,
+      progressThrottleMs: 0,
+    });
+    await downloader.downloadFile('org/model', 'revision', 'artifact.bin', file, {
+      expectedSize: 6,
+      onRetry: (retry) => retries.push(retry),
+    });
+    expect(readFileSync(file, 'utf-8')).toBe('abcdef');
+    expect(starts).toEqual([0, 3]);
+    expect(retries).toEqual([{
+      attempt: 1,
+      nextAttempt: 2,
+      retryCount: 1,
+      resumedBytes: 3,
+      errorCode: 'download_stream_interrupted',
+    }]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not apply the response-header timeout to a slow response body', async () => {
+    const { dir, file } = tempFile();
+    const http = new ModelHttpClient({
+      proxyUrl: null,
+      fetchFn: async () => new Response(new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          controller.enqueue(new TextEncoder().encode('abcdef'));
+          controller.close();
+        },
+      }), {
+        status: 200,
+        headers: { 'content-length': '6' },
+      }),
+    });
+    const downloader = new HfDownloader(http, {
+      maxAttempts: 1,
+      requestTimeoutMs: 10,
+    });
+    await downloader.downloadFile(
+      'org/model', 'revision', 'artifact.bin', file, { expectedSize: 6 },
+    );
+    expect(readFileSync(file, 'utf-8')).toBe('abcdef');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('surfaces transfer_unavailable after bounded transport attempts', async () => {
+    const { dir, file } = tempFile();
+    let requests = 0;
+    const http = new ModelHttpClient({
+      proxyUrl: null,
+      fetchFn: async () => {
+        requests += 1;
+        throw new TypeError('simulated proxy unavailable');
+      },
+    });
+    const downloader = new HfDownloader(http, {
+      maxAttempts: 3,
+      retryBaseDelayMs: 0,
+    });
+    await expect(downloader.downloadFile(
+      'org/model', 'revision', 'artifact.bin', file, { expectedSize: 6 },
+    )).rejects.toMatchObject({
+      name: 'HfDownloadTransportError',
+      code: 'download_transport_unavailable',
+    });
+    expect(requests).toBe(3);
     rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -3,11 +3,12 @@
 =====================================
 用法: python serve.py [port]
 
-默认监听 0.0.0.0:9090，生成 Tailscale 可达的下载链接。
+默认监听 [::]:9090（同时接受 IPv4/IPv6），生成 Tailscale 可达的下载链接。
 其他设备浏览器直接访问 http://<tailscale-ip>:9090/ 即可下载。
 
 支持分发:
-- PC 安装包: packaging/dist/*.exe
+- PC 安装包: packaging/dist/*.exe（主应用，不含启动器）
+- QLH 启动器: packaging/dist/QLH-Launcher-Setup-v*.exe（安装包）+ QLH-Launcher-v*.zip（自更新资产）
 - Android 安装包: packaging/dist/*.apk / *.aab，或 android/app/build/outputs/**/*.apk / *.aab
 - PC 模型压缩包: models_pc.7z 或 models_pc/*.7z
 - Android 模型压缩包: models_android.7z 或 models_android/*.7z
@@ -30,7 +31,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote, unquote, urlparse
 
-HOST = "0.0.0.0"
+HOST = os.environ.get("QLH_DISTRIBUTION_HOST", "::")
 DEFAULT_PORT = 9090
 ROOT = os.path.dirname(os.path.abspath(__file__))  # packaging/
 DIST_DIR = os.path.join(ROOT, "dist")
@@ -115,6 +116,8 @@ def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
     lower = name.lower()
     if lower.endswith(".zip") and "qlh-launcher" in lower:
         return "windows", "any", "x86_64", "launcher"
+    if lower.endswith(".exe") and "qlh-launcher-setup" in lower:
+        return "windows", "any", "x86_64", "launcher-setup"
     if lower.endswith(".exe") and "qlh-edge-inference-setup" in lower:
         return "windows", "cuda" if "cuda" in lower else "cpu", "x86_64", "installer"
     if lower.endswith((".apk", ".aab")) and "qlh-inference" in lower:
@@ -174,14 +177,54 @@ def _detect_tailscale_ip() -> str:
     try:
         import psutil
         addrs = psutil.net_if_addrs()
+        candidates = []
         for iface, addr_list in addrs.items():
             if "tailscale" in iface.lower():
                 for addr in addr_list:
-                    if addr.family == socket.AF_INET and not addr.address.startswith("127."):
-                        return addr.address
+                    if addr.family not in (socket.AF_INET, socket.AF_INET6):
+                        continue
+                    address = str(addr.address or "").split("%", 1)[0]
+                    if not address or address.startswith("127.") or address == "::1":
+                        continue
+                    candidates.append((0 if addr.family == socket.AF_INET else 1, address))
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
     except Exception:
         pass
     return "?"
+
+
+def _url_host(host: str) -> str:
+    value = str(host or "").strip()
+    if value.startswith("[") and value.endswith("]"):
+        return value
+    return f"[{value.replace('%', '%25')}]" if ":" in value else value
+
+
+class DualStackHTTPServer(http.server.ThreadingHTTPServer):
+    """One IPv6 socket accepting native IPv6 and IPv4-mapped clients."""
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def create_distribution_server(host: str, port: int, handler):
+    value = str(host or "").strip()
+    if value in {"", "::", "0.0.0.0"}:
+        try:
+            return DualStackHTTPServer(("::", port), handler)
+        except OSError:
+            return http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+    if ":" in value:
+        class IPv6HTTPServer(http.server.ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        return IPv6HTTPServer((value.strip("[]"), port), handler)
+    return http.server.ThreadingHTTPServer((value, port), handler)
 
 
 def _format_size(path: str) -> str:
@@ -236,7 +279,7 @@ def _android_url(rel_path: str) -> str:
 
 
 def _scan_pc_installers() -> list[tuple[str, str, str]]:
-    """扫描 packaging/dist 内可分发的 PC 安装包。"""
+    """扫描 packaging/dist 内可分发的 PC 主应用安装包（启动器在独立分区列出）。"""
     installers: list[tuple[str, str, str]] = []
     if not os.path.isdir(DIST_DIR):
         return installers
@@ -245,8 +288,31 @@ def _scan_pc_installers() -> list[tuple[str, str, str]]:
         item_path = os.path.join(DIST_DIR, name)
         if not os.path.isfile(item_path) or not name.lower().endswith(PC_INSTALLER_EXTS):
             continue
+        if "qlh-launcher" in name.lower():
+            continue
         installers.append((name, "/" + quote(name), item_path))
     return installers
+
+
+def _scan_launcher_assets() -> list[tuple[str, str, str]]:
+    """扫描 packaging/dist 内的 QLH 启动器资产（Setup 安装包 + 自更新 ZIP）。"""
+    assets: list[tuple[str, str, str]] = []
+    if not os.path.isdir(DIST_DIR):
+        return assets
+
+    for name in sorted(os.listdir(DIST_DIR), key=str.lower):
+        lower = name.lower()
+        if "qlh-launcher" not in lower:
+            continue
+        is_setup_exe = lower.endswith(".exe") and "setup" in lower
+        is_bundle_zip = lower.endswith(".zip")
+        if not (is_setup_exe or is_bundle_zip):
+            continue
+        item_path = os.path.join(DIST_DIR, name)
+        if not os.path.isfile(item_path):
+            continue
+        assets.append((name, "/" + quote(name), item_path))
+    return assets
 
 
 def _scan_dist_android_packages() -> list[tuple[str, str, str]]:
@@ -413,6 +479,11 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             for display, href, abs_path in _scan_pc_installers()
         ]
 
+        launcher_entries = [
+            (display, href, _format_size(abs_path))
+            for display, href, abs_path in _scan_launcher_assets()
+        ]
+
         android_entries = [
             (display, href, _format_size(abs_path))
             for display, href, abs_path in _scan_android_downloads()
@@ -436,6 +507,7 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             )
 
         pc_rows = render_rows(pc_entries, "暂无 PC 安装包（请先运行 build-installer.bat）")
+        launcher_rows = render_rows(launcher_entries, "暂无 QLH 启动器（请先运行 build-launcher.bat）")
         android_rows = render_rows(android_entries, "暂无 Android 安装包（请先运行 android/gradlew.bat assembleRelease）")
         pc_model_rows = render_rows(pc_model_entries, "暂无 PC 模型压缩包 models_pc.7z / models_pc/*.7z")
         android_model_rows = render_rows(
@@ -467,6 +539,11 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     {pc_rows}
   </ul>
 
+  <h2>QLH 启动器</h2>
+  <ul>
+    {launcher_rows}
+  </ul>
+
   <h2>Android 安装包</h2>
   <ul>
     {android_rows}
@@ -485,6 +562,7 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
   <p class="hint">
     Android Release APK 默认路径: <code>android/app/build/outputs/apk/*/release/*.apk</code><br>
     PC 安装包默认路径: <code>packaging/dist/QLH-Edge-Inference-Setup-v*.exe</code><br>
+    启动器: <code>packaging/dist/QLH-Launcher-Setup-v*.exe</code>（安装）+ <code>QLH-Launcher-v*.zip</code>（自更新资产，供 <code>qlh_launcher.py launcher-install</code> 使用）<br>
     Android 模型包仅需包含 GGUF 模型；PC 模型包可包含 PC 端需要的完整模型目录。
   </p>
 </body>
@@ -546,6 +624,7 @@ def main(argv: list[str] | None = None) -> None:
     ts_ip = _detect_tailscale_ip()
     android_packages = _scan_android_downloads()
     model_archives = _scan_model_archives()
+    launcher_assets = _scan_launcher_assets()
 
     print()
     print("=" * 55)
@@ -553,9 +632,15 @@ def main(argv: list[str] | None = None) -> None:
     print("=" * 55)
     print()
     print(f"  本机 Tailscale IP: {ts_ip}")
-    print(f"  监听: http://{HOST}:{port}")
+    print(f"  监听: http://{_url_host(HOST)}:{port}")
     print(f"  PC 安装包目录: {DIST_DIR}")
     print(f"  Android 输出目录: {ANDROID_OUTPUT_DIR}")
+    if launcher_assets:
+        print("  QLH 启动器:")
+        for display, href, abs_path in launcher_assets:
+            print(f"    {display} -> {href} ({_format_size(abs_path)})")
+    else:
+        print("  QLH 启动器: 未找到（请先运行 packaging/build-launcher.bat）")
     if android_packages:
         print("  Android 安装包:")
         for display, href, abs_path in android_packages:
@@ -572,13 +657,17 @@ def main(argv: list[str] | None = None) -> None:
     print()
     print("  其他设备浏览器访问:")
     if ts_ip and ts_ip != "?":
-        print(f"    http://{ts_ip}:{port}/")
+        print(f"    http://{_url_host(ts_ip)}:{port}/")
+        for _display, href, _abs_path in launcher_assets:
+            print(f"    http://{_url_host(ts_ip)}:{port}{href}")
         for _display, href, _abs_path in android_packages:
-            print(f"    http://{ts_ip}:{port}{href}")
+            print(f"    http://{_url_host(ts_ip)}:{port}{href}")
         for _kind, _display, href, _abs_path in model_archives:
-            print(f"    http://{ts_ip}:{port}{href}")
+            print(f"    http://{_url_host(ts_ip)}:{port}{href}")
     else:
         print(f"    http://<本机IP>:{port}/")
+        for _display, href, _abs_path in launcher_assets:
+            print(f"    http://<本机IP>:{port}{href}")
         for _display, href, _abs_path in android_packages:
             print(f"    http://<本机IP>:{port}{href}")
         for _kind, _display, href, _abs_path in model_archives:
@@ -588,8 +677,9 @@ def main(argv: list[str] | None = None) -> None:
     print("─" * 55)
     print()
 
-    server = http.server.HTTPServer(
-        (HOST, port),
+    server = create_distribution_server(
+        HOST,
+        port,
         partial(QuietHTTPRequestHandler, directory=DIST_DIR),
     )
 

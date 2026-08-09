@@ -1,5 +1,7 @@
 package com.qlh.inference.data
 
+import com.qlh.inference.network.httpBaseUrl
+
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
@@ -119,7 +121,7 @@ class SettingsDataStore(private val context: Context) {
     val baseUrl: Flow<String> = context.dataStore.data.map { prefs ->
         val host = prefs[KEY_SERVER_HOST] ?: DEFAULT_HOST
         val port = prefs[KEY_SERVER_PORT] ?: DEFAULT_PORT
-        "http://$host:$port"
+        httpBaseUrl(host, port)
     }
 
     // ==================== 一次性读取 ====================

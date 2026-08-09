@@ -58,9 +58,11 @@ def test_pc_installer_scan_excludes_android_packages_in_dist(tmp_path, monkeypat
     monkeypatch.setattr(serve, "DIST_DIR", str(dist_dir))
 
     installer = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.1.exe"
+    launcher_setup = dist_dir / "QLH-Launcher-Setup-v0.1.8.1.exe"
     full_apk = dist_dir / "QLH-Inference-v0.1.8.1-full-release.apk"
     lite_apk = dist_dir / "QLH-Inference-v0.1.8.1-lite-release.apk"
     installer.write_bytes(b"exe")
+    launcher_setup.write_bytes(b"exe")
     full_apk.write_bytes(b"apk")
     lite_apk.write_bytes(b"apk")
 
@@ -68,6 +70,27 @@ def test_pc_installer_scan_excludes_android_packages_in_dist(tmp_path, monkeypat
 
     assert entries == [
         ("QLH-Edge-Inference-Setup-v0.1.8.1.exe", "/QLH-Edge-Inference-Setup-v0.1.8.1.exe", str(installer))
+    ]
+
+
+def test_launcher_scan_finds_setup_and_zip_excluding_main_installer(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "packaging" / "dist"
+    dist_dir.mkdir(parents=True)
+    monkeypatch.setattr(serve, "DIST_DIR", str(dist_dir))
+
+    launcher_setup = dist_dir / "QLH-Launcher-Setup-v0.1.8.1.exe"
+    launcher_zip = dist_dir / "QLH-Launcher-v0.1.8.1.zip"
+    main_installer = dist_dir / "QLH-Edge-Inference-Setup-v0.1.8.1.exe"
+    launcher_setup.write_bytes(b"exe")
+    launcher_zip.write_bytes(b"zip")
+    main_installer.write_bytes(b"exe")
+
+    entries = serve._scan_launcher_assets()
+
+    assert entries == [
+        ("QLH-Launcher-Setup-v0.1.8.1.exe", "/QLH-Launcher-Setup-v0.1.8.1.exe", str(launcher_setup)),
+        ("QLH-Launcher-v0.1.8.1.zip", "/QLH-Launcher-v0.1.8.1.zip", str(launcher_zip)),
     ]
 
 
@@ -131,6 +154,34 @@ def test_serve_dist_dir_matches_launcher_zip_output():
     assert 'LAUNCHER_ZIP=packaging\\dist\\QLH-Launcher-v' in bat
 
 
+def test_distribution_url_host_formats_ipv6():
+    serve = _load_serve_module()
+
+    assert serve._url_host("100.64.0.1") == "100.64.0.1"
+    assert serve._url_host("fd7a:115c:a1e0::1") == "[fd7a:115c:a1e0::1]"
+
+
+def test_distribution_server_accepts_ipv4_and_ipv6():
+    import socket
+
+    if not socket.has_ipv6:
+        return
+    serve = _load_serve_module()
+    server = serve.create_distribution_server(
+        "::", 0, serve.http.server.SimpleHTTPRequestHandler
+    )
+    try:
+        port = server.server_address[1]
+        assert server.socket.getsockopt(
+            socket.IPPROTO_IPV6, socket.IPV6_V6ONLY
+        ) == 0
+        for host in ("127.0.0.1", "::1"):
+            client = socket.create_connection((host, port), timeout=3)
+            client.close()
+    finally:
+        server.server_close()
+
+
 def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_path, monkeypatch):
     serve = _load_serve_module()
     dist_dir = tmp_path / "dist"
@@ -158,3 +209,23 @@ def test_update_manifest_only_exposes_current_version_and_classifies_assets(tmp_
     assert manifest["assets"][1]["variant"] == "full"
     assert manifest["assets"][2]["kind"] == "launcher"
     assert manifest["assets"][2]["variant"] == "any"
+
+
+def test_update_manifest_classifies_launcher_setup_exe(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    setup = dist_dir / "QLH-Launcher-Setup-v0.1.8.1.exe"
+    bundle = dist_dir / "QLH-Launcher-v0.1.8.1.zip"
+    setup.write_bytes(b"setup")
+    bundle.write_bytes(b"bundle")
+    monkeypatch.setattr(serve, "_project_version", lambda: "0.1.8.1")
+    serve._SHA256_CACHE.clear()
+
+    manifest = serve.build_update_manifest(str(dist_dir))
+
+    by_name = {item["name"]: item for item in manifest["assets"]}
+    assert by_name[setup.name]["kind"] == "launcher-setup"
+    assert by_name[setup.name]["variant"] == "any"
+    assert by_name[setup.name]["platform"] == "windows"
+    assert by_name[bundle.name]["kind"] == "launcher"
