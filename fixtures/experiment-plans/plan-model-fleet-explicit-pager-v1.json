@@ -1,0 +1,59 @@
+{
+  "plan_id": "plan-model-fleet-explicit-pager-v1",
+  "title": "MF-MEM-N2 64 MiB 双槽显式 layer pager",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11 WDDM",
+    "engine": "isolated synthetic PyTorch explicit layer pager",
+    "tile_mib": 64,
+    "slots": 2,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop 8GB",
+    "ram_gb": 16
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 600,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "gpu0",
+      "memory_transport": "exclusive"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-1101",
+      "name": "CUDA explicit pager batch=1",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_explicit_layer_pager.py", "--backend", "cuda", "--layers", "4", "--batch-size", "1", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"case": "batch1", "batch_size": 1, "tile_mib": 64, "slots": 2}},
+      "model": {"id": "synthetic-read-only-four-layer", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1102",
+      "name": "CUDA explicit pager throughput batch=4",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_explicit_layer_pager.py", "--backend", "cuda", "--layers", "4", "--batch-size", "4", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"case": "throughput-batch4", "batch_size": 4, "tile_mib": 64, "slots": 2}},
+      "model": {"id": "synthetic-read-only-four-layer", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1103",
+      "name": "CUDA explicit pager cancellation and reclaim",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_explicit_layer_pager.py", "--backend", "cuda", "--layers", "4", "--batch-size", "1", "--cancel-after", "2", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"case": "cancel", "batch_size": 1, "cancel_after": 2, "tile_mib": 64, "slots": 2}},
+      "model": {"id": "synthetic-read-only-four-layer", "quant_family": null},
+      "gate": {"metric": "cancelled", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1104",
+      "name": "CPU resident equality control",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_explicit_layer_pager.py", "--backend", "cpu", "--layers", "4", "--batch-size", "4", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"case": "cpu-control", "batch_size": 4, "tile_mib": 64, "slots": 2}},
+      "model": {"id": "synthetic-read-only-four-layer", "quant_family": null},
+      "gate": {"metric": "output_equal", "op": "==", "threshold": 1}
+    }
+  ]
+}

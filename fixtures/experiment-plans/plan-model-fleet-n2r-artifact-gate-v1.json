@@ -1,0 +1,49 @@
+{
+  "plan_id": "plan-model-fleet-n2r-artifact-gate-v1",
+  "title": "MF-MEM-N2R 真实 7B INT8/NF4 工件资源门",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11 WDDM",
+    "engine": "artifact admission gate only; no model weights loaded",
+    "target_family": "deepseek-r1-distill-qwen-7b",
+    "target_quantizations": ["int8", "nf4"]
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 120,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "none",
+      "model_slot": "artifact-gate"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-1201",
+      "name": "7B INT8/NF4 target artifact availability",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_artifact_gate.py", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"check": "target_artifact_available", "target_family": "deepseek-r1-distill-qwen-7b"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "int8|nf4"},
+      "gate": {"metric": "target_artifact_available", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1202",
+      "name": "7B Safetensors weight file presence",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_artifact_gate.py", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"check": "target_weight_files_present", "target_family": "deepseek-r1-distill-qwen-7b"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "int8|nf4"},
+      "gate": {"metric": "target_weight_files_present", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1203",
+      "name": "smaller quantized candidate is not a 7B substitute",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_artifact_gate.py", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"check": "candidate_target_match", "candidate": "qwen-1.8b-int8|nf4", "target_family": "deepseek-r1-distill-qwen-7b"}},
+      "model": {"id": "qwen-1_8b-chat", "quant_family": "int8|nf4"},
+      "gate": {"metric": "candidate_target_match", "op": "==", "threshold": 0}
+    }
+  ]
+}

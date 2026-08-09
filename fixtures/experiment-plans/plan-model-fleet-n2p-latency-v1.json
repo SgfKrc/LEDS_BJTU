@@ -1,0 +1,55 @@
+{
+  "plan_id": "plan-model-fleet-n2p-latency-v1",
+  "title": "MF-MEM-N2P 真实 7B 预取距离与延迟决策",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11 WDDM",
+    "engine": "isolated Transformers + bitsandbytes NF4 + explicit module hook",
+    "artifact": "models/deepseek-r1-distill-qwen-7b",
+    "weight_bytes": 15231233024,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop 8GB",
+    "ram_gb": 16,
+    "fixed_tile_mib": 64,
+    "tile_slots": 2,
+    "latency_samples": 8,
+    "scope_note": "Host staging overlap is measured separately from CUDA H2D stream overlap; no UVM or production runtime claim."
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 900,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "gpu0",
+      "model_slot": "deepseek-7b-n2p"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-1231",
+      "name": "resident NF4 latency baseline ctx128 output8",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--ticket", "MF-MEM-N2P", "--mode", "resident-nf4", "--context", "128", "--batch-size", "1", "--max-new-tokens", "8", "--measure-latency", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "resident-nf4", "context": 128, "batch_size": 1, "max_new_tokens": 8, "prefetch_distance": 0}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1232",
+      "name": "explicit pager serial latency ctx128 output8",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--ticket", "MF-MEM-N2P", "--mode", "explicit-layer-pager-64", "--context", "128", "--batch-size", "1", "--max-new-tokens", "8", "--prefetch-distance", "0", "--measure-latency", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "explicit-layer-pager-64", "context": 128, "batch_size": 1, "max_new_tokens": 8, "prefetch_distance": 0, "fixed_tile_mib": 64, "tile_slots": 2}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1233",
+      "name": "explicit pager host prefetch distance1 ctx128 output8",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--ticket", "MF-MEM-N2P", "--mode", "explicit-layer-pager-64", "--context", "128", "--batch-size", "1", "--max-new-tokens", "8", "--prefetch-distance", "1", "--measure-latency", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "explicit-layer-pager-64", "context": 128, "batch_size": 1, "max_new_tokens": 8, "prefetch_distance": 1, "fixed_tile_mib": 64, "tile_slots": 2}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    }
+  ]
+}
