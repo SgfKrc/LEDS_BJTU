@@ -17,8 +17,8 @@
  * 降级说明（已记录计划文档）：role/provider 状态依赖 scheduler 与执行段——
  * role 恒 'master'、providers 空、worker_protocol 空对象；cancel 的真实跨
  * 进程取消需经 control-svc → inference-svc 消息中转（执行段不在本进程），
- * 此处仅更新本地 journal 的 cancel_requested 标记；journal 为 JSON 降级
- * （SQLite 真实数据读取待清理阶段桥接）。
+ * 此处仅更新本地 journal 的 cancel_requested 标记；journal 默认写入主节点 SQLite，
+ * 旧 JSON 仅作为启动兼容输入。
  */
 import {
   Body,
@@ -151,7 +151,7 @@ export class WorkflowsController {
     };
   }
 
-  /** 对齐 _public_task_journal：剔除 path（JSON 降级无此字段，原样返回） */
+  /** 对齐 _public_task_journal：剔除内部 path 字段。 */
   private publicJournal(status: Record<string, unknown>): Record<string, unknown> {
     const { path: _path, ...rest } = status;
     return rest;

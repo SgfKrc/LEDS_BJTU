@@ -1,121 +1,84 @@
-/**
- * M1 storage/health 契约测试（本地/远端双健康，§12.3）。
- * /db/health 三态契约保持不变（阶段 3.2）；本端点提供新结构。
- */
+/** M1.3 storage health contract: local SQLite plus retirement state. */
 import { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { AppModule } from '../src/app';
-import { ConfigDao } from '../src/data/config-dao';
-import { SqliteStore } from '../src/data/sqlite-store';
 import { OutboxService } from '../src/data/outbox.service';
+import { SqliteStore } from '../src/data/sqlite-store';
 
-class FakeConfigDao {
-  enabled = false;
-  pingOk = false;
-  dbEnabled() { return this.enabled; }
-  getConnectionInfo() { return { host: '127.0.0.1', port: 5432, db: 'qlh' }; }
-  async ping() {
-    return this.pingOk ? { ok: true } : { ok: false, error: 'fake down' };
-  }
-}
-
-describe('storage/health 契约（M1 双健康）', () => {
+describe('storage/health local-only contract', () => {
   let app: NestFastifyApplication | null = null;
+  let store: SqliteStore;
   let tmpBase: string;
-  let configDao: FakeConfigDao;
 
   beforeEach(() => {
     tmpBase = mkdtempSync(join(tmpdir(), 'control-m1-'));
-    configDao = new FakeConfigDao();
-    process.env.QLH_SQLITE_PATH = join(tmpBase, 'qlh-control.sqlite3');
+    store = new SqliteStore(join(tmpBase, 'qlh-control.sqlite3'));
+    store.open();
   });
 
   afterEach(async () => {
-    if (app) {
-      // 先关 SQLite（WAL 句柄占用会阻止 Windows 删除临时目录）
-      try {
-        app.get(SqliteStore).close();
-      } catch {
-        // 未实例化则跳过
-      }
-      await app.close();
-      app = null;
-    }
-    delete process.env.QLH_SQLITE_PATH;
+    if (app) await app.close();
+    store.close();
     rmSync(tmpBase, { recursive: true, force: true });
   });
 
   async function createTestApp(): Promise<NestFastifyApplication> {
-    const moduleRef = await Test.createTestingModule({
-      imports: [AppModule],
-    })
-      .overrideProvider(ConfigDao)
-      .useValue(configDao)
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(SqliteStore)
+      .useValue(store)
       .compile();
     const fastify = new (require('@nestjs/platform-fastify').FastifyAdapter)();
-    const testApp = moduleRef.createNestApplication(fastify) as unknown as NestFastifyApplication;
-    const { JsonDetailFilter } = require('../src/common/json-detail.filter');
-    const { RequestIdInterceptor } = require('../src/common/request-id');
-    testApp.useGlobalFilters(new JsonDetailFilter());
-    testApp.useGlobalInterceptors(new RequestIdInterceptor());
+    const testApp = moduleRef.createNestApplication(fastify) as NestFastifyApplication;
     await testApp.init();
     await testApp.getHttpAdapter().getInstance().ready();
     return testApp;
   }
 
-  it('GET /storage/health → local_only 结构（远端未配置）', async () => {
+  it('reports local-only storage without probing a remote database', async () => {
     app = await createTestApp();
-    configDao.enabled = false;
     const res = await app.inject({ method: 'GET', url: '/storage/health' });
     expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.local).toEqual({
-      status: 'ok',
-      backend: 'sqlite',
-      writable: true,
-      path: join(tmpBase, 'qlh-control.sqlite3'),
-      schema_version: 2,
+    expect(res.json()).toEqual({
+      local: {
+        status: 'ok', backend: 'sqlite', writable: true,
+        path: store.filePath, schema_version: 7,
+      },
+      remote: {
+        status: 'disabled', backend: 'postgresql', mode: 'legacy_cleanup_pending',
+      },
+      projection: { pending_events: 0, oldest_event_age_seconds: null },
+      export: { pending_items: 0, oldest_item_age_seconds: null },
+      effective_mode: 'local_only',
+      retirement: { status: 'not_prepared', prepared_at: null, retired_at: null },
     });
-    expect(body.remote).toEqual({ status: 'not_configured', backend: 'postgresql' });
-    expect(body.projection.pending_events).toBe(0);
-    expect(body.effective_mode).toBe('local_only');
   });
 
-  it('GET /storage/health → local_primary（远端 ok 且无积压）', async () => {
-    app = await createTestApp();
-    configDao.enabled = true;
-    configDao.pingOk = true;
-    const res = await app.inject({ method: 'GET', url: '/storage/health' });
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body.remote.status).toBe('ok');
-    expect(body.effective_mode).toBe('local_primary');
-  });
-
-  it('GET /storage/health → local_primary_pending（outbox 有积压）', async () => {
-    app = await createTestApp();
-    configDao.enabled = true;
-    configDao.pingOk = true;
-    // 直接向同一 SQLite 实例入队一条事件
-    const store = app.get(SqliteStore);
+  it('shows legacy outbox rows for cleanup diagnostics only', async () => {
     new OutboxService(store).enqueue('model_registry', 'created', {});
-    const res = await app.inject({ method: 'GET', url: '/storage/health' });
-    expect(res.statusCode).toBe(200);
-    const body = res.json();
+    app = await createTestApp();
+    const body = (await app.inject({ method: 'GET', url: '/storage/health' })).json();
     expect(body.projection.pending_events).toBe(1);
-    expect(body.effective_mode).toBe('local_primary_pending');
+    expect(body.effective_mode).toBe('local_only');
+    expect(body.remote.status).toBe('disabled');
   });
 
-  it('GET /storage/health → local_only（远端配置但不可达）', async () => {
+  it('reports retired after the one-time cleanup removed outbox', async () => {
+    store.exec('DROP INDEX IF EXISTS idx_outbox_pending; DROP TABLE outbox;');
+    store.prepare(
+      `INSERT INTO storage_retirement
+         (retirement_id, status, manifest_version, backup_sha256, manifest_sha256,
+          prepared_at, retired_at, removed_outbox_events, details)
+       VALUES (1, 'retired', 1, ?, ?, ?, ?, 0, '{}')`,
+    ).run('a'.repeat(64), 'b'.repeat(64), '2026-08-09T00:00:00Z', '2026-08-09T00:01:00Z');
     app = await createTestApp();
-    configDao.enabled = true;
-    configDao.pingOk = false;
-    const res = await app.inject({ method: 'GET', url: '/storage/health' });
-    const body = res.json();
-    expect(body.remote.status).toBe('unavailable');
-    expect(body.effective_mode).toBe('local_only');
+    const body = (await app.inject({ method: 'GET', url: '/storage/health' })).json();
+    expect(body.remote).toEqual({
+      status: 'retired', backend: 'postgresql', mode: 'retired',
+    });
+    expect(body.retirement.status).toBe('retired');
+    expect(body.projection.pending_events).toBe(0);
   });
 });

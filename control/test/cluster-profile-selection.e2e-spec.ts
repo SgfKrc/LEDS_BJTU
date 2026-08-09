@@ -86,6 +86,17 @@ describe('MODEL-FLEET profile selection and discovery (MF-N5)', () => {
       expect(created.json().profile.master_endpoint).toEqual({
         scheme: 'http', host: '100.64.0.1', port: 8000,
       });
+      const ipv6 = await app.inject({
+        method: 'POST', url: '/cluster/profiles',
+        payload: {
+          cluster_id: 'cluster-v6', name: 'V6',
+          master_endpoint: 'http://[fd7a:115c:a1e0::1]:8000',
+        },
+      });
+      expect(ipv6.statusCode).toBe(201);
+      expect(ipv6.json().profile.master_endpoint).toEqual({
+        scheme: 'http', host: 'fd7a:115c:a1e0::1', port: 8000,
+      });
       const second = await app.inject({
         method: 'POST', url: '/cluster/profiles',
         payload: {

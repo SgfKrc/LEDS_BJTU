@@ -2,11 +2,11 @@
  * M1 本地事务数据库测试：SQLite 迁移/WAL/backup/health、outbox、
  * storage-health 双健康、postgres projector 退避与幂等。
  */
-import { mkdtempSync, existsSync } from 'fs';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { DatabaseSync } from 'node:sqlite';
-import { MIGRATIONS, SqliteStore } from '../src/data/sqlite-store';
+import { MIGRATIONS, resolveSqlitePath, SqliteStore } from '../src/data/sqlite-store';
 import { OutboxService } from '../src/data/outbox.service';
 import { StorageHealthService } from '../src/data/storage-health';
 import { PostgresProjector } from '../src/data/postgres-projector';
@@ -30,10 +30,52 @@ class FakeConfigDao {
 }
 
 describe('SqliteStore (M1)', () => {
-  it('opens with WAL and migrates to schema v2', () => {
+  it('uses the shared state directory by default', () => {
+    const previousCwd = process.cwd();
+    const previousPath = process.env.QLH_SQLITE_PATH;
+    const previousStateDir = process.env.QLH_STATE_DIR;
+    const cwd = mkdtempSync(join(tmpdir(), 'qlh-empty-cwd-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'qlh-state-path-'));
+    try {
+      process.chdir(cwd);
+      delete process.env.QLH_SQLITE_PATH;
+      process.env.QLH_STATE_DIR = stateDir;
+      expect(resolveSqlitePath()).toBe(join(stateDir, 'qlh-control.sqlite3'));
+    } finally {
+      process.chdir(previousCwd);
+      if (previousPath === undefined) delete process.env.QLH_SQLITE_PATH;
+      else process.env.QLH_SQLITE_PATH = previousPath;
+      if (previousStateDir === undefined) delete process.env.QLH_STATE_DIR;
+      else process.env.QLH_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it('keeps using an existing cwd database until it is moved', () => {
+    const previousCwd = process.cwd();
+    const previousPath = process.env.QLH_SQLITE_PATH;
+    const previousStateDir = process.env.QLH_STATE_DIR;
+    const cwd = mkdtempSync(join(tmpdir(), 'qlh-legacy-cwd-'));
+    const stateDir = mkdtempSync(join(tmpdir(), 'qlh-new-state-'));
+    const legacyPath = join(cwd, 'qlh-control.sqlite3');
+    writeFileSync(legacyPath, '');
+    try {
+      process.chdir(cwd);
+      delete process.env.QLH_SQLITE_PATH;
+      process.env.QLH_STATE_DIR = stateDir;
+      expect(resolveSqlitePath()).toBe(legacyPath);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousPath === undefined) delete process.env.QLH_SQLITE_PATH;
+      else process.env.QLH_SQLITE_PATH = previousPath;
+      if (previousStateDir === undefined) delete process.env.QLH_STATE_DIR;
+      else process.env.QLH_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it('opens with WAL and migrates to schema v7', () => {
     const store = tempStore();
     store.open();
-    expect(store.schemaVersion).toBe(2);
+    expect(store.schemaVersion).toBe(7);
     const db = new DatabaseSync(store.filePath);
     const mode = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
     db.close();
@@ -44,11 +86,11 @@ describe('SqliteStore (M1)', () => {
   it('reopen is idempotent and does not re-run migrations', () => {
     const store = tempStore();
     store.open();
-    expect(store.schemaVersion).toBe(2);
+    expect(store.schemaVersion).toBe(7);
     store.close();
     // 重新打开：迁移器跳过已应用版本
     store.open();
-    expect(store.schemaVersion).toBe(2);
+    expect(store.schemaVersion).toBe(7);
     store.close();
     store.open();
     store.close();
@@ -61,11 +103,11 @@ describe('SqliteStore (M1)', () => {
     expect(health.status).toBe('ok');
     expect(health.backend).toBe('sqlite');
     expect(health.writable).toBe(true);
-    expect(health.schema_version).toBe(2);
+    expect(health.schema_version).toBe(7);
     store.close();
   });
 
-  it('upgrades an existing v1 database to v2 without losing data', () => {
+  it('upgrades an existing v1 database to v6 without losing data', () => {
     const dir = mkdtempSync(join(tmpdir(), 'qlh-m1-upgrade-'));
     const dbPath = join(dir, 'control.sqlite3');
     const legacy = new DatabaseSync(dbPath);
@@ -78,7 +120,7 @@ describe('SqliteStore (M1)', () => {
 
     const store = new SqliteStore(dbPath);
     store.open();
-    expect(store.schemaVersion).toBe(2);
+    expect(store.schemaVersion).toBe(7);
     const preserved = store.prepare(
       'SELECT value FROM cluster_settings WHERE key = ?',
     ).get('preserved') as { value: string };
@@ -100,6 +142,32 @@ describe('SqliteStore (M1)', () => {
     const row = backup.prepare('SELECT COUNT(*) AS c FROM outbox').get() as { c: number };
     backup.close();
     expect(row.c).toBe(0);
+    store.close();
+  });
+
+  it('exports, verifies, and restores a user-owned encrypted backup', async () => {
+    const store = tempStore();
+    store.open();
+    store.prepare(
+      'INSERT INTO cluster_settings(key, value, updated_at) VALUES (?, ?, ?)',
+    ).run('user_settings', JSON.stringify({ theme: 'dark' }), new Date().toISOString());
+    const backupPath = join(store.filePath, '..', 'user-owned.qlhbackup');
+    const passphrase = 'correct horse battery staple';
+    const exported = await store.exportEncryptedBackup(backupPath, passphrase);
+    expect(exported.schema_version).toBe(7);
+    expect(readFileSync(backupPath).toString('utf8')).not.toContain('user_settings');
+    const verified = store.verifyEncryptedBackup(backupPath, passphrase);
+    expect(verified.ciphertext_bytes).toBeGreaterThan(0);
+    expect(() => store.verifyEncryptedBackup(backupPath, 'wrong passphrase')).toThrow(
+      '口令错误或内容已损坏',
+    );
+    store.prepare('DELETE FROM cluster_settings WHERE key = ?').run('user_settings');
+    const restored = store.restoreEncryptedBackup(backupPath, passphrase);
+    expect(restored.previous_path).toBeTruthy();
+    const setting = store.prepare(
+      'SELECT value FROM cluster_settings WHERE key = ?',
+    ).get('user_settings') as { value: string };
+    expect(JSON.parse(setting.value)).toEqual({ theme: 'dark' });
     store.close();
   });
 
@@ -160,56 +228,61 @@ describe('StorageHealthService (M1)', () => {
   it('local_only when remote not configured', async () => {
     const store = tempStore();
     store.open();
-    const config = new FakeConfigDao();
-    config.enabled = false;
-    const health = await new StorageHealthService(store, config as any, new OutboxService(store)).snapshot();
+    const health = await new StorageHealthService(store).snapshot();
     expect(health.local.status).toBe('ok');
-    expect(health.remote.status).toBe('not_configured');
+    expect(health.remote).toEqual({
+      status: 'disabled',
+      backend: 'postgresql',
+      mode: 'legacy_cleanup_pending',
+    });
     expect(health.effective_mode).toBe('local_only');
     expect(health.projection.pending_events).toBe(0);
+    expect(health.export.pending_items).toBe(0);
     store.close();
   });
 
-  it('local_primary when remote ok and no backlog', async () => {
+  it('stays local_only when legacy environment could have enabled remote access', async () => {
     const store = tempStore();
     store.open();
-    const config = new FakeConfigDao();
-    config.enabled = true;
-    config.pingOk = true;
-    const health = await new StorageHealthService(store, config as any, new OutboxService(store)).snapshot();
-    expect(health.remote.status).toBe('ok');
-    expect(health.effective_mode).toBe('local_primary');
+    const health = await new StorageHealthService(store).snapshot();
+    expect(health.remote.status).toBe('disabled');
+    expect(health.effective_mode).toBe('local_only');
     store.close();
   });
 
-  it('local_primary_pending when outbox has backlog', async () => {
+  it('reports a legacy outbox backlog without changing local-only mode', async () => {
     const store = tempStore();
     store.open();
     const outbox = new OutboxService(store);
     outbox.enqueue('model_registry', 'created', {});
-    const config = new FakeConfigDao();
-    config.enabled = true;
-    config.pingOk = true;
-    const health = await new StorageHealthService(store, config as any, outbox).snapshot();
+    const health = await new StorageHealthService(store).snapshot();
     expect(health.projection.pending_events).toBe(1);
-    expect(health.effective_mode).toBe('local_primary_pending');
+    expect(health.effective_mode).toBe('local_only');
     store.close();
   });
 
-  it('unavailable remote keeps local primary semantics', async () => {
+  it('does not probe an unavailable remote', async () => {
     const store = tempStore();
     store.open();
-    const config = new FakeConfigDao();
-    config.enabled = true;
-    config.pingOk = false;
-    const health = await new StorageHealthService(store, config as any, new OutboxService(store)).snapshot();
-    expect(health.remote.status).toBe('unavailable');
+    const health = await new StorageHealthService(store).snapshot();
+    expect(health.remote.status).toBe('disabled');
     expect(health.effective_mode).toBe('local_only');
     store.close();
   });
 });
 
 describe('PostgresProjector (M1)', () => {
+  it('local_only 不启动后台远端轮询器', () => {
+    const store = tempStore();
+    store.open();
+    const config = new FakeConfigDao();
+    const projector = new PostgresProjector(config as any, new OutboxService(store));
+    projector.start();
+    expect(projector.isRunning).toBe(false);
+    projector.stop();
+    store.close();
+  });
+
   it('skips cleanly when postgres not configured', async () => {
     const store = tempStore();
     store.open();

@@ -1,15 +1,15 @@
 /**
  * 控制面配置 DAO（cluster_config 表，语义对齐 src/db.py get_config/set_config）
  *
- * 降级语义（对齐 db.py）：
- *  - PostgreSQL 不可用（QLH_DB_ENABLED != 1 或连接失败）→ settings 返回
- *    {settings:{}, source:'none'}，写入返回 {status:'skipped'}。
- *  - 连接失败后每次请求重新探测（不缓存失败状态），对齐 db.py 行为。
+ * 存储边界（M1.2）：
+ *  - 主节点 SQLite 是默认事实源；PostgreSQL 只有显式开启兼容出口时才可用。
+ *  - 连接失败后每次请求重新探测（不缓存失败状态），兼容旧投影路径。
  *
- * 环境变量（与 db.py 一致）：QLH_DB_HOST/PORT/NAME/USER/PASSWORD/ENABLED/SSLMODE。
+ * 环境变量：QLH_DB_HOST/PORT/NAME/USER/PASSWORD/ENABLED/SSLMODE。
+ * `QLH_DB_ENABLED` 默认为关闭；设为 1/true 只表示用户主动启用旧远端兼容出口。
  */
 import { Injectable, Optional } from '@nestjs/common';
-import { Client } from 'pg';
+import type { Client as PgClient } from 'pg';
 
 export interface DbConfig {
   host: string;
@@ -23,10 +23,9 @@ export interface DbConfig {
 
 export function loadDbConfig(env: NodeJS.ProcessEnv = process.env): DbConfig {
   const rawEnabled = env.QLH_DB_ENABLED;
-  // 对齐 db.py：未设置 QLH_DB_ENABLED 时默认启用（0/false 才禁用）
-  const enabled =
-    rawEnabled === undefined ||
-    !['0', 'false', 'no'].includes(rawEnabled.trim().toLowerCase());
+  // M1.2：未设置时必须 local_only，避免干净安装隐式连接 PostgreSQL。
+  const enabled = rawEnabled !== undefined
+    && ['1', 'true', 'yes'].includes(rawEnabled.trim().toLowerCase());
   return {
     host: env.QLH_DB_HOST || 'localhost',
     port: Number(env.QLH_DB_PORT || 5432),
@@ -46,7 +45,8 @@ export class ConfigDao {
     this.cfg = cfg ?? loadDbConfig();
   }
 
-  private async connect(): Promise<Client> {
+  private async connect(): Promise<PgClient> {
+    const { Client } = await import('pg');
     const client = new Client({
       host: this.cfg.host,
       port: this.cfg.port,
@@ -69,6 +69,11 @@ export class ConfigDao {
     return this.cfg.enabled;
   }
 
+  /** 主节点是否处于默认 local_only 模式。 */
+  isLocalOnly(): boolean {
+    return !this.cfg.enabled;
+  }
+
   /** 连接信息（对齐 db_health 的 host/port/db 输出） */
   getConnectionInfo(): { host: string; port: number; db: string } {
     return { host: this.cfg.host, port: this.cfg.port, db: this.cfg.name };
@@ -76,7 +81,7 @@ export class ConfigDao {
 
   /** 探测连接（对齐 db.py db_health 的 SELECT 1）；失败返回错误消息 */
   async ping(): Promise<{ ok: boolean; error?: string }> {
-    let client: Client | null = null;
+    let client: PgClient | null = null;
     try {
       client = await this.connect();
       await client.query('SELECT 1');
@@ -91,7 +96,7 @@ export class ConfigDao {
   /** 读配置项（对齐 db.py get_config：无记录返回默认值） */
   async getConfig(key: string, def = ''): Promise<string> {
     if (!this.isDbUsable()) return def;
-    let client: Client | null = null;
+    let client: PgClient | null = null;
     try {
       client = await this.connect();
       const r = await client.query('SELECT value FROM cluster_config WHERE key = $1', [
@@ -108,7 +113,7 @@ export class ConfigDao {
   /** 写配置项（对齐 db.py set_config：upsert + updated_at） */
   async setConfig(key: string, value: string): Promise<boolean> {
     if (!this.isDbUsable()) return false;
-    let client: Client | null = null;
+    let client: PgClient | null = null;
     try {
       client = await this.connect();
       await client.query(

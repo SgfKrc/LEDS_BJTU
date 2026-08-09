@@ -1,9 +1,9 @@
 /**
  * 会话/对话管理控制器 — 阶段 3.2 首迁域（语义对齐 api_server.py:6245-6662）
  *
- * 迁移范围：local_store JSON 降级路径全量迁移（含旧数据兼容硬验收）；
- * DB 分支（db.py 会话表）未迁移——control-svc 尚无会话表实现，
- * dbEnabled() 仅用于 sync-status 的 db_connected 字段与 settings 域一致。
+ * 迁移范围：主节点 SQLite 会话/消息表；旧 local_store JSON 首次启动只读导入，
+ * 显式注入目录时保留兼容测试/回滚路径。远端数据库已退出生产运行时，
+ * sync-status 保留 db_connected 字段并固定为 false 以兼容旧客户端。
  * source 恒为 "local_store"（TS 无 session_histories 内存态，
  * memory_fallback 分支折叠为本地文件空结果，行为等价：均返回空消息）。
  *
@@ -22,7 +22,6 @@ import {
   Put,
   Query,
 } from '@nestjs/common';
-import { ConfigDao } from '../../data/config-dao';
 import { ChatMessage, isValidSessionId, SessionMeta, SessionStore } from '../../data/session-store';
 
 interface CreateSessionRequest {
@@ -36,19 +35,15 @@ interface RenameSessionRequest {
 
 @Controller()
 export class SessionsController {
-  constructor(
-    private readonly store: SessionStore,
-    private readonly dao: ConfigDao,
-  ) {}
+  constructor(private readonly store: SessionStore) {}
 
   // ---------- 对话云同步状态（对齐 api_server.py:6245-6264） ----------
 
   @Get('conversations/sync-status')
   syncStatus(): Record<string, unknown> {
-    const dbConnected = this.dao.dbEnabled();
     return {
-      save_history: false, // DB 会话表未迁移，恒 false
-      db_connected: dbConnected,
+      save_history: true, // 主节点 SQLite 已承载会话历史
+      db_connected: false,
       local_save_enabled: true, // localStorage 始终可用
       local_store_enabled: true, // 本地文件降级始终可用
       cloud_sync_enabled: false,

@@ -49,24 +49,37 @@ export class ClusterEndpointsRepository {
     ).all() as unknown as ClusterEndpointRow[];
   }
 
-  /** 幂等 upsert；cluster_id UNIQUE——同 cluster_id 更新 endpoint（不重复建群）。 */
+  /**
+   * 幂等 upsert；新库对 cluster_id 建 UNIQUE，旧 v2 文件可能没有该索引，
+   * 因此先查再更新/插入，避免恢复旧主节点时 `ON CONFLICT` 失配。
+   */
   upsert(entry: ClusterEndpointInput): ClusterEndpointRow {
     const now = new Date().toISOString();
-    this.store.prepare(
-      `INSERT INTO cluster_endpoints
-         (endpoint_id, cluster_id, name, scheme, host, port, status,
-          last_verified_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(cluster_id) DO UPDATE SET
-         endpoint_id = excluded.endpoint_id,
-         name = excluded.name, scheme = excluded.scheme,
-         host = excluded.host, port = excluded.port,
-         status = excluded.status, last_verified_at = excluded.last_verified_at`,
-    ).run(
-      entry.endpoint_id, entry.cluster_id, entry.name,
-      entry.scheme, entry.host, entry.port, entry.status,
-      entry.last_verified_at ?? null, now,
-    );
+    const existing = this.store.prepare(
+      'SELECT endpoint_id FROM cluster_endpoints WHERE cluster_id = ?',
+    ).get(entry.cluster_id) as { endpoint_id: string } | undefined;
+    if (existing) {
+      this.store.prepare(
+        `UPDATE cluster_endpoints SET
+           endpoint_id = ?, name = ?, scheme = ?, host = ?, port = ?,
+           status = ?, last_verified_at = ?
+         WHERE cluster_id = ?`,
+      ).run(
+        entry.endpoint_id, entry.name, entry.scheme, entry.host, entry.port,
+        entry.status, entry.last_verified_at ?? null, entry.cluster_id,
+      );
+    } else {
+      this.store.prepare(
+        `INSERT INTO cluster_endpoints
+           (endpoint_id, cluster_id, name, scheme, host, port, status,
+            last_verified_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        entry.endpoint_id, entry.cluster_id, entry.name,
+        entry.scheme, entry.host, entry.port, entry.status,
+        entry.last_verified_at ?? null, now,
+      );
+    }
     return {
       endpoint_id: entry.endpoint_id,
       cluster_id: entry.cluster_id,

@@ -1,18 +1,17 @@
 /**
- * 审查工单持久化 — 对齐 src/review.py ReviewTicket 数据结构
+ * 审查工单持久化 — 默认使用主节点 SQLite，对齐 src/review.py 数据结构
  * (微服务架构改造计划 阶段 3.2 review 域)
  *
- * 存储：JSON 文件（对齐计划 §3.2 "DB 不可用回落本地 JSON 存储" 的降级语义；
- * Python 侧 PostgreSQL 分支未迁移——并行共存期间票数据仍在旧后端，
- * control-svc 从零独立积累；清理阶段切换时再处理数据迁移）。
+ * 显式传入文件时保留 JSON 兼容模式；默认运行路径不依赖远端 PostgreSQL。
  *
  * 时间戳均为 epoch 秒（float，对齐 Python time.time()）。
  * 并发：Node 单线程 + 原子写（tmp + rename），对齐 Python 端
  * cast_vote 的"3 次重试防并发读改写"效果（TS 天然串行）。
  */
-import { Injectable, Optional } from '@nestjs/common';
+import { Inject, Injectable, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
+import { SqliteStore } from './sqlite-store';
 
 export type TicketStatus = 'pending' | 'approved' | 'rejected' | 'expired';
 
@@ -70,13 +69,75 @@ export function resolveReviewFile(env: NodeJS.ProcessEnv = process.env): string 
 @Injectable()
 export class ReviewStore {
   private readonly file: string;
+  private readonly sqlite: SqliteStore | null;
+  private legacyImportChecked = false;
 
-  constructor(@Optional() file?: string) {
-    this.file = file ?? resolveReviewFile();
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+  constructor(@Optional() @Inject(SqliteStore) storeOrFile?: SqliteStore | string) {
+    if (typeof storeOrFile === 'string') {
+      this.sqlite = null;
+      this.file = storeOrFile;
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    } else {
+      this.sqlite = storeOrFile ?? new SqliteStore();
+      this.file = '';
+    }
+  }
+
+  private useSqlite(): SqliteStore | null {
+    if (!this.sqlite) return null;
+    this.sqlite.open();
+    this.importLegacyJsonOnce();
+    return this.sqlite;
+  }
+
+  private importLegacyJsonOnce(): void {
+    if (!this.sqlite || this.legacyImportChecked) return;
+    this.legacyImportChecked = true;
+    const marker = '__legacy_json_review_v1__';
+    const marked = this.sqlite.prepare(
+      'SELECT value FROM cluster_settings WHERE key = ?',
+    ).get(marker) as { value: string } | undefined;
+    if (marked) return;
+    const legacyFile = resolveReviewFile();
+    try {
+      const raw = fs.readFileSync(legacyFile, 'utf-8');
+      const parsed = JSON.parse(raw);
+      const tickets = Array.isArray(parsed) ? parsed.map((d) => this.normalize(d)) : [];
+      this.sqlite.transaction(() => {
+        for (const ticket of tickets) {
+          if (!ticket.ticket_id) continue;
+          this.sqlite!.prepare(
+            `INSERT INTO review_tickets (ticket_id, status, created_at, payload)
+             VALUES (?, ?, ?, ?) ON CONFLICT(ticket_id) DO NOTHING`,
+          ).run(ticket.ticket_id, ticket.status, ticket.created_at, JSON.stringify(ticket));
+        }
+        this.sqlite!.prepare(
+          `INSERT INTO cluster_settings (key, value, updated_at)
+           VALUES (?, '1', ?) ON CONFLICT(key) DO NOTHING`,
+        ).run(marker, new Date().toISOString());
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') {
+        console.warn(`[control-svc] review JSON 兼容导入失败，保留 SQLite 空域: ${String(err)}`);
+      }
+      this.sqlite.prepare(
+        `INSERT INTO cluster_settings (key, value, updated_at)
+         VALUES (?, '1', ?) ON CONFLICT(key) DO NOTHING`,
+      ).run(marker, new Date().toISOString());
+    }
+  }
+
+  private sqliteTickets(sqlite: SqliteStore): ReviewTicket[] {
+    const rows = sqlite.prepare(
+      'SELECT payload FROM review_tickets ORDER BY created_at DESC',
+    ).all() as Array<{ payload: string }>;
+    return rows.map((row) => this.normalize(JSON.parse(row.payload)));
   }
 
   loadAll(): ReviewTicket[] {
+    const sqlite = this.useSqlite();
+    if (sqlite) return this.sqliteTickets(sqlite);
     try {
       const raw = fs.readFileSync(this.file, 'utf-8');
       const parsed = JSON.parse(raw);
@@ -95,6 +156,19 @@ export class ReviewStore {
   }
 
   saveAll(tickets: ReviewTicket[]): void {
+    const sqlite = this.useSqlite();
+    if (sqlite) {
+      sqlite.transaction(() => {
+        sqlite.prepare('DELETE FROM review_tickets').run();
+        for (const ticket of tickets) {
+          sqlite.prepare(
+            `INSERT INTO review_tickets (ticket_id, status, created_at, payload)
+             VALUES (?, ?, ?, ?)`,
+          ).run(ticket.ticket_id, ticket.status, ticket.created_at, JSON.stringify(ticket));
+        }
+      });
+      return;
+    }
     const tmp = `${this.file}.tmp`;
     try {
       fs.writeFileSync(tmp, JSON.stringify(tickets, null, 2), 'utf-8');
@@ -110,10 +184,27 @@ export class ReviewStore {
   }
 
   get(ticketId: string): ReviewTicket | null {
+    const sqlite = this.useSqlite();
+    if (sqlite) {
+      const row = sqlite.prepare(
+        'SELECT payload FROM review_tickets WHERE ticket_id = ?',
+      ).get(ticketId) as { payload: string } | undefined;
+      return row ? this.normalize(JSON.parse(row.payload)) : null;
+    }
     return this.loadAll().find((t) => t.ticket_id === ticketId) ?? null;
   }
 
   upsert(ticket: ReviewTicket): void {
+    const sqlite = this.useSqlite();
+    if (sqlite) {
+      sqlite.prepare(
+        `INSERT INTO review_tickets (ticket_id, status, created_at, payload)
+         VALUES (?, ?, ?, ?) ON CONFLICT(ticket_id) DO UPDATE SET
+           status = excluded.status, created_at = excluded.created_at,
+           payload = excluded.payload`,
+      ).run(ticket.ticket_id, ticket.status, ticket.created_at, JSON.stringify(ticket));
+      return;
+    }
     const tickets = this.loadAll();
     const idx = tickets.findIndex((t) => t.ticket_id === ticket.ticket_id);
     if (idx >= 0) tickets[idx] = ticket;
@@ -122,6 +213,11 @@ export class ReviewStore {
   }
 
   delete(ticketId: string): boolean {
+    const sqlite = this.useSqlite();
+    if (sqlite) {
+      const result = sqlite.prepare('DELETE FROM review_tickets WHERE ticket_id = ?').run(ticketId);
+      return Number(result.changes) > 0;
+    }
     const tickets = this.loadAll();
     const kept = tickets.filter((t) => t.ticket_id !== ticketId);
     if (kept.length === tickets.length) return false;
