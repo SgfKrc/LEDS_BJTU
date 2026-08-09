@@ -18,6 +18,8 @@ SMTP.md
 .vscode/
 .idea/
 .claude/
+.reasonix/
+.codex/
 
 # Local-only documentation
 local_docs/
