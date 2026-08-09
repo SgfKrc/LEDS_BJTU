@@ -3,11 +3,16 @@
  * (对齐 src/bootstrap.py:21-72)
  *
  * 信任源（QLH_TRUSTED_BOOTSTRAP_CIDRS 覆盖，默认对齐 DEFAULT_TRUSTED_CIDRS）：
- *   100.64.0.0/10, 127.0.0.0/8, ::1/128
+ *   100.64.0.0/10, 127.0.0.0/8, ::1/128, fd7a:115c:a1e0::/48
  * 仅 IP 字面量参与匹配；hostname 一律不信任（对齐 ipaddress 语义）。
  */
 
-export const DEFAULT_TRUSTED_CIDRS = ['100.64.0.0/10', '127.0.0.0/8', '::1/128'];
+export const DEFAULT_TRUSTED_CIDRS = [
+  '100.64.0.0/10',
+  '127.0.0.0/8',
+  '::1/128',
+  'fd7a:115c:a1e0::/48',
+];
 
 export function resolveTrustedCidrs(env: NodeJS.ProcessEnv = process.env): string[] {
   const raw = env.QLH_TRUSTED_BOOTSTRAP_CIDRS?.trim();
@@ -23,10 +28,11 @@ export function isTrustedBootstrapSource(
   host: string,
   cidrs: string[] = DEFAULT_TRUSTED_CIDRS,
 ): boolean {
-  const ip = ipToInt(host);
+  const normalizedHost = normalizeMappedIpv4(host);
+  const ip = ipToInt(normalizedHost);
   if (ip === null) return false;
   for (const cidr of cidrs) {
-    if (isInCidr(host, cidr)) return true;
+    if (isInCidr(normalizedHost, cidr)) return true;
   }
   return false;
 }
@@ -53,10 +59,11 @@ export function isInCidr(ip: string, cidr: string): boolean {
 export function ipToInt(ip: string): bigint | null {
   const trimmed = (ip || '').trim();
   if (!trimmed) return null;
+  if (trimmed.includes(':')) {
+    return ipv6ToInt(trimmed);
+  }
   if (trimmed.includes('.')) {
-    // IPv4：容忍 IPv4-mapped IPv6（::ffff:127.0.0.1）
-    const v4 = trimmed.includes(':') ? trimmed.split(':').pop() : trimmed;
-    const octets = v4!.split('.');
+    const octets = trimmed.split('.');
     if (octets.length !== 4) return null;
     let value = 0n;
     for (const oct of octets) {
@@ -66,10 +73,13 @@ export function ipToInt(ip: string): bigint | null {
     }
     return value;
   }
-  if (trimmed.includes(':')) {
-    return ipv6ToInt(trimmed);
-  }
   return null;
+}
+
+function normalizeMappedIpv4(ip: string): string {
+  const trimmed = (ip || '').trim();
+  const match = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(trimmed);
+  return match?.[1] ?? trimmed;
 }
 
 function ipv6ToInt(ip: string): bigint | null {

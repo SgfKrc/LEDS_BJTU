@@ -171,7 +171,9 @@ def ensure_model_available(
 ) -> str:
     """Ensure the worker owns the master's exact active PyTorch model."""
     encoded_model_id = urllib.parse.quote(model_id, safe="")
-    base_url = f"http://{master_host}:{int(master_api_port)}"
+    from network_address import build_url
+
+    base_url = build_url("http", master_host, int(master_api_port))
     manifest = _read_json(
         f"{base_url}/api/models/downloadable?model_id={encoded_model_id}",
         timeout,

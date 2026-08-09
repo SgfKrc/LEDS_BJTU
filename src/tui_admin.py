@@ -210,7 +210,9 @@ class ApiClient:
 
     @property
     def base_url(self) -> str:
-        return "http://%s:%s" % (self.host, self.port)
+        from network_address import build_url
+
+        return build_url("http", self.host, self.port)
 
     # ---- 底层请求 ----
     def request(self, method: str, path: str, body=None, params=None,

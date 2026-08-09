@@ -7,7 +7,8 @@ import { createApp } from './app';
 async function bootstrap(): Promise<void> {
   const app = await createApp();
   const port = Number(process.env.QLH_API_PORT || 8000);
-  await app.listen(port, '0.0.0.0');
+  const host = process.env.QLH_API_HOST?.trim() || '::';
+  await app.listen({ port, host, ipv6Only: false });
 }
 
 bootstrap().catch((err) => {
