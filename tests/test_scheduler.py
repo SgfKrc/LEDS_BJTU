@@ -5243,7 +5243,8 @@ class TestForwardInferenceRequestId:
         assert sched._client_pending_events == {}
         assert sched._client_pending_results == {}
 
-    def test_forwarded_success_is_sent_before_task_cleanup_regression(self):
+    @patch("db.save_message")
+    def test_forwarded_success_is_sent_before_task_cleanup_regression(self, mock_save):
         sched = Scheduler()
         sent = []
         finished = threading.Event()
