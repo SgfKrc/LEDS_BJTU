@@ -59,6 +59,31 @@ function securityDeps(dir: string, store: SqliteStore): {
 }
 
 describe('MODEL-FLEET sources and dry-run (MF-N4)', () => {
+  it('allows loopback HTTP sources but rejects remote plaintext HTTP', () => {
+    const { dir, store } = tempStore();
+    const sources = new ModelSourceRepository(new ClusterSettingsRepository(store));
+    expect(sources.upsert({
+      source_id: 'local-fixture',
+      name: 'Local fixture',
+      provider: 'huggingface',
+      endpoint: 'http://127.0.0.1:8080',
+      credential_ref: null,
+      priority: 1,
+      enabled: true,
+    }).endpoint).toBe('http://127.0.0.1:8080');
+    expect(() => sources.upsert({
+      source_id: 'lan-plaintext',
+      name: 'LAN plaintext',
+      provider: 'huggingface',
+      endpoint: 'http://192.168.1.20:8080',
+      credential_ref: null,
+      priority: 2,
+      enabled: true,
+    })).toThrow('HTTP is loopback-only');
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('keeps source overrides local, rejects plaintext credentials, and re-resolves per source', async () => {
     const { dir, store } = tempStore();
     const sources = new ModelSourceRepository(
