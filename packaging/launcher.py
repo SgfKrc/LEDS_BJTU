@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sys
+import ipaddress
 
 # ═══════════════════════════════════════════════════════════════════
 # ★ 平台检测（影响后续分支逻辑）
@@ -47,28 +48,6 @@ import time
 import subprocess as _sp
 
 _WINDOWS_NO_WINDOW = getattr(_sp, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
-
-# ★ Windows PyInstaller: 强制在 psycopg2 之前加载 ssl，避免 OpenSSL DLL 冲突
-# psycopg2-binary 捆绑了自己的 libssl-3-x64-{hash}.dll，通过 add_dll_directory 注册后
-# 可能干扰 Python _ssl.pyd 加载 libssl-3.dll，导致"内存位置访问无效"。
-# Linux 上无此问题——OpenSSL 由系统包管理器管理。
-if IS_WINDOWS and getattr(sys, 'frozen', False):
-    import ctypes as _ctypes
-    import os as _os
-    _internal_dir = _os.path.join(_os.path.dirname(sys.executable), '_internal')
-    if _os.path.isdir(_internal_dir):
-        try:
-            _os.add_dll_directory(_internal_dir)
-        except Exception:
-            pass
-        # 按依赖顺序加载：libcrypto 先，libssl 后
-        for _dll_name in ('libcrypto-3.dll', 'libssl-3.dll'):
-            _dll_path = _os.path.join(_internal_dir, _dll_name)
-            if _os.path.isfile(_dll_path):
-                try:
-                    _ctypes.CDLL(_dll_path)
-                except Exception:
-                    pass
 
 import ssl  # noqa: E402, F401
 
@@ -836,21 +815,17 @@ def _find_tailscale_exe() -> str | None:
 
 
 def _is_tailscale_ip(ip: str | None) -> bool:
-    """判断是否是 Tailscale CGNAT 地址（100.64.0.0/10，兼容 100.x 项目约定）。"""
+    """判断是否是 Tailscale IPv4 CGNAT 或 IPv6 ULA 地址。"""
     if not ip or not isinstance(ip, str):
         return False
-    ip = ip.strip()
-    parts = ip.split(".")
-    if len(parts) != 4:
-        return False
     try:
-        nums = [int(p) for p in parts]
+        address = ipaddress.ip_address(ip.strip().split("%", 1)[0])
     except ValueError:
         return False
-    if nums[0] != 100:
-        return False
-    # Tailscale 官方地址池是 100.64.0.0/10；当前项目文档也用 100.x.x.x 表述。
-    return 0 <= nums[1] <= 255 and all(0 <= n <= 255 for n in nums[2:])
+    return (
+        address in ipaddress.ip_network("100.64.0.0/10")
+        or address in ipaddress.ip_network("fd7a:115c:a1e0::/48")
+    )
 
 
 def _detect_tailscale_ip_from_interfaces() -> str | None:
@@ -863,13 +838,16 @@ def _detect_tailscale_ip_from_interfaces() -> str | None:
         for iface, addr_list in addrs.items():
             iface_l = (iface or "").lower()
             for addr in addr_list:
-                if addr.family != socket.AF_INET:
+                if addr.family not in (socket.AF_INET, socket.AF_INET6):
                     continue
                 ip = getattr(addr, "address", "")
                 if not _is_tailscale_ip(ip):
                     continue
                 # Tailscale 接口优先，其次接受 100.x 兜底。
-                priority = 0 if "tailscale" in iface_l else 1
+                priority = (
+                    0 if "tailscale" in iface_l else 1,
+                    0 if addr.family == socket.AF_INET else 1,
+                )
                 candidates.append((priority, ip))
         if candidates:
             candidates.sort(key=lambda x: x[0])
@@ -937,32 +915,37 @@ def _check_tailscale_status() -> dict:
     except Exception as e:
         errors.append(f"status --json: {e}")
 
-    # 2) tailscale ip -4：很多情况下 status JSON 不可用但 IP 命令可用。
-    try:
-        r = _sp.run(
-            [exe, "ip", "-4"],
-            capture_output=True, text=True, timeout=2,
-            encoding="utf-8", errors="replace",
-            creationflags=_WINDOWS_NO_WINDOW,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            for line in r.stdout.splitlines():
-                ip = line.strip()
-                if _is_tailscale_ip(ip):
-                    result.update({
-                        "running": True,
-                        "logged_in": True,
-                        "tailscale_ip": ip,
-                        "source": "tailscale_ip",
-                    })
-                    logger.info(f"Tailscale status JSON 不可用，已通过 `tailscale ip -4` 确认: {ip}")
-                    return result
-            errors.append("tailscale ip -4 returned no 100.x IP")
-        else:
-            stderr = (r.stderr or "").strip()
-            errors.append(f"tailscale ip -4 rc={r.returncode}: {stderr[:160]}")
-    except Exception as e:
-        errors.append(f"tailscale ip -4: {e}")
+    # 2) tailscale ip：status JSON 不可用时分别尝试 IPv4/IPv6。
+    for family in ("-4", "-6"):
+        try:
+            r = _sp.run(
+                [exe, "ip", family],
+                capture_output=True, text=True, timeout=2,
+                encoding="utf-8", errors="replace",
+                creationflags=_WINDOWS_NO_WINDOW,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                for line in r.stdout.splitlines():
+                    ip = line.strip()
+                    if _is_tailscale_ip(ip):
+                        result.update({
+                            "running": True,
+                            "logged_in": True,
+                            "tailscale_ip": ip,
+                            "source": "tailscale_ip",
+                        })
+                        logger.info(
+                            "Tailscale status JSON 不可用，已通过 `tailscale ip %s` 确认: %s",
+                            family,
+                            ip,
+                        )
+                        return result
+                errors.append(f"tailscale ip {family} returned no trusted IP")
+            else:
+                stderr = (r.stderr or "").strip()
+                errors.append(f"tailscale ip {family} rc={r.returncode}: {stderr[:160]}")
+        except Exception as e:
+            errors.append(f"tailscale ip {family}: {e}")
 
     # 3) 网卡扫描：最终兜底。
     ip = _detect_tailscale_ip_from_interfaces()
@@ -1569,16 +1552,10 @@ def main():
     _server_error = []
 
     def run_server():
-        """在后台线程中启动 uvicorn。"""
+        """在后台线程中启动 uvicorn（IPv4/IPv6 双栈）。"""
         try:
-            import uvicorn
-            from api_server import app
-            uvicorn.run(
-                app, host="0.0.0.0", port=API_PORT,
-                log_level="info",
-                log_config=None,
-                timeout_graceful_shutdown=10,
-            )
+            from api_server import run_api_servers
+            run_api_servers("0.0.0.0", API_PORT)
         except Exception as e:
             _server_error.append(str(e))
             import traceback

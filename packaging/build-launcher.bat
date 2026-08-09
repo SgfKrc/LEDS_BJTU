@@ -34,9 +34,16 @@ if not exist "dist\QLH-Launcher\QLH-Launcher.exe" (
 rem ---- 自更新资产落点：packaging\dist\（serve.py DIST_DIR 扫描目录，源站才能发布）----
 if not exist "packaging\dist" mkdir "packaging\dist"
 set "LAUNCHER_ZIP=packaging\dist\QLH-Launcher-v%LAUNCHER_VERSION%.zip"
-if exist "%LAUNCHER_ZIP%" del /q "%LAUNCHER_ZIP%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'dist\QLH-Launcher\*' -DestinationPath '%LAUNCHER_ZIP%' -Force"
+if exist "%LAUNCHER_ZIP%" del /q "%LAUNCHER_ZIP%" >nul 2>&1
+rem Compress-Archive 的非终止错误不会让 powershell.exe 返回非零退出码，
+rem 必须用 $ErrorActionPreference=Stop + try/catch + 显式 exit 1 强制失败；
+rem 首次失败（常见：杀软正扫描刚生成的 EXE 占用文件）等待 3 秒自动重试一次。
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try { Compress-Archive -Path 'dist\QLH-Launcher\*' -DestinationPath '%LAUNCHER_ZIP%' -Force -ErrorAction Stop } catch { Write-Warning ('Compress-Archive failed, retry in 3s: ' + $_.Exception.Message); Start-Sleep -Seconds 3; try { Compress-Archive -Path 'dist\QLH-Launcher\*' -DestinationPath '%LAUNCHER_ZIP%' -Force -ErrorAction Stop } catch { Write-Error ('Compress-Archive failed twice: ' + $_.Exception.Message); exit 1 } }"
 if errorlevel 1 (
+  echo [ERROR] Launcher self-update ZIP was not generated.
+  exit /b 1
+)
+if not exist "%LAUNCHER_ZIP%" (
   echo [ERROR] Launcher self-update ZIP was not generated.
   exit /b 1
 )

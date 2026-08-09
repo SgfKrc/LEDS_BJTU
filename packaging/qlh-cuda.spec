@@ -142,15 +142,6 @@ a = Analysis(
         '_ssl',
 
         # ============================================================
-        # 数据库（PostgreSQL + psycopg2）
-        # ============================================================
-        'psycopg2',
-        'psycopg2.pool',
-        'psycopg2.sql',
-        'psycopg2.extras',
-        'psycopg2._psycopg',
-
-        # ============================================================
         # 本地存储（DB 不可用时自动降级）
         # ============================================================
         'local_store',
@@ -179,7 +170,7 @@ a = Analysis(
         'asyncio',
     ],
     hookspath=[],
-    runtime_hooks=[os.path.join(SPECPATH, 'pyi_rthook_ssl.py')],
+    runtime_hooks=[],
     excludes=[
         'tkinter',
         'test',
