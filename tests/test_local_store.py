@@ -9,6 +9,8 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
+import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -22,6 +24,8 @@ def temp_store_dir(monkeypatch):
     """将 local_store 的存储目录重定向到临时目录"""
     tmpdir = tempfile.mkdtemp(prefix="qlh_test_localstore_")
     import local_store
+    legacy_dir = os.path.join(tmpdir, "legacy")
+    sqlite_path = os.path.join(tmpdir, "qlh-control.sqlite3")
 
     # Patch _store_dir 函数
     def _mock_store_dir():
@@ -30,11 +34,19 @@ def temp_store_dir(monkeypatch):
 
     monkeypatch.setattr(local_store, '_store_dir', _mock_store_dir)
     monkeypatch.setattr(local_store, '_get_store_dir', _mock_store_dir)
+    monkeypatch.setattr(local_store, '_legacy_store_dir', lambda: legacy_dir)
+    monkeypatch.setattr(local_store, '_sqlite_path', lambda: sqlite_path)
+    local_store._initialized_paths.clear()
 
-    yield tmpdir
+    yield {
+        "root": tmpdir,
+        "legacy_dir": legacy_dir,
+        "sqlite_path": sqlite_path,
+    }
 
     # 清理
     import shutil
+    local_store._initialized_paths.clear()
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -302,3 +314,107 @@ class TestLocalStoreStats:
         stats = local_store_stats()
         assert stats["session_count"] == 1
         assert stats["message_count"] == 2
+
+
+class TestSqliteCompatibility:
+    def test_python_store_does_not_claim_schema_version(self, temp_store_dir):
+        from local_store import initialize_local_store
+
+        path = initialize_local_store()
+        connection = sqlite3.connect(path)
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            connection.close()
+
+        assert version == 0
+        assert str(mode).lower() == "wal"
+
+    def test_existing_control_schema_version_and_assets_are_preserved(self, temp_store_dir):
+        from local_store import create_local_session, initialize_local_store
+
+        path = temp_store_dir["sqlite_path"]
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE local_users (
+              user_id TEXT PRIMARY KEY,
+              username TEXT NOT NULL UNIQUE,
+              display_name TEXT,
+              status TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            PRAGMA user_version = 5;
+            """
+        )
+        connection.execute(
+            "INSERT INTO local_users VALUES (?, ?, ?, ?, ?, ?)",
+            ("u1", "owner", "Owner", "active", "now", "now"),
+        )
+        connection.commit()
+        connection.close()
+
+        initialize_local_store()
+        create_local_session("shared-session", "Shared")
+
+        connection = sqlite3.connect(path)
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            user = connection.execute(
+                "SELECT username FROM local_users WHERE user_id = 'u1'"
+            ).fetchone()
+            session = connection.execute(
+                "SELECT title FROM sessions WHERE session_id = 'shared-session'"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        assert version == 5
+        assert user == ("owner",)
+        assert session == ("Shared",)
+
+    def test_legacy_json_is_imported_once_and_retained(self, temp_store_dir):
+        import local_store
+
+        legacy_dir = temp_store_dir["legacy_dir"]
+        os.makedirs(legacy_dir, exist_ok=True)
+        sessions_path = os.path.join(legacy_dir, "_sessions.json")
+        messages_path = os.path.join(legacy_dir, "legacy-one.json")
+        with open(sessions_path, "w", encoding="utf-8") as handle:
+            json.dump([
+                {
+                    "id": "legacy-one",
+                    "title": "Legacy",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "message_count": "not-a-number",
+                }
+            ], handle)
+        with open(messages_path, "w", encoding="utf-8") as handle:
+            json.dump([
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ], handle)
+
+        local_store.initialize_local_store()
+        assert len(local_store.load_local_conversation("legacy-one")) == 2
+        assert os.path.isfile(sessions_path)
+        assert os.path.isfile(messages_path)
+
+        local_store._initialized_paths.clear()
+        local_store.initialize_local_store()
+        assert len(local_store.load_local_conversation("legacy-one")) == 2
+
+    def test_user_settings_round_trip(self):
+        from local_store import (
+            get_local_save_history,
+            get_local_user_settings,
+            set_local_user_settings,
+        )
+
+        settings = {"saveHistory": False, "distributedInference": True}
+        set_local_user_settings(settings)
+        assert get_local_user_settings() == settings
+        assert get_local_save_history() is False

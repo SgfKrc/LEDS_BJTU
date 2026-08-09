@@ -51,6 +51,7 @@ def build_app(node_role: str = "master", *, engine_host=None, kv_host=None):
     from inference_service.kv_host import KVHost
     from inference_service.routes import router
 
+    owns_engine_host = engine_host is None
     host = engine_host
     if host is None:
         from inference_service.engine_host import EngineHost
@@ -59,9 +60,15 @@ def build_app(node_role: str = "master", *, engine_host=None, kv_host=None):
 
     @asynccontextmanager
     async def lifespan(_app):
-        yield
         import asyncio
 
+        if owns_engine_host and node_role == "master":
+            sqlite_path = await asyncio.to_thread(host.initialize_storage)
+            logging.getLogger("inference_svc_main").info(
+                "主节点 SQLite 已就绪: %s",
+                sqlite_path,
+            )
+        yield
         await asyncio.to_thread(host.close)
 
     app = FastAPI(title="inference-svc", version="0.1.0", lifespan=lifespan)

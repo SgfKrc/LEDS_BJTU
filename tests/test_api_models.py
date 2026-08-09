@@ -295,12 +295,11 @@ def test_diffusion_capabilities_detects_manager_loaded_when_host_flag_is_stale(m
 
 def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
     saved = []
-    fake_db = types.SimpleNamespace(
-        save_experimental_model=lambda model_id, config_json: saved.append((model_id, config_json)) or True
+    monkeypatch.setattr(
+        api_server._local_store,
+        "save_local_experimental_model",
+        lambda model_id, config_json: saved.append((model_id, config_json)) or True,
     )
-
-    monkeypatch.setitem(sys.modules, "db", fake_db)
-    monkeypatch.setattr(model_host, "_db_available", True)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     req = api_server.RegisterModelRequest(
@@ -318,12 +317,11 @@ def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
 
 def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch):
     saved = []
-    fake_db = types.SimpleNamespace(
-        save_experimental_model=lambda model_id, config_json: saved.append((model_id, config_json)) or True
+    monkeypatch.setattr(
+        api_server._local_store,
+        "save_local_experimental_model",
+        lambda model_id, config_json: saved.append((model_id, config_json)) or True,
     )
-
-    monkeypatch.setitem(sys.modules, "db", fake_db)
-    monkeypatch.setattr(model_host, "_db_available", True)
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
 
     req = api_server.RegisterModelRequest(

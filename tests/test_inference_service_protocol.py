@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import threading
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -26,6 +27,33 @@ from inference_service.kv_host import KVHost
 from inference_service.protocol import ChatRequest, LoadModelRequest
 from inference_service.routes import router
 from inference_service.tensor_transport import deserialize_tensor, serialize_tensor
+
+
+@pytest.fixture(autouse=True)
+def isolated_engine_local_store(monkeypatch):
+    """Keep EngineHost protocol tests away from the user's main-node SQLite."""
+    import inference_service.engine_host as engine_host_module
+
+    messages = {}
+    titles = {}
+
+    def save_message(session_id, role, content, metrics=None):
+        messages.setdefault(session_id, []).append({
+            "role": role,
+            "content": content,
+            **({"metrics": metrics} if metrics is not None else {}),
+        })
+
+    fake_store = SimpleNamespace(
+        initialize_local_store=lambda: "memory://protocol-test",
+        get_local_save_history=lambda: False,
+        save_local_message=save_message,
+        increment_local_session_message_count=lambda _sid: None,
+        load_local_conversation=lambda sid: list(messages.get(sid, [])),
+        update_local_session_title=lambda sid, title: titles.__setitem__(sid, title),
+    )
+    monkeypatch.setattr(engine_host_module, "_local_store", fake_store)
+    return fake_store
 
 
 class FakeModel:
@@ -1186,12 +1214,13 @@ def test_chat_full_session_switch(monkeypatch):
 
 def test_chat_full_first_message_auto_title(monkeypatch):
     """首条消息自动标题：截取前 30 字。"""
-    import db
-
-    monkeypatch.setattr(db, "get_save_history", lambda: False)
-    monkeypatch.setattr(db, "update_session_title",
-                        lambda sid, title: titles.append((sid, title)))
     titles = []
+    import inference_service.engine_host as engine_host_module
+    monkeypatch.setattr(
+        engine_host_module._local_store,
+        "update_local_session_title",
+        lambda sid, title: titles.append((sid, title)),
+    )
 
     host = make_full_host()
     long_msg = "这是一个非常非常非常非常非常非常非常非常非常非常长的首条消息啊"
@@ -1313,9 +1342,46 @@ def test_chat_full_pytorch_path(monkeypatch):
 # ----------------------------------------------------------------------
 # 15. 1.3 服务入口：build_app + 角色感知门控
 # ----------------------------------------------------------------------
-def test_build_app_master_role():
+def test_engine_host_persists_locally_without_legacy_export(monkeypatch):
+    import inference_service.engine_host as engine_host_module
+
+    events = []
+    fake_local_store = SimpleNamespace(
+        get_local_save_history=lambda: True,
+        save_local_message=lambda sid, role, content, metrics=None: events.append(
+            ("local", sid, role, content)
+        ),
+        increment_local_session_message_count=lambda sid: events.append(
+            ("local", sid, "increment", None)
+        ),
+    )
+    fake_db = SimpleNamespace(
+        get_save_history=lambda: True,
+        save_message=lambda sid, role, content, metrics=None: events.append(
+            ("remote", sid, role, content)
+        ),
+        increment_session_message_count=lambda sid: events.append(
+            ("remote", sid, "increment", None)
+        ),
+    )
+    monkeypatch.setattr(engine_host_module, "_local_store", fake_local_store)
+    monkeypatch.setitem(sys.modules, "db", fake_db)
+
+    host = EngineHost()
+    host._host._db_available = False
+    assert host._persist_conversation_turn("s-local", "q", "a", {}) is True
+    assert events[:3] == [
+        ("local", "s-local", "user", "q"),
+        ("local", "s-local", "assistant", "a"),
+        ("local", "s-local", "increment", None),
+    ]
+    assert len(events) == 3
+
+
+def test_build_app_master_role(monkeypatch, tmp_path):
     from inference_svc_main import build_app
 
+    monkeypatch.setenv("QLH_SQLITE_PATH", str(tmp_path / "control.sqlite3"))
     app = build_app("master")
     assert app.state.engine_host.role == "master"
     assert app.state.node_role == "master"

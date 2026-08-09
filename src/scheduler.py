@@ -195,21 +195,14 @@ def _sync_runtime_node_config(node_id: str = None, node_role: str = None) -> Non
         if node_runtime is not None:
             node_runtime.set_node_role(NODE_ROLE)
 
-# 数据库模块（延迟导入，避免 psycopg2 未安装时直接崩溃）
+# 历史 PostgreSQL 运行时已退场；_db 仅保留给测试注入兼容对象。
 _db = None
 _db_available = False
-_db_attempted = False
-_db_disabled = False
+_db_attempted = True
+_db_disabled = True
 _db_retry_after = 0.0
-_db_last_error = ""
+_db_last_error = "远端 PostgreSQL 运行时已退场，正在使用本地 SQLite"
 _db_state_lock = threading.Lock()
-try:
-    _DB_RETRY_SECONDS = max(
-        5,
-        int(os.environ.get("QLH_DB_RETRY_SECONDS", "30") or 30),
-    )
-except (TypeError, ValueError):
-    _DB_RETRY_SECONDS = 30
 
 
 def _sync_api_db_available(available: bool) -> None:
@@ -221,68 +214,28 @@ def _sync_api_db_available(available: bool) -> None:
 
 
 def _get_db(force_retry: bool = False):
-    """Return the DB module without retrying failed connections on request paths."""
+    """Return an injected compatibility DB without loading a production driver."""
     global _db, _db_available, _db_attempted, _db_disabled
     global _db_retry_after, _db_last_error
     if _db is not None:
         return _db
-    if _db_disabled:
-        return None
-    now = time.monotonic()
-    if _db_attempted and not force_retry and now < _db_retry_after:
-        return None
-    if not _db_state_lock.acquire(blocking=False):
-        return None
-    try:
-        if _db is not None:
-            return _db
-        now = time.monotonic()
-        if _db_attempted and not force_retry and now < _db_retry_after:
-            return None
-        _db_attempted = True
-        try:
-            from db import DB_ENABLED, get_pool
-            if not DB_ENABLED:
-                _db_disabled = True
-                _db_available = False
-                _db_last_error = "数据库未配置，正在使用本地文件存储"
-                _db_retry_after = 0.0
-                _sync_api_db_available(False)
-                logger.info(_db_last_error)
-                return None
-            _db_disabled = False
-            get_pool()  # 预热连接池
-            import db as _db_mod
-            _db = _db_mod
-            _db_available = True
-            _db_last_error = ""
-            _db_retry_after = 0.0
-            _sync_api_db_available(True)
-            logger.info("数据库已连接，节点管理将持久化到 PostgreSQL")
-        except Exception as e:
-            _db = None
-            _db_available = False
-            _db_last_error = str(e)
-            _db_retry_after = time.monotonic() + _DB_RETRY_SECONDS
-            _sync_api_db_available(False)
-            logger.warning(
-                "数据库暂不可用，已切换内存模式，%s 秒后后台重试: %s",
-                _DB_RETRY_SECONDS,
-                e,
-            )
-        return _db
-    finally:
-        _db_state_lock.release()
+    _db_available = False
+    _db_attempted = True
+    _db_disabled = True
+    _db_retry_after = 0.0
+    _db_last_error = "远端 PostgreSQL 运行时已退场，正在使用本地 SQLite"
+    _sync_api_db_available(False)
+    return None
 
 
 def get_database_status() -> dict:
-    retry_in = max(0.0, _db_retry_after - time.monotonic())
     return {
         "available": bool(_db_available and _db is not None),
         "configured": not _db_disabled,
         "attempted": _db_attempted,
         "last_error": _db_last_error,
-        "retry_in_seconds": round(retry_in, 1),
+        "retry_in_seconds": 0.0,
+        "retired": True,
     }
 
 
@@ -7341,12 +7294,6 @@ class Scheduler:
         self.init_nodes()
         effective_id = self.get_effective_node_id()
         _sync_runtime_node_config(node_id=effective_id)
-        try:
-            from db import set_active_node_id
-            set_active_node_id(effective_id)
-        except Exception:
-            pass
-
         # 3. 启动从节点健康监控
         self._start_client_health_monitor()
 
@@ -7404,7 +7351,15 @@ class Scheduler:
                 data.get("bootstrapped", False)
                 or node.get("role_confirmed", False)
             )
-            if not data and os.environ.get("QLH_NODE_ROLE", "").strip() == "master":
+            if os.environ.get("QLH_NODE_ROLE", "").strip() == "master":
+                role_confirmed = True
+            # ★ 数据库已配置的主节点：DB 临时故障（IPv6 网络连不上 IPv4-only 数据库等）
+            #   绝不能触发"加入已有主节点"降级——否则身份无法验证 → provisional
+            #   （is_master=false）→ 前端管理功能全隐藏、/api/bootstrap/info 返回
+            #   is_master=false（Tailnet 发现失效）、PC 从节点连接失败。
+            #   只有 DB 完全未配置的新装机才允许 provisional 加入。
+            database_status = get_database_status()
+            if database_status.get("retired") or database_status.get("configured", False):
                 role_confirmed = True
         except Exception:
             role_confirmed = False
@@ -7422,12 +7377,6 @@ class Scheduler:
         time.sleep(2)
         try:
             result = self.activate_client_mode(master_host, master_port)
-            # 更新 api_server 中的 active_node_id
-            try:
-                from db import set_active_node_id
-                set_active_node_id(self.get_effective_node_id())
-            except Exception:
-                pass
             logger.info(f"自动切换完成: {result.get('message', '')}")
         except Exception as e:
             logger.error(f"自动切换到从节点模式失败: {e}")
@@ -7975,13 +7924,13 @@ class Scheduler:
                 # 保存到对话历史（主节点侧）
                 if content:
                     try:
-                        from db import save_message
-                        save_message(
+                        import local_store
+                        local_store.save_local_message(
                             session_id=session_id or "default",
                             role="user",
                             content=prompt,
                         )
-                        save_message(
+                        local_store.save_local_message(
                             session_id=session_id or "default",
                             role="assistant",
                             content=content,
