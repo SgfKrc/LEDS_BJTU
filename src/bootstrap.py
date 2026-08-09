@@ -16,9 +16,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from node_config import apply_runtime_config, persist_bootstrap_response
+from network_address import build_url, canonical_host, is_tailscale_ip
 
 
-DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10,127.0.0.0/8,::1/128"
+DEFAULT_TRUSTED_CIDRS = "100.64.0.0/10,127.0.0.0/8,::1/128,fd7a:115c:a1e0::/48"
 _WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
@@ -74,14 +75,9 @@ def normalize_node_id(node_id: str | None, node_type: str = "pc") -> str:
 
 def select_advertised_master_host(requested_host: str, lan_ip: str = "") -> str:
     """Keep Tailnet joins on the routable Tailnet address instead of a LAN IP."""
-    host = (requested_host or "").strip()
-    try:
-        address = ipaddress.ip_address(host)
-        if address in ipaddress.ip_network("100.64.0.0/10"):
-            return host
-    except ValueError:
-        if host.lower().endswith(".ts.net"):
-            return host
+    host = canonical_host(requested_host)
+    if is_tailscale_ip(host) or host.lower().endswith(".ts.net"):
+        return host
     if lan_ip and lan_ip not in {"0.0.0.0", "127.0.0.1", "localhost"}:
         return lan_ip
     return host
@@ -129,7 +125,8 @@ def get_tailnet_peer_ips(timeout: float = 3.0) -> list[str]:
                             ip = ipaddress.ip_address(address)
                         except ValueError:
                             continue
-                        if ip.version == 4 and is_trusted_bootstrap_source(address):
+                        # v4（100.64/10）与 v6（fd7a:115c:a1e0::/48 ULA）对等点均放行
+                        if is_trusted_bootstrap_source(address):
                             peers.append(address)
         except Exception:
             pass
@@ -147,7 +144,8 @@ def discover_master_via_tailnet(
         return {"found": False, "source": "tailnet"}
 
     def _probe(host: str) -> dict[str, Any] | None:
-        url = f"http://{host}:{int(api_port)}/api/bootstrap/info"
+        canonical = canonical_host(host)
+        url = build_url("http", canonical, api_port, "/api/bootstrap/info")
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:
                 data = json.loads(response.read().decode("utf-8") or "{}")
@@ -155,7 +153,7 @@ def discover_master_via_tailnet(
                 return None
             return {
                 "found": True,
-                "master_host": host,
+                "master_host": canonical,
                 "master_port": int(data.get("master_tcp_port") or 8888),
                 "master_api_port": int(data.get("master_api_port") or api_port),
                 "stale": False,
@@ -193,7 +191,12 @@ def first_connect(
         "app_variant": app_variant,
         "capabilities": capabilities or {},
     }
-    url = f"http://{master_api_host}:{int(master_api_port)}/api/bootstrap/first-connect"
+    url = build_url(
+        "http",
+        master_api_host,
+        master_api_port,
+        "/api/bootstrap/first-connect",
+    )
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),

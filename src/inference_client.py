@@ -44,10 +44,11 @@ class InferenceClient:
 
     def __init__(self, base_url: Optional[str] = None, timeout: float = 300.0):
         import os
+        from network_address import build_url
 
         host = os.environ.get("QLH_INFERENCE_HOST", "127.0.0.1")
         port = os.environ.get("QLH_INFERENCE_PORT", "8010")
-        self._base_url = base_url or f"http://{host}:{port}"
+        self._base_url = base_url or build_url("http", host, int(port))
         self._timeout = timeout
         self._lock = threading.RLock()
         self.full_chat_execution_lock = threading.RLock()

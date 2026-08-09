@@ -13,6 +13,7 @@ import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.network.BootstrapRequest
 import com.qlh.inference.network.ChatRepository
 import com.qlh.inference.network.RegisterNodeRequest
@@ -104,7 +105,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         apiClient = {
             val state = _uiState.value
             if (state.inferenceMode == "thin") {
-                ApiClient("http://${state.serverHost}:${state.serverPort}")
+                ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
             } else {
                 null // 全有模式 — 使用本地推理引擎
             }
@@ -462,7 +463,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ).filter { it.isNotBlank() }
             .joinToString(" ")
             .ifBlank { nodeId }
-        val client = ApiClient("http://${state.serverHost}:${state.serverPort}")
+        val client = ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
         val result = client.firstConnectBootstrap(
             BootstrapRequest(
                 nodeId = nodeId,
@@ -526,7 +527,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val networkType = detectNetworkType()
 
         val deviceInfo = buildAndroidPresenceDeviceInfo()
-        val client = ApiClient("http://${state.serverHost}:${state.serverPort}")
+        val client = ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
         val result = client.registerAndroidNode(
             RegisterNodeRequest(
                 nodeId = nodeId,

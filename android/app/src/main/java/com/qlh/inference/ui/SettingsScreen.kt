@@ -68,6 +68,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.ui.components.QlhTopBar
@@ -309,7 +310,7 @@ private fun ConnectionGroup(
                     isTesting = true
                     connectionResult = null
                     scope.launch {
-                        val url = "http://$serverHost:$serverPort"
+                        val url = httpBaseUrl(serverHost, serverPort)
                         QlhLogger.i("Settings", "测试连接: $url")
                         val client = ApiClient(url)
                         val raw = client.testConnection()
