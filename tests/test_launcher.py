@@ -97,6 +97,13 @@ def test_tailscale_interface_fallback(monkeypatch, launcher_module):
     assert status["running"] is True
 
 
+def test_tailscale_ip_accepts_ipv4_and_ipv6(launcher_module):
+    assert launcher_module._is_tailscale_ip("100.64.0.1")
+    assert launcher_module._is_tailscale_ip("fd7a:115c:a1e0::1")
+    assert not launcher_module._is_tailscale_ip("192.168.1.1")
+    assert not launcher_module._is_tailscale_ip("2001:db8::1")
+
+
 def test_tailscale_not_installed(monkeypatch, launcher_module):
     monkeypatch.setattr(launcher_module, "_find_tailscale_exe", lambda: None)
     status = launcher_module._check_tailscale_status()
