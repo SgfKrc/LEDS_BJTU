@@ -18,6 +18,10 @@ export interface ModelSource {
 
 const SETTINGS_KEY = 'model_source_overrides_v1';
 
+function isLoopbackHostname(hostname: string): boolean {
+  return ['127.0.0.1', 'localhost', '[::1]'].includes(hostname.toLowerCase());
+}
+
 export const DEFAULT_MODEL_SOURCES: ReadonlyArray<ModelSource> = [
   {
     schema_version: 1,
@@ -125,8 +129,9 @@ export class ModelSourceRepository {
     } catch {
       throw new Error('source endpoint is invalid');
     }
-    if (url.protocol !== 'https:') {
-      throw new Error('source endpoint must use HTTPS');
+    if (url.protocol !== 'https:'
+        && !(url.protocol === 'http:' && isLoopbackHostname(url.hostname))) {
+      throw new Error('source endpoint must use HTTPS (HTTP is loopback-only)');
     }
     if (url.username || url.password) {
       throw new Error('source endpoint must not contain credentials');

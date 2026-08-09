@@ -57,6 +57,24 @@ export function sha256Hex(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+export function sha256FileHex(filePath: string): string {
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);
+  try {
+    let position = 0;
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
+}
+
 @Injectable()
 export class ArtifactStore {
   readonly root: string;
@@ -114,6 +132,31 @@ export class ArtifactStore {
     return target;
   }
 
+  /** Reuse a verified content-addressed blob without copying model bytes. */
+  stageExistingBlob(
+    jobId: string,
+    relPath: string,
+    digest: string,
+    expectedSize: number,
+  ): string {
+    const normalizedDigest = digest.toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(normalizedDigest)) {
+      throw new Error(`invalid blob digest: ${digest}`);
+    }
+    const source = this.blobPath(normalizedDigest);
+    const sourceStat = fs.statSync(source);
+    if (!sourceStat.isFile() || sourceStat.size !== expectedSize) {
+      throw new Error(`existing blob size mismatch: ${normalizedDigest}`);
+    }
+    const target = path.join(this.stagingDir(jobId), relPath);
+    if (!target.startsWith(this.stagingDir(jobId) + path.sep)) {
+      throw new Error(`闈炴硶 staging 鐩稿璺緞: ${relPath}`);
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.linkSync(source, target);
+    return target;
+  }
+
   listStaging(jobId: string): string[] {
     const dir = this.stagingDir(jobId);
     if (!fs.existsSync(dir)) return [];
@@ -158,7 +201,7 @@ export class ArtifactStore {
       throw new Error(`staging 文件缺失: ${relPath}`);
     }
     const size = fs.statSync(source).size;
-    const digest = this.sha256File(source);
+    const digest = sha256FileHex(source);
     const target = this.blobPath(digest);
     if (fs.existsSync(target)) {
       fs.rmSync(source, { force: true });
@@ -301,21 +344,4 @@ export class ArtifactStore {
     fs.rmSync(this.stagingDir(jobId), { recursive: true, force: true });
   }
 
-  private sha256File(filePath: string): string {
-    const hash = crypto.createHash('sha256');
-    const fd = fs.openSync(filePath, 'r');
-    const buffer = Buffer.allocUnsafe(8 * 1024 * 1024);
-    try {
-      let position = 0;
-      while (true) {
-        const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, position);
-        if (bytesRead === 0) break;
-        hash.update(buffer.subarray(0, bytesRead));
-        position += bytesRead;
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-    return hash.digest('hex');
-  }
 }

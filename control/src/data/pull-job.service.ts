@@ -40,6 +40,11 @@ export interface PullJob {
     files_total: number;
     files_done: number;
     current_file: string | null;
+    restart_count?: number;
+    transfer_attempt?: number;
+    transfer_retry_count?: number;
+    resumed_bytes?: number;
+    last_retry_error?: string | null;
   };
   artifact_id?: string | null;
   runtime_check?: ArtifactRuntimeRecord | null;
@@ -122,6 +127,11 @@ export class PullJobService {
         files_total: input.filesTotal ?? 0,
         files_done: 0,
         current_file: null,
+        restart_count: 0,
+        transfer_attempt: 0,
+        transfer_retry_count: 0,
+        resumed_bytes: 0,
+        last_retry_error: null,
       },
       artifact_id: null,
       runtime_check: null,
@@ -216,10 +226,9 @@ export class PullJobService {
   }
 
   /** Restart recovery always re-resolves the source before reusing partial data. */
-  requeue(jobId: string): PullJob {
+  requeue(jobId: string, options: { recoveredAfterRestart?: boolean } = {}): PullJob {
     const job = this.get(jobId);
     if (!job) throw new Error(`job 不存在: ${jobId}`);
-    if (job.state === 'queued') return job;
     if (TERMINAL_STATES.has(job.state)) {
       throw new Error(`job 已终止（${job.state}），不能恢复`);
     }
@@ -227,7 +236,12 @@ export class PullJobService {
       ...job,
       state: 'queued',
       source: { ...job.source, resolved_revision: null },
-      progress: { ...job.progress, current_file: null },
+      progress: {
+        ...job.progress,
+        current_file: null,
+        restart_count: (job.progress.restart_count ?? 0)
+          + (options.recoveredAfterRestart ? 1 : 0),
+      },
       error: null,
       updated_at: new Date().toISOString(),
     };

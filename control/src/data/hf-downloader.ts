@@ -15,16 +15,43 @@ export interface DownloadProgress {
 }
 
 export interface DownloadResponseInfo {
+  attempt: number;
   status: number;
   requestedStartBytes: number;
   contentRange: string | null;
   totalBytes: number;
 }
 
+export interface DownloadRetryInfo {
+  attempt: number;
+  nextAttempt: number;
+  retryCount: number;
+  resumedBytes: number;
+  errorCode: string;
+}
+
 export interface DownloaderOptions {
   apiBase?: string;
   /** 进度回调节流间隔（毫秒）。 */
   progressThrottleMs?: number;
+  /** Includes the initial request. Only transport failures are retried. */
+  maxAttempts?: number;
+  retryBaseDelayMs?: number;
+  requestTimeoutMs?: number;
+}
+
+export class HfDownloadTransportError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    options: { cause?: unknown } = {},
+  ) {
+    super(message);
+    this.name = 'HfDownloadTransportError';
+    if (options.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
 }
 
 @Injectable()
@@ -32,6 +59,9 @@ export class HfDownloader {
   private readonly http: ModelHttpClient;
   private readonly apiBase: string;
   private readonly throttleMs: number;
+  private readonly maxAttempts: number;
+  private readonly retryBaseDelayMs: number;
+  private readonly requestTimeoutMs: number;
 
   constructor(
     @Optional() http?: ModelHttpClient,
@@ -40,6 +70,18 @@ export class HfDownloader {
     this.http = http ?? new ModelHttpClient();
     this.apiBase = options.apiBase ?? 'https://huggingface.co';
     this.throttleMs = options.progressThrottleMs ?? 250;
+    this.maxAttempts = options.maxAttempts ?? 4;
+    this.retryBaseDelayMs = options.retryBaseDelayMs ?? 250;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    if (!Number.isInteger(this.maxAttempts) || this.maxAttempts < 1) {
+      throw new Error(`下载尝试次数无效: ${this.maxAttempts}`);
+    }
+    if (!Number.isFinite(this.retryBaseDelayMs) || this.retryBaseDelayMs < 0) {
+      throw new Error(`下载重试间隔无效: ${this.retryBaseDelayMs}`);
+    }
+    if (!Number.isFinite(this.requestTimeoutMs) || this.requestTimeoutMs <= 0) {
+      throw new Error(`下载请求超时无效: ${this.requestTimeoutMs}`);
+    }
   }
 
   fileUrl(
@@ -64,12 +106,56 @@ export class HfDownloader {
     opts: {
       onProgress?: (p: DownloadProgress) => void;
       onResponse?: (response: DownloadResponseInfo) => void;
+      onRetry?: (retry: DownloadRetryInfo) => void;
       signal?: AbortSignal;
       startBytes?: number;
       expectedSize?: number;
       apiBase?: string;
       token?: string | null;
     } = {},
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+      try {
+        await this.downloadAttempt(
+          repoId, revision, filename, destPath, attempt,
+          attempt === 1 ? opts : { ...opts, startBytes: undefined },
+        );
+        return;
+      } catch (error) {
+        if (!(error instanceof HfDownloadTransportError)
+            || opts.signal?.aborted
+            || attempt >= this.maxAttempts) {
+          throw error;
+        }
+        const resumedBytes = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
+        opts.onRetry?.({
+          attempt,
+          nextAttempt: attempt + 1,
+          retryCount: attempt,
+          resumedBytes,
+          errorCode: error.code,
+        });
+        await this.waitBeforeRetry(attempt, opts.signal);
+      }
+    }
+  }
+
+  private async downloadAttempt(
+    repoId: string,
+    revision: string,
+    filename: string,
+    destPath: string,
+    attempt: number,
+    opts: {
+      onProgress?: (p: DownloadProgress) => void;
+      onResponse?: (response: DownloadResponseInfo) => void;
+      onRetry?: (retry: DownloadRetryInfo) => void;
+      signal?: AbortSignal;
+      startBytes?: number;
+      expectedSize?: number;
+      apiBase?: string;
+      token?: string | null;
+    },
   ): Promise<void> {
     fs.mkdirSync(require('path').dirname(destPath), { recursive: true });
     const destinationExists = fs.existsSync(destPath);
@@ -101,16 +187,40 @@ export class HfDownloader {
 
     const headers: Record<string, string> = {};
     if (startBytes > 0) headers['range'] = `bytes=${startBytes}-`;
-    const response = await this.http.fetch(this.fileUrl(
-      repoId, revision, filename, opts.apiBase,
-    ), {
-      headers,
-      signal: opts.signal,
-    }, { token: opts.token });
-    if (response.status !== 200 && response.status !== 206) {
-      throw new Error(
-        `HF 下载失败 (${response.status}): ${filename}（${await response.text().catch(() => '')}）`,
+    const timeoutController = new AbortController();
+    const timeout = setTimeout(() => {
+      timeoutController.abort(new Error('download response timeout'));
+    }, this.requestTimeoutMs);
+    const requestSignal = opts.signal
+      ? AbortSignal.any([opts.signal, timeoutController.signal])
+      : timeoutController.signal;
+    let response: Response;
+    try {
+      response = await this.http.fetch(this.fileUrl(
+        repoId, revision, filename, opts.apiBase,
+      ), {
+        headers,
+        signal: requestSignal,
+      }, { token: opts.token });
+    } catch (error) {
+      if (opts.signal?.aborted) throw error;
+      throw new HfDownloadTransportError(
+        timeoutController.signal.aborted
+          ? 'download_request_timeout' : 'download_transport_unavailable',
+        `HF 下载传输失败: ${filename}`,
+        { cause: error },
       );
+    } finally {
+      // Bound connection/response headers only; large response bodies may validly take longer.
+      clearTimeout(timeout);
+    }
+    if (response.status !== 200 && response.status !== 206) {
+      const detail = await response.text().catch(() => '');
+      const message = `HF 下载失败 (${response.status}): ${filename}（${detail}）`;
+      if ([408, 425, 429, 500, 502, 503, 504].includes(response.status)) {
+        throw new HfDownloadTransportError('download_transient_http_status', message);
+      }
+      throw new Error(message);
     }
     if (startBytes > 0 && response.status !== 206) {
       await response.body?.cancel().catch(() => undefined);
@@ -169,6 +279,7 @@ export class HfDownloader {
     }
 
     opts.onResponse?.({
+      attempt,
       status: response.status,
       requestedStartBytes: startBytes,
       contentRange,
@@ -176,7 +287,9 @@ export class HfDownloader {
     });
     const body = response.body;
     if (!body) {
-      throw new Error(`HF 下载无响应体: ${filename}`);
+      throw new HfDownloadTransportError(
+        'download_response_body_missing', `HF 下载无响应体: ${filename}`,
+      );
     }
 
     const fd = fs.openSync(destPath, startBytes > 0 ? 'a' : 'w');
@@ -185,7 +298,17 @@ export class HfDownloader {
     let lastEmit = 0;
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        let read: ReadableStreamReadResult<Uint8Array>;
+        try {
+          read = await reader.read();
+        } catch (error) {
+          if (opts.signal?.aborted) throw error;
+          throw new HfDownloadTransportError(
+            'download_stream_interrupted', `HF 下载流中断: ${filename}`,
+            { cause: error },
+          );
+        }
+        const { done, value } = read;
         if (done) break;
         fs.writeSync(fd, value);
         downloaded += value.length;
@@ -199,11 +322,23 @@ export class HfDownloader {
         opts.onProgress({ bytesDownloaded: downloaded, totalBytes });
       }
       if (rangeEnd !== null && downloaded !== rangeEnd + 1) {
+        if (downloaded < rangeEnd + 1) {
+          throw new HfDownloadTransportError(
+            'download_response_truncated',
+            `续传响应体提前结束: ${filename} 期望结束于 ${rangeEnd + 1}，实际 ${downloaded}`,
+          );
+        }
         throw new Error(
           `续传响应体长度不匹配: ${filename} 期望结束于 ${rangeEnd + 1}，实际 ${downloaded}`,
         );
       }
       if (opts.expectedSize !== undefined && downloaded !== opts.expectedSize) {
+        if (downloaded < opts.expectedSize) {
+          throw new HfDownloadTransportError(
+            'download_response_truncated',
+            `下载响应体提前结束: ${filename} 期望 ${opts.expectedSize}，实际 ${downloaded}`,
+          );
+        }
         throw new Error(
           `下载大小不匹配: ${filename} 期望 ${opts.expectedSize}，实际 ${downloaded}`,
         );
@@ -211,6 +346,27 @@ export class HfDownloader {
     } finally {
       fs.closeSync(fd);
     }
+  }
+
+  private async waitBeforeRetry(attempt: number, signal?: AbortSignal): Promise<void> {
+    const delayMs = this.retryBaseDelayMs * (2 ** (attempt - 1));
+    if (delayMs === 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(signal?.reason instanceof Error
+          ? signal.reason : new Error('下载已取消'));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, delayMs);
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }
 
