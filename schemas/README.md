@@ -24,6 +24,7 @@ payload schema，不替代六个文件的字段校验。
 `pull-job` 与 `deployment` 根对象允许兼容新增可选字段。本轮增加：
 
 - `pull-job.runtime_check`：节点/profile 的 `ready / load_failed / resource_rejected / stale` 终态与运行时指纹；`registered` 只代表工件已保留，不自动代表可部署；
+- `pull-job.progress.restart_count / transfer_attempt / transfer_retry_count / resumed_bytes / last_retry_error`：M3.3 重启恢复和瞬时代理/网络重试的持久观测；旧 payload 缺字段时按 0/null 处理；
 - `deployment.runtime_profile / runtime_fingerprint / runtime_checked_at`：prepare/activate 对 runtime record 做 fail-closed 过滤；
 - 未携带这些字段的旧 payload 仍可通过 v1 schema，但新部署计划必须由当前控制面补齐运行时事实后才可激活。
 
