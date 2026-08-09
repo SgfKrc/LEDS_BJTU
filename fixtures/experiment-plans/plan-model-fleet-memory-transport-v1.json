@@ -1,0 +1,124 @@
+{
+  "plan_id": "plan-model-fleet-memory-transport-v1",
+  "title": "MF-MEM-N1 固定 tile CUDA 传输矩阵",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11 WDDM",
+    "cpu": "x86_64",
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop 8GB",
+    "ram_gb": 16,
+    "engine": "isolated synthetic CUDA transport harness",
+    "torch": "2.13.0+cu126",
+    "cuda": "12.6"
+  },
+  "defaults": {
+    "runs": 8,
+    "timeout_s": 600,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "gpu0",
+      "memory_transport": "exclusive"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-0101",
+      "name": "64 MiB pageable baseline",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "64", "--mode", "pageable", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 64, "mode": "pageable", "slots": 1, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0102",
+      "name": "64 MiB pinned async single slot",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "64", "--mode", "pinned-single", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 64, "mode": "pinned-single", "slots": 1, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0103",
+      "name": "64 MiB pinned async double buffer",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "64", "--mode", "pinned-double", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 64, "mode": "pinned-double", "slots": 2, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0104",
+      "name": "64 MiB pinned async triple buffer",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "64", "--mode", "pinned-triple", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 64, "mode": "pinned-triple", "slots": 3, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0201",
+      "name": "256 MiB pageable baseline",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "256", "--mode", "pageable", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 256, "mode": "pageable", "slots": 1, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0202",
+      "name": "256 MiB pinned async single slot",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "256", "--mode", "pinned-single", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 256, "mode": "pinned-single", "slots": 1, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0203",
+      "name": "256 MiB pinned async double buffer",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "256", "--mode", "pinned-double", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 256, "mode": "pinned-double", "slots": 2, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0204",
+      "name": "256 MiB pinned async triple buffer",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "256", "--mode", "pinned-triple", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 256, "mode": "pinned-triple", "slots": 3, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0301",
+      "name": "1024 MiB pageable baseline",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "1024", "--mode", "pageable", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 1024, "mode": "pageable", "slots": 1, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0302",
+      "name": "1024 MiB pinned async single slot",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "1024", "--mode", "pinned-single", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 1024, "mode": "pinned-single", "slots": 1, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0303",
+      "name": "1024 MiB pinned async double buffer",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "1024", "--mode", "pinned-double", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 1024, "mode": "pinned-double", "slots": 2, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-0304",
+      "name": "1024 MiB pinned async triple buffer",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_memory_transport.py", "--tile-mib", "1024", "--mode", "pinned-triple", "--iterations", "8", "--warmup", "2", "--compute-ms", "20", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"tile_mib": 1024, "mode": "pinned-triple", "slots": 3, "compute_ms": 20}},
+      "model": {"id": "synthetic-read-only-weight-tile", "quant_family": null},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    }
+  ]
+}
