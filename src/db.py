@@ -1,5 +1,5 @@
 """
-数据库访问层 — PostgreSQL 持久化存储
+数据库访问层 — 已退场的 PostgreSQL 兼容实现
 =====================================
 功能:
 1. 连接池管理（psycopg2 ThreadedConnectionPool）
@@ -8,9 +8,7 @@
 4. 对话历史持久化 — 替代 localStorage
 5. 集群配置键值存储 — 替代 config.py 常量
 
-依赖: psycopg2-binary
-
-数据库: 通过环境变量配置 (QLH_DB_HOST, QLH_DB_PORT, QLH_DB_NAME, QLH_DB_USER, QLH_DB_PASSWORD)
+生产运行时不再启用或打包该后端。代码仅用于历史迁移审计。
 """
 
 from __future__ import annotations
@@ -46,9 +44,15 @@ try:
 except ImportError:
     pass  # python-dotenv 未安装，跳过
 
-import psycopg2
-from psycopg2 import pool, sql
-from psycopg2.extras import RealDictCursor
+try:
+    import psycopg2
+    from psycopg2 import pool, sql
+    from psycopg2.extras import RealDictCursor
+except ImportError:  # 历史迁移环境可选安装，生产安装包不再携带。
+    psycopg2 = None
+    pool = None
+    sql = None
+    RealDictCursor = None
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +64,15 @@ DB_NAME = os.environ.get("QLH_DB_NAME", "qlh_edge_inference")
 DB_USER = os.environ.get("QLH_DB_USER", "postgres")
 DB_PASSWORD = os.environ.get("QLH_DB_PASSWORD", "")
 _db_enabled_value = os.environ.get("QLH_DB_ENABLED")
-if _db_enabled_value is None:
-    DB_ENABLED = any(
+LEGACY_DB_REQUESTED = (
+    _db_enabled_value.strip().lower() in {"1", "true", "yes", "on"}
+    if _db_enabled_value is not None
+    else any(
         os.environ.get(key, "").strip()
         for key in ("QLH_DB_HOST", "QLH_DB_NAME", "QLH_DB_USER", "QLH_DB_PASSWORD")
     )
-else:
-    DB_ENABLED = _db_enabled_value.strip().lower() in {"1", "true", "yes", "on"}
+)
+DB_ENABLED = False
 
 # 端口和连接数的安全解析
 def _safe_int(env_key: str, default: int, min_val: int = 1, max_val: int = 65535) -> int:
@@ -107,12 +113,14 @@ _init_lock = threading.Lock()
 
 
 def get_pool() -> pool.ThreadedConnectionPool:
-    """获取数据库连接池（懒初始化，线程安全）"""
+    """拒绝生产连接；历史数据应通过一次性退场工具迁移。"""
     global _connection_pool
     if not DB_ENABLED:
         raise RuntimeError(
-            "数据库未配置；如需启用，请设置 QLH_DB_* 环境变量或用户配置目录 .env"
+            "远端 PostgreSQL 运行时已退场；请使用主节点 SQLite 和一次性退场工具"
         )
+    if pool is None:
+        raise RuntimeError("psycopg2 未安装；生产安装包不再携带旧数据库驱动")
     if _connection_pool is not None:
         return _connection_pool
 

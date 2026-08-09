@@ -118,20 +118,7 @@ from config import (
     DIFFUSION_WORKER_DATA_PLANE_BASE_URL,
 )
 
-# 数据库模块（可选，未安装 psycopg2 时使用内存降级）
-try:
-    from db import init_db, close_db, db_health
-    _db_importable = True
-except ImportError:
-    _db_importable = False
-    init_db = lambda: None
-    close_db = lambda: None
-    db_health = lambda: {"status": "unavailable", "message": "psycopg2 未安装"}
-
-# model_host._db_available 动态追踪实际连接状态：启动时尝试连接，失败则标记 False
-# _db_importable 仅表示 psycopg2 已安装（静态）
-
-# 本地文件储存（云数据库不可用时的降级方案）
+# 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
@@ -333,7 +320,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173",
-                   "http://localhost:8000", "http://127.0.0.1:8000"],
+                   "http://localhost:8000", "http://127.0.0.1:8000",
+                   "http://[::1]:5173", "http://[::1]:3000", "http://[::1]:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -694,6 +682,13 @@ async def _startup_device_detection():
     global device_profile, _device_profile_started
     active_scheduler: ClusterScheduler = globals()["scheduler"]
 
+    try:
+        sqlite_path = _local_store.initialize_local_store()
+        logger.info("主节点 SQLite 已就绪: %s", sqlite_path)
+    except Exception as exc:
+        logger.critical("主节点 SQLite 不可写，拒绝启动: %s", exc)
+        raise RuntimeError("主节点 SQLite 初始化失败") from exc
+
     def _detect_device_profile() -> None:
         global device_profile
         try:
@@ -736,38 +731,8 @@ async def _startup_device_detection():
     except Exception as e:
         logger.warning(f"日志保留线程启动失败: {e}")
 
-    # 调度器启动时已经尝试过数据库；这里复用结果，避免重复阻塞初始化。
-    import scheduler as scheduler_module
-    try:
-        db_module = scheduler_module._get_db()
-        if db_module is None:
-            raise RuntimeError(
-                scheduler_module.get_database_status().get("last_error")
-                or "数据库未配置或暂不可用"
-            )
-        # ★ 设置数据隔离参数：conversations/sessions 将按 node_id 过滤
-        from db import set_active_node_id
-        # ★ MAC 不匹配自动切换：若 start() 时检测到 MAC 不匹配且有真实主节点，
-        #    后台线程 _auto_switch_to_client 会在 2s 后完成切换。
-        #    此处等待最多 5s，确保切换完成后再设置 node_id。
-        if (getattr(active_scheduler, '_master_identity_reason', '') == 'mac_mismatch'
-                and getattr(active_scheduler, '_role_override', None) != 'client'):
-            # 自动切换尚未完成（后台线程延迟 2s），等待切换
-            logger.info("⏳ 等待 MAC 不匹配自动切换到从节点模式...")
-            import time as _time
-            for _ in range(10):  # 最多等 5 秒 (10 × 0.5s)
-                _time.sleep(0.5)
-                if getattr(active_scheduler, '_role_override', None) == 'client':
-                    break
-        set_active_node_id(active_scheduler.get_effective_node_id())
-        logger.info(f"数据库已连接，活跃节点: {active_scheduler.get_effective_node_id()}")
-    except Exception as e:
-        model_host._db_available = False
-        runtime = scheduler_module.get_database_status()
-        if runtime.get("configured", True):
-            logger.warning(f"数据库初始化失败（使用本地文件降级）: {e}")
-        else:
-            logger.info("数据库未配置，使用本地文件存储")
+    model_host._db_available = False
+    logger.info("远端 PostgreSQL 运行时已退场，使用主节点 SQLite")
 
     # P3: 启动邮件投票轮询器（仅 master 节点，IMAP 轮询不需要 CUDA）
     try:
@@ -804,7 +769,7 @@ async def _startup_device_detection():
 # ============================================================
 
 async def _shutdown_resources():
-    """应用关闭时清理资源：数据库连接池 + 调度器 + TCP 服务"""
+    """应用关闭时清理调度器、推理引擎与 TCP 服务。"""
     active_scheduler: ClusterScheduler = globals()["scheduler"]
     try:
         active_scheduler.clear_diffusion_worker()
@@ -825,24 +790,7 @@ async def _shutdown_resources():
     except Exception as e:
         logger.warning(f"调度器停止异常: {e}")
 
-    # 2. 关闭数据库连接池（线程超时防卡死）
-    import threading as _th
-
-    def _close_db_safe():
-        try:
-            close_db()
-        except Exception:
-            pass
-
-    _t = _th.Thread(target=_close_db_safe, daemon=True)
-    _t.start()
-    _t.join(timeout=3.0)
-    if _t.is_alive():
-        logger.warning("数据库连接池关闭超时（3s），跳过")
-    else:
-        logger.info("数据库连接池已关闭")
-
-    # 3. P3: 停止邮件投票轮询器
+    # 2. P3: 停止邮件投票轮询器
     try:
         from email_notifier import stop_mail_poller
         stop_mail_poller()
@@ -862,22 +810,24 @@ async def _shutdown_resources():
 #      直接执行资源清理后退出进程
 # ============================================================
 
-_uvicorn_server = None            # 通过 register_uvicorn_server() 注册
+_uvicorn_servers: list = []           # 通过 register_uvicorn_server() 注册（双栈时多个）
 _SHUTDOWN_TOKEN = os.environ.get("QLH_SHUTDOWN_TOKEN", "") or ""
 
 
 def register_uvicorn_server(server) -> None:
-    """供 `python src/api_server.py` 入口注册 uvicorn.Server 实例。"""
-    global _uvicorn_server
-    _uvicorn_server = server
+    """供 `python src/api_server.py` 入口注册 uvicorn.Server 实例（支持双栈多实例）。"""
+    global _uvicorn_servers
+    if server is not None and server not in _uvicorn_servers:
+        _uvicorn_servers.append(server)
 
 
 def _graceful_exit() -> None:
     """在后台线程中触发后端优雅退出（先等响应返回）。"""
     time.sleep(0.5)
-    server = _uvicorn_server
-    if server is not None:
-        server.should_exit = True
+    servers = list(_uvicorn_servers)
+    if servers:
+        for server in servers:
+            server.should_exit = True
         logger.info("event=system_shutdown trigger=uvicorn_should_exit")
         return
     if os.name != "nt":
@@ -1572,7 +1522,7 @@ def _switch_session(target_id: str) -> None:
     """
     切换到目标会话：暂存当前历史 → 加载目标历史 → 清 KV Cache。
 
-    如果目标会话不在内存中，首先尝试从 DB 加载；DB 不可用时初始化为空列表。
+    如果目标会话不在内存中，首先从主节点 SQLite 加载。
     """
     global active_session_id, kv_cache
     if active_session_id == target_id:
@@ -1580,23 +1530,14 @@ def _switch_session(target_id: str) -> None:
 
     active_session_id = target_id
 
-    # 如果目标会话不在内存中，尝试从 DB 或本地文件加载
+    # SQLite 是事实源；旧数据库仅用于迁移期只读兼容。
     if target_id not in session_histories:
         messages = []
-        if model_host._db_available:
-            try:
-                import db as _db_mod
-                rows = _db_mod.get_conversation(target_id)
-                messages = [{"role": r["role"], "content": r["content"]} for r in rows]
-            except Exception:
-                pass
-        if not messages:
-            # DB 不可用或返回空 → 尝试本地文件
-            try:
-                local_rows = _local_store.load_local_conversation(target_id)
-                messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-            except Exception:
-                pass
+        try:
+            local_rows = _local_store.load_local_conversation(target_id)
+            messages = [{"role": r["role"], "content": r["content"]} for r in local_rows]
+        except Exception as exc:
+            logger.error("SQLite 切换会话加载失败: session=%s: %s", target_id, exc)
         session_histories[target_id] = messages
 
     # 清 KV Cache（切换会话后 prompt 不同，必须重建）
@@ -1628,17 +1569,32 @@ def _auto_title_session(session_id: str, first_message: str) -> None:
     title = first_message.strip()[:30]
     if len(first_message.strip()) > 30:
         title += "..."
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            _db_mod.update_session_title(session_id, title)
-        except Exception:
-            pass
-    else:
-        try:
-            _local_store.update_local_session_title(session_id, title)
-        except Exception:
-            pass
+    try:
+        _local_store.update_local_session_title(session_id, title)
+    except Exception as exc:
+        logger.warning("SQLite 自动标题更新失败: session=%s: %s", session_id, exc)
+
+
+def _persist_conversation_turn(
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    metrics: Optional[dict] = None,
+) -> bool:
+    """Commit a completed turn to local SQLite, then optionally export it."""
+    try:
+        if not _local_store.get_local_save_history():
+            return False
+        _local_store.save_local_message(session_id, "user", user_message)
+        _local_store.save_local_message(
+            session_id, "assistant", assistant_message, metrics,
+        )
+        _local_store.increment_local_session_message_count(session_id)
+    except Exception as exc:
+        logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
+        return False
+
+    return True
 
 
 def _is_question(text: str) -> bool:
@@ -2978,12 +2934,6 @@ async def load_model(req: LoadModelRequest):
         def _prepare_model_load() -> None:
             # 新模型不能复用旧模型的上下文；必须和推理处于同一互斥边界。
             _reset_runtime_conversation_state(clear_histories=True)
-            if model_host._db_available:
-                try:
-                    import db as _db_mod
-                    _db_mod.clear_conversation("default")
-                except Exception:
-                    pass
 
         # P3修复: 使用 switch_model 获得失败时自动回滚保护
         logger.info(f"加载模型: engine={effective_engine}, quant={quant}, compile={req.use_compile}")
@@ -3210,28 +3160,11 @@ def _execute_external_chat(
         {"role": "assistant", "content": response_text},
     ])
 
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            if _db_mod.get_save_history():
-                _db_mod.save_message(db_session_id, "user", req.message)
-                save_metrics = dict(metrics)
-                save_metrics["followups"] = followups
-                _db_mod.save_message(db_session_id, "assistant", response_text,
-                                    save_metrics)
-                _db_mod.increment_session_message_count(db_session_id)
-        except Exception:
-            pass
-    if not model_host._db_available:
-        try:
-            _local_store.save_local_message(db_session_id, "user", req.message)
-            save_metrics = dict(metrics)
-            save_metrics["followups"] = followups
-            _local_store.save_local_message(db_session_id, "assistant",
-                                            response_text, save_metrics)
-            _local_store.increment_local_session_message_count(db_session_id)
-        except Exception:
-            pass
+    save_metrics = dict(metrics)
+    save_metrics["followups"] = followups
+    _persist_conversation_turn(
+        db_session_id, req.message, response_text, save_metrics,
+    )
 
     conversation_stats["total_generated_tokens"] += completion_tokens
     conversation_stats["rounds"] += 1
@@ -4350,28 +4283,9 @@ def _execute_task_graph_chat_with_slot(
     save_metrics["followups"] = followups
 
     db_session_id = target_session_id or "default"
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            if _db_mod.get_save_history():
-                _db_mod.save_message(db_session_id, "user", req.message)
-                _db_mod.save_message(
-                    db_session_id, "assistant", response_text, save_metrics,
-                )
-                _db_mod.increment_session_message_count(db_session_id)
-        except Exception:
-            pass
-    if not model_host._db_available:
-        try:
-            _local_store.save_local_message(
-                db_session_id, "user", req.message,
-            )
-            _local_store.save_local_message(
-                db_session_id, "assistant", response_text, save_metrics,
-            )
-            _local_store.increment_local_session_message_count(db_session_id)
-        except Exception:
-            pass
+    _persist_conversation_turn(
+        db_session_id, req.message, response_text, save_metrics,
+    )
 
     conversation_stats["total_prompt_tokens"] += prompt_tokens
     conversation_stats["total_generated_tokens"] += completion_tokens
@@ -4496,24 +4410,9 @@ def _execute_chat_full(
                     forward_metrics["fallback_reason"] = external_fallback_reason
 
                 db_session_id = target_session_id or "default"
-                if model_host._db_available:
-                    try:
-                        import db as _db_mod
-                        if _db_mod.get_save_history():
-                            _db_mod.save_message(db_session_id, "user", req.message)
-                            _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                forward_metrics)
-                            _db_mod.increment_session_message_count(db_session_id)
-                    except Exception:
-                        pass
-                if not model_host._db_available:
-                    try:
-                        _local_store.save_local_message(db_session_id, "user", req.message)
-                        _local_store.save_local_message(db_session_id, "assistant", response_text,
-                                                        forward_metrics)
-                        _local_store.increment_local_session_message_count(db_session_id)
-                    except Exception:
-                        pass
+                _persist_conversation_turn(
+                    db_session_id, req.message, response_text, forward_metrics,
+                )
 
                 conversation_stats["rounds"] += 1
                 try:
@@ -4604,25 +4503,9 @@ def _execute_chat_full(
                         pipeline_metrics["fallback_reason"] = (
                             external_fallback_reason
                         )
-                    if model_host._db_available:
-                        try:
-                            import db as _db_mod
-                            if _db_mod.get_save_history():
-                                _db_mod.save_message(db_session_id, "user", req.message)
-                                _db_mod.save_message(db_session_id, "assistant", response_text,
-                                                    pipeline_metrics)
-                                _db_mod.increment_session_message_count(db_session_id)
-                        except Exception:
-                            pass
-                    if not model_host._db_available:
-                        try:
-                            _local_store.save_local_message(db_session_id, "user", req.message)
-                            _local_store.save_local_message(db_session_id, "assistant",
-                                                            response_text,
-                                                            pipeline_metrics)
-                            _local_store.increment_local_session_message_count(db_session_id)
-                        except Exception:
-                            pass
+                    _persist_conversation_turn(
+                        db_session_id, req.message, response_text, pipeline_metrics,
+                    )
 
                     conversation_stats["rounds"] += 1
                     if not pipeline_metrics.get("distributed_used"):
@@ -4714,28 +4597,11 @@ def _execute_chat_full(
                 {"role": "assistant", "content": response_text},
             ])
 
-            if model_host._db_available:
-                try:
-                    import db as _db_mod
-                    if _db_mod.get_save_history():
-                        _db_mod.save_message(db_session_id, "user", req.message)
-                        save_metrics = dict(metrics)
-                        save_metrics["followups"] = followups
-                        _db_mod.save_message(db_session_id, "assistant", response_text,
-                                            save_metrics)
-                        _db_mod.increment_session_message_count(db_session_id)
-                except Exception:
-                    pass
-            if not model_host._db_available:
-                try:
-                    _local_store.save_local_message(db_session_id, "user", req.message)
-                    save_metrics = dict(metrics)
-                    save_metrics["followups"] = followups
-                    _local_store.save_local_message(db_session_id, "assistant", response_text,
-                                                    save_metrics)
-                    _local_store.increment_local_session_message_count(db_session_id)
-                except Exception:
-                    pass
+            save_metrics = dict(metrics)
+            save_metrics["followups"] = followups
+            _persist_conversation_turn(
+                db_session_id, req.message, response_text, save_metrics,
+            )
 
             conversation_stats["total_generated_tokens"] += completion_tokens
             conversation_stats["rounds"] += 1
@@ -4883,26 +4749,11 @@ def _execute_chat_full(
             {"role": "assistant", "content": response_text},
         ])
 
-        if model_host._db_available:
-            try:
-                import db as _db_mod
-                if _db_mod.get_save_history():
-                    _db_mod.save_message(db_session_id, "user", req.message)
-                    save_metrics = dict(metrics)
-                    save_metrics["followups"] = followups
-                    _db_mod.save_message(db_session_id, "assistant", response_text, save_metrics)
-                    _db_mod.increment_session_message_count(db_session_id)
-            except Exception:
-                pass
-        if not model_host._db_available:
-            try:
-                save_metrics = dict(metrics)
-                save_metrics["followups"] = followups
-                _local_store.save_local_message(db_session_id, "user", req.message)
-                _local_store.save_local_message(db_session_id, "assistant", response_text, save_metrics)
-                _local_store.increment_local_session_message_count(db_session_id)
-            except Exception:
-                pass
+        save_metrics = dict(metrics)
+        save_metrics["followups"] = followups
+        _persist_conversation_turn(
+            db_session_id, req.message, response_text, save_metrics,
+        )
 
         conversation_stats["total_prompt_tokens"] += prompt_len
         conversation_stats["total_generated_tokens"] += new_tokens
@@ -4968,29 +4819,9 @@ def _commit_interactive_history(
     返回是否实际写入。
     """
     db_session_id = session_id or "default"
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            if _db_mod.get_save_history():
-                _db_mod.save_message(db_session_id, "user", user_message)
-                _db_mod.save_message(
-                    db_session_id, "assistant", response_text, metrics,
-                )
-                _db_mod.increment_session_message_count(db_session_id)
-                return True
-        except Exception:
-            pass
-    else:
-        try:
-            _local_store.save_local_message(db_session_id, "user", user_message)
-            _local_store.save_local_message(
-                db_session_id, "assistant", response_text, metrics,
-            )
-            _local_store.increment_local_session_message_count(db_session_id)
-            return True
-        except Exception:
-            pass
-    return False
+    return _persist_conversation_turn(
+        db_session_id, user_message, response_text, metrics,
+    )
 
 
 def _should_forward_chat_to_master() -> bool:
@@ -6168,11 +5999,9 @@ class RegisterModelRequest(BaseModel):
 
 
 def _get_db_experimental_models() -> list[dict]:
-    """从 DB 读取用户注册的实验模型（安全包装）。"""
+    """从主节点 SQLite 读取用户注册的实验模型。"""
     try:
-        if model_host._db_available:
-            from db import get_experimental_models
-            return get_experimental_models()
+        return _local_store.get_local_experimental_models()
     except Exception:
         pass
     return []
@@ -6451,9 +6280,6 @@ async def register_model(req: RegisterModelRequest):
     """
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
-    if not model_host._db_available:
-        raise HTTPException(status_code=503, detail="数据库不可用，无法注册模型。")
-
     config = {
         "model_id": req.model_id,
         "name": req.name,
@@ -6468,8 +6294,9 @@ async def register_model(req: RegisterModelRequest):
     }
 
     try:
-        from db import save_experimental_model
-        ok = save_experimental_model(req.model_id, json.dumps(config, ensure_ascii=False))
+        ok = _local_store.save_local_experimental_model(
+            req.model_id, json.dumps(config, ensure_ascii=False),
+        )
         if not ok:
             raise HTTPException(status_code=500, detail="注册模型配置失败")
         return {"status": "registered", "model_id": req.model_id}
@@ -6485,16 +6312,12 @@ async def unregister_model(model_id: str):
 
     不会删除磁盘上的模型文件，仅取消注册。
     """
-    if not model_host._db_available:
-        raise HTTPException(status_code=503, detail="数据库不可用。")
-
     # 不允许删除内置模型
     if mc.get_builtin_model(model_id):
         raise HTTPException(status_code=400, detail=f"内置模型 '{model_id}' 不允许删除。")
 
     try:
-        from db import delete_experimental_model
-        deleted = delete_experimental_model(model_id)
+        deleted = _local_store.delete_local_experimental_model(model_id)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"模型 '{model_id}' 未注册")
         return {"status": "deleted", "model_id": model_id}
@@ -6666,6 +6489,7 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
     api_host = request.url.hostname or peer_host
     lan_ip = getattr(scheduler, "_lan_ip", "") or ""
     from bootstrap import select_advertised_master_host
+    from network_address import build_url, is_tailscale_ip
 
     master_tcp_host = select_advertised_master_host(api_host, lan_ip)
     master_api_host = api_host or master_tcp_host
@@ -6678,7 +6502,7 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         node_id=node_id,
         hostname=hostname,
         address=address,
-        network_type="tailscale" if peer_host.startswith("100.") else "trusted",
+        network_type="tailscale" if is_tailscale_ip(peer_host) else "trusted",
         node_type=node_type,
     )
     if register_result.get("status") in {"denied", "invalid", "full"}:
@@ -6705,7 +6529,9 @@ async def first_connect_bootstrap(req: FirstConnectBootstrapRequest, request: Re
         "android": {
             "presence_interval_seconds": 45,
             "pipeline_worker": False,
-            "model_manifest_url": f"http://{master_api_host}:{master_api_port}/api/models/downloadable",
+            "model_manifest_url": build_url(
+                "http", master_api_host, master_api_port, "/api/models/downloadable"
+            ),
         },
     }
     logger.info(
@@ -7502,26 +7328,18 @@ async def trigger_mail_poll():
 
 
 # ============================================================
-# 用户偏好设置云同步 API
+# 用户偏好设置 API（本地 SQLite 为事实源）
 # ============================================================
 
 @app.get("/api/user/settings")
 async def get_user_settings():
-    """
-    从云数据库读取用户偏好设置。
-
-    返回完整的 settings JSON，与 localStorage 格式一致。
-    如果数据库不可用，返回空 dict（前端使用 localStorage 值）。
-    """
-    if not model_host._db_available:
-        return {"settings": {}, "source": "none"}
+    """从主节点 SQLite 读取完整的用户偏好设置。"""
     try:
-        import db as _db_mod
-        settings = _db_mod.get_user_settings()
-        return {"settings": settings, "source": "database"}
+        settings = _local_store.get_local_user_settings()
+        return {"settings": settings, "source": "sqlite"}
     except Exception as e:
-        logger.warning(f"读取用户设置失败: {e}")
-        return {"settings": {}, "source": "error"}
+        logger.error(f"读取 SQLite 用户设置失败: {e}")
+        raise HTTPException(503, f"本地设置存储不可用: {e}")
 
 
 class UserSettingsRequest(BaseModel):
@@ -7530,58 +7348,43 @@ class UserSettingsRequest(BaseModel):
 
 @app.put("/api/user/settings")
 async def update_user_settings(req: UserSettingsRequest):
-    """
-    将用户偏好设置存储到云数据库。
-
-    前端在更新 localStorage 后调用此接口同步到云端。
-    同时同步 save_history 和 distributed_inference 到各自的专用键。
-    """
-    if not model_host._db_available:
-        return {"status": "skipped", "reason": "数据库不可用"}
+    """写入用户本人主节点上的 SQLite。"""
     try:
-        import db as _db_mod
         settings = req.settings
-
-        # 存储完整的 settings JSON
-        _db_mod.set_user_settings(settings)
-
-        # 同步 save_history 到专用键（后端推理保存逻辑依赖此键）
-        if "saveHistory" in settings:
-            _db_mod.set_save_history(bool(settings["saveHistory"]))
-
-        # 同步 distributedInference 到专用键
-        if "distributedInference" in settings:
-            _db_mod.set_distributed_inference_enabled(bool(settings["distributedInference"]))
-
-        return {"status": "ok", "synced_fields": list(settings.keys())}
+        _local_store.set_local_user_settings(settings)
     except Exception as e:
-        logger.error(f"存储用户设置失败: {e}")
-        raise HTTPException(500, f"存储失败: {e}")
+        logger.error(f"存储 SQLite 用户设置失败: {e}")
+        raise HTTPException(503, f"本地设置存储失败: {e}")
+
+    return {
+        "status": "ok",
+        "source": "sqlite",
+        "legacy_exported": False,
+        "synced_fields": list(settings.keys()),
+    }
 
 
 # ============================================================
-# 对话云同步状态 API
+# 对话持久化状态 API
 # ============================================================
 
 @app.get("/api/conversations/sync-status")
 async def get_conversation_sync_status():
-    """
-    获取对话历史云同步状态。
-    """
-    save_history = False
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            save_history = _db_mod.get_save_history()
-        except Exception:
-            pass
+    """获取用户本人主节点上的本地持久化状态。"""
+    try:
+        save_history = _local_store.get_local_save_history()
+        local_health = _local_store.local_store_health()
+    except Exception as exc:
+        raise HTTPException(503, f"本地 SQLite 不可用: {exc}")
 
     return {
         "save_history": save_history,
-        "db_connected": model_host._db_available,
+        "db_connected": False,
         "local_save_enabled": True,  # localStorage 始终可用
-        "local_store_enabled": True,  # 本地文件降级始终可用
-        "cloud_sync_enabled": save_history and model_host._db_available,
+        "local_store_enabled": local_health.get("status") == "ok",
+        "cloud_sync_enabled": False,
+        "storage_backend": "sqlite",
+        "effective_mode": "local_only",
     }
 
 
@@ -7592,43 +7395,31 @@ async def get_conversation_sync_status():
 @app.get("/api/conversations")
 async def get_conversations(session_id: str = "default", limit: int = 200):
     """
-    从数据库加载指定会话的对话历史。
+    从主节点 SQLite 加载指定会话的对话历史。
 
-    如果数据库不可用，回退到内存中的对话历史（按 session_id 过滤）。
+    旧数据库仅为迁移期只读兼容源；内存仅承接未持久化的新会话。
     """
-    # ---- 加载顺序: 数据库 → 本地文件 → 内存 ----
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            messages = _db_mod.get_conversation(session_id, limit)
-            count = _db_mod.get_conversation_count(session_id)
-            return {
-                "messages": [
-                    {"role": m["role"], "content": m["content"], "created_at": m.get("created_at")}
-                    for m in messages
-                ],
-                "count": count,
-                "source": "database",
-            }
-        except Exception as e:
-            logger.warning(f"数据库读取对话历史失败: {e}")
-
-    # 尝试本地文件
     try:
         local_messages = _local_store.load_local_conversation(session_id, limit)
-        if local_messages:
+        local_session = _local_store.get_local_session(session_id)
+        if local_messages or local_session:
             return {
                 "messages": [
-                    {"role": m["role"], "content": m["content"]}
+                    {
+                        "role": m["role"],
+                        "content": m["content"],
+                        "created_at": m.get("created_at"),
+                        **({"metrics": m["metrics"]} if "metrics" in m else {}),
+                    }
                     for m in local_messages
                 ],
-                "count": len(local_messages),
-                "source": "local_store",
+                "count": _local_store.get_local_conversation_count(session_id),
+                "source": "sqlite",
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"SQLite 读取对话历史失败: {e}")
+        raise HTTPException(503, f"本地对话存储不可用: {e}")
 
-    # 最终降级：内存
     targeted_history = session_histories.get(session_id, [])
     return {
         "messages": [
@@ -7655,19 +7446,16 @@ def delete_conversations(session_id: str = "default"):
     )
     deleted_count = 0
 
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            deleted_count = _db_mod.clear_conversation(resolved_session_id)
-            logger.info(f"数据库对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
-        except Exception as e:
-            logger.warning(f"数据库清空对话历史失败: {e}")
-    if not model_host._db_available:
-        try:
-            deleted_count = _local_store.clear_local_conversation(resolved_session_id)
-            logger.info(f"本地对话历史已清空: session={resolved_session_id}, {deleted_count} 条")
-        except Exception as e:
-            logger.warning(f"本地清空对话历史失败: {e}")
+    try:
+        deleted_count = _local_store.clear_local_conversation(resolved_session_id)
+        logger.info(
+            "SQLite 对话历史已清空: session=%s, %s 条",
+            resolved_session_id,
+            deleted_count,
+        )
+    except Exception as e:
+        logger.error(f"SQLite 清空对话历史失败: {e}")
+        raise HTTPException(503, f"本地对话存储不可用: {e}")
 
     history = session_histories.get(resolved_session_id)
     if history is not None:
@@ -7717,18 +7505,11 @@ def create_session(req: Optional[CreateSessionRequest] = None):
     elif req and req.title:
         title = req.title
 
-    # 持久化到数据库（或本地文件降级）
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            _db_mod.create_session(session_id, title)
-        except Exception as e:
-            logger.warning(f"数据库创建会话失败: {e}")
-    if not model_host._db_available:
-        try:
-            _local_store.create_local_session(session_id, title)
-        except Exception as e:
-            logger.warning(f"本地创建会话失败: {e}")
+    try:
+        _local_store.create_local_session(session_id, title)
+    except Exception as e:
+        logger.error(f"SQLite 创建会话失败: {e}")
+        raise HTTPException(503, f"本地会话存储不可用: {e}")
 
     # 注册到内存并激活
     session_histories[session_id] = []
@@ -7748,24 +7529,10 @@ async def list_sessions(limit: int = 50, offset: int = 0):
     """
     获取所有会话列表（按 updated_at DESC 排序）。
     """
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            db_sessions = _db_mod.get_all_sessions(limit, offset)
-            total = _db_mod.get_session_count()
-            return {
-                "sessions": db_sessions,
-                "active_session_id": active_session_id,
-                "total": total,
-            }
-        except Exception as e:
-            logger.warning(f"数据库读取会话列表失败: {e}")
-
-    # 降级：从本地文件 + 内存合并
+    # SQLite sessions 与尚未落盘的内存会话合并。
     mem_sessions = []
     seen_ids = set()
 
-    # 1. 本地文件中的会话（有持久化的元数据）
     try:
         local_sessions = _local_store.get_all_local_sessions(limit, offset)
         for ls in local_sessions:
@@ -7780,10 +7547,10 @@ async def list_sessions(limit: int = 50, offset: int = 0):
                 "created_at": ls.get("created_at"),
                 "updated_at": ls.get("updated_at"),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"SQLite 读取会话列表失败: {e}")
+        raise HTTPException(503, f"本地会话存储不可用: {e}")
 
-    # 2. 内存中有但本地文件中没有的会话
     for sid, hist in session_histories.items():
         if sid not in seen_ids:
             mem_sessions.append({
@@ -7797,22 +7564,16 @@ async def list_sessions(limit: int = 50, offset: int = 0):
     return {
         "sessions": mem_sessions,
         "active_session_id": active_session_id,
-        "total": len(mem_sessions),
+        "total": _local_store.get_local_session_count() + sum(
+            1 for sid in session_histories if sid not in seen_ids
+        ),
+        "source": "sqlite",
     }
 
 
 @app.get("/api/sessions/{session_id}")
 async def get_session_info(session_id: str):
     """获取单个会话的元数据"""
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            session = _db_mod.get_session(session_id)
-            if session:
-                return session
-        except Exception:
-            pass
-    # 尝试本地文件
     try:
         local_session = _local_store.get_local_session(session_id)
         if local_session:
@@ -7820,10 +7581,13 @@ async def get_session_info(session_id: str):
             local_session["message_count"] = len(hist) or local_session.get("message_count", 0)
             local_session["active"] = session_id == active_session_id
             return local_session
-    except Exception:
-        pass
-    # 最终降级
+    except Exception as e:
+        logger.error(f"SQLite 读取会话失败: {e}")
+        raise HTTPException(503, f"本地会话存储不可用: {e}")
+
     hist = session_histories.get(session_id, [])
+    if not hist:
+        raise HTTPException(404, f"会话不存在: {session_id}")
     return {
         "id": session_id,
         "title": "新对话",
@@ -7835,22 +7599,16 @@ async def get_session_info(session_id: str):
 @app.put("/api/sessions/{session_id}")
 async def rename_session(session_id: str, req: RenameSessionRequest):
     """重命名会话"""
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            updated = _db_mod.update_session_title(session_id, req.title)
-            if updated:
-                return updated
-        except Exception as e:
-            logger.warning(f"数据库重命名会话失败: {e}")
-    if not model_host._db_available:
-        try:
-            updated = _local_store.update_local_session_title(session_id, req.title)
-            if updated:
-                return updated
-        except Exception as e:
-            logger.warning(f"本地重命名会话失败: {e}")
-    raise HTTPException(404, f"会话不存在: {session_id}")
+    try:
+        updated = _local_store.update_local_session_title(session_id, req.title)
+    except Exception as e:
+        logger.error(f"SQLite 重命名会话失败: {e}")
+        raise HTTPException(503, f"本地会话存储不可用: {e}")
+
+    if updated is None:
+        raise HTTPException(404, f"会话不存在: {session_id}")
+
+    return updated
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -7863,18 +7621,11 @@ def delete_session(session_id: str):
     """
     global active_session_id
 
-    deleted = 0
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            deleted = _db_mod.delete_session(session_id)
-        except Exception as e:
-            logger.warning(f"数据库删除会话失败: {e}")
-    if not model_host._db_available:
-        try:
-            deleted = _local_store.delete_local_session(session_id)
-        except Exception as e:
-            logger.warning(f"本地删除会话失败: {e}")
+    try:
+        deleted = _local_store.delete_local_session(session_id)
+    except Exception as e:
+        logger.error(f"SQLite 删除会话失败: {e}")
+        raise HTTPException(503, f"本地会话存储不可用: {e}")
 
     # 从内存中移除
     session_histories.pop(session_id, None)
@@ -7923,22 +7674,13 @@ def delete_turn(session_id: str, turn_index: int):
     # 验证 turn_index 范围
     history = session_histories.get(session_id, [])
     if not history:
-        # 尝试从 DB 或本地文件加载
-        if model_host._db_available:
-            try:
-                import db as _db_mod
-                rows = _db_mod.get_conversation(session_id)
-                history = [{"role": r["role"], "content": r["content"]} for r in rows]
-                session_histories[session_id] = history
-            except Exception:
-                pass
-        if not history:
-            try:
-                local_rows = _local_store.load_local_conversation(session_id)
-                history = [{"role": r["role"], "content": r["content"]} for r in local_rows]
-                session_histories[session_id] = history
-            except Exception:
-                pass
+        try:
+            local_rows = _local_store.load_local_conversation(session_id)
+            history = [{"role": r["role"], "content": r["content"]} for r in local_rows]
+            session_histories[session_id] = history
+        except Exception as e:
+            logger.error(f"SQLite 读取待删除轮次失败: {e}")
+            raise HTTPException(503, f"本地会话存储不可用: {e}")
         if not history:
             raise HTTPException(404, f"会话不存在或无消息: {session_id}")
 
@@ -7946,21 +7688,12 @@ def delete_turn(session_id: str, turn_index: int):
     if turn_index < 0 or turn_index > max_turn:
         raise HTTPException(400, f"无效的轮次索引: {turn_index}（有效范围: 0-{max_turn}）")
 
-    # 从 DB 或本地文件删除
-    deleted_count = 0
-    if model_host._db_available:
-        try:
-            import db as _db_mod
-            deleted_count = _db_mod.delete_message_range(session_id, turn_index)
-            _db_mod.decrement_session_message_count(session_id, 2)
-        except Exception as e:
-            logger.warning(f"数据库删除消息失败: {e}")
-    if not model_host._db_available:
-        try:
-            deleted_count = _local_store.delete_local_message_range(session_id, turn_index)
-            _local_store.decrement_local_session_message_count(session_id, 2)
-        except Exception as e:
-            logger.warning(f"本地删除消息失败: {e}")
+    try:
+        deleted_count = _local_store.delete_local_message_range(session_id, turn_index)
+        _local_store.decrement_local_session_message_count(session_id, 2)
+    except Exception as e:
+        logger.error(f"SQLite 删除消息失败: {e}")
+        raise HTTPException(503, f"本地会话存储不可用: {e}")
 
     # 从内存中移除这两条消息
     idx = turn_index * 2
@@ -7989,26 +7722,30 @@ def delete_turn(session_id: str, turn_index: int):
 
 @app.get("/api/db/health")
 async def database_health():
-    """数据库连接健康检查"""
-    if not _db_importable:
-        return {"status": "unavailable", "reason": "driver_missing", "message": "psycopg2 未安装"}
-    import scheduler as _scheduler_module
-    runtime = _scheduler_module.get_database_status()
-    if not runtime["available"]:
-        if not runtime.get("configured", True):
-            return {
-                "status": "unavailable",
-                "reason": "not_configured",
-                "message": "数据库未配置，正在使用本地文件存储",
-                "retry_in_seconds": 0,
-            }
-        return {
+    """主节点 SQLite 健康状态及旧 PostgreSQL 退场状态。"""
+    try:
+        local = _local_store.local_store_health()
+    except Exception as exc:
+        local = {
             "status": "unavailable",
-            "reason": "connection_failed",
-            "message": runtime.get("last_error") or "数据库未配置或暂不可用",
-            "retry_in_seconds": runtime.get("retry_in_seconds", 0),
+            "backend": "sqlite",
+            "writable": False,
+            "error": str(exc),
         }
-    return db_health()
+
+    remote = {
+        "status": "retired",
+        "backend": "postgresql",
+        "mode": "retired",
+    }
+
+    return {
+        "status": local.get("status", "unavailable"),
+        "backend": "sqlite",
+        "local": local,
+        "remote": remote,
+        "effective_mode": "local_only",
+    }
 
 
 # ============================================================
@@ -8939,25 +8676,85 @@ model_host.attach("_filter_recent_logs", _filter_recent_logs)
 model_host.attach("_format_model_response", _format_model_response)
 
 
-if __name__ == "__main__":
-    import uvicorn
+def _api_bind_hosts(host: str) -> list[str]:
+    """API 监听地址展开：通配 → 双栈（0.0.0.0 + [::]）。"""
+    return ["0.0.0.0", "::"] if (host or "").strip() in ("", "0.0.0.0", "::") else [(host or "").strip()]
 
+
+def run_api_servers(host: str = "0.0.0.0", port: int = None) -> None:
+    """
+    启动 API 服务器（IPv4/IPv6 双栈）。
+
+    通配地址同时监听 0.0.0.0 与 [::]；IPv6 socket 显式 IPV6_V6ONLY=1，
+    保证 v4 流量仍从 v4 socket 进入（request.client.host 保持纯 v4，
+    不影响 is_trusted_bootstrap_source 等基于地址的信任判断），
+    也避免 Linux 上 v6 socket 与 v4 socket 端口冲突。
+    所有实例共享同一 app；任一实例退出则整体退出。
+    """
+    import uvicorn
+    from network_address import create_listen_sockets
+
+    port = port or API_PORT
+    hosts = _api_bind_hosts(host)
+
+    sockets = create_listen_sockets(
+        hosts,
+        port,
+        backlog=2048,
+        allow_partial=len(hosts) > 1,
+    )
+    actual_port = int(sockets[0].getsockname()[1])
+
+    servers = []
+    for sock in sockets:
+        bind_host = str(sock.getsockname()[0])
+        config = uvicorn.Config(
+            app,
+            host=bind_host,
+            port=actual_port,
+            log_level="info",
+            log_config=None,
+            timeout_graceful_shutdown=10,
+        )
+        server = uvicorn.Server(config)
+        register_uvicorn_server(server)
+        servers.append(server)
+
+    try:
+        if len(servers) == 1:
+            servers[0].run(sockets=[sockets[0]])
+            return
+
+        threads = [
+            threading.Thread(
+                target=server.run,
+                kwargs={"sockets": [sock]},
+                daemon=True,
+            )
+            for server, sock in zip(servers, sockets)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        for sock in sockets:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
     # 启动前检查模型文件（静默模式，仅日志提示）
     from model_downloader import ensure_model_or_warn
     ensure_model_or_warn()
 
     # 自建 uvicorn.Server 并注册，使 POST /api/system/shutdown 能触发
     # 跨平台优雅关闭（should_exit → lifespan shutdown → _shutdown_resources）。
-    # 支持 start_tui 脚本的 QLH_BACKEND_HOST / QLH_BACKEND_PORT 覆盖。
+    # 支持 start_tui 脚本的 QLH_BACKEND_HOST / QLH_BACKEND_PORT 覆盖；
+    # 默认双栈监听（IPv4 + IPv6）。
     logger.info("启动 API 服务器...")
     _backend_host = os.environ.get("QLH_BACKEND_HOST", "0.0.0.0")
     _backend_port = int(os.environ.get("QLH_BACKEND_PORT") or API_PORT)
-    _uvicorn_config = uvicorn.Config(
-        app,
-        host=_backend_host,
-        port=_backend_port,
-        log_level="info",
-    )
-    _uvicorn_server = uvicorn.Server(_uvicorn_config)
-    register_uvicorn_server(_uvicorn_server)
-    _uvicorn_server.run()
+    run_api_servers(_backend_host, _backend_port)

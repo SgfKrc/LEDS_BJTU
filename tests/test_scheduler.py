@@ -4294,6 +4294,9 @@ class TestPipelineOrchestrationIntegration:
     @pytest.fixture
     def sched_master(self, monkeypatch):
         """创建一个"主节点" scheduler，含模拟 TCP 服务端"""
+        from node_runtime import node_runtime
+        monkeypatch.setattr(node_runtime, "_node_id", "master")
+        monkeypatch.setattr(node_runtime, "_node_role", "master")
         s = Scheduler()
         # 伪装为主节点
         s._role_override = "master"
@@ -4930,10 +4933,37 @@ class TestProvisionalMasterRole:
         monkeypatch.setattr(cfg, "NODE_ID", "master", raising=False)
         monkeypatch.setattr(scheduler_mod, "NODE_ROLE", "master", raising=False)
         monkeypatch.setattr(scheduler_mod, "NODE_ID", "master", raising=False)
+        from node_runtime import node_runtime
+        monkeypatch.setattr(node_runtime, "_node_id", "master")
+        monkeypatch.setattr(node_runtime, "_node_role", "master")
         monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
         monkeypatch.delenv("QLH_NODE_ROLE", raising=False)
 
-    def test_unconfigured_db_unavailable_master_is_provisional(self, monkeypatch, tmp_path):
+    def test_local_only_master_is_not_provisional(self, monkeypatch, tmp_path):
+        """本地 SQLite 主节点不因远端数据库退场而降级。"""
+        import scheduler as scheduler_mod
+
+        self._set_master_role(monkeypatch, tmp_path)
+        monkeypatch.setattr(scheduler_mod, "_db_disabled", True)  # 数据库未配置
+        sched = Scheduler()
+        sched._master_identity_verified = True
+        sched._master_identity_reason = "db_unavailable"
+
+        role = sched.get_my_role()
+
+        assert role["node_role"] == "master"
+        assert role["is_master"] is True
+        assert role["is_provisional"] is False
+        assert role["can_join_existing_master"] is False
+
+    def test_configured_db_unavailable_master_is_not_provisional(self, monkeypatch, tmp_path):
+        """DB 已配置但临时不可用的主节点：绝不降级为 provisional。
+
+        回归：IPv6 网络连不上 IPv4-only 数据库时，主节点被误判为
+        can_join_existing_master → is_master=false → 管理功能隐藏、
+        /api/bootstrap/info 返回 is_master=false（Tailnet 发现失效）、
+        PC 从节点连接失败。
+        """
         self._set_master_role(monkeypatch, tmp_path)
         sched = Scheduler()
         sched._master_identity_verified = True
@@ -4941,11 +4971,10 @@ class TestProvisionalMasterRole:
 
         role = sched.get_my_role()
 
-        assert role["node_role"] == "unknown"
-        assert role["runtime_node_role"] == "master"
-        assert role["is_master"] is False
-        assert role["is_provisional"] is True
-        assert role["can_join_existing_master"] is True
+        assert role["node_role"] == "master"
+        assert role["is_master"] is True
+        assert role["is_provisional"] is False
+        assert role["can_join_existing_master"] is False
 
     def test_database_verified_master_is_not_provisional(self, monkeypatch, tmp_path):
         self._set_master_role(monkeypatch, tmp_path)

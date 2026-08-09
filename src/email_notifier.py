@@ -48,20 +48,20 @@ _ADMIN_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # ============================================================
 
 def _cluster_config_admin_email() -> str:
-    """读取共享 DB cluster_config 中的集群级管理员邮箱；异常/未配置时返回空串。"""
+    """读取主节点 SQLite 中的管理员邮箱；异常/未配置时返回空串。"""
     try:
-        from db import get_config
-        value = get_config(CLUSTER_ADMIN_EMAIL_KEY, "")
+        import local_store
+        value = local_store.get_local_setting(CLUSTER_ADMIN_EMAIL_KEY, "")
         return str(value or "").strip()
     except Exception:
         return ""
 
 
 def _persist_cluster_admin_email(email: str) -> bool:
-    """写入共享 DB cluster_config（集群级，仅主节点调用）；失败返回 False。"""
+    """写入主节点 SQLite；失败返回 False。"""
     try:
-        from db import set_config
-        set_config(CLUSTER_ADMIN_EMAIL_KEY, email)
+        import local_store
+        local_store.set_local_setting(CLUSTER_ADMIN_EMAIL_KEY, email)
         return True
     except Exception:
         return False
@@ -505,8 +505,8 @@ class MailPoller:
     def _has_pending_tickets(self) -> bool:
         """检查是否有待处理的审查工单（避免无意义的 IMAP 连接）。"""
         try:
-            from db import list_review_tickets
-            rows = list_review_tickets("pending")
+            import local_store
+            rows = local_store.list_local_review_tickets("pending")
             return bool(rows)
         except Exception:
             # DB 不可用时假定有工单（宁可多连一次 IMAP 也不错失投票）
