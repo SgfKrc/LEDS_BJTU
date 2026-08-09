@@ -1,0 +1,54 @@
+{
+  "plan_id": "plan-model-fleet-n2f-fixed-tile-v1",
+  "title": "MF-MEM-N2F 真实 7B 固定 64 MiB 双槽桥接与取消边界",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11 WDDM",
+    "engine": "isolated Transformers + bitsandbytes NF4 + explicit module hook",
+    "artifact": "models/deepseek-r1-distill-qwen-7b",
+    "weight_bytes": 15231233024,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop 8GB",
+    "ram_gb": 16,
+    "fixed_tile_mib": 64,
+    "tile_slots": 2,
+    "scope_note": "The bridge bounds each explicit transport chunk; it does not cap full module residency."
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 900,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "gpu0",
+      "model_slot": "deepseek-7b-n2f"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-1221",
+      "name": "fixed 64 MiB bridge full ctx128",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--ticket", "MF-MEM-N2F", "--mode", "explicit-layer-pager-64", "--context", "128", "--batch-size", "1", "--max-new-tokens", "1", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "explicit-layer-pager-64", "context": 128, "batch_size": 1, "fixed_tile_mib": 64, "tile_slots": 2, "cancel_after_layer": 0}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1222",
+      "name": "fixed bridge cancellation at layer boundary ctx128",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--ticket", "MF-MEM-N2F", "--mode", "explicit-layer-pager-64", "--context", "128", "--batch-size", "1", "--max-new-tokens", "1", "--cancel-after-layer", "1", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "explicit-layer-pager-64", "context": 128, "batch_size": 1, "fixed_tile_mib": 64, "tile_slots": 2, "cancel_after_layer": 1}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "cancelled", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1223",
+      "name": "fixed bridge cancellation at layer boundary ctx8192",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--ticket", "MF-MEM-N2F", "--mode", "explicit-layer-pager-64", "--context", "8192", "--batch-size", "1", "--max-new-tokens", "1", "--cancel-after-layer", "1", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "explicit-layer-pager-64", "context": 8192, "batch_size": 1, "fixed_tile_mib": 64, "tile_slots": 2, "cancel_after_layer": 1}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "cancelled", "op": "==", "threshold": 1}
+    }
+  ]
+}

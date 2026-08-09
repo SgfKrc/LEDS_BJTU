@@ -1,0 +1,75 @@
+{
+  "plan_id": "plan-model-fleet-n2r-real-compare-v1",
+  "title": "MF-MEM-N2R 固定 7B NF4 真实对照",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "os": "Windows 11 WDDM",
+    "engine": "isolated Transformers + bitsandbytes NF4",
+    "artifact": "models/deepseek-r1-distill-qwen-7b",
+    "weight_bytes": 15231233024,
+    "gpu": "NVIDIA GeForce RTX 4060 Laptop 8GB",
+    "ram_gb": 16
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 900,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "gpu0",
+      "model_slot": "deepseek-7b-n2r"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-1211",
+      "name": "resident NF4 context128 batch1",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--mode", "resident-nf4", "--context", "128", "--batch-size", "1", "--max-new-tokens", "8", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "resident-nf4", "context": 128, "batch_size": 1, "quant_family": "nf4"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1212",
+      "name": "device_map auto NF4 context128 batch1",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--mode", "device-map-auto", "--context", "128", "--batch-size", "1", "--max-new-tokens", "8", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "device-map-auto", "context": 128, "batch_size": 1, "quant_family": "nf4"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1213",
+      "name": "resident NF4 context2048 batch1",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--mode", "resident-nf4", "--context", "2048", "--batch-size", "1", "--max-new-tokens", "8", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "resident-nf4", "context": 2048, "batch_size": 1, "quant_family": "nf4"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1214",
+      "name": "device_map auto NF4 context2048 batch4",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--mode", "device-map-auto", "--context", "2048", "--batch-size", "4", "--max-new-tokens", "4", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "device-map-auto", "context": 2048, "batch_size": 4, "quant_family": "nf4"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1215",
+      "name": "CPU-only safety gate",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--mode", "cpu-only", "--context", "128", "--batch-size", "1", "--max-new-tokens", "4", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "cpu-only", "context": 128, "batch_size": 1, "quant_family": "bf16"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "bf16"},
+      "gate": {"metric": "resource_rejected", "op": "==", "threshold": 1}
+    },
+    {
+      "experiment_id": "exp-1216",
+      "name": "real explicit pager adapter safety gate",
+      "command": ["python", "-X", "utf8", "scripts/model_fleet_n2r_compare.py", "--mode", "explicit-layer-pager", "--context", "128", "--batch-size", "1", "--max-new-tokens", "1", "--result-file", "{out_dir}/{experiment_id}.result.json"],
+      "params": {"independent_variable": {"mode": "explicit-layer-pager", "context": 128, "batch_size": 1, "quant_family": "nf4"}},
+      "model": {"id": "deepseek-r1-distill-qwen-7b", "quant_family": "nf4"},
+      "gate": {"metric": "completed", "op": "==", "threshold": 1}
+    }
+  ]
+}
