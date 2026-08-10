@@ -32,6 +32,7 @@ import update_core
 _BUNDLE_MODULES = (
     "qlh_launcher.py",
     "diagnose.py",
+    "repair.py",
     "update_core.py",
     "updater.py",
     "signing.py",

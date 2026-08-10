@@ -90,6 +90,15 @@ def test_diagnose_command_uses_detected_root_and_structured_output(monkeypatch, 
     assert __import__("json").loads(capsys.readouterr().out) == report
 
 
+def test_repair_command_uses_detected_root_and_structured_output(monkeypatch, tmp_path, capsys):
+    report = {"ok": True, "action": "repaired", "repaired": ["app.exe"]}
+    monkeypatch.setattr(qlh_launcher, "diagnosis_app_root", lambda _variant: tmp_path)
+    monkeypatch.setattr(qlh_launcher, "repair_install", lambda root, **kwargs: report)
+
+    assert qlh_launcher.main(["repair", "--source", "https://updates.example/latest.json", "--json"]) == 0
+    assert __import__("json").loads(capsys.readouterr().out) == report
+
+
 def test_controller_bundles_a_sanitized_diagnosis_report(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setattr(qlh_launcher, "default_state_dir", lambda: tmp_path / "state")
@@ -156,6 +165,7 @@ def test_linux_deb_build_keeps_bootstrap_and_venv_fallback_contract():
 
     assert '"$PACKAGING_DIR/qlh_launcher.py"' in script
     assert '"$PACKAGING_DIR/diagnose.py"' in script
+    assert '"$PACKAGING_DIR/repair.py"' in script
     assert '"$PACKAGING_DIR/update_core.py"' in script
     assert '"$PACKAGING_DIR/updater.py"' in script
     assert '"$PACKAGING_DIR/version_store.py"' in script
@@ -188,7 +198,7 @@ def test_bjtu_routes_launcher_maintenance_commands():
     windows = (PROJECT_ROOT / "bjtu.bat").read_text(encoding="utf-8")
     linux = (PROJECT_ROOT / "bjtu.sh").read_text(encoding="utf-8")
     packaged = (PROJECT_ROOT / "packaging" / "linux" / "bjtu").read_text(encoding="utf-8")
-    for command in ("launcher-status", "launcher-check", "launcher-install", "launcher-rollback", "diagnostics", "verify", "diagnose"):
+    for command in ("launcher-status", "launcher-check", "launcher-install", "launcher-rollback", "diagnostics", "verify", "diagnose", "repair"):
         assert command in windows
         assert command in linux
         assert command in packaged

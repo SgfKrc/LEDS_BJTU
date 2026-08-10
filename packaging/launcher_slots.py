@@ -34,7 +34,7 @@ _SCHEMA = 1
 _SLOTS = ("a", "b")
 _MAINTENANCE_COMMANDS = {
     "check", "download", "install", "launcher-status", "launcher-stage",
-    "launcher-activate", "launcher-rollback", "launcher-recover", "diagnostics", "diagnose",
+    "launcher-activate", "launcher-rollback", "launcher-recover", "diagnostics", "verify", "diagnose", "repair",
     "version-status", "version-stage", "version-activate", "version-rollback",
     "version-recover",
 }

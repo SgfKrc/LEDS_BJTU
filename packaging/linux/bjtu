@@ -28,7 +28,7 @@ case "${1:-tui}" in
         shift
         exec /usr/local/bin/qlh-launcher "$command" "$@"
         ;;
-    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose)
+    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose|repair)
         command="$1"
         shift
         exec /usr/local/bin/qlh-launcher "$command" "$@"
@@ -51,7 +51,8 @@ case "${1:-tui}" in
             '                  管理 UP-N4 Launcher 槽位、修复与诊断' \
             '  bjtu verify [--level quick|full|deep] [--json]' \
             '                  校验签名清单中的程序文件（不扫描用户数据）' \
-            '  bjtu diagnose [--json]  输出只读故障诊断与人工处理建议'
+            '  bjtu diagnose [--json]  输出只读故障诊断与人工处理建议' \
+            '  bjtu repair [--json]    修复当前版本中损坏的签名程序文件'
         ;;
     *)
         exec /usr/local/bin/qlh-launcher app-tui "$@"

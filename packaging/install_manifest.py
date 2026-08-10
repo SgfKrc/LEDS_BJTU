@@ -531,6 +531,22 @@ def _manifest_file_path(root: Path, relative_path: str) -> Path:
     return target
 
 
+def resolve_install_manifest_path(
+    root: str | os.PathLike[str], relative_path: str,
+) -> Path:
+    """Resolve one signed application path without following links.
+
+    This is intentionally narrower than a general path utility: callers must
+    pass a path already listed in a verified install manifest.  It is exposed
+    for maintenance operations such as UP-N6.3 repair so they share the same
+    link/reparse-point boundary as runtime verification.
+    """
+    install_root = _safe_install_root(root)
+    return _manifest_file_path(
+        install_root, normalize_relative_path(relative_path),
+    )
+
+
 def _stat_manifest_file(root: Path, relative_path: str) -> tuple[Path, os.stat_result]:
     path = _manifest_file_path(root, relative_path)
     try:

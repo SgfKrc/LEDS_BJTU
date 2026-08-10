@@ -258,6 +258,15 @@ python packaging/qlh_launcher.py diagnose --root dist/QLH-Edge-Inference --error
 
 Launcher GUI/TUI 可直接运行诊断。导出 UP-N4 脱敏诊断 ZIP 时会附入无安装根/失败路径的诊断摘要，且只接受 Launcher 状态目录 `diagnostics/` 内不超过 1MiB 的 JSON。
 
+### 单文件修复（UP-N6.3）— `repair`
+
+```powershell
+python packaging/qlh_launcher.py repair --root dist/QLH-Edge-Inference --source https://updates.example/latest.json --json
+python packaging/repair.py build-index --root dist/QLH-Edge-Inference --output packaging/dist/QLH-Edge-Inference-Repair-v0.1.8.1-windows-cpu.json --payload-dir packaging/dist/repair/0.1.8.1/windows/cpu --url-prefix /repair/0.1.8.1/windows/cpu --trusted-keys-dir packaging/pubkeys
+```
+
+修复先执行 deep 校验，只处理已签名清单中的 `missing`、`size`、`hash` 失败。更新清单必须已验签且版本完全匹配，`repair-index` 经外层清单 SHA-256 固定，索引的每项仍需逐项匹配本机签名基线。全部载荷先下载校验，再写入同目录临时文件并原子替换；旧文件会保留为 Launcher 状态目录内的 `.bak`。超过 10 个文件或 64MiB 时不会下载或写入，而是要求使用已签名整包。修复后必跑 deep 校验，失败则回滚已替换文件。模型、聊天记录、日志、配置和本地文档既不读取也不写入。
+
 ### 原子版本与回滚（UP-N3）— version_store.py
 
 UP-N3 不直接覆盖正在运行的安装目录。版本目录先进入独立 store，健康门通过后才原子切换
