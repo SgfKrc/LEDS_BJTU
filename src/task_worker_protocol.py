@@ -774,7 +774,13 @@ def _validate_generation_fields(root_input: dict[str, Any], field: str) -> None:
         allow_empty=True,
         max_length=80,
     )
-    if scheduler not in {"", "PNDMScheduler", "DPMSolverMultistepScheduler"}:
+    if scheduler not in {
+        "",
+        "PNDMScheduler",
+        "DPMSolverMultistepScheduler",
+        "EulerDiscreteScheduler",
+        "DDIMScheduler",
+    }:
         raise _error(
             "invalid_image_stage",
             f"{field}.scheduler",

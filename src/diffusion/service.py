@@ -291,7 +291,13 @@ class SD15EditRequest:
             raise DiffusionInputError(
                 'steps and strength must produce at least one denoising step'
             )
-        if self.scheduler not in {'', 'PNDMScheduler', 'DPMSolverMultistepScheduler'}:
+        if self.scheduler not in {
+            '',
+            'PNDMScheduler',
+            'DPMSolverMultistepScheduler',
+            'EulerDiscreteScheduler',
+            'DDIMScheduler',
+        }:
             raise DiffusionInputError('unsupported SD15 scheduler')
         if not math.isfinite(self.guidance_scale) or self.guidance_scale < 0:
             raise DiffusionInputError('guidance_scale must be finite and non-negative')
