@@ -8,6 +8,7 @@ import {
   Param,
   Patch,
   Post,
+  Query,
   Req,
 } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
@@ -17,6 +18,7 @@ import {
   AuthenticatedSession,
 } from '../../data/auth-service';
 import { LocalUserRole } from '../../data/auth-asset-repository';
+import { TailscaleLocalStatusService } from '../../data/tailscale-local-status';
 
 interface BootstrapRequest {
   username?: string;
@@ -69,7 +71,10 @@ function bearerToken(req: FastifyRequest): string | null {
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly auth: AuthService) {}
+  constructor(
+    private readonly auth: AuthService,
+    private readonly tailscaleStatus: TailscaleLocalStatusService,
+  ) {}
 
   @Post('bootstrap')
   @HttpCode(201)
@@ -121,6 +126,29 @@ export class AuthController {
     return { session_id: current.session_id, expires_at: current.expires_at, user: current.user };
   }
 
+  @Get('sessions')
+  listSessions(
+    @Req() req: FastifyRequest,
+    @Query('user_id') userId?: string,
+  ): Record<string, unknown> {
+    return this.runSync(() => {
+      const current = this.currentSession(req);
+      return { sessions: this.auth.listAuthSessions(current, userId || current.user.user_id) };
+    });
+  }
+
+  @Delete('sessions/:sessionId')
+  @HttpCode(200)
+  revokeSession(
+    @Req() req: FastifyRequest,
+    @Param('sessionId') sessionId: string,
+  ): Record<string, unknown> {
+    return this.runSync(() => ({
+      status: 'revoked',
+      session: this.auth.revokeAuthSession(this.currentSession(req), sessionId),
+    }));
+  }
+
   @Post('logout')
   @HttpCode(200)
   logout(@Req() req: FastifyRequest): Record<string, string> {
@@ -141,6 +169,12 @@ export class AuthController {
   @Get('tailscale/bindings')
   listTailscaleBindings(@Req() req: FastifyRequest): Record<string, unknown> {
     return this.runSync(() => ({ bindings: this.auth.listTailscaleBindings(this.currentSession(req)) }));
+  }
+
+  @Get('tailscale/local-status')
+  async localTailscaleStatus(@Req() req: FastifyRequest): Promise<Record<string, unknown>> {
+    this.currentSession(req);
+    return { local_status: await this.tailscaleStatus.inspect() };
   }
 
   @Post('tailscale/bindings')
@@ -209,7 +243,10 @@ export class AuthController {
       if (current.user.role !== 'owner' && current.user.role !== 'admin') {
         throw new AuthServiceError(403, '需要 owner 或 admin 权限');
       }
-      return { status: 'pending', provisioning: await this.auth.createProvisioningForUser(userId) };
+      return {
+        status: 'pending',
+        provisioning: await this.auth.createProvisioningForUser(current, userId),
+      };
     });
   }
 

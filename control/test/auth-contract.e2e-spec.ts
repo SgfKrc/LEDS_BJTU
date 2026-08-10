@@ -109,6 +109,10 @@ describe('MF-AUTH-N1 local Auth App and user management contract', () => {
       headers: { authorization: `Bearer ${result.token}` },
     });
     expect(users.statusCode).toBe(200);
+    expect(users.json().users[0]).toMatchObject({
+      totp_state: 'active',
+      active_session_count: 1,
+    });
     expect(users.json().users[0]).not.toHaveProperty('secret');
     expect(users.json().users[0]).not.toHaveProperty('otpauth_uri');
     const databaseBytes = fs.readFileSync(store.filePath).toString('utf8');
@@ -268,5 +272,88 @@ describe('MF-AUTH-N1 local Auth App and user management contract', () => {
       headers: { authorization: `Bearer ${memberLogin.json().access_token}` },
     });
     expect(session.statusCode).toBe(401);
+  });
+
+  it('lists local login sessions without token hashes and revokes one immediately', async () => {
+    const result = await bootstrapAndLogin();
+    const code = totp(result.provisioning.secret, Date.now(), 'SHA1', 6, 30, 0);
+    const secondLogin = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { username: 'owner', code },
+    });
+    expect(secondLogin.statusCode).toBe(200);
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/auth/sessions',
+      headers: { authorization: `Bearer ${result.token}` },
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().sessions).toHaveLength(2);
+    expect(listed.json().sessions.every((entry: Record<string, unknown>) => !('token_hash' in entry))).toBe(true);
+    const other = listed.json().sessions.find((entry: { current: boolean }) => !entry.current);
+    expect(other).toMatchObject({ session_id: secondLogin.json().session_id, active: true });
+
+    const revoked = await app.inject({
+      method: 'DELETE',
+      url: `/auth/sessions/${other.session_id}`,
+      headers: { authorization: `Bearer ${result.token}` },
+    });
+    expect(revoked.statusCode).toBe(200);
+    expect(revoked.json().session).toMatchObject({ active: false, current: false });
+
+    const oldSession = await app.inject({
+      method: 'GET',
+      url: '/auth/session',
+      headers: { authorization: `Bearer ${secondLogin.json().access_token}` },
+    });
+    expect(oldSession.statusCode).toBe(401);
+    const currentSession = await app.inject({
+      method: 'GET',
+      url: '/auth/session',
+      headers: { authorization: `Bearer ${result.token}` },
+    });
+    expect(currentSession.statusCode).toBe(200);
+  });
+
+  it('prevents an admin from replacing the owner Auth App', async () => {
+    const result = await bootstrapAndLogin();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/users',
+      headers: { authorization: `Bearer ${result.token}` },
+      payload: { username: 'local-admin', role: 'admin' },
+    });
+    expect(created.statusCode).toBe(201);
+    const admin = created.json().user as { user_id: string };
+    const provisioning = await app.inject({
+      method: 'POST',
+      url: `/auth/users/${admin.user_id}/totp`,
+      headers: { authorization: `Bearer ${result.token}` },
+    });
+    const adminProvisioning = provisioning.json().provisioning as Record<string, string>;
+    const adminCode = totp(adminProvisioning.secret, Date.now(), 'SHA1', 6, 30, 0);
+    await app.inject({
+      method: 'POST',
+      url: '/auth/totp/verify',
+      payload: {
+        user_id: admin.user_id,
+        authenticator_id: adminProvisioning.authenticator_id,
+        code: adminCode,
+      },
+    });
+    const login = await app.inject({
+      method: 'POST',
+      url: '/auth/login',
+      payload: { username: 'local-admin', code: adminCode },
+    });
+    expect(login.statusCode).toBe(200);
+    const denied = await app.inject({
+      method: 'POST',
+      url: `/auth/users/${result.user.user_id}/totp`,
+      headers: { authorization: `Bearer ${login.json().access_token}` },
+    });
+    expect(denied.statusCode).toBe(403);
   });
 });
