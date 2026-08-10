@@ -223,6 +223,53 @@ def test_parent_reference_and_owner_checks_fail_closed(tmp_path):
         store.close()
 
 
+def test_owner_scope_cleanup_revokes_only_explicit_owner_leases(tmp_path):
+    store = PersistentImageBlobStore(tmp_path / "blobs")
+    try:
+        owned = _put(
+            store,
+            _png(color=(10, 30, 50)),
+            owner="distributed:wf_cleanup01",
+            purpose="output",
+        )
+        other = _put(
+            store,
+            _png(color=(60, 80, 100)),
+            owner="distributed:wf_cleanup02",
+            purpose="output",
+        )
+        store.acquire_lease(
+            owned.blob_id,
+            attempt_id="att_cleanup_12345678",
+        )
+
+        blocked = store.delete_owner_scope(
+            "distributed:wf_cleanup01",
+            purpose="output",
+        )
+        assert blocked == {
+            "blobs_removed": 0,
+            "blobs_blocked": 1,
+            "leases_revoked": 0,
+        }
+
+        removed = store.delete_owner_scope(
+            "distributed:wf_cleanup01",
+            purpose="output",
+            revoke_leases=True,
+        )
+        assert removed == {
+            "blobs_removed": 1,
+            "blobs_blocked": 0,
+            "leases_revoked": 1,
+        }
+        with pytest.raises(BlobNotFound):
+            store.descriptor(owned.blob_id)
+        assert store.descriptor(other.blob_id).blob_id == other.blob_id
+    finally:
+        store.close()
+
+
 def test_capacity_eviction_preserves_parents_of_the_incoming_blob(tmp_path):
     parent_data = _png(color=(1, 2, 3))
     unrelated_data = _png(color=(4, 5, 6))

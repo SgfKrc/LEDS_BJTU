@@ -7,6 +7,7 @@ import { AppModule } from '../src/app';
 import { CredentialProtector, ModelCredentialStore } from '../src/data/model-credential-store';
 import { SqliteStore } from '../src/data/sqlite-store';
 import { totp } from '../src/data/auth-service';
+import { TailscaleLocalStatusService } from '../src/data/tailscale-local-status';
 
 class TestProtector implements CredentialProtector {
   readonly name = 'test-protector';
@@ -36,6 +37,26 @@ describe('MF-AUTH-N2 Tailscale binding contract', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(store)
       .overrideProvider(ModelCredentialStore).useValue(vault)
+      .overrideProvider(TailscaleLocalStatusService).useValue({
+        inspect: async () => ({
+          available: true,
+          state: 'ready',
+          reason_code: null,
+          source: 'tailscale_status_json',
+          observed_at: '2026-08-10T10:00:00.000Z',
+          requires_confirmation: true,
+          candidate: {
+            tailnet_id: 'tailnet-local.ts.net',
+            tailnet_id_source: 'magic_dns_suffix',
+            tailnet_display_name: 'Local tailnet',
+            tailscale_user_id: '12345',
+            node_id: 'node-local',
+            hostname: 'local-node',
+            dns_name: 'local-node.tailnet-local.ts.net.',
+            addresses: ['100.64.0.2', 'fd7a:115c:a1e0::2'],
+          },
+        }),
+      })
       .compile();
     app = moduleRef.createNestApplication(
       new (require('@nestjs/platform-fastify').FastifyAdapter)(),
@@ -144,6 +165,31 @@ describe('MF-AUTH-N2 Tailscale binding contract', () => {
     expect(store.prepare(
       "SELECT COUNT(*) AS count FROM auth_audit_events WHERE event_type LIKE 'tailscale_binding_%' AND actor_user_id = ?",
     ).get(owner.userId)).toEqual({ count: 4 });
+  });
+
+  it('requires a local session before returning the safe status candidate', async () => {
+    const unauthenticated = await app.inject({ method: 'GET', url: '/auth/tailscale/local-status' });
+    expect(unauthenticated.statusCode).toBe(401);
+
+    const owner = await bootstrapOwner();
+    const response = await app.inject({
+      method: 'GET',
+      url: '/auth/tailscale/local-status',
+      headers: { authorization: `Bearer ${owner.token}` },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().local_status).toMatchObject({
+      available: true,
+      requires_confirmation: true,
+      candidate: {
+        tailnet_id: 'tailnet-local.ts.net',
+        tailscale_user_id: '12345',
+        node_id: 'node-local',
+      },
+    });
+    expect(response.json().local_status).not.toHaveProperty('Peer');
+    expect(response.json().local_status.candidate).not.toHaveProperty('login_name');
+    expect(response.json().local_status.candidate).not.toHaveProperty('public_key');
   });
 
   it('rejects cross-user identity reuse and preserves both states', async () => {

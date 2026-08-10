@@ -51,6 +51,22 @@ export interface AuthenticatedSession {
   expires_at: string;
 }
 
+export interface AuthSessionView {
+  session_id: string;
+  user_id: string;
+  created_at: string;
+  expires_at: string;
+  last_seen_at: string;
+  revoked_at: string | null;
+  active: boolean;
+  current: boolean;
+}
+
+export interface ManagedUserView extends LocalUserRecord {
+  totp_state: 'none' | 'pending' | 'active';
+  active_session_count: number;
+}
+
 export interface LoginResult extends AuthenticatedSession {
   access_token: string;
   token_type: 'Bearer';
@@ -225,7 +241,11 @@ export class AuthService {
     }
   }
 
-  async createProvisioningForUser(userId: string): Promise<ProvisioningPayload> {
+  async createProvisioningForUser(
+    session: AuthenticatedSession,
+    userId: string,
+  ): Promise<ProvisioningPayload> {
+    this.requireSessionAccess(session, userId);
     const user = this.requireActiveUser(userId);
     return this.createProvisioning(user);
   }
@@ -381,9 +401,70 @@ export class AuthService {
     return codes;
   }
 
-  listUsers(session: AuthenticatedSession): LocalUserRecord[] {
+  listUsers(session: AuthenticatedSession): ManagedUserView[] {
     this.requireManager(session);
-    return this.assets.listUsers().map(safeUser);
+    const now = iso();
+    return this.assets.listUsers().map((user) => {
+      const authenticators = this.assets.listAuthenticators(user.user_id);
+      const totpState = authenticators.some((entry) => entry.state === 'active')
+        ? 'active'
+        : authenticators.some((entry) => entry.state === 'pending') ? 'pending' : 'none';
+      const sessionCount = this.store.prepare(
+        `SELECT COUNT(*) AS count FROM auth_sessions
+         WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?`,
+      ).get(user.user_id, now) as { count: number };
+      return {
+        ...safeUser(user),
+        totp_state: totpState,
+        active_session_count: Number(sessionCount.count),
+      };
+    });
+  }
+
+  listAuthSessions(
+    session: AuthenticatedSession,
+    userId = session.user.user_id,
+  ): AuthSessionView[] {
+    this.requireSessionAccess(session, userId);
+    const now = iso();
+    const rows = this.store.prepare(
+      `SELECT session_id, user_id, created_at, expires_at, last_seen_at, revoked_at
+       FROM auth_sessions WHERE user_id = ? ORDER BY created_at DESC, session_id DESC`,
+    ).all(userId) as Array<Omit<AuthSessionView, 'active' | 'current'>>;
+    return rows.map((row) => ({
+      ...row,
+      active: row.revoked_at === null && row.expires_at > now,
+      current: row.session_id === session.session_id,
+    }));
+  }
+
+  revokeAuthSession(session: AuthenticatedSession, sessionId: string): AuthSessionView {
+    const row = this.store.prepare(
+      `SELECT session_id, user_id, created_at, expires_at, last_seen_at, revoked_at
+       FROM auth_sessions WHERE session_id = ?`,
+    ).get(sessionId) as Omit<AuthSessionView, 'active' | 'current'> | undefined;
+    if (!row) throw new AuthServiceError(404, '本地登录会话不存在');
+    this.requireSessionAccess(session, row.user_id);
+    const revokedAt = row.revoked_at ?? iso();
+    if (!row.revoked_at) {
+      this.store.prepare(
+        'UPDATE auth_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL',
+      ).run(revokedAt, sessionId);
+      this.assets.appendAudit({
+        user_id: row.user_id,
+        actor_user_id: session.user.user_id,
+        event_type: 'session_revoked',
+        outcome: 'success',
+        subject_id: sessionId,
+        details: { current: sessionId === session.session_id },
+      });
+    }
+    return {
+      ...row,
+      revoked_at: revokedAt,
+      active: false,
+      current: sessionId === session.session_id,
+    };
   }
 
   createUser(session: AuthenticatedSession, input: { username: string; display_name?: string; role?: LocalUserRole }): LocalUserRecord {
@@ -636,6 +717,15 @@ export class AuthService {
     if (requestedRole && requestedRole !== 'member' && session.user.role !== 'owner') {
       throw new AuthServiceError(403, '只有 owner 可以授予 admin 或 owner 角色');
     }
+  }
+
+  private requireSessionAccess(session: AuthenticatedSession, userId: string): void {
+    const target = this.assets.getUser(userId);
+    if (!target) throw new AuthServiceError(404, '本地用户不存在');
+    if (session.user.user_id === userId) return;
+    if (session.user.role === 'owner') return;
+    if (session.user.role === 'admin' && target.role !== 'owner') return;
+    throw new AuthServiceError(403, '没有管理该用户登录会话的权限');
   }
 
   private requireBindingAccess(session: AuthenticatedSession, userId: string): void {

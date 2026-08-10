@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QLH model-tools P0 CLI entry point."""
+"""QLH model-tools CLI entry point."""
 
 from __future__ import annotations
 

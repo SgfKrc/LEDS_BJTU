@@ -1352,6 +1352,80 @@ class PersistentImageBlobStore:
                 self._rollback()
                 raise
 
+    def delete_owner_scope(
+        self,
+        owner_scope: str,
+        *,
+        purpose: str | None = None,
+        revoke_leases: bool = False,
+    ) -> dict[str, int]:
+        """Delete unreferenced blobs owned by one exact internal scope."""
+        normalized_owner = self._safe_value(owner_scope, "owner_scope")
+        normalized_purpose = (
+            self._safe_value(purpose, "purpose") if purpose is not None else None
+        )
+        now = self._clock()
+        where = "b.owner_scope = ?"
+        params: list[Any] = [normalized_owner]
+        if normalized_purpose is not None:
+            where += " AND b.purpose = ?"
+            params.append(normalized_purpose)
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin()
+                self._purge_expired_locked(now)
+                leases_revoked = 0
+                if revoke_leases:
+                    cursor = self._db.execute(
+                        f"""
+                        DELETE FROM blob_leases
+                        WHERE blob_id IN (
+                            SELECT b.blob_id FROM blobs b WHERE {where}
+                        )
+                        """,
+                        tuple(params),
+                    )
+                    leases_revoked = max(0, int(cursor.rowcount))
+                removed = 0
+                while True:
+                    rows = list(self._db.execute(
+                        f"""
+                        SELECT b.blob_id
+                        FROM blobs b
+                        WHERE {where}
+                          AND NOT EXISTS (
+                            SELECT 1 FROM blob_leases l
+                            WHERE l.blob_id = b.blob_id AND l.expires_at > ?
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM blob_parents p
+                            WHERE p.parent_blob_id = b.blob_id
+                          )
+                        ORDER BY b.created_at DESC, b.blob_id DESC
+                        """,
+                        (*params, now),
+                    ))
+                    if not rows:
+                        break
+                    for row in rows:
+                        self._delete_blob_locked(row["blob_id"])
+                        removed += 1
+                blocked = int(self._db.execute(
+                    f"SELECT COUNT(*) FROM blobs b WHERE {where}",
+                    tuple(params),
+                ).fetchone()[0])
+                self._db.execute("COMMIT")
+                self._drain_object_gc()
+                return {
+                    "blobs_removed": removed,
+                    "blobs_blocked": blocked,
+                    "leases_revoked": leases_revoked,
+                }
+            except Exception:
+                self._rollback()
+                raise
+
     def cleanup(self) -> dict[str, int]:
         now = self._clock()
         with self._lock:

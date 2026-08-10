@@ -22,6 +22,7 @@ from task_worker_protocol import (  # noqa: E402
     stage_input_sha256,
 )
 from task_provider import (  # noqa: E402
+    ProviderExecutionError,
     ProviderUnavailable,
     StageAttempt,
     StageRequest,
@@ -351,6 +352,77 @@ def test_remote_diffusion_provider_uses_v3_worker_and_does_not_expose_grants():
     assert "grant" not in result.metadata
     provider.release(reservation.reservation_id)
     assert provider.inspect().active_reservations == 0
+
+
+def test_remote_provider_discards_result_cancelled_during_ingestion():
+    holder = {}
+    cancelled = threading.Event()
+    ingested = threading.Event()
+    discarded = []
+
+    worker = DiffusionWorkerAdapter(
+        node_id="worker_gpu_1",
+        capabilities=_capabilities(),
+        executor=lambda _payload, _cancel_event: _result(),
+        send_message=lambda message: holder["provider"].handle_message(
+            message.snapshot()
+        ),
+    )
+    coordinator = DiffusionCoordinatorControlPlane()
+    hello = worker.begin_hello()
+    assert hello is not None
+    worker.receive_hello_ack(coordinator.receive_hello(
+        "worker_gpu_1", hello.snapshot(), coordinator_node_id="master",
+    ).snapshot())
+
+    def ingest(_attempt, output, _transfer_plan):
+        safe_output = {
+            "image": {**output["image"], "blob_id": "img_localcancel123"},
+            "metrics": dict(output["metrics"]),
+        }
+        ingested.set()
+        cancelled.set()
+        return safe_output
+
+    def send_to_worker(message):
+        if message.message_type == "stage_offer":
+            worker.receive_offer(message.snapshot())
+        elif message.message_type == "stage_cancel":
+            worker.receive_cancel(message.snapshot())
+        else:
+            pytest.fail(f"unexpected provider message: {message.message_type}")
+
+    provider = RemoteDiffusionProvider(
+        node_id="worker_gpu_1",
+        peer_snapshot=lambda: coordinator.worker_snapshot("worker_gpu_1"),
+        send_message=send_to_worker,
+        result_ingestor=ingest,
+        result_discarder=lambda attempt, output: discarded.append((
+            attempt.attempt_id,
+            dict(output),
+        )),
+        dispatch_enabled=True,
+    )
+    holder["provider"] = provider
+    request = _stage_request(provider.provider_id)
+    reservation = provider.reserve(request)
+    attempt = StageAttempt(
+        attempt_id="att_diffcancel01",
+        request=request,
+        provider_id=provider.provider_id,
+        lease_id="lease_diffcancel01",
+        lease_epoch=1,
+        lease_expires_at=time.time() + 5.0,
+    )
+
+    with pytest.raises(ProviderExecutionError) as captured:
+        provider.execute(attempt, reservation, cancelled)
+
+    assert captured.value.code == "provider_cancelled"
+    assert ingested.is_set()
+    assert discarded[0][0] == attempt.attempt_id
+    assert discarded[0][1]["image"]["blob_id"] == "img_localcancel123"
+    provider.release(reservation.reservation_id)
 
 
 def test_remote_diffusion_provider_requires_explicit_dispatch_and_manifest_match():

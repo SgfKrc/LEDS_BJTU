@@ -84,7 +84,13 @@ class SD15GenerationRequest:
             raise ValueError("steps 必须在 1-100 之间")
         if self.guidance_scale < 0:
             raise ValueError("guidance_scale 不能为负数")
-        if self.scheduler not in {"", "PNDMScheduler", "DPMSolverMultistepScheduler"}:
+        if self.scheduler not in {
+            "",
+            "PNDMScheduler",
+            "DPMSolverMultistepScheduler",
+            "EulerDiscreteScheduler",
+            "DDIMScheduler",
+        }:
             raise ValueError(f"unsupported SD15 scheduler: {self.scheduler}")
 
 
@@ -546,11 +552,18 @@ class SD15Engine:
             yield
             return
 
-        from diffusers import DPMSolverMultistepScheduler, PNDMScheduler
+        from diffusers import (
+            DDIMScheduler,
+            DPMSolverMultistepScheduler,
+            EulerDiscreteScheduler,
+            PNDMScheduler,
+        )
 
         scheduler_types = {
             "DPMSolverMultistepScheduler": DPMSolverMultistepScheduler,
             "PNDMScheduler": PNDMScheduler,
+            "EulerDiscreteScheduler": EulerDiscreteScheduler,
+            "DDIMScheduler": DDIMScheduler,
         }
         scheduler_type = scheduler_types[requested]
         original_scheduler = getattr(pipeline, "scheduler", None)

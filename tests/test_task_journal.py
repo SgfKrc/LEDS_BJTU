@@ -1,7 +1,9 @@
 import os
 import sys
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -51,6 +53,7 @@ def _append_workflow_snapshot(
     *,
     stages=None,
     sequence=1,
+    **snapshot_fields,
 ):
     journal.append_event(
         JournalEvent(
@@ -73,6 +76,7 @@ def _append_workflow_snapshot(
                 "completed", "failed", "cancelled",
             } else None,
             "stages": list(stages or []),
+            **snapshot_fields,
         },
     )
 
@@ -459,6 +463,78 @@ def test_result_ready_recovery_fails_without_replaying_completed_model_work(tmp_
     assert recovered["stages"][0]["state"] == "completed"
     assert recovered["stages"][0]["attempts"][0]["state"] == "completed"
     coordinator.close()
+
+
+def test_result_ready_recovery_reclaims_distributed_output_blob(tmp_path):
+    from diffusion.coordinator_runtime import DiffusionCoordinatorRuntime
+    from diffusion.data_plane import DiffusionDataPlaneRuntime
+    from diffusion.distributed import BlobNotFound
+
+    journal_path = str(tmp_path / "task_graph.sqlite3")
+    data_plane = DiffusionDataPlaneRuntime.create(
+        state_dir=tmp_path / "state",
+        cluster_secret="x" * 32,
+    )
+    image_buffer = BytesIO()
+    Image.new("RGB", (2, 2), (20, 40, 60)).save(image_buffer, format="PNG")
+    descriptor = data_plane.store.put_bytes(
+        image_buffer.getvalue(),
+        content_type="image/png",
+        purpose="output",
+        owner_scope="distributed:wf_readyimage1",
+        width=2,
+        height=2,
+    )
+    data_plane.store.acquire_lease(
+        descriptor.blob_id,
+        attempt_id="att_before_restart1",
+    )
+    seed = SQLiteTaskJournal(journal_path)
+    _append_workflow_snapshot(
+        seed,
+        "wf_readyimage1",
+        "result_ready",
+        100.0,
+        template="image_generate_v1",
+        stages=[{
+            "stage_id": "image_generate",
+            "state": "completed",
+            "started_at": 96.0,
+            "finished_at": 99.0,
+            "attempts": [{
+                "attempt_id": "att_before_restart1",
+                "state": "completed",
+                "started_at": 96.0,
+                "finished_at": 99.0,
+            }],
+        }],
+    )
+    seed.close()
+
+    coordinator = TaskGraphCoordinator(
+        journal=SQLiteTaskJournal(journal_path),
+    )
+    try:
+        coordinator.recover_persisted_workflows()
+        runtime = DiffusionCoordinatorRuntime(data_plane=data_plane)
+        reconciled = runtime.reconcile_recovered_workflows(
+            coordinator.list(limit=20),
+        )
+
+        assert reconciled == {
+            "workflows_reconciled": 1,
+            "blobs_removed": 1,
+            "blobs_blocked": 0,
+            "leases_revoked": 1,
+        }
+        with pytest.raises(BlobNotFound):
+            data_plane.store.descriptor(descriptor.blob_id)
+        assert coordinator.get("wf_readyimage1")["error_code"] == (
+            "coordinator_restarted_before_result_commit"
+        )
+    finally:
+        coordinator.close()
+        data_plane.close()
 
 
 def test_partial_result_and_retry_counters_persist_without_error_text(tmp_path):

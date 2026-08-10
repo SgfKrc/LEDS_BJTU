@@ -23,6 +23,7 @@ if str(PACKAGING_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGING_DIR))
 
 import launcher_slots
+import install_manifest
 import serve
 import signing
 import updater
@@ -30,12 +31,47 @@ import update_core
 
 _BUNDLE_MODULES = (
     "qlh_launcher.py",
+    "diagnose.py",
+    "repair.py",
     "update_core.py",
     "updater.py",
     "signing.py",
+    "install_manifest.py",
     "launcher_slots.py",
     "version_store.py",
 )
+
+
+def _build_launcher_zip(
+    zip_path: Path,
+    *,
+    bundle_root: Path,
+    pubkeys: Path,
+    release_key: Path,
+    version: str,
+) -> None:
+    shutil.rmtree(bundle_root, ignore_errors=True)
+    bundle_root.mkdir()
+    for name in _BUNDLE_MODULES:
+        shutil.copy(PACKAGING_DIR / name, bundle_root / name)
+    shutil.copytree(pubkeys, bundle_root / "pubkeys")
+    (bundle_root / "health.ok").write_text("QLH Launcher e2e\n", encoding="utf-8")
+    install_manifest.write_signed_install_manifest(
+        bundle_root,
+        app_id="qlh-launcher",
+        version=version,
+        platform="windows",
+        variant="any",
+        package_kind="launcher",
+        private_key_path=release_key,
+        trusted_keys_dir=pubkeys,
+        generated_at="2026-08-11T00:00:00+00:00",
+        signed_at="2026-08-11T00:00:01+00:00",
+    )
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(bundle_root.rglob("*")):
+            if path.is_file():
+                bundle.write(path, path.relative_to(bundle_root).as_posix())
 
 
 class _PublishHandler(serve.QuietHTTPRequestHandler):
@@ -80,12 +116,13 @@ def publish_server(tmp_path):
     dist.mkdir()
     version = serve._project_version()
     zip_path = dist / f"QLH-Launcher-v{version}.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        for name in _BUNDLE_MODULES:
-            bundle.write(PACKAGING_DIR / name, name)
-        for pub in pubkeys.iterdir():
-            bundle.write(pub, f"pubkeys/{pub.name}")
-        bundle.writestr("health.ok", "QLH Launcher e2e\n")
+    _build_launcher_zip(
+        zip_path,
+        bundle_root=tmp_path / "launcher-bundle",
+        pubkeys=pubkeys,
+        release_key=keys / "release-e2e.key",
+        version=version,
+    )
 
     _PublishHandler.signer = serve.Signer(str(keys / "release-e2e.key"))
     server = ThreadingHTTPServer(
@@ -101,6 +138,7 @@ def publish_server(tmp_path):
             "pubkeys": str(pubkeys),
             "version": version,
             "zip_path": zip_path,
+            "release_key": keys / "release-e2e.key",
         }
     finally:
         server.shutdown()
@@ -139,6 +177,27 @@ def test_publish_chain_check_download_verifies_through_real_http(publish_server,
     assert update_core.verify_file(downloaded, asset)
 
 
+def test_launcher_install_command_requires_signed_install_baseline(
+    publish_server, tmp_path,
+):
+    store = tmp_path / "launcher-slots"
+    code = updater.main([
+        "launcher-install",
+        "--source", publish_server["base"] + "/latest.json",
+        "--trusted-keys-dir", publish_server["pubkeys"],
+        "--launcher-store", str(store),
+        "--download-dir", str(tmp_path / "downloads"),
+        "--variant", "cpu",
+        "--yes",
+        "--json",
+    ])
+    assert code == 0
+    active = launcher_slots.LauncherSlotStore(store)
+    assert active.current().version == publish_server["version"]
+    installed = active.slot_path(active.current().slot)
+    assert (installed / "manifest" / "install-manifest.json").is_file()
+
+
 def test_publish_chain_a_b_slots_activate_health_and_rollback(publish_server, tmp_path):
     """真实下载 → stage → 健康探针（真实子进程）→ activate → 再更新 →
     回滚 → 指针恢复旧版。"""
@@ -162,8 +221,16 @@ def test_publish_chain_a_b_slots_activate_health_and_rollback(publish_server, tm
     assert store.current().version == version
     assert (store.slot_path(first.slot) / "qlh_launcher.py").is_file()
 
-    # 新版本更新：同一 bundle 以更高版本号入槽 → 槽位翻转 → 回滚回旧版
-    second = store.stage_archive(zip_path, "0.1.8.2")
+    # 新版本更新：独立签名的新版本 bundle 入槽 → 槽位翻转 → 回滚回旧版
+    second_zip = tmp_path / "QLH-Launcher-v0.1.8.2.zip"
+    _build_launcher_zip(
+        second_zip,
+        bundle_root=tmp_path / "launcher-bundle-v2",
+        pubkeys=Path(publish_server["pubkeys"]),
+        release_key=Path(publish_server["release_key"]),
+        version="0.1.8.2",
+    )
+    second = store.stage_archive(second_zip, "0.1.8.2")
     second = store.activate(second.version, health_check=updater._launcher_health)
     assert store.current().version == "0.1.8.2"
     assert store.current().slot != first.slot

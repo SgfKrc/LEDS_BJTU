@@ -104,7 +104,10 @@ from diffusion.distributed import (
     DistributedBlobError,
 )
 from diffusion.worker_runtime import DiffusionWorkerRuntime
-from diffusion.coordinator_runtime import DiffusionCoordinatorRuntime
+from diffusion.coordinator_runtime import (
+    DiffusionCoordinatorRuntime,
+    DiffusionGridAggregatorProvider,
+)
 import model_config as mc
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
@@ -465,12 +468,6 @@ def _sync_diffusion_coordinator(
     data_plane: DiffusionDataPlaneRuntime | None = None,
 ) -> bool:
     """Install the verified v3 result ingestor on an opted-in master only."""
-    if (
-        not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
-        or scheduler._effective_role() != "master"
-    ):
-        scheduler.clear_diffusion_coordinator()
-        return False
     runtime_plane = data_plane or getattr(
         app.state, "diffusion_data_plane", None,
     )
@@ -479,8 +476,33 @@ def _sync_diffusion_coordinator(
         return False
     try:
         runtime = DiffusionCoordinatorRuntime(data_plane=runtime_plane)
+        if scheduler._effective_role() == "master":
+            reconciliation = runtime.reconcile_recovered_workflows(
+                task_graph_coordinator.list(limit=TASK_GRAPH_MAX_RECORDS),
+            )
+            if reconciliation["workflows_reconciled"]:
+                logger.info(
+                    "SD distributed restart result cleanup completed: %s",
+                    reconciliation,
+                )
+            if TASK_GRAPH_ENABLED and DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+                grid_provider = DiffusionGridAggregatorProvider(
+                    runtime,
+                    node_id=scheduler.get_effective_node_id(),
+                )
+                if task_graph_coordinator.has_provider(grid_provider.provider_id):
+                    task_graph_coordinator.replace_provider(grid_provider)
+                else:
+                    task_graph_coordinator.register_provider(grid_provider)
+        if (
+            not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
+            or scheduler._effective_role() != "master"
+        ):
+            scheduler.clear_diffusion_coordinator()
+            return False
         return scheduler.configure_diffusion_coordinator(
             result_ingestor=runtime.ingest_result,
+            result_discarder=runtime.discard_result,
             dispatch_enabled=TASK_GRAPH_ENABLED,
         )
     except Exception:
@@ -490,6 +512,32 @@ def _sync_diffusion_coordinator(
             exc_info=True,
         )
         return False
+
+
+def _discard_distributed_workflow_blobs(
+    workflow_id: str,
+    *,
+    revoke_leases: bool = False,
+) -> dict[str, int] | None:
+    data_plane = getattr(app.state, "diffusion_data_plane", None)
+    if not isinstance(data_plane, DiffusionDataPlaneRuntime):
+        return None
+    return DiffusionCoordinatorRuntime(data_plane=data_plane).discard_workflow(
+        workflow_id,
+        revoke_leases=revoke_leases,
+    )
+
+
+def _ensure_diffusion_grid_provider(runtime: DiffusionCoordinatorRuntime) -> str:
+    provider = DiffusionGridAggregatorProvider(
+        runtime,
+        node_id=scheduler.get_effective_node_id(),
+    )
+    if task_graph_coordinator.has_provider(provider.provider_id):
+        task_graph_coordinator.replace_provider(provider)
+    else:
+        task_graph_coordinator.register_provider(provider)
+    return provider.provider_id
 
 
 def _create_task_graph_coordinator() -> TaskGraphCoordinator:
@@ -950,6 +998,13 @@ class DiffusionDistributedGenerateRequest(DiffusionGenerateRequest):
     artifact_id: Optional[str] = Field(default=None, max_length=128)
     provider_id: Optional[str] = Field(default=None, max_length=128)
     workflow_id: Optional[str] = Field(default=None, max_length=128)
+
+
+class DiffusionDistributedGridRequest(DiffusionDistributedGenerateRequest):
+    """Fixed four-seed SD-N4 batch; execution remains experimental and opt-in."""
+
+    seeds: list[int] = Field(..., min_length=4, max_length=4)
+    layout: Literal["2x2"] = "2x2"
 
 
 class DiffusionEditRequest(BaseModel):
@@ -2313,6 +2368,208 @@ async def generate_distributed_diffusion_image(
     return await run_in_threadpool(_run_distributed_diffusion_generation, req)
 
 
+@app.post('/api/diffusion/distributed/grid')
+async def generate_distributed_diffusion_grid(
+    req: DiffusionDistributedGridRequest,
+):
+    """Experimental four-seed fan-out/fan-in; no UI exposure before SD-N4 hardware gate."""
+    return await run_in_threadpool(_run_distributed_diffusion_grid, req)
+
+
+def _run_distributed_diffusion_grid(
+    req: DiffusionDistributedGridRequest,
+) -> dict[str, Any]:
+    """Run the hardware-independent SD-N4 four-seed fan-out/fan-in plan."""
+    if not TASK_GRAPH_ENABLED or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "DIFFUSION_GRID_EXPERIMENT_DISABLED"},
+        )
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="只有主节点可以提交分布式图像批次")
+    if (
+        len(req.seeds) != 4
+        or len(set(req.seeds)) != 4
+        or any(seed < 0 or seed > 2**63 - 1 for seed in req.seeds)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "DIFFUSION_GRID_SEEDS_INVALID", "message": "必须提供四个不同 seed"},
+        )
+    data_plane = getattr(app.state, "diffusion_data_plane", None)
+    if not isinstance(data_plane, DiffusionDataPlaneRuntime):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "DIFFUSION_DATA_PLANE_UNAVAILABLE"},
+        )
+    matches = _diffusion_worker_manifest_matches(req)
+    providers = [item[0] for item in matches]
+    manifest = matches[0][1]
+    runtime = DiffusionCoordinatorRuntime(data_plane=data_plane)
+    grid_provider_id = _ensure_diffusion_grid_provider(runtime)
+    try:
+        generation = _diffusion_generation_request(req)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "DIFFUSION_GRID_REQUEST_INVALID", "message": str(exc)},
+        ) from exc
+    workflow_id = req.workflow_id or f"wf_{uuid.uuid4().hex}"
+    root_input = {
+        "prompt": generation.prompt,
+        "negative_prompt": generation.negative_prompt,
+        "seed": generation.seed,
+        "width": generation.width,
+        "height": generation.height,
+        "steps": generation.steps,
+        "guidance_scale": generation.guidance_scale,
+        "scheduler": generation.scheduler,
+        "artifact_manifest_sha256": manifest["sha256"],
+    }
+    stage_ids = [f"seed_{index}" for index in range(4)]
+    stages = []
+    for index, (stage_id, seed) in enumerate(zip(stage_ids, req.seeds)):
+        primary = providers[index % len(providers)]
+        fallbacks = tuple(
+            provider.provider_id for provider in providers
+            if provider.provider_id != primary.provider_id
+        )
+        stages.append(StageSpec(
+            stage_id=stage_id,
+            stage_type="image_generate",
+            provider=primary.provider_id,
+            fallback_providers=fallbacks,
+            pure=True,
+            lease_timeout_seconds=600.0,
+            root_input_overrides={"seed": int(seed)},
+        ))
+    stages.append(StageSpec(
+        stage_id="image_grid",
+        stage_type="image_grid",
+        depends_on=tuple(stage_ids),
+        provider=grid_provider_id,
+        root_input_overrides={
+            "__replace__": {
+                "grid_stage_ids": stage_ids,
+                "grid_seeds": [int(seed) for seed in req.seeds],
+                "grid_layout": req.layout,
+            },
+        },
+        lease_timeout_seconds=120.0,
+    ))
+    try:
+        output, _snapshot = task_graph_coordinator.run(
+            stages=stages,
+            final_stage_id="image_grid",
+            root_input=root_input,
+            request_id=_request_id_ctx.get("") or uuid.uuid4().hex,
+            template="image_grid_v1",
+            workflow_id=workflow_id,
+            runtime_context={"diffusion_artifact_manifest": manifest},
+        )
+        if (
+            not isinstance(output, dict)
+            or not isinstance(output.get("grid"), dict)
+            or not isinstance(output.get("images"), list)
+            or len(output["images"]) != 4
+        ):
+            task_graph_coordinator.discard_result(
+                workflow_id,
+                reason="invalid image grid result",
+            )
+            _discard_distributed_workflow_blobs(
+                workflow_id,
+                revoke_leases=True,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "DIFFUSION_GRID_INVALID_RESULT", "workflow_id": workflow_id},
+            )
+        committed = task_graph_coordinator.commit_result(workflow_id)
+    except HTTPException:
+        raise
+    except WorkflowCancelled as exc:
+        try:
+            _discard_distributed_workflow_blobs(exc.workflow_id)
+        except Exception:
+            logger.warning("failed to remove cancelled distributed image grid blobs", exc_info=True)
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "DIFFUSION_GRID_CANCELLED", "workflow_id": exc.workflow_id},
+        ) from exc
+    except WorkflowExecutionError as exc:
+        try:
+            _discard_distributed_workflow_blobs(
+                workflow_id,
+                revoke_leases=True,
+            )
+        except Exception:
+            logger.warning("failed to remove failed distributed image grid blobs", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "DIFFUSION_GRID_FAILED", "workflow_id": workflow_id, "message": str(exc)},
+        ) from exc
+    except TaskGraphError as exc:
+        try:
+            _discard_distributed_workflow_blobs(
+                workflow_id,
+                revoke_leases=True,
+            )
+        except Exception:
+            logger.warning("failed to remove invalid distributed image grid blobs", exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "DIFFUSION_GRID_INVALID", "workflow_id": workflow_id, "message": str(exc)},
+        ) from exc
+    grid = dict(output["grid"])
+    grid["url"] = f"/api/diffusion/distributed/workflows/{workflow_id}/blobs/{grid['blob_id']}"
+    stage_by_id = {
+        str(stage.get("stage_id", "")): stage
+        for stage in committed.get("stages", [])
+        if isinstance(stage, dict)
+    }
+    images = []
+    actual_providers = set()
+    actual_nodes = set()
+    for index, image in enumerate(output.get("images", [])):
+        item = dict(image)
+        item["url"] = f"/api/diffusion/distributed/workflows/{workflow_id}/blobs/{item['blob_id']}"
+        stage_id = stage_ids[index]
+        stage = stage_by_id.get(stage_id, {})
+        winner_id = str(stage.get("winner_attempt_id", ""))
+        winner = next((
+            attempt for attempt in stage.get("attempts", [])
+            if attempt.get("attempt_id") == winner_id
+        ), {})
+        item.update({
+            "seed": int(req.seeds[index]),
+            "stage_id": stage_id,
+            "provider_id": str(winner.get("provider", "")),
+            "node_id": str(winner.get("provider_node_id", "")),
+            "attempt_id": winner_id,
+        })
+        if item["provider_id"]:
+            actual_providers.add(item["provider_id"])
+        if item["node_id"]:
+            actual_nodes.add(item["node_id"])
+        images.append(item)
+    multi_node = len(actual_nodes) >= 2
+    return {
+        "status": "completed",
+        "distributed": multi_node,
+        "distributed_batch": True,
+        "execution_mode": "multi_node_batch" if multi_node else "single_node_serial_batch",
+        "hardware_validation": "pending_two_physical_cuda_pcs",
+        "workflow": _public_workflow(committed, task_graph_coordinator.journal_status()),
+        "result": {"grid": grid, "images": images, "metrics": dict(output.get("metrics") or {})},
+        "provider_ids": sorted(actual_providers),
+        "node_ids": sorted(actual_nodes),
+        "planned_provider_ids": [provider.provider_id for provider in providers],
+        "grid_provider_id": grid_provider_id,
+        "artifact_manifest_sha256": manifest["sha256"],
+    }
+
+
 @app.get('/api/diffusion/distributed/workflows/{workflow_id}/blobs/{blob_id}')
 async def get_distributed_diffusion_blob(workflow_id: str, blob_id: str):
     data_plane = getattr(app.state, "diffusion_data_plane", None)
@@ -3501,10 +3758,10 @@ def _sync_remote_diffusion_worker_providers() -> list[str]:
     return sorted(registered)
 
 
-def _diffusion_worker_manifest_candidates(
+def _diffusion_worker_manifest_matches(
     req: DiffusionDistributedGenerateRequest,
-) -> tuple[Any, dict[str, Any]]:
-    """Select one healthy Worker and one exact immutable SD manifest."""
+) -> list[tuple[Any, dict[str, Any]]]:
+    """Return healthy Workers sharing one exact immutable SD manifest."""
     try:
         _sync_remote_diffusion_worker_providers()
     except ProviderError as exc:
@@ -3549,22 +3806,32 @@ def _diffusion_worker_manifest_candidates(
                 ),
             },
         )
-    if not req.artifact_id:
-        manifest_digests = {str(manifest.get("sha256", "")) for _, manifest in candidates}
-        if len(manifest_digests) > 1:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "DIFFUSION_ARTIFACT_SELECTION_REQUIRED",
-                    "message": "多个远端 SD 工件可用，请显式指定 artifact_id",
-                    "artifact_ids": sorted({
-                        str(manifest.get("artifact_id", ""))
-                        for _, manifest in candidates
-                    }),
-                },
-            )
+    manifest_digests = {str(manifest.get("sha256", "")) for _, manifest in candidates}
+    if len(manifest_digests) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "DIFFUSION_ARTIFACT_SELECTION_REQUIRED",
+                "message": "多个远端 SD 工件摘要不一致，请显式指定 provider_id",
+                "artifact_ids": sorted({
+                    str(manifest.get("artifact_id", ""))
+                    for _, manifest in candidates
+                }),
+            },
+        )
     candidates.sort(key=lambda item: item[0].provider_id)
-    return candidates[0]
+    selected_digest = str(candidates[0][1].get("sha256", ""))
+    return [
+        item for item in candidates
+        if str(item[1].get("sha256", "")) == selected_digest
+    ]
+
+
+def _diffusion_worker_manifest_candidates(
+    req: DiffusionDistributedGenerateRequest,
+) -> tuple[Any, dict[str, Any]]:
+    """Select one healthy Worker for the single-stage compatibility API."""
+    return _diffusion_worker_manifest_matches(req)[0]
 
 
 def _run_distributed_diffusion_generation(
@@ -3610,7 +3877,7 @@ def _run_distributed_diffusion_generation(
         "scheduler": generation.scheduler,
         "artifact_manifest_sha256": manifest["sha256"],
     }
-    workflow_id = req.workflow_id or None
+    workflow_id = req.workflow_id or f"wf_{uuid.uuid4().hex}"
     request_id = _request_id_ctx.get("") or uuid.uuid4().hex
     try:
         output, _snapshot = task_graph_coordinator.run(
@@ -3640,6 +3907,13 @@ def _run_distributed_diffusion_generation(
                     "failed to discard malformed distributed image result",
                     exc_info=True,
                 )
+            try:
+                _discard_distributed_workflow_blobs(_snapshot["workflow_id"])
+            except Exception:
+                logger.warning(
+                    "failed to remove malformed distributed image blobs",
+                    exc_info=True,
+                )
             raise HTTPException(
                 status_code=503,
                 detail={"code": "DIFFUSION_WORKFLOW_INVALID_RESULT"},
@@ -3648,6 +3922,13 @@ def _run_distributed_diffusion_generation(
             _snapshot["workflow_id"],
         )
     except WorkflowCancelled as exc:
+        try:
+            _discard_distributed_workflow_blobs(exc.workflow_id)
+        except Exception:
+            logger.warning(
+                "failed to remove cancelled distributed image blobs",
+                exc_info=True,
+            )
         raise HTTPException(
             status_code=409,
             detail={"code": "DIFFUSION_WORKFLOW_CANCELLED", "workflow_id": exc.workflow_id},
@@ -5693,6 +5974,7 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
                 TASK_GRAPH_ENABLED and DIFFUSION_WORKER_EXPERIMENTAL_ENABLED
             ),
             "template": "image_generate_v1",
+            "templates": ["image_generate_v1", "image_grid_v1"],
             "providers": [
                 provider.provider_id
                 for provider in scheduler.remote_diffusion_providers()
@@ -5710,6 +5992,14 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
                 )
                 and not image_provider_error
             ),
+            "grid": {
+                "template": "image_grid_v1",
+                "endpoint": "/api/diffusion/distributed/grid",
+                "fixed_seed_count": 4,
+                "layout": "2x2",
+                "ui_enabled": False,
+                "hardware_validation": "pending_two_physical_cuda_pcs",
+            },
         },
         "journal": public_journal,
         "workflows": workflows,
@@ -5787,6 +6077,17 @@ async def cancel_workflow(workflow_id: str):
                 "cancel_requested": True,
             },
         }
+    if (
+        workflow.get("state") == "cancelled"
+        and workflow.get("template") in {"image_generate_v1", "image_grid_v1"}
+    ):
+        try:
+            _discard_distributed_workflow_blobs(workflow_id)
+        except Exception:
+            logger.warning(
+                "failed to remove cancelled distributed image blobs",
+                exc_info=True,
+            )
     return {
         "status": (
             "cancel_requested"

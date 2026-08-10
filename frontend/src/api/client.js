@@ -4,6 +4,36 @@
 
 const BASE = '/api';
 const LOG_ADMIN_TOKEN_STORAGE_KEY = 'qlh_log_admin_token';
+export const AUTH_TOKEN_STORAGE_KEY = 'qlh-auth-session-token';
+
+function getAuthTokenStorage() {
+  try {
+    if (typeof window === 'undefined') return null;
+    return window.sessionStorage || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+export function getAuthSessionToken() {
+  try {
+    return getAuthTokenStorage()?.getItem(AUTH_TOKEN_STORAGE_KEY) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+export function setAuthSessionToken(token) {
+  try {
+    const storage = getAuthTokenStorage();
+    if (!storage) return;
+    const normalized = String(token || '').trim();
+    if (normalized) storage.setItem(AUTH_TOKEN_STORAGE_KEY, normalized);
+    else storage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch (_) {
+    // Session storage can be disabled; login still fails closed on refresh.
+  }
+}
 
 function getLogTokenStorage() {
   try {
@@ -67,13 +97,18 @@ function normalizeErrorDetail(detail, fallback) {
 
 async function request(path, options = {}) {
   const url = `${BASE}${path}`;
-  const { signal, ...rest } = options;
+  const { signal, auth = true, ...rest } = options;
   const isFormData = typeof FormData !== 'undefined' && rest.body instanceof FormData;
+  const authToken = auth ? getAuthSessionToken() : '';
   const res = await fetch(url, {
     ...rest,                                                         // 先展开 rest，允许 headers 覆盖
     headers: isFormData
-      ? { ...options.headers }
-      : { 'Content-Type': 'application/json', ...options.headers },
+      ? { ...options.headers, ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}) }
+      : {
+          'Content-Type': 'application/json',
+          ...options.headers,
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
     ...(signal ? { signal } : {}),
   });
   const text = await res.text();
@@ -98,6 +133,156 @@ async function request(path, options = {}) {
     });
   }
   return data;
+}
+
+// ---- MF-AUTH-N1 local primary-node authentication ----
+
+export async function fetchAuthCapability() {
+  return request('/auth/capability', { auth: false });
+}
+
+export async function bootstrapAuthOwner({ username, displayName = '' }) {
+  return request('/auth/bootstrap', {
+    method: 'POST',
+    auth: false,
+    body: JSON.stringify({
+      username: String(username || '').trim(),
+      ...(String(displayName || '').trim() ? { display_name: String(displayName).trim() } : {}),
+    }),
+  });
+}
+
+export async function verifyAuthProvisioning({ userId, authenticatorId, code }) {
+  return request('/auth/totp/verify', {
+    method: 'POST',
+    auth: false,
+    body: JSON.stringify({
+      user_id: userId,
+      authenticator_id: authenticatorId,
+      code: String(code || '').trim(),
+    }),
+  });
+}
+
+export async function loginAuth({ username, code = '', recoveryCode = '' }) {
+  const result = await request('/auth/login', {
+    method: 'POST',
+    auth: false,
+    body: JSON.stringify({
+      username: String(username || '').trim(),
+      ...(recoveryCode
+        ? { recovery_code: String(recoveryCode).trim() }
+        : { code: String(code || '').trim() }),
+    }),
+  });
+  setAuthSessionToken(result.access_token || '');
+  return result;
+}
+
+export async function fetchAuthSession() {
+  return request('/auth/session', { auth: true });
+}
+
+export async function logoutAuth() {
+  try {
+    return await request('/auth/logout', { method: 'POST', auth: true });
+  } finally {
+    setAuthSessionToken('');
+  }
+}
+
+export async function fetchManagedUsers() {
+  return request('/users');
+}
+
+export async function createManagedUser({ username, displayName = '', role = 'member' }) {
+  return request('/users', {
+    method: 'POST',
+    body: JSON.stringify({
+      username: String(username || '').trim(),
+      display_name: String(displayName || '').trim(),
+      role,
+    }),
+  });
+}
+
+export async function updateManagedUser(userId, { expectedVersion, displayName, role, status }) {
+  return request(`/users/${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      expected_version: expectedVersion,
+      ...(displayName !== undefined ? { display_name: String(displayName).trim() } : {}),
+      ...(role ? { role } : {}),
+      ...(status ? { status } : {}),
+    }),
+  });
+}
+
+export async function revokeManagedUser(userId, expectedVersion) {
+  return request(`/users/${encodeURIComponent(userId)}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ expected_version: expectedVersion }),
+  });
+}
+
+export async function provisionUserTotp(userId) {
+  return request(`/auth/users/${encodeURIComponent(userId)}/totp`, { method: 'POST' });
+}
+
+export async function rotateAuthRecoveryCodes(code) {
+  return request('/auth/recovery-codes/rotate', {
+    method: 'POST',
+    body: JSON.stringify({ code: String(code || '').trim() }),
+  });
+}
+
+export async function fetchAuthSessions(userId = '') {
+  const query = userId ? `?user_id=${encodeURIComponent(userId)}` : '';
+  return request(`/auth/sessions${query}`);
+}
+
+export async function revokeAuthSession(sessionId) {
+  return request(`/auth/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+}
+
+// ---- MF-AUTH-N2 Tailscale binding ----
+
+export async function fetchTailscaleBindings(userId = '') {
+  const path = userId
+    ? `/auth/users/${encodeURIComponent(userId)}/tailscale`
+    : '/auth/tailscale/bindings';
+  return request(path);
+}
+
+export async function fetchLocalTailscaleStatus() {
+  return request('/auth/tailscale/local-status');
+}
+
+export async function prepareTailscaleBinding({ userId = '', authorizationMethod = 'local_status' } = {}) {
+  const path = userId
+    ? `/auth/users/${encodeURIComponent(userId)}/tailscale`
+    : '/auth/tailscale/bindings';
+  return request(path, {
+    method: 'POST',
+    body: JSON.stringify({ authorization_method: authorizationMethod }),
+  });
+}
+
+export async function confirmTailscaleBinding(bindingId, { tailnetId, tailscaleUserId, nodeId = '' } = {}) {
+  return request(`/auth/tailscale/bindings/${encodeURIComponent(bindingId)}/confirm`, {
+    method: 'POST',
+    body: JSON.stringify({
+      tailnet_id: String(tailnetId || '').trim(),
+      tailscale_user_id: String(tailscaleUserId || '').trim(),
+      ...(String(nodeId || '').trim() ? { node_id: String(nodeId).trim() } : {}),
+    }),
+  });
+}
+
+export async function revokeTailscaleBinding(bindingId) {
+  return request(`/auth/tailscale/bindings/${encodeURIComponent(bindingId)}/revoke`, {
+    method: 'POST',
+  });
 }
 
 export async function fetchStatus() {

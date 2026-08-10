@@ -1076,6 +1076,36 @@ class ProviderRegistry:
         if provider is not None:
             provider.cancel(attempt_id)
 
+    def discard_result(
+        self,
+        provider_id: str,
+        attempt_id: str,
+        output: dict,
+    ) -> bool:
+        """Ask an owning Provider to release an uncommitted external result."""
+        with self._lock:
+            provider = self._providers.get(provider_id)
+        if provider is None:
+            raise ProviderNotFound(
+                f"provider not found: {provider_id}",
+                code="provider_not_found",
+                provider_id=provider_id,
+            )
+        discard = getattr(provider, "discard_result", None)
+        if not callable(discard):
+            return False
+        try:
+            discard(attempt_id, output)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderExecutionError(
+                f"provider {provider_id} failed to discard an uncommitted result",
+                code="provider_result_discard_failed",
+                provider_id=provider_id,
+            ) from exc
+        return True
+
     def renew_lease(
         self,
         provider_id: str,

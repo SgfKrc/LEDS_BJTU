@@ -41,6 +41,9 @@ if /i "%~1"=="launcher-activate" goto :launcher_n4
 if /i "%~1"=="launcher-rollback" goto :launcher_n4
 if /i "%~1"=="launcher-recover" goto :launcher_n4
 if /i "%~1"=="diagnostics" goto :launcher_n4
+if /i "%~1"=="verify" goto :launcher_n4
+if /i "%~1"=="diagnose" goto :launcher_n4
+if /i "%~1"=="repair" goto :launcher_n4
 
 rem ---- unified launcher modes ----
 if /i "%~1"=="launcher" goto :launcher
@@ -75,6 +78,9 @@ if /i "%~1"=="launcher-activate" goto :packaged_launcher_n4
 if /i "%~1"=="launcher-rollback" goto :packaged_launcher_n4
 if /i "%~1"=="launcher-recover" goto :packaged_launcher_n4
 if /i "%~1"=="diagnostics" goto :packaged_launcher_n4
+if /i "%~1"=="verify" goto :packaged_launcher_n4
+if /i "%~1"=="diagnose" goto :packaged_launcher_n4
+if /i "%~1"=="repair" goto :packaged_launcher_n4
 if /i "%~1"=="version" (
     if exist "version.txt" type version.txt
     if not exist "version.txt" echo unknown
@@ -94,6 +100,22 @@ exit /b %errorlevel%
 :legacy_packaged_launcher
 if /i "%~1"=="update" (
     echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu update。
+    exit /b 2
+)
+if /i "%~1"=="verify" (
+    if exist "tools\QLH-Install-Manifest.exe" (
+        "tools\QLH-Install-Manifest.exe" verify --root "%CD%" %2 %3 %4 %5 %6
+        exit /b %errorlevel%
+    )
+    echo [ERROR] 安装完整性校验器缺失；请覆盖安装匹配版本的主应用包。
+    exit /b 2
+)
+if /i "%~1"=="diagnose" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu diagnose。
+    exit /b 2
+)
+if /i "%~1"=="repair" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu repair。
     exit /b 2
 )
 if /i "%~1"=="version" (
@@ -174,6 +196,9 @@ echo   bjtu tui        启动后端并进入 TUI 管理界面
 echo   bjtu chat       进入终端对话页
 echo   bjtu update     检查更新源中的匹配安装包
 echo   bjtu version    显示当前应用版本
+echo   bjtu verify [--level quick^|full^|deep] [--json]  校验已安装程序文件
+echo   bjtu diagnose [--json]  输出只读故障诊断与人工处理建议
+echo   bjtu repair [--json]    修复当前版本中损坏的签名程序文件
 echo   bjtu status     执行 TUI 单命令（不自动启动后端）
 echo.
 set "PYTHON_CMD=python"

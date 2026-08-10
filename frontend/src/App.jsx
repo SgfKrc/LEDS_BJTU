@@ -7,6 +7,7 @@ import AdminPanel from './components/AdminPanel';
 import SettingsModal from './components/SettingsModal';
 import SessionList from './components/SessionList';
 import DiffusionPanel from './components/DiffusionPanel';
+import UserManagementPanel from './components/UserManagementPanel';
 import { normalizeExecutionSettings } from './settings';
 
 // ---- 设备档位预设 ----
@@ -85,13 +86,13 @@ function saveSettings(settings) {
 function getInitialView() {
   try {
     const requested = new URLSearchParams(window.location.search).get('view');
-    return ['chat', 'image', 'admin'].includes(requested) ? requested : 'chat';
+    return ['chat', 'image', 'admin', 'account'].includes(requested) ? requested : 'chat';
   } catch (_) {
     return 'chat';
   }
 }
 
-export default function App() {
+export default function App({ authSession, onLogout }) {
   const [modelLoaded, setModelLoaded] = useState(false);
   const [currentQuant, setCurrentQuant] = useState(null);
   const [toast, setToast] = useState(null);
@@ -110,7 +111,7 @@ export default function App() {
   });
   const [deviceTier, setDeviceTier] = useState(null);  // 由 DevicePanel 检测后回传
   const [hasDedicatedGpu, setHasDedicatedGpu] = useState(false);  // 是否有独显（用于深度思考门控）
-  const [activeView, setActiveView] = useState(getInitialView); // 'chat' | 'image' | 'admin'
+  const [activeView, setActiveView] = useState(getInitialView); // 'chat' | 'image' | 'admin' | 'account'
   const [diffusionLoaded, setDiffusionLoaded] = useState(false);
   const [myRole, setMyRole] = useState(null);  // { node_role, node_id, is_master, is_client, ... }
   const [sessions, setSessions] = useState([]);           // 会话列表
@@ -505,7 +506,7 @@ export default function App() {
   }, []);
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout${activeView === 'account' ? ' account-active' : ''}`}>
       {/* Sidebar */}
       <aside className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}`}>
         <div className="sidebar-header">
@@ -547,6 +548,14 @@ export default function App() {
                     ⚙️ 后台管理
                   </button>
                 )}
+                {authSession && (
+                  <button
+                    className={`nav-tab ${activeView === 'account' ? 'active' : ''}`}
+                    onClick={() => setActiveView('account')}
+                  >
+                    账户
+                  </button>
+                )}
               </div>
             </>
           )}
@@ -565,6 +574,13 @@ export default function App() {
                   <span>{diffusionLoaded ? '本地模型已加载' : '本地模型未加载'}</span>
                 </div>
                 <div className="diffusion-sidebar-mode">执行模式：本地</div>
+              </div>
+            ) : activeView === 'account' ? (
+              <div className="account-sidebar-summary">
+                <span className="workspace-kicker">SIGNED IN</span>
+                <strong>{authSession.user?.display_name || authSession.user?.username || '本地用户'}</strong>
+                <span>{authSession.user?.role || 'member'}</span>
+                <small>{authSession.user?.username || ''}</small>
               </div>
             ) : (
               <>
@@ -586,11 +602,15 @@ export default function App() {
               </>
             )}
 
-            <div style={{ padding: '16px 24px', marginTop: 'auto' }}>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
-                © 2026 项目团队
+            {authSession && onLogout && (
+              <div className="sidebar-account">
+                <div className="sidebar-account-copy">
+                  <strong>{authSession.user?.display_name || authSession.user?.username || '本地用户'}</strong>
+                  <span>{authSession.user?.role || 'member'}</span>
+                </div>
+                <button type="button" onClick={onLogout} title="退出登录">退出</button>
               </div>
-            </div>
+            )}
           </>
         ) : (
           /* Collapsed sidebar — icon strip */
@@ -620,6 +640,15 @@ export default function App() {
                 ⚙️
               </button>
             )}
+            {authSession && (
+              <button
+                className="sidebar-icon-btn"
+                onClick={() => { setSidebarCollapsed(false); setActiveView('account'); }}
+                title="账户与安全"
+              >
+                ●
+              </button>
+            )}
             <button
               className="sidebar-icon-btn"
               onClick={() => setSettingsOpen(true)}
@@ -641,7 +670,15 @@ export default function App() {
             onDiffusionStateChange={setDiffusionLoaded}
           />
         </div>
-        {activeView !== 'image' && (
+        {activeView === 'account' && authSession && (
+          <UserManagementPanel
+            authSession={authSession}
+            onLogout={onLogout}
+            onToast={showToast}
+            onClose={() => setActiveView('chat')}
+          />
+        )}
+        {activeView !== 'image' && activeView !== 'account' && (
           activeView === 'chat' || !showAdminTab ? (
             <ChatPanel
               modelLoaded={modelLoaded}

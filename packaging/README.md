@@ -52,6 +52,20 @@
 
 > PyInstaller 始终从**项目根目录**运行，输出到根目录 `dist/`。Inno Setup 从 `packaging/` 运行对应的 `.iss` 文件，通过 `..\dist\` 引用 PyInstaller 输出。
 
+### GGUF 量化器工具链（MODEL-TOOLS）
+
+GGUF 转换的 `llama-quantize` 不从 PATH 随意拾取。版本锁位于 `scripts/model_tools/llama_quantize.lock.json`，当前固定 llama.cpp commit `47e1de77aa0f06bf73cfd8c5281d95979f89fcbe`。构建器只在父仓库外层 `build/` 写入，不修改 llama.cpp submodule，也不联网：
+
+```powershell
+python scripts/build_llama_quantize.py --json
+```
+
+Windows 受管包输出到 `build/model-tools/llama-quantize/packages/windows-x86_64/`，包含 `llama-quantize.exe`、上游许可证和逐文件 SHA256 manifest，并生成确定性 ZIP。Windows PyInstaller spec 会在构建时拒绝缺失、revision 漂移、文件摘要不一致或运行库依赖未验证的包。
+
+Linux `.deb` 构建脚本会先在 Linux 主机执行同一构建器，随后将包放入 `/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64/`。Linux 真机编译、`ldd`、安装和执行必须单独验收，不能用 Windows 产物替代。
+
+`gguf_convert` 对受管包报告 `managed_package/verified`；用户通过 `--quantizer`、`QLH_LLAMA_QUANTIZE` 或 PATH 指定的工具仍允许使用，但标记为 `unmanaged`，不作为锁定发布工具。
+
 独立引导器可单独构建，不需要 CUDA 环境，也不会修改项目全局解释器：
 
 ```powershell
@@ -207,6 +221,51 @@ python packaging/signing.py verify --manifest latest.json --trusted-keys-dir pac
 ```
 
 依赖：`signing.py` 使用 `cryptography` 库（打包 Launcher 的 `.venv-packaging` 需要安装；运行时 Launcher 内置 pubkeys，无需在目标机额外安装）。
+
+### 安装完整性基线（UP-N6.0）— `install_manifest.py`
+
+发布构建必须设置 `QLH_SIGNING_KEY`。CPU、CUDA、Launcher 和 Linux `.deb` 构建会扫描最终程序树，生成 `manifest/install-manifest.json`，沿用 UP-N2 Ed25519 信任链签名并立即复验。清单只列程序文件的规范相对路径、大小、SHA-256 和 kind；`models/`、`chat_history/`、`logs/`、`config/`、`local_docs/` 永不进入清单。
+
+Windows Setup 在安装末尾运行独立 `QLH-Install-Manifest.exe validate`，Linux `postinst` 用包内 venv 执行同一验证；失败会中止安装。Launcher 远端 A/B 自更新也要求 bundle 带签名清单，且版本、变体和包身份必须匹配。手工检查示例：
+
+```powershell
+python packaging/install_manifest.py validate `
+  --manifest dist/QLH-Launcher/manifest/install-manifest.json `
+  --trusted-keys-dir packaging/pubkeys
+```
+
+### 运行时完整性检查（UP-N6.1）— `verify`
+
+对已安装程序树执行只读检查：
+
+```powershell
+python packaging/qlh_launcher.py verify --root dist/QLH-Edge-Inference --level quick --json
+python packaging/install_manifest.py verify --root dist/QLH-Edge-Inference --level deep
+```
+
+`quick` 验签后只哈希入口、`version.txt`、Launcher `health.ok`（适用时）和关键运行时文件；`full` 遍历签名清单，完整哈希不大于 64MiB 的文件，对更大文件只验证大小并读取首/中/尾固定区段；`deep` 对清单所有文件执行 SHA-256 比对。schema v1 没有发布方签名的抽样摘要，所以 `full` 的大文件采样只证明可读性，不能替代 `deep` 的防篡改结论。
+
+三个级别都仅访问 `install-manifest.json` 中已签名的程序路径，不枚举或读取 `models/`、`chat_history/`、`logs/`、`config/`、`local_docs/`。不通过时命令返回 `3`；`--json` 输出稳定的 `passed`/`failed`、类别、摘要和建议。Launcher 仅在启动调用抛错后自动运行 `quick`，正常启动路径不等待完整性检查。
+
+### 本地诊断（UP-N6.2）— `diagnose`
+
+```powershell
+python packaging/qlh_launcher.py diagnose --root dist/QLH-Edge-Inference --json
+python packaging/qlh_launcher.py diagnose --root dist/QLH-Edge-Inference --error "DLL load failed"
+```
+
+诊断以 quick 的签名清单结果为主证据，并将安装签名、程序文件、版本、DLL/pyd、CUDA 驱动、磁盘、网络症状、权限、疑似杀软和模型错误症状映射为人工处理建议。它不联网、不下载、不修复，也不扫描模型或用户数据；传入的 `--error` 只用于本次匹配，不会原样写入 JSON。CUDA 包的 `nvidia-smi` 探测无 shell、3 秒超时且只保留安全的驱动版本字段。
+
+Launcher GUI/TUI 可直接运行诊断。导出 UP-N4 脱敏诊断 ZIP 时会附入无安装根/失败路径的诊断摘要，且只接受 Launcher 状态目录 `diagnostics/` 内不超过 1MiB 的 JSON。
+
+### 单文件修复（UP-N6.3）— `repair`
+
+```powershell
+python packaging/qlh_launcher.py repair --root dist/QLH-Edge-Inference --source https://updates.example/latest.json --json
+python packaging/repair.py build-index --root dist/QLH-Edge-Inference --output packaging/dist/QLH-Edge-Inference-Repair-v0.1.8.1-windows-cpu.json --payload-dir packaging/dist/repair/0.1.8.1/windows/cpu --url-prefix /repair/0.1.8.1/windows/cpu --trusted-keys-dir packaging/pubkeys
+```
+
+修复先执行 deep 校验，只处理已签名清单中的 `missing`、`size`、`hash` 失败。更新清单必须已验签且版本完全匹配，`repair-index` 经外层清单 SHA-256 固定，索引的每项仍需逐项匹配本机签名基线。全部载荷先下载校验，再写入同目录临时文件并原子替换；旧文件会保留为 Launcher 状态目录内的 `.bak`。超过 10 个文件或 64MiB 时不会下载或写入，而是要求使用已签名整包。修复后必跑 deep 校验，失败则回滚已替换文件。模型、聊天记录、日志、配置和本地文档既不读取也不写入。
 
 ### 原子版本与回滚（UP-N3）— version_store.py
 
