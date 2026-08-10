@@ -195,9 +195,20 @@ end;
 
 // 安装完成的提示（中文/英文自适应）
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  Verified: Boolean;
 begin
   if CurStep = ssPostInstall then
   begin
+    Verified := Exec(
+      ExpandConstant('{app}\tools\QLH-Install-Manifest.exe'),
+      'validate --manifest "' + ExpandConstant('{app}\manifest\install-manifest.json') +
+      '" --trusted-keys-dir "' + ExpandConstant('{app}\pubkeys') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode
+    );
+    if (not Verified) or (ResultCode <> 0) then
+      RaiseException('UP-N6.0 安装清单验签失败，安装已中止。');
     MsgBox(CustomMessage('InstallDoneMsg'), mbInformation, MB_OK);
   end;
 end;

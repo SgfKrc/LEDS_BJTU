@@ -5,13 +5,25 @@ APP_DIR="/opt/qlh-edge-inference"
 
 echo "QLH 边缘推理系统 — 安装后配置..."
 
+# UP-N6.0：系统安装事务完成前复验发布方安装清单；失败使 dpkg 配置失败。
+MANIFEST_TOOL="$APP_DIR/bin/install_manifest.py"
+INSTALL_MANIFEST="$APP_DIR/manifest/install-manifest.json"
+TRUSTED_KEYS="$APP_DIR/bin/pubkeys"
+VENV_PYTHON="$APP_DIR/venv/bin/python3"
+if [ ! -x "$VENV_PYTHON" ] || [ ! -f "$MANIFEST_TOOL" ] || [ ! -f "$INSTALL_MANIFEST" ]; then
+    echo "  [错误] UP-N6.0 安装清单或验签运行时缺失，拒绝完成安装。"
+    exit 1
+fi
+"$VENV_PYTHON" "$MANIFEST_TOOL" validate \
+    --manifest "$INSTALL_MANIFEST" \
+    --trusted-keys-dir "$TRUSTED_KEYS"
+
 # 创建可写目录
 mkdir -p "$APP_DIR/models" "$APP_DIR/logs"
 chmod 755 "$APP_DIR/models"
 chmod 1777 "$APP_DIR/logs"  # sticky + world-writable: DynamicUser 可写日志
 
 # 验证 venv 可用性（用 --copies 构建，通常可直接使用）
-VENV_PYTHON="$APP_DIR/venv/bin/python3"
 if [ -x "$VENV_PYTHON" ]; then
     if ! "$VENV_PYTHON" -c "import sys; sys.exit(0)" 2>/dev/null; then
         echo "  [警告] venv Python 不可用，请在安装后重建 venv："

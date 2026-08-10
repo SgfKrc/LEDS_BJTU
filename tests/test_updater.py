@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -177,3 +178,30 @@ def test_detect_current_version_reads_source_tree_without_importing_it(tmp_path,
     src.mkdir()
     (src / "__init__.py").write_text('__version__ = "0.1.8.1"\n', encoding="utf-8")
     assert updater.detect_current_version(tmp_path, fallback="0.0.0") == "0.1.8.1"
+
+
+def test_diagnostics_cli_bundles_only_state_directory_diagnosis_json(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setenv("QLH_LAUNCHER_STATE_DIR", str(state))
+    report = state / "diagnostics" / "qlh-diagnose-test.json"
+    report.parent.mkdir(parents=True)
+    report.write_text('{"token":"do-not-export","issue":"disk"}', encoding="utf-8")
+    output = tmp_path / "diagnostics.zip"
+
+    assert updater.main([
+        "diagnostics", "--launcher-store", str(tmp_path / "slots"),
+        "--diagnose-report", str(report), "--diagnostics-output", str(output),
+        "--json",
+    ]) == 0
+    with zipfile.ZipFile(output) as bundle:
+        text = bundle.read("diagnosis/qlh-diagnose-test.json").decode("utf-8")
+    assert "do-not-export" not in text
+    assert "<redacted>" in text
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}", encoding="utf-8")
+    assert updater.main([
+        "diagnostics", "--launcher-store", str(tmp_path / "slots"),
+        "--diagnose-report", str(outside), "--diagnostics-output", str(tmp_path / "blocked.zip"),
+        "--json",
+    ]) == 2

@@ -33,7 +33,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
-Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\QLH Launcher"; Filename: "{app}\QLH-Launcher.exe"
@@ -42,3 +41,22 @@ Name: "{group}\卸载 QLH Launcher"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\QLH-Launcher.exe"; Description: "启动 QLH Launcher"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  Verified: Boolean;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    Verified := Exec(
+      ExpandConstant('{app}\tools\QLH-Install-Manifest.exe'),
+      'validate --manifest "' + ExpandConstant('{app}\manifest\install-manifest.json') +
+      '" --trusted-keys-dir "' + ExpandConstant('{app}\pubkeys') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode
+    );
+    if (not Verified) or (ResultCode <> 0) then
+      RaiseException('UP-N6.0 install manifest verification failed; setup aborted.');
+  end;
+end;

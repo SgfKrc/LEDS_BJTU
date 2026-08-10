@@ -54,6 +54,64 @@ def test_missing_application_is_reported_without_crashing(monkeypatch):
     assert controller.last_error == "missing app"
 
 
+def test_launch_failure_runs_quick_integrity_check_when_a_signed_root_exists(monkeypatch, tmp_path):
+    report = {
+        "ok": False,
+        "summary": {"checked": 3, "failed": 1},
+        "failed": [{"path": "QLH-Edge-Inference.exe", "category": "missing"}],
+    }
+    monkeypatch.setattr(
+        qlh_launcher,
+        "quick_verify_after_launch_failure",
+        lambda _variant: (tmp_path / "app", report),
+    )
+
+    controller = qlh_launcher.LauncherController([], variant_override="cpu")
+    assert controller._launch_failed(FileNotFoundError("missing app")) == 2
+    assert "quick 校验失败" in controller.last_error
+    assert "QLH-Edge-Inference.exe" in controller.last_error
+
+
+def test_verify_command_forwards_selected_root_and_json(monkeypatch, tmp_path):
+    captured = []
+    monkeypatch.setattr(qlh_launcher, "installed_app_root", lambda _variant: tmp_path)
+    monkeypatch.setattr(qlh_launcher, "install_manifest_main", lambda argv: captured.append(argv) or 7)
+
+    assert qlh_launcher.main(["verify", "--level", "deep", "--json"]) == 7
+    assert captured == [["verify", "--root", str(tmp_path), "--level", "deep", "--json"]]
+
+
+def test_diagnose_command_uses_detected_root_and_structured_output(monkeypatch, tmp_path, capsys):
+    report = {"ok": True, "issues": [], "integrity": {"ok": True}}
+    monkeypatch.setattr(qlh_launcher, "diagnosis_app_root", lambda _variant: tmp_path)
+    monkeypatch.setattr(qlh_launcher, "diagnose_install", lambda root, **kwargs: report)
+
+    assert qlh_launcher.main(["diagnose", "--json"]) == 0
+    assert __import__("json").loads(capsys.readouterr().out) == report
+
+
+def test_controller_bundles_a_sanitized_diagnosis_report(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(qlh_launcher, "default_state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(
+        qlh_launcher.LauncherController,
+        "diagnose_app",
+        lambda _self: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        qlh_launcher,
+        "write_diagnosis_report",
+        lambda _report, path, *, bundle_safe: captured.update({"path": path, "bundle_safe": bundle_safe}) or path,
+    )
+    monkeypatch.setattr(qlh_launcher, "updater_main", lambda argv: captured.update({"argv": argv}) or 0)
+
+    assert qlh_launcher.LauncherController().create_diagnostics() == 0
+    assert captured["bundle_safe"] is True
+    assert captured["path"].parent == tmp_path / "state" / "diagnostics"
+    assert captured["argv"][0] == "diagnostics"
+    assert "--diagnose-report" in captured["argv"]
+
+
 def test_direct_app_command_does_not_open_bootstrap_menu(monkeypatch):
     controller = qlh_launcher.LauncherController([], variant_override="cpu")
     monkeypatch.setattr(controller, "start_gui", lambda: 17)
@@ -97,6 +155,7 @@ def test_linux_deb_build_keeps_bootstrap_and_venv_fallback_contract():
     )
 
     assert '"$PACKAGING_DIR/qlh_launcher.py"' in script
+    assert '"$PACKAGING_DIR/diagnose.py"' in script
     assert '"$PACKAGING_DIR/update_core.py"' in script
     assert '"$PACKAGING_DIR/updater.py"' in script
     assert '"$PACKAGING_DIR/version_store.py"' in script
@@ -129,10 +188,11 @@ def test_bjtu_routes_launcher_maintenance_commands():
     windows = (PROJECT_ROOT / "bjtu.bat").read_text(encoding="utf-8")
     linux = (PROJECT_ROOT / "bjtu.sh").read_text(encoding="utf-8")
     packaged = (PROJECT_ROOT / "packaging" / "linux" / "bjtu").read_text(encoding="utf-8")
-    for command in ("launcher-status", "launcher-check", "launcher-install", "launcher-rollback", "diagnostics"):
+    for command in ("launcher-status", "launcher-check", "launcher-install", "launcher-rollback", "diagnostics", "verify", "diagnose"):
         assert command in windows
         assert command in linux
         assert command in packaged
+    assert "tools\\QLH-Install-Manifest.exe" in windows
 
 
 def test_linux_application_command_prefers_packaged_venv(tmp_path, monkeypatch):

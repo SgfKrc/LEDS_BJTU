@@ -364,6 +364,25 @@ def _diagnostic_output(args: argparse.Namespace) -> Path:
     return default_state_dir() / "diagnostics" / f"qlh-launcher-{stamp}.zip"
 
 
+def _diagnose_report_path(args: argparse.Namespace) -> Path | None:
+    if not args.diagnose_report:
+        return None
+    candidate = Path(args.diagnose_report).expanduser().resolve()
+    allowed = (default_state_dir() / "diagnostics").resolve()
+    try:
+        candidate.relative_to(allowed)
+    except ValueError as exc:
+        raise LauncherSlotError("diagnose report must stay in the Launcher diagnostics directory") from exc
+    if candidate.suffix.lower() != ".json" or not candidate.is_file():
+        raise LauncherSlotError("diagnose report must be an existing JSON file")
+    try:
+        if candidate.stat().st_size > 1024 * 1024:
+            raise LauncherSlotError("diagnose report exceeds the 1 MiB limit")
+    except OSError as exc:
+        raise LauncherSlotError("cannot read diagnose report") from exc
+    return candidate
+
+
 def _launcher_command(
     args: argparse.Namespace,
     *,
@@ -403,7 +422,10 @@ def _launcher_command(
             _print({"recovered": pointer.as_dict()}, as_json=args.as_json)
             return 0
         if args.command == "diagnostics":
-            destination = store.diagnostics(_diagnostic_output(args))
+            report = _diagnose_report_path(args)
+            destination = store.diagnostics(
+                _diagnostic_output(args), extra_paths=[report] if report else None,
+            )
             _print({"diagnostics": str(destination)}, as_json=args.as_json)
             return 0
         if args.command not in {"launcher-check", "launcher-download", "launcher-install"}:
@@ -437,7 +459,9 @@ def _launcher_command(
             answer = input(f"将替换活动 Launcher 为 {path.name}，继续？ [y/N] ").strip().lower()
             if answer not in {"y", "yes"}:
                 return 1
-        staged = store.stage_archive(path, manifest.tag)
+        staged = store.stage_archive(
+            path, manifest.tag, require_install_manifest=True,
+        )
         pointer = store.activate(staged.version, health_check=_launcher_health)
         _print(
             {"launcher_updated": pointer.as_dict(), "path": str(path)},
@@ -472,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bundle", help="directory or zip/tar bundle for version-stage")
     parser.add_argument("--version", help="application version for UP-N3 operations")
     parser.add_argument("--diagnostics-output", help="ZIP path for the redacted diagnostic bundle")
+    parser.add_argument("--diagnose-report", help="bundle-safe diagnosis JSON inside the Launcher state directory")
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--yes", action="store_true", help="do not ask before launching an installer")
     parser.add_argument(

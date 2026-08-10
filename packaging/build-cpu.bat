@@ -23,6 +23,15 @@ if errorlevel 1 (
     exit /b 1
 )
 "%PYTHON%" --version
+if not defined QLH_SIGNING_KEY (
+    echo   [错误] 发布构建必须设置 QLH_SIGNING_KEY，禁止生成无签名安装清单。
+    exit /b 1
+)
+if not exist "packaging\version.txt" (
+    echo   [错误] 未找到 packaging\version.txt
+    exit /b 1
+)
+set /p APP_VERSION=<"packaging\version.txt"
 
 REM ---- 安装 CPU-only 依赖 ----
 echo.
@@ -62,8 +71,34 @@ echo   这可能需要 5-15 分钟，请耐心等待...
 "%PYTHON%" -m pip install pyinstaller --quiet
 REM ★ 从项目根目录运行，输出到 dist/QLH-Edge-Inference/
 "%PYTHON%" -m PyInstaller packaging\qlh-cpu.spec --noconfirm
+if errorlevel 1 exit /b 1
 
 if exist "dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
+    if not exist "dist\QLH-Edge-Inference\tools" mkdir "dist\QLH-Edge-Inference\tools"
+    "%PYTHON%" -m PyInstaller packaging\qlh-install-manifest.spec --noconfirm ^
+        --distpath "dist\QLH-Edge-Inference\tools" ^
+        --workpath "build\qlh-install-manifest-cpu"
+    if errorlevel 1 exit /b 1
+    if not exist "dist\QLH-Edge-Inference\tools\QLH-Install-Manifest.exe" exit /b 1
+    xcopy /e /i /y "packaging\pubkeys" "dist\QLH-Edge-Inference\pubkeys" >nul
+    if errorlevel 1 exit /b 1
+    "%PYTHON%" packaging\install_manifest.py build ^
+        --root "dist\QLH-Edge-Inference" ^
+        --app-id qlh-edge-inference ^
+        --version "!APP_VERSION!" ^
+        --platform windows ^
+        --variant cpu ^
+        --package-kind application ^
+        --key "!QLH_SIGNING_KEY!" ^
+        --trusted-keys-dir "packaging\pubkeys" ^
+        --include "bjtu.bat=bjtu.bat" ^
+        --include "packaging\version.txt=version.txt" ^
+        --include "README.md=docs/README.md" ^
+        --include "docs\整体架构.md=docs/整体架构.md" ^
+        --include "docs\模块接口说明.md=docs/模块接口说明.md" ^
+        --include "docs\核心技术原理.md=docs/核心技术原理.md" ^
+        --include "packaging\scripts\convert_to_gguf.py=tools/convert_to_gguf.py"
+    if errorlevel 1 exit /b 1
     echo.
     echo ============================================
     echo   打包完成！

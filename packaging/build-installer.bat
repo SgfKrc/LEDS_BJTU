@@ -46,6 +46,26 @@ if not exist "..\dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
 echo PyInstaller 输出: OK
 echo.
 
+REM ---- UP-N6.0：Inno 编译前必须复验签名安装清单 ----
+set "PYTHON=%~dp0..\.venv-packaging\Scripts\python.exe"
+set "INSTALL_MANIFEST=%~dp0..\dist\QLH-Edge-Inference\manifest\install-manifest.json"
+if not exist "%PYTHON%" (
+    echo [错误] 未找到打包 Python: %PYTHON%
+    exit /b 1
+)
+if not exist "%INSTALL_MANIFEST%" (
+    echo [错误] 未找到签名安装清单: %INSTALL_MANIFEST%
+    echo   请重新运行 build-cpu.bat，并设置 QLH_SIGNING_KEY。
+    exit /b 1
+)
+"%PYTHON%" "%~dp0install_manifest.py" validate ^
+    --manifest "%INSTALL_MANIFEST%" ^
+    --trusted-keys-dir "%~dp0pubkeys"
+if errorlevel 1 (
+    echo [错误] 安装清单验签失败，拒绝编译安装包。
+    exit /b 1
+)
+
 REM ---- 编译 Inno Setup ----
 echo 开始编译安装包...
 echo 输出: dist\QLH-Edge-Inference-Setup-v0.1.8.1.exe

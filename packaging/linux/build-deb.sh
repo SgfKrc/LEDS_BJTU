@@ -51,6 +51,10 @@ if ! command -v python3 &> /dev/null; then
     echo "错误: 未找到 python3。请安装 Python 3。"
     exit 1
 fi
+if [ -z "${QLH_SIGNING_KEY:-}" ]; then
+    echo "错误: 发布构建必须设置 QLH_SIGNING_KEY，禁止生成无签名安装清单。"
+    exit 1
+fi
 
 echo "[toolchain] 构建并校验固定 revision 的 llama-quantize..."
 python3 "$PROJECT_ROOT/scripts/build_llama_quantize.py" \
@@ -96,10 +100,12 @@ cp -r "$FRONTEND_DIR/dist"/* "$BUILD_DIR/opt/qlh-edge-inference/frontend/dist/"
 cp "$SCRIPT_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
 cp "$PACKAGING_DIR/qlh_launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
+cp "$PACKAGING_DIR/diagnose.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/diagnose.py"
 cp "$PACKAGING_DIR/update_core.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/update_core.py"
 cp "$PACKAGING_DIR/updater.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/updater.py"
 cp "$PACKAGING_DIR/version_store.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/version_store.py"
 cp "$PACKAGING_DIR/launcher_slots.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/launcher_slots.py"
+cp "$PACKAGING_DIR/install_manifest.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/install_manifest.py"
 cp -a "$MODEL_TOOL_PACKAGE/." "$BUILD_DIR/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64/"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64/llama-quantize"
 # UP-N2 可信发布：验签器与内置信任集必须随 Launcher 分发
@@ -171,6 +177,17 @@ fi
 
 echo "  安装共享依赖..."
 "$VENV_PIP" install -r "$PACKAGING_DIR/requirements-cpu.txt"
+
+# UP-N6.0：扫描最终应用树，签名后立即以发布信任集复验并原子落盘。
+"$VENV_DIR/bin/python" "$PACKAGING_DIR/install_manifest.py" build \
+    --root "$BUILD_DIR/opt/qlh-edge-inference" \
+    --app-id qlh-edge-inference \
+    --version "$VERSION" \
+    --platform linux \
+    --variant "$VARIANT" \
+    --package-kind application \
+    --key "$QLH_SIGNING_KEY" \
+    --trusted-keys-dir "$PACKAGING_DIR/pubkeys"
 
 # ---- 5. 打包 DEBIAN 控制文件 ----
 echo "[5/6] 创建包元数据..."
