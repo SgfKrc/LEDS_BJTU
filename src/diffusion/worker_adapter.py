@@ -105,6 +105,7 @@ class DiffusionExecutionResult:
 DiffusionExecutor = Callable[[Mapping[str, Any], threading.Event], DiffusionExecutionResult]
 SendMessage = Callable[[WorkerMessage], None]
 DiffusionResultIngestor = Callable[[StageAttempt, Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]
+DiffusionResultDiscarder = Callable[[StageAttempt, Mapping[str, Any]], None]
 DiffusionInputTransferPlanBuilder = Callable[[StageAttempt, StageRequest], dict[str, Any]]
 
 
@@ -687,6 +688,7 @@ class RemoteDiffusionProvider:
         peer_snapshot: Callable[[], Mapping[str, Any]],
         send_message: SendMessage,
         result_ingestor: DiffusionResultIngestor | None,
+        result_discarder: DiffusionResultDiscarder | None = None,
         input_transfer_plan_builder: DiffusionInputTransferPlanBuilder | None = None,
         dispatch_enabled: bool = False,
         accept_timeout_seconds: float = 10.0,
@@ -696,6 +698,7 @@ class RemoteDiffusionProvider:
         self._peer_snapshot = peer_snapshot
         self._send_message = send_message
         self._result_ingestor = result_ingestor
+        self._result_discarder = result_discarder
         self._input_transfer_plan_builder = input_transfer_plan_builder
         self._dispatch_enabled = bool(dispatch_enabled)
         self._accept_timeout_seconds = max(
@@ -1078,6 +1081,15 @@ class RemoteDiffusionProvider:
                 code="invalid_provider_result",
                 provider_id=self.provider_id,
             )
+        cancelled = cancel_event.is_set() or pending.cancel_requested
+        expired = time.time() > pending.lease_expires_at
+        if cancelled or expired:
+            self.cancel(attempt.attempt_id)
+            raise ProviderExecutionError(
+                "remote diffusion output arrived after its local fence",
+                code="provider_cancelled" if cancelled else "lease_expired",
+                provider_id=self.provider_id,
+            )
         try:
             safe_output = self._result_ingestor(
                 attempt, pending.output, pending.output_transfer_plan,
@@ -1089,13 +1101,23 @@ class RemoteDiffusionProvider:
                 provider_id=self.provider_id,
                 retryable=True,
             ) from exc
-        if cancel_event.is_set():
+        cancelled = cancel_event.is_set() or pending.cancel_requested
+        expired = time.time() > pending.lease_expires_at
+        if cancelled or expired:
             self.cancel(attempt.attempt_id)
-            raise ProviderExecutionError(
-                "remote diffusion output arrived after local cancellation",
-                code="provider_cancelled",
+            error = ProviderExecutionError(
+                "remote diffusion output was ingested after its local fence",
+                code="provider_cancelled" if cancelled else "lease_expired",
                 provider_id=self.provider_id,
             )
+            try:
+                self._discard_ingested_result(attempt, safe_output)
+            except Exception as discard_exc:
+                error.add_note(
+                    "ingested diffusion result cleanup also failed: "
+                    f"{discard_exc}"
+                )
+            raise error
         return StageResult(
             output=dict(safe_output),
             provider_id=self.provider_id,
@@ -1103,6 +1125,22 @@ class RemoteDiffusionProvider:
             attempt_id=attempt.attempt_id,
             lease_epoch=attempt.lease_epoch,
         )
+
+    def _discard_ingested_result(
+        self,
+        attempt: StageAttempt,
+        output: Mapping[str, Any],
+    ) -> None:
+        if self._result_discarder is not None:
+            self._result_discarder(attempt, output)
+
+    def discard_result(self, attempt_id: str, output: dict) -> None:
+        """Delete coordinator-owned output when TaskGraph rejects the result."""
+        with self._lock:
+            pending = self._pending.get(attempt_id)
+            attempt = pending.attempt if pending is not None else None
+        if attempt is not None:
+            self._discard_ingested_result(attempt, output)
 
     def handle_message(self, raw: bytes | str | Mapping[str, Any]) -> WorkerMessage:
         message = decode_message(raw)
@@ -1339,6 +1377,7 @@ __all__ = [
     "DiffusionCoordinatorControlPlane",
     "DiffusionExecutionResult",
     "DiffusionInputTransferPlanBuilder",
+    "DiffusionResultDiscarder",
     "DiffusionResultIngestor",
     "DiffusionWorkerAdapter",
     "IMAGE_PROTOCOL_VERSION",

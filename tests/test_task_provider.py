@@ -450,6 +450,65 @@ def test_coordinator_cancellation_reaches_provider_and_releases_reservation():
     coordinator.close()
 
 
+def test_cancel_after_provider_return_discards_uncommitted_result():
+    result_created = threading.Event()
+    submit_gate_entered = threading.Event()
+    allow_submit = threading.Event()
+    discarded = []
+
+    class DisposableProvider(LocalFullModelProvider):
+        def discard_result(self, attempt_id, output):
+            discarded.append((attempt_id, dict(output)))
+
+    def execute(request, cancel_event):
+        result_created.set()
+        return {"content": "must not commit"}
+
+    registry = ProviderRegistry()
+    provider = DisposableProvider(execute)
+    registry.register(provider)
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+    original_raise_if_cancelled = coordinator._raise_if_cancelled
+    gate_used = threading.Event()
+
+    def gated_cancel_check(workflow):
+        if result_created.is_set() and not gate_used.is_set():
+            gate_used.set()
+            submit_gate_entered.set()
+            assert allow_submit.wait(5)
+        original_raise_if_cancelled(workflow)
+
+    coordinator._raise_if_cancelled = gated_cancel_check
+    errors = []
+
+    def run_workflow():
+        try:
+            coordinator.run(
+                [StageSpec("answer", "full_inference")],
+                "answer",
+                {"message": "question"},
+                workflow_id="wf_discardrace1",
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_workflow)
+    thread.start()
+    assert submit_gate_entered.wait(5)
+    coordinator.cancel("wf_discardrace1")
+    allow_submit.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert isinstance(errors[0], WorkflowCancelled)
+    assert discarded == [(
+        coordinator.get("wf_discardrace1")["stages"][0]["attempts"][0]["attempt_id"],
+        {"content": "must not commit"},
+    )]
+    assert coordinator.get("wf_discardrace1")["state"] == "cancelled"
+    coordinator.close()
+
+
 def test_cancel_after_reservation_does_not_create_a_new_attempt():
     reservation_created = threading.Event()
     return_reservation = threading.Event()

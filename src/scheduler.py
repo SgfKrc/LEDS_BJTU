@@ -1154,6 +1154,7 @@ class Scheduler:
         self._diffusion_worker_lock = threading.RLock()
         self._diffusion_worker_adapter: Optional[DiffusionWorkerAdapter] = None
         self._diffusion_result_ingestor: Optional[Callable] = None
+        self._diffusion_result_discarder: Optional[Callable] = None
         self._diffusion_task_dispatch_enabled = False
         self._remote_diffusion_providers: dict[str, RemoteDiffusionProvider] = {}
         self._task_worker_refresh_lock = threading.Lock()
@@ -3633,7 +3634,11 @@ class Scheduler:
             adapter.disconnect_coordinator()
 
     def configure_diffusion_coordinator(
-        self, *, result_ingestor: Callable, dispatch_enabled: bool = False,
+        self,
+        *,
+        result_ingestor: Callable,
+        result_discarder: Optional[Callable] = None,
+        dispatch_enabled: bool = False,
     ) -> bool:
         """Enable verified v3 response routing on a configured coordinator.
 
@@ -3647,6 +3652,7 @@ class Scheduler:
             stale = list(self._remote_diffusion_providers.values())
             self._remote_diffusion_providers.clear()
             self._diffusion_result_ingestor = result_ingestor
+            self._diffusion_result_discarder = result_discarder
             self._diffusion_task_dispatch_enabled = bool(dispatch_enabled)
         for provider in stale:
             provider.close()
@@ -3658,6 +3664,7 @@ class Scheduler:
             providers = list(self._remote_diffusion_providers.values())
             self._remote_diffusion_providers.clear()
             self._diffusion_result_ingestor = None
+            self._diffusion_result_discarder = None
             self._diffusion_task_dispatch_enabled = False
         for provider in providers:
             provider.close()
@@ -3670,6 +3677,7 @@ class Scheduler:
             if provider is not None:
                 return provider
             ingestor = self._diffusion_result_ingestor
+            discarder = self._diffusion_result_discarder
             if ingestor is None or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
                 return None
             provider = RemoteDiffusionProvider(
@@ -3681,6 +3689,7 @@ class Scheduler:
                     self._send_task_worker_to_node(bound_node, message)
                 ),
                 result_ingestor=ingestor,
+                result_discarder=discarder,
                 # The isolated Provider remains directly testable.  Product
                 # dispatch is controlled separately by TaskGraph registration
                 # and reported through _diffusion_task_dispatch_enabled.

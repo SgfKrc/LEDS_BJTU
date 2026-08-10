@@ -103,6 +103,11 @@ class StageSpec:
     minimum_successful_dependencies: Optional[int] = None
     max_same_provider_retries: int = 0
     retry_safe: bool = False
+    root_input_overrides: dict[str, Any] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass
@@ -1552,6 +1557,13 @@ class TaskGraphCoordinator:
                 raise TaskGraphError(
                     f"stage {spec.stage_id} retry_safe must be a bool"
                 )
+            if not isinstance(spec.root_input_overrides, dict) or any(
+                not isinstance(key, str) or not key
+                for key in spec.root_input_overrides
+            ):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} root input overrides must use non-empty string keys"
+                )
             dependency_count = len(spec.depends_on)
             minimum_successful = spec.minimum_successful_dependencies
             if minimum_successful is None:
@@ -2205,6 +2217,16 @@ class TaskGraphCoordinator:
             if failed_dependencies:
                 dependencies[DEPENDENCY_FAILURES_KEY] = failed_dependencies
             selected_provider = stage.selected_provider()
+        stage_root_input = dict(root_input)
+        replacement = stage.spec.root_input_overrides.get("__replace__")
+        if replacement is not None:
+            if not isinstance(replacement, dict):
+                raise TaskGraphError(
+                    f"stage {stage.spec.stage_id} root input replacement must be an object"
+                )
+            stage_root_input = dict(replacement)
+        else:
+            stage_root_input.update(stage.spec.root_input_overrides)
         provider_request = StageRequest(
             workflow_id=workflow.workflow_id,
             request_id=workflow.request_id,
@@ -2212,7 +2234,7 @@ class TaskGraphCoordinator:
             stage_type=stage.spec.stage_type,
             provider_id=selected_provider,
             dependencies=dependencies,
-            root_input=root_input,
+            root_input=stage_root_input,
             model_identity=workflow.model_identity,
             runtime_context=workflow.runtime_context,
         )
@@ -2366,6 +2388,8 @@ class TaskGraphCoordinator:
     ) -> None:
         attempt: Optional[AttemptRecord] = None
         provider_attempt: Optional[ProviderStageAttempt] = None
+        result: Optional[ProviderStageResult] = None
+        result_retained = False
         attempt_started = False
         try:
             with workflow.lock:
@@ -2430,6 +2454,7 @@ class TaskGraphCoordinator:
                     workflow, stage, result,
                 )
                 if submission["status"] in {"committed", "idempotent"}:
+                    result_retained = True
                     return
                 if stage.winner_attempt_id:
                     return
@@ -2563,19 +2588,43 @@ class TaskGraphCoordinator:
                         attempt.attempt_id, None,
                     )
             active_exception = sys.exc_info()[1]
+            cleanup_failure: Optional[WorkflowExecutionError] = None
+            if result is not None and not result_retained:
+                try:
+                    provider_registry.discard_result(
+                        attempt.provider,
+                        attempt.attempt_id,
+                        result.output,
+                    )
+                except Exception as discard_exc:
+                    if active_exception is None:
+                        cleanup_failure = WorkflowExecutionError(
+                            workflow.workflow_id,
+                            stage.spec.stage_id,
+                            "uncommitted provider result cleanup failed: "
+                            f"{discard_exc}",
+                        )
+                    else:
+                        active_exception.add_note(
+                            "uncommitted provider result cleanup also failed: "
+                            f"{discard_exc}"
+                        )
             try:
                 provider_registry.release(reservation.reservation_id)
             except Exception as release_exc:
-                if active_exception is None:
+                cleanup_target = active_exception or cleanup_failure
+                if cleanup_target is None:
                     raise WorkflowExecutionError(
                         workflow.workflow_id,
                         stage.spec.stage_id,
                         f"provider reservation cleanup failed: {release_exc}",
                     ) from release_exc
-                active_exception.add_note(
+                cleanup_target.add_note(
                     "provider reservation cleanup also failed: "
                     f"{release_exc}"
                 )
+            if cleanup_failure is not None:
+                raise cleanup_failure
 
     @staticmethod
     def _raise_if_cancelled(workflow: WorkflowRecord) -> None:
