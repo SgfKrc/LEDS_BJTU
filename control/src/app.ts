@@ -71,6 +71,7 @@ import { SettingsController } from './modules/settings/settings.controller';
 import { WorkflowsController } from './modules/workflows/workflows.controller';
 import { AuthController, UsersController } from './modules/auth/auth.controller';
 import { AuthService } from './data/auth-service';
+import { TailscaleLocalStatusService } from './data/tailscale-local-status';
 
 @Controller()
 export class CatchAllController {
@@ -126,6 +127,7 @@ export class CatchAllController {
     ArtifactManifestRepository,
     AuthAssetRepository,
     AuthService,
+    TailscaleLocalStatusService,
     ArtifactStore,
     ModelInspector,
     ModelImportService,
