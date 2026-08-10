@@ -29,6 +29,10 @@ test('local model fleet workspace manages artifacts, imports, pulls, and user pr
     priority: 10, enabled: true, builtin: true,
   }];
 
+  await page.addInitScript(() => {
+    sessionStorage.setItem('qlh-auth-session-token', 'model-fleet-fixture-token');
+  });
+
   await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -38,6 +42,17 @@ test('local model fleet workspace manages artifacts, imports, pulls, and user pr
       contentType: 'application/json',
       body: JSON.stringify(body),
     });
+
+    if (path === '/api/auth/capability') {
+      return json({ required: true, mode: 'local_totp', service: 'control-svc' });
+    }
+    if (path === '/api/auth/session') {
+      return json({
+        session_id: 'session-owner',
+        expires_at: '2026-08-11T00:00:00.000Z',
+        user: { user_id: 'user-owner', username: 'owner', role: 'owner' },
+      });
+    }
 
     if (path === '/api/models/artifacts') {
       return json({

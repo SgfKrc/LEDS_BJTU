@@ -6,7 +6,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   testDir: path.join(HERE, 'tests'),
-  testMatch: 'model-fleet-ui.spec.js',
+  testMatch: ['model-fleet-ui.spec.js', 'auth-ui.spec.js', 'user-management-ui.spec.js'],
   timeout: 45_000,
   expect: { timeout: 10_000 },
   workers: 1,
