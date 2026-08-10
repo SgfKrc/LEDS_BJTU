@@ -798,7 +798,7 @@ python serve.py
 - [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC Full Worker v2（TC-N2.4 物理设备准入未过）
 - [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
-- [数据库测试指南](docs/数据库测试指南.md) — PostgreSQL 依赖用例的运行方式与跳过条件
+- [数据库测试指南](docs/数据库测试指南.md) — 存储层测试现状：SQLite 契约、退场 fail-closed 用例与运行方式（PG 已退场）
 
 ### 外部算力辅助（张量并行在异构 mesh 内不可行，改走集群外辅助）
 
