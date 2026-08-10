@@ -42,7 +42,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔗 **PyTorch 层流水线** | 兼容的 Safetensors 模型按连续层段分配，hidden states 逐节点传递，支持 KV Cache 增量解码 |
 | 🔄 **双引擎架构** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/集显)，自动切换 |
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
-| 🗄️ **多会话与本地事实源** | 会话/设置/模型注册由 control-svc 本地 SQLite 事实源承载（outbox 单向投影远端 PostgreSQL），旧数据自动迁移；断网本地不中断 |
+| 🗄️ **多会话与本地事实源** | 会话/设置/模型注册等由主节点本地 SQLite 承载（远端 PostgreSQL 已退场，仅一次性迁移审计通道），旧数据一次性导入；断网本地不中断 |
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
@@ -127,8 +127,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── graph_orchestrator.py      # ★ 图算法智能编排（最大带宽生成树 + DFS 路径搜索）
 │   ├── device_profiler.py         # 设备画像采集（CPU/GPU/RAM/网络）
 │   ├── api_server.py              # FastAPI 服务端（REST API + WebSocket）
-│   ├── db.py                      # PostgreSQL 数据库连接池
-│   ├── local_store.py             # 本地 JSON 存储（DB 不可用时自动降级）
+│   ├── db.py                      # 已退场的 PostgreSQL 兼容实现（仅历史迁移审计）
+│   ├── local_store.py             # 主节点 SQLite 本地存储（旧 JSON 一次性只读导入）
 │   ├── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
 │   ├── model_host.py              # 模型生命周期宿主（管理器统一持有、LLM/SD 互斥锁）
 │   ├── email_notifier.py          # SMTP 告警 + IMAP 投票（收件邮箱 node_config 可配置）
@@ -223,7 +223,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 通信层 | TCP长连接、粘包处理、心跳、张量序列化 | Python socket + struct |
 | 推理层 | 多引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU / Android) / island *(PoC)* |
 | 外部辅助层 *(PoC)* | 整请求外发的路由与数据作用域门控、投机解码校验 | OpenAI 兼容 HTTP（vLLM / SGLang 等） |
-| 存储层 | 对话持久化、节点注册、配置管理 | PostgreSQL + 本地 JSON 降级 + Room (Android) |
+| 存储层 | 对话持久化、节点注册、配置管理 | 主节点 SQLite（Python/Node 共库）+ Room (Android) |
 | 基础层 | 运行环境 | Python / CUDA / bitsandbytes / llama.cpp |
 
 ---
@@ -271,9 +271,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 
 ### 数据库
 
-| 依赖 | 版本要求 | 说明 |
-|------|----------|------|
-| psycopg2-binary | ≥ 2.9 | PostgreSQL 客户端（云端同步用，可选） |
+> 远端 PostgreSQL 已退场（M1.3，2026-08-10）：生产运行时不再连接或打包 PG 驱动，数据由主节点 SQLite 承载；仅历史迁移审计需要时按需安装 psycopg2。
 
 ### 网络（分布式模式必装）
 
@@ -311,11 +309,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 ### 一键安装
 
 ```bash
-# Python 依赖（PostgreSQL 客户端可选，不装也不影响单机模式）
+# Python 依赖（主节点 SQLite 自持，无需 PostgreSQL）
 pip install -r requirements.txt
-
-# 可选：PostgreSQL 数据库驱动（分布式集群节点注册/配置同步）
-pip install psycopg2-binary
 
 # 前端依赖
 cd frontend && npm install && cd ..
