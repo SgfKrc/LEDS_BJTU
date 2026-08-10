@@ -1,6 +1,27 @@
-"""Read-only model asset inspection tools."""
+"""Model asset inspection, maintenance, and conversion tools."""
 
 from .gguf import inspect_gguf, verify_gguf
+from .gguf_convert import GGUFConvertError, execute_conversion, plan_conversion
+from .llm_smoke_matrix import discover_units, fixed_prompts, run_smoke_matrix
+from .llama_quantize_toolchain import resolve_quantizer, verify_managed_package
+from .maintenance import clean_models, model_disk_usage
 from .sweep import sweep_models
+from .sync_status import build_inventory, compare_inventories
 
-__all__ = ["inspect_gguf", "verify_gguf", "sweep_models"]
+__all__ = [
+    "build_inventory",
+    "clean_models",
+    "compare_inventories",
+    "discover_units",
+    "fixed_prompts",
+    "GGUFConvertError",
+    "execute_conversion",
+    "inspect_gguf",
+    "model_disk_usage",
+    "plan_conversion",
+    "resolve_quantizer",
+    "run_smoke_matrix",
+    "sweep_models",
+    "verify_gguf",
+    "verify_managed_package",
+]

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "tool": "llama-quantize",
+  "upstream": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "47e1de77aa0f06bf73cfd8c5281d95979f89fcbe",
+    "license": "MIT"
+  },
+  "source": "android/app/src/main/cpp/llama.cpp",
+  "cmake_target": "llama-quantize",
+  "targets": {
+    "windows-x86_64": {
+      "platform": "windows",
+      "architecture": "x86_64",
+      "executable": "llama-quantize.exe"
+    },
+    "linux-x86_64": {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "executable": "llama-quantize"
+    }
+  }
+}
