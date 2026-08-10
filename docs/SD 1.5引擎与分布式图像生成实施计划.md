@@ -1,9 +1,9 @@
 # SD 1.5 引擎与分布式图像生成实施计划
 
-> 文档状态：部分实施（`L4 Candidate`；SD-N1 与 SD-N5.2 已完成；SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；img2img 与 IP-Adapter `reference` 的后端、前端和双模型完整自动质量/显存门均已通过，双人目视审核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，5 份报告均 passed）；SD-N5.3 InstructPix2Pix 指令编辑已完成实现，十指令自动门、Edge 链路与双人目视均已完成；SD-N3.3 已完成，SD-N3.4 已接通主节点 Provider、单 Stage TaskGraph API 和独立进程真实 TCP+HTTP fake executor 闭环，但真实 Diffusers/GPU Worker、物理 PC 和多 seed 分布式验收仍未完成；继续由《总体下一步计划》L4-SD1.5 管理优先级）
+> 文档状态：部分实施（`L4 Candidate / P1`；SD-N1 与 SD-N5.2 已完成；SD-N2 本地图像工作区、固定资产下载/导入和 DreamBooth 十种子自动门已实测；img2img 与 IP-Adapter `reference` 的后端、前端和双模型完整自动质量/显存门均已通过，双人目视审核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，5 份报告均 passed）；SD-N5.3 InstructPix2Pix 指令编辑已完成实现，十指令自动门、Edge 链路与双人目视均已完成；SD-N3.4 开发门已完成；SD-N4 固定四 seed、网格聚合、真实节点统计和回收边界的非硬件开发门已完成，两台物理 CUDA PC 的吞吐、故障和 UI 发布验收仍待设备；继续由《总体下一步计划》L4-SD1.5 管理优先级）
 >
 > 调研日期：2026-07-30
-> 更新日期：2026-08-07
+> 更新日期：2026-08-11
 >
 > 适用范围：Windows CUDA PC 上的 Stable Diffusion 1.5 本地文生图，以及后续图生图、局部重绘、指令式编辑和基于现有 TaskGraph/PC Full Worker 的跨 PC 图像批次分布式展示
 >
@@ -11,7 +11,7 @@
 
 本文同时记录计划与已验证边界。任何阶段只有完成对应自动化、真实模型、真实 GPU、跨设备和安装包验收后，才能把状态改为“已实现”。当前不得因为单机基线通过而宣称已支持分布式图像生成。
 
-## 0. 2026-08-07 实施状态
+## 0. 2026-08-11 实施状态
 
 | 范围 | 状态 | 已验证证据 |
 |---|---|---|
@@ -20,10 +20,10 @@
 | `SD-N2` 本地图像工作区 | `In Progress`（2026-08-05） | Web 主节点已接通本机 Diffusers 检查/登记、profile 加载、LLM/SD 显式互斥切换、原版/90s preset、异步 step 进度、取消和 PNG 生命周期。DreamBooth `aa8a082c...` 及逐权重 SHA 已冻结，4,874,690,864-byte 固定下载集合已实际下载、完整校验并生成 16 文件 manifest；独立脚本下载后服务端也能在目录刷新时自动发现并注册。90s 组合资产固定原版 SD 1.5 safety checker，组件缺失时 fail-closed。第二轮固定十种子自动门 10/10 通过：10 个唯一 PNG、0 个 safety flag、最小熵 7.855、最小文件 446,750 bytes，总耗时 111.712 s。**双人目视与许可复核于 2026-08-06 完成（Siegfried Kkm./浅草爱音，十种子报告 status=passed）**。正式离线发布包仍未完成，因此 SD-N2 不得标记完成。 |
 | single-file checkpoint、LoRA、ControlNet | 未实施 | Inspector 可以拒绝把 ControlNet 当完整模型；实际加载和组合仍未接入。 |
 | 图生图 img2img、参考图一致性、局部重绘、指令式编辑 | img2img 与 IP-Adapter `In Progress`（自动门和双人目视已完成）；inpaint `Completed`（2026-08-07）；instruction `In Progress`（自动/Edge 门和双人目视均已完成） | **img2img（2026-08-06）**：引擎 `SD15Engine.edit()` 复用已加载组件（`StableDiffusionImg2ImgPipeline.from_pipe`/`components`）、服务层 `submit_edit`/`validate_edit`（blob 租约、源图/mask 维度校验、strength 0.05–1.0）、单体 FastAPI 与 inference-svc 路由、Nest 网关 multipart 转发与 Web 工作区均已落地。已修复生成结果续编的 `purpose`/`owner_scope` 契约，并完成真实 inference-svc `文生图 → output Blob 图生图 → 引用删除 → 取消 → 卸载` 快速门：512×512/4 steps 文生图 6.739 s，strength 0.55 图生图 7.428 s，源 Blob 被结果引用时删除正确返回 409，取消在第 1/20 step 后 0.054 s 收敛。真实 Edge 150 浏览器门完成“上传源图 → img2img → 继续编辑 → 再次 img2img → 卸载”，两轮引擎耗时 5.998/4.842 s、像素采样范围 245/239。源图 SHA-256 固定为 `a6fd131b...e93264`；原版 28 steps 与 90s 40 steps 各完成 10 seed × 0.25/0.55/0.85 共 30 张，均 30/30 自动通过且 30 张唯一，耗时 291.993/361.291 s，连续 allocated/reserved span 均为 0，卸载后 allocated 增量 8,519,680 bytes。两份报告的自动门均通过，目视签字结果见本行后文。**IP-Adapter（2026-08-06）**：冻结并下载 `h94/IP-Adapter@018e4027...` 的 2,573,016,776-byte 离线资产，稳定 artifact SHA-256 为 `671c7452...e94c4`；Inspector、服务/API、Web `reference` 模式和真实 GPU 生命周期均已通过。修复 adapter 后注册的 2.5 GB image encoder 未进入 Accelerate CPU-offload hook 的性能缺陷，并在 pipeline 级关闭 tqdm，4-step 回归为 4.537 s、无 `[Errno 22]`。固定人物参考图 SHA-256 为 `3271580f...fe38f`；原版 28 steps 完成 36/36 有效图，90s 40 steps 完成 35 张有效图并正确保留 1 张 safety 黑图证据，三档 scale 有效数为 11/12/12；两轮峰值 reserved 均为 2,789,212,160 bytes，显存门通过，自动报告随后已完成双人目视签字。**img2img（2 份）与 IP-Adapter（2 份）报告于 2026-08-06 双人目视签字完成（Siegfried Kkm./浅草爱音，均 status=passed），目视门已满足；IP-Adapter 只承诺人物主要要素保持，不承诺精确身份锁定。** **inpaint（2026-08-07）**：固定 `stable-diffusion-v1-5/stable-diffusion-inpainting@8a4288a...` 的 2,742,261,613-byte FP16 下载集合，专用 9-channel U-Net 识别为 `sd15_inpaint_pipeline`，稳定 artifact SHA-256 为 `ddd6d69a...1c605`。引擎按需加载并复用专用 pipeline，服务/API/网关接通 source + mask 双租约，Web 提供鼠标/触控画笔、橡皮、撤销/重做、反转、缩放/平移和黑白 PNG 导出；缺专用资产或非 balanced CUDA profile 时排队前拒绝。固定源图 SHA `a6fd131b...e93264` 的 10 seed × 20 steps 完整门 10/10 通过：全黑 mask MAE 4.16–4.98，局部白 mask 外侧 MAE 4.59–5.03、内外差 20.16–30.01，全白 mask MAE 82.04–85.57；0 safety flag、10 张唯一，连续 allocated span 为 0，峰值 reserved 3,649,044,480 bytes，卸载后 allocated/reserved 为 8,519,680/20,971,520 bytes。Edge 150 真实画布上传与 inpaint 任务通过，4-step 引擎/浏览器链路耗时 4.683/7.015 s。** **instruction（2026-08-07）**：默认冻结完整 InstructPix2Pix `31519b5c...`（稳定 SHA `a6626f7f...c872ab`）；API/网关/Web 与独立 guidance 参数已贯通，10 条固定指令自动门 10/10、0 safety、显存门和 Edge 链路通过，报告已完成双人目视并签字为 `passed`。** |
-| API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 本地 API/UI、Blob 数据面、v3 adapter、隔离 Provider、单 Stage 实验接口和独立进程传输闭环已实现；多图生产链未接通 | SQLite WAL 内容寻址对象、受控 HTTP 分块数据面、attempt lease、HMAC 传输授权、v3 image schema、Worker/协调器 adapter、`RemoteDiffusionProvider`、校验式 Blob transfer client 以及默认关闭的 `/api/diffusion/distributed/generate` 单 `image_generate` TaskGraph seam 已实现。接口要求 TaskGraph + SD v3 双开、主节点、健康 Worker 和精确 artifact manifest；结果由 coordinator CAS owner 校验读取，取消复用 `/api/workflows/{workflow_id}/cancel`。本机独立 Worker 子进程已通过真实 TCP hello/offer/result 和真实 FastAPI HTTP 分块回传固定 PNG；该证据使用确定性 fake SD executor，不等价于真实 Diffusers/GPU、两台物理设备、固定多 seed fan-out/fan-in 或 UI 分布式统计验收，前端仍不能显示为已发布分布式能力。 |
+| API/UI、资产登记、图片 blob、TaskGraph Stage、完整 PC Worker、跨 PC fan-out/fan-in | 本地 API/UI、Blob 数据面、v3 adapter、隔离 Provider、单 Stage 实验接口和独立真实 Diffusers Worker 闭环已完成开发门；多图生产链未接通 | SQLite WAL 内容寻址对象、受控 HTTP 分块数据面、attempt lease、HMAC 传输授权、v3 image schema、Worker/协调器 adapter、`RemoteDiffusionProvider`、校验式 Blob transfer client 以及默认关闭的 `/api/diffusion/distributed/generate` 单 `image_generate` TaskGraph seam 已实现。新增 provider 结果 disposer：提交前取消、租约过期、晚到/重复/胜者冲突均回收 coordinator CAS；owner scope 批量清理只允许精确 `distributed:<workflow_id>`，重启恢复的 `result_ready` 图像工作流会撤销旧 lease 并清理 blob。新增取消/ingest 竞态、跨 owner 清理、SQLite journal 恢复测试，扩大定向回归 `133/133` 通过。真实双进程 smoke 仍以 RTX 4060 Laptop GPU、4-step PNG SHA-256 `86665855…05bfa` 为开发证据；该证据不等价于两台物理设备、固定多 seed fan-out/fan-in 或 UI 分布式统计验收，前端仍不能显示为已发布分布式能力。 |
 | Android SD 推理 | 未实施 | Android 仍不承担完整 SD Worker 或层间拆分。 |
 
-单引擎基准由 `scripts/smoke_sd15.py` 复现；真实 HTTP 文生图/续编/取消生命周期由 `scripts/validate_sd15_api_lifecycle.py` 复现；固定资产下载由 `scripts/download_sd15.py --asset-id ... --accept-license` 复现；文生图十种子门由 `scripts/quality_gate_sd15.py` 复现，图生图三 strength/多 seed 门由 `scripts/quality_gate_sd15_img2img.py` 复现，IP-Adapter 三 scale/多 seed 门由 `scripts/quality_gate_sd15_ip_adapter.py` 复现，inpaint 黑/局部白/全白十轮语义门由 `scripts/quality_gate_sd15_inpaint.py` 复现，InstructPix2Pix 十条固定指令门由 `scripts/quality_gate_sd15_instruction.py` 复现，真实浏览器门由 `frontend npm run test:e2e:sd15` 复现。图生图、IP-Adapter 和 inpaint 完整门都必须显式传入固定源图的 `--source-sha256`；快速/改参运行只会得到 `partial_pass`。IP-Adapter 完整门每档固定生成 12 个 seed，至少 10 个未被 safety 拦截的有效结果才计为通过；被拦截黑图保留在报告中，不计入质量和唯一性。inpaint 完整门固定执行 3 次全黑、4 次局部白和 3 次全白 mask，以像素 MAE 和显存跨度同时判定。指令编辑自动门只证明输出有效、结构相关、唯一且显存稳定，指令语义是否正确仍需两名独立审核者签字。推理路径只接受已下载的本地完整 Diffusers 目录，不会在加载或生成途中访问 Hub。下载器和推理侧车只使用 CUDA 可选虚拟环境，不安装或升级全局解释器依赖，尚未进入 PC/Android 发布产物。
+单引擎基准由 `scripts/smoke_sd15.py` 复现；真实 HTTP 文生图/续编/取消生命周期由 `scripts/validate_sd15_api_lifecycle.py` 复现；固定资产下载由 `scripts/download_sd15.py --asset-id ... --accept-license` 复现；文生图十种子门由 `scripts/quality_gate_sd15.py` 复现，图生图三 strength/多 seed 门由 `scripts/quality_gate_sd15_img2img.py` 复现，IP-Adapter 三 scale/多 seed 门由 `scripts/quality_gate_sd15_ip_adapter.py` 复现，inpaint 黑/局部白/全白十轮语义门由 `scripts/quality_gate_sd15_inpaint.py` 复现，InstructPix2Pix 十条固定指令门由 `scripts/quality_gate_sd15_instruction.py` 复现，真实浏览器门由 `frontend npm run test:e2e:sd15` 复现。真实双进程分布式 Worker 门由 CUDA 侧车运行 `scripts/smoke_sd15_distributed_worker.py --steps 4 --json` 复现；脚本强制 Hub 离线、使用临时集群密钥和临时状态目录，结果仅保留脱敏 JSON 与最终 PNG。图生图、IP-Adapter 和 inpaint 完整门都必须显式传入固定源图的 `--source-sha256`；快速/改参运行只会得到 `partial_pass`。IP-Adapter 完整门每档固定生成 12 个 seed，至少 10 个未被 safety 拦截的有效结果才计为通过；被拦截黑图保留在报告中，不计入质量和唯一性。inpaint 完整门固定执行 3 次全黑、4 次局部白和 3 次全白 mask，以像素 MAE 和显存跨度同时判定。指令编辑自动门只证明输出有效、结构相关、唯一且显存稳定，指令语义是否正确仍需两名独立审核者签字。推理路径只接受已下载的本地完整 Diffusers 目录，不会在加载或生成途中访问 Hub。下载器和推理侧车只使用 CUDA 可选虚拟环境，不安装或升级全局解释器依赖，尚未进入 PC/Android 发布产物。
 
 ### 0.1 单机优化能力边界
 
@@ -654,7 +654,7 @@ validate_input
 
 ### SD-N3：图像 blob 与 Worker v3
 
-**状态：** `In Progress`（2026-08-07；`SD-N3.0/N3.1/N3.2` 已完成，`SD-N3.3` 已完成默认关闭的 TCP 控制面和本机 Worker executor 桥接；尚未形成可执行的分布式图像链路）。
+**状态：** `Completed（开发门，2026-08-11）`（`SD-N3.0/N3.1/N3.2/N3.3` 与 `SD-N3.4` 本机闭环、迟到结果/取消与 lease fencing、CAS 回收、SQLite journal 重启恢复均已验证；两台物理 PC 和跨设备验收属于后续 `SD-N4`，不在本开发门内）。
 
 **依赖：** SD-N1、TC-N2.4 状态机/Worker 故障边界保持稳定。
 
@@ -668,15 +668,33 @@ validate_input
 
 **已完成 SD-N3.3（受控 TCP 与本机 Worker 桥接）：** Scheduler 继续复用已有 `TASK_WORKER` TCP 帧，并按协议版本将 v2 文本 Worker 与 v3 图像 Worker 严格分流。`QLH_DIFFUSION_WORKER_EXPERIMENTAL_ENABLED=false` 时拒绝所有 v3 协商；开启后主节点仅接纳已注册的 PC client 的 `hello`，仍拒绝 Stage 响应且不创建图像 Provider。客户端只有由 API 生命周期显式安装 `DiffusionWorkerAdapter` 后才发送 v3 hello，并只把 `hello_ack`、`stage_offer`、`lease_renew`、`stage_cancel` 交给它；TCP 断开会立刻取消 active stage、清空协商状态，重连才重新 hello。`DiffusionWorkerRuntime` 将已经加载且具有 SHA 的本地 SD 基础工件映射为 artifact manifest；一期只广告/执行 `image_generate`，以本地 `DiffusionService` 的可取消 job 运行，成功 PNG 复制到持久数据面并签发 attempt-scoped 下载 grant，取消时绝不发布输出。此 runtime 还要求配置可被协调器访问的 `QLH_DIFFUSION_WORKER_DATA_PLANE_BASE_URL`，不从 `0.0.0.0` 或猜测的地址推导。Scheduler 不导入或加载 Diffusers，侧车仍与 LLM 生命周期互斥。自动化覆盖默认关闭、注册节点门、同通道 hello、客户端 offer/cancel、断连清理、artifact 不匹配和取消不发布；尚无主节点 Provider、TaskGraph 连接或真实 TCP 双进程证据。
 
-**SD-N3.4 进行中：** 主节点现已能在 data plane 与 result ingestor 均由 API 显式注入后，把已协商 Worker 绑定为 `RemoteDiffusionProvider`；`stage_accept/result/error/cancelled` 由 Scheduler 交给该 Provider，断连会唤醒 pending attempt。`DiffusionCoordinatorRuntime` 使用标准库 HTTP 客户端逐段验证 Worker 输出，完整通过后才写入 coordinator CAS，返回新本地 descriptor；短期 grant 仅存在于 Provider 调用栈，不进入 `StageResult.metadata`。Provider 现在可在 TaskGraph 中按稳定 ID 安全替换，API 已接入默认关闭的单 Stage `image_generate_v1` 实验接口，结果通过 `workflow_id + blob_id` 的持久 owner scope 读取，取消复用 TaskGraph workflow 取消端点；TCP 心跳也会刷新图像控制面的健康时间。除 Scheduler 级 fake 闭环与 API workflow/取消/工件歧义/CAS owner 回归外，本机独立 Worker 子进程也已通过真实 TCP hello -> offer -> result 与真实 FastAPI HTTP 分块下载，协调器最终读取自己 CAS 中的新 PNG。该子进程使用确定性 fake SD executor，只证明传输和状态机边界。**尚未完成项：** 真实 Diffusers/GPU Worker、迟到结果与 journal 恢复、两台物理设备和固定多 seed fan-out/fan-in 仍待验证，因此 SD-N3.4 不能标记完成。下一步把相同双进程门替换为真实 Diffusers smoke，再进行两台物理 PC 验收。`image_grid` 在发往 Worker 前由 Provider 将已完成依赖物化为有序 Blob descriptor，协议本身不内联 TaskGraph dependency output；`image_edit` 保持关闭，待输入 Blob 拉取与各模式 asset 能力单独完成。
+**SD-N3.4 开发门已完成：** 主节点现已能在 data plane 与 result ingestor/discarder 均由 API 显式注入后，把已协商 Worker 绑定为 `RemoteDiffusionProvider`；`stage_accept/result/error/cancelled` 由 Scheduler 交给该 Provider，断连会唤醒 pending attempt。`DiffusionCoordinatorRuntime` 使用标准库 HTTP 客户端逐段验证 Worker 输出，完整通过后才写入 coordinator CAS，返回新本地 descriptor；短期 grant 仅存在于 Provider 调用栈，不进入 `StageResult.metadata`。TaskGraph 现在对已返回但未提交的结果调用 Provider disposer，覆盖取消、lease 过期、晚到、重复和 winner 冲突；Provider 在 ingest 后观察到取消/过期也立即删除已写入的 coordinator blob。owner scope 批量清理严格绑定 `distributed:<workflow_id>`，SQLite journal 将 `result_ready` 恢复为失败后，启动同步会撤销旧 lease 并回收图像输出。API 已接入默认关闭的单 Stage `image_generate_v1` 实验接口，结果通过 `workflow_id + blob_id` 的持久 owner scope 读取。新增取消/ingest 竞态、跨 owner 清理、SQLite journal 恢复测试，扩大定向回归 `133/133` 通过；当前 Python 全量 `1770 passed / 31 skipped`。2026-08-10 的真实双进程 smoke 仍以 RTX 4060 Laptop GPU、4-step PNG SHA-256 `86665855…05bfa` 为开发证据。`image_edit` 继续关闭并等待输入 Blob 拉取与各模式 asset 能力单独完成；多 seed 后续状态转由 SD-N4 记录。
 
 **完成判据：** 本机双进程能完成单 `image_generate` Stage；恶意尺寸、错误 MIME、哈希不符、断传、重复上传、迟到结果和路径探测全部 fail-closed；v2 文本 Worker 全量回归不变。
 
 ### SD-N4：固定多 seed 分布式展示
 
-**依赖：** SD-N2、SD-N3、至少两台物理 CUDA PC。
+**状态：** `Completed（非硬件开发门，2026-08-11） / Blocked（物理双机发布验收）`。当前缺少第二台 CUDA PC，不以同机 fake Worker 替代跨设备、吞吐或网络结论；实验 API 保持默认关闭，UI 不开放。
+
+**依赖：** 非硬件开发依赖 SD-N2、SD-N3；发布验收另需至少两台物理 CUDA PC。
 
 **工作：** 固定四 seed DAG、Provider 调度、网格聚合、实际参与节点 UI、单节点串行基线、故障注入。
+
+**非硬件开发门已完成：**
+
+- 新增固定四个不同 seed 的 `image_grid_v1` DAG：四个 `image_generate` Stage fan-out，最终主节点 `image_grid` Stage fan-in；生成参数仍使用严格 v3 `image_generate` schema，各 Stage 只覆盖自身 seed。
+- 调度只使用同一精确 artifact manifest 的健康 Worker 池，按稳定 provider 顺序轮转首选节点，并保留同 manifest fallback；只有一个 Worker 时明确降级为 `single_node_serial_batch`，不宣称分布式。
+- 主节点本地聚合器按 seed/Stage 顺序生成确定性 2×2 RGB PNG，并写入同一 `distributed:<workflow_id>` CAS owner；网格以四张候选图为父引用，删除与租约遵循既有 CAS 约束。
+- API 对每张图返回实际 winner 的 `seed/stage_id/provider_id/node_id/attempt_id`，计划 provider 单列；只有实际 winner 覆盖至少两个不同 Worker 节点时才返回 `distributed=true`。
+- 新增默认关闭且不接 UI 的实验入口 `POST /api/diffusion/distributed/grid`；工作流状态公开固定四 seed、2×2 布局和 `hardware_validation=pending_two_physical_cuda_pcs`，避免把 fake/local 证据写成发布结论。
+- 自动化覆盖双 fake Worker 轮转与真实 winner 统计、单 Worker 串行降级、单 seed 失败、网格写入后取消、父引用、owner 清理和 `image_grid_v1` journal 恢复；相关扩大回归 `220/220`、Python 全量 `1777 passed / 31 skipped`。
+
+**硬件验收待设备：**
+
+- 在两台物理 CUDA PC 上确认相同 manifest ready，并证明四张图的实际 winner 至少覆盖两个物理节点。
+- 对比同一设备集合的单节点串行四图热模型 wall time，记录真实收益、网络开销和瓶颈，不预设加速比。
+- 实测拔网、Worker OOM、重连、主节点重启和用户取消；核对无假成功、重复图、残留 lease 或 blob。
+- 完成浏览器 UI 的多图、节点来源和单节点降级展示后，才评估开放实验入口；当前执行入口转到不依赖第二台 CUDA PC 的 `UP-N6.0`。
 
 **完成判据：**
 
@@ -806,6 +824,7 @@ validate_input
 | SD 1.5 IP-Adapter | 固定人物参考图、原版/90s base、三档 scale、10 seed、模式切换、8 GB 显存与双人目视一致性门 |
 | SD 1.5 inpainting | 专用 inpaint 工件、三类 mask、边缘一致性、错误尺寸/方向 |
 | InstructPix2Pix / ControlNet IP2P | 固定指令集、错误 base/config/adapter、输入复用、自动门 + 双人目视 |
+| 单机真实双进程 Worker | 独立 Diffusers/GPU 进程、v3 TCP、认证 HTTP、协调器 CAS、相同 seed 重复性、报告脱敏 |
 | 两物理 Worker | 四 seed 扇出、掉线、OOM、重连、取消 |
 
 ### 9.3 性能记录
