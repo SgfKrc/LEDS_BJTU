@@ -73,7 +73,7 @@ fi
 
 # UP-N4 Launcher maintenance always runs through the stable Bootstrap.
 case "${1:-}" in
-    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose)
+    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose|repair)
         if [ -x "$PROJECT_ROOT/.venv-packaging/bin/python" ]; then
             PY="$PROJECT_ROOT/.venv-packaging/bin/python"
         elif command -v python3 >/dev/null 2>&1; then

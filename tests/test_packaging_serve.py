@@ -229,3 +229,26 @@ def test_update_manifest_classifies_launcher_setup_exe(tmp_path, monkeypatch):
     assert by_name[setup.name]["variant"] == "any"
     assert by_name[setup.name]["platform"] == "windows"
     assert by_name[bundle.name]["kind"] == "launcher"
+
+
+def test_update_manifest_classifies_repair_index(tmp_path, monkeypatch):
+    serve = _load_serve_module()
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    index = dist_dir / "QLH-Edge-Inference-Repair-v0.1.8.1-windows-cpu.json"
+    index.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(serve, "_project_version", lambda: "0.1.8.1")
+    serve._SHA256_CACHE.clear()
+
+    manifest = serve.build_update_manifest(str(dist_dir))
+
+    assert manifest["assets"] == [{
+        "name": index.name,
+        "url": "/" + index.name,
+        "size": 2,
+        "sha256": hashlib.sha256(b"{}").hexdigest(),
+        "platform": "windows",
+        "variant": "cpu",
+        "arch": "x86_64",
+        "kind": "repair-index",
+    }]

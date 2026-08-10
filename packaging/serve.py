@@ -57,6 +57,11 @@ ANDROID_EXTS = (".apk", ".aab")
 UPDATE_MANIFEST_PATH = "/latest.json"
 _SIGNER = None  # set by main() when QLH_SIGNING_KEY is configured
 _VERSION_RE = re.compile(r"(?<!\d)v?(\d+\.\d+\.\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)
+_REPAIR_INDEX_RE = re.compile(
+    r"^qlh-edge-inference-repair-v\d+\.\d+\.\d+(?:\.\d+)?-"
+    r"(?P<platform>windows|linux)-(?P<variant>cpu|cuda)\.json$",
+    re.IGNORECASE,
+)
 _SHA256_CACHE: dict[str, tuple[int, int, str]] = {}
 
 
@@ -114,6 +119,12 @@ def _sha256_cached(path: str) -> str:
 
 def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
     lower = name.lower()
+    repair_index = _REPAIR_INDEX_RE.fullmatch(lower)
+    if repair_index:
+        return (
+            repair_index.group("platform"), repair_index.group("variant"),
+            "x86_64", "repair-index",
+        )
     if lower.endswith(".zip") and "qlh-launcher" in lower:
         return "windows", "any", "x86_64", "launcher"
     if lower.endswith(".exe") and "qlh-launcher-setup" in lower:
