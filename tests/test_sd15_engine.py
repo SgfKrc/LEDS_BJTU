@@ -178,6 +178,24 @@ def test_generation_cancels_on_the_next_denoising_step():
         engine.generate(SD15GenerationRequest(prompt="test", steps=3), callback=cancel_after_first_step)
 
 
+@pytest.mark.parametrize("scheduler_name", ["EulerDiscreteScheduler", "DDIMScheduler"])
+def test_generation_uses_request_scheduler_and_restores_pipeline(monkeypatch, scheduler_name):
+    diffusers = pytest.importorskip("diffusers")
+    engine = _loaded_fake_engine()
+    original = SimpleNamespace(config={"name": "fixture"})
+    engine._pipeline.scheduler = original
+    replacement = SimpleNamespace(config={"name": scheduler_name})
+    scheduler_type = getattr(diffusers, scheduler_name)
+    monkeypatch.setattr(scheduler_type, "from_config", lambda _config: replacement)
+
+    result = engine.generate(
+        SD15GenerationRequest(prompt="test", steps=1, scheduler=scheduler_name),
+    )
+
+    assert result.metadata["scheduler"] == scheduler_name
+    assert engine._pipeline.scheduler is original
+
+
 def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
     diffusers = pytest.importorskip("diffusers")
 
