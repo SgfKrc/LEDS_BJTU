@@ -13,11 +13,12 @@
  * 仍走 legacy。
  * 注：fastify adapter 下同一方法叠加多个 @All 会覆盖，故每域拆根/子两个方法。
  */
-import { All, Controller, Req } from '@nestjs/common';
+import { All, Controller, Get, Req } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
 import { ControlClient } from '../../clients/control.client';
 import { ForwardClient } from '../../clients/forward-client';
 import { LegacyControlClient } from '../../clients/legacy.client';
+import { authPolicyEnabled } from '../auth/auth-policy.guard';
 
 @Controller()
 export class ControlController {
@@ -33,11 +34,23 @@ export class ControlController {
       : this.legacy;
   }
 
-  private forward(req: FastifyRequest, migrated: boolean): Promise<unknown> {
+  private forward(
+    req: FastifyRequest,
+    migrated: boolean,
+    includeAuthorization = false,
+    forceControl = false,
+  ): Promise<unknown> {
     const full = req.url; // 含 query
     const subPath = full.slice('/api'.length);
     const body = (req as { body?: unknown }).body;
-    return this.pick(migrated).request(req.method, subPath, body);
+    const rawAuthorization = req.headers.authorization;
+    const authorization = Array.isArray(rawAuthorization)
+      ? rawAuthorization[0]
+      : rawAuthorization;
+    const headers: Record<string, string> = {};
+    if (includeAuthorization && authorization) headers.authorization = authorization;
+    const client = forceControl ? this.control : this.pick(migrated);
+    return client.request(req.method, subPath, body, headers);
   }
 
   // ---- 已迁移域（阶段 3.2 完成） ----
@@ -60,6 +73,24 @@ export class ControlController {
 
   @All('bootstrap') bootstrapRoot(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('bootstrap/*') bootstrapSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+
+  @Get('auth/capability')
+  authCapability(): Record<string, unknown> {
+    return {
+      required: true,
+      enforced: authPolicyEnabled(),
+      mode: 'local_totp',
+      policy_version: 'n1a-v1',
+      service: 'control-svc',
+    };
+  }
+
+  // Authentication is a control-svc-only domain. It must not silently fall
+  // back to the unauthenticated legacy monolith when the migration flag is absent.
+  @All('auth') authRoot(@Req() r: FastifyRequest) { return this.forward(r, true, true, true); }
+  @All('auth/*') authSub(@Req() r: FastifyRequest) { return this.forward(r, true, true, true); }
+  @All('users') usersRoot(@Req() r: FastifyRequest) { return this.forward(r, true, true, true); }
+  @All('users/*') usersSub(@Req() r: FastifyRequest) { return this.forward(r, true, true, true); }
 
   @All('models/registry') registryRoot(@Req() r: FastifyRequest) { return this.forward(r, true); }
   @All('models/registry/*') registrySub(@Req() r: FastifyRequest) { return this.forward(r, true); }

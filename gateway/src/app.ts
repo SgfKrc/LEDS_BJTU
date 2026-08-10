@@ -6,7 +6,7 @@
  * docs/TUI适配实施计划.md §5 与 docs/微服务架构改造计划.md §2.2）。
  */
 import { All, Controller, Module, NotFoundException, Req } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { APP_GUARD, NestFactory } from '@nestjs/core';
 import {
   FastifyAdapter,
   NestFastifyApplication,
@@ -20,6 +20,7 @@ import { ControlClient } from './clients/control.client';
 import { InferenceClient } from './clients/inference.client';
 import { LegacyControlClient } from './clients/legacy.client';
 import { SchedulerClient } from './clients/scheduler.client';
+import { AuthPolicyGuard } from './modules/auth/auth-policy.guard';
 import { ClusterController } from './modules/cluster/cluster.controller';
 import { ChatController } from './modules/chat/chat.controller';
 import { ControlController } from './modules/control/control.controller';
@@ -58,7 +59,14 @@ export class CatchAllController {
     ExperimentalController,
     CatchAllController,
   ],
-  providers: [SchedulerClient, InferenceClient, LegacyControlClient, ControlClient, StaticService],
+  providers: [
+    SchedulerClient,
+    InferenceClient,
+    LegacyControlClient,
+    ControlClient,
+    StaticService,
+    { provide: APP_GUARD, useClass: AuthPolicyGuard },
+  ],
 })
 export class AppModule {}
 
