@@ -26,6 +26,7 @@
 import os
 import sys
 import glob
+from pathlib import Path
 
 # 项目根目录（SPECPATH = 当前 spec 文件所在目录）
 _PROJECT_ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
@@ -35,6 +36,21 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 
 # 前端 dist 目录
 _FRONTEND_DIST = os.path.join(_PROJECT_ROOT, "frontend", "dist")
+
+sys.path.insert(0, _PROJECT_ROOT)
+from scripts.model_tools.llama_quantize_toolchain import verify_managed_package
+
+_LLAMA_QUANTIZE_PACKAGE = os.path.join(
+    _PROJECT_ROOT, "build", "model-tools", "llama-quantize", "packages", "windows-x86_64"
+)
+_llama_quantize_verification = verify_managed_package(
+    Path(_LLAMA_QUANTIZE_PACKAGE), expected_target="windows-x86_64"
+)
+if not _llama_quantize_verification["valid"]:
+    raise FileNotFoundError(
+        "受管 llama-quantize 包缺失或校验失败；请先运行 "
+        "python scripts/build_llama_quantize.py --json"
+    )
 
 if not os.path.isdir(_FRONTEND_DIST):
     raise FileNotFoundError(
@@ -67,6 +83,7 @@ a = Analysis(
     datas=[
         # React 前端静态文件 → 运行时目录 frontend/dist/
         (_FRONTEND_DIST, 'frontend/dist'),
+        (_LLAMA_QUANTIZE_PACKAGE, 'model-tools/llama-quantize/windows-x86_64'),
     ],
     hiddenimports=[
         # ============================================================

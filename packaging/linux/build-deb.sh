@@ -29,6 +29,8 @@ PACKAGING_DIR="$PROJECT_ROOT/packaging"
 SRC_DIR="$PROJECT_ROOT/src"
 FRONTEND_DIR="$PROJECT_ROOT/frontend"
 BUILD_DIR="/tmp/qlh-deb-build"
+MODEL_TOOL_ROOT="$PROJECT_ROOT/build/model-tools/llama-quantize"
+MODEL_TOOL_PACKAGE="$MODEL_TOOL_ROOT/packages/linux-x86_64"
 
 # 前置检查
 if ! command -v dpkg-deb &> /dev/null; then
@@ -44,6 +46,20 @@ echo "  变体: $VARIANT"
 echo "  输出: $SCRIPT_DIR"
 echo "================================================================"
 echo ""
+
+if ! command -v python3 &> /dev/null; then
+    echo "错误: 未找到 python3。请安装 Python 3。"
+    exit 1
+fi
+
+echo "[toolchain] 构建并校验固定 revision 的 llama-quantize..."
+python3 "$PROJECT_ROOT/scripts/build_llama_quantize.py" \
+    --output-root "$MODEL_TOOL_ROOT" \
+    --json
+if [ ! -x "$MODEL_TOOL_PACKAGE/llama-quantize" ] || [ ! -f "$MODEL_TOOL_PACKAGE/manifest.json" ]; then
+    echo "错误: Linux llama-quantize 受管包缺失或不可执行。"
+    exit 1
+fi
 
 # ---- 清理旧构建 ----
 [ -n "$BUILD_DIR" ] && rm -rf "$BUILD_DIR"
@@ -64,6 +80,7 @@ mkdir -p "$BUILD_DIR/opt/qlh-edge-inference/src"
 mkdir -p "$BUILD_DIR/opt/qlh-edge-inference/frontend/dist"
 mkdir -p "$BUILD_DIR/opt/qlh-edge-inference/models"
 mkdir -p "$BUILD_DIR/opt/qlh-edge-inference/logs"
+mkdir -p "$BUILD_DIR/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64"
 mkdir -p "$BUILD_DIR/usr/share/applications"
 mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/256x256/apps"
 mkdir -p "$BUILD_DIR/lib/systemd/system"
@@ -83,6 +100,8 @@ cp "$PACKAGING_DIR/update_core.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/update
 cp "$PACKAGING_DIR/updater.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/updater.py"
 cp "$PACKAGING_DIR/version_store.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/version_store.py"
 cp "$PACKAGING_DIR/launcher_slots.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/launcher_slots.py"
+cp -a "$MODEL_TOOL_PACKAGE/." "$BUILD_DIR/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64/"
+chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64/llama-quantize"
 # UP-N2 可信发布：验签器与内置信任集必须随 Launcher 分发
 cp "$PACKAGING_DIR/signing.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/signing.py"
 cp -r "$PACKAGING_DIR/pubkeys" "$BUILD_DIR/opt/qlh-edge-inference/bin/pubkeys"
