@@ -28,7 +28,7 @@ case "${1:-tui}" in
         shift
         exec /usr/local/bin/qlh-launcher "$command" "$@"
         ;;
-    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics)
+    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose)
         command="$1"
         shift
         exec /usr/local/bin/qlh-launcher "$command" "$@"
@@ -46,9 +46,12 @@ case "${1:-tui}" in
             '  bjtu update     检查更新源中的匹配安装包' \
             '  bjtu version    显示当前应用版本' \
             '  bjtu version-status|version-stage|version-activate|version-rollback|version-recover' \
-            '                  管理 UP-N3 原子版本与回滚'
+            '                  管理 UP-N3 原子版本与回滚' \
             '  bjtu launcher-status|launcher-check|launcher-install|launcher-rollback|diagnostics' \
-            '                  管理 UP-N4 Launcher 槽位、修复与诊断'
+            '                  管理 UP-N4 Launcher 槽位、修复与诊断' \
+            '  bjtu verify [--level quick|full|deep] [--json]' \
+            '                  校验签名清单中的程序文件（不扫描用户数据）' \
+            '  bjtu diagnose [--json]  输出只读故障诊断与人工处理建议'
         ;;
     *)
         exec /usr/local/bin/qlh-launcher app-tui "$@"

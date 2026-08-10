@@ -222,6 +222,42 @@ python packaging/signing.py verify --manifest latest.json --trusted-keys-dir pac
 
 依赖：`signing.py` 使用 `cryptography` 库（打包 Launcher 的 `.venv-packaging` 需要安装；运行时 Launcher 内置 pubkeys，无需在目标机额外安装）。
 
+### 安装完整性基线（UP-N6.0）— `install_manifest.py`
+
+发布构建必须设置 `QLH_SIGNING_KEY`。CPU、CUDA、Launcher 和 Linux `.deb` 构建会扫描最终程序树，生成 `manifest/install-manifest.json`，沿用 UP-N2 Ed25519 信任链签名并立即复验。清单只列程序文件的规范相对路径、大小、SHA-256 和 kind；`models/`、`chat_history/`、`logs/`、`config/`、`local_docs/` 永不进入清单。
+
+Windows Setup 在安装末尾运行独立 `QLH-Install-Manifest.exe validate`，Linux `postinst` 用包内 venv 执行同一验证；失败会中止安装。Launcher 远端 A/B 自更新也要求 bundle 带签名清单，且版本、变体和包身份必须匹配。手工检查示例：
+
+```powershell
+python packaging/install_manifest.py validate `
+  --manifest dist/QLH-Launcher/manifest/install-manifest.json `
+  --trusted-keys-dir packaging/pubkeys
+```
+
+### 运行时完整性检查（UP-N6.1）— `verify`
+
+对已安装程序树执行只读检查：
+
+```powershell
+python packaging/qlh_launcher.py verify --root dist/QLH-Edge-Inference --level quick --json
+python packaging/install_manifest.py verify --root dist/QLH-Edge-Inference --level deep
+```
+
+`quick` 验签后只哈希入口、`version.txt`、Launcher `health.ok`（适用时）和关键运行时文件；`full` 遍历签名清单，完整哈希不大于 64MiB 的文件，对更大文件只验证大小并读取首/中/尾固定区段；`deep` 对清单所有文件执行 SHA-256 比对。schema v1 没有发布方签名的抽样摘要，所以 `full` 的大文件采样只证明可读性，不能替代 `deep` 的防篡改结论。
+
+三个级别都仅访问 `install-manifest.json` 中已签名的程序路径，不枚举或读取 `models/`、`chat_history/`、`logs/`、`config/`、`local_docs/`。不通过时命令返回 `3`；`--json` 输出稳定的 `passed`/`failed`、类别、摘要和建议。Launcher 仅在启动调用抛错后自动运行 `quick`，正常启动路径不等待完整性检查。
+
+### 本地诊断（UP-N6.2）— `diagnose`
+
+```powershell
+python packaging/qlh_launcher.py diagnose --root dist/QLH-Edge-Inference --json
+python packaging/qlh_launcher.py diagnose --root dist/QLH-Edge-Inference --error "DLL load failed"
+```
+
+诊断以 quick 的签名清单结果为主证据，并将安装签名、程序文件、版本、DLL/pyd、CUDA 驱动、磁盘、网络症状、权限、疑似杀软和模型错误症状映射为人工处理建议。它不联网、不下载、不修复，也不扫描模型或用户数据；传入的 `--error` 只用于本次匹配，不会原样写入 JSON。CUDA 包的 `nvidia-smi` 探测无 shell、3 秒超时且只保留安全的驱动版本字段。
+
+Launcher GUI/TUI 可直接运行诊断。导出 UP-N4 脱敏诊断 ZIP 时会附入无安装根/失败路径的诊断摘要，且只接受 Launcher 状态目录 `diagnostics/` 内不超过 1MiB 的 JSON。
+
 ### 原子版本与回滚（UP-N3）— version_store.py
 
 UP-N3 不直接覆盖正在运行的安装目录。版本目录先进入独立 store，健康门通过后才原子切换

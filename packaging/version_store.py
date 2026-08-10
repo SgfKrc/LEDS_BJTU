@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from install_manifest import InstallManifestError, verify_manifest_file_if_present
+from signing import default_trusted_keys_dir
 from update_core import UpdateError, default_state_dir, version_key
 
 try:
@@ -89,6 +91,26 @@ def _reject_symlinks(root: Path) -> None:
     for path in root.rglob("*"):
         if path.is_symlink():
             raise VersionStoreError(f"bundle contains unsupported symlink: {path.name}")
+
+
+def _verify_install_manifest(
+    root: Path, *, expected_version: str, expected_variant: str,
+) -> None:
+    trusted = root / "pubkeys"
+    keys_dir = trusted if trusted.is_dir() else default_trusted_keys_dir()
+    try:
+        mapping = verify_manifest_file_if_present(root, trusted_keys_dir=keys_dir)
+    except InstallManifestError as exc:
+        raise VersionStoreError(f"version install manifest rejected: {exc}") from exc
+    if mapping is None:
+        return
+    if mapping["app_id"] != "qlh-edge-inference" or mapping["package_kind"] != "application":
+        raise VersionStoreError("version install manifest has the wrong package identity")
+    if mapping["version"] != expected_version or mapping["variant"] != expected_variant:
+        raise VersionStoreError(
+            "version install manifest identity mismatch: "
+            f"{mapping['version']}/{mapping['variant']} != {expected_version}/{expected_variant}"
+        )
 
 
 def _safe_member_path(root: Path, name: str) -> Path:
@@ -175,7 +197,7 @@ class VersionStore:
         }
 
     def stage_directory(self, source: str | os.PathLike[str], version: str, variant: str) -> Path:
-        _, _, directory = _safe_version(version, variant)
+        version, variant, directory = _safe_version(version, variant)
         source_path = Path(source).expanduser().resolve()
         if not source_path.is_dir():
             raise VersionStoreError(f"bundle source is not a directory: {source}")
@@ -189,6 +211,9 @@ class VersionStore:
         try:
             shutil.copytree(source_path, temporary, symlinks=False)
             _reject_symlinks(temporary)
+            _verify_install_manifest(
+                temporary, expected_version=version, expected_variant=variant,
+            )
             os.replace(temporary, target)
         except Exception as exc:
             shutil.rmtree(temporary, ignore_errors=True)
@@ -242,6 +267,9 @@ class VersionStore:
         if not candidate.is_dir():
             raise VersionStoreError(f"version is not staged: {directory}")
         _reject_symlinks(candidate)
+        _verify_install_manifest(
+            candidate, expected_version=version, expected_variant=variant,
+        )
         if health_check is not None:
             try:
                 healthy = bool(health_check(candidate))

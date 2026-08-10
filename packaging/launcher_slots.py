@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from install_manifest import InstallManifestError, verify_manifest_file_if_present
+from signing import default_trusted_keys_dir
 from update_core import UpdateError, default_state_dir
 
 
@@ -32,7 +34,7 @@ _SCHEMA = 1
 _SLOTS = ("a", "b")
 _MAINTENANCE_COMMANDS = {
     "check", "download", "install", "launcher-status", "launcher-stage",
-    "launcher-activate", "launcher-rollback", "launcher-recover", "diagnostics",
+    "launcher-activate", "launcher-rollback", "launcher-recover", "diagnostics", "diagnose",
     "version-status", "version-stage", "version-activate", "version-rollback",
     "version-recover",
 }
@@ -79,6 +81,29 @@ def _reject_links(root: Path) -> None:
     for path in root.rglob("*"):
         if path.is_symlink():
             raise LauncherSlotError(f"launcher bundle contains symlink: {path.name}")
+
+
+def _verify_install_manifest(
+    root: Path, *, required: bool, expected_version: str | None = None,
+) -> None:
+    trusted = root / "pubkeys"
+    keys_dir = trusted if trusted.is_dir() else default_trusted_keys_dir()
+    try:
+        mapping = verify_manifest_file_if_present(
+            root, trusted_keys_dir=keys_dir, required=required,
+        )
+    except InstallManifestError as exc:
+        raise LauncherSlotError(f"launcher install manifest rejected: {exc}") from exc
+    if mapping is None:
+        return
+    if mapping["app_id"] != "qlh-launcher" or mapping["package_kind"] != "launcher":
+        raise LauncherSlotError("launcher install manifest has the wrong package identity")
+    if mapping["variant"] != "any":
+        raise LauncherSlotError("launcher install manifest variant must be any")
+    if expected_version is not None and mapping["version"] != str(expected_version):
+        raise LauncherSlotError(
+            f"launcher install manifest version mismatch: {mapping['version']} != {expected_version}"
+        )
 
 
 def _safe_member(root: Path, name: str) -> Path:
@@ -175,10 +200,19 @@ class LauncherSlotStore:
                 return name
         raise LauncherSlotError("launcher bundle has no recognized entrypoint")
 
-    def _validate(self, root: Path) -> str:
+    def _validate(
+        self,
+        root: Path,
+        *,
+        require_install_manifest: bool = False,
+        expected_version: str | None = None,
+    ) -> str:
         if not root.is_dir():
             raise LauncherSlotError(f"launcher slot is not a directory: {root}")
         _reject_links(root)
+        _verify_install_manifest(
+            root, required=require_install_manifest, expected_version=expected_version,
+        )
         entrypoint = self._entrypoint_for(root)
         if (root / "health.ok").is_file():
             return entrypoint
@@ -205,7 +239,13 @@ class LauncherSlotStore:
             },
         }
 
-    def stage_directory(self, source: str | os.PathLike[str], version: str) -> LauncherPointer:
+    def stage_directory(
+        self,
+        source: str | os.PathLike[str],
+        version: str,
+        *,
+        require_install_manifest: bool = False,
+    ) -> LauncherPointer:
         source_path = Path(source).expanduser().resolve()
         if not source_path.is_dir():
             raise LauncherSlotError(f"launcher bundle source is not a directory: {source}")
@@ -217,7 +257,11 @@ class LauncherSlotStore:
         target = self.slot_path(slot)
         try:
             shutil.copytree(source_path, temporary, symlinks=False)
-            entrypoint = self._validate(temporary)
+            entrypoint = self._validate(
+                temporary,
+                require_install_manifest=require_install_manifest,
+                expected_version=str(version),
+            )
             shutil.rmtree(target, ignore_errors=True)
             os.replace(temporary, target)
         except Exception as exc:
@@ -227,7 +271,13 @@ class LauncherSlotStore:
             raise LauncherSlotError(f"launcher stage failed: {exc}") from exc
         return LauncherPointer(slot, str(version), entrypoint, "")
 
-    def stage_archive(self, archive: str | os.PathLike[str], version: str) -> LauncherPointer:
+    def stage_archive(
+        self,
+        archive: str | os.PathLike[str],
+        version: str,
+        *,
+        require_install_manifest: bool = False,
+    ) -> LauncherPointer:
         archive_path = Path(archive).expanduser().resolve()
         if not archive_path.is_file() or not zipfile.is_zipfile(archive_path):
             raise LauncherSlotError("launcher self-update currently accepts ZIP bundles only")
@@ -247,14 +297,20 @@ class LauncherSlotStore:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     with bundle.open(member) as source, destination.open("wb") as output:
                         shutil.copyfileobj(source, output)
-            return self.stage_directory(temporary, version)
+            return self.stage_directory(
+                temporary, version, require_install_manifest=require_install_manifest,
+            )
         finally:
             shutil.rmtree(temporary, ignore_errors=True)
 
     def activate(self, version: str, *, health_check: HealthCheck | None = None) -> LauncherPointer:
         slot = self._choose_inactive()
         candidate = self.slot_path(slot)
-        entrypoint = self._validate(candidate)
+        entrypoint = self._validate(
+            candidate,
+            require_install_manifest=(candidate / "manifest" / "install-manifest.json").is_file(),
+            expected_version=str(version),
+        )
         if health_check is not None and not health_check(candidate):
             raise LauncherSlotError(f"launcher health check failed: {slot}")
         old = self.current()
@@ -269,7 +325,12 @@ class LauncherSlotStore:
         path = self._entrypoint_path(target)
         if target is None or path is None or not path.is_file():
             raise LauncherSlotError("no previous healthy Launcher slot is available")
-        self._validate(self.slot_path(target.slot))
+        target_root = self.slot_path(target.slot)
+        self._validate(
+            target_root,
+            require_install_manifest=(target_root / "manifest" / "install-manifest.json").is_file(),
+            expected_version=target.version,
+        )
         if health_check is not None and not health_check(self.slot_path(target.slot)):
             raise LauncherSlotError("previous Launcher slot health check failed")
         old = self.current()
@@ -282,13 +343,23 @@ class LauncherSlotStore:
         current = self.current()
         if current and self._entrypoint_path(current) and self._entrypoint_path(current).is_file():
             try:
-                self._validate(self.slot_path(current.slot))
+                current_root = self.slot_path(current.slot)
+                self._validate(
+                    current_root,
+                    require_install_manifest=(current_root / "manifest" / "install-manifest.json").is_file(),
+                    expected_version=current.version,
+                )
                 return current
             except LauncherSlotError:
                 pass
         previous = self.previous()
         if previous and self._entrypoint_path(previous) and self._entrypoint_path(previous).is_file():
-            self._validate(self.slot_path(previous.slot))
+            previous_root = self.slot_path(previous.slot)
+            self._validate(
+                previous_root,
+                require_install_manifest=(previous_root / "manifest" / "install-manifest.json").is_file(),
+                expected_version=previous.version,
+            )
             _atomic_json(self.current_file, previous.as_dict())
             return previous
         return None
@@ -306,7 +377,8 @@ class LauncherSlotStore:
                 files.append((f"state/{path.name}", path))
         for path in extra_paths or []:
             if path.is_file() and path.name.lower().endswith((".log", ".txt", ".json")):
-                files.append((f"logs/{path.name}", path))
+                prefix = "diagnosis" if path.name.startswith("qlh-diagnose-") else "logs"
+                files.append((f"{prefix}/{path.name}", path))
         metadata = {
             "schema_version": 1,
             "created_at": datetime.now(timezone.utc).isoformat(),

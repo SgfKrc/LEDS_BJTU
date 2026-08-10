@@ -81,3 +81,18 @@ def test_launcher_diagnostics_redacts_secrets(tmp_path, monkeypatch):
         text = bundle.read("state/launcher.json").decode("utf-8")
     assert "do-not-export" not in text
     assert "<redacted>" in text
+
+
+def test_launcher_diagnostics_keeps_diagnosis_json_in_its_own_redacted_entry(tmp_path, monkeypatch):
+    store = LauncherSlotStore(tmp_path / "slots")
+    state = tmp_path / "state"
+    monkeypatch.setenv("QLH_LAUNCHER_STATE_DIR", str(state))
+    report = state / "diagnostics" / "qlh-diagnose-test.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"token": "do-not-export", "issue": "disk"}), encoding="utf-8")
+
+    output = store.diagnostics(tmp_path / "diagnostics.zip", extra_paths=[report])
+    with zipfile.ZipFile(output) as bundle:
+        text = bundle.read("diagnosis/qlh-diagnose-test.json").decode("utf-8")
+    assert "do-not-export" not in text
+    assert "<redacted>" in text

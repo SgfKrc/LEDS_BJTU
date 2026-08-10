@@ -19,6 +19,10 @@ if "%LAUNCHER_VERSION%"=="" (
   echo [ERROR] %VERSION_FILE% is empty.
   exit /b 1
 )
+if not defined QLH_SIGNING_KEY (
+  echo [ERROR] Release builds require QLH_SIGNING_KEY; unsigned install manifests are forbidden.
+  exit /b 1
+)
 
 echo Building standalone QLH Launcher v%LAUNCHER_VERSION%...
 "%PYTHON%" -m pip install --disable-pip-version-check --quiet -r packaging\requirements-launcher.txt
@@ -30,6 +34,25 @@ if not exist "dist\QLH-Launcher\QLH-Launcher.exe" (
   exit /b 1
 )
 >"dist\QLH-Launcher\health.ok" echo QLH Launcher %date% %time%
+copy /y "%VERSION_FILE%" "dist\QLH-Launcher\version.txt" >nul
+if not exist "dist\QLH-Launcher\tools" mkdir "dist\QLH-Launcher\tools"
+"%PYTHON%" -m PyInstaller packaging\qlh-install-manifest.spec --noconfirm ^
+  --distpath "dist\QLH-Launcher\tools" ^
+  --workpath "build\qlh-install-manifest-launcher"
+if errorlevel 1 exit /b 1
+if not exist "dist\QLH-Launcher\tools\QLH-Install-Manifest.exe" exit /b 1
+xcopy /e /i /y "packaging\pubkeys" "dist\QLH-Launcher\pubkeys" >nul
+if errorlevel 1 exit /b 1
+"%PYTHON%" packaging\install_manifest.py build ^
+  --root "dist\QLH-Launcher" ^
+  --app-id qlh-launcher ^
+  --version "%LAUNCHER_VERSION%" ^
+  --platform windows ^
+  --variant any ^
+  --package-kind launcher ^
+  --key "%QLH_SIGNING_KEY%" ^
+  --trusted-keys-dir "packaging\pubkeys"
+if errorlevel 1 exit /b 1
 
 rem ---- 自更新资产落点：packaging\dist\（serve.py DIST_DIR 扫描目录，源站才能发布）----
 if not exist "packaging\dist" mkdir "packaging\dist"

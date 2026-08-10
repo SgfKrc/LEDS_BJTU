@@ -23,6 +23,15 @@ if errorlevel 1 (
     exit /b 1
 )
 "%PYTHON%" --version
+if not defined QLH_SIGNING_KEY (
+    echo   [错误] 发布构建必须设置 QLH_SIGNING_KEY，禁止生成无签名安装清单。
+    exit /b 1
+)
+if not exist "packaging\version.txt" (
+    echo   [错误] 未找到 packaging\version.txt
+    exit /b 1
+)
+set /p APP_VERSION=<"packaging\version.txt"
 "%PYTHON%" -c "import torch; assert torch.cuda.is_available(), 'CUDA torch not found'"
 if errorlevel 1 (
     echo   [错误] 需要 CUDA 版 torch！
@@ -70,8 +79,34 @@ REM ---- PyInstaller 打包（固定使用项目 CUDA venv） ----
 echo [5/5] PyInstaller 打包 (CUDA 独显版)...
 echo   这可能需要 10-20 分钟，请耐心等待...
 "%PYTHON%" -m PyInstaller packaging\qlh-cuda.spec --noconfirm
+if errorlevel 1 exit /b 1
 
 if exist "dist\QLH-Edge-Inference-CUDA\QLH-Edge-Inference.exe" (
+    if not exist "dist\QLH-Edge-Inference-CUDA\tools" mkdir "dist\QLH-Edge-Inference-CUDA\tools"
+    "%PYTHON%" -m PyInstaller packaging\qlh-install-manifest.spec --noconfirm ^
+        --distpath "dist\QLH-Edge-Inference-CUDA\tools" ^
+        --workpath "build\qlh-install-manifest-cuda"
+    if errorlevel 1 exit /b 1
+    if not exist "dist\QLH-Edge-Inference-CUDA\tools\QLH-Install-Manifest.exe" exit /b 1
+    xcopy /e /i /y "packaging\pubkeys" "dist\QLH-Edge-Inference-CUDA\pubkeys" >nul
+    if errorlevel 1 exit /b 1
+    "%PYTHON%" packaging\install_manifest.py build ^
+        --root "dist\QLH-Edge-Inference-CUDA" ^
+        --app-id qlh-edge-inference ^
+        --version "!APP_VERSION!" ^
+        --platform windows ^
+        --variant cuda ^
+        --package-kind application ^
+        --key "!QLH_SIGNING_KEY!" ^
+        --trusted-keys-dir "packaging\pubkeys" ^
+        --include "bjtu.bat=bjtu.bat" ^
+        --include "packaging\version.txt=version.txt" ^
+        --include "README.md=docs/README.md" ^
+        --include "docs\整体架构.md=docs/整体架构.md" ^
+        --include "docs\模块接口说明.md=docs/模块接口说明.md" ^
+        --include "docs\核心技术原理.md=docs/核心技术原理.md" ^
+        --include "packaging\scripts\convert_to_gguf.py=tools/convert_to_gguf.py"
+    if errorlevel 1 exit /b 1
     echo.
     echo ============================================
     echo   打包完成！

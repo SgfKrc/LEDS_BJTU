@@ -9,6 +9,7 @@ when torch/model/database dependencies are broken.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import os
 import platform
 import subprocess
@@ -21,6 +22,9 @@ if str(_PACKAGING_DIR) not in sys.path:
     sys.path.insert(0, str(_PACKAGING_DIR))
 
 from update_core import UpdateError, default_state_dir, load_json_state
+from diagnose import diagnose_install, format_diagnosis, write_diagnosis_report
+from install_manifest import main as install_manifest_main
+from install_manifest import verify_install_tree
 from launcher_slots import LauncherSlotStore, should_delegate
 from updater import (
     check_launcher_updates, check_updates, configured_sources, detect_current_version, detect_profile,
@@ -83,6 +87,43 @@ def installed_app_root(preferred_variant: str | None = None) -> Path | None:
             return root
         if not getattr(sys, "frozen", False) and (root / "src" / "api_server.py").is_file():
             return root
+    return None
+
+
+def quick_verify_after_launch_failure(
+    preferred_variant: str | None = None,
+) -> tuple[Path, dict] | None:
+    """Run the bounded UP-N6.1 check only after a startup call fails."""
+    candidates: list[Path] = []
+    detected = installed_app_root(preferred_variant)
+    if detected is not None:
+        candidates.append(detected)
+    candidates.extend(_candidate_app_roots(preferred_variant))
+    seen: set[str] = set()
+    for root in candidates:
+        try:
+            candidate = root.expanduser().absolute()
+        except OSError:
+            continue
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (candidate / "manifest" / "install-manifest.json").is_file():
+            continue
+        return candidate, verify_install_tree(candidate, level="quick")
+    return None
+
+
+def diagnosis_app_root(preferred_variant: str | None = None) -> Path | None:
+    """Find an application root for read-only diagnosis without following links."""
+    detected = installed_app_root(preferred_variant)
+    if detected is not None:
+        return detected.expanduser().absolute()
+    for root in _candidate_app_roots(preferred_variant):
+        candidate = root.expanduser().absolute()
+        if (candidate / "manifest" / "install-manifest.json").is_file():
+            return candidate
     return None
 
 
@@ -240,6 +281,7 @@ class LauncherController:
         self.sources = sources
         self.variant_override = variant_override
         self.last_error = ""
+        self.last_diagnosis: dict | None = None
 
     def set_variant(self, variant: str) -> None:
         if variant not in {"cpu", "cuda"}:
@@ -293,7 +335,42 @@ class LauncherController:
 
     def _launch_failed(self, exc: Exception) -> int:
         self.last_error = str(exc)
+        verification = quick_verify_after_launch_failure(self.variant_override)
+        if verification is not None:
+            root, report = verification
+            summary = report["summary"]
+            if report["ok"]:
+                detail = "签名安装清单 quick 校验通过，未发现关键程序文件损坏。"
+            else:
+                first = report["failed"][0]
+                detail = (
+                    "签名安装清单 quick 校验失败："
+                    f"{first['path']}（{first['category']}）；"
+                    f"检查 {summary['checked']} 项，失败 {summary['failed']} 项。"
+                )
+            self.last_error = f"{self.last_error}\n{detail}\n安装目录：{root}"
+            diagnosis = self.diagnose_app(error=str(exc), integrity_report=report)
+            if diagnosis and diagnosis["issues"]:
+                first_issue = diagnosis["issues"][0]
+                self.last_error = (
+                    f"{self.last_error}\n诊断建议：{first_issue['title']}；"
+                    f"{first_issue['manual_steps'][0]}"
+                )
         return 2
+
+    def diagnose_app(
+        self, *, error: str | None = None, integrity_report: dict | None = None,
+    ) -> dict | None:
+        root = diagnosis_app_root(self.variant_override)
+        if root is None:
+            self.last_diagnosis = None
+            return None
+        self.last_diagnosis = diagnose_install(
+            root,
+            error=error,
+            integrity_report=integrity_report,
+        )
+        return self.last_diagnosis
 
     def install_update(self) -> int:
         # UP-N2: install only proceeds when the manifest signature verifies.
@@ -316,7 +393,14 @@ class LauncherController:
         return updater_main(["launcher-recover"])
 
     def create_diagnostics(self) -> int:
-        return updater_main(["diagnostics"])
+        forwarded = ["diagnostics"]
+        report = self.diagnose_app()
+        if report is not None:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            path = default_state_dir() / "diagnostics" / f"qlh-diagnose-{stamp}.json"
+            write_diagnosis_report(report, path, bundle_safe=True)
+            forwarded.extend(("--diagnose-report", str(path)))
+        return updater_main(forwarded)
 
 
 def run_tui(controller: LauncherController | None = None) -> int:
@@ -343,7 +427,8 @@ def run_tui(controller: LauncherController | None = None) -> int:
         print("  [6] 检查 Launcher 自更新")
         print("  [7] 更新 Launcher")
         print("  [8] 恢复上一个 Launcher 槽")
-        print("  [9] 导出脱敏诊断包")
+        print("  [9] 运行完整性诊断")
+        print("  [10] 导出脱敏诊断包")
         print("  [Q] 退出")
         choice = input("请选择: ").strip().lower()
         if choice in {"1", "ui", "gui"}:
@@ -399,7 +484,11 @@ def run_tui(controller: LauncherController | None = None) -> int:
             code = controller.recover_launcher()
             print("Launcher 已恢复。" if code == 0 else f"Launcher 恢复失败（退出码 {code}）。")
             continue
-        if choice in {"9", "diagnostics"}:
+        if choice in {"9", "diagnose"}:
+            report = controller.diagnose_app()
+            print(format_diagnosis(report) if report else "未检测到可诊断的 QLH 主程序安装目录。")
+            continue
+        if choice in {"10", "diagnostics"}:
             code = controller.create_diagnostics()
             print("诊断包已生成。" if code == 0 else f"诊断包生成失败（退出码 {code}）。")
             continue
@@ -573,11 +662,23 @@ def run_gui(controller: LauncherController | None = None) -> int:
         code = controller.create_diagnostics()
         status.set("诊断包已生成，请查看状态目录。" if code == 0 else f"诊断包生成失败（退出码 {code}）。")
 
+    def diagnose() -> None:
+        report = controller.diagnose_app()
+        if report is None:
+            status.set("未检测到可诊断的 QLH 主程序安装目录。")
+            return
+        text = format_diagnosis(report)
+        status.set(text)
+        messagebox.showinfo("完整性诊断", text, parent=root)
+
     tools_row = ttk.Frame(frame, style="Launcher.TFrame")
     tools_row.pack(fill="x", pady=(12, 0))
     ttk.Button(
         tools_row, text="恢复 Launcher", style="Launcher.TButton", command=repair_launcher,
     ).pack(side="left")
+    ttk.Button(
+        tools_row, text="运行诊断", style="Launcher.TButton", command=diagnose,
+    ).pack(side="left", padx=(10, 0))
     ttk.Button(
         tools_row, text="导出诊断包", style="Launcher.TButton", command=export_diagnostics,
     ).pack(side="left", padx=(10, 0))
@@ -620,7 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
             "version-rollback", "version-recover",
             "launcher-status", "launcher-check", "launcher-download",
             "launcher-install", "launcher-stage", "launcher-activate",
-            "launcher-rollback", "launcher-recover", "diagnostics",
+            "launcher-rollback", "launcher-recover", "diagnostics", "verify", "diagnose",
         ),
     )
     parser.add_argument("--gui", action="store_true", help="open the Launcher GUI")
@@ -635,7 +736,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bundle")
     parser.add_argument("--version")
     parser.add_argument("--diagnostics-output")
+    parser.add_argument("--diagnose-report", help="bundle-safe diagnosis JSON for diagnostics")
     parser.add_argument("--trusted-keys-dir")
+    parser.add_argument("--root", help="install root for the verify command")
+    parser.add_argument("--level", choices=("quick", "full", "deep"), default="quick")
+    parser.add_argument("--error", help="optional local startup error text for diagnose")
+    parser.add_argument("--diagnosis-output", help="local JSON output path for diagnose")
+    parser.add_argument("--no-gpu-probe", action="store_true", help="skip the bounded CUDA driver probe")
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--allow-unsigned", action="store_true")
@@ -655,11 +762,42 @@ def main(argv: list[str] | None = None) -> int:
         "version-activate", "version-rollback", "version-recover",
         "launcher-status", "launcher-check", "launcher-download", "launcher-install",
         "launcher-stage", "launcher-activate", "launcher-rollback", "launcher-recover",
-        "diagnostics",
+        "diagnostics", "verify", "diagnose",
     } and not args.check_update:
         delegated = _delegate_to_active_launcher(list(sys.argv[1:] if argv is None else argv))
         if delegated is not None:
             return delegated
+    if args.command == "verify":
+        root = Path(args.root).expanduser() if args.root else installed_app_root(args.variant)
+        if root is None:
+            print("未检测到带签名安装清单的 QLH 主程序；请使用 --root 指定安装目录。", file=sys.stderr)
+            return 2
+        forwarded = ["verify", "--root", str(root), "--level", args.level]
+        if args.trusted_keys_dir:
+            forwarded.extend(("--trusted-keys-dir", args.trusted_keys_dir))
+        if args.as_json:
+            forwarded.append("--json")
+        return install_manifest_main(forwarded)
+    if args.command == "diagnose":
+        root = Path(args.root).expanduser() if args.root else diagnosis_app_root(args.variant)
+        if root is None:
+            print("未检测到 QLH 主程序；请使用 --root 指定安装目录。", file=sys.stderr)
+            return 2
+        report = diagnose_install(
+            root,
+            error=args.error,
+            trusted_keys_dir=args.trusted_keys_dir,
+            probe_gpu=not args.no_gpu_probe,
+        )
+        if args.diagnosis_output:
+            write_diagnosis_report(report, args.diagnosis_output)
+        if args.as_json:
+            import json
+
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        else:
+            print(format_diagnosis(report))
+        return 0 if report["ok"] else 3
     if args.command and args.command.startswith("version-"):
         forwarded = [args.command]
         for name in ("version_store", "bundle", "version", "variant"):
@@ -673,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
         forwarded = [args.command]
         for source in args.source or []:
             forwarded.extend(("--source", source))
-        for name in ("launcher_store", "bundle", "version", "download_dir", "variant", "diagnostics_output", "trusted_keys_dir"):
+        for name in ("launcher_store", "bundle", "version", "download_dir", "variant", "diagnostics_output", "diagnose_report", "trusted_keys_dir"):
             value = getattr(args, name, None)
             if value:
                 forwarded.extend((f"--{name.replace('_', '-')}", str(value)))
