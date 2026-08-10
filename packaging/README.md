@@ -52,6 +52,20 @@
 
 > PyInstaller 始终从**项目根目录**运行，输出到根目录 `dist/`。Inno Setup 从 `packaging/` 运行对应的 `.iss` 文件，通过 `..\dist\` 引用 PyInstaller 输出。
 
+### GGUF 量化器工具链（MODEL-TOOLS）
+
+GGUF 转换的 `llama-quantize` 不从 PATH 随意拾取。版本锁位于 `scripts/model_tools/llama_quantize.lock.json`，当前固定 llama.cpp commit `47e1de77aa0f06bf73cfd8c5281d95979f89fcbe`。构建器只在父仓库外层 `build/` 写入，不修改 llama.cpp submodule，也不联网：
+
+```powershell
+python scripts/build_llama_quantize.py --json
+```
+
+Windows 受管包输出到 `build/model-tools/llama-quantize/packages/windows-x86_64/`，包含 `llama-quantize.exe`、上游许可证和逐文件 SHA256 manifest，并生成确定性 ZIP。Windows PyInstaller spec 会在构建时拒绝缺失、revision 漂移、文件摘要不一致或运行库依赖未验证的包。
+
+Linux `.deb` 构建脚本会先在 Linux 主机执行同一构建器，随后将包放入 `/opt/qlh-edge-inference/model-tools/llama-quantize/linux-x86_64/`。Linux 真机编译、`ldd`、安装和执行必须单独验收，不能用 Windows 产物替代。
+
+`gguf_convert` 对受管包报告 `managed_package/verified`；用户通过 `--quantizer`、`QLH_LLAMA_QUANTIZE` 或 PATH 指定的工具仍允许使用，但标记为 `unmanaged`，不作为锁定发布工具。
+
 独立引导器可单独构建，不需要 CUDA 环境，也不会修改项目全局解释器：
 
 ```powershell
