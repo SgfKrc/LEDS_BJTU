@@ -3,8 +3,8 @@
 ===========================
 测试 ReviewManager: 创建工单、投票、阈值判定、过期处理、投票资格检查。
 
-注意: 这些测试需要数据库连接（review_tickets 表）。
-      如果数据库不可用，db 模块的测试会被跳过。
+持久化测试基于主节点本地 SQLite（local_store），通过 monkeypatch 隔离到临时目录，
+不依赖远端数据库。
 """
 
 import sys
@@ -13,17 +13,6 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import pytest
-
-
-# ================================================================
-# ReviewManager 导入
-# ================================================================
-
-@pytest.fixture(scope="module")
-def review_mgr():
-    """提供 ReviewManager 实例。"""
-    from review import ReviewManager
-    return ReviewManager()
 
 
 # ================================================================
@@ -237,144 +226,126 @@ class TestStateMachine:
 
 
 # ================================================================
-# DB 集成测试（需要数据库连接）
+# 本地 SQLite 持久化测试（M1.2 后 review 已迁主节点 local_store）
 # ================================================================
 
-@pytest.mark.slow
-@pytest.mark.requires_db
-@pytest.mark.external
-class TestReviewWithDb:
-    """需要数据库连接的审查票测试"""
+@pytest.fixture
+def review_store(monkeypatch, tmp_path):
+    """把 local_store 指向临时目录并初始化，返回隔离的 ReviewManager。
 
-    @pytest.fixture(autouse=True)
-    def setup_db(self, review_mgr):
-        """确保 DB 已初始化，测试后清理本测试创建的工单。"""
-        try:
-            from db import init_db
-            init_db()
-        except Exception:
-            pytest.skip("数据库不可用")
-        # 记录测试前已存在的 ticket 数量，测试后清理新增的
-        before = set()
-        try:
-            from db import list_review_tickets
-            before = {t["ticket_id"] for t in list_review_tickets()}
-        except Exception:
-            pass
-        yield
-        # 清理本测试创建的工单
-        try:
-            from db import list_review_tickets, delete_review_ticket
-            after = {t["ticket_id"] for t in list_review_tickets()}
-            new_ids = after - before
-            for tid in new_ids:
-                try:
-                    delete_review_ticket(tid)
-                except Exception:
-                    pass
-            if new_ids:
-                import logging
-                logging.getLogger(__name__).info(f"清理了 {len(new_ids)} 个测试工单")
-        except Exception:
-            pass
+    屏蔽邮件通知（无 SMTP 凭据时 _send_email 最长阻塞 30s）。
+    """
+    import local_store
+    sqlite_path = tmp_path / "qlh-local-store.sqlite3"
+    legacy_dir = tmp_path / "legacy-json"
+    legacy_dir.mkdir()
+    monkeypatch.setattr(local_store, '_store_dir', str(legacy_dir))
+    monkeypatch.setattr(local_store, '_get_store_dir', lambda: str(legacy_dir))
+    monkeypatch.setattr(local_store, '_legacy_store_dir', lambda: str(legacy_dir))
+    monkeypatch.setattr(local_store, '_sqlite_path', lambda: str(sqlite_path))
+    monkeypatch.setattr('email_notifier.send_review_created_alert', lambda **kwargs: None)
+    local_store.initialize_local_store()
 
-    def test_create_and_get_ticket(self, review_mgr):
+    from review import ReviewManager
+    return ReviewManager()
+
+
+class TestReviewPersistence:
+    """ReviewManager 在本地 SQLite 上的真实持久化测试（不再跳过）。"""
+
+    def test_create_and_get_ticket(self, review_store):
         """创建工单并读取"""
-        ticket = review_mgr.create_ticket(
+        ticket = review_store.create_ticket(
             created_by="master_test",
             target_node_id="client_test",
             reason="自动化测试",
             timeout_hours=1,
         )
-        if ticket is None:
-            pytest.skip("数据库不可用，跳过 DB 测试")
 
+        assert ticket is not None
         assert ticket.status.value == "pending"
         assert ticket.score == 0
         assert ticket.created_by == "master_test"
         assert ticket.target_node_id == "client_test"
 
         # 读取验证
-        loaded = review_mgr.get_ticket(ticket.ticket_id)
+        loaded = review_store.get_ticket(ticket.ticket_id)
         assert loaded is not None
         assert loaded.ticket_id == ticket.ticket_id
 
-    def test_cast_vote_and_threshold(self, review_mgr):
+    def test_cast_vote_and_threshold(self, review_store):
         """投票并验证阈值触发"""
-        ticket = review_mgr.create_ticket(
+        ticket = review_store.create_ticket(
             created_by="master_test",
             target_node_id="client_test2",
             reason="阈值测试",
             timeout_hours=1,
         )
-        if ticket is None:
-            pytest.skip("数据库不可用")
+        assert ticket is not None
 
         tid = ticket.ticket_id
 
         # 投 2 票 +1 → 应 APPROVED
-        t = review_mgr.cast_vote(tid, "node_a", 1)
+        t = review_store.cast_vote(tid, "node_a", 1)
         assert t is not None
         assert t.score == 1
         assert t.status.value == "pending"
 
-        t = review_mgr.cast_vote(tid, "node_b", 1)
+        t = review_store.cast_vote(tid, "node_b", 1)
         assert t is not None
         assert t.score == 2
         assert t.status.value == "approved"
 
-    def test_cast_vote_rejected(self, review_mgr):
+    def test_cast_vote_rejected(self, review_store):
         """投票达到 -2 → REJECTED"""
-        ticket = review_mgr.create_ticket(
+        ticket = review_store.create_ticket(
             created_by="master_test",
             target_node_id="client_test3",
             reason="拒绝测试",
             timeout_hours=1,
         )
-        if ticket is None:
-            pytest.skip("数据库不可用")
+        assert ticket is not None
 
         tid = ticket.ticket_id
 
-        review_mgr.cast_vote(tid, "node_a", -1)
-        t = review_mgr.cast_vote(tid, "node_b", -1)
+        review_store.cast_vote(tid, "node_a", -1)
+        t = review_store.cast_vote(tid, "node_b", -1)
         assert t.status.value == "rejected"
         assert t.score == -2
 
-    def test_duplicate_vote_updates(self, review_mgr):
+    def test_duplicate_vote_updates(self, review_store):
         """同一节点重复投票 → 更新旧票而非追加"""
-        ticket = review_mgr.create_ticket(
+        ticket = review_store.create_ticket(
             created_by="master_test",
             target_node_id="client_test4",
             reason="重复投票测试",
             timeout_hours=1,
         )
-        if ticket is None:
-            pytest.skip("数据库不可用")
+        assert ticket is not None
 
         tid = ticket.ticket_id
 
-        review_mgr.cast_vote(tid, "node_x", 1)
-        assert review_mgr.get_ticket(tid).score == 1
+        review_store.cast_vote(tid, "node_x", 1)
+        assert review_store.get_ticket(tid).score == 1
 
         # 同一节点改投 -1
-        t = review_mgr.cast_vote(tid, "node_x", -1)
+        t = review_store.cast_vote(tid, "node_x", -1)
         assert t.score == -1
         assert len(t.votes) == 1  # 不是 2 票
 
-    def test_list_tickets(self, review_mgr):
+    def test_list_tickets(self, review_store):
         """列出工单"""
-        tickets = review_mgr.list_tickets()
+        tickets = review_store.list_tickets()
         assert isinstance(tickets, list)
 
-    def test_find_approved_ticket(self, review_mgr):
+    def test_find_approved_ticket(self, review_store):
         """查找已批准工单"""
-        ticket = review_mgr.find_approved_ticket("nonexistent_node_xyz")
+        ticket = review_store.find_approved_ticket("nonexistent_node_xyz")
         assert ticket is None  # 不存在的节点无批准票
 
-    def test_invalid_vote_value(self, review_mgr):
+    def test_invalid_vote_value(self, review_store):
         """无效投票值 → ValueError"""
         with pytest.raises(ValueError, match="无效的投票值"):
-            review_mgr.cast_vote("t1", "n1", 2)
+            review_store.cast_vote("t1", "n1", 2)
         with pytest.raises(ValueError, match="无效的投票值"):
-            review_mgr.cast_vote("t1", "n1", -2)
+            review_store.cast_vote("t1", "n1", -2)
