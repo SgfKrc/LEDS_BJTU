@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 from fastapi.testclient import TestClient
 
+import api_server as api_server_mod
 from api_server import app
 from model_host import model_host
 
@@ -53,3 +54,69 @@ class TestApiResponseKeys:
         assert res.status_code == 200
         body = res.json()
         assert set(body.keys()) == {"status", "timestamp"}
+
+    @staticmethod
+    def _cluster_status_payload(network_path=None):
+        payload = {
+            "run_mode": "single",
+            "nodes_ready": True,
+            "nodes": {
+                "master": {
+                    "node_id": "master",
+                    "role": "master",
+                    "state": "online",
+                },
+            },
+            "current_task": None,
+            "tcp_server": None,
+            "pipeline": None,
+            "pipeline_queue": None,
+        }
+        if network_path is not None:
+            payload["network_path"] = network_path
+            payload["nodes"]["master"]["network_path"] = network_path
+        return payload
+
+    def test_cluster_status_omits_optional_network_path_for_old_snapshot(
+            self, client, monkeypatch):
+        monkeypatch.setattr(
+            api_server_mod.scheduler,
+            "get_status",
+            lambda: self._cluster_status_payload(),
+        )
+
+        response = client.get("/api/cluster/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert "network_path" not in body
+        assert "network_path" not in body["nodes"]["master"]
+        assert set(body) == {
+            "run_mode", "nodes_ready", "nodes", "current_task",
+            "tcp_server", "pipeline", "pipeline_queue",
+        }
+
+    def test_cluster_status_projects_network_path_without_changing_old_keys(
+            self, client, monkeypatch):
+        network_path = {
+            "schema_version": 1,
+            "path_kind": "derp",
+            "availability": "available",
+            "endpoint": {"role": "master", "host_scope": "tailscale_ipv4", "port": 8888},
+            "tailscale": None,
+            "tcp_probe": {"state": "available", "reason": "existing_connection", "elapsed_ms": None},
+            "quality": {"schema_version": 1, "rtt_ms_p95": 30.0},
+        }
+        monkeypatch.setattr(
+            api_server_mod.scheduler,
+            "get_status",
+            lambda: self._cluster_status_payload(network_path),
+        )
+
+        response = client.get("/api/cluster/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["network_path"] == network_path
+        assert body["nodes"]["master"]["network_path"] == network_path
+        assert body["nodes_ready"] is True

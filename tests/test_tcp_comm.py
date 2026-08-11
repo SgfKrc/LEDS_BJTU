@@ -1129,6 +1129,70 @@ class TestTCPClientRegistrationAck:
 
         assert calls == [original_sock]
 
+    def test_heartbeat_ack_updates_ewma_and_bounded_snapshot(self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        client._connection_generation = 1
+        client._heartbeat_quality.begin_generation(1)
+        client._last_heartbeat_send = 10.0
+        client._heartbeat_quality.record_send(1, 10.0)
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 10.125)
+
+        client._handle_heartbeat_ack(
+            {"data": {}},
+            connection_generation=1,
+        )
+
+        snapshot = client.get_network_quality_snapshot()
+        assert client.avg_rtt_ms == pytest.approx(125.0)
+        assert snapshot["avg_rtt_ms"] == 125.0
+        assert snapshot["rtt_ms_p50"] == 125.0
+        assert snapshot["pending_heartbeat"] is False
+
+    def test_stale_heartbeat_ack_cannot_change_current_generation_metrics(
+            self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        client._connection_generation = 1
+        client._heartbeat_quality.begin_generation(1)
+        client._heartbeat_quality.record_send(1, 10.0)
+        client._heartbeat_quality.begin_generation(2)
+        client._connection_generation = 2
+        client._heartbeat_quality.record_send(2, 20.0)
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 20.1)
+
+        client._handle_heartbeat_ack(
+            {"data": {"t_send": 10.0}},
+            connection_generation=1,
+        )
+
+        snapshot = client.get_network_quality_snapshot()
+        assert client.avg_rtt_ms == 0.0
+        assert snapshot["sample_count"] == 0
+        assert snapshot["generation"] == 2
+        assert snapshot["pending_heartbeat"] is True
+
+    def test_malformed_heartbeat_echo_does_not_fall_back_to_last_send(
+            self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        client._connection_generation = 1
+        client._heartbeat_quality.begin_generation(1)
+        client._last_heartbeat_send = 10.0
+        client._heartbeat_quality.record_send(1, 10.0)
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 10.1)
+
+        client._handle_heartbeat_ack(
+            {"data": {"t_send": -1.0}},
+            connection_generation=1,
+        )
+
+        assert client.avg_rtt_ms == 0.0
+        assert client.get_network_quality_snapshot()["sample_count"] == 0
+
     def test_registration_preparation_finishes_before_socket_connect(
             self, monkeypatch):
         packet = build_message(

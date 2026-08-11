@@ -40,6 +40,11 @@ from config import (
     AUTH_TIMESTAMP_WINDOW,
 )
 
+try:
+    from .network_path import HeartbeatQualityWindow
+except ImportError:  # Script/PYTHONPATH=src compatibility.
+    from network_path import HeartbeatQualityWindow
+
 # 尝试导入 psutil 用于网络类型检测
 try:
     import psutil
@@ -1589,6 +1594,7 @@ class TCPClient:
         self.last_register_error: str = ""
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
         self._last_heartbeat_send: float = 0.0  # 最近一次心跳发送时间
+        self._heartbeat_quality = HeartbeatQualityWindow()
         self._connect_lock = threading.Lock()   # Phase 5.4: 防止并发 connect()
         self._send_lock = threading.Lock()      # 心跳和推理消息共享同一 TCP 字节流
 
@@ -1815,6 +1821,8 @@ class TCPClient:
                         self._connection_generation += 1
                         connection_generation = self._connection_generation
                         self._disconnect_notified = False
+                        self._last_heartbeat_send = 0.0
+                        self._heartbeat_quality.begin_generation(connection_generation)
 
                     # 启动心跳线程
                     self._heartbeat_thread = threading.Thread(
@@ -1873,7 +1881,7 @@ class TCPClient:
                         break  # 连接断开
                     # 内部处理：HEARTBEAT_ACK → 计算 RTT
                     if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
-                        self._handle_heartbeat_ack(msg)
+                        self._handle_heartbeat_ack(msg, connection_generation)
                         continue  # 不向上层转发
                     if self.on_message:
                         try:
@@ -1927,6 +1935,8 @@ class TCPClient:
                 return
             self._disconnect_notified = True
             self._registered = False
+            active_generation = self._connection_generation
+        self._heartbeat_quality.record_disconnect(active_generation)
         if self.on_disconnect:
             try:
                 self.on_disconnect()
@@ -1987,7 +1997,11 @@ class TCPClient:
 
         return msg
 
-    def _handle_heartbeat_ack(self, msg: dict) -> None:
+    def _handle_heartbeat_ack(
+        self,
+        msg: dict,
+        connection_generation: int = None,
+    ) -> None:
         """
         处理心跳应答：计算往返延迟 RTT。
 
@@ -1995,14 +2009,17 @@ class TCPClient:
         客户端收到后计算 RTT = now - t_send，并用指数加权滑动平均平滑。
         """
         data = msg.get("data", {})
-        t_echo = data.get("t_send", 0) if isinstance(data, dict) else 0
+        has_echo = isinstance(data, dict) and "t_send" in data
+        t_echo = data.get("t_send") if has_echo else self._last_heartbeat_send
         t_now = time.time()
-        if t_echo > 0:
-            rtt_ms = (t_now - t_echo) * 1000
-        elif self._last_heartbeat_send > 0:
-            rtt_ms = (t_now - self._last_heartbeat_send) * 1000
-        else:
-            return  # 无法计算
+        generation = (
+            self._connection_generation
+            if connection_generation is None
+            else connection_generation
+        )
+        rtt_ms = self._heartbeat_quality.record_ack(generation, t_echo, t_now)
+        if rtt_ms is None:
+            return
 
         # 指数加权滑动平均（α=0.1），平滑网络抖动
         if self.avg_rtt_ms > 0:
@@ -2020,6 +2037,15 @@ class TCPClient:
                     break
             try:
                 self._last_heartbeat_send = time.time()
+                generation = (
+                    self._connection_generation
+                    if connection_generation is None
+                    else connection_generation
+                )
+                self._heartbeat_quality.record_send(
+                    generation,
+                    self._last_heartbeat_send,
+                )
                 self.send_data(
                     {"t_send": self._last_heartbeat_send},
                     MessageType.HEARTBEAT,
@@ -2077,6 +2103,14 @@ class TCPClient:
     def is_registered(self) -> bool:
         """是否已完成注册"""
         return self._registered
+
+    def get_network_quality_snapshot(self) -> dict:
+        """Return local heartbeat aggregates without endpoint data."""
+        snapshot = self._heartbeat_quality.snapshot()
+        snapshot["avg_rtt_ms"] = (
+            round(self.avg_rtt_ms, 3) if self.avg_rtt_ms > 0 else None
+        )
+        return snapshot
 
     def disconnect(self) -> None:
         """断开连接"""

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from model_host import InferenceHost
 
 from model_host import get_model_host
+from network_path import build_client_network_path_view
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -6582,13 +6583,42 @@ class Scheduler:
     # 状态查询
     # ================================================================
 
+    def _get_local_network_path_view(self) -> dict | None:
+        """Return the client-to-master observation without external I/O."""
+        if self._effective_role() != "client":
+            return None
+        try:
+            return build_client_network_path_view(
+                getattr(self, "_tcp_client", None)
+            )
+        except Exception as exc:
+            logger.debug("本地网络路径投影失败: %s", exc, exc_info=True)
+            return None
+
+    def _snapshot_nodes(self, network_path: dict | None = None) -> dict:
+        with self._nodes_lock:
+            snapshot = {
+                node_id: info.to_dict()
+                for node_id, info in self.nodes.items()
+            }
+            if network_path is not None:
+                target_id = next(
+                    (
+                        node_id
+                        for node_id, info in self.nodes.items()
+                        if info.role in (NodeRole.MASTER, NodeRole.MASTER.value)
+                    ),
+                    None,
+                )
+                if target_id is not None:
+                    snapshot[target_id]["network_path"] = network_path
+            return snapshot
+
     def get_status(self) -> dict:
         """获取系统整体状态（含节点详情和 TCP 连接信息）"""
         self._refresh_http_client_states()
-        node_status = {}
-        with self._nodes_lock:
-            for nid, info in self.nodes.items():
-                node_status[nid] = info.to_dict()
+        network_path = self._get_local_network_path_view()
+        node_status = self._snapshot_nodes(network_path)
 
         current_task = None
         if self._current_task:
@@ -6630,7 +6660,7 @@ class Scheduler:
                     "avg_rtt_ms": round(getattr(tcp_client, 'avg_rtt_ms', 0.0), 1),
                 }
 
-        return {
+        status = {
             "run_mode": RUN_MODE,
             "nodes": node_status,
             "current_task": current_task,
@@ -6640,12 +6670,14 @@ class Scheduler:
             "pipeline": pipeline_info,
             "pipeline_queue": queue_info,
         }
+        if network_path is not None:
+            status["network_path"] = network_path
+        return status
 
     def get_nodes(self) -> list:
         """获取所有节点详情列表"""
         self._refresh_http_client_states()
-        with self._nodes_lock:
-            return [info.to_dict() for info in self.nodes.values()]
+        return list(self._snapshot_nodes(self._get_local_network_path_view()).values())
 
     # L5: 多节点日志聚合
     def request_node_logs(self, node_id: str, limit: int = 100,
