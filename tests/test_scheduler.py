@@ -616,12 +616,6 @@ class TestGetLayerAssignments:
     @pytest.fixture
     def sched(self):
         s = Scheduler()
-        # ★ 清除 DB 缓存的层分配（避免其他测试/真实运行的旧数据污染）
-        from db import set_layer_assignments as _clear_cache
-        try:
-            _clear_cache({})
-        except Exception:
-            pass
         s.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
@@ -737,11 +731,6 @@ class TestAndroidNodeManagement:
         for nid in test_ids:
             try:
                 del s.nodes[nid]
-            except Exception:
-                pass
-            try:
-                from db import delete_node
-                delete_node(nid)
             except Exception:
                 pass
 
@@ -5315,8 +5304,7 @@ class TestForwardInferenceRequestId:
         assert sched._client_pending_events == {}
         assert sched._client_pending_results == {}
 
-    @patch("db.save_message")
-    def test_forwarded_success_is_sent_before_task_cleanup_regression(self, mock_save):
+    def test_forwarded_success_is_sent_before_task_cleanup_regression(self):
         sched = Scheduler()
         sent = []
         finished = threading.Event()
