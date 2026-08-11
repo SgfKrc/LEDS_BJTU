@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import json
 import os
 import platform
 import subprocess
@@ -23,6 +24,13 @@ if str(_PACKAGING_DIR) not in sys.path:
 
 from update_core import UpdateError, default_state_dir, load_json_state
 from diagnose import diagnose_install, format_diagnosis, write_diagnosis_report
+from data_retention import (
+    DataRetentionError,
+    auto_reassociate_user_data,
+    reassociate_user_data,
+    retain_user_data,
+    retention_status,
+)
 from install_manifest import main as install_manifest_main
 from install_manifest import verify_install_tree
 from repair import RepairError, format_repair, repair_install
@@ -132,6 +140,12 @@ def app_command(mode: str, variant_override: str | None = None) -> list[str]:
     root = installed_app_root(variant_override)
     if root is None:
         raise FileNotFoundError("未检测到 QLH 主程序；请先检查更新并安装应用包")
+    try:
+        # A previous explicit reinstall leaves a marker outside the install
+        # tree.  Consume it before launching the freshly installed app.
+        auto_reassociate_user_data(root)
+    except DataRetentionError as exc:
+        raise OSError(f"保留数据重新关联失败: {exc}") from exc
     if os.name == "nt":
         app = root / "QLH-Edge-Inference.exe"
         if app.is_file():
@@ -392,6 +406,46 @@ class LauncherController:
             self.last_repair = {"ok": False, "action": "failed", "error": str(exc)}
         return self.last_repair
 
+    def retain_data(self) -> dict:
+        root = diagnosis_app_root(self.variant_override)
+        if root is None:
+            return {"ok": False, "action": "failed", "error": "No QLH application installation was found."}
+        try:
+            return retain_user_data(root, confirm=True)
+        except DataRetentionError as exc:
+            return {"ok": False, "action": "failed", "error": str(exc)}
+
+    def reassociate_data(self) -> dict:
+        root = diagnosis_app_root(self.variant_override)
+        if root is None:
+            return {"ok": False, "action": "failed", "error": "No QLH application installation was found."}
+        try:
+            return reassociate_user_data(root, confirm=True)
+        except DataRetentionError as exc:
+            return {"ok": False, "action": "failed", "error": str(exc)}
+
+    def data_status(self) -> dict:
+        root = diagnosis_app_root(self.variant_override)
+        if root is None:
+            return {"ok": False, "action": "failed", "error": "No QLH application installation was found."}
+        try:
+            return retention_status(root)
+        except DataRetentionError as exc:
+            return {"ok": False, "action": "failed", "error": str(exc)}
+
+    def reinstall_app(self) -> dict:
+        """Explicitly retain data, then start the already signed installer flow."""
+        retained = self.retain_data()
+        if not retained.get("ok"):
+            return retained
+        code = self.install_update()
+        return {
+            **retained,
+            "action": "reinstall-started" if code == 0 else "reinstall-failed",
+            "installer_started": code == 0,
+            "installer_exit_code": code,
+        }
+
     def install_update(self) -> int:
         # UP-N2: install only proceeds when the manifest signature verifies.
         # No --allow-unsigned here: unsigned manifests must fail closed, and
@@ -450,6 +504,9 @@ def run_tui(controller: LauncherController | None = None) -> int:
         print("  [9] 运行完整性诊断")
         print("  [10] 导出脱敏诊断包")
         print("  [11] 修复签名程序文件")
+        print("  [12] 保留用户数据并准备卸载")
+        print("  [13] 重新关联已保留数据")
+        print("  [14] 保留数据并下载重装")
         print("  [Q] 退出")
         choice = input("请选择: ").strip().lower()
         if choice in {"1", "ui", "gui"}:
@@ -518,6 +575,21 @@ def run_tui(controller: LauncherController | None = None) -> int:
             if answer in {"y", "yes"}:
                 print(format_repair(controller.repair_app()))
             continue
+        if choice in {"12", "retain-data"}:
+            answer = input("将把模型、聊天记录、日志、配置和本地文档移出安装目录，继续？ [y/N] ").strip().lower()
+            if answer in {"y", "yes"}:
+                print(json.dumps(controller.retain_data(), ensure_ascii=False, indent=2, sort_keys=True))
+            continue
+        if choice in {"13", "reassociate-data"}:
+            answer = input("将把之前保留的数据重新关联到当前安装，继续？ [y/N] ").strip().lower()
+            if answer in {"y", "yes"}:
+                print(json.dumps(controller.reassociate_data(), ensure_ascii=False, indent=2, sort_keys=True))
+            continue
+        if choice in {"14", "reinstall"}:
+            answer = input("将保留用户数据、下载已验签安装包并启动系统安装器，继续？ [y/N] ").strip().lower()
+            if answer in {"y", "yes"}:
+                print(json.dumps(controller.reinstall_app(), ensure_ascii=False, indent=2, sort_keys=True))
+            continue
         if choice in {"q", "quit", "exit"}:
             return 0
 
@@ -537,8 +609,8 @@ def run_gui(controller: LauncherController | None = None) -> int:
         print(f"GUI 不可用: {exc}; 启动普通应用界面。", file=sys.stderr)
         return controller.start_gui()
     root.title("QLH · BJTU Launcher")
-    root.geometry("660x540")
-    root.minsize(600, 500)
+    root.geometry("660x590")
+    root.minsize(600, 550)
     root.configure(bg="#0c0b0b")
     for icon_path in (_PACKAGING_DIR / "leds.ico", install_root() / "leds.ico"):
         if icon_path.is_file():
@@ -730,6 +802,32 @@ def run_gui(controller: LauncherController | None = None) -> int:
         tools_row, text="导出诊断包", style="Launcher.TButton", command=export_diagnostics,
     ).pack(side="left", padx=(10, 0))
 
+    def reinstall_application() -> None:
+        if not messagebox.askyesno(
+            "确认保留数据并重装",
+            "将迁移模型、聊天记录、日志、配置和本地文档到用户数据目录，"
+            "然后下载已验签安装包并启动系统安装器。目录冲突会中止，不会合并或覆盖数据。继续吗？",
+            parent=root,
+        ):
+            return
+        status.set("正在保留用户数据并准备重装...")
+
+        def worker() -> None:
+            report = controller.reinstall_app()
+            text = (
+                "安装器已启动，安装完成后会自动重新关联保留数据。"
+                if report.get("installer_started")
+                else "重装未启动：" + str(report.get("error") or report.get("installer_exit_code"))
+            )
+            root.after(0, lambda: status.set(text))
+            root.after(0, lambda: messagebox.showinfo("保留数据重装", text, parent=root))
+
+        threading.Thread(target=worker, daemon=True, name="launcher-data-retention-reinstall").start()
+
+    ttk.Button(
+        actions, text="保留数据并重装", style="Launcher.TButton", command=reinstall_application,
+    ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+
     def install() -> None:
         if not messagebox.askyesno(
             "确认更新",
@@ -769,6 +867,7 @@ def build_parser() -> argparse.ArgumentParser:
             "launcher-status", "launcher-check", "launcher-download",
             "launcher-install", "launcher-stage", "launcher-activate",
             "launcher-rollback", "launcher-recover", "diagnostics", "verify", "diagnose", "repair",
+            "data-status", "retain-data", "reassociate-data", "reinstall",
         ),
     )
     parser.add_argument("--gui", action="store_true", help="open the Launcher GUI")
@@ -786,6 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diagnose-report", help="bundle-safe diagnosis JSON for diagnostics")
     parser.add_argument("--trusted-keys-dir")
     parser.add_argument("--root", help="install root for verify, diagnose, or repair")
+    parser.add_argument("--data-root", help="external user-data root for UP-N6.4")
     parser.add_argument("--level", choices=("quick", "full", "deep"), default="quick")
     parser.add_argument("--error", help="optional local startup error text for diagnose")
     parser.add_argument("--diagnosis-output", help="local JSON output path for diagnose")
@@ -811,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
         "launcher-status", "launcher-check", "launcher-download", "launcher-install",
         "launcher-stage", "launcher-activate", "launcher-rollback", "launcher-recover",
         "diagnostics", "verify", "diagnose", "repair",
+        "data-status", "retain-data", "reassociate-data", "reinstall",
     } and not args.check_update:
         delegated = _delegate_to_active_launcher(list(sys.argv[1:] if argv is None else argv))
         if delegated is not None:
@@ -876,6 +977,55 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_repair(report))
         return 0 if report.get("ok") else 3
+    if args.command in {"data-status", "retain-data", "reassociate-data"}:
+        root = Path(args.root).expanduser() if args.root else diagnosis_app_root(args.variant)
+        if root is None:
+            print("未检测到 QLH 主程序；请使用 --root 指定安装目录。", file=sys.stderr)
+            return 2
+        try:
+            if args.command == "data-status":
+                report = retention_status(root, args.data_root)
+            elif args.command == "retain-data":
+                report = retain_user_data(root, args.data_root, confirm=args.yes)
+            else:
+                report = reassociate_user_data(root, args.data_root, confirm=args.yes)
+        except DataRetentionError as exc:
+            report = {"ok": False, "action": "failed", "error": str(exc)}
+        if args.as_json:
+            print(__import__("json").dumps(report, ensure_ascii=False, sort_keys=True))
+        else:
+            print(__import__("json").dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if report.get("ok") else 3
+    if args.command == "reinstall":
+        if args.data_root:
+            print("自动重装仅支持默认保留数据目录；自定义目录请分别执行 retain-data 与 reassociate-data。", file=sys.stderr)
+            return 2
+        root = Path(args.root).expanduser() if args.root else diagnosis_app_root(args.variant)
+        if root is None:
+            print("未检测到 QLH 主程序；请使用 --root 指定安装目录。", file=sys.stderr)
+            return 2
+        try:
+            retained = retain_user_data(root, confirm=args.yes)
+        except DataRetentionError as exc:
+            retained = {"ok": False, "action": "failed", "error": str(exc)}
+        if not retained.get("ok"):
+            if args.as_json:
+                print(__import__("json").dumps(retained, ensure_ascii=False, sort_keys=True))
+            else:
+                print(__import__("json").dumps(retained, ensure_ascii=False, indent=2, sort_keys=True))
+            return 3
+        forwarded = ["install", "--yes"]
+        for source in args.source or []:
+            forwarded.extend(("--source", source))
+        if args.variant:
+            forwarded.extend(("--variant", args.variant))
+        if args.download_dir:
+            forwarded.extend(("--download-dir", args.download_dir))
+        if args.timeout != 8.0:
+            forwarded.extend(("--timeout", str(args.timeout)))
+        if args.as_json:
+            forwarded.append("--json")
+        return updater_main(forwarded)
     if args.command and args.command.startswith("version-"):
         forwarded = [args.command]
         for name in ("version_store", "bundle", "version", "variant"):

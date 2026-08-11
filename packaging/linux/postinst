@@ -2,6 +2,7 @@
 set -e
 
 APP_DIR="/opt/qlh-edge-inference"
+DATA_ROOT="/var/lib/qlh-edge-inference/data"
 
 echo "QLH 边缘推理系统 — 安装后配置..."
 
@@ -22,6 +23,15 @@ fi
 mkdir -p "$APP_DIR/models" "$APP_DIR/logs"
 chmod 755 "$APP_DIR/models"
 chmod 1777 "$APP_DIR/logs"  # sticky + world-writable: DynamicUser 可写日志
+
+# Only a prior retention marker may restore data.  Any conflict leaves the
+# external copy intact and fails the package configuration for manual recovery.
+RETENTION_TOOL="$APP_DIR/bin/data_retention.py"
+QLH_DATA_DIR="$DATA_ROOT" "$VENV_PYTHON" "$RETENTION_TOOL" reassociate \
+    --root "$APP_DIR" --yes --json || {
+        echo "  [错误] 保留数据重新关联失败；外置数据未被删除。" >&2
+        exit 1
+    }
 
 # 验证 venv 可用性（用 --copies 构建，通常可直接使用）
 if [ -x "$VENV_PYTHON" ]; then
@@ -46,6 +56,24 @@ if [ -f "$APP_DIR/bin/bjtu" ]; then
     chmod 755 "$APP_DIR/bin/bjtu"
     ln -sf "$APP_DIR/bin/bjtu" /usr/local/bin/bjtu
 fi
+
+# Environment registration is intentionally opt-in on Linux.  The persisted
+# state is reapplied on upgrades; QLH_ENVREG=1 or =0 explicitly changes it.
+case "${QLH_ENVREG:-}" in
+    1)
+        /usr/sbin/qlh-env-register enable
+        ;;
+    0)
+        /usr/sbin/qlh-env-register disable
+        ;;
+    "")
+        /usr/sbin/qlh-env-register apply
+        ;;
+    *)
+        echo "  [error] QLH_ENVREG must be 0 or 1 when set." >&2
+        exit 1
+        ;;
+esac
 
 # 更新桌面数据库
 if command -v update-desktop-database &> /dev/null; then
