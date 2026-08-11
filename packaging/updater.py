@@ -38,6 +38,8 @@ LAUNCHER_VERSION = "0.1.8.1"
 DEFAULT_UPDATE_SOURCES = (
     "http://100.90.76.108:9090/latest.json",
     "https://github.com/SgfKrc/LEDS_BJTU/releases/latest/download/latest.json",
+    # Gitee 镜像兜底源（gitee 无 latest 别名，发版时需同步更新 tag）
+    "https://gitee.com/sgfd8134/leds_-bjtu_-gitee/releases/download/0.1.8.2/latest.json",
 )
 
 
