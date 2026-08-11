@@ -25,6 +25,7 @@ _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LEGACY_MIGRATION_KEY = "legacy_chat_history_json_v1"
+_MASTER_IDENTITY_KEY = "master_identity_v1"
 
 
 def _now() -> str:
@@ -616,6 +617,38 @@ def set_local_setting(key: str, value) -> None:
             """,
             (str(key), json.dumps(value, ensure_ascii=False), _now()),
         )
+
+
+def get_local_master_identity() -> dict:
+    """Read the main-node MAC identity from the user-owned SQLite store."""
+    value = get_local_setting(_MASTER_IDENTITY_KEY, {})
+    if not isinstance(value, dict):
+        return {}
+    macs = value.get("mac_addresses")
+    if not isinstance(macs, list):
+        return {}
+    normalized = sorted({str(mac).strip().lower() for mac in macs if str(mac).strip()})
+    if not normalized:
+        return {}
+    return {
+        "version": int(value.get("version") or 1),
+        "mac_addresses": normalized,
+        "bound_at": str(value.get("bound_at") or ""),
+    }
+
+
+def set_local_master_identity(mac_addresses: list[str]) -> dict:
+    """Persist the physical MAC set that owns this main-node SQLite store."""
+    normalized = sorted({str(mac).strip().lower() for mac in mac_addresses if str(mac).strip()})
+    if not normalized:
+        raise ValueError("无法记录空的主节点 MAC 地址集合")
+    value = {
+        "version": 1,
+        "mac_addresses": normalized,
+        "bound_at": _now(),
+    }
+    set_local_setting(_MASTER_IDENTITY_KEY, value)
+    return value
 
 
 def save_local_experimental_model(model_id: str, config_json: str) -> bool:

@@ -1198,9 +1198,9 @@ class Scheduler:
         初始化节点状态；若为分布式模式，启动 TCP 服务端监听。
 
         主节点启动后自动:
-        - 检测局域网 IP（非 192.168.x.x 占位符）
-        - 将 IP:Port 写入数据库 cluster_config 表
-        - 周期性刷新数据库心跳（30s），供从节点自动发现
+        - 检测当前可广告地址（已登录时优先 Tailscale，否则可达 LAN）
+        - 将物理 MAC 身份保存到用户自持的主节点 SQLite
+        - 通过本机 bootstrap 配置和 Tailnet 提供发现，不依赖远端数据库
 
         Args:
             host: TCP 监听地址（默认 0.0.0.0，接受所有接口连接）
@@ -1247,14 +1247,14 @@ class Scheduler:
 
                 # ★ MAC 不匹配时的处理策略
                 if self._master_identity_reason == "mac_mismatch":
-                    # 尝试在数据库中发现真正的主节点
+                    # 尝试在本机 bootstrap 配置或 Tailnet 中发现已确认的主节点。
                     discovery = self.discover_master()
                     if discovery.get("found"):
                         # 数据库中存在真正的主节点记录 → 自动切换为从节点
                         stale_note = "（心跳过期，IP 可能已变更）" if discovery.get("stale") else ""
                         logger.warning(
-                            f"⛔ 主节点身份验证失败！本机 MAC 与数据库中记录不匹配。\n"
-                            f"   数据库中存在真正的主节点 ({discovery['master_host']}:{discovery['master_port']}){stale_note}，\n"
+                            f"⛔ 主节点身份验证失败！本机 MAC 与本地 SQLite 记录不匹配。\n"
+                            f"   已发现主节点 ({discovery['master_host']}:{discovery['master_port']}){stale_note}，\n"
                             f"   自动切换为从节点模式并尝试连接..."
                         )
                         # 启动后台线程处理切换（避免阻塞 start()）
@@ -1265,23 +1265,28 @@ class Scheduler:
                             daemon=True,
                         ).start()
                     else:
-                        # 数据库中没有主节点记录 → 可能是首次配置错误
+                        # 未发现其他主节点：保留本机服务，但不覆盖已有身份记录。
                         logger.error(
-                            f"⛔ 主节点身份验证失败 — 拒绝注册到数据库！\n"
-                            f"   本机 MAC 与数据库中记录不匹配，且未发现其他主节点。\n"
+                            f"⛔ 主节点身份验证失败 — 拒绝覆盖本机 SQLite 身份记录！\n"
+                            f"   本机 MAC 与已记录身份不匹配，且未发现其他主节点。\n"
                             f"   如需更换主节点机器，请先在原主节点的后台管理中"
-                            f"使用「重置主节点身份」功能，或手动清除数据库中的 MAC 记录。\n"
-                            f"   当前将以单机模式运行（不写入 DB 注册信息）。"
+                            f"使用「重置主节点身份」功能。\n"
+                            f"   当前将以单机模式运行（不写入远端数据库）。"
                         )
                 else:
                     if self._tcp_server and self._tcp_server._running:
-                        # 自动注册到数据库，供从节点发现
-                        self._register_master_in_db()
-                        # 启动数据库心跳刷新线程
-                        self._start_master_db_heartbeat()
+                        port_text = self._tcp_server.port
+                        if "master" in self.nodes:
+                            self.nodes["master"].address = f"{self._lan_ip}:{port_text}"
+                        logger.info(
+                            "主节点本地身份已就绪，广告地址 %s:%s；"
+                            "从节点通过 bootstrap 配置和 Tailnet 发现",
+                            self._lan_ip,
+                            port_text,
+                        )
                     else:
                         logger.warning(
-                            "主节点 TCP 未监听，跳过数据库主节点注册；"
+                            "主节点 TCP 未监听，跳过主节点地址广告；"
                             "本地推理仍可用"
                         )
                 # 检查是否需要向备用主节点发送接管通知（转让后新主节点启动）
@@ -1308,7 +1313,6 @@ class Scheduler:
             self.pipeline_queue.start(process_fn=self._process_queued_pipeline_task)
             logger.info("流水线请求队列已就绪")
 
-        self._start_database_reconnect_monitor()
         # 已经是 client 的节点由上面的 auto-connect 唯一路径处理；这里只处理
         # 尚未确认身份、可能需要从 provisional master 切换的节点。
         if (self._effective_role() == "master"
@@ -7231,28 +7235,23 @@ class Scheduler:
         """
         主节点获取邀请信息（供从节点连接使用）。
 
-        优先使用运行时检测到的局域网 IP，回退到 SERVER_IP。
-        主节点的连接信息同时持久化在数据库 cluster_config 中，
-        从节点可通过 GET /api/cluster/discover 自动发现。
+        优先使用运行时检测到的 Tailscale 地址；未登录 Tailnet 时使用
+        当前可达的 LAN 地址，回退到 SERVER_IP。地址不会写入 SQL：LAN
+        地址随网络变化在每次启动时重新探测，Tailnet 地址由 Tailscale 管理。
 
         Returns:
-            { master_host, master_port, node_count, connected_clients, db_registered,
-              mac_addresses, identity_verified, identity_reason }
+            { master_host, master_port, node_count, connected_clients,
+              discovery_methods, mac_addresses, identity_verified, identity_reason }
         """
-        # 使用运行时检测的 LAN IP 或已有的配置值
+        # 使用运行时检测到的可广告地址或已有的配置值。
         lan_ip = getattr(self, '_lan_ip', '') or SERVER_IP
+        try:
+            from network_address import is_tailscale_ip
+            host_source = "tailnet" if is_tailscale_ip(lan_ip) else "lan"
+        except Exception:
+            host_source = "lan"
         port = self._tcp_server.port if self._tcp_server else SERVER_PORT
         macs = getattr(self, '_mac_addresses', [])
-
-        # 检查是否已注册到数据库
-        db_registered = False
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db_host = db.get_config("master_host", "")
-                db_registered = bool(db_host)
-            except Exception:
-                pass
 
         # Phase 2.1+: 锁保护迭代计数，防止并发修改
         with self._nodes_lock:
@@ -7266,6 +7265,7 @@ class Scheduler:
 
         return {
             "master_host": lan_ip,
+            "master_host_source": host_source,
             "master_port": port,
             "node_count": capacity_used,
             "total_node_records": total_records,
@@ -7275,7 +7275,7 @@ class Scheduler:
             "connected_clients": (
                 self._tcp_server.get_client_ids() if self._tcp_server else []
             ),
-            "db_registered": db_registered,
+            "discovery_methods": ["local_config", "tailnet"],
             "mac_addresses": macs,
             "identity_verified": getattr(self, '_master_identity_verified', False),
             "identity_reason": getattr(self, '_master_identity_reason', ''),
@@ -7689,53 +7689,61 @@ class Scheduler:
 
     def _verify_master_identity(self) -> None:
         """
-        验证本机 MAC 地址是否与数据库中记录的主节点 MAC 匹配。
+        验证本机 MAC 地址是否与用户自持 SQLite 中的主节点 MAC 匹配。
 
         验证逻辑:
-        - DB 中尚无 MAC 记录 → 首次启动，身份为 "first_run"，后续 _register_master_in_db() 写入
-        - 本机 MAC 与 DB 记录有交集 → 身份验证通过，"match"
-        - 本机 MAC 与 DB 记录无交集 → 身份验证失败，"mac_mismatch"（可能是不同机器）
+        - SQLite 中尚无 MAC 记录 → 首次启动，立即记录本机 MAC，"first_run"
+        - 本机 MAC 与本地记录有交集 → 身份验证通过，"match"
+        - 本机 MAC 与本地记录无交集 → 身份验证失败，"mac_mismatch"（可能是不同机器）
 
         验证结果存储在 self._master_identity_verified 和 self._master_identity_reason 中，
         前端可通过 get_my_role() 查询验证状态。
         """
-        db = _get_db()
-        if not db or not _db_available:
-            self._master_identity_verified = True  # DB 不可用时不阻断
-            self._master_identity_reason = "db_unavailable"
-            if get_database_status().get("configured", True):
-                logger.warning("数据库不可用，跳过主节点身份验证")
-            else:
-                logger.info("数据库未配置，使用本地节点配置确认主节点身份")
+        local_macs = sorted({
+            str(mac).strip().lower()
+            for mac in getattr(self, "_mac_addresses", [])
+            if str(mac).strip()
+        })
+        if not local_macs:
+            self._master_identity_verified = False
+            self._master_identity_reason = "no_physical_mac"
+            logger.error("主节点身份验证失败：未检测到可用物理网卡 MAC")
             return
-
-        local_macs = self._mac_addresses
 
         try:
-            result = db.verify_master_identity(local_macs)
+            from local_store import (
+                get_local_master_identity,
+                set_local_master_identity,
+            )
+
+            stored = get_local_master_identity()
+            stored_macs = stored.get("mac_addresses", [])
+            if not stored_macs:
+                set_local_master_identity(local_macs)
+                self._master_identity_verified = True
+                self._master_identity_reason = "first_run"
+                logger.info("首次启动，已将本机 MAC 绑定到主节点 SQLite")
+                return
+
+            matched = sorted(set(local_macs).intersection(stored_macs))
+            self._master_identity_verified = bool(matched)
+            self._master_identity_reason = "match" if matched else "mac_mismatch"
         except Exception as e:
-            logger.error(f"主节点身份验证异常: {e}")
-            self._master_identity_verified = True  # 异常时不阻断
-            self._master_identity_reason = "verify_error"
+            logger.error("主节点 SQLite 身份验证异常: %s", e)
+            self._master_identity_verified = False
+            self._master_identity_reason = "local_store_unavailable"
             return
 
-        self._master_identity_verified = result["verified"]
-        self._master_identity_reason = result["reason"]
-
-        if result["reason"] == "first_run":
-            logger.info("🔓 首次启动，数据库中尚无 MAC 记录，将自动写入本机 MAC 作为主节点身份标识")
-        elif result["reason"] == "match":
-            logger.info(f"🔒 主节点身份验证通过: MAC 匹配 {result['matched']}")
-        elif result["reason"] == "mac_mismatch":
+        if self._master_identity_reason == "match":
+            logger.info("主节点身份验证通过：MAC 与主节点 SQLite 记录匹配 %s", matched)
+        elif self._master_identity_reason == "mac_mismatch":
             logger.warning(
-                f"⛔ 主节点身份验证失败！本机 MAC {result['local_macs']} "
-                f"与数据库中记录 {result['db_macs']} 不匹配！"
+                f"⛔ 主节点身份验证失败！本机 MAC {local_macs} "
+                f"与主节点 SQLite 记录 {stored_macs} 不匹配！"
                 f"这可能意味着另一台机器正在尝试冒充主节点。"
                 f"如需更换主节点机器，请在设置中使用「重置主节点身份」功能。"
             )
-            # 注意：我们仍然允许启动（不阻断），但前端会显示警告
-            # 因为也有可能是本机更换了网卡或禁用了某个网络接口
-            # 如果是恶意冒充，数据库中的 MAC 记录不会被覆盖（除非调用 reset_master_identity）
+            # 保持本机服务可用，但绝不覆盖已有身份记录。
 
     def _start_master_db_heartbeat(self) -> None:
         """
@@ -7766,10 +7774,10 @@ class Scheduler:
 
     def discover_master(self, *, skip_config: bool = False) -> dict:
         """
-        从数据库查询主节点的连接信息（供从节点自动发现）。
+        发现主节点的连接信息（供从节点自动发现）。
 
-        从节点启动时和前端「自动发现」按钮调用此方法。
-        如果 master_last_seen 超过 120 秒未更新，标记为 stale。
+        已连接节点优先使用本机保存的 bootstrap 配置；未保存配置时，
+        通过同一 Tailnet 探测主节点。
 
         Returns:
             {
@@ -7777,10 +7785,10 @@ class Scheduler:
                 "master_host": str,
                 "master_port": int,
                 "stale": bool,
-                "source": "database" | "config",
+                "source": "config" | "tailnet" | "none",
             }
         """
-        # 已完成 bootstrap 的节点优先使用本地配置，状态查询不触发 DB。
+        # 已完成 bootstrap 的节点优先使用本地配置。
         import config as cfg
         if (not skip_config
                 and cfg.CLIENT_MASTER_HOST
@@ -7792,16 +7800,6 @@ class Scheduler:
                 "stale": False,
                 "source": "config",
             }
-
-        db = _get_db()
-        if db and _db_available:
-            try:
-                info = db.get_master_info()
-                if info.get("found"):
-                    info["source"] = "database"
-                    return info
-            except Exception as e:
-                logger.warning(f"数据库查询主节点信息失败: {e}")
 
         try:
             from bootstrap import discover_master_via_tailnet
@@ -11454,28 +11452,44 @@ class Scheduler:
         重置主节点身份标识（仅主节点可调用）。
 
         用于以下场景：
-        - 更换主节点机器（新机器的 MAC 与 DB 中记录不匹配）
+        - 更换主节点机器（新机器的 MAC 与本机 SQLite 中记录不匹配）
         - 主节点更换了网卡
         - 需要清除旧的 MAC 记录重新绑定
 
-        调用后下一次启动时将自动记录新的 MAC 地址。
+        调用后立即把当前物理 MAC 绑定到主节点 SQLite，无需重启。
         """
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可重置身份标识"}
 
-        db = _get_db()
-        if not db or not _db_available:
-            return {"status": "error", "reason": "数据库不可用"}
-
         try:
-            db.reset_master_identity(new_macs=None)  # 清除旧 MAC，下次启动重新记录
-            logger.warning("⚠️ 主节点身份标识已重置，下次启动将重新记录 MAC")
+            macs = sorted({
+                str(mac).strip().lower()
+                for mac in getattr(self, "_mac_addresses", [])
+                if str(mac).strip()
+            })
+            if not macs:
+                from tcp_comm import get_mac_addresses
+                macs = sorted({
+                    str(mac).strip().lower()
+                    for mac in get_mac_addresses()
+                    if str(mac).strip()
+                })
+            if not macs:
+                return {"status": "error", "reason": "未检测到可用物理网卡 MAC，无法重置身份"}
+
+            from local_store import set_local_master_identity
+            set_local_master_identity(macs)
+            self._mac_addresses = macs
+            self._master_identity_verified = True
+            self._master_identity_reason = "reset"
+            logger.warning("主节点身份已重置并重新绑定到本机 SQLite: %s", macs)
             return {
                 "status": "ok",
-                "message": "主节点身份已重置。请重启后端服务以重新绑定 MAC 地址。",
+                "message": "主节点身份已重置，并已立即绑定当前物理网卡 MAC。",
             }
         except Exception as e:
-            return {"status": "error", "reason": str(e)}
+            logger.error("主节点 SQLite 身份重置失败: %s", e)
+            return {"status": "error", "reason": f"主节点 SQLite 不可用: {e}"}
 
     def manual_register_node(self, node_id: str, hostname: str = "",
                              address: str = "", network_type: str = "unknown",
@@ -11639,9 +11653,8 @@ class Scheduler:
         """
         检查主节点是否在线。
 
-        两级检测（从快到慢）:
-          1. 本地 TCP 连接状态 — 秒级（~3s 心跳超时即可感知）
-          2. 数据库心跳时间戳 — 120s 超时（兜底，防止 TCP 假连接）
+        活跃 TCP 连接是唯一的在线事实源；断线时只返回本机保存的
+        连接目标作为重连提示，不以远端数据库心跳推断在线状态。
 
         Returns:
             {
@@ -11650,7 +11663,7 @@ class Scheduler:
                 "stale": bool,
                 "master_host": str,
                 "master_port": int,
-                "source": str,       # "tcp" | "database" | "self" | "db_unavailable"
+                "source": str,       # "tcp" | "tcp_disconnected" | "config" | "not_connected"
                 "tcp_connected": bool | None,  # 本地 TCP 是否连通
             }
         """
@@ -11663,8 +11676,7 @@ class Scheduler:
             and getattr(tcp_client, 'sock', None) is not None
         )
 
-        # 活跃且已注册的 TCP 连接是当前、直接的在线证据。数据库只用于
-        # 未连接时发现主节点，不能在本地/无数据库模式下否定这个连接。
+        # 活跃且已注册的 TCP 连接是当前、直接的在线证据。
         if self._effective_role() == "client" and tcp_connected:
             return {
                 "master_online": True,
@@ -11676,68 +11688,35 @@ class Scheduler:
                 "tcp_connected": True,
             }
 
-        db = _get_db()
-        if not db or not _db_available:
+        configured_host = getattr(tcp_client, "server_host", "") or ""
+        configured_port = getattr(tcp_client, "server_port", 0) or 0
+        if not configured_host:
+            try:
+                import config as cfg
+                configured_host = str(getattr(cfg, "CLIENT_MASTER_HOST", "") or "")
+                configured_port = int(getattr(cfg, "CLIENT_MASTER_PORT", 0) or 0)
+            except Exception:
+                configured_host = ""
+                configured_port = 0
+        if configured_host and configured_host != "192.168.x.x":
             return {
                 "master_online": False,
                 "last_seen_seconds_ago": None,
                 "stale": True,
-                "master_host": "",
-                "master_port": 0,
-                "source": "db_unavailable",
+                "master_host": configured_host,
+                "master_port": configured_port,
+                "source": "tcp_disconnected" if tcp_client is not None else "config",
                 "tcp_connected": tcp_connected,
             }
-
-        try:
-            info = db.get_master_info()
-            if not info.get("found"):
-                return {
-                    "master_online": False,
-                    "last_seen_seconds_ago": None,
-                    "stale": True,
-                    "master_host": "",
-                    "master_port": 0,
-                    "source": "not_found",
-                    "tcp_connected": tcp_connected,
-                }
-
-            now = time.time()
-            last_seen = info.get("last_seen", 0)
-            ago = now - last_seen if last_seen > 0 else None
-            stale = info.get("stale", True)
-
-            # ★ 如果本地 TCP 已断开，即使 DB 心跳未过期也立即报告离线
-            if not tcp_connected and self._effective_role() == "client":
-                return {
-                    "master_online": False,
-                    "last_seen_seconds_ago": round(ago, 1) if ago else None,
-                    "stale": stale,
-                    "master_host": info["master_host"],
-                    "master_port": info["master_port"],
-                    "source": "tcp_disconnected",
-                    "tcp_connected": False,
-                }
-
-            return {
-                "master_online": not stale,
-                "last_seen_seconds_ago": round(ago, 1) if ago else None,
-                "stale": stale,
-                "master_host": info["master_host"],
-                "master_port": info["master_port"],
-                "source": "database",
-                "tcp_connected": tcp_connected,
-            }
-        except Exception as e:
-            logger.warning(f"主节点健康检查失败: {e}")
-            return {
-                "master_online": False,
-                "last_seen_seconds_ago": None,
-                "stale": True,
-                "master_host": "",
-                "master_port": 0,
-                "source": "error",
-                "tcp_connected": tcp_connected,
-            }
+        return {
+            "master_online": False,
+            "last_seen_seconds_ago": None,
+            "stale": True,
+            "master_host": "",
+            "master_port": 0,
+            "source": "not_connected",
+            "tcp_connected": tcp_connected,
+        }
 
     # ================================================================
     # 从节点：主节点健康监控 + 自动重连

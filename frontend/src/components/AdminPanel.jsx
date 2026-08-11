@@ -513,13 +513,14 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
   };
 
   const handleResetIdentity = async () => {
-    if (!window.confirm('⚠️ 确定要重置主节点身份标识吗？\n\n这将清除数据库中记录的 MAC 地址。\n下次启动时将重新记录本机 MAC 作为新的身份标识。\n\n此操作通常在更换主节点机器或网卡后使用。')) {
+    if (!window.confirm('⚠️ 确定要重置主节点身份标识吗？\n\n这将更新主节点 SQLite 中记录的 MAC 地址，并立即绑定当前物理网卡。\n\n此操作通常在更换主节点机器或网卡后使用。')) {
       return;
     }
     try {
       const result = await resetMasterIdentity('reset');
       if (result.status === 'ok') {
         onToast?.({ type: 'success', msg: result.message || '身份已重置' });
+        refresh();
       }
     } catch (err) {
       onToast?.({ type: 'error', msg: `重置失败: ${err.message}` });
@@ -898,7 +899,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
     }
   };
 
-  // ---- 从节点/待配置节点：自动发现主节点（本地配置、DB、Tailnet） ----
+  // ---- 从节点/待配置节点：自动发现主节点（本地配置、Tailnet、旧 DB 兼容回退） ----
   const handleDiscover = async (showToast = true) => {
     setDiscovering(true);
     try {
@@ -918,7 +919,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
           onToast?.({ type: 'warning', msg: `⚠️ 主节点记录已过期 (${result.master_host}:${result.master_port})，请确认主节点在线` });
         }
       } else if (showToast) {
-        onToast?.({ type: 'error', msg: '未发现主节点，请确认主节点在线或手动输入地址' });
+        onToast?.({ type: 'error', msg: '未发现主节点，请确认已加入同一 Tailnet，或在首次接入时输入主节点地址' });
       }
     } catch (err) {
       setDiscovery({ found: false });
@@ -1072,8 +1073,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
               <p className="connect-desc">
                 {isProvisional
                   ? '此节点尚未确认主节点身份，连接后将配置为从节点并获取集群认证信息。'
-                  : '输入主节点的 IP 地址和端口以注册到分布式推理集群。'}
-                主节点的连接信息可在主节点后台管理的「注册新节点」区域找到。
+                  : '自动发现会优先使用本机已保存的连接配置和同一 Tailnet。'}
+                首次尚未加入同一 Tailnet 时，应先完成 Tailscale 组网；随后点击「自动发现」完成可信接入。
               </p>
 
               {/* 自动发现提示 */}
@@ -1086,11 +1087,9 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                       : `已自动发现主节点: ${discovery.master_host}:${discovery.master_port}`}
                   </span>
                   <span className="discovery-source">
-                    {discovery.source === 'database'
-                      ? '📡 数据库'
-                      : discovery.source === 'tailnet'
-                        ? '🔐 Tailnet'
-                        : '⚙️ 配置文件'}
+                    {discovery.source === 'tailnet'
+                      ? '🔐 Tailnet'
+                      : '⚙️ 配置文件'}
                   </span>
                 </div>
               )}
@@ -1131,7 +1130,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                   className="btn-ghost discover-btn"
                   onClick={() => handleDiscover(true)}
                   disabled={discovering}
-                  title="从数据库查询主节点地址"
+                  title="从本机配置或同一 Tailnet 发现主节点"
                 >
                   {discovering ? '⏳ 查询中...' : '🔍 自动发现'}
                 </button>
@@ -1268,17 +1267,13 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
             <div className="invite-panel">
               <p className="connect-desc">
                 将以下连接信息提供给新节点。新节点在「设置 → 分布式推理优化」中开启后，
-                在后台管理的「连接主节点」中点击「🔍 自动发现」即可自动填充地址并注册。
-                {invite.db_registered && (
-                  <span style={{ color: 'var(--success)', display: 'block', marginTop: 4 }}>
-                    ✅ 主节点信息已自动同步到数据库，从节点可通过「自动发现」找到本节点。
-                  </span>
-                )}
-                {!invite.db_registered && (
-                  <span style={{ color: 'var(--warning)', display: 'block', marginTop: 4 }}>
-                    ⚠️ 数据库未连接，从节点需手动输入本节点地址。
-                  </span>
-                )}
+                加入同一 Tailnet 后，在后台管理的「连接主节点」中点击「🔍 自动发现」即可自动填充地址并注册。
+                <span style={{ color: 'var(--success)', display: 'block', marginTop: 4 }}>
+                  ✅ 主节点配置和用户资产保存在本机 SQLite，不依赖远端数据库。已连接节点会从本机配置自动恢复。
+                </span>
+                <span style={{ color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
+                  首次尚未加入同一 Tailnet 的节点需先完成 Tailscale 组网；下方地址仅用于首次可信 bootstrap 或受管理员明确允许的其他可信通道。
+                </span>
                 {!hasCapacity && (
                   <span style={{ color: 'var(--danger)', display: 'block', marginTop: 4 }}>
                     ⚠️ 已达到最大节点数上限 ({invite.max_nodes})，请先扩容或注销离线节点。
@@ -1326,14 +1321,16 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                   <p className="mac-identity-desc">
                     主节点通过 MAC 地址确认身份，IP 地址变化不影响身份识别。
                     {identityReason === 'first_run' && ' 本次为首次启动，MAC 已自动记录。'}
-                    {identityReason === 'match' && ' MAC 与数据库记录一致。'}
+                    {identityReason === 'match' && ' MAC 与主节点 SQLite 记录一致。'}
                     {identityReason === 'mac_mismatch' && (
                       <span style={{ color: 'var(--danger)' }}>
                         ⚠️ MAC 与数据库记录不匹配！可能是另一台机器冒充主节点，或本机更换了网卡。
                         如需更换主节点机器，请使用下方「重置主节点身份」功能。
                       </span>
                     )}
-                    {identityReason === 'db_unavailable' && ' 数据库不可用，跳过身份验证。'}
+                    {identityReason === 'reset' && ' 已重新绑定当前物理网卡 MAC。'}
+                    {identityReason === 'no_physical_mac' && ' 未检测到可用物理网卡 MAC。'}
+                    {identityReason === 'local_store_unavailable' && ' 主节点 SQLite 不可用，身份未验证。'}
                   </p>
                 </div>
               )}
@@ -1571,7 +1568,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
               <p className="connect-desc">
                 主节点使用物理网卡 MAC 地址作为不可变身份标识。
                 IP 地址可能随网络环境变化，但 MAC 地址保持不变。
-                如果 MAC 验证失败，说明当前机器与数据库中记录的主节点不是同一台。
+                如果 MAC 验证失败，说明当前机器与主节点 SQLite 中记录的主节点不是同一台。
               </p>
               <div className="identity-actions">
                 <div className="identity-current">
@@ -1579,14 +1576,20 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                   {identityVerified === true && (
                     <span className="identity-badge verified">✅ 身份已验证</span>
                   )}
-                  {identityVerified === false && identityReason === 'first_run' && (
-                    <span className="identity-badge unverified">🆕 首次启动（已自动记录）</span>
+                  {identityVerified === true && identityReason === 'first_run' && (
+                    <span className="identity-badge verified">🆕 首次启动（已自动记录）</span>
                   )}
                   {identityVerified === false && identityReason === 'mac_mismatch' && (
                     <span className="identity-badge danger">⛔ MAC 不匹配</span>
                   )}
-                  {identityVerified === false && identityReason === 'db_unavailable' && (
-                    <span className="identity-badge unverified">⚠️ 数据库不可用</span>
+                  {identityVerified === true && identityReason === 'reset' && (
+                    <span className="identity-badge verified">✅ 已重新绑定</span>
+                  )}
+                  {identityVerified === false && identityReason === 'no_physical_mac' && (
+                    <span className="identity-badge unverified">⚠️ 未检测到物理 MAC</span>
+                  )}
+                  {identityVerified === false && identityReason === 'local_store_unavailable' && (
+                    <span className="identity-badge unverified">⚠️ 主节点 SQLite 不可用</span>
                   )}
                   {(identityVerified === null || identityVerified === undefined) && (
                     <span className="identity-badge unverified">⏳ 未检测</span>
