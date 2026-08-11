@@ -36,7 +36,7 @@ def temp_store_dir(monkeypatch):
     monkeypatch.setattr(local_store, '_get_store_dir', _mock_store_dir)
     monkeypatch.setattr(local_store, '_legacy_store_dir', lambda: legacy_dir)
     monkeypatch.setattr(local_store, '_sqlite_path', lambda: sqlite_path)
-    local_store._initialized_paths.clear()
+    monkeypatch.setattr(local_store, '_initialized_paths', set())
 
     yield {
         "root": tmpdir,
@@ -46,7 +46,6 @@ def temp_store_dir(monkeypatch):
 
     # 清理
     import shutil
-    local_store._initialized_paths.clear()
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -66,12 +65,25 @@ class TestLocalSessions:
         assert fetched is not None
         assert fetched["id"] == sid
 
-    def test_list_sessions_sorted(self):
+    def test_list_sessions_sorted(self, monkeypatch):
+        import datetime
+        import local_store
         from local_store import create_local_session, get_all_local_sessions
+
+        ticks = iter(range(100))
+        base = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+        def deterministic_now():
+            return (base + datetime.timedelta(seconds=next(ticks))).isoformat().replace(
+                "+00:00", "Z",
+            )
+
+        monkeypatch.setattr(
+            local_store, "_now", deterministic_now,
+        )
         sid1 = "test-session-a"
         sid2 = "test-session-b"
         create_local_session(sid1, "A")
-        time.sleep(0.01)  # 确保时间戳不同
         create_local_session(sid2, "B")
 
         sessions = get_all_local_sessions()
@@ -228,6 +240,7 @@ class TestLocalStoreThreadSafety:
         create_local_session(sid, "线程测试")
 
         errors = []
+        round_barrier = threading.Barrier(3)
 
         def write_messages(thread_id):
             try:
@@ -264,19 +277,25 @@ class TestLocalStoreThreadSafety:
             for i in range(10):
                 try:
                     save_local_message(sid, "user", f"w-{i}")
-                    time.sleep(0.05)  # 给 reader 窗口时间
                 except PermissionError:
                     pass  # Windows 原子写入限制，可接受
                 except Exception as e:
                     errors.append(str(e))
+                try:
+                    round_barrier.wait(timeout=3)
+                except threading.BrokenBarrierError:
+                    return
 
         def reader():
             for _ in range(5):
                 try:
                     load_local_conversation(sid)
-                    time.sleep(0.1)
                 except Exception as e:
                     errors.append(str(e))
+                try:
+                    round_barrier.wait(timeout=3)
+                except threading.BrokenBarrierError:
+                    return
 
         readers = [threading.Thread(target=reader) for _ in range(2)]
         writer_thread = threading.Thread(target=writer)
@@ -375,7 +394,7 @@ class TestSqliteCompatibility:
         assert user == ("owner",)
         assert session == ("Shared",)
 
-    def test_legacy_json_is_imported_once_and_retained(self, temp_store_dir):
+    def test_legacy_json_is_imported_once_and_retained(self, temp_store_dir, monkeypatch):
         import local_store
 
         legacy_dir = temp_store_dir["legacy_dir"]
@@ -403,7 +422,7 @@ class TestSqliteCompatibility:
         assert os.path.isfile(sessions_path)
         assert os.path.isfile(messages_path)
 
-        local_store._initialized_paths.clear()
+        monkeypatch.setattr(local_store, '_initialized_paths', set())
         local_store.initialize_local_store()
         assert len(local_store.load_local_conversation("legacy-one")) == 2
 
