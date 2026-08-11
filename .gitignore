@@ -80,6 +80,8 @@ packaging/.venv-packaging/
 
 # Temp / to-delete
 _to_delete/
+test-results/
+sd15-offline-smoke/
 
 # Reasonix local tool config
 reasonix.toml
