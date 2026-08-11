@@ -776,7 +776,8 @@ class DiffusionService:
             return self._state in {"loading", "unloading"} or self._active_job_id is not None
 
     def inspect(self, path: str, *, compute_hash: bool = False) -> DiffusionArtifact:
-        return self._inspector.inspect(path, compute_hash=compute_hash)
+        resolved = self._asset_manager.resolve_local_path(path)
+        return self._inspector.inspect(str(resolved), compute_hash=compute_hash)
 
     @staticmethod
     def _default_artifact_id(artifact: DiffusionArtifact) -> str:

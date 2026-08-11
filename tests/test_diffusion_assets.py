@@ -219,6 +219,63 @@ def test_discover_installed_notifies_each_asset_path_only_once(tmp_path, monkeyp
     assert ready == [("tiny", target.resolve())]
 
 
+def test_import_resolves_catalog_relative_path_from_manager_root(tmp_path, monkeypatch):
+    model_index = _pipeline_index()
+    weight = b"weight"
+    spec = _tiny_spec(model_index, weight)
+    monkeypatch.setitem(ASSET_CATALOG, "tiny", spec)
+    target = spec.target_path(tmp_path)
+    _write_fixture(target, model_index, weight)
+    unrelated_cwd = tmp_path / "service-working-directory"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+
+    manager = DiffusionAssetManager(root=tmp_path)
+    report = manager.import_asset("tiny", "models/tiny", license_accepted=True)
+
+    assert report["valid"] is True
+    assert Path(report["path"]) == target.resolve()
+    assert (target / MANIFEST_NAME).is_file()
+
+
+def test_import_reports_missing_directory_before_asset_verification(tmp_path, monkeypatch):
+    model_index = _pipeline_index()
+    monkeypatch.setitem(ASSET_CATALOG, "tiny", _tiny_spec(model_index, b"weight"))
+    manager = DiffusionAssetManager(root=tmp_path)
+
+    with pytest.raises(ValueError, match="directory does not exist"):
+        manager.import_asset("tiny", "models/tiny", license_accepted=True)
+
+
+def test_import_corrects_a_legacy_shared_catalog_path(tmp_path, monkeypatch):
+    model_index = _pipeline_index()
+    weight = b"weight"
+    first = _tiny_spec(model_index, weight)
+    second = replace(first, asset_id="tiny-second", local_dir="models/tiny-second")
+    monkeypatch.setitem(ASSET_CATALOG, first.asset_id, first)
+    monkeypatch.setitem(ASSET_CATALOG, second.asset_id, second)
+    _write_fixture(first.target_path(tmp_path), model_index, weight)
+    expected = second.target_path(tmp_path)
+    _write_fixture(expected, model_index, weight)
+
+    report = DiffusionAssetManager(root=tmp_path).import_asset(
+        second.asset_id,
+        first.local_dir,
+        license_accepted=True,
+    )
+
+    assert Path(report["path"]) == expected.resolve()
+
+
+def test_catalog_includes_each_asset_default_local_directory(tmp_path, monkeypatch):
+    spec = _tiny_spec(_pipeline_index(), b"weight")
+    monkeypatch.setitem(ASSET_CATALOG, spec.asset_id, spec)
+
+    catalog = DiffusionAssetManager(root=tmp_path).catalog()
+
+    assert next(item for item in catalog if item["asset_id"] == spec.asset_id)["local_dir"] == spec.local_dir
+
+
 def test_ready_notification_can_retry_after_registration_failure(tmp_path, monkeypatch):
     model_index = _pipeline_index()
     weight = b"weight"
