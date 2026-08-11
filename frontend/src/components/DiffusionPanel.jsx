@@ -305,8 +305,11 @@ export default function DiffusionPanel({
       if (!['sd15_pipeline', 'sd15_ip_adapter', 'sd15_inpaint_pipeline', 'sd15_instruction_pipeline'].includes(inspected.artifact_kind) || !inspected.loadable) {
         throw new Error(inspected.warnings?.join('；') || '该路径不是完整的 SD 1.5 模型或 IP-Adapter 目录');
       }
+      const normalizedPath = path.replace(/\\/g, '/').replace(/^\.\//, '');
+      const catalogAsset = assetCatalog.find(item => item.local_dir === normalizedPath);
       const registered = await registerDiffusionArtifact(path, {
-        name: path.split(/[\\/]/).filter(Boolean).at(-1) || 'SD 1.5',
+        artifactId: catalogAsset?.artifact_id,
+        name: catalogAsset?.name || path.split(/[\\/]/).filter(Boolean).at(-1) || 'SD 1.5',
       });
       try { localStorage.setItem('qlh-sd-model-path', path); } catch (_) {}
       await refresh();
@@ -383,7 +386,7 @@ export default function DiffusionPanel({
   };
 
   const handleAssetImport = async (asset) => {
-    const path = modelPath.trim();
+    const path = (asset.local_dir || modelPath).trim();
     if (!path) return;
     setAction(`import:${asset.asset_id}`);
     setError('');
@@ -974,7 +977,7 @@ export default function DiffusionPanel({
                         <button
                           className="btn-ghost"
                           onClick={() => handleAssetImport(asset)}
-                          disabled={Boolean(action) || !accepted || !modelPath.trim()}
+                          disabled={Boolean(action) || !accepted}
                         >
                           {action === `import:${asset.asset_id}` ? '校验中...' : '导入'}
                         </button>

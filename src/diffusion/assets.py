@@ -626,6 +626,7 @@ class DiffusionAssetManager:
                     "name": spec.name,
                     "repo_id": spec.repo_id,
                     "revision": spec.revision,
+                    "local_dir": spec.local_dir,
                     "license_id": spec.license_id,
                     "model_card_url": spec.model_card_url,
                     "preset_id": spec.preset_id,
@@ -822,13 +823,54 @@ class DiffusionAssetManager:
         if not license_accepted:
             raise ValueError("model license acceptance is required before import")
         spec = get_asset_spec(asset_id)
-        root = Path(path).expanduser().resolve()
+        root = self.resolve_local_path(path)
+        canonical_root = spec.target_path(self._root).resolve()
+        requested_asset_id = self._catalog_asset_id_for_target(root)
+        if (
+            requested_asset_id is not None
+            and requested_asset_id != spec.asset_id
+            and canonical_root.is_dir()
+        ):
+            # Older web clients sent the shared model-path input for every
+            # catalog row. Prefer the selected asset's managed directory
+            # instead of validating a different catalog package as this one.
+            root = canonical_root
+        if not root.is_dir():
+            raise ValueError("offline diffusion asset directory does not exist")
         report = verify_asset_directory(root, asset_id, full_hash=True)
         if not report["valid"]:
             raise ValueError("offline diffusion asset package failed verification")
         _write_manifest(root, spec, report)
         self._notify_ready(spec, root)
         return report
+
+    def resolve_local_path(self, path: str) -> Path:
+        """Resolve local artifact paths from the application root.
+
+        The image panel uses paths such as ``models/sd15-original-v1``. A
+        service may run from ``src`` or an installer directory, so catalog
+        paths resolve from the manager root before falling back to an existing
+        caller-working-directory path used by custom installations.
+        """
+        entered = Path(path).expanduser()
+        if entered.is_absolute():
+            return entered.resolve()
+
+        managed_candidate = (self._root / entered).resolve()
+        cwd_candidate = entered.resolve()
+        if managed_candidate.exists() or not cwd_candidate.exists():
+            return managed_candidate
+        return cwd_candidate
+
+    def _resolve_import_path(self, path: str) -> Path:
+        """Backward-compatible alias for import-path callers."""
+        return self.resolve_local_path(path)
+
+    def _catalog_asset_id_for_target(self, path: Path) -> Optional[str]:
+        for spec in ASSET_CATALOG.values():
+            if path == spec.target_path(self._root).resolve():
+                return spec.asset_id
+        return None
 
     def discover_installed(self) -> None:
         if not self._on_ready:

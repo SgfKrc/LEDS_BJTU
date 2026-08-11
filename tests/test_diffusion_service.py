@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from diffusion.artifacts import DiffusionArtifact
+from diffusion.assets import DiffusionAssetManager
 from diffusion.sd15_engine import (
     GenerationCancelled,
     SD15EngineConfig,
@@ -51,6 +52,36 @@ class _Inspector:
             loadable=self.loadable,
             warnings=[] if self.artifact_kind != "unknown" else ["unknown fixture"],
         )
+
+
+class _RecordingInspector(_Inspector):
+    def __init__(self):
+        super().__init__()
+        self.paths = []
+
+    def inspect(self, path, *, compute_hash=False):
+        self.paths.append(path)
+        return super().inspect(path, compute_hash=compute_hash)
+
+
+def test_service_inspection_resolves_relative_paths_from_asset_root(tmp_path, monkeypatch):
+    target = tmp_path / "models" / "local"
+    target.mkdir(parents=True)
+    unrelated_cwd = tmp_path / "service-working-directory"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    inspector = _RecordingInspector()
+    service = DiffusionService(
+        inspector=inspector,
+        asset_manager=DiffusionAssetManager(root=tmp_path),
+    )
+    try:
+        artifact = service.inspect("models/local")
+    finally:
+        service.close()
+
+    assert artifact.path == str(target.resolve())
+    assert inspector.paths == [str(target.resolve())]
 
 
 class _Image:
