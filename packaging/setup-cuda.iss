@@ -43,6 +43,7 @@ DefaultGroupName={#MyAppNameCN}
 ; 权限
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+ChangesEnvironment=yes
 
 ; 压缩
 Compression=lzma2/max
@@ -69,25 +70,21 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 chinese.AppNameCN=轻量化大模型分布式边缘推理系统（独显版）
 chinese.LaunchDesc=立即启动 轻量化大模型分布式边缘推理系统
 chinese.InstallDoneMsg=安装完成！%n%n本版本支持 NVIDIA GPU 推理（CUDA）+ CPU 推理（llama.cpp）。%n无 GPU 时自动回退 CPU 模式。%n%n首次启动会自动检测模型文件。%n%n启动后浏览器访问: http://localhost:8000%n%n项目: 北京交通大学 · 大学生创新创业训练计划
+chinese.EnvRegTask=注册全局 bjtu 命令（写入当前用户环境变量）
+chinese.EnvRegWriteError=无法写入当前用户的 PATH；应用已安装，但新终端不会自动找到 bjtu。
+english.EnvRegTask=Register the global bjtu command for the current user
+english.EnvRegWriteError=Could not update the current user's PATH. The application was installed, but new terminals will not find bjtu automatically.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "envreg"; Description: "{cm:EnvRegTask}"
 
 [Files]
 ; ---- 主程序（PyInstaller 输出） ----
+; build-cuda.bat 已在签名前把入口、版本、文档和工具复制到发布树。
+; 安装器只能读取该签名树，禁止再用仓库文件覆盖签名内容。
 Source: "{#MyAppSourceDir}\*"; DestDir: "{app}"; \
   Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
-Source: "..\bjtu.bat"; DestDir: "{app}"; Flags: ignoreversion
-Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
-
-; ---- 项目文档 ----
-Source: "..\README.md"; DestDir: "{app}\docs"; Flags: ignoreversion
-Source: "..\docs\整体架构.md"; DestDir: "{app}\docs"; Flags: ignoreversion
-Source: "..\docs\模块接口说明.md"; DestDir: "{app}\docs"; Flags: ignoreversion
-Source: "..\docs\核心技术原理.md"; DestDir: "{app}\docs"; Flags: ignoreversion
-
-; ---- GGUF 转换工具 ----
-Source: "scripts\convert_to_gguf.py"; DestDir: "{app}\tools"; Flags: ignoreversion
 
 [Dirs]
 Name: "{app}\models"; Permissions: users-modify
@@ -114,11 +111,47 @@ Filename: "{app}\{#MyAppExeName}"; \
   Description: "{cm:LaunchDesc}"; \
   Flags: nowait postinstall skipifsilent shellexec
 
-[UninstallDelete]
-Type: files; Name: "{app}\logs\*"
-Type: dirifempty; Name: "{app}\logs"
-
 [Code]
+const
+  QlhEnvRegistrationKey = 'Software\QLH\EnvironmentRegistration';
+  QlhEnvPathEntryValue = 'PathEntry';
+  QlhEnvPathOwnedValue = 'PathOwned';
+
+#include "env-registration.issinc"
+
+function RunDataRetention(CommandName: String): Boolean;
+var
+  DataRoot, Parameters: String;
+  ResultCode: Integer;
+  Started: Boolean;
+begin
+  DataRoot := ExpandConstant('{localappdata}\QLH-Edge-Inference\data');
+  Parameters := CommandName + ' --root "' + ExpandConstant('{app}') +
+    '" --data-root "' + DataRoot + '" --yes --json';
+  ResultCode := -1;
+  Started := Exec(
+    ExpandConstant('{app}\tools\QLH-Data-Retention.exe'),
+    Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode
+  );
+  Result := Started and (ResultCode = 0);
+  if not Result then
+    MsgBox('用户数据事务失败，安装或卸载已取消以保护数据。' + #13#10#13#10 +
+      '请检查磁盘空间、目录冲突和 .qlh-retention-transaction.json 后重试。' + #13#10 +
+      DataRoot, mbError, MB_OK);
+end;
+
+procedure RetainUserData;
+begin
+  if not RunDataRetention('retain') then
+    Abort;
+end;
+
+procedure ReassociateRetainedData;
+begin
+  if not RunDataRetention('reassociate') then
+    Abort;
+end;
+
 // ---- 卸载旧版本 ----
 function GetOldUninstallString(var UninstPath: String): Boolean;
 begin
@@ -137,6 +170,12 @@ var
   ResultCode: Integer;
 begin
   Result := True;
+  if not EnvRegistrationParameterIsValid then
+  begin
+    MsgBox('ENVREG 只能为 0 或 1。', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
   if GetOldUninstallString(UninstPath) then
   begin
     if MsgBox(
@@ -155,26 +194,12 @@ begin
   end;
 end;
 
-// ---- 卸载时可选删除 models ----
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if CurUninstallStep = usPostUninstall then
-  begin
-    if DirExists(ExpandConstant('{app}\models')) then
-    begin
-      if MsgBox(
-        '是否同时删除模型目录？' + #13#10#13#10 +
-        ExpandConstant('{app}\models') + #13#10#13#10 +
-        '注意：模型文件通常较大，重新下载会耗费时间。' + #13#10 +
-        '建议默认保留。',
-        mbConfirmation, MB_YESNO or MB_DEFBUTTON2
-      ) = IDYES then
-      begin
-        DelTree(ExpandConstant('{app}\models'), True, True, True);
-        RemoveDir(ExpandConstant('{app}'));
-      end;
-    end;
-  end;
+  if CurUninstallStep = usUninstall then
+    RetainUserData
+  else if CurUninstallStep = usPostUninstall then
+    RemoveRegisteredUserEnvironment;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -186,12 +211,14 @@ begin
   begin
     Verified := Exec(
       ExpandConstant('{app}\tools\QLH-Install-Manifest.exe'),
-      'validate --manifest "' + ExpandConstant('{app}\manifest\install-manifest.json') +
-      '" --trusted-keys-dir "' + ExpandConstant('{app}\pubkeys') + '"',
+      'verify --root "' + ExpandConstant('{app}') + '" --level deep' +
+      ' --trusted-keys-dir "' + ExpandConstant('{app}\pubkeys') + '"',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode
     );
     if (not Verified) or (ResultCode <> 0) then
-      RaiseException('UP-N6.0 安装清单验签失败，安装已中止。');
+      RaiseException('UP-N6.0 安装文件 deep 校验失败，安装已中止。');
+    ReassociateRetainedData;
+    ConfigureRegisteredUserEnvironment;
     MsgBox(CustomMessage('InstallDoneMsg'), mbInformation, MB_OK);
   end;
 end;
