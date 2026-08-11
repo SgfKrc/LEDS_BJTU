@@ -452,6 +452,22 @@ class TestLocalSettings:
         set_local_setting("complex", value)
         assert get_local_setting("complex") == value
 
+    def test_master_identity_round_trip_normalizes_mac_addresses(self, temp_store_dir):
+        from local_store import get_local_master_identity, set_local_master_identity
+
+        saved = set_local_master_identity([
+            "AA-BB-CC-DD-EE-FF",
+            "aa-bb-cc-dd-ee-ff",
+            "11:22:33:44:55:66",
+        ])
+
+        assert saved["mac_addresses"] == [
+            "11:22:33:44:55:66",
+            "aa-bb-cc-dd-ee-ff",
+        ]
+        assert saved["bound_at"]
+        assert get_local_master_identity()["mac_addresses"] == saved["mac_addresses"]
+
     def test_setting_persists_across_connections(self, temp_store_dir):
         from local_store import get_local_setting, set_local_setting
 

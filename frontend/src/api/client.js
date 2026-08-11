@@ -930,7 +930,7 @@ export async function connectToMaster(masterHost, masterPort, switchToClient = f
   });
 }
 
-// ---- 主节点自动发现（数据库查询） ----
+// ---- 主节点自动发现（本地 bootstrap 配置、Tailnet） ----
 
 export async function discoverMaster() {
   return request('/cluster/discover');

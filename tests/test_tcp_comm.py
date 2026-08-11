@@ -16,6 +16,7 @@ import struct
 import threading
 import time
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 import pytest
 import torch
 
@@ -29,6 +30,63 @@ from tcp_comm import (
     TCPServer, TCPClient, ClientConn,
     parse_host_port, format_host_port,
 )
+
+
+def test_detect_lan_ip_rejects_tailscale_apipa_and_wsl_virtual_adapter(monkeypatch):
+    """未登录 Tailscale 的 169.254/16 不能作为主节点广告地址。"""
+    monkeypatch.setattr(tcp_comm_mod, "_HAS_PSUTIL", True)
+    monkeypatch.setattr(
+        tcp_comm_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "Tailscale": [SimpleNamespace(
+                family=socket.AF_INET, address="169.254.83.107",
+            )],
+            "vEthernet (WSL)": [SimpleNamespace(
+                family=socket.AF_INET, address="172.28.176.1",
+            )],
+            "WLAN": [SimpleNamespace(
+                family=socket.AF_INET, address="10.61.50.55",
+            )],
+        },
+    )
+    monkeypatch.setattr(
+        tcp_comm_mod.psutil,
+        "net_if_stats",
+        lambda: {
+            "Tailscale": SimpleNamespace(isup=True),
+            "vEthernet (WSL)": SimpleNamespace(isup=True),
+            "WLAN": SimpleNamespace(isup=True),
+        },
+    )
+
+    assert tcp_comm_mod.detect_lan_ip() == "10.61.50.55"
+
+
+def test_detect_lan_ip_prefers_assigned_tailscale_address(monkeypatch):
+    monkeypatch.setattr(tcp_comm_mod, "_HAS_PSUTIL", True)
+    monkeypatch.setattr(
+        tcp_comm_mod.psutil,
+        "net_if_addrs",
+        lambda: {
+            "Tailscale": [SimpleNamespace(
+                family=socket.AF_INET, address="100.88.9.10",
+            )],
+            "WLAN": [SimpleNamespace(
+                family=socket.AF_INET, address="10.61.50.55",
+            )],
+        },
+    )
+    monkeypatch.setattr(
+        tcp_comm_mod.psutil,
+        "net_if_stats",
+        lambda: {
+            "Tailscale": SimpleNamespace(isup=True),
+            "WLAN": SimpleNamespace(isup=True),
+        },
+    )
+
+    assert tcp_comm_mod.detect_lan_ip() == "100.88.9.10"
 
 
 # ================================================================

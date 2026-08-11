@@ -7064,20 +7064,20 @@ async def check_master_health():
 @app.get("/api/cluster/discover")
 async def discover_master():
     """
-    从数据库查询主节点的连接信息（从节点自动发现）。
+    发现主节点的连接信息（从节点自动发现）。
 
-    从节点启动后调用此接口，尝试在数据库中查找已注册的主节点。
-    如果找到且在 120 秒内有心跳，则返回主节点地址，
-    前端可自动填充连接表单。
+    已连接节点优先使用本机 bootstrap 配置；未保存配置时，通过同一
+    Tailnet 探测主节点。旧远端数据库仅为兼容回退，前端可自动填充
+    连接表单。
 
      Returns:
          {
-             "found": bool,           # 是否在数据库中找到主节点
+             "found": bool,           # 是否找到主节点
              "master_host": str,      # 主节点 IP
              "master_port": int,      # 主节点端口
              "master_mac_addresses": [str],  # 主节点 MAC 地址（身份标识）
              "stale": bool,           # 心跳是否过期 (>120s)
-             "source": str,           # "database" | "config" | "none"
+             "source": str,           # "config" | "tailnet" | "none"
          }
     """
     return scheduler.discover_master()
@@ -7092,10 +7092,10 @@ async def reset_master_identity(req: ResetIdentityRequest):
     """
     重置主节点身份标识（仅主节点可调用）。
 
-    用于更换主节点机器或网卡后，清除数据库中旧的 MAC 地址记录。
+    用于更换主节点机器或网卡后，替换主节点 SQLite 中旧的 MAC 地址记录。
     需要输入确认字符串 'reset' 以防止误操作。
 
-    调用后需重启主节点后端服务，新的 MAC 地址将在下次启动时自动记录。
+    调用成功后立即绑定当前物理 MAC，无需重启后端服务。
     """
     if req.confirm.strip().lower() != "reset":
         raise HTTPException(400, "请输入 'reset' 确认重置操作")
@@ -7545,7 +7545,7 @@ async def create_review_ticket(req: CreateReviewRequest):
             timeout_hours=req.timeout_hours,
         )
         if ticket is None:
-            raise HTTPException(status_code=503, detail="数据库不可用，无法创建审查工单")
+            raise HTTPException(status_code=503, detail="主节点 SQLite 不可用，无法创建审查工单")
         return ticket.to_dict()
     except HTTPException:
         raise
