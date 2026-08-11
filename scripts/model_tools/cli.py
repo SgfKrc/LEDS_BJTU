@@ -9,6 +9,7 @@ from typing import Any
 
 from .gguf import GGUFError, inspect_gguf, verify_gguf
 from .gguf_convert import execute_conversion, plan_conversion
+from .gemma4_native_probe import run_native_probe
 from .llm_smoke_matrix import run_smoke_matrix
 from .maintenance import clean_models, model_disk_usage
 from .sd15_batch import run_prompt_batch, run_sampler_matrix
@@ -103,6 +104,19 @@ def _parser() -> argparse.ArgumentParser:
     llm.add_argument("--require-complete", action="store_true", help="fail when any selected unit is skipped")
     llm.add_argument("--output", type=Path, default=None)
     llm.add_argument("--json", action="store_true", dest="as_json")
+    native_probe = commands.add_parser(
+        "gemma4-native-probe",
+        aliases=["gemma4_native_probe"],
+        help="check native llama-cpp-python MTMD ABI or explicitly preflight a verified local pair",
+    )
+    native_probe.add_argument("--model", type=Path, default=None, help="local GGUF text-model artifact")
+    native_probe.add_argument("--mmproj", type=Path, default=None, help="local GGUF multimodal projector artifact")
+    native_probe.add_argument("--model-sha256", default="", help="expected SHA-256 for --model")
+    native_probe.add_argument("--mmproj-sha256", default="", help="expected SHA-256 for --mmproj")
+    native_probe.add_argument("--n-ctx", type=int, default=512, help="CPU-only preflight context (128-4096)")
+    native_probe.add_argument("--require-audio", action="store_true", help="fail the artifact gate when MTMD reports no audio support")
+    native_probe.add_argument("--timeout-seconds", type=float, default=180.0)
+    native_probe.add_argument("--json", action="store_true", dest="as_json")
     convert = commands.add_parser("gguf-convert", aliases=["gguf_convert"], help="preflight or explicitly execute an HF to GGUF conversion")
     source_group = convert.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--model-id", default=None, help="registered Safetensors model ID")
@@ -201,6 +215,23 @@ def _human(command: str, report: dict[str, Any]) -> None:
                 print(f"    - {item['error'].get('code')}: {item['error'].get('message')}")
         for error in report.get("errors", []):
             print(f"  - {error}")
+        return
+    if command in {"gemma4-native-probe", "gemma4_native_probe"}:
+        state = "READY" if report.get("gate_passed") else report.get("status", "UNKNOWN").upper()
+        binding = report.get("binding", {})
+        artifacts = report.get("artifacts", {})
+        capabilities = report.get("capabilities", {})
+        print(f"{state}: {report.get('tool')}")
+        print(
+            f"binding={binding.get('status')} version={binding.get('package_version')} "
+            f"mtmd_abi={binding.get('mtmd_abi')}"
+        )
+        print(
+            f"artifacts_verified={artifacts.get('verified')} "
+            f"vision={capabilities.get('vision')} audio={capabilities.get('audio')}"
+        )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
         return
     if command in {"gguf-convert", "gguf_convert"}:
         state = "PUBLISHED" if report.get("execution", {}).get("published") else ("READY" if report.get("valid") else "BLOCKED")
@@ -340,6 +371,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.output is not None:
                 write_json(args.output, report)
+        elif args.command in {"gemma4-native-probe", "gemma4_native_probe"}:
+            report = run_native_probe(
+                model=args.model,
+                mmproj=args.mmproj,
+                model_sha256=args.model_sha256,
+                mmproj_sha256=args.mmproj_sha256,
+                n_ctx=args.n_ctx,
+                require_audio=args.require_audio,
+                timeout_seconds=args.timeout_seconds,
+            )
         elif args.command in {"gguf-convert", "gguf_convert"}:
             _ensure_output_outside_roots(args.output, [ROOT / "models"])
             if args.output is not None and args.target is not None:
@@ -364,12 +405,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = sweep_models(args.root, full_hash=args.full_hash)
     except (OSError, GGUFError, ValueError) as exc:
-        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gguf-convert", "gguf_convert"}:
+        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gguf-convert", "gguf_convert"}:
             message = str(exc) if isinstance(exc, ValueError) else f"operation failed (errno={getattr(exc, 'errno', None)})"
-            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status")
+            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("gemma4_native_probe" if args.command in {"gemma4-native-probe", "gemma4_native_probe"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status"))
             report = {
                 "tool": tool,
-                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("matrix" if tool == "llm_smoke_matrix" else "compare"),
+                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("matrix" if tool == "llm_smoke_matrix" else ("native_multimodal_preflight" if tool == "gemma4_native_probe" else "compare")),
                 "request_valid": False if tool == "gguf_convert" else None,
                 "valid": False,
                 "in_sync": False,
@@ -392,6 +433,12 @@ def main(argv: list[str] | None = None) -> int:
         if not report.get("valid", False):
             return 2
         return 0 if report.get("summary", {}).get("gate_passed", False) else 1
+    if args.command in {"gemma4-native-probe", "gemma4_native_probe"}:
+        if not report.get("valid", False):
+            return 2
+        if report.get("status") == "binding_ready":
+            return 0
+        return 0 if report.get("gate_passed", False) else 1
     if args.command in {"gguf-convert", "gguf_convert"}:
         if not report.get("request_valid", True):
             return 2
