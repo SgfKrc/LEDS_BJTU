@@ -55,6 +55,40 @@ _QUALITY_COUNT_FIELDS = (
     "consecutive_reconnects",
     "reconnects_in_window",
 )
+_HOST_SCOPES = frozenset(
+    {
+        "tailscale_ipv4",
+        "tailscale_ipv6",
+        "loopback_ipv4",
+        "loopback_ipv6",
+        "private_ipv4",
+        "private_ipv6",
+        "public_ipv4",
+        "public_ipv6",
+        "tailnet_dns",
+        "dns",
+    }
+)
+_OBSERVATION_REASONS = frozenset(
+    {
+        "not_collected",
+        "executable_not_found",
+        "timeout",
+        "command_unavailable",
+        "nonzero_exit",
+        "non_text_output",
+        "output_too_large",
+        "invalid_json",
+        "invalid_schema",
+        "unrecognized_output",
+        "existing_connection",
+        "disabled",
+        "invalid_endpoint",
+        "connection_refused",
+        "resolution_failed",
+        "connect_failed",
+    }
+)
 
 OBSERVATION_STATES = frozenset(
     {"available", "unavailable", "timeout", "command_failed", "invalid"}
@@ -245,6 +279,92 @@ def _public_quality_view(snapshot: Any) -> dict[str, Any] | None:
     return public
 
 
+def _safe_reason(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in _OBSERVATION_REASONS else None
+
+
+def sanitize_network_path_view(snapshot: Any) -> dict[str, Any] | None:
+    """Reduce any path-like mapping to the schema-v1 diagnostic allowlist."""
+    if not isinstance(snapshot, Mapping):
+        return None
+
+    endpoint = snapshot.get("endpoint")
+    safe_endpoint = None
+    if isinstance(endpoint, Mapping):
+        role = endpoint.get("role")
+        host_scope = endpoint.get("host_scope")
+        port = endpoint.get("port")
+        if (
+            role in {"master", "gateway"}
+            and host_scope in _HOST_SCOPES
+            and isinstance(port, int)
+            and not isinstance(port, bool)
+            and 1 <= port <= 65535
+        ):
+            safe_endpoint = {
+                "role": role,
+                "host_scope": host_scope,
+                "port": port,
+            }
+
+    tailscale = snapshot.get("tailscale")
+    safe_tailscale = None
+    if isinstance(tailscale, Mapping):
+        state = tailscale.get("state")
+        safe_tailscale = {
+            "state": state if state in OBSERVATION_STATES else "invalid",
+            "reason": _safe_reason(tailscale.get("reason")),
+        }
+
+    tcp_probe = snapshot.get("tcp_probe")
+    safe_tcp_probe = None
+    if isinstance(tcp_probe, Mapping):
+        state = tcp_probe.get("state")
+        elapsed_ms = tcp_probe.get("elapsed_ms")
+        safe_tcp_probe = {
+            "state": (
+                state
+                if state in {"not_run", "available", "unavailable", "timeout"}
+                else "not_run"
+            ),
+            "reason": _safe_reason(tcp_probe.get("reason")),
+            "elapsed_ms": (
+                round(float(elapsed_ms), 3)
+                if isinstance(elapsed_ms, (int, float))
+                and not isinstance(elapsed_ms, bool)
+                and math.isfinite(float(elapsed_ms))
+                and elapsed_ms >= 0
+                else None
+            ),
+        }
+
+    path_kind = snapshot.get("path_kind")
+    availability = snapshot.get("availability")
+    return {
+        "schema_version": 1,
+        "path_kind": path_kind if path_kind in PATH_KINDS else "unknown",
+        "availability": (
+            availability
+            if availability in {"available", "degraded", "unknown"}
+            else "unknown"
+        ),
+        "endpoint": safe_endpoint,
+        "tailscale": safe_tailscale,
+        "tcp_probe": safe_tcp_probe,
+        "quality": _public_quality_view(snapshot.get("quality")),
+    }
+
+
+def network_path_diagnostic_json(snapshot: Any) -> str:
+    """Serialize the exact same allowlisted view used by API diagnostics."""
+    return json.dumps(
+        sanitize_network_path_view(snapshot),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def build_client_network_path_view(tcp_client: Any) -> dict[str, Any] | None:
     """Build an API-safe local view without running probes or CLI commands."""
     if tcp_client is None:
@@ -265,7 +385,7 @@ def build_client_network_path_view(tcp_client: Any) -> dict[str, Any] | None:
             getattr(tcp_client, "server_port", 0),
         )
     except (TypeError, ValueError):
-        return {
+        return sanitize_network_path_view({
             "schema_version": 1,
             "path_kind": "unknown",
             "availability": "degraded" if connected else "unknown",
@@ -277,7 +397,7 @@ def build_client_network_path_view(tcp_client: Any) -> dict[str, Any] | None:
                 "elapsed_ms": None,
             },
             "quality": quality,
-        }
+        })
 
     tcp_observation = TcpProbeObservation(
         "available" if connected else "not_run",
@@ -287,11 +407,11 @@ def build_client_network_path_view(tcp_client: Any) -> dict[str, Any] | None:
         endpoint,
         tcp_probe=tcp_observation,
     ).public_view()
-    return {
+    return sanitize_network_path_view({
         "schema_version": 1,
         **public,
         "quality": quality,
-    }
+    })
 _NETCHECK_BOOL_RE = re.compile(
     r"^\s*(udp|ipv4|ipv6)\s*:\s*(true|false|yes|no)\b", re.IGNORECASE | re.MULTILINE
 )
