@@ -108,6 +108,8 @@ class StageSpec:
         compare=False,
         repr=False,
     )
+    # When omitted, the workflow identity is used for backwards compatibility.
+    model_identity: Optional[ModelIdentity] = None
 
 
 @dataclass
@@ -186,7 +188,10 @@ class StageRecord:
         configured = self.spec.minimum_successful_dependencies
         return len(self.spec.depends_on) if configured is None else configured
 
-    def snapshot(self) -> dict:
+    def snapshot(
+        self,
+        effective_model_identity: Optional[ModelIdentity] = None,
+    ) -> dict:
         output_digest = ""
         output_size = 0
         if self.output is not None:
@@ -201,6 +206,14 @@ class StageRecord:
         return {
             "stage_id": self.spec.stage_id,
             "stage_type": self.spec.stage_type,
+            "model_identity": (
+                effective_model_identity.snapshot()
+                if effective_model_identity is not None
+                else (
+                    self.spec.model_identity.snapshot()
+                    if self.spec.model_identity is not None else None
+                )
+            ),
             "depends_on": list(self.spec.depends_on),
             "provider": (
                 self.attempts[-1].provider
@@ -270,7 +283,10 @@ class WorkflowRecord:
             duration_end = self.finished_at or self.result_ready_at
             if self.started_at is not None and duration_end is not None:
                 duration = max(0.0, duration_end - self.started_at)
-            stages = [stage.snapshot() for stage in self.stages.values()]
+            stages = [
+                stage.snapshot(self.effective_model_identity(stage.spec))
+                for stage in self.stages.values()
+            ]
             completed = sum(stage["state"] == "completed" for stage in stages)
             failed = sum(stage["state"] == "failed" for stage in stages)
             skipped = sum(stage["state"] == "skipped" for stage in stages)
@@ -332,6 +348,17 @@ class WorkflowRecord:
                 ),
                 "stages": stages,
             }
+
+    def effective_model_identity(
+        self,
+        stage: StageSpec,
+    ) -> Optional[ModelIdentity]:
+        """Resolve a Stage identity without changing the workflow default."""
+        return (
+            stage.model_identity
+            if stage.model_identity is not None
+            else self.model_identity
+        )
 
 
 StageExecutor = Callable[
@@ -1540,6 +1567,13 @@ class TaskGraphCoordinator:
         ):
             raise TaskGraphError("stage provider_id must be non-empty and safe")
         for spec in specs:
+            if (
+                spec.model_identity is not None
+                and not isinstance(spec.model_identity, ModelIdentity)
+            ):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} model_identity must be a ModelIdentity"
+                )
             candidates = (spec.provider, *spec.fallback_providers)
             if len(candidates) != len(set(candidates)):
                 raise TaskGraphError(
@@ -2235,7 +2269,7 @@ class TaskGraphCoordinator:
             provider_id=selected_provider,
             dependencies=dependencies,
             root_input=stage_root_input,
-            model_identity=workflow.model_identity,
+            model_identity=workflow.effective_model_identity(stage.spec),
             runtime_context=workflow.runtime_context,
         )
         try:

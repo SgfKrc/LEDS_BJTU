@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import api_server
 from model_host import model_host
-from task_graph import TaskGraphCoordinator, TaskGraphUnavailable
+from task_graph import StageSpec, TaskGraphCoordinator, TaskGraphUnavailable
 from task_journal import JournalEvent, SQLiteTaskJournal
 from task_provider import (
     LocalFullModelProvider,
@@ -83,7 +83,6 @@ def task_graph_api(monkeypatch):
     monkeypatch.setattr(
         api_server.scheduler, "record_task_complete", lambda **kwargs: True,
     )
-    monkeypatch.setattr(model_host, "_db_available", False)
     monkeypatch.setattr(api_server, "_auto_title_session", lambda *a, **k: None)
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server, "kv_cache", None)
@@ -742,6 +741,77 @@ def test_task_graph_auto_remote_distributes_candidates_across_two_workers(
     assert candidate_b["requested_provider"] == providers[1].provider_id
     assert candidate_a["attempts"][0]["provider_node_id"] == "worker_01"
     assert candidate_b["attempts"][0]["provider_node_id"] == "worker_02"
+
+
+def test_task_graph_auto_remote_filters_each_stage_by_its_model_identity(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity_a = ModelIdentity(
+        model_id="qwen-1_8b",
+        engine="llama_cpp",
+        format="gguf",
+        revision="stage-a",
+        sha256="a" * 64,
+    )
+    identity_b = ModelIdentity(
+        model_id="qwen-3b",
+        engine="llama_cpp",
+        format="gguf",
+        revision="stage-b",
+        sha256="b" * 64,
+    )
+    providers = [
+        _remote_worker_provider(identity_a, "worker_a", content="a"),
+        _remote_worker_provider(identity_b, "worker_b", content="b"),
+    ]
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: providers,
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity_a,
+    )
+    monkeypatch.setattr(
+        api_server,
+        "dual_candidate_template",
+        lambda: ([
+            StageSpec(
+                "candidate_a",
+                "full_inference",
+                model_identity=identity_a,
+            ),
+            StageSpec(
+                "candidate_b",
+                "full_inference",
+                model_identity=identity_b,
+            ),
+            StageSpec(
+                "aggregate",
+                "aggregate",
+                depends_on=("candidate_a", "candidate_b"),
+                minimum_successful_dependencies=1,
+            ),
+        ], "aggregate"),
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="auto heterogeneous",
+        session_id="task-session",
+        execution_mode="task_graph",
+        task_graph_auto_remote=True,
+        workflow_id="wf_autohetero01",
+    )))
+
+    assert len(manager.calls) == 1
+    workflow = coordinator.get("wf_autohetero01")
+    stages = {stage["stage_id"]: stage for stage in workflow["stages"]}
+    assert stages["candidate_a"]["requested_provider"] == providers[0].provider_id
+    assert stages["candidate_b"]["requested_provider"] == providers[1].provider_id
+    assert stages["candidate_a"]["model_identity"] == identity_a.snapshot()
+    assert stages["candidate_b"]["model_identity"] == identity_b.snapshot()
+    assert response.metrics["workers_used"] == ["worker_a", "worker_b"]
 
 
 def test_task_graph_auto_remote_retries_pure_stage_on_local_provider(

@@ -371,5 +371,93 @@ def test_workflow_snapshot_and_stage_request_keep_model_and_runtime_separate():
     assert captured["runtime"]["local_only"] is not None
     assert captured["root_input"] == {"message": "question"}
     assert workflow["model_identity"] == identity.snapshot()
+    assert workflow["stages"][0]["model_identity"] == identity.snapshot()
     assert workflow["session_id"] == "session-a"
     coordinator.close()
+
+
+def test_stage_model_identity_routes_heterogeneous_fake_workers():
+    worker_a_identity = ModelIdentity(
+        model_id="qwen-1_8b",
+        engine="pytorch",
+        format="safetensors",
+        revision="local-rev1",
+        sha256="1" * 64,
+    )
+    worker_b_identity = ModelIdentity(
+        model_id="qwen-3b",
+        engine="pytorch",
+        format="safetensors",
+        revision="local-rev2",
+        sha256="2" * 64,
+    )
+    observed = {}
+    registry = ProviderRegistry()
+
+    def candidate_output(worker_id, expected_identity):
+        def execute(request, cancel_event):
+            del cancel_event
+            assert request.model_identity == expected_identity
+            observed[worker_id] = request.model_identity
+            return {"content": worker_id}
+
+        return execute
+
+    registry.register(DeterministicFakeProvider(
+        "fake_worker_a",
+        output_factory=candidate_output("fake_worker_a", worker_a_identity),
+    ))
+    registry.register(DeterministicFakeProvider(
+        "fake_worker_b",
+        output_factory=candidate_output("fake_worker_b", worker_b_identity),
+    ))
+    registry.register(DeterministicFakeProvider(
+        "local_aggregate",
+        supported_stage_types=("aggregate",),
+        output_factory=lambda request, cancel_event: {
+            "content": "+".join(sorted(
+                item["content"] for item in request.dependencies.values()
+            )),
+        },
+    ))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+
+    try:
+        output, workflow = coordinator.run(
+            [
+                StageSpec(
+                    "candidate_a",
+                    "full_inference",
+                    provider="fake_worker_a",
+                    model_identity=worker_a_identity,
+                ),
+                StageSpec(
+                    "candidate_b",
+                    "full_inference",
+                    provider="fake_worker_b",
+                    model_identity=worker_b_identity,
+                ),
+                StageSpec(
+                    "aggregate",
+                    "aggregate",
+                    depends_on=("candidate_a", "candidate_b"),
+                    provider="local_aggregate",
+                ),
+            ],
+            "aggregate",
+            {"message": "question"},
+            model_identity=worker_a_identity,
+            workflow_id="wf_stageidentity1",
+        )
+    finally:
+        coordinator.close()
+
+    stages = {stage["stage_id"]: stage for stage in workflow["stages"]}
+    assert output == {"content": "fake_worker_a+fake_worker_b"}
+    assert observed == {
+        "fake_worker_a": worker_a_identity,
+        "fake_worker_b": worker_b_identity,
+    }
+    assert stages["candidate_a"]["model_identity"] == worker_a_identity.snapshot()
+    assert stages["candidate_b"]["model_identity"] == worker_b_identity.snapshot()
+    assert stages["aggregate"]["model_identity"] == worker_a_identity.snapshot()
