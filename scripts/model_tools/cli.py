@@ -10,6 +10,7 @@ from typing import Any
 from .gguf import GGUFError, inspect_gguf, verify_gguf
 from .gguf_convert import execute_conversion, plan_conversion
 from .gemma4_native_probe import run_native_probe
+from .gemma4_native_artifacts import resolve_ollama_gemma4_12b, run_ollama_gemma4_12b_preflight
 from .llm_smoke_matrix import run_smoke_matrix
 from .maintenance import clean_models, model_disk_usage
 from .sd15_batch import run_prompt_batch, run_sampler_matrix
@@ -117,6 +118,24 @@ def _parser() -> argparse.ArgumentParser:
     native_probe.add_argument("--require-audio", action="store_true", help="fail the artifact gate when MTMD reports no audio support")
     native_probe.add_argument("--timeout-seconds", type=float, default=180.0)
     native_probe.add_argument("--json", action="store_true", dest="as_json")
+    native_assets = commands.add_parser(
+        "gemma4-native-assets",
+        aliases=["gemma4_native_assets"],
+        help="verify the pinned local Ollama gemma4:12b GGUF/mmproj candidate",
+    )
+    native_assets.add_argument("--ollama-models-root", type=Path, default=None, help="override the local Ollama models root")
+    native_assets.add_argument("--full-hash", action="store_true", help="hash both pinned artifacts before accepting the candidate")
+    native_assets.add_argument("--json", action="store_true", dest="as_json")
+    native_ollama_probe = commands.add_parser(
+        "gemma4-native-ollama-probe",
+        aliases=["gemma4_native_ollama_probe"],
+        help="verify pinned local Ollama gemma4:12b assets then run the isolated native preflight",
+    )
+    native_ollama_probe.add_argument("--ollama-models-root", type=Path, default=None)
+    native_ollama_probe.add_argument("--n-ctx", type=int, default=128, help="CPU-only preflight context (128-4096)")
+    native_ollama_probe.add_argument("--require-audio", action="store_true")
+    native_ollama_probe.add_argument("--timeout-seconds", type=float, default=180.0)
+    native_ollama_probe.add_argument("--json", action="store_true", dest="as_json")
     convert = commands.add_parser("gguf-convert", aliases=["gguf_convert"], help="preflight or explicitly execute an HF to GGUF conversion")
     source_group = convert.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--model-id", default=None, help="registered Safetensors model ID")
@@ -230,6 +249,38 @@ def _human(command: str, report: dict[str, Any]) -> None:
             f"artifacts_verified={artifacts.get('verified')} "
             f"vision={capabilities.get('vision')} audio={capabilities.get('audio')}"
         )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
+        return
+    if command in {"gemma4-native-assets", "gemma4_native_assets"}:
+        source = report.get("source", {})
+        artifacts = report.get("artifacts", {})
+        print(f"{'READY' if report.get('gate_passed') else 'BLOCKED'}: {report.get('tool')}")
+        print(
+            f"source={source.get('registry')}:{source.get('tag')} "
+            f"manifest={source.get('manifest_sha256_matches')} license={source.get('license')}"
+        )
+        print(
+            f"model={artifacts.get('model', {}).get('content_sha256_matches')} "
+            f"mmproj={artifacts.get('mmproj', {}).get('content_sha256_matches')} "
+            f"vision={report.get('metadata', {}).get('mmproj_has_vision_encoder')}"
+        )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
+        return
+    if command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"}:
+        native = report.get("native") or {}
+        resources = native.get("resources", {})
+        print(f"{'READY' if report.get('gate_passed') else report.get('status', 'UNKNOWN').upper()}: {report.get('tool')}")
+        print(
+            f"assets_verified={report.get('assets', {}).get('gate_passed')} "
+            f"native_status={native.get('status')} vision={native.get('capabilities', {}).get('vision')}"
+        )
+        if resources:
+            print(
+                f"available_ram_bytes={resources.get('available_ram_bytes')} "
+                f"required_free_ram_bytes={resources.get('required_free_ram_bytes')} admitted={resources.get('admitted')}"
+            )
         for error in report.get("errors", []):
             print(f"  - {error.get('code')}: {error.get('message')}")
         return
@@ -381,6 +432,18 @@ def main(argv: list[str] | None = None) -> int:
                 require_audio=args.require_audio,
                 timeout_seconds=args.timeout_seconds,
             )
+        elif args.command in {"gemma4-native-assets", "gemma4_native_assets"}:
+            report, _pair = resolve_ollama_gemma4_12b(
+                models_root=args.ollama_models_root,
+                full_hash=args.full_hash,
+            )
+        elif args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"}:
+            report = run_ollama_gemma4_12b_preflight(
+                models_root=args.ollama_models_root,
+                n_ctx=args.n_ctx,
+                require_audio=args.require_audio,
+                timeout_seconds=args.timeout_seconds,
+            )
         elif args.command in {"gguf-convert", "gguf_convert"}:
             _ensure_output_outside_roots(args.output, [ROOT / "models"])
             if args.output is not None and args.target is not None:
@@ -405,12 +468,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = sweep_models(args.root, full_hash=args.full_hash)
     except (OSError, GGUFError, ValueError) as exc:
-        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gguf-convert", "gguf_convert"}:
+        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "gguf-convert", "gguf_convert"}:
             message = str(exc) if isinstance(exc, ValueError) else f"operation failed (errno={getattr(exc, 'errno', None)})"
-            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("gemma4_native_probe" if args.command in {"gemma4-native-probe", "gemma4_native_probe"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status"))
+            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("gemma4_ollama_native_preflight" if args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"} else ("gemma4_native_assets" if args.command in {"gemma4-native-assets", "gemma4_native_assets"} else ("gemma4_native_probe" if args.command in {"gemma4-native-probe", "gemma4_native_probe"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status"))))
             report = {
                 "tool": tool,
-                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("matrix" if tool == "llm_smoke_matrix" else ("native_multimodal_preflight" if tool == "gemma4_native_probe" else "compare")),
+                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("matrix" if tool == "llm_smoke_matrix" else ("native_multimodal_preflight" if tool == "gemma4_native_probe" else ("resolve_ollama_gemma4_12b" if tool == "gemma4_native_assets" else ("verify_then_native_preflight" if tool == "gemma4_ollama_native_preflight" else "compare")))),
                 "request_valid": False if tool == "gguf_convert" else None,
                 "valid": False,
                 "in_sync": False,
@@ -438,6 +501,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if report.get("status") == "binding_ready":
             return 0
+        return 0 if report.get("gate_passed", False) else 1
+    if args.command in {"gemma4-native-assets", "gemma4_native_assets"}:
+        if not report.get("valid", False):
+            return 2
+        return 0 if report.get("gate_passed", False) else 1
+    if args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"}:
+        if not report.get("valid", False):
+            return 2
         return 0 if report.get("gate_passed", False) else 1
     if args.command in {"gguf-convert", "gguf_convert"}:
         if not report.get("request_valid", True):
