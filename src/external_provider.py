@@ -67,6 +67,12 @@ mask_external_url = mask_island_url
 _HTTP_STATUS_PATTERN = re.compile(r"状态码 (\d{3})")
 
 
+def _configured_reasoning_effort() -> str:
+    import config as _cfg
+
+    return str(getattr(_cfg, "EXTERNAL_REASONING_EFFORT", "") or "")
+
+
 # ================================================================
 # 错误分类 — 与孤岛错误一一对应，但文案面向"外部推理服务"
 # ================================================================
@@ -367,7 +373,7 @@ class ExternalChatClient:
 
     def chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -390,6 +396,7 @@ class ExternalChatClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                reasoning_effort=_configured_reasoning_effort(),
                 _cancel_event=cancel_event,
             )
         except IslandEngineError as exc:
@@ -397,7 +404,7 @@ class ExternalChatClient:
 
     def chat_stream(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -420,6 +427,7 @@ class ExternalChatClient:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            reasoning_effort=_configured_reasoning_effort(),
         )
         try:
             for chunk in stream:
@@ -739,10 +747,11 @@ class ExternalOpenAIProvider(LocalFullModelProvider):
         }
 
     @staticmethod
-    def _build_stage_messages(request: StageRequest) -> List[Dict[str, str]]:
+    def _build_stage_messages(request: StageRequest) -> List[Dict[str, Any]]:
         """由 Stage 输入构造 OpenAI messages（full_inference / aggregate）。"""
         import json as _json
 
+        from multimodal import normalize_openai_message_content
         from task_provider import DEPENDENCY_FAILURES_KEY
 
         root_input = request.root_input or {}
@@ -768,7 +777,9 @@ class ExternalOpenAIProvider(LocalFullModelProvider):
             return [
                 {
                     "role": str(item.get("role", "user")),
-                    "content": str(item.get("content", "")),
+                    "content": normalize_openai_message_content(
+                        item.get("content", ""),
+                    ),
                 }
                 for item in messages
                 if isinstance(item, dict)

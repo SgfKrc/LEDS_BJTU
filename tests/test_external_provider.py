@@ -236,6 +236,7 @@ def _patch_external_config(
     label="测试外部服务",
     timeout=10,
     connect_timeout=3,
+    reasoning_effort="",
 ):
     import config
 
@@ -255,6 +256,9 @@ def _patch_external_config(
         config, "EXTERNAL_MIN_PROMPT_CHARS", min_prompt_chars, raising=False,
     )
     monkeypatch.setattr(config, "EXTERNAL_LABEL", label, raising=False)
+    monkeypatch.setattr(
+        config, "EXTERNAL_REASONING_EFFORT", reasoning_effort, raising=False,
+    )
     return resolved
 
 
@@ -358,6 +362,40 @@ def test_client_chat_returns_content_and_metrics(monkeypatch, mock_external_serv
     posts = [r for r in mock_external_server.requests if r["method"] == "POST"]
     assert posts[-1]["payload"]["max_tokens"] == 64
     assert posts[-1]["payload"]["stream"] is False
+    client.close()
+
+
+def test_client_preserves_structured_image_content_and_reasoning_effort(
+    monkeypatch, mock_external_server,
+):
+    from multimodal import build_openai_user_content
+
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    client = _make_client(
+        monkeypatch,
+        mock_external_server,
+        reasoning_effort="none",
+    )
+    client.chat(
+        [{
+            "role": "user",
+            "content": build_openai_user_content("描述图片", [image]),
+        }],
+        allow_external=True,
+    )
+
+    posts = [r for r in mock_external_server.requests if r["method"] == "POST"]
+    payload = posts[-1]["payload"]
+    assert payload["reasoning_effort"] == "none"
+    assert payload["messages"][0]["content"][0] == {
+        "type": "text",
+        "text": "描述图片",
+    }
+    assert payload["messages"][0]["content"][1]["image_url"]["url"] == image
     client.close()
 
 
@@ -557,6 +595,26 @@ def test_provider_executes_stage_via_registry(monkeypatch, mock_external_server)
     registry.close()
 
 
+def test_provider_stage_preserves_validated_structured_content():
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    request = _stage_request(messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "描述图片"},
+            {"type": "image_url", "image_url": {"url": image}},
+        ],
+    }])
+
+    messages = ExternalOpenAIProvider._build_stage_messages(request)
+
+    assert messages[0]["content"][0]["text"] == "描述图片"
+    assert messages[0]["content"][1]["image_url"]["url"] == image
+
+
 def test_provider_scope_denied_maps_to_provider_error(
     monkeypatch, mock_external_server,
 ):
@@ -753,6 +811,7 @@ def test_status_reports_external_section_with_masked_url(
     assert external["enabled"] is True
     assert external["label"] == "测试外部服务"
     assert external["data_scope"] == "opt_in"
+    assert external["reasoning_effort"] == ""
     assert external["min_prompt_chars"] == 2048
     assert external["model"] == "qwen2.5-7b-external"
     assert external["reachable"] is True
@@ -812,6 +871,80 @@ def test_chat_routes_external_with_flags(
     assert posts[-1]["payload"]["messages"][-1]["content"] == "介绍一下张量并行"
 
 
+def test_chat_routes_bounded_image_content_without_persisting_image(
+    monkeypatch, mock_external_server, api_env,
+):
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    mock_external_server.behavior["stream_chunks"] = ["图", "片", "描", "述"]
+    _patch_external_config(
+        monkeypatch,
+        mock_external_server,
+        data_scope="opt_in",
+        reasoning_effort="none",
+    )
+    persisted = []
+    monkeypatch.setattr(
+        api_env["api_server"],
+        "_persist_conversation_turn",
+        lambda session_id, user, assistant, metrics: persisted.append(
+            (session_id, user, assistant, metrics)
+        ),
+    )
+
+    response = api_env["client"].post("/api/chat", json={
+        "message": "描述这张图片",
+        "image_data_urls": [image],
+        "allow_external": True,
+        "prefer_external": True,
+    })
+
+    assert response.status_code == 200
+    assert response.json()["content"] == "图片描述"
+    posts = [r for r in mock_external_server.requests if r["method"] == "POST"]
+    payload = posts[-1]["payload"]
+    assert payload["reasoning_effort"] == "none"
+    content = payload["messages"][-1]["content"]
+    assert content[0] == {"type": "text", "text": "描述这张图片"}
+    assert content[1]["image_url"]["url"] == image
+    assert persisted[0][1] == "描述这张图片"
+    assert persisted[0][2] == "图片描述"
+    assert image not in json.dumps(persisted, ensure_ascii=False)
+
+
+def test_multimodal_external_failure_never_falls_back_without_image(
+    monkeypatch, api_env,
+):
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    _patch_external_config(
+        monkeypatch,
+        base_url=f"http://127.0.0.1:{_closed_port()}",
+        data_scope="opt_in",
+        connect_timeout=1,
+        timeout=2,
+    )
+    api_server = api_env["api_server"]
+    monkeypatch.setattr(model_host, "model_loaded", True)
+    monkeypatch.setattr(api_server, "model_manager", _FakeLocalLlamaManager())
+
+    response = api_env["client"].post("/api/chat", json={
+        "message": "描述这张图片",
+        "image_data_urls": [image],
+        "allow_external": True,
+        "prefer_external": True,
+    })
+
+    assert response.status_code == 502
+    assert "禁止丢弃图片后回退" in response.json()["detail"]
+
+
 def test_chat_without_flag_stays_local_under_opt_in(
     monkeypatch, mock_external_server, api_env,
 ):
@@ -845,6 +978,32 @@ def test_chat_scope_deny_blocks_flagged_request_and_logs(
     ]
     assert len(denial_logs) == 1
     assert "机密数据内容" not in denial_logs[0].getMessage()
+
+
+def test_multimodal_scope_deny_fails_instead_of_dropping_image(
+    monkeypatch, mock_external_server, api_env,
+):
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    _patch_external_config(monkeypatch, mock_external_server, data_scope="deny")
+    api_server = api_env["api_server"]
+    monkeypatch.setattr(model_host, "model_loaded", True)
+    monkeypatch.setattr(api_server, "model_manager", _FakeLocalLlamaManager())
+
+    response = api_env["client"].post("/api/chat", json={
+        "message": "描述这张图片",
+        "image_data_urls": [image],
+        "allow_external": True,
+        "prefer_external": True,
+    })
+
+    assert response.status_code == 400
+    assert "scope_deny" in response.json()["detail"]
+    posts = [r for r in mock_external_server.requests if r["method"] == "POST"]
+    assert posts == []
 
 
 def test_chat_falls_back_to_local_on_backend_down(monkeypatch, api_env):

@@ -1156,6 +1156,13 @@ class EngineHost:
         # ---- 路线 B：外部推理服务整请求路由（数据作用域门控，默认不出集群）----
         external_fallback_reason = ""
         _ext_decision = self._external_route_decision(req)
+        image_data_urls = getattr(req, "image_data_urls", [])
+        if image_data_urls and not _ext_decision.use_external:
+            raise HTTPException(
+                400,
+                "多模态请求必须使用已启用且获数据作用域授权的 external_api："
+                f"{_ext_decision.reason}",
+            )
         if _ext_decision.use_external:
             try:
                 return self.execute_external_chat(
@@ -1165,6 +1172,12 @@ class EngineHost:
                 raise
             except Exception as exc:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
+                if image_data_urls:
+                    raise HTTPException(
+                        502,
+                        "多模态外部推理服务调用失败，禁止丢弃图片后回退："
+                        f"{exc}",
+                    ) from exc
                 if not self._host.model_loaded or not getattr(self._host, "is_loaded", False):
                     if req.prefer_external:
                         raise HTTPException(
@@ -3074,12 +3087,18 @@ class EngineHost:
         """整请求路由到外部推理服务（与 llama.cpp/孤岛整请求路径同构）。"""
         import config as _cfg
         from external_provider import get_external_chat_client
+        from multimodal import build_openai_user_content
 
         client = get_external_chat_client()
         client.ensure_connected()
         request_history = [
             *history,
-            {"role": "user", "content": req.message},
+            {
+                "role": "user",
+                "content": build_openai_user_content(
+                    req.message, getattr(req, "image_data_urls", []),
+                ),
+            },
         ]
         result = client.chat(
             request_history,
@@ -3094,7 +3113,8 @@ class EngineHost:
         if not req.show_thinking:
             response_text = _strip_native_thinking_tags(response_text)
         completed_history = [
-            *request_history,
+            *history,
+            {"role": "user", "content": req.message},
             {"role": "assistant", "content": response_text},
         ]
         tokens_per_sec = result.get("tokens_per_second", 0)
