@@ -532,6 +532,7 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - [x] `T9.6-R2-WDEV` Windows 开发机实装门：CPU/CUDA Setup 分别安装到 `%LOCALAPPDATA%` 隔离同卷目录，安装期和独立 deep 均为 0 failed，`bjtu chat --help` 返回 0，冻结 EXE fixture 启动 5 秒无早退；五类哨兵数据完成 CPU/CUDA 卸载保留和重装关联，最后只清理本票数据，既有主节点状态未改。真实后端/TUI 契约回归 `34 passed`，打包/清单定向 `25 passed`。
   - [x] `UP-N6.4W` Windows 跨卷数据保留：外置事务 journal、空间预检、4MiB 流式复制、逐文件大小/SHA-256、整批 staging/commit、提交后源隔离删除和四阶段崩溃恢复已落地；同卷继续走原子改名。冻结 helper 完成真实 `G:`→`C:` retain/reassociate 往返，CPU Inno Setup 完成安装→跨卷卸载保留→同路径重装回迁，安装期 deep `5016/5016`；五类哨兵内容、marker、临时物清零和非用户程序文件边界均通过。全量 Python `1836 passed / 33 skipped`。
   - [ ] `T9.6-R2-EXT` 外部发布安装门：在不含既有 QLH 状态的干净 Windows 环境安装 CPU/CUDA Setup，复核环境变量、新 shell、真实模型后端会话和卸载；Linux 真机或完整 Linux 构建环境生成/安装 `.deb` 后走同一用例。当前 WSL 缺 Linux 原生 `node/cmake/c++/make`，`npm` 仅为不可用的 Windows 互操作路径，预检按预期 fail-closed。开发机隔离安装不替代该门。
+  - 2026-08-11 本机预检（不计入外部发布安装门）：默认 `Qwen-1.8B-Chat` 的完整本地 Safetensors 已以 PyTorch INT4 加载到 RTX 4060 Laptop GPU（加载 6.9s，allocated 1788.2MiB）；`interactive + local_only` 实际返回 `start → token → done`，metrics 为 `pytorch / single_streaming / distributed_used=false / history_committed=true`。Textual 页面用同一后端完成一次真实渲染与完成态验证；TUI 定向回归 `126 passed`、三尺寸 fixture 走查 `54/54`。当前 CPU 签名发布树 `dist/QLH-Edge-Inference` 的 deep 为 `5016/5016`，冻结 `QLH-TUI-Chat.exe --help` 返回 0。上述证据不覆盖干净机 Setup、新 shell、环境变量、卸载或 Linux `.deb`；`packaging/dist/QLH-Edge-Inference` 是 7 月旧开发树，不可作为本门发布候选。
   - 保持 `tui_admin.py --plain`、单命令和 7 屏管理契约回归。
   - 经过真实使用窗口后再决定 `bjtu` 默认进入聊天还是继续进入管理菜单；在此之前 `bjtu chat` 显式启动。
 
