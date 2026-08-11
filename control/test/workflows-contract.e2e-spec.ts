@@ -23,7 +23,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
 import {
   WorkflowJournalStore,
   WorkflowSnapshot,
@@ -229,16 +228,6 @@ describe('control-svc workflows 域（阶段 3.2 任务图控制面）', () => {
   let tmpFile: string;
   let store: WorkflowJournalStore;
 
-  const dbDisabledDao = new ConfigDao({
-    host: 'localhost',
-    port: 5432,
-    name: 'x',
-    user: 'postgres',
-    password: '',
-    enabled: false,
-    sslmode: 'prefer',
-  });
-
   beforeEach(() => {
     tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'control-wf-')), 'journal.json');
     store = new WorkflowJournalStore(tmpFile);
@@ -260,8 +249,6 @@ describe('control-svc workflows 域（阶段 3.2 任务图控制面）', () => {
     })
       .overrideProvider(WorkflowJournalStore)
       .useValue(store)
-      .overrideProvider(ConfigDao)
-      .useValue(dbDisabledDao)
       .compile();
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);

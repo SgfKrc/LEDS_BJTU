@@ -1,6 +1,6 @@
 /**
- * M1 本地事务数据库测试：SQLite 迁移/WAL/backup/health、outbox、
- * storage-health 双健康、postgres projector 退避与幂等。
+ * M1 本地事务数据库测试：SQLite 迁移/WAL/backup/health、outbox
+ * 与 storage-health 本地事实源。
  */
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -9,24 +9,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { MIGRATIONS, resolveSqlitePath, SqliteStore } from '../src/data/sqlite-store';
 import { OutboxService } from '../src/data/outbox.service';
 import { StorageHealthService } from '../src/data/storage-health';
-import { PostgresProjector } from '../src/data/postgres-projector';
 
 function tempStore(): SqliteStore {
   const dir = mkdtempSync(join(tmpdir(), 'qlh-m1-'));
   return new SqliteStore(join(dir, 'control.sqlite3'));
-}
-
-class FakeConfigDao {
-  enabled = false;
-  host = '127.0.0.1';
-  port = 1;
-  db = 'qlh';
-  pingOk = false;
-  dbEnabled() { return this.enabled; }
-  getConnectionInfo() { return { host: this.host, port: this.port, db: this.db }; }
-  async ping() {
-    return this.pingOk ? { ok: true } : { ok: false, error: 'fake down' };
-  }
 }
 
 describe('SqliteStore (M1)', () => {
@@ -267,59 +253,6 @@ describe('StorageHealthService (M1)', () => {
     const health = await new StorageHealthService(store).snapshot();
     expect(health.remote.status).toBe('disabled');
     expect(health.effective_mode).toBe('local_only');
-    store.close();
-  });
-});
-
-describe('PostgresProjector (M1)', () => {
-  it('local_only 不启动后台远端轮询器', () => {
-    const store = tempStore();
-    store.open();
-    const config = new FakeConfigDao();
-    const projector = new PostgresProjector(config as any, new OutboxService(store));
-    projector.start();
-    expect(projector.isRunning).toBe(false);
-    projector.stop();
-    store.close();
-  });
-
-  it('skips cleanly when postgres not configured', async () => {
-    const store = tempStore();
-    store.open();
-    const outbox = new OutboxService(store);
-    outbox.enqueue('model_registry', 'created', {});
-    const config = new FakeConfigDao();
-    config.enabled = false;
-    const projector = new PostgresProjector(config as any, outbox, {
-      baseIntervalMs: 1000,
-      maxIntervalMs: 4000,
-    });
-    const result = await projector.runOnce();
-    expect(result.error).toBe('not_configured');
-    expect(result.skipped).toBe(1);
-    expect(outbox.pendingCount()).toBe(1); // 未投影，保留积压
-    store.close();
-  });
-
-  it('backs off exponentially on connection failure', async () => {
-    const store = tempStore();
-    store.open();
-    const config = new FakeConfigDao();
-    config.enabled = true;
-    config.host = '127.0.0.1';
-    config.port = 1; // 必失败端口
-    const projector = new PostgresProjector(config as any, new OutboxService(store), {
-      baseIntervalMs: 1000,
-      maxIntervalMs: 4000,
-    });
-    const first = await projector.runOnce();
-    expect(first.error).toBeTruthy();
-    expect(projector.intervalMs).toBe(2000);
-    const second = await projector.runOnce();
-    expect(second.error).toBeTruthy();
-    expect(projector.intervalMs).toBe(4000);
-    const third = await projector.runOnce();
-    expect(projector.intervalMs).toBe(4000); // 上限封顶
     store.close();
   });
 });

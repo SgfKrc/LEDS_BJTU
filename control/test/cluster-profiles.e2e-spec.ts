@@ -9,7 +9,6 @@ import { Test } from '@nestjs/testing';
 import { FastifyAdapter } from '@nestjs/platform-fastify';
 import { AppModule } from '../src/app';
 import { SqliteStore } from '../src/data/sqlite-store';
-import { ConfigDao } from '../src/data/config-dao';
 import { ClusterProfileRepository } from '../src/data/cluster-profile-repository';
 import { ClusterEndpointsRepository } from '../src/data/cluster-endpoints-repository';
 
@@ -65,10 +64,6 @@ describe('cluster profiles API（M4）', () => {
     sqliteStore.open();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(sqliteStore)
-      .overrideProvider(ConfigDao).useValue({
-        enabled: false, dbEnabled: () => false,
-        getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
-      })
       .compile();
     app = moduleRef.createNestApplication(new FastifyAdapter());
     await app.init();

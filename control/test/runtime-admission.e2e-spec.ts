@@ -8,7 +8,6 @@ import { AppModule } from '../src/app';
 import { JsonDetailFilter } from '../src/common/json-detail.filter';
 import { RequestIdInterceptor } from '../src/common/request-id';
 import { ArtifactStore } from '../src/data/artifact-store';
-import { ConfigDao } from '../src/data/config-dao';
 import { ModelRuntimeSidecar, RuntimeSidecarResult } from '../src/data/model-runtime-sidecar';
 import { SqliteStore } from '../src/data/sqlite-store';
 
@@ -64,15 +63,10 @@ describe('MODEL-FLEET runtime admission API', () => {
         };
       }),
     };
-    const disabledConfig = new ConfigDao({
-      host: 'localhost', port: 5432, name: 'x', user: 'postgres',
-      password: '', enabled: false, sslmode: 'prefer',
-    });
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(sqlite)
       .overrideProvider(ArtifactStore).useValue(artifacts)
       .overrideProvider(ModelRuntimeSidecar).useValue(fakeSidecar)
-      .overrideProvider(ConfigDao).useValue(disabledConfig)
       .compile();
     app = moduleRef.createNestApplication(new FastifyAdapter());
     app.useGlobalFilters(new JsonDetailFilter());

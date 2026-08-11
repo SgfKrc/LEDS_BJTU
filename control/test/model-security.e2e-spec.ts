@@ -9,7 +9,6 @@ import { ProxyAgent } from 'undici';
 import { AppModule } from '../src/app';
 import { ArtifactStore } from '../src/data/artifact-store';
 import { ClusterSettingsRepository } from '../src/data/cluster-settings-repository';
-import { ConfigDao } from '../src/data/config-dao';
 import {
   CredentialProtector, ModelCredentialStore, WindowsDpapiProtector,
 } from '../src/data/model-credential-store';
@@ -318,10 +317,6 @@ describe('MODEL-FLEET M3 credential and network security', () => {
       .overrideProvider(ModelCredentialStore).useValue(vault)
       .overrideProvider(ModelHttpClient).useValue(http)
       .overrideProvider(ModelProxyConfigRepository).useValue(proxy)
-      .overrideProvider(ConfigDao).useValue({
-        enabled: false, dbEnabled: () => false,
-        getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
-      })
       .compile();
     const app: any = moduleRef.createNestApplication(new FastifyAdapter());
     await app.init();

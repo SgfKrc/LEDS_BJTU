@@ -4,14 +4,12 @@ import { join } from 'path';
 import { Test } from '@nestjs/testing';
 import { AppModule } from '../src/app';
 import { ArtifactStore } from '../src/data/artifact-store';
-import { ConfigDao } from '../src/data/config-dao';
 import { OutboxService } from '../src/data/outbox.service';
 import {
   POSTGRES_RETIREMENT_FORMAT,
   POSTGRES_RETIREMENT_VERSION,
   PostgresRetirementService,
 } from '../src/data/postgres-retirement';
-import { PostgresProjector } from '../src/data/postgres-projector';
 import { SqliteStore } from '../src/data/sqlite-store';
 
 describe('M1.3 legacy PostgreSQL retirement', () => {
@@ -150,13 +148,12 @@ describe('M1.3 legacy PostgreSQL retirement', () => {
       .overrideProvider(SqliteStore)
       .useValue(store)
       .compile();
-    expect(() => moduleRef.get(ConfigDao, { strict: false })).toThrow();
     expect(() => moduleRef.get(OutboxService, { strict: false })).toThrow();
-    expect(() => moduleRef.get(PostgresProjector, { strict: false })).toThrow();
     await moduleRef.close();
 
     const packageJson = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
     expect(packageJson.dependencies.pg).toBeUndefined();
-    expect(packageJson.devDependencies.pg).toBeTruthy();
+    expect(packageJson.devDependencies.pg).toBeUndefined();
+    expect(packageJson.devDependencies['@types/pg']).toBeUndefined();
   });
 });

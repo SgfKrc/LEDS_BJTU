@@ -8,7 +8,6 @@ import { ClusterDiscoveryService } from '../src/data/cluster-discovery.service';
 import { ClusterProfileRepository } from '../src/data/cluster-profile-repository';
 import { ClusterProfileSelectionService } from '../src/data/cluster-profile-selection';
 import { ClusterSettingsRepository } from '../src/data/cluster-settings-repository';
-import { ConfigDao } from '../src/data/config-dao';
 import { SqliteStore } from '../src/data/sqlite-store';
 
 describe('MODEL-FLEET profile selection and discovery (MF-N5)', () => {
@@ -65,10 +64,6 @@ describe('MODEL-FLEET profile selection and discovery (MF-N5)', () => {
     store.open();
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(store)
-      .overrideProvider(ConfigDao).useValue({
-        enabled: false, dbEnabled: () => false,
-        getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
-      })
       .compile();
     const app: any = moduleRef.createNestApplication(new FastifyAdapter());
     const priorMaster = process.env.QLH_MASTER_HOST;

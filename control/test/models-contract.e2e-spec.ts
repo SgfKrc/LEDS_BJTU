@@ -20,7 +20,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
 import { SqliteStore } from '../src/data/sqlite-store';
 
 describe('control-svc models 域（阶段 3.2 模型注册表；M1 读路径切 SQLite）', () => {
@@ -29,16 +28,6 @@ describe('control-svc models 域（阶段 3.2 模型注册表；M1 读路径切 
   let tmpModelsDir: string;
   let sqlitePath: string;
   let sqliteStore: SqliteStore | null = null;
-
-  const dbDisabledDao = new ConfigDao({
-    host: 'localhost',
-    port: 5432,
-    name: 'x',
-    user: 'postgres',
-    password: '',
-    enabled: false,
-    sslmode: 'prefer',
-  });
 
   beforeEach(() => {
     tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'control-models-'));
@@ -71,8 +60,6 @@ describe('control-svc models 域（阶段 3.2 模型注册表；M1 读路径切 
     })
       .overrideProvider(SqliteStore)
       .useValue(sqliteStore as SqliteStore)
-      .overrideProvider(ConfigDao)
-      .useValue(dbDisabledDao)
       .compile();
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);

@@ -301,35 +301,15 @@ class TestMasterNodeManagement:
 
     def test_delete_offline_android_node(self, scheduler, monkeypatch):
         """删除离线 Android 节点应从内存移除。"""
-        import scheduler as scheduler_mod
-
-        class FakeDb:
-            deleted = []
-            created = []
-            def delete_node(self, nid):
-                self.deleted.append(nid)
-                return True
-            def set_layer_assignments(self, _assign):
-                pass
-            def upsert_node(self, **kwargs):
-                self.created.append(kwargs.get("node_id"))
-                pass
-
-        fake = FakeDb()
-        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: fake)
-        monkeypatch.setattr(scheduler_mod, "_db_available", True)
-
         scheduler.manual_register_node(
             "android-del", hostname="ToDelete", node_type="android",
         )
-        assert "android-del" in fake.created
         pushed = []
         scheduler._push_node_update_to_all_clients = lambda *a: pushed.append(a)
 
         result = scheduler.delete_node("android-del")
         assert result["status"] == "deleted"
         assert "android-del" not in scheduler.nodes
-        assert fake.deleted == ["android-del"]
 
     def test_delete_master_rejected(self, scheduler):
         """不能删除 master 节点。"""

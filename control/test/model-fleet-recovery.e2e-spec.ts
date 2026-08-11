@@ -4,7 +4,6 @@ import { join } from 'path';
 import { ClusterProfileRepository } from '../src/data/cluster-profile-repository';
 import { ModelRegistryEntry, ModelRegistryRepository } from '../src/data/model-registry-repository';
 import { OutboxService } from '../src/data/outbox.service';
-import { PostgresProjector } from '../src/data/postgres-projector';
 import { PullJobService } from '../src/data/pull-job.service';
 import { SqliteStore } from '../src/data/sqlite-store';
 
@@ -44,8 +43,8 @@ describe('MODEL-FLEET local recovery (MF-N2)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('persists facts across restart and drains PG backlog after recovery', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'qlh-mf-recovery-pg-'));
+  it('persists facts and legacy backlog across restart without remote projection', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'qlh-mf-recovery-local-'));
     const sqlitePath = join(dir, 'control.sqlite3');
     let store = new SqliteStore(sqlitePath);
     store.open();
@@ -78,58 +77,18 @@ describe('MODEL-FLEET local recovery (MF-N2)', () => {
     expect(new PullJobService(store).get(pull.job_id)?.state).toBe('queued');
     expect(new PullJobService(store).listActive()).toHaveLength(1);
 
-    let online = false;
-    const projectedIds = new Set<string>();
-    const fakeClientFactory = () => ({
-      async connect() {
-        if (!online) throw new Error('simulated postgres outage');
-      },
-      async query(sql: string, params?: unknown[]) {
-        if (sql.includes('CREATE TABLE')) return { rowCount: null, rows: [] };
-        const eventId = String(params?.[0]);
-        if (projectedIds.has(eventId)) return { rowCount: 0, rows: [] };
-        projectedIds.add(eventId);
-        return { rowCount: 1, rows: [] };
-      },
-      async end() { /* no-op */ },
-    });
-    const config = {
-      dbEnabled: () => true,
-      getConnectionInfo: () => ({ host: 'pg', port: 5432, db: 'qlh' }),
-    };
     let recoveredOutbox = new OutboxService(store);
-    let projector = new PostgresProjector(config as any, recoveredOutbox, {
-      baseIntervalMs: 100,
-      maxIntervalMs: 400,
-      clientFactory: fakeClientFactory as any,
-    });
-    const offline = await projector.runOnce();
-    expect(offline.error).toContain('simulated postgres outage');
     expect(recoveredOutbox.pendingCount()).toBe(1);
-    expect(projector.intervalMs).toBe(200);
 
-    new ModelRegistryRepository(store).upsert(model('model-during-outage'));
-    recoveredOutbox.enqueue('model_registry', 'created', { model_id: 'model-during-outage' });
+    new ModelRegistryRepository(store).upsert(model('model-after-restart'));
+    recoveredOutbox.enqueue('model_registry', 'created', { model_id: 'model-after-restart' });
     store.close();
 
     store = new SqliteStore(sqlitePath);
     store.open();
     recoveredOutbox = new OutboxService(store);
     expect(recoveredOutbox.pendingCount()).toBe(2);
-    expect(new ModelRegistryRepository(store).get('model-during-outage')).not.toBeNull();
-
-    online = true;
-    projector = new PostgresProjector(config as any, recoveredOutbox, {
-      baseIntervalMs: 100,
-      maxIntervalMs: 400,
-      clientFactory: fakeClientFactory as any,
-    });
-    const recovered = await projector.runOnce();
-    expect(recovered).toEqual({ projected: 2, skipped: 0 });
-    expect(recoveredOutbox.pendingCount()).toBe(0);
-    expect(projector.intervalMs).toBe(100);
-    expect((await projector.runOnce()).projected).toBe(0);
-    expect(projectedIds.size).toBe(2);
+    expect(new ModelRegistryRepository(store).get('model-after-restart')).not.toBeNull();
 
     store.close();
     rmSync(dir, { recursive: true, force: true });

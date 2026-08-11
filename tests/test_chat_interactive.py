@@ -92,7 +92,7 @@ def interactive_env(monkeypatch):
     monkeypatch.setattr(api_server, "model_manager", fake_model_manager)
     monkeypatch.setattr(
         api_server, "model_host",
-        SimpleNamespace(model_loaded=True, _db_available=False),
+        SimpleNamespace(model_loaded=True),
     )
     monkeypatch.setattr(api_server, "RUN_MODE", "local")
 
@@ -371,7 +371,7 @@ class TestRoutingPreference:
         client, calls = self._set_client_scene(interactive_env, monkeypatch)
         monkeypatch.setattr(
             api_server, "model_host",
-            SimpleNamespace(model_loaded=True, _db_available=False,
+            SimpleNamespace(model_loaded=True,
                             full_chat_execution_lock=_Lock()),
         )
         response = client.post("/api/chat/stream", json={
@@ -412,7 +412,7 @@ class TestCommitFunction:
         monkeypatch.setattr(api_server, "_local_store", fake_store)
         monkeypatch.setattr(
             api_server, "model_host",
-            SimpleNamespace(_db_available=False),
+            SimpleNamespace(),
         )
         committed = api_server._commit_interactive_history(
             "sess_l", "问", "答", {"engine": "llama_cpp"},

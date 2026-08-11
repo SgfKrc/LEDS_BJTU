@@ -51,7 +51,7 @@
     },
     {
       "source_id": "postgres_cluster_config",
-      "location": "src/db.py:cluster_config(key, value) 表",
+      "location": "已退场的历史 PostgreSQL cluster_config(key, value) 导出",
       "role": "cluster_settings",
       "id_field": "key",
       "idempotency": "key 唯一；按 key 幂等写入，不重复插入",

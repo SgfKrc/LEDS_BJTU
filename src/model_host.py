@@ -86,7 +86,7 @@ class _LazyModelManager:
 # ModelHost 自身持有（不代理给 manager）的属性名（可用 attach 扩展）
 _OWN_ATTRS = {
     "_manager", "model_loaded", "generation_config", "current_quant",
-    "full_chat_execution_lock", "_db_available",
+    "full_chat_execution_lock",
 }
 
 
@@ -105,7 +105,6 @@ class ModelHost:
         except Exception:
             _initial_quant = "int4"
         object.__setattr__(self, "current_quant", _initial_quant)
-        object.__setattr__(self, "_db_available", False)
         object.__setattr__(self, "generation_config", {
             "max_new_tokens": 1024,          # laptop 档默认值
             "tier_max_new_tokens": 1024,     # 设备档位上限（auto_configure 后更新）
