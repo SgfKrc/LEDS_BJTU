@@ -418,3 +418,127 @@ class TestSqliteCompatibility:
         set_local_user_settings(settings)
         assert get_local_user_settings() == settings
         assert get_local_save_history() is False
+
+
+# ================================================================
+# 设置/开关测试（原 db 层 requires_db 用例的 SQLite 版）
+# ================================================================
+
+class TestLocalSettings:
+    """cluster_settings 键值存储与设置/开关（M1.3 后由 local_store 承载）。"""
+
+    def test_set_and_get_setting(self, temp_store_dir):
+        from local_store import get_local_setting, set_local_setting
+
+        set_local_setting("__pytest_key__", "pytest_value_12345")
+        assert get_local_setting("__pytest_key__") == "pytest_value_12345"
+
+    def test_get_setting_default(self, temp_store_dir):
+        from local_store import get_local_setting
+
+        assert get_local_setting("__nonexistent_key_xyz__", "fallback") == "fallback"
+
+    def test_overwrite_setting(self, temp_store_dir):
+        from local_store import get_local_setting, set_local_setting
+
+        set_local_setting("__pytest_key__", "v1")
+        set_local_setting("__pytest_key__", "v2")
+        assert get_local_setting("__pytest_key__") == "v2"
+
+    def test_setting_json_round_trip(self, temp_store_dir):
+        from local_store import get_local_setting, set_local_setting
+
+        value = {"nested": [1, 2, 3], "flag": True, "text": "中文"}
+        set_local_setting("complex", value)
+        assert get_local_setting("complex") == value
+
+    def test_setting_persists_across_connections(self, temp_store_dir):
+        from local_store import get_local_setting, set_local_setting
+
+        set_local_setting("persist_key", "value")
+        # fixture 指向同一 SQLite 路径，每次调用都是新连接
+        assert get_local_setting("persist_key") == "value"
+
+    def test_user_settings_full_round_trip(self, temp_store_dir):
+        from local_store import (
+            get_local_save_history,
+            get_local_setting,
+            get_local_user_settings,
+            set_local_user_settings,
+        )
+
+        settings = {
+            "maxNewTokens": 512,
+            "temperature": 0.7,
+            "topP": 0.9,
+            "saveHistory": True,
+            "distributedInference": True,
+            "theme": "dark",
+        }
+        set_local_user_settings(settings)
+        result = get_local_user_settings()
+        assert result["maxNewTokens"] == 512
+        assert result["temperature"] == 0.7
+        assert result["topP"] == 0.9
+        assert result["saveHistory"] is True
+        assert result["distributedInference"] is True
+        assert result["theme"] == "dark"
+        # 联动专用键
+        assert get_local_save_history() is True
+        assert get_local_setting("distributed_inference_enabled") is True
+
+    def test_user_settings_empty_default(self, temp_store_dir):
+        from local_store import get_local_user_settings
+
+        assert get_local_user_settings() == {}
+
+    def test_user_settings_overwrite(self, temp_store_dir):
+        from local_store import get_local_user_settings, set_local_user_settings
+
+        set_local_user_settings({"a": 1, "b": 2})
+        set_local_user_settings({"c": 3})
+        assert get_local_user_settings() == {"c": 3}
+
+    def test_user_settings_persist_across_reads(self, temp_store_dir):
+        from local_store import get_local_user_settings, set_local_user_settings
+
+        settings = {"token": 1024, "temp": 0.5}
+        set_local_user_settings(settings)
+        assert get_local_user_settings() == settings
+
+    def test_save_history_default_true(self, temp_store_dir):
+        from local_store import get_local_save_history
+
+        assert get_local_save_history() is True
+
+    def test_save_history_set_and_restore(self, temp_store_dir):
+        from local_store import get_local_save_history, set_local_setting
+
+        set_local_setting("save_history", True)
+        assert get_local_save_history() is True
+        set_local_setting("save_history", False)
+        assert get_local_save_history() is False
+
+    def test_save_history_via_user_settings_linkage(self, temp_store_dir):
+        from local_store import get_local_save_history, set_local_user_settings
+
+        set_local_user_settings({"saveHistory": False})
+        assert get_local_save_history() is False
+        set_local_user_settings({"saveHistory": True})
+        assert get_local_save_history() is True
+
+    def test_distributed_inference_persists(self, temp_store_dir):
+        from local_store import get_local_setting, set_local_setting
+
+        set_local_setting("distributed_inference_enabled", False)
+        assert get_local_setting("distributed_inference_enabled") is False
+        set_local_setting("distributed_inference_enabled", True)
+        assert get_local_setting("distributed_inference_enabled") is True
+
+    def test_distributed_inference_via_user_settings_linkage(self, temp_store_dir):
+        from local_store import get_local_setting, set_local_user_settings
+
+        set_local_user_settings({"distributedInference": False})
+        assert get_local_setting("distributed_inference_enabled") is False
+        set_local_user_settings({"distributedInference": True})
+        assert get_local_setting("distributed_inference_enabled") is True
