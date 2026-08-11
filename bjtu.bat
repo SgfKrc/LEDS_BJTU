@@ -44,6 +44,10 @@ if /i "%~1"=="diagnostics" goto :launcher_n4
 if /i "%~1"=="verify" goto :launcher_n4
 if /i "%~1"=="diagnose" goto :launcher_n4
 if /i "%~1"=="repair" goto :launcher_n4
+if /i "%~1"=="data-status" goto :launcher_n4
+if /i "%~1"=="retain-data" goto :launcher_n4
+if /i "%~1"=="reassociate-data" goto :launcher_n4
+if /i "%~1"=="reinstall" goto :launcher_n4
 
 rem ---- unified launcher modes ----
 if /i "%~1"=="launcher" goto :launcher
@@ -57,8 +61,13 @@ exit /b %errorlevel%
 if /i "%~1"=="--help" goto :help
 if /i "%~1"=="-h" goto :help
 if /i "%~1"=="chat" (
-    echo [ERROR] 当前安装包未携带 Textual 聊天页，请使用项目环境中的 bjtu chat。
-    exit /b 2
+    if not exist "%~dp0QLH-TUI-Chat\QLH-TUI-Chat.exe" (
+        echo [ERROR] 当前安装不完整：缺少 QLH-TUI-Chat\QLH-TUI-Chat.exe。
+        echo         请运行 bjtu verify --level deep，或使用受信任安装包修复安装。
+        exit /b 2
+    )
+    "%~dp0QLH-TUI-Chat\QLH-TUI-Chat.exe" %2 %3 %4 %5 %6
+    exit /b %errorlevel%
 )
 set "QLH_LAUNCHER_EXE="
 if exist "QLH-Launcher.exe" set "QLH_LAUNCHER_EXE=%CD%\QLH-Launcher.exe"
@@ -81,6 +90,10 @@ if /i "%~1"=="diagnostics" goto :packaged_launcher_n4
 if /i "%~1"=="verify" goto :packaged_launcher_n4
 if /i "%~1"=="diagnose" goto :packaged_launcher_n4
 if /i "%~1"=="repair" goto :packaged_launcher_n4
+if /i "%~1"=="data-status" goto :packaged_launcher_n4
+if /i "%~1"=="retain-data" goto :packaged_launcher_n4
+if /i "%~1"=="reassociate-data" goto :packaged_launcher_n4
+if /i "%~1"=="reinstall" goto :packaged_launcher_n4
 if /i "%~1"=="version" (
     if exist "version.txt" type version.txt
     if not exist "version.txt" echo unknown
@@ -116,6 +129,22 @@ if /i "%~1"=="diagnose" (
 )
 if /i "%~1"=="repair" (
     echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu repair。
+    exit /b 2
+)
+if /i "%~1"=="data-status" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu data-status。
+    exit /b 2
+)
+if /i "%~1"=="retain-data" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu retain-data。
+    exit /b 2
+)
+if /i "%~1"=="reassociate-data" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu reassociate-data。
+    exit /b 2
+)
+if /i "%~1"=="reinstall" (
+    echo [ERROR] 独立 QLH Launcher 尚未安装，无法使用 bjtu reinstall。
     exit /b 2
 )
 if /i "%~1"=="version" (
@@ -193,12 +222,15 @@ echo QLH BJTU 统一入口:
 echo   bjtu launcher   启动选择页（普通界面 / TUI）
 echo   bjtu ui         直接启动普通 Web/原生界面
 echo   bjtu tui        启动后端并进入 TUI 管理界面
-echo   bjtu chat       进入终端对话页
+echo   bjtu chat       进入终端对话页（安装包内置）
 echo   bjtu update     检查更新源中的匹配安装包
 echo   bjtu version    显示当前应用版本
 echo   bjtu verify [--level quick^|full^|deep] [--json]  校验已安装程序文件
 echo   bjtu diagnose [--json]  输出只读故障诊断与人工处理建议
 echo   bjtu repair [--json]    修复当前版本中损坏的签名程序文件
+echo   bjtu retain-data --yes  保留用户数据并准备卸载
+echo   bjtu reassociate-data --yes  将保留数据重新关联到当前安装
+echo   bjtu reinstall --yes    保留数据并下载已验签安装包
 echo   bjtu status     执行 TUI 单命令（不自动启动后端）
 echo.
 set "PYTHON_CMD=python"

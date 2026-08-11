@@ -1118,6 +1118,7 @@ class NodeDetail(BaseModel):
     task_count: int = 0
     error_count: int = 0
     is_available: bool = False
+    network_path: Optional[dict] = None
 
 
 class ClusterStatus(BaseModel):
@@ -1128,6 +1129,7 @@ class ClusterStatus(BaseModel):
     tcp_server: Optional[dict] = None
     pipeline: Optional[dict] = None
     pipeline_queue: Optional[dict] = None
+    network_path: Optional[dict] = None
 
 
 class UpdateMaxNodesRequest(BaseModel):
@@ -6632,7 +6634,11 @@ async def unregister_model(model_id: str):
 # 集群管理 API
 # ============================================================
 
-@app.get("/api/cluster/status", response_model=ClusterStatus)
+@app.get(
+    "/api/cluster/status",
+    response_model=ClusterStatus,
+    response_model_exclude_unset=True,
+)
 async def get_cluster_status():
     """
     获取集群整体状态。

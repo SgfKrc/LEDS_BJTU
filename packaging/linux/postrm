@@ -2,6 +2,9 @@
 set -e
 
 APP_DIR="/opt/qlh-edge-inference"
+ENV_STATE_DIR="/etc/qlh-edge-inference"
+ENV_STATE_FILE="$ENV_STATE_DIR/env-register"
+ENV_PROFILE_FILE="/etc/profile.d/qlh.sh"
 
 case "$1" in
     remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
@@ -18,16 +21,20 @@ echo "QLH 边缘推理系统 — 卸载后清理..."
 if [ "$1" != "upgrade" ] && [ "$1" != "failed-upgrade" ]; then
     rm -f /usr/local/bin/qlh-launcher
     rm -f /usr/local/bin/bjtu
+    rm -f "$ENV_PROFILE_FILE"
 fi
 
-# purge: 完全清理（包括模型文件）
+# purge only removes the package tree.  UP-N6.4 data was retained externally;
+# deletion of user-owned data requires a separate explicit workflow.
 if [ "$1" = "purge" ]; then
-    echo "purge: 完全清理 $APP_DIR ..."
+    echo "purge: 清理程序目录 $APP_DIR ..."
     rm -rf "$APP_DIR"
+    rm -f "$ENV_STATE_FILE"
+    rmdir "$ENV_STATE_DIR" 2>/dev/null || true
 fi
 
 echo "QLH 边缘推理系统已卸载。"
 if [ "$1" != "purge" ]; then
-    echo "注意: $APP_DIR/models 中的模型文件已保留。"
-    echo "如需完全删除，请手动运行: sudo rm -rf $APP_DIR"
+    echo "注意: 用户数据已保留在 /var/lib/qlh-edge-inference/data。"
+    echo "重装同一 QLH 包会自动重新关联这些数据。"
 fi

@@ -73,8 +73,37 @@ REM ★ 从项目根目录运行，输出到 dist/QLH-Edge-Inference/
 "%PYTHON%" -m PyInstaller packaging\qlh-cpu.spec --noconfirm
 if errorlevel 1 exit /b 1
 
+REM T9.6: build the companion console before signing the application tree.
+"%PYTHON%" -m PyInstaller packaging\qlh-tui-chat.spec --noconfirm ^
+    --distpath "dist\QLH-Edge-Inference" ^
+    --workpath "build\qlh-tui-chat-cpu"
+if errorlevel 1 exit /b 1
+if not exist "dist\QLH-Edge-Inference\QLH-TUI-Chat\QLH-TUI-Chat.exe" exit /b 1
+
+if not exist "dist\QLH-Edge-Inference\docs" mkdir "dist\QLH-Edge-Inference\docs"
+if not exist "dist\QLH-Edge-Inference\tools" mkdir "dist\QLH-Edge-Inference\tools"
+copy /y "bjtu.bat" "dist\QLH-Edge-Inference\bjtu.bat" >nul
+if errorlevel 1 exit /b 1
+copy /y "packaging\version.txt" "dist\QLH-Edge-Inference\version.txt" >nul
+if errorlevel 1 exit /b 1
+copy /y "README.md" "dist\QLH-Edge-Inference\docs\README.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "docs\整体架构.md" "dist\QLH-Edge-Inference\docs\整体架构.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "docs\模块接口说明.md" "dist\QLH-Edge-Inference\docs\模块接口说明.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "docs\核心技术原理.md" "dist\QLH-Edge-Inference\docs\核心技术原理.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "packaging\scripts\convert_to_gguf.py" "dist\QLH-Edge-Inference\tools\convert_to_gguf.py" >nul
+if errorlevel 1 exit /b 1
+
 if exist "dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
     if not exist "dist\QLH-Edge-Inference\tools" mkdir "dist\QLH-Edge-Inference\tools"
+    "%PYTHON%" -m PyInstaller packaging\qlh-data-retention.spec --noconfirm ^
+        --distpath "dist\QLH-Edge-Inference\tools" ^
+        --workpath "build\qlh-data-retention-cpu"
+    if errorlevel 1 exit /b 1
+    if not exist "dist\QLH-Edge-Inference\tools\QLH-Data-Retention.exe" exit /b 1
     "%PYTHON%" -m PyInstaller packaging\qlh-install-manifest.spec --noconfirm ^
         --distpath "dist\QLH-Edge-Inference\tools" ^
         --workpath "build\qlh-install-manifest-cpu"
@@ -90,20 +119,15 @@ if exist "dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
         --variant cpu ^
         --package-kind application ^
         --key "!QLH_SIGNING_KEY!" ^
-        --trusted-keys-dir "packaging\pubkeys" ^
-        --include "bjtu.bat=bjtu.bat" ^
-        --include "packaging\version.txt=version.txt" ^
-        --include "README.md=docs/README.md" ^
-        --include "docs\整体架构.md=docs/整体架构.md" ^
-        --include "docs\模块接口说明.md=docs/模块接口说明.md" ^
-        --include "docs\核心技术原理.md=docs/核心技术原理.md" ^
-        --include "packaging\scripts\convert_to_gguf.py=tools/convert_to_gguf.py"
+        --trusted-keys-dir "packaging\pubkeys"
     if errorlevel 1 exit /b 1
     echo.
     echo ============================================
-    echo   打包完成！
-    echo   输出目录: dist\QLH-Edge-Inference\
-    echo   可执行文件: QLH-Edge-Inference.exe
+    echo   Build complete.
+    echo   Output: dist\QLH-Edge-Inference\
+    echo   Application: QLH-Edge-Inference.exe
+    echo   TUI chat: QLH-TUI-Chat\QLH-TUI-Chat.exe
+    echo   Data retention: tools\QLH-Data-Retention.exe
     echo ============================================
 ) else (
     echo.
@@ -113,4 +137,5 @@ if exist "dist\QLH-Edge-Inference\QLH-Edge-Inference.exe" (
 )
 
 endlocal
-pause
+if not defined QLH_NONINTERACTIVE pause
+exit /b 0

@@ -33,6 +33,7 @@ _BUNDLE_MODULES = (
     "qlh_launcher.py",
     "diagnose.py",
     "repair.py",
+    "data_retention.py",
     "update_core.py",
     "updater.py",
     "signing.py",

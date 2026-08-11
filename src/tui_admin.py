@@ -58,6 +58,47 @@ BACKEND_HINT = "请先在项目根目录启动后端: python src/api_server.py �
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 
+PATH_KIND_LABELS = {
+    "lan_direct": "LAN直连",
+    "public_tcp_direct": "公网直连",
+    "tailscale_direct": "Tailscale直连",
+    "derp": "DERP中继",
+    "gateway_relay": "网关中继",
+    "unknown": "未知",
+}
+PATH_AVAILABILITY_LABELS = {
+    "available": "可用",
+    "degraded": "降级",
+    "unknown": "未知",
+}
+
+
+def format_network_path(path) -> tuple[str, str]:
+    """Format only allowlisted path aggregates for terminal display."""
+    if not isinstance(path, dict):
+        return "—", "—"
+    path_label = PATH_KIND_LABELS.get(path.get("path_kind"), "未知")
+    availability = PATH_AVAILABILITY_LABELS.get(
+        path.get("availability"), "未知"
+    )
+    quality = path.get("quality") if isinstance(path.get("quality"), dict) else {}
+
+    def metric(name):
+        value = quality.get(name)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    p95 = metric("rtt_ms_p95")
+    jitter = metric("jitter_ms_p95")
+    stalls = metric("stalls_in_window")
+    reconnects = metric("reconnects_in_window")
+    quality_label = "P95 %s  J %s  S%s  R%s" % (
+        ("%.0fms" % p95) if p95 is not None else "—",
+        ("%.0fms" % jitter) if jitter is not None else "—",
+        int(stalls) if stalls is not None else "—",
+        int(reconnects) if reconnects is not None else "—",
+    )
+    return "%s/%s" % (path_label, availability), quality_label
+
 
 # ============================================================
 # 一、CJK 显示宽度处理（East Asian Width）
@@ -764,17 +805,19 @@ class NodesScreen(Screen):
         out.append(("", ""))
         rows = []
         for n in (nd.get("nodes") or []):
+            path_label, quality_label = format_network_path(n.get("network_path"))
             rows.append([
                 n.get("node_id", ""), role_cn(n.get("role", "")),
                 n.get("node_type", ""), state_cn(n.get("state", "")),
                 n.get("address", "") or "—", n.get("network_type", ""),
                 "%.0f" % float(n.get("avg_rtt_ms") or 0),
+                path_label, quality_label,
                 n.get("task_count", 0), n.get("error_count", 0),
                 fmt_age(n.get("last_heartbeat")),
             ])
         if rows:
             for ln in make_table(
-                    ["节点ID", "角色", "类型", "状态", "地址", "网络", "RTT", "任务", "错误", "心跳"],
+                    ["节点ID", "角色", "类型", "状态", "地址", "网络", "RTT", "路径", "质量", "任务", "错误", "心跳"],
                     rows, max_width=width - 2):
                 out.append(("", ln))
         else:
@@ -1738,14 +1781,16 @@ def cmd_nodes(app, args, opts):
     lines.append("")
     rows = []
     for n in (nd.get("nodes") or []):
+        path_label, quality_label = format_network_path(n.get("network_path"))
         rows.append([
             n.get("node_id", ""), role_cn(n.get("role", "")), n.get("node_type", ""),
             state_cn(n.get("state", "")), n.get("address", "") or "—",
-            n.get("network_type", ""), n.get("task_count", 0),
+            n.get("network_type", ""), path_label, quality_label,
+            n.get("task_count", 0),
             n.get("error_count", 0), fmt_age(n.get("last_heartbeat")),
         ])
     if rows:
-        lines.extend(make_table(["节点ID", "角色", "类型", "状态", "地址", "网络", "任务", "错误", "心跳"],
+        lines.extend(make_table(["节点ID", "角色", "类型", "状态", "地址", "网络", "路径", "质量", "任务", "错误", "心跳"],
                                 rows, max_width=shutil.get_terminal_size(fallback=(100, 30)).columns - 2))
     else:
         lines.append("（暂无节点记录）")

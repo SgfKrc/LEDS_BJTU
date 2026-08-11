@@ -10,7 +10,7 @@
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 >
-> 最新复核（2026-08-08）：当前仓库正式 Python 基线仍为 1650 项中的 `1641 passed / 7 skipped / 2 failed`；两个失败固定为 v2 测试调用 `_validate_capabilities()` 缺少 `version`，L0-5 尚未关闭。临时补齐 `version=2` 后可验证 `1643 passed / 7 skipped / 0 failed`，但修复尚未落地。control-svc 全量 **`264/264 passed`**（含 MODEL-FLEET M2 catalog/runtime sidecar/准入接线实跑、M3 Windows 安全门、用户代理和真实小工件续传），gateway `101 passed`；DeepSeek 7B GGUF 已由本地 API 重试得到带运行时指纹的 `ready` 并通过部署 prepare，Safetensors 因本机资源安全余量不足为 `resource_rejected`；pull/import 后置准入、状态查询/重试/失效、部署指纹过滤、DPAPI、代理优先级、gated 双重门、公开小工件 download/Range/受控中断恢复和生产依赖 0 vulnerability 已验证。真实模型权重完整 pull、Safetensors 适配主机、gated 账号、PG 长时、Tailscale/PC Worker、主应用干净机发布和 Android 真机回归仍待完成。
+> 最新复核（2026-08-11）：Python 全量回归 **`1836 passed / 33 skipped / 0 failed`**；T9.6-R2 已在当前 Windows 开发机用隔离目录实际完成 CPU/CUDA Setup 安装、安装期 deep、`bjtu chat --help`、冻结 EXE fixture 启动、五类用户数据卸载保留与重装关联。`UP-N6.4W` 进一步完成同卷原子改名与跨卷校验复制双路径：冻结 helper 和 CPU Inno Setup 均完成 `G:` 应用根到 `C:` 用户根的保留/回迁，失败恢复由外置 journal 驱动，整批目标提交前不删除源目录。control-svc 最新认证/账户管理基线 `317/317`、gateway `113/113`、前端 `30/30`、浏览器 `5/5` 均通过。Windows 外部干净机/安装包真实模型会话、Linux `.deb`（当前 WSL 原生工具链不足）、真实 Tailscale/双机和 Android 真机回归仍待最终联合验收。
 > 2026-08-06 复核：Python 全量回归 **`1416 passed / 4 skipped`**（约 3 min），control-svc 微服务套件 **205 passed**（含 MODEL-FLEET M0-M4：契约/本地事实源/工件库/一键 pull/多集群档案），SD 质量门与 T9 聊天页相关测试全绿。SD 1.5 图像工作区（文生图/图生图/IP-Adapter reference）自动门与**双人目视审核均通过**（2026-08-06，Siegfried Kkm./浅草爱音，5 份报告 status=passed）；`bjtu chat` T9 聊天页 T9.0-T9.5 完成（终端走查 54/54）；微服务改造阶段 3.2 完成（control-svc 136/136）。2026-08-05 复核：Python 全量回归 **`1303 passed / 23 skipped`**（1326 项），SD/API 专项 155/155、前端 15/15、网关 100/100；90s DreamBooth 十种子自动门 10/10。历史复核链：2026-08-03 `1112 passed / 3 skipped`（Android Full/Lite 构建成功、TUI 契约 44/44）；2026-07-31 `1066 passed / 23 skipped`；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。
 
 ---
@@ -46,7 +46,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
-| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（可选依赖 Textual，见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
+| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（安装包内置 Textual，源码模式仍可隔离安装；见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
 | 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门、Edge 链路与双人目视均已通过（2026-08-07）；正式离线资产包和分布式图像仍待完成 → [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
@@ -119,7 +119,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── external_provider.py       # ★ 外部推理服务 Provider + 数据作用域门控（路线 B）
 │   ├── speculative.py             # ★ draft-verify 投机解码（默认关闭的实验路径，路线 C）
 │   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
-│   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx，可选依赖）
+│   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx；安装包内置，源码可选）
 │   ├── tui_sse.py / tui_shared.py # T9 SSE 增量解析器与共享层（端点/命令/metrics）
 │   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存页管理、动态分配）
 │   ├── tcp_comm.py                # TCP主从通信（长连接、心跳、封包解包、张量序列化）
@@ -163,6 +163,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android + Linux 安装包）
 │   ├── qlh-cpu.spec               # PyInstaller 规格文件（集显版）
 │   ├── qlh-cuda.spec              # PyInstaller 规格文件（独显版，CUDA + CPU 回退）
+│   ├── qlh-tui-chat.spec          # Textual 聊天页控制台伴随程序（主包内置）
 │   ├── setup.iss                  # Inno Setup 安装脚本 集显版
 │   ├── setup-cuda.iss             # Inno Setup 安装脚本 独显版
 │   ├── requirements-cpu.txt       # CPU-only 依赖清单
@@ -180,7 +181,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-06 全量回归 1416 passed / 4 skipped）
+├── tests/                         # 单元测试（2026-08-11 全量回归 1836 passed / 33 skipped）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -483,7 +484,7 @@ bjtu                                        # 全局命令：任意终端输入�
 start_tui.bat                               # Windows（双击或命令行）
 ```
 
-**安装全局 `bjtu` 命令**（推荐）：Windows 把项目根加入 PATH（`setx PATH "%PATH%;<项目根>"` 或图形界面）；Linux/macOS `sudo ln -s <项目根>/bjtu.sh /usr/local/bin/bjtu`。
+**安装全局 `bjtu` 命令**（推荐）：打包版 Windows 在安装向导中选择 PATH 注册（静默参数 `/ENVREG=0|1`）；Linux `.deb` 始终安装 `/usr/local/bin/bjtu`，可用 `QLH_ENVREG=1` 或 `qlh-env-register enable` 额外注册 `/opt` PATH。源码检出时，Windows 建议在图形环境变量界面添加项目根（避免 `setx` 重写过长 PATH）；Linux/macOS 可用 `sudo ln -s <项目根>/bjtu.sh /usr/local/bin/bjtu`。
 
 **手动/高级用法**（后端未运行时先 `python src/api_server.py`）：
 
@@ -509,7 +510,7 @@ bjtu --help                                 # 查看完整命令集与启动参�
 /shutdown                 # 优雅退出：后端清理资源后退出，TUI 随后退出
 ```
 
-完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（T1-T8 现行·Active；T9.0-T9.5 已完成，终端走查 54/54；T9.6 Launcher/BJTU 接线已完成，主应用聊天依赖、分布式真机验收与默认入口仍待）。
+完整参数表、`QLH_BACKEND_PORT` 覆盖、故障排查与自动化走查见 **[TUI 使用指南](docs/TUI使用指南.md)**；**27 条 `/` 命令的完整参考（别名/参数/选项/退出语义/菜单对应）见 [TUI 指令集](docs/TUI指令集.md)**；网关契约与测试见 [TUI 适配实施计划](docs/TUI适配实施计划.md)（T1-T8 现行·Active；T9.0-T9.5 已完成，终端走查 54/54；T9.6-R2 Windows 开发机实装门及 UP-N6.4W 跨卷保留门已通过，外部干净机/Linux/真实模型会话与默认入口仍待）。
 
 ### 外部算力辅助（三条路线，均默认关闭）
 
@@ -794,7 +795,7 @@ python serve.py
 - [三种分布式拆分细化实施方案](docs/三种分布式拆分细化实施方案.md) — PyTorch 层间待测试项、任务链和张量并行的协议、容错与实施阶段
 - [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分可行性
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
-- Android llama.cpp 已迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并待手动删除
+- Android llama.cpp 已迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并移入 `docs_to_delete/`
 - [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC Full Worker v2（TC-N2.4 物理设备准入未过）
 - [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
@@ -810,7 +811,7 @@ python serve.py
 ### 工程文档
 
 - [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
-- [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5 已完成，终端走查 54/54，`bjtu chat` 可用，T9.6 Launcher/BJTU 接线已完成；主应用聊天依赖、分布式真机验收与默认入口仍待（L4 Candidate）
+- [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5、T9.6 接线、T9.6-R2 Windows 开发机实装门和 UP-N6.4W 跨卷保留门已完成；外部干净机/Linux/真实模型会话、分布式真机与默认入口仍待（L4 Candidate）
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程

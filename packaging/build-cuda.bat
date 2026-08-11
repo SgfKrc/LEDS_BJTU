@@ -32,10 +32,10 @@ if not exist "packaging\version.txt" (
     exit /b 1
 )
 set /p APP_VERSION=<"packaging\version.txt"
-"%PYTHON%" -c "import torch; assert torch.cuda.is_available(), 'CUDA torch not found'"
+"%PYTHON%" -c "import sys, torch; print('CUDA runtime:', torch.version.cuda); sys.exit(0 if torch.version.cuda else 1)"
 if errorlevel 1 (
-    echo   [错误] 需要 CUDA 版 torch！
-    echo   请先安装: pip install torch  (默认带 CUDA 12.x)
+    echo   [错误] 需要带 CUDA runtime 的 torch！
+    echo   请先安装项目锁定的 CUDA 版 torch。
     echo   当前 torch 版本:
     "%PYTHON%" -c "import torch; print(torch.__version__)"
     pause
@@ -81,8 +81,37 @@ echo   这可能需要 10-20 分钟，请耐心等待...
 "%PYTHON%" -m PyInstaller packaging\qlh-cuda.spec --noconfirm
 if errorlevel 1 exit /b 1
 
+REM T9.6: build the companion console before signing the application tree.
+"%PYTHON%" -m PyInstaller packaging\qlh-tui-chat.spec --noconfirm ^
+    --distpath "dist\QLH-Edge-Inference-CUDA" ^
+    --workpath "build\qlh-tui-chat-cuda"
+if errorlevel 1 exit /b 1
+if not exist "dist\QLH-Edge-Inference-CUDA\QLH-TUI-Chat\QLH-TUI-Chat.exe" exit /b 1
+
+if not exist "dist\QLH-Edge-Inference-CUDA\docs" mkdir "dist\QLH-Edge-Inference-CUDA\docs"
+if not exist "dist\QLH-Edge-Inference-CUDA\tools" mkdir "dist\QLH-Edge-Inference-CUDA\tools"
+copy /y "bjtu.bat" "dist\QLH-Edge-Inference-CUDA\bjtu.bat" >nul
+if errorlevel 1 exit /b 1
+copy /y "packaging\version.txt" "dist\QLH-Edge-Inference-CUDA\version.txt" >nul
+if errorlevel 1 exit /b 1
+copy /y "README.md" "dist\QLH-Edge-Inference-CUDA\docs\README.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "docs\整体架构.md" "dist\QLH-Edge-Inference-CUDA\docs\整体架构.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "docs\模块接口说明.md" "dist\QLH-Edge-Inference-CUDA\docs\模块接口说明.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "docs\核心技术原理.md" "dist\QLH-Edge-Inference-CUDA\docs\核心技术原理.md" >nul
+if errorlevel 1 exit /b 1
+copy /y "packaging\scripts\convert_to_gguf.py" "dist\QLH-Edge-Inference-CUDA\tools\convert_to_gguf.py" >nul
+if errorlevel 1 exit /b 1
+
 if exist "dist\QLH-Edge-Inference-CUDA\QLH-Edge-Inference.exe" (
     if not exist "dist\QLH-Edge-Inference-CUDA\tools" mkdir "dist\QLH-Edge-Inference-CUDA\tools"
+    "%PYTHON%" -m PyInstaller packaging\qlh-data-retention.spec --noconfirm ^
+        --distpath "dist\QLH-Edge-Inference-CUDA\tools" ^
+        --workpath "build\qlh-data-retention-cuda"
+    if errorlevel 1 exit /b 1
+    if not exist "dist\QLH-Edge-Inference-CUDA\tools\QLH-Data-Retention.exe" exit /b 1
     "%PYTHON%" -m PyInstaller packaging\qlh-install-manifest.spec --noconfirm ^
         --distpath "dist\QLH-Edge-Inference-CUDA\tools" ^
         --workpath "build\qlh-install-manifest-cuda"
@@ -98,20 +127,15 @@ if exist "dist\QLH-Edge-Inference-CUDA\QLH-Edge-Inference.exe" (
         --variant cuda ^
         --package-kind application ^
         --key "!QLH_SIGNING_KEY!" ^
-        --trusted-keys-dir "packaging\pubkeys" ^
-        --include "bjtu.bat=bjtu.bat" ^
-        --include "packaging\version.txt=version.txt" ^
-        --include "README.md=docs/README.md" ^
-        --include "docs\整体架构.md=docs/整体架构.md" ^
-        --include "docs\模块接口说明.md=docs/模块接口说明.md" ^
-        --include "docs\核心技术原理.md=docs/核心技术原理.md" ^
-        --include "packaging\scripts\convert_to_gguf.py=tools/convert_to_gguf.py"
+        --trusted-keys-dir "packaging\pubkeys"
     if errorlevel 1 exit /b 1
     echo.
     echo ============================================
-    echo   打包完成！
-    echo   输出目录: dist\QLH-Edge-Inference-CUDA\
-    echo   可执行文件: QLH-Edge-Inference.exe
+    echo   Build complete.
+    echo   Output: dist\QLH-Edge-Inference-CUDA\
+    echo   Application: QLH-Edge-Inference.exe
+    echo   TUI chat: QLH-TUI-Chat\QLH-TUI-Chat.exe
+    echo   Data retention: tools\QLH-Data-Retention.exe
     echo ============================================
 ) else (
     echo.
@@ -121,4 +145,5 @@ if exist "dist\QLH-Edge-Inference-CUDA\QLH-Edge-Inference.exe" (
 )
 
 endlocal
-pause
+if not defined QLH_NONINTERACTIVE pause
+exit /b 0

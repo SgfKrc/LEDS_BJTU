@@ -40,6 +40,12 @@ const NETWORK_CLASSES = {
   wifi: 'net-wifi', ethernet: 'net-eth', mobile: 'net-mobile',
   vpn: 'net-vpn', other: 'net-other', localhost: 'net-local', unknown: 'net-unknown',
 };
+const PATH_LABELS = {
+  lan_direct: 'LAN 直连', public_tcp_direct: '公网直连',
+  tailscale_direct: 'Tailscale 直连', derp: 'DERP 中继',
+  gateway_relay: '网关中继', unknown: '未知',
+};
+const PATH_AVAILABILITY = { available: '可用', degraded: '降级', unknown: '未知' };
 
 function formatTime(ts) {
   if (!ts) return '—';
@@ -57,6 +63,18 @@ function formatRTT(rttMs) {
   if (rttMs < 1) return '<1ms';
   if (rttMs < 10) return `${rttMs.toFixed(1)}ms`;
   return `${Math.round(rttMs)}ms`;
+}
+function formatNetworkPath(path) {
+  if (!path || typeof path !== 'object') return null;
+  const quality = path.quality && typeof path.quality === 'object' ? path.quality : {};
+  const metric = (value, suffix = '') => (
+    Number.isFinite(value) && value >= 0 ? `${Math.round(value)}${suffix}` : '—'
+  );
+  return {
+    label: PATH_LABELS[path.path_kind] || PATH_LABELS.unknown,
+    availability: PATH_AVAILABILITY[path.availability] || PATH_AVAILABILITY.unknown,
+    quality: `P95 ${metric(quality.rtt_ms_p95, 'ms')} · J ${metric(quality.jitter_ms_p95, 'ms')} · S${metric(quality.stalls_in_window)} · R${metric(quality.reconnects_in_window)}`,
+  };
 }
 function isTcpActive(clientInfo) {
   // TCP 判定为活跃：最近一次心跳在 10 秒内
@@ -1350,6 +1368,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                   <th>🔗 连接</th>
                   <th>⏱ 延迟</th>
                   <th>🌐 网络</th>
+                  <th>路径质量</th>
                   <th>地址</th>
                   <th>主机名</th>
                   <th>在线时长</th>
@@ -1361,7 +1380,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
               <tbody>
                 {filteredNodeList.length === 0 ? (
                   <tr>
-                    <td colSpan={isMaster ? 13 : 12} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
+                    <td colSpan={isMaster ? 14 : 13} style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}>
                       {isMaster ? '暂无已注册的从节点，使用上方「注册新节点」添加' : '尚未连接到主节点，请在上方输入主节点地址'}
                     </td>
                   </tr>
@@ -1373,6 +1392,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                     const isAndroidThin = node.node_type === 'android' && node.device_info?.connection_type === 'http_thin';
                     const netLabel = NETWORK_LABELS[node.network_type] || NETWORK_LABELS.unknown;
                     const netClass = NETWORK_CLASSES[node.network_type] || NETWORK_CLASSES.unknown;
+                    const pathInfo = formatNetworkPath(node.network_path);
 
                     // TCP 连接状态
                     const tcpDetail = status?.tcp_server?.client_details?.[node.node_id];
@@ -1392,7 +1412,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                       }
                     } else if (!isMaster && isMasterNode) {
                       // 从节点视角：显示到主节点的 RTT
-                      rttMs = status?.tcp_client?.avg_rtt_ms;
+                      rttMs = status?.network_path?.quality?.avg_rtt_ms
+                        ?? status?.tcp_client?.avg_rtt_ms;
                       rttDisplay = formatRTT(rttMs);
                     }
 
@@ -1455,6 +1476,14 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                           </span>
                         </td>
                         <td><span className={`network-badge ${netClass}`}>{netLabel}</span></td>
+                        <td>
+                          {pathInfo ? (
+                            <div className="path-quality-cell">
+                              <span className="path-quality-title">{pathInfo.label} · {pathInfo.availability}</span>
+                              <span className="path-quality-metrics">{pathInfo.quality}</span>
+                            </div>
+                          ) : '—'}
+                        </td>
                         <td className="mono-cell">
                           {isAndroidThin ? 'HTTP thin client' : (node.address || '—')}
                         </td>

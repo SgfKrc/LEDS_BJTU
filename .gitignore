@@ -86,3 +86,6 @@ reasonix.toml
 tests/simulation/results/
 .venv-tui/
 control/qlh-control.sqlite3*
+
+# Retired docs (moved out of docs/)
+docs_to_delete/

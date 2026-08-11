@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+APP_DIR="/opt/qlh-edge-inference"
+DATA_ROOT="/var/lib/qlh-edge-inference/data"
+
 case "$1" in
     remove|purge|upgrade|deconfigure)
         ;;
@@ -25,6 +28,17 @@ if [ "$1" != "upgrade" ]; then
     if command -v pkill &> /dev/null; then
         pkill -f "uvicorn.*api_server" || true
     fi
+
+    # UP-N6.4: refuse uninstall if the constrained data handoff cannot finish.
+    # This operation never merges directories or reads user-data contents.
+    RETENTION_TOOL="$APP_DIR/bin/data_retention.py"
+    RETENTION_PYTHON="$APP_DIR/venv/bin/python3"
+    if [ ! -x "$RETENTION_PYTHON" ] || [ ! -f "$RETENTION_TOOL" ]; then
+        echo "错误: 数据保留工具缺失；已取消卸载以保护用户数据。" >&2
+        exit 1
+    fi
+    QLH_DATA_DIR="$DATA_ROOT" "$RETENTION_PYTHON" "$RETENTION_TOOL" retain \
+        --root "$APP_DIR" --yes --json
 fi
 
 echo "卸载前清理完成。"

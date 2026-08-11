@@ -35,6 +35,7 @@ _SLOTS = ("a", "b")
 _MAINTENANCE_COMMANDS = {
     "check", "download", "install", "launcher-status", "launcher-stage",
     "launcher-activate", "launcher-rollback", "launcher-recover", "diagnostics", "verify", "diagnose", "repair",
+    "data-status", "retain-data", "reassociate-data", "reinstall",
     "version-status", "version-stage", "version-activate", "version-rollback",
     "version-recover",
 }
