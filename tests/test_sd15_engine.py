@@ -17,6 +17,54 @@ from diffusion.artifacts import DiffusionArtifact
 from diffusion.service import SD15EditRequest
 
 
+@pytest.fixture
+def diffusers_module(monkeypatch):
+    """提供 diffusers 模块：真实存在则原样返回，否则注入最小 fake 命名空间。
+
+    这些用例只把 diffusers 当命名空间替换其类以验证引擎接线，不依赖真实实现；
+    因此默认环境（无 diffusers）也可执行，CUDA 侧车环境行为不变。
+    """
+    try:
+        import diffusers  # type: ignore
+        return diffusers
+    except ImportError:
+        import sys
+        import types
+
+        def _scheduler_cls(name: str):
+            def from_config(cls, *args, **kwargs):
+                raise NotImplementedError("fake diffusers scheduler")
+            return type(name, (), {"from_config": classmethod(from_config)})
+
+        fake = types.ModuleType("diffusers")
+        fake.__path__ = []  # 标记为包，允许引擎 `from diffusers.utils import ...`
+        for name in (
+            "StableDiffusionPipeline",
+            "StableDiffusionImg2ImgPipeline",
+            "StableDiffusionInpaintPipeline",
+            "StableDiffusionInstructPix2PixPipeline",
+            "EulerDiscreteScheduler",
+            "DDIMScheduler",
+            "DPMSolverMultistepScheduler",
+            "PNDMScheduler",
+        ):
+            if name.endswith("Scheduler"):
+                setattr(fake, name, _scheduler_cls(name))
+            else:
+                setattr(fake, name, type(name, (), {}))
+
+        logging_mod = types.ModuleType("diffusers.utils.logging")
+        logging_mod.is_progress_bar_enabled = lambda: False
+        logging_mod.disable_progress_bar = lambda: None
+        logging_mod.enable_progress_bar = lambda: None
+        utils_mod = types.ModuleType("diffusers.utils")
+        utils_mod.logging = logging_mod
+        monkeypatch.setitem(sys.modules, "diffusers", fake)
+        monkeypatch.setitem(sys.modules, "diffusers.utils", utils_mod)
+        monkeypatch.setitem(sys.modules, "diffusers.utils.logging", logging_mod)
+        return fake
+
+
 class _FakePipeline:
     def __init__(self, *, type_error: str = "", progress_logging=None):
         self.type_error = type_error
@@ -179,8 +227,8 @@ def test_generation_cancels_on_the_next_denoising_step():
 
 
 @pytest.mark.parametrize("scheduler_name", ["EulerDiscreteScheduler", "DDIMScheduler"])
-def test_generation_uses_request_scheduler_and_restores_pipeline(monkeypatch, scheduler_name):
-    diffusers = pytest.importorskip("diffusers")
+def test_generation_uses_request_scheduler_and_restores_pipeline(monkeypatch, scheduler_name, diffusers_module):
+    diffusers = diffusers_module
     engine = _loaded_fake_engine()
     original = SimpleNamespace(config={"name": "fixture"})
     engine._pipeline.scheduler = original
@@ -196,8 +244,8 @@ def test_generation_uses_request_scheduler_and_restores_pipeline(monkeypatch, sc
     assert engine._pipeline.scheduler is original
 
 
-def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
-    diffusers = pytest.importorskip("diffusers")
+def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch, diffusers_module):
+    diffusers = diffusers_module
 
     class _Img2ImgPipeline:
         created_from = None
@@ -249,8 +297,8 @@ def test_img2img_reuses_loaded_components_and_reports_strength(monkeypatch):
     assert _Img2ImgPipeline.created_dtype == 'float16'
 
 
-def test_inpaint_loads_a_dedicated_pipeline_and_reuses_it(monkeypatch, tmp_path):
-    diffusers = pytest.importorskip("diffusers")
+def test_inpaint_loads_a_dedicated_pipeline_and_reuses_it(monkeypatch, tmp_path, diffusers_module):
+    diffusers = diffusers_module
 
     class _InpaintPipeline:
         load_calls = []
@@ -350,8 +398,9 @@ def test_inpaint_loads_a_dedicated_pipeline_and_reuses_it(monkeypatch, tmp_path)
 def test_instruction_mode_loads_instruct_pix2pix_and_uses_image_guidance(
     monkeypatch,
     tmp_path,
+    diffusers_module,
 ):
-    diffusers = pytest.importorskip("diffusers")
+    diffusers = diffusers_module
 
     class _InstructionPipeline:
         load_calls = []

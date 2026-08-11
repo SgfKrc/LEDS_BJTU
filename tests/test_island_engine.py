@@ -228,6 +228,19 @@ def test_chat_returns_content_and_metrics(mock_island_server):
     engine.unload()
 
 
+def test_chat_optional_reasoning_effort_is_added_to_payload(mock_island_server):
+    engine = _make_engine(mock_island_server)
+
+    engine.chat(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+    )
+
+    posts = [r for r in mock_island_server.requests if r["method"] == "POST"]
+    assert posts[-1]["payload"]["reasoning_effort"] == "none"
+    engine.unload()
+
+
 def test_chat_stream_assembles_chunks_until_done(mock_island_server):
     mock_island_server.behavior["stream_chunks"] = ["分", "布", "式", "推理"]
     engine = _make_engine(mock_island_server)
@@ -315,20 +328,35 @@ def test_transport_error_classification_is_platform_independent():
 
 def test_backend_down_raises_clean_transport_error():
     engine = IslandEngine()
-    with pytest.raises((IslandUnreachableError, IslandTimeoutError)) as excinfo:
-        engine.load_model(
-            base_url=f"http://127.0.0.1:{_closed_port()}",
-            timeout=3,
-            connect_timeout=1,
-        )
-    message = str(excinfo.value)
-    if isinstance(excinfo.value, IslandUnreachableError):
-        assert "孤岛后端不可达" in message
-    else:
-        assert "孤岛后端超时" in message
-    # 错误消息不应泄露原始 traceback / 内部异常 repr
-    assert "Traceback" not in message
-    assert "ConnectError(" not in message
+    last_error: Exception | None = None
+    # _closed_port 释放端口后存在竞态窗口（全量运行时端口可能被其他测试复用），
+    # 连接成功（未抛异常）时换端口重试，最多 5 次。
+    for attempt in range(5):
+        port = _closed_port()
+        try:
+            with pytest.raises((IslandUnreachableError, IslandTimeoutError)) as excinfo:
+                engine.load_model(
+                    base_url=f"http://127.0.0.1:{port}",
+                    timeout=3,
+                    connect_timeout=1,
+                )
+        except Exception as exc:
+            # 端口被其他进程占用（连接成功、HTTP 错误等非预期结果）→ 换端口重试
+            last_error = exc
+            if attempt == 4:
+                raise
+            continue
+        message = str(excinfo.value)
+        if isinstance(excinfo.value, IslandUnreachableError):
+            assert "孤岛后端不可达" in message
+        else:
+            assert "孤岛后端超时" in message
+        # 错误消息不应泄露原始 traceback / 内部异常 repr
+        assert "Traceback" not in message
+        assert "ConnectError(" not in message
+        return
+    assert last_error is not None
+    raise last_error
     assert not engine.is_loaded
 
 

@@ -226,6 +226,30 @@ class TestAppHeadless:
                 assert "route:local" in bar
         asyncio.run(_run())
 
+    def test_image_command_queues_then_sends_without_persisting_bytes(self, tmp_path):
+        image_path = tmp_path / "fixture.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+
+        async def _run():
+            app = TuiChatApp(fixture=FIXTURE)
+            app.route = "local_only"
+            async with app.run_test() as pilot:
+                app.query_one(ChatInput).text = f"/image {image_path}"
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                assert len(app._pending_images) == 1
+                assert app.route == "auto"
+
+                app.query_one(ChatInput).text = ""
+                await pilot.press("enter")
+                await pilot.pause(1.0)
+                assert not app._pending_images
+                assert "请描述这些图片" in app._messages[0]._markdown
+                assert "data:image" not in "".join(
+                    message._markdown for message in app._messages
+                )
+        asyncio.run(_run())
+
     def test_unknown_command_notifies(self):
         async def _run():
             app = TuiChatApp(fixture=FIXTURE)

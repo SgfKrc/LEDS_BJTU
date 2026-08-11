@@ -50,10 +50,11 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from paged_kv_cache import PagedKVCache
+from multimodal import build_openai_user_content, validate_image_data_urls
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler as ClusterScheduler
 from task_graph import (
@@ -1030,6 +1031,11 @@ class DiffusionEditRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., description="用户消息", min_length=1)
+    image_data_urls: list[str] = Field(
+        default_factory=list,
+        max_length=4,
+        description="PNG/JPEG/WebP base64 data URL；仅显式 external_api 路由可用",
+    )
     session_id: Optional[str] = Field(default=None, description="会话ID，为空时使用当前活跃会话")
     max_new_tokens: int = Field(default=1024, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
@@ -1094,6 +1100,19 @@ class ChatRequest(BaseModel):
             "作用域门控约束；deny 档位下即使置 true 也不外发）。"
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_multimodal_route(self):
+        self.image_data_urls = validate_image_data_urls(self.image_data_urls)
+        if not self.image_data_urls:
+            return self
+        if not self.allow_external or not self.prefer_external:
+            raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
+        if self.routing_preference == "local_only":
+            raise ValueError("图像请求不能使用 local_only 路由")
+        if self.execution_mode != "auto":
+            raise ValueError("图像请求暂不支持 task_graph 执行模式")
+        return self
 
 
 class ChatResponse(BaseModel):
@@ -3050,6 +3069,9 @@ async def get_status():
                 or getattr(_cfg, "EXTERNAL_MODEL", "")
             ),
             "data_scope": getattr(_cfg, "EXTERNAL_DATA_SCOPE", "opt_in"),
+            "reasoning_effort": getattr(
+                _cfg, "EXTERNAL_REASONING_EFFORT", "",
+            ),
             "min_prompt_chars": getattr(_cfg, "EXTERNAL_MIN_PROMPT_CHARS", 0),
             # 轻量健康检查结果，external_provider 内部缓存 ~30s，
             # 不会在每次 /api/status 调用时都探活外部端点。
@@ -3367,7 +3389,12 @@ def _execute_external_chat(
     client.ensure_connected()
     request_history = [
         *history,
-        {"role": "user", "content": req.message},
+        {
+            "role": "user",
+            "content": build_openai_user_content(
+                req.message, req.image_data_urls,
+            ),
+        },
     ]
     # 作用域门控在 client.chat 内部强制执行（外发前最后一道关口）
     result = client.chat(
@@ -3383,7 +3410,8 @@ def _execute_external_chat(
     if not req.show_thinking:
         response_text = _strip_native_thinking_tags(response_text)
     completed_history = [
-        *request_history,
+        *history,
+        {"role": "user", "content": req.message},
         {"role": "assistant", "content": response_text},
     ]
     tokens_per_sec = result.get("tokens_per_second", 0)
@@ -3461,7 +3489,12 @@ def _external_stream_events(
     parts: list[str] = []
     t0 = time.time()
     for chunk in client.chat_stream(
-        [{"role": "user", "content": req.message}],
+        [{
+            "role": "user",
+            "content": build_openai_user_content(
+                req.message, req.image_data_urls,
+            ),
+        }],
         max_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
@@ -4626,6 +4659,12 @@ def _execute_chat_full(
     # （作用域拒绝的 INFO 日志由端点入口统一记录，每请求一次）
     external_fallback_reason = ""
     _ext_decision = _external_route_decision(req)
+    if req.image_data_urls and not _ext_decision.use_external:
+        raise HTTPException(
+            400,
+            "多模态请求必须使用已启用且获数据作用域授权的 external_api："
+            f"{_ext_decision.reason}",
+        )
     if _ext_decision.use_external:
         try:
             return _execute_external_chat(
@@ -4635,6 +4674,11 @@ def _execute_chat_full(
             raise
         except Exception as exc:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
+            if req.image_data_urls:
+                raise HTTPException(
+                    502,
+                    f"多模态外部推理服务调用失败，禁止丢弃图片后回退：{exc}",
+                ) from exc
             if not model_host.model_loaded or not model_manager.is_loaded:
                 if req.prefer_external:
                     raise HTTPException(
@@ -5637,6 +5681,12 @@ async def chat_stream(req: ChatRequest, request: Request):
         # ---- 路线 B: 外部推理服务真流式（数据作用域门控，默认不出集群）----
         external_fallback_reason = ""
         _ext_decision = _external_route_decision(req)
+        if req.image_data_urls and not _ext_decision.use_external:
+            yield _error_event(
+                "多模态请求必须使用已启用且获数据作用域授权的 external_api："
+                f"{_ext_decision.reason}"
+            )
+            return
         if _ext_decision.use_external:
             loop = _asyncio.get_running_loop()
             ext_events = _external_stream_events(req, cancel_event)
@@ -5662,6 +5712,12 @@ async def chat_stream(req: ChatRequest, request: Request):
                             yield _error_event(str(e))
                 return
             # 外部失败 → 与 /api/chat 同语义：优先回退本地路径
+            if req.image_data_urls:
+                yield _error_event(
+                    "多模态外部推理服务调用失败，禁止丢弃图片后回退："
+                    f"{external_error}"
+                )
+                return
             if req.prefer_external and not (
                 model_host.model_loaded and model_manager.is_loaded
             ):

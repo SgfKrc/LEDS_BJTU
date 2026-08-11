@@ -8,7 +8,24 @@
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:
+    from multimodal import (
+        MAX_CHAT_IMAGE_BYTES,
+        MAX_CHAT_IMAGES,
+        MAX_CHAT_IMAGE_TOTAL_BYTES,
+        validate_image_data_urls,
+    )
+except ImportError:  # pragma: no cover - package import path
+    from .multimodal import (  # type: ignore
+        MAX_CHAT_IMAGE_BYTES,
+        MAX_CHAT_IMAGES,
+        MAX_CHAT_IMAGE_TOTAL_BYTES,
+        validate_image_data_urls,
+    )
 
 # ============================================================
 # API 端点路径（相对 /api 前缀；host 由调用方拼接）
@@ -65,11 +82,15 @@ def build_interactive_request(
     max_new_tokens: int = 1024,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    image_data_urls: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """构造 /api/chat/stream 的 interactive 请求体（T9 契约 §9.4.1）。"""
     if routing_preference not in ROUTING_PREFERENCES:
         routing_preference = "auto"
-    return {
+    images = validate_image_data_urls(image_data_urls or [])
+    if images and routing_preference == "local_only":
+        raise ValueError("图像请求不能使用 local_only 路由")
+    body = {
         "message": message,
         "streaming_mode": "interactive",
         "generation_id": generation_id,
@@ -79,6 +100,48 @@ def build_interactive_request(
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
         "top_p": top_p,
+    }
+    if images:
+        body.update({
+            "image_data_urls": images,
+            "execution_mode": "auto",
+            "allow_external": True,
+            "prefer_external": True,
+        })
+    return body
+
+
+def load_local_chat_image(path_value: str) -> Dict[str, Any]:
+    """读取 TUI 用户明确指定的本地图片并构造一次性 data URL。"""
+    candidate = (path_value or "").strip().strip('"')
+    if not candidate:
+        raise ValueError("用法: /image <PNG/JPEG/WebP 本地路径>")
+    path = Path(candidate).expanduser()
+    try:
+        if not path.is_file():
+            raise ValueError("图片路径不存在或不是普通文件")
+        size = path.stat().st_size
+        if size > MAX_CHAT_IMAGE_BYTES:
+            raise ValueError("图片超过单张 8 MiB 上限")
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"无法读取图片: {exc}") from exc
+
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif raw.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        raise ValueError("只支持内容正确的 PNG、JPEG 或 WebP 图片")
+
+    data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    validate_image_data_urls([data_url])
+    return {
+        "name": path.name,
+        "size": size,
+        "data_url": data_url,
     }
 
 
@@ -139,6 +202,9 @@ COMMAND_SPECS: List[Dict[str, str]] = [
     {"name": "/delete-session", "args": "", "desc": "删除当前会话"},
     {"name": "/route", "args": "auto|local|distributed|required",
      "desc": "设置请求级路由偏好"},
+    {"name": "/image", "args": "<path>", "desc": "添加本地 PNG/JPEG/WebP 图片"},
+    {"name": "/images", "args": "", "desc": "查看待发送图片"},
+    {"name": "/image-clear", "args": "", "desc": "移除待发送图片"},
     {"name": "/cancel", "args": "", "desc": "取消当前生成"},
     {"name": "/clear", "args": "", "desc": "清空当前会话（需确认）"},
     {"name": "/thinking", "args": "on|off", "desc": "思考内容展示"},

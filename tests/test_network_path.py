@@ -14,7 +14,9 @@ from src.network_path import (
     classify_trusted_path,
     collect_tailscale_netcheck,
     collect_tailscale_status,
+    network_path_diagnostic_json,
     probe_trusted_tcp,
+    sanitize_network_path_view,
 )
 
 
@@ -194,6 +196,64 @@ def test_client_path_view_invalid_endpoint_degrades_without_raising():
     assert view["availability"] == "unknown"
     assert view["endpoint"] is None
     assert view["tcp_probe"]["reason"] == "invalid_endpoint"
+
+
+def test_diagnostic_json_and_api_view_share_one_redaction_boundary():
+    raw = {
+        "schema_version": 999,
+        "path_kind": "derp",
+        "availability": "available",
+        "endpoint": {
+            "role": "master",
+            "host_scope": "tailscale_ipv4",
+            "port": 8888,
+            "host": "100.64.0.55",
+        },
+        "tailscale": {
+            "state": "available",
+            "reason": "private-region",
+            "tailnet": "secret-tailnet",
+        },
+        "tcp_probe": {
+            "state": "available",
+            "reason": "existing_connection",
+            "elapsed_ms": 2.25,
+            "address": "100.64.0.55",
+        },
+        "quality": {
+            "rtt_ms_p95": 30.0,
+            "jitter_ms_p95": 5.0,
+            "raw_samples": ["secret"],
+        },
+        "relay_region": "private-region",
+    }
+
+    public = sanitize_network_path_view(raw)
+    diagnostic = json.loads(network_path_diagnostic_json(raw))
+
+    assert diagnostic == public
+    encoded = json.dumps(public)
+    for secret in ("100.64.0.55", "secret-tailnet", "private-region", "raw_samples"):
+        assert secret not in encoded
+    assert public["tailscale"]["reason"] is None
+
+
+def test_runtime_client_projection_never_invokes_probe_or_tailscale(monkeypatch):
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("runtime projection must not perform external I/O")
+
+    monkeypatch.setattr("src.network_path.collect_tailscale_status", unexpected)
+    monkeypatch.setattr("src.network_path.collect_tailscale_netcheck", unexpected)
+    monkeypatch.setattr("src.network_path.probe_trusted_tcp", unexpected)
+    client = SimpleNamespace(
+        is_registered=True,
+        server_host="127.0.0.1",
+        server_port=8888,
+    )
+
+    view = build_client_network_path_view(client)
+
+    assert view["path_kind"] == "lan_direct"
 
 
 def _completed(stdout: str, returncode: int = 0) -> SimpleNamespace:

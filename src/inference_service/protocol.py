@@ -9,7 +9,12 @@
 """
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+try:
+    from multimodal import validate_image_data_urls
+except ImportError:  # package import: src.inference_service.protocol
+    from ..multimodal import validate_image_data_urls
 
 
 class HealthResponse(BaseModel):
@@ -138,6 +143,11 @@ class ChatRequest(BaseModel):
     """
 
     message: str = Field(..., description="用户消息", min_length=1)
+    image_data_urls: List[str] = Field(
+        default_factory=list,
+        max_length=4,
+        description="PNG/JPEG/WebP base64 data URL；仅显式 external_api 路由可用",
+    )
     session_id: Optional[str] = Field(default=None, description="会话 ID")
     max_new_tokens: int = Field(default=1024, ge=1, le=4096)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
@@ -194,6 +204,19 @@ class ChatRequest(BaseModel):
             "作用域门控约束；deny 档位下即使置 true 也不外发）。"
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_multimodal_route(self):
+        self.image_data_urls = validate_image_data_urls(self.image_data_urls)
+        if not self.image_data_urls:
+            return self
+        if not self.allow_external or not self.prefer_external:
+            raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
+        if self.routing_preference == "local_only":
+            raise ValueError("图像请求不能使用 local_only 路由")
+        if self.execution_mode != "auto":
+            raise ValueError("图像请求暂不支持 task_graph 执行模式")
+        return self
 
 
 class ChatCancelRequest(BaseModel):

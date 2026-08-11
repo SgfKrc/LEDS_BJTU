@@ -168,6 +168,9 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.junit)
 
+    // JVM 单元测试（纯逻辑，无需设备）
+    testImplementation(libs.junit)
+
     // Navigation
     implementation(libs.androidx.navigation.compose)
 

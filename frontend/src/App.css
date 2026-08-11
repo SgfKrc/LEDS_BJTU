@@ -1338,6 +1338,78 @@ input:focus, textarea:focus { border-color: var(--accent); }
   flex-shrink: 0;
 }
 
+.image-chip-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  margin-bottom: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.image-chip {
+  display: grid;
+  grid-template-columns: 48px minmax(76px, 150px) 18px;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 5px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent-dim);
+}
+
+.image-chip img {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--bg-input);
+}
+
+.image-chip-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.image-chip-name,
+.image-chip-meta,
+.image-queue-total {
+  white-space: nowrap;
+}
+
+.image-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.image-chip-meta,
+.image-queue-total {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.image-queue-total {
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.image-attachment-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 4px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
 /* 消息中的文件附件标识 */
 .file-attachment-badge {
   display: inline-flex;

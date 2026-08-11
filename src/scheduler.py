@@ -6592,7 +6592,10 @@ class Scheduler:
                 getattr(self, "_tcp_client", None)
             )
         except Exception as exc:
-            logger.debug("本地网络路径投影失败: %s", exc, exc_info=True)
+            logger.debug(
+                "本地网络路径投影失败: error_type=%s",
+                type(exc).__name__,
+            )
             return None
 
     def _snapshot_nodes(self, network_path: dict | None = None) -> dict:
