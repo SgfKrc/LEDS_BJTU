@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-setlocal
+setlocal EnableDelayedExpansion
 echo ============================================
 echo  QLH 边缘推理系统 — Inno Setup 安装包编译
 echo ============================================
@@ -14,18 +14,18 @@ if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
     set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 )
 
-REM 备用路径
+REM 备用路径（%ProgramFiles(x86)% 在括号块内无法展开，必须用延迟展开）
 if not defined ISCC (
-    if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" (
-        set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+    if exist "!ProgramFiles(x86)!\Inno Setup 6\ISCC.exe" (
+        set "ISCC=!ProgramFiles(x86)!\Inno Setup 6\ISCC.exe"
     )
 )
 
 REM 如果找不到，让用户手动输入
 if not defined ISCC (
     echo [错误] 未找到 Inno Setup 6
-    echo   尝试了: C:\Program Files (x86)\Inno Setup 6\
-    echo   尝试了: %ProgramFiles(x86)%\Inno Setup 6\
+    echo   尝试了: "C:\Program Files (x86)\Inno Setup 6\"
+    echo   尝试了: "%ProgramFiles(x86)%\Inno Setup 6\"
     echo.
     echo 请确保已安装 Inno Setup 6，或手动指定路径：
     echo   set ISCC=你的路径\ISCC.exe
