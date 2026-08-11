@@ -23,23 +23,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
 import { SessionStore } from '../src/data/session-store';
 
 describe('control-svc sessions/conversations 域（阶段 3.2 首迁）', () => {
   let app: NestFastifyApplication | null = null;
   let tmpDir: string;
   let store: SessionStore;
-
-  const dbDisabledDao = new ConfigDao({
-    host: 'localhost',
-    port: 5432,
-    name: 'x',
-    user: 'postgres',
-    password: '',
-    enabled: false,
-    sslmode: 'prefer',
-  });
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'control-sessions-'));
@@ -62,8 +51,6 @@ describe('control-svc sessions/conversations 域（阶段 3.2 首迁）', () => 
     })
       .overrideProvider(SessionStore)
       .useValue(store)
-      .overrideProvider(ConfigDao)
-      .useValue(dbDisabledDao)
       .compile();
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);

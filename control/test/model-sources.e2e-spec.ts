@@ -4,7 +4,6 @@ import { join } from 'path';
 import { Test } from '@nestjs/testing';
 import { FastifyAdapter } from '@nestjs/platform-fastify';
 import { ArtifactStore } from '../src/data/artifact-store';
-import { ConfigDao } from '../src/data/config-dao';
 import { HfResolver } from '../src/data/hf-resolver';
 import { ModelHttpClient } from '../src/data/model-http-client';
 import { ModelCredentialStore } from '../src/data/model-credential-store';
@@ -172,10 +171,6 @@ describe('MODEL-FLEET sources API (MF-N4)', () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(store)
       .overrideProvider(ArtifactStore).useValue(artifactStore)
-      .overrideProvider(ConfigDao).useValue({
-        enabled: false, dbEnabled: () => false,
-        getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
-      })
       .overrideProvider(HfResolver).useValue(resolverFixture())
       .overrideProvider(ModelDiskBudget).useValue({
         evaluate: () => ({

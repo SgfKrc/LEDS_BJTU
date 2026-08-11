@@ -196,50 +196,6 @@ def _sync_runtime_node_config(node_id: str = None, node_role: str = None) -> Non
         if node_runtime is not None:
             node_runtime.set_node_role(NODE_ROLE)
 
-# 历史 PostgreSQL 运行时已退场；_db 仅保留给测试注入兼容对象。
-_db = None
-_db_available = False
-_db_attempted = True
-_db_disabled = True
-_db_retry_after = 0.0
-_db_last_error = "远端 PostgreSQL 运行时已退场，正在使用本地 SQLite"
-_db_state_lock = threading.Lock()
-
-
-def _sync_api_db_available(available: bool) -> None:
-    try:
-        from model_host import get_model_host
-        get_model_host()._db_available = bool(available)
-    except Exception:
-        pass
-
-
-def _get_db(force_retry: bool = False):
-    """Return an injected compatibility DB without loading a production driver."""
-    global _db, _db_available, _db_attempted, _db_disabled
-    global _db_retry_after, _db_last_error
-    if _db is not None:
-        return _db
-    _db_available = False
-    _db_attempted = True
-    _db_disabled = True
-    _db_retry_after = 0.0
-    _db_last_error = "远端 PostgreSQL 运行时已退场，正在使用本地 SQLite"
-    _sync_api_db_available(False)
-    return None
-
-
-def get_database_status() -> dict:
-    return {
-        "available": bool(_db_available and _db is not None),
-        "configured": not _db_disabled,
-        "attempted": _db_attempted,
-        "last_error": _db_last_error,
-        "retry_in_seconds": 0.0,
-        "retired": True,
-    }
-
-
 class NodeState(str, Enum):
     """节点状态枚举"""
     ONLINE = "online"       # 在线空闲
@@ -1053,6 +1009,8 @@ class Scheduler:
         self._infer_tasks: dict[str, InferenceTask] = {}
         self._task_lock = threading.Lock()
         self._running = False
+        # 启动期后台发现线程必须能被 stop() 立即唤醒，避免停止后仍发起连接。
+        self._startup_cancel_event = threading.Event()
         self.on_task_complete: Optional[Callable] = None
 
         # TCP 服务端（分布式模式下启动）
@@ -1137,7 +1095,6 @@ class Scheduler:
 
         # 最大节点数（可动态调整）
         self._max_nodes: int = MAX_NODES
-        self._db_reconnect_thread: Optional[threading.Thread] = None
         self._master_connect_lock = threading.Lock()
         self._role_transition_lock = threading.Lock()
         self._client_health_thread: Optional[threading.Thread] = None
@@ -1146,6 +1103,15 @@ class Scheduler:
         self._distributed_inference_enabled: Optional[bool] = None
         self._local_device_profile: Optional[dict] = {}
         self._runtime_layer_override: Optional[list] = None
+        self._ha_state_lock = threading.RLock()
+        self._ha_state_loaded = False
+        self._ha_state: dict = {
+            "spare_master": None,
+            "spare_master_active": False,
+            "pending_new_master_id": "",
+            "transfer_logs": [],
+            "spare_master_logs": [],
+        }
         self._task_worker_control = TaskWorkerControlPlane(
             health_timeout_seconds=max(30.0, HEARTBEAT_INTERVAL * 4.0),
         )
@@ -1206,6 +1172,7 @@ class Scheduler:
             host: TCP 监听地址（默认 0.0.0.0，接受所有接口连接）
             port: TCP 监听端口（默认 config.SERVER_PORT）
         """
+        self._startup_cancel_event.clear()
         self.init_nodes()
         self._running = True
 
@@ -1220,7 +1187,7 @@ class Scheduler:
 
             # 绑定到 0.0.0.0 接受所有接口连接（而非占位符 192.168.x.x）
             bind_host = host or "0.0.0.0"
-            actual_port = port or SERVER_PORT
+            actual_port = SERVER_PORT if port is None else port
 
             try:
                 self._tcp_server = TCPServer(bind_host, actual_port)
@@ -1250,7 +1217,7 @@ class Scheduler:
                     # 尝试在本机 bootstrap 配置或 Tailnet 中发现已确认的主节点。
                     discovery = self.discover_master()
                     if discovery.get("found"):
-                        # 数据库中存在真正的主节点记录 → 自动切换为从节点
+                        # bootstrap/Tailnet 发现已确认主节点 → 自动切换为从节点
                         stale_note = "（心跳过期，IP 可能已变更）" if discovery.get("stale") else ""
                         logger.warning(
                             f"⛔ 主节点身份验证失败！本机 MAC 与本地 SQLite 记录不匹配。\n"
@@ -1271,7 +1238,7 @@ class Scheduler:
                             f"   本机 MAC 与已记录身份不匹配，且未发现其他主节点。\n"
                             f"   如需更换主节点机器，请先在原主节点的后台管理中"
                             f"使用「重置主节点身份」功能。\n"
-                            f"   当前将以单机模式运行（不写入远端数据库）。"
+                            f"   当前将以单机模式运行（不覆盖本机 SQLite 身份）。"
                         )
                 else:
                     if self._tcp_server and self._tcp_server._running:
@@ -1325,6 +1292,7 @@ class Scheduler:
 
     def stop(self) -> None:
         """停止调度器"""
+        self._startup_cancel_event.set()
         self._running = False
         self.pipeline_queue.stop()
         tcp_client = getattr(self, "_tcp_client", None)
@@ -1345,39 +1313,6 @@ class Scheduler:
         if self._tcp_server:
             self._tcp_server.stop()
         logger.info("调度器已停止")
-
-    def _start_database_reconnect_monitor(self) -> None:
-        if self._db_reconnect_thread and self._db_reconnect_thread.is_alive():
-            return
-        self._db_reconnect_thread = threading.Thread(
-            target=self._database_reconnect_loop,
-            name="database-reconnect",
-            daemon=True,
-        )
-        self._db_reconnect_thread.start()
-
-    def _database_reconnect_loop(self) -> None:
-        while self._running:
-            deadline = time.monotonic() + _DB_RETRY_SECONDS
-            while self._running and time.monotonic() < deadline:
-                time.sleep(0.5)
-            status = get_database_status()
-            if not self._running or status["available"] or not status["configured"]:
-                continue
-            db = _get_db(force_retry=True)
-            if db is None:
-                continue
-            try:
-                db.set_active_node_id(self.get_effective_node_id())
-            except Exception:
-                pass
-            if self._effective_role() == "master":
-                self._register_master_in_db()
-                try:
-                    # 数据库恢复时不能重新采用宕机前基于旧节点/旧画像的动态分层。
-                    db.set_layer_assignments({})
-                except Exception:
-                    logger.debug("数据库恢复后清除旧分层缓存失败", exc_info=True)
 
     # ================================================================
     # 节点管理
@@ -1402,63 +1337,29 @@ class Scheduler:
         初始化节点状态。
         - 主节点：仅创建 master 自身，从节点通过 TCP 注册动态加入（不再预创建空槽位）
         - 从节点：创建自身记录，等待用户操作连接主节点
-        - 优先从数据库恢复已注册节点
+
+        节点在线状态、能力画像和层配置均属于当前 TCP 会话的运行时
+        事实；服务重启后由 bootstrap/Tailnet 与重新注册恢复，不能从
+        已退场的远端数据库复活陈旧节点。
         """
         effective_role = self._effective_role()
-        db = _get_db()
-        db_nodes = {}
-        if db and _db_available:
-            try:
-                db_nodes = {n["node_id"]: n for n in db.get_all_nodes()}
-                logger.info(f"从数据库恢复 {len(db_nodes)} 个节点记录")
-            except Exception as e:
-                logger.warning(f"数据库读取失败，使用默认初始化: {e}")
 
         # ---- 主节点模式：仅创建 master，不预创建 client 空位 ----
         if effective_role == "master":
             now_ts = time.time()
-            if "master" in db_nodes:
-                self.nodes["master"] = self._node_from_db(db_nodes["master"])
-                # 确保主节点上线时时间戳正确
-                self.nodes["master"].state = NodeState.ONLINE
-                self.nodes["master"].connected_at = self.nodes["master"].connected_at or now_ts
-                self.nodes["master"].last_heartbeat = now_ts
-            else:
-                self.nodes["master"] = NodeInfo(
-                    node_id="master", role=NodeRole.MASTER,
-                    state=NodeState.ONLINE,
-                    hostname="localhost",
-                    network_type="localhost",
-                    connected_at=now_ts,
-                    last_heartbeat=now_ts,
-                )
-
-            # 从 DB 恢复所有之前注册过的从节点
-            # 跳过幽灵节点：从未连接过、无地址、无主机名（旧代码预创建的空槽位）
-            for nid, row in db_nodes.items():
-                if nid == "master":
-                    continue
-                node = self._node_from_db(row)
-                if (not node.address and not node.hostname
-                        and not node.connected_at and not node.last_heartbeat):
-                    logger.info(f"  跳过幽灵节点: {nid}（无连接记录），从数据库清理")
-                    try:
-                        db.delete_node(nid)
-                    except Exception:
-                        pass
-                    continue
-                if RUN_MODE == "distributed":
-                    # 分布式模式：PC 从节点尚未 TCP 重连，标记为 offline。
-                    # Android HTTP 薄客户端不依赖 TCP，保持 DB 中记录的状态。
-                    if node.node_type != "android":
-                        node.state = NodeState.OFFLINE
-                self.nodes[nid] = node
-                logger.info(f"  恢复从节点: {nid} (state={node.state.value})")
+            self.nodes["master"] = NodeInfo(
+                node_id="master", role=NodeRole.MASTER,
+                state=NodeState.ONLINE,
+                hostname="localhost",
+                network_type="localhost",
+                connected_at=now_ts,
+                last_heartbeat=now_ts,
+            )
 
         # ---- 从节点模式：仅创建自身 ----
         else:
             # ★ 安全：从节点绝不能使用 "master" 作为 node_id
-            # 否则会从数据库加载主节点记录，导致后台面板显示主节点数据
+            # 否则会和本机 master 运行时记录冲突。
             configured_node_id = _configured_node_id()
             if not configured_node_id or configured_node_id == "master":
                 node_id = f"client_{__import__('socket').gethostname()}"
@@ -1469,14 +1370,11 @@ class Scheduler:
                     )
             else:
                 node_id = configured_node_id
-            if node_id in db_nodes:
-                self.nodes[node_id] = self._node_from_db(db_nodes[node_id])
-            else:
-                self.nodes[node_id] = NodeInfo(
-                    node_id=node_id, role=NodeRole.CLIENT,
-                    state=NodeState.ONLINE,
-                    hostname="localhost",
-                )
+            self.nodes[node_id] = NodeInfo(
+                node_id=node_id, role=NodeRole.CLIENT,
+                state=NodeState.ONLINE,
+                hostname="localhost",
+            )
 
         # 设备检测与调度器启动并行执行。若画像先完成，在节点创建后立即补入；
         # 若画像稍后完成，则由 update_local_device_profile() 写回。
@@ -1486,40 +1384,6 @@ class Scheduler:
                 local_node = self.nodes.get(local_node_id)
                 if local_node is not None:
                     local_node.device_info = dict(self._local_device_profile)
-            if db and _db_available and effective_role == "master":
-                try:
-                    db.set_layer_assignments({})
-                except Exception:
-                    logger.debug("启动时清除旧分层缓存失败", exc_info=True)
-
-        # 从 DB 同步 MAX_NODES（仅主节点）
-        if db and _db_available and effective_role == "master":
-            try:
-                stored_max = db.get_config("max_nodes", "")
-                if stored_max and stored_max.isdigit():
-                    new_max = int(stored_max)
-                    if new_max != self._max_nodes:
-                        old = self._max_nodes
-                        self._max_nodes = new_max
-                        import config as cfg
-                        cfg.MAX_NODES = new_max
-                        logger.info(f"从数据库恢复 max_nodes: {old} → {new_max}")
-            except Exception:
-                pass
-
-            # 仅主节点持久化自身到 DB（从节点不自动写入数据库）
-            try:
-                master_node = self.nodes.get("master")
-                if master_node:
-                    db.upsert_node(
-                        node_id="master", role="master", state=master_node.state.value,
-                        address=master_node.address, hostname=master_node.hostname,
-                        device_info=master_node.device_info, network_type=master_node.network_type,
-                        connected_at=master_node.connected_at, last_heartbeat=master_node.last_heartbeat,
-                        task_count=master_node.task_count, error_count=master_node.error_count,
-                    )
-            except Exception as e:
-                logger.warning(f"主节点数据库同步失败: {e}")
 
         logger.info(
             f"节点初始化完成: {len(self.nodes)} 个节点 "
@@ -1588,51 +1452,11 @@ class Scheduler:
             score,
         )
 
-        db = _get_db()
-        if db and _db_available and effective_role == "master":
-            try:
-                db.upsert_node(
-                    node_id="master",
-                    role="master",
-                    node_type=node_snapshot.node_type,
-                    state=node_snapshot.state.value,
-                    address=node_snapshot.address,
-                    hostname=node_snapshot.hostname,
-                    device_info=node_snapshot.device_info,
-                    network_type=node_snapshot.network_type,
-                    connected_at=node_snapshot.connected_at,
-                    last_heartbeat=node_snapshot.last_heartbeat,
-                    task_count=node_snapshot.task_count,
-                    error_count=node_snapshot.error_count,
-                )
-                # 已缓存的 9/15 等动态结果基于旧画像，必须强制重新计算。
-                db.set_layer_assignments({})
-            except Exception as e:
-                logger.warning("主节点设备画像/分层缓存持久化失败: %s", e)
-
         if effective_role == "master":
             try:
                 self.push_layer_config_to_clients()
             except Exception as e:
                 logger.warning("设备画像更新后重新下发分层失败: %s", e, exc_info=True)
-
-    def _node_from_db(self, db_row: dict) -> NodeInfo:
-        """将数据库行转换为 NodeInfo"""
-        return NodeInfo(
-            node_id=db_row["node_id"],
-            role=db_row.get("role", "client"),
-            node_type=db_row.get("node_type", "pc"),
-            state=NodeState(db_row.get("state", "offline")),
-            address=db_row.get("address", ""),
-            hostname=db_row.get("hostname", ""),
-            device_info=db_row.get("device_info", {}),
-            network_type=db_row.get("network_type", "unknown"),
-            connected_at=db_row.get("connected_at", 0.0),
-            last_heartbeat=db_row.get("last_heartbeat", 0.0),
-            task_count=db_row.get("task_count", 0),
-            error_count=db_row.get("error_count", 0),
-            model_sha256=db_row.get("model_sha256", ""),
-        )
 
     def register_node(self, node_id: str, role: str, address: str = "",
                       hostname: str = "", device_info: dict = None,
@@ -1706,35 +1530,6 @@ class Scheduler:
             node.connected_at = time.time()
             node.last_heartbeat = time.time()
 
-        # 持久化到数据库
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.upsert_node(
-                    node_id=node_id,
-                    role=node.role,
-                    node_type=node.node_type,
-                    state=node.state.value,
-                    address=node.address,
-                    hostname=node.hostname,
-                    device_info=node.device_info,
-                    network_type=node.network_type,
-                    connected_at=node.connected_at,
-                    last_heartbeat=node.last_heartbeat,
-                    task_count=node.task_count,
-                    error_count=node.error_count,
-                    model_sha256=node.model_sha256,
-                )
-            except Exception as e:
-                logger.warning(f"节点注册 DB 持久化失败: {e}")
-
-        # ★ 清除缓存的层分配方案，强制下次查询重新计算（含新节点）
-        if db and _db_available and self._effective_role() == "master":
-            try:
-                db.set_layer_assignments({})
-            except Exception:
-                pass
-
         logger.info(
             f"✅ 节点注册: {node_id} role={role} type={node_type} "
             f"hostname={hostname} addr={address} net={network_type}"
@@ -1764,25 +1559,11 @@ class Scheduler:
             node.address = ""
             node.connected_at = 0.0
 
-        # 持久化到数据库
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.update_node_state(node_id=node_id, state="offline")
-            except Exception as e:
-                logger.warning(f"节点注销 DB 持久化失败: {e}")
-
         # 主节点：推送节点离线更新给所有已连接从节点
         if self._effective_role() == "master":
             self._push_node_update_to_all_clients(
                 node_id, "update", node
             )
-            # ★ 清除缓存的层分配方案，强制下次查询重新计算（剔除已注销节点）
-            if db and _db_available:
-                try:
-                    db.set_layer_assignments({})
-                except Exception:
-                    pass
             # ★ 清除层配置推送记录（节点离线后需重新推送）
             self._clear_layer_config_state(node_id)
             with self._layer_config_lock:
@@ -1827,20 +1608,7 @@ class Scheduler:
             else:
                 self.nodes[nid].error_count += 1
             self.nodes[nid].last_heartbeat = time.time()
-            node_snapshot = self.nodes[nid]  # 锁内快照，供外部 I/O 使用
-
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.update_node_state(
-                    node_id=nid,
-                    state=node_snapshot.state.value,
-                    last_heartbeat=node_snapshot.last_heartbeat,
-                    task_count=node_snapshot.task_count,
-                    error_count=node_snapshot.error_count,
-                )
-            except Exception as e:
-                logger.debug(f"任务计数 DB 更新失败: {nid}: {e}", exc_info=True)
+            node_snapshot = self.nodes[nid]
 
         if self._effective_role() == "master":
             try:
@@ -1977,27 +1745,6 @@ class Scheduler:
                 existing.connected_at = now
             existing.last_heartbeat = now
 
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.upsert_node(
-                    node_id=node_id,
-                    role="client",
-                    node_type="android",
-                    state="online",
-                    address=existing.address,
-                    hostname=existing.hostname,
-                    device_info=existing.device_info,
-                    network_type=existing.network_type,
-                    connected_at=existing.connected_at,
-                    last_heartbeat=existing.last_heartbeat,
-                    task_count=existing.task_count,
-                    error_count=existing.error_count,
-                    model_sha256=existing.model_sha256,
-                )
-            except Exception as e:
-                logger.warning(f"Android 客户端登记 DB 持久化失败: {e}")
-
         if self._effective_role() == "master":
             self._push_node_update_to_all_clients(
                 node_id, "add" if is_new else "update", existing
@@ -2033,13 +1780,7 @@ class Scheduler:
         if not changed:
             return
 
-        db = _get_db()
         for node in changed:
-            if db and _db_available:
-                try:
-                    db.update_node_state(node.node_id, "offline")
-                except Exception as e:
-                    logger.warning(f"Android 客户端过期状态 DB 更新失败: {e}")
             if self._effective_role() == "master":
                 self._push_node_update_to_all_clients(node.node_id, "update", node)
             logger.info(f"📱 Android HTTP 客户端心跳过期: {node.node_id} → offline")
@@ -2961,7 +2702,7 @@ class Scheduler:
         """
         获取当前分层配置。
 
-        优先返回 DB 中的手动覆盖，否则动态计算并缓存到 DB。
+        优先返回当前进程的手动覆盖，否则根据实时节点画像动态计算。
 
         Returns:
             {
@@ -2998,47 +2739,6 @@ class Scheduler:
                 }
 
         cache_key = self._layer_assignment_cache_key(total_layers)
-        db = _get_db()
-        if db and _db_available:
-            try:
-                strategy = db.get_layer_strategy()
-            except Exception:
-                strategy = "dynamic"
-
-            if strategy == "manual":
-                try:
-                    overrides = [
-                        item for item in (db.get_layer_override() or [])
-                        if item.get("node_id") not in opted_out
-                    ]
-                    if (
-                        overrides
-                        and self._manual_assignments_are_executable(overrides)
-                        and max(int(item.get("end_layer", 0)) for item in overrides)
-                        == total_layers
-                    ):
-                        overrides = self._normalize_manual_assignments(overrides)
-                        return {
-                            "total": total_layers,
-                            "strategy": "manual",
-                            "assignments": overrides,
-                            "computed_at": None,
-                        }
-                except Exception:
-                    pass
-
-            # 尝试从 DB 读取缓存的计算结果
-            try:
-                cached = db.get_layer_assignments()
-                if (
-                    cached
-                    and cached.get("assignments")
-                    and int(cached.get("total", 0)) == total_layers
-                    and cached.get("cache_key") == cache_key
-                ):
-                    return cached
-            except Exception:
-                pass
 
         # 动态计算
         assignments = self.compute_layer_assignment()
@@ -3063,13 +2763,6 @@ class Scheduler:
             "computed_at": time.time(),
             "cache_key": cache_key,
         }
-
-        # 缓存到 DB
-        if db and _db_available:
-            try:
-                db.set_layer_assignments(result)
-            except Exception as e:
-                logger.debug(f"分层缓存失败: {e}")
 
         return result
 
@@ -3118,13 +2811,6 @@ class Scheduler:
 
         self._runtime_layer_override = None
 
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.clear_layer_override()
-            except Exception as e:
-                logger.warning(f"清除层覆盖失败: {e}")
-
         # 强制重新计算
         assignments = self.compute_layer_assignment()
         result = {
@@ -3133,12 +2819,6 @@ class Scheduler:
             "assignments": assignments,
             "computed_at": time.time(),
         }
-
-        if db and _db_available:
-            try:
-                db.set_layer_assignments(result)
-            except Exception as e:
-                logger.debug(f"分层缓存失败: {e}")
 
         logger.info("分层配置已重置为自动策略")
         self.push_layer_config_to_clients()
@@ -3217,15 +2897,6 @@ class Scheduler:
             {"node_id": node_id, "start_layer": start, "end_layer": end}
             for start, end, node_id in intervals
         ])
-        # 存储到 DB + 切换策略为 manual
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.set_layer_strategy("manual")
-                db.set_layer_override(normalized_assignments)
-            except Exception as e:
-                return {"status": "error", "reason": f"DB 存储失败: {e}"}
-
         self._runtime_layer_override = [dict(item) for item in normalized_assignments]
 
         # 推送到已连接从节点
@@ -5556,7 +5227,7 @@ class Scheduler:
           1. 验证目标节点在线且为 client
           2. 通过 TCP 向目标发送 ROLE_TRANSFER 消息
           3. 等待 ROLE_TRANSFER_ACK 确认（超时 15s）
-          4. 主节点保存降级日志 → 更新 DB master 信息 → 通知其他从节点
+          4. 主节点写入本地 SQLite 审计与待接管状态
           5. 返回操作结果（建议重启以应用新角色）
 
         Args:
@@ -5646,6 +5317,7 @@ class Scheduler:
                 nid: {"role": info.role, "state": info.state.value}
                 for nid, info in self.nodes.items()
             },
+            "spare_master": dict(spare),
         }
 
         # 步骤 1: 发送 ROLE_TRANSFER 给目标从节点（新主节点）
@@ -5729,48 +5401,28 @@ class Scheduler:
         self._transfer_acks.pop(transfer_id, None)
         self._spare_activate_acks.pop(activate_data["activate_id"], None)
 
-        # 步骤 4: 主节点保存降级日志 + 备用激活日志
-        db = _get_db()
-        try:
-            if db and _db_available:
-                db.append_transfer_log(
-                    direction="demotion",
-                    from_role="master",
-                    to_role="client",
-                    related_node=target_node_id,
-                    details={
-                        "transfer_id": transfer_id,
-                        "target_ack": target_ack,
-                        "spare_activated": spare_id,
-                        "spare_ack": spare_ack,
-                        "node_count": len(self.nodes),
-                    },
-                )
-                db.append_spare_master_log(
-                    direction="activated",
-                    details={
-                        "transfer_id": transfer_id,
-                        "old_master_id": NODE_ID,
-                        "new_master_id": target_node_id,
-                        "spare_node_id": spare_id,
-                        "ack": spare_ack,
-                    },
-                )
-        except Exception as e:
-            logger.warning(f"日志写入失败: {e}")
-
-        # 步骤 5: 更新数据库 — 新主节点信息
-        try:
-            if db and _db_available:
-                db.set_config("master_node_id", target_node_id)
-                db.set_config("new_master_node_id", target_node_id)
-                db.set_config("master_role_transferred", "true")
-                db.set_config("spare_master_active", "true")  # 标记备用主节点已激活
-                db.set_config("last_transfer_id", transfer_id)
-                db.set_config("last_transfer_time", str(time.time()))
-                logger.info(f"数据库已更新: 新主节点 = {target_node_id}, 备用 = {spare_id} (已激活)")
-        except Exception as e:
-            logger.warning(f"数据库更新失败: {e}")
+        # 步骤 4/5: 审计与待接管状态只写用户主节点 SQLite。
+        self._append_ha_log("transfer_logs", "demotion", {
+            "from_role": "master",
+            "to_role": "client",
+            "related_node": target_node_id,
+            "transfer_id": transfer_id,
+            "target_ack": target_ack,
+            "spare_activated": spare_id,
+            "spare_ack": spare_ack,
+            "node_count": len(self.nodes),
+        })
+        self._append_ha_log("spare_master_logs", "activated", {
+            "transfer_id": transfer_id,
+            "old_master_id": NODE_ID,
+            "new_master_id": target_node_id,
+            "spare_node_id": spare_id,
+            "ack": spare_ack,
+        })
+        self._update_ha_state(
+            spare_master_active=True,
+            pending_new_master_id=target_node_id,
+        )
 
         logger.info(
             f"✅ 角色转让完成: {NODE_ID} → {target_node_id} "
@@ -5797,7 +5449,7 @@ class Scheduler:
         从节点收到 ROLE_TRANSFER 消息（被选为新主节点）。
 
         操作:
-          1. 保存升级日志到数据库
+          1. 保存升级日志到本机 SQLite
           2. 更新本地节点角色标记
           3. 发送 ROLE_TRANSFER_ACK 确认
           4. 提示用户重启以应用新角色
@@ -5812,27 +5464,21 @@ class Scheduler:
             f"(transfer_id={transfer_id})"
         )
 
-        # 保存升级日志
-        db = _get_db()
-        try:
-            if db and _db_available:
-                db.append_transfer_log(
-                    direction="promotion",
-                    from_role="client",
-                    to_role="master",
-                    related_node=old_master_id,
-                    details={
-                        "transfer_id": transfer_id,
-                        "old_master_id": old_master_id,
-                        "cluster_info": data,
-                    },
-                )
-                # 更新数据库中的节点角色
-                db.set_config("node_role_override", "master")
-                db.set_config("last_transfer_id", transfer_id)
-                logger.info(f"升级日志已保存: client → master (transfer_id={transfer_id})")
-        except Exception as e:
-            logger.warning(f"升级日志写入失败: {e}")
+        spare = data.get("spare_master")
+        if isinstance(spare, dict):
+            self._update_ha_state(
+                spare_master=dict(spare),
+                spare_master_active=True,
+                pending_new_master_id=new_master_id,
+            )
+        self._append_ha_log("transfer_logs", "promotion", {
+            "from_role": "client",
+            "to_role": "master",
+            "related_node": old_master_id,
+            "transfer_id": transfer_id,
+            "old_master_id": old_master_id,
+        })
+        logger.info("升级日志已保存到本地主节点 SQLite: %s", transfer_id)
 
         # 发送 ACK（从节点通过 TCP 客户端连接回传给主节点）
         ack_payload = {
@@ -5948,7 +5594,7 @@ class Scheduler:
         if has_cuda_discrete(device_info):
             return True, "ok"
 
-        # 本地主节点的 DB/节点表可能保存了旧画像（例如只记录了集显）。
+        # 本地主节点的运行时节点表可能保存了旧画像（例如只记录了集显）。
         # 仅对当前主节点再读取实时画像兜底，避免误把本机硬件套用到远端节点。
         if is_local_master_query:
             local_device_info = load_local_profile()
@@ -5964,15 +5610,68 @@ class Scheduler:
 
         return True, "ok"
 
-    def get_transfer_logs(self) -> list:
-        """获取所有角色转让日志"""
-        db = _get_db()
-        if db and _db_available:
+    def _load_ha_state(self) -> None:
+        """Load the small HA control record from the user-owned local SQLite."""
+        with self._ha_state_lock:
+            if self._ha_state_loaded:
+                return
             try:
-                return db.get_transfer_logs()
-            except Exception:
-                pass
-        return []
+                from local_store import get_local_setting
+
+                value = get_local_setting("scheduler_high_availability_v1", {})
+                if isinstance(value, dict):
+                    spare = value.get("spare_master")
+                    self._ha_state["spare_master"] = (
+                        dict(spare) if isinstance(spare, dict) else None
+                    )
+                    self._ha_state["spare_master_active"] = bool(
+                        value.get("spare_master_active", False)
+                    )
+                    self._ha_state["pending_new_master_id"] = str(
+                        value.get("pending_new_master_id", "") or ""
+                    )
+                    for key in ("transfer_logs", "spare_master_logs"):
+                        items = value.get(key, [])
+                        if isinstance(items, list):
+                            self._ha_state[key] = [
+                                dict(item) for item in items[-256:]
+                                if isinstance(item, dict)
+                            ]
+            except Exception as exc:
+                logger.warning("读取本地主节点 HA 状态失败: %s", exc)
+            self._ha_state_loaded = True
+
+    def _save_ha_state_locked(self) -> None:
+        from local_store import set_local_setting
+
+        set_local_setting("scheduler_high_availability_v1", self._ha_state)
+
+    def _update_ha_state(self, **updates) -> None:
+        self._load_ha_state()
+        with self._ha_state_lock:
+            self._ha_state.update(updates)
+            self._save_ha_state_locked()
+
+    def _append_ha_log(self, category: str, direction: str, details: dict) -> None:
+        if category not in {"transfer_logs", "spare_master_logs"}:
+            raise ValueError("unknown HA log category")
+        self._load_ha_state()
+        event = {
+            "direction": direction,
+            "details": dict(details),
+            "created_at": time.time(),
+        }
+        with self._ha_state_lock:
+            logs = list(self._ha_state.get(category, []))
+            logs.append(event)
+            self._ha_state[category] = logs[-256:]
+            self._save_ha_state_locked()
+
+    def get_transfer_logs(self) -> list:
+        """获取本地主节点 SQLite 中的角色转让日志。"""
+        self._load_ha_state()
+        with self._ha_state_lock:
+            return [dict(item) for item in self._ha_state["transfer_logs"]]
 
     # ================================================================
     # 备用主节点管理
@@ -5991,7 +5690,7 @@ class Scheduler:
           1. 验证条件和目标节点
           2. 通过 TCP 向目标发送 SPARE_MASTER_DESIGNATE 消息
           3. 等待 ACK 确认（超时 15s）
-          4. 保存备用主节点信息到数据库 + 日志
+          4. 保存备用主节点信息和日志到本机 SQLite
 
         Args:
             target_node_id: 目标从节点 ID
@@ -6023,19 +5722,13 @@ class Scheduler:
         if not target.is_available():
             return {"status": "invalid", "reason": f"节点 '{target_node_id}' 不在线，无法指定为备用主节点"}
 
-        # 检查是否已经是备用主节点
-        db = _get_db()
-        try:
-            if db and _db_available:
-                existing = db.get_spare_master()
-                if existing and existing.get("node_id") == target_node_id:
-                    return {
-                        "status": "duplicate",
-                        "reason": f"节点 '{target_node_id}' 已经是备用主节点",
-                        "spare_master": existing,
-                    }
-        except Exception:
-            pass
+        existing = self.get_spare_master()
+        if existing and existing.get("node_id") == target_node_id:
+            return {
+                "status": "duplicate",
+                "reason": f"节点 '{target_node_id}' 已经是备用主节点",
+                "spare_master": existing,
+            }
 
         if not self._tcp_server or not self._tcp_server._running:
             return {"status": "error", "reason": "TCP 服务未运行，无法发送通知"}
@@ -6089,26 +5782,24 @@ class Scheduler:
 
         ack_data = self._spare_acks.pop(designate_id)
 
-        # 步骤 3: 持久化到数据库
-        try:
-            if db and _db_available:
-                db.set_spare_master(
-                    node_id=target_node_id,
-                    hostname=target.hostname or "",
-                    address=target.address or "",
-                )
-                db.append_spare_master_log(
-                    direction="designated",
-                    details={
-                        "designate_id": designate_id,
-                        "master_id": NODE_ID,
-                        "target_node_id": target_node_id,
-                        "ack": ack_data,
-                    },
-                )
-                logger.info(f"备用主节点已持久化: {target_node_id}")
-        except Exception as e:
-            logger.warning(f"备用主节点持久化失败: {e}")
+        designated = {
+            "node_id": target_node_id,
+            "hostname": target.hostname or "",
+            "address": target.address or "",
+            "designated_at": time.time(),
+        }
+        self._update_ha_state(
+            spare_master=designated,
+            spare_master_active=False,
+            pending_new_master_id="",
+        )
+        self._append_ha_log("spare_master_logs", "designated", {
+            "designate_id": designate_id,
+            "master_id": NODE_ID,
+            "target_node_id": target_node_id,
+            "ack": ack_data,
+        })
+        logger.info("备用主节点已保存到本地主节点 SQLite: %s", target_node_id)
 
         return {
             "status": "ok",
@@ -6117,12 +5808,7 @@ class Scheduler:
                 f"当主节点需要转让身份时，可转让给该备用主节点。"
             ),
             "designate_id": designate_id,
-            "spare_master": {
-                "node_id": target_node_id,
-                "hostname": target.hostname or "",
-                "address": target.address or "",
-                "designated_at": time.time(),
-            },
+            "spare_master": designated,
         }
 
     def _handle_spare_master_designate(self, client_id: str, msg: dict) -> None:
@@ -6130,7 +5816,7 @@ class Scheduler:
         从节点收到 SPARE_MASTER_DESIGNATE 消息（被指定为备用主节点）。
 
         操作:
-          1. 保存备用主节点指定日志到数据库
+          1. 保存备用主节点指定日志到本机 SQLite
           2. 发送 ACK 确认
         """
         data = msg.get("data", {})
@@ -6142,23 +5828,11 @@ class Scheduler:
             f"designate_id={designate_id}"
         )
 
-        # 保存日志
-        db = _get_db()
-        try:
-            if db and _db_available:
-                db.append_spare_master_log(
-                    direction="designated",
-                    details={
-                        "designate_id": designate_id,
-                        "master_id": master_id,
-                        "role": "spare_master",
-                    },
-                )
-                # 标记本节点为备用主节点
-                db.set_config("node_is_spare_master", "true")
-                logger.info(f"备用主节点日志已保存 (designate_id={designate_id})")
-        except Exception as e:
-            logger.warning(f"备用主节点日志写入失败: {e}")
+        self._append_ha_log("spare_master_logs", "designated", {
+            "designate_id": designate_id,
+            "master_id": master_id,
+            "role": "spare_master",
+        })
 
         # 发送 ACK
         ack_payload = {
@@ -6226,24 +5900,16 @@ class Scheduler:
             f"new_master={new_master_id} (activate_id={activate_id})"
         )
 
-        # 记录激活日志
-        db = _get_db()
-        try:
-            if db and _db_available:
-                db.append_spare_master_log(
-                    direction="activated",
-                    details={
-                        "activate_id": activate_id,
-                        "transfer_id": transfer_id,
-                        "old_master_id": old_master_id,
-                        "new_master_id": new_master_id,
-                    },
-                )
-                db.set_config("spare_master_active", "true")
-                db.set_config("pending_new_master_id", new_master_id)
-                logger.info(f"备用主节点激活日志已保存，等待新主节点 {new_master_id} 上线")
-        except Exception as e:
-            logger.warning(f"备用主节点激活日志写入失败: {e}")
+        self._update_ha_state(
+            spare_master_active=True,
+            pending_new_master_id=new_master_id,
+        )
+        self._append_ha_log("spare_master_logs", "activated", {
+            "activate_id": activate_id,
+            "transfer_id": transfer_id,
+            "old_master_id": old_master_id,
+            "new_master_id": new_master_id,
+        })
 
         # 发送 ACK
         ack_payload = {
@@ -6296,7 +5962,7 @@ class Scheduler:
         操作:
           1. 记录接管完成日志
           2. 退出「暂代主节点」模式
-          3. 更新 DB 状态
+          3. 更新本机 SQLite 状态
         """
         data = msg.get("data", {})
         new_master_id = data.get("new_master_id", "")
@@ -6307,22 +5973,15 @@ class Scheduler:
             f"退出暂代模式 (deactivate_id={deactivate_id})"
         )
 
-        # 记录接管日志
-        db = _get_db()
-        try:
-            if db and _db_available:
-                db.append_spare_master_log(
-                    direction="deactivated",
-                    details={
-                        "deactivate_id": deactivate_id,
-                        "new_master_id": new_master_id,
-                    },
-                )
-                db.set_config("spare_master_active", "false")
-                db.set_config("pending_new_master_id", "")
-                logger.info(f"备用主节点已退出暂代模式，新主节点 {new_master_id} 已接管")
-        except Exception as e:
-            logger.warning(f"备用主节点接管日志写入失败: {e}")
+        self._update_ha_state(
+            spare_master_active=False,
+            pending_new_master_id="",
+        )
+        self._append_ha_log("spare_master_logs", "deactivated", {
+            "deactivate_id": deactivate_id,
+            "new_master_id": new_master_id,
+        })
+        logger.info("备用主节点已退出暂代模式，新主节点 %s 已接管", new_master_id)
 
     # ---- 新主节点启动：向备用主节点发送接管通知 ----
 
@@ -6333,18 +5992,16 @@ class Scheduler:
         通过 TCP 服务器向备用主节点发送 SPARE_MASTER_DEACTIVATE，
         通知其退出暂代模式。
         """
-        db = _get_db()
-        if not db or not _db_available:
-            return
-
         try:
-            spare = db.get_spare_master()
-            spare_active = db.get_config("spare_master_active", "false")
-            pending_new_master = db.get_config("pending_new_master_id", "")
+            self._load_ha_state()
+            with self._ha_state_lock:
+                spare = self._ha_state.get("spare_master")
+                spare_active = bool(self._ha_state.get("spare_master_active"))
+                pending_new_master = self._ha_state.get("pending_new_master_id", "")
 
             # 仅当自己是 pending 的新主节点，且备用主节点处于激活状态时发送
             if (spare and spare.get("node_id")
-                    and spare_active == "true"
+                    and spare_active
                     and pending_new_master == NODE_ID):
                 logger.info(
                     f"检测到本节点为转让目标，备用主节点 {spare['node_id']} 处于激活状态，"
@@ -6388,41 +6045,32 @@ class Scheduler:
                     f"(deactivate_id={deactivate_id})"
                 )
 
-                # 更新 DB 状态
-                db.set_config("spare_master_active", "false")
-                db.set_config("master_role_transferred", "false")
-                db.set_config("pending_new_master_id", "")
-                db.append_spare_master_log(
-                    direction="deactivated",
-                    details={
-                        "deactivate_id": deactivate_id,
-                        "new_master_id": NODE_ID,
-                    },
+                self._update_ha_state(
+                    spare_master_active=False,
+                    pending_new_master_id="",
                 )
+                self._append_ha_log("spare_master_logs", "deactivated", {
+                    "deactivate_id": deactivate_id,
+                    "new_master_id": NODE_ID,
+                })
 
         except Exception as e:
             logger.warning(f"备用主节点接管通知失败: {e}")
 
     def get_spare_master(self) -> Optional[dict]:
-        """获取当前备用主节点信息"""
-        db = _get_db()
-        if db and _db_available:
-            try:
-                spare = db.get_spare_master()
-                if spare and spare.get("node_id"):
-                    # 附加在线状态和激活状态
-                    node_info = self.nodes.get(spare["node_id"])
-                    spare["is_online"] = node_info.is_available() if node_info else False
-                    spare["state"] = node_info.state.value if node_info else "unknown"
-                    # 附加激活状态
-                    try:
-                        spare["is_active"] = db.get_config("spare_master_active", "false") == "true"
-                    except Exception:
-                        spare["is_active"] = False
-                    return spare
-            except Exception:
-                pass
-        return None
+        """获取用户主节点 SQLite 中的当前备用主节点信息。"""
+        self._load_ha_state()
+        with self._ha_state_lock:
+            stored = self._ha_state.get("spare_master")
+            spare = dict(stored) if isinstance(stored, dict) else None
+            active = bool(self._ha_state.get("spare_master_active"))
+        if not spare or not spare.get("node_id"):
+            return None
+        node_info = self.nodes.get(spare["node_id"])
+        spare["is_online"] = node_info.is_available() if node_info else False
+        spare["state"] = node_info.state.value if node_info else "unknown"
+        spare["is_active"] = active
+        return spare
 
     def clear_spare_master(self) -> dict:
         """
@@ -6434,38 +6082,29 @@ class Scheduler:
         if self._effective_role() != "master":
             return {"status": "denied", "reason": "仅主节点可清除备用主节点"}
 
-        db = _get_db()
-        try:
-            if db and _db_available:
-                existing = db.get_spare_master()
-                if existing:
-                    db.clear_spare_master()
-                    db.append_spare_master_log(
-                        direction="undesignated",
-                        details={
-                            "master_id": NODE_ID,
-                            "previous_spare": existing.get("node_id"),
-                            "timestamp": time.time(),
-                        },
-                    )
-                    logger.info(f"备用主节点已清除: {existing.get('node_id')}")
-                    return {
-                        "status": "ok",
-                        "message": f"已取消 '{existing.get('node_id')}' 的备用主节点身份",
-                    }
-        except Exception as e:
-            logger.warning(f"清除备用主节点失败: {e}")
+        existing = self.get_spare_master()
+        self._update_ha_state(
+            spare_master=None,
+            spare_master_active=False,
+            pending_new_master_id="",
+        )
+        if existing:
+            self._append_ha_log("spare_master_logs", "undesignated", {
+                "master_id": NODE_ID,
+                "previous_spare": existing.get("node_id"),
+            })
+            logger.info("备用主节点已清除: %s", existing.get("node_id"))
+            return {
+                "status": "ok",
+                "message": f"已取消 '{existing.get('node_id')}' 的备用主节点身份",
+            }
         return {"status": "ok", "message": "备用主节点已清除（或无现有记录）"}
 
     def get_spare_master_logs(self) -> list:
-        """获取备用主节点操作日志"""
-        db = _get_db()
-        if db and _db_available:
-            try:
-                return db.get_spare_master_logs()
-            except Exception:
-                pass
-        return []
+        """获取本地主节点 SQLite 中的备用主节点操作日志。"""
+        self._load_ha_state()
+        with self._ha_state_lock:
+            return [dict(item) for item in self._ha_state["spare_master_logs"]]
 
     # ================================================================
     # 任务调度
@@ -7008,10 +6647,8 @@ class Scheduler:
                 if getattr(self, '_role_override', None) == "client":
                     _sync_runtime_node_config(node_role="client")
 
-                # 不在此处持久化到数据库 — 主节点收到 TCP 注册消息后
-                # 会通过 _on_tcp_message → register_node() → db.upsert_node()
-                # 统一写入，保证节点管理数据的一致性。
-                # 从节点不应直接写入 master_host/master_port（数据库共享表）。
+                # 节点在线状态以主节点收到的 TCP REGISTER 为事实源。
+                # 从节点只保存 bootstrap 目标，不写共享状态或远端节点表。
 
                 # 主节点注册成功后，请求全量节点列表以同步管理面板
                 try:
@@ -7290,7 +6927,7 @@ class Scheduler:
         """
         从失败的主节点模式自动切换到从节点模式。
 
-        调用时机：MAC 地址不匹配时，若数据库中存在真正的主节点记录，
+        调用时机：MAC 地址不匹配时，若 bootstrap/Tailnet 发现真正的主节点，
         表明本机并非主节点，应自动切换为从节点并尝试连接真正的主节点。
 
         Args:
@@ -7397,28 +7034,26 @@ class Scheduler:
             )
             if os.environ.get("QLH_NODE_ROLE", "").strip() == "master":
                 role_confirmed = True
-            # ★ 数据库已配置的主节点：DB 临时故障（IPv6 网络连不上 IPv4-only 数据库等）
-            #   绝不能触发"加入已有主节点"降级——否则身份无法验证 → provisional
-            #   （is_master=false）→ 前端管理功能全隐藏、/api/bootstrap/info 返回
-            #   is_master=false（Tailnet 发现失效）、PC 从节点连接失败。
-            #   只有 DB 完全未配置的新装机才允许 provisional 加入。
-            database_status = get_database_status()
-            if database_status.get("retired") or database_status.get("configured", False):
-                role_confirmed = True
+            # 主节点身份由本机 SQLite 绑定。旧远端库是否配置不再影响
+            # provisional 判定，也不会隐藏管理能力或 Tailnet 发现入口。
         except Exception:
             role_confirmed = False
 
         identity_reason = getattr(self, "_master_identity_reason", "")
-        identity_confirmed = identity_reason in {"match", "first_run"}
+        identity_confirmed = bool(
+            getattr(self, "_master_identity_verified", False)
+            or identity_reason in {"match", "first_run", "reset"}
+        )
         return not role_confirmed and not identity_confirmed
 
     def _auto_switch_to_client(self, master_host: str, master_port: int) -> None:
         """
         后台线程：MAC 不匹配时自动切换到从节点模式并连接主节点。
 
-        延迟 2 秒执行，确保 TCP 服务端完全就绪。
+        最多等待 2 秒确保 TCP 服务端完全就绪；停止时立即取消。
         """
-        time.sleep(2)
+        if self._startup_cancel_event.wait(timeout=2):
+            return
         try:
             result = self.activate_client_mode(master_host, master_port)
             logger.info(f"自动切换完成: {result.get('message', '')}")
@@ -7426,7 +7061,8 @@ class Scheduler:
             logger.error(f"自动切换到从节点模式失败: {e}")
 
     def _auto_join_tailnet_master_on_startup(self) -> None:
-        time.sleep(5)
+        if self._startup_cancel_event.wait(timeout=5):
+            return
         if not self._running or not self.can_join_existing_master():
             return
         discovery = self.discover_master()
@@ -7447,10 +7083,11 @@ class Scheduler:
         """
         后台线程：从节点启动后自动发现并连接主节点。
 
-        启动后延迟 5 秒（给主节点 DB 心跳足够时间写入），
-        然后尝试发现主节点并连接。
+        启动后最多等待 5 秒（给本机网络与 Tailnet 状态足够时间就绪），
+        然后尝试发现主节点并连接。停止时立即取消等待。
         """
-        time.sleep(5)
+        if self._startup_cancel_event.wait(timeout=5) or not self._running:
+            return
         # 如果已经连接（例如通过 activate_client_mode），跳过
         tcp_client = getattr(self, '_tcp_client', None)
         if tcp_client and tcp_client._running:
@@ -7502,7 +7139,7 @@ class Scheduler:
         - master 节点：完全开放
         - client 节点：需开启"分布式推理优化"后才显示自己的后台
 
-        从节点会自动查询数据库，尝试发现主节点连接信息。
+        从节点使用本机 bootstrap 配置和 Tailnet 尝试发现主节点连接信息。
 
         Returns:
             { node_role, node_id, is_master, max_nodes, master_discovery, ... }
@@ -7542,7 +7179,7 @@ class Scheduler:
             result["identity_verified"] = getattr(self, '_master_identity_verified', False)
             result["identity_reason"] = getattr(self, '_master_identity_reason', '')
 
-        # 从节点：查询数据库以自动发现主节点
+        # 从节点：使用本机 bootstrap/Tailnet 自动发现主节点
         if effective_role == "client":
             try:
                 discovery = self.discover_master()
@@ -7598,19 +7235,6 @@ class Scheduler:
                 self._layer_config_expected.clear()
                 self._layer_config_acks.clear()
 
-        # 持久化到数据库
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.set_config("max_nodes", str(new_max))
-                for pid in phantoms:
-                    try:
-                        db.delete_node(pid)
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"max_nodes DB 持久化失败: {e}")
-
         logger.info(f"最大节点数已更新: {old_max} → {new_max}"
                     + (f" (清理幽灵: {phantoms})" if phantoms else ""))
 
@@ -7627,65 +7251,6 @@ class Scheduler:
     def tcp_server(self):
         """获取 TCP 服务端实例"""
         return self._tcp_server
-
-    # ================================================================
-    # 主节点数据库服务注册（从节点自动发现）
-    # ================================================================
-
-    def _register_master_in_db(self) -> None:
-        """
-        将主节点的连接信息写入数据库 cluster_config 表。
-
-        写入内容:
-        - 局域网 IP + 端口（可变动，从节点连接用）
-        - 物理网卡 MAC 地址集合（不可变，身份验证用）
-        - 心跳时间戳
-
-        从节点启动时通过 discover_master() 查询该信息，
-        即可在前端自动发现主节点，无需手动输入 IP。
-        """
-        db = _get_db()
-        if not db or not _db_available:
-            if get_database_status().get("configured", True):
-                logger.warning("数据库不可用，跳过主节点数据库注册")
-            else:
-                logger.info("数据库未配置，主节点将通过 Tailnet bootstrap 提供发现")
-            return
-
-        lan_ip = getattr(self, '_lan_ip', '')
-        if not lan_ip or lan_ip.startswith("127."):
-            logger.warning(f"未检测到有效的局域网 IP ({lan_ip})，跳过数据库注册")
-            return
-
-        port = self._tcp_server.port if self._tcp_server else SERVER_PORT
-        macs = getattr(self, '_mac_addresses', [])
-
-        # 更新 master 自身节点的地址信息
-        if "master" in self.nodes:
-            self.nodes["master"].address = f"{lan_ip}:{port}"
-
-        # 写入数据库 cluster_config（含 MAC 地址）
-        try:
-            db.register_master(
-                host=lan_ip,
-                port=port,
-                node_id=NODE_ID,
-                mac_addresses=macs if macs else None,
-            )
-            # 同步更新 nodes 表中的 master 记录
-            try:
-                db.upsert_node(
-                    node_id="master", role="master", state="online",
-                    address=f"{lan_ip}:{port}",
-                    hostname=self.nodes.get("master", NodeInfo(node_id="master", role="master")).hostname,
-                    network_type="localhost",
-                )
-            except Exception:
-                pass
-            mac_info = f"，MAC: {macs}" if macs else ""
-            logger.info(f"✅ 主节点已注册到数据库: {lan_ip}:{port}{mac_info}（从节点可自动发现）")
-        except Exception as e:
-            logger.error(f"主节点数据库注册失败: {e}")
 
     def _verify_master_identity(self) -> None:
         """
@@ -7745,33 +7310,6 @@ class Scheduler:
             )
             # 保持本机服务可用，但绝不覆盖已有身份记录。
 
-    def _start_master_db_heartbeat(self) -> None:
-        """
-        启动主节点数据库心跳刷新线程。
-
-        每 30 秒更新 cluster_config.master_last_seen，
-        从节点据此判断主节点是否在线。
-        """
-        t = threading.Thread(target=self._master_db_heartbeat_loop, daemon=True)
-        t.start()
-        logger.info("主节点状态心跳线程已启动（间隔 30s）")
-
-    def _master_db_heartbeat_loop(self) -> None:
-        """主节点数据库心跳循环（后台 daemon 线程）"""
-        while self._running and self._effective_role() == "master":
-            try:
-                db = _get_db()
-                if db and _db_available:
-                    db.update_master_heartbeat()
-            except Exception as e:
-                logger.debug(f"数据库心跳刷新失败: {e}")
-            # 同时更新主节点自身的心跳时间戳（前端在线时长/心跳列显示）
-            with self._nodes_lock:
-                master_node = self.nodes.get("master")
-                if master_node:
-                    master_node.last_heartbeat = time.time()
-            time.sleep(30)
-
     def discover_master(self, *, skip_config: bool = False) -> dict:
         """
         发现主节点的连接信息（供从节点自动发现）。
@@ -7816,14 +7354,8 @@ class Scheduler:
         """
         获取分布式推理开关状态。
 
-        优先级: DB 记录 > 运行时变量 > config.py 默认值。
+        优先级: 运行时变量 > config.py 默认值。
         """
-        db = _get_db()
-        if db and _db_available:
-            try:
-                return db.get_distributed_inference_enabled()
-            except Exception:
-                pass
         if self._distributed_inference_enabled is not None:
             return self._distributed_inference_enabled
         from config import DISTRIBUTED_INFERENCE_ENABLED
@@ -7833,19 +7365,11 @@ class Scheduler:
         """
         设置分布式推理开关。
 
-        - 持久化到 DB
         - 关闭时不影响已连接节点（不会主动断开），仅阻止新的分布式推理请求
 
         Returns:
             {status, enabled, message}
         """
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.set_distributed_inference_enabled(enabled)
-            except Exception as e:
-                return {"status": "error", "reason": f"DB 持久化失败: {e}"}
-
         self._distributed_inference_enabled = bool(enabled)
         if enabled and self._effective_role() == "client":
             self._request_pipeline_worker_opt_in()
@@ -8655,12 +8179,6 @@ class Scheduler:
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.add(client_id)
         self._clear_layer_config_state(client_id)
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.set_layer_assignments({})
-            except Exception:
-                logger.debug("worker 退出后清除分层缓存失败", exc_info=True)
         logger.info("从节点已退出 PyTorch 分层计算: node=%s", client_id)
         self.push_layer_config_to_clients()
 
@@ -8677,12 +8195,6 @@ class Scheduler:
             return
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.discard(client_id)
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.set_layer_assignments({})
-            except Exception:
-                logger.debug("worker 加入后清除分层缓存失败", exc_info=True)
         logger.info("从节点已重新加入 PyTorch 分层计算: node=%s", client_id)
         self.push_layer_config_to_clients()
 
@@ -11542,7 +11054,7 @@ class Scheduler:
                 existing = None
 
             if existing is not None:
-                pass  # 更新路径：锁内修改完成，退出锁后写 DB
+                pass  # 更新路径：锁内修改完成
             else:
                 # 检查容量：只统计在线/已注册节点（离线/幽灵不占位）
                 online_non_master = [
@@ -11565,18 +11077,6 @@ class Scheduler:
                 self.nodes[node_id] = node
 
         if existing is not None:
-            # 更新路径：锁外写 DB
-            db = _get_db()
-            if db and _db_available:
-                try:
-                    db.upsert_node(
-                        node_id=node_id, role="client", node_type=node_type,
-                        state=state_value,
-                        address=address, hostname=hostname_snapshot,
-                        network_type=network_type,
-                    )
-                except Exception as e:
-                    logger.warning(f"手动更新节点 DB 持久化失败: {e}")
             logger.info(
                 f"📝 手动注册节点已更新: {node_id} type={node_type} "
                 f"(hostname={hostname_snapshot}, addr={address}, state={state_value})"
@@ -11584,19 +11084,6 @@ class Scheduler:
             return {"status": "updated", "node_id": node_id,
                     "message": f"节点 '{node_id}' 已更新 (state={state_value})",
                     "state": state_value}
-
-        # 持久化到数据库
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.upsert_node(
-                    node_id=node_id, role="client", node_type=node_type,
-                    state="offline",
-                    address=address, hostname=node.hostname,
-                    network_type=network_type,
-                )
-            except Exception as e:
-                logger.warning(f"手动注册节点 DB 持久化失败: {e}")
 
         logger.info(f"📝 主节点手动注册从节点: {node_id} type={node_type} (hostname={hostname}, addr={address})")
         return {
@@ -11630,14 +11117,6 @@ class Scheduler:
         self._clear_layer_config_state(node_id)
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.discard(node_id)
-
-        db = _get_db()
-        if db and _db_available:
-            try:
-                db.delete_node(node_id)
-                db.set_layer_assignments({})
-            except Exception as e:
-                logger.warning(f"删除节点 DB 持久化失败: {e}")
 
         if self._effective_role() == "master":
             self._push_node_update_to_all_clients(node_id, "remove", old_node)
@@ -11726,7 +11205,7 @@ class Scheduler:
         """
         启动从节点后台线程：监控主节点是否在线。
 
-        每 15 秒检查一次数据库中的主节点心跳时间戳。
+        每 15 秒检查一次本机 TCP 连接状态。
         当检测到主节点从在线变为离线时，记录告警日志。
         当宕机超过 MASTER_DOWN_EMAIL_TIMEOUT 秒时，发送邮件告警。
         当主节点恢复在线时，发送恢复通知 + 自动重连（如已配置）。
@@ -11741,8 +11220,7 @@ class Scheduler:
     def _start_client_health_monitor_locked(self) -> None:
         """在 _client_health_start_lock 内初始化并启动唯一健康线程。"""
 
-        # ★ 从数据库读取主节点当前在线状态作为初始值，
-        #    避免启动时 was_online=False + DB 显示在线 → 误触发 "恢复重连"
+        # 从当前 TCP 连接状态初始化，避免启动时误触发“恢复重连”。
         try:
             initial_health = self.check_master_health()
             initial_online = initial_health.get("master_online", False)

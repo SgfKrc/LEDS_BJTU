@@ -20,21 +20,10 @@
  */
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
 import { isInCidr, isTrustedBootstrapSource } from '../src/common/bootstrap-trust';
 
 describe('control-svc bootstrap 域（阶段 3.2）', () => {
   let app: NestFastifyApplication | null = null;
-
-  const dbDisabledDao = new ConfigDao({
-    host: 'localhost',
-    port: 5432,
-    name: 'x',
-    user: 'postgres',
-    password: '',
-    enabled: false,
-    sslmode: 'prefer',
-  });
 
   beforeEach(() => {
     delete process.env.QLH_BOOTSTRAP_ENABLED;
@@ -59,10 +48,7 @@ describe('control-svc bootstrap 域（阶段 3.2）', () => {
     const { AppModule } = require('../src/app');
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
-    })
-      .overrideProvider(ConfigDao)
-      .useValue(dbDisabledDao)
-      .compile();
+    }).compile();
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);
     const { JsonDetailFilter } = require('../src/common/json-detail.filter');

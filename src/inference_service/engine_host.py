@@ -2040,11 +2040,10 @@ class EngineHost:
 
     def _sync_remote_task_worker_providers(
         self,
-    ) -> Dict[str, Any]:
+    ) -> list[str]:
         """1.2d 复制自 api_server._sync_remote_task_worker_providers（api_server.py:2680-2692）；
         宿主适配：scheduler → self._scheduler（None 时无远端 provider）。"""
         from task_provider import ProviderError
-        """Register stable remote Provider objects without changing request policy."""
         registered = []
         if self._scheduler is None:
             return []
@@ -2062,12 +2061,11 @@ class EngineHost:
 
     def _eligible_remote_task_worker_provider_ids(
         self, model_identity, stage_type: str, *, limit: int = 4,
-    ) -> Dict[str, Any]:
+    ) -> list[str]:
         """1.2d 复制自 api_server._eligible_remote_task_worker_provider_ids
         （api_server.py:2694-2718）；宿主适配：_cfg.TASK_WORKER_EXPERIMENTAL_ENABLED
         → config、scheduler → self._scheduler。"""
         import config as _cfg
-        """Return healthy exact-model Workers in deterministic least-loaded order."""
         if not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
             return []
         if self._scheduler is None:
@@ -2970,8 +2968,8 @@ class EngineHost:
                     engine="island",
                 )
             )
-            self._init_kv_cache()
             self._reset_runtime_conversation_state(clear_histories=False)
+            self._init_kv_cache()
             self._conversation_stats = {
                 "total_prompt_tokens": 0,
                 "total_generated_tokens": 0,
@@ -3034,8 +3032,8 @@ class EngineHost:
             )
         )
 
-        self._init_kv_cache()
         self._reset_runtime_conversation_state(clear_histories=False)
+        self._init_kv_cache()
         self._conversation_stats = {
             "total_prompt_tokens": 0,
             "total_generated_tokens": 0,
@@ -3074,8 +3072,7 @@ class EngineHost:
     # ------------------------------------------------------------------
     # 外部推理整请求路由（1.2c 复制自 api_server._execute_external_chat
     # api_server.py:2294-2400；宿主适配：conversation_stats → 实例属性、
-    # model_host._db_available → self._host、scheduler.record_task_complete
-    # → self._on_task_complete 回调（1.4 注入））
+    # scheduler.record_task_complete → self._on_task_complete 回调（1.4 注入））
     # ------------------------------------------------------------------
     def execute_external_chat(
         self,

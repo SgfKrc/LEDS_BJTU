@@ -812,6 +812,207 @@ def test_followups_fallback_on_garbage():
     assert any("量化" in q or "模型" in q for q in questions)
 
 
+# ----------------------------------------------------------------------
+# 13. P2-B Q14：EngineHost 关键实现的真实执行覆盖
+# ----------------------------------------------------------------------
+def test_engine_host_initializes_profiled_kv_cache_from_model_config(monkeypatch):
+    from paged_kv_cache import PagedKVCache
+
+    host = FakeEngineHost()
+    host._host = SimpleNamespace(
+        model=SimpleNamespace(config=SimpleNamespace(
+            num_attention_heads=12,
+            hidden_size=768,
+        )),
+        get_device=lambda: torch.device("cpu"),
+    )
+    host._device_profile = {"tier": "edge", "gpu": {}}
+    monkeypatch.setattr(
+        host, "_ensure_device_profile", lambda: host._device_profile,
+    )
+
+    original_from_profile = PagedKVCache.from_profile
+    captured = []
+
+    def observe_from_profile(cls, **kwargs):
+        captured.append(kwargs)
+        return original_from_profile(**kwargs)
+
+    monkeypatch.setattr(
+        PagedKVCache, "from_profile", classmethod(observe_from_profile),
+    )
+
+    cache = host._init_kv_cache()
+
+    assert cache.page_size == 64
+    assert cache.max_pages == 64
+    assert cache.device == "cpu"
+    assert captured == [{
+        "profile": {"tier": "edge", "gpu": {}},
+        "device": "cpu",
+        "dtype": torch.float16,
+        "num_heads": 12,
+        "head_dim": 64,
+    }]
+
+
+def test_engine_host_auto_load_selects_sorted_gguf_candidate(tmp_path, monkeypatch):
+    import config as cfg
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    selected = models_dir / "a-first.gguf"
+    selected.write_bytes(b"test-gguf")
+    (models_dir / "z-second.gguf").write_bytes(b"test-gguf")
+
+    class RecordingModelHost:
+        def __init__(self):
+            self.full_chat_execution_lock = threading.RLock()
+            self.model = None
+            self.model_loaded = False
+            self.quant_type = None
+            self.calls = []
+
+        @staticmethod
+        def get_device():
+            return torch.device("cpu")
+
+        def load_model(self, **kwargs):
+            self.calls.append(kwargs)
+            self.quant_type = kwargs["quant_type"]
+
+    host = FakeEngineHost()
+    recorder = RecordingModelHost()
+    host._host = recorder
+    host._device_profile = {"tier": "edge", "gpu": {}}
+    monkeypatch.setattr(
+        host, "_ensure_device_profile", lambda: host._device_profile,
+    )
+    monkeypatch.setattr(cfg, "GGUF_MODEL_PATH", str(models_dir / "missing.gguf"))
+    monkeypatch.setattr(cfg, "MODEL_PATH", str(tmp_path / "missing-pytorch"))
+    monkeypatch.setattr(cfg, "INFERENCE_ENGINE", "pytorch")
+    monkeypatch.setattr(cfg, "QUANT_TYPE", "fp16")
+    monkeypatch.setattr(cfg, "USE_COMPILE", True)
+
+    host._auto_load_default_model()
+
+    assert recorder.calls == [{
+        "model_path": str(selected),
+        "quant_type": "int4",
+        "profile": {"tier": "edge", "gpu": {}},
+        "engine": "llama_cpp",
+    }]
+    assert host._host.model_loaded is True
+    assert host._host.current_quant == "int4"
+    assert host._kv_cache.page_size == 64
+
+
+def test_engine_host_remote_worker_selection_enforces_feature_health_model_and_load(
+        monkeypatch):
+    import config as cfg
+
+    class Provider:
+        def __init__(self, provider_id, supports=True):
+            self.provider_id = provider_id
+            self._supports = supports
+
+        def supports_model_identity(self, model_identity, stage_type):
+            return self._supports and model_identity == "model-a" and stage_type == "full_inference"
+
+    class Coordinator:
+        def __init__(self, statuses):
+            self._statuses = statuses
+            self.providers = {}
+
+        def has_provider(self, provider_id):
+            return provider_id in self.providers
+
+        def register_provider(self, provider):
+            self.providers[provider.provider_id] = provider
+
+        def provider_status(self):
+            return self._statuses
+
+    providers = [
+        Provider("remote-alpha"),
+        Provider("remote-beta"),
+        Provider("remote-wrong-model", supports=False),
+        Provider("remote-unavailable"),
+    ]
+    statuses = [
+        {
+            "provider_id": "remote-alpha",
+            "provider_kind": "remote_full_worker",
+            "healthy": True,
+            "available": True,
+            "supported_stage_types": ["full_inference"],
+            "max_concurrency": 2,
+            "active_reservations": 1,
+        },
+        {
+            "provider_id": "remote-beta",
+            "provider_kind": "remote_full_worker",
+            "healthy": True,
+            "available": True,
+            "supported_stage_types": ["full_inference"],
+            "max_concurrency": 2,
+            "active_reservations": 0,
+        },
+        {
+            "provider_id": "remote-wrong-model",
+            "provider_kind": "remote_full_worker",
+            "healthy": True,
+            "available": True,
+            "supported_stage_types": ["full_inference"],
+            "max_concurrency": 1,
+            "active_reservations": 0,
+        },
+        {
+            "provider_id": "remote-unavailable",
+            "provider_kind": "remote_full_worker",
+            "healthy": False,
+            "available": False,
+            "supported_stage_types": ["full_inference"],
+            "max_concurrency": 1,
+            "active_reservations": 0,
+        },
+    ]
+    host = FakeEngineHost()
+    host._scheduler = SimpleNamespace(
+        remote_task_worker_providers=lambda: providers,
+    )
+    coordinator = Coordinator(statuses)
+    host._task_graph_coordinator = coordinator
+    monkeypatch.setattr(cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
+    assert host._eligible_remote_task_worker_provider_ids(
+        "model-a", "full_inference",
+    ) == []
+
+    monkeypatch.setattr(cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
+    assert host._sync_remote_task_worker_providers() == [
+        "remote-alpha",
+        "remote-beta",
+        "remote-unavailable",
+        "remote-wrong-model",
+    ]
+    assert host._eligible_remote_task_worker_provider_ids(
+        "model-a", "full_inference", limit=2,
+    ) == ["remote-beta", "remote-alpha"]
+
+
+def test_engine_host_pipeline_worker_reservation_requires_live_scheduler_check():
+    host = FakeEngineHost()
+    assert host._pipeline_worker_is_reserved() is False
+
+    host._scheduler = SimpleNamespace(
+        has_pipeline_worker_reservation=lambda: True,
+    )
+    assert host._pipeline_worker_is_reserved() is True
+
+    host._scheduler = SimpleNamespace()
+    assert host._pipeline_worker_is_reserved() is False
+
+
 def test_followups_generation_failure_non_fatal():
     host = FakeEngineHost()
 
@@ -870,8 +1071,6 @@ def test_external_chat_routes_and_persists(monkeypatch):
     monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)  # 测试不落盘
 
     host = FakeEngineHost()
-    host._host._db_available = True  # 避免走 local_store 落盘分支
-
     req = ChatRequest(message="你好", allow_external=True, client_node_type="pc")
     result = host.execute_external_chat(
         req,
@@ -901,7 +1100,6 @@ def test_external_chat_strips_thinking_when_disabled(monkeypatch):
     monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
 
     host = FakeEngineHost()
-    host._host._db_available = True
     req = ChatRequest(message="hi", allow_external=True, show_thinking=False)
     result = host.execute_external_chat(req, [], "s2")
     assert "内部" not in result["content"]
@@ -918,7 +1116,6 @@ def make_full_host(fake_model_cls=FakeModel):
     """真实 EngineHost + 假模型注入（测试 chat_full 复制实现本体）。"""
     host = EngineHost()
     host._host = fake_model_cls()
-    host._host._db_available = True
     return host
 
 
@@ -1017,8 +1214,7 @@ def test_task_graph_with_slot_real_execution(monkeypatch):
     monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", True)
     monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
 
-    host = make_full_host()  # 真实 EngineHost + FakeModel（_db_available=True）
-    host._host._db_available = False  # 走 local_store 分支
+    host = make_full_host()
     host._host.full_chat_execution_lock = threading.RLock()  # FakeModel 缺锁
     host._active_session_id = "s1"
     host._session_histories["s1"] = []
@@ -1097,7 +1293,6 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
     monkeypatch.setattr(_cfg, "TASK_WORKER_EXPERIMENTAL_ENABLED", True)
 
     host = make_full_host()
-    host._host._db_available = False
     host._host.full_chat_execution_lock = threading.RLock()
     host._active_session_id = "s1"
     host._session_histories["s1"] = []
@@ -1355,20 +1550,9 @@ def test_engine_host_persists_locally_without_legacy_export(monkeypatch):
             ("local", sid, "increment", None)
         ),
     )
-    fake_db = SimpleNamespace(
-        get_save_history=lambda: True,
-        save_message=lambda sid, role, content, metrics=None: events.append(
-            ("remote", sid, role, content)
-        ),
-        increment_session_message_count=lambda sid: events.append(
-            ("remote", sid, "increment", None)
-        ),
-    )
     monkeypatch.setattr(engine_host_module, "_local_store", fake_local_store)
-    monkeypatch.setitem(sys.modules, "db", fake_db)
 
     host = EngineHost()
-    host._host._db_available = False
     assert host._persist_conversation_turn("s-local", "q", "a", {}) is True
     assert events[:3] == [
         ("local", "s-local", "user", "q"),
@@ -1431,7 +1615,6 @@ def test_entry_module_no_heavy_imports():
 @pytest.fixture(scope="module")
 def live_inference_svc():
     """起真实 inference-svc（随机端口），engine_host 换为 FakeEngineHost。"""
-    import socket
     import threading
 
     import requests
@@ -1439,14 +1622,9 @@ def live_inference_svc():
 
     from inference_svc_main import build_app
 
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-
     app = build_app("master", engine_host=FakeEngineHost())
 
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -1454,8 +1632,17 @@ def live_inference_svc():
     import time
     deadline = time.time() + 15
     last_error = None
+    port = None
     while time.time() < deadline:
         try:
+            for running_server in getattr(server, "servers", []):
+                sockets = getattr(running_server, "sockets", None) or []
+                if sockets:
+                    port = sockets[0].getsockname()[1]
+                    break
+            if port is None:
+                time.sleep(0.1)
+                continue
             response = requests.get(
                 f"http://127.0.0.1:{port}/v1/health", timeout=1
             )
@@ -1468,6 +1655,7 @@ def live_inference_svc():
         server.should_exit = True
         thread.join(timeout=5)
         pytest.fail(f"inference-svc 未在 15 秒内就绪: {last_error}")
+    assert port is not None
     yield f"http://127.0.0.1:{port}"
     server.should_exit = True
     thread.join(timeout=5)

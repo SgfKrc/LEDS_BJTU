@@ -2,9 +2,8 @@
  * M1 复核补强测试：
  *  1. 启动自动迁移接线（旧 model_registry.json 升级后对 GET /models/registry 可见）；
  *  2. backup 数据一致性（WAL 未 checkpoint 的数据进入备份）；
- *  3. projector clientFactory 幂等投影；
- *  4. settings pg 投影抛异常时本地事实源成功；
- *  5. cluster_endpoints 同 cluster_id 去重（UNIQUE 约束）。
+ *  3. settings 写入主节点 SQLite；
+ *  4. cluster_endpoints 同 cluster_id 去重（UNIQUE 约束）。
  */
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -13,12 +12,9 @@ import { Test } from '@nestjs/testing';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { AppModule } from '../src/app';
 import { SqliteStore } from '../src/data/sqlite-store';
-import { OutboxService } from '../src/data/outbox.service';
-import { PostgresProjector } from '../src/data/postgres-projector';
 import { ClusterSettingsRepository } from '../src/data/cluster-settings-repository';
 import { ModelRegistryRepository } from '../src/data/model-registry-repository';
 import { ClusterEndpointsRepository } from '../src/data/cluster-endpoints-repository';
-import { ConfigDao } from '../src/data/config-dao';
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'qlh-m1rev-'));
@@ -53,10 +49,6 @@ describe('M1 启动自动迁移接线', () => {
   it('应用启动时自动导入旧注册表，GET /models/registry 可见存量数据', async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(sqliteStore)
-      .overrideProvider(ConfigDao).useValue({
-        enabled: false, dbEnabled: () => false,
-        getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
-      })
       .compile();
     app = moduleRef.createNestApplication(new FastifyAdapter()) as NestFastifyApplication;
     await app.init(); // 触发 onApplicationBootstrap
@@ -68,10 +60,6 @@ describe('M1 启动自动迁移接线', () => {
     await app.close();
     const moduleRef2 = await Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(SqliteStore).useValue(sqliteStore)
-      .overrideProvider(ConfigDao).useValue({
-        enabled: false, dbEnabled: () => false,
-        getConnectionInfo: () => ({}), ping: async () => ({ ok: true }),
-      })
       .compile();
     app = moduleRef2.createNestApplication(new FastifyAdapter()) as NestFastifyApplication;
     await app.init();
@@ -106,51 +94,12 @@ describe('backup WAL 一致性', () => {
   });
 });
 
-describe('projector clientFactory 幂等投影', () => {
-  it('投影后事件被标记；重复执行不重复投影', async () => {
-    const store = new SqliteStore(join(tempDir(), 'p.sqlite3'));
-    store.open();
-    const outbox = new OutboxService(store);
-    const event = outbox.enqueue('model_registry', 'created', { model_id: 'm' });
-    expect(outbox.pendingCount()).toBe(1);
-
-    const queries: Array<{ sql: string; params: unknown[] }> = [];
-    const fakeClient = {
-      async connect() { /* noop */ },
-      async query(sql: string, params: unknown[]) {
-        queries.push({ sql, params });
-        return { rowCount: 1, rows: [] }; // 首次投影成功
-      },
-      async end() { /* noop */ },
-    };
-    const config = { dbEnabled: () => true, getConnectionInfo: () => ({ host: 'x', port: 1, db: 'd' }) };
-    const projector = new PostgresProjector(config as any, outbox, {
-      baseIntervalMs: 1000, maxIntervalMs: 2000,
-      clientFactory: () => fakeClient as any,
-    });
-    const first = await projector.runOnce();
-    expect(first.projected).toBe(1);
-    expect(outbox.pendingCount()).toBe(0); // 已标记投影
-    // 重复执行：无 pending，不产生投影 INSERT（CREATE TABLE IF NOT EXISTS 仍会执行）
-    const second = await projector.runOnce();
-    expect(second.projected).toBe(0);
-    const inserts = queries.filter((q) => q.sql.includes('INSERT INTO outbox_projection'));
-    expect(inserts.length).toBe(1);
-    store.close();
-  });
-});
-
-describe('settings pg 投影抛异常', () => {
-  it('setUserSettings 抛异常 → 本地事实源成功 ok', async () => {
+describe('settings 本地事实源', () => {
+  it('设置直接写入主节点 SQLite', async () => {
     const store = new SqliteStore(join(tempDir(), 's.sqlite3'));
     store.open();
-    const fakeDao = {
-      dbEnabled: () => true,
-      setUserSettings: async () => { throw new Error('pg exploded'); },
-    } as unknown as ConfigDao;
     const { Test } = require('@nestjs/testing') as typeof import('@nestjs/testing');
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(ConfigDao).useValue(fakeDao)
       .overrideProvider(SqliteStore).useValue(store)
       .compile();
     const app = moduleRef.createNestApplication(new FastifyAdapter());

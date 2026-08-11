@@ -20,7 +20,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
 import { ReviewStore } from '../src/data/review-store';
 import { ReviewMailer, ReviewService } from '../src/modules/review/review.service';
 
@@ -49,16 +48,6 @@ describe('control-svc review 域（阶段 3.2）', () => {
   let store: ReviewStore;
   let mailer: FakeMailer;
 
-  const dbDisabledDao = new ConfigDao({
-    host: 'localhost',
-    port: 5432,
-    name: 'x',
-    user: 'postgres',
-    password: '',
-    enabled: false,
-    sslmode: 'prefer',
-  });
-
   beforeEach(() => {
     tmpFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'control-review-')), 'review_tickets.json');
     store = new ReviewStore(tmpFile);
@@ -85,8 +74,6 @@ describe('control-svc review 域（阶段 3.2）', () => {
       .useValue(store)
       .overrideProvider(ReviewService)
       .useValue(new ReviewService(store, mailer))
-      .overrideProvider(ConfigDao)
-      .useValue(dbDisabledDao)
       .compile();
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);

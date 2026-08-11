@@ -1,60 +1,64 @@
-"""The retired PostgreSQL path must never reconnect from request code."""
+"""Static gates for the retired remote PostgreSQL runtime."""
 
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from pathlib import Path
+import re
 
 
-def test_retired_database_path_never_attempts_connection(monkeypatch):
-    import db
-    import scheduler
-
-    calls = []
-
-    def fail_pool():
-        calls.append(True)
-        raise AssertionError("retired path must not call get_pool")
-
-    monkeypatch.setattr(db, "get_pool", fail_pool)
-    monkeypatch.setattr(scheduler, "_db", None)
-    monkeypatch.setattr(scheduler, "_db_available", False)
-    monkeypatch.setattr(scheduler, "_db_attempted", True)
-    monkeypatch.setattr(scheduler, "_db_retry_after", 0.0)
-    monkeypatch.setattr(scheduler, "_db_last_error", "")
-
-    assert scheduler._get_db() is None
-    assert scheduler._get_db(force_retry=True) is None
-
-    assert calls == []
-    status = scheduler.get_database_status()
-    assert status["attempted"] is True
-    assert status["available"] is False
-    assert status["retry_in_seconds"] == 0
-    assert status["retired"] is True
-    assert "退场" in status["last_error"]
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_unconfigured_install_uses_local_store_without_retry(monkeypatch):
-    import db
-    import scheduler
+def test_python_runtime_has_no_postgresql_entrypoint():
+    assert not (ROOT / "src" / "db.py").exists()
+    assert not (ROOT / "scripts" / "setup_test_db.py").exists()
+    assert not (ROOT / "scripts" / "verify_fixes.py").exists()
 
-    calls = []
-    monkeypatch.setattr(db, "DB_ENABLED", False)
-    monkeypatch.setattr(db, "get_pool", lambda: calls.append(True))
-    monkeypatch.setattr(scheduler, "_db", None)
-    monkeypatch.setattr(scheduler, "_db_available", False)
-    monkeypatch.setattr(scheduler, "_db_attempted", True)
-    monkeypatch.setattr(scheduler, "_db_disabled", True)
-    monkeypatch.setattr(scheduler, "_db_retry_after", 0.0)
-    monkeypatch.setattr(scheduler, "_db_last_error", "")
+    forbidden = {
+        "psycopg": [],
+        "QLH_DB_": [],
+    }
+    import_pattern = re.compile(r"(?m)^\s*(?:from\s+db\s+import|import\s+db\b)")
+    imports = []
+    for path in (ROOT / "src").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        relative = path.relative_to(ROOT).as_posix()
+        for token in forbidden:
+            if token in source:
+                forbidden[token].append(relative)
+        if import_pattern.search(source):
+            imports.append(relative)
 
-    assert scheduler._get_db() is None
-    assert scheduler._get_db(force_retry=True) is None
+    assert forbidden == {"psycopg": [], "QLH_DB_": []}
+    assert imports == []
 
-    assert calls == []
-    status = scheduler.get_database_status()
-    assert status["configured"] is False
-    assert status["retry_in_seconds"] == 0
-    assert "本地 SQLite" in status["last_error"]
-    assert status["retired"] is True
+
+def test_scheduler_and_model_host_expose_no_database_compatibility_flags():
+    scheduler_source = (ROOT / "src" / "scheduler.py").read_text(encoding="utf-8")
+    model_host_source = (ROOT / "src" / "model_host.py").read_text(encoding="utf-8")
+    for token in (
+        "_get_db",
+        "_db_available",
+        "_db_disabled",
+        "_register_master_in_db",
+        "_start_master_db_heartbeat",
+        "_start_database_reconnect_monitor",
+    ):
+        assert token not in scheduler_source
+        assert token not in model_host_source
+
+
+def test_control_runtime_has_no_postgresql_driver_or_projector():
+    assert not (ROOT / "control" / "src" / "data" / "config-dao.ts").exists()
+    assert not (ROOT / "control" / "src" / "data" / "postgres-projector.ts").exists()
+
+    runtime_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "control" / "src").rglob("*.ts")
+    )
+    assert "from 'pg'" not in runtime_sources
+    assert 'from "pg"' not in runtime_sources
+    assert "import('pg')" not in runtime_sources
+    assert 'import("pg")' not in runtime_sources
+
+    package_source = (ROOT / "control" / "package.json").read_text(encoding="utf-8")
+    assert '"pg"' not in package_source
+    assert '"@types/pg"' not in package_source

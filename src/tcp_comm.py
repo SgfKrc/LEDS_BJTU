@@ -997,7 +997,7 @@ class TCPServer:
 
     def __init__(self, host: str = None, port: int = None):
         self.host = host or SERVER_IP
-        self.port = port or SERVER_PORT
+        self.port = SERVER_PORT if port is None else port
         self.sock: Optional[socket.socket] = None    # 主监听 socket（兼容旧引用）
         self._socks: list[socket.socket] = []        # 双栈监听 socket 列表
         self.clients: dict[str, ClientConn] = {}     # client_id -> ClientConn
@@ -1024,6 +1024,8 @@ class TCPServer:
         self.on_disconnect = on_disconnect
         self._socks = self._create_listen_sockets(self.host, self.port)
         self.sock = self._socks[0] if self._socks else None
+        if self.port == 0 and self.sock is not None:
+            self.port = int(self.sock.getsockname()[1])
         self._running = True
         bind_desc = ", ".join(
             f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in self._socks
@@ -1051,22 +1053,30 @@ class TCPServer:
     def _create_listen_sockets(cls, host: str, port: int) -> list[socket.socket]:
         """创建监听 socket 列表（IPv6 socket 显式 V6ONLY=1，与 v4 socket 同端口共存）。"""
         socks: list[socket.socket] = []
-        for bind_host in cls._resolve_bind_hosts(host):
-            if bind_host == "::" or _ipv6_literal(bind_host):
-                family = socket.AF_INET6
-            else:
-                family = socket.AF_INET
-            sock = socket.socket(family, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if family == socket.AF_INET6:
-                try:
-                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                except OSError:
-                    pass
-            sock.bind((bind_host, port))
-            sock.listen(2)  # 两台从节点
-            sock.settimeout(1.0)  # accept 超时 1s，以便检查 _running
-            socks.append(sock)
+        bind_port = port
+        try:
+            for bind_host in cls._resolve_bind_hosts(host):
+                if bind_host == "::" or _ipv6_literal(bind_host):
+                    family = socket.AF_INET6
+                else:
+                    family = socket.AF_INET
+                sock = socket.socket(family, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    try:
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    except OSError:
+                        pass
+                sock.bind((bind_host, bind_port))
+                if bind_port == 0:
+                    bind_port = int(sock.getsockname()[1])
+                sock.listen(2)  # 两台从节点
+                sock.settimeout(1.0)  # accept 超时 1s，以便检查 _running
+                socks.append(sock)
+        except Exception:
+            for sock in socks:
+                sock.close()
+            raise
         if not socks:
             raise OSError(f"无法创建监听 socket: {host}:{port}")
         return socks

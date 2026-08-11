@@ -780,8 +780,7 @@ async def _startup_device_detection():
     except Exception as e:
         logger.warning(f"日志保留线程启动失败: {e}")
 
-    model_host._db_available = False
-    logger.info("远端 PostgreSQL 运行时已退场，使用主节点 SQLite")
+    logger.info("主节点 SQLite 已就绪")
 
     # P3: 启动邮件投票轮询器（仅 master 节点，IMAP 轮询不需要 CUDA）
     try:
@@ -3225,7 +3224,7 @@ async def load_model(req: LoadModelRequest):
                 profile=device_profile,
                 engine=effective_engine if effective_engine != "auto" else None,
                 model_path=resolved_model_path,
-                db_experimental_models=_get_db_experimental_models(),
+                db_experimental_models=_get_registered_experimental_models(),
             ),
             prepare=_prepare_model_load,
             release_worker_reservation=True,
@@ -4316,32 +4315,50 @@ def _execute_task_graph_chat_with_slot(
         if TASK_WORKER_EXPERIMENTAL_ENABLED and model_identity is None:
             auto_fallback_reason = "model_identity_unavailable"
         elif TASK_WORKER_EXPERIMENTAL_ENABLED:
-            auto_provider_ids = _eligible_remote_task_worker_provider_ids(
-                model_identity,
-                "full_inference",
-            )
+            template_stages, final_stage_id = dual_candidate_template()
+            eligible_by_stage: dict[str, list[str]] = {}
+            for stage in template_stages:
+                if stage.stage_type != "full_inference":
+                    continue
+                stage_model_identity = (
+                    stage.model_identity or model_identity
+                )
+                eligible = _eligible_remote_task_worker_provider_ids(
+                    stage_model_identity,
+                    stage.stage_type,
+                )
+                eligible_by_stage[stage.stage_id] = eligible
+                for provider_id in eligible:
+                    if provider_id not in auto_provider_ids:
+                        auto_provider_ids.append(provider_id)
             if not auto_provider_ids:
                 auto_fallback_reason = "no_eligible_remote_provider"
             else:
-                template_stages, final_stage_id = dual_candidate_template()
-                candidate_index = 0
+                selected_by_model: dict[ModelIdentity, int] = {}
                 planned_stages = []
                 for stage in template_stages:
                     if stage.stage_type != "full_inference":
                         planned_stages.append(stage)
                         continue
-                    if candidate_index >= len(auto_provider_ids):
+                    stage_model_identity = (
+                        stage.model_identity or model_identity
+                    )
+                    eligible = eligible_by_stage.get(stage.stage_id, [])
+                    candidate_index = selected_by_model.get(
+                        stage_model_identity, 0,
+                    )
+                    selected_by_model[stage_model_identity] = candidate_index + 1
+                    if candidate_index >= len(eligible):
                         planned_stages.append(replace(
                             stage,
                             provider="local_full_model",
                             fallback_providers=(),
                             pure=True,
                         ))
-                        candidate_index += 1
                         continue
-                    primary = auto_provider_ids[candidate_index]
+                    primary = eligible[candidate_index]
                     other_remotes = [
-                        provider_id for provider_id in auto_provider_ids
+                        provider_id for provider_id in eligible
                         if provider_id != primary
                     ][:3]
                     planned_stages.append(replace(
@@ -4352,7 +4369,6 @@ def _execute_task_graph_chat_with_slot(
                         ),
                         pure=True,
                     ))
-                    candidate_index += 1
                 stages = planned_stages
 
     request_id = str(_request_id_ctx.get("-") or "-")
@@ -5141,7 +5157,7 @@ def _commit_interactive_history(
 ) -> bool:
     """interactive 模式完成时的一次性会话事务提交（user + assistant）。
 
-    与 full 模式同一持久化语义（db.save_message / local_store 等价），
+    与 full 模式使用同一主节点 SQLite 持久化语义，
     但只调用一次、一次写入两条消息，供 done 事件上报 history_committed。
     返回是否实际写入。
     """
@@ -6357,7 +6373,7 @@ class RegisterModelRequest(BaseModel):
     description: str = Field(default="", description="简短说明")
 
 
-def _get_db_experimental_models() -> list[dict]:
+def _get_registered_experimental_models() -> list[dict]:
     """从主节点 SQLite 读取用户注册的实验模型。"""
     try:
         return _local_store.get_local_experimental_models()
@@ -6403,7 +6419,7 @@ def _get_all_model_configs() -> list[mc.ModelConfig]:
     """Return builtin + DB-registered models without hiding unavailable entries."""
     models = mc.get_builtin_models()
     seen = {m.model_id for m in models}
-    for entry in _get_db_experimental_models():
+    for entry in _get_registered_experimental_models():
         model = _db_entry_to_model_config(entry)
         if model and model.model_id not in seen:
             models.append(model)
@@ -6494,7 +6510,7 @@ def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
     if not model_id:
         return
 
-    model = mc.get_model_config(model_id, _get_db_experimental_models())
+    model = mc.get_model_config(model_id, _get_registered_experimental_models())
     if model is None:
         raise HTTPException(status_code=404, detail=f"模型 '{model_id}' 未在注册表中找到。")
 
@@ -6516,7 +6532,7 @@ def _resolve_model_path_for_engine(model_id: Optional[str], engine: str) -> Opti
     """Resolve a registered model path for the requested engine, including DB models."""
     if not model_id:
         return None
-    model = mc.get_model_config(model_id, _get_db_experimental_models())
+    model = mc.get_model_config(model_id, _get_registered_experimental_models())
     if model is None:
         return None
     payload = _model_api_payload(model)
@@ -6532,7 +6548,7 @@ def _effective_engine_for_model(model_id: Optional[str], engine: str) -> str:
     """Return the concrete engine to pass into ModelManager."""
     if engine != "auto" or not model_id:
         return engine
-    model = mc.get_model_config(model_id, _get_db_experimental_models())
+    model = mc.get_model_config(model_id, _get_registered_experimental_models())
     if model is None:
         return engine
     payload = _model_api_payload(model)
@@ -6590,7 +6606,7 @@ async def switch_model(req: SwitchModelRequest):
                 profile=device_profile,
                 engine=effective_engine if effective_engine != "auto" else None,
                 model_path=resolved_model_path,
-                db_experimental_models=_get_db_experimental_models(),
+                db_experimental_models=_get_registered_experimental_models(),
             ),
             prepare=_prepare_model_switch,
             release_worker_reservation=True,
@@ -6627,7 +6643,7 @@ async def switch_model(req: SwitchModelRequest):
 @app.get("/api/models/registry")
 async def list_model_registry():
     """列出用户注册的实验模型配置。"""
-    db_models = _get_db_experimental_models()
+    db_models = _get_registered_experimental_models()
     return {"models": db_models}
 
 
@@ -7642,6 +7658,8 @@ async def check_can_vote():
 @app.post("/api/cluster/review/expire-check")
 async def trigger_expire_check():
     """手动触发审查工单过期检查。"""
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="仅主节点可执行此操作")
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
@@ -7655,6 +7673,8 @@ async def trigger_expire_check():
 @app.delete("/api/cluster/review/tickets/{ticket_id}")
 async def delete_review_ticket(ticket_id: str):
     """删除单个审查工单（所有状态均可）。"""
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="仅主节点可执行此操作")
     try:
         from review import ReviewManager
         ok = ReviewManager().delete_ticket(ticket_id)
@@ -7670,6 +7690,8 @@ async def delete_review_ticket(ticket_id: str):
 @app.delete("/api/cluster/review/tickets")
 async def delete_resolved_review_tickets():
     """批量删除所有已解决（approved/rejected/expired）的审查工单。"""
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="仅主节点可执行此操作")
     try:
         from review import ReviewManager
         count = ReviewManager().delete_resolved()
@@ -7681,6 +7703,8 @@ async def delete_resolved_review_tickets():
 @app.post("/api/cluster/review/mail-poll")
 async def trigger_mail_poll():
     """手动触发邮件投票轮询（用于测试 / 调试）。"""
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="仅主节点可执行此操作")
     try:
         from email_notifier import poll_mail_once
         # IMAP 轮询为同步网络操作（可阻塞数秒），放入线程池执行

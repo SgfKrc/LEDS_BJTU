@@ -25,7 +25,6 @@ import * as path from 'path';
 import JSZip from 'jszip';
 import { createApp } from '../src/app';
 import type { NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ConfigDao } from '../src/data/config-dao';
 import { LogBuffer } from '../src/data/log-buffer';
 import { LogFileStore } from '../src/data/log-file-store';
 
@@ -34,16 +33,6 @@ describe('control-svc logs 域（阶段 3.2）', () => {
   let tmpLogDir: string;
   let buffer: LogBuffer;
   const savedToken = process.env.QLH_LOG_ADMIN_TOKEN;
-
-  const dbDisabledDao = new ConfigDao({
-    host: 'localhost',
-    port: 5432,
-    name: 'x',
-    user: 'postgres',
-    password: '',
-    enabled: false,
-    sslmode: 'prefer',
-  });
 
   beforeEach(() => {
     tmpLogDir = fs.mkdtempSync(path.join(os.tmpdir(), 'control-logs-'));
@@ -75,8 +64,6 @@ describe('control-svc logs 域（阶段 3.2）', () => {
       .useValue(new LogFileStore(tmpLogDir))
       .overrideProvider(LogBuffer)
       .useValue(buffer)
-      .overrideProvider(ConfigDao)
-      .useValue(dbDisabledDao)
       .compile();
     const fastifyAdapter = new (require('@nestjs/platform-fastify').FastifyAdapter)();
     const testApp = moduleRef.createNestApplication(fastifyAdapter);
