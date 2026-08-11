@@ -6,6 +6,8 @@ import gc
 import hashlib
 import importlib
 import json
+import ctypes
+import os
 from pathlib import Path
 import sys
 from typing import Any, Callable
@@ -20,6 +22,28 @@ REQUIRED_MTMD_SYMBOLS = (
     "mtmd_support_audio",
     "mtmd_support_vision",
 )
+
+
+def _available_ram_bytes() -> int:
+    if os.name == "nt":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        status = MemoryStatus()
+        status.dwLength = ctypes.sizeof(MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+        return 0
+    return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_AVPHYS_PAGES"))
 
 
 def _base_result(request: dict[str, Any]) -> dict[str, Any]:
@@ -52,6 +76,11 @@ def _base_result(request: dict[str, Any]) -> dict[str, Any]:
             "native_vision_preflight_passed": False,
             "native_audio_preflight_passed": False,
         },
+        "resources": {
+            "available_ram_bytes": None,
+            "required_free_ram_bytes": int(request.get("required_free_ram_bytes", 0) or 0),
+            "admitted": None,
+        },
         "errors": [],
     }
 
@@ -64,19 +93,26 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact_state(path_value: str, expected_sha256: str) -> tuple[dict[str, Any], Path | None]:
+def _artifact_state(
+    path_value: str,
+    expected_sha256: str,
+    *,
+    verify_content: bool,
+) -> tuple[dict[str, Any], Path | None]:
     if not path_value:
         return {"provided": False, "exists": False, "sha256_verified": False}, None
     path = Path(path_value)
     if not path.is_absolute() or not path.is_file():
         return {"provided": True, "exists": False, "sha256_verified": False}, None
-    actual = _sha256(path)
-    return {
+    state = {
         "provided": True,
         "exists": True,
         "size_bytes": path.stat().st_size,
-        "sha256_verified": actual == expected_sha256,
-    }, path
+        "sha256_verified": False,
+    }
+    if verify_content:
+        state["sha256_verified"] = _sha256(path) == expected_sha256
+    return state, path
 
 
 def _binding(module_loader: Callable[[str], Any]) -> tuple[Any | None, Any | None, dict[str, Any], dict[str, str] | None]:
@@ -126,10 +162,42 @@ def execute_request(
         return result
 
     model_state, model_path = _artifact_state(
-        str(request.get("model_path", "")), str(request.get("model_sha256", "")),
+        str(request.get("model_path", "")), str(request.get("model_sha256", "")), verify_content=False,
     )
     mmproj_state, mmproj_path = _artifact_state(
-        str(request.get("mmproj_path", "")), str(request.get("mmproj_sha256", "")),
+        str(request.get("mmproj_path", "")), str(request.get("mmproj_sha256", "")), verify_content=False,
+    )
+    if model_path is None or mmproj_path is None:
+        result["artifacts"] = {
+            "model": model_state,
+            "mmproj": mmproj_state,
+            "verified": False,
+        }
+        result["status"] = "artifact_rejected"
+        result["errors"].append({"code": "artifact_verification_failed", "message": "missing local artifact"})
+        return result
+    required_ram = int(request.get("required_free_ram_bytes", 0) or 0)
+    if required_ram:
+        available_ram = _available_ram_bytes()
+        result["resources"].update({
+            "available_ram_bytes": available_ram,
+            "required_free_ram_bytes": required_ram,
+            "admitted": available_ram >= required_ram,
+        })
+        if available_ram < required_ram:
+            result["artifacts"] = {
+                "model": model_state,
+                "mmproj": mmproj_state,
+                "verified": False,
+            }
+            result["status"] = "resource_rejected"
+            result["errors"].append({"code": "insufficient_ram", "message": "insufficient free RAM for isolated native model initialization"})
+            return result
+    model_state, model_path = _artifact_state(
+        str(request.get("model_path", "")), str(request.get("model_sha256", "")), verify_content=True,
+    )
+    mmproj_state, mmproj_path = _artifact_state(
+        str(request.get("mmproj_path", "")), str(request.get("mmproj_sha256", "")), verify_content=True,
     )
     result["artifacts"] = {
         "model": model_state,

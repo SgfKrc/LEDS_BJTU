@@ -1,9 +1,9 @@
 # Gemma-4-12B 多模态支持方案（实施计划）
 
-> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2+ 工件、音频、分布式和资源门 Candidate）
+> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；G4.3.2B 原生初始化与图片语义受 RAM 门 Blocked）
 >
 > 更新日期：2026-08-11
-> 适用范围：原版 Gemma 4 12B 经本机 Ollama `external_api` 提供文本与图像理解；G4.3.1 只完成原生 `llama-cpp-python` MTMD ABI 预检，音频和原生实际推理另列后续票
+> 适用范围：原版 Gemma 4 12B 经本机 Ollama `external_api` 提供文本与图像理解；G4.3.1/2A 已完成原生候选的 ABI 与资产身份门，音频和原生实际推理另列后续票
 >
 > 目标：先提供可验证、可回滚的原版 Gemma 4 12B 图像理解能力，再补产品交互；`myheretic:latest` 仍只作为用户私有资产，不进入项目基线。
 
@@ -15,7 +15,7 @@
 - 本机显卡:RTX 4060 Laptop,**8GB 显存**。
 - 本机现状：官方 Ollama `gemma4:12b` 已通过 `127.0.0.1:7897` 子进程代理完整拉取并验证；用户私有 `myheretic:latest` 保留但不参与验收。
 - 模型基线：当前唯一已验收工件为 Ollama 官方 `gemma4:12b`；直接 GGUF 来源、revision 和 Python 绑定 ABI 尚未冻结，不作为 G4.1 依赖。
-- 当前目标：QLH 已具备可用的 Gemma 4 图像理解产品路径；G4.3.1 已完成只读的原生绑定/ABI 预检，后续仅在冻结工件后验证原生 llama.cpp、音频、分布式和 8K/16K 资源门。
+- 当前目标：QLH 已具备可用的 Gemma 4 图像理解产品路径；G4.3.1 已完成只读的原生绑定/ABI 预检，G4.3.2A 已冻结本机官方 Ollama 工件身份。G4.3.2B 仅在可用 RAM 达到资源门后验证原生图片语义，音频、分布式和 8K/16K 继续后置。
 
 ### 1.1 "多模态实验缺最后一种模型"的含义
 
@@ -43,7 +43,7 @@
 | 上下文 | 262144；当前 8GB 开发门使用 2K/4K smoke，不把 256K 设计上限当本机可用承诺 |
 | 量化/工件 | Q4_K_M；Ollama 清单显示 7.6GB，运行时 `ollama ps` 显示约 9.9GB 工作集 |
 | 本机支持状态 | Ollama 0.32.8 已实测 completion/vision/audio/tools/thinking；QLH G4.1 已实测 OpenAI `image_url` |
-| 原生支持状态 | 项目锁定 llama.cpp `47e1de77…`；本机 `llama-cpp-python 0.3.28` 的 MTMD 必需 ABI 已由 G4.3.1 实测可导入，但未提供经 SHA 校验的 Gemma 4 GGUF/mmproj 对，也未初始化 handler 或处理图片，保持 Candidate |
+| 原生支持状态 | 项目锁定 llama.cpp `47e1de77…`；本机 `llama-cpp-python 0.3.28` 的 MTMD 必需 ABI 已通过。G4.3.2A 已完整 SHA 验证官方 Ollama 主 GGUF/mmproj 对；两次预检的可用 RAM 约 5-6GiB，低于保守初始化门约 8.74GiB，未初始化 handler 或处理图片，保持 Blocked |
 | 标签边界 | `gemma4:latest` 当前指向 E4B；12B 必须显式写 `gemma4:12b` |
 
 ### 2.2 本机部署现状（2026-08-11 已实测）
@@ -104,7 +104,7 @@ $ ollama show myheretic
 | chat 契约 | `image_data_urls` 最多 4 张，只接受 PNG/JPEG/WebP data URL；单张 8MiB、总计 16MiB | G4.1 Completed；远程 URL、SVG、MIME 伪装和无显式授权均拒绝 |
 | 安全/持久化 | 图片必须 `allow_external=true + prefer_external=true`；scope deny/端点失败均禁止丢图回退 | G4.1 Completed；历史和 SQLite 只保存文字问题/回复，不保存原图 |
 | 前端/TUI | Web 当前内存图片选择/预览/删除/大小提示，TUI 本地路径队列；二者均仅在本次请求发送 data URL | G4.2 Completed；桌面/移动与真实 Edge 会话已验收 |
-| 原生 llama_cpp | `gemma4-native-probe` 已验证 MTMD 必需 ABI，但没有任何已校验工件时不会初始化 `Llama` 或 handler | G4.3.1 Completed；G4.3.2 起先验工件/handler/打包再定 recipe |
+| 原生 llama_cpp | `gemma4-native-assets` 已冻结官方 Ollama 双工件；`gemma4-native-ollama-probe` 先做完整 SHA 再执行资源门 | G4.3.1/2A Completed；当前 `resource_rejected`，G4.3.2B 仅在 RAM 条件满足后初始化 handler |
 
 ---
 
@@ -175,15 +175,15 @@ set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 
 原生化仍有长期价值，但当前不能仅凭 vendored llama.cpp 中出现 `LLM_ARCH_GEMMA4` 就宣称 Python 运行时可用。必须同时冻结官方/可信工件 revision、视觉/音频 handler、`llama-cpp-python` 版本、Windows/Linux 打包 ABI 和与 Ollama 基线一致的输出。
 
-### 5.1 文件放置(原版,需下载)
+### 5.1 文件放置（原版，复用本地官方工件）
 
-当前不冻结文件名和仓库，也不启动第二份 7GB 级下载。G4.3 先用 resolver 读取候选仓库的固定 revision、许可、文件关系和 SHA/LFS 元数据，再决定单 GGUF、projector/handler 配对或官方 QAT 工件方案。
+G4.3.2A 已冻结本机已有官方 Ollama `registry.ollama.ai/library/gemma4:12b`：manifest SHA-256 为 `4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c`，主 GGUF blob SHA-256 为 `1278394b693672ac2799eadc9a83fd98259a6a88a40acfb1dcaa6c6fc895a606`（7,381,382,048 bytes），mmproj blob SHA-256 为 `675ad6e68101ca9413ec806855c452362f0213f2dfc5800996b086fdb8119842`（175,115,584 bytes），许可为 Apache-2.0。锁定文件 `scripts/model_tools/gemma4_native.lock.json` 同时约束 manifest、layer、`from=mmproj-gemma-4-12B-it-bf16.gguf` 和 GGUF 元数据配对；不复制、不移动，也不重新下载第二份 7GB 级模型。
 
 ### 5.2 代码改动点清单
 
 1. [x] G4.3.1 新增 `gemma4-native-probe`：报告项目锁定 revision、当前 `llama-cpp-python` 版本和 MTMD 必需 ABI；绑定导入不能通过产品能力门。
 2. [ ] 冻结相容的上游 llama.cpp revision 与 `llama-cpp-python` wheel/source build；当前仅记录二者版本事实，不声称二进制来源相同。
-3. [ ] 对候选工件执行固定 revision resolve、许可确认、SHA 校验和隔离预检；缺少或摘要不匹配的 GGUF/mmproj 对 fail-closed。
+3. [x] G4.3.2A 对本机官方候选执行固定 manifest/许可/双工件 SHA 与元数据配对校验；缺少、摘要不匹配或配对不符的 GGUF/mmproj 均 fail-closed。
 4. [ ] 只在前项通过后扩展 `llama_engine.py` 的模型/聊天 handler，而不是向 `Llama()` 猜测传入未经当前绑定支持的 `mmproj` 参数。
 5. [ ] 与本票相同测试图做 Ollama vs 原生语义对照，再补取消、卸载、8K/16K OOM、CPU/GPU offload 和打包门。
 6. [ ] 只有上述门通过后才新增 `model_config`/curated recipe 并允许分布式调度选择。
@@ -194,14 +194,22 @@ set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 
 后续 G4.3.2 只有在显式提供本地 `--model`、`--mmproj` 及两者 SHA-256 时才会运行。worker 先校验两个摘要，再以 CPU-only `n_gpu_layers=0` 创建 `Llama`，调用 `mtmd_init_from_file` 和 `mtmd_support_vision/audio`；成功状态仅为 `ready_for_image_smoke`，仍不等于图片语义、取消、长上下文、音频或打包已验收。
 
+### 5.4 G4.3.2A 官方工件身份与资源准入（Completed）
+
+统一只读入口为 `python scripts/model_tools.py gemma4-native-assets --full-hash` 和 `python scripts/model_tools.py gemma4-native-ollama-probe --json`。前者完整哈希本机官方 manifest、主 GGUF 和 mmproj，并验证 `gemma4`/`mmproj`、Gemma 4 12B 基模型、262144 context、视觉 encoder 与 `gemma4uv` projector；报告不输出用户绝对路径。后者仅在上述资产门通过后才调用独立 worker。
+
+原生 worker 在重新哈希或导入/初始化 `Llama` 前先检查文件存在、大小和可用物理 RAM。当前主 GGUF 加 projector 的保守门为约 8.74GiB（配对工件的 110% 加 1GiB OS headroom，且不低于 2GiB），两次实测可用 RAM 约 5-6GiB，因此返回 `resource_rejected / insufficient_ram`，不触发文件全量复哈希、MTMD 初始化、handler 创建或图片处理。这是资源保护门，不是原生图像能力失败结论。
+
+G4.3.2B 的恢复条件是运行前可用 RAM 不低于该报告中的 `required_free_ram_bytes`，并保持没有 Ollama 模型驻留；恢复后先执行 CPU-only `n_ctx=128` 初始化与固定测试图语义对照，再分别评估卸载、取消、8K/16K、audio、offload、打包和调度。不得以增加虚拟内存、隐式换页或降低身份校验来绕过此门。
+
 ---
 
 ## 6. 方案对比与推荐
 
 | 维度 | 方案 A(Ollama Provider) | 方案 B(原生 llama_cpp) |
 |---|---|---|
-| 模型获取 | 官方 `gemma4:12b` 已下载并验收 | 来源/revision/文件关系尚未冻结 |
-| 当前状态 | **G4.1/G4.2 Completed** | **G4.3 Candidate** |
+| 模型获取 | 官方 `gemma4:12b` 已下载并验收 | 本机官方 Ollama 主 GGUF/mmproj 已以 manifest、许可、双 SHA 与元数据关系冻结；不另建下载 recipe |
+| 当前状态 | **G4.1/G4.2 Completed** | **G4.3.2A Completed；G4.3.2B Blocked（RAM 门）** |
 | 代码范围 | 通用结构化 OpenAI 消息 + 显式 reasoning 配置 | Python handler、ABI、工件、打包和调度均需验证 |
 | 模型能力 | Text/Image 已由 QLH 实测；Audio 尚未开放 | 未实测，不作能力承诺 |
 | 与分布式调度 | `external_api` 整请求，统计如实标注 | 通过 G4.3 后才可作为 `llama_cpp` 候选 |
@@ -216,7 +224,8 @@ set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 | G4.1 后端与官方模型门 | Completed（2026-08-11） | 官方模型下载、文本/图像 smoke、结构化消息、reasoning、大小/格式/作用域边界、零图片持久化 | 定向 `160 passed`；QLH Provider 真实图片返回非空描述；全量（测试进程 `NO_PROXY=*`）`1908 passed / 26 skipped / 2 failed`，失败仅为当前 WSL 无法访问 `/g/...` 的 Linux env-register 路径 |
 | G4.2 Web/TUI 图片交互 | Completed（2026-08-11） | 选择/预览/删除图片，发送状态，4 图/8MiB/16MiB 提示，外部授权与 TUI 本地路径队列 | Python 定向 `179 passed`；Web 桩契约 `1 passed`；真实 Edge → QLH → `gemma4:12b` `1 passed`；全量（测试进程 `NO_PROXY=*`）`1915 passed / 26 skipped` |
 | G4.3.1 原生绑定/ABI 预检 | Completed（2026-08-11） | 独立只读 worker、MTMD 必需 ABI、项目锁定 revision/当前 binding 版本、SHA 强制与路径脱敏契约 | 定向 `56 passed / 2 skipped`；全量 `1934 passed / 13 skipped`；开发机 `llama-cpp-python 0.3.28` 报告 MTMD ABI 完整；无工件时明确 `gate_passed=false` |
-| G4.3.2 原生工件与图片 smoke | Candidate | 冻结来源/revision/许可/两个 SHA、GGUF/mmproj 配对、隔离初始化与真实测试图 | `ready_for_image_smoke` 后与 Ollama 图像语义对照一致；未知配对/摘要/初始化均 fail-closed |
+| G4.3.2A 官方工件身份与资源准入 | Completed（2026-08-11） | 固定官方 manifest/许可、主 GGUF/mmproj 双 SHA 与元数据配对；资源门先于原生初始化 | `gemma4-native-assets --full-hash` 通过；两次预检可用 RAM 约 5-6GiB 小于约 8.74GiB 门，安全返回 `resource_rejected`，未加载模型；定向 `59 passed / 2 skipped`，当前全量 `1942 passed / 8 skipped` |
+| G4.3.2B 原生初始化与图片 smoke | Blocked（资源门） | CPU-only 初始化、固定测试图与 Ollama 图像语义对照 | 可用 RAM 达到报告门且 Ollama 未驻留后，先得 `ready_for_image_smoke`，再验证语义一致；未知配对/摘要/初始化均 fail-closed |
 | G4.3.3 音频、资源、打包与分布式 | Candidate | 音频契约、8K/16K、取消/卸载/OOM、CPU/GPU offload、Windows/Linux 离线包、调度 | 所有门通过后才可新增 recipe 或让调度选中原生路径 |
 
 ---
@@ -230,6 +239,7 @@ set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 - [x] 图片不进入会话历史与 SQLite 持久化参数
 - [x] G4.2 Web/TUI 图片会话与桌面/移动浏览器验收
 - [x] G4.3.1 原生 `llama-cpp-python` MTMD ABI 隔离预检；无冻结工件时拒绝进入原生能力门
+- [x] G4.3.2A 官方 Ollama 主 GGUF/mmproj 双 SHA、许可、manifest 与元数据配对；资源不足时原生初始化前拒绝
 - [ ] 上下文限制生效:8K 上下文下连续多轮对话不 OOM
 - [x] 2K/4K smoke 的加载、图像 prompt、资源分配基线已记录；8K/16K 留 G4.3
 
@@ -250,7 +260,7 @@ set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 5. **端口占用**:Ollama 占 11434;若 QLH 后端或其他服务也用此端口需调整(`OLLAMA_HOST`)。
 6. **外部 Provider 数据门控**:`QLH_EXTERNAL_DATA_SCOPE` 默认 `opt_in`;本机 Ollama 场景可 `allow_all`,但若日后指向远端实例务必收紧。
 7. **reasoning 默认值**：Ollama OpenAI 端点默认 thinking 时，小 `max_tokens` 可能只有 reasoning、正文为空；Gemma 4 本机配置固定 `QLH_EXTERNAL_REASONING_EFFORT=none`，其他 Provider 留空不发送。
-8. **路线 B 未冻结**：不得把 vendored 源码符号当成 Python/打包支持，也不得在未固定 revision、许可和 SHA 前新增一键 recipe。
+8. **路线 B 仍未成为产品能力**：G4.3.2A 只冻结本机官方工件身份；不得把 vendored 源码符号、资产可读或 ABI 通过当成原生推理/打包支持。资源门不足时不可以虚拟内存、隐式换页或跳过 SHA 作为替代。
 
 ---
 

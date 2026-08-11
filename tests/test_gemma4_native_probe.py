@@ -98,7 +98,7 @@ def test_verified_artifacts_need_vision_and_do_not_expose_paths(tmp_path: Path):
     assert str(tmp_path) not in str(result)
 
 
-def test_audio_requirement_and_digest_mismatch_fail_closed(tmp_path: Path):
+def test_audio_requirement_digest_mismatch_and_resource_rejection_fail_closed(tmp_path: Path, monkeypatch):
     model = tmp_path / "model.gguf"
     mmproj = tmp_path / "mmproj.gguf"
     model.write_bytes(b"model")
@@ -109,6 +109,13 @@ def test_audio_requirement_and_digest_mismatch_fail_closed(tmp_path: Path):
     mismatch = _request(model, mmproj)
     mismatch["mmproj_sha256"] = "0" * 64
     rejected = execute_request(mismatch, module_loader=loader)
+    resource = _request(model, mmproj)
+    resource["required_free_ram_bytes"] = 1024
+    monkeypatch.setattr(
+        "scripts.model_tools.gemma4_native_probe_worker._available_ram_bytes",
+        lambda: 512,
+    )
+    resource_rejected = execute_request(resource, module_loader=loader)
 
     assert audio_required["status"] == "required_capability_missing"
     assert audio_required["gate_passed"] is False
@@ -117,6 +124,9 @@ def test_audio_requirement_and_digest_mismatch_fail_closed(tmp_path: Path):
     assert rejected["gate_passed"] is False
     assert rejected["errors"][0]["code"] == "artifact_verification_failed"
     assert str(tmp_path) not in str(rejected)
+    assert resource_rejected["status"] == "resource_rejected"
+    assert resource_rejected["resources"]["admitted"] is False
+    assert resource_rejected["errors"][0]["code"] == "insufficient_ram"
 
 
 def test_controller_requires_complete_explicit_artifact_identity():

@@ -18,6 +18,7 @@ MAX_TIMEOUT_SECONDS = 3600.0
 DEFAULT_N_CTX = 512
 MAX_N_CTX = 4096
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+GIB = 1024**3
 
 
 def _pinned_llama_cpp_revision() -> str | None:
@@ -102,6 +103,14 @@ def _validate_sha256(name: str, value: str) -> None:
         raise ValueError(f"{name} must be a 64-character SHA-256 hex digest")
 
 
+def _required_free_ram_bytes(model: Path | None, mmproj: Path | None) -> int:
+    if model is None or mmproj is None or not model.is_file() or not mmproj.is_file():
+        return 0
+    # mmap does not remove the need for working-set and OS headroom on Windows.
+    paired_bytes = model.stat().st_size + mmproj.stat().st_size
+    return max(2 * GIB, int(paired_bytes * 1.10) + GIB)
+
+
 def run_native_probe(
     *,
     model: Path | None = None,
@@ -149,6 +158,7 @@ def run_native_probe(
         "mmproj_path": str(mmproj) if mmproj is not None else "",
         "model_sha256": model_sha256.lower(),
         "mmproj_sha256": mmproj_sha256.lower(),
+        "required_free_ram_bytes": _required_free_ram_bytes(model, mmproj) if artifact_requested else 0,
         "n_ctx": n_ctx,
         "require_audio": bool(require_audio),
     }

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "tool": "gemma4_native_assets",
+  "candidate_id": "ollama-gemma4-12b-native-q4-k-m",
+  "source": {
+    "registry": "registry.ollama.ai/library/gemma4",
+    "tag": "12b",
+    "manifest_sha256": "4eb23ef187e2c5462566d6a1d3bbbc2f1346d0b4327cbb66d58fffbcc9b2b05c",
+    "model_id": "4eb23ef187e2",
+    "license": "Apache-2.0"
+  },
+  "artifacts": {
+    "model": {
+      "media_type": "application/vnd.ollama.image.model",
+      "sha256": "1278394b693672ac2799eadc9a83fd98259a6a88a40acfb1dcaa6c6fc895a606",
+      "size_bytes": 7381382048,
+      "architecture": "gemma4",
+      "base_model": "Gemma 4 12B",
+      "context_length": 262144
+    },
+    "mmproj": {
+      "media_type": "application/vnd.ollama.image.projector",
+      "sha256": "675ad6e68101ca9413ec806855c452362f0213f2dfc5800996b086fdb8119842",
+      "size_bytes": 175115584,
+      "from": "mmproj-gemma-4-12B-it-bf16.gguf",
+      "architecture": "clip",
+      "base_model": "Gemma 4 12B",
+      "vision_projector_type": "gemma4uv"
+    }
+  }
+}
