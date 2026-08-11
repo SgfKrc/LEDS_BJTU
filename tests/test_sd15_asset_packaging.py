@@ -89,7 +89,7 @@ class TestPackageAsset:
         with zipfile.ZipFile(pkg) as zf:
             names = set(zf.namelist())
             assert {"manifest.json", "LICENSE.txt", "MODEL_CARD.md", "IMPORT.md"} <= names
-            assert "unet/diffusion_pytorch_model.safetensors" in names
+            assert "sd15-synthetic-v1/unet/diffusion_pytorch_model.safetensors" in names
             manifest = json.loads(zf.read("manifest.json"))
             assert manifest["asset_id"] == "sd15_synthetic_v1"
             assert manifest["license_id"] == "mit"
@@ -101,10 +101,10 @@ class TestPackageAsset:
             assert zf.read("LICENSE.txt").startswith(b"MIT License")
             assert b"Synthetic model card" in zf.read("MODEL_CARD.md")
             assert "离线导入".encode() in zf.read("IMPORT.md")
-            # 包内文件与源目录逐字节一致
+            # 包内文件与源目录逐字节一致（zip 内带 local_dir 顶层目录）
             for entry in manifest["files"]:
                 source = tmp_path / "models" / "sd15-synthetic-v1" / entry["path"]
-                assert zf.read(entry["path"]) == source.read_bytes()
+                assert zf.read(f"sd15-synthetic-v1/{entry['path']}") == source.read_bytes()
 
     def test_missing_license_fails_closed(self, synthetic_spec, tmp_path, monkeypatch):
         # 把 mit 映射到不存在的文件 → 必须拒绝打包

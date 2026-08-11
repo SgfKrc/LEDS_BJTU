@@ -85,3 +85,4 @@ QLH-SD15-Assets-<asset_id>-v0.1.0.zip
 |---|---|
 | 2026-08-11 | 建立本文档；阶段 1 完成（打包脚本、许可证入库×3 + OpenRAIL 待补、serve.py `sd15-asset` kind、单元测试 11/11、serve 回归 16/16） |
 | 2026-08-11 | OpenRAIL 原文入库（licenses.ai BigScience Open RAIL-M PDF，pdfminer 提取+三处两栏校对）；打包校验重构为文件层口径（composed 资产的 model_index 结构豁免）；90s 资产预检通过，单测 12/12 |
+| 2026-08-11 | **阶段 2 完成**：五资产真实打包（15 GB，包级 SHA 侧车齐全）；`validate_sd15_offline_packages.py` 导入闭环 5/5（解包 → 逐文件比对 → 官方 import_asset → ready 通知）；原版资产 `HF_HUB_OFFLINE=1` 下 4-step CUDA 冒烟通过（4.0 s，PNG 360,858 bytes 与 SD-N3.4 记录一致）；SD-N2 发布资产门关闭 |

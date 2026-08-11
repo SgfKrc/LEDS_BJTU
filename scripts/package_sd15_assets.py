@@ -146,7 +146,22 @@ def verify_local_assets(spec, *, check_hashes: bool) -> dict:
     return file_hashes
 
 
-def build_manifest(spec, file_hashes: dict, package_bytes: int) -> dict:
+def build_manifest(spec, file_hashes: dict, package_bytes: int, *, asset_root: Path) -> dict:
+    files = []
+    for item in spec.files:
+        derived = spec.composed and item.path == "model_index.json"
+        size_bytes = item.size_bytes
+        if derived:
+            # 组合资产的本地产物：manifest 记录实际大小与哈希
+            size_bytes = (asset_root / item.path).stat().st_size
+        entry = {
+            "path": item.path,
+            "size_bytes": size_bytes,
+            "sha256": file_hashes.get(item.path, item.sha256),
+        }
+        if derived:
+            entry["derived"] = True
+        files.append(entry)
     return {
         "format": "qlh.sd15-asset.v1",
         "package": package_name(spec.asset_id),
@@ -164,14 +179,7 @@ def build_manifest(spec, file_hashes: dict, package_bytes: int) -> dict:
         "preset_id": spec.preset_id,
         "artifact_kind": spec.artifact_kind,
         "safety_checker_required": spec.safety_checker_required,
-        "files": [
-            {
-                "path": item.path,
-                "size_bytes": item.size_bytes,
-                "sha256": file_hashes.get(item.path, item.sha256),
-            }
-            for item in spec.files
-        ],
+        "files": files,
         "notes": list(spec.notes),
     }
 
@@ -216,10 +224,11 @@ def package_asset(spec, output_dir: Path, *, check_hashes: bool, dry_run: bool) 
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return result
 
-    manifest = build_manifest(spec, file_hashes, 0)
+    manifest = build_manifest(spec, file_hashes, 0, asset_root=spec.target_path())
     with zipfile.ZipFile(pkg_path, "w", allowZip64=True) as zf:
         for item in spec.files:
-            _zip_add(zf, item.path, spec.target_path() / item.path)
+            # 模型文件带 local_dir 顶层目录：解包到模型根即就位
+            _zip_add(zf, f"{spec.local_dir}/{item.path}", spec.target_path() / item.path)
         _zip_add(zf, "LICENSE.txt", None, license_text)
         _zip_add(zf, "MODEL_CARD.md", None, model_card)
         _zip_add(zf, "IMPORT.md", None, IMPORT_TEMPLATE.format(
