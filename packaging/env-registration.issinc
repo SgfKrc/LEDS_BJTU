@@ -1,0 +1,178 @@
+// Shared optional per-user PATH registration for the CPU and CUDA installers.
+// The state key records whether this package actually appended its entry, so
+// uninstall never removes an equivalent path that was already user-owned.
+
+function TryGetEnvRegistrationParameter(var Value: String): Boolean;
+var
+  Index: Integer;
+  Parameter: String;
+begin
+  Result := False;
+  Value := '';
+  for Index := 1 to ParamCount do
+  begin
+    Parameter := ParamStr(Index);
+    if CompareText(Copy(Parameter, 1, 8), '/ENVREG=') = 0 then
+    begin
+      Value := Copy(Parameter, 9, MaxInt);
+      Result := True;
+      exit;
+    end;
+  end;
+end;
+
+function EnvRegistrationParameterIsValid: Boolean;
+var
+  Value: String;
+begin
+  Result := (not TryGetEnvRegistrationParameter(Value)) or
+    (Value = '0') or (Value = '1');
+end;
+
+function EnvironmentRegistrationRequested: Boolean;
+var
+  Value: String;
+begin
+  if TryGetEnvRegistrationParameter(Value) then
+    Result := Value = '1'
+  else
+    Result := WizardIsTaskSelected('envreg');
+end;
+
+function PathContainsExactEntry(Value, Entry: String): Boolean;
+var
+  Remaining, Token: String;
+  Separator: Integer;
+  Done: Boolean;
+begin
+  Remaining := Value;
+  Result := False;
+  while True do
+  begin
+    Separator := Pos(';', Remaining);
+    Done := Separator = 0;
+    if Done then
+      Token := Remaining
+    else
+    begin
+      Token := Copy(Remaining, 1, Separator - 1);
+      Remaining := Copy(Remaining, Separator + 1, MaxInt);
+    end;
+    if CompareText(Token, Entry) = 0 then
+    begin
+      Result := True;
+      exit;
+    end;
+    if Done then
+      exit;
+  end;
+end;
+
+function RemoveExactPathEntry(Value, Entry: String): String;
+var
+  Remaining, Token: String;
+  Separator: Integer;
+  Done, First: Boolean;
+begin
+  Remaining := Value;
+  Result := '';
+  First := True;
+  while True do
+  begin
+    Separator := Pos(';', Remaining);
+    Done := Separator = 0;
+    if Done then
+      Token := Remaining
+    else
+    begin
+      Token := Copy(Remaining, 1, Separator - 1);
+      Remaining := Copy(Remaining, Separator + 1, MaxInt);
+    end;
+    if CompareText(Token, Entry) <> 0 then
+    begin
+      if not First then
+        Result := Result + ';';
+      Result := Result + Token;
+      First := False;
+    end;
+    if Done then
+      exit;
+  end;
+end;
+
+function AppendPathEntry(Value, Entry: String): String;
+begin
+  if Value = '' then
+    Result := Entry
+  else if Value[Length(Value)] = ';' then
+    Result := Value + Entry
+  else
+    Result := Value + ';' + Entry;
+end;
+
+procedure ClearEnvironmentRegistrationState;
+begin
+  RegDeleteValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathEntryValue);
+  RegDeleteValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathOwnedValue);
+end;
+
+procedure RemoveRegisteredUserEnvironment;
+var
+  Existing, RegisteredEntry, Cleaned: String;
+  Owned: Cardinal;
+begin
+  if RegQueryDWordValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathOwnedValue, Owned) and
+     (Owned = 1) and
+     RegQueryStringValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathEntryValue, RegisteredEntry) and
+     RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Existing) then
+  begin
+    Cleaned := RemoveExactPathEntry(Existing, RegisteredEntry);
+    if Cleaned <> Existing then
+      RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Cleaned);
+  end;
+  ClearEnvironmentRegistrationState;
+end;
+
+procedure ConfigureRegisteredUserEnvironment;
+var
+  Existing, PreviousEntry, Updated, AppEntry: String;
+  Owned: Cardinal;
+  PreviousOwned, AddedByPackage: Boolean;
+begin
+  if not EnvironmentRegistrationRequested then
+  begin
+    RemoveRegisteredUserEnvironment;
+    exit;
+  end;
+
+  AppEntry := ExpandConstant('{app}');
+  Existing := '';
+  RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Existing);
+  PreviousEntry := '';
+  PreviousOwned :=
+    RegQueryDWordValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathOwnedValue, Owned) and
+    (Owned = 1) and
+    RegQueryStringValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathEntryValue, PreviousEntry);
+  if PreviousOwned and (CompareText(PreviousEntry, AppEntry) <> 0) then
+    Existing := RemoveExactPathEntry(Existing, PreviousEntry);
+
+  AddedByPackage := False;
+  if not PathContainsExactEntry(Existing, AppEntry) then
+  begin
+    Updated := AppendPathEntry(Existing, AppEntry);
+    if not RegWriteExpandStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Updated) then
+    begin
+      MsgBox(CustomMessage('EnvRegWriteError'), mbError, MB_OK);
+      exit;
+    end;
+    AddedByPackage := True;
+  end
+  else
+    Updated := Existing;
+
+  RegWriteStringValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathEntryValue, AppEntry);
+  if AddedByPackage or (PreviousOwned and (CompareText(PreviousEntry, AppEntry) = 0)) then
+    RegWriteDWordValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathOwnedValue, 1)
+  else
+    RegWriteDWordValue(HKEY_CURRENT_USER, QlhEnvRegistrationKey, QlhEnvPathOwnedValue, 0);
+end;

@@ -1,0 +1,59 @@
+#!/bin/sh
+# Explicit, idempotent environment registration for the system .deb package.
+set -eu
+
+STATE_DIR="${QLH_ENVREG_STATE_DIR:-/etc/qlh-edge-inference}"
+STATE_FILE="$STATE_DIR/env-register"
+PROFILE_FILE="${QLH_ENVREG_PROFILE_FILE:-/etc/profile.d/qlh.sh}"
+APP_BIN="${QLH_ENVREG_APP_BIN:-/opt/qlh-edge-inference/bin}"
+
+write_state() {
+    state="$1"
+    mkdir -p "$STATE_DIR"
+    temporary="$(mktemp "$STATE_DIR/.env-register.XXXXXX")"
+    printf '%s\n' "$state" > "$temporary"
+    chmod 0644 "$temporary"
+    mv -f "$temporary" "$STATE_FILE"
+}
+
+apply_profile() {
+    if [ -f "$STATE_FILE" ] && [ "$(tr -d '[:space:]' < "$STATE_FILE")" = "enabled" ]; then
+        profile_directory="$(dirname "$PROFILE_FILE")"
+        mkdir -p "$profile_directory"
+        temporary="$(mktemp "$profile_directory/.qlh.sh.XXXXXX")"
+        printf '%s\n' '# Managed by QLH. Remove with: sudo qlh-env-register disable' > "$temporary"
+        printf '%s\n' 'case ":${PATH}:" in' >> "$temporary"
+        printf '%s\n' "  *:${APP_BIN}:*) ;;" >> "$temporary"
+        printf '%s\n' "  *) export PATH=\"${APP_BIN}\${PATH:+:\$PATH}\" ;;" >> "$temporary"
+        printf '%s\n' 'esac' >> "$temporary"
+        chmod 0644 "$temporary"
+        mv -f "$temporary" "$PROFILE_FILE"
+    else
+        rm -f "$PROFILE_FILE"
+    fi
+}
+
+case "${1:-status}" in
+    enable)
+        write_state enabled
+        apply_profile
+        ;;
+    disable)
+        write_state disabled
+        apply_profile
+        ;;
+    apply)
+        apply_profile
+        ;;
+    status)
+        if [ -f "$STATE_FILE" ] && [ "$(tr -d '[:space:]' < "$STATE_FILE")" = "enabled" ]; then
+            printf '%s\n' enabled
+        else
+            printf '%s\n' disabled
+        fi
+        ;;
+    *)
+        printf '%s\n' "usage: qlh-env-register [enable|disable|apply|status]" >&2
+        exit 2
+        ;;
+esac

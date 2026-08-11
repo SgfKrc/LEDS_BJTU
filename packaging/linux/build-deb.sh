@@ -5,6 +5,7 @@
 # 用法:
 #   集显版: ./build-deb.sh cpu
 #   独显版: ./build-deb.sh cuda
+#   仅检查: ./build-deb.sh cpu --preflight-only
 #
 # 前置条件:
 #   1. Ubuntu 22.04+ / Debian 12+
@@ -20,6 +21,7 @@
 set -euo pipefail
 
 VARIANT="${1:-cpu}"
+PREFLIGHT_ONLY="${2:-}"
 VERSION="0.1.8.1"
 ARCH="amd64"
 
@@ -32,10 +34,43 @@ BUILD_DIR="/tmp/qlh-deb-build"
 MODEL_TOOL_ROOT="$PROJECT_ROOT/build/model-tools/llama-quantize"
 MODEL_TOOL_PACKAGE="$MODEL_TOOL_ROOT/packages/linux-x86_64"
 
-# 前置检查
-if ! command -v dpkg-deb &> /dev/null; then
-    echo "错误: dpkg-deb 未找到。请安装 dpkg-dev 包。"
-    echo "  sudo apt install dpkg-dev"
+if [ "$VARIANT" != "cpu" ] && [ "$VARIANT" != "cuda" ]; then
+    echo "错误: 变体只能是 cpu 或 cuda。"
+    exit 1
+fi
+if [ -n "$PREFLIGHT_ONLY" ] && [ "$PREFLIGHT_ONLY" != "--preflight-only" ]; then
+    echo "错误: 未知参数 $PREFLIGHT_ONLY"
+    exit 1
+fi
+
+# 发布门只接受 Linux 原生工具；WSL 映射到 /mnt/c 的 Windows 命令不可用于 .deb。
+missing_tools=()
+for tool in python3 dpkg-deb node npm git cmake c++ make; do
+    tool_path="$(command -v "$tool" 2>/dev/null || true)"
+    if [ -z "$tool_path" ]; then
+        missing_tools+=("$tool: missing")
+    elif [[ "$tool_path" == /mnt/* ]]; then
+        missing_tools+=("$tool: Windows interop path $tool_path")
+    fi
+done
+if [ "${#missing_tools[@]}" -gt 0 ]; then
+    echo "错误: Linux .deb 发布工具链不完整:"
+    printf '  - %s\n' "${missing_tools[@]}"
+    echo "  Ubuntu/Debian 基础依赖: sudo apt install build-essential cmake git nodejs npm python3-venv dpkg-dev"
+    exit 1
+fi
+
+if ! python3 -c 'import venv' >/dev/null 2>&1; then
+    echo "错误: 当前 Python 缺少 venv 模块。请安装 python3-venv。"
+    exit 1
+fi
+NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || true)"
+if ! [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] || [ "$NODE_MAJOR" -lt 18 ]; then
+    echo "错误: 发布构建需要 Linux 原生 Node.js 18+，当前主版本: ${NODE_MAJOR:-unknown}"
+    exit 1
+fi
+if [ -z "${QLH_SIGNING_KEY:-}" ] || [ ! -f "$QLH_SIGNING_KEY" ] || [ ! -r "$QLH_SIGNING_KEY" ]; then
+    echo "错误: QLH_SIGNING_KEY 必须指向可读的发布私钥文件。"
     exit 1
 fi
 
@@ -47,13 +82,9 @@ echo "  输出: $SCRIPT_DIR"
 echo "================================================================"
 echo ""
 
-if ! command -v python3 &> /dev/null; then
-    echo "错误: 未找到 python3。请安装 Python 3。"
-    exit 1
-fi
-if [ -z "${QLH_SIGNING_KEY:-}" ]; then
-    echo "错误: 发布构建必须设置 QLH_SIGNING_KEY，禁止生成无签名安装清单。"
-    exit 1
+echo "[preflight] Linux 原生发布工具链、Node.js ${NODE_MAJOR} 和签名 key 可用。"
+if [ "$PREFLIGHT_ONLY" = "--preflight-only" ]; then
+    exit 0
 fi
 
 echo "[toolchain] 构建并校验固定 revision 的 llama-quantize..."
@@ -90,6 +121,7 @@ mkdir -p "$BUILD_DIR/usr/share/icons/hicolor/256x256/apps"
 mkdir -p "$BUILD_DIR/lib/systemd/system"
 mkdir -p "$BUILD_DIR/DEBIAN"
 mkdir -p "$BUILD_DIR/usr/local/bin"
+mkdir -p "$BUILD_DIR/usr/sbin"
 
 # ---- 3. 复制源码和前端 ----
 echo "[3/6] 复制应用文件..."
@@ -102,6 +134,7 @@ chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-app"
 cp "$PACKAGING_DIR/qlh_launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 cp "$PACKAGING_DIR/diagnose.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/diagnose.py"
 cp "$PACKAGING_DIR/repair.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/repair.py"
+cp "$PACKAGING_DIR/data_retention.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/data_retention.py"
 cp "$PACKAGING_DIR/update_core.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/update_core.py"
 cp "$PACKAGING_DIR/updater.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/updater.py"
 cp "$PACKAGING_DIR/version_store.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/version_store.py"
@@ -117,6 +150,8 @@ chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 sed -i '1c#!/opt/qlh-edge-inference/venv/bin/python3' "$BUILD_DIR/opt/qlh-edge-inference/bin/qlh-launcher"
 cp "$SCRIPT_DIR/bjtu" "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
 chmod 755 "$BUILD_DIR/opt/qlh-edge-inference/bin/bjtu"
+cp "$SCRIPT_DIR/qlh-env-register" "$BUILD_DIR/usr/sbin/qlh-env-register"
+chmod 755 "$BUILD_DIR/usr/sbin/qlh-env-register"
 printf '%s\n' "$VERSION" > "$BUILD_DIR/opt/qlh-edge-inference/version.txt"
 # 将旧 launcher.py 复制为应用包装器引用的模块；新 qlh-launcher 仅负责 bootstrap
 cp "$PACKAGING_DIR/launcher.py" "$BUILD_DIR/opt/qlh-edge-inference/bin/__launcher_main__.py"
