@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test tests/settings.test.mjs tests/taskGraphStatus.test.mjs tests/diffusionState.test.mjs tests/modelFleet.test.mjs tests/authClient.test.mjs",
+    "test": "node --test tests/settings.test.mjs tests/taskGraphStatus.test.mjs tests/diffusionState.test.mjs tests/modelFleet.test.mjs tests/authClient.test.mjs tests/apiClientErrors.test.mjs",
     "test:e2e:model-fleet": "node scripts/run-model-fleet-e2e.mjs",
     "test:e2e:sd15": "npm run build && npm --prefix ../gateway run build && playwright test --config playwright.config.js tests/diffusion-real.spec.js"
   },
