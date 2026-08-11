@@ -7,6 +7,7 @@
 
 import sys
 import os
+import json
 import logging
 import time
 import threading
@@ -3921,6 +3922,48 @@ class TestGetStatusTcpClient:
             sched._effective_role = original_role
             if hasattr(sched, '_tcp_client'):
                 del sched._tcp_client
+
+    def test_client_network_path_is_projected_to_status_and_master_node(
+            self, sched):
+        sched._effective_role = lambda: "client"
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role=NodeRole.MASTER,
+                state=NodeState.ONLINE,
+            ),
+            "client1": NodeInfo(
+                node_id="client1", role=NodeRole.CLIENT,
+                state=NodeState.ONLINE,
+            ),
+        }
+
+        class MockTCPClient:
+            is_registered = True
+            _running = True
+            server_host = "127.0.0.1"
+            server_port = 8888
+            avg_rtt_ms = 12.5
+
+            @staticmethod
+            def get_network_quality_snapshot():
+                return {
+                    "rtt_ms_p95": 20.0,
+                    "jitter_ms_p95": 4.0,
+                    "stalls_in_window": 1,
+                    "reconnects_in_window": 0,
+                }
+
+        sched._tcp_client = MockTCPClient()
+
+        status = sched.get_status()
+        node_list = sched.get_nodes()
+
+        assert status["network_path"]["path_kind"] == "lan_direct"
+        assert status["nodes"]["master"]["network_path"] == status["network_path"]
+        assert "network_path" not in status["nodes"]["client1"]
+        master = next(node for node in node_list if node["node_id"] == "master")
+        assert master["network_path"]["quality"]["rtt_ms_p95"] == 20.0
+        assert "127.0.0.1" not in json.dumps(status["network_path"])
 
 
 # ================================================================

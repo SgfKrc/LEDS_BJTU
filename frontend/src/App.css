@@ -3195,6 +3195,24 @@ input:focus, textarea:focus { border-color: var(--accent); }
   color: var(--text-secondary);
 }
 
+.path-quality-cell {
+  display: grid;
+  gap: 2px;
+  min-width: 128px;
+  white-space: nowrap;
+}
+
+.path-quality-title {
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.path-quality-metrics {
+  color: var(--text-muted);
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 10px;
+}
+
 .mono-cell {
   font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
   font-size: 11px;

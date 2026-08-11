@@ -388,6 +388,48 @@ class TestDeviceAndNodesCommands:
         msg, style = app.exec_command("/nodes")
         assert "从节点" in "\n".join(app.out)  # FakeApi /cluster/my-role → client
 
+    def test_nodes_shows_allowlisted_path_quality_without_endpoint_data(self):
+        class PathApi(FakeApi):
+            def get(self, path, params=None, with_log_token=False):
+                if path != "/cluster/nodes":
+                    return super().get(path, params, with_log_token)
+                return {
+                    "count": 1,
+                    "online_count": 1,
+                    "offline_count": 0,
+                    "nodes": [{
+                        "node_id": "master",
+                        "role": "master",
+                        "node_type": "pc",
+                        "state": "online",
+                        "network_path": {
+                            "path_kind": "derp",
+                            "availability": "degraded",
+                            "endpoint": {"host": "100.64.0.99"},
+                            "relay_region": "private-region",
+                            "quality": {
+                                "rtt_ms_p95": 31.0,
+                                "jitter_ms_p95": 7.0,
+                                "stalls_in_window": 2,
+                                "reconnects_in_window": 1,
+                            },
+                        },
+                    }],
+                }
+
+        path_app = FakeApp(PathApi())
+
+        message, style = path_app.exec_command("/nodes")
+
+        rendered = "\n".join(path_app.out)
+        assert style == "ok"
+        assert "DERP中继/降级" in rendered
+        assert "P95 31ms" in rendered
+        assert "J 7ms" in rendered
+        assert "S2" in rendered and "R1" in rendered
+        assert "100.64.0.99" not in rendered
+        assert "private-region" not in rendered
+
 
 class TestLogCommands:
     """/logs（行数校验）、/log（filter/token/用法）"""
