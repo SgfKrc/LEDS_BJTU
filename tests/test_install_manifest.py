@@ -462,9 +462,42 @@ def test_release_build_entrypoints_require_and_package_signed_baseline():
     for name in ("setup.iss", "setup-cuda.iss", "setup-launcher.iss"):
         setup = (PACKAGING_DIR / name).read_text(encoding="utf-8")
         assert "QLH-Install-Manifest.exe" in setup
-        assert "install-manifest.json" in setup
         assert "RaiseException" in setup
+    for name in ("setup.iss", "setup-cuda.iss"):
+        setup = (PACKAGING_DIR / name).read_text(encoding="utf-8")
+        assert 'verify --root "' in setup
+        assert "--level deep" in setup
+        assert "validate --manifest" not in setup
+        assert 'Source: "..\\' not in setup
+        assert 'Source: "version.txt"' not in setup
+        assert 'Source: "scripts\\convert_to_gguf.py"' not in setup
+        assert "RetainUserData" in setup
+        assert "ReassociateRetainedData" in setup
+        assert "RunDataRetention" in setup
+        assert "QLH-Data-Retention.exe" in setup
+        assert "--data-root" in setup and "--yes --json" in setup
+        assert "RenameFile(Sources" not in setup
+        assert "{localappdata}\\QLH-Edge-Inference\\data" in setup
+        assert "DelTree(ExpandConstant('{app}\\models')" not in setup
+        assert "[UninstallDelete]" not in setup
+    launcher_setup = (PACKAGING_DIR / "setup-launcher.iss").read_text(encoding="utf-8")
+    assert "install-manifest.json" in launcher_setup
+    linux_prerm = (PACKAGING_DIR / "linux" / "prerm").read_text(encoding="utf-8")
+    linux_postinst = (PACKAGING_DIR / "linux" / "postinst").read_text(encoding="utf-8")
+    assert 'RETENTION_TOOL="$APP_DIR/bin/data_retention.py"' in linux_prerm
+    assert '"$RETENTION_TOOL" retain' in linux_prerm
+    assert 'RETENTION_TOOL="$APP_DIR/bin/data_retention.py"' in linux_postinst
+    assert '"$RETENTION_TOOL" reassociate' in linux_postinst
     verifier_spec = (PACKAGING_DIR / "qlh-install-manifest.spec").read_text(encoding="utf-8")
     assert 'name="QLH-Install-Manifest"' in verifier_spec
     assert '"torch"' in verifier_spec and "excludes=" in verifier_spec
+    retention_spec = (PACKAGING_DIR / "qlh-data-retention.spec").read_text(encoding="utf-8")
+    assert 'name="QLH-Data-Retention"' in retention_spec
+    assert '"torch"' in retention_spec and "excludes=" in retention_spec
+    for name in ("build-cpu.bat", "build-cuda.bat"):
+        build = (PACKAGING_DIR / name).read_text(encoding="utf-8")
+        helper_build = build.index("packaging\\qlh-data-retention.spec")
+        manifest_build = build.index("packaging\\install_manifest.py build")
+        assert helper_build < manifest_build
+        assert "QLH-Data-Retention.exe" in build
     assert (project / "packaging" / "install_manifest.py").is_file()

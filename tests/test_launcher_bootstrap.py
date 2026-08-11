@@ -99,6 +99,37 @@ def test_repair_command_uses_detected_root_and_structured_output(monkeypatch, tm
     assert __import__("json").loads(capsys.readouterr().out) == report
 
 
+def test_retain_data_command_requires_explicit_confirmation_and_forwards_root(monkeypatch, tmp_path, capsys):
+    captured = {}
+    monkeypatch.setattr(qlh_launcher, "diagnosis_app_root", lambda _variant: tmp_path)
+    monkeypatch.setattr(
+        qlh_launcher,
+        "retain_user_data",
+        lambda root, data_root, *, confirm: captured.update(
+            {"root": root, "data_root": data_root, "confirm": confirm}
+        ) or {"ok": True, "action": "retained"},
+    )
+
+    assert qlh_launcher.main(["retain-data", "--yes", "--data-root", str(tmp_path / "data"), "--json"]) == 0
+    assert captured == {"root": tmp_path, "data_root": str(tmp_path / "data"), "confirm": True}
+    assert __import__("json").loads(capsys.readouterr().out)["action"] == "retained"
+
+
+def test_reinstall_retains_data_before_starting_signed_installer(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(qlh_launcher, "diagnosis_app_root", lambda _variant: tmp_path)
+    monkeypatch.setattr(
+        qlh_launcher,
+        "retain_user_data",
+        lambda root, *, confirm: calls.append(("retain", root, confirm)) or {"ok": True, "action": "retained"},
+    )
+    monkeypatch.setattr(qlh_launcher, "updater_main", lambda argv: calls.append(("install", argv)) or 0)
+
+    assert qlh_launcher.main(["reinstall", "--yes", "--source", "https://updates.example/latest.json"]) == 0
+    assert calls[0] == ("retain", tmp_path, True)
+    assert calls[1] == ("install", ["install", "--yes", "--source", "https://updates.example/latest.json"])
+
+
 def test_controller_bundles_a_sanitized_diagnosis_report(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setattr(qlh_launcher, "default_state_dir", lambda: tmp_path / "state")
@@ -166,6 +197,7 @@ def test_linux_deb_build_keeps_bootstrap_and_venv_fallback_contract():
     assert '"$PACKAGING_DIR/qlh_launcher.py"' in script
     assert '"$PACKAGING_DIR/diagnose.py"' in script
     assert '"$PACKAGING_DIR/repair.py"' in script
+    assert '"$PACKAGING_DIR/data_retention.py"' in script
     assert '"$PACKAGING_DIR/update_core.py"' in script
     assert '"$PACKAGING_DIR/updater.py"' in script
     assert '"$PACKAGING_DIR/version_store.py"' in script
@@ -198,7 +230,7 @@ def test_bjtu_routes_launcher_maintenance_commands():
     windows = (PROJECT_ROOT / "bjtu.bat").read_text(encoding="utf-8")
     linux = (PROJECT_ROOT / "bjtu.sh").read_text(encoding="utf-8")
     packaged = (PROJECT_ROOT / "packaging" / "linux" / "bjtu").read_text(encoding="utf-8")
-    for command in ("launcher-status", "launcher-check", "launcher-install", "launcher-rollback", "diagnostics", "verify", "diagnose", "repair"):
+    for command in ("launcher-status", "launcher-check", "launcher-install", "launcher-rollback", "diagnostics", "verify", "diagnose", "repair", "data-status", "retain-data", "reassociate-data", "reinstall"):
         assert command in windows
         assert command in linux
         assert command in packaged
