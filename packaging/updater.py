@@ -34,12 +34,13 @@ from launcher_slots import LauncherSlotError, LauncherSlotStore
 from version_store import VersionStore, VersionStoreError
 
 
-LAUNCHER_VERSION = "0.1.8.1"
+LAUNCHER_VERSION = "0.1.8.2"
 DEFAULT_UPDATE_SOURCES = (
     "http://100.90.76.108:9090/latest.json",
     "https://github.com/SgfKrc/LEDS_BJTU/releases/latest/download/latest.json",
-    # Gitee 镜像兜底源（gitee 无 latest 别名，发版时需同步更新 tag）
-    "https://gitee.com/sgfd8134/leds_-bjtu_-gitee/releases/download/0.1.8.2/latest.json",
+    # Gitee 镜像兜底源：Gitee 无 latest 别名，{release_tag} 由 fetch_latest
+    # 从已成功源的最高 tag 自动填充（随发版版本自动同步，无需手工维护）。
+    "https://gitee.com/sgfd8134/leds_-bjtu_-gitee/releases/download/{release_tag}/latest.json",
 )
 
 

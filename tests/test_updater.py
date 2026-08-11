@@ -173,7 +173,7 @@ def test_configured_sources_keeps_multiple_persisted_sources(tmp_path, monkeypat
 
 
 def test_default_update_sources_include_gitee_mirror_fallback():
-    """默认源列表包含 Gitee 镜像兜底源（发版时 tag 需同步更新）。"""
+    """默认源列表包含 Gitee 镜像兜底源（占位符形态，tag 自动填充）。"""
     sources = updater.DEFAULT_UPDATE_SOURCES
     assert len(sources) >= 3
     assert sources[0].startswith("http://")
@@ -181,7 +181,48 @@ def test_default_update_sources_include_gitee_mirror_fallback():
     assert sources[2].startswith(
         "https://gitee.com/sgfd8134/leds_-bjtu_-gitee/releases/download/"
     )
+    assert update_core.RELEASE_TAG_PLACEHOLDER in sources[2]
     assert sources[2].endswith("/latest.json")
+
+
+def test_fetch_latest_materializes_release_tag_placeholder_from_winning_source():
+    """含 {release_tag} 的兜底源用已成功源的最高 tag 填充后抓取。"""
+    called: list[str] = []
+
+    def fetcher(url, timeout):
+        called.append(url)
+        if update_core.RELEASE_TAG_PLACEHOLDER in url:
+            raise update_core.UpdateError("unresolved template must not be fetched")
+        tag = "0.1.8.2" if "github" in url else "0.1.8"
+        return update_core.UpdateManifest.from_mapping(
+            {"schema_version": 1, "tag": tag, "assets": [_asset(f"{tag}.exe")]},
+            source_url=url,
+        )
+
+    template = "https://gitee.example/{release_tag}/latest.json"
+    manifest, failures = update_core.fetch_latest(
+        ["https://old.example", "https://github.example", template],
+        timeout=1, fetcher=fetcher,
+    )
+    assert manifest.tag == "0.1.8.2"
+    assert failures == ()
+    assert "https://gitee.example/0.1.8.2/latest.json" in called
+    assert not any(update_core.RELEASE_TAG_PLACEHOLDER in url for url in called)
+
+
+def test_fetch_latest_placeholder_reports_unresolved_when_all_sources_fail():
+    """第一阶段全部失败时占位符源报告 unresolved，不猜测版本号。"""
+
+    def fetcher(url, timeout):
+        raise update_core.UpdateError("offline")
+
+    with pytest.raises(update_core.UpdateError) as excinfo:
+        update_core.fetch_latest(
+            ["https://old.example", "https://gitee.example/{release_tag}/latest.json"],
+            timeout=1, fetcher=fetcher,
+        )
+    assert "unresolved" in str(excinfo.value)
+    assert "{release_tag}" in str(excinfo.value)
 
 
 def test_detect_current_version_reads_source_tree_without_importing_it(tmp_path, monkeypatch):
