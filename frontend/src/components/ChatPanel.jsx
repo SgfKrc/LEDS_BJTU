@@ -8,6 +8,55 @@ const CHAT_HISTORY_KEY_PREFIX = 'qlh-chat-history-';
 const DEBUG_CHAT = import.meta.env.DEV;
 const debugLog = (...args) => { if (DEBUG_CHAT) console.log(...args); };
 
+const MAX_CHAT_IMAGES = 4;
+const MAX_CHAT_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_CHAT_IMAGE_TOTAL_BYTES = 16 * 1024 * 1024;
+const CHAT_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+
+function formatImageBytes(bytes) {
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function imageFileHasExpectedSignature(file, bytes) {
+  if (file.type === 'image/png') {
+    return bytes.length >= 8
+      && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e
+      && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a
+      && bytes[6] === 0x1a && bytes[7] === 0x0a;
+  }
+  if (file.type === 'image/jpeg') {
+    return bytes.length >= 3
+      && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  return bytes.length >= 12
+    && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF'
+    && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
+}
+
+async function readChatImage(file) {
+  if (!CHAT_IMAGE_MIME_TYPES.has(file.type)) {
+    throw new Error(`${file.name} 不是 PNG、JPEG 或 WebP 图片`);
+  }
+  if (file.size > MAX_CHAT_IMAGE_BYTES) {
+    throw new Error(`${file.name} 超过单张 8 MiB 上限`);
+  }
+  const signature = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  if (!imageFileHasExpectedSignature(file, signature)) {
+    throw new Error(`${file.name} 的文件内容与声明格式不一致`);
+  }
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`无法读取 ${file.name}`));
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.readAsDataURL(file);
+  });
+  if (!dataUrl.startsWith(`data:${file.type};base64,`)) {
+    throw new Error(`${file.name} 无法编码为受支持的图片格式`);
+  }
+  return dataUrl;
+}
+
 export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsTrigger, onOpenSettings, settings, taskGraphCapability, sessionId, onCreateSession, onRenameSession }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -17,6 +66,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const [presets, setPresets] = useState(null);
   const [uploadedFile, setUploadedFile] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [queuedImages, setQueuedImages] = useState([]);
+  const [readingImages, setReadingImages] = useState(false);
   const [expandedThinking, setExpandedThinking] = useState(new Set());
   const [deletingTurn, setDeletingTurn] = useState(null);  // { turnIndex, msgId } 或 null
   const [historyLoading, setHistoryLoading] = useState(false);  // 会话切换时历史加载中
@@ -24,6 +75,8 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const messagesEnd = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
+  const imageInputRef = useRef(null);
+  const imagePreviewUrlsRef = useRef(new Set());
   const creatingSessionRef = useRef(false);  // 防止并发创建会话
   const clearingRef = useRef(false);         // 防止清空期间发送消息
   const currentSessionIdRef = useRef(sessionId);  // 跟踪当前活跃会话ID，跨渲染同步
@@ -33,6 +86,25 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
   const activeGenerationIdRef = useRef(null);     // 所有聊天模式共享的后端取消 ID
   const requestSequenceRef = useRef(0);           // 隔离切换会话前后的请求清理
   currentSessionIdRef.current = sessionId;
+
+  const revokeImagePreview = useCallback((previewUrl) => {
+    if (!previewUrl || !imagePreviewUrlsRef.current.has(previewUrl)) return;
+    URL.revokeObjectURL(previewUrl);
+    imagePreviewUrlsRef.current.delete(previewUrl);
+  }, []);
+
+  const clearQueuedImages = useCallback(() => {
+    setQueuedImages((current) => {
+      current.forEach((image) => revokeImagePreview(image.previewUrl));
+      return [];
+    });
+    if (imageInputRef.current) imageInputRef.current.value = '';
+  }, [revokeImagePreview]);
+
+  useEffect(() => () => {
+    imagePreviewUrlsRef.current.forEach((previewUrl) => URL.revokeObjectURL(previewUrl));
+    imagePreviewUrlsRef.current.clear();
+  }, []);
 
   const cancelTaskGraphEventually = useCallback(async (workflowId, attempt = 0) => {
     if (!workflowId) return null;
@@ -384,8 +456,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     setLastMetrics(null);
     setTaskGraphRun(null);
     setUploadedFile(null);
+    clearQueuedImages();
     setExpandedThinking(new Set());
-  }, [sessionId, cancelActiveGeneration]);
+  }, [sessionId, cancelActiveGeneration, clearQueuedImages]);
 
   // Fetch preset questions when model changes or chat is cleared
   useEffect(() => {
@@ -427,9 +500,74 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const handleImageSelect = async (event) => {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
+
+    setReadingImages(true);
+    try {
+      let totalBytes = queuedImages.reduce((total, image) => total + image.size, 0);
+      let slots = queuedImages.length;
+      const nextImages = [];
+      const rejected = [];
+
+      for (const file of files) {
+        if (slots >= MAX_CHAT_IMAGES) {
+          rejected.push(`${file.name}: 最多选择 ${MAX_CHAT_IMAGES} 张图片`);
+          continue;
+        }
+        if (totalBytes + file.size > MAX_CHAT_IMAGE_TOTAL_BYTES) {
+          rejected.push(`${file.name}: 图片总大小不能超过 16 MiB`);
+          continue;
+        }
+        try {
+          const dataUrl = await readChatImage(file);
+          const previewUrl = URL.createObjectURL(file);
+          imagePreviewUrlsRef.current.add(previewUrl);
+          nextImages.push({
+            id: globalThis.crypto?.randomUUID?.()
+              || `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+            name: file.name,
+            type: file.type,
+            size: file.size,
+            dataUrl,
+            previewUrl,
+          });
+          totalBytes += file.size;
+          slots += 1;
+        } catch (error) {
+          rejected.push(error.message);
+        }
+      }
+
+      if (nextImages.length) {
+        setQueuedImages((current) => [...current, ...nextImages]);
+      }
+      if (rejected.length) {
+        onToast?.({ type: 'error', msg: rejected.slice(0, 2).join('；') });
+      } else if (nextImages.length) {
+        onToast?.({ type: 'success', msg: `已添加 ${nextImages.length} 张图片` });
+      }
+    } finally {
+      setReadingImages(false);
+      if (imageInputRef.current) imageInputRef.current.value = '';
+    }
+  };
+
+  const handleRemoveImage = (imageId) => {
+    setQueuedImages((current) => {
+      const image = current.find((item) => item.id === imageId);
+      if (image) revokeImagePreview(image.previewUrl);
+      return current.filter((item) => item.id !== imageId);
+    });
+  };
+
   const handleSend = async (presetText) => {
-    const text = (typeof presetText === 'string' ? presetText : input).trim();
-    if (!text || sending) return;
+    const requestedText = (typeof presetText === 'string' ? presetText : input).trim();
+    const imageDataUrls = queuedImages.map((image) => image.dataUrl);
+    const hasImages = imageDataUrls.length > 0;
+    const text = requestedText || (hasImages ? '请描述这些图片。' : '');
+    if ((!text && !hasImages) || sending || readingImages) return;
 
     // 清空操作进行中时禁止发送，避免状态竞态
     if (clearingRef.current) {
@@ -437,7 +575,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       return;
     }
 
-    if (settings?.executionMode === 'task_graph' && !taskGraphCapability?.available) {
+    if (!hasImages && settings?.executionMode === 'task_graph' && !taskGraphCapability?.available) {
       onToast?.({
         type: 'error',
         msg: '任务链实验当前不可用，请切换执行模式或检查主节点配置',
@@ -504,11 +642,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       content: fullMessage,
       displayContent: text,
       fileContext: fileContext,
+      imageCount: imageDataUrls.length,
       id: Date.now(),
     };
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
     setUploadedFile(null);
+    clearQueuedImages();
     setSending(true);
 
     // 取消上一次未完成的 SSE 请求（会话切换等场景）
@@ -518,7 +658,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     const requestSequence = ++requestSequenceRef.current;
-    const executionMode = settings?.executionMode === 'task_graph'
+    const executionMode = !hasImages && settings?.executionMode === 'task_graph'
       ? 'task_graph'
       : 'auto';
     const uniqueId = globalThis.crypto?.randomUUID?.()
@@ -543,6 +683,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         effectiveSessionId,
         currentSessionId: currentSessionIdRef.current,
         textPreview: text.slice(0, 30),
+        imageCount: imageDataUrls.length,
         streamingMode: settings?.streamingMode || 'full',
         executionMode,
         workflowId,
@@ -576,6 +717,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             && settings?.taskGraphRemoteMode === 'auto',
           workflowId,
           generationId,
+          imageDataUrls,
+          allowExternal: hasImages,
+          preferExternal: hasImages,
           onToken: (_token, fullText) => {
             // 会话切换检测：丢弃已推送的 token
             if (currentSessionIdRef.current !== effectiveSessionId) return;
@@ -617,6 +761,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             && settings?.taskGraphRemoteMode === 'auto',
           workflowId,
           generationId,
+          imageDataUrls,
+          allowExternal: hasImages,
+          preferExternal: hasImages,
         });
 
         // 推理期间用户可能切换了会话——丢弃结果，不污染新会话的消息列表
@@ -748,6 +895,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       setMessages([]);
       setLastMetrics(null);
       setUploadedFile(null);
+      clearQueuedImages();
       onToast?.({ type: 'success', msg: '对话历史已清空（服务器 + 本地）' });
     } catch (err) {
       onToast?.({ type: 'error', msg: `清空失败: ${err.message}` });
@@ -938,6 +1086,11 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                       📎 {msg.fileContext.filename} ({msg.fileContext.line_count} 行)
                     </div>
                   )}
+                  {msg.imageCount > 0 && (
+                    <div className="image-attachment-badge">
+                      🖼 {msg.imageCount} 张图片
+                    </div>
+                  )}
                   <div className="bubble">
                     {/* assistant 消息快捷操作 */}
                     {msg.role === 'assistant' && msg.content && (
@@ -1041,6 +1194,30 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
 
       {/* Input */}
       <div className="chat-input-area">
+        {queuedImages.length > 0 && (
+          <div className="image-chip-row" role="status" aria-label="待发送图片">
+            {queuedImages.map((image) => (
+              <div className="image-chip" key={image.id}>
+                <img src={image.previewUrl} alt={image.name} />
+                <div className="image-chip-info">
+                  <span className="image-chip-name" title={image.name}>{image.name}</span>
+                  <span className="image-chip-meta">{formatImageBytes(image.size)}</span>
+                </div>
+                <button
+                  className="file-chip-remove"
+                  onClick={() => handleRemoveImage(image.id)}
+                  title={`移除图片 ${image.name}`}
+                  aria-label={`移除图片 ${image.name}`}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <span className="image-queue-total">
+              {queuedImages.length}/{MAX_CHAT_IMAGES} · {formatImageBytes(queuedImages.reduce((sum, image) => sum + image.size, 0))}/{formatImageBytes(MAX_CHAT_IMAGE_TOTAL_BYTES)}
+            </span>
+          </div>
+        )}
         {/* 已上传文件标签 */}
         {uploadedFile && (
           <div className="file-chip-row">
@@ -1065,6 +1242,14 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             style={{ display: 'none' }}
             onChange={handleFileSelect}
           />
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            multiple
+            style={{ display: 'none' }}
+            onChange={handleImageSelect}
+          />
           <button
             className="btn-ghost file-upload-btn"
             onClick={() => fileInputRef.current?.click()}
@@ -1072,6 +1257,15 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             title="上传文本文件 (txt/md/csv/py/json 等)"
           >
             {uploading ? '⏳' : '📎'}
+          </button>
+          <button
+            className="btn-ghost file-upload-btn image-upload-btn"
+            onClick={() => imageInputRef.current?.click()}
+            disabled={!modelLoaded || sending || readingImages}
+            title="添加图片（PNG/JPEG/WebP，最多 4 张）"
+            aria-label="添加图片"
+          >
+            {readingImages ? '⏳' : '🖼'}
           </button>
           <textarea
             ref={inputRef}
@@ -1089,7 +1283,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           <button
             className="btn-primary"
             onClick={sending ? cancelActiveGeneration : handleSend}
-            disabled={clearing || (!sending && (!modelLoaded || (!input.trim() && !uploadedFile)))}
+            disabled={clearing || (!sending && (!modelLoaded || (!input.trim() && !uploadedFile && queuedImages.length === 0)))}
             title={sending ? '停止当前生成' : '发送消息'}
           >
             {clearing ? '清空中...' : sending ? '停止' : '发送'}

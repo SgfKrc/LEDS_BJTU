@@ -182,8 +182,16 @@ export default function App({ authSession, onLogout }) {
       // 从云端恢复用户偏好设置（仅在用户已开启云同步时）
       fetchStatus()
         .then((status) => {
-          setModelLoaded(Boolean(status?.model_loaded));
-          setCurrentQuant(status?.current_quant || null);
+          const externalReady = Boolean(
+            status?.external?.enabled && status?.external?.reachable,
+          );
+          const localModelLoaded = Boolean(status?.model_loaded);
+          setModelLoaded(Boolean(localModelLoaded || externalReady));
+          setCurrentQuant(
+            localModelLoaded
+              ? status?.current_quant
+              : (externalReady ? status?.external?.model : status?.current_quant || null),
+          );
           if (status?.active_model_id) {
             setActiveModelId(status.active_model_id);
           }

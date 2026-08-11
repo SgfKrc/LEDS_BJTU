@@ -47,11 +47,14 @@ except ImportError:  # pragma: no cover - 环境引导路径
 from tui_sse import SSEDecoder, decode_json_event  # noqa: E402
 from tui_shared import (  # noqa: E402
     API_PATHS,
+    MAX_CHAT_IMAGES,
+    MAX_CHAT_IMAGE_TOTAL_BYTES,
     ROUTE_LABELS,
     ROUTING_PREFERENCES,
     build_interactive_request,
     format_metrics,
     help_text,
+    load_local_chat_image,
     parse_session_line,
     resolve_route_arg,
 )
@@ -146,6 +149,7 @@ class TuiChatApp(App[None]):
         self.generation_id: Optional[str] = None
         self._epoch = 0
         self._history: List[str] = []
+        self._pending_images: List[dict] = []
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
         self._messages: List[Markdown] = []
         self._status = "未连接"
@@ -189,6 +193,8 @@ class TuiChatApp(App[None]):
     async def on_input_submitted(self, message: InputSubmitted) -> None:
         text = message.text.strip()
         if not text:
+            if self._pending_images and not self.is_generating:
+                await self._send_message("请描述这些图片。")
             return
         if text.startswith("/"):
             await self._run_command(text)
@@ -218,11 +224,21 @@ class TuiChatApp(App[None]):
         elif cmd in ("/route",):
             resolved = resolve_route_arg(arg)
             if resolved:
+                if self._pending_images and resolved == "local_only":
+                    self.notify("待发送图片必须走 external_api，不能设为 local_only", severity="warning")
+                    return
                 self.route = resolved
                 self._update_status()
                 self.notify(f"路由偏好: {ROUTE_LABELS[resolved]}")
             else:
                 self.notify(f"用法: /route {'|'.join(ROUTE_LABELS)}", severity="warning")
+        elif cmd in ("/image",):
+            await self._cmd_image(arg)
+        elif cmd in ("/images",):
+            await self._cmd_images()
+        elif cmd in ("/image-clear",):
+            self._clear_pending_images()
+            self.notify("待发送图片已移除")
         elif cmd in ("/cancel",):
             await self._cancel_generation()
         elif cmd in ("/clear",):
@@ -248,6 +264,7 @@ class TuiChatApp(App[None]):
     async def _cmd_new_session(self) -> None:
         await self._auto_cancel_generation()
         self._epoch += 1
+        self._clear_pending_images()
         if not self.host:
             self.session_id = None
             self.session_title = "新会话（fixture）"
@@ -273,6 +290,7 @@ class TuiChatApp(App[None]):
             return
         await self._auto_cancel_generation()
         self._epoch += 1
+        self._clear_pending_images()
         self.session_id = session_id
         if self.host:
             try:
@@ -336,6 +354,7 @@ class TuiChatApp(App[None]):
                 return
         self.session_id = None
         self.session_title = "新会话"
+        self._clear_pending_images()
         await self._clear_transcript()
         await self._append_system(f"会话已删除: {sid}")
         self._update_status()
@@ -356,15 +375,57 @@ class TuiChatApp(App[None]):
         except Exception as exc:
             await self._append_system(f"会话列表失败: {exc}")
 
+    async def _cmd_image(self, path_value: str) -> None:
+        if len(self._pending_images) >= MAX_CHAT_IMAGES:
+            self.notify(f"最多只能添加 {MAX_CHAT_IMAGES} 张图片", severity="warning")
+            return
+        try:
+            image = load_local_chat_image(path_value)
+        except ValueError as exc:
+            self.notify(str(exc), severity="warning")
+            return
+        total = sum(item["size"] for item in self._pending_images) + image["size"]
+        if total > MAX_CHAT_IMAGE_TOTAL_BYTES:
+            self.notify("待发送图片总大小不能超过 16 MiB", severity="warning")
+            return
+        self._pending_images.append(image)
+        if self.route == "local_only":
+            self.route = "auto"
+            await self._append_system("图片请求已将路由切回 auto（需 external_api）")
+        await self._append_system(
+            f"已添加图片: {image['name']}（{image['size'] // 1024} KB）；"
+            f"待发送 {len(self._pending_images)}/{MAX_CHAT_IMAGES} 张",
+        )
+        self._update_status()
+
+    async def _cmd_images(self) -> None:
+        if not self._pending_images:
+            await self._append_system("没有待发送图片")
+            return
+        total = sum(item["size"] for item in self._pending_images)
+        names = ", ".join(item["name"] for item in self._pending_images)
+        await self._append_system(
+            f"待发送图片 {len(self._pending_images)}/{MAX_CHAT_IMAGES} 张，"
+            f"{total // 1024} KB：{names}",
+        )
+
+    def _clear_pending_images(self) -> None:
+        self._pending_images = []
+        self._update_status()
+
     # ---- 发送与流式 ----
 
     async def _send_message(self, text: str) -> None:
+        image_data_urls = [item["data_url"] for item in self._pending_images]
         self._history.append(text)
         await self._append_message("user", text)
+        if image_data_urls:
+            await self._append_system(f"本次请求附带 {len(image_data_urls)} 张图片")
+        self._clear_pending_images()
         self._epoch += 1
         self._clear_input()
         self.run_worker(
-            self._stream_worker(text, self._epoch),
+            self._stream_worker(text, self._epoch, image_data_urls),
             exclusive=False,
             group="stream",
         )
@@ -387,7 +448,12 @@ class TuiChatApp(App[None]):
                     events.append(payload)
         return events
 
-    async def _stream_worker(self, text: str, epoch: int) -> None:
+    async def _stream_worker(
+        self,
+        text: str,
+        epoch: int,
+        image_data_urls: Optional[List[str]] = None,
+    ) -> None:
         self.is_generating = True
         self.generation_id = f"gen_{uuid.uuid4().hex}"
         self._update_status()
@@ -452,6 +518,7 @@ class TuiChatApp(App[None]):
             generation_id=self.generation_id,
             routing_preference=self.route,
             show_thinking=self.thinking,
+            image_data_urls=image_data_urls,
         )
         try:
             async with self._client.stream(
@@ -550,6 +617,7 @@ class TuiChatApp(App[None]):
         self._epoch += 1
         self.session_id = None
         self.session_title = "新会话"
+        self._clear_pending_images()
         await self._clear_transcript()
         self._update_status()
 
@@ -595,9 +663,10 @@ class TuiChatApp(App[None]):
         bar = self.query_one("#status-bar", Static)
         mode = "fixture" if self.fixture_path else self.host
         gen = "生成中" if self.is_generating else "空闲"
+        image_count = f" · 图片:{len(self._pending_images)}" if self._pending_images else ""
         bar.update(
             f"{mode} · {self.session_title or self.session_id or '无会话'} · "
-            f"{ROUTE_LABELS.get(self.route, self.route)} · {gen} · "
+            f"{ROUTE_LABELS.get(self.route, self.route)}{image_count} · {gen} · "
             "Enter 发送 · Alt+Enter 换行 · Ctrl+C 停止 · /help",
         )
 
