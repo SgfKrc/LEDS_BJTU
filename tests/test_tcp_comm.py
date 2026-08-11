@@ -310,6 +310,97 @@ class TestLayerConfigSocketRoundTrip:
             server.stop()
 
 
+class TestNetworkPathLoopbackBoundary:
+    """One local TCP flow proving path metrics do not alter wire semantics."""
+
+    def test_registration_heartbeat_cancel_and_result_keep_wire_contract(
+            self, monkeypatch):
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "nw1-4-loopback-secret")
+        monkeypatch.setattr(
+            TCPClient,
+            "_compute_local_model_sha256",
+            staticmethod(lambda: "sha-nw1-4"),
+        )
+        monkeypatch.setattr(
+            TCPClient,
+            "_heartbeat_loop",
+            lambda self, connection_generation=None: None,
+        )
+        monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
+        monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
+
+        received_by_server = []
+        received_by_client = []
+        cancel_received = threading.Event()
+        result_received = threading.Event()
+        heartbeat_ack = threading.Event()
+        server = TCPServer(host="127.0.0.1", port=1)
+        server.port = 0
+
+        def on_server_message(client_id, msg):
+            if msg.get("type") == MessageType.REGISTER.value:
+                assert server.confirm_registration(client_id) is True
+                return
+            received_by_server.append((client_id, msg["type"], msg["data"]))
+            if msg.get("type") == MessageType.INFER_CANCEL.value:
+                cancel_received.set()
+
+        server.start(on_message=on_server_message)
+        port = server.sock.getsockname()[1]
+        client = TCPClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            client_id="worker-nw1-4",
+            role="client",
+            advertise_host="127.0.0.1",
+            advertise_port=port,
+        )
+        original_handle_ack = client._handle_heartbeat_ack
+
+        def on_heartbeat_ack(msg, connection_generation=None):
+            original_handle_ack(msg, connection_generation)
+            heartbeat_ack.set()
+
+        client._handle_heartbeat_ack = on_heartbeat_ack
+
+        def on_client_message(msg):
+            received_by_client.append((msg["type"], msg["data"]))
+            if msg.get("type") == MessageType.INFER_RESULT.value:
+                result_received.set()
+
+        try:
+            assert client.connect(on_message=on_client_message) is True
+            assert client.is_registered is True
+            assert server.get_client_ids() == ["worker-nw1-4"]
+
+            sent_at = time.time()
+            client._last_heartbeat_send = sent_at
+            client._heartbeat_quality.record_send(
+                client._connection_generation,
+                sent_at,
+            )
+            client.send_data({"t_send": sent_at}, MessageType.HEARTBEAT)
+            assert heartbeat_ack.wait(3), "loopback heartbeat ACK timed out"
+            assert client.get_network_quality_snapshot()["sample_count"] == 1
+
+            cancel = {"request_id": "req-nw1-4", "reason": "user_cancelled"}
+            client.send_data(cancel, MessageType.INFER_CANCEL)
+            assert cancel_received.wait(3), "loopback cancel timed out"
+
+            result = {"request_id": "req-nw1-4", "result": "cancelled"}
+            server.send_to_client("worker-nw1-4", result, MessageType.INFER_RESULT)
+            assert result_received.wait(3), "loopback result timed out"
+
+            assert ("worker-nw1-4", "infer_cancel", cancel) in received_by_server
+            assert ("infer_result", result) in received_by_client
+            assert client.is_registered is True
+        finally:
+            client.disconnect()
+            server.stop()
+
+
 # ================================================================
 # build_message 测试
 # ================================================================
