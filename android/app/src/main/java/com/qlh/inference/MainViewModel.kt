@@ -559,45 +559,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val memory = provider.getMemoryStatus()
         val gpu = provider.getGpuStatus()
         val runtime = _uiState.value.runtimeStatus
-        return mapOf(
-            "connection_type" to "http_thin",
-            "pipeline_worker" to false,
-            "client_mode" to _uiState.value.inferenceMode,
-            "app_variant" to if (BuildConfig.IS_LITE) "lite" else "full",
-            "app_version" to BuildConfig.VERSION_NAME,
-            "android" to mapOf(
-                "manufacturer" to system.manufacturer,
-                "brand" to system.brand,
-                "model" to system.model,
-                "device" to system.device,
-                "hardware" to system.hardware,
-                "soc_manufacturer" to system.socManufacturer,
-                "soc_model" to system.socModel,
-                "sdk_int" to system.sdkInt,
-                "android_release" to system.androidRelease,
-                "abis" to system.abis,
-                "cpu_cores" to system.cpuCores,
-                "thermal_status" to system.thermalStatus,
-            ),
-            "memory" to mapOf(
-                "available_bytes" to memory.availableBytes,
-                "total_bytes" to memory.totalBytes,
-                "low_memory" to memory.lowMemory,
-                "low_ram_device" to memory.lowRamDevice,
-            ),
-            "gpu" to mapOf(
-                "vendor" to gpu.vendor,
-                "renderer" to gpu.renderer,
-                "version" to gpu.version,
-                "probe_error" to gpu.probeError,
-                "supports_gpu_offload" to (runtime?.gpu?.supportsGpuOffload ?: false),
-                "backend_devices" to (runtime?.gpu?.backendDevices ?: ""),
-                "note" to gpu.note,
-            ),
-            "backend" to mapOf(
-                "engine" to (runtime?.backend?.engine ?: ""),
-                "supports_gpu_offload" to (runtime?.backend?.supportsGpuOffload ?: false),
-            ),
+        return buildAndroidPresencePayload(
+            inferenceMode = _uiState.value.inferenceMode,
+            appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
+            appVersion = BuildConfig.VERSION_NAME,
+            system = system,
+            memory = memory,
+            gpu = gpu,
+            runtime = runtime,
         )
     }
 
@@ -608,13 +577,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             val network = cm?.activeNetwork ?: return "unknown"
             val caps = cm.getNetworkCapabilities(network) ?: return "unknown"
-            when {
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile"
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
-                else -> "other"
-            }
+            networkTypeFromTransports(
+                hasWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                hasCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                hasEthernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                hasVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN),
+            )
         } catch (e: Exception) {
             QlhLogger.w("MainViewModel", "detectNetworkType failed: ${e.message}")
             "unknown"
