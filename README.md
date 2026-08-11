@@ -181,7 +181,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-06 全量回归 1416 passed / 4 skipped）
+├── tests/                         # 单元测试（2026-08-11 全量回归 1836 passed / 33 skipped）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
