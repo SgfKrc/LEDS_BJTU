@@ -6,7 +6,7 @@
 >
 > **生命周期**：Active（在用）
 >
-> **更新日期**：2026-08-08
+> **更新日期**：2026-08-11
 >
 > **适用范围**：QLH 终端版管理菜单（`src/tui_admin.py`）与全局 `bjtu` 命令的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
 
@@ -24,17 +24,11 @@ TUI 是**纯 HTTP 客户端**：所有数据来自后端 API（默认 `http://12
 
 ### 安装（一次性）
 
-**Windows**：把项目根目录加入 `PATH`：
+**打包版 Windows**：安装向导默认提供“注册全局 `bjtu` 命令”任务，可取消；静默安装使用 `/ENVREG=1` 强制启用或 `/ENVREG=0` 关闭。注册只追加当前用户的 QLH 安装目录，打开新终端后生效。
 
-```bat
-:: cmd 或 PowerShell 执行（当前用户，需重新打开终端生效）
-setx PATH "%PATH%;G:\C\PYT\qlh"
-```
+**Linux `.deb`**：包始终安装 `/usr/local/bin/bjtu` 符号链接。默认不修改 shell 环境；如需把 `/opt/qlh-edge-inference/bin` 注册给新登录 shell，可在安装时运行 `sudo env QLH_ENVREG=1 dpkg -i <包名>.deb`，或安装后运行 `sudo qlh-env-register enable`。关闭使用 `sudo qlh-env-register disable`。
 
-> 或用图形界面：系统属性 → 环境变量 → 用户变量 `Path` → 新建 → 填 QLH 项目根目录（`bjtu.bat` 所在目录）。
-> ⚠️ `setx` 会把整个 PATH 写回，若原 PATH 很长有截断风险，优先用图形界面方式。
-
-**Linux / macOS**（推荐符号链接到 PATH 目录）：
+**源码检出 / macOS**：仍需自行暴露项目根的 `bjtu.bat` / `bjtu.sh`。Windows 建议通过系统“环境变量”界面向用户 `Path` 添加项目根，避免 `setx PATH "%PATH%;..."` 重写过长 PATH；Linux/macOS 可建立到 PATH 目录的符号链接：
 
 ```bash
 sudo ln -s /path/to/qlh/bjtu.sh /usr/local/bin/bjtu
@@ -47,6 +41,7 @@ bjtu                                # 启动后端 + TUI（保持原有默认行
 bjtu launcher                       # 显式打开统一选择页
 bjtu ui                             # 直接启动普通 Web/Windows 原生界面
 bjtu tui                            # 启动后端并进入 TUI 管理界面
+bjtu chat --host http://127.0.0.1:8000  # 进入 Textual 终端对话页
 bjtu --host 100.x.x.x               # 启动后端后，TUI 管理远程主节点
 bjtu --plain                        # 纯文本编号菜单
 ```
@@ -67,6 +62,12 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 > ⚠️ 命令必须是**第一个参数**（`bjtu status --port 9000`）；选项在前（`bjtu --port 9000 status`）会被当作交互模式（可能启动后端）。
 
 `bjtu tui` 的后端生命周期行为与 `start_tui.bat` / `start_tui.sh` 相同：探测 `8000` 端口（`QLH_BACKEND_PORT` 可覆盖）→ 未运行则启动后端 → 等待 `/api/health` 就绪 → 进入 TUI；退出 TUI 后后端继续运行。`bjtu ui` 则在相同检查完成后打开普通界面。
+
+### `bjtu chat`（终端对话页）
+
+已安装的 Windows 主应用包通过 `QLH-TUI-Chat/QLH-TUI-Chat.exe` 运行聊天页；Linux `.deb` 使用 `/opt/qlh-edge-inference/venv`。两者都已携带 Textual/httpx，首次进入不安装依赖也不联网。它与管理 TUI 是独立进程，`tui_admin.py --plain` 和原有 `bjtu` 默认入口不变。
+
+源码检出模式仍可使用隔离的 `.venv-tui`：先运行 `python scripts/setup_tui_env.py`，再执行 `bjtu chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列，当前不把聊天页设为默认入口。
 
 ## 三、一键启动（start_tui.bat / start_tui.sh）
 

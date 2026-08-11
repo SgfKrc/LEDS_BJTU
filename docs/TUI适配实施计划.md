@@ -1,10 +1,10 @@
 # TUI 适配与聊天页实施计划
 
-> **状态**：部分实施（T1-T8 管理 TUI 与 T9.0-T9.5 聊天页已完成；T9.6 的独立 Launcher/BJTU 接线完成，聊天依赖入包、默认入口和分布式真机验收未完成）
+> **状态**：部分实施（T1-T8 管理 TUI 与 T9.0-T9.5 聊天页已完成；T9.6 主应用包接线和 T9.6-R2 Windows 开发机 CPU/CUDA 实装门完成，外部干净机/Linux、默认入口和分布式真机验收未完成）
 >
-> **生命周期**：Active（T1-T8 在用）+ Candidate（T9 发布收口）——现有 7 屏管理 TUI 与网关契约继续作为稳定基线；`bjtu chat` 的 T9.0-T9.5 与 Launcher/BJTU 接线已可用，但聊天依赖入主应用包、分布式真机验收和默认入口尚未完成
+> **生命周期**：Active（T1-T8 在用）+ Candidate（T9 发布收口）——现有 7 屏管理 TUI 与网关契约继续作为稳定基线；`bjtu chat` 已在 Windows CPU/CUDA 隔离安装中可用，UP-N6.4W 跨卷保留门已完成，但外部干净机/Linux、分布式真机验收和默认入口尚未完成
 >
-> **更新日期**：2026-08-08
+> **更新日期**：2026-08-11
 >
 > **适用范围**：T1-T8 管理 TUI 网关适配与验收记录，以及 T9 简化聊天页面、流式会话、本地/分布式路由展示和可选依赖环境计划；当前日常使用见 [TUI 使用指南](TUI使用指南.md)
 >
@@ -499,7 +499,7 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
 - [x] **T9.1 可选依赖与启动引导** ✅ 2026-08-06（主体完成）
   - `packaging/requirements-tui.txt`（textual==8.2.8 + httpx）、`scripts/setup_tui_env.py`（创建 `.venv-tui`、幂等、尊重代理/镜像、`--wheelhouse` 离线安装、失败保留重试命令）。
   - `bjtu chat` / `bjtu.sh chat` 启动路由：缺依赖只显示检测结果与安装命令并 exit 2，不污染全局解释器；管理 TUI 与 `--plain` 不受影响。
-  - 待办：Windows/Linux 安装包携带依赖（T9.6）；干净环境实测截图。
+  - Windows/Linux 安装包携带依赖的开发接线已在 T9.6 完成；干净环境实测截图仍属于 T9.6-R 发布门。
 
 - [x] **T9.2 聊天页面与命令复用** ✅ 2026-08-06（含终端布局快照验收）
   - transcript（Markdown 增量渲染）、输入区（Enter 发送 / Alt+Enter、Ctrl+J 换行）、状态栏、滚动与第 8 屏入口（`bjtu chat`）。
@@ -517,7 +517,7 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - 启动时自动恢复最近活跃会话（`active_session_id` + activate 加载历史）。
   - 会话/模型切换先自动取消当前生成（不再拒绝切换）；epoch fencing 丢弃迟到事件，切换后旧流 token 不污染新会话。
   - 修复：parse_session_line 兼容后端 `id`/`session_id` 字段；`_clear_transcript` 全量清空避免重复 widget id。
-  - 验收：`tests/test_tui_chat.py` 17 用例（含 new/resume/rename/delete/启动恢复/切换竞态）+ 全量 T9 回归 126 passed；主节点重启与 DB 断开的历史行为依赖真实环境（T9.6 前复查）。
+  - 验收：`tests/test_tui_chat.py` 17 用例（含 new/resume/rename/delete/启动恢复/切换竞态）+ 全量 T9 回归 126 passed；主节点重启与 DB 断开的历史行为依赖真实环境（T9.6-R 发布验收复查）。
 
 - [x] **T9.5 本地/分布式路由与真实指标**（local 部分完成 2026-08-06；分布式真机验收待物理从节点）
   - 请求级 `routing_preference` 接入执行路径（api_server 单体）：`local_only` 强制本地（跳过外部路由/主节点转发/分布式流水线，含 full 与 interactive/fast）；`distributed_required` 无分布式路径时明确失败（interactive/fast 发 error 事件、full 走既有 SSE error 语义），不静默回退；`distributed_preferred` 不可用时本地回退并标注 `fallback=true` + `fallback_reason`。
@@ -525,9 +525,13 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - 验收：`tests/test_chat_interactive.py` 17 用例（local_only 客户端/主节点、required 失败/放行、preferred 回退 metrics、full 模式 local_only/required）+ 全量相关回归 263 passed。
   - 待办：inference-svc 的 interactive 历史事务提交（engine_host 薄实现 `history_committed=false` 如实上报）；物理从节点可用后验证真实参与节点与 fallback 跨端一致（TUI/Web/任务统计）。
 
-- [ ] **T9.6 打包、回归与默认入口决策**（Launcher/BJTU 子项完成 2026-08-08）
+- [ ] **T9.6 打包、回归与默认入口决策**（开发接线、Windows 发布构建、开发机实装和跨卷保留门完成 2026-08-11；外部干净机/Linux 发布门待验）
   - [x] 独立 `QLH Launcher` 建立 GUI/TUI 双入口，`bjtu launcher/ui/tui/update/version` 接线；Linux 将 Bootstrap `qlh-launcher` 与主应用载荷 `qlh-app` 分开。
-  - [ ] Windows/Linux 主应用包包含聊天依赖；源码模式环境引导已存在，但正式包仍需构建和干净机验收。
+  - [x] Windows 发布构建门：`requirements-cpu.txt` 锁定 `textual==8.2.8`；专用 CPU/CUDA venv 均完成主应用、控制台伴随程序、清单工具、跨卷保留 helper 和 Inno Setup 全量构建。最终 CPU 清单 `5015` 文件、deep `5016 checked / 0 failed`，安装器 `193205616` bytes（SHA-256 `fb3a4157...2ba02b7`）；CUDA 清单 `4736` 文件、deep `4737 checked / 0 failed`，安装器 `1504200870` bytes（SHA-256 `021a3514...63106f`）。安装器现在只读取已签名发布树，并在安装结束前执行 deep，不再用仓库文件覆盖签名内容或只验证 manifest 签名。
+  - [x] Linux 开发接线与快速门：`.deb` 的包内 venv 由同一 `requirements-cpu.txt` 安装 Textual，`bjtu chat` 直接执行 `/opt/qlh-edge-inference/venv/bin/python src/tui_chat.py`；首次进入不安装依赖、不访问网络。`build-deb.sh cpu|cuda --preflight-only` 会拒绝 Windows 互操作命令并检查 Linux 原生 Node.js 18+/npm/git/CMake/C++/make/Python venv/dpkg/signing key。
+  - [x] `T9.6-R2-WDEV` Windows 开发机实装门：CPU/CUDA Setup 分别安装到 `%LOCALAPPDATA%` 隔离同卷目录，安装期和独立 deep 均为 0 failed，`bjtu chat --help` 返回 0，冻结 EXE fixture 启动 5 秒无早退；五类哨兵数据完成 CPU/CUDA 卸载保留和重装关联，最后只清理本票数据，既有主节点状态未改。真实后端/TUI 契约回归 `34 passed`，打包/清单定向 `25 passed`。
+  - [x] `UP-N6.4W` Windows 跨卷数据保留：外置事务 journal、空间预检、4MiB 流式复制、逐文件大小/SHA-256、整批 staging/commit、提交后源隔离删除和四阶段崩溃恢复已落地；同卷继续走原子改名。冻结 helper 完成真实 `G:`→`C:` retain/reassociate 往返，CPU Inno Setup 完成安装→跨卷卸载保留→同路径重装回迁，安装期 deep `5016/5016`；五类哨兵内容、marker、临时物清零和非用户程序文件边界均通过。全量 Python `1836 passed / 33 skipped`。
+  - [ ] `T9.6-R2-EXT` 外部发布安装门：在不含既有 QLH 状态的干净 Windows 环境安装 CPU/CUDA Setup，复核环境变量、新 shell、真实模型后端会话和卸载；Linux 真机或完整 Linux 构建环境生成/安装 `.deb` 后走同一用例。当前 WSL 缺 Linux 原生 `node/cmake/c++/make`，`npm` 仅为不可用的 Windows 互操作路径，预检按预期 fail-closed。开发机隔离安装不替代该门。
   - 保持 `tui_admin.py --plain`、单命令和 7 屏管理契约回归。
   - 经过真实使用窗口后再决定 `bjtu` 默认进入聊天还是继续进入管理菜单；在此之前 `bjtu chat` 显式启动。
 
