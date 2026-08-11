@@ -316,12 +316,13 @@ class IslandEngine:
 
     def _request_payload(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int,
         temperature: float,
         top_p: float,
         stop: List[str] = None,
         stream: bool = False,
+        reasoning_effort: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": self._model_name,
@@ -335,11 +336,13 @@ class IslandEngine:
         # 仅透传调用方显式给出的 stop（OpenAI 语义上限 4 个）。
         if stop:
             payload["stop"] = list(stop)[:4]
+        if reasoning_effort in {"none", "minimal", "low", "medium", "high"}:
+            payload["reasoning_effort"] = reasoning_effort
         return payload
 
     def chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -370,6 +373,7 @@ class IslandEngine:
 
         t0 = time.perf_counter()
         cancel_event = kwargs.pop("_cancel_event", None)
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
 
         if cancel_event is not None and cancel_event.is_set():
             return {
@@ -397,6 +401,7 @@ class IslandEngine:
             try:
                 for event in self._iter_stream_events(
                     messages, max_tokens, temperature, top_p, stop,
+                    reasoning_effort=reasoning_effort,
                 ):
                     text = event.get("content", "")
                     if text:
@@ -439,6 +444,7 @@ class IslandEngine:
         masked = self.masked_base_url
         payload = self._request_payload(
             messages, max_tokens, temperature, top_p, stop, stream=False,
+            reasoning_effort=reasoning_effort,
         )
         try:
             response = self._client.post(
@@ -545,7 +551,7 @@ class IslandEngine:
 
     def chat_stream(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -561,8 +567,11 @@ class IslandEngine:
         if not self.is_loaded:
             raise RuntimeError("孤岛引擎未连接，请先调用 load_model()")
 
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+
         for event in self._iter_stream_events(
             messages, max_tokens, temperature, top_p, stop,
+            reasoning_effort=reasoning_effort,
         ):
             content = event.get("content", "")
             if content:
@@ -570,11 +579,12 @@ class IslandEngine:
 
     def _iter_stream_events(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         max_tokens: int,
         temperature: float,
         top_p: float,
         stop: List[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         内部 SSE 解析器：POST stream=true 并逐事件产出
@@ -583,6 +593,7 @@ class IslandEngine:
         masked = self.masked_base_url
         payload = self._request_payload(
             messages, max_tokens, temperature, top_p, stop, stream=True,
+            reasoning_effort=reasoning_effort,
         )
 
         try:

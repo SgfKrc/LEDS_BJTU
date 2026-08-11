@@ -228,6 +228,19 @@ def test_chat_returns_content_and_metrics(mock_island_server):
     engine.unload()
 
 
+def test_chat_optional_reasoning_effort_is_added_to_payload(mock_island_server):
+    engine = _make_engine(mock_island_server)
+
+    engine.chat(
+        [{"role": "user", "content": "hi"}],
+        reasoning_effort="none",
+    )
+
+    posts = [r for r in mock_island_server.requests if r["method"] == "POST"]
+    assert posts[-1]["payload"]["reasoning_effort"] == "none"
+    engine.unload()
+
+
 def test_chat_stream_assembles_chunks_until_done(mock_island_server):
     mock_island_server.behavior["stream_chunks"] = ["分", "布", "式", "推理"]
     engine = _make_engine(mock_island_server)

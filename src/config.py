@@ -214,6 +214,13 @@ EXTERNAL_API_KEY = os.environ.get("QLH_EXTERNAL_API_KEY", "")    # 可选 Bearer
 EXTERNAL_MODEL = _env_first("QLH_EXTERNAL_MODEL", default="")    # 为空时自动取 /v1/models 首个模型
 EXTERNAL_TIMEOUT = _env_int("QLH_EXTERNAL_TIMEOUT", 120, min_val=1, max_val=3600)  # 请求超时（秒）
 EXTERNAL_CONNECT_TIMEOUT = _env_int("QLH_EXTERNAL_CONNECT_TIMEOUT", 5, min_val=1, max_val=300)  # 连接超时（秒）
+# 可选 OpenAI reasoning_effort；留空时不发送，避免不支持该字段的端点报错。
+# Gemma 4 经 Ollama 使用 "none" 可避免 thinking 消耗全部短回复预算。
+EXTERNAL_REASONING_EFFORT = _env_first(
+    "QLH_EXTERNAL_REASONING_EFFORT", default="",
+).lower()
+if EXTERNAL_REASONING_EFFORT not in {"", "none", "minimal", "low", "medium", "high"}:
+    EXTERNAL_REASONING_EFFORT = ""
 # 数据作用域门控（安全边界，不是性能开关，见调研方案 §2.2）:
 #   "deny"      硬禁用——即使请求携带 allow_external 也拒绝出集群
 #   "opt_in"    默认——仅携带 allow_external=true 的请求可路由到外部端点
