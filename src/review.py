@@ -161,7 +161,7 @@ class ReviewManager:
             timeout_hours: 超时时间（小时），默认 48。
 
         Returns:
-            ReviewTicket 或 None（DB 不可用时）。
+            ReviewTicket 或 None（主节点 SQLite 不可用时）。
         """
         timeout = timeout_hours or self.DEFAULT_TIMEOUT_HOURS
         now = time.time()
@@ -223,7 +223,7 @@ class ReviewManager:
             comment: 投票附言。
 
         Returns:
-            更新后的 ReviewTicket，或 None（工单不存在/DB 不可用）。
+            更新后的 ReviewTicket，或 None（工单不存在/主节点 SQLite 不可用）。
 
         Raises:
             ValueError: vote_value 不在 [-1, 0, 1] 范围内。
