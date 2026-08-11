@@ -226,6 +226,23 @@ python packaging/signing.py sign --manifest latest.json --key .signing-keys/rele
 python packaging/signing.py verify --manifest latest.json --trusted-keys-dir packaging/pubkeys
 ```
 
+### 从 GitHub Release 生成 `latest.json`
+
+Release 的 CPU/CUDA 主安装包、Launcher ZIP/Setup 和 Android 包全部上传完成后，运行 `generate_latest_manifest.py`。脚本通过 GitHub Releases API 读取资产的 `size` 与 GitHub 提供的 `sha256` 摘要，不重新下载安装包；只接受 HTTPS 地址、已发布的非草稿 Release 和可识别的 QLH 资产。随后它会签名并用 `packaging/pubkeys/` 立即复验，失败时不会写出清单。
+
+```powershell
+$env:QLH_SIGNING_KEY = "packaging\.signing-keys\release-YYYYMMDD.key"
+python packaging\generate_latest_manifest.py `
+  --repo SgfKrc/LEDS_BJTU `
+  --tag 0.1.8.2 `
+  --output packaging\dist\latest.json
+python packaging\signing.py verify `
+  --manifest packaging\dist\latest.json `
+  --trusted-keys-dir packaging\pubkeys
+```
+
+把生成的 `packaging/dist/latest.json` 以**完全相同的文件名**上传到同一个 GitHub Release。此后 Launcher 默认源 `https://github.com/SgfKrc/LEDS_BJTU/releases/latest/download/latest.json` 会解析为该资产。私有仓库或 API 限流场景可将令牌放入 `GITHUB_TOKEN`；脚本不会打印令牌或私钥内容。使用 `--dry-run` 可在不落盘的情况下完成读取、签名和验签。
+
 依赖：`signing.py` 使用 `cryptography` 库（打包 Launcher 的 `.venv-packaging` 需要安装；运行时 Launcher 内置 pubkeys，无需在目标机额外安装）。
 
 ### 安装完整性基线（UP-N6.0）— `install_manifest.py`
