@@ -110,8 +110,12 @@ def _control_response(path: str, method: str):
         if path == "/user/settings":
             return {"settings": {}, "source": "none"}
         if path == "/db/health":
-            return {"status": "ok", "database": "postgresql",
-                    "message": "数据库连接正常", "retry_in_seconds": 0}
+            return {
+                "status": "retired",
+                "backend": "sqlite",
+                "effective_mode": "local_only",
+                "message": "远端 PostgreSQL 已退场；用户数据由主节点 SQLite 持有",
+            }
         return {"status": "ok"}
     # POST/PUT/DELETE：操作确认（空体场景禁止 204）
     if path.startswith("/cluster/review/mail-poll"):
