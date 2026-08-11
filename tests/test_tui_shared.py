@@ -6,6 +6,9 @@ T9 共享层（src/tui_shared.py）单元测试
 
 import sys
 import os
+from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -15,6 +18,7 @@ from tui_shared import (
     build_interactive_request,
     format_metrics,
     help_text,
+    load_local_chat_image,
     parse_session_line,
     resolve_route_arg,
 )
@@ -45,6 +49,37 @@ class TestBuildInteractiveRequest:
     def test_invalid_routing_falls_back_to_auto(self):
         body = build_interactive_request("hi", routing_preference="bogus")
         assert body["routing_preference"] == "auto"
+
+    def test_image_request_requires_external_and_preserves_data_url(self):
+        image = "data:image/png;base64,iVBORw0KGgo="
+        body = build_interactive_request("描述图片", image_data_urls=[image])
+        assert body["image_data_urls"] == [image]
+        assert body["allow_external"] is True
+        assert body["prefer_external"] is True
+        assert body["execution_mode"] == "auto"
+
+    def test_image_request_rejects_local_only_route(self):
+        with pytest.raises(ValueError, match="local_only"):
+            build_interactive_request(
+                "描述图片",
+                routing_preference="local_only",
+                image_data_urls=["data:image/png;base64,iVBORw0KGgo="],
+            )
+
+
+class TestLocalImageLoader:
+    def test_loads_png_as_valid_data_url(self, tmp_path):
+        image_path = Path(tmp_path) / "tiny.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        image = load_local_chat_image(str(image_path))
+        assert image["name"] == "tiny.png"
+        assert image["data_url"].startswith("data:image/png;base64,")
+
+    def test_rejects_non_image_file(self, tmp_path):
+        image_path = Path(tmp_path) / "not-image.txt"
+        image_path.write_text("not an image", encoding="utf-8")
+        with pytest.raises(ValueError, match="PNG、JPEG 或 WebP"):
+            load_local_chat_image(str(image_path))
 
 
 class TestFormatMetrics:
