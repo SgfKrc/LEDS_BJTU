@@ -1,5 +1,4 @@
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -15,14 +14,6 @@ from scheduler import NodeInfo, NodeRole, Scheduler  # noqa: E402
 from task_graph import StageSpec, TaskGraphCoordinator  # noqa: E402
 from task_worker_protocol import canonical_sha256  # noqa: E402
 from tcp_comm import TCPServer  # noqa: E402
-
-
-def _free_port():
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.bind(("127.0.0.1", 0))
-    port = probe.getsockname()[1]
-    probe.close()
-    return port
 
 
 def _manifest():
@@ -66,8 +57,8 @@ def test_sd_image_stage_round_trips_over_real_tcp_and_http(tmp_path, monkeypatch
         "DIFFUSION_WORKER_EXPERIMENTAL_ENABLED",
         True,
     )
-    tcp_port = _free_port()
-    http_port = _free_port()
+    tcp_port = 0
+    http_port = 0
     worker_state = tmp_path / "worker-state"
     coordinator_state = tmp_path / "coordinator-state"
     worker_state.mkdir()
@@ -100,6 +91,7 @@ def test_sd_image_stage_round_trips_over_real_tcp_and_http(tmp_path, monkeypatch
             on_message=scheduler._on_tcp_message,
             on_disconnect=scheduler._on_tcp_disconnect,
         )
+        tcp_port = server.sock.getsockname()[1]
         helper = Path(__file__).parent / "helpers" / "diffusion_worker_process.py"
         env = dict(os.environ)
         env.update({
@@ -120,6 +112,14 @@ def test_sd_image_stage_round_trips_over_real_tcp_and_http(tmp_path, monkeypatch
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        port_file = worker_state / "http-port"
+        deadline = time.time() + 10.0
+        while time.time() < deadline and not port_file.exists():
+            if process.poll() is not None:
+                pytest.fail("diffusion worker exited before publishing its HTTP port")
+            time.sleep(0.05)
+        assert port_file.exists(), "diffusion worker did not publish its HTTP port"
+        http_port = int(port_file.read_text(encoding="ascii"))
         _wait_for_http(
             f"http://127.0.0.1:{http_port}/internal/v1/diffusion/data-plane/status",
         )
@@ -166,6 +166,9 @@ def test_sd_image_stage_round_trips_over_real_tcp_and_http(tmp_path, monkeypatch
         )
         assert descriptor["content_type"] == "image/png"
         assert data.startswith(b"\x89PNG\r\n\x1a\n")
+        (worker_state / "output-transfer-consumed").write_text(
+            "consumed", encoding="ascii",
+        )
         assert process.wait(timeout=8) == 0
     finally:
         coordinator.close()

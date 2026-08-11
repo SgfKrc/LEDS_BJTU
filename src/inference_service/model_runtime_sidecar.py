@@ -120,10 +120,17 @@ def _verify_file(file_path: Path, expected_size: int, expected_digest: str) -> N
 
 def _verify_artifact(request: dict[str, Any]) -> int:
     started = time.perf_counter()
-    model_path = Path(request["model_path"])
+    model_path = Path(request["model_path"]).resolve()
     for item in request["files"]:
         rel_path = Path(str(item["path"]))
-        target = model_path if request["format"] == "gguf" else model_path / rel_path
+        if request["format"] == "gguf":
+            target = model_path
+        else:
+            target = (model_path / rel_path).resolve()
+            try:
+                target.relative_to(model_path)
+            except ValueError as exc:
+                raise ValueError("artifact path escapes model directory") from exc
         _verify_file(target, int(item["size"]), str(item["sha256"]))
     return int((time.perf_counter() - started) * 1000)
 

@@ -31,7 +31,12 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(__file__))
 from model_host import model_host
+from network_test_support import (
+    release_reserved_unreachable_ports,
+    reserve_unreachable_port,
+)
 
 import speculative as spec
 from external_provider import ExternalScopeDeniedError
@@ -780,11 +785,7 @@ def _base_url(server) -> str:
 
 
 def _closed_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    return reserve_unreachable_port()
 
 
 def _patch_spec_config(
@@ -836,6 +837,7 @@ def _reset_spec_state():
     spec.reset_last_session_metrics()
     yield
     spec.reset_last_session_metrics()
+    release_reserved_unreachable_ports()
 
 
 def test_verify_client_parses_logprobs_into_probability_rows(
@@ -1152,7 +1154,6 @@ def api_env(monkeypatch, tmp_path):
         mock_sched.has_pipeline_worker_reservation.return_value = False
         mock_sched._max_nodes = 3
         monkeypatch.setattr(model_host, "model_loaded", False)
-        monkeypatch.setattr(model_host, "_db_available", False)
         monkeypatch.setattr(api_server, "_local_store", MagicMock())
         monkeypatch.setattr(
             config, "GGUF_MODEL_PATH", str(tmp_path / "no-model.gguf"),

@@ -39,12 +39,12 @@ def test_available_models_does_not_touch_model_manager_when_unloaded(monkeypatch
         def __getattr__(self, name):
             raise AssertionError(f"model_manager should stay lazy, accessed {name}")
 
-    import model_downloader
-
-    monkeypatch.setattr(model_downloader, "gguf_model_exists", lambda: False)
-    monkeypatch.setattr(model_downloader, "safetensors_model_exists", lambda: False)
     monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "model_manager", BombModelManager())
+    # The endpoint serializes model_config availability itself.  Patch the
+    # direct config source so this lazy-manager test cannot pass by relying on
+    # whatever model files happen to exist on the developer machine.
+    monkeypatch.setattr(api_server, "_get_all_model_configs", lambda: [])
 
     result = asyncio.run(api_server.list_available_models())
 
@@ -73,7 +73,7 @@ def test_frontend_bootstrap_endpoints_keep_model_manager_lazy(monkeypatch):
             return "test-master"
 
     monkeypatch.setattr(api_server, "scheduler", FakeScheduler())
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [])
 
     client = TestClient(api_server.app)
 

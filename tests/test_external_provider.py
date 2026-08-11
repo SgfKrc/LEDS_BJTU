@@ -28,7 +28,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(__file__))
 from model_host import model_host
+from network_test_support import (
+    release_reserved_unreachable_ports,
+    reserve_unreachable_port,
+)
 
 import external_provider as ep
 from external_provider import (
@@ -203,11 +208,7 @@ def _base_url(server) -> str:
 
 
 def _closed_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    return reserve_unreachable_port()
 
 
 @pytest.fixture(autouse=True)
@@ -221,6 +222,7 @@ def _reset_external_singletons():
     ep.reset_reachable_cache()
     if client is not None:
         client.close()
+    release_reserved_unreachable_ports()
 
 
 def _patch_external_config(
@@ -758,7 +760,6 @@ def api_env(monkeypatch, tmp_path):
         mock_sched.has_pipeline_worker_reservation.return_value = False
         mock_sched._max_nodes = 3
         monkeypatch.setattr(model_host, "model_loaded", False)
-        monkeypatch.setattr(model_host, "_db_available", False)
         monkeypatch.setattr(api_server, "_local_store", MagicMock())
         # 本地无可自动加载的模型（指向空目录）
         monkeypatch.setattr(

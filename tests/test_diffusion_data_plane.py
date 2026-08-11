@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
+import pytest
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -16,6 +17,13 @@ from diffusion.data_plane import (  # noqa: E402
     DiffusionDataPlaneRuntime,
     router,
 )
+from diffusion.distributed import (  # noqa: E402
+    BlobAuthorizationError,
+    BlobConflict,
+    BlobNotFound,
+    BlobValidationError,
+)
+import diffusion.data_plane as data_plane_module  # noqa: E402
 
 
 def _png() -> bytes:
@@ -201,3 +209,108 @@ def test_data_plane_rejects_unbounded_body_and_reports_disabled_state(tmp_path):
         "reason": "cluster_secret_missing",
         "prefix": DATA_PLANE_PREFIX,
     }
+
+
+def test_upload_endpoints_require_matching_grant_attempt_and_upload_scope(tmp_path):
+    client, runtime = _client(tmp_path)
+    data = _png()
+    attempt_id = "att_data_plane_12345678"
+    created = _begin(runtime, data, attempt_id=attempt_id)
+    upload_id = created["upload"]["upload_id"]
+    url = _upload_url(attempt_id, upload_id)
+    headers = {"Authorization": f"Bearer {created['grant']}"}
+
+    missing = client.get(url)
+    assert missing.status_code == 401
+    assert missing.json()["detail"]["code"] == "missing_transfer_grant"
+    assert missing.headers["WWW-Authenticate"] == "Bearer"
+
+    wrong_attempt = client.get(
+        _upload_url("att_other_scope_12345678", upload_id), headers=headers,
+    )
+    assert wrong_attempt.status_code == 401
+    assert wrong_attempt.json()["detail"]["code"] == "transfer_scope_mismatch"
+
+    wrong_url = _upload_url(attempt_id, "up_wrong_scope_12345678")
+    scope_responses = [
+        client.get(wrong_url, headers=headers),
+        client.patch(
+            wrong_url,
+            headers={
+                **headers,
+                "Upload-Offset": "0",
+                "Content-Type": "application/octet-stream",
+            },
+            content=data,
+        ),
+        client.post(f"{wrong_url}/commit", headers=headers),
+    ]
+    assert [response.status_code for response in scope_responses] == [403, 403, 403]
+    assert all(
+        response.json()["detail"]["code"] == "transfer_scope_mismatch"
+        for response in scope_responses
+    )
+    runtime.close()
+
+
+def test_upload_chunk_rejects_invalid_request_shapes(tmp_path):
+    client, runtime = _client(tmp_path)
+    data = _png()
+    created = _begin(runtime, data)
+    url = _upload_url("att_data_plane_12345678", created["upload"]["upload_id"])
+    headers = {"Authorization": f"Bearer {created['grant']}"}
+
+    invalid_offset = client.patch(
+        url,
+        headers={
+            **headers,
+            "Upload-Offset": "not-an-integer",
+            "Content-Type": "application/octet-stream",
+        },
+        content=data,
+    )
+    unsupported_type = client.patch(
+        url,
+        headers={**headers, "Upload-Offset": "0", "Content-Type": "text/plain"},
+        content=data,
+    )
+    empty_chunk = client.patch(
+        url,
+        headers={
+            **headers,
+            "Upload-Offset": "0",
+            "Content-Type": "application/octet-stream",
+        },
+        content=b"",
+    )
+    commit_body = client.post(f"{url}/commit", headers=headers, content=b"unexpected")
+
+    assert (invalid_offset.status_code, invalid_offset.json()["detail"]["code"]) == (
+        400, "invalid_upload_offset",
+    )
+    assert (unsupported_type.status_code, unsupported_type.json()["detail"]["code"]) == (
+        415, "unsupported_transfer_content_type",
+    )
+    assert (empty_chunk.status_code, empty_chunk.json()["detail"]["code"]) == (
+        400, "empty_transfer_chunk",
+    )
+    assert (commit_body.status_code, commit_body.json()["detail"]["code"]) == (
+        400, "commit_body_not_allowed",
+    )
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (BlobAuthorizationError("denied", code="denied"), 403),
+        (BlobNotFound("missing", code="missing"), 404),
+        (BlobConflict("conflict", code="conflict"), 409),
+        (BlobValidationError("invalid", code="invalid"), 422),
+    ],
+)
+def test_data_plane_http_error_mapping_is_stable(error, status):
+    response = data_plane_module._http_error(error)
+
+    assert response.status_code == status
+    assert response.detail == {"code": error.code, "message": str(error)}
