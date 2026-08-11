@@ -267,35 +267,62 @@ def fetch_manifest(
     return manifest
 
 
+RELEASE_TAG_PLACEHOLDER = "{release_tag}"
+
+
 def fetch_latest(
     urls: Iterable[str],
     *,
     timeout: float = 8.0,
     fetcher: Callable[..., UpdateManifest] | None = None,
 ) -> tuple[UpdateManifest, tuple[str, ...]]:
-    """Fetch all usable sources and choose the greatest version deterministically."""
+    """Fetch all usable sources and choose the greatest version deterministically.
+
+    两阶段：先并行抓取无占位符的源；含 ``{release_tag}`` 占位符的源
+    （如 Gitee 兜底——Gitee 无 ``latest`` 别名）在拿到已成功源的最高 tag
+    后填充版本号再抓取，保证镜像源 URL 与发版版本自动同步。
+    """
     manifests: list[UpdateManifest] = []
     failures_by_url: dict[str, str] = {}
     fetch = fetcher or fetch_manifest
     seen: set[str] = set()
-    candidates: list[str] = []
+    direct: list[str] = []
+    templates: list[str] = []
     for url in urls:
         if not url or url in seen:
             continue
         seen.add(url)
-        candidates.append(url)
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(candidates)))) as executor:
-        pending = {
-            executor.submit(fetch, url, timeout=timeout): url for url in candidates
-        }
-        for future in as_completed(pending):
-            url = pending[future]
-            try:
-                manifests.append(future.result())
-            except UpdateError as exc:
-                failures_by_url[url] = f"{url}: {exc}"
-            except Exception as exc:
-                failures_by_url[url] = f"{url}: unexpected update source error: {exc}"
+        (templates if RELEASE_TAG_PLACEHOLDER in url else direct).append(url)
+
+    def _fetch_all(candidates: list[str]) -> None:
+        if not candidates:
+            return
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(candidates)))) as executor:
+            pending = {
+                executor.submit(fetch, url, timeout=timeout): url for url in candidates
+            }
+            for future in as_completed(pending):
+                url = pending[future]
+                try:
+                    manifests.append(future.result())
+                except UpdateError as exc:
+                    failures_by_url[url] = f"{url}: {exc}"
+                except Exception as exc:
+                    failures_by_url[url] = f"{url}: unexpected update source error: {exc}"
+
+    _fetch_all(direct)
+    materialized: list[str] = []
+    for url in templates:
+        if manifests:
+            best_tag = max(manifests, key=lambda item: version_key(item.tag)).tag
+            materialized.append(url.replace(RELEASE_TAG_PLACEHOLDER, best_tag))
+        else:
+            failures_by_url[url] = (
+                f"{url}: {RELEASE_TAG_PLACEHOLDER} unresolved (no source version available)"
+            )
+    _fetch_all(materialized)
+
+    candidates = direct + templates
     failures = [failures_by_url[url] for url in candidates if url in failures_by_url]
     if not manifests:
         detail = "; ".join(failures) or "no update source configured"
