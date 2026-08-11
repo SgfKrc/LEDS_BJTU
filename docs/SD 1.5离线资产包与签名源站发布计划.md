@@ -84,3 +84,4 @@ QLH-SD15-Assets-<asset_id>-v0.1.0.zip
 | 日期 | 事件 |
 |---|---|
 | 2026-08-11 | 建立本文档；阶段 1 完成（打包脚本、许可证入库×3 + OpenRAIL 待补、serve.py `sd15-asset` kind、单元测试 11/11、serve 回归 16/16） |
+| 2026-08-11 | OpenRAIL 原文入库（licenses.ai BigScience Open RAIL-M PDF，pdfminer 提取+三处两栏校对）；打包校验重构为文件层口径（composed 资产的 model_index 结构豁免）；90s 资产预检通过，单测 12/12 |

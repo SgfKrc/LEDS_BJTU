@@ -95,29 +95,54 @@ def package_name(asset_id: str) -> str:
 
 
 def verify_local_assets(spec, *, check_hashes: bool) -> dict:
-    """校验本地资产目录；返回 {相对路径: sha256}，不一致即抛错。"""
+    """文件层校验本地资产目录（与 assets.verify_asset_directory 同口径）。
+
+    - 逐文件存在、size、SHA-256 与 spec 一致；
+    - composed 资产的 model_index.json 允许本地改写（组合 safety checker），
+      改为结构校验（要求绑定固定 safety checker 与 CLIPImageProcessor）；
+    - 结构识别（DiffusionArtifactInspector）不属于打包职责，导入路径由
+      assets.verify_asset_directory 完成。
+    返回 {相对路径: sha256}，任何不一致 fail-closed。
+    """
     root = spec.target_path()
     if not root.is_dir():
         raise SystemExit(f"[error] 资产目录不存在: {root}")
+
     file_hashes: dict[str, str] = {}
+    errors: list[str] = []
     for item in spec.files:
         path = root / item.path
         if not path.is_file():
-            raise SystemExit(f"[error] 缺失文件: {path}（spec: {item.path}）")
+            errors.append(f"缺失文件: {item.path}")
+            continue
         size = path.stat().st_size
-        if size != item.size_bytes:
-            raise SystemExit(
-                f"[error] 大小不一致: {item.path} 期望 {item.size_bytes} 实际 {size}"
-            )
+        derived_index = spec.composed and item.path == "model_index.json"
+        if size != item.size_bytes and not derived_index:
+            errors.append(f"大小不一致: {item.path} 期望 {item.size_bytes} 实际 {size}")
         if check_hashes:
             digest = _sha256(path)
-            if item.sha256 and digest != item.sha256:
-                raise SystemExit(
-                    f"[error] SHA-256 不一致: {item.path} 期望 {item.sha256} 实际 {digest}"
-                )
+            if item.sha256 and digest != item.sha256 and not derived_index:
+                errors.append(f"SHA-256 不一致: {item.path}")
             file_hashes[item.path] = digest
         elif item.sha256:
             file_hashes[item.path] = item.sha256
+
+    if spec.composed:
+        index_path = root / "model_index.json"
+        try:
+            import json as _json
+            model_index = _json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            model_index = {}
+        if model_index.get("requires_safety_checker") is not True:
+            errors.append("model_index.json 未要求 safety checker（组合资产结构不符）")
+        if model_index.get("safety_checker") != ["stable_diffusion", "StableDiffusionSafetyChecker"]:
+            errors.append("model_index.json 未绑定固定 safety checker（组合资产结构不符）")
+        if model_index.get("feature_extractor") != ["transformers", "CLIPImageProcessor"]:
+            errors.append("model_index.json 未绑定 CLIPImageProcessor（组合资产结构不符）")
+
+    if errors:
+        raise SystemExit("[error] 资产校验未通过: " + "; ".join(errors))
     return file_hashes
 
 
