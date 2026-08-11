@@ -2,6 +2,8 @@
 # QLH BJTU unified launcher for installed Linux packages.
 set -eu
 
+APP_DIR="/opt/qlh-edge-inference"
+
 case "${1:-tui}" in
     launcher|--launcher)
         [ "$#" -gt 0 ] && shift
@@ -16,8 +18,8 @@ case "${1:-tui}" in
         exec /usr/local/bin/qlh-launcher app-tui "$@"
         ;;
     chat)
-        echo "[错误] 当前安装包未携带 Textual 聊天页，请使用项目环境中的 bjtu chat。" >&2
-        exit 2
+        shift
+        exec "$APP_DIR/venv/bin/python" "$APP_DIR/src/tui_chat.py" "$@"
         ;;
     update)
         shift
@@ -28,7 +30,7 @@ case "${1:-tui}" in
         shift
         exec /usr/local/bin/qlh-launcher "$command" "$@"
         ;;
-    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose|repair)
+    launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose|repair|data-status|retain-data|reassociate-data|reinstall)
         command="$1"
         shift
         exec /usr/local/bin/qlh-launcher "$command" "$@"
@@ -42,7 +44,7 @@ case "${1:-tui}" in
             '  bjtu launcher   启动选择页（普通界面 / TUI）' \
             '  bjtu ui         直接启动普通界面' \
             '  bjtu tui        启动后端并进入 TUI 管理界面' \
-            '  bjtu chat       需要项目环境中的可选聊天依赖' \
+            '  bjtu chat       进入安装包内置的终端对话页' \
             '  bjtu update     检查更新源中的匹配安装包' \
             '  bjtu version    显示当前应用版本' \
             '  bjtu version-status|version-stage|version-activate|version-rollback|version-recover' \
@@ -52,7 +54,10 @@ case "${1:-tui}" in
             '  bjtu verify [--level quick|full|deep] [--json]' \
             '                  校验签名清单中的程序文件（不扫描用户数据）' \
             '  bjtu diagnose [--json]  输出只读故障诊断与人工处理建议' \
-            '  bjtu repair [--json]    修复当前版本中损坏的签名程序文件'
+            '  bjtu repair [--json]    修复当前版本中损坏的签名程序文件' \
+            '  bjtu retain-data --yes  保留用户数据并准备卸载' \
+            '  bjtu reassociate-data --yes  将保留数据重新关联到当前安装' \
+            '  bjtu reinstall --yes    保留数据并下载已验签安装包'
         ;;
     *)
         exec /usr/local/bin/qlh-launcher app-tui "$@"
