@@ -425,8 +425,6 @@ class TestLocalDeviceProfileSync:
 
     def test_master_profile_updates_node_invalidates_cache_and_repushes(
             self, monkeypatch):
-        import scheduler as scheduler_mod
-
         sched = Scheduler()
         sched._role_override = "master"
         sched.nodes = {
@@ -435,19 +433,7 @@ class TestLocalDeviceProfileSync:
                 device_info={},
             ),
         }
-        cleared = []
-        persisted = []
         pushed = []
-
-        class FakeDb:
-            def upsert_node(self, **kwargs):
-                persisted.append(kwargs)
-
-            def set_layer_assignments(self, value):
-                cleared.append(value)
-
-        monkeypatch.setattr(scheduler_mod, "_get_db", lambda *args, **kwargs: FakeDb())
-        monkeypatch.setattr(scheduler_mod, "_db_available", True)
         monkeypatch.setattr(
             sched, "push_layer_config_to_clients", lambda: pushed.append(True),
         )
@@ -455,8 +441,6 @@ class TestLocalDeviceProfileSync:
         sched.update_local_device_profile(PROFILE_LAPTOP)
 
         assert sched.nodes["master"].device_info["gpu"]["name"] == "NVIDIA RTX 4060 Laptop"
-        assert cleared == [{}]
-        assert persisted[0]["device_info"] == PROFILE_LAPTOP
         assert pushed == [True]
 
     def test_client_profile_is_reported_after_background_detection(
@@ -547,8 +531,6 @@ class TestManualLayerAssignmentNormalization:
     """前端只提交区间，后端必须补齐可执行分层字段。"""
 
     def test_manual_ranges_gain_counts_roles_scores_and_io_heads(self, monkeypatch):
-        import scheduler as scheduler_mod
-
         sched = Scheduler()
         sched._role_override = "master"
         sched.nodes = {
@@ -561,17 +543,6 @@ class TestManualLayerAssignmentNormalization:
                 device_info=PROFILE_IGPU_ONLY,
             ),
         }
-        stored = []
-
-        class FakeDb:
-            def set_layer_strategy(self, _strategy):
-                pass
-
-            def set_layer_override(self, value):
-                stored.append(value)
-
-        monkeypatch.setattr(scheduler_mod, "_get_db", lambda *args, **kwargs: FakeDb())
-        monkeypatch.setattr(scheduler_mod, "_db_available", True)
         monkeypatch.setattr(sched, "push_layer_config_to_clients", lambda: None)
 
         result = sched.override_layer_assignments([
@@ -587,7 +558,7 @@ class TestManualLayerAssignmentNormalization:
         assert normalized[0]["has_embedding"] is True
         assert normalized[0]["has_lm_head"] is True
         assert normalized[1]["has_lm_head"] is False
-        assert stored == [normalized]
+        assert sched._runtime_layer_override == normalized
 
     def test_manual_ranges_reject_master_outside_first_segment(self, monkeypatch):
         sched = Scheduler()
@@ -643,33 +614,8 @@ class TestGetLayerAssignments:
         assert assignments[0]["has_embedding"] is True
         assert assignments[0]["has_lm_head"] is True
 
-    def test_legacy_dynamic_cache_without_runtime_signature_is_recomputed(
+    def test_dynamic_assignment_is_computed_from_runtime_nodes(
             self, sched, monkeypatch):
-        import scheduler as scheduler_mod
-
-        stale = {
-            "total": 24,
-            "strategy": "dynamic",
-            "assignments": [{
-                "node_id": "old-worker", "start_layer": 0, "end_layer": 24,
-                "layers_count": 24, "has_embedding": True, "has_lm_head": True,
-            }],
-        }
-
-        class FakeDb:
-            def get_layer_strategy(self):
-                return "dynamic"
-
-            def get_layer_assignments(self):
-                return stale
-
-            def set_layer_assignments(self, value):
-                self.saved = value
-
-        fake_db = FakeDb()
-        monkeypatch.setattr(scheduler_mod, "_get_db", lambda *a, **kw: fake_db)
-        monkeypatch.setattr(scheduler_mod, "_db_available", True)
-
         result = sched.get_layer_assignments()
 
         assert result["assignments"][0]["node_id"] == "master"
@@ -812,21 +758,6 @@ class TestAndroidNodeManagement:
 
     def test_android_presence_registers_online_and_expires(self, sched, monkeypatch):
         """Android HTTP thin client presence 应在线登记，并在超时后离线。"""
-        class DummyDb:
-            def __init__(self):
-                self.upserts = []
-                self.state_updates = []
-            def upsert_node(self, **kwargs):
-                self.upserts.append(kwargs)
-                return kwargs
-            def update_node_state(self, *args, **kwargs):
-                self.state_updates.append((args, kwargs))
-                return {}
-
-        dummy = DummyDb()
-        import scheduler as scheduler_mod
-        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: dummy)
-        monkeypatch.setattr(scheduler_mod, "_db_available", True)
         pushed = []
         sched._push_node_update_to_all_clients = lambda *args: pushed.append(args)
 
@@ -854,7 +785,7 @@ class TestAndroidNodeManagement:
 
         sched._refresh_http_client_states(now=node.last_heartbeat + 121)
         assert sched.nodes["android-live"].state == NodeState.OFFLINE
-        assert dummy.state_updates
+        assert pushed[-1][1] == "update"
 
     def test_android_offline_does_not_block_nodes_ready(self, sched):
         """Android HTTP 客户端离线不影响 PC worker readiness。"""
@@ -869,35 +800,13 @@ class TestAndroidNodeManagement:
 
     def test_delete_offline_android_node_removes_and_pushes_remove(self, sched, monkeypatch):
         """离线 Android 节点删除后应从内存移除并广播 remove。"""
-        class DummyDb:
-            def __init__(self):
-                self.deleted = []
-                self.created = []
-                self.layer_reset = False
-            def delete_node(self, node_id):
-                self.deleted.append(node_id)
-                return True
-            def set_layer_assignments(self, assignments):
-                self.layer_reset = True
-            def upsert_node(self, **kwargs):
-                self.created.append(kwargs.get("node_id"))
-                pass
-
-        dummy = DummyDb()
-        import scheduler as scheduler_mod
-        monkeypatch.setattr(scheduler_mod, "_get_db", lambda: dummy)
-        monkeypatch.setattr(scheduler_mod, "_db_available", True)
-
         sched.manual_register_node("android-test", hostname="Phone", node_type="android")
-        assert "android-test" in dummy.created
         pushed = []
         sched._push_node_update_to_all_clients = lambda *args: pushed.append(args)
 
         result = sched.delete_node("android-test")
         assert result["status"] == "deleted"
         assert "android-test" not in sched.nodes
-        assert dummy.deleted == ["android-test"]
-        assert dummy.layer_reset is True
         assert pushed and pushed[0][0] == "android-test" and pushed[0][1] == "remove"
 
 
@@ -1317,6 +1226,14 @@ class TestPipelineWaitResult:
         import time
 
         result_holder = []
+        waiter_ready = threading.Event()
+        original_wait = sched._wait_for_layer_result
+
+        def observed_wait(*args, **kwargs):
+            waiter_ready.set()
+            return original_wait(*args, **kwargs)
+
+        sched._wait_for_layer_result = observed_wait
 
         def waiter():
             result_holder.append(
@@ -1327,8 +1244,7 @@ class TestPipelineWaitResult:
         t = threading.Thread(target=waiter)
         t.start()
 
-        # 等待一小段时间确保 waiter 已开始等待
-        time.sleep(0.1)
+        assert waiter_ready.wait(timeout=1.0)
 
         # 注入结果（模拟 _handle_layer_result）
         key = "task_2:client1"
@@ -2360,16 +2276,21 @@ class TestPipelineQueueBasics:
 
     def test_wait_for_result_timeout(self, queue):
         """超时应返回 timeout 状态"""
+        started = threading.Event()
+        release = threading.Event()
+
         def slow_process(**kwargs):
-            import time
-            time.sleep(2.0)
+            started.set()
+            release.wait(timeout=5.0)
             return {"response": "late"}
 
         queue.start(process_fn=slow_process)
         tid = queue.enqueue(prompt="test")
+        assert started.wait(timeout=1.0)
         result = queue.wait_for_result(tid, timeout=0.3)
 
         assert result["status"] == "timeout"
+        release.set()
         queue.stop()
 
     def test_wait_for_unknown_task(self, queue):
@@ -2401,12 +2322,15 @@ class TestPipelineQueueBasics:
         order = []
         lock = threading.Lock()
         started = threading.Event()
+        completed = threading.Event()
 
         def ordered_process(**kwargs):
             with lock:
                 order.append(kwargs.get("seq", -1))
             if len(order) == 1:
                 started.set()  # 第一个任务开始后通知
+            if len(order) == 3:
+                completed.set()
             return {"seq": kwargs.get("seq", -1)}
 
         queue.start(process_fn=ordered_process)
@@ -2416,13 +2340,7 @@ class TestPipelineQueueBasics:
         queue.enqueue(seq=1, prompt="second")
         queue.enqueue(seq=2, prompt="third")
 
-        # 等待所有完成
-        import time
-        deadline = time.time() + 5.0
-        while queue.queue_size > 0 and time.time() < deadline:
-            time.sleep(0.05)
-        # 等待最后一个任务完成
-        time.sleep(0.3)
+        assert completed.wait(timeout=5.0)
 
         assert order == [0, 1, 2], f"应为 FIFO 顺序，实际: {order}"
         queue.stop()
@@ -2443,25 +2361,25 @@ class TestPipelineQueueBasics:
         assert status["queue_size"] == 0
         assert status["current_task"] is None
 
+        started = threading.Event()
+        release = threading.Event()
+
         def slow_process(**kwargs):
-            import time
-            time.sleep(0.3)
+            started.set()
+            release.wait(timeout=2.0)
             return {"response": "ok"}
 
         queue.start(process_fn=slow_process)
         queue.enqueue(prompt="test")
 
-        # 等待 worker 取走任务
-        import time
-        deadline = time.time() + 2.0
-        while queue.queue_size > 0 and time.time() < deadline:
-            time.sleep(0.05)
+        assert started.wait(timeout=1.0)
 
         status2 = queue.get_status()
         assert status2["running"]
         assert status2["queue_size"] == 0  # 已被 worker 取出
         assert status2["current_task"] is not None
 
+        release.set()
         queue.stop()
 
     def test_result_cleanup_after_ttl(self, queue):
@@ -2584,14 +2502,22 @@ class TestPipelineQueueIntegration:
         注入结果来模拟队列完成。
         """
         import threading
-        import time
+        queued = threading.Event()
+        original_enqueue = sched.pipeline_queue.enqueue
+
+        def observed_enqueue(*args, **kwargs):
+            task_id = original_enqueue(*args, **kwargs)
+            queued.set()
+            return task_id
+
+        sched.pipeline_queue.enqueue = observed_enqueue
 
         # 模拟 busy 状态
         sched.pipeline_queue._current_task_id = "fake_running"
 
         # 准备结果注入
         def inject_result():
-            time.sleep(0.3)
+            assert queued.wait(timeout=2.0)
             tid = None
             with sched.pipeline_queue._lock:
                 if sched.pipeline_queue._queue:
@@ -2728,9 +2654,15 @@ class TestChainTopology:
     def test_wait_for_layer_result_multi_nodes(self, sched):
         """_wait_for_layer_result 应在多个节点中有任一返回时立即唤醒"""
         import threading
-        import time
-
         result_holder = []
+        waiter_ready = threading.Event()
+        original_wait = sched._wait_for_layer_result
+
+        def observed_wait(*args, **kwargs):
+            waiter_ready.set()
+            return original_wait(*args, **kwargs)
+
+        sched._wait_for_layer_result = observed_wait
 
         def waiter():
             result_holder.append(
@@ -2742,7 +2674,7 @@ class TestChainTopology:
 
         t = threading.Thread(target=waiter)
         t.start()
-        time.sleep(0.1)
+        assert waiter_ready.wait(timeout=1.0)
 
         # 模拟 client2 返回结果（非最后一个节点）
         key = "task_chain:client2"
@@ -2782,9 +2714,15 @@ class TestChainTopology:
     def test_node_disconnect_wakes_pending_pipeline_waiter(self, sched):
         """节点断连应立即唤醒等待该节点结果的流水线线程。"""
         import threading
-        import time
-
         result_holder = []
+        waiter_ready = threading.Event()
+        original_wait = sched._wait_for_layer_result
+
+        def observed_wait(*args, **kwargs):
+            waiter_ready.set()
+            return original_wait(*args, **kwargs)
+
+        sched._wait_for_layer_result = observed_wait
 
         def waiter():
             result_holder.append(
@@ -2793,7 +2731,7 @@ class TestChainTopology:
 
         t = threading.Thread(target=waiter)
         t.start()
-        time.sleep(0.1)
+        assert waiter_ready.wait(timeout=1.0)
 
         t0 = time.time()
         sched._fail_pending_pipeline_results_for_node("client2", "client2 down")
@@ -4551,36 +4489,9 @@ class TestPipelineOrchestrationIntegration:
         sched_master._refresh_http_client_states(now=time.time() + 121)
         assert sched_master.nodes["android-2"].state == NodeState.OFFLINE
 
-    def test_android_node_not_forced_offline_in_init(self, sched_master, monkeypatch):
-        """Android HTTP 客户端在 init_nodes 中不应被强制 offline"""
+    def test_init_nodes_rebuilds_runtime_topology(self, sched_master, monkeypatch):
+        """启动只创建本地主节点；HTTP 客户端由新 presence 重建。"""
         import scheduler as sched_mod
-
-        now = time.time()
-        db_row = {
-            "node_id": "android-db", "role": "client", "node_type": "android",
-            "state": "online", "address": "1.2.3.4", "hostname": "Phone",
-            "device_info": {"connection_type": "http_thin"},
-            "network_type": "wifi", "connected_at": now,
-            "last_heartbeat": now, "task_count": 0, "error_count": 0,
-            "model_sha256": "", "avg_rtt_ms": 0.0, "last_rtt_ms": 0.0,
-        }
-
-        class DummyDb:
-            def get_all_nodes(self):
-                return [db_row]
-            def delete_node(self, nid):
-                pass
-            def upsert_node(self, **kw):
-                pass
-            def update_node_state(self, **kw):
-                pass
-            def get_config(self, k, d):
-                return d
-            def set_config(self, k, v):
-                pass
-
-        monkeypatch.setattr(sched_mod, "_db_available", True)
-        monkeypatch.setattr(sched_mod, "_get_db", lambda: DummyDb())
         monkeypatch.setattr(sched_mod, "RUN_MODE", "distributed")
 
         # 在新 scheduler 上运行 init_nodes（避免 sched_master fixture 已初始化）
@@ -4590,12 +4501,8 @@ class TestPipelineOrchestrationIntegration:
         s2._tcp_server = sched_master._tcp_server
         s2.init_nodes()
 
-        assert "android-db" in s2.nodes, f"Android 节点应被恢复，实际节点列表: {list(s2.nodes.keys())}"
-        android = s2.nodes["android-db"]
-        assert android.node_type == "android"
-        # ★ 关键断言：Android HTTP 节点不应被强制 offline
-        assert android.state == NodeState.ONLINE, \
-            f"Android 节点应是 ONLINE，实际: {android.state}"
+        assert list(s2.nodes) == ["master"]
+        assert s2.nodes["master"].state == NodeState.ONLINE
 
     # ----------------------------------------------------------
     # 场景 5：ensure_full_model 在 fallback 中触发
@@ -4993,10 +4900,7 @@ class TestProvisionalMasterRole:
 
     def test_local_only_master_is_not_provisional(self, monkeypatch, tmp_path):
         """本地 SQLite 主节点不因远端数据库退场而降级。"""
-        import scheduler as scheduler_mod
-
         self._set_master_role(monkeypatch, tmp_path)
-        monkeypatch.setattr(scheduler_mod, "_db_disabled", True)  # 数据库未配置
         sched = Scheduler()
         sched._master_identity_verified = True
         sched._master_identity_reason = "db_unavailable"
@@ -5008,14 +4912,8 @@ class TestProvisionalMasterRole:
         assert role["is_provisional"] is False
         assert role["can_join_existing_master"] is False
 
-    def test_configured_db_unavailable_master_is_not_provisional(self, monkeypatch, tmp_path):
-        """DB 已配置但临时不可用的主节点：绝不降级为 provisional。
-
-        回归：IPv6 网络连不上 IPv4-only 数据库时，主节点被误判为
-        can_join_existing_master → is_master=false → 管理功能隐藏、
-        /api/bootstrap/info 返回 is_master=false（Tailnet 发现失效）、
-        PC 从节点连接失败。
-        """
+    def test_locally_verified_master_is_not_provisional(self, monkeypatch, tmp_path):
+        """本地身份已验证时，外部服务状态不得隐藏主节点能力。"""
         self._set_master_role(monkeypatch, tmp_path)
         sched = Scheduler()
         sched._master_identity_verified = True
@@ -5062,7 +4960,7 @@ class TestLocalMasterIdentity:
 
         sqlite_path = tmp_path / "qlh-control.sqlite3"
         monkeypatch.setenv("QLH_SQLITE_PATH", str(sqlite_path))
-        local_store._initialized_paths.clear()
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
 
         sched = Scheduler()
         sched._role_override = "master"
@@ -5096,6 +4994,140 @@ class TestLocalMasterIdentity:
         sched._lan_ip = "100.88.9.10"
 
         assert sched.get_invite_info()["master_host_source"] == "tailnet"
+
+
+class TestSchedulerHighAvailabilitySQLite:
+    """HA control state stays local, bounded, and restart-safe."""
+
+    @pytest.fixture
+    def scheduler(self, monkeypatch, tmp_path):
+        import local_store
+
+        monkeypatch.setenv("QLH_SQLITE_PATH", str(tmp_path / "control.sqlite3"))
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        instance = Scheduler()
+        instance._role_override = "master"
+        return instance
+
+    def test_ha_state_persists_across_scheduler_instances(self, scheduler):
+        scheduler._update_ha_state(
+            spare_master={"node_id": "worker-spare", "hostname": "spare"},
+            spare_master_active=True,
+            pending_new_master_id="worker-next",
+        )
+        scheduler._append_ha_log(
+            "transfer_logs",
+            "promotion",
+            {"transfer_id": "transfer-test"},
+        )
+
+        restored = Scheduler()
+        spare = restored.get_spare_master()
+
+        assert spare == {
+            "node_id": "worker-spare",
+            "hostname": "spare",
+            "is_online": False,
+            "state": "unknown",
+            "is_active": True,
+        }
+        assert restored._ha_state["pending_new_master_id"] == "worker-next"
+        assert restored.get_transfer_logs()[0]["details"] == {
+            "transfer_id": "transfer-test",
+        }
+
+    def test_ha_log_is_bounded_and_rejects_unknown_category(self, scheduler):
+        for index in range(260):
+            scheduler._append_ha_log(
+                "spare_master_logs",
+                "designated",
+                {"sequence": index},
+            )
+
+        restored = Scheduler()
+        logs = restored.get_spare_master_logs()
+
+        assert len(logs) == 256
+        assert logs[0]["details"]["sequence"] == 4
+        assert logs[-1]["details"]["sequence"] == 259
+        with pytest.raises(ValueError, match="unknown HA log category"):
+            scheduler._append_ha_log("unknown", "ignored", {})
+
+    def test_clear_spare_master_is_role_gated_and_persisted(self, scheduler):
+        scheduler._update_ha_state(
+            spare_master={"node_id": "worker-spare"},
+            spare_master_active=True,
+            pending_new_master_id="worker-next",
+        )
+        scheduler._role_override = "client"
+        assert scheduler.clear_spare_master()["status"] == "denied"
+
+        scheduler._role_override = "master"
+        assert scheduler.clear_spare_master()["status"] == "ok"
+
+        restored = Scheduler()
+        assert restored.get_spare_master() is None
+        assert restored._ha_state["pending_new_master_id"] == ""
+        assert restored.get_spare_master_logs()[-1]["direction"] == "undesignated"
+
+    def test_role_transfer_message_persists_promotion_and_acknowledges(
+        self, scheduler,
+    ):
+        sent = []
+
+        class FakeClient:
+            sock = object()
+
+            @staticmethod
+            def send_data(payload, message_type):
+                sent.append((payload, message_type))
+
+        scheduler._tcp_client = FakeClient()
+        scheduler._handle_role_transfer("old-master", {"data": {
+            "transfer_id": "transfer-promote",
+            "old_master_id": "old-master",
+            "new_master_id": "new-master",
+            "spare_master": {"node_id": "worker-spare"},
+        }})
+
+        assert sent[0][0]["transfer_id"] == "transfer-promote"
+        assert sent[0][0]["ack"]["accepted"] is True
+        assert scheduler._ha_state["spare_master_active"] is True
+        assert scheduler._ha_state["pending_new_master_id"] == "new-master"
+        assert scheduler.get_transfer_logs()[-1]["direction"] == "promotion"
+
+    def test_startup_deactivation_notifies_spare_and_clears_state(
+        self, scheduler, monkeypatch,
+    ):
+        import scheduler as scheduler_module
+
+        sent = []
+
+        class FakeServer:
+            _running = True
+
+            @staticmethod
+            def get_client_ids():
+                return ["worker-spare"]
+
+            @staticmethod
+            def send_to_client(node_id, payload, message_type):
+                sent.append((node_id, payload, message_type))
+
+        monkeypatch.setattr(scheduler_module, "NODE_ID", "worker-next")
+        scheduler._tcp_server = FakeServer()
+        scheduler._update_ha_state(
+            spare_master={"node_id": "worker-spare"},
+            spare_master_active=True,
+            pending_new_master_id="worker-next",
+        )
+
+        scheduler.deactivate_spare_master_on_startup()
+
+        assert sent[0][0] == "worker-spare"
+        assert sent[0][1]["new_master_id"] == "worker-next"
+        assert scheduler._ha_state["spare_master_active"] is False
+        assert scheduler._ha_state["pending_new_master_id"] == ""
 
 
 # ================================================================
@@ -5846,7 +5878,6 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
             raise OSError("address already in use")
 
     sched = Scheduler()
-    register_master = MagicMock()
     monkeypatch.setattr("tcp_comm.TCPServer", FailedTCPServer)
     monkeypatch.setattr("tcp_comm.detect_lan_ip", lambda: "100.64.0.10")
     monkeypatch.setattr("tcp_comm.get_mac_addresses", lambda: ["001122334455"])
@@ -5856,10 +5887,7 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         "_verify_master_identity",
         lambda: setattr(sched, "_master_identity_reason", "first_run"),
     )
-    monkeypatch.setattr(sched, "_register_master_in_db", register_master)
-    monkeypatch.setattr(sched, "_start_master_db_heartbeat", MagicMock())
     monkeypatch.setattr(sched, "deactivate_spare_master_on_startup", lambda: None)
-    monkeypatch.setattr(sched, "_start_database_reconnect_monitor", lambda: None)
     monkeypatch.setattr(sched, "can_join_existing_master", lambda: False)
 
     try:
@@ -5868,20 +5896,202 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
         assert sched._running is True
         assert sched._tcp_server is None
         assert sched.pipeline_queue._running is True
-        register_master.assert_not_called()
     finally:
         sched.stop()
 
 
-def test_distributed_toggle_survives_without_database(monkeypatch):
-    """数据库关闭时，运行时分布式开关仍应立即生效。"""
-    import scheduler as scheduler_mod
-
+def test_distributed_toggle_is_process_owned():
+    """运行时分布式开关应立即生效。"""
     sched = Scheduler()
-    monkeypatch.setattr(scheduler_mod, "_get_db", lambda *args, **kwargs: None)
-    monkeypatch.setattr(scheduler_mod, "_db_available", False)
-
     sched.set_distributed_inference_enabled(False)
     assert sched.get_distributed_inference_enabled() is False
     sched.set_distributed_inference_enabled(True)
     assert sched.get_distributed_inference_enabled() is True
+
+
+class _ImmediateStartupWait:
+    """让启动期决策测试跳过真实等待，同时记录等待预算。"""
+
+    def __init__(self, cancelled=False):
+        self.cancelled = cancelled
+        self.timeouts = []
+
+    def clear(self):
+        self.cancelled = False
+
+    def set(self):
+        self.cancelled = True
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        return self.cancelled
+
+
+class TestSchedulerStartupDecisions:
+    def test_discover_master_prefers_local_config_and_can_skip_to_tailnet(
+            self, monkeypatch):
+        import bootstrap
+        import config as cfg
+
+        sched = Scheduler()
+        monkeypatch.setattr(cfg, "CLIENT_MASTER_HOST", "100.64.0.10")
+        monkeypatch.setattr(cfg, "CLIENT_MASTER_PORT", 8899)
+
+        configured = sched.discover_master()
+        assert configured == {
+            "found": True,
+            "master_host": "100.64.0.10",
+            "master_port": 8899,
+            "stale": False,
+            "source": "config",
+        }
+
+        monkeypatch.setattr(cfg, "CLIENT_MASTER_HOST", "192.168.x.x")
+        monkeypatch.setattr(
+            bootstrap,
+            "discover_master_via_tailnet",
+            lambda *, api_port: {
+                "found": True,
+                "master_host": "100.64.0.20",
+                "master_port": api_port,
+                "stale": True,
+                "source": "tailnet",
+            },
+        )
+        discovered = sched.discover_master(skip_config=True)
+        assert discovered["found"] is True
+        assert discovered["source"] == "tailnet"
+        assert discovered["stale"] is True
+
+    def test_discover_master_fail_closed_when_tailnet_probe_errors(self, monkeypatch):
+        import bootstrap
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "CLIENT_MASTER_HOST", "192.168.x.x")
+        monkeypatch.setattr(
+            bootstrap,
+            "discover_master_via_tailnet",
+            lambda **kwargs: (_ for _ in ()).throw(OSError("probe failed")),
+        )
+        assert Scheduler().discover_master() == {
+            "found": False,
+            "source": "none",
+        }
+
+    def test_auto_switch_wait_is_cancellable_and_activates_after_ready(
+            self, monkeypatch):
+        sched = Scheduler()
+        wait = _ImmediateStartupWait()
+        monkeypatch.setattr(sched, "_startup_cancel_event", wait)
+        activated = []
+        monkeypatch.setattr(
+            sched,
+            "activate_client_mode",
+            lambda host, port: activated.append((host, port)) or {"message": "ok"},
+        )
+
+        sched._auto_switch_to_client("100.64.0.10", 8888)
+        assert activated == [("100.64.0.10", 8888)]
+        assert wait.timeouts == [2]
+
+        activated.clear()
+        wait.cancelled = True
+        sched._auto_switch_to_client("100.64.0.11", 8889)
+        assert activated == []
+
+    def test_auto_join_requires_running_joinable_node_and_discovered_master(
+            self, monkeypatch):
+        sched = Scheduler()
+        wait = _ImmediateStartupWait()
+        monkeypatch.setattr(sched, "_startup_cancel_event", wait)
+        sched._running = True
+        monkeypatch.setattr(sched, "can_join_existing_master", lambda: True)
+        monkeypatch.setattr(
+            sched,
+            "discover_master",
+            lambda: {"found": True, "master_host": "100.64.0.12", "master_port": 8890},
+        )
+        activated = []
+        monkeypatch.setattr(
+            sched,
+            "activate_client_mode",
+            lambda host, port: activated.append((host, port)),
+        )
+
+        sched._auto_join_tailnet_master_on_startup()
+        assert activated == [("100.64.0.12", 8890)]
+
+        activated.clear()
+        sched._running = False
+        sched._auto_join_tailnet_master_on_startup()
+        assert activated == []
+
+    def test_auto_connect_retries_tailnet_discovery_after_config_failure(
+            self, monkeypatch):
+        sched = Scheduler()
+        wait = _ImmediateStartupWait()
+        monkeypatch.setattr(sched, "_startup_cancel_event", wait)
+        sched._running = True
+        discoveries = [
+            {"found": True, "master_host": "100.64.0.10", "master_port": 8899},
+            {"found": True, "master_host": "100.64.0.11", "master_port": 8900},
+        ]
+        monkeypatch.setattr(sched, "discover_master", lambda **kwargs: discoveries.pop(0))
+        connected = []
+        monkeypatch.setattr(
+            sched,
+            "connect_to_master",
+            lambda host, port: connected.append((host, port)) or {"status": "failed"},
+        )
+
+        sched._auto_connect_on_startup()
+        assert connected == [("100.64.0.10", 8899), ("100.64.0.11", 8900)]
+        assert wait.timeouts == [5]
+
+    def test_auto_connect_skips_discovery_when_already_connected_or_stopped(
+            self, monkeypatch):
+        sched = Scheduler()
+        wait = _ImmediateStartupWait()
+        monkeypatch.setattr(sched, "_startup_cancel_event", wait)
+        sched._running = True
+        sched._tcp_client = type("Client", (), {"_running": True})()
+        monkeypatch.setattr(
+            sched,
+            "discover_master",
+            lambda **kwargs: pytest.fail("active connection should win"),
+        )
+        sched._auto_connect_on_startup()
+
+        sched._tcp_client = None
+        sched._running = False
+        sched._auto_connect_on_startup()
+
+    @pytest.mark.parametrize(
+        "enabled,disabled,preempting,current_step,last_time,now,expected",
+        [
+            (False, False, False, 100, 0, 100, False),
+            (True, True, False, 100, 0, 100, False),
+            (True, False, True, 100, 0, 100, False),
+            (True, False, False, 15, 0, 100, False),
+            (True, False, False, 16, 95, 100, False),
+            (True, False, False, 16, 80, 100, True),
+        ],
+    )
+    def test_preempt_condition_truth_table(
+            self, monkeypatch, enabled, disabled, preempting, current_step,
+            last_time, now, expected):
+        import scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod, "PIPELINE_PREEMPT_ENABLED", enabled)
+        monkeypatch.setattr(
+            scheduler_mod, "PIPELINE_PREEMPT_MIN_TOKENS", 16,
+        )
+        monkeypatch.setattr(
+            scheduler_mod, "PIPELINE_PREEMPT_MIN_INTERVAL", 10.0,
+        )
+        monkeypatch.setattr(scheduler_mod.time, "time", lambda: now)
+        sched = Scheduler()
+        sched._preempt_disabled = disabled
+        sched._preempting = preempting
+        sched._preempt_last_time = last_time
+        assert sched._check_preempt_conditions(current_step) is expected

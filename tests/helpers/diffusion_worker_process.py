@@ -101,12 +101,31 @@ def main() -> int:
     )
     http_thread = threading.Thread(target=http_server.run, daemon=True)
     http_thread.start()
+    actual_http_port = None
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        for running_server in getattr(http_server, "servers", []):
+            sockets = getattr(running_server, "sockets", None) or []
+            if sockets:
+                actual_http_port = sockets[0].getsockname()[1]
+                break
+        if actual_http_port is not None:
+            break
+        time.sleep(0.02)
+    if actual_http_port is None:
+        http_server.should_exit = True
+        http_thread.join(timeout=5.0)
+        data_plane.close()
+        return 8
+    (Path(args.state_dir) / "http-port").write_text(
+        str(actual_http_port), encoding="ascii",
+    )
 
     runtime = DiffusionWorkerRuntime(
         service=service,
         data_plane=data_plane,
         node_id=args.node_id,
-        data_plane_base_url=f"http://127.0.0.1:{args.http_port}",
+        data_plane_base_url=f"http://127.0.0.1:{actual_http_port}",
     )
     scheduler = Scheduler()
     scheduler._role_override = "client"
@@ -149,10 +168,15 @@ def main() -> int:
             return 6
         if not service.completed.wait(20.0):
             return 7
-        # The local job result has been published; keep HTTP alive while the
-        # coordinator consumes its short-lived output transfer grant.
-        time.sleep(1.0)
-        return 0
+        # 结果已发布后，等待协调器明确确认已消费短期 output transfer grant。
+        # 固定保活窗口在慢机器上会让 HTTP 提前退出，使用跨进程就绪文件代替。
+        consumed_file = Path(args.state_dir) / "output-transfer-consumed"
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if consumed_file.exists():
+                return 0
+            threading.Event().wait(0.05)
+        return 9
     finally:
         client.disconnect()
         scheduler.clear_diffusion_worker()

@@ -89,6 +89,41 @@ def test_detect_lan_ip_prefers_assigned_tailscale_address(monkeypatch):
     assert tcp_comm_mod.detect_lan_ip() == "100.88.9.10"
 
 
+class TestRegistrationAuthentication:
+    def test_verify_auth_signature_rejects_missing_fields(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 1000.0)
+
+        for auth_data in (None, {}, {"auth_timestamp": 1000.0}, {"auth_signature": "x"}):
+            ok, _ = tcp_comm_mod.verify_auth_signature("client-auth", auth_data)
+            assert ok is False
+
+    def test_verify_auth_signature_rejects_missing_secret_stale_and_bad_hmac(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "")
+        ok, _ = tcp_comm_mod.verify_auth_signature(
+            "client-auth", {"auth_timestamp": 1000.0, "auth_signature": "x"},
+        )
+        assert ok is False
+
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        stale = tcp_comm_mod.build_auth_signature("client-auth", timestamp=100.0)
+        stale_ok, _ = tcp_comm_mod.verify_auth_signature("client-auth", stale)
+        assert stale_ok is False
+
+        invalid = tcp_comm_mod.build_auth_signature("client-auth", timestamp=1000.0)
+        invalid["auth_signature"] = "0" * 64
+        invalid_ok, _ = tcp_comm_mod.verify_auth_signature("client-auth", invalid)
+        assert invalid_ok is False
+
+    def test_verify_auth_signature_accepts_matching_hmac_inside_time_window(self, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        monkeypatch.setattr(tcp_comm_mod.time, "time", lambda: 1000.0)
+
+        auth = tcp_comm_mod.build_auth_signature("client-auth", timestamp=999.0)
+        assert tcp_comm_mod.verify_auth_signature("client-auth", auth) == (True, "ok")
+
+
 # ================================================================
 # pack_data / unpack_header 测试
 # ================================================================
@@ -819,6 +854,71 @@ class TestTCPServerConnectionManagement:
             srv_sock.close()
             cli_sock.close()
 
+    @pytest.mark.parametrize(
+        "client_id,role",
+        [("master", "client"), ("client_reserved_role", "master")],
+    )
+    def test_registration_rejects_reserved_master_identity(self, client_id, role, monkeypatch):
+        monkeypatch.setattr(tcp_comm_mod, "_get_cluster_secret", lambda: "s" * 32)
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": client_id,
+                    "role": role,
+                    "auth": tcp_comm_mod.build_auth_signature(client_id),
+                },
+            }
+            with pytest.raises(tcp_comm_mod._RegistrationRejected):
+                server._handle_registration(
+                    srv_sock, ("127.0.0.1", 54321), "pending_54321", msg,
+                )
+
+            header = recv_exact(cli_sock, HEADER_LEN)
+            payload = recv_exact(cli_sock, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["data"]["status"] == "rejected"
+            assert server.get_client_ids() == []
+        finally:
+            srv_sock.close()
+            cli_sock.close()
+
+    def test_broadcast_continues_after_one_client_send_failure(self):
+        class RecordingSocket:
+            def __init__(self):
+                self.packets = []
+
+            def sendall(self, packet):
+                self.packets.append(packet)
+
+            def close(self):
+                pass
+
+        class BrokenSocket:
+            def sendall(self, packet):
+                raise OSError("simulated send failure")
+
+            def close(self):
+                pass
+
+        server = TCPServer(host="127.0.0.1", port=0)
+        good = RecordingSocket()
+        server._set_client(
+            "good",
+            ClientConn("good", good, ("127.0.0.1", 1), role="client"),
+        )
+        server._set_client(
+            "bad",
+            ClientConn("bad", BrokenSocket(), ("127.0.0.1", 2), role="client"),
+        )
+
+        server.broadcast({"event": "test"}, MessageType.TASK_START)
+
+        assert len(good.packets) == 1
+        assert parse_message(good.packets[0][HEADER_LEN:])["data"] == {"event": "test"}
+
     def test_rejected_registration_does_not_call_on_message_or_leak_client(self):
         """_handle_client 应拦截注册拒绝，不进入上层回调且不泄露 pending_*。"""
         server = TCPServer(host="127.0.0.1", port=0)
@@ -1462,14 +1562,6 @@ def _ipv6_supported() -> bool:
         return False
 
 
-def _free_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 class TestDualStackUtils:
     """parse_host_port / format_host_port 对 v4/v6 字面量的处理。"""
 
@@ -1512,6 +1604,7 @@ class TestDualStackServer:
             assert len(socks) == 2
             names = sorted(s.getsockname()[0] for s in socks)
             assert "0.0.0.0" in names and "::" in names
+            assert len({sock.getsockname()[1] for sock in socks}) == 1
             # IPv6 socket 必须 V6ONLY=1，避免与 v4 socket 端口冲突
             v6_sock = next(s for s in socks if s.getsockname()[0] == "::")
             assert v6_sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
@@ -1530,7 +1623,8 @@ class TestDualStackServer:
 
     @pytest.mark.skipif(not _ipv6_supported(), reason="本机不支持 IPv6")
     def test_v4_and_v6_clients_both_connect(self):
-        server = TCPServer(host="0.0.0.0", port=_free_port())
+        server = TCPServer(host="0.0.0.0", port=0)
+        assert server.port == 0
         server.start()
         try:
             port = server.sock.getsockname()[1]

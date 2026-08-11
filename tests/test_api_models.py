@@ -234,7 +234,7 @@ def test_api_switch_model_resolves_db_registered_gguf(tmp_path, monkeypatch):
                 "error": None,
             }
 
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [db_entry])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [db_entry])
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
     monkeypatch.setattr(api_server, "kv_cache", None)
@@ -404,24 +404,16 @@ def test_load_model_rejects_invalid_quant_for_pytorch(monkeypatch):
     assert exc.value.status_code == 400
 
 
-def test_load_model_allows_any_quant_for_llama_cpp(monkeypatch):
+def test_normalize_quant_keeps_gguf_quant_for_llama_cpp():
     """llama_cpp 引擎放行任意 quant_type（GGUF 自带量化）"""
-    monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
-    # 让验证通过（model_id=None 时 _validate_model_load_request 直接 return）
-    req = api_server.LoadModelRequest(
-        engine="llama_cpp",
-        quant_type="Q4_K_M",
-    )
-    # 不应因 quant_type 被拒绝（llama_cpp 分支放行）
-    # 但会因模型未加载等原因失败 — 这里只验证不抛 400
-    try:
-        asyncio.run(api_server.load_model(req))
-    except api_server.HTTPException as e:
-        # 可能是 500（模型加载失败）或其他，但不应该是 400
-        assert e.status_code != 400, f"llama_cpp 不应拒绝 Q4_K_M quant，但返回了 400: {e.detail}"
+    api_server._validate_model_load_request(None, "llama_cpp")
+    assert api_server._normalize_quant_for_engine("Q4_K_M", "llama_cpp") == "Q4_K_M"
+    with pytest.raises(api_server.HTTPException) as exc:
+        api_server._normalize_quant_for_engine("Q4_K_M", "pytorch")
+    assert exc.value.status_code == 400
 
 
-def test_load_model_auto_allows_gguf_quant_when_effective_engine_is_llama_cpp(monkeypatch):
+def test_load_model_auto_uses_real_gguf_model_resolution(monkeypatch, tmp_path):
     """engine=auto 解析到 llama.cpp 时，GGUF 量化占位值应合法。"""
     switch_calls = []
 
@@ -446,13 +438,26 @@ def test_load_model_auto_allows_gguf_quant_when_effective_engine_is_llama_cpp(mo
     async def fake_get_status():
         return {"status": "ok"}
 
+    gguf_path = tmp_path / "gguf-model.Q4_K_M.gguf"
+    gguf_path.write_bytes(b"gguf")
+    registered_model = {
+        "model_id": "gguf-model",
+        "name": "GGUF Model",
+        "model_type": "gguf",
+        "gguf_path": str(gguf_path),
+        "quant_types": ["Q4_K_M"],
+    }
+
+    import config as runtime_config
+
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
-    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
-    monkeypatch.setattr(api_server, "_resolve_model_path_for_engine", lambda *a, **kw: "models/test.gguf")
-    monkeypatch.setattr(api_server, "_effective_engine_for_model", lambda *a, **kw: "llama_cpp")
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [registered_model])
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
     monkeypatch.setattr(api_server, "get_status", fake_get_status)
+    monkeypatch.setattr(model_host, "model_loaded", False)
+    monkeypatch.setattr(runtime_config, "INFERENCE_ENGINE", "auto")
+    monkeypatch.setattr(runtime_config, "QUANT_TYPE", "int4")
+    monkeypatch.setattr(runtime_config, "USE_COMPILE", False)
 
     req = api_server.LoadModelRequest(
         engine="auto",
@@ -464,12 +469,13 @@ def test_load_model_auto_allows_gguf_quant_when_effective_engine_is_llama_cpp(mo
     assert result["status"] == "ok"
     assert switch_calls[0]["engine"] == "llama_cpp"
     assert switch_calls[0]["quant_type"] == "Q4_K_M"
+    assert switch_calls[0]["model_path"] == str(gguf_path)
 
 
 def test_load_model_rejects_nonexistent_model_id(monkeypatch):
     """不存在的 model_id → 404"""
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [])
     req = api_server.LoadModelRequest(
         engine="auto",
         quant_type="int4",
@@ -660,7 +666,6 @@ def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
     monkeypatch.setattr(api_server, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups", lambda *a, **kw: [])
-    monkeypatch.setattr(model_host, "_db_available", False)
     monkeypatch.setattr(api_server._local_store, "save_local_message", lambda *a, **kw: None)
     monkeypatch.setattr(api_server._local_store, "increment_local_session_message_count", lambda *a, **kw: None)
 
@@ -826,7 +831,7 @@ def test_switch_model_calls_manager_switch(monkeypatch):
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: True)
     # 绕过 _validate_model_load_request（GGUF 文件实际不存在）
     monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [])
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: None)
 
     req = api_server.SwitchModelRequest(
@@ -920,7 +925,7 @@ def test_switch_model_resets_runtime_conversation_state(monkeypatch):
     monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *a, **kw: None)
     monkeypatch.setattr(api_server, "_resolve_model_path_for_engine", lambda *a, **kw: "models/test.gguf")
     monkeypatch.setattr(api_server, "_effective_engine_for_model", lambda *a, **kw: "llama_cpp")
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [])
     monkeypatch.setattr(api_server, "_init_kv_cache", lambda: init_calls.append(True))
 
     req = api_server.SwitchModelRequest(
@@ -985,7 +990,7 @@ def test_register_model_passes_db_experimental_models_to_switch(monkeypatch, tmp
                 "error": None,
             }
 
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: [db_entry])
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: [db_entry])
     monkeypatch.setattr(api_server, "model_manager", FakeManager())
     monkeypatch.setattr(model_host, "model_loaded", False)
     monkeypatch.setattr(api_server, "kv_cache", None)
@@ -1011,7 +1016,7 @@ def test_list_model_registry_returns_db_models(monkeypatch):
         {"model_id": "m1", "name": "Model 1", "model_type": "gguf"},
         {"model_id": "m2", "name": "Model 2", "model_type": "safetensors"},
     ]
-    monkeypatch.setattr(api_server, "_get_db_experimental_models", lambda: db_models)
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: db_models)
     result = asyncio.run(api_server.list_model_registry())
     assert result["models"] == db_models
 

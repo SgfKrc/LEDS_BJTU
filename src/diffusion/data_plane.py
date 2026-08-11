@@ -255,7 +255,12 @@ async def _bounded_chunk(request: Request) -> bytes:
                 status_code=400,
                 detail={"code": "invalid_content_length"},
             ) from exc
-        if declared_length <= 0 or declared_length > MAX_TRANSFER_CHUNK_BYTES:
+        if declared_length < 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_content_length"},
+            )
+        if declared_length > MAX_TRANSFER_CHUNK_BYTES:
             raise HTTPException(
                 status_code=413,
                 detail={"code": "transfer_chunk_too_large"},
