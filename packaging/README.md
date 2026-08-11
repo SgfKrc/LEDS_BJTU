@@ -20,6 +20,7 @@
 │   ├── build-launcher.bat        # 独立 Launcher 构建脚本
 │   ├── qlh-cpu.spec              # PyInstaller 规格文件（集显版）
 │   ├── qlh-cuda.spec             # PyInstaller 规格文件（独显版）
+│   ├── qlh-tui-chat.spec         # Textual 聊天页控制台伴随程序（随主包签名）
 │   ├── setup.iss                 # Inno Setup 安装脚本 — 集显版
 │   ├── setup-cuda.iss            # Inno Setup 安装脚本 — 独显版
 │   ├── requirements-cpu.txt      # CPU-only 依赖清单（两个版本共用，torch 由 venv 决定）
@@ -112,8 +113,10 @@ pip install pyinstaller
 # 2. 构建前端（★ 从项目根目录）
 cd frontend && npm ci && npx vite build && cd ..
 
-# 3. PyInstaller 打包（★ 从项目根目录，使用集显版 venv）
-pyinstaller packaging/qlh-cpu.spec --noconfirm
+# 3. 完整发布构建（★ 从项目根目录，签名 key 不得提交）
+set QLH_SIGNING_KEY=packaging\.signing-keys\release-YYYYMMDD.key
+set QLH_NONINTERACTIVE=1
+packaging\build-cpu.bat
 # 输出: dist/QLH-Edge-Inference/
 
 # 4. 编译 Inno Setup 安装包（需要 Inno Setup 6）
@@ -137,8 +140,10 @@ pip install pyinstaller
 # 2. 构建前端（★ 从项目根目录，如已构建可跳过）
 cd frontend && npm ci && npx vite build && cd ..
 
-# 3. PyInstaller 打包（★ 从项目根目录，使用独显版 venv）
-pyinstaller packaging/qlh-cuda.spec --noconfirm
+# 3. 完整发布构建（★ 从项目根目录，使用独显版 venv）
+set QLH_SIGNING_KEY=packaging\.signing-keys\release-YYYYMMDD.key
+set QLH_NONINTERACTIVE=1
+packaging\build-cuda.bat
 # 输出: dist/QLH-Edge-Inference-CUDA/
 
 # 4. 编译 Inno Setup 安装包（需要 Inno Setup 6）
@@ -160,6 +165,7 @@ cd packaging
 |------|------|-----------|
 | `packaging/qlh-cpu.spec` | 集显版 | CPU-only（~200 MB） |
 | `packaging/qlh-cuda.spec` | 独显版 | CUDA 12.x（~3.5 GB，含 CUDA DLL） |
+| `packaging/qlh-tui-chat.spec` | `bjtu chat` 控制台伴随目录 | Textual + httpx，无 torch；必须在签名清单生成前写入主应用树 |
 
 两个 spec 的 `hiddenimports` 相同，区别仅在于 venv 中安装的 torch 版本不同。
 PyInstaller 会自动追踪 venv 中的 torch，不需要修改 spec 来切换 CPU/CUDA。
@@ -226,7 +232,7 @@ python packaging/signing.py verify --manifest latest.json --trusted-keys-dir pac
 
 发布构建必须设置 `QLH_SIGNING_KEY`。CPU、CUDA、Launcher 和 Linux `.deb` 构建会扫描最终程序树，生成 `manifest/install-manifest.json`，沿用 UP-N2 Ed25519 信任链签名并立即复验。清单只列程序文件的规范相对路径、大小、SHA-256 和 kind；`models/`、`chat_history/`、`logs/`、`config/`、`local_docs/` 永不进入清单。
 
-Windows Setup 在安装末尾运行独立 `QLH-Install-Manifest.exe validate`，Linux `postinst` 用包内 venv 执行同一验证；失败会中止安装。Launcher 远端 A/B 自更新也要求 bundle 带签名清单，且版本、变体和包身份必须匹配。手工检查示例：
+Windows Setup 在安装末尾运行独立 `QLH-Install-Manifest.exe verify --level deep`，Linux `postinst` 用包内 venv 执行签名清单验证；失败会中止安装。Launcher 远端 A/B 自更新也要求 bundle 带签名清单，且版本、变体和包身份必须匹配。手工检查示例：
 
 ```powershell
 python packaging/install_manifest.py validate `
@@ -266,6 +272,18 @@ python packaging/repair.py build-index --root dist/QLH-Edge-Inference --output p
 ```
 
 修复先执行 deep 校验，只处理已签名清单中的 `missing`、`size`、`hash` 失败。更新清单必须已验签且版本完全匹配，`repair-index` 经外层清单 SHA-256 固定，索引的每项仍需逐项匹配本机签名基线。全部载荷先下载校验，再写入同目录临时文件并原子替换；旧文件会保留为 Launcher 状态目录内的 `.bak`。超过 10 个文件或 64MiB 时不会下载或写入，而是要求使用已签名整包。修复后必跑 deep 校验，失败则回滚已替换文件。模型、聊天记录、日志、配置和本地文档既不读取也不写入。
+
+### 用户数据保留与重新关联（UP-N6.4 / UP-N6.4W）
+
+```powershell
+python packaging/qlh_launcher.py data-status --root dist/QLH-Edge-Inference --json
+python packaging/qlh_launcher.py retain-data --root dist/QLH-Edge-Inference --yes --json
+python packaging/qlh_launcher.py reassociate-data --root dist/QLH-Edge-Inference --yes --json
+```
+
+事务只处理 `models/`、`chat_history/`、`logs/`、`config/`、`local_docs/` 五个固定目录，不合并或覆盖已有目标。源和保留根位于同一文件系统时使用 `os.replace` 原子改名；跨文件系统时先做目标空间预检，以 4MiB 缓冲逐文件复制并校验大小与 SHA-256，全部目录在 staging 中验证后才逐目录提交，且只有所有目标提交完成后才隔离并删除源目录。链接/reparse point、大小写碰撞、文件身份变化、摘要不一致、根绑定不一致和 journal 篡改均 fail-closed。
+
+跨卷状态保存在保留根的 `.qlh-retention-transaction.json`，可从 `copying`、`prepared`、`committed`、`deleting_source` 阶段幂等恢复；稳定状态由 `.qlh-retention.json` 记录。Windows CPU/CUDA 发布树携带签名清单内的 `tools/QLH-Data-Retention.exe`：卸载前执行 `retain`，重装完成且程序树 deep 验证通过后执行 `reassociate`。事务失败会中止安装或卸载并保留可恢复状态，不会退化为未校验的 copy-and-delete。
 
 ### 原子版本与回滚（UP-N3）— version_store.py
 
@@ -383,11 +401,11 @@ A: 不包含。首次启动会自动检测并弹出下载引导（百度网盘 /
 
 **Q: 卸载时会删除 `models/` 目录吗？**
 
-A: 默认不会。卸载程序会弹出确认框，默认选择「否」以保留模型文件。
+A: 不会。UP-N6.4 会在卸载前把 `models/`、聊天记录、日志、配置和本地文档迁移到用户数据根，拒绝合并或覆盖已有数据；Windows 为 `%LOCALAPPDATA%\QLH-Edge-Inference\data`，Linux `.deb` 为 `/var/lib/qlh-edge-inference/data`。使用 `qlh-launcher reinstall --yes` 或 `bjtu reinstall --yes` 会先保留数据，再下载已验签安装包；`retain-data`、`reassociate-data` 可用于分步恢复。
 
 **Q: 安装后运行报「数据库密码错误」？**
 
-A: 先确认卸载了旧版并手动删除了安装目录，再重新安装。旧版 `_internal/` 中可能残留了旧密码的缓存文件。
+A: 先执行 `qlh-launcher reinstall --yes`，让安装器保留用户数据并替换程序文件。不要通过删除数据根来排查；若仍失败，先导出诊断包并按提示处理旧版 `_internal/` 缓存。
 
 ---
 
@@ -403,6 +421,7 @@ packaging/linux/
 ├── postinst                      ← 安装后脚本
 ├── prerm                         ← 卸载前脚本
 ├── postrm                        ← 卸载后脚本
+├── qlh-env-register              ← 可选 PATH 注册状态工具
 ├── qlh-edge-inference.desktop    ← 桌面快捷方式
 ├── qlh-edge-inference.service    ← systemd 系统服务
 ├── launcher.py                   ← qlh-app 主应用包装器
@@ -430,6 +449,7 @@ packaging/linux/
 /lib/systemd/system/qlh-edge-inference.service
 /usr/local/bin/qlh-launcher → ../../opt/qlh-edge-inference/bin/qlh-launcher
 /usr/local/bin/bjtu → ../../opt/qlh-edge-inference/bin/bjtu
+/usr/sbin/qlh-env-register         ← 管理 /etc/profile.d/qlh.sh 的显式开关
 ```
 
 `qlh-launcher` 本身只包含 Bootstrap/更新逻辑。发现已安装的 Linux 主应用后，它优先以
@@ -440,7 +460,7 @@ packaging/linux/
 
 **前置条件** (Ubuntu 22.04/24.04):
 ```bash
-sudo apt install python3 python3-venv python3-pip python3-tk dpkg-dev zenity
+sudo apt install build-essential cmake git nodejs npm python3 python3-venv python3-pip python3-tk dpkg-dev zenity
 ```
 
 > 📌 **Windows + WSL2 环境构建**：详见 `packaging/linux/WSL-BUILD-NOTES.md`
@@ -451,6 +471,8 @@ sudo apt install python3 python3-venv python3-pip python3-tk dpkg-dev zenity
 ```bash
 cd packaging/linux
 chmod +x build-deb.sh
+export QLH_SIGNING_KEY=/secure/release.key
+./build-deb.sh cpu --preflight-only
 ./build-deb.sh cpu
 # 输出: qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 ```
@@ -468,6 +490,9 @@ chmod +x build-deb.sh
 sudo dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
 sudo apt-get install -f   # 修复可能未满足的依赖
 
+# 可选：若首装时要注册 PATH，用此命令替换上面的 dpkg 安装命令
+sudo env QLH_ENVREG=1 dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
+
 # 运行独立图形 Launcher
 qlh-launcher --gui
 
@@ -481,16 +506,26 @@ qlh-launcher --headless
 bjtu launcher
 bjtu ui
 bjtu tui
+bjtu chat --host http://127.0.0.1:8000
+
+# 查看或关闭可选 PATH 注册（默认安装不创建 profile）
+sudo qlh-env-register status
+sudo qlh-env-register disable
 
 # 可选: 开机自启
 sudo systemctl enable --now qlh-edge-inference
 
-# 卸载 (保留模型文件)
+# 卸载（用户数据迁移到 /var/lib/qlh-edge-inference/data）
 sudo dpkg -r qlh-edge-inference-cpu
 
-# 完全卸载 (包括模型)
-sudo dpkg -r qlh-edge-inference-cpu && sudo rm -rf /opt/qlh-edge-inference
+# 清理包管理器状态（仍保留用户数据）
+sudo dpkg -P qlh-edge-inference-cpu
+
+# 仅在已确认备份后，明确删除外置用户数据
+sudo rm -rf /var/lib/qlh-edge-inference/data
 ```
+
+Linux 包始终维护 `/usr/local/bin/qlh-launcher` 与 `/usr/local/bin/bjtu` 符号链接。`QLH_ENVREG=1` 仅额外创建包拥有的 `/etc/profile.d/qlh.sh`，让新登录 shell 把 `/opt/qlh-edge-inference/bin` 加入 PATH；它不会写入模型路径、端口或任何密钥。普通 remove 删除 profile 但保留选择，purge 才删除该选择状态。
 
 ### 图标
 
