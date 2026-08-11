@@ -172,6 +172,18 @@ def test_configured_sources_keeps_multiple_persisted_sources(tmp_path, monkeypat
     ]
 
 
+def test_default_update_sources_include_gitee_mirror_fallback():
+    """默认源列表包含 Gitee 镜像兜底源（发版时 tag 需同步更新）。"""
+    sources = updater.DEFAULT_UPDATE_SOURCES
+    assert len(sources) >= 3
+    assert sources[0].startswith("http://")
+    assert "github.com/SgfKrc/LEDS_BJTU" in sources[1]
+    assert sources[2].startswith(
+        "https://gitee.com/sgfd8134/leds_-bjtu_-gitee/releases/download/"
+    )
+    assert sources[2].endswith("/latest.json")
+
+
 def test_detect_current_version_reads_source_tree_without_importing_it(tmp_path, monkeypatch):
     monkeypatch.delenv("QLH_CURRENT_VERSION", raising=False)
     src = tmp_path / "src"
