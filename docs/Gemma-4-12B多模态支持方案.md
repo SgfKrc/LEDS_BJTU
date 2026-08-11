@@ -1,23 +1,21 @@
-# Gemma-4-12B 多模态支持方案(调研 + 接入设计)
+# Gemma-4-12B 多模态支持方案（实施计划）
 
-> 状态：规划（调研完成，尚未接入）
+> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互 Ready；G4.3 原生 llama.cpp/音频 Candidate）
 >
 > 更新日期：2026-08-11
-> 适用范围：补全项目多模态实验缺口的 gemma-4-12B 图像理解（图生文）接入设计；路线 A 经 `external_api` 对接 Ollama OpenAI 兼容端点，路线 B 为 llama.cpp 原生 mmproj 接入
+> 适用范围：原版 Gemma 4 12B 经本机 Ollama `external_api` 提供文本与图像理解；音频和原生 llama.cpp 另列后续票
 >
-> 目标:为 QLH 项目添加 **gemma-4-12B** 支持,补全多模态实验缺少的**图像理解(图生文)**能力。
-> 本机 OLLAMA 部署的 `myheretic:latest` 为**用户私人微调版(非原版)**,不具备通用能力,不能作为实验基线;
-> 本文以**原版模型**为准设计两条接入路线,**推荐路线 B(下载原版 GGUF 原生接入)**。
+> 目标：先提供可验证、可回滚的原版 Gemma 4 12B 图像理解能力，再补产品交互；`myheretic:latest` 仍只作为用户私有资产，不进入项目基线。
 
 ---
 
 ## 1. 背景与目标
 
-- 模型:**Google Gemma 4 12B**(2026 年发布,`gemma4` 架构,11.9B dense 参数,256K 上下文,**Text + Image 多模态**,无音频输入)。
+- 模型：**Google Gemma 4 12B Unified**（2026-06-03 发布，`gemma4` 架构，11.9B，256K 上下文，官方能力为 Text + Image + Audio 输入、Text 输出）。
 - 本机显卡:RTX 4060 Laptop,**8GB 显存**。
-- 本机现状:Ollama 已导入 `myheretic:latest`(7.4GB,实测可运行),**但它是用户私人微调版(基于 gemma-4-12B 微调,非官方原版权重),不具备通用能力**,仅证明 gemma4 架构在本机 8GB 显存可运行;且缺视觉 projector,capabilities 只有 completion/tools/thinking,无 vision。
-- 模型基线:**多模态实验必须使用原版 gemma-4-12B**(Ollama 官方 `gemma4:12b` 或 bartowski 原版 GGUF),私人微调版不满足通用能力要求。
-- 目标:**让 QLH 能调用 gemma-4-12B 的多模态(图像理解)能力**,并把它登记为项目多模态实验模型。
+- 本机现状：官方 Ollama `gemma4:12b` 已通过 `127.0.0.1:7897` 子进程代理完整拉取并验证；用户私有 `myheretic:latest` 保留但不参与验收。
+- 模型基线：当前唯一已验收工件为 Ollama 官方 `gemma4:12b`；直接 GGUF 来源、revision 和 Python 绑定 ABI 尚未冻结，不作为 G4.1 依赖。
+- 当前目标：G4.1 已打通 QLH `external_api` 的图像理解 API；G4.2 再提供前端/TUI 图片选择和预览。
 
 ### 1.1 "多模态实验缺最后一种模型"的含义
 
@@ -39,15 +37,29 @@
 
 | 项目 | 结论 |
 |---|---|
-| 模型名 | `gemma-4-12B`(Ollama 官方库 `gemma4:12b`;GGUF 由 **bartowski/gemma-4-12B-it-GGUF** 提供,ggml-org 官方仓库无 12B) |
-| 架构/参数量 | `gemma4` 架构,11.9B,dense(非 MoE);词表 262K;Gemma 3 12B 的直接继任者 |
-| 模态 | **Text + Image**(视觉 projector 独立文件,clip 架构 52.4M 参数 / 175MB BF16);音频仅 E2B/E4B 支持 |
-| 上下文 | 256K(设计值;8GB 显存下必须大幅限制,见 2.3) |
-| 量化 | Q4_K_M 权重 **7.4GB** + mmproj **175MB** ≈ 7.6GB |
-| 支持状态 | **llama.cpp 完整支持**(本项目 vendored 子模块 `android/app/src/main/cpp/llama.cpp` 已含:`LLM_ARCH_GEMMA4`、visual/audio projector 类型 gemma4v/gemma4a、conversion 脚本、聊天模板) |
-| Ollama 名称 | `gemma4:12b`(⚠️ `gemma4:latest` 是 9.6GB 的 E4B 档,不是 12B) |
+| 模型名 | Google Gemma 4 12B Unified；Ollama 固定标签 `gemma4:12b` |
+| 架构/参数量 | `gemma4`，11.9B，Ollama 模型 ID `4eb23ef187e2` |
+| 模态 | 官方为 Text + Image + Audio → Text；G4.1 只开放 Text + Image，音频尚无 QLH 契约 |
+| 上下文 | 262144；当前 8GB 开发门使用 2K/4K smoke，不把 256K 设计上限当本机可用承诺 |
+| 量化/工件 | Q4_K_M；Ollama 清单显示 7.6GB，运行时 `ollama ps` 显示约 9.9GB 工作集 |
+| 本机支持状态 | Ollama 0.32.8 已实测 completion/vision/audio/tools/thinking；QLH G4.1 已实测 OpenAI `image_url` |
+| 原生支持状态 | vendored llama.cpp 源码存在 Gemma 4 符号，但 `llama-cpp-python 0.3.28` 的模型加载、多模态 handler 和打包 ABI 尚未验收，保持 Candidate |
+| 标签边界 | `gemma4:latest` 当前指向 E4B；12B 必须显式写 `gemma4:12b` |
 
-### 2.2 本机部署现状(已实测)
+### 2.2 本机部署现状（2026-08-11 已实测）
+
+```text
+ollama 0.32.8
+gemma4:12b  4eb23ef187e2  7.6 GB
+architecture=gemma4  parameters=11.9B  quantization=Q4_K_M
+capabilities=completion/vision/audio/tools/thinking
+projector=clip 52.38M
+```
+
+- 下载：只给 `ollama pull gemma4:12b` 子进程注入 `HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:7897`，耗时约 886.9 秒；未修改系统或项目全局代理。
+- 文本：`think=false` 后返回精确 `GEMMA4_OK`；首次加载约 12.9 秒，热请求总计约 1.46 秒。
+- 图像：Ollama 原生 API 能正确描述测试图标；QLH `ExternalChatClient` 经 `/v1/chat/completions`、`reasoning_effort=none` 返回合理描述，`finish_reason=stop`，93 prompt + 19 completion tokens。
+- 资源：驻留时 `ollama ps` 为 `56% CPU / 44% GPU`；RTX 4060 Laptop 8GB 当时显存占用约 6248MiB。该证据证明可运行，不代表 256K 上下文可用。
 
 > ⚠️ **`myheretic:latest` 是用户私人微调模型,不是原版**:
 > 它是用户基于 gemma-4-12B 私人微调导入的版本,行为与官方原版**不一定一致,不具备通用能力**。
@@ -70,16 +82,16 @@ $ ollama show myheretic
 - `myheretic:latest` 是用户私人微调版 gemma-4-12B Q4_K_M(自定义 tag),**非官方原版权重**;多模态实验以原版为基线。
 - **缺 vision 的原因**:导入的 GGUF 未附带 `mmproj-*.gguf`(视觉投影器),Ollama 据此判定为非多模态。
 - **结论**:现有 `myheretic` 不可作为多模态实验模型——**必须重新获取原版模型**(路线 A1 拉官方 tag,或路线 B 下载原版 GGUF)。
-- Ollama 服务在运行,OpenAI 兼容端点可用(已实测 `GET http://localhost:11434/v1/models` 返回模型列表)。
+- Ollama 服务与 OpenAI 兼容端点均已实测；QLH 配置的 base URL 必须是 `http://127.0.0.1:11434`，由 `IslandEngine` 自行追加 `/v1/*`。
 
 ### 2.3 硬件可行性(RTX 4060 8GB)
 
 | 约束 | 结论 |
 |---|---|
-| 显存 | 权重 7.4GB + projector + KV cache + 计算缓冲 > 8GB,**必然 CPU offload**(Ollama 默认自动分配,能塞多少层进 GPU 塞多少) |
-| 上下文 | 256K 在 8GB 下不可行;**必须限制**,建议 8K–16K(`OLLAMA_CONTEXT_LENGTH` 或 `num_ctx`) |
-| 速度 | 估算 8–15 tok/s(部分 offload 后),可交互但非流畅;纯 GPU 理论 15–25 tok/s(无实测) |
-| 结论 | **可运行,定位为"实验/验证型"模型**,不适合高吞吐生产路径 |
+| 显存/内存 | 实测由 Ollama 自动分配为 56% CPU / 44% GPU；不得宣称 8GB 可全 GPU 驻留 |
+| 上下文 | 当前只验收 2K/4K；8K–16K 和长会话 OOM 必须在 G4.2 单独取数，256K 不进入本机承诺 |
+| 时延 | 文本热请求约 1.46 秒；图像原生 smoke 总计约 24.4 秒，其中模型加载约 13.1 秒、图像 prompt 约 10.0 秒 |
+| 结论 | 可作为单用户实验/验证模型；高并发、长上下文、音频与分布式均未验收 |
 
 ---
 
@@ -87,30 +99,31 @@ $ ollama show myheretic
 
 | 层 | 现状 | 新增 gemma-4-12B 需要的改动 |
 |---|---|---|
-| 模型注册 | `src/model_config.py:85` `BUILTIN_MODELS` 8 槽全文本 | 加 `ModelConfig(model_type="gguf", ...)`(或 DB 注册) |
-| llama_cpp 引擎 | `src/llama_engine.py` 的 `Llama(model_path=...)` **无 mmproj 参数** | 加 mmproj 加载 + 图像预处理(仅路线 B 需要) |
-| 外部 Provider(引擎) | `src/external_provider.py` 完整可用,`QLH_EXTERNAL_*` 配置(`src/config.py:211-229`),OpenAI 兼容消息构造 `_build_stage_messages`(:742) | **消息为纯文本,无 image 字段** → 需透传图像消息 |
-| chat 契约 | `src/api_server.py` / `src/inference_service` 请求模型无 image 字段 | 需支持 `content` 数组 / `image_url`(OpenAI 风格) |
-| control 同步 | `control/src/data/model-registry-store.ts:29-39` `BUILTIN_MODEL_IDS` 与 8 槽对齐 | 加模型 id(内置时) |
-| Ollama 集成 | 项目自身**无** Ollama 调用代码(仅远期对标,`docs/一键模型部署与自治集群远期计划.md:958-963`) | 方案 A 通过通用 OpenAI 兼容端点接入,无需 Ollama 专属代码 |
+| 模型发现 | `external_api` 通过 `/v1/models` 发现 `gemma4:12b`，不伪装成本地 GGUF 注册项 | G4.1 Completed；状态继续标记 `engine=external_api` |
+| 外部 Provider | `IslandEngine` 保持 OpenAI 兼容传输，支持结构化 `content` 和可选 `reasoning_effort` | G4.1 Completed；未添加 Ollama 私有客户端 |
+| chat 契约 | `image_data_urls` 最多 4 张，只接受 PNG/JPEG/WebP data URL；单张 8MiB、总计 16MiB | G4.1 Completed；远程 URL、SVG、MIME 伪装和无显式授权均拒绝 |
+| 安全/持久化 | 图片必须 `allow_external=true + prefer_external=true`；scope deny/端点失败均禁止丢图回退 | G4.1 Completed；历史和 SQLite 只保存文字问题/回复，不保存原图 |
+| 前端/TUI | 当前请求层尚无图片选择器、预览或大小提示 | G4.2 Ready |
+| 原生 llama_cpp | 当前 Python 绑定仍按纯文本 `Llama(model_path=...)` 加载 | G4.3 Candidate；先验 ABI/handler/打包再定工件方案 |
 
 ---
 
 ## 4. 方案 A:Ollama 外部 Provider 接入(快速验证,改动最小)
 
-**思路**:本机 Ollama 已运行且 OpenAI 兼容端点可用(`http://localhost:11434/v1`),QLH 的外部 Provider(`external_api` 引擎,即外部 Provider 接入指南中的路线 B——注意与本文方案 B 命名无关)正好对接——**零新引擎**,只需补齐"带 projector 的原版模型"与"图像消息透传"两处。
+**思路**：本机 Ollama 已运行且 OpenAI 兼容端点可用；QLH 继续复用 `external_api`，只扩展通用 OpenAI 结构化消息，不增加 Ollama 专属引擎。
 
-> 注意:本方案的"零模型文件下载"优势**已不成立**——现有 `myheretic` 是私人微调版,不能当原版用,**必须先拉取原版 `gemma4:12b`**。因此方案 A 定位为**快速验证通道**,最终落地以路线 B 为准(见第 6 节)。
+> G4.1 已完成官方模型下载和后端接线。该路线目前是唯一实机通过的 Gemma 4 路径，也是 G4.2 产品交互的基线。
 
 ### 4.1 前置:获取带 vision 的**原版** gemma-4-12B
 
-唯一途径(原版,自带 175MB projector):
+已完成命令（代理只作用于当前子进程）：
 
-- **A1**:拉官方多模态 tag:
-  ```bat
-  ollama pull gemma4:12b
-  ollama show gemma4:12b   :: Capabilities 应含 vision
-  ```
+```powershell
+$env:HTTP_PROXY='http://127.0.0.1:7897'
+$env:HTTPS_PROXY='http://127.0.0.1:7897'
+ollama pull gemma4:12b
+ollama show gemma4:12b
+```
 
 > ~~A2(复用现有 myheretic 重建)~~ **已废弃**:myheretic 是私人微调版,即便补上 mmproj 重建,得到的仍是微调版的视觉能力,**不具备通用能力**,不满足实验基线,不再提供该路径。
 
@@ -118,55 +131,53 @@ $ ollama show myheretic
 
 ```bat
 set QLH_EXTERNAL_ENABLED=true
-set QLH_EXTERNAL_BASE_URL=http://localhost:11434/v1
+set QLH_EXTERNAL_BASE_URL=http://127.0.0.1:11434
 set QLH_EXTERNAL_MODEL=gemma4:12b        :: 原版(唯一选择)
-set QLH_EXTERNAL_DATA_SCOPE=allow_all    :: 本机 Ollama,数据不出本机;按需收紧为 opt_in
+set QLH_EXTERNAL_DATA_SCOPE=opt_in       :: 请求仍需 allow_external=true
+set QLH_EXTERNAL_REASONING_EFFORT=none   :: 避免 thinking 占满短回复预算
 set QLH_EXTERNAL_LABEL=gemma-4-12B(Ollama 本机)
 ```
 
 对应实现:`src/config.py:211-229`;端点健康检查、故障回退、流式等均已支持(`docs/外部推理服务Provider接入指南.md`)。
 
-### 4.3 图像消息管线改造(多模态的关键工作)
+### 4.3 图像消息管线（G4.1 Completed）
 
-QLH 全链路目前无图像消息。需三处小改:
+后端已完成：
 
-1. **chat 请求契约**:允许消息 `content` 为 `str | list[{type:"text"|"image_url", ...}]`(OpenAI 风格),新增可选 `images: [base64]` 字段透传(api_server 与 inference_service 双侧)。
-2. **external_provider 消息构造**(`src/external_provider.py:742 _build_stage_messages`):把上游图像字段转换为 OpenAI `image_url`(`data:image/...;base64,...`)并入 messages。
-3. **前端/TUI**(可选):聊天输入附加图片按钮(纯 API 验证阶段可跳过)。
+1. `api_server.ChatRequest` 与 `inference_service.protocol.ChatRequest` 新增 `image_data_urls`，两侧同一校验口径。
+2. `multimodal.py` 只接受内联 PNG/JPEG/WebP，校验 base64、文件签名、数量和大小；不接受远程 URL，避免由推理端代取任意地址。
+3. `external_provider` 与 `IslandEngine` 保留 OpenAI `content[]/image_url`，不再把数组 `str()`；`reasoning_effort` 仅在显式配置时发送。
+4. 带图请求必须显式授权外部路由；外部被禁、失败或 scope deny 时明确失败，不降级到忽略图片的本地文本推理。
+5. 会话标题、追问、内存历史与 SQLite 仅记录文字问题和模型回复；原图 data URL 不持久化。
+
+G4.2 剩余：Web/TUI 图片选择、预览、删除、大小提示、发送状态和实际 `/api/chat` 浏览器验收。
 
 > 注:gemma4 的视觉 token 预算默认约 512(可调 70–1120),低分辨率即可,图片不必预处理成高清。
 
 ### 4.4 落地步骤
 
-1. 按 4.1 获取带 vision 模型,`ollama run gemma4:12b "描述这张图片: <图片路径>"` 先人工验证。
-2. 按 4.2 配置环境变量,重启后端。
-3. 按 4.3 实现图像消息透传(预估 1–2 个文件,几十行)。
-4. 按第 7 节验证清单跑通。
+1. [x] 经 7897 子进程代理获取官方 `gemma4:12b` 并核对模型能力。
+2. [x] Ollama 原生文本、图像与 OpenAI `image_url` smoke。
+3. [x] QLH 结构化消息、reasoning 配置、数据作用域、禁止丢图回退和零图片持久化。
+4. [ ] G4.2 Web/TUI 产品交互与 8K/16K 长会话资源门。
 
 ---
 
-## 5. 方案 B:原生 llama_cpp 接入(推荐,原生化)
+## 5. 方案 B：原生 llama_cpp 接入（G4.3 Candidate）
 
-**思路**:不走 Ollama,从 HF 下载**原版** GGUF + mmproj 直接放进 `models/`,扩展 llama_cpp 引擎支持多模态。原版权重保证通用能力,完全内聚于项目、可纳入分布式调度,是本次多模态实验的**最终落地路线**。
+原生化仍有长期价值，但当前不能仅凭 vendored llama.cpp 中出现 `LLM_ARCH_GEMMA4` 就宣称 Python 运行时可用。必须同时冻结官方/可信工件 revision、视觉/音频 handler、`llama-cpp-python` 版本、Windows/Linux 打包 ABI 和与 Ollama 基线一致的输出。
 
 ### 5.1 文件放置(原版,需下载)
 
-```
-models/
-  gemma-4-12b-it-Q4_K_M.gguf            (7.4GB, bartowski/gemma-4-12B-it-GGUF 原版)
-  mmproj-gemma-4-12B-it-Q4_K_M.gguf     (175MB, 同仓库原版)
-```
-
-> 约 7.6GB,按项目红线在**家用宽带**下载;下载后可用现有 sha256 校验管线核对(原版仓库发布页有 checksum)。
+当前不冻结文件名和仓库，也不启动第二份 7GB 级下载。G4.3 先用 resolver 读取候选仓库的固定 revision、许可、文件关系和 SHA/LFS 元数据，再决定单 GGUF、projector/handler 配对或官方 QAT 工件方案。
 
 ### 5.2 代码改动点清单
 
-1. **注册**:`src/model_config.py:85` `BUILTIN_MODELS` 加 `ModelConfig(model_type="gguf", gguf_path="models/gemma-4-12b-it-Q4_K_M.gguf", quant_types=["Q4_K_M"], is_experimental=True)`;同步 `control/src/data/model-registry-store.ts:29` `BUILTIN_MODEL_IDS`。
-2. **引擎 mmproj**:`src/llama_engine.py` 加载处加 `mmproj=...` 参数(llama-cpp-python 支持),并新增图像→`content` 数组的调用封装;`src/inference_service/engine_host.py:3054` 的自动加载逻辑同步。
-3. **GGUF 自动发现**(`src/llama_engine.py:455-503`)会优先挑 Q4_K_M,gemma 文件可直接被现有逻辑发现,但多模态模型必须显式配对 mmproj(按文件名前缀匹配 `mmproj-*`)。
-4. **curated-catalog(可选)**:`control/src/data/curated-catalog.ts:20` 加 recipe(HF 仓库 + 固定 revision + `allow_patterns` 限定上述两文件)。
-5. **图像预处理**:gemma4 视觉编码在 llama.cpp 侧完成(clip),引擎侧只需传入原始图像字节,工作量主要在消息契约(同 4.3 第 1 点)。
-6. **硬件约束**:llama-cpp-python 侧需 `n_gpu_layers` 调低(offload 策略)、`n_ctx` 限制 8K–16K,与 2.3 一致。
+1. 锁定上游 llama.cpp revision 与相容的 `llama-cpp-python` wheel/source build，新增 capability probe，不以导入成功代替 multimodal 可用。
+2. 对候选工件执行固定 revision resolve、许可确认、SHA 校验和现有 sidecar admission；未知 projector/handler 关系 fail-closed。
+3. 扩展 `llama_engine.py` 的模型/聊天 handler，而不是向 `Llama()` 猜测传入未经当前绑定支持的 `mmproj` 参数。
+4. 与本票相同测试图做 Ollama vs 原生语义对照，再补取消、卸载、8K/16K OOM、CPU/GPU offload 和打包门。
+5. 只有上述门通过后才新增 `model_config`/curated recipe 并允许分布式调度选择。
 
 ---
 
@@ -174,27 +185,35 @@ models/
 
 | 维度 | 方案 A(Ollama Provider) | 方案 B(原生 llama_cpp) |
 |---|---|---|
-| 模型获取 | 需先拉原版 `gemma4:12b`(7.4GB+175MB) | HF 下载原版 7.6GB + 手动放置 |
-| 代码改动 | 图像消息透传(1–2 文件) | 引擎 mmproj + 注册 + 发现 + catalog(4–6 处) |
-| 落地时间 | 小时级(快速验证) | 1–2 天(正式落地) |
-| 模型通用性 | 原版 `gemma4:12b`,✅ 通用 | 原版 bartowski GGUF,✅ 通用 |
-| 与分布式调度 | 走 `external_api` 引擎,统计如实标注 | 走 `llama_cpp` 引擎,可纳入任务图 |
-| 回滚 | 关环境变量即回滚 | 需改代码 |
-| 适用阶段 | **快速验证多模态能力** | **正式补全多模态实验(推荐)** |
+| 模型获取 | 官方 `gemma4:12b` 已下载并验收 | 来源/revision/文件关系尚未冻结 |
+| 当前状态 | **G4.1 Completed** | **G4.3 Candidate** |
+| 代码范围 | 通用结构化 OpenAI 消息 + 显式 reasoning 配置 | Python handler、ABI、工件、打包和调度均需验证 |
+| 模型能力 | Text/Image 已由 QLH 实测；Audio 尚未开放 | 未实测，不作能力承诺 |
+| 与分布式调度 | `external_api` 整请求，统计如实标注 | 通过 G4.3 后才可作为 `llama_cpp` 候选 |
+| 回滚 | 关闭 `QLH_EXTERNAL_ENABLED` 即回滚 | 需版本与工件级回滚 |
 
-**推荐:走路线 B(下载原版模型,原生接入)**。理由:现有 `myheretic` 是私人微调版、不具备通用能力,方案 A 的"复用现有模型"优势已不存在;路线 B 用原版权重保证实验结论可信,且模型内聚于项目、可纳入分布式调度。路线 A 可作**快速验证通道**提前确认多模态管线(需先 `ollama pull gemma4:12b` 原版),验证结论写入 `docs/一键模型部署与自治集群远期计划.md` 的多模态条目后,再实施路线 B。
+**当前推荐：以路线 A 作为产品基线推进 G4.2。** 它已经使用官方原版工件并完成实机图像调用，不再只是临时 PoC。路线 B 不因“原生化”自动获得优先级，只有在安装体积、时延、分布式调度或离线交付上给出明确收益且通过 ABI/工件门后再实施。
+
+### 6.1 分期票
+
+| 子票 | 状态 | 范围 | 完成判据 |
+|---|---|---|---|
+| G4.1 后端与官方模型门 | Completed（2026-08-11） | 官方模型下载、文本/图像 smoke、结构化消息、reasoning、大小/格式/作用域边界、零图片持久化 | 定向 `160 passed`；QLH Provider 真实图片返回非空描述；全量（测试进程 `NO_PROXY=*`）`1908 passed / 26 skipped / 2 failed`，失败仅为当前 WSL 无法访问 `/g/...` 的 Linux env-register 路径 |
+| G4.2 Web/TUI 图片交互 | Ready | 选择/预览/删除图片，发送状态，4 图/8MiB/16MiB 提示，API 错误展示 | 前端单测、浏览器桌面/移动、实际 Gemma 图像会话；8K/16K 资源取数 |
+| G4.3 原生/音频/分布式 | Candidate | llama.cpp Python ABI 与 handler、固定工件 recipe、音频契约、调度和打包 | 与 Ollama 对照一致；Windows/Linux、取消/卸载/OOM/离线包全门通过 |
 
 ---
 
 ## 7. 多模态实验补全验证清单
 
-- [ ] **模型基线为原版**:`ollama show gemma4:12b`(或 models/ 下 bartowski 原版 GGUF)的 Capabilities 含 **vision**;全程不使用私人微调版 `myheretic`
-- [ ] `curl http://localhost:11434/v1/chat/completions` 以 `image_url`(base64)发送测试图,返回合理图文描述
-- [ ] QLH 配置 `QLH_EXTERNAL_*` 后,`/api/models/available` 与前端健康检查显示 `external_api` 引擎可达
-- [ ] QLH chat 接口带图调用 gemma-4-12B,输出与 Ollama 直调一致
-- [ ] 图像理解用例:给定一张图(如 fixtures 中任一样例图),能回答图中物体/场景;中文提问可用
+- [x] 模型基线为官方 `gemma4:12b`，Capabilities 含 vision/audio；未使用 `myheretic`
+- [x] Ollama OpenAI 兼容端点接受 base64 `image_url`；默认 thinking 的空正文风险已有实测
+- [x] QLH Provider 携带 `reasoning_effort=none` 后，带图请求返回非空合理描述
+- [x] 远程 URL/SVG/MIME 伪装/超限/未授权/丢图回退均有拒绝测试
+- [x] 图片不进入会话历史与 SQLite 持久化参数
+- [ ] G4.2 实际 Web/TUI 图片会话与桌面/移动浏览器验收
 - [ ] 上下文限制生效:8K 上下文下连续多轮对话不 OOM
-- [ ] 性能基线记录:首 token 延迟、tok/s(8GB 显存 offload 预期 8–15 tok/s),写入实验记录
+- [x] 2K/4K smoke 的加载、图像 prompt、资源分配基线已记录；8K/16K 待 G4.2
 
 **实验矩阵补全后形态**(多模态实验 = 三模态闭环):
 
@@ -206,22 +225,24 @@ models/
 
 ## 8. 风险与注意事项
 
-1. **8GB 显存是硬约束**:权重 7.4GB + projector 后几乎满载,ollama 默认行为可能 OOM,务必限制 `OLLAMA_CONTEXT_LENGTH`(建议 8192–16384);OOM 时降低 `num_ctx` 或调低 `OLLAMA_NUM_GPU` 让更多层跑 CPU。
-2. **`gemma4:latest` ≠ 12B**:官方 latest tag 是 E4B(9.6GB),拉取时必须显式 `gemma4:12b`。
-3. **`myheretic` 是私人微调版,不是原版**:它是用户私人微调模型,行为与官方原版**不一定一致、不具备通用能力**,不能作为多模态实验的验证基线;多模态实验必须用原版(`ollama pull gemma4:12b` 或 bartowski 原版 GGUF),不要基于 myheretic 重建。
+1. **8GB 显存是硬约束**：当前实测 56% CPU / 44% GPU；8K/16K 未过门前不要提高默认上下文，更不能启用 256K。
+2. **`gemma4:latest` 不是 12B**：必须显式使用 `gemma4:12b`。
+3. **`myheretic` 是私人微调版，不是原版**：它不能作为项目多模态验收基线；G4.1 只使用官方 `gemma4:12b`，G4.3 的直接工件需重新冻结来源。
 4. **Ollama keep_alive**:默认模型驻留 5 分钟后卸载,连续实验建议 `OLLAMA_KEEP_ALIVE=-1` 或调用时传 `keep_alive` 参数,避免反复加载。
 5. **端口占用**:Ollama 占 11434;若 QLH 后端或其他服务也用此端口需调整(`OLLAMA_HOST`)。
 6. **外部 Provider 数据门控**:`QLH_EXTERNAL_DATA_SCOPE` 默认 `opt_in`;本机 Ollama 场景可 `allow_all`,但若日后指向远端实例务必收紧。
-7. **路线 B 依赖 llama-cpp-python 版本**:确认其绑定版本支持 gemma4 架构与 mmproj(项目 vendored llama.cpp 已支持,Python 绑定需同步升级)。
-8. **unsloth 仓库未经验证**:12B GGUF 以 **bartowski/gemma-4-12B-it-GGUF** 为准,不要引用未验证的镜像仓库。
+7. **reasoning 默认值**：Ollama OpenAI 端点默认 thinking 时，小 `max_tokens` 可能只有 reasoning、正文为空；Gemma 4 本机配置固定 `QLH_EXTERNAL_REASONING_EFFORT=none`，其他 Provider 留空不发送。
+8. **路线 B 未冻结**：不得把 vendored 源码符号当成 Python/打包支持，也不得在未固定 revision、许可和 SHA 前新增一键 recipe。
 
 ---
 
 ## 9. 参考
 
-- Ollama 官方库 `gemma4:12b`(原版):https://ollama.com/library/gemma4
-- bartowski/gemma-4-12B-it-GGUF(原版,HF,Q4_K_M + mmproj,带 checksum)
+- Google Gemma 模型总览：https://ai.google.dev/gemma/docs
+- Google Gemma 4 模型说明：https://ai.google.dev/gemma/docs/core
+- Google Gemma 发布记录：https://ai.google.dev/gemma/docs/releases
+- Ollama 官方库 `gemma4:12b`：https://ollama.com/library/gemma4
 - 模型基线约定:`myheretic:latest` 为私人微调版,不具备通用能力,仅作架构可行性参考,不作为实验模型
-- 项目 vendored llama.cpp 多模态文档:`android/app/src/main/cpp/llama.cpp/docs/multimodal.md`、`docs/multimodal/gemma3.md`(gemma4 支持已并入)
+- 项目 vendored llama.cpp 仅作为 G4.3 候选证据，不代表当前 Python 运行时已支持
 - 外部 Provider 接入:`docs/外部推理服务Provider接入指南.md`
 - 多模态远期规划:`docs/一键模型部署与自治集群远期计划.md`(:309,:340,:958-963)
