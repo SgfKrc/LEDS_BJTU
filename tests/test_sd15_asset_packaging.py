@@ -68,8 +68,10 @@ def synthetic_spec(tmp_path, monkeypatch):
         preset_id="sd15_synthetic_v1",
         files=files,
     )
-    # 资产根目录映射到 tmp_path/models（target_path() = 根 + local_dir）
+    # 资产根目录映射到 tmp_path/models（target_path() = 根 + local_dir）；
+    # verify_asset_directory 内部按 asset_id 查 spec，patch 到合成 spec
     monkeypatch.setattr(assets_mod, "_app_root", lambda: tmp_path / "models")
+    monkeypatch.setattr(assets_mod, "get_asset_spec", lambda aid: spec if aid == spec.asset_id else None)
     return spec
 
 
@@ -104,10 +106,19 @@ class TestPackageAsset:
                 source = tmp_path / "models" / "sd15-synthetic-v1" / entry["path"]
                 assert zf.read(entry["path"]) == source.read_bytes()
 
-    def test_missing_license_fails_closed(self, synthetic_spec, tmp_path):
-        spec = replace(synthetic_spec, license_id="openrail")  # 原文待补 → 必须拒绝打包
+    def test_missing_license_fails_closed(self, synthetic_spec, tmp_path, monkeypatch):
+        # 把 mit 映射到不存在的文件 → 必须拒绝打包
+        monkeypatch.setattr(pack, "LICENSE_MAP", {**pack.LICENSE_MAP, "mit": "MISSING.txt"})
         with pytest.raises(SystemExit, match="许可证原文缺失"):
-            pack.package_asset(spec, tmp_path / "out", check_hashes=True, dry_run=False)
+            pack.package_asset(synthetic_spec, tmp_path / "out", check_hashes=True, dry_run=False)
+
+    def test_openrail_license_now_available(self, tmp_path):
+        # OPENRAIL 原文已入库，映射指向真实文件
+        assert (pack.LICENSE_DIR / "OPENRAIL.txt").is_file()
+        text = (pack.LICENSE_DIR / "OPENRAIL.txt").read_text(encoding="utf-8")
+        assert text.startswith("BigScience Open RAIL-M License")
+        assert "Attachment A" in text
+        assert "arbitrarily-targeted use" in text
 
     def test_missing_file_fails_closed(self, synthetic_spec, tmp_path):
         (tmp_path / "models" / "sd15-synthetic-v1" / "model_index.json").unlink()
