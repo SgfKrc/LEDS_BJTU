@@ -127,6 +127,8 @@ def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
         )
     if lower.endswith(".zip") and "qlh-launcher" in lower:
         return "windows", "any", "x86_64", "launcher"
+    if lower.endswith(".zip") and "qlh-sd15-assets-" in lower:
+        return "any", "any", "any", "sd15-asset"
     if lower.endswith(".exe") and "qlh-launcher-setup" in lower:
         return "windows", "any", "x86_64", "launcher-setup"
     if lower.endswith(".exe") and "qlh-edge-inference-setup" in lower:
