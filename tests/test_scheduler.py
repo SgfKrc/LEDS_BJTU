@@ -616,12 +616,6 @@ class TestGetLayerAssignments:
     @pytest.fixture
     def sched(self):
         s = Scheduler()
-        # ★ 清除 DB 缓存的层分配（避免其他测试/真实运行的旧数据污染）
-        from db import set_layer_assignments as _clear_cache
-        try:
-            _clear_cache({})
-        except Exception:
-            pass
         s.nodes = {
             "master": NodeInfo(
                 node_id="master", role="master", state=NodeState.ONLINE,
@@ -739,11 +733,6 @@ class TestAndroidNodeManagement:
                 del s.nodes[nid]
             except Exception:
                 pass
-            try:
-                from db import delete_node
-                delete_node(nid)
-            except Exception:
-                pass
 
     def test_manual_register_android_node(self, sched):
         """手动注册 Android 节点应保存 node_type=android 且初始离线。"""
@@ -805,6 +794,8 @@ class TestAndroidNodeManagement:
         assert invite["has_capacity"] is True
         assert invite["node_count"] == 1
         assert invite["total_node_records"] >= 1
+        assert invite["discovery_methods"] == ["local_config", "tailnet"]
+        assert "db_registered" not in invite
 
     def test_delete_node_rejects_master_and_missing(self, sched):
         """删除 master / 不存在节点应返回明确状态。"""
@@ -4026,6 +4017,24 @@ class TestCheckMasterHealthTcp:
         assert result["tcp_connected"] is True
         assert result["master_host"] == "100.64.0.10"
 
+    def test_disconnected_client_uses_local_connection_target(self, sched):
+        """断线不得查询旧数据库，仍应保留本机的重连目标。"""
+        sched._role_override = "client"
+        sched._tcp_client = type("MockTCPClient", (), {
+            "is_registered": False,
+            "_running": False,
+            "server_host": "100.64.0.10",
+            "server_port": 8888,
+            "sock": None,
+        })()
+
+        result = sched.check_master_health()
+
+        assert result["master_online"] is False
+        assert result["source"] == "tcp_disconnected"
+        assert result["master_host"] == "100.64.0.10"
+        assert result["master_port"] == 8888
+
 
 # ================================================================
 # GPU 选择与评分测试 — 多 GPU / 独显/集显混合场景
@@ -5045,6 +5054,50 @@ class TestProvisionalMasterRole:
         assert sched._effective_role() == "master"
 
 
+class TestLocalMasterIdentity:
+    """Main-node identity must be fully owned by its local SQLite store."""
+
+    def test_verify_and_reset_identity_without_postgresql(self, monkeypatch, tmp_path):
+        import local_store
+
+        sqlite_path = tmp_path / "qlh-control.sqlite3"
+        monkeypatch.setenv("QLH_SQLITE_PATH", str(sqlite_path))
+        local_store._initialized_paths.clear()
+
+        sched = Scheduler()
+        sched._role_override = "master"
+        sched._mac_addresses = ["AA-BB-CC-DD-EE-FF"]
+
+        sched._verify_master_identity()
+        assert sched._master_identity_verified is True
+        assert sched._master_identity_reason == "first_run"
+        assert local_store.get_local_master_identity()["mac_addresses"] == [
+            "aa-bb-cc-dd-ee-ff",
+        ]
+
+        sched._verify_master_identity()
+        assert sched._master_identity_verified is True
+        assert sched._master_identity_reason == "match"
+
+        sched._mac_addresses = ["11:22:33:44:55:66"]
+        sched._verify_master_identity()
+        assert sched._master_identity_verified is False
+        assert sched._master_identity_reason == "mac_mismatch"
+
+        result = sched.reset_master_identity()
+        assert result["status"] == "ok"
+        assert sched._master_identity_reason == "reset"
+        assert local_store.get_local_master_identity()["mac_addresses"] == [
+            "11:22:33:44:55:66",
+        ]
+
+    def test_invite_reports_tailnet_address_source(self):
+        sched = Scheduler()
+        sched._lan_ip = "100.88.9.10"
+
+        assert sched.get_invite_info()["master_host_source"] == "tailnet"
+
+
 # ================================================================
 # Phase 7 P1: compute_layer_assignment 边界测试
 # ================================================================
@@ -5315,8 +5368,7 @@ class TestForwardInferenceRequestId:
         assert sched._client_pending_events == {}
         assert sched._client_pending_results == {}
 
-    @patch("db.save_message")
-    def test_forwarded_success_is_sent_before_task_cleanup_regression(self, mock_save):
+    def test_forwarded_success_is_sent_before_task_cleanup_regression(self):
         sched = Scheduler()
         sent = []
         finished = threading.Event()

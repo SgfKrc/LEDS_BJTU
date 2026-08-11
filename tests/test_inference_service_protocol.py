@@ -862,12 +862,12 @@ class FakeExternalClient:
 
 
 def test_external_chat_routes_and_persists(monkeypatch):
-    import db
+    import local_store
     import external_provider
 
     fake_client = FakeExternalClient()
     monkeypatch.setattr(external_provider, "get_external_chat_client", lambda: fake_client)
-    monkeypatch.setattr(db, "get_save_history", lambda: False)  # 测试不落盘
+    monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)  # 测试不落盘
 
     host = FakeEngineHost()
     host._host._db_available = True  # 避免走 local_store 落盘分支
@@ -890,7 +890,7 @@ def test_external_chat_routes_and_persists(monkeypatch):
 
 
 def test_external_chat_strips_thinking_when_disabled(monkeypatch):
-    import db
+    import local_store
     import external_provider
 
     class ThinkingClient(FakeExternalClient):
@@ -898,7 +898,7 @@ def test_external_chat_strips_thinking_when_disabled(monkeypatch):
             return {"content": "<think>内部</think>外部回答"}
 
     monkeypatch.setattr(external_provider, "get_external_chat_client", lambda: ThinkingClient())
-    monkeypatch.setattr(db, "get_save_history", lambda: False)
+    monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
 
     host = FakeEngineHost()
     host._host._db_available = True
@@ -1166,9 +1166,9 @@ def test_task_graph_auto_remote_identity_path(monkeypatch):
 
 def test_chat_full_llama_cpp_path(monkeypatch):
     """llama.cpp 引擎整请求路径：历史维护 + metrics + followups 兜底。"""
-    import db
+    import local_store
 
-    monkeypatch.setattr(db, "get_save_history", lambda: False)  # 不落盘
+    monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)  # 不落盘
 
     host = make_full_host()
     host._active_session_id = "s1"
@@ -1196,9 +1196,9 @@ def test_chat_full_llama_cpp_path(monkeypatch):
 
 def test_chat_full_session_switch(monkeypatch):
     """session_id 切换 → _switch_session 加载目标会话。"""
-    import db
+    import local_store
 
-    monkeypatch.setattr(db, "get_save_history", lambda: False)
+    monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
 
     host = make_full_host()
     host._active_session_id = "s_old"
@@ -1233,10 +1233,10 @@ def test_chat_full_first_message_auto_title(monkeypatch):
 def test_chat_full_external_fallback(monkeypatch):
     """外部路由失败（无本地模型）→ prefer_external 时 502。"""
     import config as _cfg
-    import db
+    import local_store
     import external_provider
 
-    monkeypatch.setattr(db, "get_save_history", lambda: False)
+    monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
     _cfg.EXTERNAL_ENABLED = True
     _cfg.EXTERNAL_BASE_URL = "https://example.com/v1"
     _cfg.EXTERNAL_DATA_SCOPE = "opt_in"
@@ -1315,9 +1315,9 @@ class FakePyTorchModel(FakeModel):
 
 def test_chat_full_pytorch_path(monkeypatch):
     """PyTorch 引擎路径：generate + 解码 + 追问 + 持久化。"""
-    import db
+    import local_store
 
-    monkeypatch.setattr(db, "get_save_history", lambda: False)
+    monkeypatch.setattr(local_store, "get_local_save_history", lambda: False)
 
     host = make_full_host(FakePyTorchModel)
     host._active_session_id = "s1"

@@ -25,6 +25,7 @@ import time
 import hashlib
 import hmac
 import io
+import ipaddress
 import os
 import select
 import subprocess
@@ -335,6 +336,20 @@ def detect_lan_ip() -> str:
         IP 地址字符串，检测失败返回 "127.0.0.1"
     """
 
+    def _usable_unicast_address(value: str) -> bool:
+        """Reject loopback, APIPA/link-local and other non-advertisable addresses."""
+        try:
+            address = ipaddress.ip_address(value.split("%", 1)[0])
+        except ValueError:
+            return False
+        return not any((
+            address.is_loopback,
+            address.is_link_local,
+            address.is_unspecified,
+            address.is_multicast,
+            address.is_reserved,
+        ))
+
     # ---- 策略 1: 优先检测 Tailscale / ZeroTier 虚拟组网 IP ----
     #   Tailscale 使用 100.64.0.0/10 (CGNAT) 地址段，接口名含 "tailscale"
     #   ZeroTier 接口名含 "zerotier"
@@ -345,7 +360,8 @@ def detect_lan_ip() -> str:
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
 
-            # 检测 Tailscale / ZeroTier 接口
+            # Tailscale 接口名称本身不足以证明地址可用于 Tailnet：未登录时
+            # Windows 会留下 169.254/16 链路本地地址，不能被广告给其他节点。
             overlay_keywords = ('tailscale', 'zerotier', 'zt')
             # 100.64.0.0/10 范围: 100.64.0.0 ~ 100.127.255.255
             _TAILSCALE_LO = 0x64400000   # 100.64.0.0
@@ -365,7 +381,7 @@ def detect_lan_ip() -> str:
                     if addr.family not in (_sock.AF_INET, _sock.AF_INET6):
                         continue
                     ip = addr.address
-                    if ip.startswith("127.") or ip == "::1":
+                    if not _usable_unicast_address(ip):
                         continue
                     # 100.64.0.0/10 范围的 IP 也视为 overlay（即使接口名不匹配）；
                     # Tailscale 还分配 fd7a:115c:a1e0::/48 的 IPv6 ULA，随接口名识别
@@ -378,7 +394,21 @@ def detect_lan_ip() -> str:
                         except (ValueError, IndexError):
                             in_tailscale_range = False
 
-                    if is_overlay or in_tailscale_range:
+                    in_tailscale_v6_range = False
+                    if addr.family == _sock.AF_INET6:
+                        try:
+                            in_tailscale_v6_range = (
+                                ipaddress.ip_address(ip.split("%", 1)[0])
+                                in ipaddress.ip_network("fd7a:115c:a1e0::/48")
+                            )
+                        except ValueError:
+                            pass
+
+                    # Tailscale only accepts its assigned 100.64/10 or ULA address.
+                    # ZeroTier has no fixed global prefix, so a usable address on its
+                    # named adapter remains a valid overlay candidate.
+                    is_zerotier = "zerotier" in iface_lower or iface_lower.startswith("zt")
+                    if in_tailscale_range or in_tailscale_v6_range or (is_zerotier and is_overlay):
                         overlay_candidates.append((ip, iface, is_up, addr.family))
 
             if overlay_candidates:
@@ -399,16 +429,18 @@ def detect_lan_ip() -> str:
             addrs = psutil.net_if_addrs()
             stats = psutil.net_if_stats()
 
-            # 排除的接口前缀（虚拟 / 容器 / 回环 / 组网）
+            # 排除的接口前缀/标识（虚拟 / 容器 / 回环 / 组网）
             skip_prefixes = ('lo', 'veth', 'docker', 'br-', 'vmnet', 'virbr',
                              'tun', 'tap', 'wg', 'utun', 'anpi', 'bluetooth',
                              'tailscale', 'zerotier', 'zt')
+            skip_markers = ('hyper-v', 'wsl', 'vbox', 'virtualbox')
 
             candidates = []  # [(ip, iface, is_up, is_wifi, family)]
 
             for iface, addr_list in addrs.items():
                 iface_lower = iface.lower()
-                if any(iface_lower.startswith(p) for p in skip_prefixes):
+                if (any(iface_lower.startswith(p) for p in skip_prefixes)
+                        or any(marker in iface_lower for marker in skip_markers)):
                     continue
 
                 stat = stats.get(iface)
@@ -421,7 +453,7 @@ def detect_lan_ip() -> str:
                     if addr.family not in (_sock.AF_INET, _sock.AF_INET6):
                         continue
                     ip = addr.address
-                    if (addr.family == _sock.AF_INET and ip.startswith("127.")) or ip == "::1":
+                    if not _usable_unicast_address(ip):
                         continue
                     candidates.append((ip, iface, is_up, is_wifi, addr.family))
 
@@ -449,7 +481,7 @@ def detect_lan_ip() -> str:
         s.connect(("8.8.8.8", 53))
         ip = s.getsockname()[0]
         s.close()
-        if ip and not ip.startswith("127."):
+        if ip and _usable_unicast_address(ip):
             logger.info(f"检测到局域网 IP (UDP): {ip}")
             return ip
     except Exception:
@@ -462,7 +494,7 @@ def detect_lan_ip() -> str:
         s.connect(("2001:4860:4860::8888", 53))
         ip = s.getsockname()[0]
         s.close()
-        if ip and ip != "::1":
+        if ip and _usable_unicast_address(ip):
             logger.info(f"检测到局域网 IP (UDP v6): {ip}")
             return ip
     except Exception:
@@ -472,7 +504,7 @@ def detect_lan_ip() -> str:
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
-        if ip and not ip.startswith("127."):
+        if ip and _usable_unicast_address(ip):
             logger.info(f"检测到局域网 IP (hostname): {ip} ({hostname})")
             return ip
     except Exception:
@@ -486,8 +518,8 @@ def get_mac_addresses() -> list[str]:
     """
     获取本机所有物理网卡的 MAC 地址列表。
 
-    用于主节点身份验证：主节点首次启动时将 MAC 地址写入数据库，
-    后续启动时验证本机 MAC 与数据库记录是否匹配，防止 IP 变化
+    用于主节点身份验证：主节点首次启动时将 MAC 地址写入本机 SQLite，
+    后续启动时验证本机 MAC 与本地记录是否匹配，防止 IP 变化
     导致身份混淆或其他机器冒充主节点。
 
     过滤策略:
