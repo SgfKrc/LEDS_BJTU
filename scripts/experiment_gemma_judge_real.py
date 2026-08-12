@@ -34,6 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 DEFAULT_MODEL = "gemma4:12b"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_JUDGE_PROMPT = "Describe this image in one or two sentences."
 DEFAULT_CONTRACT = PROJECT_ROOT / "fixtures" / "quality_rubrics" / "gemma-judge-counts-v1.json"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 与 G4.2 图像限制一致
 
@@ -54,7 +55,7 @@ def _describe_image(
     client: httpx.Client,
     ollama_url: str,
     model: str,
-    prompt: str,
+    judge_prompt: str,
     image_data_url: str,
     *,
     max_tokens: int,
@@ -62,12 +63,16 @@ def _describe_image(
 ) -> str:
     from multimodal import build_openai_user_content
 
-    content = build_openai_user_content(prompt, [image_data_url])
+    content = build_openai_user_content(judge_prompt, [image_data_url])
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
         "stream": False,
         "max_tokens": max_tokens,
+        # gemma4 默认开启 thinking：会占满短输出预算导致 content 为空，
+        # 必须显式关闭（G4.1 实测结论）；keep_alive 保持模型驻留。
+        "reasoning_effort": "none",
+        "keep_alive": "30m",
     }
     response = client.post(
         f"{ollama_url.rstrip('/')}/v1/chat/completions",
@@ -116,9 +121,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prompts", required=True, help="[{image, prompt, key_elements: []}]")
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--judge-prompt", default=DEFAULT_JUDGE_PROMPT)
     parser.add_argument("--judge-contract", default=str(DEFAULT_CONTRACT))
     parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--result-file", required=True, help="证据 JSON（白名单字段）")
     parser.add_argument("--report-file", help="脱敏报告 JSON（含失败统计）")
     parser.add_argument("--json", action="store_true", help="stdout 输出汇总 JSON")
@@ -151,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
                     client,
                     args.ollama_url,
                     args.model,
-                    prompt,
+                    args.judge_prompt,
                     _image_data_url(image_path),
                     max_tokens=args.max_tokens,
                     timeout=args.timeout,
