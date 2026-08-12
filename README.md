@@ -132,7 +132,6 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── graph_orchestrator.py      # ★ 图算法智能编排（最大带宽生成树 + DFS 路径搜索）
 │   ├── device_profiler.py         # 设备画像采集（CPU/GPU/RAM/网络）
 │   ├── api_server.py              # FastAPI 服务端（REST API + WebSocket）
-│   ├── db.py                      # 已退场的 PostgreSQL 兼容实现（仅历史迁移审计）
 │   ├── local_store.py             # 主节点 SQLite 本地存储（旧 JSON 一次性只读导入）
 │   ├── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
 │   ├── model_host.py              # 模型生命周期宿主（管理器统一持有、LLM/SD 互斥锁）
@@ -396,7 +395,7 @@ python scripts/quality_gate_sd15_ip_adapter.py --review-report build/sd15-ip-ada
 python scripts/quality_gate_sd15_instruction.py
 ```
 
-也可以在 Web 图像工作区直接下载/导入（资产目录刷新自动发现）。许可证与 gated 状态在下载前展示；正式离线资产包（含许可副本+模型卡）尚未发布。
+也可以在 Web 图像工作区直接下载/导入（资产目录刷新自动发现）。许可证与 gated 状态在下载前展示；正式离线资产包（五资产 15 GB，含许可副本+模型卡）已发布，解压即导入。
 
 ### GGUF 格式（Android 本地推理）
 
