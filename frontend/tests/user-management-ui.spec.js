@@ -117,7 +117,7 @@ test('owner manages local users, Auth App provisioning, and login sessions', asy
     }
     if (path === '/api/auth/recovery-codes/rotate') return json({ status: 'rotated', recovery_codes: recoveryCodes });
     if (path === '/api/cluster/my-role') return json({ is_master: true, node_id: 'local' });
-    if (path === '/api/cluster/distributed-inference/config') return json({ enabled: false });
+    if (path === '/api/cluster/config/distributed-inference') return json({ enabled: false });
     if (path === '/api/status') return json({ model_loaded: false });
     if (path === '/api/user/settings') return json({ settings: {} });
     if (path === '/api/sessions') return json({ sessions: [] });
