@@ -16,13 +16,20 @@ import platform
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 _PACKAGING_DIR = Path(__file__).resolve().parent
 if str(_PACKAGING_DIR) not in sys.path:
     sys.path.insert(0, str(_PACKAGING_DIR))
 
-from update_core import UpdateError, default_state_dir, load_json_state
+from update_core import (
+    DownloadProgress,
+    DownloadProgressCallback,
+    UpdateError,
+    default_state_dir,
+    load_json_state,
+)
 from diagnose import diagnose_install, format_diagnosis, write_diagnosis_report
 from data_retention import (
     DataRetentionError,
@@ -42,7 +49,7 @@ from updater import (
 from version_store import VersionStore
 
 
-LAUNCHER_VERSION = "0.1.8.1"
+LAUNCHER_VERSION = "0.1.8.2"
 
 
 def install_root() -> Path:
@@ -437,12 +444,14 @@ class LauncherController:
         except DataRetentionError as exc:
             return {"ok": False, "action": "failed", "error": str(exc)}
 
-    def reinstall_app(self) -> dict:
+    def reinstall_app(
+        self, *, progress: DownloadProgressCallback | None = None,
+    ) -> dict:
         """Explicitly retain data, then start the already signed installer flow."""
         retained = self.retain_data()
         if not retained.get("ok"):
             return retained
-        code = self.install_update()
+        code = self.install_update(progress=progress)
         return {
             **retained,
             "action": "reinstall-started" if code == 0 else "reinstall-failed",
@@ -450,7 +459,7 @@ class LauncherController:
             "installer_exit_code": code,
         }
 
-    def install_update(self) -> int:
+    def install_update(self, *, progress: DownloadProgressCallback | None = None) -> int:
         # UP-N2: install only proceeds when the manifest signature verifies.
         # No --allow-unsigned here: unsigned manifests must fail closed, and
         # the GUI/TUI flows never get a chance to bypass the gate.
@@ -459,13 +468,19 @@ class LauncherController:
             forwarded.extend(("--variant", self.variant_override))
         for source in self.sources or configured_sources():
             forwarded.extend(("--source", source))
-        return updater_main(forwarded)
+        if progress is None:
+            return updater_main(forwarded)
+        return updater_main(forwarded, progress=progress)
 
-    def install_launcher_update(self) -> int:
+    def install_launcher_update(
+        self, *, progress: DownloadProgressCallback | None = None,
+    ) -> int:
         forwarded = ["launcher-install", "--yes"]
         for source in self.sources or configured_sources():
             forwarded.extend(("--source", source))
-        return updater_main(forwarded)
+        if progress is None:
+            return updater_main(forwarded)
+        return updater_main(forwarded, progress=progress)
 
     def recover_launcher(self) -> int:
         return updater_main(["launcher-recover"])
@@ -613,8 +628,8 @@ def run_gui(controller: LauncherController | None = None) -> int:
         print(f"GUI 不可用: {exc}; 启动普通应用界面。", file=sys.stderr)
         return controller.start_gui()
     root.title("QLH · BJTU Launcher")
-    root.geometry("660x590")
-    root.minsize(600, 550)
+    root.geometry("660x640")
+    root.minsize(600, 600)
     root.configure(bg="#0c0b0b")
     for icon_path in (_PACKAGING_DIR / "leds.ico", install_root() / "leds.ico"):
         if icon_path.is_file():
@@ -647,6 +662,83 @@ def run_gui(controller: LauncherController | None = None) -> int:
     )
     status = tk.StringVar(value=f"当前应用：{app_version}。选择启动方式，或检查更新。")
     ttk.Label(frame, textvariable=status, style="Launcher.TLabel", wraplength=540).pack(anchor="w", pady=(0, 18))
+    download_progress_value = tk.IntVar(value=0)
+    download_progress_text = tk.StringVar(value="")
+    progress_row = ttk.Frame(frame, style="Launcher.TFrame")
+    progress_row.pack(fill="x", pady=(0, 14))
+    ttk.Progressbar(
+        progress_row, variable=download_progress_value,
+        maximum=100, mode="determinate",
+    ).pack(fill="x")
+    ttk.Label(
+        progress_row, textvariable=download_progress_text,
+        style="Launcher.TLabel", wraplength=540,
+    ).pack(anchor="w", pady=(4, 0))
+
+    progress_lock = threading.Lock()
+    progress_state = {
+        "scheduled": False,
+        "last_at": 0.0,
+        "last_phase": "",
+        "latest": None,
+    }
+
+    def format_bytes(value: int) -> str:
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        amount = float(max(0, value))
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} {unit}"
+            amount /= 1024
+        return f"{amount:.1f} TiB"
+
+    def render_progress(event: DownloadProgress) -> None:
+        if event.phase == "verifying":
+            action = "正在校验下载文件"
+        elif event.phase == "reused":
+            action = "已校验本地下载缓存"
+        else:
+            action = "正在下载更新包"
+        download_progress_value.set(event.percent)
+        download_progress_text.set(
+            f"{action}：{format_bytes(event.completed_bytes)} / "
+            f"{format_bytes(event.total_bytes)}（{event.percent}%）"
+        )
+
+    def flush_progress() -> None:
+        with progress_lock:
+            event = progress_state["latest"]
+            progress_state["scheduled"] = False
+            progress_state["last_at"] = time.monotonic()
+            progress_state["last_phase"] = event.phase if event else ""
+        if event is not None:
+            render_progress(event)
+
+    def receive_progress(event: DownloadProgress) -> None:
+        """Throttle worker-thread byte events before handing them to Tk."""
+        now = time.monotonic()
+        with progress_lock:
+            previous_phase = progress_state["last_phase"]
+            due = now - float(progress_state["last_at"]) >= 0.1
+            terminal = event.completed_bytes >= event.total_bytes
+            progress_state["latest"] = event
+            if progress_state["scheduled"] or (
+                not due and event.phase == previous_phase and not terminal
+            ):
+                return
+            progress_state["scheduled"] = True
+        root.after(0, flush_progress)
+
+    def begin_download(label: str) -> None:
+        with progress_lock:
+            progress_state.update({
+                "scheduled": False,
+                "last_at": 0.0,
+                "last_phase": "",
+                "latest": None,
+            })
+        download_progress_value.set(0)
+        download_progress_text.set(label)
     profile_row = ttk.Frame(frame, style="Launcher.TFrame")
     profile_row.pack(fill="x", pady=(0, 14))
     ttk.Label(profile_row, text="更新包类型", style="Launcher.TLabel").pack(side="left")
@@ -743,10 +835,11 @@ def run_gui(controller: LauncherController | None = None) -> int:
         ):
             return
         launcher_install_button.state(["disabled"])
+        begin_download("正在准备 Launcher 更新包...")
         status.set("正在下载、校验并切换 Launcher...")
 
         def worker() -> None:
-            code = controller.install_launcher_update()
+            code = controller.install_launcher_update(progress=receive_progress)
             root.after(0, lambda: status.set(
                 "Launcher 更新完成，下次启动生效。" if code == 0
                 else f"Launcher 更新失败（退出码 {code}）。"
@@ -815,9 +908,10 @@ def run_gui(controller: LauncherController | None = None) -> int:
         ):
             return
         status.set("正在保留用户数据并准备重装...")
+        begin_download("正在保留用户数据...")
 
         def worker() -> None:
-            report = controller.reinstall_app()
+            report = controller.reinstall_app(progress=receive_progress)
             text = (
                 "安装器已启动，安装完成后会自动重新关联保留数据。"
                 if report.get("installer_started")
@@ -841,10 +935,11 @@ def run_gui(controller: LauncherController | None = None) -> int:
         ):
             return
         install_button.state(["disabled"])
+        begin_download("正在准备更新包...")
         status.set("正在下载并校验更新包...")
 
         def worker() -> None:
-            code = controller.install_update()
+            code = controller.install_update(progress=receive_progress)
             root.after(0, lambda: status.set(
                 "安装器已启动。" if code == 0 else f"更新失败（退出码 {code}）。"
             ))

@@ -149,6 +149,52 @@ def test_download_is_atomic_and_reuses_verified_file(tmp_path):
     assert not (tmp_path / "setup.exe.part").exists()
 
 
+def test_download_progress_reports_download_verification_and_reused_file(tmp_path):
+    payload = b"a" * (2 * 1024 * 1024 + 17)
+    asset = update_core.UpdateAsset.from_mapping(_asset("setup.exe", payload))
+    events = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    update_core.download_asset(
+        asset, tmp_path, timeout=2, opener=lambda *_args, **_kwargs: Response(payload),
+        progress=events.append,
+    )
+    assert events[0].phase == "downloading"
+    assert events[0].completed_bytes == 0
+    assert any(event.phase == "downloading" and event.percent == 100 for event in events)
+    assert any(event.phase == "verifying" and event.percent == 0 for event in events)
+    assert events[-1].phase == "verifying" and events[-1].percent == 100
+
+    reused_events = []
+    update_core.download_asset(asset, tmp_path, timeout=2, progress=reused_events.append)
+    assert reused_events[-1].phase == "reused"
+    assert reused_events[-1].completed_bytes == len(payload)
+
+
+def test_download_progress_callback_cannot_interrupt_verified_download(tmp_path):
+    payload = b"verified installer"
+    asset = update_core.UpdateAsset.from_mapping(_asset("setup.exe", payload))
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    path = update_core.download_asset(
+        asset, tmp_path, timeout=2, opener=lambda *_args, **_kwargs: Response(payload),
+        progress=lambda _event: (_ for _ in ()).throw(RuntimeError("GUI closed")),
+    )
+    assert path.read_bytes() == payload
+
+
 def test_manifest_rejects_non_object_assets_and_unbounded_size():
     with pytest.raises(update_core.ManifestError) as invalid_assets:
         update_core.UpdateManifest.from_mapping({

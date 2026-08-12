@@ -40,6 +40,30 @@ class DownloadError(UpdateError):
     code = "UPDATE_DOWNLOAD_FAILED"
 
 
+@dataclass(frozen=True)
+class DownloadProgress:
+    """A frontend-neutral update download event.
+
+    ``phase`` is one of ``downloading``, ``verifying``, or ``reused``.  The
+    manifest supplies the total size, so consumers never have to guess from an
+    HTTP Content-Length header or a potentially untrusted response.
+    """
+
+    phase: str
+    asset_name: str
+    completed_bytes: int
+    total_bytes: int
+
+    @property
+    def percent(self) -> int:
+        if self.total_bytes <= 0:
+            return 100
+        return min(100, max(0, int(self.completed_bytes * 100 / self.total_bytes)))
+
+
+DownloadProgressCallback = Callable[[DownloadProgress], None]
+
+
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _MAX_ASSET_BYTES = 32 * 1024 * 1024 * 1024
@@ -390,13 +414,64 @@ def sha256_file(path: str | os.PathLike[str], *, chunk_size: int = 1024 * 1024) 
     return digest.hexdigest()
 
 
-def verify_file(path: str | os.PathLike[str], asset: UpdateAsset) -> bool:
+def _emit_progress(
+    callback: DownloadProgressCallback | None,
+    *,
+    phase: str,
+    asset: UpdateAsset,
+    completed_bytes: int,
+) -> None:
+    """Best-effort UI reporting; a frontend callback cannot break an update."""
+    if callback is None:
+        return
+    try:
+        callback(DownloadProgress(
+            phase=phase,
+            asset_name=asset.name,
+            completed_bytes=completed_bytes,
+            total_bytes=asset.size,
+        ))
+    except Exception:
+        # The verified download transaction must not depend on GUI/TUI state.
+        pass
+
+
+def _verify_file(
+    path: Path,
+    asset: UpdateAsset,
+    *,
+    progress: DownloadProgressCallback | None = None,
+) -> bool:
+    if not path.is_file() or path.stat().st_size != asset.size:
+        return False
+    digest = hashlib.sha256()
+    completed = 0
+    _emit_progress(progress, phase="verifying", asset=asset, completed_bytes=0)
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                completed += len(chunk)
+                _emit_progress(
+                    progress, phase="verifying", asset=asset,
+                    completed_bytes=completed,
+                )
+    except OSError:
+        return False
+    return completed == asset.size and digest.hexdigest() == asset.sha256
+
+
+def verify_file(
+    path: str | os.PathLike[str],
+    asset: UpdateAsset,
+    *,
+    progress: DownloadProgressCallback | None = None,
+) -> bool:
     candidate = Path(path)
-    return (
-        candidate.is_file()
-        and candidate.stat().st_size == asset.size
-        and sha256_file(candidate) == asset.sha256
-    )
+    return _verify_file(candidate, asset, progress=progress)
 
 
 def download_asset(
@@ -405,12 +480,22 @@ def download_asset(
     *,
     timeout: float = 30.0,
     opener: Callable[..., Any] | None = None,
+    progress: DownloadProgressCallback | None = None,
 ) -> Path:
-    """Download one asset to a verified file using a sibling .part file."""
+    """Download one asset to a verified file using a sibling .part file.
+
+    Progress comes from the signed manifest size and is advisory only: each
+    event is emitted after bytes are written, then again while SHA-256 is
+    computed.  No response header is trusted as a size authority.
+    """
     target_dir = Path(destination)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / asset.name
-    if verify_file(target, asset):
+    if verify_file(target, asset, progress=progress):
+        _emit_progress(
+            progress, phase="reused", asset=asset,
+            completed_bytes=asset.size,
+        )
         return target
     if target.exists():
         target.unlink()
@@ -421,6 +506,9 @@ def download_asset(
     try:
         with request(asset.url, timeout=timeout) as response, open(part, "wb") as output:
             written = 0
+            _emit_progress(
+                progress, phase="downloading", asset=asset, completed_bytes=written,
+            )
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
@@ -429,13 +517,16 @@ def download_asset(
                 if written > asset.size:
                     raise DownloadError(f"asset exceeds manifest size: {asset.name}")
                 output.write(chunk)
+                _emit_progress(
+                    progress, phase="downloading", asset=asset, completed_bytes=written,
+                )
     except DownloadError:
         part.unlink(missing_ok=True)
         raise
     except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
         part.unlink(missing_ok=True)
         raise DownloadError(f"download failed: {asset.name}: {exc}") from exc
-    if not verify_file(part, asset):
+    if not verify_file(part, asset, progress=progress):
         part.unlink(missing_ok=True)
         raise DownloadError(f"asset verification failed: {asset.name}")
     os.replace(part, target)

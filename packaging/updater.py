@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from update_core import (
+    DownloadProgress,
+    DownloadProgressCallback,
     UpdateError,
     UpdateManifest,
     default_state_dir,
@@ -242,6 +244,34 @@ def _print(value: Any, *, as_json: bool) -> None:
         print(value)
 
 
+def _format_download_progress(event: DownloadProgress) -> str:
+    def human_size(value: int) -> str:
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        amount = float(max(0, value))
+        for unit in units:
+            if amount < 1024 or unit == units[-1]:
+                return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} {unit}"
+            amount /= 1024
+        return f"{amount:.1f} TiB"
+
+    if event.phase == "verifying":
+        action = "正在校验"
+    elif event.phase == "reused":
+        action = "已校验本地缓存"
+    else:
+        action = "正在下载"
+    return (
+        f"{action} {event.asset_name}: "
+        f"{human_size(event.completed_bytes)} / {human_size(event.total_bytes)} "
+        f"({event.percent}%)"
+    )
+
+
+def _console_download_progress(event: DownloadProgress) -> None:
+    """Render a compact live progress line for direct TUI/CLI use."""
+    print("\r" + _format_download_progress(event)[:160].ljust(160), end="", flush=True)
+
+
 def _error_payload(exc: UpdateError) -> dict[str, str]:
     return {"error": str(exc), "error_code": str(getattr(exc, "code", "UPDATE_FAILED"))}
 
@@ -401,6 +431,7 @@ def _launcher_command(
     *,
     sources: list[str] | None = None,
     trusted_keys_dir: str | None = None,
+    progress: DownloadProgressCallback | None = None,
 ) -> int:
     store = _launcher_store(args)
     try:
@@ -463,7 +494,12 @@ def _launcher_command(
             arch=profile["arch"], kind="launcher",
         )
         destination = args.download_dir or default_state_dir() / "downloads"
-        path = download_asset(asset, destination, timeout=max(30.0, args.timeout))
+        progress_callback = progress or (None if args.as_json else _console_download_progress)
+        path = download_asset(
+            asset, destination, timeout=max(30.0, args.timeout), progress=progress_callback,
+        )
+        if progress_callback is not None and not args.as_json:
+            print()
         if args.command == "launcher-download":
             _print({"downloaded": str(path), "source_failures": list(failures)}, as_json=args.as_json)
             return 0
@@ -522,7 +558,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    progress: DownloadProgressCallback | None = None,
+) -> int:
     args = build_parser().parse_args(argv)
     if args.command.startswith("version-"):
         return _version_command(args)
@@ -543,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"launcher-check", "launcher-download", "launcher-install"}:
             return _launcher_command(
                 args, sources=sources, trusted_keys_dir=trusted_keys_dir,
+                progress=progress,
             )
         if args.command == "check":
             result = check_updates(
@@ -566,7 +607,13 @@ def main(argv: list[str] | None = None) -> int:
             arch=profile["arch"],
         )
         destination = args.download_dir or default_state_dir() / "downloads"
-        path = download_asset(asset, destination, timeout=max(30.0, args.timeout))
+        progress_callback = progress or (None if args.as_json else _console_download_progress)
+        path = download_asset(
+            asset, destination, timeout=max(30.0, args.timeout),
+            progress=progress_callback,
+        )
+        if progress_callback is not None and not args.as_json:
+            print()
         if args.command == "download":
             _print({"downloaded": str(path), "source_failures": list(failures)}, as_json=args.as_json)
             return 0
