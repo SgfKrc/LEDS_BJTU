@@ -4,14 +4,11 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8.1**（更新日期：2026-08-08，文档复核于 2026-08-08）
+**v0.1.8.2**（更新日期：2026-08-12）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
->
-> 最新复核（2026-08-11）：Python 全量回归 **`1836 passed / 33 skipped / 0 failed`**；T9.6-R2 已在当前 Windows 开发机用隔离目录实际完成 CPU/CUDA Setup 安装、安装期 deep、`bjtu chat --help`、冻结 EXE fixture 启动、五类用户数据卸载保留与重装关联。`UP-N6.4W` 进一步完成同卷原子改名与跨卷校验复制双路径：冻结 helper 和 CPU Inno Setup 均完成 `G:` 应用根到 `C:` 用户根的保留/回迁，失败恢复由外置 journal 驱动，整批目标提交前不删除源目录。control-svc 最新认证/账户管理基线 `317/317`、gateway `113/113`、前端 `30/30`、浏览器 `5/5` 均通过。Windows 外部干净机/安装包真实模型会话、Linux `.deb`（当前 WSL 原生工具链不足）、真实 Tailscale/双机和 Android 真机回归仍待最终联合验收。
-> 2026-08-06 复核：Python 全量回归 **`1416 passed / 4 skipped`**（约 3 min），control-svc 微服务套件 **205 passed**（含 MODEL-FLEET M0-M4：契约/本地事实源/工件库/一键 pull/多集群档案），SD 质量门与 T9 聊天页相关测试全绿。SD 1.5 图像工作区（文生图/图生图/IP-Adapter reference）自动门与**双人目视审核均通过**（2026-08-06，Siegfried Kkm./浅草爱音，5 份报告 status=passed）；`bjtu chat` T9 聊天页 T9.0-T9.5 完成（终端走查 54/54）；微服务改造阶段 3.2 完成（control-svc 136/136）。2026-08-05 复核：Python 全量回归 **`1303 passed / 23 skipped`**（1326 项），SD/API 专项 155/155、前端 15/15、网关 100/100；90s DreamBooth 十种子自动门 10/10。历史复核链：2026-08-03 `1112 passed / 3 skipped`（Android Full/Lite 构建成功、TUI 契约 44/44）；2026-07-31 `1066 passed / 23 skipped`；2026-07-30 `1030 passed / 23 skipped / 3 failed`（基线）。
 
 ---
 
@@ -47,11 +44,17 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（安装包内置 Textual，源码模式仍可隔离安装；见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
-| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门、Edge 链路与双人目视均已通过（2026-08-07）；正式离线资产包和分布式图像仍待完成 → [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
+| 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门、Edge 链路与双人目视均已通过（2026-08-07）；正式离线资产包已完成（五资产 15 GB，解压即导入，Hub 强制离线可复现），分布式图像跨机展示仍待双机验收 → [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
 | 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
+
+### 项目设计理念
+
+- **摆脱第三方服务依赖**：除 GitHub 官方（源码托管与 release 发布）外，QLH 不依赖任何第三方服务——更新源可由用户自建签名源站承载，Gitee 等镜像仅作带宽/可达性兜底，凭据与授权数据只存于用户主节点。
+- **所有资产归用户自己管理**：模型工件、张量并行外部资产（vLLM/SGLang/llama.cpp rpc 等）、API key 与各类凭据**不由开发组提供**，全部使用用户自己的资产；项目只提供导入、校验、登记与使用通道，不代管、不代持。
+- **数据不出集群**：外部推理与图像辅助的默认数据作用域为 `deny`，显式授权才允许出集群；离线资产包与签名清单保证模型分发可审计、可重建。
 
 **应用场景**：智能终端 · 物联网 · 边缘计算 · 教育科研
 
@@ -181,7 +184,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-11 全量回归 1836 passed / 33 skipped）
+├── tests/                         # 单元测试（2026-08-12 全量回归 1994 passed / 8 skipped）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -604,8 +607,8 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 
 | 版本 | 安装包 | 典型大小 | 适用场景 |
 |------|--------|---------|---------|
-| **CPU 版** | `qlh-edge-inference-cpu_0.1.8.1_amd64.deb` | ~200 MB | CPU / 集成显卡节点 |
-| **CUDA 版** | `qlh-edge-inference-cuda_0.1.8.1_amd64.deb` | ~1.8 GB | NVIDIA GPU 节点 |
+| **CPU 版** | `qlh-edge-inference-cpu_0.1.8.2_amd64.deb` | ~200 MB | CPU / 集成显卡节点 |
+| **CUDA 版** | `qlh-edge-inference-cuda_0.1.8.2_amd64.deb` | ~1.8 GB | NVIDIA GPU 节点 |
 
 **构建**（需 Ubuntu/Debian 环境）：
 
@@ -618,7 +621,7 @@ bash build-deb.sh cuda    # 独显版
 **安装**：
 
 ```bash
-sudo dpkg -i qlh-edge-inference-cpu_0.1.8.1_amd64.deb
+sudo dpkg -i qlh-edge-inference-cpu_0.1.8.2_amd64.deb
 # 安装后自动注册 systemd 服务、桌面入口和 /usr/local/bin/qlh-launcher
 ```
 
