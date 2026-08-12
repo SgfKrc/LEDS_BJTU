@@ -58,6 +58,10 @@ else:
 class SigningError(RuntimeError):
     """Expected signing/verification failure with a user-renderable message."""
 
+    def __init__(self, message: str, *, code: str = "SIGNING_ERROR"):
+        self.code = code
+        super().__init__(message)
+
 
 # --------------------------------------------------------------------------
 # Canonical manifest body
@@ -271,45 +275,84 @@ def _parse_signed_at(value: Any) -> str:
     return value
 
 
+def _signature_result(
+    verified: bool, error_code: str = "", reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "verified": verified,
+        "error_code": error_code,
+        "reason": reason,
+    }
+
+
+def verify_manifest_signature_details(
+    mapping: Mapping[str, Any],
+    *,
+    trusted_keys_dir: str | os.PathLike[str] | None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Verify a manifest and return stable code, localized reason and verdict.
+
+    ``verify_manifest_signature`` remains the compatibility wrapper for
+    callers that consume the historic ``(verified, reason)`` tuple.
+    """
+    if Ed25519PublicKey is None:  # pragma: no cover - environment dependent
+        return _signature_result(
+            False,
+            "SIGNATURE_CRYPTO_UNAVAILABLE",
+            f"cryptography 不可用：{_CRYPTO_IMPORT_ERROR}",
+        )
+    signature = mapping.get("signature")
+    if not signature:
+        return _signature_result(False, "SIGNATURE_MISSING", "清单没有签名")
+    key_id = mapping.get("key_id")
+    if not isinstance(key_id, str) or not key_id:
+        return _signature_result(False, "SIGNATURE_KEY_ID_MISSING", "清单缺少 key_id")
+    try:
+        _parse_signed_at(mapping.get("signed_at"))
+    except SigningError as exc:
+        return _signature_result(
+            False,
+            "SIGNATURE_SIGNED_AT_INVALID",
+            str(exc),
+        )
+    if not trusted_keys_dir:
+        return _signature_result(
+            False,
+            "SIGNATURE_TRUST_STORE_MISSING",
+            "未配置可信公钥目录（Launcher 内置 pubkeys 缺失）",
+        )
+    try:
+        public = _trusted_public_key(str(key_id), Path(trusted_keys_dir), now=now)
+    except SigningError as exc:
+        return _signature_result(False, exc.code, str(exc))
+    try:
+        raw_signature = _b64decode(str(signature), what="signature")
+        public.verify(raw_signature, manifest_body(mapping))
+    except InvalidSignature:
+        return _signature_result(
+            False, "SIGNATURE_INVALID", "清单签名校验失败",
+        )
+    except SigningError as exc:
+        return _signature_result(False, exc.code, str(exc))
+    except Exception as exc:
+        return _signature_result(
+            False, "SIGNATURE_CHECK_FAILED", f"签名校验异常: {exc}",
+        )
+    return _signature_result(True)
+
+
 def verify_manifest_signature(
     mapping: Mapping[str, Any],
     *,
     trusted_keys_dir: str | os.PathLike[str] | None,
     now: float | None = None,
 ) -> tuple[bool, str]:
-    """Verify a manifest's Ed25519 signature against the trusted key set.
-
-    Returns ``(verified, reason)``.  Every failure path returns False with a
-    concrete reason; nothing is ever promoted to trust.
-    """
-    if Ed25519PublicKey is None:  # pragma: no cover - environment dependent
-        return False, f"cryptography 不可用：{_CRYPTO_IMPORT_ERROR}"
-    signature = mapping.get("signature")
-    if not signature:
-        return False, "清单没有签名"
-    key_id = mapping.get("key_id")
-    if not isinstance(key_id, str) or not key_id:
-        return False, "清单缺少 key_id"
-    try:
-        _parse_signed_at(mapping.get("signed_at"))
-    except SigningError as exc:
-        return False, str(exc)
-    if not trusted_keys_dir:
-        return False, "未配置可信公钥目录（Launcher 内置 pubkeys 缺失）"
-    try:
-        public = _trusted_public_key(str(key_id), Path(trusted_keys_dir), now=now)
-    except SigningError as exc:
-        return False, str(exc)
-    try:
-        raw_signature = _b64decode(str(signature), what="signature")
-        public.verify(raw_signature, manifest_body(mapping))
-    except InvalidSignature:
-        return False, "清单签名校验失败"
-    except SigningError as exc:
-        return False, str(exc)
-    except Exception as exc:
-        return False, f"签名校验异常: {exc}"
-    return True, ""
+    """Compatibility wrapper returning the historic ``(verified, reason)``."""
+    result = verify_manifest_signature_details(
+        mapping, trusted_keys_dir=trusted_keys_dir, now=now,
+    )
+    return bool(result["verified"]), str(result["reason"])
 
 
 def _trusted_public_key(
@@ -328,7 +371,10 @@ def _trusted_public_key(
     try:
         root = load_public_key_file(root_path)
     except SigningError:
-        raise SigningError("可信密钥目录缺少 root.pub.json")
+        raise SigningError(
+            "可信密钥目录缺少 root.pub.json",
+            code="SIGNATURE_ROOT_KEY_MISSING",
+        )
     trusted: dict[str, Ed25519PublicKey] = {}
     _add_trusted_key(root, "root", trusted, _parse_key_bytes(root), now=now)
     if key_id in trusted:
@@ -342,7 +388,7 @@ def _trusted_public_key(
     # Resolve authorization chains in issuer-independent order: a release key
     # stays pending until its issuer is trusted, and is dropped forever once
     # its issuer is trusted but the authorization fails.
-    failures: dict[str, str] = {}
+    failures: dict[str, SigningError] = {}
     while candidates:
         progressed = False
         remaining: list[dict[str, Any]] = []
@@ -357,7 +403,7 @@ def _trusted_public_key(
                     _parse_key_bytes(candidate), now=now,
                 )
             except SigningError as exc:
-                failures[candidate["key_id"]] = str(exc)
+                failures[candidate["key_id"]] = exc
                 continue  # never trusted again
             progressed = True
         if key_id in trusted:
@@ -366,13 +412,16 @@ def _trusted_public_key(
             for candidate in remaining:
                 if candidate.get("key_id") == key_id:
                     raise SigningError(
-                        f"发布密钥授权者不受信任: {key_id} <- {candidate.get('authorized_by')}"
+                        f"发布密钥授权者不受信任: {key_id} <- {candidate.get('authorized_by')}",
+                        code="SIGNATURE_ISSUER_UNTRUSTED",
                     )
             break
         candidates = remaining
     if key_id in failures:
-        raise SigningError(failures[key_id])
-    raise SigningError(f"未知发布密钥 key_id: {key_id}")
+        raise failures[key_id]
+    raise SigningError(
+        f"未知发布密钥 key_id: {key_id}", code="SIGNATURE_KEY_UNKNOWN",
+    )
 
 
 def _parse_key_bytes(mapping: Mapping[str, Any]) -> Ed25519PublicKey:
@@ -399,7 +448,9 @@ def _add_trusted_key(
         except ValueError as exc:
             raise SigningError(f"valid_until 不是合法时间: {valid_until!r}") from exc
         if now > deadline:
-            raise SigningError(f"发布密钥已过期: {key_id}")
+            raise SigningError(
+                f"发布密钥已过期: {key_id}", code="SIGNATURE_KEY_EXPIRED",
+            )
     if key_id == "root":
         if role != "root":
             raise SigningError("root.pub.json 的 role 必须为 root")
@@ -411,17 +462,26 @@ def _add_trusted_key(
     if not isinstance(issuer_id, str) or not issuer_id:
         raise SigningError(f"发布密钥缺少授权者: {key_id}")
     if issuer_id not in trusted:
-        raise SigningError(f"发布密钥授权者不受信任: {key_id} <- {issuer_id}")
+        raise SigningError(
+            f"发布密钥授权者不受信任: {key_id} <- {issuer_id}",
+            code="SIGNATURE_ISSUER_UNTRUSTED",
+        )
     authorization = mapping.get("authorization")
     if not authorization:
-        raise SigningError(f"发布密钥缺少授权签名: {key_id}")
+        raise SigningError(
+            f"发布密钥缺少授权签名: {key_id}",
+            code="SIGNATURE_AUTHORIZATION_MISSING",
+        )
     try:
         trusted[issuer_id].verify(
             _b64decode(str(authorization), what="authorization"),
             authorization_body(mapping),
         )
     except InvalidSignature:
-        raise SigningError(f"发布密钥授权签名无效: {key_id}")
+        raise SigningError(
+            f"发布密钥授权签名无效: {key_id}",
+            code="SIGNATURE_AUTHORIZATION_INVALID",
+        )
     except SigningError:
         raise
     except Exception as exc:

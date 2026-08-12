@@ -159,6 +159,16 @@ class _StartupSplash:
     def hwnd(self):
         return self._hwnd
 
+    def snapshot(self) -> dict:
+        """Return the launcher-visible splash state without exposing controls."""
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "progress": self._progress,
+                "status": self._status,
+                "closed": self._closed.is_set(),
+            }
+
     def start(self):
         if not self.enabled:
             return self

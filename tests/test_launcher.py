@@ -136,9 +136,14 @@ def test_existing_qlh_instance_is_recognized(monkeypatch, launcher_module):
 def test_startup_splash_is_safe_when_disabled(launcher_module):
     splash = launcher_module._StartupSplash(enabled=False).start()
     splash.update(150, "ready")
-    assert splash._progress == 100
-    assert splash._status == "ready"
+    assert splash.snapshot() == {
+        "enabled": False,
+        "progress": 100,
+        "status": "ready",
+        "closed": False,
+    }
     splash.close()
+    assert splash.snapshot()["closed"] is True
 
 
 def test_windows_dialog_uses_splash_owner(monkeypatch, launcher_module):
@@ -275,9 +280,11 @@ def test_pywebview_closes_splash_after_page_loaded(monkeypatch, launcher_module)
 def test_pytorch_tokenizer_runtime_check_loads_local_tokenizer(
     monkeypatch, launcher_module
 ):
+    encoded_texts = []
+
     class FakeTokenizer:
         def encode(self, text):
-            assert text
+            encoded_texts.append(text)
             return [1, 2, 3]
 
     class FakeAutoTokenizer:
@@ -295,6 +302,7 @@ def test_pytorch_tokenizer_runtime_check_loads_local_tokenizer(
     monkeypatch.setitem(sys.modules, "config", SimpleNamespace(MODEL_PATH="local-qwen"))
 
     name = launcher_module._verify_pytorch_tokenizer_runtime()
+    assert encoded_texts == ["QLH tokenizer runtime check"]
     assert name.endswith(".FakeTokenizer")
 
 

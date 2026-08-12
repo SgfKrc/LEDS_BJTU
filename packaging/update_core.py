@@ -25,13 +25,19 @@ from typing import Any, Callable, Iterable, Mapping
 class UpdateError(RuntimeError):
     """Expected update failure that can be rendered by GUI or CLI."""
 
+    code = "UPDATE_FAILED"
+
 
 class ManifestError(UpdateError):
     """Manifest is malformed or cannot be trusted by the current parser."""
 
+    code = "UPDATE_MANIFEST_INVALID"
+
 
 class DownloadError(UpdateError):
     """Artifact download or verification failed."""
+
+    code = "UPDATE_DOWNLOAD_FAILED"
 
 
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -155,6 +161,7 @@ class UpdateManifest:
     signature_verified: bool = False
     signature_key_id: str = ""
     signature_signed_at: str = ""
+    signature_error_code: str = ""
     signature_error: str = ""
 
     @classmethod
@@ -234,15 +241,19 @@ def fetch_manifest(
     # Verify the signature against the raw manifest body BEFORE any URL
     # resolution rewrites it; the signature binds the bytes the publisher
     # actually signed.
-    from signing import default_trusted_keys_dir, verify_manifest_signature
+    from signing import default_trusted_keys_dir, verify_manifest_signature_details
 
     signature_error = ""
+    signature_error_code = ""
     signature_verified = False
     if raw.get("signature"):
         trusted = trusted_keys_dir or default_trusted_keys_dir()
-        signature_verified, signature_error = verify_manifest_signature(
+        signature_result = verify_manifest_signature_details(
             raw, trusted_keys_dir=trusted,
         )
+        signature_verified = bool(signature_result["verified"])
+        signature_error_code = str(signature_result["error_code"])
+        signature_error = str(signature_result["reason"])
     resolved = dict(raw)
     assets = []
     raw_assets = raw.get("assets", [])
@@ -260,7 +271,10 @@ def fetch_manifest(
 
         if not signature_verified:
             manifest = replace(
-                manifest, signature_verified=False, signature_error=signature_error,
+                manifest,
+                signature_verified=False,
+                signature_error_code=signature_error_code,
+                signature_error=signature_error,
             )
         else:
             manifest = replace(manifest, signature_verified=True)
