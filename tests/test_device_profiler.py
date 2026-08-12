@@ -149,17 +149,16 @@ class TestMockDevices:
 class TestScoring:
     """测试设备评分算法"""
 
-    def test_mobile_score_range(self):
-        """移动设备评分应在 0-15"""
-        p = DeviceProfiler.mock_mobile()
-        score = p.score
-        assert 0 <= score <= 15, f"移动设备评分应在 0-15，实际: {score}"
-
-    def test_edge_score_range(self):
-        """边缘设备评分应在 0-25"""
-        p = DeviceProfiler.mock_edge()
-        score = p.score
-        assert 0 <= score <= 25, f"边缘设备评分应在 0-25，实际: {score}"
+    @pytest.mark.parametrize(
+        ("mock_fn", "expected_score"),
+        [
+            (DeviceProfiler.mock_mobile, 8.0),
+            (DeviceProfiler.mock_edge, 16.0),
+        ],
+    )
+    def test_mock_score_is_stable(self, mock_fn, expected_score):
+        """固定模拟设备的评分必须精确稳定，不能用宽区间掩盖回归。"""
+        assert mock_fn().score == expected_score
 
     def test_score_is_float(self):
         """评分应为浮点数"""

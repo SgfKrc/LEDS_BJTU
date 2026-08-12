@@ -1100,6 +1100,48 @@ class EngineHost:
             "layers": list(self._layers),
         }
 
+    def generation_status(self) -> Dict[str, Any]:
+        """Return active generation IDs for cancellation and leak diagnostics."""
+
+        with self._gen_lock:
+            generation_ids = sorted(self._generations)
+        return {
+            "active_generation_count": len(generation_ids),
+            "active_generation_ids": generation_ids,
+        }
+
+    def conversation_status(self) -> Dict[str, Any]:
+        """Return aggregate conversation state without exposing message content."""
+
+        with self._gen_lock:
+            return {
+                "active_session_id": self._active_session_id,
+                "session_message_counts": {
+                    session_id: len(history)
+                    for session_id, history in self._session_histories.items()
+                },
+                "stats": dict(self._conversation_stats),
+            }
+
+    def session_history(self, session_id: str) -> list[dict]:
+        """Return a defensive copy of one in-memory session history."""
+
+        with self._gen_lock:
+            return [dict(message) for message in self._session_histories.get(session_id, [])]
+
+    def kv_cache_status(self) -> Dict[str, Any]:
+        """Return non-content metadata for the local paged KV cache."""
+
+        cache = self._kv_cache
+        if cache is None:
+            return {"initialized": False}
+        return {
+            "initialized": True,
+            "page_size": getattr(cache, "page_size", None),
+            "max_pages": getattr(cache, "max_pages", None),
+            "device": str(getattr(cache, "device", "")),
+        }
+
     # ------------------------------------------------------------------
     # 对话（1.1 薄实现：本地模型 chat/chat_stream；
     # 1.2 替换为 _execute_chat_full / fast 模式副本，含历史/追问/持久化）
@@ -2112,9 +2154,11 @@ class EngineHost:
         self._scheduler（None = 单机基线视为 master）。"""
         import config as _cfg
         from fastapi import HTTPException
+        from api_errors import coded_http_error
         if not _cfg.TASK_GRAPH_ENABLED:
-            raise HTTPException(
+            raise coded_http_error(
                 409,
+                "TASK_GRAPH_DISABLED",
                 "任务链实验未启用。请设置 QLH_TASK_GRAPH_ENABLED=true 后重启。",
             )
         journal = self._ensure_task_graph_coordinator().journal_status()
@@ -2167,18 +2211,21 @@ class EngineHost:
         remote_provider_id = str(req.task_graph_remote_provider_id or "")
         auto_remote = bool(req.task_graph_auto_remote)
         if bool(remote_stage_id) != bool(remote_provider_id):
-            raise HTTPException(
+            raise coded_http_error(
                 400,
+                "TASK_GRAPH_MANUAL_REMOTE_FIELDS_INCOMPLETE",
                 "N2.1 手动远端执行必须同时指定 Stage 和 Provider ID。",
             )
         if auto_remote and remote_stage_id:
-            raise HTTPException(
+            raise coded_http_error(
                 400,
+                "TASK_GRAPH_REMOTE_POLICY_CONFLICT",
                 "N2.3 自动 Worker 选择不能与 N2.1 手动远端 Stage 同时启用。",
             )
         if remote_stage_id and not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
-            raise HTTPException(
+            raise coded_http_error(
                 409,
+                "TASK_WORKER_EXPERIMENT_DISABLED",
                 "PC Full Worker 实验调度未启用。请设置 "
                 "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
             )
@@ -2361,8 +2408,9 @@ class EngineHost:
                 {"message": "任务链已取消", "workflow_id": exc.workflow_id},
             ) from exc
         except WorkflowExecutionError as exc:
-            raise HTTPException(
+            raise coded_http_error(
                 500,
+                exc.code,
                 {
                     "message": str(exc),
                     "workflow_id": exc.workflow_id,

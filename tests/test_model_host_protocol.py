@@ -18,7 +18,6 @@ import threading
 from model_host import (
     InferenceHost,
     ModelHost,
-    _LazyModelManager,
     get_model_host,
     model_host,
 )
@@ -35,13 +34,9 @@ class TestInferenceHostProtocol:
     """协议满足性（不加载真实模型）。"""
 
     def test_protocol_methods_exist(self):
-        # 行为由 ModelManager 提供（经 _LazyModelManager 延迟加载）；
-        # 协议层只需保证接口签名在宿主上可达（代理后属性存在）。
+        # 冷启动状态通过公共快照检查，不触发 ModelManager 导入。
         host = ModelHost()
-        mgr = host._manager
-        # _LazyModelManager 未加载时 _instance 为 None；验证惰性容器存在
-        assert mgr._instance is None
-        assert mgr._lock is not None
+        assert host.runtime_status()["manager_loaded"] is False
 
     def test_model_host_proxies_manager(self):
         # 代理转发：宿主未定义属性转发给注入的 manager
@@ -79,13 +74,21 @@ class TestModelHostAttach:
             return x + 1
 
         host.attach("_fake_callback", fake_cb)
-        assert host._fake_callback(1) == 2
+        assert host.get_attachment("_fake_callback")(1) == 2
 
     def test_attach_overrides_manager_proxy(self):
         # attach 后属性读取优先取宿主自身
         host = ModelHost()
         host.attach("_execute_task_worker_stage", lambda: "attached")
-        assert host._execute_task_worker_stage() == "attached"
+        assert host.get_attachment("_execute_task_worker_stage")() == "attached"
+
+    def test_attachment_lookup_is_instance_scoped_and_lazy(self):
+        attached = ModelHost()
+        attached.attach("_instance_callback", lambda: "attached")
+        untouched = ModelHost()
+
+        assert untouched.get_attachment("_instance_callback") is None
+        assert untouched.runtime_status()["manager_loaded"] is False
 
 
 class TestModelHostSingleton:
@@ -99,27 +102,21 @@ class TestModelHostSingleton:
         # scheduler 无 host 参数时使用全局单例（阶段 0.2 注入语义）
         import scheduler as sched_mod
         s = sched_mod.Scheduler()
-        assert s._host is model_host
+        assert s.inference_host is model_host
 
     def test_scheduler_explicit_host(self):
         import scheduler as sched_mod
         host = ModelHost()
         s = sched_mod.Scheduler(host=host)
-        assert s._host is host
+        assert s.inference_host is host
 
 
 class TestLazyModelManager:
     """从 api_server 迁入的惰性容器行为不变。"""
 
-    def test_slots_defined(self):
-        lm = _LazyModelManager()
-        assert set(lm.__slots__) == {"_instance", "_lock"}
-        assert lm._instance is None
-
     def test_lazy_no_instantiation(self):
         # 未访问任何属性前不实例化 ModelManager（冷启动友好）
-        lm = _LazyModelManager()
-        assert lm._instance is None
+        assert ModelHost().runtime_status()["manager_loaded"] is False
 
 
 class TestApiServerIntegration:
@@ -131,8 +128,8 @@ class TestApiServerIntegration:
 
     def test_api_server_attach_present(self):
         import api_server  # noqa: F401 —— 模块加载即执行 attach
-        assert callable(model_host._execute_task_worker_stage)
-        assert callable(model_host._active_task_graph_model_identity)
+        assert callable(model_host.get_attachment("_execute_task_worker_stage"))
+        assert callable(model_host.get_attachment("_active_task_graph_model_identity"))
 
     def test_no_reverse_import(self):
         # 阶段 0.5 验收项：scheduler 不再 import api_server

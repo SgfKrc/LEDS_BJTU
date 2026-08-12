@@ -64,26 +64,46 @@ ATTEMPT_STATE_TRANSITIONS = {
 class TaskGraphError(RuntimeError):
     """Base error for task-graph validation and execution."""
 
+    def __init__(self, message: str, *, code: str = "task_graph_error"):
+        self.code = code
+        super().__init__(message)
+
 
 class TaskGraphUnavailable(TaskGraphError):
     """Raised when the task graph cannot preserve required durable state."""
 
+    def __init__(self, message: str):
+        super().__init__(message, code="task_graph_unavailable")
+
 
 class WorkflowNotFound(TaskGraphError):
-    pass
+    def __init__(self, workflow_id: str):
+        super().__init__(workflow_id, code="workflow_not_found")
 
 
 class WorkflowCancelled(TaskGraphError):
     def __init__(self, workflow_id: str):
         self.workflow_id = workflow_id
-        super().__init__(f"workflow {workflow_id} cancelled")
+        super().__init__(
+            f"workflow {workflow_id} cancelled", code="workflow_cancelled",
+        )
 
 
 class WorkflowExecutionError(TaskGraphError):
-    def __init__(self, workflow_id: str, stage_id: str, message: str):
+    def __init__(
+        self,
+        workflow_id: str,
+        stage_id: str,
+        message: str,
+        *,
+        code: str = "task_graph_execution_failed",
+    ):
         self.workflow_id = workflow_id
         self.stage_id = stage_id
-        super().__init__(f"workflow {workflow_id} stage {stage_id} failed: {message}")
+        super().__init__(
+            f"workflow {workflow_id} stage {stage_id} failed: {message}",
+            code=code,
+        )
 
 
 class _StageRetryScheduled(TaskGraphError):
@@ -2614,6 +2634,7 @@ class TaskGraphCoordinator:
                 return
             raise WorkflowExecutionError(
                 workflow.workflow_id, stage.spec.stage_id, error,
+                code=error_code,
             ) from exc
         finally:
             if attempt is not None:

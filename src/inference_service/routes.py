@@ -23,6 +23,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from api_errors import coded_http_error
 from diffusion import (
     DiffusionBlobInUseError,
     DiffusionBlobReferencedError,
@@ -252,8 +253,10 @@ def _check_load_engine(engine: Optional[str]) -> str:
     """对齐 api_server.py:2220-2222 的引擎白名单校验（400）。"""
     e = (engine or "auto").lower()
     if e not in _VALID_ENGINES:
-        raise HTTPException(
-            400, f"不支持的引擎: {e}，可选: auto, llama_cpp, pytorch, island"
+        raise coded_http_error(
+            400,
+            "MODEL_ENGINE_UNSUPPORTED",
+            f"不支持的引擎: {e}，可选: auto, llama_cpp, pytorch, island",
         )
     return e
 
@@ -271,7 +274,11 @@ def _check_model_registered(model_id: Optional[str], engine: str) -> None:
 
     model = mc.get_model_config(model_id, {})
     if model is None:
-        raise HTTPException(404, f"模型 '{model_id}' 未在注册表中找到。")
+        raise coded_http_error(
+            404,
+            "MODEL_NOT_REGISTERED",
+            f"模型 '{model_id}' 未在注册表中找到。",
+        )
 
 
 @router.post("/models/load")

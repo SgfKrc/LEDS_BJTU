@@ -88,6 +88,7 @@ _OWN_ATTRS = {
     "_manager", "model_loaded", "generation_config", "current_quant",
     "full_chat_execution_lock",
 }
+_ATTACHED_ATTRS: set[str] = set()
 
 
 class ModelHost:
@@ -122,7 +123,15 @@ class ModelHost:
         避免 scheduler 反向 import api_server（阶段 0.2）。
         """
         _OWN_ATTRS.add(name)
+        _ATTACHED_ATTRS.add(name)
         object.__setattr__(self, name, value)
+
+    def get_attachment(self, name: str) -> Any:
+        """Return an explicitly attached callback without invoking manager proxying."""
+
+        if name not in _ATTACHED_ATTRS:
+            return None
+        return object.__getattribute__(self, "__dict__").get(name)
 
     def peek_manager(self) -> Any:
         """Return an already-created manager without triggering lazy import."""
@@ -139,6 +148,15 @@ class ModelHost:
             return True
         manager = self.peek_manager()
         return bool(manager is not None and getattr(manager, "is_loaded", False))
+
+    def runtime_status(self) -> dict:
+        """Return the public, lazy-safe runtime state for diagnostics and tests."""
+
+        return {
+            "manager_loaded": self.peek_manager() is not None,
+            "model_loaded": self.has_loaded_model(),
+            "current_quant": object.__getattribute__(self, "current_quant"),
+        }
 
     def __getattr__(self, name):
         # object.__getattribute__ 直接取 _manager，避免 _manager 被 del 后

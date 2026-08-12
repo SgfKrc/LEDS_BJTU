@@ -53,6 +53,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
+from api_errors import coded_http_error, error_response_content
 from paged_kv_cache import PagedKVCache
 from multimodal import build_openai_user_content, validate_image_data_urls
 from device_profiler import DeviceProfiler, get_profile
@@ -388,7 +389,7 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
         )
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail, "request_id": request_id},
+        content=error_response_content(exc, request_id=request_id),
         headers=headers,
     )
 
@@ -3195,7 +3196,11 @@ async def load_model(req: LoadModelRequest):
 
     engine = req.engine.lower()
     if engine not in ("auto", "llama_cpp", "pytorch", "island"):
-        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island")
+        raise coded_http_error(
+            400,
+            "MODEL_ENGINE_UNSUPPORTED",
+            f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island",
+        )
 
     _validate_model_load_request(req.model_id, engine)
     resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
@@ -3258,7 +3263,11 @@ async def load_model(req: LoadModelRequest):
             else:
                 model_host.model_loaded = False
                 model_host.current_quant = QUANT_TYPE
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise coded_http_error(
+                500,
+                str(result.get("error_code") or "MODEL_LOAD_FAILED"),
+                result["error"],
+            )
 
     except HTTPException:
         raise
@@ -3651,8 +3660,9 @@ def _execute_task_graph_chat(
     global conversation_stats
 
     if not TASK_GRAPH_ENABLED:
-        raise HTTPException(
+        raise coded_http_error(
             409,
+            "TASK_GRAPH_DISABLED",
             "任务链实验未启用。请设置 QLH_TASK_GRAPH_ENABLED=true 后重启。",
         )
     journal = task_graph_coordinator.journal_status()
@@ -4198,18 +4208,21 @@ def _execute_task_graph_chat_with_slot(
     remote_provider_id = str(req.task_graph_remote_provider_id or "")
     auto_remote = bool(req.task_graph_auto_remote)
     if bool(remote_stage_id) != bool(remote_provider_id):
-        raise HTTPException(
+        raise coded_http_error(
             400,
+            "TASK_GRAPH_MANUAL_REMOTE_FIELDS_INCOMPLETE",
             "N2.1 手动远端执行必须同时指定 Stage 和 Provider ID。",
         )
     if auto_remote and remote_stage_id:
-        raise HTTPException(
+        raise coded_http_error(
             400,
+            "TASK_GRAPH_REMOTE_POLICY_CONFLICT",
             "N2.3 自动 Worker 选择不能与 N2.1 手动远端 Stage 同时启用。",
         )
     if remote_stage_id and not TASK_WORKER_EXPERIMENTAL_ENABLED:
-        raise HTTPException(
+        raise coded_http_error(
             409,
+            "TASK_WORKER_EXPERIMENT_DISABLED",
             "PC Full Worker 实验调度未启用。请设置 "
             "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
         )
@@ -4409,8 +4422,9 @@ def _execute_task_graph_chat_with_slot(
             {"message": "任务链已取消", "workflow_id": exc.workflow_id},
         ) from exc
     except WorkflowExecutionError as exc:
-        raise HTTPException(
+        raise coded_http_error(
             500,
+            exc.code,
             {
                 "message": str(exc),
                 "workflow_id": exc.workflow_id,
@@ -6512,7 +6526,11 @@ def _validate_model_load_request(model_id: Optional[str], engine: str) -> None:
 
     model = mc.get_model_config(model_id, _get_registered_experimental_models())
     if model is None:
-        raise HTTPException(status_code=404, detail=f"模型 '{model_id}' 未在注册表中找到。")
+        raise coded_http_error(
+            404,
+            "MODEL_NOT_REGISTERED",
+            f"模型 '{model_id}' 未在注册表中找到。",
+        )
 
     payload = _model_api_payload(model)
     if not payload["is_available"]:
@@ -6583,7 +6601,11 @@ async def switch_model(req: SwitchModelRequest):
     # 验证 engine 参数
     engine = req.engine.lower()
     if engine not in ("auto", "llama_cpp", "pytorch", "island"):
-        raise HTTPException(400, f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island")
+        raise coded_http_error(
+            400,
+            "MODEL_ENGINE_UNSUPPORTED",
+            f"不支持的引擎: {engine}，可选: auto, llama_cpp, pytorch, island",
+        )
     _validate_model_load_request(req.model_id, engine)
     resolved_model_path = _resolve_model_path_for_engine(req.model_id, engine)
     effective_engine = _effective_engine_for_model(req.model_id, engine)
@@ -6631,7 +6653,11 @@ async def switch_model(req: SwitchModelRequest):
             else:
                 model_host.model_loaded = False
                 model_host.current_quant = QUANT_TYPE
-            raise HTTPException(status_code=500, detail=result["error"])
+            raise coded_http_error(
+                500,
+                str(result.get("error_code") or "MODEL_SWITCH_FAILED"),
+                result["error"],
+            )
 
     except HTTPException:
         raise

@@ -589,7 +589,7 @@ def test_task_graph_manual_remote_stage_requires_both_explicit_fields(
         asyncio.run(api_server.chat(req))
 
     assert captured.value.status_code == 400
-    assert "同时指定" in str(captured.value.detail)
+    assert captured.value.error_code == "TASK_GRAPH_MANUAL_REMOTE_FIELDS_INCOMPLETE"
 
 
 def test_registered_remote_provider_is_never_selected_without_explicit_fields(
@@ -978,7 +978,7 @@ def test_task_graph_auto_remote_rejects_manual_remote_fields(task_graph_api):
         asyncio.run(api_server.chat(req))
 
     assert captured.value.status_code == 400
-    assert "不能与" in str(captured.value.detail)
+    assert captured.value.error_code == "TASK_GRAPH_REMOTE_POLICY_CONFLICT"
 
 
 def test_task_worker_experiment_gate_falls_back_auto_and_rejects_manual(
@@ -1012,9 +1012,7 @@ def test_task_worker_experiment_gate_falls_back_auto_and_rejects_manual(
     with pytest.raises(HTTPException) as captured:
         asyncio.run(api_server.chat(manual))
     assert captured.value.status_code == 409
-    assert "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED" in str(
-        captured.value.detail
-    )
+    assert captured.value.error_code == "TASK_WORKER_EXPERIMENT_DISABLED"
 
 
 def test_task_graph_mode_is_rejected_while_feature_flag_is_disabled(
@@ -1030,7 +1028,7 @@ def test_task_graph_mode_is_rejected_while_feature_flag_is_disabled(
         asyncio.run(api_server.chat(req))
 
     assert exc_info.value.status_code == 409
-    assert "QLH_TASK_GRAPH_ENABLED" in str(exc_info.value.detail)
+    assert exc_info.value.error_code == "TASK_GRAPH_DISABLED"
 
 
 def test_local_provider_dispatch_validates_runtime_return_type():

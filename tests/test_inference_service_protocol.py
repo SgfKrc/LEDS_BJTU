@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from api_errors import install_http_error_handler
 from inference_service.engine_host import EngineHost
 from inference_service.kv_host import KVHost
 from inference_service.protocol import ChatRequest, LoadModelRequest
@@ -153,6 +154,7 @@ def make_app(engine_host=None, kv_host=None) -> FastAPI:
     app = FastAPI()
     app.state.engine_host = engine_host if engine_host is not None else FakeEngineHost()
     app.state.kv_host = kv_host if kv_host is not None else KVHost()
+    install_http_error_handler(app)
     app.include_router(router)
     return app
 
@@ -406,8 +408,7 @@ def test_chat_cancel_during_stream(monkeypatch):
     gids = []
     deadline = _time.time() + 5.0
     while _time.time() < deadline:
-        with host._gen_lock:
-            gids = list(host._generations.keys())
+        gids = host.generation_status()["active_generation_ids"]
         if gids:
             break
         _time.sleep(0.02)
@@ -425,8 +426,7 @@ def test_chat_cancel_during_stream(monkeypatch):
     assert any(ev.get("token") == "[cancelled]" for ev in tokens)
     assert not any(ev.get("done") for ev in tokens)
     # 注册表已清空（无泄漏）
-    with host._gen_lock:
-        assert host._generations == {}
+    assert host.generation_status()["active_generation_count"] == 0
 
 
 # ----------------------------------------------------------------------
@@ -706,8 +706,7 @@ def test_worker_stage_route_generation_no_leak(monkeypatch):
     assert resp.status_code == 200
     assert captured["stage_type"] == "candidate_a"
     # 请求结束后注册表必须清空（无泄漏）
-    with host._gen_lock:
-        assert host._generations == {}
+    assert host.generation_status()["active_generation_count"] == 0
     # 且注册期间 cancel 可命中（用注册时的 gid）
     assert captured["cancel_event"] is not None
 
@@ -902,9 +901,9 @@ def test_engine_host_auto_load_selects_sorted_gguf_candidate(tmp_path, monkeypat
         "profile": {"tier": "edge", "gpu": {}},
         "engine": "llama_cpp",
     }]
-    assert host._host.model_loaded is True
-    assert host._host.current_quant == "int4"
-    assert host._kv_cache.page_size == 64
+    assert host.current_model()["loaded"] is True
+    assert host.current_model()["quant_type"] == "int4"
+    assert host.kv_cache_status()["page_size"] == 64
 
 
 def test_engine_host_remote_worker_selection_enforces_feature_health_model_and_load(
@@ -1081,8 +1080,9 @@ def test_external_chat_routes_and_persists(monkeypatch):
     assert result["metrics"]["engine"] == "external_api"
     assert result["metrics"]["request_origin"] == "pc_http"
     assert result["metrics"]["completion_tokens"] == 3
-    assert host._conversation_stats["rounds"] == 1
-    assert host._conversation_stats["total_generated_tokens"] == 3
+    stats = host.conversation_status()["stats"]
+    assert stats["rounds"] == 1
+    assert stats["total_generated_tokens"] == 3
     # 请求历史 = 原历史 + 新消息
     assert fake_client.last[0][-1] == {"role": "user", "content": "你好"}
     assert fake_client.last[1]["allow_external"] is True
@@ -1132,7 +1132,7 @@ def test_task_graph_gate_off():
     with pytest.raises(Exception) as excinfo:
         host.chat_full(req)
     assert excinfo.value.status_code == 409
-    assert "任务链实验未启用" in str(excinfo.value.detail)
+    assert excinfo.value.error_code == "TASK_GRAPH_DISABLED"
 
 
 def test_task_graph_chat_full_dispatches(monkeypatch):
@@ -1277,9 +1277,8 @@ def test_task_graph_with_slot_real_execution(monkeypatch):
     assert captured["run_template"]["root_input"]["message"] == "hi"
     assert captured["run_template"]["session_id"] == "s1"
     # 历史已追加（user + assistant）
-    assert len(host._session_histories["s1"]) == 2
-    assert host._session_histories["s1"][0]["role"] == "user"
-    assert host._session_histories["s1"][1]["role"] == "assistant"
+    history = host.session_history("s1")
+    assert [message["role"] for message in history] == ["user", "assistant"]
     # 本地 provider 注册成功（self._dispatch_local_task_provider 引用有效）
     assert "local_full_model" in fake_coord.providers
 
@@ -1380,13 +1379,13 @@ def test_chat_full_llama_cpp_path(monkeypatch):
     assert result["metrics"]["execution_mode"] == "local_llama_cpp"
     assert result["metrics"]["request_origin"] == "web_http"
     # 历史已追加两轮
-    assert host._session_histories["s1"][-2:] == [
+    assert host.session_history("s1")[-2:] == [
         {"role": "user", "content": "新问题"},
         {"role": "assistant", "content": "候选答案内容"},
     ]
     # followups：模型无合格问句 → 模板兜底 ≥2
     assert len(result["followups"]) >= 2
-    assert host._conversation_stats["rounds"] == 1
+    assert host.conversation_status()["stats"]["rounds"] == 1
 
 
 def test_chat_full_session_switch(monkeypatch):
@@ -1401,10 +1400,10 @@ def test_chat_full_session_switch(monkeypatch):
 
     req = ChatRequest(message="hello", session_id="s_new")
     result = host.chat_full(req)
-    assert host._active_session_id == "s_new"
+    assert host.conversation_status()["active_session_id"] == "s_new"
     assert result["content"] == "候选答案内容"
     # 新会话历史 = 本次对话
-    assert host._session_histories["s_new"][-1]["role"] == "assistant"
+    assert host.session_history("s_new")[-1]["role"] == "assistant"
 
 
 def test_chat_full_first_message_auto_title(monkeypatch):
@@ -1527,11 +1526,11 @@ def test_chat_full_pytorch_path(monkeypatch):
     assert result["content"] == "PyTorch本地回答"
     assert result["metrics"]["engine"] == "pytorch"
     assert result["metrics"]["execution_mode"] == "local_pytorch"
-    assert host._conversation_stats["rounds"] == 1
+    assert host.conversation_status()["stats"]["rounds"] == 1
     # followups 走 PyTorch 追问路径（模型无问句 → 兜底）
     assert len(result["followups"]) >= 2
     # 会话历史追加
-    assert host._session_histories["s1"][-1]["role"] == "assistant"
+    assert host.session_history("s1")[-1]["role"] == "assistant"
 
 
 # ----------------------------------------------------------------------
@@ -1919,14 +1918,14 @@ def test_scheduler_svc_host_selection(monkeypatch):
     sched = scheduler_svc_main.build_scheduler()
     from inference_client import InferenceClient
 
-    assert isinstance(sched._host, InferenceClient)
+    assert isinstance(sched.inference_host, InferenceClient)
 
     # 回退模式：host=进程内 model_host（一键回单进程）
     monkeypatch.setenv("QLH_MONOLITH", "1")
     sched2 = scheduler_svc_main.build_scheduler()
     from model_host import ModelHost
 
-    assert isinstance(sched2._host, ModelHost)
+    assert isinstance(sched2.inference_host, ModelHost)
 
 
 # ----------------------------------------------------------------------
@@ -2113,7 +2112,7 @@ def test_sched_http_device_profile_detect_failure(sched_http_client, monkeypatch
     monkeypatch.setattr(http_mod, "_detect_device_profile", _boom)
     r = client.get("/device/profile")
     assert r.status_code == 500
-    assert "设备检测失败" in r.json()["detail"]
+    assert r.json()["error_code"] == "DEVICE_PROFILE_DETECTION_FAILED"
 
 
 def test_sched_http_device_auto_configure(sched_http_client, monkeypatch):
@@ -2156,7 +2155,7 @@ def test_sched_http_device_select_gpu_not_ready(sched_http_client, monkeypatch):
     monkeypatch.setattr(http_mod, "_device_profile_cache", None)
     r = client.post("/device/select-gpu", json={"gpu_index": 0})
     assert r.status_code == 400
-    assert "未就绪" in r.json()["detail"]
+    assert r.json()["error_code"] == "DEVICE_PROFILE_NOT_READY"
 
 
 def test_sched_http_device_select_gpu_out_of_range(sched_http_client, monkeypatch):
@@ -2167,8 +2166,7 @@ def test_sched_http_device_select_gpu_out_of_range(sched_http_client, monkeypatc
     monkeypatch.setattr(http_mod, "_device_profile_cache", FAKE_DEVICE_PROFILE)
     r = client.post("/device/select-gpu", json={"gpu_index": 5})
     assert r.status_code == 400
-    assert "无效的 GPU 序号" in r.json()["detail"]
-    assert "0-0" in r.json()["detail"]
+    assert r.json()["error_code"] == "DEVICE_GPU_INDEX_INVALID"
 
 
 def test_sched_http_device_select_gpu_ok(sched_http_client, monkeypatch):
@@ -2285,7 +2283,7 @@ def test_models_load_invalid_engine_400(client):
     resp = client.post("/v1/models/load", json={
         "engine": "torch", "model_id": "qwen-1_8b"})
     assert resp.status_code == 400
-    assert "不支持的引擎" in resp.json()["detail"]
+    assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
 
 def test_models_load_engine_case_normalized(client):
@@ -2300,20 +2298,21 @@ def test_models_switch_invalid_engine_400(client):
     resp = client.post("/v1/models/switch", json={
         "model_id": "qwen-1_8b", "engine": "tensorrt"})
     assert resp.status_code == 400
-    assert "不支持的引擎" in resp.json()["detail"]
+    assert resp.json()["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
 
 
 def test_models_switch_unregistered_404(client):
     resp = client.post("/v1/models/switch", json={
         "model_id": "no-such-model", "engine": "llama_cpp"})
     assert resp.status_code == 404
-    assert "未在注册表中找到" in resp.json()["detail"]
+    assert resp.json()["error_code"] == "MODEL_NOT_REGISTERED"
 
 
 def test_models_load_unregistered_404(client):
     resp = client.post("/v1/models/load", json={
         "model_id": "no-such-model", "engine": "llama_cpp"})
     assert resp.status_code == 404
+    assert resp.json()["error_code"] == "MODEL_NOT_REGISTERED"
 
 
 class _FakeLoadHost:
