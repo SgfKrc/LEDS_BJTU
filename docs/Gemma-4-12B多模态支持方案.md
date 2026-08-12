@@ -1,8 +1,8 @@
 # Gemma-4-12B 多模态支持方案（实施计划）
 
-> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；G4.3.2B 原生初始化与图片语义受 RAM 门 Blocked）
+> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；G4.3.2B 原生初始化与图片语义受 RAM 门 Blocked；EX-N3-GEMMA-S1 静态质量计数桥接完成）
 >
-> 更新日期：2026-08-11
+> 更新日期：2026-08-13
 > 适用范围：原版 Gemma 4 12B 经本机 Ollama `external_api` 提供文本与图像理解；G4.3.1/2A 已完成原生候选的 ABI 与资产身份门，音频和原生实际推理另列后续票
 >
 > 目标：先提供可验证、可回滚的原版 Gemma 4 12B 图像理解能力，再补产品交互；`myheretic:latest` 仍只作为用户私有资产，不进入项目基线。
@@ -202,6 +202,12 @@ G4.3.2A 已冻结本机已有官方 Ollama `registry.ollama.ai/library/gemma4:12
 
 G4.3.2B 的恢复条件是运行前可用 RAM 不低于该报告中的 `required_free_ram_bytes`，并保持没有 Ollama 模型驻留；恢复后先执行 CPU-only `n_ctx=128` 初始化与固定测试图语义对照，再分别评估卸载、取消、8K/16K、audio、offload、打包和调度。不得以增加虚拟内存、隐式换页或降低身份校验来绕过此门。
 
+### 5.5 EX-N3-GEMMA-S1 静态质量计数桥接（Completed，非模型验收）
+
+`scripts/experiment_gemma_quality_unit.py` 与 `plan-quality-gemma-bridge-fixture-v1` 只验证实验质量链路能安全接收 Gemma 的受限计数证据。记录 schema v2 只保留锁定的 `gemma4:12b`、判题契约 ID/SHA-256、主题命中和关键要素覆盖的已评估/通过计数；prompt、图片、base64、路径、URL、模型输出、判题解释与 reasoning 均被拒绝。该票不导入或调用 Gemma、Ollama、CUDA、网络或图像文件。
+
+fixture 以 `0.8/0.6` 穿过预注册的 `0.70/0.50` advisory 阈值，仅证明 schema、脱敏和汇总通路；它不证明图片语义、Gemma 正确率或阈值合理性。在实际 SD→Gemma 三轮取数和人工复核完成前，框架禁止将 `gemma_judge` 配置为 `quality.required=true`。这条边界与 G4.3.2B 的 RAM 门互不替代。
+
 ---
 
 ## 6. 方案对比与推荐
@@ -225,6 +231,7 @@ G4.3.2B 的恢复条件是运行前可用 RAM 不低于该报告中的 `required
 | G4.2 Web/TUI 图片交互 | Completed（2026-08-11） | 选择/预览/删除图片，发送状态，4 图/8MiB/16MiB 提示，外部授权与 TUI 本地路径队列 | Python 定向 `179 passed`；Web 桩契约 `1 passed`；真实 Edge → QLH → `gemma4:12b` `1 passed`；全量（测试进程 `NO_PROXY=*`）`1915 passed / 26 skipped` |
 | G4.3.1 原生绑定/ABI 预检 | Completed（2026-08-11） | 独立只读 worker、MTMD 必需 ABI、项目锁定 revision/当前 binding 版本、SHA 强制与路径脱敏契约 | 定向 `56 passed / 2 skipped`；全量 `1934 passed / 13 skipped`；开发机 `llama-cpp-python 0.3.28` 报告 MTMD ABI 完整；无工件时明确 `gate_passed=false` |
 | G4.3.2A 官方工件身份与资源准入 | Completed（2026-08-11） | 固定官方 manifest/许可、主 GGUF/mmproj 双 SHA 与元数据配对；资源门先于原生初始化 | `gemma4-native-assets --full-hash` 通过；两次预检可用 RAM 约 5-6GiB 小于约 8.74GiB 门，安全返回 `resource_rejected`，未加载模型；定向 `59 passed / 2 skipped`，当前全量 `1942 passed / 8 skipped` |
+| EX-N3-GEMMA-S1 静态质量证据桥接 | Completed（2026-08-13） | 模型/判题契约 SHA 绑定、两项计数投影、脱敏拒绝、v2 schema 与报告汇总 | 7 项专项静态回归通过；不运行 Gemma/Ollama/图像，`0.8/0.6` fixture 不构成模型或阈值验收 |
 | G4.3.2B 原生初始化与图片 smoke | Blocked（资源门） | CPU-only 初始化、固定测试图与 Ollama 图像语义对照 | 可用 RAM 达到报告门且 Ollama 未驻留后，先得 `ready_for_image_smoke`，再验证语义一致；未知配对/摘要/初始化均 fail-closed |
 | G4.3.3 音频、资源、打包与分布式 | Candidate | 音频契约、8K/16K、取消/卸载/OOM、CPU/GPU offload、Windows/Linux 离线包、调度 | 所有门通过后才可新增 recipe 或让调度选中原生路径 |
 
