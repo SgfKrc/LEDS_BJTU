@@ -1419,7 +1419,9 @@ def test_scheduler_does_not_advertise_a_layer_partition_as_full_model(
     capabilities = scheduler._task_worker_capabilities()
 
     assert capabilities["models"] == []
-    assert capabilities["stage_types"] == ["full_inference", "aggregate"]
+    assert capabilities["stage_types"] == [
+        "full_inference", "aggregate", "image_prompt",
+    ]
 
 
 def test_scheduler_worker_gate_blocks_hello_and_rejects_stale_offer(

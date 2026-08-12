@@ -554,7 +554,7 @@ class RemoteFullWorkerProvider:
             provider_kind=self.provider_kind,
             supported_stage_types=tuple(
                 value for value in stage_types
-                if value in {"full_inference", "aggregate"}
+                if value in {"full_inference", "aggregate", "image_prompt"}
             ),
             max_concurrency=max_concurrency,
             active_reservations=active,
@@ -578,6 +578,20 @@ class RemoteFullWorkerProvider:
                 model_identity, capabilities.get("models", []),
             )
         )
+
+    def model_identities(self) -> tuple[ModelIdentity, ...]:
+        """Return validated immutable identities advertised by this v2 Worker."""
+        capabilities = self._snapshot().get("capabilities", {})
+        models = capabilities.get("models", []) if isinstance(capabilities, dict) else []
+        identities = []
+        for model in models if isinstance(models, list) else []:
+            if not isinstance(model, dict):
+                continue
+            try:
+                identities.append(ModelIdentity(**model))
+            except (TypeError, ValueError):
+                continue
+        return tuple(identities)
 
     def reserve(self, request: StageRequest) -> Reservation:
         snapshot = self._snapshot()

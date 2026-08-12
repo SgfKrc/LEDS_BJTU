@@ -68,6 +68,7 @@ from task_graph import (
     WorkflowExecutionError,
     WorkflowNotFound,
     dual_candidate_template,
+    image_prompt_sd15_template,
 )
 from task_journal import SQLiteTaskJournal, TaskJournalError
 from task_provider import (
@@ -1006,6 +1007,22 @@ class DiffusionDistributedGridRequest(DiffusionDistributedGenerateRequest):
 
     seeds: list[int] = Field(..., min_length=4, max_length=4)
     layout: Literal["2x2"] = "2x2"
+
+
+class DiffusionMixedGenerateRequest(DiffusionDistributedGenerateRequest):
+    """Fixed v2 text-prompt to v3 SD15 image workflow; no UI exposure yet."""
+
+    message: str = Field(..., min_length=1, max_length=4000)
+    text_provider_id: Optional[str] = Field(default=None, max_length=128)
+    text_model_id: Optional[str] = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_mixed_prompt_source(self):
+        if self.prompt is not None:
+            raise ValueError("mixed workflow derives prompt from message")
+        if self.text_model_id and not self.text_provider_id:
+            raise ValueError("text_model_id requires text_provider_id")
+        return self
 
 
 class DiffusionEditRequest(BaseModel):
@@ -2395,6 +2412,14 @@ async def generate_distributed_diffusion_grid(
 ):
     """Experimental four-seed fan-out/fan-in; no UI exposure before SD-N4 hardware gate."""
     return await run_in_threadpool(_run_distributed_diffusion_grid, req)
+
+
+@app.post('/api/diffusion/distributed/mixed')
+async def generate_distributed_mixed_image(
+    req: DiffusionMixedGenerateRequest,
+):
+    """Experimental fixed v2 text-prompt -> v3 SD15 image workflow."""
+    return await run_in_threadpool(_run_distributed_mixed_generation, req)
 
 
 def _run_distributed_diffusion_grid(
@@ -4019,6 +4044,207 @@ def _run_distributed_diffusion_generation(
     }
 
 
+def _select_mixed_text_worker(
+    req: DiffusionMixedGenerateRequest,
+):
+    """Choose one exact v2 text worker without guessing among model identities."""
+    if not TASK_WORKER_EXPERIMENTAL_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "MIXED_TEXT_WORKER_EXPERIMENT_DISABLED"},
+        )
+    _sync_remote_task_worker_providers()
+    statuses = {
+        str(item.get("provider_id", "")): item
+        for item in task_graph_coordinator.provider_status()
+    }
+    matches = []
+    for provider in scheduler.remote_task_worker_providers():
+        if req.text_provider_id and provider.provider_id != req.text_provider_id:
+            continue
+        status = statuses.get(provider.provider_id, {})
+        if (
+            status.get("provider_kind") != "remote_full_worker"
+            or not status.get("healthy")
+            or not status.get("available")
+            or "image_prompt" not in status.get("supported_stage_types", [])
+        ):
+            continue
+        for identity in provider.model_identities():
+            if req.text_model_id and identity.model_id != req.text_model_id:
+                continue
+            if provider.supports_model_identity(identity, "image_prompt"):
+                matches.append((provider, identity))
+    if not matches:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "MIXED_TEXT_WORKER_UNAVAILABLE",
+                "message": "没有健康且加载完整模型的 v2 文本 Worker",
+            },
+        )
+    identities = {identity for _, identity in matches}
+    if len(identities) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MIXED_TEXT_MODEL_SELECTION_REQUIRED",
+                "message": "多个文本模型身份可用，请显式指定 text_provider_id 与 text_model_id",
+            },
+        )
+    matches.sort(key=lambda item: item[0].provider_id)
+    return matches[0]
+
+
+def _run_distributed_mixed_generation(
+    req: DiffusionMixedGenerateRequest,
+) -> dict[str, Any]:
+    """Run the fixed v2 image-prompt -> v3 SD15 image template.
+
+    This is intentionally not a chat route and does not expose arbitrary DAG
+    construction. The coordinator binds text content to the image prompt after
+    v2 completion, so the v3 offer retains an empty dependencies object.
+    """
+    if not TASK_GRAPH_ENABLED or not DIFFUSION_WORKER_EXPERIMENTAL_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "MIXED_WORKFLOW_EXPERIMENT_DISABLED"},
+        )
+    if scheduler._effective_role() != "master":
+        raise HTTPException(status_code=403, detail="只有主节点可以提交混合图像 workflow")
+    data_plane = getattr(app.state, "diffusion_data_plane", None)
+    if not isinstance(data_plane, DiffusionDataPlaneRuntime):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "DIFFUSION_DATA_PLANE_UNAVAILABLE"},
+        )
+    text_provider, text_identity = _select_mixed_text_worker(req)
+    image_provider, manifest = _diffusion_worker_manifest_candidates(req)
+    if text_provider.node_id == image_provider.node_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MIXED_WORKER_ROLE_CONFLICT",
+                "message": "同一节点不能同时承担 v2 文本和 v3 图像 Stage",
+            },
+        )
+    try:
+        generation = build_sd15_generation_request(
+            preset_id=req.preset_id,
+            prompt="generated prompt pending",
+            negative_prompt=req.negative_prompt,
+            seed=req.seed,
+            width=req.width,
+            height=req.height,
+            steps=req.steps,
+            guidance_scale=req.guidance_scale,
+            scheduler=req.scheduler,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "MIXED_IMAGE_REQUEST_INVALID", "message": str(exc)},
+        ) from exc
+    image_root_input = {
+        "prompt": "",
+        "negative_prompt": generation.negative_prompt,
+        "seed": generation.seed,
+        "width": generation.width,
+        "height": generation.height,
+        "steps": generation.steps,
+        "guidance_scale": generation.guidance_scale,
+        "scheduler": generation.scheduler,
+        "artifact_manifest_sha256": manifest["sha256"],
+    }
+    workflow_id = req.workflow_id or f"wf_{uuid.uuid4().hex}"
+    stages, final_stage_id = image_prompt_sd15_template(
+        text_provider_id=text_provider.provider_id,
+        image_provider_id=image_provider.provider_id,
+        text_model_identity=text_identity,
+    )
+    stages[0] = replace(
+        stages[0],
+        root_input_overrides={
+            "__replace__": {
+                "message": req.message,
+                "task_options": {
+                    "candidate_max_tokens": 192,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "show_thinking": False,
+                },
+            },
+        },
+    )
+    stages[1] = replace(
+        stages[1], root_input_overrides={"__replace__": image_root_input},
+    )
+    try:
+        output, snapshot = task_graph_coordinator.run(
+            stages=stages,
+            final_stage_id=final_stage_id,
+            root_input={},
+            request_id=_request_id_ctx.get("") or uuid.uuid4().hex,
+            template="llm_sd15_v1",
+            workflow_id=workflow_id,
+            runtime_context={"diffusion_artifact_manifest": manifest},
+        )
+        image = output.get("image") if isinstance(output, dict) else None
+        metrics = output.get("metrics") if isinstance(output, dict) else None
+        if not isinstance(image, dict) or not isinstance(metrics, dict) or not image.get("blob_id"):
+            raise TaskGraphError("mixed workflow returned an invalid image result")
+        committed = task_graph_coordinator.commit_result(workflow_id)
+    except WorkflowCancelled as exc:
+        _discard_distributed_workflow_blobs(exc.workflow_id, revoke_leases=True)
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "MIXED_WORKFLOW_CANCELLED", "workflow_id": exc.workflow_id},
+        ) from exc
+    except WorkflowExecutionError as exc:
+        _discard_distributed_workflow_blobs(workflow_id, revoke_leases=True)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "MIXED_WORKFLOW_FAILED", "workflow_id": workflow_id},
+        ) from exc
+    except TaskGraphError as exc:
+        _discard_distributed_workflow_blobs(workflow_id, revoke_leases=True)
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "MIXED_WORKFLOW_INVALID", "workflow_id": workflow_id},
+        ) from exc
+    prompt_stage = next(
+        (stage for stage in snapshot.get("stages", []) if stage.get("stage_id") == "image_prompt"),
+        {},
+    )
+    prompt_digest = str(prompt_stage.get("output_sha256", "") or "")
+    image = dict(image)
+    image["url"] = (
+        f"/api/diffusion/distributed/workflows/{workflow_id}/blobs/{image['blob_id']}"
+    )
+    return {
+        "status": "completed",
+        "distributed": True,
+        "workflow": _public_workflow(committed, task_graph_coordinator.journal_status()),
+        "result": {"image": image, "metrics": dict(metrics)},
+        "text_provider_id": text_provider.provider_id,
+        "text_node_id": text_provider.node_id,
+        "text_model_identity": text_identity.snapshot(),
+        "image_provider_id": image_provider.provider_id,
+        "image_node_id": image_provider.node_id,
+        "artifact_manifest_sha256": manifest["sha256"],
+        "prompt_contract": {
+            "source_stage": "image_prompt",
+            "target_field": "prompt",
+            "v3_dependencies": "omitted_after_local_binding",
+            "output_sha256": prompt_digest,
+        },
+        "cancellation": {
+            "endpoint": f"/api/workflows/{workflow_id}/cancel",
+            "supported_during_execution": True,
+        },
+    }
+
+
 def _eligible_remote_task_worker_provider_ids(
     model_identity: ModelIdentity,
     stage_type: str,
@@ -4150,6 +4376,26 @@ def _execute_task_worker_stage(
             [{"role": "system", "content": instruction}, *messages],
             candidate_budget,
         )
+    if stage_request.stage_type == "image_prompt":
+        message = str(root_input.get("message", "") or "").strip()
+        if not message:
+            raise TaskGraphError("图像提示词 Stage 缺少原始需求")
+        result = run_model(
+            [{
+                "role": "system",
+                "content": (
+                    "将用户需求改写为一条可直接用于 Stable Diffusion 1.5 的视觉提示词。"
+                    "仅输出提示词本身，不解释、不使用 Markdown、不声明任务链。"
+                ),
+            }, {"role": "user", "content": message}],
+            min(candidate_budget, 192),
+        )
+        prompt = str(result.get("content", "") or "").strip()
+        if not prompt or len(prompt) > 1000:
+            raise TaskGraphError("图像提示词 Stage 输出为空或超出长度限制")
+        result["content"] = prompt
+        result.pop("thinking_content", None)
+        return result
     if stage_request.stage_type == "aggregate":
         message = str(root_input.get("message", "") or "")
         if not message:
@@ -6088,6 +6334,14 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
                 "ui_enabled": False,
                 "hardware_validation": "pending_two_physical_cuda_pcs",
             },
+            "mixed": {
+                "template": "llm_sd15_v1",
+                "endpoint": "/api/diffusion/distributed/mixed",
+                "ui_enabled": False,
+                "stages": ["image_prompt", "image_generate"],
+                "contract": "v2_text_to_v3_root_prompt_binding",
+                "hardware_validation": "pending_two_physical_cuda_pcs",
+            },
         },
         "journal": public_journal,
         "workflows": workflows,
@@ -6167,7 +6421,7 @@ async def cancel_workflow(workflow_id: str):
         }
     if (
         workflow.get("state") == "cancelled"
-        and workflow.get("template") in {"image_generate_v1", "image_grid_v1"}
+        and workflow.get("template") in {"image_generate_v1", "image_grid_v1", "llm_sd15_v1"}
     ):
         try:
             _discard_distributed_workflow_blobs(workflow_id)

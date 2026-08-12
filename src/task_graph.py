@@ -128,6 +128,13 @@ class StageSpec:
         compare=False,
         repr=False,
     )
+    # Fixed templates may bind one completed dependency field into this Stage's
+    # root input. Bound dependencies are not forwarded to the Provider.
+    input_bindings: dict[str, tuple[str, str]] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
     # When omitted, the workflow identity is used for backwards compatibility.
     model_identity: Optional[ModelIdentity] = None
 
@@ -248,6 +255,13 @@ class StageRecord:
             "minimum_successful_dependencies": (
                 self.minimum_successful_dependencies()
             ),
+            "input_bindings": {
+                target: {
+                    "dependency_stage_id": source[0],
+                    "output_key": source[1],
+                }
+                for target, source in self.spec.input_bindings.items()
+            },
             "max_same_provider_retries": self.spec.max_same_provider_retries,
             "retry_safe": self.spec.retry_safe,
             "lease_epoch": self.lease_epoch,
@@ -401,6 +415,38 @@ def dual_candidate_template() -> tuple[list[StageSpec], str]:
             retry_safe=True,
         ),
     ], "aggregate"
+
+
+def image_prompt_sd15_template(
+    *,
+    text_provider_id: str,
+    image_provider_id: str,
+    text_model_identity: ModelIdentity,
+) -> tuple[list[StageSpec], str]:
+    """Return the only admitted v2-text -> v3-image mixed workflow.
+
+    The text result is bound locally into the image root input instead of
+    becoming a v3 dependency. This keeps the image protocol's Blob-only
+    dependency boundary intact and does not create a general DAG API.
+    """
+    return [
+        StageSpec(
+            "image_prompt",
+            "image_prompt",
+            provider=text_provider_id,
+            model_identity=text_model_identity,
+            pure=True,
+            lease_timeout_seconds=120.0,
+        ),
+        StageSpec(
+            "image_generate",
+            "image_generate",
+            depends_on=("image_prompt",),
+            provider=image_provider_id,
+            input_bindings={"prompt": ("image_prompt", "content")},
+            lease_timeout_seconds=600.0,
+        ),
+    ], "image_generate"
 
 
 class TaskGraphCoordinator:
@@ -1618,6 +1664,25 @@ class TaskGraphCoordinator:
                 raise TaskGraphError(
                     f"stage {spec.stage_id} root input overrides must use non-empty string keys"
                 )
+            if not isinstance(spec.input_bindings, dict):
+                raise TaskGraphError(
+                    f"stage {spec.stage_id} input bindings must be an object"
+                )
+            for target_key, source in spec.input_bindings.items():
+                if (
+                    not isinstance(target_key, str)
+                    or not target_key
+                    or not isinstance(source, tuple)
+                    or len(source) != 2
+                    or any(not isinstance(value, str) or not value for value in source)
+                ):
+                    raise TaskGraphError(
+                        f"stage {spec.stage_id} input bindings are invalid"
+                    )
+                if source[0] not in spec.depends_on:
+                    raise TaskGraphError(
+                        f"stage {spec.stage_id} input binding source must be a dependency"
+                    )
             dependency_count = len(spec.depends_on)
             minimum_successful = spec.minimum_successful_dependencies
             if minimum_successful is None:
@@ -2281,6 +2346,22 @@ class TaskGraphCoordinator:
             stage_root_input = dict(replacement)
         else:
             stage_root_input.update(stage.spec.root_input_overrides)
+        for target_key, (dependency_stage_id, output_key) in (
+            stage.spec.input_bindings.items()
+        ):
+            dependency_output = dependencies.get(dependency_stage_id)
+            if not isinstance(dependency_output, dict) or output_key not in dependency_output:
+                raise TaskGraphError(
+                    f"stage {stage.spec.stage_id} input binding source output is unavailable"
+                )
+            value = dependency_output[output_key]
+            if stage.spec.stage_type == "image_generate" and target_key == "prompt":
+                if not isinstance(value, str) or not value.strip() or len(value) > 1000:
+                    raise TaskGraphError(
+                        "image prompt binding output is empty or exceeds the contract limit"
+                    )
+            stage_root_input[target_key] = value
+            dependencies.pop(dependency_stage_id, None)
         provider_request = StageRequest(
             workflow_id=workflow.workflow_id,
             request_id=workflow.request_id,

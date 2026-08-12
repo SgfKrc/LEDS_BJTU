@@ -12,6 +12,7 @@ from task_graph import (
     TaskGraphCoordinator,
     TaskGraphError,
     TaskGraphUnavailable,
+    image_prompt_sd15_template,
 )
 from task_journal import SQLiteTaskJournal, TaskJournalError
 from task_provider import (
@@ -461,3 +462,78 @@ def test_stage_model_identity_routes_heterogeneous_fake_workers():
     assert stages["candidate_a"]["model_identity"] == worker_a_identity.snapshot()
     assert stages["candidate_b"]["model_identity"] == worker_b_identity.snapshot()
     assert stages["aggregate"]["model_identity"] == worker_a_identity.snapshot()
+
+
+def test_fixed_llm_sd15_template_binds_text_locally_without_image_dependencies():
+    identity = ModelIdentity(
+        model_id="qwen-1_8b",
+        engine="pytorch",
+        format="safetensors",
+        revision="local-rev1",
+        sha256="3" * 64,
+    )
+    observed = {}
+    registry = ProviderRegistry()
+    registry.register(DeterministicFakeProvider(
+        "text_worker",
+        supported_stage_types=("image_prompt",),
+        output_factory=lambda request, cancel_event: {"content": "misty mountain cabin"},
+    ))
+
+    def generate(request, cancel_event):
+        observed["root_input"] = dict(request.root_input)
+        observed["dependencies"] = dict(request.dependencies)
+        return {"image": {"blob_id": "img_test"}, "metrics": {"seed": 1}}
+
+    registry.register(DeterministicFakeProvider(
+        "image_worker",
+        supported_stage_types=("image_generate",),
+        output_factory=generate,
+    ))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+    stages, final_stage_id = image_prompt_sd15_template(
+        text_provider_id="text_worker",
+        image_provider_id="image_worker",
+        text_model_identity=identity,
+    )
+    stages[0] = StageSpec(
+        **{**stages[0].__dict__, "root_input_overrides": {
+            "__replace__": {"message": "a cabin at dawn"},
+        }},
+    )
+    stages[1] = StageSpec(
+        **{**stages[1].__dict__, "root_input_overrides": {
+            "__replace__": {"prompt": "", "seed": 1},
+        }},
+    )
+    try:
+        output, workflow = coordinator.run(
+            stages,
+            final_stage_id,
+            {},
+            workflow_id="wf_mixedbinding01",
+        )
+    finally:
+        coordinator.close()
+
+    assert output["image"]["blob_id"] == "img_test"
+    assert observed == {
+        "root_input": {"prompt": "misty mountain cabin", "seed": 1},
+        "dependencies": {},
+    }
+    image_stage = next(stage for stage in workflow["stages"] if stage["stage_id"] == "image_generate")
+    assert image_stage["input_bindings"] == {
+        "prompt": {"dependency_stage_id": "image_prompt", "output_key": "content"},
+    }
+
+
+def test_input_binding_must_reference_a_declared_dependency():
+    with pytest.raises(TaskGraphError, match="binding source must be a dependency"):
+        TaskGraphCoordinator.validate(
+            [StageSpec(
+                "image_generate",
+                "image_generate",
+                input_bindings={"prompt": ("image_prompt", "content")},
+            )],
+            "image_generate",
+        )
