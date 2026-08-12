@@ -23,6 +23,43 @@ fun networkTypeFromTransports(
     else -> "other"
 }
 
+// ---- 聊天与会话 UI 状态机（不访问 Room、DataStore 或网络，JVM 可单测） ----
+
+fun selectUiTab(state: MainUiState, tab: String): MainUiState =
+    state.copy(currentTab = tab)
+
+fun selectUiSession(
+    state: MainUiState,
+    sessionId: Long,
+    sessionTitle: String,
+): MainUiState = state.copy(
+    currentSessionId = sessionId,
+    currentSessionTitle = sessionTitle,
+    currentTab = "chat",
+)
+
+fun startMessageSubmission(state: MainUiState, message: String): MainUiState =
+    state.copy(isLoading = true, error = null, lastSentMessage = message)
+
+fun completeMessageSubmission(state: MainUiState): MainUiState =
+    state.copy(isLoading = false, error = null)
+
+fun failMessageSubmission(state: MainUiState, error: String): MainUiState =
+    state.copy(isLoading = false, error = error)
+
+fun startMessageRetry(state: MainUiState): MainUiState =
+    if (state.lastSentMessage == null) state else state.copy(isLoading = true, error = null)
+
+fun clearMessageError(state: MainUiState): MainUiState =
+    state.copy(error = null)
+
+fun formatMessageSendError(error: Throwable): String = when (error) {
+    is java.net.ConnectException -> "无法连接主节点，请检查地址和网络"
+    is java.net.SocketTimeoutException -> "连接超时，请检查主节点是否运行"
+    is UnsupportedOperationException -> error.message ?: "当前模式暂不支持"
+    else -> "发送失败: ${error.message ?: error.javaClass.simpleName}"
+}
+
 /** Android 节点 presence 设备信息 payload（纯组装；不包含模型绝对路径/密钥）。 */
 fun buildAndroidPresencePayload(
     inferenceMode: String,

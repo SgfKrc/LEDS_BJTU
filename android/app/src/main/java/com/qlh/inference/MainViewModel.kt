@@ -252,7 +252,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // ==================== 导航 ====================
 
     fun selectTab(tab: String) {
-        _uiState.value = _uiState.value.copy(currentTab = tab)
+        _uiState.value = selectUiTab(_uiState.value, tab)
     }
 
     // ==================== 会话管理 ====================
@@ -278,10 +278,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** 同步版本 — 供内部 suspend 函数直接调用，避免 race condition */
     private suspend fun selectSessionInternal(sessionId: Long) {
         val session = repository.getSession(sessionId)
-        _uiState.value = _uiState.value.copy(
-            currentSessionId = sessionId,
-            currentSessionTitle = session?.title ?: "新对话",
-            currentTab = "chat"
+        _uiState.value = selectUiSession(
+            _uiState.value,
+            sessionId,
+            session?.title ?: "新对话",
         )
     }
 
@@ -323,11 +323,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val state = ensureActiveSession()
-                _uiState.value = state.copy(
-                    isLoading = true,
-                    error = null,
-                    lastSentMessage = message
-                )
+                _uiState.value = startMessageSubmission(state, message)
 
                 val result = repository.sendMessage(
                     sessionId = state.currentSessionId,
@@ -339,20 +335,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
 
                 result.onSuccess {
-                    _uiState.value = _uiState.value.copy(isLoading = false, error = null)
+                    _uiState.value = completeMessageSubmission(_uiState.value)
                     refreshRuntimeStatus()
                 }.onFailure { e ->
                     QlhLogger.e("MainViewModel", "sendMessage failed", e)
-                    _uiState.value = _uiState.value.copy(
-                        isLoading = false,
-                        error = formatSendError(e)
+                    _uiState.value = failMessageSubmission(
+                        _uiState.value,
+                        formatMessageSendError(e),
                     )
                 }
             } catch (e: Exception) {
                 QlhLogger.e("MainViewModel", "sendMessage crashed", e)
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    error = formatSendError(e)
+                _uiState.value = failMessageSubmission(
+                    _uiState.value,
+                    formatMessageSendError(e),
                 )
             }
         }
@@ -363,7 +359,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val state = ensureActiveSession()
-                _uiState.value = state.copy(isLoading = true, error = null)
+                _uiState.value = startMessageRetry(state)
 
                 // 跳过用户消息保存（上次失败的尝试已保存），只重新调用 API
                 val result = repository.sendMessage(
@@ -377,27 +373,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
 
                 result.onSuccess {
-                    _uiState.value = _uiState.value.copy(isLoading = false, error = null)
+                    _uiState.value = completeMessageSubmission(_uiState.value)
                     refreshRuntimeStatus()
                 }.onFailure { e ->
                     QlhLogger.e("MainViewModel", "retryLastMessage failed", e)
-                    _uiState.value = _uiState.value.copy(
-                        isLoading = false,
-                        error = formatSendError(e)
+                    _uiState.value = failMessageSubmission(
+                        _uiState.value,
+                        formatMessageSendError(e),
                     )
                 }
             } catch (e: Exception) {
                 QlhLogger.e("MainViewModel", "retryLastMessage crashed", e)
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    error = formatSendError(e)
+                _uiState.value = failMessageSubmission(
+                    _uiState.value,
+                    formatMessageSendError(e),
                 )
             }
         }
     }
 
     fun clearError() {
-        _uiState.value = _uiState.value.copy(error = null)
+        _uiState.value = clearMessageError(_uiState.value)
     }
 
     fun refreshRuntimeStatus() {
@@ -440,15 +436,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             storage = provider.getStorageStatus(),
             gpu = provider.getGpuStatus(),
         )
-    }
-
-    private fun formatSendError(e: Throwable): String {
-        return when (e) {
-            is java.net.ConnectException -> "无法连接主节点，请检查地址和网络"
-            is java.net.SocketTimeoutException -> "连接超时，请检查主节点是否运行"
-            is UnsupportedOperationException -> e.message ?: "当前模式暂不支持"
-            else -> "发送失败: ${e.message ?: e.javaClass.simpleName}"
-        }
     }
 
     private suspend fun ensureAndroidBootstrap(force: Boolean = false) {
