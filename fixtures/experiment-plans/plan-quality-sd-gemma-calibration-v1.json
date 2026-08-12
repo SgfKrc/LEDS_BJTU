@@ -8,7 +8,7 @@
   "env": {
     "engine": "Real SD 1.5 ten-seed text-to-image + Ollama gemma4:12b image-to-text judging",
     "gpu": "rtx4060-8gb",
-    "notes": "按 §6.2 冻结准则：三轮基线标定；SD 与 Gemma 判题经资源 {\"gpu\":\"any\"} 强制串行。quality.required=false：真实三轮标定完成并经人工复核前，gemma_judge 不得设为 required=true。SD 报告与 Gemma 证据由前置步骤产生（quality_gate_sd15.py + experiment_gemma_judge_real.py），本 plan 的 units 只做契约校验；提示词集 ps-sd-v1 已冻结（SHA 8b1775e0…）。"
+    "notes": "按 §6.2 冻结准则：三轮基线标定；SD 与 Gemma 判题经资源 {\"gpu\":\"any\"} 强制串行。quality.required=false：真实三轮标定完成并经人工复核前，gemma_judge 不得设为 required=true。SD 报告与 Gemma 证据由前置步骤产生（quality_gate_sd15.py + experiment_gemma_judge_real.py），本 plan 的 units 只做契约校验；提示词集 ps-sd-v1 已冻结（SHA 8b1775e0…）。 2026-08-13 三轮标定（sd-gemma-cal-v1）：topic 25/30=0.833、coverage 28/60=0.467；coverage 基线按 §6.2.5 由 0.50 修订为 0.40，topic 保留 0.70。"
   },
   "quality": {
     "required": false,
@@ -17,7 +17,7 @@
       "judge_contract_id": "gemma-judge-counts-v1",
       "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
       "topic_hit_rate_baseline": 0.7,
-      "key_element_coverage_baseline": 0.5
+      "key_element_coverage_baseline": 0.4
     },
     "sd": {
       "asset_ids": [
