@@ -1,110 +1,113 @@
-# Qwen3.5 与 Qwen3-VL 小模型支持计划
+# Qwen3、Qwen3-VL 与 Qwen3.5 模型支持计划
 
-> 状态：规划（调研与实施均未开始）
+> 状态：`QW3-S0 Completed（调研，2026-08-13）`；`QW3-D1` 受控下载与登记准备就绪，尚未执行下载、登记或修改运行时。
 >
 > 更新日期：2026-08-13
-> 适用范围：为本项目补充 Qwen3.5 系列（0.8B / 2B / 4B / 9B）与 Qwen3-VL 系列（4B / 8B）的模型支持与实验接入；文本模型经既有 GGUF/Safetensors 引擎路径，VL 模型经 Ollama `external_api` 多模态路径（与 Gemma 4 同构）
 >
-> 目标：丰富项目与实验的模型梯度（0.8B→9B 文本 + 4B/8B 多模态），并借「非 R1 系 + 推理能力较强」的特性评估恢复 EX-N3 LLM 客观判题正确率口径
+> 适用范围：Qwen3 文本系列、Qwen3-VL 系列与 Qwen3.5 原生多模态系列的工件获取、引擎准入和 EX-N3 质量标定。Gemma 4 的新格式工件另立候选票，不在本文引用或预设未建立的 Gemma 子票。
+>
+> 总计划入口：[总体下一步计划](总体下一步计划.md)；下载与用户代理规则：[一键模型部署与自治集群远期计划](一键模型部署与自治集群远期计划.md) §7.1。
 
 ---
 
-## 1. 背景与动机
+## 1. 本轮结论
 
-- **模型梯度缺失**：当前注册表与实验基线只有 Qwen 1.8B（能力弱）与 DeepSeek-R1-Distill-7B（thinking 不可关闭）。项目缺少「架构新、推理能力尚可、无 thinking 污染」的中间梯度小模型。
-- **架构较新**：Qwen3.5 / Qwen3-VL 与 Gemma 4 同属新架构代次，接入经验可相互复用（Ollama 兼容层、GGUF 量化、多模态判题链路）。
-- **多模态补强**：Qwen3-VL 4B/8B 提供图像理解能力，可与 Gemma 4 判题构成**双模型对照**，缓解单一判题器偏差。
-- **EX-N3 判题口径联动**（2026-08-13 方案 1 决策的升级通道）：LLM 侧客观正确率判题因本地模型不可用而暂停；Qwen3.5 非 R1 系且推理能力较强，**若其输出满足 `normalized_contains` 判题口径，可恢复正确率作为 LLM 侧质量判据**（§6.2.4 已预留该通道）。
-- 补充：这些模型均非 R1 系列，不引入 thinking 污染问题。
+- `Qwen-1.8B Q4_K_M` 三轮客观子集均为正确率 `0/4`、格式率 `4/11`；它可继续作为弱工件回归样本，不能担当答案判定基线。
+- `DeepSeek-R1-Distill-Qwen-7B Q4_K_M` 三轮同为正确率 `0/4`、格式率 `2/11`。实测根因是 R1 蒸馏模型无法被当前路径可靠地关闭 thinking，输出预算耗尽在 `<think>`，没有最终答案可按 rubric 检验。
+- **首选替代不是再调 R1，而是官方 Qwen3-4B。** 它有官方 Safetensors 与官方 GGUF，且模型模板提供硬 `enable_thinking=false`，可以从机制上避免“只输出思考链”的已知问题。是否能通过答案检验仍必须实测，不能由模型卡或参数量推断。
+- Qwen3-VL 是独立的视觉语言系列，官方既提供 Transformers 工件，也提供带 `mmproj` 的官方 GGUF；Qwen3.5 则是原生多模态系列，不能再误写成纯文本系列。
+- Qwen3.5 也支持非 thinking 模式，但当前主运行时 `transformers==4.47.1` 不满足 Qwen3 的官方最低 `4.51` 要求；Qwen3.5 官方明确要求使用最新 Transformers，且它的 `qwen3_5` 混合注意力/多模态路径不能直接塞进现有进程。下载、运行时升级与质量标定必须分票。
 
-## 2. 模型清单
+当前质量门不变：在新模型完成固定工件的三轮标定和人工复核前，LLM 侧仍只使用现有“非 R1 格式率 + 人工复核”临时规则；**不得**因为下载成功就恢复客观正确率门。
 
-| 模型 | 参数量 | 模态 | 预期推理形态 | 备注 |
-|------|--------|------|-------------|------|
-| Qwen3.5-0.8B | 0.8B | 文本 | GGUF CPU / Android | 最小梯度，LLM 侧轻量判题候选 |
-| Qwen3.5-2B | 2B | 文本 | GGUF CPU / Android | 移动端本地推理梯度 |
-| Qwen3.5-4B | 4B | 文本 | GGUF CPU / Safetensors CUDA | 单机主流梯度 |
-| Qwen3.5-9B | 9B | 文本 | Safetensors CUDA / GGUF CPU | 本机上限梯度（接近 gemma4 12B 的资源量级） |
-| Qwen3-VL-4B | 4B | 文本 + 图像 | Ollama `external_api` | 多模态判题 / 图像理解实验 |
-| Qwen3-VL-8B | 8B | 文本 + 图像 | Ollama `external_api`（本机 VRAM 门内） | 多模态判题对照主力候选 |
+## 2. 官方工件调研
 
-> 工件来源、精确版本（revision/tag）、许可证与量化方案以 **S0 调研**结论为准，未冻结前不写入注册表。
+| 家族 / 首选型号 | 官方 Transformers/Safetensors | 官方 GGUF | 当前定位 |
+|---|---|---|---|
+| Qwen3-4B | [`Qwen/Qwen3-4B`](https://huggingface.co/Qwen/Qwen3-4B)，Apache-2.0 | [`Qwen/Qwen3-4B-GGUF`](https://huggingface.co/Qwen/Qwen3-4B-GGUF)，含 Q4_K_M（约 2.5 GB） | **D1 首个双格式目标**；文本答案判定候选 |
+| Qwen3-0.6B / 1.7B / 8B | Qwen 官方 Qwen3 collection | 对应 Qwen 官方 `-GGUF` 仓库 | 后续容量梯度；不抢占 4B 的首轮标定 |
+| Qwen3-VL-4B-Instruct | [`Qwen/Qwen3-VL-4B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) 官方 Transformers 工件 | [`Qwen/Qwen3-VL-4B-Instruct-GGUF`](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF)：语言模型 Q4_K_M 约 2.5 GB；视觉编码器 `mmproj` 是独立文件（FP16 或 Q8_0） | D1 次序二；Gemma 判题器的交叉对照候选 |
+| Qwen3-VL-8B-Instruct | [`Qwen/Qwen3-VL-8B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) 官方 Transformers 工件 | [`Qwen/Qwen3-VL-8B-Instruct-GGUF`](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF)：Q4_K_M 约 5.03 GB，另须 `mmproj` | 资源条件票；Ollama 标称包约 6.1 GB，不与 SD/Gemma 并驻留 |
+| Qwen3.5-2B | [`Qwen/Qwen3.5-2B`](https://huggingface.co/Qwen/Qwen3.5-2B)，官方 Transformers/Safetensors | 本轮未发现 Qwen 官方 GGUF 发布；第三方转换仅作候选 | 原生多模态、默认非 thinking；先走隔离 PyTorch/服务端运行时 |
+| Qwen3.5-4B | [`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B)，4B 语言模型 + 视觉编码器 | 本轮未发现 Qwen 官方 GGUF 发布；第三方转换不得直接纳入 baseline | 原生多模态；默认 thinking，需 API 级显式关闭 |
+| Qwen3.5-0.8B / 9B | [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) / [`Qwen/Qwen3.5-9B`](https://huggingface.co/Qwen/Qwen3.5-9B) 官方 Transformers/Safetensors | 本轮未发现 Qwen 官方 GGUF；第三方转换不进入 baseline | 后续梯度，不进入 D1 |
 
-## 3. 支持路径（复用现有能力）
+“PyTorch 模型”在本计划中指官方 Hugging Face Transformers/Safetensors 工件，不接受来源不明的 `.pt`/pickle 权重。GGUF 与 Safetensors 是两个独立 artifact：各自锁 revision、文件清单、总大小和 SHA-256，不能共享一次准入结论。
 
-| 环节 | 文本系列（Qwen3.5） | VL 系列（Qwen3-VL） |
-|------|--------------------|--------------------|
-| 模型注册 | `model_registry` 新增条目（现有 Qwen/DeepSeek 槽位模式） | 同左 |
-| CPU/集显/Android | GGUF（llama.cpp / llama-cpp-python，复用 Qwen 1.8B GGUF 路径） | 不适用（VL 需视觉编码） |
-| CUDA/分布式 | Safetensors（PyTorch 路径，复用 Qwen 1.8B 分布管线） | Ollama 官方工件（`external_api`，复用 Gemma 4 路径） |
-| 多模态判题 | 不适用 | `experiment_gemma_judge_real.py` 判题器复用（模型名/契约参数化，仅非 R1 系） |
-| 实验执行器 | `experiment_llm_quality_unit.py`（GGUF 执行器已支持任意本地工件 + SHA 锁） | Gemma 判题单元模式（Ollama 端点） |
-| MODEL-TOOLS | `llm_smoke_matrix`、`gguf_convert`（已有注册表模型条目即自动覆盖） | 同左（Ollama 冒烟另行接线） |
+## 3. 思考模式与答案检验边界
 
-## 4. 实验价值
+| 模型 | 可控性 | EX-N3 要求 |
+|---|---|---|
+| DeepSeek-R1-Distill-Qwen-7B | 当前实测无法可靠关闭 thinking | 不再作为客观答案判定基线；保留历史失败证据 |
+| Qwen3 | `tokenizer.apply_chat_template(..., enable_thinking=False)` 为硬关闭；`/no_think` 只是 thinking 开启时的软切换 | `QW3-G3` 必须验证 GGUF 与 Safetensors 路径都不产生 `<think>`，并且答案落在既有输出预算内 |
+| Qwen3.5-2B | 官方说明默认非 thinking；思考需 API 显式启用 | 仍须明确传递运行时参数；官方已提示 2B 在 thinking 模式更易陷入循环，不能把默认非 thinking 当作质量通过 |
+| Qwen3.5-4B / 9B | 默认 thinking；官方 OpenAI 兼容路径用 `chat_template_kwargs: {enable_thinking: false}` 获取直接回答 | QLH 当前本地聊天接口尚未证明会透传此参数；未实现/验证前不能用于答案判定 |
 
-1. **LLM 客观判题恢复**：Qwen3.5-4B/9B 重跑 `ps-v1` 客观子集三轮标定；若正确率 ≥ 基线，按 §6.2.5 重标并将 LLM 侧判据升级为「正确率 + 格式率」（替代方案 1 的格式率单判据）。
-2. **多模态判题对照**：Qwen3-VL-8B 与 Gemma 4 对同一 SD 输出集判题，比较 topic/coverage 分布，评估判题器一致性（为质量 gate 引入双判题器投票或交叉验证提供数据）。
-3. **模型对比矩阵**：0.8B/2B/4B/9B 文本梯度 + 4B/8B VL，可填充 EX 实验的「规模-能力」曲线（现有 Qwen 1.8B 与 DeepSeek 7B 两个数据点之外）。
+Qwen3 非 thinking 模式的推荐采样为 `temperature=0.7`、`top_p=0.8`、`top_k=20`、`min_p=0`；Qwen3.5 的推荐参数因型号和文本/VL 任务不同。现有 `experiment_llm_quality_unit.py` 是固定贪心 Qwen 1.8B 执行器，**不能直接把新工件名替换进去**。`QW3-G3` 必须把模型族、chat template、thinking 开关、采样参数和 `max_new_tokens` 全部写入 plan 并锁定。
 
-## 5. 阶段划分
+## 4. 工件下载与信任策略
 
-### S0 调研与基准（只读，无实施）
-- 确认 Qwen3.5 / Qwen3-VL 官方工件来源、revision/tag、许可证（Apache-2.0 预期）、量化方案（Q4_K_M 兼容性）
-- Ollama 兼容性验证（VL 系列模型名、`reasoning_effort` 支持、图像输入口径——**不启动模型**，仅查官方注册表/文档）
-- 资源评估：各模型 Q4 内存/显存占用 vs 本机 16GB RAM / 8GB VRAM 门
-- 产出：S0 调研结论 + 资源准入表
+### 4.1 下载顺序
 
-### S1 Qwen3.5 文本系列接入（0.8B / 2B / 4B / 9B）
-- 注册表条目 + 配置（上下文、量化、引擎路由）
-- GGUF 路径：`llm_smoke_matrix` 冒烟（复用既有 4 项 marker）
-- Safetensors 路径：单机 CUDA 加载 + 分布管线接线（如资源允许）
-- 验收：注册表 4 条目、冒烟 `execution_gate=true`、无回归
+1. **QW3-D1a**：`Qwen/Qwen3-4B` 官方 Safetensors 与 `Qwen/Qwen3-4B-GGUF` 官方 Q4_K_M；先完成两个独立 artifact 的 resolve、下载、摘要和 inspection。
+2. **QW3-D1b**：`Qwen/Qwen3-VL-4B-Instruct` 官方 Safetensors，以及同一官方 GGUF 仓库中、由上游兼容性声明覆盖的 Q4_K_M 语言模型与 `mmproj`。两个仓库的 Git revision 不可假定相同；必须分别锁定 revision、文件名、大小、SHA-256，并校验 `qwen3vl` 架构与同一 Instruct 型号。
+3. **QW35-D1**：`Qwen/Qwen3.5-2B` 官方 Safetensors。Qwen3.5 官方未锁定 GGUF 时，不自动下载第三方转换；若以后引入，必须以“第三方转换 artifact”独立登记、完整哈希并和官方 Transformers 输出做语义对照。
+4. **条件扩展**：Qwen3-VL-8B 和 Qwen3.5-4B 只在 D1a/D1b 通过磁盘与运行时预检后排队。Gemma 4 新格式工件单列专项，不与本票混传或共享准入结论。
 
-### S2 Qwen3-VL 系列接入（4B / 8B）
-- Ollama 官方工件拉取（子进程代理，复用 Gemma 4 拉取流程）
-- `external_api` 图像理解链路（复用 Gemma 4 的 `_describe_image` 路径，模型名参数化）
-- 图像发送/回复的 UI 与 TUI 交互（如 Gemma 4 G4.2 已提供通用交互，则仅注册模型）
-- 验收：VL 8B 实图冒烟通过、判题器可调用
+每个任务先做 resolve/dry-run，确认精确 commit revision、许可证、文件 pattern、合计大小、staging 预算和目标目录可写，再允许传输。默认每次只传一个“大工件组合”；Safetensors 与 GGUF 不并行拉取，以免 staging 与磁盘预算相互挤占。下载完成只代表 artifact 已受管，仍须通过 format/架构检查、隔离试加载和引擎 smoke，才可能进入部署。
 
-### S3 实验接入（EX-N3 联动）
-- Qwen3.5-4B/9B 跑 `ps-v1` 客观子集三轮标定 → `experiment_quality_calibrate.py` 汇总
-- 若正确率达标：修订 §6.2.3 阈值表 + 升级 §6.2.4 LLM 侧判据（正确率恢复），以 plan 变更记录
-- Qwen3-VL-8B 与 Gemma 4 双判题器对照（同一 SD 输出集，比较 topic/coverage 分布）
-- 验收：LLM 侧判据升级或明确结论；双判题器对照报告入档
+### 4.2 7897 用户代理
 
-## 6. 资源评估（初步，S0 确认）
+项目已有模型下载代理优先级：`QLH_HTTP_PROXY` > 用户持久化模型代理 > 直连。直连失败时，用户可在模型管理“网络”页设置 `http://127.0.0.1:7897`，或只为本次受控下载进程设置：
 
-| 模型 | Q4_K_M 预估内存 | 本机（16GB RAM / 8GB VRAM）可行性 |
-|------|----------------|----------------------------------|
-| 0.8B | ~0.6 GB | ✅ CPU 无压力 |
-| 2B | ~1.4 GB | ✅ CPU / Android |
-| 4B | ~2.8 GB | ✅ CPU；CUDA 亦可 |
-| 9B | ~6 GB | ⚠️ CPU 可跑（与 gemma4 12B 同量级，串行不并行）；CUDA Q4 在 8GB 门内 |
-| Qwen3-VL-4B | ~3 GB + 视觉编码 | ✅ Ollama（gemma4 已证明路径） |
-| Qwen3-VL-8B | ~6 GB + 视觉编码 | ⚠️ 需 Ollama 内存门评估（gemma4 12B 7.5GB 已近上限，VL 8B 需实测或换机） |
+```powershell
+$env:QLH_HTTP_PROXY = 'http://127.0.0.1:7897'
+```
 
-> 与 gemma4 12B **串行使用**（同一 Ollama 服务进程），不并行驻留；实测内存门在 S0/S2 确认。
+- 代理只影响模型 resolver/downloader 子进程，不修改系统代理、`HF_ENDPOINT`、全局 Hugging Face 配置或模型运行时。
+- 7897 可在下载完成后关闭；已持久化的 partial/Range 元数据按**同一 source、revision 和文件 ETag**续传，换代理不允许换源或绕过重新 resolve。
+- token 仍只通过 `credential_ref`/系统凭据保管；代理地址、访问 token、响应正文和本地绝对路径不进入实验记录。loopback HTTP 仅用于本机代理，远程模型源仍必须 HTTPS。
 
-## 7. 风险与决策点
+## 5. 分期计划
 
-| 风险/决策 | 说明 | 缓解 |
-|-----------|------|------|
-| 工件来源与许可证 | Qwen3.5/Qwen3-VL 官方工件与模型名未冻结 | S0 只读调研先行，不冻结不入库 |
-| Ollama 兼容性 | VL 模型名、`reasoning_effort` 支持未验证 | S0 查官方注册表；不启动模型 |
-| 资源门 | VL-8B 可能超本机内存门 | 以 gemma4 12B 实测为基准评估；不行则 4B 先行 |
-| LLM 判题恢复失败 | Qwen3.5 正确率若仍不达标 | 结论登记，维持方案 1 判据（不强行升级） |
-| 判题器偏差 | 双判题器不一致时以何为准 | 对照报告数据说话；人工复核兜底（既有通道） |
+| 票 | 状态 | 范围 | 退出条件 |
+|---|---|---|---|
+| QW3-S0 | Completed（调研） | 官方源、工件格式、thinking 控制、容量与现有运行时差距 | 本文 §1-§4；不下载、不改依赖 |
+| QW3-D1 | Ready（下载与登记） | Qwen3-4B 双格式，再按顺序 Qwen3-VL-4B 双格式/投影器 | 每个 artifact 具备 revision、许可、文件清单、大小、SHA、受管 manifest；下载失败可经 7897 恢复 |
+| QW3-R2 | Ready（隔离运行时设计） | 为 Qwen3 Safetensors 准备 `transformers>=4.51` 的隔离 sidecar；主安装运行时继续锁在 4.47.x | sidecar 不改变主应用/打包依赖；Qwen3 配置、tokenizer 与 `enable_thinking=false` 可被预检 |
+| QW3-G3 | Conditional（真实工件后） | Qwen3-4B GGUF/Transformers 单机 smoke、thinking 硬关闭、输出预算/格式契约 | 双路径各自产生最终答案；无 `<think>`、无 prompt/正文持久化；失败 fail-closed |
+| QW3-E4 | Conditional（G3 后） | Qwen3-4B 三轮客观子集标定与人工复核 | 仅在三轮稳定通过后，才讨论恢复 LLM 正确率质量门 |
+| QWVL-J1 | Conditional（D1b/G3 后） | Qwen3-VL-4B 与 Gemma 4 对同一 SD 输出作交叉判题 | 只记录受限计数；不以任一模型单次结果覆盖人工复核 |
+| QW35-R1 | Conditional | Qwen3.5-2B/4B 的最新 Transformers、多模态 processor、显式 thinking 控制和资源准入 | 先隔离运行时和本机 smoke；第三方 GGUF 不得替代官方 PyTorch 基线 |
 
-## 8. 验收标准（阶段门）
+## 6. 当前运行时前置
 
-- **S0**：调研结论 + 资源准入表入档（doc 内更新本计划状态）
-- **S1**：注册表 4 条目、`llm_smoke_matrix` 执行门通过、定向回归无退化
-- **S2**：VL 8B（或 4B 兜底）实图冒烟 + 判题器参数化调用通过
-- **S3**：LLM 侧判据升级或明确结论 + 双判题器对照报告；相关阈值变更随 plan 记录
+| 组件 | 当前事实 | 新模型要求 / 处理 |
+|---|---|---|
+| 主 Python/打包依赖 | `transformers==4.47.1`、`torch==2.13.0+cu126` | Qwen3 官方提示低于 `transformers 4.51` 会缺 `qwen3`；Qwen3.5 官方要求最新 Transformers。Safetensors 均先走隔离 sidecar，不能直接升级主依赖 |
+| 现有 PyTorch loader | 以 `AutoModelForCausalLM` 和 Qwen2 兼容窗口为主；遗留 Qwen 配置仍有 `TRUST_REMOTE_CODE=True` | Qwen3.5 需要官方多模态模型类/processor，另立适配票；新 Qwen3/Qwen3.5 准入不得因遗留开关而自动启用 `trust_remote_code` |
+| llama.cpp 源 | 锁定 `47e1de77…f89fcbe`，源码已枚举 `qwen3`、`qwen3vl`、`qwen35`、`gemma4` 架构 | 源码枚举不是运行时能力；本机 `llama-cpp-python==0.3.28` 必须与目标 GGUF/mmproj 组合实际 smoke 后再登记支持 |
+| Ollama（Qwen3-VL 可选路径） | 本机已有 Ollama 路线 A 与通用 `external_api` 图像消息能力；尚未拉取 Qwen3-VL | 官方要求 Ollama `>=0.12.7`；`qwen3-vl:4b` 约 3.3 GB、`qwen3-vl:8b` 约 6.1 GB。D1b 先受管官方 Hugging Face 工件，是否额外拉取 Ollama 标签由 QWVL-J1 单独决定 |
+| 8 GB RTX 4060 | Qwen3-4B/Q4 与 Qwen3-VL-4B/Q4 是优先尝试范围；不能与 SD/Gemma 并驻留 | 每次运行前执行现有资源准入；Qwen3-VL-8B、Gemma 4 Safetensors 及长上下文保持条件票 |
 
-## 9. 与现有工作的关系
+## 7. EX-N3 恢复路径
 
-- 复用：Gemma 4 多模态路径（Ollama/external_api/判题器）、MODEL-TOOLS 注册表与冒烟矩阵、EX-N3 质量链路（plan/rubric/calibrate）
-- 不冲突：与 gemma-4 原生绑定开发（G4.3）并行无脏读写（不同文件域；本计划 S0/S1 只读为主）
-- 联动：EX-N3 方案 1 的「恢复正确率判题」通道（§6.2.4 预留）
+Qwen3-4B 是“恢复答案检验”的候选，不是预设结论。执行顺序固定为：
+
+```text
+官方双格式 artifact 受管
+  -> 隔离运行时 / llama.cpp 预检
+  -> 明确关闭 thinking 的单机 smoke
+  -> 固定 chat template 与采样的三轮客观子集
+  -> 人工复核与阈值修订
+  -> 才能改动 quality.required 的 LLM 正确率规则
+```
+
+若 Qwen3-4B 仍不能产生可检验最终答案，记录失败并维持当前格式率方案；不得以增大输出预算、剥离 `<think>` 文本或放宽 rubric 来制造“通过”。
+
+## 8. 参考
+
+- [Qwen3-4B 官方模型卡](https://huggingface.co/Qwen/Qwen3-4B) 与 [官方 GGUF](https://huggingface.co/Qwen/Qwen3-4B-GGUF)
+- [Qwen3-VL-4B 官方 GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) 与 [Qwen3-VL-8B 官方 GGUF](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF)
+- [Qwen3.5-2B 官方模型卡](https://huggingface.co/Qwen/Qwen3.5-2B) 与 [Qwen3.5-4B 模型卡](https://huggingface.co/Qwen/Qwen3.5-4B)
+- [Ollama Qwen3-VL 标签与大小](https://ollama.com/library/qwen3-vl)
