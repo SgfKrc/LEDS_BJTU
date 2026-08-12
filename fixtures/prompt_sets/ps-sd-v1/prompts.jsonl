@@ -1,0 +1,10 @@
+{"id": "sd-001", "category": "image_text", "prompt": "a red apple on a wooden table", "key_elements": ["red apple", "wooden table"]}
+{"id": "sd-002", "category": "image_text", "prompt": "a white cat sleeping on a blue sofa", "key_elements": ["white cat", "blue sofa"]}
+{"id": "sd-003", "category": "image_text", "prompt": "a yellow school bus on a city street", "key_elements": ["yellow school bus", "city street"]}
+{"id": "sd-004", "category": "image_text", "prompt": "a green mountain with a river below", "key_elements": ["green mountain", "river"]}
+{"id": "sd-005", "category": "image_text", "prompt": "a black dog running in a snowy park", "key_elements": ["black dog", "snowy park"]}
+{"id": "sd-006", "category": "image_text", "prompt": "a cup of coffee next to a laptop", "key_elements": ["cup of coffee", "laptop"]}
+{"id": "sd-007", "category": "image_text", "prompt": "a red flower in a white vase", "key_elements": ["red flower", "white vase"]}
+{"id": "sd-008", "category": "image_text", "prompt": "a sailboat on a calm blue sea", "key_elements": ["sailboat", "sea"]}
+{"id": "sd-009", "category": "image_text", "prompt": "an old brick house with a chimney", "key_elements": ["brick house", "chimney"]}
+{"id": "sd-010", "category": "image_text", "prompt": "a bicycle parked beside a park bench", "key_elements": ["bicycle", "park bench"]}

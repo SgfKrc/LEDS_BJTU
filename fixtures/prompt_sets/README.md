@@ -19,3 +19,15 @@
 
 当前 SHA-256（2026-08-09 冻结）：
 `8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3`（30 条）
+
+## 版本：ps-sd-v1（SD→Gemma 三轮标定图像提示词集）
+
+- 位置：`fixtures/prompt_sets/ps-sd-v1/prompts.jsonl`
+- 类别：`image_text`，10 条固定图像描述提示词
+- 每条记录：`id`、`category`、`prompt`、`key_elements`（2 个/条，用于 EX-N3 Gemma 判题的归一化包含匹配）
+- 用途：SD 1.5 十 seed 文生图 + `experiment_gemma_judge_real.py` 图生文判题的固定输入；`prompt` 与 `key_elements` 均不进入质量证据（契约白名单禁止）
+- 选择原则：要素客观、SD 1.5 可稳定生成、Gemma 描述中大概率出现（可子串匹配）
+
+## 锁定
+
+当前 SHA-256（2026-08-13 冻结）：`8b1775e0d64e357a854a62870ca7e3c2f58667d96219773d03374bf41ecfabd6`
