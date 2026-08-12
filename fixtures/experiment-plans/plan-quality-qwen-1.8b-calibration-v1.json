@@ -1,0 +1,105 @@
+{
+  "plan_id": "plan-quality-qwen-1.8b-calibration-v1",
+  "title": "EX-N3 Qwen 1.8B GGUF 客观质量三轮基线标定",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "engine": "llama-cpp-python local GGUF",
+    "gpu": "none by default",
+    "notes": "EX-N3 baseline calibration; no network, no SD, no Gemma judge"
+  },
+  "quality": {
+    "required": false,
+    "llm": {
+      "prompt_set_id": "ps-v1-zh-en-code",
+      "prompt_set_sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+      "objective_subset_count": 15,
+      "objective_prompt_ids": [
+        "math-001", "math-002", "math-004", "math-005", "en-001",
+        "code-001", "code-002", "code-003", "code-004", "code-005",
+        "fmt-001", "fmt-002", "fmt-003", "fmt-004", "fmt-005"
+      ],
+      "rubric_id": "llm-objective-ps-v1-v1",
+      "rubric_sha256": "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+      "correctness_rate_baseline": 0.6,
+      "format_rate_baseline": 0.9,
+      "compare_rule": ">= baseline*0.9"
+    },
+    "manual_review": {
+      "reviewers_required": 2,
+      "upgrade_on": "2 pass, 0 fail"
+    },
+    "calibration": {
+      "series_id": "ex-n3-qwen-1.8b-gguf-baseline-v1",
+      "rounds_required": 3,
+      "threshold_version": "ex-n3-baseline-v1"
+    }
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 3600,
+    "max_retries": 0,
+    "resources": {"cpu_model_slot": "qwen-1_8b-gguf"}
+  },
+  "units": [
+    {
+      "experiment_id": "exp-0001",
+      "name": "Qwen 1.8B GGUF 客观质量基线标定第 1 轮",
+      "command": [
+        "{python}", "scripts/experiment_llm_quality_unit.py",
+        "--model", "models/Qwen-1_8B-Chat.Q4_K_M.gguf",
+        "--expected-model-sha256", "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+        "--prompt-set-dir", "{prompt_set_dir}",
+        "--prompt-set-sha256", "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+        "--rubric", "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
+        "--expected-rubric-sha256", "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+        "--result-file", "{out_dir}/{experiment_id}.result.json",
+        "--seed", "20260812", "--max-new-tokens", "192", "--n-ctx", "2048", "--n-gpu-layers", "0"
+      ],
+      "params": {"seed": 20260812, "temperature": 0.0, "top_p": 1.0, "max_new_tokens": 192, "stream": false, "concurrency": 1},
+      "model": {"id": "qwen-1_8b-chat-gguf", "artifact_sha256": "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc", "quant_family": "Q4_K_M", "tokenizer": "chatml", "context": 2048},
+      "gate": {"metric": "quality_completed", "op": ">=", "threshold": 1},
+      "quality_checks": ["llm"]
+    },
+    {
+      "experiment_id": "exp-0002",
+      "name": "Qwen 1.8B GGUF 客观质量基线标定第 2 轮",
+      "command": [
+        "{python}", "scripts/experiment_llm_quality_unit.py",
+        "--model", "models/Qwen-1_8B-Chat.Q4_K_M.gguf",
+        "--expected-model-sha256", "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+        "--prompt-set-dir", "{prompt_set_dir}",
+        "--prompt-set-sha256", "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+        "--rubric", "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
+        "--expected-rubric-sha256", "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+        "--result-file", "{out_dir}/{experiment_id}.result.json",
+        "--seed", "20260812", "--max-new-tokens", "192", "--n-ctx", "2048", "--n-gpu-layers", "0"
+      ],
+      "params": {"seed": 20260812, "temperature": 0.0, "top_p": 1.0, "max_new_tokens": 192, "stream": false, "concurrency": 1},
+      "model": {"id": "qwen-1_8b-chat-gguf", "artifact_sha256": "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc", "quant_family": "Q4_K_M", "tokenizer": "chatml", "context": 2048},
+      "gate": {"metric": "quality_completed", "op": ">=", "threshold": 1},
+      "quality_checks": ["llm"]
+    },
+    {
+      "experiment_id": "exp-0003",
+      "name": "Qwen 1.8B GGUF 客观质量基线标定第 3 轮",
+      "command": [
+        "{python}", "scripts/experiment_llm_quality_unit.py",
+        "--model", "models/Qwen-1_8B-Chat.Q4_K_M.gguf",
+        "--expected-model-sha256", "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+        "--prompt-set-dir", "{prompt_set_dir}",
+        "--prompt-set-sha256", "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+        "--rubric", "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
+        "--expected-rubric-sha256", "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+        "--result-file", "{out_dir}/{experiment_id}.result.json",
+        "--seed", "20260812", "--max-new-tokens", "192", "--n-ctx", "2048", "--n-gpu-layers", "0"
+      ],
+      "params": {"seed": 20260812, "temperature": 0.0, "top_p": 1.0, "max_new_tokens": 192, "stream": false, "concurrency": 1},
+      "model": {"id": "qwen-1_8b-chat-gguf", "artifact_sha256": "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc", "quant_family": "Q4_K_M", "tokenizer": "chatml", "context": 2048},
+      "gate": {"metric": "quality_completed", "op": ">=", "threshold": 1},
+      "quality_checks": ["llm"]
+    }
+  ]
+}

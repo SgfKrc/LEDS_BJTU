@@ -14,6 +14,9 @@ _DEFAULT_PROMPT_SETS = _PROJECT_ROOT / "fixtures" / "prompt_sets"
 
 _EXPERIMENT_ID_RE = re.compile(r"^exp-[0-9]{4}$")
 _GATE_OPS = {">=", "<=", ">", "<", "=="}
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_QUALITY_CHECKS = {"llm", "sd", "gemma_judge"}
 
 
 class PlanError(ValueError):
@@ -26,6 +29,33 @@ class GateSpec:
     op: str
     threshold: float | None = None
     baseline_ratio: float | None = None
+
+
+@dataclass(frozen=True)
+class QualitySpec:
+    """Frozen EX-N3 quality contract declared by an experiment plan.
+
+    Only identifiers, hashes, thresholds, and review policy belong here.  The
+    rubric source and model completions are deliberately never copied into an
+    experiment record.
+    """
+
+    required: bool
+    llm: Mapping[str, Any] | None = None
+    sd: Mapping[str, Any] | None = None
+    gemma_judge: Mapping[str, Any] | None = None
+    manual_review: Mapping[str, Any] | None = None
+    calibration: Mapping[str, Any] | None = None
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            "required": self.required,
+            "llm": dict(self.llm) if self.llm else None,
+            "sd": dict(self.sd) if self.sd else None,
+            "gemma_judge": dict(self.gemma_judge) if self.gemma_judge else None,
+            "manual_review": dict(self.manual_review) if self.manual_review else None,
+            "calibration": dict(self.calibration) if self.calibration else None,
+        }
 
 
 @dataclass(frozen=True)
@@ -43,9 +73,17 @@ class ExperimentUnit:
     max_retries: int
     result_file: str | None = None
     prompt_set: Mapping[str, Any] = field(default_factory=dict)
+    quality_checks: tuple[str, ...] = ()
 
-    def render_command(self, *, out_dir: Path, prompt_set_dir: Path, plan_id: str) -> list[str]:
-        """把 {out_dir}/{experiment_id}/{prompt_set_dir}/{plan_id} 占位符替换为实参。"""
+    def render_command(
+        self,
+        *,
+        out_dir: Path,
+        prompt_set_dir: Path,
+        plan_id: str,
+        python: str = "python",
+    ) -> list[str]:
+        """Replace the bounded command placeholders with execution arguments."""
         rendered: list[str] = []
         for token in self.command:
             rendered.append(
@@ -54,6 +92,7 @@ class ExperimentUnit:
                 .replace("{experiment_id}", self.experiment_id)
                 .replace("{prompt_set_dir}", str(prompt_set_dir))
                 .replace("{plan_id}", plan_id)
+                .replace("{python}", python)
             )
         return rendered
 
@@ -76,6 +115,7 @@ class PlanManifest:
     env: Mapping[str, Any]
     units: tuple[ExperimentUnit, ...]
     defaults: Mapping[str, Any]
+    quality: QualitySpec | None = None
     source_path: Path | None = None
 
     def prompt_set_dir(self, root: Path | None = None) -> Path:
@@ -98,7 +138,52 @@ class PlanManifest:
                     f"prompt set {self.prompt_set['id']!r} SHA-256 mismatch: "
                     f"declared {declared}, actual {digest}; 禁止原地覆盖提示词集"
                 )
+        self._verify_quality_contract(directory)
         return directory
+
+    def _verify_quality_contract(self, prompt_set_dir: Path) -> None:
+        """Verify plan-pinned EX-N3 rubric identity without persisting it."""
+        if self.quality is None or self.quality.llm is None:
+            return
+        llm = self.quality.llm
+        rubric_id = str(llm["rubric_id"])
+        rubric_path = _PROJECT_ROOT / "fixtures" / "quality_rubrics" / f"{rubric_id}.json"
+        try:
+            raw = rubric_path.read_bytes()
+            rubric = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PlanError(f"EX-N3 rubric unavailable: {rubric_id}") from exc
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != llm["rubric_sha256"]:
+            raise PlanError("EX-N3 rubric SHA-256 mismatch")
+        if not isinstance(rubric, Mapping):
+            raise PlanError("EX-N3 rubric must be an object")
+        rubric_prompt_set = rubric.get("prompt_set")
+        if not isinstance(rubric_prompt_set, Mapping) or (
+            rubric_prompt_set.get("id") != self.prompt_set["id"]
+            or rubric_prompt_set.get("sha256") != self.prompt_set.get("sha256")
+        ):
+            raise PlanError("EX-N3 rubric prompt set does not match plan")
+        try:
+            prompt_ids = {
+                str(json.loads(line)["id"])
+                for line in (prompt_set_dir / "prompts.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            }
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise PlanError("cannot read prompt-set identifiers for EX-N3") from exc
+        configured = set(llm["objective_prompt_ids"])
+        if not configured.issubset(prompt_ids):
+            raise PlanError("EX-N3 objective prompt is absent from the prompt set")
+        entries = rubric.get("entries")
+        if not isinstance(entries, list):
+            raise PlanError("EX-N3 rubric entries must be a list")
+        rubric_ids = {
+            str(entry.get("prompt_id"))
+            for entry in entries if isinstance(entry, Mapping)
+        }
+        if configured != rubric_ids:
+            raise PlanError("EX-N3 rubric entries do not match plan objective prompt IDs")
 
 
 def _require(value: Mapping[str, Any], key: str, what: str) -> Any:
@@ -133,7 +218,194 @@ def _parse_gate(raw: Any, unit_id: str) -> GateSpec | None:
     return GateSpec(metric=str(metric), op=op, threshold=threshold, baseline_ratio=ratio)
 
 
-def _parse_unit(raw: Mapping[str, Any], defaults: Mapping[str, Any], plan_id: str) -> ExperimentUnit:
+def _bounded_rate(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise PlanError(f"{label} must be a number between 0 and 1")
+    try:
+        rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PlanError(f"{label} must be a number between 0 and 1") from exc
+    if not 0.0 <= rate <= 1.0:
+        raise PlanError(f"{label} must be a number between 0 and 1")
+    return rate
+
+
+def _identifier(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
+        raise PlanError(f"{label} must be a bounded identifier")
+    return value
+
+
+def _sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+        raise PlanError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise PlanError("quality must be an object")
+    allowed = {"required", "llm", "sd", "gemma_judge", "manual_review", "calibration"}
+    if set(raw) - allowed:
+        raise PlanError("quality contains unsupported fields")
+    required = raw.get("required", False)
+    if not isinstance(required, bool):
+        raise PlanError("quality.required must be boolean")
+
+    llm_raw = raw.get("llm")
+    llm: dict[str, Any] | None = None
+    if llm_raw is not None:
+        if not isinstance(llm_raw, Mapping):
+            raise PlanError("quality.llm must be an object")
+        llm_allowed = {
+            "prompt_set_id", "prompt_set_sha256", "objective_subset_count",
+            "objective_prompt_ids", "rubric_id", "rubric_sha256",
+            "correctness_rate_baseline", "format_rate_baseline", "compare_rule",
+        }
+        if set(llm_raw) - llm_allowed:
+            raise PlanError("quality.llm contains unsupported fields")
+        required_fields = llm_allowed
+        if not required_fields.issubset(llm_raw):
+            raise PlanError("quality.llm is incomplete")
+        if llm_raw["prompt_set_id"] != prompt_set.get("id"):
+            raise PlanError("quality.llm.prompt_set_id must match plan prompt_set")
+        if llm_raw["prompt_set_sha256"] != prompt_set.get("sha256"):
+            raise PlanError("quality.llm.prompt_set_sha256 must match plan prompt_set")
+        prompt_ids = llm_raw["objective_prompt_ids"]
+        if not isinstance(prompt_ids, list) or not prompt_ids:
+            raise PlanError("quality.llm.objective_prompt_ids must be a non-empty list")
+        normalized_ids = [_identifier(item, "quality.llm objective prompt") for item in prompt_ids]
+        if len(set(normalized_ids)) != len(normalized_ids):
+            raise PlanError("quality.llm.objective_prompt_ids must be unique")
+        if llm_raw["objective_subset_count"] != len(normalized_ids):
+            raise PlanError("quality.llm.objective_subset_count must match objective_prompt_ids")
+        rubric_sha256 = llm_raw["rubric_sha256"]
+        if not isinstance(rubric_sha256, str) or not _SHA256_RE.fullmatch(rubric_sha256):
+            raise PlanError("quality.llm.rubric_sha256 must be a lowercase SHA-256")
+        compare_rule = llm_raw["compare_rule"]
+        if compare_rule != ">= baseline*0.9":
+            raise PlanError("quality.llm.compare_rule must be >= baseline*0.9")
+        llm = {
+            "prompt_set_id": str(llm_raw["prompt_set_id"]),
+            "prompt_set_sha256": str(llm_raw["prompt_set_sha256"]),
+            "objective_subset_count": int(llm_raw["objective_subset_count"]),
+            "objective_prompt_ids": tuple(normalized_ids),
+            "rubric_id": _identifier(llm_raw["rubric_id"], "quality.llm.rubric_id"),
+            "rubric_sha256": rubric_sha256,
+            "correctness_rate_baseline": _bounded_rate(
+                llm_raw["correctness_rate_baseline"], "quality.llm.correctness_rate_baseline",
+            ),
+            "format_rate_baseline": _bounded_rate(
+                llm_raw["format_rate_baseline"], "quality.llm.format_rate_baseline",
+            ),
+            "compare_rule": compare_rule,
+        }
+
+    sd_raw = raw.get("sd")
+    sd: dict[str, Any] | None = None
+    if sd_raw is not None:
+        if not isinstance(sd_raw, Mapping):
+            raise PlanError("quality.sd must be an object")
+        if set(sd_raw) - {"asset_ids", "gate"} or not {"asset_ids", "gate"}.issubset(sd_raw):
+            raise PlanError("quality.sd must contain only asset_ids and gate")
+        asset_ids = sd_raw["asset_ids"]
+        if not isinstance(asset_ids, list) or not asset_ids:
+            raise PlanError("quality.sd.asset_ids must be a non-empty list")
+        sd = {
+            "asset_ids": tuple(_identifier(item, "quality.sd asset") for item in asset_ids),
+            "gate": str(sd_raw["gate"]),
+        }
+        if sd["gate"] != "quality_gate_sd15 automatic_gate.passed":
+            raise PlanError("quality.sd.gate is unsupported")
+
+    gemma_raw = raw.get("gemma_judge")
+    gemma_judge: dict[str, Any] | None = None
+    if gemma_raw is not None:
+        if not isinstance(gemma_raw, Mapping):
+            raise PlanError("quality.gemma_judge must be an object")
+        allowed_gemma = {
+            "model", "judge_contract_id", "judge_contract_sha256",
+            "topic_hit_rate_baseline", "key_element_coverage_baseline",
+        }
+        if set(gemma_raw) - allowed_gemma or not allowed_gemma.issubset(gemma_raw):
+            raise PlanError("quality.gemma_judge is incomplete")
+        gemma_judge = {
+            "model": _identifier(gemma_raw["model"], "quality.gemma_judge.model"),
+            "judge_contract_id": _identifier(
+                gemma_raw["judge_contract_id"],
+                "quality.gemma_judge.judge_contract_id",
+            ),
+            "judge_contract_sha256": _sha256(
+                gemma_raw["judge_contract_sha256"],
+                "quality.gemma_judge.judge_contract_sha256",
+            ),
+            "topic_hit_rate_baseline": _bounded_rate(
+                gemma_raw["topic_hit_rate_baseline"], "quality.gemma_judge.topic_hit_rate_baseline",
+            ),
+            "key_element_coverage_baseline": _bounded_rate(
+                gemma_raw["key_element_coverage_baseline"],
+                "quality.gemma_judge.key_element_coverage_baseline",
+            ),
+        }
+
+    manual_raw = raw.get("manual_review")
+    manual_review: dict[str, Any] | None = None
+    if manual_raw is not None:
+        if not isinstance(manual_raw, Mapping):
+            raise PlanError("quality.manual_review must be an object")
+        if set(manual_raw) - {"reviewers_required", "upgrade_on"} or not {
+            "reviewers_required", "upgrade_on",
+        }.issubset(manual_raw):
+            raise PlanError("quality.manual_review is incomplete")
+        if manual_raw["reviewers_required"] != 2 or manual_raw["upgrade_on"] != "2 pass, 0 fail":
+            raise PlanError("quality.manual_review must use the frozen 2-pass policy")
+        manual_review = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+
+    calibration_raw = raw.get("calibration")
+    calibration: dict[str, Any] | None = None
+    if calibration_raw is not None:
+        if not isinstance(calibration_raw, Mapping):
+            raise PlanError("quality.calibration must be an object")
+        allowed_calibration = {"series_id", "rounds_required", "threshold_version"}
+        if set(calibration_raw) - allowed_calibration or not allowed_calibration.issubset(calibration_raw):
+            raise PlanError("quality.calibration is incomplete")
+        if calibration_raw["rounds_required"] != 3:
+            raise PlanError("quality.calibration.rounds_required must be 3")
+        calibration = {
+            "series_id": _identifier(calibration_raw["series_id"], "quality.calibration.series_id"),
+            "rounds_required": 3,
+            "threshold_version": _identifier(
+                calibration_raw["threshold_version"], "quality.calibration.threshold_version",
+            ),
+        }
+
+    if required and llm and (
+        llm["correctness_rate_baseline"] < 0.60
+        or llm["format_rate_baseline"] < 0.90
+    ):
+        raise PlanError(
+            "quality.required cannot use an unapproved weak LLM calibration floor"
+        )
+    if required and gemma_judge:
+        raise PlanError(
+            "gemma_judge cannot be quality.required before real calibration is approved"
+        )
+    if required and not any((llm, sd, gemma_judge)):
+        raise PlanError("quality.required needs at least one configured check")
+    return QualitySpec(
+        required=required, llm=llm, sd=sd, gemma_judge=gemma_judge,
+        manual_review=manual_review, calibration=calibration,
+    )
+
+
+def _parse_unit(
+    raw: Mapping[str, Any],
+    defaults: Mapping[str, Any],
+    plan_id: str,
+    quality: QualitySpec | None,
+) -> ExperimentUnit:
     experiment_id = str(_require(raw, "experiment_id", "unit"))
     if not _EXPERIMENT_ID_RE.fullmatch(experiment_id):
         raise PlanError(f"{experiment_id}: experiment_id 必须匹配 exp-\\d{{4}}")
@@ -172,6 +444,23 @@ def _parse_unit(raw: Mapping[str, Any], defaults: Mapping[str, Any], plan_id: st
     prompt_set = raw.get("prompt_set") or {}
     if not isinstance(prompt_set, Mapping):
         raise PlanError(f"{experiment_id}: prompt_set 必须是对象")
+    checks_raw = raw.get("quality_checks") or []
+    if not isinstance(checks_raw, list) or not all(isinstance(item, str) for item in checks_raw):
+        raise PlanError(f"{experiment_id}: quality_checks must be a string list")
+    quality_checks = tuple(checks_raw)
+    if len(set(quality_checks)) != len(quality_checks) or set(quality_checks) - _QUALITY_CHECKS:
+        raise PlanError(f"{experiment_id}: quality_checks contains unsupported entries")
+    if quality_checks and quality is None:
+        raise PlanError(f"{experiment_id}: quality_checks needs a plan quality contract")
+    configured = {
+        name for name, value in (
+            ("llm", quality.llm if quality else None),
+            ("sd", quality.sd if quality else None),
+            ("gemma_judge", quality.gemma_judge if quality else None),
+        ) if value is not None
+    }
+    if set(quality_checks) - configured:
+        raise PlanError(f"{experiment_id}: quality_checks references an unconfigured check")
     return ExperimentUnit(
         experiment_id=experiment_id,
         name=name,
@@ -186,6 +475,7 @@ def _parse_unit(raw: Mapping[str, Any], defaults: Mapping[str, Any], plan_id: st
         max_retries=retries,
         result_file=str(result_file) if result_file else None,
         prompt_set=dict(prompt_set),
+        quality_checks=quality_checks,
     )
 
 
@@ -208,6 +498,7 @@ def load_plan(path: str | Path) -> PlanManifest:
     defaults = raw.get("defaults") or {}
     if not isinstance(defaults, Mapping):
         raise PlanError("defaults 必须是对象")
+    quality = _parse_quality_config(raw.get("quality"), prompt_set)
     units_raw = raw.get("units")
     if not isinstance(units_raw, list) or not units_raw:
         raise PlanError("plan 必须包含非空 units 列表")
@@ -216,7 +507,7 @@ def load_plan(path: str | Path) -> PlanManifest:
     for item in units_raw:
         if not isinstance(item, Mapping):
             raise PlanError("unit 必须是对象")
-        unit = _parse_unit(item, defaults, plan_id)
+        unit = _parse_unit(item, defaults, plan_id, quality)
         if unit.experiment_id in seen:
             raise PlanError(f"重复的 experiment_id: {unit.experiment_id}")
         seen.add(unit.experiment_id)
@@ -228,5 +519,6 @@ def load_plan(path: str | Path) -> PlanManifest:
         env=dict(env_raw),
         units=tuple(units),
         defaults=dict(defaults),
+        quality=quality,
         source_path=source,
     )

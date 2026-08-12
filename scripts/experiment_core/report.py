@@ -42,24 +42,89 @@ def _comparison_row(record: Mapping, baseline: Mapping | None) -> list[str]:
     ]
 
 
+def _quality_cells(record: Mapping) -> list[str]:
+    quality = record.get("quality")
+    if not isinstance(quality, Mapping):
+        return ["not_collected", "-", "-", "-", "-", "-", "-", "not_collected"]
+    llm = quality.get("llm")
+    sd = quality.get("sd")
+    gemma = quality.get("gemma_judge")
+    correctness = llm.get("correctness") if isinstance(llm, Mapping) else None
+    formatting = llm.get("format") if isinstance(llm, Mapping) else None
+    automatic = sd.get("automatic_gate") if isinstance(sd, Mapping) else None
+    manual = sd.get("manual_review") if isinstance(sd, Mapping) else None
+    topic_hit = gemma.get("topic_hit") if isinstance(gemma, Mapping) else None
+    coverage = gemma.get("key_element_coverage") if isinstance(gemma, Mapping) else None
+    return [
+        str(quality.get("status", "not_collected")),
+        _fmt(correctness.get("rate") if isinstance(correctness, Mapping) else None),
+        _fmt(formatting.get("rate") if isinstance(formatting, Mapping) else None),
+        str(automatic.get("status", "-") if isinstance(automatic, Mapping) else "-"),
+        str(manual.get("status", "-") if isinstance(manual, Mapping) else "-"),
+        _fmt(topic_hit.get("rate") if isinstance(topic_hit, Mapping) else None),
+        _fmt(coverage.get("rate") if isinstance(coverage, Mapping) else None),
+        str(
+            record.get("quality_gate", {}).get("status", "not_collected")
+            if isinstance(record.get("quality_gate"), Mapping) else "not_collected"
+        ),
+    ]
+
+
 def build_report(out_dir: Path, records: list[Mapping], plan_meta: Mapping) -> tuple[Path, Path]:
     """生成 report.md 与 summary.json，返回 (report_path, summary_path)。"""
     out_dir.mkdir(parents=True, exist_ok=True)
     by_id = {str(r["experiment_id"]): r for r in records}
 
     status_counts = {"passed": 0, "failed": 0, "invalid": 0}
+    quality_counts = {"collected": 0, "not_collected": 0, "invalid": 0}
+    quality_gate_counts = {"passed": 0, "failed": 0, "not_collected": 0, "invalid": 0}
     for record in records:
         status = record["gate"].get("status")
         if status in status_counts:
             status_counts[status] += 1
+        quality = record.get("quality")
+        quality_status = quality.get("status") if isinstance(quality, Mapping) else "not_collected"
+        if quality_status not in quality_counts:
+            quality_status = "invalid"
+        quality_counts[quality_status] += 1
+        quality_gate = record.get("quality_gate")
+        quality_gate_status = (
+            quality_gate.get("status") if isinstance(quality_gate, Mapping)
+            else "not_collected"
+        )
+        if quality_gate_status not in quality_gate_counts:
+            quality_gate_status = "invalid"
+        quality_gate_counts[quality_gate_status] += 1
 
     lines: list[str] = []
     lines.append(f"# 实验报告：{plan_meta.get('title', plan_meta.get('plan_id', ''))}")
+    lines.append("")
+
+    quality_policy = plan_meta.get("quality")
+    has_ex_n3_policy = isinstance(quality_policy, Mapping)
+    lines.append("## 质量证据与门（EX-N3）" if has_ex_n3_policy else "## 质量证据（EX-N3-S0）")
+    lines.append("")
+    if has_ex_n3_policy:
+        if quality_policy.get("required"):
+            lines.append("质量门已由 manifest 声明为 required；总 gate = 性能 gate ∧ 质量 gate，缺失证据单独标记。")
+        else:
+            lines.append("质量门独立记录，不改变既有性能 gate；仅 manifest 声明 required 时才参与总 gate。")
+    else:
+        lines.append("本节只汇总结构化证据，不改变既有性能 gate。")
+    lines.append("| id | evidence | LLM correct rate | LLM format rate | SD automatic gate | manual review | Gemma topic hit | Gemma key coverage | quality gate |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for record in records:
+        lines.append("| " + record["experiment_id"] + " | " + " | ".join(_quality_cells(record)) + " |")
     lines.append("")
     lines.append(f"- plan_id：`{plan_meta.get('plan_id')}`")
     lines.append(f"- 生成时间：{datetime.now(timezone.utc).isoformat()}")
     lines.append(f"- commit：`{git_describe()}`")
     lines.append(f"- 门判定：passed {status_counts['passed']} / failed {status_counts['failed']} / invalid {status_counts['invalid']}")
+    lines.append(
+        "- 质量门："
+        f"passed {quality_gate_counts['passed']} / failed {quality_gate_counts['failed']} / "
+        f"not_collected {quality_gate_counts['not_collected']} / invalid {quality_gate_counts['invalid']}"
+    )
     lines.append("")
 
     lines.append("## 环境与工件")
@@ -133,6 +198,8 @@ def build_report(out_dir: Path, records: list[Mapping], plan_meta: Mapping) -> t
         "prompt_set": plan_meta.get("prompt_set"),
         "units": len(records),
         "status": status_counts,
+        "quality_evidence": quality_counts,
+        "quality_gate": quality_gate_counts,
         "records": f"records.jsonl",
         "report": "report.md",
     }

@@ -1,0 +1,47 @@
+{
+  "plan_id": "plan-quality-sd15-bridge-fixture-v1",
+  "title": "EX-N3-SD-N1 固定质量报告采集验证",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "engine": "quality_gate_sd15 report collector",
+    "gpu": "not used",
+    "notes": "Fixture-only bridge validation. It does not generate images or replace SD acceptance."
+  },
+  "quality": {
+    "required": false,
+    "sd": {
+      "asset_ids": ["sd15_90s_retrovers_v1"],
+      "gate": "quality_gate_sd15 automatic_gate.passed"
+    },
+    "manual_review": {
+      "reviewers_required": 2,
+      "upgrade_on": "2 pass, 0 fail"
+    }
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 60,
+    "max_retries": 0,
+    "resources": {"sd_quality_report": "fixture-v1"}
+  },
+  "units": [{
+    "experiment_id": "exp-0001",
+    "name": "SD 1.5 固定质量报告脱敏采集",
+    "command": [
+      "{python}", "scripts/experiment_sd15_quality_unit.py",
+      "--report", "fixtures/quality_reports/sd15-text-to-image-passed-v1.json",
+      "--expected-report-sha256", "87a7bb286d21b2b50b1c721504b606367d5e15cd43f644fb2c6da7a018f9ad1f",
+      "--expected-asset-id", "sd15_90s_retrovers_v1",
+      "--expected-artifact-id", "sd15_90s_retrovers_v1",
+      "--expected-mode", "text_to_image",
+      "--result-file", "{out_dir}/{experiment_id}.result.json"
+    ],
+    "params": {"fixture_only": true, "stream": false, "concurrency": 1},
+    "model": {"id": "sd15_90s_retrovers_v1", "artifact_sha256": null},
+    "gate": {"metric": "quality_completed", "op": ">=", "threshold": 1},
+    "quality_checks": ["sd"]
+  }]
+}

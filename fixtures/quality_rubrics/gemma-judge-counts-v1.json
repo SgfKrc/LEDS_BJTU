@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "id": "gemma-judge-counts-v1",
+  "model": "gemma4:12b",
+  "evidence_schema": {
+    "topic_hit": "per-item binary count",
+    "key_element_coverage": "per-item binary count"
+  },
+  "persistence": {
+    "allowed": [
+      "model",
+      "judge_contract_id",
+      "judge_contract_sha256",
+      "topic_hit.evaluated_count",
+      "topic_hit.passed_count",
+      "key_element_coverage.evaluated_count",
+      "key_element_coverage.passed_count"
+    ],
+    "forbidden": [
+      "prompt",
+      "image",
+      "image_url",
+      "path",
+      "completion",
+      "reasoning",
+      "judge_explanation"
+    ]
+  },
+  "execution": "static_contract_only"
+}
