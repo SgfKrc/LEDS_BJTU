@@ -39,6 +39,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -69,6 +72,7 @@ fun SessionListScreen(
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = onCreateSession,
+                modifier = Modifier.testTag("session_create"),
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
                 contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
                 icon = {
@@ -81,7 +85,7 @@ fun SessionListScreen(
             )
         },
         containerColor = MaterialTheme.colorScheme.background,
-        modifier = modifier
+        modifier = modifier.testTag("session_list_screen")
     ) { padding ->
         Column(
             modifier = Modifier
@@ -177,7 +181,10 @@ private fun SessionCard(
 ) {
     Card(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("session_card_${session.id}")
+            .semantics { selected = isCurrent },
         shape = MaterialTheme.shapes.medium,
         colors = CardDefaults.cardColors(
             containerColor = if (isCurrent) {
@@ -256,7 +263,10 @@ private fun SessionCard(
             }
 
             // 删除按钮
-            IconButton(onClick = onDelete) {
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.testTag("session_delete_${session.id}"),
+            ) {
                 Icon(
                     Icons.Default.Delete,
                     contentDescription = "删除会话",

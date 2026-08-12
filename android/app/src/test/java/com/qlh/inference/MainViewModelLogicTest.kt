@@ -8,6 +8,7 @@ import com.qlh.inference.status.MemoryStatus
 import com.qlh.inference.status.SystemStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -190,5 +191,75 @@ class MainViewModelLogicTest {
         assertEquals(SettingsDataStore.DEFAULT_THEME_MODE, state.themeMode)
         assertTrue(state.availableModels.isEmpty())
         assertTrue(state.sessions.isEmpty())
+    }
+
+    // ---- 聊天与会话状态机 ----
+
+    @Test
+    fun `selecting a session returns to chat and preserves unrelated state`() {
+        val state = MainUiState(
+            currentTab = "sessions",
+            serverHost = "100.64.0.2",
+            error = "旧错误",
+        )
+
+        val selected = selectUiSession(state, sessionId = 42L, sessionTitle = "部署讨论")
+
+        assertEquals("chat", selected.currentTab)
+        assertEquals(42L, selected.currentSessionId)
+        assertEquals("部署讨论", selected.currentSessionTitle)
+        assertEquals("100.64.0.2", selected.serverHost)
+        assertEquals("旧错误", selected.error)
+    }
+
+    @Test
+    fun `message submission lifecycle records retry payload and clears transient error`() {
+        val initial = MainUiState(currentSessionId = 9L, error = "上次失败")
+        val sending = startMessageSubmission(initial, "重新发送这条消息")
+        val failed = failMessageSubmission(sending, "连接超时")
+        val retrying = startMessageRetry(failed)
+        val completed = completeMessageSubmission(retrying)
+
+        assertTrue(sending.isLoading)
+        assertEquals("重新发送这条消息", sending.lastSentMessage)
+        assertEquals(null, sending.error)
+        assertFalse(failed.isLoading)
+        assertEquals("连接超时", failed.error)
+        assertTrue(retrying.isLoading)
+        assertEquals(null, retrying.error)
+        assertFalse(completed.isLoading)
+        assertEquals(null, completed.error)
+        assertEquals("重新发送这条消息", completed.lastSentMessage)
+    }
+
+    @Test
+    fun `retry without a prior message is a no-op and clear only removes error`() {
+        val state = MainUiState(currentTab = "settings", error = "发送失败")
+
+        assertSame(state, startMessageRetry(state))
+        val cleared = clearMessageError(state)
+        assertEquals("settings", cleared.currentTab)
+        assertEquals(null, cleared.error)
+        assertFalse(cleared.isLoading)
+    }
+
+    @Test
+    fun `send error formatting keeps actionable network and fallback messages`() {
+        assertEquals(
+            "无法连接主节点，请检查地址和网络",
+            formatMessageSendError(java.net.ConnectException()),
+        )
+        assertEquals(
+            "连接超时，请检查主节点是否运行",
+            formatMessageSendError(java.net.SocketTimeoutException()),
+        )
+        assertEquals(
+            "当前模式暂不支持",
+            formatMessageSendError(UnsupportedOperationException()),
+        )
+        assertEquals(
+            "发送失败: bad gateway",
+            formatMessageSendError(IllegalStateException("bad gateway")),
+        )
     }
 }

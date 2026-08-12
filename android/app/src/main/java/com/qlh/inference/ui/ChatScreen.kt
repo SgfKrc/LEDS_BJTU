@@ -53,6 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -109,6 +110,7 @@ fun ChatScreen(
         modifier = modifier
             .fillMaxSize()
             .imePadding()
+            .testTag("chat_screen")
     ) {
         // ---- 顶栏：会话标题 + 模式角标 ----
         QlhTopBar(
@@ -423,7 +425,9 @@ private fun ChatInputBar(
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("chat_input"),
                 placeholder = {
                     Text(
                         "输入消息…",
@@ -448,6 +452,7 @@ private fun ChatInputBar(
                 enabled = enabled && text.isNotBlank(),
                 modifier = Modifier
                     .size(48.dp)
+                    .testTag("chat_send")
                     .clip(CircleShape)
                     .background(
                         if (text.isNotBlank() && enabled) {
