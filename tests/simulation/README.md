@@ -2,6 +2,8 @@
 
 > 状态：现行测试入口；仿真框架存在不等于真实多设备流水线已经通过验收
 
+> 2026-08-12 起，默认自动化入口新增 `TaskGraphSimulationHarness`（`tests/test_task_graph_simulation.py`）、`TaskWorkerControlSimulationHarness`（`tests/test_task_worker_control_simulation.py`）、`DiffusionDataPlaneSimulationHarness`（`tests/test_diffusion_data_plane_simulation.py`）、`MixedWorkflowSimulationHarness`（`tests/test_mixed_workflow_simulation.py`）和 `CapacitySimulationHarness`（`tests/test_capacity_simulation.py`）：它们是无端口、无子进程、无真实模型的确定性 L1 预验证；v3 CAS、混合工作流和容量场景仅在临时本地状态目录持久化，容量报告不作性能结论。旧的 `python -m tests.simulation.test_*` 后端启动脚本保留为人工环境工具，不能被默认 pytest 结果或仿真报告替代。`SIM-N6` 已提供跨平台 `scripts/run_simulation.py`：`quick` 为默认 CI 契约，`extended` 和全量 `full` 必须显式选择，JSON 只包含聚合 pytest 计数和既有脱敏报告，且所有 profile 都不声称完成真实环境验收。
+
 端到端的仿真测试框架，验证分布式推理在真实环境下的可用性。
 
 ## 特点
@@ -14,7 +16,23 @@
 
 ## 快速开始
 
-### 1. 单机推理测试
+### SIM-N6 分层入口
+
+```bash
+# 默认快速契约：仅 SIM-N1 至 SIM-N5 的确定性 pytest，并将 JSON 输出到 stdout
+python scripts/run_simulation.py --profile quick
+
+# CI 保存安全汇总；test-results/ 已被 gitignore，适合工件目录
+python scripts/run_simulation.py --profile quick --json-output test-results/simulation/quick.json
+
+# 扩展生产契约，或显式执行数分钟的全量 pytest
+python scripts/run_simulation.py --profile extended --json-output test-results/simulation/extended.json
+python scripts/run_simulation.py --profile full --json-output test-results/simulation/full.json
+```
+
+`quick` 仅覆盖固定内存/临时状态的 SIM-N1 至 SIM-N5；`extended` 增加相邻的 TaskGraph、v2/v3 Worker 和数据面契约；`full` 等价于对 `tests` 运行 pytest。后两者不由默认 CI 隐式触发，全量执行时间也不受单次开发终端的 64 秒限制。汇总中不保存 pytest 原始输出、请求正文、模型输出、路径、URL、blob ID 或 grant；失败时以退出码和聚合计数交给 CI 日志和重跑处理。
+
+### 1. 历史人工单机推理测试
 
 测试在无从节点情况下，主节点独立完成推理的能力。
 
@@ -227,13 +245,22 @@ SCENARIOS["my_test"] = my_scenario
 
 ## 开发计划
 
-### 第一阶段（当前）✅
+### 第一阶段（历史人工脚本）✅
 
 - [x] 核心框架实现
 - [x] 单机推理测试
 - [x] 测试场景定义
 
-### 第二阶段（计划中）
+### SIM 前置队列（当前）
+
+- [x] `SIM-N1`：固定 TaskGraph 场景、内存 Provider 与不含正文的 schema v1 证据投影
+- [x] `SIM-N2`：v2 Worker 控制面故障矩阵
+- [x] `SIM-N3`：v3 图像数据面与恢复矩阵
+- [x] `SIM-N4`：LLM→SD 跨通道故障收敛
+- [x] `SIM-N5`：有界并发与容量压力
+- [x] `SIM-N6`：CLI/CI 分层运行器
+
+### 第二阶段（历史人工脚本计划）
 
 - [ ] 分布式推理测试
 - [ ] 降级测试
