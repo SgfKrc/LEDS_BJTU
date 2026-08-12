@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 from types import SimpleNamespace
 from pathlib import Path
@@ -18,6 +19,7 @@ from scripts.model_tools.sweep import sweep_models
 from scripts.model_tools.sync_status import build_inventory, compare_inventories, validate_inventory
 from scripts.model_tools.llm_smoke_matrix import fixed_prompts, run_smoke_matrix
 from scripts.model_tools.llm_smoke_worker import execute_request, validate_output
+from scripts.model_tools.lora import MAX_HEADER_BYTES, inspect_lora
 
 
 def _write_hf_fixture(root: Path, architecture: str = "Qwen2ForCausalLM") -> Path:
@@ -102,6 +104,11 @@ def _write_gguf(path: Path, *, payload: bytes = b"\x00" * 16) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _write_safetensors_header(path: Path, header: dict, payload: bytes = b"\x00" * 32) -> None:
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+
 def test_inspect_reads_metadata_and_tensor_descriptors(tmp_path: Path):
     target = tmp_path / "tiny.gguf"
     _write_gguf(target)
@@ -183,6 +190,132 @@ def test_cli_json_output_and_exit_code(tmp_path: Path, capsys):
     assert main(["gguf_inspect", str(target), "--json"]) == 0
     output = capsys.readouterr().out
     assert '"tensor_count": 1' in output
+
+
+def test_sd15_lora_inspect_reads_only_header_and_redacts_training_text(tmp_path: Path, capsys):
+    target = tmp_path / "portrait_lora.safetensors"
+    private_trigger = "private trigger phrase"
+    private_dataset = "C:/private/training-images"
+    _write_safetensors_header(target, {
+        "__metadata__": {
+            "ss_network_dim": "64",
+            "ss_learning_rate": "0.0001",
+            "ss_tag_frequency": json.dumps({private_dataset: {private_trigger: 9}}),
+            "ss_dataset_dirs": json.dumps({private_dataset: {"img_count": 12}}),
+            "ss_custom_comment": "private training comment",
+        },
+        "lora_unet_down_blocks_0.lora_down.weight": {
+            "dtype": "F16", "shape": [4, 4], "data_offsets": [0, 32],
+        },
+        "lora_unet_down_blocks_0.lora_up.weight": {
+            "dtype": "F16", "shape": [4, 4], "data_offsets": [32, 64],
+        },
+    }, payload=b"x" * 64)
+    before = target.read_bytes()
+
+    report = inspect_lora(target)
+
+    assert report["valid"] is True
+    assert report["read_only"] is True
+    assert report["weights_loaded"] is False
+    assert report["cuda_used"] is False
+    assert report["input_kind"] == "safetensors_file"
+    assert report["tensor_summary"] == {
+        "tensor_count": 2,
+        "lora_down_tensor_count": 1,
+        "lora_up_tensor_count": 1,
+        "alpha_tensor_count": 0,
+        "lora_detected": True,
+        "components": ["unet"],
+    }
+    fields = report["metadata"]["fields"]
+    assert fields["ss_network_dim"] == {"kind": "numeric", "value": "64"}
+    assert fields["ss_tag_frequency"]["numeric_entry_count"] == 1
+    assert fields["ss_dataset_dirs"]["numeric_value_total"] == 12
+    rendered = json.dumps(report)
+    assert private_trigger not in rendered
+    assert private_dataset not in rendered
+    assert "private training comment" not in rendered
+    assert str(tmp_path) not in rendered
+    assert target.read_bytes() == before
+
+    assert main(["sd15_lora_inspect", str(target), "--json"]) == 0
+    cli_output = capsys.readouterr().out
+    assert private_trigger not in cli_output
+    assert str(tmp_path) not in cli_output
+
+
+@pytest.mark.parametrize("header, payload, expected_code", [
+    ({"tensor": {"dtype": "F16", "shape": [1], "data_offsets": [0, 99]}}, b"x", "tensor_out_of_range"),
+    ({"tensor": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}, "other": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"xxxx", "overlapping_tensors"),
+])
+def test_sd15_lora_inspect_rejects_invalid_tensor_layout(tmp_path: Path, header: dict, payload: bytes, expected_code: str):
+    target = tmp_path / "invalid.safetensors"
+    _write_safetensors_header(target, header, payload=payload)
+
+    report = inspect_lora(target)
+
+    assert report["valid"] is False
+    assert report["errors"][0]["code"] == expected_code
+
+
+def test_sd15_lora_inspect_rejects_unsupported_dtype_and_size_mismatch(tmp_path: Path):
+    target = tmp_path / "bad_dtype.safetensors"
+    _write_safetensors_header(target, {
+        "tensor": {"dtype": "NOPE", "shape": [1], "data_offsets": [0, 1]},
+    }, payload=b"x")
+    unsupported = inspect_lora(target)
+    assert unsupported["valid"] is False
+    assert unsupported["errors"][0]["code"] == "invalid_tensor_descriptor"
+
+    _write_safetensors_header(target, {
+        "tensor": {"dtype": "F16", "shape": [2], "data_offsets": [0, 2]},
+    }, payload=b"xx")
+    mismatch = inspect_lora(target)
+    assert mismatch["valid"] is False
+    assert mismatch["errors"][0]["code"] == "tensor_size_mismatch"
+
+
+def test_sd15_lora_inspect_rejects_large_headers_and_path_escape(tmp_path: Path):
+    target = tmp_path / "large.safetensors"
+    target.write_bytes(struct.pack("<Q", MAX_HEADER_BYTES + 1) + b"{}")
+
+    too_large = inspect_lora(target)
+
+    assert too_large["valid"] is False
+    assert too_large["errors"][0]["code"] == "header_too_large"
+
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    _write_safetensors_header(outside, {})
+    escaped = inspect_lora(outside, root=root)
+    assert escaped["valid"] is False
+    assert escaped["errors"][0]["code"] == "path_outside_root"
+
+
+def test_sd15_lora_inspect_accepts_no_metadata_and_rejects_truncated_prefix(tmp_path: Path):
+    empty_metadata = tmp_path / "no_metadata.safetensors"
+    _write_safetensors_header(empty_metadata, {
+        "lora_te_text_model.lora_down.weight": {
+            "dtype": "F16", "shape": [2, 2], "data_offsets": [0, 8],
+        },
+        "lora_te_text_model.lora_up.weight": {
+            "dtype": "F16", "shape": [2, 2], "data_offsets": [8, 16],
+        },
+    }, payload=b"x" * 16)
+
+    report = inspect_lora(empty_metadata)
+
+    assert report["valid"] is True
+    assert report["metadata"] == {"ss_field_count": 0, "fields": {}}
+    assert report["tensor_summary"]["lora_detected"] is True
+
+    truncated = tmp_path / "truncated.safetensors"
+    truncated.write_bytes(b"bad")
+    bad = inspect_lora(truncated)
+    assert bad["valid"] is False
+    assert bad["errors"][0]["code"] == "truncated_prefix"
 
 
 def test_model_disk_usage_groups_top_level_assets_and_is_read_only(tmp_path: Path):

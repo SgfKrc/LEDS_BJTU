@@ -12,6 +12,7 @@ from .gguf_convert import execute_conversion, plan_conversion
 from .gemma4_native_probe import run_native_probe
 from .gemma4_native_artifacts import resolve_ollama_gemma4_12b, run_ollama_gemma4_12b_preflight
 from .llm_smoke_matrix import run_smoke_matrix
+from .lora import inspect_lora
 from .maintenance import clean_models, model_disk_usage
 from .sd15_batch import run_prompt_batch, run_sampler_matrix
 from .sweep import sweep_models
@@ -79,6 +80,19 @@ def _parser() -> argparse.ArgumentParser:
     sampler.add_argument("--steps", action="append", type=int, dest="steps_list", default=[])
     sampler.add_argument("--seed", type=int, default=19950101)
     sampler.add_argument("--json", action="store_true", dest="as_json")
+    lora = commands.add_parser(
+        "sd15-lora-inspect",
+        aliases=["sd15_lora_inspect"],
+        help="inspect a Safetensors LoRA header without loading weights",
+    )
+    lora.add_argument("path", type=Path)
+    lora.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="require the inspected file to remain inside this root",
+    )
+    lora.add_argument("--json", action="store_true", dest="as_json")
     sync = commands.add_parser("sync-status", aliases=["models_sync_status"], help="compare read-only model inventories")
     sync_operations = sync.add_subparsers(dest="sync_operation", required=True)
     inventory = sync_operations.add_parser("inventory", help="generate a model inventory")
@@ -198,6 +212,20 @@ def _human(command: str, report: dict[str, Any]) -> None:
             print(f"  {item.get('label')}: scheduler={item.get('scheduler')} steps={item.get('steps')} seed={item.get('seed')} elapsed={item.get('elapsed_seconds'):.3f}s")
         for error in report.get("errors", []):
             print(f"  - {error}")
+        return
+    if command in {"sd15-lora-inspect", "sd15_lora_inspect"}:
+        summary = report.get("tensor_summary", {})
+        metadata = report.get("metadata", {})
+        print(f"{'OK' if report.get('valid') else 'FAIL'}: {report.get('input_kind')}")
+        print(
+            f"lora_detected={summary.get('lora_detected')} "
+            f"tensors={summary.get('tensor_count', 0)} "
+            f"pairs={summary.get('lora_down_tensor_count', 0)}/"
+            f"{summary.get('lora_up_tensor_count', 0)} "
+            f"ss_fields={metadata.get('ss_field_count', 0)}"
+        )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
         return
     if command in {"sync-status", "models_sync_status"}:
         if report.get("operation") == "inventory":
@@ -366,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
                 steps_list=args.steps_list or [20, 28],
                 seed=args.seed,
             )
+        elif args.command in {"sd15-lora-inspect", "sd15_lora_inspect"}:
+            report = inspect_lora(args.path, root=args.root)
         elif args.command in {"sync-status", "models_sync_status"}:
             if args.sync_operation == "inventory":
                 _ensure_output_outside_roots(args.output, [args.root])
