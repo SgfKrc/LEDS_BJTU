@@ -1,0 +1,47 @@
+{
+  "plan_id": "plan-quality-gemma-bridge-fixture-v1",
+  "title": "EX-N3-GEMMA-S1 静态证据 schema 验证",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "engine": "Gemma counter-only evidence bridge",
+    "gpu": "not used",
+    "notes": "Fixture-only schema validation; no Gemma, Ollama, image, or network access."
+  },
+  "quality": {
+    "required": false,
+    "gemma_judge": {
+      "model": "gemma4:12b",
+      "judge_contract_id": "gemma-judge-counts-v1",
+      "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+      "topic_hit_rate_baseline": 0.7,
+      "key_element_coverage_baseline": 0.5
+    }
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 60,
+    "max_retries": 0,
+    "resources": {"gemma_quality_fixture": "v1"}
+  },
+  "units": [{
+    "experiment_id": "exp-0001",
+    "name": "Gemma 计数证据静态采集",
+    "command": [
+      "{python}", "scripts/experiment_gemma_quality_unit.py",
+      "--evidence", "fixtures/quality_reports/gemma-judge-counts-fixture-v1.json",
+      "--expected-evidence-sha256", "14f3d71b9b52ceb88df31a44b786ace897b1bf6a4c21b57e1ed340998e440e27",
+      "--judge-contract", "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
+      "--expected-judge-contract-sha256", "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+      "--expected-model", "gemma4:12b",
+      "--expected-contract-id", "gemma-judge-counts-v1",
+      "--result-file", "{out_dir}/{experiment_id}.result.json"
+    ],
+    "params": {"fixture_only": true, "stream": false, "concurrency": 1},
+    "model": {"id": "gemma4:12b", "artifact_sha256": null},
+    "gate": {"metric": "quality_completed", "op": ">=", "threshold": 1},
+    "quality_checks": ["gemma_judge"]
+  }]
+}

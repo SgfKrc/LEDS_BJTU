@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "asset_id": "sd15_90s_retrovers_v1",
+  "artifact_id": "sd15_90s_retrovers_v1",
+  "repo_id": "fixture/repository",
+  "revision": "fixture-revision",
+  "prompt": "fixture prompt that must not enter experiment records",
+  "negative_prompt": "fixture negative prompt that must not enter experiment records",
+  "automatic_gate": {
+    "passed": true,
+    "unique_images": 10,
+    "required_unique_images": 9
+  },
+  "manual_gate": {
+    "passed": true,
+    "required_reviewers": 2,
+    "reviews": [
+      {"name": "fixture-reviewer-one", "decision": "pass"},
+      {"name": "fixture-reviewer-two", "decision": "pass"}
+    ]
+  },
+  "status": "passed",
+  "images": [
+    {"path": "C:/fixture/private/output-a.png", "sha256": "fixture-image-a"},
+    {"path": "C:/fixture/private/output-b.png", "sha256": "fixture-image-b"},
+    {"path": "C:/fixture/private/output-c.png", "sha256": "fixture-image-c"},
+    {"path": "C:/fixture/private/output-d.png", "sha256": "fixture-image-d"},
+    {"path": "C:/fixture/private/output-e.png", "sha256": "fixture-image-e"},
+    {"path": "C:/fixture/private/output-f.png", "sha256": "fixture-image-f"},
+    {"path": "C:/fixture/private/output-g.png", "sha256": "fixture-image-g"},
+    {"path": "C:/fixture/private/output-h.png", "sha256": "fixture-image-h"},
+    {"path": "C:/fixture/private/output-i.png", "sha256": "fixture-image-i"},
+    {"path": "C:/fixture/private/output-j.png", "sha256": "fixture-image-j"}
+  ]
+}

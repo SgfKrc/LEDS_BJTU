@@ -58,7 +58,7 @@ def run_unit(
     out_dir.mkdir(parents=True, exist_ok=True)
     result_file = unit.rendered_result_file(out_dir=out_dir)
     command = unit.render_command(
-        out_dir=out_dir, prompt_set_dir=prompt_set_dir, plan_id=plan_id,
+        out_dir=out_dir, prompt_set_dir=prompt_set_dir, plan_id=plan_id, python=python,
     )
     retries: list[dict[str, Any]] = []
     last_exit: int | None = None

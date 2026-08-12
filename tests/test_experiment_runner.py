@@ -380,3 +380,25 @@ def test_cli_check_and_full_run(tmp_path):
     assert cli.main(["--plan", str(plan_path), "--out", str(out), "--resume"]) == 0
     count_after = len((out / "records.jsonl").read_text(encoding="utf-8").splitlines())
     assert count_after == count_before
+
+
+def test_cli_refuses_live_output_lock_and_requires_explicit_stale_recovery(tmp_path):
+    from experiment_core import cli
+
+    out = tmp_path / "locked-out"
+    out.mkdir()
+    (out / ".run.lock").write_text(
+        json.dumps({"pid": __import__("os").getpid(), "plan_id": "other"}),
+        encoding="utf-8",
+    )
+    plan_path = tmp_path / "locked-plan.json"
+    plan_path.write_text(json.dumps({
+        "plan_id": "plan-lock-v1", "prompt_set": PROMPT_SET, "env": {},
+        "units": [_unit("exp-0001")],
+    }), encoding="utf-8")
+    assert cli.main(["--plan", str(plan_path), "--out", str(out)]) == 2
+
+    (out / ".run.lock").write_text(json.dumps({"pid": 999999, "plan_id": "old"}), encoding="utf-8")
+    assert cli.main(["--plan", str(plan_path), "--out", str(out)]) == 2
+    assert cli.main(["--plan", str(plan_path), "--out", str(out), "--recover-lock"]) == 0
+    assert not (out / ".run.lock").exists()
