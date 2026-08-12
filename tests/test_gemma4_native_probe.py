@@ -140,8 +140,9 @@ def test_controller_requires_complete_explicit_artifact_identity():
 
     assert incomplete["valid"] is False
     assert incomplete["status"] == "invalid_request"
+    assert incomplete["errors"][0]["code"] == "artifact_identity_incomplete"
     assert invalid_hash["valid"] is False
-    assert "SHA-256" in invalid_hash["errors"][0]["message"]
+    assert invalid_hash["errors"][0]["code"] == "artifact_sha256_invalid"
 
 
 def test_cli_binding_preflight_exits_zero_and_artifact_gate_is_reported(monkeypatch, capsys):
