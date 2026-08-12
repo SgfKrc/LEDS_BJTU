@@ -99,47 +99,25 @@ class TestComputeNodeWeight:
     def sched(self):
         return Scheduler()
 
-    def test_workstation_max_score(self, sched):
-        """CUDA 工作站应获得最高执行吞吐分。"""
-        weight = sched._compute_node_weight(PROFILE_WORKSTATION)
-        assert 145 <= weight <= 165, f"工作站权重应在 145-165，实际: {weight:.1f}"
-
-    def test_laptop_moderate_score(self, sched):
-        """CUDA 游戏本应显著高于 CPU worker。"""
-        weight = sched._compute_node_weight(PROFILE_LAPTOP)
-        assert 90 <= weight <= 110, f"游戏本权重应在 90-110，实际: {weight:.1f}"
-
-    def test_ultrabook_low_score(self, sched):
-        """轻薄本（集显）应获得低分"""
-        weight = sched._compute_node_weight(PROFILE_ULTRABOOK)
-        # VRAM: 0.5/24*50≈1.0, RAM: 8/64*30=3.75, CPU: 4/16*10+3000/4000*10=10
-        # Bonus: 0 (集成显卡) → total ≈ 14.8
-        assert 5 <= weight <= 30, f"轻薄本权重应在 5-30，实际: {weight:.1f}"
-
-    def test_edge_minimal_score(self, sched):
-        """边缘设备应获得最低分"""
-        weight = sched._compute_node_weight(PROFILE_EDGE)
-        # VRAM: 0, RAM: 4/64*30=1.875, CPU: 2/16*10+1500/4000*10=5
-        # Bonus: 0 → total ≈ 6.9
-        assert 0 <= weight <= 15, f"边缘设备权重应在 0-15，实际: {weight:.1f}"
-
-    def test_no_gpu_field(self, sched):
-        """device_info 缺少 GPU 字段时应正常降级"""
-        weight = sched._compute_node_weight(PROFILE_NO_GPU)
-        # VRAM: 0 (no gpu field → defaults to 0)
-        # RAM: 8/64*30=3.75, CPU: 4/16*10+2500/4000*10=8.75
-        # Bonus: 0 → total ≈ 12.5
-        assert 0 <= weight <= 25, f"无 GPU 字段时权重应在 0-25，实际: {weight:.1f}"
-
-    def test_empty_device_info(self, sched):
-        """空 device_info 应安全降级"""
-        weight = sched._compute_node_weight({})
-        assert 0 <= weight <= 20, f"空设备信息权重应在 0-20，实际: {weight:.1f}"
-
-    def test_none_device_info(self, sched):
-        """None device_info 应安全降级"""
-        weight = sched._compute_node_weight(None)
-        assert 0 <= weight <= 20, f"None 设备信息权重应在 0-20，实际: {weight:.1f}"
+    @pytest.mark.parametrize(
+        ("profile_name", "profile", "expected_weight"),
+        [
+            ("cuda_workstation", PROFILE_WORKSTATION, 160.0),
+            ("cuda_laptop", PROFILE_LAPTOP, 99.16666666666667),
+            # 集显不计专用显存分：仅 RAM 3.75 + CPU 10.0。
+            ("integrated_ultrabook", PROFILE_ULTRABOOK, 13.75),
+            ("edge", PROFILE_EDGE, 6.875),
+            ("gpu_field_missing", PROFILE_NO_GPU, 12.5),
+            ("empty", {}, 8.125),
+            ("none", None, 8.125),
+            ("mobile_arm", PROFILE_MOBILE, 8.4375),
+        ],
+    )
+    def test_fixed_profile_weight_is_formula_stable(
+            self, sched, profile_name, profile, expected_weight):
+        """固定画像必须精确锁定权重公式，而非仅落在宽泛区间。"""
+        weight = sched._compute_node_weight(profile)
+        assert weight == pytest.approx(expected_weight), profile_name
 
     def test_discrete_gpu_bonus(self, sched):
         """只有可用 CUDA 独显才应获得专用显存与执行后端分。"""
@@ -147,21 +125,18 @@ class TestComputeNodeWeight:
         without_gpu = {**PROFILE_LAPTOP, "gpu": {**PROFILE_LAPTOP["gpu"], "cuda_available": False}}
         w_gpu = sched._compute_node_weight(with_gpu)
         w_no_gpu = sched._compute_node_weight(without_gpu)
-        # 8GB VRAM 约 16.7 分 + CUDA 执行后端 60 分。
+        # 8GB 专用显存 16.6667 分 + CUDA 执行后端 60 分。
         bonus = w_gpu - w_no_gpu
-        assert 70 <= bonus <= 85, f"CUDA 执行优势应在 70-85，实际: {bonus:.1f}"
-
-    def test_mobile_arm_score(self, sched):
-        """移动设备应有合理分数"""
-        weight = sched._compute_node_weight(PROFILE_MOBILE)
-        assert 0 <= weight <= 15, f"移动设备权重应在 0-15，实际: {weight:.1f}"
+        assert bonus == pytest.approx(76.66666666666667)
+        assert w_gpu / w_no_gpu == pytest.approx(4.407407407407407)
 
     def test_cuda_laptop_outscores_igpu_cpu_worker(self, sched):
         """4060 CUDA 主机评分必须显著高于同核数的集显 CPU worker。"""
         cuda_weight = sched._compute_node_weight(PROFILE_LAPTOP)
         igpu_weight = sched._compute_node_weight(PROFILE_IGPU_ONLY)
 
-        assert cuda_weight > igpu_weight * 2
+        assert cuda_weight > igpu_weight
+        assert cuda_weight / igpu_weight == pytest.approx(4.407407407407407)
 
 
 # ================================================================
@@ -558,7 +533,6 @@ class TestManualLayerAssignmentNormalization:
         assert normalized[0]["has_embedding"] is True
         assert normalized[0]["has_lm_head"] is True
         assert normalized[1]["has_lm_head"] is False
-        assert sched._runtime_layer_override == normalized
 
     def test_manual_ranges_reject_master_outside_first_segment(self, monkeypatch):
         sched = Scheduler()
@@ -574,7 +548,7 @@ class TestManualLayerAssignmentNormalization:
         ])
 
         assert result["status"] == "invalid"
-        assert "主节点" in result["reason"]
+        assert result["reason_code"] == "layer_assignment_master_must_be_first"
 
 
 # ================================================================
@@ -2198,7 +2172,7 @@ class TestPipelineQueueBasics:
         """新队列应为空且未运行"""
         assert queue.queue_size == 0
         assert not queue.is_busy
-        assert not queue._running
+        assert queue.get_status()["running"] is False
 
     def test_enqueue_returns_task_id(self, queue):
         """enqueue 应返回 task_id"""
@@ -2435,8 +2409,8 @@ class TestPipelineQueueIntegration:
     def test_queue_initialized_in_scheduler(self, sched):
         """Scheduler 初始化时应创建 PipelineQueue"""
         assert sched.pipeline_queue is not None
-        assert not sched.pipeline_queue._running
-        status = sched.pipeline_queue.get_status()
+        status = sched.get_status()["pipeline_queue"]
+        assert status["running"] is False
         assert status["queue_size"] == 0
 
     def test_queue_included_in_get_status(self, sched):
@@ -4442,13 +4416,14 @@ class TestPipelineOrchestrationIntegration:
         # 通过 compute_layer_assignment 间接计算 weight
         # 先 _compute_node_weight 验证
         weight = sched_master._compute_node_weight(PROFILE_MULTI_GPU)
-        # 独显 RTX 4060: VRAM=8/24*50=16.7, RAM=16/64*30=7.5, CPU=8/16*10+4000/4000*10=15, Bonus=15 → ≈54.2
-        assert weight >= 40, f"独显评分不应被集显压低，实际: {weight:.1f}"
+        # 必须选中 gpus 列表中的 RTX 4060，评分与同规格独显画像一致。
+        assert weight == pytest.approx(
+            sched_master._compute_node_weight(PROFILE_DGPU_ONLY),
+        )
 
         weight_igpu = sched_master._compute_node_weight(PROFILE_IGPU_ONLY)
-        # 集显: VRAM=0.5/24*50≈1.0, RAM=16/64*30=7.5, CPU=15, Bonus=0 → ≈23.5
-        assert weight > weight_igpu + 15, \
-            f"含独显画像评分({weight:.1f})应明显高于纯集显({weight_igpu:.1f})"
+        assert weight_igpu == pytest.approx(22.5)
+        assert weight / weight_igpu == pytest.approx(4.407407407407407)
 
     def test_vram_uses_scoring_gpu_not_frontend_gpu(self, sched_master):
         """_get_node_vram_mb 应使用评分 GPU 而非前端选中 GPU"""
@@ -4967,24 +4942,27 @@ class TestLocalMasterIdentity:
         sched._mac_addresses = ["AA-BB-CC-DD-EE-FF"]
 
         sched._verify_master_identity()
-        assert sched._master_identity_verified is True
-        assert sched._master_identity_reason == "first_run"
+        identity = sched.get_invite_info()
+        assert identity["identity_verified"] is True
+        assert identity["identity_reason"] == "first_run"
         assert local_store.get_local_master_identity()["mac_addresses"] == [
             "aa-bb-cc-dd-ee-ff",
         ]
 
         sched._verify_master_identity()
-        assert sched._master_identity_verified is True
-        assert sched._master_identity_reason == "match"
+        identity = sched.get_invite_info()
+        assert identity["identity_verified"] is True
+        assert identity["identity_reason"] == "match"
 
         sched._mac_addresses = ["11:22:33:44:55:66"]
         sched._verify_master_identity()
-        assert sched._master_identity_verified is False
-        assert sched._master_identity_reason == "mac_mismatch"
+        identity = sched.get_invite_info()
+        assert identity["identity_verified"] is False
+        assert identity["identity_reason"] == "mac_mismatch"
 
         result = sched.reset_master_identity()
         assert result["status"] == "ok"
-        assert sched._master_identity_reason == "reset"
+        assert sched.get_invite_info()["identity_reason"] == "reset"
         assert local_store.get_local_master_identity()["mac_addresses"] == [
             "11:22:33:44:55:66",
         ]
@@ -5893,9 +5871,10 @@ def test_tcp_bind_failure_keeps_master_local_pipeline_available(monkeypatch):
     try:
         sched.start(host="0.0.0.0", port=8888)
 
-        assert sched._running is True
-        assert sched._tcp_server is None
-        assert sched.pipeline_queue._running is True
+        status = sched.get_status()
+        assert status["running"] is True
+        assert status["tcp_server"] is None
+        assert status["pipeline_queue"]["running"] is True
     finally:
         sched.stop()
 

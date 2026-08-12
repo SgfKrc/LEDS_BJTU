@@ -48,6 +48,7 @@ def build_app(node_role: str = "master", *, engine_host=None, kv_host=None):
 
     from fastapi import FastAPI
 
+    from api_errors import install_http_error_handler
     from inference_service.kv_host import KVHost
     from inference_service.routes import router
 
@@ -76,6 +77,7 @@ def build_app(node_role: str = "master", *, engine_host=None, kv_host=None):
     app.state.engine_host = host
     app.state.kv_host = kv_host if kv_host is not None else KVHost()
     app.state.node_role = node_role
+    install_http_error_handler(app)
     app.include_router(router)
     return app
 

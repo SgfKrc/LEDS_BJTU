@@ -1314,6 +1314,11 @@ class Scheduler:
             self._tcp_server.stop()
         logger.info("调度器已停止")
 
+    @property
+    def inference_host(self) -> "InferenceHost":
+        """Return the host selected for this scheduler instance."""
+        return self._host
+
     # ================================================================
     # 节点管理
     # ================================================================
@@ -2841,12 +2846,23 @@ class Scheduler:
         """
         total_layers = self._get_total_model_layers()
 
+        def invalid(reason_code: str, reason: str) -> dict:
+            return {
+                "status": "invalid",
+                "reason_code": reason_code,
+                "reason": reason,
+            }
+
         if self._effective_role() != "master":
-            return {"status": "denied", "reason": "仅主节点可覆盖分层配置"}
+            return {
+                "status": "denied",
+                "reason_code": "layer_override_master_required",
+                "reason": "仅主节点可覆盖分层配置",
+            }
 
         # 基本验证
         if not assignments or not isinstance(assignments, list):
-            return {"status": "invalid", "reason": "分层配置不能为空"}
+            return invalid("layer_assignments_empty", "分层配置不能为空")
 
         # 收集所有区间，排序验证连续性
         intervals = []
@@ -2856,16 +2872,19 @@ class Scheduler:
             end = a.get("end_layer", 0)
 
             if node_id not in self.nodes:
-                return {"status": "invalid", "reason": f"未知节点: {node_id}"}
+                return invalid("layer_assignment_node_unknown", f"未知节点: {node_id}")
             # Phase 4.1: 阻止 Android 节点被分配层（Android 无 PyTorch 推理能力）
             node_type = self.nodes[node_id].node_type
             if node_type == "android":
-                return {"status": "invalid", "reason": f"Android 节点 {node_id} 不支持层前向传播"}
+                return invalid(
+                    "layer_assignment_node_unsupported",
+                    f"Android 节点 {node_id} 不支持层前向传播",
+                )
             if start < 0 or end > total_layers or start >= end:
-                return {
-                    "status": "invalid",
-                    "reason": f"节点 {node_id} 区间 [{start}, {end}) 无效（范围 0-{total_layers}）",
-                }
+                return invalid(
+                    "layer_assignment_range_invalid",
+                    f"节点 {node_id} 区间 [{start}, {end}) 无效（范围 0-{total_layers}）",
+                )
             intervals.append((start, end, node_id))
 
         # 排序后验证连续性
@@ -2874,24 +2893,24 @@ class Scheduler:
         covered = 0
         for start, end, node_id in intervals:
             if start != covered:
-                return {
-                    "status": "invalid",
-                    "reason": f"节点 {node_id} 区间 [{start}, {end}) 不连续（期望从 {covered} 开始）",
-                }
+                return invalid(
+                    "layer_assignment_range_discontinuous",
+                    f"节点 {node_id} 区间 [{start}, {end}) 不连续（期望从 {covered} 开始）",
+                )
             covered = end
 
         if covered != total_layers:
-            return {
-                "status": "invalid",
-                "reason": f"总覆盖范围 {covered} ≠ {total_layers}，分层未完整覆盖",
-            }
+            return invalid(
+                "layer_assignment_coverage_incomplete",
+                f"总覆盖范围 {covered} ≠ {total_layers}，分层未完整覆盖",
+            )
 
         master_intervals = [item for item in intervals if item[2] == "master"]
         if len(master_intervals) != 1 or master_intervals[0][0] != 0:
-            return {
-                "status": "invalid",
-                "reason": "主节点必须且只能承担从 Layer 0 开始的首段",
-            }
+            return invalid(
+                "layer_assignment_master_must_be_first",
+                "主节点必须且只能承担从 Layer 0 开始的首段",
+            )
 
         normalized_assignments = self._normalize_manual_assignments([
             {"node_id": node_id, "start_layer": start, "end_layer": end}
@@ -6307,6 +6326,7 @@ class Scheduler:
                 }
 
         status = {
+            "running": self._running,
             "run_mode": RUN_MODE,
             "nodes": node_status,
             "current_task": current_task,

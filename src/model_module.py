@@ -505,6 +505,7 @@ class ModelManager:
                         "success": False,
                         "model_id": model_id,
                         "model_name": model_id,
+                        "error_code": "MODEL_NOT_REGISTERED",
                         "error": f"模型 '{model_id}' 未在注册表中找到。请先注册或下载模型文件。",
                     }
                 self.load_model(model_id=model_id, model_path=model_path,
@@ -537,6 +538,7 @@ class ModelManager:
                             "success": False,
                             "model_id": rollback_model_id,
                             "model_name": rollback_model_name,
+                            "error_code": "MODEL_LOAD_FAILED_ROLLED_BACK",
                             "error": f"模型 '{model_id}' 加载失败: {e}。已回滚到 '{rollback_model_name}'。",
                         }
                     except Exception as rollback_err:
@@ -545,6 +547,7 @@ class ModelManager:
                             "success": False,
                             "model_id": None,
                             "model_name": "",
+                            "error_code": "MODEL_LOAD_AND_ROLLBACK_FAILED",
                             "error": f"模型 '{model_id}' 加载失败: {e}。回滚也失败: {rollback_err}。",
                         }
 
@@ -552,6 +555,7 @@ class ModelManager:
                     "success": False,
                     "model_id": None,
                     "model_name": "",
+                    "error_code": "MODEL_LOAD_FAILED",
                     "error": f"模型 '{model_id}' 加载失败: {e}",
                 }
 

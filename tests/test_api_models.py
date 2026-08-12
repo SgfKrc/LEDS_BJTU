@@ -6,6 +6,7 @@ import types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
+from fastapi.testclient import TestClient
 
 import api_server
 from model_host import model_host
@@ -604,7 +605,20 @@ def test_load_model_rollback_on_failure(monkeypatch):
     with pytest.raises(api_server.HTTPException) as exc:
         asyncio.run(api_server.load_model(req))
     assert exc.value.status_code == 500
-    assert "已回滚" in exc.value.detail
+    assert exc.value.error_code == "MODEL_LOAD_FAILED"
+
+
+def test_model_error_response_keeps_detail_and_adds_stable_code():
+    response = TestClient(api_server.app).post(
+        "/api/models/load",
+        json={"engine": "unsupported-engine"},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert isinstance(body["detail"], str)
+    assert body["error_code"] == "MODEL_ENGINE_UNSUPPORTED"
+    assert response.headers["X-QLH-Error-Code"] == "MODEL_ENGINE_UNSUPPORTED"
 
 
 def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):

@@ -23,6 +23,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
+from api_errors import coded_http_error, install_http_error_handler
+
 logger = logging.getLogger("scheduler_svc_http")
 
 router = APIRouter()
@@ -863,7 +865,9 @@ async def get_device_profile():
             except Exception:
                 pass
         except Exception as exc:
-            raise HTTPException(500, f"设备检测失败: {exc}")
+            raise coded_http_error(
+                500, "DEVICE_PROFILE_DETECTION_FAILED", f"设备检测失败: {exc}",
+            )
     return _with_compat_device_fields(_device_profile_cache)
 
 
@@ -879,7 +883,9 @@ async def auto_configure():
                 _detect_device_profile,
             )
         except Exception as exc:
-            raise HTTPException(500, f"设备检测失败: {exc}")
+            raise coded_http_error(
+                500, "DEVICE_PROFILE_DETECTION_FAILED", f"设备检测失败: {exc}",
+            )
     sched = _scheduler()
     try:
         sched.update_local_device_profile(_device_profile_cache)
@@ -924,12 +930,17 @@ async def select_gpu(req: SelectGpuRequest):
     inference-svc /v1/models/load 范畴）。"""
     global _device_profile_cache
     if _device_profile_cache is None:
-        raise HTTPException(400, "设备画像未就绪，请先调用 GET /device/profile")
+        raise coded_http_error(
+            400,
+            "DEVICE_PROFILE_NOT_READY",
+            "设备画像未就绪，请先调用 GET /device/profile",
+        )
 
     gpus = _device_profile_cache.get("gpus", [])
     if req.gpu_index < 0 or req.gpu_index >= len(gpus):
-        raise HTTPException(
+        raise coded_http_error(
             400,
+            "DEVICE_GPU_INDEX_INVALID",
             f"无效的 GPU 序号: {req.gpu_index}。"
             f"可用范围: 0-{len(gpus) - 1}（共 {len(gpus)} 个 GPU）",
         )
@@ -971,5 +982,6 @@ def build_scheduler_app(scheduler) -> "FastAPI":
 
     set_scheduler(scheduler)
     app = FastAPI(title="scheduler-svc", version="0.1.0")
+    install_http_error_handler(app)
     app.include_router(router)
     return app

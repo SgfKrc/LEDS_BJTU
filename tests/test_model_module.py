@@ -1930,7 +1930,7 @@ class TestSwitchModel:
         mgr = ModelManager()
         result = mgr.switch_model("nonexistent-model")
         assert result["success"] is False
-        assert "未在注册表中找到" in result["error"]
+        assert result["error_code"] == "MODEL_NOT_REGISTERED"
 
     def test_switch_first_model_succeeds(self, monkeypatch):
         """首次加载（无旧模型）→ 直接加载新模型"""
