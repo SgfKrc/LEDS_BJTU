@@ -37,6 +37,24 @@ def test_controller_variant_is_used_for_check(monkeypatch):
     assert captured["profile"]["variant"] == "cpu"
 
 
+def test_controller_forwards_download_progress_without_changing_update_arguments(monkeypatch):
+    captured = {}
+    progress = lambda _event: None
+    monkeypatch.setattr(
+        qlh_launcher, "updater_main",
+        lambda argv, **kwargs: captured.update({"argv": argv, "kwargs": kwargs}) or 0,
+    )
+    controller = qlh_launcher.LauncherController(
+        ["https://updates.example/latest.json"], variant_override="cpu",
+    )
+    assert controller.install_update(progress=progress) == 0
+    assert captured["argv"] == [
+        "install", "--yes", "--variant", "cpu",
+        "--source", "https://updates.example/latest.json",
+    ]
+    assert captured["kwargs"] == {"progress": progress}
+
+
 def test_headless_launch_returns_success_code(monkeypatch):
     launched = []
     monkeypatch.setattr(qlh_launcher, "launch_app", lambda mode, _variant=None: launched.append(mode))
