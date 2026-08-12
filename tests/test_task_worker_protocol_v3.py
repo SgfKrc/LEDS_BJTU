@@ -183,6 +183,37 @@ def test_v3_is_explicit_while_v2_remains_the_preferred_text_protocol():
     assert v2_rejects_image_fields.value.code == "invalid_fields"
 
 
+def test_v2_explicitly_admits_the_fixed_image_prompt_text_stage():
+    payload = {
+        "node_id": "worker_text_1",
+        "worker_kind": "pc_full_worker",
+        "min_version": 2,
+        "max_version": 2,
+        "capabilities": {
+            "stage_types": ["image_prompt"],
+            "engines": ["pytorch"],
+            "models": [{
+                "model_id": "qwen-1_8b",
+                "engine": "pytorch",
+                "format": "safetensors",
+                "revision": "local-v1",
+                "sha256": "a" * 64,
+            }],
+            "max_concurrency": 1,
+        },
+    }
+
+    hello = build_message(
+        "hello",
+        payload,
+        message_id="msg_hello_imageprompt_12345678",
+        sent_at_ms=1000,
+        version=2,
+    )
+
+    assert hello.payload["capabilities"]["stage_types"] == ["image_prompt"]
+
+
 def test_v3_worker_cannot_claim_legacy_models_engines_or_v2_downgrade():
     downgrade = _hello_payload()
     downgrade["min_version"] = 2

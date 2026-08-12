@@ -1878,6 +1878,26 @@ class EngineHost:
                 [{"role": "system", "content": instruction}, *messages],
                 candidate_budget,
             )
+        if stage_request.stage_type == "image_prompt":
+            message = str(root_input.get("message", "") or "").strip()
+            if not message:
+                raise TaskGraphError("图像提示词 Stage 缺少原始需求")
+            result = run_model(
+                [{
+                    "role": "system",
+                    "content": (
+                        "将用户需求改写为一条可直接用于 Stable Diffusion 1.5 的视觉提示词。"
+                        "仅输出提示词本身，不解释、不使用 Markdown、不声明任务链。"
+                    ),
+                }, {"role": "user", "content": message}],
+                min(candidate_budget, 192),
+            )
+            prompt = str(result.get("content", "") or "").strip()
+            if not prompt or len(prompt) > 1000:
+                raise TaskGraphError("图像提示词 Stage 输出为空或超出长度限制")
+            result["content"] = prompt
+            result.pop("thinking_content", None)
+            return result
         if stage_request.stage_type == "aggregate":
             message = str(root_input.get("message", "") or "")
             if not message:

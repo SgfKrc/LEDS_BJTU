@@ -49,6 +49,7 @@ _SUPPORTED_ENGINES = frozenset({
     "pytorch", "llama_cpp", "island", "external_api", "speculative_assisted",
 })
 _SUPPORTED_ENGINES_V3 = _SUPPORTED_ENGINES | {"diffusers_sd15"}
+_TEXT_STAGE_TYPES = frozenset({"full_inference", "aggregate", "image_prompt"})
 _IMAGE_STAGE_TYPES = frozenset({"image_generate", "image_edit", "image_grid"})
 _IMAGE_PIPELINE_KINDS = frozenset({
     "sd15_pipeline",
@@ -640,7 +641,7 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
         )
     supported_stage_types = (
         _IMAGE_STAGE_TYPES if version >= 3
-        else frozenset({"full_inference", "aggregate"})
+        else _TEXT_STAGE_TYPES
     )
     if any(value not in supported_stage_types for value in stage_types):
         raise _error(
@@ -1229,7 +1230,7 @@ def _validate_payload(
         )
         supported_stage_types = (
             _IMAGE_STAGE_TYPES if version >= 3
-            else frozenset({"full_inference", "aggregate"})
+            else _TEXT_STAGE_TYPES
         )
         if payload["stage_type"] not in supported_stage_types:
             raise _error(

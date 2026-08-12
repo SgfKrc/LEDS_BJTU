@@ -3290,7 +3290,7 @@ class Scheduler:
                 exc_info=True,
             )
         return {
-            "stage_types": ["full_inference", "aggregate"],
+            "stage_types": ["full_inference", "aggregate", "image_prompt"],
             "engines": engines,
             "models": models,
             "max_concurrency": 1,

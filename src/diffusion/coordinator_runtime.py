@@ -281,7 +281,7 @@ class DiffusionCoordinatorRuntime:
         }
         for workflow in workflows:
             if (
-                workflow.get("template") not in {"image_generate_v1", "image_grid_v1"}
+                workflow.get("template") not in {"image_generate_v1", "image_grid_v1", "llm_sd15_v1"}
                 or workflow.get("state") != "failed"
                 or not workflow.get("recovered_after_restart")
                 or workflow.get("recovery_reason")
