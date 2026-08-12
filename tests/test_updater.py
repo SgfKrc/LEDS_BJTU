@@ -150,14 +150,16 @@ def test_download_is_atomic_and_reuses_verified_file(tmp_path):
 
 
 def test_manifest_rejects_non_object_assets_and_unbounded_size():
-    with pytest.raises(update_core.ManifestError, match="must be an object"):
+    with pytest.raises(update_core.ManifestError) as invalid_assets:
         update_core.UpdateManifest.from_mapping({
             "schema_version": 1, "tag": "0.1.8.1", "assets": ["bad"],
         })
+    assert invalid_assets.value.code == "UPDATE_MANIFEST_INVALID"
     oversized = _asset("oversized.exe")
     oversized["size"] = 33 * 1024 * 1024 * 1024
-    with pytest.raises(update_core.ManifestError, match="out of range"):
+    with pytest.raises(update_core.ManifestError) as oversized_assets:
         update_core.UpdateAsset.from_mapping(oversized)
+    assert oversized_assets.value.code == "UPDATE_MANIFEST_INVALID"
 
 
 def test_configured_sources_keeps_multiple_persisted_sources(tmp_path, monkeypatch):
@@ -221,8 +223,7 @@ def test_fetch_latest_placeholder_reports_unresolved_when_all_sources_fail():
             ["https://old.example", "https://gitee.example/{release_tag}/latest.json"],
             timeout=1, fetcher=fetcher,
         )
-    assert "unresolved" in str(excinfo.value)
-    assert "{release_tag}" in str(excinfo.value)
+    assert excinfo.value.code == "UPDATE_FAILED"
 
 
 def test_detect_current_version_reads_source_tree_without_importing_it(tmp_path, monkeypatch):

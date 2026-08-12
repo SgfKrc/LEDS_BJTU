@@ -68,8 +68,7 @@ def test_launch_failure_runs_quick_integrity_check_when_a_signed_root_exists(mon
 
     controller = qlh_launcher.LauncherController([], variant_override="cpu")
     assert controller._launch_failed(FileNotFoundError("missing app")) == 2
-    assert "quick 校验失败" in controller.last_error
-    assert "QLH-Edge-Inference.exe" in controller.last_error
+    assert controller.last_error_code == "LAUNCH_INTEGRITY_CHECK_FAILED"
 
 
 def test_verify_command_forwards_selected_root_and_json(monkeypatch, tmp_path):

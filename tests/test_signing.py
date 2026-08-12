@@ -138,22 +138,22 @@ def test_tampered_manifest_body_fails_closed(keyring):
     manifest = _signed_manifest(keyring)
     tampered = dict(manifest)
     tampered["assets"] = [_asset("setup.exe", b"evil payload")]
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         tampered, trusted_keys_dir=keyring["pubkeys"],
     )
-    assert verified is False
-    assert "签名" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_INVALID"
 
 
 def test_tampered_signature_fails_closed(keyring):
     manifest = _signed_manifest(keyring)
     tampered = dict(manifest)
     tampered["signature"] = base64.b64encode(b"x" * 64).decode("ascii")
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         tampered, trusted_keys_dir=keyring["pubkeys"],
     )
-    assert verified is False
-    assert "签名校验失败" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_INVALID"
 
 
 # --------------------------------------------------------------------------
@@ -164,61 +164,61 @@ def test_missing_signature_is_not_verified(keyring):
     manifest = {
         "schema_version": 1, "tag": "0.1.8.1", "assets": [_asset("setup.exe")],
     }
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=keyring["pubkeys"],
     )
-    assert verified is False
-    assert "没有签名" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_MISSING"
 
 
 def test_unknown_key_id_fails_closed(keyring):
     manifest = _signed_manifest(keyring)
     manifest["key_id"] = "release-evil"
     manifest["signature"] = base64.b64encode(b"y" * 64).decode("ascii")
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=keyring["pubkeys"],
     )
-    assert verified is False
-    assert "未知发布密钥" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_KEY_UNKNOWN"
 
 
 def test_missing_signed_at_fails_closed(keyring):
     manifest = _signed_manifest(keyring)
     del manifest["signed_at"]
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=keyring["pubkeys"],
     )
-    assert verified is False
-    assert "signed_at" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_SIGNED_AT_INVALID"
 
 
 def test_malformed_signed_at_fails_closed(keyring):
     for bad in ("2026-08-08", "not-a-date", "2026-08-08T00:00:00"):
         manifest = _signed_manifest(keyring, signed_at=bad)
-        verified, _reason = signing.verify_manifest_signature(
+        result = signing.verify_manifest_signature_details(
             manifest, trusted_keys_dir=keyring["pubkeys"],
         )
-        assert verified is False, bad
+        assert result["error_code"] == "SIGNATURE_SIGNED_AT_INVALID", bad
 
 
 def test_missing_trusted_keys_dir_fails_closed(keyring):
     manifest = _signed_manifest(keyring)
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=None,
     )
-    assert verified is False
-    assert "未配置可信公钥" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_TRUST_STORE_MISSING"
 
 
 def test_missing_root_key_file_fails_closed(keyring, tmp_path):
     empty = tmp_path / "empty-pubkeys"
     empty.mkdir()
     manifest = _signed_manifest(keyring)
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=empty,
     )
-    assert verified is False
-    assert "root.pub.json" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_ROOT_KEY_MISSING"
 
 
 # --------------------------------------------------------------------------
@@ -277,11 +277,11 @@ def test_forged_authorization_fails_closed(keyring, tmp_path):
         json.dumps(forged, ensure_ascii=False) + "\n", encoding="utf-8",
     )
     manifest = _signed_manifest(keyring)
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=pubkeys,
     )
-    assert verified is False
-    assert "授权签名无效" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_AUTHORIZATION_INVALID"
 
 
 def test_unknown_issuer_fails_closed(keyring, tmp_path):
@@ -297,11 +297,11 @@ def test_unknown_issuer_fails_closed(keyring, tmp_path):
         json.dumps(forged, ensure_ascii=False) + "\n", encoding="utf-8",
     )
     manifest = _signed_manifest(keyring)
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=pubkeys,
     )
-    assert verified is False
-    assert "授权者不受信任" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_ISSUER_UNTRUSTED"
 
 
 def test_expired_key_fails_closed(keyring, tmp_path):
@@ -320,11 +320,11 @@ def test_expired_key_fails_closed(keyring, tmp_path):
         json.dumps(expired, ensure_ascii=False) + "\n", encoding="utf-8",
     )
     manifest = _signed_manifest(keyring)
-    verified, reason = signing.verify_manifest_signature(
+    result = signing.verify_manifest_signature_details(
         manifest, trusted_keys_dir=pubkeys,
     )
-    assert verified is False
-    assert "过期" in reason
+    assert result["verified"] is False
+    assert result["error_code"] == "SIGNATURE_KEY_EXPIRED"
 
 
 # --------------------------------------------------------------------------
@@ -356,6 +356,7 @@ def test_fetch_manifest_verifies_signed_manifest_end_to_end(keyring):
     assert fetched.signature_present is True
     assert fetched.signature_verified is True
     assert fetched.signature_key_id == "release-20260809"
+    assert fetched.signature_error_code == ""
     assert fetched.signature_error == ""
 
 
@@ -370,6 +371,7 @@ def test_fetch_manifest_tampered_body_fails_closed(keyring):
     )
     assert fetched.signature_present is True
     assert fetched.signature_verified is False
+    assert fetched.signature_error_code == "SIGNATURE_INVALID"
     assert fetched.signature_error
 
 
@@ -384,7 +386,7 @@ def test_fetch_manifest_unknown_key_fails_closed(keyring):
         trusted_keys_dir=keyring["pubkeys"],
     )
     assert fetched.signature_verified is False
-    assert "未知发布密钥" in fetched.signature_error
+    assert fetched.signature_error_code == "SIGNATURE_KEY_UNKNOWN"
 
 
 def test_fetch_manifest_unsigned_manifest_is_reported_but_usable(keyring):
@@ -412,8 +414,9 @@ def test_downloaded_asset_tampering_fails_closed(tmp_path):
         calls += 1
         return _Response(b"evil")
 
-    with pytest.raises(update_core.DownloadError, match="verification failed|exceeds manifest size"):
+    with pytest.raises(update_core.DownloadError) as download_error:
         update_core.download_asset(asset, tmp_path, timeout=1, opener=opener)
+    assert download_error.value.code == "UPDATE_DOWNLOAD_FAILED"
     assert not (tmp_path / "setup.exe").exists()
     assert not (tmp_path / "setup.exe.part").exists()
 

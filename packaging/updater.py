@@ -149,6 +149,7 @@ def _result_for_manifest(
         "signature_present": manifest.signature_present,
         "signature_verified": manifest.signature_verified,
         "signature_key_id": manifest.signature_key_id,
+        "signature_error_code": manifest.signature_error_code,
         "signature_error": manifest.signature_error,
         "profile": profile,
         "asset_kind": kind,
@@ -239,6 +240,10 @@ def _print(value: Any, *, as_json: bool) -> None:
             print("失败源: " + "; ".join(value["source_failures"]))
     else:
         print(value)
+
+
+def _error_payload(exc: UpdateError) -> dict[str, str]:
+    return {"error": str(exc), "error_code": str(getattr(exc, "code", "UPDATE_FAILED"))}
 
 
 def _launch_installer(path: Path) -> int:
@@ -357,7 +362,12 @@ def _require_verified_signature(manifest: UpdateManifest, args: argparse.Namespa
         detail = "清单签名尚未验证"
     else:
         detail = "清单没有签名"
-    raise UpdateError(f"{detail}；只能下载，必须显式 --allow-unsigned 才能安装")
+    exc = UpdateError(f"{detail}；只能下载，必须显式 --allow-unsigned 才能安装")
+    exc.code = (
+        manifest.signature_error_code
+        or ("SIGNATURE_UNVERIFIED" if manifest.signature_present else "SIGNATURE_MISSING")
+    )
+    raise exc
 
 
 def _diagnostic_output(args: argparse.Namespace) -> Path:
@@ -472,7 +482,10 @@ def _launcher_command(
         )
         return 0
     except (LauncherSlotError, UpdateError) as exc:
-        _print({"error": str(exc)}, as_json=args.as_json)
+        if isinstance(exc, UpdateError):
+            _print(_error_payload(exc), as_json=args.as_json)
+        else:
+            _print({"error": str(exc)}, as_json=args.as_json)
         return 2
 
 
@@ -557,14 +570,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "download":
             _print({"downloaded": str(path), "source_failures": list(failures)}, as_json=args.as_json)
             return 0
-        if not manifest.signature_verified and not args.allow_unsigned:
-            if manifest.signature_error:
-                detail = f"发布签名验证失败：{manifest.signature_error}"
-            elif manifest.signature_present:
-                detail = "清单签名尚未验证"
-            else:
-                detail = "清单没有签名"
-            raise UpdateError(f"{detail}；只能下载，必须显式 --allow-unsigned 才能启动安装")
+        _require_verified_signature(manifest, args)
         if not args.yes and not args.as_json:
             answer = input(f"将启动安装包 {path.name}，继续？ [y/N] ").strip().lower()
             if answer not in {"y", "yes"}:
@@ -585,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return code
     except UpdateError as exc:
-        _print({"error": str(exc)}, as_json=args.as_json)
+        _print(_error_payload(exc), as_json=args.as_json)
         return 2
 
 

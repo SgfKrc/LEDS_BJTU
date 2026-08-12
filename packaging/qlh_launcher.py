@@ -296,6 +296,7 @@ class LauncherController:
         self.sources = sources
         self.variant_override = variant_override
         self.last_error = ""
+        self.last_error_code = ""
         self.last_diagnosis: dict | None = None
         self.last_repair: dict | None = None
 
@@ -350,14 +351,17 @@ class LauncherController:
             return self._launch_failed(exc)
 
     def _launch_failed(self, exc: Exception) -> int:
+        self.last_error_code = "LAUNCH_APPLICATION_FAILED"
         self.last_error = str(exc)
         verification = quick_verify_after_launch_failure(self.variant_override)
         if verification is not None:
             root, report = verification
             summary = report["summary"]
             if report["ok"]:
+                self.last_error_code = "LAUNCH_INTEGRITY_VERIFIED"
                 detail = "签名安装清单 quick 校验通过，未发现关键程序文件损坏。"
             else:
+                self.last_error_code = "LAUNCH_INTEGRITY_CHECK_FAILED"
                 first = report["failed"][0]
                 detail = (
                     "签名安装清单 quick 校验失败："
