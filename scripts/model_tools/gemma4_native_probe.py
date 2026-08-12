@@ -30,7 +30,7 @@ def _pinned_llama_cpp_revision() -> str | None:
         return None
 
 
-def _request_error(message: str) -> dict[str, Any]:
+def _request_error(message: str, *, code: str = "invalid_request") -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": TOOL,
@@ -40,7 +40,7 @@ def _request_error(message: str) -> dict[str, Any]:
         "network_access": "disabled",
         "gate_passed": False,
         "status": "invalid_request",
-        "errors": [{"code": "invalid_request", "message": message}],
+        "errors": [{"code": code, "message": message}],
     }
 
 
@@ -130,21 +130,30 @@ def run_native_probe(
     because it happened to initialize on one machine.
     """
     if not isinstance(n_ctx, int) or not 128 <= n_ctx <= MAX_N_CTX:
-        return _request_error(f"n_ctx must be between 128 and {MAX_N_CTX}")
+        return _request_error(
+            f"n_ctx must be between 128 and {MAX_N_CTX}",
+            code="n_ctx_invalid",
+        )
     if not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
-        return _request_error(f"timeout_seconds must be between 0 and {MAX_TIMEOUT_SECONDS:g}")
+        return _request_error(
+            f"timeout_seconds must be between 0 and {MAX_TIMEOUT_SECONDS:g}",
+            code="timeout_invalid",
+        )
 
     model = _normalize_path(model)
     mmproj = _normalize_path(mmproj)
     artifact_requested = bool(model or mmproj or model_sha256 or mmproj_sha256)
     if artifact_requested:
         if model is None or mmproj is None or not model_sha256 or not mmproj_sha256:
-            return _request_error("artifact probe requires --model, --mmproj, --model-sha256 and --mmproj-sha256")
+            return _request_error(
+                "artifact probe requires --model, --mmproj, --model-sha256 and --mmproj-sha256",
+                code="artifact_identity_incomplete",
+            )
         try:
             _validate_sha256("model_sha256", model_sha256)
             _validate_sha256("mmproj_sha256", mmproj_sha256)
         except ValueError as exc:
-            return _request_error(str(exc))
+            return _request_error(str(exc), code="artifact_sha256_invalid")
 
     request = {
         "schema_version": SCHEMA_VERSION,
