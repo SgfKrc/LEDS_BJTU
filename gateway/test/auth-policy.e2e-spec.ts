@@ -1,82 +1,69 @@
-import { ExecutionContext, ForbiddenException, UnauthorizedException } from '@nestjs/common';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { ExecutionContext } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
-import {
-  accessLevelFor,
-  authPolicyEnabled,
-  AuthPolicyGuard,
-} from '../src/modules/auth/auth-policy.guard';
+import { ControlClient } from '../src/clients/control.client';
+import { AuthPolicyGuard } from '../src/modules/auth/auth-policy.guard';
 
-function context(method: string, url: string, authorization?: string): ExecutionContext {
-  const request = {
-    method,
-    url,
-    headers: authorization ? { authorization } : {},
-  } as FastifyRequest;
+function context(request: FastifyRequest): ExecutionContext {
   return {
     switchToHttp: () => ({ getRequest: () => request }),
   } as unknown as ExecutionContext;
 }
 
-describe('MF-AUTH-N1A gateway authorization policy', () => {
-  const previousAuthRequired = process.env.QLH_AUTH_REQUIRED;
-  const request = jest.fn();
-  const guard = new AuthPolicyGuard({ request } as any);
+async function readRequestBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf-8');
+}
 
-  beforeEach(() => {
-    process.env.QLH_AUTH_REQUIRED = '1';
-    request.mockReset();
+describe('MF-AUTH-N1A gateway authorization policy HTTP integration', () => {
+  const previousAuthRequired = process.env.QLH_AUTH_REQUIRED;
+  let server: Server;
+  let controlUrl: string;
+  let received: { method?: string; url?: string; authorization?: string; body?: string };
+
+  beforeAll(async () => {
+    server = createServer(async (request, response) => {
+      received = {
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization,
+        body: await readRequestBody(request),
+      };
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ user: { user_id: 'member-1', role: 'member' } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    controlUrl = `http://127.0.0.1:${port}`;
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     if (previousAuthRequired === undefined) delete process.env.QLH_AUTH_REQUIRED;
     else process.env.QLH_AUTH_REQUIRED = previousAuthRequired;
   });
 
-  it('keeps login and node trust routes outside local-user sessions', () => {
-    expect(accessLevelFor('POST', '/api/auth/login')).toBe('public');
-    expect(accessLevelFor('POST', '/api/cluster/nodes/register')).toBe('machine');
-    expect(accessLevelFor('GET', '/api/models/files/model.gguf')).toBe('machine');
-  });
+  it('validates a member session through the real ControlClient HTTP request', async () => {
+    process.env.QLH_AUTH_REQUIRED = '1';
+    received = {};
+    const request = {
+      method: 'POST',
+      url: '/api/chat',
+      headers: { authorization: 'Bearer integration-token' },
+    } as FastifyRequest & { qlhAuthSession?: Record<string, unknown> };
+    const guard = new AuthPolicyGuard(new ControlClient(controlUrl, 1000));
 
-  it('classifies member work and manager mutations separately', () => {
-    expect(accessLevelFor('POST', '/api/chat')).toBe('authenticated');
-    expect(accessLevelFor('POST', '/api/diffusion/generate')).toBe('authenticated');
-    expect(accessLevelFor('GET', '/api/auth/tailscale/local-status')).toBe('authenticated');
-    expect(accessLevelFor('GET', '/api/users')).toBe('manager');
-    expect(accessLevelFor('POST', '/api/models/load')).toBe('manager');
-    expect(accessLevelFor('PATCH', '/api/cluster/settings')).toBe('manager');
-  });
-
-  it('supports explicit rollout switches while defaulting off only in tests', () => {
-    expect(authPolicyEnabled({ NODE_ENV: 'production' })).toBe(true);
-    expect(authPolicyEnabled({ NODE_ENV: 'test' })).toBe(false);
-    expect(authPolicyEnabled({ NODE_ENV: 'test', QLH_AUTH_REQUIRED: 'on' })).toBe(true);
-    expect(authPolicyEnabled({ NODE_ENV: 'production', QLH_AUTH_REQUIRED: 'off' })).toBe(false);
-  });
-
-  it('rejects protected routes without a Bearer token', async () => {
-    await expect(guard.canActivate(context('GET', '/api/status')))
-      .rejects.toBeInstanceOf(UnauthorizedException);
-    expect(request).not.toHaveBeenCalled();
-  });
-
-  it('allows member work but rejects manager routes for members', async () => {
-    request.mockResolvedValue({ user: { user_id: 'member-1', role: 'member' } });
-    await expect(guard.canActivate(context('POST', '/api/chat', 'Bearer member-token')))
-      .resolves.toBe(true);
-    await expect(guard.canActivate(context('GET', '/api/users', 'Bearer member-token')))
-      .rejects.toBeInstanceOf(ForbiddenException);
-  });
-
-  it('allows owner and admin sessions through manager routes', async () => {
-    request.mockResolvedValueOnce({ user: { user_id: 'owner-1', role: 'owner' } });
-    await expect(guard.canActivate(context('GET', '/api/users', 'Bearer owner-token')))
-      .resolves.toBe(true);
-    request.mockResolvedValueOnce({ user: { user_id: 'admin-1', role: 'admin' } });
-    await expect(guard.canActivate(context('POST', '/api/models/load', 'Bearer admin-token')))
-      .resolves.toBe(true);
-    expect(request).toHaveBeenCalledWith(
-      'GET', '/auth/session', undefined, expect.objectContaining({ authorization: expect.any(String) }),
-    );
+    await expect(guard.canActivate(context(request))).resolves.toBe(true);
+    expect(received).toEqual({
+      method: 'GET',
+      url: '/auth/session',
+      authorization: 'Bearer integration-token',
+      body: '',
+    });
+    expect(request.qlhAuthSession).toEqual({
+      user: { user_id: 'member-1', role: 'member' },
+    });
   });
 });

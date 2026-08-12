@@ -15,10 +15,6 @@ import tempfile
 import threading
 import time
 
-# Mock _store_dir before importing local_store
-_original_store_dir = None
-
-
 @pytest.fixture(autouse=True)
 def temp_store_dir(monkeypatch):
     """将 local_store 的存储目录重定向到临时目录"""
@@ -27,13 +23,6 @@ def temp_store_dir(monkeypatch):
     legacy_dir = os.path.join(tmpdir, "legacy")
     sqlite_path = os.path.join(tmpdir, "qlh-control.sqlite3")
 
-    # Patch _store_dir 函数
-    def _mock_store_dir():
-        os.makedirs(tmpdir, exist_ok=True)
-        return tmpdir
-
-    monkeypatch.setattr(local_store, '_store_dir', _mock_store_dir)
-    monkeypatch.setattr(local_store, '_get_store_dir', _mock_store_dir)
     monkeypatch.setattr(local_store, '_legacy_store_dir', lambda: legacy_dir)
     monkeypatch.setattr(local_store, '_sqlite_path', lambda: sqlite_path)
     monkeypatch.setattr(local_store, '_initialized_paths', set())
