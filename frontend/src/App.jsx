@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import DevicePanel from './components/DevicePanel';
 import ModelSelector from './components/ModelSelector';
 import MetricsPanel from './components/MetricsPanel';
@@ -8,7 +8,11 @@ import SettingsModal from './components/SettingsModal';
 import SessionList from './components/SessionList';
 import DiffusionPanel from './components/DiffusionPanel';
 import UserManagementPanel from './components/UserManagementPanel';
-import { normalizeExecutionSettings } from './settings';
+import {
+  createSettings,
+  mergeSettingsSources,
+  normalizeExecutionSettings,
+} from './settings';
 
 // ---- 设备档位预设 ----
 export const TIER_PRESETS = {
@@ -25,20 +29,6 @@ export const TIER_LABELS = {
   ultrabook: '超极本',
   edge: '边缘设备',
   mobile: '移动端',
-};
-
-// 默认设置（无设备档位时使用）
-const DEFAULT_SETTINGS = {
-  saveHistory: true,             // 对话历史云端持久化：默认开启，确保跨设备数据共享
-  maxNewTokens: 1024,
-  temperature: 0.7,
-  topP: 0.9,
-  distributedInference: false, // 分布式推理：启动时从服务端同步，避免默认假设导致状态不一致
-  executionMode: 'auto',       // auto=标准聊天路由 | task_graph=单机任务链实验
-  taskGraphRemoteMode: 'local', // local=任务链仅本地 | auto=显式允许自动 Full Worker
-  cloudSync: true,             // 云同步设置偏好：默认开启，确保跨设备设置一致
-  showThinking: false,         // 深度思考展示：默认关闭
-  streamingMode: 'full',       // 流式输出模式: full=完整功能（历史/追问/持久化，默认）| fast=真流式逐token
 };
 
 function getSystemTheme() {
@@ -66,17 +56,22 @@ function applyTheme(themeMode) {
   try { localStorage.setItem('qlh-theme', themeMode); } catch (_) {}
 }
 
-// 从 localStorage 读取设置
-function getInitialSettings() {
+function getStoredSettings() {
   try {
     const stored = localStorage.getItem('qlh-settings');
     if (stored) {
       const parsed = JSON.parse(stored);
-      // 合并默认值以兼容新增字段
-      return normalizeExecutionSettings({ ...DEFAULT_SETTINGS, ...parsed });
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
     }
   } catch (_) {}
-  return { ...DEFAULT_SETTINGS };
+  return null;
+}
+
+// 从 localStorage 读取设置，并补齐后续版本新增字段。
+function getInitialSettings() {
+  return createSettings(getStoredSettings());
 }
 
 function saveSettings(settings) {
@@ -104,6 +99,7 @@ export default function App({ authSession, onLogout }) {
   const [themeMode, setThemeMode] = useState(getInitialThemeMode);
   const [systemTheme, setSystemTheme] = useState(getSystemTheme);
   const [settings, setSettings] = useState(getInitialSettings);
+  const settingsRevisionRef = useRef(0);
   const [taskGraphCapability, setTaskGraphCapability] = useState({
     enabled: false,
     available: false,
@@ -164,14 +160,6 @@ export default function App({ authSession, onLogout }) {
           console.warn('获取节点角色失败，管理功能暂不可用');
           setMyRole({ node_role: 'unknown', node_id: 'unknown', is_master: false, is_client: false });
         });
-      // 从服务端同步分布式推理开关状态
-      fetchDistributedInferenceConfig()
-        .then((config) => {
-          if (config && typeof config.enabled === 'boolean') {
-            updateSettings({ distributedInference: config.enabled });
-          }
-        })
-        .catch(() => {});  // 服务端不可用时保持本地设置
       fetchTaskGraphStatus(activeSessionId || '')
         .then((capability) => {
           setTaskGraphCapability(capability);
@@ -179,7 +167,7 @@ export default function App({ authSession, onLogout }) {
         .catch(() => {
           setTaskGraphCapability({ enabled: false, available: false, role: 'unknown' });
         });
-      // 从云端恢复用户偏好设置（仅在用户已开启云同步时）
+      // 主节点 SQLite 补齐浏览器未显式设置的字段；集群配置是分布式开关的权威来源。
       fetchStatus()
         .then((status) => {
           const externalReady = Boolean(
@@ -197,21 +185,31 @@ export default function App({ authSession, onLogout }) {
           }
         })
         .catch(() => {});
-      const localSettings = getInitialSettings();
-      if (localSettings.cloudSync) {
-        fetchUserSettings()
-          .then((res) => {
-            if (res && res.settings && Object.keys(res.settings).length > 0) {
-              setSettings((prev) => {
-                // localStorage 优先（最新用户意图），云端补充缺失字段
-                const merged = normalizeExecutionSettings({ ...res.settings, ...prev });
-                saveSettings(merged);
-                return merged;
-              });
-            }
-          })
-          .catch(() => {});  // 服务端不可用时保持本地设置
-      }
+      const storedSettings = getStoredSettings();
+      const initialSettings = createSettings(storedSettings);
+      const initialRevision = settingsRevisionRef.current;
+      Promise.allSettled([
+        fetchDistributedInferenceConfig(),
+        initialSettings.cloudSync ? fetchUserSettings() : Promise.resolve(null),
+      ]).then(([distributedResult, userSettingsResult]) => {
+        if (settingsRevisionRef.current !== initialRevision) return;
+
+        const primarySettings = userSettingsResult.status === 'fulfilled'
+          ? userSettingsResult.value?.settings
+          : null;
+        let merged = mergeSettingsSources(primarySettings, storedSettings);
+        if (
+          distributedResult.status === 'fulfilled'
+          && typeof distributedResult.value?.enabled === 'boolean'
+        ) {
+          merged = normalizeExecutionSettings({
+            ...merged,
+            distributedInference: distributedResult.value.enabled,
+          });
+        }
+        saveSettings(merged);
+        setSettings(merged);
+      });
     });
   }, []);
 
@@ -264,6 +262,7 @@ export default function App({ authSession, onLogout }) {
 
   // 更新设置（自动持久化到 localStorage，云同步需手动开启）
   const updateSettings = useCallback((partial) => {
+    settingsRevisionRef.current += 1;
     setSettings((prev) => {
       const next = normalizeExecutionSettings({ ...prev, ...partial });
       saveSettings(next);

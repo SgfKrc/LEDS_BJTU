@@ -24,7 +24,7 @@ test('Gemma 4 chat selects, previews, removes, and sends bounded images', async 
 
     if (path === '/api/auth/capability') return json(route, { detail: 'Not Found' }, 404);
     if (path === '/api/cluster/my-role') return json(route, { is_master: true, node_id: 'local' });
-    if (path === '/api/cluster/distributed-inference/config') return json(route, { enabled: false });
+    if (path === '/api/cluster/config/distributed-inference') return json(route, { enabled: false });
     if (path === '/api/workflows') return json(route, { workflows: [], available: false });
     if (path === '/api/status') {
       return json(route, {

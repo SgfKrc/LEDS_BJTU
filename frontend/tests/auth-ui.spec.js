@@ -57,7 +57,7 @@ test('first owner configures Auth App, receives recovery codes, enters, and logs
         : json({ detail: '本地主节点会话无效' }, 401);
     }
     if (path === '/api/cluster/my-role') return json({ is_master: true, node_id: 'local' });
-    if (path === '/api/cluster/distributed-inference/config') return json({ enabled: false });
+    if (path === '/api/cluster/config/distributed-inference') return json({ enabled: false });
     if (path === '/api/status') return json({ model_loaded: false });
     if (path === '/api/user/settings') return json({ settings: {} });
     if (path === '/api/sessions') return json({ sessions: [] });

@@ -145,7 +145,7 @@ test('local model fleet workspace manages artifacts, imports, pulls, and user pr
     if (path === '/api/models/runtime-checks/retry') return json({ runnable: true, runtime_check: { status: 'ready' } });
     if (path === '/api/models/runtime-checks' && method === 'DELETE') return json({ status: 'invalidated', count: 1 });
     if (path === '/api/cluster/my-role') return json({ is_master: true, node_id: 'local' });
-    if (path === '/api/cluster/distributed-inference/config') return json({ enabled: false });
+    if (path === '/api/cluster/config/distributed-inference') return json({ enabled: false });
     if (path === '/api/status') return json({ model_loaded: false });
     if (path === '/api/user/settings') return json({ settings: {} });
     if (path === '/api/models' && method === 'GET') return json({ models: [], active_model_id: null });
