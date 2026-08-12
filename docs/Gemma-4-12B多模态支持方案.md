@@ -1,6 +1,6 @@
 # Gemma-4-12B 多模态支持方案（实施计划）
 
-> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；G4.3.2B 原生初始化与图片语义受 RAM 门 Blocked；EX-N3-GEMMA-S1 静态质量计数桥接完成）
+> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；G4.3.2B 原生初始化与图片语义受 RAM 门 Blocked；EX-N3-GEMMA-S1 静态质量计数桥接完成；2.4 已登记 PyTorch 工件候选与下载治理 S0）
 >
 > 更新日期：2026-08-13
 > 适用范围：原版 Gemma 4 12B 经本机 Ollama `external_api` 提供文本与图像理解；G4.3.1/2A 已完成原生候选的 ABI 与资产身份门，音频和原生实际推理另列后续票
@@ -92,6 +92,52 @@ $ ollama show myheretic
 | 上下文 | 当前只验收 2K/4K；8K–16K 和长会话 OOM 必须在 G4.3 单独取数，256K 不进入本机承诺 |
 | 时延 | 文本热请求约 1.46 秒；图像原生 smoke 总计约 24.4 秒，其中模型加载约 13.1 秒、图像 prompt 约 10.0 秒 |
 | 结论 | 可作为单用户实验/验证模型；高并发、长上下文、音频与分布式均未验收 |
+
+### 2.4 PyTorch 工件候选登记与下载治理（2026-08-13）
+
+> **定位**：以下为**未来 PyTorch 候选登记**，本机（8GB 显存）**绝不允许下载后直接准入**；本机当前唯一已验收工件仍为 Ollama 官方 `gemma4:12b`（Q4_K_M，G4.1）。
+
+**工件身份**（HF API 实查，经 7897 代理）：
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `google/gemma-4-12B`（Hugging Face 官方） |
+| gated | `False`（无需同意即可下载） |
+| 许可证 | `apache-2.0` |
+| repo SHA | `023679ed352de9bb66cc873c9009ce3482585c08` |
+| model.safetensors | 单文件，**23,919,549,408 bytes（≈23.9 GB）**（HF `X-Linked-Size` 实测） |
+| 架构 | `gemma4_unified`（Transformers 需支持该架构的版本） |
+| 文件集 | 8 个：model.safetensors / config.json / generation_config.json / processor_config.json / tokenizer.json / tokenizer_config.json / README.md / .gitattributes |
+
+**准入红线（本机 8GB 显存）**：fp16 12B 权重加载需 **≈24GB VRAM**，本机显存门不通过，禁止本机准入；PyTorch 候选仅面向**大显存/多卡/分布式/微调**场景。
+
+**侧车定位（transformers 版本不兼容为预期设计）**：本机现有 transformers 4.47.1（主 venv 与 CUDA venv）均不识别 `gemma4_unified` 架构（实测 `AutoConfig.from_pretrained` 报"does not recognize this architecture"）。**不升级/污染既有 venv**——PyTorch 工件按 SD 1.5 侧车模式独立成 venv（如 `.venv-packaging-gemma4-pt`），独立安装支持 `gemma4_unified` 的新版 transformers，主解释器与 LLM 推理环境不受影响。
+
+**容量预算**（本机实测：磁盘总 166GB / 可用 59GB）：
+
+| 形态 | 磁盘占用 | VRAM 需求 | 准入条件 |
+|---|---|---|---|
+| 下载缓存（LFS 分片） | ~23.9 GB | — | 磁盘可用 ≥ 50GB（本机 59GB 临界，建议外部机） |
+| 权重落盘（fp16 safetensors） | ~23.9 GB | — | 同上 |
+| fp16 加载推理 | — | ~24 GB | 外部大显存机（≥ 24GB VRAM） |
+| Q4 量化转换产物 | ~7.5 GB | — | 与 Ollama 工件同量级，仅对照用 |
+
+**下载治理**：
+- 网络：官网直连不通，一律走 `127.0.0.1:7897` 代理（与 gemma4 Ollama 拉取同一路径）
+- 前置门：磁盘容量预算检查（下载 + 落盘 ≥ 48GB 空闲）+ 显存准入（≥ 24GB VRAM 或已规划量化目标）
+- 校验：下载后对 model.safetensors 全量 SHA-256 校验（HF LFS 提供 xet/lfs hash；旁车先于文件落盘）
+- 断点：huggingface_hub 分片/续传下载（有界超时与重试）
+
+**分期计划**：
+
+| 阶段 | 内容 | 准入条件 | 生命周期 |
+|---|---|---|---|
+| S0（本票） | 工件登记 + 下载治理 + 容量预算 | 无（只读调研） | `规划` |
+| S1 | 外部大显存机下载 + 校验 + fp16 加载冒烟 + Transformers 官方加载路径验证 | ≥ 24GB VRAM 设备 / 磁盘 ≥ 50GB | `规划` |
+| S2 | PyTorch 引擎接入：注册表条目、模型配置、CUDA 加载路径、分布管线候选 | S1 通过 + 侧车 venv 建好 | `规划` |
+| S3 | 与 Ollama Q4 路径对照实验（同模型两种工件形态：质量/速度/内存对比） | S2 通过 | `规划` |
+
+> 本登记不改变 G4.1/G4.2 已验收工件基线；在 S1 完成前，PyTorch 候选不进入任何实验、注册表或质量门。
 
 ---
 
