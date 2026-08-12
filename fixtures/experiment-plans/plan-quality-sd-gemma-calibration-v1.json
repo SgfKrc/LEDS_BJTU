@@ -1,0 +1,274 @@
+{
+  "plan_id": "plan-quality-sd-gemma-calibration-v1",
+  "title": "EX-N3 真实 SD→Gemma 三轮基线标定",
+  "prompt_set": {
+    "id": "ps-v1-zh-en-code",
+    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  },
+  "env": {
+    "engine": "Real SD 1.5 ten-seed text-to-image + Ollama gemma4:12b image-to-text judging",
+    "gpu": "rtx4060-8gb",
+    "notes": "按 §6.2 冻结准则：三轮基线标定；SD 与 Gemma 判题经资源 {\"gpu\":\"any\"} 强制串行（本机 8GB 显存 + 可用 RAM 需 ≥8GB，执行前先释放内存）。quality.required=false：真实三轮标定完成并经人工复核前，gemma_judge 不得设为 required=true。SD 报告与 Gemma 证据由前置步骤产生：quality_gate_sd15.py 生成报告、真实判题 runner（Ollama /api/chat 图生文 + 计数匹配，待建）产出证据；本 plan 的 units 只做契约校验。"
+  },
+  "quality": {
+    "required": false,
+    "gemma_judge": {
+      "model": "gemma4:12b",
+      "judge_contract_id": "gemma-judge-counts-v1",
+      "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+      "topic_hit_rate_baseline": 0.7,
+      "key_element_coverage_baseline": 0.5
+    },
+    "sd": {
+      "asset_ids": [
+        "sd15_original_v1"
+      ],
+      "gate": "quality_gate_sd15 automatic_gate.passed"
+    },
+    "manual_review": {
+      "reviewers_required": 2,
+      "upgrade_on": "2 pass, 0 fail"
+    }
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 1800,
+    "max_retries": 0,
+    "resources": {
+      "gpu": "any"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-0001",
+      "name": "第 1 轮 SD 十种子文生图质量门（真实资产）",
+      "command": [
+        "{python}",
+        "scripts/experiment_sd15_quality_unit.py",
+        "--report",
+        "{out_dir}/round-1/sd15-report.json",
+        "--expected-report-sha256",
+        "<REPORT_SHA_ROUND_1>",
+        "--expected-asset-id",
+        "sd15_original_v1",
+        "--expected-artifact-id",
+        "sd15_original_v1",
+        "--expected-mode",
+        "text_to_image",
+        "--result-file",
+        "{out_dir}/{experiment_id}.result.json"
+      ],
+      "params": {
+        "round": 1,
+        "seeds": 10,
+        "steps": 20,
+        "concurrency": 1
+      },
+      "model": {
+        "id": "sd15_original_v1",
+        "artifact_sha256": null
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": [
+        "sd"
+      ]
+    },
+    {
+      "experiment_id": "exp-0002",
+      "name": "第 1 轮 Gemma 判题计数（真实 Ollama）",
+      "command": [
+        "{python}",
+        "scripts/experiment_gemma_quality_unit.py",
+        "--evidence",
+        "{out_dir}/round-1/gemma-evidence.json",
+        "--expected-evidence-sha256",
+        "<EVIDENCE_SHA_ROUND_1>",
+        "--judge-contract",
+        "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
+        "--expected-judge-contract-sha256",
+        "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+        "--expected-model",
+        "gemma4:12b",
+        "--expected-contract-id",
+        "gemma-judge-counts-v1",
+        "--result-file",
+        "{out_dir}/{experiment_id}.result.json"
+      ],
+      "params": {
+        "round": 1,
+        "judge": "ollama gemma4:12b image-to-text + rubric matching",
+        "concurrency": 1
+      },
+      "model": {
+        "id": "gemma4:12b",
+        "artifact_sha256": null
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": [
+        "gemma_judge"
+      ]
+    },
+    {
+      "experiment_id": "exp-0003",
+      "name": "第 2 轮 SD 十种子文生图质量门（真实资产）",
+      "command": [
+        "{python}",
+        "scripts/experiment_sd15_quality_unit.py",
+        "--report",
+        "{out_dir}/round-2/sd15-report.json",
+        "--expected-report-sha256",
+        "<REPORT_SHA_ROUND_2>",
+        "--expected-asset-id",
+        "sd15_original_v1",
+        "--expected-artifact-id",
+        "sd15_original_v1",
+        "--expected-mode",
+        "text_to_image",
+        "--result-file",
+        "{out_dir}/{experiment_id}.result.json"
+      ],
+      "params": {
+        "round": 2,
+        "seeds": 10,
+        "steps": 20,
+        "concurrency": 1
+      },
+      "model": {
+        "id": "sd15_original_v1",
+        "artifact_sha256": null
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": [
+        "sd"
+      ]
+    },
+    {
+      "experiment_id": "exp-0004",
+      "name": "第 2 轮 Gemma 判题计数（真实 Ollama）",
+      "command": [
+        "{python}",
+        "scripts/experiment_gemma_quality_unit.py",
+        "--evidence",
+        "{out_dir}/round-2/gemma-evidence.json",
+        "--expected-evidence-sha256",
+        "<EVIDENCE_SHA_ROUND_2>",
+        "--judge-contract",
+        "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
+        "--expected-judge-contract-sha256",
+        "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+        "--expected-model",
+        "gemma4:12b",
+        "--expected-contract-id",
+        "gemma-judge-counts-v1",
+        "--result-file",
+        "{out_dir}/{experiment_id}.result.json"
+      ],
+      "params": {
+        "round": 2,
+        "judge": "ollama gemma4:12b image-to-text + rubric matching",
+        "concurrency": 1
+      },
+      "model": {
+        "id": "gemma4:12b",
+        "artifact_sha256": null
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": [
+        "gemma_judge"
+      ]
+    },
+    {
+      "experiment_id": "exp-0005",
+      "name": "第 3 轮 SD 十种子文生图质量门（真实资产）",
+      "command": [
+        "{python}",
+        "scripts/experiment_sd15_quality_unit.py",
+        "--report",
+        "{out_dir}/round-3/sd15-report.json",
+        "--expected-report-sha256",
+        "<REPORT_SHA_ROUND_3>",
+        "--expected-asset-id",
+        "sd15_original_v1",
+        "--expected-artifact-id",
+        "sd15_original_v1",
+        "--expected-mode",
+        "text_to_image",
+        "--result-file",
+        "{out_dir}/{experiment_id}.result.json"
+      ],
+      "params": {
+        "round": 3,
+        "seeds": 10,
+        "steps": 20,
+        "concurrency": 1
+      },
+      "model": {
+        "id": "sd15_original_v1",
+        "artifact_sha256": null
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": [
+        "sd"
+      ]
+    },
+    {
+      "experiment_id": "exp-0006",
+      "name": "第 3 轮 Gemma 判题计数（真实 Ollama）",
+      "command": [
+        "{python}",
+        "scripts/experiment_gemma_quality_unit.py",
+        "--evidence",
+        "{out_dir}/round-3/gemma-evidence.json",
+        "--expected-evidence-sha256",
+        "<EVIDENCE_SHA_ROUND_3>",
+        "--judge-contract",
+        "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
+        "--expected-judge-contract-sha256",
+        "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+        "--expected-model",
+        "gemma4:12b",
+        "--expected-contract-id",
+        "gemma-judge-counts-v1",
+        "--result-file",
+        "{out_dir}/{experiment_id}.result.json"
+      ],
+      "params": {
+        "round": 3,
+        "judge": "ollama gemma4:12b image-to-text + rubric matching",
+        "concurrency": 1
+      },
+      "model": {
+        "id": "gemma4:12b",
+        "artifact_sha256": null
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": [
+        "gemma_judge"
+      ]
+    }
+  ]
+}
