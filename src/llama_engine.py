@@ -33,6 +33,7 @@ import logging
 import os
 import sys
 import time
+from ctypes import byref
 from typing import Optional, Dict, Any, Iterator, List
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,10 @@ class LlamaCppEngine:
     def __init__(self):
         self._model = None           # llama_cpp.Llama 实例
         self._model_path: str = ""
+        self._mmproj_path: str = ""
+        self._mtmd_context = None
+        self._mtmd_module = None
+        self._mtmd_capabilities: Dict[str, bool] = {"vision": False, "audio": False}
         self._quant_type: str = ""
         self._n_ctx: int = 4096      # 上下文窗口大小
         self._n_threads: int = 4     # CPU 线程数
@@ -105,6 +110,8 @@ class LlamaCppEngine:
         n_ctx: int = None,
         n_threads: int = None,
         chat_format: str = None,
+        mmproj_path: str = None,
+        mtmd_use_gpu: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -164,6 +171,8 @@ class LlamaCppEngine:
 
             self._model = Llama(**load_kwargs)
             self._loaded = True
+            if mmproj_path:
+                self.load_mmproj(mmproj_path, use_gpu=mtmd_use_gpu)
 
             load_time = time.time() - t0
             logger.info(f"GGUF 模型加载完成 ({load_time:.1f}s)")
@@ -179,20 +188,370 @@ class LlamaCppEngine:
             )
         except Exception as e:
             logger.error(f"GGUF 模型加载失败: {e}")
+            self._free_mtmd_context()
+            model = self._model
+            self._model = None
+            close = getattr(model, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("GGUF model release after load failure failed", exc_info=True)
             self._loaded = False
             raise
 
     def unload(self) -> None:
         """卸载模型，释放内存。"""
-        if self._model is not None:
-            del self._model
+        self._free_mtmd_context()
+        model = self._model
         self._model = None
+        close = getattr(model, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("GGUF model release failed", exc_info=True)
         self._loaded = False
         logger.info("GGUF 模型已卸载")
 
     @property
     def is_loaded(self) -> bool:
         return self._loaded and self._model is not None
+
+    # ================================================================
+    # Native MTMD multimodal pipeline (G4.3.2B)
+    # ================================================================
+
+    def _load_mtmd_module(self):
+        if self._mtmd_module is not None:
+            return self._mtmd_module
+        try:
+            import llama_cpp.mtmd_cpp as mtmd
+        except ImportError as exc:
+            raise RuntimeError("llama.cpp MTMD binding is unavailable") from exc
+        required = (
+            "mtmd_context_params_default", "mtmd_init_from_file", "mtmd_free",
+            "mtmd_support_vision", "mtmd_support_audio", "mtmd_default_marker",
+            "mtmd_helper_bitmap_init_from_file", "mtmd_bitmap_free",
+            "mtmd_input_chunks_init", "mtmd_input_chunks_free",
+            "mtmd_input_chunks_size", "mtmd_input_chunks_get",
+            "mtmd_input_chunk_get_type", "mtmd_input_text", "mtmd_bitmap_p_ctypes",
+            "mtmd_tokenize",
+            "mtmd_helper_eval_chunk_single", "mtmd_batch_init", "mtmd_batch_free",
+            "mtmd_batch_add_chunk", "mtmd_batch_encode",
+            "mtmd_batch_get_output_embd", "mtmd_helper_post_decode_callback",
+            "mtmd_helper_decode_image_chunk",
+        )
+        missing = [name for name in required if not callable(getattr(mtmd, name, None))]
+        if missing:
+            raise RuntimeError("llama.cpp MTMD ABI missing symbols: " + ", ".join(missing))
+        self._mtmd_module = mtmd
+        return mtmd
+
+    def _free_mtmd_context(self) -> None:
+        context = self._mtmd_context
+        self._mtmd_context = None
+        self._mmproj_path = ""
+        self._mtmd_capabilities = {"vision": False, "audio": False}
+        if context is not None and self._mtmd_module is not None:
+            try:
+                self._mtmd_module.mtmd_free(context)
+            except Exception:
+                logger.debug("MTMD context release failed", exc_info=True)
+
+    def load_mmproj(
+        self,
+        mmproj_path: str,
+        *,
+        use_gpu: bool = False,
+        n_threads: int = None,
+    ) -> Dict[str, Any]:
+        """Load an explicit local projector and register native capabilities."""
+        if not self.is_loaded:
+            raise RuntimeError("load_model() must be called before load_mmproj()")
+        if not mmproj_path or not os.path.isfile(mmproj_path):
+            raise FileNotFoundError("MTMD projector file does not exist")
+        mtmd = self._load_mtmd_module()
+        self._free_mtmd_context()
+        params = mtmd.mtmd_context_params_default()
+        if hasattr(params, "use_gpu"):
+            params.use_gpu = bool(use_gpu)
+        if n_threads is not None and hasattr(params, "n_threads"):
+            params.n_threads = int(n_threads)
+        context = mtmd.mtmd_init_from_file(
+            os.fspath(mmproj_path).encode("utf-8"), self._model.model, params,
+        )
+        if not context:
+            raise RuntimeError("MTMD projector initialization failed")
+        try:
+            capabilities = {
+                "vision": bool(mtmd.mtmd_support_vision(context)),
+                "audio": bool(mtmd.mtmd_support_audio(context)),
+            }
+            if not capabilities["vision"]:
+                raise RuntimeError("MTMD projector does not declare vision support")
+        except Exception:
+            try:
+                mtmd.mtmd_free(context)
+            except Exception:
+                pass
+            raise
+        self._mtmd_context = context
+        self._mmproj_path = os.path.abspath(mmproj_path)
+        self._mtmd_capabilities = capabilities
+        logger.info(
+            "MTMD native capabilities registered: vision=%s audio=%s",
+            capabilities["vision"], capabilities["audio"],
+        )
+        return self.get_capabilities()
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        """Return a side-effect-free snapshot of registered capabilities."""
+        return {
+            "engine": "llama.cpp",
+            "text": self.is_loaded,
+            "native_mtmd": self._mtmd_context is not None,
+            "vision": bool(self._mtmd_capabilities.get("vision")),
+            "audio": bool(self._mtmd_capabilities.get("audio")),
+            "mmproj_loaded": bool(self._mmproj_path),
+        }
+
+    @staticmethod
+    def _mtmd_bitmap_pointer(wrapper):
+        return getattr(wrapper, "bitmap", wrapper) if wrapper is not None else None
+
+    def chat_image(
+        self,
+        image_path: str,
+        prompt: str = "Describe this image in one or two sentences. <__media__>",
+        max_tokens: int = 96,
+        temperature: float = 0.0,
+        top_p: float = 0.9,
+        stop: List[str] = None,
+        reasoning_channel_token_id: Optional[int] = 101,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Run the native MTMD image path for a single local image.
+
+        Higher layers remain responsible for authorization, uploads and
+        external-provider routing; this method only consumes a local image.
+        """
+        if not self.is_loaded:
+            raise RuntimeError("model must be loaded before chat_image()")
+        if not self._mtmd_context or not self._mtmd_capabilities.get("vision"):
+            raise RuntimeError("native MTMD vision capability is not registered")
+        if not image_path or not os.path.isfile(image_path):
+            raise FileNotFoundError("image file does not exist")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
+
+        cancel_event = kwargs.pop("_cancel_event", None)
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "content": "",
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "model": os.path.basename(self._model_path),
+                "finish_reason": "cancelled",
+                "tokens_per_second": 0,
+                "native_mtmd": True,
+            }
+
+        import llama_cpp
+        mtmd = self._mtmd_module or self._load_mtmd_module()
+        image_extensions = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
+        if os.path.splitext(image_path)[1].lower() not in image_extensions:
+            raise ValueError("chat_image() accepts image files only")
+
+        marker = mtmd.mtmd_default_marker()
+        marker_text = marker.decode("utf-8", "replace") if isinstance(marker, bytes) else str(marker)
+        prompt = prompt.replace("<__media__>", marker_text)
+        if marker_text not in prompt:
+            prompt = marker_text + "\n" + prompt
+        if prompt.count(marker_text) != 1:
+            raise ValueError("chat_image() requires exactly one MTMD media marker")
+
+        wrapper = None
+        bitmap = None
+        chunks = None
+        media_batch = None
+        decode_batch = None
+        sampler = None
+        t0 = time.time()
+        finish_reason = "length"
+        channel_found = reasoning_channel_token_id is None
+        generated_tokens: List[int] = []
+        pre_channel_tokens: List[int] = []
+        sampled_token_count = 0
+
+        try:
+            wrapper = mtmd.mtmd_helper_bitmap_init_from_file(
+                self._mtmd_context, os.fspath(image_path).encode("utf-8"), False,
+            )
+            bitmap = self._mtmd_bitmap_pointer(wrapper)
+            if not bitmap:
+                raise RuntimeError("MTMD bitmap initialization failed")
+            if getattr(wrapper, "video_ctx", None):
+                raise ValueError("video inputs are not supported by chat_image()")
+
+            chunks = mtmd.mtmd_input_chunks_init()
+            text = mtmd.mtmd_input_text(prompt.encode("utf-8"), True, True)
+            bitmaps = (mtmd.mtmd_bitmap_p_ctypes * 1)(bitmap)
+            rc = mtmd.mtmd_tokenize(
+                self._mtmd_context, chunks, byref(text), bitmaps, 1,
+            )
+            if rc != 0:
+                raise RuntimeError(f"MTMD tokenize failed (rc={rc})")
+
+            model_ctx = self._model._ctx
+            clear_kv = getattr(model_ctx, "kv_cache_clear", None)
+            if callable(clear_kv):
+                clear_kv()
+            if hasattr(self._model, "n_tokens"):
+                self._model.n_tokens = 0
+            n_past = llama_cpp.llama_pos(0)
+            n_batch = int(kwargs.pop("n_batch", 64))
+            if n_batch < 1:
+                raise ValueError("n_batch must be positive")
+
+            @mtmd.mtmd_helper_post_decode_callback
+            def _post_decode_callback(_batch, _user_data):
+                return 0
+
+            for index in range(mtmd.mtmd_input_chunks_size(chunks)):
+                if cancel_event is not None and cancel_event.is_set():
+                    finish_reason = "cancelled"
+                    break
+                chunk = mtmd.mtmd_input_chunks_get(chunks, index)
+                chunk_type = mtmd.mtmd_input_chunk_get_type(chunk)
+                new_n_past = llama_cpp.llama_pos(n_past.value)
+                if chunk_type == mtmd.MTMD_INPUT_CHUNK_TYPE_TEXT:
+                    rc = mtmd.mtmd_helper_eval_chunk_single(
+                        self._mtmd_context, model_ctx.ctx, chunk, n_past, 0,
+                        n_batch, False, byref(new_n_past),
+                    )
+                elif chunk_type == mtmd.MTMD_INPUT_CHUNK_TYPE_IMAGE:
+                    if media_batch is None:
+                        media_batch = mtmd.mtmd_batch_init(self._mtmd_context)
+                    if not media_batch:
+                        raise RuntimeError("MTMD batch initialization failed")
+                    rc = mtmd.mtmd_batch_add_chunk(media_batch, chunk)
+                    if rc == 0:
+                        rc = mtmd.mtmd_batch_encode(media_batch)
+                    if rc == 0:
+                        embd = mtmd.mtmd_batch_get_output_embd(media_batch, chunk)
+                        if not embd:
+                            raise RuntimeError("MTMD image embedding is unavailable")
+                        rc = mtmd.mtmd_helper_decode_image_chunk(
+                            self._mtmd_context, model_ctx.ctx, chunk, embd, n_past, 0,
+                            n_batch, byref(new_n_past), _post_decode_callback, None,
+                        )
+                else:
+                    raise ValueError(f"unsupported MTMD input chunk type: {chunk_type}")
+                if rc != 0:
+                    raise RuntimeError(f"MTMD chunk evaluation failed (index={index}, rc={rc})")
+                n_past = new_n_past
+
+            if finish_reason == "cancelled":
+                return {
+                    "content": "",
+                    "usage": {"prompt_tokens": int(n_past.value), "completion_tokens": 0,
+                              "total_tokens": int(n_past.value)},
+                    "model": os.path.basename(self._model_path),
+                    "finish_reason": "cancelled",
+                    "tokens_per_second": 0,
+                    "native_mtmd": True,
+                }
+
+            from llama_cpp._internals import LlamaBatch, LlamaSampler
+
+            decode_batch = LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False)
+            sampler = LlamaSampler()
+            if temperature <= 0:
+                sampler.add_greedy()
+            else:
+                sampler.add_top_k(int(kwargs.pop("top_k", 40)))
+                sampler.add_top_p(max(0.0, min(float(top_p), 1.0)))
+                sampler.add_temp(float(temperature))
+                sampler.add_dist(int(kwargs.pop("seed", 0)))
+
+            n_past_value = int(n_past.value)
+            last_token = llama_cpp.llama_token_bos(model_ctx.ctx)
+            eos_token = llama_cpp.llama_token_eos(model_ctx.ctx)
+            for _ in range(int(max_tokens)):
+                if cancel_event is not None and cancel_event.is_set():
+                    finish_reason = "cancelled"
+                    break
+                decode_batch.set_batch([last_token], n_past_value, False)
+                model_ctx.decode(decode_batch)
+                n_past_value += 1
+                token = sampler.sample(model_ctx, -1)
+                sampler.accept(token)
+                if token == eos_token:
+                    finish_reason = "stop"
+                    break
+                sampled_token_count += 1
+                if reasoning_channel_token_id is not None:
+                    if token == reasoning_channel_token_id:
+                        channel_found = True
+                        last_token = token
+                        continue
+                    if not channel_found:
+                        pre_channel_tokens.append(token)
+                        last_token = token
+                        continue
+                generated_tokens.append(token)
+                last_token = token
+
+            output_tokens = generated_tokens if channel_found else pre_channel_tokens
+            content = self._model.detokenize(output_tokens).decode("utf-8", "replace")
+            for stop_value in _merge_stop_sequences(stop):
+                if stop_value and stop_value in content:
+                    content = content.split(stop_value, 1)[0]
+                    finish_reason = "stop"
+                    break
+            elapsed = time.time() - t0
+            completion_tokens = sampled_token_count
+            return {
+                "content": content,
+                "usage": {
+                    "prompt_tokens": int(n_past.value),
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": int(n_past.value) + completion_tokens,
+                },
+                "model": os.path.basename(self._model_path),
+                "finish_reason": finish_reason,
+                "tokens_per_second": round(completion_tokens / elapsed if elapsed > 0 else 0, 1),
+                "native_mtmd": True,
+                "reasoning_channel_found": channel_found,
+            }
+        finally:
+            if sampler is not None:
+                try:
+                    sampler.close()
+                except Exception:
+                    logger.debug("MTMD sampler release failed", exc_info=True)
+            if decode_batch is not None:
+                try:
+                    decode_batch.close()
+                except Exception:
+                    logger.debug("MTMD decode batch release failed", exc_info=True)
+            if media_batch is not None:
+                try:
+                    mtmd.mtmd_batch_free(media_batch)
+                except Exception:
+                    logger.debug("MTMD media batch release failed", exc_info=True)
+            if chunks is not None:
+                try:
+                    mtmd.mtmd_input_chunks_free(chunks)
+                except Exception:
+                    logger.debug("MTMD input chunks release failed", exc_info=True)
+            if bitmap is not None:
+                try:
+                    mtmd.mtmd_bitmap_free(bitmap)
+                except Exception:
+                    logger.debug("MTMD bitmap release failed", exc_info=True)
 
     # ================================================================
     # 对话补全（对齐 ModelManager 接口）
@@ -409,6 +768,7 @@ class LlamaCppEngine:
             "n_ctx": self._n_ctx,
             "n_threads": self._n_threads,
             "loaded": self._loaded,
+            "capabilities": self.get_capabilities(),
         }
         if self._loaded:
             info["memory"] = self.get_memory_usage()
