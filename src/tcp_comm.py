@@ -174,6 +174,8 @@ class MessageType(str, Enum):
     INFER_CANCEL = "infer_cancel"    # 从节点 → 主节点：取消转发推理请求
     LAYER_CONFIG = "layer_config"    # 主节点 → 从节点：推送分层配置
     LAYER_CONFIG_ACK = "layer_config_ack"  # 从节点 → 主节点：模型层加载结果
+    QWEN3_PIPELINE_DRY_RUN = "qwen3_pipeline_dry_run"
+    QWEN3_PIPELINE_DRY_RUN_ACK = "qwen3_pipeline_dry_run_ack"
     LAYER_WORKER_OPT_OUT = "layer_worker_opt_out"  # 从节点 → 主节点：退出分层计算
     LAYER_WORKER_OPT_IN = "layer_worker_opt_in"  # 从节点 → 主节点：重新加入分层计算
     TASK_WORKER = "task_worker"      # PC Full Worker v2 控制面/后续 Stage envelope
@@ -1499,6 +1501,27 @@ class TCPServer:
     def send_layer_config(self, client_id: str, assignment: dict) -> None:
         """向指定从节点推送分层配置"""
         self.send_to_client(client_id, assignment, MessageType.LAYER_CONFIG)
+
+    def is_authenticated_loopback_client(self, client_id: str) -> bool:
+        """Return whether HMAC registration completed on a loopback socket."""
+        client = self._get_client(client_id)
+        if client is None or not client.registration_confirmed:
+            return False
+        try:
+            return ipaddress.ip_address(client.addr[0]).is_loopback
+        except ValueError:
+            return False
+
+    def send_qwen3_pipeline_dry_run(
+        self, client_id: str, payload: dict,
+    ) -> None:
+        if not self.is_authenticated_loopback_client(client_id):
+            raise ConnectionError(
+                f"Qwen3 dry-run peer {client_id} is not authenticated loopback"
+            )
+        self.send_to_client(
+            client_id, payload, MessageType.QWEN3_PIPELINE_DRY_RUN,
+        )
 
     def broadcast_layer_config(self, assignments: dict) -> None:
         """

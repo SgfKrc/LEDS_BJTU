@@ -8739,18 +8739,51 @@ async def downloadable_pipeline_assignment(
         transaction_plan = dict(transaction.get("plan", {})) if transaction else {}
         transaction_config_id = str(transaction.get("config_id", "")) if transaction else ""
         transaction_phase = str(transaction.get("phase", "")) if transaction else ""
-    if (
-        not transaction
-        or transaction_phase != "preparing"
-        or transaction_config_id != config_id
-        or str(transaction_plan.get("plan_id", "")) != plan_id
-    ):
+        qwen3_transaction = scheduler._qwen3_pipeline_dry_run
+        qwen3_contract = (
+            dict(qwen3_transaction.contract)
+            if qwen3_transaction is not None
+            and qwen3_transaction.network_dispatch
+            else {}
+        )
+        qwen3_phase = (
+            qwen3_transaction.phase if qwen3_transaction is not None else ""
+        )
+    qwen3_active = bool(
+        qwen3_contract
+        and qwen3_phase == "preparing"
+        and qwen3_contract.get("config_id") == config_id
+        and qwen3_contract.get("plan_id") == plan_id
+        and qwen3_contract.get("model_id") == model_id
+    )
+    production_active = bool(
+        transaction
+        and transaction_phase == "preparing"
+        and transaction_config_id == config_id
+        and str(transaction_plan.get("plan_id", "")) == plan_id
+    )
+    if not production_active and not qwen3_active:
         raise HTTPException(409, "pipeline assignment is no longer an active prepare generation")
+    source_assignments = (
+        qwen3_contract.get("segments", [])
+        if qwen3_active
+        else transaction_plan.get("assignments", [])
+    )
+    def _assignment_range(item: dict) -> tuple[int, int] | None:
+        layer_range = item.get("layer_range")
+        if isinstance(layer_range, (list, tuple)) and len(layer_range) == 2:
+            values = layer_range
+        else:
+            values = (item.get("start_layer"), item.get("end_layer"))
+        try:
+            return int(values[0]), int(values[1])
+        except (TypeError, ValueError):
+            return None
+
     matching = [
-        item for item in transaction_plan.get("assignments", [])
+        item for item in source_assignments
         if str(item.get("node_id", "")) == node_id
-        and int(item.get("start_layer", -1)) == int(start_layer)
-        and int(item.get("end_layer", -1)) == int(end_layer)
+        and _assignment_range(item) == (int(start_layer), int(end_layer))
     ]
     if not matching:
         raise HTTPException(409, "pipeline assignment does not match the active plan")
@@ -8771,6 +8804,10 @@ async def downloadable_pipeline_assignment(
         )
     except Exception as exc:
         raise HTTPException(409, str(exc)) from exc
+    if qwen3_active and manifest.get("manifest_sha256") != expected.get(
+        "assignment_manifest_sha256"
+    ):
+        raise HTTPException(409, "Qwen3 assignment manifest digest changed")
     return manifest
 
 
