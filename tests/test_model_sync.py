@@ -259,3 +259,235 @@ def test_stale_weight_shard_is_removed(tmp_path, monkeypatch):
 
     assert result == str(worker_path)
     assert not stale.exists()
+
+
+def test_assignment_sync_downloads_only_manifest_files(tmp_path, monkeypatch):
+    import model_sync
+
+    model_id = "assignment-model"
+    config_id = "cfg-1"
+    node_id = "worker-1"
+    plan_id = "plan-1"
+    source_files = {
+        "config.json": b'{"model_type":"qwen2","num_hidden_layers":2}',
+        "model.safetensors": b"selected-layer-shard",
+        "tokenizer_config.json": b"{}",
+    }
+    index = {
+        "metadata": {"total_size": 0},
+        "weight_map": {"model.layers.0.weight": "model.safetensors"},
+    }
+    index_bytes = json.dumps(index, sort_keys=True, separators=(",", ":")).encode()
+    source_files["model.safetensors.index.json"] = index_bytes
+    files = [
+        {
+            "path": path,
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "kind": "weights" if path.endswith(".safetensors") else "support",
+        }
+        for path, content in source_files.items()
+    ]
+    manifest = {
+        "schema_version": 1,
+        "manifest_kind": "pytorch_pipeline_assignment",
+        "model_id": model_id,
+        "model_sha256": "a" * 64,
+        "model_type": "qwen2",
+        "total_layers": 2,
+        "config_id": config_id,
+        "plan_id": plan_id,
+        "node_id": node_id,
+        "layer_range": [0, 1],
+        "has_embedding": False,
+        "has_lm_head": False,
+        "files": files,
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in manifest.items() if key != "manifest_sha256"},
+            ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            requests.append(parsed.path)
+            if parsed.path.startswith(f"/api/models/pipeline-assignment/{model_id}"):
+                payload = json.dumps(manifest).encode()
+            else:
+                relative = unquote(parsed.path.split(f"/api/models/files/{model_id}/", 1)[1])
+                payload = source_files[relative]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        model_sync, "resolve_worker_model_path",
+        lambda _model_id: str(tmp_path / "models" / model_id),
+    )
+    try:
+        destination, received = model_sync.ensure_pipeline_assignment_available(
+            "127.0.0.1", server.server_port,
+            {
+                "model_id": model_id, "config_id": config_id, "plan_id": plan_id,
+                "node_id": node_id, "model_sha256": "a" * 64,
+                "start_layer": 0, "end_layer": 1, "total_layers": 2,
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert received["manifest_sha256"] == manifest["manifest_sha256"]
+    root = __import__("pathlib").Path(destination)
+    assert (root / "config.json").read_bytes() == source_files["config.json"]
+    assert (root / "model.safetensors").read_bytes() == source_files["model.safetensors"]
+    assert (root / "assignment.manifest.json").is_file()
+    assert all("/api/models/files/" in path for path in requests if "/api/models/files/" in path)
+
+
+def test_assignment_download_resumes_with_http_range(tmp_path, monkeypatch):
+    import model_sync
+
+    payload = b"0123456789"
+    model_id = "range-assignment"
+    model_path = tmp_path / "model"
+    requested_ranges = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path.endswith("/api/models/files/range-assignment/model.safetensors"):
+                requested_ranges.append(self.headers.get("Range"))
+                value = self.headers.get("Range")
+                if value:
+                    start = int(value.split("=", 1)[1].split("-", 1)[0])
+                    body = payload[start:]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{len(payload)-1}/{len(payload)}")
+                else:
+                    body = payload
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    (model_path / "model.safetensors.part").parent.mkdir(parents=True)
+    (model_path / "model.safetensors.part").write_bytes(payload[:4])
+    monkeypatch.setattr(model_sync, "resolve_worker_model_path", lambda _mid: str(model_path))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        model_sync._download_file(
+            f"http://127.0.0.1:{server.server_port}/api/models/files/{model_id}/model.safetensors",
+            model_path / "model.safetensors", len(payload),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert requested_ranges == ["bytes=4-"]
+    assert (model_path / "model.safetensors").read_bytes() == payload
+
+
+def test_assignment_cache_reconcile_removes_stale_and_preserves_active(tmp_path, monkeypatch):
+    import model_sync
+
+    root = tmp_path / "model" / ".pipeline_assignments"
+    active = root / "cfg-active-worker"
+    stale = root / "cfg-stale-worker"
+    active.mkdir(parents=True)
+    stale.mkdir(parents=True)
+    (active / "assignment.manifest.json").write_bytes(b"active")
+    (stale / "shard.safetensors.part").write_bytes(b"partial")
+    old = 1_000.0
+    os.utime(stale, (old, old))
+    monkeypatch.setattr(model_sync, "resolve_worker_model_path", lambda _mid: str(tmp_path / "model"))
+    monkeypatch.setattr(model_sync, "_assignment_cache_limits", lambda: (1024 * 1024, 0, 60.0))
+
+    result = model_sync.reconcile_pipeline_assignment_cache(
+        "fixture", active_config_ids={"cfg-active"}, now=2_000.0,
+    )
+
+    assert "cfg-stale-worker" in result["removed"]
+    assert (active / "assignment.manifest.json").is_file()
+    assert not stale.exists()
+
+
+def test_assignment_cache_reconcile_applies_lru_budget(tmp_path, monkeypatch):
+    import model_sync
+
+    root = tmp_path / "model" / ".pipeline_assignments"
+    first = root / "cfg-first-worker"
+    second = root / "cfg-second-worker"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "data").write_bytes(b"123456")
+    (second / "data").write_bytes(b"abcdef")
+    os.utime(first, (100.0, 100.0))
+    os.utime(second, (200.0, 200.0))
+    monkeypatch.setattr(model_sync, "resolve_worker_model_path", lambda _mid: str(tmp_path / "model"))
+    monkeypatch.setattr(model_sync, "_assignment_cache_limits", lambda: (8, 0, 1000.0))
+
+    result = model_sync.reconcile_pipeline_assignment_cache("fixture", now=300.0)
+
+    assert "cfg-first-worker" in result["removed"]
+    assert second.exists()
+    assert result["bytes_after"] <= 8
+
+
+def test_assignment_cache_reconcile_protects_inflight_directory_without_marker(
+        tmp_path, monkeypatch):
+    import model_sync
+
+    root = tmp_path / "model" / ".pipeline_assignments"
+    inflight = root / "cfg-inflight-worker"
+    inflight.mkdir(parents=True)
+    (inflight / "shard.safetensors.part").write_bytes(b"partial")
+    os.utime(inflight, (1_000.0, 1_000.0))
+    monkeypatch.setattr(model_sync, "resolve_worker_model_path", lambda _mid: str(tmp_path / "model"))
+    monkeypatch.setattr(model_sync, "_assignment_cache_limits", lambda: (1024 * 1024, 0, 60.0))
+
+    result = model_sync.reconcile_pipeline_assignment_cache(
+        "fixture", active_assignment_dirs={inflight.name}, now=2_000.0,
+    )
+
+    assert inflight.name in result["protected"]
+    assert inflight.exists()
+
+
+def test_assignment_sync_rejects_insufficient_disk_budget(tmp_path, monkeypatch):
+    import model_sync
+
+    monkeypatch.setattr(model_sync, "resolve_worker_model_path", lambda _mid: str(tmp_path / "model"))
+    monkeypatch.setattr(model_sync, "_assignment_cache_limits", lambda: (1024, 4096, 60.0))
+    monkeypatch.setattr(
+        model_sync.shutil, "disk_usage",
+        lambda _path: type("Usage", (), {"free": 100})(),
+    )
+    destination = tmp_path / "model" / ".pipeline_assignments" / "cfg-node"
+    destination.mkdir(parents=True)
+    try:
+        model_sync._ensure_assignment_disk_budget(destination, 256)
+    except RuntimeError as exc:
+        assert "insufficient" in str(exc)
+    else:
+        raise AssertionError("insufficient disk budget was accepted")

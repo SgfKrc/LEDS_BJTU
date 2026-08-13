@@ -325,6 +325,25 @@ LAYER_VRAM_FACTOR = {                    # 量化精度修正系数
     "int4": 0.35,
 }
 
+# Metadata-first pipeline capacity admission.  The fixed reserve is charged to
+# every execution node for allocator workspace, activations and KV cache.  It is
+# intentionally independent from the legacy average-layer VRAM estimator.
+PIPELINE_CAPACITY_SAFETY_MARGIN = _env_float(
+    "QLH_PIPELINE_CAPACITY_SAFETY_MARGIN", 1.2, min_val=1.0, max_val=3.0,
+)
+PIPELINE_CAPACITY_RESERVE_MB = _env_float(
+    "QLH_PIPELINE_CAPACITY_RESERVE_MB", 512.0, min_val=0.0, max_val=32768.0,
+)
+PIPELINE_ASSIGNMENT_CACHE_MAX_MB = _env_float(
+    "QLH_PIPELINE_ASSIGNMENT_CACHE_MAX_MB", 4096.0, min_val=128.0, max_val=1048576.0,
+)
+PIPELINE_ASSIGNMENT_MIN_FREE_MB = _env_float(
+    "QLH_PIPELINE_ASSIGNMENT_MIN_FREE_MB", 512.0, min_val=0.0, max_val=1048576.0,
+)
+PIPELINE_ASSIGNMENT_STALE_SECONDS = _env_float(
+    "QLH_PIPELINE_ASSIGNMENT_STALE_SECONDS", 86400.0, min_val=60.0, max_val=31536000.0,
+)
+
 # 图算法智能编排阈值：节点数超过此值（>5）时自动启用最大带宽生成树 + DFS，
 # 替代纯算力权重分配；节点数 ≤ 阈值时回退到简单排序（权重比例分配）
 GRAPH_ORCHESTRATOR_THRESHOLD = 5         # 节点数 > 5 启用图算法，≤ 5 使用简单排序

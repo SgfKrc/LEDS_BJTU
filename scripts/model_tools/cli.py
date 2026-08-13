@@ -12,6 +12,8 @@ from .gguf_convert import execute_conversion, plan_conversion
 from .gemma4_native_probe import run_native_probe
 from .gemma4_native_artifacts import resolve_ollama_gemma4_12b, run_ollama_gemma4_12b_preflight
 from .qwen3_sidecar_probe import run_qwen3_sidecar_probe
+from .qwen3_pipeline_smoke import run_qwen3_pipeline_smoke
+from .qwen3_pipeline_chain_smoke import run_qwen3_pipeline_chain_smoke
 from .llm_smoke_matrix import run_smoke_matrix
 from .lora import inspect_lora
 from .maintenance import clean_models, model_disk_usage
@@ -159,6 +161,36 @@ def _parser() -> argparse.ArgumentParser:
     qwen3_probe.add_argument("--model", type=Path, required=True, help="managed local Qwen3 Safetensors directory")
     qwen3_probe.add_argument("--timeout-seconds", type=float, default=60.0)
     qwen3_probe.add_argument("--json", action="store_true", dest="as_json")
+    qwen3_smoke = commands.add_parser(
+        "qwen3-pipeline-smoke",
+        aliases=["qwen3_pipeline_smoke"],
+        help="gate and optionally smoke one isolated Qwen3 pipeline assignment",
+    )
+    qwen3_smoke.add_argument("--model", type=Path, required=True, help="local Qwen3 assignment/model directory")
+    qwen3_smoke.add_argument("--start-layer", type=int, required=True)
+    qwen3_smoke.add_argument("--end-layer", type=int, required=True)
+    qwen3_smoke.add_argument("--has-embedding", action="store_true")
+    qwen3_smoke.add_argument("--has-lm-head", action="store_true")
+    qwen3_smoke.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    qwen3_smoke.add_argument("--dtype", default=None, choices=["fp16", "bf16", "fp32"])
+    qwen3_smoke.add_argument("--safety-margin", type=float, default=1.2)
+    qwen3_smoke.add_argument("--reserve-bytes", type=int, default=512 * 1024**2)
+    qwen3_smoke.add_argument("--execute", action="store_true", help="run the isolated synthetic assignment forward after gates pass")
+    qwen3_smoke.add_argument("--timeout-seconds", type=float, default=180.0)
+    qwen3_smoke.add_argument("--json", action="store_true", dest="as_json")
+    qwen3_chain = commands.add_parser(
+        "qwen3-pipeline-chain-smoke",
+        aliases=["qwen3_pipeline_chain_smoke"],
+        help="gate and optionally smoke a two/three-segment isolated Qwen3 chain",
+    )
+    qwen3_chain.add_argument("--model", type=Path, required=True)
+    qwen3_chain.add_argument("--segments", required=True, help="JSON array of segment contracts")
+    qwen3_chain.add_argument("--chain-id", default="qwen3-local-smoke")
+    qwen3_chain.add_argument("--safety-margin", type=float, default=1.2)
+    qwen3_chain.add_argument("--reserve-bytes", type=int, default=512 * 1024**2)
+    qwen3_chain.add_argument("--execute", action="store_true")
+    qwen3_chain.add_argument("--timeout-seconds", type=float, default=600.0)
+    qwen3_chain.add_argument("--json", action="store_true", dest="as_json")
     convert = commands.add_parser("gguf-convert", aliases=["gguf_convert"], help="preflight or explicitly execute an HF to GGUF conversion")
     source_group = convert.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--model-id", default=None, help="registered Safetensors model ID")
@@ -340,6 +372,33 @@ def _human(command: str, report: dict[str, Any]) -> None:
         for error in report.get("errors", []):
             print(f"  - {error.get('code')}: {error.get('message')}")
         return
+    if command in {"qwen3-pipeline-smoke", "qwen3_pipeline_smoke"}:
+        resources = report.get("resources", {})
+        assignment = report.get("assignment", {})
+        state = "READY" if report.get("gate_passed") else report.get("status", "UNKNOWN").upper()
+        print(f"{state}: {report.get('tool')}")
+        print(
+            f"layers={assignment.get('layer_range')} tensors={assignment.get('selected_tensor_count', 0)} "
+            f"tensor_bytes={assignment.get('selected_tensor_bytes', 0)} device={resources.get('device')}"
+        )
+        print(
+            f"required={resources.get('required_device_bytes')} available={resources.get('available_vram_bytes') if str(resources.get('device', '')).startswith('cuda') else resources.get('available_ram_bytes')} "
+            f"executed={report.get('execution', {}).get('attempted', False)}"
+        )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
+        return
+    if command in {"qwen3-pipeline-chain-smoke", "qwen3_pipeline_chain_smoke"}:
+        execution = report.get("execution", {})
+        state = "READY" if report.get("gate_passed") else report.get("status", "UNKNOWN").upper()
+        print(f"{state}: {report.get('tool')}")
+        print(
+            f"chain_id={report.get('chain_id')} segments={len(report.get('segments', []))} "
+            f"prefill={execution.get('prefill_complete', False)} decode={execution.get('decode_complete', False)}"
+        )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
+        return
     if command in {"gguf-convert", "gguf_convert"}:
         state = "PUBLISHED" if report.get("execution", {}).get("published") else ("READY" if report.get("valid") else "BLOCKED")
         print(f"{state}: {report.get('tool')}")
@@ -507,6 +566,33 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 timeout_seconds=args.timeout_seconds,
             )
+        elif args.command in {"qwen3-pipeline-smoke", "qwen3_pipeline_smoke"}:
+            report = run_qwen3_pipeline_smoke(
+                model=args.model,
+                layer_range=(args.start_layer, args.end_layer),
+                has_embedding=args.has_embedding,
+                has_lm_head=args.has_lm_head,
+                execute=args.execute,
+                device=args.device,
+                dtype=args.dtype,
+                safety_margin=args.safety_margin,
+                reserve_bytes=args.reserve_bytes,
+                timeout_seconds=args.timeout_seconds,
+            )
+        elif args.command in {"qwen3-pipeline-chain-smoke", "qwen3_pipeline_chain_smoke"}:
+            try:
+                segments = json.loads(args.segments)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--segments must be a JSON array") from exc
+            report = run_qwen3_pipeline_chain_smoke(
+                model=args.model,
+                segments=segments,
+                chain_id=args.chain_id,
+                execute=args.execute,
+                safety_margin=args.safety_margin,
+                reserve_bytes=args.reserve_bytes,
+                timeout_seconds=args.timeout_seconds,
+            )
         elif args.command in {"gguf-convert", "gguf_convert"}:
             _ensure_output_outside_roots(args.output, [ROOT / "models"])
             if args.output is not None and args.target is not None:
@@ -531,12 +617,32 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = sweep_models(args.root, full_hash=args.full_hash)
     except (OSError, GGUFError, ValueError) as exc:
-        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "qwen3-sidecar-probe", "qwen3_sidecar_probe", "gguf-convert", "gguf_convert"}:
+        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "qwen3-sidecar-probe", "qwen3_sidecar_probe", "qwen3-pipeline-smoke", "qwen3_pipeline_smoke", "qwen3-pipeline-chain-smoke", "qwen3_pipeline_chain_smoke", "gguf-convert", "gguf_convert"}:
             message = str(exc) if isinstance(exc, ValueError) else f"operation failed (errno={getattr(exc, 'errno', None)})"
-            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("qwen3_sidecar_probe" if args.command in {"qwen3-sidecar-probe", "qwen3_sidecar_probe"} else ("gemma4_ollama_native_preflight" if args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"} else ("gemma4_native_assets" if args.command in {"gemma4-native-assets", "gemma4_native_assets"} else ("gemma4_native_probe" if args.command in {"gemma4-native-probe", "gemma4_native_probe"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status")))))
+            tool_by_command = {
+                "gguf-convert": "gguf_convert", "gguf_convert": "gguf_convert",
+                "qwen3-pipeline-smoke": "qwen3_pipeline_smoke", "qwen3_pipeline_smoke": "qwen3_pipeline_smoke",
+                "qwen3-pipeline-chain-smoke": "qwen3_pipeline_chain_smoke", "qwen3_pipeline_chain_smoke": "qwen3_pipeline_chain_smoke",
+                "qwen3-sidecar-probe": "qwen3_sidecar_probe", "qwen3_sidecar_probe": "qwen3_sidecar_probe",
+                "gemma4-native-ollama-probe": "gemma4_ollama_native_preflight", "gemma4_native_ollama_probe": "gemma4_ollama_native_preflight",
+                "gemma4-native-assets": "gemma4_native_assets", "gemma4_native_assets": "gemma4_native_assets",
+                "gemma4-native-probe": "gemma4_native_probe", "gemma4_native_probe": "gemma4_native_probe",
+                "llm-smoke-matrix": "llm_smoke_matrix", "llm_smoke_matrix": "llm_smoke_matrix",
+            }
+            tool = tool_by_command.get(args.command, "models_sync_status")
+            operation_by_tool = {
+                "qwen3_pipeline_smoke": "qwen3_pipeline_smoke",
+                "qwen3_pipeline_chain_smoke": "qwen3_pipeline_chain_smoke",
+                "qwen3_sidecar_probe": "qwen3_sidecar_preflight",
+                "llm_smoke_matrix": "matrix",
+                "gemma4_native_probe": "native_multimodal_preflight",
+                "gemma4_native_assets": "resolve_ollama_gemma4_12b",
+                "gemma4_ollama_native_preflight": "verify_then_native_preflight",
+                "models_sync_status": "compare",
+            }
             report = {
                 "tool": tool,
-                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("qwen3_sidecar_preflight" if tool == "qwen3_sidecar_probe" else ("matrix" if tool == "llm_smoke_matrix" else ("native_multimodal_preflight" if tool == "gemma4_native_probe" else ("resolve_ollama_gemma4_12b" if tool == "gemma4_native_assets" else ("verify_then_native_preflight" if tool == "gemma4_ollama_native_preflight" else "compare"))))),
+                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else operation_by_tool.get(tool, "compare"),
                 "request_valid": False if tool == "gguf_convert" else None,
                 "valid": False,
                 "in_sync": False,
@@ -574,6 +680,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0 if report.get("gate_passed", False) else 1
     if args.command in {"qwen3-sidecar-probe", "qwen3_sidecar_probe"}:
+        if not report.get("valid", False):
+            return 2
+        return 0 if report.get("gate_passed", False) else 1
+    if args.command in {"qwen3-pipeline-smoke", "qwen3_pipeline_smoke"}:
+        if not report.get("valid", False):
+            return 2
+        return 0 if report.get("gate_passed", False) else 1
+    if args.command in {"qwen3-pipeline-chain-smoke", "qwen3_pipeline_chain_smoke"}:
         if not report.get("valid", False):
             return 2
         return 0 if report.get("gate_passed", False) else 1

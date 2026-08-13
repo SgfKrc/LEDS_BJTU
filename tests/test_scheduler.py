@@ -204,6 +204,346 @@ class TestComputeLayerAssignment:
         assert result[0]["end_layer"] == 28
         assert result[0]["layers_count"] == 28
 
+    def test_pipeline_model_info_accepts_metadata_only_preparation(self, sched):
+        descriptor = {
+            "model_id": "tiny-qwen2",
+            "model_type": "qwen2",
+            "total_layers": 4,
+            "model_sha256": "b" * 64,
+            "pipeline_runtime_supported": True,
+            "inspection_mode": "safetensors_headers_only",
+            "weight_bytes": 1024,
+        }
+        host = type("PreparedHost", (), {
+            "is_loaded": False,
+            "is_pipeline_prepared": True,
+            "_engine_type": "pytorch",
+            "_model_path": os.getcwd(),
+            "_full_model_path": os.getcwd(),
+            "active_model_id": "tiny-qwen2",
+            "quant_type": "fp16",
+            "get_pipeline_descriptor": lambda self: dict(descriptor),
+        })()
+        sched._host = host
+
+        info = sched._get_active_pipeline_model_info()
+
+        assert info["model_id"] == "tiny-qwen2"
+        assert info["total_layers"] == 4
+        assert info["model_sha256"] == "b" * 64
+        assert info["inspection_mode"] == "safetensors_headers_only"
+
+    def test_pipeline_model_info_rejects_discovered_unsupported_architecture(self, sched):
+        host = type("PreparedHost", (), {
+            "is_loaded": False,
+            "_engine_type": "pytorch",
+            "_model_path": os.getcwd(),
+            "_full_model_path": os.getcwd(),
+            "get_pipeline_descriptor": lambda self: {
+                "model_id": "qwen3-4b",
+                "model_type": "qwen3",
+                "total_layers": 36,
+                "pipeline_runtime_supported": False,
+            },
+        })()
+        sched._host = host
+
+        assert sched._get_active_pipeline_model_info() == {}
+
+    def test_capacity_plan_uses_free_memory_and_allows_control_only_master(
+            self, sched, monkeypatch):
+        mib = 1024 * 1024
+        descriptor = {
+            "model_id": "synthetic-qwen2",
+            "model_type": "qwen2",
+            "model_sha256": "a" * 64,
+            "pipeline_runtime_supported": True,
+            "total_layers": 4,
+            "layer_weight_bytes": [100 * mib] * 4,
+            "component_weight_bytes": {
+                "embedding": 40 * mib,
+                "final_norm": 5 * mib,
+                "lm_head": 40 * mib,
+                "visual": 0,
+                "mtp": 0,
+                "other": 0,
+            },
+        }
+        sched._host = type("PreparedHost", (), {
+            "get_pipeline_descriptor": lambda self: dict(descriptor),
+        })()
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                device_info={
+                    "gpu": {"name": "RTX", "cuda_available": True,
+                            "is_integrated": False, "vram_total_gb": 8,
+                            "vram_free_gb": 0.6},
+                    "ram": {"available_gb": 8},
+                },
+            ),
+            "worker-a": NodeInfo(
+                node_id="worker-a", role="client", state=NodeState.ONLINE,
+                device_info={
+                    "gpu": {"name": "RTX", "cuda_available": True,
+                            "is_integrated": False, "vram_total_gb": 8,
+                            "vram_free_gb": 1.0},
+                },
+            ),
+            "worker-b": NodeInfo(
+                node_id="worker-b", role="client", state=NodeState.ONLINE,
+                device_info={
+                    "gpu": {"name": "RTX", "cuda_available": True,
+                            "is_integrated": False, "vram_total_gb": 8,
+                            "vram_free_gb": 1.0},
+                },
+            ),
+        }
+        monkeypatch.setattr("config.PIPELINE_CAPACITY_RESERVE_MB", 512.0)
+        monkeypatch.setattr("config.PIPELINE_CAPACITY_SAFETY_MARGIN", 1.0)
+
+        plan = sched.get_pipeline_capacity_plan()
+
+        assert plan["admitted"] is True
+        assert sum(item["layers_count"] for item in plan["assignments"]) == 4
+        assert "master" in plan["control_only_nodes"]
+        assert plan["transaction_phase"] == "planned"
+
+    def test_capacity_plan_rejects_profile_without_free_memory_evidence(
+            self, sched):
+        mib = 1024 * 1024
+        sched._host = type("PreparedHost", (), {
+            "get_pipeline_descriptor": lambda self: {
+                "model_id": "synthetic-qwen2",
+                "model_type": "qwen2",
+                "pipeline_runtime_supported": True,
+                "total_layers": 1,
+                "layer_weight_bytes": [mib],
+                "component_weight_bytes": {
+                    "embedding": 0, "final_norm": 0, "lm_head": 0,
+                    "visual": 0, "mtp": 0, "other": 0,
+                },
+            },
+        })()
+        sched.nodes = {
+            "master": NodeInfo(
+                node_id="master", role="master", state=NodeState.ONLINE,
+                device_info=PROFILE_WORKSTATION,
+            ),
+        }
+
+        plan = sched.get_pipeline_capacity_plan()
+
+        assert plan["admitted"] is False
+        assert plan["reason_code"] == "pipeline_capacity_nodes_unavailable"
+
+    def test_capacity_prepare_acks_all_workers_before_commit(self, sched):
+        sent = []
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, dict(payload))
+            ),
+        })()
+        sched._host = type("Host", (), {
+            "prepare_pipeline_tokenizer": lambda self: object(),
+        })()
+        plan = {
+            "admitted": True,
+            "plan_id": "plan-1",
+            "model_id": "qwen-test",
+            "total_layers": 4,
+            "assignments": [
+                {"node_id": "worker-a", "start_layer": 0, "end_layer": 2},
+                {"node_id": "worker-b", "start_layer": 2, "end_layer": 4},
+            ],
+        }
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-1",
+            "generation": 1,
+            "phase": "preparing",
+            "plan": plan,
+            "worker_ids": {"worker-a", "worker-b"},
+            "prepared_nodes": set(),
+        }
+        for node_id, start, end in (
+            ("worker-a", 0, 2), ("worker-b", 2, 4),
+        ):
+            sched._layer_config_expected[node_id] = {
+                "node_id": node_id,
+                "config_id": "cfg-1",
+                "phase": "prepare",
+                "plan_id": "plan-1",
+                "start_layer": start,
+                "end_layer": end,
+                "required_bytes": 100,
+                "model_sha256": "sha",
+                "model_type": "qwen2",
+            }
+
+        def ack(node_id, start, end):
+            sched._handle_layer_config_ack(node_id, {"data": {
+                "node_id": node_id,
+                "config_id": "cfg-1",
+                "status": "prepared",
+                "phase": "prepare",
+                "plan_id": "plan-1",
+                "layer_range": [start, end],
+                "model_sha256": "sha",
+                "model_type": "qwen2",
+                "engine": "pytorch",
+                "available_bytes": 100,
+            }})
+
+        ack("worker-a", 0, 2)
+        assert sent == []
+        assert sched._pipeline_load_transaction["phase"] == "preparing"
+
+        ack("worker-b", 2, 4)
+        assert sched._pipeline_load_transaction["phase"] == "committing"
+        assert {(node_id, payload["phase"]) for node_id, payload in sent} == {
+            ("worker-a", "commit"), ("worker-b", "commit"),
+        }
+        assert sched._layer_config_pushed == set()
+
+    def test_capacity_prepare_error_aborts_every_worker(self, sched):
+        sent = []
+        aborted = []
+        sched._tcp_server = type("Server", (), {
+            "_running": True,
+            "send_layer_config": lambda self, node_id, payload: sent.append(
+                (node_id, dict(payload))
+            ),
+        })()
+        sched._host = type("Host", (), {
+            "model_loaded": True,
+            "abort_pipeline_materialization": lambda self: aborted.append(True),
+        })()
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-2",
+            "generation": 2,
+            "phase": "preparing",
+            "plan": {"admitted": True, "plan_id": "plan-2"},
+            "worker_ids": {"worker-a", "worker-b"},
+            "prepared_nodes": set(),
+        }
+        sched._layer_config_expected["worker-a"] = {
+            "node_id": "worker-a",
+            "config_id": "cfg-2",
+            "phase": "prepare",
+            "plan_id": "plan-2",
+            "start_layer": 0,
+            "end_layer": 2,
+            "required_bytes": 100,
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+        }
+
+        sched._handle_layer_config_ack("worker-a", {"data": {
+            "node_id": "worker-a",
+            "config_id": "cfg-2",
+            "status": "error",
+            "error": "capacity changed",
+        }})
+
+        assert sched._pipeline_load_transaction["phase"] == "aborted"
+        assert aborted == [True]
+        assert {node_id for node_id, _ in sent} == {"worker-a", "worker-b"}
+        assert all(payload["abort"] for _, payload in sent)
+
+    def test_capacity_ready_acks_activate_plan(self, sched):
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-3",
+            "generation": 3,
+            "phase": "committing",
+            "plan": {
+                "admitted": True,
+                "plan_id": "plan-3",
+                "total_layers": 2,
+                "assignments": [{
+                    "node_id": "worker", "start_layer": 0, "end_layer": 2,
+                    "layers_count": 2,
+                }],
+            },
+            "worker_ids": {"worker"},
+            "ready_nodes": set(),
+        }
+        sched._layer_config_expected["worker"] = {
+            "node_id": "worker",
+            "config_id": "cfg-3",
+            "phase": "commit",
+            "plan_id": "plan-3",
+            "start_layer": 0,
+            "end_layer": 2,
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+        }
+
+        sched._handle_layer_config_ack("worker", {"data": {
+            "node_id": "worker",
+            "config_id": "cfg-3",
+            "status": "ready",
+            "phase": "commit",
+            "plan_id": "plan-3",
+            "layer_range": [0, 2],
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+            "engine": "pytorch",
+        }})
+
+        assert sched._pipeline_load_transaction["phase"] == "ready"
+        assert sched._active_pipeline_capacity_plan["transaction_phase"] == "ready"
+        assert sched.get_layer_assignments()["strategy"] == "capacity"
+
+    def test_capacity_transaction_aborts_when_worker_disconnects(
+            self, sched, monkeypatch):
+        aborts = []
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-drop",
+            "phase": "preparing",
+            "worker_ids": {"worker-drop"},
+        }
+        monkeypatch.setattr(
+            sched,
+            "_abort_pipeline_load_transaction",
+            lambda *args: aborts.append(args),
+        )
+        monkeypatch.setattr(
+            sched, "_fail_pending_pipeline_results_for_node", lambda *_args: None,
+        )
+        monkeypatch.setattr(sched, "deregister_node", lambda _node_id: False)
+
+        sched._on_tcp_disconnect("worker-drop")
+
+        assert aborts == [(
+            "cfg-drop",
+            "pipeline_worker_disconnected",
+            "worker worker-drop disconnected during transaction",
+        )]
+
+    def test_capacity_commit_is_not_hidden_by_cached_prepare_ack(
+            self, sched, monkeypatch):
+        started = []
+        sched._last_layer_config_ack_payload = {
+            "config_id": "cfg-phase",
+            "phase": "prepare",
+            "status": "prepared",
+        }
+        monkeypatch.setattr(
+            threading.Thread, "start", lambda thread: started.append(thread),
+        )
+
+        sched._schedule_layer_config("master", {
+            "config_id": "cfg-phase",
+            "generation": 1,
+            "phase": "commit",
+            "start_layer": 0,
+            "end_layer": 1,
+        })
+
+        assert len(started) == 1
+        assert "cfg-phase" in sched._layer_config_inflight
+
     def test_multi_node_covers_all_layers(self, sched):
         """多节点分配应完整覆盖 0-24"""
         result = sched.compute_layer_assignment()
@@ -1413,6 +1753,106 @@ class TestPipelineMessageDispatch:
             "master_quant_type": "",
             "runtime_quant_type": "fp16",
         }
+
+    def test_capacity_prepare_validates_without_loading_range(
+            self, sched, monkeypatch, tmp_path):
+        from model_host import model_host as _host
+        from tcp_comm import TCPClient
+        import model_sync
+        import pipeline_model_descriptor
+
+        calls = []
+        manager = type("Manager", (), {
+            "is_loaded": False,
+            "prepare_pipeline_model": lambda self, **kwargs: calls.append(
+                ("prepare", kwargs)
+            ),
+            "load_layer_range": lambda self, *args, **kwargs: calls.append(
+                ("load", args, kwargs)
+            ),
+        })()
+        sent = []
+        sched._tcp_client = type("Client", (), {
+            "server_host": "100.64.0.1",
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        sched._local_device_profile = {
+            "gpu": {
+                "name": "RTX", "cuda_available": True,
+                "is_integrated": False, "vram_total_gb": 8,
+                "vram_free_gb": 4,
+            },
+        }
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(_host, "_manager", manager)
+        monkeypatch.setattr(
+            model_sync, "resolve_worker_model_path", lambda _model_id: str(tmp_path),
+        )
+        monkeypatch.setattr(
+            TCPClient, "_compute_local_model_sha256", lambda **_kwargs: "sha",
+        )
+        monkeypatch.setattr(
+            pipeline_model_descriptor,
+            "inspect_pipeline_model",
+            lambda path, model_id="": {
+                "model_type": "qwen2", "total_layers": 4,
+            },
+        )
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker",
+            "config_id": "cfg-prepare",
+            "phase": "prepare",
+            "plan_id": "plan-prepare",
+            "start_layer": 0,
+            "end_layer": 2,
+            "has_embedding": True,
+            "has_lm_head": False,
+            "model_id": "tiny-qwen2",
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+            "total_layers": 4,
+            "required_bytes": 1024,
+        })
+
+        assert [call[0] for call in calls] == ["prepare"]
+        assert sent[-1]["status"] == "prepared"
+        assert sent[-1]["plan_id"] == "plan-prepare"
+        assert sched._active_layer_config is None
+        assert sched._prepared_layer_configs["cfg-prepare"]["layer_range"] == [0, 2]
+
+    def test_capacity_commit_requires_matching_prepared_record(
+            self, sched, monkeypatch):
+        from model_host import model_host as _host
+
+        loads = []
+        manager = type("Manager", (), {
+            "is_loaded": False,
+            "load_layer_range": lambda self, *args, **kwargs: loads.append(args),
+        })()
+        sent = []
+        sched._tcp_client = type("Client", (), {
+            "send_data": lambda self, payload, msg_type: sent.append(payload),
+        })()
+        monkeypatch.setattr(sched, "get_effective_node_id", lambda: "worker")
+        monkeypatch.setattr(_host, "_manager", manager)
+
+        sched._handle_layer_config("master", {
+            "node_id": "worker",
+            "config_id": "cfg-commit",
+            "phase": "commit",
+            "plan_id": "plan-commit",
+            "start_layer": 0,
+            "end_layer": 2,
+            "model_id": "tiny-qwen2",
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+            "total_layers": 4,
+        })
+
+        assert loads == []
+        assert sent[-1]["status"] == "error"
+        assert "prepared" in sent[-1]["error"]
 
     def test_deepseek_assignment_syncs_selected_model_before_loading(self, sched, monkeypatch):
         """缺少 DeepSeek 时应先同步指定模型，再按真实层数加载。"""

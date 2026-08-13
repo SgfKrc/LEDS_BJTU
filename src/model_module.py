@@ -70,6 +70,117 @@ def _select_layer_runtime() -> Tuple[str, torch.dtype]:
     return "cpu", torch.float32
 
 
+class _LayerRangeLoadTracker:
+    """Enforce filtered safetensors materialization and capture load metrics."""
+
+    MODE = "safetensors_key_filtered"
+
+    def __init__(
+        self,
+        *,
+        architecture: str,
+        start_layer: int,
+        end_layer: int,
+        layer_prefix: str,
+        selected_prefixes: List[str],
+        target_dtype: torch.dtype,
+    ) -> None:
+        self.architecture = architecture
+        self.start_layer = int(start_layer)
+        self.end_layer = int(end_layer)
+        self.layer_prefix = layer_prefix
+        self.selected_prefixes = tuple(selected_prefixes)
+        self.target_element_size = torch.empty((), dtype=target_dtype).element_size()
+        self.loaded_keys = set()
+        self.loaded_layers = set()
+        self.source_tensor_bytes = 0
+        self.materialized_tensor_bytes = 0
+        self.started_at = time.monotonic()
+        self._process = psutil.Process(os.getpid())
+        self._has_cuda = torch.cuda.is_available()
+        self._baseline = self._memory_snapshot()
+        self._peaks = dict(self._baseline)
+
+    def _memory_snapshot(self) -> Dict[str, int]:
+        snapshot = {
+            "rss_bytes": int(self._process.memory_info().rss),
+            "cuda_allocated_bytes": 0,
+        }
+        if self._has_cuda:
+            snapshot["cuda_allocated_bytes"] = int(torch.cuda.memory_allocated())
+        return snapshot
+
+    def observe(self) -> None:
+        snapshot = self._memory_snapshot()
+        for key, value in snapshot.items():
+            self._peaks[key] = max(self._peaks.get(key, 0), value)
+
+    def is_selected(self, key: str) -> bool:
+        return any(key.startswith(prefix) for prefix in self.selected_prefixes)
+
+    def materialize(self, handle: Any, key: str) -> torch.Tensor:
+        # Check before get_tensor so post-load pruning cannot hide an
+        # accidental full-model materialization by a future adapter.
+        if not self.is_selected(key):
+            raise RuntimeError(
+                "层流水线拒绝物化未分配权重: "
+                f"architecture={self.architecture}, key={key}"
+            )
+        tensor = handle.get_tensor(key)
+        self.loaded_keys.add(key)
+        self.source_tensor_bytes += tensor.numel() * tensor.element_size()
+        self.materialized_tensor_bytes += tensor.numel() * self.target_element_size
+
+        if key.startswith(self.layer_prefix):
+            suffix = key[len(self.layer_prefix):]
+            layer_text, separator, _ = suffix.partition(".")
+            if not separator or not layer_text.isdigit():
+                raise RuntimeError(f"无法解析层权重 key: {key}")
+            layer_index = int(layer_text)
+            if not self.start_layer <= layer_index < self.end_layer:
+                raise RuntimeError(
+                    "层流水线拒绝物化范围外权重: "
+                    f"key={key}, range=[{self.start_layer}, {self.end_layer})"
+                )
+            self.loaded_layers.add(layer_index)
+
+        self.observe()
+        return tensor
+
+    def finish(self) -> Dict[str, Any]:
+        self.observe()
+        expected_layers = set(range(self.start_layer, self.end_layer))
+        if self.loaded_layers != expected_layers:
+            missing = sorted(expected_layers - self.loaded_layers)
+            unexpected = sorted(self.loaded_layers - expected_layers)
+            raise RuntimeError(
+                "层流水线物化层与分配不一致: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        rss_baseline = self._baseline["rss_bytes"]
+        cuda_baseline = self._baseline["cuda_allocated_bytes"]
+        return {
+            "mode": self.MODE,
+            "architecture": self.architecture,
+            "layer_range": (self.start_layer, self.end_layer),
+            "selected_layer_indices": sorted(self.loaded_layers),
+            "selected_tensor_count": len(self.loaded_keys),
+            "source_tensor_bytes": self.source_tensor_bytes,
+            "materialized_tensor_bytes": self.materialized_tensor_bytes,
+            "sampling": "tensor_boundary",
+            "duration_ms": round((time.monotonic() - self.started_at) * 1000, 3),
+            "rss_baseline_bytes": rss_baseline,
+            "rss_peak_bytes": self._peaks["rss_bytes"],
+            "rss_peak_delta_bytes": max(0, self._peaks["rss_bytes"] - rss_baseline),
+            "cuda_allocated_baseline_bytes": cuda_baseline,
+            "cuda_allocated_peak_bytes": self._peaks["cuda_allocated_bytes"],
+            "cuda_allocated_peak_delta_bytes": max(
+                0,
+                self._peaks["cuda_allocated_bytes"] - cuda_baseline,
+            ),
+        }
+
+
 def _serialized_model_access(method):
     """Serialize model mutation and inference against the manager RLock."""
     @wraps(method)
@@ -124,6 +235,9 @@ class ModelManager:
         self._model_layers: int = 0          # 当前加载的层数（range 或 full）
         self._total_model_layers: int = 0    # 完整模型的总层数（加载时记录，load_layer_range 不覆盖）
         self._layer_architecture: str = ""   # "qwen" | "qwen2"，用于分层前向契约
+        self._layer_load_metrics: Optional[Dict[str, Any]] = None
+        self._pipeline_descriptor: Optional[Dict[str, Any]] = None
+        self._pipeline_distributed_only: bool = False
 
         # llama.cpp 引擎（延迟导入 + 延迟加载）
         self._llama_engine = None   # LlamaCppEngine 实例
@@ -371,6 +485,8 @@ class ModelManager:
         self._previous_quant_type = self.quant_type
         self._full_model_path = self._model_path
         self._full_model_quant_type = self.quant_type
+        self._pipeline_descriptor = None
+        self._pipeline_distributed_only = False
 
     @_serialized_model_access
     def unload_model(self) -> None:
@@ -396,6 +512,9 @@ class ModelManager:
         self._model_layers = 0
         self._total_model_layers = 0
         self._layer_architecture = ""
+        self._layer_load_metrics = None
+        self._pipeline_descriptor = None
+        self._pipeline_distributed_only = False
         self._full_model_path = None
         self._full_model_quant_type = None
 
@@ -437,6 +556,121 @@ class ModelManager:
         self._active_model_id = ""  # P3修复: 卸载后清空活跃模型ID
         logger.info("模型已卸载，显存已释放")
 
+    @_serialized_model_access
+    def prepare_pipeline_model(
+        self,
+        model_id: str,
+        model_path: str,
+        quant_type: str = None,
+    ) -> dict:
+        """Prepare a distributed model without materializing any weight tensor.
+
+        This is an explicit distributed-only state. A later pipeline request
+        may load the master's assigned range, but full-model fallback remains
+        disabled until the caller performs a normal model load.
+        """
+        from model_sync import compute_model_sha256
+        from pipeline_model_descriptor import inspect_pipeline_model
+
+        resolved_path = os.path.abspath(model_path or "")
+        descriptor = inspect_pipeline_model(resolved_path, model_id=model_id)
+        if not descriptor.get("pipeline_runtime_supported", False):
+            raise RuntimeError(
+                descriptor.get("runtime_block_reason")
+                or "该模型架构尚未实现流水线执行 adapter"
+            )
+        model_sha256 = compute_model_sha256(resolved_path)
+        if not model_sha256:
+            raise RuntimeError("无法计算流水线模型摘要")
+        descriptor["model_sha256"] = model_sha256
+
+        # Validate the complete artifact before replacing the current runtime.
+        if self.is_loaded or self._pipeline_descriptor is not None:
+            self.unload_model()
+        self.model = None
+        self.tokenizer = None
+        self._engine_type = "pytorch"
+        self._active_model_id = model_id
+        self._model_path = resolved_path
+        self._full_model_path = resolved_path
+        self.quant_type = quant_type or QUANT_TYPE
+        self._full_model_quant_type = self.quant_type
+        self._total_model_layers = int(descriptor["total_layers"])
+        self._model_layers = 0
+        self._pipeline_descriptor = dict(descriptor)
+        self._pipeline_distributed_only = True
+        logger.info(
+            "流水线模型元数据已准备: model=%s type=%s layers=%s "
+            "runtime_supported=%s inspection=%s",
+            model_id,
+            descriptor["model_type"],
+            descriptor["total_layers"],
+            descriptor["pipeline_runtime_supported"],
+            descriptor["inspection_mode"],
+        )
+        return dict(descriptor)
+
+    @property
+    def is_pipeline_prepared(self) -> bool:
+        """Whether an explicit distributed-only artifact is active."""
+        return bool(self._pipeline_distributed_only and self._pipeline_descriptor)
+
+    def get_pipeline_descriptor(self) -> dict:
+        """Return cached metadata, or inspect the active PyTorch artifact."""
+        if self._pipeline_descriptor is not None:
+            return dict(self._pipeline_descriptor)
+        if self._engine_type != "pytorch":
+            return {}
+        model_path = self._full_model_path or self._model_path or ""
+        if not model_path or not os.path.isdir(model_path):
+            return {}
+        from model_sync import compute_model_sha256
+        from pipeline_model_descriptor import inspect_pipeline_model
+
+        descriptor = inspect_pipeline_model(
+            model_path,
+            model_id=self._active_model_id,
+        )
+        descriptor["model_sha256"] = compute_model_sha256(model_path)
+        self._pipeline_descriptor = dict(descriptor)
+        return dict(descriptor)
+
+    @_serialized_model_access
+    def prepare_pipeline_tokenizer(self):
+        """Load tokenizer metadata for a control-only pipeline coordinator."""
+        if not self.is_pipeline_prepared:
+            raise RuntimeError("当前没有已准备的 distributed-only 流水线模型")
+        if self.tokenizer is None:
+            model_path = self._full_model_path or self._model_path or ""
+            if not model_path or not os.path.isdir(model_path):
+                raise FileNotFoundError("流水线 tokenizer 的本地模型目录不存在")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=TRUST_REMOTE_CODE,
+                local_files_only=True,
+            )
+        return self.tokenizer
+
+    @_serialized_model_access
+    def abort_pipeline_materialization(self) -> None:
+        """Release a committed segment while preserving distributed metadata."""
+        if not self._pipeline_descriptor or not self._pipeline_distributed_only:
+            return
+        self.model = None
+        self.tokenizer = None
+        self.layer_range = None
+        self._layer_has_embedding = True
+        self._layer_has_lm_head = True
+        self._model_layers = 0
+        self._layer_architecture = ""
+        self._layer_load_metrics = None
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
     def switch_model(
         self,
         model_id: str,
@@ -474,6 +708,7 @@ class ModelManager:
             rollback_quant = self._previous_quant_type or quant_type or QUANT_TYPE
             rollback_path = self._model_path
             had_model = self.is_loaded
+            had_pipeline_preparation = self.is_pipeline_prepared
 
             if had_model:
                 # 尝试获取回滚模型的可读名称
@@ -491,7 +726,7 @@ class ModelManager:
             )
 
             # 步骤 1: 卸载当前模型
-            if had_model:
+            if had_model or had_pipeline_preparation:
                 try:
                     self.unload_model()
                 except Exception as e:
@@ -580,9 +815,9 @@ class ModelManager:
         """
         加载模型的指定层范围（分布式流水线节点专用）。
 
-        加载完整 PyTorch 模型后，仅保留 [start_layer, end_layer) 的
-        Transformer 层，根据需要保留/丢弃 Embedding 和 LM Head，
-        然后释放不需要的层所占用的显存。
+        从 safetensors 按 key 仅物化 [start_layer, end_layer) 的
+        Transformer 层，并按需物化 Embedding 和 LM Head。完整模型权重
+        不得在此路径中物化；加载后的裁剪只作为防御性结构收缩。
 
         Args:
             start_layer: 起始层编号（0-based，含）
@@ -635,12 +870,14 @@ class ModelManager:
             f"🎯 层范围加载: Layer {start_layer}-{end_layer} ({layers_count}层), "
             f"embed={has_embedding}, lm_head={has_lm_head}"
         )
+        self._layer_load_metrics = None
 
         # Qwen-1.8B 与 Qwen2/DeepSeek 分别使用 transformer.h 和
         # model.layers，两种架构都从 safetensors 中只物化本节点需要的权重。
         model_type = str(getattr(model_config, "model_type", "") or "").lower()
+        load_tracker = None
         if model_type == "qwen2":
-            self._load_qwen2_layer_range(
+            load_tracker = self._load_qwen2_layer_range(
                 path,
                 start_layer,
                 end_layer,
@@ -651,7 +888,7 @@ class ModelManager:
                 model_config=model_config,
             )
         elif model_type == "qwen":
-            self._load_qwen_layer_range(
+            load_tracker = self._load_qwen_layer_range(
                 path,
                 start_layer,
                 end_layer,
@@ -663,7 +900,14 @@ class ModelManager:
             )
         else:
             raise RuntimeError(
-                f"当前 PyTorch 层流水线不支持模型架构: {model_type or 'unknown'}"
+                f"当前 PyTorch 层流水线不支持模型架构: {model_type or 'unknown'}；"
+                "新架构必须按 docs/PyTorch层流水线加载峰值优化方案.md §4.2 "
+                "实现 safetensors 按 key 过滤加载，禁止整模加载后裁剪"
+            )
+        if not isinstance(load_tracker, _LayerRangeLoadTracker):
+            raise RuntimeError(
+                f"{model_type} 层加载器未返回按 key 过滤守卫，拒绝继续；"
+                "禁止绕过 _LayerRangeLoadTracker 后再裁剪完整模型"
             )
         self._engine_type = "pytorch"
 
@@ -689,6 +933,11 @@ class ModelManager:
             )
         kept = all_layers[start_layer:end_layer]
         setattr(transformer, layers_attr, nn.ModuleList(kept))
+        if len(getattr(transformer, layers_attr)) != layers_count:
+            raise RuntimeError(
+                "分层模型裁剪结果与分配不一致: "
+                f"actual={len(getattr(transformer, layers_attr))}, expected={layers_count}"
+            )
 
         # 释放被裁剪层的引用，帮助 GC 回收显存
         for layer in all_layers[:start_layer]:
@@ -725,6 +974,7 @@ class ModelManager:
         target_device = materialized_parameters[0].device
         self.model.to(device=target_device)
         self.model.eval()
+        load_tracker.observe()
 
         # 4. 清理显存
         import gc
@@ -732,6 +982,18 @@ class ModelManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+        self._layer_load_metrics = load_tracker.finish()
+        logger.info(
+            "层流水线加载观测: mode=%s, tensors=%s, source_bytes=%s, "
+            "materialized_bytes=%s, rss_peak_delta_bytes=%s, "
+            "cuda_peak_delta_bytes=%s",
+            self._layer_load_metrics["mode"],
+            self._layer_load_metrics["selected_tensor_count"],
+            self._layer_load_metrics["source_tensor_bytes"],
+            self._layer_load_metrics["materialized_tensor_bytes"],
+            self._layer_load_metrics["rss_peak_delta_bytes"],
+            self._layer_load_metrics["cuda_allocated_peak_delta_bytes"],
+        )
 
         # ---- 记录层范围 ----
         self.layer_range = (start_layer, end_layer)
@@ -769,7 +1031,7 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
-    ) -> None:
+    ) -> _LayerRangeLoadTracker:
         """Materialize only selected Qwen2 parameters from safetensors shards."""
         import gc
         import json
@@ -795,12 +1057,6 @@ class ModelManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=TRUST_REMOTE_CODE,
-            )
-
         selected_prefixes = [
             f"model.layers.{index}."
             for index in range(start_layer, end_layer)
@@ -812,13 +1068,30 @@ class ModelManager:
         if has_lm_head:
             selected_prefixes.append("lm_head.")
 
+        target_device, target_dtype = _select_layer_runtime()
+        load_tracker = _LayerRangeLoadTracker(
+            architecture="qwen2",
+            start_layer=start_layer,
+            end_layer=end_layer,
+            layer_prefix="model.layers.",
+            selected_prefixes=selected_prefixes,
+            target_dtype=target_dtype,
+        )
+
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=TRUST_REMOTE_CODE,
+            )
+        load_tracker.observe()
+
         index_path = os.path.join(model_path, "model.safetensors.index.json")
         files_to_keys = defaultdict(list)
         if os.path.isfile(index_path):
             with open(index_path, "r", encoding="utf-8") as handle:
                 weight_map = json.load(handle).get("weight_map", {})
             for key, filename in weight_map.items():
-                if any(key.startswith(prefix) for prefix in selected_prefixes):
+                if load_tracker.is_selected(key):
                     files_to_keys[filename].append(key)
         else:
             safetensor_files = sorted(
@@ -829,13 +1102,12 @@ class ModelManager:
                 path = os.path.join(model_path, filename)
                 with safe_open(path, framework="pt", device="cpu") as handle:
                     for key in handle.keys():
-                        if any(key.startswith(prefix) for prefix in selected_prefixes):
+                        if load_tracker.is_selected(key):
                             files_to_keys[filename].append(key)
 
         if not files_to_keys:
             raise FileNotFoundError("Qwen2 模型目录中未找到分层 safetensors 权重")
 
-        target_device, target_dtype = _select_layer_runtime()
         runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE
         if requested_quant != runtime_quant:
@@ -851,7 +1123,7 @@ class ModelManager:
             shard_path = os.path.join(model_path, filename)
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
-                    tensor = handle.get_tensor(key)
+                    tensor = load_tracker.materialize(handle, key)
                     set_module_tensor_to_device(
                         model,
                         key,
@@ -860,6 +1132,8 @@ class ModelManager:
                         dtype=target_dtype,
                     )
                     loaded_keys.add(key)
+                    load_tracker.observe()
+                    del tensor
 
         required_parameter_names = {
             name for name, _ in model.named_parameters()
@@ -888,6 +1162,7 @@ class ModelManager:
             end_layer,
             total_layers,
         )
+        return load_tracker
 
     def _load_qwen_layer_range(
         self,
@@ -900,7 +1175,7 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
-    ) -> None:
+    ) -> _LayerRangeLoadTracker:
         """Materialize one original Qwen-1.8B ``transformer.h`` segment."""
         import gc
         import json
@@ -945,12 +1220,6 @@ class ModelManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=TRUST_REMOTE_CODE,
-            )
-
         selected_prefixes = [
             f"transformer.h.{index}."
             for index in range(start_layer, end_layer)
@@ -961,13 +1230,29 @@ class ModelManager:
         if has_lm_head:
             selected_prefixes.append("lm_head.")
 
+        load_tracker = _LayerRangeLoadTracker(
+            architecture="qwen",
+            start_layer=start_layer,
+            end_layer=end_layer,
+            layer_prefix="transformer.h.",
+            selected_prefixes=selected_prefixes,
+            target_dtype=target_dtype,
+        )
+
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=TRUST_REMOTE_CODE,
+            )
+        load_tracker.observe()
+
         index_path = os.path.join(model_path, "model.safetensors.index.json")
         files_to_keys = defaultdict(list)
         if os.path.isfile(index_path):
             with open(index_path, "r", encoding="utf-8") as handle:
                 weight_map = json.load(handle).get("weight_map", {})
             for key, filename in weight_map.items():
-                if any(key.startswith(prefix) for prefix in selected_prefixes):
+                if load_tracker.is_selected(key):
                     files_to_keys[filename].append(key)
         else:
             safetensor_files = sorted(
@@ -978,7 +1263,7 @@ class ModelManager:
                 shard_path = os.path.join(model_path, filename)
                 with safe_open(shard_path, framework="pt", device="cpu") as handle:
                     for key in handle.keys():
-                        if any(key.startswith(prefix) for prefix in selected_prefixes):
+                        if load_tracker.is_selected(key):
                             files_to_keys[filename].append(key)
 
         if not files_to_keys:
@@ -989,7 +1274,7 @@ class ModelManager:
             shard_path = os.path.join(model_path, filename)
             with safe_open(shard_path, framework="pt", device="cpu") as handle:
                 for key in keys:
-                    tensor = handle.get_tensor(key)
+                    tensor = load_tracker.materialize(handle, key)
                     set_module_tensor_to_device(
                         model,
                         key,
@@ -998,6 +1283,8 @@ class ModelManager:
                         dtype=target_dtype,
                     )
                     loaded_keys.add(key)
+                    load_tracker.observe()
+                    del tensor
 
         required_parameter_names = {
             name for name, _ in model.named_parameters()
@@ -1026,6 +1313,7 @@ class ModelManager:
             end_layer,
             total_layers,
         )
+        return load_tracker
 
     @_serialized_model_access
     def ensure_layer_range(
@@ -1066,6 +1354,11 @@ class ModelManager:
     def ensure_full_model(self, quant_type: str = None,
                           profile: dict = None, engine: str = None) -> None:
         """确保当前模型为完整模型；流水线裁剪后回退本地推理前调用。"""
+        if self._pipeline_distributed_only:
+            raise RuntimeError(
+                "当前模型以分布式专用模式准备，禁止自动整模回退；"
+                "请等待流水线节点就绪或显式执行普通模型加载"
+            )
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
         # llama.cpp / 孤岛引擎始终是"完整模型"语义，不存在层裁剪
@@ -1259,6 +1552,7 @@ class ModelManager:
         self.model = AutoModelForCausalLM.from_pretrained(path, **load_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=TRUST_REMOTE_CODE)
         self.layer_range = None
+        self._layer_load_metrics = None
         self._layer_has_embedding = True
         self._layer_has_lm_head = True
 
@@ -2287,6 +2581,8 @@ class ModelManager:
             "loaded_layers": self._model_layers,
             "device": str(self.get_device()),
         }
+        if self._layer_load_metrics is not None:
+            info["layer_load_metrics"] = dict(self._layer_load_metrics)
         if torch.cuda.is_available():
             info["gpu_memory_allocated_gb"] = round(torch.cuda.memory_allocated() / (1024**3), 2)
             info["gpu_memory_reserved_gb"] = round(torch.cuda.memory_reserved() / (1024**3), 2)
