@@ -170,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             key_elements = [str(e) for e in (item.get("key_elements") or [])]
             try:
                 description = None
+                first_exc: Exception | None = None
                 last_exc: Exception | None = None
                 for _ in range(max(1, args.retries + 1)):
                     try:
@@ -185,9 +186,15 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         break
                     except Exception as exc:  # 偶发空输出/超时：重试
+                        if first_exc is None:
+                            first_exc = exc
                         last_exc = exc
                 if description is None:
-                    raise last_exc or ValueError("no description")
+                    # Preserve the original semantic failure.  A later retry
+                    # may fail for a secondary reason (for example a mock or
+                    # provider response queue being exhausted), which must
+                    # not overwrite the reason that triggered retry.
+                    raise first_exc or last_exc or ValueError("no description")
                 hits, total, topic_hit = _match_counts(description, key_elements)
                 topic_evaluated += 1
                 topic_passed += topic_hit
