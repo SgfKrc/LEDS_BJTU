@@ -91,3 +91,5 @@ control/qlh-control.sqlite3*
 
 # Retired docs (moved out of docs/)
 docs_to_delete/
+models/qwen3-4b/
+.venv-gemma4-native/
