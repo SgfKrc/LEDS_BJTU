@@ -181,7 +181,7 @@ Project root
 │       ├── App.jsx                # Main layout & settings state
 │       ├── api/client.js          # API client wrapper
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal etc.
-├── tests/                         # Unit tests (2026-08-12 full run: 1994 passed / 8 skipped)
+├── tests/                         # Unit tests (2026-08-13 full run: 2085 passed / 8 skipped)
 ├── scripts/                       # Utility scripts
 │   ├── quantize_model.py          # Model preparation & quantization verification
 │   ├── benchmark_all.py           # Full quantization-tier benchmark
