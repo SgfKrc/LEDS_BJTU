@@ -153,6 +153,7 @@ Project root
 │   └── gradlew / gradlew.bat      # Gradle Wrapper (no Android Studio required)
 ├── .venv-packaging/               # iGPU packaging venv (CPU torch + PyInstaller)
 ├── .venv-packaging-cuda/          # dGPU packaging venv (CUDA torch + PyInstaller)
+├── .venv-test/                    # Isolated test env (created by setup_test_env.py; full test runs only — never install into system Python)
 ├── packaging/                     # Packaging config + distribution server (no build artifacts)
 │   ├── launcher.py                # Main-app launch payload (Tailscale → model check → engine selection → start)
 │   ├── qlh_launcher.py            # ★ Standalone Bootstrap (GUI/TUI/update, no inference deps)
@@ -181,7 +182,7 @@ Project root
 │       ├── App.jsx                # Main layout & settings state
 │       ├── api/client.js          # API client wrapper
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal etc.
-├── tests/                         # Unit tests (2026-08-13 full run: 2085 passed / 8 skipped)
+├── tests/                         # Unit tests (2026-08-14 full run: 2196 passed / 6 skipped, .venv-test, 4 workers)
 ├── scripts/                       # Utility scripts
 │   ├── quantize_model.py          # Model preparation & quantization verification
 │   ├── benchmark_all.py           # Full quantization-tier benchmark
