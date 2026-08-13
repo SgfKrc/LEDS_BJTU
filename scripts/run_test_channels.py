@@ -49,7 +49,7 @@ def _unit_args(workers: int) -> list[str]:
     return arguments
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--channel',
@@ -63,13 +63,58 @@ def _parse_args() -> argparse.Namespace:
         default=int(os.environ.get('QLH_TEST_WORKERS', '4')),
         help='parallel unit-test workers (default: 4)',
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--allow-system-python',
+        action='store_true',
+        help=(
+            'bypass the virtual-environment guard for disposable CI images or '
+            'dependency diagnostics'
+        ),
+    )
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = _parse_args()
+def _in_virtual_environment() -> bool:
+    return sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+
+
+def _check_python_environment(*, allow_system_python: bool) -> bool:
+    if _in_virtual_environment() or allow_system_python:
+        return True
+    test_python = ROOT / '.venv-test' / (
+        'Scripts/python.exe' if os.name == 'nt' else 'bin/python'
+    )
+    print(
+        '[test-channels] refusing to run with system Python because test '
+        'dependencies can change the shared runtime.',
+        file=sys.stderr,
+    )
+    print(
+        '[test-channels] prepare it with: python scripts/setup_test_env.py '
+        '--reuse-runtime',
+        file=sys.stderr,
+    )
+    print(
+        f'[test-channels] then run: {test_python} '
+        'scripts/run_test_channels.py',
+        file=sys.stderr,
+    )
+    print(
+        '[test-channels] use --allow-system-python only in a disposable '
+        'environment.',
+        file=sys.stderr,
+    )
+    return False
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     if not 1 <= args.workers <= 16:
         raise SystemExit('--workers must be between 1 and 16')
+    if not _check_python_environment(
+        allow_system_python=args.allow_system_python,
+    ):
+        return 2
 
     env = _pytest_env()
     external_args = [
