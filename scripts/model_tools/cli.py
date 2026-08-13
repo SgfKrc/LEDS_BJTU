@@ -11,6 +11,7 @@ from .gguf import GGUFError, inspect_gguf, verify_gguf
 from .gguf_convert import execute_conversion, plan_conversion
 from .gemma4_native_probe import run_native_probe
 from .gemma4_native_artifacts import resolve_ollama_gemma4_12b, run_ollama_gemma4_12b_preflight
+from .qwen3_sidecar_probe import run_qwen3_sidecar_probe
 from .llm_smoke_matrix import run_smoke_matrix
 from .lora import inspect_lora
 from .maintenance import clean_models, model_disk_usage
@@ -150,6 +151,14 @@ def _parser() -> argparse.ArgumentParser:
     native_ollama_probe.add_argument("--require-audio", action="store_true")
     native_ollama_probe.add_argument("--timeout-seconds", type=float, default=180.0)
     native_ollama_probe.add_argument("--json", action="store_true", dest="as_json")
+    qwen3_probe = commands.add_parser(
+        "qwen3-sidecar-probe",
+        aliases=["qwen3_sidecar_probe"],
+        help="preflight Qwen3 config/tokenizer in the isolated Transformers sidecar",
+    )
+    qwen3_probe.add_argument("--model", type=Path, required=True, help="managed local Qwen3 Safetensors directory")
+    qwen3_probe.add_argument("--timeout-seconds", type=float, default=60.0)
+    qwen3_probe.add_argument("--json", action="store_true", dest="as_json")
     convert = commands.add_parser("gguf-convert", aliases=["gguf_convert"], help="preflight or explicitly execute an HF to GGUF conversion")
     source_group = convert.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--model-id", default=None, help="registered Safetensors model ID")
@@ -309,6 +318,25 @@ def _human(command: str, report: dict[str, Any]) -> None:
                 f"available_ram_bytes={resources.get('available_ram_bytes')} "
                 f"required_free_ram_bytes={resources.get('required_free_ram_bytes')} admitted={resources.get('admitted')}"
             )
+        for error in report.get("errors", []):
+            print(f"  - {error.get('code')}: {error.get('message')}")
+        return
+    if command in {"qwen3-sidecar-probe", "qwen3_sidecar_probe"}:
+        runtime = report.get("runtime", {})
+        tokenizer = report.get("tokenizer", {})
+        state = "READY" if report.get("gate_passed") else report.get("status", "UNKNOWN").upper()
+        print(f"{state}: {report.get('tool')}")
+        print(
+            f"transformers={runtime.get('transformers_version')} "
+            f"isolated={runtime.get('isolated')} "
+            f"model_type={report.get('artifact', {}).get('model_type')}"
+        )
+        print(
+            f"tokenizer={tokenizer.get('loaded')} "
+            f"chat_template={tokenizer.get('chat_template_available')} "
+            f"enable_thinking={tokenizer.get('enable_thinking_supported')} "
+            f"no_thinking_render={tokenizer.get('rendered_without_thinking')}"
+        )
         for error in report.get("errors", []):
             print(f"  - {error.get('code')}: {error.get('message')}")
         return
@@ -474,6 +502,11 @@ def main(argv: list[str] | None = None) -> int:
                 require_audio=args.require_audio,
                 timeout_seconds=args.timeout_seconds,
             )
+        elif args.command in {"qwen3-sidecar-probe", "qwen3_sidecar_probe"}:
+            report = run_qwen3_sidecar_probe(
+                model=args.model,
+                timeout_seconds=args.timeout_seconds,
+            )
         elif args.command in {"gguf-convert", "gguf_convert"}:
             _ensure_output_outside_roots(args.output, [ROOT / "models"])
             if args.output is not None and args.target is not None:
@@ -498,12 +531,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = sweep_models(args.root, full_hash=args.full_hash)
     except (OSError, GGUFError, ValueError) as exc:
-        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "gguf-convert", "gguf_convert"}:
+        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "qwen3-sidecar-probe", "qwen3_sidecar_probe", "gguf-convert", "gguf_convert"}:
             message = str(exc) if isinstance(exc, ValueError) else f"operation failed (errno={getattr(exc, 'errno', None)})"
-            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("gemma4_ollama_native_preflight" if args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"} else ("gemma4_native_assets" if args.command in {"gemma4-native-assets", "gemma4_native_assets"} else ("gemma4_native_probe" if args.command in {"gemma4-native-probe", "gemma4_native_probe"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status"))))
+            tool = "gguf_convert" if args.command in {"gguf-convert", "gguf_convert"} else ("qwen3_sidecar_probe" if args.command in {"qwen3-sidecar-probe", "qwen3_sidecar_probe"} else ("gemma4_ollama_native_preflight" if args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"} else ("gemma4_native_assets" if args.command in {"gemma4-native-assets", "gemma4_native_assets"} else ("gemma4_native_probe" if args.command in {"gemma4-native-probe", "gemma4_native_probe"} else ("llm_smoke_matrix" if args.command in {"llm-smoke-matrix", "llm_smoke_matrix"} else "models_sync_status")))))
             report = {
                 "tool": tool,
-                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("matrix" if tool == "llm_smoke_matrix" else ("native_multimodal_preflight" if tool == "gemma4_native_probe" else ("resolve_ollama_gemma4_12b" if tool == "gemma4_native_assets" else ("verify_then_native_preflight" if tool == "gemma4_ollama_native_preflight" else "compare")))),
+                "operation": ("execute" if getattr(args, "apply", False) else "dry_run") if tool == "gguf_convert" else ("qwen3_sidecar_preflight" if tool == "qwen3_sidecar_probe" else ("matrix" if tool == "llm_smoke_matrix" else ("native_multimodal_preflight" if tool == "gemma4_native_probe" else ("resolve_ollama_gemma4_12b" if tool == "gemma4_native_assets" else ("verify_then_native_preflight" if tool == "gemma4_ollama_native_preflight" else "compare"))))),
                 "request_valid": False if tool == "gguf_convert" else None,
                 "valid": False,
                 "in_sync": False,
@@ -537,6 +570,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return 0 if report.get("gate_passed", False) else 1
     if args.command in {"gemma4-native-ollama-probe", "gemma4_native_ollama_probe"}:
+        if not report.get("valid", False):
+            return 2
+        return 0 if report.get("gate_passed", False) else 1
+    if args.command in {"qwen3-sidecar-probe", "qwen3_sidecar_probe"}:
         if not report.get("valid", False):
             return 2
         return 0 if report.get("gate_passed", False) else 1
