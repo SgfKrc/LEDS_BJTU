@@ -60,6 +60,7 @@ def _describe_image(
     *,
     max_tokens: int,
     timeout: float,
+    reasoning_effort: str | None = "none",
 ) -> str:
     from multimodal import build_openai_user_content
 
@@ -69,11 +70,13 @@ def _describe_image(
         "messages": [{"role": "user", "content": content}],
         "stream": False,
         "max_tokens": max_tokens,
-        # gemma4 默认开启 thinking：会占满短输出预算导致 content 为空，
-        # 必须显式关闭（G4.1 实测结论）；keep_alive 保持模型驻留。
-        "reasoning_effort": "none",
+        # keep_alive 保持模型驻留；reasoning_effort 仅 gemma4 系列需要
+        # （gemma4 默认开启 thinking 会占满短输出预算导致 content 为空），
+        # qwen3-vl 等模型对该字段会返回空输出（QWVL-J1 实测），须传 ""。
         "keep_alive": "30m",
     }
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     response = client.post(
         f"{ollama_url.rstrip('/')}/v1/chat/completions",
         json=payload,
@@ -125,6 +128,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--judge-contract", default=str(DEFAULT_CONTRACT))
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--reasoning-effort",
+        default="none",
+        help='Ollama reasoning_effort 值；"" 表示不发送该字段（qwen3-vl 等模型'
+        "对该字段会返回空输出，实测 QWVL-J1）",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="单图判题失败重试次数（qwen3-vl:4b 在 Ollama 下有偶发空输出，"
+        "QWVL-J1 实测；重试后仍失败才计 failures）",
+    )
     parser.add_argument("--result-file", required=True, help="证据 JSON（白名单字段）")
     parser.add_argument("--report-file", help="脱敏报告 JSON（含失败统计）")
     parser.add_argument("--json", action="store_true", help="stdout 输出汇总 JSON")
@@ -153,15 +169,25 @@ def main(argv: list[str] | None = None) -> int:
             prompt = str(item.get("prompt") or "")
             key_elements = [str(e) for e in (item.get("key_elements") or [])]
             try:
-                description = _describe_image(
-                    client,
-                    args.ollama_url,
-                    args.model,
-                    args.judge_prompt,
-                    _image_data_url(image_path),
-                    max_tokens=args.max_tokens,
-                    timeout=args.timeout,
-                )
+                description = None
+                last_exc: Exception | None = None
+                for _ in range(max(1, args.retries + 1)):
+                    try:
+                        description = _describe_image(
+                            client,
+                            args.ollama_url,
+                            args.model,
+                            args.judge_prompt,
+                            _image_data_url(image_path),
+                            max_tokens=args.max_tokens,
+                            timeout=args.timeout,
+                            reasoning_effort=args.reasoning_effort,
+                        )
+                        break
+                    except Exception as exc:  # 偶发空输出/超时：重试
+                        last_exc = exc
+                if description is None:
+                    raise last_exc or ValueError("no description")
                 hits, total, topic_hit = _match_counts(description, key_elements)
                 topic_evaluated += 1
                 topic_passed += topic_hit
