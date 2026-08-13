@@ -43,7 +43,7 @@
 | 上下文 | 262144；当前 8GB 开发门使用 2K/4K smoke，不把 256K 设计上限当本机可用承诺 |
 | 量化/工件 | Q4_K_M；Ollama 清单显示 7.6GB，运行时 `ollama ps` 显示约 9.9GB 工作集 |
 | 本机支持状态 | Ollama 0.32.8 已实测 completion/vision/audio/tools/thinking；QLH G4.1 已实测 OpenAI `image_url` |
-| 原生支持状态 | 项目锁定 llama.cpp `47e1de77…`；本机 `llama-cpp-python 0.3.28` 的 MTMD 必需 ABI 已通过。G4.3.2A 已完整 SHA 验证官方 Ollama 主 GGUF/mmproj 对；两次预检的可用 RAM 约 5-6GiB，低于保守初始化门约 8.74GiB，未初始化 handler 或处理图片，保持 Blocked |
+| 原生支持状态 | 项目锁定 llama.cpp `47e1de77…`；本机 `llama-cpp-python 0.3.28` 的 MTMD 必需 ABI 已通过。G4.3.2A 已完整 SHA 验证官方 Ollama 主 GGUF/mmproj 对；**G4.3.2B 初始化门已于 2026-08-13 通过**（RAM 10.80GiB ≥ 门 9.39GiB，probe `ready_for_image_smoke`、MTMD 上下文初始化、vision/audio ✓）。**图片语义新阻塞**：0.3.28 绑定缺「bitmap→图像 input_chunk 构造」导出（mtmd.dll 无该符号、`mtmd_input_chunk` 结构未封装），需绑定增强（重编锁定 revision wheel）或维持 Ollama 产品路径 |
 | 标签边界 | `gemma4:latest` 当前指向 E4B；12B 必须显式写 `gemma4:12b` |
 
 ### 2.2 本机部署现状（2026-08-11 已实测）
