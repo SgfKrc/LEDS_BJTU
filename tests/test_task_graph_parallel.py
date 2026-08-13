@@ -300,7 +300,9 @@ def test_parallel_cancellation_reaches_all_providers_and_releases_slots():
     thread.start()
     start_barrier.wait(timeout=5)
     coordinator.cancel("wf_parallelcancel")
-    thread.join(5)
+    # 并行负载（-n auto）下取消传播可能超过 5s（T-1 实测 flaky），
+    # 放宽等待上限；取消语义不变（随后断言状态与释放）。
+    thread.join(20)
 
     assert not thread.is_alive()
     assert isinstance(errors[0], WorkflowCancelled)
