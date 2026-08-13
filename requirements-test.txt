@@ -1,6 +1,7 @@
-# Test-only dependencies. Keep this file separate from runtime and packaging
-# requirements so installing it cannot change the application's model stack.
+# Complete test environment: runtime dependencies plus test tooling.
+# Install through scripts/setup_test_env.py; never install into system Python.
 -r requirements.txt
 cryptography>=42.0.0,<47.0.0
 pytest>=8.0,<10
 pytest-xdist>=3.6,<4
+pytest-timeout>=2.3,<3
