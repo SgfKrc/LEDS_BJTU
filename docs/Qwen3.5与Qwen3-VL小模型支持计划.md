@@ -1,6 +1,6 @@
 # Qwen3、Qwen3-VL 与 Qwen3.5 模型支持计划
 
-> 状态：`QW3-S0 Completed`；**`QW3-D1a` / `QW3-D1b` / `QW35-D1` Completed（2026-08-13）**——① D1a：Qwen3-4B 官方 Safetensors（ModelScope 直连，14 文件、7.51 GB，revision `2c54d5a09e…`）+ 官方 GGUF Q4_K_M（HF 代理，2.326 GB，revision `bc640142c6…`，qwen3/40K ctx），manifest 分别登记；② D1b：Qwen3-VL-4B-Instruct 官方 Safetensors（ModelScope 直连，15 文件、8.28 GB，`qwen3_vl` + 内置视觉编码器）+ 官方 GGUF `Q4_K_M`（2.326 GB，qwen3vl/256K ctx）+ `mmproj-F16`（0.779 GB，clip），两仓库 revision 独立锁定；③ QW35-D1：Qwen3.5-2B 官方 Safetensors（ModelScope 直连，14 文件、4.26 GB，`qwen3_5`，官方无 GGUF）。**`QW3-R2` Completed（2026-08-13）**——隔离 sidecar 已就绪：`setup_qwen3_sidecar_env.py` 建独立 venv（`transformers 4.57.6` 隔离，主运行时仍锁 4.47.x），`qwen3-sidecar-probe` 对 `models/qwen3-4b` 真实预检通过：tokenizer 加载、chat template 可用、`enable_thinking=False` 硬关闭且渲染无 `<think>` 脚手架，状态 `ready_for_qwen3_smoke`。**`QW3-G3` 闸门已开（工件 + sidecar 就绪）**。
+> 状态：`QW3-S0 Completed`；**`QW3-D1a` / `QW3-D1b` / `QW35-D1` Completed（2026-08-13）**——① D1a：Qwen3-4B 官方 Safetensors（ModelScope 直连，14 文件、7.51 GB，revision `2c54d5a09e…`）+ 官方 GGUF Q4_K_M（HF 代理，2.326 GB，revision `bc640142c6…`，qwen3/40K ctx），manifest 分别登记；② D1b：Qwen3-VL-4B-Instruct 官方 Safetensors（ModelScope 直连，15 文件、8.28 GB，`qwen3_vl` + 内置视觉编码器）+ 官方 GGUF `Q4_K_M`（2.326 GB，qwen3vl/256K ctx）+ `mmproj-F16`（0.779 GB，clip），两仓库 revision 独立锁定；③ QW35-D1：Qwen3.5-2B 官方 Safetensors（ModelScope 直连，14 文件、4.26 GB，`qwen3_5`，官方无 GGUF）。**`QW3-R2` Completed（2026-08-13）**——隔离 sidecar 已就绪：`setup_qwen3_sidecar_env.py` 建独立 venv（`transformers 4.57.6` 隔离，主运行时仍锁 4.47.x），`qwen3-sidecar-probe` 对 `models/qwen3-4b` 真实预检通过：tokenizer 加载、chat template 可用、`enable_thinking=False` 硬关闭且渲染无 `<think>` 脚手架，状态 `ready_for_qwen3_smoke`。**`QW3-G3` 闸门已开（工件 + sidecar 就绪）**。`QW3-G3` GGUF 半程 **Completed（2026-08-13）**：主 venv `llama-cpp-python 0.3.28` 实测可加载 qwen3 GGUF（Q4_K_M）；以 sidecar `apply_chat_template(enable_thinking=False)` 渲染（官方空 `<think>` 脚手架）喂 llama.cpp，数学题输出 `2`（1 token/1.0s）、一句话题输出 15 tokens 且无换行——**无思考正文、输出预算与格式契约通过**；thinking 默认开时输出 `<think>` 思考链（对照成立）。Safetensors 半程（sidecar + torch 真实加载）待本机 RAM 空闲（codex 组退出后）执行。
 >
 > 更新日期：2026-08-13
 >
@@ -88,7 +88,7 @@ $env:QLH_HTTP_PROXY = 'http://127.0.0.1:7897'
 |---|---|---|
 | 主 Python/打包依赖 | `transformers==4.47.1`、`torch==2.13.0+cu126` | Qwen3 官方提示低于 `transformers 4.51` 会缺 `qwen3`；Qwen3.5 官方要求最新 Transformers。Safetensors 均先走隔离 sidecar，不能直接升级主依赖 |
 | 现有 PyTorch loader | 以 `AutoModelForCausalLM` 和 Qwen2 兼容窗口为主；遗留 Qwen 配置仍有 `TRUST_REMOTE_CODE=True` | Qwen3.5 需要官方多模态模型类/processor，另立适配票；新 Qwen3/Qwen3.5 准入不得因遗留开关而自动启用 `trust_remote_code` |
-| llama.cpp 源 | 锁定 `47e1de77…f89fcbe`，源码已枚举 `qwen3`、`qwen3vl`、`qwen35`、`gemma4` 架构 | 源码枚举不是运行时能力；本机 `llama-cpp-python==0.3.28` 必须与目标 GGUF/mmproj 组合实际 smoke 后再登记支持 |
+| llama.cpp 源 | 锁定 `47e1de77…f89fcbe`，源码已枚举 `qwen3`、`qwen3vl`、`qwen35`、`gemma4` 架构 | 源码枚举不是运行时能力；**本机 `llama-cpp-python==0.3.28` 已实测支持 qwen3（2026-08-13：Q4_K_M 加载 + 生成 smoke 通过）**；qwen3vl/mmproj 与 qwen35 组合仍待实测后登记 |
 | Ollama（Qwen3-VL 可选路径） | 本机已有 Ollama 路线 A 与通用 `external_api` 图像消息能力；尚未拉取 Qwen3-VL | 官方要求 Ollama `>=0.12.7`；`qwen3-vl:4b` 约 3.3 GB、`qwen3-vl:8b` 约 6.1 GB。D1b 先受管官方 Hugging Face 工件，是否额外拉取 Ollama 标签由 QWVL-J1 单独决定 |
 | 8 GB RTX 4060 | Qwen3-4B/Q4 与 Qwen3-VL-4B/Q4 是优先尝试范围；不能与 SD/Gemma 并驻留 | 每次运行前执行现有资源准入；Qwen3-VL-8B、Gemma 4 Safetensors 及长上下文保持条件票 |
 
