@@ -94,3 +94,5 @@ docs_to_delete/
 models/qwen3-4b/
 .venv-gemma4-native/
 models/qwen3-4b-gguf/
+models/qwen3-vl-4b-instruct/
+models/qwen3-vl-4b-instruct-gguf/
