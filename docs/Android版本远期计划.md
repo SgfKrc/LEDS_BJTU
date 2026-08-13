@@ -98,7 +98,7 @@ Android Full 使用 GGUF + llama.cpp。其公开 API 面向完整 decode，量�
 
 详细逐页说明见 [Android UI 改进说明](../android/UI改进说明.md)。
 
-**验收状态：已编译，未运行验收。** 2026-07-28 已执行 `gradlew.bat :app:compileFullDebugKotlin` 并成功通过资源处理、KSP 与 Kotlin 编译。仍须执行 `assembleFullDebug`、安装 APK，并目视核对暗色模式对比度与长消息气泡限宽；在此之前不得把它记为 UI 已验收能力。
+**验收状态：已验收（2026-08-13 真机实测）。** 2026-07-28 已执行 `gradlew.bat :app:compileFullDebugKotlin` 并成功通过资源处理、KSP 与 Kotlin 编译；Full Release APK 已在真机多轮安装运行，暗色模式对比度与长消息气泡限宽均已目视核对通过。安全前缀默认暗色（0xFF171D23）与隐藏 token 的 `无明文` 占位、StatusChip "本地推理/远程推理" 显示均已核验。
 
 新增的 `StatusChip` 用于展示“本地推理 / 远程推理”，这是**执行位置**的展示，不是分布式参与度的展示；§2.1 与 §9 关于“不能把 presence 或普通聊天请求统计为流水线 Worker 任务”的要求不受本次 UI 改动影响。
 
