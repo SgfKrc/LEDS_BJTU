@@ -109,7 +109,9 @@ def main() -> int:
 
     print(f"[6] 图像编码+解码完成，开始生成（n_past={n_past}）", flush=True)
     from llama_cpp._internals import LlamaBatch
+    CHANNEL_TOKEN_ID = 101  # "<channel|>"：思考段与正文的分隔特殊 token（gemma4）
     tokens: list[int] = []
+    collecting = False
     last = llama_cpp.llama_token_bos(model._ctx.ctx)
     n_past = int(n_past.value)  # chunk 循环结束的实际 KV 位置
     batch = LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False)
@@ -125,11 +127,20 @@ def main() -> int:
         llama_cpp.llama_sampler_free(smpl)
         if tok == llama_cpp.llama_token_eos(model._ctx.ctx):
             break
-        tokens.append(tok)
+        if tok == CHANNEL_TOKEN_ID:
+            # 思考段结束标记：丢弃此前全部内容（含 "thought" 字面），开始收集正文
+            collecting = True
+            continue
+        if collecting:
+            tokens.append(tok)
         last = tok
-        if tok == llama_cpp.llama_token_nl(model._ctx.ctx):
-            # 描述通常一行内结束，遇到换行停止
-            break
+    if not collecting:
+        print(
+            "[!] 未检测到 <channel|>（思考段未结束或模型未输出正文）："
+            "原生路径无 reasoning_effort 等效控制，思考段长度不可控；"
+            "产品图像路径请使用 Ollama external_api（reasoning_effort=none）",
+            file=sys.stderr,
+        )
 
     text_out = model.detokenize(tokens).decode("utf-8", "replace")
     print(f"[7] 生成完成（{len(tokens)} tokens，{time.time()-t0:.1f}s）", flush=True)
