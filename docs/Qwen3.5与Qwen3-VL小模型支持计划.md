@@ -8,6 +8,10 @@
 >
 > 总计划入口：[总体下一步计划](总体下一步计划.md)；下载与用户代理规则：[一键模型部署与自治集群远期计划](一键模型部署与自治集群远期计划.md) §7.1。
 
+> **2026-08-14 `PT-PIPE-QW3.4` 增量**：Scheduler dry-run canonical 合同与 prepare/commit/abort/release 故障矩阵已完成；真实 Qwen3-4B 三段 C3 manifest 摘要合同约 2.9 KiB。该票明确 `network_dispatch=false / weight_materialization=false / full_model_fallback=false`，仅证明控制协议可承接真实 revision，不构成跨节点或生产准入。
+
+> **2026-08-14 `PT-PIPE-QW3.5` 增量**：已完成单机认证 loopback：只接受 HMAC 注册完成的 loopback TCP peer，控制帧/ACK 绑定 peer、合同、代际、阶段、时间窗口和 nonce；worker 先验 C3 assignment manifest，再以严格 HTTP Range 只读 Safetensors 头部。真实 Qwen3-4B shard 只读 20,008 bytes，未物化 tensor；专项 `48 passed`，扩大回归 `481 passed`。Qwen3 生产准入、真实双机 hidden tensor/KV 数据面、Qwen3-VL 和 Qwen3.5 仍未因此放开；下一票是 `PT-PIPE-QW3.6` node-local 隔离 sidecar 执行生命周期。
+
 ---
 
 ## 1. 本轮结论

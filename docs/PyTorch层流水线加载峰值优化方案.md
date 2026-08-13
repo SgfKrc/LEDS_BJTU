@@ -217,3 +217,26 @@
 1. 将 chain plan、filtered assignment revision、hidden/KV contract 摘要接入现有 C2 `prepare -> prepared ACK -> commit -> ready` 事务，但先保持 dry-run/仿真，不触发真实远端模型加载。
 2. 增加跨节点合同签名、序列化上限、缓存代际和 abort/release 清理矩阵；覆盖缺段、重复 ACK、合同篡改、KV 长度/设备不一致、超时和断线重试，全部结构化拒绝且不整模回退。
 3. 协议模拟稳定后再做单机 loopback HTTP/Range 传输；真实双机、异构设备结果等价、Qwen3-VL/Qwen3.5 和 PT-PIPE-V1 三轮标定继续后置。
+
+### 8.16 `PT-PIPE-QW3.4` Scheduler dry-run 与故障矩阵（开发门 Completed，2026-08-14）
+
+- 新增 `src/qwen3_pipeline_transaction.py`，冻结 Qwen3 专用 `prepare -> prepared ACK -> commit -> ready` 与 `abort -> release` 状态机。Scheduler 仅保存独立 `_qwen3_pipeline_dry_run`，提供 begin/ACK/retry/expire/abort/release/status 方法；不复用生产 `_pipeline_load_transaction` 准入，不调用 TCP、`load_layer_range` 或 sidecar，因此 Qwen3 生产入口仍 fail-closed。
+- canonical 合同锁定 `config_id/plan_id/generation`、模型 revision SHA-256、2/3 个连续段、每段 C3 `assignment_manifest_sha256`、segment SHA-256、hidden handoff SHA-256 和 node-local KV contract SHA-256；合同上限 `64 KiB`、ACK 上限 `8 KiB`，禁止 prompt/messages/input IDs/hidden tensor/KV tensor/logits/weights 字段进入控制面。
+- prepare ACK 绑定节点、层段、模型/合同/manifest/hidden/KV 摘要和实时可用容量；commit ACK 还必须证明本段空缓存基线：正确 segment/layer range/generation/dtype/device、`sequence_length=0`、`phase=empty`、`cleared=true`、`full_model_materialized=false`。
+- 故障矩阵覆盖：缺段/层段空洞、合同篡改、未知节点、manifest/hidden/KV 摘要不符、KV 长度/设备/代际不符、容量漂移、超限 ACK、同 ACK 幂等、改变后的重复 ACK、retry、timeout、worker disconnect 和逐节点 release ACK 清理；任一不一致全体 abort，不产生整模回退。
+- 真实 `models/qwen3-4b`（revision `2c54d5a09e7e92d4f5126b92a5a457448c9593e6`）生成三段 C3 manifest 并建 dry-run 合同：`[0,12] e7d344cd... / [12,24] acd10827... / [24,36] a5b24b9f...`，合同 SHA-256 `c7bc9f48...`、大小 `2,959` bytes、3 条 prepare 消息；只做本机 header/hash 工作，未传输、未物化。
+- QW3 transaction + chain + smoke + adapter + sidecar + manifest + capacity + descriptor + sync + API + Scheduler 扩展回归 `396 passed`，协议专项 `20 passed`；Python 全量 `2165 passed / 8 skipped`。本票不声称合同摘要替代 TCP HMAC/节点认证，也不声称真实双机、Range 传输或生产准入。
+
+### 8.17 `PT-PIPE-QW3.5` 单机认证 loopback 与 Range 故障矩阵（开发门 Completed，2026-08-14）
+
+- 新增 Qwen3 专用 TCP 消息路由，只允许完成集群 HMAC 注册且实际 socket peer 为 loopback 的连接。每个控制帧再绑定 peer、contract/generation/phase、payload SHA-256、时间窗口和 nonce；ACK 同样签名，变更后的 nonce 重放和非已认证 peer 均 fail-closed。
+- worker 在 prepare 中先获取与签名合同完全一致的 C3 assignment manifest，再以无代理、禁止跳转的 loopback HTTP 请求只读 Safetensors 头部。Range 强制 `206 + Content-Range + Content-Length + SHA-256`，最多 3 次断点续传，单次合同上限 8 MiB；真实 `models/qwen3-4b` 第一 shard 仅读取 20,008 bytes 头部，未读取 tensor payload。
+- Scheduler 已能驱动 `prepare -> commit -> ready -> release`，并在部分下发失败、超时、ready 后断线、重连与 release ACK 丢失时保留 abort/release 清理代际。CPU 只使用可用 RAM 容量池，CUDA 只使用 `mem_get_info()` 空闲 VRAM，不跨池借容量。全路径仍锁定 `dry_run=true / weight_materialization=false / full_model_fallback=false`。
+- 故障矩阵覆盖 401/403/416、跳转、错误 Range、截断/续传、超时、SHA 篡改、manifest 拒绝/篡改、基址变更、容量不足、幂等/重放、断线和重连清理。QW3.5 专项 `48 passed`；Scheduler/TCP/API/manifest 扩大回归 `481 passed`。最终在 `.venv-test` 内以固定 4 worker 运行 unit 通道：`2196 passed / 6 skipped` （约 88 秒）。
+- 本票不包含权重物化、hidden tensor 网络传输、真实双机结果等价或生产准入；Qwen3-VL/Qwen3.5 也不因此放开。
+
+### 8.18 下一票：`PT-PIPE-QW3.6` 隔离 sidecar 的 node-local 执行生命周期
+
+1. 将已认证的 QW3.5 prepare/commit/release 帧接到隔离 Qwen3 sidecar；prepare 只创建并校验本节点 filtered assignment，commit 只物化本层段，release/abort 必须清空 KV、权重和临时代际。
+2. 先以单机多进程验证首/中/末段的独立资源门、超时、sidecar 崩溃、重连和重复 commit；继续断言未分配 key 不物化、不回退主运行时整模加载。
+3. 本票先固定 node-local 执行和清理语义；hidden tensor/KV 跨机数据面、异构转换、真实双机等价和生产准入仍后置。
