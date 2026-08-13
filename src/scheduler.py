@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 from model_host import get_model_host
 from network_path import build_client_network_path_view
+from pipeline_capacity import PipelineCapacityError, solve_pipeline_capacity
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -1064,6 +1065,9 @@ class Scheduler:
         self._pipeline_worker_reserved = False
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
+        self._pipeline_load_transaction: Optional[dict] = None
+        self._active_pipeline_capacity_plan: Optional[dict] = None
+        self._prepared_layer_configs: dict[str, dict] = {}
         # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
         # 布尔值，避免前一个请求结束时把后一个请求降级为普通推送。
         self._authoritative_layer_sync_requests = 0
@@ -1175,6 +1179,21 @@ class Scheduler:
         self._startup_cancel_event.clear()
         self.init_nodes()
         self._running = True
+
+        # Reconcile only the active model's assignment cache.  This is a
+        # local, bounded cleanup and never touches the user's full model tree.
+        try:
+            active_model_id = str(
+                getattr(self._host, "active_model_id", "")
+                or getattr(self._host, "_active_model_id", "")
+                or ""
+            )
+            if active_model_id:
+                from model_sync import reconcile_pipeline_assignment_cache
+
+                reconcile_pipeline_assignment_cache(active_model_id)
+        except Exception:
+            logger.warning("pipeline assignment cache reconcile failed", exc_info=True)
 
         # 存储检测到的局域网 IP 和 MAC 地址
         self._lan_ip: str = ""
@@ -2069,6 +2088,37 @@ class Scheduler:
         ) if isinstance(gpu, dict) else False
         bytes_per_parameter = 2 if uses_cuda else 4
 
+        descriptor = {}
+        get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
+        if callable(get_descriptor):
+            try:
+                descriptor = get_descriptor() or {}
+            except Exception:
+                logger.debug("读取流水线模型描述器失败，继续使用结构估算", exc_info=True)
+        layer_bytes = descriptor.get("layer_weight_bytes") or []
+        component_bytes = descriptor.get("component_weight_bytes") or {}
+        if layer_bytes:
+            # The artifact byte counts are exact for its source dtype. CPU layer
+            # loading widens FP16/BF16 to FP32; CUDA preserves the source width.
+            source_bits_factor = 1.0
+            if not uses_cuda:
+                source_bits_factor = 2.0
+            mib = 1024.0 * 1024.0
+            average_layer_mb = (
+                sum(int(value) for value in layer_bytes) / len(layer_bytes)
+                * source_bits_factor / mib
+            )
+            embedding_mb = (
+                int(component_bytes.get("embedding", 0) or 0)
+                * source_bits_factor / mib
+            )
+            lm_head_bytes = int(component_bytes.get("lm_head", 0) or 0)
+            if not lm_head_bytes and descriptor.get("tie_word_embeddings", False):
+                lm_head_bytes = int(component_bytes.get("embedding", 0) or 0)
+            lm_head_mb = lm_head_bytes * source_bits_factor / mib
+            if average_layer_mb > 0:
+                return average_layer_mb, embedding_mb, lm_head_mb
+
         if model_config is None and manager is not None:
             model_path = getattr(manager, "_model_path", "") or ""
             config_path = os.path.join(model_path, "config.json")
@@ -2166,6 +2216,18 @@ class Scheduler:
 
         manager = self._host
         if manager is not None:
+            get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
+            if callable(get_descriptor):
+                try:
+                    descriptor_layers = int(
+                        (get_descriptor() or {}).get("total_layers", 0) or 0
+                    )
+                    if descriptor_layers > 0:
+                        return descriptor_layers
+                except (TypeError, ValueError):
+                    pass
+                except Exception:
+                    logger.debug("读取流水线描述器层数失败", exc_info=True)
             for value in (
                 getattr(manager, "_total_model_layers", 0),
                 getattr(getattr(getattr(manager, "model", None), "config", None),
@@ -2192,26 +2254,41 @@ class Scheduler:
         return TOTAL_MODEL_LAYERS
 
     def _get_active_pipeline_model_info(self) -> dict:
-        """Describe the exact PyTorch model that workers must load."""
+        """Describe a PyTorch artifact without requiring a full model load."""
         manager = self._host
-        if not manager or not manager.is_loaded:
+        if not manager or getattr(manager, "_engine_type", "") != "pytorch":
             return {}
-        if getattr(manager, "_engine_type", "") != "pytorch":
+        get_descriptor = getattr(manager, "get_pipeline_descriptor", None)
+        if not callable(get_descriptor):
             return {}
-        model_path = os.path.abspath(getattr(manager, "_model_path", "") or "")
+        try:
+            descriptor = get_descriptor() or {}
+        except Exception:
+            logger.warning("读取主节点流水线模型描述器失败", exc_info=True)
+            return {}
+        if not descriptor.get("pipeline_runtime_supported", False):
+            return {}
+        model_path = os.path.abspath(
+            getattr(manager, "_full_model_path", "")
+            or getattr(manager, "_model_path", "")
+            or ""
+        )
         if not model_path or not os.path.isdir(model_path):
             return {}
-        active_config = getattr(getattr(manager, "model", None), "config", None)
-        model_type = str(getattr(active_config, "model_type", "") or "").lower()
+        model_type = str(descriptor.get("model_type", "") or "").lower()
         if model_type not in {"qwen", "qwen2"}:
             return {}
         return {
-            "model_id": getattr(manager, "active_model_id", "") or "",
+            "model_id": descriptor.get("model_id")
+            or getattr(manager, "active_model_id", "") or "",
             "model_path": model_path,
-            "model_sha256": self._get_master_model_sha256(),
+            "model_sha256": descriptor.get("model_sha256")
+            or self._get_master_model_sha256(),
             "model_type": model_type,
-            "total_layers": self._get_total_model_layers(),
+            "total_layers": int(descriptor["total_layers"]),
             "quant_type": getattr(manager, "quant_type", "") or "",
+            "inspection_mode": descriptor.get("inspection_mode", ""),
+            "weight_bytes": int(descriptor.get("weight_bytes", 0) or 0),
         }
 
     def compute_layer_assignment(self, nodes: list = None) -> list:
@@ -2722,6 +2799,28 @@ class Scheduler:
         total_layers = self._get_total_model_layers()
         with self._layer_config_lock:
             opted_out = set(self._pipeline_worker_opt_out)
+            capacity_plan = (
+                dict(self._active_pipeline_capacity_plan)
+                if self._active_pipeline_capacity_plan else None
+            )
+            if capacity_plan is None and self._pipeline_load_transaction:
+                candidate = self._pipeline_load_transaction.get("plan")
+                if isinstance(candidate, dict) and candidate.get("admitted"):
+                    capacity_plan = dict(candidate)
+                    capacity_plan["transaction_phase"] = (
+                        self._pipeline_load_transaction.get("phase", "")
+                    )
+
+        if capacity_plan and capacity_plan.get("admitted"):
+            return {
+                "total": int(capacity_plan.get("total_layers", total_layers)),
+                "strategy": "capacity",
+                "assignments": [
+                    dict(item) for item in capacity_plan.get("assignments", [])
+                ],
+                "computed_at": capacity_plan.get("computed_at"),
+                "plan_id": capacity_plan.get("plan_id", ""),
+            }
 
         if self._runtime_layer_override:
             overrides = self._normalize_manual_assignments(
@@ -2769,6 +2868,146 @@ class Scheduler:
             "cache_key": cache_key,
         }
 
+        return result
+
+    def _get_pipeline_capacity_nodes(
+        self, eligible_node_ids: Optional[set[str]] = None,
+    ) -> list[dict]:
+        """Project live PC profiles into explicit free-memory budgets."""
+        from config import PIPELINE_CAPACITY_RESERVE_MB
+
+        reserve_bytes = int(PIPELINE_CAPACITY_RESERVE_MB * 1024 * 1024)
+        with self._layer_config_lock:
+            opted_out = set(self._pipeline_worker_opt_out)
+        with self._nodes_lock:
+            snapshot = list(self.nodes.items())
+
+        records = []
+        effective_id = self.get_effective_node_id()
+        for node_id, node in snapshot:
+            if (
+                getattr(node, "node_type", "pc") != "pc"
+                or (eligible_node_ids is not None and node_id not in eligible_node_ids)
+                or node_id in opted_out
+                or self._node_is_island_gateway(node.device_info)
+                or (
+                    node.role != NodeRole.MASTER
+                    and node_id != effective_id
+                    and not node.is_available()
+                )
+            ):
+                continue
+            device_info = dict(node.device_info or {})
+            gpu = self._select_scoring_gpu(device_info)
+            cuda_discrete = bool(
+                isinstance(gpu, dict)
+                and gpu.get("cuda_available", False)
+                and not self._gpu_is_integrated(gpu)
+            )
+            capacity_gb = 0.0
+            capacity_source = ""
+            runtime_multiplier = 2.0
+            execution_device = "cpu"
+            if cuda_discrete:
+                try:
+                    capacity_gb = float(gpu.get("vram_free_gb", 0) or 0)
+                except (TypeError, ValueError):
+                    capacity_gb = 0.0
+                capacity_source = "gpu.vram_free_gb" if capacity_gb > 0 else ""
+                runtime_multiplier = 1.0
+                execution_device = "cuda"
+            else:
+                ram = device_info.get("ram", {})
+                if isinstance(ram, dict):
+                    try:
+                        capacity_gb = float(ram.get("available_gb", 0) or 0)
+                    except (TypeError, ValueError):
+                        capacity_gb = 0.0
+                capacity_source = "ram.available_gb" if capacity_gb > 0 else ""
+            records.append({
+                "node_id": node_id,
+                "role": node.role,
+                "capacity_bytes": max(0, int(capacity_gb * 1024 ** 3)),
+                "reserve_bytes": reserve_bytes,
+                "runtime_multiplier": runtime_multiplier,
+                "execution_device": execution_device,
+                "capacity_source": capacity_source,
+                "score": self._compute_node_weight(device_info),
+            })
+        return records
+
+    def get_pipeline_capacity_plan(
+        self, eligible_node_ids: Optional[set[str]] = None,
+    ) -> dict:
+        """Compute an all-or-nothing metadata-only cluster capacity plan."""
+        if eligible_node_ids is None:
+            with self._layer_config_lock:
+                active = (
+                    dict(self._active_pipeline_capacity_plan)
+                    if self._active_pipeline_capacity_plan else None
+                )
+                transaction = self._pipeline_load_transaction
+                if transaction:
+                    transaction_snapshot = {
+                        "config_id": transaction.get("config_id", ""),
+                        "generation": transaction.get("generation", 0),
+                        "transaction_phase": transaction.get("phase", ""),
+                        "prepared_node_count": len(
+                            transaction.get("prepared_nodes", set())
+                        ),
+                        "ready_node_count": len(
+                            transaction.get("ready_nodes", set())
+                        ),
+                        "worker_count": len(transaction.get("worker_ids", set())),
+                        "reason_code": transaction.get("reason_code", ""),
+                        "reason": transaction.get("reason", ""),
+                    }
+                    transaction_plan = dict(transaction.get("plan", {}))
+                else:
+                    transaction_snapshot = None
+                    transaction_plan = None
+            if active:
+                return active
+            if transaction_snapshot and transaction_plan:
+                transaction_plan.update(transaction_snapshot)
+                return transaction_plan
+
+        get_descriptor = getattr(self._host, "get_pipeline_descriptor", None)
+        descriptor = get_descriptor() if callable(get_descriptor) else {}
+        if not isinstance(descriptor, dict) or not descriptor:
+            return {
+                "status": "unavailable",
+                "admitted": False,
+                "reason_code": "pipeline_descriptor_unavailable",
+                "assignments": [],
+            }
+        if not descriptor.get("pipeline_runtime_supported", False):
+            return {
+                "status": "rejected",
+                "admitted": False,
+                "reason_code": "pipeline_runtime_unsupported",
+                "model_id": str(descriptor.get("model_id", "") or ""),
+                "model_type": str(descriptor.get("model_type", "") or ""),
+                "assignments": [],
+            }
+        from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+
+        try:
+            result = solve_pipeline_capacity(
+                descriptor,
+                self._get_pipeline_capacity_nodes(eligible_node_ids),
+                safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+            )
+        except PipelineCapacityError as exc:
+            return {
+                "status": "rejected",
+                "admitted": False,
+                "reason_code": "pipeline_capacity_descriptor_invalid",
+                "reason": str(exc),
+                "assignments": [],
+            }
+        result["computed_at"] = time.time()
+        result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         return result
 
     def _normalize_manual_assignments(self, assignments: list) -> list:
@@ -3026,13 +3265,55 @@ class Scheduler:
             logger.warning("主节点尚未加载可校验的 PyTorch 模型，暂不推送层配置")
             return
 
-        layer_info = self.get_layer_assignments()
+        distributed_only = bool(
+            getattr(self._host, "is_pipeline_prepared", False)
+        )
+        capacity_plan = None
+        if distributed_only:
+            eligible_node_ids = set(releasable_pc_ids)
+            eligible_node_ids.update({"master", self.get_effective_node_id()})
+            capacity_plan = self.get_pipeline_capacity_plan(eligible_node_ids)
+            if not capacity_plan.get("admitted"):
+                releases = {
+                    node_id: {
+                        "node_id": node_id,
+                        "config_id": config_id,
+                        "generation": generation,
+                        "release": True,
+                        "abort": True,
+                        "reason_code": capacity_plan.get(
+                            "reason_code", "pipeline_capacity_rejected"
+                        ),
+                    }
+                    for node_id in releasable_pc_ids
+                }
+                with self._layer_config_lock:
+                    self._pipeline_load_transaction = {
+                        "config_id": config_id,
+                        "generation": generation,
+                        "phase": "rejected",
+                        "plan": dict(capacity_plan),
+                        "prepared_nodes": set(),
+                        "reason_code": capacity_plan.get("reason_code", ""),
+                    }
+                    self._active_pipeline_capacity_plan = None
+                self._publish_layer_configs(releases)
+                logger.warning(
+                    "集群容量准入拒绝流水线加载: reason=%s",
+                    capacity_plan.get("reason_code", "unknown"),
+                )
+                return
+            layer_info = {
+                "assignments": capacity_plan.get("assignments", []),
+            }
+        else:
+            layer_info = self.get_layer_assignments()
         assignments = {}
         from config import API_PORT
 
         for a in layer_info["assignments"]:
             nid = a["node_id"]
-            if nid == "master":
+            if nid in {"master", self.get_effective_node_id()}:
                 continue
 
             # 新一轮配置开始后，旧 ACK 立即失效。
@@ -3058,6 +3339,16 @@ class Scheduler:
                 "authoritative_sync": authoritative_sync,
                 "master_api_port": API_PORT,
             }
+            if capacity_plan is not None:
+                assignments[nid].update({
+                    "phase": "prepare",
+                    "assignment_manifest": True,
+                    "plan_id": capacity_plan.get("plan_id", ""),
+                    "required_bytes": int(a.get("required_bytes", 0) or 0),
+                    "capacity_bytes": int(a.get("capacity_bytes", 0) or 0),
+                    "capacity_source": a.get("capacity_source", ""),
+                    "safety_margin": capacity_plan.get("safety_margin", 1.0),
+                })
 
         releases = {
             node_id: {
@@ -3070,6 +3361,26 @@ class Scheduler:
             if node_id not in assignments
         }
         configs = {**assignments, **releases}
+        if capacity_plan is not None:
+            if not assignments:
+                capacity_plan = dict(capacity_plan)
+                capacity_plan.update({
+                    "status": "rejected",
+                    "admitted": False,
+                    "reason_code": "pipeline_capacity_workers_unavailable",
+                    "assignments": [],
+                    "transaction_phase": "rejected",
+                })
+            with self._layer_config_lock:
+                self._pipeline_load_transaction = {
+                    "config_id": config_id,
+                    "generation": generation,
+                    "phase": "preparing" if assignments else "rejected",
+                    "plan": dict(capacity_plan),
+                    "worker_ids": set(assignments),
+                    "prepared_nodes": set(),
+                }
+                self._active_pipeline_capacity_plan = None
         self._publish_layer_configs(configs)
         if assignments:
             logger.info(
@@ -3110,6 +3421,120 @@ class Scheduler:
             self._layer_config_expected.pop(node_id, None)
             self._layer_config_acks.pop(node_id, None)
             self._layer_config_retry_state.pop(node_id, None)
+
+    def _abort_pipeline_load_transaction(
+        self, config_id: str, reason_code: str, reason: str = "",
+    ) -> None:
+        """Abort one capacity transaction and release every worker atomically."""
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if not transaction or transaction.get("config_id") != config_id:
+                return
+            worker_ids = set(transaction.get("worker_ids", set()))
+            self._layer_config_generation = max(
+                self._layer_config_generation + 1,
+                time.time_ns(),
+            )
+            generation = self._layer_config_generation
+            transaction["phase"] = "aborted"
+            transaction["reason_code"] = reason_code
+            transaction["reason"] = reason
+            self._active_pipeline_capacity_plan = None
+            model_id = str(transaction.get("plan", {}).get("model_id", "") or "")
+        abort_materialization = getattr(
+            self._host, "abort_pipeline_materialization", None
+        )
+        if callable(abort_materialization):
+            try:
+                abort_materialization()
+                self._host.model_loaded = False
+            except Exception:
+                logger.warning("主节点回滚流水线层段失败", exc_info=True)
+        abort_id = uuid.uuid4().hex
+        configs = {
+            node_id: {
+                "node_id": node_id,
+                "config_id": abort_id,
+                "generation": generation,
+                "release": True,
+                "abort": True,
+                "aborted_config_id": config_id,
+                "model_id": model_id,
+                "reason_code": reason_code,
+            }
+            for node_id in worker_ids
+        }
+        self._publish_layer_configs(configs)
+        logger.error(
+            "流水线加载事务已中止: config=%s reason_code=%s reason=%s",
+            config_id, reason_code, reason,
+        )
+
+    def _commit_pipeline_load_transaction(self, config_id: str) -> None:
+        """Materialize the local segment, then publish commit to all workers."""
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if (
+                not transaction
+                or transaction.get("config_id") != config_id
+                or transaction.get("phase") != "preparing"
+            ):
+                return
+            plan = dict(transaction.get("plan", {}))
+            worker_ids = set(transaction.get("worker_ids", set()))
+            expected = {
+                node_id: dict(self._layer_config_expected.get(node_id, {}))
+                for node_id in worker_ids
+            }
+            transaction["phase"] = "committing_local"
+
+        master_ids = {"master", self.get_effective_node_id()}
+        local_assignment = next((
+            item for item in plan.get("assignments", [])
+            if item.get("node_id") in master_ids
+        ), None)
+        try:
+            prepare_tokenizer = getattr(self._host, "prepare_pipeline_tokenizer", None)
+            if callable(prepare_tokenizer):
+                prepare_tokenizer()
+            if local_assignment is not None:
+                self._host.load_layer_range(
+                    int(local_assignment["start_layer"]),
+                    int(local_assignment["end_layer"]),
+                    has_embedding=bool(local_assignment.get("has_embedding")),
+                    has_lm_head=bool(local_assignment.get("has_lm_head")),
+                    model_path=getattr(self._host, "_full_model_path", None),
+                    quant_type=getattr(self._host, "quant_type", None),
+                    total_layers=int(plan.get("total_layers", 0) or 0),
+                    model_id=str(plan.get("model_id", "") or ""),
+                )
+        except Exception as exc:
+            self._abort_pipeline_load_transaction(
+                config_id, "pipeline_local_commit_failed", str(exc)
+            )
+            return
+
+        commit_configs = {}
+        for node_id, item in expected.items():
+            if not item or item.get("release"):
+                continue
+            item["phase"] = "commit"
+            commit_configs[node_id] = item
+        if not commit_configs:
+            self._abort_pipeline_load_transaction(
+                config_id, "pipeline_commit_workers_missing",
+                "prepared worker set disappeared before commit",
+            )
+            return
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if transaction and transaction.get("config_id") == config_id:
+                transaction["phase"] = "committing"
+        self._publish_layer_configs(commit_configs)
+        logger.info(
+            "流水线 prepare 全部通过，已下发 commit: config=%s workers=%s",
+            config_id, sorted(commit_configs),
+        )
 
     def _invalidate_worker_layer_ready(
         self, node_id: str, config_id: str, reason: str,
@@ -3210,16 +3635,29 @@ class Scheduler:
         """
         获取主节点当前加载模型的 SHA256。
 
-        仅对当前已加载的 PyTorch Safetensors/BIN 模型计算摘要。
+        对当前已加载或已显式准备的 PyTorch Safetensors/BIN 模型计算摘要。
         llama.cpp/GGUF 不支持层拆分，不得作为流水线模型基准。
         """
         from model_sync import compute_model_sha256
 
         mgr = self._host
-        if not mgr or not mgr.is_loaded or getattr(mgr, '_engine_type', '') != 'pytorch':
+        if not mgr or getattr(mgr, '_engine_type', '') != 'pytorch':
             return ""
 
-        model_path = getattr(mgr, '_model_path', '') or ''
+        get_descriptor = getattr(mgr, "get_pipeline_descriptor", None)
+        if callable(get_descriptor):
+            try:
+                cached = str((get_descriptor() or {}).get("model_sha256", ""))
+                if cached:
+                    return cached
+            except Exception:
+                logger.debug("读取流水线描述器摘要失败", exc_info=True)
+
+        model_path = (
+            getattr(mgr, '_full_model_path', '')
+            or getattr(mgr, '_model_path', '')
+            or ''
+        )
         if not model_path or not os.path.isdir(model_path):
             return ""
 
@@ -4925,6 +5363,23 @@ class Scheduler:
 
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
+        abort_details = None
+        with self._layer_config_lock:
+            transaction = self._pipeline_load_transaction
+            if (
+                transaction
+                and transaction.get("phase") in {
+                    "preparing", "committing_local", "committing",
+                }
+                and client_id in set(transaction.get("worker_ids", set()))
+            ):
+                abort_details = (
+                    str(transaction.get("config_id", "")),
+                    "pipeline_worker_disconnected",
+                    f"worker {client_id} disconnected during transaction",
+                )
+        if abort_details is not None:
+            self._abort_pipeline_load_transaction(*abort_details)
         self._task_worker_control.disconnect_worker(client_id)
         self._diffusion_worker_control.disconnect_worker(client_id)
         with self._diffusion_worker_lock:
@@ -7602,6 +8057,9 @@ class Scheduler:
 
     def _schedule_layer_config(self, client_id: str, data: dict) -> None:
         config_id = str(data.get("config_id", "")) if isinstance(data, dict) else ""
+        incoming_phase = str(
+            data.get("phase", "commit") or "commit"
+        ) if isinstance(data, dict) else "commit"
         authoritative_sync = bool(
             isinstance(data, dict) and data.get("authoritative_sync")
         )
@@ -7628,6 +8086,8 @@ class Scheduler:
                 cached = self._last_layer_config_ack_payload
                 if (config_id and cached
                         and cached.get("config_id") == config_id
+                        and str(cached.get("phase", "commit") or "commit")
+                        == incoming_phase
                         and config_id not in self._layer_config_inflight):
                     payload = dict(cached)
                 else:
@@ -7796,6 +8256,26 @@ class Scheduler:
                 self._active_layer_config = None
                 self._last_layer_config_ack_payload = None
                 self._local_pipeline_steps.clear()
+                aborted_config_id = str(data.get("aborted_config_id", "") or "")
+                if aborted_config_id:
+                    self._prepared_layer_configs.pop(aborted_config_id, None)
+            if data.get("abort"):
+                abort_materialization = getattr(
+                    self._host, "abort_pipeline_materialization", None
+                )
+                if callable(abort_materialization):
+                    abort_materialization()
+                self._host.model_loaded = False
+                try:
+                    from model_sync import remove_pipeline_assignment_cache
+
+                    model_id = str(data.get("model_id", "") or "")
+                    if model_id and aborted_config_id:
+                        remove_pipeline_assignment_cache(
+                            model_id, aborted_config_id, node_id,
+                        )
+                except Exception:
+                    logger.warning("清理已中止的 assignment 缓存失败", exc_info=True)
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": str(data.get("config_id", "")),
@@ -7852,11 +8332,14 @@ class Scheduler:
         expected_model_type = str(cfg.get("model_type", "")).lower()
         expected_engine = str(cfg.get("engine", "pytorch") or "pytorch").lower()
         master_quant_type = str(cfg.get("master_quant_type", "") or "")
+        phase = str(cfg.get("phase", "commit") or "commit").lower()
+        plan_id = str(cfg.get("plan_id", "") or "")
         try:
             start = int(start)
             end = int(end)
             total_layers = int(cfg.get("total_layers", 0) or 0)
             master_api_port = int(cfg.get("master_api_port", 8000) or 8000)
+            required_bytes = int(cfg.get("required_bytes", 0) or 0)
         except (TypeError, ValueError) as exc:
             error = f"分层配置数字字段无效: {exc}"
             logger.warning(error)
@@ -7897,6 +8380,22 @@ class Scheduler:
                 raise ValueError(
                     "分层配置执行契约不完整: " + ", ".join(missing_contract)
                 )
+            if phase not in {"prepare", "commit"}:
+                raise ValueError(f"不支持的分层加载阶段: {phase}")
+            if phase == "prepare" and (not plan_id or required_bytes <= 0):
+                raise ValueError("prepare 阶段缺少 plan_id 或 required_bytes")
+            prepared = {}
+            if phase == "commit" and plan_id:
+                with self._layer_config_lock:
+                    prepared = dict(
+                        self._prepared_layer_configs.get(config_id, {})
+                    )
+                if (
+                    prepared.get("plan_id") != plan_id
+                    or prepared.get("layer_range") != [start, end]
+                    or prepared.get("model_sha256") != expected_sha256
+                ):
+                    raise RuntimeError("commit 未命中同代际 prepared 记录")
 
             # A new generation supersedes the old segment immediately. If model
             # synchronization or selective loading then fails, neither the API
@@ -7911,7 +8410,27 @@ class Scheduler:
 
             local_sha256 = ""
             local_model_path = None
-            if expected_sha256:
+            if phase == "commit" and plan_id:
+                local_sha256 = str(prepared.get("model_sha256", "") or "")
+                local_model_path = prepared.get("model_path")
+            elif phase == "prepare" and plan_id and cfg.get("assignment_manifest"):
+                from model_sync import ensure_pipeline_assignment_available
+
+                tcp_client = getattr(self, "_tcp_client", None)
+                master_host = getattr(tcp_client, "server_host", "")
+                if not master_host:
+                    raise RuntimeError("无法确定主节点模型下载地址")
+                local_model_path, assignment_manifest = ensure_pipeline_assignment_available(
+                    master_host,
+                    master_api_port,
+                    {
+                        **cfg,
+                        "model_id": model_id,
+                        "model_sha256": expected_sha256,
+                    },
+                )
+                local_sha256 = expected_sha256
+            elif expected_sha256:
                 from tcp_comm import TCPClient
                 if model_id:
                     from model_sync import (
@@ -7949,6 +8468,91 @@ class Scheduler:
                         f"模型 SHA256 不一致: local={local_sha256[:16]}... "
                         f"master={expected_sha256[:16]}..."
                     )
+
+            if phase == "prepare":
+                from pipeline_model_descriptor import inspect_pipeline_model
+
+                try:
+                    descriptor = inspect_pipeline_model(
+                        local_model_path,
+                        model_id=model_id,
+                        layer_range=(start, end),
+                    )
+                except TypeError as exc:
+                    # Keep compatibility with older test/sidecar adapters
+                    # that still expose the C1 two-argument inspector.
+                    if "layer_range" not in str(exc):
+                        raise
+                    descriptor = inspect_pipeline_model(
+                        local_model_path, model_id=model_id,
+                    )
+                if (
+                    descriptor.get("model_type") != expected_model_type
+                    or int(descriptor.get("total_layers", 0) or 0) != total_layers
+                    or start < 0 or end <= start or end > total_layers
+                ):
+                    raise ValueError("worker 工件描述器与 prepare 契约不一致")
+                profile = dict(self._local_device_profile or {})
+                gpu = self._select_scoring_gpu(profile)
+                cuda_discrete = bool(
+                    isinstance(gpu, dict)
+                    and gpu.get("cuda_available", False)
+                    and not self._gpu_is_integrated(gpu)
+                )
+                if cuda_discrete:
+                    free_gb = float(gpu.get("vram_free_gb", 0) or 0)
+                    capacity_source = "gpu.vram_free_gb"
+                else:
+                    ram = profile.get("ram", {})
+                    free_gb = float(
+                        ram.get("available_gb", 0) or 0
+                    ) if isinstance(ram, dict) else 0.0
+                    capacity_source = "ram.available_gb"
+                available_bytes = max(0, int(free_gb * 1024 ** 3))
+                if available_bytes < required_bytes:
+                    raise RuntimeError(
+                        "worker 实时容量不足: "
+                        f"required={required_bytes}, available={available_bytes}"
+                    )
+                prepare_manager = getattr(
+                    self._host, "prepare_pipeline_model", None
+                )
+                if callable(prepare_manager):
+                    prepare_manager(
+                        model_id=model_id,
+                        model_path=local_model_path,
+                        quant_type=master_quant_type or None,
+                    )
+                prepared_record = {
+                    "config_id": config_id,
+                    "plan_id": plan_id,
+                    "model_id": model_id,
+                    "model_sha256": local_sha256,
+                    "model_type": expected_model_type,
+                    "model_path": local_model_path,
+                    "layer_range": [start, end],
+                    "required_bytes": required_bytes,
+                    "available_bytes": available_bytes,
+                    "capacity_source": capacity_source,
+                }
+                with self._layer_config_lock:
+                    self._prepared_layer_configs[config_id] = prepared_record
+                self._send_layer_config_ack({
+                    "node_id": node_id,
+                    "config_id": config_id,
+                    "status": "prepared",
+                    "phase": "prepare",
+                    "plan_id": plan_id,
+                    "layer_range": [start, end],
+                    "model_sha256": local_sha256,
+                    "model_type": expected_model_type,
+                    "engine": "pytorch",
+                    "required_bytes": required_bytes,
+                    "available_bytes": available_bytes,
+                    "capacity_source": capacity_source,
+                    "timestamp": time.time(),
+                })
+                return
 
             mgr = self._host
             if mgr and mgr.is_loaded:
@@ -8025,6 +8629,7 @@ class Scheduler:
                 self._pipeline_worker_reserved = True
                 self._active_layer_config = dict(active_config)
                 self._local_pipeline_steps.clear()
+                self._prepared_layer_configs.pop(config_id, None)
             # Layer config may be the first model load on a clean worker. Keep the
             # API's compatibility globals aligned so the first forwarded chat does
             # not auto-load a full/GGUF model over this segment.
@@ -8035,6 +8640,8 @@ class Scheduler:
                 "node_id": node_id,
                 "config_id": config_id,
                 "status": "ready",
+                "phase": phase,
+                "plan_id": plan_id,
                 "layer_range": [start, end],
                 "model_sha256": local_sha256 or expected_sha256,
                 "model_type": actual_model_type,
@@ -8071,7 +8678,10 @@ class Scheduler:
         """从节点向主节点回传层配置加载结果。"""
         from tcp_comm import MessageType
 
-        if payload.get("config_id") and payload.get("status") == "ready":
+        if (
+            payload.get("config_id")
+            and payload.get("status") in {"prepared", "ready"}
+        ):
             with self._layer_config_lock:
                 self._last_layer_config_ack_payload = dict(payload)
 
@@ -8087,26 +8697,28 @@ class Scheduler:
             return False
 
     def _handle_layer_config_ack(self, client_id: str, msg: dict) -> None:
-        """主节点校验从节点层加载 ACK，并更新流水线 ready 状态。"""
+        """Validate legacy ready ACKs and capacity prepare/commit phases."""
         data = msg.get("data", {})
         node_id = str(data.get("node_id", client_id))
         config_id = str(data.get("config_id", ""))
-
         if node_id != client_id:
             logger.warning(
-                f"忽略节点标识不一致的层配置 ACK: connection={client_id}, payload={node_id}"
+                "忽略节点标识不一致的层配置 ACK: connection=%s payload=%s",
+                client_id, node_id,
             )
             return
 
+        commit_config_id = ""
+        abort_details = None
         with self._layer_config_lock:
             expected = self._layer_config_expected.get(client_id)
             if not expected:
-                logger.warning(f"忽略未请求的层配置 ACK: node={client_id}")
+                logger.warning("忽略未请求的层配置 ACK: node=%s", client_id)
                 return
             if config_id != expected.get("config_id"):
                 logger.warning(
-                    f"忽略过期层配置 ACK: node={client_id}, config_id={config_id}, "
-                    f"expected={expected.get('config_id')}"
+                    "忽略过期层配置 ACK: node=%s config_id=%s expected=%s",
+                    client_id, config_id, expected.get("config_id"),
                 )
                 return
 
@@ -8118,8 +8730,7 @@ class Scheduler:
                 released = (
                     data.get("status") == "released"
                     and data.get("release") is True
-                    and ack_generation
-                    == int(expected.get("generation", 0) or 0)
+                    and ack_generation == int(expected.get("generation", 0) or 0)
                 )
                 self._layer_config_acks[client_id] = dict(data)
                 if released:
@@ -8130,59 +8741,119 @@ class Scheduler:
                     state = self._layer_config_retry_state.setdefault(
                         client_id, {"attempts": 0, "next_retry": 0.0}
                     )
-                    state["next_retry"] = min(
-                        float(state.get("next_retry", 0.0)),
-                        time.monotonic() + 5.0,
-                    )
-                ready = False
-                expected_range = []
+                    state["next_retry"] = time.monotonic() + 5.0
                 release_ack = True
+                ready = False
+                prepared = False
+                expected_range = []
             else:
                 release_ack = False
-
-            if not release_ack:
                 expected_range = [expected["start_layer"], expected["end_layer"]]
-                ready = (
-                    data.get("status") == "ready"
+                expected_phase = str(expected.get("phase", "commit") or "commit")
+                prepared = (
+                    expected_phase == "prepare"
+                    and data.get("status") == "prepared"
+                    and data.get("phase") == "prepare"
+                    and data.get("plan_id") == expected.get("plan_id")
                     and data.get("layer_range") == expected_range
                     and data.get("model_sha256") == expected.get("model_sha256")
                     and data.get("model_type") == expected.get("model_type")
                     and data.get("engine") == "pytorch"
+                    and int(data.get("available_bytes", 0) or 0)
+                    >= int(expected.get("required_bytes", 0) or 0)
+                )
+                ready = (
+                    expected_phase == "commit"
+                    and data.get("status") == "ready"
+                    and data.get("layer_range") == expected_range
+                    and data.get("model_sha256") == expected.get("model_sha256")
+                    and data.get("model_type") == expected.get("model_type")
+                    and data.get("engine") == "pytorch"
+                    and (
+                        not expected.get("plan_id")
+                        or data.get("plan_id") == expected.get("plan_id")
+                    )
                 )
                 self._layer_config_acks[client_id] = dict(data)
                 if ready:
                     self._layer_config_pushed.add(client_id)
                     self._layer_config_retry_state.pop(client_id, None)
+                    transaction = self._pipeline_load_transaction
+                    if (
+                        transaction
+                        and transaction.get("config_id") == config_id
+                        and transaction.get("phase") == "committing"
+                    ):
+                        ready_nodes = set(transaction.get("ready_nodes", set()))
+                        ready_nodes.add(client_id)
+                        transaction["ready_nodes"] = ready_nodes
+                        if ready_nodes == set(transaction.get("worker_ids", set())):
+                            transaction["phase"] = "ready"
+                            active_plan = dict(transaction.get("plan", {}))
+                            active_plan["computed_at"] = time.time()
+                            active_plan["transaction_phase"] = "ready"
+                            self._active_pipeline_capacity_plan = active_plan
+                elif prepared:
+                    self._layer_config_pushed.discard(client_id)
+                    self._layer_config_retry_state.pop(client_id, None)
+                    transaction = self._pipeline_load_transaction
+                    if (
+                        transaction
+                        and transaction.get("config_id") == config_id
+                        and transaction.get("phase") == "preparing"
+                    ):
+                        prepared_nodes = set(transaction.get("prepared_nodes", set()))
+                        prepared_nodes.add(client_id)
+                        transaction["prepared_nodes"] = prepared_nodes
+                        if prepared_nodes == set(transaction.get("worker_ids", set())):
+                            commit_config_id = config_id
                 else:
                     self._layer_config_pushed.discard(client_id)
                     state = self._layer_config_retry_state.setdefault(
                         client_id, {"attempts": 0, "next_retry": 0.0}
                     )
-                    state["next_retry"] = min(
-                        float(state.get("next_retry", 0.0)),
-                        time.monotonic() + 5.0,
-                    )
+                    state["next_retry"] = time.monotonic() + 5.0
+                    transaction = self._pipeline_load_transaction
+                    if (
+                        transaction
+                        and transaction.get("config_id") == config_id
+                        and data.get("status") == "error"
+                    ):
+                        abort_details = (
+                            config_id,
+                            f"pipeline_{expected_phase}_failed",
+                            str(data.get("error", "") or "worker rejected phase"),
+                        )
 
         if release_ack:
             if released:
                 logger.info(
-                    "✅ 从节点已确认退出分层 worker: node=%s config_id=%s",
-                    client_id,
-                    config_id,
+                    "从节点已确认退出分层 worker: node=%s config_id=%s",
+                    client_id, config_id,
                 )
             else:
                 logger.error("从节点分层释放 ACK 未通过: node=%s", client_id)
             return
-
-        if ready:
+        if abort_details is not None:
+            self._abort_pipeline_load_transaction(*abort_details)
+            return
+        if commit_config_id:
+            self._commit_pipeline_load_transaction(commit_config_id)
+            return
+        if prepared:
             logger.info(
-                f"✅ 从节点层配置已就绪: node={client_id}, "
-                f"Layer {expected_range[0]}-{expected_range[1]}, config_id={config_id}"
+                "流水线 worker prepare 通过: node=%s config=%s",
+                client_id, config_id,
+            )
+        elif ready:
+            logger.info(
+                "从节点层配置已就绪: node=%s range=%s config=%s",
+                client_id, expected_range, config_id,
             )
         else:
             logger.error(
-                f"从节点层配置加载未通过: node={client_id}, "
-                f"status={data.get('status')}, error={data.get('error', '')}"
+                "从节点层配置阶段未通过: node=%s status=%s error=%s",
+                client_id, data.get("status"), data.get("error", ""),
             )
 
     def _handle_layer_worker_opt_out(self, client_id: str, msg: dict) -> None:
@@ -8879,9 +9550,11 @@ class Scheduler:
             }
 
         assignments = self.get_layer_assignments()
+        master_ids = {"master", self.get_effective_node_id()}
         pipeline_nodes = [
             a for a in assignments.get("assignments", [])
-            if a.get("node_id") != "master" and a.get("layers_count", 1) > 0
+            if a.get("node_id") not in master_ids
+            and a.get("layers_count", 1) > 0
         ]
         if not pipeline_nodes:
             return {
@@ -9682,8 +10355,8 @@ class Scheduler:
         from tcp_comm import MessageType, deserialize_tensor_fast, serialize_tensor_fast
 
         mgr = self._host
-        if not mgr or not mgr.tokenizer:
-            return {"response": "", "error": "模型未加载"}
+        if not mgr:
+            return {"response": "", "error": "模型运行时不可用"}
 
         # ---- Step 1: 获取分层配置 ----
         layer_info = self.get_layer_assignments()
@@ -9735,6 +10408,8 @@ class Scheduler:
                 logger.error(f"❌ 主节点本地层范围加载失败: {e}", exc_info=True)
                 return {"response": "", "error": f"主节点本地层范围加载失败: {e}"}
 
+        if not mgr.tokenizer:
+            return {"response": "", "error": "流水线 tokenizer 未加载"}
         tokenizer = mgr.tokenizer
         device = mgr.get_device()
 
@@ -10455,14 +11130,18 @@ class Scheduler:
         """
         # ---- 引擎检查：流水线仅支持 PyTorch 引擎 ----
         # llama.cpp(GGUF) 不支持层拆分，直接走全模型推理。
-        # 同时检查模型是否已加载，未加载时走回退路径（给出明确错误）。
+        # 已显式准备的 distributed-only 模型尚未物化任何权重，也允许进入；
+        # 主节点首段会在 worker 就绪后由 run_pipeline 按分配范围首次加载。
         queue_timeout = kwargs.pop('_queue_timeout', PIPELINE_TIMEOUT)
         model_sync_timeout = kwargs.pop(
             '_pipeline_model_sync_timeout', PIPELINE_MODEL_SYNC_TIMEOUT,
         )
         self._track_stream_output(kwargs)
         mgr = self._host
-        if not mgr or not mgr.is_loaded:
+        pipeline_prepared = bool(
+            mgr and getattr(mgr, "is_pipeline_prepared", False)
+        )
+        if not mgr or (not mgr.is_loaded and not pipeline_prepared):
             logger.warning("模型未加载，无法执行流水线推理")
             return self._run_full_model_inference(
                 prompt,
@@ -10620,6 +11299,14 @@ class Scheduler:
         若调用方传入 _stream_callback，则使用 chat_stream() 逐 token 推送。
         """
         mgr = self._host
+        if mgr and getattr(mgr, "is_pipeline_prepared", False):
+            return {
+                "response": "",
+                "error": (
+                    "当前模型仅以分布式流水线模式准备，禁止整模回退；"
+                    "请等待从节点就绪或显式执行普通模型加载"
+                ),
+            }
         if not mgr or not mgr.is_loaded:
             return {"response": "", "error": "模型未加载"}
 
@@ -10769,6 +11456,15 @@ class Scheduler:
         import threading as _thr
 
         mgr = self._host
+        if mgr and getattr(mgr, "is_pipeline_prepared", False):
+            yield {
+                "done": True,
+                "error": (
+                    "当前模型仅以分布式流水线模式准备，禁止整模回退；"
+                    "请等待从节点就绪或显式执行普通模型加载"
+                ),
+            }
+            return
         if not mgr or not mgr.is_loaded:
             yield {"done": True, "error": "模型未加载"}
             return

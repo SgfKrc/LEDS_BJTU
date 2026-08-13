@@ -19,7 +19,7 @@ import torch.nn as nn
 
 from transformers import Qwen2Config, Qwen2ForCausalLM
 
-from model_module import ModelManager
+from model_module import ModelManager, _LayerRangeLoadTracker
 import model_config as mc
 
 # ================================================================
@@ -728,6 +728,18 @@ class TestLoadLayerRangeIntegration:
 
         def install_fake_model(*args, **kwargs):
             mgr.model = fake_model
+            tracker = _LayerRangeLoadTracker(
+                architecture="qwen2",
+                start_layer=0,
+                end_layer=28,
+                layer_prefix="model.layers.",
+                selected_prefixes=[
+                    f"model.layers.{index}." for index in range(28)
+                ],
+                target_dtype=torch.float32,
+            )
+            tracker.loaded_layers.update(range(28))
+            return tracker
 
         monkeypatch.setattr(mgr, "_load_qwen2_layer_range", install_fake_model)
 
@@ -755,6 +767,45 @@ class TestLoadLayerRangeIntegration:
 
         with pytest.raises(ValueError, match="assignment=24, model=28"):
             mgr.load_layer_range(0, 24, total_layers=24)
+
+    def test_load_layer_range_rejects_adapter_without_filter_guard(self, monkeypatch):
+        """架构加载器不得绕过按 key 过滤守卫后依赖末尾裁剪。"""
+        import model_module
+
+        config = type("Config", (), {
+            "model_type": "qwen2",
+            "num_hidden_layers": 2,
+        })()
+        monkeypatch.setattr(
+            model_module.AutoConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: config,
+        )
+        mgr = ModelManager()
+        mgr.model = _make_tiny_model()
+        monkeypatch.setattr(mgr, "_load_qwen2_layer_range", lambda *a, **k: None)
+
+        with pytest.raises(RuntimeError, match="未返回按 key 过滤守卫"):
+            mgr.load_layer_range(0, 2, total_layers=2)
+
+    def test_unsupported_architecture_points_to_filtered_adapter_contract(
+        self,
+        monkeypatch,
+    ):
+        import model_module
+
+        config = type("Config", (), {
+            "model_type": "gemma4_unified",
+            "num_hidden_layers": 4,
+        })()
+        monkeypatch.setattr(
+            model_module.AutoConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: config,
+        )
+
+        with pytest.raises(RuntimeError, match="禁止整模加载后裁剪"):
+            ModelManager().load_layer_range(0, 2, total_layers=4)
 
     def test_load_then_forward_last_node(self):
         """通过 load_layer_range 加载末节点 → forward_layers 应产出 logits"""
@@ -829,6 +880,18 @@ class TestLoadLayerRangeIntegration:
         assert all(parameter.device.type != "meta" for parameter in mgr.model.parameters())
         assert all(parameter.dtype == torch.float32 for parameter in mgr.model.parameters())
 
+        metrics = mgr.get_model_info()["layer_load_metrics"]
+        assert metrics["mode"] == "safetensors_key_filtered"
+        assert metrics["architecture"] == "qwen2"
+        assert metrics["layer_range"] == (2, 4)
+        assert metrics["selected_layer_indices"] == [2, 3]
+        assert metrics["selected_tensor_count"] > 0
+        assert metrics["source_tensor_bytes"] > 0
+        assert metrics["materialized_tensor_bytes"] > 0
+        assert metrics["sampling"] == "tensor_boundary"
+        assert metrics["rss_peak_bytes"] >= metrics["rss_baseline_bytes"]
+        assert "loaded_keys" not in metrics
+
         # CUDA 主节点经网络送来的 FP16 hidden state 必须在 CPU worker
         # 边界转换为本地模型的 FP32，不能把半精度继续送入 CPU 算子。
         result = mgr.forward_layers(
@@ -836,6 +899,71 @@ class TestLoadLayerRangeIntegration:
         )
         assert result["logits"].shape == (1, 3, TINY_CONFIG.vocab_size)
         assert result["logits"].dtype == torch.float32
+
+    def test_prepare_pipeline_model_does_not_materialize_weights(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Distributed preparation must stop before any model construction."""
+        import model_module
+
+        source = _make_tiny_model()
+        source.save_pretrained(tmp_path, safe_serialization=True)
+        monkeypatch.setattr(
+            model_module.AutoModelForCausalLM,
+            "from_pretrained",
+            lambda *args, **kwargs: pytest.fail("must not load a full model"),
+        )
+        monkeypatch.setattr(
+            model_module.AutoModelForCausalLM,
+            "from_config",
+            lambda *args, **kwargs: pytest.fail("must not construct a model skeleton"),
+        )
+        monkeypatch.setattr(
+            "model_sync.compute_model_sha256",
+            lambda path: "a" * 64,
+        )
+
+        mgr = ModelManager()
+        descriptor = mgr.prepare_pipeline_model(
+            model_id="tiny-qwen2",
+            model_path=str(tmp_path),
+            quant_type="fp16",
+        )
+
+        assert mgr.is_pipeline_prepared is True
+        assert mgr.is_loaded is False
+        assert mgr.model is None
+        assert mgr.tokenizer is None
+        assert mgr.active_model_id == "tiny-qwen2"
+        assert descriptor["model_type"] == "qwen2"
+        assert descriptor["model_sha256"] == "a" * 64
+        with pytest.raises(RuntimeError, match="禁止自动整模回退"):
+            mgr.ensure_full_model()
+
+    def test_abort_pipeline_materialization_preserves_descriptor(self):
+        mgr = ModelManager()
+        mgr._pipeline_descriptor = {
+            "model_id": "tiny-qwen2",
+            "model_type": "qwen2",
+            "total_layers": 4,
+        }
+        mgr._pipeline_distributed_only = True
+        mgr._engine_type = "pytorch"
+        mgr.model = _make_tiny_model()
+        mgr.tokenizer = object()
+        mgr.layer_range = (0, 2)
+        mgr._model_layers = 2
+
+        mgr.abort_pipeline_materialization()
+
+        assert mgr.model is None
+        assert mgr.tokenizer is None
+        assert mgr.layer_range is None
+        assert mgr._model_layers == 0
+        assert mgr.is_pipeline_prepared is True
+        assert mgr.get_pipeline_descriptor()["model_id"] == "tiny-qwen2"
 
     def test_two_selectively_loaded_nodes_match_full_qwen2(
         self,
@@ -885,6 +1013,54 @@ class TestLoadLayerRangeIntegration:
             atol=1e-3,
             rtol=1e-3,
         )
+
+
+class TestLayerRangeLoadTracker:
+    class _RecordingHandle:
+        def __init__(self):
+            self.requested = []
+
+        def get_tensor(self, key):
+            self.requested.append(key)
+            return torch.ones(2, dtype=torch.float32)
+
+    def _tracker(self):
+        return _LayerRangeLoadTracker(
+            architecture="qwen2",
+            start_layer=1,
+            end_layer=2,
+            layer_prefix="model.layers.",
+            selected_prefixes=["model.layers.1.", "model.norm."],
+            target_dtype=torch.float16,
+        )
+
+    def test_rejects_unassigned_key_before_tensor_materialization(self):
+        tracker = self._tracker()
+        handle = self._RecordingHandle()
+
+        with pytest.raises(RuntimeError, match="拒绝物化未分配权重"):
+            tracker.materialize(handle, "model.layers.0.self_attn.q_proj.weight")
+
+        assert handle.requested == []
+
+    def test_finish_rejects_missing_assigned_layer(self):
+        tracker = self._tracker()
+
+        with pytest.raises(RuntimeError, match="missing=\[1\]"):
+            tracker.finish()
+
+    def test_records_source_and_target_bytes_for_selected_tensor(self):
+        tracker = self._tracker()
+        handle = self._RecordingHandle()
+
+        tracker.materialize(handle, "model.layers.1.input_layernorm.weight")
+        metrics = tracker.finish()
+
+        assert handle.requested == ["model.layers.1.input_layernorm.weight"]
+        assert metrics["selected_layer_indices"] == [1]
+        assert metrics["selected_tensor_count"] == 1
+        assert metrics["source_tensor_bytes"] == 8
+        assert metrics["materialized_tensor_bytes"] == 4
 
 
 class TestOriginalQwenLayerPipeline:

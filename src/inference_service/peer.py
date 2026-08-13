@@ -187,6 +187,18 @@ class PeerClient:
             with self._layer_config_lock:
                 self._active_layer_config = None
                 self._local_pipeline_steps.clear()
+            if data.get("abort"):
+                try:
+                    from model_sync import remove_pipeline_assignment_cache
+
+                    model_id = str(data.get("model_id", "") or "")
+                    aborted_config_id = str(data.get("aborted_config_id", "") or "")
+                    if model_id and aborted_config_id:
+                        remove_pipeline_assignment_cache(
+                            model_id, aborted_config_id, node_id,
+                        )
+                except Exception:
+                    logger.warning("清理已中止的 assignment 缓存失败", exc_info=True)
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": str(data.get("config_id", "")),

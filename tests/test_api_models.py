@@ -14,6 +14,44 @@ import model_config as mc
 from model_module import ModelManager
 
 
+def test_pipeline_capacity_endpoint_returns_scheduler_plan(monkeypatch):
+    expected = {
+        "status": "admitted",
+        "admitted": True,
+        "plan_id": "plan-test",
+        "assignments": [],
+    }
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "get_pipeline_capacity_plan",
+        lambda: dict(expected),
+    )
+
+    response = TestClient(api_server.app).get("/api/cluster/pipeline-capacity")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
+def test_pipeline_assignment_file_supports_http_range(monkeypatch, tmp_path):
+    model_file = tmp_path / "model.safetensors"
+    model_file.write_bytes(b"0123456789")
+    monkeypatch.setattr(api_server, "_require_trusted_model_peer", lambda _request: None)
+    monkeypatch.setattr(api_server, "_active_pytorch_model", lambda: {
+        "model_id": "fixture",
+        "model_path": str(tmp_path),
+        "model_sha256": "a" * 64,
+        "total_layers": 1,
+    })
+    response = TestClient(api_server.app).get(
+        "/api/models/files/fixture/model.safetensors",
+        headers={"Range": "bytes=4-"},
+    )
+    assert response.status_code == 206
+    assert response.headers["content-range"] == "bytes 4-9/10"
+    assert response.content == b"456789"
+
+
 def _both_model(tmp_path, model_id="custom-both"):
     hf_dir = tmp_path / f"{model_id}-hf"
     hf_dir.mkdir()
@@ -529,6 +567,67 @@ def test_load_model_uses_switch_model_internally(monkeypatch):
     assert len(switch_calls) == 1, "应调用 switch_model 而非手动 unload/load"
     assert switch_calls[0]["model_id"] == api_server.mc.DEFAULT_MODEL_ID
     assert result["status"] == "ok"
+
+
+def test_prepare_pipeline_model_does_not_mark_full_model_loaded(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeManager:
+        is_loaded = False
+        is_pipeline_prepared = False
+
+        def prepare_pipeline_model(self, **kwargs):
+            calls.append(kwargs)
+            self.is_pipeline_prepared = True
+            return {
+                "schema_version": 1,
+                "inspection_mode": "safetensors_headers_only",
+                "model_id": kwargs["model_id"],
+                "model_type": "qwen2",
+                "total_layers": 4,
+                "weight_bytes": 1024,
+                "pipeline_runtime_supported": True,
+                "model_sha256": "c" * 64,
+            }
+
+    manager = FakeManager()
+    monkeypatch.setattr(api_server, "model_manager", manager)
+    monkeypatch.setattr(model_host, "model_loaded", True)
+    monkeypatch.setattr(api_server, "_validate_model_load_request", lambda *args: None)
+    monkeypatch.setattr(
+        api_server,
+        "_resolve_model_path_for_engine",
+        lambda model_id, engine: str(tmp_path),
+    )
+    monkeypatch.setattr(api_server, "_refresh_pipeline_layer_config", lambda: None)
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "release_pipeline_worker_for_local_model",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "refresh_task_worker_capabilities",
+        lambda: True,
+    )
+
+    result = asyncio.run(api_server.prepare_pipeline_model(
+        api_server.PreparePipelineModelRequest(
+            model_id="tiny-qwen2",
+            quant_type="fp16",
+        )
+    ))
+
+    assert result["success"] is True
+    assert result["loaded"] is False
+    assert result["pipeline_prepared"] is True
+    assert result["descriptor"]["model_type"] == "qwen2"
+    assert model_host.model_loaded is False
+    assert calls == [{
+        "model_id": "tiny-qwen2",
+        "model_path": str(tmp_path),
+        "quant_type": "fp16",
+    }]
 
 
 def test_load_model_reports_effective_cpu_quant(monkeypatch):

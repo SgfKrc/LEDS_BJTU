@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -246,3 +248,289 @@ def ensure_model_available(
             f"local={actual_sha256[:16]}..., master={expected[:16]}..."
         )
     return str(destination_root)
+
+
+def _assignment_destination_root(model_id: str, config_id: str, node_id: str) -> Path:
+    """Use a generation-scoped cache so partial assignments never replace a model."""
+    base = Path(resolve_worker_model_path(model_id))
+    safe_config = re.sub(r"[^A-Za-z0-9._-]", "_", str(config_id or "")) or "config"
+    safe_node = re.sub(r"[^A-Za-z0-9._-]", "_", str(node_id or "")) or "node"
+    return base / ".pipeline_assignments" / f"{safe_config}-{safe_node}"
+
+
+def assignment_cache_root(model_id: str) -> Path:
+    """Return the model-scoped assignment cache without creating it."""
+    return Path(resolve_worker_model_path(model_id)) / ".pipeline_assignments"
+
+
+def _assignment_cache_limits() -> tuple[int, int, float]:
+    try:
+        import config
+
+        max_bytes = int(float(config.PIPELINE_ASSIGNMENT_CACHE_MAX_MB) * 1024 * 1024)
+        min_free = int(float(config.PIPELINE_ASSIGNMENT_MIN_FREE_MB) * 1024 * 1024)
+        stale_seconds = float(config.PIPELINE_ASSIGNMENT_STALE_SECONDS)
+    except (AttributeError, TypeError, ValueError):
+        max_bytes, min_free, stale_seconds = 4 * 1024**3, 512 * 1024**2, 86400.0
+    return max(0, max_bytes), max(0, min_free), max(60.0, stale_seconds)
+
+
+def _assignment_dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            if item.is_file():
+                total += item.stat().st_size
+    except OSError:
+        return total
+    return total
+
+
+def _assignment_dir_config_id(path: Path) -> str:
+    marker = path / "assignment.manifest.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        return str(payload.get("config_id", "") or "")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+
+
+def remove_pipeline_assignment_cache(
+    model_id: str,
+    config_id: str,
+    node_id: str = "",
+) -> bool:
+    """Remove exactly one assignment generation after an abort/release."""
+    root = assignment_cache_root(model_id)
+    if not root.is_dir():
+        return False
+    removed = False
+    for child in list(root.iterdir()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        marker_config = _assignment_dir_config_id(child)
+        marker_node = ""
+        try:
+            marker_node = str(json.loads(
+                (child / "assignment.manifest.json").read_text(encoding="utf-8")
+            ).get("node_id", "") or "")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        if marker_config != str(config_id) or (node_id and marker_node != str(node_id)):
+            continue
+        try:
+            shutil.rmtree(child)
+            removed = True
+        except OSError:
+            pass
+    return removed
+
+
+def reconcile_pipeline_assignment_cache(
+    model_id: str,
+    *,
+    active_config_ids: set[str] | None = None,
+    active_assignment_dirs: set[str] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Remove abandoned partials and old generations inside the cache root.
+
+    Only directories created by assignment sync are touched.  Active config
+    IDs are protected even when their mtime is old because a long load may be
+    legitimately in progress.
+    """
+    root = assignment_cache_root(model_id)
+    active = {str(value) for value in (active_config_ids or set()) if value}
+    active_dirs = {
+        str(value) for value in (active_assignment_dirs or set()) if value
+    }
+    current_time = time.time() if now is None else float(now)
+    _max_bytes, _min_free, stale_seconds = _assignment_cache_limits()
+    result = {
+        "model_id": model_id,
+        "root": str(root),
+        "removed": [],
+        "protected": [],
+        "bytes_before": 0,
+        "bytes_after": 0,
+        "status": "ok",
+    }
+    if not root.is_dir():
+        return result
+    entries: list[tuple[Path, int, float, str]] = []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        result["status"] = "unavailable"
+        return result
+    for child in children:
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        size = _assignment_dir_size(child)
+        try:
+            mtime = child.stat().st_mtime
+        except OSError:
+            mtime = current_time
+        result["bytes_before"] += size
+        config_id = _assignment_dir_config_id(child)
+        if not config_id:
+            # A directory without a valid marker is an incomplete generation;
+            # it is never considered active and can be reclaimed by policy.
+            config_id = ""
+        if config_id in active or child.name in active_dirs:
+            result["protected"].append(child.name)
+            entries.append((child, size, mtime, config_id))
+            continue
+        stale = current_time - mtime >= stale_seconds
+        has_part = any(item.is_file() and item.name.endswith(".part") for item in child.rglob("*"))
+        if stale or has_part:
+            try:
+                shutil.rmtree(child)
+                result["removed"].append(child.name)
+                continue
+            except OSError:
+                result["status"] = "partial"
+        entries.append((child, size, mtime, config_id))
+
+    result["bytes_after"] = sum(_assignment_dir_size(item[0]) for item in entries)
+    max_bytes, _min_free, _stale = _assignment_cache_limits()
+    if max_bytes > 0 and result["bytes_after"] > max_bytes:
+        for child, size, _mtime, config_id in sorted(entries, key=lambda item: item[2]):
+            if config_id in active or child.name in active_dirs:
+                continue
+            try:
+                shutil.rmtree(child)
+            except OSError:
+                result["status"] = "partial"
+                continue
+            result["removed"].append(child.name)
+            result["bytes_after"] -= size
+            if result["bytes_after"] <= max_bytes:
+                break
+    return result
+
+
+def _ensure_assignment_disk_budget(destination_root: Path, expected_bytes: int) -> None:
+    max_bytes, min_free_bytes, _stale = _assignment_cache_limits()
+    try:
+        free_bytes = shutil.disk_usage(destination_root.parent).free
+    except OSError as exc:
+        raise RuntimeError("assignment disk capacity is unavailable") from exc
+    if free_bytes < expected_bytes + min_free_bytes:
+        raise RuntimeError(
+            f"assignment disk capacity insufficient: required={expected_bytes}, "
+            f"free={free_bytes}, reserve={min_free_bytes}"
+        )
+    root = destination_root.parent
+    existing = _assignment_dir_size(root) if root.is_dir() else 0
+    current = _assignment_dir_size(destination_root) if destination_root.is_dir() else 0
+    projected = max(0, existing - current) + expected_bytes
+    if max_bytes > 0 and projected > max_bytes:
+        raise RuntimeError(
+            f"assignment cache budget exceeded: current={existing - current}, "
+            f"incoming={expected_bytes}, limit={max_bytes}"
+        )
+
+
+def ensure_pipeline_assignment_available(
+    master_host: str,
+    master_api_port: int,
+    assignment: dict[str, Any],
+    *,
+    timeout: float = 10.0,
+) -> tuple[str, dict[str, Any]]:
+    """Fetch and verify one assignment manifest without mirroring the model."""
+    model_id = str(assignment.get("model_id", "") or "")
+    config_id = str(assignment.get("config_id", "") or "")
+    plan_id = str(assignment.get("plan_id", "") or "")
+    node_id = str(assignment.get("node_id", "") or "")
+    if not model_id or not config_id or not plan_id or not node_id:
+        raise RuntimeError("pipeline assignment identity is incomplete")
+    encoded_model_id = urllib.parse.quote(model_id, safe="")
+    query = urllib.parse.urlencode({
+        "config_id": config_id,
+        "plan_id": plan_id,
+        "node_id": node_id,
+        "start_layer": int(assignment.get("start_layer", 0)),
+        "end_layer": int(assignment.get("end_layer", 0)),
+        "total_layers": int(assignment.get("total_layers", 0)),
+        "has_embedding": int(bool(assignment.get("has_embedding", False))),
+        "has_lm_head": int(bool(assignment.get("has_lm_head", False))),
+    })
+    from network_address import build_url
+
+    base_url = build_url("http", master_host, int(master_api_port))
+    manifest = _read_json(
+        f"{base_url}/api/models/pipeline-assignment/{encoded_model_id}?{query}",
+        timeout,
+    )
+    expected_revision = str(assignment.get("model_sha256", "") or "")
+    if manifest.get("model_sha256") != expected_revision:
+        raise RuntimeError("pipeline assignment model revision changed")
+    if manifest.get("config_id") != config_id or manifest.get("plan_id") != plan_id:
+        raise RuntimeError("pipeline assignment transaction identity changed")
+    manifest_sha = str(manifest.get("manifest_sha256", "") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha):
+        raise RuntimeError("pipeline assignment manifest digest is invalid")
+    check = dict(manifest)
+    check.pop("manifest_sha256", None)
+    if hashlib.sha256(
+        json.dumps(check, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest() != manifest_sha:
+        raise RuntimeError("pipeline assignment manifest digest mismatch")
+
+    destination_root = _assignment_destination_root(model_id, config_id, node_id)
+    destination_root.mkdir(parents=True, exist_ok=True)
+    files = manifest.get("files") or []
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("pipeline assignment manifest contains no files")
+    expected_manifest_bytes = sum(
+        int(entry.get("size_bytes", 0) or 0)
+        for entry in files if isinstance(entry, dict)
+    )
+    reconcile_pipeline_assignment_cache(
+        model_id,
+        active_config_ids={config_id},
+        active_assignment_dirs={destination_root.name},
+    )
+    _ensure_assignment_disk_budget(destination_root, expected_manifest_bytes)
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise RuntimeError("pipeline assignment file entry is invalid")
+        relative_path = str(entry.get("path", ""))
+        expected_size = int(entry.get("size_bytes", -1))
+        expected_sha = str(entry.get("sha256", ""))
+        destination = _safe_destination(destination_root, relative_path)
+        if relative_path == "model.safetensors.index.json" and entry.get("filtered_weight_map"):
+            filtered = {
+                "metadata": {"total_size": 0},
+                "weight_map": dict(entry["filtered_weight_map"]),
+            }
+            encoded = json.dumps(filtered, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if len(encoded) != expected_size or hashlib.sha256(encoded).hexdigest() != expected_sha:
+                raise RuntimeError("filtered assignment index size or SHA mismatch")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(encoded)
+            continue
+        if entry.get("kind") == "weights" and entry.get("keys"):
+            expected_key_digest = hashlib.sha256(
+                "\n".join(sorted(str(key) for key in entry["keys"])).encode("utf-8")
+            ).hexdigest()
+            if expected_key_digest != str(entry.get("key_set_sha256", "")):
+                raise RuntimeError(f"pipeline assignment key-set digest mismatch: {relative_path}")
+        valid = destination.is_file() and destination.stat().st_size == expected_size
+        if valid and expected_sha:
+            valid = _file_sha256(destination) == expected_sha
+        if not valid:
+            encoded_path = urllib.parse.quote(relative_path.replace("\\", "/"), safe="/")
+            _download_file(
+                f"{base_url}/api/models/files/{encoded_model_id}/{encoded_path}",
+                destination,
+                expected_size,
+            )
+            if expected_sha and _file_sha256(destination) != expected_sha:
+                raise RuntimeError(f"pipeline assignment SHA256 mismatch: {relative_path}")
+
+    marker = destination_root / "assignment.manifest.json"
+    marker.write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+    return str(destination_root), manifest

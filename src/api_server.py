@@ -949,6 +949,14 @@ class LoadModelRequest(BaseModel):
     )
 
 
+class PreparePipelineModelRequest(BaseModel):
+    model_id: str = Field(..., min_length=1, max_length=128)
+    quant_type: str = Field(
+        default="fp16",
+        description="层段运行精度请求；第一期执行器仍以实际设备 dtype 为准",
+    )
+
+
 class DiffusionArtifactInspectRequest(BaseModel):
     path: str = Field(..., min_length=1, max_length=2048)
     compute_hash: bool = Field(default=False)
@@ -1324,14 +1332,39 @@ def _diffusion_edit_request(req: DiffusionEditRequest) -> SD15EditRequest:
     )
 
 
+def _peek_model_manager():
+    """Return an existing manager instance without warming a lazy proxy."""
+    manager = model_manager
+    if manager is model_host:
+        peek = getattr(model_host, "peek_manager", None)
+        return peek() if callable(peek) else None
+    if type(manager).__name__ == "_LazyModelManager":
+        try:
+            return object.__getattribute__(manager, "_instance")
+        except AttributeError:
+            return None
+    return manager
+
+
 def _local_llm_is_loaded() -> bool:
     """Inspect LLM ownership without materializing the lazy manager."""
 
     checker = getattr(model_host, "has_loaded_model", None)
     if model_manager is model_host and callable(checker):
-        return bool(checker())
+        if bool(checker()):
+            return True
+        manager = _peek_model_manager()
+        return bool(
+            manager is not None
+            and getattr(manager, "is_pipeline_prepared", False)
+        )
+    manager = _peek_model_manager()
     return bool(model_host.model_loaded) or bool(
-        getattr(model_manager, "is_loaded", False)
+        manager is not None
+        and (
+            getattr(manager, "is_loaded", False)
+            or getattr(manager, "is_pipeline_prepared", False)
+        )
     )
 
 def _build_chat_prompt(messages: list[dict], system_prompt: Optional[str] = None,
@@ -3058,6 +3091,16 @@ async def get_status():
             active_info = model_manager.get_model_info()
         except Exception:
             active_info = {}
+    pipeline_prepared = _pipeline_model_is_prepared()
+    pipeline_descriptor = {}
+    if pipeline_prepared:
+        try:
+            from pipeline_model_descriptor import public_pipeline_descriptor
+            pipeline_descriptor = public_pipeline_descriptor(
+                model_manager.get_pipeline_descriptor()
+            )
+        except Exception:
+            logger.debug("读取流水线准备状态失败", exc_info=True)
 
     # ---- TP 孤岛状态（启用时上报，端点已脱敏）----
     import config as _cfg
@@ -3118,6 +3161,8 @@ async def get_status():
 
     return {
         "model_loaded": model_host.model_loaded,
+        "pipeline_prepared": pipeline_prepared,
+        "pipeline_descriptor": pipeline_descriptor,
         "current_quant": model_host.current_quant,
         "use_compile": USE_COMPILE if model_host.model_loaded else False,
         "model_name": active_info.get("model_name", MODEL_NAME),
@@ -3143,7 +3188,24 @@ async def get_status():
 async def get_current_model():
     """当前模型信息"""
     if not model_host.model_loaded:
-        return {"loaded": False, "quant_type": None, "model_id": None}
+        if _pipeline_model_is_prepared():
+            from pipeline_model_descriptor import public_pipeline_descriptor
+            descriptor = public_pipeline_descriptor(
+                model_manager.get_pipeline_descriptor()
+            )
+            return {
+                "loaded": False,
+                "pipeline_prepared": True,
+                "quant_type": model_host.current_quant,
+                "model_id": descriptor.get("model_id"),
+                "descriptor": descriptor,
+            }
+        return {
+            "loaded": False,
+            "pipeline_prepared": False,
+            "quant_type": None,
+            "model_id": None,
+        }
 
     info = model_manager.get_model_info()
     mem = model_manager.get_memory_usage()
@@ -3300,6 +3362,59 @@ async def load_model(req: LoadModelRequest):
         model_host.model_loaded = False
         logger.error(f"模型加载失败: {e}", exc_info=True)
         raise HTTPException(500, f"模型加载失败: {str(e)}")
+
+
+@app.post("/api/models/prepare-pipeline")
+async def prepare_pipeline_model(req: PreparePipelineModelRequest):
+    """Prepare a Qwen/Qwen2 artifact for distributed layer loading only.
+
+    This endpoint deliberately does not set ``model_loaded`` and does not
+    instantiate a Transformers model. The first local weight materialization
+    happens only when the scheduler's master assignment is executed.
+    """
+    _validate_model_load_request(req.model_id, "pytorch")
+    resolved_model_path = _resolve_model_path_for_engine(req.model_id, "pytorch")
+    if not resolved_model_path:
+        raise coded_http_error(
+            400,
+            "PIPELINE_MODEL_PATH_UNRESOLVED",
+            f"模型 '{req.model_id}' 的 Safetensors 路径不可用",
+        )
+    quant = _normalize_quant_for_engine(req.quant_type, "pytorch")
+
+    def _prepare() -> dict:
+        _reset_runtime_conversation_state(clear_histories=True)
+        return model_manager.prepare_pipeline_model(
+            model_id=req.model_id,
+            model_path=resolved_model_path,
+            quant_type=quant,
+        )
+
+    try:
+        result = await run_in_threadpool(
+            lambda: _run_exclusive_model_change(
+                _prepare,
+                release_worker_reservation=True,
+            )
+        )
+        model_host.model_loaded = False
+        model_host.current_quant = quant
+        try:
+            scheduler.refresh_task_worker_capabilities()
+        except Exception:
+            logger.debug("准备流水线模型后刷新 Worker 能力失败", exc_info=True)
+        from pipeline_model_descriptor import public_pipeline_descriptor
+        return {
+            "success": True,
+            "loaded": False,
+            "pipeline_prepared": True,
+            "descriptor": public_pipeline_descriptor(result),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("准备流水线模型失败: %s", exc, exc_info=True)
+        raise HTTPException(400, f"准备流水线模型失败: {exc}") from exc
 
 
 def _chat_origin(req: ChatRequest) -> str:
@@ -5440,6 +5555,15 @@ def _pipeline_worker_is_reserved() -> bool:
     return bool(callable(check) and check())
 
 
+def _pipeline_model_is_prepared() -> bool:
+    """Return whether the master owns metadata for a distributed-only model."""
+    manager = _peek_model_manager()
+    return bool(
+        manager is not None
+        and getattr(manager, "is_pipeline_prepared", False)
+    )
+
+
 def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
     """Load a local model only when this request cannot be master-forwarded."""
     if req is not None and _external_route_decision(req).use_external:
@@ -5457,7 +5581,16 @@ def _ensure_chat_model_or_forwarding(req: Optional[ChatRequest] = None) -> None:
             503,
             "本设备正作为 PyTorch 分层从节点，不能加载本地完整模型。",
         )
-    if model_host.model_loaded and model_manager.is_loaded:
+    if _pipeline_model_is_prepared():
+        if req is not None and req.routing_preference == "local_only":
+            raise HTTPException(
+                409,
+                "当前模型仅以分布式流水线模式准备；local_only 请求需要先显式加载完整模型。",
+            )
+        return
+    if (
+        model_host.model_loaded and model_manager.is_loaded
+    ):
         return
     _auto_load_default_model()
 
@@ -5796,7 +5929,10 @@ async def chat_stream(req: ChatRequest, request: Request):
                         "请连接主节点"
                     )
                 else:
-                    if not model_host.model_loaded or not model_manager.is_loaded:
+                    if (
+                        (not model_host.model_loaded or not model_manager.is_loaded)
+                        and not _pipeline_model_is_prepared()
+                    ):
                         try:
                             await _run_with_request_id(loop, _auto_load_default_model)
                         except Exception as exc:
@@ -5995,7 +6131,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                 )
                 return
             if req.prefer_external and not (
-                model_host.model_loaded and model_manager.is_loaded
+                (model_host.model_loaded and model_manager.is_loaded)
+                or _pipeline_model_is_prepared()
             ):
                 yield _error_event(
                     f"外部推理服务调用失败，且本地无可用推理引擎：{external_error}"
@@ -6054,7 +6191,10 @@ async def chat_stream(req: ChatRequest, request: Request):
             )
             return
 
-        if not model_host.model_loaded or not model_manager.is_loaded:
+        if (
+            (not model_host.model_loaded or not model_manager.is_loaded)
+            and not _pipeline_model_is_prepared()
+        ):
             loop = _asyncio.get_running_loop()
             try:
                 await _run_with_request_id(loop, _auto_load_default_model)
@@ -7622,6 +7762,16 @@ async def get_layer_assignments():
     return scheduler.get_layer_assignments()
 
 
+@app.get("/api/cluster/pipeline-capacity")
+async def get_pipeline_capacity_plan():
+    """Return the metadata-only, all-or-nothing pipeline capacity plan.
+
+    The response is a read-only admission/transaction projection. It never
+    downloads or materializes model weights.
+    """
+    return scheduler.get_pipeline_capacity_plan()
+
+
 class LayerOverrideItem(BaseModel):
     node_id: str = Field(..., description="节点标识")
     start_layer: int = Field(..., ge=0, description="起始层（含）")
@@ -8443,7 +8593,7 @@ def _require_trusted_model_peer(request: Request) -> None:
 def _active_pytorch_model() -> dict:
     info = scheduler._get_active_pipeline_model_info()
     if not info:
-        raise HTTPException(409, "主节点当前未加载可分层的 PyTorch 模型")
+        raise HTTPException(409, "主节点当前未加载或准备可分层的 PyTorch 模型")
     return info
 
 
@@ -8515,11 +8665,113 @@ async def download_pytorch_model_file(
         raise HTTPException(404, "模型文件不存在")
     if os.path.basename(path) in {"model.sha256", "model.sha256.meta.json"} or path.endswith(".part"):
         raise HTTPException(404, "模型文件不存在")
-    return FileResponse(
-        path,
-        media_type="application/octet-stream",
-        filename=os.path.basename(path),
+    file_size = os.path.getsize(path)
+    range_header = request.headers.get("range", "").strip()
+    start, end, status_code = 0, file_size - 1, 200
+    if range_header:
+        if not range_header.lower().startswith("bytes=") or "," in range_header:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+        value = range_header[6:].strip()
+        try:
+            raw_start, raw_end = value.split("-", 1)
+            if raw_start:
+                start = int(raw_start)
+                end = int(raw_end) if raw_end else file_size - 1
+            else:
+                suffix = int(raw_end)
+                if suffix <= 0:
+                    raise ValueError
+                start = max(0, file_size - suffix)
+                end = file_size - 1
+            if start < 0 or start >= file_size or end < start:
+                raise ValueError
+            end = min(end, file_size - 1)
+            status_code = 206
+        except (TypeError, ValueError):
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    length = end - start + 1
+
+    def _iter_file():
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(length),
+        "Content-Disposition": f'attachment; filename="{os.path.basename(path)}"',
+    }
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    return StreamingResponse(
+        _iter_file(), media_type="application/octet-stream",
+        status_code=status_code, headers=headers,
     )
+
+
+@app.get("/api/models/pipeline-assignment/{model_id}")
+async def downloadable_pipeline_assignment(
+    request: Request,
+    model_id: str,
+    config_id: str = "",
+    plan_id: str = "",
+    node_id: str = "",
+    start_layer: int = 0,
+    end_layer: int = 0,
+    total_layers: int = 0,
+    has_embedding: int = 0,
+    has_lm_head: int = 0,
+):
+    """Return a filtered, generation-bound assignment manifest."""
+    _require_trusted_model_peer(request)
+    info = _active_pytorch_model()
+    if model_id != info["model_id"]:
+        raise HTTPException(409, "请求模型已不是主节点当前流水线模型")
+    with scheduler._layer_config_lock:
+        transaction = scheduler._pipeline_load_transaction
+        transaction_plan = dict(transaction.get("plan", {})) if transaction else {}
+        transaction_config_id = str(transaction.get("config_id", "")) if transaction else ""
+        transaction_phase = str(transaction.get("phase", "")) if transaction else ""
+    if (
+        not transaction
+        or transaction_phase != "preparing"
+        or transaction_config_id != config_id
+        or str(transaction_plan.get("plan_id", "")) != plan_id
+    ):
+        raise HTTPException(409, "pipeline assignment is no longer an active prepare generation")
+    matching = [
+        item for item in transaction_plan.get("assignments", [])
+        if str(item.get("node_id", "")) == node_id
+        and int(item.get("start_layer", -1)) == int(start_layer)
+        and int(item.get("end_layer", -1)) == int(end_layer)
+    ]
+    if not matching:
+        raise HTTPException(409, "pipeline assignment does not match the active plan")
+    expected = matching[0]
+    if bool(expected.get("has_embedding", False)) != bool(has_embedding) or bool(
+        expected.get("has_lm_head", False)
+    ) != bool(has_lm_head):
+        raise HTTPException(409, "pipeline assignment component contract changed")
+    from pipeline_assignment_manifest import build_assignment_manifest
+
+    try:
+        manifest = build_assignment_manifest(
+            info["model_path"], model_id=info["model_id"],
+            model_sha256=info["model_sha256"], config_id=config_id,
+            plan_id=plan_id, node_id=node_id, start_layer=start_layer,
+            end_layer=end_layer, total_layers=total_layers,
+            has_embedding=bool(has_embedding), has_lm_head=bool(has_lm_head),
+        )
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return manifest
 
 
 @app.get("/api/models/gguf")
