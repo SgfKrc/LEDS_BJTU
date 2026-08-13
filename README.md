@@ -157,6 +157,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   └── gradlew / gradlew.bat      # Gradle Wrapper（无需 Android Studio）
 ├── .venv-packaging/               # 集显版打包专用 venv（torch CPU + PyInstaller）
 ├── .venv-packaging-cuda/          # 独显版打包专用 venv（torch CUDA + PyInstaller）
+├── .venv-test/                    # 隔离测试环境（setup_test_env.py 创建；全量测试专用，勿装系统 Python）
 ├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
 │   ├── launcher.py                # 主应用启动载荷（Tailscale → 模型检查 → 引擎选择 → 启动）
 │   ├── qlh_launcher.py            # ★ 独立 Bootstrap（GUI/TUI/更新，不导入推理依赖）
@@ -185,7 +186,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-13 全量回归 2085 passed / 8 skipped）
+├── tests/                         # 单元测试（2026-08-14 全量：2196 passed / 6 skipped，.venv-test 固定 4 worker）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
