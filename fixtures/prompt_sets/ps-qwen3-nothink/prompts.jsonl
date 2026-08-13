@@ -1,0 +1,30 @@
+{"id": "zh-001", "prompt": "<|im_start|>user\n请用中文详细介绍一下北京交通大学的办学特色和优势专业。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "zh-002", "prompt": "<|im_start|>user\n解释什么是分布式系统，并举两个现实中的例子说明其优缺点。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "zh-003", "prompt": "<|im_start|>user\n写一段话向小学生解释大语言模型是如何工作的。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "zh-004", "prompt": "<|im_start|>user\n简述 TCP 三次握手的过程，并说明为什么需要第三次握手。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "zh-005", "prompt": "<|im_start|>user\n介绍机器学习的三种主要类型，并各举一个应用场景。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "en-001", "prompt": "<|im_start|>user\nExplain the difference between TCP and UDP in one short paragraph.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "en-002", "prompt": "<|im_start|>user\nSummarize the key ideas of the paper 'Attention Is All You Need' in two sentences.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "en-003", "prompt": "<|im_start|>user\nWhat are the main advantages of edge computing over cloud computing?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "en-004", "prompt": "<|im_start|>user\nWrite a short definition of a hash function and name one practical use.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "en-005", "prompt": "<|im_start|>user\nDescribe the concept of a vector database and when you would use it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "code-001", "prompt": "<|im_start|>user\nWrite a Python function that checks whether a string is a valid IPv4 address. Return True or False.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "code-002", "prompt": "<|im_start|>user\nImplement a function in Python that merges two sorted lists into one sorted list without using the built-in sort.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "code-003", "prompt": "<|im_start|>user\nWrite a Python function to find the longest common prefix of a list of strings.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "code-004", "prompt": "<|im_start|>user\nFix the bug in this code: it should return the sum of even numbers in a list but returns 0 for empty input.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "code-005", "prompt": "<|im_start|>user\nWrite a SQL query that returns the top 5 customers by total order amount from two tables.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "math-001", "prompt": "<|im_start|>user\nA train leaves Beijing at 8:00 traveling at 120 km/h. Another leaves Shanghai at 9:00 traveling at 100 km/h toward it. Distance is 1200 km. When do they meet?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "math-002", "prompt": "<|im_start|>user\nIf 3 machines can produce 60 widgets in 5 hours, how many widgets can 5 machines produce in 8 hours?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "math-003", "prompt": "<|im_start|>user\nProve that the sum of the first n odd numbers equals n squared.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "math-004", "prompt": "<|im_start|>user\nThere are 12 coins, one is counterfeit and lighter. Using a balance scale, how many weighings are needed in the worst case? Explain.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "math-005", "prompt": "<|im_start|>user\nSolve for x: 2^(x+1) = 8^x. Show your reasoning step by step.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "long-001", "prompt": "<|im_start|>user\n请对以下长篇文档进行总结，输出三个要点并各用一句话解释。文档内容：多段技术说明文字（此处由 runner 注入固定长文）。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "long-002", "prompt": "<|im_start|>user\n阅读下面这段 2000 字左右的文章，找出其中提到的所有技术名词，并用列表形式输出。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "long-003", "prompt": "<|im_start|>user\n从以下会议纪要中提取行动项、负责人和截止日期，按表格输出。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "long-004", "prompt": "<|im_start|>user\n请把下面这段约 1500 字的英文技术文档翻译成中文，保持术语准确。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "long-005", "prompt": "<|im_start|>user\n针对以下长文档的第三节内容，回答：作者提出的三个论点分别是什么？<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "fmt-001", "prompt": "<|im_start|>user\n输出一个 JSON 对象，包含 name、age、tags 三个字段，其中 tags 是字符串数组，不要输出其他内容。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "fmt-002", "prompt": "<|im_start|>user\n用 Markdown 表格列出 2026 年 1 月到 6 月的月份名称和每个月的天数。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "fmt-003", "prompt": "<|im_start|>user\n输出一个 Python 字典字面量，键为 a、b、c，值分别为 1、2、3，只输出代码。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "fmt-004", "prompt": "<|im_start|>user\n生成一个包含三个步骤的 numbered list，每步一句话，步骤之间不要有空行。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}
+{"id": "fmt-005", "prompt": "<|im_start|>user\n输出 CSV 格式的三行数据，表头为 id,name,score，值自拟，不要输出额外文字。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"}

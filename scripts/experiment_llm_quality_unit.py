@@ -69,6 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-threads", type=int, default=0)
     parser.add_argument("--n-gpu-layers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260812)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=["chatml", "raw"],
+        default="chatml",
+        help="chatml: legacy chat-format wrapper; raw: feed pre-rendered prompts "
+        "verbatim (Qwen3 non-thinking renders produced by the isolated sidecar)",
+    )
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=40)
+    parser.add_argument("--min-p", type=float, default=0.0)
     return parser
 
 
@@ -117,30 +128,48 @@ def main(argv: list[str] | None = None) -> int:
             "n_gpu_layers": args.n_gpu_layers,
             "seed": args.seed,
             "verbose": False,
-            "chat_format": "chatml",
         }
+        if args.prompt_mode == "chatml":
+            load_kwargs["chat_format"] = "chatml"
         if args.n_threads > 0:
             load_kwargs["n_threads"] = args.n_threads
         model = Llama(**load_kwargs)
+        sample_kwargs = {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+        }
         for entry in rubric.entries:
             prompt_id = str(entry["prompt_id"])
-            response = model.create_chat_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Follow the requested output format exactly. Do not add explanations unless requested.",
-                    },
-                    {"role": "user", "content": prompts[prompt_id]},
-                ],
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=args.max_new_tokens,
-                stream=False,
-            )
-            choices = response.get("choices", []) if isinstance(response, dict) else []
-            choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-            message = choice.get("message") if isinstance(choice, dict) else None
-            content = message.get("content") if isinstance(message, dict) else None
+            if args.prompt_mode == "raw":
+                # Pre-rendered (e.g. Qwen3 enable_thinking=False) prompt: feed verbatim.
+                response = model.create_completion(
+                    prompts[prompt_id],
+                    max_tokens=args.max_new_tokens,
+                    stream=False,
+                    **sample_kwargs,
+                )
+                choices = response.get("choices", []) if isinstance(response, dict) else []
+                choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                content = choice.get("text")
+            else:
+                response = model.create_chat_completion(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Follow the requested output format exactly. Do not add explanations unless requested.",
+                        },
+                        {"role": "user", "content": prompts[prompt_id]},
+                    ],
+                    max_tokens=args.max_new_tokens,
+                    stream=False,
+                    **sample_kwargs,
+                )
+                choices = response.get("choices", []) if isinstance(response, dict) else []
+                choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                message = choice.get("message") if isinstance(choice, dict) else None
+                content = message.get("content") if isinstance(message, dict) else None
             outputs[prompt_id] = content if isinstance(content, str) else None
             if choice.get("finish_reason") == "length":
                 truncated.add(prompt_id)
