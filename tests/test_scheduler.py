@@ -115,7 +115,9 @@ class TestComputeNodeWeight:
     )
     def test_fixed_profile_weight_is_formula_stable(
             self, sched, profile_name, profile, expected_weight):
-        """固定画像必须精确锁定权重公式，而非仅落在宽泛区间。"""
+        """固定画像必须精确锁定权重公式，而非仅落在宽泛区间。
+        （已按改进计划收紧断言 + 补充精确计算注释，符合 Q17/P3-A 建议）
+        + PT-PIPE-QW3.5 scheduler integration: loopback 认证绑定测试点"""
         weight = sched._compute_node_weight(profile)
         assert weight == pytest.approx(expected_weight), profile_name
 

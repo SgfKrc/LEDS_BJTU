@@ -31,6 +31,17 @@ if TYPE_CHECKING:
 from model_host import get_model_host
 from network_path import build_client_network_path_view
 from pipeline_capacity import PipelineCapacityError, solve_pipeline_capacity
+from qwen3_pipeline_transaction import (
+    Qwen3PipelineDryRunTransaction,
+    Qwen3PipelineProtocolError,
+)
+from qwen3_pipeline_loopback import (
+    Qwen3LoopbackError,
+    Qwen3PipelineLoopbackWorker,
+    sign_loopback_message,
+    validate_loopback_base_url,
+    verify_loopback_message,
+)
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -1066,6 +1077,13 @@ class Scheduler:
         self._pipeline_worker_opted_out = False
         self._pipeline_worker_opt_out: set[str] = set()
         self._pipeline_load_transaction: Optional[dict] = None
+        # Qwen3 remains outside production runtime admission.  This isolated
+        # state machine exercises the C2 lifecycle without network dispatch,
+        # weight materialization, or full-model fallback.
+        self._qwen3_pipeline_dry_run: Optional[Qwen3PipelineDryRunTransaction] = None
+        self._qwen3_loopback_base_url = ""
+        self._qwen3_loopback_workers: dict[str, Qwen3PipelineLoopbackWorker] = {}
+        self._qwen3_loopback_ack_nonces: dict[str, str] = {}
         self._active_pipeline_capacity_plan: Optional[dict] = None
         self._prepared_layer_configs: dict[str, dict] = {}
         # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
@@ -3470,6 +3488,404 @@ class Scheduler:
             config_id, reason_code, reason,
         )
 
+    def begin_qwen3_pipeline_dry_run(
+        self, contract: dict, *, timeout_seconds: float = 30.0,
+    ) -> dict:
+        """Register a Qwen3 prepare transaction without sending or loading.
+
+        This is intentionally separate from ``_pipeline_load_transaction``:
+        production Qwen3 scheduling remains fail-closed until loopback and
+        real multi-node gates are completed.
+        """
+        transaction = Qwen3PipelineDryRunTransaction(
+            contract, timeout_seconds=timeout_seconds,
+        )
+        with self._layer_config_lock:
+            active = self._qwen3_pipeline_dry_run
+            if active and active.phase in {"preparing", "committing"}:
+                raise Qwen3PipelineProtocolError(
+                    "another Qwen3 pipeline dry-run is active"
+                )
+            self._qwen3_pipeline_dry_run = transaction
+        return {
+            "transaction": transaction.snapshot(),
+            "outbound": transaction.prepare_messages(),
+        }
+
+    @staticmethod
+    def _qwen3_cluster_secret() -> str:
+        from tcp_comm import _get_cluster_secret
+
+        return str(_get_cluster_secret() or "")
+
+    def _dispatch_qwen3_loopback_messages(
+        self, messages: list[dict], *, best_effort: bool = False,
+    ) -> list[dict]:
+        server = self._tcp_server
+        secret = self._qwen3_cluster_secret()
+        if not server or not getattr(server, "_running", False) or not secret:
+            if best_effort:
+                return []
+            raise Qwen3LoopbackError(
+                "qwen3_loopback_auth_unavailable",
+                "authenticated TCP server or cluster secret is unavailable",
+            )
+        dispatched = []
+        for message in messages:
+            node_id = str(message.get("node_id", "") or "")
+            if not server.is_authenticated_loopback_client(node_id):
+                if best_effort:
+                    logger.info(
+                        "Qwen3 loopback 清理等待节点重连: node=%s", node_id,
+                    )
+                    continue
+                raise Qwen3LoopbackError(
+                    "qwen3_loopback_peer_rejected",
+                    f"worker {node_id} is not an authenticated loopback peer",
+                )
+        for message in messages:
+            node_id = str(message["node_id"])
+            if not server.is_authenticated_loopback_client(node_id):
+                continue
+            outbound = dict(message)
+            outbound["assignment_base_url"] = self._qwen3_loopback_base_url
+            signed = sign_loopback_message(
+                outbound, peer_node_id=node_id, secret=secret,
+            )
+            try:
+                server.send_qwen3_pipeline_dry_run(node_id, signed)
+            except (ConnectionError, OSError):
+                if best_effort:
+                    logger.info(
+                        "Qwen3 loopback 消息等待节点重连: node=%s phase=%s",
+                        node_id, message.get("phase", ""),
+                    )
+                    continue
+                raise
+            dispatched.append(signed)
+        return dispatched
+
+    def begin_qwen3_pipeline_loopback(
+        self,
+        contract: dict,
+        *,
+        assignment_base_url: str,
+        timeout_seconds: float = 30.0,
+    ) -> dict:
+        """Dispatch one authenticated, header-only loopback dry-run."""
+        base_url = validate_loopback_base_url(assignment_base_url)
+        transaction = Qwen3PipelineDryRunTransaction(
+            contract,
+            timeout_seconds=timeout_seconds,
+            network_dispatch=True,
+        )
+        if any(
+            "assignment_probe" not in segment
+            for segment in transaction.contract["segments"]
+        ):
+            raise Qwen3LoopbackError(
+                "qwen3_range_contract_invalid",
+                "every loopback segment requires an assignment probe",
+            )
+        with self._layer_config_lock:
+            active = self._qwen3_pipeline_dry_run
+            if active and active.phase in {
+                "preparing", "committing", "ready", "releasing",
+            }:
+                raise Qwen3PipelineProtocolError(
+                    "another Qwen3 pipeline dry-run is active"
+                )
+            self._qwen3_loopback_base_url = base_url
+            self._qwen3_loopback_ack_nonces.clear()
+            self._qwen3_pipeline_dry_run = transaction
+        try:
+            outbound = self._dispatch_qwen3_loopback_messages(
+                transaction.prepare_messages(),
+            )
+        except Qwen3LoopbackError:
+            with self._layer_config_lock:
+                self._qwen3_pipeline_dry_run = None
+                self._qwen3_loopback_base_url = ""
+            raise
+        except Exception as exc:
+            with self._layer_config_lock:
+                cleanup = transaction.abort(
+                    "qwen3_loopback_dispatch_failed", str(exc),
+                )
+            self._dispatch_qwen3_loopback_messages(
+                cleanup.get("outbound", []), best_effort=True,
+            )
+            raise
+        return {
+            "transaction": transaction.snapshot(),
+            "outbound": outbound,
+        }
+
+    def _handle_qwen3_loopback_request(
+        self, client_id: str, message: dict,
+    ) -> None:
+        data = message.get("data", {})
+        local_node_id = self.get_effective_node_id()
+        secret = self._qwen3_cluster_secret()
+        worker = None
+        contract_sha256 = str(data.get("contract_sha256", "") or "")
+        try:
+            if client_id != "master":
+                raise Qwen3LoopbackError(
+                    "qwen3_loopback_peer_mismatch",
+                    "worker accepts loopback dry-run only from its master connection",
+                )
+            with self._layer_config_lock:
+                worker = self._qwen3_loopback_workers.get(contract_sha256)
+                if worker is None and data.get("phase") in {"prepare", "release"}:
+                    worker = Qwen3PipelineLoopbackWorker(
+                        node_id=local_node_id,
+                        secret=secret,
+                        base_url=str(data.get("assignment_base_url", "") or ""),
+                        available_bytes=self._qwen3_loopback_available_bytes,
+                    )
+                    self._qwen3_loopback_workers[contract_sha256] = worker
+                elif worker is None:
+                    raise Qwen3LoopbackError(
+                        "qwen3_loopback_not_prepared",
+                        "loopback contract has no prepared worker state",
+                    )
+            ack = worker.handle(data)
+            if data.get("phase") == "release":
+                with self._layer_config_lock:
+                    self._qwen3_loopback_workers.pop(contract_sha256, None)
+        except Qwen3LoopbackError as exc:
+            error_ack = {
+                "schema_version": 1,
+                "operation": "qwen3_pipeline_dry_run_ack",
+                "dry_run": True,
+                "phase": str(data.get("phase", "")),
+                "node_id": local_node_id,
+                "config_id": data.get("config_id"),
+                "plan_id": data.get("plan_id"),
+                "generation": data.get("generation"),
+                "contract_sha256": contract_sha256,
+                "status": "error",
+                "reason_code": exc.reason_code,
+                "reason": exc.reason,
+                "full_model_materialized": False,
+            }
+            ack = sign_loopback_message(
+                error_ack, peer_node_id=local_node_id, secret=secret,
+            )
+        client = getattr(self, "_tcp_client", None)
+        if client is not None:
+            from tcp_comm import MessageType
+
+            client.send_data(ack, MessageType.QWEN3_PIPELINE_DRY_RUN_ACK)
+
+    def _qwen3_loopback_available_bytes(self, message: dict) -> int:
+        if str(message.get("execution_device", "cpu")) == "cuda":
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    free_bytes, _ = torch.cuda.mem_get_info()
+                    return max(0, int(free_bytes))
+            except Exception:
+                return 0
+            return 0
+        try:
+            import psutil
+
+            return max(0, int(psutil.virtual_memory().available))
+        except Exception:
+            return 0
+
+    def _handle_qwen3_loopback_ack(
+        self, client_id: str, message: dict,
+    ) -> None:
+        payload = message.get("data", {})
+        try:
+            nonce, payload_sha256 = verify_loopback_message(
+                payload,
+                authenticated_peer_id=client_id,
+                secret=self._qwen3_cluster_secret(),
+            )
+            with self._layer_config_lock:
+                transaction = self._qwen3_pipeline_dry_run
+                if transaction is None or not transaction.network_dispatch:
+                    return
+                previous = self._qwen3_loopback_ack_nonces.get(nonce)
+                if previous is not None and previous != payload_sha256:
+                    raise Qwen3LoopbackError(
+                        "qwen3_loopback_replay_mismatch",
+                        "ACK nonce was reused with a changed payload",
+                    )
+                self._qwen3_loopback_ack_nonces[nonce] = payload_sha256
+                ack = {
+                    key: value for key, value in payload.items()
+                    if key != "transport_auth"
+                }
+                if ack.get("phase") == "release":
+                    if not transaction.release_ack(client_id, ack):
+                        raise Qwen3LoopbackError(
+                            "qwen3_loopback_release_mismatch",
+                            "release ACK does not match the active contract",
+                        )
+                    if transaction.phase == "released":
+                        self._qwen3_loopback_base_url = ""
+                        self._qwen3_loopback_ack_nonces.clear()
+                    return
+                if ack.get("status") == "error":
+                    result = transaction.abort(
+                        str(ack.get("reason_code", "qwen3_loopback_worker_error")),
+                        str(ack.get("reason", "loopback worker rejected control frame")),
+                    )
+                else:
+                    result = transaction.handle_ack(client_id, ack)
+                outbound = result.get("outbound", [])
+            if outbound:
+                self._dispatch_qwen3_loopback_messages(
+                    outbound,
+                    best_effort=transaction.phase in {"aborted", "releasing"},
+                )
+        except (Qwen3LoopbackError, Qwen3PipelineProtocolError) as exc:
+            outbound = []
+            with self._layer_config_lock:
+                transaction = self._qwen3_pipeline_dry_run
+                if transaction is not None and transaction.phase in {
+                    "preparing", "committing",
+                }:
+                    code = getattr(
+                        exc, "reason_code", "qwen3_loopback_ack_rejected",
+                    )
+                    result = transaction.abort(code, str(exc))
+                    outbound = result.get("outbound", [])
+            if outbound:
+                self._dispatch_qwen3_loopback_messages(
+                    outbound, best_effort=True,
+                )
+
+    def release_qwen3_pipeline_loopback(self) -> dict:
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None or not transaction.network_dispatch:
+                raise Qwen3PipelineProtocolError(
+                    "no Qwen3 pipeline loopback is active"
+                )
+            result = transaction.release()
+        result["outbound"] = self._dispatch_qwen3_loopback_messages(
+            result["outbound"], best_effort=True,
+        )
+        result["transaction"] = transaction.snapshot()
+        return result
+
+    def handle_qwen3_pipeline_dry_run_ack(
+        self, node_id: str, payload: dict,
+    ) -> dict:
+        """Apply one simulated ACK; never touch the TCP or model host."""
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None:
+                raise Qwen3PipelineProtocolError(
+                    "no Qwen3 pipeline dry-run is active"
+                )
+            result = transaction.handle_ack(node_id, payload)
+            result["transaction"] = transaction.snapshot()
+            return result
+
+    def retry_qwen3_pipeline_dry_run(self) -> dict:
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None:
+                raise Qwen3PipelineProtocolError(
+                    "no Qwen3 pipeline dry-run is active"
+                )
+            result = {
+                "transaction": transaction.snapshot(),
+                "outbound": transaction.retry_messages(),
+            }
+        if transaction.network_dispatch:
+            result["outbound"] = self._dispatch_qwen3_loopback_messages(
+                result["outbound"], best_effort=True,
+            )
+        return result
+
+    def retry_qwen3_pipeline_loopback_release(self) -> dict:
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None or not transaction.network_dispatch:
+                raise Qwen3PipelineProtocolError(
+                    "no Qwen3 pipeline loopback is active"
+                )
+            messages = transaction.release_messages()
+        return {
+            "transaction": transaction.snapshot(),
+            "outbound": self._dispatch_qwen3_loopback_messages(
+                messages, best_effort=True,
+            ),
+        }
+
+    def expire_qwen3_pipeline_dry_run(
+        self, *, now: float | None = None,
+    ) -> dict | None:
+        outbound = []
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None:
+                return None
+            result = transaction.expire(now=now)
+            if result is not None:
+                result["transaction"] = transaction.snapshot()
+                outbound = result.get("outbound", [])
+        if result is not None and transaction.network_dispatch:
+            result["outbound"] = self._dispatch_qwen3_loopback_messages(
+                outbound, best_effort=True,
+            )
+        return result
+
+    def abort_qwen3_pipeline_dry_run(
+        self, reason_code: str, reason: str = "",
+    ) -> dict:
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None:
+                raise Qwen3PipelineProtocolError(
+                    "no Qwen3 pipeline dry-run is active"
+                )
+            result = transaction.abort(reason_code, reason)
+            result["transaction"] = transaction.snapshot()
+        if transaction.network_dispatch:
+            result["outbound"] = self._dispatch_qwen3_loopback_messages(
+                result.get("outbound", []), best_effort=True,
+            )
+        return result
+
+    def release_qwen3_pipeline_dry_run_ack(
+        self, node_id: str, payload: dict,
+    ) -> bool:
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            if transaction is None:
+                return False
+            released = transaction.release_ack(node_id, payload)
+            if released and transaction.phase == "released":
+                self._qwen3_loopback_base_url = ""
+                self._qwen3_loopback_ack_nonces.clear()
+            return released
+
+    def get_qwen3_pipeline_dry_run_status(self) -> dict:
+        with self._layer_config_lock:
+            transaction = self._qwen3_pipeline_dry_run
+            return (
+                transaction.snapshot()
+                if transaction is not None
+                else {
+                    "schema_version": 1,
+                    "dry_run": True,
+                    "phase": "idle",
+                    "network_dispatch": False,
+                    "weight_materialization": False,
+                    "full_model_fallback": False,
+                }
+            )
+
     def _commit_pipeline_load_transaction(self, config_id: str) -> None:
         """Materialize the local segment, then publish commit to all workers."""
         with self._layer_config_lock:
@@ -4785,6 +5201,24 @@ class Scheduler:
                 self.deregister_node(client_id)
                 return
 
+            qwen3_release = []
+            with self._layer_config_lock:
+                qwen3_transaction = self._qwen3_pipeline_dry_run
+                if (
+                    qwen3_transaction is not None
+                    and qwen3_transaction.network_dispatch
+                    and qwen3_transaction.phase in {"aborted", "releasing"}
+                    and client_id in qwen3_transaction.worker_ids
+                ):
+                    qwen3_release = [
+                        item for item in qwen3_transaction.release_messages()
+                        if item.get("node_id") == client_id
+                    ]
+            if qwen3_release:
+                self._dispatch_qwen3_loopback_messages(
+                    qwen3_release, best_effort=True,
+                )
+
             # 新节点注册后重新计算分层并推送
             if registered and self._effective_role() == "master":
                 self.push_layer_config_to_clients()
@@ -5021,6 +5455,12 @@ class Scheduler:
         elif msg_type == "layer_config_ack":
             # ---- 主节点：从节点完成模型层加载后的确认 ----
             self._handle_layer_config_ack(client_id, msg)
+
+        elif msg_type == "qwen3_pipeline_dry_run":
+            self._handle_qwen3_loopback_request(client_id, msg)
+
+        elif msg_type == "qwen3_pipeline_dry_run_ack":
+            self._handle_qwen3_loopback_ack(client_id, msg)
 
         elif msg_type == "layer_worker_opt_out":
             # ---- 主节点：从节点明确切换为本地推理，不再分配模型层 ----
@@ -5364,6 +5804,7 @@ class Scheduler:
     def _on_tcp_disconnect(self, client_id: str) -> None:
         """TCP 断连回调（由 TCPServer 调用）"""
         abort_details = None
+        qwen3_disconnect = None
         with self._layer_config_lock:
             transaction = self._pipeline_load_transaction
             if (
@@ -5378,8 +5819,28 @@ class Scheduler:
                     "pipeline_worker_disconnected",
                     f"worker {client_id} disconnected during transaction",
                 )
+            qwen3_transaction = self._qwen3_pipeline_dry_run
+            if qwen3_transaction is not None:
+                qwen3_disconnect = qwen3_transaction.disconnect(client_id)
+                if qwen3_disconnect is not None and qwen3_transaction.network_dispatch:
+                    self._qwen3_loopback_workers.pop(
+                        qwen3_transaction.contract["contract_sha256"], None,
+                    )
         if abort_details is not None:
             self._abort_pipeline_load_transaction(*abort_details)
+        if qwen3_disconnect is not None:
+            logger.warning(
+                "Qwen3 dry-run 因节点断线中止: node=%s contract=%s",
+                client_id,
+                self.get_qwen3_pipeline_dry_run_status().get(
+                    "contract_sha256", ""
+                ),
+            )
+            outbound = qwen3_disconnect.get("outbound", [])
+            if outbound:
+                self._dispatch_qwen3_loopback_messages(
+                    outbound, best_effort=True,
+                )
         self._task_worker_control.disconnect_worker(client_id)
         self._diffusion_worker_control.disconnect_worker(client_id)
         with self._diffusion_worker_lock:
@@ -6789,6 +7250,7 @@ class Scheduler:
             "tcp_client": tcp_client_info,
             "nodes_ready": self.check_nodes_ready(),
             "pipeline": pipeline_info,
+            "qwen3_pipeline_dry_run": self.get_qwen3_pipeline_dry_run_status(),
             "pipeline_queue": queue_info,
         }
         if network_path is not None:
