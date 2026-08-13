@@ -1,0 +1,243 @@
+--- C:\Users\Koakuma\AppData\Local\Programs\Python\Python312\Lib\site-packages\llama_cpp\mtmd_cpp.py	2026-06-10 16:26:09.832430400 +0800
++++ /tmp/llama-cpp-python-src/llama_cpp/mtmd_cpp.py	2026-08-13 13:19:51.580639100 +0800
+@@ -3,7 +3,9 @@
+ import os
+ import warnings
+ from ctypes import (
++    CFUNCTYPE,
+     c_bool,
++    c_int32,
+     c_char_p,
+     c_int,
+     c_uint8,
+@@ -78,6 +80,9 @@
+ 
+ 
+ # Structures
++mtmd_progress_callback = CFUNCTYPE(c_bool, c_float, c_void_p)
++
++
+ class mtmd_context_params(Structure):
+     """Context parameters for MTMD initialization.
+ 
+@@ -110,6 +115,18 @@
+         ("image_max_tokens", c_int),
+         ("cb_eval", llama_cpp.ggml_backend_sched_eval_callback),
+         ("cb_eval_user_data", c_void_p),
++        ("batch_max_tokens", c_int32),
++        ("progress_callback", mtmd_progress_callback),
++        ("progress_callback_user_data", c_void_p),
++    ]
++
++
++class mtmd_helper_bitmap_wrapper(Structure):
++    """Return wrapper for bitmap helpers (C returns by hidden pointer)."""
++
++    _fields_ = [
++        ("bitmap", c_void_p),
++        ("video_ctx", c_void_p),
+     ]
+ 
+ 
+@@ -260,8 +277,7 @@
+ @ctypes_function(
+     "mtmd_bitmap_init_from_audio",
+     [c_size_t, POINTER(c_float)],
+-    mtmd_bitmap_p_ctypes,
+-)
++    mtmd_helper_bitmap_wrapper)
+ def mtmd_bitmap_init_from_audio(
+     n_samples: Union[c_size_t, int],
+     data: CtypesArray[c_float],
+@@ -555,12 +571,12 @@
+ @ctypes_function(
+     "mtmd_helper_bitmap_init_from_file",
+     [mtmd_context_p_ctypes, c_char_p, c_bool],
+-    mtmd_bitmap_p_ctypes,
++    mtmd_helper_bitmap_wrapper,
+ )
+ def mtmd_helper_bitmap_init_from_file(
+     ctx: mtmd_context_p, fname: bytes, placeholder: Union[c_bool, bool], /
+-) -> Optional[mtmd_bitmap_p]:
+-    """Initialize an MTMD bitmap from a file."""
++) -> Optional[mtmd_helper_bitmap_wrapper]:
++    """Initialize an MTMD bitmap from a file (returns wrapper)."""
+     ...
+ 
+ 
+@@ -568,7 +584,7 @@
+ @ctypes_function(
+     "mtmd_helper_bitmap_init_from_buf",
+     [mtmd_context_p_ctypes, POINTER(c_uint8), c_size_t, c_bool],
+-    mtmd_bitmap_p_ctypes,
++    mtmd_helper_bitmap_wrapper
+ )
+ def mtmd_helper_bitmap_init_from_buf(
+     ctx: mtmd_context_p,
+@@ -739,3 +755,166 @@
+ def mtmd_helper_log_set(log_callback, user_data: c_void_p, /):
+     """Set the MTMD helper logging callback."""
+     ...
++
++
++# =====================================================================
++# G4.3.2B 图像管线补封装（47e1de77 MTMD API，2026-08-13）
++# 参照 tools/mtmd/mtmd.h 与 mtmd-helper.h；原 0.3.28 绑定缺失以下符号
++# =====================================================================
++
++# MTMD_API int32_t mtmd_tokenize(mtmd_context * ctx,
++#                                mtmd_input_chunks * output,
++#                                const mtmd_input_text * text,
++#                                const mtmd_bitmap ** bitmaps,
++#                                size_t n_bitmaps);
++@ctypes_function(
++    "mtmd_tokenize",
++    [
++        mtmd_context_p_ctypes,
++        mtmd_input_chunks_p_ctypes,
++        POINTER(mtmd_input_text),
++        POINTER(mtmd_bitmap_p_ctypes),
++        c_size_t,
++    ],
++    c_int,
++)
++def mtmd_tokenize(
++    ctx: mtmd_context_p,
++    output: mtmd_input_chunks_p,
++    text: "_Pointer[mtmd_input_text]",
++    bitmaps: "_Pointer[mtmd_bitmap_p]",
++    n_bitmaps: Union[c_size_t, int],
++    /,
++) -> int:
++    """Tokenize a text prompt with image/audio markers into input chunks."""
++    ...
++
++
++# MTMD_API int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
++#                                                struct llama_context * lctx,
++#                                                const mtmd_input_chunk * chunk,
++#                                                llama_pos n_past,
++#                                                llama_seq_id seq_id,
++#                                                int32_t n_batch,
++#                                                bool logits_last,
++#                                                llama_pos * new_n_past);
++@ctypes_function(
++    "mtmd_helper_eval_chunk_single",
++    [
++        mtmd_context_p_ctypes,
++        llama_cpp.llama_context_p_ctypes,
++        mtmd_input_chunk_p_ctypes,
++        llama_cpp.llama_pos,
++        llama_cpp.llama_seq_id,
++        c_int,
++        c_bool,
++        POINTER(llama_cpp.llama_pos),
++    ],
++    c_int,
++)
++def mtmd_helper_eval_chunk_single(
++    ctx: mtmd_context_p,
++    lctx: llama_cpp.llama_context_p,
++    chunk: mtmd_input_chunk_p,
++    n_past: llama_cpp.llama_pos,
++    seq_id: llama_cpp.llama_seq_id,
++    n_batch: Union[c_int, int],
++    logits_last: Union[c_bool, bool],
++    new_n_past: "_Pointer[llama_cpp.llama_pos]",
++    /,
++) -> int:
++    """Eval a single input chunk (text or media) into the llama context."""
++    ...
++
++
++# typedef int32_t (*mtmd_helper_post_decode_callback)(struct llama_batch batch, void * user_data);
++# MTMD_API int32_t mtmd_helper_decode_image_chunk(mtmd_context * ctx,
++#                                                 struct llama_context * lctx,
++#                                                 const mtmd_input_chunk * chunk,
++#                                                 float * encoded_embd,
++#                                                 llama_pos n_past,
++#                                                 llama_seq_id seq_id,
++#                                                 int32_t n_batch,
++#                                                 llama_pos * new_n_past,
++#                                                 mtmd_helper_post_decode_callback callback,
++#                                                 void * user_data);
++mtmd_helper_post_decode_callback = CFUNCTYPE(
++    c_int, llama_cpp.llama_batch, c_void_p
++)
++
++@ctypes_function(
++    "mtmd_helper_decode_image_chunk",
++    [
++        mtmd_context_p_ctypes,
++        llama_cpp.llama_context_p_ctypes,
++        mtmd_input_chunk_p_ctypes,
++        POINTER(c_float),
++        llama_cpp.llama_pos,
++        llama_cpp.llama_seq_id,
++        c_int,
++        POINTER(llama_cpp.llama_pos),
++        mtmd_helper_post_decode_callback,
++        c_void_p,
++    ],
++    c_int,
++)
++def mtmd_helper_decode_image_chunk(
++    ctx: mtmd_context_p,
++    lctx: llama_cpp.llama_context_p,
++    chunk: mtmd_input_chunk_p,
++    encoded_embd: "_Pointer[c_float]",
++    n_past: llama_cpp.llama_pos,
++    seq_id: llama_cpp.llama_seq_id,
++    n_batch: Union[c_int, int],
++    new_n_past: "_Pointer[llama_cpp.llama_pos]",
++    callback: mtmd_helper_post_decode_callback,
++    user_data: c_void_p,
++    /,
++) -> int:
++    """Decode an image chunk whose embeddings were already calculated."""
++    ...
++
++
++# ---- mtmd_batch 系列（G4.3.2B 图像管线，mtmd-cli.cpp 同路径） ----
++
++# MTMD_API mtmd_batch * mtmd_batch_init(mtmd_context * ctx);
++@ctypes_function("mtmd_batch_init", [mtmd_context_p_ctypes], c_void_p)
++def mtmd_batch_init(ctx: mtmd_context_p, /):
++    """Create an MTMD batch for the given context."""
++    ...
++
++
++# MTMD_API void mtmd_batch_free(mtmd_batch * batch);
++@ctypes_function("mtmd_batch_free", [c_void_p], None)
++def mtmd_batch_free(batch: mtmd_batch_p, /):
++    """Free an MTMD batch."""
++    ...
++
++
++# MTMD_API int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk);
++@ctypes_function(
++    "mtmd_batch_add_chunk", [c_void_p, mtmd_input_chunk_p_ctypes], c_int
++)
++def mtmd_batch_add_chunk(batch: mtmd_batch_p, chunk: mtmd_input_chunk_p, /) -> int:
++    """Add a media chunk to a batch."""
++    ...
++
++
++# MTMD_API int32_t mtmd_batch_encode(mtmd_batch * batch);
++@ctypes_function("mtmd_batch_encode", [c_void_p], c_int)
++def mtmd_batch_encode(batch: mtmd_batch_p, /) -> int:
++    """Encode all media chunks in the batch."""
++    ...
++
++
++# MTMD_API float * mtmd_batch_get_output_embd(mtmd_batch * batch, const mtmd_input_chunk * chunk);
++@ctypes_function(
++    "mtmd_batch_get_output_embd",
++    [c_void_p, mtmd_input_chunk_p_ctypes],
++    POINTER(c_float),
++)
++def mtmd_batch_get_output_embd(
++    batch: mtmd_batch_p, chunk: mtmd_input_chunk_p, /
++):
++    """Get output embeddings for a chunk from an encoded batch."""
++    ...
