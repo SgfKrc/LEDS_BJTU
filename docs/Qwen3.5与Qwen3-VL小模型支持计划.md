@@ -1,6 +1,6 @@
 # Qwen3、Qwen3-VL 与 Qwen3.5 模型支持计划
 
-> 状态：`QW3-S0 Completed（调研，2026-08-13）`；**`QW3-D1a` 双格式 Completed**；**`QW3-D1b` 双格式 Completed（2026-08-13）**——① Qwen3-VL-4B-Instruct 官方 Safetensors 经 ModelScope 直连（15 文件、8.28 GB、SHA-256 对照官方哈希全通过，`model_type=qwen3_vl` + 内置视觉编码器，manifest `models/qwen3-vl-4b-instruct/.qlh-model-asset.json`）；② 官方 GGUF 仓库经 HF+7897 代理：`Qwen3VL-4B-Instruct-Q4_K_M.gguf`（2.326 GB、`gguf_inspect` qwen3vl/256K ctx、SHA 对照 LFS oid 通过）+ `mmproj-Qwen3VL-4B-Instruct-F16.gguf`（0.779 GB、clip 架构，manifest `models/qwen3-vl-4b-instruct-gguf/.qlh-model-asset.json`）。两仓库 revision 分别独立锁定（Safetensors=master、GGUF=main），mmproj 与语言模型同 Instruct 型号已核对。`QW35-D1`（Qwen3.5-2B）下一步。
+> 状态：`QW3-S0 Completed（调研，2026-08-13）`；**`QW3-D1a` 双格式 Completed**；**`QW3-D1b` 双格式 Completed**；**`QW35-D1` Completed（2026-08-13）**——Qwen3.5-2B 官方 Safetensors 经 ModelScope 直连（14 文件、4.26 GB、SHA-256 对照官方哈希全通过，`model_type=qwen3_5` / `Qwen3_5ForConditionalGeneration`，manifest `models/qwen3-5-2b/.qlh-model-asset.json`；官方未提供 GGUF，第三方转换不入 baseline）。QW3 受控下载链全部完成；后续进入运行时侧（QW3-R2 隔离 sidecar 已交开发组）。
 >
 > 更新日期：2026-08-13
 >
