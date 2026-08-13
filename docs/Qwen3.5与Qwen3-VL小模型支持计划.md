@@ -1,6 +1,8 @@
 # Qwen3、Qwen3-VL 与 Qwen3.5 模型支持计划
 
-> 状态：`QW3-S0 Completed（调研，2026-08-13）`；**`QW3-D1a` 双格式 Completed**；**`QW3-D1b` 双格式 Completed**；**`QW35-D1` Completed（2026-08-13）**——Qwen3.5-2B 官方 Safetensors 经 ModelScope 直连（14 文件、4.26 GB、SHA-256 对照官方哈希全通过，`model_type=qwen3_5` / `Qwen3_5ForConditionalGeneration`，manifest `models/qwen3-5-2b/.qlh-model-asset.json`；官方未提供 GGUF，第三方转换不入 baseline）。QW3 受控下载链全部完成；后续进入运行时侧（QW3-R2 隔离 sidecar 已交开发组）。
+> 状态：`QW3-S0 Completed`；**`QW3-D1a` / `QW3-D1b` / `QW35-D1` Completed（2026-08-13）**——① D1a：Qwen3-4B 官方 Safetensors（ModelScope 直连，14 文件、7.51 GB，revision `2c54d5a09e…`）+ 官方 GGUF Q4_K_M（HF 代理，2.326 GB，revision `bc640142c6…`，qwen3/40K ctx），manifest 分别登记；② D1b：Qwen3-VL-4B-Instruct 官方 Safetensors（ModelScope 直连，15 文件、8.28 GB，`qwen3_vl` + 内置视觉编码器）+ 官方 GGUF `Q4_K_M`（2.326 GB，qwen3vl/256K ctx）+ `mmproj-F16`（0.779 GB，clip），两仓库 revision 独立锁定；③ QW35-D1：Qwen3.5-2B 官方 Safetensors（ModelScope 直连，14 文件、4.26 GB，`qwen3_5`，官方无 GGUF）。**`QW3-R2` Completed（2026-08-13）**——隔离 sidecar 已就绪：`setup_qwen3_sidecar_env.py` 建独立 venv（`transformers 4.57.6` 隔离，主运行时仍锁 4.47.x），`qwen3-sidecar-probe` 对 `models/qwen3-4b` 真实预检通过：tokenizer 加载、chat template 可用、`enable_thinking=False` 硬关闭且渲染无 `<think>` 脚手架，状态 `ready_for_qwen3_smoke`。**`QW3-G3` 闸门已开（工件 + sidecar 就绪）**。
+>
+> 更新日期：2026-08-13
 >
 > 更新日期：2026-08-13
 >
