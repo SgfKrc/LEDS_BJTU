@@ -43,7 +43,7 @@
 | 上下文 | 262144；当前 8GB 开发门使用 2K/4K smoke，不把 256K 设计上限当本机可用承诺 |
 | 量化/工件 | Q4_K_M；Ollama 清单显示 7.6GB，运行时 `ollama ps` 显示约 9.9GB 工作集 |
 | 本机支持状态 | Ollama 0.32.8 已实测 completion/vision/audio/tools/thinking；QLH G4.1 已实测 OpenAI `image_url` |
-| 原生支持状态 | 项目锁定 llama.cpp `47e1de77…`；**G4.3.2B 原生图片语义已通过（2026-08-13）**：以 47e1de77 源码重编 llama-cpp-python 0.3.28（独立 venv `.venv-gemma4-native`）+ 补全 MTMD 图像管线绑定（`scripts/model_tools/llama-cpp-python-mtmd.patch`，含 mtmd_tokenize/batch 系列/wrapper 结构修复），`scripts/gemma4_native_image_smoke.py` 实测固定测试图（sd-001：red apple on wooden table）输出语义正确描述（two red apples / weathered wooden surface）。已知小项：输出含 `thought`/`<channel|>` 前缀（原生 thinking 未剥离，与 Ollama 路径 `reasoning_effort=none` 对应，后续可加剥离）。音频/8K-16K/offload 仍后置 |
+| 原生支持状态 | 项目锁定 llama.cpp `47e1de77…`；**G4.3.2B 原生图片语义已通过（2026-08-13）**：以 47e1de77 源码重编 llama-cpp-python 0.3.28（独立 venv `.venv-gemma4-native`）+ 补全 MTMD 图像管线绑定（`scripts/model_tools/llama-cpp-python-mtmd.patch`，含 mtmd_tokenize/batch 系列/wrapper 结构修复），`scripts/gemma4_native_image_smoke.py` 实测固定测试图（sd-001：red apple on wooden table）输出语义正确描述（two red apples / weathered wooden surface）。**已知限制（2026-08-13 实测）**：原生路径无 `reasoning_effort=none` 等效控制，gemma4 思考段长度不可控（96–234+ tokens 波动，CPU 推理下可能占满短输出预算）；验证脚本已实现 `<channel|>`(token 101) 正文剥离（遇不到时输出警告）。**产品图像路径仍推荐 Ollama `external_api`（reasoning_effort=none，G4.1/4.2 已验收）**；原生绑定定位为 ABI/语义验证与未来增强。音频/8K-16K/offload 仍后置 |
 | 标签边界 | `gemma4:latest` 当前指向 E4B；12B 必须显式写 `gemma4:12b` |
 
 ### 2.2 本机部署现状（2026-08-11 已实测）
