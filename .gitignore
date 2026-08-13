@@ -93,3 +93,4 @@ control/qlh-control.sqlite3*
 docs_to_delete/
 models/qwen3-4b/
 .venv-gemma4-native/
+models/qwen3-4b-gguf/

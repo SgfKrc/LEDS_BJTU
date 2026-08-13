@@ -1,6 +1,6 @@
 # Qwen3、Qwen3-VL 与 Qwen3.5 模型支持计划
 
-> 状态：`QW3-S0 Completed（调研，2026-08-13）`；`QW3-D1a` Safetensors 部分 **Completed（2026-08-13，ModelScope 直连）**——Qwen3-4B 官方 Safetensors 已下载并受管登记（14 文件、7.51 GB、逐文件 SHA-256 对照官方哈希全通过，manifest `models/qwen3-4b/.qlh-model-asset.json`，revision `2c54d5a09e…`）；`QW3-D1a` GGUF 部分（`Qwen/Qwen3-4B-GGUF` 官方 Q4_K_M，仅 HF 源）待网络（7897 代理或 hf-mirror 慢速兜底）恢复后执行。
+> 状态：`QW3-S0 Completed（调研，2026-08-13）`；**`QW3-D1a` 双格式 Completed（2026-08-13）**——① Qwen3-4B 官方 Safetensors 经 ModelScope 直连（14 文件、7.51 GB、逐文件 SHA-256 对照官方哈希全通过，manifest `models/qwen3-4b/.qlh-model-asset.json`，revision `2c54d5a09e…`）；② Qwen3-4B-GGUF 官方 Q4_K_M 经 HF+7897 代理（2.326 GB、SHA-256 `7485fe6f…` 对照官方 LFS oid 全通过，`gguf_inspect`：architecture=qwen3、40K 上下文，manifest `models/qwen3-4b-gguf/.qlh-model-asset.json`，revision `bc640142c6…`）。`QW3-D1b`（Qwen3-VL-4B-Instruct 双格式/mmproj）与 `QW35-D1`（Qwen3.5-2B）下一步。
 >
 > 更新日期：2026-08-13
 >
