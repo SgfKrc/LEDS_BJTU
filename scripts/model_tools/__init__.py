@@ -5,6 +5,7 @@ from .gguf_convert import GGUFConvertError, execute_conversion, plan_conversion
 from .gemma4_native_probe import run_native_probe
 from .gemma4_native_artifacts import resolve_ollama_gemma4_12b, run_ollama_gemma4_12b_preflight
 from .qwen3_sidecar_probe import run_qwen3_sidecar_probe
+from .qwen3_multimodal_processor_probe import run_qwen3_multimodal_processor_probe
 from .qwen3_pipeline_smoke import run_qwen3_pipeline_smoke
 from .qwen3_pipeline_chain_smoke import run_qwen3_pipeline_chain_smoke
 from .qwen3_pipeline_chain import (
@@ -40,6 +41,7 @@ __all__ = [
     "resolve_ollama_gemma4_12b",
     "run_ollama_gemma4_12b_preflight",
     "run_qwen3_sidecar_probe",
+    "run_qwen3_multimodal_processor_probe",
     "run_qwen3_pipeline_smoke",
     "run_qwen3_pipeline_chain_smoke",
     "build_hidden_handoff",

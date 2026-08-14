@@ -45,6 +45,16 @@ _PROCESSOR_FIELDS = {
     "video_token_id", "max_images", "max_video_frames", "image_min_pixels",
     "image_max_pixels", "video_min_pixels", "video_max_pixels",
 }
+_PROCESSOR_SMOKE_RUNTIME_FIELDS = {
+    "transformers_version", "isolated", "local_files_only", "trust_remote_code",
+    "processor_class", "image_processor_class", "video_processor_class",
+    "tokenizer_class", "declared_tokenizer_class", "image_token_id",
+    "video_token_id", "patch_size", "temporal_patch_size", "merge_size",
+}
+_PROCESSOR_SMOKE_CLEANUP_FIELDS = {
+    "attempted", "completed", "objects_released", "weight_materialized",
+    "full_model_materialized",
+}
 
 
 class Qwen3MultimodalPreflightError(ValueError):
@@ -613,14 +623,141 @@ def validate_mm1_visual_worker_response(
     return response
 
 
+def build_mm1_processor_smoke_response(
+    request: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    inspection: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a response after constructing AutoProcessor in the sidecar."""
+    safe_request = validate_mm1_visual_worker_request(
+        request, manifest=manifest, inspection=inspection,
+    )
+    runtime_value = _exact(runtime, _PROCESSOR_SMOKE_RUNTIME_FIELDS, "processor smoke runtime")
+    response = {
+        "schema_version": MM1_SCHEMA_VERSION,
+        "response_kind": "qwen3_visual_worker_processor_smoke",
+        "status": "ready_for_offline_start",
+        "request_id": safe_request["request_id"],
+        "request_sha256": safe_request["request_sha256"],
+        "manifest_sha256": safe_request["manifest_sha256"],
+        "model_id": safe_request["model_id"],
+        "node_id": safe_request["node_id"],
+        "processor_constructed": True,
+        "visual_worker_ready": True,
+        "component_count": len(safe_request["component_ids"]),
+        "runtime": runtime_value,
+        "cleanup": {
+            "attempted": True,
+            "completed": True,
+            "objects_released": True,
+            "weight_materialized": False,
+            "full_model_materialized": False,
+        },
+    }
+    response["response_sha256"] = _digest(response, label="MM1 processor smoke response")
+    return validate_mm1_processor_smoke_response(response, request=safe_request)
+
+
+def validate_mm1_processor_smoke_response(
+    value: Mapping[str, Any],
+    *,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    response = _exact(
+        value,
+        {
+            "schema_version", "response_kind", "status", "request_id",
+            "request_sha256", "manifest_sha256", "model_id", "node_id",
+            "processor_constructed", "visual_worker_ready", "component_count",
+            "runtime", "cleanup", "response_sha256",
+        },
+        "MM1 processor smoke response",
+    )
+    if (
+        response["schema_version"] != MM1_SCHEMA_VERSION
+        or response["response_kind"] != "qwen3_visual_worker_processor_smoke"
+        or response["status"] != "ready_for_offline_start"
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 processor smoke response version/status is unsupported")
+    for name in ("request_id", "request_sha256", "manifest_sha256", "model_id", "node_id"):
+        if response[name] != request[name]:
+            raise Qwen3MultimodalPreflightError(f"MM1 processor smoke response {name} does not match")
+    if response["processor_constructed"] is not True or response["visual_worker_ready"] is not True:
+        raise Qwen3MultimodalPreflightError("MM1 processor smoke did not construct a ready worker")
+    response["component_count"] = _int(
+        response["component_count"], "component_count", minimum=1, maximum=16,
+    )
+    if response["component_count"] != len(request["component_ids"]):
+        raise Qwen3MultimodalPreflightError("MM1 processor smoke component count differs")
+    runtime = _exact(response["runtime"], _PROCESSOR_SMOKE_RUNTIME_FIELDS, "processor smoke runtime")
+    version = str(runtime["transformers_version"] or "")
+    version_tuple = []
+    for part in version.split("."):
+        digits = "".join(char for char in part if char.isdigit())
+        if not digits:
+            break
+        version_tuple.append(int(digits))
+    if tuple(version_tuple or [0]) < (4, 51, 0):
+        raise Qwen3MultimodalPreflightError("processor smoke Transformers version is too old")
+    if (
+        runtime["isolated"] is not True
+        or runtime["local_files_only"] is not True
+        or runtime["trust_remote_code"] is not False
+    ):
+        raise Qwen3MultimodalPreflightError("processor smoke runtime is not isolated/offline-safe")
+    allowed_classes = {
+        "processor_class": "Qwen3VLProcessor",
+        "image_processor_class": "Qwen2VLImageProcessorFast",
+        "video_processor_class": "Qwen3VLVideoProcessor",
+    }
+    for name, expected in allowed_classes.items():
+        if runtime[name] != expected:
+            raise Qwen3MultimodalPreflightError(f"processor smoke {name} is unsupported")
+    if runtime["declared_tokenizer_class"] != request["processor"]["tokenizer_class"]:
+        raise Qwen3MultimodalPreflightError("processor smoke declared tokenizer class differs")
+    if runtime["tokenizer_class"] not in {"Qwen2Tokenizer", "Qwen2TokenizerFast"}:
+        raise Qwen3MultimodalPreflightError("processor smoke tokenizer class is unsupported")
+    for name in ("image_token_id", "video_token_id"):
+        runtime[name] = _int(runtime[name], f"runtime.{name}", minimum=0, maximum=1_000_000_000)
+        if runtime[name] != request["processor"][name]:
+            raise Qwen3MultimodalPreflightError(f"processor smoke {name} differs")
+    for name in ("patch_size", "temporal_patch_size", "merge_size"):
+        runtime[name] = _int(runtime[name], f"runtime.{name}", minimum=1, maximum=65_536)
+        expected = request["processor"]["spatial_merge_size"] if name == "merge_size" else request["processor"][name]
+        if runtime[name] != expected:
+            raise Qwen3MultimodalPreflightError(f"processor smoke {name} differs")
+    cleanup = _exact(response["cleanup"], _PROCESSOR_SMOKE_CLEANUP_FIELDS, "processor smoke cleanup")
+    if (
+        cleanup["attempted"] is not True
+        or cleanup["completed"] is not True
+        or cleanup["objects_released"] is not True
+        or cleanup["weight_materialized"] is not False
+        or cleanup["full_model_materialized"] is not False
+    ):
+        raise Qwen3MultimodalPreflightError("processor smoke cleanup is incomplete")
+    unsigned = dict(response)
+    unsigned.pop("response_sha256")
+    if response["response_sha256"] != _digest(unsigned, label="MM1 processor smoke response"):
+        raise Qwen3MultimodalPreflightError("MM1 processor smoke response digest mismatch")
+    _reject_sensitive(response)
+    _canonical(response, label="MM1 processor smoke response")
+    response["runtime"] = runtime
+    response["cleanup"] = cleanup
+    return response
+
+
 __all__ = [
     "MM1_PREFLIGHT_MAX_BYTES",
     "MM1_PROCESSOR_JSON_MAX_BYTES",
     "Qwen3MultimodalPreflightError",
     "build_mm1_visual_worker_request",
     "build_mm1_visual_worker_response",
+    "build_mm1_processor_smoke_response",
     "inspect_mm1_processor_assets",
     "validate_mm1_processor_inspection",
     "validate_mm1_visual_worker_request",
     "validate_mm1_visual_worker_response",
+    "validate_mm1_processor_smoke_response",
 ]

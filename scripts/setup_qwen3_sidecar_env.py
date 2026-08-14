@@ -29,7 +29,7 @@ def _ready(*, pipeline: bool = False) -> bool:
         return False
     check = "import transformers; from packaging.version import Version; ok = Version(transformers.__version__) >= Version('4.51.0')"
     if pipeline:
-        check += "; import torch, accelerate, safetensors; ok = ok and hasattr(torch, 'no_grad')"
+        check += "; import torch, torchvision, accelerate, safetensors, PIL; ok = ok and hasattr(torch, 'no_grad') and hasattr(torchvision, 'transforms') and bool(PIL.__version__)"
     check += "; raise SystemExit(0 if ok else 1)"
     completed = subprocess.run(
         [str(python), "-c", check],
