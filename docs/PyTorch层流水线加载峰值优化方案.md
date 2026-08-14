@@ -235,8 +235,61 @@
 - 故障矩阵覆盖 401/403/416、跳转、错误 Range、截断/续传、超时、SHA 篡改、manifest 拒绝/篡改、基址变更、容量不足、幂等/重放、断线和重连清理。QW3.5 专项 `48 passed`；Scheduler/TCP/API/manifest 扩大回归 `481 passed`。最终在 `.venv-test` 内以固定 4 worker 运行 unit 通道：`2196 passed / 6 skipped` （约 88 秒）。
 - 本票不包含权重物化、hidden tensor 网络传输、真实双机结果等价或生产准入；Qwen3-VL/Qwen3.5 也不因此放开。
 
-### 8.18 下一票：`PT-PIPE-QW3.6` 隔离 sidecar 的 node-local 执行生命周期
+### 8.18 `PT-PIPE-QW3.6` 隔离 sidecar 的 node-local 执行生命周期（开发门 Completed，2026-08-14）
 
-1. 将已认证的 QW3.5 prepare/commit/release 帧接到隔离 Qwen3 sidecar；prepare 只创建并校验本节点 filtered assignment，commit 只物化本层段，release/abort 必须清空 KV、权重和临时代际。
-2. 先以单机多进程验证首/中/末段的独立资源门、超时、sidecar 崩溃、重连和重复 commit；继续断言未分配 key 不物化、不回退主运行时整模加载。
-3. 本票先固定 node-local 执行和清理语义；hidden tensor/KV 跨机数据面、异构转换、真实双机等价和生产准入仍后置。
+- 新增 `Qwen3PipelineSidecarSession`：主进程使用有界 JSONL 控制帧管理独立 Python 子进程，强制 Transformers/Torch 离线环境、取消系统代理、请求/响应 256 KiB 上限和真实读取超时。返回只包含资源、账本和执行汇总，不回显模型路径、权重或 hidden tensor。
+- 新增持久 `qwen3_pipeline_runtime_worker.py`：prepare 先重算本地 assignment manifest 、资源门和 `enable_thinking=false` tokenizer，再以硬链接优先创建 filtered assignment；commit 只调用 `load_qwen3_layer_assignment` 物化已分配段；release/abort 释放 adapter、清空 CUDA 缓存并移除临时目录。不调用 `from_pretrained` 整模路径，不会回退主运行时整模加载。
+- Qwen3 合同增加显式 `execution_mode=node_local_sidecar`；默认 `metadata_only` 路径保持 QW3.5 行为不变。sidecar 控制帧中明确区分 `weight_materialization` 和 `segment_materialized`，commit ACK 必须证明只物化本段，不是全模。Scheduler 只通过显式 `begin_qwen3_pipeline_sidecar()` 进入该模式；TCP 断线会主动 abort sidecar 并回收。
+- sidecar/session/loopback/transaction 专项和 QW3 扩大回归共 `488 passed`；固定 4 worker 的完整 unit 通道为 `2201 passed / 6 skipped`（约 86 秒），`py_compile`/`git diff --check` 通过。本票的真实双机执行、CUDA 峰值和结果等价仍未验收；这些不能被合成 session 测试代替。
+
+### 8.19 `PT-PIPE-QW3.7` 单机多 sidecar hidden handoff 与 KV 执行（开发门 Completed，2026-08-14）
+
+- 新增 `Qwen3PipelineMultiSidecar`，可从 canonical `node_local_sidecar` 合同创建 2/3 个 sidecar session，按 `prepare -> commit -> prefill -> decode -> release` 串行推进；任何阶段异常都会对全部 session 执行 abort。
+- hidden/KV 不进入 JSONL 控制帧，sidecar 只读写 controller-owned 本机 artifact；控制帧绑定 artifact root、输入/输出 SHA-256 与字节数、chain/segment、shape、dtype/device、sequence length 和 generation。输出证据拒绝整模物化，且摘要不符、工件越界、hidden shape 或 KV 长度变化均 fail-closed。
+- 增加取消和重启恢复入口，按 chain token 回收遗留 artifact；release/abort 返回清理证据。`from_contract()` 将 QW3.6 canonical 合同绑定到本机多 sidecar 编排，未改变默认 metadata-only 或跨节点生产准入。
+- 多 sidecar/runtime worker 专项回归 `10 passed`；QW3 扩大回归 `495 passed`；固定 4 worker 的完整 unit 通道为 `2208 passed / 6 skipped`（约 105 秒），`py_compile`/`git diff --check` 通过。
+- 本票仍未验收真实 Qwen3-4B CUDA 结果等价、异构设备转换、跨机 hidden tensor/KV 传输、网络重连或生产准入；本机 artifact 测试不能替代这些门。
+
+### 8.20 `PT-PIPE-QW3.8` Scheduler 本地链入口与 CPU parity gate（开发门 Completed，2026-08-14）
+
+- 新增主节点专用、显式 opt-in 的 Scheduler 本地链入口和单体/scheduler-svc 等价 API，覆盖 begin、prefill、decode、parity、release、cancel 与只读状态；默认聊天、metadata-only 和既有生产流水线均未接入该入口，返回固定 `production_admitted=false`。
+- chain/config/plan/generation/phase/segment count/cleanup/parity 元数据投影到用户主节点 SQLite；不保存绝对路径、tensor、logits 或工件正文。启动/状态查询会把无内存会话但仍处活动阶段的记录收敛为 `recovered_aborted`，并按 chain token 只清理本链遗留工件；同合同重放和陈旧 generation 均被 fencing。
+- CPU parity gate 对 2/3 段 prefill/decode 的最终 logits 做有界容差比较，同时复核逐段 artifact 字节数/SHA-256、`full_model_materialized=false`、KV phase/generation/sequence length 和 hidden handoff shape。失败会取消全部 sidecar、清理工件并返回结构化拒绝，明确 `full_model_fallback=false`。
+- 合成 Qwen3-like CPU 小模型使用同一组权重完成整链参考与 2/3 段执行对照；另覆盖数值不一致、工件篡改、代际不符、SQLite 白名单、重启恢复、重复提交和主从权限。QW3.8 新增专项 `15 passed`，QW3 专项 `102 passed`；固定 4 worker 的完整 unit 通道为 `2223 passed / 6 skipped`（约 112 秒）。
+- 全量复核同时发现并修复 QW3.7 的独立 Worker 导入缺口：运行时 segment/KV 合同移入 `src/qwen3_pipeline_contract.py`，打包/独立进程不再依赖仓库根或 `scripts.model_tools` 可导入。真实 Qwen3-4B CUDA parity、异构转换、跨机 hidden/KV 和生产准入仍未开放。
+
+### 8.21 `PT-PIPE-QW3.9` 网络工件传输合同与 loopback 故障矩阵（开发门 Completed，2026-08-14）
+
+- 新增 Qwen3 专用 HMAC 工件票据，完整绑定 authenticated peer、chain、generation、phase、from/to segment、字节数、SHA-256、过期时间与 nonce；接收计划、状态和 receipt 均为严格 metadata-only，不返回 tensor、KV、本机绝对路径或票据。票据仅服务一个 transfer session，不与 SD 图像 CAS/SQLite 混用。
+- 新增有界接收存储和 loopback 客户端：最多 4 MiB 顺序 PATCH、逐块落盘并 `fsync`、`Upload-Offset` 背压、`.part` 断点恢复、最终全文件 SHA-256/字节复核和同卷 `os.replace` 原子提交。客户端强制 loopback、禁系统代理和重定向，控制响应上限 64 KiB；controller 不聚合完整 artifact 字节。
+- 内部 FastAPI adapter 只读取认证传输层注入的 `request.scope.qlh_authenticated_peer_id`，不接受 caller header 声称节点身份。精确重复块幂等；跨 peer/跨 session 被拒绝且不得破坏合法 staging；错序、变化重放、越界和摘要不符立即失败并清理。连接中断保留有界 `.part` 供续传，取消或 TTL 到期定向回收。
+- 2/3 段、prefill/decode 的实际 loopback GET/PATCH/commit 矩阵，以及断线后 ACK 丢失、截断提交、重放、越权、错序、摘要不符、取消、过期、超限和路径逃逸均已覆盖。新增专项 `14 passed`，QW3 专项 `107 passed`；固定 4 worker 的完整 unit 通道为 `2237 passed / 6 skipped`（约 129 秒）。
+- 本票只落下独立内部 router/runtime 与传输 fixture，尚未在生产 `api_server` 注册，也未由 Scheduler 向真实远端 peer 签发计划；因此不构成真实双机 hidden/KV 传输、CUDA parity 或生产准入。
+
+### 8.22 `PT-PIPE-QW3.10` Scheduler 认证网络接线与模拟多节点链（开发门 Completed，2026-08-14）
+
+- 新增 `qwen3_pipeline_peer_auth.py` 请求级 HMAC proof：proof 绑定 HTTP method/path、Bearer 摘要、时间窗口和 nonce，并只把认证层注入的 peer identity 交给 transfer/data-plane；新增 `qwen3_pipeline_control.py`，控制请求体以规范 JSON + SHA-256 绑定，目标端不得从普通 header 或未提交 topology 取得权限。
+- `Qwen3NetworkTransferCoordinator` 将活动 canonical contract、generation、prefill/decode 阶段、相邻 source/target topology 与 transfer session 互相 fencing；`Qwen3PipelineMultiSidecar` 现在显式产生 path-free `local`/`network` artifact reference，目标端摘要复核、原子提交后才向下一段暴露内部路径，控制元数据不携带路径、票据或 tensor。
+- Scheduler 以显式 `configure_qwen3_artifact_transfer(..., network_coordinator=...)` 接入 runtime、peer verifier 和可选 handoff transport；`scheduler_svc_http` 仅在显式配置时注册内部 control/data router，`production_admitted` 仍为 `false`，默认 API/聊天路径不进入该支线。
+- 新增 `tests/helpers/qwen3_network_node.py` 同机目标进程，2/3 节点 prefill/decode、断线续传、目标失败、全链取消、阶段未完成拒绝、body 重绑定、重启后孤儿回收/陈旧合同拒绝均通过。专项网络 `14 passed`，QW3 支线 `121 passed`，Python 全量 `2252 passed / 8 skipped`；`py_compile` 与 `git diff --check` 通过。
+- 进程 helper 用固定 allow-list 模拟已注册 peer；真实 TCP 注册生命周期、远端 sidecar 在目标节点执行、跨机吞吐、CUDA 数值等价、异构设备转换和生产路由仍未关闭，不能宣称真实双机或生产准入。
+
+### 8.23 下一票：`PT-PIPE-QW3.11` TCP peer 生命周期与目标端 sidecar 执行边界
+
+1. 将 QW3.10 control client 的 peer allow-list 替换为现有 TCP HMAC 注册/断开事件投影，覆盖注册、撤销、重连和源节点身份变化；控制请求、artifact ticket 与 Scheduler transaction 必须共享同一 live epoch。
+2. 把 network artifact reference 的消费端下沉到目标节点 sidecar：源端只提交 path-free reference，目标端本地解析并执行下一段，返回 hidden/KV/artifact 的摘要和形状合同；目标进程不得把本地绝对路径回传控制面。
+3. 保持 2/3 节点 CPU 合成链和全链清理回归；真实双机网络、CUDA parity、异构转换、吞吐/时延和生产准入继续作为独立外部门，不下载新模型。
+
+### 8.24 `PT-PIPE-QW3.11` TCP epoch 与目标侧消费边界（开发门 Completed，2026-08-14）
+
+- `src/tcp_comm.py` 为每次成功的 HMAC 注册分配单调 `registration_epoch`；服务端暴露当前已确认 peer 的 epoch，客户端在注册成功和重连后更新本地 epoch。旧连接断开或身份变化不会继续复用旧 epoch。
+- `src/qwen3_pipeline_peer_auth.py` 升级 proof schema，proof 绑定 `peer_epoch`；Scheduler 在显式配置 Qwen3 data plane 时同时投影 peer 身份与 epoch。测试 helper 改为可注册/撤销/重连的 TCP 注册事件投影，不再把静态 allow-list 当作生命周期事实。
+- transfer ticket、descriptor、状态/receipt 和 network coordinator 授权均绑定 epoch。peer 重连后，旧 ticket 即使仍在 TTL 内也会 fail-closed；控制请求、artifact ticket 和活动 network contract 使用同一 live epoch。
+- `POST /internal/v1/qwen3/network-control/consume` 将已提交 artifact 的解析和执行留在目标进程。目标 executor 才能看到目标本地路径，返回值仅含 artifact SHA/bytes、hidden handoff、KV shape/phase 摘要，不返回路径、ticket、tensor 或完整模型；`Qwen3NetworkHandoffTransport.consume_target()` 提供统一调用边界。
+- 回归新增 epoch 变更/陈旧 proof、目标消费 path-free 响应和注册 projection 覆盖；QW3 网络/传输专项当前 `30 passed`。本票仍只通过 CPU/合成工件开发门，真实双机网络、CUDA parity、异构转换、吞吐/时延和生产路由继续后置。
+
+### 8.25 下一票：`PT-PIPE-QW3.12` 目标侧真实 sidecar 串联与消费后工件生命周期
+
+1. 将 `consume` 接到目标 sidecar session 的真实 filtered assignment/hidden/KV 执行，要求输入 artifact 只在目标进程内解析，并把下一跳输出重新登记为新的 path-free network reference。
+2. 增加消费中断、重复 consume、目标重启、epoch 变化和输入/输出摘要不一致的事务回收矩阵；消费失败必须回收当前 transfer 和目标 sidecar，不得回退整模。
+3. 在不改变主运行时 `transformers==4.47.x` 和不引入硬件前置的前提下，先完成 2/3 节点 CPU 合成链，再把真实双机、CUDA parity、异构 dtype/device 转换交给独立验收票。
