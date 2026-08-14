@@ -93,7 +93,12 @@ def _assignment_manifest(
     return manifest
 
 
-def _contract(payload: bytes, node_ids=("worker-a", "worker-b")) -> dict:
+def _contract(
+    payload: bytes,
+    node_ids=("worker-a", "worker-b"),
+    *,
+    execution_mode: str = "metadata_only",
+) -> dict:
     probe = _probe(payload)
     segments = []
     layer_ranges = [(0, 2), (2, 4)] if len(node_ids) == 2 else [(0, 1), (1, 3), (3, 4)]
@@ -124,6 +129,7 @@ def _contract(payload: bytes, node_ids=("worker-a", "worker-b")) -> dict:
         total_layers=4,
         hidden_size=16,
         segments=segments,
+        execution_mode=execution_mode,
     )
 
 
@@ -397,6 +403,67 @@ def test_worker_is_idempotent_and_rejects_changed_nonce_replay():
         with pytest.raises(Qwen3LoopbackError) as exc:
             worker.handle(changed_signed, now=1001)
     assert exc.value.reason_code == "qwen3_loopback_replay_mismatch"
+
+
+def test_loopback_worker_connects_node_local_sidecar_lifecycle():
+    payload = _safetensors_bytes()
+
+    class Session:
+        def __init__(self, _message):
+            self.calls: list[str] = []
+
+        def prepare(self):
+            self.calls.append("prepare")
+            return {"status": "prepared", "gate_passed": True, "segment_materialized": False}
+
+        def commit(self):
+            self.calls.append("commit")
+            return {"status": "committed", "gate_passed": True, "segment_materialized": True}
+
+        def release(self):
+            self.calls.append("release")
+            return {"status": "released", "gate_passed": True, "cleanup_complete": True}
+
+        def abort(self):
+            self.calls.append("abort")
+
+    sessions: list[Session] = []
+
+    def factory(message):
+        session = Session(message)
+        sessions.append(session)
+        return session
+
+    with _RangeServer(payload) as server:
+        tx = Qwen3PipelineDryRunTransaction(
+            _contract(payload, execution_mode="node_local_sidecar"),
+            network_dispatch=True,
+        )
+        worker = Qwen3PipelineLoopbackWorker(
+            node_id="worker-a", secret=SECRET, base_url=server.base_url,
+            available_bytes=1024, sidecar_session_factory=factory,
+        )
+        prepare = tx._message("worker-a", "prepare")
+        prepare["assignment_base_url"] = server.base_url
+        prepare_ack = worker.handle(sign_loopback_message(
+            prepare, peer_node_id="worker-a", secret=SECRET,
+        ))
+        commit = tx._message("worker-a", "commit")
+        commit["assignment_base_url"] = server.base_url
+        commit_ack = worker.handle(sign_loopback_message(
+            commit, peer_node_id="worker-a", secret=SECRET,
+        ))
+        assert _unsigned(commit_ack)["segment_materialized"] is True
+        release = tx._message("worker-a", "release")
+        release["assignment_base_url"] = server.base_url
+        release["release"] = True
+        release_ack = worker.handle(sign_loopback_message(
+            release, peer_node_id="worker-a", secret=SECRET,
+        ))
+
+    assert _unsigned(prepare_ack)["segment_materialized"] is False
+    assert _unsigned(release_ack)["status"] == "released"
+    assert sessions[0].calls == ["prepare", "commit", "release"]
 
 
 def test_worker_rejects_signed_assignment_base_url_change():
