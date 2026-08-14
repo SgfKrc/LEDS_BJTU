@@ -3,3 +3,7 @@
 -r requirements-qwen3-sidecar.txt
 accelerate>=1.0.0,<2.0.0
 psutil>=5.9.0
+# Qwen3-VL/Qwen3.5 AutoProcessor construction uses the fast image processor.
+# Keep these visual-only dependencies in the isolated pipeline sidecar.
+Pillow>=10.0.0,<13.0.0
+torchvision>=0.28.0,<0.29.0
