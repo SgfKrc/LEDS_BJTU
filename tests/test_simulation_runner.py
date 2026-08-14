@@ -1,4 +1,5 @@
 import json
+import os
 
 from scripts import run_simulation
 
@@ -70,3 +71,31 @@ def test_simulation_runner_default_stdout_is_parseable_json(capsys, monkeypatch)
     summary = json.loads(capsys.readouterr().out)
     assert summary["profile"] == "quick"
     assert summary["pytest"]["counts"]["passed"] == 1
+
+
+def test_pytest_python_prefers_venv_test_when_called_from_system_python(monkeypatch):
+    """系统 Python 调用时优先返回 .venv-test 解释器（环境分割铁律）。"""
+    monkeypatch.setattr(run_simulation.sys, "prefix", "C:/Python312")
+    monkeypatch.setattr(run_simulation.sys, "base_prefix", "C:/Python312")
+    resolved = run_simulation._pytest_python()
+    assert "venv-test" in resolved
+    assert resolved.replace("\\", "/").endswith(
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+
+
+def test_pytest_python_keeps_current_interpreter_inside_any_venv(monkeypatch):
+    """已在虚拟环境内（无论哪个）→ 保持当前解释器，不逃逸到 .venv-test。"""
+    monkeypatch.setattr(run_simulation.sys, "prefix", "G:/some/venv")
+    monkeypatch.setattr(run_simulation.sys, "base_prefix", "C:/Python312")
+    assert run_simulation._pytest_python() == run_simulation.sys.executable
+
+
+def test_pytest_python_falls_back_when_venv_test_missing(monkeypatch):
+    """系统 Python 且 .venv-test 不存在 → 回退当前解释器（不崩溃）。"""
+    monkeypatch.setattr(run_simulation.sys, "prefix", "C:/Python312")
+    monkeypatch.setattr(run_simulation.sys, "base_prefix", "C:/Python312")
+    monkeypatch.setattr(
+        run_simulation.Path, "is_file", lambda _self: False, raising=False
+    )
+    assert run_simulation._pytest_python() == run_simulation.sys.executable
