@@ -322,6 +322,31 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
+### 🔒 环境分割（主环境 / 测试环境 / 打包环境）
+
+**硬性规则：测试依赖只装进 `.venv-test`，严禁装入系统 Python（主环境）；严禁在 `.venv-test` 与主环境之间复制/同步 site-packages。**
+
+| 环境 | 用途 | 依赖来源 | 禁止事项 |
+|---|---|---|---|
+| **主环境**（系统 Python） | 运行时（transformers 4.47.1 / torch / 推理服务）与工具脚本 | `requirements.txt` | 不装 pytest 系测试依赖；不跑全量测试 |
+| **`.venv-test`** | **唯一测试环境**（全量/定向 pytest 都在这跑） | `scripts/setup_test_env.py` + `requirements-test.txt` | 不承载运行时推理；不被当作主环境使用 |
+| `.venv-packaging/` | 集显版打包（torch CPU） | `packaging/requirements-cpu.txt` | — |
+| `.venv-packaging-cuda/` | 独显版打包（torch CUDA）+ SD 侧车 | 见打包文档 | — |
+| `.venv-gemma4-native/`、`.venv-qwen3-sidecar/` | 侧车隔离运行时（原生 MTMD / Qwen3 sidecar） | 各自 requirements | — |
+
+**常用命令**：
+
+```powershell
+# 创建/校验测试环境（--check 只读健康检查）
+python scripts/setup_test_env.py --check
+# 在测试环境跑测试（通道脚本自带 venv 守卫，拒绝系统 Python）
+.venv-test\Scripts\python.exe scripts/run_test_channels.py
+# 定向测试
+.venv-test\Scripts\python.exe -m pytest tests/test_xxx.py -q -n 1
+```
+
+> **事件记录（2026-08-14）**：曾发生主环境被灌入 pytest 系测试包、同时 `.venv-test` 的 pytest 被掏空（两个环境 site-packages 被复制混淆），导致测试被迫在主环境运行。已修复（主环境卸载测试包、`.venv-test` 重装 requirements-test.txt 恢复）。**请勿通过 `run_test_channels.py --allow-system-python` 绕过守卫**，该参数仅限一次性 CI 镜像。
+
 ---
 
 ## 🤖 模型下载
