@@ -114,6 +114,8 @@ def main() -> None:
     parser.add_argument("--sidecar-has-lm-head", action="store_true")
     parser.add_argument("--sidecar-total-layers", type=int, default=36)
     parser.add_argument("--sidecar-generation", type=int, default=0)
+    parser.add_argument("--mm1-manifest", default="")
+    parser.add_argument("--mm1-visual-tokens", type=int, default=0)
     args = parser.parse_args()
 
     runtime = Qwen3ArtifactTransferRuntime.create(
@@ -181,9 +183,20 @@ def main() -> None:
         )
         session.prepare()
         session.commit()
-        app.state.qwen3_network_sidecar_executor = Qwen3NetworkSidecarExecutor(
+        sidecar_executor = Qwen3NetworkSidecarExecutor(
             session, artifact_root=runtime.receiver.root,
         )
+        if args.mm1_manifest:
+            from qwen3_multimodal_runtime import Qwen3MultimodalSidecarAdapter  # noqa: E402
+            manifest = json.loads(
+                Path(args.mm1_manifest).read_text(encoding="utf-8"),
+            )
+            sidecar_executor = Qwen3MultimodalSidecarAdapter(
+                sidecar_executor,
+                manifest=manifest,
+                visual_tokens=(args.mm1_visual_tokens or None),
+            )
+        app.state.qwen3_network_sidecar_executor = sidecar_executor
     else:
         app.state.qwen3_network_sidecar_executor = (
             _SyntheticNetworkSidecarExecutor(runtime.receiver.root)

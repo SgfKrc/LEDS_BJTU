@@ -1129,7 +1129,13 @@ class Qwen3ArtifactTransferClient:
             for key in expected_receipt
         }
 
-    def upload(self, *, source: str | Path, plan: Mapping[str, Any]) -> dict[str, Any]:
+    def upload(
+        self,
+        *,
+        source: str | Path,
+        plan: Mapping[str, Any],
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> dict[str, Any]:
         safe_plan = self._plan(plan)
         path = self._source(source)
         descriptor = safe_plan["descriptor"]
@@ -1149,6 +1155,7 @@ class Qwen3ArtifactTransferClient:
             total_bytes=actual_size,
             sha256=actual_sha256,
             chunk_provider=provider,
+            progress_callback=progress_callback,
         )
 
 
