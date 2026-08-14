@@ -255,3 +255,45 @@ def test_review_side_effect_endpoints_execute_for_master(monkeypatch):
         "count": 2,
     }
     assert asyncio.run(api_server.trigger_mail_poll()) == {"polled": 1}
+
+
+# ================================================================
+# T-3 读端点开放契约（§4.2.1 矩阵 3/4/5）：网络信任域内读开放，
+# 不因部署角色变化而 403（写端点的 master 门在
+# test_review_side_effect_endpoints_* 已覆盖）
+# ================================================================
+
+def test_review_read_endpoints_stay_open_for_non_master(monkeypatch):
+    class ClientScheduler:
+        @staticmethod
+        def _effective_role():
+            return "client"
+
+        @staticmethod
+        def get_effective_node_id():
+            return "node-client"
+
+        @staticmethod
+        def can_node_vote(node_id):
+            return True, ""
+
+    monkeypatch.setattr(api_server, "scheduler", ClientScheduler())
+    # 列表：非 master 角色必须可读（不 403）
+    result = asyncio.run(api_server.list_review_tickets())
+    assert "tickets" in result and "count" in result
+    # can-vote 自查询：开放
+    result = asyncio.run(api_server.check_can_vote())
+    assert "can_vote" in result
+
+
+def test_review_ticket_detail_missing_is_404_not_403_for_non_master(monkeypatch):
+    class ClientScheduler:
+        @staticmethod
+        def _effective_role():
+            return "client"
+
+    monkeypatch.setattr(api_server, "scheduler", ClientScheduler())
+    with pytest.raises(HTTPException) as missing:
+        asyncio.run(api_server.get_review_ticket("ticket-does-not-exist"))
+    # 非 master 读不存在工单 → 404（资源不存在优先于角色拒绝，契约 4）
+    assert missing.value.status_code == 404
