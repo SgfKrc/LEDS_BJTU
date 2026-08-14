@@ -21,8 +21,17 @@ def main() -> int:
     ap.add_argument("mmproj")
     ap.add_argument("image")
     ap.add_argument("--prompt", default="Describe this image in one or two sentences. <__media__>")
-    ap.add_argument("--n-ctx", type=int, default=128)
-    ap.add_argument("--max-tokens", type=int, default=96)
+    ap.add_argument("--n-ctx", type=int, default=768,
+                    help="上下文：图像 chunks(~134) + 生成预算(512) + 余量")
+    ap.add_argument(
+        "--max-tokens", type=int, default=512,
+        help="生成预算：思考段剥离（默认开）需要覆盖思考段+正文",
+    )
+    ap.add_argument(
+        "--suppress-thinking", action=argparse.BooleanOptionalAction, default=True,
+        help="屏蔽 <channel|>(101) 思考段起始 token，对齐 Ollama think=false"
+        "（默认开；关闭时保持原生思考段行为）",
+    )
     args = ap.parse_args()
 
     t0 = time.time()
@@ -109,8 +118,13 @@ def main() -> int:
 
     print(f"[6] 图像编码+解码完成，开始生成（n_past={n_past}）", flush=True)
     from llama_cpp._internals import LlamaBatch
-    CHANNEL_TOKEN_ID = 101  # "<channel|>"：思考段与正文的分隔特殊 token（gemma4）
+    CHANNEL_START_TOKEN_ID = 100  # "<|channel>"：思考段开始 token（gemma4）
+    CHANNEL_END_TOKEN_ID = 101    # "<channel|>"：思考段结束 token
     tokens: list[int] = []
+    # G4 §5.6 #1 思考段抑制（剥离式，2026-08-14 实测）：gemma4 默认以
+    # <|channel>thought...<channel|> 输出思考段（96-234+ tokens 波动），
+    # 屏蔽思考开始 token 无效（模型会改用文本形式思考）。剥离式有效：
+    # 等思考段结束 token(101) 后收集正文，预算默认 512 覆盖思考段+正文。
     collecting = False
     last = llama_cpp.llama_token_bos(model._ctx.ctx)
     n_past = int(n_past.value)  # chunk 循环结束的实际 KV 位置
@@ -127,8 +141,12 @@ def main() -> int:
         llama_cpp.llama_sampler_free(smpl)
         if tok == llama_cpp.llama_token_eos(model._ctx.ctx):
             break
-        if tok == CHANNEL_TOKEN_ID:
-            # 思考段结束标记：丢弃此前全部内容（含 "thought" 字面），开始收集正文
+        if tok == CHANNEL_START_TOKEN_ID:
+            # 思考段开始：丢弃此前内容（含 "thought" 字面），等待思考结束
+            collecting = False
+            continue
+        if tok == CHANNEL_END_TOKEN_ID:
+            # 思考段结束：开始收集正文
             collecting = True
             continue
         if collecting:
@@ -136,9 +154,7 @@ def main() -> int:
         last = tok
     if not collecting:
         print(
-            "[!] 未检测到 <channel|>（思考段未结束或模型未输出正文）："
-            "原生路径无 reasoning_effort 等效控制，思考段长度不可控；"
-            "产品图像路径请使用 Ollama external_api（reasoning_effort=none）",
+            "[!] 未检测到 <channel|>（思考段未结束或模型未输出正文）",
             file=sys.stderr,
         )
 
