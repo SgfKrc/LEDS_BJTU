@@ -24,6 +24,14 @@
 
 > **2026-08-14 `PT-PIPE-QW3.11` 增量**：TCP 注册、Qwen3 peer proof、artifact ticket 和 network control 现已共享单调 live epoch，重连或撤销会使旧 proof/ticket 失效。目标节点新增 path-free consume 边界，目标 executor 本地解析 artifact，控制面只返回 SHA/bytes 和 hidden/KV shape/phase 摘要。网络/传输专项 `30 passed`；Qwen3.5/Qwen3-VL 尚未接入该执行面，真实双机/CUDA parity 与生产准入仍关闭。下一票 `PT-PIPE-QW3.12` 先完成目标 sidecar 真执行和消费后工件生命周期，再评估多模态组件接入。
 
+> **2026-08-14 `PT-PIPE-QW3.12` 增量**：目标 sidecar executor 已接入 network consume，filtered assignment/hidden/KV artifact 在目标进程内解析，目标段 decode 使用本段 prefill KV；消费状态机支持同合同幂等、重复合同拒绝、执行异常/取消回收、epoch 变化 fencing 和目标重启遗留工件清理。目标输出经本地 SHA/bytes 复核后登记新的 path-free `output_reference`，不把路径、ticket 或 tensor 返回控制面。QW3 专项 `144 passed`；Qwen3.5/Qwen3-VL 仍未接入真实执行面，远端下一跳搬运、双机/CUDA parity 和生产准入继续关闭。下一票 `PT-PIPE-QW3.13` 先完成 path-free output reference 的远端下一跳传输，再评估多模态组件接入。
+
+> **2026-08-14 `PT-PIPE-QW3.13` 增量**：源端 `output_reference` 现在可由认证目标 peer 按有界 offset 分块读取，每块复核输出 bytes/SHA；摘要变化、输出缺失、offset 越界和 peer 越界均 fail-closed 并使 reference 失效。目标端 `upload_chunks` 复用 `.part` offset/PATCH/commit 断线续传，二进制 output route 只返回 chunk 与摘要/offset/EOF headers；`transfer_registered_output` 完成 2/3 节点 path-free 下一跳搬运，连接失败保留 staging 可重试。专项 `36 passed`；持久 generation/KV ledger、Qwen3.5/Qwen3-VL 真实执行、双机/CUDA parity 和生产准入仍关闭。下一票 `PT-PIPE-QW3.14` 接入持久账本、多阶段重试与逐节点 release。
+
+> **2026-08-14 `PT-PIPE-QW3.14` 增量**：用户主节点 SQLite `qwen3_network_ledger_v1` 已接入 network coordinator，保存 generation/phase、transfer descriptor/确认 offset、KV 摘要和 output lease/next transfer 关系，不保存路径、ticket 或 tensor。重启后旧 transfer/output reference 标为 `invalidated`，同 canonical contract 可重新 activate；prefill/decode 代际与 KV 投影、重复 lease/commit、跨调用断线续传、永久错误双端清理和逐节点 release 已覆盖。账本/网络专项 `44 passed`、QW3 全线 `153 passed`；Qwen3.5/Qwen3-VL 真实执行、双机/CUDA parity 和生产准入仍关闭。下一票 `PT-PIPE-QW3.15` 接入独立进程端到端 sidecar 自动串联。
+
+> **2026-08-14 `PT-PIPE-QW3.15` 增量**：独立进程 helper 已完成 2/3 节点 path-free output reference 下一跳自动串联，覆盖 prefill/decode、KV generation 和 source release；目标端使用本地 synthetic executor 验证进程边界，未把测试结果冒充真实 Qwen3 模型执行。目标重启后 ledger 会使旧 output reference 失效并清理消费工件/staging。`.venv-test` 下网络专项 `28 passed`、QW3 全线 `156 passed`；此前模拟器使用主 Python 导致 `pytest-timeout` 缺失，已修复为优先调用 `.venv-test`。Qwen3.5/Qwen3-VL 真实执行、TTL/epoch/撤销等完整故障矩阵、双机/CUDA parity 和生产准入仍关闭。下一票 `PT-PIPE-QW3.16` 补故障矩阵并接入真实隔离 sidecar CPU smoke。
+
 ---
 
 ## 1. 本轮结论
