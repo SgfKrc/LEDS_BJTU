@@ -157,6 +157,11 @@ class Qwen3PipelineSidecarSession:
     def _start(self) -> None:
         if self._runner is not None:
             return
+        # QW3.17 修复：已有存活 worker 时不得重复启动——每次 _exchange 都
+        # 调用 _start，若无此守卫每个生命周期步骤都会拉起新 worker
+        # （idle 状态），prepare 的 phase 在 commit 时必然丢失。
+        if self._process is not None and self._process.poll() is None:
+            return
         if not self._sidecar_python.is_file():
             raise Qwen3SidecarError(
                 "qwen3_sidecar_runtime_missing", "isolated Qwen3 sidecar Python is missing",
