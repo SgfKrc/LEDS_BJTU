@@ -106,6 +106,14 @@ def main() -> None:
     parser.add_argument("--secret", required=True)
     parser.add_argument("--allowed-peer", action="append", default=[])
     parser.add_argument("--synthetic-sidecar", action="store_true")
+    # QW3.17：真实 sidecar executor 接线（真实 torch artifact 的 CPU 链）
+    parser.add_argument("--sidecar-model-path", default="")
+    parser.add_argument("--sidecar-python", default="")
+    parser.add_argument("--sidecar-layer-range", nargs=2, type=int, default=None)
+    parser.add_argument("--sidecar-has-embedding", action="store_true")
+    parser.add_argument("--sidecar-has-lm-head", action="store_true")
+    parser.add_argument("--sidecar-total-layers", type=int, default=36)
+    parser.add_argument("--sidecar-generation", type=int, default=0)
     args = parser.parse_args()
 
     runtime = Qwen3ArtifactTransferRuntime.create(
@@ -147,10 +155,40 @@ def main() -> None:
         require_peer_epoch=False,
     )
     app = FastAPI()
-    app.state.qwen3_network_sidecar_executor = (
-        _SyntheticNetworkSidecarExecutor(runtime.receiver.root)
-        if args.synthetic_sidecar else None
-    )
+    if args.sidecar_model_path:
+        # QW3.17：真实 sidecar executor——进程内构造隔离 sidecar session
+        # 并接到网络 consume 边界；layer_range 缺省 [0,1]+embedding。
+        from qwen3_pipeline_sidecar import (  # noqa: E402
+            Qwen3NetworkSidecarExecutor,
+            Qwen3PipelineSidecarSession,
+        )
+        layer_range = args.sidecar_layer_range or [0, 1]
+        session = Qwen3PipelineSidecarSession(
+            model_path=args.sidecar_model_path,
+            model_id="qwen3-4b",
+            model_sha256=("2c54d5a09e7e92d4f5126b92a5a457448c9593e6" + "0" * 24),
+            config_id="cfg-qw3-chain",
+            plan_id="plan-qw3-chain",
+            node_id=args.node_id,
+            layer_range=layer_range,
+            total_layers=args.sidecar_total_layers,
+            has_embedding=args.sidecar_has_embedding,
+            has_lm_head=args.sidecar_has_lm_head,
+            execution_device="cpu",
+            dtype="float32",
+            generation=args.sidecar_generation,
+            sidecar_python=Path(args.sidecar_python) if args.sidecar_python else None,
+        )
+        session.prepare()
+        session.commit()
+        app.state.qwen3_network_sidecar_executor = Qwen3NetworkSidecarExecutor(
+            session, artifact_root=runtime.receiver.root,
+        )
+    else:
+        app.state.qwen3_network_sidecar_executor = (
+            _SyntheticNetworkSidecarExecutor(runtime.receiver.root)
+            if args.synthetic_sidecar else None
+        )
     app.state.qwen3_artifact_transfer = runtime
     app.state.qwen3_network_transfer_coordinator = coordinator
     app.add_middleware(Qwen3PeerAuthMiddleware, verifier=verifier)

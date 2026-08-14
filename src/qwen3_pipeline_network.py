@@ -1132,8 +1132,11 @@ class Qwen3NetworkTransferCoordinator:
                 )
             if isinstance(exc, Qwen3NetworkError):
                 raise
+            # QW3.17：透传 sidecar 失败原因（错误码/消息，无路径/tensor），
+            # 否则远端 consume 失败只剩笼统的 "target sidecar execution failed"
             raise Qwen3NetworkError(
-                "qwen3_network_execution_failed", "target sidecar execution failed",
+                "qwen3_network_execution_failed",
+                f"target sidecar execution failed: {exc}",
             ) from exc
 
     def consume(self, transfer_id: str, **fields) -> dict[str, Any]:

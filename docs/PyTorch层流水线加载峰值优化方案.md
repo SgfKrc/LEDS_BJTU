@@ -359,3 +359,20 @@
 1. 给独立进程 helper 增加真实 `Qwen3NetworkSidecarExecutor` 接线，用真实 torch artifact 完成 2 节点 CPU prefill/decode；随后扩展 3 节点 output reference、KV generation 和源端 release。
 2. 加入 PATCH 后断线、重复 status/commit、revoke 中断和 `.part` offset/ledger progress 对照，确认重试只续传确认 offset，不重复物化或保留旧 lease。
 3. 保持 sidecar 独立环境、主运行时 `transformers==4.47.x`、`full_model_materialized=false` 和禁止整模回退；真实 CUDA/双机 parity、吞吐时延和生产准入继续后置。
+
+### 8.36 `PT-PIPE-QW3.17` 真实 network sidecar 进程链（开发门 Completed，2026-08-14）
+
+- 独立进程 helper（`tests/helpers/qwen3_network_node.py`）新增真实 executor 接线：`--sidecar-model-path/--sidecar-python/--sidecar-layer-range/--sidecar-has-embedding/--sidecar-has-lm-head` 时进程内构造隔离 `Qwen3PipelineSidecarSession`（真实 `.venv-qwen3-sidecar`）并接 `Qwen3NetworkSidecarExecutor` 到 consume 边界。
+- **修复 `Qwen3PipelineSidecarSession._start` 重复启动 bug**：每次 `_exchange` 都 Popen 新 worker，导致 prepare 的 phase 在 commit 时必然丢失（"commit does not match a prepared assignment"）。加存活 worker 守卫后 prepare→commit→release 单 worker 全生命周期通过。
+- **错误透传改进**：`consume_transfer` 的 sidecar 失败原因（错误码/消息，无路径/tensor）现随 `qwen3_network_execution_failed` 透传，远端不再只剩笼统消息。
+- 新测试 `tests/test_qwen3_network_sidecar_chain.py`（真实工件门，缺失 `models/qwen3-4b` 或 sidecar venv 整文件 skip）：
+  - **2 节点真实链**（node-b `[0,1]+embedding`）：真实 torch artifact 的 prefill→decode、KV 契约（prefill 4 + 新 token 1 = 5）、`full_model_materialized=false`、无段间 release（末段输出保留）；
+  - **重复 consume 幂等**（同合同同参数返回缓存结果，输出 reference 一致）；
+  - **revoke 中断清理**（取消后无 `qwen3-consume-*` 残留，已撤销 transfer 再 consume fail-closed）；
+  - **3 节点链**（node-b/node-c 级联 output reference）已实现，RAM 准入 ≥5GB 当前跳过（本机可用 4GB），代码就绪待窗口。
+- 回归：sidecar/network/真实链专项 `38 passed / 2 skipped`；QW3.17 全程保持 sidecar 独立环境、`transformers==4.47.x` 主运行时、禁整模回退；真实 CUDA/双机 parity、吞吐时延与生产准入继续后置。
+
+### 8.37 下一票：`PT-PIPE-QW3.18` 真实 3 节点链与断线续传矩阵（RAM 窗口）
+
+1. 在可用 RAM ≥5GB 窗口执行 3 节点真实链（node-b `[0,1]+embedding` → node-c `[1,2]` 的 output reference 级联与 KV generation 交接）；补齐真实模式下 PATCH 断线续传（`.part` offset 只续传确认段）、重复 status/commit 与 ledger progress 对照。
+2. 保持合成矩阵全部回归（`test_qwen3_pipeline_network.py` 的 lost_ack/resume 等）与 `full_model_materialized=false`；真实 CUDA/双机 parity、异构 dtype/device 转换和生产准入继续独立后置。
