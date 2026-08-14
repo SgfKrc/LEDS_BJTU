@@ -1,6 +1,6 @@
 # Gemma-4-12B 多模态支持方案（实施计划）
 
-> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；G4.3.2B 原生初始化与图片语义受 RAM 门 Blocked；EX-N3-GEMMA-S1 静态质量计数桥接完成；2.4 已登记 PyTorch 工件候选与下载治理 S0）
+> 状态：Active（G4.1 后端与官方模型实机门完成；G4.2 前端/TUI 图片交互完成；G4.3.1 原生绑定/ABI 预检完成；G4.3.2A 官方工件身份/资源准入完成；**G4.3.2B 原生初始化与图片语义完成（2026-08-13，后续开发缺口见 §5.6）**；EX-N3-GEMMA-S1 静态质量计数桥接完成；2.4 已登记 PyTorch 工件候选与下载治理 S0）
 >
 > 更新日期：2026-08-13
 > 适用范围：原版 Gemma 4 12B 经本机 Ollama `external_api` 提供文本与图像理解；G4.3.1/2A 已完成原生候选的 ABI 与资产身份门，音频和原生实际推理另列后续票
@@ -246,7 +246,25 @@ G4.3.2A 已冻结本机已有官方 Ollama `registry.ollama.ai/library/gemma4:12
 
 原生 worker 在重新哈希或导入/初始化 `Llama` 前先检查文件存在、大小和可用物理 RAM。当前主 GGUF 加 projector 的保守门为约 8.74GiB（配对工件的 110% 加 1GiB OS headroom，且不低于 2GiB），两次实测可用 RAM 约 5-6GiB，因此返回 `resource_rejected / insufficient_ram`，不触发文件全量复哈希、MTMD 初始化、handler 创建或图片处理。这是资源保护门，不是原生图像能力失败结论。
 
-G4.3.2B 的恢复条件是运行前可用 RAM 不低于该报告中的 `required_free_ram_bytes`，并保持没有 Ollama 模型驻留；恢复后先执行 CPU-only `n_ctx=128` 初始化与固定测试图语义对照，再分别评估卸载、取消、8K/16K、audio、offload、打包和调度。不得以增加虚拟内存、隐式换页或降低身份校验来绕过此门。
+G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生支持状态」）：CPU-only `n_ctx=128` 初始化 + 固定测试图（sd-001）语义对照通过，`<channel|>` 正文剥离生效，资源门（`required_free_ram_bytes`）fail-closed 实测有效（不足时返回 `resource_rejected / insufficient_ram`，不触发文件复哈希、MTMD 初始化或图片处理；两次实测可用 RAM 约 5-6GiB 均被正确拒绝）。不得以增加虚拟内存、隐式换页或降低身份校验来绕过此门。
+
+**后续开发缺口（逐项验收标准见 §5.6）**：思考段控制、音频输入、8K/16K 上下文、GPU offload、产品接线、打包、卸载/取消——均未开始，按 §5.6 顺序推进。
+
+### 5.6 G4.3.2B 后续开发缺口清单（2026-08-14 整理，供后续开发）
+
+> G4.3.2B 本身已闭环（图像语义验收完成）。以下为**后续票**清单，按依赖顺序排列；每项列出缺口现状、验收标准与验证方式。产品路径在全部完成前仍以 Ollama `external_api` 为准（§6）。
+
+| # | 缺口 | 现状（2026-08-13 实测） | 验收标准 | 验证方式 |
+|---|---|---|---|---|
+| 1 | **思考段控制**（`reasoning_effort=none` 等效） | 原生路径无等效控制，gemma4 思考段 96–234+ tokens 波动（CPU 下可能占满短输出预算）；`<channel|>`(101) 剥离已实现但遇不到时只警告 | 短输出预算（如 max_tokens=256）内稳定产出正文；思考段被抑制或剥离后正文完整 | 用固定测试图（sd-001）跑 `gemma4_native_image_smoke.py` 多次（≥5 次）统计正文长度稳定性；对照 Ollama `reasoning_effort=none` 输出 |
+| 2 | **产品接线**（原生路径入 chat 接口） | llama_engine 已有 MTMD 能力注册与 handler 骨架（`bf9cdc4`），但图像输入未接 `describe_image` 式 API | `llama_cpp` 引擎在 QLH chat 接口接受 `image_url`，走原生 MTMD 管线返回描述；资源门拒绝时 fail-closed | 在 api_server 对话接口传图 → 原生引擎返回；无 mmproj/内存不足时返回结构化拒绝 |
+| 3 | **音频输入** | 官方能力含 Audio→Text；Ollama 实测 capability 含 audio；原生 MTMD `mtmd_support_audio` 能力查询可用，但音频编码管线未绑定/未实测 | 固定音频样本 → 文本输出；无音频工件时 fail-closed | 扩展现有 MTMD 绑定（参考图像管线补 audio 编码符号）；`gemma4_native_audio_smoke` 脚本 |
+| 4 | **8K/16K 上下文** | 当前 CPU 门用 `n_ctx=128` smoke；文档不把 256K 当本机承诺 | 8K/16K 下长上下文对话不崩、KV 缓存内存预算正确 | `n_ctx=8192/16384` 加载 + 长文本生成 + 内存监控（复用 EX-N3 资源门工具） |
+| 5 | **GPU offload** | 8GB 显存与 SD/Gemma 并驻留规则未定；未测 `n_gpu_layers` 真实 offload | 显存预算内 offload 部分层，与 SD 侧车不互斥；超预算拒绝 | `n_gpu_layers` 扫描 + `mem_get_info` 预算门 + 与 SD 并驻留实测 |
+| 6 | **打包** | 原生绑定（重编 wheel + MTMD 补丁）未进 PyInstaller | 打包产物可加载 gemma4 GGUF + mmproj 完成图像描述 | 集显/独显 spec 加 `.venv-gemma4-native` 依赖与 mmproj 工件，冒烟打包 |
+| 7 | **卸载/取消** | 进程生命周期（推理中取消、模型卸载、Ollama 驻留冲突）未验 | 取消不泄漏进程；卸载释放内存；与 Ollama 驻留互斥规则生效 | 取消/卸载矩阵测试 + RAM 观测 |
+
+**优先级建议**：#1（思考段控制）是唯一影响"输出质量"的缺口，且 Ollama 已有参照实现，先做；#2（产品接线）价值最高（原生路径入产品）；#3-#7 视需求排期，音频/长上下文/offload 都依赖真实设备窗口。
 
 ### 5.5 EX-N3-GEMMA-S1 静态质量计数桥接（Completed，非模型验收）
 
@@ -261,7 +279,7 @@ fixture 以 `0.8/0.6` 穿过预注册的 `0.70/0.50` advisory 阈值，仅证明
 | 维度 | 方案 A(Ollama Provider) | 方案 B(原生 llama_cpp) |
 |---|---|---|
 | 模型获取 | 官方 `gemma4:12b` 已下载并验收 | 本机官方 Ollama 主 GGUF/mmproj 已以 manifest、许可、双 SHA 与元数据关系冻结；不另建下载 recipe |
-| 当前状态 | **G4.1/G4.2 Completed** | **G4.3.2A Completed；G4.3.2B Blocked（RAM 门）** |
+| 当前状态 | **G4.1/G4.2 Completed** | **G4.3.2A Completed；G4.3.2B Completed（2026-08-13，图像语义已验）；后续缺口见 §5.6** |
 | 代码范围 | 通用结构化 OpenAI 消息 + 显式 reasoning 配置 | Python handler、ABI、工件、打包和调度均需验证 |
 | 模型能力 | Text/Image 已由 QLH 实测；Audio 尚未开放 | 未实测，不作能力承诺 |
 | 与分布式调度 | `external_api` 整请求，统计如实标注 | 通过 G4.3 后才可作为 `llama_cpp` 候选 |
