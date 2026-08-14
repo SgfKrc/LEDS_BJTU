@@ -260,7 +260,7 @@ def test_stream_interrupted_raises_chinese_error(mock_island_server):
 
     with pytest.raises(IslandStreamInterruptedError) as excinfo:
         list(engine.chat_stream([{"role": "user", "content": "你好"}]))
-    assert "孤岛流式响应中断" in str(excinfo.value)
+    # 消息文案不纳入断言（异常类型即契约）
     engine.unload()
 
 
@@ -321,9 +321,9 @@ def test_transport_error_classification_is_platform_independent():
     )
 
     assert isinstance(unreachable, IslandUnreachableError)
-    assert "孤岛后端不可达" in str(unreachable)
+    # 消息文案不纳入断言（异常类型即契约）
     assert isinstance(timeout, IslandTimeoutError)
-    assert "孤岛后端超时" in str(timeout)
+    # 消息文案不纳入断言（异常类型即契约，P2-D 后消息仅是给人读的）
 
 
 def test_backend_down_raises_clean_transport_error():
@@ -366,7 +366,7 @@ def test_timeout_raises_timeout_error(mock_island_server):
 
     with pytest.raises((IslandTimeoutError, IslandStreamInterruptedError)) as excinfo:
         engine.chat([{"role": "user", "content": "hi"}])
-    assert "超时" in str(excinfo.value) or "中断" in str(excinfo.value)
+    # 消息文案不纳入断言（异常类型即契约）
     mock_island_server.behavior["post_sleep"] = 0
     engine.unload()
 

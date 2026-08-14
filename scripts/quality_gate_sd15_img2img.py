@@ -108,7 +108,10 @@ def _load_source(path: Path, output_dir: Path) -> tuple[Any, dict[str, Any]]:
     }
 
 
-def _image_metrics(image: Any, path: Path) -> dict[str, Any]:
+def _image_metrics(
+    image: Any, path: Path, *,
+    min_entropy: float = 3.0, min_stddev: float = 5.0,
+) -> dict[str, Any]:
     from PIL import ImageStat
 
     rgb = image.convert("RGB")
@@ -129,8 +132,8 @@ def _image_metrics(image: Any, path: Path) -> dict[str, Any]:
         "automatic_pass": (
             rgb.width > 0
             and rgb.height > 0
-            and float(rgb.entropy()) >= 3.0
-            and max(channel_stddev) >= 5.0
+            and float(rgb.entropy()) >= min_entropy
+            and max(channel_stddev) >= min_stddev
             and any(low < high for low, high in extrema)
         ),
     }
@@ -281,6 +284,14 @@ def main() -> int:
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--profile", default="balanced")
     parser.add_argument("--steps", type=int, default=0)
+    parser.add_argument(
+        "--min-entropy", type=float, default=3.0,
+        help="automatic gate 最小图像熵阈值（默认 3.0）",
+    )
+    parser.add_argument(
+        "--min-stddev", type=float, default=5.0,
+        help="automatic gate 最小通道标准差阈值（默认 5.0）",
+    )
     parser.add_argument("--seed-limit", type=int, default=0)
     parser.add_argument("--strength", action="append", type=_parse_strength, default=[])
     parser.add_argument("--prompt", default="")
@@ -374,7 +385,10 @@ def main() -> int:
                 output_path = output_dir / (
                     f"strength-{_strength_label(strength)}-seed-{seed}.png"
                 )
-                metrics = _image_metrics(result.image, output_path)
+                metrics = _image_metrics(
+                    result.image, output_path,
+                    min_entropy=args.min_entropy, min_stddev=args.min_stddev,
+                )
                 metrics.update(
                     {
                         "seed": seed,

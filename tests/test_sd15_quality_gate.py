@@ -14,7 +14,49 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from quality_gate_sd15 import _apply_manual_reviews, _parse_reviewer  # noqa: E402
+from quality_gate_sd15 import (  # noqa: E402
+    _apply_manual_reviews,
+    _image_metrics,
+    _parse_reviewer,
+)
+
+
+class TestImageMetricsThresholds:
+    """T-2：automatic gate 阈值参数化（--min-entropy/--min-stddev）。
+
+    合成高熵噪声图在默认阈值下通过；调高阈值后同一图必须失败，
+    证明阈值确实参与判定（而非仅记录）。
+    """
+
+    @staticmethod
+    def _noise_image():
+        from PIL import Image
+        import random
+        rng = random.Random(42)
+        img = Image.new("RGB", (64, 64))
+        img.putdata(
+            [(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+             for _ in range(64 * 64)]
+        )
+        return img
+
+    def test_default_thresholds_pass_noise(self, tmp_path):
+        metrics = _image_metrics(self._noise_image(), tmp_path / "a.png")
+        assert metrics["automatic_pass"] is True
+
+    def test_raised_entropy_threshold_fails_same_image(self, tmp_path):
+        metrics = _image_metrics(
+            self._noise_image(), tmp_path / "b.png",
+            min_entropy=100.0,  # 高熵噪声图也到不了
+        )
+        assert metrics["automatic_pass"] is False
+
+    def test_raised_stddev_threshold_fails_same_image(self, tmp_path):
+        metrics = _image_metrics(
+            self._noise_image(), tmp_path / "c.png",
+            min_stddev=100.0,
+        )
+        assert metrics["automatic_pass"] is False
 
 
 def _report(automatic_pass=True, reviews=None, status=None):
