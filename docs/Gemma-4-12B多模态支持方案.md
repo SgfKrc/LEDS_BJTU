@@ -296,8 +296,8 @@ fixture 以 `0.8/0.6` 穿过预注册的 `0.70/0.50` advisory 阈值，仅证明
 | G4.3.1 原生绑定/ABI 预检 | Completed（2026-08-11） | 独立只读 worker、MTMD 必需 ABI、项目锁定 revision/当前 binding 版本、SHA 强制与路径脱敏契约 | 定向 `56 passed / 2 skipped`；全量 `1934 passed / 13 skipped`；开发机 `llama-cpp-python 0.3.28` 报告 MTMD ABI 完整；无工件时明确 `gate_passed=false` |
 | G4.3.2A 官方工件身份与资源准入 | Completed（2026-08-11） | 固定官方 manifest/许可、主 GGUF/mmproj 双 SHA 与元数据配对；资源门先于原生初始化 | `gemma4-native-assets --full-hash` 通过；两次预检可用 RAM 约 5-6GiB 小于约 8.74GiB 门，安全返回 `resource_rejected`，未加载模型；定向 `59 passed / 2 skipped`，当前全量 `1942 passed / 8 skipped` |
 | EX-N3-GEMMA-S1 静态质量证据桥接 | Completed（2026-08-13） | 模型/判题契约 SHA 绑定、两项计数投影、脱敏拒绝、v2 schema 与报告汇总 | 7 项专项静态回归通过；不运行 Gemma/Ollama/图像，`0.8/0.6` fixture 不构成模型或阈值验收 |
-| G4.3.2B 原生初始化与图片 smoke | Blocked（资源门） | CPU-only 初始化、固定测试图与 Ollama 图像语义对照 | 可用 RAM 达到报告门且 Ollama 未驻留后，先得 `ready_for_image_smoke`，再验证语义一致；未知配对/摘要/初始化均 fail-closed |
-| G4.3.3 音频、资源、打包与分布式 | Candidate | 音频契约、8K/16K、取消/卸载/OOM、CPU/GPU offload、Windows/Linux 离线包、调度 | 所有门通过后才可新增 recipe 或让调度选中原生路径 |
+| G4.3.2B 原生初始化与图片 smoke | Completed（2026-08-13） | CPU-only 初始化、固定测试图与 Ollama 图像语义对照 | `gemma4_native_image_smoke.py` 实测 sd-001（red apple on wooden table）→ 语义正确描述；`<channel|>` 剥离生效；资源门 fail-closed 实测有效；产品路径仍推荐 Ollama，后续缺口见 §5.6 |
+| G4.3.3 音频、资源、打包与分布式 | Candidate | 音频契约、8K/16K、取消/卸载/OOM、CPU/GPU offload、Windows/Linux 离线包、调度 | 所有门通过后才可新增 recipe 或让调度选中原生路径（逐项验收见 §5.6） |
 
 ---
 
