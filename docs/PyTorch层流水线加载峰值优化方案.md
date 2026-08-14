@@ -292,4 +292,57 @@
 
 1. 将 `consume` 接到目标 sidecar session 的真实 filtered assignment/hidden/KV 执行，要求输入 artifact 只在目标进程内解析，并把下一跳输出重新登记为新的 path-free network reference。
 2. 增加消费中断、重复 consume、目标重启、epoch 变化和输入/输出摘要不一致的事务回收矩阵；消费失败必须回收当前 transfer 和目标 sidecar，不得回退整模。
+
+### 8.26 `PT-PIPE-QW3.12` 目标侧 sidecar 消费闭环（开发门 Completed，2026-08-14）
+
+- `Qwen3NetworkSidecarExecutor` 将目标节点的 sidecar session 接到 network `consume`：filtered assignment、hidden handoff 和 KV artifact 只在目标进程本地解析，decode 复用目标段 prefill KV；控制面不接收本地路径、tensor 或完整模型。
+- coordinator 新增 `receiving -> committed -> consuming -> consumed` 状态机。相同消费合同重试返回缓存结果，合同变化和并发重复消费 fail-closed；目标 executor 异常、取消、sidecar 清理失败和输入摘要不一致都会回收 transfer/输出工件，禁止 full-model fallback。
+- 目标 executor 产出的文件由 coordinator 在目标 artifact root 内复核字节数/SHA 并登记新的 path-free `output_reference`，绑定下一段 source/target、chain、generation、phase 和 segment boundary；目标重启时清理遗留 `qwen3-consume-*` 工件，peer epoch 前进时回收旧 transfer 与已登记输出。
+- `Qwen3NetworkHandoffTransport.transfer_reference/transfer_and_consume` 提供不解析目标路径的上传与消费 API；旧 `transfer/resolve` 保留给已有同机模拟链，真实远端下一跳数据搬运、双机 CUDA parity、异构转换和生产路由仍后置。
+- 新增目标执行适配、重复消费、失败回收、epoch fencing、重启工件回收、path-free transfer-and-consume 及 sidecar executor 专项；QW3 专项当前 `144 passed`，真实模型/双机/CUDA 验收未开启。
+
+### 8.27 下一票：`PT-PIPE-QW3.13` path-free 输出 reference 的远端下一跳传输
+
+1. 基于 `output_reference` 增加源节点目标端有界输出读取/下一目标上传协议，保持 source/target 两端都不交换本地路径，覆盖 2/3 节点 prefill/decode 和断线续传。
+2. 把 target sidecar session 的持久 generation/KV 账本接入下一跳重试，补目标重启后的 reference 失效、输出摘要复核和逐节点 release；真实双机/CUDA parity 与生产准入继续独立后置。
 3. 在不改变主运行时 `transformers==4.47.x` 和不引入硬件前置的前提下，先完成 2/3 节点 CPU 合成链，再把真实双机、CUDA parity、异构 dtype/device 转换交给独立验收票。
+
+### 8.28 `PT-PIPE-QW3.13` path-free 输出下一跳数据面（开发门 Completed，2026-08-14）
+
+- `Qwen3NetworkTransferCoordinator.read_output_chunk` 以 `output_reference`、认证 peer 和有界 offset/limit 读取源端登记输出；每个 chunk 都重新核对文件 bytes/SHA，路径不存在、摘要变化或 peer 越界会立即使 reference 失效并定向清理。
+- artifact transfer client 新增 `upload_chunks`，统一复用 GET offset、顺序 PATCH、断线续传和 POST commit；本地路径上传也改走该状态机。目标端新增二进制 output route，仅返回 bytes、offset/total、SHA 和 EOF 响应头，不返回路径或完整控制 JSON。
+- `Qwen3NetworkHandoffTransport.transfer_registered_output` 将源端 chunk reader 接到下一目标的既有 `.part`/receipt 管线，提交前后复核 chain、generation、phase、segment boundary、bytes/SHA；连接中断保留 target staging 与 source reference 供重试，协议/摘要/拓扑错误才回收。
+- CPU 合成覆盖 2/3 节点 path-free 下一跳、chunk provider 元数据绑定、输出摘要篡改、offset/EOF、逐条 release；传输/网络专项当前 `36 passed`。尚未接入真实双机、CUDA parity、持久 generation/KV ledger 和生产路由，不能据此宣称远端模型等价。
+
+### 8.29 下一票：`PT-PIPE-QW3.14` 持久账本与多阶段重试收口
+
+1. 将 generation/KV ledger 与 `transfer_registered_output` 的计划、确认、重试 offset 和 target restart projection 持久化绑定；target 重启后只接受仍在活动合同且摘要可复核的 reference。
+2. 增加 source output reference 的显式逐节点 release/lease、重复提交幂等、跨阶段 prefill/decode 和 2/3 节点完整重试矩阵；连接失败不得丢失可续传状态，过期/撤销必须清理两端。
+3. 继续保持主运行时 `transformers==4.47.x`、`full_model_materialized=false` 和无硬件开发门；真实双机/CUDA parity、吞吐/时延与生产准入另开验收票。
+
+### 8.30 `PT-PIPE-QW3.14` 持久账本与多阶段重试（开发门 Completed，2026-08-14）
+
+- 新增用户主节点 SQLite `qwen3_network_ledger_v1` 投影，保存 active contract、generation、phase、transfer descriptor/状态、确认 offset、KV shape/phase 摘要和 output lease/next transfer 关系；不保存路径、ticket、tensor 或完整模型。
+- Scheduler 配置 network coordinator 时自动挂接 ledger load/save。coordinator 在 begin/commit/consume/progress/lease/output-progress/commit-output/release 等边界同步投影；同一 lease/commit 可幂等重放，已确认 offset 禁止回退。
+- 目标/源节点重启加载账本后，旧 transfer/output 记录 fail-closed 标为 `invalidated`，旧消费输出不复活；仍可在相同 canonical contract/generation 下重新 activate，陈旧 generation 继续拒绝。prefill 消费完成后允许 phase finish 并进入 decode，KV contract 保留 generation/phase 摘要。
+- `transfer_registered_output` 在同一 transport 内复用 pending plan/ticket，断线后的再次调用从目标已确认 offset 继续；连接失败保留 lease/staging，摘要、协议、拓扑和过期错误同时回收两端。显式 `release_registered_output` 完成源 output 逐节点释放。
+- 账本/网络专项 `44 passed`，QW3 全线专项 `153 passed`。真实双机、CUDA parity、真实模型、生产路由和生产准入仍未开启。
+
+### 8.31 `PT-PIPE-QW3.15` 实施计划（已执行，2026-08-14）
+
+1. 在现有独立进程 helper 上接通 `consume -> output_reference -> transfer_registered_output -> consume` 自动串联，覆盖 2/3 节点 prefill/decode、KV 代际和 source output release，不再只由测试逐步调用底层 API。
+2. 增加 target restart、peer epoch 变化、ticket 过期、重复提交和中途撤销的端到端矩阵；对不可恢复错误输出可审计的 ledger terminal state，禁止残留 lease/staging。
+3. 继续保持主运行时 `transformers==4.47.x`、`full_model_materialized=false` 和无硬件开发门；真实双机/CUDA parity、吞吐/时延和生产准入另开验收票。
+
+### 8.32 `PT-PIPE-QW3.15` 多进程端到端 sidecar 串联（开发门 Completed，2026-08-14）
+
+- `Qwen3NetworkHandoffTransport.execute_target_chain` 已把 `consume -> output_reference -> transfer_registered_output -> next consume -> source release` 收口为一次受 canonical contract、generation、phase、segment topology 和 peer authorization 约束的调用，覆盖 2/3 节点 prefill/decode 与 KV generation；失败按 connection retry 或 fail-closed cleanup 分类。
+- `tests/helpers/qwen3_network_node.py` 新增用户主节点 ledger 的 JSON 投影测试适配器和目标进程 synthetic executor。跨进程测试只让目标 executor 读取本地 artifact，返回控制面的是摘要、bytes、shape、phase 等 metadata；不交换路径、ticket 或 tensor。
+- 目标节点使用同一 ledger 重启后，旧 transfer/output 记录被标记为 `invalidated`，output reference 不可重放；孤儿消费文件、`.part` staging 和旧 lease 被清理。当前已覆盖 happy path 与 target restart，TTL、peer epoch、重复提交、中途撤销的完整矩阵仍待下一票。
+- `.venv-test` 验证：网络专项 `28 passed`，ledger/transfer/sidecar/state 合并 `53 passed`，QW3 全线 `156 passed`；此前 `pytest-timeout` 错误来自主环境调用嵌套 pytest，`scripts/run_simulation.py` 现优先选择仓库 `.venv-test`。
+
+### 8.33 下一票：`PT-PIPE-QW3.16` 故障矩阵与真实 sidecar CPU smoke
+
+1. 在独立进程中补齐 peer epoch 变化、ticket TTL、重复 submit/commit、中途 revoke、断线重试和 ledger terminal state，逐项断言 output lease、transfer record 与 `.part` staging 无残留。
+2. 将 synthetic target executor 替换为已经存在的隔离 sidecar executor，先以无硬件依赖的 Qwen3 assignment CPU smoke 验证真实 hidden/KV 输入输出，再决定是否进入真实 CUDA/双机验收。
+3. 保持主运行时 `transformers==4.47.x`、sidecar 隔离、`full_model_materialized=false` 和禁止 full-model fallback；生产 API 路由、双机/CUDA parity、吞吐时延和生产准入继续后置。
