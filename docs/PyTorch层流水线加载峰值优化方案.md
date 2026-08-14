@@ -369,10 +369,11 @@
   - **2 节点真实链**（node-b `[0,1]+embedding`）：真实 torch artifact 的 prefill→decode、KV 契约（prefill 4 + 新 token 1 = 5）、`full_model_materialized=false`、无段间 release（末段输出保留）；
   - **重复 consume 幂等**（同合同同参数返回缓存结果，输出 reference 一致）；
   - **revoke 中断清理**（取消后无 `qwen3-consume-*` 残留，已撤销 transfer 再 consume fail-closed）；
-  - **3 节点链**（node-b/node-c 级联 output reference）已实现，RAM 准入 ≥5GB 当前跳过（本机可用 4GB），代码就绪待窗口。
-- 回归：sidecar/network/真实链专项 `38 passed / 2 skipped`；QW3.17 全程保持 sidecar 独立环境、`transformers==4.47.x` 主运行时、禁整模回退；真实 CUDA/双机 parity、吞吐时延与生产准入继续后置。
+  - **3 节点链**（node-b `[0,1]+embedding` → node-c `[1,2]` 级联 output reference 与 KV generation 交接）：**RAM 腾出后实测通过（2026-08-14 晚，可用 9.7GB）**，`prefill/decode` 各 2 段执行、段 1 输出转发前 release 一次、`full_model_materialized=false`；decode 依赖 prefill KV 的跨阶段保留由 executor KV 副本承载（见下）。
+- **修复 `Qwen3NetworkSidecarExecutor` KV 生命周期**：prefill 段间转发完成后传输层 release 会删除 output 文件（传输副本），而 decode 仍需 prefill 的 `past_key_values`——executor 现为 KV 单独保留副本（`qwen3-kv-*.pt`，cleanup 时一并清理），decode 不再丢失 KV 载体（3 节点链实测暴露并修复）。
+- 回归：sidecar/network/真实链专项 `40 passed`；QW3.17 全程保持 sidecar 独立环境、`transformers==4.47.x` 主运行时、禁整模回退；真实 CUDA/双机 parity、吞吐时延与生产准入继续后置。
 
-### 8.37 下一票：`PT-PIPE-QW3.18` 真实 3 节点链与断线续传矩阵（RAM 窗口）
+### 8.37 下一票：`PT-PIPE-QW3.18` PATCH 断线续传矩阵与真实链收口
 
-1. 在可用 RAM ≥5GB 窗口执行 3 节点真实链（node-b `[0,1]+embedding` → node-c `[1,2]` 的 output reference 级联与 KV generation 交接）；补齐真实模式下 PATCH 断线续传（`.part` offset 只续传确认段）、重复 status/commit 与 ledger progress 对照。
-2. 保持合成矩阵全部回归（`test_qwen3_pipeline_network.py` 的 lost_ack/resume 等）与 `full_model_materialized=false`；真实 CUDA/双机 parity、异构 dtype/device 转换和生产准入继续独立后置。
+1. 补齐真实模式（helper 真实 sidecar）下 PATCH 断线续传（`.part` offset 只续传确认段）、重复 status/commit 与 ledger progress 对照——合成矩阵（`test_qwen3_pipeline_network.py` lost_ack/resume）已覆盖，真实模式补关键场景后 QW3 合成链全部收口。
+2. 保持 `full_model_materialized=false` 与全部合成回归；真实 CUDA/双机 parity、异构 dtype/device 转换和生产准入继续独立后置；QW3 合成链收官后主线转五期 `PT-PIPE-MM1`（Qwen3-VL/Qwen3.5 多模态组件编排）。

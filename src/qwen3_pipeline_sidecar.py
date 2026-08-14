@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -527,7 +528,14 @@ class Qwen3NetworkSidecarExecutor:
         )
         self._outputs[key] = output
         if phase == "prefill":
-            self._prefill_outputs[(chain_id, segment_index)] = output
+            # KV 载体必须跨 prefill/decode 保留：段间转发完成后传输层会
+            # release 删除 output（传输副本），decode 仍需 prefill 的
+            # past_key_values——为 KV 单独保留副本（cleanup 时一并清理）。
+            kv_copy = self.artifact_root / (
+                f"qwen3-kv-{chain_id}-{segment_index}-{generation}.pt"
+            )
+            shutil.copy2(output, kv_copy)
+            self._prefill_outputs[(chain_id, segment_index)] = kv_copy
         return {**dict(report), "output_path": str(output)}
 
     def cleanup(self, request: Mapping[str, Any], reason_code: str = "cleanup") -> None:

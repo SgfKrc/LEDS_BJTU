@@ -197,8 +197,13 @@ def _run_real_chain(tmp_path, *, segment_count, generation):
     try:
         for index, node_id in enumerate(node_ids, start=1):
             segment = contract["segments"][index]
-            allowed = (["node-a"] if index == 1
-                       else [contract["segments"][index - 1]["node_id"]])
+            # 段 1 的注册表需含段 2 节点：transfer_registered_output 的
+            # output lease 以 target 身份请求 source（for_peer(target signer)）
+            allowed = ["node-a"]
+            if index + 1 < len(contract["segments"]):
+                allowed.append(contract["segments"][index + 1]["node_id"])
+            if index > 1:
+                allowed.append(contract["segments"][index - 1]["node_id"])
             process, state_dir = _spawn_real_node(
                 tmp_path, node_id, ports[node_id], allowed,
                 layer_range=segment["layer_range"],
