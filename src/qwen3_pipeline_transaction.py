@@ -79,6 +79,7 @@ def build_qwen3_dry_run_contract(
     total_layers: int,
     hidden_size: int,
     segments: Iterable[dict[str, Any]],
+    execution_mode: str = "metadata_only",
 ) -> dict[str, Any]:
     """Build one canonical two/three-node Qwen3 transaction contract."""
     config_id = str(config_id or "")
@@ -94,6 +95,9 @@ def build_qwen3_dry_run_contract(
         raise Qwen3PipelineProtocolError("Qwen3 dry-run dimensions are invalid") from exc
     if generation <= 0 or total_layers <= 0 or hidden_size <= 0:
         raise Qwen3PipelineProtocolError("Qwen3 dry-run dimensions are invalid")
+    execution_mode = str(execution_mode or "metadata_only")
+    if execution_mode not in {"metadata_only", "node_local_sidecar"}:
+        raise Qwen3PipelineProtocolError("Qwen3 execution mode is invalid")
     model_sha256 = _require_sha256(model_sha256, "model_sha256")
     raw_segments = list(segments)
     if len(raw_segments) not in {2, 3}:
@@ -244,8 +248,10 @@ def build_qwen3_dry_run_contract(
         "kv_contracts": kv_contracts,
         "full_model_fallback": False,
         "network_dispatch": False,
-        "weight_materialization": False,
+        "weight_materialization": execution_mode == "node_local_sidecar",
     }
+    if execution_mode != "metadata_only":
+        contract["execution_mode"] = execution_mode
     contract["contract_sha256"] = _digest(contract)
     _canonical_bytes(contract, maximum=MAX_CONTRACT_BYTES, label="Qwen3 dry-run contract")
     return contract
@@ -269,6 +275,7 @@ def validate_qwen3_dry_run_contract(contract: dict[str, Any]) -> dict[str, Any]:
         total_layers=contract.get("total_layers", 0),
         hidden_size=contract.get("hidden_size", 0),
         segments=contract.get("segments", []),
+        execution_mode=contract.get("execution_mode", "metadata_only"),
     )
     if rebuilt != contract:
         raise Qwen3PipelineProtocolError("Qwen3 dry-run contract is not canonical")
@@ -324,6 +331,7 @@ class Qwen3PipelineDryRunTransaction:
 
     def _message(self, node_id: str, phase: str) -> dict[str, Any]:
         segment = self._segments[node_id]
+        execution_mode = self.contract.get("execution_mode", "metadata_only")
         message = {
             "schema_version": SCHEMA_VERSION,
             "operation": "qwen3_pipeline_dry_run",
@@ -351,8 +359,10 @@ class Qwen3PipelineDryRunTransaction:
             "full_model_fallback": False,
             "network_dispatch": self.network_dispatch,
             "loopback_only": self.network_dispatch,
-            "weight_materialization": False,
+            "weight_materialization": execution_mode == "node_local_sidecar",
         }
+        if execution_mode != "metadata_only":
+            message["execution_mode"] = execution_mode
         if "assignment_probe" in segment:
             message["assignment_probe"] = dict(segment["assignment_probe"])
         return message
@@ -457,6 +467,8 @@ class Qwen3PipelineDryRunTransaction:
             "status": "prepared" if expected_phase == "prepare" else "ready",
             "full_model_materialized": False,
         }
+        if self.contract.get("execution_mode") == "node_local_sidecar":
+            expected["segment_materialized"] = expected_phase == "commit"
         if any(ack.get(key) != value for key, value in expected.items()):
             return self._abort("qwen3_ack_contract_mismatch", "ACK does not match dry-run contract")
         if expected_phase == "prepare":
@@ -615,7 +627,9 @@ class Qwen3PipelineDryRunTransaction:
             "reason": self.reason,
             "network_dispatch": self.network_dispatch,
             "loopback_only": self.network_dispatch,
-            "weight_materialization": False,
+            "weight_materialization": bool(
+                self.contract.get("execution_mode") == "node_local_sidecar"
+            ),
             "full_model_fallback": False,
         }
 

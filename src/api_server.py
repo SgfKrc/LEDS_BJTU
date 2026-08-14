@@ -7817,6 +7817,123 @@ async def reset_layer_assignments():
     return scheduler.reset_layer_assignments()
 
 
+class Qwen3LocalChainBeginRequest(BaseModel):
+    contract: dict
+
+
+class Qwen3LocalChainExecuteRequest(BaseModel):
+    input_ref: str = Field(..., min_length=1, max_length=2048)
+    batch_size: int = Field(..., ge=1, le=64)
+    sequence_length: int = Field(..., ge=1, le=1048576)
+
+
+class Qwen3LocalChainParityRequest(BaseModel):
+    reference_prefill: str = Field(..., min_length=1, max_length=2048)
+    reference_decode: str = Field(..., min_length=1, max_length=2048)
+    rtol: float = Field(default=1e-4, ge=0.0, le=1.0)
+    atol: float = Field(default=1e-5, ge=0.0, le=1.0)
+
+
+def _require_qwen3_local_master():
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "Qwen3 local chain is available only on the master node")
+    return scheduler
+
+
+def _raise_qwen3_local_http(exc: Exception) -> None:
+    code = str(getattr(exc, "reason_code", "qwen3_local_chain_rejected"))
+    message = str(getattr(exc, "reason", str(exc)))[:2048]
+    status = 409 if any(token in code or token in message.lower() for token in (
+        "phase", "stale", "active", "fenced", "duplicate",
+    )) else 400
+    raise HTTPException(status, {"code": code, "message": message}) from exc
+
+
+@app.get("/api/cluster/qwen3/local-chain")
+async def get_qwen3_local_chain_status():
+    return await run_in_threadpool(_require_qwen3_local_master().get_qwen3_local_chain_status)
+
+
+@app.post("/api/cluster/qwen3/local-chain/begin")
+async def begin_qwen3_local_chain(req: Qwen3LocalChainBeginRequest):
+    try:
+        return await run_in_threadpool(
+            _require_qwen3_local_master().begin_qwen3_local_sidecar_chain,
+            req.contract,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@app.post("/api/cluster/qwen3/local-chain/prefill")
+async def run_qwen3_local_prefill(req: Qwen3LocalChainExecuteRequest):
+    try:
+        return await run_in_threadpool(
+            _require_qwen3_local_master().run_qwen3_local_prefill,
+            input_ref=req.input_ref, batch_size=req.batch_size,
+            sequence_length=req.sequence_length,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@app.post("/api/cluster/qwen3/local-chain/decode")
+async def run_qwen3_local_decode(req: Qwen3LocalChainExecuteRequest):
+    try:
+        return await run_in_threadpool(
+            _require_qwen3_local_master().run_qwen3_local_decode,
+            input_ref=req.input_ref, batch_size=req.batch_size,
+            sequence_length=req.sequence_length,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@app.post("/api/cluster/qwen3/local-chain/parity")
+async def verify_qwen3_local_parity(req: Qwen3LocalChainParityRequest):
+    try:
+        return await run_in_threadpool(
+            _require_qwen3_local_master().verify_qwen3_local_cpu_parity,
+            reference_prefill=req.reference_prefill,
+            reference_decode=req.reference_decode,
+            rtol=req.rtol, atol=req.atol,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@app.post("/api/cluster/qwen3/local-chain/release")
+async def release_qwen3_local_chain():
+    try:
+        return await run_in_threadpool(
+            _require_qwen3_local_master().release_qwen3_local_sidecar_chain,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@app.delete("/api/cluster/qwen3/local-chain")
+async def cancel_qwen3_local_chain():
+    try:
+        return await run_in_threadpool(
+            _require_qwen3_local_master().cancel_qwen3_local_sidecar_chain,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
 # ============================================================
 # 角色转让 API
 # ============================================================
