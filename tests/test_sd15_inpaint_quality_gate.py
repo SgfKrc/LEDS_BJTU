@@ -1,3 +1,7 @@
+import pytest
+
+pytestmark = pytest.mark.quality_gate
+
 import sys
 from pathlib import Path
 

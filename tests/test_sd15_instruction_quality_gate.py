@@ -4,6 +4,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 import pytest
 
+pytestmark = pytest.mark.quality_gate
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))

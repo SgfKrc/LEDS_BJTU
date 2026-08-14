@@ -51,3 +51,31 @@ def test_wheelhouse_disables_network_proxy(monkeypatch, tmp_path):
     assert "--no-index" in command
     assert f"--find-links={tmp_path}" in command
     assert "--proxy" not in command
+
+
+# ================================================================
+# T-4：测试分类报告脚本（scripts/test_classification_report.py）
+# ================================================================
+
+def test_classify_places_quality_gate_and_contract_files():
+    from scripts import test_classification_report as tcr
+
+    files_by_class = tcr.classify_test_files(Path("tests"))
+    # 质量门文件进 quality_gate 类（marker 入口），不被其他类截胡
+    assert "test_sd15_quality_gate.py" in files_by_class["quality_gate"]
+    assert "test_sd15_img2img_quality_gate.py" in files_by_class["quality_gate"]
+    # 契约类文件（命名启发式）
+    assert any("contract" in name for name in files_by_class["contract"])
+    # 每个文件恰好落入一个分类（不重不漏：顶层 + simulation 子目录）
+    top_level = len(list(Path("tests").glob("test_*.py")))
+    sub_level = len(list(Path("tests/simulation").glob("test_*.py")))
+    total_classified = sum(len(v) for v in files_by_class.values())
+    assert total_classified == top_level + sub_level
+
+
+def test_classify_unit_is_fallback_for_unmatched_files():
+    from scripts import test_classification_report as tcr
+
+    files_by_class = tcr.classify_test_files(Path("tests"))
+    # unit 是兜底类，必有内容（多数普通单测文件按命名落入）
+    assert len(files_by_class["unit"]) > 0
