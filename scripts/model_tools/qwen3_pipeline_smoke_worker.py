@@ -243,6 +243,16 @@ def _prepare_filtered_assignment(
     stage = Path(tempfile.mkdtemp(prefix=".qlh-qwen3-assignment-", dir=str(root.parent)))
     try:
         shutil.copy2(root / "config.json", stage / "config.json")
+        # Tokenizer/chat-template support is small and must remain available
+        # inside the filtered assignment; weight shards stay hard-link-first.
+        for support_name in (
+            "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+            "generation_config.json", "chat_template.jinja", "vocab.json",
+            "merges.txt", "spiece.model", "tokenizer.model",
+        ):
+            support = root / support_name
+            if support.is_file():
+                shutil.copy2(support, stage / support_name)
         filtered_map: dict[str, str] = {}
         for key in selected_keys:
             filename = str(weight_map.get(key, "")).replace("\\", "/")

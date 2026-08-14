@@ -525,6 +525,7 @@ class Qwen3PipelineLoopbackWorker:
         base_url: str,
         available_bytes: int | Callable[[dict[str, Any]], int],
         timeout_seconds: float = 2.0,
+        sidecar_session_factory: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.node_id = str(node_id)
         self.secret = str(secret)
@@ -534,10 +535,22 @@ class Qwen3PipelineLoopbackWorker:
         self._nonce_payloads: dict[str, str] = {}
         self._responses: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_contracts: set[str] = set()
+        self._sidecar_session_factory = sidecar_session_factory
+        self._sidecar_sessions: dict[str, Any] = {}
 
     def _capacity(self, message: dict[str, Any]) -> int:
         value = self.available_bytes(message) if callable(self.available_bytes) else self.available_bytes
         return max(0, int(value))
+
+    def abort_sidecar_sessions(self) -> None:
+        """Best-effort cleanup for a TCP disconnect before worker eviction."""
+        sessions = list(self._sidecar_sessions.values())
+        self._sidecar_sessions.clear()
+        for session in sessions:
+            try:
+                session.abort()
+            except Exception:
+                continue
 
     def handle(self, message: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
         nonce, payload_sha256 = verify_loopback_message(
@@ -558,11 +571,16 @@ class Qwen3PipelineLoopbackWorker:
             raise Qwen3LoopbackError(
                 "qwen3_loopback_contract_mismatch", "message is not a Qwen3 dry-run",
             )
+        execution_mode = str(message.get("execution_mode", "metadata_only") or "metadata_only")
+        if execution_mode not in {"metadata_only", "node_local_sidecar"}:
+            raise Qwen3LoopbackError(
+                "qwen3_loopback_contract_mismatch", "loopback execution mode is unsupported",
+            )
         if (
             message.get("node_id") != self.node_id
             or message.get("network_dispatch") is not True
             or message.get("loopback_only") is not True
-            or message.get("weight_materialization") is not False
+            or bool(message.get("weight_materialization")) != (execution_mode == "node_local_sidecar")
             or message.get("full_model_fallback") is not False
         ):
             raise Qwen3LoopbackError(
@@ -594,6 +612,7 @@ class Qwen3PipelineLoopbackWorker:
             "hidden_handoff_sha256": message.get("hidden_handoff_sha256"),
             "layer_range": message.get("layer_range"),
             "full_model_materialized": False,
+            "segment_materialized": False,
         }
         if phase == "prepare":
             capacity = self._capacity(message)
@@ -617,20 +636,54 @@ class Qwen3PipelineLoopbackWorker:
                 probe,
                 timeout_seconds=self.timeout_seconds,
             )
+            sidecar_report = None
+            if execution_mode == "node_local_sidecar":
+                if self._sidecar_session_factory is None:
+                    raise Qwen3LoopbackError(
+                        "qwen3_sidecar_unavailable",
+                        "node-local sidecar execution was requested without a session factory",
+                    )
+                try:
+                    session = self._sidecar_session_factory(dict(message))
+                    sidecar_report = session.prepare()
+                except Qwen3LoopbackError:
+                    raise
+                except Exception as exc:
+                    raise Qwen3LoopbackError(
+                        "qwen3_sidecar_prepare_failed", str(exc),
+                    ) from exc
+                self._sidecar_sessions[contract_sha256] = session
             base_ack.update({
                 "status": "prepared",
                 "available_bytes": capacity,
                 "assignment_probe": report,
                 "assignment_manifest": manifest_report,
             })
+            if sidecar_report is not None:
+                base_ack["sidecar"] = sidecar_report
             self._active_contracts.add(contract_sha256)
         elif phase == "commit":
             if contract_sha256 not in self._active_contracts:
                 raise Qwen3LoopbackError(
                     "qwen3_loopback_not_prepared", "commit has no prepared loopback state",
                 )
+            sidecar = self._sidecar_sessions.get(contract_sha256)
+            sidecar_report = None
+            if sidecar is not None:
+                try:
+                    sidecar_report = sidecar.commit()
+                except Exception as exc:
+                    try:
+                        sidecar.abort()
+                    except Exception:
+                        pass
+                    self._sidecar_sessions.pop(contract_sha256, None)
+                    raise Qwen3LoopbackError(
+                        "qwen3_sidecar_commit_failed", str(exc),
+                    ) from exc
             base_ack.update({
                 "status": "ready",
+                "segment_materialized": sidecar is not None,
                 "kv_cache_probe": {
                     "segment_index": message.get("segment_index"),
                     "layer_range": message.get("layer_range"),
@@ -642,7 +695,22 @@ class Qwen3PipelineLoopbackWorker:
                     "cleared": True,
                 },
             })
+            if sidecar_report is not None:
+                base_ack["sidecar"] = sidecar_report
         elif phase == "release":
+            sidecar = self._sidecar_sessions.pop(contract_sha256, None)
+            sidecar_report = None
+            if sidecar is not None:
+                try:
+                    sidecar_report = sidecar.release()
+                except Exception as exc:
+                    try:
+                        sidecar.abort()
+                    except Exception:
+                        pass
+                    raise Qwen3LoopbackError(
+                        "qwen3_sidecar_release_failed", str(exc),
+                    ) from exc
             self._active_contracts.discard(contract_sha256)
             self._responses.clear()
             self._nonce_payloads.clear()
@@ -656,6 +724,8 @@ class Qwen3PipelineLoopbackWorker:
                 "status": "released",
                 "release": True,
             }
+            if sidecar_report is not None:
+                base_ack["sidecar"] = sidecar_report
         else:
             raise Qwen3LoopbackError(
                 "qwen3_loopback_phase_invalid", "loopback phase is not supported",

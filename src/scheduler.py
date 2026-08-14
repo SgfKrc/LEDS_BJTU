@@ -17,6 +17,7 @@ import importlib.util
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -41,6 +42,12 @@ from qwen3_pipeline_loopback import (
     sign_loopback_message,
     validate_loopback_base_url,
     verify_loopback_message,
+)
+from qwen3_pipeline_sidecar import Qwen3PipelineSidecarSession, Qwen3SidecarError
+from qwen3_pipeline_multisidecar import (
+    Qwen3MultiSidecarError,
+    Qwen3PipelineMultiSidecar,
+    cleanup_qwen3_local_artifacts,
 )
 
 from task_provider import (
@@ -1084,6 +1091,15 @@ class Scheduler:
         self._qwen3_loopback_base_url = ""
         self._qwen3_loopback_workers: dict[str, Qwen3PipelineLoopbackWorker] = {}
         self._qwen3_loopback_ack_nonces: dict[str, str] = {}
+        self._qwen3_local_chain: Optional[Qwen3PipelineMultiSidecar] = None
+        self._qwen3_local_contract: Optional[dict] = None
+        self._qwen3_local_parity: dict = {}
+        self._qwen3_local_chain_lock = threading.RLock()
+        self._qwen3_local_artifact_root_override: Optional[str] = None
+        self._qwen3_network_handoff_transport = None
+        self._qwen3_network_transfer_coordinator = None
+        self._qwen3_artifact_transfer_runtime = None
+        self._qwen3_peer_request_verifier = None
         self._active_pipeline_capacity_plan: Optional[dict] = None
         self._prepared_layer_configs: dict[str, dict] = {}
         # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
@@ -3621,6 +3637,403 @@ class Scheduler:
             "outbound": outbound,
         }
 
+    def begin_qwen3_pipeline_sidecar(
+        self, contract: dict, *, assignment_base_url: str,
+    ) -> dict:
+        """Explicitly opt into node-local sidecar materialization.
+
+        The normal QW3.5 entry point remains metadata-only.  This method is
+        intentionally separate so production admission cannot silently turn
+        on segment loading while the cross-node tensor data plane is absent.
+        """
+        if contract.get("execution_mode") != "node_local_sidecar":
+            raise Qwen3PipelineProtocolError(
+                "Qwen3 sidecar entry requires execution_mode=node_local_sidecar"
+            )
+        return self.begin_qwen3_pipeline_loopback(
+            contract, assignment_base_url=assignment_base_url,
+        )
+
+    def _qwen3_local_artifact_root(self) -> Path:
+        if self._qwen3_local_artifact_root_override:
+            root = Path(self._qwen3_local_artifact_root_override)
+        else:
+            from config import STATE_DIR
+
+            root = Path(STATE_DIR) / "qwen3-local-chain"
+        root = root.expanduser().absolute().resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def is_qwen3_authenticated_transfer_peer(self, peer_node_id: str) -> bool:
+        """Project the live TCP HMAC registration state into HTTP auth."""
+        peer = str(peer_node_id or "")
+        if not peer:
+            return False
+        if self._effective_role() == "master":
+            server = getattr(self, "_tcp_server", None)
+            return bool(
+                server
+                and getattr(server, "_running", False)
+                and server.is_authenticated_loopback_client(peer)
+            )
+        client = getattr(self, "_tcp_client", None)
+        return bool(
+            peer == "master"
+            and client
+            and getattr(client, "_running", False)
+            and getattr(client, "_registered", False)
+        )
+
+    def is_qwen3_authenticated_transfer_peer_epoch(
+        self, peer_node_id: str, peer_epoch: int,
+    ) -> bool:
+        """Check the exact TCP registration epoch used to sign a request."""
+        peer = str(peer_node_id or "")
+        try:
+            epoch = int(peer_epoch)
+        except (TypeError, ValueError):
+            return False
+        if epoch < 0:
+            return False
+        if self._effective_role() == "master":
+            server = getattr(self, "_tcp_server", None)
+            epoch_checker = getattr(server, "is_authenticated_loopback_peer", None)
+            if not callable(epoch_checker):
+                return bool(
+                    server
+                    and getattr(server, "_running", False)
+                    and int(epoch) == 0
+                    and server.is_authenticated_loopback_client(peer)
+                )
+            return bool(
+                server
+                and getattr(server, "_running", False)
+                and epoch_checker(peer, epoch)
+            )
+        client = getattr(self, "_tcp_client", None)
+        return bool(
+            peer == "master"
+            and client
+            and getattr(client, "_running", False)
+            and getattr(client, "_registered", False)
+            and int(getattr(client, "registration_epoch", 0)) == epoch
+        )
+
+    def configure_qwen3_artifact_transfer(
+        self,
+        runtime,
+        *,
+        handoff_transport=None,
+        network_coordinator=None,
+        peer_verifier=None,
+    ) -> dict:
+        """Explicit QW3.10 wiring; it does not admit the production route."""
+        from qwen3_pipeline_data_plane import Qwen3ArtifactTransferRuntime
+        from qwen3_pipeline_network import Qwen3NetworkTransferCoordinator
+        from qwen3_pipeline_peer_auth import Qwen3PeerRequestVerifier
+
+        if not isinstance(runtime, Qwen3ArtifactTransferRuntime):
+            raise Qwen3PipelineProtocolError("Qwen3 artifact transfer runtime is invalid")
+        if network_coordinator is not None and not isinstance(
+            network_coordinator, Qwen3NetworkTransferCoordinator,
+        ):
+            raise Qwen3PipelineProtocolError("Qwen3 network coordinator is invalid")
+        if peer_verifier is None:
+            secret = self._qwen3_cluster_secret()
+            if not secret:
+                raise Qwen3PipelineProtocolError("Qwen3 cluster secret is unavailable")
+            peer_verifier = Qwen3PeerRequestVerifier(
+                secret,
+                is_authenticated_peer=self.is_qwen3_authenticated_transfer_peer,
+                is_authenticated_peer_epoch=self.is_qwen3_authenticated_transfer_peer_epoch,
+                require_peer_epoch=True,
+            )
+        self._qwen3_artifact_transfer_runtime = runtime
+        self._qwen3_network_transfer_coordinator = network_coordinator
+        self._qwen3_peer_request_verifier = peer_verifier
+        self._qwen3_network_handoff_transport = handoff_transport
+        return {
+            "enabled": True,
+            "network_handoffs": handoff_transport is not None,
+            "network_control": network_coordinator is not None,
+            "production_admitted": False,
+            "runtime": runtime.snapshot(),
+        }
+
+    @staticmethod
+    def _qwen3_local_state_load() -> dict:
+        from qwen3_pipeline_state import load_qwen3_local_chain_state
+
+        return load_qwen3_local_chain_state()
+
+    @staticmethod
+    def _qwen3_local_state_save(value: dict) -> dict:
+        from qwen3_pipeline_state import save_qwen3_local_chain_state
+
+        return save_qwen3_local_chain_state(value)
+
+    def _qwen3_local_state_from_chain(
+        self, contract: dict, chain: Qwen3PipelineMultiSidecar, *, parity: dict | None = None,
+    ) -> dict:
+        contract = self._qwen3_local_contract or contract
+        snapshot = chain.snapshot
+        return {
+            "schema_version": 1,
+            "contract_sha256": str(contract.get("contract_sha256", "")),
+            "config_id": str(contract.get("config_id", "")),
+            "plan_id": str(contract.get("plan_id", "")),
+            "generation": int(contract.get("generation", 0) or 0),
+            "phase": str(snapshot.get("phase", "idle")),
+            "segment_count": int(snapshot.get("segment_count", 0) or 0),
+            "cleanup_complete": bool(snapshot.get("cleanup_complete", False)),
+            "parity": dict(parity if parity is not None else self._qwen3_local_parity),
+        }
+
+    def _qwen3_local_reconcile_locked(self) -> dict:
+        persisted = self._qwen3_local_state_load()
+        active_phases = {
+            "starting", "prepared", "committed", "prefilled", "decoded", "parity_passed",
+        }
+        if self._qwen3_local_chain is not None:
+            return self._qwen3_local_state_from_chain(
+                {"contract_sha256": self._qwen3_local_chain.chain_id},
+                self._qwen3_local_chain,
+                parity=self._qwen3_local_parity or persisted.get("parity", {}),
+            )
+        if persisted.get("phase") not in active_phases:
+            return persisted
+        cleanup = cleanup_qwen3_local_artifacts(
+            self._qwen3_local_artifact_root(), persisted.get("contract_sha256", ""),
+        )
+        transport = self._qwen3_network_handoff_transport
+        if transport is not None:
+            try:
+                network_cleanup = transport.cleanup()
+            except Exception:
+                network_cleanup = {"cleanup_complete": False}
+            cleanup["cleanup_complete"] = bool(
+                cleanup.get("cleanup_complete")
+                and network_cleanup.get("cleanup_complete")
+            )
+        recovered = {
+            **persisted,
+            "phase": "recovered_aborted",
+            "cleanup_complete": bool(cleanup.get("cleanup_complete")),
+            "parity": {},
+        }
+        return self._qwen3_local_state_save(recovered)
+
+    def begin_qwen3_local_sidecar_chain(self, contract: dict) -> dict:
+        """Explicit local-only QW3.8 entry; production pipeline remains untouched."""
+        if contract.get("execution_mode") != "node_local_sidecar":
+            raise Qwen3PipelineProtocolError(
+                "Qwen3 local chain requires execution_mode=node_local_sidecar"
+            )
+        with self._qwen3_local_chain_lock:
+            persisted = self._qwen3_local_reconcile_locked()
+            contract_sha = str(contract.get("contract_sha256", "") or "")
+            generation = int(contract.get("generation", 0) or 0)
+            if self._qwen3_local_chain is not None:
+                if self._qwen3_local_chain.chain_id == contract_sha:
+                    return {"status": "duplicate", "state": self._qwen3_local_state_from_chain(contract, self._qwen3_local_chain)}
+                raise Qwen3PipelineProtocolError("another Qwen3 local chain is active")
+            if persisted.get("contract_sha256") == contract_sha and contract_sha:
+                raise Qwen3PipelineProtocolError("Qwen3 local chain submission is already fenced")
+            if generation <= int(persisted.get("generation", 0) or 0) and persisted.get("contract_sha256"):
+                raise Qwen3PipelineProtocolError("Qwen3 local chain generation is stale")
+            root = self._qwen3_local_artifact_root()
+            starting = self._qwen3_local_state_save({
+                "contract_sha256": contract_sha,
+                "config_id": contract.get("config_id", ""),
+                "plan_id": contract.get("plan_id", ""),
+                "generation": generation,
+                "phase": "starting",
+                "segment_count": len(contract.get("segments", [])),
+                "cleanup_complete": False,
+            })
+            chain: Qwen3PipelineMultiSidecar | None = None
+            try:
+                chain_options = {
+                    "contract": contract,
+                    "artifact_root": root,
+                    "session_factory": self._qwen3_sidecar_session_from_message,
+                }
+                if self._qwen3_network_handoff_transport is not None:
+                    chain_options["handoff_transport"] = self._qwen3_network_handoff_transport
+                chain = Qwen3PipelineMultiSidecar.from_contract(**chain_options)
+                self._qwen3_local_chain = chain
+                self._qwen3_local_contract = dict(contract)
+                self._qwen3_local_parity = {}
+                chain.prepare()
+                self._qwen3_local_state_save(self._qwen3_local_state_from_chain(contract, chain))
+                chain.commit()
+                state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(contract, chain))
+                return {"status": "started", "state": state}
+            except Exception:
+                if chain is not None:
+                    try:
+                        chain.abort()
+                    except Exception:
+                        pass
+                    self._qwen3_local_state_save(self._qwen3_local_state_from_chain(contract, chain))
+                else:
+                    self._qwen3_local_state_save({**starting, "phase": "aborted", "cleanup_complete": True})
+                self._qwen3_local_chain = None
+                self._qwen3_local_contract = None
+                self._qwen3_local_parity = {}
+                raise
+
+    def _qwen3_local_require_chain(self) -> Qwen3PipelineMultiSidecar:
+        chain = self._qwen3_local_chain
+        if chain is None:
+            raise Qwen3PipelineProtocolError("no Qwen3 local chain is active")
+        return chain
+
+    def run_qwen3_local_prefill(self, *, input_ref: str, batch_size: int, sequence_length: int) -> dict:
+        with self._qwen3_local_chain_lock:
+            chain = self._qwen3_local_require_chain()
+            try:
+                chain.prefill(input_ref=input_ref, batch_size=batch_size, sequence_length=sequence_length)
+                state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                ))
+                return {"status": "prefilled", "state": state}
+            except Exception:
+                chain.abort()
+                self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                ))
+                self._qwen3_local_chain = None
+                self._qwen3_local_contract = None
+                self._qwen3_local_parity = {}
+                raise
+
+    def run_qwen3_local_decode(self, *, input_ref: str, batch_size: int, sequence_length: int) -> dict:
+        with self._qwen3_local_chain_lock:
+            chain = self._qwen3_local_require_chain()
+            try:
+                chain.decode(input_ref=input_ref, batch_size=batch_size, sequence_length=sequence_length)
+                state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                ))
+                return {"status": "decoded", "state": state}
+            except Exception:
+                chain.abort()
+                self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                ))
+                self._qwen3_local_chain = None
+                self._qwen3_local_contract = None
+                self._qwen3_local_parity = {}
+                raise
+
+    def verify_qwen3_local_cpu_parity(
+        self,
+        *,
+        reference_prefill: str,
+        reference_decode: str,
+        rtol: float = 1e-4,
+        atol: float = 1e-5,
+    ) -> dict:
+        from qwen3_pipeline_parity import evaluate_qwen3_cpu_parity
+
+        with self._qwen3_local_chain_lock:
+            chain = self._qwen3_local_require_chain()
+            if chain.phase != "decoded":
+                raise Qwen3PipelineProtocolError("Qwen3 CPU parity requires decoded local chain")
+            report = evaluate_qwen3_cpu_parity(
+                artifact_root=self._qwen3_local_artifact_root(),
+                reference_prefill=reference_prefill,
+                candidate_prefill=chain.final_output_ref("prefill"),
+                reference_decode=reference_decode,
+                candidate_decode=chain.final_output_ref("decode"),
+                prefill_artifacts=chain.artifact_refs("prefill"),
+                prefill_reports=chain.execution_reports("prefill"),
+                decode_artifacts=chain.artifact_refs("decode"),
+                decode_reports=chain.execution_reports("decode"),
+                segment_count=len(chain.sessions),
+                generation=chain.generation,
+                rtol=rtol,
+                atol=atol,
+            )
+            if report.get("gate_passed") is not True:
+                chain.cancel()
+                self._qwen3_local_parity = dict(report)
+                state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                    parity=report,
+                ))
+                self._qwen3_local_chain = None
+                self._qwen3_local_contract = None
+                self._qwen3_local_parity = {}
+                return {"status": "rejected", "state": state, "parity": report}
+            chain.phase = "parity_passed"
+            self._qwen3_local_parity = dict(report)
+            state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                parity=report,
+            ))
+            return {"status": "passed", "state": state, "parity": report}
+
+    def release_qwen3_local_sidecar_chain(self) -> dict:
+        with self._qwen3_local_chain_lock:
+            chain = self._qwen3_local_require_chain()
+            try:
+                chain.release()
+                state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                ))
+                self._qwen3_local_chain = None
+                self._qwen3_local_contract = None
+                self._qwen3_local_parity = {}
+                return {"status": "released", "state": state}
+            except Exception:
+                chain.abort()
+                self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                    {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+                ))
+                self._qwen3_local_chain = None
+                self._qwen3_local_contract = None
+                self._qwen3_local_parity = {}
+                raise
+
+    def cancel_qwen3_local_sidecar_chain(self) -> dict:
+        with self._qwen3_local_chain_lock:
+            chain = self._qwen3_local_chain
+            if chain is None:
+                with_state = self._qwen3_local_reconcile_locked()
+                return {"status": "recovered", "state": with_state}
+            chain.cancel()
+            state = self._qwen3_local_state_save(self._qwen3_local_state_from_chain(
+                {"contract_sha256": chain.chain_id, "generation": chain.generation}, chain,
+            ))
+            self._qwen3_local_chain = None
+            self._qwen3_local_contract = None
+            self._qwen3_local_parity = {}
+            return {"status": "cancelled", "state": state}
+
+    def get_qwen3_local_chain_status(self) -> dict:
+        with self._qwen3_local_chain_lock:
+            state = self._qwen3_local_reconcile_locked()
+            if self._qwen3_local_chain is not None:
+                state = self._qwen3_local_state_from_chain(
+                    {"contract_sha256": self._qwen3_local_chain.chain_id, "generation": self._qwen3_local_chain.generation},
+                    self._qwen3_local_chain,
+                    parity=self._qwen3_local_parity or state.get("parity", {}),
+                )
+            transport = self._qwen3_network_handoff_transport
+            return {
+                "state": state,
+                "active": self._qwen3_local_chain is not None,
+                "production_admitted": False,
+                "network_transfer": (
+                    transport.snapshot()
+                    if transport is not None
+                    else {"active": False, "mode": "local"}
+                ),
+            }
+
     def _handle_qwen3_loopback_request(
         self, client_id: str, message: dict,
     ) -> None:
@@ -3643,6 +4056,11 @@ class Scheduler:
                         secret=secret,
                         base_url=str(data.get("assignment_base_url", "") or ""),
                         available_bytes=self._qwen3_loopback_available_bytes,
+                        sidecar_session_factory=(
+                            self._qwen3_sidecar_session_from_message
+                            if data.get("execution_mode") == "node_local_sidecar"
+                            else None
+                        ),
                     )
                     self._qwen3_loopback_workers[contract_sha256] = worker
                 elif worker is None:
@@ -3696,6 +4114,37 @@ class Scheduler:
             return max(0, int(psutil.virtual_memory().available))
         except Exception:
             return 0
+
+    def _qwen3_sidecar_session_from_message(
+        self, message: dict,
+    ) -> Qwen3PipelineSidecarSession:
+        model_path = (
+            getattr(self._host, "_full_model_path", None)
+            or getattr(self._host, "_model_path", None)
+        )
+        if not model_path:
+            raise Qwen3SidecarError(
+                "qwen3_sidecar_model_missing",
+                "node-local sidecar has no local model assignment path",
+            )
+        return Qwen3PipelineSidecarSession(
+            model_path=model_path,
+            model_id=str(message.get("model_id", "") or ""),
+            model_sha256=str(message.get("model_sha256", "") or ""),
+            config_id=str(message.get("config_id", "") or ""),
+            plan_id=str(message.get("plan_id", "") or ""),
+            node_id=str(message.get("node_id", "") or ""),
+            layer_range=message.get("layer_range", [0, 0]),
+            total_layers=int(message.get("total_layers", 0) or 0),
+            has_embedding=bool(message.get("has_embedding", False)),
+            has_lm_head=bool(message.get("has_lm_head", False)),
+            execution_device=str(message.get("execution_device", "cpu") or "cpu"),
+            dtype=str(message.get("dtype", "float32") or "float32"),
+            generation=int(message.get("generation", 0) or 0),
+            assignment_manifest_sha256=str(
+                message.get("assignment_manifest_sha256", "") or ""
+            ),
+        )
 
     def _handle_qwen3_loopback_ack(
         self, client_id: str, message: dict,
@@ -5823,6 +6272,11 @@ class Scheduler:
             if qwen3_transaction is not None:
                 qwen3_disconnect = qwen3_transaction.disconnect(client_id)
                 if qwen3_disconnect is not None and qwen3_transaction.network_dispatch:
+                    worker = self._qwen3_loopback_workers.get(
+                        qwen3_transaction.contract["contract_sha256"], None,
+                    )
+                    if worker is not None:
+                        worker.abort_sidecar_sessions()
                     self._qwen3_loopback_workers.pop(
                         qwen3_transaction.contract["contract_sha256"], None,
                     )

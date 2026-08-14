@@ -973,6 +973,7 @@ class ClientConn:
     last_heartbeat: float = 0.0  # 上次心跳时间
     heartbeat_missed: int = 0    # 连续心跳丢失次数
     registration_confirmed: bool = False  # scheduler 确认后才返回 registered ACK
+    registration_epoch: int = 0            # monotonic identity epoch; changes on reconnect
     send_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
@@ -1008,6 +1009,7 @@ class TCPServer:
         self._accept_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._recv_threads: dict[str, threading.Thread] = {}
+        self._registration_epochs: dict[str, int] = {}
         self.on_message: Optional[Callable] = None    # 消息回调
         self.on_disconnect: Optional[Callable] = None # 断连回调
 
@@ -1094,6 +1096,13 @@ class TCPServer:
         """线程安全设置客户端连接。"""
         with self._clients_lock:
             self.clients[client_id] = conn
+
+    def _next_registration_epoch(self, client_id: str) -> int:
+        """Allocate a new live epoch for every successful TCP registration."""
+        with self._clients_lock:
+            epoch = int(self._registration_epochs.get(client_id, 0)) + 1
+            self._registration_epochs[client_id] = epoch
+            return epoch
 
     def _pop_client(self, client_id: str) -> Optional[ClientConn]:
         """线程安全移除客户端连接；不存在时返回 None。"""
@@ -1438,6 +1447,7 @@ class TCPServer:
             hostname=hostname,
             device_info=device_info,
             network_type=network_type,
+            registration_epoch=self._next_registration_epoch(client_id),
         )
         self._set_client(client_id, client_conn)
         logger.info(
@@ -1511,6 +1521,23 @@ class TCPServer:
             return ipaddress.ip_address(client.addr[0]).is_loopback
         except ValueError:
             return False
+
+    def get_authenticated_peer_epoch(self, client_id: str) -> int | None:
+        """Return the live registration epoch, or ``None`` when unauthenticated."""
+        client = self._get_client(client_id)
+        if client is None or not client.registration_confirmed:
+            return None
+        return int(client.registration_epoch)
+
+    def is_authenticated_loopback_peer(self, client_id: str, epoch: int) -> bool:
+        """Check loopback registration and the exact reconnect epoch."""
+        try:
+            expected = int(epoch)
+        except (TypeError, ValueError):
+            return False
+        return self.is_authenticated_loopback_client(client_id) and (
+            self.get_authenticated_peer_epoch(client_id) == expected
+        )
 
     def send_qwen3_pipeline_dry_run(
         self, client_id: str, payload: dict,
@@ -1597,6 +1624,7 @@ class TCPServer:
             "connected_at": c.connected_at,
             "last_heartbeat": c.last_heartbeat,
             "heartbeat_missed": c.heartbeat_missed,
+            "registration_epoch": c.registration_epoch,
         }
 
     def stop(self) -> None:
@@ -1655,6 +1683,7 @@ class TCPClient:
         self._disconnect_callback_lock = threading.Lock()
         self._disconnect_notified = False
         self._connection_generation = 0
+        self._registration_epoch = 0
         self._registered = False
         self.last_register_error: str = ""
         self.avg_rtt_ms: float = 0.0            # 滑动平均 RTT（指数加权）
@@ -1852,6 +1881,7 @@ class TCPClient:
                             ack_data = ack_msg.get("data", {})
                             if ack_data.get("status") == "registered":
                                 self._registered = True
+                                self._registration_epoch += 1
                                 logger.info(f"✅ 注册确认: {self.client_id} → {self.server_host}:{self.server_port}")
                             else:
                                 status = ack_data.get("status") or "unknown"
@@ -2168,6 +2198,11 @@ class TCPClient:
     def is_registered(self) -> bool:
         """是否已完成注册"""
         return self._registered
+
+    @property
+    def registration_epoch(self) -> int:
+        """Monotonic local epoch for the current TCP registration identity."""
+        return int(self._registration_epoch)
 
     def get_network_quality_snapshot(self) -> dict:
         """Return local heartbeat aggregates without endpoint data."""
