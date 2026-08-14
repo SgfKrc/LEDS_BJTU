@@ -46,6 +46,8 @@
 
 > **2026-08-15 `PT-PIPE-MM1.5` 开发门完成**：`qwen3_multimodal_preflight.py` 对两个本地模型目录的 `config.json`、image/video processor 和 tokenizer metadata 做有界读取、摘要及 profile 交叉校验，确认 `Qwen3VLProcessor + Qwen2Tokenizer`、patch=16、temporal=2、merge=2 与 manifest 一致。请求/响应合同只带尺寸、帧数、组件 ID 和摘要；Transformers 视觉 worker 只可使用 `processor + vision_weights`，MTMD 只可使用 `processor + mmproj`，强制 offline/local-only/network-disabled 和 `trust_remote_code=false`。定向 `15 passed`；QW3/MM1 联合 `190 passed`（`.venv-test` 4 workers，78.67s）。本票没有 AutoProcessor 实例化、视觉权重加载或图像语义结论。下一票 `PT-PIPE-MM1.6` 进入隔离 AutoProcessor 离线构造 smoke。
 
+> **2026-08-15 `PT-PIPE-MM1.6` 开发门完成**：隔离 `.venv-qwen3-sidecar` 真实构造 Qwen3-VL-4B/Qwen3.5-2B 的 `AutoProcessor`，Transformers `4.57.6` 实际类为 `Qwen3VLProcessor`、`Qwen2VLImageProcessorFast`、`Qwen3VLVideoProcessor`、`Qwen2TokenizerFast`，image/video token 与 patch=16、temporal=2、merge=2 均通过 path-free 合同校验。sidecar pipeline 依赖新增 Pillow/torchvision，setup ready gate 同步检查；未调用媒体处理、未读取视觉/文本权重、未产生语义结论。MM1.6 定向 `8 passed`，MM1.5+MM1.6 `23 passed`；串行 QW3/MM1 `198 passed`（111.12s）。下一票 `PT-PIPE-MM1.7` 做 CPU 合成媒体预处理与张量摘要，真实视觉质量/CUDA/双机/生产准入仍关闭。
+
 ---
 
 ## 1. 本轮结论
