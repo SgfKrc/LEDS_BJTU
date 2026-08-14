@@ -1019,6 +1019,138 @@ def test_same_machine_network_node_restart_fences_stale_contract_and_reconciles_
         _stop_network_node(process)
 
 
+def test_expired_transfer_reconciles_to_terminal_ledger_and_removes_staging(tmp_path):
+    now = [1000.0]
+    runtime, coordinator, _http = _node(
+        tmp_path, "node-b", {"node-a"}, now=now,
+    )
+    ledger = _attach_memory_ledger(coordinator)
+    contract = _contract(segment_count=2, generation=61)
+    coordinator.activate(contract)
+    coordinator.authorize_control_peer("node-a", contract=contract, peer_epoch=0)
+    coordinator.begin_phase("prefill", contract["generation"])
+    data = b"expires-before-upload"
+    plan = coordinator.begin_receive(
+        base_url="http://127.0.0.1:9876",
+        source_peer_id="node-a",
+        chain_id=contract["contract_sha256"],
+        generation=contract["generation"],
+        phase="prefill",
+        from_segment=0,
+        to_segment=1,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        ttl_seconds=1,
+        peer_epoch=0,
+    )
+    transfer_id = plan["transfer_id"]
+    assert list((tmp_path / "node-b" / "qwen3" / "network_artifacts").glob("*.part"))
+    now[0] += 2
+    result = coordinator.cleanup_expired()
+    assert result["reconciled_transfers"] == 1
+    assert result["cleanup_complete"] is True
+    assert coordinator.snapshot()["transfer_count"] == 0
+    assert ledger["value"]["transfers"][transfer_id]["status"] == "expired"
+    assert not list((tmp_path / "node-b" / "qwen3" / "network_artifacts").glob("*.part"))
+
+
+def test_same_machine_process_ttl_epoch_revoke_and_terminal_ledger(tmp_path):
+    contract = _contract(segment_count=2, generation=63)
+    root = tmp_path / "fault-matrix"
+    root.mkdir()
+    port = _free_port()
+    process = None
+    try:
+        process, state_dir = _spawn_network_node(
+            root, "node-b", port, ["node-a"], synthetic_sidecar=True,
+        )
+        epoch = {"value": 0}
+        signer = Qwen3PeerRequestSigner(
+            SECRET,
+            peer_node_id="node-a",
+            peer_epoch_provider=lambda: epoch["value"],
+        )
+        target = Qwen3NetworkTarget(
+            node_id="node-b",
+            base_url=f"http://127.0.0.1:{port}",
+            coordinator=Qwen3LoopbackNetworkControlClient(
+                node_id="node-b",
+                base_url=f"http://127.0.0.1:{port}",
+                artifact_root=state_dir / "qwen3" / "network_artifacts",
+                signer=signer,
+            ),
+        )
+        target.coordinator.activate(contract)
+        target.coordinator.begin_phase("prefill", contract["generation"])
+        payload = b"ttl-process-input"
+        plan = target.coordinator.begin_receive(
+            base_url=f"http://127.0.0.1:{port}",
+            source_peer_id="node-a",
+            chain_id=contract["contract_sha256"],
+            generation=contract["generation"],
+            phase="prefill",
+            from_segment=0,
+            to_segment=1,
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            ttl_seconds=1,
+        )
+        transfer_id = plan["transfer_id"]
+        time.sleep(1.25)
+        status_url = f"http://127.0.0.1:{port}{QWEN3_TRANSFER_PREFIX}/status"
+        status = default_transfer_request("GET", status_url, {}, None)
+        assert status.status_code == 200
+        ledger_path = state_dir / "qwen3-network-ledger.json"
+        expired = json.loads(ledger_path.read_text(encoding="utf-8"))
+        assert expired["transfers"][transfer_id]["status"] == "expired"
+        assert not list((state_dir / "qwen3" / "network_artifacts").glob("*.part"))
+
+        # A new registration epoch is accepted by the fresh proof.  The
+        # expired transfer remains terminal and cannot be resurrected.
+        registration_url = f"http://127.0.0.1:{port}/__fixture/registration"
+        body = json.dumps({"peer": "node-a", "action": "register"}).encode("utf-8")
+        registration = default_transfer_request(
+            "POST", registration_url,
+            {"Content-Type": "application/json", "Content-Length": str(len(body))}, body,
+        )
+        assert registration.status_code == 200
+        epoch["value"] = 1
+        expired_cancel = target.coordinator.cancel_transfer(transfer_id)
+        assert expired_cancel["status"] == "missing"
+        terminal = json.loads(ledger_path.read_text(encoding="utf-8"))
+        assert terminal["transfers"][transfer_id]["status"] == "expired"
+        assert not list((state_dir / "qwen3" / "network_artifacts").glob("**/*.part"))
+
+        active = target.coordinator.begin_receive(
+            base_url=f"http://127.0.0.1:{port}",
+            source_peer_id="node-a",
+            chain_id=contract["contract_sha256"],
+            generation=contract["generation"],
+            phase="prefill",
+            from_segment=0,
+            to_segment=1,
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            ttl_seconds=60,
+        )
+        active_id = active["transfer_id"]
+        body = json.dumps({"peer": "node-a", "action": "register"}).encode("utf-8")
+        registration = default_transfer_request(
+            "POST", registration_url,
+            {"Content-Type": "application/json", "Content-Length": str(len(body))}, body,
+        )
+        assert registration.status_code == 200
+        epoch["value"] = 2
+        fenced_cancel = target.coordinator.cancel_transfer(active_id)
+        assert fenced_cancel["status"] == "missing"
+        fenced = json.loads(ledger_path.read_text(encoding="utf-8"))
+        assert fenced["transfers"][active_id]["status"] == "invalidated"
+        assert not list((state_dir / "qwen3" / "network_artifacts").glob("**/*.part"))
+    finally:
+        if process is not None:
+            _stop_network_node(process)
+
+
 def test_peer_registration_epoch_fences_reconnect_proof_and_transfer_ticket():
     epochs = {"node-a": 1}
     signer = Qwen3PeerRequestSigner(

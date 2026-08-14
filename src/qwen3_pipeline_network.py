@@ -263,7 +263,9 @@ class Qwen3NetworkTransferCoordinator:
             self._recovered_contract = active
             self._restart_pending = bool(active and active.get("phase") != "released")
             for record in self._ledger["transfers"].values():
-                if record.get("status") not in {"cancelled", "released", "invalidated"}:
+                if record.get("status") not in {
+                    "cancelled", "released", "invalidated", "expired", "failed",
+                }:
                     record["status"] = "invalidated"
             for record in self._ledger["outputs"].values():
                 if record.get("status") not in {"released", "invalidated"}:
@@ -461,16 +463,44 @@ class Qwen3NetworkTransferCoordinator:
                 lease_state="released" if output_status == "released" else "invalidated",
             )
             self._outputs.pop(output_id, None)
-        self._record_transfer_locked(
-            transfer_key, transfer, status="released" if reason_code == "release" else "cancelled",
-        )
+        terminal_status = {
+            "release": "released",
+            "expired": "expired",
+            "peer_epoch_changed": "invalidated",
+            "consume_failed": "failed",
+        }.get(str(reason_code), "cancelled")
+        self._record_transfer_locked(transfer_key, transfer, status=terminal_status)
         return {
             "transfer_id": transfer_key,
-            "status": "cancelled",
+            "status": terminal_status,
             "cleanup_complete": failures == 0,
             "cleanup_failures": failures,
             "removed_artifacts": removed,
         }
+
+    def cleanup_expired(self) -> dict[str, Any]:
+        """Reconcile receiver TTL expiry into the persistent network ledger."""
+        with self._lock:
+            runtime_result = self.runtime.receiver.cleanup_expired()
+            reconciled = 0
+            cleanup_failures = int(runtime_result.get("cleanup_failures", 0) or 0)
+            removed_artifacts = int(runtime_result.get("removed_artifacts", 0) or 0)
+            for transfer_id in list(self._transfers):
+                if self.runtime.receiver.session_status(transfer_id) != "expired":
+                    continue
+                result = self._discard_transfer_locked(
+                    transfer_id, reason_code="expired",
+                )
+                reconciled += 1
+                cleanup_failures += int(result.get("cleanup_failures", 0) or 0)
+                removed_artifacts += int(result.get("removed_artifacts", 0) or 0)
+            return {
+                **runtime_result,
+                "reconciled_transfers": reconciled,
+                "removed_artifacts": removed_artifacts,
+                "cleanup_failures": cleanup_failures,
+                "cleanup_complete": cleanup_failures == 0,
+            }
 
     def _fence_peer_locked(self, peer_node_id: str, *, reason_code: str) -> None:
         for transfer_id, transfer in list(self._transfers.items()):
