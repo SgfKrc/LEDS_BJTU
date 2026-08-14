@@ -57,6 +57,26 @@ from qwen3_pipeline_transfer import default_transfer_request  # noqa: E402
 SECRET = "qwen3-network-contract-secret-value!!"
 
 
+class _NetworkLedger:
+    def __init__(self) -> None:
+        self.value = {}
+
+    def load(self):
+        return json.loads(json.dumps(self.value)) if self.value else {
+            "schema_version": 1,
+            "local_node_id": "",
+            "last_generation": -1,
+            "active_contract": {},
+            "transfers": {},
+            "outputs": {},
+            "updated_at": "",
+        }
+
+    def save(self, value):
+        self.value = json.loads(json.dumps(value))
+        return self.load()
+
+
 def _contract(*, segment_count=3, generation=5):
     nodes = ["node-a", "node-b", "node-c"][:segment_count]
     segments = []
@@ -136,6 +156,30 @@ def _node(tmp_path, node_id, allowed_peers, *, now=None):
     app.add_middleware(Qwen3PeerAuthMiddleware, verifier=verifier)
     app.include_router(transfer_router)
     return runtime, coordinator, TestClient(app)
+
+
+def _attach_memory_ledger(coordinator):
+    state = {
+        "value": {
+            "schema_version": 1,
+            "local_node_id": coordinator.local_node_id,
+            "last_generation": -1,
+            "active_contract": {},
+            "transfers": {},
+            "outputs": {},
+            "updated_at": "",
+        },
+    }
+
+    def load():
+        return json.loads(json.dumps(state["value"]))
+
+    def save(value):
+        state["value"] = json.loads(json.dumps(value))
+        return load()
+
+    coordinator.configure_persistent_ledger(load=load, save=save)
+    return state
 
 
 class _Session:
@@ -673,7 +717,7 @@ def _free_port():
         return int(sock.getsockname()[1])
 
 
-def _spawn_network_node(tmp_path, node_id, port, allowed_peers):
+def _spawn_network_node(tmp_path, node_id, port, allowed_peers, *, synthetic_sidecar=False):
     helper = Path(__file__).parent / "helpers" / "qwen3_network_node.py"
     state_dir = tmp_path / node_id
     command = [
@@ -686,6 +730,8 @@ def _spawn_network_node(tmp_path, node_id, port, allowed_peers):
     ]
     for peer in allowed_peers:
         command.extend(["--allowed-peer", peer])
+    if synthetic_sidecar:
+        command.append("--synthetic-sidecar")
     process = subprocess.Popen(
         command,
         cwd=str(Path(__file__).resolve().parents[1]),
@@ -778,6 +824,164 @@ def test_same_machine_three_process_network_chain_prefill_decode(tmp_path):
         chain.release()
         assert not list(root.glob("**/qtx_*.pt"))
         assert not list(root.glob("**/*.part"))
+    finally:
+        for process in reversed(processes):
+            _stop_network_node(process)
+
+
+@pytest.mark.parametrize("segment_count", [2, 3])
+def test_same_machine_process_target_chain_executes_and_releases_outputs(
+    tmp_path, segment_count,
+):
+    contract = _contract(segment_count=segment_count, generation=41 + segment_count)
+    root = tmp_path / "target-chain"
+    root.mkdir()
+    node_ids = ["node-b", "node-c"][:segment_count - 1]
+    ports = {node_id: _free_port() for node_id in node_ids}
+    processes = []
+    targets = {}
+    try:
+        for node_id in node_ids:
+            allowed = ["node-a", "node-c"] if node_id == "node-b" else ["node-b"]
+            process, state_dir = _spawn_network_node(
+                root, node_id, ports[node_id], allowed, synthetic_sidecar=True,
+            )
+            processes.append(process)
+            signer_peer = "node-a" if node_id == "node-b" else "node-b"
+            targets[node_id] = Qwen3NetworkTarget(
+                node_id=node_id,
+                base_url=f"http://127.0.0.1:{ports[node_id]}",
+                coordinator=Qwen3LoopbackNetworkControlClient(
+                    node_id=node_id,
+                    base_url=f"http://127.0.0.1:{ports[node_id]}",
+                    artifact_root=state_dir / "qwen3" / "network_artifacts",
+                    signer=Qwen3PeerRequestSigner(SECRET, peer_node_id=signer_peer),
+                ),
+            )
+        transport = Qwen3NetworkHandoffTransport(
+            artifact_root=root,
+            targets=targets,
+            peer_signers={
+                node_id: Qwen3PeerRequestSigner(SECRET, peer_node_id=node_id)
+                for node_id in ["node-a", "node-b", "node-c"][:segment_count]
+            },
+            chunk_bytes=7,
+            target_execution=True,
+        )
+        transport.activate(contract)
+        source = root / "target-chain-input.pt"
+        source.write_bytes(bytes(range(40)))
+        phases = (
+            ("prefill", contract["generation"], 3),
+            ("decode", contract["generation"] + 1, 4),
+        )
+        phase_results = []
+        for phase, generation, sequence_length in phases:
+            transport.begin_phase(phase, generation)
+            result = transport.execute_target_chain(
+                source_path=source,
+                phase=phase,
+                generation=generation,
+                batch_size=1,
+                sequence_length=sequence_length,
+            )
+            phase_results.append(result)
+            transport.finish_phase(phase, generation)
+            assert result["completed"] is True
+            assert result["target_execution_count"] == segment_count - 1
+            assert result["released_output_ids"] == (
+                [result["executions"][0]["output_reference"]["artifact_id"]]
+                if segment_count == 3 else []
+            )
+            assert result["executions"][-1]["output_reference"] is None
+            encoded = json.dumps(result, ensure_ascii=True).lower()
+            assert "path" not in encoded
+            assert "ticket" not in encoded
+            assert "tensor" not in encoded
+        assert all(
+            any(
+                record["status"] == "released"
+                for record in json.loads(
+                    (root / node_id / "qwen3-network-ledger.json").read_text(encoding="utf-8")
+                )["outputs"].values()
+            )
+            for node_id in (["node-b"] if segment_count == 3 else [])
+        )
+        transport.cleanup()
+        assert not list(root.glob("**/qtx_*.pt"))
+        assert not list(root.glob("**/*.part"))
+    finally:
+        for process in reversed(processes):
+            _stop_network_node(process)
+
+
+def test_same_machine_process_target_restart_invalidates_output_reference(tmp_path):
+    contract = _contract(segment_count=3, generation=47)
+    root = tmp_path / "target-restart"
+    root.mkdir()
+    ports = {"node-b": _free_port(), "node-c": _free_port()}
+    processes = []
+    try:
+        targets = {}
+        state_dirs = {}
+        for node_id, allowed in (
+            ("node-b", ["node-a", "node-c"]),
+            ("node-c", ["node-b"]),
+        ):
+            process, state_dir = _spawn_network_node(
+                root, node_id, ports[node_id], allowed, synthetic_sidecar=True,
+            )
+            processes.append(process)
+            state_dirs[node_id] = state_dir
+            signer_peer = "node-a" if node_id == "node-b" else "node-b"
+            targets[node_id] = Qwen3NetworkTarget(
+                node_id=node_id,
+                base_url=f"http://127.0.0.1:{ports[node_id]}",
+                coordinator=Qwen3LoopbackNetworkControlClient(
+                    node_id=node_id,
+                    base_url=f"http://127.0.0.1:{ports[node_id]}",
+                    artifact_root=state_dir / "qwen3" / "network_artifacts",
+                    signer=Qwen3PeerRequestSigner(SECRET, peer_node_id=signer_peer),
+                ),
+            )
+        transport = Qwen3NetworkHandoffTransport(
+            artifact_root=root,
+            targets=targets,
+            peer_signers={
+                node_id: Qwen3PeerRequestSigner(SECRET, peer_node_id=node_id)
+                for node_id in ["node-a", "node-b", "node-c"]
+            },
+            chunk_bytes=7,
+            target_execution=True,
+        )
+        transport.activate(contract)
+        transport.begin_phase("prefill", contract["generation"])
+        source = root / "restart-input.pt"
+        source.write_bytes(bytes(range(31)))
+        first = transport.transfer_and_consume(
+            source_path=source,
+            chain_id=contract["contract_sha256"], generation=contract["generation"],
+            phase="prefill", from_segment=0, to_segment=1,
+            source_node_id="node-a", target_node_id="node-b",
+            batch_size=1, sequence_length=3, dtype="float32", device="cpu",
+            has_next_segment=True,
+        )
+        output_reference = first["output_reference"]
+        _stop_network_node(processes[0])
+        processes[0], _ = _spawn_network_node(
+            root, "node-b", ports["node-b"], ["node-a", "node-c"],
+            synthetic_sidecar=True,
+        )
+        with pytest.raises(Qwen3NetworkError) as stale:
+            transport.transfer_registered_output(
+                output_reference=output_reference,
+                chain_id=contract["contract_sha256"], generation=contract["generation"],
+                phase="prefill", from_segment=1, to_segment=2,
+                source_node_id="node-b", target_node_id="node-c",
+            )
+        assert stale.value.reason_code == "qwen3_network_output_missing"
+        assert not list((state_dirs["node-c"] / "qwen3" / "network_artifacts").glob("qtx_*.pt"))
+        assert not list((state_dirs["node-c"] / "qwen3" / "network_artifacts").glob("*.part"))
     finally:
         for process in reversed(processes):
             _stop_network_node(process)
@@ -901,3 +1105,569 @@ def test_target_consume_returns_path_free_execution_contract(tmp_path):
     assert "path" not in encoded.lower()
     assert result["execution"]["artifact_sha256"] == hashlib.sha256(data).hexdigest()
     assert result["hidden_handoff"]["has_next_segment"] is False
+
+
+class _TargetConsumeExecutor:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls = 0
+        self.cleaned: list[str] = []
+        self.outputs: list[Path] = []
+
+    def __call__(self, input_path: Path, request: dict) -> dict:
+        self.calls += 1
+        output = input_path.parent / (
+            f"qwen3-consume-{request['transfer_id']}-{request['phase']}-"
+            f"{request['generation']}-{request['segment_index']}.pt"
+        )
+        output.write_bytes(b"target-sidecar-output")
+        self.outputs.append(output)
+        if self.fail:
+            raise RuntimeError("synthetic target sidecar failure")
+        return {
+            "status": "executed",
+            "gate_passed": True,
+            "output_path": str(output),
+            "execution": {
+                "full_model_materialized": False,
+                "segment_materialized": True,
+            },
+            "hidden_handoff": {
+                "dtype": request["dtype"],
+                "device": request["device"],
+                "shape": [request["batch_size"], request["sequence_length"], 4],
+            },
+            "kv_contract": {
+                "present": True,
+                "shape": [request["batch_size"], request["sequence_length"]],
+            },
+        }
+
+    def cleanup(self, request: dict, reason_code: str) -> None:
+        self.cleaned.append(reason_code)
+        for output in self.outputs:
+            output.unlink(missing_ok=True)
+
+
+def _committed_target_transfer(tmp_path, *, epoch: int = 1):
+    runtime = Qwen3ArtifactTransferRuntime.create(
+        state_dir=tmp_path, cluster_secret=SECRET,
+    )
+    coordinator = Qwen3NetworkTransferCoordinator(local_node_id="node-b", runtime=runtime)
+    contract = _contract(segment_count=3, generation=21)
+    coordinator.activate(contract)
+    coordinator.authorize_control_peer("node-a", contract=contract, peer_epoch=epoch)
+    coordinator.begin_phase("prefill", contract["generation"])
+    data = b"target-sidecar-input"
+    plan = coordinator.begin_receive(
+        base_url="http://127.0.0.1:9876",
+        source_peer_id="node-a",
+        chain_id=contract["contract_sha256"],
+        generation=contract["generation"],
+        phase="prefill",
+        from_segment=0,
+        to_segment=1,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        peer_epoch=epoch,
+    )
+    transfer_id = plan["transfer_id"]
+    runtime.receiver.write(
+        transfer_id,
+        ticket=plan["ticket"],
+        authenticated_peer_id="node-a",
+        authenticated_peer_epoch=epoch,
+        offset=0,
+        data=data,
+    )
+    runtime.receiver.commit(
+        transfer_id,
+        ticket=plan["ticket"],
+        authenticated_peer_id="node-a",
+        authenticated_peer_epoch=epoch,
+    )
+    coordinator.resolve(transfer_id)
+    return coordinator, contract, transfer_id
+
+
+def test_target_consume_registers_next_reference_and_is_idempotent(tmp_path):
+    coordinator, contract, transfer_id = _committed_target_transfer(tmp_path)
+    executor = _TargetConsumeExecutor()
+    result = coordinator.consume(
+        transfer_id,
+        phase="prefill",
+        generation=contract["generation"],
+        batch_size=1,
+        sequence_length=4,
+        dtype="float32",
+        device="cpu",
+        has_next_segment=True,
+        executor=executor,
+    )
+    encoded = json.dumps(result, ensure_ascii=True)
+    assert "output_path" not in encoded
+    assert "path" not in encoded.lower()
+    output_reference = result["output_reference"]
+    assert output_reference["source_node_id"] == "node-b"
+    assert output_reference["target_node_id"] == "node-c"
+    assert output_reference["from_segment"] == 1
+    assert output_reference["to_segment"] == 2
+    assert coordinator.consume(
+        transfer_id,
+        phase="prefill",
+        generation=contract["generation"],
+        batch_size=1,
+        sequence_length=4,
+        dtype="float32",
+        device="cpu",
+        has_next_segment=True,
+        executor=executor,
+    ) == result
+    assert executor.calls == 1
+    with pytest.raises(Qwen3NetworkError) as mismatch:
+        coordinator.consume(
+            transfer_id,
+            phase="prefill",
+            generation=contract["generation"],
+            batch_size=1,
+            sequence_length=5,
+            dtype="float32",
+            device="cpu",
+            has_next_segment=True,
+            executor=executor,
+        )
+    assert mismatch.value.reason_code == "qwen3_network_consume_duplicate_mismatch"
+    assert coordinator.snapshot()["output_count"] == 1
+    coordinator.cancel_transfer(transfer_id)
+    assert coordinator.snapshot()["output_count"] == 0
+    assert executor.cleaned == ["cancelled"]
+
+
+def test_registered_output_chunk_read_revalidates_digest_and_release(tmp_path):
+    coordinator, contract, transfer_id = _committed_target_transfer(tmp_path)
+    executor = _TargetConsumeExecutor()
+    result = coordinator.consume(
+        transfer_id,
+        phase="prefill",
+        generation=contract["generation"],
+        batch_size=1,
+        sequence_length=4,
+        dtype="float32",
+        device="cpu",
+        has_next_segment=True,
+        executor=executor,
+    )
+    reference = result["output_reference"]
+    first = coordinator.read_output_chunk(
+        reference["artifact_id"], requester_peer_id="node-c", offset=0, max_bytes=7,
+    )
+    second = coordinator.read_output_chunk(
+        reference["artifact_id"], requester_peer_id="node-c", offset=7, max_bytes=64,
+    )
+    assert first["data"] + second["data"] == b"target-sidecar-output"
+    assert first["reference"]["artifact_id"] == reference["artifact_id"]
+    assert second["eof"] is True
+
+    output = executor.outputs[0]
+    output.write_bytes(b"tampered")
+    with pytest.raises(Qwen3NetworkError) as mismatch:
+        coordinator.read_output_chunk(
+            reference["artifact_id"], requester_peer_id="node-c", offset=0, max_bytes=7,
+        )
+    assert mismatch.value.reason_code == "qwen3_network_output_digest_mismatch"
+    assert coordinator.snapshot()["output_count"] == 0
+    assert coordinator.release_output_reference(reference["artifact_id"])["status"] == "missing"
+
+
+def test_transfer_registered_output_is_path_free(tmp_path):
+    contract = _contract(segment_count=3, generation=25)
+    root = tmp_path / "chain"
+    root.mkdir()
+    source_runtime, source, _ = _node(root, "node-b", {"node-a", "node-c"})
+    target_runtime, target, target_http = _node(root, "node-c", {"node-b"})
+    source_exec = _TargetConsumeExecutor()
+    source.configure_sidecar_executor(source_exec)
+    target = Qwen3NetworkTarget(
+        node_id="node-c", base_url="http://127.0.0.1:9877", coordinator=target,
+        requester=_requester(target_http),
+    )
+    source_target = Qwen3NetworkTarget(
+        node_id="node-b", base_url="http://127.0.0.1:9876", coordinator=source,
+    )
+    transport = Qwen3NetworkHandoffTransport(
+        artifact_root=root,
+        targets={"node-b": source_target, "node-c": target},
+        peer_signers={
+            "node-a": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-a"),
+            "node-b": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-b"),
+        },
+        chunk_bytes=5,
+    )
+    transport.activate(contract)
+    transport.begin_phase("prefill", contract["generation"])
+    data = b"incoming-to-b"
+    plan = source.begin_receive(
+        base_url="http://127.0.0.1:9876", source_peer_id="node-a",
+        chain_id=contract["contract_sha256"], generation=contract["generation"],
+        phase="prefill", from_segment=0, to_segment=1,
+        size_bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+    )
+    source_runtime.receiver.write(
+        plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+        offset=0, data=data,
+    )
+    source_runtime.receiver.commit(
+        plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+    )
+    source.commit_reference(plan["transfer_id"])
+    consumed = source.consume(
+        plan["transfer_id"], phase="prefill", generation=contract["generation"],
+        batch_size=1, sequence_length=4, dtype="float32", device="cpu",
+        has_next_segment=True,
+    )
+    output_reference = consumed["output_reference"]
+    moved = transport.transfer_registered_output(
+        output_reference=output_reference,
+        chain_id=contract["contract_sha256"], generation=contract["generation"],
+        phase="prefill", from_segment=1, to_segment=2,
+        source_node_id="node-b", target_node_id="node-c",
+    )
+    encoded = json.dumps(moved, ensure_ascii=True)
+    assert "path" not in encoded.lower()
+    assert moved["input_reference"] == output_reference
+    assert moved["target_reference"]["target_node_id"] == "node-c"
+    target_path = target_runtime.receiver.artifact_path(moved["transfer_id"])
+    assert target_path.read_bytes() == b"target-sidecar-output"
+
+
+def test_persistent_ledger_tracks_prefill_decode_kv_and_terminal_release(tmp_path):
+    contract = _contract(segment_count=3, generation=31)
+    runtime = Qwen3ArtifactTransferRuntime.create(
+        state_dir=tmp_path / "node-b", cluster_secret=SECRET,
+    )
+    coordinator = Qwen3NetworkTransferCoordinator(local_node_id="node-b", runtime=runtime)
+    ledger = _attach_memory_ledger(coordinator)
+    executor = _TargetConsumeExecutor()
+    coordinator.configure_sidecar_executor(executor)
+    coordinator.activate(contract)
+    coordinator.begin_phase("prefill", contract["generation"])
+
+    def consume_phase(phase, generation, payload):
+        plan = coordinator.begin_receive(
+            base_url="http://127.0.0.1:9876", source_peer_id="node-a",
+            chain_id=contract["contract_sha256"], generation=generation,
+            phase=phase, from_segment=0, to_segment=1,
+            size_bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        runtime.receiver.write(
+            plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+            offset=0, data=payload,
+        )
+        runtime.receiver.commit(
+            plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+        )
+        coordinator.commit_reference(plan["transfer_id"])
+        result = coordinator.consume(
+            plan["transfer_id"], phase=phase, generation=generation,
+            batch_size=1, sequence_length=4, dtype="float32", device="cpu",
+            has_next_segment=True,
+        )
+        return plan["transfer_id"], result
+
+    prefill_id, prefill = consume_phase("prefill", contract["generation"], b"prefill-input")
+    coordinator.finish_phase("prefill", contract["generation"])
+    coordinator.begin_phase("decode", contract["generation"] + 1)
+    decode_id, decode = consume_phase("decode", contract["generation"] + 1, b"decode-input")
+    coordinator.finish_phase("decode", contract["generation"] + 1)
+
+    persisted = ledger["value"]
+    assert persisted["transfers"][prefill_id]["kv_contract"] == {
+        "present": True, "shape": [1, 4],
+    }
+    assert persisted["transfers"][prefill_id]["generation"] == contract["generation"]
+    assert persisted["transfers"][decode_id]["generation"] == contract["generation"] + 1
+    assert persisted["transfers"][decode_id]["phase"] == "decode"
+    assert persisted["outputs"][prefill["output_reference"]["artifact_id"]]["status"] == "registered"
+    assert persisted["outputs"][decode["output_reference"]["artifact_id"]]["status"] == "registered"
+
+    output_id = prefill["output_reference"]["artifact_id"]
+    next_transfer_id = "qtx_" + "f" * 32
+    assert coordinator.lease_output_reference(output_id, next_transfer_id)["status"] == "leased"
+    coordinator.record_output_progress(
+        output_id, next_transfer_id, prefill["output_reference"]["size_bytes"],
+    )
+    assert coordinator.commit_output_reference(output_id, next_transfer_id)["status"] == "committed"
+    assert coordinator.commit_output_reference(output_id, next_transfer_id)["status"] == "committed"
+    assert coordinator.lease_output_reference(output_id, next_transfer_id)["status"] == "committed"
+    coordinator.release_output_reference(output_id)
+    coordinator.release()
+    assert ledger["value"]["active_contract"]["phase"] == "released"
+    assert all(
+        record["status"] == "released" for record in ledger["value"]["outputs"].values()
+    )
+
+
+def test_persistent_ledger_invalidates_restart_references_and_recovers_contract(tmp_path):
+    contract = _contract(segment_count=3, generation=33)
+    state_dir = tmp_path / "node-b"
+    runtime = Qwen3ArtifactTransferRuntime.create(state_dir=state_dir, cluster_secret=SECRET)
+    coordinator = Qwen3NetworkTransferCoordinator(local_node_id="node-b", runtime=runtime)
+    ledger = _attach_memory_ledger(coordinator)
+    coordinator.activate(contract)
+    coordinator.begin_phase("prefill", contract["generation"])
+    data = b"restart-input"
+    plan = coordinator.begin_receive(
+        base_url="http://127.0.0.1:9876", source_peer_id="node-a",
+        chain_id=contract["contract_sha256"], generation=contract["generation"],
+        phase="prefill", from_segment=0, to_segment=1,
+        size_bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+    )
+    runtime.receiver.write(
+        plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+        offset=0, data=data,
+    )
+    runtime.receiver.commit(
+        plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+    )
+    coordinator.commit_reference(plan["transfer_id"])
+    result = coordinator.consume(
+        plan["transfer_id"], phase="prefill", generation=contract["generation"],
+        batch_size=1, sequence_length=4, dtype="float32", device="cpu",
+        has_next_segment=True, executor=_TargetConsumeExecutor(),
+    )
+    output_id = result["output_reference"]["artifact_id"]
+
+    restarted_runtime = Qwen3ArtifactTransferRuntime.create(
+        state_dir=state_dir, cluster_secret=SECRET,
+    )
+    restarted = Qwen3NetworkTransferCoordinator(
+        local_node_id="node-b", runtime=restarted_runtime,
+    )
+    restarted.configure_persistent_ledger(
+        load=lambda: json.loads(json.dumps(ledger["value"])),
+        save=lambda value: ledger.update(value=json.loads(json.dumps(value))) or ledger["value"],
+    )
+    snapshot = restarted.ledger_snapshot()
+    assert snapshot["restart_pending"] is True
+    assert snapshot["invalidated_transfers"] >= 1
+    assert snapshot["invalidated_outputs"] == 1
+    with pytest.raises(Qwen3NetworkError) as stale:
+        restarted.read_output_chunk(
+            output_id, requester_peer_id="node-c", offset=0, max_bytes=4,
+        )
+    assert stale.value.reason_code == "qwen3_network_output_missing"
+    assert restarted.activate(contract)["phase"] == "prepared"
+
+
+def test_registered_output_reuses_pending_plan_after_cross_call_disconnect(tmp_path):
+    contract = _contract(segment_count=3, generation=35)
+    root = tmp_path / "chain"
+    root.mkdir()
+    source_runtime, source, _ = _node(root, "node-b", {"node-a", "node-c"})
+    target_runtime, target_coordinator, target_http = _node(root, "node-c", {"node-b"})
+    source_ledger = _attach_memory_ledger(source)
+    target_ledger = _attach_memory_ledger(target_coordinator)
+    source.configure_sidecar_executor(_TargetConsumeExecutor())
+    disconnect = {"pending": True}
+    transport = Qwen3NetworkHandoffTransport(
+        artifact_root=root,
+        targets={
+            "node-b": Qwen3NetworkTarget(
+                node_id="node-b", base_url="http://127.0.0.1:9876", coordinator=source,
+            ),
+            "node-c": Qwen3NetworkTarget(
+                node_id="node-c", base_url="http://127.0.0.1:9877",
+                coordinator=target_coordinator,
+                requester=_requester(target_http, disconnect_after_patch=disconnect),
+            ),
+        },
+        peer_signers={
+            "node-a": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-a"),
+            "node-b": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-b"),
+        },
+        chunk_bytes=5,
+        max_attempts=1,
+    )
+    transport.activate(contract)
+    transport.begin_phase("prefill", contract["generation"])
+    data = b"ledger-source-input"
+    plan = source.begin_receive(
+        base_url="http://127.0.0.1:9876", source_peer_id="node-a",
+        chain_id=contract["contract_sha256"], generation=contract["generation"],
+        phase="prefill", from_segment=0, to_segment=1,
+        size_bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+    )
+    source_runtime.receiver.write(
+        plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+        offset=0, data=data,
+    )
+    source_runtime.receiver.commit(
+        plan["transfer_id"], ticket=plan["ticket"], authenticated_peer_id="node-a",
+    )
+    source.commit_reference(plan["transfer_id"])
+    consumed = source.consume(
+        plan["transfer_id"], phase="prefill", generation=contract["generation"],
+        batch_size=1, sequence_length=4, dtype="float32", device="cpu",
+        has_next_segment=True,
+    )
+    reference = consumed["output_reference"]
+    fields = {
+        "output_reference": reference,
+        "chain_id": contract["contract_sha256"], "generation": contract["generation"],
+        "phase": "prefill", "from_segment": 1, "to_segment": 2,
+        "source_node_id": "node-b", "target_node_id": "node-c",
+    }
+    with pytest.raises(Qwen3NetworkError) as interrupted:
+        transport.transfer_registered_output(**fields)
+    assert interrupted.value.reason_code == "qwen3_transfer_connection_failed"
+    next_transfer_id = source_ledger["value"]["outputs"][reference["artifact_id"]]["next_transfer_id"]
+    assert next_transfer_id.startswith("qtx_")
+
+    moved = transport.transfer_registered_output(**fields)
+    assert moved["transfer_id"] == next_transfer_id
+    assert target_runtime.receiver.artifact_path(next_transfer_id).read_bytes() == b"target-sidecar-output"
+    source_record = source_ledger["value"]["outputs"][reference["artifact_id"]]
+    assert source_record["status"] == "committed"
+    assert source_record["confirmed_offset"] == reference["size_bytes"]
+    assert target_ledger["value"]["transfers"][next_transfer_id]["status"] == "committed"
+    released = transport.release_registered_output(reference)
+    assert released["status"] == "released"
+    assert source_ledger["value"]["outputs"][reference["artifact_id"]]["status"] == "released"
+
+
+def test_loopback_output_identity_survives_phase_completion(tmp_path, monkeypatch):
+    contract = _contract(segment_count=3, generation=37)
+    client = Qwen3LoopbackNetworkControlClient(
+        node_id="node-b",
+        base_url="http://127.0.0.1:9876",
+        artifact_root=tmp_path,
+        signer=Qwen3PeerRequestSigner(SECRET, peer_node_id="node-c"),
+        requester=lambda *_args: None,
+    )
+    client._contract = contract
+    reference = {
+        "schema_version": 1,
+        "mode": "network",
+        "artifact_id": "qout_" + "e" * 32,
+        "source_node_id": "node-b",
+        "target_node_id": "node-c",
+        "chain_id": contract["contract_sha256"],
+        "generation": contract["generation"],
+        "phase": "prefill",
+        "from_segment": 1,
+        "to_segment": 2,
+        "size_bytes": 16,
+        "sha256": "d" * 64,
+        "status": "committed",
+        "full_model_materialized": False,
+    }
+    calls = []
+    monkeypatch.setattr(
+        client, "_call",
+        lambda action, payload: calls.append((action, dict(payload))) or {"status": "released"},
+    )
+    client.bind_output_reference(reference)
+    client._phase = "decoded"
+
+    client.release_output_reference(reference["artifact_id"])
+
+    assert calls == [(
+        "release-output",
+        {
+            "chain_id": contract["contract_sha256"],
+            "generation": contract["generation"],
+            "phase": "prefill",
+            "output_id": reference["artifact_id"],
+        },
+    )]
+
+
+def test_target_consume_failure_and_epoch_change_reclaim_sidecar_artifacts(tmp_path):
+    coordinator, contract, transfer_id = _committed_target_transfer(tmp_path)
+    executor = _TargetConsumeExecutor(fail=True)
+    with pytest.raises(Qwen3NetworkError) as failed:
+        coordinator.consume(
+            transfer_id,
+            phase="prefill",
+            generation=contract["generation"],
+            batch_size=1,
+            sequence_length=4,
+            dtype="float32",
+            device="cpu",
+            has_next_segment=True,
+            executor=executor,
+        )
+    assert failed.value.reason_code == "qwen3_network_execution_failed"
+    assert coordinator.snapshot()["transfer_count"] == 0
+    assert executor.cleaned == ["consume_failed"]
+    assert all(not path.exists() for path in executor.outputs)
+
+    coordinator, contract, transfer_id = _committed_target_transfer(tmp_path / "epoch")
+    executor = _TargetConsumeExecutor()
+    result = coordinator.consume(
+        transfer_id,
+        phase="prefill",
+        generation=contract["generation"],
+        batch_size=1,
+        sequence_length=4,
+        dtype="float32",
+        device="cpu",
+        has_next_segment=True,
+        executor=executor,
+    )
+    assert result["output_reference"]
+    coordinator.authorize_control_peer("node-a", contract=contract, peer_epoch=2)
+    assert coordinator.snapshot()["transfer_count"] == 0
+    assert coordinator.snapshot()["output_count"] == 0
+    assert executor.cleaned == ["peer_epoch_changed"]
+    assert all(not path.exists() for path in executor.outputs)
+
+
+def test_transfer_and_consume_keeps_target_path_out_of_handoff_contract(tmp_path):
+    contract = _contract(segment_count=2, generation=23)
+    root = tmp_path / "source"
+    root.mkdir()
+    source = root / "source.pt"
+    source.write_bytes(b"source-network-artifact")
+    runtime, target_coordinator, target_http = _node(
+        tmp_path, "node-b", {"node-a"},
+    )
+    executor = _TargetConsumeExecutor()
+    target_coordinator.configure_sidecar_executor(executor)
+    target = Qwen3NetworkTarget(
+        node_id="node-b",
+        base_url="http://127.0.0.1:9876",
+        coordinator=target_coordinator,
+        requester=_requester(target_http),
+    )
+    transport = Qwen3NetworkHandoffTransport(
+        artifact_root=root,
+        targets={"node-b": target},
+        peer_signers={"node-a": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-a")},
+        chunk_bytes=5,
+        target_execution=True,
+    )
+    transport.activate(contract)
+    transport.begin_phase("prefill", contract["generation"])
+    result = transport.transfer_and_consume(
+        source_path=source,
+        chain_id=contract["contract_sha256"],
+        generation=contract["generation"],
+        phase="prefill",
+        from_segment=0,
+        to_segment=1,
+        source_node_id="node-a",
+        target_node_id="node-b",
+        batch_size=1,
+        sequence_length=4,
+        dtype="float32",
+        device="cpu",
+        has_next_segment=False,
+    )
+    encoded = json.dumps(result, ensure_ascii=True)
+    assert "path" not in encoded.lower()
+    assert result["input_reference"]["target_node_id"] == "node-b"
+    assert result["output_reference"] is None
+    assert executor.calls == 1
+    transport.cleanup()
+    assert executor.cleaned == ["release"]
