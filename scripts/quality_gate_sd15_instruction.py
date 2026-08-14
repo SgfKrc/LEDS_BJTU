@@ -41,6 +41,7 @@ DEFAULT_CASES = (
 MIN_MAE = 4.0
 MAX_MAE = 120.0
 MIN_ENTROPY = 3.0
+MIN_CHANNEL_STDDEV = 5.0
 MIN_EDGE_CORRELATION = 0.05
 MAX_STEADY_ALLOCATED_SPAN = 64 * 1024 * 1024
 MAX_AFTER_UNLOAD_ALLOCATED = 64 * 1024 * 1024
@@ -95,7 +96,7 @@ def _image_metrics(source: Any, result: Any) -> dict[str, Any]:
     automatic_pass = (
         MIN_MAE <= mae <= MAX_MAE
         and entropy >= MIN_ENTROPY
-        and max(channel_stddev) >= 5.0
+        and max(channel_stddev) >= MIN_CHANNEL_STDDEV
         and edge_correlation >= MIN_EDGE_CORRELATION
     )
     return {

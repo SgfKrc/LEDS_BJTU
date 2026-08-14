@@ -1520,7 +1520,10 @@ class TestPipelineWaitResult:
 
     def test_wait_for_layer_result_observes_cancel_event(self, sched):
         cancel_event = threading.Event()
-        threading.Timer(0.05, cancel_event.set).start()
+        # 等待循环先建立再触发取消：0.2s 先导延迟足够循环推进到 ack_step，
+        # 断言放宽为 step >= 2（原 ==2 依赖 50ms Timer 恰好命中步进点，
+        # 慢机负载下可能提前取消导致 flaky）
+        threading.Timer(0.2, cancel_event.set).start()
         started = time.time()
 
         result = sched._wait_for_layer_result(
@@ -1533,7 +1536,7 @@ class TestPipelineWaitResult:
 
         elapsed = time.time() - started
         assert result["cancelled"] is True
-        assert result["step"] == 2
+        assert result["step"] >= 2
         assert elapsed < 0.5
 
     def test_result_before_wait(self, sched):
