@@ -3739,6 +3739,18 @@ class Scheduler:
             network_coordinator, Qwen3NetworkTransferCoordinator,
         ):
             raise Qwen3PipelineProtocolError("Qwen3 network coordinator is invalid")
+        if network_coordinator is not None:
+            from qwen3_pipeline_state import (
+                load_qwen3_network_ledger,
+                save_qwen3_network_ledger,
+            )
+
+            network_coordinator.configure_persistent_ledger(
+                load=lambda: load_qwen3_network_ledger(network_coordinator.local_node_id),
+                save=lambda value: save_qwen3_network_ledger(
+                    value, network_coordinator.local_node_id,
+                ),
+            )
         if peer_verifier is None:
             secret = self._qwen3_cluster_secret()
             if not secret:
