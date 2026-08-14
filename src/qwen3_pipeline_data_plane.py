@@ -209,7 +209,12 @@ def _authorized(
     request: Request, transfer_id: str,
 ) -> tuple[Qwen3ArtifactTransferRuntime, str, str, int]:
     runtime = _runtime(request)
-    runtime.cleanup_expired()
+    coordinator = getattr(request.app.state, "qwen3_network_transfer_coordinator", None)
+    reconcile = getattr(coordinator, "cleanup_expired", None)
+    if callable(reconcile):
+        reconcile()
+    else:
+        runtime.cleanup_expired()
     ticket = _bearer_ticket(request)
     peer, peer_epoch = _authenticated_peer_identity(request)
     try:
@@ -274,7 +279,12 @@ async def transfer_status(request: Request):
             ),
             "prefix": QWEN3_TRANSFER_PREFIX,
         }
-    await run_in_threadpool(runtime.cleanup_expired)
+    coordinator = getattr(request.app.state, "qwen3_network_transfer_coordinator", None)
+    reconcile = getattr(coordinator, "cleanup_expired", None)
+    if callable(reconcile):
+        await run_in_threadpool(reconcile)
+    else:
+        await run_in_threadpool(runtime.cleanup_expired)
     return await run_in_threadpool(runtime.snapshot)
 
 

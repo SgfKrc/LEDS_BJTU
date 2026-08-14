@@ -728,6 +728,12 @@ class Qwen3ArtifactReceiver:
                 "sessions": counts,
             }
 
+    def session_status(self, transfer_id: str) -> str | None:
+        """Return bounded lifecycle state for coordinator reconciliation."""
+        with self._lock:
+            session = self._sessions.get(str(transfer_id))
+            return None if session is None else str(session.status)
+
 
 @dataclass(frozen=True)
 class TransferResponse:
