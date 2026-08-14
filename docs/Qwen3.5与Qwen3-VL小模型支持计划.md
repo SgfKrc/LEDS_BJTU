@@ -32,6 +32,8 @@
 
 > **2026-08-14 `PT-PIPE-QW3.15` 增量**：独立进程 helper 已完成 2/3 节点 path-free output reference 下一跳自动串联，覆盖 prefill/decode、KV generation 和 source release；目标端使用本地 synthetic executor 验证进程边界，未把测试结果冒充真实 Qwen3 模型执行。目标重启后 ledger 会使旧 output reference 失效并清理消费工件/staging。`.venv-test` 下网络专项 `28 passed`、QW3 全线 `156 passed`；此前模拟器使用主 Python 导致 `pytest-timeout` 缺失，已修复为优先调用 `.venv-test`。Qwen3.5/Qwen3-VL 真实执行、TTL/epoch/撤销等完整故障矩阵、双机/CUDA parity 和生产准入仍关闭。下一票 `PT-PIPE-QW3.16` 补故障矩阵并接入真实隔离 sidecar CPU smoke。
 
+> **2026-08-14 `PT-PIPE-QW3.16` 增量**：receiver TTL 过期现在会同步清理 network coordinator 的活动 transfer，并在主节点 ledger 留下 `expired` 终态；peer registration epoch 前进会 fencing 活动 transfer 为 `invalidated`，独立进程验证 `.part`、lease 和旧引用均不残留。网络专项 `30 passed`、QW3 全线 `158 passed`。隔离 sidecar 对真实 Qwen3-4B assignment `[0,1]+embedding` 的 CPU smoke 已通过（13 tensors、约 0.98 GB、KV prefill/decode、thinking-off 预检、`full_model_materialized=false`）；这是受控 synthetic forward，不是 Qwen3.5/Qwen3-VL 或真实多节点质量证据。下一票 `PT-PIPE-QW3.17` 接入真实 network sidecar executor 进程链和断线续传。
+
 ---
 
 ## 1. 本轮结论
