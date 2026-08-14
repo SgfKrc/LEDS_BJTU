@@ -318,6 +318,31 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
+### 🔒 Environment Separation (main / test / packaging)
+
+**Hard rule: test dependencies go ONLY into `.venv-test` — never into the system Python (main environment); never copy/sync site-packages between `.venv-test` and the main environment.**
+
+| Environment | Purpose | Dependency source | Forbidden |
+|---|---|---|---|
+| **Main** (system Python) | Runtime (transformers 4.47.1 / torch / inference services) and tool scripts | `requirements.txt` | No pytest-family test deps; no full test runs |
+| **`.venv-test`** | **The only test environment** (all pytest runs) | `scripts/setup_test_env.py` + `requirements-test.txt` | No runtime inference; not a main env substitute |
+| `.venv-packaging/` | iGPU packaging (CPU torch) | `packaging/requirements-cpu.txt` | — |
+| `.venv-packaging-cuda/` | dGPU packaging (CUDA torch) + SD sidecar | see packaging docs | — |
+| `.venv-gemma4-native/`, `.venv-qwen3-sidecar/` | Isolated sidecar runtimes (native MTMD / Qwen3 sidecar) | their own requirements | — |
+
+**Common commands**:
+
+```powershell
+# Create / verify the test env (--check is a read-only health check)
+python scripts/setup_test_env.py --check
+# Run tests in the test env (channel script has a venv guard that rejects system Python)
+.venv-test\Scripts\python.exe scripts/run_test_channels.py
+# Targeted tests
+.venv-test\Scripts\python.exe -m pytest tests/test_xxx.py -q -n 1
+```
+
+> **Incident log (2026-08-14)**: the main env was once polluted with pytest-family packages while `.venv-test` was stripped of pytest (site-packages copied between the two envs), forcing test runs in the main env. Fixed (main env uninstalled test packages; `.venv-test` reinstalled from requirements-test.txt). **Do not bypass the guard via `run_test_channels.py --allow-system-python`** — that flag is only for throwaway CI images.
+
 ---
 
 ## 🤖 Model Download
