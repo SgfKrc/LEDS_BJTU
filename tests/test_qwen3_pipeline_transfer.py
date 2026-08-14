@@ -208,6 +208,35 @@ def test_loopback_streams_two_and_three_segment_handoffs(
     assert sum(call["body_bytes"] for call in patches) > 0
 
 
+def test_chunk_provider_upload_binds_reference_metadata(tmp_path):
+    http, runtime, _ = _environment(tmp_path)
+    data = bytes(range(127))
+    plan = _begin(runtime, data)
+    (tmp_path / "source").mkdir()
+    client = Qwen3ArtifactTransferClient(
+        tmp_path / "source", _requester(http), chunk_bytes=13,
+    )
+    digest = hashlib.sha256(data).hexdigest()
+
+    def provider(offset, limit):
+        return {
+            "offset": offset,
+            "total_bytes": len(data),
+            "sha256": digest,
+            "eof": offset + min(limit, len(data) - offset) >= len(data),
+            "data": data[offset:offset + limit],
+        }
+
+    receipt = client.upload_chunks(
+        plan=plan,
+        total_bytes=len(data),
+        sha256=digest,
+        chunk_provider=provider,
+    )
+    assert receipt["status"] == "committed"
+    assert runtime.receiver.artifact_path(plan["transfer_id"]).read_bytes() == data
+
+
 def test_disconnect_after_ack_resumes_from_persisted_offset(tmp_path):
     http, runtime, _ = _environment(tmp_path)
     source_root = tmp_path / "source"

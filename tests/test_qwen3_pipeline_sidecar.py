@@ -268,3 +268,74 @@ def test_runtime_worker_executes_local_prefill_decode_artifacts(tmp_path):
     assert decoded["kv_contract"]["phase"] == "decode"
     assert decoded["kv_contract"]["generation"] == 1
     assert decoded["execution"]["full_model_materialized"] is False
+
+
+def test_network_sidecar_executor_keeps_output_local_and_releases_it(tmp_path):
+    artifact_root = tmp_path / "network"
+    artifact_root.mkdir()
+    input_ref = artifact_root / "input.pt"
+    input_ref.write_bytes(b"hidden-input")
+
+    def runner(request, _timeout):
+        phase = request["phase"]
+        if phase in {"prepare", "commit", "release", "abort"}:
+            return {
+                "schema_version": 1,
+                "operation": "qwen3_pipeline_sidecar",
+                "phase": phase,
+                "status": {
+                    "prepare": "prepared", "commit": "committed",
+                    "release": "released", "abort": "aborted",
+                }[phase],
+                "gate_passed": True,
+                "cleanup_complete": phase in {"release", "abort"},
+            }
+        output = Path(request["output_ref"])
+        output.write_bytes(b"hidden-output")
+        size, digest = sidecar._file_evidence(output)
+        return {
+            "schema_version": 1,
+            "operation": "qwen3_pipeline_sidecar",
+            "phase": phase,
+            "status": "executed",
+            "gate_passed": True,
+            "execution": {
+                "segment_materialized": True,
+                "full_model_materialized": False,
+                "artifact_bytes": size,
+                "artifact_sha256": digest,
+            },
+            "hidden_handoff": {
+                "dtype": request["dtype"],
+                "device": request["device"],
+                "shape": [1, 3, 4],
+            },
+            "kv_contract": {"present": True, "shape": [1, 3]},
+        }
+
+    session = _session(tmp_path, runner)
+    session.prepare()
+    session.commit()
+    executor = sidecar.Qwen3NetworkSidecarExecutor(
+        session, artifact_root=artifact_root,
+    )
+    internal = executor(
+        input_ref,
+        {
+            "transfer_id": "qtx_" + "a" * 32,
+            "chain_id": "c" * 64,
+            "phase": "prefill",
+            "generation": 2,
+            "segment_index": 1,
+            "sequence_length": 3,
+            "batch_size": 1,
+            "has_next_segment": False,
+            "dtype": "float32",
+            "device": "cpu",
+        },
+    )
+    output_path = Path(internal["output_path"])
+    assert output_path.is_file()
+    assert str(artifact_root) in str(output_path)
+    executor.cleanup({"chain_id": "c" * 64, "segment_index": 1}, "cancelled")
+    assert not output_path.exists()
