@@ -346,3 +346,16 @@
 1. 在独立进程中补齐 peer epoch 变化、ticket TTL、重复 submit/commit、中途 revoke、断线重试和 ledger terminal state，逐项断言 output lease、transfer record 与 `.part` staging 无残留。
 2. 将 synthetic target executor 替换为已经存在的隔离 sidecar executor，先以无硬件依赖的 Qwen3 assignment CPU smoke 验证真实 hidden/KV 输入输出，再决定是否进入真实 CUDA/双机验收。
 3. 保持主运行时 `transformers==4.47.x`、sidecar 隔离、`full_model_materialized=false` 和禁止 full-model fallback；生产 API 路由、双机/CUDA parity、吞吐时延和生产准入继续后置。
+
+### 8.34 `PT-PIPE-QW3.16` 故障矩阵与真实 sidecar CPU smoke（开发门 Completed，2026-08-14）
+
+- `Qwen3ArtifactReceiver.session_status` 与 `Qwen3NetworkTransferCoordinator.cleanup_expired` 已接通。过期 receiver session 会被 coordinator 回收并写入 ledger `expired`；peer registration epoch 前进仍由 `_fence_peer_locked` 回收 transfer，并以 `invalidated` 终态保存。未配置 network coordinator 的普通 transfer runtime 继续保留原有 TTL 行为。
+- `/internal/v1/qwen3/artifact-transfer/status` 和受保护数据路由优先调用 coordinator reconciliation，因此轮询/访问即可完成过期清理；`.part`、committed artifact、sidecar output 和 output lease 均按终态清理。ledger 恢复时允许 `expired/failed` 作为已有终态，不会被误写成新的活动 transfer。
+- 独立进程新增 TTL 过期、注册 epoch 变化、旧 transfer 不可复活和终态 ledger 断言；控制面不返回路径、ticket 或 tensor。网络专项 `30 passed`，QW3 全线 `158 passed`。
+- 真实隔离 sidecar CPU assignment smoke 已用 `models/qwen3-4b` `[0,1]+embedding` 完成：13 tensors、`979,779,072` source bytes，`transformers 4.57.6`、`torch 2.13.0+cu126`、`accelerate 1.14.0`，prefill/decode KV 和 `full_model_materialized=false` 通过。该 worker 的 forward 仍是受控 synthetic forward，未宣称真实多节点结果等价。
+
+### 8.35 下一票：`PT-PIPE-QW3.17` 真实 network sidecar 进程链
+
+1. 给独立进程 helper 增加真实 `Qwen3NetworkSidecarExecutor` 接线，用真实 torch artifact 完成 2 节点 CPU prefill/decode；随后扩展 3 节点 output reference、KV generation 和源端 release。
+2. 加入 PATCH 后断线、重复 status/commit、revoke 中断和 `.part` offset/ledger progress 对照，确认重试只续传确认 offset，不重复物化或保留旧 lease。
+3. 保持 sidecar 独立环境、主运行时 `transformers==4.47.x`、`full_model_materialized=false` 和禁止整模回退；真实 CUDA/双机 parity、吞吐时延和生产准入继续后置。
