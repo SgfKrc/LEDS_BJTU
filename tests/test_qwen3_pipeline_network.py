@@ -1054,6 +1054,51 @@ def test_expired_transfer_reconciles_to_terminal_ledger_and_removes_staging(tmp_
     assert not list((tmp_path / "node-b" / "qwen3" / "network_artifacts").glob("*.part"))
 
 
+def test_committed_transfer_progress_replay_keeps_terminal_ledger_state(tmp_path):
+    runtime, coordinator, _http = _node(tmp_path, "node-b", {"node-a"})
+    ledger = _attach_memory_ledger(coordinator)
+    contract = _contract(segment_count=2, generation=62)
+    coordinator.activate(contract)
+    coordinator.authorize_control_peer("node-a", contract=contract, peer_epoch=0)
+    coordinator.begin_phase("prefill", contract["generation"])
+    data = b"committed-progress-replay"
+    plan = coordinator.begin_receive(
+        base_url="http://127.0.0.1:9876",
+        source_peer_id="node-a",
+        chain_id=contract["contract_sha256"],
+        generation=contract["generation"],
+        phase="prefill",
+        from_segment=0,
+        to_segment=1,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+    )
+    transfer_id = plan["transfer_id"]
+    runtime.receiver.write(
+        transfer_id,
+        ticket=plan["ticket"],
+        authenticated_peer_id="node-a",
+        offset=0,
+        data=data,
+    )
+    runtime.receiver.commit(
+        transfer_id,
+        ticket=plan["ticket"],
+        authenticated_peer_id="node-a",
+    )
+    reference = coordinator.commit_reference(transfer_id)
+    assert coordinator.record_transfer_progress(transfer_id, len(data))["status"] == "committed"
+    assert coordinator.record_transfer_progress(transfer_id, len(data)) == {
+        "transfer_id": transfer_id,
+        "received_bytes": len(data),
+        "size_bytes": len(data),
+        "status": "committed",
+    }
+    assert ledger["value"]["transfers"][transfer_id]["status"] == "committed"
+    assert ledger["value"]["transfers"][transfer_id]["received_bytes"] == len(data)
+    assert ledger["value"]["transfers"][transfer_id]["input_reference"] == reference
+
+
 def test_same_machine_process_ttl_epoch_revoke_and_terminal_ledger(tmp_path):
     contract = _contract(segment_count=2, generation=63)
     root = tmp_path / "fault-matrix"

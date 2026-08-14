@@ -15,11 +15,14 @@ output_reference。全程 `full_model_materialized=false`、禁止整模回退�
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 import psutil
@@ -31,6 +34,10 @@ sys.path.insert(0, str(ROOT / "src"))
 from qwen3_pipeline_network import (  # noqa: E402
     Qwen3NetworkHandoffTransport,
     Qwen3NetworkTarget,
+)
+from qwen3_multimodal_contract import (  # noqa: E402
+    build_mm1_model_manifest,
+    build_mm1_model_profile,
 )
 from qwen3_pipeline_peer_auth import Qwen3PeerRequestSigner  # noqa: E402
 from qwen3_pipeline_control import Qwen3LoopbackNetworkControlClient  # noqa: E402
@@ -45,10 +52,69 @@ MODEL_PATH = ROOT / "models" / "qwen3-4b"
 SIDECAR_PYTHON = ROOT / ".venv-qwen3-sidecar" / "Scripts" / "python.exe"
 TOTAL_LAYERS = 36
 
-pytestmark = pytest.mark.skipif(
-    not MODEL_PATH.is_dir() or not SIDECAR_PYTHON.is_file(),
-    reason="QW3.17 需要真实 models/qwen3-4b 工件与 .venv-qwen3-sidecar（真机工件门）",
-)
+pytestmark = [
+    pytest.mark.real_model,
+    pytest.mark.skipif(
+        not MODEL_PATH.is_dir() or not SIDECAR_PYTHON.is_file(),
+        reason="QW3.17 需要真实 models/qwen3-4b 工件与 .venv-qwen3-sidecar（真机工件门）",
+    ),
+]
+
+
+@contextmanager
+def _real_sidecar_lock():
+    """Serialize real sidecar workers across xdist processes.
+
+    Each worker may start two or three isolated runtimes, each holding a
+    filtered assignment in host memory.  The lock prevents the default
+    ``-n 4`` test runner from turning a resource-gated smoke into an OOM race.
+    """
+    lock_path = Path(tempfile.gettempdir()) / "qlh-qw317-real-sidecar.lock"
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while not acquired:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                except OSError:
+                    time.sleep(0.25)
+                    handle.seek(0)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            acquired = True
+        yield
+    finally:
+        if acquired:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+@pytest.fixture(autouse=True)
+def _serialize_real_sidecar_tests():
+    with _real_sidecar_lock():
+        yield
 
 
 def _available_ram_gb() -> float:
@@ -90,7 +156,8 @@ def _free_port() -> int:
 
 
 def _spawn_real_node(tmp_path, node_id, port, allowed_peers, *,
-                     layer_range, has_embedding=False, has_lm_head=False):
+                     layer_range, has_embedding=False, has_lm_head=False,
+                     mm1_manifest_path=None, mm1_visual_tokens=0):
     """启动带真实 sidecar executor 的 helper 进程（隔离 sidecar 真实加载）。"""
     helper = Path(__file__).parent / "helpers" / "qwen3_network_node.py"
     state_dir = tmp_path / node_id
@@ -110,6 +177,10 @@ def _spawn_real_node(tmp_path, node_id, port, allowed_peers, *,
         command.append("--sidecar-has-embedding")
     if has_lm_head:
         command.append("--sidecar-has-lm-head")
+    if mm1_manifest_path is not None:
+        command.extend(["--mm1-manifest", str(mm1_manifest_path)])
+        if mm1_visual_tokens:
+            command.extend(["--mm1-visual-tokens", str(mm1_visual_tokens)])
     for peer in allowed_peers:
         command.extend(["--allowed-peer", peer])
     process = subprocess.Popen(
@@ -185,7 +256,54 @@ def _make_source_tensor(root: Path, name: str, sequence_length: int) -> Path:
     return path
 
 
-def _run_real_chain(tmp_path, *, segment_count, generation):
+def _write_mm1_manifest(path: Path) -> Path:
+    config_path = ROOT / "models" / "qwen3-vl-4b-instruct" / "config.json"
+    profile = build_mm1_model_profile(
+        json.loads(config_path.read_text(encoding="utf-8")),
+    )
+    manifest = build_mm1_model_manifest(
+        model_id="qwen3-vl-4b-mm1-smoke",
+        model_family="qwen3_vl",
+        runtime="transformers_sidecar",
+        revision="mm1-real-smoke",
+        components=[
+            {
+                "component_id": "processor",
+                "artifact_id": "mm1-processor",
+                "component_kind": "processor",
+                "format": "tokenizer",
+                "revision": "mm1-real-smoke",
+                "size_bytes": 128,
+                "sha256": "a" * 64,
+            },
+            {
+                "component_id": "text",
+                "artifact_id": "mm1-text",
+                "component_kind": "text_weights",
+                "format": "safetensors",
+                "revision": "mm1-real-smoke",
+                "size_bytes": 1024,
+                "sha256": "b" * 64,
+            },
+            {
+                "component_id": "vision",
+                "artifact_id": "mm1-vision",
+                "component_kind": "vision_weights",
+                "format": "safetensors",
+                "revision": "mm1-real-smoke",
+                "size_bytes": 2048,
+                "sha256": "c" * 64,
+            },
+        ],
+        text=profile["text"],
+        vision=profile["vision"],
+        processor=profile["processor"],
+    )
+    path.write_text(json.dumps(manifest, ensure_ascii=True, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def _run_real_chain(tmp_path, *, segment_count, generation, mm1_manifest_path=None):
     """spawn 真实节点并执行 prefill → decode → release；返回执行报告。"""
     contract = _real_contract(segment_count=segment_count, generation=generation)
     root = tmp_path / "real-chain"
@@ -209,6 +327,8 @@ def _run_real_chain(tmp_path, *, segment_count, generation):
                 layer_range=segment["layer_range"],
                 has_embedding=segment["has_embedding"],
                 has_lm_head=segment["has_lm_head"],
+                mm1_manifest_path=mm1_manifest_path,
+                mm1_visual_tokens=4 if mm1_manifest_path is not None else 0,
             )
             processes.append(process)
             roots[node_id] = state_dir
@@ -262,6 +382,25 @@ def test_real_sidecar_two_node_chain_prefill_decode(tmp_path):
     # 2 节点链无段间转发：无输出被中途释放（末段输出保留在目标端）
     assert result["prefill"]["completed"] is True
     assert result["prefill"]["released_output_ids"] == []
+
+
+def test_real_sidecar_mm1_binding_cpu_metadata_smoke(tmp_path):
+    """Real isolated sidecar emits an MM1 binding digest without visual claims."""
+    if _available_ram_gb() < 3.0:
+        pytest.skip("available RAM < 3GB; real MM1 sidecar gate")
+    manifest_path = _write_mm1_manifest(tmp_path / "mm1-manifest.json")
+    result = _run_real_chain(
+        tmp_path, segment_count=2, generation=85,
+        mm1_manifest_path=manifest_path,
+    )
+    for phase in ("prefill", "decode"):
+        executions = result[phase]["executions"]
+        assert len(executions) == 1
+        digest = executions[0]["mm1_binding_sha256"]
+        assert isinstance(digest, str) and len(digest) == 64
+        assert all(char in "0123456789abcdef" for char in digest)
+    assert result["prefill"]["full_model_materialized"] is False
+    assert result["decode"]["full_model_materialized"] is False
 
 
 def test_real_sidecar_three_node_chain_prefill_decode(tmp_path):
@@ -442,4 +581,84 @@ def test_real_sidecar_revoke_interrupts_and_cleans_artifacts(tmp_path):
                 has_next_segment=False,
             )
     finally:
+        _stop_node(process)
+
+
+def test_real_sidecar_transfer_retry_persists_progress_and_commit_is_idempotent(tmp_path):
+    """QW3.18: a lost PATCH acknowledgement resumes from the target offset."""
+    if _available_ram_gb() < 3.0:
+        pytest.skip("available RAM < 3GB; real sidecar gate")
+    contract = _real_contract(segment_count=2, generation=84)
+    root = tmp_path / "retry-chain"
+    root.mkdir()
+    node_b = contract["segments"][1]
+    port = _free_port()
+    process, state_dir = _spawn_real_node(
+        tmp_path, "node-b", port, ["node-a"],
+        layer_range=node_b["layer_range"],
+    )
+    transport = None
+    try:
+        failure = {"raised": False, "patches": 0}
+
+        def flaky_requester(method, url, headers, body):
+            response = default_transfer_request(method, url, headers, body)
+            if method == "PATCH":
+                failure["patches"] += 1
+                if not failure["raised"]:
+                    failure["raised"] = True
+                    raise OSError("simulated disconnect after target persisted PATCH")
+            return response
+
+        target = Qwen3NetworkTarget(
+            node_id="node-b",
+            base_url=f"http://127.0.0.1:{port}",
+            coordinator=Qwen3LoopbackNetworkControlClient(
+                node_id="node-b",
+                base_url=f"http://127.0.0.1:{port}",
+                artifact_root=state_dir / "qwen3" / "network_artifacts",
+                signer=Qwen3PeerRequestSigner(SECRET, peer_node_id="node-a"),
+            ),
+            requester=flaky_requester,
+        )
+        transport = Qwen3NetworkHandoffTransport(
+            artifact_root=root,
+            targets={"node-b": target},
+            peer_signers={
+                "node-a": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-a"),
+                "node-b": Qwen3PeerRequestSigner(SECRET, peer_node_id="node-b"),
+            },
+            chunk_bytes=32 * 1024,
+        )
+        transport.activate(contract)
+        transport.begin_phase("prefill", contract["generation"])
+        source = root / "retry-input.bin"
+        source.write_bytes(bytes(index % 251 for index in range(150_000)))
+        reference = transport.transfer_reference(
+            source_path=source,
+            chain_id=contract["contract_sha256"],
+            generation=contract["generation"],
+            phase="prefill",
+            from_segment=0,
+            to_segment=1,
+            source_node_id="node-a",
+            target_node_id="node-b",
+        )
+        assert failure["raised"] is True
+        assert failure["patches"] >= 2
+        ledger_path = state_dir / "qwen3-network-ledger.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        record = ledger["transfers"][reference["artifact_id"]]
+        assert record["status"] == "committed"
+        assert record["received_bytes"] == source.stat().st_size
+        artifact = (
+            state_dir / "qwen3" / "network_artifacts"
+            / f"{reference['artifact_id']}.pt"
+        )
+        assert artifact.read_bytes() == source.read_bytes()
+        assert target.coordinator.commit_reference(reference["artifact_id"]) == reference
+        assert target.coordinator.commit_reference(reference["artifact_id"]) == reference
+    finally:
+        if transport is not None:
+            transport.cleanup()
         _stop_node(process)
