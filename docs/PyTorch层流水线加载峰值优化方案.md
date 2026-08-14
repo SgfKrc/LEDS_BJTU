@@ -3,7 +3,7 @@
 > 文档生命周期：**现行（Active）**
 >
 > 创建日期：2026-08-13
-> 更新日期：2026-08-14
+> 更新日期：2026-08-15
 > 适用范围：分布式层间流水线（layer-wise pipeline）从节点的模型加载瞬时显存/内存峰值治理；直接约束 Surface 7 级轻量从节点在重模型（DeepSeek 7B / gemma-4 12B / Qwen 9B 等）下的可用性
 >
 > 目标：**加载瞬间峰值 ≈ 分配层段权重 + 常量开销**，与稳态占用同量级，杜绝"全模型峰值压垮从节点"；一期进一步把模型身份/容量发现从权重物化中剥离，向"集群总容量加载"演进。
@@ -371,9 +371,50 @@
   - **revoke 中断清理**（取消后无 `qwen3-consume-*` 残留，已撤销 transfer 再 consume fail-closed）；
   - **3 节点链**（node-b `[0,1]+embedding` → node-c `[1,2]` 级联 output reference 与 KV generation 交接）：**RAM 腾出后实测通过（2026-08-14 晚，可用 9.7GB）**，`prefill/decode` 各 2 段执行、段 1 输出转发前 release 一次、`full_model_materialized=false`；decode 依赖 prefill KV 的跨阶段保留由 executor KV 副本承载（见下）。
 - **修复 `Qwen3NetworkSidecarExecutor` KV 生命周期**：prefill 段间转发完成后传输层 release 会删除 output 文件（传输副本），而 decode 仍需 prefill 的 `past_key_values`——executor 现为 KV 单独保留副本（`qwen3-kv-*.pt`，cleanup 时一并清理），decode 不再丢失 KV 载体（3 节点链实测暴露并修复）。
-- 回归：sidecar/network/真实链专项 `40 passed`；QW3.17 全程保持 sidecar 独立环境、`transformers==4.47.x` 主运行时、禁整模回退；真实 CUDA/双机 parity、吞吐时延与生产准入继续后置。
+- 回归：sidecar/network/真实链专项当前 `39 passed / 1 skipped`（默认 `-n 4` 由跨 worker 文件锁串行真实模型测试）；QW3 全线 `159 passed / 3 skipped`。QW3.17 全程保持 sidecar 独立环境、`transformers==4.47.x` 主运行时、禁整模回退；真实 CUDA/双机 parity、吞吐时延与生产准入继续后置。
 
-### 8.37 下一票：`PT-PIPE-QW3.18` PATCH 断线续传矩阵与真实链收口
+### 8.37 `PT-PIPE-QW3.18` PATCH 断线续传矩阵与真实链收口（开发门 Completed，2026-08-14）
 
-1. 补齐真实模式（helper 真实 sidecar）下 PATCH 断线续传（`.part` offset 只续传确认段）、重复 status/commit 与 ledger progress 对照——合成矩阵（`test_qwen3_pipeline_network.py` lost_ack/resume）已覆盖，真实模式补关键场景后 QW3 合成链全部收口。
-2. 保持 `full_model_materialized=false` 与全部合成回归；真实 CUDA/双机 parity、异构 dtype/device 转换和生产准入继续独立后置；QW3 合成链收官后主线转五期 `PT-PIPE-MM1`（Qwen3-VL/Qwen3.5 多模态组件编排）。
+- `Qwen3ArtifactTransferClient.upload` 现在接受 `progress_callback`；普通 `transfer` 与 `transfer_reference` 将每次 receiver 确认的 offset 写入目标 coordinator ledger。进度更新保持单调；已提交 transfer 在重复 status/commit 重试时允许终值 offset 重放，不会把 `committed` 回退成 `receiving`。
+- 真实 helper 测试模拟“目标已持久化 PATCH、客户端丢失 ACK”：150,000 字节工件通过 GET offset 续传，最终文件与源 SHA/字节一致，ledger `received_bytes=size_bytes/status=committed`；同一 `commit_reference` 连续调用两次返回完全相同引用。既有 revoke/TTL/epoch 终态和 `.part` 清理继续通过。
+- 回归：QW3 全线 `161 passed / 3 skipped`（164 项，`.venv-test` 默认 `-n 4`）；sidecar/network/真实 helper 合并专项 `40 passed / 2 skipped`。真实 helper 测试继续使用跨 xdist worker 文件锁，避免低 RAM 并发假失败；全程保持 sidecar 独立环境、主运行时 `transformers==4.47.x`、`full_model_materialized=false`，不宣称真实双机/CUDA parity 或生产准入。
+
+### 8.38 `PT-PIPE-MM1.1/.2` 多模态合同与 transfer binding（开发门 Completed，2026-08-14）
+
+- 新增 `src/qwen3_multimodal_contract.py`：从本地 Qwen3-VL/Qwen3.5 `config.json` 提取 path-free profile，不读取权重；固定 text/vision/processor/component manifest 字段、格式/修订/SHA/大小约束和 `full_model_materialized=false`。
+- 视觉到文本 handoff 固定为 `[batch,tokens,hidden]`、dtype/device、image/video 元数据和已提交 artifact 摘要；拒绝路径、ticket、prompt、tensor 内容等敏感字段，拒绝视觉 hidden 与 manifest 不一致。
+- 容量预算按唯一 `artifact_id` 去重，分别报告视觉/文本权重、激活、handoff 和安全余量；实际本地 profile 已核对 Qwen3-VL-4B（文本 36 层/hidden 2560）与 Qwen3.5-2B（文本 24 层/hidden 2048）。
+- 新增 transfer binding：仅在 QW3 receiver reference 已 `committed` 后绑定 artifact/SHA/大小/节点/代际/phase，结果仍为 path-free ledger 摘要；断线重试、取消、lease/revoke、清理继续复用 QW3.18 状态机。
+- MM1.1/.2 定向 `6 passed`；QW3+MM1 联合回归 `169 passed / 1 skipped`。未宣称真实视觉模型 forward、CUDA/双机 parity、吞吐或生产准入。
+
+### 8.39 `PT-PIPE-MM1.3` 合成视觉组件生命周期与 QW3 consume 接线（开发门 Completed，2026-08-14）
+
+- 新增 `src/qwen3_multimodal_runtime.py` 的 `Qwen3MultimodalSyntheticExecutor`，作为目标侧 consume callback：接收已提交 QW3 reference 后构造并校验 MM1 visual→text handoff/binding，生成小型确定性输出，不加载视觉权重。
+- `Qwen3NetworkTransferCoordinator.consume_transfer` 可携带 path-free `mm1_binding_sha256` 摘要；执行失败、取消、TTL 和 peer epoch 继续复用原有 coordinator ledger 与 executor cleanup，不新建第二套状态机。
+- 定向 MM1 runtime `3 passed`；QW3/MM1 联合回归 `172 passed / 1 skipped`。覆盖成功 consume、binding 失败后的 terminal `failed`/输出清理、TTL `expired` 和 peer epoch `invalidated`；真实视觉 forward、跨进程 sidecar、CUDA/双机 parity、吞吐时延和生产准入继续后置。
+
+### 8.40 `PT-PIPE-MM1.4` 真实隔离 sidecar 输出适配（开发门 Completed，2026-08-15）
+
+- 新增 `Qwen3MultimodalSidecarAdapter`，包裹现有 `Qwen3NetworkSidecarExecutor`：receiver reference 提交后生成 MM1 handoff/binding，把 `mm1_binding_sha256` 投影到 path-free consume 结果，并将 cleanup 原样转发给真实 sidecar executor。
+- adapter 对 sidecar 主动返回的 hidden metadata 校验 batch、text hidden size、dtype/device；旧 sidecar 未返回 hidden 字段时只保留 manifest 投影，不伪造真实视觉输出。测试 helper 新增受控 `--mm1-manifest/--mm1-visual-tokens` 参数。
+- 真实隔离 `.venv-qwen3-sidecar` CPU prefill/decode smoke 已通过，使用真实 Qwen3-4B torch artifact 与 Qwen3-VL config-derived MM1 manifest；这验证的是跨进程 metadata 接线，不是视觉塔 forward 或图像语义。MM1 runtime `4 passed`、真实 MM1 sidecar `1 passed`、QW3/MM1 联合 `174 passed / 1 skipped`。
+
+### 8.41 计划记录：`PT-PIPE-MM1.5` processor/视觉 worker 离线预检合同
+
+1. 为 Qwen3-VL/Qwen3.5 定义隔离 visual worker 的 request/response schema，固定 processor revision、image/video token、像素/帧预算、组件 assignment 与 `trust_remote_code=false`/offline 约束。
+2. 先做不加载视觉权重的 config/processor metadata preflight，覆盖 Qwen3-VL 与 Qwen3.5、缺组件/越界 media/运行时不匹配 fail-closed；图像字节和本地路径不得进入控制面。
+3. 真实视觉塔 forward、图像/视频语义质量、CUDA/双机 parity、峰值标定和生产准入继续单独后置。
+
+### 8.42 `PT-PIPE-MM1.5` processor/视觉 worker 离线预检合同（开发门 Completed，2026-08-15）
+
+- 新增 `src/qwen3_multimodal_preflight.py`：对本地 `config.json`、`preprocessor_config.json`、`video_preprocessor_config.json` 和 `tokenizer_config.json` 做有界 JSON 读取、SHA-256 摘要和模型族/视觉几何/tokenizer 交叉校验；不导入 Transformers，不读取 safetensors 权重，不处理图像或视频字节，返回结果不含本地路径。
+- 固定 path-free visual worker request/response schema：处理器 revision、`Qwen3VLProcessor`/`Qwen2Tokenizer`、image/video token、patch/merge/temporal 参数、图像/视频像素与帧预算、节点和 manifest 摘要；安全字段强制 `offline=true`、`local_files_only=true`、`network_disabled=true`、`trust_remote_code=false`。
+- 组件分配按最小权限收口：`transformers_sidecar` 仅允许 `processor + vision_weights`，`llama_cpp_mtmd` 仅允许 `processor + mmproj`，明确拒绝 `text_weights`/`mtp` 进入视觉 worker。`full_model_materialized` 与 `weight_materialized` 固定为 `false`。
+- 两个真实本地目录 Qwen3-VL-4B 与 Qwen3.5-2B 均通过 image/video metadata preflight；新增 MTMD 最小分配、安全策略、越界 media、摘要篡改和敏感字段拒绝矩阵。MM1.5 定向 `15 passed`；QW3/MM1 联合回归 `190 passed`（`.venv-test`，4 workers，78.67s）。主 Python 不含 pytest，不能作为测试环境结论。
+- 本票只证明 processor metadata 与视觉 worker 启动条件可审计，不宣称 AutoProcessor 实例化、视觉塔 forward、图像/视频语义、CUDA/双机 parity、峰值/吞吐或生产准入。
+
+### 8.43 下一票：`PT-PIPE-MM1.6` 隔离 AutoProcessor 离线构造 smoke
+
+1. 在 sidecar 独立 venv 中固定 Transformers 版本与 `local_files_only`，仅用已通过 MM1.5 的 metadata 构造 `AutoProcessor`，把实际类名、token/geometry 和清理状态投影回 path-free response。
+2. 覆盖缺少 processor 文件、版本/类名漂移、远程代码开关、异常退出和重复 cleanup；不加载 vision/text weights，不接图像语义和网络传输。
+3. 只有该 smoke 与后续人工审计同时通过，才讨论真实视觉张量 handoff；CUDA、双机 parity、长视频和生产路由继续后置。
