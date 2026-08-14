@@ -811,11 +811,15 @@ class Qwen3NetworkTransferCoordinator:
             )
         with self._lock:
             transfer = self._transfers.get(str(transfer_id))
-            if transfer is None or transfer.get("status") != "receiving":
+            if transfer is None or transfer.get("status") not in {"receiving", "committed"}:
                 raise Qwen3NetworkError(
-                    "qwen3_network_transfer_missing", "network transfer is not receiving",
+                    "qwen3_network_transfer_missing", "network transfer is not receiving or committed",
                 )
             size = int(transfer["descriptor"]["size_bytes"])
+            if transfer.get("status") == "committed" and received_bytes != size:
+                raise Qwen3NetworkError(
+                    "qwen3_network_progress_invalid", "committed network transfer progress is not terminal",
+                )
             previous = int(
                 self._ledger.get("transfers", {})
                 .get(str(transfer_id), {})
@@ -826,13 +830,16 @@ class Qwen3NetworkTransferCoordinator:
                     "qwen3_network_progress_invalid", "network transfer progress moved backwards",
                 )
             self._record_transfer_locked(
-                str(transfer_id), transfer, status="receiving", received_bytes=received_bytes,
+                str(transfer_id), transfer,
+                status=str(transfer.get("status", "receiving")),
+                received_bytes=received_bytes,
+                input_reference=transfer.get("input_reference"),
             )
             return {
                 "transfer_id": str(transfer_id),
                 "received_bytes": int(received_bytes),
                 "size_bytes": size,
-                "status": "receiving",
+                "status": str(transfer.get("status", "receiving")),
             }
 
     def commit_reference(self, transfer_id: str) -> dict[str, Any]:
@@ -1099,6 +1106,17 @@ class Qwen3NetworkTransferCoordinator:
                 },
                 "full_model_materialized": False,
             }
+            mm1_binding_sha256 = metadata.get("mm1_binding_sha256")
+            if mm1_binding_sha256 is not None:
+                binding_digest = str(mm1_binding_sha256).lower()
+                if len(binding_digest) != 64 or any(
+                    char not in "0123456789abcdef" for char in binding_digest
+                ):
+                    raise Qwen3NetworkError(
+                        "qwen3_network_execution_invalid",
+                        "multimodal binding digest is invalid",
+                    )
+                result_contract["mm1_binding_sha256"] = binding_digest
             with self._lock:
                 current = self._transfers.get(str(transfer_id))
                 if current is None or current.get("status") != "consuming":
@@ -1636,10 +1654,23 @@ class Qwen3NetworkHandoffTransport:
                 chunk_bytes=self.chunk_bytes,
                 peer_proof_headers=signer.headers,
             )
+
+            def progress(offset: int) -> None:
+                try:
+                    target.coordinator.record_transfer_progress(plan["transfer_id"], offset)
+                except Qwen3NetworkError as exc:
+                    if exc.reason_code == "qwen3_transfer_connection_failed":
+                        raise Qwen3TransferError(exc.reason_code, exc.reason) from exc
+                    raise
+
             receipt = None
             for attempt in range(1, self.max_attempts + 1):
                 try:
-                    receipt = client.upload(source=source, plan=plan)
+                    receipt = client.upload(
+                        source=source,
+                        plan=plan,
+                        progress_callback=progress,
+                    )
                     break
                 except Qwen3TransferError as exc:
                     if (
@@ -1770,10 +1801,23 @@ class Qwen3NetworkHandoffTransport:
                 chunk_bytes=self.chunk_bytes,
                 peer_proof_headers=signer.headers,
             )
+
+            def progress(offset: int) -> None:
+                try:
+                    target.coordinator.record_transfer_progress(plan["transfer_id"], offset)
+                except Qwen3NetworkError as exc:
+                    if exc.reason_code == "qwen3_transfer_connection_failed":
+                        raise Qwen3TransferError(exc.reason_code, exc.reason) from exc
+                    raise
+
             receipt = None
             for attempt in range(1, self.max_attempts + 1):
                 try:
-                    receipt = client.upload(source=source, plan=plan)
+                    receipt = client.upload(
+                        source=source,
+                        plan=plan,
+                        progress_callback=progress,
+                    )
                     break
                 except Qwen3TransferError as exc:
                     if exc.reason_code != "qwen3_transfer_connection_failed" or attempt >= self.max_attempts:
@@ -2186,6 +2230,7 @@ class Qwen3NetworkHandoffTransport:
             "execution": dict(consume["execution"]),
             "hidden_handoff": dict(consume.get("hidden_handoff", {})),
             "kv_contract": dict(consume.get("kv_contract", {})),
+            "mm1_binding_sha256": consume.get("mm1_binding_sha256"),
             "output_reference": (
                 dict(consume["output_reference"])
                 if consume.get("output_reference") is not None else None
@@ -2250,6 +2295,7 @@ class Qwen3NetworkHandoffTransport:
                 "execution": dict(consume["execution"]),
                 "hidden_handoff": dict(consume.get("hidden_handoff", {})),
                 "kv_contract": dict(consume.get("kv_contract", {})),
+                "mm1_binding_sha256": consume.get("mm1_binding_sha256"),
                 "output_reference": (
                     dict(consume["output_reference"])
                     if consume.get("output_reference") is not None else None
