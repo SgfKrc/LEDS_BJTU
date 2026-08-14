@@ -94,9 +94,19 @@ def _pytest_environment() -> dict[str, str]:
     return environment
 
 
+def _pytest_python() -> str:
+    """Prefer the repository test environment when called from system Python."""
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        return sys.executable
+    candidate = ROOT / ".venv-test" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    return str(candidate) if candidate.is_file() else sys.executable
+
+
 def _run_pytest(targets: Sequence[str]) -> tuple[int, str]:
     completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", *targets],
+        [_pytest_python(), "-m", "pytest", "-q", *targets],
         cwd=ROOT,
         env=_pytest_environment(),
         stdout=subprocess.PIPE,

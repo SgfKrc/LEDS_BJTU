@@ -751,8 +751,14 @@ def default_transfer_request(
     opener = build_opener(ProxyHandler({}), _NoRedirect())
     try:
         with opener.open(request, timeout=30.0) as response:
-            content = response.read(MAX_CONTROL_RESPONSE_BYTES + 1)
-            if len(content) > MAX_CONTROL_RESPONSE_BYTES:
+            response_limit = (
+                MAX_TRANSFER_CHUNK_BYTES + 1
+                if str(response.headers.get("Content-Type", "")).split(";", 1)[0].strip()
+                == "application/octet-stream"
+                else MAX_CONTROL_RESPONSE_BYTES + 1
+            )
+            content = response.read(response_limit)
+            if len(content) > response_limit - 1:
                 raise Qwen3TransferError(
                     "qwen3_transfer_response_oversize", "transfer response exceeds its limit",
                 )
@@ -762,8 +768,15 @@ def default_transfer_request(
                 content=content,
             )
     except HTTPError as exc:
-        content = exc.read(MAX_CONTROL_RESPONSE_BYTES + 1)
-        if len(content) > MAX_CONTROL_RESPONSE_BYTES:
+        error_content_type = "" if exc.headers is None else str(exc.headers.get("Content-Type", ""))
+        response_limit = (
+            MAX_TRANSFER_CHUNK_BYTES + 1
+            if error_content_type.split(";", 1)[0].strip()
+            == "application/octet-stream"
+            else MAX_CONTROL_RESPONSE_BYTES + 1
+        )
+        content = exc.read(response_limit)
+        if len(content) > response_limit - 1:
             raise Qwen3TransferError(
                 "qwen3_transfer_response_oversize", "transfer response exceeds its limit",
             ) from exc
@@ -943,17 +956,38 @@ class Qwen3ArtifactTransferClient:
                 "qwen3_transfer_connection_failed", "Qwen3 transfer endpoint is unreachable",
             ) from exc
 
-    def upload(self, *, source: str | Path, plan: Mapping[str, Any]) -> dict[str, Any]:
+    def upload_chunks(
+        self,
+        *,
+        plan: Mapping[str, Any],
+        total_bytes: int,
+        sha256: str,
+        chunk_provider: Callable[[int, int], bytes | Mapping[str, Any]],
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> dict[str, Any]:
+        """Upload a path-free artifact through an offset-aware chunk provider.
+
+        The provider is called only after the receiver status is read, so a
+        retry resumes from the receiver's acknowledged offset.  It may return
+        raw bytes or a mapping containing ``data``, ``offset``, ``total_bytes``
+        and ``sha256``; the latter binds every read to the registered output
+        reference without exposing a filesystem path.
+        """
         safe_plan = self._plan(plan)
-        path = self._source(source)
         descriptor = safe_plan["descriptor"]
-        actual_size, actual_sha256 = _file_evidence(path)
         if (
-            actual_size != descriptor["size_bytes"]
-            or actual_sha256 != descriptor["sha256"]
+            isinstance(total_bytes, bool)
+            or not isinstance(total_bytes, int)
+            or total_bytes != descriptor["size_bytes"]
+            or not isinstance(sha256, str)
+            or sha256.lower() != descriptor["sha256"]
         ):
             raise Qwen3TransferError(
-                "qwen3_transfer_source_mismatch", "source artifact does not match transfer plan",
+                "qwen3_transfer_source_mismatch", "chunk source does not match transfer plan",
+            )
+        if not callable(chunk_provider):
+            raise Qwen3TransferError(
+                "qwen3_transfer_source_mismatch", "chunk source provider is unavailable",
             )
         url = (
             f"{safe_plan['base_url']}{QWEN3_TRANSFER_PREFIX}/"
@@ -983,7 +1017,7 @@ class Qwen3ArtifactTransferClient:
         if (
             isinstance(offset, bool)
             or not isinstance(offset, int)
-            or not 0 <= offset <= actual_size
+            or not 0 <= offset <= total_bytes
             or _header(status_response.headers, "Upload-Offset") != str(offset)
             or any(status.get(key) != value for key, value in immutable_status.items())
             or status.get("status") not in {"receiving", "committed"}
@@ -991,43 +1025,69 @@ class Qwen3ArtifactTransferClient:
             raise Qwen3TransferError(
                 "qwen3_transfer_response_invalid", "transfer status offset is invalid",
             )
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            while offset < actual_size:
-                chunk = handle.read(min(self.chunk_bytes, actual_size - offset))
-                if not chunk:
-                    raise Qwen3TransferError(
-                        "qwen3_transfer_source_mismatch", "source artifact ended unexpectedly",
-                    )
-                response = self._request(
-                    "PATCH",
-                    url,
-                    self._headers("PATCH", url, safe_plan["ticket"], {
-                        **headers,
-                        "Content-Type": "application/octet-stream",
-                        "Upload-Offset": str(offset),
-                    }),
-                    chunk,
+        if progress_callback is not None:
+            progress_callback(offset)
+        while offset < total_bytes:
+            requested = min(self.chunk_bytes, total_bytes - offset)
+            try:
+                provided = chunk_provider(offset, requested)
+            except Qwen3TransferError:
+                raise
+            except Exception as exc:
+                raise Qwen3TransferError(
+                    "qwen3_transfer_connection_failed", "chunk source is temporarily unavailable",
+                ) from exc
+            metadata = provided if isinstance(provided, Mapping) else {}
+            chunk = metadata.get("data", provided) if isinstance(provided, Mapping) else provided
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise Qwen3TransferError(
+                    "qwen3_transfer_source_mismatch", "chunk source returned invalid data",
                 )
-                if response.status_code != 200:
-                    raise Qwen3TransferError(
-                        "qwen3_transfer_chunk_rejected", "transfer chunk was rejected",
-                    )
-                result = self._json(response)
-                expected_offset = offset + len(chunk)
+            chunk = bytes(chunk)
+            if not chunk or len(chunk) > requested:
+                raise Qwen3TransferError(
+                    "qwen3_transfer_source_mismatch", "chunk source returned an invalid size",
+                )
+            if isinstance(provided, Mapping):
                 if (
-                    result.get("received_bytes") != expected_offset
-                    or _header(response.headers, "Upload-Offset") != str(expected_offset)
-                    or any(
-                        result.get(key) != value
-                        for key, value in immutable_status.items()
-                    )
-                    or result.get("status") != "receiving"
+                    provided.get("offset") != offset
+                    or provided.get("total_bytes") != total_bytes
+                    or str(provided.get("sha256", "")).lower() != sha256.lower()
                 ):
                     raise Qwen3TransferError(
-                        "qwen3_transfer_response_invalid", "transfer acknowledgement offset changed",
+                        "qwen3_transfer_source_mismatch", "chunk source metadata changed",
                     )
-                offset = expected_offset
+            response = self._request(
+                "PATCH",
+                url,
+                self._headers("PATCH", url, safe_plan["ticket"], {
+                    **headers,
+                    "Content-Type": "application/octet-stream",
+                    "Upload-Offset": str(offset),
+                }),
+                chunk,
+            )
+            if response.status_code != 200:
+                raise Qwen3TransferError(
+                    "qwen3_transfer_chunk_rejected", "transfer chunk was rejected",
+                )
+            result = self._json(response)
+            expected_offset = offset + len(chunk)
+            if (
+                result.get("received_bytes") != expected_offset
+                or _header(response.headers, "Upload-Offset") != str(expected_offset)
+                or any(
+                    result.get(key) != value
+                    for key, value in immutable_status.items()
+                )
+                or result.get("status") != "receiving"
+            ):
+                raise Qwen3TransferError(
+                    "qwen3_transfer_response_invalid", "transfer acknowledgement offset changed",
+                )
+            offset = expected_offset
+            if progress_callback is not None:
+                progress_callback(offset)
         commit_url = f"{url}/commit"
         committed = self._request(
             "POST",
@@ -1047,10 +1107,10 @@ class Qwen3ArtifactTransferClient:
             "phase": descriptor["phase"],
             "from_segment": descriptor["from_segment"],
             "to_segment": descriptor["to_segment"],
-            "size_bytes": actual_size,
-            "sha256": actual_sha256,
+            "size_bytes": total_bytes,
+            "sha256": sha256.lower(),
             "peer_epoch": descriptor["peer_epoch"],
-            "received_bytes": actual_size,
+            "received_bytes": total_bytes,
             "status": "committed",
             "full_model_materialized": False,
         }
@@ -1062,6 +1122,28 @@ class Qwen3ArtifactTransferClient:
             key: receipt[key]
             for key in expected_receipt
         }
+
+    def upload(self, *, source: str | Path, plan: Mapping[str, Any]) -> dict[str, Any]:
+        safe_plan = self._plan(plan)
+        path = self._source(source)
+        descriptor = safe_plan["descriptor"]
+        actual_size, actual_sha256 = _file_evidence(path)
+        if actual_size != descriptor["size_bytes"] or actual_sha256 != descriptor["sha256"]:
+            raise Qwen3TransferError(
+                "qwen3_transfer_source_mismatch", "source artifact does not match transfer plan",
+            )
+
+        def provider(offset: int, limit: int) -> bytes:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                return handle.read(limit)
+
+        return self.upload_chunks(
+            plan=safe_plan,
+            total_bytes=actual_size,
+            sha256=actual_sha256,
+            chunk_provider=provider,
+        )
 
 
 __all__ = [

@@ -14,7 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 
 SCHEMA_VERSION = 1
@@ -449,4 +449,101 @@ class Qwen3PipelineSidecarSession:
             self._terminate_process()
 
 
-__all__ = ["MAX_FRAME_BYTES", "OPERATION", "Qwen3PipelineSidecarSession", "Qwen3SidecarError"]
+class Qwen3NetworkSidecarExecutor:
+    """Adapt one target sidecar session to the network consume boundary.
+
+    The callback receives the target-local input path from the coordinator and
+    returns only sidecar metadata plus an internal ``output_path`` marker.  The
+    coordinator consumes that marker locally and converts it into a path-free
+    output reference before replying to the upstream peer.
+    """
+
+    def __init__(
+        self,
+        session: Qwen3PipelineSidecarSession,
+        *,
+        artifact_root: str | Path,
+    ) -> None:
+        root = Path(artifact_root).expanduser().absolute().resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        if not root.is_dir():
+            raise Qwen3SidecarError(
+                "qwen3_sidecar_artifact_root_missing", "network sidecar artifact root is unavailable",
+            )
+        self.session = session
+        self.artifact_root = root
+        self._outputs: dict[tuple[str, int, str], Path] = {}
+        self._prefill_outputs: dict[tuple[str, int], Path] = {}
+
+    @staticmethod
+    def _safe_token(value: Any) -> str:
+        token = str(value or "")
+        if not token or len(token) > 128 or any(char in token for char in ("/", "\\", "\x00")):
+            raise Qwen3SidecarError(
+                "qwen3_sidecar_contract_invalid", "network sidecar identity is invalid",
+            )
+        return token
+
+    def __call__(self, input_path: Path, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        chain_id = self._safe_token(request.get("chain_id"))
+        transfer_id = self._safe_token(request.get("transfer_id"))
+        phase = str(request.get("phase", ""))
+        generation = int(request.get("generation", -1))
+        segment_index = int(request.get("segment_index", -1))
+        if phase not in EXECUTION_PHASES or generation < 0 or segment_index < 0:
+            raise Qwen3SidecarError(
+                "qwen3_sidecar_contract_invalid", "network sidecar execution contract is invalid",
+            )
+        key = (chain_id, segment_index, phase)
+        output = self.artifact_root / (
+            f"qwen3-consume-{transfer_id}-{phase}-{generation}-{segment_index}.pt"
+        )
+        kv_ref = None
+        if phase == "decode":
+            kv_ref = self._prefill_outputs.get((chain_id, segment_index))
+            if kv_ref is None or not kv_ref.is_file():
+                raise Qwen3SidecarError(
+                    "qwen3_sidecar_kv_missing", "target sidecar has no prefill KV artifact",
+                )
+        report = self.session.execute(
+            phase=phase,
+            artifact_root=self.artifact_root,
+            input_ref=input_path,
+            output_ref=output,
+            kv_ref=kv_ref,
+            chain_id=chain_id,
+            segment_index=segment_index,
+            sequence_length=int(request["sequence_length"]),
+            batch_size=int(request["batch_size"]),
+            has_next_segment=bool(request["has_next_segment"]),
+            generation=generation,
+            dtype=str(request["dtype"]),
+            device=str(request["device"]),
+        )
+        self._outputs[key] = output
+        if phase == "prefill":
+            self._prefill_outputs[(chain_id, segment_index)] = output
+        return {**dict(report), "output_path": str(output)}
+
+    def cleanup(self, request: Mapping[str, Any], reason_code: str = "cleanup") -> None:
+        chain_id = str(request.get("chain_id", ""))
+        segment_index = int(request.get("segment_index", -1) or -1)
+        for key, path in list(self._outputs.items()):
+            if key[0] == chain_id and (segment_index < 0 or key[1] == segment_index):
+                path.unlink(missing_ok=True)
+                self._outputs.pop(key, None)
+        for key, path in list(self._prefill_outputs.items()):
+            if key[0] == chain_id and (segment_index < 0 or key[1] == segment_index):
+                path.unlink(missing_ok=True)
+                self._prefill_outputs.pop(key, None)
+        if self.session.phase in {"prepared", "committed"}:
+            try:
+                self.session.abort()
+            except Qwen3SidecarError:
+                self.session._terminate_process()
+
+
+__all__ = [
+    "MAX_FRAME_BYTES", "OPERATION", "Qwen3PipelineSidecarSession",
+    "Qwen3NetworkSidecarExecutor", "Qwen3SidecarError",
+]

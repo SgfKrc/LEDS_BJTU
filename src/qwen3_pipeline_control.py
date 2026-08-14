@@ -37,6 +37,14 @@ from qwen3_pipeline_transfer import (
 router = APIRouter(prefix=QWEN3_NETWORK_CONTROL_PREFIX, include_in_schema=False)
 
 
+def _header(headers: Mapping[str, str], name: str) -> str:
+    needle = str(name).lower()
+    for key, value in headers.items():
+        if str(key).lower() == needle:
+            return str(value)
+    return ""
+
+
 def _canonical_bytes(value: Any) -> bytes:
     try:
         encoded = json.dumps(
@@ -155,6 +163,13 @@ def _http_error(exc: Qwen3NetworkError) -> HTTPException:
         "qwen3_network_phase_incomplete",
         "qwen3_network_contract_active",
         "qwen3_network_contract_inactive",
+        "qwen3_network_consume_duplicate_mismatch",
+        "qwen3_network_consume_in_progress",
+        "qwen3_network_consume_cancelled",
+        "qwen3_network_progress_invalid",
+        "qwen3_network_output_lease_conflict",
+        "qwen3_network_output_incomplete",
+        "qwen3_network_output_offset_invalid",
     }:
         status = 409
     elif exc.reason_code in {
@@ -324,6 +339,109 @@ async def consume_network_receive(request: Request):
         executor=executor if callable(executor) else None,
     )
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/progress")
+async def record_network_receive_progress(request: Request):
+    payload = await _payload(
+        request, {"chain_id", "generation", "phase", "transfer_id", "received_bytes"},
+    )
+    coordinator = _coordinator(request)
+    peer, peer_epoch = _peer_identity(request)
+    await _run(
+        coordinator.authorize_control_peer,
+        peer,
+        peer_epoch=peer_epoch,
+        chain_id=payload["chain_id"],
+        generation=_base_generation(payload),
+    )
+    result = await _run(
+        coordinator.record_transfer_progress,
+        payload["transfer_id"], payload["received_bytes"],
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+async def _authorize_output_request(
+    request: Request, coordinator: Qwen3NetworkTransferCoordinator,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    peer, peer_epoch = _peer_identity(request)
+    reference = await _run(
+        coordinator.authorize_output_peer,
+        payload["output_id"], peer, peer_epoch,
+    )
+    if (
+        reference["chain_id"] != payload["chain_id"]
+        or reference["generation"] != payload["generation"]
+        or reference["phase"] != payload["phase"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "qwen3_network_contract_mismatch"},
+        )
+    return reference
+
+
+@router.post("/lease-output")
+async def lease_network_output(request: Request):
+    payload = await _payload(
+        request, {"chain_id", "generation", "phase", "output_id", "next_transfer_id"},
+    )
+    coordinator = _coordinator(request)
+    await _authorize_output_request(request, coordinator, payload)
+    result = await _run(
+        coordinator.lease_output_reference,
+        payload["output_id"], payload["next_transfer_id"],
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/output-progress")
+async def record_network_output_progress(request: Request):
+    payload = await _payload(
+        request,
+        {
+            "chain_id", "generation", "phase", "output_id",
+            "next_transfer_id", "confirmed_offset",
+        },
+    )
+    coordinator = _coordinator(request)
+    await _authorize_output_request(request, coordinator, payload)
+    result = await _run(
+        coordinator.record_output_progress,
+        payload["output_id"], payload["next_transfer_id"], payload["confirmed_offset"],
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/commit-output")
+async def commit_network_output(request: Request):
+    payload = await _payload(
+        request, {"chain_id", "generation", "phase", "output_id", "next_transfer_id"},
+    )
+    coordinator = _coordinator(request)
+    await _authorize_output_request(request, coordinator, payload)
+    result = await _run(
+        coordinator.commit_output_reference,
+        payload["output_id"], payload["next_transfer_id"],
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.post("/release-output")
+async def release_network_output(request: Request):
+    payload = await _payload(
+        request, {"chain_id", "generation", "phase", "output_id"},
+    )
+    coordinator = _coordinator(request)
+    await _authorize_output_request(request, coordinator, payload)
+    result = await _run(
+        coordinator.release_output_reference, payload["output_id"],
+    )
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
 @router.post("/cancel")
 async def cancel_network_receive(request: Request):
     payload = await _payload(request, {"chain_id", "generation", "transfer_id"})
@@ -375,6 +493,7 @@ class Qwen3LoopbackNetworkControlClient:
         self._requester = requester or default_transfer_request
         self._contract: dict[str, Any] | None = None
         self._phase = "idle"
+        self._output_references: dict[str, dict[str, Any]] = {}
 
     def _call(self, action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         body = _canonical_bytes(dict(payload))
@@ -414,6 +533,36 @@ class Qwen3LoopbackNetworkControlClient:
                 "network control response is not an object",
             )
         return decoded
+
+    def for_peer(self, signer: Qwen3PeerRequestSigner) -> "Qwen3LoopbackNetworkControlClient":
+        """Create a path-free data-plane view authenticated as another peer."""
+        clone = Qwen3LoopbackNetworkControlClient(
+            node_id=self.local_node_id,
+            base_url=self.base_url,
+            artifact_root=self.artifact_root,
+            signer=signer,
+            requester=self._requester,
+        )
+        clone._contract = self._contract
+        clone._phase = self._phase
+        clone._output_references = {
+            key: dict(value) for key, value in self._output_references.items()
+        }
+        return clone
+
+    def bind_output_reference(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Remember immutable output identity across phase transitions."""
+        reference = validate_qwen3_artifact_reference(value)
+        chain_id, _generation = self._identity()
+        if (
+            reference["chain_id"] != chain_id
+            or reference["source_node_id"] != self.local_node_id
+        ):
+            raise Qwen3NetworkError(
+                "qwen3_network_contract_mismatch", "output reference belongs to another controller",
+            )
+        self._output_references[reference["artifact_id"]] = dict(reference)
+        return reference
 
     def activate(self, contract: dict[str, Any]) -> dict[str, Any]:
         canonical = validate_qwen3_dry_run_contract(contract)
@@ -458,6 +607,21 @@ class Qwen3LoopbackNetworkControlClient:
         return self._call("begin-receive", payload)
 
     def resolve(self, transfer_id: str) -> Qwen3ResolvedArtifact:
+        reference = self.commit_reference(str(transfer_id))
+        path = self.artifact_root.joinpath(f"{transfer_id}.pt").resolve(strict=False)
+        try:
+            path.relative_to(self.artifact_root)
+        except ValueError as exc:
+            raise Qwen3NetworkError(
+                "qwen3_network_artifact_scope", "resolved artifact escapes target root",
+            ) from exc
+        if not path.is_file():
+            raise Qwen3NetworkError(
+                "qwen3_network_artifact_missing", "resolved artifact is unavailable",
+            )
+        return Qwen3ResolvedArtifact(path=path, reference=reference)
+
+    def commit_reference(self, transfer_id: str) -> dict[str, Any]:
         chain_id, generation = self._identity()
         decoded = self._call(
             "resolve",
@@ -472,18 +636,158 @@ class Qwen3LoopbackNetworkControlClient:
             raise Qwen3NetworkError(
                 "qwen3_network_reference_invalid", "resolved transfer identity changed",
             )
-        path = self.artifact_root.joinpath(f"{transfer_id}.pt").resolve(strict=False)
-        try:
-            path.relative_to(self.artifact_root)
-        except ValueError as exc:
+        return reference
+
+    def read_output_chunk(
+        self,
+        output_id: str,
+        *,
+        offset: int,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        """Read one source output chunk from the authenticated transfer data plane."""
+        from qwen3_pipeline_transfer import MAX_TRANSFER_CHUNK_BYTES, QWEN3_TRANSFER_PREFIX
+
+        if (
+            isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+            or isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+            or not 0 < max_bytes <= MAX_TRANSFER_CHUNK_BYTES
+        ):
             raise Qwen3NetworkError(
-                "qwen3_network_artifact_scope", "resolved artifact escapes target root",
-            ) from exc
-        if not path.is_file():
-            raise Qwen3NetworkError(
-                "qwen3_network_artifact_missing", "resolved artifact is unavailable",
+                "qwen3_network_output_offset_invalid", "output chunk bounds are invalid",
             )
-        return Qwen3ResolvedArtifact(path=path, reference=reference)
+        url = (
+            f"{self.base_url}{QWEN3_TRANSFER_PREFIX}/output/{str(output_id)}"
+            f"?offset={int(offset)}&limit={int(max_bytes)}"
+        )
+        try:
+            response = self._requester(
+                "GET", url,
+                {
+                    "Authorization": f"Bearer {str(output_id)}",
+                    "Accept": "application/octet-stream",
+                    **self.signer.headers("GET", url, str(output_id)),
+                },
+                None,
+            )
+        except Qwen3TransferError as exc:
+            raise Qwen3NetworkError(exc.reason_code, exc.reason) from exc
+        if response.status_code != 200:
+            try:
+                detail = json.loads(response.content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                detail = {}
+            detail = detail.get("detail", {}) if isinstance(detail, dict) else {}
+            code = detail.get("code", "qwen3_network_output_read_failed") if isinstance(detail, dict) else "qwen3_network_output_read_failed"
+            message = detail.get("message", "output chunk request failed") if isinstance(detail, dict) else "output chunk request failed"
+            raise Qwen3NetworkError(str(code), str(message))
+        data = bytes(response.content)
+        try:
+            result = {
+                "reference_id": str(output_id),
+                "offset": int(_header(response.headers, "X-Artifact-Offset")),
+                "total_bytes": int(_header(response.headers, "X-Artifact-Total")),
+                "sha256": _header(response.headers, "X-Artifact-SHA256"),
+                "eof": _header(response.headers, "X-Artifact-EOF").lower() == "true",
+                "data": data,
+            }
+        except (TypeError, ValueError) as exc:
+            raise Qwen3NetworkError(
+                "qwen3_network_output_response_invalid", "output chunk metadata is invalid",
+            ) from exc
+        if (
+            result["offset"] != offset
+            or not 0 <= result["offset"] <= result["total_bytes"]
+            or len(data) > max_bytes
+            or result["offset"] + len(data) > result["total_bytes"]
+            or len(result["sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in result["sha256"].lower())
+            or (result["offset"] + len(data) >= result["total_bytes"]) != result["eof"]
+        ):
+            raise Qwen3NetworkError(
+                "qwen3_network_output_response_invalid", "output chunk metadata changed",
+            )
+        return result
+
+    def _output_identity(self, output_id: str) -> tuple[str, int, str, str]:
+        chain_id, generation = self._identity()
+        output_key = str(output_id)
+        reference = self._output_references.get(output_key)
+        if reference is None:
+            phase = str(self._phase if self._phase in {"prefill", "decode"} else "prefill")
+            return chain_id, generation + int(phase == "decode"), phase, output_key
+        return (
+            str(reference["chain_id"]), int(reference["generation"]),
+            str(reference["phase"]), output_key,
+        )
+
+    def record_transfer_progress(self, transfer_id: str, received_bytes: int) -> dict[str, Any]:
+        chain_id, generation = self._identity()
+        phase = str(self._phase if self._phase in {"prefill", "decode"} else "prefill")
+        return self._call(
+            "progress",
+            {
+                "chain_id": chain_id,
+                "generation": generation + int(phase == "decode"),
+                "phase": phase,
+                "transfer_id": str(transfer_id),
+                "received_bytes": int(received_bytes),
+            },
+        )
+
+    def lease_output_reference(self, output_id: str, next_transfer_id: str) -> dict[str, Any]:
+        chain_id, generation, phase, output_id = self._output_identity(output_id)
+        return self._call(
+            "lease-output",
+            {
+                "chain_id": chain_id,
+                "generation": generation,
+                "phase": phase,
+                "output_id": output_id,
+                "next_transfer_id": str(next_transfer_id),
+            },
+        )
+
+    def record_output_progress(
+        self, output_id: str, next_transfer_id: str, confirmed_offset: int,
+    ) -> dict[str, Any]:
+        chain_id, generation, phase, output_id = self._output_identity(output_id)
+        return self._call(
+            "output-progress",
+            {
+                "chain_id": chain_id,
+                "generation": generation,
+                "phase": phase,
+                "output_id": output_id,
+                "next_transfer_id": str(next_transfer_id),
+                "confirmed_offset": int(confirmed_offset),
+            },
+        )
+
+    def commit_output_reference(self, output_id: str, next_transfer_id: str) -> dict[str, Any]:
+        chain_id, generation, phase, output_id = self._output_identity(output_id)
+        return self._call(
+            "commit-output",
+            {
+                "chain_id": chain_id,
+                "generation": generation,
+                "phase": phase,
+                "output_id": output_id,
+                "next_transfer_id": str(next_transfer_id),
+            },
+        )
+
+    def release_output_reference(self, output_id: str) -> dict[str, Any]:
+        chain_id, generation, phase, output_id = self._output_identity(output_id)
+        return self._call(
+            "release-output",
+            {
+                "chain_id": chain_id,
+                "generation": generation,
+                "phase": phase,
+                "output_id": output_id,
+            },
+        )
 
     def consume(
         self,
@@ -546,6 +850,7 @@ class Qwen3LoopbackNetworkControlClient:
         finally:
             self._contract = None
             self._phase = "idle"
+            self._output_references.clear()
 
     def snapshot(self) -> dict[str, Any]:
         return {

@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from qwen3_pipeline_loopback import Qwen3LoopbackError, validate_loopback_base_url
 from qwen3_pipeline_transfer import (
@@ -276,6 +276,75 @@ async def transfer_status(request: Request):
         }
     await run_in_threadpool(runtime.cleanup_expired)
     return await run_in_threadpool(runtime.snapshot)
+
+
+@router.get("/output/{artifact_id}")
+async def read_registered_output(
+    artifact_id: str,
+    request: Request,
+    offset: str = "0",
+    limit: str = str(MAX_TRANSFER_CHUNK_BYTES),
+):
+    """Serve one authenticated bounded output chunk without revealing a path."""
+    coordinator = getattr(request.app.state, "qwen3_network_transfer_coordinator", None)
+    if coordinator is None or not callable(getattr(coordinator, "read_output_chunk", None)):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "qwen3_network_output_disabled"},
+        )
+    peer, peer_epoch = _authenticated_peer_identity(request)
+    try:
+        offset_value = int(offset)
+        limit_value = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "qwen3_network_output_offset_invalid"},
+        ) from exc
+    try:
+        await run_in_threadpool(
+            coordinator.authorize_output_peer,
+            artifact_id,
+            peer,
+            peer_epoch,
+        )
+        result = await run_in_threadpool(
+            coordinator.read_output_chunk,
+            artifact_id,
+            requester_peer_id=peer,
+            authenticated_peer_epoch=peer_epoch,
+            offset=offset_value,
+            max_bytes=limit_value,
+        )
+    except Exception as exc:
+        from qwen3_pipeline_network import Qwen3NetworkError
+
+        if isinstance(exc, Qwen3NetworkError):
+            code = exc.reason_code
+            status = 403 if code == "qwen3_network_output_peer_scope" else (
+                404 if code in {"qwen3_network_output_missing", "qwen3_network_output_invalid"} else
+                409 if code == "qwen3_network_output_offset_invalid" else 422
+            )
+            raise HTTPException(status_code=status, detail={"code": code, "message": exc.reason}) from exc
+        raise
+    data = result.get("data", b"")
+    if not isinstance(data, bytes) or len(data) > limit_value:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "qwen3_network_output_invalid"},
+        )
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(len(data)),
+            "X-Artifact-Offset": str(result["offset"]),
+            "X-Artifact-Total": str(result["total_bytes"]),
+            "X-Artifact-SHA256": str(result["sha256"]),
+            "X-Artifact-EOF": "true" if result["eof"] else "false",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/{transfer_id}")
