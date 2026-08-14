@@ -256,7 +256,7 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 
 | # | 缺口 | 现状（2026-08-13 实测） | 验收标准 | 验证方式 |
 |---|---|---|---|---|
-| 1 | **思考段控制**（`reasoning_effort=none` 等效） | 原生路径无等效控制，gemma4 思考段 96–234+ tokens 波动（CPU 下可能占满短输出预算）；`<channel|>`(101) 剥离已实现但遇不到时只警告 | 短输出预算（如 max_tokens=256）内稳定产出正文；思考段被抑制或剥离后正文完整 | 用固定测试图（sd-001）跑 `gemma4_native_image_smoke.py` 多次（≥5 次）统计正文长度稳定性；对照 Ollama `reasoning_effort=none` 输出 |
+| 1 | **思考段控制**（`reasoning_effort=none` 等效） | **Completed（2026-08-14）**：屏蔽思考开始 token(100) 无效（模型改用文本形式思考）；**剥离式有效**——等思考段结束 token(101) 后收集正文，默认预算 512（`gemma4_native_image_smoke.py` 默认 `--max-tokens 512 --n-ctx 768`，思考段 96-234 tokens 波动被剥离，正文完整）。实测固定图（sd-001）3/3 次正文完整稳定、无思考段残留、语义与 Ollama `think=false` 一致 | 固定测试图多次运行正文完整（3/3 实测通过）；短预算 256 下思考段仍可能吃满（文档标注：原生路径正文预算需 ≥512，产品路径仍推荐 Ollama） |
 | 2 | **产品接线**（原生路径入 chat 接口） | llama_engine 已有 MTMD 能力注册与 handler 骨架（`bf9cdc4`），但图像输入未接 `describe_image` 式 API | `llama_cpp` 引擎在 QLH chat 接口接受 `image_url`，走原生 MTMD 管线返回描述；资源门拒绝时 fail-closed | 在 api_server 对话接口传图 → 原生引擎返回；无 mmproj/内存不足时返回结构化拒绝 |
 | 3 | **音频输入** | 官方能力含 Audio→Text；Ollama 实测 capability 含 audio；原生 MTMD `mtmd_support_audio` 能力查询可用，但音频编码管线未绑定/未实测 | 固定音频样本 → 文本输出；无音频工件时 fail-closed | 扩展现有 MTMD 绑定（参考图像管线补 audio 编码符号）；`gemma4_native_audio_smoke` 脚本 |
 | 4 | **8K/16K 上下文** | 当前 CPU 门用 `n_ctx=128` smoke；文档不把 256K 当本机承诺 | 8K/16K 下长上下文对话不崩、KV 缓存内存预算正确 | `n_ctx=8192/16384` 加载 + 长文本生成 + 内存监控（复用 EX-N3 资源门工具） |
