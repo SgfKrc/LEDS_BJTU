@@ -266,6 +266,20 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 
 **优先级建议**：#1（思考段控制）是唯一影响"输出质量"的缺口，且 Ollama 已有参照实现，先做；#2（产品接线）价值最高（原生路径入产品）；#3-#7 视需求排期，音频/长上下文/offload 都依赖真实设备窗口。
 
+### 5.7 摆脱 Ollama 路线（G4.4~G4.6，两条腿走路，2026-08-14 决策）
+
+> **目标**：外部依赖软件收敛到仅 Tailscale；Gemma 4 图像理解**同时保留 Ollama 路径（基线/对照/回退）与原生路径（自包含/GPU）**；原生 GPU 支持为必做项；Ollama 开源仓库（runner/sampler/GPU 调度/思考控制）作为借鉴源。Ollama 保留期间其工件身份继续冻结（G4.3.2A），**原生路径不得以任何方式依赖 Ollama blobs 才能运行**（当前依赖，见下）。
+
+| 里程碑 | 内容 | 验收标准 | 依赖 |
+|---|---|---|---|
+| **G4.4 独立工件链** | 从 HF 官方（经 7897 代理）下载 gemma-4-12B 的 GGUF + mmproj（Q4_K_M 路线，本机 8GB 可用），SHA-256/许可/manifest 冻结，写入受管资产；原生 smoke 改用独立工件（不再读 `~/.ollama/models/blobs`） | 断网 Ollama 环境下原生路径可加载并完成图像语义 smoke；工件冻结记录（revision/SHA/大小/许可）入库 | §5.6 #1（已完成） |
+| **G4.5 原生引擎产品化** | §5.6 #2 产品接线（chat 接口 `image_url` → 原生 MTMD）、#5 GPU offload（`n_gpu_layers` + 8GB 显存预算门 + 与 SD 并驻留规则）、#6 打包（原生绑定 + 工件进安装包）、#7 卸载/取消矩阵 | `llama_cpp` 引擎在 QLH chat 接口原生图生文；GPU 吞吐对标 Ollama（见 G4.6）；打包产物离线可用；取消不泄漏 | G4.4、§5.6 #2 |
+| **G4.6 Ollama 借鉴与对照验收** | 调研 Ollama 开源仓库：gemma4 思考控制（`think` 参数真实机制）、GPU 调度/offload 策略、runner 进程模型；对照验收：同图原生 GPU vs Ollama 吞吐/时延/语义一致；性能不达标项形成改进清单 | 对照报告（吞吐/时延/语义三表）；借鉴项落地清单（至少 GPU 调度一项） | G4.5 |
+
+**顺序**：G4.4（去 Ollama blobs 依赖）→ G4.5（产品化 + GPU）→ G4.6（借鉴 + 对标）。G4.4 是本机可做（下载 + 冻结 + smoke）；G4.5 的 GPU 部分需 8GB 显存窗口（与 SD 侧车并驻留规则）；G4.6 全程可做（Ollama 仓库调研不依赖硬件）。
+
+**Ollama 保留策略**：两条腿走路期间 Ollama 是产品基线（已验收、GPU 快）；原生路径每过一门（G4.4 工件独立、G4.5 GPU 对标、G4.6 验收）逐步具备替代资格；最终"摆脱"的判定 = 无 Ollama 环境（离线/新机器）下原生路径完成同场景验收，且性能差距在可接受范围（对照报告为准）。
+
 ### 5.5 EX-N3-GEMMA-S1 静态质量计数桥接（Completed，非模型验收）
 
 `scripts/experiment_gemma_quality_unit.py` 与 `plan-quality-gemma-bridge-fixture-v1` 只验证实验质量链路能安全接收 Gemma 的受限计数证据。记录 schema v2 只保留锁定的 `gemma4:12b`、判题契约 ID/SHA-256、主题命中和关键要素覆盖的已评估/通过计数；prompt、图片、base64、路径、URL、模型输出、判题解释与 reasoning 均被拒绝。该票不导入或调用 Gemma、Ollama、CUDA、网络或图像文件。
