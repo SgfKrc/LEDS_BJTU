@@ -10,20 +10,22 @@ sys.path.insert(0, "src")
 
 from qwen3_pipeline_transaction import (  # noqa: E402
     MAX_ACK_BYTES,
+    MAX_CONTRACT_BYTES,
     Qwen3PipelineDryRunTransaction,
     Qwen3PipelineProtocolError,
     build_qwen3_dry_run_contract,
     validate_qwen3_dry_run_contract,
+    _canonical_bytes,
 )
 from scheduler import Scheduler  # noqa: E402
 
 
-def _contract():
+def _contract(*, execution_mode="metadata_only", model_id="qwen3-4b"):
     return build_qwen3_dry_run_contract(
         config_id="cfg-qw3",
         plan_id="plan-qw3",
         generation=7,
-        model_id="qwen3-4b",
+        model_id=model_id,
         model_sha256="a" * 64,
         total_layers=36,
         hidden_size=2560,
@@ -47,6 +49,7 @@ def _contract():
                 "execution_device": "cpu", "dtype": "float32",
             },
         ],
+        execution_mode=execution_mode,
     )
 
 
@@ -85,6 +88,8 @@ def _ack(tx, node_id, phase="prepare", **updates):
             "phase": "empty",
             "cleared": True,
         }
+    if tx.contract.get("execution_mode") == "node_local_sidecar":
+        payload["segment_materialized"] = phase == "commit"
     payload.update(updates)
     return payload
 
@@ -98,6 +103,20 @@ def test_contract_binds_manifests_hidden_kv_and_has_no_sensitive_data():
     assert len(encoded.encode("utf-8")) < 64 * 1024
     assert "prompt" not in encoded
     assert contract["network_dispatch"] is False
+
+
+def test_node_local_sidecar_mode_requires_segment_materialization_ack():
+    tx = Qwen3PipelineDryRunTransaction(
+        _contract(execution_mode="node_local_sidecar"), network_dispatch=True,
+    )
+    assert tx.contract["weight_materialization"] is True
+    assert tx._message("worker-a", "prepare")["execution_mode"] == "node_local_sidecar"
+    for node_id in sorted(tx.worker_ids):
+        result = tx.handle_ack(node_id, _ack(tx, node_id))
+    assert result["phase"] == "committing"
+    for node_id in sorted(tx.worker_ids):
+        result = tx.handle_ack(node_id, _ack(tx, node_id, "commit"))
+    assert result["phase"] == "ready"
 
 
 def test_qwen3_loopback_transmission_and_auth_binding():
@@ -304,3 +323,140 @@ def test_scheduler_disconnect_aborts_dry_run(monkeypatch):
     status = sched.get_qwen3_pipeline_dry_run_status()
     assert status["phase"] == "aborted"
     assert status["reason_code"] == "qwen3_worker_disconnected"
+
+
+# ================================================================
+# T-3 边界/负向参数化（2026-08-14）：大小上限严格性、generation、
+# 段连续性与全跨度、KV handoff 极端值
+# ================================================================
+
+class TestSizeLimitStrictness:
+    """合同/ACK 序列化上限是严格上界：恰好等于上限通过，超 1 字节拒绝。"""
+
+    @pytest.mark.parametrize("delta", [0])
+    def test_canonical_bytes_accepts_at_or_below_limit(self, delta):
+        payload = {"x": "a" * 100}
+        # 与 _canonical_bytes 相同的紧凑序列化（sort_keys + 无空格分隔符）
+        encoded = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        limit = len(encoded) + delta
+        assert _canonical_bytes(payload, maximum=limit, label="t") == encoded
+
+    def test_canonical_bytes_rejects_one_byte_over(self):
+        payload = {"x": "a" * 100}
+        encoded = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        with pytest.raises(Qwen3PipelineProtocolError, match="exceeds serialization limit"):
+            _canonical_bytes(payload, maximum=len(encoded) - 1, label="t")
+
+    def test_contract_near_limit_passes(self):
+        # 接近（但不超过）64 KiB 的合同必须可构造、可校验
+        contract = _contract(model_id="m" * (60 * 1024))
+        validate_qwen3_dry_run_contract(contract)
+        assert contract["model_id"].startswith("m")
+
+    def test_contract_over_limit_rejected(self):
+        with pytest.raises(Qwen3PipelineProtocolError, match="exceeds serialization limit"):
+            _contract(model_id="m" * (MAX_CONTRACT_BYTES + 1))
+
+    def test_ack_near_limit_passes(self):
+        tx = Qwen3PipelineDryRunTransaction(_contract())
+        payload = _ack(tx, "worker-a", padding="x" * (MAX_ACK_BYTES // 2))
+        result = tx.handle_ack("worker-a", payload)
+        # 接近上限的 ACK 正常受理（未超限拒绝）：单节点 ACK 后仍在进行中
+        assert result["phase"] in ("preparing", "prepared")
+
+
+class TestGenerationAndSegmentBoundaries:
+    """generation 非正、段连续性/越界/全跨度边界。"""
+
+    @pytest.mark.parametrize("generation", [0, -1, -100])
+    def test_nonpositive_generation_rejected(self, generation):
+        with pytest.raises(Qwen3PipelineProtocolError):
+            build_qwen3_dry_run_contract(
+                config_id="cfg-qw3", plan_id="plan-qw3", generation=generation,
+                model_id="qwen3-4b", model_sha256="a" * 64,
+                total_layers=36, hidden_size=2560,
+                segments=_contract()["segments"],
+            )
+
+    @pytest.mark.parametrize(
+        "ranges",
+        [
+            ([0, 6], [8, 18]),    # gap：非连续
+            ([0, 12], [6, 24]),   # 重叠
+            ([0, 12], [12, 40]),  # 越界 end > total_layers
+        ],
+        ids=["gap", "overlap", "out-of-bounds"],
+    )
+    def test_segment_contiguity_violations_rejected(self, ranges):
+        segments = [
+            {"node_id": "worker-a", "layer_range": ranges[0], "has_embedding": True,
+             "required_bytes": 100, "execution_device": "cpu", "dtype": "float32",
+             "assignment_manifest_sha256": "b" * 64},
+            {"node_id": "worker-b", "layer_range": ranges[1], "has_lm_head": True,
+             "required_bytes": 100, "execution_device": "cpu", "dtype": "float32",
+             "assignment_manifest_sha256": "c" * 64},
+        ]
+        with pytest.raises(Qwen3PipelineProtocolError, match="contiguous"):
+            build_qwen3_dry_run_contract(
+                config_id="cfg-qw3", plan_id="plan-qw3", generation=7,
+                model_id="qwen3-4b", model_sha256="a" * 64,
+                total_layers=36, hidden_size=2560, segments=segments,
+            )
+
+    def test_full_span_segments_accepted(self):
+        # 全跨度 [0, 36]（end == total_layers）两段是合法边界
+        contract = build_qwen3_dry_run_contract(
+            config_id="cfg-qw3", plan_id="plan-qw3", generation=7,
+            model_id="qwen3-4b", model_sha256="a" * 64,
+            total_layers=36, hidden_size=2560,
+            segments=[
+                {"node_id": "worker-a", "layer_range": [0, 18], "has_embedding": True,
+                 "required_bytes": 100,
+                 "execution_device": "cpu", "dtype": "float32",
+                 "assignment_manifest_sha256": "b" * 64},
+                {"node_id": "worker-b", "layer_range": [18, 36], "has_lm_head": True,
+                 "required_bytes": 100,
+                 "execution_device": "cpu", "dtype": "float32",
+                 "assignment_manifest_sha256": "c" * 64},
+            ],
+        )
+        validate_qwen3_dry_run_contract(contract)
+        assert contract["segments"][-1]["layer_range"] == [18, 36]
+
+
+class TestKvProbeExtremes:
+    """KV handoff 极端值：合法边界通过，非法值 aborted（fail-closed）。"""
+
+    def test_zero_sequence_length_is_valid_empty_cache(self):
+        tx = Qwen3PipelineDryRunTransaction(_contract())
+        for node_id in ("worker-a", "worker-b", "worker-c"):
+            tx.handle_ack(node_id, _ack(tx, node_id))
+        for node_id in ("worker-a", "worker-b", "worker-c"):
+            payload = _ack(tx, node_id, "commit")
+            payload["kv_cache_probe"]["sequence_length"] = 0  # 空缓存合法基线
+            tx.handle_ack(node_id, payload)
+        assert tx.snapshot()["phase"] == "ready"
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("sequence_length", -1),       # 负长度
+            ("sequence_length", 2**40),    # 远超容量
+            ("cache_generation", -1),      # 负代际
+            ("device", "bad-device"),      # 未知设备
+        ],
+        ids=["negative-len", "huge-len", "negative-gen", "bad-device"],
+    )
+    def test_invalid_kv_probe_values_abort(self, field, value):
+        tx = Qwen3PipelineDryRunTransaction(_contract())
+        for node_id in ("worker-a", "worker-b", "worker-c"):
+            tx.handle_ack(node_id, _ack(tx, node_id))
+        payload = _ack(tx, "worker-a", "commit")
+        payload["kv_cache_probe"][field] = value
+        result = tx.handle_ack("worker-a", payload)
+        assert result["phase"] == "aborted"
+        assert tx.reason_code == "qwen3_kv_contract_mismatch"
