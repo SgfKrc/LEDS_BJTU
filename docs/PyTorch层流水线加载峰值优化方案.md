@@ -413,8 +413,22 @@
 - 两个真实本地目录 Qwen3-VL-4B 与 Qwen3.5-2B 均通过 image/video metadata preflight；新增 MTMD 最小分配、安全策略、越界 media、摘要篡改和敏感字段拒绝矩阵。MM1.5 定向 `15 passed`；QW3/MM1 联合回归 `190 passed`（`.venv-test`，4 workers，78.67s）。主 Python 不含 pytest，不能作为测试环境结论。
 - 本票只证明 processor metadata 与视觉 worker 启动条件可审计，不宣称 AutoProcessor 实例化、视觉塔 forward、图像/视频语义、CUDA/双机 parity、峰值/吞吐或生产准入。
 
-### 8.43 下一票：`PT-PIPE-MM1.6` 隔离 AutoProcessor 离线构造 smoke
+### 8.43 计划记录：`PT-PIPE-MM1.6` 隔离 AutoProcessor 离线构造 smoke
 
 1. 在 sidecar 独立 venv 中固定 Transformers 版本与 `local_files_only`，仅用已通过 MM1.5 的 metadata 构造 `AutoProcessor`，把实际类名、token/geometry 和清理状态投影回 path-free response。
 2. 覆盖缺少 processor 文件、版本/类名漂移、远程代码开关、异常退出和重复 cleanup；不加载 vision/text weights，不接图像语义和网络传输。
 3. 只有该 smoke 与后续人工审计同时通过，才讨论真实视觉张量 handoff；CUDA、双机 parity、长视频和生产路由继续后置。
+
+### 8.44 `PT-PIPE-MM1.6` 隔离 AutoProcessor 离线构造 smoke（开发门 Completed，2026-08-15）
+
+- 新增 `scripts/model_tools/qwen3_multimodal_processor_probe.py` 与独立 `qwen3_multimodal_processor_probe_worker.py`。controller 先复核 MM1.5 manifest/request，worker 在 `.venv-qwen3-sidecar` 内强制 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、清除代理，并只调用 `AutoProcessor.from_pretrained(local_files_only=true, trust_remote_code=false)`。
+- Qwen3-VL-4B 与 Qwen3.5-2B 真实构造均通过：Transformers `4.57.6`、`Qwen3VLProcessor`、`Qwen2VLImageProcessorFast`、`Qwen3VLVideoProcessor`、`Qwen2TokenizerFast`，image/video token 与 patch=16、temporal=2、merge=2 均与 MM1.5 request 一致。未调用 processor media forward，未读取权重分片。
+- pipeline sidecar 依赖补齐并锁定 `Pillow>=10,<13`、`torchvision>=0.28,<0.29`；setup `_ready(pipeline=true)` 现在会检查 Torch/torchvision/Pillow，避免缺视觉依赖时误报环境 ready。主运行时依赖不变。
+- 响应合同额外固定 processor 实例化状态、runtime 隔离、offline 参数、实际类名、cleanup 完成和 `weight_materialized=false/full_model_materialized=false`；异常、缺文件、旧 Transformers、类漂移、非法网络协议和重复运行均 fail-closed。MM1.6 定向 `8 passed`；MM1.5+MM1.6 定向 `23 passed`；串行 QW3/MM1 全量 `198 passed in 111.12s`。4 worker 并发时既有真实 sidecar 资源门可能出现 `<3GB/<5GB` skip，不是代码失败。
+- 本票仍不宣称图像/视频处理输出、视觉张量 handoff、语义质量、CUDA/双机 parity、峰值/吞吐或生产准入。
+
+### 8.45 下一票：`PT-PIPE-MM1.7` CPU 合成媒体预处理与张量摘要合同
+
+1. 使用有限尺寸的内存 PIL 图像与短视频帧序列调用已构造的 processor，限制像素/帧/输出字节，并只投影 shape、dtype、grid 和 token 数摘要。
+2. 覆盖超限、空媒体、帧数/geometry 不符、异常退出和清理；控制面禁止 pixel_values、原始媒体和路径，仍不加载视觉塔或文本权重。
+3. 真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频和生产路由继续后置。
