@@ -863,3 +863,88 @@ def test_visual_skeleton_rejects_placement_contradiction():
         pass
     else:
         raise AssertionError("放置决策与 text-only 矛盾应拒绝")
+
+
+# ================================================================
+# MM1.13：视觉塔占位执行路径与媒体参考消费契约
+# ================================================================
+
+def _ready_skeleton():
+    from qwen3_multimodal_preflight import (
+        mm1_ledger_commit,
+        mm1_vision_tower_placement,
+    )
+    ledger = mm1_ledger_commit(
+        [{"entry_id": "text_0", "kind": "text_segment", "bytes": 100_000_000}],
+        ledger_id="node-g", node_capacity_bytes=1_000_000_000,
+    )
+    placement = mm1_vision_tower_placement(
+        ledger, request_has_media=True, vision_tower_bytes=400_000_000,
+    )
+    from qwen3_multimodal_runtime import run_mm1_visual_tower_skeleton
+    return run_mm1_visual_tower_skeleton(placement, _media_reference(), text_only=False)
+
+
+def test_placeholder_execution_projects_feature_summary():
+    """占位执行产出视觉特征摘要（shape 绑定媒体 token 与视觉 hidden）。"""
+    from qwen3_multimodal_runtime import run_mm1_visual_placeholder_execution
+    skeleton = _ready_skeleton()
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    feature = run_mm1_visual_placeholder_execution(
+        skeleton, _media_reference(), manifest=manifest,
+    )
+    assert feature["feature_kind"] == "qwen3_visual_feature_placeholder"
+    assert feature["synthetic"] is True
+    assert feature["weight_materialized"] is False
+    # 特征 shape = [1, media_tokens, vision.output_hidden_size]
+    assert feature["tensor"]["shape"][1] == 16  # 媒体参考 token 数
+    assert feature["tensor"]["shape"][2] == manifest["vision"]["output_hidden_size"]
+    payload = json.dumps(feature, ensure_ascii=True)
+    assert "models/" not in payload
+
+
+def test_placeholder_execution_requires_ready_skeleton():
+    """骨架非 placeholder_ready（skipped）→ fail-closed。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_visual_placeholder_execution,
+    )
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    try:
+        run_mm1_visual_placeholder_execution(
+            {"visual_path": "skipped"}, _media_reference(), manifest=manifest,
+        )
+    except Qwen3MultimodalRuntimeError as exc:
+        assert exc.reason_code == "qwen3_mm1_skeleton_not_ready"
+    else:
+        raise AssertionError("skipped 骨架不应执行占位")
+
+
+def test_visual_feature_binds_to_text_handoff_consistently():
+    """特征绑定回文本段 hidden handoff：visual_to_text + token 数一致。"""
+    from qwen3_multimodal_runtime import (
+        bind_mm1_visual_feature_handoff,
+        run_mm1_visual_placeholder_execution,
+    )
+    skeleton = _ready_skeleton()
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    feature = run_mm1_visual_placeholder_execution(
+        skeleton, _media_reference(), manifest=manifest,
+    )
+    contract = bind_mm1_visual_feature_handoff(
+        feature,
+        manifest=manifest,
+        text_chain_id="a" * 64,
+        generation=1,
+        phase="prefill",
+        source_node_id="node-a",
+        target_node_id="node-b",
+        modality="image",
+    )
+    assert contract["boundary"] == "visual_to_text"
+    # 消费一致性：handoff token 数 == 特征 token 数
+    assert contract["tensor"]["shape"][1] == feature["tensor"]["shape"][1]
+    # 绑定证据：artifact.sha256 == 媒体参考（path-free 消费契约）
+    assert contract["artifact"]["sha256"] == feature["media_reference_sha256"]
+    assert contract["artifact"]["mode"] == "local"
+    assert contract["full_model_materialized"] is False
