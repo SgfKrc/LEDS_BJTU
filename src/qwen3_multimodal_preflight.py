@@ -11,7 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from qwen3_multimodal_contract import (
     MM1_SCHEMA_VERSION,
@@ -623,6 +623,123 @@ def validate_mm1_visual_worker_response(
     return response
 
 
+def build_mm1_media_tensor_reference(
+    media_summary: Mapping[str, Any],
+    *,
+    model_id: str,
+    component_ids: Sequence[str],
+) -> dict[str, Any]:
+    """MM1.8：把 MM1.7 媒体摘要投影为 path-free 的媒体张量参考。
+
+    视觉组件占位：shape/dtype/grid/token 契约 + 容量预算（供视觉塔执行器
+    输入占位与容量规划）。pixel_values、原始媒体、路径与 prompt 一律不进入；
+    权重/媒体路径与摘要解耦（weight_materialized=false）。
+    """
+    if not isinstance(media_summary, Mapping) or not media_summary:
+        raise Qwen3MultimodalPreflightError("MM1.8 media summary is required")
+    image = media_summary.get("image")
+    video = media_summary.get("video")
+    if not isinstance(image, Mapping) or not isinstance(video, Mapping):
+        raise Qwen3MultimodalPreflightError("MM1.8 media summary structure is invalid")
+    if not image.get("pixel_values_shape") and not image.get("token_count_estimate"):
+        raise Qwen3MultimodalPreflightError("MM1.8 image media entry is empty")
+    safe_model_id = _safe_id(model_id, "model_id")
+    safe_components = sorted(
+        str(component) for component in component_ids if str(component)
+    )
+    if not safe_components:
+        raise Qwen3MultimodalPreflightError("MM1.8 component_ids are required")
+
+    def _tokens(value: Mapping[str, Any]) -> int:
+        tokens = value.get("token_count_estimate")
+        try:
+            return int(tokens) if tokens is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _shape(value: Mapping[str, Any]) -> list[int]:
+        shape = value.get("pixel_values_shape")
+        if not isinstance(shape, (list, tuple)):
+            return []
+        return [int(item) for item in shape]
+
+    image_tokens = _tokens(image)
+    video_tokens = _tokens(video)
+    reference = {
+        "schema_version": MM1_SCHEMA_VERSION,
+        "reference_kind": "qwen3_visual_media_tensor_placeholder",
+        "model_id": safe_model_id,
+        "component_ids": safe_components,
+        "media": {
+            "image": {
+                "pixel_values_shape": _shape(image),
+                "dtype": str(image.get("dtype") or ""),
+                "token_count_estimate": image_tokens,
+            },
+            "video": {
+                "pixel_values_shape": _shape(video),
+                "dtype": str(video.get("dtype") or ""),
+                "token_count_estimate": video_tokens,
+            },
+        },
+        "capacity": {
+            "total_media_tokens": image_tokens + video_tokens,
+            "output_bytes_estimate": max(
+                0, int(media_summary.get("output_bytes_estimate") or 0),
+            ),
+        },
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    reference["reference_sha256"] = _digest(reference, label="MM1 media tensor reference")
+    return reference
+
+
+def validate_mm1_media_tensor_reference(
+    value: Mapping[str, Any],
+    *,
+    model_id: str,
+    component_ids: Sequence[str],
+) -> dict[str, Any]:
+    """只读校验媒体张量参考（字段/身份/解耦）。"""
+    reference = _exact(
+        value,
+        {
+            "schema_version", "reference_kind", "model_id", "component_ids",
+            "media", "capacity", "weight_materialized",
+            "full_model_materialized", "reference_sha256",
+        },
+        "MM1 media tensor reference",
+    )
+    if (
+        reference["schema_version"] != MM1_SCHEMA_VERSION
+        or reference["reference_kind"] != "qwen3_visual_media_tensor_placeholder"
+        or reference["model_id"] != model_id
+        or sorted(str(item) for item in reference["component_ids"])
+        != sorted(str(item) for item in component_ids)
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 media tensor reference identity is invalid")
+    if reference["weight_materialized"] is not False or reference["full_model_materialized"] is not False:
+        raise Qwen3MultimodalPreflightError("MM1 media tensor reference must stay weight-free")
+    media = reference["media"]
+    for kind in ("image", "video"):
+        entry = media.get(kind)
+        if not isinstance(entry, Mapping):
+            raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} is invalid")
+        if not isinstance(entry.get("pixel_values_shape"), list):
+            raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} shape is invalid")
+        try:
+            int(entry.get("token_count_estimate") or 0)
+        except (TypeError, ValueError):
+            raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} tokens are invalid")
+    if reference["reference_sha256"] != _digest(
+        {key: val for key, val in reference.items() if key != "reference_sha256"},
+        label="MM1 media tensor reference",
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 media tensor reference digest is invalid")
+    return reference
+
+
 def build_mm1_processor_smoke_response(
     request: Mapping[str, Any],
     *,
@@ -630,6 +747,7 @@ def build_mm1_processor_smoke_response(
     inspection: Mapping[str, Any],
     runtime: Mapping[str, Any],
     media_summary: Mapping[str, Any] | None = None,
+    media_tensor_reference: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a response after constructing AutoProcessor in the sidecar."""
     safe_request = validate_mm1_visual_worker_request(
@@ -657,6 +775,9 @@ def build_mm1_processor_smoke_response(
             "full_model_materialized": False,
         },
         "media_summary": dict(media_summary) if media_summary else None,
+        "media_tensor_reference": (
+            dict(media_tensor_reference) if media_tensor_reference else None
+        ),
     }
     response["response_sha256"] = _digest(response, label="MM1 processor smoke response")
     return validate_mm1_processor_smoke_response(response, request=safe_request)
@@ -673,7 +794,8 @@ def validate_mm1_processor_smoke_response(
             "schema_version", "response_kind", "status", "request_id",
             "request_sha256", "manifest_sha256", "model_id", "node_id",
             "processor_constructed", "visual_worker_ready", "component_count",
-            "runtime", "cleanup", "media_summary", "response_sha256",
+            "runtime", "cleanup", "media_summary",
+            "media_tensor_reference", "response_sha256",
         },
         "MM1 processor smoke response",
     )

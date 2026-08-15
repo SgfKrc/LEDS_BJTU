@@ -394,3 +394,113 @@ def test_media_summary_contains_no_sensitive_data():
     assert '"pixel_values":' not in payload
     assert "models/" not in payload
     assert "rng" not in payload
+
+
+# ================================================================
+# MM1.8：媒体张量跨边界投影与视觉组件占位
+# ================================================================
+
+def test_media_tensor_reference_projects_capacity_and_stays_path_free():
+    """媒体摘要投影为 path-free 张量参考（shape/dtype/token/容量预算）。"""
+    from qwen3_multimodal_preflight import (
+        build_mm1_media_tensor_reference,
+        validate_mm1_media_tensor_reference,
+    )
+
+    summary = {
+        "image": {"pixel_values_shape": [1, 3, 64, 64], "dtype": "float16",
+                  "token_count_estimate": 16},
+        "video": {"pixel_values_shape": [1, 2, 3, 32, 32], "dtype": "float16",
+                  "token_count_estimate": 8},
+        "output_bytes_estimate": 4096,
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    reference = build_mm1_media_tensor_reference(
+        summary, model_id="qwen3-vl-4b-instruct",
+        component_ids=["vision_tower", "text_segment_0"],
+    )
+    validated = validate_mm1_media_tensor_reference(
+        reference, model_id="qwen3-vl-4b-instruct",
+        component_ids=["vision_tower", "text_segment_0"],
+    )
+    assert validated["reference_kind"] == "qwen3_visual_media_tensor_placeholder"
+    assert validated["media"]["image"]["token_count_estimate"] == 16
+    assert validated["media"]["video"]["token_count_estimate"] == 8
+    assert validated["capacity"]["total_media_tokens"] == 24
+    assert validated["capacity"]["output_bytes_estimate"] == 4096
+    assert validated["weight_materialized"] is False
+    payload = json.dumps(validated, ensure_ascii=True)
+    assert "pixel_values\"" not in payload
+    assert "models/" not in payload
+
+
+def test_media_tensor_reference_rejects_bad_input(monkeypatch):
+    """空/畸形媒体摘要或身份不符 fail-closed。"""
+    from qwen3_multimodal_preflight import (
+        Qwen3MultimodalPreflightError,
+        build_mm1_media_tensor_reference,
+        validate_mm1_media_tensor_reference,
+    )
+
+    for bad in (None, {}, {"image": {}, "video": {}}):
+        try:
+            build_mm1_media_tensor_reference(
+                bad, model_id="qwen3-vl-4b-instruct", component_ids=["vision_tower"],
+            )
+        except Qwen3MultimodalPreflightError:
+            pass
+        else:
+            raise AssertionError(f"应拒绝 {bad!r}")
+    summary = {
+        "image": {"pixel_values_shape": [1, 3, 64, 64], "token_count_estimate": 16},
+        "video": {"pixel_values_shape": [], "token_count_estimate": 0},
+    }
+    reference = build_mm1_media_tensor_reference(
+        summary, model_id="qwen3-vl-4b-instruct", component_ids=["vision_tower"],
+    )
+    # 身份不符（model_id 不同）拒绝
+    try:
+        validate_mm1_media_tensor_reference(
+            reference, model_id="other-model", component_ids=["vision_tower"],
+        )
+    except Qwen3MultimodalPreflightError:
+        pass
+    else:
+        raise AssertionError("身份不符应拒绝")
+    # 篡改 digest 拒绝
+    tampered = dict(reference)
+    tampered["capacity"] = dict(reference["capacity"])
+    tampered["capacity"]["total_media_tokens"] = 999
+    try:
+        validate_mm1_media_tensor_reference(
+            tampered, model_id="qwen3-vl-4b-instruct", component_ids=["vision_tower"],
+        )
+    except Qwen3MultimodalPreflightError:
+        pass
+    else:
+        raise AssertionError("篡改应拒绝")
+
+
+def test_real_media_tensor_reference_in_response():
+    """真实双模型：响应含 media_tensor_reference（与摘要解耦、无权重）。"""
+    sidecar = ROOT / ".venv-qwen3-sidecar" / "Scripts" / "python.exe"
+    if not sidecar.is_file():
+        pytest.skip("MM1.8 requires the isolated Qwen3 pipeline sidecar")
+    manifest, _inspection, request = _prepared("qwen3-vl-4b-instruct")
+    report = run_qwen3_multimodal_processor_probe(
+        model=ROOT / "models" / "qwen3-vl-4b-instruct",
+        manifest=manifest,
+        visual_request=request,
+        timeout_seconds=180,
+        media_smoke={"image_size": [32, 32], "video_frames": 2},
+    )
+    assert report["gate_passed"] is True
+    reference = report["response"]["media_tensor_reference"]
+    assert reference is not None
+    assert reference["reference_kind"] == "qwen3_visual_media_tensor_placeholder"
+    assert reference["weight_materialized"] is False
+    assert reference["capacity"]["total_media_tokens"] > 0
+    encoded = json.dumps(report, ensure_ascii=True).lower()
+    assert "pixel_values\"" not in encoded
+    assert str(ROOT).lower() not in encoded

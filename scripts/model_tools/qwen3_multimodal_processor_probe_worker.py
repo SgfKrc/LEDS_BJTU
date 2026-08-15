@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
 
 from qwen3_multimodal_preflight import (  # noqa: E402
     Qwen3MultimodalPreflightError,
+    build_mm1_media_tensor_reference,
     build_mm1_processor_smoke_response,
     inspect_mm1_processor_assets,
     validate_mm1_visual_worker_request,
@@ -252,9 +253,16 @@ def execute_request(
             raise Qwen3MultimodalPreflightError(
                 f"media preprocess failed: {exc.__class__.__name__}",
             ) from exc
+        # MM1.8：投影为 path-free 媒体张量参考（视觉组件占位/容量预算）
+        media_tensor_reference = build_mm1_media_tensor_reference(
+            media_summary,
+            model_id=safe_request["model_id"],
+            component_ids=safe_request["component_ids"],
+        )
         response = build_mm1_processor_smoke_response(
             safe_request, manifest=manifest, inspection=inspection, runtime=runtime,
             media_summary=media_summary,
+            media_tensor_reference=media_tensor_reference,
         )
         del processor, image_processor, video_processor, tokenizer
         gc.collect()
