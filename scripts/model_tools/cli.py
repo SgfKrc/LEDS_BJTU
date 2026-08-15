@@ -198,6 +198,16 @@ def _parser() -> argparse.ArgumentParser:
     convert.add_argument("--target", type=Path, default=None, help="future or executed GGUF output path")
     convert.add_argument("--outtype", default="Q4_K_M", help="GGUF output type, e.g. Q4_K_M, Q8_0, F16")
     convert.add_argument("--converter", type=Path, default=None, help="explicit convert_hf_to_gguf.py")
+    import_wizard = commands.add_parser("import-model", aliases=["model_import"], help="guided model import: resolve → download → verify → register")
+    import_wizard.add_argument("source", help="HF repo id, ModelScope path or local directory")
+    import_wizard.add_argument("--target", default="", help="target model directory (default models/<repo name>)")
+    import_wizard.add_argument("--model-id", default="", help="registered model_id (default repo name)")
+    import_wizard.add_argument("--expected-sha256", default="", help="strict SHA-256 verification")
+    import_wizard.add_argument("--gguf-path", default="", help="GGUF register path (override auto-detect)")
+    import_wizard.add_argument("--modelscope", action="store_true", help="download via ModelScope")
+    import_wizard.add_argument("--skip-download", action="store_true", help="verify/register an existing local directory only")
+    import_wizard.add_argument("--register", action="store_true", help="persist to main-node SQLite model_registry")
+    import_wizard.add_argument("--json", action="store_true", help="output JSON summary")
     convert.add_argument("--quantizer", type=Path, default=None, help="explicit llama-quantize executable")
     convert.add_argument("--apply", action="store_true", help="execute through same-volume staging")
     convert.add_argument("--confirm", default=None, help="must be CONVERT when --apply is used")
@@ -614,6 +624,9 @@ def main(argv: list[str] | None = None) -> int:
             report = operation(**kwargs)
             if args.output is not None:
                 write_json(args.output, report)
+        elif args.command in {"import-model", "model_import"}:
+            from .import_model import main as import_main
+            return import_main(argv=args)
         else:
             report = sweep_models(args.root, full_hash=args.full_hash)
     except (OSError, GGUFError, ValueError) as exc:
@@ -695,4 +708,7 @@ def main(argv: list[str] | None = None) -> int:
         if not report.get("request_valid", True):
             return 2
         return 0 if report.get("valid", False) else 1
+    if args.command in {"import-model", "model_import"}:
+        from .import_model import main as import_main
+        return import_main(argv=args)
     return 0 if report.get("valid", False) else 1
