@@ -37,8 +37,23 @@ _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 # 前端 dist 目录
 _FRONTEND_DIST = os.path.join(_PROJECT_ROOT, "frontend", "dist")
 
+# G4.5 原生 Gemma 4 构建输入。允许 CI 覆盖 venv，但默认使用仓库内
+# 经 build-cuda-llamacpp.bat 生成的隔离环境，避免误收集普通 CPU wheel。
+_GEMMA4_VENV = os.environ.get(
+    "QLH_GEMMA4_VENV", os.path.join(_PROJECT_ROOT, ".venv-gemma4-native")
+)
+_GEMMA4_SITE_PACKAGES = os.path.join(_GEMMA4_VENV, "Lib", "site-packages")
+_GEMMA4_NATIVE_DIR = os.path.join(_PROJECT_ROOT, "models", "gemma4-native")
+if not os.path.isdir(_GEMMA4_SITE_PACKAGES):
+    raise FileNotFoundError(
+        "Gemma 4 native venv is unavailable; run "
+        "scripts/model_tools/build-cuda-llamacpp.bat first"
+    )
+sys.path.insert(0, _GEMMA4_SITE_PACKAGES)
+
 sys.path.insert(0, _PROJECT_ROOT)
 from scripts.model_tools.llama_quantize_toolchain import verify_managed_package
+from scripts.model_tools.gemma4_native_freeze import _check as verify_gemma4_assets
 
 _LLAMA_QUANTIZE_PACKAGE = os.path.join(
     _PROJECT_ROOT, "build", "model-tools", "llama-quantize", "packages", "windows-x86_64"
@@ -58,41 +73,61 @@ if not os.path.isdir(_FRONTEND_DIST):
         "请先构建前端: cd frontend && npm run build"
     )
 
+if verify_gemma4_assets() != 0:
+    raise RuntimeError("Gemma 4 native assets do not match the frozen trust root")
+
 # ============================================================
 # llama.cpp 原生库（DLL）
 # ============================================================
-_llama_cpp_dlls = []
 try:
     import llama_cpp as _lc
+    import llama_cpp.mtmd_cpp as _mtmd
+
+    if _lc.__version__ != "0.3.28":
+        raise RuntimeError(
+            f"expected llama-cpp-python 0.3.28, found {_lc.__version__}"
+        )
+    for _symbol in (
+        "mtmd_init_from_file",
+        "mtmd_tokenize",
+        "mtmd_helper_decode_image_chunk",
+    ):
+        if not callable(getattr(_mtmd, _symbol, None)):
+            raise RuntimeError(f"patched MTMD binding is missing {_symbol}")
     _lc_dir = os.path.dirname(os.path.abspath(_lc.__file__))
     _lib_dir = os.path.join(_lc_dir, "lib")
-    if os.path.isdir(_lib_dir):
-        for _dll in glob.glob(os.path.join(_lib_dir, "*.dll")):
-            _llama_cpp_dlls.append((_dll, "llama_cpp/lib"))
-        # Also grab the .lib files (MSVC import libraries, needed at runtime)
-        for _lib in glob.glob(os.path.join(_lib_dir, "*.lib")):
-            _llama_cpp_dlls.append((_lib, "llama_cpp/lib"))
-        print(f"[spec] Collected {len(_llama_cpp_dlls)} llama.cpp native files")
+    _native_files = [
+        *glob.glob(os.path.join(_lib_dir, "*.dll")),
+        *glob.glob(os.path.join(_lib_dir, "*.lib")),
+    ]
+    _native_names = {os.path.basename(_path).lower() for _path in _native_files}
+    _required_native = {
+        "llama.dll", "mtmd.dll", "ggml-cuda.dll", "cudart64_13.dll",
+        "cublas64_13.dll", "cublaslt64_13.dll",
+    }
+    _missing_native = sorted(_required_native - _native_names)
+    if _missing_native:
+        raise RuntimeError(
+            "Gemma 4 CUDA binding is missing native files: "
+            + ", ".join(_missing_native)
+        )
+    _llama_cpp_dlls = [(_path, "llama_cpp/lib") for _path in _native_files]
+    print(f"[spec] Collected {len(_llama_cpp_dlls)} verified llama.cpp native files")
 except Exception as _e:
-    print(f"[spec] WARNING: Failed to collect llama.cpp DLLs: {_e}")
+    raise RuntimeError(f"failed to collect the Gemma 4 native binding: {_e}") from _e
 
-# G4.5 原生 gemma4 路径（打包代码交付，实机验证延后——Surface 修复后）：
-# 依赖 .venv-gemma4-native（llama-cpp-python 0.3.28 @ 47e1de77 + MTMD 补丁
-# 重编 wheel，含 MSYS2 运行时 libgcc/libstdc++/libwinpthread，PATH 需带
-# ucrt64/bin）与受管工件 models/gemma4-native/*.gguf（冻结记录
-# gemma4-native.lock.json）；运行时经 llama_engine.load_gemma4_native()
-# 读取（lock 相对路径）。产品图像路径默认仍走 Ollama external_api；
-# 原生路径作为自包含可选（G4.6 对照：热时延 17-18s vs Ollama 3.2s，
-# 差距主因 mmproj 图像编码 CPU——CUDA 版绑定重编为后续优化候选）。
+# G4.5 原生 Gemma 4 路径：绑定 ABI、CUDA DLL 与独立工件均在 spec
+# 解析阶段 fail-closed；安装包实机验证仍按计划延后。
 
 a = Analysis(
     ['launcher.py'],
-    pathex=[_SRC_DIR, SPECPATH],
+    pathex=[_GEMMA4_SITE_PACKAGES, _SRC_DIR, SPECPATH],
     binaries=_llama_cpp_dlls,
     datas=[
         # React 前端静态文件 → 运行时目录 frontend/dist/
         (_FRONTEND_DIST, 'frontend/dist'),
         (_LLAMA_QUANTIZE_PACKAGE, 'model-tools/llama-quantize/windows-x86_64'),
+        (_GEMMA4_NATIVE_DIR, 'models/gemma4-native'),
     ],
     hiddenimports=[
         # ============================================================
@@ -101,6 +136,7 @@ a = Analysis(
         'llama_cpp',
         'llama_cpp._internals',
         'llama_cpp.llama_cpp',
+        'llama_cpp.mtmd_cpp',
         'llama_engine',
         'tui_admin',
 
