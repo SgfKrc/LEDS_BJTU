@@ -581,7 +581,67 @@
 3. 新增 `Qwen3MultimodalStagedTextFixture` 和 `execute_mm1_staged_text_contract`：CPU fixture 覆盖首段边界、下一段请求、成功释放、执行异常释放、cleanup 不完整拒绝和合同篡改拒绝。证据明确为 `evidence_kind=cpu_fixture`，`text_weights_loaded=false`、`segment_materialized=false`、`full_model_materialized=false`；仅 `fixture_segment_materialized` 描述测试生命周期，不宣称真实权重已加载。
 4. MM1.20 专项 `7 passed`；MM1 合同/预检/runtime/processor/MM1.19-20 联合 `80 passed / 1 skipped`。真实首段权重加载与 forward、本地 artifact 数据面、CUDA/双机 parity、跨节点网络和生产准入仍未完成。
 
-### 8.72 下一票：`PT-PIPE-MM1.21` 首段 sidecar 本地 artifact 适配
+### 8.72 `PT-PIPE-MM1.21` 首段 sidecar 本地 artifact 适配（开发门 Completed，2026-08-15）
 
-1. 将 MM1.20 staged contract 适配到现有 `Qwen3PipelineSidecarSession` 的 prepare → commit → prefill → release/abort 生命周期；视觉/合并 hidden 工件路径只在受控本地 data plane 内传递，控制面只返回大小、SHA 和 handoff 摘要。
-2. 先用 CPU fake runner 覆盖输入/输出 SHA、scope fence、阶段顺序、取消和失败清理；真实 Qwen3-VL 首文本段权重与 forward、CUDA/双机和生产路由继续独立后置。
+1. 新增独立的 `qwen3_mm1_first_segment_artifact` 绑定合同：把 MM1.20 staged contract、首段 assignment、合并 hidden 的 shape/dtype、实际序列化工件大小/SHA 和下一段目标绑定；媒体摘要不再冒充 `.pt` 文件摘要。合同及返回结果均拒绝路径、文件字段、像素和 prompt 内容。
+2. 新增 `Qwen3MultimodalFirstSegmentSidecarAdapter`，复用现有 `Qwen3PipelineSidecarSession` 执行 prepare → commit → prefill → release；输入/输出路径只在受控本地 data plane 使用，scope fence、输入提交证据、输出回读证据、hidden handoff 和 sidecar assignment 均逐项校验。成功后仅以本机 `artifact_id` 保留输出供下游消费，控制结果只含大小、SHA 和 handoff 摘要。
+3. 取消、prefill 失败、输出 SHA 不符、release/abort 未证明 `cleanup_complete=true` 时均 fail-closed：删除本票创建的输出并 abort；成功 release 后 `segment_materialized=false`，下游提交后可通过本地清理接口删除保留输出。输入工件仍由上游 controller 持有，不越权删除。
+4. MM1.21 CPU fake-runner 专项 `9 passed`；排除 `real_model` 的 MM1 合同/预检/runtime/processor/MM1.19-21 与通用 sidecar 稳定回归 `91 passed`。包含真实模型门的最近一次运行 `94 passed / 2 skipped`：MM1.17 因当时可用 RAM `<4GB` 跳过，MM1.18 固定为显式 opt-in。上述结果证明合同、文件证据和生命周期接线，不证明真实 Qwen3-VL 文本权重、真实 forward、CUDA、跨节点或生产准入。
+
+### 8.73 `PT-PIPE-MM1.22` 本机 2/3 段 sidecar artifact 串联（开发门 Completed，2026-08-15）
+
+1. 新增 `Qwen3MultimodalMultiSidecarAdapter`，把 MM1.20 staged contract、MM1.21 首段输入 artifact binding 与现有 `Qwen3PipelineMultiSidecar` 严格绑定；首段输出在同一条本地链内直接作为下一段输入，避免重复执行首段。每个 session 的 model/node/layer/embedding/LM-head/generation/assignment、边界 dtype/device 和 hidden size 均在执行前或下一段启动前校验。
+2. 每段输出文件实际大小/SHA、local handoff reference、hidden shape/dtype/device、KV contract、generation 和最终段输出摘要均回读核对；控制结果只含 segment/handoff/KV/最终 artifact 摘要，不返回路径。通用 multi-sidecar 新增可选 hidden-size 门，损坏 handoff 会在下一段启动前终止。
+3. CPU fake runner 覆盖 2 段/3 段成功串联、最终 artifact 保留、逐段证据、中段失败、handoff shape 篡改、取消、重启残留清理和 path-free 返回。专项 `7 passed`，通用 multi-sidecar `5 passed`，MM1/sidecar/network 联合 `138 passed / 1 skipped`。真实权重/forward、视觉语义、CUDA/双机、网络传输和生产路由继续后置。
+
+### 8.74 `PT-PIPE-MM1.23` 2/3 段 prefill → decode/KV 生命周期（开发门 Completed，2026-08-15）
+
+1. 新增 path-free `qwen3_mm1_decode_input_artifact` 合同，绑定 decode 输入工件、prefill/decode generation、batch/token 数、prefill 完整序列长度与 decode 增量长度；decode 输入路径只在本地 data plane 解析，控制面只返回证据摘要。
+2. `Qwen3MultimodalMultiSidecarAdapter` 新增 prefill → decode 原子流程：不提前 release，逐段复用并校验 prefill KV，decode 使用完整 KV sequence length，同时用 `input_sequence_length` 正确表达本轮新增 token 的 hidden handoff；最终只保留 path-free final decode artifact/KV 摘要。
+3. 通用 `Qwen3PipelineMultiSidecar.decode` 增加可选 `input_sequence_length`，兼容旧调用并修正 decode hidden handoff 与 KV 总长度混用问题。取消、KV/输入/合同篡改、generation 不一致、异常 abort、重启和最终 cleanup 均 fail-closed。
+4. MM1.23 专项 `13 passed`；MM1/sidecar/network 联合 `144 passed / 1 skipped`。真实 Qwen3-VL forward、真实 logits 质量、CUDA/跨节点与生产准入继续后置。
+
+### 8.75 `PT-PIPE-MM1.24` decode 结果消费与 path-free 质量摘要（开发门 Completed，2026-08-15）
+
+1. 新增 `Qwen3MultimodalDecodeArtifactConsumer`，只允许读取受控 artifact root 内、状态为 committed 且类型为 `final_decode_output` 的本地工件；消费前复核实际大小/SHA，默认以 `torch.load(..., map_location="cpu", weights_only=true)` 读取 sidecar 原生 `.pt`，控制结果不返回路径或张量。
+2. 消费门严格要求 payload 只有 `logits/hidden_states/past_key_values`，且恰有一个输出张量；校验 rank-3、batch、decode token 数、dtype、CPU 映射和非有限值，并把 KV 层数/完整 sequence length 与 decode generation 合同交叉核对。返回仅含 artifact 证据、token/shape/dtype/device/KV 质量摘要和 `full_model_materialized=false`。
+3. 同一进程默认拒绝重复消费；显式 `reset()` 只清除重放账本，不删除工件，最终工件仍由 MM1 adapter 的统一 cleanup/restart recovery 管理。缺失、越界、SHA 篡改、shape/dtype/KV 不符、重复消费和清理所有权均 fail-closed。
+4. MM1.24 新增 `9` 个 CPU 小工件回归，MM1.22-24 专项共 `22 passed`；MM1/sidecar/network 联合 `153 passed / 1 skipped`。这证明本地 decode 工件证据和摘要消费，不证明真实 Qwen3-VL logits/文本质量、CUDA、跨节点或生产准入。
+
+### 8.76 `PT-PIPE-MM1.25` 有界多步 decode 与逐段 KV 滚动（开发门 Completed，2026-08-15）
+
+1. `Qwen3PipelineMultiSidecar` 已允许 committed prefill 后连续 decode；每一步 generation 自动递增，完整 KV sequence 必须按 `input_sequence_length` 单调扩展。所有 segment 的新输出均成功后才切换 KV 引用并删除上一代，任一段失败、长度跳变或取消都会 abort 全链并删除各代本地工件。snapshot 记录有界 decode 水位和 trace，不汇总模型或跨段 KV。
+2. `Qwen3NetworkSidecarExecutor` 同步改为 prefill/decode 均制作 node-local KV 副本，新一代复制与 SHA 复核完成后才替换旧代；每个 chain/segment 记录 generation/sequence 水位，陈旧或不增长的远端 decode 在执行前拒绝，复制失败恢复旧引用。cleanup 同时清除 KV 文件和水位。
+3. `Qwen3MultimodalMultiSidecarAdapter.execute_bounded_decode` 支持 batch=1、每步单 token 的有界 greedy 循环（`max_new_tokens<=4096`、最多 64 个 EOS ID）。末段 `.pt` 只在本地 data plane 以 weights-only CPU 方式校验并 `argmax`，下一 ID 仅写入临时 `input_ids` 工件；EOS、上限和显式取消均可停止，临时输入在消费后立即删除并纳入 restart cleanup。控制结果不含 token ID、logits tensor 或路径。
+4. 为避免长生成撑大控制帧，逐步证据使用增量 trace SHA，控制面只返回步数、首末 generation/sequence、停止原因和最终 logits/KV/SHA 摘要，结果大小不随生成步数线性增长。KV 层数门同时收紧为必须等于末段 layer range。
+5. MM1.25 新增 `6` 个 MM1 用例和 `2` 个通用 multi-sidecar 用例；MM1.22-25 专项 `28 passed`，sidecar/multi-sidecar/network 定向 `44 passed`，MM1/sidecar/network 最近联合 `161 passed / 1 skipped`。唯一 skip 为 MM1.18 完整模型显式 opt-in；真实 helper/本地调度器另组 `6 passed / 6 skipped`，跳过项仍受隔离运行时/外部条件门限制。上述结果不证明真实 logits/文本质量、CUDA、双机或生产准入。
+
+### 8.77 `PT-PIPE-MM1.26` 本地生成 token 账本与隔离 tokenizer 最终解码（开发门 Completed，2026-08-15）
+
+1. `execute_bounded_decode` 每步选中 ID 只追加到用户主节点拥有的本地 JSON ledger；每条记录绑定 text chain、generation、sequence、输出 artifact SHA 和停止原因。账本采用固定 schema/canonical digest/file SHA，限制最多 `4096` token、`256 KiB`，token ID 受整数边界约束；控制面只返回账本摘要，不返回 token ID 或路径。
+2. ledger 通过临时文件原子提交并归 adapter 所有；成功、失败、取消、TTL 与重启 recovery 都清除 `.pt` 与 `.json` 临时工件，不留下可重放残留。
+3. 新增隔离 controller/worker：强制专用 Python、离线环境、`local_files_only=true`、`trust_remote_code=false`，严格复核 ledger 身份、水位、内部摘要与每条 artifact SHA；仅用本地 tokenizer 解码，跳过 special token，执行严格 UTF-8 与 `64 KiB` 文本上限，输出文本及 SHA/字节证据，不回显 prompt、token ID、路径或权重状态。
+4. MM1.26 新增 `7` 项回归（6 个 worker/controller 合同、1 个 adapter 集成）；专项 `35 passed`，加入 pipeline/sidecar/network 后 `79 passed`，随后 MM1.27 sampling 回归使最新联合结果为 `176 passed / 3 skipped`。跳过项为可用 RAM 不足的 MM1.15、MM1.17 以及 MM1.18 完整模型显式 opt-in。结果不证明真实模型语义质量、CUDA/双机、跨节点或生产准入。
+
+### 8.78 `PT-PIPE-MM1.27` 本地 sampling 合同与可复现生成（开发门 Completed，2026-08-15）
+
+1. `execute_bounded_decode` 新增严格的 temperature `0..2`、top-k `0..4096`、top-p `(0,1]` 和 seed `0..2^63-1` 合同；temperature=0 保持旧 greedy，显式正温度使用 CPU 本地 `torch.Generator` 的 multinomial sampling，固定 seed 不触碰全局 RNG 状态。
+2. logits/probabilities 全程留在本地 data plane，top-k/top-p 过滤和非有限值检查在选 token 前完成；ledger 增加 sampler canonical digest、逐步 draw evidence，并由 worker 复核 sampler、record、artifact SHA 的一致性。控制面只返回采样配置摘要与 draw 数，不返回 RNG state、tensor 或 token ID。
+3. 新增参数边界、同 seed、top-p 边界、ledger 证据和 adapter 集成回归；MM1/sidecar/network 联合 `176 passed / 3 skipped`。结果不证明真实模型采样质量、CUDA/双机、跨节点调度或生产路由。
+
+### 8.79 `PT-PIPE-MM1.28` sampling 质量摘要与受控重放边界（开发门 Completed，2026-08-15）
+
+1. 每步 sampling 在本地计算候选集大小、熵、置信度和 top-p 截断水位，只输出聚合的 min/max 摘要与滚动 SHA；摘要绑定 sampler digest、step artifact SHA 和 token 数，不回传 logits、概率或 token ID。
+2. ledger 扩展 `quality_summary`，由 controller/worker 校验字段、水位、sampler 关联、质量范围和 metadata SHA；新增只读 `qwen3_token_ledger_replay` operation，仅验证 ledger/sampler/quality 证据，不加载 tokenizer、模型或完整 RNG 状态。
+3. replay 支持期望 sampler/quality digest，摘要篡改、链身份不符、过期/缺失 ledger 和旧版 ledger 均 fail-closed；MM1.28 新增 replay/quality 集成回归，定向 `46 passed`，联合回归为 `177 passed / 3 skipped`。结果不证明真实模型采样质量、CUDA/双机、跨节点调度或生产路由。
+
+### 8.80 `PT-PIPE-MM1.29` sampling 策略快照与路由接线（开发门 Completed，2026-08-15）
+
+1. 新增 sampling policy snapshot：固定策略版本、policy ID、issued/expiry、replay 权限和 `mm1-bounded-decode` route scope；快照 canonical SHA 与 sampling digest 绑定。无快照的旧客户端保持 greedy，任何隐式正温度 sampling 在 `prepare` 前拒绝。
+2. adapter 将策略摘要投影到 path-free 结果并写入新 ledger；worker/replay 校验策略身份、过期窗口、replay 权限、期望 policy SHA 和 sampling 一致性，不把完整快照、路径、prompt、token ID 或 RNG 状态放入控制结果。
+3. 新增策略快照、隐式 sampling、过期策略、policy/ledger/replay 集成回归；定向 `48 passed`，最新 MM1/sidecar/network 联合 `181 passed / 1 skipped`（唯一 skip 为 MM1.18 完整模型显式 opt-in；RAM 门本次满足）。真实模型采样质量、CUDA/双机、跨节点路由和生产准入仍未验。
+
+### 8.81 下一阶段：转向 `L4-GEMMA4 G4.3.2B` CPU-only 原生初始化与固定图片语义对照
+
+1. 复用已冻结的官方 Ollama `gemma4:12b` GGUF/mmproj 双 SHA 与资源准入门；只有可用 RAM 达到约 `8.74 GiB` 且 Ollama 未驻留时，才进入隔离 CPU-only `Llama`/MTMD 初始化。
+2. 在真实资源门满足前保持 fail-closed，不下载第二份模型、不宣称原生视觉支持；后续音频、8K/16K、分布式和打包仍按 G4.3.3 排队。
