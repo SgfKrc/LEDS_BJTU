@@ -317,7 +317,7 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 - **显存与对照**：`estimate_gpu_layers()` 已改为保守安全系数（需求乘 margin 必须小于可用显存），并把 mmproj 预留计入预算。G4.6 的 CUDA 全量 offload 对照仅作为开发机性能证据，不作为 8GB 自动准入或部分 offload 产品门。
 - **打包**：CUDA 重编脚本已去除开发者绝对路径，新增 llama.cpp revision、MTMD patch、pip 退出码、CUDA runtime staging 和安装后 ABI 门；`qlh-cuda.spec` 已从隔离 venv 收集绑定/运行时及受管工件，并通过不执行 PyInstaller 的 spec 解析预检。完整构建、安装体积/升级路径和外部干净机离线图像调用仍为 Pending。
 - **回归证据**：Gemma/多模态/TUI 专项 `49 passed`；ModelManager/API/inference-svc 合并回归 `258 passed / 1 skipped`；external Provider `39 passed`；前端 `47 passed`、生产构建通过、Gemma 浏览器桩 `1 passed`。冻结双工件全量 SHA 校验、隔离 binding gate 和 CUDA spec binding/package gate 均通过。
-- **下一票**：构建 CUDA 安装包，在无 Ollama 的外部干净 Windows 上验证模型列表加载、单图 full 请求、取消、卸载/重载、临时文件清理、离线工件和安装体积；该票不再新增引擎功能。
+- **下一票**：~~构建 CUDA 安装包，在无 Ollama 的外部干净 Windows 上验证模型列表加载、单图 full 请求、取消、卸载/重载、临时文件清理、离线工件和安装体积；该票不再新增引擎功能。~~ **CUDA 安装包已构建（2026-08-16）**：`QLH-Edge-Inference-Setup-v0.1.8.3-CUDA.exe` + 5 分片（共约 9.9GB，DiskSpanning 2GB/片，因含 7.66GB 冻结 GGUF 超 4.2GB 单文件上限），版本 0.1.8.3（`version.txt` 同步），PyInstaller 双工件 SHA 与冻结记录一致、清单 4752 文件已签名（release-20260809）。**剩余：外部干净 Windows 实机验收**（无 Ollama：模型列表加载、单图 full 请求、取消、卸载/重载、临时文件清理、离线工件、安装体积），待外部机器，登记于《验收清单与资源限制登记》C 组。
 
 ### 5.5 EX-N3-GEMMA-S1 静态质量计数桥接（Completed，非模型验收）
 
