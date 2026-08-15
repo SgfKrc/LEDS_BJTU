@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import local_store as _local_store
+from multimodal import materialize_image_data_url
 
 from diffusion import (
     DiffusionConflictError,
@@ -1199,10 +1200,22 @@ class EngineHost:
         external_fallback_reason = ""
         _ext_decision = self._external_route_decision(req)
         image_data_urls = getattr(req, "image_data_urls", [])
-        if image_data_urls and not _ext_decision.use_external:
+        local_native_image = bool(
+            image_data_urls and self._local_native_vision_available()
+        )
+        if (
+            local_native_image
+            and not _ext_decision.use_external
+            and len(image_data_urls) != 1
+        ):
             raise HTTPException(
                 400,
-                "多模态请求必须使用已启用且获数据作用域授权的 external_api："
+                "本地 MTMD 图像回退仅支持一张图片；多图请求不能静默丢弃其余图片",
+            )
+        if image_data_urls and not _ext_decision.use_external and not local_native_image:
+            raise HTTPException(
+                400,
+                "当前本地模型没有原生视觉能力，且 external_api 不可用或未获授权："
                 f"{_ext_decision.reason}",
             )
         if _ext_decision.use_external:
@@ -1214,7 +1227,7 @@ class EngineHost:
                 raise
             except Exception as exc:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
-                if image_data_urls:
+                if image_data_urls and not local_native_image:
                     raise HTTPException(
                         502,
                         "多模态外部推理服务调用失败，禁止丢弃图片后回退："
@@ -1409,13 +1422,27 @@ class EngineHost:
                     *history,
                     {"role": "user", "content": req.message},
                 ]
-                result = model_manager.chat(
-                    messages=request_history,
-                    max_tokens=req.max_new_tokens,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    _cancel_event=cancel_event,
-                )
+                if local_native_image:
+                    if engine_name != "llama_cpp":
+                        raise RuntimeError("本地原生图像请求要求 llama.cpp MTMD 引擎")
+                    with materialize_image_data_url(image_data_urls[0]) as image_path:
+                        result = model_manager.chat_image(
+                            image_path=image_path,
+                            prompt=req.message,
+                            max_tokens=min(req.max_new_tokens + 96, 512),
+                            max_answer_tokens=min(req.max_new_tokens, 256),
+                            temperature=req.temperature,
+                            top_p=req.top_p,
+                            _cancel_event=cancel_event,
+                        )
+                else:
+                    result = model_manager.chat(
+                        messages=request_history,
+                        max_tokens=req.max_new_tokens,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        _cancel_event=cancel_event,
+                    )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 response_text = result.get("content", "")
                 if not req.show_thinking:
@@ -1427,7 +1454,8 @@ class EngineHost:
                 tokens_per_sec = result.get("tokens_per_second", 0)
                 usage = result.get("usage", {})
                 completion_tokens = usage.get("completion_tokens", 0)
-                local_route = f"{_chat_origin(req)}_to_master_local_{engine_name}"
+                route_suffix = f"{engine_name}_mtmd" if local_native_image else engine_name
+                local_route = f"{_chat_origin(req)}_to_master_local_{route_suffix}"
                 fallback_reason = ""
                 if external_fallback_reason:
                     fallback_reason = external_fallback_reason
@@ -1439,8 +1467,9 @@ class EngineHost:
                 metrics = _augment_chat_metrics(
                     {
                         "engine": engine_name,
-                        "execution_mode": f"local_{engine_name}",
+                        "execution_mode": f"local_{route_suffix}",
                         "route": local_route,
+                        "native_mtmd": local_native_image,
                         "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
                         "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
                         "generated_tokens": completion_tokens,
@@ -1670,6 +1699,8 @@ class EngineHost:
         Yields:
             dict 事件：{"token": ...} 或 {"done": True, "response": ..., "metrics": ...}
         """
+        if getattr(req, "image_data_urls", []):
+            raise RuntimeError("图像请求仅支持 full 响应模式，禁止忽略图片后执行文本流式推理")
         messages = [{"role": "user", "content": req.message}]
         chunks = self._host.chat_stream(
             messages=messages,
@@ -2944,6 +2975,16 @@ class EngineHost:
             prompt_chars=len(req.message or ""),
             min_prompt_chars=int(getattr(_cfg, "EXTERNAL_MIN_PROMPT_CHARS", 0) or 0),
         )
+
+    def _local_native_vision_available(self) -> bool:
+        """Check the active local engine without importing or loading a model."""
+        check = getattr(self._host, "native_vision_available", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception:
+            return False
 
     def _should_forward_chat_to_master(self) -> bool:
         sched = self._scheduler

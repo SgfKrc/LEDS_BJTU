@@ -9,11 +9,11 @@ small deterministic artifact for downstream lifecycle tests.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from qwen3_multimodal_contract import validate_mm1_model_manifest  # noqa: E402
 from qwen3_multimodal_preflight import (  # noqa: E402
     build_mm1_media_tensor_reference,
     mm1_ledger_commit,
@@ -25,12 +25,20 @@ from qwen3_multimodal_contract import (
     Qwen3MultimodalContractError,
     build_mm1_handoff_contract,
     build_mm1_transfer_binding,
+    validate_mm1_handoff_contract,
     validate_mm1_model_manifest,
+)
+from qwen3_pipeline_contract import (
+    Qwen3PipelineContractError,
+    validate_segment_plan,
 )
 
 
 _TRANSFER_ID = re.compile(r"^qtx_[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_STAGED_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_STAGED_DTYPES = {"float16": 2, "bfloat16": 2, "float32": 4}
+_STAGED_MAX_BYTES = 1 << 40
 
 
 class Qwen3MultimodalRuntimeError(RuntimeError):
@@ -367,7 +375,16 @@ def run_mm1_visual_tower_skeleton(
     - media + inactive：fail-closed（Qwen3MultimodalRuntimeError）；
     - 一致性：placement.request_has_media 必须与 text_only 参数一致。
     """
-    if bool(placement.get("request_has_media")) == bool(text_only):
+    if not isinstance(text_only, bool) or not isinstance(placement, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_placement_invalid", "visual tower placement flags are invalid",
+        )
+    request_has_media = placement.get("request_has_media")
+    if not isinstance(request_has_media, bool):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_placement_invalid", "request_has_media must be boolean",
+        )
+    if request_has_media == text_only:
         raise Qwen3MultimodalRuntimeError(
             "qwen3_mm1_placement_inconsistent",
             "visual tower placement contradicts the text-only request flag",
@@ -387,7 +404,11 @@ def run_mm1_visual_tower_skeleton(
             "weight_materialized": False,
             "full_model_materialized": False,
         }
-    active = bool(placement.get("vision_tower_active"))
+    active = placement.get("vision_tower_active")
+    if not isinstance(active, bool):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_placement_invalid", "vision_tower_active must be boolean",
+        )
     if not active:
         raise Qwen3MultimodalRuntimeError(
             "qwen3_mm1_vision_tower_inactive",
@@ -398,10 +419,21 @@ def run_mm1_visual_tower_skeleton(
             "qwen3_mm1_media_reference_missing",
             "media requests require a media tensor reference",
         )
+    if not isinstance(media_tensor_reference, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_reference_invalid", "media tensor reference is invalid",
+        )
+    try:
+        reference_model_id = media_tensor_reference["model_id"]
+        reference_components = media_tensor_reference["component_ids"]
+    except KeyError as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_reference_invalid", "media tensor reference identity is missing",
+        ) from exc
     reference = validate_mm1_media_tensor_reference(
         media_tensor_reference,
-        model_id=str(media_tensor_reference["model_id"]),
-        component_ids=list(media_tensor_reference["component_ids"]),
+        model_id=reference_model_id,
+        component_ids=reference_components,
     )
     return {
         "schema_version": 1,
@@ -432,10 +464,21 @@ def run_mm1_visual_placeholder_execution(
             "visual placeholder execution requires a ready skeleton path",
         )
     safe_manifest = validate_mm1_model_manifest(manifest)
+    if not isinstance(media_tensor_reference, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_reference_invalid", "media tensor reference is invalid",
+        )
+    try:
+        reference_model_id = media_tensor_reference["model_id"]
+        reference_components = media_tensor_reference["component_ids"]
+    except KeyError as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_reference_invalid", "media tensor reference identity is missing",
+        ) from exc
     reference = validate_mm1_media_tensor_reference(
         media_tensor_reference,
-        model_id=str(media_tensor_reference["model_id"]),
-        component_ids=list(media_tensor_reference["component_ids"]),
+        model_id=reference_model_id,
+        component_ids=reference_components,
     )
     vision = safe_manifest["vision"]
     tokens = int(reference["capacity"]["total_media_tokens"])
@@ -825,6 +868,702 @@ def run_mm1_synthetic_hybrid_chain(
     }
 
 
+def _staged_digest(value: Mapping[str, Any]) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text contract is not canonical JSON",
+        ) from exc
+    if len(encoded) > 64 * 1024:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_oversize",
+            "staged text contract exceeds 64 KiB",
+        )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _staged_id(value: Any, field: str) -> str:
+    result = str(value or "")
+    if _STAGED_ID.fullmatch(result) is None:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            f"{field} is invalid",
+        )
+    return result
+
+
+def _staged_int(value: Any, field: str, *, positive: bool = True) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            f"{field} must be an integer",
+        )
+    minimum = 1 if positive else 0
+    if not minimum <= value <= _STAGED_MAX_BYTES:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            f"{field} is outside limits",
+        )
+    return int(value)
+
+
+def _reject_staged_sensitive(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if (
+                "path" in lowered
+                or "file" in lowered
+                or "pixel" in lowered
+                or lowered in {"prompt", "prompt_text", "prompt_content"}
+            ):
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_staged_sensitive",
+                    "staged text metadata contains a sensitive field",
+                )
+            _reject_staged_sensitive(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_staged_sensitive(item)
+
+
+def _normalise_staged_segments(
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    total_layers: int,
+) -> list[dict[str, Any]]:
+    if isinstance(segments, (str, bytes)):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text segment plan is invalid",
+        )
+    try:
+        raw_segments = [dict(item) if isinstance(item, Mapping) else item for item in segments]
+    except TypeError as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text segment plan is invalid",
+        ) from exc
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_contract_invalid",
+                "staged text segment must be an object",
+            )
+        if not isinstance(raw.get("has_embedding"), bool) or not isinstance(raw.get("has_lm_head"), bool):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_contract_invalid",
+                "staged text ownership flags must be boolean",
+            )
+        _reject_staged_sensitive(raw)
+    try:
+        topology = validate_segment_plan(raw_segments, total_layers=total_layers)
+    except (Qwen3PipelineContractError, TypeError, ValueError) as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_topology_invalid",
+            "staged text segment topology is invalid",
+        ) from exc
+    result: list[dict[str, Any]] = []
+    for raw, segment in zip(raw_segments, topology):
+        node_id = _staged_id(raw.get("node_id"), "node_id")
+        assignment_sha = str(raw.get("assignment_manifest_sha256") or "")
+        if _SHA256.fullmatch(assignment_sha) is None:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_contract_invalid",
+                "assignment manifest digest is invalid",
+            )
+        required = _staged_int(raw.get("required_bytes"), "required_bytes")
+        activation = _staged_int(raw.get("activation_bytes"), "activation_bytes", positive=False)
+        capacity = _staged_int(raw.get("node_capacity_bytes"), "node_capacity_bytes")
+        peak = required + activation
+        if peak > capacity:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_capacity_rejected",
+                "staged text segment exceeds node capacity",
+            )
+        dtype = str(raw.get("dtype") or "").lower().removeprefix("torch.")
+        device = str(raw.get("device") or "").lower()
+        if dtype not in _STAGED_DTYPES or device not in {"cpu", "cuda"}:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_contract_invalid",
+                "staged text segment dtype or device is unsupported",
+            )
+        result.append({
+            "segment_index": int(segment["segment_index"]),
+            "node_id": node_id,
+            "layer_range": [int(value) for value in segment["layer_range"]],
+            "has_embedding": bool(segment["has_embedding"]),
+            "has_lm_head": bool(segment["has_lm_head"]),
+            "dtype": dtype,
+            "device": device,
+            "required_bytes": required,
+            "activation_bytes": activation,
+            "peak_bytes": peak,
+            "node_capacity_bytes": capacity,
+            "remaining_bytes": capacity - peak,
+            "admitted": True,
+            "assignment_manifest_sha256": assignment_sha,
+        })
+    return result
+
+
+def _normalise_staged_feature(
+    vision_feature: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(vision_feature, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "staged text execution requires a visual feature summary",
+        )
+    _reject_staged_sensitive(vision_feature)
+    if vision_feature.get("feature_kind") != "qwen3_visual_feature_placeholder":
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature kind is unsupported",
+        )
+    if vision_feature.get("model_id") != manifest["model_id"]:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature model identity does not match",
+        )
+    if vision_feature.get("full_model_materialized") is not False:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_full_model_forbidden",
+            "visual feature cannot materialize the full model",
+        )
+    if not isinstance(vision_feature.get("weight_materialized"), bool):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature weight state is invalid",
+        )
+    if not isinstance(vision_feature.get("synthetic"), bool):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature synthetic state is invalid",
+        )
+    digest = str(vision_feature.get("media_reference_sha256") or "")
+    if _SHA256.fullmatch(digest) is None:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature digest is invalid",
+        )
+    tensor = vision_feature.get("tensor")
+    if not isinstance(tensor, Mapping) or set(tensor) != {"shape", "dtype", "device"}:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature tensor metadata is invalid",
+        )
+    shape = tensor.get("shape")
+    if (
+        not isinstance(shape, (list, tuple))
+        or len(shape) != 3
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in shape)
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature shape must be [batch,tokens,hidden]",
+        )
+    if int(shape[0]) > 64 or int(shape[1]) > MM1_MAX_VISUAL_TOKENS:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature dimensions exceed limits",
+        )
+    if int(shape[2]) != int(manifest["text"]["hidden_size"]):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_hidden_mismatch",
+            "visual feature hidden must match the first text segment",
+        )
+    dtype = str(tensor.get("dtype") or "").lower().removeprefix("torch.")
+    device = str(tensor.get("device") or "").lower()
+    if dtype not in _STAGED_DTYPES or device not in {"cpu", "cuda"}:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_feature_invalid",
+            "visual feature dtype or device is unsupported",
+        )
+    size_bytes = int(shape[0]) * int(shape[1]) * int(shape[2]) * _STAGED_DTYPES[dtype]
+    return {
+        "feature_kind": "qwen3_visual_feature_placeholder",
+        "model_id": manifest["model_id"],
+        "media_reference_sha256": digest,
+        "tensor": {"shape": [int(item) for item in shape], "dtype": dtype, "device": device},
+        "synthetic": bool(vision_feature.get("synthetic", False)),
+        "weight_materialized": bool(vision_feature["weight_materialized"]),
+        "full_model_materialized": False,
+        "size_bytes": size_bytes,
+    }
+
+
+def _build_staged_input_layout(
+    feature: Mapping[str, Any],
+    *,
+    prompt_tokens: Any,
+    sequence_length: Any,
+) -> dict[str, Any]:
+    if (
+        isinstance(prompt_tokens, bool)
+        or not isinstance(prompt_tokens, int)
+        or not 1 <= prompt_tokens <= 8192
+        or isinstance(sequence_length, bool)
+        or not isinstance(sequence_length, int)
+        or not 1 <= sequence_length <= 65_536
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_layout_invalid",
+            "staged text sequence dimensions are invalid",
+        )
+    shape = feature["tensor"]["shape"]
+    visual_tokens = int(shape[1])
+    total_sequence = visual_tokens + int(prompt_tokens)
+    if total_sequence > sequence_length:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_sequence_overflow",
+            "visual and text tokens exceed the staged sequence budget",
+        )
+    dtype = str(feature["tensor"]["dtype"])
+    return {
+        "batch_size": int(shape[0]),
+        "visual_tokens": visual_tokens,
+        "prompt_tokens": int(prompt_tokens),
+        "visual_span": [0, visual_tokens],
+        "text_span": [visual_tokens, total_sequence],
+        "total_sequence": total_sequence,
+        "sequence_budget": int(sequence_length),
+        "hidden_size": int(shape[2]),
+        "dtype": dtype,
+        "device": str(feature["tensor"]["device"]),
+        "minimum_activation_bytes": int(shape[0]) * total_sequence * int(shape[2]) * _STAGED_DTYPES[dtype],
+    }
+
+
+def build_mm1_staged_text_contract(
+    *,
+    vision_feature: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    segments: Sequence[Mapping[str, Any]],
+    text_chain_id: str,
+    generation: int,
+    phase: str = "prefill",
+    source_node_id: str = "vision-node",
+    prompt_tokens: int = 4,
+    sequence_length: int = 128,
+) -> dict[str, Any]:
+    """Bind a visual feature reference to the first staged text segment."""
+    safe_manifest = validate_mm1_model_manifest(manifest)
+    feature = _normalise_staged_feature(vision_feature, manifest=safe_manifest)
+    input_layout = _build_staged_input_layout(
+        feature, prompt_tokens=prompt_tokens, sequence_length=sequence_length,
+    )
+    total_layers = int(safe_manifest["text"]["num_hidden_layers"])
+    plan = _normalise_staged_segments(segments, total_layers=total_layers)
+    if any(segment["activation_bytes"] < input_layout["minimum_activation_bytes"] for segment in plan):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_capacity_rejected",
+            "staged text activation budget is below the combined input requirement",
+        )
+    first = plan[0]
+    source = _staged_id(source_node_id, "source_node_id")
+    if source == first["node_id"]:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "visual and first text nodes must differ",
+        )
+    if feature["tensor"]["dtype"] != first["dtype"] or feature["tensor"]["device"] != first["device"]:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_handoff_mismatch",
+            "visual feature dtype/device does not match the first text segment",
+        )
+    try:
+        handoff = build_mm1_handoff_contract(
+            manifest=safe_manifest,
+            text_chain_id=text_chain_id,
+            generation=generation,
+            phase=phase,
+            source_node_id=source,
+            target_node_id=first["node_id"],
+            artifact={
+                "artifact_id": feature["media_reference_sha256"],
+                "mode": "local",
+                "size_bytes": feature["size_bytes"],
+                "sha256": feature["media_reference_sha256"],
+                "status": "committed",
+            },
+            shape=feature["tensor"]["shape"],
+            dtype=feature["tensor"]["dtype"],
+            device=feature["tensor"]["device"],
+            modality="image",
+            item_count=1,
+            frame_count=0,
+        )
+    except Qwen3MultimodalContractError as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_handoff_mismatch",
+            "staged visual handoff could not be constructed",
+        ) from exc
+    values = {
+        "schema_version": 1,
+        "contract_kind": "qwen3_mm1_staged_text_execution",
+        "model_id": safe_manifest["model_id"],
+        "model_family": safe_manifest["model_family"],
+        "manifest_sha256": safe_manifest["manifest_sha256"],
+        "text_chain_id": handoff["text_chain_id"],
+        "generation": handoff["generation"],
+        "phase": handoff["phase"],
+        "total_layers": total_layers,
+        "entry_segment_index": 0,
+        "segment_plan": plan,
+        "visual_feature": feature,
+        "visual_handoff": handoff,
+        "input_layout": input_layout,
+        "execution": {
+            "mode": "staged_segment",
+            "state": "planned",
+            "text_weights_loaded": False,
+            "segment_materialized": False,
+            "full_model_materialized": False,
+        },
+        "cleanup": {"required": True, "completed": False},
+    }
+    values["contract_sha256"] = _staged_digest(values)
+    return validate_mm1_staged_text_contract(values, manifest=safe_manifest)
+
+
+def validate_mm1_staged_text_contract(
+    value: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    safe_manifest = validate_mm1_model_manifest(manifest)
+    required = {
+        "schema_version", "contract_kind", "model_id", "model_family", "manifest_sha256",
+        "text_chain_id", "generation", "phase", "total_layers", "entry_segment_index",
+        "segment_plan", "visual_feature", "visual_handoff", "execution", "cleanup",
+        "input_layout", "contract_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text contract fields are invalid",
+        )
+    try:
+        contract = json.loads(json.dumps(value, ensure_ascii=True, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text contract is not JSON serializable",
+        ) from exc
+    if contract["schema_version"] != 1 or contract["contract_kind"] != "qwen3_mm1_staged_text_execution":
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text contract version or kind is invalid",
+        )
+    if (
+        contract["model_id"] != safe_manifest["model_id"]
+        or contract["model_family"] != safe_manifest["model_family"]
+        or contract["manifest_sha256"] != safe_manifest["manifest_sha256"]
+        or contract["total_layers"] != safe_manifest["text"]["num_hidden_layers"]
+        or contract["entry_segment_index"] != 0
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text contract model or entry identity does not match",
+        )
+    plan = _normalise_staged_segments(
+        contract["segment_plan"], total_layers=int(contract["total_layers"]),
+    )
+    if plan != contract["segment_plan"]:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text segment plan is not canonical",
+        )
+    feature = _normalise_staged_feature(contract["visual_feature"], manifest=safe_manifest)
+    if feature != contract["visual_feature"]:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged visual feature is not canonical",
+        )
+    input_layout = contract["input_layout"]
+    if not isinstance(input_layout, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_layout_invalid",
+            "staged text input layout is invalid",
+        )
+    expected_layout = _build_staged_input_layout(
+        feature,
+        prompt_tokens=input_layout.get("prompt_tokens"),
+        sequence_length=input_layout.get("sequence_budget"),
+    )
+    if dict(input_layout) != expected_layout or any(
+        segment["activation_bytes"] < expected_layout["minimum_activation_bytes"]
+        for segment in plan
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_layout_invalid",
+            "staged text input layout or activation budget does not match",
+        )
+    try:
+        handoff = validate_mm1_handoff_contract(contract["visual_handoff"], safe_manifest)
+    except Qwen3MultimodalContractError as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_handoff_mismatch",
+            "staged visual handoff is invalid",
+        ) from exc
+    first = plan[0]
+    if (
+        handoff["text_chain_id"] != contract["text_chain_id"]
+        or handoff["generation"] != contract["generation"]
+        or handoff["phase"] != contract["phase"]
+        or handoff["target_node_id"] != first["node_id"]
+        or handoff["tensor"] != feature["tensor"]
+        or handoff["artifact"]["sha256"] != feature["media_reference_sha256"]
+        or handoff["artifact"]["size_bytes"] != feature["size_bytes"]
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_handoff_mismatch",
+            "staged visual handoff does not match the first text segment",
+        )
+    if contract["execution"] != {
+        "mode": "staged_segment",
+        "state": "planned",
+        "text_weights_loaded": False,
+        "segment_materialized": False,
+        "full_model_materialized": False,
+    } or contract["cleanup"] != {"required": True, "completed": False}:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged execution lifecycle is invalid",
+        )
+    unsigned = dict(contract)
+    digest = str(unsigned.pop("contract_sha256", ""))
+    if _SHA256.fullmatch(digest) is None or digest != _staged_digest(unsigned):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_contract_invalid",
+            "staged text contract digest does not match",
+        )
+    _reject_staged_sensitive(contract)
+    return contract
+
+
+class Qwen3MultimodalStagedTextFixture:
+    """Hardware-free first-segment lifecycle fixture for MM1.20 contracts."""
+
+    def __init__(self, *, fail_execution: bool = False, fail_cleanup: bool = False) -> None:
+        if not isinstance(fail_execution, bool) or not isinstance(fail_cleanup, bool):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_fixture_invalid",
+                "staged text fixture flags must be boolean",
+            )
+        self.fail_execution = fail_execution
+        self.fail_cleanup = fail_cleanup
+        self.fixture_segment_materialized = False
+        self.cleanup_reasons: list[str] = []
+
+    def __call__(self, contract: Mapping[str, Any]) -> dict[str, Any]:
+        if self.fixture_segment_materialized:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_fixture_busy",
+                "staged text fixture already owns a segment",
+            )
+        self.fixture_segment_materialized = True
+        if self.fail_execution:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_execution_failed",
+                "staged text fixture execution failed",
+            )
+        first = contract["segment_plan"][0]
+        next_segment = contract["segment_plan"][1]
+        layout = contract["input_layout"]
+        return {
+            "status": "executed",
+            "full_model_materialized": False,
+            "execution": {
+                "segment_index": 0,
+                "layer_range": list(first["layer_range"]),
+                "input_handoff_sha256": contract["visual_handoff"]["contract_sha256"],
+                "evidence_kind": "cpu_fixture",
+                "planned_segment_peak_bytes": int(first["peak_bytes"]),
+                "text_weights_loaded": False,
+                "segment_materialized": False,
+                "fixture_segment_materialized": True,
+                "full_model_materialized": False,
+            },
+            "hidden_handoff": {
+                "from_segment": 0,
+                "to_segment": 1,
+                "shape": [layout["batch_size"], layout["total_sequence"], layout["hidden_size"]],
+                "dtype": next_segment["dtype"],
+                "device": next_segment["device"],
+            },
+        }
+
+    def cleanup(self, _contract: Mapping[str, Any], reason_code: str) -> dict[str, Any]:
+        self.cleanup_reasons.append(str(reason_code))
+        if not self.fail_cleanup:
+            self.fixture_segment_materialized = False
+        return {
+            "completed": not self.fail_cleanup,
+            "text_weights_loaded": False,
+            "segment_materialized": False,
+            "fixture_segment_materialized": self.fixture_segment_materialized,
+            "full_model_materialized": False,
+        }
+
+
+def _validate_staged_cleanup(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_cleanup_failed",
+            "staged text cleanup returned no metadata",
+        )
+    _reject_staged_sensitive(value)
+    expected = {
+        "completed": True,
+        "text_weights_loaded": False,
+        "segment_materialized": False,
+        "fixture_segment_materialized": False,
+        "full_model_materialized": False,
+    }
+    if any(value.get(key) is not expected_value for key, expected_value in expected.items()):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_cleanup_failed",
+            "staged text cleanup is incomplete",
+        )
+    return dict(expected)
+
+
+def execute_mm1_staged_text_contract(
+    contract: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    executor: Any,
+) -> dict[str, Any]:
+    """Exercise the first text-segment boundary through a bounded CPU fixture."""
+    safe = validate_mm1_staged_text_contract(contract, manifest=manifest)
+    callback = executor if callable(executor) else getattr(executor, "execute", None)
+    cleanup = getattr(executor, "cleanup", None)
+    if not callable(callback) or not callable(cleanup):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_executor_invalid",
+            "staged text executor must provide execute and cleanup",
+        )
+    primary_error: Qwen3MultimodalRuntimeError | None = None
+    report: Mapping[str, Any] | None = None
+    first = safe["segment_plan"][0]
+    next_segment = safe["segment_plan"][1]
+    execution: Mapping[str, Any] | None = None
+    hidden: Mapping[str, Any] | None = None
+    try:
+        report = callback(safe)
+        if not isinstance(report, Mapping):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_execution_failed",
+                "staged text executor returned no metadata",
+            )
+        _reject_staged_sensitive(report)
+        execution_value = report.get("execution")
+        hidden_value = report.get("hidden_handoff")
+        if report.get("status") != "executed" or report.get("full_model_materialized") is not False:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_execution_failed",
+                "staged text execution status is invalid",
+            )
+        if not isinstance(execution_value, Mapping) or (
+            execution_value.get("segment_index") != 0
+            or execution_value.get("layer_range") != first["layer_range"]
+            or execution_value.get("input_handoff_sha256") != safe["visual_handoff"]["contract_sha256"]
+            or execution_value.get("planned_segment_peak_bytes") != first["peak_bytes"]
+            or execution_value.get("evidence_kind") != "cpu_fixture"
+            or execution_value.get("text_weights_loaded") is not False
+            or execution_value.get("segment_materialized") is not False
+            or execution_value.get("fixture_segment_materialized") is not True
+            or execution_value.get("full_model_materialized") is not False
+        ):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_execution_failed",
+                "staged text execution metadata does not match the contract",
+            )
+        layout = safe["input_layout"]
+        expected_shape = [layout["batch_size"], layout["total_sequence"], layout["hidden_size"]]
+        if not isinstance(hidden_value, Mapping) or (
+            hidden_value.get("from_segment") != 0
+            or hidden_value.get("to_segment") != 1
+            or hidden_value.get("shape") != expected_shape
+            or hidden_value.get("dtype") != next_segment["dtype"]
+            or hidden_value.get("device") != next_segment["device"]
+        ):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_staged_handoff_mismatch",
+                "staged text output handoff does not match the next segment",
+            )
+        execution = execution_value
+        hidden = hidden_value
+    except Qwen3MultimodalRuntimeError as exc:
+        primary_error = exc
+    except Exception as exc:
+        primary_error = Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_execution_failed",
+            "staged text executor failed",
+        )
+        primary_error.__cause__ = exc
+
+    try:
+        cleanup_report = _validate_staged_cleanup(
+            cleanup(safe, "execution_failed" if primary_error else "completed"),
+        )
+    except Qwen3MultimodalRuntimeError:
+        raise
+    except Exception as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_staged_cleanup_failed",
+            "staged text cleanup failed",
+        ) from exc
+    if primary_error is not None:
+        raise primary_error
+    assert execution is not None and hidden is not None
+    return {
+        "schema_version": 1,
+        "status": "staged_text_segment_fixture_executed",
+        "execution_kind": "qwen3_mm1_staged_text_fixture",
+        "contract_sha256": safe["contract_sha256"],
+        "execution": {
+            "segment_index": 0,
+            "layer_range": list(first["layer_range"]),
+            "evidence_kind": "cpu_fixture",
+            "planned_segment_peak_bytes": int(first["peak_bytes"]),
+            "text_weights_loaded": False,
+            "segment_materialized": False,
+            "fixture_segment_materialized": True,
+            "full_model_materialized": False,
+        },
+        "next_segment_request": {
+            "segment_index": 1,
+            "node_id": next_segment["node_id"],
+            "layer_range": list(next_segment["layer_range"]),
+            "text_chain_id": safe["text_chain_id"],
+            "generation": safe["generation"],
+            "phase": safe["phase"],
+            "hidden_handoff": {
+                "from_segment": 0,
+                "to_segment": 1,
+                "shape": list(hidden["shape"]),
+                "dtype": hidden["dtype"],
+                "device": hidden["device"],
+            },
+        },
+        "cleanup": cleanup_report,
+        "full_model_materialized": False,
+    }
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
@@ -835,4 +1574,8 @@ __all__ = [
     "run_mm1_synthetic_visual_chain",
     "run_mm1_synthetic_text_decode",
     "run_mm1_synthetic_hybrid_chain",
+    "build_mm1_staged_text_contract",
+    "validate_mm1_staged_text_contract",
+    "execute_mm1_staged_text_contract",
+    "Qwen3MultimodalStagedTextFixture",
 ]

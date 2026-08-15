@@ -2053,6 +2053,60 @@ class TestLoadModelWithModelId:
         assert mgr._active_model_id == "qwen2.5-7b-gguf"
         assert mgr._engine_type == "llama_cpp"
 
+    def test_gemma4_native_uses_managed_mtmd_loader(self, monkeypatch, tmp_path):
+        gguf = tmp_path / "gemma-4-12B-it-Q4_K_M.gguf"
+        gguf.write_bytes(b"fixture")
+        calls = []
+        mgr = ModelManager()
+
+        monkeypatch.setattr(
+            mgr,
+            "_load_gemma4_native",
+            lambda path, profile=None: calls.append((path, profile)),
+        )
+        monkeypatch.setattr(
+            mgr,
+            "_load_llama_cpp",
+            lambda *_args, **_kwargs: pytest.fail("ordinary GGUF loader was used"),
+        )
+
+        mgr.load_model(
+            model_id="gemma4-native",
+            model_path=str(gguf),
+            engine="llama_cpp",
+        )
+
+        assert calls == [(str(gguf), None)]
+        assert mgr.active_model_id == "gemma4-native"
+
+    def test_native_image_capability_and_delegation(self, monkeypatch, tmp_path):
+        image = tmp_path / "image.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        calls = []
+
+        class NativeEngine:
+            def get_capabilities(self):
+                return {"vision": True}
+
+            def chat_image(self, **kwargs):
+                calls.append(kwargs)
+                return {"content": "image reply"}
+
+        mgr = ModelManager()
+        mgr._engine_type = "llama_cpp"
+        mgr._llama_engine = NativeEngine()
+
+        assert mgr.native_vision_available() is True
+        result = mgr.chat_image(
+            str(image),
+            "describe",
+            max_tokens=32,
+            max_answer_tokens=8,
+        )
+        assert result["content"] == "image reply"
+        assert calls[0]["image_path"] == str(image)
+        assert calls[0]["max_answer_tokens"] == 8
+
     def test_load_model_finds_db_registered_model(self, monkeypatch, tmp_path):
         """DB 注册模型 → db_experimental_models 参数传递给 get_model_config"""
         gguf_file = tmp_path / "db-model.Q4_K_M.gguf"

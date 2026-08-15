@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import gc
 import json
-import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping
@@ -30,6 +29,8 @@ from qwen3_multimodal_preflight import (  # noqa: E402
 TOOL = "qwen3_multimodal_vision_tower_probe"
 SCHEMA_VERSION = 1
 MAX_INPUT_BYTES = 256 * 1024
+MIN_RAM_GATE = 4 * 2**30
+MAX_INDEX_BYTES = 2 * 1024 * 1024
 
 
 def _base_result() -> dict[str, Any]:
@@ -76,7 +77,17 @@ def execute_request(
         result["errors"] = [{"code": "request_incomplete", "message": "vision tower probe request is incomplete"}]
         return result
     try:
-        import safetensors.torch  # noqa: F401
+        import psutil
+    except Exception as exc:
+        result["status"] = "runtime_rejected"
+        result["errors"] = [{"code": "memory_probe_unavailable", "message": exc.__class__.__name__}]
+        return result
+    if psutil.virtual_memory().available < MIN_RAM_GATE:
+        result["status"] = "resource_rejected"
+        result["errors"] = [{"code": "insufficient_ram", "message": "MM1.15 requires >= 4 GiB available RAM"}]
+        return result
+    try:
+        from safetensors import safe_open
         import torch
         from transformers import AutoProcessor, AutoConfig
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
@@ -92,23 +103,65 @@ def execute_request(
         vision_config = getattr(config, "vision_config", None)
         if vision_config is None:
             raise Qwen3MultimodalPreflightError("model has no vision_config")
+        if str(getattr(config, "model_type", "")) != "qwen3_vl":
+            raise Qwen3MultimodalPreflightError("model is not a Qwen3-VL checkpoint")
 
         # 只构造视觉塔（不构造文本/embedding）
         vision_model = Qwen3VLVisionModel(vision_config)
 
         # 从 safetensors 分片 filter 加载 visual. 前缀权重
-        shards = sorted(model_path.glob("*.safetensors"))
-        if not shards:
-            raise Qwen3MultimodalPreflightError("no safetensors shards found")
-        state: dict[str, Any] = {}
-        for shard in shards:
-            loaded = safetensors.torch.load_file(str(shard), device="cpu")
-            for key, value in loaded.items():
-                if key.startswith("model.visual."):
-                    state[key[len("model.visual."):]] = value
-        if not state:
-            raise Qwen3MultimodalPreflightError("no visual. weights found in shards")
-        missing, unexpected = vision_model.load_state_dict(state, strict=False)
+        index_path = model_path / "model.safetensors.index.json"
+        visual_map: dict[str, Path] = {}
+        if index_path.is_file():
+            try:
+                if index_path.stat().st_size <= 0 or index_path.stat().st_size > MAX_INDEX_BYTES:
+                    raise Qwen3MultimodalPreflightError("safetensors index exceeds size limit")
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map = index.get("weight_map")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise Qwen3MultimodalPreflightError("safetensors index is invalid") from exc
+            if not isinstance(weight_map, dict):
+                raise Qwen3MultimodalPreflightError("safetensors index has no weight_map")
+            for key, shard_name in weight_map.items():
+                if not isinstance(key, str) or not key.startswith("model.visual."):
+                    continue
+                if not isinstance(shard_name, str):
+                    raise Qwen3MultimodalPreflightError("safetensors shard name is invalid")
+                shard = (model_path / shard_name).resolve(strict=False)
+                if shard.parent != model_path or not shard.is_file():
+                    raise Qwen3MultimodalPreflightError("safetensors shard escapes model directory")
+                if key in visual_map and visual_map[key] != shard:
+                    raise Qwen3MultimodalPreflightError("visual weight is mapped to multiple shards")
+                visual_map[key] = shard
+        else:
+            for shard in sorted(model_path.glob("*.safetensors")):
+                with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                    for key in handle.keys():
+                        if key.startswith("model.visual."):
+                            visual_map[key] = shard
+        if not visual_map:
+            raise Qwen3MultimodalPreflightError("no visual weights found in safetensors index")
+
+        expected = set(vision_model.state_dict().keys())
+        parameters = dict(vision_model.named_parameters())
+        buffers = dict(vision_model.named_buffers())
+        loaded_keys: set[str] = set()
+        for full_key, shard in sorted(visual_map.items()):
+            key = full_key[len("model.visual."):]
+            target = parameters.get(key)
+            if target is None:
+                target = buffers.get(key)
+            if target is None:
+                raise Qwen3MultimodalPreflightError(f"unexpected vision tower key: {key}")
+            with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                tensor = handle.get_tensor(full_key)
+            if tuple(tensor.shape) != tuple(target.shape):
+                raise Qwen3MultimodalPreflightError(f"vision tower shape mismatch: {key}")
+            with torch.no_grad():
+                target.copy_(tensor.to(dtype=target.dtype, device=target.device))
+            loaded_keys.add(key)
+            del tensor
+        missing = expected - loaded_keys
         if missing:
             raise Qwen3MultimodalPreflightError(
                 f"vision tower missing keys: {sorted(missing)[:5]}",
@@ -139,12 +192,12 @@ def execute_request(
         # 合成占位对照（MM1.14 投影口径）
         synthetic_summary = {
             "image": {
-                "pixel_values_shape": [1, 3, 32, 32],
+                "pixel_values_shape": [int(value) for value in pixel_values.shape],
                 "dtype": str(pixel_values.dtype),
                 "token_count_estimate": seq_len,
             },
             "video": {"pixel_values_shape": [], "dtype": "", "token_count_estimate": 0},
-            "output_bytes_estimate": seq_len * hidden_dim * 2,
+            "output_bytes_estimate": seq_len * hidden_dim * int(image_embeds.element_size()),
             "weight_materialized": False,
             "full_model_materialized": False,
         }
@@ -165,8 +218,8 @@ def execute_request(
                     "class_name": type(vision_model).__name__,
                     "depth": int(vision_config.depth),
                     "hidden_size": int(vision_config.hidden_size),
-                    "loaded_weights": len(state),
-                    "shards_loaded": len(shards),
+                    "loaded_weights": len(loaded_keys),
+                    "shards_loaded": len(set(visual_map.values())),
                 },
                 "real_feature": {
                     "shape": [1, seq_len, hidden_dim],
@@ -192,8 +245,6 @@ def execute_request(
                 "text_weights_loaded": False,
             },
         })
-        del vision_model, image_embeds, pixel_values, inputs, state
-        gc.collect()
         return result
     except Qwen3MultimodalPreflightError as exc:
         result["status"] = "vision_tower_contract_rejected"
@@ -203,6 +254,11 @@ def execute_request(
         result["status"] = "vision_tower_load_failed"
         result["errors"] = [{"code": "vision_tower_load_failed", "message": exc.__class__.__name__}]
         return result
+    finally:
+        # Drop references on both success and failure; the worker is isolated,
+        # but explicit cleanup keeps repeated probes from retaining CPU pages.
+        vision_model = processor = image_embeds = pixel_values = inputs = None
+        gc.collect()
 
 
 def main() -> int:

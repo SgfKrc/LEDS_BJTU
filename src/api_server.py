@@ -55,7 +55,11 @@ from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
 from paged_kv_cache import PagedKVCache
-from multimodal import build_openai_user_content, validate_image_data_urls
+from multimodal import (
+    build_openai_user_content,
+    materialize_image_data_url,
+    validate_image_data_urls,
+)
 from device_profiler import DeviceProfiler, get_profile
 from scheduler import Scheduler as ClusterScheduler
 from task_graph import (
@@ -1059,7 +1063,7 @@ class ChatRequest(BaseModel):
     image_data_urls: list[str] = Field(
         default_factory=list,
         max_length=4,
-        description="PNG/JPEG/WebP base64 data URL；仅显式 external_api 路由可用",
+        description="PNG/JPEG/WebP base64 data URL；external_api 最多四张，本地 MTMD 仅一张",
     )
     session_id: Optional[str] = Field(default=None, description="会话ID，为空时使用当前活跃会话")
     max_new_tokens: int = Field(default=1024, ge=1, le=4096)
@@ -1131,12 +1135,18 @@ class ChatRequest(BaseModel):
         self.image_data_urls = validate_image_data_urls(self.image_data_urls)
         if not self.image_data_urls:
             return self
-        if not self.allow_external or not self.prefer_external:
-            raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
-        if self.routing_preference == "local_only":
-            raise ValueError("图像请求不能使用 local_only 路由")
         if self.execution_mode != "auto":
             raise ValueError("图像请求暂不支持 task_graph 执行模式")
+        if self.routing_preference == "local_only":
+            if len(self.image_data_urls) != 1:
+                raise ValueError("本地 MTMD 图像请求仅支持一张图片")
+            if self.streaming_mode != "full":
+                raise ValueError("本地 MTMD 图像请求仅支持 full 响应模式")
+            if self.allow_external or self.prefer_external:
+                raise ValueError("local_only 图像请求不能同时授权外部路由")
+            return self
+        if not self.allow_external or not self.prefer_external:
+            raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
         return self
 
 
@@ -3505,6 +3515,18 @@ def _external_route_decision(req: ChatRequest):
     )
 
 
+def _local_native_vision_available(manager=None) -> bool:
+    """Check the active local engine without importing or loading a model."""
+    target = manager or model_manager
+    check = getattr(target, "native_vision_available", None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check())
+    except Exception:
+        return False
+
+
 def _maybe_log_external_scope_denial(req: ChatRequest, decision) -> None:
     """请求带外部 flag 但被数据作用域拒绝时记一条 INFO（每请求一次，不记正文）。"""
     if not (req.allow_external or req.prefer_external):
@@ -5050,10 +5072,22 @@ def _execute_chat_full(
     # （作用域拒绝的 INFO 日志由端点入口统一记录，每请求一次）
     external_fallback_reason = ""
     _ext_decision = _external_route_decision(req)
-    if req.image_data_urls and not _ext_decision.use_external:
+    local_native_image = bool(
+        req.image_data_urls and _local_native_vision_available()
+    )
+    if (
+        local_native_image
+        and not _ext_decision.use_external
+        and len(req.image_data_urls) != 1
+    ):
         raise HTTPException(
             400,
-            "多模态请求必须使用已启用且获数据作用域授权的 external_api："
+            "本地 MTMD 图像回退仅支持一张图片；多图请求不能静默丢弃其余图片",
+        )
+    if req.image_data_urls and not _ext_decision.use_external and not local_native_image:
+        raise HTTPException(
+            400,
+            "当前本地模型没有原生视觉能力，且 external_api 不可用或未获授权："
             f"{_ext_decision.reason}",
         )
     if _ext_decision.use_external:
@@ -5065,7 +5099,7 @@ def _execute_chat_full(
             raise
         except Exception as exc:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            if req.image_data_urls:
+            if req.image_data_urls and not local_native_image:
                 raise HTTPException(
                     502,
                     f"多模态外部推理服务调用失败，禁止丢弃图片后回退：{exc}",
@@ -5260,13 +5294,27 @@ def _execute_chat_full(
                 *history,
                 {"role": "user", "content": req.message},
             ]
-            result = model_manager.chat(
-                messages=request_history,
-                max_tokens=req.max_new_tokens,
-                temperature=req.temperature,
-                top_p=req.top_p,
-                _cancel_event=cancel_event,
-            )
+            if local_native_image:
+                if engine_name != "llama_cpp":
+                    raise RuntimeError("本地原生图像请求要求 llama.cpp MTMD 引擎")
+                with materialize_image_data_url(req.image_data_urls[0]) as image_path:
+                    result = model_manager.chat_image(
+                        image_path=image_path,
+                        prompt=req.message,
+                        max_tokens=min(req.max_new_tokens + 96, 512),
+                        max_answer_tokens=min(req.max_new_tokens, 256),
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        _cancel_event=cancel_event,
+                    )
+            else:
+                result = model_manager.chat(
+                    messages=request_history,
+                    max_tokens=req.max_new_tokens,
+                    temperature=req.temperature,
+                    top_p=req.top_p,
+                    _cancel_event=cancel_event,
+                )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             response_text = result.get("content", "")
             # P3修复: llama.cpp/孤岛路径同样需要剥离本地思考标记
@@ -5279,7 +5327,8 @@ def _execute_chat_full(
             tokens_per_sec = result.get("tokens_per_second", 0)
             usage = result.get("usage", {})
             completion_tokens = usage.get("completion_tokens", 0)
-            local_route = f"{_chat_origin(req)}_to_master_local_{engine_name}"
+            route_suffix = f"{engine_name}_mtmd" if local_native_image else engine_name
+            local_route = f"{_chat_origin(req)}_to_master_local_{route_suffix}"
             fallback_reason = ""
             if external_fallback_reason:
                 # 路线 B 外部路由失败后的本地回退（原因优先展示外部失败）
@@ -5292,8 +5341,9 @@ def _execute_chat_full(
             metrics = _augment_chat_metrics(
                 {
                     "engine": engine_name,
-                    "execution_mode": f"local_{engine_name}",
+                    "execution_mode": f"local_{route_suffix}",
                     "route": local_route,
+                    "native_mtmd": local_native_image,
                     "tokens_per_second": round(tokens_per_sec, 1) if tokens_per_sec else 0,
                     "tokens_per_sec": round(tokens_per_sec, 1) if tokens_per_sec else 0,
                     "generated_tokens": completion_tokens,
@@ -5915,6 +5965,11 @@ async def chat_stream(req: ChatRequest, request: Request):
                             yield frame
                         if event.get("done"):
                             break
+                elif req.image_data_urls:
+                    error = (
+                        "本地原生图像请求仅支持 full 响应模式；"
+                        "请改用 streaming_mode=full 和 local_only"
+                    )
                 elif (req.routing_preference != "local_only"
                       and _should_forward_chat_to_master()):
                     # 计划 §9.5：聊天请求不绕过网关直打本地模型；从节点

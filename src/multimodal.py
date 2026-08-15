@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+from contextlib import contextmanager
+import os
 import re
+import tempfile
 from typing import Any, Iterable
 
 
@@ -60,6 +63,32 @@ def validate_image_data_urls(values: Iterable[str] | None) -> list[str]:
             raise ValueError("图片总大小不得超过 16 MiB")
         validated.append(value)
     return validated
+
+
+def decode_image_data_url(value: str) -> tuple[str, bytes]:
+    """Decode one validated image data URL for a local native backend."""
+    validated = validate_image_data_urls([value])
+    match = _IMAGE_DATA_URL_RE.fullmatch(validated[0])
+    if match is None:  # pragma: no cover - validation above guarantees this
+        raise ValueError("图片 data URL 无效")
+    return match.group("kind").lower(), base64.b64decode(match.group("payload"), validate=True)
+
+
+@contextmanager
+def materialize_image_data_url(value: str):
+    """Expose one inline image as a short-lived local file for MTMD bindings."""
+    kind, data = decode_image_data_url(value)
+    suffix = ".jpg" if kind == "jpeg" else f".{kind}"
+    fd, path = tempfile.mkstemp(prefix="qlh-chat-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 def build_openai_user_content(

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -1386,6 +1386,74 @@ def test_chat_full_llama_cpp_path(monkeypatch):
     # followups：模型无合格问句 → 模板兜底 ≥2
     assert len(result["followups"]) >= 2
     assert host.conversation_status()["stats"]["rounds"] == 1
+
+
+def test_chat_full_local_native_image_path_removes_temp_file(monkeypatch):
+    import config as _cfg
+
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    observed = {}
+
+    class NativeImageModel(FakeModel):
+        def native_vision_available(self):
+            return True
+
+        def chat_image(self, **kwargs):
+            observed.update(kwargs)
+            observed["exists_during_call"] = os.path.isfile(kwargs["image_path"])
+            return {
+                "content": "本地图片描述",
+                "usage": {"completion_tokens": 3, "total_tokens": 10},
+                "tokens_per_second": 7.5,
+                "native_mtmd": True,
+            }
+
+    monkeypatch.setattr(_cfg, "EXTERNAL_ENABLED", False)
+    host = make_full_host(NativeImageModel)
+    req = ChatRequest(
+        message="描述图片",
+        image_data_urls=[image],
+        routing_preference="local_only",
+        max_new_tokens=24,
+    )
+
+    result = host.chat_full(req)
+
+    assert result["content"] == "本地图片描述"
+    assert result["metrics"]["execution_mode"] == "local_llama_cpp_mtmd"
+    assert result["metrics"]["native_mtmd"] is True
+    assert observed["exists_during_call"] is True
+    assert not os.path.exists(observed["image_path"])
+
+
+def test_chat_full_local_native_image_rejects_multi_image_fallback(monkeypatch):
+    import config as _cfg
+
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    class NativeImageModel(FakeModel):
+        def native_vision_available(self):
+            return True
+
+    monkeypatch.setattr(_cfg, "EXTERNAL_ENABLED", False)
+    host = make_full_host(NativeImageModel)
+    req = ChatRequest(
+        message="鎻忚堪鍥剧墖",
+        image_data_urls=[image, image],
+        allow_external=True,
+        prefer_external=True,
+    )
+
+    with pytest.raises(HTTPException, match="不能静默丢弃"):
+        host.chat_full(req)
 
 
 def test_chat_full_session_switch(monkeypatch):
