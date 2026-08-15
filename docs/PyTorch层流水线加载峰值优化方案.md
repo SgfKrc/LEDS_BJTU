@@ -554,13 +554,34 @@
 1. 以固定测试图走真实视觉塔 + 真实文本段前向（首次加载文本权重），产出视觉语义描述并对照人工/合成基线；随后将视觉特征接入跨节点 hidden handoff 契约（text_chain 边界）。
 2. 首次引入文本段权重加载与真实语义，需独立资源门与登记；CUDA/双机 parity、长视频与生产路由继续独立后置。
 
-### 8.68 `PT-PIPE-MM1.18` 真实视觉语义 smoke 与跨节点 hidden handoff 前置（开发门 Completed，2026-08-15）
+### 8.68 `PT-PIPE-MM1.18` 真实视觉语义 smoke 与跨节点 hidden handoff 前置（研究工具完成，生产能力撤回，2026-08-15）
 
-- `qwen3_multimodal_vision_text_smoke`（controller + 隔离 worker）：**首次文本权重加载**——4-bit（BitsAndBytes）加载完整 Qwen3VLForConditionalGeneration（CPU，RAM 门 ≥6GB fail-closed），固定测试图（sd-001：red apple on wooden table）真实语义生成：**"Two shiny red apples… on a rustic wooden table against a weathered wooden background."**——`apple/red/wood` 关键词全中；`text_weights_loaded=true`。
-- **跨节点 handoff 前置**：真实语义特征 → `visual_to_text` hidden handoff 契约（MM1.13：`artifact.status=committed`、sha256/大小一致、tensor shape 对齐文本 hidden）。
-- 定向 `40 passed`（MM1.7-1.17 全量 + MM1.18 真实语义/handoff）；真实语义首次达成但仅在固定测试图；CUDA/双机 parity、长视频与生产路由继续独立后置。
+- `qwen3_multimodal_vision_text_smoke`（controller + 隔离 worker）：**首次文本权重加载**——4-bit（BitsAndBytes）加载完整 `Qwen3VLForConditionalGeneration`（CPU，RAM 门 ≥10 GiB，显式 opt-in）；固定测试图的研究性语义 smoke 结果如实标记 `full_model_materialized=true`。
+- 原先把完整模型 smoke 写成 `full_model_materialized=false` 的 handoff/完成结论已撤回；该入口不签发真实跨节点 hidden handoff，也不进入生产路由。
+- 定向回归保留；真实图像语义仅是固定图研究证据，CUDA/双机 parity、长视频与生产路由继续独立后置。
 
-### 8.69 下一票：`PT-PIPE-MM1.19` 真实语义扩展与生产路由评估
+### 8.69 `PT-PIPE-MM1.19` 真实语义扩展与生产路由评估（开发门完成，实机数据待资源恢复，2026-08-15）
 
-1. 固定图扩展（sd-001/90s 风格多图）真实语义对照 + 时延/显存/内存登记（CPU 4-bit 路径）；评估生产路由（Ollama external_api vs 原生 sidecar）的取舍与门条件。
-2. CUDA/双机 parity、长视频、分布式 hidden handoff 跨节点实测与生产路由继续独立后置。
+1. controller/隔离 worker 支持 1-4 张有界本地图；同一模型只加载一次后顺序处理，逐图登记 `image_sha256`、关键词命中、语义门和 `latency_ms`，支持每图独立关键词基线（sd-001 与 90s 风格不再共用错误基线）。
+2. 新增 path-free CPU 资源观测：进程 RSS before/after/peak/delta、可用 RAM、CUDA available/allocated/reserved peak；10 GiB 资源门在加载前 fail-closed。
+3. 新增生产路由评估：原生 sidecar 必须通过无完整模型物化、多图语义、资源观测、CUDA parity、分布式 hidden handoff、长视频等门；当前研究 smoke 明确推荐条件式 `external_api`，不构成生产准入。
+4. 当前开发机真实双图请求已在模型加载前返回 `resource_rejected/insufficient_ram`（可用 RAM 约 6.5 GiB），所以真实多图时延/显存/内存表待资源恢复后补登；CUDA/双机 parity、长视频和跨节点实测继续后置。
+
+### 8.70 `PT-PIPE-MM1` 复核修正（2026-08-15）
+
+- 复核发现 MM1.15 原实现使用 `safetensors.torch.load_file()` 读取完整分片后再过滤视觉键，会在 4.9GB 分片上制造不必要的 RAM 峰值；现改为读取 index/header 后用 `safe_open.get_tensor()` 逐张量复制，仅保留视觉塔权重，并校验 shard 路径、键集合、形状和 Qwen3-VL model type。
+- 原 MM1.18 把完整 `Qwen3VLForConditionalGeneration` 4-bit 加载标记为 `full_model_materialized=false`，与分布式无峰值目标矛盾。该完成结论撤回：默认请求现在在加载前 `resource_rejected/full_model_materialization_disabled`；研究性完整模型 smoke 必须显式传 `allow_full_model_materialization=true`，成功响应真实标记 `full_model_materialized=true`，不进入生产路由或 hidden handoff。
+- MM1.8-11 的 media reference、容量合同、资源账本和 placement 校验已收紧为严格类型、容量/摘要一致、冲突 entry 拒绝和 text-only 守卫；新增 `tests/test_qwen3_multimodal_review.py` 回归。
+- 当前可宣称范围：MM1.7-1.17 的合成/视觉塔 CPU 骨架和真实视觉塔前向；MM1.18/1.19 仅为显式 opt-in 研究工具和资源观测，完整模型物化、真实跨节点 handoff、CUDA parity 和生产准入仍未完成。下一票为 `PT-PIPE-MM1.20`，先做分段文本执行器前置，不得绕过完整模型 opt-in 门。
+
+### 8.71 `PT-PIPE-MM1.20` 分段文本执行器前置与无峰值 handoff 门（开发门 Completed，2026-08-15）
+
+1. 新增 `build_mm1_staged_text_contract` / `validate_mm1_staged_text_contract`：把 MM1.15 视觉特征摘要与完整 2/3 段文本拓扑绑定；校验模型/manifest/assignment SHA、连续层范围、首段节点、单段权重与激活预算、节点容量以及 contract SHA。控制合同只含 artifact/shape/dtype/token/chain 摘要，不含路径、像素或 prompt 内容。
+2. 首段输入显式登记 `visual_span + text_span`、总序列长度与 sequence budget，并以 `[batch, visual_tokens + prompt_tokens, hidden]` 约束下一段 hidden handoff；任一段激活预算低于合并输入、容量不足、序列溢出、dtype/device 不匹配或完整模型物化均 fail-closed。
+3. 新增 `Qwen3MultimodalStagedTextFixture` 和 `execute_mm1_staged_text_contract`：CPU fixture 覆盖首段边界、下一段请求、成功释放、执行异常释放、cleanup 不完整拒绝和合同篡改拒绝。证据明确为 `evidence_kind=cpu_fixture`，`text_weights_loaded=false`、`segment_materialized=false`、`full_model_materialized=false`；仅 `fixture_segment_materialized` 描述测试生命周期，不宣称真实权重已加载。
+4. MM1.20 专项 `7 passed`；MM1 合同/预检/runtime/processor/MM1.19-20 联合 `80 passed / 1 skipped`。真实首段权重加载与 forward、本地 artifact 数据面、CUDA/双机 parity、跨节点网络和生产准入仍未完成。
+
+### 8.72 下一票：`PT-PIPE-MM1.21` 首段 sidecar 本地 artifact 适配
+
+1. 将 MM1.20 staged contract 适配到现有 `Qwen3PipelineSidecarSession` 的 prepare → commit → prefill → release/abort 生命周期；视觉/合并 hidden 工件路径只在受控本地 data plane 内传递，控制面只返回大小、SHA 和 handoff 摘要。
+2. 先用 CPU fake runner 覆盖输入/输出 SHA、scope fence、阶段顺序、取消和失败清理；真实 Qwen3-VL 首文本段权重与 forward、CUDA/双机和生产路由继续独立后置。
