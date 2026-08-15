@@ -2285,3 +2285,121 @@ class TestSwitchModel:
         assert mgr.active_model_id == mc.DEFAULT_MODEL_ID
         mgr.switch_model("qwen2.5-7b-gguf")
         assert mgr.active_model_id == "qwen2.5-7b-gguf"
+
+
+class TestGemmaLayerRangeAdapter:
+    """Gemma 4 PyTorch 层流水线 adapter（P1，§4.2 模板接线）测试。"""
+
+    def test_load_layer_range_routes_gemma_to_shared_loader(self, monkeypatch):
+        """model_type=gemma 应走 _load_gemma_layer_range（复用 Qwen2 key 布局）。"""
+        import model_module
+
+        config = type("Config", (), {
+            "model_type": "gemma",
+            "num_hidden_layers": 42,
+        })()
+        monkeypatch.setattr(
+            model_module.AutoConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: config,
+        )
+        mgr = ModelManager()
+        mgr._full_model_path = "G:/models/gemma-4-12b"
+
+        calls = []
+        original = mgr._load_gemma_layer_range
+
+        def install_fake_model(*args, **kwargs):
+            calls.append((args, kwargs))
+            fake_layers = nn.ModuleList([nn.Linear(1, 1) for _ in range(42)])
+            fake_model = nn.Module()
+            fake_model.model = nn.Module()
+            fake_model.model.layers = fake_layers
+            fake_model.model.embed_tokens = nn.Embedding(2, 1)
+            fake_model.lm_head = nn.Linear(1, 2)
+            mgr.model = fake_model
+            tracker = _LayerRangeLoadTracker(
+                architecture="gemma",
+                start_layer=0,
+                end_layer=12,
+                layer_prefix="model.layers.",
+                selected_prefixes=[
+                    f"model.layers.{index}." for index in range(12)
+                ],
+                target_dtype=torch.float32,
+            )
+            tracker.loaded_layers.update(range(12))
+            return tracker
+
+        monkeypatch.setattr(mgr, "_load_gemma_layer_range", install_fake_model)
+        assert original is not None  # 适配器存在（真实方法被替换前）
+
+        mgr.load_layer_range(
+            0, 12, has_embedding=True, has_lm_head=False,
+            total_layers=42,
+        )
+
+        # gemma 分支接线：走 gemma 加载器且裁剪 model.model.layers
+        assert len(calls) == 1
+        assert mgr.layer_range == (0, 12)
+        assert len(mgr.model.model.layers) == 12
+        assert mgr.model.lm_head is None  # has_lm_head=False 裁剪
+        assert mgr._layer_architecture == "gemma"
+
+    def test_gemma_adapter_reuses_qwen2_loader_with_identity(self, monkeypatch):
+        """_load_gemma_layer_range 应把 architecture=gemma 传给共享加载器。"""
+        import model_module
+
+        mgr = ModelManager()
+        forwarded = {}
+
+        def fake_qwen2_loader(
+            model_path, start_layer, end_layer, *, has_embedding,
+            has_lm_head, quant_type=None, profile=None, model_config=None,
+            architecture="qwen2",
+        ):
+            forwarded.update(
+                architecture=architecture,
+                start_layer=start_layer,
+                end_layer=end_layer,
+            )
+            tracker = _LayerRangeLoadTracker(
+                architecture=architecture,
+                start_layer=start_layer,
+                end_layer=end_layer,
+                layer_prefix="model.layers.",
+                selected_prefixes=[f"model.layers.{i}." for i in range(start_layer, end_layer)],
+                target_dtype=torch.float32,
+            )
+            tracker.loaded_layers.update(range(start_layer, end_layer))
+            return tracker
+
+        monkeypatch.setattr(mgr, "_load_qwen2_layer_range", fake_qwen2_loader)
+        tracker = mgr._load_gemma_layer_range(
+            "G:/models/gemma-4-12b", 4, 10,
+            has_embedding=False, has_lm_head=False,
+        )
+        assert forwarded["architecture"] == "gemma"
+        assert forwarded["start_layer"] == 4
+        assert tracker.architecture == "gemma"
+
+    def test_gemma_loader_tracker_prefix_matches_qwen2_layout(self):
+        """Gemma safetensors key 布局断言：model.layers./embed_tokens./norm./lm_head.。"""
+        tracker = _LayerRangeLoadTracker(
+            architecture="gemma",
+            start_layer=2,
+            end_layer=4,
+            layer_prefix="model.layers.",
+            selected_prefixes=[
+                "model.layers.2.", "model.layers.3.", "model.norm.",
+                "model.embed_tokens.", "lm_head.",
+            ],
+            target_dtype=torch.float32,
+        )
+        assert tracker.is_selected("model.layers.2.self_attn.q_proj.weight")
+        assert tracker.is_selected("model.layers.3.mlp.gate_proj.weight")
+        assert tracker.is_selected("model.norm.weight")
+        assert tracker.is_selected("model.embed_tokens.weight")
+        assert tracker.is_selected("lm_head.weight")
+        assert not tracker.is_selected("model.layers.1.self_attn.q_proj.weight")
+        assert not tracker.is_selected("model.layers.4.mlp.down_proj.weight")
