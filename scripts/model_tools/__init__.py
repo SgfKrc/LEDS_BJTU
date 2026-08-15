@@ -42,6 +42,7 @@ __all__ = [
     "run_ollama_gemma4_12b_preflight",
     "run_qwen3_sidecar_probe",
     "run_qwen3_multimodal_processor_probe",
+    "run_qwen3_multimodal_vision_tower_probe",
     "run_qwen3_pipeline_smoke",
     "run_qwen3_pipeline_chain_smoke",
     "build_hidden_handoff",

@@ -520,3 +520,14 @@
 
 1. 在隔离 sidecar 内加载视觉塔真实权重（mmproj 或视觉塔 safetensors），与 MM1.14 合成占位对照（真实特征 shape/dtype/token vs 合成投影），覆盖加载门、资源准入与对照一致性。
 2. 保持文本段零加载、CPU 合成先行、`weight_materialized` 如实登记；跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.62 `PT-PIPE-MM1.15` 视觉塔真实权重接入与合成/真实对照（开发门 Completed，2026-08-15）
+
+- `qwen3_multimodal_vision_tower_probe`（controller + 隔离 worker）：sidecar 内**只加载视觉塔真实权重**（`Qwen3VLVisionModel`，从 safetensors 分片 filter `model.visual.` 前缀，315 键 strict 加载）——**文本权重零加载**（`text_weights_loaded=false`）；合成图经真实 `Qwen2VLImageProcessorFast` 预处理 → 视觉塔 forward → **真实特征** `[1, 64, 2560]`（float32，merger 投影到文本 hidden 2560）。
+- **合成/真实对照**：`tokens_match=true`（64 tokens 与 MM1.14 合成占位一致）、`hidden_matches_text_config=true`（特征维度 == 文本段 hidden，visual_to_text 边界正确）；视觉塔权重已加载如实登记（`weight_materialized=true`——与合成链 `false` 区分），`full_model_materialized=false`。
+- 资源门：可用 RAM < 4GB skip；加载后释放（del/gc）。定向 `34 passed`（MM1.7-1.14 全量 + MM1.15 真实加载/对照）；跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.63 下一票：`PT-PIPE-MM1.16` 视觉特征接入文本段合成解码（CPU 混合链）
+
+1. 把 MM1.15 的真实视觉特征接入文本段合成解码：视觉特征 → 文本段 hidden 占位 → 合成 decode（含 visual token 位置对齐），覆盖特征与文本段输入一致性；真实图像语义仍不宣称。
+2. 保持文本段权重零加载、CPU 合成、`weight_materialized` 如实登记；跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。

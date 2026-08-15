@@ -1011,3 +1011,44 @@ def test_synthetic_visual_chain_text_only_skips_vision():
     assert result["visual_path"] == "skipped"
     assert result["vision_tower_active"] is False
     assert result["weight_materialized"] is False
+
+
+# ================================================================
+# MM1.15：视觉塔真实权重接入与合成/真实对照
+# ================================================================
+
+@pytest.mark.real_model
+def test_real_vision_tower_weights_load_and_forward():
+    """真实视觉塔权重加载 + 合成图前向 + 与合成占位对照。"""
+    sidecar = ROOT / ".venv-qwen3-sidecar" / "Scripts" / "python.exe"
+    if not sidecar.is_file():
+        pytest.skip("MM1.15 requires the isolated Qwen3 pipeline sidecar")
+    import psutil
+    if psutil.virtual_memory().available < 4 * 2**30:
+        pytest.skip("MM1.15 资源门：可用 RAM < 4GB")
+    from scripts.model_tools.qwen3_multimodal_vision_tower_probe import (
+        run_qwen3_multimodal_vision_tower_probe,
+    )
+    report = run_qwen3_multimodal_vision_tower_probe(
+        model=ROOT / "models" / "qwen3-vl-4b-instruct",
+        timeout_seconds=300,
+    )
+    assert report["status"] == "vision_tower_weights_loaded"
+    assert report["gate_passed"] is True
+    response = report["response"]
+    # 视觉塔真实信息
+    assert response["vision_tower"]["class_name"] == "Qwen3VLVisionModel"
+    assert response["vision_tower"]["depth"] == 24
+    assert response["vision_tower"]["hidden_size"] == 1024
+    assert response["vision_tower"]["loaded_weights"] > 0
+    # 真实特征与合成占位对照：merger 投影到文本 hidden（2560）
+    assert response["real_feature"]["shape"][-1] == 2560
+    assert response["consistency"]["hidden_matches_text_config"] is True
+    assert response["consistency"]["tokens_match"] is True
+    # 边界：视觉塔权重已加载（如实登记），文本零加载
+    assert response["weight_materialized"] is True
+    assert response["text_weights_loaded"] is False
+    assert response["full_model_materialized"] is False
+    encoded = json.dumps(report, ensure_ascii=True).lower()
+    assert "pixel_values\"" not in encoded
+    assert str(ROOT).lower() not in encoded
