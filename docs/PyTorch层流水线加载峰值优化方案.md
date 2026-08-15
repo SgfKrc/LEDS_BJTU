@@ -50,7 +50,7 @@
 - 在 `load_layer_range` 的 `else` 分支错误消息中补充指引：新架构接入须按本方案 §4.2 模板实现。
 
 ### 4.2 新架构接入模板（P1，未来架构必用）
-**状态：Shared contract ready / architecture adapters pending。** 通用 key 守卫、字节统计、层集合断言和观测字段已经落地；Gemma 4/Qwen3 等具体 prefix、模型骨架与量化适配仍必须随各自架构票实现，不能把“通用守卫完成”登记成架构已支持。
+**状态：Gemma 4 adapter Completed（2026-08-16）；Qwen3 无需此 adapter。** 通用 key 守卫、字节统计、层集合断言和观测字段已经落地；**Gemma 4 的层前缀/骨架适配已实现**（`_load_gemma_layer_range` 复用共享加载器，key 布局 `model.layers./model.embed_tokens./model.norm./lm_head.` 与 Qwen2 一致，tracker 身份 `gemma`，定向测试 4 passed）；**Qwen3 系走 PT-PIPE 独立 filtered assignment/sidecar 物化路径**（`qwen3_pipeline_adapter` + C3 manifest），不经过 `load_layer_range`，因此不在本模板范围内。其余新架构仍必须按本模板实现，不能把“通用守卫完成”登记成架构已支持。
 
 1. 解析 config 的 `num_hidden_layers`，校验与 assignment 一致（现有逻辑复用）；
 2. 确定层 key 前缀（`model.layers.` / `transformer.h.` / `model.h.`——按架构）；
