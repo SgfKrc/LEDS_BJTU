@@ -531,3 +531,14 @@
 
 1. 把 MM1.15 的真实视觉特征接入文本段合成解码：视觉特征 → 文本段 hidden 占位 → 合成 decode（含 visual token 位置对齐），覆盖特征与文本段输入一致性；真实图像语义仍不宣称。
 2. 保持文本段权重零加载、CPU 合成、`weight_materialized` 如实登记；跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.64 `PT-PIPE-MM1.16` 视觉特征接入文本段合成解码（开发门 Completed，2026-08-15）
+
+- `run_mm1_synthetic_text_decode`：MM1.15 真实视觉特征接入文本段合成解码——**序列布局** = 视觉 token 区（`[0:visual_tokens]`）+ 文本 token 区（`[visual_tokens: +prompt_tokens]`），**visual token 位置与特征 token 数对齐**；合成 decode（文本段零权重，`text_weights_loaded=false`，不宣称真实语义）。
+- fail-closed：特征 hidden 与文本段 hidden 不符（`qwen3_mm1_hidden_mismatch`）、视觉+文本超序列预算（`qwen3_mm1_sequence_overflow`）、维度越界；`weight_materialized=false`（文本段），视觉塔 `weight_materialized` 由特征如实携带。
+- 定向 `36 passed`（MM1.7-1.15 全量 + MM1.16 对齐/不匹配/超预算）；真实图像语义仍不宣称，跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.65 下一票：`PT-PIPE-MM1.17` CPU 混合链端到端合成回归（视觉塔真实 + 文本合成）
+
+1. 串联 MM1.15+MM1.16 与 MM1.14 合成链：真实视觉特征 → 文本段合成解码，作为 CPU 混合端到端回归（视觉塔真实权重、文本段零权重、视觉/文本 token 对齐）。
+2. 保持 `weight_materialized` 如实登记（视觉塔 true/文本 false）、CPU 合成；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。

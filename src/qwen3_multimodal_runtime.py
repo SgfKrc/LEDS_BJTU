@@ -659,6 +659,91 @@ def _synthetic_ledger(
     )
 
 
+def run_mm1_synthetic_text_decode(
+    *,
+    vision_feature: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    prompt_tokens: int = 4,
+    batch_size: int = 1,
+    sequence_length: int = 64,
+    text_chain_id: str = "a" * 64,
+    generation: int = 2,
+) -> dict[str, Any]:
+    """MM1.16：真实视觉特征接入文本段合成解码（CPU 混合链）。
+
+    文本段零权重（合成解码）：序列布局 = 视觉 token 区 + 文本 token 区，
+    visual token 位置与特征 token 数对齐；合成 decode 不宣称真实语义。
+    """
+    safe_manifest = validate_mm1_model_manifest(manifest)
+    if vision_feature.get("feature_kind") != "qwen3_visual_feature_placeholder":
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_feature_invalid",
+            "synthetic text decode requires a visual feature summary",
+        )
+    tensor = vision_feature.get("tensor") or {}
+    feature_shape = tensor.get("shape")
+    if not isinstance(feature_shape, (list, tuple)) or len(feature_shape) != 3:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_feature_shape_invalid",
+            "visual feature shape must be [batch, tokens, hidden]",
+        )
+    visual_tokens = int(feature_shape[1])
+    hidden_dim = int(feature_shape[2])
+    try:
+        prompt_tokens = int(prompt_tokens)
+        batch_size = int(batch_size)
+        sequence_length = int(sequence_length)
+    except (TypeError, ValueError):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_decode_dims_invalid",
+            "decode dimensions are invalid",
+        )
+    if (
+        not 1 <= prompt_tokens <= 8192
+        or not 1 <= batch_size <= 64
+        or not 1 <= sequence_length <= 65536
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_decode_dims_invalid",
+            "decode dimensions are outside the MM1 contract limits",
+        )
+    text_hidden = int(safe_manifest["text"]["hidden_size"])
+    if hidden_dim != text_hidden:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_hidden_mismatch",
+            "visual feature hidden must match the text segment hidden",
+        )
+    # visual token 位置对齐：视觉区 [0:visual_tokens] + 文本区
+    layout = {
+        "visual_span": [0, visual_tokens],
+        "text_span": [visual_tokens, visual_tokens + prompt_tokens],
+        "total_sequence": visual_tokens + prompt_tokens,
+        "batch_size": batch_size,
+    }
+    if layout["total_sequence"] > sequence_length:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sequence_overflow",
+            "visual + text tokens exceed the sequence budget",
+        )
+    return {
+        "schema_version": 1,
+        "decode_kind": "qwen3_synthetic_text_decode",
+        "model_id": safe_manifest["model_id"],
+        "text_chain_id": text_chain_id,
+        "generation": generation,
+        "input": {
+            "visual_tokens": visual_tokens,
+            "prompt_tokens": prompt_tokens,
+            "hidden_size": hidden_dim,
+            "layout": layout,
+        },
+        "synthetic": True,
+        "text_weights_loaded": False,
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
@@ -667,4 +752,5 @@ __all__ = [
     "run_mm1_visual_placeholder_execution",
     "bind_mm1_visual_feature_handoff",
     "run_mm1_synthetic_visual_chain",
+    "run_mm1_synthetic_text_decode",
 ]

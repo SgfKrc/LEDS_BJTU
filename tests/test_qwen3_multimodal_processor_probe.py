@@ -1052,3 +1052,72 @@ def test_real_vision_tower_weights_load_and_forward():
     encoded = json.dumps(report, ensure_ascii=True).lower()
     assert "pixel_values\"" not in encoded
     assert str(ROOT).lower() not in encoded
+
+
+# ================================================================
+# MM1.16：视觉特征接入文本段合成解码（CPU 混合链）
+# ================================================================
+
+def _real_vision_feature():
+    """构造 MM1.15 口径的真实视觉特征摘要（[1, tokens, text_hidden]）。"""
+    return {
+        "feature_kind": "qwen3_visual_feature_placeholder",
+        "model_id": "qwen3-vl-4b-instruct",
+        "media_reference_sha256": "b" * 64,
+        "tensor": {"shape": [1, 64, 2560], "dtype": "float32", "device": "cpu"},
+        "synthetic": False,
+        "weight_materialized": True,
+        "full_model_materialized": False,
+    }
+
+
+def test_synthetic_text_decode_aligns_visual_tokens():
+    """视觉特征接入文本段合成解码：visual token 位置对齐 + 文本零权重。"""
+    from qwen3_multimodal_runtime import run_mm1_synthetic_text_decode
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    result = run_mm1_synthetic_text_decode(
+        vision_feature=_real_vision_feature(),
+        manifest=manifest,
+        prompt_tokens=4,
+        sequence_length=128,
+    )
+    assert result["decode_kind"] == "qwen3_synthetic_text_decode"
+    layout = result["input"]["layout"]
+    # 视觉区 [0:64] + 文本区 [64:68]
+    assert layout["visual_span"] == [0, 64]
+    assert layout["text_span"] == [64, 68]
+    assert layout["total_sequence"] == 68
+    assert result["input"]["visual_tokens"] == 64
+    assert result["synthetic"] is True
+    assert result["text_weights_loaded"] is False
+    assert result["weight_materialized"] is False
+
+
+def test_synthetic_text_decode_fails_closed_on_mismatch():
+    """hidden 与文本段不符 / 序列超预算 → fail-closed。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_synthetic_text_decode,
+    )
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    # hidden 不匹配（特征 128 vs 文本 2560）
+    bad_feature = dict(_real_vision_feature())
+    bad_feature["tensor"] = {"shape": [1, 64, 128], "dtype": "float32", "device": "cpu"}
+    try:
+        run_mm1_synthetic_text_decode(
+            vision_feature=bad_feature, manifest=manifest, sequence_length=128,
+        )
+    except Qwen3MultimodalRuntimeError as exc:
+        assert exc.reason_code == "qwen3_mm1_hidden_mismatch"
+    else:
+        raise AssertionError("hidden 不匹配应拒绝")
+    # 序列超预算（visual 64 + prompt 4096 > 128）
+    try:
+        run_mm1_synthetic_text_decode(
+            vision_feature=_real_vision_feature(),
+            manifest=manifest, prompt_tokens=4096, sequence_length=128,
+        )
+    except Qwen3MultimodalRuntimeError as exc:
+        assert exc.reason_code == "qwen3_mm1_sequence_overflow"
+    else:
+        raise AssertionError("序列超预算应拒绝")
