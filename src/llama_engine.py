@@ -30,10 +30,13 @@ llama-cpp-python 通过 GGUF 元数据中的 tokenizer.chat_template
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 import sys
 import time
 from ctypes import byref
+from pathlib import Path
 from typing import Optional, Dict, Any, Iterator, List
 
 logger = logging.getLogger(__name__)
@@ -126,6 +129,8 @@ class LlamaCppEngine:
         """
         from config import MAX_SEQ_LEN
 
+        if self.is_loaded or self._mtmd_context is not None:
+            self.unload()
         self._model_path = model_path
 
         # 自动检测量化类型（从文件名提取）
@@ -225,6 +230,7 @@ class LlamaCppEngine:
         vram_free_bytes: int,
         *,
         kv_reserve_bytes: int = 512 * 1024**2,
+        projector_reserve_bytes: int = 0,
         safety_margin: float = 1.15,
     ) -> int:
         """G4.5 部分 offload 层数估算（8GB 显存预算门）。
@@ -233,11 +239,70 @@ class LlamaCppEngine:
         KV > 可用 ~7.4GB），必须部分 offload：按每层权重字节数计算可容纳层数，
         预留 KV 与安全余量（§5.7 决策：不承诺全量 offload）。
         """
-        per_layer = max(1, gguf_size_bytes // max(1, total_layers))
-        budget = int(vram_free_bytes * safety_margin - kv_reserve_bytes)
+        if total_layers <= 0 or gguf_size_bytes < 0 or vram_free_bytes < 0:
+            raise ValueError("GPU layer budget inputs must be non-negative")
+        if kv_reserve_bytes < 0 or projector_reserve_bytes < 0 or safety_margin <= 0:
+            raise ValueError("GPU layer budget reserves are invalid")
+        per_layer = max(1, gguf_size_bytes // total_layers)
+        # safety_margin is headroom: required bytes * margin must fit in free VRAM.
+        budget = int(
+            vram_free_bytes / safety_margin
+            - kv_reserve_bytes
+            - projector_reserve_bytes
+        )
         if budget <= 0:
             return 0
         return max(0, min(total_layers, budget // per_layer))
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _verify_gemma4_native_assets(
+        cls,
+        lock_path: Path,
+        gguf_path: Path,
+        mmproj_path: Path,
+    ) -> None:
+        """Verify the exact frozen Gemma pair before any model initialization."""
+        try:
+            record = json.loads(lock_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("gemma4-native lock file is invalid") from exc
+        if record.get("schema_version") != 1 or not isinstance(record.get("artifacts"), dict):
+            raise RuntimeError("gemma4-native lock schema is invalid")
+        artifacts = record["artifacts"]
+        for key, path in (("main_gguf", gguf_path), ("mmproj", mmproj_path)):
+            expected = artifacts.get(key)
+            if not isinstance(expected, dict):
+                raise RuntimeError(f"gemma4-native lock is missing {key}")
+            filename = expected.get("filename")
+            digest = expected.get("sha256")
+            size_bytes = expected.get("size_bytes")
+            if (
+                not isinstance(filename, str)
+                or path.name != filename
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest.lower())
+                or isinstance(size_bytes, bool)
+                or not isinstance(size_bytes, int)
+                or size_bytes < 1
+            ):
+                raise RuntimeError(f"gemma4-native lock entry {key} is invalid")
+            try:
+                actual_size = path.stat().st_size
+            except OSError as exc:
+                raise FileNotFoundError(f"gemma4-native artifact is unavailable: {key}") from exc
+            if actual_size != size_bytes:
+                raise RuntimeError(f"gemma4-native {key} size does not match the lock")
+            if cls._sha256_file(path) != digest.lower():
+                raise RuntimeError(f"gemma4-native {key} SHA-256 does not match the lock")
 
     def load_gemma4_native(
         self,
@@ -255,18 +320,50 @@ class LlamaCppEngine:
         - gpu_layers=-1 时按显存预算自动估算（部分 offload）；
         - 显存不足（低于 require_gpu_layers 对应预算）时 fail-closed。
         """
-        from pathlib import Path as _Path
-        lock = _Path(__file__).resolve().parents[1] / "models" / "gemma4-native" / "gemma4-native.lock.json"
+        if isinstance(gpu_layers, bool) or not isinstance(gpu_layers, int):
+            raise ValueError("gpu_layers must be an integer")
+        if gpu_layers < -1 or gpu_layers > 36:
+            raise ValueError("gpu_layers must be -1 or in the range 0..36")
+        if isinstance(require_gpu_layers, bool) or not isinstance(require_gpu_layers, int):
+            raise ValueError("require_gpu_layers must be an integer")
+        if require_gpu_layers < 0 or require_gpu_layers > 36:
+            raise ValueError("require_gpu_layers must be in the range 0..36")
+        if isinstance(n_ctx, bool) or not isinstance(n_ctx, int) or n_ctx < 1:
+            raise ValueError("n_ctx must be a positive integer")
+        if not isinstance(mtmd_use_gpu, bool):
+            raise ValueError("mtmd_use_gpu must be boolean")
+
+        if getattr(sys, "frozen", False):
+            asset_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        else:
+            asset_root = Path(__file__).resolve().parents[1]
+        lock = asset_root / "models" / "gemma4-native" / "gemma4-native.lock.json"
         if not lock.is_file():
             raise RuntimeError("gemma4-native 工件未冻结：先运行 gemma4_native_freeze.py --hash")
-        import json as _json
-        record = _json.loads(lock.read_text(encoding="utf-8"))
-        artifacts = record.get("artifacts", {})
+        try:
+            record = json.loads(lock.read_text(encoding="utf-8"))
+            artifacts = record["artifacts"]
+            main_record = artifacts["main_gguf"]
+            mmproj_record = artifacts["mmproj"]
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise RuntimeError("gemma4-native lock file is invalid") from exc
+        if (
+            not isinstance(record, dict)
+            or record.get("schema_version") != 1
+            or not isinstance(artifacts, dict)
+            or not isinstance(main_record, dict)
+            or not isinstance(mmproj_record, dict)
+            or not isinstance(main_record.get("filename"), str)
+            or not isinstance(mmproj_record.get("filename"), str)
+        ):
+            raise RuntimeError("gemma4-native lock schema is invalid")
         if gguf_path is None:
-            gguf_path = str(lock.parent / artifacts["main_gguf"]["filename"])
+            gguf_path = str(lock.parent / main_record["filename"])
         if mmproj_path is None:
-            mmproj_path = str(lock.parent / artifacts["mmproj"]["filename"])
-        if not os.path.isfile(gguf_path) or not os.path.isfile(mmproj_path):
+            mmproj_path = str(lock.parent / mmproj_record["filename"])
+        gguf_file = Path(gguf_path).expanduser().absolute().resolve(strict=False)
+        mmproj_file = Path(mmproj_path).expanduser().absolute().resolve(strict=False)
+        if not gguf_file.is_file() or not mmproj_file.is_file():
             raise FileNotFoundError("gemma4-native 工件缺失：检查 models/gemma4-native/ 与冻结记录")
 
         load_kwargs: Dict[str, Any] = {}
@@ -279,7 +376,10 @@ class LlamaCppEngine:
                     "无法查询显存（nvidia-smi 不可用）：请显式传 gpu_layers 或使用 CPU",
                 )
             auto = self.estimate_gpu_layers(
-                36, os.path.getsize(gguf_path), free,
+                36,
+                gguf_file.stat().st_size,
+                free,
+                projector_reserve_bytes=(mmproj_file.stat().st_size if mtmd_use_gpu else 0),
             )
             load_kwargs["n_gpu_layers"] = auto
             logger.info(
@@ -291,10 +391,11 @@ class LlamaCppEngine:
                 f"显存预算不足：需要 ≥{require_gpu_layers} 层 offload，"
                 f"实际 {load_kwargs.get('n_gpu_layers', 0)}（fail-closed）"
             )
+        self._verify_gemma4_native_assets(lock, gguf_file, mmproj_file)
         self.load_model(
-            model_path=gguf_path,
+            model_path=str(gguf_file),
             n_ctx=n_ctx,
-            mmproj_path=mmproj_path,
+            mmproj_path=str(mmproj_file),
             mtmd_use_gpu=mtmd_use_gpu,
             **load_kwargs,
         )
@@ -444,8 +545,18 @@ class LlamaCppEngine:
             raise RuntimeError("native MTMD vision capability is not registered")
         if not image_path or not os.path.isfile(image_path):
             raise FileNotFoundError("image file does not exist")
-        if max_tokens < 1:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
             raise ValueError("max_tokens must be positive")
+        if isinstance(max_answer_tokens, bool) or not isinstance(max_answer_tokens, int) or max_answer_tokens < 0:
+            raise ValueError("max_answer_tokens must be non-negative")
+        if isinstance(think_budget, bool) or not isinstance(think_budget, int) or think_budget < 0:
+            raise ValueError("think_budget must be non-negative")
+        if reasoning_channel_token_id is not None and (
+            isinstance(reasoning_channel_token_id, bool)
+            or not isinstance(reasoning_channel_token_id, int)
+            or reasoning_channel_token_id < 0
+        ):
+            raise ValueError("reasoning_channel_token_id must be a non-negative integer or None")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a non-empty string")
 
@@ -519,8 +630,8 @@ class LlamaCppEngine:
             if hasattr(self._model, "n_tokens"):
                 self._model.n_tokens = 0
             n_past = llama_cpp.llama_pos(0)
-            n_batch = int(kwargs.pop("n_batch", 64))
-            if n_batch < 1:
+            n_batch = kwargs.pop("n_batch", 64)
+            if isinstance(n_batch, bool) or not isinstance(n_batch, int) or n_batch < 1:
                 raise ValueError("n_batch must be positive")
 
             @mtmd.mtmd_helper_post_decode_callback

@@ -822,6 +822,105 @@ def test_reserved_worker_forward_failure_does_not_restore_full_model(monkeypatch
     assert ensure_calls == []
 
 
+def test_local_native_image_chat_uses_mtmd_and_removes_temp_file(monkeypatch):
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    observed = {}
+    persisted = []
+
+    class NativeManager:
+        _engine_type = "llama_cpp"
+        is_loaded = True
+
+        def native_vision_available(self):
+            return True
+
+        def chat_image(self, **kwargs):
+            observed.update(kwargs)
+            observed["exists_during_call"] = os.path.isfile(kwargs["image_path"])
+            with open(kwargs["image_path"], "rb") as handle:
+                observed["bytes"] = handle.read()
+            return {
+                "content": "一张测试图片",
+                "usage": {"completion_tokens": 4, "total_tokens": 12},
+                "tokens_per_second": 8.0,
+                "native_mtmd": True,
+            }
+
+    req = api_server.ChatRequest(
+        message="描述图片",
+        image_data_urls=[image],
+        routing_preference="local_only",
+        max_new_tokens=32,
+    )
+    monkeypatch.setattr(api_server, "model_manager", NativeManager())
+    monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
+    monkeypatch.setattr(api_server, "active_session_id", None)
+    monkeypatch.setattr(api_server, "_generate_followups_llama", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        api_server,
+        "_persist_conversation_turn",
+        lambda session_id, user, assistant, metrics: persisted.append(
+            (session_id, user, assistant, metrics)
+        ),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "conversation_stats",
+        {
+            "total_prompt_tokens": 0,
+            "total_generated_tokens": 0,
+            "total_time_seconds": 0.0,
+            "rounds": 0,
+        },
+    )
+
+    result = api_server._execute_chat_full(req)
+
+    assert result["content"] == "一张测试图片"
+    assert result["metrics"]["native_mtmd"] is True
+    assert result["metrics"]["execution_mode"] == "local_llama_cpp_mtmd"
+    assert observed["exists_during_call"] is True
+    assert observed["bytes"].startswith(b"\x89PNG\r\n\x1a\n")
+    assert not os.path.exists(observed["image_path"])
+    assert persisted[0][1:3] == ("描述图片", "一张测试图片")
+    assert image not in repr(persisted)
+
+
+def test_local_native_image_chat_rejects_multi_image_fallback(monkeypatch):
+    image = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    class NativeManager:
+        _engine_type = "llama_cpp"
+        is_loaded = True
+
+        def native_vision_available(self):
+            return True
+
+    req = api_server.ChatRequest(
+        message="鎻忚堪鍥剧墖",
+        image_data_urls=[image, image],
+        allow_external=True,
+        prefer_external=True,
+    )
+    monkeypatch.setattr(api_server, "model_manager", NativeManager())
+    monkeypatch.setattr(
+        api_server,
+        "_external_route_decision",
+        lambda _req: types.SimpleNamespace(use_external=False, reason="disabled"),
+    )
+
+    with pytest.raises(api_server.HTTPException, match="不能静默丢弃"):
+        api_server._execute_chat_full(req)
+
+
 # ================================================================
 # /api/models 端点测试
 # ================================================================

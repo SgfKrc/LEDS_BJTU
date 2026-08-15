@@ -1222,6 +1222,7 @@ def test_real_vision_feature_feeds_hybrid_chain():
 # MM1.18：真实视觉语义 smoke 与跨节点 hidden handoff 前置
 # ================================================================
 
+@pytest.mark.skip(reason="MM1.18 full-model semantic smoke is explicit opt-in only")
 @pytest.mark.real_model
 def test_real_vision_semantics_and_handoff():
     """首次文本权重加载：固定测试图真实语义 + 真实特征 handoff 绑定。"""
@@ -1286,3 +1287,24 @@ def test_real_vision_semantics_and_handoff():
     assert handoff["artifact"]["status"] == "committed"
     assert handoff["artifact"]["sha256"] == feature["media_reference_sha256"]
     assert handoff["artifact"]["size_bytes"] > 0
+
+
+def test_real_vision_semantics_requires_explicit_full_model_opt_in():
+    """MM1.18 must not silently materialize a full model on an 8GB node."""
+    from scripts.model_tools.qwen3_multimodal_vision_text_smoke_worker import execute_request
+
+    report = execute_request({
+        "schema_version": 1,
+        "tool": "qwen3_multimodal_vision_text_smoke",
+        "operation": "qwen3_vision_text_real_semantics",
+        "read_only": True,
+        "network_access": "disabled",
+        "model_path": "not-used",
+        "image_path": "not-used",
+        "text_chain_id": "a" * 64,
+        "generation": 4,
+        "allow_full_model_materialization": False,
+    })
+    assert report["status"] == "resource_rejected"
+    assert report["errors"][0]["code"] == "full_model_materialization_disabled"
+    assert "response" not in report

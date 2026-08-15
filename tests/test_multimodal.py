@@ -1,9 +1,11 @@
 import pytest
 from pydantic import ValidationError
+from pathlib import Path
 
 from src.inference_service.protocol import ChatRequest
 from src.multimodal import (
     build_openai_user_content,
+    materialize_image_data_url,
     normalize_openai_message_content,
     validate_image_data_urls,
 )
@@ -38,9 +40,15 @@ def test_image_validation_rejects_remote_unsupported_or_spoofed_data(value):
         validate_image_data_urls([value])
 
 
-def test_chat_images_require_explicit_external_route():
+def test_chat_images_require_explicit_external_or_local_route():
     with pytest.raises(ValidationError):
         ChatRequest(message="看图", image_data_urls=[PNG_DATA_URL])
+    local = ChatRequest(
+        message="看图",
+        image_data_urls=[PNG_DATA_URL],
+        routing_preference="local_only",
+    )
+    assert local.streaming_mode == "full"
     with pytest.raises(ValidationError):
         ChatRequest(
             message="看图",
@@ -56,6 +64,22 @@ def test_chat_images_require_explicit_external_route():
             allow_external=True,
             prefer_external=True,
             execution_mode="task_graph",
+        )
+
+
+def test_local_chat_image_requires_one_full_response_image():
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            message="看图",
+            image_data_urls=[PNG_DATA_URL, PNG_DATA_URL],
+            routing_preference="local_only",
+        )
+    with pytest.raises(ValidationError):
+        ChatRequest(
+            message="看图",
+            image_data_urls=[PNG_DATA_URL],
+            routing_preference="local_only",
+            streaming_mode="interactive",
         )
 
 
@@ -77,3 +101,14 @@ def test_structured_content_rejects_unvalidated_remote_image():
                 "image_url": {"url": "https://example.test/private.png"},
             }
         ])
+
+
+def test_materialized_image_is_removed_after_use():
+    materialized = None
+    with materialize_image_data_url(PNG_DATA_URL) as path:
+        materialized = Path(path)
+        assert materialized.is_file()
+        assert materialized.suffix == ".png"
+        assert materialized.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert materialized is not None
+    assert not materialized.exists()

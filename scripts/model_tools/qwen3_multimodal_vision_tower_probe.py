@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -65,16 +65,31 @@ def run_qwen3_multimodal_vision_tower_probe(
     try:
         proc = subprocess.run(
             [str(sidecar), str(worker)],
-            input=__import__("json").dumps(request, separators=(",", ":")),
+            input=json.dumps(request, separators=(",", ":")),
             capture_output=True, text=True, encoding="utf-8",
             timeout=float(timeout_seconds), cwd=str(ROOT),
         )
     except Exception:
         return _request_error("worker_failed", "vision tower worker did not return")
     try:
-        report = __import__("json").loads(proc.stdout.strip().splitlines()[-1])
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
     except Exception:
         return _request_error("worker_output_invalid", "vision tower worker output is invalid")
+    if not isinstance(report, dict) or report.get("tool") != TOOL or report.get("schema_version") != SCHEMA_VERSION:
+        return _request_error("worker_report_invalid", "vision tower worker report is invalid")
+    encoded = json.dumps(report, ensure_ascii=True, separators=(",", ":")).lower()
+    for path_value in (str(model_path), str(ROOT)):
+        if path_value.lower() in encoded:
+            return _request_error("worker_report_sensitive", "vision tower worker report contains a path")
+    if report.get("status") == "vision_tower_weights_loaded":
+        response = report.get("response")
+        if (
+            not isinstance(response, dict)
+            or response.get("weight_materialized") is not True
+            or response.get("text_weights_loaded") is not False
+            or response.get("full_model_materialized") is not False
+        ):
+            return _request_error("worker_report_inconsistent", "vision tower worker report is inconsistent")
     return report
 
 

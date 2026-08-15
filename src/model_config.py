@@ -33,6 +33,16 @@ def _get_app_root() -> str:
 _APP_ROOT = _get_app_root()
 
 
+def _get_bundled_asset_root() -> str:
+    """Return PyInstaller's data root while preserving user-model paths."""
+    if getattr(sys, "frozen", False):
+        return str(getattr(sys, "_MEIPASS", _APP_ROOT))
+    return _APP_ROOT
+
+
+_BUNDLED_ASSET_ROOT = _get_bundled_asset_root()
+
+
 def resolve_model_path(path: str) -> str:
     """Return an absolute path for a model file or directory."""
     if not path:
@@ -194,6 +204,20 @@ BUILTIN_MODELS: list[ModelConfig] = [
         quant_types=["fp16", "int8", "int4"],
         description="R1 蒸馏推理模型，基于 Qwen2.5 Dense 架构。INT4 建议 24GB+ VRAM 或分布式验证，需手动下载 Safetensors。",
         location="external",
+    ),
+    ModelConfig(
+        model_id="gemma4-native",
+        name="Gemma 4 12B Native (GGUF + MTMD)",
+        model_type="gguf",
+        model_path="",
+        gguf_path=os.path.join(_BUNDLED_ASSET_ROOT, "models", "gemma4-native", "gemma-4-12B-it-Q4_K_M.gguf"),
+        recommended_vram_gb=7.5,
+        max_context=4096,
+        is_experimental=True,
+        huggingface_id="bartowski/gemma-4-12B-it-GGUF",
+        quant_types=["Q4_K_M"],
+        description="受管 HF bartowski GGUF + mmproj，原生 llama.cpp MTMD 图像理解；需先通过冻结记录校验。",
+        location="bundled",
     ),
 ]
 

@@ -146,7 +146,7 @@ class ChatRequest(BaseModel):
     image_data_urls: List[str] = Field(
         default_factory=list,
         max_length=4,
-        description="PNG/JPEG/WebP base64 data URL；仅显式 external_api 路由可用",
+        description="PNG/JPEG/WebP base64 data URL；external_api 最多四张，本地 MTMD 仅一张",
     )
     session_id: Optional[str] = Field(default=None, description="会话 ID")
     max_new_tokens: int = Field(default=1024, ge=1, le=4096)
@@ -210,12 +210,18 @@ class ChatRequest(BaseModel):
         self.image_data_urls = validate_image_data_urls(self.image_data_urls)
         if not self.image_data_urls:
             return self
-        if not self.allow_external or not self.prefer_external:
-            raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
-        if self.routing_preference == "local_only":
-            raise ValueError("图像请求不能使用 local_only 路由")
         if self.execution_mode != "auto":
             raise ValueError("图像请求暂不支持 task_graph 执行模式")
+        if self.routing_preference == "local_only":
+            if len(self.image_data_urls) != 1:
+                raise ValueError("本地 MTMD 图像请求仅支持一张图片")
+            if self.streaming_mode != "full":
+                raise ValueError("本地 MTMD 图像请求仅支持 full 响应模式")
+            if self.allow_external or self.prefer_external:
+                raise ValueError("local_only 图像请求不能同时授权外部路由")
+            return self
+        if not self.allow_external or not self.prefer_external:
+            raise ValueError("图像请求必须显式设置 allow_external 和 prefer_external")
         return self
 
 

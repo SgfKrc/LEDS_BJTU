@@ -3,6 +3,8 @@ import sys
 import threading
 import ctypes
 import types
+import hashlib
+import json
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -294,8 +296,10 @@ def test_estimate_gpu_layers_budget_gate():
     layers = LlamaCppEngine.estimate_gpu_layers(
         36, 7_662_533_088, int(7.4 * 2**30),
     )
-    # 每层 ~0.2GB；预算 = 7.4*1.15 - 0.5 ≈ 8.0GB → ~40 层 → 封顶 36
-    assert layers == 36
+    # Safety headroom reduces the usable budget; it must never create VRAM.
+    assert 0 < layers < 36
+    per_layer = 7_662_533_088 // 36
+    assert (layers * per_layer + 512 * 2**20) * 1.15 <= int(7.4 * 2**30)
     # 显存紧张（4GB，与 SD 并驻留场景）：显著少于全量
     low = LlamaCppEngine.estimate_gpu_layers(
         36, 7_662_533_088, int(4 * 2**30),
@@ -318,3 +322,41 @@ def test_load_gemma4_native_fails_closed_on_vram_shortage(monkeypatch):
         assert "显存预算不足" in str(exc)
     else:
         raise AssertionError("显存不足时应 fail-closed")
+
+
+def test_load_gemma4_native_rejects_invalid_gpu_layer_request():
+    engine = LlamaCppEngine()
+    try:
+        engine.load_gemma4_native(gpu_layers=-2)
+    except ValueError as exc:
+        assert "gpu_layers" in str(exc)
+    else:
+        raise AssertionError("invalid gpu_layers should be rejected")
+
+
+def test_gemma4_native_asset_lock_rejects_tampering(tmp_path):
+    model = tmp_path / "model.gguf"
+    mmproj = tmp_path / "mmproj.gguf"
+    model.write_bytes(b"model")
+    mmproj.write_bytes(b"mmproj")
+    lock = tmp_path / "lock.json"
+
+    def entry(path):
+        return {
+            "filename": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    lock.write_text(json.dumps({
+        "schema_version": 1,
+        "artifacts": {"main_gguf": entry(model), "mmproj": entry(mmproj)},
+    }), encoding="utf-8")
+    LlamaCppEngine._verify_gemma4_native_assets(lock, model, mmproj)
+    model.write_bytes(b"tampered")
+    try:
+        LlamaCppEngine._verify_gemma4_native_assets(lock, model, mmproj)
+    except RuntimeError as exc:
+        assert "does not match" in str(exc)
+    else:
+        raise AssertionError("tampered Gemma asset should be rejected")

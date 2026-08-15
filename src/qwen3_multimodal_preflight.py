@@ -23,6 +23,8 @@ from qwen3_multimodal_contract import (
 MM1_PREFLIGHT_MAX_BYTES = 64 * 1024
 MM1_PROCESSOR_JSON_MAX_BYTES = 2 * 1024 * 1024
 MM1_MAX_MEDIA_PIXELS = 1_000_000_000
+MM1_MAX_LEDGER_BYTES = 2**63 - 1
+MM1_MAX_COMPONENTS = 64
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -84,7 +86,9 @@ def _exact(value: Any, fields: set[str], field: str) -> dict[str, Any]:
 
 
 def _safe_id(value: Any, field: str) -> str:
-    result = str(value or "")
+    if not isinstance(value, str):
+        raise Qwen3MultimodalPreflightError(f"{field} is invalid")
+    result = value
     if _SAFE_ID.fullmatch(result) is None:
         raise Qwen3MultimodalPreflightError(f"{field} is invalid")
     return result
@@ -635,20 +639,32 @@ def build_mm1_visual_input_contract(
     超过 node_capacity 则 admitted=false（fail-closed，视觉塔不执行）。
     契约不含路径、像素值或权重。
     """
+    if not isinstance(media_tensor_reference, Mapping):
+        raise Qwen3MultimodalPreflightError("MM1.9 media tensor reference is invalid")
+    try:
+        reference_model_id = media_tensor_reference["model_id"]
+        reference_components = media_tensor_reference["component_ids"]
+    except KeyError as exc:
+        raise Qwen3MultimodalPreflightError("MM1.9 media tensor reference identity is missing") from exc
     reference = validate_mm1_media_tensor_reference(
         media_tensor_reference,
-        model_id=str(media_tensor_reference["model_id"]),
-        component_ids=list(media_tensor_reference["component_ids"]),
+        model_id=reference_model_id,
+        component_ids=reference_components,
     )
     capacity = reference["capacity"]
     total_bytes = int(capacity.get("output_bytes_estimate") or 0)
     total_tokens = int(capacity.get("total_media_tokens") or 0)
+    node_capacity = _int(
+        node_capacity_bytes, "MM1.9 node capacity",
+        minimum=1, maximum=MM1_MAX_LEDGER_BYTES,
+    )
+    if isinstance(safety_margin, bool):
+        raise Qwen3MultimodalPreflightError("MM1.9 safety margin is invalid")
     try:
-        node_capacity = int(node_capacity_bytes)
         margin = float(safety_margin)
-    except (TypeError, ValueError):
-        raise Qwen3MultimodalPreflightError("MM1.9 node capacity is invalid")
-    if node_capacity <= 0 or not 1.0 <= margin <= 10.0:
+    except (TypeError, ValueError) as exc:
+        raise Qwen3MultimodalPreflightError("MM1.9 safety margin is invalid") from exc
+    if not 1.0 <= margin <= 10.0:
         raise Qwen3MultimodalPreflightError("MM1.9 node capacity or margin is out of bounds")
     required_bytes = int(total_bytes * margin)
     admitted = required_bytes <= node_capacity
@@ -704,9 +720,49 @@ def validate_mm1_visual_input_contract(
         raise Qwen3MultimodalPreflightError("MM1 visual input contract identity is invalid")
     if contract["weight_materialized"] is not False or contract["full_model_materialized"] is not False:
         raise Qwen3MultimodalPreflightError("MM1 visual input contract must stay weight-free")
+    if not isinstance(contract["model_id"], str):
+        raise Qwen3MultimodalPreflightError("MM1 visual input contract model_id is invalid")
+    input_value = _exact(
+        contract["input"], {"total_media_tokens", "total_bytes_estimate", "grid"},
+        "MM1 visual input contract input",
+    )
+    input_value["total_media_tokens"] = _int(
+        input_value["total_media_tokens"], "MM1.9 input.total_media_tokens",
+        minimum=0, maximum=MM1_MAX_MEDIA_PIXELS,
+    )
+    input_value["total_bytes_estimate"] = _int(
+        input_value["total_bytes_estimate"], "MM1.9 input.total_bytes_estimate",
+        minimum=0, maximum=MM1_MAX_LEDGER_BYTES,
+    )
+    grid = _exact(input_value["grid"], {"image_shape", "video_shape"}, "MM1 visual input contract grid")
+    for name in ("image_shape", "video_shape"):
+        shape = grid[name]
+        if not isinstance(shape, list) or len(shape) not in {0, 2, 3, 4, 5}:
+            raise Qwen3MultimodalPreflightError(f"MM1.9 {name} is invalid")
+        for index, item in enumerate(shape):
+            _int(item, f"MM1.9 {name}[{index}]", minimum=1, maximum=MM1_MAX_MEDIA_PIXELS)
+    capacity = _exact(
+        contract["capacity"],
+        {"node_capacity_bytes", "required_bytes", "safety_margin", "admitted"},
+        "MM1 visual input contract capacity",
+    )
+    node_capacity = _int(capacity["node_capacity_bytes"], "MM1.9 node_capacity_bytes", minimum=1, maximum=MM1_MAX_LEDGER_BYTES)
+    required_bytes = _int(capacity["required_bytes"], "MM1.9 required_bytes", minimum=0, maximum=MM1_MAX_LEDGER_BYTES)
+    try:
+        margin = float(capacity["safety_margin"])
+    except (TypeError, ValueError) as exc:
+        raise Qwen3MultimodalPreflightError("MM1.9 safety_margin is invalid") from exc
+    if not 1.0 <= margin <= 10.0:
+        raise Qwen3MultimodalPreflightError("MM1.9 safety_margin is outside limits")
+    if not isinstance(capacity["admitted"], bool):
+        raise Qwen3MultimodalPreflightError("MM1.9 admitted flag is invalid")
+    expected_required = int(input_value["total_bytes_estimate"] * margin)
+    if required_bytes != expected_required:
+        raise Qwen3MultimodalPreflightError("MM1.9 required_bytes is inconsistent")
+    expected_admitted = required_bytes <= node_capacity
+    if capacity["admitted"] is not expected_admitted:
+        raise Qwen3MultimodalPreflightError("MM1.9 admitted flag is inconsistent")
     capacity = contract["capacity"]
-    if capacity["admitted"] is True and int(capacity["required_bytes"]) > int(capacity["node_capacity_bytes"]):
-        raise Qwen3MultimodalPreflightError("MM1 visual input contract admitted flag is inconsistent")
     if contract["contract_sha256"] != _digest(
         {key: val for key, val in contract.items() if key != "contract_sha256"},
         label="MM1 visual input contract",
@@ -730,13 +786,13 @@ def mm1_vision_tower_placement(
     决策对象只含布尔/字节/理由摘要，无路径/权重/像素。
     """
     safe_ledger = validate_mm1_resource_ledger(ledger)
-    has_media = bool(request_has_media)
-    try:
-        tower_bytes = int(vision_tower_bytes)
-    except (TypeError, ValueError):
-        raise Qwen3MultimodalPreflightError("MM1.11 vision tower bytes are invalid")
-    if tower_bytes < 0:
-        raise Qwen3MultimodalPreflightError("MM1.11 vision tower bytes must be non-negative")
+    if not isinstance(request_has_media, bool):
+        raise Qwen3MultimodalPreflightError("MM1.11 request_has_media must be boolean")
+    has_media = request_has_media
+    tower_bytes = _int(
+        vision_tower_bytes, "MM1.11 vision tower bytes",
+        minimum=0, maximum=MM1_MAX_LEDGER_BYTES,
+    )
 
     remaining = int(safe_ledger["capacity"]["remaining_bytes"])
     ledger_admitted = bool(safe_ledger["capacity"]["admitted"])
@@ -748,6 +804,8 @@ def mm1_vision_tower_placement(
         required = 0
     else:
         required = tower_bytes
+        if required <= 0:
+            raise Qwen3MultimodalPreflightError("MM1.11 media requests require positive vision tower bytes")
         admitted = bool(ledger_admitted and required <= remaining)
         active = admitted
         reason = (
@@ -798,16 +856,35 @@ def validate_mm1_vision_tower_placement(
         raise Qwen3MultimodalPreflightError("MM1 vision tower placement identity is invalid")
     if decision["weight_materialized"] is not False or decision["full_model_materialized"] is not False:
         raise Qwen3MultimodalPreflightError("MM1 vision tower placement must stay weight-free")
-    has_media = bool(decision["request_has_media"])
+    if not isinstance(decision["request_has_media"], bool) or not isinstance(decision["vision_tower_active"], bool):
+        raise Qwen3MultimodalPreflightError("MM1 vision tower placement boolean fields are invalid")
+    has_media = decision["request_has_media"]
+    capacity = _exact(
+        decision["capacity"],
+        {"vision_tower_bytes", "remaining_bytes", "admitted"},
+        "MM1 vision tower placement capacity",
+    )
+    required = _int(capacity["vision_tower_bytes"], "MM1.11 vision_tower_bytes", minimum=0, maximum=MM1_MAX_LEDGER_BYTES)
+    remaining = _int(capacity["remaining_bytes"], "MM1.11 remaining_bytes", minimum=0, maximum=MM1_MAX_LEDGER_BYTES)
+    if not isinstance(capacity["admitted"], bool):
+        raise Qwen3MultimodalPreflightError("MM1.11 placement admitted flag is invalid")
     if not has_media and decision["vision_tower_active"] is not False:
         # 纯文本守卫：无媒体请求绝不允许激活视觉塔
         raise Qwen3MultimodalPreflightError("MM1 vision tower must stay inactive for text-only requests")
-    if (
-        has_media
-        and decision["vision_tower_active"] is True
-        and int(decision["capacity"]["vision_tower_bytes"]) > int(decision["capacity"]["remaining_bytes"])
-    ):
+    expected_admitted = bool(
+        True if not has_media else (required <= remaining and safe_ledger["capacity"]["admitted"])
+    )
+    expected_active = bool(has_media and expected_admitted)
+    if capacity["admitted"] is not expected_admitted or decision["vision_tower_active"] is not expected_active:
         raise Qwen3MultimodalPreflightError("MM1 vision tower placement capacity is inconsistent")
+    if not has_media and required != 0:
+        raise Qwen3MultimodalPreflightError("MM1 text-only placement must reserve zero vision bytes")
+    expected_reason = (
+        "text_only_request_guard" if not has_media
+        else ("capacity_admitted" if expected_admitted else "vision_tower_capacity_insufficient")
+    )
+    if decision["reason"] != expected_reason:
+        raise Qwen3MultimodalPreflightError("MM1 vision tower placement reason is inconsistent")
     if decision["decision_sha256"] != _digest(
         {key: val for key, val in decision.items() if key != "decision_sha256"},
         label="MM1 vision tower placement",
@@ -829,12 +906,10 @@ def mm1_ledger_commit(
     类别摘要，不携带路径/权重/像素。
     """
     safe_ledger_id = _safe_id(ledger_id, "ledger_id")
-    try:
-        node_capacity = int(node_capacity_bytes)
-    except (TypeError, ValueError):
-        raise Qwen3MultimodalPreflightError("MM1.10 node capacity is invalid")
-    if node_capacity <= 0:
-        raise Qwen3MultimodalPreflightError("MM1.10 node capacity must be positive")
+    node_capacity = _int(
+        node_capacity_bytes, "MM1.10 node capacity", minimum=1,
+        maximum=MM1_MAX_LEDGER_BYTES,
+    )
     if not isinstance(entries, (list, tuple)):
         raise Qwen3MultimodalPreflightError("MM1.10 ledger entries must be a sequence")
 
@@ -843,21 +918,29 @@ def mm1_ledger_commit(
     for raw in entries:
         if not isinstance(raw, Mapping):
             raise Qwen3MultimodalPreflightError("MM1.10 ledger entry is invalid")
-        entry_id = _safe_id(raw.get("entry_id"), "entry_id")
-        kind = str(raw.get("kind") or "")
+        entry = _exact(raw, {"entry_id", "kind", "bytes"}, "MM1.10 ledger entry")
+        entry_id = _safe_id(entry["entry_id"], "entry_id")
+        kind = entry["kind"]
+        if not isinstance(kind, str):
+            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry kind is unsupported")
         if kind not in {"vision_tower_weights", "media_input", "text_segment"}:
             raise Qwen3MultimodalPreflightError("MM1.10 ledger entry kind is unsupported")
         try:
-            entry_bytes = int(raw.get("bytes") or 0)
-        except (TypeError, ValueError):
-            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry bytes are invalid")
-        if entry_bytes < 0:
-            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry bytes must be non-negative")
-        unique[entry_id] = {
+            entry_bytes = _int(
+                entry["bytes"], "MM1.10 ledger entry bytes", minimum=0,
+                maximum=MM1_MAX_LEDGER_BYTES,
+            )
+        except Qwen3MultimodalPreflightError:
+            raise
+        candidate = {
             "entry_id": entry_id,
             "kind": kind,
             "bytes": entry_bytes,
         }
+        previous = unique.get(entry_id)
+        if previous is not None and previous != candidate:
+            raise Qwen3MultimodalPreflightError("MM1.10 duplicate entry_id conflicts")
+        unique[entry_id] = candidate
 
     normalized = [unique[key] for key in sorted(unique)]
     total = sum(int(entry["bytes"]) for entry in normalized)
@@ -937,21 +1020,39 @@ def validate_mm1_resource_ledger(
         raise Qwen3MultimodalPreflightError("MM1 resource ledger version/kind is unsupported")
     if ledger["weight_materialized"] is not False or ledger["full_model_materialized"] is not False:
         raise Qwen3MultimodalPreflightError("MM1 resource ledger must stay weight-free")
+    if not isinstance(ledger["entries"], list):
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger entries are invalid")
     total = 0
     seen: set[str] = set()
-    for entry in ledger["entries"]:
-        entry_id = _safe_id(entry.get("entry_id"), "entry_id")
+    for entry_value in ledger["entries"]:
+        entry = _exact(entry_value, {"entry_id", "kind", "bytes"}, "MM1 resource ledger entry")
+        entry_id = _safe_id(entry["entry_id"], "entry_id")
         if entry_id in seen:
             raise Qwen3MultimodalPreflightError("MM1 resource ledger entry_id is duplicated")
         seen.add(entry_id)
-        kind = str(entry.get("kind") or "")
+        kind = entry["kind"]
         if kind not in {"vision_tower_weights", "media_input", "text_segment"}:
             raise Qwen3MultimodalPreflightError("MM1 resource ledger entry kind is unsupported")
-        total += int(entry.get("bytes") or 0)
-    capacity = ledger["capacity"]
-    if int(capacity["total_bytes"]) != total:
+        total += _int(
+            entry["bytes"], "MM1 resource ledger entry bytes", minimum=0,
+            maximum=MM1_MAX_LEDGER_BYTES,
+        )
+    capacity = _exact(
+        ledger["capacity"],
+        {"node_capacity_bytes", "total_bytes", "remaining_bytes", "admitted"},
+        "MM1 resource ledger capacity",
+    )
+    node_capacity = _int(capacity["node_capacity_bytes"], "MM1 ledger node_capacity_bytes", minimum=1, maximum=MM1_MAX_LEDGER_BYTES)
+    total_value = _int(capacity["total_bytes"], "MM1 ledger total_bytes", minimum=0, maximum=MM1_MAX_LEDGER_BYTES)
+    remaining_value = _int(capacity["remaining_bytes"], "MM1 ledger remaining_bytes", minimum=0, maximum=MM1_MAX_LEDGER_BYTES)
+    if not isinstance(capacity["admitted"], bool):
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger admitted flag is invalid")
+    if total_value != total:
         raise Qwen3MultimodalPreflightError("MM1 resource ledger total is inconsistent")
-    if capacity["admitted"] is True and int(capacity["total_bytes"]) > int(capacity["node_capacity_bytes"]):
+    expected_remaining = max(0, node_capacity - total)
+    if remaining_value != expected_remaining:
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger remaining bytes are inconsistent")
+    if capacity["admitted"] is not (total <= node_capacity):
         raise Qwen3MultimodalPreflightError("MM1 resource ledger admitted flag is inconsistent")
     if ledger["ledger_sha256"] != _digest(
         {key: val for key, val in ledger.items() if key != "ledger_sha256"},
@@ -982,27 +1083,34 @@ def build_mm1_media_tensor_reference(
     if not image.get("pixel_values_shape") and not image.get("token_count_estimate"):
         raise Qwen3MultimodalPreflightError("MM1.8 image media entry is empty")
     safe_model_id = _safe_id(model_id, "model_id")
-    safe_components = sorted(
-        str(component) for component in component_ids if str(component)
-    )
-    if not safe_components:
+    if not isinstance(component_ids, (list, tuple)):
+        raise Qwen3MultimodalPreflightError("MM1.8 component_ids are invalid")
+    safe_components = sorted(_safe_id(component, "component_ids") for component in component_ids)
+    if not safe_components or len(safe_components) > MM1_MAX_COMPONENTS or len(set(safe_components)) != len(safe_components):
         raise Qwen3MultimodalPreflightError("MM1.8 component_ids are required")
 
     def _tokens(value: Mapping[str, Any]) -> int:
         tokens = value.get("token_count_estimate")
-        try:
-            return int(tokens) if tokens is not None else 0
-        except (TypeError, ValueError):
-            return 0
+        return _int(tokens if tokens is not None else 0, "MM1.8 token_count_estimate", minimum=0)
 
     def _shape(value: Mapping[str, Any]) -> list[int]:
         shape = value.get("pixel_values_shape")
         if not isinstance(shape, (list, tuple)):
             return []
-        return [int(item) for item in shape]
+        if len(shape) not in {0, 2, 3, 4, 5}:
+            raise Qwen3MultimodalPreflightError("MM1.8 media shape rank is invalid")
+        return [_int(item, "MM1.8 media shape", minimum=1) for item in shape]
 
+    image_shape = _shape(image)
+    video_shape = _shape(video)
+    if not image_shape:
+        raise Qwen3MultimodalPreflightError("MM1.8 image media entry is empty")
     image_tokens = _tokens(image)
     video_tokens = _tokens(video)
+    if video_shape and video_tokens == 0:
+        raise Qwen3MultimodalPreflightError("MM1.8 video shape requires positive token estimate")
+    if not video_shape and video_tokens != 0:
+        raise Qwen3MultimodalPreflightError("MM1.8 empty video shape requires zero token estimate")
     reference = {
         "schema_version": MM1_SCHEMA_VERSION,
         "reference_kind": "qwen3_visual_media_tensor_placeholder",
@@ -1010,20 +1118,22 @@ def build_mm1_media_tensor_reference(
         "component_ids": safe_components,
         "media": {
             "image": {
-                "pixel_values_shape": _shape(image),
+                "pixel_values_shape": image_shape,
                 "dtype": str(image.get("dtype") or ""),
                 "token_count_estimate": image_tokens,
             },
             "video": {
-                "pixel_values_shape": _shape(video),
+                "pixel_values_shape": video_shape,
                 "dtype": str(video.get("dtype") or ""),
                 "token_count_estimate": video_tokens,
             },
         },
         "capacity": {
             "total_media_tokens": image_tokens + video_tokens,
-            "output_bytes_estimate": max(
-                0, int(media_summary.get("output_bytes_estimate") or 0),
+            "output_bytes_estimate": _int(
+                media_summary.get("output_bytes_estimate") or 0,
+                "MM1.8 output_bytes_estimate", minimum=0,
+                maximum=MM1_MAX_LEDGER_BYTES,
             ),
         },
         "weight_materialized": False,
@@ -1049,27 +1159,51 @@ def validate_mm1_media_tensor_reference(
         },
         "MM1 media tensor reference",
     )
+    safe_model_id = _safe_id(model_id, "model_id")
+    if not isinstance(component_ids, (list, tuple)):
+        raise Qwen3MultimodalPreflightError("MM1 media tensor reference component_ids are invalid")
+    expected_components = sorted(_safe_id(item, "component_ids") for item in component_ids)
+    if len(expected_components) > MM1_MAX_COMPONENTS or len(set(expected_components)) != len(expected_components):
+        raise Qwen3MultimodalPreflightError("MM1 media tensor reference component_ids are invalid")
     if (
         reference["schema_version"] != MM1_SCHEMA_VERSION
         or reference["reference_kind"] != "qwen3_visual_media_tensor_placeholder"
-        or reference["model_id"] != model_id
-        or sorted(str(item) for item in reference["component_ids"])
-        != sorted(str(item) for item in component_ids)
+        or reference["model_id"] != safe_model_id
+        or not isinstance(reference["component_ids"], list)
+        or len(reference["component_ids"]) != len(expected_components)
+        or sorted(_safe_id(item, "component_ids") for item in reference["component_ids"])
+        != expected_components
     ):
         raise Qwen3MultimodalPreflightError("MM1 media tensor reference identity is invalid")
     if reference["weight_materialized"] is not False or reference["full_model_materialized"] is not False:
         raise Qwen3MultimodalPreflightError("MM1 media tensor reference must stay weight-free")
-    media = reference["media"]
+    media = _exact(reference["media"], {"image", "video"}, "MM1 media tensor reference media")
+    total_tokens = 0
     for kind in ("image", "video"):
-        entry = media.get(kind)
-        if not isinstance(entry, Mapping):
-            raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} is invalid")
-        if not isinstance(entry.get("pixel_values_shape"), list):
+        entry = _exact(
+            media[kind], {"pixel_values_shape", "dtype", "token_count_estimate"},
+            f"MM1 media tensor reference {kind}",
+        )
+        shape = entry["pixel_values_shape"]
+        if not isinstance(shape, list) or len(shape) not in {0, 2, 3, 4, 5}:
             raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} shape is invalid")
-        try:
-            int(entry.get("token_count_estimate") or 0)
-        except (TypeError, ValueError):
-            raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} tokens are invalid")
+        for index, item in enumerate(shape):
+            _int(item, f"MM1 media tensor reference {kind}.shape[{index}]", minimum=1)
+        if not isinstance(entry["dtype"], str) or len(entry["dtype"]) > 32:
+            raise Qwen3MultimodalPreflightError(f"MM1 media tensor reference {kind} dtype is invalid")
+        tokens = _int(entry["token_count_estimate"], f"MM1 media tensor reference {kind} tokens", minimum=0)
+        if kind == "image" and not shape:
+            raise Qwen3MultimodalPreflightError("MM1 media tensor reference image shape is empty")
+        if kind == "video" and ((shape and tokens == 0) or (not shape and tokens != 0)):
+            raise Qwen3MultimodalPreflightError("MM1 media tensor reference video tokens are inconsistent")
+        total_tokens += tokens
+    capacity = _exact(
+        reference["capacity"], {"total_media_tokens", "output_bytes_estimate"},
+        "MM1 media tensor reference capacity",
+    )
+    if _int(capacity["total_media_tokens"], "MM1 media tensor reference total tokens", minimum=0) != total_tokens:
+        raise Qwen3MultimodalPreflightError("MM1 media tensor reference total tokens are inconsistent")
+    _int(capacity["output_bytes_estimate"], "MM1 media tensor reference output bytes", minimum=0, maximum=MM1_MAX_LEDGER_BYTES)
     if reference["reference_sha256"] != _digest(
         {key: val for key, val in reference.items() if key != "reference_sha256"},
         label="MM1 media tensor reference",
@@ -1221,8 +1355,17 @@ __all__ = [
     "build_mm1_visual_worker_request",
     "build_mm1_visual_worker_response",
     "build_mm1_processor_smoke_response",
+    "build_mm1_media_tensor_reference",
+    "build_mm1_visual_input_contract",
     "inspect_mm1_processor_assets",
+    "mm1_ledger_commit",
+    "mm1_ledger_release",
+    "mm1_vision_tower_placement",
     "validate_mm1_processor_inspection",
+    "validate_mm1_media_tensor_reference",
+    "validate_mm1_resource_ledger",
+    "validate_mm1_visual_input_contract",
+    "validate_mm1_vision_tower_placement",
     "validate_mm1_visual_worker_request",
     "validate_mm1_visual_worker_response",
     "validate_mm1_processor_smoke_response",

@@ -475,7 +475,10 @@ class ModelManager:
         self._engine_type = resolved_engine
 
         if self._engine_type == "llama_cpp":
-            self._load_llama_cpp(resolved_path, profile)
+            if resolved_id == "gemma4-native":
+                self._load_gemma4_native(resolved_path, profile)
+            else:
+                self._load_llama_cpp(resolved_path, profile)
         else:
             self._load_pytorch(resolved_path, quant_type, profile)
 
@@ -1458,6 +1461,110 @@ class ModelManager:
 
         logger.info("✅ llama.cpp 引擎就绪 (CPU/集显 优化)")
 
+    def _load_gemma4_native(self, gguf_path: str, profile: dict = None) -> None:
+        """Load the frozen Gemma 4 GGUF/mmproj pair through native MTMD."""
+        from llama_engine import LlamaCppEngine
+
+        use_cuda = bool(torch.cuda.is_available())
+        self._prepare_gemma4_native_binding(use_cuda=use_cuda)
+        engine = LlamaCppEngine()
+        try:
+            engine.load_gemma4_native(
+                gguf_path=gguf_path,
+                n_ctx=768,
+                gpu_layers=-1 if use_cuda else 0,
+                require_gpu_layers=1 if use_cuda else 0,
+                mtmd_use_gpu=use_cuda,
+            )
+        except Exception:
+            try:
+                engine.unload()
+            except Exception:
+                pass
+            raise
+        self._llama_engine = engine
+        self._model_path = gguf_path
+        self.quant_type = "Q4_K_M"
+        logger.info("Gemma 4 native llama.cpp/MTMD 引擎就绪")
+
+    @staticmethod
+    def _prepare_gemma4_native_binding(*, use_cuda: bool) -> None:
+        """Select and validate the isolated native binding before first import."""
+        import importlib
+        from pathlib import Path
+        import sys
+
+        managed_root = None
+        if getattr(sys, "frozen", False):
+            site_packages = None
+            managed_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)).resolve(strict=False)
+        else:
+            configured = os.environ.get("QLH_GEMMA4_SITE_PACKAGES", "").strip()
+            if configured:
+                site_packages = Path(configured).expanduser().resolve(strict=False)
+            else:
+                venv = Path(__file__).resolve().parents[1] / ".venv-gemma4-native"
+                if os.name == "nt":
+                    site_packages = venv / "Lib" / "site-packages"
+                else:
+                    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+                    site_packages = venv / "lib" / version / "site-packages"
+
+            if site_packages.is_dir():
+                loaded = sys.modules.get("llama_cpp")
+                if loaded is not None:
+                    loaded_file = Path(getattr(loaded, "__file__", "")).resolve(strict=False)
+                    try:
+                        loaded_file.relative_to(site_packages)
+                        managed_binding_loaded = True
+                    except ValueError:
+                        managed_binding_loaded = False
+                    if not managed_binding_loaded:
+                        raise RuntimeError(
+                            "当前进程已导入另一套 llama_cpp；请重启后再加载 gemma4-native"
+                        )
+                else:
+                    site_path = os.fspath(site_packages)
+                    sys.path[:] = [entry for entry in sys.path if entry != site_path]
+                    sys.path.insert(0, site_path)
+                    importlib.invalidate_caches()
+
+        loaded = sys.modules.get("llama_cpp")
+        if loaded is not None and managed_root is not None:
+            loaded_file = Path(getattr(loaded, "__file__", "")).resolve(strict=False)
+            try:
+                loaded_file.relative_to(managed_root)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "当前进程已导入另一套 llama_cpp；请重启后再加载 gemma4-native"
+                ) from exc
+
+        try:
+            import llama_cpp
+            import llama_cpp.mtmd_cpp as mtmd
+        except ImportError as exc:
+            raise RuntimeError("gemma4-native requires the managed llama_cpp MTMD binding") from exc
+        if getattr(llama_cpp, "__version__", "") != "0.3.28":
+            raise RuntimeError("gemma4-native requires llama-cpp-python 0.3.28")
+        for symbol in ("mtmd_tokenize", "mtmd_helper_decode_image_chunk"):
+            if not callable(getattr(mtmd, symbol, None)):
+                raise RuntimeError(f"gemma4-native MTMD binding is missing {symbol}")
+        if use_cuda:
+            lib_dir = Path(llama_cpp.__file__).resolve().parent / "lib"
+            names = {path.name.lower() for path in lib_dir.iterdir()} if lib_dir.is_dir() else set()
+            if os.name == "nt":
+                required = {
+                    "ggml-cuda.dll", "cudart64_13.dll", "cublas64_13.dll",
+                    "cublaslt64_13.dll",
+                }
+                missing = sorted(required - names)
+            else:
+                missing = [] if any("ggml-cuda" in name for name in names) else ["ggml-cuda"]
+            if missing:
+                raise RuntimeError(
+                    "gemma4-native CUDA binding is incomplete: " + ", ".join(missing)
+                )
+
     def _load_pytorch(
         self,
         model_path: str = None,
@@ -1679,6 +1786,43 @@ class ModelManager:
 
         else:
             raise RuntimeError(f"未知引擎类型: {self._engine_type}")
+
+    @_serialized_model_access
+    def chat_image(
+        self,
+        image_path: str,
+        prompt: str,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+        top_p: float = 0.9,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Delegate one local image request to the native MTMD engine."""
+        if self._engine_type != "llama_cpp" or self._llama_engine is None:
+            raise RuntimeError("native image chat requires a loaded llama.cpp engine")
+        chat_image = getattr(self._llama_engine, "chat_image", None)
+        if not callable(chat_image):
+            raise RuntimeError("native MTMD image capability is unavailable")
+        return chat_image(
+            image_path=image_path,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            **kwargs,
+        )
+
+    def native_vision_available(self) -> bool:
+        """Return whether the active local engine has a registered MTMD vision path."""
+        if self._engine_type != "llama_cpp" or self._llama_engine is None:
+            return False
+        capabilities = getattr(self._llama_engine, "get_capabilities", None)
+        if not callable(capabilities):
+            return False
+        try:
+            return bool(capabilities().get("vision"))
+        except Exception:
+            return False
 
     def _pytorch_chat(
         self,
