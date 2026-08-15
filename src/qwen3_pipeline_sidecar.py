@@ -478,8 +478,9 @@ class Qwen3NetworkSidecarExecutor:
             )
         self.session = session
         self.artifact_root = root
-        self._outputs: dict[tuple[str, int, str], Path] = {}
+        self._outputs: dict[tuple[str, int, str, int], Path] = {}
         self._prefill_outputs: dict[tuple[str, int], Path] = {}
+        self._kv_state: dict[tuple[str, int], tuple[int, int]] = {}
 
     @staticmethod
     def _safe_token(value: Any) -> str:
@@ -500,16 +501,25 @@ class Qwen3NetworkSidecarExecutor:
             raise Qwen3SidecarError(
                 "qwen3_sidecar_contract_invalid", "network sidecar execution contract is invalid",
             )
-        key = (chain_id, segment_index, phase)
+        key = (chain_id, segment_index, phase, generation)
         output = self.artifact_root / (
             f"qwen3-consume-{transfer_id}-{phase}-{generation}-{segment_index}.pt"
         )
         kv_ref = None
         if phase == "decode":
             kv_ref = self._prefill_outputs.get((chain_id, segment_index))
-            if kv_ref is None or not kv_ref.is_file():
+            kv_state = self._kv_state.get((chain_id, segment_index))
+            if kv_ref is None or not kv_ref.is_file() or kv_state is None:
                 raise Qwen3SidecarError(
                     "qwen3_sidecar_kv_missing", "target sidecar has no prefill KV artifact",
+                )
+            if (
+                generation <= kv_state[0]
+                or int(request["sequence_length"]) <= kv_state[1]
+            ):
+                raise Qwen3SidecarError(
+                    "qwen3_sidecar_kv_stale",
+                    "target sidecar decode does not advance KV generation and sequence",
                 )
         report = self.session.execute(
             phase=phase,
@@ -527,15 +537,37 @@ class Qwen3NetworkSidecarExecutor:
             device=str(request["device"]),
         )
         self._outputs[key] = output
-        if phase == "prefill":
-            # KV 载体必须跨 prefill/decode 保留：段间转发完成后传输层会
-            # release 删除 output（传输副本），decode 仍需 prefill 的
-            # past_key_values——为 KV 单独保留副本（cleanup 时一并清理）。
+        if phase in {"prefill", "decode"}:
+            # Transfer outputs may be reclaimed by the coordinator. Rotate a
+            # node-local KV copy only after the new generation is durable.
             kv_copy = self.artifact_root / (
                 f"qwen3-kv-{chain_id}-{segment_index}-{generation}.pt"
             )
-            shutil.copy2(output, kv_copy)
-            self._prefill_outputs[(chain_id, segment_index)] = kv_copy
+            previous = self._prefill_outputs.get((chain_id, segment_index))
+            previous_state = self._kv_state.get((chain_id, segment_index))
+            try:
+                shutil.copy2(output, kv_copy)
+                if _file_evidence(kv_copy) != _file_evidence(output):
+                    raise Qwen3SidecarError(
+                        "qwen3_sidecar_kv_mismatch",
+                        "target sidecar KV copy changed during rotation",
+                    )
+                self._prefill_outputs[(chain_id, segment_index)] = kv_copy
+                self._kv_state[(chain_id, segment_index)] = (
+                    generation, int(request["sequence_length"]),
+                )
+                if previous is not None and previous != kv_copy:
+                    previous.unlink(missing_ok=True)
+            except Exception:
+                kv_copy.unlink(missing_ok=True)
+                if previous is None:
+                    self._prefill_outputs.pop((chain_id, segment_index), None)
+                    self._kv_state.pop((chain_id, segment_index), None)
+                else:
+                    self._prefill_outputs[(chain_id, segment_index)] = previous
+                    if previous_state is not None:
+                        self._kv_state[(chain_id, segment_index)] = previous_state
+                raise
         return {**dict(report), "output_path": str(output)}
 
     def cleanup(self, request: Mapping[str, Any], reason_code: str = "cleanup") -> None:
@@ -549,6 +581,7 @@ class Qwen3NetworkSidecarExecutor:
             if key[0] == chain_id and (segment_index < 0 or key[1] == segment_index):
                 path.unlink(missing_ok=True)
                 self._prefill_outputs.pop(key, None)
+                self._kv_state.pop(key, None)
         if self.session.phase in {"prepared", "committed"}:
             try:
                 self.session.abort()

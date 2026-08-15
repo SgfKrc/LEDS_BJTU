@@ -111,6 +111,7 @@ class Qwen3PipelineMultiSidecar:
         generation: int = 0,
         node_ids: Sequence[str] | None = None,
         handoff_transport: Any | None = None,
+        hidden_size: int | None = None,
     ) -> None:
         if not str(chain_id).strip():
             raise Qwen3MultiSidecarError("qwen3_multisidecar_chain_invalid", "chain_id is required")
@@ -153,6 +154,17 @@ class Qwen3PipelineMultiSidecar:
             raise Qwen3MultiSidecarError(
                 "qwen3_multisidecar_contract_invalid", "generation is invalid",
             )
+        if hidden_size is not None:
+            try:
+                hidden_size = int(hidden_size)
+            except (TypeError, ValueError) as exc:
+                raise Qwen3MultiSidecarError(
+                    "qwen3_multisidecar_contract_invalid", "hidden size is invalid",
+                ) from exc
+            if hidden_size <= 0:
+                raise Qwen3MultiSidecarError(
+                    "qwen3_multisidecar_contract_invalid", "hidden size is invalid",
+                )
         self.sessions = list(sessions)
         self.segments = normalized
         resolved_node_ids = list(node_ids or [f"segment-{index}" for index in range(len(normalized))])
@@ -169,6 +181,7 @@ class Qwen3PipelineMultiSidecar:
         self.chain_id = str(chain_id)
         self._chain_token = _chain_token(self.chain_id)
         self.generation = generation
+        self.hidden_size = hidden_size
         self.phase = "idle"
         self._created: list[Path] = []
         self._prefill_outputs: list[Path] = []
@@ -178,6 +191,9 @@ class Qwen3PipelineMultiSidecar:
         self._cleanup_complete = False
         self._handoff_transport = handoff_transport
         self._handoff_references: dict[str, list[dict[str, Any]]] = {}
+        self._decode_step_count = 0
+        self._kv_sequence_length: int | None = None
+        self._decode_history: list[dict[str, int]] = []
 
     @classmethod
     def from_contract(
@@ -237,6 +253,7 @@ class Qwen3PipelineMultiSidecar:
             generation=int(canonical["generation"]),
             node_ids=[segment["node_id"] for segment in canonical["segments"]],
             handoff_transport=handoff_transport,
+            hidden_size=int(canonical["hidden_size"]),
         )
         if handoff_transport is not None:
             try:
@@ -268,6 +285,9 @@ class Qwen3PipelineMultiSidecar:
             "handoff_reference_count": sum(
                 len(references) for references in self._handoff_references.values()
             ),
+            "decode_step_count": self._decode_step_count,
+            "kv_sequence_length": self._kv_sequence_length,
+            "decode_history": [dict(value) for value in self._decode_history],
             "last_report": dict(self._last_report),
         }
 
@@ -308,6 +328,9 @@ class Qwen3PipelineMultiSidecar:
         self._outputs_by_phase.clear()
         self._reports_by_phase.clear()
         self._handoff_references.clear()
+        self._decode_step_count = 0
+        self._kv_sequence_length = None
+        self._decode_history.clear()
         transport_cleanup = {"cleanup_complete": True, "cleanup_failures": 0}
         if self._handoff_transport is not None:
             try:
@@ -321,9 +344,12 @@ class Qwen3PipelineMultiSidecar:
         self._cleanup_complete = failed == 0
         return removed
 
-    def _artifact(self, phase: str, segment_index: int) -> Path:
+    def _artifact(
+        self, phase: str, segment_index: int, *, execution_generation: int | None = None,
+    ) -> Path:
+        generation = self.generation if execution_generation is None else int(execution_generation)
         path = self.artifact_root / (
-            f"qwen3-{self._chain_token}-{self.generation}-{phase}-"
+            f"qwen3-{self._chain_token}-{generation}-{phase}-"
             f"{segment_index}-{uuid4().hex}.pt"
         )
         self._created.append(path)
@@ -341,6 +367,8 @@ class Qwen3PipelineMultiSidecar:
         batch_size: int,
         sequence_length: int,
         has_next: bool,
+        hidden_size: int | None = None,
+        handoff_sequence_length: int | None = None,
     ) -> None:
         if not isinstance(report, dict) or report.get("status") != "executed" or report.get("gate_passed") is not True:
             raise Qwen3MultiSidecarError(
@@ -385,15 +413,26 @@ class Qwen3PipelineMultiSidecar:
                 raise Qwen3MultiSidecarError(
                     "qwen3_multisidecar_handoff_missing", "non-final segment returned no hidden handoff",
                 )
-            expected_shape_prefix = [batch_size, sequence_length]
+            expected_handoff_sequence = (
+                int(handoff_sequence_length)
+                if handoff_sequence_length is not None else int(sequence_length)
+            )
+            expected_shape_prefix = [batch_size, expected_handoff_sequence]
             if (
                 handoff.get("chain_id") != chain_id
                 or handoff.get("from_segment") != segment["segment_index"]
                 or handoff.get("to_segment") != segment["segment_index"] + 1
                 or handoff.get("shape", [])[:2] != expected_shape_prefix
-                or handoff.get("sequence_length") != sequence_length
+                or handoff.get("sequence_length") != expected_handoff_sequence
                 or _dtype_alias(handoff.get("dtype")) != _dtype_alias(segment["dtype"])
                 or _device_alias(handoff.get("device")) != _device_alias(segment["device"])
+                or (
+                    hidden_size is not None
+                    and (
+                        handoff.get("shape", [0, 0, 0])[2] != hidden_size
+                        or handoff.get("hidden_size") != hidden_size
+                    )
+                )
             ):
                 raise Qwen3MultiSidecarError(
                     "qwen3_multisidecar_handoff_mismatch", "hidden handoff does not match segment boundary",
@@ -443,12 +482,26 @@ class Qwen3PipelineMultiSidecar:
         sequence_length: int,
         generation: int,
         kv_refs: Sequence[Path | None] | None,
+        input_sequence_length: int | None = None,
     ) -> dict[str, Any]:
-        if self.phase not in {"committed", "prefilled"} or (phase == "prefill" and self.phase != "committed"):
+        if (
+            (phase == "prefill" and self.phase != "committed")
+            or (phase == "decode" and self.phase not in {"prefilled", "decoded"})
+        ):
             raise Qwen3MultiSidecarError("qwen3_multisidecar_phase_invalid", "chain is not ready for execution")
         if int(batch_size) <= 0 or int(sequence_length) <= 0 or int(generation) < 0:
             raise Qwen3MultiSidecarError("qwen3_multisidecar_contract_invalid", "execution dimensions are invalid")
-        if phase == "decode" and len(self._prefill_outputs) != len(self.sessions):
+        if input_sequence_length is None:
+            input_sequence_length = int(sequence_length)
+        if int(input_sequence_length) <= 0 or int(input_sequence_length) > int(sequence_length):
+            raise Qwen3MultiSidecarError(
+                "qwen3_multisidecar_contract_invalid", "handoff sequence length is invalid",
+            )
+        resolved_kv_refs = list(kv_refs or [])
+        if phase == "decode" and (
+            len(resolved_kv_refs) != len(self.sessions)
+            or any(path is None or not Path(path).is_file() for path in resolved_kv_refs)
+        ):
             raise Qwen3MultiSidecarError("qwen3_multisidecar_kv_missing", "decode has no per-segment prefill KV artifacts")
         current_input = Path(input_ref).expanduser().absolute().resolve(strict=False)
         reports: list[dict[str, Any]] = []
@@ -458,8 +511,10 @@ class Qwen3PipelineMultiSidecar:
             if self._handoff_transport is not None:
                 self._handoff_transport.begin_phase(phase, int(generation))
             for index, (session, segment) in enumerate(zip(self.sessions, self.segments)):
-                output = self._artifact(phase, index)
-                kv_ref = self._prefill_outputs[index] if phase == "decode" else None
+                output = self._artifact(
+                    phase, index, execution_generation=int(generation),
+                )
+                kv_ref = resolved_kv_refs[index] if phase == "decode" else None
                 report = session.execute(
                     phase=phase,
                     artifact_root=self.artifact_root,
@@ -484,6 +539,8 @@ class Qwen3PipelineMultiSidecar:
                     batch_size=int(batch_size),
                     sequence_length=int(sequence_length),
                     has_next=index < len(self.sessions) - 1,
+                    hidden_size=self.hidden_size,
+                    handoff_sequence_length=input_sequence_length,
                 )
                 if index < len(self.sessions) - 1:
                     handoff = report.get("hidden_handoff") or {}
@@ -580,6 +637,11 @@ class Qwen3PipelineMultiSidecar:
                 current_input = next_input
             if self._handoff_transport is not None:
                 self._handoff_transport.finish_phase(phase, int(generation))
+            if phase == "decode":
+                for previous in resolved_kv_refs:
+                    assert previous is not None
+                    if Path(previous) not in outputs:
+                        Path(previous).unlink(missing_ok=True)
         except Exception as exc:
             self._abort_all(f"{phase}_failed")
             if isinstance(exc, Qwen3MultiSidecarError):
@@ -587,8 +649,18 @@ class Qwen3PipelineMultiSidecar:
             raise Qwen3MultiSidecarError("qwen3_multisidecar_execution_failed", str(exc)) from exc
         if phase == "prefill":
             self._prefill_outputs = list(outputs)
+            self._kv_sequence_length = int(sequence_length)
             self.phase = "prefilled"
         elif phase == "decode":
+            self._prefill_outputs = list(outputs)
+            self._kv_sequence_length = int(sequence_length)
+            self._decode_step_count += 1
+            self._decode_history.append({
+                "step_index": self._decode_step_count,
+                "generation": int(generation),
+                "sequence_length": int(sequence_length),
+                "input_sequence_length": int(input_sequence_length),
+            })
             self.phase = "decoded"
         self._outputs_by_phase[phase] = list(outputs)
         self._reports_by_phase[phase] = list(reports)
@@ -621,11 +693,45 @@ class Qwen3PipelineMultiSidecar:
             kv_refs=None,
         )
 
-    def decode(self, *, input_ref: str | Path, batch_size: int, sequence_length: int) -> dict[str, Any]:
+    def decode(
+        self,
+        *,
+        input_ref: str | Path,
+        batch_size: int,
+        sequence_length: int,
+        input_sequence_length: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            requested_sequence = int(sequence_length)
+            requested_input = (
+                int(input_sequence_length) if input_sequence_length is not None else None
+            )
+        except (TypeError, ValueError) as exc:
+            self._abort_all("decode_sequence_invalid")
+            raise Qwen3MultiSidecarError(
+                "qwen3_multisidecar_contract_invalid", "decode dimensions are invalid",
+            ) from exc
+        previous_sequence = self._kv_sequence_length
+        if (
+            previous_sequence is None
+            or requested_sequence <= previous_sequence
+            or (
+                requested_input is not None
+                and requested_sequence != previous_sequence + requested_input
+            )
+            or (self.phase == "decoded" and requested_input is None)
+        ):
+            self._abort_all("decode_sequence_invalid")
+            raise Qwen3MultiSidecarError(
+                "qwen3_multisidecar_sequence_mismatch",
+                "decode sequence does not monotonically extend the current KV cache",
+            )
         return self._execute(
             phase="decode", input_ref=input_ref, batch_size=batch_size,
-            sequence_length=sequence_length, generation=self.generation + 1,
+            sequence_length=requested_sequence,
+            generation=self.generation + self._decode_step_count + 1,
             kv_refs=self._prefill_outputs,
+            input_sequence_length=requested_input,
         )
 
     def release(self) -> dict[str, Any]:

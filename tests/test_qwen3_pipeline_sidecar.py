@@ -275,6 +275,7 @@ def test_network_sidecar_executor_keeps_output_local_and_releases_it(tmp_path):
     artifact_root.mkdir()
     input_ref = artifact_root / "input.pt"
     input_ref.write_bytes(b"hidden-input")
+    kv_refs = []
 
     def runner(request, _timeout):
         phase = request["phase"]
@@ -290,6 +291,7 @@ def test_network_sidecar_executor_keeps_output_local_and_releases_it(tmp_path):
                 "gate_passed": True,
                 "cleanup_complete": phase in {"release", "abort"},
             }
+        kv_refs.append(Path(request["kv_ref"]) if request.get("kv_ref") else None)
         output = Path(request["output_ref"])
         output.write_bytes(b"hidden-output")
         size, digest = sidecar._file_evidence(output)
@@ -335,7 +337,65 @@ def test_network_sidecar_executor_keeps_output_local_and_releases_it(tmp_path):
         },
     )
     output_path = Path(internal["output_path"])
+    prefill_kv = executor._prefill_outputs[("c" * 64, 1)]
+    first_decode = executor(
+        input_ref,
+        {
+            "transfer_id": "qtx_" + "b" * 32,
+            "chain_id": "c" * 64,
+            "phase": "decode",
+            "generation": 3,
+            "segment_index": 1,
+            "sequence_length": 4,
+            "batch_size": 1,
+            "has_next_segment": False,
+            "dtype": "float32",
+            "device": "cpu",
+        },
+    )
+    first_decode_kv = executor._prefill_outputs[("c" * 64, 1)]
+    second_decode = executor(
+        input_ref,
+        {
+            "transfer_id": "qtx_" + "d" * 32,
+            "chain_id": "c" * 64,
+            "phase": "decode",
+            "generation": 4,
+            "segment_index": 1,
+            "sequence_length": 5,
+            "batch_size": 1,
+            "has_next_segment": False,
+            "dtype": "float32",
+            "device": "cpu",
+        },
+    )
+    current_kv = executor._prefill_outputs[("c" * 64, 1)]
     assert output_path.is_file()
+    assert Path(first_decode["output_path"]).is_file()
+    assert Path(second_decode["output_path"]).is_file()
     assert str(artifact_root) in str(output_path)
+    assert kv_refs == [None, prefill_kv, first_decode_kv]
+    assert not prefill_kv.exists()
+    assert not first_decode_kv.exists()
+    assert current_kv.is_file()
+    with pytest.raises(sidecar.Qwen3SidecarError) as stale:
+        executor(
+            input_ref,
+            {
+                "transfer_id": "qtx_" + "e" * 32,
+                "chain_id": "c" * 64,
+                "phase": "decode",
+                "generation": 4,
+                "segment_index": 1,
+                "sequence_length": 6,
+                "batch_size": 1,
+                "has_next_segment": False,
+                "dtype": "float32",
+                "device": "cpu",
+            },
+        )
+    assert stale.value.reason_code == "qwen3_sidecar_kv_stale"
+    assert executor._prefill_outputs[("c" * 64, 1)] == current_kv
     executor.cleanup({"chain_id": "c" * 64, "segment_index": 1}, "cancelled")
     assert not output_path.exists()
+    assert not current_kv.exists()
