@@ -8,6 +8,7 @@ import com.qlh.inference.status.MemoryStatus
 import com.qlh.inference.status.SystemStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -261,5 +262,68 @@ class MainViewModelLogicTest {
             "发送失败: bad gateway",
             formatMessageSendError(IllegalStateException("bad gateway")),
         )
+    }
+
+    // ---- 聊天/会话 UI 状态机（MainViewModelLogic 纯函数） ----
+
+    @Test
+    fun `select tab switches tab without touching other fields`() {
+        val base = MainUiState(currentTab = "chat", serverHost = "1.2.3.4")
+        val next = selectUiTab(base, "settings")
+        assertEquals("settings", next.currentTab)
+        assertEquals("1.2.3.4", next.serverHost)
+    }
+
+    @Test
+    fun `select session sets id title and jumps to chat tab`() {
+        val base = MainUiState(currentTab = "sessions", currentSessionId = 0)
+        val next = selectUiSession(base, sessionId = 7L, sessionTitle = "网络排查")
+        assertEquals(7L, next.currentSessionId)
+        assertEquals("网络排查", next.currentSessionTitle)
+        assertEquals("chat", next.currentTab)
+    }
+
+    @Test
+    fun `start submission marks loading clears error and records last message`() {
+        val base = MainUiState(isLoading = false, error = "旧错误")
+        val next = startMessageSubmission(base, "你好")
+        assertTrue(next.isLoading)
+        assertNull(next.error)
+        assertEquals("你好", next.lastSentMessage)
+    }
+
+    @Test
+    fun `complete submission stops loading and clears error`() {
+        val base = MainUiState(isLoading = true, error = "旧错误")
+        val next = completeMessageSubmission(base)
+        assertFalse(next.isLoading)
+        assertNull(next.error)
+        assertEquals("旧错误", base.error) // 纯函数不改原状态
+    }
+
+    @Test
+    fun `fail submission stops loading and records error`() {
+        val next = failMessageSubmission(MainUiState(isLoading = true), "后端 500")
+        assertFalse(next.isLoading)
+        assertEquals("后端 500", next.error)
+    }
+
+    @Test
+    fun `retry only starts when a last message exists`() {
+        // 无 lastSentMessage 时保持原状态（不进入加载）
+        val idle = MainUiState(isLoading = false, lastSentMessage = null)
+        assertSame(idle, startMessageRetry(idle))
+        // 有 lastSentMessage：进入加载并清错误（保留原文）
+        val next = startMessageRetry(MainUiState(isLoading = false, error = "旧错", lastSentMessage = "原文"))
+        assertTrue(next.isLoading)
+        assertNull(next.error)
+        assertEquals("原文", next.lastSentMessage)
+    }
+
+    @Test
+    fun `clear error nulls the error only`() {
+        val next = clearMessageError(MainUiState(error = "x", isLoading = true))
+        assertNull(next.error)
+        assertTrue(next.isLoading)
     }
 }
