@@ -285,7 +285,9 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 
 > G4.5 的 GPU 验收按**部分 offload + 互斥规则**执行，不承诺全量 offload。
 
-> **G4.4 过渡版 Completed（2026-08-15）**：Ollama 官方构建的 Q4_K_M + mmproj 已复制入受管目录 `models/gemma4-native/`（`gemma4-12b-ollama-q4_k_m.gguf` 7.38GB、`mmproj-ollama-bf16.gguf` 175MB），SHA-256 冻结于 `gemma4-native.lock.json`（`scripts/model_tools/gemma4_native_freeze.py --hash/--check`）；smoke 用受管工件通过（原生推理**运行时不再依赖 Ollama 服务或 blobs 路径**）。**独立来源未达成**：4 个 HF 独立工件（unsloth/bartowski Q4_K_M、ggml-org Q4_0/Q8_0，共 ~32GB 已下载留作 G4.6 对照）在原生 MTMD 管线全部退化（思考段空转/复读/非确定性分叉），仅 Ollama 自构建工件稳定；根因指向权重/训练差异（模板渲染输出相同、Q8_0 仍退化），待 **G4.6 Ollama 仓库调研**定论后替换独立工件（G4.4 最终态）。
+> **G4.4 最终态 Completed（2026-08-15）——独立来源达成**：工件切换为 HF 官方 **bartowski** `gemma-4-12B-it-Q4_K_M.gguf`（7.14GB）+ `mmproj-gemma-4-12B-it-bf16.gguf`（175MB，均 apache-2.0），SHA-256 冻结于 `gemma4-native.lock.json`（`--hash/--check` 全通过）；smoke 用独立工件 **3/3 稳定**（sd-001 → "Two red apples rest on a weathered wooden surface, with a rustic, textured background."，无思考段、无重复）。**机制**：G4.6 调研确认 Ollama 稳定 = llama.cpp b10434 的 **reasoning-budget sampler**（思考段超预算强制输出结束 tag）；47e1de77 已实现等效（`--think-budget 96`：超预算注入 `<channel|>`(101) + 头尾裁剪 `thought`/空行/101）。**Ollama blobs 依赖彻底移除**（受管目录仅 HF 工件）。Ollama 过渡工件已清理。
+
+> **G4.6 调研结论（2026-08-15，Ollama 仓库）**：Ollama 用 llama.cpp `b10434` + compat 补丁；`think=false` = 模板 kwargs `enable_thinking:false`（与本地渲染相同）；**稳定性来源 = `common/reasoning-budget.cpp` 采样器**（IDLE→COUNTING 匹配思考开始 tag→超预算 FORCING 强制输出结束 tag）——非 Ollama 工件特殊（HF 工件 + 等效预算机制同样稳定，已实证）。**借鉴项已落地**：思考预算强制（本票）；**后续借鉴候选**：`reasoning_format` 解析、`--reasoning off` 语义、compat 分词器补丁（SPM 拆 `<|thought|>` 等）。对照验收（吞吐/时延/语义三表）随 G4.5 GPU 部分执行。
 
 | 里程碑 | 内容 | 验收标准 | 依赖 |
 |---|---|---|---|
