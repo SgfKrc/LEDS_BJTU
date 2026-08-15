@@ -623,6 +623,98 @@ def validate_mm1_visual_worker_response(
     return response
 
 
+def build_mm1_visual_input_contract(
+    media_tensor_reference: Mapping[str, Any],
+    *,
+    node_capacity_bytes: int,
+    safety_margin: float = 1.2,
+) -> dict[str, Any]:
+    """MM1.9：以媒体张量参考为输入占位，构造视觉塔执行器的 path-free 输入契约。
+
+    grid/token/字节预算与节点容量比对：required = 字节估计 × margin，
+    超过 node_capacity 则 admitted=false（fail-closed，视觉塔不执行）。
+    契约不含路径、像素值或权重。
+    """
+    reference = validate_mm1_media_tensor_reference(
+        media_tensor_reference,
+        model_id=str(media_tensor_reference["model_id"]),
+        component_ids=list(media_tensor_reference["component_ids"]),
+    )
+    capacity = reference["capacity"]
+    total_bytes = int(capacity.get("output_bytes_estimate") or 0)
+    total_tokens = int(capacity.get("total_media_tokens") or 0)
+    try:
+        node_capacity = int(node_capacity_bytes)
+        margin = float(safety_margin)
+    except (TypeError, ValueError):
+        raise Qwen3MultimodalPreflightError("MM1.9 node capacity is invalid")
+    if node_capacity <= 0 or not 1.0 <= margin <= 10.0:
+        raise Qwen3MultimodalPreflightError("MM1.9 node capacity or margin is out of bounds")
+    required_bytes = int(total_bytes * margin)
+    admitted = required_bytes <= node_capacity
+    image_shape = list(reference["media"]["image"].get("pixel_values_shape") or [])
+    video_shape = list(reference["media"]["video"].get("pixel_values_shape") or [])
+    contract = {
+        "schema_version": MM1_SCHEMA_VERSION,
+        "contract_kind": "qwen3_visual_input_placeholder",
+        "model_id": reference["model_id"],
+        "media_reference_sha256": reference["reference_sha256"],
+        "input": {
+            "total_media_tokens": total_tokens,
+            "total_bytes_estimate": total_bytes,
+            "grid": {
+                "image_shape": image_shape,
+                "video_shape": video_shape,
+            },
+        },
+        "capacity": {
+            "node_capacity_bytes": node_capacity,
+            "required_bytes": required_bytes,
+            "safety_margin": margin,
+            "admitted": bool(admitted),
+        },
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    contract["contract_sha256"] = _digest(contract, label="MM1 visual input contract")
+    return contract
+
+
+def validate_mm1_visual_input_contract(
+    value: Mapping[str, Any],
+    *,
+    media_tensor_reference: Mapping[str, Any],
+) -> dict[str, Any]:
+    """只读校验视觉输入契约（身份/digest/预算不足即 admitted=false）。"""
+    contract = _exact(
+        value,
+        {
+            "schema_version", "contract_kind", "model_id",
+            "media_reference_sha256", "input", "capacity",
+            "weight_materialized", "full_model_materialized", "contract_sha256",
+        },
+        "MM1 visual input contract",
+    )
+    if (
+        contract["schema_version"] != MM1_SCHEMA_VERSION
+        or contract["contract_kind"] != "qwen3_visual_input_placeholder"
+        or contract["model_id"] != media_tensor_reference["model_id"]
+        or contract["media_reference_sha256"] != media_tensor_reference["reference_sha256"]
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 visual input contract identity is invalid")
+    if contract["weight_materialized"] is not False or contract["full_model_materialized"] is not False:
+        raise Qwen3MultimodalPreflightError("MM1 visual input contract must stay weight-free")
+    capacity = contract["capacity"]
+    if capacity["admitted"] is True and int(capacity["required_bytes"]) > int(capacity["node_capacity_bytes"]):
+        raise Qwen3MultimodalPreflightError("MM1 visual input contract admitted flag is inconsistent")
+    if contract["contract_sha256"] != _digest(
+        {key: val for key, val in contract.items() if key != "contract_sha256"},
+        label="MM1 visual input contract",
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 visual input contract digest is invalid")
+    return contract
+
+
 def build_mm1_media_tensor_reference(
     media_summary: Mapping[str, Any],
     *,
@@ -748,6 +840,7 @@ def build_mm1_processor_smoke_response(
     runtime: Mapping[str, Any],
     media_summary: Mapping[str, Any] | None = None,
     media_tensor_reference: Mapping[str, Any] | None = None,
+    visual_input_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a response after constructing AutoProcessor in the sidecar."""
     safe_request = validate_mm1_visual_worker_request(
@@ -778,6 +871,9 @@ def build_mm1_processor_smoke_response(
         "media_tensor_reference": (
             dict(media_tensor_reference) if media_tensor_reference else None
         ),
+        "visual_input_contract": (
+            dict(visual_input_contract) if visual_input_contract else None
+        ),
     }
     response["response_sha256"] = _digest(response, label="MM1 processor smoke response")
     return validate_mm1_processor_smoke_response(response, request=safe_request)
@@ -795,7 +891,7 @@ def validate_mm1_processor_smoke_response(
             "request_sha256", "manifest_sha256", "model_id", "node_id",
             "processor_constructed", "visual_worker_ready", "component_count",
             "runtime", "cleanup", "media_summary",
-            "media_tensor_reference", "response_sha256",
+            "media_tensor_reference", "visual_input_contract", "response_sha256",
         },
         "MM1 processor smoke response",
     )

@@ -454,3 +454,14 @@
 
 1. 把 `media_tensor_reference` 接到视觉塔执行器边界：以张量参考为输入占位构造 path-free 的视觉输入契约（grid/token/字节预算与节点容量比对），覆盖预算不足 fail-closed 与参考解耦回归。
 2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
+
+### 8.50 `PT-PIPE-MM1.9` 视觉塔执行器输入占位与容量预算接线（开发门 Completed，2026-08-15）
+
+- `build_mm1_visual_input_contract` 以媒体张量参考为输入占位构造 **path-free 视觉输入契约**（`qwen3_visual_input_placeholder`）：`input.total_media_tokens/total_bytes_estimate/grid`（image/video shape）+ `capacity`（节点容量、required = 字节估计 × margin、**admitted**）；required > node_capacity 时 **admitted=false（fail-closed，视觉塔不执行）**。
+- `validate_mm1_visual_input_contract`：身份（model_id/media_reference_sha256）、admitted 与容量一致性（不足却标 True → 拒绝）、digest 校验；worker 响应新增 `visual_input_contract`（`node_capacity_bytes` 经 controller 透传，缺省 None）。
+- 定向 `17 passed`（MM1.7/1.8 全量 + MM1.9 预算足/不足/篡改/真实模型接线）；未加载视觉塔或文本权重，真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.51 下一票：`PT-PIPE-MM1.10` 视觉塔组件容量规划与多模态资源账本
+
+1. 把 MM1.9 的视觉输入契约接入节点容量账本：视觉塔权重字节 + 媒体输入预算 + 文本段预算统一入账，覆盖组合超限 fail-closed 与账本幂等（重复入账不重复计费）。
+2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。

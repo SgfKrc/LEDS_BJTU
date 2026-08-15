@@ -127,6 +127,7 @@ def run_qwen3_multimodal_processor_probe(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     worker_runner: Callable[[dict[str, Any], float], dict[str, Any]] | None = None,
     media_smoke: Mapping[str, Any] | None = None,
+    node_capacity_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Construct AutoProcessor in the isolated sidecar after MM1.5 validation."""
     if model is None:
@@ -156,6 +157,9 @@ def run_qwen3_multimodal_processor_probe(
         "visual_request": safe_request,
         "controller_python": str(Path(sys.executable).absolute().resolve(strict=False)),
         "media_smoke": dict(media_smoke) if media_smoke else None,
+        "node_capacity_bytes": (
+            int(node_capacity_bytes) if node_capacity_bytes is not None else None
+        ),
     }
     try:
         report = (worker_runner or _run_worker)(request, float(timeout_seconds))
