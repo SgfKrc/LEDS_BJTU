@@ -76,6 +76,15 @@ try:
 except Exception as _e:
     print(f"[spec] WARNING: Failed to collect llama.cpp DLLs: {_e}")
 
+# G4.5 原生 gemma4 路径（打包代码交付，实机验证延后——Surface 修复后）：
+# 依赖 .venv-gemma4-native（llama-cpp-python 0.3.28 @ 47e1de77 + MTMD 补丁
+# 重编 wheel，含 MSYS2 运行时 libgcc/libstdc++/libwinpthread，PATH 需带
+# ucrt64/bin）与受管工件 models/gemma4-native/*.gguf（冻结记录
+# gemma4-native.lock.json）；运行时经 llama_engine.load_gemma4_native()
+# 读取（lock 相对路径）。产品图像路径默认仍走 Ollama external_api；
+# 原生路径作为自包含可选（G4.6 对照：热时延 17-18s vs Ollama 3.2s，
+# 差距主因 mmproj 图像编码 CPU——CUDA 版绑定重编为后续优化候选）。
+
 a = Analysis(
     ['launcher.py'],
     pathex=[_SRC_DIR, SPECPATH],
