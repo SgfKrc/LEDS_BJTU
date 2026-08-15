@@ -26,12 +26,19 @@ _ROOT_KEYS = {"schema_version", "rubric_id", "prompt_set", "entries"}
 _ENTRY_KEYS = {"prompt_id", "correctness", "format"}
 _CHECK_KINDS = {
     "normalized_contains",
+    "loose_contains",
     "json_object_fields",
     "python_dict_exact",
     "python_function",
     "numbered_list",
     "csv_header_rows",
     "paragraph_terms",
+}
+
+# P5 (2026-08-16): loose_contains 的中文数字表（只替换独立数字词，避免误伤文字）
+_CHINESE_DIGITS = {
+    "零": "0", "一": "1", "二": "2", "两": "2", "三": "3",
+    "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
 }
 
 
@@ -54,6 +61,12 @@ def _check_spec(raw: Any, label: str) -> dict[str, Any]:
     if kind not in _CHECK_KINDS:
         raise RubricError(f"{label} has an unsupported check kind")
     if kind == "normalized_contains":
+        _only_keys(raw, {"kind", "accepted"}, label)
+        accepted = raw.get("accepted")
+        if not isinstance(accepted, list) or not accepted or not all(isinstance(v, str) for v in accepted):
+            raise RubricError(f"{label}.accepted must be a non-empty string list")
+    elif kind == "loose_contains":
+        # P5：宽松匹配与 normalized_contains 同构（accepted 字符串列表）
         _only_keys(raw, {"kind", "accepted"}, label)
         accepted = raw.get("accepted")
         if not isinstance(accepted, list) or not accepted or not all(isinstance(v, str) for v in accepted):
@@ -146,6 +159,36 @@ def _normalise(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
+def _loose_normalise(text: str) -> str:
+    """P5 宽松归一化：在 ``_normalise`` 之上增强时间/中文数字表达。
+
+    - ``13时54分`` / ``13点54`` / ``13：54`` → ``13:54``
+    - ``X小时Y分钟`` → ``X:Y``
+    - 独立中文数字词（一/两/三…）→ 阿拉伯数字（只替换不被中文数字包围的词）
+    """
+    value = _normalise(text)
+    value = re.sub(r"(\d+)\s*(?:时|点)\s*(\d+)\s*分?", r"\1:\2", value)
+    value = re.sub(r"(\d+)\s*小时\s*(\d+)\s*分钟?", r"\1:\2", value)
+    for zh, arabic in _CHINESE_DIGITS.items():
+        value = re.sub(rf"(?<![零一两二三四五六七八九]){zh}(?![零一两二三四五六七八九])", arabic, value)
+    return value
+
+
+def _answer_candidates(text: str) -> list[str]:
+    """P5 答案候选提取。
+
+    优先答案标记：命中"答案是/因此/所以"等标记时只取标记后的尾部（更
+    干净、假阳性更低）；无标记时退化为全文 + 末行（覆盖推理文本场景）。
+    """
+    for marker in ("答案是", "答案：", "答案为", "答案:", "因此", "所以"):
+        if marker in text:
+            tail = text.split(marker, 1)[1]
+            tail = re.split(r"[。！？\n]", tail, 1)[0].strip()
+            return [tail] if tail else [text]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return [text] + ([lines[-1]] if lines else [])
+
+
 def _code(text: str) -> str:
     match = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
     return match.group(1).strip() if match else text.strip()
@@ -156,6 +199,15 @@ def _evaluate_check(check: Mapping[str, Any], output: str) -> bool:
     if kind == "normalized_contains":
         normalized = _normalise(output)
         return any(_normalise(value) in normalized for value in check["accepted"])
+    if kind == "loose_contains":
+        # P5：宽匹配——任一答案候选（全文/标记尾部/末行）经宽松归一化后
+        # 包含任一 accepted 值即通过；用于区分推理风格模型的客观题能力。
+        normalized_candidates = [_loose_normalise(candidate) for candidate in _answer_candidates(output)]
+        return any(
+            _loose_normalise(value) in candidate
+            for value in check["accepted"]
+            for candidate in normalized_candidates
+        )
     if kind == "json_object_fields":
         try:
             value = json.loads(_code(output))

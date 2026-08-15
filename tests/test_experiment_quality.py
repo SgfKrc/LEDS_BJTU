@@ -162,3 +162,47 @@ def test_record_schema_accepts_v1_evidence_and_pre_evidence_records(tmp_path):
     legacy = dict(record)
     legacy["quality"] = {"correct_rate": None, "format_rate": None}
     assert list(validator.iter_errors(legacy)) == []
+
+
+# ---- P5 loose_contains 判题口径（2026-08-16） ----
+
+def _loose_check(accepted, output):
+    from experiment_core.objective_rubric import _evaluate_check
+    return _evaluate_check({"kind": "loose_contains", "accepted": accepted}, output)
+
+
+def test_loose_contains_matches_time_expression_with_chinese_units():
+    # E4 人工复核场景：推理风格输出 "13时54分" 在 v1 normalized_contains 下
+    # 判错（不包含 "13:54"）；宽松归一化应命中。
+    assert _loose_check(["13:54", "13：54"], "火车 8:00 出发，约 13时54分 到达")
+    assert _loose_check(["13:54"], "13点54分")
+
+
+def test_loose_contains_matches_answer_marker_tail():
+    assert _loose_check(["160"], "先计算速度……因此答案是 160。")
+    assert _loose_check(["3"], "经过推导，答案：3")
+
+
+def test_loose_contains_matches_isolated_chinese_digits():
+    assert _loose_check(["3"], "所以结果是三")
+    assert _loose_check(["2"], "答案为两")
+
+
+def test_loose_contains_keeps_false_positive_floor():
+    # 无关文本与错误答案不应命中
+    assert not _loose_check(["13:54"], "火车晚点，未能在 8:00 出发")
+    assert not _loose_check(["160"], "答案是 16")
+    assert not _loose_check(["3"], "三个苹果放在桌上，答案是 4")
+
+
+def test_normalized_contains_unchanged_by_p5():
+    # v1 语义不回退："13时54分" 仍不包含 "13:54"
+    from experiment_core.objective_rubric import _evaluate_check
+    assert not _evaluate_check(
+        {"kind": "normalized_contains", "accepted": ["13:54"]},
+        "13时54分",
+    )
+    assert _evaluate_check(
+        {"kind": "normalized_contains", "accepted": ["13:54"]},
+        "答案 13:54",
+    )

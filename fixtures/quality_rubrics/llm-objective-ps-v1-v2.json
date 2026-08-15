@@ -1,0 +1,152 @@
+{
+ "schema_version": 1,
+ "rubric_id": "llm-objective-ps-v1-v2",
+ "prompt_set": {
+  "id": "ps-qwen3-nothink",
+  "sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9"
+ },
+ "entries": [
+  {
+   "prompt_id": "math-001",
+   "correctness": {
+    "kind": "loose_contains",
+    "accepted": [
+     "13:54",
+     "13：54"
+    ]
+   }
+  },
+  {
+   "prompt_id": "math-002",
+   "correctness": {
+    "kind": "loose_contains",
+    "accepted": [
+     "160"
+    ]
+   }
+  },
+  {
+   "prompt_id": "math-004",
+   "correctness": {
+    "kind": "loose_contains",
+    "accepted": [
+     "3"
+    ]
+   }
+  },
+  {
+   "prompt_id": "math-005",
+   "correctness": {
+    "kind": "loose_contains",
+    "accepted": [
+     "0.5",
+     "1/2",
+     "½"
+    ]
+   }
+  },
+  {
+   "prompt_id": "en-001",
+   "format": {
+    "kind": "paragraph_terms",
+    "required_terms": [
+     "TCP",
+     "UDP"
+    ]
+   }
+  },
+  {
+   "prompt_id": "code-001",
+   "format": {
+    "kind": "python_function",
+    "minimum_functions": 1
+   }
+  },
+  {
+   "prompt_id": "code-002",
+   "format": {
+    "kind": "python_function",
+    "minimum_functions": 1
+   }
+  },
+  {
+   "prompt_id": "code-003",
+   "format": {
+    "kind": "python_function",
+    "minimum_functions": 1
+   }
+  },
+  {
+   "prompt_id": "code-004",
+   "format": {
+    "kind": "python_function",
+    "minimum_functions": 1
+   }
+  },
+  {
+   "prompt_id": "code-005",
+   "format": {
+    "kind": "paragraph_terms",
+    "required_terms": [
+     "SELECT",
+     "ORDER BY"
+    ]
+   }
+  },
+  {
+   "prompt_id": "fmt-001",
+   "format": {
+    "kind": "json_object_fields",
+    "fields": {
+     "name": "string",
+     "age": "number",
+     "tags": "string_array"
+    }
+   }
+  },
+  {
+   "prompt_id": "fmt-002",
+   "format": {
+    "kind": "paragraph_terms",
+    "required_terms": [
+     "January",
+     "February",
+     "March",
+     "April",
+     "May",
+     "June"
+    ]
+   }
+  },
+  {
+   "prompt_id": "fmt-003",
+   "format": {
+    "kind": "python_dict_exact",
+    "expected": {
+     "a": 1,
+     "b": 2,
+     "c": 3
+    }
+   }
+  },
+  {
+   "prompt_id": "fmt-004",
+   "format": {
+    "kind": "numbered_list",
+    "items": 3
+   }
+  },
+  {
+   "prompt_id": "fmt-005",
+   "format": {
+    "kind": "csv_header_rows",
+    "header": [
+     "id",
+     "name",
+     "score"
+    ],
+    "data_rows": 2
+   }
+  }
+ ]
+}
