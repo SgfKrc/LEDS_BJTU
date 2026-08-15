@@ -27,6 +27,16 @@ def main() -> int:
         "--max-tokens", type=int, default=512,
         help="生成预算：思考段剥离（默认开）需要覆盖思考段+正文",
     )
+    ap.add_argument(
+        "--max-answer-tokens", type=int, default=48,
+        help="正文收集上限（tokens）：HF 独立工件可能重复循环，正文 1-2 句即止",
+    )
+    ap.add_argument(
+        "--think-budget", type=int, default=96,
+        help="思考段预算（tokens）：超预算后强制注入 <channel|>(101) 结束思考，"
+        "等效 llama.cpp b10434 reasoning-budget sampler（Ollama 稳定机制）；"
+        "0 = 禁用（保持思考段自然结束）",
+    )
     ap.add_argument("--trace-tokens", type=int, default=0,
                     help="打印生成 token 追踪（1=仅通道标记，2=全部，前 300 个）")
     ap.add_argument(
@@ -128,6 +138,8 @@ def main() -> int:
     # 屏蔽思考开始 token 无效（模型会改用文本形式思考）。剥离式有效：
     # 等思考段结束 token(101) 后收集正文，预算默认 512 覆盖思考段+正文。
     collecting = False
+    in_thinking = False
+    think_tokens = 0
     last = llama_cpp.llama_token_bos(model._ctx.ctx)
     n_past = int(n_past.value)  # chunk 循环结束的实际 KV 位置
     batch = LlamaBatch(n_tokens=1, embd=0, n_seq_max=1, verbose=False)
@@ -143,16 +155,45 @@ def main() -> int:
         llama_cpp.llama_sampler_free(smpl)
         if tok == llama_cpp.llama_token_eos(model._ctx.ctx):
             break
-        if tok == CHANNEL_START_TOKEN_ID:
-            # 思考段开始：丢弃此前内容（含 "thought" 字面），等待思考结束
+        if tok == CHANNEL_START_TOKEN_ID or (
+            not collecting and not in_thinking and not tokens and tok == 45518
+        ):
+            # 思考段开始：通道标记(100) 或 生成开头直接输出 "thought" 字面
+            # （HF 独立工件路径）——丢弃思考内容，等待思考结束
             collecting = False
+            in_thinking = True
+            think_tokens = 0
             continue
-        if tok == CHANNEL_END_TOKEN_ID:
-            # 思考段结束：开始收集正文
-            collecting = True
+        if tok == CHANNEL_END_TOKEN_ID and collecting and tokens:
+            # 正文已结束（模型以 101 开新段即循环）：停止
+            break
+        if in_thinking:
+            think_tokens += 1
+            if tok == CHANNEL_END_TOKEN_ID:
+                # 思考段自然结束：开始收集正文
+                in_thinking = False
+                collecting = True
+                continue
+            if args.think_budget > 0 and think_tokens > args.think_budget:
+                # 思考段超预算：等效 llama.cpp reasoning-budget FORCING——
+                # 注入思考结束 token(101)（不进模型采样），模型回到正文轨道
+                last = CHANNEL_END_TOKEN_ID
+                n_past += 0  # 101 将由下一轮 decode 处理
+                in_thinking = False
+                collecting = True
+                continue
+            # 思考内容：丢弃，继续生成
+            last = tok
             continue
         if collecting:
             tokens.append(tok)
+            # 正文结束检测：HF 独立工件正文可能以 </thought>（954+45518+
+            # 236813）收尾或直接重复循环——正文超限或检测到收尾序列即停止
+            if tokens[-3:] == [954, 45518, 236813]:
+                del tokens[-3:]
+                break
+            if len(tokens) >= args.max_answer_tokens:
+                break
         if args.trace_tokens and len(tokens) + (0 if collecting else 0) < 300:
             piece = model.detokenize([tok]).decode("utf-8", "replace")
             if not collecting and tok in (CHANNEL_START_TOKEN_ID, CHANNEL_END_TOKEN_ID):
@@ -166,6 +207,12 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    # 裁剪尾渣：思考段残余（thought 字面/空行）在 101 前可能被收集
+    while tokens and tokens[-1] in (106, 107, 45518):
+        tokens.pop()
+    # 裁剪头渣：注入/模型输出的开头 <channel|>(101) 与空行
+    while tokens and tokens[0] in (101, 106, 107):
+        tokens.pop(0)
     text_out = model.detokenize(tokens).decode("utf-8", "replace")
     print(f"[7] 生成完成（{len(tokens)} tokens，{time.time()-t0:.1f}s）", flush=True)
     print("=== 原生描述输出 ===")

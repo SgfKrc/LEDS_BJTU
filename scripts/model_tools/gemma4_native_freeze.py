@@ -22,21 +22,23 @@ ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "models" / "gemma4-native"
 LOCK = MODEL_DIR / "gemma4-native.lock.json"
 
-# G4.4 过渡工件（2026-08-15）：Ollama 官方构建的 Q4_K_M + mmproj 冻结为
-# 受管资产（复制自 Ollama blobs——运行时不再调用 Ollama 服务；"摆脱"的
-# 中间态：工件来源仍是 Ollama 构建，独立来源待 G4.6 调研结论后替换）。
+# G4.4 最终工件（2026-08-15，独立来源达成）：HF 官方 bartowski Q4_K_M +
+# bartowski mmproj-BF16（均 apache-2.0，经 7897 代理下载）。G4.6 调研确认
+# Ollama 稳定机制 = llama.cpp b10434 reasoning-budget sampler（思考段超预算
+# 强制结束）；47e1de77 上已实现等效（--think-budget 注入结束 tag + 头尾
+# 裁剪），HF 工件 + 等效机制 3/3 稳定（sd-001 语义正确）。
 ARTIFACTS = {
     "main_gguf": {
-        "source": "ollama gemma4:12b blobs（过渡；独立来源待 G4.6）",
+        "source": "https://huggingface.co/bartowski/gemma-4-12B-it-GGUF/resolve/main/gemma-4-12B-it-Q4_K_M.gguf",
         "license": "apache-2.0",
-        "filename": "gemma4-12b-ollama-q4_k_m.gguf",
-        "expected_size": 7_381_382_048,
+        "filename": "gemma-4-12B-it-Q4_K_M.gguf",
+        "expected_size": 7_662_533_088,
     },
     "mmproj": {
-        "source": "ollama gemma4:12b blobs（过渡；独立来源待 G4.6）",
+        "source": "https://huggingface.co/bartowski/gemma-4-12B-it-GGUF/resolve/main/mmproj-gemma-4-12B-it-bf16.gguf",
         "license": "apache-2.0",
-        "filename": "mmproj-ollama-bf16.gguf",
-        "expected_size": 175_115_584,
+        "filename": "mmproj-gemma-4-12B-it-bf16.gguf",
+        "expected_size": 175_115_712,
     },
 }
 
