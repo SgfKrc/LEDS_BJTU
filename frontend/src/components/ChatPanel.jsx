@@ -690,7 +690,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         generationId,
       });
 
-      const useFastStream = settings?.streamingMode === 'fast' && executionMode !== 'task_graph';
+      const useFastStream = settings?.streamingMode === 'fast'
+        && executionMode !== 'task_graph'
+        && !hasImages;
       let res;
 
       if (useFastStream) {

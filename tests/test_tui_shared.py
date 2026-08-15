@@ -58,12 +58,25 @@ class TestBuildInteractiveRequest:
         assert body["prefer_external"] is True
         assert body["execution_mode"] == "auto"
 
-    def test_image_request_rejects_local_only_route(self):
-        with pytest.raises(ValueError, match="local_only"):
+    def test_image_request_supports_local_only_full_mode(self):
+        body = build_interactive_request(
+            "描述图片",
+            routing_preference="local_only",
+            image_data_urls=["data:image/png;base64,iVBORw0KGgo="],
+        )
+        assert body["streaming_mode"] == "full"
+        assert body["allow_external"] is False
+        assert body["prefer_external"] is False
+
+    def test_image_request_rejects_multiple_local_images(self):
+        with pytest.raises(ValueError, match="一张"):
             build_interactive_request(
                 "描述图片",
                 routing_preference="local_only",
-                image_data_urls=["data:image/png;base64,iVBORw0KGgo="],
+                image_data_urls=[
+                    "data:image/png;base64,iVBORw0KGgo=",
+                    "data:image/png;base64,iVBORw0KGgo=",
+                ],
             )
 
 

@@ -88,11 +88,12 @@ def build_interactive_request(
     if routing_preference not in ROUTING_PREFERENCES:
         routing_preference = "auto"
     images = validate_image_data_urls(image_data_urls or [])
-    if images and routing_preference == "local_only":
-        raise ValueError("图像请求不能使用 local_only 路由")
+    local_image = bool(images and routing_preference == "local_only")
+    if local_image and len(images) != 1:
+        raise ValueError("本地 MTMD 图像请求仅支持一张图片")
     body = {
         "message": message,
-        "streaming_mode": "interactive",
+        "streaming_mode": "full" if local_image else "interactive",
         "generation_id": generation_id,
         "session_id": session_id,
         "routing_preference": routing_preference,
@@ -105,8 +106,8 @@ def build_interactive_request(
         body.update({
             "image_data_urls": images,
             "execution_mode": "auto",
-            "allow_external": True,
-            "prefer_external": True,
+            "allow_external": not local_image,
+            "prefer_external": not local_image,
         })
     return body
 
