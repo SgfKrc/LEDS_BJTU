@@ -476,3 +476,14 @@
 
 1. 基于资源账本做视觉塔组件放置决策（节点容量账本 → 视觉塔可放置性），并保证**纯文本请求不错误加载视觉塔**（视觉组件按需激活，文本段独立可执行）。
 2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
+
+### 8.54 `PT-PIPE-MM1.11` 视觉塔组件放置与纯文本请求守卫（开发门 Completed，2026-08-15）
+
+- `mm1_vision_tower_placement`：基于资源账本做视觉塔放置决策（`qwen3_vision_tower_placement`）——**纯文本请求守卫**：无媒体时 `vision_tower_active=false`（视觉塔不激活、不加载，文本段独立可执行，`reason=text_only_request_guard`）；有媒体时账本剩余容量 ≥ 视觉塔权重字节 → `active=true`（`capacity_admitted`），否则 **fail-closed**（`vision_tower_capacity_insufficient`）。
+- `validate_mm1_vision_tower_placement`：身份、**纯文本守卫不可绕过**（无媒体却 active=true → 拒绝）、容量一致性、digest；决策对象只含布尔/字节/理由摘要（无路径/权重/像素，`weight_materialized=false`）。
+- 定向 `23 passed`（MM1.7-1.10 全量 + MM1.11 纯文本守卫/容量足/容量不足/守卫绕过篡改）；未加载视觉塔或文本权重，真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.55 下一票：`PT-PIPE-MM1.12` 视觉塔执行器骨架与 text-only 会话回归
+
+1. 把 MM1.11 的放置决策接到视觉塔执行器骨架：media 请求激活视觉占位执行路径，text-only 会话全程不触碰视觉塔（含既有文本链路回归）；覆盖放置决策与执行路径一致性。
+2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
