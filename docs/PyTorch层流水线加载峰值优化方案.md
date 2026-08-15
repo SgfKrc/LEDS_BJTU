@@ -553,3 +553,14 @@
 
 1. 以固定测试图走真实视觉塔 + 真实文本段前向（首次加载文本权重），产出视觉语义描述并对照人工/合成基线；随后将视觉特征接入跨节点 hidden handoff 契约（text_chain 边界）。
 2. 首次引入文本段权重加载与真实语义，需独立资源门与登记；CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.68 `PT-PIPE-MM1.18` 真实视觉语义 smoke 与跨节点 hidden handoff 前置（开发门 Completed，2026-08-15）
+
+- `qwen3_multimodal_vision_text_smoke`（controller + 隔离 worker）：**首次文本权重加载**——4-bit（BitsAndBytes）加载完整 Qwen3VLForConditionalGeneration（CPU，RAM 门 ≥6GB fail-closed），固定测试图（sd-001：red apple on wooden table）真实语义生成：**"Two shiny red apples… on a rustic wooden table against a weathered wooden background."**——`apple/red/wood` 关键词全中；`text_weights_loaded=true`。
+- **跨节点 handoff 前置**：真实语义特征 → `visual_to_text` hidden handoff 契约（MM1.13：`artifact.status=committed`、sha256/大小一致、tensor shape 对齐文本 hidden）。
+- 定向 `40 passed`（MM1.7-1.17 全量 + MM1.18 真实语义/handoff）；真实语义首次达成但仅在固定测试图；CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.69 下一票：`PT-PIPE-MM1.19` 真实语义扩展与生产路由评估
+
+1. 固定图扩展（sd-001/90s 风格多图）真实语义对照 + 时延/显存/内存登记（CPU 4-bit 路径）；评估生产路由（Ollama external_api vs 原生 sidecar）的取舍与门条件。
+2. CUDA/双机 parity、长视频、分布式 hidden handoff 跨节点实测与生产路由继续独立后置。

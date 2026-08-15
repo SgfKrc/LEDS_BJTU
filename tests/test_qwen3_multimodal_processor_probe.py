@@ -1216,3 +1216,73 @@ def test_real_vision_feature_feeds_hybrid_chain():
     assert result["vision_tower_weight_materialized"] is True
     assert result["text_weight_materialized"] is False
     assert result["full_model_materialized"] is False
+
+
+# ================================================================
+# MM1.18：真实视觉语义 smoke 与跨节点 hidden handoff 前置
+# ================================================================
+
+@pytest.mark.real_model
+def test_real_vision_semantics_and_handoff():
+    """首次文本权重加载：固定测试图真实语义 + 真实特征 handoff 绑定。"""
+    sidecar = ROOT / ".venv-qwen3-sidecar" / "Scripts" / "python.exe"
+    if not sidecar.is_file():
+        pytest.skip("MM1.18 requires the isolated Qwen3 pipeline sidecar")
+    import psutil
+    if psutil.virtual_memory().available < 6 * 2**30:
+        pytest.skip("MM1.18 资源门：可用 RAM < 6GB")
+    from scripts.model_tools.qwen3_multimodal_vision_text_smoke import (
+        run_qwen3_multimodal_vision_text_smoke,
+    )
+    from qwen3_multimodal_runtime import bind_mm1_visual_feature_handoff
+
+    image = ROOT / "build" / "exp-calibration" / "round-1" / "images" / "sd-001_seed19950101.png"
+    if not image.is_file():
+        pytest.skip("MM1.18 requires the fixed test image (sd-001)")
+    report = run_qwen3_multimodal_vision_text_smoke(
+        model=ROOT / "models" / "qwen3-vl-4b-instruct",
+        image=image,
+        timeout_seconds=900,
+    )
+    assert report["status"] == "vision_semantics_loaded"
+    response = report["response"]
+    assert response["text_weights_loaded"] is True
+    assert response["weight_materialized"] is True
+    assert response["full_model_materialized"] is False
+    # 固定测试图语义基线：red apple / wooden surface
+    assert response["keyword_hits"]["apple"] is True
+    assert response["keyword_hits"]["red"] is True
+    assert response["keyword_hits"]["wood"] is True
+    assert len(response["description"]) >= 20
+
+    # 真实特征 → visual_to_text hidden handoff（MM1.13 契约）
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    feature = {
+        "feature_kind": "qwen3_visual_feature_placeholder",
+        "model_id": "qwen3-vl-4b-instruct",
+        "media_reference_sha256": "c" * 64,
+        "tensor": {
+            "shape": [1, 64, manifest["text"]["hidden_size"]],
+            "dtype": "float32",
+            "device": "cpu",
+        },
+        "synthetic": False,
+        "weight_materialized": True,
+        "full_model_materialized": False,
+    }
+    handoff = bind_mm1_visual_feature_handoff(
+        feature,
+        manifest=manifest,
+        text_chain_id="a" * 64,
+        generation=4,
+        phase="prefill",
+        source_node_id="node-a",
+        target_node_id="node-b",
+        modality="image",
+    )
+    assert handoff["boundary"] == "visual_to_text"
+    assert handoff["tensor"]["shape"][-1] == manifest["text"]["hidden_size"]
+    assert handoff["contract_sha256"]
+    assert handoff["artifact"]["status"] == "committed"
+    assert handoff["artifact"]["sha256"] == feature["media_reference_sha256"]
+    assert handoff["artifact"]["size_bytes"] > 0
