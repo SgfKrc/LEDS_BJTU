@@ -103,3 +103,4 @@ models/.qlh-*/
 
 # QW3 runtime logs
 logs/*.log.*
+models/gemma4-native/*.gguf
