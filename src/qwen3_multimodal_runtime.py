@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from qwen3_multimodal_contract import validate_mm1_model_manifest  # noqa: E402
-from qwen3_multimodal_preflight import validate_mm1_media_tensor_reference  # noqa: E402
+from qwen3_multimodal_preflight import (  # noqa: E402
+    build_mm1_media_tensor_reference,
+    mm1_ledger_commit,
+    mm1_vision_tower_placement,
+    validate_mm1_media_tensor_reference,
+)
 from qwen3_multimodal_contract import (
     MM1_MAX_VISUAL_TOKENS,
     Qwen3MultimodalContractError,
@@ -504,6 +509,156 @@ def bind_mm1_visual_feature_handoff(
     return contract
 
 
+def _synthetic_media_summary(media_smoke: Mapping[str, Any]) -> dict[str, Any]:
+    """MM1.14：从受限 media_smoke 参数构造合成媒体摘要（模拟 MM1.7 输出）。"""
+    image_size = media_smoke.get("image_size") or (32, 32)
+    video_size = media_smoke.get("video_size") or (32, 32)
+    video_frames = int(media_smoke.get("video_frames", 2))
+    image_h, image_w = (int(v) for v in image_size)
+    video_h, video_w = (int(v) for v in video_size)
+    if (
+        not 8 <= image_h <= 1024 or not 8 <= image_w <= 1024
+        or not 8 <= video_h <= 1024 or not 8 <= video_w <= 1024
+        or not 1 <= video_frames <= 32
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_bounds",
+            "synthetic media dimensions are outside the MM1 contract limits",
+        )
+    patch = 16
+    image_tokens = max(1, (image_h // patch) * (image_w // patch))
+    video_tokens = max(1, (video_h // patch) * (video_w // patch))
+    return {
+        "image": {
+            "pixel_values_shape": [1, 3, image_h, image_w],
+            "dtype": "float16",
+            "token_count_estimate": image_tokens,
+        },
+        "video": {
+            "pixel_values_shape": [1, video_frames, 3, video_h, video_w],
+            "dtype": "float16",
+            "token_count_estimate": video_tokens,
+        },
+        "output_bytes_estimate": (image_tokens + video_tokens) * 2048,
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+
+
+def run_mm1_synthetic_visual_chain(
+    *,
+    manifest: Mapping[str, Any],
+    media_smoke: Mapping[str, Any] | None,
+    node_capacity_bytes: int,
+    text_only: bool = False,
+    text_chain_id: str = "a" * 64,
+    generation: int = 1,
+    phase: str = "prefill",
+    source_node_id: str = "node-a",
+    target_node_id: str = "node-b",
+) -> dict[str, Any]:
+    """MM1.14：MM1.7→MM1.13 全链 CPU 合成端到端回归。
+
+    合成媒体 → 摘要 → 张量参考 → 容量账本 → 放置决策 → 骨架 →
+    占位执行 → visual_to_text handoff；全程不加载视觉塔/文本权重。
+    text_only 路径跳过媒体链（骨架 skipped，文本段独立）。
+    """
+    safe_manifest = validate_mm1_model_manifest(manifest)
+    components = [
+        str(item) for item in safe_manifest.get("component_ids", [])
+    ] or ["vision_tower", "text_segment_0"]
+
+    if text_only:
+        placement = mm1_vision_tower_placement(
+            _synthetic_ledger(safe_manifest, node_capacity_bytes, media_bytes=0),
+            request_has_media=False,
+            vision_tower_bytes=0,
+        )
+        skeleton = run_mm1_visual_tower_skeleton(placement, None, text_only=True)
+        return {
+            "chain_kind": "qwen3_synthetic_visual_chain",
+            "text_only": True,
+            "visual_path": skeleton["visual_path"],
+            "vision_tower_active": False,
+            "weight_materialized": False,
+            "full_model_materialized": False,
+        }
+
+    if not isinstance(media_smoke, Mapping):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_required",
+            "media requests require media_smoke parameters",
+        )
+    summary = _synthetic_media_summary(media_smoke)
+    reference = build_mm1_media_tensor_reference(
+        summary,
+        model_id=safe_manifest["model_id"],
+        component_ids=components,
+    )
+    vision = safe_manifest["vision"]
+    tower_bytes = int(
+        vision.get("hidden_size", 0) * 4096 * vision.get("depth", 1) * 2
+    ) or 400_000_000
+    ledger = mm1_ledger_commit(
+        [
+            {"entry_id": "vision_tower", "kind": "vision_tower_weights", "bytes": tower_bytes},
+            {"entry_id": "media_1", "kind": "media_input",
+             "bytes": int(summary["output_bytes_estimate"])},
+            {"entry_id": "text_0", "kind": "text_segment",
+             "bytes": int(safe_manifest["text"]["hidden_size"]) * 2048 * 2},
+        ],
+        ledger_id="node-e2e",
+        node_capacity_bytes=int(node_capacity_bytes),
+    )
+    placement = mm1_vision_tower_placement(
+        ledger, request_has_media=True, vision_tower_bytes=tower_bytes,
+    )
+    skeleton = run_mm1_visual_tower_skeleton(placement, reference, text_only=False)
+    feature = run_mm1_visual_placeholder_execution(
+        skeleton, reference, manifest=safe_manifest,
+    )
+    handoff = bind_mm1_visual_feature_handoff(
+        feature,
+        manifest=safe_manifest,
+        text_chain_id=text_chain_id,
+        generation=generation,
+        phase=phase,
+        source_node_id=source_node_id,
+        target_node_id=target_node_id,
+        modality="image",
+    )
+    return {
+        "chain_kind": "qwen3_synthetic_visual_chain",
+        "text_only": False,
+        "media_tokens": int(reference["capacity"]["total_media_tokens"]),
+        "ledger_admitted": bool(ledger["capacity"]["admitted"]),
+        "vision_tower_active": bool(placement["vision_tower_active"]),
+        "visual_path": skeleton["visual_path"],
+        "feature_shape": list(feature["tensor"]["shape"]),
+        "handoff_boundary": handoff["boundary"],
+        "handoff_tokens": int(handoff["tensor"]["shape"][1]),
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+
+
+def _synthetic_ledger(
+    manifest: Mapping[str, Any], node_capacity_bytes: int, *, media_bytes: int,
+) -> dict[str, Any]:
+    vision = manifest["vision"]
+    tower_bytes = int(vision.get("hidden_size", 0) * 4096 * vision.get("depth", 1) * 2) or 400_000_000
+    text_bytes = int(manifest["text"]["hidden_size"]) * 2048 * 2
+    return mm1_ledger_commit(
+        [
+            {"entry_id": "vision_tower", "kind": "vision_tower_weights", "bytes": tower_bytes},
+            {"entry_id": "media_1", "kind": "media_input", "bytes": media_bytes},
+            {"entry_id": "text_0", "kind": "text_segment", "bytes": text_bytes},
+        ],
+        ledger_id="node-e2e",
+        node_capacity_bytes=int(node_capacity_bytes),
+    )
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
@@ -511,4 +666,5 @@ __all__ = [
     "run_mm1_visual_tower_skeleton",
     "run_mm1_visual_placeholder_execution",
     "bind_mm1_visual_feature_handoff",
+    "run_mm1_synthetic_visual_chain",
 ]

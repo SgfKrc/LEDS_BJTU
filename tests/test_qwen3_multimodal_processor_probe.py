@@ -948,3 +948,66 @@ def test_visual_feature_binds_to_text_handoff_consistently():
     assert contract["artifact"]["sha256"] == feature["media_reference_sha256"]
     assert contract["artifact"]["mode"] == "local"
     assert contract["full_model_materialized"] is False
+
+
+# ================================================================
+# MM1.14：视觉占位链端到端合成回归（CPU）
+# ================================================================
+
+def test_synthetic_visual_chain_end_to_end():
+    """MM1.7→MM1.13 全链串联：合成媒体 → 摘要 → 参考 → 账本 → 放置 → 骨架
+    → 占位执行 → visual_to_text handoff（零权重加载）。"""
+    from qwen3_multimodal_runtime import run_mm1_synthetic_visual_chain
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    result = run_mm1_synthetic_visual_chain(
+        manifest=manifest,
+        media_smoke={"image_size": [32, 32], "video_frames": 2},
+        node_capacity_bytes=2_000_000_000,
+    )
+    assert result["chain_kind"] == "qwen3_synthetic_visual_chain"
+    assert result["text_only"] is False
+    assert result["media_tokens"] > 0
+    assert result["ledger_admitted"] is True
+    assert result["vision_tower_active"] is True
+    assert result["visual_path"] == "placeholder_ready"
+    # 消费一致性：handoff token == 特征 token == 媒体 token
+    assert result["feature_shape"][1] == result["media_tokens"]
+    assert result["handoff_tokens"] == result["media_tokens"]
+    assert result["handoff_boundary"] == "visual_to_text"
+    assert result["weight_materialized"] is False
+
+
+def test_synthetic_visual_chain_fails_closed_on_capacity():
+    """容量不足 → 账本 admitted=false → 视觉塔不激活 → fail-closed。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_synthetic_visual_chain,
+    )
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    try:
+        run_mm1_synthetic_visual_chain(
+            manifest=manifest,
+            media_smoke={"image_size": [32, 32], "video_frames": 2},
+            node_capacity_bytes=100_000,  # 远小于视觉塔需求
+        )
+    except Qwen3MultimodalRuntimeError:
+        pass  # fail-closed（视觉塔不执行）
+    else:
+        # 或 admitted=false 路径（骨架 fail-closed）——二选一都算关闭
+        raise AssertionError("容量不足应 fail-closed")
+
+
+def test_synthetic_visual_chain_text_only_skips_vision():
+    """text-only 路径：全链跳过视觉塔（骨架 skipped，零媒体参考）。"""
+    from qwen3_multimodal_runtime import run_mm1_synthetic_visual_chain
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    result = run_mm1_synthetic_visual_chain(
+        manifest=manifest,
+        media_smoke=None,
+        node_capacity_bytes=2_000_000_000,
+        text_only=True,
+    )
+    assert result["text_only"] is True
+    assert result["visual_path"] == "skipped"
+    assert result["vision_tower_active"] is False
+    assert result["weight_materialized"] is False

@@ -509,3 +509,14 @@
 
 1. 串联 MM1.7→MM1.13 全链：合成媒体 → 摘要 → 张量参考 → 容量账本 → 放置决策 → 骨架 → 占位执行 → visual_to_text handoff，作为一条 CPU 合成端到端回归（全程不加载视觉塔/文本权重）。
 2. 保持 `weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.60 `PT-PIPE-MM1.14` 视觉占位链端到端合成回归（开发门 Completed，2026-08-15）——MM1 合成链收口
+
+- `run_mm1_synthetic_visual_chain`（runtime 编排）：串联 **MM1.7→MM1.13 全链**——合成媒体摘要 → 媒体张量参考 → 资源账本（视觉塔/媒体/文本三段）→ 放置决策 → 执行器骨架 → 占位执行（视觉特征摘要）→ `visual_to_text` handoff；**消费一致性**（handoff token == 特征 token == 媒体 token）。text_only 路径全链跳过视觉塔（骨架 skipped，零媒体参考）。
+- fail-closed：容量不足 → 账本/放置/骨架任一环节拒绝（视觉塔不执行）；媒体请求缺 media_smoke 拒绝；全程 `weight_materialized=false/full_model_materialized=false`。
+- 定向 `33 passed`（MM1.7-1.13 全量 + MM1.14 端到端 media/容量不足/text_only 三路径）；**MM1 合成链（不依赖真机的部分）至此收口**：真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.61 下一票：`PT-PIPE-MM1.15` 视觉塔真实权重接入与合成/真实对照
+
+1. 在隔离 sidecar 内加载视觉塔真实权重（mmproj 或视觉塔 safetensors），与 MM1.14 合成占位对照（真实特征 shape/dtype/token vs 合成投影），覆盖加载门、资源准入与对照一致性。
+2. 保持文本段零加载、CPU 合成先行、`weight_materialized` 如实登记；跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
