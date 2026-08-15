@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -1564,6 +1565,455 @@ def execute_mm1_staged_text_contract(
     }
 
 
+def build_mm1_first_segment_artifact_binding(
+    staged_contract: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    artifact_id: str,
+    size_bytes: int,
+    sha256: str,
+) -> dict[str, Any]:
+    """Bind a controller-owned local tensor artifact without exposing its path."""
+    safe = validate_mm1_staged_text_contract(staged_contract, manifest=manifest)
+    artifact_size = _staged_int(size_bytes, "artifact.size_bytes")
+    artifact_sha256 = str(sha256 or "")
+    if _SHA256.fullmatch(artifact_sha256) is None:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_artifact_invalid",
+            "first-segment input artifact digest is invalid",
+        )
+    layout = safe["input_layout"]
+    first = safe["segment_plan"][0]
+    next_segment = safe["segment_plan"][1]
+    values = {
+        "schema_version": 1,
+        "contract_kind": "qwen3_mm1_first_segment_artifact",
+        "staged_contract_sha256": safe["contract_sha256"],
+        "model_id": safe["model_id"],
+        "manifest_sha256": safe["manifest_sha256"],
+        "text_chain_id": safe["text_chain_id"],
+        "generation": safe["generation"],
+        "phase": safe["phase"],
+        "segment_index": 0,
+        "node_id": first["node_id"],
+        "layer_range": list(first["layer_range"]),
+        "input_artifact": {
+            "artifact_id": _staged_id(artifact_id, "artifact_id"),
+            "size_bytes": artifact_size,
+            "sha256": artifact_sha256,
+            "status": "committed",
+            "serialization": "torch_pt",
+            "content_kind": "combined_hidden_states",
+        },
+        "tensor": {
+            "shape": [
+                layout["batch_size"], layout["total_sequence"], layout["hidden_size"],
+            ],
+            "dtype": first["dtype"],
+            "storage_device": "cpu",
+        },
+        "next_segment": {
+            "segment_index": 1,
+            "node_id": next_segment["node_id"],
+            "layer_range": list(next_segment["layer_range"]),
+            "dtype": next_segment["dtype"],
+            "device": next_segment["device"],
+        },
+        "full_model_materialized": False,
+    }
+    values["contract_sha256"] = _staged_digest(values)
+    return validate_mm1_first_segment_artifact_binding(
+        values, staged_contract=safe, manifest=manifest,
+    )
+
+
+def validate_mm1_first_segment_artifact_binding(
+    value: Mapping[str, Any],
+    *,
+    staged_contract: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the path-free local artifact binding for MM1 segment zero."""
+    safe = validate_mm1_staged_text_contract(staged_contract, manifest=manifest)
+    required = {
+        "schema_version", "contract_kind", "staged_contract_sha256", "model_id",
+        "manifest_sha256", "text_chain_id", "generation", "phase", "segment_index",
+        "node_id", "layer_range", "input_artifact", "tensor", "next_segment",
+        "full_model_materialized", "contract_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_binding_invalid",
+            "first-segment artifact binding fields are invalid",
+        )
+    try:
+        binding = json.loads(json.dumps(value, ensure_ascii=True, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_binding_invalid",
+            "first-segment artifact binding is not JSON serializable",
+        ) from exc
+    first = safe["segment_plan"][0]
+    next_segment = safe["segment_plan"][1]
+    layout = safe["input_layout"]
+    if (
+        binding["schema_version"] != 1
+        or binding["contract_kind"] != "qwen3_mm1_first_segment_artifact"
+        or binding["staged_contract_sha256"] != safe["contract_sha256"]
+        or binding["model_id"] != safe["model_id"]
+        or binding["manifest_sha256"] != safe["manifest_sha256"]
+        or binding["text_chain_id"] != safe["text_chain_id"]
+        or binding["generation"] != safe["generation"]
+        or binding["phase"] != "prefill"
+        or binding["phase"] != safe["phase"]
+        or binding["segment_index"] != 0
+        or binding["node_id"] != first["node_id"]
+        or binding["layer_range"] != first["layer_range"]
+        or binding["full_model_materialized"] is not False
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_binding_invalid",
+            "first-segment artifact binding identity does not match the staged contract",
+        )
+    artifact = binding["input_artifact"]
+    if not isinstance(artifact, Mapping) or set(artifact) != {
+        "artifact_id", "size_bytes", "sha256", "status", "serialization", "content_kind",
+    }:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_artifact_invalid",
+            "first-segment input artifact metadata is invalid",
+        )
+    _staged_id(artifact.get("artifact_id"), "artifact_id")
+    _staged_int(artifact.get("size_bytes"), "artifact.size_bytes")
+    if (
+        _SHA256.fullmatch(str(artifact.get("sha256") or "")) is None
+        or artifact.get("status") != "committed"
+        or artifact.get("serialization") != "torch_pt"
+        or artifact.get("content_kind") != "combined_hidden_states"
+    ):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_artifact_invalid",
+            "first-segment input artifact evidence is invalid",
+        )
+    expected_tensor = {
+        "shape": [layout["batch_size"], layout["total_sequence"], layout["hidden_size"]],
+        "dtype": first["dtype"],
+        "storage_device": "cpu",
+    }
+    expected_next = {
+        "segment_index": 1,
+        "node_id": next_segment["node_id"],
+        "layer_range": list(next_segment["layer_range"]),
+        "dtype": next_segment["dtype"],
+        "device": next_segment["device"],
+    }
+    if binding["tensor"] != expected_tensor or binding["next_segment"] != expected_next:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_binding_invalid",
+            "first-segment tensor or next-segment binding does not match",
+        )
+    unsigned = dict(binding)
+    digest = str(unsigned.pop("contract_sha256", ""))
+    if _SHA256.fullmatch(digest) is None or digest != _staged_digest(unsigned):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_sidecar_binding_invalid",
+            "first-segment artifact binding digest does not match",
+        )
+    _reject_staged_sensitive(binding)
+    return binding
+
+
+def _mm1_local_file_evidence(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+class Qwen3MultimodalFirstSegmentSidecarAdapter:
+    """Drive one MM1 first text segment through a node-local Qwen3 sidecar."""
+
+    def __init__(self, session: Any, *, artifact_root: str | Path) -> None:
+        root = Path(artifact_root).expanduser().absolute().resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        if not root.is_dir():
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_artifact_root_missing",
+                "first-segment sidecar artifact root is unavailable",
+            )
+        self.session = session
+        self.artifact_root = root
+        self.lifecycle: list[str] = []
+        self._outputs: dict[str, Path] = {}
+
+    def _local_ref(self, value: str | Path, *, must_exist: bool) -> Path:
+        candidate = Path(value).expanduser().absolute().resolve(strict=False)
+        try:
+            candidate.relative_to(self.artifact_root)
+        except ValueError as exc:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_artifact_scope",
+                "first-segment artifact escapes the local data-plane root",
+            ) from exc
+        if must_exist and not candidate.is_file():
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_artifact_missing",
+                "first-segment input artifact is unavailable",
+            )
+        return candidate
+
+    def _validate_session_identity(self, staged: Mapping[str, Any]) -> None:
+        identity = getattr(self.session, "identity", None)
+        if not isinstance(identity, Mapping) or getattr(self.session, "phase", None) != "idle":
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_session_invalid",
+                "first-segment sidecar session is unavailable or already used",
+            )
+        first = staged["segment_plan"][0]
+        dtype = str(identity.get("dtype") or "").lower().removeprefix("torch.")
+        device = str(identity.get("execution_device") or "").lower()
+        expected = {
+            "model_id": staged["model_id"],
+            "node_id": first["node_id"],
+            "layer_range": first["layer_range"],
+            "total_layers": staged["total_layers"],
+            "has_embedding": first["has_embedding"],
+            "has_lm_head": first["has_lm_head"],
+            "generation": staged["generation"],
+            "assignment_manifest_sha256": first["assignment_manifest_sha256"],
+        }
+        if any(identity.get(key) != expected_value for key, expected_value in expected.items()):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_session_mismatch",
+                "first-segment sidecar assignment does not match the staged contract",
+            )
+        if dtype != first["dtype"] or device != first["device"]:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_session_mismatch",
+                "first-segment sidecar dtype or device does not match",
+            )
+
+    @staticmethod
+    def _normalised_dtype(value: Any) -> str:
+        return str(value or "").lower().removeprefix("torch.")
+
+    def execute(
+        self,
+        staged_contract: Mapping[str, Any],
+        *,
+        manifest: Mapping[str, Any],
+        artifact_binding: Mapping[str, Any],
+        input_ref: str | Path,
+        cancel_after_commit: bool = False,
+    ) -> dict[str, Any]:
+        """Execute prefill and retain its output only in the local data plane."""
+        if not isinstance(cancel_after_commit, bool):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_contract_invalid", "cancel flag must be boolean",
+            )
+        staged = validate_mm1_staged_text_contract(staged_contract, manifest=manifest)
+        binding = validate_mm1_first_segment_artifact_binding(
+            artifact_binding, staged_contract=staged, manifest=manifest,
+        )
+        self._validate_session_identity(staged)
+        input_path = self._local_ref(input_ref, must_exist=True)
+        artifact = binding["input_artifact"]
+        if _mm1_local_file_evidence(input_path) != (
+            artifact["size_bytes"], artifact["sha256"],
+        ):
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_artifact_mismatch",
+                "first-segment input artifact evidence does not match the binding",
+            )
+        output_path = self.artifact_root / f"mm1-first-{secrets.token_hex(16)}.pt"
+        first = staged["segment_plan"][0]
+        layout = staged["input_layout"]
+        try:
+            self.session.prepare()
+            self.lifecycle.append("prepare")
+            self.session.commit()
+            self.lifecycle.append("commit")
+            if cancel_after_commit:
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_sidecar_cancelled",
+                    "first-segment sidecar execution was cancelled after commit",
+                )
+            report = self.session.execute(
+                phase="prefill",
+                artifact_root=self.artifact_root,
+                input_ref=input_path,
+                output_ref=output_path,
+                chain_id=staged["text_chain_id"],
+                segment_index=0,
+                sequence_length=layout["total_sequence"],
+                batch_size=layout["batch_size"],
+                has_next_segment=True,
+                generation=staged["generation"],
+                dtype=first["dtype"],
+                device=first["device"],
+            )
+            self.lifecycle.append("prefill")
+            _reject_staged_sensitive(report)
+            execution = report.get("execution")
+            hidden = report.get("hidden_handoff")
+            expected_shape = [
+                layout["batch_size"], layout["total_sequence"], layout["hidden_size"],
+            ]
+            if not isinstance(execution, Mapping) or (
+                execution.get("data_plane") != "local_artifact"
+                or execution.get("segment_materialized") is not True
+                or execution.get("full_model_materialized") is not False
+                or isinstance(execution.get("artifact_bytes"), bool)
+                or not isinstance(execution.get("artifact_bytes"), int)
+                or execution.get("artifact_bytes", 0) <= 0
+                or _SHA256.fullmatch(str(execution.get("artifact_sha256") or "")) is None
+            ):
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_sidecar_execution_failed",
+                    "first-segment sidecar execution evidence is invalid",
+                )
+            if not isinstance(hidden, Mapping) or (
+                hidden.get("chain_id") != staged["text_chain_id"]
+                or hidden.get("from_segment") != 0
+                or hidden.get("to_segment") != 1
+                or hidden.get("shape") != expected_shape
+                or hidden.get("batch_size") != layout["batch_size"]
+                or hidden.get("sequence_length") != layout["total_sequence"]
+                or hidden.get("hidden_size") != layout["hidden_size"]
+                or self._normalised_dtype(hidden.get("dtype")) != first["dtype"]
+                or str(hidden.get("device") or "").lower() != first["device"]
+            ):
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_sidecar_handoff_mismatch",
+                    "first-segment sidecar hidden handoff does not match the next segment",
+                )
+            output_evidence = _mm1_local_file_evidence(output_path)
+            if output_evidence != (
+                execution["artifact_bytes"], execution["artifact_sha256"],
+            ):
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_sidecar_artifact_mismatch",
+                    "first-segment output artifact evidence does not match",
+                )
+            release_report = self.session.release()
+            self.lifecycle.append("release")
+            if not isinstance(release_report, Mapping) or (
+                release_report.get("cleanup_complete") is not True
+                or release_report.get("segment_materialized") is not False
+                or release_report.get("full_model_materialized") is not False
+            ):
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_sidecar_cleanup_failed",
+                    "first-segment sidecar release did not prove cleanup",
+                )
+            output_id = f"mm1out_{output_evidence[1][:32]}"
+            self._outputs[output_id] = output_path
+            result = {
+                "schema_version": 1,
+                "status": "first_segment_sidecar_executed",
+                "contract_sha256": staged["contract_sha256"],
+                "artifact_binding_sha256": binding["contract_sha256"],
+                "lifecycle": list(self.lifecycle),
+                "input_artifact": dict(artifact),
+                "output_artifact": {
+                    "artifact_id": output_id,
+                    "size_bytes": output_evidence[0],
+                    "sha256": output_evidence[1],
+                    "status": "committed",
+                },
+                "hidden_handoff": dict(hidden),
+                "next_segment": {
+                    **dict(binding["next_segment"]),
+                    "hidden_handoff": dict(hidden),
+                },
+                "sidecar_cleanup_complete": True,
+                "artifact_cleanup_required": True,
+                "segment_materialized": False,
+                "full_model_materialized": False,
+            }
+            _reject_staged_sensitive(result)
+            return result
+        except Exception as exc:
+            output_path.unlink(missing_ok=True)
+            if getattr(self.session, "phase", None) in {"prepared", "committed"}:
+                try:
+                    abort_report = self.session.abort()
+                    self.lifecycle.append("abort")
+                    if not isinstance(abort_report, Mapping) or (
+                        abort_report.get("cleanup_complete") is not True
+                        or abort_report.get("segment_materialized") is not False
+                        or abort_report.get("full_model_materialized") is not False
+                    ):
+                        raise Qwen3MultimodalRuntimeError(
+                            "qwen3_mm1_sidecar_cleanup_failed",
+                            "first-segment sidecar abort did not prove cleanup",
+                        )
+                except Exception as cleanup_exc:
+                    if isinstance(cleanup_exc, Qwen3MultimodalRuntimeError):
+                        raise
+                    raise Qwen3MultimodalRuntimeError(
+                        "qwen3_mm1_sidecar_cleanup_failed",
+                        "first-segment sidecar abort did not complete",
+                    ) from cleanup_exc
+            if isinstance(exc, Qwen3MultimodalRuntimeError):
+                raise
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_execution_failed",
+                "first-segment sidecar execution failed",
+            ) from exc
+
+    def output_path(self, artifact_id: str) -> Path:
+        """Resolve a retained output for an in-process downstream data-plane step."""
+        path = self._outputs.get(str(artifact_id))
+        if path is None or not path.is_file():
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_sidecar_artifact_missing",
+                "first-segment output artifact is unavailable",
+            )
+        return path
+
+    def cleanup(self, reason_code: str = "completed") -> dict[str, Any]:
+        """Release retained local outputs without returning their paths."""
+        reason = _staged_id(reason_code, "reason_code")
+        removed = 0
+        for artifact_id, path in list(self._outputs.items()):
+            if path.exists():
+                path.unlink()
+                removed += 1
+            self._outputs.pop(artifact_id, None)
+        if getattr(self.session, "phase", None) in {"prepared", "committed"}:
+            try:
+                abort_report = self.session.abort()
+                self.lifecycle.append("abort")
+                if not isinstance(abort_report, Mapping) or (
+                    abort_report.get("cleanup_complete") is not True
+                    or abort_report.get("segment_materialized") is not False
+                    or abort_report.get("full_model_materialized") is not False
+                ):
+                    raise Qwen3MultimodalRuntimeError(
+                        "qwen3_mm1_sidecar_cleanup_failed",
+                        "first-segment sidecar cleanup did not prove release",
+                    )
+            except Exception as exc:
+                if isinstance(exc, Qwen3MultimodalRuntimeError):
+                    raise
+                raise Qwen3MultimodalRuntimeError(
+                    "qwen3_mm1_sidecar_cleanup_failed",
+                    "first-segment sidecar cleanup did not complete",
+                ) from exc
+        return {
+            "completed": True,
+            "reason_code": reason,
+            "removed_artifacts": removed,
+            "retained_artifacts": 0,
+            "segment_materialized": False,
+            "full_model_materialized": False,
+        }
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
@@ -1578,4 +2028,7 @@ __all__ = [
     "validate_mm1_staged_text_contract",
     "execute_mm1_staged_text_contract",
     "Qwen3MultimodalStagedTextFixture",
+    "build_mm1_first_segment_artifact_binding",
+    "validate_mm1_first_segment_artifact_binding",
+    "Qwen3MultimodalFirstSegmentSidecarAdapter",
 ]

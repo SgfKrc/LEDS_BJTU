@@ -21,6 +21,8 @@ class _Session:
         self.index = index
         self.fail_phase = fail_phase
         self.calls: list[str] = []
+        self.requests: list[dict] = []
+        self.decode_handoff_tokens: int | None = None
 
     def prepare(self):
         self.calls.append("prepare")
@@ -35,6 +37,7 @@ class _Session:
     def execute(self, **request):
         phase = str(request["phase"])
         self.calls.append(phase)
+        self.requests.append(dict(request))
         if self.fail_phase == phase:
             raise RuntimeError(f"{phase} failed")
         dtype = str(request["dtype"])
@@ -43,6 +46,11 @@ class _Session:
         batch = int(request["batch_size"])
         segment = int(request["segment_index"])
         Path(request["output_ref"]).write_bytes(b"artifact")
+        handoff_sequence = (
+            self.decode_handoff_tokens
+            if phase == "decode" and self.decode_handoff_tokens is not None
+            else sequence
+        )
         return {
             "status": "executed",
             "gate_passed": True,
@@ -64,9 +72,9 @@ class _Session:
                     "chain_id": request["chain_id"],
                     "from_segment": segment,
                     "to_segment": segment + 1,
-                    "shape": [batch, sequence, 4],
+                    "shape": [batch, handoff_sequence, 4],
                     "batch_size": batch,
-                    "sequence_length": sequence,
+                    "sequence_length": handoff_sequence,
                     "hidden_size": 4,
                     "dtype": dtype,
                     "device": device,
@@ -110,6 +118,71 @@ def test_multi_sidecar_prefill_decode_and_release_cleans_artifacts(tmp_path):
     assert chain.decode(input_ref=source, batch_size=1, sequence_length=4)["phase"] == "decoded"
     assert chain.release()["phase"] == "released"
     assert all(session.calls == ["prepare", "commit", "prefill", "decode", "release"] for session in sessions)
+    assert list(root.glob("qwen3-*.pt")) == []
+
+
+def test_multi_sidecar_rotates_kv_across_repeated_decode_steps(tmp_path):
+    chain, sessions, source, root = _chain(tmp_path)
+    for session in sessions:
+        session.decode_handoff_tokens = 1
+    chain.prepare()
+    chain.commit()
+    prefill = chain.prefill(input_ref=source, batch_size=1, sequence_length=3)
+    prefill_kv = list(chain._prefill_outputs)
+
+    first = chain.decode(
+        input_ref=source, batch_size=1, sequence_length=4,
+        input_sequence_length=1,
+    )
+    first_kv = list(chain._prefill_outputs)
+    second = chain.decode(
+        input_ref=source, batch_size=1, sequence_length=5,
+        input_sequence_length=1,
+    )
+    second_kv = list(chain._prefill_outputs)
+
+    assert prefill["decode_step_count"] == 0
+    assert first["decode_step_count"] == 1
+    assert second["decode_step_count"] == 2
+    assert second["kv_sequence_length"] == 5
+    assert second["decode_history"] == [
+        {"step_index": 1, "generation": 1, "sequence_length": 4,
+         "input_sequence_length": 1},
+        {"step_index": 2, "generation": 2, "sequence_length": 5,
+         "input_sequence_length": 1},
+    ]
+    assert all(not path.exists() for path in prefill_kv + first_kv)
+    assert all(path.is_file() for path in second_kv)
+    for index, session in enumerate(sessions):
+        decode_requests = [value for value in session.requests if value["phase"] == "decode"]
+        assert Path(decode_requests[0]["kv_ref"]) == prefill_kv[index]
+        assert Path(decode_requests[1]["kv_ref"]) == first_kv[index]
+        assert [value["generation"] for value in decode_requests] == [1, 2]
+    assert chain.release()["phase"] == "released"
+    assert list(root.glob("qwen3-*.pt")) == []
+
+
+def test_multi_sidecar_repeated_decode_sequence_mismatch_aborts_chain(tmp_path):
+    chain, sessions, source, root = _chain(tmp_path)
+    for session in sessions:
+        session.decode_handoff_tokens = 1
+    chain.prepare()
+    chain.commit()
+    chain.prefill(input_ref=source, batch_size=1, sequence_length=3)
+    chain.decode(
+        input_ref=source, batch_size=1, sequence_length=4,
+        input_sequence_length=1,
+    )
+
+    with pytest.raises(Qwen3MultiSidecarError) as caught:
+        chain.decode(
+            input_ref=source, batch_size=1, sequence_length=6,
+            input_sequence_length=1,
+        )
+
+    assert caught.value.reason_code == "qwen3_multisidecar_sequence_mismatch"
+    assert chain.phase == "aborted"
+    assert all(session.calls[-1] == "abort" for session in sessions)
     assert list(root.glob("qwen3-*.pt")) == []
 
 
