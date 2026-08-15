@@ -289,6 +289,13 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 
 > **G4.6 调研结论（2026-08-15，Ollama 仓库）**：Ollama 用 llama.cpp `b10434` + compat 补丁；`think=false` = 模板 kwargs `enable_thinking:false`（与本地渲染相同）；**稳定性来源 = `common/reasoning-budget.cpp` 采样器**（IDLE→COUNTING 匹配思考开始 tag→超预算 FORCING 强制输出结束 tag）——非 Ollama 工件特殊（HF 工件 + 等效预算机制同样稳定，已实证）。**借鉴项已落地**：思考预算强制（本票）；**后续借鉴候选**：`reasoning_format` 解析、`--reasoning off` 语义、compat 分词器补丁（SPM 拆 `<|thought|>` 等）。对照验收（吞吐/时延/语义三表）随 G4.5 GPU 部分执行。
 
+> **G4.5 原生引擎产品化 Completed（2026-08-15）+ G4.6 对照验收结论（保留双轨）**：
+> - **chat 接线**：`LlamaCppEngine.chat_image` 增加思考预算（`think_budget` 等效 reasoning-budget：思考超预算注入 101）+ 思考开始检测（100/`thought` 字面）+ 头尾裁剪（101/thought/空行）+ 正文循环断（101/`max_answer_tokens`）——HF 独立工件稳定（实测 3/3，语义与 Ollama 一致）；
+> - **GPU offload**：`load_gemma4_native()`（受管工件 + `estimate_gpu_layers` 显存预算门 + `_vram_free_bytes` nvidia-smi 查询 + `require_gpu_layers` fail-closed + `mtmd_use_gpu`）；实测加载后显存 6152 MiB（部分 offload 生效），热时延 **17-18s**（CPU 基线 170-250s，10 倍加速）；
+> - **打包代码**：`qlh-cuda.spec` 注释登记（.venv-gemma4-native 依赖/工件/运行时约束）——**实机验证延后**（Surface 修复后）；
+> - **卸载/取消**：cancel_event 中途取消 ✓（finish=cancelled）；⚠️ unload 后显存不归零（llama.cpp CUDA context 缓存，进程退出才释放——后续优化：llama_backend_free）；
+> - **G4.6 对照三表（sd-001 图生文，热）**：时延 **原生 17-18s vs Ollama 3.2s（~5 倍）**；吞吐 原生 ~2.8 tok/s vs Ollama ~15 tok/s；语义 一致（同图同义）。**主因 mmproj 图像编码在 CPU**（`CLIP using CPU backend`——绑定无 CUDA 编译）；**结论：性能差距不可接受 → 按 §5.7 决策保留双轨**（Ollama 产品基线 + 原生自包含可选）；后续优化候选：CUDA 版 llama-cpp-python 重编（mmproj GPU offload）+ `llama_backend_free` 显存释放。
+
 | 里程碑 | 内容 | 验收标准 | 依赖 |
 |---|---|---|---|
 | **G4.4 独立工件链** | 从 HF 官方（经 7897 代理）下载 gemma-4-12B 的 GGUF + mmproj（Q4_K_M 路线，本机 8GB 可用），SHA-256/许可/manifest 冻结，写入受管资产；原生 smoke 改用独立工件（不再读 `~/.ollama/models/blobs`） | 断网 Ollama 环境下原生路径可加载并完成图像语义 smoke；工件冻结记录（revision/SHA/大小/许可）入库 | §5.6 #1（已完成） |

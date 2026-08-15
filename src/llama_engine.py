@@ -200,6 +200,106 @@ class LlamaCppEngine:
             self._loaded = False
             raise
 
+    @staticmethod
+    def _vram_free_bytes() -> Optional[int]:
+        """查询当前 VRAM 空闲（nvidia-smi）；不可用时返回 None。"""
+        import shutil
+        import subprocess as _sp
+        if shutil.which("nvidia-smi") is None:
+            return None
+        try:
+            out = _sp.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if out.returncode != 0:
+                return None
+            return int(out.stdout.strip().splitlines()[0]) * 1024**2
+        except Exception:
+            return None
+
+    @staticmethod
+    def estimate_gpu_layers(
+        total_layers: int,
+        gguf_size_bytes: int,
+        vram_free_bytes: int,
+        *,
+        kv_reserve_bytes: int = 512 * 1024**2,
+        safety_margin: float = 1.15,
+    ) -> int:
+        """G4.5 部分 offload 层数估算（8GB 显存预算门）。
+
+        全量 offload 在本机（RTX 4060 8GB）超预算（Q4 权重 7.1GB + mmproj +
+        KV > 可用 ~7.4GB），必须部分 offload：按每层权重字节数计算可容纳层数，
+        预留 KV 与安全余量（§5.7 决策：不承诺全量 offload）。
+        """
+        per_layer = max(1, gguf_size_bytes // max(1, total_layers))
+        budget = int(vram_free_bytes * safety_margin - kv_reserve_bytes)
+        if budget <= 0:
+            return 0
+        return max(0, min(total_layers, budget // per_layer))
+
+    def load_gemma4_native(
+        self,
+        *,
+        gguf_path: str = None,
+        mmproj_path: str = None,
+        n_ctx: int = 768,
+        gpu_layers: int = -1,
+        require_gpu_layers: int = 0,
+        mtmd_use_gpu: bool = True,
+    ) -> Dict[str, Any]:
+        """G4.5 便捷加载：gemma4 原生工件（受管目录）+ GPU 预算门 + 互斥规则。
+
+        - 缺省工件路径从 models/gemma4-native/gemma4-native.lock.json 读取；
+        - gpu_layers=-1 时按显存预算自动估算（部分 offload）；
+        - 显存不足（低于 require_gpu_layers 对应预算）时 fail-closed。
+        """
+        from pathlib import Path as _Path
+        lock = _Path(__file__).resolve().parents[1] / "models" / "gemma4-native" / "gemma4-native.lock.json"
+        if not lock.is_file():
+            raise RuntimeError("gemma4-native 工件未冻结：先运行 gemma4_native_freeze.py --hash")
+        import json as _json
+        record = _json.loads(lock.read_text(encoding="utf-8"))
+        artifacts = record.get("artifacts", {})
+        if gguf_path is None:
+            gguf_path = str(lock.parent / artifacts["main_gguf"]["filename"])
+        if mmproj_path is None:
+            mmproj_path = str(lock.parent / artifacts["mmproj"]["filename"])
+        if not os.path.isfile(gguf_path) or not os.path.isfile(mmproj_path):
+            raise FileNotFoundError("gemma4-native 工件缺失：检查 models/gemma4-native/ 与冻结记录")
+
+        load_kwargs: Dict[str, Any] = {}
+        if gpu_layers > 0:
+            load_kwargs["n_gpu_layers"] = int(gpu_layers)
+        elif gpu_layers == -1:
+            free = self._vram_free_bytes()
+            if free is None:
+                raise RuntimeError(
+                    "无法查询显存（nvidia-smi 不可用）：请显式传 gpu_layers 或使用 CPU",
+                )
+            auto = self.estimate_gpu_layers(
+                36, os.path.getsize(gguf_path), free,
+            )
+            load_kwargs["n_gpu_layers"] = auto
+            logger.info(
+                "gemma4-native 自动 offload 层数: %d（VRAM %.1f GiB 预算门）",
+                auto, free / 2**30,
+            )
+        if require_gpu_layers > 0 and load_kwargs.get("n_gpu_layers", 0) < require_gpu_layers:
+            raise RuntimeError(
+                f"显存预算不足：需要 ≥{require_gpu_layers} 层 offload，"
+                f"实际 {load_kwargs.get('n_gpu_layers', 0)}（fail-closed）"
+            )
+        self.load_model(
+            model_path=gguf_path,
+            n_ctx=n_ctx,
+            mmproj_path=mmproj_path,
+            mtmd_use_gpu=mtmd_use_gpu,
+            **load_kwargs,
+        )
+        return self.get_capabilities()
+
     def unload(self) -> None:
         """卸载模型，释放内存。"""
         self._free_mtmd_context()
@@ -329,6 +429,8 @@ class LlamaCppEngine:
         top_p: float = 0.9,
         stop: List[str] = None,
         reasoning_channel_token_id: Optional[int] = 101,
+        think_budget: int = 96,
+        max_answer_tokens: int = 48,
         **kwargs,
     ) -> Dict[str, Any]:
         """Run the native MTMD image path for a single local image.
@@ -384,6 +486,12 @@ class LlamaCppEngine:
         generated_tokens: List[int] = []
         pre_channel_tokens: List[int] = []
         sampled_token_count = 0
+        # G4.5：思考预算（等效 llama.cpp b10434 reasoning-budget sampler）——
+        # 思考段超预算强制结束（注入 101），HF 独立工件思考段失控时正文仍稳定
+        CHANNEL_START_TOKEN_ID = 100  # "<|channel>"
+        THOUGHT_TEXT_TOKEN_ID = 45518  # "thought" 字面（HF 工件无 100 时的思考开始）
+        in_thinking = False
+        think_tokens = 0
 
         try:
             wrapper = mtmd.mtmd_helper_bitmap_init_from_file(
@@ -493,7 +601,43 @@ class LlamaCppEngine:
                     break
                 sampled_token_count += 1
                 if reasoning_channel_token_id is not None:
+                    if (
+                        token == CHANNEL_START_TOKEN_ID
+                        or (
+                            not channel_found and not in_thinking
+                            and not generated_tokens and not pre_channel_tokens
+                            and token == THOUGHT_TEXT_TOKEN_ID
+                        )
+                    ):
+                        # 思考段开始（通道标记或生成开头 "thought" 字面）
+                        in_thinking = True
+                        think_tokens = 0
+                        channel_found = False
+                        pre_channel_tokens.clear()
+                        last_token = token
+                        continue
+                    if in_thinking:
+                        think_tokens += 1
+                        if token == reasoning_channel_token_id:
+                            # 思考段自然结束
+                            in_thinking = False
+                            channel_found = True
+                            last_token = token
+                            continue
+                        if think_budget > 0 and think_tokens > think_budget:
+                            # 思考超预算：注入结束 tag（等效 reasoning-budget FORCING）
+                            in_thinking = False
+                            channel_found = True
+                            last_token = reasoning_channel_token_id
+                            continue
+                        # 思考内容：丢弃
+                        last_token = token
+                        continue
                     if token == reasoning_channel_token_id:
+                        if generated_tokens:
+                            # 正文已结束（模型以 101 开新段即循环）：停止
+                            break
+                        # 思考段自然结束（无 100/45518 触发路径）
                         channel_found = True
                         last_token = token
                         continue
@@ -501,10 +645,20 @@ class LlamaCppEngine:
                         pre_channel_tokens.append(token)
                         last_token = token
                         continue
+                    generated_tokens.append(token)
+                    if max_answer_tokens > 0 and len(generated_tokens) >= max_answer_tokens:
+                        break
+                    last_token = token
+                    continue
                 generated_tokens.append(token)
                 last_token = token
 
             output_tokens = generated_tokens if channel_found else pre_channel_tokens
+            # G4.5 裁剪：头尾思考段残余（101/thought/空行）
+            while output_tokens and output_tokens[-1] in (101, 106, 107, 45518):
+                output_tokens.pop()
+            while output_tokens and output_tokens[0] in (101, 106, 107):
+                output_tokens.pop(0)
             content = self._model.detokenize(output_tokens).decode("utf-8", "replace")
             for stop_value in _merge_stop_sequences(stop):
                 if stop_value and stop_value in content:
