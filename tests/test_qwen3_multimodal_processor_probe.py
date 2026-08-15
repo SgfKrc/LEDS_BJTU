@@ -606,3 +606,75 @@ def test_real_visual_input_contract_in_response():
     encoded = json.dumps(report2, ensure_ascii=True).lower()
     assert "pixel_values\"" not in encoded
     assert str(ROOT).lower() not in encoded
+
+
+# ================================================================
+# MM1.10：视觉塔组件容量规划与多模态资源账本
+# ================================================================
+
+def test_resource_ledger_commits_and_is_idempotent():
+    """统一入账：视觉塔权重+媒体输入+文本段；重复入账不重复计费。"""
+    from qwen3_multimodal_preflight import (
+        mm1_ledger_commit,
+        validate_mm1_resource_ledger,
+    )
+    entries = [
+        {"entry_id": "vision_tower", "kind": "vision_tower_weights", "bytes": 800_000_000},
+        {"entry_id": "media_1", "kind": "media_input", "bytes": 4_000_000},
+        {"entry_id": "text_0", "kind": "text_segment", "bytes": 200_000_000},
+    ]
+    ledger = mm1_ledger_commit(entries, ledger_id="node-b", node_capacity_bytes=1_200_000_000)
+    validated = validate_mm1_resource_ledger(ledger)
+    assert validated["capacity"]["total_bytes"] == 1_004_000_000
+    assert validated["capacity"]["admitted"] is True
+    assert validated["capacity"]["remaining_bytes"] == 1_200_000_000 - 1_004_000_000
+    # 幂等：同 ledger_id 重复入账（相同 entry_id）不翻倍
+    again = mm1_ledger_commit(
+        entries + entries, ledger_id="node-b", node_capacity_bytes=1_200_000_000,
+    )
+    assert validate_mm1_resource_ledger(again)["capacity"]["total_bytes"] == 1_004_000_000
+
+
+def test_resource_ledger_fails_closed_on_combined_overrun():
+    """组合超限 → admitted=false（fail-closed）；admitted 篡改拒绝。"""
+    from qwen3_multimodal_preflight import (
+        Qwen3MultimodalPreflightError,
+        mm1_ledger_commit,
+        validate_mm1_resource_ledger,
+    )
+    entries = [
+        {"entry_id": "vision_tower", "kind": "vision_tower_weights", "bytes": 900_000_000},
+        {"entry_id": "media_1", "kind": "media_input", "bytes": 400_000_000},
+    ]
+    ledger = mm1_ledger_commit(entries, ledger_id="node-c", node_capacity_bytes=1_000_000_000)
+    assert ledger["capacity"]["admitted"] is False
+    validate_mm1_resource_ledger(ledger)  # admitted=False 是合法终态
+    tampered = dict(ledger)
+    tampered["capacity"] = dict(ledger["capacity"])
+    tampered["capacity"]["admitted"] = True
+    try:
+        validate_mm1_resource_ledger(tampered)
+    except Qwen3MultimodalPreflightError:
+        pass
+    else:
+        raise AssertionError("超限却标 admitted=True 应拒绝")
+
+
+def test_resource_ledger_release_is_idempotent():
+    """释放条目：total 减少；重复释放为 no-op（幂等）。"""
+    from qwen3_multimodal_preflight import (
+        mm1_ledger_commit,
+        mm1_ledger_release,
+        validate_mm1_resource_ledger,
+    )
+    entries = [
+        {"entry_id": "vision_tower", "kind": "vision_tower_weights", "bytes": 800_000_000},
+        {"entry_id": "media_1", "kind": "media_input", "bytes": 4_000_000},
+    ]
+    ledger = mm1_ledger_commit(entries, ledger_id="node-d", node_capacity_bytes=1_000_000_000)
+    released = mm1_ledger_release(ledger, entry_id="media_1")
+    validated = validate_mm1_resource_ledger(released)
+    assert validated["capacity"]["total_bytes"] == 800_000_000
+    # 重复释放（media_1 已不在）→ no-op
+    again = mm1_ledger_release(released, entry_id="media_1")
+    assert validate_mm1_resource_ledger(again)["capacity"]["total_bytes"] == 800_000_000

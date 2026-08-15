@@ -715,6 +715,151 @@ def validate_mm1_visual_input_contract(
     return contract
 
 
+def mm1_ledger_commit(
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    ledger_id: str,
+    node_capacity_bytes: int,
+) -> dict[str, Any]:
+    """MM1.10：多模态资源账本——视觉塔权重 + 媒体输入 + 文本段统一入账。
+
+    组合超限 fail-closed（admitted=false）；幂等：同 ledger_id 下相同
+    entry_id 重复入账不重复计费（按 entry_id 去重）。账本只记录字节与
+    类别摘要，不携带路径/权重/像素。
+    """
+    safe_ledger_id = _safe_id(ledger_id, "ledger_id")
+    try:
+        node_capacity = int(node_capacity_bytes)
+    except (TypeError, ValueError):
+        raise Qwen3MultimodalPreflightError("MM1.10 node capacity is invalid")
+    if node_capacity <= 0:
+        raise Qwen3MultimodalPreflightError("MM1.10 node capacity must be positive")
+    if not isinstance(entries, (list, tuple)):
+        raise Qwen3MultimodalPreflightError("MM1.10 ledger entries must be a sequence")
+
+    # 幂等：按 entry_id 去重（重复入账不重复计费）
+    unique: dict[str, dict[str, Any]] = {}
+    for raw in entries:
+        if not isinstance(raw, Mapping):
+            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry is invalid")
+        entry_id = _safe_id(raw.get("entry_id"), "entry_id")
+        kind = str(raw.get("kind") or "")
+        if kind not in {"vision_tower_weights", "media_input", "text_segment"}:
+            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry kind is unsupported")
+        try:
+            entry_bytes = int(raw.get("bytes") or 0)
+        except (TypeError, ValueError):
+            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry bytes are invalid")
+        if entry_bytes < 0:
+            raise Qwen3MultimodalPreflightError("MM1.10 ledger entry bytes must be non-negative")
+        unique[entry_id] = {
+            "entry_id": entry_id,
+            "kind": kind,
+            "bytes": entry_bytes,
+        }
+
+    normalized = [unique[key] for key in sorted(unique)]
+    total = sum(int(entry["bytes"]) for entry in normalized)
+    ledger = {
+        "schema_version": MM1_SCHEMA_VERSION,
+        "ledger_kind": "qwen3_multimodal_resource_ledger",
+        "ledger_id": safe_ledger_id,
+        "entries": normalized,
+        "capacity": {
+            "node_capacity_bytes": node_capacity,
+            "total_bytes": total,
+            "remaining_bytes": max(0, node_capacity - total),
+            "admitted": bool(total <= node_capacity),
+        },
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    ledger["ledger_sha256"] = _digest(ledger, label="MM1 resource ledger")
+    return ledger
+
+
+def mm1_ledger_release(
+    ledger: Mapping[str, Any],
+    *,
+    entry_id: str,
+) -> dict[str, Any]:
+    """MM1.10：按 entry_id 释放条目（total 减少，幂等：已释放条目为 no-op）。"""
+    validated = validate_mm1_resource_ledger(ledger)
+    safe_entry = _safe_id(entry_id, "entry_id")
+    remaining = [
+        dict(entry)
+        for entry in validated["entries"]
+        if entry["entry_id"] != safe_entry
+    ]
+    total = sum(int(entry["bytes"]) for entry in remaining)
+    released_ledger = {
+        "schema_version": MM1_SCHEMA_VERSION,
+        "ledger_kind": "qwen3_multimodal_resource_ledger",
+        "ledger_id": validated["ledger_id"],
+        "entries": remaining,
+        "capacity": {
+            "node_capacity_bytes": int(validated["capacity"]["node_capacity_bytes"]),
+            "total_bytes": total,
+            "remaining_bytes": max(
+                0, int(validated["capacity"]["node_capacity_bytes"]) - total,
+            ),
+            "admitted": bool(
+                total <= int(validated["capacity"]["node_capacity_bytes"]),
+            ),
+        },
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    released_ledger["ledger_sha256"] = _digest(
+        released_ledger, label="MM1 resource ledger",
+    )
+    return released_ledger
+
+
+def validate_mm1_resource_ledger(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """只读校验资源账本（身份/digest/条目与合计一致性）。"""
+    ledger = _exact(
+        value,
+        {
+            "schema_version", "ledger_kind", "ledger_id", "entries",
+            "capacity", "weight_materialized", "full_model_materialized",
+            "ledger_sha256",
+        },
+        "MM1 resource ledger",
+    )
+    if (
+        ledger["schema_version"] != MM1_SCHEMA_VERSION
+        or ledger["ledger_kind"] != "qwen3_multimodal_resource_ledger"
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger version/kind is unsupported")
+    if ledger["weight_materialized"] is not False or ledger["full_model_materialized"] is not False:
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger must stay weight-free")
+    total = 0
+    seen: set[str] = set()
+    for entry in ledger["entries"]:
+        entry_id = _safe_id(entry.get("entry_id"), "entry_id")
+        if entry_id in seen:
+            raise Qwen3MultimodalPreflightError("MM1 resource ledger entry_id is duplicated")
+        seen.add(entry_id)
+        kind = str(entry.get("kind") or "")
+        if kind not in {"vision_tower_weights", "media_input", "text_segment"}:
+            raise Qwen3MultimodalPreflightError("MM1 resource ledger entry kind is unsupported")
+        total += int(entry.get("bytes") or 0)
+    capacity = ledger["capacity"]
+    if int(capacity["total_bytes"]) != total:
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger total is inconsistent")
+    if capacity["admitted"] is True and int(capacity["total_bytes"]) > int(capacity["node_capacity_bytes"]):
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger admitted flag is inconsistent")
+    if ledger["ledger_sha256"] != _digest(
+        {key: val for key, val in ledger.items() if key != "ledger_sha256"},
+        label="MM1 resource ledger",
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 resource ledger digest is invalid")
+    return ledger
+
+
 def build_mm1_media_tensor_reference(
     media_summary: Mapping[str, Any],
     *,

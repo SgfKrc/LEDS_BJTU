@@ -465,3 +465,14 @@
 
 1. 把 MM1.9 的视觉输入契约接入节点容量账本：视觉塔权重字节 + 媒体输入预算 + 文本段预算统一入账，覆盖组合超限 fail-closed 与账本幂等（重复入账不重复计费）。
 2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
+
+### 8.52 `PT-PIPE-MM1.10` 视觉塔组件容量规划与多模态资源账本（开发门 Completed，2026-08-15）
+
+- `mm1_ledger_commit`：多模态资源账本（`qwen3_multimodal_resource_ledger`）——视觉塔权重 + 媒体输入 + 文本段三类条目统一入账，`total_bytes/remaining_bytes/admitted`；**组合超限 fail-closed**（total > node_capacity → admitted=false，视觉塔不执行）；**幂等**：同 ledger_id 下相同 entry_id 重复入账按 entry_id 去重（不重复计费）。
+- `mm1_ledger_release`：按 entry_id 释放（total 减少；已释放条目为 no-op，幂等）；`validate_mm1_resource_ledger`：条目去重、kind 白名单、total 一致性、admitted 与容量一致性、digest（篡改拒绝）。账本只记录字节与类别摘要，不携带路径/权重/像素（`weight_materialized=false`）。
+- 定向 `20 passed`（MM1.7-1.9 全量 + MM1.10 入账/幂等/超限/篡改/释放）；未加载视觉塔或文本权重，真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.53 下一票：`PT-PIPE-MM1.11` 视觉塔组件放置与纯文本请求守卫
+
+1. 基于资源账本做视觉塔组件放置决策（节点容量账本 → 视觉塔可放置性），并保证**纯文本请求不错误加载视觉塔**（视觉组件按需激活，文本段独立可执行）。
+2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
