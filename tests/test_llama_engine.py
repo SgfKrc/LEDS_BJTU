@@ -283,3 +283,38 @@ def test_chat_image_requires_registered_vision(tmp_path):
         assert "vision capability" in str(exc)
     else:
         raise AssertionError("chat_image should require native vision registration")
+
+
+# ================================================================
+# G4.5：GPU offload 预算门与便捷加载
+# ================================================================
+
+def test_estimate_gpu_layers_budget_gate():
+    """8GB 显存场景：部分 offload 层数在合理区间（不承诺全量，不归零）。"""
+    layers = LlamaCppEngine.estimate_gpu_layers(
+        36, 7_662_533_088, int(7.4 * 2**30),
+    )
+    # 每层 ~0.2GB；预算 = 7.4*1.15 - 0.5 ≈ 8.0GB → ~40 层 → 封顶 36
+    assert layers == 36
+    # 显存紧张（4GB，与 SD 并驻留场景）：显著少于全量
+    low = LlamaCppEngine.estimate_gpu_layers(
+        36, 7_662_533_088, int(4 * 2**30),
+    )
+    assert 0 < low < 36
+    # 显存不足 → 0（不强行 offload）
+    zero = LlamaCppEngine.estimate_gpu_layers(
+        36, 7_662_533_088, int(0.4 * 2**30),
+    )
+    assert zero == 0
+
+
+def test_load_gemma4_native_fails_closed_on_vram_shortage(monkeypatch):
+    """require_gpu_layers 不满足时 fail-closed（不加载）。"""
+    monkeypatch.setattr(LlamaCppEngine, "_vram_free_bytes", staticmethod(lambda: int(0.5 * 2**30)))
+    engine = LlamaCppEngine()
+    try:
+        engine.load_gemma4_native(gpu_layers=-1, require_gpu_layers=8)
+    except RuntimeError as exc:
+        assert "显存预算不足" in str(exc)
+    else:
+        raise AssertionError("显存不足时应 fail-closed")
