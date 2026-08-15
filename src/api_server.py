@@ -9641,6 +9641,78 @@ async def get_node_recent_logs(
     return result
 
 
+@app.get("/api/cluster/nodes/log-aggregate")
+async def get_nodes_log_aggregate(
+    request: Request,
+    limit: int = 50,
+    level: str = "",
+    name: str = "",
+):
+    """
+    P7（2026-08-16）：聚合本地与全部在线从节点的最近日志行。
+
+    本地取内存环形缓冲，worker 经 TCP request_node_logs 拉取；每节点
+    返回独立标注的日志行，不落凭据/密钥（行内容由既有脱敏链路保障）。
+    仅主节点可调用；单节点失败返回 error 摘要不中断其余节点。
+    """
+    _require_log_api_access(request)
+    role = _get_effective_role_safe()
+    if role != "master":
+        raise HTTPException(403, "仅主节点可聚合集群日志")
+
+    limit = _normalize_log_limit(limit)
+    from scheduler import NodeRole, NodeState
+
+    # 本地
+    local_entries, _total = _snapshot_recent_logs()
+    local_filtered = _filter_recent_logs(local_entries, level, name)
+    local_logs = [entry["message"] for entry in local_filtered[-limit:]]
+
+    # 在线 worker
+    with scheduler._nodes_lock:
+        online_workers = [
+            nid
+            for nid, info in scheduler.nodes.items()
+            if info.role != NodeRole.MASTER
+            and info.state == NodeState.ONLINE
+        ]
+
+    workers = []
+    for nid in online_workers:
+        try:
+            result = scheduler.request_node_logs(
+                node_id=nid, limit=limit, level=level, name=name, timeout=3.0,
+            )
+            if result and result.get("logs"):
+                workers.append({
+                    "node_id": nid,
+                    "logs": list(result["logs"]),
+                    "count": int(result.get("count", 0)),
+                })
+            else:
+                workers.append({
+                    "node_id": nid,
+                    "logs": [],
+                    "count": 0,
+                    "error": "timeout" if result is None else "no logs",
+                })
+        except Exception as exc:
+            workers.append({
+                "node_id": nid,
+                "logs": [],
+                "count": 0,
+                "error": str(exc)[:100],
+            })
+
+    return {
+        "local": {"node_id": scheduler.get_effective_node_id(), "logs": local_logs},
+        "workers": workers,
+        "limit": limit,
+        "filters": {"level": level or None, "name": name or None},
+        "total_workers": len(online_workers),
+    }
+
+
 @app.get("/api/logs/nodes-summary")
 async def get_nodes_log_summary(request: Request):
     """

@@ -734,3 +734,75 @@ class TestStructuredLogFormat:
         if log_text.strip():
             # 如果有输出，格式应正确
             pass  # 空目录无输出也是正常的
+
+
+# ================================================================
+# P7: 跨节点日志聚合 API（2026-08-16）
+# ================================================================
+
+class TestLogAggregate:
+    def _master_client(self, monkeypatch):
+        import api_server
+        import scheduler as sched_mod
+
+        class FakeInfo:
+            role = sched_mod.NodeRole.CLIENT
+            state = sched_mod.NodeState.ONLINE
+
+        fake_sched = type("FakeScheduler", (), {
+            "nodes": {"w1": FakeInfo(), "w2": FakeInfo()},
+            "get_effective_node_id": staticmethod(lambda: "m0"),
+            "_nodes_lock": __import__("threading").RLock(),
+            "request_node_logs": lambda self, node_id, limit, level="", name="", timeout=3.0: (
+                {"node_id": node_id, "logs": [f"{node_id} line 1", f"{node_id} line 2"],
+                 "count": 2, "buffer_size": 2}
+            ),
+        })()
+        monkeypatch.setattr(api_server, "scheduler", fake_sched)
+        monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "master")
+        return api_server.app
+
+    def test_aggregate_returns_local_and_worker_logs(self, monkeypatch, client):
+        app = self._master_client(monkeypatch)
+        resp = client.get("/api/cluster/nodes/log-aggregate?limit=50")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["local"]["node_id"] == "m0"
+        assert body["total_workers"] == 2
+        assert len(body["workers"]) == 2
+        assert all(w["count"] == 2 for w in body["workers"])
+        assert "w1 line 1" in body["workers"][0]["logs"][0]
+
+    def test_aggregate_worker_timeout_returns_error_without_breaking(self, monkeypatch, client):
+        import api_server
+        import scheduler as sched_mod
+
+        class FakeInfo:
+            role = sched_mod.NodeRole.CLIENT
+            state = sched_mod.NodeState.ONLINE
+
+        fake_sched = type("FakeScheduler", (), {
+            "nodes": {"w1": FakeInfo(), "w2": FakeInfo()},
+            "get_effective_node_id": staticmethod(lambda: "m0"),
+            "_nodes_lock": __import__("threading").RLock(),
+            "request_node_logs": lambda self, node_id, limit, level="", name="", timeout=3.0: (
+                None if node_id == "w1" else
+                {"node_id": node_id, "logs": ["ok"], "count": 1, "buffer_size": 1}
+            ),
+        })()
+        monkeypatch.setattr(api_server, "scheduler", fake_sched)
+        monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "master")
+
+        resp = client.get("/api/cluster/nodes/log-aggregate")
+        assert resp.status_code == 200
+        body = resp.json()
+        w1 = next(w for w in body["workers"] if w["node_id"] == "w1")
+        assert w1["error"] == "timeout"
+        w2 = next(w for w in body["workers"] if w["node_id"] == "w2")
+        assert w2["count"] == 1
+
+    def test_aggregate_requires_master_role(self, monkeypatch, client):
+        import api_server
+        monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "worker")
+        resp = client.get("/api/cluster/nodes/log-aggregate")
+        assert resp.status_code == 403
