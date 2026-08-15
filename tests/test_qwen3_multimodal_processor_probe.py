@@ -764,3 +764,102 @@ def test_vision_tower_placement_fails_closed_without_capacity():
         pass
     else:
         raise AssertionError("纯文本守卫被绕过应拒绝")
+
+
+# ================================================================
+# MM1.12：视觉塔执行器骨架与 text-only 会话回归
+# ================================================================
+
+def _placement(*, has_media: bool, active: bool):
+    from qwen3_multimodal_preflight import (
+        mm1_ledger_commit,
+        mm1_vision_tower_placement,
+    )
+    ledger = mm1_ledger_commit(
+        [{"entry_id": "text_0", "kind": "text_segment", "bytes": 100_000_000}],
+        ledger_id="node-f", node_capacity_bytes=1_000_000_000,
+    )
+    return mm1_vision_tower_placement(
+        ledger, request_has_media=has_media,
+        # inactive = 视觉塔字节超剩余容量（ledger 1GB、text 100MB → 剩 900MB）
+        vision_tower_bytes=(
+            400_000_000 if active else 1_200_000_000
+        ) if has_media else 0,
+    )
+
+
+def _media_reference():
+    from qwen3_multimodal_preflight import build_mm1_media_tensor_reference
+    return build_mm1_media_tensor_reference(
+        {
+            "image": {"pixel_values_shape": [1, 3, 64, 64], "dtype": "float16",
+                      "token_count_estimate": 16},
+            "video": {"pixel_values_shape": [], "token_count_estimate": 0},
+            "output_bytes_estimate": 4096,
+            "weight_materialized": False,
+            "full_model_materialized": False,
+        },
+        model_id="qwen3-vl-4b-instruct",
+        component_ids=["vision_tower", "text_segment_0"],
+    )
+
+
+def test_visual_skeleton_skips_vision_tower_for_text_only():
+    """text-only 会话：visual_path=skipped，全程不触碰视觉塔。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_visual_tower_skeleton,
+    )
+    placement = _placement(has_media=False, active=False)
+    result = run_mm1_visual_tower_skeleton(placement, None, text_only=True)
+    assert result["visual_path"] == "skipped"
+    assert result["vision_tower_active"] is False
+    assert result["weight_materialized"] is False
+    # text-only 带媒体参考 → 拒绝（守卫）
+    try:
+        run_mm1_visual_tower_skeleton(placement, _media_reference(), text_only=True)
+    except Qwen3MultimodalRuntimeError:
+        pass
+    else:
+        raise AssertionError("text-only 携带媒体参考应拒绝")
+
+
+def test_visual_skeleton_placeholder_ready_for_media():
+    """media + active：visual_path=placeholder_ready（占位执行路径）。"""
+    from qwen3_multimodal_runtime import run_mm1_visual_tower_skeleton
+    placement = _placement(has_media=True, active=True)
+    result = run_mm1_visual_tower_skeleton(placement, _media_reference(), text_only=False)
+    assert result["visual_path"] == "placeholder_ready"
+    assert result["vision_tower_active"] is True
+    assert result["total_media_tokens"] == 16
+    assert result["weight_materialized"] is False
+
+
+def test_visual_skeleton_fails_closed_when_tower_inactive():
+    """media + inactive：fail-closed（视觉塔不执行）。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_visual_tower_skeleton,
+    )
+    placement = _placement(has_media=True, active=False)
+    try:
+        run_mm1_visual_tower_skeleton(placement, _media_reference(), text_only=False)
+    except Qwen3MultimodalRuntimeError as exc:
+        assert exc.reason_code == "qwen3_mm1_vision_tower_inactive"
+    else:
+        raise AssertionError("视觉塔未激活的 media 请求应 fail-closed")
+
+
+def test_visual_skeleton_rejects_placement_contradiction():
+    """一致性：放置决策与 text-only 标志矛盾 → 拒绝。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_visual_tower_skeleton,
+    )
+    media_placement = _placement(has_media=True, active=True)
+    try:
+        run_mm1_visual_tower_skeleton(media_placement, None, text_only=True)
+    except Qwen3MultimodalRuntimeError:
+        pass
+    else:
+        raise AssertionError("放置决策与 text-only 矛盾应拒绝")

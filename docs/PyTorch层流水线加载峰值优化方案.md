@@ -487,3 +487,14 @@
 
 1. 把 MM1.11 的放置决策接到视觉塔执行器骨架：media 请求激活视觉占位执行路径，text-only 会话全程不触碰视觉塔（含既有文本链路回归）；覆盖放置决策与执行路径一致性。
 2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
+
+### 8.56 `PT-PIPE-MM1.12` 视觉塔执行器骨架与 text-only 会话回归（开发门 Completed，2026-08-15）
+
+- `run_mm1_visual_tower_skeleton`（`src/qwen3_multimodal_runtime.py`）：按放置决策选执行路径——**text-only 会话** `visual_path="skipped"`（全程不触碰视觉塔，携带媒体参考即拒绝）；**media + active** `visual_path="placeholder_ready"`（占位执行，绑定 media_reference_sha256 与 total_media_tokens）；**media + inactive** fail-closed（`qwen3_mm1_vision_tower_inactive`）；放置决策与 text-only 标志矛盾拒绝（`qwen3_mm1_placement_inconsistent`）。
+- 骨架不加载视觉塔或文本权重（`weight_materialized=false`）；text-only 回归 = 骨架 + 放置守卫双保险，既有文本链路不触碰视觉塔。
+- 定向 `27 passed`（MM1.7-1.11 全量 + MM1.12 四路径：skipped/占位/未激活 fail-closed/矛盾拒绝）；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.57 下一票：`PT-PIPE-MM1.13` 视觉塔占位执行路径与媒体参考消费契约
+
+1. 把 MM1.12 的 `placeholder_ready` 路径接到媒体参考消费边界：以占位执行产出 path-free 的视觉特征摘要（特征 shape/dtype/token 数），并绑定回文本段 hidden handoff 契约；覆盖占位执行与文本段消费一致性。
+2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。

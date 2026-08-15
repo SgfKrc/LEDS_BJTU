@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from qwen3_multimodal_preflight import validate_mm1_media_tensor_reference  # noqa: E402
 from qwen3_multimodal_contract import (
     MM1_MAX_VISUAL_TOKENS,
     Qwen3MultimodalContractError,
@@ -346,8 +347,71 @@ class Qwen3MultimodalSidecarAdapter:
             cleanup(request, reason_code)
 
 
+def run_mm1_visual_tower_skeleton(
+    placement: Mapping[str, Any],
+    media_tensor_reference: Mapping[str, Any] | None,
+    *,
+    text_only: bool,
+) -> dict[str, Any]:
+    """MM1.12：视觉塔执行器骨架——按放置决策选执行路径（不加载权重）。
+
+    - text_only=True：visual_path="skipped"（纯文本守卫：全程不触碰视觉塔，
+      media 参考必须为 None）；
+    - media + vision_tower_active：visual_path="placeholder_ready"（占位执行）；
+    - media + inactive：fail-closed（Qwen3MultimodalRuntimeError）；
+    - 一致性：placement.request_has_media 必须与 text_only 参数一致。
+    """
+    if bool(placement.get("request_has_media")) == bool(text_only):
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_placement_inconsistent",
+            "visual tower placement contradicts the text-only request flag",
+        )
+    if text_only:
+        if media_tensor_reference is not None:
+            raise Qwen3MultimodalRuntimeError(
+                "qwen3_mm1_text_only_media_reference",
+                "text-only requests must not carry a media tensor reference",
+            )
+        return {
+            "schema_version": 1,
+            "skeleton_kind": "qwen3_visual_tower_skeleton",
+            "visual_path": "skipped",
+            "vision_tower_active": False,
+            "reason": "text_only_request_guard",
+            "weight_materialized": False,
+            "full_model_materialized": False,
+        }
+    active = bool(placement.get("vision_tower_active"))
+    if not active:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_vision_tower_inactive",
+            "vision tower is inactive for a media request",
+        )
+    if media_tensor_reference is None:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_media_reference_missing",
+            "media requests require a media tensor reference",
+        )
+    reference = validate_mm1_media_tensor_reference(
+        media_tensor_reference,
+        model_id=str(media_tensor_reference["model_id"]),
+        component_ids=list(media_tensor_reference["component_ids"]),
+    )
+    return {
+        "schema_version": 1,
+        "skeleton_kind": "qwen3_visual_tower_skeleton",
+        "visual_path": "placeholder_ready",
+        "vision_tower_active": True,
+        "media_reference_sha256": reference["reference_sha256"],
+        "total_media_tokens": int(reference["capacity"]["total_media_tokens"]),
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
     "Qwen3MultimodalSyntheticExecutor",
+    "run_mm1_visual_tower_skeleton",
 ]
