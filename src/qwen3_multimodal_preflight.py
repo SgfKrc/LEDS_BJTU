@@ -715,6 +715,107 @@ def validate_mm1_visual_input_contract(
     return contract
 
 
+def mm1_vision_tower_placement(
+    ledger: Mapping[str, Any],
+    *,
+    request_has_media: bool,
+    vision_tower_bytes: int = 0,
+) -> dict[str, Any]:
+    """MM1.11：视觉塔放置决策与纯文本请求守卫。
+
+    - 纯文本请求（无媒体）：vision_tower_active=false——视觉塔不激活、
+      不加载（文本段独立可执行）；
+    - 有媒体请求：账本 admitted 且剩余容量 ≥ 视觉塔权重字节 → 可放置
+      （active=true）；否则 fail-closed（active=false，不执行）。
+    决策对象只含布尔/字节/理由摘要，无路径/权重/像素。
+    """
+    safe_ledger = validate_mm1_resource_ledger(ledger)
+    has_media = bool(request_has_media)
+    try:
+        tower_bytes = int(vision_tower_bytes)
+    except (TypeError, ValueError):
+        raise Qwen3MultimodalPreflightError("MM1.11 vision tower bytes are invalid")
+    if tower_bytes < 0:
+        raise Qwen3MultimodalPreflightError("MM1.11 vision tower bytes must be non-negative")
+
+    remaining = int(safe_ledger["capacity"]["remaining_bytes"])
+    ledger_admitted = bool(safe_ledger["capacity"]["admitted"])
+    if not has_media:
+        # 纯文本守卫：视觉塔不激活，文本段独立
+        active = False
+        reason = "text_only_request_guard"
+        admitted = True
+        required = 0
+    else:
+        required = tower_bytes
+        admitted = bool(ledger_admitted and required <= remaining)
+        active = admitted
+        reason = (
+            "capacity_admitted" if admitted
+            else "vision_tower_capacity_insufficient"
+        )
+    decision = {
+        "schema_version": MM1_SCHEMA_VERSION,
+        "decision_kind": "qwen3_vision_tower_placement",
+        "ledger_id": safe_ledger["ledger_id"],
+        "request_has_media": has_media,
+        "vision_tower_active": bool(active),
+        "reason": reason,
+        "capacity": {
+            "vision_tower_bytes": required,
+            "remaining_bytes": remaining,
+            "admitted": bool(admitted),
+        },
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    decision["decision_sha256"] = _digest(decision, label="MM1 vision tower placement")
+    return decision
+
+
+def validate_mm1_vision_tower_placement(
+    value: Mapping[str, Any],
+    *,
+    ledger: Mapping[str, Any],
+) -> dict[str, Any]:
+    """只读校验放置决策（身份/纯文本守卫/容量一致性/digest）。"""
+    decision = _exact(
+        value,
+        {
+            "schema_version", "decision_kind", "ledger_id",
+            "request_has_media", "vision_tower_active", "reason",
+            "capacity", "weight_materialized", "full_model_materialized",
+            "decision_sha256",
+        },
+        "MM1 vision tower placement",
+    )
+    safe_ledger = validate_mm1_resource_ledger(ledger)
+    if (
+        decision["schema_version"] != MM1_SCHEMA_VERSION
+        or decision["decision_kind"] != "qwen3_vision_tower_placement"
+        or decision["ledger_id"] != safe_ledger["ledger_id"]
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 vision tower placement identity is invalid")
+    if decision["weight_materialized"] is not False or decision["full_model_materialized"] is not False:
+        raise Qwen3MultimodalPreflightError("MM1 vision tower placement must stay weight-free")
+    has_media = bool(decision["request_has_media"])
+    if not has_media and decision["vision_tower_active"] is not False:
+        # 纯文本守卫：无媒体请求绝不允许激活视觉塔
+        raise Qwen3MultimodalPreflightError("MM1 vision tower must stay inactive for text-only requests")
+    if (
+        has_media
+        and decision["vision_tower_active"] is True
+        and int(decision["capacity"]["vision_tower_bytes"]) > int(decision["capacity"]["remaining_bytes"])
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 vision tower placement capacity is inconsistent")
+    if decision["decision_sha256"] != _digest(
+        {key: val for key, val in decision.items() if key != "decision_sha256"},
+        label="MM1 vision tower placement",
+    ):
+        raise Qwen3MultimodalPreflightError("MM1 vision tower placement digest is invalid")
+    return decision
+
+
 def mm1_ledger_commit(
     entries: Sequence[Mapping[str, Any]],
     *,

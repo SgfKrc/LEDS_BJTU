@@ -678,3 +678,89 @@ def test_resource_ledger_release_is_idempotent():
     # 重复释放（media_1 已不在）→ no-op
     again = mm1_ledger_release(released, entry_id="media_1")
     assert validate_mm1_resource_ledger(again)["capacity"]["total_bytes"] == 800_000_000
+
+
+# ================================================================
+# MM1.11：视觉塔组件放置与纯文本请求守卫
+# ================================================================
+
+def _ledger(*, total_entries, capacity_bytes):
+    from qwen3_multimodal_preflight import mm1_ledger_commit
+    return mm1_ledger_commit(
+        total_entries, ledger_id="node-e", node_capacity_bytes=capacity_bytes,
+    )
+
+
+def test_pure_text_request_never_activates_vision_tower():
+    """纯文本请求守卫：无媒体 → 视觉塔不激活（文本段独立可执行）。"""
+    from qwen3_multimodal_preflight import (
+        mm1_vision_tower_placement,
+        validate_mm1_vision_tower_placement,
+    )
+    ledger = _ledger(
+        total_entries=[
+            {"entry_id": "text_0", "kind": "text_segment", "bytes": 200_000_000},
+        ],
+        capacity_bytes=1_000_000_000,
+    )
+    decision = mm1_vision_tower_placement(
+        ledger, request_has_media=False, vision_tower_bytes=800_000_000,
+    )
+    validated = validate_mm1_vision_tower_placement(decision, ledger=ledger)
+    assert validated["vision_tower_active"] is False
+    assert validated["reason"] == "text_only_request_guard"
+    assert validated["capacity"]["admitted"] is True  # 文本段独立可执行
+    payload = json.dumps(validated, ensure_ascii=True)
+    assert "models/" not in payload
+
+
+def test_vision_tower_placement_admitted_with_capacity():
+    """有媒体 + 容量足够 → 视觉塔可放置（active=true）。"""
+    from qwen3_multimodal_preflight import (
+        mm1_vision_tower_placement,
+        validate_mm1_vision_tower_placement,
+    )
+    ledger = _ledger(
+        total_entries=[
+            {"entry_id": "media_1", "kind": "media_input", "bytes": 4_000_000},
+            {"entry_id": "text_0", "kind": "text_segment", "bytes": 200_000_000},
+        ],
+        capacity_bytes=1_500_000_000,
+    )
+    decision = mm1_vision_tower_placement(
+        ledger, request_has_media=True, vision_tower_bytes=800_000_000,
+    )
+    validated = validate_mm1_vision_tower_placement(decision, ledger=ledger)
+    assert validated["vision_tower_active"] is True
+    assert validated["reason"] == "capacity_admitted"
+
+
+def test_vision_tower_placement_fails_closed_without_capacity():
+    """有媒体 + 容量不足 → active=false（fail-closed，视觉塔不执行）。"""
+    from qwen3_multimodal_preflight import (
+        Qwen3MultimodalPreflightError,
+        mm1_vision_tower_placement,
+        validate_mm1_vision_tower_placement,
+    )
+    ledger = _ledger(
+        total_entries=[
+            {"entry_id": "media_1", "kind": "media_input", "bytes": 900_000_000},
+            {"entry_id": "text_0", "kind": "text_segment", "bytes": 200_000_000},
+        ],
+        capacity_bytes=1_000_000_000,
+    )
+    decision = mm1_vision_tower_placement(
+        ledger, request_has_media=True, vision_tower_bytes=800_000_000,
+    )
+    assert decision["vision_tower_active"] is False
+    assert decision["reason"] == "vision_tower_capacity_insufficient"
+    validate_mm1_vision_tower_placement(decision, ledger=ledger)
+    # 篡改：无媒体却标 active=True → 拒绝（纯文本守卫）
+    tampered = dict(decision)
+    tampered["request_has_media"] = False
+    try:
+        validate_mm1_vision_tower_placement(tampered, ledger=ledger)
+    except Qwen3MultimodalPreflightError:
+        pass
+    else:
+        raise AssertionError("纯文本守卫被绕过应拒绝")
