@@ -901,6 +901,17 @@ class ModelManager:
                 profile=profile,
                 model_config=model_config,
             )
+        elif model_type == "gemma":
+            load_tracker = self._load_gemma_layer_range(
+                path,
+                start_layer,
+                end_layer,
+                has_embedding=has_embedding,
+                has_lm_head=has_lm_head,
+                quant_type=quant_type,
+                profile=profile,
+                model_config=model_config,
+            )
         else:
             raise RuntimeError(
                 f"当前 PyTorch 层流水线不支持模型架构: {model_type or 'unknown'}；"
@@ -918,7 +929,7 @@ class ModelManager:
             raise RuntimeError("模型加载失败，无法进行层范围裁剪")
 
         # ---- 裁剪 Transformer 层 ----
-        if model_type == "qwen2":
+        if model_type in ("qwen2", "gemma"):
             transformer = self.model.model
             layers_attr = "layers"
             embedding_attr = "embed_tokens"
@@ -1034,8 +1045,15 @@ class ModelManager:
         quant_type: str = None,
         profile: dict = None,
         model_config=None,
+        architecture: str = "qwen2",
     ) -> _LayerRangeLoadTracker:
-        """Materialize only selected Qwen2 parameters from safetensors shards."""
+        """Materialize only selected parameters from safetensors shards.
+
+        ``architecture`` names the tracker identity for load metrics; the key
+        layout is shared by Qwen2 (``model.layers.`` / ``model.embed_tokens.``
+        / ``model.norm.`` / ``lm_head.``) and Gemma/Gemma 4, so the Gemma
+        adapter reuses this loader through :meth:`_load_gemma_layer_range`.
+        """
         import gc
         import json
         from collections import defaultdict
@@ -1051,7 +1069,7 @@ class ModelManager:
         )
         total_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
         if total_layers <= 0:
-            raise RuntimeError("Qwen2 config 缺少 num_hidden_layers")
+            raise RuntimeError(f"{architecture} config 缺少 num_hidden_layers")
 
         old_path = os.path.abspath(self._model_path or "") if self._model_path else ""
         keep_tokenizer = self.tokenizer if old_path == os.path.abspath(model_path) else None
@@ -1073,7 +1091,7 @@ class ModelManager:
 
         target_device, target_dtype = _select_layer_runtime()
         load_tracker = _LayerRangeLoadTracker(
-            architecture="qwen2",
+            architecture=architecture,
             start_layer=start_layer,
             end_layer=end_layer,
             layer_prefix="model.layers.",
@@ -1109,7 +1127,7 @@ class ModelManager:
                             files_to_keys[filename].append(key)
 
         if not files_to_keys:
-            raise FileNotFoundError("Qwen2 模型目录中未找到分层 safetensors 权重")
+            raise FileNotFoundError(f"{architecture} 模型目录中未找到分层 safetensors 权重")
 
         runtime_quant = "fp16" if target_dtype == torch.float16 else "fp32"
         requested_quant = quant_type or QUANT_TYPE
@@ -1145,7 +1163,7 @@ class ModelManager:
         missing = sorted(required_parameter_names - loaded_keys)
         if missing:
             raise RuntimeError(
-                "Qwen2 分层权重不完整: " + ", ".join(missing[:5])
+                f"{architecture} 分层权重不完整: " + ", ".join(missing[:5])
             )
 
         model.eval()
@@ -1160,12 +1178,42 @@ class ModelManager:
         self._total_model_layers = total_layers
         self._model_layers = end_layer - start_layer
         logger.info(
-            "Qwen2 选择性权重加载完成: Layer %s-%s / %s",
+            f"{architecture} 选择性权重加载完成: Layer %s-%s / %s",
             start_layer,
             end_layer,
             total_layers,
         )
         return load_tracker
+
+    def _load_gemma_layer_range(
+        self,
+        model_path: str,
+        start_layer: int,
+        end_layer: int,
+        *,
+        has_embedding: bool,
+        has_lm_head: bool,
+        quant_type: str = None,
+        profile: dict = None,
+        model_config=None,
+    ) -> _LayerRangeLoadTracker:
+        """Gemma / Gemma 4 PyTorch layer-range adapter (§4.2 模板).
+
+        Gemma's safetensors key layout matches Qwen2 (``model.layers.`` /
+        ``model.embed_tokens.`` / ``model.norm.`` / ``lm_head.``), so the
+        loader is shared; only the tracker/observation identity differs.
+        """
+        return self._load_qwen2_layer_range(
+            model_path,
+            start_layer,
+            end_layer,
+            has_embedding=has_embedding,
+            has_lm_head=has_lm_head,
+            quant_type=quant_type,
+            profile=profile,
+            model_config=model_config,
+            architecture="gemma",
+        )
 
     def _load_qwen_layer_range(
         self,
