@@ -504,3 +504,105 @@ def test_real_media_tensor_reference_in_response():
     encoded = json.dumps(report, ensure_ascii=True).lower()
     assert "pixel_values\"" not in encoded
     assert str(ROOT).lower() not in encoded
+
+
+# ================================================================
+# MM1.9：视觉塔执行器输入占位与容量预算接线
+# ================================================================
+
+def _sample_reference():
+    from qwen3_multimodal_preflight import build_mm1_media_tensor_reference
+    return build_mm1_media_tensor_reference(
+        {
+            "image": {"pixel_values_shape": [1, 3, 64, 64], "dtype": "float16",
+                      "token_count_estimate": 16},
+            "video": {"pixel_values_shape": [1, 2, 3, 32, 32], "dtype": "float16",
+                      "token_count_estimate": 8},
+            "output_bytes_estimate": 4096,
+            "weight_materialized": False,
+            "full_model_materialized": False,
+        },
+        model_id="qwen3-vl-4b-instruct",
+        component_ids=["vision_tower", "text_segment_0"],
+    )
+
+
+def test_visual_input_contract_admitted_within_budget():
+    """容量充足 → admitted=True，契约含 grid/token/字节预算且 path-free。"""
+    from qwen3_multimodal_preflight import (
+        build_mm1_visual_input_contract,
+        validate_mm1_visual_input_contract,
+    )
+    reference = _sample_reference()
+    contract = build_mm1_visual_input_contract(
+        reference, node_capacity_bytes=8192, safety_margin=1.2,
+    )
+    validated = validate_mm1_visual_input_contract(contract, media_tensor_reference=reference)
+    assert validated["contract_kind"] == "qwen3_visual_input_placeholder"
+    assert validated["media_reference_sha256"] == reference["reference_sha256"]
+    assert validated["input"]["total_media_tokens"] == 24
+    assert validated["capacity"]["admitted"] is True
+    assert validated["capacity"]["required_bytes"] == int(4096 * 1.2)
+    payload = json.dumps(validated, ensure_ascii=True)
+    assert "pixel_values\"" not in payload
+    assert "models/" not in payload
+
+
+def test_visual_input_contract_fails_closed_on_budget_shortage():
+    """预算不足 → admitted=False（fail-closed，视觉塔不执行）。"""
+    from qwen3_multimodal_preflight import (
+        Qwen3MultimodalPreflightError,
+        build_mm1_visual_input_contract,
+        validate_mm1_visual_input_contract,
+    )
+    reference = _sample_reference()
+    contract = build_mm1_visual_input_contract(
+        reference, node_capacity_bytes=1024, safety_margin=1.2,
+    )
+    assert contract["capacity"]["admitted"] is False
+    validated = validate_mm1_visual_input_contract(contract, media_tensor_reference=reference)
+    assert validated["capacity"]["admitted"] is False
+    # 篡改 admitted（不足却标 True）→ 拒绝
+    tampered = dict(contract)
+    tampered["capacity"] = dict(contract["capacity"])
+    tampered["capacity"]["admitted"] = True
+    try:
+        validate_mm1_visual_input_contract(tampered, media_tensor_reference=reference)
+    except Qwen3MultimodalPreflightError:
+        pass
+    else:
+        raise AssertionError("admitted 不一致应拒绝")
+
+
+def test_real_visual_input_contract_in_response():
+    """真实模型：响应含 visual_input_contract（容量比对，无权重）。"""
+    sidecar = ROOT / ".venv-qwen3-sidecar" / "Scripts" / "python.exe"
+    if not sidecar.is_file():
+        pytest.skip("MM1.9 requires the isolated Qwen3 pipeline sidecar")
+    manifest, _inspection, request = _prepared("qwen3-vl-4b-instruct")
+    report = run_qwen3_multimodal_processor_probe(
+        model=ROOT / "models" / "qwen3-vl-4b-instruct",
+        manifest=manifest,
+        visual_request=request,
+        timeout_seconds=180,
+        media_smoke={"image_size": [32, 32], "video_frames": 2},
+    )
+    assert report["gate_passed"] is True
+    # 未给 node_capacity → 契约为 None（接线点可选）
+    assert report["response"]["visual_input_contract"] is None
+    # 带容量再跑：契约非 None（接线点生效）
+    report2 = run_qwen3_multimodal_processor_probe(
+        model=ROOT / "models" / "qwen3-vl-4b-instruct",
+        manifest=manifest,
+        visual_request=request,
+        timeout_seconds=180,
+        media_smoke={"image_size": [32, 32], "video_frames": 2},
+        node_capacity_bytes=1024 * 1024,
+    )
+    contract = report2["response"]["visual_input_contract"]
+    assert contract is not None
+    assert contract["contract_kind"] == "qwen3_visual_input_placeholder"
+    assert contract["capacity"]["node_capacity_bytes"] == 1024 * 1024
+    encoded = json.dumps(report2, ensure_ascii=True).lower()
+    assert "pixel_values\"" not in encoded
+    assert str(ROOT).lower() not in encoded

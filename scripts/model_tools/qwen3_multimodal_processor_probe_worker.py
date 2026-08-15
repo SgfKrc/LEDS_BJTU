@@ -20,6 +20,7 @@ from qwen3_multimodal_preflight import (  # noqa: E402
     Qwen3MultimodalPreflightError,
     build_mm1_media_tensor_reference,
     build_mm1_processor_smoke_response,
+    build_mm1_visual_input_contract,
     inspect_mm1_processor_assets,
     validate_mm1_visual_worker_request,
 )
@@ -259,10 +260,18 @@ def execute_request(
             model_id=safe_request["model_id"],
             component_ids=safe_request["component_ids"],
         )
+        # MM1.9：节点容量比对——预算不足 fail-closed（视觉塔不执行）
+        node_capacity = request.get("node_capacity_bytes")
+        visual_input_contract = None
+        if node_capacity is not None:
+            visual_input_contract = build_mm1_visual_input_contract(
+                media_tensor_reference, node_capacity_bytes=int(node_capacity),
+            )
         response = build_mm1_processor_smoke_response(
             safe_request, manifest=manifest, inspection=inspection, runtime=runtime,
             media_summary=media_summary,
             media_tensor_reference=media_tensor_reference,
+            visual_input_contract=visual_input_contract,
         )
         del processor, image_processor, video_processor, tokenizer
         gc.collect()
