@@ -27,6 +27,8 @@ def main() -> int:
         "--max-tokens", type=int, default=512,
         help="生成预算：思考段剥离（默认开）需要覆盖思考段+正文",
     )
+    ap.add_argument("--trace-tokens", type=int, default=0,
+                    help="打印生成 token 追踪（1=仅通道标记，2=全部，前 300 个）")
     ap.add_argument(
         "--suppress-thinking", action=argparse.BooleanOptionalAction, default=True,
         help="屏蔽 <channel|>(101) 思考段起始 token，对齐 Ollama think=false"
@@ -151,6 +153,12 @@ def main() -> int:
             continue
         if collecting:
             tokens.append(tok)
+        if args.trace_tokens and len(tokens) + (0 if collecting else 0) < 300:
+            piece = model.detokenize([tok]).decode("utf-8", "replace")
+            if not collecting and tok in (CHANNEL_START_TOKEN_ID, CHANNEL_END_TOKEN_ID):
+                print(f"    [trace] tok={tok} {'思考开始' if tok == CHANNEL_START_TOKEN_ID else '思考结束'} {piece!r}", flush=True)
+            elif args.trace_tokens >= 2:
+                print(f"    [trace] tok={tok} {piece!r}", flush=True)
         last = tok
     if not collecting:
         print(
