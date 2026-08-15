@@ -381,17 +381,37 @@ def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpe
             ),
         }
 
-    if required and llm and (
-        llm["correctness_rate_baseline"] < 0.60
-        or llm["format_rate_baseline"] < 0.90
-    ):
-        raise PlanError(
-            "quality.required cannot use an unapproved weak LLM calibration floor"
-        )
+    # §6.2.4 (decision 2026-08-13, plan 1): with quality.required the LLM side
+    # judges only format rate on the approved non-R1 floor (>= 0.30) plus
+    # manual review; objective correctness is explicitly not participating
+    # (baseline 0.0). A non-zero correctness floor still needs the >= 0.60
+    # approval bar so no unapproved correctness gate can slip in.
+    if required and llm:
+        if llm["format_rate_baseline"] < 0.30:
+            raise PlanError(
+                "quality.required LLM format floor must be >= 0.30 "
+                "(approved non-R1 floor, decision 2026-08-13)"
+            )
+        if (
+            llm["correctness_rate_baseline"] != 0.0
+            and llm["correctness_rate_baseline"] < 0.60
+        ):
+            raise PlanError(
+                "quality.required LLM correctness floor must be 0 "
+                "(not participating) or >= 0.60"
+            )
+    # gemma_judge became eligible for quality.required after the real
+    # three-round calibration + dual manual review (2026-08-13);
+    # baselines must stay at or above the approved 0.70/0.40 floors.
     if required and gemma_judge:
-        raise PlanError(
-            "gemma_judge cannot be quality.required before real calibration is approved"
-        )
+        if (
+            gemma_judge["topic_hit_rate_baseline"] < 0.70
+            or gemma_judge["key_element_coverage_baseline"] < 0.40
+        ):
+            raise PlanError(
+                "quality.required gemma_judge baselines must be >= approved "
+                "0.70/0.40 (calibrated 2026-08-13)"
+            )
     if required and not any((llm, sd, gemma_judge)):
         raise PlanError("quality.required needs at least one configured check")
     return QualitySpec(

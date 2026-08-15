@@ -32,7 +32,7 @@
     "command": [
       "{python}", "scripts/experiment_gemma_quality_unit.py",
       "--evidence", "fixtures/quality_reports/gemma-judge-counts-fixture-v1.json",
-      "--expected-evidence-sha256", "14f3d71b9b52ceb88df31a44b786ace897b1bf6a4c21b57e1ed340998e440e27",
+      "--expected-evidence-sha256", "a0a33752672169585e0bf07eb39ae56879e460ebd64add0262f44311a0a2136f",
       "--judge-contract", "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
       "--expected-judge-contract-sha256", "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
       "--expected-model", "gemma4:12b",

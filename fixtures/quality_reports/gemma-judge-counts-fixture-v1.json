@@ -1,6 +1,7 @@
 {
   "model": "gemma4:12b",
   "judge_contract_id": "gemma-judge-counts-v1",
+  "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
   "topic_hit": {"evaluated_count": 10, "passed_count": 8},
   "key_element_coverage": {"evaluated_count": 10, "passed_count": 6}
 }
