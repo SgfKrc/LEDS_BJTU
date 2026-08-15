@@ -190,19 +190,39 @@ def _find_converter(explicit: Path | None) -> tuple[Path | None, str]:
 # QLH converter patch marker (2026-08-16): legacy Qwen (QWenLMHeadModel) needs
 # `layer_norm_epsilon` accepted as an rms-epsilon source in conversion/base.py.
 # The llama.cpp submodule points at read-only upstream and cannot be pushed,
-# so the patch lives in the working tree; a fresh submodule init drops it.
-# Fail closed instead of silently producing GGUF that quantize rejects.
+# so the patch is tracked in packaging/patches/ and auto-applied on demand;
+# a fresh submodule init is repaired on the next conversion (no silent failure).
 _PATCH_MARKER = "QLH patch (2026-08-16): legacy Qwen (QWenLMHeadModel)"
 
 
-def _require_converter_patch(converter: Path) -> None:
+def _ensure_converter_patch(converter: Path) -> None:
+    """Apply the tracked converter patch to the submodule working tree if missing.
+
+    Idempotent: an already-patched base.py passes through untouched. A missing
+    patch file or a failed apply fails closed instead of silently producing
+    GGUF that quantize rejects.
+    """
     base_py = converter.parent / "conversion" / "base.py"
     if not base_py.is_file():
         return  # non-submodule converters (PATH installs) are out of scope
-    if _PATCH_MARKER not in base_py.read_text(encoding="utf-8"):
+    if _PATCH_MARKER in base_py.read_text(encoding="utf-8"):
+        return
+    patch = (
+        Path(__file__).resolve().parents[2]
+        / "packaging" / "patches" / "llama-cpp-converter-qwen-eps.patch"
+    )
+    if not patch.is_file():
         raise GGUFConvertError(
-            "llama.cpp submodule converter patch is missing "
-            "(fresh submodule init?); see docs/已知问题记录.md #10"
+            "converter patch file packaging/patches/llama-cpp-converter-qwen-eps.patch "
+            "is missing; see docs/已知问题记录.md #10"
+        )
+    result = subprocess.run(
+        ["git", "-C", str(converter.parent), "apply", str(patch)],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        raise GGUFConvertError(
+            f"failed to apply converter patch: {(result.stderr or result.stdout)[:200]}"
         )
 
 
@@ -298,7 +318,7 @@ def plan_conversion(
     quantizer_path, quantizer_info = _find_quantizer(Path(quantizer).expanduser().absolute() if quantizer else None)
     if converter_path is not None:
         try:
-            _require_converter_patch(converter_path)
+            _ensure_converter_patch(converter_path)
         except GGUFConvertError as exc:
             errors.append(_error("converter_patch_missing", str(exc)))
     converter_supported = _supported_architectures(converter_path)
