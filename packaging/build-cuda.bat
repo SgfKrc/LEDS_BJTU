@@ -88,9 +88,18 @@ REM T9.6: build the companion console before signing the application tree.
 if errorlevel 1 exit /b 1
 if not exist "dist\QLH-Edge-Inference-CUDA\QLH-TUI-Chat\QLH-TUI-Chat.exe" exit /b 1
 
+REM MODEL-TOOLS P0: build the model-tools CLI console into the same signed tree.
+"%PYTHON%" -m PyInstaller packaging\qlh-model-tools.spec --noconfirm ^
+    --distpath "dist\QLH-Edge-Inference-CUDA" ^
+    --workpath "build\qlh-model-tools-cuda"
+if errorlevel 1 exit /b 1
+if not exist "dist\QLH-Edge-Inference-CUDA\QLH-Model-Tools\QLH-Model-Tools.exe" exit /b 1
+
 if not exist "dist\QLH-Edge-Inference-CUDA\docs" mkdir "dist\QLH-Edge-Inference-CUDA\docs"
 if not exist "dist\QLH-Edge-Inference-CUDA\tools" mkdir "dist\QLH-Edge-Inference-CUDA\tools"
 copy /y "bjtu.bat" "dist\QLH-Edge-Inference-CUDA\bjtu.bat" >nul
+if errorlevel 1 exit /b 1
+copy /y "packaging\model-tools.bat" "dist\QLH-Edge-Inference-CUDA\model-tools.bat" >nul
 if errorlevel 1 exit /b 1
 copy /y "packaging\version.txt" "dist\QLH-Edge-Inference-CUDA\version.txt" >nul
 if errorlevel 1 exit /b 1
