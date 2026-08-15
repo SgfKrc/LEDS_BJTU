@@ -154,13 +154,44 @@ def test_plan_rejects_quality_rubric_or_objective_subset_drift(tmp_path):
         plan.verify_prompt_set()
 
 
-def test_weak_calibration_floor_cannot_be_declared_as_required(tmp_path):
+def test_correctness_floor_zero_allowed_but_weak_format_rejected_as_required(tmp_path):
+    # Decision 2026-08-13 plan 1: with required=true the LLM side judges only
+    # format rate; correctness baseline 0.0 means "not participating" and is
+    # allowed. A format floor below the approved 0.30 stays rejected.
     path = _quality_plan(tmp_path, required=False).source_path
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["quality"]["required"] = True
     raw["quality"]["llm"]["correctness_rate_baseline"] = 0.0
     path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(PlanError, match="unapproved weak"):
+    plan = load_plan(path)  # allowed: correctness 0 + format 0.9 >= 0.30
+    assert plan.quality.required is True
+
+    raw["quality"]["llm"]["format_rate_baseline"] = 0.20
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(PlanError, match="format floor"):
+        load_plan(path)
+
+
+def test_gemma_judge_required_requires_approved_baselines(tmp_path):
+    # Decision 2026-08-13: gemma_judge is eligible for required=true with the
+    # approved 0.70/0.40 floors; weaker baselines stay rejected.
+    path = _quality_plan(tmp_path, required=False).source_path
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["quality"]["required"] = True
+    raw["quality"]["gemma_judge"] = {
+        "model": "gemma4:12b",
+        "judge_contract_id": "gemma-judge-counts-v1",
+        "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+        "topic_hit_rate_baseline": 0.70,
+        "key_element_coverage_baseline": 0.40,
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    plan = load_plan(path)
+    assert plan.quality.required is True
+
+    raw["quality"]["gemma_judge"]["topic_hit_rate_baseline"] = 0.60
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(PlanError, match="approved"):
         load_plan(path)
 
 

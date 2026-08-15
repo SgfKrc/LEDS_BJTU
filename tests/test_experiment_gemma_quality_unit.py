@@ -29,7 +29,7 @@ CONTRACT = ROOT / "fixtures" / "quality_rubrics" / "gemma-judge-counts-v1.json"
 EVIDENCE = ROOT / "fixtures" / "quality_reports" / "gemma-judge-counts-fixture-v1.json"
 ADAPTER = ROOT / "scripts" / "experiment_gemma_quality_unit.py"
 CONTRACT_SHA256 = "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88"
-EVIDENCE_SHA256 = "14f3d71b9b52ceb88df31a44b786ace897b1bf6a4c21b57e1ed340998e440e27"
+EVIDENCE_SHA256 = "a0a33752672169585e0bf07eb39ae56879e460ebd64add0262f44311a0a2136f"
 GEMMA_SPEC = {
     "model": "gemma4:12b",
     "judge_contract_id": "gemma-judge-counts-v1",
@@ -45,10 +45,14 @@ def _contract() -> dict:
     return json.loads(CONTRACT.read_text(encoding="utf-8"))
 
 
-def _run_adapter(output: Path, *, evidence_digest: str = EVIDENCE_SHA256) -> subprocess.CompletedProcess[str]:
+def _run_adapter(
+    output: Path, *, evidence_digest: str = EVIDENCE_SHA256,
+    evidence_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    evidence = evidence_path or EVIDENCE
     return subprocess.run([
         sys.executable, str(ADAPTER),
-        "--evidence", str(EVIDENCE), "--expected-evidence-sha256", evidence_digest,
+        "--evidence", str(evidence), "--expected-evidence-sha256", evidence_digest,
         "--judge-contract", str(CONTRACT), "--expected-judge-contract-sha256", CONTRACT_SHA256,
         "--expected-model", "gemma4:12b", "--expected-contract-id", "gemma-judge-counts-v1",
         "--result-file", str(output),
@@ -127,13 +131,38 @@ def test_gemma_v2_record_schema_and_advisory_gate(tmp_path):
     assert list(jsonschema.Draft202012Validator(schema).iter_errors(record)) == []
 
 
-def test_gemma_required_plan_is_rejected_before_runtime(tmp_path):
+def test_gemma_required_plan_allowed_with_approved_baselines(tmp_path):
+    # Decision 2026-08-13: gemma_judge is eligible for quality.required after
+    # the real calibration + dual review; the fixture's 0.70/0.50 floors are at
+    # or above the approved 0.70/0.40, so required=true now loads fine.
     raw = json.loads(PLAN.read_text(encoding="utf-8"))
     raw["quality"]["required"] = True
     path = tmp_path / "required-gemma.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
-    with pytest.raises(PlanError, match="cannot be quality.required"):
-        load_plan(path)
+    plan = load_plan(path)
+    assert plan.quality.required is True
+
+
+def test_adapter_accepts_real_evidence_with_contract_sha(tmp_path):
+    # Real judge output carries judge_contract_sha256; the adapter must accept
+    # it (and reject a mismatching SHA) instead of treating it as unsupported.
+    output = tmp_path / "result.json"
+    raw = _raw_evidence()
+    raw["judge_contract_sha256"] = CONTRACT_SHA256
+    ev_path = tmp_path / "real-evidence.json"
+    ev_path.write_text(json.dumps(raw), encoding="utf-8")
+    import hashlib
+    digest = hashlib.sha256(ev_path.read_bytes()).hexdigest()
+    assert _run_adapter(output, evidence_digest=digest, evidence_path=ev_path).returncode == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["quality_completed"] == 1
+
+    raw["judge_contract_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="SHA-256"):
+        collect_evidence(
+            raw, _contract(), expected_model="gemma4:12b",
+            expected_contract_id="gemma-judge-counts-v1",
+            expected_contract_sha256=CONTRACT_SHA256,
+        )
 
 
 def test_fixture_plan_runs_through_cli_without_gemma(tmp_path):
