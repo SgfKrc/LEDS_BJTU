@@ -294,7 +294,8 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 > - **GPU offload**：`load_gemma4_native()`（受管工件 + `estimate_gpu_layers` 显存预算门 + `_vram_free_bytes` nvidia-smi 查询 + `require_gpu_layers` fail-closed + `mtmd_use_gpu`）；实测加载后显存 6152 MiB（部分 offload 生效），热时延 **17-18s**（CPU 基线 170-250s，10 倍加速）；
 > - **打包代码**：`qlh-cuda.spec` 注释登记（.venv-gemma4-native 依赖/工件/运行时约束）——**实机验证延后**（Surface 修复后）；
 > - **卸载/取消**：cancel_event 中途取消 ✓（finish=cancelled）；⚠️ unload 后显存不归零（llama.cpp CUDA context 缓存，进程退出才释放——后续优化：llama_backend_free）；
-> - **G4.6 对照三表（sd-001 图生文，热）**：时延 **原生 17-18s vs Ollama 3.2s（~5 倍）**；吞吐 原生 ~2.8 tok/s vs Ollama ~15 tok/s；语义 一致（同图同义）。**主因 mmproj 图像编码在 CPU**（`CLIP using CPU backend`——绑定无 CUDA 编译）；**结论：性能差距不可接受 → 按 §5.7 决策保留双轨**（Ollama 产品基线 + 原生自包含可选）；后续优化候选：CUDA 版 llama-cpp-python 重编（mmproj GPU offload）+ `llama_backend_free` 显存释放。
+> - **G4.6 对照三表（sd-001 图生文，热）——最终版（2026-08-15，CUDA 13.3 全 offload）**：时延 **原生 3.1s vs Ollama 3.2s（打平）**；吞吐 原生 ~15 tok/s vs Ollama ~15 tok/s（持平）；语义 一致（同图同义）。显存 原生 ~6.1GB vs Ollama ~9.9GB 工作集（原生更低）。**结论更新：性能差距消除，原生路径具备替代资格**；双轨保留（Ollama 产品基线 + 原生自包含等价路径）——"最终摆脱"判定（无 Ollama 环境验收）仍待打包实机（Surface 修复后）。
+> - **CUDA 绑定重编方案（2026-08-15 记录，供复现）**：工具链 = CUDA 13.3（network 安装器 + redist 补运行时 cudart/cublas 拷入 `llama_cpp/lib`）+ VS2026 BuildTools（MSVC 14.51）+ pip cmake 4.4.2 + pip nvcc 包 ptxas。**关键坑**：① vcvars64 环境使 cudafe++ 崩溃（ACCESS_VIOLATION）——必须**最小环境**（手动设 INCLUDE/LIB/PATH，PATH 不带 MSYS2/vcvars）；② CMAKE_ARGS 经 scikit-build shlex 解析——路径用**短名正斜杠**（`C:/PROGRA~1/NVIDIA~2/CUDA/v13.3`）；③ MSBuild 需 `CudaToolkitDir` 环境变量；④ 运行时 DLL（cudart64_13/cublas64_13/cublasLt64_13）从 NVIDIA redist 下载拷入绑定 lib 目录。构建脚本 `build/build-cuda-llamacpp.bat`（项目内留存）。
 
 | 里程碑 | 内容 | 验收标准 | 依赖 |
 |---|---|---|---|
