@@ -1324,3 +1324,70 @@ def test_gguf_convert_execute_cancel_cleans_staging(tmp_path: Path, monkeypatch)
     assert not target.exists()
     assert not target.with_name(target.name + ".sha256").exists()
     assert not list(tmp_path.glob(".qlh-gguf-staging-*"))
+
+
+# ================================================================
+# P8: 模型导入向导（2026-08-16）
+# ================================================================
+
+class TestImportModelWizard:
+    def test_resolve_local_directory(self, tmp_path):
+        from scripts.model_tools.import_model import resolve_target
+        assert resolve_target(str(tmp_path), None) == tmp_path.absolute()
+
+    def test_resolve_repo_name_to_models_root(self, tmp_path, monkeypatch):
+        from scripts.model_tools.import_model import resolve_target
+        monkeypatch.chdir(tmp_path)
+        assert resolve_target("SomeOrg/some-model", None).name == "some-model"
+
+    def test_verify_files_calculates_sha_and_bytes(self, tmp_path):
+        from scripts.model_tools.import_model import verify_files
+        import hashlib
+        target = tmp_path / "model"
+        target.mkdir()
+        payload = b"fake-weights"
+        (target / "model.safetensors").write_bytes(payload)
+        summary = verify_files([target / "model.safetensors"], None)
+        assert summary["file_count"] == 1
+        assert summary["total_bytes"] == len(payload)
+        assert summary["sha256"] == hashlib.sha256(payload).hexdigest()
+
+    def test_verify_files_strict_sha_mismatch_fails_closed(self, tmp_path):
+        from scripts.model_tools.import_model import verify_files
+        target = tmp_path / "model"
+        target.mkdir()
+        (target / "model.gguf").write_bytes(b"x")
+        import pytest as _pytest
+        with _pytest.raises(ValueError, match="SHA-256 不匹配"):
+            verify_files([target / "model.gguf"], "0" * 64)
+
+    def test_register_model_persists_to_sqlite(self, tmp_path, monkeypatch):
+        from scripts.model_tools.import_model import register_model
+        from local_store import get_local_experimental_models, delete_local_experimental_model
+        target = tmp_path / "imported-model"
+        target.mkdir()
+        summary = {"file_count": 1, "total_bytes": 3, "sha256": "a" * 64}
+        assert register_model("imported-model", target, summary) is True
+        try:
+            models = get_local_experimental_models()
+            assert any(m.get("model_id") == "imported-model" for m in models)
+        finally:
+            delete_local_experimental_model("imported-model")
+
+    def test_cli_wizard_imports_local_dir_without_download(self, tmp_path, monkeypatch, capsys):
+        import subprocess, sys
+        target = tmp_path / "cli-model"
+        target.mkdir()
+        (target / "model.gguf").write_bytes(b"fake")
+        result = subprocess.run(
+            [sys.executable, "scripts/model_tools.py", "import-model", str(target),
+             "--json", "--register"],
+            capture_output=True, text=True, encoding="utf-8", cwd=".",
+        )
+        assert result.returncode == 0
+        import json as _json
+        payload = _json.loads(result.stdout[result.stdout.find("{"):])
+        assert payload["registered"] is True
+        assert payload["model_id"] == "cli-model"
+        from local_store import delete_local_experimental_model
+        delete_local_experimental_model("cli-model")
