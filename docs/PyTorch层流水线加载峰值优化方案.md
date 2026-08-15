@@ -443,3 +443,14 @@
 
 1. 将 MM1.7 的媒体摘要接入视觉组件边界：投影为 path-free 的媒体张量参考（shape/dtype/grid/token 契约），供后续视觉塔执行器的输入占位与容量预算；覆盖摘要与权重/媒体路径解耦的回归。
 2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
+
+### 8.48 `PT-PIPE-MM1.8` 媒体张量跨边界投影与视觉组件占位（开发门 Completed，2026-08-15）
+
+- `build_mm1_media_tensor_reference` 把 MM1.7 媒体摘要投影为 **path-free 媒体张量参考**（`qwen3_visual_media_tensor_placeholder`）：image/video 的 shape/dtype/patch 网格 token 估计 + `capacity.total_media_tokens`/`output_bytes_estimate` 容量预算（供视觉塔执行器输入占位与容量规划）；`weight_materialized=false/full_model_materialized=false`，pixel_values/原始媒体/路径与 prompt 一律不进入。
+- `validate_mm1_media_tensor_reference` 只读校验：身份（model_id/component_ids）、空媒体条目、digest（篡改 fail-closed）。worker 响应新增 `media_tensor_reference`（与 `media_summary` 解耦并列）。
+- 定向 `14 passed`（MM1.7 全量 + MM1.8 投影/拒绝/真实双模型）；未加载视觉塔或文本权重，真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.49 下一票：`PT-PIPE-MM1.9` 视觉塔执行器输入占位与容量预算接线
+
+1. 把 `media_tensor_reference` 接到视觉塔执行器边界：以张量参考为输入占位构造 path-free 的视觉输入契约（grid/token/字节预算与节点容量比对），覆盖预算不足 fail-closed 与参考解耦回归。
+2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
