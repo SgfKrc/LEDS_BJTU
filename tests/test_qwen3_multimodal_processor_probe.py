@@ -1121,3 +1121,98 @@ def test_synthetic_text_decode_fails_closed_on_mismatch():
         assert exc.reason_code == "qwen3_mm1_sequence_overflow"
     else:
         raise AssertionError("序列超预算应拒绝")
+
+
+# ================================================================
+# MM1.17：CPU 混合链端到端合成回归（视觉塔真实 + 文本合成）
+# ================================================================
+
+def test_synthetic_hybrid_chain_end_to_end():
+    """混合链：合成媒体链 + 真实视觉特征 + 文本段合成解码（token 对齐）。"""
+    from qwen3_multimodal_runtime import run_mm1_synthetic_hybrid_chain
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    result = run_mm1_synthetic_hybrid_chain(
+        vision_feature=_real_vision_feature(),
+        manifest=manifest,
+        media_smoke={"image_size": [32, 32], "video_frames": 2},
+        node_capacity_bytes=2_000_000_000,
+        prompt_tokens=4,
+    )
+    assert result["chain_kind"] == "qwen3_synthetic_hybrid_chain"
+    assert result["ledger_admitted"] is True
+    assert result["vision_tower_active"] is True
+    assert result["visual_path"] == "placeholder_ready"
+    # token 一致性：特征 token == 文本段视觉 token
+    assert result["consistency"]["tokens_match"] is True
+    decode = result["decode"]
+    assert decode["input"]["layout"]["visual_span"] == [0, 64]
+    assert decode["input"]["layout"]["text_span"] == [64, 68]
+    # 权重登记：视觉塔 true（真实特征携带）、文本 false
+    assert result["vision_tower_weight_materialized"] is True
+    assert result["text_weight_materialized"] is False
+    assert result["full_model_materialized"] is False
+
+
+def test_synthetic_hybrid_chain_fails_closed_without_capacity():
+    """容量不足 → 骨架 fail-closed（视觉塔不执行）。"""
+    from qwen3_multimodal_runtime import (
+        Qwen3MultimodalRuntimeError,
+        run_mm1_synthetic_hybrid_chain,
+    )
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    try:
+        run_mm1_synthetic_hybrid_chain(
+            vision_feature=_real_vision_feature(),
+            manifest=manifest,
+            media_smoke={"image_size": [32, 32], "video_frames": 2},
+            node_capacity_bytes=100_000,
+        )
+    except Qwen3MultimodalRuntimeError:
+        pass  # fail-closed（视觉塔不执行）
+    else:
+        raise AssertionError("容量不足应 fail-closed")
+
+
+@pytest.mark.real_model
+def test_real_vision_feature_feeds_hybrid_chain():
+    """真实串联：MM1.15 真实视觉特征 → MM1.17 混合链（端到端回归）。"""
+    sidecar = ROOT / ".venv-qwen3-sidecar" / "Scripts" / "python.exe"
+    if not sidecar.is_file():
+        pytest.skip("MM1.17 requires the isolated Qwen3 pipeline sidecar")
+    import psutil
+    if psutil.virtual_memory().available < 4 * 2**30:
+        pytest.skip("MM1.17 资源门：可用 RAM < 4GB")
+    from scripts.model_tools.qwen3_multimodal_vision_tower_probe import (
+        run_qwen3_multimodal_vision_tower_probe,
+    )
+    from qwen3_multimodal_runtime import run_mm1_synthetic_hybrid_chain
+
+    probe = run_qwen3_multimodal_vision_tower_probe(
+        model=ROOT / "models" / "qwen3-vl-4b-instruct", timeout_seconds=300,
+    )
+    assert probe["status"] == "vision_tower_weights_loaded"
+    feature = {
+        "feature_kind": "qwen3_visual_feature_placeholder",
+        "model_id": "qwen3-vl-4b-instruct",
+        "media_reference_sha256": probe["response"]["synthetic_reference_sha256"],
+        "tensor": {
+            "shape": list(probe["response"]["real_feature"]["shape"]),
+            "dtype": "float32",
+            "device": "cpu",
+        },
+        "synthetic": False,
+        "weight_materialized": True,
+        "full_model_materialized": False,
+    }
+    manifest, _inspection, _request = _prepared("qwen3-vl-4b-instruct")
+    result = run_mm1_synthetic_hybrid_chain(
+        vision_feature=feature,
+        manifest=manifest,
+        media_smoke={"image_size": [32, 32], "video_frames": 2},
+        node_capacity_bytes=2_000_000_000,
+        prompt_tokens=4,
+    )
+    assert result["consistency"]["tokens_match"] is True
+    assert result["vision_tower_weight_materialized"] is True
+    assert result["text_weight_materialized"] is False
+    assert result["full_model_materialized"] is False

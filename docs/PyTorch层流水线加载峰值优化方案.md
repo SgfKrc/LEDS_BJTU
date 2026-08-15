@@ -542,3 +542,14 @@
 
 1. 串联 MM1.15+MM1.16 与 MM1.14 合成链：真实视觉特征 → 文本段合成解码，作为 CPU 混合端到端回归（视觉塔真实权重、文本段零权重、视觉/文本 token 对齐）。
 2. 保持 `weight_materialized` 如实登记（视觉塔 true/文本 false）、CPU 合成；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.66 `PT-PIPE-MM1.17` CPU 混合链端到端合成回归（开发门 Completed，2026-08-15）——MM1 视觉塔真实阶段收口
+
+- `run_mm1_synthetic_hybrid_chain`：**CPU 混合链端到端**——合成媒体链（摘要→张量参考→账本→放置→骨架，MM1.14 路径）→ **真实视觉特征**（MM1.15 产出，替代占位执行）→ 文本段合成解码（MM1.16，视觉区 `[0:64]` + 文本区 `[64:68]` token 对齐）；容量不足 fail-closed。
+- **权重如实登记**：`vision_tower_weight_materialized=true`（真实特征携带）、`text_weight_materialized=false`（文本零加载）、`full_model_materialized=false`。
+- 定向 `39 passed`（MM1.7-1.16 全量 + MM1.17 混合链/容量不足/**真实串联端到端**）；真实图像语义仍不宣称，跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。
+
+### 8.67 下一票：`PT-PIPE-MM1.18` 真实视觉语义 smoke 与跨节点 hidden handoff 前置
+
+1. 以固定测试图走真实视觉塔 + 真实文本段前向（首次加载文本权重），产出视觉语义描述并对照人工/合成基线；随后将视觉特征接入跨节点 hidden handoff 契约（text_chain 边界）。
+2. 首次引入文本段权重加载与真实语义，需独立资源门与登记；CUDA/双机 parity、长视频与生产路由继续独立后置。

@@ -744,6 +744,87 @@ def run_mm1_synthetic_text_decode(
     }
 
 
+def run_mm1_synthetic_hybrid_chain(
+    *,
+    vision_feature: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    media_smoke: Mapping[str, Any],
+    node_capacity_bytes: int,
+    prompt_tokens: int = 4,
+    sequence_length: int = 128,
+    text_chain_id: str = "a" * 64,
+    generation: int = 3,
+) -> dict[str, Any]:
+    """MM1.17：CPU 混合链端到端合成回归——真实视觉特征 + 合成媒体链 +
+    文本段合成解码（视觉塔真实、文本零权重、token 对齐）。
+
+    媒体链（摘要→参考→账本→放置→骨架）走 MM1.14 合成路径；占位执行
+    由真实视觉特征替代（MM1.15 产出）；文本段合成解码（MM1.16）。
+    """
+    safe_manifest = validate_mm1_model_manifest(manifest)
+    if vision_feature.get("feature_kind") != "qwen3_visual_feature_placeholder":
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_feature_invalid",
+            "hybrid chain requires a visual feature summary",
+        )
+    # 1) 合成媒体链（MM1.14 前置：摘要 → 张量参考 → 账本 → 放置 → 骨架）
+    summary = _synthetic_media_summary(media_smoke)
+    reference = build_mm1_media_tensor_reference(
+        summary,
+        model_id=safe_manifest["model_id"],
+        component_ids=[str(item) for item in safe_manifest.get("component_ids", [])]
+        or ["vision_tower", "text_segment_0"],
+    )
+    vision = safe_manifest["vision"]
+    tower_bytes = int(vision.get("hidden_size", 0) * 4096 * vision.get("depth", 1) * 2) or 400_000_000
+    ledger = mm1_ledger_commit(
+        [
+            {"entry_id": "vision_tower", "kind": "vision_tower_weights", "bytes": tower_bytes},
+            {"entry_id": "media_1", "kind": "media_input",
+             "bytes": int(summary["output_bytes_estimate"])},
+            {"entry_id": "text_0", "kind": "text_segment",
+             "bytes": int(safe_manifest["text"]["hidden_size"]) * 2048 * 2},
+        ],
+        ledger_id="node-hybrid",
+        node_capacity_bytes=int(node_capacity_bytes),
+    )
+    placement = mm1_vision_tower_placement(
+        ledger, request_has_media=True, vision_tower_bytes=tower_bytes,
+    )
+    skeleton = run_mm1_visual_tower_skeleton(placement, reference, text_only=False)
+
+    # 2) 真实视觉特征（替代占位执行——MM1.15 产出）接入文本段合成解码
+    decode = run_mm1_synthetic_text_decode(
+        vision_feature=vision_feature,
+        manifest=safe_manifest,
+        prompt_tokens=prompt_tokens,
+        sequence_length=sequence_length,
+        text_chain_id=text_chain_id,
+        generation=generation,
+    )
+    feature_tokens = int(
+        (vision_feature.get("tensor") or {}).get("shape", [0, 0, 0])[1],
+    )
+    return {
+        "chain_kind": "qwen3_synthetic_hybrid_chain",
+        "model_id": safe_manifest["model_id"],
+        "ledger_admitted": bool(ledger["capacity"]["admitted"]),
+        "vision_tower_active": bool(placement["vision_tower_active"]),
+        "visual_path": skeleton["visual_path"],
+        "media_tokens": int(reference["capacity"]["total_media_tokens"]),
+        "feature_tokens": feature_tokens,
+        "decode": decode,
+        "consistency": {
+            "tokens_match": bool(feature_tokens == decode["input"]["visual_tokens"]),
+        },
+        "vision_tower_weight_materialized": bool(
+            vision_feature.get("weight_materialized", False),
+        ),
+        "text_weight_materialized": False,
+        "full_model_materialized": False,
+    }
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
@@ -753,4 +834,5 @@ __all__ = [
     "bind_mm1_visual_feature_handoff",
     "run_mm1_synthetic_visual_chain",
     "run_mm1_synthetic_text_decode",
+    "run_mm1_synthetic_hybrid_chain",
 ]
