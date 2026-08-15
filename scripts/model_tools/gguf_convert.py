@@ -187,6 +187,25 @@ def _find_converter(explicit: Path | None) -> tuple[Path | None, str]:
     return None, "missing"
 
 
+# QLH converter patch marker (2026-08-16): legacy Qwen (QWenLMHeadModel) needs
+# `layer_norm_epsilon` accepted as an rms-epsilon source in conversion/base.py.
+# The llama.cpp submodule points at read-only upstream and cannot be pushed,
+# so the patch lives in the working tree; a fresh submodule init drops it.
+# Fail closed instead of silently producing GGUF that quantize rejects.
+_PATCH_MARKER = "QLH patch (2026-08-16): legacy Qwen (QWenLMHeadModel)"
+
+
+def _require_converter_patch(converter: Path) -> None:
+    base_py = converter.parent / "conversion" / "base.py"
+    if not base_py.is_file():
+        return  # non-submodule converters (PATH installs) are out of scope
+    if _PATCH_MARKER not in base_py.read_text(encoding="utf-8"):
+        raise GGUFConvertError(
+            "llama.cpp submodule converter patch is missing "
+            "(fresh submodule init?); see docs/已知问题记录.md #10"
+        )
+
+
 def _find_quantizer(explicit: Path | None) -> tuple[Path | None, dict[str, Any]]:
     return resolve_quantizer(explicit)
 
@@ -277,6 +296,11 @@ def plan_conversion(
         errors.append(_error("target_inside_source", "target must not be inside the source directory"))
     converter_path, converter_status = _find_converter(Path(converter).expanduser().absolute() if converter else None)
     quantizer_path, quantizer_info = _find_quantizer(Path(quantizer).expanduser().absolute() if quantizer else None)
+    if converter_path is not None:
+        try:
+            _require_converter_patch(converter_path)
+        except GGUFConvertError as exc:
+            errors.append(_error("converter_patch_missing", str(exc)))
     converter_supported = _supported_architectures(converter_path)
     dependencies = _dependency_probe(converter_path)
     architectures = set(summary.get("architectures", []))
