@@ -1,7 +1,7 @@
 """G4.3.2B 原生图片语义验证：MTMD 图像管线（参照 mtmd-cli.cpp）。
 
 用法（在 .venv-gemma4-native 下运行，需 PATH 含 C:/msys64/ucrt64/bin）：
-  python verify_image_semantics.py <gguf> <mmproj> <image> [--prompt ...]
+  python scripts/gemma4_native_image_smoke.py <gguf> <mmproj> <image> [--prompt ...]
 """
 import argparse
 import os
@@ -9,7 +9,11 @@ import sys
 import time
 from ctypes import byref, c_void_p
 
-os.add_dll_directory(r"C:\msys64\ucrt64\bin")
+_DLL_DIRECTORY_HANDLE = None
+if os.name == "nt" and hasattr(os, "add_dll_directory"):
+    runtime_dir = os.environ.get("QLH_LLAMA_RUNTIME_DIR", r"C:\msys64\ucrt64\bin")
+    if os.path.isdir(runtime_dir):
+        _DLL_DIRECTORY_HANDLE = os.add_dll_directory(runtime_dir)
 
 from llama_cpp import Llama, llama_cpp
 import llama_cpp.mtmd_cpp as m
