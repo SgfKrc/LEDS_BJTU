@@ -13,7 +13,7 @@
 
 #define MyAppName         "QLH Edge Inference (CUDA)"
 #define MyAppNameCN       "轻量化大模型分布式边缘推理系统（独显版）"
-#define MyAppVersion      "0.1.8.2"
+#define MyAppVersion      "0.1.8.3"
 #define MyAppPublisher    "北京交通大学 · 大创项目"
 #define MyAppExeName      "QLH-Edge-Inference.exe"
 #define MyAppSourceDir    "..\dist\QLH-Edge-Inference-CUDA"
@@ -48,6 +48,9 @@ ChangesEnvironment=yes
 ; 压缩
 Compression=lzma2/max
 SolidCompression=yes
+; 安装包含 7.66GB 冻结 GGUF，超过 4.2GB 单 Setup.exe 上限，必须分片
+DiskSpanning=yes
+DiskSliceSize=2147483648
 
 ; 界面
 WizardStyle=modern
