@@ -498,3 +498,14 @@
 
 1. 把 MM1.12 的 `placeholder_ready` 路径接到媒体参考消费边界：以占位执行产出 path-free 的视觉特征摘要（特征 shape/dtype/token 数），并绑定回文本段 hidden handoff 契约；覆盖占位执行与文本段消费一致性。
 2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。
+
+### 8.58 `PT-PIPE-MM1.13` 视觉塔占位执行路径与媒体参考消费契约（开发门 Completed，2026-08-15）
+
+- `run_mm1_visual_placeholder_execution`：`placeholder_ready` 骨架 + 媒体参考 → **path-free 视觉特征摘要**（`qwen3_visual_feature_placeholder`）——特征 shape `[1, media_tokens, vision.output_hidden_size]`（合成特征 `synthetic=true`，不加载视觉塔）；骨架非 ready（skipped）即 fail-closed（`qwen3_mm1_skeleton_not_ready`）。
+- `bind_mm1_visual_feature_handoff`：特征绑定回文本段 hidden handoff（`visual_to_text` 边界，`build_mm1_handoff_contract`），**消费一致性**：handoff tensor token 数 == 特征 token 数；绑定证据 = artifact.sha256 == media_reference_sha256（path-free 消费）。
+- 定向 `30 passed`（MM1.7-1.12 全量 + MM1.13 特征投影/非 ready fail-closed/绑定一致性）；未加载视觉塔或文本权重，真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.59 下一票：`PT-PIPE-MM1.14` 视觉占位链端到端合成回归（CPU）
+
+1. 串联 MM1.7→MM1.13 全链：合成媒体 → 摘要 → 张量参考 → 容量账本 → 放置决策 → 骨架 → 占位执行 → visual_to_text handoff，作为一条 CPU 合成端到端回归（全程不加载视觉塔/文本权重）。
+2. 保持 `weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续独立后置。

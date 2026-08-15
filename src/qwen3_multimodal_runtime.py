@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from qwen3_multimodal_contract import validate_mm1_model_manifest  # noqa: E402
 from qwen3_multimodal_preflight import validate_mm1_media_tensor_reference  # noqa: E402
 from qwen3_multimodal_contract import (
     MM1_MAX_VISUAL_TOKENS,
@@ -409,9 +410,105 @@ def run_mm1_visual_tower_skeleton(
     }
 
 
+def run_mm1_visual_placeholder_execution(
+    skeleton: Mapping[str, Any],
+    media_tensor_reference: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """MM1.13：视觉塔占位执行——以媒体参考消费产出 path-free 视觉特征摘要。
+
+    不加载视觉塔：特征 shape = [1, media_tokens, vision.output_hidden_size]
+    （合成特征，synthetic=true），只投影 shape/dtype/token 摘要。
+    """
+    if skeleton.get("visual_path") != "placeholder_ready":
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_skeleton_not_ready",
+            "visual placeholder execution requires a ready skeleton path",
+        )
+    safe_manifest = validate_mm1_model_manifest(manifest)
+    reference = validate_mm1_media_tensor_reference(
+        media_tensor_reference,
+        model_id=str(media_tensor_reference["model_id"]),
+        component_ids=list(media_tensor_reference["component_ids"]),
+    )
+    vision = safe_manifest["vision"]
+    tokens = int(reference["capacity"]["total_media_tokens"])
+    hidden = int(vision["output_hidden_size"])
+    feature = {
+        "schema_version": 1,
+        "feature_kind": "qwen3_visual_feature_placeholder",
+        "model_id": reference["model_id"],
+        "media_reference_sha256": reference["reference_sha256"],
+        "tensor": {
+            "shape": [1, tokens, hidden],
+            "dtype": str(vision.get("dtype") or "float16"),
+            "device": "cpu",
+        },
+        "synthetic": True,
+        "weight_materialized": False,
+        "full_model_materialized": False,
+    }
+    return feature
+
+
+def bind_mm1_visual_feature_handoff(
+    feature: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    text_chain_id: str,
+    generation: int,
+    phase: str,
+    source_node_id: str,
+    target_node_id: str,
+    modality: str = "image",
+) -> dict[str, Any]:
+    """MM1.13：视觉特征绑定回文本段 hidden handoff（visual_to_text 边界）。
+
+    消费一致性：handoff tensor shape 必须与特征 shape 一致。
+    """
+    if feature.get("feature_kind") != "qwen3_visual_feature_placeholder":
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_feature_invalid",
+            "visual handoff requires a placeholder feature summary",
+        )
+    tensor = feature.get("tensor") or {}
+    shape = tensor.get("shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+        raise Qwen3MultimodalRuntimeError(
+            "qwen3_mm1_feature_shape_invalid",
+            "visual feature shape must be [batch, tokens, hidden]",
+        )
+    from qwen3_multimodal_contract import build_mm1_handoff_contract
+    contract = build_mm1_handoff_contract(
+        manifest=manifest,
+        text_chain_id=text_chain_id,
+        generation=generation,
+        phase=phase,
+        source_node_id=source_node_id,
+        target_node_id=target_node_id,
+        artifact={
+            "artifact_id": "a" * 64,
+            "mode": "local",
+            "size_bytes": max(1, int(shape[1]) * int(shape[2]) * 2),
+            "sha256": str(feature.get("media_reference_sha256") or "a" * 64),
+            "status": "committed",
+        },
+        shape=[int(v) for v in shape],
+        dtype=str(tensor.get("dtype") or "float16"),
+        device=str(tensor.get("device") or "cpu"),
+        modality=modality,
+        item_count=1,
+        frame_count=0,
+    )
+    return contract
+
+
 __all__ = [
     "Qwen3MultimodalRuntimeError",
     "Qwen3MultimodalSidecarAdapter",
     "Qwen3MultimodalSyntheticExecutor",
     "run_mm1_visual_tower_skeleton",
+    "run_mm1_visual_placeholder_execution",
+    "bind_mm1_visual_feature_handoff",
 ]
