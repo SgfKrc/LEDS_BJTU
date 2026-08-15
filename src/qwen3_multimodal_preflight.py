@@ -629,6 +629,7 @@ def build_mm1_processor_smoke_response(
     manifest: Mapping[str, Any],
     inspection: Mapping[str, Any],
     runtime: Mapping[str, Any],
+    media_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a response after constructing AutoProcessor in the sidecar."""
     safe_request = validate_mm1_visual_worker_request(
@@ -655,6 +656,7 @@ def build_mm1_processor_smoke_response(
             "weight_materialized": False,
             "full_model_materialized": False,
         },
+        "media_summary": dict(media_summary) if media_summary else None,
     }
     response["response_sha256"] = _digest(response, label="MM1 processor smoke response")
     return validate_mm1_processor_smoke_response(response, request=safe_request)
@@ -671,7 +673,7 @@ def validate_mm1_processor_smoke_response(
             "schema_version", "response_kind", "status", "request_id",
             "request_sha256", "manifest_sha256", "model_id", "node_id",
             "processor_constructed", "visual_worker_ready", "component_count",
-            "runtime", "cleanup", "response_sha256",
+            "runtime", "cleanup", "media_summary", "response_sha256",
         },
         "MM1 processor smoke response",
     )

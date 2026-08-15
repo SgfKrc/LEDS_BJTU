@@ -432,3 +432,14 @@
 1. 使用有限尺寸的内存 PIL 图像与短视频帧序列调用已构造的 processor，限制像素/帧/输出字节，并只投影 shape、dtype、grid 和 token 数摘要。
 2. 覆盖超限、空媒体、帧数/geometry 不符、异常退出和清理；控制面禁止 pixel_values、原始媒体和路径，仍不加载视觉塔或文本权重。
 3. 真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频和生产路由继续后置。
+
+### 8.46 `PT-PIPE-MM1.7` CPU 合成媒体预处理与张量摘要合同（开发门 Completed，2026-08-15）
+
+- `qwen3_multimodal_processor_probe_worker` 在 MM1.6 的 processor 构造后新增媒体预处理阶段：受限合成媒体（内存 numpy 图像/帧，边长 8..1024、帧数 1..32，契约层拒绝超限/空/过小）调用 `image_processor`/`video_processor` 预处理，只投影 `pixel_values_shape`、dtype、patch 网格 token 数估计与输出字节估计；pixel_values、原始媒体、路径与 prompt 一律不进响应（`weight_materialized=false/full_model_materialized=false`）。
+- 真实 sidecar（`.venv-qwen3-sidecar`，transformers 4.57.6）双模型实测：Qwen3-VL-4B 与 Qwen3.5-2B 的 image 预处理均产出张量摘要（shape 为网格化 [H,W] 形态、dtype `torch.float32`、token 估计按 patch=16 网格）；Qwen3.5-2B 的 video 预处理对合成帧不产张量（摘要空，非空时校验）。
+- 媒体异常统一 `processor_contract_rejected`（fail-closed）；`media_smoke` 经 controller 参数透传（缺省合成 32x32/2 帧）。MM1.7 定向 `11 passed`（含真实双模型）；未加载视觉塔或文本权重，真实图像语义、跨节点 hidden handoff、CUDA/双机 parity、长视频与生产路由继续后置。
+
+### 8.47 下一票：`PT-PIPE-MM1.8` 媒体张量跨边界投影与视觉组件占位
+
+1. 将 MM1.7 的媒体摘要接入视觉组件边界：投影为 path-free 的媒体张量参考（shape/dtype/grid/token 契约），供后续视觉塔执行器的输入占位与容量预算；覆盖摘要与权重/媒体路径解耦的回归。
+2. 保持不加载视觉塔与文本权重、CPU 合成、`weight_materialized=false`；真实图像语义、跨节点 hidden handoff、CUDA/双机 parity 与生产路由继续独立后置。

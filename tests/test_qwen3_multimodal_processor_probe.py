@@ -84,10 +84,23 @@ def _fake_transformers(*, version: str = "4.57.6", kwargs_sink: list[dict] | Non
         temporal_patch_size = 2
         merge_size = 2
 
+        def __call__(self, images, **kwargs):
+            # MM1.7：合成媒体预处理——返回模拟 pixel_values（不加载权重）
+            import numpy as np
+            arr = np.asarray(images)
+            h, w = arr.shape[:2]
+            return {"pixel_values": np.zeros((1, 3, h, w), dtype=np.float16)}
+
     class Qwen3VLVideoProcessor:
         patch_size = 16
         temporal_patch_size = 2
         merge_size = 2
+
+        def __call__(self, frames, **kwargs):
+            import numpy as np
+            arr = np.asarray(frames)
+            n, h, w = arr.shape[:3]
+            return {"pixel_values": np.zeros((1, n, 3, h, w), dtype=np.float16)}
 
     class Qwen2TokenizerFast:
         image_token_id = 151655
@@ -290,11 +303,26 @@ def test_real_isolated_autoprocessor_smoke(model_name: str):
         manifest=manifest,
         visual_request=request,
         timeout_seconds=180,
+        media_smoke={"image_size": [32, 32], "video_size": [32, 32], "video_frames": 2},
     )
     assert report["status"] == "ready_for_offline_start"
     assert report["gate_passed"] is True
     response = report["response"]
     assert response["processor_constructed"] is True
+    # MM1.7：真实 processor 媒体预处理摘要（shape/dtype/token 数，无权重）
+    summary = response["media_summary"]
+    assert summary is not None
+    assert summary["weight_materialized"] is False
+    # 真实 processor 会 resize/网格化（shape 维度数因实现而异）——
+    # 契约只投影存在性、dtype 与正数 token 数
+    assert len(summary["image"]["pixel_values_shape"]) >= 2
+    assert "float" in summary["image"]["dtype"]
+    assert summary["image"]["token_count_estimate"] and summary["image"]["token_count_estimate"] > 0
+    if summary["video"]["pixel_values_shape"]:
+        # 真实 video_processor 对合成帧可能不产张量——非空时校验
+        assert len(summary["video"]["pixel_values_shape"]) >= 2
+        assert "float" in summary["video"]["dtype"]
+        assert summary["video"]["token_count_estimate"] and summary["video"]["token_count_estimate"] > 0
     assert response["runtime"]["transformers_version"] == "4.57.6"
     assert response["runtime"]["processor_class"] == "Qwen3VLProcessor"
     assert response["runtime"]["image_processor_class"] == "Qwen2VLImageProcessorFast"
@@ -305,3 +333,64 @@ def test_real_isolated_autoprocessor_smoke(model_name: str):
     encoded = json.dumps(report, ensure_ascii=True).lower()
     assert str(ROOT).lower() not in encoded
     assert "model_path" not in encoded
+
+
+# ================================================================
+# MM1.7：CPU 合成媒体预处理与张量摘要合同
+# ================================================================
+
+def test_media_preprocess_projects_shape_dtype_and_tokens():
+    """合成图像/帧经 processor 预处理后投影摘要（shape/dtype/token 数）。"""
+    request, _manifest, _visual = _worker_request()
+    request["media_smoke"] = {"image_size": [64, 64], "video_size": [32, 32], "video_frames": 3}
+    result = execute_request(
+        request, module_loader=lambda name: _fake_transformers(),
+    )
+    assert result["gate_passed"] is True
+    summary = result["response"]["media_summary"]
+    assert summary is not None
+    assert summary["weight_materialized"] is False
+    assert summary["full_model_materialized"] is False
+    # 图像：shape [1,3,H,W]、fp16、token 网格 = H*W
+    assert summary["image"]["pixel_values_shape"][-2:] == [64, 64]
+    assert summary["image"]["dtype"] == "float16"
+    assert summary["image"]["token_count_estimate"] == (64 // 16) * (64 // 16)  # patch=16
+    # 视频：shape [1,F,3,H,W]
+    assert summary["video"]["pixel_values_shape"][1] == 3
+    assert summary["video"]["pixel_values_shape"][-2:] == [32, 32]
+    assert summary["video"]["token_count_estimate"] == (32 // 16) * (32 // 16)
+    assert summary["output_bytes_estimate"] > 0
+
+
+def test_media_preprocess_rejects_out_of_bounds_media():
+    """超限尺寸/帧数 fail-closed（MM1.7 契约限制）。"""
+    for bad_media in (
+        {"image_size": [2048, 64]},            # 图像边长超 1024
+        {"video_size": [64, 4096]},            # 视频边长超 1024
+        {"video_frames": 64},                  # 帧数超 32
+        {"video_frames": 0},                   # 空媒体
+        {"image_size": [2, 2]},                # 过小
+    ):
+        request, _manifest, _visual = _worker_request()
+        request["media_smoke"] = bad_media
+        result = execute_request(
+            request, module_loader=lambda name: _fake_transformers(),
+        )
+        assert result["gate_passed"] is False, bad_media
+        assert result["errors"][0]["code"] in (
+            "processor_contract_rejected", "processor_smoke_failed",
+        )
+
+
+def test_media_summary_contains_no_sensitive_data():
+    """摘要不含像素值/原始媒体/路径（path-free 合同）。"""
+    request, _manifest, _visual = _worker_request()
+    request["media_smoke"] = {"image_size": [32, 32], "video_frames": 2}
+    result = execute_request(
+        request, module_loader=lambda name: _fake_transformers(),
+    )
+    payload = json.dumps(result, ensure_ascii=True)
+    # 字段名 pixel_values_shape 允许；实际像素数组/原始媒体/路径禁止
+    assert '"pixel_values":' not in payload
+    assert "models/" not in payload
+    assert "rng" not in payload
