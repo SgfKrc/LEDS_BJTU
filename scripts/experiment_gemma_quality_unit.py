@@ -37,7 +37,8 @@ def collect_evidence(
 ) -> dict[str, Any]:
     """Bind counter-only evidence to a versioned judge contract."""
     allowed_evidence_fields = {
-        "model", "judge_contract_id", "topic_hit", "key_element_coverage",
+        "model", "judge_contract_id", "judge_contract_sha256",
+        "topic_hit", "key_element_coverage",
     }
     if set(evidence) != allowed_evidence_fields:
         raise ValueError("judge evidence contains unsupported fields")
@@ -46,7 +47,9 @@ def collect_evidence(
     if contract.get("model") != expected_model or evidence.get("model") != expected_model:
         raise ValueError("judge model does not match the plan")
     if evidence.get("judge_contract_id") != expected_contract_id:
-        raise ValueError("judge contract reference does not match the plan")
+        raise ValueError("judge contract id does not match the plan")
+    if evidence.get("judge_contract_sha256") != expected_contract_sha256:
+        raise ValueError("judge contract SHA-256 does not match the plan")
     result = {
         "model": expected_model,
         "judge_contract_id": expected_contract_id,
