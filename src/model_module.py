@@ -728,6 +728,33 @@ class ModelManager:
                 f"profile_tier={profile.get('tier', '?') if profile else '?'})"
             )
 
+            # P6 (2026-08-16): 同模型切换短路——目标模型已加载（同 id、
+            # 同量化、同权重路径）时直接复用，跳过 unload+load。二次切换
+            # 耗时接近 0 且不触碰权重文件；会话上下文重置仍由调用方
+            # （api_server 的 _prepare_model_switch）统一执行，行为不变。
+            requested_path = model_path or self._model_path
+            requested_quant = quant_type or QUANT_TYPE
+            if (
+                had_model
+                and self._active_model_id == model_id
+                and (self._model_path or "") == (requested_path or "")
+                and (self._quant_type or QUANT_TYPE) == requested_quant
+            ):
+                logger.info(
+                    f"P6 同模型切换短路: {model_id} 已加载（quant={requested_quant}），直接复用"
+                )
+                try:
+                    cfg = mc.get_model_config(model_id, db_experimental_models)
+                except Exception:
+                    cfg = None
+                return {
+                    "success": True,
+                    "model_id": self._active_model_id,
+                    "model_name": cfg.name if cfg else model_id,
+                    "error": None,
+                    "reused": True,
+                }
+
             # 步骤 1: 卸载当前模型
             if had_model or had_pipeline_preparation:
                 try:

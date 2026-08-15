@@ -2287,6 +2287,68 @@ class TestSwitchModel:
         assert mgr.active_model_id == "qwen2.5-7b-gguf"
 
 
+class TestP6SameModelSwitchShortCircuit:
+    """P6（2026-08-16）：同模型切换短路——已加载模型二次切换直接复用。"""
+
+    def _loaded_mgr(self, monkeypatch):
+        import model_module
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        mgr = ModelManager()
+        load_calls = []
+
+        def fake_llama(*a, **kw):
+            load_calls.append(("llama", kw))
+            mgr._llama_engine = object()
+            mgr._quant_type = "int4"
+            mgr._model_path = "G:/models/qwen2.5-7b-gguf"
+
+        monkeypatch.setattr(mgr, "_load_llama_cpp", fake_llama)
+        monkeypatch.setattr(
+            mgr, "_load_pytorch",
+            lambda *a, **kw: load_calls.append(("pytorch", kw)),
+        )
+        first = mgr.switch_model("qwen2.5-7b-gguf")
+        assert first["success"] is True
+        assert mgr.is_loaded is True
+        return mgr, load_calls
+
+    def test_same_model_switch_short_circuits_without_reload(self, monkeypatch):
+        mgr, load_calls = self._loaded_mgr(monkeypatch)
+        before = len(load_calls)
+
+        second = mgr.switch_model("qwen2.5-7b-gguf")
+
+        assert second["success"] is True
+        assert second.get("reused") is True
+        assert len(load_calls) == before  # 未触发任何加载
+        assert mgr.is_loaded is True
+
+    def test_same_model_short_circuit_with_explicit_same_path(self, monkeypatch):
+        mgr, load_calls = self._loaded_mgr(monkeypatch)
+        before = len(load_calls)
+        path = mgr._model_path
+
+        second = mgr.switch_model(
+            "qwen2.5-7b-gguf", quant_type="q8_0", model_path=path,
+        )
+
+        # 显式传相同路径但不同量化 → 不短路（量化不同需重载）
+        assert second.get("reused") is None or second.get("reused") is False
+        assert len(load_calls) > before
+
+    def test_different_model_switch_still_reloads(self, monkeypatch):
+        mgr, load_calls = self._loaded_mgr(monkeypatch)
+        before = len(load_calls)
+
+        other = mgr.switch_model("qwen-1_8b")
+
+        assert other["success"] is True
+        assert other.get("reused") is None
+        assert len(load_calls) > before
+
+
 class TestGemmaLayerRangeAdapter:
     """Gemma 4 PyTorch 层流水线 adapter（P1，§4.2 模板接线）测试。"""
 
