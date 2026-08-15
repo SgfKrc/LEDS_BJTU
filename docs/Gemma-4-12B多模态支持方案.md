@@ -285,6 +285,8 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 
 > G4.5 的 GPU 验收按**部分 offload + 互斥规则**执行，不承诺全量 offload。
 
+> **G4.4 过渡版 Completed（2026-08-15）**：Ollama 官方构建的 Q4_K_M + mmproj 已复制入受管目录 `models/gemma4-native/`（`gemma4-12b-ollama-q4_k_m.gguf` 7.38GB、`mmproj-ollama-bf16.gguf` 175MB），SHA-256 冻结于 `gemma4-native.lock.json`（`scripts/model_tools/gemma4_native_freeze.py --hash/--check`）；smoke 用受管工件通过（原生推理**运行时不再依赖 Ollama 服务或 blobs 路径**）。**独立来源未达成**：4 个 HF 独立工件（unsloth/bartowski Q4_K_M、ggml-org Q4_0/Q8_0，共 ~32GB 已下载留作 G4.6 对照）在原生 MTMD 管线全部退化（思考段空转/复读/非确定性分叉），仅 Ollama 自构建工件稳定；根因指向权重/训练差异（模板渲染输出相同、Q8_0 仍退化），待 **G4.6 Ollama 仓库调研**定论后替换独立工件（G4.4 最终态）。
+
 | 里程碑 | 内容 | 验收标准 | 依赖 |
 |---|---|---|---|
 | **G4.4 独立工件链** | 从 HF 官方（经 7897 代理）下载 gemma-4-12B 的 GGUF + mmproj（Q4_K_M 路线，本机 8GB 可用），SHA-256/许可/manifest 冻结，写入受管资产；原生 smoke 改用独立工件（不再读 `~/.ollama/models/blobs`） | 断网 Ollama 环境下原生路径可加载并完成图像语义 smoke；工件冻结记录（revision/SHA/大小/许可）入库 | §5.6 #1（已完成） |
