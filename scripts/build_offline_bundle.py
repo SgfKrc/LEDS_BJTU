@@ -77,6 +77,13 @@ ASSETS: dict[str, dict] = {
 }
 
 PRUNE_SD_ZIPS = False  # --prune-sd-zips 时置 True
+PRUNE_DRY_RUN = False  # --prune-dry-run：只打印将删文件不执行
+_PRUNE_WARNED = False
+
+
+def _set_prune_warned() -> None:
+    global _PRUNE_WARNED
+    _PRUNE_WARNED = True
 
 # 临时目录放 D 盘（系统盘只有 ~11GB，verify/staging 会写几十 GB）
 TMP_BASE = Path(os.environ.get("QLH_BUNDLE_TMP", "D:/qlh_tmp"))
@@ -114,7 +121,9 @@ def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
     dedup_of）；其余资产直接引用仓库路径。
     """
     spec = ASSETS[asset_id]
-    root = _resolve(asset_id)
+    raw_root = REPO_ROOT / spec["path"]
+    root = raw_root.resolve()  # 解析 junction 到真实位置（读文件用）
+    is_archive_junction = raw_root.is_junction()  # 必须在 resolve 前检测
     files: list[dict] = []
 
     def add(path_in_bundle: str, src: Path) -> None:
@@ -197,8 +206,16 @@ def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
                     })
             if PRUNE_SD_ZIPS:
                 # 源 zip 可重建（package_sd15_assets.py），处理完即删以省空间
-                fp.unlink()
-                sidecar.unlink(missing_ok=True)
+                if is_archive_junction:
+                    # 归档 junction（如 H:/qlh-archives）只读：绝不删归档文件
+                    if not _PRUNE_WARNED:
+                        print("  [prune] 源为归档 junction，只读保护——跳过删除")
+                        _set_prune_warned()
+                elif PRUNE_DRY_RUN:
+                    print(f"  [prune-dry-run] 将删除: {fp.name} + 侧车")
+                else:
+                    fp.unlink()
+                    sidecar.unlink(missing_ok=True)
         if not files:
             raise BundleError(
                 f"资产 {asset_id}: {root} 无离线包（先跑 download_sd15 / 导入离线包）")
@@ -490,12 +507,28 @@ def main(argv: list[str] | None = None) -> int:
                     help="7z 分卷大小（如 4g/2g；PC 版建议 4g 便于 U 盘/局域网分批）")
     ap.add_argument("--prune-sd-zips", action="store_true",
                     help="SD 源 zip 处理完即删（可重建；省磁盘，峰值约降 15GB）")
+    ap.add_argument("--prune-dry-run", action="store_true",
+                    help="只打印将删除的 SD 源 zip，不执行删除（先看再删）")
     ap.add_argument("--threads", type=int, default=4, metavar="N",
                     help="7z 压缩线程数（默认 4；本机 20 核默认会吃满，限制后留余量）")
     args = ap.parse_args(argv)
     if args.prune_sd_zips:
-        global PRUNE_SD_ZIPS
+        global PRUNE_SD_ZIPS, PRUNE_DRY_RUN
         PRUNE_SD_ZIPS = True
+        PRUNE_DRY_RUN = args.prune_dry_run
+
+    if args.prune_dry_run:
+        # 独立预览：列出 SD 源将删除的 zip（不打包、不删除）
+        root = _resolve("sd15-assets")
+        raw = REPO_ROOT / ASSETS["sd15-assets"]["path"]
+        if raw.is_junction():
+            print(f"[prune-dry-run] SD 源是归档 junction（{root}）——只读保护，永不删除")
+        else:
+            zips = sorted((root if root.is_dir() else Path()).glob("*.zip"))
+            print(f"[prune-dry-run] 将删除 {len(zips)} 个可重建 SD 源 zip：")
+            for z in zips:
+                print(f"  - {z.name}（{z.stat().st_size / 1e9:.1f} GB）")
+        return 0
 
     if args.missing:
         for scope, variant in ((PC_ASSETS, "pc"), (ANDROID_ASSETS, "android")):

@@ -199,6 +199,71 @@ def test_sd15_sidecar_mismatch_fails_closed(fake_assets):
         b._collect_asset("sd15-assets", staging_sd=staging)
 
 
+def _make_sd15_package(dirpath: Path, pkg_name: str) -> Path:
+    """构造最小 SD zip + 侧车（供独立测试用）。"""
+    import hashlib as _h
+    import zipfile as _zf
+    pkg = dirpath / pkg_name
+    with _zf.ZipFile(pkg, "w") as zf:
+        zf.writestr("models/sd15-original-v1/unet/model.fp16.safetensors", b"x" * 10)
+    (dirpath / (pkg_name + ".sha256")).write_text(
+        _h.sha256(pkg.read_bytes()).hexdigest() + "  " + pkg_name + chr(10),
+        encoding="utf-8")
+    return pkg
+
+
+def test_prune_skips_junction_archive(tmp_path, monkeypatch):
+    """归档 junction 源：--prune 绝不删除归档文件。"""
+    import os
+    import shutil as _sh
+    import subprocess as _sp
+    if os.name != "nt":
+        pytest.skip("junction 仅 Windows")
+    repo = tmp_path / "repo"
+    out = tmp_path / "out"
+    real = repo / "build" / "sd15-assets"
+    real.mkdir(parents=True)
+    _make_sd15_package(real, "QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip")
+    # 归档备份 + junction 替换源目录
+    archive = tmp_path / "archive-backup"
+    archive.mkdir()
+    for z in real.glob("*.zip"):
+        (archive / z.name).write_bytes(z.read_bytes())
+    _sh.rmtree(real)
+    r = _sp.run(["cmd", "/c", "mklink", "/J",
+                 str(real).replace("/", "\\"), str(archive).replace("/", "\\")],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert real.is_junction(), r.stderr
+    monkeypatch.setattr(b, "REPO_ROOT", repo)
+    monkeypatch.setattr(b, "OUT_DIR", out)
+    b.PRUNE_SD_ZIPS = True
+    try:
+        b._collect_asset("sd15-assets", staging_sd=out / ".staging-test")
+    finally:
+        b.PRUNE_SD_ZIPS = False
+    assert list(archive.glob("*.zip")), "归档被 prune 删除了！"
+
+
+def test_prune_dry_run_does_not_delete(tmp_path, monkeypatch):
+    """dry-run：只打印将删列表，不执行删除。"""
+    repo = tmp_path / "repo"
+    out = tmp_path / "out"
+    real = repo / "build" / "sd15-assets"
+    real.mkdir(parents=True)
+    _make_sd15_package(real, "QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip")
+    monkeypatch.setattr(b, "REPO_ROOT", repo)
+    monkeypatch.setattr(b, "OUT_DIR", out)
+    b.PRUNE_SD_ZIPS = True
+    b.PRUNE_DRY_RUN = True
+    try:
+        b._collect_asset("sd15-assets", staging_sd=out / ".staging-test")
+    finally:
+        b.PRUNE_SD_ZIPS = False
+        b.PRUNE_DRY_RUN = False
+    target = real / "QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip"
+    assert target.is_file(), "dry-run 不应删除文件"
+
+
 def test_missing_asset_fails_closed_with_fetch(fake_assets):
     repo, _ = fake_assets
     (repo / "models" / "Qwen-1_8B-Chat.Q4_K_M.gguf").unlink()
