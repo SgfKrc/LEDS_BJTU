@@ -39,13 +39,26 @@ def fake_assets(tmp_path, monkeypatch):
     (gm / "gemma4-native.lock.json").write_text(json.dumps({
         "artifacts": {"model.gguf": {"size": 1000}, "mmproj-f16.gguf": {"size": 500}},
     }), encoding="utf-8")
-    # sd15 离线包 + 侧车
+    # sd15 离线包（真 zip，含 models/ 顶层）+ 侧车；两个包共享一个文件（测去重）
     sd = repo / "build" / "sd15-assets"
     sd.mkdir(parents=True)
-    pkg = sd / "QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip"
-    pkg.write_bytes(b"fake-sd15-pkg" * 100)
-    pkg_sha = hashlib.sha256(pkg.read_bytes()).hexdigest()
-    (sd / (pkg.name + ".sha256")).write_text(f"{pkg_sha}  {pkg.name}\n", encoding="utf-8")
+    shared_bytes = b"shared-vae" * 50
+    for pkg_name, extra in (
+            ("QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip", b"orig-unet"),
+            ("QLH-SD15-Assets-sd15_inpaint_v1-v0.1.0.zip", b"inpaint-unet")):
+        pkg = sd / pkg_name
+        with zipfile.ZipFile(pkg, "w") as zf:
+            zf.writestr("models/sd15-original-v1/vae/model.fp16.safetensors"
+                        if "original" in pkg_name
+                        else "models/sd15-inpaint-v1/vae/model.fp16.safetensors",
+                        shared_bytes)
+            zf.writestr("models/sd15-original-v1/unet/model.fp16.safetensors"
+                        if "original" in pkg_name
+                        else "models/sd15-inpaint-v1/unet/model.fp16.safetensors",
+                        extra)
+        pkg_sha = hashlib.sha256(pkg.read_bytes()).hexdigest()
+        (sd / (pkg_name + ".sha256")).write_text(
+            f"{pkg_sha}  {pkg_name}\n", encoding="utf-8")
 
     monkeypatch.setattr(b, "REPO_ROOT", repo)
     monkeypatch.setattr(b, "OUT_DIR", out)
@@ -77,13 +90,18 @@ def test_pc_bundle_structure_and_manifest(fake_assets):
         assert "README-导入说明.md" in names
         assert any("qwen-1_8b-chat/model.safetensors" in n for n in names)
         assert any("gemma4-native/model.gguf" in n for n in names)
-        assert any("sd15-assets/QLH-SD15-Assets-" in n for n in names)
+        # SD 已解包重组到 models/sd15-*/（不再收 zip）；共享文件只存一份
+        assert any("models/sd15-original-v1/unet/model.fp16.safetensors"
+                   in n for n in names)
+        assert not any("sd15-assets/" in n for n in names)
         # manifest 字段
         manifest = json.loads(zf.read("MANIFEST.json"))
         assert manifest["variant"] == "pc"
         assert set(manifest["asset_ids"]) == set(b.PC_ASSETS)
-        # 所有 manifest 文件都在包内
+        # 所有非去重条目都在包内
         for f in manifest["files"]:
+            if f.get("dedup_of"):
+                continue  # 去重条目由 restore 恢复，不在包内
             assert f["path"] in names
             assert f["sha256"] and f["size"] > 0
 
@@ -111,6 +129,27 @@ def test_7z_build_and_verify_roundtrip(fake_assets):
     b._verify_bundle(bundle)  # 7z 解包逐文件比对，不应抛异常
 
 
+def test_sd15_dedup_stores_shared_file_once(fake_assets):
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
+    with zipfile.ZipFile(bundle) as zf:
+        names = zf.namelist()
+        vae_orig = "models/sd15-original-v1/vae/model.fp16.safetensors"
+        vae_inp = "models/sd15-inpaint-v1/vae/model.fp16.safetensors"
+        # 共享 vae 只存一次（打包顺序决定主/副），另一个记 dedup_of
+        assert (vae_orig in names) != (vae_inp in names), "vae 应只存一份"
+        manifest = json.loads(zf.read("MANIFEST.json"))
+        entries = {f["path"]: f for f in manifest["files"]}
+        stored, shadow = ((vae_orig, vae_inp) if vae_orig in names
+                          else (vae_inp, vae_orig))
+        assert entries[shadow]["dedup_of"] == stored
+        assert "dedup_of" not in entries[stored]
+
+
+def test_verify_restores_dedup_links(fake_assets):
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
+    b._verify_bundle(bundle)  # 内部会 restore dedup 后逐文件校验
+
+
 def test_verify_detects_tamper(fake_assets):
     bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
     # 篡改包内一个文件后 verify 必须失败
@@ -131,11 +170,13 @@ def test_verify_detects_tamper(fake_assets):
 
 
 def test_sd15_sidecar_mismatch_fails_closed(fake_assets):
-    repo, _ = fake_assets
+    repo, out = fake_assets
     sidecar = repo / "build" / "sd15-assets" / "QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip.sha256"
     sidecar.write_text("deadbeef" * 8 + "  x.zip\n", encoding="utf-8")
+    staging = out / ".staging-test"
+    staging.mkdir(parents=True)
     with pytest.raises(b.BundleError, match="SHA 不匹配"):
-        b._collect_asset("sd15-assets")
+        b._collect_asset("sd15-assets", staging_sd=staging)
 
 
 def test_missing_asset_fails_closed_with_fetch(fake_assets):

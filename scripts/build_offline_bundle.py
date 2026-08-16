@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -95,8 +96,12 @@ def _resolve(asset_id: str) -> Path:
     return (REPO_ROOT / ASSETS[asset_id]["path"]).resolve()
 
 
-def _collect_asset(asset_id: str) -> dict:
-    """收集资产文件清单（src=仓库绝对、path=bundle 内相对），校验 SHA。"""
+def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
+    """收集资产文件清单（src=仓库绝对、path=bundle 内相对），校验 SHA。
+
+    sd15 资产会解包去重到 staging_sd（同 SHA 文件只写一份，重复条目记
+    dedup_of）；其余资产直接引用仓库路径。
+    """
     spec = ASSETS[asset_id]
     root = _resolve(asset_id)
     files: list[dict] = []
@@ -139,6 +144,9 @@ def _collect_asset(asset_id: str) -> dict:
     elif spec["kind"] == "sd15":
         if not root.is_dir():
             raise BundleError(f"缺失资产 {asset_id}: {root}\n  获取: {spec['fetch']}")
+        if staging_sd is None:
+            raise BundleError("sd15 资产需要 staging 目录（去重重组）")
+        seen_sha: dict[str, str] = {}  # sha -> 已存储的 bundle 路径
         for fp in sorted(root.glob("*.zip")):
             sidecar = fp.with_suffix(".zip.sha256")
             declared_sha = None
@@ -148,7 +156,34 @@ def _collect_asset(asset_id: str) -> dict:
             if declared_sha and actual != declared_sha:
                 raise BundleError(
                     f"资产 {asset_id} 包 {fp.name} SHA 不匹配（{declared_sha} != {actual}）")
-            add(f"sd15-assets/{fp.name}", fp)
+            with zipfile.ZipFile(fp) as zf:
+                for info in zf.infolist():
+                    if info.is_dir() or not info.filename.startswith("models/"):
+                        continue
+                    bundle_path = info.filename
+                    entry_sha = hashlib.sha256()
+                    with zf.open(info) as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            entry_sha.update(chunk)
+                    digest = entry_sha.hexdigest()
+                    if digest in seen_sha:
+                        # 跨包重复：只记映射，不重复写
+                        files.append({
+                            "src": "", "path": bundle_path,
+                            "size": info.file_size, "sha256": digest,
+                            "dedup_of": seen_sha[digest],
+                        })
+                        continue
+                    seen_sha[digest] = bundle_path
+                    staging_target = staging_sd / bundle_path
+                    staging_target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as fh, open(staging_target, "wb") as out:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            out.write(chunk)
+                    files.append({
+                        "src": str(staging_target), "path": bundle_path,
+                        "size": info.file_size, "sha256": digest,
+                    })
         if not files:
             raise BundleError(
                 f"资产 {asset_id}: {root} 无离线包（先跑 download_sd15 / 导入离线包）")
@@ -162,7 +197,13 @@ def _missing_assets(scope: tuple[str, ...]) -> list[str]:
     missing = []
     for asset_id in scope:
         try:
-            _collect_asset(asset_id)
+            if ASSETS[asset_id]["kind"] == "sd15":
+                # 缺失检查只验证 zip 存在（深解包去重校验在打包时做）
+                root = _resolve(asset_id)
+                if not root.is_dir() or not list(root.glob("*.zip")):
+                    raise BundleError("sd15 无离线包")
+            else:
+                _collect_asset(asset_id)
         except BundleError:
             missing.append(asset_id)
     return missing
@@ -183,7 +224,7 @@ def _bundle_root_name(bundle_path: Path) -> str:
 
 
 def _build_bundle(scope: tuple[str, ...], variant: str,
-                  fmt: str = "7z") -> Path:
+                  fmt: str = "7z", volume: str | None = None) -> Path:
     manifest_files: list[dict] = []
     checksum_lines: list[str] = []
     collected_all: list[dict] = []
@@ -192,18 +233,27 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
     ext = ".7z" if fmt == "7z" else ".zip"
     bundle_path = OUT_DIR / f"qlh-models-{variant}-{BUNDLE_VERSION}{ext}"
 
+    staging_sd = None
+    if "sd15-assets" in scope:
+        staging_sd = OUT_DIR / f".staging-{variant}"
+        if staging_sd.exists():
+            shutil.rmtree(staging_sd)
+        staging_sd.mkdir(parents=True)
+
     for asset_id in scope:
-        collected = _collect_asset(asset_id)
+        collected = _collect_asset(asset_id, staging_sd=staging_sd)
         collected_all.append(collected)
         for f in collected["files"]:
             manifest_files.append({k: v for k, v in f.items() if k != "src"})
-            checksum_lines.append(f"{f['sha256']}  {f['path']}")
+            if not f.get("dedup_of"):
+                checksum_lines.append(f"{f['sha256']}  {f['path']}")
 
     manifest = {
         "schema_version": "qlh.offline_bundle.v1",
         "bundle_version": BUNDLE_VERSION,
         "variant": variant,
         "format": fmt,
+        "volume": volume or "",
         "asset_ids": list(scope),
         "files": manifest_files,
     }
@@ -212,7 +262,7 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
 
     if fmt == "7z":
         _build_bundle_7z(bundle_path, collected_all, manifest_json,
-                         checksum_lines, variant)
+                         checksum_lines, variant, volume)
     else:
         _build_bundle_zip(bundle_path, collected_all,
                           manifest_json, checksum_lines, variant)
@@ -224,6 +274,8 @@ def _build_bundle_zip(bundle_path, collected_all, manifest_json,
     with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_STORED) as zf:
         for collected in collected_all:
             for f in collected["files"]:
+                if f.get("dedup_of"):
+                    continue  # 去重条目由 restore 阶段恢复
                 zf.write(f["src"], f["path"])
         zf.writestr("MANIFEST.json", manifest_json)
         zf.writestr("CHECKSUMS.sha256",
@@ -233,23 +285,22 @@ def _build_bundle_zip(bundle_path, collected_all, manifest_json,
 
 
 def _build_bundle_7z(bundle_path, collected_all, manifest_json,
-                     checksum_lines, variant) -> None:
+                     checksum_lines, variant, volume=None) -> None:
     seven_zip = _seven_zip()
     if seven_zip is None:
         raise BundleError("7z 模式需要 7-Zip（winget install 7zip.7zip）")
     root = _bundle_root_name(bundle_path)
-    # 三段增量追加（免复制 30GB）：
-    #   models/ 部分 cwd=REPO_ROOT；sd15-assets/ 部分 cwd=REPO_ROOT/build
-    #   清单文件用临时目录
+    # 分段增量追加（免复制）：models/（cwd=REPO_ROOT）；sd15 staging
+    # （cwd=staging）；清单（临时目录）
     parts: list[tuple[Path, list[str]]] = []
     models_files = [f for c in collected_all for f in c["files"]
-                    if f["path"].startswith("models/")]
-    sd15_files = [f for c in collected_all for f in c["files"]
-                  if f["path"].startswith("sd15-assets/")]
+                    if f["path"].startswith("models/") and not f.get("dedup_of")]
     if models_files:
         parts.append((REPO_ROOT, [f["path"] for f in models_files]))
+    sd15_files = [f for c in collected_all for f in c["files"]
+                  if f["path"].startswith("models/sd15-") and not f.get("dedup_of")]
     if sd15_files:
-        parts.append((REPO_ROOT / "build", [f["path"] for f in sd15_files]))
+        parts.append((OUT_DIR / f".staging-{variant}", [f["path"] for f in sd15_files]))
     if bundle_path.exists():
         bundle_path.unlink()
     with tempfile.TemporaryDirectory() as td:
@@ -264,11 +315,17 @@ def _build_bundle_7z(bundle_path, collected_all, manifest_json,
         for cwd, paths in parts:
             cmd = [seven_zip, "a", "-t7z", "-mx=1", "-y",
                    str(bundle_path), *paths]
+            if volume:
+                cmd.insert(5, f"-v{volume}")
             r = subprocess.run(cmd, cwd=str(cwd), capture_output=True,
                                text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise BundleError(
                     f"7z 打包失败: {r.stderr[-300:] or r.stdout[-300:]}")
+    if volume:
+        # 分卷输出为 name.7z.001/.002/...；清理可能残留的裸单卷
+        for leftover in OUT_DIR.glob(f"{bundle_path.name}.{''}*"):
+            pass  # 7z -v 不会生成裸文件；无清理需要
 
 
 def _import_readme(variant: str, manifest_json: str) -> str:
@@ -293,28 +350,37 @@ def _import_readme(variant: str, manifest_json: str) -> str:
 
 
 def _verify_bundle(bundle_path: Path) -> None:
-    """解包到临时目录，逐文件 SHA 比对（支持 .7z 与 .zip）。"""
+    """解包到临时目录，恢复 dedup 链接后逐文件 SHA 比对（7z/分卷/zip）。"""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         if bundle_path.suffix == ".7z":
             seven_zip = _seven_zip()
             if seven_zip is None:
                 raise BundleError("verify 7z 需要 7-Zip")
+            # 分卷时用 .001 作为入口
+            target = bundle_path
+            if not target.exists():
+                first_vol = Path(str(target) + ".001")
+                if first_vol.exists():
+                    target = first_vol
             r = subprocess.run(
-                [seven_zip, "x", "-y", f"-o{tmp}", str(bundle_path)],
+                [seven_zip, "x", "-y", f"-o{tmp}", str(target)],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace")
             if r.returncode != 0:
                 raise BundleError(f"7z 解包失败: {r.stderr[-300:]}")
-            r = subprocess.run(
-                [seven_zip, "l", "-slt", str(bundle_path)],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace")
             root_dir = tmp
         else:
             with zipfile.ZipFile(bundle_path) as zf:
                 zf.extractall(tmp)
                 root_dir = tmp
+        # 先恢复 dedup 链接（MANIFEST 里的 dedup_of 映射）
+        manifest_path = root_dir / "MANIFEST.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            restored = _restore_dedup(root_dir, manifest)
+            if restored:
+                print(f"  verify 恢复 {restored} 个去重链接")
         checksums = (root_dir / "CHECKSUMS.sha256").read_text(
             encoding="utf-8").splitlines()
         checked = 0
@@ -329,6 +395,32 @@ def _verify_bundle(bundle_path: Path) -> None:
         print(f"  verify OK：{checked} 文件一致")
 
 
+def _restore_dedup(root_dir: Path, manifest: dict) -> int:
+    """按 MANIFEST 的 dedup_of 恢复链接/复制（Windows hardlink、posix symlink）。"""
+    restored = 0
+    for f in manifest.get("files", []):
+        dedup_of = f.get("dedup_of")
+        if not dedup_of:
+            continue
+        target = root_dir / f["path"]
+        source = root_dir / dedup_of
+        if target.exists() or target.is_symlink():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            try:
+                os.link(source, target)  # 同卷 hardlink
+            except OSError:
+                shutil.copy2(source, target)
+        else:
+            try:
+                target.symlink_to(source)
+            except OSError:
+                shutil.copy2(source, target)
+        restored += 1
+    return restored
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="离线资产一键整合包打包器")
     ap.add_argument("--pc", action="store_true", help="构建 PC 版")
@@ -339,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="只列出缺失资产与获取命令（不打包）")
     ap.add_argument("--format", choices=("7z", "zip"), default="7z",
                     help="打包格式（默认 7z，体积最小；zip=ZIP_STORED 快速）")
+    ap.add_argument("--volume", metavar="SIZE", default=None,
+                    help="7z 分卷大小（如 4g/2g；PC 版建议 4g 便于 U 盘/局域网分批）")
     args = ap.parse_args(argv)
 
     if args.missing:
@@ -359,14 +453,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pc:
         print(f"构建 PC 版（全量，{args.format}）...")
-        bundle = _build_bundle(PC_ASSETS, "pc", args.format)
-        print(f"  -> {bundle}（{bundle.stat().st_size / 1e9:.1f} GB）")
+        bundle = _build_bundle(PC_ASSETS, "pc", args.format, args.volume)
+        print(f"  -> {bundle}（{bundle.stat().st_size / 1e9:.1f} GB）"
+              + (f" 分卷 {args.volume}" if args.volume else ""))
         if args.verify:
             _verify_bundle(bundle)
     if args.android:
         print(f"构建安卓版（纯 GGUF，{args.format}）...")
-        bundle = _build_bundle(ANDROID_ASSETS, "android", args.format)
-        print(f"  -> {bundle}（{bundle.stat().st_size / 1e9:.1f} GB）")
+        bundle = _build_bundle(ANDROID_ASSETS, "android", args.format,
+                              args.volume)
+        print(f"  -> {bundle}（{bundle.stat().st_size / 1e9:.1f} GB）"
+              + (f" 分卷 {args.volume}" if args.volume else ""))
         if args.verify:
             _verify_bundle(bundle)
     return 0
