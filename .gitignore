@@ -54,12 +54,16 @@ node_config.json.tmp
 models/qwen-1_8b-chat/
 models/deepseek-*/
 models/sd15-*/
+models/qwen3-*/
+models/gemma4-*/
+models/Qwen-*/
 .hf-cache/
 models/.cache/
 !models/README.md
 
 # Large binaries
 models/*.gguf
+models/**/*.gguf
 models/*.sha256
 models_pc/*.7z
 models_android/*.7z
