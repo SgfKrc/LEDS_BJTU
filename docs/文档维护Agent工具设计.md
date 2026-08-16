@@ -73,29 +73,29 @@ python scripts/doc_maintenance_audit.py --since 7d # 只看近 7 天有改动的
 
 ## 4. M2 本地/远程 LLM 判定（中期）
 
-### 4.1 Provider 抽象（本地 Ollama + 远程 DeepSeek 双通道）
+### 4.1 Provider 抽象（远程 DeepSeek V4 Flash 优先 + 本地 Ollama 兜底）
 
-判定引擎通过 OpenAI 兼容接口抽象 provider，支持两种后端：
+判定引擎通过 OpenAI 兼容接口抽象 provider，支持两种后端。**默认优先走 opencode go 套餐的远程通道**（本地 Ollama 模型如 gemma4:12b 上下文窗口有限，判题输入超限会截断误判；远程 DS V4 Flash 上下文充足），Ollama 作为无密钥/离线环境兜底：
 
 | Provider | 用途 | 接入方式 | 说明 |
 |---|---|---|---|
-| **本地 Ollama**（默认） | 本机 GPU/CPU 推理（`gemma4:12b`、`qwen3:4b` 等） | `http://127.0.0.1:11434/v1`，无需密钥 | 无外发数据、无网络依赖；Ollama 未运行时自动降级为"需人工" |
-| **远程 DeepSeek V4 Flash**（opencode go 套餐） | 更强判定能力（可选通道） | OpenAI 兼容 `base_url` + `sk-*` 密钥 | 判定质量更高/更快，但**判题文本会外发**——只允许发送文档片段与提交标题，且必须在独立 env 中显式启用才可用 |
+| **远程 DeepSeek V4 Flash**（opencode go 套餐，**默认优先**） | 主判定通道 | OpenAI 兼容 `base_url=https://opencode.ai/zen/go/v1`（完整端点 `/chat/completions`）+ `sk-*` 密钥 | 上下文充足、判定质量高；**判题文本会外发**——只允许发送文档片段与提交标题，且必须在独立 env 中显式配置密钥才启用 |
+| **本地 Ollama**（兜底） | 离线/无密钥环境（`gemma4:12b`、`qwen3:4b` 等） | `http://127.0.0.1:11434/v1`，无需密钥 | 无外发数据、无网络依赖；Ollama 未运行或上下文不足时自动降级为"需人工" |
 
 配置独立于主 `.env`，放在 **`.env.docagent`**（已入 `.gitignore`，随 `.env` 一行忽略规则覆盖）：
 
 ```bash
 # .env.docagent（示例；sk 不落 git）
-DOCAGENT_PROVIDER=ollama          # ollama（默认）| deepseek
+DOCAGENT_PROVIDER=deepseek        # deepseek（默认优先，需完整配置）| ollama
+DOCAGENT_DEEPSEEK_BASE_URL=https://opencode.ai/zen/go/v1
+DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash   # 以 opencode go 套餐实际模型名为准
+DOCAGENT_DEEPSEEK_API_KEY=sk-xxx
 DOCAGENT_OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
 DOCAGENT_OLLAMA_MODEL=gemma4:12b  # 或 qwen3:4b
-DOCAGENT_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
-DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash
-DOCAGENT_DEEPSEEK_API_KEY=sk-xxx
 DOCAGENT_CONFIDENCE_FLOOR=0.6     # 低于此值一律 needs_review
 ```
 
-- 读取规则：`--provider` 显式指定 > `.env.docagent` 的 `DOCAGENT_PROVIDER` > 默认 ollama；远程通道**必须**有 base_url+api_key 且 `DOCAGENT_PROVIDER=deepseek` 才启用（fail-closed：配置缺失即跳过远程，不半启用）。
+- 读取规则：`--provider` 显式指定 > `.env.docagent` 的 `DOCAGENT_PROVIDER` > 默认 deepseek；远程通道**必须**有 base_url+api_key 且 `DOCAGENT_PROVIDER=deepseek` 才启用（fail-closed：配置缺失自动回退 ollama；ollama 也不可用则跳过 LLM 判定，机械化清单照常输出）。
 - 密钥纪律：sk 只从 `.env.docagent` 读取，**不进入**命令行参数、日志、audit.json 与任何输出；`--llm` 输出只含判定与建议文本。
 - 数据边界：无论哪个 provider，发送内容仅限「疑似项 + 文档头部/相关段落（≤4KB/项）+ 提交标题」；正文、密钥、路径、URL、blob、grant 类字段一律不发送（沿用投影脱敏白名单思路）。
 
