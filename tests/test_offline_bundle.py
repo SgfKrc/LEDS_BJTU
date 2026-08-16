@@ -67,30 +67,29 @@ def test_missing_all_present(fake_assets):
 
 
 def test_pc_bundle_structure_and_manifest(fake_assets):
-    bundle = b._build_bundle(b.PC_ASSETS, "pc")
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
     assert bundle.name == f"qlh-models-pc-{b.BUNDLE_VERSION}.zip"
     with zipfile.ZipFile(bundle) as zf:
         names = zf.namelist()
-        root = bundle.name.removesuffix(".zip")
-        # 关键文件都在
-        assert f"{root}/MANIFEST.json" in names
-        assert f"{root}/CHECKSUMS.sha256" in names
-        assert f"{root}/README-导入说明.md" in names
+        # 关键文件都在（解压到项目根即就位，无顶层目录）
+        assert "MANIFEST.json" in names
+        assert "CHECKSUMS.sha256" in names
+        assert "README-导入说明.md" in names
         assert any("qwen-1_8b-chat/model.safetensors" in n for n in names)
         assert any("gemma4-native/model.gguf" in n for n in names)
         assert any("sd15-assets/QLH-SD15-Assets-" in n for n in names)
         # manifest 字段
-        manifest = json.loads(zf.read(f"{root}/MANIFEST.json"))
+        manifest = json.loads(zf.read("MANIFEST.json"))
         assert manifest["variant"] == "pc"
         assert set(manifest["asset_ids"]) == set(b.PC_ASSETS)
         # 所有 manifest 文件都在包内
         for f in manifest["files"]:
-            assert f"{root}/{f['path']}" in names
+            assert f["path"] in names
             assert f["sha256"] and f["size"] > 0
 
 
 def test_android_bundle_only_gguf(fake_assets):
-    bundle = b._build_bundle(b.ANDROID_ASSETS, "android")
+    bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="zip")
     with zipfile.ZipFile(bundle) as zf:
         names = zf.namelist()
         # 只有 GGUF + 清单文件
@@ -101,23 +100,31 @@ def test_android_bundle_only_gguf(fake_assets):
 
 
 def test_verify_roundtrip(fake_assets):
-    bundle = b._build_bundle(b.PC_ASSETS, "pc")
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
     b._verify_bundle(bundle)  # 不应抛异常
 
 
+@pytest.mark.skipif(b._seven_zip() is None, reason="7-Zip 未安装")
+def test_7z_build_and_verify_roundtrip(fake_assets):
+    bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="7z")
+    assert bundle.suffix == ".7z"
+    b._verify_bundle(bundle)  # 7z 解包逐文件比对，不应抛异常
+
+
 def test_verify_detects_tamper(fake_assets):
-    bundle = b._build_bundle(b.PC_ASSETS, "pc")
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
     # 篡改包内一个文件后 verify 必须失败
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         with zipfile.ZipFile(bundle) as zf:
             zf.extractall(tmp)
-        root = tmp / bundle.name.removesuffix(".zip")
-        target = next(root.rglob("model.safetensors"))
+        target = next(Path(tmp).rglob("model.safetensors"))
         target.write_bytes(b"tampered")
         tampered = tmp / "tampered.zip"
         with zipfile.ZipFile(tampered, "w", zipfile.ZIP_STORED) as zf:
-            for p in sorted(root.rglob("*")):
+            for p in sorted(Path(tmp).rglob("*")):
+                if p == tampered:
+                    continue  # 不把输出包自己压进去
                 zf.write(p, p.relative_to(tmp).as_posix())
         with pytest.raises(b.BundleError, match="SHA 不匹配|缺文件"):
             b._verify_bundle(tampered)
