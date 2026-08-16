@@ -49,6 +49,14 @@ from qwen3_pipeline_multisidecar import (
     Qwen3PipelineMultiSidecar,
     cleanup_qwen3_local_artifacts,
 )
+from gemma4_pipeline_multisidecar import (
+    Gemma4MultiSidecarError,
+    Gemma4PipelineMultiSidecar,
+)
+from gemma4_pipeline_sidecar import (
+    Gemma4PipelineSidecarSession,
+    Gemma4SidecarError,
+)
 
 from task_provider import (
     ModelIdentity as TaskModelIdentity,
@@ -1100,6 +1108,15 @@ class Scheduler:
         self._qwen3_network_transfer_coordinator = None
         self._qwen3_artifact_transfer_runtime = None
         self._qwen3_peer_request_verifier = None
+        # Gemma 4 Unified uses a distinct Transformers 5.10.1 sidecar.  This
+        # local chain is an explicit development route and never changes the
+        # production pipeline runtime allow-list.
+        self._gemma4_local_chain: Optional[Gemma4PipelineMultiSidecar] = None
+        self._gemma4_local_contract: Optional[dict] = None
+        self._gemma4_local_chain_lock = threading.RLock()
+        self._gemma4_local_artifact_root_override: Optional[str] = None
+        self._gemma4_assignment_paths: dict[str, str] = {}
+        self._gemma4_sidecar_python_override: Optional[str] = None
         self._active_pipeline_capacity_plan: Optional[dict] = None
         self._prepared_layer_configs: dict[str, dict] = {}
         # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
@@ -3503,6 +3520,212 @@ class Scheduler:
             "流水线加载事务已中止: config=%s reason_code=%s reason=%s",
             config_id, reason_code, reason,
         )
+
+    def configure_gemma4_pipeline_sidecar(
+        self,
+        assignment_paths: dict[str, str],
+        *,
+        sidecar_python: str | None = None,
+        artifact_root: str | None = None,
+    ) -> dict:
+        """Bind node-local filtered assignments to the experimental route."""
+        if not isinstance(assignment_paths, dict) or not assignment_paths:
+            raise Gemma4MultiSidecarError(
+                "gemma4_scheduler_config_invalid", "assignment path map is empty",
+            )
+        normalized: dict[str, str] = {}
+        resolved_paths: set[str] = set()
+        for raw_node_id, raw_path in assignment_paths.items():
+            node_id = str(raw_node_id or "")
+            path = Path(str(raw_path or "")).expanduser().absolute().resolve(strict=False)
+            if not node_id or not path.is_dir():
+                raise Gemma4MultiSidecarError(
+                    "gemma4_scheduler_config_invalid",
+                    "every Gemma 4 node requires a local assignment directory",
+                )
+            normalized_path = str(path)
+            if normalized_path in resolved_paths:
+                raise Gemma4MultiSidecarError(
+                    "gemma4_scheduler_config_invalid",
+                    "each segment requires a distinct filtered assignment directory",
+                )
+            normalized[node_id] = normalized_path
+            resolved_paths.add(normalized_path)
+        resolved_python = None
+        if sidecar_python:
+            resolved_python = str(
+                Path(sidecar_python).expanduser().absolute().resolve(strict=False)
+            )
+        resolved_root = None
+        if artifact_root:
+            path = Path(artifact_root).expanduser().absolute().resolve(strict=False)
+            path.mkdir(parents=True, exist_ok=True)
+            if not path.is_dir():
+                raise Gemma4MultiSidecarError(
+                    "gemma4_scheduler_config_invalid", "artifact root is unavailable",
+                )
+            resolved_root = str(path)
+        with self._gemma4_local_chain_lock:
+            if self._gemma4_local_chain is not None:
+                raise Gemma4MultiSidecarError(
+                    "gemma4_scheduler_chain_active",
+                    "cannot reconfigure an active Gemma 4 chain",
+                )
+            self._gemma4_assignment_paths = normalized
+            self._gemma4_sidecar_python_override = resolved_python
+            self._gemma4_local_artifact_root_override = resolved_root
+        return {
+            "configured": True,
+            "node_ids": sorted(normalized),
+            "assignment_count": len(normalized),
+            "runtime_environment": ".venv-gemma4-pipeline",
+            "production_admitted": False,
+        }
+
+    def _gemma4_local_artifact_root(self) -> Path:
+        if self._gemma4_local_artifact_root_override:
+            root = Path(self._gemma4_local_artifact_root_override)
+        else:
+            from config import STATE_DIR
+
+            root = Path(STATE_DIR) / "gemma4-local-chain"
+        root = root.expanduser().absolute().resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _gemma4_sidecar_session_from_message(
+        self, message: dict,
+    ) -> Gemma4PipelineSidecarSession:
+        node_id = str(message.get("node_id", "") or "")
+        model_path = self._gemma4_assignment_paths.get(node_id)
+        if not model_path:
+            raise Gemma4SidecarError(
+                "gemma4_sidecar_model_missing",
+                "node-local filtered assignment path is not configured",
+            )
+        return Gemma4PipelineSidecarSession(
+            model_path=model_path,
+            model_id=str(message.get("model_id", "") or ""),
+            model_sha256=str(message.get("model_sha256", "") or ""),
+            config_id=str(message.get("config_id", "") or ""),
+            plan_id=str(message.get("plan_id", "") or ""),
+            node_id=node_id,
+            layer_range=message.get("layer_range", [0, 0]),
+            total_layers=int(message.get("total_layers", 0) or 0),
+            has_embedding=bool(message.get("has_embedding", False)),
+            has_lm_head=bool(message.get("has_lm_head", False)),
+            required_shared_kv_types=message.get("requires_shared_kv_types", []),
+            produced_shared_kv_types=message.get("produces_shared_kv_types", []),
+            execution_device=str(message.get("execution_device", "cpu") or "cpu"),
+            dtype=str(message.get("dtype", "float32") or "float32"),
+            generation=int(message.get("generation", 0) or 0),
+            assignment_manifest_sha256=str(
+                message.get("assignment_manifest_sha256", "") or ""
+            ),
+            sidecar_python=self._gemma4_sidecar_python_override,
+        )
+
+    def begin_gemma4_local_sidecar_chain(
+        self,
+        contract: dict,
+        *,
+        session_factory=None,
+    ) -> dict:
+        """Prepare and commit an explicit local Gemma 4 development chain."""
+        factory = session_factory or self._gemma4_sidecar_session_from_message
+        with self._gemma4_local_chain_lock:
+            if self._gemma4_local_chain is not None:
+                raise Gemma4MultiSidecarError(
+                    "gemma4_scheduler_chain_active", "another Gemma 4 chain is active",
+                )
+            chain = Gemma4PipelineMultiSidecar.from_contract(
+                contract=contract,
+                artifact_root=self._gemma4_local_artifact_root(),
+                session_factory=factory,
+            )
+            self._gemma4_local_chain = chain
+            self._gemma4_local_contract = dict(contract)
+            try:
+                chain.prepare()
+                chain.commit()
+            except Exception:
+                chain.abort()
+                self._gemma4_local_chain = None
+                self._gemma4_local_contract = None
+                raise
+            return {
+                "status": "committed",
+                "state": chain.snapshot,
+                "production_admitted": False,
+            }
+
+    def _gemma4_require_local_chain(self) -> Gemma4PipelineMultiSidecar:
+        chain = self._gemma4_local_chain
+        if chain is None:
+            raise Gemma4MultiSidecarError(
+                "gemma4_scheduler_chain_missing", "no Gemma 4 local chain is active",
+            )
+        return chain
+
+    def run_gemma4_local_prefill(
+        self, *, input_ref: str, batch_size: int, sequence_length: int,
+    ) -> dict:
+        with self._gemma4_local_chain_lock:
+            chain = self._gemma4_require_local_chain()
+            result = chain.prefill(
+                input_ref=input_ref,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+            )
+            return {"status": "prefilled", "result": result, "state": chain.snapshot}
+
+    def run_gemma4_local_decode(
+        self, *, input_ref: str, batch_size: int, sequence_length: int,
+    ) -> dict:
+        with self._gemma4_local_chain_lock:
+            chain = self._gemma4_require_local_chain()
+            result = chain.decode(
+                input_ref=input_ref,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+            )
+            return {"status": "decoded", "result": result, "state": chain.snapshot}
+
+    def release_gemma4_local_sidecar_chain(self) -> dict:
+        with self._gemma4_local_chain_lock:
+            chain = self._gemma4_require_local_chain()
+            try:
+                result = chain.release()
+                return {"status": "released", "result": result, "state": chain.snapshot}
+            finally:
+                self._gemma4_local_chain = None
+                self._gemma4_local_contract = None
+
+    def abort_gemma4_local_sidecar_chain(self) -> dict:
+        with self._gemma4_local_chain_lock:
+            chain = self._gemma4_local_chain
+            if chain is None:
+                return {
+                    "status": "idle",
+                    "active": False,
+                    "production_admitted": False,
+                }
+            try:
+                result = chain.abort()
+                return {"status": "aborted", "result": result, "state": chain.snapshot}
+            finally:
+                self._gemma4_local_chain = None
+                self._gemma4_local_contract = None
+
+    def get_gemma4_local_sidecar_status(self) -> dict:
+        with self._gemma4_local_chain_lock:
+            chain = self._gemma4_local_chain
+            return {
+                "active": chain is not None,
+                "state": chain.snapshot if chain is not None else {"phase": "idle"},
+                "runtime_environment": ".venv-gemma4-pipeline",
+                "production_admitted": False,
+            }
 
     def begin_qwen3_pipeline_dry_run(
         self, contract: dict, *, timeout_seconds: float = 30.0,
