@@ -1,8 +1,8 @@
 # SD 1.5 离线资产包与签名源站发布计划
 
-> 状态：规划（阶段 1 进行中；阶段 2 待 GPU 空窗）
+> 状态：**`✅ Completed`**（阶段 1 + 阶段 2 均完成，2026-08-11；收口复核 2026-08-16）
 >
-> 更新日期：2026-08-11
+> 更新日期：2026-08-16
 > 适用范围：SD 1.5 系列五个已冻结资产的正式离线资产包制作、签名源站发布与离线导入验收；SD-N2 发布资产门收尾
 >
 > 总计划入口：[总体下一步计划](总体下一步计划.md) L4-SD1.5；专项背景见 [SD 1.5引擎与分布式图像生成实施计划](SD%201.5引擎与分布式图像生成实施计划.md)
@@ -32,7 +32,7 @@ SD 1.5 系列五个资产已全部冻结并下载到本机（原版 SD 1.5、90s
 
 冲突边界：**不修改 `src/` 任何现有文件、不运行 GPU、不动 `.venv-packaging-cuda` 依赖**；新增文件限 `scripts/package_sd15_assets.py`、`packaging/sd15-licenses/`、`packaging/serve.py`（kind 分类）、`tests/test_sd15_asset_packaging.py`。serve.py 的改动与 gemma-4（api_server/model_config/llama_engine）零交集。
 
-### 阶段 2（需 GPU 空窗，gemma-4 开发告一段落后执行）
+### 阶段 2（✅ 已完成 2026-08-11；当时需 GPU 空窗，gemma-4 开发告一段落后执行）
 交付：五资产真实打包与离线导入闭环验收。
 
 冲突边界：逐资产 1–4 step 离线冒烟占用 RTX 4060 显存（峰值 reserved ~3.4–3.6 GB），必须避开 gemma-4 的 GPU 推理窗口；打包 IO 约 13 GB，输出到 `build/sd15-assets/`（不写 `models/` 内部）。
@@ -65,7 +65,7 @@ QLH-SD15-Assets-<asset_id>-v0.1.0.zip
 - 打包脚本：合成资产 fixture 打包 → manifest 字段齐全、逐文件 SHA 与 spec 一致、LICENSE/MODEL_CARD/IMPORT 齐备、`.sha256` 侧车正确、缺文件/哈希不符 fail-closed（`tests/test_sd15_asset_packaging.py`）；
 - serve.py：`_classify_update_asset` 对 `qlh-sd15-assets-*` 返回 `sd15-asset`；manifest 构建含该类资产（复用现有 serve 测试）。
 
-### 阶段 2（实机）
+### 阶段 2（实机，✅ 全部达成 2026-08-11）
 - 五资产真实打包：打包前逐文件 size+SHA 与 spec 一致，包级 SHA 侧车正确；
 - 离线导入闭环：解包到干净临时目录 → `verify_asset_directory` 通过 → 服务自动发现注册 → **Hub 强制离线**下单资产 1–4 step 真实生成冒烟，全程无网络访问；
 - SD-N2 标记 `Completed`，专项计划与总计划同步登记。
