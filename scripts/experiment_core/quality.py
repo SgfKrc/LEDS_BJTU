@@ -190,7 +190,7 @@ def _normalize_gemma_judge(
         value,
         {
             "model", "judge_contract_id", "judge_contract_sha256",
-            "topic_hit", "key_element_coverage",
+            "topic_hit", "key_element_coverage", "manual_review",
         },
         "gemma_judge",
     )
@@ -200,6 +200,20 @@ def _normalize_gemma_judge(
     }
     if not required.issubset(value):
         raise QualityEvidenceError("gemma_judge requires model and both rate counters")
+    # KIP-16: 人工复核绑定（可选字段；quality.required 时由 gate 强制
+    # status==passed）。只存状态与人数，不存审核者身份。
+    manual = None
+    if value.get("manual_review") is not None:
+        manual = _mapping(value["manual_review"], "gemma_judge.manual_review")
+        _only_keys(manual, {"status", "required_reviewers"}, "gemma_judge.manual_review")
+        if not {"status", "required_reviewers"}.issubset(manual):
+            raise QualityEvidenceError("gemma_judge.manual_review is incomplete")
+        if manual["status"] not in _MANUAL_REVIEW_STATUSES:
+            raise QualityEvidenceError("gemma_judge.manual_review.status is unsupported")
+        manual = {
+            "status": str(manual["status"]),
+            "required_reviewers": int(manual["required_reviewers"]),
+        }
     model = _identifier(value["model"], "gemma_judge.model")
     contract_id = _identifier(
         value["judge_contract_id"], "gemma_judge.judge_contract_id",
@@ -227,6 +241,7 @@ def _normalize_gemma_judge(
             value["key_element_coverage"],
             "gemma_judge.key_element_coverage",
         ),
+        "manual_review": manual,
     }
 
 

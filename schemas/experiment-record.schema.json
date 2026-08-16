@@ -1,301 +1,783 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "qlh-experiment-record-schema-v1",
-  "title": "QLH 实验记录（EX-N1 schema v1，2026-08-09 冻结）",
-  "type": "object",
-  "additionalProperties": true,
-  "required": [
-    "experiment_id", "experiment_name", "plan_id", "timestamp",
-    "commit", "env", "model", "prompt_set", "params", "runs",
-    "metrics", "gate", "artifacts"
-  ],
-  "properties": {
-    "experiment_id": { "type": "string", "pattern": "^exp-[0-9]{4}$" },
-    "experiment_name": { "type": "string" },
-    "plan_id": { "type": "string" },
-    "timestamp": { "type": "string" },
-    "commit": { "type": "string" },
-    "env": {
-      "type": "object",
-      "properties": {
-        "os": { "type": "string" },
-        "cpu": { "type": "string" },
-        "gpu": { "type": "string" },
-        "ram_gb": { "type": ["number", "null"] },
-        "engine": { "type": "string" },
-        "torch": { "type": "string" },
-        "cuda": { "type": "string" }
-      }
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "qlh-experiment-record-schema-v1",
+ "title": "QLH 实验记录（EX-N1 schema v1，2026-08-09 冻结）",
+ "type": "object",
+ "additionalProperties": true,
+ "required": [
+  "experiment_id",
+  "experiment_name",
+  "plan_id",
+  "timestamp",
+  "commit",
+  "env",
+  "model",
+  "prompt_set",
+  "params",
+  "runs",
+  "metrics",
+  "gate",
+  "artifacts"
+ ],
+ "properties": {
+  "experiment_id": {
+   "type": "string",
+   "pattern": "^exp-[0-9]{4}$"
+  },
+  "experiment_name": {
+   "type": "string"
+  },
+  "plan_id": {
+   "type": "string"
+  },
+  "timestamp": {
+   "type": "string"
+  },
+  "commit": {
+   "type": "string"
+  },
+  "env": {
+   "type": "object",
+   "properties": {
+    "os": {
+     "type": "string"
     },
-    "model": {
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "artifact_sha256": { "type": ["string", "null"] },
-        "quant_family": { "type": ["string", "null"] },
-        "effective_bpw": { "type": ["number", "null"] },
-        "tokenizer": { "type": ["string", "null"] },
-        "context": { "type": ["number", "null"] }
-      }
+    "cpu": {
+     "type": "string"
     },
-    "prompt_set": {
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "sha256": { "type": "string" },
-        "count": { "type": "number" }
-      }
+    "gpu": {
+     "type": "string"
     },
-    "params": {
-      "type": "object",
-      "properties": {
-        "seed": { "type": ["number", "null"] },
-        "temperature": { "type": ["number", "null"] },
-        "top_p": { "type": ["number", "null"] },
-        "max_new_tokens": { "type": ["number", "null"] },
-        "stream": { "type": "boolean" },
-        "concurrency": { "type": "number" },
-        "independent_variable": { "type": "object" }
-      }
+    "ram_gb": {
+     "type": [
+      "number",
+      "null"
+     ]
     },
-    "runs": { "type": "number", "minimum": 1 },
-    "metrics": {
-      "type": "object",
-      "properties": {
-        "ttft_ms": { "type": ["number", "null"] },
-        "decode_tok_s": { "type": ["number", "null"] },
-        "e2e_ms": { "type": ["number", "null"] },
-        "peak_vram_gb": { "type": ["number", "null"] },
-        "load_s": { "type": ["number", "null"] },
-        "success": { "type": "number" },
-        "failed": { "type": "number" }
-      }
+    "engine": {
+     "type": "string"
     },
-    "quality": {
-      "oneOf": [
-        { "$ref": "#/$defs/quality_evidence_v2" },
-        { "$ref": "#/$defs/quality_evidence_v1" },
-        { "$ref": "#/$defs/quality_legacy" }
+    "torch": {
+     "type": "string"
+    },
+    "cuda": {
+     "type": "string"
+    }
+   }
+  },
+  "model": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "artifact_sha256": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "quant_family": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "effective_bpw": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "tokenizer": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "context": {
+     "type": [
+      "number",
+      "null"
+     ]
+    }
+   }
+  },
+  "prompt_set": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "sha256": {
+     "type": "string"
+    },
+    "count": {
+     "type": "number"
+    }
+   }
+  },
+  "params": {
+   "type": "object",
+   "properties": {
+    "seed": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "temperature": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "top_p": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "max_new_tokens": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "stream": {
+     "type": "boolean"
+    },
+    "concurrency": {
+     "type": "number"
+    },
+    "independent_variable": {
+     "type": "object"
+    }
+   }
+  },
+  "runs": {
+   "type": "number",
+   "minimum": 1
+  },
+  "metrics": {
+   "type": "object",
+   "properties": {
+    "ttft_ms": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "decode_tok_s": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "e2e_ms": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "peak_vram_gb": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "load_s": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "success": {
+     "type": "number"
+    },
+    "failed": {
+     "type": "number"
+    }
+   }
+  },
+  "quality": {
+   "oneOf": [
+    {
+     "$ref": "#/$defs/quality_evidence_v2"
+    },
+    {
+     "$ref": "#/$defs/quality_evidence_v1"
+    },
+    {
+     "$ref": "#/$defs/quality_legacy"
+    }
+   ]
+  },
+  "quality_gate": {
+   "type": "object",
+   "properties": {
+    "status": {
+     "enum": [
+      "passed",
+      "failed",
+      "not_collected",
+      "invalid"
+     ]
+    },
+    "required": {
+     "type": "boolean"
+    },
+    "checks": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "llm",
+       "sd",
+       "gemma_judge"
       ]
+     }
     },
-    "quality_gate": {
-      "type": "object",
-      "properties": {
-        "status": { "enum": ["passed", "failed", "not_collected", "invalid"] },
-        "required": { "type": "boolean" },
-        "checks": { "type": "array", "items": { "enum": ["llm", "sd", "gemma_judge"] } },
-        "criteria": { "type": "array", "items": { "type": "string" } }
-      }
-    },
-    "performance_gate": {
-      "type": "object",
-      "properties": {
-        "metric": { "type": "string" },
-        "threshold": { "type": "string" },
-        "status": { "enum": ["passed", "failed", "invalid"] }
-      }
-    },
-    "calibration": {
-      "type": ["object", "null"],
-      "properties": {
-        "series_id": { "type": "string" },
-        "rounds_required": { "const": 3 },
-        "threshold_version": { "type": "string" }
-      }
-    },
-    "baseline_experiment_id": { "type": ["string", "null"] },
-    "gate": {
-      "type": "object",
-      "properties": {
-        "metric": { "type": "string" },
-        "threshold": { "type": "string" },
-        "status": { "enum": ["passed", "failed", "invalid"] }
-      }
-    },
-    "artifacts": {
-      "type": "object",
-      "properties": {
-        "raw_log": { "type": "string" },
-        "outputs": { "type": "string" },
-        "result_file": { "type": ["string", "null"] }
-      }
-    },
-    "retries": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "attempt": { "type": "number" },
-          "exit_code": { "type": ["number", "null"] },
-          "reason": { "type": "string" },
-          "log": { "type": "string" }
-        }
-      }
+    "criteria": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
     }
-  }
-  ,"$defs": {
-    "quality_legacy": {
-      "type": "object",
-      "not": { "required": ["schema_version"] },
-      "additionalProperties": false,
-      "required": ["correct_rate", "format_rate"],
-      "properties": {
-        "correct_rate": { "type": ["number", "null"] },
-        "format_rate": { "type": ["number", "null"] }
-      }
+   }
+  },
+  "performance_gate": {
+   "type": "object",
+   "properties": {
+    "metric": {
+     "type": "string"
     },
-    "quality_evidence_v1": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema_version", "status", "not_collected_reason",
-        "correct_rate", "format_rate", "llm", "sd"
-      ],
-      "properties": {
-        "schema_version": { "const": "qlh.experiment_quality.v1" },
-        "status": { "enum": ["collected", "not_collected", "invalid"] },
-        "not_collected_reason": { "type": ["string", "null"] },
-        "correct_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
-        "format_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
-        "llm": {
-          "type": ["object", "null"],
-          "additionalProperties": false,
-          "required": ["prompt_set_id", "prompt_set_sha256", "correctness", "format"],
-          "properties": {
-            "prompt_set_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-            "prompt_set_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-            "correctness": { "$ref": "#/$defs/quality_rate" },
-            "format": { "$ref": "#/$defs/quality_rate" }
-          }
-        },
-        "sd": {
-          "type": ["object", "null"],
-          "additionalProperties": false,
-          "required": [
-            "mode", "asset_id", "artifact_id", "source_schema_version",
-            "automatic_gate", "manual_review"
-          ],
-          "properties": {
-            "mode": { "enum": ["text_to_image", "img2img", "ip_adapter", "inpaint", "instruction"] },
-            "asset_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-            "artifact_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-            "source_schema_version": { "const": 1 },
-            "automatic_gate": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["status", "output_count", "unique_output_count"],
-              "properties": {
-                "status": { "enum": ["passed", "failed"] },
-                "output_count": { "type": "integer", "minimum": 0 },
-                "unique_output_count": { "type": "integer", "minimum": 0 }
-              }
-            },
-            "manual_review": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["status", "required_reviewers"],
-              "properties": {
-                "status": { "enum": ["passed", "failed", "pending", "not_required"] },
-                "required_reviewers": { "type": "integer", "minimum": 0 }
-              }
-            }
-          }
-        }
-      }
+    "threshold": {
+     "type": "string"
     },
-    "quality_evidence_v2": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema_version", "status", "not_collected_reason",
-        "correct_rate", "format_rate", "llm", "sd", "gemma_judge"
-      ],
-      "properties": {
-        "schema_version": { "const": "qlh.experiment_quality.v2" },
-        "status": { "const": "collected" },
-        "not_collected_reason": { "const": null },
-        "correct_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
-        "format_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
-        "llm": {
-          "oneOf": [
-            { "type": "null" },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["prompt_set_id", "prompt_set_sha256", "correctness", "format"],
-              "properties": {
-                "prompt_set_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-                "prompt_set_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-                "correctness": { "$ref": "#/$defs/quality_rate" },
-                "format": { "$ref": "#/$defs/quality_rate" }
-              }
-            }
-          ]
-        },
-        "sd": {
-          "oneOf": [
-            { "type": "null" },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "mode", "asset_id", "artifact_id", "source_schema_version",
-                "automatic_gate", "manual_review"
-              ],
-              "properties": {
-                "mode": { "enum": ["text_to_image", "img2img", "ip_adapter", "inpaint", "instruction"] },
-                "asset_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-                "artifact_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-                "source_schema_version": { "const": 1 },
-                "automatic_gate": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["status", "output_count", "unique_output_count"],
-                  "properties": {
-                    "status": { "enum": ["passed", "failed"] },
-                    "output_count": { "type": "integer", "minimum": 0 },
-                    "unique_output_count": { "type": "integer", "minimum": 0 }
-                  }
-                },
-                "manual_review": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["status", "required_reviewers"],
-                  "properties": {
-                    "status": { "enum": ["passed", "failed", "pending", "not_required"] },
-                    "required_reviewers": { "type": "integer", "minimum": 0 }
-                  }
-                }
-              }
-            }
-          ]
-        },
-        "gemma_judge": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "model", "judge_contract_id", "judge_contract_sha256",
-            "topic_hit", "key_element_coverage"
-          ],
-          "properties": {
-            "model": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-            "judge_contract_id": { "type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$" },
-            "judge_contract_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-            "topic_hit": { "$ref": "#/$defs/quality_rate" },
-            "key_element_coverage": { "$ref": "#/$defs/quality_rate" }
-          }
-        }
-      }
-    },
-    "quality_rate": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["evaluated_count", "passed_count", "rate"],
-      "properties": {
-        "evaluated_count": { "type": "integer", "minimum": 1 },
-        "passed_count": { "type": "integer", "minimum": 0 },
-        "rate": { "type": "number", "minimum": 0, "maximum": 1 }
-      }
+    "status": {
+     "enum": [
+      "passed",
+      "failed",
+      "invalid"
+     ]
     }
+   }
+  },
+  "calibration": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "properties": {
+    "series_id": {
+     "type": "string"
+    },
+    "rounds_required": {
+     "const": 3
+    },
+    "threshold_version": {
+     "type": "string"
+    }
+   }
+  },
+  "baseline_experiment_id": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "gate": {
+   "type": "object",
+   "properties": {
+    "metric": {
+     "type": "string"
+    },
+    "threshold": {
+     "type": "string"
+    },
+    "status": {
+     "enum": [
+      "passed",
+      "failed",
+      "invalid"
+     ]
+    }
+   }
+  },
+  "artifacts": {
+   "type": "object",
+   "properties": {
+    "raw_log": {
+     "type": "string"
+    },
+    "outputs": {
+     "type": "string"
+    },
+    "result_file": {
+     "type": [
+      "string",
+      "null"
+     ]
+    }
+   }
+  },
+  "retries": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "properties": {
+     "attempt": {
+      "type": "number"
+     },
+     "exit_code": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "reason": {
+      "type": "string"
+     },
+     "log": {
+      "type": "string"
+     }
+    }
+   }
   }
+ },
+ "$defs": {
+  "quality_legacy": {
+   "type": "object",
+   "not": {
+    "required": [
+     "schema_version"
+    ]
+   },
+   "additionalProperties": false,
+   "required": [
+    "correct_rate",
+    "format_rate"
+   ],
+   "properties": {
+    "correct_rate": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "format_rate": {
+     "type": [
+      "number",
+      "null"
+     ]
+    }
+   }
+  },
+  "quality_evidence_v1": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "schema_version",
+    "status",
+    "not_collected_reason",
+    "correct_rate",
+    "format_rate",
+    "llm",
+    "sd"
+   ],
+   "properties": {
+    "schema_version": {
+     "const": "qlh.experiment_quality.v1"
+    },
+    "status": {
+     "enum": [
+      "collected",
+      "not_collected",
+      "invalid"
+     ]
+    },
+    "not_collected_reason": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "correct_rate": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0,
+     "maximum": 1
+    },
+    "format_rate": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0,
+     "maximum": 1
+    },
+    "llm": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "additionalProperties": false,
+     "required": [
+      "prompt_set_id",
+      "prompt_set_sha256",
+      "correctness",
+      "format"
+     ],
+     "properties": {
+      "prompt_set_id": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+      },
+      "prompt_set_sha256": {
+       "type": "string",
+       "pattern": "^[0-9a-f]{64}$"
+      },
+      "correctness": {
+       "$ref": "#/$defs/quality_rate"
+      },
+      "format": {
+       "$ref": "#/$defs/quality_rate"
+      }
+     }
+    },
+    "sd": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "additionalProperties": false,
+     "required": [
+      "mode",
+      "asset_id",
+      "artifact_id",
+      "source_schema_version",
+      "automatic_gate",
+      "manual_review"
+     ],
+     "properties": {
+      "mode": {
+       "enum": [
+        "text_to_image",
+        "img2img",
+        "ip_adapter",
+        "inpaint",
+        "instruction"
+       ]
+      },
+      "asset_id": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+      },
+      "artifact_id": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+      },
+      "source_schema_version": {
+       "const": 1
+      },
+      "automatic_gate": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "status",
+        "output_count",
+        "unique_output_count"
+       ],
+       "properties": {
+        "status": {
+         "enum": [
+          "passed",
+          "failed"
+         ]
+        },
+        "output_count": {
+         "type": "integer",
+         "minimum": 0
+        },
+        "unique_output_count": {
+         "type": "integer",
+         "minimum": 0
+        }
+       }
+      },
+      "manual_review": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "status",
+        "required_reviewers"
+       ],
+       "properties": {
+        "status": {
+         "enum": [
+          "passed",
+          "failed",
+          "pending",
+          "not_required"
+         ]
+        },
+        "required_reviewers": {
+         "type": "integer",
+         "minimum": 0
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "quality_evidence_v2": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "schema_version",
+    "status",
+    "not_collected_reason",
+    "correct_rate",
+    "format_rate",
+    "llm",
+    "sd",
+    "gemma_judge"
+   ],
+   "properties": {
+    "schema_version": {
+     "const": "qlh.experiment_quality.v2"
+    },
+    "status": {
+     "const": "collected"
+    },
+    "not_collected_reason": {
+     "const": null
+    },
+    "correct_rate": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0,
+     "maximum": 1
+    },
+    "format_rate": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0,
+     "maximum": 1
+    },
+    "llm": {
+     "oneOf": [
+      {
+       "type": "null"
+      },
+      {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "prompt_set_id",
+        "prompt_set_sha256",
+        "correctness",
+        "format"
+       ],
+       "properties": {
+        "prompt_set_id": {
+         "type": "string",
+         "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+        },
+        "prompt_set_sha256": {
+         "type": "string",
+         "pattern": "^[0-9a-f]{64}$"
+        },
+        "correctness": {
+         "$ref": "#/$defs/quality_rate"
+        },
+        "format": {
+         "$ref": "#/$defs/quality_rate"
+        }
+       }
+      }
+     ]
+    },
+    "sd": {
+     "oneOf": [
+      {
+       "type": "null"
+      },
+      {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "mode",
+        "asset_id",
+        "artifact_id",
+        "source_schema_version",
+        "automatic_gate",
+        "manual_review"
+       ],
+       "properties": {
+        "mode": {
+         "enum": [
+          "text_to_image",
+          "img2img",
+          "ip_adapter",
+          "inpaint",
+          "instruction"
+         ]
+        },
+        "asset_id": {
+         "type": "string",
+         "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+        },
+        "artifact_id": {
+         "type": "string",
+         "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+        },
+        "source_schema_version": {
+         "const": 1
+        },
+        "automatic_gate": {
+         "type": "object",
+         "additionalProperties": false,
+         "required": [
+          "status",
+          "output_count",
+          "unique_output_count"
+         ],
+         "properties": {
+          "status": {
+           "enum": [
+            "passed",
+            "failed"
+           ]
+          },
+          "output_count": {
+           "type": "integer",
+           "minimum": 0
+          },
+          "unique_output_count": {
+           "type": "integer",
+           "minimum": 0
+          }
+         }
+        },
+        "manual_review": {
+         "type": "object",
+         "additionalProperties": false,
+         "required": [
+          "status",
+          "required_reviewers"
+         ],
+         "properties": {
+          "status": {
+           "enum": [
+            "passed",
+            "failed",
+            "pending",
+            "not_required"
+           ]
+          },
+          "required_reviewers": {
+           "type": "integer",
+           "minimum": 0
+          }
+         }
+        }
+       }
+      }
+     ]
+    },
+    "gemma_judge": {
+     "type": "object",
+     "additionalProperties": false,
+     "required": [
+      "model",
+      "judge_contract_id",
+      "judge_contract_sha256",
+      "topic_hit",
+      "key_element_coverage"
+     ],
+     "properties": {
+      "model": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+      },
+      "judge_contract_id": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
+      },
+      "judge_contract_sha256": {
+       "type": "string",
+       "pattern": "^[0-9a-f]{64}$"
+      },
+      "topic_hit": {
+       "$ref": "#/$defs/quality_rate"
+      },
+      "key_element_coverage": {
+       "$ref": "#/$defs/quality_rate"
+      },
+      "manual_review": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "object",
+         "additionalProperties": false,
+         "required": [
+          "status",
+          "required_reviewers"
+         ],
+         "properties": {
+          "status": {
+           "enum": [
+            "passed",
+            "failed",
+            "pending",
+            "not_required"
+           ]
+          },
+          "required_reviewers": {
+           "type": "integer",
+           "minimum": 0
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  "quality_rate": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "evaluated_count",
+    "passed_count",
+    "rate"
+   ],
+   "properties": {
+    "evaluated_count": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "passed_count": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "rate": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    }
+   }
+  }
+ }
 }

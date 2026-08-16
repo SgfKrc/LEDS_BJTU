@@ -1,165 +1,194 @@
 {
-  "plan_id": "plan-quality-total-gate-v1",
-  "title": "EX-N3 质量总 gate 实跑（三侧真实证据收口）",
-  "prompt_set": {
-    "id": "ps-v1-zh-en-code",
-    "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+ "plan_id": "plan-quality-total-gate-v1",
+ "title": "EX-N3 质量总 gate 实跑（三侧真实证据收口）",
+ "prompt_set": {
+  "id": "ps-v1-zh-en-code",
+  "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+ },
+ "env": {
+  "engine": "llm llama-cpp local GGUF + SD report collector + Gemma Ollama judge",
+  "gpu": "gemma judge via local Ollama; llm CPU",
+  "notes": "EX-N3 total-gate run: LLM format (non-R1 floor 0.30, correctness floor 0.0 per decision 2026-08-13 plan 1), SD automatic gate (real 90s report), Gemma real 10-image judge (topic 0.70 / coverage 0.40). quality.required=true."
+ },
+ "quality": {
+  "required": true,
+  "llm": {
+   "prompt_set_id": "ps-v1-zh-en-code",
+   "prompt_set_sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+   "objective_subset_count": 15,
+   "objective_prompt_ids": [
+    "math-001",
+    "math-002",
+    "math-004",
+    "math-005",
+    "en-001",
+    "code-001",
+    "code-002",
+    "code-003",
+    "code-004",
+    "code-005",
+    "fmt-001",
+    "fmt-002",
+    "fmt-003",
+    "fmt-004",
+    "fmt-005"
+   ],
+   "rubric_id": "llm-objective-ps-v1-v1",
+   "rubric_sha256": "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+   "correctness_rate_baseline": 0.0,
+   "format_rate_baseline": 0.3,
+   "compare_rule": ">= baseline*0.9"
   },
-  "env": {
-    "engine": "llm llama-cpp local GGUF + SD report collector + Gemma Ollama judge",
-    "gpu": "gemma judge via local Ollama; llm CPU",
-    "notes": "EX-N3 total-gate run: LLM format (non-R1 floor 0.30, correctness floor 0.0 per decision 2026-08-13 plan 1), SD automatic gate (real 90s report), Gemma real 10-image judge (topic 0.70 / coverage 0.40). quality.required=true."
+  "sd": {
+   "asset_ids": [
+    "sd15_90s_retrovers_v1"
+   ],
+   "gate": "quality_gate_sd15 automatic_gate.passed"
   },
-  "quality": {
-    "required": true,
-    "llm": {
-      "prompt_set_id": "ps-v1-zh-en-code",
-      "prompt_set_sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
-      "objective_subset_count": 15,
-      "objective_prompt_ids": ["math-001", "math-002", "math-004", "math-005", "en-001", "code-001", "code-002", "code-003", "code-004", "code-005", "fmt-001", "fmt-002", "fmt-003", "fmt-004", "fmt-005"],
-      "rubric_id": "llm-objective-ps-v1-v1",
-      "rubric_sha256": "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
-      "correctness_rate_baseline": 0.0,
-      "format_rate_baseline": 0.30,
-      "compare_rule": ">= baseline*0.9"
-    },
-    "sd": {
-      "asset_ids": ["sd15_90s_retrovers_v1"],
-      "gate": "quality_gate_sd15 automatic_gate.passed"
-    },
-    "gemma_judge": {
-      "model": "gemma4:12b",
-      "judge_contract_id": "gemma-judge-counts-v1",
-      "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
-      "topic_hit_rate_baseline": 0.70,
-      "key_element_coverage_baseline": 0.40
-    },
-    "manual_review": {
-      "reviewers_required": 2,
-      "upgrade_on": "2 pass, 0 fail"
-    }
+  "gemma_judge": {
+   "model": "gemma4:12b",
+   "judge_contract_id": "gemma-judge-counts-v1",
+   "judge_contract_sha256": "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
+   "topic_hit_rate_baseline": 0.7,
+   "key_element_coverage_baseline": 0.4
   },
-  "defaults": {
-    "runs": 1,
-    "timeout_s": 3600,
-    "max_retries": 0,
-    "resources": {
-      "cpu_model_slot": "qwen-1_8b-gguf"
-    }
+  "manual_review": {
+   "reviewers_required": 2,
+   "upgrade_on": "2 pass, 0 fail"
   },
-  "units": [
-    {
-      "experiment_id": "exp-0001",
-      "name": "LLM 格式率（Qwen 1.8B Q4 客观子集 15 题）",
-      "command": [
-        "{python}",
-        "scripts/experiment_llm_quality_unit.py",
-        "--model",
-        "models/Qwen-1_8B-Chat.Q4_K_M.gguf",
-        "--expected-model-sha256",
-        "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
-        "--prompt-set-dir",
-        "{prompt_set_dir}",
-        "--prompt-set-sha256",
-        "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
-        "--rubric",
-        "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
-        "--expected-rubric-sha256",
-        "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
-        "--result-file",
-        "{out_dir}/{experiment_id}.result.json",
-        "--seed",
-        "20260816",
-        "--max-new-tokens",
-        "192",
-        "--n-ctx",
-        "2048",
-        "--n-gpu-layers",
-        "0"
-      ],
-      "quality_checks": ["llm"],
-      "params": {
-        "seed": 20260816,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_new_tokens": 192,
-        "stream": false,
-        "concurrency": 1
-      },
-      "model": {
-        "id": "qwen-1_8b-chat-gguf",
-        "artifact_sha256": "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
-        "quant_family": "Q4_K_M",
-        "tokenizer": "chatml",
-        "context": 2048
-      },
-      "gate": {
-        "metric": "quality_completed",
-        "op": ">=",
-        "threshold": 1
-      }
-    },
-    {
-      "experiment_id": "exp-0002",
-      "name": "SD 自动门（90s 真实质量报告）",
-      "command": [
-        "{python}",
-        "scripts/experiment_sd15_quality_unit.py",
-        "--report",
-        "build/sd15-quality/sd15_90s_retrovers_v1/quality-report.json",
-        "--expected-report-sha256",
-        "f18c7950c9d80e74cfdf4a2d6ae1f4ed04f1bf72b85f2aa532ad0ccb10d8be8b",
-        "--expected-asset-id",
-        "sd15_90s_retrovers_v1",
-        "--expected-artifact-id",
-        "sd15_90s_retrovers_v1",
-        "--expected-mode",
-        "text_to_image",
-        "--result-file",
-        "{out_dir}/{experiment_id}.result.json"
-      ],
-      "quality_checks": ["sd"],
-      "params": {
-        "fixture_only": false
-      },
-      "gate": {
-        "metric": "quality_completed",
-        "op": ">=",
-        "threshold": 1
-      }
-    },
-    {
-      "experiment_id": "exp-0003",
-      "name": "Gemma 判题（真实 10 图 evidence）",
-      "command": [
-        "{python}",
-        "scripts/experiment_gemma_quality_unit.py",
-        "--evidence",
-        "build/exp-total-gate/rounds/evidence-r2.json",
-        "--expected-evidence-sha256",
-        "ed4737fdb6a2d6793f3d6f4e075959c16336b580d0ee4d03c3e5c3cfb6745039",
-        "--judge-contract",
-        "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
-        "--expected-judge-contract-sha256",
-        "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
-        "--expected-model",
-        "gemma4:12b",
-        "--expected-contract-id",
-        "gemma-judge-counts-v1",
-        "--result-file",
-        "{out_dir}/{experiment_id}.result.json"
-      ],
-      "quality_checks": ["gemma_judge"],
-      "params": {
-        "fixture_only": false,
-        "stream": false,
-        "concurrency": 1
-      },
-      "gate": {
-        "metric": "quality_completed",
-        "op": ">=",
-        "threshold": 1
-      }
-    }
-  ]
+  "calibration": {
+   "series_id": "sd-gemma-cal-v1",
+   "rounds_required": 3,
+   "threshold_version": "v1"
+  }
+ },
+ "defaults": {
+  "runs": 1,
+  "timeout_s": 3600,
+  "max_retries": 0,
+  "resources": {
+   "cpu_model_slot": "qwen-1_8b-gguf"
+  }
+ },
+ "units": [
+  {
+   "experiment_id": "exp-0001",
+   "name": "LLM 格式率（Qwen 1.8B Q4 客观子集 15 题）",
+   "command": [
+    "{python}",
+    "scripts/experiment_llm_quality_unit.py",
+    "--model",
+    "models/Qwen-1_8B-Chat.Q4_K_M.gguf",
+    "--expected-model-sha256",
+    "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+    "--prompt-set-dir",
+    "{prompt_set_dir}",
+    "--prompt-set-sha256",
+    "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+    "--rubric",
+    "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
+    "--expected-rubric-sha256",
+    "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+    "--result-file",
+    "{out_dir}/{experiment_id}.result.json",
+    "--seed",
+    "20260816",
+    "--max-new-tokens",
+    "192",
+    "--n-ctx",
+    "2048",
+    "--n-gpu-layers",
+    "0"
+   ],
+   "quality_checks": [
+    "llm"
+   ],
+   "params": {
+    "seed": 20260816,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_new_tokens": 192,
+    "stream": false,
+    "concurrency": 1
+   },
+   "model": {
+    "id": "qwen-1_8b-chat-gguf",
+    "artifact_sha256": "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+    "quant_family": "Q4_K_M",
+    "tokenizer": "chatml",
+    "context": 2048
+   },
+   "gate": {
+    "metric": "quality_completed",
+    "op": ">=",
+    "threshold": 1
+   }
+  },
+  {
+   "experiment_id": "exp-0002",
+   "name": "SD 自动门（90s 真实质量报告）",
+   "command": [
+    "{python}",
+    "scripts/experiment_sd15_quality_unit.py",
+    "--report",
+    "build/sd15-quality/sd15_90s_retrovers_v1/quality-report.json",
+    "--expected-report-sha256",
+    "f18c7950c9d80e74cfdf4a2d6ae1f4ed04f1bf72b85f2aa532ad0ccb10d8be8b",
+    "--expected-asset-id",
+    "sd15_90s_retrovers_v1",
+    "--expected-artifact-id",
+    "sd15_90s_retrovers_v1",
+    "--expected-mode",
+    "text_to_image",
+    "--result-file",
+    "{out_dir}/{experiment_id}.result.json"
+   ],
+   "quality_checks": [
+    "sd"
+   ],
+   "params": {
+    "fixture_only": false
+   },
+   "gate": {
+    "metric": "quality_completed",
+    "op": ">=",
+    "threshold": 1
+   }
+  },
+  {
+   "experiment_id": "exp-0003",
+   "name": "Gemma 判题（真实 10 图 evidence）",
+   "command": [
+    "{python}",
+    "scripts/experiment_gemma_quality_unit.py",
+    "--evidence",
+    "build/exp-total-gate/rounds/evidence-kip16.json",
+    "--expected-evidence-sha256",
+    "c591748d57687270805ee9aed74a3e9a3fc259d7c912afc699d425c208c98f92",
+    "--judge-contract",
+    "fixtures/quality_rubrics/gemma-judge-counts-v1.json",
+    "--expected-judge-contract-sha256",
+    "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
+    "--expected-model",
+    "gemma4:12b",
+    "--expected-contract-id",
+    "gemma-judge-counts-v1",
+    "--result-file",
+    "{out_dir}/{experiment_id}.result.json"
+   ],
+   "quality_checks": [
+    "gemma_judge"
+   ],
+   "params": {
+    "fixture_only": false,
+    "stream": false,
+    "concurrency": 1
+   },
+   "gate": {
+    "metric": "quality_completed",
+    "op": ">=",
+    "threshold": 1
+   }
+  }
+ ]
 }

@@ -28,8 +28,8 @@ PLAN = ROOT / "fixtures" / "experiment-plans" / "plan-quality-gemma-bridge-fixtu
 CONTRACT = ROOT / "fixtures" / "quality_rubrics" / "gemma-judge-counts-v1.json"
 EVIDENCE = ROOT / "fixtures" / "quality_reports" / "gemma-judge-counts-fixture-v1.json"
 ADAPTER = ROOT / "scripts" / "experiment_gemma_quality_unit.py"
-CONTRACT_SHA256 = "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88"
-EVIDENCE_SHA256 = "a0a33752672169585e0bf07eb39ae56879e460ebd64add0262f44311a0a2136f"
+CONTRACT_SHA256 = "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374"
+EVIDENCE_SHA256 = "4b93d41aeb3bb58d9ca25ba7787621085faa4f46c3333dd1ef28b3f34fac09d4"
 GEMMA_SPEC = {
     "model": "gemma4:12b",
     "judge_contract_id": "gemma-judge-counts-v1",
@@ -67,6 +67,7 @@ def _quality_payload() -> dict:
             "judge_contract_sha256": CONTRACT_SHA256,
             "topic_hit": {"evaluated_count": 10, "passed_count": 8},
             "key_element_coverage": {"evaluated_count": 10, "passed_count": 6},
+            "manual_review": {"status": "passed", "required_reviewers": 2},
         }
     }
 
@@ -137,6 +138,8 @@ def test_gemma_required_plan_allowed_with_approved_baselines(tmp_path):
     # or above the approved 0.70/0.40, so required=true now loads fine.
     raw = json.loads(PLAN.read_text(encoding="utf-8"))
     raw["quality"]["required"] = True
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"]["calibration"] = {"series_id": "sd-gemma-cal-v1", "rounds_required": 3, "threshold_version": "v1"}
     path = tmp_path / "required-gemma.json"
     path.write_text(json.dumps(raw), encoding="utf-8")
     plan = load_plan(path)

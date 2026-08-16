@@ -38,7 +38,7 @@ def collect_evidence(
     """Bind counter-only evidence to a versioned judge contract."""
     allowed_evidence_fields = {
         "model", "judge_contract_id", "judge_contract_sha256",
-        "topic_hit", "key_element_coverage",
+        "topic_hit", "key_element_coverage", "manual_review",
     }
     if set(evidence) != allowed_evidence_fields:
         raise ValueError("judge evidence contains unsupported fields")
@@ -56,6 +56,7 @@ def collect_evidence(
         "judge_contract_sha256": expected_contract_sha256,
         "topic_hit": evidence.get("topic_hit"),
         "key_element_coverage": evidence.get("key_element_coverage"),
+        "manual_review": evidence.get("manual_review"),
     }
     # The shared normalizer rejects extra fields and invalid counters before write.
     normalize_quality_evidence(

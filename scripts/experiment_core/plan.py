@@ -412,6 +412,19 @@ def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpe
                 "quality.required gemma_judge baselines must be >= approved "
                 "0.70/0.40 (calibrated 2026-08-13)"
             )
+    # KIP-16: required 的人工审核与三轮证据门——required 必须声明
+    # manual_review（reviewers_required >= 1）与 calibration
+    # （series_id + rounds_required=3），否则 plan 拒绝。
+    if required:
+        if not manual_review or int(manual_review.get("reviewers_required", 0) or 0) < 1:
+            raise PlanError(
+                "quality.required must declare manual_review with reviewers_required >= 1"
+            )
+        if not calibration or calibration.get("rounds_required") != 3:
+            raise PlanError(
+                "quality.required must declare calibration with rounds_required = 3 "
+                "(three-round evidence gate)"
+            )
     if required and not any((llm, sd, gemma_judge)):
         raise PlanError("quality.required needs at least one configured check")
     return QualitySpec(

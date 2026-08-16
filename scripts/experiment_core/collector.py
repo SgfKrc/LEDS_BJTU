@@ -184,6 +184,18 @@ def evaluate_quality_gate(
             allowed_assets = quality_spec.sd.get("asset_ids", ())
             criteria.append("sd.asset_id is declared by the plan")
             failed = failed or asset_id not in allowed_assets
+            # KIP-16: required 时人工审核必须 passed（双人目视证据绑定）。
+            if quality_spec.required:
+                manual = sd.get("manual_review") if isinstance(sd, Mapping) else None
+                plan_manual = quality_spec.manual_review or {}
+                required_reviewers = int(plan_manual.get("reviewers_required", 0) or 0)
+                criteria.append(f"sd.manual_review == passed (reviewers >= {required_reviewers})")
+                manual_ok = (
+                    isinstance(manual, Mapping)
+                    and manual.get("status") == "passed"
+                    and int(manual.get("required_reviewers", 0) or 0) >= required_reviewers
+                )
+                failed = failed or not manual_ok
 
     if "gemma_judge" in checks:
         gemma = quality.get("gemma_judge")
@@ -207,6 +219,18 @@ def evaluate_quality_gate(
                 f"gemma_judge.key_element_coverage >= {coverage_floor:.4g}",
             ))
             failed = failed or topic_hit < topic_floor or coverage < coverage_floor
+            # KIP-16: required 时判题结果必须已人工复核（evidence 绑定）。
+            if quality_spec.required:
+                plan_manual = quality_spec.manual_review or {}
+                required_reviewers = int(plan_manual.get("reviewers_required", 0) or 0)
+                criteria.append(f"gemma_judge.manual_review == passed (reviewers >= {required_reviewers})")
+                manual = gemma.get("manual_review") if isinstance(gemma, Mapping) else None
+                manual_ok = (
+                    isinstance(manual, Mapping)
+                    and manual.get("status") == "passed"
+                    and int(manual.get("required_reviewers", 0) or 0) >= required_reviewers
+                )
+                failed = failed or not manual_ok
 
     return {
         "status": "failed" if failed else "not_collected" if missing else "passed",

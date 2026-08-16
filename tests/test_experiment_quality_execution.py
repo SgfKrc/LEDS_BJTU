@@ -46,6 +46,9 @@ def _quality_plan(tmp_path: Path, *, required: bool = False, baseline: str | Non
         "prompt_set": PROMPT_SET,
         "quality": {
             "required": required,
+            "manual_review": {
+                "reviewers_required": 2, "upgrade_on": "2 pass, 0 fail",
+            },
             "llm": {
                 "prompt_set_id": PROMPT_SET["id"],
                 "prompt_set_sha256": PROMPT_SET["sha256"],
@@ -162,6 +165,8 @@ def test_correctness_floor_zero_allowed_but_weak_format_rejected_as_required(tmp
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["quality"]["required"] = True
     raw["quality"]["llm"]["correctness_rate_baseline"] = 0.0
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"]["calibration"] = {"series_id": "ex-n3-test-series-v1", "rounds_required": 3, "threshold_version": "v1"}
     path.write_text(json.dumps(raw), encoding="utf-8")
     plan = load_plan(path)  # allowed: correctness 0 + format 0.9 >= 0.30
     assert plan.quality.required is True
@@ -178,10 +183,12 @@ def test_gemma_judge_required_requires_approved_baselines(tmp_path):
     path = _quality_plan(tmp_path, required=False).source_path
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["quality"]["required"] = True
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"]["calibration"] = {"series_id": "ex-n3-test-series-v1", "rounds_required": 3, "threshold_version": "v1"}
     raw["quality"]["gemma_judge"] = {
         "model": "gemma4:12b",
         "judge_contract_id": "gemma-judge-counts-v1",
-        "judge_contract_sha256": "593c93446cc04553a2c058f36b988aee53b3c994ff92dde9d1539bcf81144b88",
+        "judge_contract_sha256": "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
         "topic_hit_rate_baseline": 0.70,
         "key_element_coverage_baseline": 0.40,
     }
@@ -278,3 +285,98 @@ def test_calibration_summarizer_requires_three_rounds_and_never_edits_plan(tmp_p
         "duplicates": [{"experiment_id": "exp-0003", "observed_records": 2}],
     }
     assert summary["correctness"]["minimum"] == 0.1
+
+
+def test_required_plan_must_declare_manual_review_and_calibration(tmp_path):
+    """KIP-16：required 必须带 manual_review 与三轮 calibration。"""
+    path = _quality_plan(tmp_path, required=False).source_path
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["quality"]["required"] = True
+    raw["quality"].pop("manual_review")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(PlanError, match="manual_review"):
+        load_plan(path)
+
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"].pop("calibration")
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(PlanError, match="rounds_required"):
+        load_plan(path)
+
+
+def test_required_sd_gate_requires_passed_manual_review(tmp_path):
+    """KIP-16：required 时 SD 证据人工审核未通过 → quality failed。"""
+    import scripts.experiment_core.collector as collector_mod
+    from experiment_core.plan import load_plan
+    from experiment_core.quality import normalize_quality_evidence
+
+    path = _quality_plan(tmp_path, required=False).source_path
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["quality"]["required"] = True
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"]["calibration"] = {"series_id": "s", "rounds_required": 3, "threshold_version": "v1"}
+    raw["quality"]["sd"] = {"asset_ids": ["a1"], "gate": "quality_gate_sd15 automatic_gate.passed"}
+    raw["units"][0]["quality_checks"] = ["sd"]
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    plan = load_plan(path)
+
+    evidence = normalize_quality_evidence({"sd": {
+        "mode": "text_to_image", "asset_id": "a1", "artifact_id": "a1",
+        "source_schema_version": 1,
+        "automatic_gate": {"passed": True, "output_count": 10, "unique_output_count": 10},
+        "manual_review": {"status": "pending", "required_reviewers": 2},
+    }})
+    gate = collector_mod.evaluate_quality_gate(
+        evidence, plan.quality, ("sd",), baseline_record=None,
+    )
+    assert gate["status"] == "failed"
+    assert any("manual_review" in c for c in gate["criteria"])
+
+
+def test_required_gemma_gate_requires_manual_review_binding(tmp_path):
+    """KIP-16：required 时 Gemma 判题证据缺人工复核绑定 → quality failed。"""
+    import scripts.experiment_core.collector as collector_mod
+    from experiment_core.plan import load_plan
+    from experiment_core.quality import normalize_quality_evidence
+
+    path = _quality_plan(tmp_path, required=False).source_path
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["quality"]["required"] = True
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"]["calibration"] = {"series_id": "s", "rounds_required": 3, "threshold_version": "v1"}
+    raw["quality"]["gemma_judge"] = {
+        "model": "gemma4:12b",
+        "judge_contract_id": "gemma-judge-counts-v1",
+        "judge_contract_sha256": "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
+        "topic_hit_rate_baseline": 0.70,
+        "key_element_coverage_baseline": 0.40,
+    }
+    raw["units"][0]["quality_checks"] = ["gemma_judge"]
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    plan = load_plan(path)
+
+    evidence = normalize_quality_evidence({"gemma_judge": {
+        "model": "gemma4:12b",
+        "judge_contract_id": "gemma-judge-counts-v1",
+        "judge_contract_sha256": "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
+        "topic_hit": {"evaluated_count": 10, "passed_count": 8},
+        "key_element_coverage": {"evaluated_count": 20, "passed_count": 12},
+    }}, expected_gemma_judge=plan.quality.gemma_judge)
+    gate = collector_mod.evaluate_quality_gate(
+        evidence, plan.quality, ("gemma_judge",), baseline_record=None,
+    )
+    assert gate["status"] == "failed"
+
+    # 带人工复核绑定后通过
+    evidence2 = normalize_quality_evidence({"gemma_judge": {
+        "model": "gemma4:12b",
+        "judge_contract_id": "gemma-judge-counts-v1",
+        "judge_contract_sha256": "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
+        "topic_hit": {"evaluated_count": 10, "passed_count": 8},
+        "key_element_coverage": {"evaluated_count": 20, "passed_count": 12},
+        "manual_review": {"status": "passed", "required_reviewers": 2},
+    }}, expected_gemma_judge=plan.quality.gemma_judge)
+    gate2 = collector_mod.evaluate_quality_gate(
+        evidence2, plan.quality, ("gemma_judge",), baseline_record=None,
+    )
+    assert gate2["status"] == "passed"
