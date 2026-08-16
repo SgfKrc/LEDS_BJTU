@@ -1,0 +1,230 @@
+"""文档维护机械化扫描器（M1）单测：5 条规则各覆盖命中+不命中。
+
+工具代码位于 docs/agent_tool/（非 tests 收集路径），通过 sys.path 引入。
+规则用临时文档目录 + 临时 git 仓库构造，不触碰真实 docs/。
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+TOOL_DIR = Path(__file__).resolve().parents[1] / "docs" / "agent_tool"
+sys.path.insert(0, str(TOOL_DIR))
+
+from doc_maintenance_audit import (  # noqa: E402
+    REPO_ROOT,
+    _check_link,
+    _extract_links,
+    _status_line,
+    _updated_at,
+    scan_all,
+    scan_doc,
+)
+
+
+@pytest.fixture
+def fake_repo(tmp_path):
+    """构造临时 git 仓库 + docs/ 目录，返回 (repo_root, docs_dir)。"""
+    repo = tmp_path / "repo"
+    docs = repo / "docs"
+    docs.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    return repo, docs
+
+
+def _write(docs: Path, name: str, content: str) -> Path:
+    p = docs / name
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def _commit(repo: Path, message: str = "init") -> None:
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", message], check=True)
+
+
+# ---------- 辅助函数 ----------
+
+def test_status_line_extraction():
+    text = "> 文档状态：规划（未开始）\n> 更新日期：2026-08-16\n"
+    assert "规划" in _status_line(text)
+    assert _updated_at(text) == "2026-08-16"
+
+
+def test_status_line_skips_lifecycle():
+    text = "> 文档生命周期：Active\n> 状态：现行\n"
+    assert _status_line(text) == "> 状态：现行"
+
+
+def test_links_extraction_and_existence(tmp_path):
+    # 提取
+    text = "[甲](A.md) [乙](../README.md) [外链](https://x.com/a) [锚](#sec)"
+    links = _extract_links(text)
+    paths = [h for _, h in links]
+    assert "A.md" in paths and "../README.md" in paths
+    assert not any(h.startswith(("http", "#")) for h in paths)
+    # 存在性
+    assert _check_link("文档维护Agent工具设计.md")
+    assert not _check_link("不存在的文档.md")
+
+
+# ---------- R1 完成未收口 ----------
+
+def test_r1_hit_when_stale_status_with_done_marks(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "x.md",
+               "> 状态：规划（阶段 1 进行中）\n> 更新日期：2026-08-10\n\n"
+               "## 记录\n\n阶段 2 完成 2026-08-11，导入闭环 5/5")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    rules = {f["rule"] for f in entry["findings"]}
+    assert "R1" in rules
+
+
+def test_r1_miss_when_status_current(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "y.md",
+               "> 状态：**`✅ Completed`**（阶段 1+2 完成）\n\n正文完成记录")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R1" not in {f["rule"] for f in entry["findings"]}
+
+
+def test_r1_miss_when_exempt_document(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "hist.md",
+               "> 状态：历史参考 / 待拆分\n\n已完成事项记录（不更新）")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R1" not in {f["rule"] for f in entry["findings"]}
+
+
+def test_r1_miss_when_no_done_marks(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "z.md",
+               "> 状态：规划（未开始）\n\n只有背景描述，无完成标记")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R1" not in {f["rule"] for f in entry["findings"]}
+
+
+# ---------- R2 未提交登记 ----------
+
+def test_r2_hit_when_docs_uncommitted(fake_repo):
+    repo, docs = fake_repo
+    _write(docs, "a.md", "> 状态：现行\n")
+    _commit(repo)
+    _write(docs, "b.md", "> 状态：现行\n")  # 未提交
+    entry = scan_doc(repo / "docs" / "a.md", repo, None)
+    assert "R2" in {f["rule"] for f in entry["findings"]}
+
+
+def test_r2_miss_when_clean(fake_repo):
+    repo, docs = fake_repo
+    _write(docs, "a.md", "> 状态：现行\n")
+    _commit(repo)
+    entry = scan_doc(repo / "docs" / "a.md", repo, None)
+    assert "R2" not in {f["rule"] for f in entry["findings"]}
+
+
+# ---------- R3 状态行滞后 ----------
+
+def test_r3_hit_when_commit_newer_than_updated_at(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "s.md",
+               "> 状态：现行\n> 更新日期：2026-08-01\n")
+    _commit(repo, "first")
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-08-15T00:00:00",
+           "GIT_COMMITTER_DATE": "2026-08-15T00:00:00"}
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "--allow-empty",
+         "--date", "2026-08-15T00:00:00", "-m", "later"],
+        env=env, check=True)
+    entry = scan_doc(p, repo, None)
+    assert "R3" in {f["rule"] for f in entry["findings"]}
+
+
+def test_r3_miss_when_updated_recently(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "t.md",
+               "> 状态：现行\n> 更新日期：2026-08-16\n")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R3" not in {f["rule"] for f in entry["findings"]}
+
+
+# ---------- R4 链接失效 ----------
+
+def test_r4_hit_on_broken_link(fake_repo):
+    repo, docs = fake_repo
+    (docs / "exists.md").write_text("> 状态：现行\n", encoding="utf-8")
+    p = _write(docs, "l.md",
+               "> 状态：现行\n\n[坏链](不存在.md) [好链](exists.md)")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    r4 = [f for f in entry["findings"] if f["rule"] == "R4"]
+    assert len(r4) == 1 and "不存在.md" in r4[0]["message"]
+
+
+def test_r4_miss_when_all_links_ok(fake_repo):
+    repo, docs = fake_repo
+    (docs / "ok.md").write_text("> 状态：现行\n", encoding="utf-8")
+    p = _write(docs, "m.md",
+               "> 状态：现行\n\n[好链](ok.md) [外链](https://example.com)")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R4" not in {f["rule"] for f in entry["findings"]}
+
+
+# ---------- R5 状态行缺失 ----------
+
+def test_r5_hit_when_status_missing(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "n.md", "# 标题\n\n正文没有状态行\n")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R5" in {f["rule"] for f in entry["findings"]}
+
+
+def test_r5_miss_when_status_present(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "o.md",
+               "> 状态：现行（正常文档）\n> 更新日期：2026-08-16\n")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R5" not in {f["rule"] for f in entry["findings"]}
+
+
+# ---------- 对真实仓库的烟雾验证（不触碰、只读） ----------
+
+def test_real_repo_scan_is_read_only_and_fast():
+    """对真实仓库跑全量：只读、<10s、能找到至少一类 warn 命中。"""
+    import subprocess
+    import time
+
+    def docs_status():
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--", "docs/"],
+            capture_output=True, text=True, encoding="utf-8").stdout
+
+    before = docs_status()
+    t0 = time.time()
+    out = scan_all(None, "error")
+    elapsed = time.time() - t0
+    assert elapsed < 10, f"扫描超时: {elapsed:.1f}s"
+    assert out["docs"]
+    # 只读性：扫描前后 docs/ 工作区状态一致（不产生/清除任何改动）
+    assert docs_status() == before, "扫描改变了 docs/ 工作区状态"
+    # 至少一类 warn 命中（对当前仓库必然成立：存在已知遗留模式）
+    all_findings = [f for d in out["docs"] for f in d["findings"]]
+    assert any(f["level"] == "warn" for f in all_findings)
