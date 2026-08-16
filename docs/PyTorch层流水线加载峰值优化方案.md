@@ -3,7 +3,7 @@
 > 文档生命周期：**现行（Active）**
 >
 > 创建日期：2026-08-13
-> 更新日期：2026-08-15
+> 更新日期：2026-08-16
 > 适用范围：分布式层间流水线（layer-wise pipeline）从节点的模型加载瞬时显存/内存峰值治理；直接约束 Surface 7 级轻量从节点在重模型（DeepSeek 7B / gemma-4 12B / Qwen 9B 等）下的可用性
 >
 > 目标：**加载瞬间峰值 ≈ 分配层段权重 + 常量开销**，与稳态占用同量级，杜绝"全模型峰值压垮从节点"；一期进一步把模型身份/容量发现从权重物化中剥离，向"集群总容量加载"演进。
@@ -26,7 +26,8 @@
 | Embedding / LM Head | 按 `has_embedding` / `has_lm_head` 决定保留；过滤路径下未分配端不物化 | ✅ 常量级 |
 | 加载后裁剪 | `ModuleList(kept)` + `del` 释放，并断言裁剪后层数等于 assignment | 防御性二次保险（过滤路径下未分配层仍为 meta） |
 | 加载观测 | tensor/materialization 边界采样 RSS + CUDA allocated；统计源权重字节与目标 dtype 字节 | ✅ 本机可回归；不宣称捕获两个边界间的瞬时尖峰 |
-| **其他架构**（`gemma4_unified`、`qwen3`、`qwen3_vl` 等） | `load_layer_range` fail-closed，并明确指向 §4.2；不能回退整模加载 | 不适用（尚未接入） |
+| **Gemma 4 Unified**（`gemma4_unified`） | KIP-11A/11B 开发门已完成：官方嵌套 text layout、隔离 assignment、分段前向、shared-KV/mask、sidecar 与 Scheduler 本地链路已落地；主运行时仍 fail-closed | ✅ 官方 Transformers 5.10.1 CPU tiny prefill/decode 与整模 logits 等价；真实工件/CUDA/双机/生产准入仍关闭 |
+| **其他架构**（`qwen3`、`qwen3_vl` 等） | 主 `load_layer_range` fail-closed；已实现的 Qwen3 filtered sidecar 路径单独登记，不能回退整模加载 | 按各架构 sidecar 状态判定 |
 
 **结论**：Qwen/Qwen2 系**现状已无全模型峰值问题**；真正的风险在**未来新架构接入层流水线时**（若实现者图省事走"全加载 → 截断"，就会引入峰值）。本方案的任务是：**把"按层 key 过滤物化"固化为唯一允许的接入路径**，并治理其余加载缓冲。
 
@@ -50,7 +51,7 @@
 - 在 `load_layer_range` 的 `else` 分支错误消息中补充指引：新架构接入须按本方案 §4.2 模板实现。
 
 ### 4.2 新架构接入模板（P1，未来架构必用）
-**状态：Gemma 4 adapter Completed（2026-08-16）；Qwen3 无需此 adapter。** 通用 key 守卫、字节统计、层集合断言和观测字段已经落地；**Gemma 4 的层前缀/骨架适配已实现**（`_load_gemma_layer_range` 复用共享加载器，key 布局 `model.layers./model.embed_tokens./model.norm./lm_head.` 与 Qwen2 一致，tracker 身份 `gemma`，定向测试 4 passed）；**Qwen3 系走 PT-PIPE 独立 filtered assignment/sidecar 物化路径**（`qwen3_pipeline_adapter` + C3 manifest），不经过 `load_layer_range`，因此不在本模板范围内。其余新架构仍必须按本模板实现，不能把“通用守卫完成”登记成架构已支持。
+**状态：KIP-11A/11B Development Gate Completed（2026-08-16，见《已知问题记录》#11）；Qwen3 走独立 adapter。** KIP-11A 已按官方 Transformers 定义纠正 Gemma 4 身份和布局：顶层 `model_type=gemma4_unified`，文本层位于 `model.language_model.layers.*`，首尾权重位于 `model.language_model.embed_tokens.*`、`model.language_model.norm.*` 和 `lm_head.*`；视觉与音频权重位于 `model.embed_vision.*`、`model.embed_audio.*`，不得混入文本 assignment。KIP-11B 在独立 `.venv-gemma4-pipeline`（Transformers 5.10.1）中完成官方层段前向、连续 KV/shared-KV、显式 mask/位置、path-free sidecar 合同和 Scheduler 本地 2/3 段链；官方 CPU tiny prefill/decode 与整模 logits 最大绝对误差为 0。`.venv-gemma4-native` 仅保留原生 MTMD/llama.cpp，不得复用。当前 `pipeline_runtime_supported=false`，真实 23.9GB 工件、CUDA/双机、网络传输、恢复和生产准入仍必须后验收。**Qwen3 系继续使用 `qwen3_pipeline_adapter` + C3 manifest**，不经过主运行时 `load_layer_range`。
 
 1. 解析 config 的 `num_hidden_layers`，校验与 assignment 一致（现有逻辑复用）；
 2. 确定层 key 前缀（`model.layers.` / `transformer.h.` / `model.h.`——按架构）；
@@ -86,7 +87,7 @@
 ## 7. 关联与登记
 
 - 关联：`docs/Gemma-4-12B多模态支持方案.md` §2.4（PyTorch 候选 S2 接入层流水线时按本方案模板）；`docs/验收清单与资源限制登记.md` A4（双机验收含峰值实测）；`docs/张量并行外部辅助与混合拆分调研方案.md`（层间拆分 vs TP 的显存语义区分）。
-- 优先级：P0 已完成；P2 本机开发基线已完成；下一张相关开发票随首个 PyTorch 新架构选择执行 P1 adapter，硬件到位后再执行三轮峰值标定与阈值冻结。
+- 优先级：P0、P2 本机开发基线与 Gemma 4 KIP-11A/11B 开发门已完成；KIP-12 受管 native binding 冻结身份门也已关闭。当前下一票转 KIP-13（P6 完整加载复用指纹）；硬件到位后再执行真实工件三轮峰值标定与阈值冻结，KIP-11B 不因 tiny smoke 进入生产 allow-list。
 - 本方案不改变任何已验收行为；当前 Qwen 系分布式加载行为不变（已是目标形态）。
 
 ## 8. 从“单机先整模”迁移到“集群总容量加载”的分期计划
@@ -641,7 +642,23 @@
 2. adapter 将策略摘要投影到 path-free 结果并写入新 ledger；worker/replay 校验策略身份、过期窗口、replay 权限、期望 policy SHA 和 sampling 一致性，不把完整快照、路径、prompt、token ID 或 RNG 状态放入控制结果。
 3. 新增策略快照、隐式 sampling、过期策略、policy/ledger/replay 集成回归；定向 `48 passed`，最新 MM1/sidecar/network 联合 `181 passed / 1 skipped`（唯一 skip 为 MM1.18 完整模型显式 opt-in；RAM 门本次满足）。真实模型采样质量、CUDA/双机、跨节点路由和生产准入仍未验。
 
-### 8.81 下一阶段：转向 `L4-GEMMA4 G4.3.2B` CPU-only 原生初始化与固定图片语义对照
+### 8.81 历史排期：`L4-GEMMA4 G4.3.2B`（已完成，2026-08-16 复核）
 
-1. 复用已冻结的官方 Ollama `gemma4:12b` GGUF/mmproj 双 SHA 与资源准入门；只有可用 RAM 达到约 `8.74 GiB` 且 Ollama 未驻留时，才进入隔离 CPU-only `Llama`/MTMD 初始化。
-2. 在真实资源门满足前保持 fail-closed，不下载第二份模型、不宣称原生视觉支持；后续音频、8K/16K、分布式和打包仍按 G4.3.3 排队。
+1. `3a3ee84`、`b41788c` 已完成官方 Ollama `gemma4:12b` GGUF/mmproj 身份下的 CPU-only 原生图片 smoke；本条不再作为下一票。
+2. 该结论只属于已冻结 GGUF/mmproj 路径，不代表 23.9GB PyTorch 工件、分布式 pipeline、音频、长上下文或生产路由已经验收。
+
+### 8.82 `KIP-11A` Gemma 4 Unified 元数据、分配与隔离物化合同（开发门 Completed，2026-08-16）
+
+1. `pipeline_model_descriptor` 已登记官方 `gemma4_unified` 嵌套布局；descriptor 独立统计 text layer、embedding/norm/head 与 `embed_vision`/`embed_audio` 多模态字节，运行时能力继续显式关闭。
+2. assignment manifest 只允许分配 `model.language_model.*` 和 `lm_head.*`；未规划视觉/音频组件时容量与物化均 fail-closed，tied head 的源权重按架构布局解析，不再硬编码 Qwen2 路径。
+3. 新增隔离 `gemma4_pipeline_adapter`：要求 filtered safetensors index、`local_files_only=true`、`trust_remote_code=false`，先验证完整 assignment/key 集合再读取 tensor；只创建 meta 骨架和目标层段，清除未分配首尾与两种模态模块，指标固定声明 `full_model_materialized=false`、`multimodal_materialized=false`。
+4. 主运行时在读取本地 config 后即拒绝 `gemma`/`gemma4_unified`，不会落入旧 Transformers 的未知架构错误，也不会复用 Qwen2 前向。定向回归 `125 passed / 1 skipped`（含官方默认 tied output），Scheduler/API/模型同步扩展回归 `348 passed`。
+5. **已转入 KIP-11B**：见下一节；在真实工件、CUDA/双机和生产路由验收完成前，`pipeline_runtime_supported` 必须保持 `false`。
+
+### 8.83 `KIP-11B` Gemma 4 隔离分段执行与本地 Scheduler 链（开发门 Completed，2026-08-16）
+
+1. 新增 `packaging/requirements-gemma4-pipeline-sidecar.txt` 与 `scripts/setup_gemma4_pipeline_env.py`；`.venv-gemma4-pipeline` 独立安装 Transformers `5.10.1`、Torch、Accelerate、Safetensors，脚本拒绝复用 `.venv-gemma4-native`，支持显式 PyTorch wheel index、wheelhouse 和用户代理。
+2. `Gemma4PipelineAdapter` 保持官方绝对 layer index，按 `full_attention/sliding_attention` 构造官方 mask；处理跨段 prefill 的位置/掩码、连续 decode、native `Cache` 和 shared-KV source/consumer，纯 shared 段使用只读 mask cache geometry，避免把上游 cache 重复计入。
+3. 新增 path-free `gemma4_pipeline_contract`、sidecar controller/worker、2/3 段 `Gemma4PipelineMultiSidecar` 与 Scheduler 本地显式 opt-in 接线；prepare/commit/execute/release/abort、assignment SHA、资源门、工件证据和 cleanup 均 fail-closed。控制结果固定 `full_model_materialized=false`、`multimodal_materialized=false`，不提供网络执行器或生产路由。
+4. 验证：KIP-11B 合同/adapter/sidecar/env 专项 `18 passed`；官方 Transformers 5.10.1 CPU tiny smoke（整模 vs 两段 prefill/decode）`prefill_max_abs_error=0`、`decode_max_abs_error=0`；主 `.venv-test` 官方 smoke 因旧 Transformers 版本跳过，未把测试依赖写入 sidecar。
+5. **KIP-12 已完成**：`gemma4-native` 受管 binding 已冻结路径、版本、revision、patch SHA、ABI 摘要和 package/frozen marker；缺失或篡改均 fail-closed。当前下一票转 KIP-13；KIP-11B 真实 23.9GB Safetensors header/assignment、CUDA、双机 handoff、断线恢复、真实语义和生产 allow-list 继续后置。
