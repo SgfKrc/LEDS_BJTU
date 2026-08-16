@@ -45,6 +45,7 @@ ANDROID_EXTS = (".apk", ".aab")
 UPDATE_MANIFEST_PATH = "/latest.json"
 _SIGNER = None  # set by main() when QLH_SIGNING_KEY is configured
 _VERSION_RE = re.compile(r"(?<!\d)v?(\d+\.\d+\.\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)
+_BUNDLE_VOLUME_RE = re.compile(r"\.7z\.\d{3}$", re.IGNORECASE)
 _REPAIR_INDEX_RE = re.compile(
     r"^qlh-edge-inference-repair-v\d+\.\d+\.\d+(?:\.\d+)?-"
     r"(?P<platform>windows|linux)-(?P<variant>cpu|cuda)\.json$",
@@ -115,7 +116,8 @@ def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
         )
     if lower.endswith(".zip") and "qlh-launcher" in lower:
         return "windows", "any", "x86_64", "launcher"
-    if lower.endswith(".7z") and "qlh-models-" in lower:
+    if "qlh-models-" in lower and (
+            lower.endswith(".7z") or _BUNDLE_VOLUME_RE.search(lower)):
         return "any", "any", "any", "model-bundle"
     if lower.endswith(".exe") and "qlh-launcher-setup" in lower:
         return "windows", "any", "x86_64", "launcher-setup"
