@@ -90,6 +90,40 @@ def test_model_download_rejects_paths_and_non_gguf_filenames(filename):
     assert rejected.value.status_code == 400
 
 
+def test_gguf_catalog_and_download_supports_range_without_local_path_leak(
+    monkeypatch,
+    tmp_path,
+):
+    from fastapi.testclient import TestClient
+
+    payload = b"0123456789"
+    model_path = tmp_path / "tiny.gguf"
+    model_path.write_bytes(payload)
+    monkeypatch.setattr(api_server, "_MODELS_DIR", str(tmp_path))
+
+    with TestClient(api_server.app) as client:
+        catalog = client.get("/api/models/gguf")
+        assert catalog.status_code == 200
+        body = catalog.json()
+        assert body["models"] == [{
+            "filename": "tiny.gguf",
+            "size_bytes": len(payload),
+            "size_mb": 0.0,
+            "sha256": __import__("hashlib").sha256(payload).hexdigest(),
+            "download_url": "/api/models/download/tiny.gguf",
+        }]
+        assert "directory" not in body
+
+        downloaded = client.get(
+            "/api/models/download/tiny.gguf",
+            headers={"Range": "bytes=4-7"},
+        )
+        assert downloaded.status_code == 206
+        assert downloaded.content == b"4567"
+        assert downloaded.headers["accept-ranges"] == "bytes"
+        assert downloaded.headers["content-range"] == "bytes 4-7/10"
+
+
 def test_downloadable_model_rejects_untrusted_peer(monkeypatch):
     import bootstrap
 

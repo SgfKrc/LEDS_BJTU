@@ -9020,7 +9020,7 @@ async def list_gguf_models():
     """
     models = []
     if not os.path.isdir(_MODELS_DIR):
-        return {"models": models, "directory": _MODELS_DIR, "exists": False}
+        return {"models": models, "exists": False, "count": 0}
 
     for fname in sorted(os.listdir(_MODELS_DIR)):
         if not fname.lower().endswith(".gguf"):
@@ -9062,7 +9062,6 @@ async def list_gguf_models():
 
     return {
         "models": models,
-        "directory": os.path.abspath(_MODELS_DIR),
         "exists": True,
         "count": len(models),
     }
