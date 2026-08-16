@@ -110,8 +110,8 @@ DOCAGENT_CONFIDENCE_FLOOR=0.6     # 低于此值一律 needs_review
 
 ### 4.4 使用流程
 ```bash
-python scripts/doc_maintenance_audit.py --llm                # 机械化 + LLM 分级（默认 ollama）
-python scripts/doc_maintenance_audit.py --llm --provider deepseek  # 远程 DS V4 Flash（需 .env.docagent 配置）
+python scripts/doc_maintenance_audit.py --llm                # 机械化 + LLM 分级（默认 deepseek/opencode go，需 .env.docagent 密钥）
+python scripts/doc_maintenance_audit.py --llm --provider ollama    # 本地 Ollama（离线/无密钥环境）
 python scripts/doc_maintenance_audit.py --llm --apply              # 生成建议 diff（不自动提交）
 ```
 
@@ -153,7 +153,7 @@ CREATE TABLE check_runs (           -- 核对历史，避免重复人工核对
 | 里程碑 | 交付 | 验收口径 |
 |---|---|---|
 | **M1 机械化扫描器** | `scripts/doc_maintenance_audit.py` + 规则表 + 清单模板 | 对当前仓库实测：能复现 2026-08-16 筛查发现的 4 类遗漏中的至少 3 类；全量扫描 <10s；零误删零改写（只读）；单测覆盖 5 条规则各至少 2 例（命中+不命中） |
-| **M2 LLM 判定** | `--llm` 路径 + 判定协议 + 脱敏检查 | 对已知 4 例遗留样本：判定与人工结论一致率 ≥ 3/4；confidence<0.6 全部转人工；Ollama 缺失时机械化照常 |
+| **M2 LLM 判定** | `--llm` 路径 + 判定协议 + 脱敏检查 | 对已知 4 例遗留样本：判定与人工结论一致率 ≥ 3/4（deepseek 通道）；confidence<0.6 全部转人工；远程密钥缺失自动回退 ollama、两者都不可用则机械化照常 |
 | **M3 事件库 + RAG** | SQLite 三表 + embedding 索引 + 检索 CLI | 变更描述→关联文档 top-5 命中率 ≥ 60%（30 条抽样人工标注）；`--rebuild` 从 git log 重建与 git 一致 |
 | 收口 | 全量核对清单清零（或逐项登记为已知/有意） | 2026-08-16 发现的 4 类问题模式在后续扫描中不再以"未发现"状态存在 |
 
@@ -173,3 +173,4 @@ CREATE TABLE check_runs (           -- 核对历史，避免重复人工核对
 |---|---|
 | 2026-08-16 | 建立本文档（M1-M3 设计基线）；立项背景为当日批量筛查发现的 4 类遗漏 |
 | 2026-08-16 | M2 扩展为双 provider：本地 Ollama（GPU/CPU）默认 + 远程 DeepSeek V4 Flash（opencode go 套餐）可选；配置独立 `.env.docagent`（入 gitignore），远程通道 fail-closed，密钥不落任何输出 |
+| 2026-08-16 | M2 优先级调整：**opencode go 远程通道（`https://opencode.ai/zen/go/v1`）默认优先**（本地 Ollama 上下文窗口有限易截断误判），Ollama 降为离线/无密钥兜底；回退链 deepseek→ollama→跳过 |
