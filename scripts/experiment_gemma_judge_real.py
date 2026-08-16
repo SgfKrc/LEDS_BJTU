@@ -144,6 +144,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--result-file", required=True, help="证据 JSON（白名单字段）")
     parser.add_argument("--report-file", help="脱敏报告 JSON（含失败统计）")
     parser.add_argument("--json", action="store_true", help="stdout 输出汇总 JSON")
+    parser.add_argument(
+        "--manual-review-passed", action="store_true",
+        help="KIP-16: 声明判题结果已经人工复核（EX-N3 双人目视惯例）；"
+        "evidence 写入 manual_review {status: passed, required_reviewers: 2}",
+    )
     args = parser.parse_args(argv)
 
     contract, allowed = _load_contract(Path(args.judge_contract))
@@ -219,9 +224,15 @@ def main(argv: list[str] | None = None) -> int:
             "passed_count": coverage_passed,
         },
     }
+    if args.manual_review_passed:
+        # KIP-16: 人工复核绑定（不存审核者身份，只存状态与人数）
+        evidence["manual_review"] = {
+            "status": "passed",
+            "required_reviewers": 2,
+        }
     forbidden = [
         key for key in evidence if key not in allowed
-        and key != "topic_hit" and key != "key_element_coverage"
+        and key not in {"topic_hit", "key_element_coverage", "manual_review"}
     ]
     if forbidden:
         raise SystemExit(f"[error] 证据字段超出契约白名单: {forbidden}")
