@@ -58,6 +58,7 @@ class QlhApplication : Application() {
     companion object {
         const val NOTIFICATION_CHANNEL_INFERENCE = "inference_engine"
         const val NOTIFICATION_ID_INFERENCE = 1001
+        const val NOTIFICATION_ID_WORKER = 1002
 
         lateinit var instance: QlhApplication
             private set

@@ -124,6 +124,12 @@ class MainViewModelLogicTest {
         val backend = payload["backend"] as Map<String, Any?>
         assertEquals("", backend["engine"])
         assertEquals(false, backend["supports_gpu_offload"])
+
+        @Suppress("UNCHECKED_CAST")
+        val multimodal = payload["multimodal"] as Map<String, Any?>
+        assertEquals(false, multimodal["vision_supported"])
+        assertEquals(false, multimodal["assets_present"])
+        assertEquals(false, multimodal["ready"])
     }
 
     @Test
@@ -325,5 +331,45 @@ class MainViewModelLogicTest {
         val next = clearMessageError(MainUiState(error = "x", isLoading = true))
         assertNull(next.error)
         assertTrue(next.isLoading)
+    }
+
+    @Test
+    fun `image submission keeps a bounded normalized payload`() {
+        val image = "data:image/png;base64,iVBORw0KGgo="
+        val urls = normalizeChatImageDataUrls(listOf("  $image  ", "", image))
+
+        assertEquals(listOf(image, image), urls)
+        assertNull(validateChatImageSubmission("thin", urls))
+    }
+
+    @Test
+    fun `image submission rejects invalid format and local mode`() {
+        assertEquals(
+            "图像仅支持 PNG/JPEG/WebP base64 data URL",
+            validateChatImageSubmission("thin", listOf("https://example/image.png")),
+        )
+        assertEquals(
+            "本地模式暂不支持图像理解，请切换远程模式",
+            validateChatImageSubmission("full", listOf("data:image/png;base64,iVBORw0KGgo=")),
+        )
+    }
+
+    @Test
+    fun `image submission rejects more than four non-empty urls`() {
+        val images = (1..5).map { "data:image/png;base64,$it" }
+        assertEquals(
+            "一次最多附加 4 张图片",
+            validateChatImageSubmission("thin", images),
+        )
+    }
+
+    @Test
+    fun `retry state retains image payload`() {
+        val image = "data:image/png;base64,iVBORw0KGgo="
+        val state = startMessageSubmission(MainUiState(), "看图", listOf(image))
+        val retry = startMessageRetry(failMessageSubmission(state, "超时"))
+
+        assertEquals(listOf(image), retry.lastSentImageDataUrls)
+        assertEquals("看图", retry.lastSentMessage)
     }
 }

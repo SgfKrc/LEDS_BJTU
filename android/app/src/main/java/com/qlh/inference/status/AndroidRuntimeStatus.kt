@@ -11,6 +11,7 @@ data class AndroidRuntimeStatus(
     val storage: StorageStatus = StorageStatus(),
     val gpu: GpuStatus = GpuStatus(),
     val backend: BackendStatus = BackendStatus(),
+    val multimodal: MultimodalStatus = MultimodalStatus(),
     val model: ModelRuntimeStatus = ModelRuntimeStatus(),
     val context: ContextRuntimeStatus = ContextRuntimeStatus(),
 )
@@ -66,6 +67,14 @@ data class BackendStatus(
     val supportsMlock: Boolean = false,
     val supportsGpuOffload: Boolean = false,
     val supportsRpc: Boolean = false,
+)
+
+data class MultimodalStatus(
+    val visionSupported: Boolean = false,
+    val assetsPresent: Boolean = false,
+    val assetSizesVerified: Boolean = false,
+    val ready: Boolean = false,
+    val reason: String = "",
 )
 
 data class ModelRuntimeStatus(

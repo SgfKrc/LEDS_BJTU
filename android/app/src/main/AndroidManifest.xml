@@ -42,5 +42,10 @@
             android:name=".service.InferenceService"
             android:exported="false"
             android:foregroundServiceType="specialUse" />
+
+        <service
+            android:name=".worker.TaskWorkerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
     </application>
 </manifest>

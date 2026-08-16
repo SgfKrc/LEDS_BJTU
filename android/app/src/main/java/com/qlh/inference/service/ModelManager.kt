@@ -8,6 +8,9 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Log
 import com.qlh.inference.data.SettingsDataStore
+import com.qlh.inference.model.Gemma4AssetFile
+import com.qlh.inference.model.Gemma4NativeAssetStatus
+import com.qlh.inference.model.Gemma4NativeAssets
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -271,6 +274,30 @@ class ModelManager(private val context: Context) {
         val treeUri = getSavedTreeUri() ?: return false
         return hasPersistedPermission(treeUri)
     }
+
+    /**
+     * Inspect the fixed Gemma4 native model/mmproj pair without opening either file.
+     * This is intentionally a registration gate; JNI capability and SHA-256 checks
+     * are reported separately by the runtime/import paths.
+     */
+    suspend fun inspectGemma4NativeAssets(): Gemma4NativeAssetStatus =
+        withContext(Dispatchers.IO) {
+            try {
+                val treeUri = getSavedTreeUri()
+                val files = if (treeUri != null && hasPersistedPermission(treeUri)) {
+                    listSafModels(treeUri).map { Gemma4AssetFile(it.name, it.sizeBytes) }
+                } else {
+                    modelsDir.listFiles { file ->
+                        file.isFile && file.name.endsWith(GGUF_EXTENSION, ignoreCase = true)
+                    }?.map { Gemma4AssetFile(it.name, it.length()) }.orEmpty()
+                }
+                Gemma4NativeAssets.inspect(files)
+            } catch (error: Exception) {
+                Gemma4NativeAssets.inspect(emptyList()).copy(
+                    reason = "asset scan failed: ${error.message ?: error.javaClass.simpleName}"
+                )
+            }
+        }
 
     private fun listSafModels(treeUri: Uri): List<ModelDocument> {
         val treeDocumentId = DocumentsContract.getTreeDocumentId(treeUri)

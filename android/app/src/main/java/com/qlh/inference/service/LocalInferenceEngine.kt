@@ -336,6 +336,19 @@ class LocalInferenceEngine(private val context: Context) {
         }
     }
 
+    /** Query the compiled multimodal bridge; text-only builds must report false. */
+    suspend fun getMultimodalCapability(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
+        val libResult = ensureNativeLibraryLoaded()
+        if (libResult.isFailure) {
+            return@withContext Result.failure(libResult.exceptionOrNull()!!)
+        }
+        try {
+            Result.success(nativeGetMultimodalCapability())
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
+    }
+
     suspend fun getLastGenerationStats(): Result<Map<String, String>> = withContext(Dispatchers.IO) {
         if (!isLoaded) {
             return@withContext Result.success(emptyMap())
@@ -393,6 +406,9 @@ class LocalInferenceEngine(private val context: Context) {
 
     /** 获取 llama.cpp / ggml 后端能力。 */
     private external fun nativeGetBackendInfo(): Map<String, String>
+
+    /** 获取 Android MTMD 图像/音频桥接能力。 */
+    private external fun nativeGetMultimodalCapability(): Map<String, String>
 
     /** 获取最近一次生成的 token 和耗时统计。 */
     private external fun nativeGetLastGenerationStats(modelPtr: Long): Map<String, String>

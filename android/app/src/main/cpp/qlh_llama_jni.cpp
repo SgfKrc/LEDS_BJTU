@@ -469,6 +469,22 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetBackendInfo(
 }
 
 extern "C" JNIEXPORT jobject JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetMultimodalCapability(
+    JNIEnv * env,
+    jobject /* thiz */
+) {
+    // The Android CMake target currently builds the text-only llama.cpp bridge.
+    // Keep this explicit so image requests fail closed until mtmd is wired in.
+    jmethodID put_method = nullptr;
+    jobject map = new_string_map(env, &put_method);
+    map_put(env, map, put_method, "vision_supported", "false");
+    map_put(env, map, put_method, "audio_supported", "false");
+    map_put(env, map, put_method, "mtmd_compiled", "false");
+    map_put(env, map, put_method, "reason", "Android JNI text-only build; MTMD bridge is not compiled");
+    return map;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
 Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetLastGenerationStats(
     JNIEnv * env,
     jobject /* thiz */,

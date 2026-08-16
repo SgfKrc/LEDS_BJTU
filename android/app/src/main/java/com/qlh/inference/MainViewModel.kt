@@ -79,7 +79,8 @@ data class MainUiState(
     val themeMode: String = SettingsDataStore.DEFAULT_THEME_MODE,
 
     // 上次发送的消息（用于重试）
-    val lastSentMessage: String? = null
+    val lastSentMessage: String? = null,
+    val lastSentImageDataUrls: List<String> = emptyList()
 )
 
 // ================================================================
@@ -318,12 +319,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     // ==================== 消息 ====================
 
-    fun sendMessage(message: String) {
-        QlhLogger.i("MainViewModel", "sendMessage start: ${message.length} chars")
+    fun sendMessage(message: String, imageDataUrls: List<String> = emptyList()) {
+        val normalizedImages = normalizeChatImageDataUrls(imageDataUrls)
+        QlhLogger.i(
+            "MainViewModel",
+            "sendMessage start: ${message.length} chars, images=${normalizedImages.size}"
+        )
         viewModelScope.launch {
             try {
                 val state = ensureActiveSession()
-                _uiState.value = startMessageSubmission(state, message)
+                val validationError = validateChatImageSubmission(state.inferenceMode, imageDataUrls)
+                if (validationError != null) {
+                    _uiState.value = failMessageSubmission(state, validationError)
+                    return@launch
+                }
+                _uiState.value = startMessageSubmission(state, message, normalizedImages)
 
                 val result = repository.sendMessage(
                     sessionId = state.currentSessionId,
@@ -331,7 +341,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     maxTokens = state.maxTokens,
                     temperature = state.temperature,
                     topP = state.topP,
-                    showThinking = state.showThinking
+                    showThinking = state.showThinking,
+                    imageDataUrls = normalizedImages,
                 )
 
                 result.onSuccess {
@@ -355,10 +366,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryLastMessage() {
-        val lastMsg = _uiState.value.lastSentMessage ?: return
+        val retryState = _uiState.value
+        val lastMsg = retryState.lastSentMessage ?: return
+        val retryImages = retryState.lastSentImageDataUrls
         viewModelScope.launch {
             try {
                 val state = ensureActiveSession()
+                val validationError = validateChatImageSubmission(state.inferenceMode, retryImages)
+                if (validationError != null) {
+                    _uiState.value = failMessageSubmission(state, validationError)
+                    return@launch
+                }
                 _uiState.value = startMessageRetry(state)
 
                 // 跳过用户消息保存（上次失败的尝试已保存），只重新调用 API
@@ -369,7 +387,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     temperature = state.temperature,
                     topP = state.topP,
                     showThinking = state.showThinking,
-                    skipUserSave = true  // ★ 避免重复用户消息
+                    skipUserSave = true,  // ★ 避免重复用户消息
+                    imageDataUrls = retryImages,
                 )
 
                 result.onSuccess {

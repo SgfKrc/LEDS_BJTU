@@ -129,6 +129,9 @@ fun MainApp(
                 isLoading = uiState.isLoading,
                 error = uiState.error,
                 onSendMessage = { viewModel.sendMessage(it) },
+                onSendMessageWithImages = { message, imageDataUrls ->
+                    viewModel.sendMessage(message, imageDataUrls)
+                },
                 onRetry = { viewModel.retryLastMessage() },
                 onClearError = { viewModel.clearError() },
                 modifier = Modifier.padding(innerPadding),

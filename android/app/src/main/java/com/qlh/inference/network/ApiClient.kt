@@ -25,6 +25,9 @@ import kotlin.coroutines.resumeWithException
 
 data class ChatRequest(
     val message: String,
+    /** PC /api/chat 的多模态输入；空列表保持原有纯文本请求语义。 */
+    @SerializedName("image_data_urls")
+    val imageDataUrls: List<String> = emptyList(),
     @SerializedName("max_new_tokens")
     val maxNewTokens: Int = 1024,
     val temperature: Float = 0.7f,
@@ -43,7 +46,12 @@ data class ChatRequest(
     @SerializedName("client_mode")
     val clientMode: String? = null,
     @SerializedName("client_app_variant")
-    val clientAppVariant: String? = null
+    val clientAppVariant: String? = null,
+    /** Only populated for an image request; PC requires explicit multimodal routing consent. */
+    @SerializedName("allow_external")
+    val allowExternal: Boolean? = null,
+    @SerializedName("prefer_external")
+    val preferExternal: Boolean? = null,
 )
 
 data class ChatResponse(

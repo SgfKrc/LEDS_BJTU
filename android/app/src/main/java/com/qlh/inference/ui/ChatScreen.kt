@@ -1,6 +1,10 @@
 package com.qlh.inference.ui
 
+import android.graphics.BitmapFactory
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +31,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
@@ -44,6 +50,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -54,10 +62,13 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.data.MessageEntity
+import com.qlh.inference.media.EncodedImageAttachment
+import com.qlh.inference.media.ImageAttachmentEncoder
 import com.qlh.inference.ui.components.EmptyState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.StatusChip
@@ -65,6 +76,9 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 // ================================================================
 // 聊天主界面
@@ -81,13 +95,47 @@ fun ChatScreen(
     onRetry: () -> Unit,
     onClearError: () -> Unit,
     modifier: Modifier = Modifier,
-    inferenceMode: String = ""
+    inferenceMode: String = "",
+    onSendMessageWithImages: (String, List<String>) -> Unit = { message, _ ->
+        onSendMessage(message)
+    },
 ) {
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
     val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var inputText by rememberSaveable { mutableStateOf("") }
+    var pendingImage by remember { mutableStateOf<EncodedImageAttachment?>(null) }
+    var imageError by remember { mutableStateOf<String?>(null) }
+    var isEncodingImage by remember { mutableStateOf(false) }
+    val canAttachImage = inferenceMode == "thin" && !isLoading
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        isEncodingImage = true
+        imageError = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                ImageAttachmentEncoder.encode(context.contentResolver, uri)
+            }
+            result.onSuccess { attachment ->
+                pendingImage = attachment
+            }.onFailure { error ->
+                pendingImage = null
+                imageError = error.message ?: "图片处理失败"
+            }
+            isEncodingImage = false
+        }
+    }
+
+    LaunchedEffect(inferenceMode) {
+        if (inferenceMode != "thin") {
+            pendingImage = null
+            imageError = null
+        }
+    }
 
     val copyAssistantMessage: (String) -> Unit = { text ->
         clipboardManager.setText(AnnotatedString(text))
@@ -184,12 +232,29 @@ fun ChatScreen(
             onTextChange = { inputText = it },
             onSend = {
                 if (inputText.isNotBlank()) {
-                    onSendMessage(inputText.trim())
+                    val message = inputText.trim()
+                    val image = pendingImage
+                    pendingImage = null
+                    imageError = null
+                    if (image == null) {
+                        onSendMessage(message)
+                    } else {
+                        onSendMessageWithImages(message, listOf(image.dataUrl))
+                    }
                     inputText = ""
                     focusManager.clearFocus()
                 }
             },
-            enabled = !isLoading
+            enabled = !isLoading,
+            pendingImage = pendingImage,
+            imageError = imageError,
+            isEncodingImage = isEncodingImage,
+            canAttachImage = canAttachImage,
+            onPickImage = { imagePicker.launch("image/*") },
+            onClearImage = {
+                pendingImage = null
+                imageError = null
+            },
         )
     }
 }
@@ -410,7 +475,13 @@ private fun ChatInputBar(
     text: String,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
-    enabled: Boolean
+    enabled: Boolean,
+    pendingImage: EncodedImageAttachment?,
+    imageError: String?,
+    isEncodingImage: Boolean,
+    canAttachImage: Boolean,
+    onPickImage: () -> Unit,
+    onClearImage: () -> Unit,
 ) {
     Surface(
         modifier = Modifier.navigationBarsPadding(),
@@ -422,6 +493,23 @@ private fun ChatInputBar(
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.Bottom
         ) {
+            IconButton(
+                onClick = onPickImage,
+                enabled = canAttachImage && !isEncodingImage,
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("chat_image_pick")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.AddPhotoAlternate,
+                    contentDescription = "选择图片",
+                    tint = if (canAttachImage && !isEncodingImage) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.outline
+                    }
+                )
+            }
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
@@ -471,6 +559,74 @@ private fun ChatInputBar(
                         MaterialTheme.colorScheme.outline
                     }
                 )
+            }
+        }
+        if (pendingImage != null || imageError != null || isEncodingImage) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 12.dp, bottom = 8.dp)
+                    .testTag("chat_image_preview"),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                when {
+                    pendingImage != null -> {
+                        val preview = remember(pendingImage.dataUrl) {
+                            BitmapFactory.decodeByteArray(
+                                pendingImage.previewBytes,
+                                0,
+                                pendingImage.previewBytes.size,
+                            )?.asImageBitmap()
+                        }
+                        if (preview != null) {
+                            Image(
+                                bitmap = preview,
+                                contentDescription = "已选择的图片",
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .clip(RoundedCornerShape(8.dp)),
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "已附加图片（${pendingImage.byteCount / 1024} KiB）",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        IconButton(
+                            onClick = onClearImage,
+                            modifier = Modifier.testTag("chat_image_clear"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "移除图片",
+                            )
+                        }
+                    }
+                    isEncodingImage -> {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("正在处理图片", style = MaterialTheme.typography.labelMedium)
+                    }
+                    else -> {
+                        Text(
+                            text = imageError.orEmpty(),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Spacer(modifier = Modifier.weight(1f))
+                        IconButton(onClick = onClearImage) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "清除图片错误",
+                            )
+                        }
+                    }
+                }
             }
         }
     }

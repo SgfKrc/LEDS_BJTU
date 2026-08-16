@@ -38,8 +38,86 @@ fun selectUiSession(
     currentTab = "chat",
 )
 
-fun startMessageSubmission(state: MainUiState, message: String): MainUiState =
-    state.copy(isLoading = true, error = null, lastSentMessage = message)
+const val MAX_CHAT_IMAGE_DATA_URLS = 4
+const val MAX_CHAT_IMAGE_BYTES = 8 * 1024 * 1024
+const val MAX_CHAT_IMAGE_TOTAL_BYTES = 16 * 1024 * 1024
+
+private val CHAT_IMAGE_DATA_URL = Regex(
+    "^data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)$",
+    RegexOption.IGNORE_CASE,
+)
+
+/** Normalize client-provided image payloads before they reach the HTTP contract. */
+fun normalizeChatImageDataUrls(imageDataUrls: List<String>): List<String> =
+    imageDataUrls
+        .asSequence()
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .take(MAX_CHAT_IMAGE_DATA_URLS)
+        .toList()
+
+/**
+ * Image understanding is a remote-only Android capability until mmproj/JNI is wired.
+ * Keep this check pure so UI and ViewModel tests can cover the gate without a device.
+ */
+fun validateChatImageSubmission(inferenceMode: String, imageDataUrls: List<String>): String? {
+    val normalized = normalizeChatImageDataUrls(imageDataUrls)
+    if (imageDataUrls.count { it.trim().isNotEmpty() } > MAX_CHAT_IMAGE_DATA_URLS) {
+        return "一次最多附加 $MAX_CHAT_IMAGE_DATA_URLS 张图片"
+    }
+    val maxPayloadChars = ((MAX_CHAT_IMAGE_BYTES + 2) / 3) * 4
+    var totalBytes = 0
+    for (dataUrl in normalized) {
+        val match = CHAT_IMAGE_DATA_URL.matchEntire(dataUrl)
+            ?: return "图像仅支持 PNG/JPEG/WebP base64 data URL"
+        val payload = match.groupValues[2]
+        if (payload.length > maxPayloadChars) {
+            return "单张图片不得超过 8 MiB"
+        }
+        val decoded = try {
+            java.util.Base64.getDecoder().decode(payload)
+        } catch (_: IllegalArgumentException) {
+            return "图像 data URL 的 base64 数据无效"
+        }
+        if (decoded.isEmpty() || decoded.size > MAX_CHAT_IMAGE_BYTES) {
+            return "单张图片必须为 1 byte 至 8 MiB"
+        }
+        val kind = match.groupValues[1].lowercase()
+        val signatureValid = when (kind) {
+            "png" -> decoded.size >= 8 && decoded.copyOfRange(0, 8).contentEquals(
+                byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+            )
+            "jpeg" -> decoded.size >= 3 && decoded[0] == 0xff.toByte() &&
+                decoded[1] == 0xd8.toByte() && decoded[2] == 0xff.toByte()
+            "webp" -> decoded.size >= 12 &&
+                decoded.copyOfRange(0, 4).contentEquals(byteArrayOf(0x52, 0x49, 0x46, 0x46)) &&
+                decoded.copyOfRange(8, 12).contentEquals(byteArrayOf(0x57, 0x45, 0x42, 0x50))
+            else -> false
+        }
+        if (!signatureValid) {
+            return "图像 MIME 类型与文件签名不一致"
+        }
+        totalBytes += decoded.size
+        if (totalBytes > MAX_CHAT_IMAGE_TOTAL_BYTES) {
+            return "图像总大小不得超过 16 MiB"
+        }
+    }
+    if (normalized.isNotEmpty() && inferenceMode != "thin") {
+        return "本地模式暂不支持图像理解，请切换远程模式"
+    }
+    return null
+}
+
+fun startMessageSubmission(
+    state: MainUiState,
+    message: String,
+    imageDataUrls: List<String> = emptyList(),
+): MainUiState = state.copy(
+    isLoading = true,
+    error = null,
+    lastSentMessage = message,
+    lastSentImageDataUrls = normalizeChatImageDataUrls(imageDataUrls),
+)
 
 fun completeMessageSubmission(state: MainUiState): MainUiState =
     state.copy(isLoading = false, error = null)
@@ -107,5 +185,12 @@ fun buildAndroidPresencePayload(
     "backend" to mapOf(
         "engine" to (runtime?.backend?.engine ?: ""),
         "supports_gpu_offload" to (runtime?.backend?.supportsGpuOffload ?: false),
+    ),
+    "multimodal" to mapOf(
+        "vision_supported" to (runtime?.multimodal?.visionSupported ?: false),
+        "assets_present" to (runtime?.multimodal?.assetsPresent ?: false),
+        "asset_sizes_verified" to (runtime?.multimodal?.assetSizesVerified ?: false),
+        "ready" to (runtime?.multimodal?.ready ?: false),
+        "reason" to (runtime?.multimodal?.reason ?: ""),
     ),
 )

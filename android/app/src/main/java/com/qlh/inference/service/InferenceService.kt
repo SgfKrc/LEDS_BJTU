@@ -17,6 +17,7 @@ import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.ContextRuntimeStatus
 import com.qlh.inference.status.GpuStatus
+import com.qlh.inference.status.MultimodalStatus
 import com.qlh.inference.status.ModelRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import kotlinx.coroutines.CoroutineScope
@@ -208,6 +209,32 @@ class InferenceService : Service() {
         return eng.unloadModel()
     }
 
+    /** Return the intersection of registered Gemma4 assets and compiled JNI MTMD capability. */
+    suspend fun getMultimodalStatus(): MultimodalStatus {
+        val assets = runCatching { modelManager.inspectGemma4NativeAssets() }
+            .getOrElse { error ->
+                return MultimodalStatus(
+                    reason = "asset scan failed: ${error.message ?: error.javaClass.simpleName}"
+                )
+            }
+        val native = engine?.getMultimodalCapability()?.getOrNull().orEmpty()
+        val visionSupported = native["vision_supported"] == "true"
+        val ready = visionSupported && assets.sizeVerified
+        val reason = when {
+            native.isEmpty() -> "本地 JNI 未初始化"
+            !visionSupported -> native["reason"] ?: "MTMD 图像桥接未启用"
+            !assets.sizeVerified -> assets.reason
+            else -> "ready"
+        }
+        return MultimodalStatus(
+            visionSupported = visionSupported,
+            assetsPresent = assets.pairPresent,
+            assetSizesVerified = assets.sizeVerified,
+            ready = ready,
+            reason = reason,
+        )
+    }
+
     suspend fun getRuntimeStatus(
         inferenceMode: String,
         isLite: Boolean,
@@ -227,6 +254,7 @@ class InferenceService : Service() {
             supportsGpuOffload = backendInfo.bool("supports_gpu_offload"),
             backendDevices = backendInfo["backend_devices"].orEmpty(),
         )
+        val multimodalStatus = getMultimodalStatus()
 
         return AndroidRuntimeStatus(
             nativeRuntimeAvailable = nativeResult?.isSuccess == true,
@@ -246,6 +274,7 @@ class InferenceService : Service() {
                 supportsGpuOffload = backendInfo.bool("supports_gpu_offload"),
                 supportsRpc = backendInfo.bool("supports_rpc"),
             ),
+            multimodal = multimodalStatus,
             model = ModelRuntimeStatus(
                 selectedName = selected?.name.orEmpty(),
                 selectedSizeBytes = selected?.sizeBytes ?: 0L,

@@ -61,12 +61,22 @@ class ChatScreenTest {
         }
     }
 
+    @Test
+    fun imagePickerIsEnabledOnlyInThinMode() {
+        setChatContent(inferenceMode = "thin")
+        composeRule.onNodeWithTag("chat_image_pick").assertIsEnabled()
+
+        setChatContent(inferenceMode = "full")
+        composeRule.onNodeWithTag("chat_image_pick").assertIsNotEnabled()
+    }
+
     private fun setChatContent(
         isLoading: Boolean = false,
         error: String? = null,
         onSendMessage: (String) -> Unit = {},
         onRetry: () -> Unit = {},
         onClearError: () -> Unit = {},
+        inferenceMode: String = "thin",
     ) {
         composeRule.setContent {
             QlhTheme(darkTheme = false) {
@@ -79,7 +89,7 @@ class ChatScreenTest {
                     onSendMessage = onSendMessage,
                     onRetry = onRetry,
                     onClearError = onClearError,
-                    inferenceMode = "thin",
+                    inferenceMode = inferenceMode,
                 )
             }
         }

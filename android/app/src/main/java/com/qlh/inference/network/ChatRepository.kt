@@ -87,8 +87,25 @@ class ChatRepository(
         temperature: Float = 0.7f,
         topP: Float = 0.9f,
         showThinking: Boolean = false,
-        skipUserSave: Boolean = false
+        skipUserSave: Boolean = false,
+        imageDataUrls: List<String> = emptyList(),
     ): Result<String> {
+        // Android local llama.cpp has no mmproj route yet. Reject before Room writes so
+        // an unsupported image request cannot leave a misleading user message behind.
+        val routeClient = apiClient()
+        val localService = if (routeClient == null) inferenceService() else null
+        if (imageDataUrls.isNotEmpty() && routeClient == null) {
+            val capabilityReason = localService?.getMultimodalStatus()?.reason.orEmpty()
+            val message = if (capabilityReason.isBlank()) {
+                "本地模式暂不支持图像理解，请切换远程模式"
+            } else {
+                "本地模式暂不支持图像理解：$capabilityReason；请切换远程模式"
+            }
+            return Result.failure(
+                UnsupportedOperationException(message)
+            )
+        }
+
         // 1. 保存用户消息到本地（重试时跳过，避免重复）
         if (!skipUserSave) {
             val userMsg = MessageEntity(
@@ -110,18 +127,27 @@ class ChatRepository(
         QlhLogger.i(TAG, "user message saved: session=$sessionId skipUserSave=$skipUserSave")
 
         // 3. 路由到推理引擎
-        val client = apiClient()
+        val client = routeClient
         if (client != null) {
             // ============================================================
             // 全无模式：HTTP → PC 主节点
             // ============================================================
-            return sendViaApi(client, sessionId, message, maxTokens, temperature, topP, showThinking)
+            return sendViaApi(
+                client,
+                sessionId,
+                message,
+                maxTokens,
+                temperature,
+                topP,
+                showThinking,
+                imageDataUrls,
+            )
         }
 
         // ================================================================
         // 全有模式：本地 llama.cpp 推理
         // ================================================================
-        val service = inferenceService()
+        val service = localService ?: inferenceService()
         if (service == null) {
             val errorMsg = MessageEntity(
                 sessionId = sessionId,
@@ -248,7 +274,8 @@ class ChatRepository(
         maxTokens: Int,
         temperature: Float,
         topP: Float,
-        showThinking: Boolean
+        showThinking: Boolean,
+        imageDataUrls: List<String>,
     ): Result<String> {
         QlhLogger.i(TAG, "sendViaApi: session=$sessionId message=${message.length} chars")
         thinPresenceHook?.invoke()
@@ -256,6 +283,7 @@ class ChatRepository(
         val result = client.chat(
             ChatRequest(
                 message = message,
+                imageDataUrls = imageDataUrls,
                 maxNewTokens = maxTokens,
                 temperature = temperature,
                 topP = topP,
@@ -264,7 +292,9 @@ class ChatRepository(
                 clientNodeId = clientNodeId,
                 clientNodeType = "android",
                 clientMode = "thin",
-                clientAppVariant = if (BuildConfig.IS_LITE) "lite" else "full"
+                clientAppVariant = if (BuildConfig.IS_LITE) "lite" else "full",
+                allowExternal = imageDataUrls.takeIf { it.isNotEmpty() }?.let { true },
+                preferExternal = imageDataUrls.takeIf { it.isNotEmpty() }?.let { true },
             )
         )
 

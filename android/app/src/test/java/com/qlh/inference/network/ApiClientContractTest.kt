@@ -168,6 +168,34 @@ class ApiClientContractTest {
     }
 
     @Test
+    fun `chat serializes remote image data urls using PC field name`() {
+        var seen: Request? = null
+        route("/api/chat") { req, reply ->
+            seen = req
+            reply(200, """{"content":"vision reply"}""")
+        }
+
+        val image = "data:image/png;base64,iVBORw0KGgo="
+        val result = runBlocking {
+            client.chat(
+                ChatRequest(
+                    message = "describe",
+                    imageDataUrls = listOf(image),
+                    allowExternal = true,
+                    preferExternal = true,
+                )
+            )
+        }
+
+        assertTrue(result.isSuccess)
+        // Gson escapes '=' as \\u003d, so assert the wire field and stable data URL prefix.
+        assertTrue(seen!!.body.contains("\"image_data_urls\":[\"data:image/png;base64,"))
+        assertTrue(seen!!.body.contains("iVBORw0KGgo"))
+        assertTrue(seen!!.body.contains("\"allow_external\":true"))
+        assertTrue(seen!!.body.contains("\"prefer_external\":true"))
+    }
+
+    @Test
     fun `chat non-2xx returns failure not exception`() {
         route("/api/chat") { _, reply -> reply(500, """{"error":"boom"}""") }
         val result = runBlocking { client.chat(ChatRequest(message = "x")) }
