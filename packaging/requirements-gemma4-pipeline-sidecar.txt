@@ -1,0 +1,6 @@
+# KIP-11B isolated Gemma 4 Unified PyTorch pipeline runtime.
+# Keep this file out of requirements.txt and out of .venv-gemma4-native.
+transformers==5.10.1
+accelerate>=1.14.0,<2.0.0
+safetensors>=0.8.0,<1.0.0
+psutil>=7.0.0,<8.0.0
