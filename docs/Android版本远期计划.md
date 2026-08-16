@@ -413,7 +413,7 @@ OpenCL 当前有最明确的上游 Android/Adreno 验证记录，因此建议优
 
 验收：Android 注册不会改变 PC 层配置，任务统计不误报 Android 参与层间推理。
 
-进度（2026-07-28）：P0 的边界约束继续成立（`pipeline_worker=false`、主节点仍排除 Android 层分配）。§2.3 的 UI 层重构已通过 Full Debug Kotlin 编译，属于 P0 中“UI 明确区分状态”的配套改造，但尚未安装与目视验收；P1–P5 全部未开始。
+进度（2026-08-17）：P0 的边界约束继续成立（`pipeline_worker=false`、主节点仍排除 Android 层分配）。§2.3 的 UI 层重构已通过 Full Debug Kotlin 编译，属于 P0 中“UI 明确区分状态”的配套改造，但尚未安装与目视验收；P1 已完成 Android `qlh.task_worker` v2 协议、前台 Worker Service、连接退避与取消/迟到结果 fencing 的开发，真实认证、PC scheduler 准入、ServerSocket 对端契约和设备验收后置；P2–P5 尚未开始。
 
 ### P1：完整 Worker 协议原型
 

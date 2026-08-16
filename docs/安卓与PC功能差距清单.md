@@ -30,8 +30,8 @@
 
 **A1 图像理解（图生文）**
 - PC：Gemma 4 12B 原生绑定（MTMD，`gemma4_native_image_smoke` 已验）+ Ollama 双轨；EX-N3 Gemma 判题依赖此能力。
-- 安卓：`qlh_llama_jni.cpp` 仅文本生成；无相机/相册/图片选择、无图像 token 处理（llama.cpp submodule 47e1de77 含 mmproj 支持但 JNI 未接）。
-- 差距点：① UI 图片选择与发送；② JNI 图像编码（mmproj）接线；③ 模型资源（Gemma4 原生 ~7.3GB，安卓端需 GGUF+mmproj 变体，受 RAM 限制）。
+- 安卓：已具备相册选择、压缩与远程图片发送；`qlh_llama_jni.cpp` 仍是文本生成，并已提供 MTMD 能力闸门与 Gemma4 资源登记，但没有图像 token 处理（llama.cpp submodule 47e1de77 含 mmproj 支持但 JNI 尚未接入）。
+- 差距点：① JNI 图像编码（mmproj）实际接线；② Gemma4 原生 ~7.3GB GGUF+mmproj 在 Android RAM 上的加载与采样验收；③ 本地模式在 MTMD 接线完成前保持 fail-closed。
 
 **A2 图像生成（SD 1.5）——走远程推理**
 - PC：完整图像工作区（五资产 15GB，全部自动质量门通过）。
@@ -82,9 +82,38 @@
 | **P3** | F 应用内更新/日志 | 运维体验 | 无 |
 | **不做** | ~~本地判题~~ / 安卓本地图像生成 | 判题与 SD 生成都留在 PC 侧，安卓不承担 | — |
 
+## 3.1 Android 分票排期（2026-08-17）
+
+排期以“先收口协议与失败边界，再接入设备能力”为原则；未完成真机、RAM 或 CUDA 验收的票可以先开发，但不能在清单中标记为已验收。
+
+| 票号 | 优先级 | 范围 | 依赖 | 状态 |
+|---|---|---|---|---|
+| **AND-A1-01** | P1 | 远程图像请求契约：`image_data_urls` DTO、最多 4 张、Full 本地模式 fail-closed、失败重试保留载荷 | PC `/api/chat` 已有字段 | **开发完成；设备验收后置** |
+| AND-A1-02 | P1 | SAF/系统图片选择器、尺寸/格式压缩、data URL 预览与上传 | AND-A1-01 | **开发完成；设备验收后置** |
+| **AND-A1-03** | P1 | Gemma4 GGUF + mmproj 资源登记、JNI MTMD 能力闸门、本地模式接线 | AND-A1-02；需 Android 真机验收 | **开发完成；JNI/设备验收后置** |
+| **AND-B-01** | P1 | Worker A 最小协议：hello、lease、幂等键、结果/错误 envelope | PC 任务链契约 | **开发完成；传输/PC准入后置** |
+| **AND-B-02** | P1 | Android 前台 Service 承载 Worker 客户端、断线/取消状态机 | AND-B-01 | **开发完成；真实连接/设备验收后置** |
+| AND-B-03 | P1 | ServerSocket/Mock Worker 契约测试与跨平台构建检查 | AND-B-02 | 待开发 |
+| AND-A2-01 | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | 待开发 |
+| AND-A2-02 | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | 待开发 |
+| AND-C-01 | P2 | 主节点模型清单、下载进度、SHA-256 校验与断点续传 | 主节点分发 API | 待开发 |
+| AND-E-01 | P2 | Auth/Keystore token 保存、轮换与登出清理 | 主节点 auth API | 待开发 |
+| AND-F-01 | P3 | 应用更新、日志上传与连接健康诊断 | Launcher/日志 API | 待开发 |
+
+本阶段不排本地 SD、生成本地判题和分布式真机性能标定；这些属于后续验收项，不作为 Android 开发阻塞条件。
+
+`AND-B-01` 只冻结并实现跨语言的 `qlh.task_worker` v2 envelope、Android Full Worker 能力声明、严格 UTF-8/canonical JSON、租约/摘要校验和 1024 条 `message_id` replay cache。Android 的 `worker_kind=android_full_worker` 已被 PC v2 schema 接受，但 PC scheduler 当前仍只准入已注册 PC Full Worker；TCP framing、认证连接、Android 前台 Service、任务执行和取消状态机分别属于 `AND-B-02/03`，因此本票不代表 Android Worker 已可接单。
+
+`AND-B-02` 已新增独立 `TaskWorkerService` 前台生命周期壳、可注入的 length-prefixed transport、连接/hello/有界指数退避状态机，以及 offer/lease/result/error/cancel 的 attempt identity fencing。断线会将活动 attempt 标记为 `LOST`，迟到结果被丢弃；Android 主动取消使用 `stage_error`，只有协调器发起的 `stage_cancel` 才回 `stage_cancelled`。本票尚未开放 PC scheduler 准入、认证协议和真实设备验收，ServerSocket/Mock Worker 跨平台契约归 `AND-B-03`。
+
 ## 4. 变更记录
 
 | 日期 | 内容 |
 |---|---|
+| 2026-08-17 | AND-B-02 已完成：新增 Android `TaskWorkerService` 前台 Worker 生命周期、socket length-prefixed transport、连接/hello/有界退避、断线丢弃迟到结果、lease 与取消状态机；增加 Full JVM 状态机回归，真实连接、认证、PC 准入和设备验收后置，ServerSocket 契约留待 AND-B-03 |
+| 2026-08-17 | AND-B-01 已完成：新增 Android `qlh.task_worker` v2 Kotlin codec，覆盖 hello/ack、stage offer/accept、lease renew、result/error、cancel envelope；固定 canonical JSON + SHA-256、严格字段/ID/租约校验、UTF-8 拒绝和有界 message-id replay cache；PC `task_worker_protocol.py` v2 接受 `android_full_worker` 角色但不改变当前 scheduler/transport 准入门，Full/Lite JVM 与 PC 协议专项通过 |
+| 2026-08-17 | AND-A1-03 已完成：登记 Gemma4 原生 GGUF/mmproj 固定文件名、大小与 SHA-256 常量，覆盖 SAF/internal 资源配对扫描（当前仅做文件身份/大小闸门，完整 SHA 校验仍由导入链路负责）；新增 JNI MTMD 能力查询并对当前 text-only APK fail-closed；运行时状态与 presence payload 已暴露资源/能力原因，真实 MTMD 接线与真机验收后置 |
+| 2026-08-17 | AND-A1-02 已完成：系统图片选择器、源文件/输出大小上限、最长边缩放、JPEG data URL 编码、缩略图预览、清除与错误状态；Full 模式禁用图片入口，设备验收后置 |
+| 2026-08-17 | 建立 AND-A1/B/A2/C/E/F 分票排期；AND-A1-01 已完成远程图像请求契约、Full 模式 fail-closed 和重试载荷保留，Full/Lite JVM 单测通过，图片选择器与 mmproj/JNI 留待后续票 |
 | 2026-08-16 | 建立本清单（全面排查 PC vs 安卓差距：12 类 7 大项；P1-P3 排期建议） |
 | 2026-08-16 | 修订：① **本地判题移除**（安卓不承担判题，留在 PC）；② **图像生成改远程推理**（安卓 UI 发起 → PC SD 工作区生成 → 回传，本地零负担）；排期表同步 |
