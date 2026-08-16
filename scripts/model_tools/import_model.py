@@ -56,7 +56,12 @@ def download_model(repo_or_path: str, target: Path, *, use_modelscope: bool = Fa
             f"snapshot_download({repo_or_path!r}, local_dir={str(target)!r})"
         )
         with proxy_environment(resolved_proxy) as environment:
-            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=environment)
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                env=environment,
+            )
         if result.returncode != 0:
             raise RuntimeError(f"ModelScope download failed: {(result.stderr or result.stdout)[-300:]}")
     else:
