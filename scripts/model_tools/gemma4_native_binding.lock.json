@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "marker": "qlh_gemma4_native_binding",
+  "package": {
+    "name": "llama-cpp-python",
+    "version": "0.3.28"
+  },
+  "upstream": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "47e1de77aa0f06bf73cfd8c5281d95979f89fcbe"
+  },
+  "patch": {
+    "path": "scripts/model_tools/llama-cpp-python-mtmd.patch",
+    "sha256": "428c93f4a52d1e88e252dbabf60b533413638175504cb60e1101114ef9ded388"
+  },
+  "abi": {
+    "mtmd_python_symbols": [
+      "mtmd_context_params_default",
+      "mtmd_init_from_file",
+      "mtmd_free",
+      "mtmd_support_vision",
+      "mtmd_support_audio",
+      "mtmd_tokenize",
+      "mtmd_helper_decode_image_chunk"
+    ],
+    "digest": "97db4429dcdfb869e1137daf36cb1785d1f288aedea1044f92e0c56aa9108e67"
+  }
+}
