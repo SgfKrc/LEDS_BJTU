@@ -33,7 +33,9 @@ DOCS_DIR = REPO_ROOT / "docs"
 OUT_DIR = REPO_ROOT / "build" / "doc-audit"
 
 # R1 命中词：状态行含这些词 → "疑似未收口"
-STALE_HINTS = ("进行中", "规划", "待", "Candidate", "In Progress", "Open", "Blocked")
+# 注意：① 不用"待"（"待办/待验"是正常状态描述）；② 不用"进行中/实施中/In Progress/
+# Open"（进行中的文档有部分完成记录是正常的）；③ 状态行自身已含完成标记 → 不命中
+STALE_HINTS = ("规划", "Candidate", "Blocked")
 # R1/R5 豁免：状态行含这些词 → 故意不更新的文档
 EXEMPT_HINTS = (
     "历史参考", "待拆分", "不作为当前能力", "已废弃", "废弃", "冻结", "历史记录",
@@ -114,8 +116,12 @@ def scan_doc(doc: Path, repo_root: Path, since: datetime | None) -> dict:
             findings.append({"rule": "R5", "level": "info",
                              "message": "前 12 行无状态行"})
     else:
-        # R1 完成未收口（非豁免）
-        if not exempt and any(h.lower() in status_lower for h in STALE_HINTS):
+        # R1 完成未收口（非豁免；只检查状态行主干=去括号内容，避免
+        # "（…仍为规划…）"类括号说明误报；状态行自身已含完成标记 → 不命中）
+        status_stem = re.sub(r"[（(][^（）()]*[）)]", "", status)
+        stem_lower = status_stem.lower()
+        if not exempt and not DONE_MARKS.search(status) and any(
+                h.lower() in stem_lower for h in STALE_HINTS):
             body_head = "\n".join(text.splitlines()[:200])
             if DONE_MARKS.search(body_head):
                 findings.append({

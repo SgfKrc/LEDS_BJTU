@@ -100,6 +100,28 @@ def test_r1_miss_when_status_current(fake_repo):
     assert "R1" not in {f["rule"] for f in entry["findings"]}
 
 
+def test_r1_miss_when_status_mentions_partial_done(fake_repo):
+    """状态行已含完成标记（部分完成+未实施）→ 无矛盾，不命中。"""
+    repo, docs = fake_repo
+    p = _write(docs, "part.md",
+               "> 状态：规划与技术预研（分布式部分全部未实施；UI 层已完成重构）\n\n"
+               "UI 层已完成重构并通过编译")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R1" not in {f["rule"] for f in entry["findings"]}
+
+
+def test_r1_miss_when_stale_word_only_in_parentheses(fake_repo):
+    """命中词只出现在括号说明（"（…仍为规划…）"）→ 主干无矛盾，不命中。"""
+    repo, docs = fake_repo
+    p = _write(docs, "impl.md",
+               "> 状态：实施中（单机 POC 已接线；mesh 内方案仍为规划，尚未验收）\n\n"
+               "任务链单机 POC 已接线")
+    _commit(repo)
+    entry = scan_doc(p, repo, None)
+    assert "R1" not in {f["rule"] for f in entry["findings"]}
+
+
 def test_r1_miss_when_exempt_document(fake_repo):
     repo, docs = fake_repo
     p = _write(docs, "hist.md",
