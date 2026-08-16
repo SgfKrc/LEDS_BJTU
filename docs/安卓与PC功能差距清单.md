@@ -93,10 +93,10 @@
 | **AND-A1-03** | P1 | Gemma4 GGUF + mmproj 资源登记、JNI MTMD 能力闸门、本地模式接线 | AND-A1-02；需 Android 真机验收 | **开发完成；JNI/设备验收后置** |
 | **AND-B-01** | P1 | Worker A 最小协议：hello、lease、幂等键、结果/错误 envelope | PC 任务链契约 | **开发完成；传输/PC准入后置** |
 | **AND-B-02** | P1 | Android 前台 Service 承载 Worker 客户端、断线/取消状态机 | AND-B-01 | **开发完成；真实连接/设备验收后置** |
-| AND-B-03 | P1 | ServerSocket/Mock Worker 契约测试与跨平台构建检查 | AND-B-02 | 待开发 |
-| AND-A2-01 | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | 待开发 |
-| AND-A2-02 | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | 待开发 |
-| AND-C-01 | P2 | 主节点模型清单、下载进度、SHA-256 校验与断点续传 | 主节点分发 API | 待开发 |
+| **AND-B-03** | P1 | ServerSocket/Mock Worker 契约测试与跨平台构建检查 | AND-B-02 | **开发完成；真实认证/准入/设备验收后置** |
+| **AND-A2-01** | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | **开发完成；真实 PC SD/设备验收后置** |
+| **AND-A2-02** | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | **开发完成；真实 PC SD/设备验收后置** |
+| **AND-C-01** | P2 | 主节点模型清单、下载进度、SHA-256 校验与断点续传 | 主节点分发 API | **开发完成；真实大文件/断网/SAF 提供器验收后置** |
 | AND-E-01 | P2 | Auth/Keystore token 保存、轮换与登出清理 | 主节点 auth API | 待开发 |
 | AND-F-01 | P3 | 应用更新、日志上传与连接健康诊断 | Launcher/日志 API | 待开发 |
 
@@ -106,10 +106,22 @@
 
 `AND-B-02` 已新增独立 `TaskWorkerService` 前台生命周期壳、可注入的 length-prefixed transport、连接/hello/有界指数退避状态机，以及 offer/lease/result/error/cancel 的 attempt identity fencing。断线会将活动 attempt 标记为 `LOST`，迟到结果被丢弃；Android 主动取消使用 `stage_error`，只有协调器发起的 `stage_cancel` 才回 `stage_cancelled`。本票尚未开放 PC scheduler 准入、认证协议和真实设备验收，ServerSocket/Mock Worker 跨平台契约归 `AND-B-03`。
 
+`AND-B-03` 已用本地 `ServerSocket` 验证 Android transport 与 PC 现有 4 字节大端 length-prefix、`task_worker/json` outer envelope 和 v2 inner envelope 的双向 hello/ack/UTF-8 result；非法 outer frame 会 fail-closed。PC 侧直接复用 `tcp_comm.build_message/parse_message` 做同一 framing 检查。Full/Lite JVM 与 PC wire/protocol 专项通过，`compileFullDebugAndroidTestKotlin` 通过；这仍不代表真实认证、PC scheduler 准入或物理设备链路已验收。
+
+`AND-A2-01` 已新增 Android PC SD 客户端契约：生成/编辑请求 DTO、PNG/JPEG/WebP multipart 参考图/遮罩上传、job 快照解析、终态轮询和远程取消；轮询有界且遵守协程取消，job ID 使用 fail-closed 字符集校验。结果 blob 下载、缩略图和界面状态归 `AND-A2-02`，真实 PC SD 引擎、网络与设备验收后置。
+
+`AND-A2-02` 已新增独立 Android 图像页：文生图与参考图 img2img 入口、任务状态/进度/取消反馈、结果 blob 有界下载、1024px 缩略图解码、空结果/失败/取消状态展示；Full/Lite 共用同一远程链路，不在 Android 本地加载 SD。
+
+`AND-C-01` 已接通 PC `/api/models/gguf` 与带 `Range` 的模型分发端点；Android Full 模式可列出主节点 GGUF，显示容量和 SHA-256 摘要，并续传到用户授权的 SAF 目录。下载只在精确匹配 `206 Content-Range` 时追加，服务器返回完整 `200` 时安全重写；临时 `.part` 文件在大小和 SHA-256 均通过后才原子提升并选中。PC 清单不再泄露服务端绝对路径。真实大文件下载、断网重连、不同 DocumentsProvider 的重命名行为及物理设备空间不足仍后置验收。
+
 ## 4. 变更记录
 
 | 日期 | 内容 |
 |---|---|
+| 2026-08-17 | AND-C-01 已完成：Android Full 设置页新增主节点 GGUF 目录、进度与校验状态，下载落入用户授权 SAF 目录并支持严格 Range 续传、大小/SHA-256 校验和 `.part` 提升；PC 清单移除绝对目录泄露并增加 Range 契约测试；Full/Lite JVM、AndroidTest Kotlin 编译和 PC 安全边界测试通过，真实大文件/断网/SAF 提供器验收后置 |
+| 2026-08-17 | AND-A2-02 已完成：新增 Android 图像导航页、提示词/反向提示词/步数表单、参考图选择与预览、远程生成/变体提交、任务取消、结果 blob 32 MiB 有界下载和 1024px 缩略图展示；补齐状态机、ApiClient 下载和 Compose 契约测试，Full/Lite JVM 与 Full AndroidTest Kotlin 编译通过，真实 PC SD/网络/设备验收后置 |
+| 2026-08-17 | AND-A2-01 已完成：Android `ApiClient` 接入 PC `/api/diffusion/generate`、`/edit`、`/blobs`、`/jobs/{id}` 与取消端点，新增 snake_case DTO、16 MiB 上传限制、multipart 参考图/遮罩上传、有限终态轮询和协程取消传播；Full/Lite 全量 JVM 单测、远程 SD 契约测试与 Full AndroidTest Kotlin 编译通过，真实 PC SD/设备验收后置 |
+| 2026-08-17 | AND-B-03 已完成：新增 Android `ServerSocket` 双向 task-worker framing/hello-ack/UTF-8 result 契约测试、非法 outer frame 拒绝测试和 PC `tcp_comm` length-prefix 对照测试；Full/Lite JVM、PC 23 项协议/wire 专项与 Full AndroidTest Kotlin 编译通过，真实认证、scheduler 准入和设备验收后置 |
 | 2026-08-17 | AND-B-02 已完成：新增 Android `TaskWorkerService` 前台 Worker 生命周期、socket length-prefixed transport、连接/hello/有界退避、断线丢弃迟到结果、lease 与取消状态机；增加 Full JVM 状态机回归，真实连接、认证、PC 准入和设备验收后置，ServerSocket 契约留待 AND-B-03 |
 | 2026-08-17 | AND-B-01 已完成：新增 Android `qlh.task_worker` v2 Kotlin codec，覆盖 hello/ack、stage offer/accept、lease renew、result/error、cancel envelope；固定 canonical JSON + SHA-256、严格字段/ID/租约校验、UTF-8 拒绝和有界 message-id replay cache；PC `task_worker_protocol.py` v2 接受 `android_full_worker` 角色但不改变当前 scheduler/transport 准入门，Full/Lite JVM 与 PC 协议专项通过 |
 | 2026-08-17 | AND-A1-03 已完成：登记 Gemma4 原生 GGUF/mmproj 固定文件名、大小与 SHA-256 常量，覆盖 SAF/internal 资源配对扫描（当前仅做文件身份/大小闸门，完整 SHA 校验仍由导入链路负责）；新增 JNI MTMD 能力查询并对当前 text-only APK fail-closed；运行时状态与 presence payload 已暴露资源/能力原因，真实 MTMD 接线与真机验收后置 |
