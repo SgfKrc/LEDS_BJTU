@@ -15,17 +15,47 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import sys
+import urllib.parse
 import urllib.request
 from typing import Any
 
 
+def _build_base_url(host: str, port: int) -> str:
+    """Build an HTTP origin with a correctly bracketed IPv6 authority."""
+    value = str(host or "").strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    if not value or any(char in value for char in "/?#@"):
+        raise ValueError("无效的主节点地址")
+    if not 1 <= int(port) <= 65535:
+        raise ValueError("端口必须在 1-65535 范围内")
+    try:
+        is_ipv6 = ipaddress.ip_address(value.split("%", 1)[0]).version == 6
+    except ValueError:
+        is_ipv6 = ":" in value
+    authority_host = f"[{value}]" if is_ipv6 else value
+    return urllib.parse.urlunsplit(("http", f"{authority_host}:{int(port)}", "", "", ""))
+
+
+def _build_query(lines: int, level: str = "", name: str = "") -> str:
+    """Encode log filters without allowing reserved characters to alter the URL."""
+    normalized_lines = max(1, min(int(lines), 1000))
+    params: list[tuple[str, str | int]] = [("limit", normalized_lines)]
+    if level:
+        params.append(("level", str(level)))
+    if name:
+        params.append(("name", str(name)))
+    return urllib.parse.urlencode(params)
+
+
 def _request(base_url: str, path: str, token: str | None) -> dict[str, Any]:
-    url = f"{base_url}{path}"
+    url = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
     headers = {"Accept": "application/json"}
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["X-QLH-Log-Token"] = token
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=10) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
@@ -36,9 +66,9 @@ def _request(base_url: str, path: str, token: str | None) -> dict[str, Any]:
     return payload
 
 
-def _print_node(node_id: str, logs: list[str]) -> None:
+def _print_node(node_id: str, logs: list[str], limit: int) -> None:
     print(f"── {node_id} ──")
-    for line in logs[-20:]:
+    for line in logs[-max(1, int(limit)):]:
         print(f"  {line}")
 
 
@@ -53,12 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="输出原始 JSON（供脚本消费）")
     args = parser.parse_args(argv)
 
-    base = f"http://{args.host}:{args.port}"
-    query = f"limit={args.lines}"
-    if args.level:
-        query += f"&level={args.level}"
-    if args.name:
-        query += f"&name={args.name}"
+    try:
+        base = _build_base_url(args.host, args.port)
+        query = _build_query(args.lines, args.level, args.name)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     payload = _request(base, f"/api/cluster/nodes/log-aggregate?{query}", args.token)
 
@@ -68,12 +97,12 @@ def main(argv: list[str] | None = None) -> int:
 
     local = payload.get("local") or {}
     print(f"== 本地节点 {local.get('node_id', '?')}（{payload.get('total_workers', 0)} 个在线 worker）==")
-    _print_node(local.get("node_id", "local"), local.get("logs") or [])
+    _print_node(local.get("node_id", "local"), local.get("logs") or [], args.lines)
     for worker in payload.get("workers") or []:
         if worker.get("error"):
             print(f"── {worker.get('node_id', '?')} ── [error] {worker['error']}")
             continue
-        _print_node(worker.get("node_id", "worker"), worker.get("logs") or [])
+        _print_node(worker.get("node_id", "worker"), worker.get("logs") or [], args.lines)
     return 0
 
 

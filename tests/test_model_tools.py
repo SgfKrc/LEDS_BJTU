@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -427,6 +428,22 @@ def test_models_clean_collapses_cache_tree_to_one_candidate(tmp_path: Path):
     )
     assert cache_apply["deleted"] == [".cache"]
     assert not cache.exists()
+
+
+def test_models_clean_zero_age_includes_fresh_cache_despite_clock_boundary(tmp_path: Path, monkeypatch):
+    from scripts.model_tools import maintenance
+
+    root = tmp_path / "models"
+    cache = root / ".cache"
+    cache.mkdir(parents=True)
+    (cache / "orphan.sha256").write_text("0" * 64, encoding="utf-8")
+
+    # Windows file timestamps may briefly be later than the initial scan clock.
+    monkeypatch.setattr(maintenance, "_tree_mtime", lambda _path: time.time() + 1.0)
+
+    report = clean_models(root, min_age_hours=0)
+
+    assert [(item["kind"], item["path"]) for item in report["candidates"]] == [("cache", ".cache")]
 
 
 def test_disk_tools_never_follow_nested_symlinks(tmp_path: Path):
@@ -1366,6 +1383,7 @@ class TestImportModelWizard:
         from local_store import get_local_experimental_models, delete_local_experimental_model
         target = tmp_path / "imported-model"
         target.mkdir()
+        (target / "model.gguf").write_bytes(b"abc")
         summary = {"file_count": 1, "total_bytes": 3, "sha256": "a" * 64}
         assert register_model("imported-model", target, summary) is True
         try:
@@ -1391,3 +1409,48 @@ class TestImportModelWizard:
         assert payload["model_id"] == "cli-model"
         from local_store import delete_local_experimental_model
         delete_local_experimental_model("cli-model")
+
+    def test_empty_directory_fails_closed(self, tmp_path):
+        from scripts.model_tools.import_model import main
+        target = tmp_path / "empty"
+        target.mkdir()
+        assert main([str(target), "--skip-download"]) == 2
+
+    def test_safetensors_import_writes_manifest_and_type(self, tmp_path):
+        from scripts.model_tools.import_model import main
+        target = tmp_path / "hf-model"
+        target.mkdir()
+        (target / "config.json").write_text("{}", encoding="utf-8")
+        (target / "model.safetensors").write_bytes(b"weights")
+        assert main([str(target), "--skip-download"]) == 0
+        manifest = target / "model.manifest.json"
+        assert manifest.is_file()
+        payload = manifest.read_text(encoding="utf-8")
+        assert '"model_type": "safetensors"' in payload
+        assert '"path": "config.json"' in payload
+
+    def test_explicit_missing_gguf_fails_closed(self, tmp_path):
+        from scripts.model_tools.import_model import main
+        target = tmp_path / "hf-model"
+        target.mkdir()
+        (target / "config.json").write_text("{}", encoding="utf-8")
+        (target / "model.safetensors").write_bytes(b"weights")
+        assert main([str(target), "--skip-download", "--gguf-path", str(tmp_path / "missing.gguf")]) == 2
+
+    def test_proxy_resolution_prefers_qlh_setting(self):
+        from proxy_config import resolve_http_proxy
+        assert resolve_http_proxy(env={"QLH_HTTP_PROXY": "http://127.0.0.1:7897", "HTTP_PROXY": "http://bad:1"}) == "http://127.0.0.1:7897"
+        assert resolve_http_proxy("https://proxy.example:8443", env={"QLH_HTTP_PROXY": "http://bad:1"}) == "https://proxy.example:8443"
+
+    def test_remote_staging_is_removed_when_download_fails(self, tmp_path, monkeypatch):
+        import scripts.model_tools.import_model as wizard
+        target = tmp_path / "remote-model"
+
+        def broken_download(_source, staging, **_kwargs):
+            (staging / "partial.gguf").write_bytes(b"partial")
+            raise RuntimeError("network failed")
+
+        monkeypatch.setattr(wizard, "download_model", broken_download)
+        assert wizard.main(["Org/remote-model", "--target", str(target)]) == 2
+        assert not target.exists()
+        assert not list(tmp_path.glob(".remote-model.qlh-import-*"))

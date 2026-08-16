@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""P8 (2026-08-16): 模型导入向导——`model_tools import-model`。
-
-引导式完成 resolve → 下载 → 校验 → 登记 四步：
-
-1. resolve：输入 Hugging Face repo id（或本地已存在路径），解析目标目录
-2. download：经 huggingface_hub snapshot_download（继承 QLH_HTTP_PROXY
-   代理），失败时可用 ModelScope 镜像路径重试
-3. verify：统计下载目录内 safetensors/gguf 的字节数与 SHA-256 摘要；
-   提供 --expected-sha256 时严格校验（不匹配 fail-closed）
-4. register：登记到主节点 SQLite model_registry（实验模型），后续
-   /api/models 可见
-
-安全：不落凭据；交互输入不回显到报告；登记 payload 不含绝对路径之外的
-敏感信息（路径为用户指定目录）。
-"""
+"""Fail-closed model import wizard with staging, manifests and SQLite registration."""
 
 from __future__ import annotations
 
@@ -21,159 +7,210 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from local_store import (
-    delete_local_experimental_model,
-    save_local_experimental_model,
-)
+from local_store import save_local_experimental_model
+
+try:
+    from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
+    from proxy_config import proxy_environment, resolve_http_proxy
+except ImportError:
+    from src.model_registry_validation import build_manifest, validate_model_artifact, write_manifest
+    from src.proxy_config import proxy_environment, resolve_http_proxy
 
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin")
+_SAFE_SUFFIXES = (".safetensors", ".bin")
 
 
 def resolve_target(repo_or_path: str, target: str | None, models_root: str = "models") -> Path:
-    """Step 1：把 repo id / 路径解析为目标模型目录。"""
     source = Path(repo_or_path)
     if source.is_dir():
         return source.absolute()
     name = repo_or_path.strip("/").split("/")[-1]
     if not name:
-        raise ValueError(f"无法从输入解析模型名: {repo_or_path!r}")
+        raise ValueError(f"cannot resolve model name from source: {repo_or_path!r}")
     return Path(target or os.path.join(models_root, name)).absolute()
 
 
-def download_model(repo_or_path: str, target: Path, *, use_modelscope: bool = False) -> list[Path]:
-    """Step 2：下载（HF snapshot_download 或 ModelScope），返回权重文件列表。"""
+def _weight_files(target: Path) -> list[Path]:
+    if not target.is_dir():
+        return []
+    return sorted(path for path in target.rglob("*") if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES))
+
+
+def download_model(repo_or_path: str, target: Path, *, use_modelscope: bool = False, proxy: str = "") -> list[Path]:
+    """Download into a caller-owned staging directory and return weight files."""
     source = Path(repo_or_path)
     if source.is_dir():
         return _weight_files(target)
-
+    target.mkdir(parents=True, exist_ok=True)
+    resolved_proxy = resolve_http_proxy(proxy or None)
     if use_modelscope:
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import modelscope, sys; from modelscope import snapshot_download; "
-             f"snapshot_download({repo_or_path!r}, local_dir={str(target)!r})"],
-            capture_output=True, text=True,
+        code = (
+            "from modelscope import snapshot_download; "
+            f"snapshot_download({repo_or_path!r}, local_dir={str(target)!r})"
         )
+        with proxy_environment(resolved_proxy) as environment:
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=environment)
         if result.returncode != 0:
-            raise RuntimeError(f"ModelScope 下载失败: {(result.stderr or result.stdout)[-200:]}")
+            raise RuntimeError(f"ModelScope download failed: {(result.stderr or result.stdout)[-300:]}")
     else:
         import huggingface_hub
-        huggingface_hub.snapshot_download(
-            repo_id=repo_or_path,
-            local_dir=str(target),
-            local_dir_use_symlinks=False,
-        )
+        # huggingface_hub reads standard proxy variables at request time.
+        with proxy_environment(resolved_proxy) as environment:
+            keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+            previous = {key: os.environ.get(key) for key in keys}
+            try:
+                os.environ.update({key: environment[key] for key in keys})
+                huggingface_hub.snapshot_download(repo_id=repo_or_path, local_dir=str(target), local_dir_use_symlinks=False)
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
     files = _weight_files(target)
     if not files:
-        raise RuntimeError("下载完成但未找到权重文件（safetensors/gguf/bin）")
+        raise RuntimeError("download completed but no safetensors/gguf/bin weights were found")
     return files
 
 
-def _weight_files(target: Path) -> list[Path]:
-    return sorted(
-        path for path in target.rglob("*")
-        if path.is_file() and path.name.lower().endswith(_WEIGHT_SUFFIXES)
-    )
-
-
 def verify_files(files: list[Path], expected_sha256: str | None = None) -> dict[str, Any]:
-    """Step 3：字节数 + SHA-256 摘要（可选严格校验）。"""
+    """Return the backwards-compatible raw digest and fail on empty assets."""
+    if not files:
+        raise ValueError("no model weight files found; empty directories are not importable")
     total_bytes = 0
     digest = hashlib.sha256()
     for path in files:
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise ValueError(f"weight file is missing or empty: {path}")
         size = path.stat().st_size
         total_bytes += size
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-    summary = {
-        "file_count": len(files),
-        "total_bytes": total_bytes,
-        "sha256": digest.hexdigest(),
-    }
-    if expected_sha256 and digest.hexdigest() != expected_sha256.lower():
-        raise ValueError(
-            f"SHA-256 不匹配: 期望 {expected_sha256.lower()}，实际 {digest.hexdigest()}"
-        )
+    raw_sha256 = digest.hexdigest()
+    summary = {"file_count": len(files), "total_bytes": total_bytes, "sha256": raw_sha256}
+    if expected_sha256 and raw_sha256 != expected_sha256.lower():
+        raise ValueError(f"SHA-256 不匹配 (mismatch): expected {expected_sha256.lower()}, got {raw_sha256}")
     return summary
 
 
-def register_model(
-    model_id: str,
-    target: Path,
-    summary: dict[str, Any],
-    *,
-    gguf_path: str = "",
-) -> bool:
-    """Step 4：登记到主节点 SQLite model_registry（实验模型）。"""
+def _infer_artifact(target: Path, gguf_path: str = "") -> dict[str, Any]:
+    files = _weight_files(target)
+    safe_files = [item for item in files if item.name.lower().endswith(_SAFE_SUFFIXES)]
+    gguf_files = [item for item in files if item.suffix.lower() == ".gguf"]
+    explicit = Path(gguf_path).expanduser().absolute() if gguf_path else None
+    if not explicit and len(gguf_files) > 1:
+        raise ValueError("multiple GGUF files found; pass --gguf-path to select one")
+    selected_gguf = explicit or (gguf_files[0] if len(gguf_files) == 1 else None)
+    model_type = "both" if safe_files and selected_gguf else "safetensors" if safe_files else "gguf" if selected_gguf else ""
+    if not model_type:
+        raise ValueError("cannot infer model type: expected safetensors/bin or GGUF weights")
+    artifact = validate_model_artifact(model_type, str(target) if safe_files else "", str(selected_gguf) if selected_gguf else "")
+    if selected_gguf and selected_gguf not in files:
+        files.append(selected_gguf)
+        artifact["files"] = [*artifact["safetensors_files"], selected_gguf]
+    return artifact
+
+
+def register_model(model_id: str, target: Path, summary: dict[str, Any], *, gguf_path: str = "", revision: str = "") -> bool:
+    """Validate immediately before the SQLite upsert."""
+    artifact = _infer_artifact(target, gguf_path)
+    manifest = summary.get("manifest") or build_manifest(target, artifact["files"], model_type=artifact["model_type"], revision=revision, source="import-model")
     config = {
         "model_id": model_id,
         "name": model_id,
-        "model_path": str(target) if not gguf_path else "",
-        "gguf_path": gguf_path or (str(target / "model.gguf") if (target / "model.gguf").is_file() else ""),
-        "quantization": "Q4_K_M" if gguf_path else "fp16",
+        "model_type": artifact["model_type"],
+        "model_path": artifact["model_path"],
+        "gguf_path": artifact["gguf_path"],
+        "quantization": "Q4_K_M" if artifact["model_type"] == "gguf" else "fp16",
         "sha256": summary["sha256"],
+        "artifact_sha256": manifest["artifact_sha256"],
+        "manifest_sha256": manifest["manifest_sha256"],
         "source": "import-model",
+        "revision": revision,
+        "manifest": manifest,
     }
     return save_local_experimental_model(model_id, config)
 
 
 def main(argv: list[str] | argparse.Namespace | None = None) -> int:
-    parser = argparse.ArgumentParser(description="模型导入向导（resolve→下载→校验→登记）")
-    parser.add_argument("source", help="Hugging Face repo id、ModelScope 路径或本地目录")
-    parser.add_argument("--target", default="", help="目标模型目录（默认 models/<repo 名>）")
-    parser.add_argument("--model-id", default="", help="登记用的 model_id（默认取 repo 名）")
-    parser.add_argument("--expected-sha256", default="", help="严格校验期望 SHA-256")
-    parser.add_argument("--gguf-path", default="", help="GGUF 登记路径（覆盖自动探测）")
-    parser.add_argument("--modelscope", action="store_true", help="使用 ModelScope 下载")
-    parser.add_argument("--skip-download", action="store_true", help="仅校验/登记本地目录")
-    parser.add_argument("--register", action="store_true", help="完成后登记到主节点 SQLite")
-    parser.add_argument("--json", action="store_true", help="输出 JSON 摘要")
+    parser = argparse.ArgumentParser(description="model import: resolve -> download -> verify -> register")
+    parser.add_argument("source", help="Hugging Face repo id, ModelScope path or local directory")
+    parser.add_argument("--target", default="", help="target model directory (default models/<repo name>)")
+    parser.add_argument("--model-id", default="", help="registered model_id (default target name)")
+    parser.add_argument("--expected-sha256", default="", help="strict raw SHA-256 verification")
+    parser.add_argument("--gguf-path", default="", help="explicit GGUF registration path")
+    parser.add_argument("--proxy", default="", help="user HTTP(S) proxy, overriding environment settings")
+    parser.add_argument("--revision", default="", help="source revision recorded in the manifest")
+    parser.add_argument("--modelscope", action="store_true", help="download via ModelScope")
+    parser.add_argument("--skip-download", action="store_true", help="verify/register an existing local directory only")
+    parser.add_argument("--register", action="store_true", help="persist to main-node SQLite model_registry")
+    parser.add_argument("--json", action="store_true", help="output JSON summary")
     args = parser.parse_args(argv) if not isinstance(argv, argparse.Namespace) else argv
 
+    target: Path | None = None
+    staging: Path | None = None
+    published = False
+    remote_import = False
     try:
-        target = resolve_target(args.source, args.target)
-        if not args.skip_download and not Path(args.source).is_dir():
-            print(f"[1/4] 下载 {args.source} → {target} ...", flush=True)
-            files = download_model(args.source, target, use_modelscope=args.modelscope)
+        target = resolve_target(args.source, getattr(args, "target", ""))
+        local_source = Path(args.source).is_dir()
+        if not getattr(args, "skip_download", False) and not local_source:
+            if target.exists():
+                raise RuntimeError(f"target already exists; refusing in-place import: {target}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.qlh-import-", dir=target.parent))
+            remote_import = True
+            print(f"[1/4] downloading {args.source} -> staging ...", flush=True)
+            files = download_model(args.source, staging, use_modelscope=getattr(args, "modelscope", False), proxy=getattr(args, "proxy", ""))
+            target_for_validation = staging
         else:
-            files = _weight_files(target)
-            if not files and not Path(args.source).is_dir():
-                raise RuntimeError("目标目录无权重文件")
+            target_for_validation = target
+            files = _weight_files(target_for_validation)
+            if not files and not local_source:
+                raise RuntimeError("target directory has no model weights")
 
-        print(f"[2/4] 校验 {len(files)} 个权重文件 ...", flush=True)
-        summary = verify_files(files, args.expected_sha256 or None)
+        print(f"[2/4] validating {len(files)} weight files ...", flush=True)
+        artifact = _infer_artifact(target_for_validation, getattr(args, "gguf_path", ""))
+        files = artifact["files"]
+        summary = verify_files(files, getattr(args, "expected_sha256", "") or None)
+        manifest = build_manifest(target_for_validation, artifact["files"], model_type=artifact["model_type"], revision=getattr(args, "revision", ""), source=args.source)
+        write_manifest(target_for_validation, manifest)
+        summary.update({"artifact_sha256": manifest["artifact_sha256"], "manifest_sha256": manifest["manifest_sha256"], "manifest": manifest, "model_type": artifact["model_type"]})
 
-        model_id = args.model_id or target.name
-        print(f"[3/4] 登记准备: model_id={model_id}")
-
+        if staging is not None:
+            staging.replace(target)
+            published = True
+        model_id = getattr(args, "model_id", "") or target.name
+        print(f"[3/4] registration ready: model_id={model_id}")
         registered = False
-        if args.register:
-            registered = register_model(model_id, target, summary, gguf_path=args.gguf_path)
-            print(f"[4/4] 登记{'成功' if registered else '失败'}（主节点 SQLite model_registry）")
+        if getattr(args, "register", False):
+            registered = register_model(model_id, target, summary, gguf_path=getattr(args, "gguf_path", ""), revision=getattr(args, "revision", ""))
+            print(f"[4/4] registration {'succeeded' if registered else 'failed'} (main-node SQLite)")
+            if remote_import and not registered:
+                shutil.rmtree(target, ignore_errors=True)
         else:
-            print("[4/4] 未登记（加 --register 写入主节点 SQLite）")
-
-        result = {
-            "model_id": model_id,
-            "target": str(target),
-            "file_count": summary["file_count"],
-            "total_bytes": summary["total_bytes"],
-            "sha256": summary["sha256"],
-            "registered": registered,
-        }
-        if args.json:
+            print("[4/4] not registered (use --register to write main-node SQLite)")
+        result = {"model_id": model_id, "target": str(target), "model_type": artifact["model_type"], "file_count": summary["file_count"], "total_bytes": summary["total_bytes"], "sha256": summary["sha256"], "artifact_sha256": summary["artifact_sha256"], "manifest_sha256": summary["manifest_sha256"], "registered": registered}
+        if getattr(args, "json", False):
             print(json.dumps(result, ensure_ascii=False, indent=1))
         else:
-            print(f"完成: {result['file_count']} 文件 / {result['total_bytes']} bytes")
+            print(f"complete: {result['file_count']} files / {result['total_bytes']} bytes")
             print(f"  SHA-256: {result['sha256']}")
         return 0
     except Exception as exc:
-        print(f"[error] 导入失败: {str(exc)[:200]}", file=sys.stderr)
+        if staging is not None and staging.exists() and not published:
+            shutil.rmtree(staging, ignore_errors=True)
+        if remote_import and published and target is not None:
+            shutil.rmtree(target, ignore_errors=True)
+        print(f"[error] import failed: {str(exc)[:300]}", file=sys.stderr)
         return 2
 
 

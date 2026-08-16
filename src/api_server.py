@@ -29,6 +29,7 @@ from collections import Counter, deque
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
+from pathlib import Path
 from typing import Any, Literal, Optional, cast
 
 try:
@@ -116,6 +117,7 @@ from diffusion.coordinator_runtime import (
     DiffusionGridAggregatorProvider,
 )
 import model_config as mc
+from model_registry_validation import build_manifest, validate_model_artifact, write_manifest
 from config import (
     MODEL_NAME, MODEL_PATH, QUANT_TYPE, USE_COMPILE,
     DEVICE, PAGE_SIZE, MAX_PAGE_NUM, MAX_SEQ_LEN, RUN_MODE,
@@ -134,6 +136,10 @@ import local_store as _local_store
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 _LOG_BUFFER_MAXLEN = 5000
 _log_buffer: deque[dict] = deque(maxlen=_LOG_BUFFER_MAXLEN)
+# P7: the aggregate endpoint must have a bounded fan-out and one total wait
+# budget, independent of the number of online workers.
+LOG_AGGREGATE_DEADLINE_SECONDS = 3.0
+LOG_AGGREGATE_MAX_CONCURRENCY = 8
 _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
 
@@ -7130,6 +7136,24 @@ async def register_model(req: RegisterModelRequest):
     """
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
+    resolved_model_path = mc.resolve_model_path(req.model_path) if req.model_path else ""
+    resolved_gguf_path = mc.resolve_model_path(req.gguf_path) if req.gguf_path else ""
+    try:
+        artifact = validate_model_artifact(
+            req.model_type,
+            resolved_model_path,
+            resolved_gguf_path,
+        )
+        manifest_root = Path(artifact["model_path"] or Path(artifact["gguf_path"]).parent)
+        manifest = build_manifest(
+            manifest_root,
+            artifact["files"],
+            model_type=req.model_type,
+            source=req.huggingface_id,
+        )
+        write_manifest(manifest_root, manifest)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"model preflight failed: {exc}") from exc
     config = {
         "model_id": req.model_id,
         "name": req.name,
@@ -7141,6 +7165,10 @@ async def register_model(req: RegisterModelRequest):
         "huggingface_id": req.huggingface_id,
         "description": req.description,
         "quant_types": ["fp16", "int8", "int4"] if req.model_type != "gguf" else ["Q4_K_M"],
+        "sha256": manifest["artifact_sha256"],
+        "artifact_sha256": manifest["artifact_sha256"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "manifest": manifest,
     }
 
     try:
@@ -9668,41 +9696,77 @@ async def get_nodes_log_aggregate(
     local_filtered = _filter_recent_logs(local_entries, level, name)
     local_logs = [entry["message"] for entry in local_filtered[-limit:]]
 
-    # 在线 worker
+    # 在线 worker。每个 TCP 等待都在线程中执行，且受 semaphore 与整体
+    # deadline 限制，避免节点数把 async 事件循环线性拖长。
     with scheduler._nodes_lock:
-        online_workers = [
+        online_workers = sorted([
             nid
             for nid, info in scheduler.nodes.items()
             if info.role != NodeRole.MASTER
             and info.state == NodeState.ONLINE
-        ]
+        ])
 
-    workers = []
-    for nid in online_workers:
-        try:
-            result = scheduler.request_node_logs(
-                node_id=nid, limit=limit, level=level, name=name, timeout=3.0,
-            )
-            if result and result.get("logs"):
-                workers.append({
-                    "node_id": nid,
-                    "logs": list(result["logs"]),
-                    "count": int(result.get("count", 0)),
-                })
-            else:
-                workers.append({
+    import asyncio
+
+    aggregate_deadline = float(LOG_AGGREGATE_DEADLINE_SECONDS)
+    max_parallel = min(LOG_AGGREGATE_MAX_CONCURRENCY, max(1, len(online_workers)))
+    semaphore = asyncio.Semaphore(max_parallel)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + aggregate_deadline
+
+    async def fetch_worker_logs(nid: str) -> dict:
+        async with semaphore:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return {"node_id": nid, "logs": [], "count": 0, "error": "deadline"}
+            try:
+                result = await asyncio.to_thread(
+                    scheduler.request_node_logs,
+                    node_id=nid,
+                    limit=limit,
+                    level=level,
+                    name=name,
+                    timeout=min(3.0, remaining),
+                )
+                if result and result.get("logs"):
+                    return {
+                        "node_id": nid,
+                        "logs": list(result["logs"]),
+                        "count": int(result.get("count", 0)),
+                    }
+                return {
                     "node_id": nid,
                     "logs": [],
                     "count": 0,
                     "error": "timeout" if result is None else "no logs",
-                })
-        except Exception as exc:
-            workers.append({
-                "node_id": nid,
-                "logs": [],
-                "count": 0,
-                "error": str(exc)[:100],
-            })
+                }
+            except Exception as exc:
+                return {
+                    "node_id": nid,
+                    "logs": [],
+                    "count": 0,
+                    "error": str(exc)[:100],
+                }
+
+    workers_by_id = {}
+    if online_workers:
+        tasks = {nid: asyncio.create_task(fetch_worker_logs(nid)) for nid in online_workers}
+        done, pending = await asyncio.wait(
+            tasks.values(), timeout=max(0.0, deadline - loop.time()),
+        )
+        for task in done:
+            try:
+                result = task.result()
+            except Exception as exc:
+                result = {"node_id": "unknown", "logs": [], "count": 0, "error": str(exc)[:100]}
+            workers_by_id[result.get("node_id", "unknown")] = result
+        for task in pending:
+            task.cancel()
+    for nid in online_workers:
+        workers_by_id.setdefault(
+            nid, {"node_id": nid, "logs": [], "count": 0, "error": "deadline"},
+        )
+    workers = [workers_by_id[nid] for nid in online_workers]
 
     return {
         "local": {"node_id": scheduler.get_effective_node_id(), "logs": local_logs},
