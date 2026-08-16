@@ -153,9 +153,19 @@ class TestPackageAsset:
 
 class TestServeClassification:
     def test_sd15_asset_zip_classified(self):
+        # 2026-08-17 起 sd15-asset 独立分类已废弃（SD 并入 PC 整合包）：
+        # 旧 SD zip 不再被 serve 分类为 sd15-asset
         assert serve._classify_update_asset(
             "QLH-SD15-Assets-sd15_original_v1-v0.1.0.zip"
-        ) == ("any", "any", "any", "sd15-asset")
+        ) is None
+
+    def test_model_bundle_classified(self):
+        assert serve._classify_update_asset(
+            "qlh-models-android-v1.7z"
+        ) == ("any", "any", "any", "model-bundle")
+        assert serve._classify_update_asset(
+            "qlh-models-pc-v1.7z.001"
+        ) == ("any", "any", "any", "model-bundle")
 
     def test_launcher_unaffected(self):
         assert serve._classify_update_asset("QLH-Launcher-v0.1.8.1.zip") == (
