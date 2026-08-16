@@ -18,7 +18,7 @@ from typing import Any
 
 SCHEMA_VERSION = "qlh.task_graph_projection.v1"
 OPTIMIZER_SCHEMA_VERSION = "qlh.task_graph_optimizer.v1"
-OPTIMIZER_VERSION = "task-dag-opt-v1"
+OPTIMIZER_VERSION = "task-dag-opt-v2"
 GRAPH_KINDS = frozenset({
     "logical_dag",
     "optimized_dag",
@@ -187,6 +187,9 @@ def validate_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
             raise TaskGraphProjectionError("edge target_node_id is unknown")
         if not isinstance(edge.get("relation"), str):
             raise TaskGraphProjectionError("edge relation must be a string")
+        semantic_contract = edge.get("semantic_contract")
+        if semantic_contract is not None:
+            _validate_edge_semantic_contract(semantic_contract)
 
     for event in trace:
         _normalise_trace_event(event)
@@ -206,6 +209,7 @@ def optimize_task_graph(
     projection: Mapping[str, Any],
     *,
     mode: str = "shadow",
+    rules: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build a deterministic, shadow-only optimization candidate.
 
@@ -218,6 +222,7 @@ def optimize_task_graph(
         raise TaskGraphOptimizationError(
             "only shadow optimization is enabled",
         )
+    enabled_rules = _normalise_optimizer_rules(rules)
     logical = require_graph_kind(projection, "logical_dag")
     normalized = _normalized_logical_graph(logical)
     stage_nodes = {
@@ -279,6 +284,19 @@ def optimize_task_graph(
         if edge["source_node_id"].split(":", 1)[-1] in kept_ids
         and edge["target_node_id"].split(":", 1)[-1] in kept_ids
     ]
+    reduced_edges, reduction_trace, reduced_edge_count = (
+        _semantic_transitive_reduction(
+            optimized_nodes,
+            optimized_edges,
+            enabled="semantic_transitive_reduction" in enabled_rules,
+        )
+    )
+    optimized_edges = reduced_edges
+    trace.extend(reduction_trace)
+    if reduced_edge_count:
+        optimized_nodes = _remove_reduced_dependencies(
+            optimized_nodes, optimized_edges,
+        )
     payload_plan, payload_trace = _payload_share_plan(
         optimized_nodes, optimized_edges,
     )
@@ -292,12 +310,22 @@ def optimize_task_graph(
         summary_updates={
             "culled_stage_count": len(culled),
             "payload_share_candidate_count": len(payload_plan),
+            "reduced_edge_count": reduced_edge_count,
+            "semantic_reduction_enabled": (
+                "semantic_transitive_reduction" in enabled_rules
+            ),
         },
     )
     result: dict[str, Any] = {
         "schema_version": OPTIMIZER_SCHEMA_VERSION,
         "optimizer_version": OPTIMIZER_VERSION,
         "mode": "shadow",
+        "enabled_rules": enabled_rules,
+        "fallback": {
+            "available": True,
+            "graph_kind": "logical_dag",
+            "reason_code": "shadow_only_candidate",
+        },
         "logical_graph": _detached(logical),
         "optimized_graph": optimized,
         "trace": trace,
@@ -307,6 +335,10 @@ def optimize_task_graph(
             "optimized_stage_count": len(optimized_nodes),
             "culled_stage_count": len(culled),
             "payload_share_candidate_count": len(payload_plan),
+            "reduced_edge_count": reduced_edge_count,
+            "semantic_reduction_enabled": (
+                "semantic_transitive_reduction" in enabled_rules
+            ),
             "normalization_changed": (
                 normalized["digest"] != logical["digest"]
             ),
@@ -318,10 +350,12 @@ def optimize_task_graph(
 
 def shadow_optimize_task_graph(
     projection: Mapping[str, Any],
+    *,
+    rules: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Compatibility spelling for the explicit shadow optimizer entrypoint."""
 
-    return optimize_task_graph(projection, mode="shadow")
+    return optimize_task_graph(projection, mode="shadow", rules=rules)
 
 
 def validate_optimization_result(
@@ -340,6 +374,8 @@ def validate_optimization_result(
         raise TaskGraphOptimizationError("optimization result must be shadow-only")
     logical = require_graph_kind(result.get("logical_graph"), "logical_dag")
     optimized = require_graph_kind(result.get("optimized_graph"), "optimized_dag")
+    enabled_rules = result.get("enabled_rules")
+    fallback = result.get("fallback")
     trace = result.get("trace")
     payload_plan = result.get("payload_plan")
     summary = result.get("summary")
@@ -347,6 +383,20 @@ def validate_optimization_result(
         raise TaskGraphOptimizationError("optimization trace/plan must be lists")
     if not isinstance(summary, Mapping):
         raise TaskGraphOptimizationError("optimization summary must be a mapping")
+    if not isinstance(enabled_rules, list) or any(
+        not isinstance(rule, str) for rule in enabled_rules
+    ):
+        raise TaskGraphOptimizationError("enabled_rules must be text values")
+    if enabled_rules != sorted(set(enabled_rules)):
+        raise TaskGraphOptimizationError("enabled_rules must be sorted and unique")
+    if any(rule != "semantic_transitive_reduction" for rule in enabled_rules):
+        raise TaskGraphOptimizationError("unsupported optimizer rule")
+    if fallback != {
+        "available": True,
+        "graph_kind": "logical_dag",
+        "reason_code": "shadow_only_candidate",
+    }:
+        raise TaskGraphOptimizationError("logical DAG fallback is required")
     for event in trace:
         _normalise_trace_event(event)
     for plan in payload_plan:
@@ -362,12 +412,20 @@ def validate_optimization_result(
         _identifier(plan.get("reason_code"), "payload reason_code")
     for key in (
         "logical_stage_count", "optimized_stage_count", "culled_stage_count",
-        "payload_share_candidate_count",
+        "payload_share_candidate_count", "reduced_edge_count",
     ):
         _nonnegative_int(summary.get(key), f"summary.{key}")
     if not isinstance(summary.get("normalization_changed"), bool):
         raise TaskGraphOptimizationError(
             "summary.normalization_changed must be boolean",
+        )
+    if not isinstance(summary.get("semantic_reduction_enabled"), bool):
+        raise TaskGraphOptimizationError(
+            "summary.semantic_reduction_enabled must be boolean",
+        )
+    if summary["semantic_reduction_enabled"] != bool(enabled_rules):
+        raise TaskGraphOptimizationError(
+            "semantic reduction summary does not match enabled rules",
         )
     supplied_digest = result.get("digest")
     if not isinstance(supplied_digest, str) or not re.fullmatch(
@@ -384,6 +442,12 @@ def validate_optimization_result(
     if optimized["summary"]["stage_count"] != summary["optimized_stage_count"]:
         raise TaskGraphOptimizationError(
             "optimized stage count does not match graph",
+        )
+    if optimized["summary"].get("reduced_edge_count", 0) != summary[
+        "reduced_edge_count"
+    ]:
+        raise TaskGraphOptimizationError(
+            "reduced edge count does not match graph",
         )
     return _detached(result)
 
@@ -427,6 +491,15 @@ def _rebuild_projection(
     rebuilt["summary"]["stage_count"] = len(rebuilt["nodes"])
     rebuilt["summary"]["node_count"] = len(rebuilt["nodes"])
     rebuilt["summary"]["edge_count"] = len(rebuilt["edges"])
+    rebuilt["summary"]["provider_count"] = len({
+        provider
+        for node in rebuilt["nodes"]
+        for provider in (
+            node.get("provider_constraints", {}).get("requested_provider", ""),
+            *node.get("provider_constraints", {}).get("fallback_providers", []),
+        )
+        if provider
+    })
     rebuilt["digest"] = _digest({
         key: value for key, value in rebuilt.items() if key != "digest"
     })
@@ -508,6 +581,184 @@ def _payload_share_plan(
     return plan, trace
 
 
+def _normalise_optimizer_rules(rules: Sequence[str]) -> list[str]:
+    if isinstance(rules, (str, bytes)) or not isinstance(rules, Sequence):
+        raise TaskGraphOptimizationError("optimizer rules must be a sequence")
+    if any(not isinstance(rule, str) for rule in rules):
+        raise TaskGraphOptimizationError("optimizer rule must be text")
+    normalised = sorted(set(rules))
+    if any(rule != "semantic_transitive_reduction" for rule in normalised):
+        raise TaskGraphOptimizationError("unsupported optimizer rule")
+    return normalised
+
+
+def _semantic_transitive_reduction(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    if not enabled:
+        return list(edges), [{
+            "rule": "semantic_transitive_reduction",
+            "reason_code": "disabled_by_default",
+            "affected_node_ids": [],
+            "accepted": False,
+        }], 0
+    by_node_id = {node["node_id"]: node for node in nodes}
+    removable: set[str] = set()
+    blocked_nodes: set[str] = set()
+    for edge in sorted(edges, key=lambda item: item["edge_id"]):
+        if edge.get("relation") != "depends_on":
+            continue
+        contract = edge.get("semantic_contract")
+        if not _is_pure_dependency_contract(contract):
+            blocked_nodes.update({
+                edge["source_node_id"], edge["target_node_id"],
+            })
+            continue
+        if _has_equivalent_alternative_path(edge, edges, by_node_id):
+            removable.add(edge["edge_id"])
+
+    reduced = _rebind_reduced_edge_contracts(
+        [edge for edge in edges if edge["edge_id"] not in removable],
+    )
+    if removable:
+        affected = sorted({
+            node_id
+            for edge in edges
+            if edge["edge_id"] in removable
+            for node_id in (edge["source_node_id"], edge["target_node_id"])
+        })
+        trace = [{
+            "rule": "semantic_transitive_reduction",
+            "reason_code": "redundant_pure_dependency",
+            "affected_node_ids": affected,
+            "accepted": True,
+        }]
+    else:
+        trace = [{
+            "rule": "semantic_transitive_reduction",
+            "reason_code": (
+                "semantic_contract_required"
+                if blocked_nodes
+                else "no_semantically_redundant_edge"
+            ),
+            "affected_node_ids": sorted(blocked_nodes),
+            "accepted": False,
+        }]
+    return reduced, trace, len(removable)
+
+
+def _is_pure_dependency_contract(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("kind") == "dependency"
+        and value.get("pure_dependency") is True
+        and value.get("schema_version") == 1
+        and value.get("data_scope") == "workflow"
+        and value.get("join_policy") == "required"
+        and value.get("failure_policy") == "fail_target"
+        and value.get("binding_targets") == []
+    )
+
+
+def _has_equivalent_alternative_path(
+    removed_edge: Mapping[str, Any],
+    edges: Sequence[Mapping[str, Any]],
+    nodes: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    source = removed_edge["source_node_id"]
+    target = removed_edge["target_node_id"]
+    contract_key = _semantic_contract_equivalence_key(
+        removed_edge["semantic_contract"],
+    )
+    adjacency: dict[str, list[Mapping[str, Any]]] = {}
+    for edge in edges:
+        if edge["edge_id"] == removed_edge["edge_id"]:
+            continue
+        if (
+            edge.get("relation") == "depends_on"
+            and _semantic_contract_equivalence_key(
+                edge.get("semantic_contract"),
+            ) == contract_key
+        ):
+            adjacency.setdefault(edge["source_node_id"], []).append(edge)
+    pending = [source]
+    visited = {source}
+    while pending:
+        current = pending.pop(0)
+        for edge in sorted(
+            adjacency.get(current, ()), key=lambda item: item["edge_id"],
+        ):
+            next_node = edge["target_node_id"]
+            if next_node == target:
+                return True
+            if next_node in nodes and next_node not in visited:
+                visited.add(next_node)
+                pending.append(next_node)
+    return False
+
+
+def _semantic_contract_equivalence_key(value: Any) -> tuple[Any, ...] | None:
+    if not _is_pure_dependency_contract(value):
+        return None
+    return (
+        value["kind"], value["pure_dependency"], value["schema_version"],
+        value["data_scope"], value["join_policy"], value["failure_policy"],
+        tuple(value["binding_targets"]),
+    )
+
+
+def _rebind_reduced_edge_contracts(
+    edges: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    dependency_counts: dict[str, int] = {}
+    for edge in edges:
+        if edge.get("relation") == "depends_on":
+            target = edge["target_node_id"]
+            dependency_counts[target] = dependency_counts.get(target, 0) + 1
+    rebuilt: list[dict[str, Any]] = []
+    for edge in edges:
+        copy = _detached(edge)
+        contract = copy.get("semantic_contract")
+        if _is_pure_dependency_contract(contract):
+            contract["minimum_successful_dependencies"] = dependency_counts[
+                copy["target_node_id"]
+            ]
+        rebuilt.append(copy)
+    return rebuilt
+
+
+def _remove_reduced_dependencies(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    dependencies: dict[str, list[str]] = {}
+    for edge in edges:
+        if edge.get("relation") != "depends_on":
+            continue
+        dependencies.setdefault(edge["target_node_id"], []).append(
+            edge["source_node_id"].split(":", 1)[-1],
+        )
+    rebuilt: list[dict[str, Any]] = []
+    for node in nodes:
+        copy = _detached(node)
+        if copy.get("node_kind") != "stage":
+            rebuilt.append(copy)
+            continue
+        node_id = copy["node_id"]
+        new_depends = sorted(dependencies.get(node_id, ()))
+        old_depends = list(copy.get("depends_on", ()))
+        if new_depends != sorted(old_depends):
+            copy["depends_on"] = new_depends
+            constraints = copy.setdefault("execution_constraints", {})
+            if constraints.get("minimum_successful_dependencies") == len(old_depends):
+                constraints["minimum_successful_dependencies"] = len(new_depends)
+        rebuilt.append(copy)
+    return rebuilt
+
+
 def _build_projection(
     graph_kind: str,
     rows: list[dict[str, Any]],
@@ -568,6 +819,11 @@ def _stage_view(
                 "fallback_providers": list(row["fallback_providers"]),
                 "pure": row["pure"],
             },
+            "execution_constraints": {
+                "minimum_successful_dependencies": (
+                    row["minimum_successful_dependencies"]
+                ),
+            },
             "model_identity": row["model_identity"],
         }
         if graph_kind == "attempt_graph":
@@ -582,6 +838,9 @@ def _stage_view(
                 "source_node_id": f"stage:{dependency_id}",
                 "target_node_id": f"stage:{row['stage_id']}",
                 "relation": "depends_on",
+                "semantic_contract": _edge_semantic_contract(
+                    row, dependency_id,
+                ),
             })
 
     if graph_kind != "attempt_graph":
@@ -625,6 +884,34 @@ def _stage_view(
                 })
             previous_attempt_node_id = attempt_node_id
     return nodes, edges
+
+
+def _edge_semantic_contract(
+    row: Mapping[str, Any], dependency_id: str,
+) -> dict[str, Any]:
+    bindings = [
+        binding["target_key"]
+        for binding in row["input_bindings"]
+        if binding["dependency_stage_id"] == dependency_id
+    ]
+    minimum_successful = row["minimum_successful_dependencies"]
+    all_required = minimum_successful == len(row["depends_on"])
+    if bindings:
+        kind = "bound_input"
+    elif not all_required:
+        kind = "optional_dependency"
+    else:
+        kind = "dependency"
+    return {
+        "kind": kind,
+        "pure_dependency": kind == "dependency",
+        "schema_version": 1,
+        "data_scope": "workflow",
+        "join_policy": "required" if all_required else "partial",
+        "failure_policy": "fail_target" if all_required else "allow_partial",
+        "minimum_successful_dependencies": minimum_successful,
+        "binding_targets": sorted(bindings),
+    }
 
 
 def _provider_topology(
@@ -675,6 +962,10 @@ def _normalise_stages(
             "stage_id": stage_id,
             "stage_type": stage_type,
             "depends_on": depends_on,
+            "minimum_successful_dependencies": _minimum_successful_dependencies(
+                _read(stage, "minimum_successful_dependencies", None),
+                len(depends_on),
+            ),
             "requested_provider": requested_provider,
             "fallback_providers": fallback_providers,
             "provider_candidates": (requested_provider, *fallback_providers),
@@ -821,6 +1112,43 @@ def _validate_node_namespace(node: Mapping[str, Any], graph_kind: str) -> None:
         )
 
 
+def _validate_edge_semantic_contract(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise TaskGraphProjectionError("edge semantic_contract must be a mapping")
+    expected = {
+        "kind", "pure_dependency", "schema_version", "data_scope",
+        "join_policy", "failure_policy", "minimum_successful_dependencies",
+        "binding_targets",
+    }
+    if set(value) != expected:
+        raise TaskGraphProjectionError(
+            "edge semantic_contract has unsupported fields",
+        )
+    _identifier(value.get("kind"), "edge semantic kind")
+    if not isinstance(value.get("pure_dependency"), bool):
+        raise TaskGraphProjectionError(
+            "edge semantic pure_dependency must be boolean",
+        )
+    if value.get("schema_version") != 1:
+        raise TaskGraphProjectionError(
+            "edge semantic schema_version must be 1",
+        )
+    _identifier(value.get("data_scope"), "edge semantic data_scope")
+    _identifier(value.get("join_policy"), "edge semantic join_policy")
+    _identifier(value.get("failure_policy"), "edge semantic failure_policy")
+    _nonnegative_int(
+        value.get("minimum_successful_dependencies"),
+        "edge semantic minimum_successful_dependencies",
+    )
+    _identifiers(value.get("binding_targets"), "edge semantic binding_targets")
+    if value.get("pure_dependency") and (
+        value.get("kind") != "dependency" or value.get("binding_targets")
+    ):
+        raise TaskGraphProjectionError(
+            "pure dependency edge cannot carry input bindings",
+        )
+
+
 def _normalise_trace_event(event: Any) -> dict[str, Any]:
     if not isinstance(event, Mapping):
         raise TaskGraphProjectionError("trace event must be a mapping")
@@ -887,6 +1215,17 @@ def _identifiers(value: Any, field_name: str) -> tuple[str, ...]:
 
 def _safe_state(value: Any) -> str:
     return _identifier(value, "state") if value not in (None, "") else "unknown"
+
+
+def _minimum_successful_dependencies(value: Any, dependency_count: int) -> int:
+    if value is None:
+        return dependency_count
+    minimum = _nonnegative_int(value, "minimum_successful_dependencies")
+    if minimum > dependency_count:
+        raise TaskGraphProjectionError(
+            "minimum_successful_dependencies cannot exceed dependency count",
+        )
+    return minimum
 
 
 def _nonnegative_int(value: Any, field_name: str) -> int:

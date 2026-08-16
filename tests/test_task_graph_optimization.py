@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 
 import pytest
@@ -262,3 +263,162 @@ def test_shadow_optimizer_is_deterministic_and_rejects_runtime_mode():
     assert first["digest"] == second["digest"]
     with pytest.raises(TaskGraphOptimizationError, match="shadow"):
         optimize_task_graph(logical, mode="runtime")
+
+
+def _transitive_stages(*, bound_direct_edge=False, minimum_successful=None):
+    return [
+        StageSpec("source", "transform", pure=True),
+        StageSpec(
+            "middle", "transform", depends_on=("source",), pure=True,
+        ),
+        StageSpec(
+            "final",
+            "transform",
+            depends_on=("source", "middle"),
+            pure=True,
+            minimum_successful_dependencies=minimum_successful,
+            input_bindings=(
+                {"direct": ("source", "content")}
+                if bound_direct_edge else {}
+            ),
+        ),
+    ]
+
+
+def test_g2_semantic_transitive_reduction_is_disabled_by_default():
+    logical = project_task_graph(
+        _transitive_stages(), "final", graph_id="g2_default_off",
+    )
+    result = optimize_task_graph(logical)
+
+    assert result["enabled_rules"] == []
+    assert result["summary"]["semantic_reduction_enabled"] is False
+    assert result["summary"]["reduced_edge_count"] == 0
+    assert len(result["optimized_graph"]["edges"]) == 3
+    assert any(
+        event["rule"] == "semantic_transitive_reduction"
+        and event["reason_code"] == "disabled_by_default"
+        for event in result["trace"]
+    )
+
+
+def test_g2_reduces_only_redundant_pure_dependency_and_keeps_fallback():
+    logical = project_task_graph(
+        _transitive_stages(), "final", graph_id="g2_safe_reduction",
+    )
+    result = optimize_task_graph(
+        logical, rules=("semantic_transitive_reduction",),
+    )
+
+    assert result["enabled_rules"] == ["semantic_transitive_reduction"]
+    assert result["summary"]["reduced_edge_count"] == 1
+    assert {
+        (edge["source_node_id"], edge["target_node_id"])
+        for edge in result["optimized_graph"]["edges"]
+    } == {
+        ("stage:source", "stage:middle"),
+        ("stage:middle", "stage:final"),
+    }
+    final = next(
+        node for node in result["optimized_graph"]["nodes"]
+        if node["stage_id"] == "final"
+    )
+    assert final["depends_on"] == ["middle"]
+    assert final["execution_constraints"]["minimum_successful_dependencies"] == 1
+    assert len(result["logical_graph"]["edges"]) == 3
+    assert result["fallback"] == {
+        "available": True,
+        "graph_kind": "logical_dag",
+        "reason_code": "shadow_only_candidate",
+    }
+
+
+def test_g2_preserves_direct_edge_with_unique_input_binding():
+    logical = project_task_graph(
+        _transitive_stages(bound_direct_edge=True),
+        "final",
+        graph_id="g2_binding_boundary",
+    )
+    result = optimize_task_graph(
+        logical, rules=("semantic_transitive_reduction",),
+    )
+
+    assert result["summary"]["reduced_edge_count"] == 0
+    assert len(result["optimized_graph"]["edges"]) == 3
+    direct = next(
+        edge for edge in result["optimized_graph"]["edges"]
+        if edge["source_node_id"] == "stage:source"
+        and edge["target_node_id"] == "stage:final"
+    )
+    assert direct["semantic_contract"]["kind"] == "bound_input"
+    assert direct["semantic_contract"]["binding_targets"] == ["direct"]
+
+
+def test_g2_preserves_partial_join_and_rejects_unknown_rule():
+    logical = project_task_graph(
+        _transitive_stages(minimum_successful=1),
+        "final",
+        graph_id="g2_partial_boundary",
+    )
+    result = optimize_task_graph(
+        logical, rules=("semantic_transitive_reduction",),
+    )
+
+    assert result["summary"]["reduced_edge_count"] == 0
+    assert len(result["optimized_graph"]["edges"]) == 3
+    with pytest.raises(TaskGraphOptimizationError, match="unsupported"):
+        optimize_task_graph(logical, rules=("unsafe_runtime_rewrite",))
+
+
+def test_g2_edge_semantic_contract_rejects_bound_pure_dependency():
+    projection = project_task_graph(_transitive_stages(), "final")
+    projection["edges"][0]["semantic_contract"]["binding_targets"] = ["content"]
+
+    with pytest.raises(TaskGraphProjectionError, match="cannot carry"):
+        validate_projection(projection)
+
+
+def test_g2_random_pure_dags_preserve_reachability_after_reduction():
+    def reachable_pairs(projection):
+        adjacency = {}
+        for edge in projection["edges"]:
+            adjacency.setdefault(edge["source_node_id"], set()).add(
+                edge["target_node_id"],
+            )
+        pairs = set()
+        for source in adjacency:
+            pending = list(adjacency[source])
+            visited = set()
+            while pending:
+                target = pending.pop()
+                if target in visited:
+                    continue
+                visited.add(target)
+                pairs.add((source, target))
+                pending.extend(adjacency.get(target, ()))
+        return pairs
+
+    for seed in range(20):
+        rng = random.Random(seed)
+        dependencies = {f"n{index}": set() for index in range(8)}
+        for index in range(1, 8):
+            dependencies[f"n{index}"].add(f"n{index - 1}")
+            for source in range(index - 1):
+                if rng.random() < 0.35:
+                    dependencies[f"n{index}"].add(f"n{source}")
+        stages = [
+            StageSpec(
+                stage_id,
+                "transform",
+                depends_on=tuple(sorted(dependencies[stage_id])),
+                pure=True,
+            )
+            for stage_id in sorted(dependencies, key=lambda item: int(item[1:]))
+        ]
+        logical = project_task_graph(stages, "n7", graph_id=f"g2_random_{seed}")
+        optimized = optimize_task_graph(
+            logical, rules=("semantic_transitive_reduction",),
+        )["optimized_graph"]
+
+        assert reachable_pairs(optimized) == reachable_pairs(logical)
+        assert len(optimized["edges"]) <= len(logical["edges"])
