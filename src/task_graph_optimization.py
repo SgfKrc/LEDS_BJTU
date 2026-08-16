@@ -17,6 +17,8 @@ from typing import Any
 
 
 SCHEMA_VERSION = "qlh.task_graph_projection.v1"
+OPTIMIZER_SCHEMA_VERSION = "qlh.task_graph_optimizer.v1"
+OPTIMIZER_VERSION = "task-dag-opt-v1"
 GRAPH_KINDS = frozenset({
     "logical_dag",
     "optimized_dag",
@@ -66,6 +68,10 @@ class TaskGraphProjectionError(ValueError):
 
 class GraphTypeError(TaskGraphProjectionError):
     """Raised when a graph view is used as a different graph type."""
+
+
+class TaskGraphOptimizationError(TaskGraphProjectionError):
+    """Raised when a shadow optimization result is unsafe or malformed."""
 
 
 def project_task_graph(
@@ -194,6 +200,312 @@ def validate_projection(projection: Mapping[str, Any]) -> dict[str, Any]:
     if _digest(unsigned) != supplied_digest:
         raise TaskGraphProjectionError("projection digest does not match content")
     return _detached(projection)
+
+
+def optimize_task_graph(
+    projection: Mapping[str, Any],
+    *,
+    mode: str = "shadow",
+) -> dict[str, Any]:
+    """Build a deterministic, shadow-only optimization candidate.
+
+    The logical projection remains the execution source of truth.  This
+    function only returns a detached candidate graph, a privacy-safe trace and
+    a payload-sharing plan; it never mutates a workflow or chooses a Provider.
+    """
+
+    if mode != "shadow":
+        raise TaskGraphOptimizationError(
+            "only shadow optimization is enabled",
+        )
+    logical = require_graph_kind(projection, "logical_dag")
+    normalized = _normalized_logical_graph(logical)
+    stage_nodes = {
+        node["stage_id"]: node
+        for node in normalized["nodes"]
+        if node.get("node_kind") == "stage"
+    }
+    final_stage_id = normalized["summary"]["final_stage_id"]
+    reachable = _reverse_reachable(stage_nodes, final_stage_id)
+    unreachable = set(stage_nodes) - reachable
+    protected = set(reachable)
+    side_effect_nodes = {
+        stage_id
+        for stage_id in unreachable
+        if not bool(
+            stage_nodes[stage_id].get("provider_constraints", {}).get("pure", False),
+        )
+    }
+    for stage_id in sorted(side_effect_nodes):
+        protected.update(_ancestors(stage_nodes, stage_id))
+    culled = sorted(set(stage_nodes) - protected)
+
+    trace: list[dict[str, Any]] = [{
+        "rule": "normalize",
+        "reason_code": "canonical_order",
+        "affected_node_ids": sorted(
+            node["node_id"] for node in normalized["nodes"]
+        ),
+        "accepted": True,
+    }]
+    if culled:
+        trace.append({
+            "rule": "cull_unreachable",
+            "reason_code": "pure_unreachable_only",
+            "affected_node_ids": [f"stage:{stage_id}" for stage_id in culled],
+            "accepted": True,
+        })
+    else:
+        trace.append({
+            "rule": "cull_unreachable",
+            "reason_code": (
+                "side_effect_boundary"
+                if side_effect_nodes
+                else "no_unreachable_stage"
+            ),
+            "affected_node_ids": [
+                f"stage:{stage_id}" for stage_id in sorted(side_effect_nodes)
+            ],
+            "accepted": False,
+        })
+
+    kept_ids = set(stage_nodes) - set(culled)
+    optimized_nodes = [
+        node for node in normalized["nodes"] if node["stage_id"] in kept_ids
+    ]
+    optimized_edges = [
+        edge
+        for edge in normalized["edges"]
+        if edge["source_node_id"].split(":", 1)[-1] in kept_ids
+        and edge["target_node_id"].split(":", 1)[-1] in kept_ids
+    ]
+    payload_plan, payload_trace = _payload_share_plan(
+        optimized_nodes, optimized_edges,
+    )
+    trace.extend(payload_trace)
+    optimized = _rebuild_projection(
+        normalized,
+        graph_kind="optimized_dag",
+        nodes=optimized_nodes,
+        edges=optimized_edges,
+        trace=trace,
+        summary_updates={
+            "culled_stage_count": len(culled),
+            "payload_share_candidate_count": len(payload_plan),
+        },
+    )
+    result: dict[str, Any] = {
+        "schema_version": OPTIMIZER_SCHEMA_VERSION,
+        "optimizer_version": OPTIMIZER_VERSION,
+        "mode": "shadow",
+        "logical_graph": _detached(logical),
+        "optimized_graph": optimized,
+        "trace": trace,
+        "payload_plan": payload_plan,
+        "summary": {
+            "logical_stage_count": len(stage_nodes),
+            "optimized_stage_count": len(optimized_nodes),
+            "culled_stage_count": len(culled),
+            "payload_share_candidate_count": len(payload_plan),
+            "normalization_changed": (
+                normalized["digest"] != logical["digest"]
+            ),
+        },
+    }
+    result["digest"] = _digest(result)
+    return validate_optimization_result(result)
+
+
+def shadow_optimize_task_graph(
+    projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compatibility spelling for the explicit shadow optimizer entrypoint."""
+
+    return optimize_task_graph(projection, mode="shadow")
+
+
+def validate_optimization_result(
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a shadow result before it can be logged or compared."""
+
+    if not isinstance(result, Mapping):
+        raise TaskGraphOptimizationError("optimization result must be a mapping")
+    _assert_no_forbidden_content(result)
+    if result.get("schema_version") != OPTIMIZER_SCHEMA_VERSION:
+        raise TaskGraphOptimizationError("unsupported optimizer schema_version")
+    if result.get("optimizer_version") != OPTIMIZER_VERSION:
+        raise TaskGraphOptimizationError("unsupported optimizer_version")
+    if result.get("mode") != "shadow":
+        raise TaskGraphOptimizationError("optimization result must be shadow-only")
+    logical = require_graph_kind(result.get("logical_graph"), "logical_dag")
+    optimized = require_graph_kind(result.get("optimized_graph"), "optimized_dag")
+    trace = result.get("trace")
+    payload_plan = result.get("payload_plan")
+    summary = result.get("summary")
+    if not isinstance(trace, list) or not isinstance(payload_plan, list):
+        raise TaskGraphOptimizationError("optimization trace/plan must be lists")
+    if not isinstance(summary, Mapping):
+        raise TaskGraphOptimizationError("optimization summary must be a mapping")
+    for event in trace:
+        _normalise_trace_event(event)
+    for plan in payload_plan:
+        if not isinstance(plan, Mapping):
+            raise TaskGraphOptimizationError("payload plan entry must be a mapping")
+        if set(plan) != {
+            "payload_ref", "source_stage_id", "target_stage_ids", "reason_code",
+        }:
+            raise TaskGraphOptimizationError("payload plan entry has unsupported fields")
+        _identifier(plan.get("payload_ref"), "payload_ref")
+        _identifier(plan.get("source_stage_id"), "payload source_stage_id")
+        _identifiers(plan.get("target_stage_ids"), "payload target_stage_ids")
+        _identifier(plan.get("reason_code"), "payload reason_code")
+    for key in (
+        "logical_stage_count", "optimized_stage_count", "culled_stage_count",
+        "payload_share_candidate_count",
+    ):
+        _nonnegative_int(summary.get(key), f"summary.{key}")
+    if not isinstance(summary.get("normalization_changed"), bool):
+        raise TaskGraphOptimizationError(
+            "summary.normalization_changed must be boolean",
+        )
+    supplied_digest = result.get("digest")
+    if not isinstance(supplied_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", supplied_digest,
+    ):
+        raise TaskGraphOptimizationError("optimization digest is invalid")
+    unsigned = {key: value for key, value in result.items() if key != "digest"}
+    if _digest(unsigned) != supplied_digest:
+        raise TaskGraphOptimizationError("optimization digest does not match content")
+    # Keep these local variables as explicit validation anchors for callers
+    # debugging a malformed result without exposing payload contents.
+    if logical["summary"]["stage_count"] != summary["logical_stage_count"]:
+        raise TaskGraphOptimizationError("logical stage count does not match graph")
+    if optimized["summary"]["stage_count"] != summary["optimized_stage_count"]:
+        raise TaskGraphOptimizationError(
+            "optimized stage count does not match graph",
+        )
+    return _detached(result)
+
+
+def _normalized_logical_graph(projection: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = _detached(projection)
+    normalized["nodes"] = sorted(
+        normalized["nodes"], key=lambda node: node["node_id"],
+    )
+    for node in normalized["nodes"]:
+        if node.get("node_kind") == "stage":
+            node["depends_on"] = sorted(node.get("depends_on", []))
+            node["input_bindings"] = sorted(
+                node.get("input_bindings", []),
+                key=lambda binding: binding["target_key"],
+            )
+    normalized["edges"] = sorted(
+        normalized["edges"], key=lambda edge: edge["edge_id"],
+    )
+    normalized["digest"] = _digest({
+        key: value for key, value in normalized.items() if key != "digest"
+    })
+    return validate_projection(normalized)
+
+
+def _rebuild_projection(
+    projection: Mapping[str, Any],
+    *,
+    graph_kind: str,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    trace: list[dict[str, Any]],
+    summary_updates: Mapping[str, Any],
+) -> dict[str, Any]:
+    rebuilt = _detached(projection)
+    rebuilt["graph_kind"] = graph_kind
+    rebuilt["nodes"] = sorted(_detached(nodes), key=lambda node: node["node_id"])
+    rebuilt["edges"] = sorted(_detached(edges), key=lambda edge: edge["edge_id"])
+    rebuilt["trace"] = _detached(trace)
+    rebuilt["summary"].update(_detached(summary_updates))
+    rebuilt["summary"]["stage_count"] = len(rebuilt["nodes"])
+    rebuilt["summary"]["node_count"] = len(rebuilt["nodes"])
+    rebuilt["summary"]["edge_count"] = len(rebuilt["edges"])
+    rebuilt["digest"] = _digest({
+        key: value for key, value in rebuilt.items() if key != "digest"
+    })
+    return validate_projection(rebuilt)
+
+
+def _reverse_reachable(
+    nodes: Mapping[str, Mapping[str, Any]],
+    final_stage_id: str,
+) -> set[str]:
+    reachable: set[str] = set()
+    pending = [final_stage_id]
+    while pending:
+        stage_id = pending.pop()
+        if stage_id in reachable:
+            continue
+        reachable.add(stage_id)
+        pending.extend(nodes[stage_id].get("depends_on", ()))
+    return reachable
+
+
+def _ancestors(
+    nodes: Mapping[str, Mapping[str, Any]],
+    stage_id: str,
+) -> set[str]:
+    return _reverse_reachable(nodes, stage_id)
+
+
+def _payload_share_plan(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    by_source: dict[str, set[str]] = {}
+    by_id = {
+        node["node_id"].split(":", 1)[-1]: node
+        for node in nodes if node.get("node_kind") == "stage"
+    }
+    for edge in edges:
+        if edge.get("relation") != "depends_on":
+            continue
+        source = edge["source_node_id"].split(":", 1)[-1]
+        target = edge["target_node_id"].split(":", 1)[-1]
+        by_source.setdefault(source, set()).add(target)
+    plan: list[dict[str, Any]] = []
+    trace: list[dict[str, Any]] = []
+    for source, targets in sorted(by_source.items()):
+        if len(targets) < 2:
+            continue
+        node = by_id[source]
+        target_ids = sorted(targets)
+        affected = [f"stage:{source}"] + [f"stage:{target}" for target in target_ids]
+        if not bool(node.get("provider_constraints", {}).get("pure", False)):
+            trace.append({
+                "rule": "share_payload",
+                "reason_code": "source_not_pure",
+                "affected_node_ids": affected,
+                "accepted": False,
+            })
+            continue
+        plan.append({
+            "payload_ref": f"payload:{source}",
+            "source_stage_id": source,
+            "target_stage_ids": target_ids,
+            "reason_code": "immutable_fanout_source",
+        })
+        trace.append({
+            "rule": "share_payload",
+            "reason_code": "immutable_fanout_source",
+            "affected_node_ids": affected,
+            "accepted": True,
+        })
+    if not trace:
+        trace.append({
+            "rule": "share_payload",
+            "reason_code": "no_fanout_candidate",
+            "affected_node_ids": [],
+            "accepted": False,
+        })
+    return plan, trace
 
 
 def _build_projection(
@@ -618,11 +930,17 @@ def _detached(value: Mapping[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "GRAPH_KINDS",
+    "OPTIMIZER_SCHEMA_VERSION",
+    "OPTIMIZER_VERSION",
     "SCHEMA_VERSION",
     "GraphTypeError",
+    "TaskGraphOptimizationError",
     "TaskGraphProjectionError",
+    "optimize_task_graph",
     "project_task_graph",
     "project_workflow_snapshot",
     "require_graph_kind",
+    "shadow_optimize_task_graph",
+    "validate_optimization_result",
     "validate_projection",
 ]

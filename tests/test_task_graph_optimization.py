@@ -9,10 +9,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from task_graph import StageSpec, TaskGraphCoordinator
 from task_graph_optimization import (
     GraphTypeError,
+    TaskGraphOptimizationError,
     TaskGraphProjectionError,
+    optimize_task_graph,
     project_task_graph,
     project_workflow_snapshot,
     require_graph_kind,
+    validate_optimization_result,
     validate_projection,
 )
 
@@ -184,3 +187,78 @@ def test_projection_fails_closed_for_unsafe_trace_and_body_fields():
     projection["summary"]["output"] = "unsafe body"
     with pytest.raises(TaskGraphProjectionError, match="forbidden field"):
         validate_projection(projection)
+
+
+def test_shadow_optimizer_culls_only_pure_unreachable_stages():
+    stages = [
+        *_diamond_stages(),
+        StageSpec("unused_pure", "transform", pure=True),
+    ]
+    logical = project_task_graph(stages, "aggregate", graph_id="shadow_cull")
+    result = optimize_task_graph(logical)
+
+    assert result["mode"] == "shadow"
+    assert result["summary"]["culled_stage_count"] == 1
+    assert {
+        node["stage_id"] for node in result["optimized_graph"]["nodes"]
+    } == {"shared_input", "candidate_a", "candidate_b", "aggregate"}
+    cull_events = [event for event in result["trace"] if event["rule"] == "cull_unreachable"]
+    assert cull_events == [{
+        "rule": "cull_unreachable",
+        "reason_code": "pure_unreachable_only",
+        "affected_node_ids": ["stage:unused_pure"],
+        "accepted": True,
+    }]
+    assert validate_optimization_result(result) == result
+
+
+def test_shadow_optimizer_preserves_unreachable_side_effect_boundary():
+    stages = [
+        *_diamond_stages(),
+        StageSpec("audit_side_effect", "audit", pure=False),
+    ]
+    result = optimize_task_graph(
+        project_task_graph(stages, "aggregate", graph_id="shadow_side_effect"),
+    )
+
+    assert result["summary"]["culled_stage_count"] == 0
+    assert {
+        node["stage_id"] for node in result["optimized_graph"]["nodes"]
+    } == {
+        "shared_input", "candidate_a", "candidate_b", "aggregate",
+        "audit_side_effect",
+    }
+    assert any(
+        event["rule"] == "cull_unreachable"
+        and event["reason_code"] == "side_effect_boundary"
+        and event["accepted"] is False
+        for event in result["trace"]
+    )
+
+
+def test_shadow_optimizer_plans_one_immutable_payload_for_diamond_fanout():
+    result = optimize_task_graph(
+        project_task_graph(_diamond_stages(), "aggregate", graph_id="shadow_payload"),
+    )
+
+    assert result["payload_plan"] == [{
+        "payload_ref": "payload:shared_input",
+        "source_stage_id": "shared_input",
+        "target_stage_ids": ["candidate_a", "candidate_b"],
+        "reason_code": "immutable_fanout_source",
+    }]
+    assert result["summary"]["payload_share_candidate_count"] == 1
+    assert any(
+        event["rule"] == "share_payload" and event["accepted"] is True
+        for event in result["trace"]
+    )
+
+
+def test_shadow_optimizer_is_deterministic_and_rejects_runtime_mode():
+    logical = project_task_graph(_diamond_stages(), "aggregate")
+    first = optimize_task_graph(logical)
+    second = optimize_task_graph(logical)
+
+    assert first["digest"] == second["digest"]
+    with pytest.raises(TaskGraphOptimizationError, match="shadow"):
+        optimize_task_graph(logical, mode="runtime")
