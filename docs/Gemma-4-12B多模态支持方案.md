@@ -1,8 +1,8 @@
 # Gemma-4-12B 多模态支持方案（实施计划）
 
-> 状态：Active（G4.1-G4.4 已完成；G4.5 原生产品代码开发门完成，安装包实机验证待办；G4.6 调研与开发机对照完成；音频、长上下文和无 Ollama 干净机验收继续后置）
+> 状态：Active（G4.1-G4.4、G4.3.2B 已完成；G4.5 原生产品代码开发门和 CUDA 安装包构建完成，外部干净机实体验收待办；G4.6 调研与开发机对照完成；音频、长上下文继续后置）
 >
-> 更新日期：2026-08-15
+> 更新日期：2026-08-16
 > 适用范围：原版 Gemma 4 12B 同时保留 Ollama `external_api` 基线与受管 GGUF/mmproj 原生 MTMD 路径；原生代码已接入模型注册、API、Web/TUI 和 CUDA spec，安装包实机仍未验收
 >
 > 目标：先提供可验证、可回滚的原版 Gemma 4 12B 图像理解能力，再补产品交互；`myheretic:latest` 仍只作为用户私有资产，不进入项目基线。
@@ -15,7 +15,7 @@
 - 本机显卡:RTX 4060 Laptop,**8GB 显存**。
 - 本机现状：官方 Ollama `gemma4:12b` 已通过 `127.0.0.1:7897` 子进程代理完整拉取并验证；用户私有 `myheretic:latest` 保留但不参与验收。
 - 模型基线：Ollama 官方 `gemma4:12b` 仍是外部 Provider 产品基线；原生路径现已改用 Hugging Face `bartowski/gemma-4-12B-it-GGUF` 的受管 GGUF/mmproj，文件名、大小和 SHA-256 已冻结。
-- 当前目标：QLH 已具备可用的 Gemma 4 图像理解双轨路径；G4.4 独立工件、G4.5 原生产品代码和 G4.6 调研/开发机对照已完成，完整 CUDA 包、无 Ollama 干净机、音频和 8K/16K 继续后置。
+- 当前目标：QLH 已具备可用的 Gemma 4 图像理解双轨路径；G4.3.2B 原生图片 smoke 已完成，G4.4 独立工件、G4.5 原生产品代码/CUDA 包构建和 G4.6 调研/开发机对照已完成，外部无 Ollama 干净机、音频和 8K/16K 继续后置。
 
 ### 1.1 "多模态实验缺最后一种模型"的含义
 
@@ -134,10 +134,10 @@ $ ollama show myheretic
 |---|---|---|---|
 | S0（本票） | 工件登记 + 下载治理 + 容量预算 | 无（只读调研） | `规划` |
 | S1 | 外部大显存机下载 + 校验 + fp16 加载冒烟 + Transformers 官方加载路径验证 | ≥ 24GB VRAM 设备 / 磁盘 ≥ 50GB | `规划` |
-| S2 | PyTorch 引擎接入：注册表条目、模型配置、CUDA 加载路径、分布管线候选 | S1 通过 + 侧车 venv 建好 | `规划` |
+| S2 | PyTorch 引擎接入：KIP-11A metadata/assignment/隔离选择性物化与 KIP-11B 分段前向、KV、mask、Scheduler sidecar 开发门完成 | S1 通过 + 真实工件/CUDA/双机/生产路由验收后方可准入 | `开发门完成，真实准入待验` |
 | S3 | 与 Ollama Q4 路径对照实验（同模型两种工件形态：质量/速度/内存对比） | S2 通过 | `规划` |
 
-> 本登记不改变 G4.1/G4.2 已验收工件基线；在 S1 完成前，PyTorch 候选不进入任何实验、注册表或质量门。
+> 本登记不改变 G4.1/G4.2 已验收工件基线。KIP-11B 使用独立 `.venv-gemma4-pipeline`（Transformers 5.10.1）完成官方 CPU tiny 分段前向和 shared-KV 开发门，但尚未下载 23.9GB 工件，也不越过 S1：在真实工件、CUDA/双机和生产路由验收前，PyTorch 候选不进入生产注册表、质量门或可执行分布式路由，`pipeline_runtime_supported` 保持 `false`。`.venv-gemma4-native` 仅用于原生 MTMD/llama.cpp。
 
 ---
 
@@ -313,10 +313,10 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 
 - **G4.4 工件身份**：当前是 Hugging Face `bartowski` 的受管 GGUF 转换工件，不应写成 Google 官方权重；运行时现在必须同时满足冻结记录中的文件名、大小和 SHA-256，不能用任意自定义文件绕过工件门。
 - **G4.5 产品接线**：新增内置 `gemma4-native` 注册和专用受管加载分支；单体 API 与 inference-svc 均支持单张 `local_only + full` 图片，也允许外部路由不可用时在本地原生视觉能力已加载的前提下保留图片回退。data URL 仅落到随机临时文件，MTMD 返回或抛错后立即删除，会话与 SQLite 仍只保存文本。Web 带图请求强制避开 fast 文本流，TUI 的本地图像请求自动改用 full 模式。
-- **绑定隔离与回退门**：源码模式会把 `QLH_GEMMA4_SITE_PACKAGES` 或仓库 `.venv-gemma4-native` 置于 `sys.path` 首位；进程已导入其他 `llama_cpp` 时 fail-closed 并提示重启。外部路由失败回退本地 MTMD 时再次要求恰好一张图片，多图不会静默丢弃。
+- **绑定隔离与回退门**：源码模式会把 `QLH_GEMMA4_SITE_PACKAGES` 或仓库 `.venv-gemma4-native` 置于 `sys.path` 首位；受管目录缺失、进程已导入外部 `llama_cpp`、以及 `llama_cpp`/`mtmd_cpp` 模块路径不在受管根时均 fail-closed。KIP-12 已增加 revision/patch SHA/ABI 冻结 lock 与包内 marker，源码构建、PyInstaller 收集和运行时首次 `Llama` 前均做一致性检查。外部路由失败回退本地 MTMD 时再次要求恰好一张图片，多图不会静默丢弃。
 - **显存与对照**：`estimate_gpu_layers()` 已改为保守安全系数（需求乘 margin 必须小于可用显存），并把 mmproj 预留计入预算。G4.6 的 CUDA 全量 offload 对照仅作为开发机性能证据，不作为 8GB 自动准入或部分 offload 产品门。
 - **打包**：CUDA 重编脚本已去除开发者绝对路径，新增 llama.cpp revision、MTMD patch、pip 退出码、CUDA runtime staging 和安装后 ABI 门；`qlh-cuda.spec` 已从隔离 venv 收集绑定/运行时及受管工件，并通过不执行 PyInstaller 的 spec 解析预检。完整构建、安装体积/升级路径和外部干净机离线图像调用仍为 Pending。
-- **回归证据**：Gemma/多模态/TUI 专项 `49 passed`；ModelManager/API/inference-svc 合并回归 `258 passed / 1 skipped`；external Provider `39 passed`；前端 `47 passed`、生产构建通过、Gemma 浏览器桩 `1 passed`。冻结双工件全量 SHA 校验、隔离 binding gate 和 CUDA spec binding/package gate 均通过。
+- **回归证据**：Gemma/多模态/TUI 专项 `49 passed`；KIP-12 binding/ModelManager/Launcher/量化器组合 `138 passed / 1 skipped`；ModelManager/API/inference-svc 合并回归 `258 passed / 1 skipped`；external Provider `39 passed`；前端 `47 passed`、生产构建通过、Gemma 浏览器桩 `1 passed`。冻结双工件全量 SHA 校验、binding 路径门、revision/patch/ABI marker 和 CUDA spec binding/package gate 均通过。
 - **下一票**：~~构建 CUDA 安装包，在无 Ollama 的外部干净 Windows 上验证模型列表加载、单图 full 请求、取消、卸载/重载、临时文件清理、离线工件和安装体积；该票不再新增引擎功能。~~ **CUDA 安装包已构建（2026-08-16）**：`QLH-Edge-Inference-Setup-v0.1.8.3-CUDA.exe` + 5 分片（共约 9.9GB，DiskSpanning 2GB/片，因含 7.66GB 冻结 GGUF 超 4.2GB 单文件上限），版本 0.1.8.3（`version.txt` 同步），PyInstaller 双工件 SHA 与冻结记录一致、清单 4752 文件已签名（release-20260809）。**剩余：外部干净 Windows 实机验收**（无 Ollama：模型列表加载、单图 full 请求、取消、卸载/重载、临时文件清理、离线工件、安装体积），待外部机器，登记于《验收清单与资源限制登记》C 组。
 
 ### 5.5 EX-N3-GEMMA-S1 静态质量计数桥接（Completed，非模型验收）
@@ -352,7 +352,7 @@ fixture 以 `0.8/0.6` 穿过预注册的 `0.70/0.50` advisory 阈值，仅证明
 | G4.3.2B 原生初始化与图片 smoke | Completed（历史，2026-08-13） | CPU-only 初始化、固定测试图与 Ollama 图像语义对照 | 原生图片语义 smoke 已通过；当前产品实现和独立工件转入 G4.4-G4.6 |
 | G4.3.3 音频、资源、打包与分布式 | Candidate | 音频契约、8K/16K、取消/卸载/OOM、CPU/GPU offload、Windows/Linux 离线包、调度 | 音频/长上下文/跨平台安装包和分布式准入仍后置 |
 | G4.4 独立工件链 | Completed（2026-08-15） | 去除 Ollama blobs 运行依赖，固定 bartowski GGUF/mmproj 文件名、大小、SHA-256 和许可 | `gemma4_native_freeze.py --check`、真实双工件 hash 和 3/3 image smoke 通过 |
-| G4.5 原生产品化 | 产品代码开发门完成；安装包 Pending | MTMD chat、单图 local-only full、GPU 预算/projector、临时文件清理、隔离 CUDA binding/spec | 代码/专项回归和 spec 解析预检通过；完整 CUDA 安装包、无 Ollama 干净机待验 |
+| G4.5 原生产品化 | 产品代码开发门完成；CUDA 包已构建，外机 Pending | MTMD chat、单图 local-only full、GPU 预算/projector、临时文件清理、隔离 CUDA binding/spec | 代码/专项回归、KIP-12 冻结身份门、spec 解析预检和 `0.1.8.3` CUDA 分片包构建通过；无 Ollama 干净机待验 |
 | G4.6 Ollama 借鉴与对照 | 调研与开发机对照完成 | reasoning-budget 等效控制和原生/Ollama 吞吐、时延、语义三表 | 开发机 CUDA 对照已完成；不替代外部干净机验收 |
 
 ---

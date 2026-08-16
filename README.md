@@ -332,7 +332,9 @@ cd frontend && npm install && cd ..
 | **`.venv-test`** | **唯一测试环境**（全量/定向 pytest 都在这跑） | `scripts/setup_test_env.py` + `requirements-test.txt` | 不承载运行时推理；不被当作主环境使用 |
 | `.venv-packaging/` | 集显版打包（torch CPU） | `packaging/requirements-cpu.txt` | — |
 | `.venv-packaging-cuda/` | 独显版打包（torch CUDA）+ SD 侧车 | 见打包文档 | — |
-| `.venv-gemma4-native/`、`.venv-qwen3-sidecar/` | 侧车隔离运行时（原生 MTMD / Qwen3 sidecar） | 各自 requirements | — |
+| `.venv-gemma4-native/` | 原生 Gemma 4 MTMD/llama.cpp 运行时 | `packaging/requirements-gemma4-native.txt` | 不得复用给 Transformers pipeline |
+| `.venv-gemma4-pipeline/` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | 与 native/Qwen3 环境隔离 |
+| `.venv-qwen3-sidecar/` | Qwen3 PyTorch sidecar | 各自 requirements | — |
 
 **常用命令**：
 
