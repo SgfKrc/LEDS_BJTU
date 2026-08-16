@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import io
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ sys.path.insert(0, str(TOOL_DIR))
 from doc_maintenance_audit import (  # noqa: E402
     REPO_ROOT,
     _check_link,
+    _configure_text_stream,
     _extract_links,
     _status_line,
     _updated_at,
@@ -53,12 +55,30 @@ def _commit(repo: Path, message: str = "init") -> None:
         ["git", "-C", str(repo), "commit", "-q", "-m", message], check=True)
 
 
+def _commit_at(repo: Path, date: str, message: str) -> None:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": f"{date}T12:00:00",
+        "GIT_COMMITTER_DATE": f"{date}T12:00:00",
+    }
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", message],
+        check=True, env=env)
+
+
 # ---------- 辅助函数 ----------
 
 def test_status_line_extraction():
     text = "> 文档状态：规划（未开始）\n> 更新日期：2026-08-16\n"
     assert "规划" in _status_line(text)
     assert _updated_at(text) == "2026-08-16"
+
+
+def test_status_line_accepts_markdown_bold_label():
+    text = "> **状态**：设计方案\n> 更新日期：2026-08-16\n"
+    assert _status_line(text) == "> **状态**：设计方案"
 
 
 def test_status_line_skips_lifecycle():
@@ -76,6 +96,15 @@ def test_links_extraction_and_existence(tmp_path):
     # 存在性
     assert _check_link("文档维护Agent工具设计.md")
     assert not _check_link("不存在的文档.md")
+
+
+def test_windows_text_stream_is_reconfigured_to_utf8():
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="gbk")
+    _configure_text_stream(stream)
+    stream.write("✅ 文档")
+    stream.flush()
+    assert raw.getvalue().decode("utf-8") == "✅ 文档"
 
 
 # ---------- R1 完成未收口 ----------
@@ -147,8 +176,10 @@ def test_r2_hit_when_docs_uncommitted(fake_repo):
     _write(docs, "a.md", "> 状态：现行\n")
     _commit(repo)
     _write(docs, "b.md", "> 状态：现行\n")  # 未提交
-    entry = scan_doc(repo / "docs" / "a.md", repo, None)
-    assert "R2" in {f["rule"] for f in entry["findings"]}
+    unchanged = scan_doc(repo / "docs" / "a.md", repo, None)
+    changed = scan_doc(repo / "docs" / "b.md", repo, None)
+    assert "R2" not in {f["rule"] for f in unchanged["findings"]}
+    assert "R2" in {f["rule"] for f in changed["findings"]}
 
 
 def test_r2_miss_when_clean(fake_repo):
@@ -163,17 +194,30 @@ def test_r2_miss_when_clean(fake_repo):
 
 def test_r3_hit_when_commit_newer_than_updated_at(fake_repo):
     repo, docs = fake_repo
-    p = _write(docs, "s.md",
+    p = _write(docs, "task_graph_plan.md",
                "> 状态：现行\n> 更新日期：2026-08-01\n")
-    _commit(repo, "first")
-    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-08-15T00:00:00",
-           "GIT_COMMITTER_DATE": "2026-08-15T00:00:00"}
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-q", "--allow-empty",
-         "--date", "2026-08-15T00:00:00", "-m", "later"],
-        env=env, check=True)
+    src = repo / "src"
+    src.mkdir()
+    (src / "task_graph.py").write_text("BASE = 1\n", encoding="utf-8")
+    _commit_at(repo, "2026-08-01", "initial task graph")
+    (src / "task_graph.py").write_text("BASE = 2\n", encoding="utf-8")
+    _commit_at(repo, "2026-08-15", "update task graph")
     entry = scan_doc(p, repo, None)
     assert "R3" in {f["rule"] for f in entry["findings"]}
+
+
+def test_r3_miss_for_unrelated_source_change(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "task_graph_plan.md",
+               "> 状态：现行\n> 更新日期：2026-08-01\n")
+    src = repo / "src" / "auth"
+    src.mkdir(parents=True)
+    (src / "login.py").write_text("BASE = 1\n", encoding="utf-8")
+    _commit_at(repo, "2026-08-01", "initial files")
+    (src / "login.py").write_text("BASE = 2\n", encoding="utf-8")
+    _commit_at(repo, "2026-08-15", "update task graph documentation only")
+    entry = scan_doc(p, repo, None)
+    assert "R3" not in {f["rule"] for f in entry["findings"]}
 
 
 def test_r3_miss_when_updated_recently(fake_repo):
