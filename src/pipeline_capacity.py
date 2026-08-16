@@ -80,7 +80,7 @@ def _descriptor_costs(
         name: _non_negative_int(
             components.get(name, 0), f"component_weight_bytes.{name}"
         )
-        for name in ("visual", "mtp")
+        for name in ("visual", "mtp", "multimodal")
     }
     active_unsupported = [name for name, size in unsupported.items() if size > 0]
     if active_unsupported:

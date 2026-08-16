@@ -20,6 +20,8 @@
   llama.cpp 栈: llama-cpp-python (pip install llama-cpp-python)
 """
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -255,6 +257,8 @@ class ModelManager:
         # 主节点进入分层模式后，保留完整模型的加载参数供本地回退恢复。
         self._full_model_path: Optional[str] = None
         self._full_model_quant_type: Optional[str] = None
+        self._load_fingerprint: Optional[Dict[str, Any]] = None
+        self._load_fingerprint_sha256: str = ""
 
         # 并发保护锁 — 防止推理与模型切换之间的数据竞争
         self._lock = threading.RLock()
@@ -386,6 +390,243 @@ class ModelManager:
     # 模型加载（双引擎入口）
     # ================================================================
 
+    @staticmethod
+    def _normalize_load_path(path: str | None) -> str:
+        if not path:
+            return ""
+        return os.path.normcase(
+            os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+        )
+
+    @staticmethod
+    def _read_sha256_sidecar(path: str) -> str:
+        candidates = []
+        if os.path.isdir(path):
+            candidates.append(os.path.join(path, "model.sha256"))
+        elif path:
+            candidates.extend((path + ".sha256", os.path.splitext(path)[0] + ".sha256"))
+        for candidate in dict.fromkeys(candidates):
+            try:
+                if os.path.getsize(candidate) > 4096:
+                    continue
+                with open(candidate, "r", encoding="utf-8") as handle:
+                    digest = handle.read(4097).strip().split()[0].lower()
+            except (OSError, IndexError, UnicodeDecodeError):
+                continue
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                return digest
+        return ""
+
+    @staticmethod
+    def _registry_load_identity(
+        model_id: str,
+        db_experimental_models: list[dict] | None,
+    ) -> Dict[str, str]:
+        if mc.get_builtin_model(model_id) is not None or not db_experimental_models:
+            return {}
+        entry = next(
+            (
+                item for item in db_experimental_models
+                if isinstance(item, dict) and str(item.get("model_id", "")) == model_id
+            ),
+            None,
+        )
+        if entry is None:
+            return {}
+        identity: Dict[str, str] = {}
+        for key in (
+            "artifact_id", "sha256", "model_sha256", "artifact_sha256",
+            "manifest_sha256", "revision", "resolved_revision", "commit_hash",
+            "quantization",
+        ):
+            value = str(entry.get(key, "") or "").strip()
+            if value:
+                identity[key] = value
+        source = entry.get("source")
+        if isinstance(source, dict):
+            for key in ("provider", "repo_id", "requested_revision", "resolved_revision"):
+                value = str(source.get(key, "") or "").strip()
+                if value:
+                    identity[f"source_{key}"] = value
+        return identity
+
+    @classmethod
+    def _artifact_load_identity(
+        cls,
+        path: str | None,
+        *,
+        model_id: str,
+        db_experimental_models: list[dict] | None,
+    ) -> Dict[str, Any]:
+        normalized = cls._normalize_load_path(path)
+        identity: Dict[str, Any] = {
+            "path": normalized,
+            "registry": cls._registry_load_identity(model_id, db_experimental_models),
+        }
+        try:
+            stat_result = os.stat(normalized)
+        except OSError:
+            identity["kind"] = "missing" if normalized else "none"
+            return identity
+        identity.update({
+            "kind": "directory" if os.path.isdir(normalized) else "file",
+            "size_bytes": int(stat_result.st_size),
+            "mtime_ns": int(stat_result.st_mtime_ns),
+        })
+        sidecar_sha256 = cls._read_sha256_sidecar(normalized)
+        if sidecar_sha256:
+            identity["sidecar_sha256"] = sidecar_sha256
+        return identity
+
+    @staticmethod
+    def _profile_load_identity(profile: dict | None) -> Dict[str, Any]:
+        value = profile if isinstance(profile, dict) else {}
+        gpu = value.get("gpu") if isinstance(value.get("gpu"), dict) else {}
+        cpu = value.get("cpu") if isinstance(value.get("cpu"), dict) else {}
+        gpus = value.get("gpus") if isinstance(value.get("gpus"), list) else []
+
+        def stable_int(raw: Any, default: int) -> int:
+            try:
+                return int(raw)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        def stable_float(raw: Any, default: float) -> float:
+            try:
+                result = float(raw)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            return result if result == result and abs(result) != float("inf") else default
+
+        gpu_layers = value.get("gpu_layers")
+        if gpu_layers is not None and not isinstance(gpu_layers, (bool, int, float, str)):
+            gpu_layers = str(gpu_layers)
+        return {
+            "tier": str(value.get("tier", "laptop") or "laptop"),
+            "selected_gpu_index": stable_int(value.get("selected_gpu_index", 0) or 0, 0),
+            "gpu": {
+                "index": stable_int(gpu.get("index", 0) or 0, 0),
+                "cuda_available": bool(gpu.get("cuda_available", False)),
+                "vram_total_gb": stable_float(gpu.get("vram_total_gb", 0) or 0, 0.0),
+                "is_integrated": bool(gpu.get("is_integrated", False)),
+                "gpu_type": str(gpu.get("gpu_type", "") or ""),
+            },
+            "any_cuda_gpu": any(
+                isinstance(item, dict) and bool(item.get("cuda_available", False))
+                for item in gpus
+            ),
+            "cpu_physical_cores": stable_int(cpu.get("physical_cores", 4) or 4, 4),
+            "requested_device": str(value.get("device", "") or ""),
+            "offload_profile": str(value.get("offload_profile", "") or ""),
+            "gpu_layers": gpu_layers,
+        }
+
+    def _resolve_model_load_request(
+        self,
+        *,
+        model_path: str | None,
+        quant_type: str | None,
+        profile: dict | None,
+        model_id: str | None,
+        engine: str | None,
+        db_experimental_models: list[dict] | None,
+        require_existing: bool,
+    ) -> Dict[str, Any]:
+        resolved_path = model_path
+        resolved_id = model_id or mc.DEFAULT_MODEL_ID
+        cfg = mc.get_model_config(resolved_id, db_experimental_models) if model_id else None
+        resolved_engine = engine if engine and engine != "auto" else self.select_engine(profile)
+
+        if resolved_engine != "island":
+            if model_id and cfg is None and not resolved_path:
+                raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
+            if resolved_id != mc.DEFAULT_MODEL_ID and cfg:
+                if cfg.model_type == "gguf" and resolved_engine == "pytorch":
+                    logger.warning(
+                        "模型 '%s' 仅有 GGUF 格式，引擎从 pytorch 切换为 llama_cpp",
+                        resolved_id,
+                    )
+                    resolved_engine = "llama_cpp"
+                elif cfg.model_type == "safetensors" and resolved_engine == "llama_cpp":
+                    logger.warning(
+                        "模型 '%s' 仅有 Safetensors 格式，引擎保持 pytorch（CPU 推理）",
+                        resolved_id,
+                    )
+                    resolved_engine = "pytorch"
+
+            if not resolved_path and cfg:
+                candidate = (
+                    mc.resolve_model_path(cfg.gguf_path)
+                    if resolved_engine == "llama_cpp"
+                    else mc.resolve_model_path(cfg.model_path)
+                )
+                exists = os.path.isfile(candidate) if resolved_engine == "llama_cpp" else os.path.isdir(candidate)
+                if require_existing and not exists:
+                    label = "GGUF 文件" if resolved_engine == "llama_cpp" else "Safetensors 目录"
+                    configured = cfg.gguf_path if resolved_engine == "llama_cpp" else cfg.model_path
+                    raise FileNotFoundError(
+                        f"模型 '{resolved_id}' 的 {label}不存在: {configured or '(未配置)'}"
+                    )
+                resolved_path = candidate
+
+        return {
+            "model_id": resolved_id,
+            "config": cfg,
+            "engine": resolved_engine,
+            "path": resolved_path or "",
+            "requested_quantization": str(quant_type or QUANT_TYPE).casefold(),
+        }
+
+    def _build_load_fingerprint(
+        self,
+        request: Dict[str, Any],
+        *,
+        profile: dict | None,
+        db_experimental_models: list[dict] | None,
+    ) -> tuple[Dict[str, Any], str]:
+        cfg = request.get("config")
+        payload: Dict[str, Any] = {
+            "schema_version": 1,
+            "model_id": request["model_id"],
+            "engine": request["engine"],
+            "requested_quantization": request["requested_quantization"],
+            "artifact": self._artifact_load_identity(
+                request.get("path"),
+                model_id=request["model_id"],
+                db_experimental_models=db_experimental_models,
+            ),
+            "registry_model_type": str(getattr(cfg, "model_type", "") or ""),
+            "execution": {
+                "profile": self._profile_load_identity(profile),
+                "torch_cuda_available": bool(torch.cuda.is_available()),
+                "configured_device": str(DEVICE),
+                "use_compile": bool(USE_COMPILE),
+                "trust_remote_code": bool(TRUST_REMOTE_CODE),
+            },
+        }
+        canonical = json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return payload, hashlib.sha256(canonical).hexdigest()
+
+    def _record_load_fingerprint(
+        self,
+        request: Dict[str, Any],
+        *,
+        profile: dict | None,
+        db_experimental_models: list[dict] | None,
+    ) -> None:
+        if not request.get("path") and self._model_path:
+            request = dict(request)
+            request["path"] = self._model_path
+        payload, digest = self._build_load_fingerprint(
+            request,
+            profile=profile,
+            db_experimental_models=db_experimental_models,
+        )
+        self._load_fingerprint = payload
+        self._load_fingerprint_sha256 = digest
+
     @_serialized_model_access
     def load_model(
         self,
@@ -411,16 +652,18 @@ class ModelManager:
                       若提供且 model_path 未指定，从 model_config 查找路径。
             db_experimental_models: DB 注册的实验模型列表（P3修复：支持 DB 模型查找）。
         """
-        resolved_path = model_path
-        resolved_id = model_id or mc.DEFAULT_MODEL_ID
-        cfg = mc.get_model_config(resolved_id, db_experimental_models) if model_id else None
-
-        # 确定引擎（尊重 model_type 约束）
-        # P3修复: 允许调用者通过 engine 参数强制选择引擎
-        if engine and engine != "auto":
-            resolved_engine = engine
-        else:
-            resolved_engine = self.select_engine(profile)
+        request = self._resolve_model_load_request(
+            model_path=model_path,
+            quant_type=quant_type,
+            profile=profile,
+            model_id=model_id,
+            engine=engine,
+            db_experimental_models=db_experimental_models,
+            require_existing=True,
+        )
+        resolved_path = request["path"] or None
+        resolved_id = request["model_id"]
+        resolved_engine = request["engine"]
 
         # ---- TP 孤岛引擎：无本地模型文件，"加载" = 健康检查 + 解析后端模型名 ----
         # 孤岛模型不进本地注册表（无落盘 artifact），跳过注册表/文件校验。
@@ -433,44 +676,12 @@ class ModelManager:
             # 孤岛节点没有可回退的本地完整模型
             self._full_model_path = None
             self._full_model_quant_type = None
+            self._record_load_fingerprint(
+                request,
+                profile=profile,
+                db_experimental_models=db_experimental_models,
+            )
             return
-
-        if model_id and cfg is None and not resolved_path:
-            raise ValueError(f"模型 '{model_id}' 未在注册表中找到")
-        # model_type 强制约束：GGUF-only 模型必须用 llama.cpp；
-        # Safetensors-only 模型在 CPU 上仍需走 PyTorch（或报错）
-        if resolved_id != mc.DEFAULT_MODEL_ID:
-            if cfg:
-                if cfg.model_type == "gguf" and resolved_engine == "pytorch":
-                    logger.warning(
-                        f"模型 '{resolved_id}' 仅有 GGUF 格式，"
-                        f"引擎从 pytorch 切换为 llama_cpp"
-                    )
-                    resolved_engine = "llama_cpp"
-                elif cfg.model_type == "safetensors" and resolved_engine == "llama_cpp":
-                    logger.warning(
-                        f"模型 '{resolved_id}' 仅有 Safetensors 格式，"
-                        f"引擎保持 pytorch（CPU 推理）"
-                    )
-                    resolved_engine = "pytorch"
-
-        if not resolved_path and cfg:
-            safetensors_path = mc.resolve_model_path(cfg.model_path)
-            gguf_path = mc.resolve_model_path(cfg.gguf_path)
-            if resolved_engine == "llama_cpp":
-                if gguf_path and os.path.isfile(gguf_path):
-                    resolved_path = gguf_path
-                else:
-                    raise FileNotFoundError(
-                        f"模型 '{resolved_id}' 的 GGUF 文件不存在: {cfg.gguf_path or '(未配置)'}"
-                    )
-            else:
-                if safetensors_path and os.path.isdir(safetensors_path):
-                    resolved_path = safetensors_path
-                else:
-                    raise FileNotFoundError(
-                        f"模型 '{resolved_id}' 的 Safetensors 目录不存在: {cfg.model_path or '(未配置)'}"
-                    )
 
         self._engine_type = resolved_engine
 
@@ -490,6 +701,11 @@ class ModelManager:
         self._full_model_quant_type = self.quant_type
         self._pipeline_descriptor = None
         self._pipeline_distributed_only = False
+        self._record_load_fingerprint(
+            request,
+            profile=profile,
+            db_experimental_models=db_experimental_models,
+        )
 
     @_serialized_model_access
     def unload_model(self) -> None:
@@ -520,6 +736,8 @@ class ModelManager:
         self._pipeline_distributed_only = False
         self._full_model_path = None
         self._full_model_quant_type = None
+        self._load_fingerprint = None
+        self._load_fingerprint_sha256 = ""
 
         # --- llama.cpp 引擎清理 ---
         if self._llama_engine is not None:
@@ -602,6 +820,8 @@ class ModelManager:
         self._model_layers = 0
         self._pipeline_descriptor = dict(descriptor)
         self._pipeline_distributed_only = True
+        self._load_fingerprint = None
+        self._load_fingerprint_sha256 = ""
         logger.info(
             "流水线模型元数据已准备: model=%s type=%s layers=%s "
             "runtime_supported=%s inspection=%s",
@@ -728,31 +948,51 @@ class ModelManager:
                 f"profile_tier={profile.get('tier', '?') if profile else '?'})"
             )
 
-            # P6 (2026-08-16): 同模型切换短路——目标模型已加载（同 id、
-            # 同量化、同权重路径）时直接复用，跳过 unload+load。二次切换
-            # 耗时接近 0 且不触碰权重文件；会话上下文重置仍由调用方
-            # （api_server 的 _prepare_model_switch）统一执行，行为不变。
-            requested_path = model_path or self._model_path
-            requested_quant = quant_type or QUANT_TYPE
+            # KIP-13: reuse requires an exact immutable load-fingerprint match.
+            # The public result exposes only the digest; local paths stay private.
+            target_request = None
+            target_fingerprint = ""
+            try:
+                target_request = self._resolve_model_load_request(
+                    model_path=model_path,
+                    quant_type=quant_type,
+                    profile=profile,
+                    model_id=model_id,
+                    engine=engine,
+                    db_experimental_models=db_experimental_models,
+                    require_existing=False,
+                )
+                _, target_fingerprint = self._build_load_fingerprint(
+                    target_request,
+                    profile=profile,
+                    db_experimental_models=db_experimental_models,
+                )
+            except (OSError, TypeError, ValueError):
+                # The normal load path below returns the existing structured error.
+                target_request = None
+                target_fingerprint = ""
+
             if (
                 had_model
-                and self._active_model_id == model_id
-                and (self._model_path or "") == (requested_path or "")
-                and (self._quant_type or QUANT_TYPE) == requested_quant
+                and not had_pipeline_preparation
+                and self.layer_range is None
+                and target_request is not None
+                and target_request["engine"] != "island"
+                and bool(self._load_fingerprint_sha256)
+                and self._load_fingerprint_sha256 == target_fingerprint
             ):
+                requested_quant = target_request["requested_quantization"]
                 logger.info(
                     f"P6 同模型切换短路: {model_id} 已加载（quant={requested_quant}），直接复用"
                 )
-                try:
-                    cfg = mc.get_model_config(model_id, db_experimental_models)
-                except Exception:
-                    cfg = None
+                cfg = target_request.get("config")
                 return {
                     "success": True,
                     "model_id": self._active_model_id,
                     "model_name": cfg.name if cfg else model_id,
                     "error": None,
                     "reused": True,
+                    "load_fingerprint": f"sha256:{target_fingerprint}",
                 }
 
             # 步骤 1: 卸载当前模型
@@ -782,6 +1022,7 @@ class ModelManager:
                     "model_id": self._active_model_id,
                     "model_name": cfg.name if cfg else model_id,
                     "error": None,
+                    "load_fingerprint": self.load_fingerprint,
                 }
             except Exception as e:
                 logger.error(f"加载模型 '{model_id}' 失败: {e}")
@@ -829,6 +1070,13 @@ class ModelManager:
         """当前活跃的模型 ID。"""
         return self._active_model_id
 
+    @property
+    def load_fingerprint(self) -> str:
+        """Return the public load identity without exposing local artifact paths."""
+        if not self._load_fingerprint_sha256:
+            return ""
+        return f"sha256:{self._load_fingerprint_sha256}"
+
     @_serialized_model_access
     def load_layer_range(
         self,
@@ -874,6 +1122,22 @@ class ModelManager:
         # has 28 layers while the legacy Qwen project default has 24, and the
         # master normally reuses ``_full_model_path`` without passing a path.
         path = model_path or self._full_model_path or self._model_path or MODEL_PATH
+        config_path = os.path.join(path, "config.json")
+        if os.path.isfile(config_path):
+            try:
+                import json
+
+                with open(config_path, "r", encoding="utf-8") as handle:
+                    declared_model_type = str(
+                        (json.load(handle) or {}).get("model_type", "") or ""
+                    ).lower()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                declared_model_type = ""
+            if declared_model_type in {"gemma", "gemma4_unified"}:
+                raise RuntimeError(
+                    "Gemma 4 PyTorch 层流水线需要隔离 Transformers sidecar；"
+                    "主运行时禁止把 gemma/gemma4_unified 复用为 Qwen2 执行器"
+                )
         model_config = AutoConfig.from_pretrained(
             path,
             trust_remote_code=TRUST_REMOTE_CODE,
@@ -928,16 +1192,10 @@ class ModelManager:
                 profile=profile,
                 model_config=model_config,
             )
-        elif model_type == "gemma":
-            load_tracker = self._load_gemma_layer_range(
-                path,
-                start_layer,
-                end_layer,
-                has_embedding=has_embedding,
-                has_lm_head=has_lm_head,
-                quant_type=quant_type,
-                profile=profile,
-                model_config=model_config,
+        elif model_type in {"gemma", "gemma4_unified"}:
+            raise RuntimeError(
+                "Gemma 4 PyTorch 层流水线需要隔离 Transformers sidecar；"
+                "主运行时禁止把 gemma/gemma4_unified 复用为 Qwen2 执行器"
             )
         else:
             raise RuntimeError(
@@ -956,7 +1214,7 @@ class ModelManager:
             raise RuntimeError("模型加载失败，无法进行层范围裁剪")
 
         # ---- 裁剪 Transformer 层 ----
-        if model_type in ("qwen2", "gemma"):
+        if model_type == "qwen2":
             transformer = self.model.model
             layers_attr = "layers"
             embedding_attr = "embed_tokens"
@@ -1043,6 +1301,8 @@ class ModelManager:
         self._layer_architecture = model_type
         self._model_layers = layers_count
         self._total_model_layers = actual_total
+        self._load_fingerprint = None
+        self._load_fingerprint_sha256 = ""
         if model_id:
             self._active_model_id = model_id
         # _total_model_layers 在 _load_pytorch 中已设为完整模型总层数，此处不覆盖
@@ -1078,8 +1338,8 @@ class ModelManager:
 
         ``architecture`` names the tracker identity for load metrics; the key
         layout is shared by Qwen2 (``model.layers.`` / ``model.embed_tokens.``
-        / ``model.norm.`` / ``lm_head.``) and Gemma/Gemma 4, so the Gemma
-        adapter reuses this loader through :meth:`_load_gemma_layer_range`.
+        / ``model.norm.`` / ``lm_head.``). Architectures with a different
+        model wrapper or forward contract must use an isolated adapter.
         """
         import gc
         import json
@@ -1211,36 +1471,6 @@ class ModelManager:
             total_layers,
         )
         return load_tracker
-
-    def _load_gemma_layer_range(
-        self,
-        model_path: str,
-        start_layer: int,
-        end_layer: int,
-        *,
-        has_embedding: bool,
-        has_lm_head: bool,
-        quant_type: str = None,
-        profile: dict = None,
-        model_config=None,
-    ) -> _LayerRangeLoadTracker:
-        """Gemma / Gemma 4 PyTorch layer-range adapter (§4.2 模板).
-
-        Gemma's safetensors key layout matches Qwen2 (``model.layers.`` /
-        ``model.embed_tokens.`` / ``model.norm.`` / ``lm_head.``), so the
-        loader is shared; only the tracker/observation identity differs.
-        """
-        return self._load_qwen2_layer_range(
-            model_path,
-            start_layer,
-            end_layer,
-            has_embedding=has_embedding,
-            has_lm_head=has_lm_head,
-            quant_type=quant_type,
-            profile=profile,
-            model_config=model_config,
-            architecture="gemma",
-        )
 
     def _load_qwen_layer_range(
         self,
@@ -1571,8 +1801,8 @@ class ModelManager:
 
         managed_root = None
         if getattr(sys, "frozen", False):
-            site_packages = None
             managed_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)).resolve(strict=False)
+            site_packages = managed_root
         else:
             configured = os.environ.get("QLH_GEMMA4_SITE_PACKAGES", "").strip()
             if configured:
@@ -1584,44 +1814,56 @@ class ModelManager:
                 else:
                     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
                     site_packages = venv / "lib" / version / "site-packages"
+            managed_root = site_packages
 
-            if site_packages.is_dir():
-                loaded = sys.modules.get("llama_cpp")
-                if loaded is not None:
-                    loaded_file = Path(getattr(loaded, "__file__", "")).resolve(strict=False)
-                    try:
-                        loaded_file.relative_to(site_packages)
-                        managed_binding_loaded = True
-                    except ValueError:
-                        managed_binding_loaded = False
-                    if not managed_binding_loaded:
-                        raise RuntimeError(
-                            "当前进程已导入另一套 llama_cpp；请重启后再加载 gemma4-native"
-                        )
-                else:
-                    site_path = os.fspath(site_packages)
-                    sys.path[:] = [entry for entry in sys.path if entry != site_path]
-                    sys.path.insert(0, site_path)
-                    importlib.invalidate_caches()
+        if not site_packages.is_dir():
+            raise RuntimeError(
+                "gemma4-native requires an existing managed llama_cpp site-packages directory"
+            )
 
-        loaded = sys.modules.get("llama_cpp")
-        if loaded is not None and managed_root is not None:
-            loaded_file = Path(getattr(loaded, "__file__", "")).resolve(strict=False)
+        def _validate_module_root(module, label: str) -> None:
+            module_file = str(getattr(module, "__file__", "") or "").strip()
+            if not module_file:
+                raise RuntimeError(f"gemma4-native {label} module has no __file__")
+            resolved = Path(module_file).expanduser().resolve(strict=False)
             try:
-                loaded_file.relative_to(managed_root)
+                resolved.relative_to(managed_root)
             except ValueError as exc:
                 raise RuntimeError(
-                    "当前进程已导入另一套 llama_cpp；请重启后再加载 gemma4-native"
+                    f"gemma4-native {label} module is outside the managed binding root"
                 ) from exc
+
+        loaded = sys.modules.get("llama_cpp")
+        if loaded is not None:
+            _validate_module_root(loaded, "llama_cpp")
+        else:
+            site_path = os.fspath(site_packages)
+            sys.path[:] = [entry for entry in sys.path if entry != site_path]
+            sys.path.insert(0, site_path)
+            importlib.invalidate_caches()
+
+        loaded = sys.modules.get("llama_cpp")
 
         try:
             import llama_cpp
             import llama_cpp.mtmd_cpp as mtmd
         except ImportError as exc:
             raise RuntimeError("gemma4-native requires the managed llama_cpp MTMD binding") from exc
-        if getattr(llama_cpp, "__version__", "") != "0.3.28":
-            raise RuntimeError("gemma4-native requires llama-cpp-python 0.3.28")
-        for symbol in ("mtmd_tokenize", "mtmd_helper_decode_image_chunk"):
+        _validate_module_root(llama_cpp, "llama_cpp")
+        _validate_module_root(mtmd, "mtmd_cpp")
+        from scripts.model_tools.gemma4_native_binding import (
+            expected_binding_marker,
+            validate_binding_marker,
+        )
+
+        expected_marker = expected_binding_marker()
+        expected_version = expected_marker["package"]["version"]
+        if getattr(llama_cpp, "__version__", "") != expected_version:
+            raise RuntimeError(
+                f"gemma4-native requires llama-cpp-python {expected_version}"
+            )
+        validate_binding_marker(site_packages)
+        for symbol in expected_marker["abi"]["mtmd_python_symbols"]:
             if not callable(getattr(mtmd, symbol, None)):
                 raise RuntimeError(f"gemma4-native MTMD binding is missing {symbol}")
         if use_cuda:
@@ -2778,6 +3020,9 @@ class ModelManager:
             info["model_id"] = self._active_model_id
             info["model_name"] = model_name
             info["model_path"] = self._model_path
+            if self.load_fingerprint:
+                info["load_fingerprint"] = self.load_fingerprint
+                info["load_fingerprint_schema"] = 1
             return info
 
         if self._engine_type == "island" and self._island_engine:
@@ -2786,6 +3031,9 @@ class ModelManager:
             # 孤岛节点对外展示后端模型名（凭据已在 base_url 中脱敏）
             info["model_name"] = info.get("model") or model_name
             info["model_path"] = info.get("base_url", "")
+            if self.load_fingerprint:
+                info["load_fingerprint"] = self.load_fingerprint
+                info["load_fingerprint_schema"] = 1
             return info
 
         info = {
@@ -2802,6 +3050,9 @@ class ModelManager:
         }
         if self._layer_load_metrics is not None:
             info["layer_load_metrics"] = dict(self._layer_load_metrics)
+        if self.load_fingerprint:
+            info["load_fingerprint"] = self.load_fingerprint
+            info["load_fingerprint_schema"] = 1
         if torch.cuda.is_available():
             info["gpu_memory_allocated_gb"] = round(torch.cuda.memory_allocated() / (1024**3), 2)
             info["gpu_memory_reserved_gb"] = round(torch.cuda.memory_reserved() / (1024**3), 2)

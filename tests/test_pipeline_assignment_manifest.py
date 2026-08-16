@@ -27,6 +27,29 @@ def _fixture(root):
     (root / "tokenizer_config.json").write_text("{}", encoding="utf-8")
 
 
+def _gemma4_fixture(root):
+    (root / "config.json").write_text(
+        json.dumps({
+            "model_type": "gemma4_unified",
+            "text_config": {
+                "num_hidden_layers": 2,
+                "tie_word_embeddings": True,
+            },
+        }),
+        encoding="utf-8",
+    )
+    save_file({
+        "model.language_model.embed_tokens.weight": torch.zeros(4, 2, dtype=torch.float16),
+        "model.language_model.layers.0.input_layernorm.weight": torch.zeros(2, dtype=torch.float16),
+        "model.language_model.layers.1.input_layernorm.weight": torch.zeros(2, dtype=torch.float16),
+        "model.language_model.norm.weight": torch.zeros(2, dtype=torch.float16),
+        "lm_head.weight": torch.zeros(4, 2, dtype=torch.float16),
+        "model.embed_vision.proj.weight": torch.zeros(2, 2, dtype=torch.float16),
+        "model.embed_audio.proj.weight": torch.zeros(2, 2, dtype=torch.float16),
+    }, str(root / "model.safetensors"))
+    (root / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+
 def test_manifest_contains_only_assigned_keys_and_identity(tmp_path):
     _fixture(tmp_path)
     manifest = build_assignment_manifest(
@@ -103,3 +126,32 @@ def test_tied_output_assignment_includes_shared_embedding_weight(tmp_path):
     assert "model.embed_tokens.weight" in keys
     assert manifest["tie_word_embeddings"] is True
     assert manifest["output_weight_source"] == "model.embed_tokens.weight"
+
+
+def test_gemma4_text_assignment_excludes_vision_and_audio_weights(tmp_path):
+    _gemma4_fixture(tmp_path)
+    manifest = build_assignment_manifest(
+        tmp_path,
+        model_id="gemma4-fixture",
+        model_sha256="c" * 64,
+        config_id="config-g4",
+        plan_id="plan-g4",
+        node_id="worker-g4",
+        start_layer=0,
+        end_layer=1,
+        total_layers=2,
+        has_embedding=True,
+        has_lm_head=False,
+    )
+
+    keys = {
+        key
+        for item in manifest["files"] if item.get("kind") == "weights"
+        for key in item["keys"]
+    }
+    assert keys == {
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.layers.0.input_layernorm.weight",
+        "model.language_model.norm.weight",
+    }
+    assert all("embed_vision" not in key and "embed_audio" not in key for key in keys)

@@ -96,7 +96,7 @@ def _selected_keys(
             )
         elif component == "lm_head":
             include = bool(has_lm_head)
-        elif component in {"visual", "mtp"}:
+        elif component in {"visual", "mtp", "multimodal"}:
             include = False
         else:
             # ``other`` is charged with the output side of the plan, so keep
@@ -155,6 +155,9 @@ def build_assignment_manifest(
         raise PipelineAssignmentManifestError("assignment layer range is invalid")
     config = _read_json_object(root / "config.json")
     model_type = str(config.get("model_type", "") or "").lower()
+    layout = _ARCHITECTURE_LAYOUTS.get(model_type)
+    if layout is None:
+        raise PipelineAssignmentManifestError(f"unsupported model type: {model_type}")
     try:
         configured_layers = int(_decoder_config(config).get("num_hidden_layers", 0) or 0)
     except (TypeError, ValueError) as exc:
@@ -244,7 +247,7 @@ def build_assignment_manifest(
         "has_lm_head": bool(has_lm_head),
         "tie_word_embeddings": tie_word_embeddings,
         "output_weight_source": (
-            "model.embed_tokens.weight"
+            f"{layout['embedding_prefixes'][0]}weight"
             if bool(has_lm_head) and tie_word_embeddings
             else "lm_head.weight"
             if bool(has_lm_head)
