@@ -81,11 +81,12 @@ def test_cpu_runtime_multiplier_is_charged_to_required_bytes():
     assert plan["assignments"][0]["required_bytes"] == 195 * MIB
 
 
-def test_component_that_requires_an_unimplemented_runtime_is_rejected():
+@pytest.mark.parametrize("component", ["visual", "mtp", "multimodal"])
+def test_component_that_requires_an_unimplemented_runtime_is_rejected(component):
     item = descriptor((100,))
-    item["component_weight_bytes"]["visual"] = 20 * MIB
+    item["component_weight_bytes"][component] = 20 * MIB
 
-    with pytest.raises(PipelineCapacityError, match="visual"):
+    with pytest.raises(PipelineCapacityError, match=component):
         solve_pipeline_capacity(item, [node("worker", 500)])
 
 

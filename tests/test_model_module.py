@@ -9,6 +9,8 @@
 
 import sys
 import os
+import json
+import re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import copy
@@ -804,7 +806,7 @@ class TestLoadLayerRangeIntegration:
             lambda *args, **kwargs: config,
         )
 
-        with pytest.raises(RuntimeError, match="禁止整模加载后裁剪"):
+        with pytest.raises(RuntimeError, match="隔离 Transformers sidecar"):
             ModelManager().load_layer_range(0, 2, total_layers=4)
 
     def test_load_then_forward_last_node(self):
@@ -2288,7 +2290,14 @@ class TestSwitchModel:
 
 
 class TestP6SameModelSwitchShortCircuit:
-    """P6（2026-08-16）：同模型切换短路——已加载模型二次切换直接复用。"""
+    """KIP-13: same-model reuse is gated by an immutable load fingerprint."""
+
+    class _FakeLlamaEngine:
+        def get_model_info(self):
+            return {"engine": "llama_cpp"}
+
+        def close(self):
+            return None
 
     def _loaded_mgr(self, monkeypatch):
         import model_module
@@ -2300,8 +2309,7 @@ class TestP6SameModelSwitchShortCircuit:
 
         def fake_llama(*a, **kw):
             load_calls.append(("llama", kw))
-            mgr._llama_engine = object()
-            mgr._quant_type = "int4"
+            mgr._llama_engine = self._FakeLlamaEngine()
             mgr._model_path = "G:/models/qwen2.5-7b-gguf"
 
         monkeypatch.setattr(mgr, "_load_llama_cpp", fake_llama)
@@ -2322,8 +2330,13 @@ class TestP6SameModelSwitchShortCircuit:
 
         assert second["success"] is True
         assert second.get("reused") is True
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", second["load_fingerprint"])
         assert len(load_calls) == before  # 未触发任何加载
         assert mgr.is_loaded is True
+        status = mgr.get_model_info()
+        assert status["load_fingerprint"] == second["load_fingerprint"]
+        assert status["load_fingerprint_schema"] == 1
+        assert "G:/models" not in status["load_fingerprint"]
 
     def test_same_model_short_circuit_with_explicit_same_path(self, monkeypatch):
         mgr, load_calls = self._loaded_mgr(monkeypatch)
@@ -2348,120 +2361,181 @@ class TestP6SameModelSwitchShortCircuit:
         assert other.get("reused") is None
         assert len(load_calls) > before
 
-
-class TestGemmaLayerRangeAdapter:
-    """Gemma 4 PyTorch 层流水线 adapter（P1，§4.2 模板接线）测试。"""
-
-    def test_load_layer_range_routes_gemma_to_shared_loader(self, monkeypatch):
-        """model_type=gemma 应走 _load_gemma_layer_range（复用 Qwen2 key 布局）。"""
+    def _db_loaded_mgr(self, monkeypatch, tmp_path):
         import model_module
 
-        config = type("Config", (), {
-            "model_type": "gemma",
-            "num_hidden_layers": 42,
-        })()
+        first_path = tmp_path / "first.gguf"
+        second_path = tmp_path / "second.gguf"
+        first_path.write_bytes(b"first")
+        second_path.write_bytes(b"second")
+        entry = {
+            "model_id": "fingerprint-db-model",
+            "name": "Fingerprint DB Model",
+            "model_type": "gguf",
+            "gguf_path": str(first_path),
+            "model_path": "",
+            "sha256": "a" * 64,
+            "revision": "revision-a",
+            "quantization": "Q4_K_M",
+        }
+        db_models = [entry]
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        mgr = ModelManager()
+        load_calls = []
+
+        def fake_llama(path, _profile=None):
+            load_calls.append(("llama_cpp", path))
+            mgr._llama_engine = self._FakeLlamaEngine()
+            mgr._model_path = path
+
+        monkeypatch.setattr(mgr, "_load_llama_cpp", fake_llama)
+        first = mgr.switch_model(
+            entry["model_id"],
+            engine="llama_cpp",
+            db_experimental_models=db_models,
+        )
+        assert first["success"] is True
+        assert len(load_calls) == 1
+        return mgr, load_calls, db_models, first_path, second_path
+
+    def test_registry_path_change_forces_reload(self, monkeypatch, tmp_path):
+        mgr, calls, db_models, _first_path, second_path = self._db_loaded_mgr(
+            monkeypatch, tmp_path,
+        )
+        before_fingerprint = mgr.load_fingerprint
+        db_models[0]["gguf_path"] = str(second_path)
+
+        result = mgr.switch_model(
+            "fingerprint-db-model",
+            engine="llama_cpp",
+            db_experimental_models=db_models,
+        )
+
+        assert result["success"] is True
+        assert result.get("reused") is None
+        assert calls[-1] == ("llama_cpp", str(second_path))
+        assert len(calls) == 2
+        assert result["load_fingerprint"] != before_fingerprint
+
+    @pytest.mark.parametrize("field,new_value", [
+        ("sha256", "b" * 64),
+        ("revision", "revision-b"),
+    ])
+    def test_registry_artifact_identity_change_forces_reload(
+        self, monkeypatch, tmp_path, field, new_value,
+    ):
+        mgr, calls, db_models, _first_path, _second_path = self._db_loaded_mgr(
+            monkeypatch, tmp_path,
+        )
+        before_fingerprint = mgr.load_fingerprint
+        db_models[0][field] = new_value
+
+        result = mgr.switch_model(
+            "fingerprint-db-model",
+            engine="llama_cpp",
+            db_experimental_models=db_models,
+        )
+
+        assert result["success"] is True
+        assert result.get("reused") is None
+        assert len(calls) == 2
+        assert result["load_fingerprint"] != before_fingerprint
+
+    def test_engine_change_forces_reload(self, monkeypatch, tmp_path):
+        model_path = tmp_path / "artifact"
+        model_path.mkdir()
+        mgr = ModelManager()
+        load_calls = []
+
+        def fake_llama(path, _profile=None):
+            load_calls.append("llama_cpp")
+            mgr._llama_engine = self._FakeLlamaEngine()
+            mgr._model_path = path
+
+        def fake_pytorch(path, _quant_type=None, _profile=None):
+            load_calls.append("pytorch")
+            mgr.model = object()
+            mgr._model_path = path
+
+        monkeypatch.setattr(mgr, "_load_llama_cpp", fake_llama)
+        monkeypatch.setattr(mgr, "_load_pytorch", fake_pytorch)
+        first = mgr.switch_model(
+            "external-model", model_path=str(model_path), engine="llama_cpp",
+        )
+        assert first["success"] is True
+
+        result = mgr.switch_model(
+            "external-model", model_path=str(model_path), engine="pytorch",
+        )
+
+        assert result["success"] is True
+        assert result.get("reused") is None
+        assert load_calls == ["llama_cpp", "pytorch"]
+
+    def test_relevant_profile_change_reloads_but_free_vram_does_not(
+        self, monkeypatch, tmp_path,
+    ):
+        mgr, calls, db_models, _first_path, _second_path = self._db_loaded_mgr(
+            monkeypatch, tmp_path,
+        )
+        baseline = {
+            "tier": "laptop",
+            "gpu": {"cuda_available": True, "vram_total_gb": 8, "vram_free_gb": 7},
+        }
+        # Establish a fingerprint with the explicit profile.
+        reloaded = mgr.switch_model(
+            "fingerprint-db-model", profile=baseline, engine="llama_cpp",
+            db_experimental_models=db_models,
+        )
+        assert reloaded.get("reused") is None
+        assert len(calls) == 2
+
+        free_vram_only = {
+            "tier": "laptop",
+            "gpu": {"cuda_available": True, "vram_total_gb": 8, "vram_free_gb": 1},
+        }
+        reused = mgr.switch_model(
+            "fingerprint-db-model", profile=free_vram_only, engine="llama_cpp",
+            db_experimental_models=db_models,
+        )
+        assert reused.get("reused") is True
+        assert len(calls) == 2
+
+        changed_tier = dict(free_vram_only, tier="edge")
+        changed = mgr.switch_model(
+            "fingerprint-db-model", profile=changed_tier, engine="llama_cpp",
+            db_experimental_models=db_models,
+        )
+        assert changed.get("reused") is None
+        assert len(calls) == 3
+
+
+class TestGemmaLayerRangeAdapter:
+    """Gemma 4 must not enter the legacy in-process Qwen2 executor."""
+
+    @pytest.mark.parametrize("model_type", ["gemma", "gemma4_unified"])
+    def test_main_runtime_requires_isolated_sidecar(
+        self, monkeypatch, tmp_path, model_type,
+    ):
+        import model_module
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({
+                "model_type": model_type,
+                "text_config": {"num_hidden_layers": 4},
+            }),
+            encoding="utf-8",
+        )
         monkeypatch.setattr(
             model_module.AutoConfig,
             "from_pretrained",
-            lambda *args, **kwargs: config,
+            lambda *args, **kwargs: pytest.fail(
+                "main runtime AutoConfig must not inspect Gemma 4"
+            ),
         )
-        mgr = ModelManager()
-        mgr._full_model_path = "G:/models/gemma-4-12b"
 
-        calls = []
-        original = mgr._load_gemma_layer_range
-
-        def install_fake_model(*args, **kwargs):
-            calls.append((args, kwargs))
-            fake_layers = nn.ModuleList([nn.Linear(1, 1) for _ in range(42)])
-            fake_model = nn.Module()
-            fake_model.model = nn.Module()
-            fake_model.model.layers = fake_layers
-            fake_model.model.embed_tokens = nn.Embedding(2, 1)
-            fake_model.lm_head = nn.Linear(1, 2)
-            mgr.model = fake_model
-            tracker = _LayerRangeLoadTracker(
-                architecture="gemma",
-                start_layer=0,
-                end_layer=12,
-                layer_prefix="model.layers.",
-                selected_prefixes=[
-                    f"model.layers.{index}." for index in range(12)
-                ],
-                target_dtype=torch.float32,
+        with pytest.raises(RuntimeError, match="隔离 Transformers sidecar"):
+            ModelManager().load_layer_range(
+                0, 2, total_layers=4, model_path=str(tmp_path),
             )
-            tracker.loaded_layers.update(range(12))
-            return tracker
-
-        monkeypatch.setattr(mgr, "_load_gemma_layer_range", install_fake_model)
-        assert original is not None  # 适配器存在（真实方法被替换前）
-
-        mgr.load_layer_range(
-            0, 12, has_embedding=True, has_lm_head=False,
-            total_layers=42,
-        )
-
-        # gemma 分支接线：走 gemma 加载器且裁剪 model.model.layers
-        assert len(calls) == 1
-        assert mgr.layer_range == (0, 12)
-        assert len(mgr.model.model.layers) == 12
-        assert mgr.model.lm_head is None  # has_lm_head=False 裁剪
-        assert mgr._layer_architecture == "gemma"
-
-    def test_gemma_adapter_reuses_qwen2_loader_with_identity(self, monkeypatch):
-        """_load_gemma_layer_range 应把 architecture=gemma 传给共享加载器。"""
-        import model_module
-
-        mgr = ModelManager()
-        forwarded = {}
-
-        def fake_qwen2_loader(
-            model_path, start_layer, end_layer, *, has_embedding,
-            has_lm_head, quant_type=None, profile=None, model_config=None,
-            architecture="qwen2",
-        ):
-            forwarded.update(
-                architecture=architecture,
-                start_layer=start_layer,
-                end_layer=end_layer,
-            )
-            tracker = _LayerRangeLoadTracker(
-                architecture=architecture,
-                start_layer=start_layer,
-                end_layer=end_layer,
-                layer_prefix="model.layers.",
-                selected_prefixes=[f"model.layers.{i}." for i in range(start_layer, end_layer)],
-                target_dtype=torch.float32,
-            )
-            tracker.loaded_layers.update(range(start_layer, end_layer))
-            return tracker
-
-        monkeypatch.setattr(mgr, "_load_qwen2_layer_range", fake_qwen2_loader)
-        tracker = mgr._load_gemma_layer_range(
-            "G:/models/gemma-4-12b", 4, 10,
-            has_embedding=False, has_lm_head=False,
-        )
-        assert forwarded["architecture"] == "gemma"
-        assert forwarded["start_layer"] == 4
-        assert tracker.architecture == "gemma"
-
-    def test_gemma_loader_tracker_prefix_matches_qwen2_layout(self):
-        """Gemma safetensors key 布局断言：model.layers./embed_tokens./norm./lm_head.。"""
-        tracker = _LayerRangeLoadTracker(
-            architecture="gemma",
-            start_layer=2,
-            end_layer=4,
-            layer_prefix="model.layers.",
-            selected_prefixes=[
-                "model.layers.2.", "model.layers.3.", "model.norm.",
-                "model.embed_tokens.", "lm_head.",
-            ],
-            target_dtype=torch.float32,
-        )
-        assert tracker.is_selected("model.layers.2.self_attn.q_proj.weight")
-        assert tracker.is_selected("model.layers.3.mlp.gate_proj.weight")
-        assert tracker.is_selected("model.norm.weight")
-        assert tracker.is_selected("model.embed_tokens.weight")
-        assert tracker.is_selected("lm_head.weight")
-        assert not tracker.is_selected("model.layers.1.self_attn.q_proj.weight")
-        assert not tracker.is_selected("model.layers.4.mlp.down_proj.weight")

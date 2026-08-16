@@ -16,6 +16,9 @@ from typing import Any
 
 
 DESCRIPTOR_SCHEMA_VERSION = 1
+# These model types have an in-process loader and forward executor.  Architectures
+# may still have a metadata/assignment layout below while remaining fail-closed
+# here when they require an isolated runtime.
 PIPELINE_RUNTIME_MODEL_TYPES = frozenset({"qwen", "qwen2"})
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _DTYPE_BYTES = {
@@ -90,8 +93,27 @@ _ARCHITECTURE_LAYOUTS = {
         "lm_head_prefixes": ("lm_head.",),
         "visual_prefixes": ("model.visual.", "visual."),
         "mtp_prefixes": ("mtp.",),
+        "multimodal_prefixes": (),
+    },
+    "gemma4_unified": {
+        "layer_pattern": re.compile(
+            r"^model\.language_model\.layers\.(\d+)\."
+        ),
+        "layer_prefix": "model.language_model.layers.",
+        "embedding_prefixes": ("model.language_model.embed_tokens.",),
+        "final_norm_prefixes": ("model.language_model.norm.",),
+        "lm_head_prefixes": ("lm_head.",),
+        "visual_prefixes": (),
+        "mtp_prefixes": (),
+        "multimodal_prefixes": (
+            "model.embed_vision.",
+            "model.embed_audio.",
+        ),
     },
 }
+
+for _layout in _ARCHITECTURE_LAYOUTS.values():
+    _layout.setdefault("multimodal_prefixes", ())
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -192,6 +214,7 @@ def _component_for_key(key: str, layout: dict[str, Any]) -> tuple[str, int | Non
         ("lm_head", "lm_head_prefixes"),
         ("visual", "visual_prefixes"),
         ("mtp", "mtp_prefixes"),
+        ("multimodal", "multimodal_prefixes"),
     ):
         if any(key.startswith(prefix) for prefix in layout[field]):
             return component, None
@@ -239,6 +262,7 @@ def inspect_pipeline_model(
         "lm_head": 0,
         "visual": 0,
         "mtp": 0,
+        "multimodal": 0,
         "other": 0,
     }
     layer_bytes = [0] * total_layers
@@ -312,7 +336,12 @@ def inspect_pipeline_model(
         "pipeline_runtime_supported": runtime_supported,
         "runtime_block_reason": (
             "" if runtime_supported
-            else f"{model_type} 尚未实现按层执行 adapter"
+            else (
+                "gemma4_unified 需要隔离 Transformers sidecar；"
+                "主运行时禁止复用 Qwen2 执行器"
+                if model_type == "gemma4_unified"
+                else f"{model_type} 尚未实现按层执行 adapter"
+            )
         ),
         "partial_assignment": bool(partial_range),
     }
