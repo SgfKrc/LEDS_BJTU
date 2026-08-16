@@ -16,6 +16,7 @@ PROTOCOL_VERSION = 2
 MIN_PROTOCOL_VERSION = 1
 MAX_PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+FULL_WORKER_KINDS = frozenset({"pc_full_worker", "android_full_worker"})
 
 MESSAGE_TYPES = frozenset({
     "hello",
@@ -1172,13 +1173,13 @@ def _validate_payload(
     _require_exact_fields(payload, fields[message_type], "payload")
     if message_type == "hello":
         _require_string(payload["node_id"], "payload.node_id", pattern=_SAFE_ID)
-        expected_worker_kind = (
-            "pc_diffusion_worker" if version >= 3 else "pc_full_worker"
+        expected_worker_kinds = (
+            {"pc_diffusion_worker"} if version >= 3 else FULL_WORKER_KINDS
         )
-        if payload["worker_kind"] != expected_worker_kind:
+        if payload["worker_kind"] not in expected_worker_kinds:
             raise _error(
                 "unsupported_worker_kind", "payload.worker_kind",
-                f"worker_kind must be {expected_worker_kind}",
+                "worker_kind is not supported for this protocol version",
             )
         _validate_version_range(
             payload["min_version"], payload["max_version"], prefix="payload"

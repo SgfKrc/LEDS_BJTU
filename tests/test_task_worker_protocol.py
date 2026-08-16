@@ -12,6 +12,7 @@ from task_worker_protocol import (
     MESSAGE_TYPES,
     PROTOCOL_NAME,
     WorkerProtocolError,
+    build_message,
     canonical_message_bytes,
     decode_message,
     negotiate_protocol_version,
@@ -188,6 +189,27 @@ def test_v2_offer_requires_exact_model_identity(golden):
     with pytest.raises(WorkerProtocolError) as missing:
         decode_message(offer)
     assert missing.value.code == "invalid_fields"
+
+
+def test_v2_accepts_android_full_worker_role_without_enabling_transport(golden):
+    payload = copy.deepcopy(golden["messages"][0]["payload"])
+    payload.update({
+        "node_id": "android_worker_01",
+        "worker_kind": "android_full_worker",
+        "min_version": 2,
+        "max_version": 2,
+    })
+    payload["capabilities"]["engines"] = ["llama_cpp"]
+    payload["capabilities"]["models"][0]["engine"] = "llama_cpp"
+    hello = build_message(
+        "hello",
+        payload,
+        message_id="msg_android_hello_01",
+        sent_at_ms=1700000000000,
+        version=2,
+    )
+
+    assert hello.payload["worker_kind"] == "android_full_worker"
 
 
 def test_v2_accept_carries_explicit_retryability(golden):

@@ -8,7 +8,7 @@
   M1 迟到结果（旧 attempt 在 winner 提交后到达）  -> winner_already_committed
   M2 重复提交（同 attempt 同 digest）             -> already_committed（幂等）
   M3 冲突重复（同 attempt 不同 digest）           -> winner_digest_mismatch
-  M4 双 winner（第二个 attempt 结果到达）         -> winner_already_committed
+  M4 winner 后第二个 attempt 结果到达             -> winner_already_committed
   M5 epoch 回退（旧 epoch 重放）                  -> attempt_epoch_mismatch
   M6 stale lease（attempt epoch < stage epoch）   -> stale_lease_epoch
   M7 provider 身份错配                            -> provider_identity_mismatch
@@ -184,9 +184,10 @@ def test_m3_conflicting_duplicate_is_rejected(winner_workflow):
     _audit_clean(coordinator)
 
 
-def test_m4_double_winner_second_result_rejected(winner_workflow):
+def test_m4_second_attempt_after_winner_is_rejected(winner_workflow):
     coordinator, _, old_attempt, _ = winner_workflow
-    # 模拟第二个 attempt 也返回结果：用旧 attempt 的身份但新内容（双赢家语义）
+    # 当前运行时没有并发 speculative attempt；这里验证已存在的另一个
+    # attempt 在 winner 后返回时不能成为第二个 winner。
     r = _submit(coordinator, old_attempt, output={"content": "second-winner"})
     assert r["status"] == "rejected"
     assert r["reason"] == "winner_already_committed"
@@ -198,14 +199,16 @@ def test_m4_double_winner_second_result_rejected(winner_workflow):
 def test_m5_epoch_rollback_is_rejected(running_stage):
     coordinator, wf_id, attempts, release, thread, completed, errors = (
         running_stage)
-    old_attempt = attempts[0]  # expired, epoch1
-    r = _submit(coordinator, old_attempt, workflow_id=wf_id,
-                epoch=old_attempt["lease_epoch"] + 99)
+    running = attempts[-1]
+    r = _submit(coordinator, running, workflow_id=wf_id,
+                epoch=running["lease_epoch"] - 1)
     assert r["status"] == "rejected"
     assert r["reason"] == "attempt_epoch_mismatch"
     release.set()
     thread.join(5)
     assert not errors
+    assert completed
+    _audit_clean(coordinator, wf_id)
 
 
 def test_m6_stale_lease_epoch_rejected_before_winner(running_stage):
@@ -218,6 +221,8 @@ def test_m6_stale_lease_epoch_rejected_before_winner(running_stage):
     release.set()
     thread.join(5)
     assert not errors
+    assert completed
+    _audit_clean(coordinator, wf_id)
 
 
 
@@ -234,6 +239,8 @@ def test_m7_provider_identity_mismatch_rejected(running_stage):
     release.set()
     thread.join(5)
     assert not errors
+    assert completed
+    _audit_clean(coordinator, wf_id)
 
 
 def test_m8_attempt_not_owned_by_stage(running_stage):
@@ -254,6 +261,8 @@ def test_m8_attempt_not_owned_by_stage(running_stage):
     release.set()
     thread.join(5)
     assert not errors
+    assert completed
+    _audit_clean(coordinator, wf_id)
 
 
 # ---- M9：终态 ----
@@ -266,19 +275,22 @@ def test_m9_workflow_terminal_rejects_submission():
     registry.register(failing2)
     coordinator = TaskGraphCoordinator(provider_registry=registry)
     try:
-        coordinator.run(_single_stage(), "answer", {"message": "q"},
-                        workflow_id="wf_terminal_matrix")
-    except WorkflowExecutionError:
-        pass  # 全失败 -> 终态，从快照取
-    workflow = coordinator.get("wf_terminal_matrix")
-    stage = workflow["stages"][0]
-    attempt = stage["attempts"][0]
-    assert workflow["state"] in ("failed", "cancelled")
-    r = _submit(coordinator, attempt,
-                workflow_id="wf_terminal_matrix")
-    assert r["status"] == "rejected"
-    assert r["reason"] == "workflow_terminal"
-    coordinator.close()
+        try:
+            coordinator.run(_single_stage(), "answer", {"message": "q"},
+                            workflow_id="wf_terminal_matrix")
+        except WorkflowExecutionError:
+            pass  # 全失败 -> 终态，从快照取
+        workflow = coordinator.get("wf_terminal_matrix")
+        stage = workflow["stages"][0]
+        attempt = stage["attempts"][0]
+        assert workflow["state"] in ("failed", "cancelled")
+        r = _submit(coordinator, attempt,
+                    workflow_id="wf_terminal_matrix")
+        assert r["status"] == "rejected"
+        assert r["reason"] == "workflow_terminal"
+        _audit_clean(coordinator, "wf_terminal_matrix")
+    finally:
+        coordinator.close()
 
 
 # ---- M10：schema ----
@@ -293,22 +305,41 @@ def test_m10_invalid_output_schema_rejected(winner_workflow):
 
 # ---- M11：非 running attempt ----
 
-def test_m11_completed_attempt_cannot_submit_again(winner_workflow):
-    coordinator, _, _, winner = winner_workflow
-    # winner 已 completed：同 attempt 提交 -> 幂等/winner 分支（同 digest）
-    r = _submit(coordinator, winner)
-    assert r["status"] in ("idempotent", "rejected")
-    # 旧 attempt 已 expired：提交 -> 拒绝
-    old_attempt = coordinator.get("wf_fault_matrix")["stages"][0]["attempts"][0]
-    r2 = _submit(coordinator, old_attempt)
-    assert r2["status"] == "rejected"
-    _audit_clean(coordinator)
+def test_m11_non_running_attempt_is_rejected(running_stage):
+    coordinator, wf_id, attempts, release, thread, completed, errors = (
+        running_stage)
+    running = attempts[-1]
+
+    # attempt_not_running 位于 epoch/stage fencing 之后。合法状态机不会留下
+    # “当前 epoch、Stage running、Attempt terminal”的组合，因此本故障注入
+    # 在锁内暂时破坏该单一状态，再在释放 Provider 前恢复。
+    with coordinator._lock:
+        workflow = coordinator._workflows[wf_id]
+        with workflow.lock:
+            attempt = workflow.stages["answer"].attempts[-1]
+            assert attempt.attempt_id == running["attempt_id"]
+            assert attempt.state == "running"
+            attempt.state = "expired"
+    try:
+        r = _submit(coordinator, running, workflow_id=wf_id)
+        assert r["status"] == "rejected"
+        assert r["reason"] == "attempt_not_running"
+    finally:
+        with coordinator._lock:
+            workflow = coordinator._workflows[wf_id]
+            with workflow.lock:
+                workflow.stages["answer"].attempts[-1].state = "running"
+    release.set()
+    thread.join(5)
+    assert not errors
+    assert completed
+    _audit_clean(coordinator, wf_id)
 
 
 # ---- 矩阵汇总：全部注入路径必须拒绝（fail-closed 总量断言） ----
 
-def test_fault_matrix_total_rejection_count(winner_workflow):
-    """汇总执行 M1-M11 全部注入，统计：零未拒绝路径。"""
+def test_winner_guard_batch_has_zero_unaccepted_conflicts(winner_workflow):
+    """批量复核 winner 已提交分支，冲突结果不得被接受。"""
     coordinator, _, old_attempt, winner = winner_workflow
     attempts = [
         ("M1", _submit(coordinator, old_attempt)),
