@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import types
 
+import pytest
+
 from scripts.model_tools.cli import main
 from scripts.model_tools.qwen3_pipeline_smoke import run_qwen3_pipeline_smoke
 from scripts.model_tools import qwen3_pipeline_smoke_worker as worker
@@ -101,6 +103,36 @@ def test_pipeline_cli_returns_one_for_resource_or_runtime_block(capsys, tmp_path
     monkeypatch.setattr("scripts.model_tools.cli.run_qwen3_pipeline_smoke", lambda **kwargs: report)
     assert main(["qwen3-pipeline-smoke", "--model", str(tmp_path), "--start-layer", "0", "--end-layer", "1", "--json"]) == 1
     assert '"runtime_unavailable"' in capsys.readouterr().out
+
+
+def test_cleanup_stale_assignments_removes_legacy_staging(tmp_path):
+    """启动清理：删除模型根下遗留 assignment staging，保留无关目录。"""
+    root = tmp_path / "model-root"
+    root.mkdir()
+    stale = root.parent / ".qlh-qwen3-assignment-stale1"
+    stale.mkdir()
+    (stale / "config.json").write_text("x", encoding="utf-8")
+    keep = root.parent / "unrelated-dir"
+    keep.mkdir()
+
+    worker._cleanup_stale_assignments(root)
+    assert not stale.exists(), "遗留 staging 应被清理"
+    assert keep.exists(), "无关目录不应被误删"
+
+
+def test_prepare_assignment_cleans_up_on_midway_failure(tmp_path):
+    """_prepare_filtered_assignment 中途失败（shard 缺失）时 staging 自清理。"""
+    root = tmp_path / "model-root"
+    root.mkdir()
+    (root / "config.json").write_text('{"model_type": "qwen3"}', encoding="utf-8")
+    # 请求一个不存在的 shard -> _populate 中途抛错
+    before = set(root.parent.glob(".qlh-qwen3-assignment-*"))
+    with pytest.raises(Exception):
+        worker._prepare_filtered_assignment(
+            root, ["missing.key"],
+            {"missing.key": "no-such-shard.safetensors"})
+    after = set(root.parent.glob(".qlh-qwen3-assignment-*"))
+    assert after == before, "中途失败不应留下 staging 残留"
 
 
 def test_cache_length_prefers_expected_sequence_dimension():

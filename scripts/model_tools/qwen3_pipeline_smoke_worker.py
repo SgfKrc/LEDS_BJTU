@@ -242,6 +242,23 @@ def _prepare_filtered_assignment(
     """
     stage = Path(tempfile.mkdtemp(prefix=".qlh-qwen3-assignment-", dir=str(root.parent)))
     try:
+        _populate_filtered_assignment(stage, root, selected_keys, weight_map)
+        return stage
+    except BaseException:
+        # 中途异常（如 shard 缺失/越界）也必须清理 staging——历史上泄漏的
+        # 残留（2026-08-17 清理 3.9G）正是这里未兜底造成的。
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _populate_filtered_assignment(
+    stage: Path,
+    root: Path,
+    selected_keys: list[str],
+    weight_map: dict[str, str],
+) -> None:
+    """填充 staging 内容（从 _prepare_filtered_assignment 拆出，保证自清理兜底）。"""
+    try:
         shutil.copy2(root / "config.json", stage / "config.json")
         # Tokenizer/chat-template support is small and must remain available
         # inside the filtered assignment; weight shards stay hard-link-first.
@@ -284,9 +301,28 @@ def _prepare_filtered_assignment(
         raise
 
 
+def _cleanup_stale_assignments(root: Path) -> None:
+    """清理模型根下历史遗留的 assignment staging（异常退出残留）。
+
+    worker 单实例串行（stdin 同步协议），启动清理不会误删正在使用的目录；
+    只删 `qlh-qwen3-assignment-` 前缀目录（worker 自己的 mkdtemp 命名）。
+    """
+    parent = root.parent
+    if not parent.is_dir():
+        return
+    removed = 0
+    for entry in parent.iterdir():
+        if (entry.name.startswith(".qlh-qwen3-assignment-")
+                and entry.is_dir()):
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+    if removed:
+        print(f"qwen3 pipeline smoke: 清理 {removed} 个遗留 assignment staging",
+              file=sys.stderr)
+
+
 def _base_result(request: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "schema_version": QWEN3_ADAPTER_SCHEMA_VERSION,
+    return {        "schema_version": QWEN3_ADAPTER_SCHEMA_VERSION,
         "tool": TOOL,
         "operation": OPERATION,
         "valid": True,
@@ -685,6 +721,8 @@ def execute_request(
         root = Path(str(request.get("model_path", ""))).expanduser().absolute().resolve(strict=False)
         if not root.is_dir():
             return _error(result, "model_path_invalid", "Qwen3 assignment directory is missing", status="artifact_rejected")
+        # 启动时清理历史遗留 staging（worker 单实例串行；防止异常退出残留累积）
+        _cleanup_stale_assignments(root)
         config = _load_object(root / "config.json")
         model_type = str(config.get("model_type", "") or "").lower()
         total_layers = int(config.get("num_hidden_layers", 0) or 0)
