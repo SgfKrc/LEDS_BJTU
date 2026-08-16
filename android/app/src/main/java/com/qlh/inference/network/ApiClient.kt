@@ -3,18 +3,25 @@ package com.qlh.inference.network
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.qlh.inference.BuildConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.logging.HttpLoggingInterceptor
+import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -183,6 +190,118 @@ data class BootstrapResponse(
 )
 
 // ================================================================
+// Remote SD DTOs (PC /api/diffusion/*)
+// ================================================================
+
+const val DIFFUSION_MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+const val DIFFUSION_MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
+
+data class DiffusionGenerateRequest(
+    @SerializedName("preset_id") val presetId: String? = null,
+    val prompt: String? = null,
+    @SerializedName("negative_prompt") val negativePrompt: String? = null,
+    val seed: Int? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val steps: Int? = null,
+    @SerializedName("guidance_scale") val guidanceScale: Float? = null,
+    val scheduler: String? = null,
+)
+
+data class DiffusionEditRequest(
+    val mode: String,
+    @SerializedName("preset_id") val presetId: String? = null,
+    @SerializedName("source_blob_id") val sourceBlobId: String,
+    @SerializedName("mask_blob_id") val maskBlobId: String? = null,
+    val prompt: String? = null,
+    @SerializedName("negative_prompt") val negativePrompt: String? = null,
+    val seed: Int? = null,
+    val width: Int? = null,
+    val height: Int? = null,
+    val steps: Int? = null,
+    @SerializedName("guidance_scale") val guidanceScale: Float? = null,
+    val scheduler: String? = null,
+    val strength: Float = 0.75f,
+    val instruction: String? = null,
+    @SerializedName("edit_adapter_id") val editAdapterId: String? = null,
+    @SerializedName("conditioning_scale") val conditioningScale: Float? = null,
+    @SerializedName("image_guidance_scale") val imageGuidanceScale: Float? = null,
+    @SerializedName("ip_adapter_scale") val ipAdapterScale: Float? = null,
+)
+
+data class DiffusionBlobUpload(
+    val data: ByteArray,
+    val fileName: String = "input.png",
+    val contentType: String = "image/png",
+    val purpose: String = "input_image",
+)
+
+data class DiffusionProgress(
+    val step: Int = 0,
+    val total: Int = 0,
+)
+
+data class DiffusionBlobDescriptor(
+    @SerializedName("blob_id") val blobId: String = "",
+    @SerializedName("content_type") val contentType: String = "",
+    @SerializedName("size_bytes") val sizeBytes: Long = 0L,
+    val sha256: String = "",
+    val width: Int? = null,
+    val height: Int? = null,
+    val purpose: String? = null,
+    @SerializedName("created_at") val createdAt: Double? = null,
+    @SerializedName("expires_at") val expiresAt: Double? = null,
+)
+
+data class DiffusionJob(
+    @SerializedName("job_id") val jobId: String = "",
+    @SerializedName("artifact_id") val artifactId: String = "",
+    val kind: String = "generate",
+    @SerializedName("owner_scope") val ownerScope: String = "local",
+    @SerializedName("input_blob_ids") val inputBlobIds: List<String> = emptyList(),
+    val state: String = "queued",
+    @SerializedName("created_at") val createdAt: Double? = null,
+    @SerializedName("started_at") val startedAt: Double? = null,
+    @SerializedName("completed_at") val completedAt: Double? = null,
+    val progress: DiffusionProgress = DiffusionProgress(),
+    @SerializedName("cancel_requested") val cancelRequested: Boolean = false,
+    val parameters: Map<String, Any?> = emptyMap(),
+    val blob: DiffusionBlobDescriptor? = null,
+    @SerializedName("output_blob_id") val outputBlobId: String? = null,
+    val metrics: Map<String, Any?> = emptyMap(),
+    val error: String? = null,
+    @SerializedName("error_code") val errorCode: String? = null,
+) {
+    val isTerminal: Boolean
+        get() = state == "completed" || state == "failed" || state == "cancelled"
+}
+
+data class DiffusionCancelResponse(
+    val accepted: Boolean = false,
+    val job: DiffusionJob = DiffusionJob(),
+)
+
+data class DiffusionBlobDownload(
+    val data: ByteArray,
+    val contentType: String = "application/octet-stream",
+    val eTag: String? = null,
+)
+
+data class GgufModelInfo(
+    val filename: String = "",
+    @SerializedName("size_bytes") val sizeBytes: Long = 0L,
+    @SerializedName("size_mb") val sizeMb: Double = 0.0,
+    val sha256: String = "",
+    @SerializedName("download_url") val downloadUrl: String = "",
+)
+
+data class GgufModelsResponse(
+    val models: List<GgufModelInfo> = emptyList(),
+    val exists: Boolean = false,
+    val count: Int = 0,
+)
+
+// ================================================================
 // API 客户端
 // ================================================================
 
@@ -205,6 +324,8 @@ class ApiClient(
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+
+    private val diffusionTerminalStates = setOf("completed", "failed", "cancelled")
 
     // ==================== 聊天 ====================
 
@@ -400,6 +521,195 @@ class ApiClient(
         }
     }
 
+    // ==================== Remote SD ====================
+
+    /** Submit a text-to-image job to the PC diffusion workspace. */
+    suspend fun submitDiffusionGeneration(
+        request: DiffusionGenerateRequest,
+    ): Result<DiffusionJob> = withContext(Dispatchers.IO) {
+        try {
+            postDiffusionJson("/api/diffusion/generate", request, DiffusionJob::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Upload a PNG/JPEG/WebP source image used by img2img/reference/inpaint. */
+    suspend fun uploadDiffusionBlob(
+        upload: DiffusionBlobUpload,
+    ): Result<DiffusionBlobDescriptor> = withContext(Dispatchers.IO) {
+        try {
+            require(upload.data.isNotEmpty()) { "image upload is empty" }
+            require(upload.data.size <= DIFFUSION_MAX_UPLOAD_BYTES) {
+                "image upload exceeds the 16 MiB limit"
+            }
+            require(upload.purpose == "input_image" || upload.purpose == "mask") {
+                "purpose must be input_image or mask"
+            }
+            val multipart = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("purpose", upload.purpose)
+                .addFormDataPart(
+                    "file",
+                    upload.fileName.ifBlank { "input.png" },
+                    upload.data.toRequestBody(upload.contentType.toMediaType()),
+                )
+                .build()
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/diffusion/blobs")
+                .post(multipart)
+                .build()
+            executeJson(request, DiffusionBlobDescriptor::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Submit an image editing job after its source blob has been uploaded. */
+    suspend fun submitDiffusionEdit(
+        request: DiffusionEditRequest,
+    ): Result<DiffusionJob> = withContext(Dispatchers.IO) {
+        try {
+            postDiffusionJson("/api/diffusion/edit", request, DiffusionJob::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Read one remote SD job snapshot. */
+    suspend fun getDiffusionJob(jobId: String): Result<DiffusionJob> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url(diffusionJobUrl(jobId))
+                .get()
+                .build()
+            executeJson(request, DiffusionJob::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Ask the PC service to cancel an active SD job. */
+    suspend fun cancelDiffusionJob(jobId: String): Result<DiffusionCancelResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url(diffusionJobUrl(jobId, "/cancel"))
+                .post(ByteArray(0).toRequestBody(null))
+                .build()
+            executeJson(request, DiffusionCancelResponse::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Download one completed result blob with an Android-side memory bound. */
+    suspend fun downloadDiffusionBlob(blobId: String): Result<DiffusionBlobDownload> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url(diffusionBlobUrl(blobId))
+                .get()
+                .build()
+            val response = executeAsync(request)
+            if (!response.isSuccessful) {
+                val body = response.body?.string() ?: ""
+                return@withContext Result.failure(IOException("HTTP ${response.code}: $body"))
+            }
+            val body = response.body
+                ?: return@withContext Result.failure(IOException("diffusion blob response has no body"))
+            val contentLength = body.contentLength()
+            if (contentLength > DIFFUSION_MAX_DOWNLOAD_BYTES) {
+                body.close()
+                return@withContext Result.failure(
+                    IOException("diffusion blob exceeds the 32 MiB Android download limit"),
+                )
+            }
+            val data = body.byteStream().use { input ->
+                val output = ByteArrayOutputStream()
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    require(output.size() + count <= DIFFUSION_MAX_DOWNLOAD_BYTES) {
+                        "diffusion blob exceeds the 32 MiB Android download limit"
+                    }
+                    output.write(buffer, 0, count)
+                }
+                output.toByteArray()
+            }
+            if (data.isEmpty()) {
+                return@withContext Result.failure(IOException("diffusion blob response is empty"))
+            }
+            Result.success(
+                DiffusionBlobDownload(
+                    data = data,
+                    contentType = body.contentType()?.toString() ?: "application/octet-stream",
+                    eTag = response.header("ETag"),
+                ),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Poll until a terminal snapshot; coroutine cancellation stops polling and its HTTP call. */
+    suspend fun pollDiffusionJob(
+        jobId: String,
+        intervalMillis: Long = 1_000L,
+        maxPolls: Int = 600,
+    ): Result<DiffusionJob> = withContext(Dispatchers.IO) {
+        if (intervalMillis < 0L) {
+            return@withContext Result.failure(IllegalArgumentException("intervalMillis must be non-negative"))
+        }
+        if (maxPolls < 1) {
+            return@withContext Result.failure(IllegalArgumentException("maxPolls must be positive"))
+        }
+        var latest: DiffusionJob? = null
+        repeat(maxPolls) { index ->
+            currentCoroutineContext().ensureActive()
+            val result = getDiffusionJob(jobId)
+            if (result.isFailure) return@withContext Result.failure(result.exceptionOrNull()!!)
+            val job = result.getOrThrow()
+            latest = job
+            if (job.state in diffusionTerminalStates) return@withContext Result.success(job)
+            if (index + 1 < maxPolls) delay(intervalMillis)
+        }
+        Result.failure(TimeoutException("diffusion job did not reach a terminal state: ${latest?.jobId ?: jobId}"))
+    }
+
+    // ==================== Remote GGUF catalog ====================
+
+    suspend fun getGgufModels(): Result<List<GgufModelInfo>> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/models/gguf")
+                .get()
+                .build()
+            executeJson(request, GgufModelsResponse::class.java).map { response ->
+                response.models.filter { model ->
+                    model.filename.endsWith(".gguf", ignoreCase = true) &&
+                        model.sizeBytes > 0L &&
+                        model.sha256.matches(Regex("[a-fA-F0-9]{64}"))
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     // ==================== 内部方法 ====================
 
     private suspend fun executeAsync(request: Request): Response =
@@ -419,6 +729,45 @@ class ApiClient(
                 call.cancel()
             }
         }
+
+    private suspend fun <T> executeJson(request: Request, responseType: Class<T>): Result<T> {
+        val response = executeAsync(request)
+        val body = response.body?.string() ?: "{}"
+        if (!response.isSuccessful) {
+            return Result.failure(IOException("HTTP ${response.code}: $body"))
+        }
+        return Result.success(gson.fromJson(body, responseType))
+    }
+
+    private suspend fun <T> postDiffusionJson(
+        path: String,
+        payload: Any,
+        responseType: Class<T>,
+    ): Result<T> {
+        val body = gson.toJson(payload).toRequestBody(jsonMediaType)
+        val request = Request.Builder()
+            .url("${baseUrl.trimEnd('/')}$path")
+            .post(body)
+            .header("Content-Type", "application/json")
+            .build()
+        return executeJson(request, responseType)
+    }
+
+    private fun diffusionJobUrl(jobId: String, suffix: String = ""): String {
+        requireDiffusionResourceId(jobId, "job")
+        return "${baseUrl.trimEnd('/')}/api/diffusion/jobs/$jobId$suffix"
+    }
+
+    private fun diffusionBlobUrl(blobId: String): String {
+        requireDiffusionResourceId(blobId, "blob")
+        return "${baseUrl.trimEnd('/')}/api/diffusion/blobs/$blobId"
+    }
+
+    private fun requireDiffusionResourceId(value: String, kind: String) {
+        require(value.matches(Regex("[A-Za-z0-9._~-]{1,128}"))) {
+            "invalid diffusion $kind id"
+        }
+    }
 
     // ---- DTO 包装 ----
 

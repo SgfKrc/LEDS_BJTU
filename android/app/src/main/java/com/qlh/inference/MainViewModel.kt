@@ -13,6 +13,10 @@ import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.DiffusionBlobUpload
+import com.qlh.inference.network.DiffusionEditRequest
+import com.qlh.inference.network.DiffusionGenerateRequest
+import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.network.BootstrapRequest
 import com.qlh.inference.network.ChatRepository
@@ -22,6 +26,8 @@ import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -71,6 +77,11 @@ data class MainUiState(
     val selectedModelSizeBytes: Long = 0L,
     val isScanningModels: Boolean = false,
     val modelMessage: String? = null,
+    val remoteModels: List<GgufModelInfo> = emptyList(),
+    val remoteModelsLoading: Boolean = false,
+    val remoteDownloadModelName: String? = null,
+    val remoteDownloadProgress: ModelManager.DownloadProgress? = null,
+    val remoteModelMessage: String? = null,
 
     // 本地运行时状态
     val runtimeStatus: AndroidRuntimeStatus? = null,
@@ -80,7 +91,10 @@ data class MainUiState(
 
     // 上次发送的消息（用于重试）
     val lastSentMessage: String? = null,
-    val lastSentImageDataUrls: List<String> = emptyList()
+    val lastSentImageDataUrls: List<String> = emptyList(),
+
+    // Remote PC Stable Diffusion workspace
+    val diffusion: DiffusionUiState = DiffusionUiState(),
 )
 
 // ================================================================
@@ -98,6 +112,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private var lastAutoRegisterKey: String = ""
+    private var diffusionJob: Job? = null
 
     // ---- 仓库（根据模式动态创建 ApiClient 或使用本地引擎） ----
     private val repository = ChatRepository(
@@ -413,6 +428,123 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearError() {
         _uiState.value = clearMessageError(_uiState.value)
+    }
+
+    // ==================== 远程图像生成 ====================
+
+    /** Submit text-to-image or reference-image img2img work to the configured PC node. */
+    fun submitDiffusion(
+        request: DiffusionGenerateRequest,
+        referenceImage: DiffusionBlobUpload? = null,
+    ) {
+        if (_uiState.value.diffusion.isBusy || request.prompt.orEmpty().isBlank()) {
+            if (request.prompt.orEmpty().isBlank()) {
+                _uiState.value = _uiState.value.copy(
+                    diffusion = failDiffusion(_uiState.value.diffusion, "请输入提示词"),
+                )
+            }
+            return
+        }
+        diffusionJob?.cancel()
+        val initial = startDiffusionSubmission(_uiState.value.diffusion, referenceImage != null)
+        _uiState.value = _uiState.value.copy(diffusion = initial)
+        diffusionJob = viewModelScope.launch {
+            val client = ApiClient(httpBaseUrl(_uiState.value.serverHost, _uiState.value.serverPort))
+            try {
+                val submitted = if (referenceImage != null) {
+                    val blob = client.uploadDiffusionBlob(referenceImage).getOrThrow()
+                    _uiState.value = _uiState.value.copy(
+                        diffusion = _uiState.value.diffusion.copy(state = "submitting"),
+                    )
+                    client.submitDiffusionEdit(
+                        DiffusionEditRequest(
+                            mode = "img2img",
+                            sourceBlobId = blob.blobId,
+                            prompt = request.prompt,
+                            negativePrompt = request.negativePrompt,
+                            seed = request.seed,
+                            width = request.width,
+                            height = request.height,
+                            steps = request.steps,
+                            guidanceScale = request.guidanceScale,
+                            scheduler = request.scheduler,
+                        ),
+                    ).getOrThrow()
+                } else {
+                    client.submitDiffusionGeneration(request).getOrThrow()
+                }
+                _uiState.value = _uiState.value.copy(
+                    diffusion = applyDiffusionJob(_uiState.value.diffusion, submitted),
+                )
+
+                val terminal = client.pollDiffusionJob(
+                    submitted.jobId,
+                    intervalMillis = 1_000L,
+                    maxPolls = 1_800,
+                ).getOrThrow()
+                _uiState.value = _uiState.value.copy(
+                    diffusion = applyDiffusionJob(_uiState.value.diffusion, terminal),
+                )
+                if (terminal.state != "completed") return@launch
+
+                val outputBlobId = terminal.outputBlobId ?: terminal.blob?.blobId
+                if (outputBlobId.isNullOrBlank()) {
+                    throw IllegalStateException("任务已完成但没有结果图片")
+                }
+                _uiState.value = _uiState.value.copy(
+                    diffusion = beginDiffusionResultDownload(
+                        _uiState.value.diffusion,
+                        outputBlobId,
+                    ),
+                )
+                val output = client.downloadDiffusionBlob(outputBlobId).getOrThrow()
+                _uiState.value = _uiState.value.copy(
+                    diffusion = completeDiffusionResultDownload(
+                        _uiState.value.diffusion,
+                        output.data,
+                        output.contentType,
+                    ),
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                QlhLogger.e("MainViewModel", "remote diffusion failed", e)
+                _uiState.value = _uiState.value.copy(
+                    diffusion = failDiffusion(
+                        _uiState.value.diffusion,
+                        e.message ?: "远程图像生成失败",
+                    ),
+                )
+            } finally {
+                diffusionJob = null
+            }
+        }
+    }
+
+    /** Request cancellation on the PC and keep polling for its terminal acknowledgement. */
+    fun cancelDiffusion() {
+        val current = _uiState.value.diffusion
+        val jobId = current.jobId ?: return
+        if (!current.canCancel) return
+        val cancelling = markDiffusionCancelling(current)
+        _uiState.value = _uiState.value.copy(diffusion = cancelling)
+        viewModelScope.launch {
+            val client = ApiClient(httpBaseUrl(_uiState.value.serverHost, _uiState.value.serverPort))
+            client.cancelDiffusionJob(jobId)
+                .onSuccess { response ->
+                    _uiState.value = _uiState.value.copy(
+                        diffusion = applyDiffusionJob(_uiState.value.diffusion, response.job),
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        diffusion = current.copy(
+                            error = error.message ?: "取消图像任务失败",
+                            isCancelling = false,
+                        ),
+                    )
+                }
+        }
     }
 
     fun refreshRuntimeStatus() {
@@ -767,6 +899,75 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 refreshRuntimeStatus()
             }.onFailure { e ->
                 _uiState.value = _uiState.value.copy(modelMessage = "删除模型失败: ${e.message}")
+            }
+        }
+    }
+
+    fun refreshRemoteModels() {
+        if (_uiState.value.remoteModelsLoading || _uiState.value.remoteDownloadModelName != null) return
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(remoteModelsLoading = true, remoteModelMessage = null)
+            ApiClient(httpBaseUrl(state.serverHost, state.serverPort)).getGgufModels()
+                .onSuccess { models ->
+                    _uiState.value = _uiState.value.copy(
+                        remoteModels = models,
+                        remoteModelsLoading = false,
+                        remoteModelMessage = if (models.isEmpty()) {
+                            "主节点没有可下载的 GGUF 模型"
+                        } else {
+                            "主节点提供 ${models.size} 个已校验模型"
+                        },
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        remoteModelsLoading = false,
+                        remoteModelMessage = "获取主节点模型失败: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun downloadRemoteModel(model: GgufModelInfo) {
+        if (_uiState.value.remoteDownloadModelName != null) return
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                remoteDownloadModelName = model.filename,
+                remoteDownloadProgress = null,
+                remoteModelMessage = null,
+            )
+            try {
+                unloadRunningModel()
+                modelManager.downloadRemoteModel(
+                    model = model,
+                    baseUrl = httpBaseUrl(state.serverHost, state.serverPort),
+                ).collect { progress ->
+                    _uiState.value = _uiState.value.copy(
+                        remoteDownloadProgress = progress,
+                    )
+                }
+                val selected = modelManager.getSelectedModel()
+                _uiState.value = _uiState.value.copy(
+                    selectedModelUri = selected?.uri?.toString().orEmpty(),
+                    selectedModelName = selected?.name.orEmpty(),
+                    selectedModelSizeBytes = selected?.sizeBytes ?: 0L,
+                    remoteModelMessage = "模型已下载并通过 SHA-256 校验",
+                )
+                refreshModels(showMessage = false)
+                refreshRuntimeStatus()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                QlhLogger.e("MainViewModel", "remote model download failed", error)
+                _uiState.value = _uiState.value.copy(
+                    remoteModelMessage = "模型下载失败: ${error.message ?: error.javaClass.simpleName}",
+                )
+            } finally {
+                _uiState.value = _uiState.value.copy(
+                    remoteDownloadModelName = null,
+                )
             }
         }
     }

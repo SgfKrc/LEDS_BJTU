@@ -24,6 +24,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FolderOpen
@@ -39,6 +40,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -68,6 +70,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
@@ -119,6 +122,13 @@ fun SettingsScreen(
     runtimeStatusError: String?,
     onRefreshRuntimeStatus: () -> Unit,
     onConnectionTestSuccess: () -> Unit = {},
+    remoteModels: List<GgufModelInfo> = emptyList(),
+    remoteModelsLoading: Boolean = false,
+    remoteDownloadModelName: String? = null,
+    remoteDownloadProgress: ModelManager.DownloadProgress? = null,
+    remoteModelMessage: String? = null,
+    onRefreshRemoteModels: () -> Unit = {},
+    onDownloadRemoteModel: (GgufModelInfo) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isLite = BuildConfig.IS_LITE
@@ -178,6 +188,19 @@ fun SettingsScreen(
                         onRefreshModels = onRefreshModels,
                         onModelSelected = onModelSelected,
                         onDeleteSelectedModel = onDeleteSelectedModel
+                    )
+                }
+
+                SettingsGroup(title = "主节点模型", icon = Icons.Default.CloudDownload) {
+                    RemoteModelPanel(
+                        modelTreeUri = modelTreeUri,
+                        models = remoteModels,
+                        loading = remoteModelsLoading,
+                        activeModelName = remoteDownloadModelName,
+                        progress = remoteDownloadProgress,
+                        message = remoteModelMessage,
+                        onRefresh = onRefreshRemoteModels,
+                        onDownload = onDownloadRemoteModel,
                     )
                 }
             }
@@ -578,6 +601,144 @@ private fun ParamLabel(label: String, value: String) {
 // ================================================================
 // 模型管理
 // ================================================================
+
+@Composable
+private fun RemoteModelPanel(
+    modelTreeUri: String,
+    models: List<GgufModelInfo>,
+    loading: Boolean,
+    activeModelName: String?,
+    progress: ModelManager.DownloadProgress?,
+    message: String?,
+    onRefresh: () -> Unit,
+    onDownload: (GgufModelInfo) -> Unit,
+) {
+    val busy = activeModelName != null
+    Column(
+        modifier = Modifier.testTag("remote_model_panel"),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "从当前主节点下载 GGUF 到已授权目录",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(
+                onClick = onRefresh,
+                enabled = !loading && !busy,
+                modifier = Modifier.testTag("remote_model_refresh"),
+            ) {
+                if (loading) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("刷新")
+            }
+        }
+
+        if (modelTreeUri.isBlank()) {
+            Text(
+                text = "请先在模型管理中选择存储目录。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+
+        activeModelName?.let { filename ->
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("remote_model_progress"),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = filename,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val current = progress
+                if (current != null) {
+                    LinearProgressIndicator(
+                        progress = { current.percent.coerceIn(0, 100) / 100f },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        text = when (current.phase) {
+                            "verifying" -> "正在校验 SHA-256"
+                            "completed" -> "校验完成"
+                            else -> "${formatBytes(current.downloadedBytes)} / ${formatBytes(current.totalBytes)} (${current.percent}%)"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Text("准备下载", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+
+        if (models.isNotEmpty()) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                models.forEach { model ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("remote_model_${model.filename}"),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = model.filename,
+                                style = MaterialTheme.typography.bodyMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = "${formatBytes(model.sizeBytes)} · SHA-256 ${model.sha256.take(12)}…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { onDownload(model) },
+                            enabled = modelTreeUri.isNotBlank() && !busy && !loading,
+                            modifier = Modifier.testTag("remote_model_download_${model.filename}"),
+                        ) {
+                            Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("下载")
+                        }
+                    }
+                }
+            }
+        }
+
+        message?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (it.contains("失败") || it.contains("无效")) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
+                modifier = Modifier.testTag("remote_model_message"),
+            )
+        }
+    }
+}
 
 @Composable
 private fun ModelManagementPanel(

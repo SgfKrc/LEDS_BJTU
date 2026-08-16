@@ -11,13 +11,17 @@ import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.model.Gemma4AssetFile
 import com.qlh.inference.model.Gemma4NativeAssetStatus
 import com.qlh.inference.model.Gemma4NativeAssets
+import com.qlh.inference.network.GgufModelInfo
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -505,6 +509,243 @@ class ModelManager(private val context: Context) {
     }
 
     // ================================================================
+    // Remote PC GGUF distribution to user-owned SAF storage
+    // ================================================================
+
+    fun downloadRemoteModel(
+        model: GgufModelInfo,
+        baseUrl: String,
+    ): Flow<DownloadProgress> = flow {
+        validateRemoteModel(model)
+        val treeUri = getSavedTreeUri()
+            ?: throw IOException("请先选择模型存储目录")
+        if (!hasPersistedPermission(treeUri)) {
+            throw IOException("模型目录授权已失效，请重新选择目录")
+        }
+
+        val existingFinal = findDirectSafChild(treeUri, model.filename)
+        if (existingFinal != null && getSize(existingFinal) == model.sizeBytes) {
+            emit(DownloadProgress(model.sizeBytes, model.sizeBytes, 100, phase = "verifying"))
+            if (computeSha256(existingFinal) == model.sha256.lowercase()) {
+                selectDownloadedSafModel(existingFinal)
+                emit(
+                    DownloadProgress(
+                        model.sizeBytes,
+                        model.sizeBytes,
+                        100,
+                        phase = "completed",
+                        verified = true,
+                    ),
+                )
+                return@flow
+            }
+        }
+
+        val partialName = "${model.filename}.part"
+        var partialUri = findDirectSafChild(treeUri, partialName)
+            ?: createSafDocument(treeUri, partialName)
+        var existingBytes = getSize(partialUri).coerceAtLeast(0L)
+        if (existingBytes >= model.sizeBytes) {
+            if (
+                existingBytes == model.sizeBytes &&
+                computeSha256(partialUri) == model.sha256.lowercase()
+            ) {
+                partialUri = promoteSafDownload(treeUri, partialUri, model.filename, existingFinal)
+                selectDownloadedSafModel(partialUri)
+                emit(
+                    DownloadProgress(
+                        model.sizeBytes,
+                        model.sizeBytes,
+                        100,
+                        phase = "completed",
+                        verified = true,
+                    ),
+                )
+                return@flow
+            }
+            existingBytes = 0L
+        }
+
+        val downloadUrl = baseUrl.trimEnd('/').toHttpUrl().newBuilder()
+            .addPathSegments("api/models/download")
+            .addPathSegment(model.filename)
+            .build()
+        val request = Request.Builder()
+            .url(downloadUrl)
+            .get()
+            .apply {
+                if (existingBytes > 0L) header("Range", "bytes=$existingBytes-")
+            }
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("模型下载失败: HTTP ${response.code}")
+            }
+            val body = response.body ?: throw IOException("模型下载响应体为空")
+            val plan = try {
+                planModelDownloadWrite(
+                    existingBytes = existingBytes,
+                    statusCode = response.code,
+                    contentLength = body.contentLength(),
+                    contentRange = response.header("Content-Range"),
+                    expectedTotalBytes = model.sizeBytes,
+                )
+            } catch (error: IllegalArgumentException) {
+                throw IOException("模型续传响应无效: ${error.message}", error)
+            }
+            val descriptor = context.contentResolver.openFileDescriptor(partialUri, "rw")
+                ?: throw IOException("无法写入模型临时文件")
+            ParcelFileDescriptor.AutoCloseOutputStream(descriptor).use { output ->
+                if (plan.append) {
+                    output.channel.position(plan.startBytes)
+                } else {
+                    output.channel.truncate(0L)
+                    output.channel.position(0L)
+                }
+                body.byteStream().use { input ->
+                    val buffer = ByteArray(1024 * 1024)
+                    var downloaded = plan.startBytes
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        downloaded += count
+                        if (downloaded > model.sizeBytes) {
+                            throw IOException("模型下载大小超过清单声明")
+                        }
+                        emit(
+                            DownloadProgress(
+                                downloadedBytes = downloaded,
+                                totalBytes = model.sizeBytes,
+                                percent = (downloaded * 100.0 / model.sizeBytes)
+                                    .toInt().coerceIn(0, 100),
+                                phase = "downloading",
+                            ),
+                        )
+                    }
+                    output.flush()
+                    if (downloaded != model.sizeBytes) {
+                        throw IOException("模型下载不完整: $downloaded/${model.sizeBytes} bytes")
+                    }
+                }
+            }
+        }
+
+        emit(DownloadProgress(model.sizeBytes, model.sizeBytes, 100, phase = "verifying"))
+        val actualSha256 = computeSha256(partialUri)
+        if (actualSha256 != model.sha256.lowercase()) {
+            runCatching { DocumentsContract.deleteDocument(context.contentResolver, partialUri) }
+            throw IOException("模型 SHA-256 校验失败")
+        }
+
+        partialUri = promoteSafDownload(treeUri, partialUri, model.filename, existingFinal)
+        selectDownloadedSafModel(partialUri)
+        emit(
+            DownloadProgress(
+                model.sizeBytes,
+                model.sizeBytes,
+                100,
+                phase = "completed",
+                verified = true,
+            ),
+        )
+    }.flowOn(Dispatchers.IO)
+
+    private fun validateRemoteModel(model: GgufModelInfo) {
+        require(model.filename.endsWith(GGUF_EXTENSION, ignoreCase = true)) {
+            "远端模型必须是 GGUF 文件"
+        }
+        require(
+            model.filename.length in 1..255 &&
+                '/' !in model.filename && '\\' !in model.filename && ".." !in model.filename
+        ) { "远端模型文件名无效" }
+        require(model.sizeBytes > 0L) { "远端模型大小无效" }
+        require(model.sha256.matches(Regex("[a-fA-F0-9]{64}"))) {
+            "远端模型缺少有效 SHA-256"
+        }
+    }
+
+    private fun findDirectSafChild(treeUri: Uri, displayName: String): Uri? {
+        val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, rootId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
+        context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIndex = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                if (
+                    cursor.getString(nameIndex) == displayName &&
+                    cursor.getString(mimeIndex) != DocumentsContract.Document.MIME_TYPE_DIR
+                ) {
+                    return DocumentsContract.buildDocumentUriUsingTree(
+                        treeUri,
+                        cursor.getString(idIndex),
+                    )
+                }
+            }
+        }
+        return null
+    }
+
+    private fun createSafDocument(treeUri: Uri, displayName: String): Uri {
+        val parent = DocumentsContract.buildDocumentUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri),
+        )
+        return DocumentsContract.createDocument(
+            context.contentResolver,
+            parent,
+            "application/octet-stream",
+            displayName,
+        ) ?: throw IOException("无法在模型目录创建 $displayName")
+    }
+
+    private fun promoteSafDownload(
+        treeUri: Uri,
+        partialUri: Uri,
+        finalName: String,
+        previousFinal: Uri?,
+    ): Uri {
+        if (previousFinal != null && previousFinal != partialUri) {
+            if (!DocumentsContract.deleteDocument(context.contentResolver, previousFinal)) {
+                throw IOException("无法替换旧模型文件: $finalName")
+            }
+        }
+        return DocumentsContract.renameDocument(
+            context.contentResolver,
+            partialUri,
+            finalName,
+        ) ?: findDirectSafChild(treeUri, finalName)
+        ?: throw IOException("模型已校验，但无法将临时文件重命名为 $finalName")
+    }
+
+    private fun computeSha256(uri: Uri): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        } ?: throw IOException("无法读取模型文件进行 SHA-256 校验")
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private suspend fun selectDownloadedSafModel(uri: Uri) {
+        settings.setSelectedModelUri(uri.toString())
+        settings.setModelStorageMode(STORAGE_MODE_SAF_FD)
+        settings.clearModelPath()
+    }
+
+    // ================================================================
     // 旧内部目录下载/校验 API（保留给 PC 下载和测试模式）
     // ================================================================
 
@@ -532,15 +773,22 @@ class ModelManager(private val context: Context) {
             throw IOException("下载失败: HTTP ${response.code} ${response.message}")
         }
 
-        val contentLength = response.body?.contentLength() ?: -1L
-        val totalExpected = if (contentLength > 0) existingBytes + contentLength else -1L
-        val inputStream = response.body?.byteStream()
-            ?: throw IOException("响应体为空")
-        val outputStream = FileOutputStream(tmpFile, existingBytes > 0)
+        val responseBody = response.body ?: throw IOException("响应体为空")
+        val contentLength = responseBody.contentLength()
+        val append = existingBytes > 0L && response.code == 206 &&
+            response.header("Content-Range")?.startsWith("bytes $existingBytes-") == true
+        if (existingBytes > 0L && response.code == 206 && !append) {
+            response.close()
+            throw IOException("续传响应的 Content-Range 与本地临时文件不一致")
+        }
+        val startBytes = if (append) existingBytes else 0L
+        val totalExpected = if (contentLength > 0) startBytes + contentLength else -1L
+        val inputStream = responseBody.byteStream()
+        val outputStream = FileOutputStream(tmpFile, append)
 
         try {
             val buffer = ByteArray(8192)
-            var downloaded = existingBytes
+            var downloaded = startBytes
             var bytesRead: Int
 
             while (inputStream.read(buffer).also { bytesRead = it } != -1) {
@@ -717,7 +965,9 @@ class ModelManager(private val context: Context) {
     data class DownloadProgress(
         val downloadedBytes: Long,
         val totalBytes: Long,
-        val percent: Int
+        val percent: Int,
+        val phase: String = "downloading",
+        val verified: Boolean = false,
     )
 
     data class LocalModelInfo(

@@ -5,6 +5,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.ui.theme.QlhTheme
@@ -53,25 +54,53 @@ class SettingsScreenTest {
         composeRule.onNodeWithTag("settings_theme_system").assertIsDisplayed().assertIsEnabled()
     }
 
+    @Test
+    fun remoteModelCatalogShowsVerifiedModelAndEmitsDownload() {
+        var selected: GgufModelInfo? = null
+        val model = GgufModelInfo(
+            filename = "tiny.gguf",
+            sizeBytes = 1_048_576L,
+            sizeMb = 1.0,
+            sha256 = "a".repeat(64),
+            downloadUrl = "/api/models/download/tiny.gguf",
+        )
+
+        setSettingsContent(
+            themeMode = "system",
+            inferenceMode = "full",
+            modelTreeUri = "content://example/tree/models",
+            remoteModels = listOf(model),
+            onDownloadRemoteModel = { selected = it },
+        )
+
+        composeRule.onNodeWithTag("remote_model_panel").assertIsDisplayed()
+        composeRule.onNodeWithTag("remote_model_download_tiny.gguf").assertIsEnabled().performClick()
+        composeRule.runOnIdle { assertEquals(model, selected) }
+    }
+
     private fun setSettingsContent(
         themeMode: String,
         darkTheme: Boolean = false,
+        inferenceMode: String = "thin",
+        modelTreeUri: String = "",
+        remoteModels: List<GgufModelInfo> = emptyList(),
         onThemeModeChange: (String) -> Unit = {},
         onRefreshRuntimeStatus: () -> Unit = {},
+        onDownloadRemoteModel: (GgufModelInfo) -> Unit = {},
     ) {
         composeRule.setContent {
             QlhTheme(darkTheme = darkTheme) {
                 SettingsScreen(
                     serverHost = "100.64.0.1",
                     serverPort = 8000,
-                    inferenceMode = "thin",
+                    inferenceMode = inferenceMode,
                     maxTokens = 512,
                     temperature = 0.7f,
                     topP = 0.9f,
                     contextSize = 2048,
                     showThinking = false,
                     themeMode = themeMode,
-                    modelTreeUri = "",
+                    modelTreeUri = modelTreeUri,
                     selectedModelUri = "",
                     modelStorageMode = "saf",
                     availableModels = emptyList<ModelManager.ModelDocument>(),
@@ -96,6 +125,8 @@ class SettingsScreenTest {
                     runtimeStatusLoading = false,
                     runtimeStatusError = null,
                     onRefreshRuntimeStatus = onRefreshRuntimeStatus,
+                    remoteModels = remoteModels,
+                    onDownloadRemoteModel = onDownloadRemoteModel,
                 )
             }
         }

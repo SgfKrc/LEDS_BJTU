@@ -327,6 +327,147 @@ class ApiClientContractTest {
         assertEquals("/api/bootstrap/first-connect", seen?.path)
     }
 
+    // ---- remote diffusion ----
+
+    @Test
+    fun `diffusion generation serializes PC request and parses job`() {
+        var seen: Request? = null
+        route("/api/diffusion/generate") { req, reply ->
+            seen = req
+            reply(202, """{"job_id":"sdjob_1","state":"queued","progress":{"step":0,"total":28}}""")
+        }
+
+        val result = runBlocking {
+            client.submitDiffusionGeneration(
+                DiffusionGenerateRequest(
+                    presetId = "sd15_original_v1",
+                    prompt = "a lighthouse",
+                    negativePrompt = "blurry",
+                    seed = 7,
+                    steps = 28,
+                )
+            )
+        }
+        assertTrue("generation failed: ${result.exceptionOrNull()}", result.isSuccess)
+        assertEquals("sdjob_1", result.getOrNull()?.jobId)
+        assertEquals("queued", result.getOrNull()?.state)
+        assertEquals("POST", seen?.method)
+        assertTrue(seen!!.body.contains("\"preset_id\":\"sd15_original_v1\""))
+        assertTrue(seen!!.body.contains("\"steps\":28"))
+    }
+
+    @Test
+    fun `diffusion blob upload uses multipart purpose and file`() {
+        var seen: Request? = null
+        route("/api/diffusion/blobs") { req, reply ->
+            seen = req
+            reply(201, """{"blob_id":"img_1","content_type":"image/png","size_bytes":8,"sha256":"abc"}""")
+        }
+
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(
+                    data = "png-data".toByteArray(),
+                    fileName = "reference.png",
+                    contentType = "image/png",
+                )
+            )
+        }
+        assertTrue("upload failed: ${result.exceptionOrNull()}", result.isSuccess)
+        assertEquals("img_1", result.getOrNull()?.blobId)
+        assertEquals("POST", seen?.method)
+        assertTrue(seen!!.body.contains("name=\"purpose\""))
+        assertTrue(seen!!.body.contains("input_image"))
+        assertTrue(seen!!.body.contains("filename=\"reference.png\""))
+        assertTrue(seen!!.body.contains("png-data"))
+    }
+
+    @Test
+    fun `diffusion edit and cancellation use job endpoints`() {
+        var editBody = ""
+        route("/api/diffusion/edit") { req, reply ->
+            editBody = req.body
+            reply(202, """{"job_id":"sdedit_1","kind":"edit","state":"queued"}""")
+        }
+        route("/api/diffusion/jobs/sdedit_1/cancel") { req, reply ->
+            assertEquals("POST", req.method)
+            reply(200, """{"accepted":true,"job":{"job_id":"sdedit_1","state":"queued","cancel_requested":true}}""")
+        }
+
+        val edit = runBlocking {
+            client.submitDiffusionEdit(
+                DiffusionEditRequest(
+                    mode = "reference",
+                    sourceBlobId = "img_1",
+                    prompt = "same subject",
+                    editAdapterId = "ip-adapter",
+                    ipAdapterScale = 0.65f,
+                )
+            )
+        }
+        assertTrue("edit failed: ${edit.exceptionOrNull()}", edit.isSuccess)
+        assertEquals("sdedit_1", edit.getOrNull()?.jobId)
+        assertTrue(editBody.contains("\"source_blob_id\":\"img_1\""))
+        assertTrue(editBody.contains("\"ip_adapter_scale\":0.65"))
+
+        val cancelled = runBlocking { client.cancelDiffusionJob("sdedit_1") }
+        assertTrue("cancel failed: ${cancelled.exceptionOrNull()}", cancelled.isSuccess)
+        assertTrue(cancelled.getOrNull()?.accepted == true)
+        assertEquals("sdedit_1", cancelled.getOrNull()?.job?.jobId)
+    }
+
+    @Test
+    fun `diffusion polling stops at terminal state and rejects invalid job id`() {
+        var calls = 0
+        route("/api/diffusion/jobs/sdjob_poll") { _, reply ->
+            calls += 1
+            if (calls == 1) {
+                reply(200, """{"job_id":"sdjob_poll","state":"running"}""")
+            } else {
+                reply(200, """{"job_id":"sdjob_poll","state":"completed","output_blob_id":"out_1"}""")
+            }
+        }
+
+        val polled = runBlocking {
+            client.pollDiffusionJob("sdjob_poll", intervalMillis = 0L, maxPolls = 3)
+        }
+        assertTrue("poll failed: ${polled.exceptionOrNull()}", polled.isSuccess)
+        assertEquals("completed", polled.getOrNull()?.state)
+        assertEquals(2, calls)
+
+        val invalid = runBlocking { client.getDiffusionJob("bad/id") }
+        assertTrue(invalid.isFailure)
+    }
+
+    @Test
+    fun `diffusion result download reads blob bytes and rejects missing blob`() {
+        route("/api/diffusion/blobs/out_1") { req, reply ->
+            assertEquals("GET", req.method)
+            reply(200, "png-result")
+        }
+        val downloaded = runBlocking { client.downloadDiffusionBlob("out_1") }
+        assertTrue("download failed: ${downloaded.exceptionOrNull()}", downloaded.isSuccess)
+        assertEquals("png-result", downloaded.getOrThrow().data.toString(Charsets.UTF_8))
+
+        route("/api/diffusion/blobs/missing") { _, reply -> reply(404, "not found") }
+        assertTrue(runBlocking { client.downloadDiffusionBlob("missing") }.isFailure)
+    }
+
+    @Test
+    fun `gguf catalog parses verified models and drops incomplete entries`() {
+        route("/api/models/gguf") { req, reply ->
+            assertEquals("GET", req.method)
+            reply(
+                200,
+                """{"models":[{"filename":"qwen.gguf","size_bytes":1024,"sha256":"${"a".repeat(64)}","download_url":"/api/models/download/qwen.gguf"},{"filename":"broken.gguf","size_bytes":0,"sha256":""}],"exists":true,"count":2}""",
+            )
+        }
+        val models = runBlocking { client.getGgufModels() }.getOrThrow()
+        assertEquals(1, models.size)
+        assertEquals("qwen.gguf", models[0].filename)
+        assertEquals(1024L, models[0].sizeBytes)
+    }
+
     @Test
     fun `network unreachable returns failure`() {
         val unreachable = ApiClient(baseUrl = "http://127.0.0.1:1")
