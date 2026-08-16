@@ -13,6 +13,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+_TEST_TMP = Path("D:/qlh_tmp")
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -153,7 +155,7 @@ def test_verify_restores_dedup_links(fake_assets):
 def test_verify_detects_tamper(fake_assets):
     bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
     # 篡改包内一个文件后 verify 必须失败
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=_TEST_TMP) as td:
         tmp = Path(td)
         with zipfile.ZipFile(bundle) as zf:
             zf.extractall(tmp)

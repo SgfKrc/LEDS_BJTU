@@ -75,6 +75,16 @@ ASSETS: dict[str, dict] = {
     },
 }
 
+PRUNE_SD_ZIPS = False  # --prune-sd-zips 时置 True
+
+# 临时目录放 D 盘（系统盘只有 ~11GB，verify/staging 会写几十 GB）
+TMP_BASE = Path(os.environ.get("QLH_BUNDLE_TMP", "D:/qlh_tmp"))
+try:
+    TMP_BASE.mkdir(parents=True, exist_ok=True)
+except OSError:
+    TMP_BASE = Path(tempfile.gettempdir())  # 兜底系统临时目录
+
+
 PC_ASSETS = ("qwen18b-safetensors", "qwen18b-gguf", "qwen3-4b-gguf",
              "gemma4-native", "sd15-assets")
 ANDROID_ASSETS = ("qwen18b-gguf", "qwen3-4b-gguf")
@@ -184,6 +194,10 @@ def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
                         "src": str(staging_target), "path": bundle_path,
                         "size": info.file_size, "sha256": digest,
                     })
+            if PRUNE_SD_ZIPS:
+                # 源 zip 可重建（package_sd15_assets.py），处理完即删以省空间
+                fp.unlink()
+                sidecar.unlink(missing_ok=True)
         if not files:
             raise BundleError(
                 f"资产 {asset_id}: {root} 无离线包（先跑 download_sd15 / 导入离线包）")
@@ -303,7 +317,7 @@ def _build_bundle_7z(bundle_path, collected_all, manifest_json,
         parts.append((OUT_DIR / f".staging-{variant}", [f["path"] for f in sd15_files]))
     if bundle_path.exists():
         bundle_path.unlink()
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
         staging = Path(td)
         (staging / "MANIFEST.json").write_text(manifest_json, encoding="utf-8")
         (staging / "CHECKSUMS.sha256").write_text(
@@ -351,7 +365,7 @@ def _import_readme(variant: str, manifest_json: str) -> str:
 
 def _verify_bundle(bundle_path: Path) -> None:
     """解包到临时目录，恢复 dedup 链接后逐文件 SHA 比对（7z/分卷/zip）。"""
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
         tmp = Path(td)
         if bundle_path.suffix == ".7z":
             seven_zip = _seven_zip()
@@ -433,7 +447,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="打包格式（默认 7z，体积最小；zip=ZIP_STORED 快速）")
     ap.add_argument("--volume", metavar="SIZE", default=None,
                     help="7z 分卷大小（如 4g/2g；PC 版建议 4g 便于 U 盘/局域网分批）")
+    ap.add_argument("--prune-sd-zips", action="store_true",
+                    help="SD 源 zip 处理完即删（可重建；省磁盘，峰值约降 15GB）")
     args = ap.parse_args(argv)
+    if args.prune_sd_zips:
+        global PRUNE_SD_ZIPS
+        PRUNE_SD_ZIPS = True
 
     if args.missing:
         for scope, variant in ((PC_ASSETS, "pc"), (ANDROID_ASSETS, "android")):
