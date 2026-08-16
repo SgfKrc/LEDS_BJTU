@@ -54,6 +54,12 @@ sys.path.insert(0, _GEMMA4_SITE_PACKAGES)
 sys.path.insert(0, _PROJECT_ROOT)
 from scripts.model_tools.llama_quantize_toolchain import verify_managed_package
 from scripts.model_tools.gemma4_native_freeze import _check as verify_gemma4_assets
+from scripts.model_tools.gemma4_native_binding import (
+    MARKER_FILENAME as _GEMMA4_BINDING_MARKER,
+    expected_binding_marker as _expected_gemma4_binding_marker,
+    validate_binding_marker as _validate_gemma4_binding_marker,
+    verify_binding_sources as _verify_gemma4_binding_sources,
+)
 
 _LLAMA_QUANTIZE_PACKAGE = os.path.join(
     _PROJECT_ROOT, "build", "model-tools", "llama-quantize", "packages", "windows-x86_64"
@@ -75,6 +81,7 @@ if not os.path.isdir(_FRONTEND_DIST):
 
 if verify_gemma4_assets() != 0:
     raise RuntimeError("Gemma 4 native assets do not match the frozen trust root")
+_verify_gemma4_binding_sources()
 
 # ============================================================
 # llama.cpp 原生库（DLL）
@@ -83,15 +90,13 @@ try:
     import llama_cpp as _lc
     import llama_cpp.mtmd_cpp as _mtmd
 
-    if _lc.__version__ != "0.3.28":
+    _validate_gemma4_binding_marker(_GEMMA4_SITE_PACKAGES)
+    _expected_binding = _expected_gemma4_binding_marker()
+    if _lc.__version__ != _expected_binding["package"]["version"]:
         raise RuntimeError(
-            f"expected llama-cpp-python 0.3.28, found {_lc.__version__}"
+            f"expected llama-cpp-python {_expected_binding['package']['version']}, found {_lc.__version__}"
         )
-    for _symbol in (
-        "mtmd_init_from_file",
-        "mtmd_tokenize",
-        "mtmd_helper_decode_image_chunk",
-    ):
+    for _symbol in _expected_binding["abi"]["mtmd_python_symbols"]:
         if not callable(getattr(_mtmd, _symbol, None)):
             raise RuntimeError(f"patched MTMD binding is missing {_symbol}")
     _lc_dir = os.path.dirname(os.path.abspath(_lc.__file__))
@@ -128,6 +133,8 @@ a = Analysis(
         (_FRONTEND_DIST, 'frontend/dist'),
         (_LLAMA_QUANTIZE_PACKAGE, 'model-tools/llama-quantize/windows-x86_64'),
         (_GEMMA4_NATIVE_DIR, 'models/gemma4-native'),
+        (os.path.join(_GEMMA4_SITE_PACKAGES, 'llama_cpp', _GEMMA4_BINDING_MARKER), 'llama_cpp'),
+        (os.path.join(_PROJECT_ROOT, 'scripts', 'model_tools', 'gemma4_native_binding.lock.json'), 'scripts/model_tools'),
     ],
     hiddenimports=[
         # ============================================================

@@ -77,5 +77,10 @@ if errorlevel 1 (
   echo ERROR: rebuilt Gemma 4 binding failed the ABI check
   exit /b 2
 )
+"!QLH_GEMMA4_VENV!\Scripts\python.exe" "%ROOT%\scripts\model_tools\gemma4_native_binding.py" --write-marker --site-packages "!QLH_GEMMA4_VENV!\Lib\site-packages"
+if errorlevel 1 (
+  echo ERROR: failed to write the frozen Gemma 4 binding marker
+  exit /b 2
+)
 echo BUILD_RC=!BUILD_RC!
 exit /b !BUILD_RC!

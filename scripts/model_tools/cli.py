@@ -204,6 +204,8 @@ def _parser() -> argparse.ArgumentParser:
     import_wizard.add_argument("--model-id", default="", help="registered model_id (default repo name)")
     import_wizard.add_argument("--expected-sha256", default="", help="strict SHA-256 verification")
     import_wizard.add_argument("--gguf-path", default="", help="GGUF register path (override auto-detect)")
+    import_wizard.add_argument("--proxy", default="", help="user HTTP(S) proxy (overrides environment settings)")
+    import_wizard.add_argument("--revision", default="", help="source revision recorded in the manifest")
     import_wizard.add_argument("--modelscope", action="store_true", help="download via ModelScope")
     import_wizard.add_argument("--skip-download", action="store_true", help="verify/register an existing local directory only")
     import_wizard.add_argument("--register", action="store_true", help="persist to main-node SQLite model_registry")

@@ -4,6 +4,13 @@ from .gguf import inspect_gguf, verify_gguf
 from .gguf_convert import GGUFConvertError, execute_conversion, plan_conversion
 from .gemma4_native_probe import run_native_probe
 from .gemma4_native_artifacts import resolve_ollama_gemma4_12b, run_ollama_gemma4_12b_preflight
+from .gemma4_pipeline_adapter import (
+    Gemma4AdapterError,
+    Gemma4PipelineAdapter,
+    load_gemma4_text_layer_assignment,
+    select_gemma4_assignment_keys,
+    validate_gemma4_assignment,
+)
 from .qwen3_sidecar_probe import run_qwen3_sidecar_probe
 from .qwen3_multimodal_processor_probe import run_qwen3_multimodal_processor_probe
 from .qwen3_multimodal_vision_text_smoke import run_qwen3_multimodal_vision_text_smoke
@@ -42,6 +49,11 @@ __all__ = [
     "run_native_probe",
     "resolve_ollama_gemma4_12b",
     "run_ollama_gemma4_12b_preflight",
+    "Gemma4AdapterError",
+    "Gemma4PipelineAdapter",
+    "load_gemma4_text_layer_assignment",
+    "select_gemma4_assignment_keys",
+    "validate_gemma4_assignment",
     "run_qwen3_sidecar_probe",
     "run_qwen3_multimodal_processor_probe",
     "run_qwen3_multimodal_vision_tower_probe",

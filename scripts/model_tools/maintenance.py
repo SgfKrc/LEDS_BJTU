@@ -224,6 +224,21 @@ def _is_protected_tree(path: Path, cleanup_roots: set[Path]) -> bool:
     return any(path == candidate or candidate in path.parents for candidate in cleanup_roots)
 
 
+def _is_old_enough(path: Path, *, now: float, minimum_seconds: float) -> bool:
+    """Treat an explicit zero-age cleanup scan as immediately eligible.
+
+    On Windows, a newly created file can briefly receive an mtime later than the
+    preceding ``time.time()`` sample.  A zero threshold is an explicit request
+    to inspect all candidates, so it must not depend on that clock boundary.
+    """
+    if minimum_seconds <= 0.0:
+        return True
+    try:
+        return now - _tree_mtime(path) >= minimum_seconds
+    except OSError:
+        return False
+
+
 def _find_cleanup_candidates(target: Path, *, min_age_hours: float, include_duplicates: bool) -> tuple[list[dict[str, Any]], list[str]]:
     files, skipped = _iter_files(target)
     now = time.time()
@@ -240,7 +255,7 @@ def _find_cleanup_candidates(target: Path, *, min_age_hours: float, include_dupl
                 continue
             if name in CLEANUP_DIR_NAMES:
                 cleanup_roots.add(candidate)
-                if now - _tree_mtime(candidate) >= age_seconds:
+                if _is_old_enough(candidate, now=now, minimum_seconds=age_seconds):
                     kind = "cache" if name == ".cache" else "old_backup"
                     candidates.append(_candidate(candidate, target, kind, safe=False, reason=f"stale {name} tree; may contain reusable asset metadata", now=now))
                 continue
@@ -253,10 +268,7 @@ def _find_cleanup_candidates(target: Path, *, min_age_hours: float, include_dupl
                 continue
             if _is_protected_tree(item, cleanup_roots):
                 continue
-            try:
-                age_ok = now - item.stat().st_mtime >= age_seconds
-            except OSError:
-                age_ok = False
+            age_ok = _is_old_enough(item, now=now, minimum_seconds=age_seconds)
             if age_ok and item.name.endswith((".part", ".tmp")):
                 candidates.append(_candidate(item, target, "partial", safe=True, reason="stale partial/temp file", now=now))
 
@@ -270,7 +282,10 @@ def _find_cleanup_candidates(target: Path, *, min_age_hours: float, include_dupl
             continue
         base_name = item.name[:-7]
         possibilities = {item.with_name(base_name), item.with_suffix("")}
-        if not any(candidate in sidecar_targets for candidate in possibilities) and now - item.stat().st_mtime >= age_seconds:
+        if (
+            not any(candidate in sidecar_targets for candidate in possibilities)
+            and _is_old_enough(item, now=now, minimum_seconds=age_seconds)
+        ):
             candidates.append(_candidate(item, target, "orphan_sidecar", safe=True, reason="sha256 sidecar has no local target", now=now))
 
     if include_duplicates:
