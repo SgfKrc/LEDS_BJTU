@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -238,7 +239,8 @@ def _bundle_root_name(bundle_path: Path) -> str:
 
 
 def _build_bundle(scope: tuple[str, ...], variant: str,
-                  fmt: str = "7z", volume: str | None = None) -> Path:
+                  fmt: str = "7z", volume: str | None = None,
+                  threads: int = 4) -> Path:
     manifest_files: list[dict] = []
     checksum_lines: list[str] = []
     collected_all: list[dict] = []
@@ -274,12 +276,17 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
     manifest_json = json.dumps(manifest, ensure_ascii=False, indent=1,
                                sort_keys=True)
 
-    if fmt == "7z":
-        _build_bundle_7z(bundle_path, collected_all, manifest_json,
-                         checksum_lines, variant, volume)
-    else:
-        _build_bundle_zip(bundle_path, collected_all,
-                          manifest_json, checksum_lines, variant)
+    try:
+        if fmt == "7z":
+            _build_bundle_7z(bundle_path, collected_all, manifest_json,
+                             checksum_lines, variant, volume, threads)
+        else:
+            _build_bundle_zip(bundle_path, collected_all,
+                              manifest_json, checksum_lines, variant)
+    finally:
+        # staging 是中间产物：打包完（或失败）立即删，降低磁盘峰值
+        if staging_sd is not None and staging_sd.exists():
+            shutil.rmtree(staging_sd, ignore_errors=True)
     return bundle_path
 
 
@@ -299,7 +306,8 @@ def _build_bundle_zip(bundle_path, collected_all, manifest_json,
 
 
 def _build_bundle_7z(bundle_path, collected_all, manifest_json,
-                     checksum_lines, variant, volume=None) -> None:
+                     checksum_lines, variant, volume=None,
+                     threads: int = 4) -> None:
     seven_zip = _seven_zip()
     if seven_zip is None:
         raise BundleError("7z 模式需要 7-Zip（winget install 7zip.7zip）")
@@ -327,19 +335,52 @@ def _build_bundle_7z(bundle_path, collected_all, manifest_json,
         parts.append((staging, ["MANIFEST.json", "CHECKSUMS.sha256",
                                 "README-导入说明.md"]))
         for cwd, paths in parts:
-            cmd = [seven_zip, "a", "-t7z", "-mx=1", "-y",
-                   str(bundle_path), *paths]
-            if volume:
-                cmd.insert(5, f"-v{volume}")
+            # 单卷三段追加（分卷后置物理切分——7z 不支持对分卷追加）
+            cmd = [seven_zip, "a", "-t7z", "-mx=1", f"-mmt={threads}",
+                   "-y", str(bundle_path), *paths]
             r = subprocess.run(cmd, cwd=str(cwd), capture_output=True,
                                text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise BundleError(
                     f"7z 打包失败: {r.stderr[-300:] or r.stdout[-300:]}")
     if volume:
-        # 分卷输出为 name.7z.001/.002/...；清理可能残留的裸单卷
-        for leftover in OUT_DIR.glob(f"{bundle_path.name}.{''}*"):
-            pass  # 7z -v 不会生成裸文件；无清理需要
+        _split_volumes(bundle_path, volume)
+
+
+def _parse_volume_size(volume: str) -> int:
+    """'4g'/'2g'/'512m' -> 字节。"""
+    m = re.fullmatch(r"(\d+)([gmk])", volume.strip().lower())
+    if not m:
+        raise BundleError(f"分卷大小格式错误: {volume}（示例 4g/2g/512m）")
+    n = int(m.group(1))
+    return n * {"g": 1 << 30, "m": 1 << 20, "k": 1 << 10}[m.group(2)]
+
+
+def _split_volumes(bundle_path: Path, volume: str) -> None:
+    """7z 分卷 = 纯字节切割：.001 含完整 header，后续为数据段。
+
+    单卷打包完成后按大小切块命名 name.7z.001/.002/...，删除单卷。
+    """
+    size = _parse_volume_size(volume)
+    for stale in OUT_DIR.glob(f"{bundle_path.name}.*"):
+        stale.unlink()  # 清理上次中断残留的旧分卷
+    data = bundle_path.read_bytes() if bundle_path.stat().st_size < (1 << 30) else None
+    if data is not None:
+        # 小文件（测试）直接内存切
+        parts = [data[i:i + size] for i in range(0, len(data), size)]
+        for idx, chunk in enumerate(parts, 1):
+            (Path(str(bundle_path) + f".{idx:03d}")).write_bytes(chunk)
+    else:
+        # 大文件流式切
+        vol_idx = 1
+        with open(bundle_path, "rb") as src:
+            while True:
+                chunk = src.read(size)
+                if not chunk:
+                    break
+                (Path(str(bundle_path) + f".{vol_idx:03d}")).write_bytes(chunk)
+                vol_idx += 1
+    bundle_path.unlink()
 
 
 def _import_readme(variant: str, manifest_json: str) -> str:
@@ -449,6 +490,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="7z 分卷大小（如 4g/2g；PC 版建议 4g 便于 U 盘/局域网分批）")
     ap.add_argument("--prune-sd-zips", action="store_true",
                     help="SD 源 zip 处理完即删（可重建；省磁盘，峰值约降 15GB）")
+    ap.add_argument("--threads", type=int, default=4, metavar="N",
+                    help="7z 压缩线程数（默认 4；本机 20 核默认会吃满，限制后留余量）")
     args = ap.parse_args(argv)
     if args.prune_sd_zips:
         global PRUNE_SD_ZIPS
@@ -472,20 +515,30 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pc:
         print(f"构建 PC 版（全量，{args.format}）...")
-        bundle = _build_bundle(PC_ASSETS, "pc", args.format, args.volume)
-        print(f"  -> {bundle}（{bundle.stat().st_size / 1e9:.1f} GB）"
-              + (f" 分卷 {args.volume}" if args.volume else ""))
+        bundle = _build_bundle(PC_ASSETS, "pc", args.format, args.volume,
+                              args.threads)
+        _print_bundle_result(bundle, args.volume)
         if args.verify:
             _verify_bundle(bundle)
     if args.android:
         print(f"构建安卓版（纯 GGUF，{args.format}）...")
         bundle = _build_bundle(ANDROID_ASSETS, "android", args.format,
-                              args.volume)
-        print(f"  -> {bundle}（{bundle.stat().st_size / 1e9:.1f} GB）"
-              + (f" 分卷 {args.volume}" if args.volume else ""))
+                              args.volume, args.threads)
+        _print_bundle_result(bundle, args.volume)
         if args.verify:
             _verify_bundle(bundle)
     return 0
+
+
+def _print_bundle_result(bundle_path: Path, volume: str | None) -> None:
+    """打印产物信息（分卷后单卷文件已删，需按卷统计）。"""
+    if volume:
+        vols = sorted(OUT_DIR.glob(f"{bundle_path.name}.*"))
+        total = sum(v.stat().st_size for v in vols)
+        print(f"  -> {bundle_path.name} 分卷 {len(vols)} 个"
+              f"（共 {total / 1e9:.1f} GB，每卷 {volume}）")
+    else:
+        print(f"  -> {bundle_path}（{bundle_path.stat().st_size / 1e9:.1f} GB）")
 
 
 if __name__ == "__main__":

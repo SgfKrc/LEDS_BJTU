@@ -152,6 +152,24 @@ def test_verify_restores_dedup_links(fake_assets):
     b._verify_bundle(bundle)  # 内部会 restore dedup 后逐文件校验
 
 
+def test_volume_split_and_verify(fake_assets):
+    # 小 bundle 用 512k 卷切分 -> verify 用 .001 入口
+    bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="7z",
+                             volume="512k")
+    assert not bundle.exists()  # 单卷已删
+    vols = sorted(p for p in b.OUT_DIR.glob("qlh-models-android-v1.7z.*"))
+    assert vols and vols[0].name.endswith(".001")
+    assert all(v.stat().st_size <= 512 * 1024 for v in vols)
+    b._verify_bundle(bundle)  # 自动找 .001 解包比对
+
+
+def test_parse_volume_size():
+    assert b._parse_volume_size("4g") == 4 * (1 << 30)
+    assert b._parse_volume_size("512m") == 512 * (1 << 20)
+    with pytest.raises(b.BundleError):
+        b._parse_volume_size("xyz")
+
+
 def test_verify_detects_tamper(fake_assets):
     bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
     # 篡改包内一个文件后 verify 必须失败
