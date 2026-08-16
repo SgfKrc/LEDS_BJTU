@@ -71,22 +71,48 @@ python scripts/doc_maintenance_audit.py --since 7d # 只看近 7 天有改动的
 ```
 - 手动入口为主；CI 选配（只读，无副作用）。
 
-## 4. M2 本地 LLM 判定（中期）
+## 4. M2 本地/远程 LLM 判定（中期）
 
-### 4.1 输入与输出
+### 4.1 Provider 抽象（本地 Ollama + 远程 DeepSeek 双通道）
+
+判定引擎通过 OpenAI 兼容接口抽象 provider，支持两种后端：
+
+| Provider | 用途 | 接入方式 | 说明 |
+|---|---|---|---|
+| **本地 Ollama**（默认） | 本机 GPU/CPU 推理（`gemma4:12b`、`qwen3:4b` 等） | `http://127.0.0.1:11434/v1`，无需密钥 | 无外发数据、无网络依赖；Ollama 未运行时自动降级为"需人工" |
+| **远程 DeepSeek V4 Flash**（opencode go 套餐） | 更强判定能力（可选通道） | OpenAI 兼容 `base_url` + `sk-*` 密钥 | 判定质量更高/更快，但**判题文本会外发**——只允许发送文档片段与提交标题，且必须在独立 env 中显式启用才可用 |
+
+配置独立于主 `.env`，放在 **`.env.docagent`**（已入 `.gitignore`，随 `.env` 一行忽略规则覆盖）：
+
+```bash
+# .env.docagent（示例；sk 不落 git）
+DOCAGENT_PROVIDER=ollama          # ollama（默认）| deepseek
+DOCAGENT_OLLAMA_BASE_URL=http://127.0.0.1:11434/v1
+DOCAGENT_OLLAMA_MODEL=gemma4:12b  # 或 qwen3:4b
+DOCAGENT_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash
+DOCAGENT_DEEPSEEK_API_KEY=sk-xxx
+DOCAGENT_CONFIDENCE_FLOOR=0.6     # 低于此值一律 needs_review
+```
+
+- 读取规则：`--provider` 显式指定 > `.env.docagent` 的 `DOCAGENT_PROVIDER` > 默认 ollama；远程通道**必须**有 base_url+api_key 且 `DOCAGENT_PROVIDER=deepseek` 才启用（fail-closed：配置缺失即跳过远程，不半启用）。
+- 密钥纪律：sk 只从 `.env.docagent` 读取，**不进入**命令行参数、日志、audit.json 与任何输出；`--llm` 输出只含判定与建议文本。
+- 数据边界：无论哪个 provider，发送内容仅限「疑似项 + 文档头部/相关段落（≤4KB/项）+ 提交标题」；正文、密钥、路径、URL、blob、grant 类字段一律不发送（沿用投影脱敏白名单思路）。
+
+### 4.2 输入与输出
 - 输入：audit.json 的疑似项 + 文档头部/相关段落（截断到 ≤4KB/项）+ 相关提交 message 列表；**脱敏**：不传 .env 值、密钥、日志正文，仅传提交标题与文档文本。
 - 输出（JSON）：`{"doc": ..., "judgement": "stale|accurate|needs_review", "confidence": 0-1, "suggestion": "建议的状态行文本或说明"}`。
-- 模型：Ollama 本地（gemma4:12b 或 qwen3 4b 均可；缺 Ollama 时跳过 L1，清单保持原样并标注）。
 
-### 4.2 判定协议（防误报）
+### 4.3 判定协议（防误报）
 - 只允许三种判定；`confidence < 0.6` 一律 `needs_review`。
 - `suggestion` 仅作为建议 diff 呈现，不自动应用。
 - 校验输出 schema，非法 JSON 视为 `needs_review`（fail-closed）。
 
-### 4.3 使用流程
+### 4.4 使用流程
 ```bash
-python scripts/doc_maintenance_audit.py --llm          # 机械化 + LLM 分级
-python scripts/doc_maintenance_audit.py --llm --apply  # 生成建议 diff（不自动提交）
+python scripts/doc_maintenance_audit.py --llm                # 机械化 + LLM 分级（默认 ollama）
+python scripts/doc_maintenance_audit.py --llm --provider deepseek  # 远程 DS V4 Flash（需 .env.docagent 配置）
+python scripts/doc_maintenance_audit.py --llm --apply              # 生成建议 diff（不自动提交）
 ```
 
 ## 5. M3 事件库与 RAG（远期）
@@ -146,3 +172,4 @@ CREATE TABLE check_runs (           -- 核对历史，避免重复人工核对
 | 日期 | 内容 |
 |---|---|
 | 2026-08-16 | 建立本文档（M1-M3 设计基线）；立项背景为当日批量筛查发现的 4 类遗漏 |
+| 2026-08-16 | M2 扩展为双 provider：本地 Ollama（GPU/CPU）默认 + 远程 DeepSeek V4 Flash（opencode go 套餐）可选；配置独立 `.env.docagent`（入 gitignore），远程通道 fail-closed，密钥不落任何输出 |
