@@ -120,7 +120,10 @@ def _apply_patch(frame: dict, *, no_clean: bool, logger: logging.Logger
                  ) -> tuple[str, str]:
     """强拉 dev 分支对齐 commit_sha；返回 (status, detail)。"""
     branch = frame["branch"]
-    proxy_port = int(frame.get("proxy_port") or DEFAULT_PROXY_PORT)
+    try:
+        proxy_port = int(frame.get("proxy_port") or DEFAULT_PROXY_PORT)
+    except (TypeError, ValueError):
+        proxy_port = DEFAULT_PROXY_PORT  # 恶意/非法值回退默认，不崩溃
     target = frame["commit_sha"]
 
     # dirty 告警（从节点为纯部署机，正常无改动；不拒绝，强制覆盖）
@@ -169,6 +172,9 @@ def _handle_frame(frame: dict, args, logger: logging.Logger) -> str:
     return ack
 
 
+MAX_FRAME_BYTES = 4 * 1024 * 1024  # 帧大小上限（防恶意超大帧内存膨胀）
+
+
 def _recv_frame(conn: socket.socket) -> dict | None:
     header = b""
     while len(header) < 10:
@@ -176,14 +182,22 @@ def _recv_frame(conn: socket.socket) -> dict | None:
         if not chunk:
             return None
         header += chunk
-    length = int(header.decode("ascii"))
+    try:
+        length = int(header.decode("ascii"))
+    except ValueError:
+        return None
+    if not 0 < length <= MAX_FRAME_BYTES:
+        return None
     data = b""
     while len(data) < length:
-        chunk = conn.recv(length - len(data))
+        chunk = conn.recv(min(length - len(data), 1 << 20))
         if not chunk:
             return None
         data += chunk
-    return json.loads(data.decode("utf-8"))
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:

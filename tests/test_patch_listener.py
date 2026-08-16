@@ -204,6 +204,45 @@ def test_handle_frame_restart_requested_flag(keys, args, monkeypatch):
     assert "restart_requested" in ack
 
 
+def test_recv_frame_rejects_oversized_and_bad_header():
+    class FakeConn:
+        def __init__(self, payload):
+            self._payload = payload
+            self._pos = 0
+
+        def recv(self, n):
+            chunk = self._payload[self._pos:self._pos + n]
+            self._pos += len(chunk)
+            return chunk
+
+    # 超长帧头（超过 MAX_FRAME_BYTES）-> None
+    oversized = f"{pl.MAX_FRAME_BYTES + 1:010d}".encode("ascii")
+    assert pl._recv_frame(FakeConn(oversized + b"x")) is None
+    # 非法 header -> None
+    assert pl._recv_frame(FakeConn(b"not-a-number")) is None
+    # 非 JSON body -> None
+    bad = f"{5:010d}".encode("ascii") + b"hello"
+    assert pl._recv_frame(FakeConn(bad)) is None
+
+
+def test_apply_patch_handles_malicious_proxy_port(monkeypatch):
+    """proxy_port 非法值回退默认，不崩溃。"""
+    def fake_git(gargs, *, env=None, check=True):
+        if gargs[0] == "status":
+            return ""
+        if gargs[0] == "fetch":
+            assert env["HTTPS_PROXY"].endswith(":7897")  # 回退默认端口
+            return ""
+        if gargs[0] == "rev-parse":
+            return "a" * 40
+        return ""
+
+    monkeypatch.setattr(pl, "_git", fake_git)
+    frame = _valid_payload(proxy_port="evil")
+    status, detail = pl._apply_patch(frame, no_clean=False, logger=pl._log_setup())
+    assert status == "applied"
+
+
 def test_recv_frame_length_header():
     import socket
     frame = {"schema": "qlh.patch_frame.v1", "commit_sha": "x" * 40}

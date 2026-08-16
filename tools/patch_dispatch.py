@@ -149,13 +149,18 @@ def _push(branch: str, proxy_port: int, *, dry_run: bool, retries: int = PUSH_RE
 
 
 def _send_frame_to_node(node: str, frame: dict, port: int) -> str:
-    """TCP 推送帧到单节点，返回 ack 文本。"""
+    """TCP 推送帧到单节点，返回 ack 文本（循环读到连接关闭，防分包）。"""
     data = json.dumps(frame, ensure_ascii=False).encode("utf-8")
     header = f"{len(data):010d}".encode("ascii")
     with socket.create_connection((node, port), timeout=ACK_TIMEOUT) as sock:
         sock.sendall(header + data)
-        ack = sock.recv(4096).decode("utf-8", errors="replace")
-    return ack
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def _broadcast(nodes: list[str], frame: dict, port: int, *, dry_run: bool) -> dict:
