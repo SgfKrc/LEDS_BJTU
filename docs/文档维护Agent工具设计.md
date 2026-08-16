@@ -108,7 +108,52 @@ DOCAGENT_CONFIDENCE_FLOOR=0.6     # 低于此值一律 needs_review
 - `suggestion` 仅作为建议 diff 呈现，不自动应用。
 - 校验输出 schema，非法 JSON 视为 `needs_review`（fail-closed）。
 
-### 4.4 使用流程
+### 4.5 缓存与省钱设计（远程按量计费的关键）
+
+opencode go 远程通道按量计费，缓存命中直接决定成本。设计**三级缓存**，全部落本地 SQLite（M2 即可用独立 `build/docagent-cache.sqlite`，M3 并入事件库）：
+
+#### 4.5.1 三级缓存
+| 级 | 机制 | 命中条件 | 成本 |
+|---|---|---|---|
+| **L1 精确缓存** | 输入 canonical hash（疑似项 + 文档片段截断 + 相关提交标题，规范化排序去空白）→ 上次判定 | 同一文档同一疑似项，输入指纹一致 | 零（本地查表） |
+| **L2 状态缓存** | 缓存键 = 文档 sha256 + 相关 commit 列表 + 规则 ID；键未变且上次判定非 `needs_review` | **文档与提交都没变**时重扫/人工核对后重跑 | 零 |
+| **L3 语义缓存**（远期，M3 向量） | embedding 相似度 ≥ 阈值时复用"参考建议" | 相似状态行/相似规则模式 | 零（仅本地向量检索） |
+
+**失效策略（懒失效）**：缓存条目记录 `doc_sha256` 与 `related_commits`；每次命中先比对当前值，变了则标记 stale 不命中（**提交后自然失效**，但同一提交状态下的重复扫描/核对重跑全部命中）。
+
+#### 4.5.2 提高命中率的输入设计（省钱核心）
+1. **输入规范化**：文档片段固定截断窗口（≤4KB，从头取）、列表排序、空白归一 → 同一状态行在多次扫描中产生**相同指纹**（不做规范化则时间戳/行号会让缓存永远 miss）。
+2. **批量合并**：同一文档的多个疑似项**合并为一次调用**（一条 prompt 判多项），减少调用次数；合并键 = 文档 sha256，任一疑似项变化才 miss 该批。
+3. **模式去重**：相同规则 + 相似状态行措辞（如多个文档都是"完成未收口"模式）→ 先按模板分类（规则 ID + 状态行关键词聚类），同类只抽样判定一次，其余复用模板结论并标注"模板复用"。
+4. **人工确认回写**：人工核对后的最终结论写入缓存（`source=human` 优先于 `source=llm`），后续命中直接用人工结论——**人工核对一次，终身复用**。
+5. **预检跳过**：扫描时先比对缓存键，命中且上次判定 `accurate` 的文档**完全跳过 LLM 调用**（连批量合并都不做）。
+
+#### 4.5.3 缓存表结构（M2 落地版）
+```sql
+CREATE TABLE llm_judgements (
+  cache_key TEXT PRIMARY KEY,        -- sha256(canonical input)
+  doc_id TEXT, rule_id TEXT,
+  doc_sha256 TEXT, related_commits TEXT,  -- 懒失效依据
+  judgement TEXT, confidence REAL, suggestion TEXT,
+  source TEXT,                        -- llm | human | semantic
+  provider TEXT, model TEXT,
+  prompt_tokens INT, completion_tokens INT,  -- 成本核算
+  judged_at TEXT
+);
+CREATE TABLE cost_log (              -- 每次远程调用一条
+  run_id TEXT, ts TEXT, provider TEXT, model TEXT,
+  prompt_tokens INT, completion_tokens INT,
+  hits INT, misses INT
+);
+```
+- **安全**：缓存只存判定结果 + 脱敏输入片段（≤4KB 文档头）；sk、正文、密钥类字段**永不落缓存**；`--llm` 输出报告可加 `--cost` 显示"本次扫描命中 N 次、远程调用 M 次、估算 tokens"。
+
+#### 4.5.4 预期效果（验收基准）
+- 同一提交状态下连续两次扫描：第二次 LLM 调用数 ≈ 0（L1/L2 全命中）。
+- 人工核对后的重扫：被核对文档不再产生远程调用（source=human 命中）。
+- 提交一次新 commit 后：仅该 commit 涉及的文档重新调用（其余仍命中）。
+
+### 4.6 使用流程
 ```bash
 python scripts/doc_maintenance_audit.py --llm                # 机械化 + LLM 分级（默认 deepseek/opencode go，需 .env.docagent 密钥）
 python scripts/doc_maintenance_audit.py --llm --provider ollama    # 本地 Ollama（离线/无密钥环境）
@@ -153,7 +198,7 @@ CREATE TABLE check_runs (           -- 核对历史，避免重复人工核对
 | 里程碑 | 交付 | 验收口径 |
 |---|---|---|
 | **M1 机械化扫描器** | `scripts/doc_maintenance_audit.py` + 规则表 + 清单模板 | 对当前仓库实测：能复现 2026-08-16 筛查发现的 4 类遗漏中的至少 3 类；全量扫描 <10s；零误删零改写（只读）；单测覆盖 5 条规则各至少 2 例（命中+不命中） |
-| **M2 LLM 判定** | `--llm` 路径 + 判定协议 + 脱敏检查 | 对已知 4 例遗留样本：判定与人工结论一致率 ≥ 3/4（deepseek 通道）；confidence<0.6 全部转人工；远程密钥缺失自动回退 ollama、两者都不可用则机械化照常 |
+| **M2 LLM 判定** | `--llm` 路径 + 判定协议 + 脱敏检查 + **三级缓存**（L1/L2 本地 SQLite，L3 随 M3 接入） | 对已知 4 例遗留样本：判定与人工结论一致率 ≥ 3/4（deepseek 通道）；confidence<0.6 全部转人工；远程密钥缺失自动回退 ollama、两者都不可用则机械化照常；**同提交状态重扫远程调用 ≈ 0，人工核对后重扫零调用，新 commit 后仅涉及文档重调** |
 | **M3 事件库 + RAG** | SQLite 三表 + embedding 索引 + 检索 CLI | 变更描述→关联文档 top-5 命中率 ≥ 60%（30 条抽样人工标注）；`--rebuild` 从 git log 重建与 git 一致 |
 | 收口 | 全量核对清单清零（或逐项登记为已知/有意） | 2026-08-16 发现的 4 类问题模式在后续扫描中不再以"未发现"状态存在 |
 
@@ -174,3 +219,4 @@ CREATE TABLE check_runs (           -- 核对历史，避免重复人工核对
 | 2026-08-16 | 建立本文档（M1-M3 设计基线）；立项背景为当日批量筛查发现的 4 类遗漏 |
 | 2026-08-16 | M2 扩展为双 provider：本地 Ollama（GPU/CPU）默认 + 远程 DeepSeek V4 Flash（opencode go 套餐）可选；配置独立 `.env.docagent`（入 gitignore），远程通道 fail-closed，密钥不落任何输出 |
 | 2026-08-16 | M2 优先级调整：**opencode go 远程通道（`https://opencode.ai/zen/go/v1`）默认优先**（本地 Ollama 上下文窗口有限易截断误判），Ollama 降为离线/无密钥兜底；回退链 deepseek→ollama→跳过 |
+| 2026-08-16 | M2 新增 §4.5 缓存与省钱设计：三级缓存（精确/状态/语义）+ 输入规范化、批量合并、模式去重、人工确认回写、预检跳过；`llm_judgements`/`cost_log` 表；验收基准（同状态重扫零调用） |
