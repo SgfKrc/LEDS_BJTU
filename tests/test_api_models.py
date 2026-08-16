@@ -332,7 +332,7 @@ def test_diffusion_capabilities_detects_manager_loaded_when_host_flag_is_stale(m
     assert result["local_llm_loaded"] is True
 
 
-def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
+def test_register_gguf_model_is_allowed_without_cuda(monkeypatch, tmp_path):
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
@@ -340,12 +340,14 @@ def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
         lambda model_id, config_json: saved.append((model_id, config_json)) or True,
     )
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
+    gguf = tmp_path / "custom.Q4_K_M.gguf"
+    gguf.write_bytes(b"fake-gguf")
 
     req = api_server.RegisterModelRequest(
         model_id="custom-gguf",
         name="Custom GGUF",
         model_type="gguf",
-        gguf_path="models/custom.Q4_K_M.gguf",
+        gguf_path=str(gguf),
     )
 
     result = asyncio.run(api_server.register_model(req))
@@ -354,7 +356,7 @@ def test_register_gguf_model_is_allowed_without_cuda(monkeypatch):
     assert saved and saved[0][0] == "custom-gguf"
 
 
-def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch):
+def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch, tmp_path):
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
@@ -362,18 +364,36 @@ def test_register_safetensors_model_without_cuda_is_allowed(monkeypatch):
         lambda model_id, config_json: saved.append((model_id, config_json)) or True,
     )
     monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
+    model_dir = tmp_path / "custom-hf"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.safetensors").write_bytes(b"fake-weights")
 
     req = api_server.RegisterModelRequest(
         model_id="custom-hf",
         name="Custom HF",
         model_type="safetensors",
-        model_path="models/custom-hf",
+        model_path=str(model_dir),
     )
 
     result = asyncio.run(api_server.register_model(req))
 
     assert result == {"status": "registered", "model_id": "custom-hf"}
     assert saved and saved[0][0] == "custom-hf"
+
+
+def test_register_model_rejects_empty_or_missing_assets(monkeypatch, tmp_path):
+    from fastapi import HTTPException
+    monkeypatch.setattr(api_server._local_store, "save_local_experimental_model", lambda *_args: True)
+    req = api_server.RegisterModelRequest(
+        model_id="missing-hf",
+        name="Missing HF",
+        model_type="safetensors",
+        model_path=str(tmp_path / "missing"),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api_server.register_model(req))
+    assert exc_info.value.status_code == 400
 
 
 # ================================================================

@@ -806,3 +806,89 @@ class TestLogAggregate:
         monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "worker")
         resp = client.get("/api/cluster/nodes/log-aggregate")
         assert resp.status_code == 403
+
+    def test_aggregate_empty_worker_set_returns_local_only(self, monkeypatch, client):
+        import api_server
+
+        fake_sched = type("FakeScheduler", (), {
+            "nodes": {},
+            "get_effective_node_id": staticmethod(lambda: "m0"),
+            "_nodes_lock": threading.RLock(),
+        })()
+        monkeypatch.setattr(api_server, "scheduler", fake_sched)
+        monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "master")
+
+        resp = client.get("/api/cluster/nodes/log-aggregate")
+
+        assert resp.status_code == 200
+        assert resp.json()["workers"] == []
+        assert resp.json()["total_workers"] == 0
+
+    def test_aggregate_fetches_workers_with_bounded_concurrency(self, monkeypatch, client):
+        import api_server
+        import scheduler as sched_mod
+
+        class FakeInfo:
+            role = sched_mod.NodeRole.CLIENT
+            state = sched_mod.NodeState.ONLINE
+
+        state = {"active": 0, "maximum": 0}
+        state_lock = threading.Lock()
+
+        def request_node_logs(self, node_id, limit, level="", name="", timeout=3.0):
+            with state_lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            time.sleep(0.05)
+            with state_lock:
+                state["active"] -= 1
+            return {"node_id": node_id, "logs": [node_id], "count": 1}
+
+        fake_sched = type("FakeScheduler", (), {
+            "nodes": {f"w{i}": FakeInfo() for i in range(4)},
+            "get_effective_node_id": staticmethod(lambda: "m0"),
+            "_nodes_lock": threading.RLock(),
+            "request_node_logs": request_node_logs,
+        })()
+        monkeypatch.setattr(api_server, "scheduler", fake_sched)
+        monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "master")
+
+        resp = client.get("/api/cluster/nodes/log-aggregate")
+
+        assert resp.status_code == 200
+        assert state["maximum"] >= 2
+        assert [worker["node_id"] for worker in resp.json()["workers"]] == [
+            "w0", "w1", "w2", "w3",
+        ]
+
+    def test_aggregate_returns_deadline_errors_without_waiting_per_node(
+        self, monkeypatch, client,
+    ):
+        import api_server
+        import scheduler as sched_mod
+
+        class FakeInfo:
+            role = sched_mod.NodeRole.CLIENT
+            state = sched_mod.NodeState.ONLINE
+
+        def request_node_logs(self, node_id, limit, level="", name="", timeout=3.0):
+            time.sleep(0.2)
+            return {"node_id": node_id, "logs": [node_id], "count": 1}
+
+        fake_sched = type("FakeScheduler", (), {
+            "nodes": {"w1": FakeInfo(), "w2": FakeInfo()},
+            "get_effective_node_id": staticmethod(lambda: "m0"),
+            "_nodes_lock": threading.RLock(),
+            "request_node_logs": request_node_logs,
+        })()
+        monkeypatch.setattr(api_server, "scheduler", fake_sched)
+        monkeypatch.setattr(api_server, "_get_effective_role_safe", lambda: "master")
+        monkeypatch.setattr(api_server, "LOG_AGGREGATE_DEADLINE_SECONDS", 0.03)
+
+        started = time.monotonic()
+        resp = client.get("/api/cluster/nodes/log-aggregate")
+        elapsed = time.monotonic() - started
+
+        assert resp.status_code == 200
+        assert elapsed < 0.4
+        assert all(worker["error"] == "deadline" for worker in resp.json()["workers"])
