@@ -6,11 +6,12 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8.2**（更新日期：2026-08-12）
+**v0.1.8.2**（更新日期：2026-08-16）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
+> 🧰 **刚克隆仓库？先看 [克隆后资产获取清单](#-克隆后资产获取清单)。**
 
 ---
 
@@ -348,6 +349,58 @@ python scripts/setup_test_env.py --check
 ```
 
 > **事件记录（2026-08-14）**：曾发生主环境被灌入 pytest 系测试包、同时 `.venv-test` 的 pytest 被掏空（两个环境 site-packages 被复制混淆），导致测试被迫在主环境运行。已修复（主环境卸载测试包、`.venv-test` 重装 requirements-test.txt 恢复）。**请勿通过 `run_test_channels.py --allow-system-python` 绕过守卫**，该参数仅限一次性 CI 镜像。
+
+---
+
+## 🧰 克隆后资产获取清单
+
+> 克隆仓库 ≠ 立即可用。以下清单列出**代码之外还需要获取的离线资产**（模型权重、子模块、密钥、环境文件）。标 ✅ 的项目随仓库已有或 clone 自动带出，其余需按表格获取。
+
+### 0. 克隆后必做（一次性的环境步骤）
+
+```bash
+# 1. 拉取子模块（Android Full 版 llama.cpp 原生后端，约 2-4 GB 历史）
+git submodule update --init --recursive
+
+# 2. 安装 Python 依赖（主环境；联网）
+pip install -r requirements.txt
+
+# 3. 前端依赖（可选，仅开发前端时）
+cd frontend && npm install && cd ..
+
+# 4. 环境文件（不进仓库，按需自建）
+#    主环境 .env 至少含 QLH_CLUSTER_SECRET（分布式密钥）；判题/工具密钥见
+#    docs/文档维护Agent工具设计.md §4.1 的 .env.docagent 说明
+
+# 5. 验证
+python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
+```
+
+### 1. 离线资产清单（按需获取）
+
+| 资产 | 大小 | 用途 | 获取方式 | 必需性 |
+|---|---|---|---|---|
+| **Qwen-1.8B-Chat（Safetensors）** | ~3.5 GB | 默认示例模型：独显推理、分布式流水线 | ModelScope `Qwen/Qwen-1.8B-Chat` 或 HF（见下文模型下载节） | ⭐ 必需（默认模型） |
+| **Qwen-1.8B-Chat（GGUF Q4_K_M）** | ~1.16 GB | CPU/集显单机、Android 本地推理 | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ 必需（CPU 路径） |
+| **Qwen3-4B（GGUF Q4_K_M）** | ~2.5 GB | EX-N3 判题模型（v2 正确率判据）、实验 | 受管下载（MODEL-TOOLS）/ HF `Qwen/Qwen3-4B-GGUF` | 实验必需 |
+| **Gemma 4 12B 原生绑定**（GGUF + mmproj） | ~7.3 GB | 图像理解（图生文）原生路径 | 受管工件清单 `models/gemma4-native/gemma4-native.lock.json` + 下载脚本 | 多模态实验 |
+| **SD 1.5 五资产离线包** | ~15 GB（5 包） | 图像生成工作区（原版/90s/IP-Adapter/inpaint/InstructPix2Pix） | 官方离线资产包（见 [SD 1.5 离线资产包计划](docs/SD%201.5离线资产包与签名源站发布计划.md)）或 `python scripts/download_sd15.py` | 图像实验 |
+| **Ollama 模型**（`gemma4:12b` 等） | 按需 | EX-N3 Gemma 判题、外部路径验证 | `ollama pull gemma4:12b` | 判题实验 |
+
+### 2. 随仓库已有 / 不需要获取的
+
+| 项 | 说明 |
+|---|---|
+| ✅ 许可证原文 | `packaging/sd15-licenses/` 已入库（CreativeML OpenRAIL-M / OpenRAIL / Apache-2.0 / MIT） |
+| ✅ 测试 fixture 与实验计划 | `fixtures/` 全部入库 |
+| ✅ 签名源站 / serve 分发 | 代码在 `packaging/`，无需额外资产 |
+| ⚠️ 发布签名密钥 | `packaging/.signing-keys/` **不进仓库**；由发布者持有，克隆者无密钥只能验签不能签发 |
+| ⚠️ `.env`（QLH_CLUSTER_SECRET 等） | 各节点自备，不入库 |
+| ⚠️ `models/` 大文件 | 全部 gitignore；按上表获取，不随仓库分发 |
+
+### 3. 安装包（不克隆也可用）
+
+Windows CPU/CUDA Setup、Launcher、Android Full/Lite APK、Linux `.deb` 均从**发布渠道**获取（本项目内网：主节点 `python packaging/serve.py` 分发服务器浏览器直下）。不要求克隆仓库即可安装使用；克隆仓库主要用于开发与验收。
 
 ---
 
