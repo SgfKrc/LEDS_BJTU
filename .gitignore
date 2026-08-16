@@ -45,6 +45,7 @@ chat_history/
 # Environment
 .env
 .env.local
+.env.docagent
 node_config.json
 node_config.json.tmp
 .gitignore_bak
