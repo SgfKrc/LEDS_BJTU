@@ -10,8 +10,7 @@
 - PC 安装包: packaging/dist/*.exe（主应用，不含启动器）
 - QLH 启动器: packaging/dist/QLH-Launcher-Setup-v*.exe（安装包）+ QLH-Launcher-v*.zip（自更新资产）
 - Android 安装包: packaging/dist/*.apk / *.aab，或 android/app/build/outputs/**/*.apk / *.aab
-- PC 模型压缩包: models_pc.7z 或 models_pc/*.7z
-- Android 模型压缩包: models_android.7z 或 models_android/*.7z
+- 模型整合包（唯一维护路径）: build/offline-bundles/qlh-models-pc-v1.7z.001-007（PC 分卷）+ qlh-models-android-v1.7z（安卓）；旧 models_pc/models_android/sd15-assets 线路已废弃（2026-08-17，文件不再生成）
 
 Ctrl+C 停止。
 """
@@ -36,20 +35,9 @@ DEFAULT_PORT = 9090
 ROOT = os.path.dirname(os.path.abspath(__file__))  # packaging/
 DIST_DIR = os.path.join(ROOT, "dist")
 PROJECT_ROOT = os.path.dirname(ROOT)
-MODEL_ARCHIVES = {
-    "pc": {
-        "title": "PC 模型压缩包",
-        "root_file": "models_pc.7z",
-        "dir": "models_pc",
-        "url_prefix": "/models-pc/",
-    },
-    "android": {
-        "title": "Android 模型压缩包",
-        "root_file": "models_android.7z",
-        "dir": "models_android",
-        "url_prefix": "/models-android/",
-    },
-}
+BUNDLE_DIR = os.path.join(PROJECT_ROOT, "build", "offline-bundles")
+# 整合包命名：qlh-models-{pc|android}-v1.7z（PC 为分卷 .001-007，安卓单卷）
+BUNDLE_URL_PREFIX = "/models-bundle/" 
 ANDROID_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "android", "app", "build", "outputs")
 
 PC_INSTALLER_EXTS = (".exe",)
@@ -127,8 +115,8 @@ def _classify_update_asset(name: str) -> tuple[str, str, str, str] | None:
         )
     if lower.endswith(".zip") and "qlh-launcher" in lower:
         return "windows", "any", "x86_64", "launcher"
-    if lower.endswith(".zip") and "qlh-sd15-assets-" in lower:
-        return "any", "any", "any", "sd15-asset"
+    if lower.endswith(".7z") and "qlh-models-" in lower:
+        return "any", "any", "any", "model-bundle"
     if lower.endswith(".exe") and "qlh-launcher-setup" in lower:
         return "windows", "any", "x86_64", "launcher-setup"
     if lower.endswith(".exe") and "qlh-edge-inference-setup" in lower:
@@ -361,68 +349,58 @@ def _scan_android_downloads() -> list[tuple[str, str, str]]:
     return entries
 
 
-def _scan_model_archives(kind: str | None = None) -> list[tuple[str, str, str, str]]:
+def _scan_model_bundles() -> list[tuple[str, str, str, str]]:
     """
-    扫描模型压缩包，返回 [(kind, display_name, href, absolute_path)]。
+    扫描模型整合包（build/offline-bundles/），返回 [(kind, display, href, abs)]。
 
-    支持两种约定:
-    - 根目录固定文件: models_pc.7z / models_android.7z
-    - 分类目录文件: models_pc/*.7z / models_android/*.7z
+    - PC 版分卷（.001-007）合并为一个展示项，链接指向 .001
+    - 安卓版单卷
     """
     entries: list[tuple[str, str, str, str]] = []
-    seen: set[str] = set()
-    items = MODEL_ARCHIVES.items() if kind is None else [(kind, MODEL_ARCHIVES[kind])]
-
-    for archive_kind, config in items:
-        root_file = os.path.join(PROJECT_ROOT, config["root_file"])
-        if os.path.isfile(root_file):
-            abs_path = os.path.abspath(root_file)
-            seen.add(abs_path)
-            entries.append((archive_kind, config["root_file"], "/" + quote(config["root_file"]), root_file))
-
-        archive_dir = os.path.join(PROJECT_ROOT, config["dir"])
-        if not os.path.isdir(archive_dir):
+    if not os.path.isdir(BUNDLE_DIR):
+        return entries
+    bundle_re = re.compile(r"\.7z(\.\d+)?$", re.IGNORECASE)
+    for name in sorted(os.listdir(BUNDLE_DIR)):
+        if not bundle_re.search(name):
             continue
-
-        for root, _dirs, files in os.walk(archive_dir):
-            for name in files:
-                if not name.lower().endswith(".7z"):
-                    continue
-                abs_path = os.path.abspath(os.path.join(root, name))
-                if abs_path in seen:
-                    continue
-                seen.add(abs_path)
-                rel_path = os.path.relpath(abs_path, archive_dir).replace(os.sep, "/")
-                display_name = f'{config["dir"]}/{rel_path}'
-                href = config["url_prefix"] + quote(rel_path, safe="/")
-                entries.append((archive_kind, display_name, href, abs_path))
-
+        abs_path = os.path.abspath(os.path.join(BUNDLE_DIR, name))
+        if not os.path.isfile(abs_path):
+            continue
+        if name.endswith(".001"):
+            # PC 分卷：以 .001 为代表项，卷数动态统计
+            base = name.rsplit(".", 1)[0]
+            vol_count = sum(
+                1 for n in os.listdir(BUNDLE_DIR)
+                if n.startswith(base + ".") and n[len(base) + 1:].isdigit()
+            )
+            display = f"{base}.7z (.001-{vol_count:03d})" if vol_count > 1 else name
+            entries.append(("pc-bundle", display,
+                            BUNDLE_URL_PREFIX + quote(name), abs_path))
+        else:
+            # 分卷成员（.002-007）：有同前缀 .001 则合并到代表项，不单独列出
+            base = name.rsplit(".", 1)[0]
+            if any(n == base + ".001" for n in os.listdir(BUNDLE_DIR)):
+                continue
+            # 非分卷（安卓单卷）
+            variant = "android" if "android" in name else "pc"
+            entries.append((f"{variant}-bundle", name,
+                            BUNDLE_URL_PREFIX + quote(name), abs_path))
     return sorted(entries, key=lambda item: (item[0], item[1].lower()))
 
 
-def _resolve_model_archive_path(request_path: str) -> str | None:
-    """将模型压缩包下载 URL 映射到项目内 .7z 文件。"""
-    for archive_kind, config in MODEL_ARCHIVES.items():
-        root_url = "/" + config["root_file"]
-        if request_path == root_url:
-            candidate = os.path.abspath(os.path.join(PROJECT_ROOT, config["root_file"]))
-            return candidate if os.path.isfile(candidate) else None
-
-        prefix = config["url_prefix"]
-        if not request_path.startswith(prefix):
-            continue
-
-        rel = unquote(request_path[len(prefix):]).replace("\\", "/").lstrip("/")
-        if not rel or rel.endswith("/") or not rel.lower().endswith(".7z"):
-            return None
-
-        archive_dir = os.path.abspath(os.path.join(PROJECT_ROOT, config["dir"]))
-        candidate = os.path.abspath(os.path.join(archive_dir, rel))
-        if candidate != archive_dir and not candidate.startswith(archive_dir + os.sep):
-            return None
-        return candidate if os.path.isfile(candidate) else None
-
-    return None
+def _resolve_model_bundle_path(request_path: str) -> str | None:
+    """将 /models-bundle/<name> 映射到 build/offline-bundles/ 内文件（防穿越）。"""
+    prefix = BUNDLE_URL_PREFIX
+    if not request_path.startswith(prefix):
+        return None
+    rel = unquote(request_path[len(prefix):]).replace("\\", "/").lstrip("/")
+    if not rel or rel.endswith("/"):
+        return None
+    candidate = os.path.abspath(os.path.join(BUNDLE_DIR, rel))
+    if candidate != os.path.abspath(BUNDLE_DIR) and not candidate.startswith(
+            os.path.abspath(BUNDLE_DIR) + os.sep):
+        return None
+    return candidate if os.path.isfile(candidate) else None
 
 
 def _resolve_android_path(request_path: str) -> str | None:
@@ -473,9 +451,9 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def translate_path(self, path):
         request_path = unquote(urlparse(path).path)
-        model_archive_path = _resolve_model_archive_path(request_path)
-        if model_archive_path:
-            return model_archive_path
+        model_bundle_path = _resolve_model_bundle_path(request_path)
+        if model_bundle_path:
+            return model_bundle_path
 
         android_path = _resolve_android_path(request_path)
         if android_path:
@@ -502,13 +480,9 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             for display, href, abs_path in _scan_android_downloads()
         ]
 
-        pc_model_entries = [
+        bundle_entries = [
             (display, href, _format_size(abs_path))
-            for kind, display, href, abs_path in _scan_model_archives("pc")
-        ]
-        android_model_entries = [
-            (display, href, _format_size(abs_path))
-            for kind, display, href, abs_path in _scan_model_archives("android")
+            for kind, display, href, abs_path in _scan_model_bundles()
         ]
 
         def render_rows(entries: list[tuple[str, str, str]], empty_text: str) -> str:
@@ -522,10 +496,9 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         pc_rows = render_rows(pc_entries, "暂无 PC 安装包（请先运行 build-installer.bat）")
         launcher_rows = render_rows(launcher_entries, "暂无 QLH 启动器（请先运行 build-launcher.bat）")
         android_rows = render_rows(android_entries, "暂无 Android 安装包（请先运行 android/gradlew.bat assembleRelease）")
-        pc_model_rows = render_rows(pc_model_entries, "暂无 PC 模型压缩包 models_pc.7z / models_pc/*.7z")
-        android_model_rows = render_rows(
-            android_model_entries,
-            "暂无 Android 模型压缩包 models_android.7z / models_android/*.7z",
+        bundle_rows = render_rows(
+            bundle_entries,
+            "暂无模型整合包（请先运行 scripts/build_offline_bundle.py --pc/--android）",
         )
 
         body = f"""<!doctype html>
@@ -562,21 +535,17 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     {android_rows}
   </ul>
 
-  <h2>PC 模型压缩包</h2>
+  <h2>模型整合包</h2>
   <ul>
-    {pc_model_rows}
-  </ul>
-
-  <h2>Android 模型压缩包</h2>
-  <ul>
-    {android_model_rows}
+    {bundle_rows}
   </ul>
 
   <p class="hint">
     Android Release APK 默认路径: <code>android/app/build/outputs/apk/*/release/*.apk</code><br>
     PC 安装包默认路径: <code>packaging/dist/QLH-Edge-Inference-Setup-v*.exe</code><br>
     启动器: <code>packaging/dist/QLH-Launcher-Setup-v*.exe</code>（安装）+ <code>QLH-Launcher-v*.zip</code>（自更新资产，供 <code>qlh_launcher.py launcher-install</code> 使用）<br>
-    Android 模型包仅需包含 GGUF 模型；PC 模型包可包含 PC 端需要的完整模型目录。
+    整合包由 scripts/build_offline_bundle.py 生成：PC 版为 4GB 分卷（.001-007，全量资产含 SD），
+    安卓版为单卷（仅 GGUF，SAF 目录直接可用）；旧 models_pc/models_android/sd15 包线路已废弃。
   </p>
 </body>
 </html>
@@ -636,7 +605,7 @@ def main(argv: list[str] | None = None) -> None:
 
     ts_ip = _detect_tailscale_ip()
     android_packages = _scan_android_downloads()
-    model_archives = _scan_model_archives()
+    model_bundles = _scan_model_bundles()
     launcher_assets = _scan_launcher_assets()
 
     print()
@@ -660,13 +629,12 @@ def main(argv: list[str] | None = None) -> None:
             print(f"    {display} -> {href} ({_format_size(abs_path)})")
     else:
         print("  Android 安装包: 未找到（请先运行 android/gradlew.bat assembleRelease）")
-    if model_archives:
-        print("  模型压缩包:")
-        for kind, display, href, abs_path in model_archives:
-            title = MODEL_ARCHIVES[kind]["title"]
-            print(f"    {title}: {display} -> {href} ({_format_size(abs_path)})")
+    if model_bundles:
+        print("  模型整合包:")
+        for kind, display, href, abs_path in model_bundles:
+            print(f"    {display} -> {href} ({_format_size(abs_path)})")
     else:
-        print("  模型压缩包: 未找到 models_pc.7z / models_android.7z 或分类目录 .7z")
+        print("  模型整合包: 未找到（先运行 scripts/build_offline_bundle.py --pc/--android）")
     print()
     print("  其他设备浏览器访问:")
     if ts_ip and ts_ip != "?":
@@ -675,7 +643,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"    http://{_url_host(ts_ip)}:{port}{href}")
         for _display, href, _abs_path in android_packages:
             print(f"    http://{_url_host(ts_ip)}:{port}{href}")
-        for _kind, _display, href, _abs_path in model_archives:
+        for _kind, _display, href, _abs_path in model_bundles:
             print(f"    http://{_url_host(ts_ip)}:{port}{href}")
     else:
         print(f"    http://<本机IP>:{port}/")
@@ -683,7 +651,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"    http://<本机IP>:{port}{href}")
         for _display, href, _abs_path in android_packages:
             print(f"    http://<本机IP>:{port}{href}")
-        for _kind, _display, href, _abs_path in model_archives:
+        for _kind, _display, href, _abs_path in model_bundles:
             print(f"    http://<本机IP>:{port}{href}")
     print()
     print("  按 Ctrl+C 停止服务")

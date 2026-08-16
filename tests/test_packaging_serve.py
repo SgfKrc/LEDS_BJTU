@@ -12,43 +12,49 @@ def _load_serve_module():
     return module
 
 
-def test_model_archive_scan_uses_pc_and_android_packages(tmp_path, monkeypatch):
+def test_model_bundle_scan_merges_pc_volumes_and_android(tmp_path, monkeypatch):
     serve = _load_serve_module()
-    monkeypatch.setattr(serve, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(serve, "BUNDLE_DIR", str(tmp_path))
 
-    (tmp_path / "model.7z").write_bytes(b"legacy")
-    (tmp_path / "models_pc.7z").write_bytes(b"pc-root")
-    android_dir = tmp_path / "models_android" / "qwen"
-    android_dir.mkdir(parents=True)
-    (android_dir / "android-gguf.7z").write_bytes(b"android")
+    # PC 分卷 .001-.003 + 安卓单卷
+    for vol in ("qlh-models-pc-v1.7z.001", "qlh-models-pc-v1.7z.002",
+                "qlh-models-pc-v1.7z.003"):
+        (tmp_path / vol).write_bytes(b"vol")
+    (tmp_path / "qlh-models-android-v1.7z").write_bytes(b"android")
+    (tmp_path / "unrelated.bin").write_bytes(b"x")
 
-    entries = serve._scan_model_archives()
+    entries = serve._scan_model_bundles()
     display_names = [entry[1] for entry in entries]
-    hrefs = [entry[2] for entry in entries]
 
-    assert "models_pc.7z" in display_names
-    assert "models_android/qwen/android-gguf.7z" in display_names
-    assert "/models_pc.7z" in hrefs
-    assert "/models-android/qwen/android-gguf.7z" in hrefs
-    assert "model.7z" not in display_names
+    # PC 分卷合并为一个代表项；安卓单卷一项；无关文件不出现
+    assert any("(.001-003)" in n for n in display_names)
+    assert "qlh-models-android-v1.7z" in display_names
+    assert len(entries) == 2
+    # 代表项 href 指向 .001
+    pc_entry = next(e for e in entries if e[0] == "pc-bundle")
+    assert pc_entry[2].endswith("qlh-models-pc-v1.7z.001")
 
 
-def test_model_archive_path_resolution_rejects_legacy_and_traversal(tmp_path, monkeypatch):
+def test_model_bundle_path_resolution_rejects_traversal_and_missing(tmp_path, monkeypatch):
     serve = _load_serve_module()
-    monkeypatch.setattr(serve, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(serve, "BUNDLE_DIR", str(tmp_path))
 
-    (tmp_path / "models_pc.7z").write_bytes(b"pc-root")
-    pc_dir = tmp_path / "models_pc"
-    pc_dir.mkdir()
-    (pc_dir / "nested.7z").write_bytes(b"nested")
+    (tmp_path / "qlh-models-android-v1.7z").write_bytes(b"android")
+    (tmp_path / "qlh-models-pc-v1.7z.001").write_bytes(b"vol1")
     (tmp_path / "secret.7z").write_bytes(b"secret")
-    (tmp_path / "model.7z").write_bytes(b"legacy")
 
-    assert serve._resolve_model_archive_path("/models_pc.7z") == str(tmp_path / "models_pc.7z")
-    assert serve._resolve_model_archive_path("/models-pc/nested.7z") == str(pc_dir / "nested.7z")
-    assert serve._resolve_model_archive_path("/model.7z") is None
-    assert serve._resolve_model_archive_path("/models-pc/../secret.7z") is None
-    assert serve._resolve_model_archive_path("/models-pc/not-a-model.zip") is None
+    assert serve._resolve_model_bundle_path(
+        "/models-bundle/qlh-models-android-v1.7z") == str(
+        tmp_path / "qlh-models-android-v1.7z")
+    assert serve._resolve_model_bundle_path(
+        "/models-bundle/qlh-models-pc-v1.7z.001") == str(
+        tmp_path / "qlh-models-pc-v1.7z.001")
+    # 穿越防护与不存在
+    assert serve._resolve_model_bundle_path(
+        "/models-bundle/../secret.7z") is None
+    assert serve._resolve_model_bundle_path(
+        "/models-bundle/nope.7z") is None
+    assert serve._resolve_model_bundle_path("/models-pc/legacy.7z") is None
 
 
 def test_pc_installer_scan_excludes_android_packages_in_dist(tmp_path, monkeypatch):
