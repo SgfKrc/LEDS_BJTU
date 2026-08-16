@@ -62,6 +62,21 @@ def fake_assets(tmp_path, monkeypatch):
         (sd / (pkg_name + ".sha256")).write_text(
             f"{pkg_sha}  {pkg_name}\n", encoding="utf-8")
 
+    # 新资产骨架（v2 注册表补全）
+    for d in ("qwen3-4b", "qwen3-vl-4b-instruct", "qwen3-5-2b",
+              "qwen3-5-9b", "gemma4-12b-safetensors",
+              "deepseek-r1-distill-qwen-7b"):
+        dd = repo / "models" / d
+        dd.mkdir(parents=True, exist_ok=True)
+        (dd / "model.safetensors").write_bytes(b"w" * 64)
+    for d in ("qwen3-vl-4b-instruct-gguf", "qwen3-5-2b-gguf",
+              "qwen3-5-9b-gguf"):
+        dd = repo / "models" / d
+        dd.mkdir(parents=True, exist_ok=True)
+        (dd / "model.gguf").write_bytes(b"g" * 64)
+    (repo / "models" / "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf").write_bytes(
+        b"d" * 64)
+
     monkeypatch.setattr(b, "REPO_ROOT", repo)
     monkeypatch.setattr(b, "OUT_DIR", out)
     return repo, out
@@ -157,7 +172,8 @@ def test_volume_split_and_verify(fake_assets):
     bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="7z",
                              volume="512k")
     assert not bundle.exists()  # 单卷已删
-    vols = sorted(p for p in b.OUT_DIR.glob("qlh-models-android-v1.7z.*"))
+    vols = sorted(p for p in b.OUT_DIR.glob(
+            f"qlh-models-android-{b.BUNDLE_VERSION}.7z.*"))
     assert vols and vols[0].name.endswith(".001")
     assert all(v.stat().st_size <= 512 * 1024 for v in vols)
     b._verify_bundle(bundle)  # 自动找 .001 解包比对
