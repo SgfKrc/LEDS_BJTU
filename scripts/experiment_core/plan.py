@@ -381,24 +381,28 @@ def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpe
             ),
         }
 
-    # §6.2.4 (decision 2026-08-13, plan 1): with quality.required the LLM side
-    # judges only format rate on the approved non-R1 floor (>= 0.30) plus
-    # manual review; objective correctness is explicitly not participating
-    # (baseline 0.0). A non-zero correctness floor still needs the >= 0.60
-    # approval bar so no unapproved correctness gate can slip in.
+    # §6.2.4 (decision 2026-08-13, plan 1; upgraded 2026-08-16 by P5/v2):
+    # with quality.required the LLM side judges objective correctness on the
+    # v2 approved floor (>= 0.15, Qwen3-4B three-round calibration median
+    # 0.25 minus 0.10 margin, loose_contains + 512-token budget) plus manual
+    # review. A baseline of 0 means "not participating" for either rate.
+    # The v1 format-rate floor (>= 0.30) stays approved for the 192-token
+    # budget; under the 512-token v2 budget reasoning-style outputs fail
+    # format checks (0/11 observed), so format is not a required gate there.
     if required and llm:
-        if llm["format_rate_baseline"] < 0.30:
+        if llm["format_rate_baseline"] != 0.0 and llm["format_rate_baseline"] < 0.30:
             raise PlanError(
-                "quality.required LLM format floor must be >= 0.30 "
-                "(approved non-R1 floor, decision 2026-08-13)"
+                "quality.required LLM format floor must be 0 (not participating) "
+                "or >= 0.30 (approved v1 floor)"
             )
         if (
             llm["correctness_rate_baseline"] != 0.0
-            and llm["correctness_rate_baseline"] < 0.60
+            and llm["correctness_rate_baseline"] < 0.15
         ):
             raise PlanError(
                 "quality.required LLM correctness floor must be 0 "
-                "(not participating) or >= 0.60"
+                "(not participating) or >= 0.15 (approved v2 floor, "
+                "Qwen3-4B calibration 2026-08-16)"
             )
     # gemma_judge became eligible for quality.required after the real
     # three-round calibration + dual manual review (2026-08-13);

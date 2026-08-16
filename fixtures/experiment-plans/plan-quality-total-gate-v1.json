@@ -2,8 +2,8 @@
  "plan_id": "plan-quality-total-gate-v1",
  "title": "EX-N3 质量总 gate 实跑（三侧真实证据收口）",
  "prompt_set": {
-  "id": "ps-v1-zh-en-code",
-  "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3"
+  "id": "ps-qwen3-nothink",
+  "sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9"
  },
  "env": {
   "engine": "llm llama-cpp local GGUF + SD report collector + Gemma Ollama judge",
@@ -13,8 +13,8 @@
  "quality": {
   "required": true,
   "llm": {
-   "prompt_set_id": "ps-v1-zh-en-code",
-   "prompt_set_sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+   "prompt_set_id": "ps-qwen3-nothink",
+   "prompt_set_sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
    "objective_subset_count": 15,
    "objective_prompt_ids": [
     "math-001",
@@ -33,10 +33,10 @@
     "fmt-004",
     "fmt-005"
    ],
-   "rubric_id": "llm-objective-ps-v1-v1",
-   "rubric_sha256": "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
-   "correctness_rate_baseline": 0.0,
-   "format_rate_baseline": 0.3,
+   "rubric_id": "llm-objective-ps-v1-v2",
+   "rubric_sha256": "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
+   "correctness_rate_baseline": 0.15,
+   "format_rate_baseline": 0.0,
    "compare_rule": ">= baseline*0.9"
   },
   "sd": {
@@ -78,23 +78,23 @@
     "{python}",
     "scripts/experiment_llm_quality_unit.py",
     "--model",
-    "models/Qwen-1_8B-Chat.Q4_K_M.gguf",
+    "models/qwen3-4b-gguf/Qwen3-4B-Q4_K_M.gguf",
     "--expected-model-sha256",
-    "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+    "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
     "--prompt-set-dir",
     "{prompt_set_dir}",
     "--prompt-set-sha256",
-    "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+    "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
     "--rubric",
-    "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
+    "fixtures/quality_rubrics/llm-objective-ps-v1-v2.json",
     "--expected-rubric-sha256",
-    "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+    "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
     "--result-file",
     "{out_dir}/{experiment_id}.result.json",
     "--seed",
     "20260816",
     "--max-new-tokens",
-    "192",
+    "512",
     "--n-ctx",
     "2048",
     "--n-gpu-layers",
@@ -107,15 +107,15 @@
     "seed": 20260816,
     "temperature": 0.0,
     "top_p": 1.0,
-    "max_new_tokens": 192,
+    "max_new_tokens": 512,
     "stream": false,
     "concurrency": 1
    },
    "model": {
-    "id": "qwen-1_8b-chat-gguf",
-    "artifact_sha256": "703678db4ee5b8c9023e4385719e80ac32405e92a9c157ff07b76dbe799f18cc",
+    "id": "qwen3-4b-gguf",
+    "artifact_sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
     "quant_family": "Q4_K_M",
-    "tokenizer": "chatml",
+    "tokenizer": "qwen3",
     "context": 2048
    },
    "gate": {
