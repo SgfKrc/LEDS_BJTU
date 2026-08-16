@@ -158,22 +158,42 @@ def test_plan_rejects_quality_rubric_or_objective_subset_drift(tmp_path):
 
 
 def test_correctness_floor_zero_allowed_but_weak_format_rejected_as_required(tmp_path):
-    # Decision 2026-08-13 plan 1: with required=true the LLM side judges only
-    # format rate; correctness baseline 0.0 means "not participating" and is
-    # allowed. A format floor below the approved 0.30 stays rejected.
+    # P5/v2 (2026-08-16): correctness 0.0 = not participating; format 0.0 is
+    # also allowed (v2 512-token budget disables the format gate). A format
+    # floor in (0, 0.30) stays rejected.
     path = _quality_plan(tmp_path, required=False).source_path
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["quality"]["required"] = True
     raw["quality"]["llm"]["correctness_rate_baseline"] = 0.0
+    raw["quality"]["llm"]["format_rate_baseline"] = 0.0
     raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
     raw["quality"]["calibration"] = {"series_id": "ex-n3-test-series-v1", "rounds_required": 3, "threshold_version": "v1"}
     path.write_text(json.dumps(raw), encoding="utf-8")
-    plan = load_plan(path)  # allowed: correctness 0 + format 0.9 >= 0.30
+    plan = load_plan(path)  # allowed: both 0 (not participating)
     assert plan.quality.required is True
 
     raw["quality"]["llm"]["format_rate_baseline"] = 0.20
     path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(PlanError, match="format floor"):
+        load_plan(path)
+
+
+def test_required_correctness_floor_uses_v2_approved_0_15(tmp_path):
+    # P5/v2 (2026-08-16): non-zero correctness floor must be >= 0.15
+    # (Qwen3-4B v2 three-round calibration); weaker gates are rejected.
+    path = _quality_plan(tmp_path, required=False).source_path
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["quality"]["required"] = True
+    raw["quality"]["llm"]["correctness_rate_baseline"] = 0.15
+    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
+    raw["quality"]["calibration"] = {"series_id": "ex-n3-test-series-v1", "rounds_required": 3, "threshold_version": "v1"}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    plan = load_plan(path)
+    assert plan.quality.required is True
+
+    raw["quality"]["llm"]["correctness_rate_baseline"] = 0.10
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(PlanError, match="correctness floor"):
         load_plan(path)
 
 
