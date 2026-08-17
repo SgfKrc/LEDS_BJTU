@@ -474,4 +474,64 @@ class ApiClientContractTest {
         val result = runBlocking { unreachable.chat(ChatRequest(message = "x")) }
         assertTrue(result.isFailure)
     }
+
+    // ---- T10：上传前置校验 + poll 边界（测试修复票排期） ----
+
+    @Test
+    fun `T10 upload rejects empty data without hitting network`() {
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(data = ByteArray(0)),
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `T10 upload rejects oversize payload`() {
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(data = ByteArray(DIFFUSION_MAX_UPLOAD_BYTES + 1)),
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `T10 upload rejects illegal purpose`() {
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(
+                    data = ByteArray(8),
+                    purpose = "not_input_image",
+                ),
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `T10 poll rejects negative interval and zero polls`() {
+        val negInterval = runBlocking { client.pollDiffusionJob("j", intervalMillis = -1) }
+        assertTrue(negInterval.isFailure)
+        assertTrue(negInterval.exceptionOrNull() is IllegalArgumentException)
+        val zeroPolls = runBlocking { client.pollDiffusionJob("j", maxPolls = 0) }
+        assertTrue(zeroPolls.isFailure)
+        assertTrue(zeroPolls.exceptionOrNull() is IllegalArgumentException)
+    }
+
+    @Test
+    fun `T10 poll timeout surfaces TimeoutException`() {
+        route("/api/diffusion/jobs/j") { _, respond ->
+            respond(
+                200,
+                """{"job_id":"j","state":"queued","progress":{"step":0,"total":1}}""",
+            )
+        }
+        val result = runBlocking {
+            client.pollDiffusionJob("j", intervalMillis = 1, maxPolls = 1)
+        }
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull() is java.util.concurrent.TimeoutException)
+    }
 }
