@@ -59,6 +59,11 @@ const MEMBER_MUTATION_PREFIXES = [
   '/api/auth',
 ];
 
+function isReadOnlyLocalAssetPreflight(method: string, path: string): boolean {
+  return method === 'POST'
+    && /^\/api\/models\/local-assets\/[^/]+\/preflight$/.test(path);
+}
+
 function normalizedPath(url: string): string {
   const path = String(url || '').split('?', 1)[0] || '/';
   return path.length > 1 ? path.replace(/\/+$/, '') : path;
@@ -82,6 +87,7 @@ export function accessLevelFor(method: string, url: string): AuthAccessLevel {
   if (PUBLIC_ROUTES.has(route)) return 'public';
   if (MACHINE_ROUTES.has(route) || startsWithRoute(path, '/api/models/files')) return 'machine';
   if (MANAGER_PREFIXES.some((prefix) => startsWithRoute(path, prefix))) return 'manager';
+  if (isReadOnlyLocalAssetPreflight(verb, path)) return 'authenticated';
   if (startsWithRoute(path, '/api/auth/users')) return 'manager';
   if (verb !== 'GET' && (
     startsWithRoute(path, '/api/cluster')

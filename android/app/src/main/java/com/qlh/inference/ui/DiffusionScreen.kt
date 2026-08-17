@@ -59,6 +59,7 @@ import com.qlh.inference.media.DiffusionImageDecoder
 import com.qlh.inference.media.ImageAttachmentEncoder
 import com.qlh.inference.network.DiffusionBlobUpload
 import com.qlh.inference.network.DiffusionGenerateRequest
+import com.qlh.inference.ui.theme.QlhShapeTokens
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -190,7 +191,7 @@ fun DiffusionScreen(
                 Image(
                     bitmap = referencePreview,
                     contentDescription = "参考图预览",
-                    modifier = Modifier.size(52.dp).clip(RoundedCornerShape(8.dp)),
+                    modifier = Modifier.size(52.dp).clip(RoundedCornerShape(QlhShapeTokens.control)),
                 )
                 IconButton(
                     onClick = { referenceImage = null },
@@ -246,7 +247,7 @@ fun DiffusionScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(1f)
-                    .clip(RoundedCornerShape(12.dp))
+                    .clip(RoundedCornerShape(QlhShapeTokens.control))
                     .background(MaterialTheme.colorScheme.surfaceVariant)
                     .testTag("diffusion_result"),
             )
@@ -255,7 +256,10 @@ fun DiffusionScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(1f)
-                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp))
+                    .background(
+                        MaterialTheme.colorScheme.surfaceVariant,
+                        RoundedCornerShape(QlhShapeTokens.control)
+                    )
                     .testTag("diffusion_result_empty"),
                 contentAlignment = Alignment.Center,
             ) {
@@ -293,7 +297,7 @@ private fun DiffusionStatus(state: DiffusionUiState) {
         } else {
             MaterialTheme.colorScheme.surfaceContainerHighest
         },
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(QlhShapeTokens.control),
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {

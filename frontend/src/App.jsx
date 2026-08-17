@@ -1,4 +1,14 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
+import {
+  Bot,
+  Image,
+  LayoutDashboard,
+  MessageSquare,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Settings2,
+  ShieldUser,
+} from 'lucide-react';
 import DevicePanel from './components/DevicePanel';
 import ModelSelector from './components/ModelSelector';
 import MetricsPanel from './components/MetricsPanel';
@@ -8,6 +18,9 @@ import SettingsModal from './components/SettingsModal';
 import SessionList from './components/SessionList';
 import DiffusionPanel from './components/DiffusionPanel';
 import UserManagementPanel from './components/UserManagementPanel';
+import qlhDarkLogo from '../../qlh.jpg';
+import qlhLightLogo from '../../qlh-light.jpg';
+import { readStoredUserAvatar, saveStoredUserAvatar } from './avatarPreferences';
 import {
   createSettings,
   mergeSettingsSources,
@@ -95,9 +108,11 @@ export default function App({ authSession, onLogout }) {
   const [lastInferMetrics, setLastInferMetrics] = useState(null);
   const [deviceRefreshKey, setDeviceRefreshKey] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [compactLayout, setCompactLayout] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [themeMode, setThemeMode] = useState(getInitialThemeMode);
   const [systemTheme, setSystemTheme] = useState(getSystemTheme);
+  const [userAvatar, setUserAvatar] = useState(readStoredUserAvatar);
   const [settings, setSettings] = useState(getInitialSettings);
   const settingsRevisionRef = useRef(0);
   const [taskGraphCapability, setTaskGraphCapability] = useState({
@@ -116,9 +131,12 @@ export default function App({ authSession, onLogout }) {
   // P3: 多模型实验支持
   const [activeModelId, setActiveModelId] = useState('qwen-1_8b');
   const [availableModels, setAvailableModels] = useState([]);
+  const [localModelAssets, setLocalModelAssets] = useState([]);
   const [switchingModel, setSwitchingModel] = useState(false);
 
   const theme = themeMode === 'system' ? systemTheme : themeMode;
+  const modelAvatarUrl = theme === 'dark' ? qlhDarkLogo : qlhLightLogo;
+  const sidebarIsCollapsed = sidebarCollapsed || compactLayout;
 
   // 初始化主题，并在“跟随系统”时响应系统深浅色变化
   useEffect(() => {
@@ -147,6 +165,15 @@ export default function App({ authSession, onLogout }) {
       }
     };
   }, [themeMode]);
+
+  useEffect(() => {
+    const media = window.matchMedia?.('(max-width: 720px)');
+    if (!media) return undefined;
+    const updateCompactLayout = () => setCompactLayout(media.matches);
+    updateCompactLayout();
+    media.addEventListener?.('change', updateCompactLayout);
+    return () => media.removeEventListener?.('change', updateCompactLayout);
+  }, []);
 
   // 获取当前节点角色 + 同步分布式推理开关 + 云端设置恢复 + L5 错误上报
   useEffect(() => {
@@ -384,14 +411,21 @@ export default function App({ authSession, onLogout }) {
 
   // P3: 多模型支持 — 加载可用模型列表
   const loadAvailableModels = useCallback(async () => {
-    try {
-      const { fetchModels } = await import('./api/client');
-      const data = await fetchModels();
+    const { fetchModels, fetchLocalModelAssets } = await import('./api/client');
+    const [modelsResult, assetsResult] = await Promise.allSettled([
+      fetchModels(),
+      fetchLocalModelAssets(),
+    ]);
+    if (modelsResult.status === 'fulfilled') {
+      const data = modelsResult.value;
       setAvailableModels(data.models || []);
       if (data.active_model_id) {
         setActiveModelId(data.active_model_id);
       }
-    } catch (_) { /* 静默失败，列表为空 */ }
+    }
+    if (assetsResult.status === 'fulfilled') {
+      setLocalModelAssets(assetsResult.value.assets || []);
+    }
   }, []);
 
   // P3: 切换模型
@@ -415,12 +449,23 @@ export default function App({ authSession, onLogout }) {
     }
   }, [showToast]);
 
+  const handlePreflightLocalModelAsset = useCallback(async (modelId) => {
+    const { preflightLocalModelAsset } = await import('./api/client');
+    const result = await preflightLocalModelAsset(modelId);
+    if (result.gate_passed) {
+      showToast({ type: 'success', msg: 'Sidecar 预检通过；尚未启动模型加载。' });
+    } else {
+      showToast({ type: 'error', msg: 'Sidecar 预检未通过，请查看资产卡结果。' });
+    }
+    return result;
+  }, [showToast]);
+
   // P3: 注册实验模型
-  const handleRegisterModel = useCallback(async (config) => {
+  const handleRegisterModel = useCallback(async (config, { isEdit = false } = {}) => {
     try {
       const { registerModel } = await import('./api/client');
       await registerModel(config);
-      showToast({ type: 'success', msg: `已注册模型: ${config.name}` });
+      showToast({ type: 'success', msg: `${isEdit ? '已更新' : '已注册'}模型: ${config.name}` });
       await loadAvailableModels();
     } catch (e) {
       showToast({ type: 'error', msg: `模型注册失败: ${e.message}` });
@@ -501,6 +546,11 @@ export default function App({ authSession, onLogout }) {
     }
   }, []);
 
+  const updateUserAvatar = useCallback((avatar) => {
+    const saved = saveStoredUserAvatar(avatar);
+    setUserAvatar(saved);
+  }, []);
+
   const handleInferMetrics = useCallback((m) => {
     setLastInferMetrics(m);
     setRefreshKey((k) => k + 1);
@@ -515,68 +565,105 @@ export default function App({ authSession, onLogout }) {
   return (
     <div className={`app-layout${activeView === 'account' ? ' account-active' : ''}`}>
       {/* Sidebar */}
-      <aside className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}`}>
+      <aside className={`sidebar${sidebarIsCollapsed ? ' collapsed' : ''}`}>
         <div className="sidebar-header">
           <button
             className="sidebar-toggle-btn"
             onClick={() => setSidebarCollapsed((prev) => !prev)}
-            title={sidebarCollapsed ? '展开侧边栏 (Ctrl+B)' : '折叠侧边栏 (Ctrl+B)'}
+            title={sidebarIsCollapsed ? '展开侧边栏 (Ctrl+B)' : '折叠侧边栏 (Ctrl+B)'}
+            aria-label={sidebarIsCollapsed ? '展开侧边栏' : '折叠侧边栏'}
           >
-            {sidebarCollapsed ? '☰' : '◀'}
+            {sidebarIsCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
           </button>
-          {!sidebarCollapsed && (
+          {!sidebarIsCollapsed && (
             <>
-              <h1>边缘推理优化系统</h1>
-              <div className="subtitle">
-                北京交通大学 · 大创项目 | Qwen-1.8B-Chat
+              <div className="brand-lockup">
+                <button
+                  type="button"
+                  className="brand-mark brand-account-entry"
+                  onClick={() => setActiveView('account')}
+                  title="账户与安全"
+                  aria-label="打开账户与安全"
+                >
+                  <Bot size={20} aria-hidden="true" />
+                </button>
+                <div>
+                  <span className="workspace-kicker">QLH / EDGE</span>
+                  <h1>边缘推理系统</h1>
+                  <div className="subtitle">本地主节点工作台</div>
+                </div>
               </div>
 
               {/* 导航切换 */}
-              <div className="nav-tabs">
+              <nav className="nav-tabs" aria-label="主导航">
                 <button
                   className={`nav-tab ${activeView === 'chat' ? 'active' : ''}`}
                   onClick={() => setActiveView('chat')}
+                  aria-current={activeView === 'chat' ? 'page' : undefined}
                 >
-                  💬 对话
+                  <MessageSquare size={16} aria-hidden="true" />
+                  <span>对话</span>
                 </button>
                 {showDiffusionTab && (
                   <button
                     className={`nav-tab ${activeView === 'image' ? 'active' : ''}`}
                     onClick={() => setActiveView('image')}
+                    aria-current={activeView === 'image' ? 'page' : undefined}
                   >
-                    图像
+                    <Image size={16} aria-hidden="true" />
+                    <span>图像工作区</span>
                   </button>
                 )}
                 {showAdminTab && (
                   <button
                     className={`nav-tab ${activeView === 'admin' ? 'active' : ''}`}
                     onClick={() => setActiveView('admin')}
+                    aria-current={activeView === 'admin' ? 'page' : undefined}
                   >
-                    ⚙️ 后台管理
+                    <LayoutDashboard size={16} aria-hidden="true" />
+                    <span>后台管理</span>
                   </button>
                 )}
                 {authSession && (
                   <button
                     className={`nav-tab ${activeView === 'account' ? 'active' : ''}`}
                     onClick={() => setActiveView('account')}
+                    aria-current={activeView === 'account' ? 'page' : undefined}
                   >
-                    账户
+                    <ShieldUser size={16} aria-hidden="true" />
+                    <span>账户与安全</span>
                   </button>
                 )}
+                <button
+                  className="nav-tab"
+                  onClick={() => setSettingsOpen(true)}
+                >
+                  <Settings2 size={16} aria-hidden="true" />
+                  <span>系统设置</span>
+                </button>
+              </nav>
+
+              <div className="sidebar-system-status" aria-label={`推理服务${modelLoaded ? '已就绪' : '待命'}`}>
+                <span className={`system-status-dot ${modelLoaded ? 'ready' : 'standby'}`} aria-hidden="true" />
+                <div>
+                  <span>推理服务</span>
+                  <strong>{modelLoaded ? 'ONLINE' : 'STANDBY'}</strong>
+                </div>
+                <span className="system-status-meta">{currentQuant || 'unloaded'}</span>
               </div>
             </>
           )}
-          {sidebarCollapsed && (
-            <div className="sidebar-collapsed-icon">🧠</div>
+          {sidebarIsCollapsed && (
+            <div className="sidebar-collapsed-icon" title="QLH 边缘推理系统"><Bot size={20} /></div>
           )}
         </div>
 
-        {!sidebarCollapsed ? (
+        {!sidebarIsCollapsed ? (
           <>
             {activeView === 'image' ? (
               <div className="sidebar-section diffusion-sidebar-status">
                 <h3>图像引擎</h3>
-                <div className="diffusion-sidebar-model">
+                <div className={`diffusion-sidebar-model ${diffusionLoaded ? 'loaded' : 'unloaded'}`}>
                   <strong>Stable Diffusion 1.5</strong>
                   <span>{diffusionLoaded ? '本地模型已加载' : '本地模型未加载'}</span>
                 </div>
@@ -584,10 +671,12 @@ export default function App({ authSession, onLogout }) {
               </div>
             ) : activeView === 'account' ? (
               <div className="account-sidebar-summary">
-                <span className="workspace-kicker">SIGNED IN</span>
-                <strong>{authSession.user?.display_name || authSession.user?.username || '本地用户'}</strong>
-                <span>{authSession.user?.role || 'member'}</span>
-                <small>{authSession.user?.username || ''}</small>
+                <span className="workspace-kicker">{authSession ? 'SIGNED IN' : 'LOCAL MODE'}</span>
+                <strong>{authSession
+                  ? (authSession.user?.display_name || authSession.user?.username || '本地用户')
+                  : '认证服务未启用'}</strong>
+                <span>{authSession ? (authSession.user?.role || 'member') : '兼容模式'}</span>
+                <small>{authSession?.user?.username || '账户入口可用；登录后可管理认证与组网'}</small>
               </div>
             ) : (
               <>
@@ -626,16 +715,18 @@ export default function App({ authSession, onLogout }) {
               className="sidebar-icon-btn"
               onClick={() => { setSidebarCollapsed(false); setActiveView('chat'); }}
               title="对话"
+              aria-label="对话"
             >
-              💬
+              <MessageSquare size={19} aria-hidden="true" />
             </button>
             {showDiffusionTab && (
               <button
                 className="sidebar-icon-btn"
                 onClick={() => { setSidebarCollapsed(false); setActiveView('image'); }}
                 title="图像生成"
+                aria-label="图像工作区"
               >
-                ◫
+                <Image size={19} aria-hidden="true" />
               </button>
             )}
             {showAdminTab && (
@@ -643,8 +734,9 @@ export default function App({ authSession, onLogout }) {
                 className="sidebar-icon-btn"
                 onClick={() => { setSidebarCollapsed(false); setActiveView('admin'); }}
                 title="后台管理"
+                aria-label="后台管理"
               >
-                ⚙️
+                <LayoutDashboard size={19} aria-hidden="true" />
               </button>
             )}
             {authSession && (
@@ -652,16 +744,18 @@ export default function App({ authSession, onLogout }) {
                 className="sidebar-icon-btn"
                 onClick={() => { setSidebarCollapsed(false); setActiveView('account'); }}
                 title="账户与安全"
+                aria-label="账户与安全"
               >
-                ●
+                <ShieldUser size={19} aria-hidden="true" />
               </button>
             )}
             <button
               className="sidebar-icon-btn"
               onClick={() => setSettingsOpen(true)}
               title="系统设置"
+              aria-label="系统设置"
             >
-              🔧
+              <Settings2 size={19} aria-hidden="true" />
             </button>
           </div>
         )}
@@ -677,14 +771,31 @@ export default function App({ authSession, onLogout }) {
             onDiffusionStateChange={setDiffusionLoaded}
           />
         </div>
-        {activeView === 'account' && authSession && (
+        {activeView === 'account' && (authSession ? (
           <UserManagementPanel
             authSession={authSession}
             onLogout={onLogout}
             onToast={showToast}
             onClose={() => setActiveView('chat')}
           />
-        )}
+        ) : (
+          <section className="account-legacy-panel" aria-labelledby="account-legacy-title">
+            <div className="workspace-header">
+              <div>
+                <span className="workspace-kicker">LOCAL MODE</span>
+                <h2 id="account-legacy-title">账户与安全</h2>
+                <p>当前主节点处于兼容模式，认证服务尚未启用。机器人入口仍可用于返回此状态页。</p>
+              </div>
+              <button
+                type="button"
+                className="setting-btn secondary"
+                onClick={() => setActiveView('chat')}
+              >
+                返回对话
+              </button>
+            </div>
+          </section>
+        ))}
         {activeView !== 'image' && activeView !== 'account' && (
           activeView === 'chat' || !showAdminTab ? (
             <ChatPanel
@@ -698,6 +809,8 @@ export default function App({ authSession, onLogout }) {
               sessionId={activeSessionId}
               onCreateSession={handleCreateSession}
               onRenameSession={handleRenameSession}
+              userAvatar={userAvatar}
+              modelAvatarUrl={modelAvatarUrl}
             />
           ) : (
             <AdminPanel
@@ -720,6 +833,8 @@ export default function App({ authSession, onLogout }) {
         themeMode={themeMode}
         onToggleTheme={toggleTheme}
         onThemeModeChange={setThemePreference}
+        userAvatar={userAvatar}
+        onUserAvatarChange={updateUserAvatar}
         settings={settings}
         taskGraphCapability={taskGraphCapability}
         onSettingsChange={updateSettings}
@@ -730,9 +845,11 @@ export default function App({ authSession, onLogout }) {
         myRole={myRole}
         activeModelId={activeModelId}
         availableModels={availableModels}
+        localModelAssets={localModelAssets}
         switchingModel={switchingModel}
         onLoadModels={loadAvailableModels}
         onSwitchModel={handleSwitchModel}
+        onPreflightLocalModelAsset={handlePreflightLocalModelAsset}
         onRegisterModel={handleRegisterModel}
         onUnregisterModel={handleUnregisterModel}
       />

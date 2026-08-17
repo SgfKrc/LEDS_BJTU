@@ -35,7 +35,9 @@ DEFAULT_PORT = 9090
 ROOT = os.path.dirname(os.path.abspath(__file__))  # packaging/
 DIST_DIR = os.path.join(ROOT, "dist")
 PROJECT_ROOT = os.path.dirname(ROOT)
-BUNDLE_DIR = os.path.join(PROJECT_ROOT, "build", "offline-bundles")
+# 整合包目录：默认 build/offline-bundles；大包可放其他盘（如 D:/qlh-bundles）
+BUNDLE_DIR = os.environ.get(
+    "QLH_BUNDLE_DIR", os.path.join(PROJECT_ROOT, "build", "offline-bundles"))
 # 整合包命名：qlh-models-{pc|android}-v1.7z（PC 为分卷 .001-007，安卓单卷）
 BUNDLE_URL_PREFIX = "/models-bundle/" 
 ANDROID_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "android", "app", "build", "outputs")

@@ -1,5 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
+  Activity,
+  Bell,
+  Network,
+  RefreshCw,
+  Server,
+  ShieldCheck,
+  SlidersHorizontal,
+  Users,
+} from 'lucide-react';
+import {
   fetchClusterStatus, fetchClusterNodes,
   fetchClusterConfig, deregisterNode, deleteClusterNode, updateMaxNodes,
   fetchInviteInfo, connectToMaster, fetchMyRole,
@@ -19,6 +29,20 @@ import {
 
 const ROLE_LABELS = { master: '主节点', client: '从节点' };
 const ROLE_ICONS = { master: '🖥️', client: '💻' };
+
+const MASTER_WORKSPACES = Object.freeze([
+  { id: 'overview', label: '概览', description: '集群就绪状态、节点摘要与流水线拓扑', Icon: Activity },
+  { id: 'nodes', label: '节点', description: '注册、发现、邀请和节点连接信息', Icon: Users },
+  { id: 'runtime', label: '运行时', description: '分布式推理、队列、分层与容量配置', Icon: SlidersHorizontal },
+  { id: 'availability', label: '高可用', description: '主节点身份、备用节点和角色转让', Icon: ShieldCheck },
+  { id: 'audit', label: '审查与告警', description: '转让审查与通知配置', Icon: Bell },
+]);
+
+const CLIENT_WORKSPACES = Object.freeze([
+  { id: 'overview', label: '概览', description: '本节点状态与可用流水线信息', Icon: Activity },
+  { id: 'nodes', label: '连接', description: '主节点发现、连接和本节点详情', Icon: Network },
+  { id: 'runtime', label: '运行时', description: '本节点的分布式推理开关和同步状态', Icon: SlidersHorizontal },
+]);
 
 // 动态加载的模块引用（避免 window 全局污染）
 let _deleteReviewTicketFn = null;
@@ -310,6 +334,7 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
   const [config, setConfig] = useState(null);
   const [invite, setInvite] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [activeAdminWorkspace, setActiveAdminWorkspace] = useState('overview');
   const [deregistering, setDeregistering] = useState(null);
   const [maxNodesInput, setMaxNodesInput] = useState('');
   const [updatingMaxNodes, setUpdatingMaxNodes] = useState(false);
@@ -381,6 +406,15 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
   const isMaster = myRole?.is_master ?? false;
   const isProvisional = myRole?.is_provisional ?? false;
   const refreshInFlight = useRef(null);
+  const adminWorkspaces = isMaster ? MASTER_WORKSPACES : CLIENT_WORKSPACES;
+  const activeWorkspace = adminWorkspaces.find(item => item.id === activeAdminWorkspace)
+    || adminWorkspaces[0];
+
+  useEffect(() => {
+    if (!adminWorkspaces.some(item => item.id === activeAdminWorkspace)) {
+      setActiveAdminWorkspace('overview');
+    }
+  }, [activeAdminWorkspace, adminWorkspaces]);
 
   // 拉取全部数据
   const refresh = useCallback(() => {
@@ -1032,23 +1066,45 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
     <div className="admin-panel">
       {/* Header */}
       <div className="chat-header">
-        <h2>⚙️ 后台管理 · 节点管理</h2>
+        <h2 className="admin-title"><Server size={18} aria-hidden="true" />后台管理</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <span className={`cluster-mode-badge ${runMode}`}>
-            {runMode === 'distributed' ? '🌐 分布式' : '🏠 单机'}
+            {runMode === 'distributed' ? '分布式' : '单机'}
           </span>
           {isMaster ? (
-            <span className="role-badge" data-role="master">🖥️ 主节点</span>
+            <span className="role-badge" data-role="master">主节点</span>
           ) : isProvisional ? (
             <span className="role-badge" data-role="unknown">待配置节点</span>
           ) : (
-            <span className="role-badge" data-role="client">💻 {myRole?.node_id || '从节点'}</span>
+            <span className="role-badge" data-role="client">{myRole?.node_id || '从节点'}</span>
           )}
-          <button className="btn-ghost" onClick={refresh} title="刷新">🔄</button>
+          <button className="btn-ghost icon-only-btn" onClick={refresh} title="刷新" aria-label="刷新后台状态">
+            <RefreshCw size={16} aria-hidden="true" />
+          </button>
         </div>
       </div>
 
-      <div className="admin-content">
+      <div className="admin-content" data-active-workspace={activeWorkspace.id}>
+        <div className="admin-workspace-tabs" role="tablist" aria-label="后台管理工作区">
+          {adminWorkspaces.map(({ id, label, description, Icon }) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={activeWorkspace.id === id}
+              className={`admin-workspace-tab${activeWorkspace.id === id ? ' active' : ''}`}
+              title={description}
+              onClick={() => setActiveAdminWorkspace(id)}
+            >
+              <Icon size={15} aria-hidden="true" />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
+        <div className="admin-workspace-summary" aria-live="polite">
+          {activeWorkspace.description}
+        </div>
+
         {/* ---- 从节点：主节点宕机告警 ---- */}
         {!isMaster && masterHealth && !masterHealth.master_online && (
           <div className="master-down-banner">
@@ -1067,8 +1123,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 从节点：连接主节点面板 ---- */}
         {!isMaster && (
-          <section className="admin-section">
-            <h3>🔗 连接主节点</h3>
+          <section className="admin-section" data-admin-workspace="nodes">
+            <h3>连接主节点</h3>
             <div className="connect-panel">
               <p className="connect-desc">
                 {isProvisional
@@ -1141,8 +1197,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 主节点：手动注册从节点 ---- */}
         {isMaster && (
-          <section className="admin-section">
-            <h3>📝 手动注册从节点</h3>
+          <section className="admin-section" data-admin-workspace="nodes">
+            <h3>手动注册从节点</h3>
             <div className="connect-panel">
               <p className="connect-desc">
                 手动录入从节点信息以预留槽位。注册后节点显示为离线状态，
@@ -1219,18 +1275,18 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
         )}
 
         {/* ---- 集群概览卡片 ---- */}
-        <section className="admin-section">
-          <h3>📊 {isMaster ? '集群概览' : '本节点状态'}</h3>
+        <section className="admin-section" data-admin-workspace="overview">
+          <h3>{isMaster ? '集群概览' : '本节点状态'}</h3>
           <div className="admin-stats-grid">
             <div className={`admin-stat-card ${nodesReady ? 'ready' : 'not-ready'}`}>
-              <div className="stat-icon">{nodesReady ? '✅' : '⚠️'}</div>
+              <div className="stat-icon" aria-hidden="true"><Activity size={19} /></div>
               <div className="stat-info">
                 <div className="stat-value">{nodesReady ? '就绪' : '未就绪'}</div>
                 <div className="stat-label">集群状态</div>
               </div>
             </div>
             <div className="admin-stat-card online">
-              <div className="stat-icon">🟢</div>
+              <div className="stat-icon" aria-hidden="true"><Users size={19} /></div>
               <div className="stat-info">
                 <div className="stat-value">
                   {onlineCount}
@@ -1240,14 +1296,14 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
               </div>
             </div>
             <div className="admin-stat-card offline">
-              <div className="stat-icon">🔴</div>
+              <div className="stat-icon" aria-hidden="true"><Network size={19} /></div>
               <div className="stat-info">
                 <div className="stat-value">{offlineCount}</div>
                 <div className="stat-label">离线节点</div>
               </div>
             </div>
             <div className={`admin-stat-card ${currentTask ? 'busy' : 'idle'}`}>
-              <div className="stat-icon">{currentTask ? '🔄' : '💤'}</div>
+              <div className="stat-icon" aria-hidden="true"><SlidersHorizontal size={19} /></div>
               <div className="stat-info">
                 <div className="stat-value">{currentTask ? '运行中' : '空闲'}</div>
                 <div className="stat-label">
@@ -1262,8 +1318,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 主节点：注册新节点邀请面板 ---- */}
         {isMaster && invite && (
-          <section className="admin-section">
-            <h3>📨 注册新节点</h3>
+          <section className="admin-section" data-admin-workspace="nodes">
+            <h3>注册新节点</h3>
             <div className="invite-panel">
               <p className="connect-desc">
                 将以下连接信息提供给新节点。新节点在「设置 → 分布式推理优化」中开启后，
@@ -1339,8 +1395,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
         )}
 
         {/* ---- 节点列表 ---- */}
-        <section className="admin-section">
-          <h3>🖥️ {isMaster ? '已注册节点' : '本节点详情'}</h3>
+        <section className="admin-section" data-admin-workspace="overview nodes">
+          <h3>{isMaster ? '已注册节点' : '本节点详情'}</h3>
           {isMaster && (
             <div className="queue-control-row" style={{ marginBottom: 8 }}>
               <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -1535,8 +1591,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 节点容量配置（仅主节点） ---- */}
         {isMaster && config && (
-          <section className="admin-section">
-            <h3>🔧 节点容量配置</h3>
+          <section className="admin-section" data-admin-workspace="runtime">
+            <h3>节点容量配置</h3>
             <div className="max-nodes-config">
               <div className="max-nodes-info">
                 <span className="config-key">最大节点数</span>
@@ -1562,8 +1618,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 主节点身份管理（仅主节点） ---- */}
         {isMaster && (
-          <section className="admin-section">
-            <h3>🔐 主节点身份管理</h3>
+          <section className="admin-section" data-admin-workspace="availability">
+            <h3>主节点身份管理</h3>
             <div className="identity-management">
               <p className="connect-desc">
                 主节点使用物理网卡 MAC 地址作为不可变身份标识。
@@ -1610,8 +1666,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 备用主节点（仅主节点） ---- */}
         {isMaster && (
-          <section className="admin-section">
-            <h3>🛡️ 备用主节点</h3>
+          <section className="admin-section" data-admin-workspace="availability">
+            <h3>备用主节点</h3>
             <div className="identity-management">
               <p className="connect-desc">
                 指定一个从节点作为备用主节点。转让期间，备用主节点<strong>暂代主节点职责</strong>填补空窗期。
@@ -1726,8 +1782,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 角色转让（仅主节点） ---- */}
         {isMaster && (
-          <section className="admin-section">
-            <h3>🔄 转让主节点身份</h3>
+          <section className="admin-section" data-admin-workspace="availability">
+            <h3>转让主节点身份</h3>
             <div className="identity-management">
               <p className="connect-desc">
                 将主节点身份转让给任意在线从节点。<strong>备用主节点</strong>在转让空窗期暂代主节点职责。
@@ -1840,8 +1896,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 主节点转让审查（仅主节点可见） ---- */}
         {isMaster && (
-          <section className="admin-section">
-            <h3>🗳️ 主节点转让审查</h3>
+          <section className="admin-section" data-admin-workspace="audit">
+            <h3>主节点转让审查</h3>
             <p className="connect-desc">
               主节点转让需要经过集群中 PC 独显节点的投票审查。
               投票通过（≥ +2）后，转让操作才会生效。仅 NVIDIA CUDA 独显节点可投票。
@@ -1966,8 +2022,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 邮件告警配置与测试（仅主节点；管理员邮箱为集群级配置） ---- */}
         {isMaster && (
-        <section className="admin-section">
-          <h3>📧 邮件告警</h3>
+        <section className="admin-section" data-admin-workspace="audit">
+          <h3>邮件告警</h3>
           <div className="identity-management">
             <p className="connect-desc">
               当从节点检测到主节点宕机超过 {180}s 时，将自动向管理员发送告警邮件。
@@ -2022,8 +2078,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
         )}
 
         {/* ---- 分布式推理开关（所有节点可见） ---- */}
-        <section className="admin-section">
-          <h3>🌐 分布式推理</h3>
+        <section className="admin-section" data-admin-workspace="runtime">
+          <h3>分布式推理</h3>
           <div className="distributed-toggle-panel">
             <p className="connect-desc">
               {isMaster
@@ -2048,8 +2104,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 动态分层配置（仅主节点） ---- */}
         {config && isMaster && (
-          <section className="admin-section">
-            <h3>📋 分布式配置</h3>
+          <section className="admin-section" data-admin-workspace="runtime">
+            <h3>分布式配置</h3>
             <div className="admin-config-grid">
               <div className="config-card">
                 <div className="config-card-header">🌐 网络配置</div>
@@ -2149,8 +2205,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 推理调度队列 (Phase 3 — 仅主节点) ---- */}
         {isMaster && (
-          <section className="admin-section">
-            <h3>📋 推理调度</h3>
+          <section className="admin-section" data-admin-workspace="runtime">
+            <h3>推理调度</h3>
             <div className="queue-panel">
               {/* Header: strategy + status + controls */}
               <div className="queue-header-row">
@@ -2266,8 +2322,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 手动覆盖分层（仅主节点） ---- */}
         {isMaster && layerAssignment?.assignments && layerAssignment.assignments.length > 0 && (
-          <section className="admin-section">
-            <h3>✏️ 手动覆盖分层</h3>
+          <section className="admin-section" data-admin-workspace="runtime">
+            <h3>手动覆盖分层</h3>
             <div className="layer-override-panel">
               <p className="connect-desc">
                 修改各节点的层区间将切换为手动覆盖模式。修改后自动推送到所有已连接的从节点。
@@ -2315,8 +2371,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 流水线拓扑（仅主节点 + 分布式模式） ---- */}
         {isMaster && distributedEnabled && layerAssignment?.assignments && layerAssignment.assignments.length > 0 && (
-          <section className="admin-section">
-            <h3>🔗 流水线拓扑</h3>
+          <section className="admin-section" data-admin-workspace="overview runtime">
+            <h3>流水线拓扑</h3>
             <PipelineTopology
               assignments={layerAssignment.assignments}
               nodes={nodes?.nodes || []}
@@ -2329,8 +2385,8 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
 
         {/* ---- 云同步状态 ---- */}
         {distributedEnabled && syncStatus && (
-          <section className="admin-section">
-            <h3>☁️ 云同步状态</h3>
+          <section className="admin-section" data-admin-workspace="runtime">
+            <h3>云同步状态</h3>
             <div className="sync-status-panel">
               <div className="sync-status-row">
                 <span>本地存储</span>

@@ -468,6 +468,51 @@ export async function fetchModels() {
   return request('/models');
 }
 
+export async function fetchLocalModelAssets() {
+  return request('/models/local-assets');
+}
+
+export async function preflightLocalModelAsset(modelId) {
+  return request(`/models/local-assets/${encodeURIComponent(modelId)}/preflight`, {
+    method: 'POST',
+  });
+}
+
+export async function fetchModelRuntimeSidecars() {
+  return request('/cluster/model-runtime/sidecars');
+}
+
+export async function fetchModelRuntimeContracts() {
+  return request('/cluster/model-runtime/contracts');
+}
+
+export async function bindModelRuntimeContract(profile, modelId) {
+  return request('/cluster/model-runtime/contracts/bind', {
+    method: 'POST',
+    body: JSON.stringify({ profile, model_id: modelId }),
+  });
+}
+
+export async function beginModelRuntimeSidecar(profile, contract, contractId = '') {
+  return request('/cluster/model-runtime/sidecars/begin', {
+    method: 'POST',
+    body: JSON.stringify({ profile, contract, ...(contractId ? { contract_id: contractId } : {}) }),
+  });
+}
+
+export async function releaseModelRuntimeSidecar(profile) {
+  return request('/cluster/model-runtime/sidecars/release', {
+    method: 'POST',
+    body: JSON.stringify({ profile }),
+  });
+}
+
+export async function cancelModelRuntimeSidecar(profile) {
+  return request(`/cluster/model-runtime/sidecars/${encodeURIComponent(profile)}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function switchModel(modelId, quantType = 'int4', engine = 'auto') {
   return request('/models/switch', {
     method: 'POST',

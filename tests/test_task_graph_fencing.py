@@ -8,6 +8,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from task_graph import StageSpec, TaskGraphCoordinator, WorkflowExecutionError
+from tests.helpers.task_graph_common import (
+    assert_no_active_reservations,
+    single_stage,
+)
 from task_journal import SQLiteTaskJournal
 from task_provider import (
     DeterministicFakeProvider,
@@ -16,26 +20,6 @@ from task_provider import (
     ProviderRegistry,
     StageResult,
 )
-
-
-def _single_stage(*, pure=True, lease_timeout_seconds=1.0):
-    return [
-        StageSpec(
-            "answer",
-            "full_inference",
-            provider="primary",
-            fallback_providers=("fallback",),
-            pure=pure,
-            lease_timeout_seconds=lease_timeout_seconds,
-        ),
-    ]
-
-
-def _assert_no_active_reservations(coordinator):
-    assert all(
-        status["active_reservations"] == 0
-        for status in coordinator.provider_status()
-    )
 
 
 def test_accept_timeout_falls_back_before_creating_a_lease():
@@ -47,7 +31,7 @@ def test_accept_timeout_falls_back_before_creating_a_lease():
     coordinator = TaskGraphCoordinator(provider_registry=registry)
 
     output, workflow = coordinator.run(
-        _single_stage(),
+        single_stage(),
         "answer",
         {"message": "question"},
         workflow_id="wf_acceptretry",
@@ -66,7 +50,7 @@ def test_accept_timeout_falls_back_before_creating_a_lease():
         "fallback",
     ]
     assert stage["winner_attempt_id"] == stage["attempts"][0]["attempt_id"]
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -82,7 +66,7 @@ def test_retryable_disconnect_expires_old_attempt_and_fences_late_result():
     coordinator = TaskGraphCoordinator(provider_registry=registry)
 
     output, workflow = coordinator.run(
-        _single_stage(),
+        single_stage(),
         "answer",
         {"message": "question"},
         workflow_id="wf_disconnect1",
@@ -141,7 +125,7 @@ def test_retryable_disconnect_expires_old_attempt_and_fences_late_result():
     assert current["stages"][0]["last_result_rejection_reason"] == (
         "winner_digest_mismatch"
     )
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -163,7 +147,7 @@ def test_execution_timeout_rejects_result_and_reassigns_with_new_epoch(tmp_path)
     )
 
     output, workflow = coordinator.run(
-        _single_stage(lease_timeout_seconds=0.15),
+        single_stage(lease_timeout_seconds=0.15),
         "answer",
         {"message": "question"},
         workflow_id="wf_leasetimeout",
@@ -186,7 +170,7 @@ def test_execution_timeout_rejects_result_and_reassigns_with_new_epoch(tmp_path)
     ]
     assert len(rejection_events) == 1
     assert rejection_events[0]["payload"]["reason"] == "lease_expired"
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -223,7 +207,7 @@ def test_local_model_is_fenced_by_epoch_but_not_forcibly_timed_out():
     assert attempt["lease_epoch"] == 1
     assert attempt["lease_enforced"] is False
     assert attempt["state"] == "completed"
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -240,7 +224,7 @@ def test_invalid_output_schema_is_rejected_without_fallback():
 
     with pytest.raises(WorkflowExecutionError, match="invalid_result_schema"):
         coordinator.run(
-            _single_stage(),
+            single_stage(),
             "answer",
             {"message": "question"},
             workflow_id="wf_invalidschema",
@@ -250,7 +234,7 @@ def test_invalid_output_schema_is_rejected_without_fallback():
     assert stage["attempts"][0]["state"] == "failed"
     assert stage["winner_attempt_id"] == ""
     assert fallback.call_records() == []
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -303,7 +287,7 @@ def test_wrong_epoch_is_rejected_before_winner_and_valid_result_can_commit():
     assert completed[0][1]["stages"][0]["winner_attempt_id"] == attempt[
         "attempt_id"
     ]
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -340,7 +324,7 @@ def test_provider_result_attempt_identity_is_not_silently_rebound():
     stage = coordinator.get("wf_wrongattempt")["stages"][0]
     assert stage["winner_attempt_id"] == ""
     assert stage["attempts"][0]["state"] == "failed"
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -377,7 +361,7 @@ def test_partial_provider_result_identity_is_rejected_not_completed():
     stage = coordinator.get("wf_partialidentity")["stages"][0]
     assert stage["winner_attempt_id"] == ""
     assert stage["attempts"][0]["state"] == "failed"
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -407,7 +391,7 @@ def test_fallback_requires_both_pure_stage_and_retryable_error(
 
     with pytest.raises(WorkflowExecutionError, match=expected_code):
         coordinator.run(
-            _single_stage(pure=pure),
+            single_stage(pure=pure),
             "answer",
             {"message": "question"},
             workflow_id=f"wf_guardcase{int(pure)}{int(retryable)}",
@@ -418,7 +402,7 @@ def test_fallback_requires_both_pure_stage_and_retryable_error(
     assert len(stage["attempts"]) == 1
     assert stage["attempts"][0]["state"] == "failed"
     assert fallback.call_records() == []
-    _assert_no_active_reservations(coordinator)
+    assert_no_active_reservations(coordinator)
     coordinator.close()
 
 
@@ -494,7 +478,7 @@ def test_fault_loop_commits_each_aggregate_once_and_never_accepts_old_epoch():
         assert rejected["status"] == "rejected"
         assert rejected["winner_attempt_id"] == winner["attempt_id"]
         assert aggregate_calls.count(workflow_id) == 1
-        _assert_no_active_reservations(coordinator)
+        assert_no_active_reservations(coordinator)
 
     assert len(aggregate_calls) == loop_count
     coordinator.close()

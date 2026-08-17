@@ -42,7 +42,7 @@ Android 后续不再限定为“全有或全无”，但必须区分三个完全
 | 能力 | Full | Lite |
 |---|:---:|:---:|
 | Android 原生 UI、会话和 Room 存储 | 是 | 是 |
-| Material 3 主题体系与共享组件（2026-07-26 重构，见 §2.3） | 是 | 是 |
+| Material 3 主题体系与共享组件（2026-07-26 重构、2026-08-17 UX-04 中性 token 映射，见 §2.3） | 是 | 是 |
 | 连接 PC 主节点并转发聊天 | 是 | 是 |
 | SAF 模型目录和 GGUF 模型选择 | 是 | 否 |
 | llama.cpp JNI 完整模型生成 | 是 | 否 |
@@ -90,9 +90,9 @@ Android Full 使用 GGUF + llama.cpp。其公开 API 面向完整 decode，量�
 
 | 范围 | 内容 |
 |---|---|
-| 主题 | `ui/theme/{Color,Theme,Type}.kt` 换为完整 Material 3 色调系统（曜蓝主色），亮/暗双套，含 `surfaceContainer` 层次 |
-| 共享组件 | 新增 `ui/components/Common.kt`：`QlhTopBar`、`StatusChip`、`SettingsGroup`、`SettingRow`、`EmptyState` |
-| 对话页 | 气泡重做（用户/助手容器色 + 对齐 + 85% 限宽、20dp 圆角带 6dp 尾角）；顶栏加本地/远程状态角标；圆角胶囊输入栏 |
+| 主题 | `ui/theme/{Color,Theme,Type}.kt` 使用中性 Material 3 色调系统：浅色白底黑字、深色黑底白字，灰阶 `surfaceContainer` 层次；状态色独立，全部排版 token 字距为零 |
+| 共享组件 | 新增 `ui/components/Common.kt`：`QlhTopBar`、`StatusChip`、`SettingsGroup`、`SettingRow`、`EmptyState`；普通控件/卡片统一 `8dp`，状态角标保留胶囊形状 |
+| 对话页 | 气泡重做（用户/助手容器色 + 对齐 + 85% 限宽、8dp 圆角带 4dp 尾角）；顶栏加本地/远程状态角标；8dp 输入栏 |
 | 会话页 | `SessionListScreen` 改为卡片式 |
 | 设置页 | `SettingsScreen` 重排为 8 个分组卡片；36 个参数、回调、`testTag` 与极简版分支全部保留 |
 

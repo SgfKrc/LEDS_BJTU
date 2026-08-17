@@ -35,8 +35,9 @@ import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = REPO_ROOT / "build" / "offline-bundles"
-BUNDLE_VERSION = "v1"
+OUT_DIR = Path(os.environ.get(
+    "QLH_BUNDLE_OUT", str(REPO_ROOT / "build" / "offline-bundles")))
+BUNDLE_VERSION = "v2"
 
 SEVEN_ZIP_CANDIDATES = (
     r"C:\Program Files\7-Zip\7z.exe",
@@ -45,6 +46,56 @@ SEVEN_ZIP_CANDIDATES = (
 
 # 资产注册表：asset_id -> 相对路径（目录或文件）+ 说明
 ASSETS: dict[str, dict] = {
+    "qwen3-4b-safetensors": {
+        "path": "models/qwen3-4b", "kind": "dir", "scope": "pc",
+        "desc": "Qwen3-4B Safetensors（实验/训练）",
+        "fetch": "ModelScope Qwen/Qwen3-4B（受管下载）",
+    },
+    "qwen3vl-4b-safetensors": {
+        "path": "models/qwen3-vl-4b-instruct", "kind": "dir", "scope": "pc",
+        "desc": "Qwen3-VL-4B Safetensors（多模态）",
+        "fetch": "ModelScope Qwen/Qwen3-VL-4B-Instruct",
+    },
+    "qwen3vl-4b-gguf": {
+        "path": "models/qwen3-vl-4b-instruct-gguf", "kind": "dir", "scope": "pc",
+        "desc": "Qwen3-VL-4B GGUF + mmproj（多模态 CPU）",
+        "fetch": "ModelScope Qwen/Qwen3-VL-4B-Instruct-GGUF",
+    },
+    "qwen35-2b-safetensors": {
+        "path": "models/qwen3-5-2b", "kind": "dir", "scope": "pc",
+        "desc": "Qwen3.5-2B Safetensors",
+        "fetch": "ModelScope Qwen/Qwen3.5-2B",
+    },
+    "qwen35-2b-gguf": {
+        "path": "models/qwen3-5-2b-gguf", "kind": "dir", "scope": "both",
+        "desc": "Qwen3.5-2B GGUF Q4_K_M（本地转换）",
+        "fetch": "本地 gguf-convert（官方无 GGUF）",
+    },
+    "qwen35-9b-safetensors": {
+        "path": "models/qwen3-5-9b", "kind": "dir", "scope": "pc",
+        "desc": "Qwen3.5-9B Safetensors（蒸馏主选学生）",
+        "fetch": "ModelScope Qwen/Qwen3.5-9B",
+    },
+    "qwen35-9b-gguf": {
+        "path": "models/qwen3-5-9b-gguf", "kind": "dir", "scope": "both",
+        "desc": "Qwen3.5-9B GGUF Q4_K_M（unsloth）",
+        "fetch": "ModelScope unsloth/Qwen3.5-9B-GGUF",
+    },
+    "gemma4-12b-safetensors": {
+        "path": "models/gemma4-12b-safetensors", "kind": "dir", "scope": "pc",
+        "desc": "Gemma4 12B Safetensors 权重（原生绑定对照）",
+        "fetch": "ModelScope google/gemma-4-12b-it",
+    },
+    "deepseek-7b-safetensors": {
+        "path": "models/deepseek-r1-distill-qwen-7b", "kind": "dir", "scope": "pc",
+        "desc": "DeepSeek-R1-Distill-7B Safetensors",
+        "fetch": "受管下载",
+    },
+    "deepseek-7b-gguf": {
+        "path": "models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf", "kind": "file",
+        "scope": "pc", "desc": "DeepSeek-R1-Distill-7B GGUF Q4_K_M",
+        "fetch": "受管下载",
+    },
     "qwen18b-safetensors": {
         "path": "models/qwen-1_8b-chat", "kind": "dir", "scope": "pc",
         "desc": "Qwen-1.8B-Chat Safetensors（默认模型，独显/分布式）",
@@ -93,9 +144,18 @@ except OSError:
     TMP_BASE = Path(tempfile.gettempdir())  # 兜底系统临时目录
 
 
-PC_ASSETS = ("qwen18b-safetensors", "qwen18b-gguf", "qwen3-4b-gguf",
-             "gemma4-native", "sd15-assets")
-ANDROID_ASSETS = ("qwen18b-gguf", "qwen3-4b-gguf")
+PC_ASSETS = (
+    "qwen18b-safetensors", "qwen18b-gguf",
+    "qwen3-4b-safetensors", "qwen3-4b-gguf",
+    "qwen3vl-4b-safetensors", "qwen3vl-4b-gguf",
+    "qwen35-2b-safetensors", "qwen35-2b-gguf",
+    "qwen35-9b-safetensors", "qwen35-9b-gguf",
+    "gemma4-native", "gemma4-12b-safetensors",
+    "deepseek-7b-safetensors", "deepseek-7b-gguf",
+    "sd15-assets",
+)
+ANDROID_ASSETS = ("qwen18b-gguf", "qwen3-4b-gguf",
+                  "qwen35-9b-gguf", "qwen35-2b-gguf")
 
 
 class BundleError(RuntimeError):
@@ -511,7 +571,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="只打印将删除的 SD 源 zip，不执行删除（先看再删）")
     ap.add_argument("--threads", type=int, default=4, metavar="N",
                     help="7z 压缩线程数（默认 4；本机 20 核默认会吃满，限制后留余量）")
+    ap.add_argument("--out-dir", metavar="DIR", default=None,
+                    help="输出目录（默认 build/offline-bundles；大包可用 D 盘如 D:/qlh-bundles）")
     args = ap.parse_args(argv)
+    if args.out_dir:
+        global OUT_DIR
+        OUT_DIR = Path(args.out_dir)
     if args.prune_sd_zips:
         global PRUNE_SD_ZIPS, PRUNE_DRY_RUN
         PRUNE_SD_ZIPS = True

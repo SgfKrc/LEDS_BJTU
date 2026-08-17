@@ -73,6 +73,14 @@ const routes: Array<{ method: string; match: RegExp; data: unknown }> = [
   },
   {
     method: 'GET',
+    match: /^\/v1\/models\/local-assets$/,
+    data: {
+      assets: [{ model_id: 'qwen3-4b', available_formats: ['safetensors', 'gguf'] }],
+      summary: { total: 1, total_bytes: 1 },
+    },
+  },
+  {
+    method: 'GET',
     match: /^\/v1\/models\/available$/,
     data: {
       models: [

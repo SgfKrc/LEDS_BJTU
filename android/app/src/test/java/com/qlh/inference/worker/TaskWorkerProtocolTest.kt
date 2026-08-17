@@ -175,4 +175,95 @@ class TaskWorkerProtocolTest {
             assertNotNull(error.field)
         }
     }
+
+    // ---- T8：validate 分支补齐（测试修复票排期） ----
+
+    private fun expectRejected(block: () -> Unit) {
+        try {
+            block()
+            fail("expected TaskWorkerProtocolException")
+        } catch (error: TaskWorkerProtocolException) {
+            // 拒绝即通过：build 或 validate 任一步骤拒绝非法输入都是回归保护
+        }
+    }
+
+    @Test
+    fun `T8 safeId regex rejects illegal id characters`() {
+        expectRejected {
+            TaskWorkerProtocol.buildStageOffer(
+                identity = identity,
+                requestId = "bad id with space",
+                stageType = "full_inference",
+                providerId = "remote_android_worker_01",
+                leaseExpiresAtMs = 1_700_000_000_200,
+                rootInput = emptyMap(),
+                dependencies = emptyMap(),
+                modelIdentity = model,
+                messageId = "msg_offer_badid_01",
+                sentAtMs = 1_700_000_000_100,
+            )
+        }
+    }
+
+    @Test
+    fun `T8 hello_ack negotiation contradiction is rejected`() {
+        expectRejected {
+            TaskWorkerProtocol.buildHelloAck(
+                coordinatorNodeId = "coordinator_01",
+                accepted = true,
+                selectedVersion = 2,
+                reasonCode = "busy",
+                messageId = "msg_ack_contradiction_01",
+                sentAtMs = 1_700_000_000_000,
+            )
+        }
+    }
+
+    @Test
+    fun `T8 capability mismatch is rejected for android worker`() {
+        expectRejected {
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = mapOf(
+                    "stage_types" to listOf("text_generation"),
+                    "engines" to listOf("llama_cpp"),
+                    "max_concurrency" to 1,
+                ),
+                messageId = "msg_hello_badcap_01",
+                sentAtMs = 1_700_000_000_000,
+            )
+        }
+    }
+
+    @Test
+    fun `T8 numeric bounds are enforced`() {
+        expectRejected {
+            TaskWorkerProtocol.buildHello(
+                nodeId = "android_worker_01",
+                capabilities = mapOf(
+                    "stage_types" to listOf("full_inference"),
+                    "engines" to listOf("llama_cpp"),
+                    "max_concurrency" to 1,
+                ),
+                messageId = "msg_hello_neg_01",
+                sentAtMs = -1,
+            )
+        }
+    }
+
+    @Test
+    fun `T8 stage acceptance disagreement is rejected`() {
+        // accepted=true 且 reason 非空：accepted==reason.isNotEmpty 矛盾
+        expectRejected {
+            TaskWorkerProtocol.buildStageAccept(
+                identity = identity,
+                providerId = "remote_android_worker_01",
+                accepted = true,
+                reasonCode = "busy",
+                retryable = false,
+                messageId = "msg_accept_bad_01",
+                sentAtMs = 1_700_000_000_100,
+            )
+        }
+    }
 }

@@ -36,25 +36,13 @@ from task_graph import (  # noqa: E402
     TaskGraphCoordinator,
     WorkflowExecutionError,
 )
+from tests.helpers.task_graph_common import single_stage  # noqa: E402
 from task_graph_attempt_audit import audit_task_graph_attempts  # noqa: E402
 from task_provider import (  # noqa: E402
     DeterministicFakeProvider,
     ProviderRegistry,
     StageResult,
 )
-
-
-def _single_stage(*, lease_timeout_seconds=1.0):
-    return [
-        StageSpec(
-            "answer",
-            "full_inference",
-            provider="primary",
-            fallback_providers=("fallback",),
-            pure=True,
-            lease_timeout_seconds=lease_timeout_seconds,
-        ),
-    ]
 
 
 @pytest.fixture
@@ -71,7 +59,7 @@ def winner_workflow():
     coordinator = TaskGraphCoordinator(provider_registry=registry)
 
     _, workflow = coordinator.run(
-        _single_stage(),
+        single_stage(),
         "answer",
         {"message": "question"},
         workflow_id="wf_fault_matrix",
@@ -276,7 +264,7 @@ def test_m9_workflow_terminal_rejects_submission():
     coordinator = TaskGraphCoordinator(provider_registry=registry)
     try:
         try:
-            coordinator.run(_single_stage(), "answer", {"message": "q"},
+            coordinator.run(single_stage(), "answer", {"message": "q"},
                             workflow_id="wf_terminal_matrix")
         except WorkflowExecutionError:
             pass  # 全失败 -> 终态，从快照取

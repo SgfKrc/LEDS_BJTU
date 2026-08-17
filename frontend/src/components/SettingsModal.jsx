@@ -1,8 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import DevicePanel from './DevicePanel';
 import ModelFleetPanel from './ModelFleetPanel';
 import { TIER_PRESETS, TIER_LABELS } from '../App';
 import { updateDistributedInferenceConfig } from '../api/client';
+import { ImageUp, RotateCcw, UserRound } from 'lucide-react';
+import { readUserAvatarFile, validateUserAvatarFile } from '../avatarPreferences';
+import { mergeModelCatalog } from '../modelCatalogState';
 
 // Token 限制档位选项
 const TOKEN_OPTIONS = [
@@ -35,18 +38,209 @@ const TOPP_OPTIONS = [
   { value: 1.0,  label: '1.0' },
 ];
 
+const SETTINGS_WORKSPACES = Object.freeze([
+  { id: 'general', label: '常用' },
+  { id: 'models', label: '模型与设备' },
+  { id: 'cluster', label: '集群' },
+  { id: 'appearance', label: '外观' },
+  { id: 'logs', label: '日志' },
+  { id: 'about', label: '关于' },
+]);
+
+const LOG_WORKSPACES = Object.freeze([
+  { id: 'live', label: '实时' },
+  { id: 'nodes', label: '节点' },
+  { id: 'files', label: '文件' },
+  { id: 'access', label: '访问' },
+]);
+
+const EMPTY_MODEL_FORM = Object.freeze({
+  model_id: '', name: '', model_type: 'safetensors',
+  model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
+  max_context: 4096, huggingface_id: '', description: '',
+});
+
+const RUNTIME_AUDIT_LABELS = Object.freeze({
+  bound: '合同已绑定',
+  prepare_succeeded: '准备完成',
+  prepare_duplicate: '已在准备中',
+  prepare_failed: '准备被拒绝',
+  released: '已释放',
+  release_failed: '释放失败',
+  cancelled: '已取消',
+  cancel_failed: '取消失败',
+  recovered: '已恢复清理',
+});
+
+const RUNTIME_RECOVERY_LABELS = Object.freeze({
+  prepare: '可按此合同准备',
+  retry_prepare: '可重新检查后准备',
+});
+
+function formatRuntimeAuditTime(value) {
+  const date = new Date(Number(value) * 1000);
+  return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString();
+}
+
+function emptyModelForm() {
+  return { ...EMPTY_MODEL_FORM };
+}
+
 export default function SettingsModal({
   open, onClose, deviceRefreshKey, onToast, theme, onToggleTheme,
-  themeMode = 'system', onThemeModeChange,
+  themeMode = 'system', onThemeModeChange, userAvatar, onUserAvatarChange,
   settings, onSettingsChange, deviceTier, hasDedicatedGpu,
   taskGraphCapability,
   onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
   // P3: 多模型实验支持
-  activeModelId, availableModels, switchingModel,
-  onLoadModels, onSwitchModel, onRegisterModel, onUnregisterModel,
+  activeModelId, availableModels, localModelAssets, switchingModel,
+  onLoadModels, onSwitchModel, onPreflightLocalModelAsset,
+  onRegisterModel, onUnregisterModel,
 }) {
   const overlayRef = useRef(null);
+  const userAvatarInputRef = useRef(null);
+  const [activeSettingsWorkspace, setActiveSettingsWorkspace] = useState('general');
+  const [modelArtifacts, setModelArtifacts] = useState([]);
+  const [localAssetPreflights, setLocalAssetPreflights] = useState({});
+  const [preflightingAssetId, setPreflightingAssetId] = useState('');
+  const [sidecarControl, setSidecarControl] = useState(null);
+  const [runtimeContracts, setRuntimeContracts] = useState([]);
+  const [sidecarControlError, setSidecarControlError] = useState('');
+  const [runtimeContractError, setRuntimeContractError] = useState('');
+  const [sidecarControlLoading, setSidecarControlLoading] = useState(false);
+  const [stoppingSidecarProfile, setStoppingSidecarProfile] = useState('');
+  const [startingSidecarProfile, setStartingSidecarProfile] = useState('');
+  const [bindingContractProfile, setBindingContractProfile] = useState('');
+  const [contractModelChoices, setContractModelChoices] = useState({});
+  const modelCatalog = useMemo(
+    () => mergeModelCatalog(availableModels, modelArtifacts, activeModelId, localModelAssets),
+    [availableModels, modelArtifacts, activeModelId, localModelAssets],
+  );
+
+  const handleUserAvatarSelect = async (event) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    const fileError = validateUserAvatarFile(file);
+    if (fileError) {
+      onToast?.({ type: 'error', msg: fileError });
+      return;
+    }
+    try {
+      const avatar = await readUserAvatarFile(file);
+      onUserAvatarChange?.(avatar);
+      onToast?.({ type: 'success', msg: '对话头像已保存在本机浏览器。' });
+    } catch (error) {
+      onToast?.({ type: 'error', msg: `设置头像失败: ${error.message}` });
+    }
+  };
+
+  const resetUserAvatar = () => {
+    try {
+      onUserAvatarChange?.(null);
+      onToast?.({ type: 'success', msg: '已恢复默认对话头像。' });
+    } catch (error) {
+      onToast?.({ type: 'error', msg: `恢复头像失败: ${error.message}` });
+    }
+  };
+
+  const runLocalAssetPreflight = useCallback(async (model) => {
+    const modelId = model?.local_asset?.model_id;
+    if (!modelId || !onPreflightLocalModelAsset) return;
+    setPreflightingAssetId(modelId);
+    try {
+      const report = await onPreflightLocalModelAsset(modelId);
+      setLocalAssetPreflights((current) => ({ ...current, [modelId]: report }));
+    } catch (error) {
+      setLocalAssetPreflights((current) => ({
+        ...current,
+        [modelId]: { gate_passed: false, status: 'request_failed', errors: [{ message: error.message }] },
+      }));
+      onToast?.({ type: 'error', msg: `Sidecar 预检失败: ${error.message}` });
+    } finally {
+      setPreflightingAssetId('');
+    }
+  }, [onPreflightLocalModelAsset, onToast]);
+
+  const loadSidecarControl = useCallback(async () => {
+    setSidecarControlLoading(true);
+    try {
+      const { fetchModelRuntimeContracts, fetchModelRuntimeSidecars } = await import('../api/client');
+      const [statusResult, contractsResult] = await Promise.allSettled([
+        fetchModelRuntimeSidecars(),
+        fetchModelRuntimeContracts(),
+      ]);
+      if (statusResult.status === 'fulfilled') {
+        setSidecarControl(statusResult.value);
+        setSidecarControlError('');
+      } else {
+        setSidecarControl(null);
+        setSidecarControlError(statusResult.reason?.message || '运行时控制面不可用');
+      }
+      if (contractsResult.status === 'fulfilled') {
+        setRuntimeContracts(contractsResult.value.contracts || []);
+        setRuntimeContractError('');
+      } else {
+        setRuntimeContracts([]);
+        setRuntimeContractError(contractsResult.reason?.message || '任务合同列表不可用');
+      }
+    } catch (error) {
+      setSidecarControl(null);
+      setSidecarControlError(error.message || '运行时控制面不可用');
+      setRuntimeContracts([]);
+      setRuntimeContractError(error.message || '任务合同列表不可用');
+    } finally {
+      setSidecarControlLoading(false);
+    }
+  }, []);
+
+  const bindSidecarContract = useCallback(async (profile, modelId) => {
+    if (!modelId) return;
+    setBindingContractProfile(profile);
+    try {
+      const { bindModelRuntimeContract } = await import('../api/client');
+      const result = await bindModelRuntimeContract(profile, modelId);
+      await loadSidecarControl();
+      onToast?.({
+        type: result.status === 'already_bound' ? 'info' : 'success',
+        msg: result.status === 'already_bound' ? '已有相同容量计划合同，已复用。' : '任务合同已绑定到主节点 SQLite。',
+      });
+    } catch (error) {
+      onToast?.({ type: 'error', msg: `任务合同绑定失败: ${error.message}` });
+    } finally {
+      setBindingContractProfile('');
+    }
+  }, [loadSidecarControl, onToast]);
+
+  const prepareSidecar = useCallback(async (profile, contractId) => {
+    if (!contractId) return;
+    setStartingSidecarProfile(profile);
+    try {
+      const { beginModelRuntimeSidecar } = await import('../api/client');
+      await beginModelRuntimeSidecar(profile, null, contractId);
+      await loadSidecarControl();
+      onToast?.({ type: 'success', msg: 'Sidecar 已按受管任务合同进入准备流程。' });
+    } catch (error) {
+      onToast?.({ type: 'error', msg: `Sidecar 准备失败: ${error.message}` });
+    } finally {
+      setStartingSidecarProfile('');
+    }
+  }, [loadSidecarControl, onToast]);
+
+  const cancelSidecar = useCallback(async (profile) => {
+    if (!window.confirm('确定取消当前 Sidecar 会话？已物化的分段权重和临时工件将被释放。')) return;
+    setStoppingSidecarProfile(profile);
+    try {
+      const { cancelModelRuntimeSidecar } = await import('../api/client');
+      await cancelModelRuntimeSidecar(profile);
+      await loadSidecarControl();
+      onToast?.({ type: 'success', msg: 'Sidecar 会话已取消并请求释放资源。' });
+    } catch (error) {
+      onToast?.({ type: 'error', msg: `停止 Sidecar 失败: ${error.message}` });
+    } finally {
+      setStoppingSidecarProfile('');
+    }
+  }, [loadSidecarControl, onToast]);
 
   // Close on Escape
   useEffect(() => {
@@ -91,6 +285,7 @@ export default function SettingsModal({
   const [logStats, setLogStats] = useState(null);
   const [logAdminTokenInput, setLogAdminTokenInput] = useState('');
   const [nodesLogSummary, setNodesLogSummary] = useState(null);
+  const [activeLogWorkspace, setActiveLogWorkspace] = useState('live');
 
   const loadLogFiles = useCallback(async () => {
     try {
@@ -286,20 +481,48 @@ export default function SettingsModal({
   }, [recentLogsAutoRefresh, open, loadRecentLogs]);
 
   const formatFileSize = (bytes) => {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value < 0) return '—';
+    if (value < 1024) return value + ' B';
+    if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB';
+    return (value / (1024 * 1024)).toFixed(1) + ' MB';
   };
 
   // ================================================================
   // P3: 实验模型注册表单
   // ================================================================
   const [showAddModel, setShowAddModel] = useState(false);
-  const [newModelForm, setNewModelForm] = useState({
-    model_id: '', name: '', model_type: 'safetensors',
-    model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
-    max_context: 4096, huggingface_id: '', description: '',
-  });
+  const [editingModelId, setEditingModelId] = useState('');
+  const [newModelForm, setNewModelForm] = useState(emptyModelForm);
+
+  const closeModelForm = useCallback(() => {
+    setShowAddModel(false);
+    setEditingModelId('');
+    setNewModelForm(emptyModelForm());
+  }, []);
+
+  const beginAddModel = useCallback(() => {
+    setEditingModelId('');
+    setNewModelForm(emptyModelForm());
+    setShowAddModel(true);
+  }, []);
+
+  const beginEditModel = useCallback((model) => {
+    if (!model?.is_editable) return;
+    setEditingModelId(model.model_id);
+    setNewModelForm({
+      model_id: model.model_id,
+      name: model.name || model.model_id,
+      model_type: model.model_type || 'safetensors',
+      model_path: model.model_path || '',
+      gguf_path: model.gguf_path || '',
+      recommended_vram_gb: Number(model.recommended_vram_gb) || 8.0,
+      max_context: Number(model.max_context) || 4096,
+      huggingface_id: model.huggingface_id || '',
+      description: model.description || '',
+    });
+    setShowAddModel(true);
+  }, []);
 
   const handleAddModel = useCallback(async () => {
     if (!newModelForm.model_id || !newModelForm.name) {
@@ -307,17 +530,12 @@ export default function SettingsModal({
       return;
     }
     try {
-      await onRegisterModel?.(newModelForm);
-      setShowAddModel(false);
-      setNewModelForm({
-        model_id: '', name: '', model_type: 'safetensors',
-        model_path: '', gguf_path: '', recommended_vram_gb: 8.0,
-        max_context: 4096, huggingface_id: '', description: '',
-      });
+      await onRegisterModel?.(newModelForm, { isEdit: Boolean(editingModelId) });
+      closeModelForm();
     } catch (_) {
       // Parent handler owns the toast; keep the form open so the user can fix it.
     }
-  }, [newModelForm, onRegisterModel, onToast]);
+  }, [newModelForm, editingModelId, onRegisterModel, onToast, closeModelForm]);
 
   const handleRemoveModel = useCallback(async (modelId) => {
     if (!window.confirm(`确定移除模型 "${modelId}" 的注册？\n不会删除磁盘上的模型文件。`)) return;
@@ -337,8 +555,9 @@ export default function SettingsModal({
       loadLogStats();
       loadNodesLogSummary();
       onLoadModels?.();
+      loadSidecarControl();
     }
-  }, [open, loadLogFiles, loadRecentLogs, loadLogStats, loadNodesLogSummary, onLoadModels]);
+  }, [open, loadLogFiles, loadRecentLogs, loadLogStats, loadNodesLogSummary, onLoadModels, loadSidecarControl]);
 
   // 判断档位是否匹配当前设备
   const isCurrentTier = (tier) => deviceTier === tier;
@@ -355,23 +574,179 @@ export default function SettingsModal({
     <div className="settings-overlay" ref={overlayRef} onClick={handleOverlayClick}>
       <div className="settings-modal">
         <div className="settings-header">
-          <h2>⚙️ 系统设置</h2>
-          <button className="settings-close-btn" onClick={onClose}>
+          <h2>系统设置</h2>
+          <button className="settings-close-btn" onClick={onClose} title="关闭系统设置" aria-label="关闭系统设置">
             ✕
           </button>
         </div>
-        <div className="settings-body">
-          <DevicePanel
-            key={deviceRefreshKey}
-            onToast={onToast}
-            onProfileLoaded={handleDeviceProfile}
-          />
+        <div className="settings-body" data-active-settings-workspace={activeSettingsWorkspace}>
+          <div className="settings-workspace-tabs" role="tablist" aria-label="系统设置工作区">
+            {SETTINGS_WORKSPACES.map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={activeSettingsWorkspace === id}
+                className={activeSettingsWorkspace === id ? 'active' : ''}
+                onClick={() => setActiveSettingsWorkspace(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
 
-          <ModelFleetPanel onToast={onToast} />
+          <div className="settings-workspace-block" data-settings-workspace="models">
+            <DevicePanel
+              key={deviceRefreshKey}
+              onToast={onToast}
+              onProfileLoaded={handleDeviceProfile}
+            />
+          </div>
+
+          <div className="settings-workspace-block" data-settings-workspace="models">
+            <ModelFleetPanel onToast={onToast} onInventoryChange={setModelArtifacts} />
+          </div>
+
+          <section
+            className="sidecar-control-panel settings-workspace-block"
+            data-settings-workspace="models"
+            aria-label="Sidecar 运行时控制面"
+          >
+            <div className="sidecar-control-heading">
+              <div>
+                <span className="workspace-kicker">MODEL RUNTIME</span>
+                <h3>Sidecar 运行时</h3>
+              </div>
+              <button
+                type="button"
+                className="setting-btn secondary"
+                onClick={loadSidecarControl}
+                disabled={sidecarControlLoading}
+              >
+                {sidecarControlLoading ? '刷新中…' : '刷新状态'}
+              </button>
+            </div>
+            {sidecarControlError ? (
+              <div className="sidecar-control-error" role="status">
+                运行时控制面不可用：{sidecarControlError}
+              </div>
+            ) : (
+              <div className="sidecar-profile-list">
+                {Object.entries(sidecarControl?.profiles || {}).map(([profile, capability]) => {
+                  const session = capability.session || {};
+                  const phase = session.state?.phase || (session.active ? 'active' : 'idle');
+                  const candidates = (localModelAssets || []).filter(
+                    (asset) => asset.runtime_profile === profile && asset.model_path,
+                  );
+                  const selectedModelId = contractModelChoices[profile] || candidates[0]?.model_id || '';
+                  const boundContract = runtimeContracts.find(
+                    (item) => item.profile === profile && item.contract_id === session.contract_id,
+                  ) || runtimeContracts.find((item) => item.profile === profile);
+                  const execution = boundContract?.execution || {};
+                  const recentEvents = Array.isArray(execution.recent_events)
+                    ? execution.recent_events.slice(0, 3)
+                    : [];
+                  const activeBoundContract = Boolean(
+                    session.active && session.contract_id === boundContract?.contract_id,
+                  );
+                  return (
+                    <div className="sidecar-profile-row" key={profile}>
+                      <div className="sidecar-profile-copy">
+                        <strong>{capability.display_name || profile}</strong>
+                        <span>{capability.runtime_environment || '隔离运行时未声明'}</span>
+                      </div>
+                      <div className="sidecar-profile-state">
+                        <span className={`runtime-phase${session.active ? ' active' : ''}`}>{phase}</span>
+                        <span>{capability.requires_task_contract ? '需要任务合同' : '可直接准备'}</span>
+                        <span>{capability.production_admitted ? '生产已准入' : '生产未准入'}</span>
+                      </div>
+                      {session.active && sidecarControl?.control_available && (
+                        <button
+                          type="button"
+                          className="setting-btn danger-ghost"
+                          onClick={() => cancelSidecar(profile)}
+                          disabled={stoppingSidecarProfile === profile}
+                        >
+                          {stoppingSidecarProfile === profile ? '停止中…' : '停止 Sidecar'}
+                        </button>
+                      )}
+                      {capability.requires_task_contract && sidecarControl?.control_available && (
+                        <div className="sidecar-contract-actions">
+                          <select
+                            aria-label={`${capability.display_name || profile} 合同模型`}
+                            value={selectedModelId}
+                            onChange={(event) => setContractModelChoices((current) => ({
+                              ...current, [profile]: event.target.value,
+                            }))}
+                            disabled={bindingContractProfile === profile || candidates.length === 0}
+                          >
+                            {candidates.length === 0 ? (
+                              <option value="">没有可绑定的本地 Safetensors 资产</option>
+                            ) : candidates.map((asset) => (
+                              <option key={asset.model_id} value={asset.model_id}>{asset.model_id}</option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            className="setting-btn secondary"
+                            onClick={() => bindSidecarContract(profile, selectedModelId)}
+                            disabled={!selectedModelId || bindingContractProfile === profile}
+                          >
+                            {bindingContractProfile === profile ? '绑定中…' : boundContract ? '重新检查合同' : '绑定任务合同'}
+                          </button>
+                          {boundContract && !session.active && (
+                            <button
+                              type="button"
+                              className="setting-btn"
+                              onClick={() => prepareSidecar(profile, boundContract.contract_id)}
+                              disabled={startingSidecarProfile === profile}
+                            >
+                              {startingSidecarProfile === profile ? '准备中…' : '准备 Sidecar'}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {boundContract && (
+                        <span className="sidecar-contract-badge" title={boundContract.contract_id}>
+                          {boundContract.model_id} · {boundContract.segment_count} 段 · v{boundContract.generation || 0}
+                          {activeBoundContract ? ' · 当前会话' : ''}
+                        </span>
+                      )}
+                      {boundContract && (
+                        <div className="sidecar-contract-evidence" role="status">
+                          <span className="sidecar-contract-recovery">
+                            {RUNTIME_RECOVERY_LABELS[execution.recovery_action] || '可检查合同状态'}
+                          </span>
+                          {recentEvents.length > 0 ? recentEvents.map((event, index) => (
+                            <span className="sidecar-audit-event" key={`${event.at || index}-${event.action || 'event'}`}>
+                              {RUNTIME_AUDIT_LABELS[event.action] || event.action || '运行事件'}
+                              {event.phase ? ` · ${event.phase}` : ''}
+                              {event.reason_code ? ` · ${event.reason_code}` : ''}
+                              {' · '}{formatRuntimeAuditTime(event.at)}
+                            </span>
+                          )) : (
+                            <span className="sidecar-audit-event">尚无运行证据</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {!sidecarControlLoading && Object.keys(sidecarControl?.profiles || {}).length === 0 && (
+                  <div className="sidecar-control-empty">尚未发现可管理的 Sidecar profile。</div>
+                )}
+              </div>
+            )}
+            {runtimeContractError && (
+              <div className="sidecar-control-error" role="status">
+                任务合同列表不可用：{runtimeContractError}
+              </div>
+            )}
+          </section>
 
           {/* ======== 推理参数设置 ======== */}
-          <div className="sidebar-section">
-            <h3>🎛️ 推理参数</h3>
+          <div className="sidebar-section" data-settings-workspace="general">
+            <h3>推理参数</h3>
 
             {/* ---- Token 输出限制 ---- */}
             <div className="setting-group">
@@ -501,8 +876,8 @@ export default function SettingsModal({
           </div>
 
           {/* ======== 深度思考（仅独显设备可用） ======== */}
-          <div className="sidebar-section">
-            <h3>🧠 深度思考</h3>
+          <div className="sidebar-section" data-settings-workspace="general">
+            <h3>深度思考</h3>
             {hasDedicatedGpu ? (
               <>
                 <div className="setting-toggle-row">
@@ -551,10 +926,10 @@ export default function SettingsModal({
 
           {/* ======== 实验性模型 ======== */}
           {
-            <div className="sidebar-section">
-              <h3>🧪 模型管理</h3>
+            <div className="sidebar-section" data-settings-workspace="models">
+              <h3>模型管理</h3>
               <div className="setting-desc" style={{ marginBottom: 12 }}>
-                模型需手动下载，不包含在安装包内。未落盘或当前设备不支持的模型会标注为不可选。
+                已注册模型与本机 MODEL-FLEET 工件统一展示；未落盘或当前设备不支持的候选会标注为不可选。
               </div>
 
               {/* 当前模型 */}
@@ -566,20 +941,45 @@ export default function SettingsModal({
               </div>
 
               {/* 模型列表 */}
-              {availableModels.length > 0 && (
+              {modelCatalog.length > 0 && (
                 <div className="experimental-model-list">
-                  {availableModels.map(m => (
-                    <div key={m.model_id} className={`experimental-model-card${m.is_available ? '' : ' unavailable'}`}>
+                  {modelCatalog.map(m => (
+                    (() => {
+                      const boundContract = runtimeContracts.find((item) => (
+                        item.model_id === m.model_id || item.model_id === m.local_asset?.model_id
+                      ));
+                      const lastExecutionEvent = boundContract?.execution?.last_event
+                        || boundContract?.execution?.recent_events?.[0];
+                      return (
+                    <div key={m.model_id} className={`experimental-model-card${m.has_local_asset ? '' : ' unavailable'}`}>
                       <div className="model-card-header">
                         <strong>{m.name}</strong>
-                        {m.is_experimental && (
+                        {m.is_fleet_artifact && (
+                          <span className="chip-badge exp">工件</span>
+                        )}
+                        {m.is_local_discovered_asset && !m.is_fleet_artifact && (
+                          <span className="chip-badge exp">本地资产</span>
+                        )}
+                        {m.is_editable && (
+                          <span className="chip-badge exp">自定义</span>
+                        )}
+                        {m.is_experimental && !m.is_editable && !m.is_fleet_artifact && (
                           <span className="chip-badge exp">实验性</span>
                         )}
                         {!m.is_experimental && (
                           <span className="chip-badge default">默认</span>
                         )}
+                        {boundContract && (
+                          <span className="chip-badge available">已绑定合同</span>
+                        )}
                         {m.is_available ? (
-                          <span className="chip-badge available">可用</span>
+                          <span className="chip-badge available">可加载</span>
+                        ) : m.has_local_asset ? (
+                          <span className="chip-badge available">
+                            {m.is_local_discovered_asset
+                              ? '本地已发现'
+                              : m.fleet_runnable ? '工件可运行' : '已登记资产'}
+                          </span>
                         ) : (
                           <span className="chip-badge unavailable">未下载</span>
                         )}
@@ -588,9 +988,11 @@ export default function SettingsModal({
                         <div className="model-card-desc">{m.description}</div>
                       )}
                       <div className="model-card-specs">
-                        <span>显存 ≥ {m.recommended_vram_gb} GB</span>
-                        <span>上下文 {m.max_context}</span>
-                        <span>类型 {m.model_type}</span>
+                        {Number.isFinite(Number(m.recommended_vram_gb)) && Number(m.recommended_vram_gb) > 0 && (
+                          <span>显存 ≥ {m.recommended_vram_gb} GB</span>
+                        )}
+                        {m.max_context && <span>上下文 {m.max_context}</span>}
+                        {m.model_type && <span>类型 {m.model_type}</span>}
                         {m.available_formats?.length > 0 && (
                           <span>{m.available_formats.join(' + ')}</span>
                         )}
@@ -600,15 +1002,61 @@ export default function SettingsModal({
                           {m.unavailable_reason || '模型文件未落盘，暂不可加载。'}
                         </div>
                       )}
-                      <div className="model-card-actions">
-                        <button
-                          className="setting-btn secondary"
-                          onClick={() => onSwitchModel?.(m.model_id, m.default_quant_type || 'int4', m.preferred_engine || 'auto')}
-                          disabled={switchingModel || activeModelId === m.model_id || !m.is_available}
+                      {boundContract && (
+                        <div className="model-card-desc model-contract-status" role="status">
+                          合同 {boundContract.contract_id?.slice(0, 12)}… · {boundContract.segment_count} 段 · v{boundContract.generation || 0}
+                          {lastExecutionEvent?.action
+                            ? ` · ${RUNTIME_AUDIT_LABELS[lastExecutionEvent.action] || lastExecutionEvent.action}`
+                            : ''}
+                        </div>
+                      )}
+                      {m.is_local_discovered_asset && localAssetPreflights[m.local_asset?.model_id] && (
+                        <div
+                          className={`model-preflight-status${localAssetPreflights[m.local_asset?.model_id].gate_passed ? ' passed' : ' failed'}`}
+                          role="status"
                         >
-                          {activeModelId === m.model_id ? '当前模型' : switchingModel ? '切换中…' : '加载此模型'}
-                        </button>
-                        {m.is_experimental && !m.is_builtin && (
+                          {localAssetPreflights[m.local_asset?.model_id].gate_passed
+                            ? 'Sidecar 预检通过：隔离运行时可用于后续任务路由，尚未启动模型加载。'
+                            : `Sidecar 预检未通过：${localAssetPreflights[m.local_asset?.model_id].status || 'unknown'}`}
+                        </div>
+                      )}
+                      <div className="model-card-actions">
+                        {m.is_available ? (
+                          <button
+                            className="setting-btn secondary"
+                            onClick={() => onSwitchModel?.(m.model_id, m.default_quant_type || 'int4', m.preferred_engine || 'auto')}
+                            disabled={switchingModel || activeModelId === m.model_id}
+                          >
+                            {activeModelId === m.model_id ? '当前模型' : switchingModel ? '切换中…' : '加载此模型'}
+                          </button>
+                        ) : m.is_local_discovered_asset && m.local_asset?.runtime_action === 'qwen3_preflight' ? (
+                          <button
+                            className="setting-btn secondary"
+                            onClick={() => runLocalAssetPreflight(m)}
+                            disabled={preflightingAssetId === m.local_asset?.model_id}
+                          >
+                            {preflightingAssetId === m.local_asset?.model_id ? 'Sidecar 预检中…' : 'Sidecar 预检'}
+                          </button>
+                        ) : (
+                          <button className="setting-btn secondary" disabled>
+                            {boundContract
+                              ? '已绑定，等待 Sidecar'
+                              : m.has_local_asset
+                              ? (m.is_local_discovered_asset
+                                ? '等待任务合同'
+                                : m.fleet_runnable ? '由任务路由加载' : '等待运行时检查')
+                              : '尚未下载'}
+                          </button>
+                        )}
+                        {m.is_editable && (
+                          <button
+                            className="setting-btn secondary"
+                            onClick={() => beginEditModel(m)}
+                          >
+                            编辑
+                          </button>
+                        )}
+                        {m.is_editable && (
                           <button
                             className="setting-btn danger-ghost"
                             onClick={() => handleRemoveModel(m.model_id)}
@@ -618,6 +1066,8 @@ export default function SettingsModal({
                         )}
                       </div>
                     </div>
+                      );
+                    })()
                   ))}
                 </div>
               )}
@@ -627,18 +1077,19 @@ export default function SettingsModal({
                 <button
                   className="setting-btn secondary"
                   style={{ marginTop: 8, width: '100%' }}
-                  onClick={() => setShowAddModel(true)}
+                  onClick={beginAddModel}
                 >
                   ＋ 添加实验性模型
                 </button>
               ) : (
                 <div className="add-model-form">
-                  <h4>注册新模型</h4>
+                  <h4>{editingModelId ? '编辑自定义模型' : '注册新模型'}</h4>
                   <div className="form-row">
                     <label>模型 ID <span className="required">*</span></label>
                     <input
                       placeholder="如 qwen2.5-7b"
                       value={newModelForm.model_id}
+                      disabled={Boolean(editingModelId)}
                       onChange={e => setNewModelForm(f => ({ ...f, model_id: e.target.value }))}
                     />
                   </div>
@@ -715,9 +1166,9 @@ export default function SettingsModal({
                   </div>
                   <div className="form-actions">
                     <button className="setting-btn primary" onClick={handleAddModel}>
-                      注册
+                      {editingModelId ? '保存修改' : '注册'}
                     </button>
-                    <button className="setting-btn secondary" onClick={() => setShowAddModel(false)}>
+                    <button className="setting-btn secondary" onClick={closeModelForm}>
                       取消
                     </button>
                   </div>
@@ -726,14 +1177,14 @@ export default function SettingsModal({
 
               {/* 提示：模型需手动下载 */}
               <p className="setting-desc" style={{ marginTop: 10, fontSize: 11 }}>
-                💡 实验性模型文件不会随安装包分发，需从 HuggingFace 手动下载到指定目录。
+                💡 自定义模型需先下载到登记路径；受管工件请在上方模型工件区导入、拉取和复检。
               </p>
             </div>
           }
 
           {/* ======== 对话历史 ======== */}
-          <div className="sidebar-section">
-            <h3>💾 对话记录</h3>
+          <div className="sidebar-section" data-settings-workspace="general">
+            <h3>对话记录</h3>
             <div className="setting-toggle-row">
               <div>
                 <div className="setting-label">保存对话历史</div>
@@ -764,8 +1215,8 @@ export default function SettingsModal({
           </div>
 
           {/* ======== 云同步设置偏好 ======== */}
-          <div className="sidebar-section">
-            <h3>☁️ 云同步</h3>
+          <div className="sidebar-section" data-settings-workspace="cluster">
+            <h3>云同步</h3>
             <div className="setting-toggle-row">
               <div>
                 <div className="setting-label">同步设置到云端</div>
@@ -797,8 +1248,8 @@ export default function SettingsModal({
           </div>
 
           {/* ======== 流式输出模式 ======== */}
-          <div className="sidebar-section">
-            <h3>📡 流式输出</h3>
+          <div className="sidebar-section" data-settings-workspace="general">
+            <h3>流式输出</h3>
             <div className="setting-toggle-row">
               <div>
                 <div className="setting-label">
@@ -841,8 +1292,8 @@ export default function SettingsModal({
           </div>
 
           {/* ======== 对话执行模式 ======== */}
-          <div className="sidebar-section">
-            <h3>🧩 执行模式</h3>
+          <div className="sidebar-section" data-settings-workspace="general">
+            <h3>执行模式</h3>
             <div className="execution-mode-segment" role="group" aria-label="对话执行模式">
               <button
                 type="button"
@@ -895,8 +1346,8 @@ export default function SettingsModal({
           </div>
 
           {/* ======== 分布式推理优化（所有节点可见） ======== */}
-          <div className="sidebar-section">
-            <h3>🌐 分布式推理优化</h3>
+          <div className="sidebar-section" data-settings-workspace="cluster">
+            <h3>分布式推理优化</h3>
             <div className="setting-toggle-row">
               <div>
                 <div className="setting-label">启用分布式推理优化</div>
@@ -985,8 +1436,8 @@ export default function SettingsModal({
 
           {/* ======== 设备档位快捷应用 ======== */}
           {deviceTier && (
-            <div className="sidebar-section">
-              <h3>📱 设备档位预设</h3>
+            <div className="sidebar-section" data-settings-workspace="models">
+              <h3>设备档位预设</h3>
               <p className="setting-desc" style={{ marginBottom: 10 }}>
                 当前检测为 <strong>{TIER_LABELS[deviceTier] || deviceTier}</strong>，
                 可一键应用该档位的推荐参数，也可手动切换其他档位查看对应配置:
@@ -1017,8 +1468,8 @@ export default function SettingsModal({
           )}
 
           {/* ---- 外观 ---- */}
-          <div className="sidebar-section">
-            <h3>🎨 外观</h3>
+          <div className="sidebar-section" data-settings-workspace="appearance">
+            <h3>外观</h3>
             <div className="theme-toggle-row">
               <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
                 当前: {themeMode === 'system' ? `跟随系统 · ${theme === 'dark' ? '深色' : '浅色'}` : (theme === 'dark' ? '深色模式' : '浅色模式')}
@@ -1050,16 +1501,76 @@ export default function SettingsModal({
                 >
                   {label}
                 </button>
-              ))}
+                ))}
+            </div>
+            <div className="avatar-preference" aria-label="对话头像">
+              <div className="avatar-preference-preview" data-testid="user-avatar-preview">
+                {userAvatar
+                  ? <img src={userAvatar} alt="当前对话头像" />
+                  : <UserRound size={20} aria-hidden="true" />}
+              </div>
+              <div className="avatar-preference-copy">
+                <strong>对话头像</strong>
+                <span>本机浏览器</span>
+              </div>
+              <input
+                ref={userAvatarInputRef}
+                data-testid="chat-user-avatar-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                aria-label="选择对话头像"
+                hidden
+                onChange={handleUserAvatarSelect}
+              />
+              <div className="avatar-preference-actions">
+                <button
+                  type="button"
+                  className="setting-btn secondary avatar-preference-action"
+                  onClick={() => userAvatarInputRef.current?.click()}
+                  title="选择对话头像"
+                >
+                  <ImageUp size={15} aria-hidden="true" />
+                  选择
+                </button>
+                {userAvatar && (
+                  <button
+                    type="button"
+                    className="setting-btn secondary avatar-preference-action"
+                    onClick={resetUserAvatar}
+                    title="恢复默认头像"
+                  >
+                    <RotateCcw size={15} aria-hidden="true" />
+                    默认
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 
           {/* ---- 日志管理 ---- */}
-          <div className="sidebar-section" style={{ borderBottom: 'none' }}>
-            <h3>📋 日志管理</h3>
+          <div className="sidebar-section" data-settings-workspace="logs" style={{ borderBottom: 'none' }}>
+            <h3>日志管理</h3>
 
+            <div className="log-workspace-tabs" role="tablist" aria-label="日志工作区">
+              {LOG_WORKSPACES
+                .filter(({ id }) => id !== 'nodes' || myRole?.is_master)
+                .map(({ id, label }) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={activeLogWorkspace === id}
+                    className={activeLogWorkspace === id ? 'active' : ''}
+                    onClick={() => setActiveLogWorkspace(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+            </div>
+
+            {activeLogWorkspace === 'access' && (
             <div className="log-subsection">
-              <h4 style={{ margin: '8px 0 4px' }}>🔑 远程访问</h4>
+              <h4 style={{ margin: '8px 0 4px' }}>远程访问</h4>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <input
                   type="password"
@@ -1083,6 +1594,7 @@ export default function SettingsModal({
                 </button>
               </div>
             </div>
+            )}
 
             {/* L3: 日志统计摘要 */}
             {logStats && (
@@ -1094,10 +1606,10 @@ export default function SettingsModal({
               </div>
             )}
 
-            {myRole?.is_master && (
+            {activeLogWorkspace === 'nodes' && myRole?.is_master && (
               <div className="log-subsection">
                 <div className="log-subsection-header">
-                  <h4>🖧 节点日志</h4>
+                  <h4>节点日志</h4>
                   <button className="sidebar-btn" onClick={loadNodesLogSummary} style={{ fontSize: 11 }}>
                     刷新
                   </button>
@@ -1147,9 +1659,10 @@ export default function SettingsModal({
             )}
 
             {/* L3: 最近日志（内存实时缓冲） */}
+            {activeLogWorkspace === 'live' && (
             <div className="log-subsection">
               <div className="log-subsection-header">
-                <h4>📡 最近日志</h4>
+                <h4>最近日志</h4>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                   <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>
                     {recentLogsAutoRefresh ? '⏱ 每 3s 刷新' : '已暂停刷新'}
@@ -1246,10 +1759,12 @@ export default function SettingsModal({
                 </div>
               )}
             </div>
+            )}
 
             {/* 日志文件列表 */}
+            {activeLogWorkspace === 'files' && (
             <div className="log-subsection">
-              <h4 style={{ margin: '8px 0 4px' }}>📁 日志文件</h4>
+              <h4 style={{ margin: '8px 0 4px' }}>日志文件</h4>
 
               {logFiles === null ? (
                 <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -1287,6 +1802,7 @@ export default function SettingsModal({
                 </div>
               )}
             </div>
+            )}
 
             {/* 日志内容查看弹窗（L3增强：搜索 + truncated 标记） */}
             {viewingLog !== null && (
@@ -1364,8 +1880,8 @@ export default function SettingsModal({
             )}
           </div>
 
-          <div className="sidebar-section" style={{ borderBottom: 'none' }}>
-            <h3>📖 快捷键</h3>
+          <div className="sidebar-section" data-settings-workspace="about" style={{ borderBottom: 'none' }}>
+            <h3>快捷键</h3>
             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 2.2 }}>
               <div><kbd style={kbdStyle}>Enter</kbd> 发送消息</div>
               <div><kbd style={kbdStyle}>Shift+Enter</kbd> 换行</div>
@@ -1374,8 +1890,8 @@ export default function SettingsModal({
             </div>
           </div>
 
-          <div className="sidebar-section" style={{ borderBottom: 'none' }}>
-            <h3>💡 关于</h3>
+          <div className="sidebar-section" data-settings-workspace="about" style={{ borderBottom: 'none' }}>
+            <h3>关于</h3>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.8 }}>
               轻量化大模型分布式边缘推理优化系统<br />
               北京交通大学 · 大学生创新创业训练计划<br />

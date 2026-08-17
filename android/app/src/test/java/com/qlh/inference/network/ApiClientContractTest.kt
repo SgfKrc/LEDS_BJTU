@@ -1,5 +1,7 @@
 package com.qlh.inference.network
 
+import com.google.gson.Gson
+import com.google.gson.JsonParser
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -40,6 +42,10 @@ class ApiClientContractTest {
     }
 
     private class Request(val method: String, val path: String, val body: String)
+
+    // T14：完整 JSON 解析比较（Gson 自动还原 \u003d 转义）
+    private fun parseJson(body: String): com.google.gson.JsonObject =
+        JsonParser.parseString(body).asJsonObject
 
     /** 迷你 HTTP 桩：解析请求行/头/体，回调后写固定响应。 */
     private class HttpStub {
@@ -163,8 +169,12 @@ class ApiClientContractTest {
         assertEquals("hello back", result.getOrNull()?.content)
         assertEquals("POST", seen?.method)
         assertEquals("/api/chat", seen?.path)
-        assertTrue(seen!!.body.contains("\"message\":\"hello\""))
-        assertTrue(seen!!.body.contains("\"max_new_tokens\":1024"))
+        val json = parseJson(seen!!.body)
+        assertEquals("hello", json.get("message").asString)
+        assertEquals(1024, json.get("max_new_tokens").asInt)
+        assertEquals(0.7f, json.get("temperature").asFloat, 1e-6f)
+        assertEquals(false, json.get("show_thinking").asBoolean)
+        assertTrue("默认请求不应带 allow_external", !json.has("allow_external"))
     }
 
     @Test
@@ -188,11 +198,13 @@ class ApiClientContractTest {
         }
 
         assertTrue(result.isSuccess)
-        // Gson escapes '=' as \\u003d, so assert the wire field and stable data URL prefix.
-        assertTrue(seen!!.body.contains("\"image_data_urls\":[\"data:image/png;base64,"))
-        assertTrue(seen!!.body.contains("iVBORw0KGgo"))
-        assertTrue(seen!!.body.contains("\"allow_external\":true"))
-        assertTrue(seen!!.body.contains("\"prefer_external\":true"))
+        // Gson 转义 '=' 为 \u003d，parseJson 还原后完整比较数组
+        val json = parseJson(seen!!.body)
+        val images = json.getAsJsonArray("image_data_urls")
+        assertEquals(1, images.size())
+        assertEquals(image, images[0].asString)
+        assertEquals(true, json.get("allow_external").asBoolean)
+        assertEquals(true, json.get("prefer_external").asBoolean)
     }
 
     @Test
@@ -473,5 +485,65 @@ class ApiClientContractTest {
         val unreachable = ApiClient(baseUrl = "http://127.0.0.1:1")
         val result = runBlocking { unreachable.chat(ChatRequest(message = "x")) }
         assertTrue(result.isFailure)
+    }
+
+    // ---- T10：上传前置校验 + poll 边界（测试修复票排期） ----
+
+    @Test
+    fun `T10 upload rejects empty data without hitting network`() {
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(data = ByteArray(0)),
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `T10 upload rejects oversize payload`() {
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(data = ByteArray(DIFFUSION_MAX_UPLOAD_BYTES + 1)),
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `T10 upload rejects illegal purpose`() {
+        val result = runBlocking {
+            client.uploadDiffusionBlob(
+                DiffusionBlobUpload(
+                    data = ByteArray(8),
+                    purpose = "not_input_image",
+                ),
+            )
+        }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `T10 poll rejects negative interval and zero polls`() {
+        val negInterval = runBlocking { client.pollDiffusionJob("j", intervalMillis = -1) }
+        assertTrue(negInterval.isFailure)
+        assertTrue(negInterval.exceptionOrNull() is IllegalArgumentException)
+        val zeroPolls = runBlocking { client.pollDiffusionJob("j", maxPolls = 0) }
+        assertTrue(zeroPolls.isFailure)
+        assertTrue(zeroPolls.exceptionOrNull() is IllegalArgumentException)
+    }
+
+    @Test
+    fun `T10 poll timeout surfaces TimeoutException`() {
+        route("/api/diffusion/jobs/j") { _, respond ->
+            respond(
+                200,
+                """{"job_id":"j","state":"queued","progress":{"step":0,"total":1}}""",
+            )
+        }
+        val result = runBlocking {
+            client.pollDiffusionJob("j", intervalMillis = 1, maxPolls = 1)
+        }
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull() is java.util.concurrent.TimeoutException)
     }
 }

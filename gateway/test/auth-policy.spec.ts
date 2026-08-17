@@ -44,6 +44,7 @@ describe('MF-AUTH-N1A gateway authorization policy', () => {
     expect(accessLevelFor('GET', '/api/auth/tailscale/local-status')).toBe('authenticated');
     expect(accessLevelFor('GET', '/api/users')).toBe('manager');
     expect(accessLevelFor('POST', '/api/models/load')).toBe('manager');
+    expect(accessLevelFor('POST', '/api/models/local-assets/qwen3-4b/preflight')).toBe('authenticated');
     expect(accessLevelFor('PATCH', '/api/cluster/settings')).toBe('manager');
   });
 

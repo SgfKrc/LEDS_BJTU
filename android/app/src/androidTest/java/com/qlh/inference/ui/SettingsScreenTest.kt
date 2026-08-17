@@ -78,6 +78,19 @@ class SettingsScreenTest {
         composeRule.runOnIdle { assertEquals(model, selected) }
     }
 
+    @Test
+    fun highFrequencyStatusAndThinkingControlStayAvailable() {
+        var showThinking = false
+        setSettingsContent(
+            themeMode = "system",
+            onShowThinkingChange = { showThinking = it }
+        )
+
+        composeRule.onNodeWithTag("settings_device_details").assertIsDisplayed()
+        composeRule.onNodeWithTag("settings_show_thinking").assertIsDisplayed().performClick()
+        composeRule.runOnIdle { assertTrue(showThinking) }
+    }
+
     private fun setSettingsContent(
         themeMode: String,
         darkTheme: Boolean = false,
@@ -87,6 +100,7 @@ class SettingsScreenTest {
         onThemeModeChange: (String) -> Unit = {},
         onRefreshRuntimeStatus: () -> Unit = {},
         onDownloadRemoteModel: (GgufModelInfo) -> Unit = {},
+        onShowThinkingChange: (Boolean) -> Unit = {},
     ) {
         composeRule.setContent {
             QlhTheme(darkTheme = darkTheme) {
@@ -115,7 +129,7 @@ class SettingsScreenTest {
                     onTemperatureChange = {},
                     onTopPChange = {},
                     onContextSizeChange = {},
-                    onShowThinkingChange = {},
+                    onShowThinkingChange = onShowThinkingChange,
                     onThemeModeChange = onThemeModeChange,
                     onChooseModelDirectory = {},
                     onRefreshModels = {},

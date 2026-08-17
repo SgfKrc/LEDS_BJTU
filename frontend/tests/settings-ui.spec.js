@@ -71,6 +71,7 @@ test('distributed inference failure is surfaced and rolls the optimistic setting
 
   await page.goto('/');
   await openSettings(page);
+  await page.getByRole('tab', { name: '集群' }).click();
   const section = page.getByText('启用分布式推理优化')
     .locator('xpath=ancestor::div[contains(@class,"sidebar-section")]');
   const toggle = section.locator('button.setting-toggle-btn');

@@ -33,6 +33,12 @@ function formatDate(value) {
   try { return new Date(value).toLocaleString(); } catch (_) { return value; }
 }
 
+const ACCOUNT_WORKSPACES = Object.freeze([
+  { id: 'security', label: '安全与会话' },
+  { id: 'network', label: '组网绑定' },
+  { id: 'users', label: '用户管理', managerOnly: true },
+]);
+
 export default function UserManagementPanel({ authSession, onLogout, onToast, onClose }) {
   const currentUser = authSession?.user || {};
   const isManager = currentUser.role === 'owner' || currentUser.role === 'admin';
@@ -50,6 +56,7 @@ export default function UserManagementPanel({ authSession, onLogout, onToast, on
   const [provisionCode, setProvisionCode] = useState('');
   const [provisionQr, setProvisionQr] = useState('');
   const [provisionRecovery, setProvisionRecovery] = useState([]);
+  const [activeWorkspace, setActiveWorkspace] = useState('security');
 
   const notifyError = useCallback((nextError) => {
     setError(messageOf(nextError));
@@ -238,6 +245,24 @@ export default function UserManagementPanel({ authSession, onLogout, onToast, on
 
       {error && <div className="account-alert" role="alert">{error}</div>}
 
+      <div className="account-workspace-tabs" role="tablist" aria-label="账户与安全工作区">
+        {ACCOUNT_WORKSPACES
+          .filter((workspace) => !workspace.managerOnly || isManager)
+          .map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={activeWorkspace === id}
+              className={activeWorkspace === id ? 'active' : ''}
+              onClick={() => setActiveWorkspace(id)}
+            >
+              {label}
+            </button>
+          ))}
+      </div>
+
+      {activeWorkspace === 'security' && (
       <div className="account-grid">
         <section className="account-section">
           <div className="section-heading"><h3>当前会话</h3><span>{activeSessions.length} 个活跃</span></div>
@@ -274,10 +299,11 @@ export default function UserManagementPanel({ authSession, onLogout, onToast, on
           )}
         </section>
       </div>
+      )}
 
-      <TailscaleBindingPanel onToast={onToast} />
+      {activeWorkspace === 'network' && <TailscaleBindingPanel onToast={onToast} />}
 
-      {isManager && (
+      {activeWorkspace === 'users' && isManager && (
         <section className="account-section manager-section">
           <div className="section-heading"><h3>本地主节点用户</h3><span>{users.length} 个账户</span></div>
           <form className="create-user-form" onSubmit={handleCreate}>

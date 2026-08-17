@@ -372,4 +372,78 @@ class MainViewModelLogicTest {
         assertEquals(listOf(image), retry.lastSentImageDataUrls)
         assertEquals("看图", retry.lastSentMessage)
     }
+
+    // ---- T12：validateChatImageSubmission 分支补齐（测试修复票排期） ----
+
+    private fun legalPngUrl(miB: Double): String {
+        val prefix = byteArrayOf(
+            0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        )
+        val target = (miB * 1024.0 * 1024.0).toInt()
+        val bytes = ByteArray(target)
+        System.arraycopy(prefix, 0, bytes, 0, prefix.size)
+        val b64 = java.util.Base64.getEncoder().encodeToString(bytes)
+        return "data:image/png;base64,$b64"
+    }
+
+    @Test
+    fun `T12 single image over 8 MiB is rejected`() {
+        val tooBig = legalPngUrl(8.1)  // > MAX_CHAT_IMAGE_BYTES
+        assertEquals(
+            "单张图片不得超过 8 MiB",
+            validateChatImageSubmission("thin", listOf(tooBig)),
+        )
+    }
+
+    @Test
+    fun `T12 invalid base64 payload is rejected`() {
+        // 格式匹配（合法 base64 字符）但长度非法 -> decode 抛
+        assertEquals(
+            "图像 data URL 的 base64 数据无效",
+            validateChatImageSubmission("thin", listOf("data:image/png;base64,A")),
+        )
+        assertEquals(
+            "图像 data URL 的 base64 数据无效",
+            validateChatImageSubmission("thin", listOf("data:image/png;base64,=")),
+        )
+        // 非 base64 字符（!）-> 格式分支拒绝
+        assertEquals(
+            "图像仅支持 PNG/JPEG/WebP base64 data URL",
+            validateChatImageSubmission(
+                "thin",
+                listOf("data:image/png;base64,!!!invalid!!!not-base64"),
+            ),
+        )
+    }
+
+    @Test
+    fun `T12 minimal decoded payload is rejected by signature`() {
+        // 单字符 payload 解码后 1 字节，PNG 签名不全 -> MIME 不一致
+        val oneByte = "data:image/png;base64,AA=="
+        assertEquals(
+            "图像 MIME 类型与文件签名不一致",
+            validateChatImageSubmission("thin", listOf(oneByte)),
+        )
+    }
+
+    @Test
+    fun `T12 mime signature mismatch is rejected`() {
+        // data URL 声明 png 但内容非 PNG 签名
+        val mismatch = "data:image/png;base64," +
+            java.util.Base64.getEncoder().encodeToString("not-a-png".toByteArray())
+        assertEquals(
+            "图像 MIME 类型与文件签名不一致",
+            validateChatImageSubmission("thin", listOf(mismatch)),
+        )
+    }
+
+    @Test
+    fun `T12 total size over 16 MiB is rejected`() {
+        // 三张 ~5.6 MiB 合法 PNG = 16.8 MiB > 16 MiB 总上限
+        val three = listOf(legalPngUrl(5.6), legalPngUrl(5.6), legalPngUrl(5.6))
+        assertEquals(
+            "图像总大小不得超过 16 MiB",
+            validateChatImageSubmission("thin", three),
+        )
+    }
 }

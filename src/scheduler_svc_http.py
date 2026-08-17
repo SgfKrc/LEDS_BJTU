@@ -17,7 +17,7 @@
 import asyncio
 import logging
 import threading
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -58,6 +58,21 @@ class Qwen3LocalChainParityRequest(BaseModel):
     reference_decode: str = Field(..., min_length=1, max_length=2048)
     rtol: float = Field(default=1e-4, ge=0.0, le=1.0)
     atol: float = Field(default=1e-5, ge=0.0, le=1.0)
+
+
+class ModelRuntimeSidecarBeginRequest(BaseModel):
+    profile: Literal["qwen3_sidecar", "gemma4_pipeline"]
+    contract: Optional[dict] = None
+    contract_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+
+class ModelRuntimeSidecarActionRequest(BaseModel):
+    profile: Literal["qwen3_sidecar", "gemma4_pipeline"]
+
+
+class ModelRuntimeContractBindRequest(BaseModel):
+    profile: Literal["qwen3_sidecar", "gemma4_pipeline"]
+    model_id: str = Field(..., min_length=1, max_length=128)
 
 
 # ---- scheduler 实例注入（build_scheduler_app 时设置） ----
@@ -730,10 +745,71 @@ def _require_qwen3_local_master():
 def _raise_qwen3_local_http(exc: Exception) -> None:
     code = str(getattr(exc, "reason_code", "qwen3_local_chain_rejected"))
     message = str(getattr(exc, "reason", str(exc)))[:2048]
-    status = 409 if any(token in code or token in message.lower() for token in (
+    status = 403 if "master" in code.lower() or "master" in message.lower() else 409 if any(token in code or token in message.lower() for token in (
         "phase", "stale", "active", "fenced", "duplicate",
     )) else 400
     raise HTTPException(status, {"code": code, "message": message}) from exc
+
+
+@router.get("/cluster/model-runtime/sidecars")
+async def get_model_runtime_sidecar_status():
+    return await run_in_threadpool(_scheduler().get_model_runtime_sidecar_status)
+
+
+@router.get("/cluster/model-runtime/contracts")
+async def get_model_runtime_contracts():
+    return await run_in_threadpool(_scheduler().get_model_runtime_contracts)
+
+
+@router.post("/cluster/model-runtime/contracts/bind")
+async def bind_model_runtime_contract(req: ModelRuntimeContractBindRequest):
+    try:
+        return await run_in_threadpool(
+            _scheduler().bind_model_runtime_contract, req.profile, req.model_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@router.post("/cluster/model-runtime/sidecars/begin")
+async def begin_model_runtime_sidecar(req: ModelRuntimeSidecarBeginRequest):
+    try:
+        if req.contract_id:
+            return await run_in_threadpool(
+                _scheduler().begin_model_runtime_sidecar,
+                req.profile,
+                req.contract,
+                contract_id=req.contract_id,
+            )
+        return await run_in_threadpool(
+            _scheduler().begin_model_runtime_sidecar, req.profile, req.contract,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@router.post("/cluster/model-runtime/sidecars/release")
+async def release_model_runtime_sidecar(req: ModelRuntimeSidecarActionRequest):
+    try:
+        return await run_in_threadpool(_scheduler().release_model_runtime_sidecar, req.profile)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
+
+
+@router.delete("/cluster/model-runtime/sidecars/{profile}")
+async def cancel_model_runtime_sidecar(profile: Literal["qwen3_sidecar", "gemma4_pipeline"]):
+    try:
+        return await run_in_threadpool(_scheduler().cancel_model_runtime_sidecar, profile)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_qwen3_local_http(exc)
 
 
 @router.get("/cluster/qwen3/local-chain")

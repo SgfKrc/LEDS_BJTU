@@ -123,6 +123,15 @@ class FakeEngineHost(EngineHost):
             "gpu_reserved_gb": 0,
         }
 
+    def list_local_model_assets(self):
+        return {
+            "assets": [{"model_id": "fixture-local"}],
+            "summary": {"total": 1, "total_bytes": 1},
+        }
+
+    def preflight_local_model_asset(self, model_id):
+        return {"model_id": model_id, "gate_passed": True, "status": "ready_for_qwen3_smoke"}
+
     def chat_full(self, req, cancel_event=None):
         # 返回结构与真实 EngineHost.chat_full 一致（content 而非 response，
         # 见 engine_host.py:678）：routes 取 result["content"]
@@ -175,6 +184,8 @@ EXPECTED_ENDPOINTS = [
     ("POST", "/v1/models/unload"),
     ("POST", "/v1/models/switch"),
     ("GET", "/v1/models/current"),
+    ("GET", "/v1/models/local-assets"),
+    ("POST", "/v1/models/local-assets/{model_id}/preflight"),
     ("GET", "/v1/diffusion/capabilities"),
     ("POST", "/v1/diffusion/artifacts/inspect"),
     ("POST", "/v1/diffusion/artifacts/register"),
@@ -209,6 +220,27 @@ def test_contract_endpoint_existence():
     paths = {route.path for route in router.routes}
     for method, path in EXPECTED_ENDPOINTS:
         assert path in paths, f"缺少端点 {method} {path}"
+
+
+def test_models_local_assets_is_read_only_inventory(client):
+    response = client.get("/v1/models/local-assets")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "assets": [{"model_id": "fixture-local"}],
+        "summary": {"total": 1, "total_bytes": 1},
+    }
+
+
+def test_models_local_asset_preflight_is_explicit_and_read_only(client):
+    response = client.post("/v1/models/local-assets/fixture-local/preflight")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "model_id": "fixture-local",
+        "gate_passed": True,
+        "status": "ready_for_qwen3_smoke",
+    }
 
 
 # ----------------------------------------------------------------------

@@ -65,6 +65,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.data.MessageEntity
 import com.qlh.inference.media.EncodedImageAttachment
@@ -72,6 +73,7 @@ import com.qlh.inference.media.ImageAttachmentEncoder
 import com.qlh.inference.ui.components.EmptyState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.StatusChip
+import com.qlh.inference.ui.theme.QlhShapeTokens
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -285,10 +287,10 @@ private fun ChatBubble(
         ) {
             Surface(
                 shape = RoundedCornerShape(
-                    topStart = 20.dp,
-                    topEnd = 20.dp,
-                    bottomStart = if (isUser) 20.dp else 6.dp,
-                    bottomEnd = if (isUser) 6.dp else 20.dp
+                    topStart = QlhShapeTokens.control,
+                    topEnd = QlhShapeTokens.control,
+                    bottomStart = if (isUser) QlhShapeTokens.control else QlhShapeTokens.compact,
+                    bottomEnd = if (isUser) QlhShapeTokens.compact else QlhShapeTokens.control
                 ),
                 color = if (isUser) {
                     MaterialTheme.colorScheme.primary
@@ -367,10 +369,10 @@ private fun LoadingBubble() {
     ) {
         Surface(
             shape = RoundedCornerShape(
-                topStart = 20.dp,
-                topEnd = 20.dp,
-                bottomStart = 6.dp,
-                bottomEnd = 20.dp
+                topStart = QlhShapeTokens.control,
+                topEnd = QlhShapeTokens.control,
+                bottomStart = QlhShapeTokens.compact,
+                bottomEnd = QlhShapeTokens.control
             ),
             color = MaterialTheme.colorScheme.surfaceContainerHigh
         ) {
@@ -519,14 +521,16 @@ private fun ChatInputBar(
                 placeholder = {
                     Text(
                         "输入消息…",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 },
                 maxLines = 4,
                 enabled = enabled,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
-                shape = RoundedCornerShape(24.dp),
+                shape = RoundedCornerShape(QlhShapeTokens.control),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = MaterialTheme.colorScheme.primary,
                     unfocusedBorderColor = Color.Transparent,
@@ -584,7 +588,7 @@ private fun ChatInputBar(
                                 contentDescription = "已选择的图片",
                                 modifier = Modifier
                                     .size(56.dp)
-                                    .clip(RoundedCornerShape(8.dp)),
+                                    .clip(RoundedCornerShape(QlhShapeTokens.control)),
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))

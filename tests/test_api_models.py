@@ -312,6 +312,27 @@ def test_model_payload_marks_builtin_slots(monkeypatch):
     assert custom_payload["is_builtin"] is False
 
 
+def test_local_assets_endpoint_returns_discovery_inventory(monkeypatch):
+    import local_model_assets
+
+    expected = {
+        "assets": [{"model_id": "qwen3-4b"}],
+        "summary": {"total": 1, "total_bytes": 1},
+    }
+    monkeypatch.setattr(local_model_assets, "discover_local_model_assets", lambda: expected)
+
+    assert asyncio.run(api_server.list_local_model_assets()) == expected
+
+
+def test_local_asset_preflight_delegates_to_read_only_inventory_gate(monkeypatch):
+    import local_model_assets
+
+    expected = {"model_id": "qwen3-4b", "gate_passed": True, "status": "ready_for_qwen3_smoke"}
+    monkeypatch.setattr(local_model_assets, "preflight_local_model_asset", lambda model_id: expected)
+
+    assert asyncio.run(api_server.preflight_local_model_asset("qwen3-4b")) == expected
+
+
 def test_diffusion_capabilities_detects_manager_loaded_when_host_flag_is_stale(monkeypatch):
     class LoadedManager:
         is_loaded = True
