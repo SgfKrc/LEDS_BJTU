@@ -7,12 +7,13 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test tests/settings.test.mjs tests/taskGraphStatus.test.mjs tests/diffusionState.test.mjs tests/modelFleet.test.mjs tests/authClient.test.mjs tests/apiClientErrors.test.mjs tests/apiFixtureContract.test.mjs",
+    "test": "node --test tests/settings.test.mjs tests/taskGraphStatus.test.mjs tests/diffusionState.test.mjs tests/modelFleet.test.mjs tests/authClient.test.mjs tests/apiClientErrors.test.mjs tests/apiFixtureContract.test.mjs tests/avatarPreferences.test.mjs tests/shell-ux.test.mjs",
     "test:e2e:settings": "playwright test --config settings.playwright.config.js",
     "test:e2e:model-fleet": "node scripts/run-model-fleet-e2e.mjs",
     "test:e2e:sd15": "npm run build && npm --prefix ../gateway run build && playwright test --config playwright.config.js tests/diffusion-real.spec.js"
   },
   "dependencies": {
+    "lucide-react": "^1.31.0",
     "qrcode": "^1.5.4",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

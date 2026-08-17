@@ -114,6 +114,7 @@ export default function DiffusionPanel({
   const [modelPath, setModelPath] = useState(getInitialModelPath);
   const [inspection, setInspection] = useState(null);
   const [profile, setProfile] = useState('balanced');
+  const [activeDiffusionWorkspace, setActiveDiffusionWorkspace] = useState('generate');
   const [form, setForm] = useState(() => presetToForm(null));
   const [editMode, setEditMode] = useState('txt2img');
   const [sourceBlob, setSourceBlob] = useState(null);
@@ -916,8 +917,33 @@ export default function DiffusionPanel({
           </div>
         )}
 
-        <div className="diffusion-layout-grid">
+        <div className="diffusion-workspace-tabs" role="tablist" aria-label="图像工作区">
+          <button
+            type="button"
+            role="tab"
+            data-testid="diffusion-workspace-generate"
+            aria-selected={activeDiffusionWorkspace === 'generate'}
+            className={activeDiffusionWorkspace === 'generate' ? 'active' : ''}
+            onClick={() => setActiveDiffusionWorkspace('generate')}
+          >
+            创作
+          </button>
+          <button
+            type="button"
+            role="tab"
+            data-testid="diffusion-workspace-assets"
+            aria-selected={activeDiffusionWorkspace === 'assets'}
+            className={activeDiffusionWorkspace === 'assets' ? 'active' : ''}
+            onClick={() => setActiveDiffusionWorkspace('assets')}
+          >
+            模型资产
+            <span>{modelArtifacts.length}</span>
+          </button>
+        </div>
+
+        <div className={`diffusion-layout-grid workspace-${activeDiffusionWorkspace}`}>
           <div className="diffusion-controls">
+            {activeDiffusionWorkspace === 'assets' && (
             <section className="diffusion-section">
               <div className="diffusion-section-heading">
                 <h3>模型</h3>
@@ -1069,12 +1095,20 @@ export default function DiffusionPanel({
                         : '加载图像模型'}
               </button>
             </section>
+            )}
 
+            {activeDiffusionWorkspace === 'generate' && (
             <section className="diffusion-section">
               <div className="diffusion-section-heading">
                 <h3>生成参数</h3>
                 <span>{selectedPreset?.model_id || '自定义'}</span>
               </div>
+              {!capabilities?.loaded && (
+                <div className="diffusion-alert warning diffusion-model-gate">
+                  <span>请先在模型资产中登记并加载图像模型。</span>
+                  <button type="button" onClick={() => setActiveDiffusionWorkspace('assets')}>管理模型</button>
+                </div>
+              )}
               <div className="mode-segment" role="group" aria-label="图像生成模式">
                 <button
                   type="button"
@@ -1424,6 +1458,7 @@ export default function DiffusionPanel({
                     : editMode === 'img2img' ? '生成编辑图片' : editMode === 'reference' ? '按参考图生成' : editMode === 'inpaint' ? '生成局部重绘' : editMode === 'instruction' ? '执行指令编辑' : '生成图片'}
               </button>
             </section>
+            )}
           </div>
 
           <div className="diffusion-output">

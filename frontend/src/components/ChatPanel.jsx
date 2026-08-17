@@ -1,4 +1,30 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import {
+  Bot,
+  BrainCircuit,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  Clock3,
+  Code2,
+  Coins,
+  Copy,
+  Cpu,
+  Database,
+  FileText,
+  ImagePlus,
+  LoaderCircle,
+  MessageSquare,
+  Network,
+  Paperclip,
+  PenLine,
+  Send,
+  Settings2,
+  Square,
+  Trash2,
+  UserRound,
+  X,
+} from 'lucide-react';
 import { sendMessage, sendMessageStream, cancelChatGeneration, cancelWorkflow, clearChat, fetchPresets, fetchWorkflow, uploadFile, fetchConversations, deleteTurn, deleteSession, createSession, activateSession } from '../api/client';
 import { normalizeTaskGraphWorkflow } from '../taskGraphStatus';
 
@@ -12,6 +38,34 @@ const MAX_CHAT_IMAGES = 4;
 const MAX_CHAT_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_CHAT_IMAGE_TOTAL_BYTES = 16 * 1024 * 1024;
 const CHAT_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+
+const PRESET_ICONS = Object.freeze({
+  intro: MessageSquare,
+  edge_computing: Network,
+  model_quantization: Cpu,
+  code_assist: Code2,
+  creative: PenLine,
+  reasoning: BrainCircuit,
+});
+
+function PresetIcon({ presetId }) {
+  const Icon = PRESET_ICONS[presetId] || MessageSquare;
+  return <Icon size={16} strokeWidth={1.8} aria-hidden="true" />;
+}
+
+function MessageAvatar({ role, userAvatar, modelAvatarUrl }) {
+  if (role === 'user') {
+    return userAvatar
+      ? <img className="message-avatar-image" src={userAvatar} alt="" aria-hidden="true" />
+      : <UserRound size={17} aria-hidden="true" />;
+  }
+  if (role === 'assistant') {
+    return modelAvatarUrl
+      ? <img className="message-avatar-image" src={modelAvatarUrl} alt="" aria-hidden="true" />
+      : <Bot size={18} aria-hidden="true" />;
+  }
+  return <CircleAlert size={18} aria-hidden="true" />;
+}
 
 function formatImageBytes(bytes) {
   if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
@@ -57,7 +111,7 @@ async function readChatImage(file) {
   return dataUrl;
 }
 
-export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsTrigger, onOpenSettings, settings, taskGraphCapability, sessionId, onCreateSession, onRenameSession }) {
+export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsTrigger, onOpenSettings, settings, taskGraphCapability, sessionId, onCreateSession, onRenameSession, userAvatar, modelAvatarUrl }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -625,7 +679,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       fileContext = uploadedFile;
       const lang = uploadedFile.language || 'plaintext';
       fullMessage = [
-        `📄 **${uploadedFile.filename}** (${uploadedFile.line_count} 行):`,
+        `**${uploadedFile.filename}** (${uploadedFile.line_count} 行):`,
         '',
         '```' + lang,
         uploadedFile.content,
@@ -956,7 +1010,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       {/* Header */}
       <div className="chat-header">
         <div style={{ display: 'flex', alignItems: 'center' }}>
-          <h2>💬 对话测试</h2>
+          <h2>对话</h2>
           {currentQuant && (
             <span className="model-badge">
               {currentQuant.toUpperCase()}
@@ -969,11 +1023,17 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           )}
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn-ghost" onClick={onOpenSettings} title="系统设置">
-            ⚙️
+          <button className="btn-ghost chat-tool-button" onClick={onOpenSettings} title="系统设置" aria-label="系统设置">
+            <Settings2 size={17} aria-hidden="true" />
           </button>
-          <button className="btn-ghost" onClick={handleClear} disabled={messages.length === 0 || clearing}>
-            {clearing ? '清空中...' : '清空对话'}
+          <button
+            className="btn-ghost chat-tool-button"
+            onClick={handleClear}
+            disabled={messages.length === 0 || clearing}
+            title={clearing ? '正在清空对话' : '清空对话'}
+            aria-label={clearing ? '正在清空对话' : '清空对话'}
+          >
+            {clearing ? <LoaderCircle className="spin-icon" size={17} aria-hidden="true" /> : <Trash2 size={17} aria-hidden="true" />}
           </button>
         </div>
       </div>
@@ -1015,14 +1075,14 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       {messages.length === 0 ? (
         historyLoading ? (
           <div className="empty-state">
-            <div className="icon">⏳</div>
+            <div className="icon"><LoaderCircle className="spin-icon" size={42} aria-hidden="true" /></div>
             <p>加载对话历史中...</p>
           </div>
         ) : (
         <div className="empty-state">
           {modelLoaded && presets?.presets?.length > 0 ? (
             <>
-              <div className="icon">🧠</div>
+              <div className="icon"><BrainCircuit size={42} strokeWidth={1.5} aria-hidden="true" /></div>
               <p>模型已就绪，选择一个预设问题或直接输入</p>
               {presets.current_speed_tok_s && (
                 <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16 }}>
@@ -1039,14 +1099,14 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                     onClick={() => handlePresetClick(p.question)}
                   >
                     <div className="preset-header">
-                      <span className="preset-icon">{p.icon}</span>
+                      <span className="preset-icon"><PresetIcon presetId={p.id} /></span>
                       <span className="preset-label">{p.label}</span>
                     </div>
                     <div className="preset-question">{p.question}</div>
                     <div className="preset-meta">
-                      <span title="预估输入+输出 Token">🪙 ~{p.estimated_prompt_tokens + p.estimated_response_tokens} tokens</span>
-                      <span title="预估 KV 缓存显存">💾 ~{p.estimated_memory_mb} MB</span>
-                      <span title="预估耗时">⏱ ~{p.estimated_seconds}s</span>
+                      <span title="预估输入+输出 Token"><Coins size={12} aria-hidden="true" /> ~{p.estimated_prompt_tokens + p.estimated_response_tokens} tokens</span>
+                      <span title="预估 KV 缓存显存"><Database size={12} aria-hidden="true" /> ~{p.estimated_memory_mb} MB</span>
+                      <span title="预估耗时"><Clock3 size={12} aria-hidden="true" /> ~{p.estimated_seconds}s</span>
                     </div>
                   </button>
                 ))}
@@ -1054,7 +1114,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             </>
           ) : (
             <>
-              <div className="icon">🧠</div>
+              <div className="icon"><BrainCircuit size={42} strokeWidth={1.5} aria-hidden="true" /></div>
               <p>
                 {modelLoaded
                   ? '模型已就绪，输入消息开始对话测试'
@@ -1080,17 +1140,17 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             return (
               <div key={msg.id} className={`message ${msg.role}`}>
                 <div className="avatar">
-                  {msg.role === 'user' ? '👤' : msg.role === 'assistant' ? '🤖' : '⚠️'}
+                  <MessageAvatar role={msg.role} userAvatar={userAvatar} modelAvatarUrl={modelAvatarUrl} />
                 </div>
                 <div>
                   {msg.fileContext && (
                     <div className="file-attachment-badge">
-                      📎 {msg.fileContext.filename} ({msg.fileContext.line_count} 行)
+                      <Paperclip size={13} aria-hidden="true" /> {msg.fileContext.filename} ({msg.fileContext.line_count} 行)
                     </div>
                   )}
                   {msg.imageCount > 0 && (
                     <div className="image-attachment-badge">
-                      🖼 {msg.imageCount} 张图片
+                      <ImagePlus size={13} aria-hidden="true" /> {msg.imageCount} 张图片
                     </div>
                   )}
                   <div className="bubble">
@@ -1119,16 +1179,18 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                               className="message-copy-btn"
                               onClick={() => handleCopyMessage(msg.content)}
                               title="复制回答"
+                              aria-label="复制回答"
                             >
-                              ⧉
+                              <Copy size={14} aria-hidden="true" />
                             </button>
                             {!sending && (
                               <button
                                 className="message-delete-btn"
                                 onClick={() => setDeletingTurn({ turnIndex, msgId: msg.id })}
                                 title="删除这轮对话"
+                                aria-label="删除这轮对话"
                               >
-                                ✕
+                                <Trash2 size={14} aria-hidden="true" />
                               </button>
                             )}
                           </div>
@@ -1142,9 +1204,11 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                           onClick={() => toggleThinking(msg.id)}
                         >
                           <span className="thinking-toggle-icon">
-                            {expandedThinking.has(msg.id) ? '▼' : '▶'}
+                            {expandedThinking.has(msg.id)
+                              ? <ChevronDown size={14} aria-hidden="true" />
+                              : <ChevronRight size={14} aria-hidden="true" />}
                           </span>
-                          <span className="thinking-toggle-label">🧠 深度思考</span>
+                          <span className="thinking-toggle-label"><BrainCircuit size={14} aria-hidden="true" /> 深度思考</span>
                           <span className="thinking-toggle-hint">
                             {expandedThinking.has(msg.id) ? '点击收起' : '点击展开'}
                           </span>
@@ -1182,7 +1246,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
           })}
           {sending && (
             <div className="message assistant">
-              <div className="avatar">🤖</div>
+              <div className="avatar"><MessageAvatar role="assistant" userAvatar={userAvatar} modelAvatarUrl={modelAvatarUrl} /></div>
               <div className="bubble">
                 <div className="typing-indicator">
                   <span /><span /><span />
@@ -1205,13 +1269,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
                   <span className="image-chip-name" title={image.name}>{image.name}</span>
                   <span className="image-chip-meta">{formatImageBytes(image.size)}</span>
                 </div>
-                <button
-                  className="file-chip-remove"
-                  onClick={() => handleRemoveImage(image.id)}
-                  title={`移除图片 ${image.name}`}
-                  aria-label={`移除图片 ${image.name}`}
-                >
-                  ✕
+              <button
+                className="file-chip-remove"
+                onClick={() => handleRemoveImage(image.id)}
+                title={`移除图片 ${image.name}`}
+                aria-label={`移除图片 ${image.name}`}
+              >
+                  <X size={14} aria-hidden="true" />
                 </button>
               </div>
             ))}
@@ -1224,13 +1288,13 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
         {uploadedFile && (
           <div className="file-chip-row">
             <div className="file-chip">
-              <span className="file-chip-icon">📎</span>
+              <span className="file-chip-icon"><FileText size={14} aria-hidden="true" /></span>
               <span className="file-chip-name">{uploadedFile.filename}</span>
               <span className="file-chip-meta">
                 {uploadedFile.language} · {uploadedFile.line_count} 行 · {Math.round(uploadedFile.size_bytes / 1024)} KB
               </span>
-              <button className="file-chip-remove" onClick={handleRemoveFile} title="移除文件">
-                ✕
+              <button className="file-chip-remove" onClick={handleRemoveFile} title="移除文件" aria-label="移除文件">
+                <X size={14} aria-hidden="true" />
               </button>
             </div>
           </div>
@@ -1257,8 +1321,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             onClick={() => fileInputRef.current?.click()}
             disabled={!modelLoaded || sending || uploading}
             title="上传文本文件 (txt/md/csv/py/json 等)"
+            aria-label="上传文本文件"
           >
-            {uploading ? '⏳' : '📎'}
+            {uploading ? <LoaderCircle className="spin-icon" size={17} aria-hidden="true" /> : <Paperclip size={17} aria-hidden="true" />}
           </button>
           <button
             className="btn-ghost file-upload-btn image-upload-btn"
@@ -1267,7 +1332,7 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             title="添加图片（PNG/JPEG/WebP，最多 4 张）"
             aria-label="添加图片"
           >
-            {readingImages ? '⏳' : '🖼'}
+            {readingImages ? <LoaderCircle className="spin-icon" size={17} aria-hidden="true" /> : <ImagePlus size={17} aria-hidden="true" />}
           </button>
           <textarea
             ref={inputRef}
@@ -1283,12 +1348,17 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
             rows={1}
           />
           <button
-            className="btn-primary"
+            className="btn-primary chat-send-button"
             onClick={sending ? cancelActiveGeneration : handleSend}
             disabled={clearing || (!sending && (!modelLoaded || (!input.trim() && !uploadedFile && queuedImages.length === 0)))}
             title={sending ? '停止当前生成' : '发送消息'}
+            aria-label={clearing ? '正在清空对话' : sending ? '停止当前生成' : '发送消息'}
           >
-            {clearing ? '清空中...' : sending ? '停止' : '发送'}
+            {clearing
+              ? <LoaderCircle className="spin-icon" size={17} aria-hidden="true" />
+              : sending
+                ? <Square size={15} fill="currentColor" aria-hidden="true" />
+                : <Send size={17} aria-hidden="true" />}
           </button>
         </div>
       </div>

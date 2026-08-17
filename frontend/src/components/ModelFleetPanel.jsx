@@ -66,7 +66,7 @@ function preflightLabel(status) {
   })[status] || status || '未解析';
 }
 
-export default function ModelFleetPanel({ onToast }) {
+export default function ModelFleetPanel({ onToast, onInventoryChange }) {
   const [tab, setTab] = useState('artifacts');
   const [inventory, setInventory] = useState(EMPTY_INVENTORY);
   const [jobs, setJobs] = useState([]);
@@ -101,7 +101,11 @@ export default function ModelFleetPanel({ onToast }) {
       api.fetchModelLicenseAcceptances(),
     ]);
     const failures = [];
-    if (results[0].status === 'fulfilled') setInventory(results[0].value);
+    if (results[0].status === 'fulfilled') {
+      const nextInventory = results[0].value;
+      setInventory(nextInventory);
+      onInventoryChange?.(nextInventory.artifacts || []);
+    }
     else failures.push(results[0].reason);
     if (results[1].status === 'fulfilled') setJobs(results[1].value.jobs || []);
     else failures.push(results[1].reason);
@@ -129,7 +133,7 @@ export default function ModelFleetPanel({ onToast }) {
     else failures.push(results[5].reason);
     setError(failures.length === results.length ? (failures[0]?.message || '模型控制面不可用') : '');
     if (!quiet) setLoading(false);
-  }, []);
+  }, [onInventoryChange]);
 
   useEffect(() => { refresh(); }, [refresh]);
 

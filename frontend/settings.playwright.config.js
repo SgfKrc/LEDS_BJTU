@@ -7,7 +7,7 @@ const BASE_URL = 'http://127.0.0.1:15174';
 
 export default defineConfig({
   testDir: path.join(HERE, 'tests'),
-  testMatch: ['settings-ui.spec.js'],
+  testMatch: ['settings-ui.spec.js', 'shell-ux.spec.js'],
   timeout: 45_000,
   expect: { timeout: 10_000 },
   workers: 1,

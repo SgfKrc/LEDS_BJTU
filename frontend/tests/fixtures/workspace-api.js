@@ -17,6 +17,29 @@ export const WORKSPACE_API_FIXTURES = Object.freeze({
     body: { node_role: 'master', node_id: 'local', is_master: true, is_client: false },
   },
   'GET /api/cluster/config/distributed-inference': { body: { enabled: false } },
+  'GET /api/cluster/model-runtime/sidecars': {
+    body: {
+      schema_version: 1,
+      role: 'master',
+      control_available: true,
+      production_admitted: false,
+      profiles: {
+        qwen3_sidecar: {
+          display_name: 'Qwen3 Sidecar', runtime_environment: '.venv-qwen3-sidecar',
+          preflight_supported: true, requires_task_contract: true,
+          production_admitted: false, session: { active: false, state: { phase: 'idle' } },
+        },
+        gemma4_pipeline: {
+          display_name: 'Gemma 4 Pipeline Sidecar', runtime_environment: '.venv-gemma4-pipeline',
+          preflight_supported: false, requires_task_contract: true,
+          production_admitted: false, session: { active: false, state: { phase: 'idle' } },
+        },
+      },
+    },
+  },
+  'GET /api/cluster/model-runtime/contracts': {
+    body: { schema_version: 1, contracts: [] },
+  },
   'PUT /api/cluster/config/distributed-inference': {
     body: { status: 'ok', enabled: true },
   },
@@ -36,6 +59,9 @@ export const WORKSPACE_API_FIXTURES = Object.freeze({
   'PUT /api/user/settings': { body: { status: 'ok', source: 'sqlite' } },
   'GET /api/sessions': { body: { sessions: [] } },
   'GET /api/models': { body: { models: [], active_model_id: null } },
+  'GET /api/models/local-assets': {
+    body: { assets: [], summary: { total: 0, total_bytes: 0 } },
+  },
   'GET /api/models/available': {
     body: { available_engines: [], current: null, current_engine: null },
   },

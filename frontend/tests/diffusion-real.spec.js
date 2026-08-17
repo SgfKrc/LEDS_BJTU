@@ -67,6 +67,7 @@ test('real Edge img2img upload and result continuation', async ({ browserName, p
     report.browser = await page.context().browser().version();
     await page.goto('/?view=image');
     await expect(page.getByTestId('diffusion-workspace')).toBeVisible();
+    await page.getByTestId('diffusion-workspace-assets').click();
 
     await page.getByTestId('diffusion-model-path').fill(MODEL_PATH);
     const registerStarted = performance.now();
@@ -78,6 +79,7 @@ test('real Edge img2img upload and result continuation', async ({ browserName, p
     const loadStarted = performance.now();
     await page.getByTestId('diffusion-load').click();
     await expect(page.getByTestId('diffusion-load')).toContainText('图像模型已就绪');
+    await page.getByTestId('diffusion-workspace-generate').click();
     report.timings.load_seconds = (performance.now() - loadStarted) / 1000;
 
     await page.getByTestId('diffusion-mode-img2img').click();
@@ -225,12 +227,14 @@ test('real Edge inpaint canvas uploads a mask and completes an edit', async ({ b
     report.browser = await page.context().browser().version();
     await page.goto('/?view=image');
     await expect(page.getByTestId('diffusion-workspace')).toBeVisible();
+    await page.getByTestId('diffusion-workspace-assets').click();
     await page.getByTestId('diffusion-model-path').fill(MODEL_PATH);
     await page.getByTestId('diffusion-register').click();
     await expect(page.getByTestId('diffusion-artifact-select').locator('option')).not.toHaveCount(0);
     await page.getByTestId('diffusion-profile').selectOption('balanced');
     await page.getByTestId('diffusion-load').click();
     await expect(page.getByTestId('diffusion-load')).toContainText('图像模型已就绪');
+    await page.getByTestId('diffusion-workspace-generate').click();
 
     await page.getByTestId('diffusion-mode-inpaint').click();
     await page.getByTestId('diffusion-steps').fill('4');
@@ -338,12 +342,14 @@ test('real Edge instruction editing uses the dedicated pipeline', async ({ brows
     report.browser = await page.context().browser().version();
     await page.goto('/?view=image');
     await expect(page.getByTestId('diffusion-workspace')).toBeVisible();
+    await page.getByTestId('diffusion-workspace-assets').click();
     await page.getByTestId('diffusion-model-path').fill(MODEL_PATH);
     await page.getByTestId('diffusion-register').click();
     await expect(page.getByTestId('diffusion-artifact-select').locator('option')).not.toHaveCount(0);
     await page.getByTestId('diffusion-profile').selectOption('balanced');
     await page.getByTestId('diffusion-load').click();
     await expect(page.getByTestId('diffusion-load')).toContainText('图像模型已就绪');
+    await page.getByTestId('diffusion-workspace-generate').click();
 
     await page.getByTestId('diffusion-mode-instruction').click();
     await expect(page.getByTestId('diffusion-instruction-select')).toHaveValue(
