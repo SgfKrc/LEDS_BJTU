@@ -49,6 +49,7 @@ import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.ui.components.EmptyState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.StatusChip
+import com.qlh.inference.ui.theme.QlhShapeTokens
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -204,7 +205,7 @@ private fun SessionCard(
             // 会话图标（圆角底色）
             Surface(
                 modifier = Modifier.size(40.dp),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(QlhShapeTokens.control),
                 color = if (isCurrent) {
                     MaterialTheme.colorScheme.primary
                 } else {

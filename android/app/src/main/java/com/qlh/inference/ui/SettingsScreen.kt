@@ -47,6 +47,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -55,6 +56,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,6 +77,7 @@ import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.ui.components.QlhTopBar
+import com.qlh.inference.ui.components.CollapsibleSettingsGroup
 import com.qlh.inference.ui.components.SettingRow
 import com.qlh.inference.ui.components.SettingsGroup
 import com.qlh.inference.ui.components.StatusChip
@@ -154,11 +157,12 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
-            AppearanceGroup(
-                themeMode = themeMode,
-                onThemeModeChange = onThemeModeChange
+            DeviceStatusGroups(
+                status = runtimeStatus,
+                loading = runtimeStatusLoading,
+                error = runtimeStatusError,
+                onRefresh = onRefreshRuntimeStatus
             )
-
             ConnectionGroup(
                 serverHost = serverHost,
                 serverPort = serverPort,
@@ -171,6 +175,11 @@ fun SettingsScreen(
                 inferenceMode = inferenceMode,
                 isLite = isLite,
                 onInferenceModeChange = onInferenceModeChange
+            )
+
+            AppearanceGroup(
+                themeMode = themeMode,
+                onThemeModeChange = onThemeModeChange
             )
 
             if (!isLite && inferenceMode == "full") {
@@ -210,17 +219,12 @@ fun SettingsScreen(
                 temperature = temperature,
                 topP = topP,
                 contextSize = contextSize,
+                showThinking = showThinking,
                 onMaxTokensChange = onMaxTokensChange,
                 onTemperatureChange = onTemperatureChange,
                 onTopPChange = onTopPChange,
-                onContextSizeChange = onContextSizeChange
-            )
-
-            DeviceStatusGroups(
-                status = runtimeStatus,
-                loading = runtimeStatusLoading,
-                error = runtimeStatusError,
-                onRefresh = onRefreshRuntimeStatus
+                onContextSizeChange = onContextSizeChange,
+                onShowThinkingChange = onShowThinkingChange
             )
 
             LogManagementGroup(isLite = isLite)
@@ -503,12 +507,28 @@ private fun InferenceParamsGroup(
     temperature: Float,
     topP: Float,
     contextSize: Int,
+    showThinking: Boolean,
     onMaxTokensChange: (Int) -> Unit,
     onTemperatureChange: (Float) -> Unit,
     onTopPChange: (Float) -> Unit,
-    onContextSizeChange: (Int) -> Unit
+    onContextSizeChange: (Int) -> Unit,
+    onShowThinkingChange: (Boolean) -> Unit
 ) {
     SettingsGroup(title = "推理参数", icon = Icons.Default.Tune) {
+        SettingRow(
+            title = "显示思考过程",
+            subtitle = "仅影响对话内容的展示，不改变模型执行模式",
+            trailing = {
+                Switch(
+                    checked = showThinking,
+                    onCheckedChange = onShowThinkingChange,
+                    modifier = Modifier.testTag("settings_show_thinking")
+                )
+            }
+        )
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+
         // Max Tokens
         var maxTokensText by remember(maxTokens) {
             mutableStateOf(maxTokens.toString())
@@ -756,6 +776,7 @@ private fun ModelManagementPanel(
     onDeleteSelectedModel: () -> Unit
 ) {
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var showModelList by rememberSaveable { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -808,14 +829,29 @@ private fun ModelManagementPanel(
         }
 
         if (availableModels.isNotEmpty()) {
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                availableModels.forEach { model ->
-                    ModelRow(
-                        model = model,
-                        selected = selectedModelUri == model.uri.toString(),
-                        onClick = { onModelSelected(model) }
+            SettingRow(
+                title = if (showModelList) "收起模型列表" else "查看模型列表",
+                subtitle = "${availableModels.size} 个可用模型 · 当前：${selectedModelName.ifBlank { "未选择" }}",
+                modifier = Modifier.testTag("settings_model_list_toggle"),
+                onClick = { showModelList = !showModelList },
+                trailing = {
+                    Text(
+                        text = if (showModelList) "收起" else "展开",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
                     )
+                }
+            )
+            if (showModelList) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    availableModels.forEach { model ->
+                        ModelRow(
+                            model = model,
+                            selected = selectedModelUri == model.uri.toString(),
+                            onClick = { onModelSelected(model) }
+                        )
+                    }
                 }
             }
         }
@@ -956,6 +992,8 @@ private fun DeviceStatusGroups(
     error: String?,
     onRefresh: () -> Unit
 ) {
+    var showDeviceDetails by rememberSaveable { mutableStateOf(false) }
+
     Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
         SettingsGroup(title = "设备状态", icon = Icons.Default.Memory) {
             Row(
@@ -1033,36 +1071,50 @@ private fun DeviceStatusGroups(
                         StatusRow("推理服务", "运行中")
                     }
 
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+                    SettingRow(
+                        title = if (showDeviceDetails) "收起设备详情" else "查看设备详情",
+                        subtitle = "系统、内存、存储与热状态",
+                        modifier = Modifier.testTag("settings_device_details"),
+                        onClick = { showDeviceDetails = !showDeviceDetails },
+                        trailing = {
+                            Text(
+                                text = if (showDeviceDetails) "收起" else "展开",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    )
 
-                    // ---- 系统信息 ----
-                    StatusRow("设备", "${status.system.manufacturer} ${status.system.brand} ${status.system.model}".trim())
-                    StatusRow("ABI", status.system.abis.joinToString(", ").ifBlank { "未知" })
-                    StatusRow("CPU 核心", "${status.system.cpuCores}")
-                    StatusRow("Android", "${status.system.androidRelease} (SDK ${status.system.sdkInt})")
-                    if (status.system.socModel.isNotBlank()) {
-                        StatusRow("SoC", "${status.system.socManufacturer} ${status.system.socModel}".trim())
-                    }
-                    StatusRow("省电模式", if (status.system.powerSaveMode) "开启" else "关闭")
-                    StatusRow("热状态", status.system.thermalStatus)
+                    if (showDeviceDetails) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
 
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+                        StatusRow("设备", "${status.system.manufacturer} ${status.system.brand} ${status.system.model}".trim())
+                        StatusRow("ABI", status.system.abis.joinToString(", ").ifBlank { "未知" })
+                        StatusRow("CPU 核心", "${status.system.cpuCores}")
+                        StatusRow("Android", "${status.system.androidRelease} (SDK ${status.system.sdkInt})")
+                        if (status.system.socModel.isNotBlank()) {
+                            StatusRow("SoC", "${status.system.socManufacturer} ${status.system.socModel}".trim())
+                        }
+                        StatusRow("省电模式", if (status.system.powerSaveMode) "开启" else "关闭")
+                        StatusRow("热状态", status.system.thermalStatus)
 
-                    // ---- 内存 / 存储 ----
-                    StatusRow("系统内存", "${formatBytes(status.memory.availableBytes)} / ${formatBytes(status.memory.totalBytes)}")
-                    if (status.memory.lowMemory) {
-                        Text(
-                            text = "系统内存不足",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+
+                        StatusRow("系统内存", "${formatBytes(status.memory.availableBytes)} / ${formatBytes(status.memory.totalBytes)}")
+                        if (status.memory.lowMemory) {
+                            Text(
+                                text = "系统内存不足",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        StatusRow("JVM Heap", "${formatBytes(status.memory.heapFreeBytes)} / ${formatBytes(status.memory.heapTotalBytes)} (max ${formatBytes(status.memory.heapMaxBytes)})")
+                        if (status.memory.lowRamDevice) {
+                            StatusRow("低 RAM 设备", "是")
+                        }
+                        StatusRow("存储 (文件)", "${formatBytes(status.storage.filesAvailableBytes)} / ${formatBytes(status.storage.filesTotalBytes)}")
+                        StatusRow("存储 (缓存)", "${formatBytes(status.storage.cacheAvailableBytes)} / ${formatBytes(status.storage.cacheTotalBytes)}")
                     }
-                    StatusRow("JVM Heap", "${formatBytes(status.memory.heapFreeBytes)} / ${formatBytes(status.memory.heapTotalBytes)} (max ${formatBytes(status.memory.heapMaxBytes)})")
-                    if (status.memory.lowRamDevice) {
-                        StatusRow("低 RAM 设备", "是")
-                    }
-                    StatusRow("存储 (文件)", "${formatBytes(status.storage.filesAvailableBytes)} / ${formatBytes(status.storage.filesTotalBytes)}")
-                    StatusRow("存储 (缓存)", "${formatBytes(status.storage.cacheAvailableBytes)} / ${formatBytes(status.storage.cacheTotalBytes)}")
                 }
             }
         }
@@ -1078,7 +1130,12 @@ private fun DeviceStatusGroups(
 
 @Composable
 private fun GpuGroup(status: AndroidRuntimeStatus) {
-    SettingsGroup(title = "GPU", icon = Icons.Default.Memory) {
+    CollapsibleSettingsGroup(
+        title = "GPU",
+        summary = "渲染器、厂商和 GPU offload 能力",
+        icon = Icons.Default.Memory,
+        testTag = "settings_gpu_details"
+    ) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             val gpu = status.gpu
             if (gpu.probeError != null) {
@@ -1107,7 +1164,12 @@ private fun GpuGroup(status: AndroidRuntimeStatus) {
 private fun BackendGroup(status: AndroidRuntimeStatus) {
     val be = status.backend
     if (be.systemInfo.isNotBlank()) {
-        SettingsGroup(title = "llama.cpp 后端", icon = Icons.Default.Info) {
+        CollapsibleSettingsGroup(
+            title = "llama.cpp 后端",
+            summary = "引擎、mmap、mlock、RPC 和编译信息",
+            icon = Icons.Default.Info,
+            testTag = "settings_backend_details"
+        ) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 StatusRow("引擎", be.engine)
                 StatusRow("mmap", if (be.supportsMmap) "支持" else "不支持")
@@ -1132,7 +1194,12 @@ private fun BackendGroup(status: AndroidRuntimeStatus) {
 @Composable
 private fun ModelStatusGroup(status: AndroidRuntimeStatus) {
     val mdl = status.model
-    SettingsGroup(title = "模型状态", icon = Icons.Default.Info) {
+    CollapsibleSettingsGroup(
+        title = "模型状态",
+        summary = if (mdl.loaded) "已加载：${mdl.name.ifBlank { "当前模型" }}" else "尚未加载模型",
+        icon = Icons.Default.Info,
+        testTag = "settings_model_details"
+    ) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             StatusRow("已加载", if (mdl.loaded) "是" else "否")
             StatusRow("已选择模型", mdl.selectedName.ifBlank { "无" })
@@ -1161,7 +1228,12 @@ private fun ContextGroup(status: AndroidRuntimeStatus) {
     val mdl = status.model
     if (!mdl.loaded) return
     val ctx = status.context
-    SettingsGroup(title = "上下文 / KV (估算)", icon = Icons.Default.Memory) {
+    CollapsibleSettingsGroup(
+        title = "上下文 / KV (估算)",
+        summary = "上下文、批大小和 KV 缓存指标",
+        icon = Icons.Default.Memory,
+        testTag = "settings_context_details"
+    ) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             StatusRow("配置上下文", "${ctx.configuredContextSize}")
             StatusRow("模型上下文 (n_ctx)", ctx.modelContextSize.ifBlank { "-" })

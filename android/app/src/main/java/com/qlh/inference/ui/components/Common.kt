@@ -17,19 +17,26 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.qlh.inference.ui.theme.QlhShapeTokens
 
 // ================================================================
 // 共享 UI 组件 — 统一各页面的视觉语言
@@ -196,7 +203,7 @@ fun SettingRow(
         if (icon != null) {
             Surface(
                 modifier = Modifier.size(36.dp),
-                shape = RoundedCornerShape(10.dp),
+                shape = RoundedCornerShape(QlhShapeTokens.control),
                 color = MaterialTheme.colorScheme.secondaryContainer
             ) {
                 Box(contentAlignment = Alignment.Center) {
@@ -231,6 +238,45 @@ fun SettingRow(
         if (trailing != null) {
             Spacer(modifier = Modifier.width(12.dp))
             trailing()
+        }
+    }
+}
+
+/** A settings card whose low-frequency details stay out of the primary scan path. */
+@Composable
+fun CollapsibleSettingsGroup(
+    title: String,
+    summary: String,
+    modifier: Modifier = Modifier,
+    icon: ImageVector? = null,
+    initiallyExpanded: Boolean = false,
+    testTag: String? = null,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    var expanded by rememberSaveable(title) { mutableStateOf(initiallyExpanded) }
+
+    SettingsGroup(title = title, modifier = modifier, icon = icon) {
+        SettingRow(
+            title = if (expanded) "收起详情" else "查看详情",
+            subtitle = summary,
+            modifier = if (testTag == null) Modifier else Modifier.testTag(testTag),
+            onClick = { expanded = !expanded },
+            trailing = {
+                Text(
+                    text = if (expanded) "收起" else "展开",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        )
+        if (expanded) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+                content = content
+            )
         }
     }
 }

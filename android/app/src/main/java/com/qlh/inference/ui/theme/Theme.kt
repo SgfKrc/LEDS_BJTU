@@ -88,13 +88,19 @@ private val DarkColorScheme = darkColorScheme(
     surfaceContainerHighest = SurfaceContainerHighestDark
 )
 
-// 统一圆角体系：小控件 8dp，普通卡片 16dp，大容器 20dp+
+// 统一形状 token：信息卡和设置分组保持克制的 8dp 内圆角。
+object QlhShapeTokens {
+    val compact = 4.dp
+    val control = 8.dp
+    val dialog = 12.dp
+}
+
 private val QlhShapes = Shapes(
-    extraSmall = RoundedCornerShape(8.dp),
-    small = RoundedCornerShape(12.dp),
-    medium = RoundedCornerShape(16.dp),
-    large = RoundedCornerShape(20.dp),
-    extraLarge = RoundedCornerShape(28.dp)
+    extraSmall = RoundedCornerShape(QlhShapeTokens.compact),
+    small = RoundedCornerShape(QlhShapeTokens.control),
+    medium = RoundedCornerShape(QlhShapeTokens.control),
+    large = RoundedCornerShape(QlhShapeTokens.control),
+    extraLarge = RoundedCornerShape(QlhShapeTokens.dialog)
 )
 
 @Composable
@@ -111,7 +117,9 @@ fun QlhTheme(
             val window = (view.context as Activity).window
             @Suppress("DEPRECATION")
             window.statusBarColor = colorScheme.background.toArgb()
-            WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
+            val insetsController = WindowCompat.getInsetsController(window, view)
+            insetsController.isAppearanceLightStatusBars = !darkTheme
+            insetsController.isAppearanceLightNavigationBars = !darkTheme
         }
     }
 
