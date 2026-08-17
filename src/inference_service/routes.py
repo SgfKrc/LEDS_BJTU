@@ -327,6 +327,18 @@ async def models_list(request: Request):
     return _engine_host(request).list_models()
 
 
+@router.get("/models/local-assets")
+async def models_local_assets(request: Request):
+    """Read-only inventory of locally present sidecar/task-route assets."""
+    return _engine_host(request).list_local_model_assets()
+
+
+@router.post("/models/local-assets/{model_id}/preflight")
+async def models_local_asset_preflight(request: Request, model_id: str):
+    """Run a supported read-only Sidecar preflight; never loads model weights."""
+    return await run_in_threadpool(_engine_host(request).preflight_local_model_asset, model_id)
+
+
 @router.get("/models/available")
 async def models_available(request: Request):
     """可选模型配置 + 可用引擎（对齐 api_server /api/models/available）。"""

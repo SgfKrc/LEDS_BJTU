@@ -5,7 +5,7 @@
  * （对齐 src/api_server.py:2159-2178 的返回形状：loaded/model_id/quant_type/
  *  model_name/model_path/engine/total_params/device/gpu_allocated_gb/...）。
  */
-import { Body, Controller, Get, HttpCode, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';
 import { InferenceClient } from '../../clients/inference.client';
 
 @Controller('models')
@@ -16,6 +16,23 @@ export class ModelsController {
   list(): Promise<unknown> {
     // 对齐 api_server.py:5059-5070 list_models：全部模型配置 + active_model_id
     return this.inference.request('GET', '/v1/models');
+  }
+
+  @Get('local-assets')
+  localAssets(): Promise<unknown> {
+    return this.inference.request('GET', '/v1/models/local-assets');
+  }
+
+  @Post('local-assets/:modelId/preflight')
+  @HttpCode(200)
+  localAssetPreflight(@Param('modelId') modelId: string): Promise<unknown> {
+    return this.inference.request(
+      'POST',
+      `/v1/models/local-assets/${encodeURIComponent(modelId)}/preflight`,
+      undefined,
+      {},
+      75_000,
+    );
   }
 
   @Get('current')

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -1117,6 +1118,7 @@ class Scheduler:
         self._gemma4_local_artifact_root_override: Optional[str] = None
         self._gemma4_assignment_paths: dict[str, str] = {}
         self._gemma4_sidecar_python_override: Optional[str] = None
+        self._model_runtime_contract_lock = threading.RLock()
         self._active_pipeline_capacity_plan: Optional[dict] = None
         self._prepared_layer_configs: dict[str, dict] = {}
         # 同时到达的分布式请求都可能要求权威同步，必须用计数而非
@@ -2989,9 +2991,10 @@ class Scheduler:
 
     def get_pipeline_capacity_plan(
         self, eligible_node_ids: Optional[set[str]] = None,
+        *, descriptor: Optional[dict] = None,
     ) -> dict:
         """Compute an all-or-nothing metadata-only cluster capacity plan."""
-        if eligible_node_ids is None:
+        if eligible_node_ids is None and descriptor is None:
             with self._layer_config_lock:
                 active = (
                     dict(self._active_pipeline_capacity_plan)
@@ -3023,8 +3026,9 @@ class Scheduler:
                 transaction_plan.update(transaction_snapshot)
                 return transaction_plan
 
-        get_descriptor = getattr(self._host, "get_pipeline_descriptor", None)
-        descriptor = get_descriptor() if callable(get_descriptor) else {}
+        if descriptor is None:
+            get_descriptor = getattr(self._host, "get_pipeline_descriptor", None)
+            descriptor = get_descriptor() if callable(get_descriptor) else {}
         if not isinstance(descriptor, dict) or not descriptor:
             return {
                 "status": "unavailable",
@@ -4268,6 +4272,431 @@ class Scheduler:
                     else {"active": False, "mode": "local"}
                 ),
             }
+
+    def _resolve_model_runtime_descriptor(self, profile: str, model_id: str) -> tuple[dict, dict]:
+        """Inspect a verified local asset without changing the active model."""
+        from local_model_assets import resolve_local_model_asset_metadata
+        from pipeline_model_descriptor import inspect_pipeline_model
+
+        metadata = resolve_local_model_asset_metadata(model_id)
+        if not metadata:
+            raise ValueError("受管本地 Safetensors 资产不存在或清单未通过验证")
+        expected_type = {
+            "qwen3_sidecar": "qwen3",
+            "gemma4_pipeline": "gemma4_unified",
+        }.get(str(profile))
+        if expected_type is None:
+            raise ValueError("model runtime Sidecar profile is unsupported")
+        descriptor = inspect_pipeline_model(
+            metadata["model_path"], model_id=str(model_id),
+        )
+        if str(descriptor.get("model_type", "")).lower() != expected_type:
+            raise ValueError(
+                f"模型架构与 Sidecar profile 不匹配: {descriptor.get('model_type', '')}"
+            )
+        descriptor["config"] = dict(metadata.get("config") or {})
+        descriptor["model_sha256"] = str(metadata["model_sha256"])
+        # The capacity solver is a metadata solver, while runtime admission is
+        # still kept fail-closed by the profile-specific Sidecar contracts.
+        descriptor["pipeline_runtime_supported"] = True
+        if profile == "gemma4_pipeline":
+            components = dict(descriptor.get("component_weight_bytes") or {})
+            for key in ("visual", "multimodal", "mtp"):
+                components[key] = 0
+            descriptor["component_weight_bytes"] = components
+        return metadata, descriptor
+
+    @staticmethod
+    def _runtime_contract_plan_projection(plan: dict) -> dict:
+        """Keep the persisted/UI plan bounded and path-free."""
+        allowed = (
+            "schema_version", "status", "admitted", "reason_code", "plan_id",
+            "model_id", "model_type", "total_layers", "raw_model_bytes",
+            "safety_margin", "candidate_node_count", "excluded_nodes",
+            "control_only_nodes", "participating_node_count", "aggregate_only",
+            "single_node_full_model_candidates", "assignments",
+        )
+        return {key: plan[key] for key in allowed if key in plan}
+
+    @staticmethod
+    def _load_model_runtime_contract_records() -> list[dict]:
+        from local_store import get_local_setting
+
+        value = get_local_setting("model_runtime_contracts_v1", {})
+        records = value.get("bindings") if isinstance(value, dict) else None
+        return [dict(item) for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+
+    @staticmethod
+    def _save_model_runtime_contract_records(records: list[dict]) -> None:
+        from local_store import set_local_setting
+
+        set_local_setting(
+            "model_runtime_contracts_v1",
+            {"schema_version": 1, "bindings": records[-64:]},
+        )
+
+    @staticmethod
+    def _model_runtime_audit_token(value: object, *, fallback: str = "") -> str:
+        token = re.sub(r"[^a-z0-9_.-]+", "_", str(value or "").lower()).strip("._-")
+        return token[:96] or fallback
+
+    @staticmethod
+    def _model_runtime_contract_id_from_state(state: object) -> str:
+        if not isinstance(state, dict):
+            return ""
+        for key in ("contract_sha256", "chain_id"):
+            candidate = str(state.get(key, "") or "").lower()
+            if len(candidate) == 64 and all(char in "0123456789abcdef" for char in candidate):
+                return candidate
+        return ""
+
+    def _model_runtime_audit_event(
+        self,
+        action: str,
+        *,
+        state: object = None,
+        error: Exception | None = None,
+    ) -> dict:
+        """Create a bounded, path-free lifecycle evidence record."""
+        snapshot = state if isinstance(state, dict) else {}
+        event = {
+            "at": time.time(),
+            "action": self._model_runtime_audit_token(
+                action, fallback="runtime_operation",
+            ),
+        }
+        phase = self._model_runtime_audit_token(snapshot.get("phase", ""))
+        if phase:
+            event["phase"] = phase
+        for key in ("generation", "segment_count"):
+            try:
+                value = int(snapshot.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                event[key] = value
+        if "cleanup_complete" in snapshot:
+            event["cleanup_complete"] = bool(snapshot.get("cleanup_complete"))
+        if error is not None:
+            event["reason_code"] = self._model_runtime_audit_token(
+                getattr(error, "reason_code", "") or error.__class__.__name__,
+                fallback="runtime_operation_rejected",
+            )
+        return event
+
+    @staticmethod
+    def _model_runtime_execution_projection(record: dict) -> dict:
+        audit = record.get("audit") if isinstance(record.get("audit"), list) else []
+        events = [dict(item) for item in audit if isinstance(item, dict)][-8:]
+        last_event = dict(events[-1]) if events else {}
+        action = str(last_event.get("action", "") or "")
+        if action in {"prepare_failed", "release_failed", "cancel_failed"}:
+            recovery_action = "retry_prepare"
+        elif action in {"released", "cancelled", "recovered"}:
+            recovery_action = "prepare"
+        else:
+            recovery_action = "prepare"
+        return {
+            "event_count": len(audit),
+            "last_event": last_event,
+            "recent_events": list(reversed(events)),
+            "recovery_action": recovery_action,
+        }
+
+    def _append_model_runtime_contract_event(
+        self,
+        profile: str,
+        contract_id: str,
+        action: str,
+        *,
+        state: object = None,
+        error: Exception | None = None,
+    ) -> dict | None:
+        """Append bounded lifecycle evidence to a persisted contract only."""
+        requested = str(contract_id or "").strip().lower()
+        if not requested:
+            return None
+        event = self._model_runtime_audit_event(action, state=state, error=error)
+        with self._model_runtime_contract_lock:
+            records = self._load_model_runtime_contract_records()
+            for record in reversed(records):
+                summary = record.get("summary") if isinstance(record.get("summary"), dict) else {}
+                if (
+                    record.get("profile") != profile
+                    or str(summary.get("contract_id", "") or "").lower() != requested
+                ):
+                    continue
+                audit = record.get("audit") if isinstance(record.get("audit"), list) else []
+                record["audit"] = [
+                    dict(item) for item in audit if isinstance(item, dict)
+                ][-23:] + [event]
+                self._save_model_runtime_contract_records(records)
+                return event
+        return None
+
+    def _model_runtime_active_contract_id(self, profile: str) -> str:
+        if profile == "qwen3_sidecar":
+            status = self.get_qwen3_local_chain_status()
+        elif profile == "gemma4_pipeline":
+            status = self.get_gemma4_local_sidecar_status()
+        else:
+            return ""
+        return self._model_runtime_contract_id_from_state(status.get("state"))
+
+    def get_model_runtime_contracts(
+        self, profile: Optional[str] = None, model_id: Optional[str] = None,
+    ) -> dict:
+        with self._model_runtime_contract_lock:
+            records = self._load_model_runtime_contract_records()
+        filtered = [
+            item for item in records
+            if (not profile or item.get("profile") == profile)
+            and (not model_id or item.get("model_id") == model_id)
+        ]
+        return {
+            "schema_version": 1,
+            "contracts": [
+                {
+                    **dict(item.get("summary") or item),
+                    "execution": self._model_runtime_execution_projection(item),
+                }
+                for item in reversed(filtered)
+            ],
+        }
+
+    def get_model_runtime_contract(
+        self, contract_id: str, *, profile: Optional[str] = None,
+    ) -> dict:
+        requested = str(contract_id or "").strip().lower()
+        if not requested:
+            raise ValueError("model runtime contract_id is required")
+        with self._model_runtime_contract_lock:
+            for record in self._load_model_runtime_contract_records():
+                summary = record.get("summary") or {}
+                if str(summary.get("contract_id", "")).lower() == requested:
+                    if profile and record.get("profile") != profile:
+                        raise ValueError("model runtime contract profile does not match the requested Sidecar")
+                    contract = record.get("contract")
+                    if isinstance(contract, dict):
+                        return dict(contract)
+        raise ValueError("model runtime task contract was not found")
+
+    def bind_model_runtime_contract(self, profile: str, model_id: str) -> dict:
+        """Create an auditable, path-free contract from MODEL-FLEET capacity."""
+        if self._effective_role() != "master":
+            raise Qwen3PipelineProtocolError(
+                "model runtime contract binding is available only on the master node"
+            )
+        profile = str(profile or "")
+        model_id = str(model_id or "").strip()
+        if not model_id:
+            raise ValueError("model runtime contract model_id is required")
+        metadata, descriptor = self._resolve_model_runtime_descriptor(profile, model_id)
+        plan = self.get_pipeline_capacity_plan(descriptor=descriptor)
+        if not plan.get("admitted"):
+            raise ValueError(
+                f"MODEL-FLEET capacity plan is not admitted: {plan.get('reason_code', 'unknown')}"
+            )
+        assignments = list(plan.get("assignments") or [])
+        records = self._load_model_runtime_contract_records()
+        same_model = [
+            item for item in records
+            if item.get("profile") == profile and item.get("model_id") == model_id
+        ]
+        for record in reversed(same_model):
+            summary = record.get("summary") or {}
+            if summary.get("plan_id") == plan.get("plan_id"):
+                return {
+                    **dict(summary),
+                    "status": "already_bound",
+                    "plan": self._runtime_contract_plan_projection(plan),
+                }
+        generation = max(
+            [int((item.get("summary") or {}).get("generation", 0) or 0) for item in same_model]
+            or [0]
+        ) + 1
+        model_token = "".join(
+            char if char.isalnum() or char in "._-" else "-"
+            for char in model_id
+        ).strip(".-") or "model"
+        config_id = f"model-runtime-{profile}-{model_token}"
+        from model_runtime_contracts import (
+            build_model_runtime_contract,
+            contract_summary,
+            validate_model_runtime_contract,
+        )
+
+        contract = build_model_runtime_contract(
+            profile,
+            config_id=config_id,
+            plan_id=str(plan.get("plan_id", "")),
+            generation=generation,
+            model_id=model_id,
+            model_sha256=str(metadata["model_sha256"]),
+            descriptor=descriptor,
+            assignments=assignments,
+        )
+        contract = validate_model_runtime_contract(profile, contract)
+        summary = contract_summary(profile, contract)
+        summary["bound_at"] = time.time()
+        record = {
+            "profile": profile,
+            "model_id": model_id,
+            "summary": summary,
+            "contract": contract,
+            "plan": self._runtime_contract_plan_projection(plan),
+            "audit": [self._model_runtime_audit_event(
+                "bound",
+                state={
+                    "phase": "bound",
+                    "generation": generation,
+                    "segment_count": len(contract.get("segments", [])),
+                    "cleanup_complete": False,
+                },
+            )],
+        }
+        self._save_model_runtime_contract_records(records + [record])
+        return {
+            "status": "bound",
+            **summary,
+            "plan": self._runtime_contract_plan_projection(plan),
+        }
+
+    def get_model_runtime_sidecar_status(self) -> dict:
+        """Project experimental Sidecar control state without exposing paths.
+
+        Sidecar execution is master-owned and contract-bound.  This summary is
+        intentionally metadata-only so a UI can distinguish an unavailable
+        control plane from an idle-but-capable one without treating discovery
+        of a model directory as permission to load it.
+        """
+        is_master = self._effective_role() == "master"
+        profiles: dict[str, dict] = {
+            "qwen3_sidecar": {
+                "display_name": "Qwen3 Sidecar",
+                "runtime_environment": ".venv-qwen3-sidecar",
+                "preflight_supported": True,
+                "requires_task_contract": True,
+                "production_admitted": False,
+                "supported_actions": ["status", "begin", "release", "cancel"],
+            },
+            "gemma4_pipeline": {
+                "display_name": "Gemma 4 Pipeline Sidecar",
+                "runtime_environment": ".venv-gemma4-pipeline",
+                "preflight_supported": False,
+                "requires_task_contract": True,
+                "production_admitted": False,
+                "supported_actions": ["status", "begin", "release", "cancel"],
+            },
+        }
+        if is_master:
+            profiles["qwen3_sidecar"]["session"] = self.get_qwen3_local_chain_status()
+            profiles["gemma4_pipeline"]["session"] = self.get_gemma4_local_sidecar_status()
+            for profile, capability in profiles.items():
+                contract_id = self._model_runtime_contract_id_from_state(
+                    capability["session"].get("state"),
+                )
+                if contract_id:
+                    capability["session"]["contract_id"] = contract_id
+        else:
+            unavailable = {
+                "active": False,
+                "state": {"phase": "unavailable"},
+                "reason_code": "master_only",
+            }
+            profiles["qwen3_sidecar"]["session"] = dict(unavailable)
+            profiles["gemma4_pipeline"]["session"] = dict(unavailable)
+        return {
+            "schema_version": 1,
+            "role": self._effective_role(),
+            "control_available": is_master,
+            "production_admitted": False,
+            "profiles": profiles,
+        }
+
+    def begin_model_runtime_sidecar(
+        self, profile: str, contract: Optional[dict] = None,
+        *, contract_id: Optional[str] = None,
+    ) -> dict:
+        """Start an explicit experimental chain only from a supplied contract."""
+        if self._effective_role() != "master":
+            raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
+        persisted_contract_id = ""
+        if contract_id:
+            persisted_contract_id = str(contract_id).strip().lower()
+            contract = self.get_model_runtime_contract(contract_id, profile=profile)
+        if not isinstance(contract, dict) or not contract:
+            raise Qwen3PipelineProtocolError("model runtime Sidecar begin requires a task contract")
+        try:
+            if profile == "qwen3_sidecar":
+                result = self.begin_qwen3_local_sidecar_chain(contract)
+            elif profile == "gemma4_pipeline":
+                result = self.begin_gemma4_local_sidecar_chain(contract)
+            else:
+                raise Qwen3PipelineProtocolError("model runtime Sidecar profile is unsupported")
+        except Exception as exc:
+            if persisted_contract_id:
+                self._append_model_runtime_contract_event(
+                    profile, persisted_contract_id, "prepare_failed", error=exc,
+                )
+            raise
+        if persisted_contract_id:
+            self._append_model_runtime_contract_event(
+                profile,
+                persisted_contract_id,
+                "prepare_duplicate" if result.get("status") == "duplicate" else "prepare_succeeded",
+                state=result.get("state"),
+            )
+        return {"profile": profile, **result, "production_admitted": False}
+
+    def release_model_runtime_sidecar(self, profile: str) -> dict:
+        if self._effective_role() != "master":
+            raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
+        active_contract_id = self._model_runtime_active_contract_id(profile)
+        try:
+            if profile == "qwen3_sidecar":
+                result = self.release_qwen3_local_sidecar_chain()
+            elif profile == "gemma4_pipeline":
+                result = self.release_gemma4_local_sidecar_chain()
+            else:
+                raise Qwen3PipelineProtocolError("model runtime Sidecar profile is unsupported")
+        except Exception as exc:
+            if active_contract_id:
+                self._append_model_runtime_contract_event(
+                    profile, active_contract_id, "release_failed", error=exc,
+                )
+            raise
+        contract_id = self._model_runtime_contract_id_from_state(result.get("state")) or active_contract_id
+        if contract_id:
+            self._append_model_runtime_contract_event(
+                profile, contract_id, "released", state=result.get("state"),
+            )
+        return {"profile": profile, **result, "production_admitted": False}
+
+    def cancel_model_runtime_sidecar(self, profile: str) -> dict:
+        if self._effective_role() != "master":
+            raise Qwen3PipelineProtocolError("model runtime Sidecar control is available only on the master node")
+        active_contract_id = self._model_runtime_active_contract_id(profile)
+        try:
+            if profile == "qwen3_sidecar":
+                result = self.cancel_qwen3_local_sidecar_chain()
+            elif profile == "gemma4_pipeline":
+                result = self.abort_gemma4_local_sidecar_chain()
+            else:
+                raise Qwen3PipelineProtocolError("model runtime Sidecar profile is unsupported")
+        except Exception as exc:
+            if active_contract_id:
+                self._append_model_runtime_contract_event(
+                    profile, active_contract_id, "cancel_failed", error=exc,
+                )
+            raise
+        contract_id = self._model_runtime_contract_id_from_state(result.get("state")) or active_contract_id
+        if contract_id:
+            action = "recovered" if result.get("status") == "recovered" else "cancelled"
+            self._append_model_runtime_contract_event(
+                profile, contract_id, action, state=result.get("state"),
+            )
+        return {"profile": profile, **result, "production_admitted": False}
 
     def _handle_qwen3_loopback_request(
         self, client_id: str, message: dict,

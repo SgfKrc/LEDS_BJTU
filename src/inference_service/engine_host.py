@@ -806,6 +806,18 @@ class EngineHost:
                 active = None
         return {"models": models, "active_model_id": active}
 
+    def list_local_model_assets(self) -> Dict[str, Any]:
+        """Expose discovered local packages without claiming legacy loadability."""
+        from local_model_assets import discover_local_model_assets
+
+        return discover_local_model_assets()
+
+    def preflight_local_model_asset(self, model_id: str) -> Dict[str, Any]:
+        """Run a read-only isolated runtime preflight for one inventory asset."""
+        from local_model_assets import preflight_local_model_asset
+
+        return preflight_local_model_asset(model_id)
+
     def available_models(self) -> Dict[str, Any]:
         """可选模型配置 + 可用引擎（/v1/models/available，对齐 api_server.py:4727-4879）。
 

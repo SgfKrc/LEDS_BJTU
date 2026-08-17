@@ -198,6 +198,14 @@ describe('阶段 2 其余域契约', () => {
       expect(res.body).toHaveProperty('active_model_id');
     });
 
+    it('GET /api/models/local-assets 透传只读本地资产目录', async () => {
+      const res = await request(server()).get('/api/models/local-assets');
+      expect(res.status).toBe(200);
+      expect(res.body.summary).toMatchObject({ total: 1 });
+      expect(res.body.assets[0]).toMatchObject({ model_id: 'qwen3-4b' });
+      expect(fakeInf?.requests.some(item => item.path === '/v1/models/local-assets')).toBe(true);
+    });
+
     it('POST /api/models/unload 显式释放本地 LLM', async () => {
       const res = await request(server()).post('/api/models/unload');
       expect(res.status).toBe(200);
