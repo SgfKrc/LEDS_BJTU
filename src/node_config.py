@@ -26,15 +26,43 @@ def get_node_config_path() -> Path:
     override = os.environ.get("QLH_NODE_CONFIG_PATH", "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    if getattr(sys, "frozen", False):
-        if sys.platform == "win32":
-            base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-            return base / "QLH-Edge-Inference" / "node_config.json"
-        if sys.platform == "darwin":
-            return Path.home() / "Library" / "Application Support" / "qlh" / "node_config.json"
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        return base / "qlh" / "node_config.json"
-    return get_app_root() / "node_config.json"
+    # Keep identity outside the checkout in both frozen and source mode.  A
+    # source checkout is disposable (and patch delivery may hard-reset/clean
+    # it), while the node identity and cluster secret belong to the user.
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+        return base / "QLH-Edge-Inference" / "node_config.json"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "qlh" / "node_config.json"
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "qlh" / "node_config.json"
+
+
+def resolve_initial_node_role() -> str:
+    """Resolve startup role without promoting an unconfigured source clone.
+
+    Packaged installs retain the historical master-first behavior for the
+    first-run setup UI.  A source checkout with no persisted configuration is
+    treated as a worker until the user explicitly selects ``master``.
+    """
+    explicit = os.environ.get("QLH_NODE_ROLE", "").strip().lower()
+    if explicit:
+        if explicit == "master":
+            return "master"
+        if explicit in {"slave", "worker", "client"}:
+            return "client"
+        # An unrecognised role must not promote a source checkout.
+        return "master" if getattr(sys, "frozen", False) else "client"
+    data = load_node_config()
+    node = data.get("node") if isinstance(data.get("node"), dict) else {}
+    configured = str(node.get("role", "")).strip().lower()
+    if configured:
+        if configured == "master":
+            return "master"
+        if configured in {"slave", "worker", "client"}:
+            return "client"
+        return "master" if getattr(sys, "frozen", False) else "client"
+    return "master" if getattr(sys, "frozen", False) else "client"
 
 
 def load_node_config() -> dict[str, Any]:

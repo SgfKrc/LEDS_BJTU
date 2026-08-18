@@ -207,6 +207,53 @@ def test_frozen_windows_config_uses_local_app_data(tmp_path, monkeypatch):
     )
 
 
+def test_source_checkout_uses_user_config_directory(tmp_path, monkeypatch):
+    from node_config import get_node_config_path
+
+    monkeypatch.delenv("QLH_NODE_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    assert get_node_config_path() == (
+        tmp_path / "LocalAppData" / "QLH-Edge-Inference" / "node_config.json"
+    )
+
+
+def test_unconfigured_source_checkout_defaults_to_client(tmp_path, monkeypatch):
+    import node_config
+
+    monkeypatch.delenv("QLH_NODE_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("QLH_NODE_ROLE", raising=False)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    assert node_config.resolve_initial_node_role() == "client"
+
+
+def test_source_checkout_requires_explicit_master_role(tmp_path, monkeypatch):
+    import node_config
+
+    monkeypatch.delenv("QLH_NODE_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("QLH_NODE_ROLE", "master")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+
+    assert node_config.resolve_initial_node_role() == "master"
+
+
+def test_source_checkout_rejects_unknown_role_as_client(tmp_path, monkeypatch):
+    import node_config
+
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node_config.json"))
+    monkeypatch.setenv("QLH_NODE_ROLE", "typo-role")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+
+    assert node_config.resolve_initial_node_role() == "client"
+
+
 def test_frozen_config_migrates_legacy_exe_directory_file(tmp_path, monkeypatch):
     from node_config import get_node_config_path, load_node_config
 
