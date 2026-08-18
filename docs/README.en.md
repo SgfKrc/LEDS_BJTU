@@ -6,7 +6,7 @@
 
 Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Multi-terminal collaborative inference · Visual monitoring · External-compute assistance
 
-**v0.1.8.2** (updated 2026-08-12)
+**v0.1.8.2** (updated 2026-08-19)
 
 > 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** (Chinese).
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
@@ -318,6 +318,41 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
+### 🚀 One-Click Setup for All Development Environments (recommended after cloning)
+
+The repo contains **the main runtime + 8 Python virtual environments + 3 Node sub-projects**; wiring them up one by one is tedious. The unified entrypoint `scripts/setup_envs.py` (or the root-level `setup_all_envs.bat` / `setup_all_envs.sh`) prepares them all at once:
+
+```bash
+# Windows
+setup_all_envs.bat --all
+
+# Linux / macOS
+./setup_all_envs.sh --all
+
+# Or call the script directly (equivalent; also --only / --skip / --check / --snapshot / --list)
+python scripts/setup_envs.py --all
+python scripts/setup_envs.py --check      # verify existing envs only, no install
+python scripts/setup_envs.py --list       # show the environment inventory
+```
+
+> ⚠️ **Platform-specific heavy deps such as torch are NOT installed automatically**: the script filters out `torch/torchvision/torchaudio` and prints the per-environment install commands, so CPU/CUDA wheels never contaminate each other (the two packaging venvs must never be mixed: the iGPU build takes CPU-only torch, the dGPU build defaults to CUDA). Pass `--torch-index-url URL` to bake your chosen source into the hints, e.g. `https://download.pytorch.org/whl/cu126`. Packages that need a source build (e.g. llama-cpp-python) fail loudly without a compiler toolchain — follow the header comments of the corresponding requirements file.
+
+**Environment ↔ dependency file ↔ lock snapshot**: `requirements-lock/*.lock.txt` are generated from the live `pip freeze` via `--snapshot` and pin exact versions for reproducibility (torch-family, editable and local-path installs are not pinned); installation still follows the version windows in the `requirements-*.txt` files.
+
+| Environment | Purpose | Dependency source | lock snapshot |
+|---|---|---|---|
+| **Main** (system Python) | Runtime (transformers/torch inference services) & tool scripts | `requirements.txt` | `requirements-lock/main.lock.txt` |
+| `.venv-test` | The only test environment (all pytest runs) | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
+| `.venv-tui` | T9 terminal chat page (textual) | `packaging/requirements-tui.txt` | `requirements-lock/tui.lock.txt` |
+| `.venv-gemma4-native` | Native Gemma 4 MTMD / llama.cpp | `packaging/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
+| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
+| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar (incl. pipeline execution deps) | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
+| `.venv-packaging` | iGPU packaging (CPU torch + PyInstaller) | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
+| `.venv-packaging-cuda` | dGPU packaging + SD sidecar | `packaging/requirements-cpu.txt` + `packaging/requirements-sd15.txt` | `requirements-lock/packaging-cuda.lock.txt` |
+| frontend / gateway / control | Node sub-projects | each `package-lock.json` (`npm ci`, handled with --all) | — |
+
+> `setup_all_envs.bat` runs `chcp 65001` automatically on Windows; if you run the script directly and the terminal shows mojibake, run `chcp 65001` or `set PYTHONIOENCODING=utf-8`.
+
 ### 🔒 Environment Separation (main / test / packaging)
 
 **Hard rule: test dependencies go ONLY into `.venv-test` — never into the system Python (main environment); never copy/sync site-packages between `.venv-test` and the main environment.**
@@ -342,6 +377,72 @@ python scripts/setup_test_env.py --check
 ```
 
 > **Incident log (2026-08-14)**: the main env was once polluted with pytest-family packages while `.venv-test` was stripped of pytest (site-packages copied between the two envs), forcing test runs in the main env. Fixed (main env uninstalled test packages; `.venv-test` reinstalled from requirements-test.txt). **Do not bypass the guard via `run_test_channels.py --allow-system-python`** — that flag is only for throwaway CI images.
+
+---
+
+## 🧰 After-Clone Asset Checklist
+
+> Cloning the repo ≠ immediately usable. The list below covers the **offline assets you still need beyond the code** (model weights, submodules, secrets, environment files). Items marked ✅ ship with the repo or come with a normal clone; the rest must be obtained per the tables.
+
+### 0. First Steps After Cloning (one-time environment steps)
+
+```bash
+# 1. Only pull the llama.cpp submodule when building Android Full; PC workers and Python sidecars do NOT need it
+git submodule update --init --recursive
+
+# 2. Install Python dependencies (main environment; online)
+pip install -r requirements.txt
+
+# 3. Frontend dependencies (optional, only when developing the frontend)
+cd frontend && npm install && cd ..
+
+# 4. Environment files (not committed; create per node)
+#    The main .env needs at least QLH_CLUSTER_SECRET (distributed secret);
+#    judging/tool keys see §4.1 of docs/文档维护Agent工具设计.md and .env.docagent
+
+# 5. Verify
+python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
+```
+
+`llama.cpp` is pinned as the `android/app/src/main/cpp/llama.cpp` Git submodule. To keep Android Full build capability, prefer a first clone with `git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU`; if a node only runs PC CPU workers / Qwen3 or Gemma 4 PyTorch sidecars, a plain clone is enough — no separate clone or build of `llama.cpp`. `.venv-gemma4-native` uses `llama-cpp-python` and does not reference that Android source submodule either.
+
+A PC worker without CUDA / discrete GPU must explicitly install CPU PyTorch; never copy the master's CUDA venv:
+
+```bash
+python scripts/setup_qwen3_sidecar_env.py --pipeline \
+  --torch-index-url https://download.pytorch.org/whl/cpu
+python scripts/setup_gemma4_pipeline_env.py \
+  --torch-index-url https://download.pytorch.org/whl/cpu
+python scripts/setup_envs.py --check --no-node
+```
+
+At runtime use `execution_device=cpu` (or `auto`, which falls back to CPU when CUDA is absent); capacity gates judge by available RAM, not VRAM. CPU and CUDA environments must be created locally on each node — never copy `.venv-*` across machines.
+
+### 1. Offline Asset Checklist (fetch as needed)
+
+| Asset | Size | Purpose | How to get | Required? |
+|---|---|---|---|---|
+| **Qwen-1.8B-Chat (Safetensors)** | ~3.5 GB | Default sample model: dGPU inference, distributed pipeline | ModelScope `Qwen/Qwen-1.8B-Chat` or HF (see Model Download below) | ⭐ Required (default model) |
+| **Qwen-1.8B-Chat (GGUF Q4_K_M)** | ~1.16 GB | CPU/iGPU standalone, Android local inference | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ Required (CPU path) |
+| **Qwen3-4B (GGUF Q4_K_M)** | ~2.5 GB | EX-N3 judging model (v2 accuracy criteria), experiments | managed download (MODEL-TOOLS) / HF `Qwen/Qwen3-4B-GGUF` | experiments |
+| **Gemma 4 12B native binding** (GGUF + mmproj) | ~7.3 GB | image understanding (image-to-text) native path | managed artifact manifest `models/gemma4-native/gemma4-native.lock.json` + download script | multimodal experiments |
+| **SD 1.5 five-asset offline package** | ~15 GB (5 packages) | image generation workspace (vanilla/90s/IP-Adapter/inpaint/InstructPix2Pix) | official offline assets (see [SD 1.5 offline asset plan](SD%201.5离线资产包与签名源站发布计划.md)) or `python scripts/download_sd15.py` | image experiments |
+| **Ollama models** (`gemma4:12b` etc.) | on demand | EX-N3 Gemma judging, external-path verification | `ollama pull gemma4:12b` | judging experiments |
+
+### 2. Already in the Repo / No Need to Fetch
+
+| Item | Note |
+|---|---|
+| ✅ License texts | `packaging/sd15-licenses/` committed (CreativeML OpenRAIL-M / OpenRAIL / Apache-2.0 / MIT) |
+| ✅ Test fixtures & experiment plans | all of `fixtures/` committed |
+| ✅ Signature origin / serve distribution | code in `packaging/`, no extra assets |
+| ⚠️ Release signing keys | `packaging/.signing-keys/` **not in the repo**; held by release owners — a clone can only verify, not sign |
+| ⚠️ `.env` (e.g. QLH_CLUSTER_SECRET) | each node provides its own; not committed |
+| ⚠️ `models/` large files | all gitignored; fetch per the table above, not shipped with the repo |
+
+### 3. Installers (usable without cloning)
+
+Windows CPU/CUDA Setup, Launcher, Android Full/Lite APK and Linux `.deb` are all obtained from the **release channel** (on this project's intranet: the master node's `python packaging/serve.py` distribution server, browser download). Installing does not require cloning the repo; cloning is mainly for development and acceptance.
 
 ---
 

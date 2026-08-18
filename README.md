@@ -6,7 +6,7 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8.2**（更新日期：2026-08-16）
+**v0.1.8.2**（更新日期：2026-08-19）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
@@ -961,6 +961,7 @@ python serve.py
 - [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5、T9.6 接线、T9.6-R2 Windows 开发机实装门和 UP-N6.4W 跨卷保留门已完成；外部干净机/Linux/真实模型会话、分布式真机与默认入口仍待（L4 Candidate）
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）
+- [双机补丁分发工具专项计划](docs/双机补丁分发工具专项计划.md) — 从节点签名补丁收发（`tools/patch_dispatch.py` / `patch_listener.py` + 根目录 bat；推送走本地 7897 代理、帧/分支校验、force-clean 保护节点身份）
 - [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
 - [独立安装包启动器与自动更新方案](docs/安装包自动更新引导器方案.md) — 独立 Bootstrap、GUI/TUI、清单下载、Ed25519 验签/key rotation、UP-N3 原子版本与 UP-N4 A/B 自更新回滚；Launcher ZIP 发布链路已实测，Windows/Linux 干净机与 Android 更新仍待
 
