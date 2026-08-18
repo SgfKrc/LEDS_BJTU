@@ -598,7 +598,9 @@ def _run_tailscale_command(
 
     kwargs: dict[str, Any] = {
         "capture_output": True,
-        "text": True,
+        # Tailscale emits UTF-8 JSON even when the Windows console locale is
+        # GBK. Read bytes first so subprocess does not decode with ACP.
+        "text": False,
         "timeout": timeout,
         "check": False,
     }
@@ -616,8 +618,18 @@ def _run_tailscale_command(
 
     if int(getattr(completed, "returncode", 1)) != 0:
         return "command_failed", "nonzero_exit", None
-    output = getattr(completed, "stdout", "")
-    if not isinstance(output, str):
+    raw_output = getattr(completed, "stdout", b"")
+    if isinstance(raw_output, bytes):
+        if len(raw_output) > MAX_COMMAND_OUTPUT_BYTES:
+            return "invalid", "output_too_large", None
+        try:
+            output = raw_output.decode("utf-8")
+        except UnicodeDecodeError:
+            return "invalid", "non_text_output", None
+    elif isinstance(raw_output, str):
+        # Keep injectable test runners and embedders source-compatible.
+        output = raw_output
+    else:
         return "invalid", "non_text_output", None
     if len(output.encode("utf-8", errors="replace")) > MAX_COMMAND_OUTPUT_BYTES:
         return "invalid", "output_too_large", None

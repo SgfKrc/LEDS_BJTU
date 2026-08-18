@@ -309,6 +309,29 @@ def test_status_command_uses_argument_vector_and_classifies_direct_tailnet_peer(
     assert "198.51.100.5" not in json.dumps(public)
 
 
+def test_status_command_decodes_utf8_bytes_independent_of_windows_locale():
+    payload = json.dumps(
+        {"Peer": {"peer-1": {"TailscaleIPs": ["100.100.100.7"], "CurAddr": ""}}}
+    ).encode("utf-8")
+
+    status = collect_tailscale_status(
+        executable="tailscale-test",
+        runner=lambda *_args, **_kwargs: _completed(payload),
+    )
+
+    assert status.state == "available"
+    assert status.reason is None
+
+
+def test_status_command_rejects_invalid_utf8_bytes_without_raising():
+    status = collect_tailscale_status(
+        executable="tailscale-test",
+        runner=lambda *_args, **_kwargs: _completed(b"\xff\xfe"),
+    )
+
+    assert status.public_view() == {"state": "invalid", "reason": "non_text_output"}
+
+
 def test_relay_path_is_classified_without_exposing_region_or_peer_address():
     status = collect_tailscale_status(
         executable="tailscale-test",
