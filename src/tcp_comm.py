@@ -1560,22 +1560,18 @@ class TCPServer:
                     logger.debug("重复注册拒绝 ACK 发送失败: %s", e, exc_info=True)
                 raise _RegistrationRejected(reason)
             if previous is not None and previous.registration_confirmed:
-                # Preserve a live session while a CPU-only worker applies a
-                # layer configuration.  Replacing it here creates a reconnect
-                # loop and can prevent the layer load from completing.
-                last_heartbeat = float(getattr(previous, "last_heartbeat", 0.0) or 0.0)
-                heartbeat_age = (
-                    time.time() - last_heartbeat if last_heartbeat else float("inf")
+                # A confirmed session may still be stale from the client's
+                # perspective (for example after a dual-stack reconnect).
+                # Adopt the new socket so its REGISTER ACK and subsequent
+                # layer configuration are delivered to the live client. The
+                # exact-socket cleanup below prevents the old recv thread from
+                # removing this replacement or firing a false disconnect.
+                logger.info(
+                    "替换同一节点的已确认 TCP 会话: client=%s old_peer=%s new_peer=%s",
+                    client_id,
+                    getattr(previous, "addr", None),
+                    addr,
                 )
-                if heartbeat_age <= max(float(PIPELINE_STEP_TIMEOUT), 120.0):
-                    reason = f"active connection exists (heartbeat_age={heartbeat_age:.1f}s)"
-                    try:
-                        self._send_register_ack(
-                            conn, "rejected", client_id=client_id, reason=reason,
-                        )
-                    except OSError as e:
-                        logger.debug("活动连接拒绝 ACK 发送失败: %s", e, exc_info=True)
-                    raise _RegistrationRejected(reason)
             self._pending_registrations[client_id] = client_conn
             self.clients[client_id] = client_conn
         if previous is not None and previous.sock is not conn:
@@ -2172,13 +2168,22 @@ class TCPClient:
                     connection_sock.close()
                 except OSError:
                     pass
-            self._notify_disconnect(connection_generation)
+            self._notify_disconnect(
+                connection_generation,
+                connection_sock=connection_sock,
+            )
             logger.info(f"接收循环已退出: {self.client_id}")
 
-    def _notify_disconnect(self, connection_generation: int = None) -> None:
+    def _notify_disconnect(
+        self,
+        connection_generation: int = None,
+        connection_sock: socket.socket = None,
+    ) -> None:
         with self._disconnect_callback_lock:
             if (connection_generation is not None
                     and connection_generation != self._connection_generation):
+                return
+            if connection_sock is not None and self.sock is not connection_sock:
                 return
             if self._disconnect_notified:
                 return
@@ -2284,6 +2289,8 @@ class TCPClient:
                 if (connection_generation is not None
                         and connection_generation != self._connection_generation):
                     break
+                if self.sock is not connection_sock:
+                    break
             try:
                 self._last_heartbeat_send = time.time()
                 generation = (
@@ -2313,6 +2320,8 @@ class TCPClient:
                 with self._disconnect_callback_lock:
                     if (connection_generation is not None
                             and connection_generation != self._connection_generation):
+                        break
+                    if self.sock is not connection_sock:
                         break
                 logger.warning(f"心跳发送失败，尝试重连: {e}", exc_info=True)
                 self._reconnect()
