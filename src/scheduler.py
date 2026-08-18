@@ -1267,6 +1267,9 @@ class Scheduler:
                     on_message=self._on_tcp_message,
                     on_disconnect=self._on_tcp_disconnect,
                 )
+                self._tcp_server.on_registration_confirmed = (
+                    self._on_tcp_registration_confirmed
+                )
             except Exception as e:
                 self._tcp_server = None
                 logger.error(
@@ -3065,6 +3068,130 @@ class Scheduler:
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
         return result
 
+    def _build_manual_pipeline_capacity_plan(
+        self, assignments: list[dict], *, descriptor: Optional[dict] = None,
+    ) -> dict:
+        """Validate a user-forced split without replacing it with full-model fit.
+
+        The normal solver intentionally minimizes participating nodes.  That is
+        correct for automatic admission, but it would make a deliberate 21/24
+        split impossible whenever the master can still hold the whole model.
+        Manual plans retain the same byte and reserve checks while preserving
+        the requested contiguous ranges.
+        """
+        from config import PIPELINE_CAPACITY_SAFETY_MARGIN
+        from pipeline_capacity import _descriptor_costs, _required_bytes
+
+        if descriptor is None:
+            getter = getattr(self._host, "get_pipeline_descriptor", None)
+            descriptor = getter() if callable(getter) else {}
+        if not isinstance(descriptor, dict) or not descriptor:
+            return {
+                "status": "rejected", "admitted": False,
+                "reason_code": "pipeline_descriptor_unavailable",
+                "assignments": [],
+            }
+
+        try:
+            layer_bytes, embedding_bytes, per_node_bytes, output_bytes = (
+                _descriptor_costs(descriptor)
+            )
+        except PipelineCapacityError as exc:
+            return {
+                "status": "rejected", "admitted": False,
+                "reason_code": "pipeline_capacity_descriptor_invalid",
+                "reason": str(exc), "assignments": [],
+            }
+
+        total_layers = len(layer_bytes)
+        node_ids = {str(item.get("node_id", "")) for item in assignments}
+        records = {
+            item["node_id"]: item
+            for item in self._get_pipeline_capacity_nodes(node_ids)
+        }
+        planned = []
+        for item in assignments:
+            node_id = str(item.get("node_id", ""))
+            start = int(item.get("start_layer", 0) or 0)
+            end = int(item.get("end_layer", 0) or 0)
+            record = records.get(node_id)
+            if record is None:
+                return {
+                    "status": "rejected", "admitted": False,
+                    "reason_code": "pipeline_capacity_manual_node_unavailable",
+                    "reason": f"node {node_id} has no usable capacity",
+                    "assignments": [],
+                }
+            raw_bytes = sum(layer_bytes[start:end]) + per_node_bytes
+            if bool(item.get("has_embedding")):
+                raw_bytes += embedding_bytes
+            if bool(item.get("has_lm_head")):
+                raw_bytes += output_bytes
+            required = _required_bytes(
+                raw_bytes, record, PIPELINE_CAPACITY_SAFETY_MARGIN,
+            )
+            if required > int(record["capacity_bytes"]):
+                return {
+                    "status": "rejected", "admitted": False,
+                    "reason_code": "pipeline_capacity_manual_insufficient",
+                    "reason": (
+                        f"node {node_id} requires {required} bytes, "
+                        f"has {record['capacity_bytes']} bytes"
+                    ),
+                    "assignments": [],
+                }
+            planned.append({
+                **dict(item),
+                "raw_weight_bytes": raw_bytes,
+                "required_bytes": required,
+                "capacity_bytes": record["capacity_bytes"],
+                "headroom_bytes": record["capacity_bytes"] - required,
+                "reserve_bytes": record["reserve_bytes"],
+                "runtime_multiplier": record["runtime_multiplier"],
+                "execution_device": record["execution_device"],
+                "capacity_source": record["capacity_source"],
+            })
+
+        plan_identity = {
+            "model_id": descriptor.get("model_id", ""),
+            "model_sha256": descriptor.get("model_sha256", ""),
+            "assignments": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "node_id", "start_layer", "end_layer",
+                        "required_bytes", "capacity_bytes",
+                    )
+                }
+                for item in planned
+            ],
+        }
+        return {
+            "schema_version": 1,
+            "status": "admitted",
+            "admitted": True,
+            "reason_code": "manual_override",
+            "plan_id": hashlib.sha256(
+                json.dumps(plan_identity, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "model_id": str(descriptor.get("model_id", "") or ""),
+            "model_type": str(descriptor.get("model_type", "") or ""),
+            "total_layers": total_layers,
+            "raw_model_bytes": sum(layer_bytes) + embedding_bytes
+            + per_node_bytes + output_bytes,
+            "safety_margin": PIPELINE_CAPACITY_SAFETY_MARGIN,
+            "candidate_node_count": len(records),
+            "excluded_nodes": [],
+            "assignments": planned,
+            "control_only_nodes": [
+                node_id for node_id in records if node_id not in node_ids
+            ],
+            "participating_node_count": len(planned),
+            "single_node_full_model_candidates": [],
+            "aggregate_only": len(planned) > 1,
+            "computed_at": time.time(),
+        }
+
     def _normalize_manual_assignments(self, assignments: list) -> list:
         """补齐手动区间的运行字段，并按节点能力放置 Embedding/LM Head。"""
         normalized = []
@@ -3325,9 +3452,16 @@ class Scheduler:
         )
         capacity_plan = None
         if distributed_only:
-            eligible_node_ids = set(releasable_pc_ids)
-            eligible_node_ids.update({"master", self.get_effective_node_id()})
-            capacity_plan = self.get_pipeline_capacity_plan(eligible_node_ids)
+            manual_override = bool(self._runtime_layer_override)
+            if manual_override:
+                layer_info = self.get_layer_assignments()
+                capacity_plan = self._build_manual_pipeline_capacity_plan(
+                    layer_info.get("assignments", [])
+                )
+            else:
+                eligible_node_ids = set(releasable_pc_ids)
+                eligible_node_ids.update({"master", self.get_effective_node_id()})
+                capacity_plan = self.get_pipeline_capacity_plan(eligible_node_ids)
             if not capacity_plan.get("admitted"):
                 releases = {
                     node_id: {
@@ -6259,6 +6393,39 @@ class Scheduler:
         })
         return runtime
 
+    def _on_tcp_registration_confirmed(self, client_id: str) -> None:
+        """Push scheduling state only after the REGISTER ACK is on the wire."""
+        if self._effective_role() != "master":
+            return
+        with self._nodes_lock:
+            node = self.nodes.get(client_id)
+            if node is None or node.role == NodeRole.MASTER:
+                return
+
+        qwen3_release = []
+        with self._layer_config_lock:
+            qwen3_transaction = self._qwen3_pipeline_dry_run
+            if (
+                qwen3_transaction is not None
+                and qwen3_transaction.network_dispatch
+                and qwen3_transaction.phase in {"aborted", "releasing"}
+                and client_id in qwen3_transaction.worker_ids
+            ):
+                qwen3_release = [
+                    item for item in qwen3_transaction.release_messages()
+                    if item.get("node_id") == client_id
+                ]
+        if qwen3_release:
+            self._dispatch_qwen3_loopback_messages(
+                qwen3_release, best_effort=True,
+            )
+
+        self.push_layer_config_to_clients()
+        self._push_node_list_to_client(client_id)
+        self._push_node_update_to_all_clients(
+            client_id, "add", self.nodes.get(client_id)
+        )
+
     def _on_tcp_message(self, client_id: str, msg: dict) -> None:
         """
         TCP 消息回调（由 TCPServer 调用）。
@@ -6308,39 +6475,10 @@ class Scheduler:
                     self._tcp_server.reject_client(client_id, reason)
                 return
 
-            if self._tcp_server and not self._tcp_server.confirm_registration(client_id):
-                logger.warning("event=tcp_register_confirm_failed client_id=%s", client_id)
-                self._tcp_server.reject_client(client_id, "注册确认发送失败")
-                self.deregister_node(client_id)
-                return
-
-            qwen3_release = []
-            with self._layer_config_lock:
-                qwen3_transaction = self._qwen3_pipeline_dry_run
-                if (
-                    qwen3_transaction is not None
-                    and qwen3_transaction.network_dispatch
-                    and qwen3_transaction.phase in {"aborted", "releasing"}
-                    and client_id in qwen3_transaction.worker_ids
-                ):
-                    qwen3_release = [
-                        item for item in qwen3_transaction.release_messages()
-                        if item.get("node_id") == client_id
-                    ]
-            if qwen3_release:
-                self._dispatch_qwen3_loopback_messages(
-                    qwen3_release, best_effort=True,
-                )
-
-            # 新节点注册后重新计算分层并推送
-            if registered and self._effective_role() == "master":
-                self.push_layer_config_to_clients()
-                # 向新注册的从节点推送全量节点列表（同步管理面板）
-                self._push_node_list_to_client(client_id)
-                # 向其他从节点推送新节点加入更新
-                self._push_node_update_to_all_clients(
-                    client_id, "add", self.nodes.get(client_id)
-                )
+            # TCPServer sends REGISTER ACK first, then invokes
+            # _on_tcp_registration_confirmed.  Keeping all business pushes in
+            # that post-ACK callback prevents layer_config from racing the
+            # client's registration handshake.
 
         elif msg_type == "heartbeat":
             if self._effective_role() == "master":
@@ -13215,7 +13353,10 @@ class Scheduler:
         mgr = self._host
         engine_ok = (
             mgr is not None
-            and getattr(mgr, 'is_loaded', False)
+            and (
+                getattr(mgr, 'is_loaded', False)
+                or getattr(mgr, 'is_pipeline_prepared', False)
+            )
             and getattr(mgr, '_engine_type', '') == 'pytorch'
         )
 
