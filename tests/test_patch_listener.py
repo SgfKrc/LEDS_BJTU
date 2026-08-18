@@ -63,7 +63,7 @@ def _valid_payload(**over):
     base = {
         "schema": "qlh.patch_frame.v1",
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "repo": "https://github.com/sgfd8134/leds_-bjtu_-gitee.git",
+        "repo": pl._configured_repo() or "https://github.com/sgfd8134/leds_-bjtu_-gitee.git",
         "branch": "dev",
         "commit_sha": "a" * 40,
         "proxy_port": 7897,
@@ -103,11 +103,26 @@ def test_verify_rejects_wrong_schema(keys, args):
     assert reason and "unknown schema" in reason
 
 
+def test_verify_rejects_missing_repository(keys, args):
+    key_path, _, _ = keys
+    frame = _sign_frame(_valid_payload(repo=""), key_path)
+    reason = pl._verify_frame(dict(frame), Path(args.verify_key), pl._log_setup())
+    assert reason == "repo missing"
+
+
+def test_clean_args_protects_custom_repo_local_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("QLH_NODE_CONFIG_PATH", str(tmp_path / "node-state.json"))
+    args = pl._clean_args()
+    assert args[:2] == ["clean", "-fd"]
+    assert ["-e", "node_config.json"] in [args[i:i + 2] for i in range(len(args) - 1)]
+    assert "node-state.json" not in args  # outside checkout: no clean target
+
+
 def test_verify_rejects_repo_mismatch(keys, args, monkeypatch):
     key_path, _, _ = keys
+    frame = _sign_frame(_valid_payload(), key_path)
     monkeypatch.setattr(pl, "_ACCEPTED_REPO",
                         "https://github.com/only/this.git")
-    frame = _sign_frame(_valid_payload(), key_path)
     reason = pl._verify_frame(dict(frame), Path(args.verify_key), pl._log_setup())
     assert reason and "repo mismatch" in reason
 
@@ -155,7 +170,10 @@ def test_apply_patch_dirty_warns_and_force_overwrites(keys, args, monkeypatch):
     assert status == "applied"
     assert detail == "a" * 40
     assert ["reset", "--hard", "origin/dev"] in calls
-    assert ["clean", "-fd"] in calls
+    clean_call = next(call for call in calls if call[:2] == ["clean", "-fd"])
+    assert ["-e", "node_config.json"] in [
+        clean_call[i:i + 2] for i in range(len(clean_call) - 1)
+    ]
 
 
 def test_apply_patch_head_mismatch_fails(keys, args, monkeypatch):
@@ -198,6 +216,7 @@ def test_handle_frame_restart_requested_flag(keys, args, monkeypatch):
     frame = _sign_frame(_valid_payload(restart_requested=True), key_path)
     monkeypatch.setattr(pl, "_git", lambda gargs, **kw: {
         "status": "", "fetch": "", "rev-parse": "a" * 40,
+        "remote": "https://github.com/SgfKrc/LEDS_BJTU",
     }.get(gargs[0], ""))
     ack = pl._handle_frame(frame, args, pl._log_setup())
     assert ack.startswith("applied:")

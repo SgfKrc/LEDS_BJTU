@@ -37,10 +37,11 @@ except ImportError:
     pass  # python-dotenv 未安装，跳过
 
 try:
-    from node_config import apply_node_config_to_env
-    apply_node_config_to_env()
+    from node_config import apply_node_config_to_env, resolve_initial_node_role
+    _NODE_CONFIG = apply_node_config_to_env()
 except Exception:
-    pass
+    _NODE_CONFIG = {}
+    resolve_initial_node_role = None
 
 
 def _get_app_root() -> str:
@@ -382,7 +383,15 @@ PIPELINE_PREEMPT_MAX_OVERHEAD_MS = 500    # checkpoint+restore 超过此值 → 
 # ============================================================
 # 5. 节点身份配置
 # ============================================================
-NODE_ROLE = _normalize_node_role(os.environ.get("QLH_NODE_ROLE", "master"))
+if resolve_initial_node_role is not None:
+    _initial_role = resolve_initial_node_role()
+else:
+    # Keep a safe source-checkout fallback even when optional config imports
+    # are unavailable during a minimal diagnostic import.
+    _initial_role = os.environ.get(
+        "QLH_NODE_ROLE", "master" if getattr(sys, "frozen", False) else "client"
+    )
+NODE_ROLE = _normalize_node_role(_initial_role)
 _default_node_id = "master" if NODE_ROLE == "master" else f"client_{socket.gethostname()}"
 NODE_ID = _env_first("QLH_NODE_ID", default=_default_node_id)
 _default_app_variant = (

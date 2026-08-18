@@ -1457,12 +1457,9 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                     let rttDisplay = '—';
                     let rttMs = null;
                     if (isMaster && !isSelfMaster) {
-                      // 主节点视角：显示从节点心跳新鲜度
-                      if (tcpDetail?.last_heartbeat) {
-                        const age = Date.now() / 1000 - tcpDetail.last_heartbeat;
-                        rttMs = age * 1000;
-                        rttDisplay = formatRTT(rttMs);
-                      }
+                      // Heartbeat freshness is not network RTT.
+                      rttMs = node.avg_rtt_ms > 0 ? node.avg_rtt_ms : node.last_rtt_ms;
+                      rttDisplay = formatRTT(rttMs);
                     } else if (!isMaster && isMasterNode) {
                       // 从节点视角：显示到主节点的 RTT
                       rttMs = status?.network_path?.quality?.avg_rtt_ms

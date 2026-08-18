@@ -2,6 +2,9 @@
 # Install through scripts/setup_test_env.py; never install into system Python.
 -r requirements.txt
 cryptography>=42.0.0,<47.0.0
+jsonschema>=4.23,<5.0
+Pillow>=10.0,<13.0
 pytest>=8.0,<10
 pytest-xdist>=3.6,<4
 pytest-timeout>=2.3,<3
+textual==8.2.8

@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import io
 import ipaddress
+import math
 import os
 import select
 import subprocess
@@ -39,12 +40,19 @@ from config import (
     SERVER_IP, SERVER_PORT, HEARTBEAT_INTERVAL,
     RECONNECT_MAX_RETRIES, RECONNECT_DELAY,
     AUTH_TIMESTAMP_WINDOW,
+    PIPELINE_STEP_TIMEOUT,
 )
 
 try:
-    from .network_path import HeartbeatQualityWindow
+    from .network_path import (
+        HeartbeatQualityWindow,
+        DEFAULT_MAX_HEARTBEAT_RTT_MS,
+    )
 except ImportError:  # Script/PYTHONPATH=src compatibility.
-    from network_path import HeartbeatQualityWindow
+    from network_path import (
+        HeartbeatQualityWindow,
+        DEFAULT_MAX_HEARTBEAT_RTT_MS,
+    )
 
 # 尝试导入 psutil 用于网络类型检测
 try:
@@ -972,6 +980,8 @@ class ClientConn:
     connected_at: float = 0.0    # 连接时间
     last_heartbeat: float = 0.0  # 上次心跳时间
     heartbeat_missed: int = 0    # 连续心跳丢失次数
+    avg_rtt_ms: float = 0.0      # 客户端测得的到主节点 EWMA RTT
+    last_rtt_ms: float = 0.0     # 客户端最近一次测得的 RTT
     registration_confirmed: bool = False  # scheduler 确认后才返回 registered ACK
     registration_epoch: int = 0            # monotonic identity epoch; changes on reconnect
     send_lock: threading.Lock = field(
@@ -996,7 +1006,13 @@ class ClientConn:
 class TCPServer:
     """TCP 服务端：主节点使用，监听从节点连接"""
 
-    MAX_HEARTBEAT_MISSED = 3     # 连续丢失 N 次心跳视为离线
+    # CPU-only pipeline workers may spend as long as the configured per-step
+    # timeout in one layer forward.  Leave two additional heartbeat periods
+    # for serialization and network transit before declaring the peer dead.
+    MAX_HEARTBEAT_MISSED = max(
+        10,
+        math.ceil(PIPELINE_STEP_TIMEOUT / HEARTBEAT_INTERVAL) + 2,
+    )
 
     def __init__(self, host: str = None, port: int = None):
         self.host = host or SERVER_IP
@@ -1004,14 +1020,19 @@ class TCPServer:
         self.sock: Optional[socket.socket] = None    # 主监听 socket（兼容旧引用）
         self._socks: list[socket.socket] = []        # 双栈监听 socket 列表
         self.clients: dict[str, ClientConn] = {}     # client_id -> ClientConn
+        self._pending_registrations: dict[str, ClientConn] = {}
         self._clients_lock = threading.RLock()       # 保护 clients 的跨线程访问
         self._running = False
         self._accept_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._recv_threads: dict[str, threading.Thread] = {}
         self._registration_epochs: dict[str, int] = {}
+        self._registration_context = threading.local()
         self.on_message: Optional[Callable] = None    # 消息回调
         self.on_disconnect: Optional[Callable] = None # 断连回调
+        # Called only after a successful REGISTER ACK has been written to the
+        # socket.  Scheduler-side layer/config pushes must wait for this edge.
+        self.on_registration_confirmed: Optional[Callable] = None
 
     def start(self, on_message: Callable = None,
               on_disconnect: Callable = None) -> None:
@@ -1139,13 +1160,29 @@ class TCPServer:
 
     def confirm_registration(self, client_id: str) -> bool:
         """上层调度器确认注册成功后，向客户端返回 registered。"""
-        client = self._get_client(client_id)
+        # The scheduler callback runs synchronously in the registration
+        # thread.  Prefer that exact socket so a concurrent reconnect cannot
+        # redirect or invalidate the ACK merely by reusing the same client ID.
+        client = getattr(self._registration_context, "client", None)
+        if client is None or client.client_id != client_id:
+            with self._clients_lock:
+                client = self._pending_registrations.get(client_id)
+                if client is None:
+                    client = self.clients.get(client_id)
         if client is None:
+            logger.warning("注册确认失败: client=%s 的连接已不存在", client_id)
             return False
         try:
             with client.send_lock:
                 self._send_register_ack(client.sock, "registered", client_id=client_id)
             client.registration_confirmed = True
+            with self._clients_lock:
+                current = self.clients.get(client_id)
+                if (current is None
+                        or current.registration_epoch <= client.registration_epoch):
+                    self.clients[client_id] = client
+                if self._pending_registrations.get(client_id) is client:
+                    self._pending_registrations.pop(client_id, None)
             return True
         except OSError as e:
             logger.warning(f"注册确认发送失败: {e}", exc_info=True)
@@ -1285,6 +1322,17 @@ class TCPServer:
                 # 回调上层（scheduler）
                 if self.on_message:
                     try:
+                        # Keep the scheduler that handles this callback bound
+                        # to the TCPServer which actually accepted the socket.
+                        # Windows runtime re-exec can otherwise leave the API
+                        # status path observing a sibling server instance.
+                        callback_owner = getattr(self.on_message, "__self__", None)
+                        if (callback_owner is not None
+                                and getattr(callback_owner, "_tcp_server", None) is not self):
+                            logger.warning(
+                                "repairing scheduler TCP server binding during registration"
+                            )
+                            callback_owner._tcp_server = self
                         self.on_message(client_id, msg)
                     except Exception as e:
                         logger.error(f"消息回调异常: {e}", exc_info=True)
@@ -1294,13 +1342,47 @@ class TCPServer:
                 elif registration_pending:
                     self.confirm_registration(client_id)
 
+                registration_confirmed_now = False
                 if registration_pending:
-                    current = self._get_client(client_id)
-                    if current is None:
+                    current = getattr(
+                        self._registration_context, "client", None,
+                    )
+                    if current is None or current.sock is not conn:
                         break
                     if not current.registration_confirmed:
-                        self.reject_client(client_id, "调度器未确认注册")
-                        break
+                        try:
+                            self._send_register_ack(
+                                current.sock,
+                                "registered",
+                                client_id=client_id,
+                            )
+                        except OSError:
+                            self._pop_client_if_same(client_id, current)
+                            break
+                        else:
+                            current.registration_confirmed = True
+                            registration_confirmed_now = True
+                            with self._clients_lock:
+                                if self.clients.get(client_id) is None:
+                                    self.clients[client_id] = current
+                                if self._pending_registrations.get(client_id) is current:
+                                    self._pending_registrations.pop(client_id, None)
+
+                if (
+                    registration_confirmed_now
+                    and self.on_registration_confirmed is not None
+                    and current is not None
+                    and current.node_type != "pipeline_peer"
+                ):
+                    try:
+                        self.on_registration_confirmed(client_id)
+                    except Exception as e:
+                        # Registration is already valid; a post-ACK scheduling
+                        # failure must not tear down the worker connection.
+                        logger.warning(
+                            "注册确认后的调度回调失败: client=%s error=%s",
+                            client_id, e, exc_info=True,
+                        )
 
         except socket.timeout:
             logger.info(f"客户端 {client_id} 接收超时")
@@ -1309,6 +1391,8 @@ class TCPServer:
         except (ConnectionError, OSError) as e:
             logger.warning(f"客户端 {client_id} 连接异常: {e}", exc_info=True)
         finally:
+            if hasattr(self._registration_context, "client"):
+                del self._registration_context.client
             # 清理
             try:
                 conn.close()
@@ -1320,6 +1404,10 @@ class TCPServer:
                 current = self._get_client(client_id)
                 if current is not None and current.sock is conn:
                     removed = self._pop_client_if_same(client_id, current)
+            with self._clients_lock:
+                pending = self._pending_registrations.get(client_id)
+                if pending is not None and pending.sock is conn:
+                    self._pending_registrations.pop(client_id, None)
 
             if removed is not None:
                 logger.info(f"客户端 {client_id} 已断开: {removed.addr}")
@@ -1449,7 +1537,56 @@ class TCPServer:
             network_type=network_type,
             registration_epoch=self._next_registration_epoch(client_id),
         )
-        self._set_client(client_id, client_conn)
+        # Bind before publishing the object.  An older reconnect callback may
+        # concurrently remove the global mapping, but it cannot erase this
+        # registration thread's exact socket identity.
+        self._registration_context.client = client_conn
+        # A reconnecting worker can briefly have more than one connect loop
+        # racing (for example while the master restarts).  Never overwrite a
+        # connection whose registration is still being confirmed: doing so
+        # makes the scheduler ACK a different socket and all registrations
+        # fail in a loop.  A fully registered connection may be replaced,
+        # but the old socket is closed only after leaving the lock.
+        previous = None
+        with self._clients_lock:
+            previous = self.clients.get(client_id)
+            if previous is not None and not previous.registration_confirmed:
+                reason = "该节点已有注册正在确认"
+                try:
+                    self._send_register_ack(
+                        conn, "rejected", client_id=client_id, reason=reason,
+                    )
+                except OSError as e:
+                    logger.debug("重复注册拒绝 ACK 发送失败: %s", e, exc_info=True)
+                raise _RegistrationRejected(reason)
+            if previous is not None and previous.registration_confirmed:
+                # Preserve a live session while a CPU-only worker applies a
+                # layer configuration.  Replacing it here creates a reconnect
+                # loop and can prevent the layer load from completing.
+                last_heartbeat = float(getattr(previous, "last_heartbeat", 0.0) or 0.0)
+                heartbeat_age = (
+                    time.time() - last_heartbeat if last_heartbeat else float("inf")
+                )
+                if heartbeat_age <= max(float(PIPELINE_STEP_TIMEOUT), 120.0):
+                    reason = f"active connection exists (heartbeat_age={heartbeat_age:.1f}s)"
+                    try:
+                        self._send_register_ack(
+                            conn, "rejected", client_id=client_id, reason=reason,
+                        )
+                    except OSError as e:
+                        logger.debug("活动连接拒绝 ACK 发送失败: %s", e, exc_info=True)
+                    raise _RegistrationRejected(reason)
+            self._pending_registrations[client_id] = client_conn
+            self.clients[client_id] = client_conn
+        if previous is not None and previous.sock is not conn:
+            try:
+                previous.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                previous.sock.close()
+            except OSError:
+                pass
         logger.info(
             f"✅ 节点注册成功: {client_id} role={role} "
             f"hostname={hostname} advertised={advertised_address} "
@@ -1467,7 +1604,19 @@ class TCPServer:
             # 提取客户端发送时间戳，原样回显
             echo_data = None
             if msg and isinstance(msg.get("data"), dict):
-                t_send = msg["data"].get("t_send", 0)
+                data = msg["data"]
+                reported_rtt = data.get("rtt_ms")
+                try:
+                    reported_rtt = float(reported_rtt)
+                except (TypeError, ValueError):
+                    reported_rtt = 0.0
+                if (
+                    math.isfinite(reported_rtt)
+                    and 0.0 < reported_rtt <= DEFAULT_MAX_HEARTBEAT_RTT_MS
+                ):
+                    conn.last_rtt_ms = reported_rtt
+                    conn.avg_rtt_ms = reported_rtt
+                t_send = data.get("t_send", 0)
                 if t_send:
                     echo_data = {"t_send": t_send}
             # 回复 ACK
@@ -1624,6 +1773,8 @@ class TCPServer:
             "connected_at": c.connected_at,
             "last_heartbeat": c.last_heartbeat,
             "heartbeat_missed": c.heartbeat_missed,
+            "avg_rtt_ms": round(c.avg_rtt_ms, 3) if c.avg_rtt_ms > 0 else None,
+            "last_rtt_ms": round(c.last_rtt_ms, 3) if c.last_rtt_ms > 0 else None,
             "registration_epoch": c.registration_epoch,
         }
 
@@ -1691,6 +1842,9 @@ class TCPClient:
         self._heartbeat_quality = HeartbeatQualityWindow()
         self._connect_lock = threading.Lock()   # Phase 5.4: 防止并发 connect()
         self._send_lock = threading.Lock()      # 心跳和推理消息共享同一 TCP 字节流
+        self._reconnect_state_lock = threading.Lock()
+        self._reconnect_in_progress = False
+        self._reconnect_retry_scheduled = False
 
     @staticmethod
     def _compute_local_model_sha256(
@@ -2141,8 +2295,11 @@ class TCPClient:
                     generation,
                     self._last_heartbeat_send,
                 )
+                heartbeat_data = {"t_send": self._last_heartbeat_send}
+                if self.avg_rtt_ms > 0:
+                    heartbeat_data["rtt_ms"] = round(self.avg_rtt_ms, 3)
                 self.send_data(
-                    {"t_send": self._last_heartbeat_send},
+                    heartbeat_data,
                     MessageType.HEARTBEAT,
                     connection_sock=connection_sock,
                 )
@@ -2160,6 +2317,30 @@ class TCPClient:
                 logger.warning(f"心跳发送失败，尝试重连: {e}", exc_info=True)
                 self._reconnect()
 
+    def _schedule_reconnect_retry(self) -> None:
+        """Schedule one retry without reviving a stale heartbeat thread."""
+        with self._reconnect_state_lock:
+            if self._reconnect_retry_scheduled:
+                return
+            self._reconnect_retry_scheduled = True
+
+        def _retry() -> None:
+            try:
+                time.sleep(RECONNECT_DELAY)
+                with self._disconnect_callback_lock:
+                    should_retry = not self._running and not self._registered
+                if should_retry:
+                    self._reconnect()
+            finally:
+                with self._reconnect_state_lock:
+                    self._reconnect_retry_scheduled = False
+
+        threading.Thread(
+            target=_retry,
+            name=f"tcp-reconnect-{self.client_id}",
+            daemon=True,
+        ).start()
+
     def _reconnect(self) -> None:
         """断线重连
 
@@ -2167,32 +2348,48 @@ class TCPClient:
         此处不再额外循环。若 connect() 全部失败，设置 _running=True
         并延迟，使心跳循环在下次迭代时自动触发重连。
         """
-        logger.info(
-            f"开始重连主节点: client={self.client_id}, "
-            f"target={self.server_host}:{self.server_port}"
-        )
-        self._running = False
-        if self.sock:
-            try:
-                self.sock.close()
-            except OSError:
-                pass
-            self.sock = None
-
-        # connect() 内部对 TCP 连接失败最多重试 RECONNECT_MAX_RETRIES 次；
-        # 注册失败（被拒绝/等待确认超时）则立即返回 False
-        ok = self.connect(self.on_message)
-        if ok:
-            logger.info(f"重连主节点成功: client={self.client_id}")
-        else:
-            logger.error(
-                f"重连主节点失败: client={self.client_id}，"
-                f"将在下次心跳时重新尝试"
+        with self._reconnect_state_lock:
+            if self._reconnect_in_progress:
+                return
+            self._reconnect_in_progress = True
+        try:
+            logger.info(
+                f"开始重连主节点: client={self.client_id}, "
+                f"target={self.server_host}:{self.server_port}"
             )
-            # 设置 _running=True 使心跳循环继续，下次 send_data 失败
-            # 时会再次触发 _reconnect()，实现持续重连
-            self._running = True
-            time.sleep(RECONNECT_DELAY)
+            # Fence every older heartbeat/receive loop before closing its socket.
+            # A failed REGISTER must never revive that stale loop.
+            with self._disconnect_callback_lock:
+                self._connection_generation += 1
+                self._running = False
+                self._registered = False
+                old_sock = self.sock
+                self.sock = None
+            if old_sock is not None:
+                try:
+                    old_sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    old_sock.close()
+                except OSError:
+                    pass
+
+            # connect() internally retries transport errors; REGISTER rejection
+            # returns immediately so the delayed retry below can wait for the
+            # server to retire the old session without reviving old threads.
+            ok = self.connect(self.on_message)
+            if ok:
+                logger.info(f"重连主节点成功: client={self.client_id}")
+            else:
+                logger.error(
+                    f"重连主节点失败: client={self.client_id}，"
+                    f"将在 {RECONNECT_DELAY}s 后单独重试"
+                )
+                self._schedule_reconnect_retry()
+        finally:
+            with self._reconnect_state_lock:
+                self._reconnect_in_progress = False
 
     @property
     def is_registered(self) -> bool:

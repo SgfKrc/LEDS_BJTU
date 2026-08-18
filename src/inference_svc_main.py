@@ -17,6 +17,8 @@ load 请求时才加载（§2.3：model_module 子树 9.7s 从启动成本变为
 import logging
 import os
 import time
+
+from node_config import apply_node_config_to_env, resolve_initial_node_role
 from pathlib import Path
 
 _LOG_FILE = Path(__file__).resolve().parent.parent / "logs" / "inference_svc_startup.log"
@@ -87,7 +89,10 @@ def main() -> None:
     logger = logging.getLogger("inference_svc_main")
     t_start = time.time()
 
-    node_role = os.environ.get("QLH_NODE_ROLE", "master")
+    # Keep the lightweight service entrypoint aligned with config.py: an
+    # unconfigured source checkout is a client, never an accidental master.
+    apply_node_config_to_env()
+    node_role = resolve_initial_node_role()
 
     if node_role == "client":
         # 1.5 从节点入口：不 import fastapi/uvicorn，直接起 peer

@@ -6346,9 +6346,19 @@ class Scheduler:
             if self._effective_role() == "master":
                 self._task_worker_control.mark_worker_heartbeat(client_id)
                 self._diffusion_worker_control.mark_heartbeat(client_id)
+            client_info = (
+                self._tcp_server.get_client_info(client_id)
+                if self._tcp_server else None
+            ) or {}
             with self._nodes_lock:
                 if client_id in self.nodes:
-                    self.nodes[client_id].last_heartbeat = time.time()
+                    node = self.nodes[client_id]
+                    node.last_heartbeat = time.time()
+                    if client_info.get("avg_rtt_ms"):
+                        node.avg_rtt_ms = client_info["avg_rtt_ms"]
+                        node.last_rtt_ms = client_info.get(
+                            "last_rtt_ms", node.last_rtt_ms,
+                        )
 
         elif msg_type == "task_worker":
             self._handle_task_worker_message(client_id, msg)

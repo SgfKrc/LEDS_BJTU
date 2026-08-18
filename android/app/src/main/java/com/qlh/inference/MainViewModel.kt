@@ -25,6 +25,8 @@ import com.qlh.inference.service.InferenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
+import com.qlh.inference.security.AuthTokenStore
+import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -95,6 +97,11 @@ data class MainUiState(
 
     // Remote PC Stable Diffusion workspace
     val diffusion: DiffusionUiState = DiffusionUiState(),
+
+    // Local control-plane authentication
+    val authSession: StoredAuthSession? = null,
+    val authBusy: Boolean = false,
+    val authError: String? = null,
 )
 
 // ================================================================
@@ -107,12 +114,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = QlhApplication.instance.database
     private val settings = SettingsDataStore(application)
     private val modelManager = ModelManager(application)
+    private val authStore = AuthTokenStore(application)
 
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private var lastAutoRegisterKey: String = ""
     private var diffusionJob: Job? = null
+
+    private fun apiClient(state: MainUiState = _uiState.value): ApiClient =
+        ApiClient(httpBaseUrl(state.serverHost, state.serverPort), authStore = authStore)
 
     // ---- 仓库（根据模式动态创建 ApiClient 或使用本地引擎） ----
     private val repository = ChatRepository(
@@ -121,7 +132,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         apiClient = {
             val state = _uiState.value
             if (state.inferenceMode == "thin") {
-                ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
+                apiClient(state)
             } else {
                 null // 全有模式 — 使用本地推理引擎
             }
@@ -169,7 +180,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 modelStorageMode = storageMode,
                 themeMode = themeMode,
                 selectedModelName = selectedModel?.name.orEmpty(),
-                selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L
+                selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L,
+                authSession = authStore.read(),
             )
             QlhApplication.instance.inferenceService?.modelContextSize = contextSize
             ensureAndroidBootstrap()
@@ -430,6 +442,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = clearMessageError(_uiState.value)
     }
 
+    /** Authenticate the Android client; the token is persisted only in Android Keystore-backed storage. */
+    fun login(username: String, code: String? = null, recoveryCode: String? = null) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(authBusy = true, authError = null)
+            val result = apiClient().login(username, code, recoveryCode)
+            _uiState.value = _uiState.value.copy(
+                authBusy = false,
+                authSession = result.getOrNull() ?: authStore.read(),
+                authError = result.exceptionOrNull()?.message,
+            )
+        }
+    }
+
+    /** Revalidate the local session against the control plane without exposing credentials to UI code. */
+    fun refreshAuthSession() {
+        viewModelScope.launch {
+            val result = apiClient().getAuthSession()
+            if (result.isFailure) {
+                _uiState.value = _uiState.value.copy(
+                    authSession = authStore.read(),
+                    authError = result.exceptionOrNull()?.message,
+                )
+            } else {
+                _uiState.value = _uiState.value.copy(authSession = authStore.read(), authError = null)
+            }
+        }
+    }
+
+    /** Clear local credentials even when the control plane is offline. */
+    fun logout() {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(authBusy = true, authError = null)
+            val result = apiClient().logout()
+            _uiState.value = _uiState.value.copy(
+                authBusy = false,
+                authSession = null,
+                authError = result.exceptionOrNull()?.message,
+            )
+        }
+    }
+
     // ==================== 远程图像生成 ====================
 
     /** Submit text-to-image or reference-image img2img work to the configured PC node. */
@@ -449,7 +502,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val initial = startDiffusionSubmission(_uiState.value.diffusion, referenceImage != null)
         _uiState.value = _uiState.value.copy(diffusion = initial)
         diffusionJob = viewModelScope.launch {
-            val client = ApiClient(httpBaseUrl(_uiState.value.serverHost, _uiState.value.serverPort))
+            val client = apiClient()
             try {
                 val submitted = if (referenceImage != null) {
                     val blob = client.uploadDiffusionBlob(referenceImage).getOrThrow()
@@ -529,7 +582,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val cancelling = markDiffusionCancelling(current)
         _uiState.value = _uiState.value.copy(diffusion = cancelling)
         viewModelScope.launch {
-            val client = ApiClient(httpBaseUrl(_uiState.value.serverHost, _uiState.value.serverPort))
+            val client = apiClient()
             client.cancelDiffusionJob(jobId)
                 .onSuccess { response ->
                     _uiState.value = _uiState.value.copy(
@@ -601,7 +654,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ).filter { it.isNotBlank() }
             .joinToString(" ")
             .ifBlank { nodeId }
-        val client = ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
+        val client = apiClient(state)
         val result = client.firstConnectBootstrap(
             BootstrapRequest(
                 nodeId = nodeId,
@@ -665,7 +718,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val networkType = detectNetworkType()
 
         val deviceInfo = buildAndroidPresenceDeviceInfo()
-        val client = ApiClient(httpBaseUrl(state.serverHost, state.serverPort))
+        val client = apiClient(state)
         val result = client.registerAndroidNode(
             RegisterNodeRequest(
                 nodeId = nodeId,
@@ -908,7 +961,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val state = _uiState.value
             _uiState.value = state.copy(remoteModelsLoading = true, remoteModelMessage = null)
-            ApiClient(httpBaseUrl(state.serverHost, state.serverPort)).getGgufModels()
+            apiClient(state).getGgufModels()
                 .onSuccess { models ->
                     _uiState.value = _uiState.value.copy(
                         remoteModels = models,

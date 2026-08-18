@@ -102,3 +102,9 @@ test('UX-03R2 keeps execution-mode hover contrast and exposes the brand account 
   assert.match(cssSource, /\.execution-mode-segment button\.active:hover:not\(:disabled\)[\s\S]*?color: var\(--on-accent\);/);
   assert.match(cssSource, /\.execution-mode-segment button:hover:not\(:disabled\)[\s\S]*?background: var\(--bg-secondary\);/);
 });
+
+test('admin node RTT never uses heartbeat freshness as a latency measurement', () => {
+  assert.match(adminSource, /rttMs = node\.avg_rtt_ms > 0 \? node\.avg_rtt_ms : node\.last_rtt_ms/);
+  assert.doesNotMatch(adminSource, /const age = Date\.now\(\) \/ 1000 - tcpDetail\.last_heartbeat/);
+  assert.doesNotMatch(adminSource, /rttMs = age \* 1000/);
+});

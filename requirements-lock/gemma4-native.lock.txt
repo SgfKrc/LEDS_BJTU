@@ -1,0 +1,18 @@
+# ============================================================
+# gemma4-native 依赖精确快照（pip freeze 自动生成，勿手改）
+# 环境: Gemma 4 MTMD 原生运行时（.venv-gemma4-native；llama.cpp GGUF）
+# 生成: python scripts/setup_envs.py --snapshot
+# 说明: torch/torchvision/torchaudio 与 editable/本地路径安装不在此锁定；
+#       各类依赖按 packaging/requirements-*.txt 安装，torch 按 setup_envs.py 提示手动补齐。
+# ============================================================
+diskcache==5.6.3
+Jinja2==3.1.6
+# (本地文件路径安装已跳过，未锁定)
+MarkupSafe==3.0.3
+ninja==1.13.0
+numpy==2.5.2
+packaging==26.3
+pathspec==1.1.1
+psutil==7.2.2
+scikit_build_core==1.0.3
+typing_extensions==4.16.0

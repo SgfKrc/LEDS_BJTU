@@ -43,6 +43,7 @@ PUSH_RETRIES = 2          # push 重试次数（含首次）
 BROADCAST_RETRIES = 3     # 每节点 TCP 推送重试
 BROADCAST_RETRY_DELAY = 2.0
 ACK_TIMEOUT = 10.0
+PROTECTED_REPO_PATHS = ("node_config.json", "node_config.json.tmp")
 
 
 class PatchDispatchError(RuntimeError):
@@ -95,10 +96,24 @@ def _commit_changes(message: str, *, dry_run: bool,
     if not staged:
         return None
     if paths:
+        protected = {
+            p.replace("\\", "/").lstrip("./")
+            for p in paths
+        } & set(PROTECTED_REPO_PATHS)
+        if protected:
+            raise PatchDispatchError(
+                "拒绝提交本地节点身份文件: " + ", ".join(sorted(protected))
+            )
         for p in paths:
             _git(["add", "--", p])
     else:
-        _git(["add", "-A"])
+        # Keep the guard even though .gitignore excludes these files: a local
+        # checkout may have an older/modified ignore file, and identity data
+        # must never enter a patch commit.
+        add_args = ["add", "-A", "--", "."]
+        for protected in PROTECTED_REPO_PATHS:
+            add_args.extend([f":(exclude){protected}"])
+        _git(add_args)
     _git(["commit", "-m", message])
     return _git(["rev-parse", "HEAD"])
 
@@ -204,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
 
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
 
+    current_branch = _git(["branch", "--show-current"])
+    if current_branch != args.branch:
+        raise PatchDispatchError(
+            f"当前分支为 {current_branch or '<detached>'}，与目标分支 {args.branch} 不一致"
+        )
+
     # 1. commit（--paths 隔离并行组文件）
     paths = [p.strip() for p in args.paths.split(",") if p.strip()] or None
     sha = _commit_changes(args.message, dry_run=args.dry_run, paths=paths)
@@ -228,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 4. 广播
     if not nodes:
-        print("未指定 --nodes，跳过广播（可用 --discover 的 UDP 发现模式在 M2 提供）")
+        print("未指定 --nodes，跳过广播（当前仅支持静态节点清单）")
         return 0
     results = _broadcast(nodes, frame, args.port, dry_run=args.dry_run)
     failed = [n for n, a in results.items() if a.startswith("failed")]

@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "packaging"))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from signing import (  # noqa: E402
     SigningError,
@@ -41,7 +43,8 @@ DEFAULT_PROXY_PORT = 7897
 FRAME_SCHEMA = "qlh.patch_frame.v1"
 FETCH_RETRIES = 2
 LOG_PATH = REPO_ROOT / "build" / "patch-listener.log"
-_ACCEPTED_REPO = os.environ.get("QLH_PATCH_REPO", "")  # 空 = 接受任意（默认）
+PROTECTED_REPO_PATHS = ("node_config.json", "node_config.json.tmp")
+_ACCEPTED_REPO = os.environ.get("QLH_PATCH_REPO", "")  # 空 = 使用 origin
 
 
 def _log_setup() -> logging.Logger:
@@ -75,6 +78,34 @@ def _proxy_env(proxy_port: int) -> dict:
             "https_proxy": proxy, "http_proxy": proxy}
 
 
+def _configured_repo() -> str:
+    """Return the configured repository, defaulting to this checkout origin."""
+    if _ACCEPTED_REPO.strip():
+        return _ACCEPTED_REPO.strip()
+    try:
+        return _git(["remote", "get-url", "origin"])
+    except RuntimeError:
+        return ""
+
+
+def _clean_args() -> list[str]:
+    """Build a force-clean command that cannot remove node identity state."""
+    args = ["clean", "-fd"]
+    for path in PROTECTED_REPO_PATHS:
+        args.extend(["-e", path])
+    configured = os.environ.get("QLH_NODE_CONFIG_PATH", "").strip()
+    if configured:
+        try:
+            relative = Path(configured).expanduser().resolve().relative_to(REPO_ROOT)
+        except (OSError, ValueError):
+            relative = None
+        if relative is not None:
+            value = relative.as_posix()
+            if value not in PROTECTED_REPO_PATHS:
+                args.extend(["-e", value])
+    return args
+
+
 def _verify_frame(frame: dict, public_key_path: Path, logger: logging.Logger,
                   branch: str = DEFAULT_BRANCH) -> str | None:
     """验签 + schema/repo/branch 校验。返回拒绝原因（None=通过）。"""
@@ -84,9 +115,14 @@ def _verify_frame(frame: dict, public_key_path: Path, logger: logging.Logger,
         key_info = load_public_key_file(public_key_path)
     except SigningError as exc:
         return f"public key unreadable: {exc}"
-    if _ACCEPTED_REPO and frame.get("repo") != _ACCEPTED_REPO:
+    expected_repo = _configured_repo()
+    if not frame.get("repo"):
+        return "repo missing"
+    if not expected_repo:
+        return "origin repo unavailable"
+    if expected_repo and frame.get("repo") != expected_repo:
         return f"repo mismatch: {frame.get('repo')}"
-    if frame.get("branch") and frame["branch"] != branch:
+    if frame.get("branch") != branch:
         return f"branch mismatch: {frame.get('branch')}"
     signature = frame.pop("signature", None)
     key_id = frame.pop("key_id", None)
@@ -122,6 +158,8 @@ def _apply_patch(frame: dict, *, no_clean: bool, logger: logging.Logger
     branch = frame["branch"]
     try:
         proxy_port = int(frame.get("proxy_port") or DEFAULT_PROXY_PORT)
+        if not 1 <= proxy_port <= 65535:
+            raise ValueError("proxy port out of range")
     except (TypeError, ValueError):
         proxy_port = DEFAULT_PROXY_PORT  # 恶意/非法值回退默认，不崩溃
     target = frame["commit_sha"]
@@ -148,7 +186,7 @@ def _apply_patch(frame: dict, *, no_clean: bool, logger: logging.Logger
     # 强拉覆盖
     _git(["reset", "--hard", f"origin/{branch}"])
     if not no_clean:
-        _git(["clean", "-fd"])
+        _git(_clean_args())
     head = _git(["rev-parse", "HEAD"])
     if head != target:
         return "failed", f"HEAD {head[:12]} != 目标 {target[:12]}"
@@ -200,6 +238,42 @@ def _recv_frame(conn: socket.socket) -> dict | None:
         return None
 
 
+def _serve(args, logger: logging.Logger) -> None:
+    """Serve frames on IPv4 and IPv6 sockets when the platform supports both."""
+    from network_address import canonical_host, create_listen_sockets
+
+    bind_host = canonical_host(args.host)
+    hosts = ["0.0.0.0", "::"] if bind_host in {"", "0.0.0.0"} else [bind_host]
+    servers = create_listen_sockets(hosts, args.port, backlog=8, allow_partial=True)
+    try:
+        bound = ", ".join(
+            f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in servers
+        )
+        logger.info("补丁监听器就绪：%s（branch=%s, key=%s）",
+                    bound, args.branch, Path(args.verify_key).name)
+        while True:
+            readable, _, _ = select.select(servers, [], [])
+            for server in readable:
+                conn, _addr = server.accept()
+                with conn:
+                    try:
+                        frame = _recv_frame(conn)
+                        if frame is None:
+                            conn.sendall(b"failed:empty")
+                            continue
+                        ack = _handle_frame(frame, args, logger)
+                        conn.sendall(ack.encode("utf-8", errors="replace"))
+                    except Exception as exc:  # noqa: BLE001 - single frame must not kill listener
+                        logger.error("处理帧异常: %s", exc)
+                        try:
+                            conn.sendall(f"failed:{exc}".encode("utf-8"))
+                        except OSError:
+                            pass
+    finally:
+        for server in servers:
+            server.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="从节点补丁监听器（M2）")
     ap.add_argument("--verify-key", required=True, help="Ed25519 公钥文件（.pub.json）")
@@ -210,30 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     logger = _log_setup()
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((args.host, args.port))
-        server.listen(8)
-        logger.info("补丁监听器就绪 %s:%d（branch=%s, key=%s）",
-                    args.host, args.port, args.branch,
-                    Path(args.verify_key).name)
-        while True:
-            conn, addr = server.accept()
-            with conn:
-                try:
-                    frame = _recv_frame(conn)
-                    if frame is None:
-                        conn.sendall(b"failed:empty")
-                        continue
-                    ack = _handle_frame(frame, args, logger)
-                    conn.sendall(ack.encode("utf-8", errors="replace"))
-                except Exception as exc:  # noqa: BLE001 - 单帧失败不杀监听
-                    logger.error("处理帧异常: %s", exc)
-                    try:
-                        conn.sendall(f"failed:{exc}".encode("utf-8"))
-                    except OSError:
-                        pass
+    return _serve(args, logger)
 
 
 if __name__ == "__main__":

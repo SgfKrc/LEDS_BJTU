@@ -1175,6 +1175,8 @@ class NodeDetail(BaseModel):
     network_type: str = "unknown"
     connected_at: float = 0.0
     last_heartbeat: float = 0.0
+    avg_rtt_ms: float = 0.0
+    last_rtt_ms: float = 0.0
     task_count: int = 0
     error_count: int = 0
     is_available: bool = False

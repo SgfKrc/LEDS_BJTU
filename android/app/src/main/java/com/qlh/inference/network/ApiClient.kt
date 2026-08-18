@@ -3,6 +3,8 @@ package com.qlh.inference.network
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.qlh.inference.BuildConfig
+import com.qlh.inference.security.AuthSessionStore
+import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -301,19 +303,83 @@ data class GgufModelsResponse(
     val count: Int = 0,
 )
 
+data class AuthLoginRequest(
+    val username: String,
+    val code: String? = null,
+    @SerializedName("recovery_code") val recoveryCode: String? = null,
+)
+
+data class AuthUser(
+    @SerializedName("user_id") val userId: String = "",
+    val username: String = "",
+    @SerializedName("display_name") val displayName: String? = null,
+    val role: String = "",
+)
+
+data class AuthLoginResponse(
+    @SerializedName("access_token") val accessToken: String = "",
+    @SerializedName("token_type") val tokenType: String = "Bearer",
+    @SerializedName("session_id") val sessionId: String = "",
+    @SerializedName("expires_at") val expiresAt: String = "",
+    val user: AuthUser = AuthUser(),
+) {
+    fun toStoredSession(): StoredAuthSession {
+        require(tokenType.equals("Bearer", ignoreCase = true)) { "unsupported auth token type" }
+        return StoredAuthSession(
+        accessToken = accessToken,
+        sessionId = sessionId,
+        expiresAt = expiresAt,
+        userId = user.userId,
+        username = user.username,
+        displayName = user.displayName,
+        role = user.role,
+        )
+    }
+}
+
+data class AuthSessionResponse(
+    @SerializedName("session_id") val sessionId: String = "",
+    @SerializedName("expires_at") val expiresAt: String = "",
+    val user: AuthUser = AuthUser(),
+)
+
 // ================================================================
 // API 客户端
 // ================================================================
 
 class ApiClient(
     private val baseUrl: String,
-    private val gson: Gson = Gson()
+    private val gson: Gson = Gson(),
+    private val authStore: AuthSessionStore? = null,
 ) {
+    /** Login is anonymous; all other control-plane requests may use the local session. */
+    private val anonymousPaths = setOf(
+        "/api/auth/login",
+        "/api/auth/bootstrap",
+        "/api/auth/totp/verify",
+        "/api/bootstrap/first-connect",
+        "/api/cluster/android/register",
+    )
+
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)   // 推理可能较慢
         .writeTimeout(30, TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            val original = chain.request()
+            val anonymous = anonymousPaths.contains(original.url.encodedPath)
+            val token = if (!anonymous) authStore?.read()?.accessToken else null
+            val request = if (!token.isNullOrBlank() && original.header("Authorization") == null) {
+                original.newBuilder().header("Authorization", "Bearer $token").build()
+            } else {
+                original
+            }
+            val response = chain.proceed(request)
+            if (response.code == 401 && !anonymous) authStore?.clear()
+            response
+        }
         .addInterceptor(HttpLoggingInterceptor().apply {
+            redactHeader("Authorization")
             // BODY 级别会打印完整聊天内容，仅 debug 构建时使用
             level = if (BuildConfig.DEBUG) {
                 HttpLoggingInterceptor.Level.BODY
@@ -326,6 +392,71 @@ class ApiClient(
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
     private val diffusionTerminalStates = setOf("completed", "failed", "cancelled")
+
+    /** Authenticate against the local control plane and persist the encrypted session. */
+    suspend fun login(
+        username: String,
+        code: String? = null,
+        recoveryCode: String? = null,
+    ): Result<StoredAuthSession> = withContext(Dispatchers.IO) {
+        try {
+            require(username.isNotBlank()) { "username is required" }
+            require(!code.isNullOrBlank() || !recoveryCode.isNullOrBlank()) {
+                "code or recoveryCode is required"
+            }
+            val payload = AuthLoginRequest(username, code, recoveryCode)
+            val body = gson.toJson(payload).toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/login")
+                .post(body)
+                .header("Content-Type", "application/json")
+                .build()
+            val response = executeAsync(request)
+            val responseBody = response.body?.string() ?: "{}"
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
+            }
+            val session = gson.fromJson(responseBody, AuthLoginResponse::class.java).toStoredSession()
+            require(session.isValid()) { "auth login response is invalid" }
+            authStore?.save(session)
+                ?: return@withContext Result.failure(IllegalStateException("auth session store unavailable"))
+            Result.success(session)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Read the current authenticated session without exposing the bearer token to callers. */
+    suspend fun getAuthSession(): Result<AuthSessionResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/session")
+                .get()
+                .build()
+            executeJson(request, AuthSessionResponse::class.java)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Revoke the server session when reachable and always clear local credentials. */
+    suspend fun logout(): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/logout")
+                .post(ByteArray(0).toRequestBody(null))
+                .build()
+            val response = executeAsync(request)
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}"))
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        } finally {
+            authStore?.clear()
+        }
+    }
 
     // ==================== 聊天 ====================
 

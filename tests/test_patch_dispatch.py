@@ -181,7 +181,7 @@ def test_dry_run_commit_preview(fake_git, monkeypatch):
     monkeypatch.setattr(pd, "_git", fake_git_wrap)
     sha = pd._commit_changes("fix: x", dry_run=True)
     assert sha == "dry-run-sha"
-    assert ("add", "-A") not in executed
+    assert not any(args[:2] == ["add", "-A"] for args in executed)
     assert ("commit", "-m", "fix: x") not in executed
 
 
@@ -206,5 +206,35 @@ def test_paths_isolation_only_adds_selected(fake_git, monkeypatch):
     sha = pd._commit_changes("fix: x", dry_run=False, paths=["src/mine.py"])
     assert sha == "sha1" * 10
     assert ["add", "--", "src/mine.py"] in executed
-    assert ["add", "-A"] not in executed
+    assert not any(args[:2] == ["add", "-A"] for args in executed)
     assert not any(a == ["add", "--", "android/theirs.kt"] for a in executed)
+
+
+def test_commit_rejects_local_node_identity_path(monkeypatch):
+    monkeypatch.setattr(pd, "_git", lambda args, **kw: " M node_config.json")
+
+    with pytest.raises(pd.PatchDispatchError, match="节点身份"):
+        pd._commit_changes(
+            "fix: should not publish identity",
+            dry_run=False,
+            paths=["node_config.json"],
+        )
+
+
+def test_all_changes_add_excludes_local_node_identity(monkeypatch):
+    executed = []
+
+    def fake_git(args, **_kwargs):
+        executed.append(args)
+        if args[:2] == ["status", "--porcelain"]:
+            return " M src/example.py"
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return "sha1" * 10
+        return ""
+
+    monkeypatch.setattr(pd, "_git", fake_git)
+    pd._commit_changes("fix: preserve node state", dry_run=False)
+
+    add_call = next(args for args in executed if args[:2] == ["add", "-A"])
+    assert ":(exclude)node_config.json" in add_call
+    assert ":(exclude)node_config.json.tmp" in add_call

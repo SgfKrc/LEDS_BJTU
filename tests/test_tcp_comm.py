@@ -827,6 +827,34 @@ class TestTCPServerConnectionManagement:
             srv_sock.close()
             cli_sock.close()
 
+    def test_heartbeat_keeps_client_reported_rtt(self):
+        """服务端保存客户端测得的 RTT，避免用跨主机时钟估算。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": "client_rtt",
+                    "role": "client",
+                    "auth": tcp_comm_mod.build_auth_signature("client_rtt"),
+                },
+            }
+            server._handle_registration(
+                srv_sock, ("127.0.0.1", 54321), "pending_rtt", msg,
+            )
+            server._handle_heartbeat(
+                "client_rtt",
+                {"data": {"t_send": 1.0, "rtt_ms": 4.812}},
+            )
+            info = server.get_client_info("client_rtt")
+            assert info["avg_rtt_ms"] == pytest.approx(4.812)
+            assert info["last_rtt_ms"] == pytest.approx(4.812)
+        finally:
+            server.stop()
+            srv_sock.close()
+            cli_sock.close()
+
     def test_rejected_registration_returns_ack_and_raises(self):
         """认证失败的 REGISTER 应返回 rejected ACK 并抛内部拒绝异常。"""
         server = TCPServer(host="127.0.0.1", port=0)
@@ -884,6 +912,55 @@ class TestTCPServerConnectionManagement:
         finally:
             srv_sock.close()
             cli_sock.close()
+
+    def test_duplicate_registration_returns_rejected_ack(self):
+        """活动连接存在时，重复 REGISTER 必须收到明确 rejected ACK。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        old_srv, old_cli = socket.socketpair()
+        new_srv, new_cli = socket.socketpair()
+        try:
+            client_id = "client_duplicate"
+            server._set_client(
+                client_id,
+                ClientConn(
+                    client_id=client_id,
+                    sock=old_srv,
+                    addr=("127.0.0.1", 1),
+                    role="client",
+                    registration_confirmed=True,
+                    last_heartbeat=time.time(),
+                ),
+            )
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": client_id,
+                    "role": "client",
+                    "auth": tcp_comm_mod.build_auth_signature(client_id),
+                },
+            }
+            with pytest.raises(
+                tcp_comm_mod._RegistrationRejected,
+                match="active connection exists",
+            ):
+                server._handle_registration(
+                    new_srv, ("127.0.0.1", 54325), "pending_54325", msg,
+                )
+            header = recv_exact(new_cli, HEADER_LEN)
+            assert header is not None
+            payload = recv_exact(new_cli, unpack_header(header))
+            ack = parse_message(payload)
+            assert ack["type"] == "register"
+            assert ack["data"]["status"] == "rejected"
+            assert ack["data"]["client_id"] == client_id
+            assert "active connection exists" in ack["data"]["reason"]
+            assert server.get_client_info(client_id)["peer_addr"] == "127.0.0.1:1"
+        finally:
+            server.stop()
+            old_srv.close()
+            old_cli.close()
+            new_srv.close()
+            new_cli.close()
 
     def test_broadcast_continues_after_one_client_send_failure(self):
         class RecordingSocket:
@@ -1179,6 +1256,7 @@ class TestReconnectBehavior:
 
         monkeypatch.setattr(client, "connect", mock_connect)
         monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _: None)
+        monkeypatch.setattr(client, "_schedule_reconnect_retry", lambda: None)
         client.on_message = None
 
         client._reconnect()
@@ -1188,7 +1266,7 @@ class TestReconnectBehavior:
             f"_reconnect 应仅调用 connect() 一次，实际调用了 {len(connect_calls)} 次"
         )
 
-    def test_reconnect_sets_running_true_on_failure(self, monkeypatch):
+    def test_reconnect_keeps_stale_heartbeat_stopped_on_failure(self, monkeypatch):
         """connect() 失败后应设置 _running=True 以便心跳循环下次重试。"""
         client = TCPClient(
             server_host="127.0.0.1", server_port=1,
@@ -1197,14 +1275,13 @@ class TestReconnectBehavior:
 
         monkeypatch.setattr(client, "connect", lambda on_message=None: False)
         monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _: None)
+        monkeypatch.setattr(client, "_schedule_reconnect_retry", lambda: None)
         client.on_message = None
 
         client._reconnect()
 
-        # _running 应为 True（允许心跳循环重试）
-        assert client._running is True, (
-            "connect() 失败后 _running 应设为 True 以便持续重连"
-        )
+        assert client._running is False
+        assert client._registered is False
 
     def test_reconnect_closes_socket_before_reconnect(self, monkeypatch):
         """重连前应关闭旧 socket。"""
@@ -1377,6 +1454,27 @@ class TestTCPClientRegistrationAck:
         client._heartbeat_loop(1)
 
         assert calls == [original_sock]
+
+    def test_heartbeat_reports_existing_rtt(self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        client.sock = object()
+        client._running = True
+        client._connection_generation = 1
+        client.avg_rtt_ms = 4.81234
+        payloads = []
+
+        def send_data(data, msg_type, connection_sock=None):
+            payloads.append(data)
+            client._running = False
+
+        monkeypatch.setattr(client, "send_data", send_data)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _seconds: None)
+
+        client._heartbeat_loop(1)
+
+        assert payloads[0]["rtt_ms"] == pytest.approx(4.812)
 
     def test_heartbeat_ack_updates_ewma_and_bounded_snapshot(self, monkeypatch):
         client = TCPClient(
