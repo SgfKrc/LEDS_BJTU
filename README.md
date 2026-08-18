@@ -323,6 +323,49 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
+### 🚀 一键配置全部开发环境（克隆后推荐）
+
+仓库包含**主运行时 + 8 个 Python 虚拟环境 + 3 个 Node 子项目**，逐个手配繁琐。
+统一入口 `scripts/setup_envs.py`（或根目录 `setup_all_envs.bat` / `setup_all_envs.sh`）可一次配完：
+
+```bash
+# Windows
+setup_all_envs.bat --all
+
+# Linux / macOS
+./setup_all_envs.sh --all
+
+# 或直接调脚本（等价；另有 --only / --skip / --check / --snapshot / --list 等）
+python scripts/setup_envs.py --all
+python scripts/setup_envs.py --check      # 只校验现有环境，不安装
+python scripts/setup_envs.py --list       # 查看环境清单
+```
+
+> ⚠️ **torch 等平台相关大件不自动安装**：脚本自动过滤 `torch/torchvision/torchaudio`
+> 并打印各环境的平台安装命令，避免 CPU/CUDA 版本互相污染（两个打包 venv 严禁混用，
+> 集显版只准 CPU torch、独显版默认 CUDA）。需要时用
+> `--torch-index-url URL` 让提示带好源，例如 `https://download.pytorch.org/whl/cu126`。
+> llama-cpp-python 等需源码构建的包会在缺编译工具链时报错，按对应 requirements 头注释处理。
+
+**环境 ↔ 依赖文件 ↔ 锁定快照**：`requirements-lock/*.lock.txt` 由 `--snapshot` 从现有
+venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch 系与 editable/本地安装不
+锁定）；实际安装仍以各 `requirements-*.txt` 的版本窗口为准。
+
+| 环境 | 用途 | 依赖来源 | lock 快照 |
+|---|---|---|---|
+| **主环境**（系统 Python） | 运行时（transformers/torch 推理服务）与工具脚本 | `requirements.txt` | `requirements-lock/main.lock.txt` |
+| `.venv-test` | 唯一测试环境（全量/定向 pytest） | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
+| `.venv-tui` | T9 终端聊天页（textual） | `packaging/requirements-tui.txt` | `requirements-lock/tui.lock.txt` |
+| `.venv-gemma4-native` | 原生 Gemma 4 MTMD / llama.cpp | `packaging/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
+| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
+| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar（含 pipeline 执行依赖） | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
+| `.venv-packaging` | 集显版打包（torch CPU + PyInstaller） | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
+| `.venv-packaging-cuda` | 独显版打包 + SD 侧车 | `packaging/requirements-cpu.txt` + `packaging/requirements-sd15.txt` | `requirements-lock/packaging-cuda.lock.txt` |
+| frontend / gateway / control | Node 子项目 | 各 `package-lock.json`（`npm ci`，随 --all 处理） | — |
+
+> `setup_all_envs.bat` 在 Windows 会自动 `chcp 65001`；直接跑脚本时若终端乱码，
+> 手动 `chcp 65001` 或 `set PYTHONIOENCODING=utf-8` 即可。
+
 ### 🔒 环境分割（主环境 / 测试环境 / 打包环境）
 
 **硬性规则：测试依赖只装进 `.venv-test`，严禁装入系统 Python（主环境）；严禁在 `.venv-test` 与主环境之间复制/同步 site-packages。**
