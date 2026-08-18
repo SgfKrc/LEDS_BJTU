@@ -6604,6 +6604,10 @@ class Scheduler:
             data = msg.get("data", {})
             limit = data.get("limit", 100)
             try:
+                # Keep this branch self-contained: log aggregation can be
+                # invoked independently of the inference message handlers.
+                from tcp_comm import MessageType
+
                 entries, _ = self._host._snapshot_recent_logs()
                 filtered = self._host._filter_recent_logs(
                     entries,
