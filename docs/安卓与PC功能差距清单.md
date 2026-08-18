@@ -97,8 +97,8 @@
 | **AND-A2-01** | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | **开发完成；真实 PC SD/设备验收后置** |
 | **AND-A2-02** | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | **开发完成；真实 PC SD/设备验收后置** |
 | **AND-C-01** | P2 | 主节点模型清单、下载进度、SHA-256 校验与断点续传 | 主节点分发 API | **开发完成；真实大文件/断网/SAF 提供器验收后置** |
-| AND-E-01 | P2 | Auth/Keystore token 保存、轮换与登出清理 | 主节点 auth API | 待开发 |
-| AND-F-01 | P3 | 应用更新、日志上传与连接健康诊断 | Launcher/日志 API | 待开发 |
+| AND-E-01 | P2 | Auth/Keystore token 保存、轮换与登出清理 | 主节点 auth API | **客户端开发完成；真实 auth API/真机验收后置** |
+| AND-F-01 | P3 | 应用更新、日志上传与连接健康诊断 | Launcher/日志 API | **开发完成（f05bcf3）；真实安装/更新/日志链路验收后置** |
 
 本阶段不排本地 SD、生成本地判题和分布式真机性能标定；这些属于后续验收项，不作为 Android 开发阻塞条件。
 
@@ -118,6 +118,7 @@
 
 | 日期 | 内容 |
 |---|---|
+| 2026-08-18 | AND-E-01 客户端开发门完成：Android Keystore-backed session store 已接入 ApiClient，登录/会话校验/登出、Bearer 注入、401 清理和 Authorization 日志脱敏均已实现；JVM contract tests 覆盖登录、授权头、失效会话和离线登出。AND-F-01 核对确认已由 f05bcf3 交付。真实 auth API、安装更新与设备验收后置。 |
 | 2026-08-17 | AND-C-01 已完成：Android Full 设置页新增主节点 GGUF 目录、进度与校验状态，下载落入用户授权 SAF 目录并支持严格 Range 续传、大小/SHA-256 校验和 `.part` 提升；PC 清单移除绝对目录泄露并增加 Range 契约测试；Full/Lite JVM、AndroidTest Kotlin 编译和 PC 安全边界测试通过，真实大文件/断网/SAF 提供器验收后置 |
 | 2026-08-17 | AND-A2-02 已完成：新增 Android 图像导航页、提示词/反向提示词/步数表单、参考图选择与预览、远程生成/变体提交、任务取消、结果 blob 32 MiB 有界下载和 1024px 缩略图展示；补齐状态机、ApiClient 下载和 Compose 契约测试，Full/Lite JVM 与 Full AndroidTest Kotlin 编译通过，真实 PC SD/网络/设备验收后置 |
 | 2026-08-17 | AND-A2-01 已完成：Android `ApiClient` 接入 PC `/api/diffusion/generate`、`/edit`、`/blobs`、`/jobs/{id}` 与取消端点，新增 snake_case DTO、16 MiB 上传限制、multipart 参考图/遮罩上传、有限终态轮询和协程取消传播；Full/Lite 全量 JVM 单测、远程 SD 契约测试与 Full AndroidTest Kotlin 编译通过，真实 PC SD/设备验收后置 |
