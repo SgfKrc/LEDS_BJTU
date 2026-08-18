@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -555,6 +556,26 @@ class TcpProbeObservation:
 
 
 @dataclass(frozen=True)
+class TlsProbeObservation:
+    """Bounded TLS handshake result for one caller-approved endpoint."""
+
+    state: str
+    reason: str | None = None
+    elapsed_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {"not_run", "available", "unavailable", "timeout"}:
+            raise ValueError("invalid TLS probe state")
+
+    def public_view(self) -> dict[str, str | float | None]:
+        return {
+            "state": self.state,
+            "reason": self.reason,
+            "elapsed_ms": self.elapsed_ms,
+        }
+
+
+@dataclass(frozen=True)
 class PathSnapshot:
     path_kind: str
     availability: str
@@ -717,6 +738,53 @@ def probe_trusted_tcp(
             connection.close()
     elapsed_ms = max(0.0, (clock() - started) * 1000.0)
     return TcpProbeObservation("available", elapsed_ms=round(elapsed_ms, 3))
+
+
+def probe_trusted_tls(
+    endpoint: TrustedEndpoint,
+    *,
+    connector: Callable[..., socket.socket] = socket.create_connection,
+    context_factory: Callable[[], ssl.SSLContext] = ssl.create_default_context,
+    timeout_seconds: float = DEFAULT_TCP_TIMEOUT_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+) -> TlsProbeObservation:
+    """Connect and complete a verified TLS handshake to one trusted endpoint.
+
+    The endpoint is never discovered or enumerated. The explicit endpoint host
+    is passed as SNI/hostname input so the default certificate checks remain
+    enabled for both DNS names and IP literals. No certificate details or peer
+    addresses are included in the result.
+    """
+    timeout = _validate_timeout(timeout_seconds)
+    started = clock()
+    raw_socket: socket.socket | None = None
+    tls_socket: ssl.SSLSocket | None = None
+    tcp_connected = False
+    try:
+        raw_socket = connector((endpoint.host, endpoint.port), timeout=timeout)
+        tcp_connected = True
+        tls_socket = context_factory().wrap_socket(
+            raw_socket,
+            server_hostname=endpoint.host,
+        )
+    except (socket.timeout, TimeoutError):
+        return TlsProbeObservation("timeout", "timeout")
+    except (ssl.SSLError, ValueError):
+        return TlsProbeObservation("unavailable", "tls_failed")
+    except (ConnectionRefusedError, socket.gaierror):
+        return TlsProbeObservation("unavailable", "connect_failed")
+    except OSError:
+        return TlsProbeObservation(
+            "unavailable",
+            "tls_failed" if tcp_connected else "connect_failed",
+        )
+    finally:
+        if tls_socket is not None:
+            tls_socket.close()
+        elif raw_socket is not None:
+            raw_socket.close()
+    elapsed_ms = max(0.0, (clock() - started) * 1000.0)
+    return TlsProbeObservation("available", elapsed_ms=round(elapsed_ms, 3))
 
 
 def _tailscale_peer_path(
