@@ -10008,22 +10008,40 @@ class Scheduler:
                 local_sha256 = str(prepared.get("model_sha256", "") or "")
                 local_model_path = prepared.get("model_path")
             elif phase == "prepare" and plan_id and cfg.get("assignment_manifest"):
-                from model_sync import ensure_pipeline_assignment_available
+                from model_sync import (
+                    ensure_pipeline_assignment_available,
+                    resolve_worker_model_path,
+                )
+                from tcp_comm import TCPClient
 
                 tcp_client = getattr(self, "_tcp_client", None)
                 master_host = getattr(tcp_client, "server_host", "")
                 if not master_host:
                     raise RuntimeError("无法确定主节点模型下载地址")
-                local_model_path, assignment_manifest = ensure_pipeline_assignment_available(
-                    master_host,
-                    master_api_port,
-                    {
-                        **cfg,
-                        "model_id": model_id,
-                        "model_sha256": expected_sha256,
-                    },
+                # Prefer an already provisioned full model. The assignment
+                # manifest is only a cold-start fallback for workers that do
+                # not own the same revision locally.
+                local_model_path = resolve_worker_model_path(model_id)
+                local_sha256 = TCPClient._compute_local_model_sha256(
+                    model_path=local_model_path,
+                    model_id=model_id,
                 )
-                local_sha256 = expected_sha256
+                if local_sha256 == expected_sha256:
+                    logger.info(
+                        "worker local model revision matches; skip assignment weight transfer: model=%s",
+                        model_id,
+                    )
+                else:
+                    local_model_path, assignment_manifest = ensure_pipeline_assignment_available(
+                        master_host,
+                        master_api_port,
+                        {
+                            **cfg,
+                            "model_id": model_id,
+                            "model_sha256": expected_sha256,
+                        },
+                    )
+                    local_sha256 = expected_sha256
             elif expected_sha256:
                 from tcp_comm import TCPClient
                 if model_id:
