@@ -10481,7 +10481,14 @@ class Scheduler:
         with self._layer_config_lock:
             self._pipeline_worker_opt_out.discard(client_id)
         logger.info("从节点已重新加入 PyTorch 分层计算: node=%s", client_id)
-        self.push_layer_config_to_clients()
+        # A worker may still carry a local opt-out from its previous model
+        # operation.  When the master has a prepared distributed artifact,
+        # use the authoritative path so the assignment clears that stale
+        # local state instead of immediately eliciting another opt-out.
+        if getattr(self._host, "is_pipeline_prepared", False):
+            self.request_authoritative_layer_sync()
+        else:
+            self.push_layer_config_to_clients()
 
     def _run_master_lm_head(self, hidden_states):
         """在主节点对 worker 返回的尾层 hidden states 执行 Norm + LM Head。"""
