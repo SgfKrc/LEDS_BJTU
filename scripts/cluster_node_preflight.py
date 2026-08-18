@@ -30,6 +30,7 @@ from network_path import (  # noqa: E402
     collect_tailscale_netcheck,
     collect_tailscale_status,
     probe_trusted_tcp,
+    probe_trusted_tls,
 )
 from network_address import is_tailscale_ip  # noqa: E402
 
@@ -155,6 +156,7 @@ def _endpoint_report(
     *,
     timeout_seconds: float,
     tailscale_status: Any,
+    probe_tls: bool = False,
 ) -> dict[str, Any]:
     endpoint = TrustedEndpoint(host, port, role="master")
     tcp_probe = probe_trusted_tcp(endpoint, timeout_seconds=timeout_seconds)
@@ -163,12 +165,17 @@ def _endpoint_report(
         tailscale_status=tailscale_status,
         tcp_probe=tcp_probe,
     )
-    return {
+    report = {
         "endpoint": endpoint.public_descriptor(),
         "tcp_probe": tcp_probe.public_view(),
         "path": path.public_view(),
         "ready": tcp_probe.state == "available",
     }
+    if probe_tls:
+        tls_probe = probe_trusted_tls(endpoint, timeout_seconds=timeout_seconds)
+        report["tls_probe"] = tls_probe.public_view()
+        report["ready"] = report["ready"] and tls_probe.state == "available"
+    return report
 
 
 def build_report(
@@ -177,10 +184,12 @@ def build_report(
     master_host: str = "",
     api_port: int = 8000,
     tcp_port: int = 8888,
+    tls_port: int = 443,
     timeout_seconds: float = 2.0,
     sidecar: str = "none",
     require_tailnet: bool = False,
     require_ipv6: bool = False,
+    require_tls: bool = False,
     status_collector: Callable[..., Any] = collect_tailscale_status,
     netcheck_collector: Callable[..., Any] = collect_tailscale_netcheck,
     endpoint_reporter: Callable[..., dict[str, Any]] = _endpoint_report,
@@ -232,8 +241,20 @@ def build_report(
                 tailscale_status=tailscale_status,
             )
             report["endpoints"] = {"api": api, "tcp": tcp}
+            tls = None
+            if require_tls:
+                tls = endpoint_reporter(
+                    master_host,
+                    tls_port,
+                    timeout_seconds=timeout_seconds,
+                    tailscale_status=tailscale_status,
+                    probe_tls=True,
+                )
+                report["endpoints"]["tls"] = tls
             checks["master_api_tcp"] = bool(api["ready"])
             checks["master_tcp_tcp"] = bool(tcp["ready"])
+            if require_tls:
+                checks["master_tls"] = bool(tls and tls["ready"])
             endpoint_scope = str(api["endpoint"].get("host_scope", ""))
             if require_tailnet:
                 checks["tailnet_endpoint"] = endpoint_scope in {
@@ -257,10 +278,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--master-host", default="", help="one approved master host; never scanned")
     parser.add_argument("--api-port", type=_port, default=int(os.environ.get("QLH_MASTER_API_PORT", "8000")))
     parser.add_argument("--tcp-port", type=_port, default=int(os.environ.get("QLH_MASTER_PORT", "8888")))
+    parser.add_argument("--tls-port", type=_port, default=443)
     parser.add_argument("--timeout", type=_timeout, default=2.0)
     parser.add_argument("--sidecar", choices=("none", "qwen3", "gemma4", "all"), default="none")
     parser.add_argument("--require-tailnet", action="store_true")
     parser.add_argument("--require-ipv6", action="store_true")
+    parser.add_argument("--require-tls", action="store_true")
     parser.add_argument("--output", type=Path, default=None, help="optional JSON report path")
     return parser
 
@@ -272,10 +295,12 @@ def main(argv: list[str] | None = None) -> int:
         master_host=args.master_host,
         api_port=args.api_port,
         tcp_port=args.tcp_port,
+        tls_port=args.tls_port,
         timeout_seconds=args.timeout,
         sidecar=args.sidecar,
         require_tailnet=args.require_tailnet,
         require_ipv6=args.require_ipv6,
+        require_tls=args.require_tls,
     )
     encoded = json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
     print(encoded, end="")
