@@ -10116,6 +10116,8 @@ class Scheduler:
                         model_id=model_id,
                         model_path=local_model_path,
                         quant_type=master_quant_type or None,
+                        layer_range=(start, end),
+                        model_sha256=local_sha256 or expected_sha256,
                     )
                 prepared_record = {
                     "config_id": config_id,
