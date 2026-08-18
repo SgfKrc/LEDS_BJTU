@@ -2,6 +2,8 @@ package com.qlh.inference.network
 
 import com.google.gson.Gson
 import com.google.gson.JsonParser
+import com.qlh.inference.security.AuthSessionStore
+import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -41,7 +43,26 @@ class ApiClientContractTest {
         server.routes[path] = handler
     }
 
-    private class Request(val method: String, val path: String, val body: String)
+    private class Request(
+        val method: String,
+        val path: String,
+        val body: String,
+        val headers: Map<String, String> = emptyMap(),
+    )
+
+    private class FakeAuthStore(initial: StoredAuthSession? = null) : AuthSessionStore {
+        var session: StoredAuthSession? = initial
+        var clearCount: Int = 0
+
+        override fun read(): StoredAuthSession? = session
+        override fun save(session: StoredAuthSession) {
+            this.session = session
+        }
+        override fun clear() {
+            clearCount += 1
+            session = null
+        }
+    }
 
     // T14：完整 JSON 解析比较（Gson 自动还原 \u003d 转义）
     private fun parseJson(body: String): com.google.gson.JsonObject =
@@ -105,12 +126,17 @@ class ApiClientContractTest {
             val path = parts[1]
 
             var contentLength = 0
+            val headers = mutableMapOf<String, String>()
             while (true) {
                 val line = readLine() ?: break
                 if (line.isEmpty()) break
                 val lower = line.lowercase()
                 if (lower.startsWith("content-length:")) {
                     contentLength = line.substringAfter(':').trim().toIntOrNull() ?: 0
+                }
+                val separator = line.indexOf(':')
+                if (separator > 0) {
+                    headers[line.substring(0, separator).trim()] = line.substring(separator + 1).trim()
                 }
             }
             val body = if (contentLength > 0) {
@@ -130,7 +156,7 @@ class ApiClientContractTest {
             val (code, responseBody) = if (handler != null) {
                 var code = 200
                 var response = "{}"
-                handler(Request(method, path, body)) { c, b ->
+                handler(Request(method, path, body, headers)) { c, b ->
                     code = c
                     response = b
                 }
@@ -152,6 +178,78 @@ class ApiClientContractTest {
             out.write(bytes)
             out.flush()
         }
+    }
+
+    private fun storedSession(): StoredAuthSession = StoredAuthSession(
+        accessToken = "token_" + "a".repeat(24),
+        sessionId = "session-1",
+        expiresAt = "2030-01-01T00:00:00.000Z",
+        userId = "user-1",
+        username = "owner",
+        displayName = "Owner",
+        role = "owner",
+    )
+
+    @Test
+    fun `login saves validated session without sending stale bearer`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/login") { req, reply ->
+            seen = req
+            reply(
+                200,
+                """{"access_token":"new_token_${"b".repeat(24)}","token_type":"Bearer","session_id":"session-2","expires_at":"2030-01-02T00:00:00.000Z","user":{"user_id":"user-2","username":"alice","display_name":"Alice","role":"member"}}""",
+            )
+        }
+
+        val result = runBlocking { client.login("alice", code = "123456") }
+        assertTrue(result.isSuccess)
+        assertEquals("alice", result.getOrNull()?.username)
+        assertEquals("session-2", store.session?.sessionId)
+        assertTrue(seen?.headers?.keys?.none { it.equals("Authorization", ignoreCase = true) } == true)
+        assertEquals("123456", parseJson(seen!!.body).get("code").asString)
+    }
+
+    @Test
+    fun `authenticated requests receive bearer from session store`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/session") { req, reply ->
+            seen = req
+            reply(200, """{"session_id":"session-1","expires_at":"2030-01-01T00:00:00.000Z","user":{"user_id":"user-1","username":"owner","role":"owner"}}""")
+        }
+
+        val result = runBlocking { client.getAuthSession() }
+        assertTrue(result.isSuccess)
+        assertEquals("Bearer ${storedSession().accessToken}", seen?.headers?.entries?.firstOrNull {
+            it.key.equals("Authorization", ignoreCase = true)
+        }?.value)
+    }
+
+    @Test
+    fun `unauthorized response clears the local session`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        route("/api/auth/session") { _, reply -> reply(401, """{"error":"expired"}""") }
+
+        val result = runBlocking { client.getAuthSession() }
+        assertTrue(result.isFailure)
+        assertEquals(1, store.clearCount)
+        assertEquals(null, store.session)
+    }
+
+    @Test
+    fun `logout clears local session when server is unavailable`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        route("/api/auth/logout") { _, reply -> reply(503, """{"error":"offline"}""") }
+
+        val result = runBlocking { client.logout() }
+        assertTrue(result.isFailure)
+        assertEquals(null, store.session)
+        assertTrue(store.clearCount >= 1)
     }
 
     // ---- chat ----

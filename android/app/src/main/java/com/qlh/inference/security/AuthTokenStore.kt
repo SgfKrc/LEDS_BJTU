@@ -16,7 +16,13 @@ import javax.crypto.spec.GCMParameterSpec
  * leaves AndroidKeyStore. Session metadata is encrypted together with it so a
  * backup of app preferences cannot reveal account identity or expiry details.
  */
-class AuthTokenStore(context: Context) {
+interface AuthSessionStore {
+    fun read(): StoredAuthSession?
+    fun save(session: StoredAuthSession)
+    fun clear()
+}
+
+class AuthTokenStore(context: Context) : AuthSessionStore {
     companion object {
         private const val STORE_NAME = "qlh_auth_session"
         private const val KEY_CIPHERTEXT = "session_ciphertext"
@@ -31,7 +37,7 @@ class AuthTokenStore(context: Context) {
     private val gson = Gson()
 
     @Synchronized
-    fun read(): StoredAuthSession? {
+    override fun read(): StoredAuthSession? {
         val ciphertext = preferences.getString(KEY_CIPHERTEXT, null) ?: return null
         val iv = preferences.getString(KEY_IV, null) ?: run {
             clear()
@@ -60,7 +66,7 @@ class AuthTokenStore(context: Context) {
     }
 
     @Synchronized
-    fun save(session: StoredAuthSession) {
+    override fun save(session: StoredAuthSession) {
         require(session.isValid()) { "invalid auth session" }
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
@@ -72,7 +78,7 @@ class AuthTokenStore(context: Context) {
     }
 
     @Synchronized
-    fun clear() {
+    override fun clear() {
         preferences.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).commit()
         runCatching {
             KeyStore.getInstance(KEYSTORE).apply { load(null) }.deleteEntry(KEY_ALIAS)
