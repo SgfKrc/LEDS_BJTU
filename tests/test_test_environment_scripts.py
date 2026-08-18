@@ -2,8 +2,11 @@
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 from scripts import run_test_channels
+from scripts import setup_envs
+from scripts import setup_qwen3_sidecar_env
 from scripts import setup_test_env
 
 
@@ -14,7 +17,9 @@ def test_test_channel_guard_rejects_system_python(monkeypatch, capsys):
     assert run_test_channels._check_python_environment(
         allow_system_python=False,
     ) is False
-    assert "setup_test_env.py" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "setup_test_env.py" in error
+    assert "--reuse-runtime" not in error
 
 
 def test_test_channel_guard_accepts_virtual_environment(monkeypatch):
@@ -51,6 +56,97 @@ def test_wheelhouse_disables_network_proxy(monkeypatch, tmp_path):
     assert "--no-index" in command
     assert f"--find-links={tmp_path}" in command
     assert "--proxy" not in command
+
+
+def test_check_rejects_overlay_when_isolation_is_requested(monkeypatch, capsys):
+    monkeypatch.setattr(setup_test_env, "_uses_system_site_packages", lambda: True)
+    monkeypatch.setattr(
+        setup_test_env,
+        "_ready",
+        lambda: (_ for _ in ()).throw(AssertionError("health check must not run")),
+    )
+
+    assert setup_test_env.main(["--check"]) == 2
+    assert "existing environment is overlay" in capsys.readouterr().err
+
+
+def test_check_accepts_explicit_overlay_mode(monkeypatch):
+    monkeypatch.setattr(setup_test_env, "_uses_system_site_packages", lambda: True)
+    monkeypatch.setattr(setup_test_env, "_ready", lambda: True)
+
+    assert setup_test_env.main(["--check", "--reuse-runtime"]) == 0
+
+
+def test_unified_setup_keeps_test_environment_isolated():
+    test_env = setup_envs.ENV_BY_NAME["test"]
+
+    assert test_env.system_site_packages is False
+    assert {"pytest", "xdist", "pytest_timeout"} <= set(test_env.required_modules)
+
+
+def test_sidecar_checks_require_torch_runtime_modules():
+    qwen = setup_envs.ENV_BY_NAME["qwen3-sidecar"]
+    gemma = setup_envs.ENV_BY_NAME["gemma4-pipeline"]
+
+    assert {"torch", "torchvision", "transformers"} <= set(qwen.required_modules)
+    assert {"torch", "accelerate", "transformers"} <= set(gemma.required_modules)
+
+
+def test_qwen_sidecar_installs_torch_and_torchvision_from_one_index(monkeypatch):
+    readiness = iter((False, True))
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        setup_qwen3_sidecar_env,
+        "_ready",
+        lambda **_kwargs: next(readiness),
+    )
+    monkeypatch.setattr(
+        setup_qwen3_sidecar_env,
+        "_python_path",
+        lambda: Path(sys.executable),
+    )
+    monkeypatch.setattr(
+        setup_qwen3_sidecar_env.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(list(command)) or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    assert setup_qwen3_sidecar_env.main([
+        "--pipeline",
+        "--torch-index-url", "https://download.pytorch.org/whl/cu126",
+    ]) == 0
+
+    assert commands[0][-2:] == [
+        "torch>=2.0", "torchvision>=0.28,<0.29",
+    ]
+    assert "https://download.pytorch.org/whl/cu126" in commands[0]
+
+
+def test_qwen_unified_setup_hint_keeps_torch_wheels_on_one_index():
+    hint = setup_envs._torch_hint(
+        setup_envs.ENV_BY_NAME["qwen3-sidecar"],
+        "https://download.pytorch.org/whl/cu126",
+    )
+
+    assert "torchvision>=0.28,<0.29" in hint
+    assert hint.count("https://download.pytorch.org/whl/cu126") == 1
+
+
+def test_qwen_runtime_probe_reports_mixed_wheels(monkeypatch):
+    seen: list[list[str]] = []
+    monkeypatch.setattr(
+        setup_envs.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            seen.append(list(command))
+            or SimpleNamespace(returncode=1, stdout="mixed Torch builds", stderr="")
+        ),
+    )
+
+    assert setup_envs._qwen3_torchvision_runtime_issue(Path("python")) == "mixed Torch builds"
+    assert "torchvision.ops.nms" in seen[0][2]
 
 
 # ================================================================

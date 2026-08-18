@@ -146,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.check:
+        existing_mode = _uses_system_site_packages()
+        if existing_mode is not None and existing_mode != args.reuse_runtime:
+            current = "overlay" if existing_mode else "isolated"
+            requested = "overlay" if args.reuse_runtime else "isolated"
+            print(
+                f"[test-env] existing environment is {current}, requested {requested}; "
+                "rerun with its original mode or add --recreate",
+                file=sys.stderr,
+            )
+            return 2
         if not _ready():
             print("[test-env] environment is missing or unhealthy", file=sys.stderr)
             return 1

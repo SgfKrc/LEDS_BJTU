@@ -90,8 +90,7 @@ def _check_python_environment(*, allow_system_python: bool) -> bool:
         file=sys.stderr,
     )
     print(
-        '[test-channels] prepare it with: python scripts/setup_test_env.py '
-        '--reuse-runtime',
+        '[test-channels] prepare it with: python scripts/setup_test_env.py',
         file=sys.stderr,
     )
     print(

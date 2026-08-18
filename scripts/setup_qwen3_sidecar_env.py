@@ -15,6 +15,9 @@ VENV_DIR = ROOT / ".venv-qwen3-sidecar"
 REQUIREMENTS = ROOT / "packaging" / "requirements-qwen3-sidecar.txt"
 PIPELINE_REQUIREMENTS = ROOT / "packaging" / "requirements-qwen3-pipeline-sidecar.txt"
 DEFAULT_TORCH_SPEC = os.environ.get("QLH_QWEN3_TORCH_SPEC", "torch>=2.0")
+DEFAULT_TORCHVISION_SPEC = os.environ.get(
+    "QLH_QWEN3_TORCHVISION_SPEC", "torchvision>=0.28,<0.29",
+)
 
 
 def _python_path() -> Path:
@@ -52,6 +55,11 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_TORCH_SPEC,
         help="Torch requirement used for --pipeline (default: QLH_QWEN3_TORCH_SPEC or torch>=2.0)",
     )
+    parser.add_argument(
+        "--torchvision-spec",
+        default=DEFAULT_TORCHVISION_SPEC,
+        help="matching torchvision requirement used for --pipeline",
+    )
     args = parser.parse_args(argv)
     if _ready(pipeline=args.pipeline):
         print(f"Qwen3 sidecar environment ready: {VENV_DIR} (pipeline={args.pipeline})")
@@ -75,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             torch_command.extend(["--no-index", f"--find-links={wheelhouse}"])
         elif args.torch_index_url:
             torch_command.extend(["--index-url", str(args.torch_index_url)])
-        torch_command.extend([str(args.torch_spec)])
+        torch_command.extend([str(args.torch_spec), str(args.torchvision_spec)])
         torch_install = subprocess.run(torch_command, check=False)
         if torch_install.returncode != 0:
             return torch_install.returncode

@@ -60,6 +60,7 @@ class PyEnv:
     system_site_packages: bool = False
     needs_torch: bool = False     # True => 自动安装时过滤 torch 系，仅打印提示
     extra_packages: tuple[str, ...] = ()   # 追加到 -r 之外的包（如 pyinstaller）
+    required_modules: tuple[str, ...] = () # --check 需实际可导入的运行时模块
     python_version_hint: str = "3.12"
 
     @property
@@ -74,6 +75,7 @@ ENVS: tuple[PyEnv, ...] = (
         venv_dir=None,
         requirements=("requirements.txt",),
         lock_file="main.lock.txt",
+        required_modules=("torch", "transformers", "fastapi", "psutil", "numpy"),
     ),
     PyEnv(
         name="test",
@@ -81,7 +83,7 @@ ENVS: tuple[PyEnv, ...] = (
         venv_dir=".venv-test",
         requirements=("requirements-test.txt",),
         lock_file="test.lock.txt",
-        system_site_packages=True,
+        required_modules=("pytest", "xdist", "pytest_timeout"),
         python_version_hint="3.12",
     ),
     PyEnv(
@@ -90,6 +92,7 @@ ENVS: tuple[PyEnv, ...] = (
         venv_dir=".venv-tui",
         requirements=("packaging/requirements-tui.txt",),
         lock_file="tui.lock.txt",
+        required_modules=("textual", "httpx"),
     ),
     PyEnv(
         name="gemma4-native",
@@ -97,6 +100,7 @@ ENVS: tuple[PyEnv, ...] = (
         venv_dir=".venv-gemma4-native",
         requirements=("packaging/requirements-gemma4-native.txt",),
         lock_file="gemma4-native.lock.txt",
+        required_modules=("llama_cpp",),
     ),
     PyEnv(
         name="gemma4-pipeline",
@@ -105,6 +109,7 @@ ENVS: tuple[PyEnv, ...] = (
         requirements=("packaging/requirements-gemma4-pipeline-sidecar.txt",),
         lock_file="gemma4-pipeline.lock.txt",
         needs_torch=True,
+        required_modules=("torch", "accelerate", "safetensors", "transformers"),
         python_version_hint="3.12",
     ),
     PyEnv(
@@ -117,6 +122,7 @@ ENVS: tuple[PyEnv, ...] = (
         ),
         lock_file="qwen3-sidecar.lock.txt",
         needs_torch=True,
+        required_modules=("torch", "torchvision", "accelerate", "safetensors", "transformers"),
         python_version_hint="3.12",
     ),
     PyEnv(
@@ -127,6 +133,7 @@ ENVS: tuple[PyEnv, ...] = (
         lock_file="packaging.lock.txt",
         needs_torch=True,
         extra_packages=("pyinstaller",),
+        required_modules=("torch", "transformers", "PyInstaller"),
         python_version_hint="3.12",
     ),
     PyEnv(
@@ -140,6 +147,7 @@ ENVS: tuple[PyEnv, ...] = (
         lock_file="packaging-cuda.lock.txt",
         needs_torch=True,
         extra_packages=("pyinstaller",),
+        required_modules=("torch", "diffusers", "PyInstaller"),
         python_version_hint="3.12",
     ),
 )
@@ -207,6 +215,17 @@ def _ensure_venv(env: PyEnv, base_python: Path, dry_run: bool) -> Path:
     py = _venv_python(env)
     assert py is not None
     if py.is_file():
+        actual_site_mode = _uses_system_site_packages(env)
+        if actual_site_mode is not None and actual_site_mode != env.system_site_packages:
+            expected = "overlay" if env.system_site_packages else "fully isolated"
+            actual = "overlay" if actual_site_mode else "fully isolated"
+            hint = (
+                "python scripts/setup_test_env.py --recreate"
+                if env.name == "test" else f"recreate {env.venv_dir}"
+            )
+            raise SystemExit(
+                f"[{env.name}] existing venv is {actual}, expected {expected}; {hint}"
+            )
         return py
     command = [str(base_python), "-m", "venv"]
     if env.system_site_packages:
@@ -221,11 +240,18 @@ def _ensure_venv(env: PyEnv, base_python: Path, dry_run: bool) -> Path:
 
 
 def _torch_hint(env: PyEnv, index_url: str) -> str:
+    torch_index = index_url if index_url else TORCH_HINT_DEFAULT_INDEX
+    if env.name == "qwen3-sidecar":
+        return (
+            "[qwen3-sidecar] 请将 torch 与 torchvision 从同一个 CPU/CUDA 源安装（避免混用 wheel）：\n"
+            f"    {env.venv_dir}\\Scripts\\python.exe -m pip install torch "
+            f"'torchvision>=0.28,<0.29' --index-url {torch_index}"
+        )
     if env.name == "packaging":
         return (
             f"[{env.name}] 请手动安装 torch CPU 版（打包 venv 严禁装 CUDA 版）：\n"
             f"    {env.venv_dir}\\Scripts\\python.exe -m pip install torch --index-url"
-            f" {index_url if index_url else TORCH_HINT_DEFAULT_INDEX}"
+            f" {torch_index}"
         )
     if env.name == "packaging-cuda":
         return (
@@ -241,8 +267,6 @@ def _torch_hint(env: PyEnv, index_url: str) -> str:
     ]
     if env.name == "gemma4-pipeline":
         lines.append("    （Transformers 5.10.1 建议 torch>=2.10,<2.14）")
-    if env.name == "qwen3-sidecar":
-        lines.append("    装完 torch 后还需 torchvision：python -m pip install 'torchvision>=0.28.0,<0.29.0'")
     return "\n".join(lines)
 
 
@@ -313,6 +337,81 @@ def install_node(project: str, description: str, args: argparse.Namespace) -> No
 
 # ---------------------------------------------------------------- check 逻辑
 
+def _uses_system_site_packages(env: PyEnv) -> bool | None:
+    """Return the venv inheritance mode recorded by ``pyvenv.cfg``."""
+    if env.is_main or env.venv_dir is None:
+        return None
+    config = ROOT / env.venv_dir / "pyvenv.cfg"
+    if not config.is_file():
+        return None
+    for line in config.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip().lower() == "include-system-site-packages":
+            return value.strip().lower() == "true"
+    return None
+
+
+def _missing_modules(python: Path, modules: tuple[str, ...]) -> list[str]:
+    if not modules:
+        return []
+    check = (
+        "import importlib.util, sys; "
+        f"modules = {modules!r}; "
+        "missing = [name for name in modules if importlib.util.find_spec(name) is None]; "
+        "print('\\n'.join(missing)); "
+        "raise SystemExit(1 if missing else 0)"
+    )
+    try:
+        result = subprocess.run(
+            [str(python), "-c", check],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return list(modules)
+    if result.returncode == 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()] or list(modules)
+
+
+def _qwen3_torchvision_runtime_issue(python: Path) -> str:
+    """Detect mixed Torch wheels which pass ``pip check`` but break CUDA ops."""
+    check = """
+import torch
+import torchvision
+
+torch_tag = torch.__version__.partition("+")[2]
+vision_tag = torchvision.__version__.partition("+")[2]
+issue = ""
+if torch_tag and vision_tag and torch_tag != vision_tag:
+    issue = f"mixed Torch builds: torch={torch.__version__}, torchvision={torchvision.__version__}"
+if not issue and torch.cuda.is_available():
+    try:
+        boxes = torch.tensor([[0., 0., 1., 1.], [0., 0., 2., 2.]], device="cuda")
+        scores = torch.tensor([0.9, 0.8], device="cuda")
+        torchvision.ops.nms(boxes, scores, 0.5)
+    except Exception as exc:
+        issue = f"CUDA torchvision nms unavailable: {exc.__class__.__name__}"
+print(issue)
+raise SystemExit(1 if issue else 0)
+"""
+    try:
+        result = subprocess.run(
+            [str(python), "-c", check],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"unable to run Qwen3 Torch compatibility probe: {exc.__class__.__name__}"
+    if result.returncode == 0:
+        return ""
+    return (result.stdout.strip() or result.stderr.strip() or "Qwen3 Torch compatibility probe failed")
+
+
 def check_python_env(env: PyEnv, base_python: Path) -> bool:
     py = _resolve_python(env, base_python)
     if env.is_main:
@@ -324,6 +423,19 @@ def check_python_env(env: PyEnv, base_python: Path) -> bool:
         if py is None or not py.is_file():
             print(f"[{env.name}] [MISSING] venv 未创建: {env.venv_dir}（可运行 setup_envs.py --only {env.name}）")
             return False
+        actual_site_mode = _uses_system_site_packages(env)
+        if actual_site_mode is not None and actual_site_mode != env.system_site_packages:
+            expected = "overlay" if env.system_site_packages else "fully isolated"
+            actual = "overlay" if actual_site_mode else "fully isolated"
+            recreate_hint = (
+                "python scripts/setup_test_env.py --recreate"
+                if env.name == "test" else f"python scripts/setup_envs.py --only {env.name}"
+            )
+            print(
+                f"[{env.name}] [MISSING] venv is {actual}; expected {expected}. "
+                f"Recreate it with: {recreate_hint}"
+            )
+            return False
     result = subprocess.run([str(py), "-m", "pip", "check"], capture_output=True, text=True, check=False)
     ok = result.returncode == 0
     if ok:
@@ -331,10 +443,19 @@ def check_python_env(env: PyEnv, base_python: Path) -> bool:
     else:
         raw = (result.stdout.strip() or result.stderr.strip()).splitlines()
         detail = raw[0] if raw else "pip check 异常"
+    if ok:
+        missing_modules = _missing_modules(py, env.required_modules)
+        if missing_modules:
+            detail = f"missing importable modules: {', '.join(missing_modules)}"
+            ok = False
+    if ok and env.name == "qwen3-sidecar":
+        runtime_issue = _qwen3_torchvision_runtime_issue(py)
+        if runtime_issue:
+            detail = runtime_issue
+            ok = False
     print(f"[{env.name}] {'[OK]' if ok else '[MISSING]'} {detail}")
-    if ok and env.needs_torch:
-        # torch 相关仅提示，不做硬性校验（用户可能尚未安装）
-        print(f"[{env.name}]   （torch 未自动安装；如未装请参照 --snapshot 提示的命令补齐）")
+    if not ok and env.needs_torch:
+        print(_torch_hint(env, TORCH_HINT_DEFAULT_INDEX))
     return ok
 
 

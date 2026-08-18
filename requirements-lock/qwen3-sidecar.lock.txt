@@ -2,7 +2,7 @@
 # qwen3-sidecar 依赖精确快照（pip freeze 自动生成，勿手改）
 # 环境: Qwen3 PyTorch sidecar（.venv-qwen3-sidecar；含 pipeline 执行依赖）
 # 生成: python scripts/setup_envs.py --snapshot
-# 当前 torch 系版本（参考）: torch==2.13.0+cu126, torchvision==0.28.0
+# 当前 torch 系版本（参考）: torch==2.13.0+cu126, torchvision==0.28.0+cu126
 # 说明: torch/torchvision/torchaudio 与 editable/本地路径安装不在此锁定；
 #       各类依赖按 packaging/requirements-*.txt 安装，torch 按 setup_envs.py 提示手动补齐。
 # ============================================================
@@ -30,7 +30,7 @@ safetensors==0.8.0
 sympy==1.14.0
 tokenizers==0.22.2
 # torch==2.13.0+cu126   # torch 系不自动锁定，手动安装（--torch-index-url）
-# torchvision==0.28.0   # torch 系不自动锁定，手动安装（--torch-index-url）
+# torchvision==0.28.0+cu126   # torch 系不自动锁定，手动安装（--torch-index-url）
 tqdm==4.70.0
 transformers==4.57.6
 typing_extensions==4.15.0
