@@ -355,7 +355,12 @@ PIPELINE_MODEL_SYNC_TIMEOUT = _env_float(
     "QLH_PIPELINE_MODEL_SYNC_TIMEOUT", 60.0, min_val=1.0, max_val=600.0,
 )                                           # 等待从节点同步模型和分层 ACK
 PIPELINE_MAX_CONCURRENT = 1              # 最大并发流水线任务数（当前仅支持 1，串行执行）
-PIPELINE_STEP_TIMEOUT = 30               # 单个节点前向传播超时（秒）
+# CPU-only workers may need tens of seconds for the first layer forward over
+# a DERP/Tailscale path.  Keep this configurable so deployments can tune it
+# to their slowest participating node without changing source code.
+PIPELINE_STEP_TIMEOUT = _env_float(
+    "QLH_PIPELINE_STEP_TIMEOUT", 120.0, min_val=5.0, max_val=600.0,
+)                                           # 单个节点前向传播超时（秒）
 PIPELINE_QUEUE_MAX_SIZE = 100            # 请求队列最大容量（超出返回 503）
 PIPELINE_QUEUE_RESULT_TTL = 300          # 已完成任务结果保留时间（秒），超时清理
 PIPELINE_QUEUE_POLL_INTERVAL = 0.5       # 排队请求轮询间隔（秒）

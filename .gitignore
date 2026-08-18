@@ -49,6 +49,7 @@ chat_history/
 node_config.json
 node_config.json.tmp
 .gitignore_bak
+runtime/
 
 # Model weights (downloaded separately)
 models/qwen-1_8b-chat/

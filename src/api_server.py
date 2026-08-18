@@ -3502,6 +3502,23 @@ def _routing_gate_error(req: ChatRequest) -> Optional[str]:
     return None
 
 
+def _enforce_distributed_required(
+    req: ChatRequest,
+    metrics: dict | None = None,
+    *,
+    detail: str = "分布式执行未完成",
+) -> None:
+    """Reject silent local fallback for an explicitly required route."""
+    if req.routing_preference != "distributed_required":
+        return
+    if isinstance(metrics, dict) and metrics.get("distributed_used"):
+        return
+    raise HTTPException(
+        503,
+        f"distributed_required 执行失败：{detail}",
+    )
+
+
 def _external_route_decision(req: ChatRequest):
     """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""
     if req.routing_preference == "local_only":
@@ -5153,9 +5170,7 @@ def _execute_chat_full(
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if result.get("status") == "ok":
-                history.append({"role": "user", "content": req.message})
                 response_text = result.get("content", "")
-                history.append({"role": "assistant", "content": response_text})
                 forward_metrics = _augment_chat_metrics(
                     result.get("metrics", {}),
                     req,
@@ -5168,6 +5183,14 @@ def _execute_chat_full(
                 ):
                     forward_metrics["fallback"] = True
                     forward_metrics["fallback_reason"] = external_fallback_reason
+
+                _enforce_distributed_required(
+                    req,
+                    forward_metrics,
+                    detail="从节点转发结果未标记为分布式执行",
+                )
+                history.append({"role": "user", "content": req.message})
+                history.append({"role": "assistant", "content": response_text})
 
                 db_session_id = target_session_id or "default"
                 _persist_conversation_turn(
@@ -5194,15 +5217,24 @@ def _execute_chat_full(
                 }
             elif result.get("status") == "disconnected":
                 logger.warning("分布式推理转发失败（未连接主节点），回退到本地推理")
+                _enforce_distributed_required(req, detail="从节点未连接主节点")
             elif result.get("status") == "timeout":
                 logger.warning("分布式推理转发超时，回退到本地推理")
+                _enforce_distributed_required(req, detail="分布式转发超时")
             else:
                 logger.warning(f"分布式推理转发失败: {result.get('error', 'unknown')}，回退到本地推理")
+                _enforce_distributed_required(
+                    req,
+                    detail=str(result.get("error", "分布式转发失败")),
+                )
         except ChatGenerationCancelled:
+            raise
+        except HTTPException:
             raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             logger.warning(f"分布式推理转发异常: {e}，回退到本地推理")
+            _enforce_distributed_required(req, detail=str(e))
 
         if _pipeline_worker_is_reserved():
             raise HTTPException(
@@ -5240,15 +5272,16 @@ def _execute_chat_full(
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             if pipeline_result.get("error"):
                 logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
+                _enforce_distributed_required(
+                    req,
+                    detail=str(pipeline_result["error"]),
+                )
             else:
                 response_text = pipeline_result.get("response", "")
                 if not response_text:
                     logger.warning("流水线返回空响应，回退到本地推理")
+                    _enforce_distributed_required(req, detail="流水线返回空响应")
                 else:
-                    history.append({"role": "user", "content": req.message})
-                    history.append({"role": "assistant", "content": response_text})
-
-                    db_session_id = target_session_id or "default"
                     pipeline_metrics = _augment_chat_metrics(
                         pipeline_result.get("metrics", {}),
                         req,
@@ -5256,6 +5289,15 @@ def _execute_chat_full(
                         execution_mode="distributed_pipeline",
                         route="master_pipeline",
                     )
+                    _enforce_distributed_required(
+                        req,
+                        pipeline_metrics,
+                        detail="流水线结果未标记为分布式执行",
+                    )
+                    history.append({"role": "user", "content": req.message})
+                    history.append({"role": "assistant", "content": response_text})
+
+                    db_session_id = target_session_id or "default"
                     if external_fallback_reason and not pipeline_metrics.get(
                         "fallback_reason",
                     ):
@@ -5290,9 +5332,15 @@ def _execute_chat_full(
                     }
         except ChatGenerationCancelled:
             raise
+        except HTTPException:
+            raise
         except Exception as e:
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
             logger.warning(f"流水线推理异常: {e}，回退到本地推理")
+            _enforce_distributed_required(req, detail=str(e))
+
+    if req.routing_preference == "distributed_required":
+        raise HTTPException(503, "distributed_required 执行失败：当前引擎未完成分布式流水线")
 
     # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
     if model_manager._engine_type in ("llama_cpp", "island"):
