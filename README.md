@@ -402,7 +402,7 @@ python scripts/setup_test_env.py --check
 ### 0. 克隆后必做（一次性的环境步骤）
 
 ```bash
-# 1. 拉取子模块（Android Full 版 llama.cpp 原生后端，约 2-4 GB 历史）
+# 1. 仅构建 Android Full 时拉取 llama.cpp 子模块；PC 从节点和 Python sidecar 不需要
 git submodule update --init --recursive
 
 # 2. 安装 Python 依赖（主环境；联网）
@@ -418,6 +418,25 @@ cd frontend && npm install && cd ..
 # 5. 验证
 python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
 ```
+
+`llama.cpp` 已锁定为 `android/app/src/main/cpp/llama.cpp` Git submodule。要保留 Android Full
+构建能力，推荐首次使用 `git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU`；
+若从节点只运行 PC CPU Worker、Qwen3/Gemma 4 PyTorch sidecar，则普通 clone 即可，不需要另行
+clone 或编译 `llama.cpp`。`.venv-gemma4-native` 使用 `llama-cpp-python`，也不直接引用该 Android
+源码子模块。
+
+无 CUDA/独显的 PC 从节点必须显式安装 CPU PyTorch，不要复制主节点 CUDA venv：
+
+```bash
+python scripts/setup_qwen3_sidecar_env.py --pipeline \
+  --torch-index-url https://download.pytorch.org/whl/cpu
+python scripts/setup_gemma4_pipeline_env.py \
+  --torch-index-url https://download.pytorch.org/whl/cpu
+python scripts/setup_envs.py --check --no-node
+```
+
+运行时使用 `execution_device=cpu`（或 `auto`，无 CUDA 时会回退 CPU）；资源门按可用 RAM 而非
+显存判定。CPU 与 CUDA 环境必须在各节点本地创建，不能跨机器复制 `.venv-*`。
 
 ### 1. 离线资产清单（按需获取）
 
