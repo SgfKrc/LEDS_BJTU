@@ -944,6 +944,43 @@ class TestLoadLayerRangeIntegration:
         with pytest.raises(RuntimeError, match="禁止自动整模回退"):
             mgr.ensure_full_model()
 
+    def test_prepare_pipeline_model_accepts_filtered_assignment_manifest(
+        self, tmp_path,
+    ):
+        """A worker assignment may contain only its non-zero layer range."""
+        from safetensors.torch import save_file
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({
+                "architectures": ["Qwen2ForCausalLM"],
+                "model_type": "qwen2",
+                "num_hidden_layers": 4,
+                "hidden_size": 2,
+                "tie_word_embeddings": False,
+            }),
+            encoding="utf-8",
+        )
+        save_file({
+            "model.layers.2.input_layernorm.weight": torch.zeros(2),
+            "model.layers.3.input_layernorm.weight": torch.zeros(2),
+            "model.norm.weight": torch.zeros(2),
+        }, str(tmp_path / "model.safetensors"))
+
+        mgr = ModelManager()
+        descriptor = mgr.prepare_pipeline_model(
+            model_id="filtered-qwen2",
+            model_path=str(tmp_path),
+            quant_type="fp16",
+            layer_range=(2, 4),
+            model_sha256="c" * 64,
+        )
+
+        assert mgr.is_pipeline_prepared is True
+        assert descriptor["total_layers"] == 4
+        assert descriptor["layer_weight_bytes"][:2] == [0, 0]
+        assert descriptor["layer_weight_bytes"][2:] == [8, 8]
+        assert descriptor["model_sha256"] == "c" * 64
+
     def test_abort_pipeline_materialization_preserves_descriptor(self):
         mgr = ModelManager()
         mgr._pipeline_descriptor = {
