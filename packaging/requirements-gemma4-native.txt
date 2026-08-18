@@ -1,0 +1,35 @@
+# ============================================================
+# Gemma 4 MTMD 原生运行时（.venv-gemma4-native）依赖清单
+# ============================================================
+# 用途：原生 Gemma 4 MTMD / llama.cpp GGUF 推理运行时。
+#       与 Transformers pipeline（.venv-gemma4-pipeline）严格隔离，
+#       不得复用给 Qwen3 sidecar / 主运行时的 PyTorch pipeline。
+#
+# 安装环境变量（可选）：
+#   CMAKE_ARGS / LLAMA_*     —— llama-cpp-python 源码构建时传给 CMake 的选项，
+#                               如启用 CUDA：CMAKE_ARGS="-DGGML_CUDA=on" 见 llama.cpp 官方 README。
+#
+# 注：llama-cpp-python 若 PyPI 无匹配预编译 wheel（本机架构/GPU 组合），
+#     会自动回退源码构建，需要本机 C/C++ 编译工具链（Windows: MSVC Build Tools；
+#     Linux: gcc + make + cmake）。这是 llama.cpp 生态的固有行为，不属于本项目问题。
+# ============================================================
+
+# --- llama.cpp GGUF 推理引擎（CPU/集显默认；如需 CUDA 用 CMAKE_ARGS 重建）---
+llama-cpp-python>=0.3.0
+
+# --- 数值 / 加载辅助 ---
+numpy>=1.26
+
+# --- 磁盘缓存（GGUF mmproj / 多模态投影缓存）---
+diskcache>=5.6
+
+# --- 系统资源监控 ---
+psutil>=5.9
+
+# --- llama-cpp-python 源码构建工具链（仅 PyPI 无预编译 wheel 时被拉起）---
+ninja>=1.11
+scikit-build-core>=0.10
+packaging>=24
+pathspec>=0.12
+Jinja2>=3.1
+typing_extensions>=4.9
