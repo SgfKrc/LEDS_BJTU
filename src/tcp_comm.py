@@ -44,9 +44,15 @@ from config import (
 )
 
 try:
-    from .network_path import HeartbeatQualityWindow
+    from .network_path import (
+        HeartbeatQualityWindow,
+        DEFAULT_MAX_HEARTBEAT_RTT_MS,
+    )
 except ImportError:  # Script/PYTHONPATH=src compatibility.
-    from network_path import HeartbeatQualityWindow
+    from network_path import (
+        HeartbeatQualityWindow,
+        DEFAULT_MAX_HEARTBEAT_RTT_MS,
+    )
 
 # 尝试导入 psutil 用于网络类型检测
 try:
@@ -974,6 +980,8 @@ class ClientConn:
     connected_at: float = 0.0    # 连接时间
     last_heartbeat: float = 0.0  # 上次心跳时间
     heartbeat_missed: int = 0    # 连续心跳丢失次数
+    avg_rtt_ms: float = 0.0      # 客户端测得的到主节点 EWMA RTT
+    last_rtt_ms: float = 0.0     # 客户端最近一次测得的 RTT
     registration_confirmed: bool = False  # scheduler 确认后才返回 registered ACK
     registration_epoch: int = 0            # monotonic identity epoch; changes on reconnect
     send_lock: threading.Lock = field(
@@ -1596,7 +1604,19 @@ class TCPServer:
             # 提取客户端发送时间戳，原样回显
             echo_data = None
             if msg and isinstance(msg.get("data"), dict):
-                t_send = msg["data"].get("t_send", 0)
+                data = msg["data"]
+                reported_rtt = data.get("rtt_ms")
+                try:
+                    reported_rtt = float(reported_rtt)
+                except (TypeError, ValueError):
+                    reported_rtt = 0.0
+                if (
+                    math.isfinite(reported_rtt)
+                    and 0.0 < reported_rtt <= DEFAULT_MAX_HEARTBEAT_RTT_MS
+                ):
+                    conn.last_rtt_ms = reported_rtt
+                    conn.avg_rtt_ms = reported_rtt
+                t_send = data.get("t_send", 0)
                 if t_send:
                     echo_data = {"t_send": t_send}
             # 回复 ACK
@@ -1753,6 +1773,8 @@ class TCPServer:
             "connected_at": c.connected_at,
             "last_heartbeat": c.last_heartbeat,
             "heartbeat_missed": c.heartbeat_missed,
+            "avg_rtt_ms": round(c.avg_rtt_ms, 3) if c.avg_rtt_ms > 0 else None,
+            "last_rtt_ms": round(c.last_rtt_ms, 3) if c.last_rtt_ms > 0 else None,
             "registration_epoch": c.registration_epoch,
         }
 
@@ -2273,8 +2295,11 @@ class TCPClient:
                     generation,
                     self._last_heartbeat_send,
                 )
+                heartbeat_data = {"t_send": self._last_heartbeat_send}
+                if self.avg_rtt_ms > 0:
+                    heartbeat_data["rtt_ms"] = round(self.avg_rtt_ms, 3)
                 self.send_data(
-                    {"t_send": self._last_heartbeat_send},
+                    heartbeat_data,
                     MessageType.HEARTBEAT,
                     connection_sock=connection_sock,
                 )

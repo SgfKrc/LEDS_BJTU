@@ -827,6 +827,34 @@ class TestTCPServerConnectionManagement:
             srv_sock.close()
             cli_sock.close()
 
+    def test_heartbeat_keeps_client_reported_rtt(self):
+        """服务端保存客户端测得的 RTT，避免用跨主机时钟估算。"""
+        server = TCPServer(host="127.0.0.1", port=0)
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            msg = {
+                "type": "register",
+                "data": {
+                    "client_id": "client_rtt",
+                    "role": "client",
+                    "auth": tcp_comm_mod.build_auth_signature("client_rtt"),
+                },
+            }
+            server._handle_registration(
+                srv_sock, ("127.0.0.1", 54321), "pending_rtt", msg,
+            )
+            server._handle_heartbeat(
+                "client_rtt",
+                {"data": {"t_send": 1.0, "rtt_ms": 4.812}},
+            )
+            info = server.get_client_info("client_rtt")
+            assert info["avg_rtt_ms"] == pytest.approx(4.812)
+            assert info["last_rtt_ms"] == pytest.approx(4.812)
+        finally:
+            server.stop()
+            srv_sock.close()
+            cli_sock.close()
+
     def test_rejected_registration_returns_ack_and_raises(self):
         """认证失败的 REGISTER 应返回 rejected ACK 并抛内部拒绝异常。"""
         server = TCPServer(host="127.0.0.1", port=0)
@@ -1426,6 +1454,27 @@ class TestTCPClientRegistrationAck:
         client._heartbeat_loop(1)
 
         assert calls == [original_sock]
+
+    def test_heartbeat_reports_existing_rtt(self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        client.sock = object()
+        client._running = True
+        client._connection_generation = 1
+        client.avg_rtt_ms = 4.81234
+        payloads = []
+
+        def send_data(data, msg_type, connection_sock=None):
+            payloads.append(data)
+            client._running = False
+
+        monkeypatch.setattr(client, "send_data", send_data)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _seconds: None)
+
+        client._heartbeat_loop(1)
+
+        assert payloads[0]["rtt_ms"] == pytest.approx(4.812)
 
     def test_heartbeat_ack_updates_ewma_and_bounded_snapshot(self, monkeypatch):
         client = TCPClient(
