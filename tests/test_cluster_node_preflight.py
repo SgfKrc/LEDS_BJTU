@@ -66,6 +66,39 @@ def test_client_preflight_probes_only_the_approved_ipv6_endpoint():
     assert "fd7a:115c:a1e0::1234" not in json.dumps(report)
 
 
+def test_client_preflight_can_require_a_separate_tls_endpoint():
+    calls = []
+
+    def endpoint_reporter(host, port, **kwargs):
+        calls.append((host, port, kwargs.get("probe_tls", False)))
+        report = {
+            "endpoint": {"role": "master", "host_scope": "tailscale_ipv4", "port": port},
+            "tcp_probe": {"state": "available", "reason": None, "elapsed_ms": 1.0},
+            "path": {"path_kind": "derp", "availability": "available"},
+            "ready": True,
+        }
+        if kwargs.get("probe_tls"):
+            report["tls_probe"] = {"state": "available", "reason": None, "elapsed_ms": 2.0}
+        return report
+
+    report = preflight.build_report(
+        role="client",
+        master_host="100.64.0.1",
+        require_tls=True,
+        status_collector=_status,
+        netcheck_collector=_netcheck,
+        endpoint_reporter=endpoint_reporter,
+    )
+
+    assert calls == [
+        ("100.64.0.1", 8000, False),
+        ("100.64.0.1", 8888, False),
+        ("100.64.0.1", 443, True),
+    ]
+    assert report["checks"]["master_tls"] is True
+    assert report["endpoints"]["tls"]["tls_probe"]["state"] == "available"
+
+
 def test_client_preflight_fails_closed_without_master_host():
     report = preflight.build_report(
         role="client",

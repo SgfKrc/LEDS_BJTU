@@ -783,6 +783,8 @@ class ModelManager:
         model_id: str,
         model_path: str,
         quant_type: str = None,
+        layer_range: tuple[int, int] | None = None,
+        model_sha256: str | None = None,
     ) -> dict:
         """Prepare a distributed model without materializing any weight tensor.
 
@@ -794,13 +796,20 @@ class ModelManager:
         from pipeline_model_descriptor import inspect_pipeline_model
 
         resolved_path = os.path.abspath(model_path or "")
-        descriptor = inspect_pipeline_model(resolved_path, model_id=model_id)
+        # Assignment manifests contain only the worker's layer range. Validate
+        # that range instead of treating the filtered directory as complete.
+        descriptor = inspect_pipeline_model(
+            resolved_path,
+            model_id=model_id,
+            layer_range=layer_range,
+        )
         if not descriptor.get("pipeline_runtime_supported", False):
             raise RuntimeError(
                 descriptor.get("runtime_block_reason")
                 or "该模型架构尚未实现流水线执行 adapter"
             )
-        model_sha256 = compute_model_sha256(resolved_path)
+        if not model_sha256:
+            model_sha256 = compute_model_sha256(resolved_path)
         if not model_sha256:
             raise RuntimeError("无法计算流水线模型摘要")
         descriptor["model_sha256"] = model_sha256

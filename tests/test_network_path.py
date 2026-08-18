@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import subprocess
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import pytest
 from src.network_path import (
     HeartbeatQualityWindow,
     TcpProbeObservation,
+    TlsProbeObservation,
     TrustedEndpoint,
     build_client_network_path_view,
     classify_trusted_path,
@@ -16,6 +18,7 @@ from src.network_path import (
     collect_tailscale_status,
     network_path_diagnostic_json,
     probe_trusted_tcp,
+    probe_trusted_tls,
     sanitize_network_path_view,
 )
 
@@ -309,6 +312,29 @@ def test_status_command_uses_argument_vector_and_classifies_direct_tailnet_peer(
     assert "198.51.100.5" not in json.dumps(public)
 
 
+def test_status_command_decodes_utf8_bytes_independent_of_windows_locale():
+    payload = json.dumps(
+        {"Peer": {"peer-1": {"TailscaleIPs": ["100.100.100.7"], "CurAddr": ""}}}
+    ).encode("utf-8")
+
+    status = collect_tailscale_status(
+        executable="tailscale-test",
+        runner=lambda *_args, **_kwargs: _completed(payload),
+    )
+
+    assert status.state == "available"
+    assert status.reason is None
+
+
+def test_status_command_rejects_invalid_utf8_bytes_without_raising():
+    status = collect_tailscale_status(
+        executable="tailscale-test",
+        runner=lambda *_args, **_kwargs: _completed(b"\xff\xfe"),
+    )
+
+    assert status.public_view() == {"state": "invalid", "reason": "non_text_output"}
+
+
 def test_relay_path_is_classified_without_exposing_region_or_peer_address():
     status = collect_tailscale_status(
         executable="tailscale-test",
@@ -460,3 +486,70 @@ def test_tcp_probe_connects_once_to_exact_trusted_endpoint_and_closes_socket():
 
     assert calls == [(("master.example.test", 8443), 1.0), "closed"]
     assert observation.public_view() == {"state": "available", "reason": None, "elapsed_ms": 25.0}
+
+
+def test_tls_probe_verifies_one_exact_endpoint_and_uses_dns_name_as_sni():
+    calls = []
+
+    class FakeSocket:
+        def close(self):
+            calls.append("raw_closed")
+
+    class FakeTlsSocket:
+        def close(self):
+            calls.append("tls_closed")
+
+    class FakeContext:
+        def wrap_socket(self, raw_socket, *, server_hostname):
+            calls.append((raw_socket, server_hostname))
+            return FakeTlsSocket()
+
+    timestamps = iter([10.0, 10.015])
+    observation = probe_trusted_tls(
+        TrustedEndpoint("master.example.test", 443),
+        connector=lambda address, *, timeout: (calls.append((address, timeout)) or FakeSocket()),
+        context_factory=lambda: FakeContext(),
+        timeout_seconds=1.0,
+        clock=lambda: next(timestamps),
+    )
+
+    assert calls[0] == (("master.example.test", 443), 1.0)
+    assert calls[1][1] == "master.example.test"
+    assert calls[2] == "tls_closed"
+    assert observation.public_view() == {"state": "available", "reason": None, "elapsed_ms": 15.0}
+
+
+def test_tls_probe_fails_closed_for_certificate_or_handshake_errors():
+    class FakeContext:
+        def wrap_socket(self, *_args, **_kwargs):
+            raise ssl.SSLError("certificate details must not escape")
+
+    class FakeSocket:
+        def close(self):
+            pass
+
+    observation = probe_trusted_tls(
+        TrustedEndpoint("100.100.100.7", 443),
+        connector=lambda *_args, **_kwargs: FakeSocket(),
+        context_factory=lambda: FakeContext(),
+    )
+
+    assert observation.public_view() == {"state": "unavailable", "reason": "tls_failed", "elapsed_ms": None}
+
+
+def test_tls_probe_labels_post_connect_reset_as_tls_failure():
+    class FakeContext:
+        def wrap_socket(self, *_args, **_kwargs):
+            raise ConnectionResetError("peer reset during handshake")
+
+    class FakeSocket:
+        def close(self):
+            pass
+
+    observation = probe_trusted_tls(
+        TrustedEndpoint("master.example.test", 443),
+        connector=lambda *_args, **_kwargs: FakeSocket(),
+        context_factory=lambda: FakeContext(),
+    )
+
+    assert observation == TlsProbeObservation("unavailable", "tls_failed")

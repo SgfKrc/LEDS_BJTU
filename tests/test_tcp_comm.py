@@ -913,8 +913,8 @@ class TestTCPServerConnectionManagement:
             srv_sock.close()
             cli_sock.close()
 
-    def test_duplicate_registration_returns_rejected_ack(self):
-        """活动连接存在时，重复 REGISTER 必须收到明确 rejected ACK。"""
+    def test_duplicate_registration_replaces_confirmed_session(self):
+        """重连应替换已确认旧会话，保证新 socket 能收到 ACK。"""
         server = TCPServer(host="127.0.0.1", port=0)
         old_srv, old_cli = socket.socketpair()
         new_srv, new_cli = socket.socketpair()
@@ -939,22 +939,18 @@ class TestTCPServerConnectionManagement:
                     "auth": tcp_comm_mod.build_auth_signature(client_id),
                 },
             }
-            with pytest.raises(
-                tcp_comm_mod._RegistrationRejected,
-                match="active connection exists",
-            ):
-                server._handle_registration(
-                    new_srv, ("127.0.0.1", 54325), "pending_54325", msg,
-                )
+            server._handle_registration(
+                new_srv, ("127.0.0.1", 54325), "pending_54325", msg,
+            )
+            assert server.get_client_info(client_id)["peer_addr"] == "127.0.0.1:54325"
+            assert server.confirm_registration(client_id) is True
             header = recv_exact(new_cli, HEADER_LEN)
             assert header is not None
             payload = recv_exact(new_cli, unpack_header(header))
             ack = parse_message(payload)
             assert ack["type"] == "register"
-            assert ack["data"]["status"] == "rejected"
+            assert ack["data"]["status"] == "registered"
             assert ack["data"]["client_id"] == client_id
-            assert "active connection exists" in ack["data"]["reason"]
-            assert server.get_client_info(client_id)["peer_addr"] == "127.0.0.1:1"
         finally:
             server.stop()
             old_srv.close()
@@ -1414,7 +1410,9 @@ class TestTCPClientRegistrationAck:
         client._recv_loop(1)
 
         assert received_from == [original_sock]
-        assert client.is_registered is False
+        # The replacement socket owns the current session; the stale receive
+        # loop must not clear its registration state.
+        assert client.is_registered is True
         assert original_sock.closed is True
         assert client.sock is replacement_sock
 
@@ -1475,6 +1473,39 @@ class TestTCPClientRegistrationAck:
         client._heartbeat_loop(1)
 
         assert payloads[0]["rtt_ms"] == pytest.approx(4.812)
+
+    def test_stale_socket_cannot_notify_disconnect_or_send_again(self, monkeypatch):
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+        old_sock = object()
+        new_sock = object()
+        client.sock = new_sock
+        client._running = True
+        client._registered = True
+        client._connection_generation = 1
+        disconnects = []
+        client.on_disconnect = lambda: disconnects.append(True)
+
+        client._notify_disconnect(1, connection_sock=old_sock)
+
+        assert client._registered is True
+        assert disconnects == []
+
+        sent = []
+        client.sock = old_sock
+        client._running = True
+        client._connection_generation = 1
+
+        def send_data(data, msg_type, connection_sock=None):
+            sent.append(connection_sock)
+            client.sock = new_sock
+
+        monkeypatch.setattr(client, "send_data", send_data)
+        monkeypatch.setattr(tcp_comm_mod.time, "sleep", lambda _seconds: None)
+        client._heartbeat_loop(1)
+
+        assert sent == [old_sock]
 
     def test_heartbeat_ack_updates_ewma_and_bounded_snapshot(self, monkeypatch):
         client = TCPClient(
