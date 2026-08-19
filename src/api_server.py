@@ -132,6 +132,8 @@ from config import (
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
+from rag_store import RagStore, RagStoreError
+from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 _LOG_BUFFER_MAXLEN = 5000
@@ -142,6 +144,22 @@ LOG_AGGREGATE_DEADLINE_SECONDS = 3.0
 LOG_AGGREGATE_MAX_CONCURRENCY = 8
 _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
+_rag_store_lock = threading.RLock()
+_rag_store_instance: RagStore | None = None
+
+
+def _get_rag_store() -> RagStore:
+    """Return the user-owned RAG store, never the retired remote database."""
+    global _rag_store_instance
+    with _rag_store_lock:
+        if _rag_store_instance is None:
+            from config import STATE_DIR
+            path = os.environ.get("QLH_RAG_SQLITE_PATH", "").strip()
+            if not path:
+                path = os.path.join(STATE_DIR, "qlh-rag.sqlite3")
+            _rag_store_instance = RagStore(path)
+        _rag_store_instance.initialize()
+        return _rag_store_instance
 
 
 class RequestIdFilter(logging.Filter):
@@ -965,6 +983,38 @@ class PreparePipelineModelRequest(BaseModel):
         default="fp16",
         description="层段运行精度请求；第一期执行器仍以实际设备 dtype 为准",
     )
+
+
+class RagSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=512)
+    access_scope: Literal["owner", "local_system", "project"] = "owner"
+    limit: int = Field(default=20, ge=1, le=100)
+    mode: Literal["fts", "hybrid"] = "fts"
+    provider: str = Field(default="ollama", min_length=1, max_length=64)
+    model_id: str = Field(default="nomic-embed-text:latest", min_length=1, max_length=128)
+    model_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
+    dimensions: Optional[int] = Field(default=None, ge=1, le=32768)
+    query_vector: Optional[list[float]] = None
+
+
+class RagRebuildRequest(BaseModel):
+    include_embeddings: bool = False
+
+
+class RagEmbeddingJobRequest(BaseModel):
+    provider: Literal["ollama"] = "ollama"
+    model_id: str = Field(default=DEFAULT_OLLAMA_EMBEDDING_MODEL, min_length=1, max_length=128)
+    model_sha256: str = Field(..., min_length=64, max_length=64)
+    source_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    batch_size: int = Field(default=16, ge=1, le=64)
+
+
+class RagEmbeddingRunRequest(BaseModel):
+    model_id: str = Field(default=DEFAULT_OLLAMA_EMBEDDING_MODEL, min_length=1, max_length=128)
+    expected_dimensions: Optional[int] = Field(default=None, ge=1, le=32_768)
+    max_batches: int = Field(default=1, ge=1, le=100)
+    lease_seconds: int = Field(default=120, ge=5, le=3_600)
+    max_retries: int = Field(default=2, ge=0, le=5)
 
 
 class DiffusionArtifactInspectRequest(BaseModel):
@@ -2190,6 +2240,211 @@ def _init_kv_cache():
 async def health():
     """健康检查"""
     return {"status": "ok", "timestamp": time.time()}
+
+
+def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
+    """Return citation-safe fields; never expose stored vector blobs."""
+    text = str(row.get("text_content", ""))
+    return {
+        "chunk_id": row.get("chunk_id"),
+        "document_id": row.get("document_id"),
+        "source_id": row.get("source_id"),
+        "revision": row.get("revision"),
+        "access_scope": row.get("access_scope"),
+        "relative_ref": row.get("relative_ref"),
+        "ordinal": row.get("ordinal"),
+        "snippet": text[:800],
+        **{
+            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code")
+            if key in row
+        },
+    }
+
+
+def _rag_public_job(row: dict[str, Any]) -> dict[str, Any]:
+    cursor = dict(row.get("cursor") or {})
+    chunk_ids = cursor.pop("chunk_ids", [])
+    cursor["total"] = len(chunk_ids)
+    cursor.pop("model_sha256", None)
+    lease_expires_at = float(row.get("lease_expires_at") or 0.0)
+    return {
+        "job_id": row.get("job_id"),
+        "kind": row.get("kind"),
+        "state": row.get("state"),
+        "cursor": cursor,
+        "error_code": row.get("error_code"),
+        "attempts": int(row.get("attempts") or 0),
+        "lease_active": bool(row.get("lease_owner") and lease_expires_at > time.time()),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@app.get("/api/rag/health")
+async def rag_health():
+    try:
+        return await run_in_threadpool(_get_rag_store().health)
+    except Exception as exc:
+        logger.error("RAG SQLite health failed: %s", exc)
+        raise HTTPException(status_code=503, detail="本地主节点 RAG 存储不可用") from exc
+
+
+@app.get("/api/rag/sources")
+async def rag_sources(owner_scope: Optional[str] = None):
+    try:
+        rows = await run_in_threadpool(lambda: _get_rag_store().list_sources(owner_scope=owner_scope))
+        return {"sources": rows, "storage": "sqlite"}
+    except RagStoreError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG source listing failed: %s", exc)
+        raise HTTPException(status_code=503, detail="本地主节点 RAG 存储不可用") from exc
+
+
+@app.post("/api/rag/search")
+async def rag_search(req: RagSearchRequest):
+    try:
+        store = _get_rag_store()
+        if req.mode == "fts":
+            rows = await run_in_threadpool(
+                lambda: store.search(req.query, access_scope=req.access_scope, limit=req.limit)
+            )
+        else:
+            if req.model_sha256 is None or req.dimensions is None or req.query_vector is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="hybrid 检索需要 model_sha256、dimensions 和 query_vector",
+                )
+            if len(req.query_vector) != req.dimensions:
+                raise HTTPException(status_code=422, detail="query_vector 维度与 dimensions 不一致")
+            rows = await run_in_threadpool(
+                lambda: store.hybrid_search(
+                    req.query, req.query_vector, provider=req.provider, model_id=req.model_id,
+                    model_sha256=req.model_sha256, dimensions=req.dimensions,
+                    access_scope=req.access_scope, limit=req.limit,
+                )
+            )
+        return {
+            "mode": req.mode,
+            "provider": req.provider if req.mode == "hybrid" else None,
+            "results": [_rag_public_result(row) for row in rows],
+            "count": len(rows),
+            "storage": "sqlite",
+        }
+    except HTTPException:
+        raise
+    except RagStoreError as exc:
+        status = 422 if exc.code.endswith("invalid") or "dimension" in exc.code else 409
+        raise HTTPException(status_code=status, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG search failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG 检索暂不可用") from exc
+
+
+@app.post("/api/rag/rebuild")
+async def rag_rebuild(req: RagRebuildRequest):
+    if req.include_embeddings:
+        raise HTTPException(
+            status_code=422,
+            detail="embedding 重建需要显式 provider 任务，当前接口只重建 FTS5 索引",
+        )
+    try:
+        count = await run_in_threadpool(_get_rag_store().rebuild_fts)
+        return {"status": "ok", "fts_chunk_count": count, "storage": "sqlite"}
+    except Exception as exc:
+        logger.error("RAG FTS rebuild failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG FTS5 重建失败") from exc
+
+
+@app.get("/api/rag/capacity")
+async def rag_capacity(dimensions: int = 768):
+    try:
+        return await run_in_threadpool(lambda: _get_rag_store().embedding_capacity(dimensions=dimensions))
+    except RagStoreError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG capacity inspection failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG 容量估算不可用") from exc
+
+
+@app.post("/api/rag/embedding-jobs")
+async def rag_create_embedding_job(req: RagEmbeddingJobRequest):
+    try:
+        job = await run_in_threadpool(
+            lambda: _get_rag_store().create_embedding_job(
+                provider=req.provider, model_sha256=req.model_sha256,
+                source_id=req.source_id, batch_size=req.batch_size,
+            )
+        )
+        return _rag_public_job(job)
+    except RagStoreError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG embedding job creation failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG embedding 任务创建失败") from exc
+
+
+@app.get("/api/rag/embedding-jobs/{job_id}")
+async def rag_get_embedding_job(job_id: str):
+    try:
+        return _rag_public_job(await run_in_threadpool(lambda: _get_rag_store().get_embedding_job(job_id)))
+    except RagStoreError as exc:
+        raise HTTPException(status_code=404 if exc.code == "rag_job_not_found" else 422, detail=exc.code) from exc
+
+
+@app.post("/api/rag/embedding-jobs/{job_id}/run")
+async def rag_run_embedding_job(job_id: str, req: RagEmbeddingRunRequest):
+    try:
+        job = await run_in_threadpool(lambda: _get_rag_store().get_embedding_job(job_id))
+        cursor = job.get("cursor") or {}
+        if cursor.get("model_id") not in (None, req.model_id):
+            raise HTTPException(status_code=422, detail="embedding model identity changed during job")
+        expected = req.expected_dimensions or cursor.get("dimensions")
+        provider = OllamaEmbeddingProvider(
+            model_id=req.model_id,
+            base_url=os.environ.get("QLH_OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+            expected_dimensions=expected,
+        )
+        result = await run_in_threadpool(
+            lambda: _get_rag_store().run_embedding_job(
+                job_id, provider, max_batches=req.max_batches,
+                lease_seconds=req.lease_seconds, max_retries=req.max_retries,
+            )
+        )
+        return _rag_public_job(result)
+    except HTTPException:
+        raise
+    except RagStoreError as exc:
+        status = 404 if exc.code == "rag_job_not_found" else 409
+        raise HTTPException(status_code=status, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG embedding job run failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG embedding 任务运行失败") from exc
+
+
+@app.post("/api/rag/embedding-jobs/{job_id}/cancel")
+async def rag_cancel_embedding_job(job_id: str):
+    try:
+        result = await run_in_threadpool(lambda: _get_rag_store().cancel_embedding_job(job_id))
+        return _rag_public_job(result)
+    except RagStoreError as exc:
+        raise HTTPException(status_code=404 if exc.code == "rag_job_not_found" else 422, detail=exc.code) from exc
+
+
+@app.delete("/api/rag/sources/{source_id}")
+async def rag_delete_source(source_id: str):
+    try:
+        deleted = await run_in_threadpool(lambda: _get_rag_store().delete_source(source_id))
+        if not deleted:
+            raise HTTPException(status_code=404, detail="RAG source not found")
+        return {"status": "deleted", "source_id": source_id, "storage": "sqlite"}
+    except HTTPException:
+        raise
+    except RagStoreError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG source deletion failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG source 删除失败") from exc
 
 
 @app.get("/api/presets")

@@ -2511,6 +2511,74 @@ input:focus, textarea:focus { border-color: var(--accent); }
   border-bottom: 1px solid var(--border);
 }
 
+.rag-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 920px;
+}
+
+.rag-panel-heading,
+.rag-panel-actions,
+.rag-search-form,
+.rag-result-meta,
+.rag-health-grid {
+  display: flex;
+  align-items: center;
+}
+
+.rag-panel-heading {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.rag-panel-heading h3 { margin: 2px 0 0; }
+.rag-panel-actions { gap: 8px; flex-wrap: wrap; }
+
+.rag-health-grid {
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.rag-search-form {
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+
+.rag-search-form input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.rag-results { display: grid; gap: 8px; }
+.rag-result {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+}
+
+.rag-result-meta { gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.rag-result-meta span, .rag-result p, .rag-empty { color: var(--text-secondary); }
+.rag-result p { margin: 6px 0 0; font-size: 13px; line-height: 1.5; }
+.rag-panel-error { color: var(--danger, #d84a4a); font-size: 12px; }
+.rag-empty { margin: 0; font-size: 13px; }
+
+@media (max-width: 640px) {
+  .rag-panel-heading { align-items: flex-start; flex-direction: column; }
+  .rag-panel-actions { width: 100%; }
+}
+
 .settings-workspace-tabs {
   position: sticky;
   top: -8px;
@@ -2556,6 +2624,7 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .settings-body[data-active-settings-workspace="cluster"] [data-settings-workspace~="cluster"],
 .settings-body[data-active-settings-workspace="appearance"] [data-settings-workspace~="appearance"],
 .settings-body[data-active-settings-workspace="logs"] [data-settings-workspace~="logs"],
+.settings-body[data-active-settings-workspace="rag"] [data-settings-workspace~="rag"],
 .settings-body[data-active-settings-workspace="about"] [data-settings-workspace~="about"] {
   display: block;
 }

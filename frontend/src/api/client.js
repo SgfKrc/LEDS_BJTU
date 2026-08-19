@@ -1103,6 +1103,54 @@ export async function updateUserSettings(settings) {
   });
 }
 
+// ---- 本地主节点 RAG ----
+
+export async function fetchRagHealth() {
+  return request('/rag/health');
+}
+
+export async function searchRag(query, options = {}) {
+  return request('/rag/search', {
+    method: 'POST',
+    body: JSON.stringify({ query, ...options }),
+  });
+}
+
+export async function rebuildRagIndex() {
+  return request('/rag/rebuild', {
+    method: 'POST',
+    body: JSON.stringify({ include_embeddings: false }),
+  });
+}
+
+export async function fetchRagCapacity(dimensions = 768) {
+  return request(`/rag/capacity?dimensions=${encodeURIComponent(dimensions)}`);
+}
+
+export async function createRagEmbeddingJob(payload) {
+  return request('/rag/embedding-jobs', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchRagEmbeddingJob(jobId) {
+  return request(`/rag/embedding-jobs/${encodeURIComponent(jobId)}`);
+}
+
+export async function runRagEmbeddingJob(jobId, payload = {}) {
+  return request(`/rag/embedding-jobs/${encodeURIComponent(jobId)}/run`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function cancelRagEmbeddingJob(jobId) {
+  return request(`/rag/embedding-jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+  });
+}
+
 // ---- 对话云同步状态 ----
 
 export async function fetchConversationSyncStatus() {
