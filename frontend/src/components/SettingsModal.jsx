@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import DevicePanel from './DevicePanel';
 import ModelFleetPanel from './ModelFleetPanel';
+import RagPanel from './RagPanel';
 import { TIER_PRESETS, TIER_LABELS } from '../App';
 import { updateDistributedInferenceConfig } from '../api/client';
 import { ImageUp, RotateCcw, UserRound } from 'lucide-react';
@@ -44,6 +45,7 @@ const SETTINGS_WORKSPACES = Object.freeze([
   { id: 'cluster', label: '集群' },
   { id: 'appearance', label: '外观' },
   { id: 'logs', label: '日志' },
+  { id: 'rag', label: '知识库' },
   { id: 'about', label: '关于' },
 ]);
 
@@ -605,6 +607,10 @@ export default function SettingsModal({
 
           <div className="settings-workspace-block" data-settings-workspace="models">
             <ModelFleetPanel onToast={onToast} onInventoryChange={setModelArtifacts} />
+          </div>
+
+          <div className="settings-workspace-block" data-settings-workspace="rag">
+            <RagPanel onToast={onToast} />
           </div>
 
           <section

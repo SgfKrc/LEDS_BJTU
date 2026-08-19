@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -102,6 +103,11 @@ class LlamaCppEngine:
         self._n_ctx: int = 4096      # 上下文窗口大小
         self._n_threads: int = 4     # CPU 线程数
         self._loaded: bool = False
+        # RAG embedding is opt-in. A normal text-generation load is never
+        # silently reused as an embedding model.
+        self._embedding_enabled: bool = False
+        self._embedding_dimension: int | None = None
+        self._embedding_model_id: str = ""
 
     # ================================================================
     # 模型加载
@@ -115,6 +121,9 @@ class LlamaCppEngine:
         chat_format: str = None,
         mmproj_path: str = None,
         mtmd_use_gpu: bool = False,
+        embedding: bool = False,
+        embedding_dimension: int | None = None,
+        embedding_model_id: str | None = None,
         **kwargs,
     ) -> None:
         """
@@ -128,6 +137,16 @@ class LlamaCppEngine:
             **kwargs: 传递给 llama_cpp.Llama 的额外参数
         """
         from config import MAX_SEQ_LEN
+
+        if not isinstance(embedding, bool):
+            raise ValueError("embedding must be a boolean")
+        if embedding:
+            if isinstance(embedding_dimension, bool) or not isinstance(embedding_dimension, int) or not 1 <= embedding_dimension <= 32_768:
+                raise ValueError("embedding_dimension must be declared for an embedding model")
+            if not isinstance(embedding_model_id, str) or not embedding_model_id.strip() or len(embedding_model_id) > 128:
+                raise ValueError("embedding_model_id must be declared for an embedding model")
+        elif embedding_dimension is not None or embedding_model_id is not None:
+            raise ValueError("embedding identity requires embedding=True")
 
         if self.is_loaded or self._mtmd_context is not None:
             self.unload()
@@ -165,6 +184,8 @@ class LlamaCppEngine:
                 n_threads=n_threads,
                 verbose=False,
             )
+            if embedding:
+                load_kwargs["embedding"] = True
 
             if chat_format:
                 load_kwargs["chat_format"] = chat_format
@@ -176,6 +197,9 @@ class LlamaCppEngine:
 
             self._model = Llama(**load_kwargs)
             self._loaded = True
+            self._embedding_enabled = embedding
+            self._embedding_dimension = embedding_dimension if embedding else None
+            self._embedding_model_id = embedding_model_id.strip() if embedding else ""
             if mmproj_path:
                 self.load_mmproj(mmproj_path, use_gpu=mtmd_use_gpu)
 
@@ -413,6 +437,9 @@ class LlamaCppEngine:
             except Exception:
                 logger.debug("GGUF model release failed", exc_info=True)
         self._loaded = False
+        self._embedding_enabled = False
+        self._embedding_dimension = None
+        self._embedding_model_id = ""
         logger.info("GGUF 模型已卸载")
 
     @property
@@ -515,6 +542,9 @@ class LlamaCppEngine:
             "vision": bool(self._mtmd_capabilities.get("vision")),
             "audio": bool(self._mtmd_capabilities.get("audio")),
             "mmproj_loaded": bool(self._mmproj_path),
+            "embedding": self._embedding_enabled and self.is_loaded,
+            "embedding_dimension": self._embedding_dimension if self._embedding_enabled else None,
+            "embedding_model_id": self._embedding_model_id if self._embedding_enabled else None,
         }
 
     @staticmethod
@@ -821,6 +851,41 @@ class LlamaCppEngine:
     # ================================================================
     # 对话补全（对齐 ModelManager 接口）
     # ================================================================
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Return native embeddings only for an explicitly declared model.
+
+        ``llama-cpp-python`` exposes embedding extraction for a loaded GGUF,
+        but enabling it for arbitrary chat models is a semantic error.  The
+        caller must have loaded this engine with ``embedding=True`` and a
+        declared identity/dimension.
+        """
+        if not self.is_loaded or not self._embedding_enabled or self._embedding_dimension is None:
+            raise RuntimeError("native embedding capability is not registered")
+        if not isinstance(texts, list) or not texts or any(not isinstance(text, str) or not text for text in texts):
+            raise ValueError("embedding input must be a non-empty list of text strings")
+        create_embedding = getattr(self._model, "create_embedding", None)
+        if not callable(create_embedding):
+            raise RuntimeError("native llama.cpp binding has no embedding API")
+
+        vectors: List[List[float]] = []
+        for text in texts:
+            try:
+                response = create_embedding(text)
+                data = response.get("data") if isinstance(response, dict) else None
+                vector = data[0].get("embedding") if isinstance(data, list) and data and isinstance(data[0], dict) else None
+            except Exception as exc:
+                raise RuntimeError("native embedding inference failed") from exc
+            if not isinstance(vector, list) or len(vector) != self._embedding_dimension:
+                raise RuntimeError("native embedding dimension mismatch")
+            try:
+                normalized = [float(value) for value in vector]
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("native embedding vector is invalid") from exc
+            if any(not math.isfinite(value) for value in normalized):
+                raise RuntimeError("native embedding vector is invalid")
+            vectors.append(normalized)
+        return vectors
 
     def chat(
         self,

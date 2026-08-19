@@ -1,6 +1,6 @@
 # 集群接入稳定性与本地 RAG 实施计划
 
-> 状态：部分实施（NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`CLUSTER-JOIN-S0`、`SYNC-SSH-S0/S1` 本机开发门已完成；真实 SSH、RAG、T-RACE-6 和 NW3.1 尚未实施，2026-08-19）
+> 状态：部分实施（NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`CLUSTER-JOIN-S0`、`SYNC-SSH-S0/S1/S2`、`RAG-S0/S1/S2/S3/S4/S5A/S5B/S5C` 代码与本地质量门已完成；T-RACE-6、NW3.1、容量/模型摘要变化和 ANN 仍待后续验收，2026-08-20）
 >
 > 更新日期：2026-08-19
 >
@@ -12,7 +12,7 @@
 2. **认证采用一次性入群授权**：目标节点本地生成公钥/密钥对；管理员在主节点用 Auth App/TOTP 批准；邮件只承担“是否批准”的通知和回复，不承担长期秘密传输。二维码或字符串只携带短期、单次、绑定目标公钥的签名授权票据。
 3. **分布式稳定性需要单独的时序门**：当前连接注册、重连、层配置 ACK、租约释放和节点状态投影均应以 `generation/attempt/config_id/lease_id` 形成可审计的状态机，不能靠日志文本或固定 sleep 判断成功。
 4. **SSH 同步应是补丁工具的可选传输层**：现有签名补丁帧、`pull/push` 和 7897 代理继续作为默认兜底；SSH 只负责受控的 `status/fetch/apply/verify`，不复制数据库/模型，不执行任意远程 shell，不自动重启服务。
-5. **本地 RAG 有必要，但先做 SQLite FTS5**：适合本地文档、模型卡、日志摘要、任务记录和用户手册；不索引权重张量，不把用户资料上传开发组。向量检索作为可选增强，Ollama embedding 或原生 llama embedding sidecar 必须与文本生成运行时隔离。
+5. **本地 RAG 有必要，但先做 SQLite FTS5**：适合本地文档、模型卡、日志摘要、任务记录和用户手册；不索引权重张量，不把用户资料上传开发组。向量检索作为可选增强，当前统一 provider 支持 Ollama 与显式原生 llama embedding；长时运行时的进程隔离与并发资源仲裁另列环境门。
 6. **竞态测试应前置到开发门**：新增确定性事件屏障、可控时钟、连接生命周期矩阵和 SQLite 崩溃恢复测试；真实双机只承担最后的环境门，不再承担发现全部时序缺陷的职责。
 
 ## 2. 手动加入集群与认证
@@ -50,7 +50,7 @@
 - `JoinGrantLedger` 使用用户主节点 SQLite `WAL + synchronous=FULL` 记录 nonce，`verify_and_consume_join_grant()` 在验证签名、目标公钥、请求摘要、authority、TTL 和角色后原子消费；重启、并发或重复兑换均返回稳定 `nonce_replayed`。
 - `tests/test_cluster_join.py` 覆盖 IPv6、Auth App 未批准、签名/目标/TTL/角色篡改、QR 畸形输入、重启/并发 nonce 重放和敏感字段不泄露，`.venv-test` `6 passed`。
 
-本票不接入 Web/TUI 页面、TCP 注册自动切换、Tailscale CLI、SMTP/IMAP 或真实双机；控制面负责 Auth App/TOTP 校验。`SYNC-SSH-S0/S1` 随后已完成，当前下一票为 `SYNC-SSH-S2` 环境部署与实测。
+本票不接入 Web/TUI 页面、TCP 注册自动切换、Tailscale CLI、SMTP/IMAP 或真实双机；控制面负责 Auth App/TOTP 校验。`SYNC-SSH-S0/S1/S2` 随后已完成，`RAG-S4`、`RAG-S5A`、`RAG-S5B` 和 `RAG-S5C` 代码/质量门均已完成；多源固定基准已达到质量线，当前转入容量、长时任务和 ANN 决策的后置验收。
 
 ### 2.3 角色与失败语义
 
@@ -134,7 +134,7 @@ SSH 约束：
 |---|---|---|---|
 | `SYNC-SSH-S0` | Completed（本机契约门） | 固定 helper、Ed25519 key/fingerprint、维护锁与失败码契约 | `11 passed`，不建立 SSH 连接 |
 | `SYNC-SSH-S1` | Completed（本机 fake loopback 门） | fake SSH helper/server、临时 Git 真实 fetch/reset、签名补丁帧、维护锁与断连/重放/脏工作区故障 | `9 passed`，不连接真实 SSH |
-| `SYNC-SSH-S2` | In progress（客户端完成，远端授权待配置） | 同 LAN/Tailscale 双机实测 | 一行提交到两端 `HEAD` 一致且不改用户数据 |
+| `SYNC-SSH-S2` | Completed（真实双机门） | 同 LAN/Tailscale 双机实测 | `status/fetch/apply/verify` 顺序通过，两端 `HEAD` 一致且未改用户数据 |
 | `SYNC-SSH-S3` | Optional | GUI/TUI 传输选择与 7897 代理诊断 | SSH、TCP、pull/push 三种路径可解释切换 |
 
 ### 4.3 `SYNC-SSH-S0` 实施结果
@@ -157,11 +157,13 @@ S2 的部署前置现已明确：从节点安装 helper，生成检出外配置�
 
 新增 `tools/ssh_sync_client.py`：它只能渲染 S0 固定 `qlh-patch-helper` argv，原子写入独立 `known_hosts`，禁用 password/keyboard-interactive/首次信任，且只接受一行、受 S0 schema 约束的 helper JSON。超时、无法启动 SSH、无有效 helper JSON 以及“非零退出却宣称成功”分别收敛为 `transport_unavailable` 或 `remote_helper_rejected`，不会把 SSH banner、路径或 stderr 透传。`tools/patch_dispatch.py --write-frame <external-json>` 同时可原子保存现有发布私钥生成的公开签名 frame，供受控 `apply` 使用，不会保存私钥。
 
-2026-08-19 首次探测曾因账号未授权而失败；随后从节点已完成 SSH 免密授权。重新执行严格 key-only 的固定 `qlh-patch-helper status` 后，`surface@100.100.52.106` 已通过认证，但远端返回 Windows “`qlh-patch-helper` 不是内部或外部命令”，即 helper/forced-command 尚未部署。登记的 Ed25519 host fingerprint 为 `SHA256:TKKb3kNjDJomz5Ko+0X2/Hymt+PrygSUdPZGM6ou3/g`，端口与身份层均正常；不得把该部署缺口误判为网络故障，也不得改用密码、遍历账户或普通 shell。
+2026-08-19 首次探测曾因账号未授权、随后因 helper 尚未部署而失败；部署器完成后，`surface@100.100.52.106` 的专用 key/forced-command/helper 已通过严格 key-only 通道验证。登记的 Ed25519 host fingerprint 为 `SHA256:TKKb3kNjDJomz5Ko+0X2/Hymt+PrygSUdPZGM6ou3/g`。真实 `status -> fetch -> apply -> verify` 已通过；README 换行脏变更仅在从节点确认后清理，未改动用户数据。不得把历史部署缺口误判为网络故障，也不得改用密码、遍历账户或普通 shell。
 
-从节点管理员需在**从节点本地控制台**完成一次性配置：建立独立受限 `qlh_sync` 账号，向其授权主节点 Ed25519 公钥并禁用 PTY、端口转发、agent/X11 转发；为该账号设置只调用 `tools/ssh_sync_helper.py --forced-command` 的 forced command wrapper。wrapper 固定设置 `QLH_SSH_SYNC_HELPER_CONFIG`，配置、ledger/state 和 release 验签公钥均置于 checkout 外；checkout 仅可访问受管 `dev` 工作树，不能同步 SQLite、模型、附件或密钥。专用账号必须获得该工作树的最小读写 ACL，不能直接复用会被锁死为 forced command 的日常 `surface` 远程账户。
+从节点管理员可使用 `tools/ssh_sync_deployment.py install --apply` 完成一次性配置。当前真机采用 `surface` 账户上的**独立专用 Ed25519 key**（不改动原有 `surface` 通用登录 key），该 key 通过 `restrict,command="...\qlh-patch-helper.cmd"` 绑定 `tools/ssh_sync_helper.py --forced-command`；后续有条件时可迁移为独立 `qlh_sync` 系统账号。wrapper 固定设置 `QLH_SSH_SYNC_HELPER_CONFIG`，配置、ledger/state 和 release 验签公钥均置于 checkout 外；checkout 仅可访问受管 `dev` 工作树，不能同步 SQLite、模型、附件或密钥。
 
 完成配置后，主节点在 checkout 外保存 S0 profile/managed known-hosts，依次运行 `ssh_sync_client.py` 的 `status`、`fetch --commit-sha <sha>`、`apply --frame <signed-frame.json> --operation-id <sha256>` 和 `verify --commit-sha <sha>`。验收 frame 由 `patch_dispatch.py --write-frame` 在 commit/push 成功后生成，operation ID 可取该 frame 文件的 SHA-256；只选择不涉及用户数据路径的代码提交。任一失败保留现有 `pull/push` 为默认兜底，不自动 reset、重启或清理从节点。
+
+2026-08-19 真机门已收口：`status`、`fetch`、`apply`、`verify` 按固定顺序通过。`apply` 首次按设计返回 `workspace_dirty`，原因是从节点 `models/README.md` 仅存在换行符脏变更；经从节点确认后只清理该已确认变更，重试成功，两端目标 `HEAD` 一致。未执行全量 reset/clean、未覆盖用户数据、未重启服务。
 
 在 S2 真机不可用期间，继续使用现有 `pull/push` 工具，不因 SSH 阻塞其他开发票。
 
@@ -180,7 +182,7 @@ S2 的部署前置现已明确：从节点安装 helper，生成检出外配置�
 ```text
 rag_sources(source_id, owner_scope, relative_ref, sha256, mime, title, status, created_at, updated_at)
 rag_documents(document_id, source_id, revision, text_digest, language, access_scope, status)
-rag_chunks(chunk_id, document_id, ordinal, text_digest, token_count, start_offset, end_offset, metadata_json)
+rag_chunks(chunk_id, document_id, ordinal, text_digest, token_count, start_offset, end_offset, text_content, metadata_json)
 rag_embeddings(chunk_id, provider, model_id, model_sha256, dimensions, dtype, vector_blob, created_at)
 rag_jobs(job_id, kind, state, cursor, error_code, created_at, updated_at)
 rag_query_events(event_id, query_digest, filters_json, result_ids_json, created_at)
@@ -191,21 +193,26 @@ rag_query_events(event_id, query_digest, filters_json, result_ids_json, created_
 - `owner_scope/access_scope` 是硬过滤条件；查询结果必须返回 source/chunk/revision 引用，支持删除、重建和过期 revision 清理。
 - 默认不索引密钥、恢复码、TOTP、邮件认证内容、私钥和原始附件；日志先脱敏再入库。提示词注入内容只能作为资料，不能改变系统权限或任务策略。
 
+`RAG-S4` 已将本地控制面接入 `/api/rag/health`、`/api/rag/sources`、`/api/rag/search`、`/api/rag/rebuild` 和 source 删除；设置页知识库工作区只展示受限引用摘要和计数，不返回 vector blob 或绝对模型路径。普通重建按钮只重建 FTS5，embedding 重建必须由后续受控任务执行。
+
 ### 5.3 Embedding provider
 
-Ollama 提供本地 `/api/embed` 适配器，可接受单条或批量输入，候选模型记录为 `embeddinggemma`、`qwen3-embedding`、`all-minilm`，具体准入以本机资源和模型许可为准。原生 llama 引擎只有在明确声明 embedding 能力、维度和模型身份时才可作为第二 provider；文本生成模型不能因为“使用 llama 引擎”就自动当作 embedding 模型。
+Ollama 提供本地 `/api/embed` 适配器，当前开发机部署基线为 `nomic-embed-text:latest`（`nomic-bert`、137M、F16、768 维；Ollama model ID 前缀 `0a109f422b47`）。索引绑定的模型摘要为本机 Modelfile 指向的 blob `sha256:970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6`；`latest` 标签变化时必须重新建立摘要和向量索引。原生 llama 引擎只有在明确声明 embedding 能力、维度和模型身份时才可作为第二 provider；文本生成模型不能因为“使用 llama 引擎”就自动当作 embedding 模型。`src/rag_embedding.py` 的路由必须由调用者明确选择 provider，不作隐式跨 provider fallback。
 
-Provider 运行在独立 worker/sidecar，具有超时、取消、模型摘要校验和 CPU-only fallback；embedding 不应改变主文本引擎的 Python/Transformers 版本锁。
+当前 provider 契约已经冻结批量、超时、不可达/拒绝、响应大小、有限值和维度校验，并且不改主文本引擎的 Python/Transformers 版本锁。实际 embedding 模型加载、长期独立 worker、取消及与聊天/生图的资源仲裁属于后续真实运行时门，不能由本机 fake provider 结果替代。
 
 ### 5.4 分期与门槛
 
 | 票 | 状态 | 内容 | 证据门 |
 |---|---|---|---|
-| `RAG-S0` | Planned | 数据边界、schema、删除/重建和隐私契约 | 迁移 fixture + threat review |
-| `RAG-S1` | Planned | SQLite WAL + FTS5、文档/日志/模型卡索引 | 断电/重复导入/删除重建一致 |
-| `RAG-S2` | Planned | Ollama `/api/embed` sidecar adapter | 无网络、provider 超时、维度不匹配均可恢复 |
-| `RAG-S3` | Candidate | `vec1` 或等价向量后端、FTS+向量混排 | 30 条标注查询的 top-k/引用率基线 |
-| `RAG-S4` | Candidate | Web/TUI 检索、引用、重建和容量治理 | 不越权、不泄露敏感字段、模型更换可重建 |
+| `RAG-S0` | Completed（本地主节点门） | 数据边界、schema、删除/重建基础和隐私契约 | `.venv-test` `11 passed` |
+| `RAG-S1` | Completed（本地主节点门） | SQLite WAL + FTS5、文档/日志/模型卡索引与访问范围硬过滤 | `.venv-test` `13 passed` |
+| `RAG-S2` | Completed（本地 provider 门） | 统一 Ollama `/api/embed` 与显式原生 llama.cpp embedding provider；批量、超时、拒绝、维度和有限值边界 | `.venv-test` `26 passed`；真实模型和长时 sidecar 后置 |
+| `RAG-S3` | Completed（本地有界向量门） | SQLite float32 向量存储、模型摘要/维度绑定、活动 revision cosine、FTS+向量混排和超预算 FTS fallback；不默认无界暴力扫描 | `.venv-test` `29 passed`；本机 nomic 768 维临时库 smoke 通过 |
+| `RAG-S4` | Completed（本地产品接线门） | API 与设置页知识库工作区：健康/来源/FTS 检索/引用摘要/FTS 重建/source 删除；不返回 vector blob 或绝对路径 | `.venv-test` `31 passed`，前端 Vite build 通过 |
+| `RAG-S5A` | Completed（可恢复任务与容量门） | `rag_jobs` 脱敏 chunk 快照、模型摘要/游标、分批事务提交、取消/恢复幂等、进程内互斥；API capacity/job 控制面 | `.venv-test` RAG 定向 `25 passed`；跨进程 lease 与真实 provider 长时验收后置 |
+| `RAG-S5B` | Completed（代码门与真实质量门） | `src/rag_quality.py` + `scripts/rag_quality_gate.py` 固定 30 条标注查询、top-k/引用率、查询脱敏；`rag_jobs` 跨进程 lease、可重试 provider 故障恢复与旧库迁移 | S5C 修复后同一五源真实 smoke：`hit@5=0.966667`、`citation_rate=1.0`、`MRR=0.609444`；引用完整，达到质量基线 |
+| `RAG-S5C` | Completed（本地质量门） | 重叠/边界感知 chunk、NFKC 查询规范化、中文二元词 FTS 回退、稳定 lexical/vector 混排与受限旧库索引回填 | 同一模型摘要/数据集 `hit@5>=0.8` 已满足；容量、模型摘要变化、长时任务及 ANN/`sqlite-vec` 仍后置验收 |
 
 ## 6. 竞态与时序测试计划
 
@@ -237,8 +244,8 @@ Provider 运行在独立 worker/sidecar，具有超时、取消、模型摘要�
 ## 7. 执行顺序
 
 1. `NW4.1` Transport v2 契约与故障矩阵（本地契约门已完成）→ `NW4.1-F1` fake transport（已完成）→ `T-RACE-0` 状态盘点（已完成）→ `T-RACE-2` TCP 生命周期矩阵（已完成）→ `T-RACE-3` 层配置与任务 lease 状态矩阵（已完成）→ `T-RACE-4` SQLite/补丁应用恢复矩阵（已完成）→ `T-RACE-5` 随机化压力/soak（已完成）→ `CLUSTER-JOIN-S0` 手动入群授权契约。
-2. 手动入群授权契约与角色状态机（`CLUSTER-JOIN-S0` 本地契约已完成）→ `SYNC-SSH-S0/S1`（已完成）→ `SYNC-SSH-S2` 环境部署与真实双机验收。
-3. `RAG-S0`/`RAG-S1` 本地主节点 SQLite FTS5，不等待外部 GPU 或公网证书。
+2. 手动入群授权契约与角色状态机（`CLUSTER-JOIN-S0` 本地契约已完成）→ `SYNC-SSH-S0/S1/S2`（已完成真实双机门）。
+3. `RAG-S0` → `RAG-S1` → `RAG-S2` → `RAG-S3` → `RAG-S4` → `RAG-S5A` → `RAG-S5B` → `RAG-S5C`（代码门与固定多源质量门均已完成）→ 容量/模型摘要变化/长时任务验收与 ANN 决策，本地主节点 SQLite 不等待外部 GPU 或公网证书。
 4. `NW3.1` 本地自签名 WSS loopback，仅用于协议测试，不宣称生产信任。
 5. 外部 SMTP、公开域名证书、双 CUDA、IPv4 打洞和真实双机作为后置环境门。
 
