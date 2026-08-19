@@ -91,6 +91,11 @@ def task_graph_api(monkeypatch):
     )
     monkeypatch.setattr(
         api_server._local_store,
+        "save_local_conversation_turn",
+        lambda *a, **k: True,
+    )
+    monkeypatch.setattr(
+        api_server._local_store,
         "increment_local_session_message_count",
         lambda *a, **k: None,
     )
@@ -1652,8 +1657,14 @@ def test_task_graph_persists_followups_with_assistant_metrics(
     saved = []
     monkeypatch.setattr(
         api_server._local_store,
-        "save_local_message",
-        lambda *args: saved.append(args),
+        "save_local_conversation_turn",
+        lambda session_id, user_message, assistant_message, metrics=None, **kwargs: (
+            saved.extend([
+                (session_id, "user", user_message, None),
+                (session_id, "assistant", assistant_message, metrics),
+            ])
+            or True
+        ),
     )
     req = api_server.ChatRequest(
         message="persist followups",

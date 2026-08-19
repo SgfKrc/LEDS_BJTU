@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import pytest
 import json
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -219,6 +220,72 @@ class TestLocalMessages:
         assert msgs[0]["metrics"]["engine"] == "llama_cpp"
         assert msgs[0]["metrics"]["tokens_per_second"] == 12.5
 
+    def test_conversation_turn_rolls_back_as_one_transaction(self, temp_store_dir):
+        """助手消息写入失败时，用户消息和计数都不能半提交。"""
+        from local_store import (
+            get_local_session,
+            initialize_local_store,
+            load_local_conversation,
+            save_local_conversation_turn,
+        )
+
+        path = initialize_local_store()
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_assistant_turn
+                BEFORE INSERT ON session_messages
+                WHEN NEW.role = 'assistant'
+                BEGIN
+                  SELECT RAISE(ABORT, 'simulated assistant write failure');
+                END;
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with pytest.raises(sqlite3.IntegrityError, match="simulated assistant"):
+            save_local_conversation_turn(
+                "atomic-turn", "question", "answer", operation_id="req-atomic",
+            )
+
+        assert get_local_session("atomic-turn") is None
+        assert load_local_conversation("atomic-turn") == []
+
+    def test_conversation_turn_replay_is_idempotent_after_reopen(
+            self, temp_store_dir, monkeypatch):
+        from local_store import (
+            get_local_session,
+            initialize_local_store,
+            load_local_conversation,
+            save_local_conversation_turn,
+        )
+        import local_store
+
+        assert save_local_conversation_turn(
+            "replay-turn", "question", "answer", {"engine": "test"},
+            operation_id="req-replay-1",
+        ) is True
+
+        # A restarted runtime must recover the same durable receipt and avoid
+        # creating a duplicate pair of conversation rows.
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        initialize_local_store()
+        assert save_local_conversation_turn(
+            "replay-turn", "question", "answer", {"engine": "test"},
+            operation_id="req-replay-1",
+        ) is False
+        assert len(load_local_conversation("replay-turn")) == 2
+        assert get_local_session("replay-turn")["message_count"] == 2
+
+        with pytest.raises(ValueError, match="conflicting conversation turn"):
+            save_local_conversation_turn(
+                "replay-turn", "question", "different answer",
+                operation_id="req-replay-1",
+            )
+
 
 class TestLocalStoreThreadSafety:
     """测试本地存储的线程安全性"""
@@ -338,6 +405,71 @@ class TestSqliteCompatibility:
 
         assert version == 0
         assert str(mode).lower() == "wal"
+
+    def test_wal_recovers_uncommitted_and_keeps_committed_child_writes(
+            self, temp_store_dir, monkeypatch):
+        """A killed writer cannot expose its uncommitted transaction after reopen."""
+        import local_store
+        from local_store import (
+            get_local_setting,
+            initialize_local_store,
+            local_store_health,
+            set_local_setting,
+        )
+
+        path = initialize_local_store()
+        set_local_setting("t-race4-crash", "before")
+        child_code = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+connection.execute('PRAGMA busy_timeout=5000')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute(
+    \"INSERT INTO cluster_settings(key, value, updated_at) VALUES ('t-race4-crash', ?, 'child') \"
+    \"ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at\",
+    (sys.argv[2],),
+)
+if sys.argv[3] == 'commit':
+    connection.execute('COMMIT')
+os._exit(0)
+"""
+
+        subprocess.run(
+            [sys.executable, "-c", child_code, path, '"uncommitted"', "abort"],
+            check=True,
+        )
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        initialize_local_store()
+        assert get_local_setting("t-race4-crash") == "before"
+        assert local_store_health()["status"] == "ok"
+
+        subprocess.run(
+            [sys.executable, "-c", child_code, path, '"committed"', "commit"],
+            check=True,
+        )
+        monkeypatch.setattr(local_store, "_initialized_paths", set())
+        initialize_local_store()
+        health = local_store_health()
+        assert get_local_setting("t-race4-crash") == "committed"
+        assert health["journal_mode"] == "wal"
+        assert health["synchronous"] == "full"
+
+    def test_session_count_is_message_count_and_delete_turn_is_atomic(
+            self, temp_store_dir):
+        from local_store import (
+            delete_local_message_range,
+            get_local_session,
+            save_local_conversation_turn,
+        )
+
+        save_local_conversation_turn("count-turn", "q1", "a1")
+        save_local_conversation_turn("count-turn", "q2", "a2")
+        assert get_local_session("count-turn")["message_count"] == 4
+        assert delete_local_message_range("count-turn", 0) == 2
+        assert get_local_session("count-turn")["message_count"] == 2
 
     def test_existing_control_schema_version_and_assets_are_preserved(self, temp_store_dir):
         from local_store import create_local_session, initialize_local_store

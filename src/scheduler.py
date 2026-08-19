@@ -9698,16 +9698,12 @@ class Scheduler:
                 if content:
                     try:
                         import local_store
-                        local_store.save_local_message(
+                        local_store.save_local_conversation_turn(
                             session_id=session_id or "default",
-                            role="user",
-                            content=prompt,
-                        )
-                        local_store.save_local_message(
-                            session_id=session_id or "default",
-                            role="assistant",
-                            content=content,
+                            user_message=prompt,
+                            assistant_message=content,
                             metrics=metrics,
+                            operation_id=f"pipeline:{task_id}",
                         )
                     except Exception:
                         pass
@@ -9975,6 +9971,9 @@ class Scheduler:
                 return
 
         node_id = self.get_effective_node_id()
+        ack_generation = (
+            data.get("generation", 0) if isinstance(data, dict) else 0
+        )
         if isinstance(data, dict) and data.get("release"):
             target_node_id = str(data.get("node_id", node_id))
             if target_node_id != node_id:
@@ -10011,7 +10010,7 @@ class Scheduler:
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": str(data.get("config_id", "")),
-                "generation": data.get("generation", 0),
+                "generation": ack_generation,
                 "status": "released",
                 "release": True,
                 "timestamp": time.time(),
@@ -10032,6 +10031,7 @@ class Scheduler:
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": str(data.get("config_id", "")) if isinstance(data, dict) else "",
+                "generation": ack_generation,
                 "status": "error",
                 "error": error,
             })
@@ -10048,12 +10048,14 @@ class Scheduler:
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": data.get("config_id", "") if isinstance(data, dict) else "",
+                "generation": ack_generation,
                 "status": "error",
                 "error": error,
             })
             return
 
         config_id = str(cfg.get("config_id", ""))
+        ack_generation = cfg.get("generation", ack_generation)
         target_node_id = str(cfg.get("node_id", node_id))
         start = cfg.get("start_layer", 0)
         end = cfg.get("end_layer", 24)
@@ -10078,6 +10080,7 @@ class Scheduler:
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": config_id,
+                "generation": ack_generation,
                 "status": "error",
                 "error": error,
             })
@@ -10292,6 +10295,7 @@ class Scheduler:
                 self._send_layer_config_ack({
                     "node_id": node_id,
                     "config_id": config_id,
+                    "generation": ack_generation,
                     "status": "prepared",
                     "phase": "prepare",
                     "plan_id": plan_id,
@@ -10391,6 +10395,7 @@ class Scheduler:
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": config_id,
+                "generation": ack_generation,
                 "status": "ready",
                 "phase": phase,
                 "plan_id": plan_id,
@@ -10417,6 +10422,7 @@ class Scheduler:
             self._send_layer_config_ack({
                 "node_id": node_id,
                 "config_id": config_id,
+                "generation": ack_generation,
                 "status": "error",
                 "layer_range": [start, end],
                 "model_sha256": "",
@@ -10473,6 +10479,27 @@ class Scheduler:
                     client_id, config_id, expected.get("config_id"),
                 )
                 return
+
+            # A versioned assignment is fenced by both config_id and
+            # generation. This rejects a delayed prepare/ready ACK after a
+            # reconnect or replacement assignment, while preserving the
+            # legacy path for expectations that never carried generation.
+            if not expected.get("release") and "generation" in expected:
+                try:
+                    expected_generation = int(expected.get("generation"))
+                    ack_generation = int(data.get("generation"))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "忽略缺少或无效 generation 的层配置 ACK: node=%s config=%s",
+                        client_id, config_id,
+                    )
+                    return
+                if ack_generation != expected_generation:
+                    logger.warning(
+                        "忽略过期层配置 ACK generation: node=%s config=%s ack=%s expected=%s",
+                        client_id, config_id, ack_generation, expected_generation,
+                    )
+                    return
 
             if expected.get("release"):
                 try:

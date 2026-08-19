@@ -523,6 +523,58 @@ class TestComputeLayerAssignment:
             "worker worker-drop disconnected during transaction",
         )]
 
+    def test_versioned_ready_ack_is_fenced_by_generation(self, sched):
+        """迟到的同 config ACK 不能跨 generation 激活容量计划。"""
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-generation",
+            "generation": 8,
+            "phase": "committing",
+            "plan": {
+                "admitted": True,
+                "plan_id": "plan-generation",
+                "total_layers": 2,
+                "assignments": [{
+                    "node_id": "worker", "start_layer": 0, "end_layer": 2,
+                    "layers_count": 2,
+                }],
+            },
+            "worker_ids": {"worker"},
+            "ready_nodes": set(),
+        }
+        sched._layer_config_expected["worker"] = {
+            "node_id": "worker",
+            "config_id": "cfg-generation",
+            "generation": 8,
+            "phase": "commit",
+            "plan_id": "plan-generation",
+            "start_layer": 0,
+            "end_layer": 2,
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+        }
+        stale = {
+            "node_id": "worker",
+            "config_id": "cfg-generation",
+            "generation": 7,
+            "status": "ready",
+            "phase": "commit",
+            "plan_id": "plan-generation",
+            "layer_range": [0, 2],
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+            "engine": "pytorch",
+        }
+        sched._handle_layer_config_ack("worker", {"data": stale})
+        assert sched._pipeline_load_transaction["phase"] == "committing"
+        assert sched._layer_config_pushed == set()
+        assert "worker" not in sched._layer_config_acks
+
+        sched._handle_layer_config_ack(
+            "worker", {"data": {**stale, "generation": 8}},
+        )
+        assert sched._pipeline_load_transaction["phase"] == "ready"
+        assert sched._layer_config_pushed == {"worker"}
+
     def test_capacity_commit_is_not_hidden_by_cached_prepare_ack(
             self, sched, monkeypatch):
         started = []
@@ -1418,6 +1470,7 @@ class TestPipelineReadiness:
             "data": {
                 "node_id": "client1",
                 "config_id": payload["config_id"],
+                "generation": payload["generation"],
                 "status": "ready",
                 "layer_range": [8, 24],
                 "model_sha256": "sha-qwen",
@@ -1807,6 +1860,7 @@ class TestPipelineMessageDispatch:
         sched._handle_layer_config("master", {
             "node_id": "worker",
             "config_id": "cfg-prepare",
+            "generation": 11,
             "phase": "prepare",
             "plan_id": "plan-prepare",
             "start_layer": 0,
@@ -1823,6 +1877,7 @@ class TestPipelineMessageDispatch:
         assert [call[0] for call in calls] == ["prepare"]
         assert sent[-1]["status"] == "prepared"
         assert sent[-1]["plan_id"] == "plan-prepare"
+        assert sent[-1]["generation"] == 11
         assert sched._active_layer_config is None
         assert sched._prepared_layer_configs["cfg-prepare"]["layer_range"] == [0, 2]
 

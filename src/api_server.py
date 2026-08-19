@@ -1729,11 +1729,14 @@ def _persist_conversation_turn(
     try:
         if not _local_store.get_local_save_history():
             return False
-        _local_store.save_local_message(session_id, "user", user_message)
-        _local_store.save_local_message(
-            session_id, "assistant", assistant_message, metrics,
+        request_id = _request_id_ctx.get("")
+        _local_store.save_local_conversation_turn(
+            session_id,
+            user_message,
+            assistant_message,
+            metrics,
+            operation_id=request_id if request_id and request_id != "-" else None,
         )
-        _local_store.increment_local_session_message_count(session_id)
     except Exception as exc:
         logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
         return False
@@ -8843,7 +8846,6 @@ def delete_turn(session_id: str, turn_index: int):
 
     try:
         deleted_count = _local_store.delete_local_message_range(session_id, turn_index)
-        _local_store.decrement_local_session_message_count(session_id, 2)
     except Exception as e:
         logger.error(f"SQLite 删除消息失败: {e}")
         raise HTTPException(503, f"本地会话存储不可用: {e}")
