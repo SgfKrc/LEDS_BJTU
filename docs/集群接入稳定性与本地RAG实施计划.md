@@ -1,6 +1,6 @@
 # 集群接入稳定性与本地 RAG 实施计划
 
-> 状态：规划中（仅文档与调研，2026-08-19）
+> 状态：部分实施（NW4.1 本地契约门、T-RACE-0 至 T-RACE-5 本机开发门已完成；手动入群、SSH、RAG、T-RACE-6 和 NW3.1 尚未实施，2026-08-19）
 >
 > 更新日期：2026-08-19
 >
@@ -64,7 +64,28 @@
 | 节点投影 | 拓扑变更与任务记账分开 | 避免把普通任务 accounting 打成“节点变更: update master”而误导排障 |
 | SQLite 控制面 | 事务边界 + WAL checkpoint 策略 | 入群、身份切换、节点租约和审计事件不能出现半提交状态 |
 
-### 3.2 可用性策略
+### 3.2 `T-RACE-0` 审计结论（2026-08-19）
+
+| 子系统 | 已确认的实现边界 | 本轮结论 | 后续证明票 |
+|---|---|---|---|
+| TCP 客户端连接/注册 | `_connect_lock` 串行化 `connect()`；`_connection_generation`、`_registration_epoch` 和幂等断连回调区分会话；发送锁保证单 socket 上的字节帧不交叉。 | 发现并修复一个真实竞态：旧代际接收线程若延迟启动，会在重连后读取新的 `self.sock`，并把新连接关闭，表现为注册后立即断连或 `WinError 10038`。线程现改为在注册成功时绑定 socket 实例和 generation。 | `T-RACE-2`：并发注册、旧 socket 迟到、发送/关闭交错与 ACK barrier。 |
+| 注册确认与节点投影 | 注册确认、节点列表推送和层配置推送共用 TCP 接收顺序；服务端维护注册 epoch，调度器在断线时清除该节点的层配置状态。 | 不可把“收到任意首帧”当成注册完成；注册确认必须先于业务推送，客户端也应只在已注册会话上处理业务帧。现有真机曾出现首帧为 `layer_config` 的历史症状，需以确定性 fixture 覆盖其排序和拒绝语义。 | `T-RACE-2`：REGISTER/ACK/业务帧乱序矩阵。 |
+| 分层配置事务 | `config_id`、接收 sequence、generation、prepare/commit/ready/release phase 和节点断线中止均已存在；ACK 校验预期分配和当前事务阶段。 | T-RACE-3 已用屏障覆盖 reserve/prepare/commit/ready/release、迟到/错误 generation ACK、断线中止和释放重入；T-RACE-5 再以 144 个固定 seed 注入代际切换、乱序、重复、篡改和 deadline，未出现未分类终态。 | 下一步进入 `CLUSTER-JOIN-S0`；真实双机仍后置。 |
+| 工作流任务 lease | `workflow_id`、`stage_id`、`attempt_id`、`lease_id`、`lease_epoch` 与 provider identity 已进入 worker 协议；结果/取消按 attempt 身份校验。 | T-RACE-3 已覆盖同 epoch 结果竞态单 winner、取消/租约到期后的迟到结果拒绝和 reservation 清理；T-RACE-5 每个 seed 追加同 epoch 并发提交，始终只有一个 winner 且 reservation 清零。 | 下一步进入 `CLUSTER-JOIN-S0`；真实双机仍后置。 |
+| 主节点 SQLite | `local_store` 使用 WAL + `synchronous=FULL`，写路径持有进程内锁并以 `BEGIN IMMEDIATE`、commit/rollback 包围；健康检查执行 quick-check 和可回滚写探针。 | T-RACE-4 新增整轮对话与消息计数原子提交、operation_id 收据去重，并用子进程未提交/已提交退出验证 WAL 重开；T-RACE-5 三轮并发写/读 soak 覆盖每个 operation_id 多次重放，计数、WAL 和健康检查均一致。 | 下一步进入 `CLUSTER-JOIN-S0`；真实断电/双机仍后置。 |
+| 补丁分发 | 既有签名、来源/工作区检查和受控 pull/push 是当前默认路径；SSH 仍是规划中的可选传输层。 | T-RACE-4 新增签名 SHA 前置可达性校验、精确 SHA reset、工作区外原子 patch journal、同目标重放和新目标 fencing；启动探针只读判定，不自动覆盖工作区。 | `SYNC-SSH-S0/S1`；真实双机应用和升级恢复仍后置。 |
+
+本票不接线 Transport v2，也不改动默认 Legacy TCP 路由。修复的 socket 生命周期回归与现有 TCP、Transport v2、网络路径专项在 `.venv-test` 通过 `146 passed`；这只证明本机确定性行为，不替代从节点长连接验收。
+
+`T-RACE-2` 在同一确定性矩阵中补齐了 REGISTER ACK 后边沿：调度器主动确认和 TCPServer 默认确认均只触发一次 `on_registration_confirmed`；服务端只在 ACK 写入成功后推送节点列表/层配置。旧绑定 socket 写入会被 `ConnectionError` 拦截，关闭交错的底层 `OSError` 保留为异常原因链。TCP/Transport/网络路径专项当前为 `149 passed`；仍不替代真实从节点验收。
+
+`T-RACE-3` 收口了层配置与任务 lease 的本机状态矩阵：版本化层配置 ACK 必须同时匹配 `config_id` 与 `generation`，worker ACK 会回显 generation；覆盖 prepare/commit/ready/release、断线中止、释放重入和旧 ACK 拒绝。任务图新增同 epoch 结果并发提交门，只有一个 winner 能提交，取消/租约到期后的迟到结果被记录并拒绝，活动 reservation 最终清零。`.venv-test` 调度/任务专项 `343 passed`；未使用从节点或真实网络，后续转入 T-RACE-4 持久化恢复矩阵。
+
+`T-RACE-4` 收口本机持久化恢复：主节点 SQLite 每条连接显式使用 `WAL + synchronous=FULL`，完整对话轮次、消息计数和 operation receipt 在同一事务中提交，整轮删除也原子更新计数；子进程在未提交/已提交断点退出后，重开库分别回滚/保留正确状态，重复 operation_id 返回幂等成功而不重复写入。补丁监听器新增工作区外原子 journal，签名目标必须是 fetch 后远端分支的可达 commit，应用时精确 reset 到签名 SHA；半应用只能重放同一签名目标，新目标被拒绝，启动探针不做自动修改。SQLite、任务 journal、补丁、Scheduler 和 API 联合定向回归 `588 passed`。
+
+`T-RACE-5` 收口本机随机压力/soak：新增 `tests/test_t_race5_soak.py`，三轮固定 seed（每轮 48 个，共 144 个）分别覆盖 FakeTransportLink 的显式投递/丢弃/重复/重排/篡改/deadline/代际切换、SQLite WAL 并发写读与 operation_id 幂等重放、任务图同 epoch 并发 winner。`.venv-test` 三轮 `3 passed`，xdist 用时 `43.26s`；失败时会保存 `qlh.t-race-5.failure.v1` 的 seed、操作序列和状态快照。该门仍不替代真实从节点、断网和升级恢复验收。下一票为 `CLUSTER-JOIN-S0`。
+
+### 3.3 可用性策略
 
 - `distributed_required`：任一必需从节点不可用即 fail-closed，不能静默回退到主节点单机。
 - `distributed_preferred`：允许有原因、有时限的本地回退，UI 必须显示 `fallback_reason` 和实际参与节点。
@@ -154,12 +175,12 @@ Provider 运行在独立 worker/sidecar，具有超时、取消、模型摘要�
 
 | 票 | 状态 | 内容 |
 |---|---|---|
-| `T-RACE-0` | Planned | 盘点连接、注册、ACK、层配置、租约、SQLite、补丁同步状态转移 |
-| `T-RACE-1` | Planned | 可控时钟、事件屏障、随机延迟注入；新测试禁止固定 sleep 作为完成判定 |
-| `T-RACE-2` | Planned | 同时注册、旧 socket 迟到心跳、发送中断、重复连接、ACK barrier 矩阵 |
-| `T-RACE-3` | Planned | 层 reserve/prepare/ACK/release、任务 epoch/winner/取消/lease expiry |
-| `T-RACE-4` | Planned | SQLite WAL 提交中断、进程 kill、重启恢复、幂等重放 |
-| `T-RACE-5` | Planned | 3 次以上随机化压力/soak，记录失败序列和最小复现种子 |
+| `T-RACE-0` | Completed（本机审计） | 盘点连接、注册、ACK、层配置、租约、SQLite、补丁同步状态转移；修复旧接收线程迟启动时误关闭新 socket 的 generation/socket 绑定竞态 |
+| `T-RACE-1` | Completed（测试基础） | `DeterministicClock`、`EventBarrier` 和 fake link 的无 sleep 时序骨架；随机延迟注入与业务状态矩阵仍后续 |
+| `T-RACE-2` | Completed（本机确定性矩阵） | 并发注册、REGISTER/ACK/业务帧排序、旧 socket 迟到、发送/关闭交错、重复连接和 ACK barrier；修复 ACK 后推送边沿缺失 |
+| `T-RACE-3` | Completed（本机确定性矩阵） | 层 reserve/prepare/ACK/release、generation 围栏、任务 epoch/winner/取消/lease expiry；`.venv-test` 调度/任务专项 `343 passed` |
+| `T-RACE-4` | Completed（本机故障矩阵） | SQLite WAL 提交中断/进程退出/重启恢复/operation_id 幂等重放、消息计数原子维护；签名补丁目标校验、半应用 journal、同目标重放和新目标 fencing；相关专项 `588 passed` |
+| `T-RACE-5` | Completed（本机随机压力门） | 三轮固定 seed、每轮 48 个，共 144 个；Transport/SQLite/任务图随机故障与同 epoch winner；`.venv-test` `3 passed / 43.26s`，失败证据保存 seed、操作序列和状态快照 |
 | `T-RACE-6` | Blocked by environment | 两台真实设备长连接、断网、升级和恢复联合验收 |
 
 ### 6.2 最小场景矩阵
@@ -177,7 +198,7 @@ Provider 运行在独立 worker/sidecar，具有超时、取消、模型摘要�
 
 ## 7. 执行顺序
 
-1. `NW4.1` Transport v2 契约与故障矩阵（文档）→ `T-RACE-0/1`。
+1. `NW4.1` Transport v2 契约与故障矩阵（本地契约门已完成）→ `NW4.1-F1` fake transport（已完成）→ `T-RACE-0` 状态盘点（已完成）→ `T-RACE-2` TCP 生命周期矩阵（已完成）→ `T-RACE-3` 层配置与任务 lease 状态矩阵（已完成）→ `T-RACE-4` SQLite/补丁应用恢复矩阵（已完成）→ `T-RACE-5` 随机化压力/soak（已完成）→ `CLUSTER-JOIN-S0` 手动入群授权契约。
 2. 手动入群授权契约与角色状态机（文档）→ `SYNC-SSH-S0`。
 3. `RAG-S0`/`RAG-S1` 本地主节点 SQLite FTS5，不等待外部 GPU 或公网证书。
 4. `NW3.1` 本地自签名 WSS loopback，仅用于协议测试，不宣称生产信任。
