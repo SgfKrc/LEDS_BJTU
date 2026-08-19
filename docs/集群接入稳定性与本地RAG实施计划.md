@@ -134,7 +134,7 @@ SSH 约束：
 |---|---|---|---|
 | `SYNC-SSH-S0` | Completed（本机契约门） | 固定 helper、Ed25519 key/fingerprint、维护锁与失败码契约 | `11 passed`，不建立 SSH 连接 |
 | `SYNC-SSH-S1` | Completed（本机 fake loopback 门） | fake SSH helper/server、临时 Git 真实 fetch/reset、签名补丁帧、维护锁与断连/重放/脏工作区故障 | `9 passed`，不连接真实 SSH |
-| `SYNC-SSH-S2` | Ready after SSH deployment | 同 LAN/Tailscale 双机实测 | 一行提交到两端 `HEAD` 一致且不改用户数据 |
+| `SYNC-SSH-S2` | In progress（客户端完成，远端授权待配置） | 同 LAN/Tailscale 双机实测 | 一行提交到两端 `HEAD` 一致且不改用户数据 |
 | `SYNC-SSH-S3` | Optional | GUI/TUI 传输选择与 7897 代理诊断 | SSH、TCP、pull/push 三种路径可解释切换 |
 
 ### 4.3 `SYNC-SSH-S0` 实施结果
@@ -151,7 +151,17 @@ SSH 约束：
 
 S1 的 `HelperLedger` 在受管检出外原子持久化成功收据，并将 operation ID 绑定至同一目标 commit。若 reset 已完成但 ACK 因连接中断丢失，重放同一 operation ID 直接返回收据、不再 reset；请求前断连、应用中断、已有维护锁、篡改帧、不匹配 `origin`、错误复用 operation ID 和不受管目录均 fail-closed。`tests/test_ssh_sync_helper.py` 以临时 bare remote、seed/worker 两份真实 Git checkout 验证上述路径，专项 `.venv-test` `9 passed`；连同 S0 与既有补丁工具回归为 `48 passed`。没有连接当前从节点 SSH，也没有修改任何真实 checkout。
 
-S2 的部署前置现已明确：从节点安装 helper，生成检出外配置（repo/state/verify-key），用专用受限账号以 forced command 暴露 helper，登记 host Ed25519 public key/fingerprint 和主节点专用 client key；然后先执行 `status/fetch/verify`，最后才以一个已签名、无用户数据路径的代码 commit 做 apply/HEAD 一致性验证。
+S2 的部署前置现已明确：从节点安装 helper，生成检出外配置（repo/state/verify-key），用专用受限账号以 forced command 暴露 helper，登记 host Ed25519 public key/fingerprint 和主节点专用 client key；验收顺序必须是 `status -> fetch(target)`（只证明可达）-> `apply(signed frame)` -> `verify(target)`，因为 fetch 不改变 HEAD。
+
+### 4.5 `SYNC-SSH-S2` 当前实施与现场门
+
+新增 `tools/ssh_sync_client.py`：它只能渲染 S0 固定 `qlh-patch-helper` argv，原子写入独立 `known_hosts`，禁用 password/keyboard-interactive/首次信任，且只接受一行、受 S0 schema 约束的 helper JSON。超时、无法启动 SSH、无有效 helper JSON 以及“非零退出却宣称成功”分别收敛为 `transport_unavailable` 或 `remote_helper_rejected`，不会把 SSH banner、路径或 stderr 透传。`tools/patch_dispatch.py --write-frame <external-json>` 同时可原子保存现有发布私钥生成的公开签名 frame，供受控 `apply` 使用，不会保存私钥。
+
+2026-08-19 首次探测曾因账号未授权而失败；随后从节点已完成 SSH 免密授权。重新执行严格 key-only 的固定 `qlh-patch-helper status` 后，`surface@100.100.52.106` 已通过认证，但远端返回 Windows “`qlh-patch-helper` 不是内部或外部命令”，即 helper/forced-command 尚未部署。登记的 Ed25519 host fingerprint 为 `SHA256:TKKb3kNjDJomz5Ko+0X2/Hymt+PrygSUdPZGM6ou3/g`，端口与身份层均正常；不得把该部署缺口误判为网络故障，也不得改用密码、遍历账户或普通 shell。
+
+从节点管理员需在**从节点本地控制台**完成一次性配置：建立独立受限 `qlh_sync` 账号，向其授权主节点 Ed25519 公钥并禁用 PTY、端口转发、agent/X11 转发；为该账号设置只调用 `tools/ssh_sync_helper.py --forced-command` 的 forced command wrapper。wrapper 固定设置 `QLH_SSH_SYNC_HELPER_CONFIG`，配置、ledger/state 和 release 验签公钥均置于 checkout 外；checkout 仅可访问受管 `dev` 工作树，不能同步 SQLite、模型、附件或密钥。专用账号必须获得该工作树的最小读写 ACL，不能直接复用会被锁死为 forced command 的日常 `surface` 远程账户。
+
+完成配置后，主节点在 checkout 外保存 S0 profile/managed known-hosts，依次运行 `ssh_sync_client.py` 的 `status`、`fetch --commit-sha <sha>`、`apply --frame <signed-frame.json> --operation-id <sha256>` 和 `verify --commit-sha <sha>`。验收 frame 由 `patch_dispatch.py --write-frame` 在 commit/push 成功后生成，operation ID 可取该 frame 文件的 SHA-256；只选择不涉及用户数据路径的代码提交。任一失败保留现有 `pull/push` 为默认兜底，不自动 reset、重启或清理从节点。
 
 在 S2 真机不可用期间，继续使用现有 `pull/push` 工具，不因 SSH 阻塞其他开发票。
 
