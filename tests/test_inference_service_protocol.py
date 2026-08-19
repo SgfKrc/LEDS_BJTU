@@ -45,10 +45,17 @@ def isolated_engine_local_store(monkeypatch):
             **({"metrics": metrics} if metrics is not None else {}),
         })
 
+    def save_turn(session_id, user_message, assistant_message, metrics=None,
+                  *, operation_id=None):
+        save_message(session_id, "user", user_message)
+        save_message(session_id, "assistant", assistant_message, metrics)
+        return True
+
     fake_store = SimpleNamespace(
         initialize_local_store=lambda: "memory://protocol-test",
         get_local_save_history=lambda: False,
         save_local_message=save_message,
+        save_local_conversation_turn=save_turn,
         increment_local_session_message_count=lambda _sid: None,
         load_local_conversation=lambda sid: list(messages.get(sid, [])),
         update_local_session_title=lambda sid, title: titles.__setitem__(sid, title),
@@ -1642,23 +1649,17 @@ def test_engine_host_persists_locally_without_legacy_export(monkeypatch):
     events = []
     fake_local_store = SimpleNamespace(
         get_local_save_history=lambda: True,
-        save_local_message=lambda sid, role, content, metrics=None: events.append(
-            ("local", sid, role, content)
-        ),
-        increment_local_session_message_count=lambda sid: events.append(
-            ("local", sid, "increment", None)
+        save_local_conversation_turn=(
+            lambda sid, user, assistant, metrics=None, *, operation_id=None:
+            events.append(("local", sid, user, assistant, metrics, operation_id))
+            or True
         ),
     )
     monkeypatch.setattr(engine_host_module, "_local_store", fake_local_store)
 
     host = EngineHost()
     assert host._persist_conversation_turn("s-local", "q", "a", {}) is True
-    assert events[:3] == [
-        ("local", "s-local", "user", "q"),
-        ("local", "s-local", "assistant", "a"),
-        ("local", "s-local", "increment", None),
-    ]
-    assert len(events) == 3
+    assert events == [("local", "s-local", "q", "a", {}, None)]
 
 
 def test_build_app_master_role(monkeypatch, tmp_path):

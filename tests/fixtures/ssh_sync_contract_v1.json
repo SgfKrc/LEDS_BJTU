@@ -1,0 +1,33 @@
+{
+  "profile_schema": "qlh.sync_ssh.profile.v1",
+  "helper_schema": "qlh.sync_ssh.helper.v1",
+  "helper_result_schema": "qlh.sync_ssh.helper-result.v1",
+  "helper_ledger_schema": "qlh.sync_ssh.helper-ledger.v1",
+  "maintenance_lock_schema": "qlh.sync_ssh.maintenance-lock.v1",
+  "remote_helper": "qlh-patch-helper",
+  "actions": ["apply", "fetch", "status", "verify"],
+  "failure_matrix": {
+    "host_invalid": {"retryable": false, "next_action": "fix_profile"},
+    "host_key_invalid": {"retryable": false, "next_action": "reenroll_host_key"},
+    "host_fingerprint_mismatch": {"retryable": false, "next_action": "reenroll_host_key"},
+    "identity_key_invalid": {"retryable": false, "next_action": "fix_identity"},
+    "password_auth_forbidden": {"retryable": false, "next_action": "fix_profile"},
+    "helper_action_invalid": {"retryable": false, "next_action": "reject_request"},
+    "helper_payload_too_large": {"retryable": false, "next_action": "reject_request"},
+    "maintenance_lock_held": {"retryable": true, "next_action": "retry_later"},
+    "repository_unmanaged": {"retryable": false, "next_action": "manual_review"},
+    "workspace_dirty": {"retryable": false, "next_action": "manual_review"},
+    "patch_signature_invalid": {"retryable": false, "next_action": "reject_request"},
+    "remote_helper_rejected": {"retryable": false, "next_action": "manual_review"},
+    "transport_unavailable": {"retryable": true, "next_action": "fallback_pull_push"}
+  },
+  "prohibited": [
+    "password_authentication",
+    "accept_new_host_keys",
+    "arbitrary_remote_shell",
+    "sqlite_transfer",
+    "model_weight_transfer",
+    "attachment_transfer",
+    "automatic_restart"
+  ]
+}

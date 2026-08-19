@@ -9,6 +9,7 @@ imported once and retained as user-owned recovery material.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ _lock = threading.RLock()
 _init_lock = threading.Lock()
 _initialized_paths: set[str] = set()
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _LEGACY_MIGRATION_KEY = "legacy_chat_history_json_v1"
 _MASTER_IDENTITY_KEY = "master_identity_v1"
 
@@ -77,6 +79,10 @@ def _connect_raw(path: str) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
+    # Control-plane writes are user-owned durable state.  Every connection
+    # explicitly requests FULL synchronization rather than relying on the
+    # SQLite build default for WAL mode.
+    connection.execute("PRAGMA synchronous=FULL")
     return connection
 
 
@@ -96,6 +102,15 @@ def _valid_session_id(value: object) -> str | None:
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return None
     return session_id
+
+
+def _valid_operation_id(value: object) -> str | None:
+    operation_id = str(value or "").strip()
+    if not operation_id:
+        return None
+    if not _SAFE_OPERATION_ID.fullmatch(operation_id):
+        raise ValueError("operation_id is invalid")
+    return operation_id
 
 
 def _nonnegative_int(value: object, default: int = 0) -> int:
@@ -222,7 +237,9 @@ def initialize_local_store() -> str:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         connection = _connect_raw(path)
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
+            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+            if mode is None or str(mode[0]).lower() != "wal":
+                raise RuntimeError("本地 SQLite 需要 WAL 模式")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS cluster_settings (
@@ -273,6 +290,14 @@ def initialize_local_store() -> str:
                   value TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS python_conversation_turn_receipts (
+                  operation_id TEXT PRIMARY KEY,
+                  session_id TEXT NOT NULL,
+                  turn_sha256 TEXT NOT NULL,
+                  committed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_python_turn_receipts_session
+                  ON python_conversation_turn_receipts(session_id, committed_at DESC);
                 """
             )
             try:
@@ -362,7 +387,14 @@ def get_all_local_sessions(limit: int = 50, offset: int = 0) -> list[dict]:
     try:
         rows = connection.execute(
             """
-            SELECT session_id, title, created_at, updated_at, message_count
+            SELECT
+              sessions.session_id, sessions.title, sessions.created_at,
+              sessions.updated_at,
+              MAX(
+                sessions.message_count,
+                (SELECT COUNT(*) FROM session_messages
+                 WHERE session_messages.session_id = sessions.session_id)
+              ) AS message_count
             FROM sessions ORDER BY updated_at DESC, session_id LIMIT ? OFFSET ?
             """,
             (max(0, int(limit)), max(0, int(offset))),
@@ -386,7 +418,14 @@ def get_local_session(session_id: str) -> Optional[dict]:
     try:
         row = connection.execute(
             """
-            SELECT session_id, title, created_at, updated_at, message_count
+            SELECT
+              sessions.session_id, sessions.title, sessions.created_at,
+              sessions.updated_at,
+              MAX(
+                sessions.message_count,
+                (SELECT COUNT(*) FROM session_messages
+                 WHERE session_messages.session_id = sessions.session_id)
+              ) AS message_count
             FROM sessions WHERE session_id = ?
             """,
             (session_id,),
@@ -470,6 +509,106 @@ def save_local_message(
         )
 
 
+def save_local_conversation_turn(
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    metrics: dict | None = None,
+    *,
+    operation_id: str | None = None,
+) -> bool:
+    """Atomically persist one completed turn and optionally deduplicate a replay.
+
+    A successful turn is one user message, one assistant message, and one
+    session-turn count update.  Keeping them in a single transaction prevents
+    a crash from exposing a half-written conversation.  ``operation_id`` is
+    an opaque request/task identity; replaying it with identical content is a
+    no-op, while reusing it for different content fails closed.
+    """
+    session_id = _valid_session_id(session_id) or ""
+    if not session_id:
+        raise ValueError("session_id is invalid")
+    normalized_operation_id = _valid_operation_id(operation_id)
+    if metrics is not None and not isinstance(metrics, dict):
+        raise ValueError("metrics must be an object")
+    metrics_json = (
+        json.dumps(metrics, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if metrics is not None else None
+    )
+    turn_payload = json.dumps(
+        {
+            "session_id": session_id,
+            "user_message": str(user_message),
+            "assistant_message": str(assistant_message),
+            "metrics": metrics,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    turn_sha256 = hashlib.sha256(turn_payload.encode("utf-8")).hexdigest()
+    now = _now()
+
+    with _write_connection() as connection:
+        if normalized_operation_id:
+            receipt = connection.execute(
+                """
+                SELECT session_id, turn_sha256
+                FROM python_conversation_turn_receipts
+                WHERE operation_id = ?
+                """,
+                (normalized_operation_id,),
+            ).fetchone()
+            if receipt is not None:
+                if (
+                    receipt["session_id"] != session_id
+                    or receipt["turn_sha256"] != turn_sha256
+                ):
+                    raise ValueError("operation_id has conflicting conversation turn")
+                return False
+
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO sessions
+              (session_id, title, created_at, updated_at, message_count)
+            VALUES (?, '新对话', ?, ?, 0)
+            """,
+            (session_id, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO session_messages(session_id, role, content, created_at, metrics)
+            VALUES (?, 'user', ?, ?, NULL)
+            """,
+            (session_id, str(user_message), now),
+        )
+        connection.execute(
+            """
+            INSERT INTO session_messages(session_id, role, content, created_at, metrics)
+            VALUES (?, 'assistant', ?, ?, ?)
+            """,
+            (session_id, str(assistant_message), now, metrics_json),
+        )
+        connection.execute(
+            """
+            UPDATE sessions SET
+              message_count = message_count + 2, updated_at = ?
+            WHERE session_id = ?
+            """,
+            (now, session_id),
+        )
+        if normalized_operation_id:
+            connection.execute(
+                """
+                INSERT INTO python_conversation_turn_receipts(
+                  operation_id, session_id, turn_sha256, committed_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (normalized_operation_id, session_id, turn_sha256, now),
+            )
+    return True
+
+
 def load_local_conversation(session_id: str, limit: int = 200) -> list[dict]:
     connection = _connect()
     try:
@@ -545,6 +684,14 @@ def delete_local_message_range(session_id: str, turn_index: int) -> int:
         connection.execute(
             "DELETE FROM session_messages WHERE message_id IN (?, ?)",
             (ids[0], ids[1]),
+        )
+        connection.execute(
+            """
+            UPDATE sessions SET
+              message_count = MAX(0, message_count - 2), updated_at = ?
+            WHERE session_id = ?
+            """,
+            (_now(), session_id),
         )
         return 2
 
@@ -818,6 +965,8 @@ def local_store_health() -> dict:
     connection = _connect_raw(path)
     try:
         quick = connection.execute("PRAGMA quick_check").fetchone()
+        mode = connection.execute("PRAGMA journal_mode").fetchone()
+        synchronous = connection.execute("PRAGMA synchronous").fetchone()
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
@@ -828,11 +977,18 @@ def local_store_health() -> dict:
             (_now(),),
         )
         connection.rollback()
+        healthy = bool(
+            quick and str(quick[0]).lower() == "ok"
+            and mode and str(mode[0]).lower() == "wal"
+            and synchronous and int(synchronous[0]) == 2
+        )
         return {
-            "status": "ok" if quick and str(quick[0]).lower() == "ok" else "unavailable",
+            "status": "ok" if healthy else "unavailable",
             "backend": "sqlite",
-            "writable": True,
+            "writable": healthy,
             "path": path,
+            "journal_mode": "" if mode is None else str(mode[0]).lower(),
+            "synchronous": "full" if synchronous and int(synchronous[0]) == 2 else "other",
         }
     except Exception as exc:
         return {

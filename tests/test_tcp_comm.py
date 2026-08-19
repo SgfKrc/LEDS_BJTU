@@ -321,7 +321,7 @@ class TestLayerConfigSocketRoundTrip:
         monkeypatch.setattr(
             TCPClient,
             "_heartbeat_loop",
-            lambda self, connection_generation=None: None,
+            lambda self, connection_generation=None, connection_sock=None: None,
         )
         monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
         monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
@@ -419,7 +419,7 @@ class TestNetworkPathLoopbackBoundary:
         monkeypatch.setattr(
             TCPClient,
             "_heartbeat_loop",
-            lambda self, connection_generation=None: None,
+            lambda self, connection_generation=None, connection_sock=None: None,
         )
         monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
         monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
@@ -1416,6 +1416,35 @@ class TestTCPClientRegistrationAck:
         assert original_sock.closed is True
         assert client.sock is replacement_sock
 
+    def test_delayed_stale_recv_loop_cannot_close_replacement_socket(self):
+        """旧线程晚于重连启动时，只能清理自己绑定的旧 socket。"""
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="client1",
+        )
+
+        class FakeSocket:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        old_sock = FakeSocket()
+        replacement_sock = FakeSocket()
+        client.sock = replacement_sock
+        client._running = True
+        client._registered = True
+        client._connection_generation = 2
+
+        # Simulate a generation-1 receive thread that did not get CPU time
+        # until generation 2 had already registered its replacement socket.
+        client._recv_loop(1, old_sock)
+
+        assert old_sock.closed is True
+        assert replacement_sock.closed is False
+        assert client.sock is replacement_sock
+        assert client.is_registered is True
+
     def test_stale_heartbeat_generation_cannot_send_on_new_connection(
             self, monkeypatch):
         client = TCPClient(
@@ -1618,8 +1647,16 @@ class TestTCPClientRegistrationAck:
         monkeypatch.setattr(tcp_comm_mod, "detect_network_type", detect_network)
         monkeypatch.setattr(client, "_compute_local_model_sha256", compute_model_sha)
         monkeypatch.setattr(tcp_comm_mod.socket, "socket", lambda *_args, **_kwargs: FakeSocket())
-        monkeypatch.setattr(client, "_heartbeat_loop", lambda _generation=None: None)
-        monkeypatch.setattr(client, "_recv_loop", lambda _generation=None: None)
+        monkeypatch.setattr(
+            client,
+            "_heartbeat_loop",
+            lambda _generation=None, _connection_sock=None: None,
+        )
+        monkeypatch.setattr(
+            client,
+            "_recv_loop",
+            lambda _generation=None, _connection_sock=None: None,
+        )
 
         assert client.connect() is True
         assert preparation_socket_states == [None, None]
@@ -1673,6 +1710,109 @@ class TestTCPClientRegistrationAck:
         assert "bad secret" in client.last_register_error
         assert fake_socket.closed is True
         assert client.sock is None
+
+
+class TestTCPLifecycleRaceMatrix:
+    """T-RACE-2: deterministic TCP registration and socket ownership fences."""
+
+    def test_registered_ack_precedes_post_registration_business_frame(
+            self, monkeypatch):
+        import config as cfg
+
+        monkeypatch.setattr(cfg, "CLUSTER_SECRET", "t-race-2-order-secret")
+        monkeypatch.setattr(
+            TCPClient,
+            "_compute_local_model_sha256",
+            staticmethod(lambda: "sha-t-race-2"),
+        )
+        monkeypatch.setattr(
+            TCPClient,
+            "_heartbeat_loop",
+            lambda self, connection_generation=None, connection_sock=None: None,
+        )
+        monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
+        monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
+
+        received = []
+        business_frame = threading.Event()
+        server = TCPServer(host="127.0.0.1", port=0)
+
+        def push_after_ack(client_id):
+            server.send_to_client(
+                client_id,
+                {"event": "registered_business_frame"},
+                MessageType.NODE_LIST_SYNC,
+            )
+
+        server.on_registration_confirmed = push_after_ack
+        server.start()
+        port = server.sock.getsockname()[1]
+        client = TCPClient(
+            server_host="127.0.0.1",
+            server_port=port,
+            client_id="worker-t-race-2",
+            role="client",
+            advertise_host="127.0.0.1",
+            advertise_port=port,
+        )
+
+        try:
+            assert client.connect(
+                on_message=lambda message: (
+                    received.append(message), business_frame.set(),
+                ),
+            ) is True
+            assert client.is_registered is True
+            assert business_frame.wait(2), "post-registration frame was not delivered"
+            assert len(received) == 1
+            assert received[0]["type"] == MessageType.NODE_LIST_SYNC.value
+            assert received[0]["data"] == {
+                "event": "registered_business_frame",
+            }
+        finally:
+            client.disconnect()
+            server.stop()
+
+    def test_send_data_rejects_stale_bound_socket_without_writing(self):
+        class RecordingSocket:
+            def __init__(self):
+                self.packets = []
+
+            def sendall(self, packet):
+                self.packets.append(packet)
+
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="worker-t-race-2",
+        )
+        stale_sock = RecordingSocket()
+        current_sock = RecordingSocket()
+        client.sock = current_sock
+
+        with pytest.raises(ConnectionError, match="新代际替换"):
+            client.send_data(
+                {"event": "stale_write"},
+                MessageType.HEARTBEAT,
+                connection_sock=stale_sock,
+            )
+
+        assert stale_sock.packets == []
+        assert current_sock.packets == []
+
+    def test_send_data_classifies_close_interleaving(self):
+        class ClosedSocket:
+            def sendall(self, _packet):
+                raise OSError(10038, "not a socket")
+
+        client = TCPClient(
+            server_host="127.0.0.1", server_port=1, client_id="worker-t-race-2",
+        )
+        client.sock = ClosedSocket()
+
+        with pytest.raises(ConnectionError, match="主节点连接发送失败") as exc_info:
+            client.send_data({"event": "close_race"}, MessageType.HEARTBEAT)
+
+        assert isinstance(exc_info.value.__cause__, OSError)
+        assert exc_info.value.__cause__.errno == 10038
 
 
 # ================================================================

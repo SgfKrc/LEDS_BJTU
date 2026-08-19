@@ -1,6 +1,6 @@
 # 集群接入稳定性与本地 RAG 实施计划
 
-> 状态：规划中（仅文档与调研，2026-08-19）
+> 状态：部分实施（NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`CLUSTER-JOIN-S0`、`SYNC-SSH-S0/S1` 本机开发门已完成；真实 SSH、RAG、T-RACE-6 和 NW3.1 尚未实施，2026-08-19）
 >
 > 更新日期：2026-08-19
 >
@@ -40,6 +40,18 @@
 
 兑换成功后立即消费 nonce。主节点只保存哈希化邀请摘要、票据状态和审计事件；目标节点保存自己的私钥，主节点不能代替目标节点生成私钥。
 
+### 2.4 `CLUSTER-JOIN-S0` 本机实现（2026-08-19）
+
+已新增 `src/cluster_join.py`，冻结 `qlh.cluster.join-grant.v1` 本地契约：
+
+- 目标节点用 Ed25519 生成本地 keypair；`build_join_request()` 规范化 IPv4、`[IPv6]:port` 和 MagicDNS authority，并绑定 cluster、node、capabilities、request TTL 和 request digest。
+- `issue_join_grant()` 只有在控制面已返回 `auth_verified=true` 时签发；签名使用主节点管理员 Ed25519 key，grant 固定 `grant_type=client_only`、`role=client`，不接受 master/admin capability。
+- `encode_join_grant()` 输出 `qlhjoin1.<payload>.<signature>`，同一字符串可作为手工输入和 QR payload；编码不携带 cluster secret、TOTP seed、恢复码、私钥、邮件凭据、模型路径或用户正文。
+- `JoinGrantLedger` 使用用户主节点 SQLite `WAL + synchronous=FULL` 记录 nonce，`verify_and_consume_join_grant()` 在验证签名、目标公钥、请求摘要、authority、TTL 和角色后原子消费；重启、并发或重复兑换均返回稳定 `nonce_replayed`。
+- `tests/test_cluster_join.py` 覆盖 IPv6、Auth App 未批准、签名/目标/TTL/角色篡改、QR 畸形输入、重启/并发 nonce 重放和敏感字段不泄露，`.venv-test` `6 passed`。
+
+本票不接入 Web/TUI 页面、TCP 注册自动切换、Tailscale CLI、SMTP/IMAP 或真实双机；控制面负责 Auth App/TOTP 校验。`SYNC-SSH-S0/S1` 随后已完成，当前下一票为 `SYNC-SSH-S2` 环境部署与实测。
+
 ### 2.3 角色与失败语义
 
 角色状态固定为：
@@ -64,7 +76,28 @@
 | 节点投影 | 拓扑变更与任务记账分开 | 避免把普通任务 accounting 打成“节点变更: update master”而误导排障 |
 | SQLite 控制面 | 事务边界 + WAL checkpoint 策略 | 入群、身份切换、节点租约和审计事件不能出现半提交状态 |
 
-### 3.2 可用性策略
+### 3.2 `T-RACE-0` 审计结论（2026-08-19）
+
+| 子系统 | 已确认的实现边界 | 本轮结论 | 后续证明票 |
+|---|---|---|---|
+| TCP 客户端连接/注册 | `_connect_lock` 串行化 `connect()`；`_connection_generation`、`_registration_epoch` 和幂等断连回调区分会话；发送锁保证单 socket 上的字节帧不交叉。 | 发现并修复一个真实竞态：旧代际接收线程若延迟启动，会在重连后读取新的 `self.sock`，并把新连接关闭，表现为注册后立即断连或 `WinError 10038`。线程现改为在注册成功时绑定 socket 实例和 generation。 | `T-RACE-2`：并发注册、旧 socket 迟到、发送/关闭交错与 ACK barrier。 |
+| 注册确认与节点投影 | 注册确认、节点列表推送和层配置推送共用 TCP 接收顺序；服务端维护注册 epoch，调度器在断线时清除该节点的层配置状态。 | 不可把“收到任意首帧”当成注册完成；注册确认必须先于业务推送，客户端也应只在已注册会话上处理业务帧。现有真机曾出现首帧为 `layer_config` 的历史症状，需以确定性 fixture 覆盖其排序和拒绝语义。 | `T-RACE-2`：REGISTER/ACK/业务帧乱序矩阵。 |
+| 分层配置事务 | `config_id`、接收 sequence、generation、prepare/commit/ready/release phase 和节点断线中止均已存在；ACK 校验预期分配和当前事务阶段。 | T-RACE-3 已用屏障覆盖 reserve/prepare/commit/ready/release、迟到/错误 generation ACK、断线中止和释放重入；T-RACE-5 再以 144 个固定 seed 注入代际切换、乱序、重复、篡改和 deadline，未出现未分类终态。 | `SYNC-SSH-S2`；真实双机仍后置。 |
+| 工作流任务 lease | `workflow_id`、`stage_id`、`attempt_id`、`lease_id`、`lease_epoch` 与 provider identity 已进入 worker 协议；结果/取消按 attempt 身份校验。 | T-RACE-3 已覆盖同 epoch 结果竞态单 winner、取消/租约到期后的迟到结果拒绝和 reservation 清理；T-RACE-5 每个 seed 追加同 epoch 并发提交，始终只有一个 winner 且 reservation 清零。 | `SYNC-SSH-S2`；真实双机仍后置。 |
+| 主节点 SQLite | `local_store` 使用 WAL + `synchronous=FULL`，写路径持有进程内锁并以 `BEGIN IMMEDIATE`、commit/rollback 包围；健康检查执行 quick-check 和可回滚写探针。 | T-RACE-4 新增整轮对话与消息计数原子提交、operation_id 收据去重，并用子进程未提交/已提交退出验证 WAL 重开；T-RACE-5 三轮并发写/读 soak 覆盖每个 operation_id 多次重放，计数、WAL 和健康检查均一致。 | `SYNC-SSH-S2`；真实断电/双机仍后置。 |
+| 补丁分发 | 既有签名、来源/工作区检查和受控 pull/push 是当前默认路径；SSH S0/S1 本机门已完成。 | T-RACE-4 新增签名 SHA 前置可达性校验、精确 SHA reset、工作区外原子 patch journal、同目标重放和新目标 fencing；S0/S1 已固定 SSH helper、key/fingerprint、维护锁、失败矩阵和 fake loopback。 | `SYNC-SSH-S2`；真实双机应用和升级恢复仍后置。 |
+
+本票不接线 Transport v2，也不改动默认 Legacy TCP 路由。修复的 socket 生命周期回归与现有 TCP、Transport v2、网络路径专项在 `.venv-test` 通过 `146 passed`；这只证明本机确定性行为，不替代从节点长连接验收。
+
+`T-RACE-2` 在同一确定性矩阵中补齐了 REGISTER ACK 后边沿：调度器主动确认和 TCPServer 默认确认均只触发一次 `on_registration_confirmed`；服务端只在 ACK 写入成功后推送节点列表/层配置。旧绑定 socket 写入会被 `ConnectionError` 拦截，关闭交错的底层 `OSError` 保留为异常原因链。TCP/Transport/网络路径专项当前为 `149 passed`；仍不替代真实从节点验收。
+
+`T-RACE-3` 收口了层配置与任务 lease 的本机状态矩阵：版本化层配置 ACK 必须同时匹配 `config_id` 与 `generation`，worker ACK 会回显 generation；覆盖 prepare/commit/ready/release、断线中止、释放重入和旧 ACK 拒绝。任务图新增同 epoch 结果并发提交门，只有一个 winner 能提交，取消/租约到期后的迟到结果被记录并拒绝，活动 reservation 最终清零。`.venv-test` 调度/任务专项 `343 passed`；未使用从节点或真实网络，后续转入 T-RACE-4 持久化恢复矩阵。
+
+`T-RACE-4` 收口本机持久化恢复：主节点 SQLite 每条连接显式使用 `WAL + synchronous=FULL`，完整对话轮次、消息计数和 operation receipt 在同一事务中提交，整轮删除也原子更新计数；子进程在未提交/已提交断点退出后，重开库分别回滚/保留正确状态，重复 operation_id 返回幂等成功而不重复写入。补丁监听器新增工作区外原子 journal，签名目标必须是 fetch 后远端分支的可达 commit，应用时精确 reset 到签名 SHA；半应用只能重放同一签名目标，新目标被拒绝，启动探针不做自动修改。SQLite、任务 journal、补丁、Scheduler 和 API 联合定向回归 `588 passed`。
+
+`T-RACE-5` 收口本机随机压力/soak：新增 `tests/test_t_race5_soak.py`，三轮固定 seed（每轮 48 个，共 144 个）分别覆盖 FakeTransportLink 的显式投递/丢弃/重复/重排/篡改/deadline/代际切换、SQLite WAL 并发写读与 operation_id 幂等重放、任务图同 epoch 并发 winner。`.venv-test` 三轮 `3 passed`，xdist 用时 `43.26s`；失败时会保存 `qlh.t-race-5.failure.v1` 的 seed、操作序列和状态快照。该门仍不替代真实从节点、断网和升级恢复验收；随后 `CLUSTER-JOIN-S0`、`SYNC-SSH-S0/S1` 已完成，当前环境票为 `SYNC-SSH-S2`。
+
+### 3.3 可用性策略
 
 - `distributed_required`：任一必需从节点不可用即 fail-closed，不能静默回退到主节点单机。
 - `distributed_preferred`：允许有原因、有时限的本地回退，UI 必须显示 `fallback_reason` 和实际参与节点。
@@ -99,10 +132,36 @@ SSH 约束：
 
 | 票 | 状态 | 内容 | 验收 |
 |---|---|---|---|
-| `SYNC-SSH-S0` | Planned | 固定 helper、key/fingerprint、锁与失败码契约 | 文档和协议 fixture |
-| `SYNC-SSH-S1` | Planned | fake SSH server + 签名补丁帧 loopback | 断连/重放/脏工作区 fail-closed |
-| `SYNC-SSH-S2` | Blocked by environment | 同 LAN/Tailscale 双机实测 | 一行提交到两端 `HEAD` 一致且不改用户数据 |
+| `SYNC-SSH-S0` | Completed（本机契约门） | 固定 helper、Ed25519 key/fingerprint、维护锁与失败码契约 | `11 passed`，不建立 SSH 连接 |
+| `SYNC-SSH-S1` | Completed（本机 fake loopback 门） | fake SSH helper/server、临时 Git 真实 fetch/reset、签名补丁帧、维护锁与断连/重放/脏工作区故障 | `9 passed`，不连接真实 SSH |
+| `SYNC-SSH-S2` | In progress（客户端完成，远端授权待配置） | 同 LAN/Tailscale 双机实测 | 一行提交到两端 `HEAD` 一致且不改用户数据 |
 | `SYNC-SSH-S3` | Optional | GUI/TUI 传输选择与 7897 代理诊断 | SSH、TCP、pull/push 三种路径可解释切换 |
+
+### 4.3 `SYNC-SSH-S0` 实施结果
+
+`tools/ssh_sync_contract.py` 冻结 `qlh.sync_ssh.profile.v1`、`qlh.sync_ssh.helper.v1` 和维护锁 schema。profile 同时要求 Ed25519 host public key 与其 OpenSSH `SHA256:` fingerprint 匹配，生成受管 `known_hosts` 条目；密码、代理命令、远程命令和自动接受新 host key 字段一律拒绝。客户端 argv 固定 `BatchMode=yes`、key-only、`StrictHostKeyChecking=yes`、受管 `UserKnownHostsFile` 和 `GlobalKnownHostsFile=os.devnull`，不经过 shell。
+
+远端仅可执行 `qlh-patch-helper` 的 `status/fetch/apply/verify`；`fetch/verify` 只能携带精确 commit SHA，`apply` 只携带有大小上限的既有签名 patch frame 与 SHA-256 operation ID，并强制附加由远端持有的 managed-checkout maintenance lock。自动重启、任意命令、SQLite/模型/附件传输均被契约拒绝。fixture 同时冻结 path-free helper result 的错误码、`retryable` 与 `next_action`，其中仅 transport unavailable 可回退既有 `pull/push`。`.venv-test` `tests/test_ssh_sync_contract.py` 为 `11 passed`。
+
+本票未读取私钥、未启动 SSH、未写仓库，也不改变 TCP listener 或 `pull/push` 回退。S1 再提供 fake SSH helper/server，验证签名复核、维护锁占用、断连、重放和脏工作区的 fail-closed 行为。当前 Tailnet 双机只读探测确认从节点 API 健康响应且 SSH 端口可达，旧 TCP patch listener 未启动；这只解除 S2 的基础连通性门，不代表 SSH 身份认证或 helper 已部署。S2 仍需创建专用受限账号、部署 helper、交换主机 Ed25519 公钥/fingerprint，并在 S1 完成后执行无用户数据改动的实测。
+
+### 4.4 `SYNC-SSH-S1` 实施结果
+
+新增 `tools/ssh_sync_helper.py`。`FakeSshServer` 仅为本机内存 JSON 通道，不创建 socket；它和固定 CLI 共享同一 helper。helper 只接受 S0 schema 的四个 action，真实执行仅限 `git fetch origin dev`、精确 SHA 可达性校验和 `git reset --hard <signed_sha>`；repo、state、验签公钥由从节点部署配置提供，且三者均不得位于受管检出内。签名/branch/commit/key-id 任一不符都在 fetch/reset 前拒绝，dirty workspace 拒绝且不写成功收据，维护锁独占。
+
+S1 的 `HelperLedger` 在受管检出外原子持久化成功收据，并将 operation ID 绑定至同一目标 commit。若 reset 已完成但 ACK 因连接中断丢失，重放同一 operation ID 直接返回收据、不再 reset；请求前断连、应用中断、已有维护锁、篡改帧、不匹配 `origin`、错误复用 operation ID 和不受管目录均 fail-closed。`tests/test_ssh_sync_helper.py` 以临时 bare remote、seed/worker 两份真实 Git checkout 验证上述路径，专项 `.venv-test` `9 passed`；连同 S0 与既有补丁工具回归为 `48 passed`。没有连接当前从节点 SSH，也没有修改任何真实 checkout。
+
+S2 的部署前置现已明确：从节点安装 helper，生成检出外配置（repo/state/verify-key），用专用受限账号以 forced command 暴露 helper，登记 host Ed25519 public key/fingerprint 和主节点专用 client key；验收顺序必须是 `status -> fetch(target)`（只证明可达）-> `apply(signed frame)` -> `verify(target)`，因为 fetch 不改变 HEAD。
+
+### 4.5 `SYNC-SSH-S2` 当前实施与现场门
+
+新增 `tools/ssh_sync_client.py`：它只能渲染 S0 固定 `qlh-patch-helper` argv，原子写入独立 `known_hosts`，禁用 password/keyboard-interactive/首次信任，且只接受一行、受 S0 schema 约束的 helper JSON。超时、无法启动 SSH、无有效 helper JSON 以及“非零退出却宣称成功”分别收敛为 `transport_unavailable` 或 `remote_helper_rejected`，不会把 SSH banner、路径或 stderr 透传。`tools/patch_dispatch.py --write-frame <external-json>` 同时可原子保存现有发布私钥生成的公开签名 frame，供受控 `apply` 使用，不会保存私钥。
+
+2026-08-19 首次探测曾因账号未授权而失败；随后从节点已完成 SSH 免密授权。重新执行严格 key-only 的固定 `qlh-patch-helper status` 后，`surface@100.100.52.106` 已通过认证，但远端返回 Windows “`qlh-patch-helper` 不是内部或外部命令”，即 helper/forced-command 尚未部署。登记的 Ed25519 host fingerprint 为 `SHA256:TKKb3kNjDJomz5Ko+0X2/Hymt+PrygSUdPZGM6ou3/g`，端口与身份层均正常；不得把该部署缺口误判为网络故障，也不得改用密码、遍历账户或普通 shell。
+
+从节点管理员需在**从节点本地控制台**完成一次性配置：建立独立受限 `qlh_sync` 账号，向其授权主节点 Ed25519 公钥并禁用 PTY、端口转发、agent/X11 转发；为该账号设置只调用 `tools/ssh_sync_helper.py --forced-command` 的 forced command wrapper。wrapper 固定设置 `QLH_SSH_SYNC_HELPER_CONFIG`，配置、ledger/state 和 release 验签公钥均置于 checkout 外；checkout 仅可访问受管 `dev` 工作树，不能同步 SQLite、模型、附件或密钥。专用账号必须获得该工作树的最小读写 ACL，不能直接复用会被锁死为 forced command 的日常 `surface` 远程账户。
+
+完成配置后，主节点在 checkout 外保存 S0 profile/managed known-hosts，依次运行 `ssh_sync_client.py` 的 `status`、`fetch --commit-sha <sha>`、`apply --frame <signed-frame.json> --operation-id <sha256>` 和 `verify --commit-sha <sha>`。验收 frame 由 `patch_dispatch.py --write-frame` 在 commit/push 成功后生成，operation ID 可取该 frame 文件的 SHA-256；只选择不涉及用户数据路径的代码提交。任一失败保留现有 `pull/push` 为默认兜底，不自动 reset、重启或清理从节点。
 
 在 S2 真机不可用期间，继续使用现有 `pull/push` 工具，不因 SSH 阻塞其他开发票。
 
@@ -154,12 +213,12 @@ Provider 运行在独立 worker/sidecar，具有超时、取消、模型摘要�
 
 | 票 | 状态 | 内容 |
 |---|---|---|
-| `T-RACE-0` | Planned | 盘点连接、注册、ACK、层配置、租约、SQLite、补丁同步状态转移 |
-| `T-RACE-1` | Planned | 可控时钟、事件屏障、随机延迟注入；新测试禁止固定 sleep 作为完成判定 |
-| `T-RACE-2` | Planned | 同时注册、旧 socket 迟到心跳、发送中断、重复连接、ACK barrier 矩阵 |
-| `T-RACE-3` | Planned | 层 reserve/prepare/ACK/release、任务 epoch/winner/取消/lease expiry |
-| `T-RACE-4` | Planned | SQLite WAL 提交中断、进程 kill、重启恢复、幂等重放 |
-| `T-RACE-5` | Planned | 3 次以上随机化压力/soak，记录失败序列和最小复现种子 |
+| `T-RACE-0` | Completed（本机审计） | 盘点连接、注册、ACK、层配置、租约、SQLite、补丁同步状态转移；修复旧接收线程迟启动时误关闭新 socket 的 generation/socket 绑定竞态 |
+| `T-RACE-1` | Completed（测试基础） | `DeterministicClock`、`EventBarrier` 和 fake link 的无 sleep 时序骨架；随机延迟注入与业务状态矩阵仍后续 |
+| `T-RACE-2` | Completed（本机确定性矩阵） | 并发注册、REGISTER/ACK/业务帧排序、旧 socket 迟到、发送/关闭交错、重复连接和 ACK barrier；修复 ACK 后推送边沿缺失 |
+| `T-RACE-3` | Completed（本机确定性矩阵） | 层 reserve/prepare/ACK/release、generation 围栏、任务 epoch/winner/取消/lease expiry；`.venv-test` 调度/任务专项 `343 passed` |
+| `T-RACE-4` | Completed（本机故障矩阵） | SQLite WAL 提交中断/进程退出/重启恢复/operation_id 幂等重放、消息计数原子维护；签名补丁目标校验、半应用 journal、同目标重放和新目标 fencing；相关专项 `588 passed` |
+| `T-RACE-5` | Completed（本机随机压力门） | 三轮固定 seed、每轮 48 个，共 144 个；Transport/SQLite/任务图随机故障与同 epoch winner；`.venv-test` `3 passed / 43.26s`，失败证据保存 seed、操作序列和状态快照 |
 | `T-RACE-6` | Blocked by environment | 两台真实设备长连接、断网、升级和恢复联合验收 |
 
 ### 6.2 最小场景矩阵
@@ -177,8 +236,8 @@ Provider 运行在独立 worker/sidecar，具有超时、取消、模型摘要�
 
 ## 7. 执行顺序
 
-1. `NW4.1` Transport v2 契约与故障矩阵（文档）→ `T-RACE-0/1`。
-2. 手动入群授权契约与角色状态机（文档）→ `SYNC-SSH-S0`。
+1. `NW4.1` Transport v2 契约与故障矩阵（本地契约门已完成）→ `NW4.1-F1` fake transport（已完成）→ `T-RACE-0` 状态盘点（已完成）→ `T-RACE-2` TCP 生命周期矩阵（已完成）→ `T-RACE-3` 层配置与任务 lease 状态矩阵（已完成）→ `T-RACE-4` SQLite/补丁应用恢复矩阵（已完成）→ `T-RACE-5` 随机化压力/soak（已完成）→ `CLUSTER-JOIN-S0` 手动入群授权契约。
+2. 手动入群授权契约与角色状态机（`CLUSTER-JOIN-S0` 本地契约已完成）→ `SYNC-SSH-S0/S1`（已完成）→ `SYNC-SSH-S2` 环境部署与真实双机验收。
 3. `RAG-S0`/`RAG-S1` 本地主节点 SQLite FTS5，不等待外部 GPU 或公网证书。
 4. `NW3.1` 本地自签名 WSS loopback，仅用于协议测试，不宣称生产信任。
 5. 外部 SMTP、公开域名证书、双 CUDA、IPv4 打洞和真实双机作为后置环境门。

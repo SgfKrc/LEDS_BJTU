@@ -404,10 +404,10 @@ class TestCommitFunction:
 
         fake_store = SimpleNamespace(
             get_local_save_history=lambda: True,
-            save_local_message=lambda sid, role, content, metrics=None:
-                saved.append((sid, role, content)),
-            increment_local_session_message_count=lambda sid:
-                saved.append((sid, "increment", None)),
+            save_local_conversation_turn=(
+                lambda sid, user, assistant, metrics=None, **kwargs:
+                saved.append((sid, user, assistant, metrics)) or True
+            ),
         )
         monkeypatch.setattr(api_server, "_local_store", fake_store)
         monkeypatch.setattr(
@@ -418,6 +418,4 @@ class TestCommitFunction:
             "sess_l", "问", "答", {"engine": "llama_cpp"},
         )
         assert committed is True
-        assert ("sess_l", "user", "问") in saved
-        assert ("sess_l", "assistant", "答") in saved
-        assert ("sess_l", "increment", None) in saved
+        assert saved == [("sess_l", "问", "答", {"engine": "llama_cpp"})]

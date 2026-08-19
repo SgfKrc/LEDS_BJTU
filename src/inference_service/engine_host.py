@@ -583,11 +583,9 @@ class EngineHost:
         try:
             if not _local_store.get_local_save_history():
                 return False
-            _local_store.save_local_message(session_id, "user", user_message)
-            _local_store.save_local_message(
-                session_id, "assistant", assistant_message, metrics,
+            _local_store.save_local_conversation_turn(
+                session_id, user_message, assistant_message, metrics,
             )
-            _local_store.increment_local_session_message_count(session_id)
         except Exception as exc:
             logger.error("SQLite 对话提交失败: session=%s: %s", session_id, exc)
             return False

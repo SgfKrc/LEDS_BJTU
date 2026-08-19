@@ -21,6 +21,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,6 +147,30 @@ def _b64encode(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def write_signed_frame(path: str | os.PathLike[str], frame: dict) -> Path:
+    """Persist a signed public patch frame for a controlled secondary transport."""
+    target = Path(path).expanduser().resolve()
+    if frame.get("schema") != FRAME_SCHEMA:
+        raise PatchDispatchError("refuse to persist an unknown patch frame schema")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", dir=target.parent, delete=False,
+        ) as handle:
+            json.dump(frame, handle, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.replace(temporary, target)
+    except OSError as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise PatchDispatchError("cannot persist signed patch frame") from exc
+    return target
+
+
 def _push(branch: str, proxy_port: int, *, dry_run: bool, retries: int = PUSH_RETRIES) -> None:
     """push 到远程分支（会话级代理，不写全局 git config）。"""
     if dry_run:
@@ -215,6 +240,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="从节点监听端口")
     ap.add_argument("--key", default=str(DEFAULT_KEY), help="Ed25519 签名私钥路径")
     ap.add_argument("--paths", default="", help="只提交指定路径（逗号分隔，隔离并行组进行中文件）")
+    ap.add_argument(
+        "--write-frame", default="",
+        help="将已签名 patch frame 原子写入指定 JSON 文件，供 SSH 受控传输使用",
+    )
     args = ap.parse_args(argv)
 
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
@@ -240,6 +269,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(f"  [dry-run] 帧摘要: {json.dumps({k: v for k, v in frame.items() if k != 'signature'}, ensure_ascii=False)[:160]}")
         print(f"  [dry-run] 签名: {frame['signature'][:24]}... key_id={frame['key_id']}")
+    elif args.write_frame:
+        written = write_signed_frame(args.write_frame, frame)
+        print(f"  已保存签名 patch frame: {written}")
 
     # 3. push（除非 --no-push）
     if not args.no_push:

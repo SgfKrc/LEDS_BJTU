@@ -104,6 +104,21 @@ def test_commit_and_frame_signing(fake_git, signing_key, monkeypatch):
                                         if k not in ("signature", "key_id")}))
 
 
+def test_write_signed_frame_is_atomic_json_without_private_key(tmp_path):
+    frame = {
+        "schema": pd.FRAME_SCHEMA,
+        "commit_sha": "a" * 40,
+        "signature": "public-signature",
+        "key_id": "release-20260809",
+    }
+    target = pd.write_signed_frame(tmp_path / "state" / "frame.json", frame)
+    assert target == (tmp_path / "state" / "frame.json").resolve()
+    assert json.loads(target.read_text(encoding="utf-8")) == frame
+    assert "private" not in target.read_text(encoding="utf-8").lower()
+    with pytest.raises(pd.PatchDispatchError):
+        pd.write_signed_frame(tmp_path / "bad.json", {"schema": "unknown"})
+
+
 def test_proxy_env_is_session_scoped():
     env = pd._proxy_env(7897)
     assert env["HTTPS_PROXY"] == "http://127.0.0.1:7897"

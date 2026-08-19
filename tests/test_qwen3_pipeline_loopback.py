@@ -842,7 +842,11 @@ def test_real_tcp_hmac_loopback_round_trip(monkeypatch):
     monkeypatch.setattr(
         TCPClient, "_compute_local_model_sha256", staticmethod(lambda: ""),
     )
-    monkeypatch.setattr(TCPClient, "_heartbeat_loop", lambda self, connection_generation=None: None)
+    monkeypatch.setattr(
+        TCPClient,
+        "_heartbeat_loop",
+        lambda self, connection_generation=None, connection_sock=None: None,
+    )
     monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
     monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
     probe_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

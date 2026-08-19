@@ -23,6 +23,12 @@ import patch_listener as pl  # noqa: E402
 from signing import canonical_json  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_patch_state(monkeypatch, tmp_path):
+    """Patch recovery tests must never write to the developer's state dir."""
+    monkeypatch.setenv("QLH_PATCH_STATE_DIR", str(tmp_path / "patch-state"))
+
+
 @pytest.fixture
 def keys(tmp_path):
     """临时 Ed25519 密钥对：返回 (key_path, pub_json_path, pub_bytes)。"""
@@ -162,6 +168,8 @@ def test_apply_patch_dirty_warns_and_force_overwrites(keys, args, monkeypatch):
             return ""
         if gargs[0] == "rev-parse":
             return "a" * 40  # 与帧 commit 对齐
+        if gargs[0] == "merge-base":
+            return "a" * 40
         return ""
 
     monkeypatch.setattr(pl, "_git", fake_git)
@@ -169,7 +177,7 @@ def test_apply_patch_dirty_warns_and_force_overwrites(keys, args, monkeypatch):
     status, detail = pl._apply_patch(frame, no_clean=False, logger=pl._log_setup())
     assert status == "applied"
     assert detail == "a" * 40
-    assert ["reset", "--hard", "origin/dev"] in calls
+    assert ["reset", "--hard", "a" * 40] in calls
     clean_call = next(call for call in calls if call[:2] == ["clean", "-fd"])
     assert ["-e", "node_config.json"] in [
         clean_call[i:i + 2] for i in range(len(clean_call) - 1)
@@ -182,8 +190,12 @@ def test_apply_patch_head_mismatch_fails(keys, args, monkeypatch):
             return ""
         if gargs[0] == "fetch":
             return ""
-        if gargs[0] == "rev-parse":
+        if gargs[:2] == ["rev-parse", "HEAD"]:
             return "f" * 40  # 不等于目标
+        if gargs[0] == "rev-parse":
+            return "a" * 40
+        if gargs[0] == "merge-base":
+            return "a" * 40
         return ""
 
     monkeypatch.setattr(pl, "_git", fake_git)
@@ -216,6 +228,7 @@ def test_handle_frame_restart_requested_flag(keys, args, monkeypatch):
     frame = _sign_frame(_valid_payload(restart_requested=True), key_path)
     monkeypatch.setattr(pl, "_git", lambda gargs, **kw: {
         "status": "", "fetch": "", "rev-parse": "a" * 40,
+        "merge-base": "a" * 40,
         "remote": "https://github.com/SgfKrc/LEDS_BJTU",
     }.get(gargs[0], ""))
     ack = pl._handle_frame(frame, args, pl._log_setup())
@@ -254,12 +267,103 @@ def test_apply_patch_handles_malicious_proxy_port(monkeypatch):
             return ""
         if gargs[0] == "rev-parse":
             return "a" * 40
+        if gargs[0] == "merge-base":
+            return "a" * 40
         return ""
 
     monkeypatch.setattr(pl, "_git", fake_git)
     frame = _valid_payload(proxy_port="evil")
     status, detail = pl._apply_patch(frame, no_clean=False, logger=pl._log_setup())
     assert status == "applied"
+
+
+def test_interrupted_apply_requires_same_signed_target_for_recovery(
+        monkeypatch):
+    """A failure after reset leaves an applying journal that fences new targets."""
+    calls = []
+    head = {"value": "b" * 40}
+    target = "a" * 40
+
+    def fake_git(gargs, *, env=None, check=True):
+        calls.append(gargs)
+        if gargs[:2] == ["rev-parse", "HEAD"]:
+            return head["value"]
+        if gargs[0] == "rev-parse":
+            return target if str(gargs[-1]).startswith(target) else "c" * 40
+        if gargs[0] == "merge-base":
+            return target
+        if gargs[0] == "reset":
+            head["value"] = gargs[-1]
+            return ""
+        if gargs[0] == "clean":
+            raise RuntimeError("simulated interruption after reset")
+        return ""
+
+    monkeypatch.setattr(pl, "_git", fake_git)
+    frame = _valid_payload(commit_sha=target)
+    status, detail = pl._apply_patch(frame, no_clean=False, logger=pl._log_setup())
+    assert status == "failed"
+    assert "patch apply failed" in detail
+    state = pl._read_patch_state()
+    assert state["active"]["phase"] == "applying"
+    assert state["active"]["target"] == target
+
+    other = _valid_payload(commit_sha="d" * 40)
+    status, detail = pl._apply_patch(other, no_clean=False, logger=pl._log_setup())
+    assert status == "failed"
+    assert "pending patch recovery" in detail
+    assert ["reset", "--hard", "d" * 40] not in calls
+
+
+def test_same_signed_target_replays_interrupted_apply_and_marks_applied(
+        monkeypatch):
+    """Replaying the signed frame safely converges an interrupted clean step."""
+    head = {"value": "b" * 40}
+    target = "a" * 40
+    fail_clean = {"once": True}
+
+    def fake_git(gargs, *, env=None, check=True):
+        if gargs[:2] == ["rev-parse", "HEAD"]:
+            return head["value"]
+        if gargs[0] == "rev-parse":
+            return target if str(gargs[-1]).startswith(target) else "c" * 40
+        if gargs[0] == "merge-base":
+            return target
+        if gargs[0] == "reset":
+            head["value"] = gargs[-1]
+            return ""
+        if gargs[0] == "clean" and fail_clean["once"]:
+            fail_clean["once"] = False
+            raise RuntimeError("simulated interruption after reset")
+        return ""
+
+    monkeypatch.setattr(pl, "_git", fake_git)
+    frame = _valid_payload(commit_sha=target)
+    assert pl._apply_patch(frame, no_clean=False, logger=pl._log_setup())[0] == "failed"
+    assert pl._apply_patch(frame, no_clean=False, logger=pl._log_setup()) == (
+        "applied", target,
+    )
+    state = pl._read_patch_state()
+    assert state["active"] is None
+    assert state["latest"]["phase"] == "applied"
+
+
+def test_inspect_patch_recovery_is_read_only(monkeypatch):
+    state = {
+        "schema": pl.PATCH_STATE_SCHEMA,
+        "active": {
+            "operation_id": "op",
+            "target": "a" * 40,
+            "previous_head": "b" * 40,
+            "phase": "applying",
+        },
+        "history": [],
+    }
+    pl._write_patch_state(state)
+    monkeypatch.setattr(pl, "_git", lambda args, **kwargs: "a" * 40)
+    result = pl.inspect_patch_recovery()
+    assert result["status"] == "target_present_replay_required"
+    assert pl._read_patch_state()["active"]["phase"] == "applying"
 
 
 def test_recv_frame_length_header():

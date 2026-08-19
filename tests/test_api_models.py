@@ -820,8 +820,11 @@ def test_local_pytorch_chat_restores_full_model_before_generate(monkeypatch):
     monkeypatch.setattr(api_server.scheduler, "get_distributed_inference_enabled", lambda: False)
     monkeypatch.setattr(api_server, "active_session_id", None)
     monkeypatch.setattr(api_server, "_generate_followups", lambda *a, **kw: [])
-    monkeypatch.setattr(api_server._local_store, "save_local_message", lambda *a, **kw: None)
-    monkeypatch.setattr(api_server._local_store, "increment_local_session_message_count", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        api_server._local_store,
+        "save_local_conversation_turn",
+        lambda *a, **kw: True,
+    )
 
     result = api_server._execute_chat_full(req)
 

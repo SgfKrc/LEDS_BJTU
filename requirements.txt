@@ -25,6 +25,7 @@ bitsandbytes>=0.45.0             # INT4/INT8 量化（Windows + CUDA 12.x 兼容
 
 # --- 网络通信（标准库）---
 # socket, struct, threading, json — Python 内置
+cryptography>=42.0.0,<47.0.0     # Ed25519 join grants and local signing contracts
 
 # --- Web 可视化 ---
 # 注：Streamlit 已移除，统一使用 FastAPI + React 前端
