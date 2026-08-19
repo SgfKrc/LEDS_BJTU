@@ -3,12 +3,19 @@ from __future__ import annotations
 import pytest
 
 from src.cluster_transport import (
+    CONTROL_CHANNEL,
     LEGACY_TCP,
+    STREAM_CHANNEL,
+    TRANSPORT_FAILURE_MATRIX,
     WSS_443,
     TransportCandidate,
+    TransportCircuitBreaker,
+    TransportChunkAck,
     TransportContractError,
+    TransportEnvelope,
     TransportPolicy,
     TransportSession,
+    TransportWindow,
     select_transport,
 )
 
@@ -116,3 +123,89 @@ def test_snapshot_does_not_expose_endpoint_or_lease_token():
     assert lease.lease_token not in str(snapshot)
     assert snapshot["attempts"]["attempt-1"]["transport"] == WSS_443
 
+
+def test_transport_v2_envelope_is_canonical_and_payload_free():
+    envelope = TransportEnvelope.from_payload(
+        b"hello",
+        request_id="req-1",
+        connection_generation=4,
+        attempt_id="attempt-1",
+        channel=STREAM_CHANNEL,
+        sequence=2,
+        deadline_ms=2_000,
+    )
+    encoded = envelope.encode()
+    decoded = TransportEnvelope.decode(encoded)
+    assert decoded == envelope
+    assert b"hello" not in encoded
+    assert decoded.payload_size == 5
+    assert decoded.is_expired(now_ms=1_999) is False
+    assert decoded.is_expired(now_ms=2_000) is True
+
+
+def test_transport_v2_envelope_rejects_unknown_fields_and_bad_digest():
+    envelope = TransportEnvelope.from_payload(
+        b"x",
+        request_id="req-1",
+        connection_generation=0,
+        attempt_id="attempt-1",
+        channel=CONTROL_CHANNEL,
+        sequence=0,
+        deadline_ms=2_000,
+    )
+    value = envelope.to_dict()
+    value["extra"] = True
+    with pytest.raises(TransportContractError) as error:
+        TransportEnvelope.decode(__import__("json").dumps(value))
+    assert error.value.code == "envelope_fields_invalid"
+    with pytest.raises(TransportContractError) as error:
+        TransportEnvelope(
+            **{**envelope.to_dict(), "payload_digest": "not-a-digest"},
+        )
+    assert error.value.code == "payload_digest_invalid"
+
+
+def test_transport_window_enforces_backpressure_and_idempotent_duplicate_detection():
+    window = TransportWindow(10)
+    window.reserve(
+        request_id="req-1", connection_generation=1, attempt_id="attempt-1", sequence=0, payload_size=6,
+    )
+    with pytest.raises(TransportContractError) as error:
+        window.reserve(
+            request_id="req-1", connection_generation=1, attempt_id="attempt-1", sequence=1, payload_size=5,
+        )
+    assert error.value.code == "window_exhausted"
+    ack = TransportChunkAck("req-1", 1, "attempt-1", 0, 6)
+    window.acknowledge(ack)
+    assert window.snapshot()["inflight_bytes"] == 0
+    with pytest.raises(TransportContractError) as error:
+        window.acknowledge(ack)
+    assert error.value.code == "sequence_duplicate"
+    with pytest.raises(TransportContractError) as error:
+        window.acknowledge(TransportChunkAck("req-1", 1, "attempt-1", 9, 1))
+    assert error.value.code == "sequence_out_of_order"
+    window.reserve(
+        request_id="req-1", connection_generation=1, attempt_id="attempt-1", sequence=2, payload_size=2,
+    )
+    with pytest.raises(TransportContractError) as error:
+        window.acknowledge(TransportChunkAck("other-request", 1, "attempt-1", 2, 2))
+    assert error.value.code == "ack_context_mismatch"
+
+
+def test_transport_failure_matrix_and_circuit_breaker_are_deterministic():
+    assert set(TRANSPORT_FAILURE_MATRIX) == {
+        "connection_timeout", "tls_auth_failed", "connection_reset",
+        "sequence_duplicate", "sequence_out_of_order", "window_exhausted",
+        "ack_size_mismatch", "ack_context_mismatch", "payload_mismatch", "deadline_exceeded", "generation_stale", "attempt_fenced", "circuit_open",
+    }
+    breaker = TransportCircuitBreaker(failure_threshold=2, cooldown_seconds=5)
+    assert breaker.allow(now=0) is True
+    breaker.record("connection_timeout", now=0)
+    breaker.record("connection_reset", now=1)
+    assert breaker.allow(now=1) is False
+    assert breaker.allow(now=6) is True
+    breaker.success()
+    assert breaker.snapshot() == {"state": "closed", "failures": 0}
+    with pytest.raises(TransportContractError) as error:
+        breaker.record("not-a-code", now=7)
+    assert error.value.code == "failure_unknown"

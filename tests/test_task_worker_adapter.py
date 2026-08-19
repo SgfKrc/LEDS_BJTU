@@ -748,7 +748,7 @@ def test_hello_round_trips_over_authenticated_loopback_tcp(monkeypatch):
     monkeypatch.setattr(
         TCPClient,
         "_heartbeat_loop",
-        lambda self, connection_generation=None: None,
+        lambda self, connection_generation=None, connection_sock=None: None,
     )
     monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
     monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")
@@ -812,7 +812,7 @@ def test_single_stage_round_trips_over_authenticated_loopback_tcp(monkeypatch):
     monkeypatch.setattr(
         TCPClient,
         "_heartbeat_loop",
-        lambda self, connection_generation=None: None,
+        lambda self, connection_generation=None, connection_sock=None: None,
     )
     monkeypatch.setattr(tcp_comm_mod, "detect_network_type", lambda: "ethernet")
     monkeypatch.setattr(tcp_comm_mod, "detect_lan_ip", lambda: "127.0.0.1")

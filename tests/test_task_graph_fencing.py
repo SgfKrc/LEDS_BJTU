@@ -291,6 +291,83 @@ def test_wrong_epoch_is_rejected_before_winner_and_valid_result_can_commit():
     coordinator.close()
 
 
+def test_concurrent_results_commit_one_winner_and_fence_the_other():
+    """Two same-epoch results racing at the gate must produce one winner."""
+    start_barrier = threading.Barrier(2)
+    release_provider = threading.Event()
+    registry = ProviderRegistry()
+    registry.register(DeterministicFakeProvider(
+        "primary",
+        start_barrier=start_barrier,
+        block_event=release_provider,
+    ))
+    coordinator = TaskGraphCoordinator(provider_registry=registry)
+    completed = []
+    errors = []
+
+    def run_workflow():
+        try:
+            completed.append(coordinator.run(
+                [StageSpec("answer", "full_inference", provider="primary")],
+                "answer",
+                {"message": "question"},
+                workflow_id="wf_concurrentwinner",
+            ))
+        except Exception as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_workflow)
+    runner.start()
+    start_barrier.wait(timeout=5)
+    attempt = coordinator.get("wf_concurrentwinner")["stages"][0]["attempts"][0]
+    result_barrier = threading.Barrier(3)
+    outcomes = []
+
+    def submit(content):
+        result_barrier.wait(timeout=5)
+        outcomes.append(coordinator.submit_stage_result(
+            "wf_concurrentwinner",
+            "answer",
+            StageResult(
+                output={"content": content},
+                provider_id="primary",
+                attempt_id=attempt["attempt_id"],
+                lease_epoch=attempt["lease_epoch"],
+            ),
+        ))
+
+    threads = [
+        threading.Thread(target=submit, args=("winner-a",)),
+        threading.Thread(target=submit, args=("winner-b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    result_barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+    release_provider.set()
+    runner.join(timeout=5)
+
+    assert not errors
+    assert len(completed) == 1
+    assert sorted(item["status"] for item in outcomes) == [
+        "committed", "rejected",
+    ]
+    workflow = coordinator.get("wf_concurrentwinner")
+    stage = workflow["stages"][0]
+    assert stage["winner_attempt_id"] == attempt["attempt_id"]
+    # The provider was intentionally released only after the two external
+    # submissions. Its in-flight result may arrive as a third, stale result,
+    # so the durable count is at least the losing external submission.
+    assert stage["result_rejection_count"] >= 1
+    assert stage["last_result_rejection_reason"] in {
+        "winner_digest_mismatch",
+        "winner_already_committed",
+    }
+    assert_no_active_reservations(coordinator)
+    coordinator.close()
+
+
 def test_provider_result_attempt_identity_is_not_silently_rebound():
     class WrongAttemptProvider(LocalFullModelProvider):
         def execute(self, attempt, reservation, cancel_event):

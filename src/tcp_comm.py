@@ -1368,6 +1368,13 @@ class TCPServer:
                                 if self._pending_registrations.get(client_id) is current:
                                     self._pending_registrations.pop(client_id, None)
 
+                    # Scheduler callbacks may have already called
+                    # confirm_registration().  The post-registration hook is
+                    # an ACK edge, not an implementation-detail edge of the
+                    # fallback path, so it must run for either confirmation
+                    # route exactly once for this REGISTER frame.
+                    registration_confirmed_now = current.registration_confirmed
+
                 if (
                     registration_confirmed_now
                     and self.on_registration_confirmed is not None
@@ -2065,6 +2072,11 @@ class TCPClient:
                     with self._disconnect_callback_lock:
                         self._connection_generation += 1
                         connection_generation = self._connection_generation
+                        # Bind both workers to this exact socket.  A worker from a
+                        # previous generation may be delayed until after reconnect;
+                        # reading self.sock from inside that worker could otherwise
+                        # make it close or use the newly registered connection.
+                        connection_sock = self.sock
                         self._disconnect_notified = False
                         self._last_heartbeat_send = 0.0
                         self._heartbeat_quality.begin_generation(connection_generation)
@@ -2072,7 +2084,7 @@ class TCPClient:
                     # 启动心跳线程
                     self._heartbeat_thread = threading.Thread(
                         target=self._heartbeat_loop,
-                        args=(connection_generation,),
+                        args=(connection_generation, connection_sock),
                         daemon=True,
                     )
                     self._heartbeat_thread.start()
@@ -2080,7 +2092,7 @@ class TCPClient:
                     # 启动接收线程
                     self._recv_thread = threading.Thread(
                         target=self._recv_loop,
-                        args=(connection_generation,),
+                        args=(connection_generation, connection_sock),
                         daemon=True,
                     )
                     self._recv_thread.start()
@@ -2111,9 +2123,14 @@ class TCPClient:
         finally:
             self._connect_lock.release()
 
-    def _recv_loop(self, connection_generation: int = None) -> None:
+    def _recv_loop(
+        self,
+        connection_generation: int = None,
+        connection_sock: socket.socket = None,
+    ) -> None:
         """接收消息循环（在独立线程中运行）"""
-        connection_sock = self.sock
+        if connection_sock is None:
+            connection_sock = self.sock
         try:
             while self._running and connection_sock:
                 with self._disconnect_callback_lock:
@@ -2200,12 +2217,20 @@ class TCPClient:
     def send_data(self, data: Any, msg_type: MessageType = MessageType.TENSOR,
                   connection_sock: socket.socket = None) -> None:
         """向主节点发送数据"""
-        active_sock = connection_sock or self.sock
-        if not active_sock:
-            raise ConnectionError("未连接到主节点")
         packet = build_message(msg_type, data)
         with self._send_lock:
-            active_sock.sendall(packet)
+            active_sock = self.sock if connection_sock is None else connection_sock
+            if active_sock is None:
+                raise ConnectionError("未连接到主节点")
+            # A worker that already captured a socket must never write after
+            # reconnect moved ownership to another generation.  The caller can
+            # then fence itself instead of surfacing an unclassified WinError.
+            if connection_sock is not None and self.sock is not connection_sock:
+                raise ConnectionError("连接已被新代际替换")
+            try:
+                active_sock.sendall(packet)
+            except OSError as exc:
+                raise ConnectionError("主节点连接发送失败") from exc
 
     def recv_data(self, connection_sock: socket.socket = None) -> Optional[dict]:
         """
@@ -2281,9 +2306,14 @@ class TCPClient:
         else:
             self.avg_rtt_ms = rtt_ms
 
-    def _heartbeat_loop(self, connection_generation: int = None) -> None:
+    def _heartbeat_loop(
+        self,
+        connection_generation: int = None,
+        connection_sock: socket.socket = None,
+    ) -> None:
         """心跳发送循环（含时间戳用于 RTT 测量）"""
-        connection_sock = self.sock
+        if connection_sock is None:
+            connection_sock = self.sock
         while self._running and connection_sock:
             with self._disconnect_callback_lock:
                 if (connection_generation is not None
