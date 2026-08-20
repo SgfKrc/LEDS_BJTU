@@ -73,3 +73,15 @@ def test_rag_api_capacity_and_job_cursor_are_redacted(monkeypatch, tmp_path):
     cancelled = client.post(f"/api/rag/embedding-jobs/{body['job_id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["state"] == "cancelled"
+
+
+def test_rag_api_ann_decision_is_path_free(monkeypatch, tmp_path):
+    store = _store(tmp_path)
+    monkeypatch.setattr(api_server, "_rag_store_instance", store)
+    client = TestClient(api_server.app)
+    response = client.get("/api/rag/ann-decision?scan_budget=100")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["storage"] == "sqlite"
+    assert body["decision"]["decision"] == "NO_GO"
+    assert "path" not in body["decision"]

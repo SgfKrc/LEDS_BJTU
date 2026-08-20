@@ -59,6 +59,7 @@ _JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 _JOB_STATES = frozenset({"queued", "running", "paused", "completed", "failed", "cancelled"})
 _MIN_JOB_LEASE_SECONDS = 5
 _MAX_JOB_LEASE_SECONDS = 3_600
+_DEFAULT_EMBEDDING_MODEL_ID = "nomic-embed-text:latest"
 
 
 class RagStoreError(ValueError):
@@ -254,6 +255,15 @@ class RagStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_rag_embeddings_identity
                       ON rag_embeddings(provider, model_id, model_sha256, dimensions, chunk_id);
+                    CREATE TABLE IF NOT EXISTS rag_embedding_identities (
+                      provider TEXT NOT NULL,
+                      model_id TEXT NOT NULL,
+                      model_sha256 TEXT NOT NULL,
+                      dimensions INTEGER,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL,
+                      PRIMARY KEY(provider, model_id)
+                    );
                     CREATE TABLE IF NOT EXISTS rag_jobs (
                       job_id TEXT PRIMARY KEY,
                       kind TEXT NOT NULL,
@@ -603,6 +613,12 @@ class RagStore:
                 "WHERE d.status='active' AND s.status='active'"
             ).fetchone()[0])
             embedding_count = int(connection.execute("SELECT COUNT(*) FROM rag_embeddings").fetchone()[0])
+            current_identity_count = int(connection.execute(
+                "SELECT COUNT(*) FROM rag_embeddings e JOIN rag_embedding_identities i "
+                "ON i.provider=e.provider AND i.model_id=e.model_id AND i.model_sha256=e.model_sha256 "
+                "WHERE e.dimensions=?", (int(dimensions),)
+            ).fetchone()[0])
+            stale_embedding_count = max(0, embedding_count - current_identity_count)
             db_bytes = self.path.stat().st_size if self.path.exists() else 0
             wal_path = Path(f"{self.path}-wal")
             wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
@@ -611,6 +627,8 @@ class RagStore:
                 "dimensions": int(dimensions),
                 "active_chunk_count": active_chunks,
                 "embedding_count": embedding_count,
+                "current_identity_embedding_count": current_identity_count,
+                "stale_embedding_count": stale_embedding_count,
                 "estimated_vector_bytes": vector_bytes,
                 "database_bytes": int(db_bytes),
                 "wal_bytes": int(wal_bytes),
@@ -646,6 +664,19 @@ class RagStore:
     ) -> dict[str, Any]:
         now = time.time()
         job = self._read_job(connection, job_id)
+        cursor = job.get("cursor") or {}
+        identity = connection.execute(
+            "SELECT model_sha256 FROM rag_embedding_identities WHERE provider=? AND model_id=?",
+            (cursor.get("provider"), cursor.get("model_id")),
+        ).fetchone()
+        if identity is not None and str(identity[0]) != str(cursor.get("model_sha256")):
+            connection.execute(
+                "UPDATE rag_jobs SET state='failed', error_code='embedding_model_changed', "
+                "lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE job_id=? "
+                "AND state NOT IN ('completed', 'cancelled', 'failed')",
+                (_now(), job_id),
+            )
+            raise RagStoreError("embedding_model_changed", "embedding model summary changed; rebuild the job")
         if job["state"] in {"completed", "cancelled"}:
             return job
         current_owner = job.get("lease_owner")
@@ -679,11 +710,13 @@ class RagStore:
         *,
         provider: str,
         model_sha256: str,
+        model_id: str = _DEFAULT_EMBEDDING_MODEL_ID,
         source_id: str | None = None,
         batch_size: int = _MAX_EMBEDDING_BATCH,
     ) -> dict[str, Any]:
         """Create a deterministic, user-owned embedding job snapshot."""
         provider = _safe_id(provider, _EMBEDDING_PROVIDER, code="embedding_provider_invalid", label="provider")
+        model_id = _safe_id(model_id, _EMBEDDING_MODEL_ID, code="embedding_model_invalid", label="model_id")
         model_sha256 = _sha(model_sha256, code="embedding_model_digest_invalid")
         if source_id is not None:
             source_id = _safe_id(source_id, _SOURCE_ID, code="source_id_invalid", label="source_id")
@@ -691,6 +724,10 @@ class RagStore:
             raise RagStoreError("embedding_batch_invalid", "embedding batch size must be between 1 and 64")
         self.initialize()
         with self._write() as connection:
+            self._activate_embedding_identity(
+                connection, provider=provider, model_id=model_id,
+                model_sha256=model_sha256, dimensions=None,
+            )
             sql = (
                 "SELECT c.chunk_id FROM rag_chunks c "
                 "JOIN rag_documents d ON d.document_id=c.document_id "
@@ -715,7 +752,7 @@ class RagStore:
                 "chunk_ids": [str(row[0]) for row in rows],
                 "position": 0,
                 "indexed": 0,
-                "model_id": None,
+                "model_id": model_id,
                 "dimensions": None,
             }
             now = _now()
@@ -852,7 +889,7 @@ class RagStore:
                     indexed_delta = len(encoded)
                     self.upsert_embeddings(
                         provider=provider_name, model_id=model_id, model_sha256=cursor["model_sha256"],
-                        dimensions=dimensions, vectors=encoded,
+                        dimensions=dimensions, vectors=encoded, allow_identity_switch=False,
                     )
                 except RagStoreError as exc:
                     self._mark_embedding_job_error(job_id, owner, exc)
@@ -884,6 +921,7 @@ class RagStore:
         model_sha256: str,
         dimensions: int,
         vectors: Mapping[str, Sequence[object]],
+        allow_identity_switch: bool = True,
     ) -> int:
         """Atomically bind a bounded batch of vectors to active local chunks.
 
@@ -901,6 +939,11 @@ class RagStore:
             chunk_id = _safe_id(chunk_id, _SHA256, code="chunk_id_invalid", label="chunk_id")
             encoded.append((chunk_id, self._pack_vector(vector, dimensions)))
         with self._write() as connection:
+            self._activate_embedding_identity(
+                connection, provider=provider, model_id=model_id,
+                model_sha256=model_sha256, dimensions=dimensions,
+                allow_switch=allow_identity_switch,
+            )
             placeholders = ",".join("?" for _ in encoded)
             active = connection.execute(
                 "SELECT c.chunk_id FROM rag_chunks c "
@@ -922,6 +965,61 @@ class RagStore:
                     (chunk_id, provider, model_id, model_sha256, dimensions, blob, now),
                 )
             return len(encoded)
+
+    @staticmethod
+    def _activate_embedding_identity(
+        connection: sqlite3.Connection,
+        *,
+        provider: str,
+        model_id: str,
+        model_sha256: str,
+        dimensions: int | None,
+        allow_switch: bool = True,
+    ) -> None:
+        """Bind one mutable provider tag to one frozen model summary.
+
+        A new summary invalidates old vectors and queued/paused jobs for the
+        same provider/model tag.  Running jobs are fenced by the identity
+        check in ``_claim_embedding_job`` and by ``allow_identity_switch`` at
+        commit, so they cannot reintroduce stale vectors.
+        """
+        row = connection.execute(
+            "SELECT model_sha256, dimensions FROM rag_embedding_identities WHERE provider=? AND model_id=?",
+            (provider, model_id),
+        ).fetchone()
+        now = _now()
+        if row is not None and str(row[0]) != model_sha256:
+            if not allow_switch:
+                raise RagStoreError("embedding_model_changed", "embedding model summary changed during job")
+            connection.execute(
+                "DELETE FROM rag_embeddings WHERE provider=? AND model_id=? AND model_sha256<>?",
+                (provider, model_id, model_sha256),
+            )
+            for job_row in connection.execute("SELECT job_id, state, cursor FROM rag_jobs").fetchall():
+                try:
+                    cursor = json.loads(job_row[2])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if (
+                    cursor.get("provider") == provider
+                    and cursor.get("model_id") == model_id
+                    and cursor.get("model_sha256") != model_sha256
+                    and job_row[1] in {"queued", "paused", "running"}
+                ):
+                    connection.execute(
+                        "UPDATE rag_jobs SET state='failed', error_code='embedding_model_changed', "
+                        "lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE job_id=?",
+                        (now, job_row[0]),
+                    )
+        if row is not None and row[1] is not None and dimensions is not None and int(row[1]) != int(dimensions):
+            raise RagStoreError("embedding_dimensions_changed", "embedding model dimensions changed")
+        connection.execute(
+            "INSERT INTO rag_embedding_identities(provider, model_id, model_sha256, dimensions, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(provider, model_id) DO UPDATE SET "
+            "model_sha256=excluded.model_sha256, dimensions=COALESCE(excluded.dimensions, rag_embedding_identities.dimensions), "
+            "updated_at=excluded.updated_at",
+            (provider, model_id, model_sha256, dimensions, now, now),
+        )
 
     def index_active_embeddings(
         self,
