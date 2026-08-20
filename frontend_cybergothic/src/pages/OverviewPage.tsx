@@ -23,6 +23,7 @@ import {
   usePipelineCapacity,
   useQueue,
   useRecentLogs,
+  useMyRole,
   useSystemStatus,
 } from '../data/hooks';
 import type { ClusterNode } from '../data/types';
@@ -85,17 +86,22 @@ function NodeCard({ node }: { node: ClusterNode }) {
 export function OverviewPage() {
   const status = useSystemStatus();
   const nodes = useClusterNodes();
-  const queue = useQueue(8_000);
+  const role = useMyRole();
+  const queueEnabled = role.state === 'ready' && role.data?.is_master === true;
+  const queue = useQueue(8_000, queueEnabled);
   const capacity = usePipelineCapacity();
   const logs = useRecentLogs({ limit: 6 }, 15_000);
+  const queueNotApplicable = role.state === 'ready' && role.data?.is_master !== true;
+  const roleUnavailable = role.state === 'error';
 
   const refresh = useCallback(() => {
     status.refresh();
     nodes.refresh();
+    role.refresh();
     queue.refresh();
     capacity.refresh();
     logs.refresh();
-  }, [status.refresh, nodes.refresh, queue.refresh, capacity.refresh, logs.refresh]);
+  }, [status.refresh, nodes.refresh, role.refresh, queue.refresh, capacity.refresh, logs.refresh]);
   useRegisterRefresh(refresh);
 
   useReveal([nodes.data, logs.data]);
@@ -108,7 +114,7 @@ export function OverviewPage() {
   const metrics: Metric[] = useMemo(() => {
     const gpuUtil = s?.gpu?.utilization ?? 0;
     const kvUtil = (s?.kv_cache?.utilization ?? 0) * 100;
-    const queueDepth = queue.data?.queue_size ?? 0;
+    const queueDepth = queueEnabled ? queue.data?.queue_size ?? 0 : 0;
 
     return [
       {
@@ -137,11 +143,19 @@ export function OverviewPage() {
       {
         label: '队列深度',
         value: queueDepth,
-        hint: queue.state === 'error' ? '队列接口不可用' : `已完成 ${queue.data?.completed_count ?? 0}`,
+        hint: queueNotApplicable
+          ? '单机模式不适用'
+          : roleUnavailable
+            ? '节点角色不可用'
+          : role.state !== 'ready'
+            ? '正在确认节点角色'
+            : queue.state === 'error'
+              ? '队列接口不可用'
+              : `已完成 ${queue.data?.completed_count ?? 0}`,
         tone: queueDepth > 0 ? 'info' : 'idle',
       },
     ];
-  }, [s, onlineCount, totalNodes, queue.data, queue.state]);
+  }, [s, onlineCount, totalNodes, queue.data, queue.state, queueEnabled, queueNotApplicable, role.state, roleUnavailable]);
 
   const timelineItems: TimelineItem[] = useMemo(
     () =>
@@ -172,7 +186,7 @@ export function OverviewPage() {
     return `本机以${role}身份运行在${mode}模式，${modelPart}。`;
   })();
 
-  const hasActiveWork = (queue.data?.queue_size ?? 0) > 0 || Boolean(queue.data?.current_task);
+  const hasActiveWork = queueEnabled && ((queue.data?.queue_size ?? 0) > 0 || Boolean(queue.data?.current_task));
 
   return (
     <>
@@ -235,7 +249,31 @@ export function OverviewPage() {
           title="流水线准入"
           hint="分布式推理的层分配结果；未准入时会回落到单机全模型。"
         />
-        {capacity.state === 'loading' && !capacity.data ? (
+        {roleUnavailable ? (
+          <EmptyState
+            kind="error"
+            title="节点角色不可用"
+            description="无法判断本机是否为主节点，队列数据暂不请求。"
+            detail={role.error}
+            action={
+              <CommandButton variant="ghost" size="sm" onClick={role.refresh}>
+                重试角色探针
+              </CommandButton>
+            }
+          />
+        ) : queueNotApplicable ? (
+          <EmptyState
+            kind="denied"
+            title="单机模式不使用主节点队列"
+            description="本机状态和对话仍可用；请求队列只在主节点提供。"
+            detail={role.data?.node_role ? `当前角色：${role.data.node_role}` : undefined}
+            action={
+              <CommandButton variant="ghost" size="sm" href={routeHref('settings')}>
+                查看设置
+              </CommandButton>
+            }
+          />
+        ) : capacity.state === 'loading' && !capacity.data ? (
           <SkeletonRows rows={2} columns={3} />
         ) : capacity.state === 'error' ? (
           <EmptyState
@@ -288,8 +326,8 @@ export function OverviewPage() {
               <div>
                 <dt>仅控制面</dt>
                 <dd>
-                  {capacity.data.control_only_nodes.length
-                    ? capacity.data.control_only_nodes.join('、')
+                  {(capacity.data.control_only_nodes ?? []).length
+                    ? (capacity.data.control_only_nodes ?? []).join('、')
                     : '无'}
                 </dd>
               </div>

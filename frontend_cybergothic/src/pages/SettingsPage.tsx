@@ -21,6 +21,7 @@ import { fixturesEnabled, setFixturesEnabled } from '../data/fixtures';
 import { getAuthToken, getLogToken, setLogToken } from '../data/api';
 import { useMyRole, useSystemStatus } from '../data/hooks';
 import { APP_VERSION } from '../app/version';
+import { SettingsWorkspace } from '../components/SettingsWorkspace';
 
 const MOTION_OPTIONS: Array<{ id: MotionPreference; label: string; hint: string }> = [
   { id: 'system', label: '跟随系统', hint: '使用操作系统的「减少动态效果」设置。' },
@@ -85,6 +86,8 @@ export function SettingsPage() {
         description="控制台自身的偏好项。这些设置只保存在当前浏览器，不会写入后端配置。"
       />
 
+      <SettingsWorkspace />
+
       <section className="band" data-reveal>
         <SectionHead title="连接" hint="当前控制台连接的后端与本机在集群中的角色。" />
         <dl className="kvgrid">
@@ -143,7 +146,7 @@ export function SettingsPage() {
         ) : null}
       </section>
 
-      <section className="band band--alt" data-reveal>
+      <section className="band band--alt" data-reveal id="settings-preferences">
         <SectionHead
           title="动效"
           hint="减少动效会关闭入场位移、揭示动画与背景 Canvas 的持续绘制。"

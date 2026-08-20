@@ -5,6 +5,9 @@ import './styles/tokens.css';
 import './styles/global.css';
 import './styles/components.css';
 import './styles/workbench.css';
+import './styles/image-studio.css';
+import './styles/models.css';
+import './styles/settings-workspace.css';
 
 const container = document.getElementById('root');
 if (!container) throw new Error('#root 未找到，index.html 可能被修改。');

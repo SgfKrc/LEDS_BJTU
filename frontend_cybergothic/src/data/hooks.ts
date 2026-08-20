@@ -8,8 +8,16 @@
 import * as api from './api';
 import {
   capacityFixture,
+  diffusionArtifactsFixture,
+  diffusionAssetsFixture,
+  diffusionCapabilitiesFixture,
+  availableModelsFixture,
+  currentModelFixture,
+  deviceProfileFixture,
   fixturesEnabled,
+  localModelAssetsFixture,
   logsFixture,
+  modelsFixture,
   nodesFixture,
   queueFixture,
   ragFixture,
@@ -20,6 +28,14 @@ import {
 import { useResource, type ResourceResult } from './useResource';
 import type {
   ClusterNodesResponse,
+  DiffusionArtifactsResponse,
+  DiffusionAssetsResponse,
+  DiffusionCapabilitiesResponse,
+  AvailableModelsResponse,
+  CurrentModelResponse,
+  DeviceProfileResponse,
+  LocalModelAssetsResponse,
+  ModelsResponse,
   MyRoleResponse,
   PipelineCapacityResponse,
   QueueResponse,
@@ -150,5 +166,85 @@ export function useMyRole(): ResourceResult<MyRoleResponse> {
           )
         : api.fetchMyRole(signal),
     {},
+  );
+}
+
+export function useDiffusionCapabilities(pollMs = 15_000): ResourceResult<DiffusionCapabilitiesResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<DiffusionCapabilitiesResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(diffusionCapabilitiesFixture, signal)
+      : api.fetchDiffusionCapabilities(signal),
+    { pollMs },
+  );
+}
+
+export function useDiffusionArtifacts(pollMs = 30_000): ResourceResult<DiffusionArtifactsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<DiffusionArtifactsResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(diffusionArtifactsFixture, signal)
+      : api.fetchDiffusionArtifacts(signal),
+    { pollMs },
+  );
+}
+
+export function useDiffusionAssets(pollMs = 30_000): ResourceResult<DiffusionAssetsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<DiffusionAssetsResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(diffusionAssetsFixture, signal)
+      : api.fetchDiffusionAssets(signal),
+    { pollMs },
+  );
+}
+
+export function useModels(pollMs = 15_000): ResourceResult<ModelsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<ModelsResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(modelsFixture, signal)
+      : api.fetchModels(signal),
+    { pollMs },
+  );
+}
+
+export function useAvailableModels(pollMs = 30_000): ResourceResult<AvailableModelsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<AvailableModelsResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(availableModelsFixture, signal)
+      : api.fetchAvailableModels(signal),
+    { pollMs },
+  );
+}
+
+export function useCurrentModel(pollMs = 15_000): ResourceResult<CurrentModelResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<CurrentModelResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(currentModelFixture, signal)
+      : api.fetchCurrentModel(signal),
+    { pollMs },
+  );
+}
+
+export function useLocalModelAssets(pollMs = 30_000): ResourceResult<LocalModelAssetsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<LocalModelAssetsResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(localModelAssetsFixture, signal)
+      : api.fetchLocalModelAssets(signal),
+    { pollMs },
+  );
+}
+
+export function useDeviceProfile(pollMs = 30_000): ResourceResult<DeviceProfileResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<DeviceProfileResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(deviceProfileFixture, signal)
+      : api.fetchDeviceProfile(signal),
+    { pollMs },
   );
 }

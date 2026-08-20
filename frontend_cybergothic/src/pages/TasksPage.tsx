@@ -17,7 +17,7 @@ import { useRegisterRefresh } from '../app/refreshBus';
 import { useReveal } from '../motion/useReveal';
 import { formatDuration, formatRelative } from '../motion/countUp';
 import { labelForState, toneForState } from '../components/statusTone';
-import { useQueue, useWorkflows } from '../data/hooks';
+import { useMyRole, useQueue, useWorkflows } from '../data/hooks';
 import { fixturesEnabled } from '../data/fixtures';
 import * as api from '../data/api';
 import type { QueueTask, WorkflowRecord } from '../data/types';
@@ -37,7 +37,9 @@ const WORKFLOW_FILTERS = [
 type WorkflowFilter = (typeof WORKFLOW_FILTERS)[number]['id'];
 
 export function TasksPage() {
-  const queue = useQueue(5_000);
+  const role = useMyRole();
+  const queueEnabled = role.state === 'ready' && role.data?.is_master === true;
+  const queue = useQueue(5_000, queueEnabled);
   const workflows = useWorkflows(20, 8_000);
 
   const [filter, setFilter] = useState<WorkflowFilter>('all');
@@ -46,9 +48,10 @@ export function TasksPage() {
   const [busyAction, setBusyAction] = useState('');
 
   const refresh = useCallback(() => {
+    role.refresh();
     queue.refresh();
     workflows.refresh();
-  }, [queue.refresh, workflows.refresh]);
+  }, [role.refresh, queue.refresh, workflows.refresh]);
   useRegisterRefresh(refresh);
 
   useReveal([queue.data, workflows.data]);
@@ -229,7 +232,8 @@ export function TasksPage() {
 
   const q = queue.data;
   // 403 表示当前节点不是主节点，属于「无权限」而不是错误。
-  const queueDenied = queue.state === 'error' && queue.error.startsWith('无权限');
+  const queueDenied = role.state === 'ready' && role.data?.is_master !== true;
+  const roleUnavailable = role.state === 'error';
 
   return (
     <>
@@ -300,12 +304,24 @@ export function TasksPage() {
           }
         />
 
-        {queueDenied ? (
+        {roleUnavailable ? (
+          <EmptyState
+            kind="error"
+            title="节点角色不可用"
+            description="无法判断队列权限，暂不请求主节点队列。"
+            detail={role.error}
+            action={
+              <CommandButton variant="ghost" size="sm" onClick={role.refresh}>
+                重试角色探针
+              </CommandButton>
+            }
+          />
+        ) : queueDenied ? (
           <EmptyState
             kind="denied"
-            title="当前节点无权查看队列"
-            description="请求队列只在主节点开放。请在主节点打开控制台，或切换本机角色。"
-            detail={queue.error}
+            title="当前节点不使用主节点队列"
+            description="请求队列只在主节点开放。工作流和本机对话仍可继续使用。"
+            detail={role.data?.node_role ? `当前角色：${role.data.node_role}` : undefined}
           />
         ) : queue.state === 'loading' && !q ? (
           <SkeletonRows rows={3} columns={4} />

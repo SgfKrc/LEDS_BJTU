@@ -9,11 +9,24 @@ import type {
   ChatMetrics,
   ChatUploadResponse,
   ClusterNodesResponse,
+  DiffusionArtifactsResponse,
+  DiffusionAssetsResponse,
+  DiffusionCapabilitiesResponse,
+  DiffusionJob,
+  AvailableModelsResponse,
+  CurrentModelResponse,
+  DeviceAutoConfigureResponse,
+  DeviceProfileResponse,
+  LocalModelAssetsResponse,
+  ModelPreflightResponse,
+  ModelsResponse,
   ConversationResponse,
   MyRoleResponse,
   PipelineCapacityResponse,
   QueueResponse,
+  RagRebuildResponse,
   RagHealthResponse,
+  RagSearchResponse,
   RecentLogsResponse,
   SessionsResponse,
   SystemStatusResponse,
@@ -135,14 +148,74 @@ export const fetchQueue = (signal?: AbortSignal) =>
 export const fetchWorkflows = (limit = 20, signal?: AbortSignal) =>
   request<WorkflowsResponse>(`/workflows?limit=${encodeURIComponent(limit)}`, { signal });
 
-export const fetchPipelineCapacity = (signal?: AbortSignal) =>
-  request<PipelineCapacityResponse>('/cluster/pipeline-capacity', { signal });
+export const fetchPipelineCapacity = async (signal?: AbortSignal): Promise<PipelineCapacityResponse> => {
+  // 后端在模型描述符尚未就绪时返回精简的 unavailable 响应，只包含
+  // status/admitted/reason_code/assignments；在数据层补齐集合字段，避免
+  // 页面把「能力暂不可用」误当成完整计划并读取 undefined.length。
+  const data = await request<Partial<PipelineCapacityResponse>>('/cluster/pipeline-capacity', { signal });
+  const normalized = {
+    model_id: '',
+    model_type: '',
+    total_layers: 0,
+    raw_model_bytes: 0,
+    candidate_node_count: 0,
+    status: 'unavailable',
+    admitted: false,
+    reason_code: '',
+    reason: '',
+    plan_id: '',
+    assignments: [],
+    control_only_nodes: [],
+    participating_node_count: 0,
+    single_node_full_model_candidates: [],
+    prepared_node_count: 0,
+    ready_node_count: 0,
+    worker_count: 0,
+    computed_at: 0,
+    ...data,
+  };
+  return {
+    ...normalized,
+    assignments: Array.isArray(normalized.assignments) ? normalized.assignments : [],
+    control_only_nodes: Array.isArray(normalized.control_only_nodes) ? normalized.control_only_nodes : [],
+    single_node_full_model_candidates: Array.isArray(normalized.single_node_full_model_candidates)
+      ? normalized.single_node_full_model_candidates
+      : [],
+  };
+};
 
 export const fetchRagHealth = (signal?: AbortSignal) =>
   request<RagHealthResponse>('/rag/health', { signal });
 
 export const fetchSessions = (limit = 20, signal?: AbortSignal) =>
   request<SessionsResponse>(`/sessions?limit=${encodeURIComponent(limit)}`, { signal });
+
+export const createSession = (title = '新对话') =>
+  request<{ id: string; title: string; message_count?: number; active?: boolean }>('/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ title }),
+  });
+
+export const renameSession = (sessionId: string, title: string) =>
+  request<Partial<import('./types').SessionSummary> & { id: string }>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ title }),
+    },
+  );
+
+export const deleteSession = (sessionId: string) =>
+  request<{ status?: string; session_id?: string }>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' },
+  );
+
+export const activateSession = (sessionId: string) =>
+  request<{ session_id: string; messages?: unknown[]; count?: number }>(
+    `/sessions/${encodeURIComponent(sessionId)}/activate`,
+    { method: 'POST' },
+  );
 
 export const fetchRecentLogs = (
   params: { limit?: number; level?: string } = {},
@@ -160,6 +233,118 @@ export const fetchRecentLogs = (
 
 export const fetchHealth = (signal?: AbortSignal) =>
   request<{ status: string; timestamp: number }>('/health', { signal });
+
+// ---- Device and local RAG workspace ----
+
+export const fetchDeviceProfile = (signal?: AbortSignal) =>
+  request<DeviceProfileResponse>('/device/profile', { signal });
+
+export const autoConfigureDevice = () =>
+  request<DeviceAutoConfigureResponse>('/device/auto-configure', { method: 'POST' });
+
+export const selectGpu = (gpuIndex: number) =>
+  request<DeviceProfileResponse & { selected_gpu?: DeviceProfileResponse['gpu']; warning?: string }>(
+    '/device/select-gpu',
+    { method: 'POST', body: JSON.stringify({ gpu_index: gpuIndex }) },
+  );
+
+export const searchRag = (query: string, options: { mode?: string; access_scope?: string; limit?: number } = {}) =>
+  request<RagSearchResponse>('/rag/search', {
+    method: 'POST',
+    body: JSON.stringify({ query, ...options }),
+  });
+
+export const rebuildRagIndex = () =>
+  request<RagRebuildResponse>('/rag/rebuild', {
+    method: 'POST',
+    body: JSON.stringify({ include_embeddings: false }),
+  });
+
+// ---- Stable Diffusion 工作区 ----
+
+export const fetchDiffusionCapabilities = (signal?: AbortSignal) =>
+  request<DiffusionCapabilitiesResponse>('/diffusion/capabilities', { signal });
+
+export const fetchDiffusionArtifacts = (signal?: AbortSignal) =>
+  request<DiffusionArtifactsResponse>('/diffusion/artifacts', { signal });
+
+export const fetchDiffusionAssets = (signal?: AbortSignal) =>
+  request<DiffusionAssetsResponse>('/diffusion/assets/catalog', { signal });
+
+export const loadDiffusionArtifact = (artifactId: string, profile = 'balanced') =>
+  request<DiffusionCapabilitiesResponse>('/diffusion/load', {
+    method: 'POST',
+    body: JSON.stringify({ artifact_id: artifactId, profile, safety_checker_required: true }),
+  });
+
+export const unloadDiffusionArtifact = () =>
+  request<DiffusionCapabilitiesResponse>('/diffusion/unload', { method: 'POST' });
+
+export const generateDiffusionImage = (params: {
+  preset_id?: string;
+  prompt: string;
+  negative_prompt?: string;
+  seed?: number;
+  width?: number;
+  height?: number;
+  steps?: number;
+  guidance_scale?: number;
+  scheduler?: string;
+}) =>
+  request<DiffusionJob>('/diffusion/generate', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+
+export const fetchDiffusionJob = (jobId: string, signal?: AbortSignal) =>
+  request<DiffusionJob>(`/diffusion/jobs/${encodeURIComponent(jobId)}`, { signal });
+
+export const cancelDiffusionJob = (jobId: string) =>
+  request<{ accepted?: boolean; job?: DiffusionJob }>(
+    `/diffusion/jobs/${encodeURIComponent(jobId)}/cancel`,
+    { method: 'POST' },
+  );
+
+// ---- Model and local asset workspace ----
+
+export const fetchModels = (signal?: AbortSignal) =>
+  request<ModelsResponse>('/models', { signal });
+
+export const fetchAvailableModels = (signal?: AbortSignal) =>
+  request<AvailableModelsResponse>('/models/available', { signal });
+
+export const fetchCurrentModel = (signal?: AbortSignal) =>
+  request<CurrentModelResponse>('/models/current', { signal });
+
+export const fetchLocalModelAssets = (signal?: AbortSignal) =>
+  request<LocalModelAssetsResponse>('/models/local-assets', { signal });
+
+export const preflightLocalModelAsset = (modelId: string) =>
+  request<ModelPreflightResponse>(`/models/local-assets/${encodeURIComponent(modelId)}/preflight`, {
+    method: 'POST',
+  });
+
+export const loadModel = (
+  engine: string,
+  quantType: string,
+  useCompile = false,
+  modelId?: string,
+) =>
+  request<CurrentModelResponse>('/models/load', {
+    method: 'POST',
+    body: JSON.stringify({
+      engine: engine || 'auto',
+      quant_type: quantType || 'int4',
+      use_compile: useCompile,
+      ...(modelId ? { model_id: modelId } : {}),
+    }),
+  });
+
+export const unloadModel = () =>
+  request<CurrentModelResponse>('/models/unload', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
 
 // ---- 写操作（Tasks 页队列控制） ----
 

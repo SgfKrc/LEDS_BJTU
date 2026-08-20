@@ -7,11 +7,20 @@
  */
 
 import type {
+  AvailableModelsResponse,
   ClusterNodesResponse,
   ConversationResponse,
+  CurrentModelResponse,
+  DeviceProfileResponse,
+  DiffusionArtifactsResponse,
+  DiffusionAssetsResponse,
+  DiffusionCapabilitiesResponse,
+  LocalModelAssetsResponse,
+  ModelsResponse,
   PipelineCapacityResponse,
   QueueResponse,
   RagHealthResponse,
+  RagSearchResponse,
   RecentLogsResponse,
   SessionsResponse,
   SystemStatusResponse,
@@ -322,6 +331,17 @@ export const ragFixture: RagHealthResponse = {
   query_event_count: 96,
 };
 
+export const ragSearchFixture: RagSearchResponse = {
+  mode: 'fts',
+  provider: null,
+  results: [
+    { chunk_id: 'chunk_overview_01', source_id: 'runtime-notes', relative_ref: 'docs/runtime.md', revision: 3, ordinal: 12, snippet: 'The local runtime keeps model loading, device selection, and queue admission as separate control surfaces.' },
+    { chunk_id: 'chunk_overview_02', source_id: 'frontend-plan', relative_ref: 'docs/frontend-plan.md', revision: 2, ordinal: 8, snippet: 'Use explicit empty and unavailable states when the backend is offline or the current role cannot access an endpoint.' },
+  ],
+  count: 2,
+  storage: 'sqlite',
+};
+
 export const sessionsFixture: SessionsResponse = {
   sessions: [
     { id: 'default', title: '新对话', message_count: 56, created_at: '2026-08-18T12:28:05.340855Z', updated_at: '2026-08-20T15:28:56.588493Z' },
@@ -330,6 +350,214 @@ export const sessionsFixture: SessionsResponse = {
   active_session_id: 'default',
   total: 2,
   source: 'sqlite',
+};
+
+export const diffusionCapabilitiesFixture: DiffusionCapabilitiesResponse = {
+  state: 'loaded',
+  loaded: true,
+  loaded_artifact: {
+    artifact_id: 'sd15-demo',
+    name: 'SD 1.5 Demo',
+    artifact: { artifact_kind: 'sd15_pipeline', loadable: true, precision: 'fp16' },
+  },
+  capabilities: { txt2img: true, img2img: false, inpaint: false },
+  dependencies: { torch: true, diffusers: true, transformers: true },
+  presets: [
+    {
+      preset_id: 'sd15_demo',
+      model_id: 'sd15-demo',
+      prompt: 'gothic observatory at night',
+      negative_prompt: 'blurry, low quality',
+      width: 512,
+      height: 512,
+      steps: 24,
+      guidance_scale: 7.5,
+      scheduler: 'ddim',
+      seeds: [1742],
+    },
+  ],
+};
+
+export const diffusionArtifactsFixture: DiffusionArtifactsResponse = {
+  artifacts: [
+    {
+      artifact_id: 'sd15-demo',
+      name: 'SD 1.5 Demo',
+      registered_at: NOW - 7200,
+      artifact: { artifact_kind: 'sd15_pipeline', loadable: true, precision: 'fp16', size_bytes: 3673657344 },
+    },
+  ],
+};
+
+export const diffusionAssetsFixture: DiffusionAssetsResponse = {
+  assets: [
+    {
+      asset_id: 'sd15-demo',
+      name: 'SD 1.5 Demo Pipeline',
+      artifact_id: 'sd15-demo',
+      artifact_kind: 'sd15_pipeline',
+      description: '用于离线预览的本地 SD 1.5 资产。',
+      installed: true,
+      present_bytes: 3673657344,
+      total_bytes: 3673657344,
+    },
+  ],
+};
+
+export const modelsFixture: ModelsResponse = {
+  active_model_id: 'qwen-1_8b',
+  models: [
+    {
+      model_id: 'qwen-1_8b',
+      name: 'Qwen 1.8B Chat',
+      model_type: 'qwen',
+      is_builtin: true,
+      recommended_vram_gb: 3.5,
+      max_context: 8192,
+      quant_types: ['fp16', 'int8', 'int4', 'Q4_K_M'],
+      description: 'Compact local assistant model for chat and workflow tasks.',
+      location: 'builtin',
+      is_available: true,
+      available_formats: ['gguf', 'safetensors'],
+      has_gguf: true,
+      has_safetensors: true,
+      supported_engines: ['llama_cpp', 'pytorch'],
+      preferred_engine: 'llama_cpp',
+      default_quant_type: 'Q4_K_M',
+      requires_cuda: false,
+      expected_paths: ['models/qwen-1_8b'],
+    },
+    {
+      model_id: 'qwen3-8b-sidecar',
+      name: 'Qwen3 8B Sidecar',
+      model_type: 'qwen3',
+      is_builtin: false,
+      is_experimental: true,
+      recommended_vram_gb: 10,
+      max_context: 32768,
+      quant_types: ['int4'],
+      description: 'Inventory-only asset. Requires the sidecar runtime gate.',
+      location: 'local asset',
+      is_available: false,
+      unavailable_reason: 'Sidecar asset is registered for preflight only.',
+      available_formats: ['safetensors'],
+      has_safetensors: true,
+      has_gguf: false,
+      supported_engines: [],
+      preferred_engine: 'auto',
+      default_quant_type: 'int4',
+      requires_cuda: true,
+      expected_paths: ['models/qwen3-8b-sidecar'],
+    },
+    {
+      model_id: 'deepseek-r1-7b',
+      name: 'DeepSeek R1 7B',
+      model_type: 'deepseek',
+      is_builtin: false,
+      is_experimental: true,
+      recommended_vram_gb: 8,
+      max_context: 16384,
+      quant_types: ['int4'],
+      description: 'Registered model awaiting a local weight package.',
+      location: 'external',
+      is_available: false,
+      unavailable_reason: 'Model weights are not present on this node.',
+      available_formats: [],
+      has_safetensors: false,
+      has_gguf: false,
+      supported_engines: [],
+      preferred_engine: 'auto',
+      default_quant_type: 'int4',
+      requires_cuda: true,
+      expected_paths: ['models/deepseek-r1-7b'],
+    },
+  ],
+};
+
+export const availableModelsFixture: AvailableModelsResponse = {
+  current: 'Q4_K_M',
+  current_engine: 'llama_cpp',
+  models: [
+    { id: 'gguf', name: 'GGUF 量化', engine: 'llama_cpp', description: 'CPU/集显友好', is_available: true },
+    { id: 'int4', name: 'INT4 量化', engine: 'pytorch', memory_gb: 1.8, speed_tok_s: 29, is_available: true },
+    { id: 'int8', name: 'INT8 量化', engine: 'pytorch', memory_gb: 2.3, speed_tok_s: 10, is_available: true },
+  ],
+  available_engines: [
+    { id: 'llama_cpp', name: 'llama.cpp + GGUF', description: 'GGUF quantized runtime.', requires_cuda: false },
+    { id: 'pytorch', name: 'PyTorch + Safetensors', description: 'Safetensors runtime.', requires_cuda: false },
+  ],
+};
+
+export const currentModelFixture: CurrentModelResponse = {
+  loaded: true,
+  pipeline_prepared: false,
+  quant_type: 'Q4_K_M',
+  model_id: 'qwen-1_8b',
+  model_name: 'Qwen 1.8B Chat',
+  model_path: 'models/qwen-1_8b/Qwen-1_8B-Chat.Q4_K_M.gguf',
+  engine: 'llama_cpp',
+};
+
+export const localModelAssetsFixture: LocalModelAssetsResponse = {
+  assets: [
+    {
+      model_id: 'qwen3-8b-sidecar',
+      name: 'Qwen3 8B Sidecar',
+      huggingface_id: 'Qwen/Qwen3-8B',
+      model_type: 'safetensors',
+      available_formats: ['safetensors'],
+      model_path: 'models/qwen3-8b-sidecar',
+      max_context: 32768,
+      architectures: ['Qwen3ForCausalLM'],
+      total_bytes: 8589934592,
+      asset_ids: ['qwen3-8b-sidecar'],
+      source_paths: ['models/qwen3-8b-sidecar'],
+      manifest_paths: ['models/qwen3-8b-sidecar/.qlh-model-asset.json'],
+      integrity: 'manifest_verified',
+      runtime_profile: 'qwen3_sidecar',
+      runtime_hint: 'Inventory only until the sidecar preflight gate passes.',
+      runtime_status: 'inventory_only',
+      runtime_action: 'qwen3_preflight',
+    },
+    {
+      model_id: 'qwen-1_8b',
+      name: 'Qwen 1.8B Chat',
+      model_type: 'gguf',
+      available_formats: ['gguf'],
+      model_path: '',
+      gguf_path: 'models/qwen-1_8b/Qwen-1_8B-Chat.Q4_K_M.gguf',
+      max_context: 8192,
+      architectures: ['QWenForCausalLM'],
+      total_bytes: 1929379840,
+      asset_ids: ['qwen-1_8b-gguf'],
+      source_paths: ['models/qwen-1_8b'],
+      manifest_paths: [],
+      integrity: 'filesystem_discovered',
+      runtime_profile: 'manual_runtime_selection',
+      runtime_hint: 'Available through the classic model loader.',
+      runtime_status: 'inventory_only',
+      runtime_action: null,
+    },
+  ],
+  summary: { total: 2, total_bytes: 10519314432 },
+};
+
+export const deviceProfileFixture: DeviceProfileResponse = {
+  tier: 'laptop',
+  tier_label: 'Performance laptop',
+  tier_icon: 'GPU',
+  score_total: 78,
+  score_breakdown: { gpu: 42, ram: 23, cpu: 13 },
+  cpu: { model_name: 'AMD Ryzen 7 7840HS', physical_cores: 8, logical_cores: 16, freq_max_mhz: 5100 },
+  ram: { total_gb: 32, available_gb: 18.6, used_gb: 13.4, percent_used: 41.9 },
+  gpu: { name: 'NVIDIA GeForce RTX 4060 Laptop GPU', gpu_type: 'dedicated', is_integrated: false, cuda_available: true, vram_total_gb: 8, vram_free_gb: 6.2 },
+  gpus: [
+    { name: 'NVIDIA GeForce RTX 4060 Laptop GPU', gpu_type: 'dedicated', is_integrated: false, cuda_available: true, vram_total_gb: 8, vram_free_gb: 6.2 },
+    { name: 'AMD Radeon 780M', gpu_type: 'integrated', is_integrated: true, cuda_available: false, vram_total_gb: 0, vram_free_gb: 0, mps_available: false },
+  ],
+  selected_gpu_index: 0,
+  recommendations: ['Use INT4 for the best memory/speed balance.', 'Keep the dedicated GPU selected for local PyTorch inference.'],
+  warnings: ['Switching GPU takes effect after the next model reload.'],
 };
 
 export const conversationFixture: ConversationResponse = {

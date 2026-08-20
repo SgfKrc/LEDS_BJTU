@@ -11,6 +11,8 @@ const PAGES = [
   { hash: '#/overview', heading: '集群概览' },
   { hash: '#/tasks', heading: '任务' },
   { hash: '#/activity', heading: '活动' },
+  { hash: '#/image', heading: '生图工坊' },
+  { hash: '#/models', heading: 'Model workspace' },
   { hash: '#/settings', heading: '设置' },
   { hash: '#/help', heading: '帮助' },
 ];

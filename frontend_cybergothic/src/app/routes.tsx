@@ -7,8 +7,10 @@
 import { useEffect, useState } from 'react';
 import {
   Activity,
+  Boxes,
   CircleHelp,
   Columns2,
+  Image,
   LayoutDashboard,
   ListTree,
   SlidersHorizontal,
@@ -21,8 +23,10 @@ import { TasksPage } from '../pages/TasksPage';
 import { ActivityPage } from '../pages/ActivityPage';
 import { SettingsPage } from '../pages/SettingsPage';
 import { HelpPage } from '../pages/HelpPage';
+import { ImageStudioPage } from '../pages/ImageStudioPage';
+import { ModelsPage } from '../pages/ModelsPage';
 
-export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'settings' | 'help';
+export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'image' | 'models' | 'settings' | 'help';
 
 export interface RouteDef {
   id: RouteId;
@@ -74,6 +78,22 @@ export const ROUTES: RouteDef[] = [
     icon: Activity,
     description: '运行事件时间线与错误详情。',
     component: ActivityPage,
+  },
+  {
+    id: 'image',
+    label: '生图',
+    tag: 'IMAGE STUDIO',
+    icon: Image,
+    description: 'Stable Diffusion 资产、生成任务与结果列表。',
+    component: ImageStudioPage,
+  },
+  {
+    id: 'models',
+    label: 'Models',
+    tag: 'MODEL LAB',
+    icon: Boxes,
+    description: 'Model runtime, local assets, and load controls.',
+    component: ModelsPage,
   },
   {
     id: 'settings',
