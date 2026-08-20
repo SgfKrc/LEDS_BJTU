@@ -4948,7 +4948,18 @@ def _execute_task_graph_chat_with_slot(
 
     remote_stage_id = str(req.task_graph_remote_stage or "")
     remote_provider_id = str(req.task_graph_remote_provider_id or "")
-    auto_remote = bool(req.task_graph_auto_remote)
+    distributed_task_required = (
+        req.routing_preference == "distributed_required"
+    )
+    auto_remote = bool(
+        req.task_graph_auto_remote
+        or (
+            not remote_stage_id
+            and req.routing_preference in {
+                "distributed_preferred", "distributed_required",
+            }
+        )
+    )
     if bool(remote_stage_id) != bool(remote_provider_id):
         raise coded_http_error(
             400,
@@ -4968,6 +4979,13 @@ def _execute_task_graph_chat_with_slot(
             "PC Full Worker 实验调度未启用。请设置 "
             "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
         )
+    if auto_remote and not TASK_WORKER_EXPERIMENTAL_ENABLED:
+        if distributed_task_required:
+            raise coded_http_error(
+                503,
+                "TASK_WORKER_EXPERIMENT_DISABLED",
+                "distributed_required 需要已启用的 PC Full Worker 实验调度。",
+            )
 
     target_session_id = req.session_id or active_session_id
     if target_session_id and target_session_id != active_session_id:
@@ -5069,6 +5087,12 @@ def _execute_task_graph_chat_with_slot(
             model_identity = _active_task_graph_model_identity()
         if TASK_WORKER_EXPERIMENTAL_ENABLED and model_identity is None:
             auto_fallback_reason = "model_identity_unavailable"
+            if distributed_task_required:
+                raise coded_http_error(
+                    409,
+                    "TASK_WORKER_MODEL_IDENTITY_UNAVAILABLE",
+                    "distributed_required 需要主节点已加载完整模型并生成精确身份。",
+                )
         elif TASK_WORKER_EXPERIMENTAL_ENABLED:
             template_stages, final_stage_id = dual_candidate_template()
             eligible_by_stage: dict[str, list[str]] = {}
@@ -5088,6 +5112,12 @@ def _execute_task_graph_chat_with_slot(
                         auto_provider_ids.append(provider_id)
             if not auto_provider_ids:
                 auto_fallback_reason = "no_eligible_remote_provider"
+                if distributed_task_required:
+                    raise coded_http_error(
+                        503,
+                        "TASK_WORKER_NO_ELIGIBLE_REMOTE_PROVIDER",
+                        "distributed_required 没有可用且模型身份精确匹配的 PC Full Worker。",
+                    )
             else:
                 selected_by_model: dict[ModelIdentity, int] = {}
                 planned_stages = []
@@ -5120,7 +5150,13 @@ def _execute_task_graph_chat_with_slot(
                         stage,
                         provider=primary,
                         fallback_providers=tuple(
-                            [*other_remotes, "local_full_model"]
+                            [
+                                *other_remotes,
+                                *(
+                                    [] if distributed_task_required
+                                    else ["local_full_model"]
+                                ),
+                            ]
                         ),
                         pure=True,
                     ))
@@ -5267,6 +5303,12 @@ def _execute_task_graph_chat_with_slot(
         if attempt.get("provider_node_id")
     })
     remote_used = bool(remote_attempts)
+    if distributed_task_required and not remote_used:
+        raise coded_http_error(
+            503,
+            "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
+            "distributed_required 未执行任何远端 Full Worker Stage。",
+        )
     provider_status_by_id = {
         str(item.get("provider_id", "")): item
         for item in task_graph_coordinator.provider_status()
@@ -5497,6 +5539,7 @@ def _execute_chat_full(
                 temperature=req.temperature,
                 top_p=req.top_p,
                 show_thinking=req.show_thinking,
+                routing_preference=req.routing_preference,
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 request_id=_request_id_ctx.get("-"),   # L5: 链路追踪
@@ -5601,6 +5644,8 @@ def _execute_chat_full(
                 session_id=req.session_id,
                 messages=list(history) + [{"role": "user", "content": req.message}],
                 show_thinking=req.show_thinking,
+                _require_distributed=(req.routing_preference == "distributed_required"),
+                _force_distributed_assignment=True,
                 _cancel_event=cancel_event,
             )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
@@ -6399,6 +6444,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 session_id=req.session_id,
                                 messages=[{"role": "user", "content": req.message}],
                                 show_thinking=req.show_thinking,
+                                _require_distributed=(req.routing_preference == "distributed_required"),
+                                _force_distributed_assignment=True,
                                 _cancel_event=cancel_event,
                             )):
                                 _append_event(event)
@@ -6432,6 +6479,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                                     temperature=req.temperature,
                                     top_p=req.top_p,
                                     session_id=req.session_id,
+                                    _require_distributed=(req.routing_preference == "distributed_required"),
+                                    _force_distributed_assignment=(req.routing_preference != "local_only"),
                                     _cancel_event=cancel_event,
                                 ),
                             )
@@ -6604,6 +6653,7 @@ async def chat_stream(req: ChatRequest, request: Request):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     show_thinking=req.show_thinking,
+                    routing_preference=req.routing_preference,
                     session_id=req.session_id,
                     messages=[{"role": "user", "content": req.message}],
                     request_id=request_id,
@@ -6662,6 +6712,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     session_id=req.session_id,
                     messages=[{"role": "user", "content": req.message}],
                     show_thinking=req.show_thinking,
+                    _require_distributed=(req.routing_preference == "distributed_required"),
+                    _force_distributed_assignment=True,
                     _cancel_event=cancel_event,
                 )):
                     yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
@@ -6699,6 +6751,8 @@ async def chat_stream(req: ChatRequest, request: Request):
                     temperature=req.temperature,
                     top_p=req.top_p,
                     session_id=req.session_id,
+                    _require_distributed=(req.routing_preference == "distributed_required"),
+                    _force_distributed_assignment=(req.routing_preference != "local_only"),
                     _cancel_event=cancel_event,
                 )
             )

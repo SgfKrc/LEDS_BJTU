@@ -1365,6 +1365,46 @@ def test_scheduler_experimental_gate_reports_physical_validation_pending(
     )
 
 
+def test_scheduler_does_not_advertise_worker_without_full_model_as_dispatchable(
+        monkeypatch):
+    import scheduler as scheduler_mod
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    monkeypatch.setattr(
+        scheduler_mod, "TASK_WORKER_EXPERIMENTAL_ENABLED", True,
+    )
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    scheduler._tcp_server = type("Server", (), {
+        "send_to_client": lambda self, *args: None,
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    worker = TaskWorkerControlPlane()
+    capabilities = {**_capabilities(), "models": []}
+    hello = worker.begin_worker_hello(
+        node_id="worker_01", capabilities=capabilities,
+    )
+    assert hello is not None
+    scheduler._handle_task_worker_message(
+        "worker_01", {"data": hello.snapshot()},
+    )
+
+    status = scheduler.get_task_worker_protocol_status()
+    assert status["connected_worker_count"] == 1
+    assert status["full_model_worker_count"] == 0
+    assert status["workers_missing_full_model"] == ["worker_01"]
+    assert status["experimental_dispatch_enabled"] is False
+    assert status["worker_readiness_reason"] == (
+        "task_worker_full_model_not_advertised"
+    )
+
+
 def test_scheduler_rejects_android_client_full_worker_claim(monkeypatch):
     from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
 

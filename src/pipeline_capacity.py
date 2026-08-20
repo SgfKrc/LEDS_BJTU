@@ -150,12 +150,17 @@ def solve_pipeline_capacity(
     nodes: list[dict[str, Any]],
     *,
     safety_margin: float = 1.2,
+    require_distributed: bool = False,
 ) -> dict[str, Any]:
     """Return an all-or-nothing contiguous layer placement.
 
     ``capacity_bytes`` must describe currently free memory, not installed
     physical memory. ``reserve_bytes`` is charged once to every participating
     node for allocator, activation, KV-cache and loading workspace headroom.
+    When ``require_distributed`` is true, a single-node full-model placement is
+    deliberately rejected; the returned plan must contain at least two
+    participating nodes. This is used by an explicitly distributed request,
+    while ordinary capacity inspection remains single-node efficient.
     """
 
     safety_margin = _positive_float(safety_margin, "safety_margin")
@@ -188,19 +193,35 @@ def solve_pipeline_capacity(
             **base,
             "status": "rejected",
             "admitted": False,
-            "reason_code": "pipeline_capacity_nodes_unavailable",
+            "reason_code": (
+                "pipeline_distributed_workers_unavailable"
+                if require_distributed
+                else "pipeline_capacity_nodes_unavailable"
+            ),
             "assignments": [],
             "control_only_nodes": [],
         }
+    if require_distributed and len(usable) < 2:
+        return {
+            **base,
+            "status": "rejected",
+            "admitted": False,
+            "reason_code": "pipeline_distributed_workers_unavailable",
+            "reason": "distributed placement requires at least two usable PC nodes",
+            "assignments": [],
+            "control_only_nodes": [node["node_id"] for node in usable],
+        }
 
     @lru_cache(maxsize=None)
-    def search(node_index: int, cursor: int, started: bool):
+    def search(node_index: int, cursor: int, started: bool, used_count: int):
         if cursor == total_layers:
+            if require_distributed and used_count < 2:
+                return None
             return ()
         if node_index >= len(usable):
             return None
         node = usable[node_index]
-        best = search(node_index + 1, cursor, started)
+        best = search(node_index + 1, cursor, started, used_count)
         remaining = total_layers - cursor
         for count in range(remaining, 0, -1):
             end = cursor + count
@@ -214,7 +235,7 @@ def solve_pipeline_capacity(
             required = _required_bytes(raw_bytes, node, safety_margin)
             if required > node["capacity_bytes"]:
                 continue
-            tail = search(node_index + 1, end, True)
+            tail = search(node_index + 1, end, True, used_count + 1)
             if tail is None:
                 continue
             item = (
@@ -244,7 +265,7 @@ def solve_pipeline_capacity(
                 best = candidate
         return best
 
-    solved = search(0, 0, False)
+    solved = search(0, 0, False, 0)
     if solved is None:
         allocatable_bytes = sum(
             max(0, node["capacity_bytes"] - node["reserve_bytes"])
@@ -254,7 +275,11 @@ def solve_pipeline_capacity(
             **base,
             "status": "rejected",
             "admitted": False,
-            "reason_code": "pipeline_cluster_capacity_insufficient",
+            "reason_code": (
+                "pipeline_distributed_capacity_insufficient"
+                if require_distributed
+                else "pipeline_cluster_capacity_insufficient"
+            ),
             "allocatable_bytes": allocatable_bytes,
             "raw_capacity_deficit_bytes": max(0, raw_model_bytes - allocatable_bytes),
             "assignments": [],
@@ -313,7 +338,7 @@ def solve_pipeline_capacity(
         **base,
         "status": "admitted",
         "admitted": True,
-        "reason_code": "",
+        "reason_code": "distributed_forced" if require_distributed else "",
         "plan_id": plan_id,
         "assignments": assignments,
         "control_only_nodes": [
@@ -321,5 +346,6 @@ def solve_pipeline_capacity(
         ],
         "participating_node_count": len(assignments),
         "single_node_full_model_candidates": full_model_fits,
-        "aggregate_only": not full_model_fits and len(assignments) > 1,
+        "aggregate_only": len(assignments) > 1,
+        "require_distributed": bool(require_distributed),
     }

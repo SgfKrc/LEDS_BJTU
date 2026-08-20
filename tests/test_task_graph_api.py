@@ -702,6 +702,77 @@ def test_task_graph_auto_remote_splits_one_candidate_to_one_worker(
     assert stages["aggregate"]["pure"] is False
 
 
+def test_task_graph_distributed_required_auto_assigns_remote_worker(
+    task_graph_api, monkeypatch,
+):
+    manager, coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="d" * 64,
+    )
+    provider = _remote_worker_provider(identity, "worker_01")
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "remote_task_worker_providers",
+        lambda: [provider],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+
+    response = asyncio.run(api_server.chat(api_server.ChatRequest(
+        message="required task split",
+        session_id="task-session",
+        execution_mode="task_graph",
+        routing_preference="distributed_required",
+        workflow_id="wf_requiredtaskauto01",
+    )))
+
+    assert response.metrics["distributed_used"] is True
+    assert response.metrics["distributed_kind"] == "task_graph_remote_auto"
+    assert response.metrics["workers_used"] == ["worker_01"]
+    workflow = coordinator.get("wf_requiredtaskauto01")
+    stages = {stage["stage_id"]: stage for stage in workflow["stages"]}
+    assert stages["candidate_a"]["requested_provider"] == provider.provider_id
+    assert stages["candidate_a"]["fallback_providers"] == []
+    assert len(manager.calls) == 2
+
+
+def test_task_graph_distributed_required_rejects_without_eligible_worker(
+    task_graph_api, monkeypatch,
+):
+    manager, _coordinator = task_graph_api
+    identity = ModelIdentity(
+        model_id="fake-model",
+        engine="llama_cpp",
+        format="gguf",
+        revision="local-test",
+        sha256="e" * 64,
+    )
+    monkeypatch.setattr(
+        api_server.scheduler, "remote_task_worker_providers", lambda: [],
+    )
+    monkeypatch.setattr(
+        api_server, "_active_task_graph_model_identity", lambda: identity,
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        asyncio.run(api_server.chat(api_server.ChatRequest(
+            message="required task no worker",
+            session_id="task-session",
+            execution_mode="task_graph",
+            routing_preference="distributed_required",
+            workflow_id="wf_requiredtasknone01",
+        )))
+
+    assert captured.value.status_code == 503
+    assert captured.value.error_code == "TASK_WORKER_NO_ELIGIBLE_REMOTE_PROVIDER"
+    assert manager.calls == []
+
+
 def test_task_graph_auto_remote_distributes_candidates_across_two_workers(
     task_graph_api, monkeypatch,
 ):
