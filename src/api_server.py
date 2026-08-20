@@ -134,6 +134,21 @@ from config import (
 import local_store as _local_store
 from rag_store import RagStore, RagStoreError
 from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
+from rag_ann import evaluate_ann_decision
+from cluster_join import (
+    JoinContractError,
+    JoinGrantLedger,
+    build_join_request,
+    decode_join_request,
+    decode_join_grant,
+    encode_join_grant,
+    encode_join_request,
+    generate_join_keypair,
+    issue_join_grant,
+    load_join_private_key,
+    verify_join_grant,
+    verify_and_consume_join_grant,
+)
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 _LOG_BUFFER_MAXLEN = 5000
@@ -146,6 +161,27 @@ _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
 _rag_store_lock = threading.RLock()
 _rag_store_instance: RagStore | None = None
+_join_ledger_lock = threading.RLock()
+_join_ledger_instance: JoinGrantLedger | None = None
+
+
+def _get_join_ledger() -> JoinGrantLedger:
+    """Use the same user-owned local SQLite file as the control plane."""
+    global _join_ledger_instance
+    with _join_ledger_lock:
+        if _join_ledger_instance is None:
+            _join_ledger_instance = JoinGrantLedger(_local_store.initialize_local_store())
+        return _join_ledger_instance
+
+
+def _join_endpoint_parts(endpoint: str) -> tuple[str, int]:
+    """Split host:port while preserving IPv6 bracket notation."""
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(f"//{endpoint}")
+    if not parsed.hostname or parsed.port is None:
+        raise JoinContractError("master_endpoint is invalid", code="invalid_endpoint")
+    return parsed.hostname, int(parsed.port)
 
 
 def _get_rag_store() -> RagStore:
@@ -1255,6 +1291,25 @@ class ConnectToMasterRequest(BaseModel):
         False,
         description="待配置节点显式切换为从节点后加入现有集群",
     )
+
+
+class ClusterJoinRequestCreate(BaseModel):
+    master_endpoint: str = Field(..., min_length=3, max_length=256)
+    target_node_id: Optional[str] = Field(default=None, max_length=128)
+    cluster_id: str = Field(default="", max_length=128)
+    capabilities: list[str] = Field(default_factory=lambda: ["presence", "task"], max_length=16)
+    request_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+
+
+class ClusterJoinGrantIssue(BaseModel):
+    request_code: Optional[str] = Field(default=None, max_length=16 * 1024)
+    request: Optional[dict[str, Any]] = None
+    auth_verified: bool = Field(default=False, description="由 Auth App 控制面确认后才允许签发")
+    ttl_seconds: int = Field(default=300, ge=60, le=900)
+
+
+class ClusterJoinConsume(BaseModel):
+    grant_code: str = Field(..., min_length=12, max_length=16 * 1024)
 
 
 class FirstConnectBootstrapRequest(BaseModel):
@@ -2367,12 +2422,33 @@ async def rag_capacity(dimensions: int = 768):
         raise HTTPException(status_code=503, detail="RAG 容量估算不可用") from exc
 
 
+@app.get("/api/rag/ann-decision")
+async def rag_ann_decision(scan_budget: int = 1_024):
+    """Return a conservative local ANN adoption decision, never a benchmark claim."""
+    try:
+        capacity = await run_in_threadpool(lambda: _get_rag_store().embedding_capacity(dimensions=1))
+        return {
+            "storage": "sqlite",
+            "decision": evaluate_ann_decision(
+                corpus_chunks=int(capacity["active_chunk_count"]),
+                scan_budget=scan_budget,
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="ann_decision_invalid") from exc
+    except RagStoreError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("RAG ANN decision failed: %s", exc)
+        raise HTTPException(status_code=503, detail="RAG ANN decision unavailable") from exc
+
+
 @app.post("/api/rag/embedding-jobs")
 async def rag_create_embedding_job(req: RagEmbeddingJobRequest):
     try:
         job = await run_in_threadpool(
             lambda: _get_rag_store().create_embedding_job(
-                provider=req.provider, model_sha256=req.model_sha256,
+                provider=req.provider, model_id=req.model_id, model_sha256=req.model_sha256,
                 source_id=req.source_id, batch_size=req.batch_size,
             )
         )
@@ -7655,6 +7731,170 @@ async def get_invite_info():
     用户将此信息提供给从节点，从节点在后台管理中输入并连接。
     """
     return scheduler.get_invite_info()
+
+
+@app.post("/api/cluster/join/request")
+async def create_cluster_join_request(req: ClusterJoinRequestCreate):
+    """Create a client-only request code on the node that wants to join."""
+    try:
+        current_node_id = scheduler.get_effective_node_id()
+        target_node_id = req.target_node_id or current_node_id
+        # A provisional master is still reported as ``master`` until the
+        # explicit role transition. Predict the same stable ID that
+        # Scheduler.get_effective_node_id() will use after client activation.
+        if target_node_id == "master":
+            target_node_id = "client_%s" % __import__("socket").gethostname()
+        elif req.target_node_id and target_node_id != current_node_id:
+            raise JoinContractError(
+                "target_node_id must match this node identity", code="request_mismatch"
+            )
+        cluster_id = req.cluster_id.strip() or os.environ.get("QLH_CLUSTER_ID", "qlh-default")
+        keypair = generate_join_keypair()
+        request = build_join_request(
+            master_endpoint=req.master_endpoint,
+            cluster_id=cluster_id,
+            target_node_id=target_node_id,
+            target_public_key=keypair.public_key,
+            request_ttl_seconds=req.request_ttl_seconds,
+            capabilities=req.capabilities,
+        )
+        ledger = _get_join_ledger()
+        ledger.save_pending_request(request, keypair)
+        code = encode_join_request(request)
+        return {
+            "status": "created",
+            "request": request,
+            "request_code": code,
+            "qr_payload": code,
+            "target_node_id": target_node_id,
+            "expires_at": request["request_expires_at"],
+            "storage": "sqlite",
+        }
+    except JoinContractError as exc:
+        raise HTTPException(400, {"code": exc.code, "message": str(exc)}) from exc
+    except Exception as exc:
+        logger.error("cluster join request creation failed: %s", exc, exc_info=True)
+        raise HTTPException(503, "本地入群请求存储不可用") from exc
+
+
+@app.post("/api/cluster/join/grant")
+async def issue_cluster_join_grant(req: ClusterJoinGrantIssue):
+    """Issue a short-lived client-only grant after explicit Auth App approval.
+
+    `auth_verified` is deliberately a control-plane seam. It must be wired to
+    the real Auth App/TOTP verifier before production exposure; this endpoint
+    never accepts a TOTP seed or code itself.
+    """
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可签发入群授权")
+    boolean_approval_enabled = os.environ.get(
+        "QLH_CLUSTER_JOIN_BOOLEAN_APPROVAL", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not boolean_approval_enabled:
+        raise HTTPException(
+            501,
+            {
+                "code": "auth_control_plane_unavailable",
+                "message": "真实 Auth App/TOTP 控制面尚未配置，拒绝布尔审批接缝",
+            },
+        )
+    if req.auth_verified is not True:
+        raise HTTPException(403, {"code": "auth_required", "message": "需要先完成 Auth App 审批"})
+    try:
+        if bool(req.request_code) == bool(req.request):
+            raise JoinContractError("request_code 或 request 必须且只能提供一个", code="invalid_request")
+        request = decode_join_request(req.request_code) if req.request_code else dict(req.request or {})
+        if req.request is not None:
+            encode_join_request(request)
+        ledger = _get_join_ledger()
+        key_id, keypair = ledger.get_or_create_issuer_keypair()
+        grant = issue_join_grant(
+            request,
+            issuer_key_id=key_id,
+            issuer_private_key=load_join_private_key(keypair.private_key),
+            issuer_public_key=keypair.public_key,
+            auth_verified=True,
+            ttl_seconds=req.ttl_seconds,
+        )
+        code = encode_join_grant(grant)
+        return {
+            "status": "issued",
+            "grant_code": code,
+            "qr_payload": code,
+            "issuer_key_id": key_id,
+            "issuer_public_key": keypair.public_key,
+            "target_node_id": request["target_node_id"],
+            "expires_at": grant["payload"]["expires_at"],
+            "auth_method": "totp",
+        }
+    except JoinContractError as exc:
+        status = 409 if exc.code in {"request_expired", "nonce_replayed"} else 400
+        raise HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
+    except Exception as exc:
+        logger.error("cluster join grant issuance failed: %s", exc, exc_info=True)
+        raise HTTPException(503, "本地主节点入群密钥不可用") from exc
+
+
+@app.post("/api/cluster/join/consume")
+async def consume_cluster_join_grant(req: ClusterJoinConsume):
+    """Verify a one-time grant, switch this node to client, and connect."""
+    try:
+        grant = decode_join_grant(req.grant_code)
+        payload = grant["payload"]
+        pending = _get_join_ledger().load_pending_request(str(payload.get("request_digest", "")))
+        if pending is None:
+            raise JoinContractError("本节点没有对应的待处理入群请求", code="request_not_found")
+        expected_request, _target_keypair = pending
+        current_node_id = scheduler.get_effective_node_id()
+        if current_node_id != expected_request.get("target_node_id"):
+            raise JoinContractError("授权目标节点与本节点不匹配", code="request_mismatch")
+        issuer_public_key = str(payload.get("issuer_public_key") or "")
+        ledger = _get_join_ledger()
+        verify_join_grant(
+            req.grant_code,
+            issuer_public_key=issuer_public_key,
+            expected_request=expected_request,
+        )
+        master_host, master_port = _join_endpoint_parts(str(payload["master_endpoint"]))
+        if scheduler._effective_role() == "master":
+            if not scheduler.can_join_existing_master():
+                raise JoinContractError("当前主节点不允许降级加入其他集群", code="role_switch_denied")
+            switch_result = await run_in_threadpool(
+                scheduler.activate_client_mode, master_host, master_port
+            )
+            if switch_result.get("status") == "denied":
+                raise JoinContractError(
+                    switch_result.get("reason", "无法切换为从节点"), code="role_switch_denied"
+                )
+            connection_result = switch_result.get("connect_result") or switch_result
+        else:
+            connection_result = await run_in_threadpool(
+                scheduler.connect_to_master, master_host, master_port
+            )
+        if connection_result.get("status") not in {"connected", "unchanged", "switched"}:
+            raise JoinContractError(
+                connection_result.get("reason", "连接主节点失败"), code="connect_failed"
+            )
+        verified = verify_and_consume_join_grant(
+            req.grant_code,
+            issuer_public_key=issuer_public_key,
+            expected_request=expected_request,
+            ledger=ledger,
+        )
+        ledger.delete_pending_request(str(expected_request["request_digest"]))
+        return {
+            "status": "connected",
+            "role": "client",
+            "node_id": verified["target_node_id"],
+            "master_endpoint": verified["master_endpoint"],
+            "message": "已验证一次性授权并降级为从节点",
+        }
+    except JoinContractError as exc:
+        status = 409 if exc.code in {"nonce_replayed", "request_not_found", "role_switch_denied", "connect_failed"} else 400
+        raise HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
+    except Exception as exc:
+        logger.error("cluster join grant consumption failed: %s", exc, exc_info=True)
+        raise HTTPException(500, "入群授权消费失败") from exc
 
 
 @app.post("/api/bootstrap/first-connect")
