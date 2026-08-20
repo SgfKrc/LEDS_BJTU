@@ -1,8 +1,8 @@
 # 集群接入稳定性与本地 RAG 实施计划
 
-> 状态：部分实施（NW3.1 本机开发门、NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`CLUSTER-JOIN-S0`/`CLUSTER-JOIN`、`SYNC-SSH-S0/S1/S2`、`RAG-S0/S1/S2/S3/S4/S5A/S5B/S5C/S5D` 代码与本地质量门已完成；T-RACE-6、真实 WSS/443、真实容量/模型 provider 长时 soak 和 ANN 基准仍待后续验收，2026-08-20）
+> 状态：部分实施（NW3.1 本机开发门、NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`T-RACE-6-A/B`、`B3`、`CLUSTER-JOIN-S0`/`CLUSTER-JOIN`、`SYNC-SSH-S0/S1/S2`、`RAG-S0/S1/S2/S3/S4/S5A/S5B/S5C/S5D` 代码与质量门已完成；T-RACE-6-C、真实 WSS/443、真实容量/模型 provider 长时 soak 和 ANN 基准仍待后续验收，2026-08-21）
 >
-> 更新日期：2026-08-19
+> 更新日期：2026-08-21
 >
 > 本文把手动加入集群、分布式角色与可用性审计、双机代码同步、主节点本地 RAG 和竞态/时序测试收敛为一组可独立排期的开发票。本文不把真实双机、CUDA、外部 SMTP、公开证书或公网可达性验收提前算作完成。
 
@@ -236,7 +236,10 @@ Ollama 提供本地 `/api/embed` 适配器，当前开发机部署基线为 `nom
 | `T-RACE-3` | Completed（本机确定性矩阵） | 层 reserve/prepare/ACK/release、generation 围栏、任务 epoch/winner/取消/lease expiry；`.venv-test` 调度/任务专项 `343 passed` |
 | `T-RACE-4` | Completed（本机故障矩阵） | SQLite WAL 提交中断/进程退出/重启恢复/operation_id 幂等重放、消息计数原子维护；签名补丁目标校验、半应用 journal、同目标重放和新目标 fencing；相关专项 `588 passed` |
 | `T-RACE-5` | Completed（本机随机压力门） | 三轮固定 seed、每轮 48 个，共 144 个；Transport/SQLite/任务图随机故障与同 epoch winner；`.venv-test` `3 passed / 43.26s`，失败证据保存 seed、操作序列和状态快照 |
-| `T-RACE-6` | Blocked by environment | 两台真实设备长连接、断网、升级和恢复联合验收 |
+| `T-RACE-6-A` | Completed（真实双机重启恢复，2026-08-21） | 主节点受控重启；Surface 自动重新注册并恢复 `remote_full_worker` provider；主节点重新加载 QW1.8B 后，`dual_candidate` 三 stage/三 attempt 完成，0 重试、0 重派、无 fallback |
+| `T-RACE-6-B` | Completed（运行中断节点，2026-08-21） | 运行中终止 Surface 服务，任务图记录 `remote_worker_disconnected`，重派次数 1，最终主节点 fallback；恢复服务并同步运行时开关后，hello ACK、完整模型重载和远端候选任务图再次通过 |
+| `T-RACE-6-C` | Scheduled（真实双机环境门） | 长时/多轮与资源 soak、升级/断电恢复；仍不得用一次重启 smoke 代替完整矩阵 |
+| `B3` | Completed（真实 Tailnet IPv6，2026-08-21） | Surface 强制以 IPv6 TCP 注册并保持健康；Full Worker hello 带精确 QW1.8B 身份；短 `dual_candidate` 使用远端 `candidate_a`，本地完成其余 Stage，`distributed_used=true`、无 fallback/重派。模型重载后旧 IPv4 自动重连仍需单独策略验收 |
 
 ### 6.2 最小场景矩阵
 
