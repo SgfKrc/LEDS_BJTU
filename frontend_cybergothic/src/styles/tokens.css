@@ -1,0 +1,119 @@
+/**
+ * 设计令牌 — 克制赛博哥特主题
+ *
+ * 所有颜色、边框、阴影、间距和动效时长都必须从这里取值。
+ * 组件内禁止直接写死色值（验收标准 §8）。
+ */
+
+:root {
+  /* ---- 表面与层级 ---- */
+  --bg: #0b0b0d;
+  --bg-deep: #070709;
+  --surface: #141419;
+  --surface-raised: #1b1b22;
+  --surface-sunken: #101014;
+  /* 半透明层：写成同色系 rgba 而非 color-mix，兼容性更稳 */
+  --surface-veil: rgba(11, 11, 13, 0.88); /* 吸顶栏毛玻璃底 */
+  --scrim: rgba(5, 5, 5, 0.72); /* 抽屉 / 移动导航遮罩 */
+
+  /* ---- 线条 ---- */
+  --line: rgba(255, 255, 255, 0.16);
+  --line-strong: rgba(255, 255, 255, 0.28);
+  --line-faint: rgba(255, 255, 255, 0.08);
+
+  /* ---- 文字 ---- */
+  --text: #f4f2ed;
+  --muted: #9c9aa2;
+  --muted-dim: #6f6d76;
+
+  /* ---- 主强调色（唯一主色，可按品牌替换） ---- */
+  --accent: #c7ff3d;
+  --accent-soft: rgba(199, 255, 61, 0.14);
+  --accent-line: rgba(199, 255, 61, 0.42);
+  --accent-ink: #0b0b0d; /* 主色背景上的文字色 */
+
+  /* ---- 状态色（仅表达状态，不作为装饰） ---- */
+  --info: #76c7ff;
+  --info-soft: rgba(118, 199, 255, 0.14);
+  --warn: #ffb454;
+  --warn-soft: rgba(255, 180, 84, 0.14);
+  --danger: #ff6b76;
+  --danger-soft: rgba(255, 107, 118, 0.14);
+
+  /* ---- 阴影与圆角 ---- */
+  --shadow-hard: 8px 8px 0 var(--bg-deep);
+  --shadow-hard-sm: 4px 4px 0 var(--bg-deep);
+  --shadow-hard-accent: 6px 6px 0 rgba(199, 255, 61, 0.22);
+  --radius-sm: 2px;
+  --radius-pill: 999px;
+
+  /* ---- 布局 ---- */
+  --content-max: 1180px;
+  --topbar-h: 60px;
+  --gap-xs: 6px;
+  --gap-sm: 10px;
+  --gap-md: 16px;
+  --gap-lg: 24px;
+  --gap-xl: 40px;
+  --gap-2xl: 64px;
+
+  /* ---- 字体 ---- */
+  --font-sans: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Cascadia Code',
+    Consolas, 'Courier New', monospace;
+  --font-display: 'Syne', 'Space Grotesk', -apple-system, 'Segoe UI',
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  /* ---- 动效时长（§5.4 动效规格） ---- */
+  --t-fast: 160ms;
+  --t-hover: 180ms;
+  --t-base: 240ms;
+  --t-reveal: 500ms;
+  --t-enter: 560ms;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-hard: cubic-bezier(0.16, 0.84, 0.44, 1);
+
+  /* ---- 切角（低圆角 + 斜切，替代大圆角卡片） ---- */
+  --cut-sm: 8px;
+  --cut-md: 14px;
+
+  /* ---- 平行四边形（控制台侧用它替代部分矩形） ---- */
+  --skew: -8deg; /* 统一倾角；内容要反向 skew 回来，否则文字会歪 */
+  --skew-back: 8deg;
+  --slant-sm: 10px; /* clip-path 用的水平位移量，等价于小尺寸倾角 */
+  --slant-md: 18px;
+
+  /* ---- 哥特侧（对话栏）---- */
+  --gothic-bg: #0a090c; /* 比控制台更冷、更深，带一点紫 */
+  --gothic-surface: #14111a;
+  --gothic-surface-raised: #1c1824;
+  --gothic-line: rgba(214, 198, 255, 0.18);
+  --gothic-line-strong: rgba(214, 198, 255, 0.34);
+  --gothic-ink: #ece7f5; /* 哥特侧正文：偏冷的象牙白 */
+  --gothic-muted: #a49bb8;
+  --gothic-accent: #d8b4ff; /* 苍紫，与控制台的酸绿区分左右两侧 */
+  --gothic-accent-soft: rgba(216, 180, 255, 0.14);
+  --gothic-accent-line: rgba(216, 180, 255, 0.45);
+  --gothic-gold: #d9c27a; /* 描边金，用于尖拱和首字下沉 */
+  --gothic-accent-ink: #17121f; /* 苍紫底上的文字 */
+  --gothic-bg-deep: #050408; /* 硬阴影用的最深色 */
+  --gothic-shadow: 8px 8px 0 #050408;
+  --arch: 96px; /* 尖拱跨度=高度；连券的单元格尺寸 */
+  --font-gothic: 'Cinzel', 'Times New Roman', 'Songti SC', 'SimSun', serif;
+
+  /* ---- 分屏 ---- */
+  --split-handle: 14px;
+  --split-min: 22%; /* 任一侧的最小占比，避免拖到不可用 */
+}
+
+/* 减少动效偏好：关闭视差、循环、弹簧，仅保留颜色/布局变化（§5.4 强制要求） */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t-fast: 1ms;
+    --t-hover: 1ms;
+    --t-base: 1ms;
+    --t-reveal: 1ms;
+    --t-enter: 1ms;
+  }
+}
