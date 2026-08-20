@@ -157,6 +157,71 @@ cd packaging
 
 ---
 
+## 打包范围与开发工具排除清单（红线）
+
+> **红线**：安装包**不得**包含各类辅助开发的自动化工具与 agent 工具。安装包只携带
+> 运行时、产品功能与发布必需的运维/文档文件；凡属于"开发/自动化/质量门/文档维护
+> agent"的内容一律不进包。
+>
+> 现状核查（2026-08-20）：当前 **Windows / Linux 两条打包链均未带入开发工具与 agent
+> 工具**（见下表"进包白名单"实测清单）。本清单用于固化边界，新增文件或改构建脚本时
+> 对照检查。
+
+### 各平台打包源范围
+
+| 平台/产物 | 打包源 | 说明 |
+|---|---|---|
+| Windows 主程序（Inno） | `dist\QLH-Edge-Inference\*`（PyInstaller 输出签名树） | 源 = PyInstaller dist，不是仓库根；`*` + `recursesubdirs` 只遍历 dist 树 |
+| Windows PyInstaller spec | `launcher.py` 引用链 + 显式 `datas` | `datas` 仅 `frontend/dist`、`model-tools/llama-quantize/...`；`hiddenimports` 仅 llama_cpp/engine/uvicorn/fastapi/transformers 等运行时 |
+| Linux .deb | `src/`（tar）+ `packaging/` 运行时 py + `frontend/dist` + model-tools | `build-deb.sh` 的 `SRC_DIR=src`（不含 scripts/docs/tools/fixtures 等） |
+| 独立工具 | `QLH-Model-Tools` / `QLH-Data-Retention` / `QLH-Install-Manifest` / `QLH-TUI-Chat` | 面向终端用户/安装运维的产品工具（单独 spec 构建） |
+
+### 进包白名单（dist\.{app} 实测清单，2026-08-20）
+
+| 项 | 内容 | 性质 |
+|---|---|---|
+| `_internal/` | PyInstaller 运行时（Python + dell 依赖 + hiddenimports） | 运行时 |
+| `docs/` | 仅 **README.md / 整体架构 / 核心技术原理 / 模块接口说明** 4 个 | 产品文档（by `build-cpu.bat` 白名单拷贝） |
+| `tools/` | `QLH-Data-Retention.exe`、`QLH-Install-Manifest.exe`、`convert_to_gguf.py` | 安装/数据运维与终端 GGUF 工具（产品） |
+| `model-tools/` `model-tools.bat` | 模型下载/GGUF 工具 | 产品功能 |
+| `QLH-TUI-Chat`、`bjtu.bat` | 终端聊天与启动脚本 | 产品功能 |
+| `pubkeys/`、`manifest/`、`version.txt`、`signing.py` | 验签公钥、安装清单、版本 | 发布必需 |
+| `QLH-Model-Tools` | 模型工具 CLI（独立 exe） | 产品功能 |
+
+### 永不进包（开发/自动化/agent）
+
+| 目录/文件 | 性质 |
+|---|---|
+| `scripts/`（仓库根） | 开发自动化/QE 门：`quality_gate_*`、`run_*`、`benchmark_*`、`experiment_*`、`smoke_*`、`doc_maintenance_audit.py`、`model_fleet_*`、`validate_*` 等 |
+| `docs/agent_tool/` | 文档维护 agent 扫描器（M1） |
+| `docs/`（除白名单 4 文档外的全部） | 专项/排期/问答/试验文档（含投机解码、抗弱网、任务链、RAG、排期等） |
+| `tools/`（仓库根） | `ssh_sync_*`、`patch_dispatch/patch_listener`、`modelscope_download` 等运维/部署工具 |
+| `tests/`、`fixtures/`、`schemas/` | 测试与开发资产 |
+| `local_docs/`、`build/`、`logs/`、`*.log`、`__pycache__` | 本地私有/构建/日志 |
+| `.reasonix/`、`.agents/`、`.claude/`、`.codex/`、`reasonix.toml`、`.env.docagent` | Agent / 助手配置与密钥引用（**任何情况下不得进包**） |
+| 根目录 `*.bat/sh`（除白名单 `bjtu.bat`） | 开发启动/维护脚本（`start_*`、`setup_*`、`run_simulation_tests.py` 等等） |
+
+### 分类边界（容易出现歧义，统一口径）
+
+- **仓库根 `scripts/`** = 开发自动化/QE/实验脚本，**永不进包**；`packaging/scripts/`（如
+  `convert_to_gguf.py`）是**打包侧产物、面向终端用户**，可进包。名字都叫 scripts，但**只有
+  `packaging/scripts/` 这一个例外**，且必须逐个白名单列出。
+- `QLH-Model-Tools` / `QLH-Data-Retention`（数据保留）/ `QLH-Install-Manifest`（安装清单）/
+  `QLH-TUI-Chat` 属于**产品/安装运维工具**，可进包；`tools/`（仓库根）的 SSH 补丁同步、
+  补丁收发是**开发/运维自动化**，不进包。
+- `docs/` 只进 4 个白名单文档（README/架构/核心技术/模块接口），其余一律不进。
+
+### 防回归检查点（改打包时对照）
+
+1. 新增功能文件 → 先问"是运行时/产品，还是开发自动化/agent"；后者绝不加进 `datas`/构建拷贝。
+2. 改 `build-cpu.bat`/`build-cuda.bat`/`build-deb.sh` 的 copy/打包清单 → 逐条核对不会
+   把 `scripts/`、`docs/`（非白名单）、`tools/`、`fixtures/`、agent 配置带进去。
+3. 打包后核对 `dist\QLH-Edge-Inference\` 顶层清单：应只出现本节"进包白名单"的条目；
+   若出现 `scripts/`、`docs/`（远超 4 份）、`agent_tool`、`ssh_sync_*`、`.reasonix` 等即回归，禁止发布。
+4. 超过 2 份文档进 `docs/`、任何 `packaging/spec` 引入新 `datas` 指向根目录开发目录 → 需评审。
+
+---
+
 ## 文件说明
 
 ### PyInstaller Spec 文件
