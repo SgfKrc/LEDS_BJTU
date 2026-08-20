@@ -157,6 +157,41 @@ cd packaging
 
 ---
 
+## 瘦身安装包（SLIM：PyTorch 系改为外部运行时依赖）
+
+> **为什么**：qlh-cpu.spec / qlh-cuda.spec 把 torch/transformers 等打进包体，
+> 集显包 ~734MB、独显包可达 1.7GB+（实测 dist CUDA 甚至 13GB）。更新一次安装包
+> 就要重装整包大 PyTorch。瘦身包把 PyTorch 系**移出安装包**，由启动器每次启动
+> 自动检查外部运行时依赖、缺失就 pip 引导，安装包更新只换小包。
+
+**构建（需先构建前端）**：
+
+```bash
+cd frontend && npm run build                                # 生成 frontend/dist
+.venv-packaging\Scripts\python -m PyInstaller packaging\qlh-slim.spec --noconfirm
+# 产物: dist\QLH-Edge-Inference\  （仅引导器 + _internal/src + frontend/dist +
+#       requirements-runtime-{cpu,cuda}.txt + pubkeys，不含 torch 系）
+```
+
+**首次启动（自动）**：`QLH-Edge-Inference.exe`（= qlh_launcher）识别瘦身包后：
+1. 检查用户级外部运行时 venv `%LOCALAPPDATA%\QLH-Edge-Inference\runtime`；
+2. probe 必需模块（torch/transformers/accelerate/fastapi/uvicorn/httpx/psutil/dotenv/llama_cpp）；
+3. 缺失则按引擎 pip 引导：
+   - **CPU**：`pip install torch --index-url https://download.pytorch.org/whl/cpu` **单独装 torch**，
+     再 `pip install -r requirements-runtime-cpu.txt`（其余走默认 PyPI——不要对整条
+     `-r` 加 `--index-url`，PyTorch 索引没有 transformers 等）；
+   - **CUDA**：`pip install -r requirements-runtime-cuda.txt`（torch 官方默认 CUDA wheel）；
+   - 代理走 `QLH_RUNTIME_PROXY` / `QLH_HTTP_PROXY`；
+4. 用该 venv 的 python 以 `_internal` 为 cwd 运行 `-m uvicorn src.api_server:app :8000`。
+
+**引擎选择**：`QLH_RUNTIME_ENGINE=cpu|cuda` 或启动参数 `--variant cpu|cuda`；手动诊断
+`QLH-Edge-Inference.exe --runtime-check [--runtime-engine cpu|cuda]`。
+
+**与旧 spec 的关系**：`qlh-cpu.spec`/`qlh-cuda.spec` 保留（向后兼容全量打包）；生产安装推荐改用
+`qlh-slim.spec` 瘦身包。运行时升级只 `pip upgrade`，不重装安装包。
+
+---
+
 ## 打包范围与开发工具排除清单（红线）
 
 > **红线**：安装包**不得**包含各类辅助开发的自动化工具与 agent 工具。安装包只携带

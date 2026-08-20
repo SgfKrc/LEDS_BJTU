@@ -1,0 +1,24 @@
+# ============================================================
+# QLH 外部运行时依赖（CUDA 版）— 安装包不携带，由启动器每次启动检查并 pip 引导
+# ============================================================
+# 与 CPU 版差别仅在 torch 安装源：CUDA 走官方默认源（torch 二进制带 CUDA），
+# 由 qlh_launcher 在 engine=cuda 时自动安装：
+#   python -m pip install -r requirements-runtime-cuda.txt
+# 升级运行时只 pip upgrade，不重装安装包。
+
+torch>=2.2.0
+transformers>=4.47.0,<4.48.0
+accelerate>=1.0.0
+transformers-stream-generator>=0.0.4
+einops>=0.6.0
+tiktoken>=0.5.0
+bitsandbytes>=0.45.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.12
+httpx>=0.28.1,<0.29.0
+pandas>=2.0.0
+tqdm>=4.65.0
+psutil>=5.9.0
+python-dotenv>=1.0.0
+llama-cpp-python>=0.3.0

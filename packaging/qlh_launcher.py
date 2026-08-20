@@ -101,7 +101,10 @@ def installed_app_root(preferred_variant: str | None = None) -> Path | None:
             return root
         if os.name != "nt" and (root / "bin" / "qlh-app").is_file():
             return root
-        if not getattr(sys, "frozen", False) and (root / "src" / "api_server.py").is_file():
+        if (root / "src" / "api_server.py").is_file():
+            return root
+        # 瘦身安装包（PyInstaller datas 把 src 收进 _internal/）
+        if (root / "_internal" / "src" / "api_server.py").is_file():
             return root
     return None
 
@@ -143,6 +146,91 @@ def diagnosis_app_root(preferred_variant: str | None = None) -> Path | None:
     return None
 
 
+def _slim_src_root(root: Path) -> Path | None:
+    """瘦身安装包识别：``_internal/src/api_server.py`` 存在（src 由 datas 收进
+    ``_internal/`` 且无打包 exe 主程序）→ 返回 ``_internal`` 作为 uvicorn 的 cwd。
+
+    瘦身包形态仅 **Windows Inno 安装**；Linux deb 已用包内 venv 运行时形态，
+    不适用本分支。非 nt 直接返回 None —— 也避免 Python 3.12 下 ``Path``
+    按被 mock 的 ``os.name`` 实例化 PosixPath 而崩（Linux 模拟单测）。"""
+    if os.name != "nt":
+        return None
+    internal = Path(root).expanduser() / "_internal"
+    if (internal / "src" / "api_server.py").is_file() and not (
+        Path(root).expanduser() / "QLH-Edge-Inference.exe"
+    ).is_file():
+        return internal
+    return None
+
+
+def _requirements_path(root: Path, engine: str) -> Path:
+    """外部运行时清单位置：优先安装树内 _internal/packaging/，其次打包树根。"""
+    candidates = [
+        Path(root).expanduser() / "_internal" / "packaging"
+        / f"requirements-runtime-{engine}.txt",
+        Path(root).expanduser() / "packaging" / f"requirements-runtime-{engine}.txt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+def _runtime_proxy() -> str:
+    """运行时引导代理：QLH_RUNTIME_PROXY > QLH_HTTP_PROXY > 空。"""
+    return (
+        os.environ.get("QLH_RUNTIME_PROXY", "").strip()
+        or os.environ.get("QLH_HTTP_PROXY", "").strip()
+        or ""
+    )
+
+
+def runtime_app_command(root: Path, *, engine: str | None = None) -> list[str] | None:
+    """瘦身包：确保外部运行时就绪（缺失则 pip 引导），返回以外部 runtime venv 的
+    python 启动 uvicorn 的命令。引擎缺失/引导失败 → None。"""
+    from runtime_guard import RuntimeContext, runtime_dir, venv_python, ensure_runtime
+    engine = (engine or os.environ.get("QLH_RUNTIME_ENGINE", "cpu")).strip().lower()
+    if engine not in {"cpu", "cuda"}:
+        engine = "cpu"
+    root = Path(root).expanduser()
+    requirements = _requirements_path(root, engine)
+    ctx = RuntimeContext(
+        root=root, engine=engine, requirements=requirements, proxy=_runtime_proxy(),
+    )
+    report = ensure_runtime(ctx)
+    if report["state"] not in {"ok", "installed"}:
+        return None
+    python = venv_python(runtime_dir())
+    return [
+        str(python), "-m", "uvicorn", "src.api_server:app",
+        "--host", "0.0.0.0", "--port", "8000",
+    ]
+
+
+def _runtime_check_main(args: Any) -> int:
+    """只读诊断：检查/引导外部运行时并输出 JSON 状态（不启动主程序）。"""
+    from runtime_guard import RuntimeContext, runtime_dir, venv_python, ensure_runtime
+    root = Path(args.root).expanduser() if args.root else (
+        installed_app_root(args.variant) or Path.cwd()
+    )
+    engine = (getattr(args, "runtime_engine", None)
+              or os.environ.get("QLH_RUNTIME_ENGINE", "cpu")).strip().lower()
+    if engine not in {"cpu", "cuda"}:
+        engine = "cpu"
+    requirements = _requirements_path(root, engine)
+    ctx = RuntimeContext(
+        root=root, engine=engine, requirements=requirements, proxy=_runtime_proxy(),
+    )
+    report = ensure_runtime(ctx)
+    keys = ("state", "created", "exit", "missing_before", "missing_after", "error")
+    summary = {"state": report["state"], "runtime_python": str(venv_python(runtime_dir()))}
+    for key in keys:
+        if key in report:
+            summary[key] = report[key]
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if report["state"] in {"ok", "installed"} else 1
+
+
 def app_command(mode: str, variant_override: str | None = None) -> list[str]:
     root = installed_app_root(variant_override)
     if root is None:
@@ -153,6 +241,15 @@ def app_command(mode: str, variant_override: str | None = None) -> list[str]:
         auto_reassociate_user_data(root)
     except DataRetentionError as exc:
         raise OSError(f"保留数据重新关联失败: {exc}") from exc
+    # ---- 瘦身包：无打包 exe，外部运行时由 runtime_guard 引导，以源码跑 uvicorn ----
+    slim = _slim_src_root(root)
+    if slim is not None:
+        command = runtime_app_command(root, engine=variant_override)
+        if command is not None:
+            return command
+        raise FileNotFoundError(
+            "外部运行时依赖未就绪或引导失败（CPU/CUDA）；请运行 --runtime-check 查看",
+        )
     if os.name == "nt":
         app = root / "QLH-Edge-Inference.exe"
         if app.is_file():
@@ -174,7 +271,10 @@ def app_command(mode: str, variant_override: str | None = None) -> list[str]:
 def launch_app(mode: str, variant_override: str | None = None) -> subprocess.Popen:
     command = app_command(mode, variant_override)
     root = installed_app_root(variant_override) or install_root()
-    return subprocess.Popen(command, cwd=str(root))
+    slim = _slim_src_root(root)
+    # 瘦身包以 _internal 作为 cwd（uvicorn 需可 import src.api_server）
+    cwd = str(slim) if slim is not None else str(root)
+    return subprocess.Popen(command, cwd=cwd)
 
 
 def _delegate_to_active_launcher(argv: list[str]) -> int | None:
@@ -986,6 +1086,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", help="install root for verify, diagnose, or repair")
     parser.add_argument("--data-root", help="external user-data root for UP-N6.4")
     parser.add_argument("--level", choices=("quick", "full", "deep"), default="quick")
+    parser.add_argument("--runtime-check", action="store_true",
+                        help="检查/引导外部运行时依赖（瘦身包），不启动主程序")
+    parser.add_argument("--runtime-engine", choices=("cpu", "cuda"),
+                        help="外部运行时引擎（瘦身包）；默认 QLH_RUNTIME_ENGINE 或 cpu")
     parser.add_argument("--error", help="optional local startup error text for diagnose")
     parser.add_argument("--diagnosis-output", help="local JSON output path for diagnose")
     parser.add_argument("--repair-output", help="local JSON output path for repair")
@@ -1004,6 +1108,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.health_check:
         return _self_health_check()
+    if args.runtime_check:
+        return _runtime_check_main(args)
     if args.command not in {
         "check", "download", "install", "version-status", "version-stage",
         "version-activate", "version-rollback", "version-recover",
