@@ -149,6 +149,7 @@ from cluster_join import (
     verify_join_grant,
     verify_and_consume_join_grant,
 )
+from node_config import load_node_config, write_node_config
 
 _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 _LOG_BUFFER_MAXLEN = 5000
@@ -483,6 +484,103 @@ _device_profile_started = False
 
 # 调度器（单机 / 分布式模式共用）
 scheduler: ClusterScheduler = ClusterScheduler()
+_task_graph_runtime_lock = threading.RLock()
+
+
+def _sync_task_worker_runtime_module(enabled: bool) -> None:
+    """Synchronize the flag with the module owning the live scheduler."""
+    import scheduler as scheduler_module
+
+    scheduler_modules = {
+        scheduler_module,
+        sys.modules.get(type(scheduler).__module__),
+    }
+    for module in scheduler_modules:
+        if module is not None:
+            module.TASK_WORKER_EXPERIMENTAL_ENABLED = bool(enabled)
+
+
+# Keep a persisted feature flag effective even when package and legacy module
+# imports resolve to different scheduler module names during server startup.
+_sync_task_worker_runtime_module(TASK_WORKER_EXPERIMENTAL_ENABLED)
+
+
+def _task_graph_feature_settings() -> dict[str, Any]:
+    """Return the user-owned task-graph switches and their control state."""
+    role = scheduler._effective_role()
+    return {
+        "task_graph_enabled": bool(TASK_GRAPH_ENABLED),
+        "task_worker_experimental_enabled": bool(
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+        ),
+        "can_toggle": role == "master",
+        "physical_validation_pending": bool(
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+            and scheduler.get_task_worker_protocol_status().get(
+                "admission_state"
+            ) == "n2_4_experimental_physical_validation_pending"
+        ),
+    }
+
+
+def _persist_task_graph_feature_settings(
+    *, task_graph_enabled: bool, task_worker_experimental_enabled: bool,
+) -> None:
+    data = load_node_config()
+    features = data.get("features") if isinstance(data.get("features"), dict) else {}
+    data["features"] = {
+        **features,
+        "task_graph_enabled": bool(task_graph_enabled),
+        "task_worker_experimental_enabled": bool(
+            task_worker_experimental_enabled
+        ),
+    }
+    write_node_config(data)
+
+
+def _set_task_graph_runtime_settings(
+    *, task_graph_enabled: bool | None = None,
+    task_worker_experimental_enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Apply task-graph switches to already imported modules.
+
+    Worker dispatch remains independently gated by readiness/admission; this
+    setter only opens the experimental control-plane switch.
+    """
+    global TASK_GRAPH_ENABLED, TASK_WORKER_EXPERIMENTAL_ENABLED
+    with _task_graph_runtime_lock:
+        import config as cfg
+
+        next_graph = bool(TASK_GRAPH_ENABLED if task_graph_enabled is None else task_graph_enabled)
+        next_worker = bool(
+            TASK_WORKER_EXPERIMENTAL_ENABLED
+            if task_worker_experimental_enabled is None
+            else task_worker_experimental_enabled
+        )
+        graph_changed = next_graph != bool(TASK_GRAPH_ENABLED)
+        TASK_GRAPH_ENABLED = next_graph
+        TASK_WORKER_EXPERIMENTAL_ENABLED = next_worker
+        cfg.TASK_GRAPH_ENABLED = next_graph
+        cfg.TASK_WORKER_EXPERIMENTAL_ENABLED = next_worker
+        _sync_task_worker_runtime_module(next_worker)
+
+        if graph_changed:
+            old_coordinator = globals().get("task_graph_coordinator")
+            new_coordinator = _create_task_graph_coordinator()
+            globals()["task_graph_coordinator"] = new_coordinator
+            if old_coordinator is not None and old_coordinator is not new_coordinator:
+                try:
+                    old_coordinator.close()
+                except Exception:
+                    logger.warning("旧任务图协调器关闭失败", exc_info=True)
+            if next_graph and scheduler._effective_role() == "master":
+                _ensure_local_task_provider()
+
+        _persist_task_graph_feature_settings(
+            task_graph_enabled=next_graph,
+            task_worker_experimental_enabled=next_worker,
+        )
+        return _task_graph_feature_settings()
 
 
 def _sync_local_diffusion_worker(
@@ -6926,21 +7024,27 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
         and bool(item.get("available"))
         for item in provider_status
     )
+    local_available = bool(
+        TASK_GRAPH_ENABLED
+        and role == "master"
+        and bool(journal.get("available", False))
+        and not provider_error
+    )
     return {
         "enabled": TASK_GRAPH_ENABLED,
-        "available": (
-            TASK_GRAPH_ENABLED
-            and role == "master"
-            and bool(journal.get("available", False))
-            and not provider_error
-            and local_provider_ready
-        ),
+        # ``available`` retains provider-readiness semantics for API clients;
+        # the UI uses ``local_available`` so physical Worker admission cannot
+        # lock the local experiment selector.
+        "available": bool(local_available and local_provider_ready),
+        "local_available": local_available,
+        "local_provider_ready": local_provider_ready,
         "role": role,
         "templates": ["dual_candidate"],
         "providers": task_graph_coordinator.provider_ids(),
         "provider_status": provider_status,
         "provider_error": provider_error,
         "worker_protocol": scheduler.get_task_worker_protocol_status(),
+        "controls": _task_graph_feature_settings(),
         "image_worker_protocol": scheduler.get_diffusion_worker_protocol_status(),
         "image_workflow": {
             "enabled": bool(
@@ -6984,7 +7088,7 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
         },
         "journal": public_journal,
         "workflows": workflows,
-    }
+}
 
 
 @app.post("/api/workflows/journal/cleanup")
@@ -8411,6 +8515,35 @@ async def cancel_queue_task(task_id: str):
 # ============================================================
 # 分布式推理开关 API
 # ============================================================
+
+class TaskGraphConfigRequest(BaseModel):
+    enabled: Optional[bool] = Field(default=None, description="是否启用任务链本地实验")
+    worker_experimental_enabled: Optional[bool] = Field(
+        default=None, description="是否打开 PC Full Worker 实验控制面"
+    )
+
+
+@app.get("/api/cluster/config/task-graph")
+async def get_task_graph_config():
+    """Read task-graph experiment switches without claiming physical readiness."""
+    return _task_graph_feature_settings()
+
+
+@app.put("/api/cluster/config/task-graph")
+async def set_task_graph_config(req: TaskGraphConfigRequest):
+    """Toggle local task-graph experiments; production Worker dispatch stays gated."""
+    if scheduler._effective_role() != "master":
+        raise HTTPException(403, "仅主节点可切换任务链实验开关")
+    if req.enabled is None and req.worker_experimental_enabled is None:
+        raise HTTPException(400, "至少提供一个任务链开关")
+    try:
+        return _set_task_graph_runtime_settings(
+            task_graph_enabled=req.enabled,
+            task_worker_experimental_enabled=req.worker_experimental_enabled,
+        )
+    except Exception as exc:
+        logger.error("任务链运行时开关更新失败", exc_info=True)
+        raise HTTPException(500, f"任务链实验开关更新失败: {exc}") from exc
 
 @app.get("/api/cluster/config/distributed-inference")
 async def get_distributed_inference_config():

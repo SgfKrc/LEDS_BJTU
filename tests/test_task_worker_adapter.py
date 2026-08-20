@@ -965,6 +965,103 @@ def test_scheduler_binds_full_worker_hello_to_registered_pc_client(monkeypatch):
     ] == 1
 
 
+def test_scheduler_full_worker_hello_releases_layer_reservation(monkeypatch):
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    opted_out = []
+    scheduler._tcp_server = type("Server", (), {
+        "send_to_client": lambda self, node_id, data, message_type: sent.append(
+            (node_id, data, message_type)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    monkeypatch.setattr(
+        scheduler,
+        "_handle_layer_worker_opt_out",
+        lambda node_id, msg: opted_out.append((node_id, msg)),
+    )
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="worker_01", capabilities=_capabilities(),
+    )
+    assert hello is not None
+
+    scheduler._handle_task_worker_message(
+        "worker_01", {"data": hello.snapshot()},
+    )
+
+    assert sent[0][1]["payload"]["accepted"] is True
+    assert opted_out == [("worker_01", {"data": {"node_id": "worker_01"}})]
+
+
+def test_full_task_worker_takes_precedence_over_automatic_layer_assignment(
+    monkeypatch,
+):
+    import scheduler as scheduler_mod
+    from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
+
+    monkeypatch.setattr(
+        scheduler_mod, "TASK_WORKER_EXPERIMENTAL_ENABLED", True,
+    )
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    scheduler.nodes["worker_01"] = NodeInfo(
+        node_id="worker_01",
+        role=NodeRole.CLIENT,
+        node_type="pc",
+        state=NodeState.ONLINE,
+    )
+    sent = []
+    scheduler._tcp_server = type("Server", (), {
+        "_running": True,
+        "clients": {"worker_01": object()},
+        "get_client_ids": lambda self: ["worker_01"],
+        "send_layer_config": lambda self, node_id, payload: sent.append(
+            (node_id, payload)
+        ),
+    })()
+    monkeypatch.setattr(scheduler, "get_effective_node_id", lambda: "master")
+    monkeypatch.setattr(
+        scheduler,
+        "get_layer_assignments",
+        lambda: {"assignments": [
+            {"node_id": "master", "start_layer": 0, "end_layer": 21},
+            {"node_id": "worker_01", "start_layer": 21, "end_layer": 24},
+        ]},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_active_pipeline_model_info",
+        lambda: {
+            "model_id": "qwen-1_8b",
+            "model_sha256": "1" * 64,
+            "model_type": "qwen",
+            "total_layers": 24,
+            "quant_type": "fp16",
+        },
+    )
+    monkeypatch.setattr(
+        scheduler, "_task_worker_full_model_ids", lambda: {"worker_01"},
+    )
+
+    scheduler.push_layer_config_to_clients()
+
+    assert sent
+    assert sent[-1][0] == "worker_01"
+    assert sent[-1][1]["release"] is True
+    assert "start_layer" not in sent[-1][1]
+    assert "worker_01" in scheduler._pipeline_worker_opt_out
+
+
 def test_scheduler_routes_opted_in_diffusion_hello_over_shared_tcp(monkeypatch):
     import scheduler as scheduler_mod
     from scheduler import NodeInfo, NodeRole, NodeState, Scheduler
@@ -1462,6 +1559,32 @@ def test_scheduler_does_not_advertise_a_layer_partition_as_full_model(
     assert capabilities["stage_types"] == [
         "full_inference", "aggregate", "image_prompt",
     ]
+
+
+def test_scheduler_advertises_modelhost_loaded_model_without_legacy_is_loaded(
+    monkeypatch,
+):
+    """The ModelHost loaded-state proxy is sufficient for Full Worker hello."""
+    from scheduler import Scheduler
+
+    identity = ModelIdentity(
+        model_id="qwen-1_8b",
+        engine="pytorch",
+        format="safetensors",
+        revision="local-rev1",
+        sha256="2" * 64,
+    )
+    fake_host = SimpleNamespace(
+        has_loaded_model=lambda: True,
+        layer_range=None,
+        _active_task_graph_model_identity=lambda: identity,
+    )
+    scheduler = Scheduler()
+    monkeypatch.setattr(scheduler, "_host", fake_host)
+
+    capabilities = scheduler._task_worker_capabilities()
+
+    assert capabilities["models"] == [identity.snapshot()]
 
 
 def test_scheduler_worker_gate_blocks_hello_and_rejects_stale_offer(

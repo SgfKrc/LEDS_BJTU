@@ -119,6 +119,65 @@ def task_graph_api(monkeypatch):
     return manager, coordinator
 
 
+def test_task_graph_config_can_open_local_experiment_without_physical_worker(
+    task_graph_api, monkeypatch,
+):
+    """The UI switch controls the experiment gate, not physical admission."""
+    import config as config_module
+    import scheduler as scheduler_module
+    monkeypatch.setattr(config_module, "TASK_GRAPH_ENABLED", config_module.TASK_GRAPH_ENABLED)
+    monkeypatch.setattr(
+        config_module,
+        "TASK_WORKER_EXPERIMENTAL_ENABLED",
+        config_module.TASK_WORKER_EXPERIMENTAL_ENABLED,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "TASK_WORKER_EXPERIMENTAL_ENABLED",
+        scheduler_module.TASK_WORKER_EXPERIMENTAL_ENABLED,
+    )
+    monkeypatch.setattr(api_server, "TASK_GRAPH_ENABLED", False)
+    monkeypatch.setattr(api_server, "TASK_WORKER_EXPERIMENTAL_ENABLED", False)
+    monkeypatch.setattr(api_server, "load_node_config", lambda: {})
+    saved = {}
+    monkeypatch.setattr(api_server, "write_node_config", lambda data: saved.update(data))
+    monkeypatch.setattr(
+        api_server.scheduler,
+        "get_task_worker_protocol_status",
+        lambda: {
+            "admission_state": "n2_4_experiment_enabled_not_connected",
+        },
+    )
+
+    result = asyncio.run(api_server.set_task_graph_config(
+        api_server.TaskGraphConfigRequest(
+            enabled=True,
+            worker_experimental_enabled=True,
+        )
+    ))
+
+    assert result["task_graph_enabled"] is True
+    assert result["task_worker_experimental_enabled"] is True
+    assert result["physical_validation_pending"] is False
+    live_scheduler_module = sys.modules[
+        type(api_server.scheduler).__module__
+    ]
+    assert live_scheduler_module.TASK_WORKER_EXPERIMENTAL_ENABLED is True
+    assert saved["features"] == {
+        "task_graph_enabled": True,
+        "task_worker_experimental_enabled": True,
+    }
+
+
+def test_task_graph_config_is_master_only(monkeypatch):
+    monkeypatch.setattr(api_server.scheduler, "_effective_role", lambda: "client")
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api_server.set_task_graph_config(
+            api_server.TaskGraphConfigRequest(enabled=True)
+        ))
+    assert exc_info.value.status_code == 403
+
+
 def _remote_worker_provider(
     identity: ModelIdentity,
     node_id: str,
