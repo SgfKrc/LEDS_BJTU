@@ -159,13 +159,28 @@ def apply_node_config_to_env(
         cluster.get("master_api_port") if node.get("role") == "master" else None,
         overwrite=overwrite,
     )
+    # Feature gates are user-owned runtime preferences.  Keeping them in the
+    # node config lets the settings UI survive a restart without putting the
+    # flags (or any secrets) into the repository.
+    features = data.get("features") if isinstance(data.get("features"), dict) else {}
+    # Unlike transport identity, these switches are deliberately controlled
+    # by the user's settings UI and therefore override a stale process-level
+    # .env value on startup.
+    _set_env_value("QLH_TASK_GRAPH_ENABLED", features.get("task_graph_enabled"), overwrite=True)
+    _set_env_value(
+        "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED",
+        features.get("task_worker_experimental_enabled"),
+        overwrite=True,
+    )
     return data
 
 
 def build_bootstrap_config(response: dict[str, Any]) -> dict[str, Any]:
     cluster = response.get("cluster") if isinstance(response.get("cluster"), dict) else {}
     node = response.get("node") if isinstance(response.get("node"), dict) else {}
-    return {
+    existing = load_node_config()
+    features = existing.get("features") if isinstance(existing.get("features"), dict) else {}
+    result = {
         "bootstrapped": True,
         "cluster": {
             "cluster_id": cluster.get("cluster_id", "qlh-default"),
@@ -183,6 +198,9 @@ def build_bootstrap_config(response: dict[str, Any]) -> dict[str, Any]:
         },
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if features:
+        result["features"] = dict(features)
+    return result
 
 
 def persist_bootstrap_response(response: dict[str, Any]) -> Path:

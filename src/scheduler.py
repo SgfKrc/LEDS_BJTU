@@ -3394,9 +3394,36 @@ class Scheduler:
         }
 
     def push_layer_config_to_clients(self) -> None:
-        """串行生成并下发层配置，防止多个 config_id 交错到达从节点。"""
         with self._layer_config_push_lock:
             self._push_layer_config_to_clients_locked()
+
+    def _task_worker_full_model_ids(self) -> set[str]:
+        """Return healthy Task Worker peers that advertise a full model."""
+        if (
+            self._effective_role() != "master"
+            or not TASK_WORKER_EXPERIMENTAL_ENABLED
+        ):
+            return set()
+        try:
+            status = self._task_worker_control.status(role="master")
+        except Exception:
+            return set()
+        worker_ids: set[str] = set()
+        for worker in status.get("workers", []):
+            if not isinstance(worker, dict):
+                continue
+            if not (
+                worker.get("healthy")
+                and worker.get("accepted")
+                and worker.get("manual_stage_dispatch_enabled")
+            ):
+                continue
+            capabilities = worker.get("capabilities") or {}
+            if isinstance(capabilities, dict) and capabilities.get("models"):
+                node_id = str(worker.get("node_id", "") or "")
+                if node_id:
+                    worker_ids.add(node_id)
+        return worker_ids
 
     def request_authoritative_layer_sync(
         self, *, require_distributed: bool = False,
@@ -3453,12 +3480,22 @@ class Scheduler:
                 and getattr(node, "node_type", "pc") == "pc"
             }
 
+        # A healthy full-model Task Worker has priority over legacy automatic
+        # layer assignment. Keep its local model intact and release any stale
+        # layer reservation instead of reassigning a subset of layers.
+        full_worker_release_ids = (
+            releasable_pc_ids & self._task_worker_full_model_ids()
+        )
+        layer_releasable_pc_ids = releasable_pc_ids - full_worker_release_ids
+
         with self._layer_config_lock:
+            if full_worker_release_ids:
+                self._pipeline_worker_opt_out.update(full_worker_release_ids)
             authoritative_sync = bool(
                 self._authoritative_layer_sync_requests
             )
             reenabled_nodes = (
-                self._pipeline_worker_opt_out & releasable_pc_ids
+                self._pipeline_worker_opt_out & layer_releasable_pc_ids
                 if authoritative_sync else set()
             )
             if reenabled_nodes:
@@ -3512,7 +3549,7 @@ class Scheduler:
                     logger.info(
                         "分布式请求忽略单机手动分层覆盖，改用多节点容量求解"
                     )
-                eligible_node_ids = set(releasable_pc_ids)
+                eligible_node_ids = set(layer_releasable_pc_ids)
                 eligible_node_ids.update({"master", self.get_effective_node_id()})
                 capacity_plan = self.get_pipeline_capacity_plan(
                     eligible_node_ids,
@@ -3558,7 +3595,10 @@ class Scheduler:
 
         for a in layer_info["assignments"]:
             nid = a["node_id"]
-            if nid in {"master", self.get_effective_node_id()}:
+            if (
+                nid in {"master", self.get_effective_node_id()}
+                or nid not in layer_releasable_pc_ids
+            ):
                 continue
 
             # 新一轮配置开始后，旧 ACK 立即失效。
@@ -3602,7 +3642,7 @@ class Scheduler:
                     "generation": generation,
                     "release": True,
             }
-            for node_id in releasable_pc_ids
+            for node_id in (layer_releasable_pc_ids | full_worker_release_ids)
             if node_id not in assignments
         }
         configs = {**assignments, **releases}
@@ -5426,10 +5466,20 @@ class Scheduler:
         try:
             # 阶段 0.2：完整模型判定直接走 host 代理（不依赖内部 manager 容器
             # 的 _instance 结构，阶段 1 替换远程 host 适配器后依然成立）
+            has_loaded_model = getattr(self._host, "has_loaded_model", None)
+            if callable(has_loaded_model):
+                # ModelHost owns the authoritative loaded-state check and
+                # correctly accounts for its lazy manager proxy.  Requiring
+                # the legacy ``is_loaded`` attribute here made a real full
+                # Safetensors worker advertise an empty model list.
+                full_model_loaded = bool(has_loaded_model())
+            else:
+                full_model_loaded = bool(
+                    getattr(self._host, "model_loaded", False)
+                    and getattr(self._host, "is_loaded", False)
+                )
             full_model_loaded = bool(
-                getattr(self._host, "model_loaded", False)
-                and getattr(self._host, "is_loaded", False)
-                and getattr(self._host, "layer_range", None) is None
+                full_model_loaded and getattr(self._host, "layer_range", None) is None
             )
             if full_model_loaded:
                 identity = self._host._active_task_graph_model_identity()
@@ -6167,6 +6217,21 @@ class Scheduler:
                     self._send_task_worker_to_node(client_id, ack)
                     if ack.payload["accepted"]:
                         self._ensure_remote_task_worker_provider(client_id)
+                        # A node that has just advertised a complete model is
+                        # a Full Worker, not a layer partition.  Registration
+                        # may have pushed a layer config before the hello
+                        # arrived; release that reservation so the two roles
+                        # cannot race and make the Worker reject its Stage.
+                        advertised_models = (
+                            message.payload.get("capabilities", {}).get("models", [])
+                            if isinstance(message.payload, dict)
+                            else []
+                        )
+                        if advertised_models:
+                            self._handle_layer_worker_opt_out(
+                                client_id,
+                                {"data": {"node_id": client_id}},
+                            )
                     logger.info(
                         "event=task_worker_hello_acked node_id=%s accepted=%s version=%s",
                         client_id,

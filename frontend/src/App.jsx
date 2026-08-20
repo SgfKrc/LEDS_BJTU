@@ -303,6 +303,18 @@ export default function App({ authSession, onLogout }) {
     });
   }, []);
 
+  const updateTaskGraphConfig = useCallback(async (partial) => {
+    const enabled = typeof partial?.enabled === 'boolean' ? partial.enabled : undefined;
+    const workerExperimentalEnabled = typeof partial?.workerExperimentalEnabled === 'boolean'
+      ? partial.workerExperimentalEnabled
+      : undefined;
+    const { updateTaskGraphConfig: updateRemoteTaskGraphConfig, fetchTaskGraphStatus } = await import('./api/client');
+    await updateRemoteTaskGraphConfig({ enabled, workerExperimentalEnabled });
+    const capability = await fetchTaskGraphStatus(activeSessionId || '');
+    setTaskGraphCapability(capability);
+    return capability;
+  }, [activeSessionId]);
+
   // ---- Toast 通知（必须在会话回调之前定义，因依赖数组引用） ----
   const showToast = useCallback(({ type, msg }) => {
     setToast({ type, msg, id: Date.now() });
@@ -837,6 +849,7 @@ export default function App({ authSession, onLogout }) {
         onUserAvatarChange={updateUserAvatar}
         settings={settings}
         taskGraphCapability={taskGraphCapability}
+        onTaskGraphConfigChange={updateTaskGraphConfig}
         onSettingsChange={updateSettings}
         deviceTier={deviceTier}
         hasDedicatedGpu={hasDedicatedGpu}

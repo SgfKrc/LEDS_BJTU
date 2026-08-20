@@ -111,3 +111,9 @@ models/.qlh-*/
 # QW3 runtime logs
 logs/*.log.*
 models/gemma4-native/*.gguf
+
+# Root-level runtime / diagnostic logs (never committed)
+/runtime-*.log
+/runtime-*.stdout.log
+/runtime-*.stderr.log
+/surface-ssh*.log

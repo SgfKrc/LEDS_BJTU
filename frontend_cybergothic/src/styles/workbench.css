@@ -1,0 +1,1154 @@
+/*
+ * 工作台：左侧集群控制台 + 右侧对话，比例可拖动。
+ *
+ * 单独成文件而不是塞进 components.css：那边已经 2400+ 行，
+ * 且结尾是响应式 / hover:none / print 覆盖块，追加在后面会绕过那些覆盖。
+ * 本文件自带同结构的收尾块。
+ */
+
+/* ============ 外壳：分屏页占满剩余高度 ============ */
+
+/*
+ * 两栏要各自吃滚轮，前提是 .split__pane 真的成为溢出容器；
+ * 而这要求它的每一级祖先都有**确定**高度。基线 .shell 是 min-height:100%
+ * ——那不是确定高度，于是 .split 一路被内容顶高，overflow-y:auto 永不生效，
+ * 滚轮落到 document 上，两栏只能一起滚（对话一长，控制台底下就空一大截）。
+ *
+ * 所以分屏路由上把外壳钉成 100dvh 并禁掉自身滚动，
+ * 高度沿 .shell → .shell__main--bleed → .split → .split__pane 一路确定下来。
+ * dvh 而非 vh：移动端浏览器地址栏收起时 vh 会算多一截。
+ */
+.shell--bleed {
+  /* 桌面工作台是一个独立视口：顶栏/提示条占掉自然高度，主区吃完剩余空间。 */
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.shell__main--bleed {
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* 没有这行，flex 子项会被内容顶开，撑出第二条滚动条 */
+  padding: 0;
+}
+
+/* ============ 分屏骨架 ============ */
+
+.split {
+  display: grid;
+  grid-template-columns: var(--split-ratio, 42%) var(--split-handle) 1fr;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.split__pane {
+  min-width: 0; /* 允许内容收缩，否则长文本会把栅格挤爆 */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.split__pane--left {
+  border-right: 1px solid var(--line);
+  /*
+   * 左栏内部按「自己有多宽」排版，而不是按视口宽度：
+   * 用户可以把这一栏拖到 22%（1440px 下约 317px），
+   * 那时视口级 media query 不会触发，但内容已经需要换行了。
+   */
+  container-type: inline-size;
+  container-name: console;
+}
+
+/*
+ * 右栏自己不滚：对话内部由 .chat__list 滚，头部与输入区常驻。
+ * 若这里也开 auto，头部/输入区会跟着消息一起被推出视野，
+ * 就变成「一个巨长的对话框」——正是要消掉的那个毛病。
+ */
+.split__pane--right {
+  overflow: hidden;
+  background: var(--gothic-bg);
+}
+
+/* 拖动中禁用文本选中与指针事件穿透，否则拖过对话区会选中一片文字 */
+.split[data-dragging='true'] {
+  user-select: none;
+  cursor: col-resize;
+}
+
+.split[data-dragging='true'] .split__pane {
+  pointer-events: none;
+}
+
+/* ============ 拖动手柄 ============ */
+
+.split__handle {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--gothic-line);
+  background: var(--surface);
+  cursor: col-resize;
+  touch-action: none; /* 指针拖动要自己处理，否则移动端会当成滚动 */
+  transition: background 180ms ease;
+}
+
+.split__handle:hover,
+.split__handle:focus-visible {
+  background: var(--surface-raised);
+}
+
+.split__handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* 中缝的一条竖线，拖动时亮起并向两侧渗出光 */
+.split__rail {
+  position: absolute;
+  inset: 0 50% 0 50%;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--line-strong);
+  transition: background 180ms ease, box-shadow 180ms ease;
+}
+
+.split__handle:hover .split__rail,
+.split[data-dragging='true'] .split__rail {
+  background: var(--accent);
+  box-shadow: 0 0 10px 1px var(--accent-soft);
+}
+
+/* 抓握点：斜切成平行四边形的小块，和控制台的斜切语言呼应 */
+.split__grip {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 46px;
+  background: var(--surface-raised);
+  color: var(--muted);
+  /* 上下各让出 4px 形成倾斜 */
+  clip-path: polygon(0 4px, 100% 0, 100% calc(100% - 4px), 0 100%);
+  transition:
+    height 180ms var(--ease-out),
+    background 180ms ease,
+    color 180ms ease;
+}
+
+.split__grip svg {
+  /* 图标要跟着容器一起「倾斜」才不显得是贴上去的 */
+  transform: skewX(var(--skew));
+}
+
+.split__handle:hover .split__grip,
+.split__handle:focus-visible .split__grip {
+  height: 66px;
+  color: var(--accent);
+}
+
+.split[data-dragging='true'] .split__grip {
+  height: 86px;
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* 拖动时在手柄上方浮出当前比例 */
+.split__readout {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  padding: 4px 8px;
+  border: 1px solid var(--accent);
+  background: var(--bg);
+  color: var(--accent);
+  white-space: nowrap;
+  opacity: 0;
+  transform: translate(-50%, -6px);
+  transition: opacity 160ms ease, transform 160ms ease;
+  pointer-events: none;
+}
+
+.split[data-dragging='true'] .split__readout,
+.split__handle:focus-visible .split__readout {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* ============ 左栏：控制台 ============ */
+
+.console {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-lg);
+  padding: var(--gap-lg) var(--gap-lg) var(--gap-xl);
+}
+
+.console__head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-xs);
+}
+
+/* 标签 + 标题同一行，状态句独占下一行（栏窄，三者挤一行会各自换行） */
+.console__headmain {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--gap-xs) var(--gap-sm);
+}
+
+.console__status {
+  grid-column: 1 / -1;
+}
+
+/* 斜切标签：平行四边形替代矩形徽标 */
+.console__tag {
+  padding: 4px 12px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  transform: skewX(var(--skew));
+}
+
+.console__tag > * {
+  display: inline-block;
+  transform: skewX(var(--skew-back)); /* 反向抵消，文字不歪 */
+}
+
+.console__title {
+  margin: 0;
+  font-size: 1.25rem;
+  line-height: 1.15;
+}
+
+.console__status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+/* 栏被拖窄时：标签与标题也各占一行，日志正文换到独立行 */
+@container console (max-width: 420px) {
+  .console__headmain {
+    grid-template-columns: 1fr;
+  }
+
+  .console__tag {
+    justify-self: start;
+  }
+
+  .evlist__item {
+    grid-template-columns: auto 1fr;
+    row-gap: 4px;
+  }
+
+  .evlist__time {
+    grid-area: 1 / 1;
+  }
+
+  .evlist__level {
+    grid-area: 1 / 2;
+  }
+
+  .evlist__msg {
+    grid-area: 2 / 1 / 3 / -1;
+  }
+}
+
+.console__foot {
+  margin: 0;
+  padding-top: var(--gap-sm);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* ---- 面板（窄栏用，无嵌套卡片，只有分隔带） ---- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-sm);
+}
+
+.panel__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+  padding-bottom: var(--gap-xs);
+  border-bottom: 1px solid var(--line);
+}
+
+.panel__headtext {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.panel__tag {
+  color: var(--accent);
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.panel__hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.panel__headaction {
+  flex-shrink: 0;
+}
+
+/* ---- 流水线准入胶囊：整块斜切成平行四边形 ---- */
+
+.capsule {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-xs);
+  padding: var(--gap-md) calc(var(--gap-md) + var(--slant-sm));
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  /* 上下边各让出 slant，形成左低右高的平行四边形 */
+  clip-path: polygon(
+    var(--slant-md) 0,
+    100% 0,
+    calc(100% - var(--slant-md)) 100%,
+    0 100%
+  );
+  transition: background var(--t-hover) var(--ease-out);
+}
+
+.capsule[data-tone='ok'] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.capsule[data-tone='warn'] {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.capsule[data-tone='danger'] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.capsule__top {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  font-weight: 600;
+}
+
+.capsule__reason {
+  margin: 0;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.capsule__specs {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* ---- 队列深度条：斜切条形 ---- */
+
+.qbars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-sm);
+}
+
+.qbars__item {
+  display: grid;
+  grid-template-columns: 3.4rem 1fr 2.6rem;
+  align-items: center;
+  gap: var(--gap-sm);
+}
+
+.qbars__label {
+  color: var(--muted);
+}
+
+.qbars__track {
+  height: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface-sunken);
+  /* 轨道与填充同样斜切，读起来像倾斜的示波器刻度 */
+  clip-path: polygon(
+    var(--slant-sm) 0,
+    100% 0,
+    calc(100% - var(--slant-sm)) 100%,
+    0 100%
+  );
+}
+
+.qbars__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width var(--t-base) var(--ease-out);
+}
+
+.qbars__item[data-tone='warn'] .qbars__fill {
+  background: var(--warn);
+}
+
+.qbars__item[data-tone='danger'] .qbars__fill {
+  background: var(--danger);
+}
+
+.qbars__value {
+  text-align: right;
+  font-size: 13px;
+}
+
+/* ---- 近期事件 ---- */
+
+.evlist {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.evlist__item {
+  display: grid;
+  grid-template-columns: 4.2rem 4.4rem 1fr;
+  gap: var(--gap-sm);
+  align-items: baseline;
+  padding: var(--gap-sm) 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+
+.evlist__item:last-child {
+  border-bottom: 0;
+}
+
+.evlist__time {
+  color: var(--muted-dim);
+}
+
+.evlist__level {
+  color: var(--muted);
+}
+
+.evlist__item--warn .evlist__level {
+  color: var(--warn);
+}
+
+.evlist__item--danger .evlist__level {
+  color: var(--danger);
+}
+
+.evlist__item--ok .evlist__level {
+  color: var(--accent);
+}
+
+.evlist__msg {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  overflow-wrap: anywhere; /* 日志里有长 ID / 路径，必须能断行 */
+}
+
+/* ============ 右栏：哥特对话 ============ */
+
+.chat {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /*
+   * height 而不是 min-height：min-height 允许它被消息顶高，
+   * 于是滚动条长在外层，头部和输入区跟着跑。钉死高度后，
+   * 唯一的滚动容器是 .chat__list，对话再长这一栏也只有一屏高。
+   */
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--gothic-ink);
+  background: var(--gothic-bg);
+
+  /*
+   * 把共享组件（.cbtn、.badge 等）的取色变量在这个子树里改绑到哥特色板。
+   * 比给每个组件写 .chat .cbtn 覆盖强：新组件放进对话栏会自动跟着变，
+   * 不会漏出一颗酸绿按钮。§8「所有颜色来自 token」仍然成立。
+   */
+  --accent: var(--gothic-accent);
+  --accent-soft: var(--gothic-accent-soft);
+  --accent-line: var(--gothic-accent-line);
+  --accent-ink: var(--gothic-accent-ink);
+  --text: var(--gothic-ink);
+  --muted: var(--gothic-muted);
+  --line: var(--gothic-line);
+  --line-strong: var(--gothic-line-strong);
+  --surface: var(--gothic-surface);
+  --surface-raised: var(--gothic-surface-raised);
+  --bg: var(--gothic-bg);
+  --bg-deep: var(--gothic-bg-deep);
+}
+
+/*
+ * 窗棂：竖向细线。放在 ::before 上用 opacity 压到几乎看不见的强度，
+ * 直接写进 background 会和正文抢注意力（顶部那排线会读成表格列）。
+ */
+.chat::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to right,
+    var(--gothic-line) 0 1px,
+    transparent 1px 112px
+  );
+  opacity: 0.32;
+  pointer-events: none;
+}
+
+/* 内容压在窗棂与背景画之上 */
+.chat > * {
+  position: relative;
+  z-index: 1;
+}
+
+/*
+ * 哥特建筑 + 齿轮钟的画布。铺满整栏、跟着栏一起定位（不随消息滚动），
+ * 强度压得比正文低一个数量级：装饰只提供纵深，不参与阅读（§2.5 / §5.5）。
+ * z-index 给 0，和窗棂 ::before 同层（按 DOM 序叠在它之上，
+ * 因为只有细描边 + 0.5 透明度，窗棂仍透得出来），整体在内容 z-index:1 之下。
+ */
+.chat__bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+/* 定高列里的头部/输入区不参与压缩，中间的列表吃掉剩余高度 */
+.chat__head {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--gap-md);
+  /* 底部留出 --arch 的一部分给连券，标题不会被压 */
+  padding: var(--gap-lg) var(--gap-lg) calc(var(--gap-md) + 22px);
+  border-bottom: 1px solid var(--gothic-line-strong);
+  background: var(--gothic-bg);
+  overflow: hidden; /* 连券超出头部的部分裁掉 */
+}
+
+/*
+ * 尖拱连券（arcade）——纯 CSS，不引资源。
+ *
+ * 每个 --arch 宽的格子里放两段半径 = --arch 的圆环圆弧：
+ * 一段圆心在左下角，一段在右下角。两段弧在格子上方交汇，
+ * 交点就是尖拱的顶点，两条腿落到格子的两个下角。横向重复即成连券。
+ */
+.chat__arch {
+  position: absolute;
+  inset: auto 0 -1px 0; /* 压在头部下边框上，让券脚落在那条线上 */
+  height: var(--arch);
+  background-image:
+    radial-gradient(
+      circle at 100% 100%,
+      transparent calc(var(--arch) - 1px),
+      var(--gothic-gold) calc(var(--arch) - 1px) var(--arch),
+      transparent var(--arch)
+    ),
+    radial-gradient(
+      circle at 0 100%,
+      transparent calc(var(--arch) - 1px),
+      var(--gothic-gold) calc(var(--arch) - 1px) var(--arch),
+      transparent var(--arch)
+    );
+  background-size: var(--arch) 100%;
+  background-repeat: repeat-x;
+  /* 向上淡出：只留券脚清晰，避免顶部一排硬线抢标题 */
+  /* mask 的黑白只是不透明度通道，不是画到屏幕上的颜色，故不走色板 token */
+  mask-image: linear-gradient(to top, black, transparent);
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.chat__headtext {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.chat__eyebrow {
+  color: var(--gothic-gold);
+  letter-spacing: 0.18em;
+}
+
+.chat__title {
+  margin: 0;
+  font-family: var(--font-gothic);
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
+}
+
+.chat__headtools {
+  display: flex;
+  flex-shrink: 0;
+  gap: var(--gap-xs);
+}
+
+.chat__toggle {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border: 1px solid var(--gothic-line-strong);
+  background: transparent;
+  color: var(--gothic-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition:
+    color var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    background var(--t-hover) var(--ease-out);
+}
+
+.chat__toggle:hover {
+  color: var(--gothic-ink);
+  border-color: var(--gothic-accent-line);
+  background: var(--gothic-accent-soft);
+}
+
+/* label 包着 checkbox，焦点在 input 上，所以焦点环画在 :focus-within */
+.chat__toggle:focus-within {
+  outline: 2px solid var(--gothic-accent);
+  outline-offset: 2px;
+}
+
+.chat__toggle input {
+  /* 原生勾选框在深底上是一块白，改成苍紫描边的小方框 */
+  width: 12px;
+  height: 12px;
+  margin: 0 6px 0 0;
+  accent-color: var(--gothic-accent);
+  vertical-align: -1px;
+}
+
+.chat__toggle:has(input:checked) {
+  color: var(--gothic-ink);
+  border-color: var(--gothic-accent-line);
+}
+
+.chat__list {
+  flex: 1;
+  min-height: 0;
+  padding: var(--gap-lg);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.chat__turns {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-lg);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* 开场白：首字下沉，抄手稿的味道 */
+.chat__opening {
+  max-width: 46ch;
+  margin: 0 0 var(--gap-md);
+  color: var(--gothic-muted);
+  font-family: var(--font-gothic);
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.chat__dropcap {
+  float: left;
+  margin: 4px 10px 0 0;
+  color: var(--gothic-gold);
+  font-family: var(--font-gothic);
+  font-size: 3.2em;
+  line-height: 0.82;
+}
+
+.chat__openingnote {
+  margin: 0;
+  color: var(--gothic-muted);
+  font-size: 12px;
+}
+
+/* ---- 单条消息 ---- */
+
+.msg {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: var(--gap-md);
+}
+
+/* 左侧竖线兼装饰槽：用户为苍紫，助手为描边金 */
+.msg__gutter {
+  position: relative;
+  width: 1px;
+  margin-left: 8px;
+  background: var(--gothic-line);
+}
+
+.msg--user .msg__gutter {
+  background: var(--gothic-accent-line);
+}
+
+.msg--assistant .msg__gutter {
+  background: linear-gradient(
+    to bottom,
+    var(--gothic-gold),
+    var(--gothic-line) 70%
+  );
+}
+
+/* 槽顶的小菱形节点 */
+.msg__gutter::before {
+  content: '';
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  background: var(--gothic-line-strong);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.msg--user .msg__gutter::before {
+  background: var(--gothic-accent);
+}
+
+.msg--assistant .msg__gutter::before {
+  background: var(--gothic-gold);
+}
+
+.msg__body {
+  min-width: 0;
+}
+
+.msg__who {
+  margin: 0 0 var(--gap-xs);
+  color: var(--gothic-muted);
+  letter-spacing: 0.16em;
+}
+
+.msg--assistant .msg__who {
+  color: var(--gothic-gold);
+}
+
+.msg__text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.75;
+  white-space: pre-wrap; /* 后端返回的换行要保留 */
+  overflow-wrap: anywhere;
+}
+
+.msg--assistant .msg__text {
+  font-family: var(--font-gothic);
+  font-size: 15px;
+}
+
+/* 流式光标 */
+.msg__caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  background: var(--gothic-accent);
+  vertical-align: text-bottom;
+  animation: caret-blink 1.1s steps(2, start) infinite;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.msg__rule {
+  height: 1px;
+  margin: var(--gap-sm) 0 0;
+  border: 0;
+  background: linear-gradient(
+    to right,
+    var(--gothic-gold),
+    transparent 60%
+  );
+  opacity: 0.55;
+}
+
+.msg__metrics {
+  margin: var(--gap-xs) 0 0;
+  color: var(--gothic-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+}
+
+.msg__error {
+  margin: var(--gap-xs) 0 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+/* ---- 思考过程折叠 ---- */
+
+.msg__thinking {
+  margin: var(--gap-xs) 0 0;
+}
+
+.msg__thinkingtoggle {
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--gothic-muted);
+  font: inherit;
+  font-size: 11.5px;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.msg__thinkingtoggle:hover {
+  color: var(--gothic-accent);
+}
+
+.msg__thinkingtoggle:focus-visible {
+  outline: 2px solid var(--gothic-accent);
+  outline-offset: 2px;
+}
+
+.msg__thinkingbody {
+  margin: var(--gap-xs) 0 0;
+  padding-left: var(--gap-sm);
+  border-left: 1px solid var(--gothic-line);
+  color: var(--gothic-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+/* ---- 输入区 ---- */
+
+.composer {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+  padding: var(--gap-md) var(--gap-lg) var(--gap-lg);
+  border-top: 1px solid var(--gothic-line-strong);
+  background: var(--gothic-bg);
+}
+
+.composer__input {
+  display: block;
+  width: 100%;
+  min-height: 68px;
+  /* 上限收到 168px：输入区再高就开始吃消息列表的高度，
+   * 手动拖大仍然可以（resize: vertical 不受 max-height 约束以外的限制）。 */
+  max-height: 168px;
+  padding: var(--gap-sm);
+  border: 1px solid var(--gothic-line-strong);
+  background: var(--gothic-surface);
+  color: var(--gothic-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  resize: vertical;
+  transition: border-color var(--t-hover) var(--ease-out);
+}
+
+.composer__input:hover {
+  border-color: var(--gothic-accent-line);
+}
+
+.composer__input:focus-visible {
+  outline: 2px solid var(--gothic-accent);
+  outline-offset: -1px;
+  border-color: var(--gothic-accent);
+}
+
+.composer__input::placeholder {
+  color: var(--gothic-muted);
+}
+
+/* 输入框下面一行：左提示 / 右按钮 */
+.composer__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-md);
+  margin-top: var(--gap-sm);
+}
+
+.composer__hint {
+  flex: 1;
+  min-width: 0;
+  color: var(--gothic-muted);
+  font-size: 11px;
+}
+
+/* ---- 附件 ---- */
+
+.composer__atts,
+.msg__atts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-xs);
+  margin: 0 0 var(--gap-sm);
+  padding: 0;
+  list-style: none;
+}
+
+.msg__atts {
+  margin: var(--gap-sm) 0 0;
+}
+
+/*
+ * 附件条：切角矩形，和控制台的平行四边形同一手法，
+ * 但只切右下一角 —— 满屏斜切会把文件名读成倾斜的。
+ */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--gothic-line-strong);
+  background: var(--gothic-surface);
+  color: var(--gothic-ink);
+  font-size: 11.5px;
+  clip-path: polygon(0 0, 100% 0, calc(100% - var(--slant-sm)) 100%, 0 100%);
+}
+
+.chip svg {
+  flex-shrink: 0;
+  color: var(--gothic-gold);
+}
+
+.chip--static {
+  border-style: dashed; /* 已发出的附件不可操作，用虚线区别于输入区里的 */
+  background: transparent;
+}
+
+.chip__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip__meta {
+  flex-shrink: 0;
+  color: var(--gothic-muted);
+  font-size: 10.5px;
+}
+
+.chip__x {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--gothic-muted);
+  cursor: pointer;
+  transition: color var(--t-hover) var(--ease-out);
+}
+
+.chip__x:hover {
+  color: var(--gothic-accent);
+}
+
+.chip__x:focus-visible {
+  outline: 2px solid var(--gothic-accent);
+  outline-offset: 1px;
+}
+
+.composer__actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: var(--gap-xs);
+}
+
+/* ============ 窄屏：改为上下堆叠，分隔条退场 ============ */
+
+@media (max-width: 860px) {
+  /*
+   * 堆叠后回到「整页一条滚动条」：把宽屏那套定高全部退掉。
+   * 留着 height:100dvh + overflow:hidden 会把堆叠后的下半屏直接裁掉。
+   */
+  .shell--bleed {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+
+  .split {
+    display: flex;
+    flex-direction: column;
+    /* 比例在窄屏无意义：横向拖动没有可分的宽度 */
+  }
+
+  .split__pane {
+    overflow-y: visible; /* 交回给页面统一滚动，避免嵌套滚动容器 */
+  }
+
+  .split__pane--right {
+    overflow: visible;
+  }
+
+  .chat {
+    height: auto;
+    overflow: visible;
+  }
+
+  /*
+   * 堆叠后右栏不再有确定高度，`flex:1 + min-height:0` 的消息列表会塌成零高，
+   * 把粘底的输入框顶到消息上方。这里退回普通文档流：列表自然长高，
+   * 输入框跟在最后，滚动由页面统一负责。
+   */
+  .chat__list {
+    flex: none;
+    overflow-y: visible;
+  }
+
+  .composer {
+    position: static;
+  }
+
+  /*
+   * 吸顶依赖滚动容器，堆叠后没有意义；但必须留 relative ——
+   * 连券是 absolute 定位的，一旦头部退出定位上下文，它会掉到整栏底部。
+   */
+  .chat__head {
+    position: relative;
+  }
+
+  .split__pane--left {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .split__pane--right {
+    min-height: 78vh; /* 对话要有足够高度，否则输入区贴着上一栏 */
+  }
+
+  .split__handle {
+    display: none;
+  }
+
+  .shell__main--bleed {
+    /* 堆叠后不再是「一屏两栏」，让页面正常滚动 */
+    display: block;
+  }
+
+  .chat__list,
+  .chat__head,
+  .composer {
+    padding-left: var(--gap-md);
+    padding-right: var(--gap-md);
+  }
+
+  .console {
+    padding: var(--gap-md) var(--gap-md) var(--gap-lg);
+  }
+}
+
+@media (max-width: 520px) {
+  /*
+   * 斜切在窄屏会吃掉可读宽度，收敛成矩形。
+   * 日志与头部的窄栏排版不在这里 —— 那些跟「这一栏多宽」有关，
+   * 交给上面的 @container console 处理，避免两处规则打架。
+   */
+  .capsule {
+    padding-left: var(--gap-md);
+    padding-right: var(--gap-md);
+    clip-path: none;
+  }
+}
+
+/* ============ 降低动效 ============ */
+
+@media (prefers-reduced-motion: reduce) {
+  .split__grip,
+  .split__handle,
+  .split__rail,
+  .split__readout,
+  .qbars__fill,
+  .capsule {
+    transition: none;
+  }
+
+  .split__grip,
+  .split__handle:hover .split__grip,
+  .split__handle:focus-visible .split__grip,
+  .split[data-dragging='true'] .split__grip {
+    height: 46px; /* 不用高度变化表达状态，改由颜色承担 */
+  }
+
+  .msg__caret {
+    animation: none;
+  }
+}
+
+/* ============ 触摸设备：不依赖 hover ============ */
+
+@media (hover: none) {
+  /* 手柄的比例读数只在 hover 时出现，触摸下改为常显 */
+  .split__readout {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+
+  .split__grip {
+    height: 64px; /* 触摸目标要够大 */
+  }
+}
+
+/* ============ 打印 ============ */
+
+@media print {
+  .split {
+    display: block;
+  }
+
+  .split__handle,
+  .composer,
+  .chat__headtools {
+    display: none;
+  }
+
+  .chat,
+  .split__pane--right {
+    background: none;
+  }
+}
