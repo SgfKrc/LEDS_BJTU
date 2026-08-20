@@ -217,8 +217,143 @@ def _rejection_reason(stage: Mapping[str, Any], profile: Mapping[str, Any]) -> s
     return None
 
 
+_DISTURB_KEYS = frozenset({
+    "tail_latency_ms", "elapsed_ms", "deadline_ms", "extra_cost_ratio",
+    "idle_compatible_workers", "provider_admitted", "failure_domain_changed",
+    "primary_provider", "candidate_provider", "fail_provider",
+})
+SPECULATION_INJECTION_SCHEMA_VERSION = "qlh.task_graph_speculation_injection.v1"
+
+
+def inject_speculation_disturbance(
+    stage: Mapping[str, Any], *, disturb: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按白名单扰动改写 stage 的候选证据；只影响决策输入，不改 DAG/运行时。
+
+    未知扰动键或非法类型 fail-closed 拒绝。``fail_provider`` 是"把候选
+    Provider 换成不可信 Provider"的故障注入捷径（映射到 candidate_provider）。
+    """
+    if not isinstance(stage, Mapping):
+        raise TaskGraphSpeculationError("stage evidence is invalid")
+    if not isinstance(disturb, Mapping):
+        raise TaskGraphSpeculationError("disturbance is invalid")
+    _assert_safe(stage)
+    unknown = sorted(str(k) for k in disturb if k not in _DISTURB_KEYS)
+    if unknown:
+        raise TaskGraphSpeculationError(
+            "unsupported disturbance keys: " + ", ".join(unknown),
+        )
+
+    out = dict(stage)
+    latency = dict(out.get("latency") or {})
+    resources = dict(out.get("resources") or {})
+    if "tail_latency_ms" in disturb:
+        latency["p95_ms"] = _bounded(disturb["tail_latency_ms"], 1, 7 * 24 * 60 * 60 * 1000, "p95_ms")
+    if "elapsed_ms" in disturb:
+        latency["elapsed_ms"] = _bounded(disturb["elapsed_ms"], 0, 7 * 24 * 60 * 60 * 1000, "elapsed_ms")
+    if "deadline_ms" in disturb:
+        latency["deadline_ms"] = _bounded(disturb["deadline_ms"], 1, 7 * 24 * 60 * 60 * 1000, "deadline_ms")
+    if "extra_cost_ratio" in disturb:
+        resources["extra_cost_ratio"] = _bounded(disturb["extra_cost_ratio"], 0.0, 10.0, "extra_cost_ratio")
+    if "idle_compatible_workers" in disturb:
+        resources["idle_compatible_workers"] = _bounded(
+            disturb["idle_compatible_workers"], 0, 1_000_000_000,
+            "idle_compatible_workers",
+        )
+    for key in ("provider_admitted", "failure_domain_changed"):
+        if key in disturb:
+            value = disturb[key]
+            if not isinstance(value, bool):
+                raise TaskGraphSpeculationError(f"disturbance {key} must be bool")
+            resources[key] = value
+    out["latency"] = latency
+    out["resources"] = resources
+    for provider_key in ("primary_provider", "candidate_provider"):
+        if provider_key in disturb:
+            out[provider_key] = _identifier(disturb[provider_key], provider_key)
+    if "fail_provider" in disturb:
+        out["candidate_provider"] = _identifier(disturb["fail_provider"], "candidate_provider")
+    return out
+
+
+def _scenario_digest(seed: object, index: int, disturb: Mapping[str, Any]) -> str:
+    payload = json.dumps(
+        {"seed": str(seed), "index": int(index), "disturb": dict(disturb)},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def run_speculation_injection_matrix(
+    stage: Mapping[str, Any],
+    *,
+    profile: Mapping[str, Any] | None = None,
+    disturbances: Sequence[Mapping[str, Any]],
+    seed: object,
+) -> dict[str, Any]:
+    """对每个扰动场景跑一次 shadow 推荐，返回注入矩阵（含场景摘要）。"""
+    checked_profile = validate_speculation_profile(profile or build_speculation_profile())
+    rows: list[dict[str, Any]] = []
+    for index, disturb in enumerate(disturbances):
+        scenario = _scenario_digest(seed, index, disturb)
+        injected = inject_speculation_disturbance(stage, disturb=disturb)
+        report = recommend_speculative_execution([injected], profile=checked_profile)
+        rows.append({
+            "index": index,
+            "scenario": scenario,
+            "disturb": dict(disturb),
+            "recommend_digest": report["digest"],
+            "status": report["status"],
+            "runtime_actions_enabled": bool(report["runtime_actions_enabled"]),
+            "candidate_count": int(report["summary"]["candidate_count"]),
+            "rejection_count": int(report["summary"]["rejection_count"]),
+        })
+    return {
+        "schema_version": SPECULATION_INJECTION_SCHEMA_VERSION,
+        "stage_id": _identifier(stage.get("stage_id"), "stage_id"),
+        "rows": rows,
+        "runtime_actions_enabled": any(row["runtime_actions_enabled"] for row in rows),
+    }
+
+
+def verify_speculation_injection_closed_loop(
+    matrix: Mapping[str, Any],
+    *,
+    stage: Mapping[str, Any],
+    profile: Mapping[str, Any] | None = None,
+    disturbances: Sequence[Mapping[str, Any]],
+    seed: object,
+) -> list[str]:
+    """复验闭环：同 seed 重放矩阵，断言每个场景的推荐 digest 可复现，
+    且影子永不启用运行时动作。返回违规列表（空 = 闭环验证通过）。"""
+    violations: list[str] = []
+    rerun = run_speculation_injection_matrix(
+        stage, profile=profile, disturbances=disturbances, seed=seed,
+    )
+    previous = {row["scenario"]: row for row in matrix.get("rows", [])}
+    for row in rerun["rows"]:
+        prev = previous.get(row["scenario"])
+        if prev is None:
+            violations.append(f"scenario {row['scenario']}: missing in original matrix")
+            continue
+        if prev["recommend_digest"] != row["recommend_digest"]:
+            violations.append(
+                f"scenario {row['scenario']}: digest not reproducible "
+                f"({prev['recommend_digest']} != {row['recommend_digest']})",
+            )
+        if row["runtime_actions_enabled"]:
+            violations.append(f"scenario {row['scenario']}: shadow enabled runtime actions")
+        if prev["status"] != row["status"]:
+            violations.append(f"scenario {row['scenario']}: status not reproducible")
+    if rerun["runtime_actions_enabled"]:
+        violations.append("matrix enabled runtime actions in shadow")
+    return violations
+
+
 __all__ = [
     "SPECULATION_PROFILE_SCHEMA_VERSION", "SPECULATION_RECOMMENDATION_SCHEMA_VERSION",
-    "TaskGraphSpeculationError", "build_speculation_profile", "validate_speculation_profile",
-    "recommend_speculative_execution",
+    "SPECULATION_INJECTION_SCHEMA_VERSION", "TaskGraphSpeculationError",
+    "build_speculation_profile", "validate_speculation_profile",
+    "recommend_speculative_execution", "inject_speculation_disturbance",
+    "run_speculation_injection_matrix", "verify_speculation_injection_closed_loop",
 ]
