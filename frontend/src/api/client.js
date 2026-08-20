@@ -975,6 +975,39 @@ export async function connectToMaster(masterHost, masterPort, switchToClient = f
   });
 }
 
+// ---- 客户端入群授权（request -> grant -> consume） ----
+
+export async function createClusterJoinRequest({
+  masterEndpoint,
+  targetNodeId = null,
+  clusterId = '',
+  capabilities = ['presence', 'task'],
+} = {}) {
+  return request('/cluster/join/request', {
+    method: 'POST',
+    body: JSON.stringify({
+      master_endpoint: masterEndpoint,
+      target_node_id: targetNodeId,
+      cluster_id: clusterId,
+      capabilities,
+    }),
+  });
+}
+
+export async function issueClusterJoinGrant(requestCode, authVerified = false) {
+  return request('/cluster/join/grant', {
+    method: 'POST',
+    body: JSON.stringify({ request_code: requestCode, auth_verified: authVerified }),
+  });
+}
+
+export async function consumeClusterJoinGrant(grantCode) {
+  return request('/cluster/join/consume', {
+    method: 'POST',
+    body: JSON.stringify({ grant_code: grantCode }),
+  });
+}
+
 // ---- 主节点自动发现（本地 bootstrap 配置、Tailnet） ----
 
 export async function discoverMaster() {
@@ -1125,6 +1158,10 @@ export async function rebuildRagIndex() {
 
 export async function fetchRagCapacity(dimensions = 768) {
   return request(`/rag/capacity?dimensions=${encodeURIComponent(dimensions)}`);
+}
+
+export async function fetchRagAnnDecision(scanBudget = 1024) {
+  return request(`/rag/ann-decision?scan_budget=${encodeURIComponent(scanBudget)}`);
 }
 
 export async function createRagEmbeddingJob(payload) {

@@ -32,6 +32,7 @@ cryptography>=42.0.0,<47.0.0     # Ed25519 join grants and local signing contrac
 pandas>=2.0.0                    # 数据处理
 fastapi>=0.110.0                 # API 后端框架
 uvicorn[standard]>=0.29.0        # ASGI 服务器
+websockets>=16.0,<18.0           # NW3.1 local WSS transport gate
 python-multipart>=0.0.12          # 文件上传支持
 httpx>=0.28.1,<0.29.0            # 集群仿真 / 异步 API 客户端
 httpx2>=2.5.0,<3.0.0             # Starlette 1.x TestClient 后端

@@ -838,6 +838,7 @@ class NodesScreen(Screen):
             ("u", "移除备用主节点", self.act_spare_clear),
             ("m", "最大节点数", self.act_max_nodes),
             ("v", "自动发现主节点", self.act_discover),
+            ("j", "入群授权向导", self.act_join),
             ("l", "转让日志", self.act_transfer_logs),
             ("e", "邮件告警测试", self.act_email_test),
             ("z", "重置主节点身份", self.act_reset_identity),
@@ -942,6 +943,40 @@ class NodesScreen(Screen):
                 r.get("master_host"), r.get("master_port"), r.get("source", "—"),
                 ", 心跳过期" if r.get("stale") else "")
         return "数据库中未发现主节点记录"
+
+    def act_join(self, ui: BaseUI):
+        """Run the three-step client-only join flow without exposing secrets."""
+        role = (self.data or {}).get("role") or {}
+        if role.get("is_master") and not role.get("is_provisional"):
+            request_code = ui.prompt("目标节点请求码（主节点签发）: ")
+            if not request_code:
+                return "已取消"
+            if not ui.confirm("确认 Auth App 已审批该请求并签发一次性授权?"):
+                return "未确认 Auth App 审批，已取消"
+            result = self.api.post("/cluster/join/grant", {
+                "request_code": request_code.strip(), "auth_verified": True,
+            })
+            return "授权码（请交给目标节点）: %s" % result.get("grant_code", "")
+
+        host = ui.prompt("主节点地址（host 或 IPv6）: ")
+        if not host:
+            return "已取消"
+        port = ui.prompt("主节点 TCP 端口: ", "8888")
+        try:
+            port_i = int(port or "8888")
+        except ValueError:
+            return "端口无效: %s" % port
+        endpoint = (host if "]:" in host else "%s:%s" % (host, port_i)) if host.startswith("[") else ("[%s]:%s" % (host, port_i) if ":" in host else "%s:%s" % (host, port_i))
+        request = self.api.post("/cluster/join/request", {
+            "master_endpoint": endpoint,
+            "target_node_id": role.get("node_id") or None,
+        })
+        code = request.get("request_code", "")
+        grant = ui.prompt("输入主节点回传的授权码（留空只显示请求码）:")
+        if not grant:
+            return "请求码（交给主节点）: %s" % code
+        result = self.api.post("/cluster/join/consume", {"grant_code": grant.strip()})
+        return "入群结果: %s %s" % (result.get("status", "ok"), result.get("message", ""))
 
     def act_transfer_logs(self, ui: BaseUI):
         r = self.api.get("/cluster/transfer-logs")
@@ -1821,6 +1856,40 @@ def cmd_connect(app, args, opts):
     return ("连接结果: %s %s" % (r.get("status", "ok"), r.get("message", "")), "ok")
 
 
+def cmd_join(app, args, opts):
+    """CLI equivalent of the client-only join control-plane flow."""
+    sub = (args[0] if args else "").lower()
+    if sub == "request":
+        if len(args) < 2:
+            return ("用法: /join request <主节点IP> [端口]", "err")
+        host = args[1]
+        try:
+            port = int(args[2]) if len(args) > 2 else 8888
+        except ValueError:
+            return ("端口无效: %s" % args[2], "err")
+        endpoint = (host if "]:" in host else "%s:%s" % (host, port)) if host.startswith("[") else ("[%s]:%s" % (host, port) if ":" in host else "%s:%s" % (host, port))
+        role = app.api.get("/cluster/my-role") or {}
+        result = app.api.post("/cluster/join/request", {
+            "master_endpoint": endpoint, "target_node_id": role.get("node_id") or None,
+        })
+        return ("入群请求码: %s" % result.get("request_code", ""), "ok")
+    if sub == "grant":
+        if len(args) < 2:
+            return ("用法: /join grant <请求码> --approved", "err")
+        if not opts.get("approved"):
+            return ("为避免误签发，请加 --approved 表示 Auth App 已审批", "warn")
+        result = app.api.post("/cluster/join/grant", {
+            "request_code": args[1], "auth_verified": True,
+        })
+        return ("入群授权码: %s" % result.get("grant_code", ""), "ok")
+    if sub == "consume":
+        if len(args) < 2:
+            return ("用法: /join consume <授权码>", "err")
+        result = app.api.post("/cluster/join/consume", {"grant_code": args[1]})
+        return ("入群结果: %s %s" % (result.get("status", "ok"), result.get("message", "")), "ok")
+    return ("用法: /join request <IP> [端口] | /join grant <请求码> --approved | /join consume <授权码>", "err")
+
+
 def cmd_dist(app, args, opts):
     act = args[0].lower() if args else "status"
     try:
@@ -2029,6 +2098,8 @@ COMMANDS = [
      "summary": "节点列表与状态", "handler": cmd_nodes},
     {"name": "/connect", "aliases": [], "usage": "/connect <IP> [端口] [--switch]",
      "summary": "连接主节点（--switch 放弃本机主节点身份）", "handler": cmd_connect, "min_args": 1, "max_args": 2},
+    {"name": "/join", "aliases": [], "usage": "/join <request|grant|consume> ...",
+     "summary": "生成入群请求 / 签发或消费 client-only 授权码", "handler": cmd_join, "min_args": 1, "max_args": 3},
     {"name": "/dist", "aliases": [], "usage": "/dist <on|off|toggle|status>",
      "summary": "分布式推理开关", "handler": cmd_dist, "max_args": 1},
     {"name": "/queue", "aliases": [], "usage": "/queue [status|strategy <fifo|mlfq>|pause|resume|clear|cancel <任务ID>]",
@@ -2059,7 +2130,7 @@ def _build_command_help_lines() -> list:
         ("系统", ["/help", "/status", "/screen", "/refresh", "/quit", "/shutdown"]),
         ("模型 / 量化 / 引擎", ["/model", "/models", "/switch", "/load", "/quant", "/engine", "/presets"]),
         ("设备", ["/gpu", "/device"]),
-        ("集群 / 队列", ["/nodes", "/connect", "/dist", "/queue"]),
+        ("集群 / 队列", ["/nodes", "/connect", "/join", "/dist", "/queue"]),
         ("日志", ["/logs", "/log"]),
         ("设置", ["/host", "/interval", "/timeout", "/token"]),
         ("会话", ["/chat", "/cancel"]),

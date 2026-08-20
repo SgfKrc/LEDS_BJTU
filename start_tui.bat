@@ -38,7 +38,7 @@ if defined FIRST_ARG (
     if "%FIRST_ARG:~0,1%"=="/" set "SINGLE_CMD=1"
 )
 if defined FIRST_ARG if not defined SINGLE_CMD (
-    for %%c in (help h quit q exit shutdown halt status st screen goto refresh r model models switch load quant engine presets gpu device nodes connect dist queue logs log host interval timeout token chat cancel) do (
+    for %%c in (help h quit q exit shutdown halt status st screen goto refresh r model models switch load quant engine presets gpu device nodes connect join dist queue logs log host interval timeout token chat cancel) do (
         if /i "%FIRST_ARG%"=="%%c" set "SINGLE_CMD=1"
     )
 )
