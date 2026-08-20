@@ -1129,6 +1129,9 @@ class Scheduler:
         self._local_pipeline_steps: dict[str, int] = {}
         self._chain_clients: dict[str, object] = {}
         self._chain_clients_lock = threading.Lock()
+        # Optional Transport v2 runtime factory.  It is unset by default so
+        # all existing TCP clients keep the Legacy wire path unchanged.
+        self._transport_runtime_factory: Optional[Callable[[str], object]] = None
         self._pipeline_accounted_tasks: set = set()  # 主节点侧：已完成记账的流水线任务
         self._pipeline_accounted_order: collections.deque = collections.deque()
         self._local_pipeline_counted_tasks: set = set()  # 从节点侧：已本地计数的流水线任务
@@ -1209,6 +1212,29 @@ class Scheduler:
             aging_q2_to_q1=PIPELINE_AGING_Q2_TO_Q1_SECONDS,
             aging_max_wait=PIPELINE_AGING_MAX_WAIT_SECONDS,
         )
+
+    def set_transport_runtime_factory(self, factory: Optional[Callable[[str], object]]) -> None:
+        """Inject a per-peer Transport v2 bridge for local/production rollout."""
+
+        if factory is not None and not callable(factory):
+            raise TypeError("transport runtime factory must be callable or None")
+        self._transport_runtime_factory = factory
+
+    def _new_transport_runtime(self, node_id: str) -> object | None:
+        factory = self._transport_runtime_factory
+        if not callable(factory):
+            return None
+        try:
+            return factory(str(node_id))
+        except Exception:
+            logger.warning("transport runtime factory failed for %s", node_id, exc_info=True)
+            return None
+
+    def _transport_runtime_kwargs(self, node_id: str) -> dict[str, object]:
+        """Return an opt-in constructor kwarg without breaking test doubles."""
+
+        runtime = self._new_transport_runtime(node_id)
+        return {"transport_runtime": runtime} if runtime is not None else {}
 
     # ================================================================
     # 启动 / 停止
@@ -8810,6 +8836,7 @@ class Scheduler:
                 role="client",
                 advertise_port=advertise_port,
                 device_info=self._local_device_profile,
+                **self._transport_runtime_kwargs(node_id),
             )
             # REGISTER_ACK 后主节点会立即下发层配置，接收线程可能在
             # connect() 返回前进入回调。提前绑定连接和最终 node_id，保证
@@ -8890,6 +8917,7 @@ class Scheduler:
                         role="client",
                         advertise_port=advertise_port,
                         device_info=self._local_device_profile,
+                        **self._transport_runtime_kwargs(node_id),
                     )
                     self._tcp_client = client
                     _sync_runtime_node_config(node_id=node_id, node_role="client")
@@ -11729,6 +11757,7 @@ class Scheduler:
                         client_id=self.get_effective_node_id(),
                         role="client",
                         node_type="pipeline_peer",
+                        **self._transport_runtime_kwargs(target_node_id),
                     )
                     if not client.connect():
                         logger.error(

@@ -1818,7 +1818,8 @@ class TCPClient:
                  node_type: str = "pc",
                  advertise_host: str = None,
                  advertise_port: int = None,
-                 device_info: dict = None):
+                 device_info: dict = None,
+                 transport_runtime: Any = None):
         self.server_host = server_host or SERVER_IP
         self.server_port = server_port or SERVER_PORT
         self.client_id = client_id or f"client_{socket.gethostname()}"
@@ -1827,6 +1828,9 @@ class TCPClient:
         self.advertise_host = advertise_host
         self.advertise_port = advertise_port
         self.device_info = dict(device_info or {})
+        # Optional Transport v2 runtime seam.  With no bridge injected the
+        # established Legacy TCP path remains byte-for-byte unchanged.
+        self.transport_runtime = transport_runtime
         self.sock: Optional[socket.socket] = None
         self._running = False
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -1848,6 +1852,31 @@ class TCPClient:
         self._reconnect_state_lock = threading.Lock()
         self._reconnect_in_progress = False
         self._reconnect_retry_scheduled = False
+
+    def _transport_runtime_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        runtime = self.transport_runtime
+        callback = getattr(runtime, method, None) if runtime is not None else None
+        if not callable(callback):
+            return None
+        try:
+            return callback(*args, **kwargs)
+        except Exception:
+            # Transport telemetry must never take down the established Legacy
+            # TCP connection.  Explicit v2 send/receive calls are responsible
+            # for surfacing their own contract errors to the caller.
+            logger.debug("transport runtime hook failed: %s", method, exc_info=True)
+            return None
+
+    def get_transport_snapshot(self) -> dict:
+        runtime = self.transport_runtime
+        snapshot = getattr(runtime, "snapshot", None) if runtime is not None else None
+        if not callable(snapshot):
+            return {"mode": "legacy_tcp", "connected": bool(self._running and self.sock)}
+        try:
+            value = snapshot()
+            return dict(value) if isinstance(value, dict) else {"mode": "legacy_tcp"}
+        except Exception:
+            return {"mode": "legacy_tcp", "snapshot_error": True}
 
     @staticmethod
     def _compute_local_model_sha256(
@@ -2080,6 +2109,9 @@ class TCPClient:
                         self._disconnect_notified = False
                         self._last_heartbeat_send = 0.0
                         self._heartbeat_quality.begin_generation(connection_generation)
+                        self._transport_runtime_call(
+                            "connected", connection_generation,
+                        )
 
                     # 启动心跳线程
                     self._heartbeat_thread = threading.Thread(
@@ -2141,6 +2173,11 @@ class TCPClient:
                     msg = self.recv_data(connection_sock)
                     if msg is None:
                         break  # 连接断开
+                    self._transport_runtime_call(
+                        "observe_legacy_receive",
+                        msg,
+                        connection_generation=connection_generation,
+                    )
                     # 内部处理：HEARTBEAT_ACK → 计算 RTT
                     if msg.get("type") == MessageType.HEARTBEAT_ACK.value:
                         self._handle_heartbeat_ack(msg, connection_generation)
@@ -2155,6 +2192,7 @@ class TCPClient:
                 except (ConnectionError, OSError) as e:
                     if not self._running:
                         break
+                    self._transport_runtime_call("record_failure", e)
                     logger.warning(
                         f"客户端接收循环连接异常: {self.client_id} "
                         f"→ {self.server_host}:{self.server_port}, error={e}",
@@ -2218,6 +2256,12 @@ class TCPClient:
                   connection_sock: socket.socket = None) -> None:
         """向主节点发送数据"""
         packet = build_message(msg_type, data)
+        self._transport_runtime_call(
+            "observe_legacy_send",
+            packet,
+            request_id=self.client_id,
+            connection_generation=self._connection_generation,
+        )
         with self._send_lock:
             active_sock = self.sock if connection_sock is None else connection_sock
             if active_sock is None:
@@ -2230,6 +2274,7 @@ class TCPClient:
             try:
                 active_sock.sendall(packet)
             except OSError as exc:
+                self._transport_runtime_call("record_failure", exc)
                 raise ConnectionError("主节点连接发送失败") from exc
 
     def recv_data(self, connection_sock: socket.socket = None) -> Optional[dict]:
