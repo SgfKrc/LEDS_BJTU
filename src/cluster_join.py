@@ -42,7 +42,9 @@ else:
 
 SCHEMA_VERSION = "qlh.cluster.join-grant.v1"
 GRANT_PREFIX = "qlhjoin1"
+REQUEST_PREFIX = "qlhjoinreq1"
 MAX_GRANT_LENGTH = 16 * 1024
+MAX_REQUEST_LENGTH = 16 * 1024
 DEFAULT_CAPABILITIES = ("presence", "task")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SAFE_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -155,6 +157,30 @@ def generate_join_keypair() -> JoinKeyPair:
     )
 
 
+def load_join_private_key(encoded: str) -> Ed25519PrivateKey:
+    """Load a raw Ed25519 private key kept in the user-owned local store."""
+    _require_crypto()
+    try:
+        return Ed25519PrivateKey.from_private_bytes(
+            _unb64(encoded, field="private_key", expected_length=32)
+        )
+    except (ValueError, TypeError) as exc:
+        raise JoinContractError("private key is invalid", code="invalid_key") from exc
+
+
+def public_key_for_private(private_key: Ed25519PrivateKey) -> str:
+    """Return the URL-safe raw public key for a private key object."""
+    _require_crypto()
+    if not isinstance(private_key, Ed25519PrivateKey):
+        raise JoinContractError("private key is invalid", code="invalid_key")
+    return _b64(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    )
+
+
 def _normalize_capabilities(value: Any) -> list[str]:
     if value is None:
         value = DEFAULT_CAPABILITIES
@@ -186,11 +212,14 @@ def build_join_request(
     if isinstance(request_ttl_seconds, bool) or not 60 <= int(request_ttl_seconds) <= 3600:
         raise JoinContractError("request TTL is outside the allowed window", code="invalid_ttl")
     _unb64(target_public_key, field="target_public_key", expected_length=32)
+    target_id = _safe_id(target_node_id, field="target_node_id")
+    if target_id == "master":
+        raise JoinContractError("client join target cannot be master", code="role_escalation")
     request = {
         "schema_version": SCHEMA_VERSION,
         "master_endpoint": _normalize_endpoint(master_endpoint),
         "cluster_id": _safe_id(cluster_id, field="cluster_id"),
-        "target_node_id": _safe_id(target_node_id, field="target_node_id"),
+        "target_node_id": target_id,
         "target_public_key": target_public_key,
         "capabilities": _normalize_capabilities(capabilities),
         "requested_at": requested,
@@ -198,6 +227,56 @@ def build_join_request(
         "request_nonce": _b64(secrets.token_bytes(18)),
     }
     request["request_digest"] = hashlib.sha256(_canonical(request)).hexdigest()
+    return request
+
+
+def encode_join_request(request: Mapping[str, Any]) -> str:
+    """Encode a join request for both manual entry and QR rendering."""
+    if not isinstance(request, Mapping):
+        raise JoinContractError("join request is invalid", code="invalid_request")
+    required = {
+        "schema_version", "master_endpoint", "cluster_id", "target_node_id",
+        "target_public_key", "capabilities", "requested_at",
+        "request_expires_at", "request_nonce", "request_digest",
+    }
+    if not required.issubset(request) or request.get("schema_version") != SCHEMA_VERSION:
+        raise JoinContractError("join request is incomplete", code="invalid_request")
+    if request.get("target_node_id") == "master":
+        raise JoinContractError("client join target cannot be master", code="role_escalation")
+    _normalize_endpoint(request.get("master_endpoint"))
+    _safe_id(request.get("cluster_id"), field="cluster_id")
+    _safe_id(request.get("target_node_id"), field="target_node_id")
+    _unb64(request.get("target_public_key"), field="target_public_key", expected_length=32)
+    _normalize_capabilities(request.get("capabilities"))
+    for field in ("requested_at", "request_expires_at"):
+        if not isinstance(request.get(field), int) or request[field] < 0:
+            raise JoinContractError(f"{field} is invalid", code="invalid_request")
+    _unb64(request.get("request_nonce"), field="request_nonce", expected_length=18)
+    expected_digest = hashlib.sha256(
+        _canonical({key: value for key, value in dict(request).items() if key != "request_digest"})
+    ).hexdigest()
+    if request.get("request_digest") != expected_digest:
+        raise JoinContractError("join request digest mismatch", code="request_tampered")
+    encoded = f"{REQUEST_PREFIX}.{_b64(_canonical(dict(request)))}"
+    if len(encoded) > MAX_REQUEST_LENGTH:
+        raise JoinContractError("join request is too large", code="request_too_large")
+    return encoded
+
+
+def decode_join_request(value: str) -> dict[str, Any]:
+    """Decode and validate a manual/QR join request."""
+    if not isinstance(value, str) or len(value) > MAX_REQUEST_LENGTH or not value.startswith(f"{REQUEST_PREFIX}."):
+        raise JoinContractError("join request prefix is invalid", code="invalid_request")
+    parts = value.split(".")
+    if len(parts) != 2:
+        raise JoinContractError("join request encoding is invalid", code="invalid_request")
+    try:
+        request = json.loads(_unb64(parts[1], field="request").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise JoinContractError("join request is not valid JSON", code="invalid_request") from exc
+    if not isinstance(request, dict):
+        raise JoinContractError("join request payload is invalid", code="invalid_request")
+    encode_join_request(request)
     return request
 
 
@@ -209,6 +288,7 @@ def issue_join_grant(
     auth_verified: bool,
     now: int | float | None = None,
     ttl_seconds: int = 300,
+    issuer_public_key: str | None = None,
 ) -> dict[str, Any]:
     """Issue a short-lived grant after the control plane verified Auth App/TOTP."""
     if auth_verified is not True:
@@ -218,6 +298,8 @@ def issue_join_grant(
     _require_crypto()
     if not isinstance(issuer_private_key, Ed25519PrivateKey):
         raise JoinContractError("issuer private key is invalid", code="invalid_key")
+    resolved_issuer_public_key = issuer_public_key or public_key_for_private(issuer_private_key)
+    _unb64(resolved_issuer_public_key, field="issuer_public_key", expected_length=32)
     required = {
         "schema_version", "master_endpoint", "cluster_id", "target_node_id",
         "target_public_key", "capabilities", "request_expires_at", "request_digest",
@@ -250,6 +332,7 @@ def issue_join_grant(
         "request_digest": request_copy["request_digest"],
         "issuer_key_id": str(issuer_key_id),
         "auth_method": "totp",
+        "issuer_public_key": resolved_issuer_public_key,
     }
     signature = _b64(issuer_private_key.sign(_canonical(payload)))
     return {
@@ -284,6 +367,7 @@ def encode_join_grant(grant: Mapping[str, Any]) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("request_digest", ""))):
         raise JoinContractError("request_digest is invalid", code="invalid_grant")
     _safe_id(payload.get("issuer_key_id"), field="issuer_key_id", pattern=_SAFE_KEY_ID)
+    _unb64(payload.get("issuer_public_key"), field="issuer_public_key", expected_length=32)
     _unb64(payload.get("nonce"), field="nonce", expected_length=18)
     _unb64(signature, field="signature", expected_length=64)
     encoded = f"{GRANT_PREFIX}.{_b64(_canonical(dict(payload)))}.{signature}"
@@ -327,6 +411,28 @@ class JoinGrantLedger:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cluster_join_keys (
+                  key_scope TEXT PRIMARY KEY,
+                  key_id TEXT NOT NULL,
+                  private_key TEXT NOT NULL,
+                  public_key TEXT NOT NULL,
+                  updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cluster_join_pending_requests (
+                  request_digest TEXT PRIMARY KEY,
+                  request_json TEXT NOT NULL,
+                  private_key TEXT NOT NULL,
+                  public_key TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
+                )
+                """
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10.0)
@@ -353,6 +459,72 @@ class JoinGrantLedger:
                 (nonce, grant_digest, timestamp),
             )
 
+    def get_or_create_issuer_keypair(self, key_id: str = "main") -> tuple[str, JoinKeyPair]:
+        """Return the durable main-node signing key owned by this SQLite store."""
+        _safe_id(key_id, field="key_id", pattern=_SAFE_KEY_ID)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT key_id, private_key, public_key FROM cluster_join_keys WHERE key_scope = 'issuer'"
+            ).fetchone()
+            if row is not None:
+                return str(row["key_id"]), JoinKeyPair(
+                    private_key=str(row["private_key"]), public_key=str(row["public_key"])
+                )
+            pair = generate_join_keypair()
+            connection.execute(
+                "INSERT INTO cluster_join_keys(key_scope, key_id, private_key, public_key, updated_at) VALUES ('issuer', ?, ?, ?, ?)",
+                (key_id, pair.private_key, pair.public_key, _now_seconds(None)),
+            )
+            return key_id, pair
+
+    def save_pending_request(self, request: Mapping[str, Any], keypair: JoinKeyPair) -> None:
+        encode_join_request(request)
+        if not isinstance(keypair, JoinKeyPair) or keypair.public_key != request.get("target_public_key"):
+            raise JoinContractError("pending key does not match request target", code="request_mismatch")
+        _unb64(keypair.private_key, field="private_key", expected_length=32)
+        _unb64(keypair.public_key, field="public_key", expected_length=32)
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO cluster_join_pending_requests(request_digest, request_json, private_key, public_key, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(request_digest) DO UPDATE SET request_json=excluded.request_json,
+                  private_key=excluded.private_key, public_key=excluded.public_key,
+                  created_at=excluded.created_at
+                """,
+                (
+                    str(request["request_digest"]),
+                    json.dumps(dict(request), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    keypair.private_key,
+                    keypair.public_key,
+                    _now_seconds(None),
+                ),
+            )
+
+    def load_pending_request(self, request_digest: str) -> tuple[dict[str, Any], JoinKeyPair] | None:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(request_digest)):
+            return None
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT request_json, private_key, public_key FROM cluster_join_pending_requests WHERE request_digest = ?",
+                (request_digest,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            request = json.loads(str(row["request_json"]))
+            encode_join_request(request)
+        except (JoinContractError, json.JSONDecodeError, TypeError):
+            return None
+        return request, JoinKeyPair(private_key=str(row["private_key"]), public_key=str(row["public_key"]))
+
+    def delete_pending_request(self, request_digest: str) -> None:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM cluster_join_pending_requests WHERE request_digest = ?",
+                (request_digest,),
+            )
+
 
 def verify_and_consume_join_grant(
     encoded_grant: str,
@@ -363,6 +535,26 @@ def verify_and_consume_join_grant(
     now: int | float | None = None,
 ) -> dict[str, Any]:
     """Verify signature, binding, TTL and role, then atomically consume nonce."""
+    payload = verify_join_grant(
+        encoded_grant,
+        issuer_public_key=issuer_public_key,
+        expected_request=expected_request,
+        now=now,
+    )
+    nonce = payload.get("nonce")
+    digest = hashlib.sha256(encoded_grant.encode("ascii")).hexdigest()
+    ledger.consume(nonce=nonce, grant_digest=digest, consumed_at=_now_seconds(now))
+    return payload
+
+
+def verify_join_grant(
+    encoded_grant: str,
+    *,
+    issuer_public_key: str,
+    expected_request: Mapping[str, Any],
+    now: int | float | None = None,
+) -> dict[str, Any]:
+    """Verify a grant without consuming its nonce (for pre-switch checks)."""
     _require_crypto()
     grant = decode_join_grant(encoded_grant)
     # Validate the full envelope before any nonce state is consumed.
@@ -380,6 +572,8 @@ def verify_and_consume_join_grant(
         )
     except (InvalidSignature, ValueError, TypeError) as exc:
         raise JoinContractError("grant signature is invalid", code="signature_invalid") from exc
+    if payload.get("issuer_public_key") != issuer_public_key:
+        raise JoinContractError("issuer public key mismatch", code="issuer_mismatch")
     if payload.get("role") != "client":
         raise JoinContractError("grant is not client-only", code="role_escalation")
     current = _now_seconds(now)
@@ -397,7 +591,4 @@ def verify_and_consume_join_grant(
         if payload.get(field) != expected:
             raise JoinContractError(f"grant {field} mismatch", code="request_mismatch")
     _unb64(payload.get("target_public_key"), field="target_public_key", expected_length=32)
-    nonce = payload.get("nonce")
-    digest = hashlib.sha256(encoded_grant.encode("ascii")).hexdigest()
-    ledger.consume(nonce=nonce, grant_digest=digest, consumed_at=current)
     return dict(payload)

@@ -497,6 +497,46 @@ class TestComputeLayerAssignment:
         assert sched._active_pipeline_capacity_plan["transaction_phase"] == "ready"
         assert sched.get_layer_assignments()["strategy"] == "capacity"
 
+    def test_late_prepare_ack_after_commit_is_not_logged_as_worker_error(
+            self, sched, caplog):
+        sched._pipeline_load_transaction = {
+            "config_id": "cfg-late-prepare",
+            "generation": 4,
+            "phase": "committing",
+            "plan": {"admitted": True, "plan_id": "plan-late"},
+            "worker_ids": {"worker"},
+            "ready_nodes": set(),
+        }
+        sched._layer_config_expected["worker"] = {
+            "node_id": "worker",
+            "config_id": "cfg-late-prepare",
+            "phase": "commit",
+            "plan_id": "plan-late",
+            "start_layer": 2,
+            "end_layer": 4,
+            "required_bytes": 100,
+            "model_sha256": "sha",
+            "model_type": "qwen2",
+        }
+
+        with caplog.at_level(logging.ERROR):
+            sched._handle_layer_config_ack("worker", {"data": {
+                "node_id": "worker",
+                "config_id": "cfg-late-prepare",
+                "status": "prepared",
+                "phase": "prepare",
+                "plan_id": "plan-late",
+                "layer_range": [2, 4],
+                "model_sha256": "sha",
+                "model_type": "qwen2",
+                "engine": "pytorch",
+                "available_bytes": 100,
+            }})
+
+        assert sched._layer_config_acks["worker"]["status"] == "prepared"
+        assert sched._pipeline_load_transaction["phase"] == "committing"
+        assert not any("阶段未通过" in record.message for record in caplog.records)
+
     def test_capacity_transaction_aborts_when_worker_disconnects(
             self, sched, monkeypatch):
         aborts = []
@@ -1372,6 +1412,34 @@ class TestPipelineReadiness:
         """TCP 服务端未启动 → 返回 False"""
         sched._tcp_server = None
         assert sched._all_pipeline_nodes_ready() is False
+
+    def test_forced_sync_does_not_accept_ready_single_node_plan(
+            self, sched, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sched, "_get_pipeline_readiness", lambda: {
+            "ready": True,
+            "reason_code": "ready",
+            "reason": "当前单节点计划已就绪",
+            "workers": [],
+        })
+        monkeypatch.setattr(sched, "_connected_pc_worker_ids", lambda: ["worker"])
+        monkeypatch.setattr(
+            sched, "_has_active_distributed_pipeline_plan", lambda: False,
+        )
+        monkeypatch.setattr(
+            sched,
+            "request_authoritative_layer_sync",
+            lambda **kwargs: calls.append(kwargs),
+        )
+
+        readiness = sched._synchronize_pipeline_workers_for_request(
+            timeout=0.0,
+            force_distributed_assignment=True,
+        )
+
+        assert calls == [{"require_distributed": True}]
+        assert readiness["ready"] is False
+        assert readiness["reason_code"] == "pipeline_single_node_plan_active"
 
     def test_only_master_nodes(self, sched):
         """仅主节点分配了层 → 无流水线从节点 → 返回 False"""
@@ -3029,6 +3097,59 @@ class TestPipelineQueueIntegration:
             sched._all_pipeline_nodes_ready = original
             sched.run_pipeline = original_run
             sched.pipeline_queue._current_task_id = None
+
+    def test_queued_distributed_request_preserves_routing_flags(
+            self, sched, monkeypatch):
+        """排队不能丢失强制分布式标记并静默改走整模。"""
+        from model_host import model_host as _host
+
+        class MockModelManager:
+            is_loaded = True
+            _engine_type = "pytorch"
+
+        monkeypatch.setattr(_host, "_manager", MockModelManager())
+        monkeypatch.setattr(sched, "_all_pipeline_nodes_ready", lambda: True)
+        monkeypatch.setattr(
+            sched, "_has_active_distributed_pipeline_plan", lambda: True,
+        )
+        monkeypatch.setattr(
+            sched,
+            "_synchronize_pipeline_workers_for_request",
+            lambda **kwargs: {"ready": True, "reason_code": "ready"},
+        )
+        captured = {}
+        sched.pipeline_queue._current_task_id = "busy"
+        monkeypatch.setattr(
+            sched.pipeline_queue,
+            "enqueue",
+            lambda **data: captured.update(data) or "queued-distributed",
+        )
+        monkeypatch.setattr(
+            sched.pipeline_queue,
+            "wait_for_result",
+            lambda *args, **kwargs: {
+                "status": "done",
+                "result": {
+                    "response": "queued distributed",
+                    "metrics": {"distributed_used": True},
+                },
+            },
+        )
+
+        try:
+            result = sched.run_pipeline_safe(
+                "queued prompt",
+                _require_distributed=True,
+                _force_distributed_assignment=True,
+                _pipeline_model_sync_timeout=3,
+            )
+        finally:
+            sched.pipeline_queue._current_task_id = None
+
+        assert result["response"] == "queued distributed"
+        assert captured["_require_distributed"] is True
+        assert captured["_force_distributed_assignment"] is True
+        assert captured["_pipeline_model_sync_timeout"] == 3
 
 
 # ================================================================

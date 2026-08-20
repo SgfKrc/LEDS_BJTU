@@ -6536,6 +6536,22 @@ input:focus, textarea:focus { border-color: var(--accent); }
 .dialog-actions { justify-content: flex-end; }
 .account-qr-box { width: 240px; height: 240px; margin: 0 auto; display: grid; place-items: center; border: 8px solid #fff; background: #fff; color: #374151; }
 .account-qr-box img { display: block; width: 224px; height: 224px; }
+
+/* Cluster join request/grant controls: compact, readable in both themes. */
+.join-auth-panel { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
+.join-auth-heading { font-weight: 650; color: var(--text); margin-bottom: 6px; }
+.join-auth-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; }
+.join-auth-label { display: block; color: var(--text-muted); font-size: 12px; margin: 8px 0 5px; }
+.join-auth-code { width: 100%; min-height: 84px; resize: vertical; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; line-height: 1.45; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--input-bg, var(--surface)); color: var(--text); }
+.join-auth-grant-input { min-height: 72px; margin-bottom: 8px; }
+.join-auth-code-row { display: grid; grid-template-columns: minmax(0, 1fr) 132px; gap: 12px; align-items: center; margin: 8px 0 10px; }
+.join-auth-qr { width: 124px; height: 124px; padding: 4px; background: #fff; border-radius: 4px; justify-self: end; }
+.join-auth-check { display: flex; align-items: flex-start; gap: 7px; color: var(--text-muted); font-size: 12px; margin: 10px 0; }
+.join-auth-check input { margin-top: 2px; }
+@media (max-width: 560px) {
+  .join-auth-code-row { grid-template-columns: 1fr; }
+  .join-auth-qr { justify-self: start; }
+}
 .secret-box { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--border); background: var(--bg-input); }
 .secret-box code { overflow-wrap: anywhere; color: var(--text-primary); font-size: 12px; line-height: 1.45; }
 .full-btn { width: 100%; }

@@ -1278,6 +1278,7 @@ class EngineHost:
                     temperature=req.temperature,
                     top_p=req.top_p,
                     show_thinking=req.show_thinking,
+                    routing_preference=req.routing_preference,
                     session_id=req.session_id,
                     messages=list(history) + [{"role": "user", "content": req.message}],
                     request_id=_request_id_ctx.get("-"),
@@ -1325,10 +1326,15 @@ class EngineHost:
                     }
                 elif result.get("status") == "disconnected":
                     logger.warning("分布式推理转发失败（未连接主节点），回退到本地推理")
+                    self._enforce_distributed_required(req, detail="从节点未连接主节点")
                 elif result.get("status") == "timeout":
                     logger.warning("分布式推理转发超时，回退到本地推理")
+                    self._enforce_distributed_required(req, detail="分布式转发超时")
                 else:
                     logger.warning(f"分布式推理转发失败: {result.get('error', 'unknown')}，回退到本地推理")
+                    self._enforce_distributed_required(
+                        req, detail=str(result.get("error", "分布式转发失败")),
+                    )
             except ChatGenerationCancelled:
                 raise
             except Exception as e:
@@ -1366,11 +1372,16 @@ class EngineHost:
                     session_id=req.session_id,
                     messages=list(history) + [{"role": "user", "content": req.message}],
                     show_thinking=req.show_thinking,
+                    _require_distributed=(req.routing_preference == "distributed_required"),
+                    _force_distributed_assignment=True,
                     _cancel_event=cancel_event,
                 )
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 if pipeline_result.get("error"):
                     logger.warning(f"流水线推理失败: {pipeline_result['error']}，回退到本地推理")
+                    self._enforce_distributed_required(
+                        req, detail=str(pipeline_result["error"]),
+                    )
                 else:
                     response_text = pipeline_result.get("response", "")
                     if not response_text:
@@ -1396,6 +1407,11 @@ class EngineHost:
                             pipeline_metrics["fallback_reason"] = (
                                 external_fallback_reason
                             )
+                        self._enforce_distributed_required(
+                            req,
+                            pipeline_metrics,
+                            detail="流水线结果未标记为分布式执行",
+                        )
                         self._persist_conversation_turn(
                             db_session_id, req.message, response_text, pipeline_metrics,
                         )
@@ -1422,6 +1438,7 @@ class EngineHost:
             except Exception as e:
                 _raise_if_generation_cancelled(cancel_event, req.generation_id)
                 logger.warning(f"流水线推理异常: {e}，回退到本地推理")
+                self._enforce_distributed_required(req, detail=str(e))
 
         model_manager = self._host
         # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
@@ -2270,7 +2287,18 @@ class EngineHost:
 
         remote_stage_id = str(req.task_graph_remote_stage or "")
         remote_provider_id = str(req.task_graph_remote_provider_id or "")
-        auto_remote = bool(req.task_graph_auto_remote)
+        distributed_task_required = (
+            req.routing_preference == "distributed_required"
+        )
+        auto_remote = bool(
+            req.task_graph_auto_remote
+            or (
+                not remote_stage_id
+                and req.routing_preference in {
+                    "distributed_preferred", "distributed_required",
+                }
+            )
+        )
         if bool(remote_stage_id) != bool(remote_provider_id):
             raise coded_http_error(
                 400,
@@ -2290,6 +2318,13 @@ class EngineHost:
                 "PC Full Worker 实验调度未启用。请设置 "
                 "QLH_TASK_WORKER_EXPERIMENTAL_ENABLED=true 后重启。",
             )
+        if auto_remote and not _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
+            if distributed_task_required:
+                raise coded_http_error(
+                    503,
+                    "TASK_WORKER_EXPERIMENT_DISABLED",
+                    "distributed_required 需要已启用的 PC Full Worker 实验调度。",
+                )
 
         target_session_id = req.session_id or self._active_session_id
         if target_session_id and target_session_id != self._active_session_id:
@@ -2391,6 +2426,12 @@ class EngineHost:
                 model_identity = self._active_task_graph_model_identity()
             if _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED and model_identity is None:
                 auto_fallback_reason = "model_identity_unavailable"
+                if distributed_task_required:
+                    raise coded_http_error(
+                        409,
+                        "TASK_WORKER_MODEL_IDENTITY_UNAVAILABLE",
+                        "distributed_required 需要主节点已加载完整模型并生成精确身份。",
+                    )
             elif _cfg.TASK_WORKER_EXPERIMENTAL_ENABLED:
                 auto_provider_ids = self._eligible_remote_task_worker_provider_ids(
                     model_identity,
@@ -2398,6 +2439,12 @@ class EngineHost:
                 )
                 if not auto_provider_ids:
                     auto_fallback_reason = "no_eligible_remote_provider"
+                    if distributed_task_required:
+                        raise coded_http_error(
+                            503,
+                            "TASK_WORKER_NO_ELIGIBLE_REMOTE_PROVIDER",
+                            "distributed_required 没有可用且模型身份精确匹配的 PC Full Worker。",
+                        )
                 else:
                     template_stages, final_stage_id = dual_candidate_template()
                     candidate_index = 0
@@ -2424,7 +2471,13 @@ class EngineHost:
                             stage,
                             provider=primary,
                             fallback_providers=tuple(
-                                [*other_remotes, "local_full_model"]
+                                [
+                                    *other_remotes,
+                                    *(
+                                        [] if distributed_task_required
+                                        else ["local_full_model"]
+                                    ),
+                                ]
                             ),
                             pure=True,
                         ))
@@ -2572,6 +2625,12 @@ class EngineHost:
             if attempt.get("provider_node_id")
         })
         remote_used = bool(remote_attempts)
+        if distributed_task_required and not remote_used:
+            raise coded_http_error(
+                503,
+                "TASK_WORKER_REMOTE_STAGE_NOT_EXECUTED",
+                "distributed_required 未执行任何远端 Full Worker Stage。",
+            )
         provider_status_by_id = {
             str(item.get("provider_id", "")): item
             for item in self._ensure_task_graph_coordinator().provider_status()
@@ -2965,6 +3024,21 @@ class EngineHost:
                     "（分布式未启用或本节点不是主节点）"
                 )
         return None
+
+    def _enforce_distributed_required(
+        self,
+        req: "ChatRequest",
+        metrics: Optional[dict] = None,
+        *,
+        detail: str = "分布式执行未完成",
+    ) -> None:
+        """Reject the EngineHost's local fallback for an explicit route."""
+        if req.routing_preference != "distributed_required":
+            return
+        if isinstance(metrics, dict) and metrics.get("distributed_used"):
+            return
+        from fastapi import HTTPException
+        raise HTTPException(503, f"distributed_required 执行失败：{detail}")
 
     def _external_route_decision(self, req: "ChatRequest"):
         """按当前配置 + 请求 flag 计算外部路由决策（纯函数包装，读实时配置）。"""

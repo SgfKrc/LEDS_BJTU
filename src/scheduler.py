@@ -1129,6 +1129,9 @@ class Scheduler:
         self._local_pipeline_steps: dict[str, int] = {}
         self._chain_clients: dict[str, object] = {}
         self._chain_clients_lock = threading.Lock()
+        # Optional Transport v2 runtime factory.  It is unset by default so
+        # all existing TCP clients keep the Legacy wire path unchanged.
+        self._transport_runtime_factory: Optional[Callable[[str], object]] = None
         self._pipeline_accounted_tasks: set = set()  # 主节点侧：已完成记账的流水线任务
         self._pipeline_accounted_order: collections.deque = collections.deque()
         self._local_pipeline_counted_tasks: set = set()  # 从节点侧：已本地计数的流水线任务
@@ -1209,6 +1212,29 @@ class Scheduler:
             aging_q2_to_q1=PIPELINE_AGING_Q2_TO_Q1_SECONDS,
             aging_max_wait=PIPELINE_AGING_MAX_WAIT_SECONDS,
         )
+
+    def set_transport_runtime_factory(self, factory: Optional[Callable[[str], object]]) -> None:
+        """Inject a per-peer Transport v2 bridge for local/production rollout."""
+
+        if factory is not None and not callable(factory):
+            raise TypeError("transport runtime factory must be callable or None")
+        self._transport_runtime_factory = factory
+
+    def _new_transport_runtime(self, node_id: str) -> object | None:
+        factory = self._transport_runtime_factory
+        if not callable(factory):
+            return None
+        try:
+            return factory(str(node_id))
+        except Exception:
+            logger.warning("transport runtime factory failed for %s", node_id, exc_info=True)
+            return None
+
+    def _transport_runtime_kwargs(self, node_id: str) -> dict[str, object]:
+        """Return an opt-in constructor kwarg without breaking test doubles."""
+
+        runtime = self._new_transport_runtime(node_id)
+        return {"transport_runtime": runtime} if runtime is not None else {}
 
     # ================================================================
     # 启动 / 停止
@@ -2995,9 +3021,20 @@ class Scheduler:
     def get_pipeline_capacity_plan(
         self, eligible_node_ids: Optional[set[str]] = None,
         *, descriptor: Optional[dict] = None,
+        require_distributed: bool = False,
     ) -> dict:
-        """Compute an all-or-nothing metadata-only cluster capacity plan."""
-        if eligible_node_ids is None and descriptor is None:
+        """Compute an all-or-nothing metadata-only cluster capacity plan.
+
+        ``require_distributed`` is request-scoped. It bypasses a cached
+        single-node plan and asks the solver for at least two participating
+        nodes, so an explicit distributed request cannot be satisfied by a
+        master-only placement.
+        """
+        if (
+            not require_distributed
+            and eligible_node_ids is None
+            and descriptor is None
+        ):
             with self._layer_config_lock:
                 active = (
                     dict(self._active_pipeline_capacity_plan)
@@ -3055,6 +3092,7 @@ class Scheduler:
                 descriptor,
                 self._get_pipeline_capacity_nodes(eligible_node_ids),
                 safety_margin=PIPELINE_CAPACITY_SAFETY_MARGIN,
+                require_distributed=require_distributed,
             )
         except PipelineCapacityError as exc:
             return {
@@ -3066,6 +3104,7 @@ class Scheduler:
             }
         result["computed_at"] = time.time()
         result["transaction_phase"] = "planned" if result.get("admitted") else "rejected"
+        result.setdefault("require_distributed", bool(require_distributed))
         return result
 
     def _build_manual_pipeline_capacity_plan(
@@ -3359,7 +3398,9 @@ class Scheduler:
         with self._layer_config_push_lock:
             self._push_layer_config_to_clients_locked()
 
-    def request_authoritative_layer_sync(self) -> bool:
+    def request_authoritative_layer_sync(
+        self, *, require_distributed: bool = False,
+    ) -> bool:
         """让在线 PC 从节点服从主节点当前模型和分层配置。
 
         从节点显式执行本地模型操作后会暂时退出分层 worker。主节点模型
@@ -3371,7 +3412,12 @@ class Scheduler:
         with self._layer_config_lock:
             self._authoritative_layer_sync_requests += 1
         try:
-            self.push_layer_config_to_clients()
+            # Explicit distributed requests bypass a single-node capacity plan;
+            # ordinary authoritative refreshes preserve the existing policy.
+            with self._layer_config_push_lock:
+                self._push_layer_config_to_clients_locked(
+                    require_distributed=require_distributed,
+                )
         finally:
             with self._layer_config_lock:
                 self._authoritative_layer_sync_requests = max(
@@ -3379,7 +3425,9 @@ class Scheduler:
                 )
         return True
 
-    def _push_layer_config_to_clients_locked(self) -> None:
+    def _push_layer_config_to_clients_locked(
+        self, *, require_distributed: bool = False,
+    ) -> None:
         """
         向所有 TCP 连接的从节点推送其分层配置。
 
@@ -3448,20 +3496,28 @@ class Scheduler:
             return
 
         distributed_only = bool(
-            getattr(self._host, "is_pipeline_prepared", False)
+            require_distributed
+            or getattr(self._host, "is_pipeline_prepared", False)
         )
         capacity_plan = None
         if distributed_only:
             manual_override = bool(self._runtime_layer_override)
-            if manual_override:
+            if manual_override and not require_distributed:
                 layer_info = self.get_layer_assignments()
                 capacity_plan = self._build_manual_pipeline_capacity_plan(
                     layer_info.get("assignments", [])
                 )
             else:
+                if manual_override:
+                    logger.info(
+                        "分布式请求忽略单机手动分层覆盖，改用多节点容量求解"
+                    )
                 eligible_node_ids = set(releasable_pc_ids)
                 eligible_node_ids.update({"master", self.get_effective_node_id()})
-                capacity_plan = self.get_pipeline_capacity_plan(eligible_node_ids)
+                capacity_plan = self.get_pipeline_capacity_plan(
+                    eligible_node_ids,
+                    require_distributed=require_distributed,
+                )
             if not capacity_plan.get("admitted"):
                 releases = {
                     node_id: {
@@ -6314,17 +6370,58 @@ class Scheduler:
         )
 
     def get_task_worker_protocol_status(self) -> dict:
-        runtime = self._task_worker_control.status(role=self._effective_role())
+        role = self._effective_role()
+        runtime = self._task_worker_control.status(role=role)
         connected = bool(runtime.get("control_plane_connected", False))
+        if role == "master":
+            healthy_workers = [
+                worker for worker in runtime.get("workers", [])
+                if isinstance(worker, dict) and worker.get("healthy")
+            ]
+            full_model_worker_ids = sorted(
+                str(worker.get("node_id", ""))
+                for worker in healthy_workers
+                if isinstance(worker.get("capabilities"), dict)
+                and bool(worker["capabilities"].get("models"))
+            )
+            workers_missing_full_model = sorted(
+                str(worker.get("node_id", ""))
+                for worker in healthy_workers
+                if str(worker.get("node_id", "")) not in full_model_worker_ids
+            )
+        else:
+            local_models = self._task_worker_capabilities().get("models", [])
+            full_model_worker_ids = (
+                [self.get_effective_node_id()] if connected and local_models else []
+            )
+            workers_missing_full_model = (
+                [self.get_effective_node_id()] if connected and not local_models else []
+            )
+        full_model_ready = bool(full_model_worker_ids)
+        if not TASK_WORKER_EXPERIMENTAL_ENABLED:
+            readiness_reason = "task_worker_experiment_disabled"
+        elif not connected:
+            readiness_reason = "task_worker_control_plane_not_connected"
+        elif not full_model_ready:
+            readiness_reason = "task_worker_full_model_not_advertised"
+        else:
+            readiness_reason = "task_worker_manual_dispatch_ready"
         runtime.update({
             "phase": "TC-N2.4",
             "experiment_enabled": TASK_WORKER_EXPERIMENTAL_ENABLED,
             "experimental_dispatch_enabled": bool(
-                TASK_WORKER_EXPERIMENTAL_ENABLED and connected
+                TASK_WORKER_EXPERIMENTAL_ENABLED and connected and full_model_ready
             ),
             "auto_provider_selection_enabled": bool(
-                TASK_WORKER_EXPERIMENTAL_ENABLED and connected
+                TASK_WORKER_EXPERIMENTAL_ENABLED and connected and full_model_ready
             ),
+            "manual_stage_dispatch_enabled": bool(
+                TASK_WORKER_EXPERIMENTAL_ENABLED and connected and full_model_ready
+            ),
+            "full_model_worker_count": len(full_model_worker_ids),
+            "full_model_worker_ids": full_model_worker_ids,
+            "workers_missing_full_model": workers_missing_full_model,
+            "worker_readiness_reason": readiness_reason,
             "admission_state": (
                 "n2_4_experimental_physical_validation_pending"
                 if TASK_WORKER_EXPERIMENTAL_ENABLED and connected
@@ -8810,6 +8907,7 @@ class Scheduler:
                 role="client",
                 advertise_port=advertise_port,
                 device_info=self._local_device_profile,
+                **self._transport_runtime_kwargs(node_id),
             )
             # REGISTER_ACK 后主节点会立即下发层配置，接收线程可能在
             # connect() 返回前进入回调。提前绑定连接和最终 node_id，保证
@@ -8890,6 +8988,7 @@ class Scheduler:
                         role="client",
                         advertise_port=advertise_port,
                         device_info=self._local_device_profile,
+                        **self._transport_runtime_kwargs(node_id),
                     )
                     self._tcp_client = client
                     _sync_runtime_node_config(node_id=node_id, node_role="client")
@@ -8954,6 +9053,7 @@ class Scheduler:
                                      session_id: Optional[str] = None,
                                      messages: list = None,
                                      request_id: str = None,   # L5: 链路追踪
+                                     routing_preference: str = "auto",
                                      _cancel_event: Optional[threading.Event] = None,
                                      timeout: float = 120.0) -> dict:
         """
@@ -9002,6 +9102,7 @@ class Scheduler:
                 "session_id": session_id,
                 "messages": messages or [{"role": "user", "content": message}],
                 "request_id": request_id,   # L5: 链路追踪
+                "routing_preference": routing_preference,
                 "forward_request_id": forward_request_id,
             }
             tcp_client.send_data(infer_data, MessageType.INFER_FORWARD)
@@ -9629,6 +9730,7 @@ class Scheduler:
         max_new_tokens = data.get("max_new_tokens", 512)
         temperature = data.get("temperature", 0.7)
         top_p = data.get("top_p", 0.9)
+        routing_preference = str(data.get("routing_preference", "auto") or "auto")
         show_thinking = data.get("show_thinking", False)
         session_id = data.get("session_id")
         messages = data.get("messages")
@@ -9670,6 +9772,8 @@ class Scheduler:
                     session_id=session_id,
                     messages=messages,
                     show_thinking=show_thinking,
+                    _require_distributed=(routing_preference == "distributed_required"),
+                    _force_distributed_assignment=(routing_preference != "local_only"),
                     _cancel_event=cancel_event,
                 )
 
@@ -10524,6 +10628,7 @@ class Scheduler:
                 release_ack = True
                 ready = False
                 prepared = False
+                prepared_late = False
                 expected_range = []
             else:
                 release_ack = False
@@ -10540,6 +10645,19 @@ class Scheduler:
                     and data.get("engine") == "pytorch"
                     and int(data.get("available_bytes", 0) or 0)
                     >= int(expected.get("required_bytes", 0) or 0)
+                )
+                # A fast worker may deliver prepare after the coordinator has
+                # already published commit. This is a valid same-generation
+                # state update, not a worker failure.
+                prepared_late = (
+                    expected_phase == "commit"
+                    and data.get("status") == "prepared"
+                    and data.get("phase") == "prepare"
+                    and data.get("plan_id") == expected.get("plan_id")
+                    and data.get("layer_range") == expected_range
+                    and data.get("model_sha256") == expected.get("model_sha256")
+                    and data.get("model_type") == expected.get("model_type")
+                    and data.get("engine") == "pytorch"
                 )
                 ready = (
                     expected_phase == "commit"
@@ -10586,6 +10704,8 @@ class Scheduler:
                         transaction["prepared_nodes"] = prepared_nodes
                         if prepared_nodes == set(transaction.get("worker_ids", set())):
                             commit_config_id = config_id
+                elif prepared_late:
+                    self._layer_config_retry_state.pop(client_id, None)
                 else:
                     self._layer_config_pushed.discard(client_id)
                     state = self._layer_config_retry_state.setdefault(
@@ -10628,6 +10748,11 @@ class Scheduler:
             logger.info(
                 "从节点层配置已就绪: node=%s range=%s config=%s",
                 client_id, expected_range, config_id,
+            )
+        elif prepared_late:
+            logger.info(
+                "忽略已进入 commit 的迟到 prepare ACK: node=%s config=%s",
+                client_id, config_id,
             )
         else:
             logger.error(
@@ -11489,16 +11614,39 @@ class Scheduler:
                 and not self._node_is_island_gateway(node.device_info)
             )
 
+    def _has_active_distributed_pipeline_plan(self) -> bool:
+        """Return whether the current generation actually uses two nodes."""
+        with self._layer_config_lock:
+            plan = self._active_pipeline_capacity_plan
+            transaction = self._pipeline_load_transaction
+            if not plan and transaction:
+                plan = transaction.get("plan")
+            assignments = plan.get("assignments", []) if isinstance(plan, dict) else []
+            return len(assignments) >= 2
+
     def _synchronize_pipeline_workers_for_request(
-        self, timeout: float = PIPELINE_MODEL_SYNC_TIMEOUT,
+        self,
+        timeout: float = PIPELINE_MODEL_SYNC_TIMEOUT,
+        *,
+        force_distributed_assignment: bool = False,
     ) -> dict:
         """Synchronize worker model segments before falling back to the master."""
         readiness = self._get_pipeline_readiness()
-        if readiness.get("ready"):
+        if readiness.get("ready") and (
+            not force_distributed_assignment
+            or self._has_active_distributed_pipeline_plan()
+        ):
             return readiness
 
         worker_ids = self._connected_pc_worker_ids()
         if not worker_ids:
+            if force_distributed_assignment:
+                return {
+                    **readiness,
+                    "ready": False,
+                    "reason_code": "pipeline_distributed_workers_unavailable",
+                    "reason": "没有在线 PC 从节点可参与强制分布式分层",
+                }
             return readiness
 
         recoverable = {
@@ -11507,23 +11655,55 @@ class Scheduler:
             "worker_layer_loading",
             "worker_layer_load_failed",
         }
-        if readiness.get("reason_code") not in recoverable:
+        if (
+            not force_distributed_assignment
+            and readiness.get("reason_code") not in recoverable
+        ):
             return readiness
 
         # An existing loading generation should finish without being superseded.
         # Other recoverable states need a fresh authoritative generation.
-        if readiness.get("reason_code") != "worker_layer_loading":
+        if (
+            force_distributed_assignment
+            or readiness.get("reason_code") != "worker_layer_loading"
+        ):
             logger.info(
                 "分布式请求触发主节点权威模型同步: workers=%s reason=%s",
                 worker_ids,
                 readiness.get("reason", ""),
             )
-            self.request_authoritative_layer_sync()
+            if force_distributed_assignment:
+                self.request_authoritative_layer_sync(require_distributed=True)
+            else:
+                self.request_authoritative_layer_sync()
 
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
             readiness = self._get_pipeline_readiness()
-            if readiness.get("ready"):
+            if force_distributed_assignment:
+                with self._layer_config_lock:
+                    transaction = self._pipeline_load_transaction or {}
+                    phase = str(transaction.get("phase", "") or "")
+                    plan = transaction.get("plan") or {}
+                if phase in {"rejected", "aborted"}:
+                    return {
+                        **readiness,
+                        "ready": False,
+                        "reason_code": (
+                            transaction.get("reason_code")
+                            or plan.get("reason_code")
+                            or "pipeline_distributed_capacity_rejected"
+                        ),
+                        "reason": (
+                            transaction.get("reason")
+                            or plan.get("reason")
+                            or "强制分布式容量计划未获准入"
+                        ),
+                    }
+            if readiness.get("ready") and (
+                not force_distributed_assignment
+                or self._has_active_distributed_pipeline_plan()
+            ):
                 logger.info(
                     "主从模型配置同步完成，流水线已就绪: workers=%s",
                     worker_ids,
@@ -11542,8 +11722,18 @@ class Scheduler:
                     opted_out,
                 )
                 return readiness
-            if readiness.get("reason_code") not in recoverable:
+            if (
+                not force_distributed_assignment
+                and readiness.get("reason_code") not in recoverable
+            ):
                 return readiness
+            if readiness.get("ready") and force_distributed_assignment:
+                readiness = {
+                    **readiness,
+                    "ready": False,
+                    "reason_code": "pipeline_single_node_plan_active",
+                    "reason": "当前计划仍是单节点，等待多节点容量计划生效",
+                }
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.warning(
@@ -11729,6 +11919,7 @@ class Scheduler:
                         client_id=self.get_effective_node_id(),
                         role="client",
                         node_type="pipeline_peer",
+                        **self._transport_runtime_kwargs(target_node_id),
                     )
                     if not client.connect():
                         logger.error(
@@ -12849,7 +13040,31 @@ class Scheduler:
         lock_held = True
         try:
             # 检查节点是否就绪
-            if not self._all_pipeline_nodes_ready():
+            require_distributed = bool(kwargs.pop("_require_distributed", False))
+            force_distributed = bool(
+                kwargs.pop("_force_distributed_assignment", require_distributed)
+            )
+            sync_timeout = kwargs.pop(
+                "_pipeline_model_sync_timeout", PIPELINE_MODEL_SYNC_TIMEOUT,
+            )
+            pipeline_ready = self._all_pipeline_nodes_ready()
+            if force_distributed and not self._has_active_distributed_pipeline_plan():
+                pipeline_ready = False
+            if not pipeline_ready and force_distributed:
+                readiness = self._synchronize_pipeline_workers_for_request(
+                    timeout=sync_timeout,
+                    force_distributed_assignment=True,
+                )
+                pipeline_ready = bool(readiness.get("ready"))
+            if not pipeline_ready:
+                if require_distributed:
+                    return {
+                        "response": "",
+                        "error": (
+                            "distributed_required: queued pipeline workers not ready"
+                        ),
+                        "metrics": {"distributed_used": False, "fallback": False},
+                    }
                 logger.warning("流水线节点不可用，队列任务回退到全模型推理")
                 # ★ H1 修复: 保持 lock_held=True，回退推理在锁保护下执行（防止 GPU 并发）
                 return self._run_full_model_inference(
@@ -12919,6 +13134,10 @@ class Scheduler:
         # 已显式准备的 distributed-only 模型尚未物化任何权重，也允许进入；
         # 主节点首段会在 worker 就绪后由 run_pipeline 按分配范围首次加载。
         queue_timeout = kwargs.pop('_queue_timeout', PIPELINE_TIMEOUT)
+        require_distributed = bool(kwargs.pop("_require_distributed", False))
+        force_distributed_assignment = bool(
+            kwargs.pop("_force_distributed_assignment", require_distributed)
+        )
         model_sync_timeout = kwargs.pop(
             '_pipeline_model_sync_timeout', PIPELINE_MODEL_SYNC_TIMEOUT,
         )
@@ -12929,6 +13148,12 @@ class Scheduler:
         )
         if not mgr or (not mgr.is_loaded and not pipeline_prepared):
             logger.warning("模型未加载，无法执行流水线推理")
+            if require_distributed:
+                return {
+                    "response": "",
+                    "error": "distributed_required: pipeline model is not prepared",
+                    "metrics": {"distributed_used": False, "fallback": False},
+                }
             return self._run_full_model_inference(
                 prompt,
                 _fallback_reason="model_not_loaded_for_pipeline",
@@ -12940,6 +13165,15 @@ class Scheduler:
                 f"引擎类型为 {engine_type}，不支持流水线层拆分，"
                 f"使用全模型推理"
             )
+            if require_distributed:
+                return {
+                    "response": "",
+                    "error": (
+                        "distributed_required: pipeline execution requires "
+                        f"pytorch, got {engine_type}"
+                    ),
+                    "metrics": {"distributed_used": False, "fallback": False},
+                }
             return self._run_full_model_inference(
                 prompt,
                 _fallback_reason=f"engine {engine_type} does not support layer-split pipeline",
@@ -12949,11 +13183,21 @@ class Scheduler:
         # ---- 自动回退：节点不可用 → 全模型推理 ----
         readiness = None
         try:
-            pipeline_ready = self._all_pipeline_nodes_ready()
+            pipeline_ready = (
+                False
+                if force_distributed_assignment
+                else self._all_pipeline_nodes_ready()
+            )
             if not pipeline_ready:
-                readiness = self._synchronize_pipeline_workers_for_request(
-                    timeout=model_sync_timeout,
-                )
+                if force_distributed_assignment:
+                    readiness = self._synchronize_pipeline_workers_for_request(
+                        timeout=model_sync_timeout,
+                        force_distributed_assignment=True,
+                    )
+                else:
+                    readiness = self._synchronize_pipeline_workers_for_request(
+                        timeout=model_sync_timeout,
+                    )
                 pipeline_ready = bool(readiness.get("ready"))
         except Exception:
             logger.warning(
@@ -12972,6 +13216,19 @@ class Scheduler:
                 "部分流水线节点未就绪，回退到全层主节点模式: %s",
                 readiness_reason,
             )
+            if require_distributed:
+                return {
+                    "response": "",
+                    "error": (
+                        "distributed_required: pipeline workers not ready: "
+                        f"{readiness_reason}"
+                    ),
+                    "metrics": {
+                        "distributed_used": False,
+                        "fallback": False,
+                        "pipeline_readiness": readiness or {},
+                    },
+                }
             # 回退仍会执行完整模型推理，必须与其他 GPU 推理共享同一把锁。
             # 这里阻塞等待，避免锁被占用时直接绕过互斥保护。
             self._inference_lock.acquire()
@@ -12993,7 +13250,19 @@ class Scheduler:
         with self.pipeline_queue._lock:
             if self.pipeline_queue.is_busy or self.pipeline_queue.queue_size > 0:
                 # 有任务执行中 或 队列非空 → 入队（保证 FIFO 顺序）
-                task_id = self.pipeline_queue.enqueue(prompt=prompt, **kwargs)
+                queued_kwargs = dict(kwargs)
+                # Preserve request-scoped routing semantics across the queue.
+                # These flags are consumed by _process_queued_pipeline_task
+                # before it calls run_pipeline, so they never reach the model
+                # engine as unexpected keyword arguments.
+                queued_kwargs.update({
+                    "_require_distributed": require_distributed,
+                    "_force_distributed_assignment": force_distributed_assignment,
+                    "_pipeline_model_sync_timeout": model_sync_timeout,
+                })
+                task_id = self.pipeline_queue.enqueue(
+                    prompt=prompt, **queued_kwargs,
+                )
             else:
                 # 空闲且队列空 → 标记为"即将执行"（阻止其他线程绕过队列）
                 task_id = None
@@ -13014,6 +13283,8 @@ class Scheduler:
                 payload = result.get("result", {})
                 if isinstance(payload, dict) and payload.get("error"):
                     if self._stream_output_started(kwargs):
+                        return payload
+                    if require_distributed:
                         return payload
                     self._inference_lock.acquire()
                     try:
@@ -13047,6 +13318,8 @@ class Scheduler:
                 if result.get("error"):
                     if self._stream_output_started(kwargs):
                         return result
+                    if require_distributed:
+                        return result
                     logger.warning(
                         "流水线推理返回错误，回退到全层主节点模式: %s",
                         result.get("error"),
@@ -13060,6 +13333,12 @@ class Scheduler:
             except Exception as e:
                 if self._stream_output_started(kwargs):
                     return {"response": "", "error": str(e)}
+                if require_distributed:
+                    return {
+                        "response": "",
+                        "error": f"distributed_required: {e}",
+                        "metrics": {"distributed_used": False, "fallback": False},
+                    }
                 logger.error(f"流水线推理失败: {e}，回退到全层主节点模式", exc_info=True)
                 return self._run_full_model_inference(
                     prompt,

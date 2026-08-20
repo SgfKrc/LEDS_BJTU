@@ -1,6 +1,6 @@
 # 集群接入稳定性与本地 RAG 实施计划
 
-> 状态：部分实施（NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`CLUSTER-JOIN-S0`、`SYNC-SSH-S0/S1/S2`、`RAG-S0/S1/S2/S3/S4/S5A/S5B/S5C` 代码与本地质量门已完成；T-RACE-6、NW3.1、容量/模型摘要变化和 ANN 仍待后续验收，2026-08-20）
+> 状态：部分实施（NW3.1 本机开发门、NW4.1 本地契约门、T-RACE-0 至 T-RACE-5、`CLUSTER-JOIN-S0`/`CLUSTER-JOIN`、`SYNC-SSH-S0/S1/S2`、`RAG-S0/S1/S2/S3/S4/S5A/S5B/S5C/S5D` 代码与本地质量门已完成；T-RACE-6、真实 WSS/443、真实容量/模型 provider 长时 soak 和 ANN 基准仍待后续验收，2026-08-20）
 >
 > 更新日期：2026-08-19
 >
@@ -38,7 +38,7 @@
 - SMTP 密码、管理员邮箱密码、Tailscale auth key；
 - 模型路径、权重正文、用户 prompt 或聊天正文。
 
-兑换成功后立即消费 nonce。主节点只保存哈希化邀请摘要、票据状态和审计事件；目标节点保存自己的私钥，主节点不能代替目标节点生成私钥。
+兑换成功后立即消费 nonce。主节点只保存自己的 issuer key、授权状态/nonce 和必要的请求摘要；目标节点的私钥只保存在目标节点本地 pending store，主节点不能代替目标节点生成或导出该私钥。当前 issuer/pending key 仍是用户自持 SQLite 中的开发门存储，OS 密钥环/加密封装列为生产加固票。
 
 ### 2.4 `CLUSTER-JOIN-S0` 本机实现（2026-08-19）
 
@@ -51,6 +51,15 @@
 - `tests/test_cluster_join.py` 覆盖 IPv6、Auth App 未批准、签名/目标/TTL/角色篡改、QR 畸形输入、重启/并发 nonce 重放和敏感字段不泄露，`.venv-test` `6 passed`。
 
 本票不接入 Web/TUI 页面、TCP 注册自动切换、Tailscale CLI、SMTP/IMAP 或真实双机；控制面负责 Auth App/TOTP 校验。`SYNC-SSH-S0/S1/S2` 随后已完成，`RAG-S4`、`RAG-S5A`、`RAG-S5B` 和 `RAG-S5C` 代码/质量门均已完成；多源固定基准已达到质量线，当前转入容量、长时任务和 ANN 决策的后置验收。
+
+### 2.5 `CLUSTER-JOIN` Web/TUI 控制面接线（2026-08-20）
+
+本机开发门已完成，真实认证与跨机验收继续后置：
+
+- `src/cluster_join.py` 新增 `qlhjoinreq1` 请求码、请求解码/摘要校验、issuer key 与 pending request 的 SQLite 存储；主节点密钥、目标私钥和 nonce ledger 不离开用户自持 `qlh-control.sqlite3`。
+- `POST /api/cluster/join/request` 在目标节点生成 keypair 和请求码；`POST /api/cluster/join/grant` 仅主节点接受明确 `auth_verified=true` 的控制面结果并签发短期 client-only grant；`POST /api/cluster/join/consume` 在验证签名、目标绑定、TTL 和 endpoint 后切换/连接 client，再原子消费 nonce。
+- Web 管理页显示请求/授权字符串并用相同 payload 生成二维码；TUI 节点管理增加入群向导，命令行增加 `/join request|grant|consume`；Windows/Linux 启动器单命令列表同步。
+- 当前 `auth_verified` 是明确的实际 Auth App/TOTP 接缝，不是后端自行验证；布尔联调开关 `QLH_CLUSTER_JOIN_BOOLEAN_APPROVAL` 默认关闭，未配置真实认证时 API 返回 `auth_control_plane_unavailable`。未接 SMTP/IMAP 自动回码、Tailscale CLI、OS 密钥环或真实双机长时。专项 API/契约 `11 passed`、TUI `74 passed`，前端生产构建通过。
 
 ### 2.3 角色与失败语义
 
@@ -213,6 +222,7 @@ Ollama 提供本地 `/api/embed` 适配器，当前开发机部署基线为 `nom
 | `RAG-S5A` | Completed（可恢复任务与容量门） | `rag_jobs` 脱敏 chunk 快照、模型摘要/游标、分批事务提交、取消/恢复幂等、进程内互斥；API capacity/job 控制面 | `.venv-test` RAG 定向 `25 passed`；跨进程 lease 与真实 provider 长时验收后置 |
 | `RAG-S5B` | Completed（代码门与真实质量门） | `src/rag_quality.py` + `scripts/rag_quality_gate.py` 固定 30 条标注查询、top-k/引用率、查询脱敏；`rag_jobs` 跨进程 lease、可重试 provider 故障恢复与旧库迁移 | S5C 修复后同一五源真实 smoke：`hit@5=0.966667`、`citation_rate=1.0`、`MRR=0.609444`；引用完整，达到质量基线 |
 | `RAG-S5C` | Completed（本地质量门） | 重叠/边界感知 chunk、NFKC 查询规范化、中文二元词 FTS 回退、稳定 lexical/vector 混排与受限旧库索引回填 | 同一模型摘要/数据集 `hit@5>=0.8` 已满足；容量、模型摘要变化、长时任务及 ANN/`sqlite-vec` 仍后置验收 |
+| `RAG-S5D` | Completed（本机开发门，2026-08-20） | 新增容量摘要中的当前/陈旧 embedding 计数；`provider + model_id` tag 绑定冻结 `model_sha256`，tag 摘要变化会清理旧向量并 fail 已排队/暂停/运行任务；embedding job 继续使用 SQLite 跨进程 lease、有限重试和提交前 lease/身份围栏；新增脱敏 `/api/rag/ann-decision` 与 `src/rag_ann.py`，默认保留 FTS/有界 cosine，未安装 `sqlite-vec` 明确 `NO_GO` | `.venv-test` RAG `30 passed`；不宣称生产 ANN 性能。真实用户数据规模、provider 长时 soak、sqlite-vec 基准仍为后置环境门 |
 
 ## 6. 竞态与时序测试计划
 
@@ -244,9 +254,9 @@ Ollama 提供本地 `/api/embed` 适配器，当前开发机部署基线为 `nom
 ## 7. 执行顺序
 
 1. `NW4.1` Transport v2 契约与故障矩阵（本地契约门已完成）→ `NW4.1-F1` fake transport（已完成）→ `T-RACE-0` 状态盘点（已完成）→ `T-RACE-2` TCP 生命周期矩阵（已完成）→ `T-RACE-3` 层配置与任务 lease 状态矩阵（已完成）→ `T-RACE-4` SQLite/补丁应用恢复矩阵（已完成）→ `T-RACE-5` 随机化压力/soak（已完成）→ `CLUSTER-JOIN-S0` 手动入群授权契约。
-2. 手动入群授权契约与角色状态机（`CLUSTER-JOIN-S0` 本地契约已完成）→ `SYNC-SSH-S0/S1/S2`（已完成真实双机门）。
-3. `RAG-S0` → `RAG-S1` → `RAG-S2` → `RAG-S3` → `RAG-S4` → `RAG-S5A` → `RAG-S5B` → `RAG-S5C`（代码门与固定多源质量门均已完成）→ 容量/模型摘要变化/长时任务验收与 ANN 决策，本地主节点 SQLite 不等待外部 GPU 或公网证书。
-4. `NW3.1` 本地自签名 WSS loopback，仅用于协议测试，不宣称生产信任。
+2. 手动入群授权契约与角色状态机（`CLUSTER-JOIN-S0`、`CLUSTER-JOIN` Web/TUI 本机门已完成）→ `SYNC-SSH-S0/S1/S2`（已完成真实双机门）。
+3. `RAG-S0` → `RAG-S1` → `RAG-S2` → `RAG-S3` → `RAG-S4` → `RAG-S5A` → `RAG-S5B` → `RAG-S5C` → `RAG-S5D`（本机代码门已完成）→ 真实容量/长时 provider/ANN benchmark 环境门；本地主节点 SQLite 不等待外部 GPU 或公网证书。
+4. `NW3.1` 本地自签名 WSS loopback 本机开发门已完成，仅用于协议测试，不宣称生产信任；真实 WSS/443 与双机流量后置。
 5. 外部 SMTP、公开域名证书、双 CUDA、IPv4 打洞和真实双机作为后置环境门。
 
 ## 8. 调研依据

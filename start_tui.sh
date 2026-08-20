@@ -38,7 +38,7 @@ echo
 #      选项在前（bjtu --port 9000 status）会回退为交互模式。
 FIRST_ARG="$1"
 case "$FIRST_ARG" in
-    /*|help|h|quit|q|exit|shutdown|halt|status|st|screen|goto|refresh|r|model|models|switch|load|quant|engine|presets|gpu|device|nodes|connect|dist|queue|logs|log|host|interval|timeout|token|chat|cancel)
+    /*|help|h|quit|q|exit|shutdown|halt|status|st|screen|goto|refresh|r|model|models|switch|load|quant|engine|presets|gpu|device|nodes|connect|join|dist|queue|logs|log|host|interval|timeout|token|chat|cancel)
         exec "$PY" src/tui_admin.py "$@"
         ;;
 esac

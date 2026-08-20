@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import QRCode from 'qrcode';
 import {
   Activity,
   Bell,
@@ -25,6 +26,7 @@ import {
   removeSpareMaster, fetchSpareMasterLogs,
   fetchQueue, setQueueStrategy, pauseQueue,
   resumeQueue, clearQueue, cancelQueueTask,
+  createClusterJoinRequest, issueClusterJoinGrant, consumeClusterJoinGrant,
 } from '../api/client';
 
 const ROLE_LABELS = { master: '主节点', client: '从节点' };
@@ -343,6 +345,14 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
   const [masterHost, setMasterHost] = useState('');
   const [masterPort, setMasterPort] = useState('8888');
   const [connecting, setConnecting] = useState(false);
+
+  // client-only 入群授权（请求码/授权码均可复制或扫码）
+  const [joinRequestCode, setJoinRequestCode] = useState('');
+  const [joinGrantInput, setJoinGrantInput] = useState('');
+  const [issuedJoinGrant, setIssuedJoinGrant] = useState('');
+  const [joinQrDataUrl, setJoinQrDataUrl] = useState('');
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinAuthVerified, setJoinAuthVerified] = useState(false);
 
   // 主节点自动发现
   const [discovery, setDiscovery] = useState(null);  // { found, master_host, master_port, stale, source }
@@ -1036,6 +1046,94 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
     }
   };
 
+  useEffect(() => {
+    const value = isMaster ? issuedJoinGrant : joinRequestCode;
+    if (!value) {
+      setJoinQrDataUrl('');
+      return undefined;
+    }
+    let cancelled = false;
+    QRCode.toDataURL(value, { width: 220, margin: 1, errorCorrectionLevel: 'M' })
+      .then((url) => { if (!cancelled) setJoinQrDataUrl(url); })
+      .catch(() => { if (!cancelled) setJoinQrDataUrl(''); });
+    return () => { cancelled = true; };
+  }, [isMaster, issuedJoinGrant, joinRequestCode]);
+
+  const copyJoinCode = async (value, label) => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      onToast?.({ type: 'success', msg: `${label}已复制` });
+    } catch (_) {
+      onToast?.({ type: 'warning', msg: '剪贴板不可用，请手动选择复制' });
+    }
+  };
+
+  const handleCreateJoinRequest = async () => {
+    if (!masterHost.trim()) {
+      onToast?.({ type: 'error', msg: '请先填写主节点地址' });
+      return;
+    }
+    const host = masterHost.trim();
+    const port = parseInt(masterPort, 10) || 8888;
+    const endpoint = host.startsWith('[')
+      ? (host.includes(']:') ? host : `${host}:${port}`)
+      : (host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`);
+    setJoinBusy(true);
+    try {
+      const result = await createClusterJoinRequest({
+        masterEndpoint: endpoint,
+        targetNodeId: myRole?.node_id && myRole.node_id !== 'master' ? myRole.node_id : null,
+      });
+      setJoinRequestCode(result.request_code || result.qr_payload || '');
+      onToast?.({ type: 'success', msg: '入群请求码已生成，请交给目标集群管理员审批' });
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `生成入群请求失败: ${err.message}` });
+    } finally {
+      setJoinBusy(false);
+    }
+  };
+
+  const handleConsumeJoinGrant = async () => {
+    if (!joinGrantInput.trim()) {
+      onToast?.({ type: 'error', msg: '请粘贴主节点签发的授权码' });
+      return;
+    }
+    setJoinBusy(true);
+    try {
+      const result = await consumeClusterJoinGrant(joinGrantInput.trim());
+      onToast?.({ type: 'success', msg: result.message || '已验证授权并加入集群' });
+      const updatedRole = await fetchMyRole().catch(() => null);
+      if (updatedRole) onRoleChange?.(updatedRole);
+      refresh();
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `消费入群授权失败: ${err.message}` });
+    } finally {
+      setJoinBusy(false);
+    }
+  };
+
+  const handleIssueJoinGrant = async () => {
+    if (!joinRequestCode.trim()) {
+      onToast?.({ type: 'error', msg: '请粘贴目标节点的入群请求码' });
+      return;
+    }
+    if (!joinAuthVerified) {
+      onToast?.({ type: 'error', msg: '请先完成 Auth App 审批并勾选确认' });
+      return;
+    }
+    setJoinBusy(true);
+    try {
+      const result = await issueClusterJoinGrant(joinRequestCode.trim(), true);
+      setIssuedJoinGrant(result.grant_code || result.qr_payload || '');
+      onToast?.({ type: 'success', msg: '一次性入群授权已签发，请交给目标节点消费' });
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `签发入群授权失败: ${err.message}` });
+    } finally {
+      setJoinBusy(false);
+    }
+  };
+
   if (loading && !status) {
     return (
       <div className="admin-panel">
@@ -1191,6 +1289,38 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                   {discovering ? '⏳ 查询中...' : '🔍 自动发现'}
                 </button>
               </div>
+              <div className="join-auth-panel">
+                <div className="join-auth-heading">授权接入（client-only）</div>
+                <p className="connect-desc">
+                  生成请求码交给目标集群管理员；管理员完成 Auth App 审批后回传一次性授权码。
+                  授权消费会把本节点强制降级为从节点，授权码不会包含集群密钥。
+                </p>
+                <div className="join-auth-actions">
+                  <button type="button" className="btn-ghost" onClick={handleCreateJoinRequest} disabled={joinBusy || !masterHost.trim()}>
+                    {joinBusy ? '⏳ 处理中...' : '🔑 生成入群请求码'}
+                  </button>
+                  {joinRequestCode && (
+                    <button type="button" className="btn-ghost" onClick={() => copyJoinCode(joinRequestCode, '请求码')}>复制请求码</button>
+                  )}
+                </div>
+                {joinRequestCode && (
+                  <div className="join-auth-code-row">
+                    <textarea className="join-auth-code" readOnly value={joinRequestCode} aria-label="入群请求码" />
+                    {joinQrDataUrl && <img className="join-auth-qr" src={joinQrDataUrl} alt="入群请求二维码" />}
+                  </div>
+                )}
+                <label className="join-auth-label" htmlFor="cluster-join-grant">主节点授权码</label>
+                <textarea
+                  id="cluster-join-grant"
+                  className="join-auth-code join-auth-grant-input"
+                  placeholder="粘贴 qlhjoin1. 开头的一次性授权码"
+                  value={joinGrantInput}
+                  onChange={(e) => setJoinGrantInput(e.target.value)}
+                />
+                <button type="button" className="btn-primary connect-btn" onClick={handleConsumeJoinGrant} disabled={joinBusy || !joinGrantInput.trim()}>
+                  {joinBusy ? '⏳ 验证中...' : '✅ 使用授权码加入'}
+                </button>
+              </div>
             </div>
           </section>
         )}
@@ -1270,6 +1400,45 @@ export default function AdminPanel({ onToast, myRole, onRoleChange, hasDedicated
                   {registering ? '⏳ 注册中...' : '📝 注册节点'}
                 </button>
               </div>
+            </div>
+          </section>
+        )}
+
+        {isMaster && (
+          <section className="admin-section" data-admin-workspace="nodes">
+            <h3>授权加入集群</h3>
+            <div className="connect-panel join-auth-panel">
+              <p className="connect-desc">
+                粘贴目标节点生成的请求码，确认已通过 Auth App 审批后签发 client-only 授权。
+                当前按钮是认证控制面的明确接缝；真实 TOTP 验证接入前不会自动放行。
+              </p>
+              <label className="join-auth-label" htmlFor="cluster-join-request">目标节点请求码</label>
+              <textarea
+                id="cluster-join-request"
+                className="join-auth-code"
+                placeholder="粘贴 qlhjoinreq1. 开头的请求码"
+                value={joinRequestCode}
+                onChange={(e) => setJoinRequestCode(e.target.value)}
+              />
+              <label className="join-auth-check">
+                <input type="checkbox" checked={joinAuthVerified} onChange={(e) => setJoinAuthVerified(e.target.checked)} />
+                已完成 Auth App 审批（当前仅接受控制面布尔结果）
+              </label>
+              <button type="button" className="btn-primary connect-btn" onClick={handleIssueJoinGrant} disabled={joinBusy || !joinRequestCode.trim() || !joinAuthVerified}>
+                {joinBusy ? '⏳ 签发中...' : '🛡️ 签发一次性授权'}
+              </button>
+              {issuedJoinGrant && (
+                <div className="join-auth-result">
+                  <div className="join-auth-actions">
+                    <span className="join-auth-label">回传给目标节点的授权码</span>
+                    <button type="button" className="btn-ghost" onClick={() => copyJoinCode(issuedJoinGrant, '授权码')}>复制授权码</button>
+                  </div>
+                  <div className="join-auth-code-row">
+                    <textarea className="join-auth-code" readOnly value={issuedJoinGrant} aria-label="入群授权码" />
+                    {joinQrDataUrl && <img className="join-auth-qr" src={joinQrDataUrl} alt="入群授权二维码" />}
+                  </div>
+                </div>
+              )}
             </div>
           </section>
         )}

@@ -13,7 +13,9 @@ from cluster_join import (
     JoinContractError,
     JoinGrantLedger,
     build_join_request,
+    decode_join_request,
     decode_join_grant,
+    encode_join_request,
     encode_join_grant,
     generate_join_keypair,
     issue_join_grant,
@@ -78,6 +80,30 @@ def test_issue_encode_verify_and_consume_client_only_grant(tmp_path):
             now=1_006,
         )
     assert error.value.code == "nonce_replayed"
+
+
+def test_request_code_roundtrip_and_durable_key_store(tmp_path):
+    target = generate_join_keypair()
+    request = build_join_request(
+        master_endpoint="[FD7A:115C:A1E0::1]:8888",
+        cluster_id="cluster-local",
+        target_node_id="client-01",
+        target_public_key=target.public_key,
+        requested_at=1_000,
+    )
+    encoded = encode_join_request(request)
+    assert encoded.startswith("qlhjoinreq1.")
+    assert target.private_key not in encoded
+    assert decode_join_request(encoded) == request
+    ledger = JoinGrantLedger(tmp_path / "join.sqlite3")
+    key_id, issuer = ledger.get_or_create_issuer_keypair()
+    assert key_id == "main"
+    assert ledger.get_or_create_issuer_keypair()[1] == issuer
+    ledger.save_pending_request(request, target)
+    stored = ledger.load_pending_request(request["request_digest"])
+    assert stored is not None
+    assert stored[0] == request
+    assert stored[1] == target
 
 
 def test_nonce_replay_survives_ledger_restart(tmp_path):

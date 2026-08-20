@@ -58,6 +58,26 @@ def test_aggregate_capacity_admits_when_no_single_node_fits():
     assert "master" in plan["control_only_nodes"]
 
 
+def test_required_distributed_rejects_single_node_shortcut():
+    plan = solve_pipeline_capacity(
+        descriptor(),
+        [
+            node("master", 600, role="master", score=100),
+            node("worker-a", 300, score=10),
+        ],
+        safety_margin=1.0,
+        require_distributed=True,
+    )
+
+    assert plan["admitted"] is True
+    assert plan["reason_code"] == "distributed_forced"
+    assert plan["require_distributed"] is True
+    assert plan["participating_node_count"] == 2
+    assert {item["node_id"] for item in plan["assignments"]} == {
+        "master", "worker-a",
+    }
+
+
 def test_capacity_failure_returns_no_partial_assignment():
     plan = solve_pipeline_capacity(
         descriptor(),

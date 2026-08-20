@@ -409,3 +409,71 @@ def test_s5a_job_schema_is_migrated_in_place(tmp_path):
     store.initialize()
     columns = {row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(rag_jobs)").fetchall()}
     assert {"lease_owner", "lease_expires_at", "attempts"} <= columns
+
+
+def test_s5d_model_summary_change_invalidates_old_vectors_and_jobs(tmp_path):
+    store = RagStore(tmp_path / "rag.sqlite3", max_chunk_chars=256)
+    _ingest(
+        store, source_id="model-change", relative_ref="docs/model-change.md", revision="r1",
+        text=("model summary change " * 80),
+    )
+    first = store.create_embedding_job(
+        provider="ollama", model_id="nomic-embed-text:latest", model_sha256="1" * 64, batch_size=1,
+    )
+    class Provider:
+        def embed(self, texts):
+            return type("Result", (), {
+                "provider": "ollama", "model_id": "nomic-embed-text:latest",
+                "dimensions": 2, "vectors": [[1.0, 0.5] for _ in texts],
+            })()
+    store.run_embedding_job(first["job_id"], Provider(), max_batches=1)
+    old = store.get_embedding_job(first["job_id"])
+    assert old["state"] == "paused"
+    second = store.create_embedding_job(
+        provider="ollama", model_id="nomic-embed-text:latest", model_sha256="2" * 64, batch_size=1,
+    )
+    assert store.get_embedding_job(first["job_id"])["state"] == "failed"
+    assert store.get_embedding_job(first["job_id"])["error_code"] == "embedding_model_changed"
+    assert store.health()["embedding_count"] == 0
+    store.run_embedding_job(second["job_id"], Provider())
+    assert store.health()["embedding_count"] > 0
+    import sqlite3
+    rows = sqlite3.connect(store.path).execute(
+        "SELECT DISTINCT model_sha256 FROM rag_embeddings"
+    ).fetchall()
+    assert rows == [("2" * 64,)]
+
+
+def test_s5d_model_change_fences_running_job(tmp_path):
+    store = RagStore(tmp_path / "rag.sqlite3", max_chunk_chars=256)
+    _ingest(store, source_id="running-change", relative_ref="docs/running-change.md", revision="r1")
+    job = store.create_embedding_job(
+        provider="ollama", model_id="nomic-embed-text:latest", model_sha256="3" * 64,
+    )
+    with store._write() as connection:
+        connection.execute(
+            "UPDATE rag_jobs SET state='running', lease_owner='other', lease_expires_at=9999999999 WHERE job_id=?",
+            (job["job_id"],),
+        )
+        store._activate_embedding_identity(
+            connection, provider="ollama", model_id="nomic-embed-text:latest",
+            model_sha256="4" * 64, dimensions=None,
+        )
+    fenced = store.get_embedding_job(job["job_id"])
+    assert fenced["state"] == "failed"
+    assert fenced["error_code"] == "embedding_model_changed"
+    assert fenced["lease_owner"] is None
+
+
+def test_s5d_ann_decision_is_conservative():
+    from src.rag_ann import evaluate_ann_decision
+
+    within = evaluate_ann_decision(corpus_chunks=10, scan_budget=100, extension_available=True)
+    assert within["decision"] == "NO_GO"
+    assert within["reason"] == "bounded_cosine_within_scan_budget"
+    missing = evaluate_ann_decision(corpus_chunks=101, scan_budget=100, extension_available=False)
+    assert missing["decision"] == "NO_GO"
+    assert missing["reason"] == "sqlite_vec_not_installed"
+    candidate = evaluate_ann_decision(corpus_chunks=101, scan_budget=100, extension_available=True)
+    assert candidate["decision"] == "GO"
+    assert candidate["production_approved"] is False
