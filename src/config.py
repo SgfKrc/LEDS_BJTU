@@ -246,7 +246,11 @@ EXTERNAL_LABEL = _env_first("QLH_EXTERNAL_LABEL", default="外部推理服务") 
 # ★ 数据作用域**不另设开关**：本路径把用户内容派生的草稿 token 送出集群，
 #   与路线 B 完全同一风险面，因此共用 QLH_EXTERNAL_DATA_SCOPE 硬门控。
 SPEC_ENABLED = _env_bool("QLH_SPEC_ENABLED", False)          # 投机解码总开关（默认关）
-SPEC_GAMMA = _env_int("QLH_SPEC_GAMMA", 4, min_val=1, max_val=16)   # 每轮草稿 token 数 γ
+SPEC_GAMMA = _env_int("QLH_SPEC_GAMMA", 4, min_val=1, max_val=64)   # 每轮草稿 token 数 γ（static 默认 / adaptive 初值）
+SPEC_GAMMA_MODE = os.environ.get("QLH_SPEC_GAMMA_MODE", "static")  # static|adaptive（SPC-CS 置信度调度）
+SPEC_GAMMA_MIN = _env_int("QLH_SPEC_GAMMA_MIN", 1, min_val=1, max_val=64)
+SPEC_GAMMA_MAX = _env_int("QLH_SPEC_GAMMA_MAX", 16, min_val=1, max_val=64)
+SPEC_CONF_ALPHA = _env_float("QLH_SPEC_CONF_ALPHA", 0.2, min_val=0.0, max_val=1.0)
 SPEC_MAX_ROUNDS = _env_int("QLH_SPEC_MAX_ROUNDS", 64, min_val=1, max_val=4096)  # 单会话最大轮数
 SPEC_MAX_NEW_TOKENS = _env_int(
     "QLH_SPEC_MAX_NEW_TOKENS", 128, min_val=1, max_val=4096,
