@@ -6,7 +6,7 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8.2**（更新日期：2026-08-19）
+**v0.1.8.3**（更新日期：2026-08-21）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
@@ -39,7 +39,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 特性 | 说明 |
 |------|------|
 | 🧠 **智能编排** | PyTorch 层流水线可按算力、内存和网络状态分配连续层段；较大拓扑可使用最大带宽生成树 + DFS → [详见分布式资源调度系统](docs/分布式资源调度系统.md) |
-| 🔗 **PyTorch 层流水线** | 兼容的 Safetensors 模型按连续层段分配，hidden states 逐节点传递，支持 KV Cache 增量解码 |
+| 🔗 **PyTorch 层流水线** | 兼容的 Safetensors 模型按连续层段分配，hidden states 逐节点传递，支持 KV Cache 增量解码；**QW1.8B 双机分层数据面已验收**（2026-08-20，`master 0-21 + client 21-24`，`distributed_used=true`/`fallback=false`，L1-3） |
 | 🔄 **双引擎架构** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/集显)，自动切换 |
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
 | 🗄️ **多会话与本地事实源** | 会话/设置/模型注册等由主节点本地 SQLite 承载（远端 PostgreSQL 已退场，仅一次性迁移审计通道），旧数据一次性导入；断网本地不中断 |
@@ -52,6 +52,10 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
+| ⚙️ **任务链 Full Worker** | `dual_candidate` DAG、可恢复任务状态/ journal / lease-epoch winner fencing、Provider registry；PC Full Worker 与任务图已完成重启与断线恢复、IPv6 TCP 实测（2026-08-21），`task_dispatch` 生产准入门保持关闭 → [任务链专项](docs/任务链下一阶段实施计划.md) |
+| 🗂️ **本地 RAG** | 主节点 SQLite FTS5 + 向量 embedding（Ollama / llama.cpp 双 provider）、质量门与容量/ANN 决策门（RAG-S0…S5D）；默认不接外部模型、不自动下载 → [集群接入与本地 RAG 计划](docs/集群接入稳定性与本地RAG实施计划.md) |
+| 🔑 **手动入群（CLUSTER-JOIN）** | 目标节点生成一次性授权票据，主节点 Auth App 审批后签发 Ed25519 client-only grant（文本码 + 二维码，nonce ledger 原子消费），成功即降级为从节点；Web/TUI 已接线 → [集群接入计划](docs/集群接入稳定性与本地RAG实施计划.md) |
+| 🌐 **抗弱网与 Transport v2** | `cluster_transport` 提供 `legacy_tcp`/`wss_443` 能力选择、有界 ACK 窗口、稳定故障矩阵与 circuit breaker；NW3.1 本地自签名 WSS loopback 门完成；真实 443/证书/流量对照后置 → [抗弱网专项](docs/抗弱网通信协议专项计划.md) |
 
 ### 项目设计理念
 
@@ -187,7 +191,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │       ├── App.jsx                # 主布局 & 设置状态管理
 │       ├── api/client.js          # API 客户端封装
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-14 全量：2196 passed / 6 skipped，.venv-test 固定 4 worker）
+├── tests/                         # 单元测试（2026-08-16 全量基线：2524 passed / 18 skipped，.venv-test 固定 4 worker；最新见项目进展）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
@@ -936,6 +940,8 @@ python serve.py
 ### 专项文档
 
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
+- [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
+- [StudyPact 风格分析与 frontend cyber-gothic 前端计划](docs/StudyPact风格分析与frontend_cybergothic前端计划.md) — 新前端视觉方案/原型（`frontend_cybergothic/` 独立实现，未接生产路由）
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
@@ -958,6 +964,9 @@ python serve.py
 ### 工程文档
 
 - [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
+- [已知问题记录](docs/已知问题记录.md) — 缺陷/审计条目与修复状态（含 Full Worker/重启/IPv6 等实证登记）
+- [开发完成度盘点](docs/开发完成度盘点.md) — 各支线开发门完成度与可开发队列快照
+- [验收清单与资源限制登记](docs/验收清单与资源限制登记.md) — A 硬件限制类（显存/RAM，如 Qwen3-VL-8B 待内存条）/ B 网络限制类（B3 IPv6 实跑已验）验收入口
 - [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5、T9.6 接线、T9.6-R2 Windows 开发机实装门和 UP-N6.4W 跨卷保留门已完成；外部干净机/Linux/真实模型会话、分布式真机与默认入口仍待（L4 Candidate）
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - [TUI 技术 Q&A](docs/TUI技术Q&A.md) — TUI 技术栈与实现机制问答（纯标准库、ANSI 渲染、命令系统、单命令模式等）

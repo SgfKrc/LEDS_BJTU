@@ -6,7 +6,7 @@
 
 Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Multi-terminal collaborative inference · Visual monitoring · External-compute assistance
 
-**v0.1.8.2** (updated 2026-08-19)
+**v0.1.8.3** (updated 2026-08-21)
 
 > 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** (Chinese).
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
@@ -34,7 +34,7 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | Feature | Description |
 |------|------|
 | 🧠 **Intelligent orchestration** | PyTorch layer pipeline assigns contiguous layer segments by compute/memory/network; large topologies use max-bandwidth spanning tree + DFS → [distributed resource scheduling](分布式资源调度系统.md) |
-| 🔗 **PyTorch layer pipeline** | Compatible Safetensors models split by contiguous layers; hidden states passed node-to-node with KV cache incremental decoding |
+| 🔗 **PyTorch layer pipeline** | Compatible Safetensors models split by contiguous layers; hidden states passed node-to-node with KV cache incremental decoding; **QW1.8B dual-machine layered data plane verified** (2026-08-20, `master 0-21 + client 21-24`, `distributed_used=true`/`fallback=false`, L1-3) |
 | 🔄 **Dual engine** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/iGPU), automatic switching |
 | 📋 **MLFQ queue** | Three-level feedback queue: short-interaction priority + aging anti-starvation + FIFO compatibility → [scheduling doc](分布式资源调度系统.md) |
 | 🗄️ **Local facts source** | Sessions/settings/model registry on the master-node SQLite (remote PostgreSQL retired); offline-safe |
@@ -47,6 +47,10 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
 | 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |
+| ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, recoverable task state/journal, lease-epoch winner fencing, provider registry; PC Full Worker & task graph verified for restart & disconnect recovery and IPv6 TCP (2026-08-21); `task_dispatch` production gate stays closed → [task chain plan](任务链下一阶段实施计划.md) |
+| 🗂️ **Local RAG** | Master-node SQLite FTS5 + vector embedding (Ollama / llama.cpp dual providers), quality gate & capacity/ANN decision gate (RAG-S0…S5D); no external model by default, no auto-download → [cluster-join & local RAG plan](集群接入稳定性与本地RAG实施计划.md) |
+| 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → [cluster-join plan](集群接入稳定性与本地RAG实施计划.md) |
+| 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](抗弱网通信协议专项计划.md) |
 
 ### Project Design Philosophy
 
@@ -182,7 +186,7 @@ Project root
 │       ├── App.jsx                # Main layout & settings state
 │       ├── api/client.js          # API client wrapper
 │       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal etc.
-├── tests/                         # Unit tests (2026-08-14 full run: 2196 passed / 6 skipped, .venv-test, 4 workers)
+├── tests/                         # Unit tests (2026-08-16 full-run baseline: 2524 passed / 18 skipped, .venv-test, 4 workers; latest in Progress & Next Steps)
 ├── scripts/                       # Utility scripts
 │   ├── quantize_model.py          # Model preparation & quantization verification
 │   ├── benchmark_all.py           # Full quantization-tier benchmark
