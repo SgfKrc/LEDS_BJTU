@@ -795,6 +795,22 @@ export async function fetchTaskGraphStatus(sessionId = '') {
   return request(`/workflows?${query.toString()}`);
 }
 
+export async function fetchTaskGraphConfig() {
+  return request('/cluster/config/task-graph');
+}
+
+export async function updateTaskGraphConfig({ enabled, workerExperimentalEnabled } = {}) {
+  const body = {};
+  if (typeof enabled === 'boolean') body.enabled = enabled;
+  if (typeof workerExperimentalEnabled === 'boolean') {
+    body.worker_experimental_enabled = workerExperimentalEnabled;
+  }
+  return request('/cluster/config/task-graph', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
 export async function fetchWorkflow(workflowId, options = {}) {
   return request(`/workflows/${encodeURIComponent(workflowId)}`, options);
 }

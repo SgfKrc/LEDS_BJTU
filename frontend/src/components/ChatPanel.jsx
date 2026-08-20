@@ -629,7 +629,9 @@ export default function ChatPanel({ modelLoaded, currentQuant, onToast, metricsT
       return;
     }
 
-    if (!hasImages && settings?.executionMode === 'task_graph' && !taskGraphCapability?.available) {
+    const taskGraphLocallyAvailable = taskGraphCapability?.local_available
+      ?? taskGraphCapability?.available;
+    if (!hasImages && settings?.executionMode === 'task_graph' && !taskGraphLocallyAvailable) {
       onToast?.({
         type: 'error',
         msg: '任务链实验当前不可用，请切换执行模式或检查主节点配置',

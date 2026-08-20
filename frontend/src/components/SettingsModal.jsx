@@ -93,6 +93,7 @@ export default function SettingsModal({
   themeMode = 'system', onThemeModeChange, userAvatar, onUserAvatarChange,
   settings, onSettingsChange, deviceTier, hasDedicatedGpu,
   taskGraphCapability,
+  onTaskGraphConfigChange,
   onDeviceProfileLoaded, onApplyTierPreset,
   myRole,
   // P3: 多模型实验支持
@@ -1312,21 +1313,96 @@ export default function SettingsModal({
               <button
                 type="button"
                 className={settings.executionMode === 'task_graph' ? 'active' : ''}
-                disabled={!taskGraphCapability?.available}
+                disabled={!(taskGraphCapability?.local_available ?? taskGraphCapability?.available)}
                 onClick={() => onSettingsChange({ executionMode: 'task_graph', streamingMode: 'full' })}
-                title={taskGraphCapability?.available
+                title={(taskGraphCapability?.local_available ?? taskGraphCapability?.available)
                   ? '使用双候选校验任务链（单机实验）'
                   : '任务链实验未在当前节点启用'}
               >
                 任务链实验
               </button>
             </div>
-            {!taskGraphCapability?.available && (
-              <div className="setting-disabled-hint" style={{ marginTop: 8 }}>
-                当前节点未启用任务链实验
+            {myRole?.is_master && taskGraphCapability?.controls?.can_toggle && (
+              <div className="setting-toggle-row" style={{ marginTop: 10 }}>
+                <div>
+                  <div className="setting-label">启用任务链实验</div>
+                  <div className="setting-desc">
+                    只开启本地任务链实验入口；不会自动宣称双机 Worker 已通过物理验收。
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className={`setting-toggle-btn${taskGraphCapability?.controls?.task_graph_enabled ? ' on' : ''}`}
+                  onClick={async () => {
+                    const next = !taskGraphCapability?.controls?.task_graph_enabled;
+                    try {
+                      await onTaskGraphConfigChange?.({ enabled: next });
+                      onToast?.({ type: 'success', msg: `任务链实验已${next ? '启用' : '关闭'}` });
+                    } catch (error) {
+                      onToast?.({ type: 'error', msg: error?.message || '任务链实验开关更新失败' });
+                    }
+                  }}
+                  title="切换本地任务链实验入口"
+                >
+                  <span className="setting-toggle-track">
+                    <span
+                      className="setting-toggle-thumb"
+                      style={{
+                        transform: taskGraphCapability?.controls?.task_graph_enabled
+                          ? 'translateX(22px)' : 'translateX(0)',
+                      }}
+                    />
+                  </span>
+                </button>
               </div>
             )}
-            {settings.executionMode === 'task_graph' && taskGraphCapability?.available && (
+            {!taskGraphCapability?.enabled && (
+              <div className="setting-disabled-hint" style={{ marginTop: 8 }}>
+                任务链实验尚未启用，请由主节点打开上方开关
+              </div>
+            )}
+            {taskGraphCapability?.enabled && !taskGraphCapability?.local_available && (
+              <div className="setting-disabled-hint" style={{ marginTop: 8 }}>
+                任务链实验已开启，正在等待本地模型提供者就绪
+              </div>
+            )}
+            {settings.executionMode === 'task_graph' && taskGraphCapability?.enabled
+              && (taskGraphCapability?.local_available ?? taskGraphCapability?.available) && (
+              <>
+              {myRole?.is_master && taskGraphCapability?.controls?.can_toggle && (
+                <div className="setting-toggle-row" style={{ marginTop: 10 }}>
+                  <div>
+                    <div className="setting-label">启用实验 Worker 控制面</div>
+                    <div className="setting-desc">
+                      允许自动 Worker 参与候选 Stage；物理准入和生产分发仍单独受协议状态控制。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`setting-toggle-btn${taskGraphCapability?.controls?.task_worker_experimental_enabled ? ' on' : ''}`}
+                    onClick={async () => {
+                      const next = !taskGraphCapability?.controls?.task_worker_experimental_enabled;
+                      try {
+                        await onTaskGraphConfigChange?.({ workerExperimentalEnabled: next });
+                        onToast?.({ type: 'success', msg: `实验 Worker 控制面已${next ? '启用' : '关闭'}` });
+                      } catch (error) {
+                        onToast?.({ type: 'error', msg: error?.message || '实验 Worker 开关更新失败' });
+                      }
+                    }}
+                    title="切换实验 Worker 控制面"
+                  >
+                    <span className="setting-toggle-track">
+                      <span
+                        className="setting-toggle-thumb"
+                        style={{
+                          transform: taskGraphCapability?.controls?.task_worker_experimental_enabled
+                            ? 'translateX(22px)' : 'translateX(0)',
+                        }}
+                      />
+                    </span>
+                  </button>
+                </div>
+              )}
               <div className="execution-mode-segment" role="group" aria-label="任务链 Provider 策略" style={{ marginTop: 10 }}>
                 <button
                   type="button"
@@ -1348,6 +1424,12 @@ export default function SettingsModal({
                   自动 Worker
                 </button>
               </div>
+              <div className="setting-hint" style={{ marginTop: 8 }}>
+                {taskGraphCapability?.worker_protocol?.worker_readiness_reason === 'task_worker_manual_dispatch_ready'
+                  ? '自动 Worker 控制面已就绪；双机物理验收仍待执行。'
+                  : '自动 Worker 当前仅为实验入口：' + (taskGraphCapability?.worker_protocol?.worker_readiness_reason || '尚未连接')}
+              </div>
+              </>
             )}
           </div>
 
