@@ -39,9 +39,7 @@ export function Topbar({
       <div className="topbar__inner">
         <a className="brand" href={routeHref('overview')} aria-label="QLH 控制台 首页">
           <span className="brand__mark" aria-hidden="true">
-            <svg viewBox="0 0 32 32" width="22" height="22">
-              <path d="M7 24 L16 6 L25 24 Z" fill="none" stroke="currentColor" strokeWidth="2.5" />
-            </svg>
+            <img src="/qlh.jpg" alt="" width="28" height="28" />
           </span>
           <span className="brand__text">
             <span className="brand__name">QLH</span>

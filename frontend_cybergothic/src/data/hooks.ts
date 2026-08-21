@@ -7,7 +7,13 @@
 
 import * as api from './api';
 import {
+  authCapabilityFixture,
+  authSessionFixture,
+  authSessionsFixture,
   capacityFixture,
+  clusterConfigFixture,
+  clusterInviteFixture,
+  clusterStatusFixture,
   diffusionArtifactsFixture,
   diffusionAssetsFixture,
   diffusionCapabilitiesFixture,
@@ -16,18 +22,34 @@ import {
   deviceProfileFixture,
   fixturesEnabled,
   localModelAssetsFixture,
+  localTailscaleStatusFixture,
+  logFilesFixture,
+  logStatsFixture,
   logsFixture,
   modelsFixture,
+  managedUsersFixture,
+  masterHealthFixture,
   nodesFixture,
+  nodesLogAggregateFixture,
+  nodesLogSummaryFixture,
   queueFixture,
   ragFixture,
+  canVoteFixture,
+  reviewTicketsFixture,
   sessionsFixture,
   statusFixture,
+  tailscaleBindingsFixture,
   workflowsFixture,
 } from './fixtures';
 import { useResource, type ResourceResult } from './useResource';
 import type {
+  AuthCapabilityResponse,
+  AuthSessionResponse,
+  AuthSessionsResponse,
   ClusterNodesResponse,
+  ClusterConfigResponse,
+  ClusterInviteResponse,
+  ClusterStatusResponse,
   DiffusionArtifactsResponse,
   DiffusionAssetsResponse,
   DiffusionCapabilitiesResponse,
@@ -35,14 +57,24 @@ import type {
   CurrentModelResponse,
   DeviceProfileResponse,
   LocalModelAssetsResponse,
+  LocalTailscaleStatusResponse,
+  CanVoteResponse,
+  LogFilesResponse,
+  LogStatsResponse,
+  NodeLogAggregateResponse,
+  NodesLogSummaryResponse,
+  ManagedUsersResponse,
   ModelsResponse,
+  MasterHealthResponse,
   MyRoleResponse,
   PipelineCapacityResponse,
   QueueResponse,
   RagHealthResponse,
   RecentLogsResponse,
+  ReviewTicketsResponse,
   SessionsResponse,
   SystemStatusResponse,
+  TailscaleBindingsResponse,
   WorkflowsResponse,
 } from './types';
 
@@ -81,6 +113,38 @@ export function useClusterNodes(pollMs = 15_000): ResourceResult<ClusterNodesRes
     (signal) =>
       useFixtures ? withFixtureDelay(nodesFixture, signal) : api.fetchClusterNodes(signal),
     { pollMs },
+  );
+}
+
+export function useClusterStatus(pollMs = 15_000): ResourceResult<ClusterStatusResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<ClusterStatusResponse>(
+    (signal) => useFixtures ? withFixtureDelay(clusterStatusFixture, signal) : api.fetchClusterStatus(signal),
+    { pollMs },
+  );
+}
+
+export function useClusterConfig(pollMs = 30_000): ResourceResult<ClusterConfigResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<ClusterConfigResponse>(
+    (signal) => useFixtures ? withFixtureDelay(clusterConfigFixture, signal) : api.fetchClusterConfig(signal),
+    { pollMs },
+  );
+}
+
+export function useClusterInvite(pollMs = 30_000, enabled = true): ResourceResult<ClusterInviteResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<ClusterInviteResponse>(
+    (signal) => useFixtures ? withFixtureDelay(clusterInviteFixture, signal) : api.fetchClusterInvite(signal),
+    { pollMs, enabled },
+  );
+}
+
+export function useMasterHealth(pollMs = 15_000, enabled = true): ResourceResult<MasterHealthResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<MasterHealthResponse>(
+    (signal) => useFixtures ? withFixtureDelay(masterHealthFixture, signal) : api.fetchMasterHealth(signal),
+    { pollMs, enabled },
   );
 }
 
@@ -139,6 +203,57 @@ export function useRecentLogs(
   );
 }
 
+export function useLogFiles(pollMs = 30_000): ResourceResult<LogFilesResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<LogFilesResponse>(
+    (signal) => useFixtures ? withFixtureDelay(logFilesFixture, signal) : api.fetchLogFiles(signal),
+    { pollMs },
+  );
+}
+
+export function useLogStats(pollMs = 15_000): ResourceResult<LogStatsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<LogStatsResponse>(
+    (signal) => useFixtures ? withFixtureDelay(logStatsFixture, signal) : api.fetchLogStats(signal),
+    { pollMs },
+  );
+}
+
+export function useNodesLogSummary(enabled = true, pollMs = 30_000): ResourceResult<NodesLogSummaryResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<NodesLogSummaryResponse>(
+    (signal) => useFixtures ? withFixtureDelay(nodesLogSummaryFixture, signal) : api.fetchNodesLogSummary(signal),
+    { enabled, pollMs },
+  );
+}
+
+export function useNodesLogAggregate(
+  enabled = true,
+  pollMs = 20_000,
+): ResourceResult<NodeLogAggregateResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<NodeLogAggregateResponse>(
+    (signal) => useFixtures ? withFixtureDelay(nodesLogAggregateFixture, signal) : api.fetchNodesLogAggregate({ limit: 50 }, signal),
+    { enabled, pollMs },
+  );
+}
+
+export function useReviewTickets(pollMs = 20_000): ResourceResult<ReviewTicketsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<ReviewTicketsResponse>(
+    (signal) => useFixtures ? withFixtureDelay(reviewTicketsFixture, signal) : api.fetchReviewTickets('', signal),
+    { pollMs },
+  );
+}
+
+export function useCanVote(pollMs = 30_000): ResourceResult<CanVoteResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<CanVoteResponse>(
+    (signal) => useFixtures ? withFixtureDelay(canVoteFixture, signal) : api.checkCanVote(signal),
+    { pollMs },
+  );
+}
+
 export function useSessions(limit = 20, pollMs = 30_000): ResourceResult<SessionsResponse> {
   const useFixtures = fixturesEnabled();
   return useResource<SessionsResponse>(
@@ -166,6 +281,54 @@ export function useMyRole(): ResourceResult<MyRoleResponse> {
           )
         : api.fetchMyRole(signal),
     {},
+  );
+}
+
+export function useAuthCapability(pollMs = 60_000): ResourceResult<AuthCapabilityResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<AuthCapabilityResponse>(
+    (signal) => useFixtures ? withFixtureDelay(authCapabilityFixture, signal) : api.fetchAuthCapability(signal),
+    { pollMs },
+  );
+}
+
+export function useAuthSession(enabled = true): ResourceResult<AuthSessionResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<AuthSessionResponse>(
+    (signal) => useFixtures ? withFixtureDelay(authSessionFixture, signal) : api.fetchAuthSession(signal),
+    { enabled },
+  );
+}
+
+export function useAuthSessions(enabled = true, pollMs = 30_000): ResourceResult<AuthSessionsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<AuthSessionsResponse>(
+    (signal) => useFixtures ? withFixtureDelay(authSessionsFixture, signal) : api.fetchAuthSessions('', signal),
+    { enabled, pollMs },
+  );
+}
+
+export function useManagedUsers(enabled = true, pollMs = 30_000): ResourceResult<ManagedUsersResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<ManagedUsersResponse>(
+    (signal) => useFixtures ? withFixtureDelay(managedUsersFixture, signal) : api.fetchManagedUsers(signal),
+    { enabled, pollMs },
+  );
+}
+
+export function useTailscaleBindings(enabled = true, pollMs = 30_000): ResourceResult<TailscaleBindingsResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<TailscaleBindingsResponse>(
+    (signal) => useFixtures ? withFixtureDelay(tailscaleBindingsFixture, signal) : api.fetchTailscaleBindings('', signal),
+    { enabled, pollMs },
+  );
+}
+
+export function useLocalTailscaleStatus(enabled = true): ResourceResult<LocalTailscaleStatusResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<LocalTailscaleStatusResponse>(
+    (signal) => useFixtures ? withFixtureDelay(localTailscaleStatusFixture, signal) : api.fetchLocalTailscaleStatus(signal),
+    { enabled },
   );
 }
 

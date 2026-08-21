@@ -997,6 +997,69 @@
   letter-spacing: 0.08em;
 }
 
+.msg__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--gap-xs);
+  min-height: 24px;
+  margin-top: var(--gap-xs);
+  color: var(--gothic-muted);
+}
+
+.msg__delete,
+.msg__action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 3px 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--gothic-muted);
+  font: inherit;
+  font-size: 10.5px;
+  cursor: pointer;
+  transition:
+    color var(--t-hover) var(--ease-out),
+    border-color var(--t-hover) var(--ease-out),
+    background var(--t-hover) var(--ease-out);
+}
+
+.msg__delete {
+  width: 28px;
+  padding: 3px;
+  opacity: 0.45;
+}
+
+.msg__delete:hover,
+.msg__delete:focus-visible,
+.msg__action:hover,
+.msg__action:focus-visible {
+  border-color: var(--gothic-accent-line);
+  background: var(--gothic-accent-soft);
+  color: var(--gothic-accent);
+  opacity: 1;
+}
+
+.msg__action--danger:hover,
+.msg__action--danger:focus-visible {
+  border-color: color-mix(in srgb, var(--danger) 70%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.msg__delete:disabled,
+.msg__action:disabled {
+  cursor: wait;
+  opacity: 0.35;
+}
+
+.msg__confirm-label {
+  color: var(--gothic-muted);
+  font-size: 10.5px;
+}
+
 .msg__error {
   margin: var(--gap-xs) 0 0;
   color: var(--danger);

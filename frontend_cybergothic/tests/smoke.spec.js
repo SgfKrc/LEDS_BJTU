@@ -13,6 +13,9 @@ const PAGES = [
   { hash: '#/activity', heading: '活动' },
   { hash: '#/image', heading: '生图工坊' },
   { hash: '#/models', heading: 'Model workspace' },
+  { hash: '#/cluster', heading: 'Cluster Admin' },
+  { hash: '#/account', heading: 'Account & Security' },
+  { hash: '#/audit', heading: 'Audit Ledger' },
   { hash: '#/settings', heading: '设置' },
   { hash: '#/help', heading: '帮助' },
 ];
@@ -32,17 +35,14 @@ async function openPage(page, hash = '#/overview') {
 test('概览页渲染 hero、关键数字与后续区块', async ({ page }) => {
   const errors = await openPage(page, '#/overview');
 
-  // Hero 三件套：状态句 + 主行动 + 关键数字（§4.4）
+  // 页面标题、状态句、主行动与四项关键数字。
   await expect(page.getByRole('heading', { level: 1, name: /集群概览/ })).toBeVisible();
-  await expect(page.locator('.hero__status')).not.toBeEmpty();
-  await expect(page.locator('.hero__actions .cbtn').first()).toBeVisible();
+  await expect(page.locator('.pagehead__desc')).not.toBeEmpty();
+  await expect(page.locator('.pagehead__actions .cbtn').first()).toBeVisible();
   await expect(page.locator('.metricstrip .metric')).toHaveCount(4);
 
-  // 首屏底部必须露出下一段的线索
-  await expect(page.locator('.hero__next')).toBeVisible();
-
   // 装饰 Canvas 必须是 aria-hidden，不承载信息（§5.5）
-  const canvas = page.locator('canvas.accent-canvas');
+  const canvas = page.locator('canvas.observatory-nave');
   await expect(canvas).toHaveAttribute('aria-hidden', 'true');
 
   // fixture 模式的提示条要出现，避免误读为真实状态
@@ -68,18 +68,16 @@ test('任务页展示队列层级并可切换工作流筛选', async ({ page }) 
   await openPage(page, '#/tasks');
 
   await expect(page.locator('.qlevel')).toHaveCount(3);
-  await expect(page.locator('.ttable').first()).toBeVisible();
+  await expect(page.locator('.tasks-workspace[data-workspace="queue"] .ttable')).toBeVisible();
 
+  await page.getByRole('button', { name: 'Workflows' }).click();
   // 筛选到「失败」后，fixture 里只剩失败的工作流
   await page.getByRole('button', { name: '失败' }).click();
-  await expect(page.locator('.ttable').last().locator('tbody tr')).toHaveCount(1);
+  await expect(page.locator('.tasks-workspace[data-workspace="workflows"] .ttable tbody tr')).toHaveCount(1);
 
-  // 打开详情抽屉并用 Escape 关闭（§5.5）
-  await page.locator('.ttable__open').last().click();
-  const dialog = page.getByRole('dialog');
-  await expect(dialog).toBeVisible();
-  await page.keyboard.press('Escape');
-  await expect(dialog).toHaveCount(0);
+  // 桌面端固定右侧详情，不再打断当前列表。
+  await page.locator('.tasks-workspace[data-workspace="workflows"] .ttable__open').click();
+  await expect(page.locator('.tasks-detail-panel')).toContainText('执行阶段');
 });
 
 test('活动页日志可按级别筛选，条目可展开详情', async ({ page }) => {
@@ -102,12 +100,13 @@ test('活动页日志可按级别筛选，条目可展开详情', async ({ page 
 
   await page.locator('.chip', { hasText: '全部' }).click();
   await page.locator('.timeline__body--action').first().click();
-  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.locator('.activity-detail-panel')).toContainText('消息');
 });
 
 test('设置页可切换动效偏好并写入 html 标记', async ({ page }) => {
   await openPage(page, '#/settings');
 
+  await page.getByRole('button', { name: /动效偏好/ }).click();
   await page.getByRole('radio', { name: /减少动效/ }).check();
   await expect(page.locator('html')).toHaveAttribute('data-reduced-motion', 'true');
   await expect(page.locator('.toasthost .toast')).toContainText('减少动效');
@@ -178,7 +177,7 @@ test('reduced-motion 下装饰 Canvas 不持续绘制', async ({ browser }) => {
   const context = await browser.newContext({ reducedMotion: 'reduce' });
   const page = await context.newPage();
   await page.goto('/#/overview?fixtures=1');
-  await expect(page.locator('canvas.accent-canvas')).toBeVisible();
+  await expect(page.locator('canvas.observatory-nave')).toBeVisible();
 
   // 统计 rAF 调用次数：静态模式下应当停在个位数
   const frames = await page.evaluate(async () => {

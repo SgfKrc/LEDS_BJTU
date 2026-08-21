@@ -45,6 +45,7 @@ test('client 角色的 Overview 不被主节点队列 403 阻断', async ({ page
   await page.goto('/#/overview');
   await expect(page.getByRole('heading', { level: 1, name: '集群概览' })).toBeVisible();
   await expect(page.locator('.metric').filter({ hasText: '队列深度' })).toContainText('单机模式不适用');
+  await page.getByRole('button', { name: '流水线准入' }).click();
   await expect(page.getByText('单机模式不使用主节点队列')).toBeVisible();
   await expect(page.getByRole('heading', { level: 1, name: '集群概览' })).toBeVisible();
 });
@@ -79,6 +80,7 @@ test('容量接口返回 unavailable 精简响应时 Overview 仍可渲染', asy
 
   await page.goto('/#/overview?fixtures=0');
   await expect(page.getByRole('heading', { level: 1, name: '集群概览' })).toBeVisible();
+  await page.getByRole('button', { name: '流水线准入' }).click();
   await expect(page.locator('.capacity__facts')).toBeVisible();
   await expect(page.locator('.capacity__facts')).toContainText('无');
 });

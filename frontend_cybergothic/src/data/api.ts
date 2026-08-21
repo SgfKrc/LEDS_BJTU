@@ -8,18 +8,38 @@
 import type {
   ChatMetrics,
   ChatUploadResponse,
+  ClusterConfigResponse,
+  ClusterInviteResponse,
+  ClusterMutationResponse,
   ClusterNodesResponse,
+  ClusterStatusResponse,
+  AuthCapabilityResponse,
+  AuthMutationResponse,
+  AuthSessionResponse,
+  AuthSessionsResponse,
   DiffusionArtifactsResponse,
   DiffusionAssetsResponse,
   DiffusionCapabilitiesResponse,
   DiffusionJob,
   AvailableModelsResponse,
+  ApiErrorKind,
   CurrentModelResponse,
   DeviceAutoConfigureResponse,
   DeviceProfileResponse,
   LocalModelAssetsResponse,
+  LocalTailscaleStatusResponse,
+  CanVoteResponse,
+  LogFileContentResponse,
+  LogFilesResponse,
+  LogStatsResponse,
+  NodeLogAggregateResponse,
+  NodesLogSummaryResponse,
+  ReviewMutationResponse,
+  ReviewTicketsResponse,
+  ManagedUsersResponse,
   ModelPreflightResponse,
   ModelsResponse,
+  MasterHealthResponse,
   ConversationResponse,
   MyRoleResponse,
   PipelineCapacityResponse,
@@ -30,6 +50,7 @@ import type {
   RecentLogsResponse,
   SessionsResponse,
   SystemStatusResponse,
+  TailscaleBindingsResponse,
   WorkflowsResponse,
 } from './types';
 
@@ -38,15 +59,72 @@ const BASE = '/api';
 /** 与既有 frontend/src/api/client.js 保持同一个 key，便于两套 UI 共存。 */
 const AUTH_TOKEN_STORAGE_KEY = 'qlh-auth-session-token';
 const LOG_ADMIN_TOKEN_STORAGE_KEY = 'qlh_log_admin_token';
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
+function kindForStatus(status: number): ApiErrorKind {
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not_found';
+  if (status === 408) return 'timeout';
+  if (status === 409) return 'conflict';
+  if (status === 429) return 'rate_limited';
+  if (status >= 500) return 'server';
+  return 'http';
+}
+
+function retryableForKind(kind: ApiErrorKind): boolean {
+  return kind === 'network' || kind === 'timeout' || kind === 'rate_limited' || kind === 'server';
+}
+
+interface RequestSignal {
+  signal: AbortSignal;
+  timedOut: () => boolean;
+  cleanup: () => void;
+}
+
+function createRequestSignal(signal: AbortSignal | undefined, timeoutMs: number): RequestSignal {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = 0;
+
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  if (timeoutMs > 0) {
+    timer = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    timedOut: () => timedOut,
+    cleanup: () => {
+      if (timer) window.clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    },
+  };
+}
 
 export class ApiError extends Error {
   status: number;
   requestId: string | null;
   path: string;
+  kind: ApiErrorKind;
+  retryable: boolean;
 
   constructor(
     message: string,
-    opts: { status?: number; requestId?: string | null; path?: string } = {},
+    opts: {
+      status?: number;
+      requestId?: string | null;
+      path?: string;
+      kind?: ApiErrorKind;
+      retryable?: boolean;
+    } = {},
   ) {
     const requestId = opts.requestId ?? null;
     super(requestId ? `${message} (request_id: ${requestId})` : message);
@@ -54,6 +132,8 @@ export class ApiError extends Error {
     this.status = opts.status ?? 0;
     this.requestId = requestId;
     this.path = opts.path ?? '';
+    this.kind = opts.kind ?? (this.status > 0 ? kindForStatus(this.status) : 'network');
+    this.retryable = opts.retryable ?? retryableForKind(this.kind);
   }
 }
 
@@ -89,23 +169,60 @@ interface RequestOptions {
   headers?: Record<string, string>;
   /** 日志类接口需要额外的管理 token。 */
   withLogToken?: boolean;
+  /** 首部响应超时；流式正文由调用方自己的 AbortController 管理。 */
+  timeoutMs?: number;
+}
+
+async function fetchResponse(
+  url: string,
+  init: RequestInit,
+  opts: { signal?: AbortSignal; timeoutMs?: number; path: string },
+): Promise<Response> {
+  const requestSignal = createRequestSignal(
+    opts.signal,
+    opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+  );
+  try {
+    return await fetch(url, { ...init, signal: requestSignal.signal });
+  } catch (err) {
+    if (opts.signal?.aborted && !requestSignal.timedOut()) throw err;
+    if (requestSignal.timedOut()) {
+      throw new ApiError(`请求超时（${Math.round((opts.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) / 1000)} 秒）`, {
+        status: 0,
+        path: opts.path,
+        kind: 'timeout',
+        retryable: true,
+      });
+    }
+    throw new ApiError('无法连接后端，请检查服务是否启动或网络连接。', {
+      status: 0,
+      path: opts.path,
+      kind: 'network',
+      retryable: true,
+    });
+  } finally {
+    requestSignal.cleanup();
+  }
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { signal, withLogToken, headers, ...rest } = options;
+  const { signal, withLogToken, headers, timeoutMs, ...rest } = options;
   const token = readStorage('session', AUTH_TOKEN_STORAGE_KEY);
   const logToken = withLogToken ? readStorage('local', LOG_ADMIN_TOKEN_STORAGE_KEY) : '';
 
-  const res = await fetch(`${BASE}${path}`, {
-    ...rest,
-    headers: {
-      'Content-Type': 'application/json',
-      ...headers,
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(logToken ? { 'X-QLH-Log-Token': logToken } : {}),
+  const res = await fetchResponse(
+    `${BASE}${path}`,
+    {
+      ...rest,
+      headers: {
+        'Content-Type': 'application/json',
+        ...headers,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(logToken ? { 'X-QLH-Log-Token': logToken } : {}),
+      },
     },
-    ...(signal ? { signal } : {}),
-  });
+    { signal, timeoutMs, path },
+  );
 
   const text = await res.text();
   let data: Record<string, unknown> = {};
@@ -125,6 +242,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       status: res.status,
       requestId,
       path,
+      kind: kindForStatus(res.status),
+      retryable: retryableForKind(kindForStatus(res.status)),
     });
   }
 
@@ -139,8 +258,104 @@ export const fetchSystemStatus = (signal?: AbortSignal) =>
 export const fetchClusterNodes = (signal?: AbortSignal) =>
   request<ClusterNodesResponse>('/cluster/nodes', { signal });
 
+export const fetchClusterStatus = (signal?: AbortSignal) =>
+  request<ClusterStatusResponse>('/cluster/status', { signal });
+
+export const fetchClusterConfig = (signal?: AbortSignal) =>
+  request<ClusterConfigResponse>('/cluster/config', { signal });
+
+export const fetchClusterInvite = (signal?: AbortSignal) =>
+  request<ClusterInviteResponse>('/cluster/invite', { signal });
+
+export const fetchMasterHealth = (signal?: AbortSignal) =>
+  request<MasterHealthResponse>('/cluster/master-health', { signal });
+
+export const updateMaxNodes = (maxNodes: number) =>
+  request<ClusterMutationResponse>('/cluster/config/max-nodes', {
+    method: 'PUT',
+    body: JSON.stringify({ max_nodes: maxNodes }),
+  });
+
+export const registerClusterNode = (payload: {
+  node_id: string;
+  hostname?: string;
+  address?: string;
+  network_type?: string;
+  node_type?: string;
+}) =>
+  request<ClusterMutationResponse>('/cluster/nodes/register', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+export const deregisterClusterNode = (nodeId: string) =>
+  request<ClusterMutationResponse>(`/cluster/nodes/${encodeURIComponent(nodeId)}/deregister`, {
+    method: 'POST',
+  });
+
+export const deleteClusterNode = (nodeId: string) =>
+  request<ClusterMutationResponse>(`/cluster/nodes/${encodeURIComponent(nodeId)}`, {
+    method: 'DELETE',
+  });
+
 export const fetchMyRole = (signal?: AbortSignal) =>
   request<MyRoleResponse>('/cluster/my-role', { signal });
+
+// ---- Authentication, account, and Tailscale ----
+
+export const fetchAuthCapability = (signal?: AbortSignal) =>
+  request<AuthCapabilityResponse>('/auth/capability', { signal });
+
+export const fetchAuthSession = (signal?: AbortSignal) =>
+  request<AuthSessionResponse>('/auth/session', { signal });
+
+export const loginAuth = (username: string, code: string, recoveryCode = '') =>
+  request<AuthSessionResponse & { access_token?: string }>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      username: username.trim(),
+      ...(recoveryCode.trim() ? { recovery_code: recoveryCode.trim() } : { code: code.trim() }),
+    }),
+  }).then((result) => {
+    setAuthToken(result.access_token || '');
+    return result;
+  });
+
+export const logoutAuth = () =>
+  request<AuthMutationResponse>('/auth/logout', { method: 'POST' }).finally(() => setAuthToken(''));
+
+export const fetchAuthSessions = (userId = '', signal?: AbortSignal) =>
+  request<AuthSessionsResponse>(`/auth/sessions${userId ? `?user_id=${encodeURIComponent(userId)}` : ''}`, { signal });
+
+export const revokeAuthSession = (sessionId: string) =>
+  request<AuthMutationResponse>(`/auth/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+
+export const fetchManagedUsers = (signal?: AbortSignal) =>
+  request<ManagedUsersResponse>('/users', { signal });
+
+export const createManagedUser = (payload: { username: string; display_name?: string; role?: string }) =>
+  request<AuthMutationResponse>('/users', { method: 'POST', body: JSON.stringify(payload) });
+
+export const updateManagedUser = (userId: string, payload: { expected_version?: number; display_name?: string; role?: string; status?: string }) =>
+  request<AuthMutationResponse>(`/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify({ expected_version: payload.expected_version, ...payload }) });
+
+export const fetchTailscaleBindings = (userId = '', signal?: AbortSignal) =>
+  request<TailscaleBindingsResponse>(userId ? `/auth/users/${encodeURIComponent(userId)}/tailscale` : '/auth/tailscale/bindings', { signal });
+
+export const fetchLocalTailscaleStatus = (signal?: AbortSignal) =>
+  request<LocalTailscaleStatusResponse>('/auth/tailscale/local-status', { signal });
+
+export const prepareTailscaleBinding = (authorizationMethod: string, userId = '') =>
+  request<AuthMutationResponse>(userId ? `/auth/users/${encodeURIComponent(userId)}/tailscale` : '/auth/tailscale/bindings', {
+    method: 'POST',
+    body: JSON.stringify({ authorization_method: authorizationMethod }),
+  });
+
+export const confirmTailscaleBinding = (bindingId: string, payload: { tailnet_id: string; tailscale_user_id: string; node_id?: string }) =>
+  request<AuthMutationResponse>(`/auth/tailscale/bindings/${encodeURIComponent(bindingId)}/confirm`, { method: 'POST', body: JSON.stringify(payload) });
+
+export const revokeTailscaleBinding = (bindingId: string) =>
+  request<AuthMutationResponse>(`/auth/tailscale/bindings/${encodeURIComponent(bindingId)}/revoke`, { method: 'POST' });
 
 export const fetchQueue = (signal?: AbortSignal) =>
   request<QueueResponse>('/cluster/queue', { signal });
@@ -230,6 +445,66 @@ export const fetchRecentLogs = (
     withLogToken: true,
   });
 };
+
+export const fetchLogFiles = (signal?: AbortSignal) =>
+  request<LogFilesResponse>('/logs', { signal, withLogToken: true });
+
+export const fetchLogContent = (filename: string, signal?: AbortSignal) =>
+  request<LogFileContentResponse>(`/logs/${encodeURIComponent(filename)}`, { signal, withLogToken: true });
+
+export const deleteLogFile = (filename: string) =>
+  request<{ status?: string; name?: string }>(`/logs/${encodeURIComponent(filename)}`, {
+    method: 'DELETE',
+    withLogToken: true,
+  });
+
+export const fetchLogStats = (signal?: AbortSignal) =>
+  request<LogStatsResponse>('/logs/stats', { signal, withLogToken: true });
+
+export const fetchNodesLogSummary = (signal?: AbortSignal) =>
+  request<NodesLogSummaryResponse>('/logs/nodes-summary', { signal, withLogToken: true });
+
+export const fetchNodesLogAggregate = (
+  params: { limit?: number; level?: string; name?: string } = {},
+  signal?: AbortSignal,
+) => {
+  const qs = new URLSearchParams();
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.level) qs.set('level', params.level);
+  if (params.name) qs.set('name', params.name);
+  const query = qs.toString();
+  return request<NodeLogAggregateResponse>(`/cluster/nodes/log-aggregate${query ? `?${query}` : ''}`, {
+    signal,
+    withLogToken: true,
+  });
+};
+
+export const fetchReviewTickets = (status = '', signal?: AbortSignal) =>
+  request<ReviewTicketsResponse>(`/cluster/review/tickets${status ? `?status=${encodeURIComponent(status)}` : ''}`, { signal });
+
+export const checkCanVote = (signal?: AbortSignal) =>
+  request<CanVoteResponse>('/cluster/review/can-vote', { signal });
+
+export const createReviewTicket = (targetNodeId: string, reason: string, timeoutHours = 48) =>
+  request<ReviewMutationResponse>('/cluster/review/create', {
+    method: 'POST',
+    body: JSON.stringify({ target_node_id: targetNodeId, reason, timeout_hours: timeoutHours }),
+  });
+
+export const castReviewVote = (ticketId: string, vote: -1 | 0 | 1, comment = '') =>
+  request<ReviewMutationResponse>('/cluster/review/vote', {
+    method: 'POST',
+    body: JSON.stringify({ ticket_id: ticketId, vote, comment }),
+  });
+
+export const expireReviewCheck = () =>
+  request<ReviewMutationResponse>('/cluster/review/expire-check', { method: 'POST' });
+
+export const deleteReviewTicket = (ticketId: string) =>
+  request<ReviewMutationResponse>(`/cluster/review/tickets/${encodeURIComponent(ticketId)}`, { method: 'DELETE' });
+
+export const deleteResolvedReviewTickets = () =>
+  request<ReviewMutationResponse>('/cluster/review/tickets', { method: 'DELETE' });
 
 export const fetchHealth = (signal?: AbortSignal) =>
   request<{ status: string; timestamp: number }>('/health', { signal });
@@ -385,6 +660,13 @@ export const clearChat = (sessionId = 'default') =>
     { method: 'POST' },
   );
 
+/** 删除会话中的一整轮消息（用户 + 助手）— DELETE /api/sessions/:id/turns/:index。 */
+export const deleteConversationTurn = (sessionId = 'default', turnIndex: number) =>
+  request<{ status?: string; session_id?: string; turn_index?: number; remaining_turns?: number }>(
+    `/sessions/${encodeURIComponent(sessionId)}/turns/${turnIndex}`,
+    { method: 'DELETE' },
+  );
+
 export const cancelGeneration = (generationId: string) =>
   request<{ success?: boolean }>(
     `/chat/generations/${encodeURIComponent(generationId)}/cancel`,
@@ -406,12 +688,16 @@ export async function uploadChatFile(
   const form = new FormData();
   form.append('file', file);
 
-  const res = await fetch(`${BASE}/chat/upload`, {
-    method: 'POST',
-    body: form,
-    ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
-    ...(signal ? { signal } : {}),
-  });
+  const path = '/chat/upload';
+  const res = await fetchResponse(
+    `${BASE}${path}`,
+    {
+      method: 'POST',
+      body: form,
+      ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+    },
+    { signal, timeoutMs: 30_000, path },
+  );
 
   const text = await res.text();
   let data: Record<string, unknown> = {};
@@ -430,7 +716,9 @@ export async function uploadChatFile(
     throw new ApiError(normalizeDetail(data.detail, `HTTP ${res.status}`), {
       status: res.status,
       requestId,
-      path: '/chat/upload',
+      path,
+      kind: kindForStatus(res.status),
+      retryable: retryableForKind(kindForStatus(res.status)),
     });
   }
 
@@ -481,23 +769,28 @@ export async function streamChat(
   } = options;
 
   const token = readStorage('session', AUTH_TOKEN_STORAGE_KEY);
-  const res = await fetch(`${BASE}/chat/stream`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  const path = '/chat/stream';
+  const res = await fetchResponse(
+    `${BASE}${path}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        message,
+        session_id: sessionId,
+        streaming_mode: streamingMode,
+        show_thinking: showThinking,
+        temperature,
+        max_new_tokens: maxNewTokens,
+        ...(generationId ? { generation_id: generationId } : {}),
+      }),
     },
-    body: JSON.stringify({
-      message,
-      session_id: sessionId,
-      streaming_mode: streamingMode,
-      show_thinking: showThinking,
-      temperature,
-      max_new_tokens: maxNewTokens,
-      ...(generationId ? { generation_id: generationId } : {}),
-    }),
-    ...(signal ? { signal } : {}),
-  });
+    // 只限制建立连接的时间，不限制生成正文的时长。
+    { signal, timeoutMs: 10_000, path },
+  );
 
   const requestId = res.headers.get('X-Request-ID');
   if (!res.ok) {
@@ -508,10 +801,16 @@ export async function streamChat(
     } catch {
       /* 响应体不是 JSON，保留 HTTP 状态描述 */
     }
-    throw new ApiError(detail, { status: res.status, requestId, path: '/chat/stream' });
+    throw new ApiError(detail, {
+      status: res.status,
+      requestId,
+      path,
+      kind: kindForStatus(res.status),
+      retryable: retryableForKind(kindForStatus(res.status)),
+    });
   }
   if (!res.body) {
-    throw new ApiError('后端未返回流式响应体', { status: 0, requestId, path: '/chat/stream' });
+    throw new ApiError('后端未返回流式响应体', { status: 0, requestId, path, kind: 'network' });
   }
 
   const reader = res.body.getReader();
@@ -539,13 +838,24 @@ export async function streamChat(
     }
   };
 
-  for (;;) {
-    const { done: streamDone, value } = await reader.read();
-    if (streamDone) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    for (const line of lines) handleLine(line);
+  try {
+    for (;;) {
+      const { done: streamDone, value } = await reader.read();
+      if (streamDone) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) handleLine(line);
+    }
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    throw new ApiError('流式连接中断，请稍后重试。', {
+      status: 0,
+      requestId,
+      path,
+      kind: 'network',
+      retryable: true,
+    });
   }
   if (buffer) handleLine(buffer);
 
@@ -553,7 +863,9 @@ export async function streamChat(
     throw new ApiError('流式响应中断，未收到完成事件', {
       status: 0,
       requestId,
-      path: '/chat/stream',
+      path,
+      kind: 'network',
+      retryable: true,
     });
   }
 
@@ -594,16 +906,54 @@ export function getAuthToken(): string {
   return readStorage('session', AUTH_TOKEN_STORAGE_KEY);
 }
 
+export function setAuthToken(token: string): void {
+  try {
+    if (typeof window === 'undefined') return;
+    if (token) window.sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+    else window.sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+  } catch {
+    // Storage may be unavailable in private or embedded contexts.
+  }
+}
+
 /** 把任意异常转成可展示的中文文案，避免页面直接渲染 Error 对象。 */
 export function describeError(err: unknown): string {
   if (err instanceof ApiError) {
-    if (err.status === 403) return `无权限：${err.message}`;
-    if (err.status === 404) return `接口不存在：${err.path}`;
-    if (err.status === 0) return `无法连接后端：${err.message}`;
-    return err.message;
+    switch (err.kind) {
+      case 'unauthorized':
+        return `登录已失效，请重新登录。${err.message ? `（${err.message}）` : ''}`;
+      case 'forbidden':
+        return `无权限：${err.message}`;
+      case 'not_found':
+        return `接口不存在：${err.path}`;
+      case 'conflict':
+        return `状态冲突：${err.message}`;
+      case 'timeout':
+        return `${err.message || '请求超时'}，请稍后重试。`;
+      case 'rate_limited':
+        return `请求过于频繁，请稍后重试。${err.message ? `（${err.message}）` : ''}`;
+      case 'server':
+        return `后端暂时不可用：${err.message}`;
+      case 'network':
+        return err.message || '无法连接后端，请检查服务是否启动或网络连接。';
+      default:
+        return err.message;
+    }
   }
   if (err instanceof DOMException && err.name === 'AbortError') return '';
-  if (err instanceof TypeError) return '网络请求失败，后端可能未启动。';
+  if (err instanceof TypeError) return '无法连接后端，请检查服务是否启动或网络连接。';
   if (err instanceof Error) return err.message;
   return '未知错误';
+}
+
+export function getErrorKind(err: unknown): ApiErrorKind {
+  if (err instanceof ApiError) return err.kind;
+  if (err instanceof DOMException && err.name === 'AbortError') return 'aborted';
+  if (err instanceof TypeError) return 'network';
+  return 'unknown';
+}
+
+export function isRetryableError(err: unknown): boolean {
+  if (err instanceof ApiError) return err.retryable;
+  return getErrorKind(err) === 'network';
 }

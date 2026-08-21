@@ -282,7 +282,14 @@ export function WorkbenchPage() {
           流水线准入
         </span>
         {capacity.state === 'error' ? (
-          <EmptyState kind="error" title="准入信息不可用" detail={capacity.error} compact />
+          <EmptyState
+            kind="error"
+            title="准入信息不可用"
+            detail={capacity.error}
+            errorKind={capacity.errorKind}
+            errorStatus={capacity.errorStatus}
+            compact
+          />
         ) : cap ? (
           <div className="capsule" data-tone={cap.status === 'ready' ? 'ok' : 'warn'}>
             <div className="capsule__top">
@@ -354,7 +361,14 @@ export function WorkbenchPage() {
             compact
           />
         ) : queue.state === 'error' ? (
-          <EmptyState kind="error" title="队列信息不可用" detail={queue.error} compact />
+          <EmptyState
+            kind="error"
+            title="队列信息不可用"
+            detail={queue.error}
+            errorKind={queue.errorKind}
+            errorStatus={queue.errorStatus}
+            compact
+          />
         ) : queue.data ? (
           <ul className="qbars">
             {(['q0', 'q1', 'q2'] as const).map((lv) => {
@@ -401,6 +415,8 @@ export function WorkbenchPage() {
             kind={logs.error.startsWith('无权限') ? 'denied' : 'error'}
             title={logs.error.startsWith('无权限') ? '日志需要管理令牌' : '日志不可用'}
             detail={logs.error}
+            errorKind={logs.errorKind}
+            errorStatus={logs.errorStatus}
             compact
           />
         ) : recentLogs.length === 0 ? (

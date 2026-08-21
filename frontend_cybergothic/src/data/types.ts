@@ -9,6 +9,20 @@
 
 export type LoadState = 'idle' | 'loading' | 'ready' | 'error';
 
+/** 请求失败的稳定语义，页面不应通过解析中文错误文案来判断状态。 */
+export type ApiErrorKind =
+  | 'aborted'
+  | 'network'
+  | 'timeout'
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not_found'
+  | 'conflict'
+  | 'rate_limited'
+  | 'server'
+  | 'http'
+  | 'unknown';
+
 export type StatusTone = 'ok' | 'warn' | 'danger' | 'info' | 'idle';
 
 export interface ApiErrorShape {
@@ -16,6 +30,8 @@ export interface ApiErrorShape {
   status: number;
   requestId: string | null;
   path: string;
+  kind?: ApiErrorKind;
+  retryable?: boolean;
 }
 
 // ---- /api/cluster/nodes ----
@@ -86,6 +102,156 @@ export interface ClusterStatusResponse {
   pipeline: Record<string, unknown> | null;
   pipeline_queue: Record<string, unknown> | null;
   network_path: Record<string, unknown> | null;
+}
+
+// ---- /api/cluster/config, /api/cluster/invite, /api/cluster/master-health ----
+
+export interface ClusterConfigResponse {
+  max_nodes?: number;
+  network?: {
+    server_ip?: string;
+    server_port?: number;
+    heartbeat_interval_s?: number;
+    [key: string]: unknown;
+  };
+  model?: Record<string, unknown>;
+  layers?: Record<string, unknown>;
+  task_stats?: Record<string, unknown>;
+  node_role?: string;
+  node_id?: string;
+  [key: string]: unknown;
+}
+
+export interface ClusterInviteResponse {
+  master_host?: string;
+  master_port?: number;
+  node_count?: number;
+  max_nodes?: number;
+  has_capacity?: boolean;
+  identity_verified?: boolean;
+  identity_reason?: string;
+  mac_addresses?: string[];
+  [key: string]: unknown;
+}
+
+export interface MasterHealthResponse {
+  master_online: boolean;
+  last_seen_seconds_ago?: number;
+  stale?: boolean;
+  master_host?: string;
+  master_port?: number;
+  source?: string;
+  [key: string]: unknown;
+}
+
+export interface ClusterMutationResponse {
+  status?: string;
+  node_id?: string;
+  max_nodes?: number;
+  reason?: string;
+  message?: string;
+  [key: string]: unknown;
+}
+
+// ---- /api/auth*, /api/users, /api/auth/tailscale ----
+
+export interface AuthCapabilityResponse {
+  required: boolean;
+  mode?: string;
+  bootstrap_available?: boolean;
+  [key: string]: unknown;
+}
+
+export interface AuthUser {
+  user_id: string;
+  username: string;
+  display_name?: string;
+  role: 'owner' | 'admin' | 'member' | string;
+  status?: 'active' | 'suspended' | 'revoked' | string;
+  totp_state?: string;
+  active_session_count?: number;
+  aggregate_version?: number;
+  [key: string]: unknown;
+}
+
+export interface AuthSessionResponse {
+  session_id: string;
+  expires_at?: string;
+  user: AuthUser;
+  [key: string]: unknown;
+}
+
+export interface AuthSessionRecord {
+  session_id: string;
+  user_id?: string;
+  active?: boolean;
+  current?: boolean;
+  created_at?: string;
+  last_seen_at?: string;
+  expires_at?: string;
+  [key: string]: unknown;
+}
+
+export interface AuthSessionsResponse {
+  sessions: AuthSessionRecord[];
+  [key: string]: unknown;
+}
+
+export interface ManagedUsersResponse {
+  users: AuthUser[];
+  [key: string]: unknown;
+}
+
+export interface AuthMutationResponse {
+  status?: string;
+  message?: string;
+  user?: AuthUser;
+  recovery_codes?: string[];
+  provisioning?: {
+    user_id?: string;
+    authenticator_id?: string;
+    secret?: string;
+    qr_payload?: string;
+    otpauth_uri?: string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export interface TailscaleBinding {
+  binding_id: string;
+  user_id?: string;
+  tailnet_id?: string;
+  tailscale_user_id?: string;
+  node_id?: string;
+  state?: 'active' | 'pending' | 'revoked' | 'expired' | string;
+  authorization_method?: string;
+  confirmed_at?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface TailscaleBindingsResponse {
+  bindings: TailscaleBinding[];
+  [key: string]: unknown;
+}
+
+export interface LocalTailscaleStatusResponse {
+  local_status?: {
+    state?: string;
+    available?: boolean;
+    candidate?: {
+      tailnet_id?: string;
+      tailnet_display_name?: string;
+      tailscale_user_id?: string;
+      node_id?: string;
+      hostname?: string;
+      addresses?: string[];
+      [key: string]: unknown;
+    } | null;
+    [key: string]: unknown;
+  } | null;
+  [key: string]: unknown;
 }
 
 // ---- /api/status ----
@@ -282,6 +448,110 @@ export interface RecentLogsResponse {
   buffer_size: number;
   buffer_capacity: number;
   truncated?: boolean;
+}
+
+// ---- /api/logs, /api/logs/stats, /api/logs/nodes-summary ----
+
+export interface LogFileRecord {
+  name: string;
+  size: number;
+  modified: string;
+  [key: string]: unknown;
+}
+
+export interface LogFilesResponse {
+  files: LogFileRecord[];
+  [key: string]: unknown;
+}
+
+export interface LogFileContentResponse {
+  name: string;
+  content: string;
+  truncated?: boolean;
+  [key: string]: unknown;
+}
+
+export interface LogStatsResponse {
+  files_count: number;
+  files_total_bytes: number;
+  buffer_size: number;
+  buffer_capacity: number;
+  buffer_total_seen: number;
+  buffer_dropped_estimate: number;
+  levels: Record<string, number>;
+  loggers: Record<string, number>;
+  nodes: Record<string, number>;
+  node_id?: string;
+  device_ip?: string;
+  [key: string]: unknown;
+}
+
+export interface NodeLogSummary {
+  node_id: string;
+  role?: string;
+  state?: string;
+  files_count?: number;
+  files_total_bytes?: number;
+  buffer_size?: number;
+  buffer_capacity?: number;
+  buffer_total_seen?: number;
+  buffer_dropped_estimate?: number;
+  levels?: Record<string, number>;
+  error?: string;
+  [key: string]: unknown;
+}
+
+export interface NodesLogSummaryResponse {
+  local: NodeLogSummary;
+  workers: NodeLogSummary[];
+  total_workers: number;
+  [key: string]: unknown;
+}
+
+export interface NodeLogAggregateResponse {
+  local: { node_id: string; logs: LogEntry[]; [key: string]: unknown };
+  workers: Array<{ node_id: string; logs: LogEntry[]; count?: number; error?: string; [key: string]: unknown }>;
+  limit: number;
+  filters?: Record<string, unknown>;
+  total_workers: number;
+  [key: string]: unknown;
+}
+
+// ---- /api/cluster/review/* ----
+
+export interface ReviewTicket {
+  ticket_id: string;
+  target_node_id?: string;
+  transfer_reason?: string;
+  status?: string;
+  created_at?: string | number;
+  expires_at?: string | number;
+  resolved_at?: string | number | null;
+  created_by?: string;
+  score?: number;
+  votes?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+export interface ReviewTicketsResponse {
+  tickets: ReviewTicket[];
+  count: number;
+  [key: string]: unknown;
+}
+
+export interface CanVoteResponse {
+  node_id?: string;
+  can_vote: boolean;
+  reason?: string;
+  [key: string]: unknown;
+}
+
+export interface ReviewMutationResponse {
+  status?: string;
+  ticket_id?: string;
+  count?: number;
+  expired?: ReviewTicket[];
+  [key: string]: unknown;
 }
 
 // ---- /api/sessions ----

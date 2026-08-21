@@ -13,7 +13,10 @@ import {
   Image,
   LayoutDashboard,
   ListTree,
+  Network,
+  ShieldCheck,
   SlidersHorizontal,
+  ScrollText,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { ComponentType } from 'react';
@@ -25,8 +28,11 @@ import { SettingsPage } from '../pages/SettingsPage';
 import { HelpPage } from '../pages/HelpPage';
 import { ImageStudioPage } from '../pages/ImageStudioPage';
 import { ModelsPage } from '../pages/ModelsPage';
+import { ClusterAdminPage } from '../pages/ClusterAdminPage';
+import { AccountPage } from '../pages/AccountPage';
+import { AuditPage } from '../pages/AuditPage';
 
-export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'image' | 'models' | 'settings' | 'help';
+export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'image' | 'models' | 'cluster' | 'account' | 'audit' | 'settings' | 'help';
 
 export interface RouteDef {
   id: RouteId;
@@ -94,6 +100,30 @@ export const ROUTES: RouteDef[] = [
     icon: Boxes,
     description: 'Model runtime, local assets, and load controls.',
     component: ModelsPage,
+  },
+  {
+    id: 'cluster',
+    label: 'Cluster',
+    tag: 'CLUSTER CONTROL',
+    icon: Network,
+    description: 'Node topology, health, access, and role-gated cluster operations.',
+    component: ClusterAdminPage,
+  },
+  {
+    id: 'account',
+    label: 'Account',
+    tag: 'IRON GATE',
+    icon: ShieldCheck,
+    description: 'Authentication, sessions, managed users, and Tailscale identity.',
+    component: AccountPage,
+  },
+  {
+    id: 'audit',
+    label: 'Audit',
+    tag: 'AUDIT LEDGER',
+    icon: ScrollText,
+    description: '日志归档、节点汇总与主节点转让审查。',
+    component: AuditPage,
   },
   {
     id: 'settings',

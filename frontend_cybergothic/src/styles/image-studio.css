@@ -12,7 +12,7 @@
   z-index: -1;
   width: 100%;
   height: calc(100% - 60px);
-  opacity: 0.42;
+  opacity: 0.56;
   pointer-events: none;
 }
 
@@ -45,7 +45,7 @@
   min-width: 0;
   padding: var(--gap-md);
   border: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  background: color-mix(in srgb, var(--surface) 62%, transparent);
 }
 
 .studio-panel--rail {

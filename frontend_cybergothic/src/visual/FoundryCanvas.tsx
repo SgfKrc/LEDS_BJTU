@@ -20,8 +20,8 @@ export function FoundryCanvas({ className = '' }: { className?: string }) {
     let visible = true;
     let phase = 0;
     const style = getComputedStyle(canvas);
-    const gold = style.getPropertyValue('--gothic-gold').trim() || '#d9c27a';
-    const accent = style.getPropertyValue('--gothic-accent').trim() || '#d8b4ff';
+    const gold = style.getPropertyValue('--gothic-gold-bright').trim() || '#ecd184';
+    const brass = style.getPropertyValue('--gothic-brass').trim() || '#80672f';
     const line = style.getPropertyValue('--gothic-line-strong').trim() || '#3a3350';
 
     const draw = (t: number) => {
@@ -69,7 +69,7 @@ export function FoundryCanvas({ className = '' }: { className?: string }) {
       ctx.save();
       ctx.translate(width * 0.22, height * 0.78);
       ctx.rotate(-t * 0.08);
-      ctx.strokeStyle = accent;
+      ctx.strokeStyle = brass;
       ctx.globalAlpha = 0.18;
       ctx.lineWidth = 1.2;
       ctx.beginPath();

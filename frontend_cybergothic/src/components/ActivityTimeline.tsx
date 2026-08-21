@@ -2,7 +2,7 @@
  * 活动时间线 — 语义化列表 + aria-live 更新区（§5.5）。
  */
 
-import type { StatusTone } from '../data/types';
+import type { ApiErrorKind, StatusTone } from '../data/types';
 import { EmptyState, SkeletonRows } from './EmptyState';
 import { CommandButton } from './CommandButton';
 import { StatusBadge } from './StatusBadge';
@@ -27,6 +27,8 @@ interface ActivityTimelineProps {
   items: TimelineItem[];
   state: LoadState;
   error?: string;
+  errorKind?: ApiErrorKind | null;
+  errorStatus?: number | null;
   onRetry?: () => void;
   emptyTitle?: string;
   /** 实时追加时用 aria-live 播报最新一条。 */
@@ -39,6 +41,8 @@ export function ActivityTimeline({
   items,
   state,
   error = '',
+  errorKind = null,
+  errorStatus = null,
   onRetry,
   emptyTitle = '暂无活动记录',
   live = false,
@@ -51,6 +55,8 @@ export function ActivityTimeline({
         title="活动记录加载失败"
         description="日志接口可能需要管理令牌，或后端未启动。"
         detail={error}
+        errorKind={errorKind}
+        errorStatus={errorStatus}
         {...(onRetry
           ? { action: <CommandButton variant="ghost" size="sm" onClick={onRetry}>重试</CommandButton> }
           : {})}

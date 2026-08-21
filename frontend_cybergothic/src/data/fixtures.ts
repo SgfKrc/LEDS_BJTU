@@ -7,7 +7,14 @@
  */
 
 import type {
+  AuthCapabilityResponse,
+  AuthSessionResponse,
+  AuthSessionsResponse,
+  AuthUser,
   AvailableModelsResponse,
+  ClusterConfigResponse,
+  ClusterInviteResponse,
+  ClusterStatusResponse,
   ClusterNodesResponse,
   ConversationResponse,
   CurrentModelResponse,
@@ -16,14 +23,24 @@ import type {
   DiffusionAssetsResponse,
   DiffusionCapabilitiesResponse,
   LocalModelAssetsResponse,
+  LocalTailscaleStatusResponse,
+  CanVoteResponse,
+  LogFilesResponse,
+  LogStatsResponse,
+  NodeLogAggregateResponse,
+  NodesLogSummaryResponse,
+  ManagedUsersResponse,
   ModelsResponse,
+  MasterHealthResponse,
   PipelineCapacityResponse,
   QueueResponse,
   RagHealthResponse,
   RagSearchResponse,
   RecentLogsResponse,
+  ReviewTicketsResponse,
   SessionsResponse,
   SystemStatusResponse,
+  TailscaleBindingsResponse,
   WorkflowsResponse,
 } from './types';
 
@@ -66,6 +83,58 @@ export function setFixturesEnabled(on: boolean): void {
 }
 
 const NOW = Date.now() / 1000;
+
+export const authCapabilityFixture: AuthCapabilityResponse = {
+  required: true,
+  mode: 'local_primary_node',
+  bootstrap_available: false,
+};
+
+export const authOwnerFixture: AuthUser = {
+  user_id: 'user_owner_01',
+  username: 'operator',
+  display_name: 'QLH Operator',
+  role: 'owner',
+  status: 'active',
+  totp_state: 'enabled',
+  active_session_count: 2,
+  aggregate_version: 4,
+};
+
+export const authSessionFixture: AuthSessionResponse = {
+  session_id: 'auth_session_current',
+  expires_at: '2026-08-22T12:00:00.000Z',
+  user: authOwnerFixture,
+};
+
+export const authSessionsFixture: AuthSessionsResponse = {
+  sessions: [
+    { session_id: 'auth_session_current', user_id: authOwnerFixture.user_id, active: true, current: true, created_at: '2026-08-20T12:28:05.340855Z', last_seen_at: '2026-08-21T09:28:05.340855Z', expires_at: '2026-08-22T12:00:00.000Z' },
+    { session_id: 'auth_session_tablet', user_id: authOwnerFixture.user_id, active: true, current: false, created_at: '2026-08-19T08:20:00.000Z', last_seen_at: '2026-08-21T08:55:00.000Z', expires_at: '2026-08-22T08:20:00.000Z' },
+  ],
+};
+
+export const managedUsersFixture: ManagedUsersResponse = {
+  users: [
+    authOwnerFixture,
+    { user_id: 'user_member_02', username: 'researcher', display_name: 'Researcher', role: 'member', status: 'active', totp_state: 'enabled', active_session_count: 1, aggregate_version: 2 },
+    { user_id: 'user_member_03', username: 'tablet', display_name: 'Tablet Client', role: 'member', status: 'suspended', totp_state: 'pending', active_session_count: 0, aggregate_version: 1 },
+  ],
+};
+
+export const tailscaleBindingsFixture: TailscaleBindingsResponse = {
+  bindings: [
+    { binding_id: 'binding_qlh_01', user_id: authOwnerFixture.user_id, tailnet_id: 'tailnet-qlh-demo', tailscale_user_id: 'ts-user-operator', node_id: 'master', state: 'active', authorization_method: 'local_status', confirmed_at: '2026-08-20T12:30:00.000Z', updated_at: '2026-08-20T12:30:00.000Z' },
+  ],
+};
+
+export const localTailscaleStatusFixture: LocalTailscaleStatusResponse = {
+  local_status: {
+    state: 'ready',
+    available: true,
+    candidate: { tailnet_id: 'tailnet-qlh-demo', tailnet_display_name: 'QLH Demo Tailnet', tailscale_user_id: 'ts-user-operator', node_id: 'master', hostname: 'qlh-master', addresses: ['100.90.76.108'] },
+  },
+};
 
 export const statusFixture: SystemStatusResponse = {
   model_loaded: false,
@@ -198,6 +267,45 @@ export const nodesFixture: ClusterNodesResponse = {
   count: 3,
   online_count: 2,
   offline_count: 1,
+};
+
+export const clusterStatusFixture: ClusterStatusResponse = {
+  run_mode: 'distributed',
+  nodes_ready: true,
+  nodes: Object.fromEntries(nodesFixture.nodes.map((node) => [node.node_id, node])),
+  current_task: { task_id: 'task_9f31c2', state: 'running' },
+  tcp_server: { host: '100.90.76.108', port: 8888, connected: true },
+  pipeline: { prepared: true, model_id: 'qwen-1_8b' },
+  pipeline_queue: { paused: false, queue_size: 3 },
+  network_path: { type: 'tailscale', healthy: true },
+};
+
+export const clusterConfigFixture: ClusterConfigResponse = {
+  max_nodes: 3,
+  network: { server_ip: '100.90.76.108', server_port: 8888, heartbeat_interval_s: 5 },
+  model: { quant_type: 'int4', page_size: 512, max_seq_len: 8192 },
+  node_role: 'master',
+  node_id: 'master',
+};
+
+export const clusterInviteFixture: ClusterInviteResponse = {
+  master_host: '100.90.76.108',
+  master_port: 8888,
+  node_count: 3,
+  max_nodes: 3,
+  has_capacity: false,
+  identity_verified: true,
+  identity_reason: 'local identity matches cluster record',
+  mac_addresses: ['AA:BB:CC:DD:EE:FF'],
+};
+
+export const masterHealthFixture: MasterHealthResponse = {
+  master_online: true,
+  last_seen_seconds_ago: 0,
+  stale: false,
+  master_host: '100.90.76.108',
+  master_port: 8888,
+  source: 'self',
 };
 
 export const queueFixture: QueueResponse = {
@@ -632,4 +740,111 @@ export const logsFixture: RecentLogsResponse = {
   buffer_size: 2746,
   buffer_capacity: 5000,
   truncated: true,
+};
+
+export const logFilesFixture: LogFilesResponse = {
+  files: [
+    { name: 'qlh-api-20260821.log', size: 184_320, modified: '2026-08-21T09:29:45.000Z' },
+    { name: 'qlh-scheduler-20260820.log', size: 98_304, modified: '2026-08-20T23:58:22.000Z' },
+    { name: 'qlh-worker-tablet-20260820.log', size: 42_018, modified: '2026-08-20T20:06:10.000Z' },
+  ],
+};
+
+export const logStatsFixture: LogStatsResponse = {
+  files_count: 3,
+  files_total_bytes: 324_642,
+  buffer_size: 2746,
+  buffer_capacity: 5000,
+  buffer_total_seen: 2879,
+  buffer_dropped_estimate: 133,
+  levels: { INFO: 2381, WARNING: 241, ERROR: 116, DEBUG: 8 },
+  loggers: { api_server: 1287, scheduler: 934, task_graph: 298, cluster_transport: 227 },
+  nodes: { master: 2288, client_TABLET_2TLUCNU8: 458 },
+  node_id: 'master',
+  device_ip: '100.90.76.108',
+};
+
+export const nodesLogSummaryFixture: NodesLogSummaryResponse = {
+  local: {
+    node_id: 'master',
+    role: 'master',
+    state: 'online',
+    files_count: 3,
+    files_total_bytes: 324_642,
+    buffer_size: 2746,
+    buffer_capacity: 5000,
+    buffer_total_seen: 2879,
+    buffer_dropped_estimate: 133,
+    levels: logStatsFixture.levels,
+  },
+  workers: [
+    {
+      node_id: 'client_TABLET-2TLUCNU8',
+      role: 'client',
+      state: 'online',
+      files_count: 1,
+      files_total_bytes: 42_018,
+      buffer_size: 418,
+      buffer_capacity: 1000,
+      buffer_total_seen: 438,
+      buffer_dropped_estimate: 20,
+      levels: { INFO: 381, WARNING: 29, ERROR: 8 },
+    },
+  ],
+  total_workers: 1,
+};
+
+export const nodesLogAggregateFixture: NodeLogAggregateResponse = {
+  local: { node_id: 'master', logs: logsFixture.logs },
+  workers: [
+    {
+      node_id: 'client_TABLET-2TLUCNU8',
+      count: 2,
+      logs: [
+        { timestamp: '2026-08-20 23:29:37', level: 'INFO', levelno: 20, name: 'worker', message: 'event=heartbeat_sent rtt_ms=19.8', node_id: 'client_TABLET-2TLUCNU8', seq: 82 },
+        { timestamp: '2026-08-20 23:26:14', level: 'WARNING', levelno: 30, name: 'worker', message: 'event=thermal_limit throttle=true', node_id: 'client_TABLET-2TLUCNU8', seq: 77 },
+      ],
+    },
+  ],
+  limit: 50,
+  filters: {},
+  total_workers: 1,
+};
+
+export const canVoteFixture: CanVoteResponse = {
+  node_id: 'master',
+  can_vote: true,
+  reason: 'Current node is an eligible reviewer.',
+};
+
+export const reviewTicketsFixture: ReviewTicketsResponse = {
+  tickets: [
+    {
+      ticket_id: 'review_20260821_01',
+      status: 'pending',
+      created_at: NOW - 2_400,
+      created_by: 'master',
+      target_node_id: 'client_TABLET-2TLUCNU8',
+      transfer_reason: 'Planned maintenance window for the current primary node.',
+      score: 1,
+      expires_at: NOW + 86_400,
+      votes: [{ voter_node_id: 'master', value: 1, timestamp: NOW - 1_800, comment: 'Approved for the maintenance window.' }],
+    },
+    {
+      ticket_id: 'review_20260818_02',
+      status: 'approved',
+      created_at: NOW - 250_000,
+      resolved_at: NOW - 180_000,
+      created_by: 'master',
+      target_node_id: 'client_STUDIO-01',
+      transfer_reason: 'Recovery drill.',
+      score: 2,
+      expires_at: NOW - 190_000,
+      votes: [
+        { voter_node_id: 'master', value: 1, timestamp: NOW - 240_000, comment: 'Approved.' },
+        { voter_node_id: 'client_STUDIO-01', value: 1, timestamp: NOW - 230_000, comment: 'Ready.' },
+      ],
+    },
+  ],
+  count: 2,
 };

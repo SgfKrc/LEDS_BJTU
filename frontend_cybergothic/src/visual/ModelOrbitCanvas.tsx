@@ -20,8 +20,8 @@ export function ModelOrbitCanvas({ className = '' }: { className?: string }) {
     let running = false;
     let visible = true;
     const style = getComputedStyle(canvas);
-    const accent = style.getPropertyValue('--gothic-accent').trim() || '#d8b4ff';
-    const gold = style.getPropertyValue('--gothic-gold').trim() || '#d9c27a';
+    const brass = style.getPropertyValue('--gothic-brass').trim() || '#80672f';
+    const gold = style.getPropertyValue('--gothic-gold-bright').trim() || '#ecd184';
     const line = style.getPropertyValue('--gothic-line-strong').trim() || '#3a3350';
 
     const draw = (time: number) => {
@@ -46,7 +46,7 @@ export function ModelOrbitCanvas({ className = '' }: { className?: string }) {
       ctx.save();
       ctx.translate(cx, cy);
       ctx.rotate(time * 0.07);
-      ctx.strokeStyle = accent;
+      ctx.strokeStyle = brass;
       ctx.lineWidth = 1.2;
       ctx.globalAlpha = 0.23;
       for (let ring = 0; ring < 4; ring += 1) {
@@ -62,7 +62,7 @@ export function ModelOrbitCanvas({ className = '' }: { className?: string }) {
         const y = Math.sin(angle) * radius * 0.43;
         ctx.beginPath();
         ctx.arc(x, y, 2.3 + (node % 2), 0, Math.PI * 2);
-        ctx.fillStyle = node % 3 === 0 ? gold : accent;
+        ctx.fillStyle = node % 3 === 0 ? gold : brass;
         ctx.fill();
       }
       ctx.restore();

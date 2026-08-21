@@ -22,7 +22,14 @@ import { deviceProfileFixture, fixturesEnabled, ragFixture, ragSearchFixture } f
 import { useDeviceProfile, useRagHealth } from '../data/hooks';
 import type { DeviceProfileResponse, RagHealthResponse, RagSearchResult } from '../data/types';
 
-type WorkspaceTab = 'device' | 'rag';
+export type SettingsWorkspaceTab = 'device' | 'rag';
+
+interface SettingsWorkspaceProps {
+  /** Controlled mode lets SettingsPage own the navigation while preserving standalone use. */
+  tab?: SettingsWorkspaceTab;
+  onTabChange?: (tab: SettingsWorkspaceTab) => void;
+  showNavigation?: boolean;
+}
 
 function count(value: unknown): string {
   const parsed = Number(value);
@@ -34,11 +41,11 @@ function scoreWidth(value: unknown, max: number): string {
   return `${Math.max(0, Math.min(100, (parsed / max) * 100))}%`;
 }
 
-export function SettingsWorkspace() {
+export function SettingsWorkspace({ tab, onTabChange, showNavigation = true }: SettingsWorkspaceProps) {
   const device = useDeviceProfile();
   const rag = useRagHealth();
   const usingFixtures = fixturesEnabled();
-  const [tab, setTab] = useState<WorkspaceTab>('device');
+  const [localTab, setLocalTab] = useState<SettingsWorkspaceTab>('device');
   const [deviceBusy, setDeviceBusy] = useState('');
   const [deviceOverride, setDeviceOverride] = useState<DeviceProfileResponse | null>(null);
   const [ragOverride, setRagOverride] = useState<RagHealthResponse | null>(null);
@@ -60,6 +67,11 @@ export function SettingsWorkspace() {
   useRegisterRefresh(refresh);
 
   const activeGpu = gpuList[selectedGpuIndex] ?? gpuList[0];
+  const activeTab = tab ?? localTab;
+  const selectTab = useCallback((next: SettingsWorkspaceTab) => {
+    if (tab === undefined) setLocalTab(next);
+    onTabChange?.(next);
+  }, [onTabChange, tab]);
   const scoreRows = useMemo(() => [
     ['GPU', profile?.score_breakdown?.gpu ?? 0, 50],
     ['RAM', profile?.score_breakdown?.ram ?? 0, 30],
@@ -149,20 +161,20 @@ export function SettingsWorkspace() {
   };
 
   return (
-    <section className="settings-workspace" data-testid="settings-workspace">
-      <aside className="settings-workspace__nav" aria-label="Runtime settings sections">
+    <section className={`settings-workspace${showNavigation ? '' : ' settings-workspace--embedded'}`} data-testid="settings-workspace">
+      {showNavigation ? <aside className="settings-workspace__nav" aria-label="Runtime settings sections">
         <p className="mono-label">RUNTIME WORKSPACE</p>
-        <button type="button" className={tab === 'device' ? 'is-active' : ''} onClick={() => setTab('device')}>
+        <button type="button" className={activeTab === 'device' ? 'is-active' : ''} onClick={() => selectTab('device')}>
           <Cpu size={16} aria-hidden="true" /><span>Device profile</span><StatusBadge label={profile ? 'READY' : 'WAIT'} tone={profile ? 'ok' : 'idle'} size="sm" />
         </button>
-        <button type="button" className={tab === 'rag' ? 'is-active' : ''} onClick={() => setTab('rag')}>
+        <button type="button" className={activeTab === 'rag' ? 'is-active' : ''} onClick={() => selectTab('rag')}>
           <Database size={16} aria-hidden="true" /><span>Local RAG</span><StatusBadge label={health?.status?.toUpperCase() || 'WAIT'} tone={runtimeHealth} size="sm" />
         </button>
         <a href="#settings-preferences"><Sparkles size={16} aria-hidden="true" /><span>Console preferences</span></a>
-      </aside>
+      </aside> : null}
 
       <div className="settings-workspace__main">
-        {tab === 'device' ? (
+        {activeTab === 'device' ? (
           <div className="settings-tool" data-testid="device-workspace">
             <div className="settings-tool__head">
               <SectionHead title="Device profile" hint="Hardware detection and runtime recommendations" actions={<CommandButton variant="ghost" size="sm" icon={RefreshCw} busy={device.refreshing} onClick={refresh}>Refresh</CommandButton>} />
@@ -183,7 +195,7 @@ export function SettingsWorkspace() {
               {gpuList.length > 1 ? <div className="gpu-picker"><span className="control-label">Inference GPU</span><div>{gpuList.map((gpu, index) => <button key={`${gpu.name || 'gpu'}-${index}`} type="button" className={index === selectedGpuIndex ? 'is-active' : ''} disabled={deviceBusy !== ''} onClick={() => void handleSelectGpu(index)}><span>{gpu.name || `GPU ${index}`}</span><small>{gpu.is_integrated ? 'Integrated' : gpu.cuda_available ? 'CUDA' : 'Dedicated'}</small>{index === selectedGpuIndex ? <Check size={14} aria-hidden="true" /> : null}</button>)}</div></div> : null}
               {profile.warnings?.length ? <div className="settings-notice settings-notice--warn"><ShieldAlert size={15} aria-hidden="true" /><span>{profile.warnings[0]}</span></div> : null}
               <div className="settings-tool__actions"><CommandButton icon={Sparkles} busy={deviceBusy === 'auto'} onClick={() => void handleAutoConfigure()}>Apply recommended configuration</CommandButton></div>
-            </> : <EmptyState kind="error" title="Device profile unavailable" detail={device.error} compact action={<CommandButton variant="ghost" size="sm" onClick={refresh}>Retry</CommandButton>} />}
+            </> : <EmptyState kind="error" title="Device profile unavailable" detail={device.error} errorKind={device.errorKind} errorStatus={device.errorStatus} compact action={<CommandButton variant="ghost" size="sm" onClick={refresh}>Retry</CommandButton>} />}
           </div>
         ) : (
           <div className="settings-tool" data-testid="rag-workspace">

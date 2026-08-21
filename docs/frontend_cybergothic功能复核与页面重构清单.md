@@ -19,11 +19,11 @@
 | `#/image` | 生图任务、资产目录、生成参数和任务详情 | P1 基础工作区已接入；编辑/局部重绘待补 |
 | `#/models` | 模型目录、运行时加载/卸载、本地资产和只读预检 | P1.2 基础工作区已接入；导入/拉取/许可证管理待补 |
 | `#/settings` | 后端连接、设备/GPU、RAG、动效、fixture、日志令牌 | P1.3 已接入设备与 RAG 工作区；模型能力位于 `#/models`，其余运行时选项待补 |
-| `#/help` | 启动、接口清单、FAQ、版本 | 文档页，仍是纵向长页 |
+| `#/help` | 启动、接口清单、FAQ、版本 | P3 三栏文档工作区已接入；目录、正文与当前条目详情独立组织，主区局部滚动 |
 
 旧 `frontend` 的入口在 `frontend/src/App.jsx`，视图为 `chat / image / admin / account`，并在设置弹窗中挂载设备、模型、RAG 等工作区。`frontend_cybergothic` 的路由表在 `frontend_cybergothic/src/app/routes.tsx`，数据入口在 `frontend_cybergothic/src/data/api.ts` 和 `src/data/hooks.ts`；两者目前不是功能等价实现。
 
-视觉现状也存在明显不均衡：`ChatPane` 使用 `GothicWorksCanvas` 绘制哥特建筑、齿轮和时钟，`OverviewPage` 只有一层 `AccentCanvas`；Tasks、Activity、Settings、Help 没有同等级的页面背景场景。Workbench 已是独立视口的左右分屏，但其他页面仍由多个纵向 band 组成，详情 Drawer 打开后容易把操作上下文和页面高度拉开。
+视觉现状已在 P3 阶段统一：`ChatPane` 使用 `GothicWorksCanvas`，Overview、Tasks、Activity、Settings、Help 分别接入独立页面场景，并迁移为固定视口内的侧栏、主区与详情布局。三栏外层壳层使用约 56% 至 66% 的半透明底色，Canvas 提升至约 52% 至 58%；正文卡片、表格和表单维持更实的底色，背景动效以古铜远景与金色近景出现，不干扰阅读。
 
 ### 1.2 差异清单
 
@@ -36,21 +36,21 @@
 
 | 功能域 | `frontend` 基线 | `frontend_cybergothic` 现状 | 状态 | 后续验收点 |
 | --- | --- | --- | --- | --- |
-| 流式对话 | `ChatPanel`、预设、工作流详情、取消生成、附件 | `ChatPane` 已支持流式、取消、文本上传和清空 | 部分覆盖 | 保留预设、工作流详情、失败重试、生成状态和附件列表 |
-| 会话管理 | `SessionList`：新建、切换、重命名、删除、激活、删除单轮 | 仅 `GET /sessions` 展示历史；工作台固定 `default` 会话 | 部分覆盖 | 工作台左侧会话栏；操作后同步消息、标题和当前会话 ID |
-| 对话历史 | `fetchConversations`、分页/清空 | 有历史读取和清空 | 部分覆盖 | 支持分页、空态、会话切换、删除单轮，不能因历史接口失败阻塞输入框 |
-| 生图工作区 | `DiffusionPanel`，生成/编辑/局部重绘/图生图、模型 artifact、资产目录、任务状态 | 无图片路由、组件或 diffusion API | 缺失 | 见第 2 节，必须有生图列表和任务详情 |
-| 生图列表 | 旧组件维护 artifacts、asset catalog、运行中 job、结果 blob | 完全不存在 | 缺失 | 可按状态筛选，显示缩略图、prompt、参数、耗时；支持取消、重试、下载、删除和详情抽屉 |
-| 模型选择与加载 | `ModelSelector`、当前模型、可用模型、加载/卸载、量化 | 仅 Overview 展示状态快照 | 缺失 | 模型列表、加载进度、量化/运行时、失败原因和本地模式提示 |
-| 设备/GPU | `DevicePanel`，档位检测、GPU 选择、自动配置 | 只读显示 `/status` 中的设备字段 | 缺失 | 独显选择、显存预算、自动配置、CPU 回退和配置持久化 |
-| 模型资产/模型舰队 | `ModelFleetPanel`：本地资产、artifact、导入/拉取、预检、运行时 sidecar、许可证与来源 | 无页面、hooks 或写接口 | 缺失 | 资产状态、下载/导入任务、校验、加载/卸载和来源信息可追踪 |
-| RAG | `RagPanel`：健康、容量、检索、重建、ANN、embedding job | 只有 `GET /rag/health` 和 Overview 小卡片 | 部分覆盖 | 独立 RAG 工作区，检索预览、重建确认、容量和 embedding 任务详情 |
-| 集群/管理员 | `AdminPanel`：节点注册/注销、邀请、角色、层分配、分布式配置、邮件、主节点转移、备用主、审查工单、队列控制 | 只有节点只读、队列少量控制 | 缺失 | 按角色隐藏或禁用主节点操作，所有写操作有确认、审计反馈和失败回滚提示 |
-| 账户/鉴权 | `AuthGate`、用户管理、登录会话、头像、Tailscale | 没有账户路由、用户管理或鉴权入口 | 缺失 | 未登录、普通用户、管理员、Tailscale 状态均有明确工作区 |
-| 日志 | 最近日志、会话记录 | `GET /logs/recent`、日志令牌、会话表 | 部分覆盖 | 日志文件/内容、统计、节点聚合、删除/导出、会话同步状态按权限显示 |
+| 流式对话 | `ChatPanel`、预设、工作流详情、取消生成、附件 | `ChatPane` 已支持流式、取消、文本上传、清空、刷新和单轮删除 | 部分覆盖 | 保留预设、工作流详情、失败重试、生成状态和附件列表 |
+| 会话管理 | `SessionList`：新建、切换、重命名、删除、激活、删除单轮 | 工作台左侧会话栏已支持新建、切换、重命名、删除和当前会话同步 | 已覆盖（P0） | 后续补服务端分页、最近会话排序和跨设备恢复 |
+| 对话历史 | `fetchConversations`、分页/清空 | `ChatPane` 支持历史读取、清空、刷新和确认后删除单轮；fixture 与真实接口路径一致 | 已覆盖（P1.4） | 后续补服务端分页/增量加载、失败重试按钮和持久化结果校验 |
+| 生图工作区 | `DiffusionPanel`，生成/编辑/局部重绘/图生图、模型 artifact、资产目录、任务状态 | `#/image` 已有生成参数、任务轮询、取消、结果预览、下载和本地历史 | 部分覆盖 | 编辑/局部重绘/图生图模式、真实结果历史持久化和资产下载待补 |
+| 生图列表 | 旧组件维护 artifacts、asset catalog、运行中 job、结果 blob | 已有任务/资产侧栏、状态、prompt、结果和下载；fixture/真实 job 查询均接线 | 已覆盖（P1） | 状态筛选、重试、删除、详情抽屉和真实 blob 生命周期待补 |
+| 模型选择与加载 | `ModelSelector`、当前模型、可用模型、加载/卸载、量化 | `#/models` 已有目录、引擎/量化、加载/卸载、运行时状态和预检 | 已覆盖（P1.2） | 导入/拉取、加载进度、失败恢复和 sidecar 控制待补 |
+| 设备/GPU | `DevicePanel`，档位检测、GPU 选择、自动配置 | `#/settings` 已有设备画像、GPU 选择和推荐配置操作 | 已覆盖（P1.3） | 显存预算、CPU 回退策略和配置持久化待补 |
+| 模型资产/模型舰队 | `ModelFleetPanel`：本地资产、artifact、导入/拉取、预检、运行时 sidecar、许可证与来源 | `#/models` 已有本地资产、来源/状态、只读预检和运行时详情 | 部分覆盖 | 导入/拉取、许可证与 sidecar 控制待补 |
+| RAG | `RagPanel`：健康、容量、检索、重建、ANN、embedding job | `#/settings` 已有健康、FTS 检索和重建操作 | 部分覆盖 | 容量、ANN 和 embedding job 详情待补 |
+| 集群/管理员 | `AdminPanel`：节点注册/注销、邀请、角色、层分配、分布式配置、邮件、主节点转移、备用主、审查工单、队列控制 | `#/cluster` 已覆盖节点拓扑、状态、邀请端点和角色门控；`#/audit` 覆盖审查工单 | 部分覆盖（P2） | 层分配、邮件与完整转移流程待补；所有写操作有确认、审计反馈和失败回滚提示 |
+| 账户/鉴权 | `AuthGate`、用户管理、登录会话、头像、Tailscale | `#/account` 已接入能力探针、登录/退出、会话撤销、管理员用户管理和 Tailscale 绑定工作区；真实接口缺失时显示明确错误态 | 已覆盖（P2） | 后续补 Auth App QR、恢复码轮换和跨设备恢复的真实后端联调 |
+| 日志 | 最近日志、会话记录 | `#/activity` 保留实时日志与会话；`#/audit` 接入日志文件预览/删除、统计、节点汇总/聚合和审查工单 | 已覆盖（P2） | 日志导出、会话同步状态和完整审查邮件流待补 |
 | 设置 | 主题、设备、模型、RAG、分布式推理、日志和运行时选项 | 连接信息、动效、fixture、日志令牌 | 部分覆盖 | 采用设置侧栏，按领域拆分并保留未保存/保存成功状态 |
 | 任务图 | 工作流列表和阶段 Drawer | 已有工作流列表、筛选、取消和提供者状态 | 部分覆盖 | 迁移完整阶段详情、输入输出、错误堆栈、重试/取消和能力开关 |
-| API/错误语义 | 旧 client 覆盖完整 API 和鉴权 | 新 API 只覆盖 status、cluster 快照、queue、workflow、RAG health、sessions、logs、chat | 部分覆盖 | 先补 client 能力，再为 403、404、409、超时和离线分别建状态，不使用一个通用错误页 |
+| API/错误语义 | 旧 client 覆盖完整 API 和鉴权 | 新 API 已统一请求超时、网络异常、401/403/404/409/429/5xx 分类，并保留 request id | 已覆盖（P0） | 后续继续扩展缺失业务接口；页面可按 `errorKind` 细化权限引导 |
 
 ## 2. 生图工作区优先清单
 
@@ -116,11 +116,11 @@
 | 页面 | 建议结构 | 侧栏内容 | 主内容/详情 |
 | --- | --- | --- | --- |
 | Workbench | 保留左右分屏 | 控制台、会话入口可折叠 | 左侧集群实况；右侧对话消息和输入区 |
-| Overview | `上下文侧栏 / 状态主区 / 当前告警详情` | 角色、运行模式、最近刷新、快捷入口 | 指标与本机状态为主；节点、活动、容量用可切换 pane；点击节点在详情区展开 |
-| Tasks | `队列/筛选侧栏 / 任务表 / 任务详情` | 队列层级、工作流状态、提供者、暂停状态 | 中央表格固定表头；右侧展示工作流阶段、输入输出、取消/重试 |
-| Activity | `筛选与会话侧栏 / 日志时间线 / 事件详情` | 日志级别、节点、时间范围、会话 | 时间线独立滚动；点击日志或会话后打开详情，不把详情插入长列表底部 |
-| Settings | `设置导航侧栏 / 设置详情` | 连接、设备、模型、RAG、分布式、日志、账户 | 右侧只显示当前域，底部 sticky 保存栏展示脏状态和结果 |
-| Help | `目录侧栏 / 文档内容` | 启动、接口、FAQ、故障排查、版本 | 右侧文章按锚点切换；API 表格局部滚动 |
+| Overview | `运行上下文侧栏 / 可切换状态主区 / 当前详情` | 角色、运行模式、模型与快捷入口 | 已迁移为 `#/overview` 三栏局部滚动；总览、准入、节点、活动按 pane 切换，节点/日志固定详情，平板与窄屏使用 Drawer |
+| Tasks | `队列/筛选侧栏 / 任务表 / 任务详情` | 队列层级、工作流状态、提供者、暂停状态 | 已迁移为 `#/tasks` 队列/工作流切换工作区；桌面三栏局部滚动，平板与窄屏使用详情 Drawer |
+| Activity | `筛选与会话侧栏 / 日志时间线 / 事件详情` | 日志级别、节点、时间范围、会话 | 已迁移为 `#/activity` 桌面三栏局部滚动；点击日志/会话固定详情，平板与窄屏切换 Drawer |
+| Settings | `设置导航侧栏 / 设置工作区 / 运行上下文` | 设备、RAG、连接、动效、数据源、日志令牌 | 已迁移为 `#/settings` 三栏局部滚动；设备/RAG 受控嵌入，右栏固定显示数据源、节点角色与令牌脏状态 |
+| Help | `目录侧栏 / 文档内容 / 当前条目详情` | 启动、接口、FAQ、故障排查、版本 | 已迁移为 `#/help` 三栏局部滚动；目录切换启动、API、FAQ 与关于，API/FAQ 当前条目固定显示在右栏 |
 | Image Studio | `生图任务/资产 / 生成画布 / 任务详情` | 见第 2 节 | 画布和参数稳定，历史列表不随画布高度增长 |
 | Models & Assets | `模型/资产筛选 / 资产表 / 预检与运行时详情` | 状态、来源、许可证、设备兼容性 | 导入、拉取、加载和卸载放在详情 pane |
 | Cluster Admin | `管理导航 / 操作台 / 审计详情` | 节点、加入、角色、分层、分布式、邮件、审查 | 高风险操作必须有确认、影响范围和结果日志 |
@@ -130,7 +130,7 @@
 
 ### 5.1 统一实现方式
 
-当前 `frontend_cybergothic/src/visual/GothicWorksCanvas.tsx` 只服务 ChatPane，已经具备 DPR 上限、ResizeObserver、IntersectionObserver、减少动效和静态建筑缓存。后续建议抽象为一个 `GothicSceneCanvas`（或 `PageBackdrop`）组件，通过 `scene` 配置切换场景，而不是每页复制一套绘制循环。
+当前 `frontend_cybergothic/src/visual/PageBackdrop.tsx` 和 `sceneRegistry.ts` 已将页面 Canvas 统一注册；各场景均具备 DPR 上限、ResizeObserver、IntersectionObserver、减少动效与后台暂停。场景保持独立绘制循环，以便每页拥有不重复的建筑和机械语汇。
 
 每个场景包含：`sceneId`、调色板、远景建筑类型、主机械部件、次级装饰、视差系数、粒子密度、速度、随机种子。Canvas 仅作 `aria-hidden` 装饰，任何状态、文本和操作都必须在 DOM 中可用。
 
@@ -154,15 +154,16 @@
 | 页面 | 场景名 | 主元素 | 色彩/动效重点 |
 | --- | --- | --- | --- |
 | Workbench / Chat | Cathedral Works | 尖拱、互相啮合的巨型齿轮、玫瑰窗时钟 | 暗紫石材 + 金色/淡青线条；齿轮反向旋转，时钟慢速走针 |
-| Overview | Observatory Nave | 天文台拱顶、星盘、轨道环、远处塔楼 | 石灰蓝 + 哑金；轨道缓慢进动，星点只在 L3 轻微闪烁 |
-| Tasks | Gearworks Queue | 分层齿条、输送链、闸门和排队脉冲 | 铜/琥珀 + 深灰；链条按队列方向移动，脉冲不超过提示色亮度 |
-| Activity | Bell Tower Rain | 钟楼、垂直雨线、摆锤、检修栈桥 | 蓝紫 + 冷白；雨线有深度差，摆锤只在 L2 摆动 |
-| Settings | Clockwork Archive | 档案柜、锁孔、刻度盘、机械书脊 | 紫灰 + 青铜；刻度盘微调，整体速度最低，突出可读性 |
-| Help | Stained-glass Scriptorium | 柳叶窗、彩色玻璃分格、翻页框架、导管 | 靛青 + 低饱和红金；玻璃光带缓慢扫过，避免闪烁 |
+| Overview | Observatory Nave | 天文台拱顶、星盘、轨道环、远处塔楼 | 已接入独立 Canvas；古铜远景 + 金色星盘，轨道、反向齿轮与彗星低速进动 |
+| Tasks | Gearworks Queue | 分层齿条、输送链、闸门和排队脉冲 | 已接入独立 Canvas；古铜齿条 + 金色传动轮，齿条与啮合齿轮反向移动且只影响背景层 |
+| Activity | Bell Tower Rain | 钟楼、垂直雨线、摆锤、检修栈桥 | 古铜钟楼 + 金色雨线与传动轮；雨线有深度差，摆锤和齿轮相位独立 |
+| Settings | Clockwork Archive | 档案柜、锁孔、刻度盘、机械书脊 | 已接入独立 Canvas；古铜档案柜 + 金色锁件，档案柜、书脊、表盘和啮合齿轮分层视差 |
+| Help | Stained-glass Scriptorium | 柳叶窗、彩色玻璃分格、翻页框架、导管 | 已接入独立 Canvas；古铜窗格 + 金色玫瑰盘，彩窗光带、手稿与窗格按层缓慢移动 |
 | Image Studio | Alchemical Foundry | 炼金炉、转台、光圈环、图像版片、蒸汽管 | 品红/琥珀作为少量强调；转台和光圈与生成状态联动 |
 | Models & Assets | Reliquary Engine | 资产匣、堆叠金属板、轴承、铭牌 | 青绿 + 金色；资产卡槽有序点亮，下载时显示单向流光 |
 | Cluster Admin | Gargoyle Relay | 城堡塔楼、连线、继电器、节点信标 | 铁红 + 青色；节点信标按在线状态呼吸，连线不做强光束 |
 | Account | Iron Gate | 门闩、锁环、钥匙、护盾和链条 | 金色 + 暗红；锁环慢旋，安全状态用低频脉冲 |
+| Audit Ledger | Archive Clock | 钟楼、档案卷轴、反向齿轮、刻度盘 | 金色 + 苍紫；卷轴分层视差，齿轮低速反向旋转，指针缓慢走动 |
 
 ### 5.4 动效与交互验收
 
@@ -179,27 +180,28 @@
 - [x] 增加 `my-role` 上下文和单机模式判定。
 - [x] 修复 Overview 队列 403 的 `not_applicable` 状态；拆分独立资源错误边界。
 - [x] 将 ChatPane 从固定 `default` 会话接入会话列表的创建、切换、重命名、删除。
-- [ ] 补齐 API client 的错误分类、超时、离线和鉴权状态。
-- [ ] 为单机 master/client/未设置角色补启动矩阵测试（当前已覆盖 client 角色的 Overview 403 回归）。
+- [x] 补齐 API client 的错误分类、超时、离线和鉴权状态（请求层已覆盖 401/403/404/409/429/5xx、网络、超时与流式中断；资源 hook 暴露 `errorKind/errorStatus/retryable`）。
+- [x] 为单机 master/client/未设置角色补启动矩阵测试（`tests/p0_role_matrix.spec.js` 覆盖首屏、队列门控、容量状态、全局刷新和页面错误；client/未设置角色不会请求主节点队列）。
 
 ### P1：补齐旧前端的核心工作区
 
 - [x] 新增 Image Studio，优先完成生图列表、任务详情、取消/重试/下载（P1 已完成 `#/image` 基础任务列表、生成、轮询、取消和本地历史；编辑模式与真实结果历史持久化待补）。
 - [x] 新增 Models & Assets，接入模型选择、加载/卸载和本地资产（P1.2 已完成 `#/models` 的模型目录、引擎/量化选择、运行时加载/卸载、资产详情和只读预检；导入、拉取、许可证与 sidecar 控制待补）。
 - [x] 将 Device、RAG、运行时设置从旧弹窗迁移为设置侧栏页面（P1.3 已完成设备画像、GPU 选择、推荐配置、RAG 健康、FTS 检索与重建；容量、ANN 和 embedding job 待补）。
-- [ ] 新增完整会话工作区和对话历史操作。
+- [x] 新增完整会话工作区和对话历史操作（P1.4 已完成会话栏与对话历史刷新、清空、单轮删除；服务端分页、失败重试和跨设备恢复留后续）。
 
 ### P2：集群与账户能力
 
-- [ ] 新增 Cluster Admin，并按角色控制可见性和写操作。
-- [ ] 新增 Account/Auth、登录会话、用户管理和 Tailscale。
-- [ ] 补日志文件、节点日志聚合、统计和审查工单等管理能力。
+- [x] 新增 Cluster Admin，并按角色控制可见性和写操作（`#/cluster` 已接入节点拓扑、状态、邀请端点、主节点容量、手动预注册、注销/删除；client 只读且不请求邀请数据，覆盖 `tests/p2_cluster.spec.js`）。
+- [x] 新增 Account/Auth、登录会话、用户管理和 Tailscale（`#/account` 已接入 owner/admin 权限域、fixture/真实 API、会话撤销、Tailscale inspect/prepare/confirm/revoke 与服务缺失错误态，覆盖 `tests/p2_account.spec.js`）。
+- [x] 补日志文件、节点日志聚合、统计和审查工单等管理能力（`#/audit` 已接入受保护日志文件预览/删除、buffer 统计、master-only 节点汇总与聚合、审查工单创建/投票/过期检查/清理，fixture/真实 API 与 client 只读门控覆盖 `tests/p2_audit.spec.js`）。
 
 ### P3：布局与视觉系统
 
-- [ ] 抽象 `GothicSceneCanvas/PageBackdrop` 和 scene registry。
-- [ ] 将 Overview、Tasks、Activity、Settings、Help 改成侧栏 + 主区 + 详情的局部滚动布局。
-- [ ] 为每个页面接入第 5.3 节的独特场景，并做桌面、平板、窄屏截图检查。
+- [x] 抽象 `GothicSceneCanvas/PageBackdrop` 和 scene registry（`src/visual/PageBackdrop.tsx`、`sceneRegistry.ts` 已提供统一场景注册；Overview、Activity、Tasks、Settings、Help 已接入独立场景）。
+- [x] 将 Overview、Tasks、Activity、Settings、Help 改成侧栏 + 主区 + 详情的局部滚动布局；桌面保持三栏，窄屏退化为单列或 Drawer，并统一调整外层面板透明度。
+- [x] 为每个页面接入第 5.3 节的独特场景，并做桌面、平板、窄屏截图检查（分别使用 Observatory Nave / Bell Tower Rain / Gearworks Queue / Clockwork Archive / Stained-glass Scriptorium）。
+- [x] 修复工作区壳层过实的问题：所有已接入背景的侧栏、主区和详情壳层降低透明底色，内部表单、表格和可操作卡片保持实底；背景统一使用古铜远景与金色近景，并补充反向齿轮、钟面、玫瑰盘和扫光等低速层次。
 - [ ] 检查 reduced motion、Canvas 不可用、后台暂停和高 DPI 下的 CPU/GPU 占用。
 
 ## 7. 验收矩阵

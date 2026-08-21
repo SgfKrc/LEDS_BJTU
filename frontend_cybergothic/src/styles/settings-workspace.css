@@ -63,6 +63,15 @@
   min-width: 0;
 }
 
+/* The page-level settings shell owns navigation in embedded mode. */
+.settings-workspace--embedded {
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
 .settings-tool {
   min-width: 0;
 }
