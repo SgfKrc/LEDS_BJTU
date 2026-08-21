@@ -7,14 +7,40 @@
  */
 
 import type {
+  AuthCapabilityResponse,
+  AuthSessionResponse,
+  AuthSessionsResponse,
+  AuthUser,
+  AvailableModelsResponse,
+  ClusterConfigResponse,
+  ClusterInviteResponse,
+  ClusterStatusResponse,
   ClusterNodesResponse,
   ConversationResponse,
+  CurrentModelResponse,
+  DeviceProfileResponse,
+  DiffusionArtifactsResponse,
+  DiffusionAssetsResponse,
+  DiffusionCapabilitiesResponse,
+  LocalModelAssetsResponse,
+  LocalTailscaleStatusResponse,
+  CanVoteResponse,
+  LogFilesResponse,
+  LogStatsResponse,
+  NodeLogAggregateResponse,
+  NodesLogSummaryResponse,
+  ManagedUsersResponse,
+  ModelsResponse,
+  MasterHealthResponse,
   PipelineCapacityResponse,
   QueueResponse,
   RagHealthResponse,
+  RagSearchResponse,
   RecentLogsResponse,
+  ReviewTicketsResponse,
   SessionsResponse,
   SystemStatusResponse,
+  TailscaleBindingsResponse,
   WorkflowsResponse,
 } from './types';
 
@@ -57,6 +83,58 @@ export function setFixturesEnabled(on: boolean): void {
 }
 
 const NOW = Date.now() / 1000;
+
+export const authCapabilityFixture: AuthCapabilityResponse = {
+  required: true,
+  mode: 'local_primary_node',
+  bootstrap_available: false,
+};
+
+export const authOwnerFixture: AuthUser = {
+  user_id: 'user_owner_01',
+  username: 'operator',
+  display_name: 'QLH Operator',
+  role: 'owner',
+  status: 'active',
+  totp_state: 'enabled',
+  active_session_count: 2,
+  aggregate_version: 4,
+};
+
+export const authSessionFixture: AuthSessionResponse = {
+  session_id: 'auth_session_current',
+  expires_at: '2026-08-22T12:00:00.000Z',
+  user: authOwnerFixture,
+};
+
+export const authSessionsFixture: AuthSessionsResponse = {
+  sessions: [
+    { session_id: 'auth_session_current', user_id: authOwnerFixture.user_id, active: true, current: true, created_at: '2026-08-20T12:28:05.340855Z', last_seen_at: '2026-08-21T09:28:05.340855Z', expires_at: '2026-08-22T12:00:00.000Z' },
+    { session_id: 'auth_session_tablet', user_id: authOwnerFixture.user_id, active: true, current: false, created_at: '2026-08-19T08:20:00.000Z', last_seen_at: '2026-08-21T08:55:00.000Z', expires_at: '2026-08-22T08:20:00.000Z' },
+  ],
+};
+
+export const managedUsersFixture: ManagedUsersResponse = {
+  users: [
+    authOwnerFixture,
+    { user_id: 'user_member_02', username: 'researcher', display_name: 'Researcher', role: 'member', status: 'active', totp_state: 'enabled', active_session_count: 1, aggregate_version: 2 },
+    { user_id: 'user_member_03', username: 'tablet', display_name: 'Tablet Client', role: 'member', status: 'suspended', totp_state: 'pending', active_session_count: 0, aggregate_version: 1 },
+  ],
+};
+
+export const tailscaleBindingsFixture: TailscaleBindingsResponse = {
+  bindings: [
+    { binding_id: 'binding_qlh_01', user_id: authOwnerFixture.user_id, tailnet_id: 'tailnet-qlh-demo', tailscale_user_id: 'ts-user-operator', node_id: 'master', state: 'active', authorization_method: 'local_status', confirmed_at: '2026-08-20T12:30:00.000Z', updated_at: '2026-08-20T12:30:00.000Z' },
+  ],
+};
+
+export const localTailscaleStatusFixture: LocalTailscaleStatusResponse = {
+  local_status: {
+    state: 'ready',
+    available: true,
+    candidate: { tailnet_id: 'tailnet-qlh-demo', tailnet_display_name: 'QLH Demo Tailnet', tailscale_user_id: 'ts-user-operator', node_id: 'master', hostname: 'qlh-master', addresses: ['100.90.76.108'] },
+  },
+};
 
 export const statusFixture: SystemStatusResponse = {
   model_loaded: false,
@@ -191,6 +269,45 @@ export const nodesFixture: ClusterNodesResponse = {
   offline_count: 1,
 };
 
+export const clusterStatusFixture: ClusterStatusResponse = {
+  run_mode: 'distributed',
+  nodes_ready: true,
+  nodes: Object.fromEntries(nodesFixture.nodes.map((node) => [node.node_id, node])),
+  current_task: { task_id: 'task_9f31c2', state: 'running' },
+  tcp_server: { host: '100.90.76.108', port: 8888, connected: true },
+  pipeline: { prepared: true, model_id: 'qwen-1_8b' },
+  pipeline_queue: { paused: false, queue_size: 3 },
+  network_path: { type: 'tailscale', healthy: true },
+};
+
+export const clusterConfigFixture: ClusterConfigResponse = {
+  max_nodes: 3,
+  network: { server_ip: '100.90.76.108', server_port: 8888, heartbeat_interval_s: 5 },
+  model: { quant_type: 'int4', page_size: 512, max_seq_len: 8192 },
+  node_role: 'master',
+  node_id: 'master',
+};
+
+export const clusterInviteFixture: ClusterInviteResponse = {
+  master_host: '100.90.76.108',
+  master_port: 8888,
+  node_count: 3,
+  max_nodes: 3,
+  has_capacity: false,
+  identity_verified: true,
+  identity_reason: 'local identity matches cluster record',
+  mac_addresses: ['AA:BB:CC:DD:EE:FF'],
+};
+
+export const masterHealthFixture: MasterHealthResponse = {
+  master_online: true,
+  last_seen_seconds_ago: 0,
+  stale: false,
+  master_host: '100.90.76.108',
+  master_port: 8888,
+  source: 'self',
+};
+
 export const queueFixture: QueueResponse = {
   running: true,
   strategy: 'mlfq',
@@ -322,6 +439,17 @@ export const ragFixture: RagHealthResponse = {
   query_event_count: 96,
 };
 
+export const ragSearchFixture: RagSearchResponse = {
+  mode: 'fts',
+  provider: null,
+  results: [
+    { chunk_id: 'chunk_overview_01', source_id: 'runtime-notes', relative_ref: 'docs/runtime.md', revision: 3, ordinal: 12, snippet: 'The local runtime keeps model loading, device selection, and queue admission as separate control surfaces.' },
+    { chunk_id: 'chunk_overview_02', source_id: 'frontend-plan', relative_ref: 'docs/frontend-plan.md', revision: 2, ordinal: 8, snippet: 'Use explicit empty and unavailable states when the backend is offline or the current role cannot access an endpoint.' },
+  ],
+  count: 2,
+  storage: 'sqlite',
+};
+
 export const sessionsFixture: SessionsResponse = {
   sessions: [
     { id: 'default', title: '新对话', message_count: 56, created_at: '2026-08-18T12:28:05.340855Z', updated_at: '2026-08-20T15:28:56.588493Z' },
@@ -330,6 +458,214 @@ export const sessionsFixture: SessionsResponse = {
   active_session_id: 'default',
   total: 2,
   source: 'sqlite',
+};
+
+export const diffusionCapabilitiesFixture: DiffusionCapabilitiesResponse = {
+  state: 'loaded',
+  loaded: true,
+  loaded_artifact: {
+    artifact_id: 'sd15-demo',
+    name: 'SD 1.5 Demo',
+    artifact: { artifact_kind: 'sd15_pipeline', loadable: true, precision: 'fp16' },
+  },
+  capabilities: { txt2img: true, img2img: false, inpaint: false },
+  dependencies: { torch: true, diffusers: true, transformers: true },
+  presets: [
+    {
+      preset_id: 'sd15_demo',
+      model_id: 'sd15-demo',
+      prompt: 'gothic observatory at night',
+      negative_prompt: 'blurry, low quality',
+      width: 512,
+      height: 512,
+      steps: 24,
+      guidance_scale: 7.5,
+      scheduler: 'ddim',
+      seeds: [1742],
+    },
+  ],
+};
+
+export const diffusionArtifactsFixture: DiffusionArtifactsResponse = {
+  artifacts: [
+    {
+      artifact_id: 'sd15-demo',
+      name: 'SD 1.5 Demo',
+      registered_at: NOW - 7200,
+      artifact: { artifact_kind: 'sd15_pipeline', loadable: true, precision: 'fp16', size_bytes: 3673657344 },
+    },
+  ],
+};
+
+export const diffusionAssetsFixture: DiffusionAssetsResponse = {
+  assets: [
+    {
+      asset_id: 'sd15-demo',
+      name: 'SD 1.5 Demo Pipeline',
+      artifact_id: 'sd15-demo',
+      artifact_kind: 'sd15_pipeline',
+      description: '用于离线预览的本地 SD 1.5 资产。',
+      installed: true,
+      present_bytes: 3673657344,
+      total_bytes: 3673657344,
+    },
+  ],
+};
+
+export const modelsFixture: ModelsResponse = {
+  active_model_id: 'qwen-1_8b',
+  models: [
+    {
+      model_id: 'qwen-1_8b',
+      name: 'Qwen 1.8B Chat',
+      model_type: 'qwen',
+      is_builtin: true,
+      recommended_vram_gb: 3.5,
+      max_context: 8192,
+      quant_types: ['fp16', 'int8', 'int4', 'Q4_K_M'],
+      description: 'Compact local assistant model for chat and workflow tasks.',
+      location: 'builtin',
+      is_available: true,
+      available_formats: ['gguf', 'safetensors'],
+      has_gguf: true,
+      has_safetensors: true,
+      supported_engines: ['llama_cpp', 'pytorch'],
+      preferred_engine: 'llama_cpp',
+      default_quant_type: 'Q4_K_M',
+      requires_cuda: false,
+      expected_paths: ['models/qwen-1_8b'],
+    },
+    {
+      model_id: 'qwen3-8b-sidecar',
+      name: 'Qwen3 8B Sidecar',
+      model_type: 'qwen3',
+      is_builtin: false,
+      is_experimental: true,
+      recommended_vram_gb: 10,
+      max_context: 32768,
+      quant_types: ['int4'],
+      description: 'Inventory-only asset. Requires the sidecar runtime gate.',
+      location: 'local asset',
+      is_available: false,
+      unavailable_reason: 'Sidecar asset is registered for preflight only.',
+      available_formats: ['safetensors'],
+      has_safetensors: true,
+      has_gguf: false,
+      supported_engines: [],
+      preferred_engine: 'auto',
+      default_quant_type: 'int4',
+      requires_cuda: true,
+      expected_paths: ['models/qwen3-8b-sidecar'],
+    },
+    {
+      model_id: 'deepseek-r1-7b',
+      name: 'DeepSeek R1 7B',
+      model_type: 'deepseek',
+      is_builtin: false,
+      is_experimental: true,
+      recommended_vram_gb: 8,
+      max_context: 16384,
+      quant_types: ['int4'],
+      description: 'Registered model awaiting a local weight package.',
+      location: 'external',
+      is_available: false,
+      unavailable_reason: 'Model weights are not present on this node.',
+      available_formats: [],
+      has_safetensors: false,
+      has_gguf: false,
+      supported_engines: [],
+      preferred_engine: 'auto',
+      default_quant_type: 'int4',
+      requires_cuda: true,
+      expected_paths: ['models/deepseek-r1-7b'],
+    },
+  ],
+};
+
+export const availableModelsFixture: AvailableModelsResponse = {
+  current: 'Q4_K_M',
+  current_engine: 'llama_cpp',
+  models: [
+    { id: 'gguf', name: 'GGUF 量化', engine: 'llama_cpp', description: 'CPU/集显友好', is_available: true },
+    { id: 'int4', name: 'INT4 量化', engine: 'pytorch', memory_gb: 1.8, speed_tok_s: 29, is_available: true },
+    { id: 'int8', name: 'INT8 量化', engine: 'pytorch', memory_gb: 2.3, speed_tok_s: 10, is_available: true },
+  ],
+  available_engines: [
+    { id: 'llama_cpp', name: 'llama.cpp + GGUF', description: 'GGUF quantized runtime.', requires_cuda: false },
+    { id: 'pytorch', name: 'PyTorch + Safetensors', description: 'Safetensors runtime.', requires_cuda: false },
+  ],
+};
+
+export const currentModelFixture: CurrentModelResponse = {
+  loaded: true,
+  pipeline_prepared: false,
+  quant_type: 'Q4_K_M',
+  model_id: 'qwen-1_8b',
+  model_name: 'Qwen 1.8B Chat',
+  model_path: 'models/qwen-1_8b/Qwen-1_8B-Chat.Q4_K_M.gguf',
+  engine: 'llama_cpp',
+};
+
+export const localModelAssetsFixture: LocalModelAssetsResponse = {
+  assets: [
+    {
+      model_id: 'qwen3-8b-sidecar',
+      name: 'Qwen3 8B Sidecar',
+      huggingface_id: 'Qwen/Qwen3-8B',
+      model_type: 'safetensors',
+      available_formats: ['safetensors'],
+      model_path: 'models/qwen3-8b-sidecar',
+      max_context: 32768,
+      architectures: ['Qwen3ForCausalLM'],
+      total_bytes: 8589934592,
+      asset_ids: ['qwen3-8b-sidecar'],
+      source_paths: ['models/qwen3-8b-sidecar'],
+      manifest_paths: ['models/qwen3-8b-sidecar/.qlh-model-asset.json'],
+      integrity: 'manifest_verified',
+      runtime_profile: 'qwen3_sidecar',
+      runtime_hint: 'Inventory only until the sidecar preflight gate passes.',
+      runtime_status: 'inventory_only',
+      runtime_action: 'qwen3_preflight',
+    },
+    {
+      model_id: 'qwen-1_8b',
+      name: 'Qwen 1.8B Chat',
+      model_type: 'gguf',
+      available_formats: ['gguf'],
+      model_path: '',
+      gguf_path: 'models/qwen-1_8b/Qwen-1_8B-Chat.Q4_K_M.gguf',
+      max_context: 8192,
+      architectures: ['QWenForCausalLM'],
+      total_bytes: 1929379840,
+      asset_ids: ['qwen-1_8b-gguf'],
+      source_paths: ['models/qwen-1_8b'],
+      manifest_paths: [],
+      integrity: 'filesystem_discovered',
+      runtime_profile: 'manual_runtime_selection',
+      runtime_hint: 'Available through the classic model loader.',
+      runtime_status: 'inventory_only',
+      runtime_action: null,
+    },
+  ],
+  summary: { total: 2, total_bytes: 10519314432 },
+};
+
+export const deviceProfileFixture: DeviceProfileResponse = {
+  tier: 'laptop',
+  tier_label: 'Performance laptop',
+  tier_icon: 'GPU',
+  score_total: 78,
+  score_breakdown: { gpu: 42, ram: 23, cpu: 13 },
+  cpu: { model_name: 'AMD Ryzen 7 7840HS', physical_cores: 8, logical_cores: 16, freq_max_mhz: 5100 },
+  ram: { total_gb: 32, available_gb: 18.6, used_gb: 13.4, percent_used: 41.9 },
+  gpu: { name: 'NVIDIA GeForce RTX 4060 Laptop GPU', gpu_type: 'dedicated', is_integrated: false, cuda_available: true, vram_total_gb: 8, vram_free_gb: 6.2 },
+  gpus: [
+    { name: 'NVIDIA GeForce RTX 4060 Laptop GPU', gpu_type: 'dedicated', is_integrated: false, cuda_available: true, vram_total_gb: 8, vram_free_gb: 6.2 },
+    { name: 'AMD Radeon 780M', gpu_type: 'integrated', is_integrated: true, cuda_available: false, vram_total_gb: 0, vram_free_gb: 0, mps_available: false },
+  ],
+  selected_gpu_index: 0,
+  recommendations: ['Use INT4 for the best memory/speed balance.', 'Keep the dedicated GPU selected for local PyTorch inference.'],
+  warnings: ['Switching GPU takes effect after the next model reload.'],
 };
 
 export const conversationFixture: ConversationResponse = {
@@ -404,4 +740,111 @@ export const logsFixture: RecentLogsResponse = {
   buffer_size: 2746,
   buffer_capacity: 5000,
   truncated: true,
+};
+
+export const logFilesFixture: LogFilesResponse = {
+  files: [
+    { name: 'qlh-api-20260821.log', size: 184_320, modified: '2026-08-21T09:29:45.000Z' },
+    { name: 'qlh-scheduler-20260820.log', size: 98_304, modified: '2026-08-20T23:58:22.000Z' },
+    { name: 'qlh-worker-tablet-20260820.log', size: 42_018, modified: '2026-08-20T20:06:10.000Z' },
+  ],
+};
+
+export const logStatsFixture: LogStatsResponse = {
+  files_count: 3,
+  files_total_bytes: 324_642,
+  buffer_size: 2746,
+  buffer_capacity: 5000,
+  buffer_total_seen: 2879,
+  buffer_dropped_estimate: 133,
+  levels: { INFO: 2381, WARNING: 241, ERROR: 116, DEBUG: 8 },
+  loggers: { api_server: 1287, scheduler: 934, task_graph: 298, cluster_transport: 227 },
+  nodes: { master: 2288, client_TABLET_2TLUCNU8: 458 },
+  node_id: 'master',
+  device_ip: '100.90.76.108',
+};
+
+export const nodesLogSummaryFixture: NodesLogSummaryResponse = {
+  local: {
+    node_id: 'master',
+    role: 'master',
+    state: 'online',
+    files_count: 3,
+    files_total_bytes: 324_642,
+    buffer_size: 2746,
+    buffer_capacity: 5000,
+    buffer_total_seen: 2879,
+    buffer_dropped_estimate: 133,
+    levels: logStatsFixture.levels,
+  },
+  workers: [
+    {
+      node_id: 'client_TABLET-2TLUCNU8',
+      role: 'client',
+      state: 'online',
+      files_count: 1,
+      files_total_bytes: 42_018,
+      buffer_size: 418,
+      buffer_capacity: 1000,
+      buffer_total_seen: 438,
+      buffer_dropped_estimate: 20,
+      levels: { INFO: 381, WARNING: 29, ERROR: 8 },
+    },
+  ],
+  total_workers: 1,
+};
+
+export const nodesLogAggregateFixture: NodeLogAggregateResponse = {
+  local: { node_id: 'master', logs: logsFixture.logs },
+  workers: [
+    {
+      node_id: 'client_TABLET-2TLUCNU8',
+      count: 2,
+      logs: [
+        { timestamp: '2026-08-20 23:29:37', level: 'INFO', levelno: 20, name: 'worker', message: 'event=heartbeat_sent rtt_ms=19.8', node_id: 'client_TABLET-2TLUCNU8', seq: 82 },
+        { timestamp: '2026-08-20 23:26:14', level: 'WARNING', levelno: 30, name: 'worker', message: 'event=thermal_limit throttle=true', node_id: 'client_TABLET-2TLUCNU8', seq: 77 },
+      ],
+    },
+  ],
+  limit: 50,
+  filters: {},
+  total_workers: 1,
+};
+
+export const canVoteFixture: CanVoteResponse = {
+  node_id: 'master',
+  can_vote: true,
+  reason: 'Current node is an eligible reviewer.',
+};
+
+export const reviewTicketsFixture: ReviewTicketsResponse = {
+  tickets: [
+    {
+      ticket_id: 'review_20260821_01',
+      status: 'pending',
+      created_at: NOW - 2_400,
+      created_by: 'master',
+      target_node_id: 'client_TABLET-2TLUCNU8',
+      transfer_reason: 'Planned maintenance window for the current primary node.',
+      score: 1,
+      expires_at: NOW + 86_400,
+      votes: [{ voter_node_id: 'master', value: 1, timestamp: NOW - 1_800, comment: 'Approved for the maintenance window.' }],
+    },
+    {
+      ticket_id: 'review_20260818_02',
+      status: 'approved',
+      created_at: NOW - 250_000,
+      resolved_at: NOW - 180_000,
+      created_by: 'master',
+      target_node_id: 'client_STUDIO-01',
+      transfer_reason: 'Recovery drill.',
+      score: 2,
+      expires_at: NOW - 190_000,
+      votes: [
+        { voter_node_id: 'master', value: 1, timestamp: NOW - 240_000, comment: 'Approved.' },
+        { voter_node_id: 'client_STUDIO-01', value: 1, timestamp: NOW - 230_000, comment: 'Ready.' },
+      ],
+    },
+  ],
+  count: 2,
 };

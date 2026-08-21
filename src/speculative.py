@@ -402,6 +402,81 @@ DraftCallable = Callable[[Sequence[int], int], Tuple[Sequence[int], Any]]
 VerifyCallable = Callable[[Sequence[int], Sequence[int]], Any]
 
 
+class GammaPolicy:
+    """γ 调度策略基类。返回下一轮目标草稿长度；不改 verify 接受语义。"""
+
+    def __call__(self, *, context_len: int, remaining: int) -> int:
+        raise NotImplementedError
+
+
+class StaticGammaPolicy(GammaPolicy):
+    """固定 γ（现状默认，向后兼容）。"""
+
+    def __init__(self, gamma: int):
+        self._gamma = max(0, int(gamma))
+
+    def __call__(self, *, context_len: int, remaining: int) -> int:
+        return max(0, min(self._gamma, remaining - 1))
+
+
+class AdaptiveGammaPolicy(GammaPolicy):
+    """置信度调度（SPC-CS）：按 draft 置信度与历史接受率自适应 γ。
+
+    每轮收到 Outcome 后调用 :meth:`observe` 更新 EWMA 接受率与 draft 置信度；
+    下一轮目标 γ = gamma_min + round((gamma_max-gamma_min) * (acc_ewma * conf))，
+    并据此 clamp。γ 只影响"每轮尝试多少草稿/前进多少"，输出分布仍完全由
+    verify 决定（与静态 γ 等价），保证分布等价性质不变。
+    """
+
+    def __init__(self, *, gamma_min: int = 1, gamma_max: int = 16, alpha: float = 0.2):
+        self.gamma_min = max(1, int(gamma_min))
+        self.gamma_max = max(self.gamma_min, int(gamma_max))
+        self.alpha = float(alpha)
+        self._acc_ewma = 1.0
+        self._last_conf: float = 1.0
+
+    def __call__(self, *, context_len: int, remaining: int) -> int:
+        return max(0, min(self._target(), remaining - 1))
+
+    def _target(self) -> int:
+        span = self.gamma_max - self.gamma_min
+        score = max(0.0, min(1.0, self._acc_ewma * self._last_conf))
+        return self.gamma_min + int(round(span * score))
+
+    def observe(self, *, draft_probs: Any, accepted: int, rejected: int) -> None:
+        """轮末更新置信度与 EWMA 接受率。"""
+        conf = self._draft_confidence(draft_probs)
+        if conf is not None:
+            self._last_conf = conf
+        total = int(accepted) + int(rejected)
+        if total > 0:
+            ratio = int(accepted) / total
+            self._acc_ewma = self.alpha * ratio + (1.0 - self.alpha) * self._acc_ewma
+
+    @staticmethod
+    def _draft_confidence(probs: Any) -> float | None:
+        if probs is None:
+            return None
+        arr = np.asarray(probs, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return None
+        return float(np.mean(np.max(arr, axis=1)))
+
+
+def build_gamma_policy(
+    *,
+    mode: str, gamma: int, gamma_min: int, gamma_max: int, alpha: float,
+) -> GammaPolicy:
+    """按模式构造 γ 策略（查询/静态/自适应）。未知模式 fail-closed 拒绝。"""
+    if mode == "static":
+        return StaticGammaPolicy(gamma)
+    if mode == "adaptive":
+        effective_min = max(1, int(gamma_min))
+        effective_max = max(effective_min, int(gamma_max))
+        return AdaptiveGammaPolicy(gamma_min=effective_min, gamma_max=effective_max, alpha=alpha)
+    raise SpeculativeConfigError(f"unsupported gamma mode: {mode}")
+
+
 @dataclass
 class SpeculativeResult:
     """一次投机解码会话的产出。"""
@@ -432,6 +507,11 @@ class SpeculativeSession:
         verify_fn: VerifyCallable,
         *,
         gamma: int = 4,
+        gamma_mode: str = "static",
+        gamma_min: int = 1,
+        gamma_max: int | None = None,
+        conf_alpha: float = 0.2,
+        gamma_policy: GammaPolicy | None = None,
         max_new_tokens: int = 64,
         max_rounds: int = 0,
         stop_token_ids: Iterable[int] = (),
@@ -447,6 +527,23 @@ class SpeculativeSession:
         self._draft_fn = draft_fn
         self._verify_fn = verify_fn
         self._gamma = max(0, int(gamma))
+        self._gamma_min = max(1, int(gamma_min))
+        self._gamma_max = max(
+            self._gamma_min,
+            int(gamma_max) if gamma_max is not None else max(self._gamma, self._gamma_min),
+        )
+        self._gamma_mode = str(gamma_mode or "static")
+        self._conf_alpha = float(conf_alpha if conf_alpha is not None else 0.2)
+        self._gamma_policy = (
+            gamma_policy
+            if callable(gamma_policy)
+            else build_gamma_policy(
+                mode=self._gamma_mode, gamma=self._gamma,
+                gamma_min=self._gamma_min, gamma_max=self._gamma_max,
+                alpha=self._conf_alpha,
+            )
+        )
+        self._gamma_debug: Dict[str, Any] = {"target": 0, "conf": 1.0, "ewma": 1.0}
         self._max_new_tokens = max(1, int(max_new_tokens))
         self._max_rounds = max(0, int(max_rounds))
         self._stop_token_ids = {int(t) for t in (stop_token_ids or ())}
@@ -564,8 +661,11 @@ class SpeculativeSession:
 
             remaining = self._max_new_tokens - len(self._generated)
             # 每轮最多产出 k+1 个 token，因此 γ 上限为 remaining-1，
-            # 保证不会越过 max_new_tokens（remaining=1 时 γ=0，只取奖励 token）
-            gamma_eff = max(0, min(self._gamma, remaining - 1))
+            # 保证不会越过 max_new_tokens（remaining=1 时 γ=0，只取奖励 token）。
+            # 目标 γ 由 GammaPolicy 给出（static=固定，adaptive=置信度调度）。
+            gamma_eff = self._gamma_policy(
+                context_len=len(self._context), remaining=remaining,
+            )
 
             draft_tokens, draft_probs = self._call_draft(gamma_eff)
             if self._cancelled():
@@ -609,8 +709,21 @@ class SpeculativeSession:
             if outcome.residual_fallback:
                 self._counters["residual_fallbacks"] += 1
 
+            if isinstance(self._gamma_policy, AdaptiveGammaPolicy):
+                self._gamma_policy.observe(
+                    draft_probs=draft_probs,
+                    accepted=outcome.accepted_count,
+                    rejected=outcome.rejected_count,
+                )
+                self._gamma_debug = {
+                    "target": self._gamma_policy._target(),
+                    "conf": self._gamma_policy._last_conf,
+                    "ewma": self._gamma_policy._acc_ewma,
+                }
+
             round_entry = {
                 "round": int(self._counters["rounds"]),
+                "gamma_used": gamma_eff,
                 "drafted": len(draft_tokens),
                 "accepted": outcome.accepted_count,
                 "rejected": outcome.rejected_count,
@@ -696,6 +809,15 @@ class SpeculativeSession:
         bytes_down = int(self._counters["bytes_down"])
         return {
             "gamma": self._gamma,
+            "gamma_mode": self._gamma_mode,
+            "gamma_adaptive": (
+                {
+                    "last_target": int(self._gamma_debug["target"]),
+                    "last_conf": round(float(self._gamma_debug["conf"]), 6),
+                    "acc_ewma": round(float(self._gamma_debug["ewma"]), 6),
+                }
+                if self._gamma_mode == "adaptive" else None
+            ),
             "greedy": self._greedy,
             "stateful_verify": self._stateful_verify,
             "rounds": rounds,
@@ -1317,12 +1439,29 @@ def speculative_model_identity(
 # 6. 高层编排 —— 供实验端点调用的一体化入口
 # ================================================================
 
+def _cfg(name: str) -> object:
+    """读取 src/config.py 的 SPEC_* 运行时配置（SPC-CS 接线点，函数级懒加载）。"""
+    from config import (  # config 是轻量配置模块，与 speculative 无循环依赖
+        SPEC_CONF_ALPHA, SPEC_GAMMA_MAX, SPEC_GAMMA_MIN, SPEC_GAMMA_MODE,
+    )
+    return {
+        "SPEC_GAMMA_MODE": SPEC_GAMMA_MODE,
+        "SPEC_GAMMA_MIN": SPEC_GAMMA_MIN,
+        "SPEC_GAMMA_MAX": SPEC_GAMMA_MAX,
+        "SPEC_CONF_ALPHA": SPEC_CONF_ALPHA,
+    }[name]
+
+
 def run_speculative_chat(
     message: str,
     *,
     allow_external: bool,
     max_new_tokens: Optional[int] = None,
     gamma: Optional[int] = None,
+    gamma_mode: Optional[str] = None,
+    gamma_min: Optional[int] = None,
+    gamma_max: Optional[int] = None,
+    conf_alpha: Optional[float] = None,
     max_rounds: Optional[int] = None,
     temperature: Optional[float] = None,
     seed: int = 0,
@@ -1373,6 +1512,13 @@ def run_speculative_chat(
         draft_fn,
         client.as_verify_callable(allow_external=allow_external),
         gamma=resolved_gamma,
+        gamma_mode=(
+            gamma_mode if gamma_mode is not None
+            else _cfg("SPEC_GAMMA_MODE")
+        ),
+        gamma_min=gamma_min if gamma_min is not None else _cfg("SPEC_GAMMA_MIN"),
+        gamma_max=gamma_max if gamma_max is not None else _cfg("SPEC_GAMMA_MAX"),
+        conf_alpha=conf_alpha if conf_alpha is not None else _cfg("SPEC_CONF_ALPHA"),
         max_new_tokens=resolved_max_new,
         max_rounds=resolved_max_rounds,
         stop_token_ids=stop_ids,

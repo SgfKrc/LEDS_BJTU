@@ -8,7 +8,7 @@
 import type { ReactNode } from 'react';
 import { EmptyState, SkeletonRows } from './EmptyState';
 import { CommandButton } from './CommandButton';
-import type { LoadState } from '../data/types';
+import type { ApiErrorKind, LoadState } from '../data/types';
 
 export interface Column<T> {
   key: string;
@@ -28,6 +28,8 @@ interface TaskTableProps<T> {
   rowKey: (row: T) => string;
   state: LoadState;
   error?: string;
+  errorKind?: ApiErrorKind | null;
+  errorStatus?: number | null;
   /** 空数据文案。 */
   emptyTitle?: string;
   emptyDescription?: string;
@@ -52,6 +54,8 @@ export function TaskTable<T>({
   rowKey,
   state,
   error = '',
+  errorKind = null,
+  errorStatus = null,
   emptyTitle = '暂无数据',
   emptyDescription,
   onRetry,
@@ -72,6 +76,8 @@ export function TaskTable<T>({
         title="数据加载失败"
         description="请检查后端是否运行，或稍后重试。"
         detail={error}
+        errorKind={errorKind}
+        errorStatus={errorStatus}
         {...(onRetry
           ? { action: <CommandButton variant="ghost" size="sm" onClick={onRetry}>重试</CommandButton> }
           : {})}

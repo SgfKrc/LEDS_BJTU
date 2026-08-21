@@ -1396,3 +1396,102 @@ def test_run_speculative_chat_disables_verify_renormalization():
         "run_speculative_chat 未关闭 verify 行归一化，"
         "HTTP verify 路径的接受判定会失真"
     )
+
+
+# ================================================================
+# SPC-CS 置信度调度（gamma_mode=adaptive）
+# ================================================================
+
+def _adaptive_session(p, *, gamma=4, gamma_min=1, gamma_max=16, max_new_tokens=400,
+                      max_rounds=40, draft_invert=False, seed=7):
+    """构造一个 Session：draft/verify 都基于 same distributions。
+
+    draft_invert=True 时 draft 集中在 token 0、verify 集中在 token 1，两者支撑集
+    不相交 → 全拒绝场景。draft 每次调用用递增 seed 采样，避免固定 seed 引入
+    序列偏差（分布等价的 Monte-Carlo 需要统计多样性）。
+    """
+    rows = np.tile(np.asarray(p, dtype=np.float64), (48, 1))
+    if draft_invert:
+        draft_rows = np.tile(np.array([1.0, 0.0], dtype=np.float64), (48, 1))
+        verify_rows = np.tile(np.array([0.0, 1.0], dtype=np.float64), (48, 1))
+    else:
+        draft_rows = verify_rows = rows
+    call_count = [0]
+
+    def draft(context, gamma):
+        call_count[0] += 1
+        g = max(0, min(int(gamma), 24))
+        rng = np.random.default_rng(seed * 1000 + call_count[0])
+        tokens = [spec.sample_from_probs(draft_rows[i], rng) for i in range(g)]
+        return tokens, draft_rows[:g]
+
+    def verify(context, draft_tokens):
+        return verify_rows[:len(draft_tokens) + 1], {}
+
+    return spec.SpeculativeSession(
+        [1, 2], draft, verify, gamma=gamma, gamma_mode="adaptive",
+        gamma_min=gamma_min, gamma_max=gamma_max, max_new_tokens=max_new_tokens,
+        max_rounds=max_rounds, rng=np.random.default_rng(seed),
+    )
+
+
+def test_adaptive_gamma_grows_on_high_acceptance():
+    """完美 draft（draft==verify）→ 接受率高、置信度高 → γ 放大到接近上限。"""
+    p = np.array([1.0, 0.0])
+    result = _adaptive_session(p).run()
+    used = [r["gamma_used"] for r in result.rounds]
+    assert used, "应产生至少一轮"
+    assert max(used) >= 12, f"高置信应放大 γ，实测峰值={max(used)}（{used}）"
+    assert result.metrics["gamma_mode"] == "adaptive"
+    assert result.rounds[0]["gamma_used"] >= 1
+
+
+def test_session_default_gamma_mode_is_static():
+    """默认仍为 static（向后兼容），adaptive 指标占位初值。"""
+    rows = np.tile(np.array([1.0, 0.0], dtype=np.float64), (8, 1))
+
+    def draft(context, gamma):
+        g = int(gamma)
+        return [0] * g, rows[:g]
+
+    def verify(context, draft_tokens):
+        return rows[:len(draft_tokens) + 1], {}
+
+    sess = spec.SpeculativeSession([1], draft, verify, gamma=4)
+    metrics = sess.metrics()
+    assert metrics["gamma_mode"] == "static"
+    assert metrics["gamma_adaptive"] is None          # static 无自适应占位
+
+
+def test_adaptive_gamma_shrinks_on_low_acceptance():
+    """draft 与 verify 支撑集不相交 → 全拒绝 → γ 收敛到 gamma_min。"""
+    p = np.array([0.5, 0.5])
+    result = _adaptive_session(p, draft_invert=True, gamma_max=8).run()
+    used = [r["gamma_used"] for r in result.rounds]
+    # 第一轮可能是初值附近，但收敛后应到 min
+    tail = used[-3:]
+    assert all(g <= 2 for g in tail), f"低置信应收敛 γ，实测尾部={tail}（{used}）"
+
+
+def test_build_gamma_policy_rejects_unknown_mode():
+    with pytest.raises(spec.SpeculativeConfigError):
+        spec.build_gamma_policy(mode="bogus", gamma=4, gamma_min=1, gamma_max=8, alpha=0.2)
+    assert isinstance(spec.build_gamma_policy(
+        mode="static", gamma=4, gamma_min=1, gamma_max=8, alpha=0.2,
+    ), spec.StaticGammaPolicy)
+    assert isinstance(spec.build_gamma_policy(
+        mode="adaptive", gamma=4, gamma_min=1, gamma_max=8, alpha=0.2,
+    ), spec.AdaptiveGammaPolicy)
+
+
+def test_adaptive_output_distribution_equals_verify():
+    """adaptive γ 不改变分布等价：完美 draft 下产出分布仍等于 verify。"""
+    p = np.array([0.25, 0.75])
+    result = _adaptive_session(p, max_new_tokens=600, max_rounds=60).run()
+    tokens = np.asarray(result.tokens, dtype=np.int64)
+    assert tokens.size > 40, "需要足够多产出 token"
+    empirical = np.bincount(tokens, minlength=2) / tokens.size
+    assert abs(float(empirical[0]) - 0.25) < 0.06, (
+        f"adaptive 下产出分布偏离 verify：{empirical.tolist()}"
+    )
+

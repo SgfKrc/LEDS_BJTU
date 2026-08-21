@@ -5,8 +5,8 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { describeError } from './api';
-import type { LoadState } from './types';
+import { describeError, getErrorKind, isRetryableError } from './api';
+import type { ApiErrorKind, LoadState } from './types';
 
 interface UseResourceOptions {
   /** 轮询间隔（毫秒）；0 或省略表示只加载一次。 */
@@ -30,6 +30,12 @@ export interface ResourceResult<T> {
   refresh: () => void;
   /** 后台刷新进行中（用于顶栏的细微指示，不遮挡内容）。 */
   refreshing: boolean;
+  /** 最近一次错误的稳定分类，供页面选择权限/网络/冲突状态。 */
+  errorKind: ApiErrorKind | null;
+  /** HTTP 状态码；网络和超时错误为 0。 */
+  errorStatus: number | null;
+  /** 该错误是否适合显示「重试」。 */
+  retryable: boolean;
 }
 
 export function useResource<T>(
@@ -41,6 +47,9 @@ export function useResource<T>(
   const [data, setData] = useState<T | null>(null);
   const [state, setState] = useState<LoadState>(enabled ? 'loading' : 'idle');
   const [error, setError] = useState('');
+  const [errorKind, setErrorKind] = useState<ApiErrorKind | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
+  const [retryable, setRetryable] = useState(false);
   const [updatedAt, setUpdatedAt] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -56,7 +65,13 @@ export function useResource<T>(
   if (keyRef.current !== key) {
     keyRef.current = key;
     if (data !== null) setData(null);
-    if (enabled) setState('loading');
+    if (enabled) {
+      setState('loading');
+      setError('');
+      setErrorKind(null);
+      setErrorStatus(null);
+      setRetryable(false);
+    }
   }
 
   useEffect(() => {
@@ -75,12 +90,22 @@ export function useResource<T>(
         setData(next);
         setState('ready');
         setError('');
+        setErrorKind(null);
+        setErrorStatus(null);
+        setRetryable(false);
         setUpdatedAt(Date.now());
       } catch (err) {
         if (signal.aborted || !mountedRef.current) return;
         const message = describeError(err);
         if (!message) return; // AbortError
         setError(message);
+        setErrorKind(getErrorKind(err));
+        setErrorStatus(
+          typeof err === 'object' && err !== null && 'status' in err && typeof err.status === 'number'
+            ? err.status
+            : null,
+        );
+        setRetryable(isRetryableError(err));
         setState('error');
       } finally {
         if (mountedRef.current && !signal.aborted) setRefreshing(false);
@@ -92,6 +117,10 @@ export function useResource<T>(
   useEffect(() => {
     if (!enabled) {
       setState('idle');
+      setError('');
+      setErrorKind(null);
+      setErrorStatus(null);
+      setRetryable(false);
       return;
     }
 
@@ -119,5 +148,15 @@ export function useResource<T>(
 
   const refresh = useCallback(() => setNonce((n) => n + 1), []);
 
-  return { data, state, error, updatedAt, refresh, refreshing };
+  return {
+    data,
+    state,
+    error,
+    updatedAt,
+    refresh,
+    refreshing,
+    errorKind,
+    errorStatus,
+    retryable,
+  };
 }

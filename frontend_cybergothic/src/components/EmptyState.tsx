@@ -5,6 +5,7 @@
  */
 
 import type { ReactNode } from 'react';
+import type { ApiErrorKind } from '../data/types';
 
 type Kind = 'empty' | 'error' | 'loading' | 'denied';
 
@@ -16,6 +17,10 @@ interface EmptyStateProps {
   action?: ReactNode;
   /** 错误详情，如 request_id，等宽小字显示。 */
   detail?: string;
+  /** 错误的稳定分类，供样式和自动化验收识别。 */
+  errorKind?: ApiErrorKind | null;
+  /** HTTP 状态码；用于保留服务端语义而不解析文案。 */
+  errorStatus?: number | null;
   compact?: boolean;
 }
 
@@ -48,23 +53,44 @@ function LineArt({ kind }: { kind: Kind }) {
   );
 }
 
+function errorContext(kind: ApiErrorKind | null | undefined): string {
+  switch (kind) {
+    case 'unauthorized': return '认证已失效，需要重新登录。';
+    case 'forbidden': return '当前账号无权访问此资源。';
+    case 'not_found': return '当前后端未提供此接口。';
+    case 'conflict': return '资源状态已变化，请刷新后重试。';
+    case 'timeout': return '后端响应超时，可以稍后重试。';
+    case 'network': return '后端离线或网络不可达。';
+    case 'rate_limited': return '请求受到频率限制，请稍后重试。';
+    case 'server': return '后端暂时不可用，可以稍后重试。';
+    default: return '';
+  }
+}
+
 export function EmptyState({
   kind = 'empty',
   title,
   description,
   action,
   detail,
+  errorKind,
+  errorStatus,
   compact = false,
 }: EmptyStateProps) {
   return (
     <div
       className={`emptystate emptystate--${kind}${compact ? ' emptystate--compact' : ''}`}
       role={kind === 'error' ? 'alert' : 'status'}
+      {...(errorKind ? { 'data-error-kind': errorKind } : {})}
+      {...(typeof errorStatus === 'number' ? { 'data-error-status': String(errorStatus) } : {})}
     >
       <LineArt kind={kind} />
       <div className="emptystate__body">
         <p className="emptystate__title">{title}</p>
         {description ? <p className="emptystate__desc">{description}</p> : null}
+        {kind === 'error' && errorKind ? (
+          <p className="emptystate__kind">{errorContext(errorKind)}</p>
+        ) : null}
         {detail ? <p className="emptystate__detail">{detail}</p> : null}
         {action ? <div className="emptystate__action">{action}</div> : null}
       </div>

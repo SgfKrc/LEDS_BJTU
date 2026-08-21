@@ -8,11 +8,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Eraser, Loader2, Paperclip, SendHorizontal, Square, X } from 'lucide-react';
+import { Eraser, Loader2, Paperclip, RefreshCw, SendHorizontal, Square, Trash2, X } from 'lucide-react';
 import * as api from '../data/api';
 import { fixturesEnabled } from '../data/fixtures';
 import { conversationFixture } from '../data/fixtures';
-import type { ChatAttachment, ChatTurn } from '../data/types';
+import type { ApiErrorKind, ChatAttachment, ChatTurn } from '../data/types';
 import { CommandButton } from './CommandButton';
 import { EmptyState } from './EmptyState';
 import { pushToast } from './Toast';
@@ -60,6 +60,22 @@ let seq = 0;
 function nextId(prefix: string): string {
   seq += 1;
   return `${prefix}-${Date.now().toString(36)}-${seq}`;
+}
+
+function removeTurnPair(items: ChatTurn[], turnIndex: number): ChatTurn[] {
+  let currentTurn = 0;
+  let start = -1;
+  for (let index = 0; index < items.length; index += 1) {
+    if (items[index]?.role !== 'user') continue;
+    if (currentTurn === turnIndex) {
+      start = index;
+      break;
+    }
+    currentTurn += 1;
+  }
+  if (start < 0) return items;
+  const end = items[start + 1]?.role === 'assistant' ? start + 2 : start + 1;
+  return items.filter((_item, index) => index < start || index >= end);
 }
 
 /**
@@ -122,8 +138,14 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState('');
+  const [loadErrorKind, setLoadErrorKind] = useState<ApiErrorKind | null>(null);
+  const [loadErrorStatus, setLoadErrorStatus] = useState<number | null>(null);
   const [sending, setSending] = useState(false);
+  const [deletingTurn, setDeletingTurn] = useState<number | null>(null);
+  const [confirmDeleteTurn, setConfirmDeleteTurn] = useState<number | null>(null);
+  const [historyNonce, setHistoryNonce] = useState(0);
   const [showThinking, setShowThinking] = useState(false);
   const [openThinking, setOpenThinking] = useState<Record<string, boolean>>({});
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
@@ -143,6 +165,8 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
     let alive = true;
     setLoading(true);
     setLoadError('');
+    setLoadErrorKind(null);
+    setLoadErrorStatus(null);
 
     const load = async () => {
       try {
@@ -164,9 +188,20 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
       } catch (err) {
         if (!alive || controller.signal.aborted) return;
         const message = api.describeError(err);
-        if (message) setLoadError(message);
+        if (message) {
+          setLoadError(message);
+          setLoadErrorKind(api.getErrorKind(err));
+          setLoadErrorStatus(
+            typeof err === 'object' && err !== null && 'status' in err && typeof err.status === 'number'
+              ? err.status
+              : null,
+          );
+        }
       } finally {
-        if (alive) setLoading(false);
+        if (alive) {
+          setLoading(false);
+          setRefreshing(false);
+        }
       }
     };
 
@@ -175,7 +210,7 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
       alive = false;
       controller.abort();
     };
-  }, [sessionId, usingFixtures]);
+  }, [sessionId, usingFixtures, historyNonce]);
 
   // ---- 自动滚到底 ----
   useEffect(() => {
@@ -363,6 +398,41 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
     }
   }, [usingFixtures, sessionId]);
 
+  const refreshHistory = useCallback(() => {
+    if (sending || loading || refreshing) return;
+    setRefreshing(true);
+    setHistoryNonce((value) => value + 1);
+  }, [loading, refreshing, sending]);
+
+  const getTurnIndex = useCallback(
+    (messageIndex: number) =>
+      turns.slice(0, messageIndex + 1).filter((turn) => turn.role === 'assistant').length - 1,
+    [turns],
+  );
+
+  const deleteTurn = useCallback(
+    async (turnIndex: number) => {
+      if (sending || deletingTurn !== null) return;
+      setConfirmDeleteTurn(null);
+      setDeletingTurn(turnIndex);
+      try {
+        if (!usingFixtures) {
+          await api.deleteConversationTurn(sessionId, turnIndex);
+        }
+        setTurns((previous) => removeTurnPair(previous, turnIndex));
+        pushToast(
+          usingFixtures ? '演示会话已移除这一轮。' : '已删除这一轮会话历史。',
+          'ok',
+        );
+      } catch (err) {
+        pushToast(`删除失败：${api.describeError(err)}`, 'danger');
+      } finally {
+        setDeletingTurn(null);
+      }
+    },
+    [deletingTurn, sending, sessionId, usingFixtures],
+  );
+
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
       // Enter 发送，Shift+Enter 换行；输入法组合中的 Enter 不能拦。
@@ -414,6 +484,17 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
           >
             清空
           </CommandButton>
+          <CommandButton
+            variant="ghost"
+            size="sm"
+            icon={RefreshCw}
+            busy={refreshing}
+            onClick={refreshHistory}
+            disabled={sending || loading || refreshing}
+            ariaLabel="刷新会话历史"
+          >
+            刷新
+          </CommandButton>
         </div>
       </header>
 
@@ -428,6 +509,8 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
             title="会话历史加载失败"
             description="后端可能未启动，或当前节点不是主节点。"
             detail={loadError}
+            errorKind={loadErrorKind}
+            errorStatus={loadErrorStatus}
             compact
           />
         ) : null}
@@ -442,9 +525,12 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
         ) : null}
 
         <ol className="chat__turns">
-          {turns.map((turn) => {
+          {turns.map((turn, messageIndex) => {
             const metricsText = turn.role === 'assistant' ? formatMetrics(turn) : '';
             const thinkingOpen = openThinking[turn.id] === true;
+            const turnIndex = turn.role === 'assistant' ? getTurnIndex(messageIndex) : -1;
+            const canDelete = turn.role === 'assistant' && !turn.streaming && turnIndex >= 0;
+            const confirmingDelete = confirmDeleteTurn === turnIndex;
             return (
               <li key={turn.id} className={`msg msg--${turn.role}`}>
                 <div className="msg__gutter" aria-hidden="true">
@@ -491,6 +577,42 @@ export function ChatPane({ sessionId = 'default', onTurnComplete }: ChatPaneProp
 
                   {turn.error ? <p className="msg__error">{turn.error}</p> : null}
                   {metricsText ? <p className="msg__metrics mono-label">{metricsText}</p> : null}
+                  {canDelete ? (
+                    <div className="msg__actions">
+                      {confirmingDelete ? (
+                        <>
+                          <span className="msg__confirm-label">删除这一轮？</span>
+                          <button
+                            type="button"
+                            className="msg__action msg__action--danger"
+                            onClick={() => void deleteTurn(turnIndex)}
+                            disabled={deletingTurn !== null}
+                          >
+                            {deletingTurn === turnIndex ? '删除中…' : '确认'}
+                          </button>
+                          <button
+                            type="button"
+                            className="msg__action"
+                            onClick={() => setConfirmDeleteTurn(null)}
+                            disabled={deletingTurn !== null}
+                          >
+                            取消
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          className="msg__delete"
+                          onClick={() => setConfirmDeleteTurn(turnIndex)}
+                          disabled={deletingTurn !== null || sending}
+                          title="删除这一轮对话"
+                          aria-label="删除这一轮对话"
+                        >
+                          <Trash2 size={13} strokeWidth={2.1} aria-hidden="true" />
+                        </button>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
               </li>
             );

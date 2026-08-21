@@ -10,7 +10,7 @@
 import { test, expect } from '@playwright/test';
 
 const WIDTHS = [1440, 1024, 768, 390];
-const PAGES = ['workbench', 'overview', 'tasks', 'activity', 'settings', 'help'];
+const PAGES = ['workbench', 'overview', 'tasks', 'activity', 'image', 'models', 'cluster', 'account', 'audit', 'settings', 'help'];
 const SHOTS = '../build/cybergothic-shots';
 
 /** 允许的溢出容差（px）：阴影和 1px 边框的取整误差。 */

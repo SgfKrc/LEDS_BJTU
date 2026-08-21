@@ -7,11 +7,16 @@
 import { useEffect, useState } from 'react';
 import {
   Activity,
+  Boxes,
   CircleHelp,
   Columns2,
+  Image,
   LayoutDashboard,
   ListTree,
+  Network,
+  ShieldCheck,
   SlidersHorizontal,
+  ScrollText,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { ComponentType } from 'react';
@@ -21,8 +26,13 @@ import { TasksPage } from '../pages/TasksPage';
 import { ActivityPage } from '../pages/ActivityPage';
 import { SettingsPage } from '../pages/SettingsPage';
 import { HelpPage } from '../pages/HelpPage';
+import { ImageStudioPage } from '../pages/ImageStudioPage';
+import { ModelsPage } from '../pages/ModelsPage';
+import { ClusterAdminPage } from '../pages/ClusterAdminPage';
+import { AccountPage } from '../pages/AccountPage';
+import { AuditPage } from '../pages/AuditPage';
 
-export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'settings' | 'help';
+export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'image' | 'models' | 'cluster' | 'account' | 'audit' | 'settings' | 'help';
 
 export interface RouteDef {
   id: RouteId;
@@ -74,6 +84,46 @@ export const ROUTES: RouteDef[] = [
     icon: Activity,
     description: '运行事件时间线与错误详情。',
     component: ActivityPage,
+  },
+  {
+    id: 'image',
+    label: '生图',
+    tag: 'IMAGE STUDIO',
+    icon: Image,
+    description: 'Stable Diffusion 资产、生成任务与结果列表。',
+    component: ImageStudioPage,
+  },
+  {
+    id: 'models',
+    label: 'Models',
+    tag: 'MODEL LAB',
+    icon: Boxes,
+    description: 'Model runtime, local assets, and load controls.',
+    component: ModelsPage,
+  },
+  {
+    id: 'cluster',
+    label: 'Cluster',
+    tag: 'CLUSTER CONTROL',
+    icon: Network,
+    description: 'Node topology, health, access, and role-gated cluster operations.',
+    component: ClusterAdminPage,
+  },
+  {
+    id: 'account',
+    label: 'Account',
+    tag: 'IRON GATE',
+    icon: ShieldCheck,
+    description: 'Authentication, sessions, managed users, and Tailscale identity.',
+    component: AccountPage,
+  },
+  {
+    id: 'audit',
+    label: 'Audit',
+    tag: 'AUDIT LEDGER',
+    icon: ScrollText,
+    description: '日志归档、节点汇总与主节点转让审查。',
+    component: AuditPage,
   },
   {
     id: 'settings',

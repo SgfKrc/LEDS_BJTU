@@ -96,6 +96,8 @@
   --gothic-accent-soft: rgba(216, 180, 255, 0.14);
   --gothic-accent-line: rgba(216, 180, 255, 0.45);
   --gothic-gold: #d9c27a; /* 描边金，用于尖拱和首字下沉 */
+  --gothic-brass: #80672f; /* 背景远景层：低亮度古铜，不与正文争夺注意力 */
+  --gothic-gold-bright: #ecd184; /* 背景近景层：仅用于缓慢运动的机械高光 */
   --gothic-accent-ink: #17121f; /* 苍紫底上的文字 */
   --gothic-bg-deep: #050408; /* 硬阴影用的最深色 */
   --gothic-shadow: 8px 8px 0 #050408;

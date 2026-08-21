@@ -239,15 +239,22 @@ html[data-reduced-motion='true'] [data-reveal] {
   flex-shrink: 0;
 }
 
-/* 品牌标记：斜切方块 + 主色，替代圆形 logo */
+/* 品牌标记使用项目根目录 qlh.jpg，与浏览器 favicon 保持一致。 */
 .brand__mark {
   display: grid;
   place-items: center;
   width: 28px;
   height: 28px;
-  background: var(--accent);
-  color: var(--accent-ink);
+  overflow: hidden;
+  background: var(--surface-sunken);
   clip-path: polygon(0 0, 100% 0, 100% 72%, 72% 100%, 0 100%);
+}
+
+.brand__mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .brand__text {
@@ -1767,6 +1774,12 @@ code {
   max-width: 62ch;
   color: var(--muted);
   font-size: 13.5px;
+}
+
+.emptystate__kind {
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 700;
 }
 
 .emptystate__detail {

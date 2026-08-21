@@ -1,0 +1,440 @@
+/* P1.3 device and RAG controls are kept in a bounded settings workspace. */
+
+.settings-workspace {
+  display: grid;
+  grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
+  gap: var(--gap-md);
+  margin-bottom: var(--gap-lg);
+  padding: var(--gap-md);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+}
+
+.settings-workspace__nav {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: var(--gap-md);
+  border-right: 1px solid var(--line);
+}
+
+.settings-workspace__nav > .mono-label {
+  margin: 2px 8px 8px;
+}
+
+.settings-workspace__nav button,
+.settings-workspace__nav a {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.settings-workspace__nav button:hover,
+.settings-workspace__nav button.is-active,
+.settings-workspace__nav a:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.settings-workspace__nav button > span,
+.settings-workspace__nav a > span {
+  min-width: 0;
+  flex: 1;
+}
+
+.settings-workspace__nav svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.settings-workspace__main {
+  min-width: 0;
+}
+
+/* The page-level settings shell owns navigation in embedded mode. */
+.settings-workspace--embedded {
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.settings-tool {
+  min-width: 0;
+}
+
+.settings-tool__head .sectionhead {
+  margin-bottom: var(--gap-md);
+}
+
+.device-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(210px, 0.8fr);
+  gap: var(--gap-md);
+  padding: var(--gap-md);
+  border: 1px solid var(--line-strong);
+  background: var(--surface-sunken);
+}
+
+.device-summary__tier,
+.device-summary__gpu {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.device-summary__tier strong {
+  font-size: 1.2rem;
+}
+
+.device-summary__gpu {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: center;
+  column-gap: 8px;
+  color: var(--accent);
+}
+
+.device-summary__gpu span {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-summary__gpu small {
+  grid-column: 2;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.device-score-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gap-sm);
+  margin-top: var(--gap-md);
+}
+
+.device-score {
+  padding: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface-sunken);
+}
+
+.device-score > div:first-child {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.device-score strong {
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+.device-score__track {
+  height: 5px;
+  margin-top: 8px;
+  overflow: hidden;
+  background: var(--surface-raised);
+}
+
+.device-score__track span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.device-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gap-sm);
+  margin-top: var(--gap-md);
+}
+
+.device-metrics > div {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-faint);
+  color: var(--accent);
+}
+
+.device-metrics > div > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.device-metrics strong,
+.device-metrics small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-metrics strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.device-metrics small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.gpu-picker {
+  margin-top: var(--gap-md);
+}
+
+.gpu-picker > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap-sm);
+  margin-top: 6px;
+}
+
+.gpu-picker button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-sunken);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.gpu-picker button:hover,
+.gpu-picker button.is-active {
+  border-color: var(--accent);
+}
+
+.gpu-picker button > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.gpu-picker button > small {
+  grid-column: 1;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.gpu-picker button > svg {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: var(--accent);
+}
+
+.settings-tool__actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--gap-md);
+}
+
+.settings-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: var(--gap-md);
+  padding: 9px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-notice svg {
+  flex: 0 0 auto;
+}
+
+.settings-notice--warn {
+  border-color: color-mix(in srgb, var(--warn) 50%, var(--line));
+  color: var(--warn);
+}
+
+.settings-notice--error {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--line));
+  color: var(--danger);
+}
+
+.rag-health-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1px;
+  border: 1px solid var(--line);
+  background: var(--line);
+}
+
+.rag-health-strip span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px;
+  background: var(--surface-sunken);
+}
+
+.rag-health-strip strong {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rag-health-strip small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.rag-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--gap-sm);
+  margin-top: var(--gap-md);
+}
+
+.rag-search {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding-left: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-sunken);
+  color: var(--muted);
+}
+
+.rag-search input {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.rag-search button {
+  align-self: stretch;
+  padding: 0 12px;
+  border: 0;
+  border-left: 1px solid var(--line-strong);
+  background: var(--accent);
+  color: var(--bg-deep);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.rag-search button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.rag-results {
+  max-height: 260px;
+  margin-top: var(--gap-md);
+  overflow-y: auto;
+}
+
+.rag-results > article {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+
+.rag-results > article > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+}
+
+.rag-results strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.rag-results span {
+  color: var(--muted-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.rag-results p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+@media (max-width: 900px) {
+  .settings-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-workspace__nav {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    padding-right: 0;
+    padding-bottom: var(--gap-sm);
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .settings-workspace__nav > .mono-label {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 620px) {
+  .device-summary,
+  .device-score-grid,
+  .device-metrics,
+  .gpu-picker > div,
+  .rag-health-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-workspace__nav {
+    display: flex;
+  }
+
+  .rag-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

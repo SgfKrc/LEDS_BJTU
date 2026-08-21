@@ -1162,9 +1162,14 @@ def make_full_host(fake_model_cls=FakeModel):
 # 14.5 1.2d task_graph 执行段（复制自 api_server._execute_task_graph_chat
 #      + _execute_task_graph_chat_with_slot + 5 个辅助函数）
 # ----------------------------------------------------------------------
-def test_task_graph_gate_off():
+def test_task_graph_gate_off(monkeypatch):
     """TASK_GRAPH_ENABLED 默认关闭 → chat_full(task_graph) 409 门控
-    （对齐 api_server 语义；不加载模型、不创建 journal）。"""
+    （对齐 api_server 语义；不加载模型、不创建 journal）。
+    显式强制关闭：node_config 的 feature-gates 持久化会把
+    QLH_TASK_GRAPH_ENABLED 注入环境，测试须自包含不受用户配置影响。"""
+    import config as _cfg
+
+    monkeypatch.setattr(_cfg, "TASK_GRAPH_ENABLED", False)
     # 真实 EngineHost（FakeEngineHost 覆盖了基类 chat_full，分支不会触发）
     host = EngineHost()
     req = ChatRequest(message="hi", execution_mode="task_graph")

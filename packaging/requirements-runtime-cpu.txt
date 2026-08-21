@@ -1,0 +1,26 @@
+# ============================================================
+# QLH 外部运行时依赖（CPU 版）— 安装包不携带，由启动器每次启动检查并 pip 引导
+# ============================================================
+# 瘦身包只含 轻量引导器 + src + 前端 + 清单；PyTorch 系在此清单内，由
+# qlh_launcher 收到缺失时自动安装：
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   python -m pip install -r requirements-runtime-cpu.txt   # 其余走默认 PyPI
+# 注意：torch 不在本文件内（CPU 必须从 PyTorch CPU index 单独安装；若放进 -r
+# 再对整条命令加 --index-url 会让 transformers 等因 PyTorch 索引缺失而装不上）。
+# 升级运行时只 pip upgrade，不重装安装包。
+
+transformers>=4.47.0,<4.48.0
+accelerate>=1.0.0
+transformers-stream-generator>=0.0.4
+einops>=0.6.0
+tiktoken>=0.5.0
+bitsandbytes>=0.45.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.12
+httpx>=0.28.1,<0.29.0
+pandas>=2.0.0
+tqdm>=4.65.0
+psutil>=5.9.0
+python-dotenv>=1.0.0
+llama-cpp-python>=0.3.0
