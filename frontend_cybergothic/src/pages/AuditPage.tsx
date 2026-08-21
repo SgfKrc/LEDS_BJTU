@@ -33,7 +33,7 @@ import {
   useNodesLogSummary,
   useReviewTickets,
 } from '../data/hooks';
-import type { LogFileContentResponse, LogFileRecord, NodeLogSummary, ReviewTicket } from '../data/types';
+import type { LogEntry, LogFileContentResponse, LogFileRecord, NodeLogSummary, ReviewTicket } from '../data/types';
 import { ArchiveClockCanvas } from '../visual/ArchiveClockCanvas';
 
 type WorkspaceId = 'archive' | 'nodes' | 'review';
@@ -81,6 +81,29 @@ function sourceSummaries(summary: NodeLogSummary | undefined): Array<[string, nu
   return Object.entries(summary?.levels ?? {}).sort(([, a], [, b]) => b - a);
 }
 
+type RelayLog = LogEntry & {
+  source: string;
+  _sortKey: string;
+};
+
+function normalizeRelayLog(entry: unknown, source: string, index: number): RelayLog {
+  const raw = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {};
+  const timestamp = String(raw.timestamp ?? raw.time ?? raw.created_at ?? '');
+  const sequence = Number(raw.seq);
+  return {
+    name: String(raw.name ?? 'unknown'),
+    timestamp,
+    level: String(raw.level ?? 'INFO'),
+    levelno: Number(raw.levelno ?? 0),
+    message: String(raw.message ?? raw.msg ?? ''),
+    seq: Number.isFinite(sequence) ? sequence : index,
+    ...(raw.request_id != null ? { request_id: String(raw.request_id) } : {}),
+    ...(raw.node_id != null ? { node_id: String(raw.node_id) } : {}),
+    source,
+    _sortKey: `${timestamp}-${String(Number.isFinite(sequence) ? sequence : index)}`,
+  };
+}
+
 export function AuditPage() {
   const role = useMyRole();
   const canManageCluster = role.state === 'ready' && role.data?.is_master === true;
@@ -107,9 +130,9 @@ export function AuditPage() {
   );
   const aggregateEntries = useMemo(
     () => [
-      ...(aggregate.data?.local.logs ?? []).map((entry) => ({ ...entry, source: aggregate.data?.local.node_id || 'local' })),
-      ...(aggregate.data?.workers ?? []).flatMap((worker) => (worker.logs ?? []).map((entry) => ({ ...entry, source: worker.node_id }))),
-    ].sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, 10),
+      ...(aggregate.data?.local?.logs ?? []).map((entry, index) => normalizeRelayLog(entry, aggregate.data?.local?.node_id || 'local', index)),
+      ...(aggregate.data?.workers ?? []).flatMap((worker) => (worker?.logs ?? []).map((entry, index) => normalizeRelayLog(entry, worker?.node_id || 'unknown', index))),
+    ].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '') || b._sortKey.localeCompare(a._sortKey)).slice(0, 10),
     [aggregate.data],
   );
   const pendingTickets = ticketList.filter((ticket) => ticket.status === 'pending');

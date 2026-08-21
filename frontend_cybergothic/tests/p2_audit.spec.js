@@ -55,3 +55,37 @@ test('audit node relay stays gated on a client role', async ({ page }) => {
   await expect(page.locator('.audit-readonly-callout')).toContainText('master-only');
   expect(aggregateRequests).toBe(0);
 });
+
+test('audit node relay tolerates aggregate entries without timestamps', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (error) => pageErrors.push(error));
+  await page.route('**/api/**', async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    let payload = { status: 'ok' };
+    if (pathname.endsWith('/cluster/my-role')) {
+      payload = { node_role: 'master', node_id: 'master', is_master: true, is_client: false, max_nodes: 3, run_mode: 'distributed' };
+    } else if (pathname.endsWith('/cluster/nodes/log-aggregate')) {
+      payload = {
+        local: { node_id: 'master', logs: [{ seq: 1, level: 'ERROR', message: 'missing timestamp' }] },
+        workers: [{ node_id: 'client-01', logs: [{ seq: 2, level: 'INFO', message: 'legacy relay record' }] }],
+        limit: 50,
+        total_workers: 1,
+      };
+    } else if (pathname.endsWith('/logs/nodes-summary')) {
+      payload = { local: { node_id: 'master', levels: {} }, workers: [], total_workers: 0 };
+    } else if (pathname.endsWith('/logs') || pathname.endsWith('/logs/stats')) {
+      payload = { files: [], files_count: 0, files_total_bytes: 0, buffer_size: 0, buffer_capacity: 100, buffer_total_seen: 0, buffer_dropped_estimate: 0, levels: {}, loggers: {}, nodes: {} };
+    } else if (pathname.endsWith('/cluster/review/tickets')) {
+      payload = { tickets: [], count: 0 };
+    } else if (pathname.endsWith('/cluster/review/can-vote')) {
+      payload = { node_id: 'master', can_vote: true, reason: '' };
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(payload) });
+  });
+
+  await page.goto('/#/audit');
+  await page.locator('.audit-nav button', { hasText: 'Node relay' }).click();
+  await expect(page.locator('.audit-relay-feed')).toContainText('missing timestamp');
+  await expect(page.locator('.audit-relay-feed')).toContainText('legacy relay record');
+  expect(pageErrors).toEqual([]);
+});

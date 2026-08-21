@@ -201,6 +201,24 @@
   padding-bottom: var(--gap-md);
 }
 
+.activity-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-md);
+  margin-top: var(--gap-md);
+  padding-top: var(--gap-md);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.activity-pagination > div {
+  display: inline-flex;
+  gap: var(--gap-xs);
+}
+
 .activity-details {
   min-height: 0;
 }
@@ -304,5 +322,10 @@
 
   .activity-feed {
     min-height: 460px;
+  }
+
+  .activity-pagination {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

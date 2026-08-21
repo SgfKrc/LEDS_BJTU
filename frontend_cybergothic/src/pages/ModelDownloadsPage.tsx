@@ -23,6 +23,7 @@ import { PageHeader, SectionHead } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
 import { pushToast } from '../components/Toast';
 import { useRegisterRefresh } from '../app/refreshBus';
+import { useReveal } from '../motion/useReveal';
 import {
   fixturesEnabled,
   modelDownloadsFixture,
@@ -39,6 +40,7 @@ import type {
   ModelSearchResponse,
   ModelSearchResult,
 } from '../data/types';
+import { PageBackdrop } from '../visual/PageBackdrop';
 
 type SearchSource = 'hf' | 'ms' | 'all';
 
@@ -109,6 +111,8 @@ export function ModelDownloadsPage() {
   const presetList: ModelPreset[] = presets.data?.presets ?? [];
   const jobList = usingFixtures ? fixtureJobs : (jobs.data?.jobs ?? []);
   const searchResults = searchData?.results ?? [];
+
+  useReveal([presetList.length, jobList.length, searchResults.length]);
 
   const handleSearch = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -227,6 +231,7 @@ export function ModelDownloadsPage() {
 
   return (
     <div className="page downloads-page">
+      <PageBackdrop scene="models" className="downloads-page__bg" />
       <PageHeader
         tag="MODEL DOWNLOADS"
         title="模型下载"
@@ -234,7 +239,7 @@ export function ModelDownloadsPage() {
         actions={<CommandButton variant="ghost" icon={RefreshCw} busy={presets.refreshing || jobs.refreshing} onClick={refresh}>刷新</CommandButton>}
       />
 
-      <section className="downloads-search" aria-labelledby="model-search-title">
+      <section className="downloads-panel downloads-search" aria-labelledby="model-search-title" data-reveal>
         <SectionHead title="搜索模型仓库" hint="HF 直连失败会自动尝试代理，再以 ModelScope 兜底；结果只展示公开元数据。" id="model-search-title" />
         <form className="downloads-search__form" onSubmit={handleSearch}>
           <label className="field downloads-search__query">
@@ -273,6 +278,7 @@ export function ModelDownloadsPage() {
         ) : searchData && !searching ? <EmptyState compact title="没有匹配结果" description="换一个关键词或切换搜索源。" /> : null}
       </section>
 
+      <section className="downloads-panel downloads-section" data-reveal>
       <SectionHead title="预设列表" hint="点击下载即开始后台任务，进度可在下方追踪。" />
       {presets.state === 'loading' && <SkeletonRows rows={3} />}
       {presets.error && <EmptyState kind="error" title="无法加载预设" description={presets.error} errorKind={presets.errorKind ?? undefined} errorStatus={presets.errorStatus} action={<CommandButton variant="ghost" onClick={presets.refresh}>重试</CommandButton>} />}
@@ -290,7 +296,9 @@ export function ModelDownloadsPage() {
           </tr>;
         })}</tbody>
       </table></div></div> : null}
+      </section>
 
+      <section className="downloads-panel downloads-section" data-reveal>
       <SectionHead title="下载任务" hint="queued → downloading → verifying → registering → ready" />
       {jobs.state === 'loading' && <SkeletonRows rows={2} />}
       {jobs.error && <EmptyState kind="error" title="无法加载下载任务" description={jobs.error} errorKind={jobs.errorKind ?? undefined} errorStatus={jobs.errorStatus} action={<CommandButton variant="ghost" onClick={jobs.refresh}>重试</CommandButton>} />}
@@ -308,6 +316,7 @@ export function ModelDownloadsPage() {
           </tr>;
         })}</tbody>
       </table></div></div> : null}
+      </section>
     </div>
   );
 }

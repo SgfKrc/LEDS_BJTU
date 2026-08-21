@@ -25,8 +25,7 @@ const LEVELS = [
 ] as const;
 
 type LevelId = (typeof LEVELS)[number]['id'];
-const VIRTUAL_THRESHOLD = 100;
-const VISIBLE_STEP = 60;
+const PAGE_SIZE = 24;
 
 function LogDetail({ log }: { log: LogEntry }) {
   return (
@@ -58,7 +57,7 @@ function SessionDetail({ session }: { session: SessionSummary }) {
 
 export function ActivityPage() {
   const [level, setLevel] = useState<LevelId>('');
-  const [visible, setVisible] = useState(VISIBLE_STEP);
+  const [page, setPage] = useState(1);
   const [activeLog, setActiveLog] = useState<LogEntry | null>(null);
   const [activeSession, setActiveSession] = useState<SessionSummary | null>(null);
   const [compactDetails, setCompactDetails] = useState(false);
@@ -82,9 +81,13 @@ export function ActivityPage() {
   useReveal([logs.data, sessions.data]);
 
   const entries = logs.data?.logs ?? [];
-  const windowed = useMemo(() => entries.length > VIRTUAL_THRESHOLD ? entries.slice(0, visible) : entries, [entries, visible]);
+  const pageCount = Math.max(1, Math.ceil(entries.length / PAGE_SIZE));
+  const pageEntries = useMemo(() => entries.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [entries, page]);
+  useEffect(() => {
+    if (page > pageCount) setPage(pageCount);
+  }, [page, pageCount]);
   const items: TimelineItem[] = useMemo(
-    () => windowed.map((entry) => ({
+    () => pageEntries.map((entry) => ({
       id: `${entry.seq}`,
       time: entry.timestamp,
       title: entry.message,
@@ -93,13 +96,13 @@ export function ActivityPage() {
       badge: entry.level,
       ...(entry.node_id ? { source: entry.node_id } : {}),
     })),
-    [windowed],
+    [pageEntries],
   );
 
   const sessionList = sessions.data?.sessions ?? [];
   const selectLevel = useCallback((id: LevelId) => {
     setLevel(id);
-    setVisible(VISIBLE_STEP);
+    setPage(1);
   }, []);
   const selectLog = useCallback((id: string) => {
     const found = entries.find((entry) => `${entry.seq}` === id) ?? null;
@@ -156,7 +159,7 @@ export function ActivityPage() {
           <section className="activity-panel activity-feed" id="activity-feed" aria-labelledby="activity-feed-title">
             <SectionHead title="运行日志" id="activity-feed-title" hint={logs.data ? `缓冲区 ${logs.data.count} / ${logs.data.buffer_capacity} 条，匹配 ${logs.data.matched} 条` : '最近的后端日志'} />
             <div className="activity-feed__scroll">
-              {logsDenied ? <EmptyState kind="denied" title="需要日志访问令牌" description="后端要求 X-QLH-Log-Token 才能读取日志缓冲区。" detail={logs.error} errorKind={logs.errorKind} errorStatus={logs.errorStatus} action={<CommandButton variant="ghost" size="sm" icon={KeyRound} href={routeHref('settings')}>前往设置</CommandButton>} /> : logs.state === 'error' ? <EmptyState kind="error" title="日志加载失败" description="请确认后端正在运行。" detail={logs.error} errorKind={logs.errorKind} errorStatus={logs.errorStatus} action={<CommandButton variant="ghost" size="sm" onClick={logs.refresh}>重试</CommandButton>} /> : logs.state === 'loading' && entries.length === 0 ? <SkeletonRows rows={6} columns={2} /> : entries.length === 0 ? <EmptyState kind="empty" title={level ? '该级别下暂无日志' : '日志缓冲区为空'} description="产生新的后端事件后会出现在这里。" /> : <><ActivityTimeline items={items} state={logs.state} errorKind={logs.errorKind} errorStatus={logs.errorStatus} live onSelect={selectLog} />{entries.length > windowed.length ? <div className="loadmore"><CommandButton variant="ghost" size="sm" onClick={() => setVisible((current) => current + VISIBLE_STEP)}>加载更多（剩余 {entries.length - windowed.length} 条）</CommandButton></div> : null}</>}
+              {logsDenied ? <EmptyState kind="denied" title="需要日志访问令牌" description="后端要求 X-QLH-Log-Token 才能读取日志缓冲区。" detail={logs.error} errorKind={logs.errorKind} errorStatus={logs.errorStatus} action={<CommandButton variant="ghost" size="sm" icon={KeyRound} href={routeHref('settings')}>前往设置</CommandButton>} /> : logs.state === 'error' ? <EmptyState kind="error" title="日志加载失败" description="请确认后端正在运行。" detail={logs.error} errorKind={logs.errorKind} errorStatus={logs.errorStatus} action={<CommandButton variant="ghost" size="sm" onClick={logs.refresh}>重试</CommandButton>} /> : logs.state === 'loading' && entries.length === 0 ? <SkeletonRows rows={6} columns={2} /> : entries.length === 0 ? <EmptyState kind="empty" title={level ? '该级别下暂无日志' : '日志缓冲区为空'} description="产生新的后端事件后会出现在这里。" /> : <><ActivityTimeline items={items} state={logs.state} errorKind={logs.errorKind} errorStatus={logs.errorStatus} live onSelect={selectLog} />{pageCount > 1 ? <nav className="activity-pagination" aria-label="日志分页"><span>第 {page} / {pageCount} 页 · 共 {entries.length} 条</span><div><CommandButton variant="ghost" size="sm" disabled={page <= 1} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</CommandButton><CommandButton variant="ghost" size="sm" disabled={page >= pageCount} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>下一页</CommandButton></div></nav> : null}</>}
             </div>
           </section>
         </main>
