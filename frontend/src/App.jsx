@@ -597,7 +597,7 @@ export default function App({ authSession, onLogout }) {
                   title="账户与安全"
                   aria-label="打开账户与安全"
                 >
-                  <Bot size={20} aria-hidden="true" />
+                  <img src="/qlh.jpg" alt="" width="34" height="34" />
                 </button>
                 <div>
                   <span className="workspace-kicker">QLH / EDGE</span>
