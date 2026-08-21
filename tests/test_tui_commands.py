@@ -67,6 +67,21 @@ class FakeApi:
                  "estimated_seconds": 2.0},
             ], "current_quant": "int4",
                "current_speed_tok_s": 29, "max_new_tokens": 512}
+        if path == "/models/presets":
+            return {"presets": [
+                {"id": "qwen-1_8b-gguf-q4", "display": "Qwen Q4",
+                 "kind": "gguf", "hf_repo": "Qwen/example",
+                 "resource_gate": {"min_ram_gb": 4, "min_vram_gb": 0,
+                                    "min_disk_gb": 2}, "installable": True,
+                 "blocked_reasons": {}},
+                {"id": "qw3-vl-4b", "display": "QW3 VL",
+                 "kind": "safetensors", "resource_gate": {"min_ram_gb": 10,
+                 "min_vram_gb": 8, "min_disk_gb": 10}, "installable": False,
+                 "blocked_reasons": {"gpu": "cuda_required"}},
+            ]}
+        if path == "/models/downloads":
+            return {"jobs": [{"job_id": "job-1", "status": "downloading",
+                               "progress": 0.42, "preset_id": "qwen-1_8b-gguf-q4"}]}
         if path == "/cluster/nodes":
             return {"count": 1, "online_count": 1,
                     "nodes": [{"node_id": "n1"}]}
@@ -84,6 +99,8 @@ class FakeApi:
             return {"selected_gpu_index": 1, "selected_gpu": {"name": "Tesla T4"}}
         if path == "/system/shutdown":
             return {"ok": True}
+        if path == "/models/downloads":
+            return {"status": "queued", "job": {"job_id": "job-1", "status": "queued"}}
         if path == "/chat/generations/g-1/cancel":
             raise t.ApiError("HTTP 404: not found")
         return {"status": "ok", "message": ""}
@@ -357,6 +374,45 @@ class TestModelInfoCommands:
         out = "\n".join(app.out)
         assert "自我介绍" in out and "预估" in out
 
+    def test_model_presets(self, app):
+        msg, style = app.exec_command("/model presets")
+        assert style == "ok"
+        assert "共 2 个模型预设" in msg
+        out = "\n".join(app.out)
+        assert "qwen-1_8b-gguf-q4" in out
+        assert "cuda_required" in out
+        assert ("GET", "/models/presets") in app.api.calls
+
+    def test_model_install_creates_download_job(self, app):
+        msg, style = app.exec_command(
+            "/model install qwen-1_8b-gguf-q4 --proxy http://127.0.0.1:7897"
+        )
+        assert style == "ok"
+        assert "job-1" in msg and "queued" in msg
+        call = next(call for call in app.api.calls
+                    if call[0] == "POST" and call[1] == "/models/downloads")
+        assert call[2] == {
+            "preset_id": "qwen-1_8b-gguf-q4",
+            "proxy": "http://127.0.0.1:7897",
+        }
+
+    def test_model_download_jobs(self, app):
+        msg, style = app.exec_command("/model jobs --limit 10")
+        assert style == "ok"
+        assert "共 1 个模型下载任务" in msg
+        out = "\n".join(app.out)
+        assert "job-1" in out and "42%" in out
+
+    def test_model_install_validation(self, app):
+        msg, style = app.exec_command("/model install")
+        assert style == "warn"
+        assert "preset_id" in msg
+
+    def test_model_unknown_subcommand(self, app):
+        msg, style = app.exec_command("/model search qwen")
+        assert style == "err"
+        assert "install|jobs|presets" in msg
+
 
 class TestDeviceAndNodesCommands:
     """/device（auto/profile/非法）、/nodes"""
@@ -563,6 +619,25 @@ class TestSingleCommandMode:
         # 无命令 / 空串
         assert t._is_single_command([], None) is False
         assert t._is_single_command([""], "") is False
+
+    def test_main_single_command_preserves_model_subcommand_and_options(self, monkeypatch):
+        captured = {}
+
+        def _fake_run(api, interval, command):
+            captured["command"] = command
+            captured["interval"] = interval
+            return 0
+
+        monkeypatch.setattr(t, "run_single_command", _fake_run)
+        rc = t.main([
+            "model", "install", "qwen-1_8b-gguf-q4",
+            "--proxy", "http://127.0.0.1:7897", "--interval", "7",
+        ])
+        assert rc == 0
+        assert captured["command"] == (
+            "model install qwen-1_8b-gguf-q4 --proxy http://127.0.0.1:7897"
+        )
+        assert captured["interval"] == 7.0
 
 
 class TestLauncherScriptSync:
