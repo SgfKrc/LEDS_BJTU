@@ -2,8 +2,10 @@
 
 > 状态：现行（随两端开发持续更新）
 >
-> 更新日期：2026-08-16
+> 更新日期：2026-08-22
 > 适用范围：Android Full/Lite 相对 PC 版（Windows/Linux 主节点）缺失功能的**全面排查清单**，供排期与任务分配使用；能力现状依据 [Android 版本远期计划](Android版本远期计划.md)（2026-07-28 基线 + C5 真机验收）、README 与源码
+
+> 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、远程 SD、主节点 GGUF Range/SHA 下载、bootstrap 和节点注册；但当前用 register 代替独立 heartbeat，Android Full Worker 尚未进入 PC scheduler 正式准入，任务图 Stage executor 尚未接通。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。
 >
 > 结论一句话：**安卓版当前 = 聊天客户端（远程转发）+ Full 本地单模型 GGUF 推理；PC 版的多模态、任务链、实验判题、模型管理、运维工具在安卓上全部缺失**
 
