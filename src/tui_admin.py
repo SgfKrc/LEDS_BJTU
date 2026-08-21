@@ -1639,7 +1639,114 @@ def cmd_refresh(app, args, opts):
     return ("当前不在任何屏幕中", "warn")
 
 
+def _model_preset_lines(presets: list) -> list:
+    """Render the install catalog without exposing local paths or secrets."""
+    lines = []
+    for preset in presets:
+        preset_id = str(preset.get("id") or "—")
+        display = str(preset.get("display") or preset_id)
+        kind = str(preset.get("kind") or "—")
+        installable = bool(preset.get("installable", True))
+        state = "可安装" if installable else "不可安装"
+        lines.append("  %-28s %-10s %s [%s]" % (
+            preset_id, kind, display, state,
+        ))
+        sources = []
+        if preset.get("hf_repo"):
+            sources.append("HF=" + str(preset["hf_repo"]))
+        if preset.get("ms_path"):
+            sources.append("MS=" + str(preset["ms_path"]))
+        if sources:
+            lines.append("      源: %s" % " / ".join(sources))
+        gate = preset.get("resource_gate") or {}
+        if gate:
+            lines.append("      资源门: RAM >= %sGB, VRAM >= %sGB, 磁盘 >= %sGB" % (
+                gate.get("min_ram_gb", 0), gate.get("min_vram_gb", 0),
+                gate.get("min_disk_gb", 0),
+            ))
+        blocked = preset.get("blocked_reasons") or {}
+        if blocked:
+            lines.append("      阻塞: %s" % ", ".join(
+                "%s=%s" % (key, value) for key, value in blocked.items()
+            ))
+    return lines
+
+
+def _cmd_model_presets(app):
+    try:
+        data = app.api.get("/models/presets") or {}
+    except ApiError as e:
+        return (str(e), "err")
+    presets = data.get("presets") or []
+    lines = ["可安装模型预设:"]
+    lines.extend(_model_preset_lines(presets))
+    if not presets:
+        lines.append("  （无可用预设）")
+    app.show_output(lines, title="◆ 模型安装预设")
+    return ("共 %d 个模型预设" % len(presets), "ok")
+
+
+def _cmd_model_install(app, args, opts):
+    if len(args) < 2:
+        return ("用法: /model install <preset_id> [--modelscope] [--proxy URL]", "warn")
+    preset_id = args[1]
+    body = {"preset_id": preset_id}
+    if opts.get("modelscope") or opts.get("ms"):
+        body["use_modelscope"] = True
+    if opts.get("proxy"):
+        body["proxy"] = str(opts["proxy"])
+    try:
+        response = app.api.post("/models/downloads", body)
+    except ApiError as e:
+        return ("创建模型下载任务失败: %s" % e, "err")
+    job = response.get("job") or {}
+    job_id = job.get("job_id") or response.get("job_id") or "—"
+    status = job.get("status") or response.get("status") or "queued"
+    return ("已创建模型下载任务: %s (%s)" % (job_id, status), "ok")
+
+
+def _cmd_model_jobs(app, opts):
+    raw_limit = opts.get("limit", 20)
+    try:
+        limit = max(1, min(int(raw_limit), 100))
+    except (TypeError, ValueError):
+        return ("--limit 必须是 1-100 的整数", "warn")
+    try:
+        data = app.api.get("/models/downloads", params={"limit": limit}) or {}
+    except ApiError as e:
+        return (str(e), "err")
+    jobs = data.get("jobs") or []
+    lines = ["模型下载任务:"]
+    for job in jobs:
+        progress = max(0.0, min(float(job.get("progress") or 0.0), 1.0))
+        label = str(job.get("preset_id") or job.get("model_id") or "—")
+        status = str(job.get("status") or "—")
+        lines.append("  %-36s %-12s %3.0f%%  %s" % (
+            str(job.get("job_id") or "—"), status, progress * 100, label,
+        ))
+        error = job.get("error") or job.get("error_code")
+        if error:
+            lines.append("      错误: %s" % error)
+    if not jobs:
+        lines.append("  （暂无下载任务）")
+    app.show_output(lines, title="◆ 模型下载任务")
+    return ("共 %d 个模型下载任务" % len(jobs), "ok")
+
+
 def cmd_model(app, args, opts):
+    if args:
+        subcommand = str(args[0]).lower()
+        if subcommand == "presets":
+            if len(args) > 1:
+                return ("用法: /model presets", "warn")
+            return _cmd_model_presets(app)
+        if subcommand == "jobs":
+            if len(args) > 1:
+                return ("用法: /model jobs [--limit N]", "warn")
+            return _cmd_model_jobs(app, opts)
+        if subcommand == "install":
+            return _cmd_model_install(app, args, opts)
+        return ("未知模型子命令: %s（可用 install|jobs|presets）" % args[0], "err")
     cur = app.api.get("/models/current")
     if not cur.get("loaded"):
         return ("模型未加载。可用: /models 查看列表，/load <模型ID> 加载", "warn")
@@ -2076,8 +2183,9 @@ COMMANDS = [
      "summary": "跳转管理屏幕（1-7 或 名称关键字）", "handler": cmd_screen, "min_args": 1},
     {"name": "/refresh", "aliases": ["/r"], "usage": "/refresh",
      "summary": "立即刷新当前屏幕", "handler": cmd_refresh},
-    {"name": "/model", "aliases": [], "usage": "/model",
-     "summary": "当前模型详情", "handler": cmd_model},
+    {"name": "/model", "aliases": [],
+     "usage": "/model [install|jobs|presets] ...", "max_args": 2,
+     "summary": "当前模型详情 / 安装预设 / 查看下载任务", "handler": cmd_model},
     {"name": "/models", "aliases": [], "usage": "/models",
      "summary": "列出可用模型 / 量化 / 引擎", "handler": cmd_models},
     {"name": "/switch", "aliases": [], "usage": "/switch <模型ID> [--quant 精度] [--engine 引擎] [--compile]",
@@ -2709,7 +2817,10 @@ def _is_single_command(argv: list, command) -> bool:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # ``command`` 是首个位置参数；其后的 token 属于 TUI 命令本身，不能
+    # 交给 argparse 判为未知参数，以支持 ``bjtu model install <preset>``。
+    args, command_tail = parser.parse_known_args(argv)
     api = ApiClient(host=args.host, port=args.port,
                     timeout=max(1.0, args.timeout), log_token=args.log_token)
     interval = max(1.0, args.interval)
@@ -2717,7 +2828,12 @@ def main(argv=None) -> int:
     # 单命令模式：直接执行一条命令后退出（不启动后端、不进入交互界面）
     argv_list = list(sys.argv[1:] if argv is None else argv)
     if _is_single_command(argv_list, args.command):
-        return run_single_command(api, interval, args.command)
+        command = " ".join([
+            str(args.command or ""), *(str(item) for item in command_tail),
+        ]).strip()
+        return run_single_command(api, interval, command)
+    if command_tail:
+        parser.error("unrecognized arguments: %s" % " ".join(command_tail))
 
     if not args.plain:
         term = AnsiTerm(color=not args.no_color)

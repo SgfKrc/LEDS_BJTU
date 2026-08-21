@@ -55,6 +55,14 @@
   font-size: 1.18rem;
 }
 
+.cluster-profile-list { display: grid; gap: .45rem; margin: .65rem 0; padding: 0; list-style: none; }
+.cluster-profile-list li { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .5rem; border: 1px solid rgba(197,157,82,.18); background: rgba(8,7,12,.35); }
+.cluster-profile-list li > div { min-width: 0; display: grid; gap: .15rem; }
+.cluster-profile-list span { color: var(--text-muted); font-size: .72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cluster-profile-form { display: grid; gap: .45rem; }
+.cluster-profile-form input { min-width: 0; border: 1px solid rgba(197,157,82,.25); background: rgba(8,7,12,.6); color: var(--text-primary); padding: .48rem .55rem; }
+.cluster-profile-form > div { display: flex; gap: .45rem; }
+
 .cluster-identity {
   display: flex;
   flex-direction: column;

@@ -19,6 +19,7 @@ import httpx
 
 from tui_chat import ChatInput, TuiChatApp
 from tui_sse import SSEDecoder, decode_json_event
+import tui_chat
 
 FIXTURE = str(
     Path(__file__).resolve().parent.parent / "fixtures" / "chat_interactive_fixture.sse",
@@ -473,3 +474,78 @@ class TestSessionManagement:
                 # 迟到 token 不得出现在新会话 transcript
                 assert "L29" not in text
         asyncio.run(_run())
+
+
+# ============================================================
+# 入口参数（_build_parser / _default_host / main）—— 回归：
+# bjtu chat 无 --host 时不得报 required 错误，须默认连本地后端。
+# ============================================================
+
+def test_parser_min_args_ok():
+    """无参数可解析（此前 add_mutually_exclusive_group(required=True) 会抛错）。"""
+    args = tui_chat._build_parser().parse_args([])
+    assert args.host == ""
+    assert args.fixture == ""
+    assert args.route == "auto"
+
+
+def test_parser_host_and_fixture_are_exclusive():
+    p = tui_chat._build_parser()
+    with pytest.raises(SystemExit):
+        p.parse_args(["--host", "http://x", "--fixture", "y.sse"])
+
+
+def test_default_host_default_port():
+    assert tui_chat._default_host() == "http://127.0.0.1:8000"
+
+
+def test_default_host_respects_qih_backend_port(monkeypatch):
+    monkeypatch.setenv("QLH_BACKEND_PORT", "9001")
+    assert tui_chat._default_host() == "http://127.0.0.1:9001"
+    monkeypatch.delenv("QLH_BACKEND_PORT")
+    assert tui_chat._default_host() == "http://127.0.0.1:8000"
+
+
+def test_main_defaults_to_local_backend(monkeypatch):
+    """无参数时 main() 把默认后端地址注入 TuiChatApp（不真启动 Textual）。"""
+    captured = {}
+
+    class _FakeApp:
+        def __init__(self, **kw):
+            captured.update(kw)
+            self.route = None
+            self.title = None
+
+        def run(self):
+            self._ran = True
+
+    monkeypatch.setattr(tui_chat, "TuiChatApp", _FakeApp)
+    monkeypatch.setattr(tui_chat, "resolve_route_arg", lambda r: r)
+    import sys
+    monkeypatch.setattr(sys, "argv", ["tui_chat"])
+    assert tui_chat.main() == 0
+    assert captured["host"] == "http://127.0.0.1:8000"
+    assert captured["fixture"] == ""
+
+
+def test_main_fixture_no_host(monkeypatch):
+    """--fixture 时不再注入 host。"""
+    captured = {}
+
+    class _FakeApp:
+        def __init__(self, **kw):
+            captured.update(kw)
+            self.route = None
+            self.title = None
+
+        def run(self):
+            self._ran = True
+
+    monkeypatch.setattr(tui_chat, "TuiChatApp", _FakeApp)
+    monkeypatch.setattr(tui_chat, "resolve_route_arg", lambda r: r)
+    import sys
+    monkeypatch.setattr(sys, "argv", ["tui_chat", "--fixture", "x.sse"])
+    rc = tui_chat.main()
+    assert rc == 0
+    assert captured["host"] == ""
+    assert captured["fixture"] == "x.sse"

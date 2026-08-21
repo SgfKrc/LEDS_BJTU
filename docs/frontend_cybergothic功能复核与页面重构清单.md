@@ -1,6 +1,6 @@
 # frontend_cybergothic 功能复核与页面重构清单
 
-> 目的：以现有 `frontend` 为功能基线，盘点 `frontend_cybergothic` 的缺口，记录单机模式下 Overview 的故障路径，并给出后续分屏布局与逐页背景动效方案。
+> 目的：以现有 `frontend` 为历史行为基线，盘点 `frontend_cybergothic` 的缺口，记录单机模式下 Overview 的故障路径，并给出后续分屏布局与逐页背景动效方案。
 >
 > 范围：本文件是实现清单和验收标准，不在本轮直接修改前端代码。已有的 StudyPact 风格分析与首期视觉计划见 [`StudyPact风格分析与frontend_cybergothic前端计划.md`](./StudyPact风格分析与frontend_cybergothic前端计划.md)。
 
@@ -21,7 +21,7 @@
 | `#/settings` | 后端连接、设备/GPU、RAG、动效、fixture、日志令牌 | P1.3 已接入设备与 RAG 工作区；模型能力位于 `#/models`，其余运行时选项待补 |
 | `#/help` | 启动、接口清单、FAQ、版本 | P3 三栏文档工作区已接入；目录、正文与当前条目详情独立组织，主区局部滚动 |
 
-旧 `frontend` 的入口在 `frontend/src/App.jsx`，视图为 `chat / image / admin / account`，并在设置弹窗中挂载设备、模型、RAG 等工作区。`frontend_cybergothic` 的路由表在 `frontend_cybergothic/src/app/routes.tsx`，数据入口在 `frontend_cybergothic/src/data/api.ts` 和 `src/data/hooks.ts`；两者目前不是功能等价实现。
+旧 `frontend` 的入口在 `frontend/src/App.jsx`，视图为 `chat / image / admin / account`，并在设置弹窗中挂载设备、模型、RAG 等工作区。自 2026-08-22 起旧前端冻结，仅用于行为/接口对照，不再开新开发票。`frontend_cybergothic` 的路由表在 `frontend_cybergothic/src/app/routes.tsx`，数据入口在 `frontend_cybergothic/src/data/api.ts` 和 `src/data/hooks.ts`；两者不是功能等价实现，差异以《前端安卓后端接口与功能缺口审查-2026-08-22》为准。
 
 视觉现状已在 P3 阶段统一：`ChatPane` 使用 `GothicWorksCanvas`，Overview、Tasks、Activity、Settings、Help 分别接入独立页面场景，并迁移为固定视口内的侧栏、主区与详情布局。三栏外层壳层使用约 56% 至 66% 的半透明底色，Canvas 提升至约 52% 至 58%；正文卡片、表格和表单维持更实的底色，背景动效以古铜远景与金色近景出现，不干扰阅读。
 

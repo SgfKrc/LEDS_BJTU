@@ -77,6 +77,39 @@ history fallback / rewrite 规则**。
 
 参考体积（gzip）：JS 约 79 kB，CSS 约 10 kB。
 
+## 桌面窗口（pywebview，与主应用同栈）
+
+构建产物也可以放进**桌面原生窗口**，复用主应用的 pywebview（Windows 用 Edge WebView2，
+Linux 回退系统浏览器），不引入 Electron。
+
+```bash
+npm run build                                     # 先产出 dist/
+# 后端在默认地址跑（127.0.0.1:8000）；随后：
+python packaging/launcher_cybergothic.py          # 弹原生窗口加载 http://127.0.0.1:9851/
+```
+
+用法：
+
+| 参数/环境变量 | 作用 |
+| --- | --- |
+| `--port <n>` | 本地窗口服务端口（默认 9851；占用自动向后探测，避开 5174/8000/9090） |
+| `--api-target <url>` | `/api/*` 反向代理目标（默认 `http://127.0.0.1:8000`；可设 `QLH_API_TARGET`） |
+| `--dist <dir>` | 指定 dist 目录（可设 `QLH_CG_DIST`）；`--dist` 指向缺失目录会直接报错 |
+| `--no-window` | 不开窗口，只打印访问地址（供调试/无人环境；不会误开浏览器） |
+| `--debug` | 打印请求级日志 |
+
+要点：
+
+- 生产构建下前端 `BASE='/api'` 是相对同源，桌面壳会把 `/api/*` 反向代理到
+  `--api-target`，否则窗口里接口全 404。
+- 静态服务带 SPA history 回退：无扩展名的路由回到 `index.html`，带扩展名的缺失
+  资源（如 `.png`）返回 404，不给前端吞错误。
+- 服务只监听 `127.0.0.1`，非回环来源一律 403。
+- 需要 Python 环境具备 `pywebview`（主应用 requirements 已含 `pywebview>=6.0`；
+  开发机 `.venv-test` 未安装时用主应用运行时 venv 或 `pip install pywebview`）。
+
+测试：`pytest tests/test_launcher_cybergothic.py`（不开真窗口/不连外网，回环 fake 后端驱动）。
+
 ## 验证
 
 ```bash

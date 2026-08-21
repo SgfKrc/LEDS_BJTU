@@ -671,13 +671,23 @@ class TuiChatApp(App[None]):
         )
 
 
+def _default_host() -> str:
+    """本地后端地址；端口优先取 QLH_BACKEND_PORT 环境变量（与 start_tui.bat 一致）。"""
+    import os
+    port = os.environ.get("QLH_BACKEND_PORT", "8000").strip()
+    if not port:
+        port = "8000"
+    return f"http://127.0.0.1:{port}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tui_chat",
         description="T9 简化聊天页（Textual PoC）",
     )
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--host", default="", help="后端地址，如 http://127.0.0.1:8000")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--host", default="",
+                      help="后端地址，如 http://127.0.0.1:8000（缺省连本地后端）")
     mode.add_argument(
         "--fixture", default="",
         help="SSE fixture 文件路径（无需后端，重放固定事件流）",
@@ -691,7 +701,10 @@ def main() -> int:
     if args.route not in ROUTING_PREFERENCES:
         print(f"非法路由偏好: {args.route}")
         return 2
-    app = TuiChatApp(host=args.host, fixture=args.fixture)
+    host = args.host
+    if not host and not args.fixture:
+        host = _default_host()
+    app = TuiChatApp(host=host, fixture=args.fixture)
     app.route = resolve_route_arg(args.route) or args.route
     app.title = "QLH Chat"
     app.run()

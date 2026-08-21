@@ -187,6 +187,18 @@ export function TasksPage() {
     pushToast(success === ids.length ? `已取消 ${success} 个任务。` : `已取消 ${success} 个，${ids.length - success} 个失败。`, success === ids.length ? 'ok' : 'warn');
   }, [guardWrite, queue, selected]);
 
+  const cleanupJournal = useCallback(async () => {
+    if (!guardWrite() || !window.confirm('Clean task journal records older than the retention window?')) return;
+    setBusyAction('journal-cleanup');
+    try {
+      await api.cleanupWorkflowJournal({ max_age_days: 30, max_records: 5000 });
+      pushToast('Task journal cleanup completed', 'ok');
+      workflows.refresh();
+    } catch (error) {
+      pushToast(`Journal cleanup failed: ${api.describeError(error)}`, 'danger');
+    } finally { setBusyAction(''); }
+  }, [guardWrite, workflows]);
+
   const selectTask = useCallback((task: LeveledTask) => {
     setActiveTask(task);
     setActiveWorkflow(null);
@@ -234,7 +246,7 @@ export function TasksPage() {
               <div className="tasks-workspace__scroll">
                 {role.state === 'error' ? <EmptyState kind="error" title="节点角色不可用" description="暂不请求主节点队列。" detail={role.error} errorKind={role.errorKind} errorStatus={role.errorStatus} action={<CommandButton variant="ghost" size="sm" onClick={role.refresh}>重试角色探针</CommandButton>} /> : queueDenied ? <EmptyState kind="denied" title="当前节点不使用主节点队列" description="请求队列只在主节点开放；工作流历史仍可继续使用。" detail={role.data?.node_role ? `当前角色：${role.data.node_role}` : undefined} /> : queue.state === 'loading' && !q ? <SkeletonRows rows={4} columns={3} /> : q ? <><QueueOverview queue={q} /><div className="tasks-table-scroll"><TaskTable<LeveledTask> caption="队列中的推理任务" columns={queueColumns} rows={queueTasks} rowKey={(row) => row.task_id || `${row.level}-${row.session_id}`} state={queue.state} error={queue.error} errorKind={queue.errorKind} errorStatus={queue.errorStatus} emptyTitle="队列为空" emptyDescription="当前没有排队的推理请求。" onRetry={queue.refresh} selected={selected} onToggleSelect={toggleSelect} onToggleSelectAll={toggleSelectAll} isSelectable={(row) => Boolean(row.task_id)} bulkActions={<CommandButton variant="danger" size="sm" icon={Ban} busy={busyAction === 'bulk-cancel'} onClick={() => void cancelSelected()}>取消所选</CommandButton>} onOpenRow={selectTask} /></div></> : <EmptyState kind="empty" title="队列状态未返回" description="刷新后重试。" />}
               </div>
-            </> : <><SectionHead title="工作流" hint="任务图执行记录；选择一项可查看阶段、提供者和失败信息。" actions={<div className="chiprow" role="group" aria-label="按状态筛选工作流">{WORKFLOW_FILTERS.map((entry) => <button key={entry.id} type="button" className="chip" data-active={filter === entry.id ? 'true' : undefined} aria-pressed={filter === entry.id} onClick={() => setFilter(entry.id)}>{entry.label}</button>)}</div>} />
+            </> : <><SectionHead title="工作流" hint="任务图执行记录；选择一项可查看阶段、提供者和失败信息。" actions={<div className="chiprow" role="group" aria-label="按状态筛选工作流">{canManageQueue ? <CommandButton variant="ghost" size="sm" busy={busyAction === 'journal-cleanup'} onClick={() => void cleanupJournal()}>Clean journal</CommandButton> : null}{WORKFLOW_FILTERS.map((entry) => <button key={entry.id} type="button" className="chip" data-active={filter === entry.id ? 'true' : undefined} aria-pressed={filter === entry.id} onClick={() => setFilter(entry.id)}>{entry.label}</button>)}</div>} />
               <div className="tasks-workspace__scroll tasks-workspace__scroll--table">{workflows.data && !workflows.data.enabled ? <EmptyState kind="empty" title="任务图未启用" description="后端 TASK_GRAPH_ENABLED 处于关闭状态。" /> : <TaskTable<WorkflowRecord> caption="任务图工作流记录" columns={workflowColumns} rows={filteredWorkflows} rowKey={(row) => row.workflow_id} state={workflows.state} error={workflows.error} errorKind={workflows.errorKind} errorStatus={workflows.errorStatus} emptyTitle={filter === 'all' ? '暂无工作流记录' : '该状态下没有工作流'} emptyDescription={filter === 'all' ? '发起带任务图的对话后，执行记录会出现在这里。' : '尝试切换到“全部”。'} onRetry={workflows.refresh} onOpenRow={selectWorkflow} />}</div>
             </>}
           </section>

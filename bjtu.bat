@@ -29,6 +29,10 @@ if /i "%~1"=="--help" goto :help
 if /i "%~1"=="-h" goto :help
 
 rem ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
+rem ---- 归一化别名：--chat / -chat / -c 等价于 chat ----
+if /i "%~1"=="--chat" goto :chat
+if /i "%~1"=="-chat" goto :chat
+if /i "%~1"=="-c" goto :chat
 if /i "%~1"=="chat" goto :chat
 if /i "%~1"=="update" goto :update
 if /i "%~1"=="version" goto :version

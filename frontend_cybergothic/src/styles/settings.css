@@ -173,6 +173,12 @@
   padding: var(--gap-md);
 }
 
+.settings-danger-zone {
+  margin-top: 1.4rem;
+  padding-top: 1rem;
+  border-top: 1px solid rgba(196, 79, 69, .35);
+}
+
 .settings-current__scroll > .settings-workspace--embedded {
   height: auto;
 }
