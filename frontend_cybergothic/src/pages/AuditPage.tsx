@@ -4,6 +4,7 @@ import {
   Archive,
   BarChart3,
   Check,
+  Download,
   FileSearch,
   Gauge,
   Gavel,
@@ -158,6 +159,40 @@ export function AuditPage() {
     }
   };
 
+  const saveBlob = (blob: Blob, filename: string) => {
+    const href = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(href);
+  };
+
+  const downloadFile = async (file: LogFileRecord) => {
+    setBusy(`download:${file.name}`);
+    try {
+      if (usingFixtures) {
+        saveBlob(new Blob([previewFixture(file).content], { type: 'text/plain' }), file.name);
+      } else {
+        saveBlob(await api.downloadLogFile(file.name), file.name);
+      }
+      pushToast(`Downloaded ${file.name}`, usingFixtures ? 'info' : 'ok');
+    } catch (error) {
+      pushToast(`Log download failed: ${api.describeError(error)}`, 'danger');
+    } finally { setBusy(''); }
+  };
+
+  const exportArchive = async () => {
+    setBusy('export');
+    try {
+      if (usingFixtures) saveBlob(new Blob(['Fixture archive'], { type: 'application/zip' }), 'qlh-logs-fixture.zip');
+      else saveBlob(await api.exportLogs(), 'qlh-logs-export.zip');
+      pushToast('Log archive exported', usingFixtures ? 'info' : 'ok');
+    } catch (error) {
+      pushToast(`Log export failed: ${api.describeError(error)}`, 'danger');
+    } finally { setBusy(''); }
+  };
+
   const createTicket = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!reviewForm.targetNodeId.trim()) {
@@ -233,6 +268,18 @@ export function AuditPage() {
     }
   };
 
+  const pollMail = async () => {
+    setBusy('mail-poll');
+    try {
+      if (usingFixtures) pushToast('Fixture mail poll completed', 'info');
+      else await api.pollReviewMail();
+      await tickets.refresh();
+      pushToast('Mail vote poll completed', usingFixtures ? 'info' : 'ok');
+    } catch (error) {
+      pushToast(`Mail poll failed: ${api.describeError(error)}`, 'danger');
+    } finally { setBusy(''); }
+  };
+
   const clearResolved = async () => {
     if (!window.confirm('Clear all resolved review tickets?')) return;
     setBusy('clear-resolved');
@@ -293,7 +340,7 @@ export function AuditPage() {
           <main className="audit-main">
             {workspace === 'archive' ? (
               <section className="audit-panel audit-workspace" aria-label="Log archive">
-                <SectionHead title="Log archive" hint="Files remain separate from the live Activity timeline." actions={<StatusBadge label={`${fileList.length} FILES`} tone="info" size="sm" />} />
+                <SectionHead title="Log archive" hint="Files remain separate from the live Activity timeline." actions={<div className="audit-review-actions"><CommandButton variant="ghost" size="sm" icon={Download} busy={busy === 'export'} onClick={() => void exportArchive()}>Export ZIP</CommandButton><StatusBadge label={`${fileList.length} FILES`} tone="info" size="sm" /></div>} />
                 {logDenied ? (
                   <EmptyState kind="denied" title="Log token required" description="Archive and statistics APIs require X-QLH-Log-Token." detail={files.error || stats.error} action={<CommandButton variant="ghost" size="sm" icon={KeyRound} href={routeHref('settings')}>Open settings</CommandButton>} />
                 ) : files.state === 'error' || stats.state === 'error' ? (
@@ -313,6 +360,7 @@ export function AuditPage() {
                           <div><strong>{file.name}</strong><span>{formatBytes(file.size)} · {dateLabel(file.modified)}</span></div>
                           <div className="audit-file-row__actions">
                             <CommandButton variant="ghost" size="sm" busy={busy === `open:${file.name}`} onClick={() => void openFile(file)}>Preview</CommandButton>
+                            <CommandButton variant="ghost" size="sm" icon={Download} busy={busy === `download:${file.name}`} onClick={() => void downloadFile(file)}>Download</CommandButton>
                             <CommandButton variant="danger" size="sm" icon={Trash2} busy={busy === `delete:${file.name}`} onClick={() => void removeFile(file)}>Delete</CommandButton>
                           </div>
                         </article>
@@ -338,7 +386,7 @@ export function AuditPage() {
 
             {workspace === 'review' ? (
               <section className="audit-panel audit-workspace" aria-label="Transfer review tickets">
-                <SectionHead title="Transfer review" hint="A traceable gate before primary-node handover." actions={<div className="audit-review-actions">{canManageCluster ? <CommandButton variant="ghost" size="sm" busy={busy === 'expire-review'} onClick={() => void expireTickets()}>Expiry check</CommandButton> : null}{canManageCluster && ticketList.some((ticket) => ticket.status !== 'pending') ? <CommandButton variant="danger" size="sm" busy={busy === 'clear-resolved'} onClick={() => void clearResolved()}>Clear resolved</CommandButton> : null}</div>} />
+                <SectionHead title="Transfer review" hint="A traceable gate before primary-node handover." actions={<div className="audit-review-actions">{canManageCluster ? <><CommandButton variant="ghost" size="sm" busy={busy === 'mail-poll'} onClick={() => void pollMail()}>Poll mail</CommandButton><CommandButton variant="ghost" size="sm" busy={busy === 'expire-review'} onClick={() => void expireTickets()}>Expiry check</CommandButton></> : null}{canManageCluster && ticketList.some((ticket) => ticket.status !== 'pending') ? <CommandButton variant="danger" size="sm" busy={busy === 'clear-resolved'} onClick={() => void clearResolved()}>Clear resolved</CommandButton> : null}</div>} />
                 <div className="audit-review-status"><StatusBadge label={canVote.data?.can_vote ? 'VOTE ELIGIBLE' : 'NO VOTE'} tone={canVote.data?.can_vote ? 'ok' : 'idle'} size="sm" /><span>{canVote.data?.reason || 'Checking local review eligibility.'}</span><strong>{pendingTickets.length} pending</strong></div>
                 {canManageCluster ? <form className="audit-review-form" onSubmit={createTicket}><label><span>TARGET NODE ID</span><input aria-label="TARGET NODE ID" value={reviewForm.targetNodeId} onChange={(event) => setReviewForm((current) => ({ ...current, targetNodeId: event.target.value }))} /></label><label><span>REASON</span><input aria-label="REASON" value={reviewForm.reason} onChange={(event) => setReviewForm((current) => ({ ...current, reason: event.target.value }))} /></label><label><span>TIMEOUT / HOURS</span><input aria-label="TIMEOUT / HOURS" type="number" min="1" max="720" value={reviewForm.timeoutHours} onChange={(event) => setReviewForm((current) => ({ ...current, timeoutHours: event.target.value }))} /></label><CommandButton type="submit" size="sm" icon={Check} busy={busy === 'create-review'}>Create review</CommandButton></form> : <p className="audit-inline-note">Only the master node may create, expire, or remove transfer review tickets.</p>}
                 {tickets.state === 'error' ? <EmptyState kind="error" title="Review tickets are unavailable" description="Cluster review storage did not return a usable response." detail={tickets.error} errorKind={tickets.errorKind} errorStatus={tickets.errorStatus} action={<CommandButton variant="ghost" size="sm" onClick={tickets.refresh}>Retry</CommandButton>} /> : tickets.state === 'loading' && ticketList.length === 0 ? <SkeletonRows rows={3} columns={2} /> : <div className="audit-ticket-list">{ticketList.map((ticket) => <article key={ticket.ticket_id}><div className="audit-ticket__head"><div><span className="mono-label">{ticket.ticket_id}</span><strong>{ticket.target_node_id || 'Unknown target'}</strong></div><StatusBadge label={String(ticket.status || 'unknown').toUpperCase()} tone={toneForTicket(ticket.status)} size="sm" /></div><p>{ticket.transfer_reason || 'No transfer reason recorded.'}</p><dl><div><dt>SCORE</dt><dd>{ticket.score ?? 0}</dd></div><div><dt>VOTES</dt><dd>{ticket.votes?.length ?? 0}</dd></div><div><dt>EXPIRES</dt><dd>{dateLabel(ticket.expires_at)}</dd></div></dl>{ticket.status === 'pending' && canVote.data?.can_vote ? <div className="audit-votes"><CommandButton variant="ghost" size="sm" icon={Vote} busy={busy === `vote:${ticket.ticket_id}:1`} onClick={() => void vote(ticket, 1)}>Approve</CommandButton><CommandButton variant="ghost" size="sm" busy={busy === `vote:${ticket.ticket_id}:0`} onClick={() => void vote(ticket, 0)}>Abstain</CommandButton><CommandButton variant="danger" size="sm" busy={busy === `vote:${ticket.ticket_id}:-1`} onClick={() => void vote(ticket, -1)}>Block</CommandButton></div> : null}</article>)}</div>}

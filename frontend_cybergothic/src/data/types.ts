@@ -486,6 +486,34 @@ export interface LogStatsResponse {
   [key: string]: unknown;
 }
 
+export interface ClientErrorReport {
+  source?: string;
+  message: string;
+  url?: string;
+  line?: number;
+  col?: number;
+  stack?: string;
+  user_agent?: string;
+  extra?: Record<string, unknown>;
+}
+
+export interface RagSource {
+  source_id: string;
+  owner_scope?: string;
+  display_name?: string;
+  relative_ref?: string;
+  revision?: number;
+  document_count?: number;
+  chunk_count?: number;
+  [key: string]: unknown;
+}
+
+export interface RagSourcesResponse {
+  sources: RagSource[];
+  storage?: string;
+  [key: string]: unknown;
+}
+
 export interface NodeLogSummary {
   node_id: string;
   role?: string;
@@ -659,6 +687,14 @@ export interface RagRebuildResponse {
   status?: string;
   fts_chunk_count?: number;
   storage?: string;
+  [key: string]: unknown;
+}
+
+export interface DiffusionDistributedResponse extends DiffusionJob {
+  workflow_id?: string;
+  artifact_id?: string;
+  blob_id?: string;
+  images?: Array<Record<string, unknown>>;
   [key: string]: unknown;
 }
 
@@ -876,6 +912,45 @@ export interface LocalModelAssetsResponse {
   [key: string]: unknown;
 }
 
+export interface GgufModelRecord {
+  filename: string;
+  size_bytes?: number;
+  size_mb?: number;
+  sha256?: string;
+  download_url?: string;
+  [key: string]: unknown;
+}
+
+export interface GgufModelsResponse {
+  models: GgufModelRecord[];
+  exists?: boolean;
+  count?: number;
+  [key: string]: unknown;
+}
+
+export interface PreparePipelineResponse {
+  status?: string;
+  model_id?: string;
+  pipeline_prepared?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ClusterProfile {
+  profile_id: string;
+  name: string;
+  cluster_id: string;
+  master_endpoint?: { scheme?: string; host?: string; port?: number };
+  status?: string;
+  node_role?: string;
+  last_verified_at?: string | number | null;
+  [key: string]: unknown;
+}
+
+export interface ClusterProfilesResponse { profiles: ClusterProfile[]; [key: string]: unknown }
+export interface ClusterCurrentProfileResponse { profile: ClusterProfile | null; [key: string]: unknown }
+export interface ClusterDiscoveryResponse { candidates: Array<Record<string, unknown>>; [key: string]: unknown }
+export interface ClusterEndpointsResponse { endpoints: Array<Record<string, unknown>>; [key: string]: unknown }
+
 export interface ModelPreflightResponse {
   schema_version?: number;
   operation?: string;
@@ -888,6 +963,126 @@ export interface ModelPreflightResponse {
   preflight?: Record<string, unknown> | null;
   errors?: Array<{ code?: string; message?: string; [key: string]: unknown }>;
   [key: string]: unknown;
+}
+
+// ---- 模型一键下载（/api/models/presets、/api/models/downloads） ----
+
+export interface ModelPreset {
+  id: string;
+  display: string;
+  kind: 'gguf' | 'safetensors' | string;
+  default_engine?: string;
+  default_quant?: string;
+  default_model_id?: string;
+  hf_repo?: string;
+  ms_path?: string;
+  file_pattern?: string;
+  expected_sha256?: string;
+  resource_gate?: {
+    min_ram_gb?: number;
+    min_vram_gb?: number;
+    min_disk_gb?: number;
+    allow_cpu?: boolean;
+    [key: string]: unknown;
+  };
+  description?: string;
+  installable: boolean;
+  blocked_reasons: Record<string, string>;
+  [key: string]: unknown;
+}
+
+export interface ModelPresetsResponse {
+  presets: ModelPreset[];
+  [key: string]: unknown;
+}
+
+export interface ModelDownloadJob {
+  job_id: string;
+  status:
+    | 'queued'
+    | 'downloading'
+    | 'verifying'
+    | 'registering'
+    | 'ready'
+    | 'failed'
+    | 'cancelled';
+  progress: number;
+  source: string;
+  target?: string;
+  model_id?: string;
+  preset_id?: string;
+  engine?: string;
+  quant?: string;
+  total_bytes?: number;
+  downloaded_bytes?: number;
+  error_code?: string | null;
+  error?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  finished_at?: string | null;
+  [key: string]: unknown;
+}
+
+export interface ModelDownloadResponse {
+  job: ModelDownloadJob;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface ModelDownloadsResponse {
+  jobs: ModelDownloadJob[];
+  [key: string]: unknown;
+}
+
+export interface ModelSearchAttempt {
+  provider: 'hf' | 'ms' | string;
+  transport?: 'direct' | 'proxy' | string;
+  status?: 'ok' | 'failed' | string;
+  code?: string;
+  [key: string]: unknown;
+}
+
+export interface ModelSearchResult {
+  id: string;
+  source: 'hf' | 'ms' | string;
+  display_name?: string;
+  description?: string;
+  tasks?: string[];
+  tags?: string[];
+  downloads?: number | null;
+  likes?: number | null;
+  size_bytes?: number;
+  last_modified?: string;
+  license?: string;
+  private?: boolean;
+  gated?: boolean;
+  url?: string;
+  [key: string]: unknown;
+}
+
+export interface ModelSearchResponse {
+  query: string;
+  source: 'hf' | 'ms' | 'all' | string;
+  provider: 'hf' | 'ms' | string;
+  results: ModelSearchResult[];
+  total?: number;
+  fallback_used?: boolean;
+  attempts?: ModelSearchAttempt[];
+  [key: string]: unknown;
+}
+
+export interface CreateModelDownloadPayload {
+  preset_id?: string;
+  source?: string;
+  target?: string;
+  model_id?: string;
+  engine?: string;
+  quant?: string;
+  use_modelscope?: boolean;
+  proxy?: string;
+  expected_sha256?: string;
+  gguf_path?: string;
+  allow_cpu?: boolean;
 }
 
 // ---- /api/cluster/my-role ----

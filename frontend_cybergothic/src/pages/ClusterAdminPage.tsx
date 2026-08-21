@@ -30,7 +30,7 @@ import {
   useMasterHealth,
   useMyRole,
 } from '../data/hooks';
-import type { ClusterNode } from '../data/types';
+import type { ClusterNode, ClusterProfile } from '../data/types';
 import { ClusterConstellationCanvas } from '../visual/ClusterConstellationCanvas';
 
 function relativeTime(timestamp?: number): string {
@@ -68,8 +68,19 @@ export function ClusterAdminPage() {
   const [maxNodes, setMaxNodes] = useState('');
   const [busy, setBusy] = useState('');
   const [registerForm, setRegisterForm] = useState({ node_id: '', hostname: '', address: '', network_type: 'tailscale', node_type: 'pc' });
+  const [profiles, setProfiles] = useState<ClusterProfile[]>([]);
+  const [profileForm, setProfileForm] = useState({ name: '', cluster_id: '', master_endpoint: '' });
+  const [profileBusy, setProfileBusy] = useState('');
   const nodeList = nodeOverride ?? nodes.data?.nodes ?? [];
   const effectiveMaxNodes = Number(maxNodes || config.data?.max_nodes || 0);
+
+  const loadProfiles = useCallback(async () => {
+    if (usingFixtures) {
+      setProfiles([{ profile_id: 'fixture-profile', name: 'Local master', cluster_id: 'fixture-cluster', master_endpoint: { scheme: 'http', host: '127.0.0.1', port: 8000 }, status: 'active' }]);
+      return;
+    }
+    try { setProfiles((await api.fetchClusterProfiles()).profiles ?? []); } catch { setProfiles([]); }
+  }, [usingFixtures]);
 
   useEffect(() => {
     if (!maxNodes && config.data?.max_nodes) setMaxNodes(String(config.data.max_nodes));
@@ -82,7 +93,10 @@ export function ClusterAdminPage() {
     config.refresh();
     if (canWrite) invite.refresh();
     else health.refresh();
-  }, [canWrite, config, health, invite, nodes, role, status]);
+    void loadProfiles();
+  }, [canWrite, config, health, invite, loadProfiles, nodes, role, status]);
+
+  useEffect(() => { void loadProfiles(); }, [loadProfiles]);
 
   useRegisterRefresh(refresh);
 
@@ -208,6 +222,43 @@ export function ClusterAdminPage() {
     }
   };
 
+  const verifyProfile = async () => {
+    if (!profileForm.master_endpoint.trim() || profileBusy) return;
+    setProfileBusy('verify');
+    try {
+      const result = usingFixtures ? { status: 'ok', cluster_id: profileForm.cluster_id || 'fixture-cluster' } : await api.verifyClusterProfile(profileForm.master_endpoint.trim(), profileForm.name.trim());
+      pushToast(result.status === 'ok' ? 'Master endpoint verified' : 'Endpoint is unreachable', result.status === 'ok' ? 'ok' : 'warn');
+      if (result.status === 'ok' && !profileForm.cluster_id && typeof result.cluster_id === 'string') setProfileForm((current) => ({ ...current, cluster_id: result.cluster_id as string }));
+    } catch (error) { pushToast(`Profile verification failed: ${api.describeError(error)}`, 'danger'); }
+    finally { setProfileBusy(''); }
+  };
+
+  const createProfile = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!profileForm.name.trim() || !profileForm.cluster_id.trim() || !profileForm.master_endpoint.trim() || profileBusy) return;
+    setProfileBusy('create');
+    try {
+      if (usingFixtures) setProfiles((current) => [...current, { profile_id: `fixture-${Date.now()}`, name: profileForm.name.trim(), cluster_id: profileForm.cluster_id.trim(), master_endpoint: { scheme: 'http', host: profileForm.master_endpoint.trim(), port: 8000 }, status: 'saved' }]);
+      else await api.createClusterProfile({ ...profileForm, node_role: canWrite ? 'master' : 'client' });
+      await loadProfiles();
+      setProfileForm({ name: '', cluster_id: '', master_endpoint: '' });
+      pushToast('Cluster profile saved', usingFixtures ? 'info' : 'ok');
+    } catch (error) { pushToast(`Profile save failed: ${api.describeError(error)}`, 'danger'); }
+    finally { setProfileBusy(''); }
+  };
+
+  const removeProfile = async (profile: ClusterProfile) => {
+    if (profileBusy || !window.confirm(`Delete cluster profile ${profile.name}?`)) return;
+    setProfileBusy(`delete:${profile.profile_id}`);
+    try {
+      if (usingFixtures) setProfiles((current) => current.filter((item) => item.profile_id !== profile.profile_id));
+      else await api.deleteClusterProfile(profile.profile_id);
+      await loadProfiles();
+      pushToast('Cluster profile deleted', usingFixtures ? 'info' : 'ok');
+    } catch (error) { pushToast(`Profile deletion failed: ${api.describeError(error)}`, 'danger'); }
+    finally { setProfileBusy(''); }
+  };
+
   return (
     <div className="cluster-page" data-testid="cluster-admin-page">
       <ClusterConstellationCanvas className="cluster-page__bg" />
@@ -226,6 +277,12 @@ export function ClusterAdminPage() {
               <div className="cluster-identity__main"><UserRound size={18} aria-hidden="true" /><strong>{role.data?.node_id || 'detecting'}</strong></div>
               <StatusBadge label={role.state === 'loading' ? 'CHECKING' : canWrite ? 'MASTER / WRITE' : 'CLIENT / READ ONLY'} tone={canWrite ? 'ok' : 'info'} />
               <p>{canWrite ? 'Topology mutations are available on this node.' : 'This view is read-only until a master role is detected.'}</p>
+            </section>
+
+            <section className="cluster-panel cluster-profiles">
+              <SectionHead title="Cluster profiles" hint={`${profiles.length} saved`} />
+              {profiles.length ? <ul className="cluster-profile-list">{profiles.map((profile) => <li key={profile.profile_id}><div><strong>{profile.name}</strong><span>{profile.cluster_id} · {profile.master_endpoint?.host || 'endpoint'}:{profile.master_endpoint?.port || 80}</span></div><button type="button" className="cluster-icon-button cluster-icon-button--danger" title="Delete profile" aria-label={`Delete ${profile.name}`} disabled={profileBusy !== ''} onClick={() => void removeProfile(profile)}><Trash2 size={14} /></button></li>)}</ul> : <p className="cluster-readonly">No saved profiles.</p>}
+              <form className="cluster-profile-form" onSubmit={(event) => void createProfile(event)}><input aria-label="Profile name" placeholder="Profile name" value={profileForm.name} onChange={(event) => setProfileForm((current) => ({ ...current, name: event.target.value }))} /><input aria-label="Cluster ID" placeholder="Cluster ID" value={profileForm.cluster_id} onChange={(event) => setProfileForm((current) => ({ ...current, cluster_id: event.target.value }))} /><input aria-label="Master endpoint" placeholder="http://100.x.x.x:8000" value={profileForm.master_endpoint} onChange={(event) => setProfileForm((current) => ({ ...current, master_endpoint: event.target.value }))} /><div><CommandButton type="button" variant="ghost" size="sm" busy={profileBusy === 'verify'} onClick={() => void verifyProfile()}>Verify</CommandButton><CommandButton type="submit" size="sm" busy={profileBusy === 'create'}>Save</CommandButton></div></form>
             </section>
 
             <nav className="cluster-nav" aria-label="Cluster admin sections">

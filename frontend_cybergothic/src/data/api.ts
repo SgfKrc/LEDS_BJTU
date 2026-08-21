@@ -42,16 +42,30 @@ import type {
   MasterHealthResponse,
   ConversationResponse,
   MyRoleResponse,
+  ModelPresetsResponse,
+  ModelDownloadResponse,
+  ModelDownloadsResponse,
+  CreateModelDownloadPayload,
+  ModelSearchResponse,
+  ClientErrorReport,
+  ClusterCurrentProfileResponse,
+  ClusterDiscoveryResponse,
+  ClusterEndpointsResponse,
+  ClusterProfilesResponse,
+  DiffusionDistributedResponse,
+  GgufModelsResponse,
   PipelineCapacityResponse,
   QueueResponse,
   RagRebuildResponse,
   RagHealthResponse,
+  RagSourcesResponse,
   RagSearchResponse,
   RecentLogsResponse,
   SessionsResponse,
   SystemStatusResponse,
   TailscaleBindingsResponse,
   WorkflowsResponse,
+  PreparePipelineResponse,
 } from './types';
 
 const BASE = '/api';
@@ -250,6 +264,29 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return data as T;
 }
 
+async function requestBlob(path: string, options: RequestOptions = {}): Promise<Blob> {
+  const { signal, withLogToken, headers, timeoutMs, ...rest } = options;
+  const token = readStorage('session', AUTH_TOKEN_STORAGE_KEY);
+  const logToken = withLogToken ? readStorage('local', LOG_ADMIN_TOKEN_STORAGE_KEY) : '';
+  const res = await fetchResponse(`${BASE}${path}`, {
+    ...rest,
+    headers: {
+      ...headers,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(logToken ? { 'X-QLH-Log-Token': logToken } : {}),
+    },
+  }, { signal, timeoutMs, path });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json() as { detail?: unknown };
+      detail = normalizeDetail(body.detail, detail);
+    } catch { /* binary endpoints may return plain text */ }
+    throw new ApiError(detail, { status: res.status, path, kind: kindForStatus(res.status) });
+  }
+  return res.blob();
+}
+
 // ---- 只读快照接口（Overview / Nodes / Activity 使用） ----
 
 export const fetchSystemStatus = (signal?: AbortSignal) =>
@@ -342,6 +379,60 @@ export const updateManagedUser = (userId: string, payload: { expected_version?: 
 export const fetchTailscaleBindings = (userId = '', signal?: AbortSignal) =>
   request<TailscaleBindingsResponse>(userId ? `/auth/users/${encodeURIComponent(userId)}/tailscale` : '/auth/tailscale/bindings', { signal });
 
+// ---- Cluster profiles, discovery, and advertised endpoints ----
+
+export const fetchClusterProfiles = (signal?: AbortSignal) =>
+  request<ClusterProfilesResponse>('/cluster/profiles', { signal });
+
+export const fetchCurrentClusterProfile = (signal?: AbortSignal) =>
+  request<ClusterCurrentProfileResponse>('/cluster/profiles/current', { signal });
+
+export const verifyClusterProfile = (masterEndpoint: string, name = '') =>
+  request<Record<string, unknown>>('/cluster/profiles/verify', {
+    method: 'POST', body: JSON.stringify({ master_endpoint: masterEndpoint, ...(name ? { name } : {}) }),
+  });
+
+export const createClusterProfile = (payload: { cluster_id: string; name: string; master_endpoint: string; node_role?: string }) =>
+  request<Record<string, unknown>>('/cluster/profiles', { method: 'POST', body: JSON.stringify(payload) });
+
+export const activateClusterProfile = (profileId: string) =>
+  request<Record<string, unknown>>(`/cluster/profiles/${encodeURIComponent(profileId)}/activate`, { method: 'POST' });
+
+export const deleteClusterProfile = (profileId: string) =>
+  request<Record<string, unknown>>(`/cluster/profiles/${encodeURIComponent(profileId)}`, { method: 'DELETE' });
+
+export const fetchClusterDiscoveryCandidates = (tailscalePeers: string[] = [], signal?: AbortSignal) => {
+  const query = tailscalePeers.length ? `?tailscale_peers=${encodeURIComponent(tailscalePeers.join(','))}` : '';
+  return request<ClusterDiscoveryResponse>(`/cluster/discovery/candidates${query}`, { signal });
+};
+
+export const fetchClusterEndpoints = (signal?: AbortSignal) =>
+  request<ClusterEndpointsResponse>('/cluster/endpoints', { signal });
+
+export const verifyClusterEndpoint = (payload: { scheme?: string; host: string; port?: number }) =>
+  request<Record<string, unknown>>('/cluster/endpoints/verify', { method: 'POST', body: JSON.stringify(payload) });
+
+export const fetchQwen3LocalChain = (signal?: AbortSignal) =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain', { signal });
+
+export const beginQwen3LocalChain = (contract: Record<string, unknown>) =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain/begin', { method: 'POST', body: JSON.stringify({ contract }) });
+
+export const runQwen3LocalPrefill = (payload: { input_ref: string; batch_size: number; sequence_length: number }) =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain/prefill', { method: 'POST', body: JSON.stringify(payload) });
+
+export const runQwen3LocalDecode = (payload: { input_ref: string; batch_size: number; sequence_length: number }) =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain/decode', { method: 'POST', body: JSON.stringify(payload) });
+
+export const verifyQwen3LocalParity = (payload: { reference_prefill: string; reference_decode: string; rtol?: number; atol?: number }) =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain/parity', { method: 'POST', body: JSON.stringify(payload) });
+
+export const releaseQwen3LocalChain = () =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain/release', { method: 'POST' });
+
+export const cancelQwen3LocalChain = () =>
+  request<Record<string, unknown>>('/cluster/qwen3/local-chain', { method: 'DELETE' });
+
 export const fetchLocalTailscaleStatus = (signal?: AbortSignal) =>
   request<LocalTailscaleStatusResponse>('/auth/tailscale/local-status', { signal });
 
@@ -401,6 +492,12 @@ export const fetchPipelineCapacity = async (signal?: AbortSignal): Promise<Pipel
 
 export const fetchRagHealth = (signal?: AbortSignal) =>
   request<RagHealthResponse>('/rag/health', { signal });
+
+export const fetchRagSources = (ownerScope = '', signal?: AbortSignal) =>
+  request<RagSourcesResponse>(`/rag/sources${ownerScope ? `?owner_scope=${encodeURIComponent(ownerScope)}` : ''}`, { signal });
+
+export const deleteRagSource = (sourceId: string) =>
+  request<{ status?: string; source_id?: string }>('/rag/sources/' + encodeURIComponent(sourceId), { method: 'DELETE' });
 
 export const fetchSessions = (limit = 20, signal?: AbortSignal) =>
   request<SessionsResponse>(`/sessions?limit=${encodeURIComponent(limit)}`, { signal });
@@ -479,6 +576,15 @@ export const fetchNodesLogAggregate = (
   });
 };
 
+export const downloadLogFile = (filename: string, signal?: AbortSignal) =>
+  requestBlob(`/logs/download?name=${encodeURIComponent(filename)}`, { signal, withLogToken: true });
+
+export const exportLogs = (signal?: AbortSignal) =>
+  requestBlob('/logs/export', { signal, withLogToken: true, timeoutMs: 60_000 });
+
+export const reportClientError = (payload: ClientErrorReport) =>
+  request<{ status?: string }>('/logs/client-error', { method: 'POST', body: JSON.stringify(payload), withLogToken: true });
+
 export const fetchReviewTickets = (status = '', signal?: AbortSignal) =>
   request<ReviewTicketsResponse>(`/cluster/review/tickets${status ? `?status=${encodeURIComponent(status)}` : ''}`, { signal });
 
@@ -496,6 +602,9 @@ export const castReviewVote = (ticketId: string, vote: -1 | 0 | 1, comment = '')
     method: 'POST',
     body: JSON.stringify({ ticket_id: ticketId, vote, comment }),
   });
+
+export const pollReviewMail = () =>
+  request<Record<string, unknown>>('/cluster/review/mail-poll', { method: 'POST' });
 
 export const expireReviewCheck = () =>
   request<ReviewMutationResponse>('/cluster/review/expire-check', { method: 'POST' });
@@ -534,6 +643,9 @@ export const rebuildRagIndex = () =>
     method: 'POST',
     body: JSON.stringify({ include_embeddings: false }),
   });
+
+export const fetchStorageHealth = (signal?: AbortSignal) =>
+  request<Record<string, unknown>>('/storage/health', { signal });
 
 // ---- Stable Diffusion 工作区 ----
 
@@ -580,6 +692,18 @@ export const cancelDiffusionJob = (jobId: string) =>
     { method: 'POST' },
   );
 
+export const generateDistributedDiffusion = (params: Record<string, unknown>) =>
+  request<DiffusionDistributedResponse>('/diffusion/distributed/generate', { method: 'POST', body: JSON.stringify(params) });
+
+export const generateDistributedDiffusionGrid = (params: Record<string, unknown> & { seeds: number[] }) =>
+  request<DiffusionDistributedResponse>('/diffusion/distributed/grid', { method: 'POST', body: JSON.stringify(params) });
+
+export const generateDistributedDiffusionMixed = (params: { message: string; text_provider_id?: string; text_model_id?: string }) =>
+  request<DiffusionDistributedResponse>('/diffusion/distributed/mixed', { method: 'POST', body: JSON.stringify(params) });
+
+export const downloadDistributedWorkflowBlob = (workflowId: string, blobId: string, signal?: AbortSignal) =>
+  requestBlob(`/diffusion/distributed/workflows/${encodeURIComponent(workflowId)}/blobs/${encodeURIComponent(blobId)}`, { signal });
+
 // ---- Model and local asset workspace ----
 
 export const fetchModels = (signal?: AbortSignal) =>
@@ -598,6 +722,28 @@ export const preflightLocalModelAsset = (modelId: string) =>
   request<ModelPreflightResponse>(`/models/local-assets/${encodeURIComponent(modelId)}/preflight`, {
     method: 'POST',
   });
+
+export const prepareModelPipeline = (modelId: string, quantType = 'fp16') =>
+  request<PreparePipelineResponse>('/models/prepare-pipeline', {
+    method: 'POST', body: JSON.stringify({ model_id: modelId, quant_type: quantType }),
+  });
+
+export const fetchGgufModels = (signal?: AbortSignal) =>
+  request<GgufModelsResponse>('/models/gguf', { signal });
+
+export const downloadGgufModel = (filename: string, signal?: AbortSignal) =>
+  requestBlob(`/models/download/${encodeURIComponent(filename)}`, { signal, timeoutMs: 120_000 });
+
+export const fetchDownloadableModelManifest = (modelId = '', signal?: AbortSignal) =>
+  request<Record<string, unknown>>(`/models/downloadable${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`, { signal });
+
+export const fetchModelPipelineAssignment = (modelId: string, params: Record<string, string | number | boolean> = {}, signal?: AbortSignal) => {
+  const query = new URLSearchParams(Object.entries(params).reduce<Record<string, string>>((out, [key, value]) => { out[key] = String(value); return out; }, {})).toString();
+  return request<Record<string, unknown>>(`/models/pipeline-assignment/${encodeURIComponent(modelId)}${query ? `?${query}` : ''}`, { signal });
+};
+
+export const downloadModelFile = (modelId: string, relativePath: string, signal?: AbortSignal) =>
+  requestBlob(`/models/files/${encodeURIComponent(modelId)}/${relativePath.split('/').map(encodeURIComponent).join('/')}`, { signal, timeoutMs: 120_000 });
 
 export const loadModel = (
   engine: string,
@@ -621,6 +767,41 @@ export const unloadModel = () =>
     body: JSON.stringify({}),
   });
 
+// ---- 模型一键下载（P0A）----
+
+export const fetchModelPresets = (signal?: AbortSignal) =>
+  request<ModelPresetsResponse>('/models/presets', { signal });
+
+export const createModelDownload = (payload: CreateModelDownloadPayload) =>
+  request<ModelDownloadResponse>('/models/downloads', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+export const fetchModelDownloads = (signal?: AbortSignal) =>
+  request<ModelDownloadsResponse>('/models/downloads', { signal });
+
+export const searchModelRepositories = (
+  params: { q: string; source?: 'hf' | 'ms' | 'all'; page?: number; limit?: number; proxy?: string },
+  signal?: AbortSignal,
+) => {
+  const qs = new URLSearchParams({ q: params.q });
+  if (params.source) qs.set('source', params.source);
+  if (params.page) qs.set('page', String(params.page));
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.proxy) qs.set('proxy', params.proxy);
+  return request<ModelSearchResponse>(`/models/search?${qs.toString()}`, { signal });
+};
+
+export const fetchModelDownload = (jobId: string, signal?: AbortSignal) =>
+  request<ModelDownloadResponse>(`/models/downloads/${encodeURIComponent(jobId)}`, { signal });
+
+export const cancelModelDownload = (jobId: string) =>
+  request<ModelDownloadResponse & { cancelled?: boolean }>(
+    `/models/downloads/${encodeURIComponent(jobId)}`,
+    { method: 'DELETE' },
+  );
+
 // ---- 写操作（Tasks 页队列控制） ----
 
 export const pauseQueue = () => request<{ success?: boolean }>('/cluster/queue/pause', { method: 'POST' });
@@ -642,6 +823,34 @@ export const cancelWorkflow = (workflowId: string) =>
   request<Record<string, unknown>>(`/workflows/${encodeURIComponent(workflowId)}/cancel`, {
     method: 'POST',
   });
+
+export const cleanupWorkflowJournal = (params: { max_age_days?: number; max_records?: number } = {}) => {
+  const query = new URLSearchParams();
+  if (params.max_age_days !== undefined) query.set('max_age_days', String(params.max_age_days));
+  if (params.max_records !== undefined) query.set('max_records', String(params.max_records));
+  return request<Record<string, unknown>>(`/workflows/journal/cleanup${query.toString() ? `?${query}` : ''}`, { method: 'POST' });
+};
+
+export const shutdownSystem = (reason = 'operator_requested') =>
+  request<{ ok?: boolean; message?: string }>('/system/shutdown', { method: 'POST', body: JSON.stringify({ reason }) });
+
+export const runSpeculativeExperiment = (payload: { message?: string; execution_mode?: 'speculative_assisted'; allow_external?: boolean; [key: string]: unknown }) =>
+  request<Record<string, unknown>>('/experimental/speculative', { method: 'POST', body: JSON.stringify(payload) });
+
+export const createDeploymentSimulation = (payload: { artifact_id: string; runtime_profile: string; required_capabilities?: string[]; nodes: Array<Record<string, unknown>> }) =>
+  request<Record<string, unknown>>('/models/deployment-simulations', { method: 'POST', body: JSON.stringify(payload) });
+
+export const fetchDeploymentSimulation = (planId: string, signal?: AbortSignal) =>
+  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}`, { signal });
+
+export const prepareDeploymentSimulation = (planId: string, nodes: Array<Record<string, unknown>> = []) =>
+  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}/prepare`, { method: 'POST', body: JSON.stringify({ nodes }) });
+
+export const activateDeploymentSimulation = (planId: string) =>
+  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}/activate`, { method: 'POST' });
+
+export const rollbackDeploymentSimulation = (planId: string) =>
+  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}/rollback`, { method: 'POST' });
 
 // ---- 令牌读写（Settings 页使用；与既有 frontend 共用同一存储键） ----
 

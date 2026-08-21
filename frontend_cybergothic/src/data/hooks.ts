@@ -70,6 +70,7 @@ import type {
   PipelineCapacityResponse,
   QueueResponse,
   RagHealthResponse,
+  RagSourcesResponse,
   RecentLogsResponse,
   ReviewTicketsResponse,
   SessionsResponse,
@@ -179,6 +180,19 @@ export function useRagHealth(pollMs = 60_000): ResourceResult<RagHealthResponse>
   return useResource<RagHealthResponse>(
     (signal) => (useFixtures ? withFixtureDelay(ragFixture, signal) : api.fetchRagHealth(signal)),
     { pollMs },
+  );
+}
+
+export function useRagSources(ownerScope = '', pollMs = 30_000): ResourceResult<RagSourcesResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<RagSourcesResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay({ storage: 'sqlite', sources: [
+          { source_id: 'workspace-notes', display_name: 'Workspace notes', relative_ref: 'docs/notes', document_count: 8, chunk_count: 42 },
+          { source_id: 'api-contracts', display_name: 'API contracts', relative_ref: 'docs/contracts', document_count: 5, chunk_count: 27 },
+        ] }, signal)
+      : api.fetchRagSources(ownerScope, signal),
+    { pollMs, key: ownerScope },
   );
 }
 

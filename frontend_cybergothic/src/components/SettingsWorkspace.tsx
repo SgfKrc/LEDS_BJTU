@@ -19,8 +19,8 @@ import { pushToast } from './Toast';
 import { useRegisterRefresh } from '../app/refreshBus';
 import * as api from '../data/api';
 import { deviceProfileFixture, fixturesEnabled, ragFixture, ragSearchFixture } from '../data/fixtures';
-import { useDeviceProfile, useRagHealth } from '../data/hooks';
-import type { DeviceProfileResponse, RagHealthResponse, RagSearchResult } from '../data/types';
+import { useDeviceProfile, useRagHealth, useRagSources } from '../data/hooks';
+import type { DeviceProfileResponse, RagHealthResponse, RagSearchResult, RagSource } from '../data/types';
 
 export type SettingsWorkspaceTab = 'device' | 'rag';
 
@@ -44,6 +44,7 @@ function scoreWidth(value: unknown, max: number): string {
 export function SettingsWorkspace({ tab, onTabChange, showNavigation = true }: SettingsWorkspaceProps) {
   const device = useDeviceProfile();
   const rag = useRagHealth();
+  const sources = useRagSources();
   const usingFixtures = fixturesEnabled();
   const [localTab, setLocalTab] = useState<SettingsWorkspaceTab>('device');
   const [deviceBusy, setDeviceBusy] = useState('');
@@ -53,9 +54,11 @@ export function SettingsWorkspace({ tab, onTabChange, showNavigation = true }: S
   const [ragResults, setRagResults] = useState<RagSearchResult[]>([]);
   const [ragError, setRagError] = useState('');
   const [ragBusy, setRagBusy] = useState('');
+  const [sourceOverride, setSourceOverride] = useState<RagSource[] | null>(null);
 
   const profile = deviceOverride ?? device.data;
   const health = ragOverride ?? rag.data;
+  const sourceList = sourceOverride ?? sources.data?.sources ?? [];
   const gpuList = profile?.gpus ?? (profile?.gpu ? [profile.gpu] : []);
   const selectedGpuIndex = profile?.selected_gpu_index ?? 0;
   const runtimeHealth = rag.state === 'error' ? 'danger' : health?.status === 'ok' ? 'ok' : 'warn';
@@ -63,7 +66,8 @@ export function SettingsWorkspace({ tab, onTabChange, showNavigation = true }: S
   const refresh = useCallback(() => {
     device.refresh();
     rag.refresh();
-  }, [device.refresh, rag.refresh]);
+    sources.refresh();
+  }, [device.refresh, rag.refresh, sources.refresh]);
   useRegisterRefresh(refresh);
 
   const activeGpu = gpuList[selectedGpuIndex] ?? gpuList[0];
@@ -160,6 +164,25 @@ export function SettingsWorkspace({ tab, onTabChange, showNavigation = true }: S
     }
   };
 
+  const handleDeleteSource = async (source: RagSource) => {
+    if (ragBusy || !window.confirm(`Delete indexed source ${source.display_name || source.source_id}?`)) return;
+    setRagBusy(`delete:${source.source_id}`);
+    try {
+      if (usingFixtures) {
+        setSourceOverride(sourceList.filter((item) => item.source_id !== source.source_id));
+      } else {
+        await api.deleteRagSource(source.source_id);
+        await sources.refresh();
+        await rag.refresh();
+      }
+      pushToast('Indexed source removed', usingFixtures ? 'info' : 'ok');
+    } catch (err) {
+      pushToast(`Source removal failed: ${api.describeError(err)}`, 'danger');
+    } finally {
+      setRagBusy('');
+    }
+  };
+
   return (
     <section className={`settings-workspace${showNavigation ? '' : ' settings-workspace--embedded'}`} data-testid="settings-workspace">
       {showNavigation ? <aside className="settings-workspace__nav" aria-label="Runtime settings sections">
@@ -206,6 +229,10 @@ export function SettingsWorkspace({ tab, onTabChange, showNavigation = true }: S
             <div className="rag-actions"><form className="rag-search" onSubmit={handleRagSearch}><Search size={15} aria-hidden="true" /><input aria-label="RAG search" value={ragQuery} onChange={(event) => setRagQuery(event.target.value)} placeholder="Search local sources" maxLength={512} /><button type="submit" disabled={!ragQuery.trim() || ragBusy !== ''}>{ragBusy === 'search' ? 'Searching' : 'Search'}</button></form><CommandButton variant="ghost" size="sm" icon={Database} busy={ragBusy === 'rebuild'} onClick={() => void handleRagRebuild()}>Rebuild FTS index</CommandButton></div>
             {ragError ? <p className="settings-notice settings-notice--error" role="alert"><ShieldAlert size={15} />{ragError}</p> : null}
             <div className="rag-results" aria-live="polite">{ragResults.length ? ragResults.map((item, index) => <article key={item.chunk_id || `${item.source_id}-${index}`}><div><strong>{item.source_id || 'local source'}</strong><span>{item.relative_ref || 'reference unavailable'}</span></div><p>{item.snippet || 'No snippet returned.'}</p></article>) : <EmptyState title={ragQuery ? 'No matching sources' : 'Search the local index'} description={ragQuery ? 'Try a broader query or rebuild the FTS index.' : 'Results stay in this workspace and do not alter the source files.'} compact />}</div>
+            <div className="rag-source-registry">
+              <SectionHead title="Indexed sources" hint={`${sourceList.length} registered`} />
+              {sources.state === 'error' ? <p className="settings-notice settings-notice--error" role="alert">{sources.error}</p> : sourceList.length ? <ul>{sourceList.map((source) => <li key={source.source_id}><div><strong>{source.display_name || source.source_id}</strong><span>{source.relative_ref || source.source_id} · {source.document_count ?? 0} docs · {source.chunk_count ?? 0} chunks</span></div><button type="button" className="settings-icon-button" aria-label={`Delete ${source.source_id}`} title="Delete indexed source" disabled={ragBusy !== ''} onClick={() => void handleDeleteSource(source)}>×</button></li>)}</ul> : <EmptyState title="No sources indexed" description="Import a source or rebuild the index to populate this registry." compact />}
+            </div>
           </div>
         )}
       </div>

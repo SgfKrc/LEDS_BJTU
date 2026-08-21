@@ -27,7 +27,7 @@ import {
   useLocalModelAssets,
   useModels,
 } from '../data/hooks';
-import type { CurrentModelResponse, LocalModelAsset, ModelPreflightResponse, ModelSummary } from '../data/types';
+import type { CurrentModelResponse, GgufModelRecord, LocalModelAsset, ModelPreflightResponse, ModelSummary } from '../data/types';
 import { ModelOrbitCanvas } from '../visual/ModelOrbitCanvas';
 
 function formatBytes(value: unknown): string {
@@ -69,6 +69,7 @@ export function ModelsPage() {
   const [busy, setBusy] = useState('');
   const [preflight, setPreflight] = useState<ModelPreflightResponse | null>(null);
   const [runtimeOverride, setRuntimeOverride] = useState<CurrentModelResponse | null>(null);
+  const [ggufModels, setGgufModels] = useState<GgufModelRecord[]>([]);
 
   const modelList = models.data?.models ?? [];
   const assetList = assets.data?.assets ?? [];
@@ -94,6 +95,14 @@ export function ModelsPage() {
   const loadedModelId = runtime?.model_id || (runtime as (CurrentModelResponse & { active_model_id?: string | null }) | undefined)?.active_model_id || '';
   const selectedAsset = assetList.find((asset) => asset.model_id === selectedModel?.model_id) ?? null;
 
+  const loadGguf = useCallback(async () => {
+    if (usingFixtures) {
+      setGgufModels([{ filename: 'qwen2.5-1.5b-q4_k_m.gguf', size_mb: 980, sha256: 'fixture' }]);
+      return;
+    }
+    try { setGgufModels((await api.fetchGgufModels()).models ?? []); } catch { setGgufModels([]); }
+  }, [usingFixtures]);
+
   useEffect(() => {
     if (!selectedId && (models.data?.active_model_id || modelList[0]?.model_id)) {
       setSelectedId(models.data?.active_model_id || modelList[0]?.model_id || '');
@@ -117,7 +126,10 @@ export function ModelsPage() {
     available.refresh();
     current.refresh();
     assets.refresh();
-  }, [assets.refresh, available.refresh, current.refresh, models.refresh]);
+    void loadGguf();
+  }, [assets.refresh, available.refresh, current.refresh, loadGguf, models.refresh]);
+
+  useEffect(() => { void loadGguf(); }, [loadGguf]);
   useRegisterRefresh(refresh);
 
   const handleLoad = async () => {
@@ -199,6 +211,35 @@ export function ModelsPage() {
     } finally {
       setBusy('');
     }
+  };
+
+  const handlePreparePipeline = async () => {
+    if (!selectedModel || busy || usingFixtures) {
+      if (usingFixtures) pushToast('Pipeline preparation is disabled in fixture mode', 'info');
+      return;
+    }
+    setBusy('prepare-pipeline');
+    try {
+      const result = await api.prepareModelPipeline(selectedModel.model_id, effectiveQuant || 'fp16');
+      setRuntimeOverride((currentRuntime) => ({ ...(currentRuntime ?? { loaded: false }), ...result, pipeline_prepared: true, model_id: selectedModel.model_id }));
+      await current.refresh();
+      pushToast(`Pipeline prepared for ${selectedModel.name}`, 'ok');
+    } catch (err) {
+      pushToast(`Pipeline preparation failed: ${api.describeError(err)}`, 'danger');
+    } finally { setBusy(''); }
+  };
+
+  const handleDownloadGguf = async (file: GgufModelRecord) => {
+    if (busy) return;
+    setBusy(`download:${file.filename}`);
+    try {
+      if (usingFixtures) { pushToast(`Fixture download queued: ${file.filename}`, 'info'); return; }
+      const blob = await api.downloadGgufModel(file.filename);
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement('a'); anchor.href = href; anchor.download = file.filename; anchor.click(); URL.revokeObjectURL(href);
+      pushToast(`Downloaded ${file.filename}`, 'ok');
+    } catch (err) { pushToast(`GGUF download failed: ${api.describeError(err)}`, 'danger'); }
+    finally { setBusy(''); }
   };
 
   const modelError = models.state === 'error' ? api.describeError(models.error) : '';
@@ -300,9 +341,15 @@ export function ModelsPage() {
               </div>
               <div className="runtime-actions">
                 <CommandButton icon={Gauge} busy={busy === 'load'} disabled={!selectedModel?.is_available || busy !== ''} onClick={() => void handleLoad()}>Load selected</CommandButton>
+                <CommandButton variant="ghost" icon={Database} busy={busy === 'prepare-pipeline'} disabled={!selectedModel || busy !== ''} onClick={() => void handlePreparePipeline()}>Prepare pipeline</CommandButton>
                 <CommandButton variant="danger" icon={Unplug} busy={busy === 'unload'} disabled={!runtime?.loaded || busy !== ''} onClick={() => void handleUnload()}>Unload runtime</CommandButton>
               </div>
               {!selectedModel?.is_available && selectedModel ? <p className="model-inline-note"><CircleAlert size={14} />{selectedModel.unavailable_reason || 'This model has no loadable local format.'}</p> : null}
+            </section>
+
+            <section className="model-panel model-panel--gguf">
+              <SectionHead title="GGUF files" hint={`${ggufModels.length} downloadable`} actions={<CommandButton variant="ghost" size="sm" icon={RefreshCw} onClick={() => void loadGguf()}>Refresh</CommandButton>} />
+              {ggufModels.length ? <ul className="gguf-list">{ggufModels.map((file) => <li key={file.filename}><div className="asset-list__item"><span><strong>{file.filename}</strong><small>{file.size_mb ? `${file.size_mb} MB` : formatBytes(file.size_bytes)} · {file.sha256 ? `${file.sha256.slice(0, 12)}…` : 'checksum pending'}</small></span><CommandButton variant="ghost" size="sm" busy={busy === `download:${file.filename}`} onClick={() => void handleDownloadGguf(file)}>Download</CommandButton></div></li>)}</ul> : <EmptyState title="No GGUF files advertised" description="The backend exposes local GGUF files here when they are available." compact />}
             </section>
 
             <section className="model-panel model-panel--engines">

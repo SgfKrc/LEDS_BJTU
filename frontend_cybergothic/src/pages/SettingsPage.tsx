@@ -9,6 +9,7 @@ import {
   EyeOff,
   KeyRound,
   Network,
+  Power,
   RefreshCw,
   Save,
   SlidersHorizontal,
@@ -25,6 +26,7 @@ import {
 } from '../motion/useReducedMotion';
 import { fixturesEnabled, setFixturesEnabled } from '../data/fixtures';
 import { getAuthToken, getLogToken, setLogToken } from '../data/api';
+import * as api from '../data/api';
 import { useMyRole, useSystemStatus } from '../data/hooks';
 import { APP_VERSION } from '../app/version';
 import { SettingsWorkspace, type SettingsWorkspaceTab } from '../components/SettingsWorkspace';
@@ -56,6 +58,7 @@ export function SettingsPage() {
   const [logToken, setLogTokenInput] = useState(() => getLogToken());
   const [tokenVisible, setTokenVisible] = useState(false);
   const [savedToken, setSavedToken] = useState(() => getLogToken());
+  const [shutdownBusy, setShutdownBusy] = useState(false);
 
   const refresh = useCallback(() => {
     status.refresh();
@@ -90,6 +93,18 @@ export function SettingsPage() {
     url.searchParams.delete('fixtures');
     window.setTimeout(() => window.location.replace(url.toString()), 400);
   }, []);
+
+  const shutdownBackend = useCallback(async () => {
+    if (shutdownBusy || useFixtures || !window.confirm('Stop the QLH backend on this node?')) return;
+    setShutdownBusy(true);
+    try {
+      await api.shutdownSystem('settings_operator');
+      pushToast('Backend shutdown requested', 'warn');
+    } catch (error) {
+      pushToast(`Shutdown request failed: ${api.describeError(error)}`, 'danger');
+      setShutdownBusy(false);
+    }
+  }, [shutdownBusy, useFixtures]);
 
   const selectWorkspace = useCallback((next: SettingsWorkspaceTab) => {
     setSection(next);
@@ -164,6 +179,7 @@ export function SettingsPage() {
                     <div><dt>控制台版本</dt><dd className="cell-mono">v{APP_VERSION}</dd></div>
                   </dl>
                   {status.state === 'error' ? <EmptyState kind="error" title="无法读取后端状态" detail={status.error} errorKind={status.errorKind} errorStatus={status.errorStatus} action={<CommandButton variant="ghost" size="sm" icon={RefreshCw} onClick={refresh}>重试</CommandButton>} /> : null}
+                  {role.data?.is_master ? <div className="settings-danger-zone"><SectionHead title="Backend lifecycle" hint="Master-only operator action" /><CommandButton variant="danger" size="sm" icon={Power} busy={shutdownBusy} onClick={() => void shutdownBackend()}>Shutdown backend</CommandButton></div> : null}
                 </>
               ) : null}
 
