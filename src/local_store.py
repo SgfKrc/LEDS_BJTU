@@ -277,6 +277,26 @@ def initialize_local_store() -> str:
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS model_download_jobs (
+                  job_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL,
+                  progress REAL NOT NULL DEFAULT 0,
+                  source TEXT NOT NULL,
+                  target TEXT NOT NULL DEFAULT '',
+                  model_id TEXT NOT NULL DEFAULT '',
+                  preset_id TEXT NOT NULL DEFAULT '',
+                  engine TEXT NOT NULL DEFAULT 'auto',
+                  quant TEXT NOT NULL DEFAULT '',
+                  total_bytes INTEGER NOT NULL DEFAULT 0,
+                  downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                  error_code TEXT,
+                  error TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  finished_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_model_download_jobs_created
+                  ON model_download_jobs(created_at DESC);
                 CREATE TABLE IF NOT EXISTS review_tickets (
                   ticket_id TEXT PRIMARY KEY,
                   status TEXT NOT NULL,

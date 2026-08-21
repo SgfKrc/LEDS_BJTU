@@ -10,6 +10,7 @@ import {
   Boxes,
   CircleHelp,
   Columns2,
+  Download,
   Image,
   LayoutDashboard,
   ListTree,
@@ -28,11 +29,12 @@ import { SettingsPage } from '../pages/SettingsPage';
 import { HelpPage } from '../pages/HelpPage';
 import { ImageStudioPage } from '../pages/ImageStudioPage';
 import { ModelsPage } from '../pages/ModelsPage';
+import { ModelDownloadsPage } from '../pages/ModelDownloadsPage';
 import { ClusterAdminPage } from '../pages/ClusterAdminPage';
 import { AccountPage } from '../pages/AccountPage';
 import { AuditPage } from '../pages/AuditPage';
 
-export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'image' | 'models' | 'cluster' | 'account' | 'audit' | 'settings' | 'help';
+export type RouteId = 'workbench' | 'overview' | 'tasks' | 'activity' | 'image' | 'models' | 'downloads' | 'cluster' | 'account' | 'audit' | 'settings' | 'help';
 
 export interface RouteDef {
   id: RouteId;
@@ -100,6 +102,14 @@ export const ROUTES: RouteDef[] = [
     icon: Boxes,
     description: 'Model runtime, local assets, and load controls.',
     component: ModelsPage,
+  },
+  {
+    id: 'downloads',
+    label: 'Downloads',
+    tag: 'MODEL DOWNLOAD',
+    icon: Download,
+    description: 'One-click model presets and live download job progress.',
+    component: ModelDownloadsPage,
   },
   {
     id: 'cluster',

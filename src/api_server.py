@@ -26,6 +26,7 @@ import os
 import threading
 import uuid
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
@@ -132,6 +133,8 @@ from config import (
 
 # 主节点用户自持 SQLite；生产运行时不再加载远端 PostgreSQL 驱动。
 import local_store as _local_store
+import model_download_jobs
+import model_search
 from rag_store import RagStore, RagStoreError
 from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
 from rag_ann import evaluate_ann_decision
@@ -7761,6 +7764,102 @@ async def unregister_model(model_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"取消注册失败: {e}")
+
+
+# ============================================================
+# 模型一键下载（P0A）API
+# ============================================================
+
+class CreateModelDownloadRequest(BaseModel):
+    preset_id: str = Field(default="", description="预设 ID；提供则按预设解析 source/model_id/量化")
+    source: str = Field(default="", description="HF repo id / ModelScope 路径 / 本地目录")
+    target: str = Field(default="", description="目标目录（默认 models/<name>）")
+    model_id: str = Field(default="", description="注册的 model_id（默认取自 target 名）")
+    engine: str = Field(default="auto", description="default_engine 覆盖（auto 用预设）")
+    quant: str = Field(default="", description="量化精度")
+    use_modelscope: bool = Field(default=False, description="走 ModelScope 下载")
+    proxy: str = Field(default="", description="代理，覆盖环境设置")
+    expected_sha256: str = Field(default="", description="严格 SHA-256 校验（可选）")
+    gguf_path: str = Field(default="", description="显式 GGUF 路径")
+    allow_cpu: bool = Field(default=True, description="允许 CPU 运行（safetensors 默认否）")
+
+
+_download_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="qlh-model-dl")
+
+
+@app.get("/api/models/presets")
+async def list_model_presets():
+    """预设列表，含本机可装性评估（installable / blocked_reasons）。"""
+    return {"presets": model_download_jobs.list_presets()}
+
+
+@app.get("/api/models/search")
+async def search_model_repositories(
+    q: str = "", source: str = "all", page: int = 1, limit: int = 20,
+    proxy: str = "",
+):
+    """搜索公开模型仓库，HF 直连→代理→ModelScope 兜底。"""
+    try:
+        return await run_in_threadpool(
+            lambda: model_search.search_models(
+                q, source=source, page=page, limit=limit, proxy=proxy or None,
+            )
+        )
+    except model_search.ModelSearchError as exc:
+        status = 400 if exc.code in {
+            "QUERY_REQUIRED", "QUERY_TOO_LONG", "SOURCE_INVALID", "PAGINATION_INVALID",
+        } else 502
+        detail: dict[str, Any] = {"message": exc.message}
+        if exc.attempts:
+            detail["attempts"] = exc.attempts
+        raise coded_http_error(status, exc.code, detail) from exc
+
+
+@app.post("/api/models/downloads")
+async def create_model_download(req: CreateModelDownloadRequest):
+    """排队一个下载 job（异步，轮询 /api/models/downloads/{id} 查进度）。"""
+    try:
+        job = model_download_jobs.create_job(
+            source=req.source, target=req.target, model_id=req.model_id,
+            preset_id=req.preset_id, engine=req.engine or "auto", quant=req.quant,
+            use_modelscope=req.use_modelscope, proxy=req.proxy,
+            expected_sha256=req.expected_sha256, gguf_path=req.gguf_path,
+            allow_cpu=req.allow_cpu,
+            executor=lambda fn: _download_executor.submit(fn),
+        )
+        return {"job": job, "status": "queued"}
+    except model_download_jobs.JobError as exc:
+        raise coded_http_error(400, exc.code, exc.message)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"创建下载任务失败: {exc}")
+
+
+@app.get("/api/models/downloads")
+async def list_model_downloads(limit: int = 100):
+    """列出下载 job（新到旧）。"""
+    return {"jobs": model_download_jobs.list_jobs(limit=limit)}
+
+
+@app.get("/api/models/downloads/{job_id}")
+async def get_model_download(job_id: str):
+    """查询单个下载 job 进度。"""
+    job = model_download_jobs.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"下载任务 '{job_id}' 不存在")
+    return {"job": job}
+
+
+@app.delete("/api/models/downloads/{job_id}")
+async def cancel_model_download(job_id: str):
+    """取消排队中的下载 job；执行中的由后台线程控制，返回当前状态。"""
+    cancelled = model_download_jobs.cancel_job(job_id)
+    if not cancelled:
+        job = model_download_jobs.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"下载任务 '{job_id}' 不存在")
+    return {"cancelled": cancelled, "job": model_download_jobs.get_job(job_id)}
 
 
 # ============================================================
