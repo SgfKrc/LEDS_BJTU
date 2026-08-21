@@ -4,6 +4,8 @@ test('模型下载页支持仓库搜索并从结果创建下载任务', async ({
   await page.goto('/#/downloads?fixtures=1');
 
   await expect(page.getByRole('heading', { level: 1, name: '模型下载' })).toBeVisible();
+  await expect(page.locator('.downloads-page__bg')).toBeVisible();
+  await expect(page.locator('.downloads-panel[data-reveal]')).toHaveCount(3);
   await page.getByRole('textbox', { name: '搜索模型仓库' }).fill('qwen');
   await page.getByRole('button', { name: '搜索' }).click();
 

@@ -2,9 +2,11 @@
 """接口契约对齐审计：一键导出前后端接口清单并机械比对缺口（静态、离线）。
 
 用法：
-    python scripts/api_gap_scan.py            # 默认：单体后端 × 两端前端
+    python scripts/api_gap_scan.py            # 默认：单体后端 × frontend_cybergothic
     python scripts/api_gap_scan.py --include-gateway   # 加 TS 网关面
+    python scripts/api_gap_scan.py --include-legacy-frontend  # 追加旧 frontend/ 对照面
     python scripts/api_gap_scan.py --json -o api-gap.json
+    python scripts/api_gap_scan.py --ownership --include-gateway --include-control
     python scripts/api_gap_scan.py --only chat          # 过滤子串
 
 产出（schema v1）：
@@ -14,7 +16,8 @@
       frontend_without_backend (缺口 A：前端调、后端未定义 → 404 风险)
       backend_without_frontend (缺口 B：后端定义、前端未消费 → 功能缺口)
       method_mismatch         (软缺口：同路径、方法不一致)
-    summary: 计数与基线
+    summary: 计数与基线（含 canonical/legacy scope、页面/共享 client 证据）
+    ownership: 按归一化 endpoint 聚合的页面/共享 client/内部协议/实验域归属表
 
 退出码：0=对齐（无 A/B）；1=有缺口 A；2=有缺口 B；3=A+B；10=解析中途失败。
 method 推断：前端缺省 GET；`?` 表示无法静态确定（比对时匹配任意后端方法）。
@@ -221,19 +224,67 @@ class FrontendEntry:
     file: str
     line: int
     kind: str
+    # additive v1 fields: exact static evidence boundary, not runtime call tracing
+    scope: str = "canonical"
+    surface: str = "other"
+    symbol: str = ""
 
 
-_CALL_RE = re.compile(r"\b(request|fetch)\s*(?:<[^>\n]*>)?\s*\(\s*([`'\"])(.*?)\2", re.S)
+# Allow nested TypeScript generics such as ``request<Result<{ ok: boolean }>>()``.
+# The scanner only needs to reach the first call parenthesis; it does not try
+# to parse TypeScript types.
+_CALL_RE = re.compile(r"\b(request|fetch)\s*(?:<[^()\n]*>)*\s*\(\s*([`'\"])(.*?)\2", re.S)
 _METHOD_IN_CALL_RE = re.compile(r"method\s*:\s*['\"]([A-Z]+)['\"]")
 _BASE_VAR_RE = re.compile(r"const\s+BASE\s*=\s*['\"]/api['\"]")
 # const path = '/chat/stream' → 变量随后交给 request(path)，method 无法静态确定标 '?'
 _PATH_VAR_RE = re.compile(r"\bconst\s+path\s*=\s*(['\"`])(/.*?)\1")
+_EXPORT_SYMBOL_RE = re.compile(
+    r"\bexport\s+(?:async\s+)?(?:const|function)\s+([A-Za-z_$][\w$]*)"
+)
+
+
+def _enclosing_export_symbol(text: str, offset: int) -> str:
+    """Find the nearest exported function/const before a route literal."""
+    symbol = ""
+    for match in _EXPORT_SYMBOL_RE.finditer(text):
+        if match.start() > offset:
+            break
+        symbol = match.group(1)
+    return symbol
+
+
+def classify_frontend_surface(file: Path) -> str:
+    """Classify the file that contains a literal route.
+
+    This is deliberately evidence-based: a route literal in ``data/api.ts``
+    proves a shared-client declaration, while a literal in a page proves a
+    direct page call.  It does not claim that a page imports an API wrapper.
+    """
+    parts = {part.lower() for part in file.parts}
+    name = file.name.lower()
+    if "pages" in parts or "page" in name:
+        return "page"
+    if "components" in parts:
+        return "component"
+    if name in {"hooks.ts", "hooks.tsx"} or "hooks" in name:
+        return "hook"
+    if "data" in parts or name in {"api.ts", "api.tsx", "client.js", "client.ts"}:
+        return "shared_client"
+    return "other"
 
 
 def _call_window(text: str, start: int, maxlen: int = 400) -> str:
-    """从调用起点截取双目配平后的完整调用文本（模板内嵌括号不截断）。"""
+    """截取调用窗口，跳过 TypeScript 泛型中的 ``{}``。
+
+    ``request<Result<{ value: string }>>(...)`` contains braces before the
+    actual call parenthesis.  Starting depth tracking at ``request`` caused
+    the old scanner to return before reaching ``method: 'POST'``.
+    """
+    open_paren = text.find("(", start, start + maxlen)
+    if open_paren < 0:
+        return text[start:start + maxlen]
     depth = 0
-    i = start
+    i = open_paren
     while i < len(text) and i - start < maxlen:
         ch = text[i]
         if ch in "([{":
@@ -246,7 +297,7 @@ def _call_window(text: str, start: int, maxlen: int = 400) -> str:
     return text[start:i]
 
 
-def extract_frontend(root: Path, label: str) -> list[FrontendEntry]:
+def extract_frontend(root: Path, label: str, *, scope: str = "canonical") -> list[FrontendEntry]:
     out: list[FrontendEntry] = []
     for ext in ("js", "jsx", "ts", "tsx"):
         for f in sorted(root.rglob(f"*.{ext}")):
@@ -263,6 +314,17 @@ def extract_frontend(root: Path, label: str) -> list[FrontendEntry]:
                 # 通用包装器形态（fetch(`${BASE}${path}`)）无法静态解析，跳过
                 if path_token.startswith("${BASE}${"):
                     continue
+                # A second expression immediately after a path expression is
+                # normally query-string construction (``.../${id}${query}``)
+                # or a nested query template.  Keep the path expression and
+                # discard the dynamic query suffix; slash-separated path
+                # parameters (``/.../${a}/${b}``) remain intact.
+                first_expr = path_token.find("${")
+                if first_expr >= 0:
+                    first_close = path_token.find("}", first_expr + 2)
+                    second_expr = path_token.find("${", first_close + 1) if first_close >= 0 else -1
+                    if second_expr > first_expr and path_token[second_expr - 1] != "/":
+                        path_token = path_token[:second_expr]
                 # 嵌套反引号/未闭合 ${ 的模板（query 拼接截断）→ 取第一个 ${ 前缀为净路径
                 if "${" in path_token and not re.search(r"\$\{[^}]*\}", path_token):
                     path_token = path_token.split("${", 1)[0].rstrip()
@@ -278,6 +340,9 @@ def extract_frontend(root: Path, label: str) -> list[FrontendEntry]:
                     file=_rel_or_abs(f),
                     line=text.count("\n", 0, m.start()) + 1,
                     kind="template" if "`" in m.group(2) else "literal",
+                    scope=scope,
+                    surface=classify_frontend_surface(f),
+                    symbol=_enclosing_export_symbol(text, m.start()),
                 ))
             # const path = '/…' 形态（request(path) 变量传参）
             for m in _PATH_VAR_RE.finditer(text):
@@ -291,7 +356,105 @@ def extract_frontend(root: Path, label: str) -> list[FrontendEntry]:
                     file=_rel_or_abs(f),
                     line=text.count("\n", 0, m.start()) + 1,
                     kind="path-var",
+                    scope=scope,
+                    surface=classify_frontend_surface(f),
+                    symbol=_enclosing_export_symbol(text, m.start()),
                 ))
+    return out
+
+
+def collect_frontend(*, include_legacy: bool = False) -> list[FrontendEntry]:
+    """Collect the canonical product frontend and, optionally, legacy evidence."""
+    canonical_root = REPO_ROOT / "frontend_cybergothic" / "src"
+    entries = extract_frontend(canonical_root, "cybergothic", scope="canonical")
+    entries.extend(_extract_symbol_consumers(canonical_root, entries, scope="canonical"))
+    if include_legacy:
+        legacy_root = REPO_ROOT / "frontend" / "src"
+        legacy_entries = extract_frontend(legacy_root, "legacy", scope="legacy")
+        entries += legacy_entries
+        entries.extend(_extract_symbol_consumers(legacy_root, legacy_entries, scope="legacy"))
+    return entries
+
+
+def _extract_symbol_consumers(
+    root: Path, entries: list[FrontendEntry], *, scope: str
+) -> list[FrontendEntry]:
+    """Add static evidence for pages/components/hooks invoking API helpers.
+
+    This only follows symbols that have a route literal in the same frontend
+    tree. It never resolves dynamic imports or URLs, so a match is additional
+    evidence for a known route rather than a new endpoint.
+    """
+    by_symbol: dict[str, list[FrontendEntry]] = {}
+    for entry in entries:
+        if entry.symbol:
+            by_symbol.setdefault(entry.symbol, []).append(entry)
+    if not by_symbol:
+        return []
+    out: list[FrontendEntry] = []
+    symbol_pattern = re.compile(
+        r"(?<![A-Za-z0-9_$])(?:(?P<qual>[A-Za-z_$][\w$]*)\.)?"
+        r"(?P<symbol>[A-Za-z_$][\w$]*)\s*\("
+    )
+    import_pattern = re.compile(
+        r"import\s+(?P<spec>[^;]*?)\s+from\s+['\"](?P<path>[^'\"]+)['\"]",
+        re.S,
+    )
+    for ext in ("js", "jsx", "ts", "tsx"):
+        for file in sorted(root.rglob(f"*.{ext}")):
+            if "node_modules" in file.parts or "dist" in file.parts:
+                continue
+            if file.name.lower() in {"api.ts", "api.tsx", "client.js", "client.ts"}:
+                continue
+            try:
+                text = file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            namespaces: set[str] = set()
+            local_symbols: set[str] = set()
+            for import_match in import_pattern.finditer(text):
+                import_path = import_match.group("path").replace("\\", "/")
+                if not re.search(r"(?:^|/)api(?:\.tsx?|\.jsx?)?$", import_path):
+                    continue
+                spec = import_match.group("spec").strip()
+                namespace_match = re.search(r"\*\s+as\s+([A-Za-z_$][\w$]*)", spec)
+                if namespace_match:
+                    namespaces.add(namespace_match.group(1))
+                named_match = re.search(r"\{(?P<body>.*?)\}", spec, re.S)
+                if named_match:
+                    for item in named_match.group("body").split(","):
+                        parts = re.split(r"\s+as\s+", item.strip())
+                        if parts and parts[0].strip() in by_symbol:
+                            local_symbols.add(parts[-1].strip())
+            if not namespaces and not local_symbols:
+                continue
+            seen: set[tuple[str, str, int]] = set()
+            for match in symbol_pattern.finditer(text):
+                qualifier = match.group("qual")
+                symbol = match.group("symbol")
+                if (qualifier and qualifier not in namespaces) or (not qualifier and symbol not in local_symbols):
+                    continue
+                source_entries = by_symbol.get(symbol)
+                if not source_entries:
+                    continue
+                line = text.count("\n", 0, match.start()) + 1
+                surface = classify_frontend_surface(file)
+                for source_entry in source_entries:
+                    key = (source_entry.path, str(file), line)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(FrontendEntry(
+                        method=source_entry.method,
+                        path=source_entry.path,
+                        source=f"{scope}/{file.name}",
+                        file=_rel_or_abs(file),
+                        line=line,
+                        kind="symbol-call",
+                        scope=scope,
+                        surface=surface,
+                        symbol=symbol,
+                    ))
     return out
 
 
@@ -342,12 +505,144 @@ _INTERNAL_HINTS = (
     "spare-master", "/activate", "probe", "sidecar", "smoke", "worker",
 )
 
+# 只使用具有明确语义的实验域提示。普通 ``/api/workflows`` 等路径即使
+# 当前由实验开关保护，也不能因为名称相似而把已经接入页面的产品接口
+# 误标为实验域；后端 source 命中 experimental controller 时同样成立。
+_EXPERIMENTAL_PATH_HINTS = (
+    "/api/experimental/",
+    "/api/speculative",
+    "/api/diffusion/distributed",
+    "/api/diffusion/mixed",
+)
+_EXPERIMENTAL_SOURCE_HINTS = ("experimental.controller.ts", "experimental.py")
+
 
 def is_internal(norm: str) -> bool:
     """非 /api 前缀，或命中内部面关键词 → 判为内部/节点面（前端不调属正常）。"""
     if not norm.startswith("/api/"):
         return True
     return any(h in norm for h in _INTERNAL_HINTS)
+
+
+def is_experimental(norm: str, backend_entries: list[BackendEntry] | None = None) -> bool:
+    """Return whether an endpoint belongs to an explicitly experimental domain."""
+    if any(h in norm for h in _EXPERIMENTAL_PATH_HINTS):
+        return True
+    return any(
+        any(h in entry.source.lower() for h in _EXPERIMENTAL_SOURCE_HINTS)
+        for entry in (backend_entries or [])
+    )
+
+
+def coverage_status(entries: list[FrontendEntry]) -> str:
+    """Return the strongest static consumer evidence for one normalized path."""
+    surfaces = {e.surface for e in entries}
+    if "page" in surfaces:
+        return "page_consumed"
+    if "component" in surfaces:
+        return "component_consumed"
+    if "hook" in surfaces:
+        return "hook_consumed"
+    if "shared_client" in surfaces:
+        return "client_declared"
+    if surfaces:
+        return "other_frontend_evidence"
+    return "unconsumed"
+
+
+def frontend_scope_counts(entries: list[FrontendEntry]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        counts[entry.scope] = counts.get(entry.scope, 0) + 1
+    return counts
+
+
+def frontend_surface_counts(entries: list[FrontendEntry]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        counts[entry.surface] = counts.get(entry.surface, 0) + 1
+    return counts
+
+
+def coverage_summary(report: GapReport) -> dict[str, int]:
+    """Summarize direct static route evidence without pretending to trace imports."""
+    backend_by_path: dict[str, list[BackendEntry]] = {}
+    for entry in report.backend:
+        backend_by_path.setdefault(normalize_path(entry.path), []).append(entry)
+    frontend_by_path: dict[str, list[FrontendEntry]] = {}
+    for entry in report.frontend:
+        frontend_by_path.setdefault(normalize_path(entry.path), []).append(entry)
+    counts = {"page_consumed": 0, "component_consumed": 0,
+              "hook_consumed": 0, "client_declared": 0,
+              "other_frontend_evidence": 0, "internal_protocol": 0,
+              "unconsumed": 0}
+    for path in backend_by_path:
+        if path in frontend_by_path:
+            status = coverage_status(frontend_by_path[path])
+        elif is_internal(path):
+            status = "internal_protocol"
+        else:
+            status = "unconsumed"
+        counts[status] += 1
+    return counts
+
+
+def _frontend_files_by_surface(entries: list[FrontendEntry]) -> dict[str, list[str]]:
+    grouped: dict[str, set[str]] = {}
+    for entry in entries:
+        grouped.setdefault(entry.surface, set()).add(entry.file)
+    return {surface: sorted(files) for surface, files in sorted(grouped.items())}
+
+
+def build_ownership(report: GapReport) -> list[dict[str, Any]]:
+    """Aggregate static evidence into a deterministic endpoint ownership table.
+
+    The table intentionally separates ``domain`` (product/internal/experimental)
+    from ``frontend_status`` (page/client/unconsumed). An experimental endpoint
+    may therefore still be visible as page-consumed without being mistaken for a
+    normal production route.
+    """
+    backend_by_path: dict[str, list[BackendEntry]] = {}
+    for entry in report.backend:
+        backend_by_path.setdefault(normalize_path(entry.path), []).append(entry)
+    frontend_by_path: dict[str, list[FrontendEntry]] = {}
+    for entry in report.frontend:
+        frontend_by_path.setdefault(normalize_path(entry.path), []).append(entry)
+
+    rows: list[dict[str, Any]] = []
+    for path in sorted(set(backend_by_path) | set(frontend_by_path)):
+        backend_entries = backend_by_path.get(path, [])
+        frontend_entries = frontend_by_path.get(path, [])
+        frontend_status = coverage_status(frontend_entries) if frontend_entries else "unconsumed"
+        if is_experimental(path, backend_entries):
+            domain = "experimental"
+        elif is_internal(path):
+            domain = "internal_protocol"
+        else:
+            domain = "product"
+        rows.append({
+            "path": path,
+            "domain": domain,
+            "frontend_status": frontend_status,
+            "backend_methods": sorted({entry.method for entry in backend_entries}),
+            "frontend_methods": sorted({entry.method for entry in frontend_entries}),
+            "backend_files": sorted({entry.file for entry in backend_entries}),
+            "frontend_files_by_surface": _frontend_files_by_surface(frontend_entries),
+            "frontend_entry_count": len(frontend_entries),
+            "backend_entry_count": len(backend_entries),
+            "has_backend": bool(backend_entries),
+            "has_frontend": bool(frontend_entries),
+        })
+    return rows
+
+
+def ownership_summary(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Count ownership rows by domain and frontend evidence status."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        for key in (f"domain:{row['domain']}", f"frontend:{row['frontend_status']}"):
+            counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def exit_code(report: GapReport) -> int:
@@ -369,6 +664,8 @@ def render(report: GapReport, only: str = "") -> str:
         "QLH 接口契约对齐审计（静态面扫描）",
         "═" * 72,
         f"后端定义: {len(report.backend)} 条 · 前端引用: {len(report.frontend)} 条",
+        f"前端 scope: {frontend_scope_counts(report.frontend)} · surface: {frontend_surface_counts(report.frontend)}",
+        f"覆盖证据: {coverage_summary(report)}",
         "",
         f"── 缺口 A：前端调用但后端未定义（404 风险）—— {len(a)} 条",
     ]
@@ -378,10 +675,10 @@ def render(report: GapReport, only: str = "") -> str:
     lines += [
         "",
         f"── 缺口 B：后端已定义但前端未消费 —— {len(b)} 条"
-        f"（内部/节点面 {sum(1 for p, _m, _es in b if is_internal(p))} 条，标 [i]）",
+        f"（内部协议 {sum(1 for p, _m, _es in b if is_internal(p))} 条，标 [internal_protocol]）",
     ]
     for p, m, es in b:
-        tag = " [i]" if is_internal(p) else ""
+        tag = " [internal_protocol]" if is_internal(p) else " [unconsumed]"
         for e in es:
             lines.append(f"  [{m:<7}] {p:<52} {e.file}:{e.line}{tag}")
     lines += [
@@ -395,13 +692,41 @@ def render(report: GapReport, only: str = "") -> str:
     return "\n".join(lines)
 
 
+def render_ownership(report: GapReport, only: str = "") -> str:
+    rows = build_ownership(report)
+    if only:
+        rows = [row for row in rows if only in row["path"]]
+    lines = [
+        "═" * 120,
+        "QLH endpoint ownership（静态证据表）",
+        "═" * 120,
+        "domain 与 frontend_status 分离：实验端点仍可被页面消费，但不会被误认为普通生产接口。",
+        "",
+        "| endpoint | domain | frontend_status | backend methods | frontend surfaces |",
+        "|---|---|---|---|---|",
+    ]
+    for row in rows:
+        surfaces = ", ".join(sorted(row["frontend_files_by_surface"])) or "-"
+        backend_methods = ",".join(row["backend_methods"]) or "-"
+        lines.append(
+            f"| `{row['path']}` | `{row['domain']}` | `{row['frontend_status']}` "
+            f"| `{backend_methods}` | `{surfaces}` |"
+        )
+    lines += ["", f"共 {len(rows)} 个归一化 endpoint；`--json` 输出可供 CI 消费的完整 ownership 数组。"]
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="api-gap-scan", description=__doc__)
     parser.add_argument("--include-gateway", action="store_true",
                         help="纳入 TS 网关（gateway/src）controller 面")
     parser.add_argument("--include-control", action="store_true",
                         help="纳入 control-svc（control/src）controller 面")
+    parser.add_argument("--include-legacy-frontend", action="store_true",
+                        help="追加旧 frontend/src 对照面；默认只扫描 frontend_cybergothic/src")
     parser.add_argument("--json", action="store_true", help="输出 JSON 到 stdout")
+    parser.add_argument("--ownership", action="store_true",
+                        help="输出 endpoint ownership 表（与 --json 可组合）")
     parser.add_argument("-o", "--output", default="", help="写报告/JSON 到文件")
     parser.add_argument("--only", default="", help="只输出含该子串的路径")
     args = parser.parse_args(argv)
@@ -412,19 +737,24 @@ def main(argv: list[str] | None = None) -> int:
             backend += extract_ts_controllers(REPO_ROOT / "gateway" / "src")
         if args.include_control:
             backend += extract_ts_controllers(REPO_ROOT / "control" / "src")
-        frontend = (extract_frontend(REPO_ROOT / "frontend" / "src", "frontend")
-                    + extract_frontend(REPO_ROOT / "frontend_cybergothic" / "src", "cybergothic"))
+        frontend = collect_frontend(include_legacy=args.include_legacy_frontend)
     except Exception as exc:  # noqa: BLE001
         print(f"提取失败: {exc}", file=sys.stderr)
         return 10
 
     report = compare(backend, frontend)
+    ownership = build_ownership(report)
     if args.json:
         payload = {
             "schema": "qlh.api_gap_scan.v1",
+            "ownership_schema": "qlh.api_ownership.v1",
             "summary": {
                 "backend": len(report.backend), "frontend": len(report.frontend),
                 "gap_a": len(report.a), "gap_b": len(report.b), "soft": len(report.soft),
+                "frontend_scope_counts": frontend_scope_counts(report.frontend),
+                "frontend_surface_counts": frontend_surface_counts(report.frontend),
+                "coverage_counts": coverage_summary(report),
+                "ownership_counts": ownership_summary(ownership),
             },
             "inventory": {
                 "backend": [e.__dict__ for e in report.backend],
@@ -437,6 +767,7 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 "backend_without_frontend": [
                     {"path": p, "method": m, "internal": is_internal(p),
+                     "classification": "internal_protocol" if is_internal(p) else "unconsumed",
                      "backend": [e.__dict__ for e in es]}
                     for p, m, es in report.b
                 ],
@@ -446,8 +777,11 @@ def main(argv: list[str] | None = None) -> int:
                     for p, fm, bm, es in report.soft
                 ],
             },
+            "ownership": ownership,
         }
         text = json.dumps(payload, ensure_ascii=False, indent=2)
+    elif args.ownership:
+        text = render_ownership(report, only=args.only)
     else:
         text = render(report, only=args.only)
 
