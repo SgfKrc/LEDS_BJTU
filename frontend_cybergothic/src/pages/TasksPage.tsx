@@ -1,6 +1,6 @@
 /** Task operations workspace: queue controls, workflow index, and a persistent execution detail. */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Ban, Pause, Play, RefreshCw, SlidersHorizontal } from 'lucide-react';
 import { PageHeader, SectionHead } from '../components/PageHeader';
 import { TaskTable, type Column } from '../components/TaskTable';
@@ -10,6 +10,7 @@ import { EmptyState, SkeletonRows } from '../components/EmptyState';
 import { Drawer } from '../components/Drawer';
 import { pushToast } from '../components/Toast';
 import { useRegisterRefresh } from '../app/refreshBus';
+import { routeHref } from '../app/routes';
 import { useReveal } from '../motion/useReveal';
 import { formatDuration, formatRelative } from '../motion/countUp';
 import { labelForState, toneForState } from '../components/statusTone';
@@ -46,23 +47,61 @@ function QueueDetail({ task }: { task: LeveledTask }) {
   );
 }
 
+function errorCode(value?: string): string {
+  const match = String(value || '').trim().match(/^([A-Za-z][A-Za-z0-9_]{1,63})/);
+  return match?.[1] || '';
+}
+
+function auditHref(workflowId: string): string {
+  const base = routeHref('audit');
+  return `${base}${base.includes('?') ? '&' : '?'}workflow_id=${encodeURIComponent(workflowId)}`;
+}
+
 function WorkflowDetail({ workflow }: { workflow: WorkflowRecord }) {
+  const observability = workflow.observability;
+  const stages = workflow.stages ?? [];
   return (
-    <>
+    <div data-testid="workflow-detail">
       <dl className="kvlist">
         <div><dt>状态</dt><dd><StatusBadge state={workflow.state} size="sm" /></dd></div>
         <div><dt>会话</dt><dd className="cell-mono">{workflow.session_id || '—'}</dd></div>
         <div><dt>模板</dt><dd>{workflow.template || '—'}</dd></div>
         <div><dt>创建</dt><dd>{formatRelative(workflow.created_at ?? 0)}</dd></div>
         <div><dt>更新</dt><dd>{formatRelative(workflow.updated_at ?? 0)}</dd></div>
+        <div><dt>阶段 / attempts</dt><dd className="num-display">{workflow.completed_stage_count ?? stages.filter((stage) => ['succeeded', 'success', 'completed'].includes(String(stage.state).toLowerCase())).length} / {workflow.stage_count ?? stages.length} · {workflow.attempt_count ?? stages.reduce((count, stage) => count + (stage.attempts?.length ?? 0), 0)}</dd></div>
       </dl>
+      {observability ? <div className="workflow-observability" data-testid="workflow-observability">
+        <div><span>重试</span><strong>{observability.retry_count ?? workflow.retry_count ?? 0}</strong></div>
+        <div><span>重派</span><strong>{observability.reassignment_count ?? 0}</strong></div>
+        <div><span>结果拒绝</span><strong>{observability.result_rejection_count ?? workflow.result_rejection_count ?? 0}</strong></div>
+        <div><span>执行节点</span><strong>{observability.actual_nodes?.length ?? 0}</strong></div>
+      </div> : null}
       {workflow.error ? <p className="inline-error" role="alert">{workflow.error}</p> : null}
-      <h3 className="drawer__subtitle">执行阶段</h3>
-      {(workflow.stages ?? []).length === 0 ? <EmptyState kind="empty" title="没有阶段记录" compact /> : <ol className="stagelist">{(workflow.stages ?? []).map((stage, index) => {
+      <div className="workflow-detail__heading"><h3 className="drawer__subtitle">执行阶段</h3><a className="workflow-audit-link" href={auditHref(workflow.workflow_id)}>查看审计索引</a></div>
+      {stages.length === 0 ? <EmptyState kind="empty" title="没有阶段记录" compact /> : <ol className="stagelist">{stages.map((stage, index) => {
         const duration = stage.started_at && stage.finished_at ? formatDuration(stage.finished_at - stage.started_at) : stage.started_at ? '进行中' : '—';
-        return <li className={`stage stage--${toneForState(stage.state)}`} key={stage.stage_id || index}><div className="stage__head"><span className="stage__id cell-mono">{stage.stage_id || `阶段 ${index + 1}`}</span><StatusBadge state={stage.state} size="sm" /></div><p className="stage__meta">{stage.stage_type || '—'} · {stage.provider_id || '未分配'} · {stage.node_id || '—'} · {duration}</p>{stage.error ? <p className="stage__error">{stage.error}</p> : null}</li>;
+        const stageId = stage.stage_id || `阶段 ${index + 1}`;
+        const provider = stage.provider_id || stage.provider || stage.selected_provider || '未分配';
+        const stageErrorCode = errorCode(stage.error) || stage.last_retry_error_code;
+        const bindings = Object.entries(stage.input_bindings ?? {});
+        const attempts = stage.attempts ?? [];
+        return <li className={`stage stage--${toneForState(stage.state)}`} key={stage.stage_id || index} data-testid="workflow-stage">
+          <div className="stage__head"><span className="stage__id cell-mono">{stageId}</span><StatusBadge state={stage.state} size="sm" /></div>
+          <p className="stage__meta">{stage.stage_type || '—'} · {provider} · {stage.provider_node_id || stage.node_id || '—'} · {duration}</p>
+          <div className="stage-contract-grid">
+            <div><span>输入契约</span><strong>{bindings.length ? bindings.map(([key, binding]) => `${key} ← ${binding.dependency_stage_id || 'dependency'}.${binding.output_key || 'output'}`).join(' · ') : stage.depends_on?.length ? `${stage.depends_on.length} 个依赖` : 'root input'}</strong></div>
+            <div><span>输出摘要</span><strong>{stage.output_available ? `${stage.output_size_bytes ?? 0} B · ${stage.output_sha256 ? `sha256:${stage.output_sha256.slice(0, 12)}` : '已生成'}` : '未提交'}</strong></div>
+          </div>
+          {stageErrorCode || stage.last_result_rejection_reason ? <p className="stage__error"><span className="stage__error-code">{stageErrorCode || 'RESULT_REJECTED'}</span> {stage.error || stage.last_result_rejection_reason}</p> : null}
+          {attempts.length ? <div className="stage-attempts"><span className="stage-attempts__label">Attempts / worker</span>{attempts.map((attempt, attemptIndex) => <article className="stage-attempt" key={attempt.attempt_id || attemptIndex}>
+            <div className="stage-attempt__head"><span className="cell-mono">{attempt.attempt_id || `attempt-${attemptIndex + 1}`}</span><StatusBadge state={attempt.state} size="sm" /></div>
+            <p>{attempt.provider || provider} · {attempt.provider_node_id || '未绑定 worker'} · {attempt.duration_seconds !== undefined ? formatDuration(attempt.duration_seconds) : '—'}</p>
+            {attempt.error ? <small><span className="stage__error-code">{errorCode(attempt.error) || 'ATTEMPT_FAILED'}</span> {attempt.error}</small> : null}
+            {attempt.result_sha256 ? <small className="cell-mono">result sha256:{attempt.result_sha256.slice(0, 12)}</small> : null}
+          </article>)}</div> : <p className="stage-attempts__empty">尚未产生 attempt 记录</p>}
+        </li>;
       })}</ol>}
-    </>
+    </div>
   );
 }
 
@@ -100,6 +139,7 @@ export function TasksPage() {
   const [activeTask, setActiveTask] = useState<LeveledTask | null>(null);
   const [busyAction, setBusyAction] = useState('');
   const [compactDetails, setCompactDetails] = useState(false);
+  const workflowDetailRequest = useRef(0);
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 1199px)');
@@ -203,10 +243,22 @@ export function TasksPage() {
     setActiveTask(task);
     setActiveWorkflow(null);
   }, []);
-  const selectWorkflow = useCallback((workflow: WorkflowRecord) => {
+  const selectWorkflow = useCallback(async (workflow: WorkflowRecord) => {
     setActiveWorkflow(workflow);
     setActiveTask(null);
-  }, []);
+    if (usingFixtures) return;
+    const requestNumber = workflowDetailRequest.current + 1;
+    workflowDetailRequest.current = requestNumber;
+    setBusyAction(`workflow-detail:${workflow.workflow_id}`);
+    try {
+      const detail = await api.fetchWorkflow(workflow.workflow_id);
+      if (workflowDetailRequest.current === requestNumber) setActiveWorkflow(detail);
+    } catch (error) {
+      pushToast(`加载工作流详情失败：${api.describeError(error)}`, 'danger');
+    } finally {
+      if (workflowDetailRequest.current === requestNumber) setBusyAction('');
+    }
+  }, [usingFixtures]);
   const detailTitle = activeWorkflow?.workflow_id || activeTask?.task_id || '';
   const detailContent = activeWorkflow ? <WorkflowDetail workflow={activeWorkflow} /> : activeTask ? <QueueDetail task={activeTask} /> : <EmptyState kind="empty" title="未选择执行项" description="从队列或工作流表中选择一行以固定详情。" compact />;
   const queueDenied = role.state === 'ready' && !canManageQueue;

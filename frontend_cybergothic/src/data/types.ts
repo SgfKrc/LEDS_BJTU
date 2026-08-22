@@ -218,6 +218,18 @@ export interface AuthMutationResponse {
   [key: string]: unknown;
 }
 
+export interface AuthProvisioning {
+  user_id: string;
+  authenticator_id: string;
+  secret: string;
+  qr_payload: string;
+  otpauth_uri: string;
+  algorithm?: string;
+  digits?: number;
+  period_seconds?: number;
+  [key: string]: unknown;
+}
+
 export interface TailscaleBinding {
   binding_id: string;
   user_id?: string;
@@ -346,20 +358,102 @@ export interface WorkflowStage {
   state?: string;
   provider_id?: string;
   node_id?: string;
+  provider?: string;
+  requested_provider?: string;
+  selected_provider?: string;
+  provider_node_id?: string;
+  provider_kind?: string;
+  depends_on?: string[];
+  input_bindings?: Record<string, {
+    dependency_stage_id?: string;
+    output_key?: string;
+    [key: string]: unknown;
+  }>;
+  winner_attempt_id?: string;
+  retry_count?: number;
+  same_provider_retry_count?: number;
+  last_retry_error_code?: string;
+  result_rejection_count?: number;
+  last_result_rejection_reason?: string;
+  output_available?: boolean;
+  output_sha256?: string;
+  output_size_bytes?: number;
   started_at?: number;
   finished_at?: number;
+  duration_seconds?: number;
   error?: string;
+  attempts?: WorkflowAttempt[];
+  [key: string]: unknown;
+}
+
+export interface WorkflowAttempt {
+  attempt_id?: string;
+  provider?: string;
+  provider_kind?: string;
+  provider_node_id?: string;
+  reservation_id?: string;
+  reservation_active?: boolean;
+  lease_id?: string;
+  lease_epoch?: number;
+  lease_expires_at?: number;
+  lease_enforced?: boolean;
+  state?: string;
+  started_at?: number;
+  finished_at?: number;
+  duration_seconds?: number;
+  error?: string;
+  result_metadata?: Record<string, unknown>;
+  result_sha256?: string;
+  [key: string]: unknown;
 }
 
 export interface WorkflowRecord {
   workflow_id: string;
   session_id?: string;
+  request_id?: string;
   template?: string;
   state?: string;
+  final_stage_id?: string;
   created_at?: number;
+  started_at?: number;
+  result_ready_at?: number;
+  finished_at?: number;
+  duration_seconds?: number;
   updated_at?: number;
+  stage_count?: number;
+  completed_stage_count?: number;
+  failed_stage_count?: number;
+  attempt_count?: number;
+  retry_count?: number;
+  same_provider_retry_count?: number;
+  result_rejection_count?: number;
+  cancel_requested?: boolean;
   stages?: WorkflowStage[];
   error?: string;
+  observability?: {
+    state?: string;
+    result_ready?: boolean;
+    terminal?: boolean;
+    partial_result?: boolean;
+    recovered_after_restart?: boolean;
+    recovery_reason?: string;
+    retry_count?: number;
+    same_provider_retry_count?: number;
+    reassignment_count?: number;
+    retrying?: boolean;
+    result_rejection_count?: number;
+    last_result_rejection_reason?: string;
+    actual_providers?: string[];
+    actual_nodes?: string[];
+    [key: string]: unknown;
+  };
+  journal?: {
+    available?: boolean;
+    record_count?: number;
+    retention_days?: number;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
 }
 
 export interface ProviderStatus {
@@ -495,6 +589,53 @@ export interface ClientErrorReport {
   stack?: string;
   user_agent?: string;
   extra?: Record<string, unknown>;
+}
+
+export interface StorageHealthResponse {
+  local?: {
+    status?: string;
+    backend?: string;
+    writable?: boolean;
+    path?: string;
+    journal_mode?: string;
+    synchronous?: string;
+    error?: string;
+    [key: string]: unknown;
+  };
+  remote?: {
+    status?: string;
+    backend?: string;
+    mode?: string;
+    [key: string]: unknown;
+  };
+  projection?: { pending_events?: number; oldest_event_age_seconds?: number | null; [key: string]: unknown };
+  export?: { pending_items?: number; oldest_item_age_seconds?: number | null; [key: string]: unknown };
+  effective_mode?: string;
+  retirement?: { status?: string; prepared_at?: string | null; retired_at?: string | null; [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+export interface SpeculativeCapabilityResponse {
+  enabled: boolean;
+  configured?: boolean;
+  available: boolean;
+  execution_mode?: string;
+  local_only?: boolean;
+  data_scope?: string;
+  reason_code?: string;
+  verify_model?: string;
+  gamma?: number;
+  max_rounds?: number;
+  [key: string]: unknown;
+}
+
+export interface SpeculativeExperimentResponse {
+  content?: string;
+  finish_reason?: string;
+  metrics?: Record<string, unknown>;
+  rounds?: number;
+  request_id?: string | null;
+  [key: string]: unknown;
 }
 
 export interface RagSource {
@@ -690,11 +831,92 @@ export interface RagRebuildResponse {
   [key: string]: unknown;
 }
 
-export interface DiffusionDistributedResponse extends DiffusionJob {
+export interface RagCapacityResponse {
+  dimensions?: number;
+  active_chunk_count?: number;
+  embedding_count?: number;
+  current_identity_embedding_count?: number;
+  stale_embedding_count?: number;
+  estimated_vector_bytes?: number;
+  database_bytes?: number;
+  wal_bytes?: number;
+  estimated_total_bytes?: number;
+  max_index_chunks?: number;
+  [key: string]: unknown;
+}
+
+export interface RagAnnDecision {
+  decision?: 'GO' | 'NO_GO' | string;
+  reason?: string;
+  corpus_chunks?: number;
+  scan_budget?: number;
+  extension?: string;
+  extension_available?: boolean;
+  production_approved?: boolean;
+  [key: string]: unknown;
+}
+
+export interface RagAnnDecisionResponse {
+  storage?: string;
+  decision?: RagAnnDecision;
+  [key: string]: unknown;
+}
+
+export interface RagEmbeddingJob {
+  job_id: string;
+  kind?: string;
+  state?: 'queued' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed' | string;
+  cursor?: { total?: number; indexed?: number; position?: number; batch_size?: number; model_id?: string; [key: string]: unknown };
+  error_code?: string | null;
+  attempts?: number;
+  lease_active?: boolean;
+  created_at?: number | string;
+  updated_at?: number | string;
+  [key: string]: unknown;
+}
+
+export interface DiffusionDistributedResponse {
+  job_id?: string;
+  state?: string;
   workflow_id?: string;
   artifact_id?: string;
   blob_id?: string;
   images?: Array<Record<string, unknown>>;
+  distributed?: boolean;
+  status?: string;
+  workflow?: Record<string, unknown>;
+  result?: {
+    image?: { blob_id?: string; url?: string; content_type?: string; size_bytes?: number; [key: string]: unknown };
+    images?: Array<{ blob_id?: string; url?: string; [key: string]: unknown }>;
+    metrics?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  provider_id?: string;
+  node_id?: string;
+  cancellation?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface DiffusionArtifactInspectResponse extends DiffusionArtifact {
+  path?: string;
+}
+
+export interface DiffusionAssetActionResponse {
+  status?: string;
+  asset_id?: string;
+  valid?: boolean;
+  path?: string;
+  artifact_id?: string;
+  artifact?: Record<string, unknown>;
+  job?: Record<string, unknown> | null;
+  [key: string]: unknown;
+}
+
+export interface DiffusionBlobUploadResponse {
+  blob_id: string;
+  content_type?: string;
+  size_bytes?: number;
+  sha256?: string;
   [key: string]: unknown;
 }
 
@@ -935,6 +1157,62 @@ export interface PreparePipelineResponse {
   [key: string]: unknown;
 }
 
+export interface ModelRegistryResponse {
+  models: ModelSummary[];
+  [key: string]: unknown;
+}
+
+export interface ModelDownloadManifest {
+  model_id?: string;
+  sha256?: string;
+  artifact_sha256?: string;
+  total_layers?: number;
+  files?: Array<{
+    path?: string;
+    size_bytes?: number;
+    sha256?: string;
+    [key: string]: unknown;
+  }>;
+  count?: number;
+  [key: string]: unknown;
+}
+
+export interface ModelPipelineAssignmentResponse {
+  model_id?: string;
+  assignments?: Array<Record<string, unknown>>;
+  segments?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+export interface DeploymentSimulationRecord {
+  node_id?: string;
+  status?: string;
+  error?: string | null;
+  [key: string]: unknown;
+}
+
+export interface DeploymentSimulationPlan {
+  schema_version?: number;
+  plan_id: string;
+  artifact_id: string;
+  runtime_profile: string;
+  required_capabilities?: string[];
+  target_nodes?: string[];
+  actual_nodes?: string[];
+  status?: string;
+  epoch?: number;
+  records?: DeploymentSimulationRecord[];
+  created_at?: string;
+  updated_at?: string;
+  [key: string]: unknown;
+}
+
+export interface DeploymentSimulationResponse {
+  status?: string;
+  plan?: DeploymentSimulationPlan;
+  [key: string]: unknown;
+}
+
 export interface ClusterProfile {
   profile_id: string;
   name: string;
@@ -950,6 +1228,41 @@ export interface ClusterProfilesResponse { profiles: ClusterProfile[]; [key: str
 export interface ClusterCurrentProfileResponse { profile: ClusterProfile | null; [key: string]: unknown }
 export interface ClusterDiscoveryResponse { candidates: Array<Record<string, unknown>>; [key: string]: unknown }
 export interface ClusterEndpointsResponse { endpoints: Array<Record<string, unknown>>; [key: string]: unknown }
+
+export interface ClusterLayersResponse {
+  total?: number;
+  strategy?: string;
+  assignments: Array<Record<string, unknown>>;
+  computed_at?: number | null;
+  cache_key?: string;
+  [key: string]: unknown;
+}
+
+export interface ModelRuntimeSidecarProfile {
+  display_name?: string;
+  runtime_environment?: string;
+  preflight_supported?: boolean;
+  requires_task_contract?: boolean;
+  production_admitted?: boolean;
+  supported_actions?: string[];
+  session?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface ModelRuntimeSidecarStatusResponse {
+  schema_version?: number;
+  role?: string;
+  control_available?: boolean;
+  production_admitted?: boolean;
+  profiles: Record<string, ModelRuntimeSidecarProfile>;
+  [key: string]: unknown;
+}
+
+export interface ModelRuntimeContractsResponse {
+  schema_version?: number;
+  contracts: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
 
 export interface ModelPreflightResponse {
   schema_version?: number;

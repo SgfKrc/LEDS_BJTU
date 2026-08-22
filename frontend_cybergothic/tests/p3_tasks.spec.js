@@ -14,6 +14,8 @@ test('tasks workspace separates queue controls, workflow records, and detail on 
   await page.getByRole('button', { name: 'Workflows' }).click();
   await page.locator('.tasks-workspace[data-workspace="workflows"] .ttable__open').first().click();
   await expect(page.locator('.tasks-detail-panel')).toContainText('执行阶段');
+  await expect(page.getByTestId('workflow-detail')).toContainText('Attempts / worker');
+  await expect(page.getByTestId('workflow-detail')).toContainText('查看审计索引');
 });
 
 test('tasks workspace sends workflow details to a drawer on tablet', async ({ page }) => {

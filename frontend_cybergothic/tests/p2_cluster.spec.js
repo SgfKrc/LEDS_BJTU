@@ -50,3 +50,14 @@ test('cluster admin is read-only on a client role and does not request invite da
   await expect(page.locator('.cluster-table__actions')).toContainText('read only');
   expect(inviteRequests).toBe(0);
 });
+
+test('cluster admin exposes capacity, layer and sidecar contract projections', async ({ page }) => {
+  await page.goto('/#/cluster?fixtures=1');
+
+  await expect(page.locator('#cluster-plans')).toBeVisible();
+  await expect(page.locator('.cluster-plan-status')).toContainText('ADMITTED');
+  await expect(page.locator('.cluster-layer-list .cluster-layer-row')).toHaveCount(2);
+  await expect(page.locator('.cluster-endpoint-list .cluster-endpoint-row')).toContainText('Local API');
+  await expect(page.locator('.cluster-sidecar-list .cluster-sidecar-row')).toHaveCount(2);
+  await expect(page.locator('.cluster-contract-summary')).toContainText('experimental gate only');
+});

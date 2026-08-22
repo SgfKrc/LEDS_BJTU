@@ -17,8 +17,11 @@ import type {
   AuthMutationResponse,
   AuthSessionResponse,
   AuthSessionsResponse,
+  DiffusionArtifactInspectResponse,
   DiffusionArtifactsResponse,
+  DiffusionAssetActionResponse,
   DiffusionAssetsResponse,
+  DiffusionBlobUploadResponse,
   DiffusionCapabilitiesResponse,
   DiffusionJob,
   AvailableModelsResponse,
@@ -38,6 +41,10 @@ import type {
   ReviewTicketsResponse,
   ManagedUsersResponse,
   ModelPreflightResponse,
+  ModelRegistryResponse,
+  ModelDownloadManifest,
+  ModelPipelineAssignmentResponse,
+  DeploymentSimulationResponse,
   ModelsResponse,
   MasterHealthResponse,
   ConversationResponse,
@@ -48,23 +55,33 @@ import type {
   CreateModelDownloadPayload,
   ModelSearchResponse,
   ClientErrorReport,
+  StorageHealthResponse,
+  SpeculativeCapabilityResponse,
+  SpeculativeExperimentResponse,
   ClusterCurrentProfileResponse,
   ClusterDiscoveryResponse,
   ClusterEndpointsResponse,
+  ClusterLayersResponse,
   ClusterProfilesResponse,
   DiffusionDistributedResponse,
   GgufModelsResponse,
   PipelineCapacityResponse,
+  ModelRuntimeContractsResponse,
+  ModelRuntimeSidecarStatusResponse,
   QueueResponse,
   RagRebuildResponse,
   RagHealthResponse,
   RagSourcesResponse,
   RagSearchResponse,
+  RagCapacityResponse,
+  RagAnnDecisionResponse,
+  RagEmbeddingJob,
   RecentLogsResponse,
   SessionsResponse,
   SystemStatusResponse,
   TailscaleBindingsResponse,
   WorkflowsResponse,
+  WorkflowRecord,
   PreparePipelineResponse,
 } from './types';
 
@@ -358,6 +375,32 @@ export const loginAuth = (username: string, code: string, recoveryCode = '') =>
     return result;
   });
 
+export const bootstrapAuth = (payload: { username: string; display_name?: string }) =>
+  request<AuthMutationResponse>('/auth/bootstrap', {
+    method: 'POST',
+    body: JSON.stringify({
+      username: payload.username.trim(),
+      ...(payload.display_name?.trim() ? { display_name: payload.display_name.trim() } : {}),
+    }),
+  });
+
+export const verifyAuthTotp = (payload: { user_id: string; authenticator_id: string; code: string }) =>
+  request<AuthMutationResponse>('/auth/totp/verify', {
+    method: 'POST',
+    body: JSON.stringify({ ...payload, code: payload.code.trim() }),
+  });
+
+export const rotateRecoveryCodes = (code: string) =>
+  request<AuthMutationResponse>('/auth/recovery-codes/rotate', {
+    method: 'POST',
+    body: JSON.stringify({ code: code.trim() }),
+  });
+
+export const provisionUserTotp = (userId: string) =>
+  request<AuthMutationResponse>(`/auth/users/${encodeURIComponent(userId)}/totp`, {
+    method: 'POST',
+  });
+
 export const logoutAuth = () =>
   request<AuthMutationResponse>('/auth/logout', { method: 'POST' }).finally(() => setAuthToken(''));
 
@@ -412,6 +455,23 @@ export const fetchClusterEndpoints = (signal?: AbortSignal) =>
 export const verifyClusterEndpoint = (payload: { scheme?: string; host: string; port?: number }) =>
   request<Record<string, unknown>>('/cluster/endpoints/verify', { method: 'POST', body: JSON.stringify(payload) });
 
+export const fetchClusterLayers = (signal?: AbortSignal) =>
+  request<ClusterLayersResponse>('/cluster/layers', { signal });
+
+export const fetchModelRuntimeSidecarStatus = (signal?: AbortSignal) =>
+  request<ModelRuntimeSidecarStatusResponse>('/cluster/model-runtime/sidecars', { signal });
+
+export const fetchModelRuntimeContracts = (signal?: AbortSignal) =>
+  request<ModelRuntimeContractsResponse>('/cluster/model-runtime/contracts', { signal });
+
+export const releaseModelRuntimeSidecar = (profile: 'qwen3_sidecar' | 'gemma4_pipeline') =>
+  request<Record<string, unknown>>('/cluster/model-runtime/sidecars/release', {
+    method: 'POST', body: JSON.stringify({ profile }),
+  });
+
+export const cancelModelRuntimeSidecar = (profile: 'qwen3_sidecar' | 'gemma4_pipeline') =>
+  request<Record<string, unknown>>(`/cluster/model-runtime/sidecars/${encodeURIComponent(profile)}`, { method: 'DELETE' });
+
 export const fetchQwen3LocalChain = (signal?: AbortSignal) =>
   request<Record<string, unknown>>('/cluster/qwen3/local-chain', { signal });
 
@@ -453,6 +513,9 @@ export const fetchQueue = (signal?: AbortSignal) =>
 
 export const fetchWorkflows = (limit = 20, signal?: AbortSignal) =>
   request<WorkflowsResponse>(`/workflows?limit=${encodeURIComponent(limit)}`, { signal });
+
+export const fetchWorkflow = (workflowId: string, signal?: AbortSignal) =>
+  request<WorkflowRecord>(`/workflows/${encodeURIComponent(workflowId)}`, { signal });
 
 export const fetchPipelineCapacity = async (signal?: AbortSignal): Promise<PipelineCapacityResponse> => {
   // 后端在模型描述符尚未就绪时返回精简的 unavailable 响应，只包含
@@ -644,8 +707,42 @@ export const rebuildRagIndex = () =>
     body: JSON.stringify({ include_embeddings: false }),
   });
 
+export const fetchRagCapacity = (dimensions = 768, signal?: AbortSignal) =>
+  request<RagCapacityResponse>(`/rag/capacity?dimensions=${encodeURIComponent(dimensions)}`, { signal });
+
+export const fetchRagAnnDecision = (scanBudget = 1024, signal?: AbortSignal) =>
+  request<RagAnnDecisionResponse>(`/rag/ann-decision?scan_budget=${encodeURIComponent(scanBudget)}`, { signal });
+
+export const createRagEmbeddingJob = (payload: {
+  provider?: 'ollama';
+  model_id?: string;
+  model_sha256: string;
+  source_id?: string;
+  batch_size?: number;
+}) => request<RagEmbeddingJob>('/rag/embedding-jobs', {
+  method: 'POST',
+  body: JSON.stringify({ provider: 'ollama', model_id: 'nomic-embed-text:latest', ...payload }),
+});
+
+export const fetchRagEmbeddingJob = (jobId: string, signal?: AbortSignal) =>
+  request<RagEmbeddingJob>(`/rag/embedding-jobs/${encodeURIComponent(jobId)}`, { signal });
+
+export const runRagEmbeddingJob = (jobId: string, payload: {
+  model_id?: string;
+  expected_dimensions?: number;
+  max_batches?: number;
+  lease_seconds?: number;
+  max_retries?: number;
+} = {}) => request<RagEmbeddingJob>(`/rag/embedding-jobs/${encodeURIComponent(jobId)}/run`, {
+  method: 'POST',
+  body: JSON.stringify({ model_id: 'nomic-embed-text:latest', ...payload }),
+});
+
+export const cancelRagEmbeddingJob = (jobId: string) =>
+  request<RagEmbeddingJob>(`/rag/embedding-jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+
 export const fetchStorageHealth = (signal?: AbortSignal) =>
-  request<Record<string, unknown>>('/storage/health', { signal });
+  request<StorageHealthResponse>('/storage/health', { signal });
 
 // ---- Stable Diffusion 工作区 ----
 
@@ -657,6 +754,49 @@ export const fetchDiffusionArtifacts = (signal?: AbortSignal) =>
 
 export const fetchDiffusionAssets = (signal?: AbortSignal) =>
   request<DiffusionAssetsResponse>('/diffusion/assets/catalog', { signal });
+
+export const inspectDiffusionArtifact = (path: string, computeHash = false) =>
+  request<DiffusionArtifactInspectResponse>('/diffusion/artifacts/inspect', {
+    method: 'POST',
+    body: JSON.stringify({ path, compute_hash: computeHash }),
+  });
+
+export const registerDiffusionArtifact = (payload: {
+  path: string;
+  artifact_id?: string;
+  name?: string;
+  compute_hash?: boolean;
+}) => request<DiffusionArtifactInspectResponse>('/diffusion/artifacts/register', {
+  method: 'POST',
+  body: JSON.stringify(payload),
+});
+
+export const fetchDiffusionAssetStatus = (assetId: string, signal?: AbortSignal) =>
+  request<DiffusionAssetActionResponse>(`/diffusion/assets/${encodeURIComponent(assetId)}/status`, { signal });
+
+export const downloadDiffusionAsset = (assetId: string, options: {
+  licenseAccepted: boolean;
+  useLocalProxyFallback?: boolean;
+}) => request<DiffusionAssetActionResponse>(`/diffusion/assets/${encodeURIComponent(assetId)}/download`, {
+  method: 'POST',
+  body: JSON.stringify({
+    license_accepted: options.licenseAccepted,
+    use_local_proxy_fallback: options.useLocalProxyFallback ?? true,
+  }),
+});
+
+export const importDiffusionAsset = (payload: {
+  assetId: string;
+  path: string;
+  licenseAccepted: boolean;
+}) => request<DiffusionAssetActionResponse>('/diffusion/assets/import', {
+  method: 'POST',
+  body: JSON.stringify({
+    asset_id: payload.assetId,
+    path: payload.path,
+    license_accepted: payload.licenseAccepted,
+  }),
+});
 
 export const loadDiffusionArtifact = (artifactId: string, profile = 'balanced') =>
   request<DiffusionCapabilitiesResponse>('/diffusion/load', {
@@ -683,6 +823,54 @@ export const generateDiffusionImage = (params: {
     body: JSON.stringify(params),
   });
 
+export const editDiffusionImage = (params: {
+  mode: 'img2img' | 'reference' | 'inpaint' | 'instruction';
+  source_blob_id: string;
+  mask_blob_id?: string;
+  prompt?: string;
+  negative_prompt?: string;
+  seed?: number;
+  width?: number;
+  height?: number;
+  steps?: number;
+  guidance_scale?: number;
+  scheduler?: string;
+  strength?: number;
+  instruction?: string;
+  edit_adapter_id?: string;
+  conditioning_scale?: number;
+  image_guidance_scale?: number;
+}) => request<DiffusionJob>('/diffusion/edit', {
+  method: 'POST',
+  body: JSON.stringify(params),
+});
+
+export async function uploadDiffusionBlob(file: File, purpose = 'input_image', signal?: AbortSignal) {
+  const token = readStorage('session', AUTH_TOKEN_STORAGE_KEY);
+  const form = new FormData();
+  form.append('purpose', purpose);
+  form.append('file', file);
+  const path = '/diffusion/blobs';
+  const res = await fetchResponse(`${BASE}${path}`, {
+    method: 'POST',
+    body: form,
+    ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+  }, { signal, timeoutMs: 60_000, path });
+  const text = await res.text();
+  let data: Record<string, unknown> = {};
+  if (text) {
+    try { data = JSON.parse(text) as Record<string, unknown>; } catch { data = { detail: text }; }
+  }
+  const requestId = res.headers.get('X-Request-ID') || (data.request_id as string | undefined) || null;
+  if (!res.ok) {
+    const kind = kindForStatus(res.status);
+    throw new ApiError(normalizeDetail(data.detail, `HTTP ${res.status}`), {
+      status: res.status, requestId, path, kind, retryable: retryableForKind(kind),
+    });
+  }
+  return data as DiffusionBlobUploadResponse;
+}
+
 export const fetchDiffusionJob = (jobId: string, signal?: AbortSignal) =>
   request<DiffusionJob>(`/diffusion/jobs/${encodeURIComponent(jobId)}`, { signal });
 
@@ -691,6 +879,9 @@ export const cancelDiffusionJob = (jobId: string) =>
     `/diffusion/jobs/${encodeURIComponent(jobId)}/cancel`,
     { method: 'POST' },
   );
+
+export const deleteDiffusionBlob = (blobId: string) =>
+  request<{ deleted?: boolean; blob_id?: string }>(`/diffusion/blobs/${encodeURIComponent(blobId)}`, { method: 'DELETE' });
 
 export const generateDistributedDiffusion = (params: Record<string, unknown>) =>
   request<DiffusionDistributedResponse>('/diffusion/distributed/generate', { method: 'POST', body: JSON.stringify(params) });
@@ -718,6 +909,32 @@ export const fetchCurrentModel = (signal?: AbortSignal) =>
 export const fetchLocalModelAssets = (signal?: AbortSignal) =>
   request<LocalModelAssetsResponse>('/models/local-assets', { signal });
 
+export const fetchModelRegistry = (signal?: AbortSignal) =>
+  request<ModelRegistryResponse>('/models/registry', { signal });
+
+export interface RegisterModelPayload {
+  model_id: string;
+  name: string;
+  model_type?: 'safetensors' | 'gguf' | 'both';
+  model_path?: string;
+  gguf_path?: string;
+  recommended_vram_gb?: number;
+  max_context?: number;
+  huggingface_id?: string;
+  description?: string;
+}
+
+export const registerModel = (payload: RegisterModelPayload) =>
+  request<{ status?: string; model_id?: string }>('/models/registry', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+export const unregisterModel = (modelId: string) =>
+  request<{ status?: string; model_id?: string }>(`/models/registry/${encodeURIComponent(modelId)}`, {
+    method: 'DELETE',
+  });
+
 export const preflightLocalModelAsset = (modelId: string) =>
   request<ModelPreflightResponse>(`/models/local-assets/${encodeURIComponent(modelId)}/preflight`, {
     method: 'POST',
@@ -735,11 +952,11 @@ export const downloadGgufModel = (filename: string, signal?: AbortSignal) =>
   requestBlob(`/models/download/${encodeURIComponent(filename)}`, { signal, timeoutMs: 120_000 });
 
 export const fetchDownloadableModelManifest = (modelId = '', signal?: AbortSignal) =>
-  request<Record<string, unknown>>(`/models/downloadable${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`, { signal });
+  request<ModelDownloadManifest>(`/models/downloadable${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`, { signal });
 
 export const fetchModelPipelineAssignment = (modelId: string, params: Record<string, string | number | boolean> = {}, signal?: AbortSignal) => {
   const query = new URLSearchParams(Object.entries(params).reduce<Record<string, string>>((out, [key, value]) => { out[key] = String(value); return out; }, {})).toString();
-  return request<Record<string, unknown>>(`/models/pipeline-assignment/${encodeURIComponent(modelId)}${query ? `?${query}` : ''}`, { signal });
+  return request<ModelPipelineAssignmentResponse>(`/models/pipeline-assignment/${encodeURIComponent(modelId)}${query ? `?${query}` : ''}`, { signal });
 };
 
 export const downloadModelFile = (modelId: string, relativePath: string, signal?: AbortSignal) =>
@@ -835,22 +1052,25 @@ export const shutdownSystem = (reason = 'operator_requested') =>
   request<{ ok?: boolean; message?: string }>('/system/shutdown', { method: 'POST', body: JSON.stringify({ reason }) });
 
 export const runSpeculativeExperiment = (payload: { message?: string; execution_mode?: 'speculative_assisted'; allow_external?: boolean; [key: string]: unknown }) =>
-  request<Record<string, unknown>>('/experimental/speculative', { method: 'POST', body: JSON.stringify(payload) });
+  request<SpeculativeExperimentResponse>('/experimental/speculative', { method: 'POST', body: JSON.stringify(payload) });
+
+export const fetchSpeculativeCapability = (signal?: AbortSignal) =>
+  request<SpeculativeCapabilityResponse>('/experimental/speculative/capability', { signal });
 
 export const createDeploymentSimulation = (payload: { artifact_id: string; runtime_profile: string; required_capabilities?: string[]; nodes: Array<Record<string, unknown>> }) =>
-  request<Record<string, unknown>>('/models/deployment-simulations', { method: 'POST', body: JSON.stringify(payload) });
+  request<DeploymentSimulationResponse>('/models/deployment-simulations', { method: 'POST', body: JSON.stringify(payload) });
 
 export const fetchDeploymentSimulation = (planId: string, signal?: AbortSignal) =>
-  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}`, { signal });
+  request<DeploymentSimulationResponse>(`/models/deployment-simulations/${encodeURIComponent(planId)}`, { signal });
 
 export const prepareDeploymentSimulation = (planId: string, nodes: Array<Record<string, unknown>> = []) =>
-  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}/prepare`, { method: 'POST', body: JSON.stringify({ nodes }) });
+  request<DeploymentSimulationResponse>(`/models/deployment-simulations/${encodeURIComponent(planId)}/prepare`, { method: 'POST', body: JSON.stringify({ nodes }) });
 
 export const activateDeploymentSimulation = (planId: string) =>
-  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}/activate`, { method: 'POST' });
+  request<DeploymentSimulationResponse>(`/models/deployment-simulations/${encodeURIComponent(planId)}/activate`, { method: 'POST' });
 
 export const rollbackDeploymentSimulation = (planId: string) =>
-  request<Record<string, unknown>>(`/models/deployment-simulations/${encodeURIComponent(planId)}/rollback`, { method: 'POST' });
+  request<DeploymentSimulationResponse>(`/models/deployment-simulations/${encodeURIComponent(planId)}/rollback`, { method: 'POST' });
 
 // ---- 令牌读写（Settings 页使用；与既有 frontend 共用同一存储键） ----
 

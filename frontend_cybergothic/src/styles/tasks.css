@@ -251,6 +251,135 @@
   padding-right: 4px;
 }
 
+.workflow-detail__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+}
+
+.workflow-detail__heading .drawer__subtitle {
+  margin-bottom: var(--gap-sm);
+}
+
+.workflow-audit-link {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.workflow-observability {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0 0 var(--gap-md);
+}
+
+.workflow-observability > div,
+.stage-contract-grid > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid var(--line-faint);
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+}
+
+.workflow-observability span,
+.stage-contract-grid span,
+.stage-attempts__label {
+  color: var(--muted-dim);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-observability strong {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.stage-contract-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 3px;
+}
+
+.stage-contract-grid strong {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.stage__error-code {
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.stage-attempts {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 4px;
+}
+
+.stage-attempts__label {
+  margin-top: 2px;
+}
+
+.stage-attempts__empty {
+  margin: 0;
+  color: var(--muted-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.stage-attempt {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--line);
+  background: color-mix(in srgb, var(--surface-raised) 72%, transparent);
+}
+
+.stage-attempt__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.stage-attempt p,
+.stage-attempt small {
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .tasks-page > .drawer {
   display: none;
 }
@@ -352,5 +481,13 @@
 
   .tasks-queuebar {
     padding: var(--gap-sm);
+  }
+
+  .workflow-observability {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stage-contract-grid {
+    grid-template-columns: 1fr;
   }
 }
