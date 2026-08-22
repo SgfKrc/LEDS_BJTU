@@ -4226,6 +4226,48 @@ def _run_speculative_experiment(req: SpeculativeExperimentRequest) -> dict:
     )
 
 
+@app.get("/api/experimental/speculative/capability")
+async def speculative_experiment_capability():
+    """Return a zero-network, fail-closed capability snapshot for the UI."""
+    try:
+        import config as cfg
+        from speculative import resolve_verify_config
+
+        enabled = bool(getattr(cfg, "SPEC_ENABLED", False))
+        verify = resolve_verify_config()
+        configured = bool(verify.get("base_url"))
+        available = enabled and configured
+        reason_code = (
+            "ready"
+            if available
+            else "disabled_by_config"
+            if not enabled
+            else "verify_endpoint_missing"
+        )
+        return {
+            "enabled": enabled,
+            "configured": configured,
+            "available": available,
+            "execution_mode": "speculative_assisted",
+            "local_only": not configured,
+            "data_scope": str(getattr(cfg, "EXTERNAL_DATA_SCOPE", "opt_in")),
+            "reason_code": reason_code,
+            "verify_model": str(verify.get("model") or ""),
+            "gamma": int(verify.get("gamma", 0)),
+            "max_rounds": int(verify.get("max_rounds", 0)),
+        }
+    except Exception as exc:
+        logger.warning("投机实验能力探针失败: %s", exc)
+        return {
+            "enabled": False,
+            "configured": False,
+            "available": False,
+            "execution_mode": "speculative_assisted",
+            "local_only": True,
+            "reason_code": "capability_probe_error",
+        }
+
+
 @app.post("/api/experimental/speculative")
 async def experimental_speculative_chat(req: SpeculativeExperimentRequest):
     """
@@ -8263,6 +8305,28 @@ async def bootstrap_info(request: Request):
     }
 
 
+@app.get("/api/auth/capability")
+async def auth_capability():
+    """Expose the authentication boundary when running the monolith directly.
+
+    Auth App provisioning, sessions, and Tailscale binding are owned by the
+    local control service.  The standalone FastAPI process must still expose
+    the capability probe used by the canonical UI; returning an explicit
+    disabled capability is safer than a 404 (or pretending that auth exists).
+    The gateway/control service exposes the enforced ``local_totp`` variant.
+    """
+    return {
+        "required": False,
+        "enforced": False,
+        "available": False,
+        "mode": "local_primary_node",
+        "policy_version": "n1a-v1",
+        "service": "api_server",
+        "bootstrap_available": False,
+        "reason_code": "auth_control_plane_unavailable",
+    }
+
+
 @app.post("/api/cluster/connect")
 async def connect_to_master(req: ConnectToMasterRequest):
     """
@@ -9681,6 +9745,48 @@ async def database_health():
         "local": local,
         "remote": remote,
         "effective_mode": "local_only",
+    }
+
+
+@app.get("/api/storage/health")
+async def storage_health():
+    """Expose the local-first storage contract used by the canonical console.
+
+    The monolith does not own a projection worker or a remote export queue, so
+    those fields are explicit zero/retired states instead of leaking internal
+    implementation details to the UI.
+    """
+    try:
+        local = _local_store.local_store_health()
+    except Exception as exc:
+        local = {
+            "status": "unavailable",
+            "backend": "sqlite",
+            "writable": False,
+            "error": str(exc),
+        }
+
+    return {
+        "local": local,
+        "remote": {
+            "status": "retired",
+            "backend": "postgresql",
+            "mode": "retired",
+        },
+        "projection": {
+            "pending_events": 0,
+            "oldest_event_age_seconds": None,
+        },
+        "export": {
+            "pending_items": 0,
+            "oldest_item_age_seconds": None,
+        },
+        "effective_mode": "local_only" if local.get("writable", False) else "readonly_failure",
+        "retirement": {
+            "status": "retired",
+            "prepared_at": None,
+            "retired_at": None,
+        },
     }
 
 

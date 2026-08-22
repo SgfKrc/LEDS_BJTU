@@ -55,6 +55,39 @@ class TestApiResponseKeys:
         body = res.json()
         assert set(body.keys()) == {"status", "timestamp"}
 
+    def test_auth_capability_is_explicit_when_running_direct_api(self, client):
+        """The standalone API must not make Account fail with a 404 probe."""
+        res = client.get("/api/auth/capability")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["required"] is False
+        assert body["enforced"] is False
+        assert body["available"] is False
+        assert body["service"] == "api_server"
+        assert body["reason_code"] == "auth_control_plane_unavailable"
+
+    def test_storage_health_is_local_first_and_retired_remote(self, client, monkeypatch):
+        monkeypatch.setattr(
+            api_server_mod._local_store,
+            "local_store_health",
+            lambda: {"status": "ok", "backend": "sqlite", "writable": True},
+        )
+        res = client.get("/api/storage/health")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["local"]["backend"] == "sqlite"
+        assert body["effective_mode"] == "local_only"
+        assert body["remote"] == {"status": "retired", "backend": "postgresql", "mode": "retired"}
+        assert body["projection"]["pending_events"] == 0
+
+    def test_speculative_capability_is_zero_network_and_fail_closed(self, client, monkeypatch):
+        res = client.get("/api/experimental/speculative/capability")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["execution_mode"] == "speculative_assisted"
+        assert body["available"] is False
+        assert body["reason_code"] in {"disabled_by_config", "verify_endpoint_missing"}
+
     @staticmethod
     def _cluster_status_payload(network_path=None):
         payload = {
