@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Cpu, Download, Image as ImageIcon, LoaderCircle, PauseCircle, RefreshCw, Sparkles } from 'lucide-react';
+import type { ChangeEvent } from 'react';
+import { Cpu, Download, FileSearch, Image as ImageIcon, LoaderCircle, Network, PauseCircle, RefreshCw, ShieldCheck, Sparkles, Upload } from 'lucide-react';
 import { CommandButton } from '../components/CommandButton';
 import { EmptyState } from '../components/EmptyState';
 import { PageHeader, SectionHead } from '../components/PageHeader';
@@ -14,7 +15,7 @@ import {
   useDiffusionAssets,
   useDiffusionCapabilities,
 } from '../data/hooks';
-import type { DiffusionJob, DiffusionPreset } from '../data/types';
+import type { DiffusionArtifactInspectResponse, DiffusionAssetActionResponse, DiffusionDistributedResponse, DiffusionJob, DiffusionPreset } from '../data/types';
 import { FoundryCanvas } from '../visual/FoundryCanvas';
 
 interface ImageHistoryItem {
@@ -26,7 +27,12 @@ interface ImageHistoryItem {
   blobId?: string;
   error?: string;
   parameters?: DiffusionJob['parameters'];
+  workflowId?: string;
+  distributed?: boolean;
 }
+
+type StudioMode = 'txt2img' | 'img2img' | 'inpaint' | 'distributed';
+type DistributedMode = 'single' | 'grid';
 
 const HISTORY_KEY = 'qlh_cg_diffusion_history';
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
@@ -87,6 +93,21 @@ export function ImageStudioPage() {
   const [steps, setSteps] = useState(28);
   const [guidanceScale, setGuidanceScale] = useState(7.5);
   const [seed, setSeed] = useState(-1);
+  const [mode, setMode] = useState<StudioMode>('txt2img');
+  const [distributedMode, setDistributedMode] = useState<DistributedMode>('single');
+  const [sourceBlobId, setSourceBlobId] = useState('');
+  const [maskBlobId, setMaskBlobId] = useState('');
+  const [strength, setStrength] = useState(0.75);
+  const [gridSeeds, setGridSeeds] = useState('11, 22, 33, 44');
+  const [distributedResult, setDistributedResult] = useState<DiffusionDistributedResponse | null>(null);
+  const [selectedAssetId, setSelectedAssetId] = useState('');
+  const [assetPath, setAssetPath] = useState('models/sd15-original-v1');
+  const [assetName, setAssetName] = useState('');
+  const [assetLicenseAccepted, setAssetLicenseAccepted] = useState(false);
+  const [assetComputeHash, setAssetComputeHash] = useState(false);
+  const [assetInspect, setAssetInspect] = useState<DiffusionArtifactInspectResponse | null>(null);
+  const [assetStatus, setAssetStatus] = useState<DiffusionAssetActionResponse | null>(null);
+  const [assetBusy, setAssetBusy] = useState('');
   const [busy, setBusy] = useState('');
   const mountedRef = useRef(true);
 
@@ -96,10 +117,18 @@ export function ImageStudioPage() {
   const activeJob = job && !TERMINAL_STATES.has(job.state) ? job : null;
   const selectedHistory = history.find((item) => item.jobId === selectedJobId) ?? null;
   const loadedArtifactId = capabilities.data?.loaded_artifact?.artifact_id ?? '';
+  const distributedWorkflow = (capabilities.data?.distributed_workflow || {}) as Record<string, unknown>;
+  const distributedEnabled = Boolean(distributedWorkflow.enabled);
+  const selectedAsset = assetList.find((asset) => asset.asset_id === selectedAssetId) ?? assetList[0];
   const blobId = job?.blob?.blob_id || selectedHistory?.blobId || '';
-  const blobUrl = blobId ? `/api/diffusion/blobs/${encodeURIComponent(blobId)}` : '';
+  const distributedWorkflowId = String(distributedResult?.workflow?.workflow_id || distributedResult?.workflow_id || '');
+  const distributedImage = distributedResult?.result?.image;
+  const blobUrl = distributedImage?.url || (distributedWorkflowId && distributedImage?.blob_id
+    ? `/api/diffusion/distributed/workflows/${encodeURIComponent(distributedWorkflowId)}/blobs/${encodeURIComponent(distributedImage.blob_id)}`
+    : blobId ? `/api/diffusion/blobs/${encodeURIComponent(blobId)}` : '');
   const canGenerate = Boolean(
-    capabilities.data?.loaded && prompt.trim() && !activeJob && !busy,
+    capabilities.data?.loaded && prompt.trim() && !activeJob && !busy
+      && (mode === 'txt2img' || (mode === 'distributed' ? distributedEnabled : Boolean(sourceBlobId))),
   );
 
   useEffect(() => {
@@ -131,6 +160,10 @@ export function ImageStudioPage() {
     if (first) setSelectedArtifactId(first.artifact_id);
   }, [artifactList, loadedArtifactId, selectedArtifactId]);
 
+  useEffect(() => {
+    if (!selectedAssetId && assetList[0]) setSelectedAssetId(assetList[0].asset_id);
+  }, [assetList, selectedAssetId]);
+
   const refresh = useCallback(() => {
     capabilities.refresh();
     artifacts.refresh();
@@ -149,6 +182,8 @@ export function ImageStudioPage() {
         ...(nextJob.blob?.blob_id ? { blobId: nextJob.blob.blob_id } : {}),
         ...(nextJob.error ? { error: nextJob.error } : {}),
         ...(nextJob.parameters ? { parameters: nextJob.parameters } : {}),
+        ...(nextJob.workflow_id ? { workflowId: String(nextJob.workflow_id) } : {}),
+        ...(nextJob.distributed ? { distributed: true } : {}),
       };
       const withoutCurrent = previous.filter((item) => item.jobId !== next.jobId);
       return [next, ...withoutCurrent].slice(0, 40);
@@ -250,6 +285,233 @@ export function ImageStudioPage() {
       pushToast(`提交生图任务失败：${api.describeError(err)}`, 'danger');
     } finally {
       setBusy('');
+    }
+  };
+
+  const handleEdit = async () => {
+    if (!sourceBlobId.trim() || activeJob || busy) return;
+    setBusy('edit');
+    const editMode = mode === 'inpaint' ? 'inpaint' : 'img2img';
+    const request = {
+      mode: editMode as 'img2img' | 'inpaint',
+      source_blob_id: sourceBlobId.trim(),
+      ...(mode === 'inpaint' && maskBlobId.trim() ? { mask_blob_id: maskBlobId.trim() } : {}),
+      prompt: prompt.trim(),
+      negative_prompt: negativePrompt.trim(),
+      seed: seed < 0 ? undefined : seed,
+      width,
+      height,
+      steps,
+      guidance_scale: guidanceScale,
+      strength,
+    };
+    try {
+      if (usingFixtures) {
+        const fixtureJob: DiffusionJob = {
+          job_id: `fixture-sdedit-${Date.now().toString(36)}`,
+          state: 'completed',
+          created_at: Date.now() / 1000,
+          parameters: { ...request, prompt: prompt.trim() },
+          blob: { blob_id: 'fixture-edited-image', content_type: 'image/png' },
+        };
+        setJob(fixtureJob);
+        updateHistory(fixtureJob, prompt.trim(), negativePrompt.trim());
+        pushToast('演示数据已完成图像编辑。', 'info');
+      } else {
+        const submitted = await api.editDiffusionImage(request);
+        setJob(submitted);
+        updateHistory(submitted, prompt.trim(), negativePrompt.trim());
+        void pollJob(submitted.job_id, prompt.trim(), negativePrompt.trim()).catch((err) => {
+          if (mountedRef.current) pushToast(`编辑任务状态读取失败：${api.describeError(err)}`, 'danger');
+        });
+      }
+    } catch (err) {
+      pushToast(`提交编辑任务失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const handleDistributed = async () => {
+    if (!prompt.trim() || activeJob || busy || !distributedEnabled) return;
+    const seeds = gridSeeds.split(',').map((value) => Number(value.trim())).filter((value) => Number.isInteger(value) && value >= 0);
+    if (distributedMode === 'grid' && (seeds.length !== 4 || new Set(seeds).size !== 4)) {
+      pushToast('四宫格必须填写四个不同的非负 seed。', 'danger');
+      return;
+    }
+    setBusy('distributed');
+    const request = {
+      prompt: prompt.trim(),
+      negative_prompt: negativePrompt.trim(),
+      seed: seed < 0 ? undefined : seed,
+      width,
+      height,
+      steps,
+      guidance_scale: guidanceScale,
+      ...(selectedArtifactId ? { artifact_id: selectedArtifactId } : {}),
+    };
+    try {
+      let response: DiffusionDistributedResponse;
+      if (usingFixtures) {
+        const workflowId = `fixture-wf-${Date.now().toString(36)}`;
+        response = {
+          status: 'completed', distributed: distributedMode === 'grid', workflow_id: workflowId,
+          workflow: { workflow_id: workflowId, state: 'completed', template: distributedMode === 'grid' ? 'image_grid_v1' : 'image_generate_v1' },
+          result: distributedMode === 'grid'
+            ? { images: seeds.map((item, index) => ({ blob_id: `fixture-grid-${index}`, url: `/api/diffusion/blobs/fixture-grid-${index}`, seed: item })) }
+            : { image: { blob_id: 'fixture-distributed-image', url: '/api/diffusion/blobs/fixture-distributed-image' }, metrics: { elapsed_seconds: 0.42 } },
+          provider_id: 'fixture_remote_diffusion', node_id: 'fixture-worker',
+        };
+      } else if (distributedMode === 'grid') {
+        response = await api.generateDistributedDiffusionGrid({ ...request, seeds });
+      } else {
+        response = await api.generateDistributedDiffusion(request);
+      }
+      setDistributedResult(response);
+      const firstImage = response.result?.image || response.result?.images?.[0];
+      const workflowId = String(response.workflow?.workflow_id || response.workflow_id || `distributed-${Date.now().toString(36)}`);
+      const completedJob: DiffusionJob = {
+        job_id: workflowId,
+        workflow_id: workflowId,
+        state: 'completed',
+        created_at: Date.now() / 1000,
+        parameters: request,
+        ...(firstImage?.blob_id ? { blob: { blob_id: firstImage.blob_id, content_type: 'image/png' } } : {}),
+        distributed: true,
+      };
+      setJob(completedJob);
+      updateHistory(completedJob, prompt.trim(), negativePrompt.trim());
+      pushToast(distributedMode === 'grid' ? '分布式四宫格任务已完成。' : '分布式图像任务已完成。', usingFixtures ? 'info' : 'ok');
+    } catch (err) {
+      pushToast(`分布式任务失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const handleSubmit = () => {
+    if (mode === 'txt2img') return void handleGenerate();
+    if (mode === 'distributed') return void handleDistributed();
+    return void handleEdit();
+  };
+
+  const handleUploadSource = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || assetBusy) return;
+    setAssetBusy('upload');
+    try {
+      if (usingFixtures) {
+        setSourceBlobId('fixture-input-image');
+        pushToast('演示数据已准备输入图像。', 'info');
+      } else {
+        const uploaded = await api.uploadDiffusionBlob(file);
+        setSourceBlobId(uploaded.blob_id);
+        pushToast(`输入图像已上传：${uploaded.blob_id}`, 'ok');
+      }
+    } catch (err) {
+      pushToast(`上传输入图像失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setAssetBusy('');
+      event.target.value = '';
+    }
+  };
+
+  const handleInspectAsset = async () => {
+    if (!assetPath.trim() || assetBusy) return;
+    setAssetBusy('inspect');
+    try {
+      if (usingFixtures) {
+        setAssetInspect({ artifact_id: 'fixture-inspected-artifact', name: assetName || 'Inspected SD asset', path: assetPath.trim(), artifact: { artifact_kind: 'sd15_pipeline', loadable: true, size_bytes: 3673657344 } });
+        pushToast('演示数据已完成资产预检。', 'info');
+      } else {
+        setAssetInspect(await api.inspectDiffusionArtifact(assetPath.trim(), assetComputeHash));
+        pushToast('资产预检完成。', 'ok');
+      }
+    } catch (err) {
+      setAssetInspect(null);
+      pushToast(`资产预检失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setAssetBusy('');
+    }
+  };
+
+  const handleRegisterAsset = async () => {
+    if (!assetPath.trim() || assetBusy) return;
+    setAssetBusy('register');
+    try {
+      if (usingFixtures) {
+        setAssetInspect({ artifact_id: assetName.trim() || 'fixture-registered-artifact', name: assetName.trim() || 'Registered SD asset', path: assetPath.trim(), artifact: { artifact_kind: 'sd15_pipeline', loadable: true } });
+        pushToast('演示数据已登记资产。', 'info');
+      } else {
+        setAssetInspect(await api.registerDiffusionArtifact({ path: assetPath.trim(), ...(assetName.trim() ? { name: assetName.trim() } : {}), compute_hash: assetComputeHash }));
+        await artifacts.refresh();
+        pushToast('资产已登记。', 'ok');
+      }
+    } catch (err) {
+      pushToast(`资产登记失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setAssetBusy('');
+    }
+  };
+
+  const handleAssetStatus = async () => {
+    if (!selectedAssetId || assetBusy) return;
+    setAssetBusy('status');
+    try {
+      if (usingFixtures) {
+        setAssetStatus({ asset_id: selectedAssetId, status: selectedAsset?.installed ? 'installed' : 'missing', present_bytes: selectedAsset?.present_bytes, total_bytes: selectedAsset?.total_bytes });
+      } else {
+        setAssetStatus(await api.fetchDiffusionAssetStatus(selectedAssetId));
+      }
+    } catch (err) {
+      pushToast(`读取资产状态失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setAssetBusy('');
+    }
+  };
+
+  const handleDownloadAsset = async () => {
+    if (!selectedAssetId || assetBusy) return;
+    if (!assetLicenseAccepted) {
+      pushToast('下载前请确认资产许可证。', 'danger');
+      return;
+    }
+    setAssetBusy('download');
+    try {
+      if (usingFixtures) {
+        setAssetStatus({ asset_id: selectedAssetId, status: 'queued', job: { state: 'queued' } });
+        pushToast('演示数据已排队下载资产。', 'info');
+      } else {
+        setAssetStatus(await api.downloadDiffusionAsset(selectedAssetId, { licenseAccepted: assetLicenseAccepted, useLocalProxyFallback: true }));
+        pushToast('资产下载已排队。', 'ok');
+      }
+    } catch (err) {
+      pushToast(`资产下载失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setAssetBusy('');
+    }
+  };
+
+  const handleImportAsset = async () => {
+    if (!selectedAssetId || !assetPath.trim() || assetBusy) return;
+    if (!assetLicenseAccepted) {
+      pushToast('导入前请确认资产许可证。', 'danger');
+      return;
+    }
+    setAssetBusy('import');
+    try {
+      if (usingFixtures) {
+        setAssetStatus({ asset_id: selectedAssetId, status: 'imported', valid: true, path: assetPath.trim() });
+        pushToast('演示数据已登记本地资产。', 'info');
+      } else {
+        setAssetStatus(await api.importDiffusionAsset({ assetId: selectedAssetId, path: assetPath.trim(), licenseAccepted: assetLicenseAccepted }));
+        await assets.refresh();
+        pushToast('资产导入完成。', 'ok');
+      }
+    } catch (err) {
+      pushToast(`资产导入失败：${api.describeError(err)}`, 'danger');
+    } finally {
+      setAssetBusy('');
     }
   };
 
@@ -355,12 +617,35 @@ export function ImageStudioPage() {
               <SectionHead title="资产目录" hint={`${assetList.length} 个资产`} />
               <ul className="image-assets">
                 {assetList.map((asset) => (
-                  <li key={asset.asset_id} data-installed={asset.installed ? 'true' : 'false'}>
-                    <span>{asset.name || asset.asset_id}</span>
+                  <li key={asset.asset_id} data-installed={asset.installed ? 'true' : 'false'} data-selected={asset.asset_id === selectedAssetId ? 'true' : undefined}>
+                    <button type="button" className="image-asset" onClick={() => setSelectedAssetId(asset.asset_id)}>
+                      <span>{asset.name || asset.asset_id}</span>
+                      <small>{asset.asset_id}</small>
+                    </button>
                     <StatusBadge label={asset.installed ? '已安装' : '待获取'} tone={asset.installed ? 'ok' : 'idle'} size="sm" />
                   </li>
                 ))}
               </ul>
+              {selectedAsset ? <div className="asset-quick-actions">
+                <span className="cell-mono">{selectedAsset.asset_id}</span>
+                <CommandButton variant="ghost" size="sm" icon={RefreshCw} busy={assetBusy === 'status'} onClick={() => void handleAssetStatus()}>状态</CommandButton>
+              </div> : null}
+            </section>
+
+            <section className="studio-panel studio-panel--rail studio-panel--asset-tools" data-testid="image-asset-tools">
+              <SectionHead title="资产工具" hint="本地主节点" />
+              <label className="studio-field"><span>本地路径</span><input value={assetPath} onChange={(event) => setAssetPath(event.target.value)} placeholder="models/sd15-original-v1" /></label>
+              <label className="studio-field"><span>登记名称</span><input value={assetName} onChange={(event) => setAssetName(event.target.value)} placeholder="可选" /></label>
+              <label className="studio-check"><input type="checkbox" checked={assetComputeHash} onChange={(event) => setAssetComputeHash(event.target.checked)} /><span>计算 SHA256</span></label>
+              <label className="studio-check"><input type="checkbox" checked={assetLicenseAccepted} onChange={(event) => setAssetLicenseAccepted(event.target.checked)} /><span>我确认许可证和来源</span></label>
+              <div className="studio-inline-actions">
+                <CommandButton variant="ghost" size="sm" icon={FileSearch} busy={assetBusy === 'inspect'} onClick={() => void handleInspectAsset()}>检查</CommandButton>
+                <CommandButton variant="ghost" size="sm" icon={ShieldCheck} busy={assetBusy === 'register'} onClick={() => void handleRegisterAsset()}>登记</CommandButton>
+                <CommandButton variant="ghost" size="sm" icon={Download} busy={assetBusy === 'download'} disabled={!selectedAssetId} onClick={() => void handleDownloadAsset()}>下载</CommandButton>
+                <CommandButton variant="ghost" size="sm" icon={Upload} busy={assetBusy === 'import'} disabled={!selectedAssetId} onClick={() => void handleImportAsset()}>导入</CommandButton>
+              </div>
+              {assetInspect ? <p className="inline-note">预检：{assetInspect.artifact_id || 'unknown'} · {String(assetInspect.artifact?.artifact_kind || 'unknown')} · {assetInspect.path}</p> : null}
+              {assetStatus ? <p className="inline-note">状态：{assetStatus.status || (assetStatus.valid ? 'valid' : 'reported')} {assetStatus.job ? `· ${String(assetStatus.job.state || 'queued')}` : ''}</p> : null}
             </section>
           </aside>
 
@@ -409,13 +694,14 @@ export function ImageStudioPage() {
             <section className="studio-panel studio-panel--form">
               <div className="studio-form__head">
                 <div>
-                  <p className="mono-label">TEXT TO IMAGE</p>
-                  <h2>生成参数</h2>
+                  <p className="mono-label">{mode === 'distributed' ? 'DISTRIBUTED IMAGE' : mode === 'txt2img' ? 'TEXT TO IMAGE' : mode === 'inpaint' ? 'MASKED EDIT' : 'IMAGE TO IMAGE'}</p>
+                  <h2>{mode === 'distributed' ? '分布式任务' : mode === 'txt2img' ? '生成参数' : mode === 'inpaint' ? '局部重绘' : '图像编辑'}</h2>
                 </div>
                 <div className="studio-form__modes" role="group" aria-label="生成模式">
-                  <button type="button" className="is-active" aria-pressed="true">文生图</button>
-                  <button type="button" disabled aria-pressed="false">图生图</button>
-                  <button type="button" disabled aria-pressed="false">局部重绘</button>
+                  <button type="button" className={mode === 'txt2img' ? 'is-active' : ''} aria-pressed={mode === 'txt2img'} onClick={() => setMode('txt2img')}>文生图</button>
+                  <button type="button" className={mode === 'img2img' ? 'is-active' : ''} aria-pressed={mode === 'img2img'} onClick={() => setMode('img2img')}>图生图</button>
+                  <button type="button" className={mode === 'inpaint' ? 'is-active' : ''} aria-pressed={mode === 'inpaint'} onClick={() => setMode('inpaint')}>局部重绘</button>
+                  <button type="button" className={mode === 'distributed' ? 'is-active' : ''} aria-pressed={mode === 'distributed'} onClick={() => setMode('distributed')}><Network size={13} aria-hidden="true" />分布式</button>
                 </div>
               </div>
               <label className="studio-field studio-field--wide">
@@ -426,6 +712,17 @@ export function ImageStudioPage() {
                 <span>负面提示词</span>
                 <input value={negativePrompt} maxLength={4000} onChange={(event) => setNegativePrompt(event.target.value)} />
               </label>
+              {mode !== 'txt2img' && mode !== 'distributed' ? <div className="studio-source-fields">
+                <label className="studio-field"><span>输入 Blob ID</span><input value={sourceBlobId} onChange={(event) => setSourceBlobId(event.target.value)} placeholder="上传后自动填入" /></label>
+                <label className="studio-field"><span>上传输入图像</span><input type="file" accept="image/png,image/jpeg,image/webp" aria-label="上传输入图像" onChange={(event) => void handleUploadSource(event)} disabled={assetBusy !== ''} /></label>
+                {mode === 'inpaint' ? <label className="studio-field"><span>蒙版 Blob ID</span><input value={maskBlobId} onChange={(event) => setMaskBlobId(event.target.value)} placeholder="可选，默认全图" /></label> : null}
+                <label className="studio-field"><span>编辑强度</span><input type="number" min={0} max={1} step={0.05} value={strength} onChange={(event) => setStrength(Number(event.target.value) || 0.75)} /></label>
+              </div> : null}
+              {mode === 'distributed' ? <div className="studio-distributed-fields">
+                <div className="studio-form__modes" role="group" aria-label="分布式模式"><button type="button" className={distributedMode === 'single' ? 'is-active' : ''} aria-pressed={distributedMode === 'single'} onClick={() => setDistributedMode('single')}>单图 Worker</button><button type="button" className={distributedMode === 'grid' ? 'is-active' : ''} aria-pressed={distributedMode === 'grid'} onClick={() => setDistributedMode('grid')}>四宫格 fan-out</button></div>
+                {distributedMode === 'grid' ? <label className="studio-field"><span>四个 Seed（逗号分隔）</span><input value={gridSeeds} onChange={(event) => setGridSeeds(event.target.value)} placeholder="11, 22, 33, 44" /></label> : null}
+                <p className="inline-note">{distributedEnabled ? '当前实验门已开启；结果会绑定 workflow 和远端 Blob。' : '分布式实验门未开启，页面不会提交请求。'}</p>
+              </div> : null}
               <div className="studio-form__grid">
                 <label className="studio-field"><span>预设</span><select value={selectedPresetId} onChange={(event) => {
                   setSelectedPresetId(event.target.value);
@@ -442,11 +739,12 @@ export function ImageStudioPage() {
               <div className="studio-form__actions">
                 {!capabilities.data?.loaded && selectedArtifactId ? <CommandButton variant="ghost" icon={LoaderCircle} busy={busy === 'load'} onClick={() => void handleLoad()}>加载模型</CommandButton> : null}
                 {capabilities.data?.loaded ? <CommandButton variant="ghost" onClick={() => void handleUnload()} busy={busy === 'unload'}>卸载模型</CommandButton> : null}
-                <CommandButton icon={Sparkles} busy={busy === 'generate'} disabled={!canGenerate} onClick={() => void handleGenerate()}>
-                  {activeJob ? '生成中' : '开始生成'}
+                <CommandButton icon={mode === 'distributed' ? Network : mode === 'txt2img' ? Sparkles : ImageIcon} busy={busy !== '' && ['generate', 'edit', 'distributed'].includes(busy)} disabled={!canGenerate} onClick={handleSubmit}>
+                  {activeJob ? '处理中' : mode === 'distributed' ? '提交分布式' : mode === 'txt2img' ? '开始生成' : '开始编辑'}
                 </CommandButton>
               </div>
               {!capabilities.data?.loaded ? <p className="inline-note">请先加载可用的 SD 1.5 artifact；未安装依赖或模型时会在这里显示后端原因。</p> : null}
+              {mode !== 'txt2img' && mode !== 'distributed' && !sourceBlobId ? <p className="inline-note">图像编辑需要输入 Blob；可用上方文件选择器上传，或粘贴已有 Blob ID。</p> : null}
             </section>
           </main>
 
@@ -464,6 +762,18 @@ export function ImageStudioPage() {
                 </dl>
               ) : <EmptyState kind="empty" title="选择一个任务" description="列表中的任务详情会显示在这里。" compact />}
             </section>
+            {distributedResult ? <section className="studio-panel studio-panel--distributed-result" data-testid="distributed-result">
+              <SectionHead title="分布式结果" hint={distributedWorkflowId || 'workflow'} />
+              <dl className="studio-facts">
+                <div><dt>执行模式</dt><dd>{String(distributedResult.execution_mode || (distributedResult.distributed ? 'multi-node' : 'worker'))}</dd></div>
+                <div><dt>Provider</dt><dd className="cell-mono">{String(distributedResult.provider_id || (Array.isArray(distributedResult.provider_ids) ? distributedResult.provider_ids.join(', ') : '') || '—')}</dd></div>
+                <div><dt>节点</dt><dd className="cell-mono">{String(distributedResult.node_id || (Array.isArray(distributedResult.node_ids) ? distributedResult.node_ids.join(', ') : '') || '—')}</dd></div>
+              </dl>
+              {distributedResult.result?.images?.length ? <div className="distributed-thumbnails">{distributedResult.result.images.map((image, index) => {
+                const href = image.url || (distributedWorkflowId && image.blob_id ? `/api/diffusion/distributed/workflows/${encodeURIComponent(distributedWorkflowId)}/blobs/${encodeURIComponent(image.blob_id)}` : '');
+                return href ? <a key={image.blob_id || index} href={href} download={`qlh-grid-${index}.png`}><img src={href} alt={`分布式结果 ${index + 1}`} /><span>#{index + 1}</span></a> : null;
+              })}</div> : null}
+            </section> : null}
             <section className="studio-panel">
               <SectionHead title="运行时" hint="来自 /api/diffusion/capabilities" />
               <dl className="studio-facts">

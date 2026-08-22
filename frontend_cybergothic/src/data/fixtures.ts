@@ -40,9 +40,14 @@ import type {
   QueueResponse,
   RagHealthResponse,
   RagSearchResponse,
+  RagCapacityResponse,
+  RagAnnDecisionResponse,
+  RagEmbeddingJob,
   RecentLogsResponse,
   ReviewTicketsResponse,
   SessionsResponse,
+  StorageHealthResponse,
+  SpeculativeCapabilityResponse,
   SystemStatusResponse,
   TailscaleBindingsResponse,
   WorkflowsResponse,
@@ -92,6 +97,32 @@ export const authCapabilityFixture: AuthCapabilityResponse = {
   required: true,
   mode: 'local_primary_node',
   bootstrap_available: false,
+};
+
+export const storageHealthFixture: StorageHealthResponse = {
+  local: {
+    status: 'ok',
+    backend: 'sqlite',
+    writable: true,
+    path: 'data/qlh.sqlite3',
+    journal_mode: 'wal',
+    synchronous: 'full',
+  },
+  remote: { status: 'retired', backend: 'postgresql', mode: 'retired' },
+  projection: { pending_events: 0, oldest_event_age_seconds: null },
+  export: { pending_items: 0, oldest_item_age_seconds: null },
+  effective_mode: 'local_only',
+  retirement: { status: 'retired', prepared_at: null, retired_at: null },
+};
+
+export const speculativeCapabilityFixture: SpeculativeCapabilityResponse = {
+  enabled: false,
+  configured: false,
+  available: false,
+  execution_mode: 'speculative_assisted',
+  local_only: true,
+  data_scope: 'opt_in',
+  reason_code: 'disabled_by_config',
 };
 
 export const authOwnerFixture: AuthUser = {
@@ -375,10 +406,16 @@ export const workflowsFixture: WorkflowsResponse = {
       state: 'succeeded',
       created_at: NOW - 480,
       updated_at: NOW - 420,
+      stage_count: 3,
+      completed_stage_count: 3,
+      attempt_count: 3,
+      retry_count: 0,
+      observability: { state: 'succeeded', terminal: true, result_ready: true, retry_count: 0, reassignment_count: 0, result_rejection_count: 0, actual_providers: ['local_full_model'], actual_nodes: ['master'] },
+      journal: { available: true, record_count: 18 },
       stages: [
-        { stage_id: 'cand_a', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 478, finished_at: NOW - 450 },
-        { stage_id: 'cand_b', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 450, finished_at: NOW - 430 },
-        { stage_id: 'agg', stage_type: 'aggregate', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 430, finished_at: NOW - 420 },
+        { stage_id: 'cand_a', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 478, finished_at: NOW - 450, output_available: true, output_sha256: 'a'.repeat(64), output_size_bytes: 2048, attempts: [{ attempt_id: 'attempt_cand_a_1', provider: 'local_full_model', provider_kind: 'local_full_model', provider_node_id: 'master', state: 'succeeded', started_at: NOW - 478, finished_at: NOW - 450, duration_seconds: 28, result_sha256: 'b'.repeat(64) }] },
+        { stage_id: 'cand_b', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 450, finished_at: NOW - 430, output_available: true, output_sha256: 'c'.repeat(64), output_size_bytes: 1792, attempts: [{ attempt_id: 'attempt_cand_b_1', provider: 'local_full_model', provider_kind: 'local_full_model', provider_node_id: 'master', state: 'succeeded', started_at: NOW - 450, finished_at: NOW - 430, duration_seconds: 20, result_sha256: 'd'.repeat(64) }] },
+        { stage_id: 'agg', stage_type: 'aggregate', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 430, finished_at: NOW - 420, depends_on: ['cand_a', 'cand_b'], input_bindings: { candidate_a: { dependency_stage_id: 'cand_a', output_key: 'content' }, candidate_b: { dependency_stage_id: 'cand_b', output_key: 'content' } }, output_available: true, output_sha256: 'e'.repeat(64), output_size_bytes: 768, attempts: [{ attempt_id: 'attempt_agg_1', provider: 'local_full_model', provider_kind: 'local_full_model', provider_node_id: 'master', state: 'succeeded', started_at: NOW - 430, finished_at: NOW - 420, duration_seconds: 10, result_sha256: 'f'.repeat(64) }] },
       ],
     },
     {
@@ -388,9 +425,13 @@ export const workflowsFixture: WorkflowsResponse = {
       state: 'running',
       created_at: NOW - 60,
       updated_at: NOW - 4,
+      stage_count: 3,
+      completed_stage_count: 1,
+      attempt_count: 2,
+      observability: { state: 'running', terminal: false, retry_count: 0, reassignment_count: 0, result_rejection_count: 0, actual_providers: ['local_full_model'], actual_nodes: ['master'] },
       stages: [
-        { stage_id: 'cand_a', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 58, finished_at: NOW - 30 },
-        { stage_id: 'cand_b', stage_type: 'full_inference', state: 'running', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 30 },
+        { stage_id: 'cand_a', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 58, finished_at: NOW - 30, output_available: true, output_size_bytes: 1536, attempts: [{ attempt_id: 'attempt_running_a', provider: 'local_full_model', provider_node_id: 'master', state: 'succeeded', started_at: NOW - 58, finished_at: NOW - 30, duration_seconds: 28 }] },
+        { stage_id: 'cand_b', stage_type: 'full_inference', state: 'running', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 30, attempts: [{ attempt_id: 'attempt_running_b', provider: 'local_full_model', provider_node_id: 'master', state: 'running', started_at: NOW - 30, lease_enforced: true, lease_epoch: 2 }] },
         { stage_id: 'agg', stage_type: 'aggregate', state: 'pending' },
       ],
     },
@@ -401,10 +442,16 @@ export const workflowsFixture: WorkflowsResponse = {
       state: 'failed',
       created_at: NOW - 1800,
       updated_at: NOW - 1740,
+      stage_count: 2,
+      completed_stage_count: 1,
+      failed_stage_count: 1,
+      attempt_count: 2,
+      retry_count: 1,
+      observability: { state: 'failed', terminal: true, retry_count: 1, reassignment_count: 1, result_rejection_count: 0, actual_providers: ['local_full_model'], actual_nodes: ['master'] },
       error: 'PROVIDER_UNAVAILABLE: 本地全模型提供者被占用',
       stages: [
-        { stage_id: 'cand_a', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 1798, finished_at: NOW - 1770 },
-        { stage_id: 'cand_b', stage_type: 'full_inference', state: 'failed', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 1770, error: 'PROVIDER_UNAVAILABLE' },
+        { stage_id: 'cand_a', stage_type: 'full_inference', state: 'succeeded', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 1798, finished_at: NOW - 1770, output_available: true, output_size_bytes: 1024, attempts: [{ attempt_id: 'attempt_failed_a', provider: 'local_full_model', provider_node_id: 'master', state: 'succeeded', started_at: NOW - 1798, finished_at: NOW - 1770, duration_seconds: 28 }] },
+        { stage_id: 'cand_b', stage_type: 'full_inference', state: 'failed', provider_id: 'local_full_model', node_id: 'master', started_at: NOW - 1770, error: 'PROVIDER_UNAVAILABLE: 本地全模型提供者被占用', last_retry_error_code: 'PROVIDER_UNAVAILABLE', retry_count: 1, attempts: [{ attempt_id: 'attempt_failed_b', provider: 'local_full_model', provider_node_id: 'master', state: 'failed', started_at: NOW - 1770, finished_at: NOW - 1740, duration_seconds: 30, error: 'PROVIDER_UNAVAILABLE: 本地全模型提供者被占用' }] },
       ],
     },
   ],
@@ -454,6 +501,43 @@ export const ragSearchFixture: RagSearchResponse = {
   storage: 'sqlite',
 };
 
+export const ragCapacityFixture: RagCapacityResponse = {
+  dimensions: 768,
+  active_chunk_count: 2841,
+  embedding_count: 2841,
+  current_identity_embedding_count: 2841,
+  stale_embedding_count: 0,
+  estimated_vector_bytes: 8_730_624,
+  database_bytes: 18_442_240,
+  wal_bytes: 0,
+  estimated_total_bytes: 27_172_864,
+  max_index_chunks: 100_000,
+};
+
+export const ragAnnDecisionFixture: RagAnnDecisionResponse = {
+  storage: 'sqlite',
+  decision: {
+    decision: 'NO_GO',
+    reason: 'bounded_cosine_within_scan_budget',
+    corpus_chunks: 2841,
+    scan_budget: 1024,
+    extension: 'sqlite_vec',
+    extension_available: false,
+    production_approved: false,
+  },
+};
+
+export const ragEmbeddingJobFixture: RagEmbeddingJob = {
+  job_id: 'fixture-rag-job-01',
+  kind: 'embedding_index',
+  state: 'queued',
+  cursor: { total: 2841, indexed: 0, position: 0, batch_size: 16, model_id: 'nomic-embed-text:latest' },
+  attempts: 0,
+  lease_active: false,
+  created_at: '2026-08-22T10:00:00Z',
+  updated_at: '2026-08-22T10:00:00Z',
+};
+
 export const sessionsFixture: SessionsResponse = {
   sessions: [
     { id: 'default', title: '新对话', message_count: 56, created_at: '2026-08-18T12:28:05.340855Z', updated_at: '2026-08-20T15:28:56.588493Z' },
@@ -474,6 +558,11 @@ export const diffusionCapabilitiesFixture: DiffusionCapabilitiesResponse = {
   },
   capabilities: { txt2img: true, img2img: false, inpaint: false },
   dependencies: { torch: true, diffusers: true, transformers: true },
+  distributed_workflow: {
+    enabled: true,
+    role: 'master',
+    status: { connected_worker_count: 1, task_dispatch_enabled: true },
+  },
   presets: [
     {
       preset_id: 'sd15_demo',

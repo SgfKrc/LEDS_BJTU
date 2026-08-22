@@ -2,11 +2,14 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
+  Activity,
   Check,
   Cpu,
   Database,
   Eye,
   EyeOff,
+  FileWarning,
+  FlaskConical,
   KeyRound,
   Network,
   Power,
@@ -27,7 +30,7 @@ import {
 import { fixturesEnabled, setFixturesEnabled } from '../data/fixtures';
 import { getAuthToken, getLogToken, setLogToken } from '../data/api';
 import * as api from '../data/api';
-import { useMyRole, useSystemStatus } from '../data/hooks';
+import { useMyRole, useSpeculativeCapability, useStorageHealth, useSystemStatus } from '../data/hooks';
 import { APP_VERSION } from '../app/version';
 import { SettingsWorkspace, type SettingsWorkspaceTab } from '../components/SettingsWorkspace';
 import { PageBackdrop } from '../visual/PageBackdrop';
@@ -44,6 +47,7 @@ const SETTINGS_SECTIONS = [
   { id: 'connection', label: '连接状态', short: 'LINK', icon: Network },
   { id: 'preferences', label: '动效偏好', short: 'MOTION', icon: SlidersHorizontal },
   { id: 'fixtures', label: '演示数据', short: 'SOURCE', icon: Database },
+  { id: 'diagnostics', label: '运行诊断', short: 'DIAG', icon: Activity },
   { id: 'token', label: '日志令牌', short: 'ACCESS', icon: KeyRound },
 ] as const;
 
@@ -52,6 +56,8 @@ type SettingsSection = (typeof SETTINGS_SECTIONS)[number]['id'];
 export function SettingsPage() {
   const status = useSystemStatus(30_000);
   const role = useMyRole();
+  const storage = useStorageHealth(30_000);
+  const speculative = useSpeculativeCapability(30_000);
   const [section, setSection] = useState<SettingsSection>('device');
   const [motion, setMotion] = useMotionPreference();
   const [useFixtures, setUseFixtures] = useState(() => fixturesEnabled());
@@ -59,11 +65,14 @@ export function SettingsPage() {
   const [tokenVisible, setTokenVisible] = useState(false);
   const [savedToken, setSavedToken] = useState(() => getLogToken());
   const [shutdownBusy, setShutdownBusy] = useState(false);
+  const [reportBusy, setReportBusy] = useState(false);
 
   const refresh = useCallback(() => {
     status.refresh();
     role.refresh();
-  }, [role, status]);
+    storage.refresh();
+    speculative.refresh();
+  }, [role, speculative, storage, status]);
   useRegisterRefresh(refresh);
 
   const tokenDirty = logToken !== savedToken;
@@ -105,6 +114,29 @@ export function SettingsPage() {
       setShutdownBusy(false);
     }
   }, [shutdownBusy, useFixtures]);
+
+  const sendClientDiagnostic = useCallback(async () => {
+    if (reportBusy) return;
+    if (useFixtures) {
+      pushToast('Fixture client diagnostic recorded', 'ok');
+      return;
+    }
+    setReportBusy(true);
+    try {
+      await api.reportClientError({
+        source: 'settings_manual_probe',
+        message: 'Manual client diagnostics probe',
+        url: window.location.href,
+        user_agent: navigator.userAgent,
+        extra: { route: window.location.hash, fixture_mode: useFixtures },
+      });
+      pushToast('Client diagnostic sent', 'ok');
+    } catch (error) {
+      pushToast(`Client diagnostic failed: ${api.describeError(error)}`, 'danger');
+    } finally {
+      setReportBusy(false);
+    }
+  }, [reportBusy, useFixtures]);
 
   const selectWorkspace = useCallback((next: SettingsWorkspaceTab) => {
     setSection(next);
@@ -159,7 +191,7 @@ export function SettingsPage() {
               <SectionHead
                 id="settings-current-title"
                 title={current.label}
-                hint={section === 'device' ? '硬件检测、GPU 选择与推荐运行配置。' : section === 'rag' ? '检索本地知识索引并维护 FTS 数据。' : section === 'connection' ? '当前控制台与本机节点之间的连接上下文。' : section === 'preferences' ? '为全部页面设置动效强度。' : section === 'fixtures' ? '在演示数据与真实后端之间切换。' : '为受保护的日志与审计接口设置访问令牌。'}
+                hint={section === 'device' ? '硬件检测、GPU 选择与推荐运行配置。' : section === 'rag' ? '检索本地知识索引并维护 FTS 数据。' : section === 'connection' ? '当前控制台与本机节点之间的连接上下文。' : section === 'preferences' ? '为全部页面设置动效强度。' : section === 'fixtures' ? '在演示数据与真实后端之间切换。' : section === 'diagnostics' ? '本地存储、客户端日志和实验能力的只读健康检查。' : '为受保护的日志与审计接口设置访问令牌。'}
               />
             </div>
 
@@ -206,6 +238,45 @@ export function SettingsPage() {
                     </label>
                     <p className="switchrow__hint">启用后页面读取本地 fixture，写操作会被拦截。网址中也可使用 <code>?fixtures=1</code> 临时开启。</p>
                   </div>
+                </div>
+              ) : null}
+
+              {section === 'diagnostics' ? (
+                <div className="settings-diagnostics" data-testid="settings-diagnostics">
+                  <div className="settings-diagnostics__grid">
+                    <section className="settings-tool settings-diagnostics__card">
+                      <div className="settings-tool__head"><SectionHead title="Storage health" hint="SQLite is the local source of truth" /></div>
+                      {storage.state === 'error' ? (
+                        <EmptyState kind="error" title="Storage health unavailable" detail={storage.error} action={<CommandButton variant="ghost" size="sm" icon={RefreshCw} onClick={() => storage.refresh()}>Retry</CommandButton>} />
+                      ) : (
+                        <dl className="kvgrid settings-kvgrid">
+                          <div><dt>Effective mode</dt><dd><StatusBadge label={storage.data?.effective_mode || 'checking'} tone={storage.data?.effective_mode === 'local_only' ? 'ok' : 'warn'} size="sm" /></dd></div>
+                          <div><dt>Local backend</dt><dd>{storage.data?.local?.backend || 'sqlite'} / {storage.data?.local?.writable ? 'writable' : 'read-only'}</dd></div>
+                          <div><dt>Remote backend</dt><dd>{storage.data?.remote?.status || 'retired'}</dd></div>
+                          <div><dt>Pending projection</dt><dd>{storage.data?.projection?.pending_events ?? 0}</dd></div>
+                        </dl>
+                      )}
+                      <p className="field__hint cell-mono">{storage.data?.local?.path || 'local path hidden until health returns'}</p>
+                    </section>
+
+                    <section className="settings-tool settings-diagnostics__card">
+                      <div className="settings-tool__head"><SectionHead title="Client diagnostics" hint="Sends a fixed probe without page content" /></div>
+                      <p className="field__hint">Use this after a visible UI failure. The report follows the configured log access token and contains no conversation text.</p>
+                      <CommandButton icon={FileWarning} size="sm" busy={reportBusy} onClick={() => void sendClientDiagnostic()}>Send client diagnostic</CommandButton>
+                    </section>
+                  </div>
+
+                  <section className="settings-tool settings-diagnostics__card">
+                    <div className="settings-tool__head"><SectionHead title="Speculative experiment gate" hint="Experimental and master-only" /></div>
+                    <div className="settings-experiment-row">
+                      <FlaskConical size={18} aria-hidden="true" />
+                      <div>
+                        <strong>{speculative.data?.available && role.data?.is_master ? 'Ready for controlled use' : 'Unavailable'}</strong>
+                        <p className="field__hint">{role.data?.is_master ? `reason=${speculative.data?.reason_code || 'checking'}; scope=${speculative.data?.data_scope || 'unknown'}` : 'Only the primary node may open this experiment.'}</p>
+                      </div>
+                      <StatusBadge label={speculative.data?.available && role.data?.is_master ? 'GATED ON' : 'FAIL CLOSED'} tone={speculative.data?.available && role.data?.is_master ? 'warn' : 'idle'} size="sm" />
+                    </div>
+                  </section>
                 </div>
               ) : null}
 

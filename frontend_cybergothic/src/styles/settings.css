@@ -226,6 +226,58 @@
   font-size: 11px;
 }
 
+.settings-diagnostics {
+  display: grid;
+  gap: var(--gap-md);
+}
+
+.settings-diagnostics__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap-md);
+}
+
+.settings-diagnostics__card {
+  padding: var(--gap-md);
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface-raised) 72%, transparent);
+}
+
+.settings-diagnostics__card .kvgrid {
+  margin: 0;
+}
+
+.settings-diagnostics__card .field__hint {
+  overflow-wrap: anywhere;
+}
+
+.settings-experiment-row {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-sm);
+  color: var(--text-muted);
+}
+
+.settings-experiment-row > svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.settings-experiment-row > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.settings-experiment-row strong {
+  color: var(--text);
+}
+
+@media (max-width: 720px) {
+  .settings-diagnostics__grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .settings-unsaved {
   color: var(--warn);
 }

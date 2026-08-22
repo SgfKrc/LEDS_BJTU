@@ -37,6 +37,8 @@ import {
   canVoteFixture,
   reviewTicketsFixture,
   sessionsFixture,
+  speculativeCapabilityFixture,
+  storageHealthFixture,
   statusFixture,
   tailscaleBindingsFixture,
   workflowsFixture,
@@ -74,6 +76,8 @@ import type {
   RecentLogsResponse,
   ReviewTicketsResponse,
   SessionsResponse,
+  SpeculativeCapabilityResponse,
+  StorageHealthResponse,
   SystemStatusResponse,
   TailscaleBindingsResponse,
   WorkflowsResponse,
@@ -179,6 +183,24 @@ export function useRagHealth(pollMs = 60_000): ResourceResult<RagHealthResponse>
   const useFixtures = fixturesEnabled();
   return useResource<RagHealthResponse>(
     (signal) => (useFixtures ? withFixtureDelay(ragFixture, signal) : api.fetchRagHealth(signal)),
+    { pollMs },
+  );
+}
+
+export function useStorageHealth(pollMs = 30_000): ResourceResult<StorageHealthResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<StorageHealthResponse>(
+    (signal) => useFixtures ? withFixtureDelay(storageHealthFixture, signal) : api.fetchStorageHealth(signal),
+    { pollMs },
+  );
+}
+
+export function useSpeculativeCapability(pollMs = 30_000): ResourceResult<SpeculativeCapabilityResponse> {
+  const useFixtures = fixturesEnabled();
+  return useResource<SpeculativeCapabilityResponse>(
+    (signal) => useFixtures
+      ? withFixtureDelay(speculativeCapabilityFixture, signal)
+      : api.fetchSpeculativeCapability(signal),
     { pollMs },
   );
 }

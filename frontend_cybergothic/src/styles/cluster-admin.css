@@ -330,6 +330,149 @@
   gap: var(--gap-md);
 }
 
+.cluster-ops-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap-md);
+}
+
+.cluster-panel--wide {
+  grid-column: 1 / -1;
+}
+
+.cluster-profile-list li.is-active {
+  border-color: var(--accent-line);
+}
+
+.cluster-profile-actions,
+.cluster-endpoint-row__actions,
+.cluster-sidecar-row__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.cluster-profile-state {
+  margin-left: 5px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: .08em;
+}
+
+.cluster-endpoint-list,
+.cluster-layer-list,
+.cluster-sidecar-list {
+  display: grid;
+  gap: 6px;
+}
+
+.cluster-endpoint-row,
+.cluster-layer-row,
+.cluster-sidecar-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-sunken);
+}
+
+.cluster-endpoint-row > div:first-child,
+.cluster-layer-row > div:first-child,
+.cluster-sidecar-row > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.cluster-endpoint-row span,
+.cluster-layer-row span,
+.cluster-sidecar-row span {
+  overflow: hidden;
+  color: var(--muted-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cluster-plan-status {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: var(--gap-sm);
+}
+
+.cluster-facts--grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cluster-facts--grid div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.cluster-facts--grid dt,
+.cluster-facts--grid dd {
+  margin: 0;
+}
+
+.cluster-facts--grid dt {
+  color: var(--muted-dim);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: .06em;
+}
+
+.cluster-facts--grid dd {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cluster-plan-reason {
+  margin: var(--gap-sm) 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.cluster-layer-range {
+  display: grid;
+  min-width: 150px;
+  gap: 3px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: right;
+}
+
+.cluster-layer-range small {
+  color: var(--muted-dim);
+  font-size: 9px;
+}
+
+.cluster-contract-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: var(--gap-sm);
+  color: var(--muted-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
 .cluster-endpoint {
   display: flex;
   align-items: center;
@@ -432,6 +575,7 @@
 @media (max-width: 680px) {
   .cluster-status-grid,
   .cluster-access-grid,
+  .cluster-ops-grid,
   .cluster-register__row,
   .cluster-rail {
     grid-template-columns: 1fr;
@@ -449,6 +593,20 @@
 
   .cluster-status-card {
     min-height: 82px;
+  }
+
+  .cluster-facts--grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cluster-layer-row,
+  .cluster-sidecar-row,
+  .cluster-endpoint-row {
+    align-items: flex-start;
+  }
+
+  .cluster-layer-range {
+    min-width: 0;
   }
 
   .cluster-table {

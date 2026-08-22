@@ -25,6 +25,14 @@ test('account workspace covers auth session, Tailscale binding, and user managem
   await page.getByLabel('DISPLAY NAME').fill('Audit User');
   await page.getByRole('button', { name: 'Create user' }).click();
   await expect(page.locator('.account-user-row')).toHaveCount(4);
+  await page.getByRole('button', { name: 'Provision Auth App for auditor' }).click();
+  await expect(page.getByRole('heading', { level: 2, name: 'Auth App for auditor' })).toBeVisible();
+  await page.getByRole('button', { name: 'Discard provisioning material' }).click();
+
+  await page.locator('.account-nav button', { hasText: 'Security' }).click();
+  await page.getByLabel('CURRENT AUTH APP CODE').fill('123456');
+  await page.getByRole('button', { name: 'Rotate recovery codes' }).click();
+  await expect(page.getByRole('heading', { level: 2, name: /Recovery codes/ })).toBeVisible();
 
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByRole('heading', { level: 2, name: 'Sign in to continue' })).toBeVisible();
@@ -42,4 +50,37 @@ test('account page reports missing auth service instead of rendering a fake sess
   await expect(page.getByRole('heading', { level: 1, name: 'Account & Security' })).toBeVisible();
   await expect(page.locator('.emptystate--error')).toContainText('Authentication capability unavailable');
   await expect(page.locator('.account-profile')).toHaveCount(0);
+});
+
+test('first owner receives local Auth App QR and recovery codes before sign in', async ({ page }) => {
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/auth/capability') {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ required: true, bootstrap_available: true }) });
+      return;
+    }
+    if (path === '/api/auth/bootstrap') {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ status: 'pending', provisioning: { user_id: 'user-owner', authenticator_id: 'totp-owner', secret: 'JBSWY3DPEHPK3PXP', qr_payload: 'otpauth://totp/QLH:owner?secret=JBSWY3DPEHPK3PXP&issuer=QLH', otpauth_uri: 'otpauth://totp/QLH:owner?secret=JBSWY3DPEHPK3PXP&issuer=QLH' } }) });
+      return;
+    }
+    if (path === '/api/auth/totp/verify') {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ status: 'active', recovery_codes: ['A1C2-E3F4', 'B5D6-G7H8'] }) });
+      return;
+    }
+    await route.fulfill({ contentType: 'application/json', body: '{}' });
+  });
+
+  await page.goto('/#/account');
+  await expect(page.getByRole('heading', { level: 2, name: 'Initialize the owner account' })).toBeVisible();
+  await page.getByLabel('USERNAME').fill('owner');
+  await page.getByRole('button', { name: 'Create Auth App setup' }).click();
+  await expect(page.getByAltText('Auth App provisioning QR')).toBeVisible();
+  await page.getByRole('button', { name: 'String' }).click();
+  await expect(page.locator('.account-secret-row').first()).toContainText('JBSWY3DPEHPK3PXP');
+  await page.getByLabel('AUTH APP CODE').fill('123456');
+  await page.getByRole('button', { name: 'Verify and activate' }).click();
+  await expect(page.getByRole('heading', { level: 2, name: 'Recovery codes for owner' })).toBeVisible();
+  await expect(page.locator('.account-recovery-grid')).toContainText('A1C2-E3F4');
+  await page.getByRole('button', { name: 'Continue to sign in' }).click();
+  await expect(page.getByRole('heading', { level: 2, name: 'Sign in to continue' })).toBeVisible();
 });

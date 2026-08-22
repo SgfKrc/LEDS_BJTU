@@ -21,3 +21,34 @@ test('settings workspace exposes device controls and local RAG actions in fixtur
   await page.getByRole('button', { name: 'Rebuild FTS index' }).click();
   await expect(page.getByText('Fixture FTS index rebuilt', { exact: true })).toBeVisible();
 });
+
+test('local RAG exposes capacity, ANN gate, and resumable embedding jobs in fixture mode', async ({ page }) => {
+  await page.goto('/#/settings?fixtures=1');
+
+  await page.getByRole('button', { name: 'Local RAG' }).click();
+  await expect(page.getByTestId('rag-capacity')).toContainText('2,841');
+  await expect(page.getByTestId('rag-ann')).toContainText('bounded_cosine_within_scan_budget');
+
+  const jobs = page.getByTestId('rag-embedding-jobs');
+  await jobs.getByLabel('Model SHA256').fill('a'.repeat(64));
+  await jobs.getByRole('button', { name: 'Create job' }).click();
+  await expect(jobs).toContainText('fixture-rag-job-01');
+
+  await jobs.getByRole('button', { name: 'Run batch' }).click();
+  await expect(jobs).toContainText('RUNNING');
+  await jobs.getByRole('button', { name: 'Cancel' }).click();
+  await expect(jobs).toContainText('CANCELLED');
+});
+
+test('settings diagnostics exposes local storage and fail-closed experiment gate', async ({ page }) => {
+  await page.goto('/#/settings?fixtures=1');
+
+  await page.getByRole('button', { name: '运行诊断' }).click();
+  const diagnostics = page.getByTestId('settings-diagnostics');
+  await expect(diagnostics).toBeVisible();
+  await expect(diagnostics).toContainText('sqlite');
+  await expect(diagnostics).toContainText('local_only');
+  await expect(diagnostics).toContainText('FAIL CLOSED');
+  await diagnostics.getByRole('button', { name: 'Send client diagnostic' }).click();
+  await expect(page.getByText('Fixture client diagnostic recorded', { exact: true })).toBeVisible();
+});

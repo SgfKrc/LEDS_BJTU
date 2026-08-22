@@ -427,6 +427,213 @@
   font-size: 11px;
 }
 
+.model-panel--governance {
+  grid-column: 1 / -1;
+}
+
+.governance-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap-md);
+}
+
+.governance-block {
+  min-width: 0;
+  padding: var(--gap-sm);
+  border: 1px solid var(--line);
+  background: var(--surface-sunken);
+}
+
+.governance-block__head,
+.simulation-strip,
+.simulation-actions,
+.contract-note,
+.registry-list li,
+.manifest-list li,
+.assignment-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+}
+
+.governance-block__head {
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.governance-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 var(--gap-sm);
+}
+
+.governance-facts > div {
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid var(--line-faint);
+}
+
+.governance-facts dt,
+.governance-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.governance-facts dt {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.governance-facts dd {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.manifest-list,
+.assignment-list,
+.registry-list {
+  display: flex;
+  max-height: 190px;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.manifest-list li,
+.assignment-list li,
+.registry-list li {
+  min-width: 0;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-faint);
+}
+
+.manifest-list li > span,
+.assignment-list li > span:first-child,
+.registry-list li > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.manifest-list strong,
+.assignment-list strong,
+.registry-list strong {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.manifest-list small,
+.assignment-list small,
+.registry-list small {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.contract-note {
+  align-items: flex-start;
+  justify-content: flex-start;
+  margin-top: var(--gap-sm);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.contract-note svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.simulation-strip {
+  align-items: flex-end;
+  margin-top: var(--gap-md);
+  padding-top: var(--gap-md);
+  border-top: 1px solid var(--line);
+}
+
+.simulation-strip > div:first-child {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.simulation-strip strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.simulation-strip span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.simulation-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.registry-editor {
+  margin-top: var(--gap-md);
+  border-top: 1px solid var(--line);
+}
+
+.registry-editor summary {
+  padding-top: var(--gap-md);
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.registry-editor form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: var(--gap-sm);
+}
+
+.registry-editor label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.registry-editor label:last-of-type,
+.registry-editor form > .cbtn,
+.registry-editor form > .model-inline-note {
+  grid-column: 1 / -1;
+}
+
+.registry-editor input,
+.registry-editor select,
+.registry-editor textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.registry-editor textarea {
+  resize: vertical;
+}
+
 .spin {
   animation: model-spin 1s linear infinite;
 }
@@ -470,5 +677,24 @@
 
   .runtime-actions .cbtn {
     flex: 1 1 180px;
+  }
+
+  .governance-grid,
+  .governance-facts,
+  .registry-editor form {
+    grid-template-columns: 1fr;
+  }
+
+  .simulation-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .simulation-actions {
+    justify-content: stretch;
+  }
+
+  .simulation-actions .cbtn {
+    flex: 1 1 130px;
   }
 }
