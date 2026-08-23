@@ -43,15 +43,15 @@ echo   依赖安装完成。
 
 REM ---- 构建前端 ----
 echo.
-echo [3/5] 构建 React 前端...
-cd frontend
+echo [3/5] 构建 CyberGothic 产品前端...
+cd frontend_cybergothic
 if not exist "node_modules" (
     echo   安装 npm 依赖...
     call npm install
 )
 call npx vite build
 cd ..
-if not exist "frontend\dist\index.html" (
+if not exist "frontend_cybergothic\dist\index.html" (
     echo   [错误] 前端构建失败！
     pause
     exit /b 1

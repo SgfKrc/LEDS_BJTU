@@ -33,7 +33,7 @@
 │
 ├── .venv-packaging/              # 集显版打包专用 venv（torch CPU + PyInstaller）
 ├── .venv-packaging-cuda/         # 独显版打包专用 venv（torch CUDA + PyInstaller）
-├── frontend/dist/                # React 前端构建产物（PyInstaller 打包进 EXE）
+├── frontend_cybergothic/dist/    # CyberGothic 产品前端构建产物（PyInstaller 打包进 EXE）
 └── src/                          # Python 源码（PyInstaller 从 launcher.py 追踪导入）
 ```
 
@@ -47,7 +47,7 @@
 
 | 步骤 | 工具 | 输入 | 输出 |
 |------|------|------|------|
-| **1. 程序打包** | PyInstaller | `qlh-cpu.spec` / `qlh-cuda.spec` + `launcher.py` + `src/` + `frontend/dist/` | `dist/QLH-Edge-Inference/` 或 `dist/QLH-Edge-Inference-CUDA/` |
+| **1. 程序打包** | PyInstaller | `qlh-cpu.spec` / `qlh-cuda.spec` + `launcher.py` + `src/` + `frontend_cybergothic/dist/` | `dist/QLH-Edge-Inference/` 或 `dist/QLH-Edge-Inference-CUDA/` |
 | **2. 安装包编译** | Inno Setup 6 | `setup.iss` / `setup-cuda.iss` + `dist/` 中的 PyInstaller 输出 | `packaging/dist/QLH-Edge-Inference-Setup-vX.X.X.exe` |
 | **3. 独立引导器** | PyInstaller + Inno Setup 6 | `qlh-launcher.spec` + `setup-launcher.iss` | `dist/QLH-Launcher/` + `packaging/dist/QLH-Launcher-Setup-vX.X.X.exe` |
 
@@ -111,7 +111,7 @@ pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
 # 2. 构建前端（★ 从项目根目录）
-cd frontend && npm ci && npx vite build && cd ..
+cd frontend_cybergothic && npm ci && npx vite build && cd ..
 
 # 3. 完整发布构建（★ 从项目根目录，签名 key 不得提交）
 set QLH_SIGNING_KEY=packaging\.signing-keys\release-YYYYMMDD.key
@@ -138,7 +138,7 @@ pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
 # 2. 构建前端（★ 从项目根目录，如已构建可跳过）
-cd frontend && npm ci && npx vite build && cd ..
+cd frontend_cybergothic && npm ci && npx vite build && cd ..
 
 # 3. 完整发布构建（★ 从项目根目录，使用独显版 venv）
 set QLH_SIGNING_KEY=packaging\.signing-keys\release-YYYYMMDD.key
@@ -167,9 +167,9 @@ cd packaging
 **构建（需先构建前端）**：
 
 ```bash
-cd frontend && npm run build                                # 生成 frontend/dist
+cd frontend_cybergothic && npm run build                    # 生成 frontend_cybergothic/dist
 .venv-packaging\Scripts\python -m PyInstaller packaging\qlh-slim.spec --noconfirm
-# 产物: dist\QLH-Edge-Inference\  （仅引导器 + _internal/src + frontend/dist +
+# 产物: dist\QLH-Edge-Inference\  （仅引导器 + _internal/src + frontend_cybergothic/dist +
 #       requirements-runtime-{cpu,cuda}.txt + pubkeys，不含 torch 系）
 ```
 
@@ -207,8 +207,8 @@ cd frontend && npm run build                                # 生成 frontend/di
 | 平台/产物 | 打包源 | 说明 |
 |---|---|---|
 | Windows 主程序（Inno） | `dist\QLH-Edge-Inference\*`（PyInstaller 输出签名树） | 源 = PyInstaller dist，不是仓库根；`*` + `recursesubdirs` 只遍历 dist 树 |
-| Windows PyInstaller spec | `launcher.py` 引用链 + 显式 `datas` | `datas` 仅 `frontend/dist`、`model-tools/llama-quantize/...`；`hiddenimports` 仅 llama_cpp/engine/uvicorn/fastapi/transformers 等运行时 |
-| Linux .deb | `src/`（tar）+ `packaging/` 运行时 py + `frontend/dist` + model-tools | `build-deb.sh` 的 `SRC_DIR=src`（不含 scripts/docs/tools/fixtures 等） |
+| Windows PyInstaller spec | `launcher.py` 引用链 + 显式 `datas` | `datas` 仅 `frontend_cybergothic/dist`、`model-tools/llama-quantize/...`；`hiddenimports` 仅 llama_cpp/engine/uvicorn/fastapi/transformers 等运行时 |
+| Linux .deb | `src/`（tar）+ `packaging/` 运行时 py + `frontend_cybergothic/dist` + model-tools | `build-deb.sh` 的 `SRC_DIR=src`（不含 scripts/docs/tools/fixtures 等） |
 | 独立工具 | `QLH-Model-Tools` / `QLH-Data-Retention` / `QLH-Install-Manifest` / `QLH-TUI-Chat` | 面向终端用户/安装运维的产品工具（单独 spec 构建） |
 
 ### 进包白名单（dist\.{app} 实测清单，2026-08-20）
@@ -557,7 +557,7 @@ packaging/linux/
 │   ├── bjtu                      ← BJTU 统一入口（launcher/ui/tui/update/version）
 │   └── __launcher_main__.py      ← 旧主应用启动模块
 ├── src/                          ← Python 源码
-├── frontend/dist/                ← React 构建产物
+├── frontend_cybergothic/dist/    ← CyberGothic 产品前端构建产物
 ├── models/                       ← 模型目录 (postinst 创建, 755)
 ├── logs/                         ← 日志目录 (postinst 创建, 1777 sticky)
 ├── venv/                         ← Python 虚拟环境 (pip 依赖)
