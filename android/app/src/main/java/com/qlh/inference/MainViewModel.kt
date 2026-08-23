@@ -169,49 +169,62 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         // 加载设置
         viewModelScope.launch {
-            val host = settings.getServerHost()
-            val port = settings.getServerPort()
-            val mode = if (BuildConfig.IS_LITE) "thin" else settings.getInferenceMode()
-            val maxTokens = settings.getMaxTokens()
-            val temp = settings.getTemperature()
-            val topP = settings.getTopP()
-            val contextSize = settings.getContextSize()
-            val modelTreeUri = settings.getModelTreeUri()
-            val selectedModelUri = settings.getSelectedModelUri()
-            val storageMode = settings.getModelStorageMode()
-            val themeMode = settings.getThemeMode()
-            val selectedModel = modelManager.getSelectedModel()
-            val sessions = database.sessionDao().getAllSessions().first()
-            val initialSessionId = sessions.firstOrNull()?.id ?: repository.createSession("新对话")
-            val initialSession = database.sessionDao().getById(initialSessionId)
+            try {
+                val host = settings.getServerHost()
+                val port = settings.getServerPort()
+                val mode = if (BuildConfig.IS_LITE) "thin" else settings.getInferenceMode()
+                val maxTokens = settings.getMaxTokens()
+                val temp = settings.getTemperature()
+                val topP = settings.getTopP()
+                val contextSize = settings.getContextSize()
+                val modelTreeUri = settings.getModelTreeUri()
+                val selectedModelUri = settings.getSelectedModelUri()
+                val storageMode = settings.getModelStorageMode()
+                val themeMode = settings.getThemeMode()
+                val selectedModel = modelManager.getSelectedModel()
+                val sessions = database.sessionDao().getAllSessions().first()
+                val initialSessionId = sessions.firstOrNull()?.id ?: repository.createSession("新对话")
+                val initialSession = database.sessionDao().getById(initialSessionId)
 
-            _uiState.value = _uiState.value.copy(
-                currentSessionId = initialSessionId,
-                currentSessionTitle = initialSession?.title ?: "新对话",
-                serverHost = host,
-                serverPort = port,
-                inferenceMode = mode,
-                maxTokens = maxTokens,
-                temperature = temp,
-                topP = topP,
-                contextSize = contextSize,
-                modelTreeUri = modelTreeUri,
-                selectedModelUri = selectedModelUri,
-                modelStorageMode = storageMode,
-                themeMode = themeMode,
-                selectedModelName = selectedModel?.name.orEmpty(),
-                selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L,
-                authSession = authStore.read(),
-                authControl = AuthControlUiState(
-                    localSessionPresent = authStore.read() != null,
-                ),
-            )
-            QlhApplication.instance.inferenceService?.modelContextSize = contextSize
-            ensureAndroidBootstrap()
-            autoRegisterAndroidNode()
-            refreshModels(showMessage = false)
-            refreshRuntimeStatus()
-            refreshManagement()
+                _uiState.value = _uiState.value.copy(
+                    currentSessionId = initialSessionId,
+                    currentSessionTitle = initialSession?.title ?: "新对话",
+                    serverHost = host,
+                    serverPort = port,
+                    inferenceMode = mode,
+                    maxTokens = maxTokens,
+                    temperature = temp,
+                    topP = topP,
+                    contextSize = contextSize,
+                    modelTreeUri = modelTreeUri,
+                    selectedModelUri = selectedModelUri,
+                    modelStorageMode = storageMode,
+                    themeMode = themeMode,
+                    selectedModelName = selectedModel?.name.orEmpty(),
+                    selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L,
+                    authSession = authStore.read(),
+                    authControl = AuthControlUiState(
+                        localSessionPresent = authStore.read() != null,
+                    ),
+                )
+                QlhApplication.instance.inferenceService?.modelContextSize = contextSize
+                ensureAndroidBootstrap()
+                autoRegisterAndroidNode()
+                refreshModels(showMessage = false)
+                refreshRuntimeStatus()
+                refreshManagement()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                QlhLogger.e(
+                    "MainViewModel",
+                    "Android startup initialization failed: ${e.message ?: e.javaClass.simpleName}",
+                    e,
+                )
+                _uiState.value = _uiState.value.copy(
+                    error = "本地启动初始化失败，请进入设置重试：${e.message ?: e.javaClass.simpleName}",
+                )
+            }
         }
 
         // 监听会话列表
@@ -1231,19 +1244,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val networkType = detectNetworkType()
         val deviceInfoJson = Gson().toJson(buildAndroidPresenceDeviceInfo())
-        ContextCompat.startForegroundService(
-            getApplication(),
-            AndroidPresenceService.startIntent(
+        runCatching {
+            ContextCompat.startForegroundService(
                 getApplication(),
-                state.serverHost,
-                state.serverPort,
-                nodeId,
-                hostname,
-                networkType,
-                deviceInfoJson,
+                AndroidPresenceService.startIntent(
+                    getApplication(),
+                    state.serverHost,
+                    state.serverPort,
+                    nodeId,
+                    hostname,
+                    networkType,
+                    deviceInfoJson,
+                )
             )
-        )
-        QlhLogger.i("MainViewModel", "Android presence service started: nodeId=$nodeId host=${state.serverHost}:${state.serverPort}")
+        }.onFailure { error ->
+            // Presence is an optional control-plane lease. A platform FGS policy
+            // failure must not take down the chat UI during cold start.
+            QlhLogger.w(
+                "MainViewModel",
+                "Android presence service unavailable: ${error.message ?: error.javaClass.simpleName}",
+            )
+        }.onSuccess {
+            QlhLogger.i("MainViewModel", "Android presence service started: nodeId=$nodeId host=${state.serverHost}:${state.serverPort}")
+        }
     }
 
     override fun onCleared() {
