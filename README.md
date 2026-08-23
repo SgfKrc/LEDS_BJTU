@@ -941,7 +941,7 @@ python serve.py
 
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
-- [StudyPact 风格分析与 frontend cyber-gothic 前端计划](docs/StudyPact风格分析与frontend_cybergothic前端计划.md) — 新前端视觉方案/原型（`frontend_cybergothic/` 独立实现，未接生产路由）
+- [StudyPact 风格分析与 frontend cyber-gothic 前端计划](local_docs/StudyPact风格分析与frontend_cybergothic前端计划.md) — 新前端视觉方案/原型（`frontend_cybergothic/` 独立实现，未接生产路由）
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
@@ -965,7 +965,7 @@ python serve.py
 
 - [TUI 使用指南](docs/TUI使用指南.md) — TUI 一键启动（自动带后端）、参数表、远程管理、故障排查
 - [已知问题记录](docs/已知问题记录.md) — 缺陷/审计条目与修复状态（含 Full Worker/重启/IPv6 等实证登记）
-- [开发完成度盘点](docs/开发完成度盘点.md) — 各支线开发门完成度与可开发队列快照
+- [待完成工作清单与推进顺序](docs/待完成工作清单与推进顺序-2026-08-23.md) — 当前可开发、条件性架构和外部验收队列
 - [验收清单与资源限制登记](docs/验收清单与资源限制登记.md) — A 硬件限制类（显存/RAM，如 Qwen3-VL-8B 待内存条）/ B 网络限制类（B3 IPv6 实跑已验）验收入口
 - [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5、T9.6 接线、T9.6-R2 Windows 开发机实装门和 UP-N6.4W 跨卷保留门已完成；外部干净机/Linux/真实模型会话、分布式真机与默认入口仍待（L4 Candidate）
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
