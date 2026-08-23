@@ -2,10 +2,12 @@
 
 > 状态：现行（随两端开发持续更新）
 >
-> 更新日期：2026-08-22
+> 更新日期：2026-08-23
 > 适用范围：Android Full/Lite 相对 PC 版（Windows/Linux 主节点）缺失功能的**全面排查清单**，供排期与任务分配使用；能力现状依据 [Android 版本远期计划](Android版本远期计划.md)（2026-07-28 基线 + C5 真机验收）、README 与源码
 
 > 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、远程 SD、主节点 GGUF Range/SHA 下载、bootstrap 和带 lease 的 presence；Android Full Worker 已进入 PC scheduler 准入门，并已用可注入 executor 接入任务图 Stage contract；Full 原生构建已接入 Gemma4 `mtmd` projector/图像路径（fake/journal/JVM/交叉编译开发回归通过）。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。
+>
+> **2026-08-23 界面复核补充**：Android 继续采用原生 Material 3 极简风（深色黑底白字、浅色白底黑字、四个底部导航页），不迁移 PC 赛博哥特 canvas/三栏工作台；这是触控、小屏、耗电与可读性优先的产品决定。PC 的新赛博哥特前端已有 pywebview 独立启动器，`CY-PKG-01` 已将默认后端静态页和标准安装包输入统一为 `frontend_cybergothic/dist`；旧 `frontend/dist` 只保留显式兼容覆盖，真实包首启归 E8。完整证据与页面映射见《桌面赛博哥特与安卓原生界面复核-2026-08-23》。
 >
 > 结论一句话：**安卓版当前 = 聊天客户端（远程转发）+ Full 本地单模型 GGUF 推理，并已具备 Worker/Stage 与 Gemma4 mmproj 的本机开发门；PC 版的多模态真实质量、任务链真机运行、实验判题、模型管理、运维工具仍未形成 Android 产品闭环**
 
@@ -13,18 +15,18 @@
 
 | 类别 | PC 版能力 | 安卓现状 | 差距等级 |
 |---|---|---|---|
-| 多模态（图像理解） | Gemma 4 12B 图生文（原生 MTMD + Ollama 双轨） | ❌ 无图像输入/输出，聊天纯文本 | 🔴 大 |
-| 多模态（图像生成） | SD 1.5 全套（文生图/图生图/IP-Adapter/inpaint/指令编辑） | ❌ 本地无；**走远程推理**——安卓 UI 发起请求，全丢给 PC 主节点 SD 工作区生成后回传 | 🟡 中（远程通道） |
+| 多模态（图像理解） | Gemma 4 12B 图生文（原生 MTMD + Ollama 双轨） | Full 已有相册/远程图片与本地 `mtmd`/mmproj 开发路径；真实设备 RAM、语义、多图与长时未验收，Lite fail-closed | 🔴 大 |
+| 多模态（图像生成） | SD 1.5 全套（文生图/图生图/IP-Adapter/inpaint/指令编辑） | 本地不做；远程 SD 请求、图片/结果和轮询取消已有开发路径，真实 PC SD/设备验收未完成 | 🟡 中（远程子集） |
 | 分布式参与 | 层流水线 Worker、任务链/任务图、TP 孤岛、外部服务、推测解码 | ⚠️ Android Full Worker 准入与 Stage executor 开发门已完成；真实设备/认证/长时仍未验收 | 🔴 大（需设备验收与运行时质量门） |
-| 模型管理 | MODEL-TOOLS 全套（导入向导/GGUF 转换/受管下载/注册表/扫描） | 仅 SAF 本地目录选 GGUF | 🟠 中 |
+| 模型管理 | MODEL-TOOLS 全套（导入向导/GGUF 转换/受管下载/注册表/扫描） | SAF 本地目录 + 主节点 GGUF Range/SHA/续传下载开发路径；无完整模型注册表/来源许可/多工件管理 | 🟠 中 |
 | 模型能力梯度 | Qwen 1.8B / Qwen3-4B / Gemma4 12B / SD 多模型并存 | Full 单次一个 GGUF（llama.cpp CPU） | 🟠 中 |
 | 实验与判题 | EX-N3 判题（LLM/Gemma/SD 自动门）、标定、质量总 gate | ❌ 无实验入口 | 🟠 中 |
-| 用户/凭据管理 | control auth（bootstrap/恢复码/DPAPI token/多用户） | ❌ 无本地凭据管理 | 🟠 中 |
+| 用户/凭据管理 | control auth（bootstrap/恢复码/DPAPI token/多用户） | Keystore 登录/会话开发路径已具备；无 Auth App 引导、恢复码、成员/Tailscale 管理产品页 | 🟠 中 |
 | 抗弱网 | TCP 直连专线/WSS/ICE-TCP（计划）、重试与续传 | 基础 HTTP + IPv6 地址选择 | 🟡 小-中 |
-| 运维工具 | TUI 管理、跨节点日志聚合（qlh log）、健康门 | ❌ 无 | 🟡 小 |
-| 更新与数据 | Launcher A/B 自更新、Ed25519 签名、跨卷数据保留 | ❌ APK 手动安装 | 🟡 小 |
-| Web 管理面 | 模型舰队、SD 图像工作区、任务图、用户管理、设置 API | 仅聊天 + 设置 | 🟡 小 |
-| 前端工程 | 双语 README、E2E 测试套件 | JVM 单测 17 例 + androidTest 2 例 | 🟡 小（测试覆盖） |
+| 运维工具 | TUI 管理、跨节点日志聚合（qlh log）、健康门 | 设置中已有有界脱敏日志、连接诊断与更新开发路径；无 TUI/跨节点运营工作台 | 🟡 中 |
+| 更新与数据 | Launcher A/B 自更新、Ed25519 签名、跨卷数据保留 | APK 更新清单、下载/校验/安装权限开发路径已具备；真实更新源、商店/安装和长时日志未验收 | 🟡 中 |
+| Web 管理面 | 模型舰队、SD 图像工作区、任务图、用户管理、设置 API | 四个原生页（对话/图像/会话/设置）；无桌面运营控制面 | 🟡 中 |
+| 前端工程 | 双语 README、E2E 测试套件 | Full/Lite JVM、AndroidTest 与原生交叉编译开发门；设备视觉/可用性验收后置 | 🟡 小（验收覆盖） |
 
 ## 2. 逐项差距明细
 
@@ -38,7 +40,7 @@
 **A2 图像生成（SD 1.5）——走远程推理**
 - PC：完整图像工作区（五资产 15GB，全部自动质量门通过）。
 - 安卓：**本地不做**——图像生成全丢给 PC 主节点：安卓 UI 发起生成请求（提示词/参考图上传）→ 主节点 SD 工作区执行（质量门照常）→ 结果图回传显示。
-- 差距点：① 安卓端生成请求 API + 图片上传/回传 UI；② 任务状态轮询/推送（可复用 PC 任务链语义的简化版）；③ 不要求安卓本地 SD 任何能力（省资源）。
+- 差距点：① 已有远程生成/图片上传/结果回传与轮询取消开发路径，仍需真实 PC SD、设备网络和长任务验收；② 缺桌面资产目录、许可证/导入、Inpaint/指令编辑、四宫格工作流与分布式遥测操作面；③ 不要求安卓本地 SD 任何能力（省资源）。
 
 ### 🔴 B. 分布式参与（需协议，路线 A/B 未实施）
 
@@ -51,8 +53,8 @@
 ### 🟠 C. 模型管理与能力梯度
 
 - PC：MODEL-TOOLS P0-P8（导入向导支持 HF/ModelScope 真实下载、GGUF 转换器、资产扫描、注册表、原子发布）。
-- 安卓：仅 SAF 选目录（人工放文件）；无受管下载（远期计划有"PC 分发/应用内下载"规划未实施）。
-- 差距点：① 应用内从主节点/局域网下载 GGUF；② 模型版本/SHA 校验显示；③ 多模型切换（当前单模型加载）。
+- 安卓：SAF 选目录与主节点 GGUF Range/SHA/续传下载均有开发路径；仍以单模型本地运行和有限 Settings 入口为主。
+- 差距点：① 完整模型注册表、来源/许可证、资产状态与多工件展示；② 多模型切换（当前单模型加载）；③ 真实大文件、断网和 SAF 提供器验收。
 
 ### 🟠 D. 实验与判题
 
@@ -63,16 +65,18 @@
 ### 🟠 E. 用户/凭据管理
 
 - PC：control 面 bootstrap 注册、TOTP、恢复码、锁定期、DPAPI token 保护、多用户角色（owner/admin/member）。
-- 安卓：无登录/凭据（直接连主节点 IP）。
-- 差距点：① 连接主节点的凭据存储（Android Keystore）；② 多用户登录（若主节点启用 auth-required）；③ token 生命周期管理。
+- 安卓：Keystore 登录/会话、轮换和登出清理已有客户端开发门；未形成账户页和 Auth App 产品引导。
+- 差距点：① Auth App QR/字符串配置与恢复码展示；② 多用户成员和 Tailscale 绑定管理；③ 真实 auth-required、真机密钥库与 token 生命周期验收。
 
 ### 🟡 F. 运维与可靠性
 
 - PC：TUI 管理（27 命令）、跨节点日志聚合（P7）、启动预检、Launcher 更新（A/B/签名）、数据保留工具。
-- 安卓：无对应项；更新靠手动 APK。
-- 差距点：① 应用内更新（校验签名后安装）；② 日志上报；③ 连接健康诊断（当前仅"测试连接"）。
+- 安卓：Settings 已接更新清单、下载/签名校验/安装权限、有界脱敏日志和主节点/认证连接诊断开发路径；无 PC TUI 或跨节点运营台。
+- 差距点：① 真实 APK/商店、外部更新源、真机网络切换和长时日志验收；② 只读移动端集群摘要是否有真实使用价值；③ 不把 PC 运维台机械复制到手机。
 
-## 3. 建议排期优先级（供任务分配）
+## 3. 历史开发排期（2026-08-17，保留票据沿革）
+
+下表中的 AND-A1、AND-A2、AND-B、AND-C、AND-E、AND-F 与 `AND-API-01..05` 已完成本机开发门，不能再被当作未开发票；当前仅保留对应真机、主节点、真实模型与发布链路验收。最新页面取舍和桌面交付票以《桌面赛博哥特与安卓原生界面复核-2026-08-23》及《待完成工作清单与推进顺序-2026-08-23》为准。
 
 | 优先级 | 项 | 理由 | 阻塞 |
 |---|---|---|---|
@@ -108,6 +112,20 @@
 
 本阶段不排本地 SD、生成本地判题和分布式真机性能标定；这些属于后续验收项，不作为 Android 开发阻塞条件。
 
+## 3.2 Android 移动控制面排期（2026-08-23）
+
+此次将“缺完整集群、模型舰队、审计与账户控制面”拆为渐进式移动端能力，而非复刻 PC 管理台：
+
+| 票号 | 优先级 | 目标 | 权限边界 | 状态 |
+|---|---:|---|---|---|
+| `AND-CTRL-01` | P0 | 在设置页增加只读集群概览，显示运行模式、就绪状态、当前任务与最多 8 个节点。 | 只能刷新；不提供节点删除/注销、容量/层配置、切主、队列或任务操作。 | **本机开发完成**：修正 `/api/cluster/status` 节点映射 DTO；Full JVM `128 passed`，`compileFullDebugAndroidTestKotlin` 通过；真机/主节点验收后置。 |
+| `AND-CTRL-02` | P1 | 模型舰队只读统一视图：已选本地模型、主节点当前模型、注册表、资产状态和已验签 GGUF 清单，最多展开 8 项。既有下载进度保留在原 SAF 下载面板。 | 禁止远程删除、注册、代理/源调整与强制切换；保留用户主动下载的 SHA/SAF 边界。 | **本机开发完成**：Full JVM `132 passed`，`compileFullDebugAndroidTestKotlin` 通过；真机/主节点/大工件/SAF 验收后置。 |
+| `AND-CTRL-03` | P1 | 有界审计/活动只读列表，投影工作流阶段、attempt 状态和 review 摘要。 | 禁止投票、重派、删除、过期或提交结果；不下发提示词、原始错误、路径、投票评论或投票人身份。 | **本机开发完成**：主节点 `summary=1` 安全投影与 `limit`、Android Settings 审计折叠组；Full JVM `135 passed`，后端任务图定向 `1 passed`，`compileFullDebugAndroidTestKotlin` 通过；真机/真实授权验收后置。 |
+| `AND-CTRL-04` | P1 | 账户/Auth App 会话：能力、用户角色/到期、登录/TOTP/恢复码、Keystore 会话校验和登出。 | 不展示或持久化种子、恢复码明文、bearer、管理员密钥或 cluster secret。 | **本机开发完成**：Android Settings 新增账户/Auth App 折叠组，统一解析 gateway `required/enforced` 与单体 `available/reason_code` capability；接入 Keystore 登录/会话校验/登出，能力不可用、会话 401 和退出失败均 fail-closed；登录错误不回显响应体。Full JVM `138 passed`，AndroidTest Kotlin 编译通过；真实 Auth App、control/gateway 和真机验收后置。 |
+| `AND-CTRL-05` | P2 | Owner/admin 的成员、Tailscale 绑定与入群审批受限入口。 | 高风险/批量/破坏性管理保持 PC 优先；Android 仅在明确授权、二次确认和审计均具备时开放，`review_admin` 未迁移时只读。 | **本机开发完成**：管理摘要、成员/绑定/审计投影和撤销确认 UI 已接入；真实权限/审计/真机联调后置。 |
+
+`AND-CTRL-01/02/03/04/05` 与 `CY-PKG-01` 已完成本机开发门；下一步转入真实桌面包/E8 和 Android 管理面真机联调。`review_admin` 审批仍保持后端未迁移的只读边界。
+
 `AND-B-01` 只冻结并实现跨语言的 `qlh.task_worker` v2 envelope、Android Full Worker 能力声明、严格 UTF-8/canonical JSON、租约/摘要校验和 1024 条 `message_id` replay cache。Android 的 `worker_kind=android_full_worker` 已被 PC v2 schema 接受；后续 `AND-API-02` 已开放注册节点类型/worker kind 对齐的 scheduler 准入，`AND-API-03` 又接入了统一 Stage executor。真实认证、设备资源门、Android offer→result 和长时验收仍后置。
 
 `AND-B-02` 已新增独立 `TaskWorkerService` 前台生命周期壳、可注入的 length-prefixed transport、连接/hello/有界指数退避状态机，以及 offer/lease/result/error/cancel 的 attempt identity fencing。断线会将活动 attempt 标记为 `LOST`，迟到结果被丢弃；Android 主动取消使用 `stage_error`，只有协调器发起的 `stage_cancel` 才回 `stage_cancelled`。本票尚未开放 PC scheduler 准入、认证协议和真实设备验收，ServerSocket/Mock Worker 跨平台契约归 `AND-B-03`。
@@ -132,6 +150,10 @@
 
 | 日期 | 内容 |
 |---|---|
+| 2026-08-23 | `AND-CTRL-02` 完成：Settings 新增只读“模型舰队”，聚合主节点当前模型、注册表、已发现本地资产和已验签 GGUF 清单，并显示 Android 已选模型；只显示运行中/可用/待验证/缺失及最多 8 项，不保留服务器路径、下载 URL、代理或注册表写入入口。现有 SAF 下载进度不变。Full JVM `132 passed`、AndroidTest Kotlin 编译通过，真实主节点、大工件和 SAF 验收后置。 |
+| 2026-08-23 | `AND-CTRL-03` 完成：主节点工作流与复核票新增有界 `summary=1` 安全投影，Android Settings 新增只读“审计与活动”折叠组，最多 8 个工作流/复核票、每阶段 8 个阶段/4 个 attempt；不下发提示词、原始错误、路径、lease、输出元数据、投票评论或写操作。Full JVM `135 passed`、后端任务图定向 `1 passed`、AndroidTest Kotlin 编译通过，真实主节点与授权验收后置。 |
+| 2026-08-23 | `AND-CTRL-04` 完成：Android Settings 新增账户/Auth App 会话折叠组，统一 gateway/单体 capability，显示脱敏账号、角色和到期时间；登录支持 Auth App 验证码/恢复码二选一，复用 Keystore 会话，退出始终清本地凭据；不展示 token、seed、恢复码明文或管理员密钥，认证错误不回显响应体。Full JVM `138 passed`、AndroidTest Kotlin 编译通过；真实 Auth App/control/gateway/真机验收后置。 |
+| 2026-08-23 | 新增移动控制面分期。`AND-CTRL-01` 将 Settings 的旧 `/api/cluster/status` DTO 从过期的数组/计数假设改为服务端实际节点映射，并新增只读、最多 8 节点的集群概览；不接任何调度或节点管理写操作。Full JVM `128 passed`、AndroidTest Kotlin 编译通过，真实主节点和真机验收后置。 |
 | 2026-08-18 | AND-E-01 客户端开发门完成：Android Keystore-backed session store 已接入 ApiClient，登录/会话校验/登出、Bearer 注入、401 清理和 Authorization 日志脱敏均已实现；JVM contract tests 覆盖登录、授权头、失效会话和离线登出。AND-F-01 核对确认已由 f05bcf3 交付。真实 auth API、安装更新与设备验收后置。 |
 | 2026-08-17 | AND-C-01 已完成：Android Full 设置页新增主节点 GGUF 目录、进度与校验状态，下载落入用户授权 SAF 目录并支持严格 Range 续传、大小/SHA-256 校验和 `.part` 提升；PC 清单移除绝对目录泄露并增加 Range 契约测试；Full/Lite JVM、AndroidTest Kotlin 编译和 PC 安全边界测试通过，真实大文件/断网/SAF 提供器验收后置 |
 | 2026-08-17 | AND-A2-02 已完成：新增 Android 图像导航页、提示词/反向提示词/步数表单、参考图选择与预览、远程生成/变体提交、任务取消、结果 blob 32 MiB 有界下载和 1024px 缩略图展示；补齐状态机、ApiClient 下载和 Compose 契约测试，Full/Lite JVM 与 Full AndroidTest Kotlin 编译通过，真实 PC SD/网络/设备验收后置 |

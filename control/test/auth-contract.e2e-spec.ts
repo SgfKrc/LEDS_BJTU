@@ -259,10 +259,22 @@ describe('MF-AUTH-N1 local Auth App and user management contract', () => {
       payload: { username: 'member-session', code },
     });
     expect(memberLogin.statusCode).toBe(200);
+    // AND-CTRL-05 前置④：跨用户撤销是管理写操作，必须先取一次性确认令牌。
+    const confirmation = await app.inject({
+      method: 'POST',
+      url: '/auth/manage/confirm',
+      headers: { authorization: `Bearer ${result.token}` },
+      payload: { action: 'user_manage', target_id: user.user_id },
+    });
+    expect(confirmation.statusCode).toBe(200);
+    const confirmToken = confirmation.json().confirm_token as string;
     const revoked = await app.inject({
       method: 'DELETE',
       url: `/users/${user.user_id}`,
-      headers: { authorization: `Bearer ${result.token}` },
+      headers: {
+        authorization: `Bearer ${result.token}`,
+        'x-qlh-confirm-token': confirmToken,
+      },
       payload: { expected_version: user.aggregate_version },
     });
     expect(revoked.statusCode).toBe(200);

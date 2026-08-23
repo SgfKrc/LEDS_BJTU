@@ -48,6 +48,18 @@ describe('MF-AUTH-N1A gateway authorization policy', () => {
     expect(accessLevelFor('PATCH', '/api/cluster/settings')).toBe('manager');
   });
 
+  it('classifies AND-CTRL-05 management surface as manager-only', () => {
+    // 管理摘要/审计/确认签发只对 owner/admin 开放
+    expect(accessLevelFor('GET', '/api/auth/manage/summary')).toBe('manager');
+    expect(accessLevelFor('GET', '/api/auth/manage/audit')).toBe('manager');
+    expect(accessLevelFor('POST', '/api/auth/manage/confirm')).toBe('manager');
+    // 成员自操作的 Tailnet prepare/confirm 仍为 authenticated；跨用户 revoke 提级 manager
+    expect(accessLevelFor('POST', '/api/auth/tailscale/bindings')).toBe('authenticated');
+    expect(accessLevelFor('POST', '/api/auth/tailscale/bindings/b-1/confirm')).toBe('authenticated');
+    expect(accessLevelFor('POST', '/api/auth/tailscale/bindings/b-1/revoke')).toBe('manager');
+    expect(accessLevelFor('DELETE', '/api/auth/users/u-1')).toBe('manager');
+  });
+
   it('supports explicit rollout switches while defaulting off only in tests', () => {
     expect(authPolicyEnabled({ NODE_ENV: 'production' })).toBe(true);
     expect(authPolicyEnabled({ NODE_ENV: 'test' })).toBe(false);

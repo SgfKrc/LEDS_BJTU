@@ -4,7 +4,7 @@
 产物只含：
   - QLH-Edge-Inference.exe：轻量引导器（qlh_launcher.py，不 import 推理运行时）
   - _internal/src/            ：主程序源码（运行时由外部 venv python 以源码方式运行）
-  - _internal/frontend/dist/  ：React 前端静态文件
+  - _internal/frontend_cybergothic/dist/  ：CyberGothic 产品前端静态文件
   - _internal/packaging/      ：外部运行时依赖清单（cpu/cuda）
   - _internal/pubkeys         ：验签公钥
 PyTorch / Transformers / llama.cpp / FastAPI / uvicorn 等全部从包体**排除**，
@@ -18,7 +18,7 @@ import os
 
 _ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 _SRC_DIR = os.path.join(_ROOT, "src")
-_FRONTEND_DIST = os.path.join(_ROOT, "frontend", "dist")
+_FRONTEND_DIST = os.path.join(_ROOT, "frontend_cybergothic", "dist")
 _PUBKEYS = os.path.join(SPECPATH, "pubkeys")
 _ICO = os.path.join(SPECPATH, "leds.ico")
 
@@ -29,7 +29,7 @@ _RUNTIME_REQS = [
 
 if not os.path.isdir(_FRONTEND_DIST):
     raise SystemExit(
-        "[qlh-slim.spec] frontend/dist 不存在；请先构建前端（cd frontend && npm run build）"
+        "[qlh-slim.spec] frontend_cybergothic/dist 不存在；请先构建前端（cd frontend_cybergothic && npm run build）"
     )
 
 a = Analysis(
@@ -39,7 +39,7 @@ a = Analysis(
         (_ICO, "."),
         (_PUBKEYS, "pubkeys"),
         (_SRC_DIR, "src"),
-        (_FRONTEND_DIST, "frontend/dist"),
+        (_FRONTEND_DIST, "frontend_cybergothic/dist"),
     ] + _RUNTIME_REQS,
     hiddenimports=[
         "tkinter",

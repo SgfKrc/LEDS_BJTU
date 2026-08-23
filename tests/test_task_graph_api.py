@@ -1482,6 +1482,16 @@ def test_workflow_query_list_and_cancel_api(task_graph_api):
     }
     assert listed["workflows"][0]["journal"]["backend"] == "memory"
 
+    summary = asyncio.run(api_server.list_workflows(limit=50, summary=True))
+    assert summary["enabled"] is True
+    assert summary["workflows"][0]["workflow_id"] == "wf_query123"
+    assert summary["workflows"][0]["stages"]
+    assert "session_id" not in summary["workflows"][0]
+    assert "error" not in summary["workflows"][0]
+    assert "model_identity" not in summary["workflows"][0]
+    assert "input_bindings" not in summary["workflows"][0]["stages"][0]
+    assert "result_metadata" not in summary["workflows"][0]["stages"][0]["attempts"][0]
+
     fetched = asyncio.run(api_server.get_workflow("wf_query123"))
     assert fetched["state"] == "completed"
     assert fetched["observability"]["winner_count"] == 3

@@ -13,7 +13,7 @@
 #   1. CPU-only PyTorch: pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
 #   2. llama-cpp-python: pip install llama-cpp-python
 #   3. 其余依赖: pip install -r packaging/requirements-cpu.txt
-#   4. 前端构建: cd frontend && npm run build
+#   4. 前端构建: cd frontend_cybergothic && npm run build
 # ============================================================
 
 import os
@@ -27,8 +27,8 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 # src 目录（Python 模块搜索路径）
 _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 
-# 前端 dist 目录
-_FRONTEND_DIST = os.path.join(_PROJECT_ROOT, "frontend", "dist")
+# 唯一产品前端 dist 目录
+_FRONTEND_DIST = os.path.join(_PROJECT_ROOT, "frontend_cybergothic", "dist")
 
 sys.path.insert(0, _PROJECT_ROOT)
 from scripts.model_tools.llama_quantize_toolchain import verify_managed_package
@@ -47,8 +47,8 @@ if not _llama_quantize_verification["valid"]:
 
 if not os.path.isdir(_FRONTEND_DIST):
     raise FileNotFoundError(
-        f"前端 dist 目录未找到: {_FRONTEND_DIST}\n"
-        "请先构建前端: cd frontend && npm run build"
+        f"赛博哥特前端 dist 目录未找到: {_FRONTEND_DIST}\n"
+        "请先构建前端: cd frontend_cybergothic && npm run build"
     )
 
 # ============================================================
@@ -74,8 +74,8 @@ a = Analysis(
     pathex=[_SRC_DIR, SPECPATH],
     binaries=_llama_cpp_dlls,
     datas=[
-        # React 前端静态文件 → 运行时目录 frontend/dist/
-        (_FRONTEND_DIST, 'frontend/dist'),
+        # CyberGothic 产品前端静态文件 → 运行时目录 frontend_cybergothic/dist/
+        (_FRONTEND_DIST, 'frontend_cybergothic/dist'),
         (_LLAMA_QUANTIZE_PACKAGE, 'model-tools/llama-quantize/windows-x86_64'),
     ],
     hiddenimports=[

@@ -6,7 +6,7 @@
 
 Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Multi-terminal collaborative inference · Visual monitoring · External-compute assistance
 
-**v0.1.8.3** (updated 2026-08-21)
+**v0.1.8.3** (updated 2026-08-23)
 
 > 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** (Chinese).
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
@@ -16,7 +16,7 @@ Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orche
 
 ## 📋 Project Introduction
 
-QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The PC PyTorch pipeline can split compatible models across nodes by Transformer layers; the PC/Android llama.cpp path runs full local GGUF inference. The system keeps INT4/INT8 quantization, operator fusion, paged KV cache, graph orchestration and graceful degradation, and plans full inference workers, task chains, standalone tensor parallelism and GGUF stages.
+QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The PC PyTorch pipeline can split compatible models across nodes by Transformer layers; the PC/Android llama.cpp path runs full local GGUF inference. INT4/INT8 quantization, operator fusion, paged KV cache, graph orchestration and graceful degradation remain available. Local development gates are complete for PC Full Worker/task graphs, Android Full Worker/Stage and GGUF stages; short dual-machine evidence covers the PyTorch layer pipeline and task graph. `task_dispatch`, real CUDA parity, long disconnect recovery and production routing remain deferred acceptance gates; tensor parallelism remains an out-of-cluster PoC only.
 
 Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient for scheduling — eligibility depends on engine, model format, model fingerprint, available memory, accelerator and network topology.
 
@@ -26,8 +26,8 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 |------|----------|----------------|-------------------|----------------------------|
 | 1 | **PC iGPU** | Windows / Linux PCs without NVIDIA dGPU | llama.cpp + GGUF CPU/iGPU inference, cluster join, remote request forwarding | PyTorch layer pipeline, heavy-model experiments, CUDA-only features |
 | 2 | **PC dGPU** | Windows / Linux NVIDIA GPU master/experiment PCs | PyTorch + CUDA + bitsandbytes with CPU fallback, **SD 1.5 image sidecar** (txt2img/img2img/reference/inpaint/instruction), future multi-model & heavy-model experiments | Android minimal strategy |
-| 3 | **Android standard** | Android phones/tablets | Full-on mode local GGUF inference, thin mode forwarding to PC, SAF model directory, full settings | Transformer layer splitting, heavy-model experiments |
-| 4 | **Android lite** | Lightweight phone entry | Minimal chat, smallest APK/cache/model footprint, single recommended small/INT4 model | Full model directory |
+| 3 | **Android standard** | Android phones/tablets | Full-on local GGUF, thin forwarding to PC, SAF model directory, update/log/connection diagnostics; Full Worker/Stage and Gemma4 MTMD have local development wiring | Transformer layer splitting and heavy-model experiments; real-device Worker, multimodal quality and background survival remain to be accepted |
+| 4 | **Android lite** | Lightweight phone entry | Minimal chat, remote PC forwarding, smallest APK/cache/model footprint, single recommended small/INT4 route | Local GGUF, full model directory, Worker execution and advanced control surfaces |
 
 ### Core Features
 
@@ -38,25 +38,43 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🔄 **Dual engine** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/iGPU), automatic switching |
 | 📋 **MLFQ queue** | Three-level feedback queue: short-interaction priority + aging anti-starvation + FIFO compatibility → [scheduling doc](分布式资源调度系统.md) |
 | 🗄️ **Local facts source** | Sessions/settings/model registry on the master-node SQLite (remote PostgreSQL retired); offline-safe |
-| 🌐 **Tailscale networking** | Cross-subnet device interconnect, guided first-join |
-| 📦 **Installers** | PC iGPU (~180 MB) / PC dGPU (~1.7 GB) / Linux .deb (~200 MB) / Android APK |
+| 🧩 **Model-asset governance** | Registry, manifest/SHA verification, source/license handling, Sidecar contracts, deployment simulation and HF direct → user proxy → ModelScope fallback are wired into the local product surface; real large artifacts, CUDA and cross-PC delivery remain to be accepted |
+| 🖼️ **Multi-model & multimodal Sidecars** | Qwen3 PyTorch isolated runtime plus Gemma4 native GGUF/mmproj MTMD and PyTorch Sidecar paths have completed development gates. Artifact availability, memory/VRAM budgets and precise identity contracts still fail closed; heavy models are never auto-admitted on an 8 GB machine |
+| 🌐 **Tailscale & dual stack** | IPv4/IPv6 endpoints, manual cluster join and reconnect fall back as “user preference → bootstrap → Tailnet”; explicit successful connects persist the preference. A short dual-machine IPv6 task is verified; IPv4-only/IPv6-only installers and real WSS/443 remain environment acceptance work |
+| 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; real control/gateway, OS credential and first-install integration remain deferred |
+| 📦 **Install, update & offline bundle** | Independent Launcher signing/update/rollback, download progress and diagnostics are implemented. The offline bundle provides capacity preflight, SHA/manifest, atomic ZIP, 7z/split output and restore validation; real full bundles, empty-root/Android SAF import and cross-platform install acceptance are deferred |
 | 🎛️ **Admin panel** | Node register/deregister, layer overrides, role transfer, spare master, TCP status |
 | 🖥️ **TUI** | Terminal admin menu, zero-dependency stdlib; `bjtu chat` built-in Textual chat page |
 | 🎨 **SD 1.5 image gen** *(dGPU)* | Local workspace: txt2img, img2img, IP-Adapter, inpaint, InstructPix2Pix; offline asset packages ready (5 assets, 15 GB, offline-reproducible) |
-| 📱 **Android client** | Standard: full-on (local GGUF) / thin (forward to PC cluster); Material 3 UI |
+| 📱 **Android client** | Standard supports local GGUF/remote PC, SAF, presence lease, Full Worker/Stage, Gemma4 mmproj/JNI image path, update/redacted logs/connection diagnostics; Lite is the remote lightweight entry. These are local/JVM/cross-build gates, with device and production acceptance deferred |
 | 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
 | 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |
 | ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, recoverable task state/journal, lease-epoch winner fencing, provider registry; PC Full Worker & task graph verified for restart & disconnect recovery and IPv6 TCP (2026-08-21); `task_dispatch` production gate stays closed → [task chain plan](任务链下一阶段实施计划.md) |
-| 🗂️ **Local RAG** | Master-node SQLite FTS5 + vector embedding (Ollama / llama.cpp dual providers), quality gate & capacity/ANN decision gate (RAG-S0…S5D); no external model by default, no auto-download → [cluster-join & local RAG plan](集群接入稳定性与本地RAG实施计划.md) |
+| 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → [cluster-join & local RAG plan](集群接入稳定性与本地RAG实施计划.md) |
 | 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → [cluster-join plan](集群接入稳定性与本地RAG实施计划.md) |
 | 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](抗弱网通信协议专项计划.md) |
+| 🧪 **Experiment quality & document governance** | EX-N3 read-only production gate verifies plan, samples, calibration, performance, quality and human review; historical records pass 3/3. The document-maintenance Agent has local retrieval/semantic quality gates and only produces suggestions, never automatic rewrites |
 
 ### Project Design Philosophy
 
-- **No third-party service dependency**: apart from GitHub official (source hosting and releases), QLH depends on no third-party service — update sources can be self-hosted signed stations; mirrors (e.g. Gitee) are bandwidth/availability fallbacks only; credentials and authorization data live only on the user's master node.
-- **All assets belong to the user**: model artifacts, tensor-parallel external assets (vLLM/SGLang/llama.cpp rpc, etc.), API keys and credentials are **not provided by the development team** — you bring your own; the project only provides import, verification, registration and usage channels.
+- **Asset sovereignty and local autonomy**: model artifacts, external-compute assets, API keys, sessions, task journals, knowledge bases, authentication material, backups and migration capability belong to the user. The development team supplies code plus import/verification/registration/migration tools, never custody, escrow or reset authority; except for source hosting and releases, no development-team service is a runtime prerequisite. Primary-node `local_only` SQLite, user filesystems, encrypted backups and `.qlhmigrate` implement this boundary.
+- **Engineering discipline, automation and controlled Agent collaboration**: testing, acceptance and maintenance tools, together with their test and quality-gate code, are first-class engineering work built alongside product code. Automation both proves quality and removes repetitive work: one-command isolated environment setup, test channels, automatic simulation/experiments, contract/API scans, fault injection, quality gates, offline asset bundle build/verification/restore, launcher-manifest generation, environment diagnostics and controlled deployment sync turn mechanical work into reproducible flows. Agents only summarize evidence, generate suggestions and run quality checks within explicit data, retrieval and permission scopes; they cannot bypass script gates, human review or authorization to rewrite facts, publish assets or make admission decisions.
+- **Test quality constrains automation quality**: tests are split by risk, dependency and realism into unit, contract, browser/API, race/fault-injection, simulation and physical/dual-machine acceptance, rather than optimized for one aggregate green run. Classifications, channels, fixtures and negative cases are repeatedly audited and revised after environment, race or interface blind spots, reducing the pesticide effect of a static test set repeatedly passing while new defects escape.
 - **Data stays in-cluster**: external inference/image assistance defaults to `deny` scope; offline asset packages and signed manifests keep distribution auditable and rebuildable.
+
+### Architecture Evolution: From Feature Delivery to User Sovereignty
+
+The original proposal focused on quantization, cache optimization and multi-node pipelines. It did not yet make ownership of data or offline recovery an explicit product constraint. Early engineering retained a PostgreSQL compatibility path. Once offline primary-node operation, cross-device migration and bring-your-own assets became non-negotiable, QLH converged on the local-first boundary below. This is a clarification of the system contract, not a substitution of one remote dependency for another.
+
+| Concern | Earlier engineering path | Current boundary |
+|---------|--------------------------|------------------|
+| State and identity | A PostgreSQL compatibility path existed; the master-node source-of-truth boundary was incomplete | `local_only` by default. Sessions, settings, model registration, task journals, audit records and local users live on the master-node SQLite database; WAL/FULL and idempotent recovery preserve offline operation |
+| Models and file assets | The focus was loading and distribution | Weights remain in user-controlled local filesystems; SQLite keeps only verified references, manifests and digests. Import, offline bundles, download and deployment are bounded by SHA/manifest checks, capacity preflight and atomic publish |
+| Knowledge and credentials | No unified data-sovereignty policy | RAG uses an independent user-owned master-node SQLite store (FTS5 plus bounded vectors); embeddings can come from local Ollama or native llama.cpp. Authentication keys use the OS credential store and recovery codes are hashed; the development team keeps no user copy or reset authority |
+| Migration and recovery | A remote service could become a runtime prerequisite | Encrypted backup, `.qlhmigrate` streaming migration and local restore are the primary path. PostgreSQL remains only as a user-initiated, one-time compatibility export/audit window; remote unavailability must not stop core functions |
+
+> These two principles constrain future work: a new model, RAG source, Auth App flow, cluster-join path or external provider must define asset ownership, data scope, offline recovery and revocation semantics, plus reproducible automated checks, failure boundaries and a human acceptance path. Convenience must not reintroduce development-team custody, and an Agent or a single green run must not substitute for factual evidence.
 
 **Use cases**: smart terminals · IoT · edge computing · education & research
 
@@ -88,7 +106,7 @@ Open the Tailscale admin console at https://login.tailscale.com/admin/machines a
 - Tailscale builds a virtual LAN on top of WireGuard, giving each device a fixed `100.x.x.x` address
 - The Windows packaged launcher automatically checks whether Tailscale is installed and logged in
 
-> The campus network is currently observed to block UDP in real-world tests, so Tailscale cannot establish direct connections or relay via the self-hosted DERP over HTTPS/TCP 443. The self-hosted DERP has resolved basic reachability, but path observation, backup relays, the WSS data plane connecting directly to the primary node, and chunked resumption are still being planned/implemented; see the [Anti-Weak-Network Communication Protocol Plan](抗弱网通信协议专项计划.md) for diagnostic boundaries and the phased plan.
+> The campus network is observed to block UDP, so Tailscale can fall back to relay paths. `NET-DUALSTACK-PREF-01` has completed its local gate: a successful explicit connect persists the selected IPv4/IPv6 endpoint, while startup and reconnect use “preference → original bootstrap → Tailnet” fallback; a short dual-machine IPv6 task is verified. Self-hosted DERP, path observation, backup relays, a WSS data plane direct to the primary node and chunked resume still require real 443/certificate/network acceptance; see the [Anti-Weak-Network Communication Protocol Plan](抗弱网通信协议专项计划.md).
 
 ---
 
@@ -161,6 +179,7 @@ Project root
 ├── packaging/                     # Packaging config + distribution server (no build artifacts)
 │   ├── launcher.py                # Main-app launch payload (Tailscale → model check → engine selection → start)
 │   ├── qlh_launcher.py            # ★ Standalone Bootstrap (GUI/TUI/update, no inference deps)
+│   ├── launcher_cybergothic.py    # CyberGothic desktop shell: static UI + /api reverse proxy
 │   ├── updater.py                 # Update CLI
 │   ├── update_core.py             # Manifest, version, download & SHA-256 core
 │   ├── qlh-launcher.spec          # Standalone Launcher PyInstaller spec
@@ -181,17 +200,21 @@ Project root
 │   │   └── qlh-edge-inference.desktop  # desktop entry
 │   ├── dist/                      # ★ Final installer output (git-ignored)
 │   └── README.md                  # Packaging docs
-├── frontend/                      # React frontend (Vite + FastAPI backend proxy)
+├── frontend/                      # Frozen historical React frontend; comparison and legacy-package resources only
 │   └── src/
-│       ├── App.jsx                # Main layout & settings state
-│       ├── api/client.js          # API client wrapper
-│       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal etc.
-├── tests/                         # Unit tests (2026-08-16 full-run baseline: 2524 passed / 18 skipped, .venv-test, 4 workers; latest in Progress & Next Steps)
+│       └── ...                    # No new product work is accepted here
+├── frontend_cybergothic/          # ★ Sole product frontend (React + TypeScript + Vite)
+│   ├── src/                       # Chat / Models / RAG / Tasks / Image Studio / Account product pages
+│   └── scripts/                   # Contrast and browser-regression tools
+├── tests/                         # Unit/contract/regression tests (full-run baselines are historical; plans hold current evidence)
 ├── scripts/                       # Utility scripts
 │   ├── quantize_model.py          # Model preparation & quantization verification
 │   ├── benchmark_all.py           # Full quantization-tier benchmark
 │   ├── benchmark_compile.py       # torch.compile fusion test
-│   └── convert_to_gguf.py         # Safetensors → GGUF conversion
+│   ├── convert_to_gguf.py         # Safetensors → GGUF conversion
+│   ├── build_offline_bundle.py    # Offline-bundle preflight, manifest and atomic publish
+│   ├── experiment_quality_production_gate.py # EX-N3 read-only quality audit
+│   └── docagent_*_gate.py         # Document retrieval/semantic quality gates
 ├── models/                        # Model files (download yourself)
 │   ├── qwen-1_8b-chat/            # PC: Safetensors format
 │   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF format (llama.cpp engine)
@@ -318,8 +341,8 @@ User input → Master → TCP → Worker 1 (Client) → TCP → Worker 2 (Client
 # Python dependencies (primary node is self-contained on SQLite; no PostgreSQL needed)
 pip install -r requirements.txt
 
-# Frontend dependencies
-cd frontend && npm install && cd ..
+# Product frontend dependencies (legacy frontend/ is frozen)
+cd frontend_cybergothic && npm ci && cd ..
 ```
 
 ### 🚀 One-Click Setup for All Development Environments (recommended after cloning)
@@ -397,8 +420,8 @@ git submodule update --init --recursive
 # 2. Install Python dependencies (main environment; online)
 pip install -r requirements.txt
 
-# 3. Frontend dependencies (optional, only when developing the frontend)
-cd frontend && npm install && cd ..
+# 3. Product frontend dependencies (optional; legacy frontend/ is frozen)
+cd frontend_cybergothic && npm ci && cd ..
 
 # 4. Environment files (not committed; create per node)
 #    The main .env needs at least QLH_CLUSTER_SECRET (distributed secret);
@@ -430,6 +453,7 @@ At runtime use `execution_device=cpu` (or `auto`, which falls back to CPU when C
 | **Qwen-1.8B-Chat (GGUF Q4_K_M)** | ~1.16 GB | CPU/iGPU standalone, Android local inference | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ Required (CPU path) |
 | **Qwen3-4B (GGUF Q4_K_M)** | ~2.5 GB | EX-N3 judging model (v2 accuracy criteria), experiments | managed download (MODEL-TOOLS) / HF `Qwen/Qwen3-4B-GGUF` | experiments |
 | **Gemma 4 12B native binding** (GGUF + mmproj) | ~7.3 GB | image understanding (image-to-text) native path | managed artifact manifest `models/gemma4-native/gemma4-native.lock.json` + download script | multimodal experiments |
+| **nomic-embed-text:latest** (Ollama) | on demand | master-node local RAG embedding provider | `ollama pull nomic-embed-text:latest` | local RAG quality/capacity gates |
 | **SD 1.5 five-asset offline package** | ~15 GB (5 packages) | image generation workspace (vanilla/90s/IP-Adapter/inpaint/InstructPix2Pix) | official offline assets (see [SD 1.5 offline asset plan](SD%201.5离线资产包与签名源站发布计划.md)) or `python scripts/download_sd15.py` | image experiments |
 | **Ollama models** (`gemma4:12b` etc.) | on demand | EX-N3 Gemma judging, external-path verification | `ollama pull gemma4:12b` | judging experiments |
 
@@ -566,14 +590,17 @@ Open app → Settings → switch to "Full mode" → Model management → pick di
 # Terminal 1: start the Python backend (run from the project root)
 python src/api_server.py
 
-# Terminal 2: start the frontend dev server (optional; the backend serves built frontend assets)
-cd frontend && npm run dev
+# Terminal 2: start the sole product frontend (Vite proxies to 8000)
+cd frontend_cybergothic && npm run dev
 ```
 
 Once the backend is ready:
 
-- **Backend direct access**: `http://localhost:8000` (serves the frontend after `npm run build`)
-- **Frontend dev server**: `http://localhost:5173` (Vite HMR, proxied to 8000)
+- **Backend API**: `http://localhost:8000`
+- **Product frontend dev server**: `http://localhost:5174` (Vite HMR, proxied to 8000)
+- **Product desktop shell**: build `frontend_cybergothic`, then run `python packaging/launcher_cybergothic.py` (default `9851`, proxies `/api` to `8000`)
+
+> The standard backend, pywebview Launcher, CPU/CUDA/Slim specs, and Linux `.deb` now use `frontend_cybergothic/dist` by default. The old `frontend/dist` is available only through the explicit `QLH_FRONTEND_DIST` compatibility override; clean-machine first launch, WebView2, Linux install, and upgrade remain release acceptance gates.
 
 ### Standalone Mode (PC)
 
@@ -670,9 +697,9 @@ curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
 
 > ⚠️ **Data boundary**: Routes B / C send user content (including speculative-decoding draft tokens) out of the cluster. The scope levels `deny` / `opt_in` (default) / `allow_all` are a security boundary, not a performance switch; an invalid value fails closed to `deny`. Confirm compliance requirements before enabling.
 
-### Packaged Build (Windows Installer)
+### Windows Packaging Baseline and Build Scripts
 
-Two versions are provided — pick whichever fits:
+The table below is the historical size baseline for the existing full-package build scripts, not a `PACK-SLIM` release promise. `PACK-SLIM` has completed its local development gate; real PyInstaller builds and first external-runtime bootstrap still await packaging-environment acceptance.
 
 | Version | Installer | Typical size | Use case |
 |------|--------|---------|---------|
@@ -691,8 +718,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
-# 2. Build the frontend
-cd frontend && npm install && npx vite build && cd ..
+# 2. Build historical compatibility static resources for the current installer
+#    Product UI development/desktop shell uses frontend_cybergothic; see Quick Start.
+cd frontend_cybergothic && npm install && npx vite build && cd ..
 
 # 3. PyInstaller packaging (★ run from the project root)
 pyinstaller packaging/qlh-cpu.spec --noconfirm
@@ -729,14 +757,14 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 >
 > See [packaging/README.md](../packaging/README.md) for the detailed packaging workflow.
 
-### Linux Package (.deb)
+### Linux `.deb` Packaging Baseline
 
-A `.deb` package corresponding to the Windows iGPU edition is provided, for Ubuntu 22.04+ / Debian 12+:
+The Linux build scripts cover Ubuntu 22.04+ / Debian 12+. Versions and sizes below are historical examples, not a substitute for the current release manifest or clean-machine acceptance:
 
 | Version | Package | Typical size | Use case |
 |------|--------|---------|---------|
-| **CPU edition** | `qlh-edge-inference-cpu_0.1.8.2_amd64.deb` | ~200 MB | CPU / integrated-graphics nodes |
-| **CUDA edition** | `qlh-edge-inference-cuda_0.1.8.2_amd64.deb` | ~1.8 GB | NVIDIA GPU nodes |
+| **CPU edition** | `qlh-edge-inference-cpu_<version>_amd64.deb` | ~200 MB (historical) | CPU / integrated-graphics nodes |
+| **CUDA edition** | `qlh-edge-inference-cuda_<version>_amd64.deb` | ~1.8 GB (historical) | NVIDIA GPU nodes |
 
 **Build** (requires an Ubuntu/Debian environment):
 
@@ -828,7 +856,9 @@ The homepage lists:
 
 ---
 
-## 📊 Quantization Results
+## 📊 Historical Quantization Baselines (not current release or multi-node performance claims)
+
+> These fixed-environment samples describe comparison dimensions only. Real sampling quality, CUDA parity, dual-machine throughput and production routing are governed by the [Acceptance Checklist & Resource Limits](验收清单与资源限制登记.md) and the specialist records.
 
 ### CUDA dGPU (PyTorch + bitsandbytes)
 
@@ -852,7 +882,7 @@ The homepage lists:
 
 > llama.cpp vs PyTorch CPU: memory **-65%**, speed **+300% (3–5x)**
 
-### Android Local Inference (estimates)
+### Android Local Inference (theoretical estimates; not physical-device acceptance results)
 
 | Chip | Tier | Q4_K_M tok/s | Peak RAM |
 |------|------|--------------|----------|
@@ -862,7 +892,9 @@ The homepage lists:
 
 ---
 
-## 🧪 Comparative Experiments
+## 🧪 Comparative Experiment Matrix (design and future acceptance criteria)
+
+> This is not a table of completed experiment results. EX-N3 has read-only audited historical records; real-model multi-round sampling, CUDA, dual-machine and production-routing evidence remain in the acceptance queue.
 
 | Experiment | Quantization | Operator Fusion | KV Cache | Scheduling Strategy | Deployment Mode |
 |------------|--------------|-----------------|----------|---------------------|-----------------|

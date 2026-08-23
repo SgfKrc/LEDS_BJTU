@@ -23,6 +23,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
@@ -34,12 +35,14 @@ import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -67,12 +70,26 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.AppUpdateUiState
+import com.qlh.inference.AuthControlUiState
+import com.qlh.inference.AuditAttempt
+import com.qlh.inference.AuditReviewTicket
+import com.qlh.inference.AuditUiState
+import com.qlh.inference.AuditWorkflow
+import com.qlh.inference.ClusterOverviewUiState
 import com.qlh.inference.DiagnosticsUiState
+import com.qlh.inference.ModelFleetEntry
+import com.qlh.inference.ModelFleetStatus
+import com.qlh.inference.ModelFleetUiState
+import com.qlh.inference.ManagementUiState
+import com.qlh.inference.ManagedBindingSnapshot
+import com.qlh.inference.ManagedUserSnapshot
+import com.qlh.inference.MAX_MANAGEMENT_AUDIT_EVENTS
 import com.qlh.inference.network.ConnectionHealthState
 import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.GgufModelInfo
@@ -141,6 +158,20 @@ fun SettingsScreen(
     diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
     onRefreshDiagnostics: () -> Unit = {},
     onUploadDiagnostics: () -> Unit = {},
+    clusterOverview: ClusterOverviewUiState = ClusterOverviewUiState(),
+    onRefreshClusterOverview: () -> Unit = {},
+    modelFleet: ModelFleetUiState = ModelFleetUiState(),
+    onRefreshModelFleet: () -> Unit = {},
+    audit: AuditUiState = AuditUiState(),
+    onRefreshAudit: () -> Unit = {},
+    authControl: AuthControlUiState = AuthControlUiState(),
+    onRefreshAuthControl: () -> Unit = {},
+    onLogin: (String, String?, String?) -> Unit = { _, _, _ -> },
+    onLogout: () -> Unit = {},
+    management: ManagementUiState = ManagementUiState(),
+    onRefreshManagement: () -> Unit = {},
+    onRevokeManagedUser: (ManagedUserSnapshot) -> Unit = {},
+    onRevokeManagedBinding: (ManagedBindingSnapshot) -> Unit = {},
     appUpdate: AppUpdateUiState = AppUpdateUiState(),
     onCheckForAppUpdate: () -> Unit = {},
     onDownloadAppUpdate: () -> Unit = {},
@@ -153,6 +184,10 @@ fun SettingsScreen(
     LaunchedEffect(Unit) {
         onRefreshRuntimeStatus()
         onRefreshDiagnostics()
+        onRefreshClusterOverview()
+        onRefreshModelFleet()
+        onRefreshAudit()
+        onRefreshAuthControl()
     }
 
     Column(modifier = modifier.fillMaxSize()) {
@@ -193,6 +228,37 @@ fun SettingsScreen(
             )
 
             PresenceStatusGroup(presence)
+
+            ClusterOverviewGroup(
+                state = clusterOverview,
+                onRefresh = onRefreshClusterOverview,
+            )
+
+            ModelFleetOverviewGroup(
+                state = modelFleet,
+                onRefresh = onRefreshModelFleet,
+            )
+
+            AuditOverviewGroup(
+                state = audit,
+                onRefresh = onRefreshAudit,
+            )
+
+            AuthControlGroup(
+                state = authControl,
+                onRefresh = onRefreshAuthControl,
+                onLogin = onLogin,
+                onLogout = onLogout,
+            )
+
+            if (authControl.account?.role?.lowercase() in setOf("owner", "admin")) {
+                ManagementControlGroup(
+                    state = management,
+                    onRefresh = onRefreshManagement,
+                    onRevokeUser = onRevokeManagedUser,
+                    onRevokeBinding = onRevokeManagedBinding,
+                )
+            }
 
             DiagnosticsGroup(
                 state = diagnostics,
@@ -348,6 +414,684 @@ private fun PresenceStatusGroup(snapshot: AndroidPresenceSnapshot) {
                 color = MaterialTheme.colorScheme.error,
             )
         }
+    }
+}
+
+@Composable
+private fun ClusterOverviewGroup(
+    state: ClusterOverviewUiState,
+    onRefresh: () -> Unit,
+) {
+    val snapshot = state.snapshot
+    val summary = when {
+        state.loading -> "正在读取主节点状态"
+        snapshot != null -> "${snapshot.reachableNodes}/${snapshot.totalNodes} 个节点可达"
+        state.error != null -> "暂时无法读取"
+        else -> "尚未读取"
+    }
+
+    CollapsibleSettingsGroup(
+        title = "集群概览",
+        summary = summary,
+        icon = Icons.Default.Cloud,
+        testTag = "cluster_overview_details",
+    ) {
+        if (state.loading) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("正在刷新", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        state.error?.let { error ->
+            Text(
+                text = "集群状态不可用：$error",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        snapshot?.let { value ->
+            Text(
+                text = "运行：${if (value.running) "已启动" else "未启动"} · ${if (value.nodesReady) "节点已就绪" else "节点待就绪"}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (value.runMode.isNotBlank()) {
+                Text(
+                    text = "模式：${value.runMode}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            value.currentTaskId?.let { taskId ->
+                val taskState = value.currentTaskState?.ifBlank { "unknown" } ?: "unknown"
+                val elapsed = value.currentTaskElapsedSeconds?.let { " · ${it}s" }.orEmpty()
+                Text(
+                    text = "当前任务：$taskState$elapsed",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.testTag("cluster_overview_task_$taskId"),
+                )
+            }
+            if (value.nodes.isEmpty()) {
+                Text(
+                    text = "主节点未返回节点明细",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                value.nodes.take(8).forEach { node ->
+                    SettingRow(
+                        title = node.hostname.ifBlank { node.nodeId },
+                        subtitle = "${node.role} · ${node.nodeType} · ${node.networkType} · 任务 ${node.taskCount} · 错误 ${node.errorCount}",
+                        modifier = Modifier.testTag("cluster_overview_node_${node.nodeId}"),
+                        trailing = {
+                            StatusChip(
+                                text = node.state,
+                                showDot = node.reachable,
+                            )
+                        },
+                    )
+                }
+                if (value.nodes.size > 8) {
+                    Text(
+                        text = "其余 ${value.nodes.size - 8} 个节点未在移动端展开；请使用 PC 控制台处理详细运维。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.loading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("cluster_overview_refresh"),
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("刷新集群状态")
+        }
+    }
+}
+
+@Composable
+private fun ModelFleetOverviewGroup(
+    state: ModelFleetUiState,
+    onRefresh: () -> Unit,
+) {
+    val snapshot = state.snapshot
+    val summary = when {
+        state.loading -> "正在读取主节点模型"
+        snapshot != null -> "注册 ${snapshot.registryCount} · 资产 ${snapshot.localAssetCount} · 已验签 GGUF ${snapshot.verifiedGgufCount}"
+        state.error != null -> "暂时无法读取"
+        else -> "尚未读取"
+    }
+
+    CollapsibleSettingsGroup(
+        title = "模型舰队",
+        summary = summary,
+        icon = Icons.Default.Memory,
+        testTag = "model_fleet_details",
+    ) {
+        if (state.loading) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("正在刷新", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        state.error?.let { error ->
+            Text(
+                text = "模型舰队不可用：$error",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        snapshot?.let { value ->
+            val runtimeLabel = when {
+                value.currentLoaded -> "已加载：${value.currentModelName.ifBlank { value.currentModelId ?: "当前模型" }}"
+                value.pipelinePrepared -> "已准备流水线：${value.currentModelName.ifBlank { value.currentModelId ?: "当前模型" }}"
+                else -> "主节点当前未加载模型"
+            }
+            Text(
+                text = runtimeLabel,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (value.currentEngine.isNotBlank() || !value.currentQuantType.isNullOrBlank()) {
+                Text(
+                    text = listOf(value.currentEngine, value.currentQuantType.orEmpty())
+                        .filter { it.isNotBlank() }
+                        .joinToString(" · "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (value.androidSelectedModelName.isNotBlank()) {
+                val size = value.androidSelectedModelSizeBytes.takeIf { it > 0L }
+                    ?.let { " · ${formatBytes(it)}" }
+                    .orEmpty()
+                Text(
+                    text = "本机已选：${value.androidSelectedModelName}$size",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            } else {
+                Text(
+                    text = "本机尚未选择 GGUF 模型",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (value.entries.isEmpty()) {
+                Text(
+                    text = "主节点未返回可展示的模型条目",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                value.entries.take(8).forEach { entry ->
+                    ModelFleetEntryRow(entry)
+                }
+                if (value.entries.size > 8) {
+                    Text(
+                        text = "其余 ${value.entries.size - 8} 项未在移动端展开；下载治理、注册表编辑与部署操作请使用 PC 控制台。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.loading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("model_fleet_refresh"),
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("刷新模型舰队")
+        }
+    }
+}
+
+@Composable
+private fun ModelFleetEntryRow(entry: ModelFleetEntry) {
+    val details = buildList {
+        if (entry.modelType.isNotBlank()) add(entry.modelType)
+        if (entry.formats.isNotEmpty()) add(entry.formats.joinToString("/"))
+        if (entry.totalBytes > 0L) add(formatBytes(entry.totalBytes))
+        if (entry.sources.isNotEmpty()) add(entry.sources.joinToString(" · "))
+    }.joinToString(" · ")
+    SettingRow(
+        title = entry.name,
+        subtitle = details.ifBlank { entry.modelId },
+        modifier = Modifier.testTag("model_fleet_entry_${entry.modelId}"),
+        trailing = {
+            StatusChip(
+                text = when (entry.status) {
+                    ModelFleetStatus.ACTIVE -> "运行中"
+                    ModelFleetStatus.AVAILABLE -> "可用"
+                    ModelFleetStatus.UNVERIFIED -> "待验证"
+                    ModelFleetStatus.MISSING -> "缺失"
+                },
+                showDot = entry.status == ModelFleetStatus.ACTIVE || entry.status == ModelFleetStatus.AVAILABLE,
+            )
+        },
+    )
+}
+
+@Composable
+private fun AuditOverviewGroup(
+    state: AuditUiState,
+    onRefresh: () -> Unit,
+) {
+    val snapshot = state.snapshot
+    val summary = when {
+        state.loading -> "姝ｅ湪璇诲彇"
+        snapshot != null -> "娲诲姩 ${snapshot.workflows.size} · 澶嶆牳 ${snapshot.reviews.size}"
+        state.error != null -> "鏆傛椂鏃犳硶璇诲彇"
+        else -> "灏氭湭璇诲彇"
+    }
+    CollapsibleSettingsGroup(
+        title = "瀹¤涓庢椿鍔?",
+        summary = summary,
+        icon = Icons.Default.Description,
+        testTag = "audit_overview_details",
+    ) {
+        if (state.loading) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("姝ｅ湪鍒锋柊", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        state.error?.let { error ->
+            Text(
+                text = "瀹¤璧勬枡涓嶅彲鐢細$error",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        snapshot?.let { value ->
+            Text(
+                text = "工作流 ${value.workflows.size} 条 · 复核票 ${value.reviews.size} 条",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            value.workflows.take(8).forEach { workflow ->
+                AuditWorkflowRow(workflow)
+            }
+            value.reviews.take(8).forEach { ticket ->
+                AuditReviewRow(ticket)
+            }
+            if (value.workflows.isEmpty() && value.reviews.isEmpty()) {
+                Text(
+                    text = "暂无可显示的活动或复核摘要",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.loading,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("audit_overview_refresh"),
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("刷新审计摘要")
+        }
+    }
+}
+
+@Composable
+private fun AuditWorkflowRow(workflow: AuditWorkflow) {
+    val stageSummary = "阶段 ${workflow.completedStageCount}/${workflow.stageCount} · 尝试 ${workflow.attemptCount} · 重试 ${workflow.retryCount}"
+    SettingRow(
+        title = workflow.template,
+        subtitle = "$stageSummary · ${workflow.workflowId}",
+        modifier = Modifier.testTag("audit_workflow_${workflow.workflowId}"),
+        trailing = {
+            StatusChip(
+                text = workflow.state,
+                showDot = workflow.state in setOf("running", "pending", "created", "result_ready"),
+            )
+        },
+    )
+    workflow.stages.take(4).forEach { stage ->
+        val attemptKinds = stage.attempts.map { it.providerKind }.distinct().filter { it != "unknown" }
+        val errorCode = stage.errorCode.ifBlank { stage.attempts.firstOrNull()?.errorCode.orEmpty() }
+        SettingRow(
+            title = stage.stageType,
+            subtitle = "${stage.state} · 尝试 ${stage.attempts.size} · 重试 ${stage.retryCount}" +
+                (if (attemptKinds.isEmpty()) "" else " · ${attemptKinds.joinToString(", ")}") +
+                (if (errorCode.isBlank()) "" else " · 错误 $errorCode"),
+            modifier = Modifier.testTag("audit_stage_${workflow.workflowId}_${stage.stageId}"),
+            trailing = {
+                StatusChip(text = stage.state, showDot = stage.state == "running")
+            },
+        )
+    }
+}
+
+@Composable
+private fun AuditReviewRow(ticket: AuditReviewTicket) {
+    SettingRow(
+        title = "复核 ${ticket.targetNodeId}",
+        subtitle = "${ticket.ticketId} · 票数 ${ticket.voteCount} · 分数 ${ticket.score}",
+        modifier = Modifier.testTag("audit_review_${ticket.ticketId}"),
+        trailing = {
+            StatusChip(
+                text = ticket.status,
+                showDot = ticket.status == "pending" || ticket.status == "approved",
+            )
+        },
+    )
+}
+
+@Composable
+private fun AuthControlGroup(
+    state: AuthControlUiState,
+    onRefresh: () -> Unit,
+    onLogin: (String, String?, String?) -> Unit,
+    onLogout: () -> Unit,
+) {
+    var username by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var recoveryCode by remember { mutableStateOf("") }
+    var useRecovery by remember { mutableStateOf(false) }
+
+    val summary = when {
+        state.loading -> "正在读取认证能力"
+        state.account != null -> "已登录 · ${state.account.role}"
+        state.capability == null -> "尚未读取"
+        !state.capability.canAuthenticate -> "认证控制面未启用"
+        state.error != null -> "会话待确认"
+        else -> "需要 Auth App 验证"
+    }
+
+    CollapsibleSettingsGroup(
+        title = "账户与 Auth App",
+        summary = summary,
+        icon = Icons.Default.AccountCircle,
+        testTag = "auth_control_details",
+    ) {
+        if (state.loading) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("正在确认认证控制面", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        state.error?.let { error ->
+            Text(
+                text = error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        state.capability?.let { capability ->
+            val mode = capability.mode.ifBlank { "unknown" }
+            Text(
+                text = if (capability.canAuthenticate) "认证模式：$mode" else "主节点未启用用户认证",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (capability.reasonCode.isNotBlank() && !capability.canAuthenticate) {
+                Text(
+                    text = "认证状态：${capability.reasonCode}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+
+        state.account?.let { account ->
+            SettingRow(
+                title = account.displayName,
+                subtitle = "${account.username} · 角色 ${account.role} · 到期 ${account.expiresAt}",
+                modifier = Modifier.testTag("auth_account_summary"),
+            )
+            OutlinedButton(
+                onClick = onLogout,
+                enabled = !state.busy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("auth_logout"),
+            ) {
+                if (state.busy) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+                Spacer(Modifier.width(6.dp))
+                Text("退出当前会话")
+            }
+        } ?: state.capability?.takeIf { it.canAuthenticate }?.let {
+            Text(
+                text = "使用 Authenticator 应用生成 6 位验证码；恢复码仅用于无法访问 Auth App 时的一次性登录。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedTextField(
+                value = username,
+                onValueChange = { username = it },
+                label = { Text("用户名") },
+                singleLine = true,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("auth_username"),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (!useRecovery) {
+                    Button(
+                        onClick = { useRecovery = false },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Auth App") }
+                    OutlinedButton(
+                        onClick = { useRecovery = true },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("恢复码") }
+                } else {
+                    OutlinedButton(
+                        onClick = { useRecovery = false },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("Auth App") }
+                    Button(
+                        onClick = { useRecovery = true },
+                        modifier = Modifier.weight(1f),
+                    ) { Text("恢复码") }
+                }
+            }
+            OutlinedTextField(
+                value = if (useRecovery) recoveryCode else code,
+                onValueChange = { value -> if (useRecovery) recoveryCode = value else code = value },
+                label = { Text(if (useRecovery) "恢复码" else "Auth App 验证码") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(if (useRecovery) "auth_recovery" else "auth_code"),
+            )
+            Button(
+                onClick = {
+                    val submittedCode = code.takeIf { !useRecovery && it.isNotBlank() }
+                    val submittedRecovery = recoveryCode.takeIf { useRecovery && it.isNotBlank() }
+                    onLogin(username.trim(), submittedCode, submittedRecovery)
+                    code = ""
+                    recoveryCode = ""
+                },
+                enabled = !state.busy && username.isNotBlank() &&
+                    ((!useRecovery && code.isNotBlank()) || (useRecovery && recoveryCode.isNotBlank())),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("auth_login"),
+            ) {
+                if (state.busy) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(6.dp))
+                Text("登录")
+            }
+        }
+
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.loading && !state.busy,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("auth_refresh"),
+        ) {
+            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("刷新认证状态")
+        }
+    }
+}
+
+@Composable
+private fun ManagementControlGroup(
+    state: ManagementUiState,
+    onRefresh: () -> Unit,
+    onRevokeUser: (ManagedUserSnapshot) -> Unit,
+    onRevokeBinding: (ManagedBindingSnapshot) -> Unit,
+) {
+    var pendingUser by remember { mutableStateOf<ManagedUserSnapshot?>(null) }
+    var pendingBinding by remember { mutableStateOf<ManagedBindingSnapshot?>(null) }
+    val managerActions = state.summary?.actions.orEmpty()
+    val reviewPending = state.summary?.reviewAdminAuthPending == true
+    val summary = when {
+        state.loading -> "正在读取管理控制面"
+        state.summary == null && state.error != null -> "管理控制面不可用"
+        reviewPending -> "成员 ${state.users.size} · 入群审批待授权"
+        else -> "成员 ${state.users.size} · 审计 ${state.audit.size}"
+    }
+
+    CollapsibleSettingsGroup(
+        title = "主节点管理",
+        summary = summary,
+        icon = Icons.Default.AccountCircle,
+        testTag = "management_control_details",
+    ) {
+        state.error?.let { error ->
+            Text(
+                text = error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        state.summary?.let { matrix ->
+            Text(
+                text = "当前角色：${matrix.role} · 策略 ${matrix.policyVersion}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "成员 ${matrix.counts["users"] ?: 0} · Tailnet 绑定 ${matrix.counts["bindings"] ?: 0} · 审计 ${if (matrix.auditAvailable) "可用" else "不可用"}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (reviewPending) {
+                Text(
+                    text = "入群审批暂不可用：review_admin 授权契约尚未迁移。此页面不会伪造审批按钮。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            managerActions.entries.forEach { (action, rule) ->
+                SettingRow(
+                    title = rule.description.ifBlank { action },
+                    subtitle = "允许：${if (rule.allowed) "是" else "否"} · 二次确认：${if (rule.confirmRequired) "是" else "否"} · 审计：${if (rule.audited) "是" else "否"}",
+                )
+            }
+        }
+
+        Text("成员清单", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
+        if (state.users.isEmpty() && state.error == null) {
+            Text("没有可显示的成员", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        state.users.forEach { user ->
+            SettingRow(
+                title = user.displayName,
+                subtitle = "${user.username} · ${user.role} · ${user.status} · 版本 ${user.aggregateVersion}",
+                modifier = Modifier.testTag("managed_user_${user.userId}"),
+                trailing = {
+                    if (user.status != "revoked" && user.aggregateVersion > 0) {
+                        IconButton(
+                            onClick = { pendingUser = user },
+                            enabled = state.busyAction == null,
+                            modifier = Modifier.testTag("managed_user_revoke_${user.userId}"),
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "撤销成员")
+                        }
+                    }
+                },
+            )
+            user.bindings.forEach { binding ->
+                SettingRow(
+                    title = "Tailnet ${binding.tailnetId.ifBlank { "unknown" }}",
+                    subtitle = "${binding.tailscaleUserId.ifBlank { "unknown user" }} · 节点 ${binding.nodeId.ifBlank { "unknown" }} · ${binding.state}",
+                    modifier = Modifier
+                        .padding(start = 16.dp)
+                        .testTag("managed_binding_${binding.bindingId}"),
+                    trailing = {
+                        if (binding.state != "revoked") {
+                            IconButton(
+                                onClick = { pendingBinding = binding },
+                                enabled = state.busyAction == null,
+                                modifier = Modifier.testTag("managed_binding_revoke_${binding.bindingId}"),
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "撤销绑定")
+                            }
+                        }
+                    },
+                )
+            }
+        }
+
+        Text("最近管理审计", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
+        state.audit.take(MAX_MANAGEMENT_AUDIT_EVENTS).forEach { event ->
+            SettingRow(
+                title = event.eventType.ifBlank { "管理事件" },
+                subtitle = "${event.outcome.ifBlank { "unknown" }} · ${event.createdAt}",
+                modifier = Modifier.testTag("management_audit_${event.eventId}"),
+            )
+        }
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.loading && state.busyAction == null,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("management_refresh"),
+        ) {
+            if (state.loading) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            else Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("刷新管理摘要")
+        }
+    }
+
+    pendingUser?.let { user ->
+        AlertDialog(
+            onDismissRequest = { if (state.busyAction == null) pendingUser = null },
+            title = { Text("确认撤销成员") },
+            text = { Text("将撤销 ${user.displayName} 的账户。服务端会要求一次性二次确认并写入审计，操作不可在此页面回滚。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingUser = null
+                        onRevokeUser(user)
+                    },
+                    enabled = state.busyAction == null,
+                ) { Text("确认撤销") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingUser = null }, enabled = state.busyAction == null) { Text("取消") }
+            },
+        )
+    }
+    pendingBinding?.let { binding ->
+        AlertDialog(
+            onDismissRequest = { if (state.busyAction == null) pendingBinding = null },
+            title = { Text("确认撤销 Tailnet 绑定") },
+            text = { Text("将撤销该用户的 Tailnet 绑定。服务端会要求一次性二次确认并写入审计。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingBinding = null
+                        onRevokeBinding(binding)
+                    },
+                    enabled = state.busyAction == null,
+                ) { Text("确认撤销") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingBinding = null }, enabled = state.busyAction == null) { Text("取消") }
+            },
+        )
     }
 }
 

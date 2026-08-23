@@ -15,7 +15,7 @@
 #   2. llama-cpp-python: pip install llama-cpp-python
 #   3. 其余依赖: pip install -r packaging/requirements-cpu.txt
 #   4. NVIDIA 驱动 + CUDA 12.x（运行时需要；打包机必须已安装）
-#   5. 前端构建: cd frontend && npm run build
+#   5. 前端构建: cd frontend_cybergothic && npm run build
 #
 # ★ 与 qlh-cpu.spec 的区别：
 #   - 打包时使用 CUDA 版 torch（非 CPU-only），带 ~3.5 GB CUDA DLL
@@ -34,8 +34,8 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 # src 目录（Python 模块搜索路径）
 _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
 
-# 前端 dist 目录
-_FRONTEND_DIST = os.path.join(_PROJECT_ROOT, "frontend", "dist")
+# 唯一产品前端 dist 目录
+_FRONTEND_DIST = os.path.join(_PROJECT_ROOT, "frontend_cybergothic", "dist")
 
 # G4.5 原生 Gemma 4 构建输入。允许 CI 覆盖 venv，但默认使用仓库内
 # 经 build-cuda-llamacpp.bat 生成的隔离环境，避免误收集普通 CPU wheel。
@@ -75,8 +75,8 @@ if not _llama_quantize_verification["valid"]:
 
 if not os.path.isdir(_FRONTEND_DIST):
     raise FileNotFoundError(
-        f"前端 dist 目录未找到: {_FRONTEND_DIST}\n"
-        "请先构建前端: cd frontend && npm run build"
+        f"赛博哥特前端 dist 目录未找到: {_FRONTEND_DIST}\n"
+        "请先构建前端: cd frontend_cybergothic && npm run build"
     )
 
 if verify_gemma4_assets() != 0:
@@ -129,8 +129,8 @@ a = Analysis(
     pathex=[_GEMMA4_SITE_PACKAGES, _SRC_DIR, SPECPATH],
     binaries=_llama_cpp_dlls,
     datas=[
-        # React 前端静态文件 → 运行时目录 frontend/dist/
-        (_FRONTEND_DIST, 'frontend/dist'),
+        # CyberGothic 产品前端静态文件 → 运行时目录 frontend_cybergothic/dist/
+        (_FRONTEND_DIST, 'frontend_cybergothic/dist'),
         (_LLAMA_QUANTIZE_PACKAGE, 'model-tools/llama-quantize/windows-x86_64'),
         (_GEMMA4_NATIVE_DIR, 'models/gemma4-native'),
         (os.path.join(_GEMMA4_SITE_PACKAGES, 'llama_cpp', _GEMMA4_BINDING_MARKER), 'llama_cpp'),
