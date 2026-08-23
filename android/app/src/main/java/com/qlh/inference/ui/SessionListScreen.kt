@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -50,6 +51,11 @@ import com.qlh.inference.ui.components.EmptyState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.StatusChip
 import com.qlh.inference.ui.theme.QlhShapeTokens
+import com.qlh.inference.ui.theme.qlhBrandGold
+import com.qlh.inference.ui.theme.qlhBrandGoldContainer
+import com.qlh.inference.ui.theme.qlhOnBrandGoldContainer
+import com.qlh.inference.ui.theme.qlhNeonGreen
+import com.qlh.inference.ui.theme.qlhOnNeonGreen
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -189,10 +195,15 @@ private fun SessionCard(
         shape = MaterialTheme.shapes.medium,
         colors = CardDefaults.cardColors(
             containerColor = if (isCurrent) {
-                MaterialTheme.colorScheme.primaryContainer
+                MaterialTheme.colorScheme.tertiaryContainer
             } else {
                 MaterialTheme.colorScheme.surfaceContainer
             }
+        ),
+        border = BorderStroke(
+            1.dp,
+            if (isCurrent) qlhBrandGold().copy(alpha = 0.78f)
+            else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.64f),
         ),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
@@ -207,7 +218,7 @@ private fun SessionCard(
                 modifier = Modifier.size(40.dp),
                 shape = RoundedCornerShape(QlhShapeTokens.control),
                 color = if (isCurrent) {
-                    MaterialTheme.colorScheme.primary
+                    qlhBrandGoldContainer()
                 } else {
                     MaterialTheme.colorScheme.secondaryContainer
                 }
@@ -218,7 +229,7 @@ private fun SessionCard(
                         contentDescription = null,
                         modifier = Modifier.size(20.dp),
                         tint = if (isCurrent) {
-                            MaterialTheme.colorScheme.onPrimary
+                            qlhOnBrandGoldContainer()
                         } else {
                             MaterialTheme.colorScheme.onSecondaryContainer
                         }
@@ -235,20 +246,20 @@ private fun SessionCard(
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium,
                         color = if (isCurrent) {
-                            MaterialTheme.colorScheme.onPrimaryContainer
+                            MaterialTheme.colorScheme.onTertiaryContainer
                         } else {
                             MaterialTheme.colorScheme.onSurface
                         },
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
+                        modifier = Modifier.weight(1f)
                     )
                     if (isCurrent) {
                         Spacer(modifier = Modifier.width(8.dp))
                         StatusChip(
                             text = "当前",
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            containerColor = qlhNeonGreen(),
+                            contentColor = qlhOnNeonGreen(),
                             showDot = false
                         )
                     }

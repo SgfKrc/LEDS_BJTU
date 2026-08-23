@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import com.qlh.inference.BuildConfig
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -51,6 +53,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -103,7 +106,57 @@ import com.qlh.inference.ui.components.CollapsibleSettingsGroup
 import com.qlh.inference.ui.components.SettingRow
 import com.qlh.inference.ui.components.SettingsGroup
 import com.qlh.inference.ui.components.StatusChip
+import com.qlh.inference.ui.theme.qlhBrandGold
+import com.qlh.inference.ui.theme.qlhBrandGoldContainer
+import com.qlh.inference.ui.theme.qlhOnBrandGoldContainer
+import com.qlh.inference.ui.theme.qlhNeonGreen
+import com.qlh.inference.ui.theme.qlhOnNeonGreen
 import kotlinx.coroutines.launch
+
+private data class QlhStatusTone(
+    val containerColor: Color,
+    val contentColor: Color,
+    val showDot: Boolean,
+)
+
+@Composable
+private fun qlhStatusTone(status: String): QlhStatusTone {
+    return when (status.trim().lowercase()) {
+        "active", "approved", "authenticated", "available", "busy", "completed",
+        "connected", "enabled", "online", "pass", "ready", "result_ready", "running",
+        "success" -> QlhStatusTone(qlhNeonGreen(), qlhOnNeonGreen(), showDot = true)
+        "created", "pending", "registering", "skipped", "waiting", "unknown" ->
+            QlhStatusTone(qlhBrandGoldContainer(), qlhOnBrandGoldContainer(), showDot = false)
+        "denied", "disabled", "error", "fail", "failed", "missing", "offline", "revoked",
+        "stopped" -> QlhStatusTone(
+            MaterialTheme.colorScheme.errorContainer,
+            MaterialTheme.colorScheme.onErrorContainer,
+            showDot = true,
+        )
+        else -> QlhStatusTone(
+            MaterialTheme.colorScheme.tertiaryContainer,
+            MaterialTheme.colorScheme.onTertiaryContainer,
+            showDot = false,
+        )
+    }
+}
+
+@Composable
+private fun QlhSemanticStatusChip(
+    text: String,
+    status: String = text,
+    showDot: Boolean? = null,
+    modifier: Modifier = Modifier,
+) {
+    val tone = qlhStatusTone(status)
+    StatusChip(
+        text = text,
+        modifier = modifier,
+        containerColor = tone.containerColor,
+        contentColor = tone.contentColor,
+        showDot = showDot ?: tone.showDot,
+    )
+}
 
 // ================================================================
 // 设置界面 — 按分组卡片组织：外观 / 主节点连接 / 推理模式 / 模型管理 /
@@ -398,15 +451,23 @@ private fun PresenceStatusGroup(snapshot: AndroidPresenceSnapshot) {
         AndroidPresenceState.STOPPED -> "stopped"
     }
     SettingsGroup(title = "Cluster presence", icon = Icons.Default.Cloud) {
-        Text(
-            text = "Status: $label",
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (snapshot.state == AndroidPresenceState.ONLINE) {
-                MaterialTheme.colorScheme.primary
-            } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            },
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Status", style = MaterialTheme.typography.bodyMedium)
+            QlhSemanticStatusChip(
+                text = label,
+                status = when (snapshot.state) {
+                    AndroidPresenceState.ONLINE -> "online"
+                    AndroidPresenceState.REGISTERING -> "registering"
+                    AndroidPresenceState.BACKING_OFF -> "offline"
+                    AndroidPresenceState.OFFLINE -> "offline"
+                    AndroidPresenceState.STOPPED -> "stopped"
+                },
+            )
+        }
         if (!snapshot.lastErrorCode.isNullOrBlank()) {
             Text(
                 text = "Code: ${snapshot.lastErrorCode}",
@@ -490,8 +551,9 @@ private fun ClusterOverviewGroup(
                         subtitle = "${node.role} · ${node.nodeType} · ${node.networkType} · 任务 ${node.taskCount} · 错误 ${node.errorCount}",
                         modifier = Modifier.testTag("cluster_overview_node_${node.nodeId}"),
                         trailing = {
-                            StatusChip(
+                            QlhSemanticStatusChip(
                                 text = node.state,
+                                status = if (node.reachable) "online" else node.state,
                                 showDot = node.reachable,
                             )
                         },
@@ -634,6 +696,12 @@ private fun ModelFleetEntryRow(entry: ModelFleetEntry) {
         if (entry.totalBytes > 0L) add(formatBytes(entry.totalBytes))
         if (entry.sources.isNotEmpty()) add(entry.sources.joinToString(" · "))
     }.joinToString(" · ")
+    val statusColors = when (entry.status) {
+        ModelFleetStatus.ACTIVE -> qlhNeonGreen() to qlhOnNeonGreen()
+        ModelFleetStatus.AVAILABLE -> qlhBrandGoldContainer() to qlhOnBrandGoldContainer()
+        ModelFleetStatus.UNVERIFIED -> MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
+        ModelFleetStatus.MISSING -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+    }
     SettingRow(
         title = entry.name,
         subtitle = details.ifBlank { entry.modelId },
@@ -646,6 +714,8 @@ private fun ModelFleetEntryRow(entry: ModelFleetEntry) {
                     ModelFleetStatus.UNVERIFIED -> "待验证"
                     ModelFleetStatus.MISSING -> "缺失"
                 },
+                containerColor = statusColors.first,
+                contentColor = statusColors.second,
                 showDot = entry.status == ModelFleetStatus.ACTIVE || entry.status == ModelFleetStatus.AVAILABLE,
             )
         },
@@ -728,9 +798,8 @@ private fun AuditWorkflowRow(workflow: AuditWorkflow) {
         subtitle = "$stageSummary · ${workflow.workflowId}",
         modifier = Modifier.testTag("audit_workflow_${workflow.workflowId}"),
         trailing = {
-            StatusChip(
+            QlhSemanticStatusChip(
                 text = workflow.state,
-                showDot = workflow.state in setOf("running", "pending", "created", "result_ready"),
             )
         },
     )
@@ -744,7 +813,7 @@ private fun AuditWorkflowRow(workflow: AuditWorkflow) {
                 (if (errorCode.isBlank()) "" else " · 错误 $errorCode"),
             modifier = Modifier.testTag("audit_stage_${workflow.workflowId}_${stage.stageId}"),
             trailing = {
-                StatusChip(text = stage.state, showDot = stage.state == "running")
+                QlhSemanticStatusChip(text = stage.state, showDot = stage.state == "running")
             },
         )
     }
@@ -757,9 +826,8 @@ private fun AuditReviewRow(ticket: AuditReviewTicket) {
         subtitle = "${ticket.ticketId} · 票数 ${ticket.voteCount} · 分数 ${ticket.score}",
         modifier = Modifier.testTag("audit_review_${ticket.ticketId}"),
         trailing = {
-            StatusChip(
+            QlhSemanticStatusChip(
                 text = ticket.status,
-                showDot = ticket.status == "pending" || ticket.status == "approved",
             )
         },
     )
@@ -810,11 +878,23 @@ private fun AuthControlGroup(
         }
         state.capability?.let { capability ->
             val mode = capability.mode.ifBlank { "unknown" }
-            Text(
-                text = if (capability.canAuthenticate) "认证模式：$mode" else "主节点未启用用户认证",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = if (capability.canAuthenticate) "认证模式：$mode" else "主节点未启用用户认证",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                QlhSemanticStatusChip(
+                    text = if (capability.canAuthenticate) "ready" else "disabled",
+                    status = if (capability.canAuthenticate) "ready" else "disabled",
+                    showDot = false,
+                )
+            }
             if (capability.reasonCode.isNotBlank() && !capability.canAuthenticate) {
                 Text(
                     text = "认证状态：${capability.reasonCode}",
@@ -831,6 +911,17 @@ private fun AuthControlGroup(
                 title = account.displayName,
                 subtitle = "${account.username} · 角色 ${account.role} · 到期 ${account.expiresAt}",
                 modifier = Modifier.testTag("auth_account_summary"),
+                trailing = {
+                    QlhSemanticStatusChip(
+                        text = account.role,
+                        status = if (account.role.equals("owner", true) || account.role.equals("admin", true)) {
+                            "active"
+                        } else {
+                            "unknown"
+                        },
+                        showDot = false,
+                    )
+                },
             )
             OutlinedButton(
                 onClick = onLogout,
@@ -940,8 +1031,12 @@ private fun ManagementControlGroup(
 ) {
     var pendingUser by remember { mutableStateOf<ManagedUserSnapshot?>(null) }
     var pendingBinding by remember { mutableStateOf<ManagedBindingSnapshot?>(null) }
+    var showAllUsers by rememberSaveable { mutableStateOf(false) }
+    var showAllAudit by rememberSaveable { mutableStateOf(false) }
     val managerActions = state.summary?.actions.orEmpty()
     val reviewPending = state.summary?.reviewAdminAuthPending == true
+    val visibleUsers = if (showAllUsers) state.users else state.users.take(8)
+    val visibleAudit = if (showAllAudit) state.audit else state.audit.take(8)
     val summary = when {
         state.loading -> "正在读取管理控制面"
         state.summary == null && state.error != null -> "管理控制面不可用"
@@ -986,6 +1081,13 @@ private fun ManagementControlGroup(
                 SettingRow(
                     title = rule.description.ifBlank { action },
                     subtitle = "允许：${if (rule.allowed) "是" else "否"} · 二次确认：${if (rule.confirmRequired) "是" else "否"} · 审计：${if (rule.audited) "是" else "否"}",
+                    trailing = {
+                        QlhSemanticStatusChip(
+                            text = if (rule.allowed) "allowed" else "denied",
+                            status = if (rule.allowed) "enabled" else "denied",
+                            showDot = false,
+                        )
+                    },
                 )
             }
         }
@@ -994,19 +1096,23 @@ private fun ManagementControlGroup(
         if (state.users.isEmpty() && state.error == null) {
             Text("没有可显示的成员", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        state.users.forEach { user ->
+        visibleUsers.forEach { user ->
             SettingRow(
                 title = user.displayName,
                 subtitle = "${user.username} · ${user.role} · ${user.status} · 版本 ${user.aggregateVersion}",
                 modifier = Modifier.testTag("managed_user_${user.userId}"),
                 trailing = {
-                    if (user.status != "revoked" && user.aggregateVersion > 0) {
-                        IconButton(
-                            onClick = { pendingUser = user },
-                            enabled = state.busyAction == null,
-                            modifier = Modifier.testTag("managed_user_revoke_${user.userId}"),
-                        ) {
-                            Icon(Icons.Default.Delete, contentDescription = "撤销成员")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        QlhSemanticStatusChip(text = user.status, showDot = false)
+                        if (user.status != "revoked" && user.aggregateVersion > 0) {
+                            Spacer(Modifier.width(6.dp))
+                            IconButton(
+                                onClick = { pendingUser = user },
+                                enabled = state.busyAction == null,
+                                modifier = Modifier.testTag("managed_user_revoke_${user.userId}"),
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "撤销成员")
+                            }
                         }
                     }
                 },
@@ -1019,27 +1125,52 @@ private fun ManagementControlGroup(
                         .padding(start = 16.dp)
                         .testTag("managed_binding_${binding.bindingId}"),
                     trailing = {
-                        if (binding.state != "revoked") {
-                            IconButton(
-                                onClick = { pendingBinding = binding },
-                                enabled = state.busyAction == null,
-                                modifier = Modifier.testTag("managed_binding_revoke_${binding.bindingId}"),
-                            ) {
-                                Icon(Icons.Default.Delete, contentDescription = "撤销绑定")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            QlhSemanticStatusChip(text = binding.state, showDot = false)
+                            if (binding.state != "revoked") {
+                                Spacer(Modifier.width(6.dp))
+                                IconButton(
+                                    onClick = { pendingBinding = binding },
+                                    enabled = state.busyAction == null,
+                                    modifier = Modifier.testTag("managed_binding_revoke_${binding.bindingId}"),
+                                ) {
+                                    Icon(Icons.Default.Delete, contentDescription = "撤销绑定")
+                                }
                             }
                         }
                     },
                 )
             }
         }
+        if (state.users.size > visibleUsers.size) {
+            TextButton(onClick = { showAllUsers = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("查看全部成员 (${state.users.size})")
+            }
+        } else if (showAllUsers && state.users.size > 8) {
+            TextButton(onClick = { showAllUsers = false }, modifier = Modifier.fillMaxWidth()) {
+                Text("收起成员列表")
+            }
+        }
 
         Text("最近管理审计", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
-        state.audit.take(MAX_MANAGEMENT_AUDIT_EVENTS).forEach { event ->
+        visibleAudit.take(MAX_MANAGEMENT_AUDIT_EVENTS).forEach { event ->
             SettingRow(
                 title = event.eventType.ifBlank { "管理事件" },
                 subtitle = "${event.outcome.ifBlank { "unknown" }} · ${event.createdAt}",
                 modifier = Modifier.testTag("management_audit_${event.eventId}"),
+                trailing = {
+                    QlhSemanticStatusChip(text = event.outcome.ifBlank { "unknown" }, showDot = false)
+                },
             )
+        }
+        if (state.audit.size > visibleAudit.size) {
+            TextButton(onClick = { showAllAudit = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("查看全部审计 (${state.audit.size})")
+            }
+        } else if (showAllAudit && state.audit.size > 8) {
+            TextButton(onClick = { showAllAudit = false }, modifier = Modifier.fillMaxWidth()) {
+                Text("收起审计列表")
+            }
         }
         OutlinedButton(
             onClick = onRefresh,
@@ -1109,24 +1240,24 @@ private fun DiagnosticsGroup(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             report.checks.forEach { check ->
-                val color = when (check.state) {
-                    ConnectionHealthState.PASS -> MaterialTheme.colorScheme.primary
-                    ConnectionHealthState.FAIL -> MaterialTheme.colorScheme.error
-                    ConnectionHealthState.SKIPPED -> MaterialTheme.colorScheme.onSurfaceVariant
-                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(check.label, color = MaterialTheme.colorScheme.onSurface)
-                    Text(
+                    QlhSemanticStatusChip(
                         text = when (check.state) {
                             ConnectionHealthState.PASS -> "通过"
                             ConnectionHealthState.FAIL -> "失败"
                             ConnectionHealthState.SKIPPED -> "跳过"
                         } + (check.latencyMillis?.let { " · ${it} ms" } ?: ""),
-                        color = color,
-                        style = MaterialTheme.typography.bodySmall,
+                        status = when (check.state) {
+                            ConnectionHealthState.PASS -> "pass"
+                            ConnectionHealthState.FAIL -> "fail"
+                            ConnectionHealthState.SKIPPED -> "skipped"
+                        },
+                        showDot = false,
                     )
                 }
                 if (check.detail.isNotBlank()) {
@@ -1144,7 +1275,7 @@ private fun DiagnosticsGroup(
             Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
         state.uploadMessage?.let { message ->
-            Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+            Text(message, color = qlhNeonGreen(), style = MaterialTheme.typography.bodySmall)
         }
         state.uploadError?.let { error ->
             Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -1329,16 +1460,16 @@ private fun ConnectionGroup(
             connectionResult?.let { success ->
                 Spacer(modifier = Modifier.width(12.dp))
                 if (success) {
-                    StatusChip(
+                    QlhSemanticStatusChip(
                         text = "已连接",
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        status = "connected",
+                        showDot = false,
                     )
                 } else {
-                    StatusChip(
+                    QlhSemanticStatusChip(
                         text = "无法连接",
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                        contentColor = MaterialTheme.colorScheme.onErrorContainer
+                        status = "offline",
+                        showDot = false,
                     )
                 }
             }
@@ -1648,6 +1779,7 @@ private fun RemoteModelPanel(
                     LinearProgressIndicator(
                         progress = { current.percent.coerceIn(0, 100) / 100f },
                         modifier = Modifier.fillMaxWidth(),
+                        color = if (current.phase == "completed") qlhNeonGreen() else qlhBrandGold(),
                     )
                     Text(
                         text = when (current.phase) {
@@ -1669,34 +1801,44 @@ private fun RemoteModelPanel(
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 models.forEach { model ->
-                    Row(
+                    Surface(
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("remote_model_${model.filename}"),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        shape = MaterialTheme.shapes.small,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.64f)),
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = model.filename,
-                                style = MaterialTheme.typography.bodyMedium,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = "${formatBytes(model.sizeBytes)} · SHA-256 ${model.sha256.take(12)}…",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        OutlinedButton(
-                            onClick = { onDownload(model) },
-                            enabled = modelTreeUri.isNotBlank() && !busy && !loading,
-                            modifier = Modifier.testTag("remote_model_download_${model.filename}"),
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("下载")
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = model.filename,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = "${formatBytes(model.sizeBytes)} · SHA-256 ${model.sha256.take(12)}…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = { onDownload(model) },
+                                enabled = modelTreeUri.isNotBlank() && !busy && !loading,
+                                modifier = Modifier.testTag("remote_model_download_${model.filename}"),
+                                colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                                    contentColor = qlhBrandGold(),
+                                ),
+                            ) {
+                                Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("下载")
+                            }
                         }
                     }
                 }
@@ -1710,7 +1852,7 @@ private fun RemoteModelPanel(
                 color = if (it.contains("失败") || it.contains("无效")) {
                     MaterialTheme.colorScheme.error
                 } else {
-                    MaterialTheme.colorScheme.primary
+                    qlhNeonGreen()
                 },
                 modifier = Modifier.testTag("remote_model_message"),
             )
@@ -1887,9 +2029,17 @@ private fun ModelRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .border(
+                BorderStroke(
+                    1.dp,
+                    if (selected) qlhBrandGold().copy(alpha = 0.72f)
+                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.42f),
+                ),
+                MaterialTheme.shapes.small,
+            )
             .clip(MaterialTheme.shapes.small)
             .clickable(onClick = onClick)
-            .padding(vertical = 6.dp),
+            .padding(horizontal = 6.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         RadioButton(selected = selected, onClick = onClick)
@@ -1900,7 +2050,7 @@ private fun ModelRow(
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                 color = if (selected) {
-                    MaterialTheme.colorScheme.primary
+                    qlhBrandGold()
                 } else {
                     MaterialTheme.colorScheme.onSurface
                 },

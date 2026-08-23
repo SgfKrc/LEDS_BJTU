@@ -10,6 +10,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
@@ -23,10 +24,10 @@ private val LightColorScheme = lightColorScheme(
     onSecondary = OnSecondaryLight,
     secondaryContainer = SecondaryContainerLight,
     onSecondaryContainer = OnSecondaryContainerLight,
-    tertiary = TertiaryLight,
-    onTertiary = OnTertiaryLight,
-    tertiaryContainer = TertiaryContainerLight,
-    onTertiaryContainer = OnTertiaryContainerLight,
+    tertiary = BrandAccentLight,
+    onTertiary = OnBrandAccentLight,
+    tertiaryContainer = BrandAccentContainerLight,
+    onTertiaryContainer = OnBrandAccentContainerLight,
     error = ErrorLight,
     onError = OnErrorLight,
     errorContainer = ErrorContainerLight,
@@ -60,10 +61,10 @@ private val DarkColorScheme = darkColorScheme(
     onSecondary = OnSecondaryDark,
     secondaryContainer = SecondaryContainerDark,
     onSecondaryContainer = OnSecondaryContainerDark,
-    tertiary = TertiaryDark,
-    onTertiary = OnTertiaryDark,
-    tertiaryContainer = TertiaryContainerDark,
-    onTertiaryContainer = OnTertiaryContainerDark,
+    tertiary = BrandAccentDark,
+    onTertiary = OnBrandAccentDark,
+    tertiaryContainer = BrandAccentContainerDark,
+    onTertiaryContainer = OnBrandAccentContainerDark,
     error = ErrorDark,
     onError = OnErrorDark,
     errorContainer = ErrorContainerDark,
@@ -94,6 +95,31 @@ object QlhShapeTokens {
     val control = 8.dp
     val dialog = 12.dp
 }
+
+/** Shared low-cost geometry tokens corresponding to the PC surface vocabulary. */
+object QlhUiTokens {
+    val pageHorizontal = 16.dp
+    val sectionGap = 18.dp
+    val rowGap = 8.dp
+    val hairline = 1.dp
+    val cornerMark = 28.dp
+    val touchTarget = 48.dp
+}
+
+@Composable
+fun qlhBrandGold() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) BrandGoldDark else BrandGoldLight
+
+@Composable
+fun qlhBrandGoldContainer() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) BrandGoldContainerDark else BrandGoldContainerLight
+
+@Composable
+fun qlhOnBrandGoldContainer() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) OnBrandGoldContainerDark else OnBrandGoldContainerLight
+
+@Composable
+fun qlhNeonGreen() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) NeonGreenDark else NeonGreenLight
+
+@Composable
+fun qlhOnNeonGreen() = if (MaterialTheme.colorScheme.background.luminance() < 0.5f) OnNeonGreenDark else OnNeonGreenLight
 
 private val QlhShapes = Shapes(
     extraSmall = RoundedCornerShape(QlhShapeTokens.compact),

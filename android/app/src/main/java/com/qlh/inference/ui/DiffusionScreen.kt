@@ -3,7 +3,9 @@ package com.qlh.inference.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,6 +39,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -60,6 +63,11 @@ import com.qlh.inference.media.ImageAttachmentEncoder
 import com.qlh.inference.network.DiffusionBlobUpload
 import com.qlh.inference.network.DiffusionGenerateRequest
 import com.qlh.inference.ui.theme.QlhShapeTokens
+import com.qlh.inference.ui.theme.qlhBrandGold
+import com.qlh.inference.ui.theme.qlhBrandGoldContainer
+import com.qlh.inference.ui.theme.qlhNeonGreen
+import com.qlh.inference.ui.theme.qlhOnNeonGreen
+import com.qlh.inference.ui.components.QlhTopBar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -118,24 +126,21 @@ fun DiffusionScreen(
             .testTag("diffusion_screen"),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(Icons.Default.Image, contentDescription = null)
-            Spacer(Modifier.width(10.dp))
-            Text("图像生成", style = MaterialTheme.typography.headlineSmall)
-            Spacer(Modifier.weight(1f))
-            if (state.canCancel) {
-                IconButton(
-                    onClick = onCancel,
-                    enabled = !state.isCancelling,
-                    modifier = Modifier.testTag("diffusion_cancel"),
-                ) {
-                    Icon(Icons.Default.Close, contentDescription = "取消任务")
+        QlhTopBar(
+            title = "图像生成",
+            subtitle = "本地准备 · 远程任务",
+            actions = {
+                if (state.canCancel) {
+                    IconButton(
+                        onClick = onCancel,
+                        enabled = !state.isCancelling,
+                        modifier = Modifier.testTag("diffusion_cancel"),
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "取消任务", tint = qlhBrandGold())
+                    }
                 }
-            }
-        }
+            },
+        )
 
         OutlinedTextField(
             value = prompt,
@@ -144,6 +149,10 @@ fun DiffusionScreen(
             enabled = !state.isBusy,
             label = { Text("提示词") },
             minLines = 3,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = qlhNeonGreen(),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f),
+            ),
         )
         OutlinedTextField(
             value = negativePrompt,
@@ -152,6 +161,10 @@ fun DiffusionScreen(
             enabled = !state.isBusy,
             label = { Text("反向提示词") },
             minLines = 2,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = qlhNeonGreen(),
+                unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f),
+            ),
         )
 
         Row(
@@ -167,38 +180,55 @@ fun DiffusionScreen(
                 label = { Text("步数") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = qlhNeonGreen(),
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f),
+                ),
             )
-            Text("512 × 512", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "512 × 512",
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
         }
 
-        Row(
+        Surface(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            color = MaterialTheme.colorScheme.surfaceContainerLow,
+            shape = MaterialTheme.shapes.medium,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f)),
         ) {
-            IconButton(
-                onClick = { referencePicker.launch("image/*") },
-                enabled = !state.isBusy,
-                modifier = Modifier.testTag("diffusion_reference_pick"),
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons.Default.AddPhotoAlternate, contentDescription = "选择参考图")
-            }
-            Text(
-                if (referenceImage == null) "可选参考图" else "已选择参考图",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (referencePreview != null) {
-                Image(
-                    bitmap = referencePreview,
-                    contentDescription = "参考图预览",
-                    modifier = Modifier.size(52.dp).clip(RoundedCornerShape(QlhShapeTokens.control)),
-                )
                 IconButton(
-                    onClick = { referenceImage = null },
+                    onClick = { referencePicker.launch("image/*") },
                     enabled = !state.isBusy,
-                    modifier = Modifier.testTag("diffusion_reference_clear"),
+                    modifier = Modifier.testTag("diffusion_reference_pick"),
                 ) {
-                    Icon(Icons.Default.Close, contentDescription = "移除参考图")
+                    Icon(Icons.Default.AddPhotoAlternate, contentDescription = "选择参考图", tint = qlhBrandGold())
+                }
+                Text(
+                    if (referenceImage == null) "可选参考图" else "已选择参考图",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (referencePreview != null) {
+                    Image(
+                        bitmap = referencePreview,
+                        contentDescription = "参考图预览",
+                        modifier = Modifier.size(52.dp).clip(RoundedCornerShape(QlhShapeTokens.control)),
+                    )
+                    IconButton(
+                        onClick = { referenceImage = null },
+                        enabled = !state.isBusy,
+                        modifier = Modifier.testTag("diffusion_reference_clear"),
+                    ) {
+                        Icon(Icons.Default.Close, contentDescription = "移除参考图")
+                    }
                 }
             }
         }
@@ -226,6 +256,12 @@ fun DiffusionScreen(
             enabled = canSubmit,
             modifier = Modifier.fillMaxWidth().testTag("diffusion_submit"),
             contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (canSubmit) qlhNeonGreen() else MaterialTheme.colorScheme.surfaceContainerHighest,
+                contentColor = if (canSubmit) qlhOnNeonGreen() else MaterialTheme.colorScheme.onSurfaceVariant,
+                disabledContainerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
         ) {
             if (state.state == "submitting" || state.state == "uploading") {
                 CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -238,19 +274,21 @@ fun DiffusionScreen(
 
         DiffusionStatus(state)
 
-        HorizontalDivider()
-        Text("结果", style = MaterialTheme.typography.titleMedium)
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f))
+        Text("结果", style = MaterialTheme.typography.titleMedium, color = qlhBrandGold())
         if (resultPreview != null) {
-            Image(
-                bitmap = resultPreview,
-                contentDescription = "生成结果",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(1f)
-                    .clip(RoundedCornerShape(QlhShapeTokens.control))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .testTag("diffusion_result"),
-            )
+            Surface(
+                modifier = Modifier.fillMaxWidth().aspectRatio(1f).testTag("diffusion_result"),
+                shape = RoundedCornerShape(QlhShapeTokens.control),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                border = BorderStroke(1.dp, qlhBrandGold().copy(alpha = 0.72f)),
+            ) {
+                Image(
+                    bitmap = resultPreview,
+                    contentDescription = "生成结果",
+                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(QlhShapeTokens.control)),
+                )
+            }
         } else {
             Box(
                 modifier = Modifier
@@ -259,6 +297,11 @@ fun DiffusionScreen(
                     .background(
                         MaterialTheme.colorScheme.surfaceVariant,
                         RoundedCornerShape(QlhShapeTokens.control)
+                    )
+                    .border(
+                        1.dp,
+                        qlhBrandGold().copy(alpha = 0.72f),
+                        RoundedCornerShape(QlhShapeTokens.control),
                     )
                     .testTag("diffusion_result_empty"),
                 contentAlignment = Alignment.Center,
@@ -294,10 +337,20 @@ private fun DiffusionStatus(state: DiffusionUiState) {
         modifier = Modifier.fillMaxWidth().testTag("diffusion_status"),
         color = if (state.state == "failed") {
             MaterialTheme.colorScheme.errorContainer
+        } else if (state.state == "completed") {
+            qlhBrandGoldContainer()
         } else {
             MaterialTheme.colorScheme.surfaceContainerHighest
         },
         shape = RoundedCornerShape(QlhShapeTokens.control),
+        border = BorderStroke(
+            1.dp,
+            when (state.state) {
+                "failed" -> MaterialTheme.colorScheme.error.copy(alpha = 0.5f)
+                "completed" -> qlhBrandGold().copy(alpha = 0.64f)
+                else -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f)
+            },
+        ),
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -319,6 +372,7 @@ private fun DiffusionStatus(state: DiffusionUiState) {
                 LinearProgressIndicator(
                     progress = { (state.progressStep.toFloat() / state.progressTotal).coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth(),
+                    color = qlhBrandGold(),
                 )
             }
             if (!state.error.isNullOrBlank()) {
