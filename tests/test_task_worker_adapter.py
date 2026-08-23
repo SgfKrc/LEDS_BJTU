@@ -69,6 +69,25 @@ def _capabilities():
     }
 
 
+def _android_capabilities(*, resource_admitted=True):
+    return {
+        "stage_types": ["full_inference"],
+        "engines": ["llama_cpp"],
+        "models": [{
+            "model_id": "qwen_1_8b",
+            "engine": "llama_cpp",
+            "format": "gguf",
+            "revision": "local-v1",
+            "sha256": "a" * 64,
+        }],
+        "max_concurrency": 1,
+        "resource_gate": {
+            "admitted": resource_admitted,
+            "reason_code": "" if resource_admitted else "thermal_gate",
+        },
+    }
+
+
 def _diffusion_manifest():
     body = {
         "artifact_id": "artifact_sd15",
@@ -174,6 +193,23 @@ def _admitted_control_plane():
     return coordinator, worker
 
 
+def _admitted_android_control_plane():
+    worker = TaskWorkerControlPlane()
+    coordinator = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_worker_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_capabilities(),
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_worker_01", hello.snapshot(), coordinator_node_id="master",
+    )
+    assert ack.payload["accepted"] is True
+    worker.receive_on_worker(ack.snapshot())
+    return coordinator, worker
+
+
 def _model_identity():
     return ModelIdentity(**_capabilities()["models"][0])
 
@@ -272,6 +308,167 @@ def test_v2_hello_negotiates_and_reports_control_plane_only():
     assert master_status["adapter_connected"] is False
     assert master_status["task_dispatch_enabled"] is False
     assert worker_status["coordinator"]["selected_version"] == 2
+
+
+def test_android_full_worker_provider_requires_resource_gate_and_exact_model():
+    worker = TaskWorkerControlPlane()
+    coordinator = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_worker_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_capabilities(),
+        sent_at_ms=1000,
+    )
+    assert hello is not None
+    ack = coordinator.receive_on_coordinator(
+        "android_worker_01", hello.snapshot(), coordinator_node_id="master",
+        sent_at_ms=1001,
+    )
+    assert ack.payload["accepted"] is True
+    provider = RemoteFullWorkerProvider(
+        node_id="android_worker_01",
+        peer_snapshot=lambda: coordinator.worker_snapshot("android_worker_01"),
+        send_message=lambda _message: None,
+    )
+    status = provider.inspect()
+    assert status.healthy is True
+    assert status.max_concurrency == 1
+    assert provider.supports_model_identity(
+        ModelIdentity(**_android_capabilities()["models"][0]),
+        "full_inference",
+    )
+
+    denied_worker = TaskWorkerControlPlane()
+    denied_coordinator = TaskWorkerControlPlane()
+    denied_hello = denied_worker.begin_worker_hello(
+        node_id="android_worker_denied",
+        worker_kind="android_full_worker",
+        capabilities=_android_capabilities(resource_admitted=False),
+    )
+    assert denied_hello is not None
+    denied_coordinator.receive_on_coordinator(
+        "android_worker_denied", denied_hello.snapshot(), coordinator_node_id="master",
+    )
+    denied_provider = RemoteFullWorkerProvider(
+        node_id="android_worker_denied",
+        peer_snapshot=lambda: denied_coordinator.worker_snapshot("android_worker_denied"),
+        send_message=lambda _message: None,
+    )
+    assert denied_provider.inspect().healthy is False
+    assert denied_provider.supports_model_identity(
+        ModelIdentity(**_android_capabilities()["models"][0]),
+        "full_inference",
+    ) is False
+
+
+def test_scheduler_admits_android_worker_only_for_android_node(monkeypatch):
+    from scheduler import Scheduler
+
+    scheduler = Scheduler()
+    scheduler._role_override = "master"
+    assert scheduler.register_node(
+        "android_worker_01", role="client", node_type="android",
+    ) is True
+    sent = []
+    monkeypatch.setattr(
+        scheduler, "_send_task_worker_to_node",
+        lambda _node_id, message: sent.append(message),
+    )
+    worker = TaskWorkerControlPlane()
+    hello = worker.begin_worker_hello(
+        node_id="android_worker_01",
+        worker_kind="android_full_worker",
+        capabilities=_android_capabilities(),
+    )
+    assert hello is not None
+    scheduler._handle_task_worker_message(
+        "android_worker_01", {"data": hello.snapshot()},
+    )
+    assert sent and sent[0].message_type == "hello_ack"
+    assert sent[0].payload["accepted"] is True
+    providers = scheduler.remote_task_worker_providers()
+    assert len(providers) == 1
+    assert providers[0].inspect().healthy is True
+
+
+def test_android_fake_provider_task_graph_journal_records_attempt_identity(tmp_path):
+    from task_graph import StageSpec, TaskGraphCoordinator
+    from task_journal import SQLiteTaskJournal
+
+    coordinator_control, _worker_control = _admitted_android_control_plane()
+    sent = []
+    provider_holder = {}
+
+    def send(message):
+        sent.append(message.message_type)
+        if message.message_type != "stage_offer":
+            return
+        identity = _response_identity(message.payload)
+        provider = provider_holder["provider"]
+        provider.handle_message(build_message(
+            "stage_accept",
+            {
+                **identity,
+                "accepted": True,
+                "reason_code": "",
+                "retryable": False,
+            },
+            message_id="msg_android_journal_accept",
+            sent_at_ms=int(time.time() * 1000),
+            version=2,
+        ).snapshot())
+        output = {"content": "android fake journal result"}
+        provider.handle_message(build_message(
+            "stage_result",
+            {
+                **identity,
+                "output": output,
+                "output_sha256": canonical_sha256(output),
+                "metadata": {"model": "qwen_1_8b"},
+            },
+            message_id="msg_android_journal_result",
+            sent_at_ms=int(time.time() * 1000),
+            version=2,
+        ).snapshot())
+
+    provider = RemoteFullWorkerProvider(
+        node_id="android_worker_01",
+        peer_snapshot=lambda: coordinator_control.worker_snapshot("android_worker_01"),
+        send_message=send,
+    )
+    provider_holder["provider"] = provider
+    journal = SQLiteTaskJournal(str(tmp_path / "android-task-graph.sqlite3"))
+    graph = TaskGraphCoordinator(journal=journal)
+    graph.register_provider(provider)
+    try:
+        output, snapshot = graph.run(
+            stages=[StageSpec(
+                "android_stage",
+                "full_inference",
+                provider=provider.provider_id,
+                model_identity=ModelIdentity(**_android_capabilities()["models"][0]),
+                lease_timeout_seconds=5.0,
+            )],
+            final_stage_id="android_stage",
+            root_input={"message": "hello"},
+            model_identity=ModelIdentity(**_android_capabilities()["models"][0]),
+            workflow_id="wf_android_journal01",
+        )
+        assert output == {"content": "android fake journal result"}
+        attempt = snapshot["stages"][0]["attempts"][0]
+        assert attempt["provider_kind"] == "remote_full_worker"
+        assert attempt["provider_node_id"] == "android_worker_01"
+        # The fake worker feeds accept/result back into the provider; only the
+        # coordinator-to-worker offer traverses the outbound callback.
+        assert sent == ["stage_offer"]
+        graph.commit_result("wf_android_journal01")
+        persisted = journal.get_snapshot("wf_android_journal01")
+        assert persisted["state"] == "completed"
+        assert persisted["stages"][0]["attempts"][0]["provider_node_id"] == "android_worker_01"
+    finally:
+        graph.close()
+        journal.close()
+        provider.close()
 
 
 def test_v1_and_transport_identity_mismatch_are_stably_rejected():

@@ -57,8 +57,9 @@ fun normalizeChatImageDataUrls(imageDataUrls: List<String>): List<String> =
         .toList()
 
 /**
- * Image understanding is a remote-only Android capability until mmproj/JNI is wired.
- * Keep this check pure so UI and ViewModel tests can cover the gate without a device.
+ * Image payload validation is independent of the runtime capability gate. Full mode
+ * may proceed to the InferenceService mmproj gate; thin mode sends the same contract
+ * to the PC coordinator.
  */
 fun validateChatImageSubmission(inferenceMode: String, imageDataUrls: List<String>): String? {
     val normalized = normalizeChatImageDataUrls(imageDataUrls)
@@ -102,8 +103,8 @@ fun validateChatImageSubmission(inferenceMode: String, imageDataUrls: List<Strin
             return "图像总大小不得超过 16 MiB"
         }
     }
-    if (normalized.isNotEmpty() && inferenceMode != "thin") {
-        return "本地模式暂不支持图像理解，请切换远程模式"
+    if (normalized.isNotEmpty() && inferenceMode !in setOf("thin", "full")) {
+        return "当前模式不支持图像理解"
     }
     return null
 }

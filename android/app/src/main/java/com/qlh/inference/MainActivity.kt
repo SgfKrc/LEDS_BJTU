@@ -77,6 +77,11 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshAppInstallPermission()
+    }
 }
 
 // ================================================================
@@ -202,6 +207,7 @@ fun MainApp(
                 runtimeStatus = uiState.runtimeStatus,
                 runtimeStatusLoading = uiState.runtimeStatusLoading,
                 runtimeStatusError = uiState.runtimeStatusError,
+                presence = uiState.presence,
                 onRefreshRuntimeStatus = { viewModel.refreshRuntimeStatus() },
                 onConnectionTestSuccess = { viewModel.onConnectionTestSuccess() },
                 remoteModels = uiState.remoteModels,
@@ -211,6 +217,14 @@ fun MainApp(
                 remoteModelMessage = uiState.remoteModelMessage,
                 onRefreshRemoteModels = { viewModel.refreshRemoteModels() },
                 onDownloadRemoteModel = { viewModel.downloadRemoteModel(it) },
+                diagnostics = uiState.diagnostics,
+                onRefreshDiagnostics = { viewModel.refreshDiagnostics() },
+                onUploadDiagnostics = { viewModel.uploadDiagnostics() },
+                appUpdate = uiState.appUpdate,
+                onCheckForAppUpdate = { viewModel.checkForAppUpdate() },
+                onDownloadAppUpdate = { viewModel.downloadAppUpdate() },
+                onOpenInstallPermissionSettings = { viewModel.openInstallPermissionSettings() },
+                onInstallDownloadedUpdate = { viewModel.installDownloadedUpdate() },
                 modifier = Modifier.padding(innerPadding)
             )
         }

@@ -52,13 +52,25 @@ class QlhApplication : Application() {
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    NOTIFICATION_CHANNEL_PRESENCE,
+                    "QLH 集群在线状态",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    description = "Android 主节点 presence lease"
+                    setShowBadge(false)
+                }
+            )
         }
     }
 
     companion object {
         const val NOTIFICATION_CHANNEL_INFERENCE = "inference_engine"
+        const val NOTIFICATION_CHANNEL_PRESENCE = "cluster_presence"
         const val NOTIFICATION_ID_INFERENCE = 1001
         const val NOTIFICATION_ID_WORKER = 1002
+        const val NOTIFICATION_ID_PRESENCE = 1003
 
         lateinit var instance: QlhApplication
             private set

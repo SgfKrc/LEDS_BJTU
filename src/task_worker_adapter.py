@@ -118,6 +118,7 @@ class TaskWorkerControlPlane:
         *,
         node_id: str,
         capabilities: Mapping[str, Any],
+        worker_kind: str = "pc_full_worker",
         sent_at_ms: Optional[int] = None,
     ) -> Optional[WorkerMessage]:
         """Build one v2 hello; overlapping negotiations are deliberately fenced."""
@@ -129,7 +130,7 @@ class TaskWorkerControlPlane:
                 "hello",
                 {
                     "node_id": node_id,
-                    "worker_kind": "pc_full_worker",
+                    "worker_kind": worker_kind,
                     "min_version": PROTOCOL_VERSION,
                     "max_version": PROTOCOL_VERSION,
                     "capabilities": dict(capabilities),
@@ -536,6 +537,15 @@ class RemoteFullWorkerProvider:
         stage_types = capabilities.get("stage_types", [])
         if not isinstance(stage_types, list):
             stage_types = []
+        worker_kind = snapshot.get("worker_kind", "pc_full_worker")
+        resource_gate = capabilities.get("resource_gate")
+        resource_admitted = True
+        if worker_kind == "android_full_worker":
+            resource_admitted = bool(
+                isinstance(resource_gate, dict)
+                and resource_gate.get("admitted") is True
+                and not resource_gate.get("reason_code")
+            )
         # N2.3 still exposes one controlled slot even if hello advertises
         # future multi-Stage capacity.
         max_concurrency = 1
@@ -548,6 +558,7 @@ class RemoteFullWorkerProvider:
             and snapshot.get("healthy")
             and snapshot.get("selected_version") == 2
             and snapshot.get("manual_stage_dispatch_enabled")
+            and resource_admitted
         )
         return ProviderCapabilities(
             provider_id=self.provider_id,

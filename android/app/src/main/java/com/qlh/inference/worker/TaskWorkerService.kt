@@ -64,19 +64,44 @@ class TaskWorkerService : Service() {
             stopSelf()
             return
         }
+        val modelId = intent.getStringExtra(EXTRA_MODEL_ID).orEmpty().trim()
+        val modelFormat = intent.getStringExtra(EXTRA_MODEL_FORMAT).orEmpty().ifBlank { "gguf" }
+        val modelRevision = intent.getStringExtra(EXTRA_MODEL_REVISION).orEmpty().ifBlank { "local" }
+        val modelSha256 = intent.getStringExtra(EXTRA_MODEL_SHA256).orEmpty().trim()
+        val resourceAdmitted = intent.getBooleanExtra(EXTRA_RESOURCE_ADMITTED, false)
+        val resourceReason = intent.getStringExtra(EXTRA_RESOURCE_REASON).orEmpty().trim()
+        val expectedModelIdentity = {
+            AndroidWorkerCapabilities.modelIdentity(
+                modelId, modelFormat, modelRevision, modelSha256, resourceAdmitted,
+            )
+        }
         stopWorker()
         client = TaskWorkerClient(
             host = host,
             port = port,
             nodeId = nodeId,
             capabilities = {
-                mapOf(
-                    "stage_types" to listOf("full_inference"),
-                    "engines" to listOf("llama_cpp"),
-                    "models" to emptyList<Map<String, Any?>>(),
-                    "max_concurrency" to 1,
+                AndroidWorkerCapabilities.build(
+                    modelId = modelId,
+                    modelFormat = modelFormat,
+                    modelRevision = modelRevision,
+                    modelSha256 = modelSha256,
+                    resourceAdmitted = resourceAdmitted,
+                    resourceReason = resourceReason,
                 )
             },
+            stageHandler = AndroidFullWorkerStageExecutor(
+                expectedModelIdentity = expectedModelIdentity,
+                ensureModelLoaded = { contextSize ->
+                    QlhApplication.instance.inferenceService?.ensureModelLoaded(contextSize)
+                        ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                },
+                generate = { prompt, maxTokens, temperature, topP ->
+                    QlhApplication.instance.inferenceService?.generate(
+                        prompt, maxTokens, temperature, topP,
+                    ) ?: Result.failure(IllegalStateException("inference_service_unavailable"))
+                },
+            ),
         ).also { it.start() }
     }
 
@@ -122,15 +147,38 @@ class TaskWorkerService : Service() {
         const val EXTRA_COORDINATOR_HOST = "coordinator_host"
         const val EXTRA_COORDINATOR_PORT = "coordinator_port"
         const val EXTRA_NODE_ID = "node_id"
+        const val EXTRA_MODEL_ID = "model_id"
+        const val EXTRA_MODEL_FORMAT = "model_format"
+        const val EXTRA_MODEL_REVISION = "model_revision"
+        const val EXTRA_MODEL_SHA256 = "model_sha256"
+        const val EXTRA_RESOURCE_ADMITTED = "resource_admitted"
+        const val EXTRA_RESOURCE_REASON = "resource_reason"
         const val EXTRA_REASON = "reason"
 
-        fun startIntent(context: Context, host: String, port: Int, nodeId: String): Intent = Intent(
+        fun startIntent(
+            context: Context,
+            host: String,
+            port: Int,
+            nodeId: String,
+            modelId: String = "",
+            modelFormat: String = "gguf",
+            modelRevision: String = "local",
+            modelSha256: String = "",
+            resourceAdmitted: Boolean = false,
+            resourceReason: String = "resource_gate_not_confirmed",
+        ): Intent = Intent(
             context,
             TaskWorkerService::class.java,
         ).setAction(ACTION_START)
             .putExtra(EXTRA_COORDINATOR_HOST, host)
             .putExtra(EXTRA_COORDINATOR_PORT, port)
             .putExtra(EXTRA_NODE_ID, nodeId)
+            .putExtra(EXTRA_MODEL_ID, modelId)
+            .putExtra(EXTRA_MODEL_FORMAT, modelFormat)
+            .putExtra(EXTRA_MODEL_REVISION, modelRevision)
+            .putExtra(EXTRA_MODEL_SHA256, modelSha256)
+            .putExtra(EXTRA_RESOURCE_ADMITTED, resourceAdmitted)
+            .putExtra(EXTRA_RESOURCE_REASON, resourceReason)
 
         fun stopIntent(context: Context): Intent = Intent(context, TaskWorkerService::class.java)
             .setAction(ACTION_STOP)

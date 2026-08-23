@@ -578,9 +578,11 @@ class TaskWorkerClient(
                     publish()
                 }
             } catch (error: Exception) {
-                if (machine.fail(identity, "worker_execution_failed", retryable = true)) {
+                val errorCode = (error as? AndroidFullWorkerStageException)?.code
+                    ?: "worker_execution_failed"
+                if (machine.fail(identity, errorCode, retryable = true)) {
                     connection.send(TaskWorkerProtocol.buildStageError(
-                        identity, nodeId, "worker_execution_failed", true,
+                        identity, nodeId, errorCode, true,
                         newMessageId("error"), clockMs(),
                     ))
                     publish()

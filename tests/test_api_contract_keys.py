@@ -88,6 +88,52 @@ class TestApiResponseKeys:
         assert body["available"] is False
         assert body["reason_code"] in {"disabled_by_config", "verify_endpoint_missing"}
 
+    def test_android_heartbeat_returns_lease_contract(self, client, monkeypatch):
+        monkeypatch.setattr(
+            api_server_mod.scheduler,
+            "heartbeat_android_client",
+            lambda **kwargs: {
+                "status": "heartbeat",
+                "node_id": kwargs["node_id"],
+                "state": "online",
+                "server_time_ms": 1700000000000,
+                "presence_generation": kwargs["presence_generation"],
+                "presence_lease_id": kwargs["presence_lease_id"],
+                "lease_expires_at_ms": 1700000120000,
+                "heartbeat_interval_seconds": 45,
+            },
+        )
+        response = client.post(
+            "/api/cluster/android/heartbeat",
+            json={
+                "node_id": "android-1",
+                "presence_generation": 2,
+                "presence_lease_id": "lease-2",
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "heartbeat"
+        assert body["presence_generation"] == 2
+        assert body["heartbeat_interval_seconds"] == 45
+
+    def test_android_heartbeat_rejection_has_stable_error_code(self, client, monkeypatch):
+        monkeypatch.setattr(
+            api_server_mod.scheduler,
+            "heartbeat_android_client",
+            lambda **kwargs: {
+                "status": "rejected",
+                "reason": "stale",
+                "error_code": "stale_generation",
+            },
+        )
+        response = client.post(
+            "/api/cluster/android/heartbeat",
+            json={"node_id": "android-1", "presence_generation": 1, "presence_lease_id": "old"},
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "stale_generation"
+
     @staticmethod
     def _cluster_status_payload(network_path=None):
         payload = {

@@ -13,6 +13,7 @@ import androidx.core.app.NotificationCompat
 import com.qlh.inference.MainActivity
 import com.qlh.inference.QlhApplication
 import com.qlh.inference.R
+import com.qlh.inference.model.Gemma4NativeAssets
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.ContextRuntimeStatus
@@ -207,6 +208,61 @@ class InferenceService : Service() {
     suspend fun unloadModel(): Result<Unit> {
         val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
         return eng.unloadModel()
+    }
+
+    /** Load the fixed Gemma4 model/mmproj pair before accepting local image input. */
+    suspend fun ensureMultimodalReady(): Result<Unit> {
+        val eng = engine ?: return Result.failure(IllegalStateException("Service 未初始化"))
+        val assets = modelManager.inspectGemma4NativeAssets()
+        if (!assets.sizeVerified) {
+            return Result.failure(IllegalStateException(assets.reason))
+        }
+        val selected = modelManager.getSelectedModel()
+        if (selected?.name?.equals(Gemma4NativeAssets.MAIN_FILENAME, ignoreCase = true) != true) {
+            return Result.failure(
+                IllegalStateException(
+                    "请先选中 Gemma4 主模型 ${Gemma4NativeAssets.MAIN_FILENAME}"
+                )
+            )
+        }
+        val loadResult = ensureModelLoaded(modelContextSize)
+        if (loadResult.isFailure) return loadResult
+        if (eng.multimodalLoaded) return Result.success(Unit)
+
+        val projector = modelManager.openGemma4MmprojForLlama(preferFd = true)
+            .getOrElse { return Result.failure(it) }
+        val projectorResult = eng.loadMultimodalProjector(projector)
+        if (projectorResult.isFailure) return projectorResult
+        val capability = eng.getMultimodalCapability().getOrNull().orEmpty()
+        return if (capability["vision_supported"] == "true") {
+            Result.success(Unit)
+        } else {
+            Result.failure(
+                IllegalStateException(capability["reason"] ?: "MTMD 图像桥接不可用")
+            )
+        }
+    }
+
+    suspend fun generateMultimodal(
+        prompt: String,
+        imageBytes: List<ByteArray>,
+        maxTokens: Int = 1024,
+        temperature: Float = 0.7f,
+        topP: Float = 0.9f,
+    ): Result<String> {
+        if (imageBytes.isEmpty() || imageBytes.size > 4) {
+            return Result.failure(IllegalArgumentException("图片数量必须在 1-4 张之间"))
+        }
+        if (imageBytes.any { it.isEmpty() || it.size > 8 * 1024 * 1024 } ||
+            imageBytes.sumOf { it.size.toLong() } > 16L * 1024 * 1024
+        ) {
+            return Result.failure(IllegalArgumentException("图片总大小超过本地多模态限制"))
+        }
+        val ready = ensureMultimodalReady()
+        if (ready.isFailure) return Result.failure(ready.exceptionOrNull()!!)
+        return engine?.generateMultimodal(
+            prompt, imageBytes, maxTokens, temperature, topP,
+        ) ?: Result.failure(IllegalStateException("Service 未初始化"))
     }
 
     /** Return the intersection of registered Gemma4 assets and compiled JNI MTMD capability. */

@@ -366,7 +366,12 @@ object TaskWorkerProtocol {
             fail("Android worker requires protocol v2", "invalid_version_range", "payload.min_version")
         }
         val capabilities = objectValue(payload, "capabilities")
-        requireExact(capabilities.keys, setOf("stage_types", "engines", "models", "max_concurrency"), "payload.capabilities")
+        val expectedCapabilityFields = setOf("stage_types", "engines", "models", "max_concurrency")
+        requireExact(
+            capabilities.keys,
+            expectedCapabilityFields + if (capabilities.containsKey("resource_gate")) setOf("resource_gate") else emptySet(),
+            "payload.capabilities",
+        )
         val stageTypes = stringList(capabilities, "stage_types")
         if (stageTypes != listOf("full_inference")) {
             fail("Android workers may advertise only full_inference", "invalid_capabilities", "payload.capabilities.stage_types")
@@ -379,6 +384,9 @@ object TaskWorkerProtocol {
         models.forEachIndexed { index, item -> validateModelIdentity(item as? Map<*, *>, "payload.capabilities.models[$index]") }
         val maxConcurrency = integer(capabilities, "max_concurrency")
         if (maxConcurrency != 1) fail("Android workers support one concurrent task", "invalid_capabilities", "payload.capabilities.max_concurrency")
+        if (capabilities.containsKey("resource_gate")) {
+            validateResourceGate(capabilities["resource_gate"] as? Map<*, *>, "payload.capabilities.resource_gate")
+        }
     }
 
     private fun validateHelloAck(payload: Map<String, Any?>, version: Int) {
@@ -461,6 +469,19 @@ object TaskWorkerProtocol {
         requirePattern(value["format"].toString(), safeId, "$field.format")
         requirePattern(value["revision"].toString(), safeId, "$field.revision")
         requireSha(value["sha256"].toString(), "$field.sha256")
+    }
+
+    private fun validateResourceGate(value: Map<*, *>?, field: String) {
+        if (value == null) fail("resource gate must be an object", "invalid_object", field)
+        requireExact(value.keys.map { it.toString() }.toSet(), setOf("admitted", "reason_code"), field)
+        val admitted = value["admitted"]
+        if (admitted !is Boolean) fail("admitted must be a boolean", "invalid_boolean", "$field.admitted")
+        val reason = value["reason_code"]
+        if (reason !is String || (reason.isNotEmpty() && !safeCode.matches(reason))) {
+            fail("reason_code is invalid", "invalid_code", "$field.reason_code")
+        }
+        if (admitted && reason.isNotEmpty()) fail("admitted resource gate cannot carry a reason", "invalid_resource_gate", "$field.reason_code")
+        if (!admitted && reason.isEmpty()) fail("rejected resource gate requires a reason", "invalid_resource_gate", "$field.reason_code")
     }
 
     private fun envelopeSnapshot(envelope: TaskWorkerEnvelope): Map<String, Any?> = mapOf(

@@ -627,6 +627,11 @@ def _validate_image_capabilities(value: Any) -> None:
 def _validate_capabilities(value: Any, *, version: int) -> None:
     capabilities = _require_object(value, "payload.capabilities")
     expected_fields = {"stage_types", "engines", "models", "max_concurrency"}
+    # Optional for backwards compatibility with existing PC workers. Android
+    # workers are admitted only when this gate is present and explicitly true;
+    # the scheduler performs that role-specific check after hello validation.
+    if "resource_gate" in capabilities:
+        expected_fields.add("resource_gate")
     if version >= 3:
         expected_fields.add("image")
     _require_exact_fields(
@@ -705,6 +710,8 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
             "invalid_capabilities", "payload.capabilities.max_concurrency",
             "max_concurrency must not exceed 32",
         )
+    if "resource_gate" in capabilities:
+        _validate_resource_gate(capabilities["resource_gate"])
     if version >= 3:
         if engines != ["diffusers_sd15"]:
             raise _error(
@@ -713,6 +720,27 @@ def _validate_capabilities(value: Any, *, version: int) -> None:
                 "v3 image workers must declare only diffusers_sd15",
             )
         _validate_image_capabilities(capabilities["image"])
+
+
+def _validate_resource_gate(value: Any) -> None:
+    field = "payload.capabilities.resource_gate"
+    gate = _require_object(value, field)
+    _require_exact_fields(gate, {"admitted", "reason_code"}, field)
+    _require_bool(gate["admitted"], f"{field}.admitted")
+    reason = _require_string(
+        gate["reason_code"], f"{field}.reason_code",
+        pattern=_SAFE_CODE, allow_empty=True, max_length=64,
+    )
+    if gate["admitted"] and reason:
+        raise _error(
+            "invalid_resource_gate", f"{field}.reason_code",
+            "an admitted resource gate cannot carry a rejection reason",
+        )
+    if not gate["admitted"] and not reason:
+        raise _error(
+            "invalid_resource_gate", f"{field}.reason_code",
+            "a rejected resource gate must carry a reason code",
+        )
 
 
 def _require_finite_number(

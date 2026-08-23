@@ -129,7 +129,9 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = 120
+ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS = 45
+ANDROID_HTTP_CLIENT_LEASE_SECONDS = 120
+ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS = ANDROID_HTTP_CLIENT_LEASE_SECONDS
 _LAYER_ASSIGNMENT_CACHE_VERSION = 3
 
 
@@ -255,6 +257,9 @@ class NodeInfo:
     task_count: int = 0            # 已完成任务数
     error_count: int = 0           # 错误计数
     model_sha256: str = ""         # 模型 SHA256 校验值（阶段 7）
+    presence_generation: int = 0
+    presence_lease_id: str = ""
+    presence_expires_at: float = 0.0
 
     def is_available(self) -> bool:
         return self.state == NodeState.ONLINE
@@ -277,6 +282,8 @@ class NodeInfo:
             "task_count": self.task_count,
             "error_count": self.error_count,
             "model_sha256": self.model_sha256,
+            "presence_generation": self.presence_generation,
+            "presence_expires_at": self.presence_expires_at,
             "is_available": self.is_available(),
         }
 
@@ -1850,6 +1857,9 @@ class Scheduler:
             if not existing.connected_at:
                 existing.connected_at = now
             existing.last_heartbeat = now
+            existing.presence_generation = max(1, existing.presence_generation + 1)
+            existing.presence_lease_id = uuid.uuid4().hex
+            existing.presence_expires_at = now + ANDROID_HTTP_CLIENT_LEASE_SECONDS
 
         if self._effective_role() == "master":
             self._push_node_update_to_all_clients(
@@ -1865,6 +1875,82 @@ class Scheduler:
             "node_id": node_id,
             "state": existing.state.value,
             "message": "Android HTTP thin client online",
+            "server_time_ms": int(now * 1000),
+            "presence_generation": existing.presence_generation,
+            "presence_lease_id": existing.presence_lease_id,
+            "lease_expires_at_ms": int(existing.presence_expires_at * 1000),
+            "heartbeat_interval_seconds": ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS,
+        }
+
+    def heartbeat_android_client(self, node_id: str, presence_generation: int = 0,
+                                 presence_lease_id: str = "", http_peer: str = "") -> dict:
+        """Refresh one Android presence lease without re-registering the node.
+
+        A lease is deliberately fenced by both a monotonically increasing generation
+        and an opaque id. This prevents a delayed request from an older app process
+        from reviving a newer registration.
+        """
+        if self._effective_role() != "master":
+            return {"status": "denied", "reason": "仅主节点可接收 Android 心跳", "error_code": "not_master"}
+        if not node_id or node_id == "master":
+            return {"status": "invalid", "reason": "Android node_id 无效", "error_code": "invalid_node_id"}
+
+        now = time.time()
+        expired_node = None
+        with self._nodes_lock:
+            existing = self.nodes.get(node_id)
+            if existing is None or existing.node_type != "android":
+                return {
+                    "status": "rejected", "reason": "Android presence 尚未注册",
+                    "error_code": "presence_not_registered",
+                }
+            if existing.role == NodeRole.MASTER:
+                return {"status": "invalid", "reason": f"'{node_id}' 是主节点，不可心跳", "error_code": "invalid_node_id"}
+            if not presence_generation or not presence_lease_id:
+                return {
+                    "status": "rejected", "reason": "缺少 Android presence lease",
+                    "error_code": "presence_lease_required",
+                }
+            if presence_generation != existing.presence_generation:
+                return {
+                    "status": "rejected", "reason": "Android presence generation 已过期",
+                    "error_code": "stale_generation",
+                }
+            if presence_lease_id != existing.presence_lease_id:
+                return {
+                    "status": "rejected", "reason": "Android presence lease 已过期",
+                    "error_code": "stale_lease",
+                }
+            if existing.presence_expires_at and now >= existing.presence_expires_at:
+                existing.state = NodeState.OFFLINE
+                expired_node = existing
+            else:
+                existing.state = NodeState.ONLINE
+                existing.last_heartbeat = now
+                existing.presence_expires_at = now + ANDROID_HTTP_CLIENT_LEASE_SECONDS
+                if http_peer:
+                    existing.device_info = dict(existing.device_info or {})
+                    existing.device_info["http_peer"] = http_peer
+
+        if expired_node is not None:
+            if self._effective_role() == "master":
+                self._push_node_update_to_all_clients(node_id, "update", expired_node)
+            return {
+                "status": "rejected", "reason": "Android presence lease 已过期，请重新注册",
+                "error_code": "lease_expired",
+            }
+
+        if self._effective_role() == "master":
+            self._push_node_update_to_all_clients(node_id, "update", existing)
+        return {
+            "status": "heartbeat",
+            "node_id": node_id,
+            "state": existing.state.value,
+            "server_time_ms": int(now * 1000),
+            "presence_generation": existing.presence_generation,
+            "presence_lease_id": existing.presence_lease_id,
+            "lease_expires_at_ms": int(existing.presence_expires_at * 1000),
+            "heartbeat_interval_seconds": ANDROID_HTTP_CLIENT_HEARTBEAT_INTERVAL_SECONDS,
         }
 
     def _refresh_http_client_states(self, now: float = None) -> None:
@@ -1879,7 +1965,8 @@ class Scheduler:
                 if info.get("connection_type") != "http_thin":
                     continue
                 if node.state == NodeState.ONLINE and node.last_heartbeat:
-                    if now - node.last_heartbeat > ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS:
+                    lease_expired = node.presence_expires_at and now >= node.presence_expires_at
+                    if lease_expired or now - node.last_heartbeat > ANDROID_HTTP_CLIENT_TIMEOUT_SECONDS:
                         node.state = NodeState.OFFLINE
                         changed.append(node)
 
@@ -6189,6 +6276,11 @@ class Scheduler:
                         code="invalid_message_direction",
                         field="message_type",
                     )
+                worker_kind = (
+                    message.payload.get("worker_kind")
+                    if message.message_type == "hello"
+                    else ""
+                )
                 with self._nodes_lock:
                     registered_node = self.nodes.get(client_id)
                     registered_role = getattr(
@@ -6196,18 +6288,31 @@ class Scheduler:
                         "value",
                         getattr(registered_node, "role", ""),
                     )
-                    admitted_pc_worker = bool(
+                    admitted_worker_node = bool(
                         registered_node is not None
-                        and registered_node.node_type == "pc"
+                        and registered_node.node_type in {"pc", "android"}
                         and registered_role == NodeRole.CLIENT.value
                     )
-                if not admitted_pc_worker:
+                if not admitted_worker_node:
                     self._task_worker_control.record_rejection()
                     raise WorkerProtocolError(
-                        "only a registered PC client may negotiate a full worker",
+                        "only a registered PC or Android client may negotiate a full worker",
                         code="unsupported_worker_node",
                         field="payload.worker_kind",
                     )
+                if message.message_type == "hello":
+                    expected_kind = (
+                        "android_full_worker"
+                        if registered_node.node_type == "android"
+                        else "pc_full_worker"
+                    )
+                    if worker_kind != expected_kind:
+                        self._task_worker_control.record_rejection()
+                        raise WorkerProtocolError(
+                            "worker kind does not match the registered node type",
+                            code="worker_kind_node_type_mismatch",
+                            field="payload.worker_kind",
+                        )
                 if message.message_type == "hello":
                     ack = self._task_worker_control.receive_on_coordinator(
                         client_id,
@@ -6448,6 +6553,14 @@ class Scheduler:
                 for worker in healthy_workers
                 if isinstance(worker.get("capabilities"), dict)
                 and bool(worker["capabilities"].get("models"))
+                and (
+                    worker.get("worker_kind") != "android_full_worker"
+                    or (
+                        isinstance(worker["capabilities"].get("resource_gate"), dict)
+                        and worker["capabilities"]["resource_gate"].get("admitted") is True
+                        and not worker["capabilities"]["resource_gate"].get("reason_code")
+                    )
+                )
             )
             workers_missing_full_model = sorted(
                 str(worker.get("node_id", ""))

@@ -246,6 +246,45 @@ class ModelManager(private val context: Context) {
             }
         }
 
+    /** Open the fixed Gemma4 mmproj from the same user-owned storage root. */
+    suspend fun openGemma4MmprojForLlama(preferFd: Boolean = true): Result<ModelOpenHandle> =
+        withContext(Dispatchers.IO) {
+            try {
+                val treeUri = getSavedTreeUri()
+                if (treeUri != null && hasPersistedPermission(treeUri)) {
+                    val document = listSafModels(treeUri).firstOrNull {
+                        it.name.equals(Gemma4NativeAssets.MMPROJ_FILENAME, ignoreCase = true)
+                    } ?: return@withContext Result.failure(
+                        IOException("未找到 Gemma4 mmproj: ${Gemma4NativeAssets.MMPROJ_FILENAME}")
+                    )
+                    if (preferFd && settings.getModelStorageMode() != STORAGE_MODE_SAF_CACHE) {
+                        openSafFd(document.uri).onSuccess {
+                            return@withContext Result.success(it)
+                        }
+                    }
+                    return@withContext openSafCachedCopy(document.uri)
+                }
+
+                val file = File(modelsDir, Gemma4NativeAssets.MMPROJ_FILENAME)
+                if (!file.exists() || !file.canRead()) {
+                    return@withContext Result.failure(
+                        IOException("未找到 Gemma4 mmproj: ${file.name}")
+                    )
+                }
+                Result.success(
+                    ModelOpenHandle(
+                        loadPath = file.absolutePath,
+                        displayName = file.name,
+                        sourceUri = Uri.fromFile(file),
+                        mode = STORAGE_MODE_INTERNAL_TEST,
+                        pfd = null,
+                    )
+                )
+            } catch (error: Exception) {
+                Result.failure(error)
+            }
+        }
+
     suspend fun deleteSelectedModel(): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val selectedUri = settings.getSelectedModelUri()

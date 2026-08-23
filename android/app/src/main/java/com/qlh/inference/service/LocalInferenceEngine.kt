@@ -62,8 +62,16 @@ class LocalInferenceEngine(private val context: Context) {
     var loadedModelSourceUri: String = ""
         private set
 
+    /** Whether a verified/loaded MTMD projector is attached to the model. */
+    @Volatile
+    var multimodalLoaded: Boolean = false
+        private set
+
     /** SAF fd 或缓存加载句柄。模型卸载前必须保持 fd 存活。 */
     private var modelOpenHandle: ModelManager.ModelOpenHandle? = null
+
+    /** mmproj fd/cache handle retained until the native projector is released. */
+    private var multimodalOpenHandle: ModelManager.ModelOpenHandle? = null
 
     /** 引擎是否就绪 */
     val isLoaded: Boolean get() = modelPtr != 0L && nativeLoaded
@@ -232,6 +240,70 @@ class LocalInferenceEngine(private val context: Context) {
         }
     }
 
+    /** Load the user-owned Gemma4 mmproj beside the already loaded text model. */
+    suspend fun loadMultimodalProjector(handle: ModelManager.ModelOpenHandle): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            if (!isLoaded) {
+                handle.close()
+                return@withContext Result.failure(IllegalStateException("模型未加载"))
+            }
+            try {
+                val previousHandle = multimodalOpenHandle
+                val loaded = nativeLoadMultimodalProjector(modelPtr, handle.loadPath)
+                previousHandle?.close()
+                multimodalOpenHandle = null
+                if (!loaded) {
+                    handle.close()
+                    multimodalLoaded = false
+                    Result.failure(IllegalStateException("mmproj 加载失败"))
+                } else {
+                    multimodalOpenHandle = handle
+                    multimodalLoaded = true
+                    Result.success(Unit)
+                }
+            } catch (error: Exception) {
+                handle.close()
+                multimodalLoaded = false
+                Result.failure(error)
+            }
+        }
+
+    /** Run bounded in-memory images through the loaded MTMD projector. */
+    suspend fun generateMultimodal(
+        prompt: String,
+        imageBytes: List<ByteArray>,
+        maxTokens: Int = 1024,
+        temperature: Float = 0.7f,
+        topP: Float = 0.9f,
+    ): Result<String> = withContext(Dispatchers.IO) {
+        if (!isLoaded || !multimodalLoaded) {
+            return@withContext Result.failure(IllegalStateException("mmproj 未加载"))
+        }
+        if (imageBytes.isEmpty()) {
+            return@withContext Result.failure(IllegalArgumentException("至少需要一张图片"))
+        }
+        try {
+            val markedPrompt = if (prompt.contains("<__media__>")) {
+                prompt
+            } else {
+                "<__media__>\n$prompt"
+            }
+            Result.success(
+                nativeGenerateMultimodal(
+                    modelPtr,
+                    markedPrompt,
+                    imageBytes.toTypedArray(),
+                    maxTokens,
+                    temperature,
+                    topP,
+                ) { _ -> },
+            )
+        } catch (error: Exception) {
+            Log.e(TAG, "多模态推理失败", error)
+            Result.failure(error)
+        }
+    }
+
     private fun unloadModelInternal() {
         if (modelPtr != 0L) {
             try {
@@ -246,6 +318,9 @@ class LocalInferenceEngine(private val context: Context) {
         }
         modelOpenHandle?.close()
         modelOpenHandle = null
+        multimodalOpenHandle?.close()
+        multimodalOpenHandle = null
+        multimodalLoaded = false
     }
 
     // ================================================================
@@ -343,7 +418,7 @@ class LocalInferenceEngine(private val context: Context) {
             return@withContext Result.failure(libResult.exceptionOrNull()!!)
         }
         try {
-            Result.success(nativeGetMultimodalCapability())
+            Result.success(nativeGetMultimodalCapability(modelPtr))
         } catch (e: Throwable) {
             Result.failure(e)
         }
@@ -382,6 +457,9 @@ class LocalInferenceEngine(private val context: Context) {
     /** 释放模型内存 */
     private external fun nativeFreeModel(modelPtr: Long)
 
+    /** Attach a GGUF mmproj to an already loaded text model. */
+    private external fun nativeLoadMultimodalProjector(modelPtr: Long, mmprojPath: String): Boolean
+
     /**
      * 执行自回归生成。
      * @param modelPtr 模型指针
@@ -401,6 +479,17 @@ class LocalInferenceEngine(private val context: Context) {
         onToken: (String) -> Unit
     ): String
 
+    /** Execute one bounded multimodal prompt with in-memory encoded images. */
+    private external fun nativeGenerateMultimodal(
+        modelPtr: Long,
+        prompt: String,
+        imageBytes: Array<ByteArray>,
+        maxTokens: Int,
+        temperature: Float,
+        topP: Float,
+        onToken: (String) -> Unit,
+    ): String
+
     /** 获取模型元数据（name, arch, n_params, n_layers 等） */
     private external fun nativeGetModelInfo(modelPtr: Long): Map<String, String>
 
@@ -408,7 +497,7 @@ class LocalInferenceEngine(private val context: Context) {
     private external fun nativeGetBackendInfo(): Map<String, String>
 
     /** 获取 Android MTMD 图像/音频桥接能力。 */
-    private external fun nativeGetMultimodalCapability(): Map<String, String>
+    private external fun nativeGetMultimodalCapability(modelPtr: Long): Map<String, String>
 
     /** 获取最近一次生成的 token 和耗时统计。 */
     private external fun nativeGetLastGenerationStats(modelPtr: Long): Map<String, String>
