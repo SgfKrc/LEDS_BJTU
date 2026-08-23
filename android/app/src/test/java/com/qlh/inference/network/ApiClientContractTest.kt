@@ -7,6 +7,8 @@ import com.qlh.inference.security.StoredAuthSession
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -270,6 +272,159 @@ class ApiClientContractTest {
         assertTrue(result.isFailure)
         assertEquals(null, store.session)
         assertTrue(store.clearCount >= 1)
+    }
+
+    // ---- AND-CTRL-05 前置：管理摘要 / 审计 / 二次确认 ----
+
+    @Test
+    fun `manage summary is authenticated and projects manager matrix`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/manage/summary") { req, reply ->
+            seen = req
+            reply(
+                200,
+                """{"role":"owner","policy_version":"and-ctrl-05-v1","audit_available":true,"confirm_ttl_seconds":120,
+                    "actions":{"user_manage":{"allowed":true,"confirm_required":true,"audited":true,"description":"成员管理"},
+                               "tailnet_bind":{"allowed":true,"confirm_required":true,"audited":true,"description":"绑定撤销"},
+                               "review_admin":{"allowed":true,"confirm_required":false,"audited":false,"description":"审批域"}},
+                    "counts":{"users":3,"bindings":2},"review_admin_auth_pending":true}""",
+            )
+        }
+
+        val result = runBlocking { client.fetchManageSummary() }
+        assertTrue(result.isSuccess)
+        assertEquals("GET", seen?.method)
+        assertEquals("owner", result.getOrNull()?.role)
+        assertEquals(true, result.getOrNull()?.actions?.get("user_manage")?.allowed)
+        assertEquals(true, result.getOrNull()?.actions?.get("user_manage")?.confirmRequired)
+        assertEquals(false, result.getOrNull()?.actions?.get("review_admin")?.confirmRequired)
+        assertEquals(true, result.getOrNull()?.reviewAdminAuthPending)
+        // 管理端点必须带 Bearer
+        assertNotNull(seen?.headers?.entries?.firstOrNull { it.key.equals("Authorization", ignoreCase = true) })
+    }
+
+    @Test
+    fun `manage audit is bounded client side and parses redacted events`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/manage/audit?limit=5") { req, reply ->
+            seen = req
+            reply(
+                200,
+                """{"events":[
+                    {"event_id":"e1","event_type":"user_revoked","outcome":"success","reason_code":null,
+                     "actor_user_id":"user-1","user_id":"user-2","subject_id":"user-2","created_at":"2026-08-23T00:00:00.000Z"},
+                    {"event_id":"e2","event_type":"tailscale_binding_revoked","outcome":"success","reason_code":null,
+                     "actor_user_id":"user-1","user_id":"user-2","subject_id":"binding-1","created_at":"2026-08-23T00:01:00.000Z"}]}""",
+            )
+        }
+
+        val result = runBlocking { client.fetchManageAudit(limit = 5) }
+        assertTrue(result.isSuccess)
+        assertEquals("/api/auth/manage/audit?limit=5", seen?.path)
+        val events = result.getOrNull()?.events.orEmpty()
+        assertEquals(2, events.size)
+        assertEquals("user_revoked", events[0].eventType)
+        assertEquals("binding-1", events[1].subjectId)
+        // 脱敏契约：无 details/token 字段可直接消费
+        assertTrue(events.none { it.eventType.contains("secret", ignoreCase = true) })
+    }
+
+    @Test
+    fun `manage confirm issues token then revoke carries it in header`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        val issued = mutableListOf<String>()
+        route("/api/auth/manage/confirm") { req, reply ->
+            issued += parseJson(req.body).get("action").asString
+            reply(200, """{"confirm_token":"ct_1234567890abcdef","expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage","target_id":"user-9"}""")
+        }
+        var revokeSeen: Request? = null
+        route("/api/auth/users/user-9") { req, reply ->
+            revokeSeen = req
+            reply(200, """{"status":"revoked","user":{"user_id":"user-9","username":"member"}}""")
+        }
+
+        val confirmation = runBlocking { client.requestManageConfirm("user_manage", "user-9") }
+        assertTrue(confirmation.isSuccess)
+        assertEquals("user_manage", issued.firstOrNull())
+        val token = confirmation.getOrNull()?.confirmToken.orEmpty()
+        assertFalse(token.isBlank())
+
+        val revoke = runBlocking { client.revokeUser("user-9", expectedVersion = 1, confirmToken = token) }
+        assertTrue(revoke.isSuccess)
+        assertEquals("DELETE", revokeSeen?.method)
+        assertEquals("ct_1234567890abcdef", revokeSeen?.headers?.entries?.firstOrNull {
+            it.key.equals("X-QLH-Confirm-Token", ignoreCase = true)
+        }?.value)
+    }
+
+    @Test
+    fun `revoking own tailscale binding may omit confirm token while cross-user revoke fails without it`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/tailscale/bindings/binding-5/revoke") { req, reply ->
+            seen = req
+            reply(200, """{"status":"revoked","binding":{"binding_id":"binding-5","state":"revoked"}}""")
+        }
+        // 自撤销（无 token 头）
+        val own = runBlocking { client.revokeTailscaleBinding("binding-5") }
+        assertTrue(own.isSuccess)
+        assertEquals("POST", seen?.method)
+        assertTrue(seen?.headers?.keys?.none { it.equals("X-QLH-Confirm-Token", ignoreCase = true) } == true)
+        // 跨用户管理（带头）
+        val crossSeen = arrayOf<Request?>(null)
+        route("/api/auth/tailscale/bindings/binding-6/revoke") { req, reply ->
+            crossSeen[0] = req
+            reply(200, """{"status":"revoked","binding":{"binding_id":"binding-6","state":"revoked"}}""")
+        }
+        val cross = runBlocking { client.revokeTailscaleBinding("binding-6", confirmToken = "ct_cross") }
+        assertTrue(cross.isSuccess)
+        assertEquals("ct_cross", crossSeen[0]?.headers?.entries?.firstOrNull {
+            it.key.equals("X-QLH-Confirm-Token", ignoreCase = true)
+        }?.value)
+    }
+
+    @Test
+    fun `revoking user without confirm token fails without hitting network`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var hitServer = false
+        route("/api/auth/users/user-9") { _, reply -> hitServer = true; reply(200, "{}") }
+
+        val result = runBlocking { client.revokeUser("user-9", expectedVersion = 1, confirmToken = "") }
+        assertTrue(result.isFailure)
+        assertFalse(hitServer)
+    }
+
+    @Test
+    fun `manage confirm rejects invalid token response`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        route("/api/auth/manage/confirm") { _, reply ->
+            reply(200, """{"expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage"}""")
+        }
+
+        val result = runBlocking { client.requestManageConfirm("user_manage", "user-9") }
+        assertTrue(result.isFailure)
+    }
+
+    @Test
+    fun `manage audit clamps limit to server bound`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/manage/audit?limit=200") { req, reply ->
+            seen = req
+            reply(200, """{"events":[]}""")
+        }
+        val result = runBlocking { client.fetchManageAudit(limit = 500) }
+        assertTrue(result.isSuccess)
+        assertEquals("/api/auth/manage/audit?limit=200", seen?.path)
     }
 
     // ---- chat ----

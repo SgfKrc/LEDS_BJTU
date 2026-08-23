@@ -554,6 +554,49 @@ data class AuthSessionResponse(
     val user: AuthUser = AuthUser(),
 )
 
+// ---- AND-CTRL-05 前置契约：管理授权矩阵摘要 / 审计 / 二次确认 ----
+
+data class ManageActionRule(
+    val allowed: Boolean = false,
+    @SerializedName("confirm_required") val confirmRequired: Boolean = false,
+    val audited: Boolean = false,
+    val description: String = "",
+)
+
+data class ManageSummaryResponse(
+    val role: String = "",
+    @SerializedName("policy_version") val policyVersion: String = "",
+    @SerializedName("audit_available") val auditAvailable: Boolean = false,
+    @SerializedName("confirm_ttl_seconds") val confirmTtlSeconds: Int = 120,
+    val actions: Map<String, ManageActionRule> = emptyMap(),
+    val counts: Map<String, Int> = emptyMap(),
+    @SerializedName("review_admin_auth_pending") val reviewAdminAuthPending: Boolean = true,
+)
+
+data class ManageAuditEvent(
+    @SerializedName("event_id") val eventId: String = "",
+    @SerializedName("event_type") val eventType: String = "",
+    val outcome: String = "",
+    @SerializedName("reason_code") val reasonCode: String? = null,
+    @SerializedName("actor_user_id") val actorUserId: String? = null,
+    @SerializedName("user_id") val userId: String? = null,
+    @SerializedName("subject_id") val subjectId: String? = null,
+    @SerializedName("created_at") val createdAt: String = "",
+)
+
+data class ManageAuditResponse(
+    val events: List<ManageAuditEvent> = emptyList(),
+)
+
+data class ManageConfirmResponse(
+    @SerializedName("confirm_token") val confirmToken: String = "",
+    @SerializedName("expires_at") val expiresAt: String = "",
+    val action: String = "",
+    @SerializedName("target_id") val targetId: String = "",
+) {
+    fun isValid(): Boolean = confirmToken.isNotBlank() && action.isNotBlank()
+}
+
 // ================================================================
 // API 客户端
 // ================================================================
@@ -681,6 +724,100 @@ class ApiClient(
             Result.failure(e)
         } finally {
             authStore?.clear()
+        }
+    }
+
+    // ==================== AND-CTRL-05 前置：管理摘要/审计/二次确认 ====================
+
+    /** 管理授权矩阵摘要（仅 owner/admin 有完整内容；member 侧 allowed=false）。 */
+    suspend fun fetchManageSummary(): Result<ManageSummaryResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/manage/summary")
+                .get()
+                .build()
+            executeJson(request, ManageSummaryResponse::class.java)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** 管理写操作审计列表（只读，服务端有界分页；Android 不信任调用方 page size）。 */
+    suspend fun fetchManageAudit(limit: Int = 50): Result<ManageAuditResponse> = withContext(Dispatchers.IO) {
+        try {
+            val bounded = limit.coerceIn(1, 200)
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/manage/audit?limit=$bounded")
+                .get()
+                .build()
+            executeJson(request, ManageAuditResponse::class.java)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** 危险管理写操作的一次性确认令牌（二次确认第一步）。 */
+    suspend fun requestManageConfirm(action: String, targetId: String): Result<ManageConfirmResponse> = withContext(Dispatchers.IO) {
+        try {
+            require(action.isNotBlank()) { "action is required" }
+            val payload = "{\"action\":\"${action}\",\"target_id\":\"${targetId}\"}"
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/manage/confirm")
+                .post(payload.toRequestBody(jsonMediaType))
+                .header("Content-Type", "application/json")
+                .build()
+            val response = executeAsync(request)
+            val body = response.body?.string() ?: "{}"
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}: ${response.message}"))
+            }
+            val confirmation = gson.fromJson(body, ManageConfirmResponse::class.java)
+            if (!confirmation.isValid()) {
+                return@withContext Result.failure(IOException("confirm token response invalid"))
+            }
+            Result.success(confirmation)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** 撤销用户（管理写操作，需先 requestManageConfirm("user_manage", userId) 取令牌）。 */
+    suspend fun revokeUser(userId: String, expectedVersion: Int, confirmToken: String): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            require(confirmToken.isNotBlank()) { "confirm token is required for revoke" }
+            val payload = "{\"expected_version\":$expectedVersion}"
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/users/${userId}")
+                .delete(payload.toRequestBody(jsonMediaType))
+                .header("Content-Type", "application/json")
+                .header("X-QLH-Confirm-Token", confirmToken)
+                .build()
+            val response = executeAsync(request)
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}"))
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** 撤销 Tailnet 绑定（跨用户需确认令牌；成员撤销自己绑定免确认）。 */
+    suspend fun revokeTailscaleBinding(bindingId: String, confirmToken: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val builder = Request.Builder()
+                .url("$baseUrl/api/auth/tailscale/bindings/$bindingId/revoke")
+                .post(ByteArray(0).toRequestBody(null))
+            if (!confirmToken.isNullOrBlank()) {
+                builder.header("X-QLH-Confirm-Token", confirmToken)
+            }
+            val response = executeAsync(builder.build())
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(IOException("HTTP ${response.code}"))
+            }
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 
