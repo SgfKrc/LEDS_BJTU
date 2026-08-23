@@ -126,6 +126,20 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
     expect(body.review_admin_auth_pending).toBe(true);
   });
 
+  it('② member is rejected from manage summary (contract aligns with gateway)', async () => {
+    const owner = await ownerSession();
+    const member = await memberSession(owner);
+    const summary = await app.inject({
+      method: 'GET',
+      url: '/auth/manage/summary',
+      headers: { authorization: `Bearer ${member}` },
+    });
+    // 管理摘要即管理功能：member 403（与 gateway manager-only 语义一致，
+    // 不向成员暴露管理入口投影）
+    expect(summary.statusCode).toBe(403);
+    expect(summary.json().message).toContain('owner 或 admin');
+  });
+
   it('③ audit endpoint is manager-only and bounded', async () => {
     const owner = await ownerSession();
     const member = await memberSession(owner);
@@ -136,7 +150,17 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
       url: '/auth/manage/audit',
       headers: { authorization: `Bearer ${member}` },
     });
-    expect(forbidden.statusCode).toBe(403);
+    expect(forbidden.statusCode).toBe(403); // member 访问 audit 应 403
+
+    // 超限 limit 被服务端有界截断（≤200 项，这里用 5000 验证不 5xx）
+    const oversize = await app.inject({
+      method: 'GET',
+      url: '/auth/manage/audit?limit=5000',
+      headers: { authorization: `Bearer ${owner.token}` },
+    });
+    expect(oversize.statusCode).toBe(200);
+    expect((oversize.json() as { events: unknown[] }).events.length)
+      .toBeLessThanOrEqual(200);
 
     // owner 200（空库也有 bootstrap/login 事件）
     const ok = await app.inject({
@@ -168,7 +192,7 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
       headers: { authorization: `Bearer ${owner.token}` },
       payload: { expected_version: victim.aggregate_version },
     });
-    expect(noToken.statusCode).toBe(403);
+    expect(noToken.statusCode).toBe(403); // 无确认令牌应 403
 
     // 错误 token → 403
     const badToken = await app.inject({
@@ -177,7 +201,7 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
       headers: { authorization: `Bearer ${owner.token}`, 'x-qlh-confirm-token': 'garbage' },
       payload: { expected_version: victim.aggregate_version },
     });
-    expect(badToken.statusCode).toBe(403);
+    expect(badToken.statusCode).toBe(403); // 错误令牌应 403
 
     // 先确认再撤销 → 200
     const confirm = await app.inject({
@@ -220,7 +244,7 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
       headers: { authorization: `Bearer ${owner.token}` },
       payload: { action: 'no_such_action', target_id: 'u-1' },
     });
-    expect(unknown.statusCode).toBe(422);
+    expect(unknown.statusCode).toBe(422); // 未知 action 应 422
 
     const missingTarget = await app.inject({
       method: 'POST',
@@ -228,7 +252,7 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
       headers: { authorization: `Bearer ${owner.token}` },
       payload: { action: 'user_manage' },
     });
-    expect(missingTarget.statusCode).toBe(422);
+    expect(missingTarget.statusCode).toBe(422); // 缺 target_id 应 422
 
     const memberTry = await app.inject({
       method: 'POST',
@@ -236,6 +260,6 @@ describe('AND-CTRL-05 management contract (② matrix / ③ audit / ④ confirm)
       headers: { authorization: `Bearer ${member}` },
       payload: { action: 'user_manage', target_id: 'u-1' },
     });
-    expect(memberTry.statusCode).toBe(403);
+    expect(memberTry.statusCode).toBe(403); // member 发确认应 403
   });
 });

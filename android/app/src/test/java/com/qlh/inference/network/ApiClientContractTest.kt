@@ -310,15 +310,16 @@ class ApiClientContractTest {
         val store = FakeAuthStore(storedSession())
         client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
         var seen: Request? = null
+        val auditResponseJson = """{"events":[
+            {"event_id":"e1","event_type":"user_revoked","outcome":"success","reason_code":null,
+             "actor_user_id":"user-1","user_id":"user-2","subject_id":"user-2","created_at":"2026-08-23T00:00:00.000Z"},
+            {"event_id":"e2","event_type":"tailscale_binding_revoked","outcome":"success","reason_code":null,
+             "actor_user_id":"user-1","user_id":"user-2","subject_id":"binding-1","created_at":"2026-08-23T00:01:00.000Z"}]}"""
         route("/api/auth/manage/audit?limit=5") { req, reply ->
             seen = req
             reply(
                 200,
-                """{"events":[
-                    {"event_id":"e1","event_type":"user_revoked","outcome":"success","reason_code":null,
-                     "actor_user_id":"user-1","user_id":"user-2","subject_id":"user-2","created_at":"2026-08-23T00:00:00.000Z"},
-                    {"event_id":"e2","event_type":"tailscale_binding_revoked","outcome":"success","reason_code":null,
-                     "actor_user_id":"user-1","user_id":"user-2","subject_id":"binding-1","created_at":"2026-08-23T00:01:00.000Z"}]}""",
+                auditResponseJson,
             )
         }
 
@@ -329,17 +330,24 @@ class ApiClientContractTest {
         assertEquals(2, events.size)
         assertEquals("user_revoked", events[0].eventType)
         assertEquals("binding-1", events[1].subjectId)
-        // 脱敏契约：无 details/token 字段可直接消费
-        assertTrue(events.none { it.eventType.contains("secret", ignoreCase = true) })
+        // 脱敏契约：原始响应体不得含 details/token 类键（data class 会静默丢弃，
+        // 必须对原始 JSON 断言才能防回归）
+        val raw = JsonParser.parseString(auditResponseJson).asJsonObject.getAsJsonArray("events")
+        raw.forEach { element ->
+            val event = element.asJsonObject
+            assertFalse("脱敏契约：审计事件不得含 details", event.has("details"))
+            assertFalse("脱敏契约：审计事件不得含 token", event.has("token"))
+        }
     }
 
     @Test
     fun `manage confirm issues token then revoke carries it in header`() {
         val store = FakeAuthStore(storedSession())
         client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
-        val issued = mutableListOf<String>()
+        val issued = mutableListOf<Pair<String, String>>()
         route("/api/auth/manage/confirm") { req, reply ->
-            issued += parseJson(req.body).get("action").asString
+            val body = parseJson(req.body)
+            issued += body.get("action").asString to body.get("target_id").asString
             reply(200, """{"confirm_token":"ct_1234567890abcdef","expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage","target_id":"user-9"}""")
         }
         var revokeSeen: Request? = null
@@ -350,7 +358,7 @@ class ApiClientContractTest {
 
         val confirmation = runBlocking { client.requestManageConfirm("user_manage", "user-9") }
         assertTrue(confirmation.isSuccess)
-        assertEquals("user_manage", issued.firstOrNull())
+        assertEquals("user_manage" to "user-9", issued.firstOrNull())
         val token = confirmation.getOrNull()?.confirmToken.orEmpty()
         assertFalse(token.isBlank())
 
@@ -360,6 +368,8 @@ class ApiClientContractTest {
         assertEquals("ct_1234567890abcdef", revokeSeen?.headers?.entries?.firstOrNull {
             it.key.equals("X-QLH-Confirm-Token", ignoreCase = true)
         }?.value)
+        // revoke 请求体必须携带 expected_version
+        assertEquals(1, parseJson(revokeSeen!!.body).get("expected_version").asInt)
     }
 
     @Test

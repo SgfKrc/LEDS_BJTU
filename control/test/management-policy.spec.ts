@@ -66,11 +66,20 @@ describe('ConfirmTokenStore (票④ 二次确认令牌)', () => {
   });
 
   it('rejects mismatched action/target/role/actor', () => {
-    const record = store.issue('user_manage', 'user-1', 'admin', 'actor-1');
-    expect(store.consume('tailnet_bind', 'user-1', 'admin', 'actor-1', record.token)).toBeNull();
-    expect(store.consume('user_manage', 'user-2', 'admin', 'actor-1', record.token)).toBeNull();
-    expect(store.consume('user_manage', 'user-1', 'owner', 'actor-1', record.token)).toBeNull();
-    expect(store.consume('user_manage', 'user-1', 'admin', 'actor-2', record.token)).toBeNull();
+    // 每个不匹配维度独立签发 token：否则前一个断言已消费令牌，
+    // 后三个断言会退化为「已消费返回 null」的假绿。
+    const mismatches: Array<[string, string, string, string]> = [
+      ['tailnet_bind', 'user-1', 'admin', 'actor-1'], // action 不匹配
+      ['user_manage', 'user-2', 'admin', 'actor-1'], // target 不匹配
+      ['user_manage', 'user-1', 'owner', 'actor-1'], // role 不匹配
+      ['user_manage', 'user-1', 'admin', 'actor-2'], // actor 不匹配
+    ];
+    for (const [action, targetId, role, actorUserId] of mismatches) {
+      const record = store.issue('user_manage', 'user-1', 'admin', 'actor-1');
+      expect(
+        store.consume(action as 'user_manage' | 'tailnet_bind', targetId, role, actorUserId, record.token),
+      ).toBeNull();
+    }
   });
 
   it('rejects expired tokens (still single-use: consumed on attempt)', () => {

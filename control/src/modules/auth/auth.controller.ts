@@ -188,6 +188,11 @@ export class AuthController {
   manageSummary(@Req() req: FastifyRequest): Record<string, unknown> {
     return this.runSync(() => {
       const session = this.currentSession(req);
+      // 管理摘要即管理功能：契约面与 gateway 语义一致，member 直接 403
+      //（低权限投影由前端按 role 自理，不向 member 暴露管理入口）。
+      if (!roleAllows('user_manage', session.user.role)) {
+        throw new AuthServiceError(403, '需要 owner 或 admin 权限');
+      }
       const role = session.user.role;
       const actions: Record<string, unknown> = {};
       for (const [action, rule] of Object.entries(MANAGEMENT_POLICY) as Array<[ManagementAction, typeof MANAGEMENT_POLICY[ManagementAction]]>) {
