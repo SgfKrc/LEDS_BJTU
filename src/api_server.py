@@ -6939,6 +6939,21 @@ def _workflow_safe_timestamp(value: Any) -> float:
         return 0.0
 
 
+def _workflow_safe_duration(value: Any) -> float:
+    try:
+        duration = float(value or 0.0)
+        return duration if duration == duration and 0 <= duration <= 1e12 else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _workflow_safe_code(value: Any) -> str:
+    code = str(value or "").strip()
+    return code[:64] if code and all(
+        char.isalnum() or char in "_.:-" for char in code
+    ) else ""
+
+
 def _workflow_observability(snapshot: dict) -> dict:
     stages = snapshot.get("stages", [])
     if not isinstance(stages, list):
@@ -7035,8 +7050,94 @@ def _public_workflow(snapshot: dict, journal: dict) -> dict:
     return public
 
 
+def _public_workflow_summary(snapshot: dict, journal: dict) -> dict:
+    """Return the bounded, content-free projection used by mobile audit views.
+
+    The normal workflow endpoint intentionally remains detailed for the desktop
+    control plane.  Mobile clients must never receive prompts, input bindings,
+    raw provider errors, model identities, lease material, paths, or output
+    metadata merely to render activity status.
+    """
+    stages = snapshot.get("stages", [])
+    if not isinstance(stages, list):
+        stages = []
+    safe_stages = []
+    for stage in stages[:8]:
+        if not isinstance(stage, dict):
+            continue
+        attempts = stage.get("attempts", [])
+        if not isinstance(attempts, list):
+            attempts = []
+        safe_attempts = []
+        for attempt in attempts[:4]:
+            if not isinstance(attempt, dict):
+                continue
+            safe_attempts.append({
+                "attempt_id": str(attempt.get("attempt_id", "") or ""),
+                "provider_kind": str(attempt.get("provider_kind", "") or ""),
+                "provider_node_id": str(attempt.get("provider_node_id", "") or ""),
+                "state": str(attempt.get("state", "unknown") or "unknown"),
+                "error_code": _workflow_safe_code(attempt.get("error_code")),
+                "started_at": _workflow_safe_timestamp(attempt.get("started_at")),
+                "finished_at": _workflow_safe_timestamp(attempt.get("finished_at")),
+                "duration_seconds": _workflow_safe_duration(attempt.get("duration_seconds")),
+            })
+        safe_stages.append({
+            "stage_id": str(stage.get("stage_id", "") or ""),
+            "stage_type": str(stage.get("stage_type", "") or ""),
+            "state": str(stage.get("state", "unknown") or "unknown"),
+            "started_at": _workflow_safe_timestamp(stage.get("started_at")),
+            "finished_at": _workflow_safe_timestamp(stage.get("finished_at")),
+            "duration_seconds": _workflow_safe_duration(stage.get("duration_seconds")),
+            "retry_count": _workflow_safe_count(stage.get("retry_count")),
+            "result_rejection_count": _workflow_safe_count(stage.get("result_rejection_count")),
+            "error_code": _workflow_safe_code(stage.get("last_retry_error_code")),
+            "attempt_count": len(safe_attempts),
+            "attempts": safe_attempts,
+        })
+    observability = _workflow_observability(snapshot)
+    safe_observability = {
+        key: observability.get(key)
+        for key in (
+            "state", "result_ready", "terminal", "partial_result",
+            "recovered_after_restart", "retry_count", "same_provider_retry_count",
+            "reassignment_count", "retrying", "result_rejection_count",
+            "winner_count", "actual_providers", "actual_nodes",
+        )
+    }
+    return {
+        "workflow_id": str(snapshot.get("workflow_id", "") or ""),
+        "template": str(snapshot.get("template", "") or ""),
+        "state": str(snapshot.get("state", "unknown") or "unknown"),
+        "created_at": _workflow_safe_timestamp(snapshot.get("created_at")),
+        "started_at": _workflow_safe_timestamp(snapshot.get("started_at")),
+        "result_ready_at": _workflow_safe_timestamp(snapshot.get("result_ready_at")),
+        "finished_at": _workflow_safe_timestamp(snapshot.get("finished_at")),
+        "duration_seconds": _workflow_safe_duration(snapshot.get("duration_seconds")),
+        "stage_count": _workflow_safe_count(snapshot.get("stage_count")),
+        "completed_stage_count": _workflow_safe_count(snapshot.get("completed_stage_count")),
+        "failed_stage_count": _workflow_safe_count(snapshot.get("failed_stage_count")),
+        "attempt_count": _workflow_safe_count(snapshot.get("attempt_count")),
+        "retry_count": _workflow_safe_count(snapshot.get("retry_count")),
+        "same_provider_retry_count": _workflow_safe_count(snapshot.get("same_provider_retry_count")),
+        "result_rejection_count": _workflow_safe_count(snapshot.get("result_rejection_count")),
+        "cancel_requested": bool(snapshot.get("cancel_requested", False)),
+        "observability": safe_observability,
+        "stages": safe_stages,
+        "journal": {
+            key: journal.get(key)
+            for key in ("available", "record_count", "retention_days")
+            if key in journal
+        },
+    }
+
+
 @app.get("/api/workflows")
-async def list_workflows(limit: int = 20, session_id: str = ""):
+async def list_workflows(limit: int = 20, session_id: str = "", summary: bool = False):
+    if summary:
+        # Mobile audit is deliberately bounded server-side, independent of a
+        # caller-provided page size.
+        limit = max(1, min(int(limit), 8))
     role = scheduler._effective_role()
     provider_error = ""
     image_provider_error = ""
@@ -7060,7 +7161,8 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
         )
     public_journal = _public_task_journal(journal)
     workflows = [
-        _public_workflow(workflow, journal) for workflow in workflows
+        (_public_workflow_summary(workflow, journal) if summary else _public_workflow(workflow, journal))
+        for workflow in workflows
     ]
     provider_status = task_graph_coordinator.provider_status()
     local_provider_ready = any(
@@ -7075,6 +7177,18 @@ async def list_workflows(limit: int = 20, session_id: str = ""):
         and bool(journal.get("available", False))
         and not provider_error
     )
+    if summary:
+        return {
+            "enabled": bool(TASK_GRAPH_ENABLED),
+            "available": bool(journal.get("available", False)),
+            "role": role,
+            "workflows": workflows,
+            "journal": {
+                key: public_journal.get(key)
+                for key in ("available", "record_count", "retention_days")
+                if key in public_journal
+            },
+        }
     return {
         "enabled": TASK_GRAPH_ENABLED,
         # ``available`` retains provider-readiness semantics for API clients;
@@ -9243,14 +9357,33 @@ async def cast_review_vote(req: CastVoteRequest):
 
 
 @app.get("/api/cluster/review/tickets")
-async def list_review_tickets(status: Optional[str] = None):
+async def list_review_tickets(
+    status: Optional[str] = None,
+    limit: int = 20,
+    summary: bool = False,
+):
     """列出审查工单。可选过滤: ?status=pending"""
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        tickets = review_mgr.list_tickets(status)
+        safe_limit = max(1, min(int(limit), 8 if summary else 100))
+        tickets = review_mgr.list_tickets(status)[:safe_limit]
+        if summary:
+            tickets = [
+                {
+                    "ticket_id": ticket.ticket_id,
+                    "status": ticket.status.value,
+                    "created_at": _workflow_safe_timestamp(ticket.created_at),
+                    "target_node_id": str(ticket.target_node_id or ""),
+                    "score": max(-100, min(int(ticket.score or 0), 100)),
+                    "expires_at": _workflow_safe_timestamp(ticket.expires_at),
+                    "resolved_at": _workflow_safe_timestamp(ticket.resolved_at),
+                    "vote_count": min(len(ticket.votes), 100),
+                }
+                for ticket in tickets
+            ]
         return {
-            "tickets": [t.to_dict() for t in tickets],
+            "tickets": [t if isinstance(t, dict) else t.to_dict() for t in tickets],
             "count": len(tickets),
         }
     except Exception as e:
@@ -9809,7 +9942,7 @@ async def storage_health():
 # ============================================================
 # 生产模式：挂载 React 前端静态文件
 # ============================================================
-# 构建前端: cd frontend && npm run build （输出到 frontend/dist/）
+# 构建前端: cd frontend_cybergothic && npm run build （输出到 frontend_cybergothic/dist/）
 # 生产模式下 FastAPI 在 8000 端口直接提供全部服务（无需 Vite dev server）
 # 开发模式下 dist 目录不存在，跳过挂载，使用 Vite proxy 模式
 
@@ -10947,15 +11080,27 @@ async def delete_log_file(filename: str, request: Request):
     return {"status": "ok", "deleted": safe_name, "failed": []}
 
 
-# PyInstaller 打包后前端文件在 sys._MEIPASS/frontend/dist/ 下
-if getattr(sys, 'frozen', False):
-    _frontend_dist = os.path.join(
-        getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
-        "frontend",
-        "dist",
-    )
-else:
-    _frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist")
+def _resolve_frontend_dist() -> str:
+    """Resolve the product UI without silently falling back to the frozen legacy UI.
+
+    ``QLH_FRONTEND_DIST`` is an explicit escape hatch for compatibility checks or
+    local migration work. The normal source and packaged paths are always the
+    CyberGothic build output; an absent build leaves the API in API-only mode.
+    """
+    explicit = os.environ.get("QLH_FRONTEND_DIST", "").strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+
+    if getattr(sys, "frozen", False):
+        root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    else:
+        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    return os.path.join(root, "frontend_cybergothic", "dist")
+
+
+# PyInstaller and source runs both use frontend_cybergothic/dist by default.
+# The old frontend can only be selected explicitly with QLH_FRONTEND_DIST.
+_frontend_dist = _resolve_frontend_dist()
 
 if os.path.isdir(_frontend_dist):
     app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")

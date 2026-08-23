@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -352,6 +353,32 @@ def test_review_read_endpoints_stay_open_for_non_master(monkeypatch):
     # can-vote 自查询：开放
     result = asyncio.run(api_server.check_can_vote())
     assert "can_vote" in result
+
+
+def test_review_summary_is_bounded_and_does_not_return_comments(monkeypatch):
+    import review
+
+    class FakeReviewManager:
+        def list_tickets(self, status=None):
+            return [SimpleNamespace(
+                ticket_id=f"review-{index}",
+                status=SimpleNamespace(value="pending"),
+                created_at=float(index),
+                target_node_id="node-target",
+                score=0,
+                expires_at=100.0,
+                resolved_at=None,
+                votes=[SimpleNamespace(comment="secret") for _ in range(20)],
+                transfer_reason="private reason",
+            ) for index in range(20)]
+
+    monkeypatch.setattr(review, "ReviewManager", FakeReviewManager)
+    result = asyncio.run(api_server.list_review_tickets(limit=50, summary=True))
+    assert result["count"] == 8
+    assert len(result["tickets"]) == 8
+    assert result["tickets"][0]["vote_count"] == 20
+    assert "transfer_reason" not in result["tickets"][0]
+    assert "votes" not in result["tickets"][0]
 
 
 def test_review_ticket_detail_missing_is_404_not_403_for_non_master(monkeypatch):
