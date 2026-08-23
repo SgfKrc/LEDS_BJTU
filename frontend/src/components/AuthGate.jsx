@@ -50,6 +50,16 @@ export default function AuthGate({ children }) {
     fetchAuthCapability()
       .then(async (capability) => {
         if (cancelled) return;
+        // The standalone primary-node API explicitly reports `required: false`.
+        // That is a supported compatibility mode, not a failed capability probe.
+        // Its Auth App session endpoints are intentionally absent, so do not keep
+        // a bearer token that was issued by a different gateway topology.
+        if (capability?.required === false) {
+          setAuthSessionToken('');
+          setSession(null);
+          setPhase('legacy');
+          return;
+        }
         if (capability?.required !== true) {
           throw new Error('主节点返回了无效的认证能力声明');
         }
