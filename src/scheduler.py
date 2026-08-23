@@ -8937,8 +8937,13 @@ class Scheduler:
         master_port: int,
         *,
         force_bootstrap: bool = False,
+        persist_preference: bool = False,
     ) -> dict:
         """串行建立唯一的主节点连接。"""
+        from network_address import canonical_host
+
+        master_host = canonical_host(master_host)
+        master_port = int(master_port)
         with self._master_connect_lock:
             current = getattr(self, "_tcp_client", None)
             current_connected = bool(
@@ -8950,18 +8955,45 @@ class Scheduler:
             if (current_connected
                     and str(getattr(current, "server_host", "")) == str(master_host)
                     and int(getattr(current, "server_port", 0)) == int(master_port)):
+                preference = self._persist_master_endpoint_preference(
+                    master_host, master_port,
+                ) if persist_preference else {}
                 return {
                     "status": "connected",
                     "node_id": self.get_effective_node_id(),
                     "master": f"{master_host}:{master_port}",
                     "message": "已连接到该主节点",
                     "reused": True,
+                    **preference,
                 }
             return self._connect_to_master_locked(
                 master_host,
                 master_port,
                 force_bootstrap=force_bootstrap,
+                persist_preference=persist_preference,
             )
+
+    @staticmethod
+    def _persist_master_endpoint_preference(master_host: str, master_port: int) -> dict:
+        """Expose a failed local preference write instead of silently losing it."""
+        try:
+            from node_config import persist_preferred_master_endpoint
+
+            endpoint = persist_preferred_master_endpoint(master_host, master_port)
+            return {
+                "endpoint_preference": {
+                    "persisted": True,
+                    "address_family": endpoint["address_family"],
+                },
+            }
+        except Exception as exc:
+            logger.warning("主节点首选地址未能持久化: %s", exc, exc_info=True)
+            return {
+                "endpoint_preference": {
+                    "persisted": False,
+                    "reason": "local_config_write_failed",
+                },
+            }
 
     def _connect_to_master_locked(
         self,
@@ -8969,6 +9001,7 @@ class Scheduler:
         master_port: int,
         *,
         force_bootstrap: bool = False,
+        persist_preference: bool = False,
     ) -> dict:
         """
         从节点主动连接主节点（由前端「连接主节点」按钮触发）。
@@ -9143,11 +9176,15 @@ class Scheduler:
                 self._send_diffusion_worker_hello(client)
 
                 logger.info(f"✅ 从节点 {node_id} 已连接到主节点 {master_host}:{master_port}")
+                preference = self._persist_master_endpoint_preference(
+                    master_host, master_port,
+                ) if persist_preference else {}
                 return {
                     "status": "connected",
                     "node_id": node_id,
                     "master": f"{master_host}:{master_port}",
                     "message": f"已成功注册到主节点 {master_host}:{master_port}",
+                    **preference,
                 }
             if getattr(self, '_tcp_client', None) is client:
                 _discard_candidate_client(client)
@@ -9192,11 +9229,15 @@ class Scheduler:
                             "✅ 从节点 %s 刷新配置后已连接到主节点 %s:%s",
                             node_id, master_host, master_port,
                         )
+                        preference = self._persist_master_endpoint_preference(
+                            master_host, master_port,
+                        ) if persist_preference else {}
                         return {
                             "status": "connected",
                             "node_id": node_id,
                             "master": f"{master_host}:{master_port}",
                             "message": f"已刷新自动部署配置并注册到主节点 {master_host}:{master_port}",
+                            **preference,
                         }
                     if getattr(self, '_tcp_client', None) is client:
                         _discard_candidate_client(client)
@@ -9592,13 +9633,15 @@ class Scheduler:
                     logger.info(f"✅ 启动自动连接成功: {host}:{port}")
                 else:
                     logger.info(f"启动自动连接失败: {result.get('reason', result.get('status'))}")
-                    alternate = self.discover_master(skip_config=True)
-                    alt_host = alternate.get("master_host", "")
-                    alt_port = int(alternate.get("master_port", 0) or 0)
-                    if (alternate.get("found")
-                            and alt_host and alt_port
-                            and (alt_host, alt_port) != (host, int(port))):
-                        self.connect_to_master(alt_host, alt_port)
+                    for alternate in self._discover_master_fallbacks(host, int(port)):
+                        alt_host = alternate["master_host"]
+                        alt_port = alternate["master_port"]
+                        logger.info(
+                            "启动自动连接回退: source=%s master=%s:%s",
+                            alternate["source"], alt_host, alt_port,
+                        )
+                        if self.connect_to_master(alt_host, alt_port).get("status") == "connected":
+                            break
             else:
                 logger.info("启动自动发现: 未找到可用主节点，稍后可通过前端手动连接")
         except Exception as e:
@@ -9831,6 +9874,60 @@ class Scheduler:
         except Exception as e:
             logger.debug("Tailnet 主节点发现失败: %s", e, exc_info=True)
             return {"found": False, "source": "none"}
+
+    def _discover_master_fallbacks(
+        self,
+        attempted_host: str,
+        attempted_port: int,
+    ) -> list[dict]:
+        """Return deterministic fallback endpoints after a primary attempt.
+
+        The user-selected endpoint remains the primary config value.  The
+        bootstrap endpoint is retained separately, then Tailnet discovery is
+        last.  This prevents a background retry from overwriting an explicit
+        IPv6 choice with a stale IPv4 bootstrap address.
+        """
+        from network_address import canonical_host
+
+        attempted = (canonical_host(attempted_host), int(attempted_port or 0))
+        candidates: list[dict] = []
+        seen = {attempted}
+
+        def _append(host: str, port: int, source: str, *, stale: bool = False) -> None:
+            endpoint = (canonical_host(host), int(port or 0))
+            if not endpoint[0] or not endpoint[1] or endpoint in seen:
+                return
+            seen.add(endpoint)
+            candidates.append({
+                "found": True,
+                "master_host": endpoint[0],
+                "master_port": endpoint[1],
+                "stale": stale,
+                "source": source,
+            })
+
+        try:
+            from node_config import get_bootstrap_master_endpoint
+
+            bootstrap_endpoint = get_bootstrap_master_endpoint()
+            if bootstrap_endpoint is not None:
+                _append(
+                    bootstrap_endpoint["host"],
+                    bootstrap_endpoint["port"],
+                    "bootstrap_config",
+                )
+        except Exception as exc:
+            logger.debug("读取 bootstrap 回退地址失败: %s", exc, exc_info=True)
+
+        tailnet = self.discover_master(skip_config=True)
+        if tailnet.get("found"):
+            _append(
+                str(tailnet.get("master_host", "")),
+                int(tailnet.get("master_port", 0) or 0),
+                str(tailnet.get("source", "tailnet")),
+                stale=bool(tailnet.get("stale", False)),
+            )
+        return candidates
 
     # ================================================================
     # 分布式推理开关
@@ -14327,17 +14424,14 @@ class Scheduler:
                                     logger.info(f"✅ 周期性重连成功: {host}:{port}")
                                     self._client_last_reconnect_attempt = 0.0  # 成功后重置
                                 else:
-                                    alternate = self.discover_master(skip_config=True)
-                                    alt_host = alternate.get("master_host", "")
-                                    alt_port = int(alternate.get("master_port", 0) or 0)
-                                    if (alternate.get("found")
-                                            and alt_host and alt_port
-                                            and (alt_host, alt_port) != (host, port)):
+                                    for alternate in self._discover_master_fallbacks(host, port):
                                         alt_result = self.connect_to_master(
-                                            alt_host, alt_port
+                                            alternate["master_host"],
+                                            alternate["master_port"],
                                         )
                                         if alt_result.get("status") == "connected":
                                             self._client_last_reconnect_attempt = 0.0
+                                            break
 
                 self._client_master_was_online = is_online
             except Exception as e:

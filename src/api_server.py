@@ -8352,6 +8352,7 @@ async def connect_to_master(req: ConnectToMasterRequest):
         req.master_host,
         req.master_port,
         force_bootstrap=force_bootstrap,
+        persist_preference=True,
     )
     if result.get("status") == "denied":
         raise HTTPException(403, result.get("reason", "仅从节点可连接主节点"))

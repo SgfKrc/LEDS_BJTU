@@ -166,8 +166,10 @@ def test_cluster_mutation_endpoints_map_scheduler_denials_to_forbidden(
             return {"status": "denied", "reason": "client denied"}
 
         @staticmethod
-        def connect_to_master(host, port, *, force_bootstrap=False):
-            del host, port, force_bootstrap
+        def connect_to_master(
+            host, port, *, force_bootstrap=False, persist_preference=False,
+        ):
+            del host, port, force_bootstrap, persist_preference
             return {"status": "denied", "reason": "client denied"}
 
         @staticmethod
@@ -195,6 +197,38 @@ def test_cluster_mutation_endpoints_map_scheduler_denials_to_forbidden(
         connect.value.status_code,
         transfer.value.status_code,
     } == {403}
+
+
+def test_manual_cluster_connect_persists_the_explicit_endpoint_preference(
+    monkeypatch,
+):
+    calls = []
+
+    class ClientScheduler:
+        @staticmethod
+        def _effective_role():
+            return "client"
+
+        @staticmethod
+        def connect_to_master(
+            host, port, *, force_bootstrap=False, persist_preference=False,
+        ):
+            calls.append((host, port, force_bootstrap, persist_preference))
+            return {"status": "connected", "master": f"{host}:{port}"}
+
+    monkeypatch.setattr(api_server, "scheduler", ClientScheduler())
+
+    result = asyncio.run(api_server.connect_to_master(
+        api_server.ConnectToMasterRequest(
+            master_host="fd7a:115c:a1e0::8d01:4cc5",
+            master_port=8888,
+        ),
+    ))
+
+    assert result["status"] == "connected"
+    assert calls == [
+        ("fd7a:115c:a1e0::8d01:4cc5", 8888, False, True),
+    ]
 
 
 def test_review_create_and_vote_keep_their_role_and_eligibility_gates(

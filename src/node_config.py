@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from network_address import canonical_host
+
 
 def get_app_root() -> Path:
     if getattr(sys, "frozen", False):
@@ -116,6 +118,83 @@ def _set_env_value(name: str, value: Any, *, overwrite: bool = False) -> None:
         os.environ.setdefault(name, value_str)
 
 
+def _normalize_master_endpoint(host: str | None, port: int | str | None) -> dict[str, Any] | None:
+    """Return a canonical, safe-to-persist master TCP endpoint."""
+    normalized_host = canonical_host(host)
+    if not normalized_host:
+        return None
+    try:
+        normalized_port = int(port or 0)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= normalized_port <= 65535:
+        return None
+
+    address_family = "hostname"
+    try:
+        import ipaddress
+
+        address = ipaddress.ip_address(normalized_host.split("%", 1)[0])
+        address_family = "ipv6" if address.version == 6 else "ipv4"
+    except ValueError:
+        pass
+    return {
+        "host": normalized_host,
+        "port": normalized_port,
+        "address_family": address_family,
+    }
+
+
+def get_preferred_master_endpoint(
+    config_data: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Read the user-selected endpoint without trusting malformed old state."""
+    data = config_data if config_data is not None else load_node_config()
+    cluster = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
+    preferred = (
+        cluster.get("preferred_master_endpoint")
+        if isinstance(cluster.get("preferred_master_endpoint"), dict)
+        else {}
+    )
+    return _normalize_master_endpoint(preferred.get("host"), preferred.get("port"))
+
+
+def get_bootstrap_master_endpoint(
+    config_data: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Read the bootstrap-provided endpoint kept as a fallback to a preference."""
+    data = config_data if config_data is not None else load_node_config()
+    cluster = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
+    return _normalize_master_endpoint(
+        cluster.get("master_tcp_host") or cluster.get("master_host"),
+        cluster.get("master_tcp_port") or cluster.get("master_port"),
+    )
+
+
+def persist_preferred_master_endpoint(host: str, port: int) -> dict[str, Any]:
+    """Persist an explicit successful connection without replacing bootstrap data.
+
+    The selected endpoint belongs to the user-owned node configuration.  The
+    original bootstrap endpoint remains available for deterministic recovery
+    when the preferred address cannot be reached.
+    """
+    endpoint = _normalize_master_endpoint(host, port)
+    if endpoint is None:
+        raise ValueError("invalid master endpoint")
+
+    data = load_node_config()
+    cluster = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
+    data["cluster"] = {
+        **cluster,
+        "preferred_master_endpoint": endpoint,
+    }
+    write_node_config(data)
+    apply_node_config_to_env(data, overwrite=True)
+    _sync_loaded_module_attr("config", "CLIENT_MASTER_HOST", endpoint["host"])
+    _sync_loaded_module_attr("config", "CLIENT_MASTER_PORT", endpoint["port"])
+    return endpoint
+
+
 def apply_node_config_to_env(
     config_data: dict[str, Any] | None = None,
     *,
@@ -127,6 +206,20 @@ def apply_node_config_to_env(
 
     cluster = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
     node = data.get("node") if isinstance(data.get("node"), dict) else {}
+    preferred_endpoint = get_preferred_master_endpoint(data)
+    configured_host = (
+        preferred_endpoint["host"]
+        if preferred_endpoint is not None
+        else cluster.get("master_tcp_host") or cluster.get("master_host")
+    )
+    configured_port = (
+        preferred_endpoint["port"]
+        if preferred_endpoint is not None
+        else cluster.get("master_tcp_port") or cluster.get("master_port")
+    )
+    # An explicit successful connection is user-owned runtime state.  It must
+    # win over a stale installer or source-checkout .env bootstrap address.
+    endpoint_overwrite = overwrite or preferred_endpoint is not None
 
     _set_env_value("QLH_NODE_ROLE", node.get("role"), overwrite=overwrite)
     _set_env_value("QLH_NODE_ID", node.get("node_id"), overwrite=overwrite)
@@ -134,23 +227,23 @@ def apply_node_config_to_env(
     _set_env_value("QLH_CLUSTER_SECRET", cluster.get("cluster_secret"), overwrite=overwrite)
     _set_env_value(
         "QLH_MASTER_HOST",
-        cluster.get("master_tcp_host") or cluster.get("master_host"),
-        overwrite=overwrite,
+        configured_host,
+        overwrite=endpoint_overwrite,
     )
     _set_env_value(
         "QLH_MASTER_PORT",
-        cluster.get("master_tcp_port") or cluster.get("master_port"),
-        overwrite=overwrite,
+        configured_port,
+        overwrite=endpoint_overwrite,
     )
     _set_env_value(
         "QLH_CLIENT_MASTER_HOST",
-        cluster.get("master_tcp_host") or cluster.get("master_host"),
-        overwrite=overwrite,
+        configured_host,
+        overwrite=endpoint_overwrite,
     )
     _set_env_value(
         "QLH_CLIENT_MASTER_PORT",
-        cluster.get("master_tcp_port") or cluster.get("master_port"),
-        overwrite=overwrite,
+        configured_port,
+        overwrite=endpoint_overwrite,
     )
     _set_env_value("QLH_MASTER_API_HOST", cluster.get("master_api_host"), overwrite=overwrite)
     _set_env_value("QLH_MASTER_API_PORT", cluster.get("master_api_port"), overwrite=overwrite)
@@ -179,6 +272,9 @@ def build_bootstrap_config(response: dict[str, Any]) -> dict[str, Any]:
     cluster = response.get("cluster") if isinstance(response.get("cluster"), dict) else {}
     node = response.get("node") if isinstance(response.get("node"), dict) else {}
     existing = load_node_config()
+    existing_cluster = (
+        existing.get("cluster") if isinstance(existing.get("cluster"), dict) else {}
+    )
     features = existing.get("features") if isinstance(existing.get("features"), dict) else {}
     result = {
         "bootstrapped": True,
@@ -200,6 +296,14 @@ def build_bootstrap_config(response: dict[str, Any]) -> dict[str, Any]:
     }
     if features:
         result["features"] = dict(features)
+    # A preference is valid only inside the same cluster.  A successful join
+    # to another cluster must not silently retain its previous master.
+    existing_cluster_id = str(existing_cluster.get("cluster_id", "") or "")
+    response_cluster_id = str(cluster.get("cluster_id", "qlh-default") or "")
+    if not existing_cluster_id or existing_cluster_id == response_cluster_id:
+        preferred_endpoint = get_preferred_master_endpoint(existing)
+        if preferred_endpoint is not None:
+            result["cluster"]["preferred_master_endpoint"] = preferred_endpoint
     return result
 
 
