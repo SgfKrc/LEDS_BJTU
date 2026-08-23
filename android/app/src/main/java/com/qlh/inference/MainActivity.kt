@@ -31,6 +31,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.ui.ChatScreen
 import com.qlh.inference.ui.DiffusionScreen
@@ -67,10 +68,17 @@ class MainActivity : ComponentActivity() {
                     onChooseModelDirectory = { modelDirectoryLauncher.launch(null) },
                     onInferenceModeChanged = { mode ->
                         if (mode == "full" && !BuildConfig.IS_LITE) {
-                            ContextCompat.startForegroundService(
-                                this,
-                                Intent(this, InferenceService::class.java)
-                            )
+                            runCatching {
+                                ContextCompat.startForegroundService(
+                                    this,
+                                    Intent(this, InferenceService::class.java),
+                                )
+                            }.onFailure { error ->
+                                QlhLogger.w(
+                                    "MainActivity",
+                                    "Inference service unavailable: ${error.message ?: error.javaClass.simpleName}",
+                                )
+                            }
                         }
                     }
                 )

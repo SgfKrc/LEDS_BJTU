@@ -1,5 +1,6 @@
 package com.qlh.inference.service
 
+import android.annotation.SuppressLint
 import com.google.gson.Gson
 import android.app.Notification
 import android.app.PendingIntent
@@ -187,6 +188,7 @@ class AndroidPresenceService : Service() {
 
     private fun errorMessage(error: Throwable): String = error.message ?: error.javaClass.simpleName
 
+    @SuppressLint("ForegroundServiceType")
     private fun startForegroundNotification() {
         val pendingIntent = PendingIntent.getActivity(
             this,

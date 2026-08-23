@@ -1,5 +1,6 @@
 package com.qlh.inference.service
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
@@ -414,6 +415,7 @@ class InferenceService : Service() {
     // 内部 — 前台通知 + WakeLock
     // ================================================================
 
+    @SuppressLint("ForegroundServiceType")
     private fun startForegroundNotification() {
         val pendingIntent = PendingIntent.getActivity(
             this, 0,

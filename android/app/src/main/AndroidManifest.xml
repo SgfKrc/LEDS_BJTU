@@ -41,17 +41,29 @@
         <service
             android:name=".service.InferenceService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local_model_inference" />
+        </service>
 
         <service
             android:name=".worker.TaskWorkerService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="distributed_task_worker" />
+        </service>
 
         <service
             android:name=".service.AndroidPresenceService"
             android:exported="false"
-            android:foregroundServiceType="specialUse" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="cluster_presence_heartbeat" />
+        </service>
 
         <provider
             android:name="androidx.core.content.FileProvider"
