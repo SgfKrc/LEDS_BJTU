@@ -6,7 +6,7 @@
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
 
-**v0.1.8.3**（更新日期：2026-08-21）
+**v0.1.8.3**（更新日期：2026-08-23）
 
 > 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
@@ -17,7 +17,7 @@
 
 ## 📋 项目简介
 
-QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Windows/Linux 台式机、工作站、服务器、笔记本以及 Android 手机和平板。当前 PC PyTorch 路线可以把兼容模型按 Transformer 层拆分到多个节点；PC/Android 的 llama.cpp 路线负责 GGUF 本地完整推理。系统同时保留 INT4/INT8 量化、算子融合、分页 KV 缓存、图算法编排和降级恢复能力，并规划完整推理 Worker、任务链、独立张量并行与 GGUF Stage 等执行体系。
+QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Windows/Linux 台式机、工作站、服务器、笔记本以及 Android 手机和平板。PC PyTorch 路线可将兼容模型按 Transformer 层拆分到多个节点；PC/Android 的 llama.cpp 路线负责 GGUF 本地完整推理。系统保留 INT4/INT8 量化、算子融合、分页 KV 缓存、图算法编排和降级恢复能力；PC Full Worker、任务图、Android Full Worker/Stage 与 GGUF Stage 的本机开发门已完成，短程双机证据已覆盖 PyTorch 层流水线与任务图。`task_dispatch`、真实 CUDA、多轮断网恢复与生产路由仍是后置验收门，张量并行仍只作为集群外 PoC 路线。
 
 现已覆盖 **Windows PC + Linux PC + Android**。设备类型不是调度能力的充分条件：是否能参与某种分布式执行，还取决于运行引擎、模型格式、模型指纹、可用内存、加速器和网络拓扑。
 
@@ -29,8 +29,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 |------|----------|----------|----------|---------------|
 | 1 | **PC 集显版** | Windows / Linux 无 NVIDIA 独显的 PC | llama.cpp + GGUF CPU/集显推理、集群接入与远程请求转发 | 当前 PyTorch 层流水线、重模型实验、CUDA 专属能力 |
 | 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、**SD 1.5 图像生成侧车（文生图/图生图/参考图/局部重绘/指令编辑）**、后续支持多模型/重模型实验 | Android 极简化策略 |
-| 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、较完整设置、后续可研究完整任务 Worker | Transformer 层间拆分、重模型实验 |
-| 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 完整 models 目录、日志管理、Worker 接收任务、高级控制面板 |
+| 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、更新/日志/连接诊断；Full Worker/Stage 和 Gemma4 MTMD 已完成本机开发接线 | Transformer 层间拆分、重模型实验；真实设备 Worker、多模态质量和后台存活仍待验收 |
+| 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、远程 PC 转发、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 本地 GGUF、完整 models 目录、Worker 接收任务和高级控制面板 |
 
 > Android 普通版和极简版的区别：普通版面向“完整移动客户端”，极简版面向“尽量小、尽量少设置、尽量低存储占用”的手机轻量入口。
 
@@ -43,25 +43,43 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔄 **双引擎架构** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/集显)，自动切换 |
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
 | 🗄️ **多会话与本地事实源** | 会话/设置/模型注册等由主节点本地 SQLite 承载（远端 PostgreSQL 已退场，仅一次性迁移审计通道），旧数据一次性导入；断网本地不中断 |
-| 🌐 **Tailscale 组网** | 跨子网设备互联，首次启动自动引导加入 |
-| 📦 **一键安装包** | PC 集显版 (~180 MB) / PC 独显版 (~1.7 GB) / Linux .deb (~200 MB) / Android 普通版 APK，含 Tailscale 检查 + 模型下载引导 + pywebview 原生窗口 |
+| 🧩 **模型资产治理** | 模型注册、清单/SHA 校验、来源与许可证、Sidecar 契约、部署模拟及下载来源回退（HF 直连 → 用户代理 → ModelScope）均已接入本机产品面；真实大工件、CUDA 和跨机分发仍待验收 |
+| 🖼️ **多模型与多模态 Sidecar** | Qwen3 PyTorch 隔离运行时，以及 Gemma4 原生 GGUF/mmproj MTMD 与 PyTorch Sidecar 路径均已完成开发门；模型可用性仍由工件、显存/内存预算和精确身份契约 fail-closed 决定，不在 8 GB 机器上自动准入重模型 |
+| 🌐 **Tailscale 与双栈组网** | IPv4/IPv6 端点、手动入群和启动重连按“用户首选 → bootstrap → Tailnet”回退；显式连接的偏好会持久化。双机 IPv6 短任务已实测，IPv4-only/IPv6-only 安装包和真实 WSS/443 仍待环境验收 |
+| 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；真实 control/gateway、系统凭据和首次安装联调后置 |
+| 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（安装包内置 Textual，源码模式仍可隔离安装；见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
 | 🎨 **SD 1.5 图像生成** *(独显版)* | 本地图像工作区：文生图、img2img、IP-Adapter 参考图、专用 inpaint 局部重绘与 InstructPix2Pix 指令编辑；img2img/IP-Adapter 自动门与双人目视已通过（2026-08-06），inpaint 自动/Edge 门已通过，指令编辑十指令自动门、Edge 链路与双人目视均已通过（2026-08-07）；正式离线资产包已完成（五资产 15 GB，解压即导入，Hub 强制离线可复现），分布式图像跨机展示仍待双机验收 → [SD 1.5 计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) |
-| 📱 **Android 客户端** | 普通版支持全有模式（本地 GGUF 推理）/ 全无模式（转发给 PC 集群），极简版后续主打小体积轻量聊天；UI 已重构为 Material 3 |
+| 📱 **Android 客户端** | 普通版支持本地 GGUF/远程 PC、SAF、presence lease、Full Worker/Stage、Gemma4 mmproj/JNI 图像路径、更新/脱敏日志/连接诊断；极简版保留远程轻量入口。以上为本机/JVM/交叉编译开发门，真机与生产验收后置 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
 | ⚙️ **任务链 Full Worker** | `dual_candidate` DAG、可恢复任务状态/ journal / lease-epoch winner fencing、Provider registry；PC Full Worker 与任务图已完成重启与断线恢复、IPv6 TCP 实测（2026-08-21），`task_dispatch` 生产准入门保持关闭 → [任务链专项](docs/任务链下一阶段实施计划.md) |
-| 🗂️ **本地 RAG** | 主节点 SQLite FTS5 + 向量 embedding（Ollama / llama.cpp 双 provider）、质量门与容量/ANN 决策门（RAG-S0…S5D）；默认不接外部模型、不自动下载 → [集群接入与本地 RAG 计划](docs/集群接入稳定性与本地RAG实施计划.md) |
+| 🗂️ **本地 RAG** | 主节点 SQLite FTS5 + 有界向量 embedding（Ollama `nomic-embed-text` / 原生 llama.cpp 双 provider）、可恢复 job、容量预算与 ANN 决策门（RAG-S0…S5D）；30 条人工查询的本机质量门已完成，真实长时、规模与 sqlite-vec benchmark 后置 → [集群接入与本地 RAG 计划](docs/集群接入稳定性与本地RAG实施计划.md) |
 | 🔑 **手动入群（CLUSTER-JOIN）** | 目标节点生成一次性授权票据，主节点 Auth App 审批后签发 Ed25519 client-only grant（文本码 + 二维码，nonce ledger 原子消费），成功即降级为从节点；Web/TUI 已接线 → [集群接入计划](docs/集群接入稳定性与本地RAG实施计划.md) |
 | 🌐 **抗弱网与 Transport v2** | `cluster_transport` 提供 `legacy_tcp`/`wss_443` 能力选择、有界 ACK 窗口、稳定故障矩阵与 circuit breaker；NW3.1 本地自签名 WSS loopback 门完成；真实 443/证书/流量对照后置 → [抗弱网专项](docs/抗弱网通信协议专项计划.md) |
+| 🧪 **实验质量与文档治理** | EX-N3 以只读生产质量门复核计划、样本、校准、性能、质量和人工复核，历史记录 3/3 通过；文档维护 Agent 已完成本机检索/语义质量门，只生成建议而不自动改写文档 |
 
 ### 项目设计理念
 
-- **摆脱第三方服务依赖**：除 GitHub 官方（源码托管与 release 发布）外，QLH 不依赖任何第三方服务——更新源可由用户自建签名源站承载，Gitee 等镜像仅作带宽/可达性兜底，凭据与授权数据只存于用户主节点。
-- **所有资产归用户自己管理**：模型工件、张量并行外部资产（vLLM/SGLang/llama.cpp rpc 等）、API key 与各类凭据**不由开发组提供**，全部使用用户自己的资产；项目只提供导入、校验、登记与使用通道，不代管、不代持。
+- **资产主权与本地自治**：模型工件、外部算力资产、API key、会话、任务 journal、知识库、认证材料、备份与迁移能力均属于用户。开发组只提供代码、导入/校验/登记/迁移工具，不代管、不代持，也不保留用户重置权；除源码托管与 release 发布外，运行时不以开发组第三方服务为前置。主节点 `local_only` SQLite、用户文件系统、加密备份和 `.qlhmigrate` 是这一原则的实现边界。
+- **工程化、自动化与受控 Agent 协作**：测试、验收与维护工具及其测试/质量门代码是工程主体的一部分，与产品代码并行建设。自动化既证明质量，也消除重复劳动：隔离环境一键创建、测试通道、自动仿真/实验、契约/接口扫描、故障注入、质量门、离线资产包构建/校验/恢复、启动器清单生成、环境诊断与受控部署同步，均把可重复的机械步骤变成可复现流程；Agent 只在明确的数据、检索与权限范围内辅助归纳证据、生成建议和执行质量检查，不能绕过脚本门、人工复核或授权边界自动改写事实、发布资产和作出准入决定。
+- **以测试质量约束自动化质量**：测试按风险、依赖和真实度分为单元、契约、浏览器/API、竞态/故障注入、仿真与真机/双机验收，而非只追求一次全量通过。针对环境污染、竞态和接口盲区持续重拆分类、隔离通道、审计 fixture/覆盖边界并补负例，以降低“同一批固定用例反复通过却漏掉新缺陷”的杀虫剂效应。
 - **数据不出集群**：外部推理与图像辅助的默认数据作用域为 `deny`，显式授权才允许出集群；离线资产包与签名清单保证模型分发可审计、可重建。
+
+### 架构演进：从功能优先到用户主权
+
+立项阶段聚焦量化、缓存优化和多机流水线，尚未把“谁拥有数据、断网后谁能恢复系统”明确为产品约束。早期工程曾保留 PostgreSQL 兼容路径；随着主节点离线运行、跨设备迁移和用户自带资产成为刚性需求，系统已收敛为以下本地优先架构。这是对目标边界的补全，不是把远端依赖换成另一种远端依赖。
+
+| 维度 | 早期工程路线 | 当前确定的边界 |
+|------|--------------|----------------|
+| 状态与身份 | PostgreSQL 兼容路径存在，主节点本地事实边界尚未完整定义 | 默认 `local_only`；会话、设置、模型登记、任务 journal、审计与本地用户均由主节点 SQLite 承载，WAL/FULL 与幂等恢复保证断网可继续运行 |
+| 模型与文件资产 | 重点是加载与分发能力 | 权重仍由用户保存于本地文件系统；SQLite 仅保存受校验的引用、清单和摘要。导入、离线包、下载与部署均以 SHA/manifest、空间预检和原子发布为边界 |
+| 知识与凭据 | 未形成统一的数据主权策略 | RAG 使用独立的用户主节点 SQLite（FTS5 + 有界向量）；embedding 可由本地 Ollama 或原生 llama.cpp 提供。认证密钥走操作系统凭据存储，恢复码只保存哈希；开发组不保留用户副本或重置权 |
+| 迁移与恢复 | 远端服务容易成为运行时前置 | 加密备份、`.qlhmigrate` 流式迁移与本地恢复是主路径；PostgreSQL 只保留用户主动发起的一次性兼容导出/审计窗口，远端不可用不得影响核心功能 |
+
+> 两条原则共同约束后续功能：新模型、RAG、Auth App、集群入群和外部 Provider 都必须先说明资产归属、数据作用域、离线恢复和撤销语义，也必须给出可复现的自动化检查、失败边界与人工验收路径；不能以“方便接入”重新引入开发组托管依赖，也不能以 Agent 或单次绿灯替代事实证据。
 
 **应用场景**：智能终端 · 物联网 · 边缘计算 · 教育科研
 
@@ -93,7 +111,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 - Tailscale 基于 WireGuard 创建虚拟局域网，每个设备获得一个固定的 `100.x.x.x` 地址
 - Windows 打包版启动器会自动检查 Tailscale 是否已安装并登录
 
-> 当前校园网实测会阻断 UDP，Tailscale 因此无法建立直连并经自建 DERP 的 HTTPS/TCP 443 中继。自建 DERP 已解决基本可达性，但路径观测、备用中继、主节点直连 WSS 数据面和分块续传仍在规划/实施中；诊断边界与阶段计划见[抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md)。
+> 当前校园网实测会阻断 UDP，Tailscale 可能退化为中继路径。`NET-DUALSTACK-PREF-01` 已完成本机门：显式连接成功后持久化用户选择的 IPv4/IPv6 端点，启动与自动重连按“首选 → bootstrap 原地址 → Tailnet”回退；双机 IPv6 短任务已验证。自建 DERP、路径观测、备用中继、主节点直连 WSS 数据面和分块续传仍需真实 443/证书/网络环境验收；边界见[抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md)。
 
 ---
 
@@ -166,6 +184,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 ├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
 │   ├── launcher.py                # 主应用启动载荷（Tailscale → 模型检查 → 引擎选择 → 启动）
 │   ├── qlh_launcher.py            # ★ 独立 Bootstrap（GUI/TUI/更新，不导入推理依赖）
+│   ├── launcher_cybergothic.py    # CyberGothic 桌面壳：静态页 + /api 反向代理
 │   ├── updater.py                 # 更新 CLI
 │   ├── update_core.py             # 清单、版本、下载与 SHA-256 核心
 │   ├── qlh-launcher.spec          # 独立 Launcher PyInstaller 规格
@@ -186,17 +205,21 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   │   └── qlh-edge-inference.desktop  # 桌面入口
 │   ├── dist/                      # ★ 最终安装包输出目录（Git 忽略）
 │   └── README.md                  # 打包文档
-├── frontend/                      # React 前端（Vite + FastAPI 后端代理）
+├── frontend/                      # 冻结的历史 React 前端，仅作对照与旧包兼容资源
 │   └── src/
-│       ├── App.jsx                # 主布局 & 设置状态管理
-│       ├── api/client.js          # API 客户端封装
-│       └── components/            # ChatPanel / AdminPanel / DevicePanel / SettingsModal 等
-├── tests/                         # 单元测试（2026-08-16 全量基线：2524 passed / 18 skipped，.venv-test 固定 4 worker；最新见项目进展）
+│       └── ...                    # 不再接受新功能开发
+├── frontend_cybergothic/          # ★ 唯一产品前端（React + TypeScript + Vite）
+│   ├── src/                       # Chat / Models / RAG / Tasks / Image Studio / Account 等产品页面
+│   └── scripts/                   # 对比度与浏览器回归工具
+├── tests/                         # 单元/契约/回归测试（全量基线仅作历史参考；当前证据见计划与专项文档）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
 │   ├── benchmark_all.py           # 全量化档位基准测试
 │   ├── benchmark_compile.py       # torch.compile 融合测试
-│   └── convert_to_gguf.py         # Safetensors → GGUF 转换
+│   ├── convert_to_gguf.py         # Safetensors → GGUF 转换
+│   ├── build_offline_bundle.py    # 离线整合包容量预检、清单与原子发布
+│   ├── experiment_quality_production_gate.py # EX-N3 只读质量复核
+│   └── docagent_*_gate.py         # 文档检索/语义质量门
 ├── models/                        # 模型文件存放目录（需自行下载）
 │   ├── qwen-1_8b-chat/            # PC: Safetensors 格式
 │   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF 格式（llama.cpp 引擎）
@@ -323,8 +346,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 # Python 依赖（主节点 SQLite 自持，无需 PostgreSQL）
 pip install -r requirements.txt
 
-# 前端依赖
-cd frontend && npm install && cd ..
+# 产品前端依赖（旧 frontend/ 已冻结）
+cd frontend_cybergothic && npm ci && cd ..
 ```
 
 ### 🚀 一键配置全部开发环境（克隆后推荐）
@@ -412,8 +435,8 @@ git submodule update --init --recursive
 # 2. 安装 Python 依赖（主环境；联网）
 pip install -r requirements.txt
 
-# 3. 前端依赖（可选，仅开发前端时）
-cd frontend && npm install && cd ..
+# 3. 产品前端依赖（可选，仅开发前端时；旧 frontend/ 已冻结）
+cd frontend_cybergothic && npm ci && cd ..
 
 # 4. 环境文件（不进仓库，按需自建）
 #    主环境 .env 至少含 QLH_CLUSTER_SECRET（分布式密钥）；判题/工具密钥见
@@ -450,6 +473,7 @@ python scripts/setup_envs.py --check --no-node
 | **Qwen-1.8B-Chat（GGUF Q4_K_M）** | ~1.16 GB | CPU/集显单机、Android 本地推理 | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ 必需（CPU 路径） |
 | **Qwen3-4B（GGUF Q4_K_M）** | ~2.5 GB | EX-N3 判题模型（v2 正确率判据）、实验 | 受管下载（MODEL-TOOLS）/ HF `Qwen/Qwen3-4B-GGUF` | 实验必需 |
 | **Gemma 4 12B 原生绑定**（GGUF + mmproj） | ~7.3 GB | 图像理解（图生文）原生路径 | 受管工件清单 `models/gemma4-native/gemma4-native.lock.json` + 下载脚本 | 多模态实验 |
+| **nomic-embed-text:latest**（Ollama） | 按需 | 主节点本地 RAG embedding provider | `ollama pull nomic-embed-text:latest` | RAG 本机质量/容量门 |
 | **SD 1.5 五资产离线包** | ~15 GB（5 包） | 图像生成工作区（原版/90s/IP-Adapter/inpaint/InstructPix2Pix） | 官方离线资产包（见 [SD 1.5 离线资产包计划](docs/SD%201.5离线资产包与签名源站发布计划.md)）或 `python scripts/download_sd15.py` | 图像实验 |
 | **Ollama 模型**（`gemma4:12b` 等） | 按需 | EX-N3 Gemma 判题、外部路径验证 | `ollama pull gemma4:12b` | 判题实验 |
 
@@ -587,13 +611,16 @@ Android 本地模式（现有 UI 中称“全有模式”）下，模型需放�
 # 终端 1：启动 Python 后端（从项目根目录运行）
 python src/api_server.py
 
-# 终端 2：启动前端开发服务器（可选，后端已内置前端构建产物）
-cd frontend && npm run dev
+# 终端 2：启动唯一产品前端（Vite 代理到 8000）
+cd frontend_cybergothic && npm run dev
 ```
 
 后端就绪后：
-- **后端直连**：`http://localhost:8000`（含前端，`npm run build` 后）
-- **开发前端**：`http://localhost:5173`（Vite 热更新，代理到 8000）
+- **后端 API**：`http://localhost:8000`
+- **产品前端开发服务器**：`http://localhost:5174`（Vite 热更新，代理到 8000）
+- **产品前端桌面壳**：先构建 `frontend_cybergothic`，再执行 `python packaging/launcher_cybergothic.py`（默认 `9851`，反向代理 `/api` 到 `8000`）
+
+> 当前标准后端、pywebview Launcher、CPU/CUDA/Slim spec 与 Linux `.deb` 默认携带 `frontend_cybergothic/dist`。旧 `frontend/dist` 仅可通过显式 `QLH_FRONTEND_DIST` 做兼容对照；干净机首启、WebView2、Linux 安装与升级仍属于后置发布验收。
 
 ### 单机模式（PC）
 
@@ -690,9 +717,9 @@ curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
 
 > ⚠️ **数据边界**：路线 B / C 会把用户内容（含投机解码的草稿 token）送出集群。作用域档位 `deny` / `opt_in`（默认）/ `allow_all` 是安全边界而非性能开关，取值写错会 fail-closed 回落 `deny`。放开前请确认合规要求。
 
-### 打包版（Windows 安装包）
+### Windows 打包基线与构建脚本
 
-提供两个版本，按需选择：
+下表是现有完整包构建脚本的历史体积基线，不是 `PACK-SLIM` 的发布承诺。`PACK-SLIM` 已完成本机开发门，但真实 PyInstaller 构建与首次外置 runtime 引导仍待打包环境验收。
 
 | 版本 | 安装包 | 典型大小 | 适用场景 |
 |------|--------|---------|---------|
@@ -711,8 +738,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
-# 2. 构建前端
-cd frontend && npm install && npx vite build && cd ..
+# 2. 构建当前安装包的历史兼容静态资源
+#    新产品 UI 的开发/桌面壳使用 frontend_cybergothic；见“快速开始”。
+cd frontend_cybergothic && npm install && npx vite build && cd ..
 
 # 3. PyInstaller 打包（★ 从项目根目录运行）
 pyinstaller packaging/qlh-cpu.spec --noconfirm
@@ -743,20 +771,20 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 > 不能混用——集显版 venv 必须装 CPU-only torch，独显版 venv 必须装 CUDA torch。
 > 装错会导致集显版体积从 180 MB 膨胀到 1.8 GB。
 >
-> **SD 1.5 图像侧车**：独显版额外安装 `pip install -r packaging/requirements-sd15.txt`（锁 diffusers 0.35.2 / transformers 4.47.1，独立侧车不污染 LLM 推理环境）；图像模型资产不进入安装包，由 Web 工作区/脚本按固定 revision 下载。正式离线资产包（含许可副本+模型卡）尚未发布。
+> **SD 1.5 图像侧车**：独显版额外安装 `pip install -r packaging/requirements-sd15.txt`（锁 diffusers 0.35.2 / transformers 4.47.1，独立侧车不污染 LLM 推理环境）；图像模型资产不进入安装包，由 Web 工作区/脚本按固定 revision 下载。正式离线资产包（五资产约 15 GB，含许可副本与模型卡）已可离线导入；真实 Diffusers Worker 和跨机图像生成仍待验收。
 >
 > 安装后双击桌面快捷方式即可启动，无需配置 Python 环境。卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
 >
 > 详细打包流程参见 [packaging/README.md](packaging/README.md)。
 
-### Linux 安装包 (.deb)
+### Linux `.deb` 打包基线
 
-提供与 Windows 集显版对应的 `.deb` 安装包，适用于 Ubuntu 22.04+ / Debian 12+：
+Linux 构建脚本覆盖 Ubuntu 22.04+ / Debian 12+；下表的版本号和体积是历史示例，不应代替当前 release 清单或干净机验收结果：
 
 | 版本 | 安装包 | 典型大小 | 适用场景 |
 |------|--------|---------|---------|
-| **CPU 版** | `qlh-edge-inference-cpu_0.1.8.2_amd64.deb` | ~200 MB | CPU / 集成显卡节点 |
-| **CUDA 版** | `qlh-edge-inference-cuda_0.1.8.2_amd64.deb` | ~1.8 GB | NVIDIA GPU 节点 |
+| **CPU 版** | `qlh-edge-inference-cpu_<version>_amd64.deb` | ~200 MB（历史） | CPU / 集成显卡节点 |
+| **CUDA 版** | `qlh-edge-inference-cuda_<version>_amd64.deb` | ~1.8 GB（历史） | NVIDIA GPU 节点 |
 
 **构建**（需 Ubuntu/Debian 环境）：
 
@@ -848,7 +876,9 @@ python serve.py
 
 ---
 
-## 📊 量化效果
+## 📊 历史量化基线（不构成当前发布或多机性能结论）
+
+> 下表是早期固定环境的性能样例，只用于说明比较维度；真实模型采样质量、CUDA parity、双机吞吐与生产路由以[验收清单与资源限制登记](docs/验收清单与资源限制登记.md)和专项记录为准。
 
 ### CUDA 独显（PyTorch + bitsandbytes）
 
@@ -872,7 +902,7 @@ python serve.py
 
 > llama.cpp 相比 PyTorch CPU：内存 **-65%**，速度 **+300%（3-5x）**
 
-### Android 本地推理（预估）
+### Android 本地推理（理论预估，尚未作为真机验收结果）
 
 | 芯片 | 等级 | Q4_K_M tok/s | 峰值 RAM |
 |------|------|-------------|----------|
@@ -882,7 +912,9 @@ python serve.py
 
 ---
 
-## 🧪 对照实验组
+## 🧪 对照实验矩阵（设计与后续验收口径）
+
+> 这不是已全部完成的实验结果。EX-N3 已完成既有历史记录的只读质量复核；真实模型多轮、CUDA、双机和生产路由采样仍在验收队列。
 
 | 实验组 | 量化 | 算子融合 | KV缓存 | 编排策略 | 部署模式 |
 |--------|------|----------|--------|----------|----------|
@@ -923,7 +955,7 @@ python serve.py
 ### 设计文档
 
 - [总体下一步计划](docs/总体下一步计划.md) — **唯一总计划入口**：L0–L4 阶段门、工作项生命周期、依赖、止损和归档规则
-- [项目进展与下一步计划](docs/项目进展与下一步计划.md) — **进度快照与决策入口**：能力总表、能力边界、P0/P1/P2 下一步清单
+- [项目进展与下一步计划](docs/项目进展与下一步计划.md) — **历史能力与证据快照**；当前排期、验收边界和唯一决策入口以《总体下一步计划》为准
 - [项目技术说明（新人入门）](docs/项目技术说明.md) — KV、算子融合、模型量化、分布式架构、并发调度与通信协议
 - [文档状态与维护规则](docs/文档状态与清理清单.md) — 文档状态定义与后续维护规则
 - [整体架构](docs/整体架构.md)
@@ -933,26 +965,30 @@ python serve.py
 - [测试与评判标准](docs/测试与评判标准.md)
 - [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.1/5.1A/5.3 本地门与双人目视完成；剩余正式离线发布包、真实 Diffusers Worker 与分布式接入）
 - [微服务架构改造计划](docs/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
-- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — **P1 并行主线**：M2 8 条目迁移/runtime sidecar/准入接线、M3 Windows 安全门与真实小工件续传均已完成；DeepSeek 7B GGUF `ready` 且部署 prepare 通过，Safetensors `resource_rejected`；下一票为本地模型管理控制面/UI（不需代理），真实模型权重完整 pull、PG/Tailscale/跨 PC 分发仍受外部或硬件门约束
+- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 模型注册、Sidecar、导入/下载、部署模拟与本机产品面已收口；下载治理采用 HF 直连 → 用户代理 → ModelScope 回退，真实大工件、CUDA、跨 PC 分发和生产路由仍待验收
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
-- [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 全自动优化实验流水线：固定提示词集/seed/工件、串并行调度与资源互斥、统一 schema 与对照表报告（EX-N0/EX-N1 已完成，`scripts/run_experiments.py`）
+- [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 固定提示词/seed/工件、串并行调度、统一 schema 与对照报告；EX-N3 只读生产质量门已复核既有记录 3/3 通过，真实模型采样、CUDA、双机和生产路由仍待验收
+- [桌面赛博哥特与安卓原生界面复核](docs/桌面赛博哥特与安卓原生界面复核-2026-08-23.md) — PC 新前端与 pywebview/安装包交付链路、Android 原生极简风的边界、端间功能映射与 `CY-PKG-01` 计划
 
 ### 专项文档
 
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
-- [StudyPact 风格分析与 frontend cyber-gothic 前端计划](local_docs/StudyPact风格分析与frontend_cybergothic前端计划.md) — 新前端视觉方案/原型（`frontend_cybergothic/` 独立实现，未接生产路由）
+- [前端、Android 与后端接口缺口审查](docs/前端安卓后端接口与功能缺口审查-2026-08-22.md) — `frontend_cybergothic/` 已成为唯一产品前端，Account/Cluster/Models/RAG/Tasks/Image Studio/诊断等本机产品面已接线；旧 `frontend/` 冻结为历史对照，标准安装包输入已接入，真实首启仍随 E8 打包链路验收
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
 - [三种分布式拆分细化实施方案](docs/三种分布式拆分细化实施方案.md) — PyTorch 层间待测试项、任务链和张量并行的协议、容错与实施阶段
-- [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分可行性
+- [Android 与 PC 功能差距清单](docs/安卓与PC功能差距清单.md) — 当前 Android Full/Lite 与 PC 的能力边界；presence、Full Worker/Stage、Gemma4 MTMD、更新/日志/诊断已完成本机开发门，真机/生产验收后置
+- [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分的历史架构基线与远期边界
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
 - Android llama.cpp 已迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并移入 `docs_to_delete/`
-- [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC Full Worker v2（TC-N2.4 物理设备准入未过）
+- [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC/Android Full Worker；开发门与短程双机证据已具备，`task_dispatch` 生产准入、长时/断电恢复仍后置
 - [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
 - [数据库测试指南](docs/数据库测试指南.md) — 存储层测试现状：SQLite 契约、退场 fail-closed 用例与运行方式（PG 已退场）
+- [离线资产一键整合包设计](docs/离线资产一键整合包设计.md) — M1 已完成容量预检、清单、原子 ZIP、7z/分卷与恢复校验；真实全量出包和 Android SAF 导入后置
+- [文档维护 Agent 工具设计](docs/文档维护Agent工具设计.md) — M1-M3 已完成本机检索/语义质量门；工具只提供证据和建议，不自动改写文档
 
 ### 外部算力辅助（张量并行在异构 mesh 内不可行，改走集群外辅助）
 

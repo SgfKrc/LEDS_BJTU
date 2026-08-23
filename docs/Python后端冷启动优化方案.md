@@ -149,7 +149,7 @@
        pathex=['src'],
        binaries=[],
        datas=[
-           ('frontend/dist', 'frontend/dist'),
+           ('frontend_cybergothic/dist', 'frontend_cybergothic/dist'),
            ('.env', '.'),
        ],
        hiddenimports=[
@@ -326,7 +326,7 @@
    WORKDIR /app
    COPY --from=builder /root/.local /root/.local
    COPY src/ ./src/
-   COPY frontend/dist/ ./frontend/dist/
+   COPY frontend_cybergothic/dist/ ./frontend_cybergothic/dist/
    COPY .env .
    
    ENV PATH=/root/.local/bin:$PATH
