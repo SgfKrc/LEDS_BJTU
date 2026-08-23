@@ -516,6 +516,13 @@ export class AuthAssetRepository {
     ).all(userId) as unknown as TailscaleBindingRecord[];
   }
 
+  countTailscaleBindings(): number {
+    const row = this.store.prepare(
+      'SELECT COUNT(*) AS total FROM tailscale_bindings',
+    ).get() as { total: number };
+    return Number(row?.total || 0);
+  }
+
   appendAudit(input: {
     user_id?: string | null;
     actor_user_id?: string | null;

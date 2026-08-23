@@ -17,6 +17,7 @@ import {
 } from './auth-asset-repository';
 import { ModelCredentialStore } from './model-credential-store';
 import { SqliteStore } from './sqlite-store';
+import { CONTROL_CONFIRM_TOKENS } from '../modules/auth/management-policy';
 
 const TOTP_ISSUER = 'QLH';
 const TOTP_WINDOW = 1;
@@ -493,7 +494,7 @@ export class AuthService {
     this.assets.appendAudit({
       user_id: userId,
       actor_user_id: session.user.user_id,
-      event_type: 'user_updated_by_manager',
+      event_type: patch.status === 'revoked' ? 'user_revoked' : 'user_updated_by_manager',
       outcome: 'success',
       subject_id: userId,
       details: { status: updated.status, role: updated.role },
@@ -504,6 +505,12 @@ export class AuthService {
   listTailscaleBindings(session: AuthenticatedSession, userId = session.user.user_id): TailscaleBindingView[] {
     this.requireBindingAccess(session, userId);
     return this.assets.listTailscaleBindings(userId).map(safeTailscaleBinding);
+  }
+
+  /** 管理摘要用全量绑定计数（仅 owner/admin 可见，service 层强制）。 */
+  countTailscaleBindings(session: AuthenticatedSession): number {
+    this.requireManager(session);
+    return this.assets.countTailscaleBindings();
   }
 
   prepareTailscaleBinding(
@@ -575,12 +582,49 @@ export class AuthService {
     }
   }
 
-  revokeTailscaleBinding(session: AuthenticatedSession, bindingId: string): TailscaleBindingView {
+  revokeTailscaleBinding(session: AuthenticatedSession, bindingId: string, confirmToken: string | null = null): TailscaleBindingView {
     const current = this.assets.getTailscaleBinding(bindingId);
     if (!current) throw new AuthServiceError(404, 'Tailscale 绑定不存在');
     this.requireBindingAccess(session, current.user_id);
     if (current.state === 'revoked' || current.state === 'expired') return safeTailscaleBinding(current);
-    return safeTailscaleBinding(this.assets.revokeTailscaleBinding(bindingId));
+    // 二次确认：跨用户撤销是管理写操作（票④），成员撤销自己绑定免确认。
+    if (current.user_id !== session.user.user_id) {
+      const record = CONTROL_CONFIRM_TOKENS.consume(
+        'tailnet_bind', bindingId, session.user.role, session.user.user_id, confirmToken || '',
+      );
+      if (!record) {
+        throw new AuthServiceError(403, '撤销他人 Tailnet 绑定需要二次确认：请先 POST /auth/manage/confirm');
+      }
+    }
+    const revoked = this.assets.revokeTailscaleBinding(bindingId);
+    this.assets.appendAudit({
+      user_id: current.user_id,
+      actor_user_id: session.user.user_id,
+      event_type: 'tailscale_binding_revoked',
+      outcome: 'success',
+      subject_id: bindingId,
+      details: { tailnet_id: current.tailnet_id, method: current.authorization_method },
+    });
+    return safeTailscaleBinding(revoked);
+  }
+
+  /** 管理审计查询（只读，供 manage/audit 端点与 Android 摘要投影）。 */
+  listAuditEvents(limit: number, eventType?: string): Array<Record<string, unknown>> {
+    const events = this.assets.listAuditEvents();
+    const filtered = eventType
+      ? events.filter((event) => event.event_type === eventType)
+      : events;
+    const bounded = filtered.slice(-Math.max(1, Math.min(200, Number(limit) || 50)));
+    return bounded.map((event) => ({
+      event_id: event.event_id,
+      event_type: event.event_type,
+      outcome: event.outcome,
+      reason_code: event.reason_code,
+      actor_user_id: event.actor_user_id,
+      user_id: event.user_id,
+      subject_id: event.subject_id,
+      created_at: event.created_at,
+    }));
   }
 
   private async createProvisioning(user: LocalUserRecord): Promise<ProvisioningPayload> {

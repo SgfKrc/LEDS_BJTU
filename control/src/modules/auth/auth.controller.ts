@@ -19,6 +19,12 @@ import {
 } from '../../data/auth-service';
 import { LocalUserRole } from '../../data/auth-asset-repository';
 import { TailscaleLocalStatusService } from '../../data/tailscale-local-status';
+import {
+  CONTROL_CONFIRM_TOKENS,
+  MANAGEMENT_POLICY,
+  ManagementAction,
+  roleAllows,
+} from './management-policy';
 
 interface BootstrapRequest {
   username?: string;
@@ -67,6 +73,28 @@ function bearerToken(req: FastifyRequest): string | null {
   if (!value) return null;
   const match = /^Bearer\s+(.+)$/i.exec(value.trim());
   return match ? match[1].trim() : null;
+}
+
+// 管理操作二次确认令牌：与 controller 同生命周期（进程内单例）。
+// 真实部署中由主节点进程持有；control 契约面与 Android 契约测试共用同一语义。
+const CONFIRM_TOKENS = CONTROL_CONFIRM_TOKENS;
+
+function confirmTokenHeader(req: FastifyRequest): string | null {
+  const raw = req.headers['x-qlh-confirm-token'];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return value ? String(value).trim() : null;
+}
+
+/** 二次确认：危险管理写操作必须先 POST /auth/manage/confirm 换取一次性令牌。 */
+function requireConfirm(session: AuthenticatedSession, action: ManagementAction, targetId: string, req: FastifyRequest): void {
+  const token = confirmTokenHeader(req);
+  if (!token) {
+    throw new AuthServiceError(403, `需要二次确认：请先 POST /auth/manage/confirm 获取确认令牌（action=${action}）`);
+  }
+  const consumed = CONFIRM_TOKENS.consume(action, targetId, session.user.role, session.user.user_id, token);
+  if (!consumed) {
+    throw new AuthServiceError(403, '确认令牌无效/过期或与目标不匹配，请重新发起确认');
+  }
 }
 
 @Controller('auth')
@@ -156,6 +184,83 @@ export class AuthController {
     return { status: 'logged_out' };
   }
 
+  @Get('manage/summary')
+  manageSummary(@Req() req: FastifyRequest): Record<string, unknown> {
+    return this.runSync(() => {
+      const session = this.currentSession(req);
+      const role = session.user.role;
+      const actions: Record<string, unknown> = {};
+      for (const [action, rule] of Object.entries(MANAGEMENT_POLICY) as Array<[ManagementAction, typeof MANAGEMENT_POLICY[ManagementAction]]>) {
+        actions[action] = {
+          allowed: roleAllows(action, role),
+          confirm_required: rule.confirmRequired,
+          audited: rule.audited,
+          description: rule.description,
+        };
+      }
+      return {
+        role,
+        policy_version: 'and-ctrl-05-v1',
+        audit_available: true,
+        confirm_ttl_seconds: 120,
+        actions,
+        counts: {
+          users: this.auth.listUsers(session).length,
+          bindings: this.auth.countTailscaleBindings(session),
+        },
+        // review 审批域在 control 仍为「master/角色判定降级未迁移」：只读可用，不签发确认。
+        review_admin_auth_pending: true,
+      };
+    });
+  }
+
+  @Get('manage/audit')
+  manageAudit(
+    @Req() req: FastifyRequest,
+    @Query('limit') limit?: string,
+    @Query('event_type') eventType?: string,
+  ): Record<string, unknown> {
+    return this.runSync(() => {
+      const session = this.currentSession(req);
+      // 审计查询仅对 manager 开放（owner/admin）。
+      if (!roleAllows('user_manage', session.user.role)) {
+        throw new AuthServiceError(403, '需要 owner 或 admin 权限');
+      }
+      return { events: this.auth.listAuditEvents(Number(limit) || 50, eventType) };
+    });
+  }
+
+  @Post('manage/confirm')
+  @HttpCode(200)
+  manageConfirm(@Req() req: FastifyRequest, @Body() body: Record<string, unknown>): Record<string, unknown> {
+    return this.runSync(() => {
+      const session = this.currentSession(req);
+      const action = String(body?.action || '');
+      if (!Object.prototype.hasOwnProperty.call(MANAGEMENT_POLICY, action)) {
+        throw new AuthServiceError(422, `未知管理操作: ${action}`);
+      }
+      const typed = action as ManagementAction;
+      const rule = MANAGEMENT_POLICY[typed];
+      if (!roleAllows(typed, session.user.role)) {
+        throw new AuthServiceError(403, '当前角色不允许该管理操作');
+      }
+      if (!rule.confirmRequired) {
+        throw new AuthServiceError(409, '该操作无需二次确认（或审批域尚未开放确认契约）');
+      }
+      const targetId = body?.target_id ? String(body.target_id) : '';
+      if (!targetId) {
+        throw new AuthServiceError(422, '管理操作确认必须携带 target_id');
+      }
+      const record = CONFIRM_TOKENS.issue(typed, targetId, session.user.role, session.user.user_id);
+      return {
+        confirm_token: record.token,
+        expires_at: new Date(record.expiresAtMs).toISOString(),
+        action: record.action,
+        target_id: record.targetId,
+      };
+    });
+  }
+
   @Post('recovery-codes/rotate')
   @HttpCode(200)
   async rotateRecoveryCodes(@Req() req: FastifyRequest, @Body() body: RecoveryRotateRequest): Promise<Record<string, unknown>> {
@@ -211,10 +316,14 @@ export class AuthController {
   @Post('tailscale/bindings/:bindingId/revoke')
   @HttpCode(200)
   revokeTailscaleBinding(@Req() req: FastifyRequest, @Param('bindingId') bindingId: string): Record<string, unknown> {
-    return this.runSync(() => ({
-      status: 'revoked',
-      binding: this.auth.revokeTailscaleBinding(this.currentSession(req), bindingId),
-    }));
+    return this.runSync(() => {
+      const session = this.currentSession(req);
+      // 确认令牌由 service 按「自撤销 or 跨用户管理」判定是否必需（成员可自撤销免确认）。
+      return {
+        status: 'revoked',
+        binding: this.auth.revokeTailscaleBinding(session, bindingId, confirmTokenHeader(req)),
+      };
+    });
   }
 
   @Get('users/:userId/tailscale')
@@ -333,7 +442,9 @@ export class UsersController {
       if (!Number.isInteger(body?.expected_version) || Number(body.expected_version) < 1) {
         throw new AuthServiceError(422, 'expected_version 必须为正整数');
       }
-      const user = this.auth.updateUser(this.currentSession(req), userId, Number(body.expected_version), {
+      const session = this.currentSession(req);
+      requireConfirm(session, 'user_manage', userId, req);
+      const user = this.auth.updateUser(session, userId, Number(body.expected_version), {
         status: 'revoked',
       });
       return { status: 'revoked', user };
