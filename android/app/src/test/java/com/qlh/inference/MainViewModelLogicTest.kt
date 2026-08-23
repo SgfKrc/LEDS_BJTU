@@ -6,6 +6,24 @@ import com.qlh.inference.status.BackendStatus
 import com.qlh.inference.status.GpuStatus
 import com.qlh.inference.status.MemoryStatus
 import com.qlh.inference.status.SystemStatus
+import com.qlh.inference.network.ClusterNode
+import com.qlh.inference.network.ClusterStatus
+import com.qlh.inference.network.ClusterTask
+import com.qlh.inference.network.CurrentModelStatus
+import com.qlh.inference.network.AuditAttemptSummary
+import com.qlh.inference.network.AuditData
+import com.qlh.inference.network.AuditReviewTicketsResponse
+import com.qlh.inference.network.AuditStageSummary
+import com.qlh.inference.network.AuditWorkflowSummary
+import com.qlh.inference.network.AuditWorkflowsResponse
+import com.qlh.inference.network.AuthCapabilityResponse
+import com.qlh.inference.network.GgufModelInfo
+import com.qlh.inference.network.LocalModelAssetSummary
+import com.qlh.inference.network.LocalModelAssetsResponse
+import com.qlh.inference.network.LocalModelAssetsSummary
+import com.qlh.inference.network.MasterModelFleetData
+import com.qlh.inference.network.ServerModelSummary
+import com.qlh.inference.network.ServerModelsResponse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -200,7 +218,275 @@ class MainViewModelLogicTest {
         assertTrue(state.sessions.isEmpty())
     }
 
+    @Test
+    fun `cluster overview normalizes node map and keeps busy workers reachable`() {
+        val overview = toClusterOverviewSnapshot(
+            ClusterStatus(
+                running = true,
+                runMode = "distributed",
+                nodesReady = true,
+                nodes = mapOf(
+                    "worker-b" to ClusterNode(
+                        nodeId = "worker-b",
+                        role = "client",
+                        nodeType = "android",
+                        state = "busy",
+                        hostname = "phone",
+                        networkType = "wifi",
+                        taskCount = 1,
+                    ),
+                    "master" to ClusterNode(
+                        nodeId = "master",
+                        role = "master",
+                        state = "online",
+                        hostname = "main",
+                        isAvailable = true,
+                    ),
+                    "worker-a" to ClusterNode(
+                        nodeId = "worker-a",
+                        role = "client",
+                        state = "offline",
+                    ),
+                ),
+                currentTask = ClusterTask(taskId = "task-1", state = "running", elapsed = 7.9),
+            ),
+        )
+
+        assertEquals(listOf("master", "worker-a", "worker-b"), overview.nodes.map { it.nodeId })
+        assertEquals(2, overview.reachableNodes)
+        assertEquals(3, overview.totalNodes)
+        assertEquals("task-1", overview.currentTaskId)
+        assertEquals(7L, overview.currentTaskElapsedSeconds)
+        assertTrue(overview.nodes.last().reachable)
+    }
+
+    @Test
+    fun `cluster overview errors do not disclose endpoint details`() {
+        assertEquals(
+            "无法连接主节点",
+            formatClusterOverviewError(java.net.ConnectException("failed to connect to 100.90.76.108")),
+        )
+        assertEquals(
+            "读取主节点状态超时",
+            formatClusterOverviewError(java.net.SocketTimeoutException("http://[fd7a::1]:8000")),
+        )
+        assertEquals(
+            "读取集群状态失败",
+            formatClusterOverviewError(IllegalStateException("Bearer secret")),
+        )
+    }
+
+    @Test
+    fun `model fleet merges active available missing unverified and local selection`() {
+        val snapshot = toModelFleetSnapshot(
+            data = MasterModelFleetData(
+                current = CurrentModelStatus(
+                    loaded = true,
+                    modelId = "qwen-1_8b",
+                    modelName = "Qwen 1.8B",
+                    engine = "llama_cpp",
+                    quantType = "Q4_K_M",
+                ),
+                registry = ServerModelsResponse(
+                    models = listOf(
+                        ServerModelSummary(
+                            modelId = "qwen-1-8b",
+                            name = "Qwen 1.8B",
+                            modelType = "both",
+                            isAvailable = true,
+                            availableFormats = listOf("gguf", "safetensors"),
+                        ),
+                        ServerModelSummary(modelId = "unverified", name = "Unverified"),
+                        ServerModelSummary(modelId = "missing", name = "Missing"),
+                    ),
+                ),
+                localAssets = LocalModelAssetsResponse(
+                    assets = listOf(
+                        LocalModelAssetSummary(
+                            modelId = "unverified",
+                            name = "Unverified",
+                            totalBytes = 512L,
+                            integrity = "filesystem_discovered",
+                        ),
+                        LocalModelAssetSummary(
+                            modelId = "asset-only",
+                            name = "Asset only",
+                            totalBytes = 1024L,
+                            integrity = "manifest_verified",
+                        ),
+                    ),
+                    summary = LocalModelAssetsSummary(total = 2, totalBytes = 1536L),
+                ),
+                verifiedGguf = listOf(
+                    GgufModelInfo(
+                        filename = "downloaded.gguf",
+                        sizeBytes = 2048L,
+                        sha256 = "a".repeat(64),
+                    ),
+                ),
+            ),
+            androidSelectedModelName = "phone.gguf",
+            androidSelectedModelSizeBytes = 4096L,
+        )
+
+        assertEquals("qwen-1_8b", snapshot.currentModelId)
+        assertTrue(snapshot.currentLoaded)
+        assertEquals("phone.gguf", snapshot.androidSelectedModelName)
+        assertEquals(4096L, snapshot.androidSelectedModelSizeBytes)
+        assertEquals(3, snapshot.registryCount)
+        assertEquals(2, snapshot.localAssetCount)
+        assertEquals(1, snapshot.verifiedGgufCount)
+        assertEquals(ModelFleetStatus.ACTIVE, snapshot.entries.first().status)
+        assertEquals(
+            ModelFleetStatus.UNVERIFIED,
+            snapshot.entries.first { it.modelId == "unverified" }.status,
+        )
+        assertEquals(
+            ModelFleetStatus.MISSING,
+            snapshot.entries.first { it.modelId == "missing" }.status,
+        )
+        assertEquals(
+            ModelFleetStatus.AVAILABLE,
+            snapshot.entries.first { it.modelId == "asset-only" }.status,
+        )
+        assertTrue(snapshot.entries.none { it.name.contains("C:/") })
+    }
+
+    @Test
+    fun `prepared pipeline is not reported as an active model`() {
+        val snapshot = toModelFleetSnapshot(
+            MasterModelFleetData(
+                current = CurrentModelStatus(
+                    loaded = false,
+                    pipelinePrepared = true,
+                    modelId = "qwen_1_8b",
+                    modelName = "Qwen 1.8B",
+                ),
+                registry = ServerModelsResponse(
+                    models = listOf(
+                        ServerModelSummary(
+                            modelId = "qwen-1-8b",
+                            name = "Qwen 1.8B",
+                            isAvailable = true,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        assertTrue(snapshot.pipelinePrepared)
+        assertFalse(snapshot.currentLoaded)
+        assertEquals(ModelFleetStatus.AVAILABLE, snapshot.entries.single().status)
+    }
+
+    @Test
+    fun `model fleet errors do not disclose endpoint details`() {
+        assertEquals(
+            "无法连接主节点",
+            formatModelFleetError(java.net.ConnectException("failed to connect to 100.90.76.108")),
+        )
+        assertEquals(
+            "读取模型舰队超时",
+            formatModelFleetError(java.net.SocketTimeoutException("http://[fd7a::1]:8000")),
+        )
+        assertEquals(
+            "读取模型舰队失败",
+            formatModelFleetError(IllegalStateException("Bearer secret")),
+        )
+    }
+
     // ---- 聊天与会话状态机 ----
+
+    @Test
+    fun `audit projection is bounded and content free`() {
+        val data = AuditData(
+            workflows = AuditWorkflowsResponse(
+                enabled = true,
+                available = true,
+                role = "master",
+                workflows = (1..12).map { index ->
+                    AuditWorkflowSummary(
+                        workflowId = "wf-$index",
+                        template = "chat",
+                        state = "completed",
+                        createdAt = index.toDouble(),
+                        stageCount = 20,
+                        completedStageCount = 20,
+                        attemptCount = 20,
+                        stages = (1..20).map { stage ->
+                            AuditStageSummary(
+                                stageId = "stage-$stage",
+                                stageType = "llm",
+                                attempts = (1..10).map { attempt ->
+                                    AuditAttemptSummary(
+                                        attemptId = "attempt-$attempt",
+                                        providerKind = "local",
+                                        providerNodeId = "node-$attempt",
+                                        state = "completed",
+                                    )
+                                },
+                            )
+                        },
+                    )
+                },
+            ),
+            reviewTickets = AuditReviewTicketsResponse(
+                tickets = (1..12).map { index ->
+                    com.qlh.inference.network.ReviewTicketSummary(
+                        ticketId = "review-$index",
+                        status = "pending",
+                        targetNodeId = "node-$index",
+                        score = 300,
+                        voteCount = 500,
+                    )
+                },
+            ),
+        )
+
+        val snapshot = toAuditSnapshot(data)
+        assertEquals(MAX_AUDIT_WORKFLOWS, snapshot.workflows.size)
+        assertEquals(MAX_AUDIT_REVIEWS, snapshot.reviews.size)
+        assertEquals(MAX_AUDIT_STAGES, snapshot.workflows.first().stages.size)
+        assertEquals(MAX_AUDIT_ATTEMPTS, snapshot.workflows.first().stages.first().attempts.size)
+        assertEquals(100, snapshot.reviews.first().score)
+        assertEquals(100, snapshot.reviews.first().voteCount)
+    }
+
+    @Test
+    fun `audit errors do not disclose endpoint details`() {
+        assertEquals("无法连接主节点", formatAuditError(java.net.ConnectException("100.90.76.108")))
+        assertEquals("读取审计资料超时", formatAuditError(java.net.SocketTimeoutException("Bearer secret")))
+        assertEquals("读取审计资料失败", formatAuditError(IllegalStateException("C:/secret")))
+    }
+
+    @Test
+    fun `auth capability normalizes gateway and standalone shapes`() {
+        val gateway = AuthCapabilityResponse(
+            required = true,
+            enforced = true,
+            mode = "local_totp",
+            bootstrapAvailable = true,
+        ).toSnapshot()
+        assertTrue(gateway.canAuthenticate)
+        assertEquals("local_totp", gateway.mode)
+
+        val standalone = AuthCapabilityResponse(
+            required = false,
+            available = false,
+            mode = "local_primary_node",
+            reasonCode = "auth_control_plane_unavailable",
+        ).toSnapshot()
+        assertFalse(standalone.canAuthenticate)
+        assertEquals("auth_control_plane_unavailable", standalone.reasonCode)
+    }
+
+    @Test
+    fun `auth errors never disclose response details`() {
+        assertEquals("无法连接认证控制面", formatAuthError(java.net.ConnectException("100.90.76.108")))
+        assertEquals("认证控制面响应超时", formatAuthError(java.net.SocketTimeoutException("Bearer secret")))
+        assertEquals("认证会话无效或已过期", formatAuthError(IllegalStateException("HTTP 401: secret")))
+        assertEquals("认证服务不可用", formatAuthError(IllegalStateException("C:/secret")))
+    }
 
     @Test
     fun `selecting a session returns to chat and preserves unrelated state`() {

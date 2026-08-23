@@ -83,14 +83,28 @@ data class SessionInfo(
 )
 
 data class ClusterStatus(
-    val master: ClusterNode? = null,
-    val nodes: List<ClusterNode>? = null,
+    val running: Boolean = false,
+    @SerializedName("run_mode")
+    val runMode: String = "",
+    @SerializedName("nodes_ready")
+    val nodesReady: Boolean = false,
+    /** `api_server.py` returns this as a node-id keyed object, not an array. */
+    val nodes: Map<String, ClusterNode> = emptyMap(),
+    @SerializedName("current_task")
+    val currentTask: ClusterTask? = null,
     @SerializedName("online_count")
     val onlineCount: Int = 0,
     @SerializedName("total_count")
     val totalCount: Int = 0,
     @SerializedName("distributed_enabled")
     val distributedEnabled: Boolean = false
+)
+
+data class ClusterTask(
+    @SerializedName("task_id")
+    val taskId: String = "",
+    val state: String = "",
+    val elapsed: Double = 0.0,
 )
 
 data class ClusterNode(
@@ -107,7 +121,11 @@ data class ClusterNode(
     @SerializedName("task_count")
     val taskCount: Int = 0,
     @SerializedName("avg_rtt_ms")
-    val avgRttMs: Float = 0f
+    val avgRttMs: Float = 0f,
+    @SerializedName("error_count")
+    val errorCount: Int = 0,
+    @SerializedName("is_available")
+    val isAvailable: Boolean = false,
 )
 
 data class RegisterNodeRequest(
@@ -330,10 +348,173 @@ data class GgufModelsResponse(
     val count: Int = 0,
 )
 
+/** Path-free model configuration returned by the main-node registry. */
+data class ServerModelSummary(
+    @SerializedName("model_id") val modelId: String = "",
+    val name: String = "",
+    @SerializedName("model_type") val modelType: String = "",
+    @SerializedName("is_builtin") val isBuiltin: Boolean = false,
+    @SerializedName("is_experimental") val isExperimental: Boolean = false,
+    @SerializedName("is_available") val isAvailable: Boolean = false,
+    @SerializedName("unavailable_reason") val unavailableReason: String = "",
+    @SerializedName("available_formats") val availableFormats: List<String> = emptyList(),
+    @SerializedName("has_safetensors") val hasSafetensors: Boolean = false,
+    @SerializedName("has_gguf") val hasGguf: Boolean = false,
+    @SerializedName("preferred_engine") val preferredEngine: String = "",
+    @SerializedName("recommended_vram_gb") val recommendedVramGb: Double? = null,
+)
+
+data class ServerModelsResponse(
+    val models: List<ServerModelSummary> = emptyList(),
+    @SerializedName("active_model_id") val activeModelId: String? = null,
+)
+
+/** Runtime status deliberately excludes server filesystem paths. */
+data class CurrentModelStatus(
+    val loaded: Boolean = false,
+    @SerializedName("pipeline_prepared") val pipelinePrepared: Boolean = false,
+    @SerializedName("model_id") val modelId: String? = null,
+    @SerializedName("model_name") val modelName: String = "",
+    val engine: String = "",
+    @SerializedName("quant_type") val quantType: String? = null,
+)
+
+/** Read-only local-asset projection. Paths and runtime hints stay on the main node. */
+data class LocalModelAssetSummary(
+    @SerializedName("model_id") val modelId: String = "",
+    val name: String = "",
+    @SerializedName("model_type") val modelType: String = "",
+    @SerializedName("available_formats") val availableFormats: List<String> = emptyList(),
+    @SerializedName("total_bytes") val totalBytes: Long = 0L,
+    val integrity: String = "",
+    @SerializedName("runtime_status") val runtimeStatus: String = "",
+)
+
+data class LocalModelAssetsResponse(
+    val assets: List<LocalModelAssetSummary> = emptyList(),
+    val summary: LocalModelAssetsSummary = LocalModelAssetsSummary(),
+)
+
+data class LocalModelAssetsSummary(
+    val total: Int = 0,
+    @SerializedName("total_bytes") val totalBytes: Long = 0L,
+)
+
+/** Inputs for the Android read-only model-fleet projection. */
+data class MasterModelFleetData(
+    val current: CurrentModelStatus = CurrentModelStatus(),
+    val registry: ServerModelsResponse = ServerModelsResponse(),
+    val localAssets: LocalModelAssetsResponse = LocalModelAssetsResponse(),
+    val verifiedGguf: List<GgufModelInfo> = emptyList(),
+)
+
+/** Content-free audit summaries returned by /api/workflows?summary=1. */
+data class AuditAttemptSummary(
+    @SerializedName("attempt_id") val attemptId: String = "",
+    @SerializedName("provider_kind") val providerKind: String = "",
+    @SerializedName("provider_node_id") val providerNodeId: String = "",
+    val state: String = "",
+    @SerializedName("error_code") val errorCode: String = "",
+    @SerializedName("started_at") val startedAt: Double = 0.0,
+    @SerializedName("finished_at") val finishedAt: Double = 0.0,
+    @SerializedName("duration_seconds") val durationSeconds: Double = 0.0,
+)
+
+data class AuditStageSummary(
+    @SerializedName("stage_id") val stageId: String = "",
+    @SerializedName("stage_type") val stageType: String = "",
+    val state: String = "",
+    @SerializedName("started_at") val startedAt: Double = 0.0,
+    @SerializedName("finished_at") val finishedAt: Double = 0.0,
+    @SerializedName("duration_seconds") val durationSeconds: Double = 0.0,
+    @SerializedName("retry_count") val retryCount: Int = 0,
+    @SerializedName("result_rejection_count") val resultRejectionCount: Int = 0,
+    @SerializedName("error_code") val errorCode: String = "",
+    @SerializedName("attempt_count") val attemptCount: Int = 0,
+    val attempts: List<AuditAttemptSummary> = emptyList(),
+)
+
+data class AuditObservabilitySummary(
+    val state: String = "",
+    @SerializedName("result_ready") val resultReady: Boolean = false,
+    val terminal: Boolean = false,
+    @SerializedName("partial_result") val partialResult: Boolean = false,
+    @SerializedName("recovered_after_restart") val recoveredAfterRestart: Boolean = false,
+    @SerializedName("retry_count") val retryCount: Int = 0,
+    @SerializedName("same_provider_retry_count") val sameProviderRetryCount: Int = 0,
+    @SerializedName("reassignment_count") val reassignmentCount: Int = 0,
+    val retrying: Boolean = false,
+    @SerializedName("result_rejection_count") val resultRejectionCount: Int = 0,
+    @SerializedName("winner_count") val winnerCount: Int = 0,
+    @SerializedName("actual_providers") val actualProviders: List<String> = emptyList(),
+    @SerializedName("actual_nodes") val actualNodes: List<String> = emptyList(),
+)
+
+data class AuditWorkflowSummary(
+    @SerializedName("workflow_id") val workflowId: String = "",
+    val template: String = "",
+    val state: String = "",
+    @SerializedName("created_at") val createdAt: Double = 0.0,
+    @SerializedName("started_at") val startedAt: Double = 0.0,
+    @SerializedName("result_ready_at") val resultReadyAt: Double = 0.0,
+    @SerializedName("finished_at") val finishedAt: Double = 0.0,
+    @SerializedName("duration_seconds") val durationSeconds: Double = 0.0,
+    @SerializedName("stage_count") val stageCount: Int = 0,
+    @SerializedName("completed_stage_count") val completedStageCount: Int = 0,
+    @SerializedName("failed_stage_count") val failedStageCount: Int = 0,
+    @SerializedName("attempt_count") val attemptCount: Int = 0,
+    @SerializedName("retry_count") val retryCount: Int = 0,
+    @SerializedName("same_provider_retry_count") val sameProviderRetryCount: Int = 0,
+    @SerializedName("result_rejection_count") val resultRejectionCount: Int = 0,
+    @SerializedName("cancel_requested") val cancelRequested: Boolean = false,
+    val observability: AuditObservabilitySummary = AuditObservabilitySummary(),
+    val stages: List<AuditStageSummary> = emptyList(),
+)
+
+data class AuditWorkflowsResponse(
+    val enabled: Boolean = false,
+    val available: Boolean = false,
+    val role: String = "",
+    val workflows: List<AuditWorkflowSummary> = emptyList(),
+)
+
+/** Review ticket projection excludes transfer reasons, comments and voter identities. */
+data class ReviewTicketSummary(
+    @SerializedName("ticket_id") val ticketId: String = "",
+    val status: String = "",
+    @SerializedName("created_at") val createdAt: Double = 0.0,
+    @SerializedName("target_node_id") val targetNodeId: String = "",
+    val score: Int = 0,
+    @SerializedName("expires_at") val expiresAt: Double = 0.0,
+    @SerializedName("resolved_at") val resolvedAt: Double = 0.0,
+    @SerializedName("vote_count") val voteCount: Int = 0,
+)
+
+data class AuditReviewTicketsResponse(
+    val tickets: List<ReviewTicketSummary> = emptyList(),
+    val count: Int = 0,
+)
+
+data class AuditData(
+    val workflows: AuditWorkflowsResponse = AuditWorkflowsResponse(),
+    val reviewTickets: AuditReviewTicketsResponse = AuditReviewTicketsResponse(),
+)
+
 data class AuthLoginRequest(
     val username: String,
     val code: String? = null,
     @SerializedName("recovery_code") val recoveryCode: String? = null,
+)
+
+data class AuthCapabilityResponse(
+    val required: Boolean = false,
+    val enforced: Boolean = false,
+    val available: Boolean = false,
+    val mode: String = "",
+    @SerializedName("bootstrap_available") val bootstrapAvailable: Boolean = false,
+    @SerializedName("reason_code") val reasonCode: String = "",
+    @SerializedName("policy_version") val policyVersion: String = "",
+    val service: String = "",
 )
 
 data class AuthUser(
@@ -341,6 +522,9 @@ data class AuthUser(
     val username: String = "",
     @SerializedName("display_name") val displayName: String? = null,
     val role: String = "",
+    val status: String? = null,
+    @SerializedName("totp_state") val totpState: String? = null,
+    @SerializedName("active_session_count") val activeSessionCount: Int? = null,
 )
 
 data class AuthLoginResponse(
@@ -381,6 +565,7 @@ class ApiClient(
 ) {
     /** Login is anonymous; all other control-plane requests may use the local session. */
     private val anonymousPaths = setOf(
+        "/api/auth/capability",
         "/api/auth/login",
         "/api/auth/bootstrap",
         "/api/auth/totp/verify",
@@ -421,6 +606,19 @@ class ApiClient(
 
     private val diffusionTerminalStates = setOf("completed", "failed", "cancelled")
 
+    /** Read the public auth boundary without requiring a local bearer token. */
+    suspend fun getAuthCapability(): Result<AuthCapabilityResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/capability")
+                .get()
+                .build()
+            executeJson(request, AuthCapabilityResponse::class.java)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     /** Authenticate against the local control plane and persist the encrypted session. */
     suspend fun login(
         username: String,
@@ -442,7 +640,7 @@ class ApiClient(
             val response = executeAsync(request)
             val responseBody = response.body?.string() ?: "{}"
             if (!response.isSuccessful) {
-                return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
+                return@withContext Result.failure(IOException("HTTP ${response.code}"))
             }
             val session = gson.fromJson(responseBody, AuthLoginResponse::class.java).toStoredSession()
             require(session.isValid()) { "auth login response is invalid" }
@@ -949,6 +1147,88 @@ class ApiClient(
     }
 
     // ==================== Remote GGUF catalog ====================
+
+    suspend fun getModels(): Result<ServerModelsResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/models")
+                .get()
+                .build()
+            executeJson(request, ServerModelsResponse::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getCurrentModel(): Result<CurrentModelStatus> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/models/current")
+                .get()
+                .build()
+            executeJson(request, CurrentModelStatus::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getLocalModelAssets(): Result<LocalModelAssetsResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/models/local-assets")
+                .get()
+                .build()
+            executeJson(request, LocalModelAssetsResponse::class.java)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Read the four existing model inventory endpoints as one bounded snapshot.
+     * This method only aggregates server-owned metadata; it never starts a model,
+     * changes a registry entry, or mutates the Android SAF model directory.
+     */
+    suspend fun getModelFleetData(): Result<MasterModelFleetData> = withContext(Dispatchers.IO) {
+        try {
+            val current = getCurrentModel().getOrThrow()
+            val registry = getModels().getOrThrow()
+            val localAssets = getLocalModelAssets().getOrThrow()
+            val verifiedGguf = getGgufModels().getOrThrow()
+            Result.success(MasterModelFleetData(current, registry, localAssets, verifiedGguf))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Read only bounded audit summaries; the server omits prompts, errors, paths and comments. */
+    suspend fun getAuditData(): Result<AuditData> = withContext(Dispatchers.IO) {
+        try {
+            val workflowRequest = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/workflows?limit=8&summary=1")
+                .get()
+                .build()
+            val reviewRequest = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/cluster/review/tickets?limit=8&summary=1")
+                .get()
+                .build()
+            val workflows = executeJson(workflowRequest, AuditWorkflowsResponse::class.java).getOrThrow()
+            val reviews = executeJson(reviewRequest, AuditReviewTicketsResponse::class.java).getOrThrow()
+            Result.success(AuditData(workflows, reviews))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 
     suspend fun getGgufModels(): Result<List<GgufModelInfo>> = withContext(Dispatchers.IO) {
         try {

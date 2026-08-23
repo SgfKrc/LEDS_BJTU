@@ -139,6 +139,38 @@ fun formatMessageSendError(error: Throwable): String = when (error) {
     else -> "发送失败: ${error.message ?: error.javaClass.simpleName}"
 }
 
+/** Cluster status is diagnostic-only; do not echo endpoints, response bodies, or credentials into the UI. */
+fun formatClusterOverviewError(error: Throwable): String = when (error) {
+    is java.net.ConnectException -> "无法连接主节点"
+    is java.net.SocketTimeoutException -> "读取主节点状态超时"
+    else -> "读取集群状态失败"
+}
+
+/** Model inventory errors must not disclose the endpoint, response body, or credentials. */
+fun formatModelFleetError(error: Throwable): String = when (error) {
+    is java.net.ConnectException -> "无法连接主节点"
+    is java.net.SocketTimeoutException -> "读取模型舰队超时"
+    else -> "读取模型舰队失败"
+}
+
+/** Audit summaries are diagnostic-only and must not echo response bodies or credentials. */
+fun formatAuditError(error: Throwable): String = when (error) {
+    is java.net.ConnectException -> "无法连接主节点"
+    is java.net.SocketTimeoutException -> "读取审计资料超时"
+    else -> "读取审计资料失败"
+}
+
+/** Authentication failures are intentionally coarse; never echo response bodies or secrets. */
+fun formatAuthError(error: Throwable): String = when (error) {
+    is java.net.ConnectException -> "无法连接认证控制面"
+    is java.net.SocketTimeoutException -> "认证控制面响应超时"
+    else -> when {
+        error.message?.contains("HTTP 401") == true || error.message?.contains("HTTP 403") == true ->
+            "认证会话无效或已过期"
+        else -> "认证服务不可用"
+    }
+}
+
 /** Android 节点 presence 设备信息 payload（纯组装；不包含模型绝对路径/密钥）。 */
 fun buildAndroidPresencePayload(
     inferenceMode: String,

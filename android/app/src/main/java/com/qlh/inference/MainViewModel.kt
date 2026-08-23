@@ -98,6 +98,10 @@ data class MainUiState(
     val runtimeStatusError: String? = null,
     val themeMode: String = SettingsDataStore.DEFAULT_THEME_MODE,
     val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
+    val clusterOverview: ClusterOverviewUiState = ClusterOverviewUiState(),
+    val modelFleet: ModelFleetUiState = ModelFleetUiState(),
+    val audit: AuditUiState = AuditUiState(),
+    val authControl: AuthControlUiState = AuthControlUiState(),
     val appUpdate: AppUpdateUiState = AppUpdateUiState(),
 
     // 上次发送的消息（用于重试）
@@ -194,6 +198,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 selectedModelName = selectedModel?.name.orEmpty(),
                 selectedModelSizeBytes = selectedModel?.sizeBytes ?: 0L,
                 authSession = authStore.read(),
+                authControl = AuthControlUiState(
+                    localSessionPresent = authStore.read() != null,
+                ),
             )
             QlhApplication.instance.inferenceService?.modelContextSize = contextSize
             ensureAndroidBootstrap()
@@ -456,40 +463,115 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Authenticate the Android client; the token is persisted only in Android Keystore-backed storage. */
     fun login(username: String, code: String? = null, recoveryCode: String? = null) {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(authBusy = true, authError = null)
+            _uiState.value = _uiState.value.copy(
+                authBusy = true,
+                authError = null,
+                authControl = _uiState.value.authControl.copy(busy = true, error = null),
+            )
             val result = apiClient().login(username, code, recoveryCode)
+            val session = result.getOrNull()
+            val error = result.exceptionOrNull()?.let(::formatAuthError)
             _uiState.value = _uiState.value.copy(
                 authBusy = false,
-                authSession = result.getOrNull() ?: authStore.read(),
-                authError = result.exceptionOrNull()?.message,
+                authSession = session ?: authStore.read(),
+                authError = error,
+                authControl = _uiState.value.authControl.copy(
+                    busy = false,
+                    account = session?.toAccountSnapshot(),
+                    localSessionPresent = session != null || authStore.read() != null,
+                    error = error,
+                ),
+            )
+        }
+    }
+
+    /** Refresh capability first, then validate a stored session; failure never shows a stale account. */
+    fun refreshAuthControl() {
+        viewModelScope.launch {
+            val current = _uiState.value
+            _uiState.value = current.copy(
+                authControl = current.authControl.copy(
+                    loading = true,
+                    error = null,
+                    account = null,
+                    localSessionPresent = authStore.read() != null,
+                ),
+            )
+            val capabilityResult = apiClient().getAuthCapability()
+            if (capabilityResult.isFailure) {
+                val error = formatAuthError(capabilityResult.exceptionOrNull()!!)
+                _uiState.value = _uiState.value.copy(
+                    authBusy = false,
+                    authError = error,
+                    authControl = _uiState.value.authControl.copy(
+                        capability = null,
+                        loading = false,
+                        account = null,
+                        error = error,
+                    ),
+                )
+                return@launch
+            }
+
+            val capability = capabilityResult.getOrThrow().toSnapshot()
+            val localSession = authStore.read()
+            if (!capability.canAuthenticate || localSession == null) {
+                _uiState.value = _uiState.value.copy(
+                    authBusy = false,
+                    authError = null,
+                    authControl = _uiState.value.authControl.copy(
+                        capability = capability,
+                        loading = false,
+                        account = null,
+                        localSessionPresent = localSession != null,
+                        error = null,
+                    ),
+                )
+                return@launch
+            }
+
+            val sessionResult = apiClient().getAuthSession()
+            val error = sessionResult.exceptionOrNull()?.let(::formatAuthError)
+            _uiState.value = _uiState.value.copy(
+                authBusy = false,
+                authError = error,
+                authSession = if (sessionResult.isSuccess) localSession else authStore.read(),
+                authControl = _uiState.value.authControl.copy(
+                    capability = capability,
+                    loading = false,
+                    account = sessionResult.getOrNull()?.toAccountSnapshot(),
+                    localSessionPresent = authStore.read() != null,
+                    error = error,
+                ),
             )
         }
     }
 
     /** Revalidate the local session against the control plane without exposing credentials to UI code. */
     fun refreshAuthSession() {
-        viewModelScope.launch {
-            val result = apiClient().getAuthSession()
-            if (result.isFailure) {
-                _uiState.value = _uiState.value.copy(
-                    authSession = authStore.read(),
-                    authError = result.exceptionOrNull()?.message,
-                )
-            } else {
-                _uiState.value = _uiState.value.copy(authSession = authStore.read(), authError = null)
-            }
-        }
+        refreshAuthControl()
     }
 
     /** Clear local credentials even when the control plane is offline. */
     fun logout() {
         viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(authBusy = true, authError = null)
+            _uiState.value = _uiState.value.copy(
+                authBusy = true,
+                authError = null,
+                authControl = _uiState.value.authControl.copy(busy = true, account = null, error = null),
+            )
             val result = apiClient().logout()
+            val error = result.exceptionOrNull()?.let(::formatAuthError)
             _uiState.value = _uiState.value.copy(
                 authBusy = false,
                 authSession = null,
-                authError = result.exceptionOrNull()?.message,
+                authError = error,
+                authControl = _uiState.value.authControl.copy(
+                    busy = false,
+                    account = null,
+                    localSessionPresent = false,
+                    error = error,
+                ),
             )
         }
     }
@@ -662,6 +744,89 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             healthLoading = false,
                             healthError = error.message ?: error.javaClass.simpleName,
                         )
+                    )
+                }
+        }
+    }
+
+    /** Refresh only the safe, read-only cluster projection used by Settings. */
+    fun refreshClusterOverview() {
+        if (_uiState.value.clusterOverview.loading) return
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                clusterOverview = state.clusterOverview.copy(loading = true, error = null),
+            )
+            apiClient(state).getClusterStatus()
+                .onSuccess { status ->
+                    _uiState.value = _uiState.value.copy(
+                        clusterOverview = ClusterOverviewUiState(
+                            snapshot = toClusterOverviewSnapshot(status),
+                        ),
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        clusterOverview = _uiState.value.clusterOverview.copy(
+                            loading = false,
+                            error = formatClusterOverviewError(error),
+                        ),
+                    )
+                }
+        }
+    }
+
+    /** Refresh the mobile-safe model-fleet projection; it has no deployment controls. */
+    fun refreshModelFleet() {
+        if (_uiState.value.modelFleet.loading) return
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                modelFleet = state.modelFleet.copy(loading = true, error = null),
+            )
+            apiClient(state).getModelFleetData()
+                .onSuccess { data ->
+                    _uiState.value = _uiState.value.copy(
+                        modelFleet = ModelFleetUiState(
+                            snapshot = toModelFleetSnapshot(
+                                data = data,
+                                androidSelectedModelName = state.selectedModelName,
+                                androidSelectedModelSizeBytes = state.selectedModelSizeBytes,
+                            ),
+                        ),
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        modelFleet = _uiState.value.modelFleet.copy(
+                            loading = false,
+                            error = formatModelFleetError(error),
+                        ),
+                    )
+                }
+        }
+    }
+
+    /** Refresh the bounded, content-free audit projection used by Android Settings. */
+    fun refreshAudit() {
+        if (_uiState.value.audit.loading) return
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                audit = state.audit.copy(loading = true, error = null),
+            )
+            apiClient(state).getAuditData()
+                .onSuccess { data ->
+                    _uiState.value = _uiState.value.copy(
+                        audit = AuditUiState(snapshot = toAuditSnapshot(data)),
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        audit = _uiState.value.audit.copy(
+                            loading = false,
+                            error = formatAuditError(error),
+                        ),
                     )
                 }
         }
