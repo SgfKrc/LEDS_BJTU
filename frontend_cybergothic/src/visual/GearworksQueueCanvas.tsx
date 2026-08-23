@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useReducedMotion } from '../motion/useReducedMotion';
+import { drawEtchedFrame, drawRoseWindow } from './canvasOrnaments';
 
 const DPR_MAX = 2;
 
@@ -78,6 +79,8 @@ export function GearworksQueueCanvas({ className = '' }: { className?: string })
       const driftX = pointerX * 12;
       const driftY = pointerY * 9;
 
+      drawEtchedFrame(ctx, width * 0.065, height * 0.1, width * 0.87, height * 0.75, { stroke: line, alpha: 0.14 });
+
       ctx.save();
       ctx.translate(driftX * 0.16, driftY * 0.12);
       ctx.strokeStyle = line;
@@ -115,6 +118,13 @@ export function GearworksQueueCanvas({ className = '' }: { className?: string })
         ctx.lineTo(gateX + gateWidth * 0.36, y);
         ctx.stroke();
       }
+      drawRoseWindow(ctx, gateX, gateY + gateHeight * 0.23, Math.min(gateWidth, gateHeight) * 0.18, {
+        stroke: gold,
+        accent: brass,
+        alpha: 0.2,
+        rotation: -phase * 0.08,
+        petals: 8,
+      });
       ctx.restore();
 
       const laneLength = Math.min(width * 0.46, 520);

@@ -5,7 +5,7 @@
  */
 
 import { Menu, RefreshCw, Zap } from 'lucide-react';
-import { ROUTES, routeHref, type RouteDef, type RouteId } from '../routes';
+import { PRIMARY_NAV_IDS, ROUTES, routeHref, type RouteDef, type RouteId } from '../routes';
 import { useMotionPreference } from '../../motion/useReducedMotion';
 
 interface TopbarProps {
@@ -33,6 +33,8 @@ export function Topbar({
   const connectionLabel =
     online === null ? '检测中' : online ? '已连接' : '未连接';
   const connectionTone = online === null ? 'idle' : online ? 'ok' : 'danger';
+  const primaryRoutes = ROUTES.filter((route) => PRIMARY_NAV_IDS.includes(route.id));
+  const currentIsSecondary = !PRIMARY_NAV_IDS.includes(current.id);
 
   return (
     <header className="topbar">
@@ -49,7 +51,7 @@ export function Topbar({
 
         <nav className="topnav" aria-label="主导航">
           <ul className="topnav__list">
-            {ROUTES.map((route) => {
+            {primaryRoutes.map((route) => {
               const isActive = route.id === current.id;
               return (
                 <li key={route.id}>
@@ -105,7 +107,9 @@ export function Topbar({
             type="button"
             className="iconbtn iconbtn--menu"
             onClick={onOpenMenu}
-            aria-label="打开菜单"
+            aria-label={`打开菜单（更多功能）${currentIsSecondary ? `，当前：${current.label}` : ''}`}
+            data-active={currentIsSecondary ? 'true' : undefined}
+            title="更多功能"
           >
             <Menu size={18} strokeWidth={2.25} />
           </button>

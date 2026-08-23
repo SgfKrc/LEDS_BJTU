@@ -6653,11 +6653,18 @@ class TestSchedulerStartupDecisions:
         wait = _ImmediateStartupWait()
         monkeypatch.setattr(sched, "_startup_cancel_event", wait)
         sched._running = True
-        discoveries = [
-            {"found": True, "master_host": "100.64.0.10", "master_port": 8899},
-            {"found": True, "master_host": "100.64.0.11", "master_port": 8900},
-        ]
-        monkeypatch.setattr(sched, "discover_master", lambda **kwargs: discoveries.pop(0))
+        monkeypatch.setattr(
+            sched,
+            "discover_master",
+            lambda **kwargs: {"found": True, "master_host": "100.64.0.10", "master_port": 8899},
+        )
+        monkeypatch.setattr(
+            sched,
+            "_discover_master_fallbacks",
+            lambda host, port: [
+                {"found": True, "master_host": "100.64.0.11", "master_port": 8900, "source": "tailnet"},
+            ],
+        )
         connected = []
         monkeypatch.setattr(
             sched,

@@ -1,0 +1,82 @@
+/* Shared page depth: canvases stay readable behind information surfaces without competing with data. */
+:where(
+  .overview-page,
+  .tasks-page,
+  .activity-page,
+  .image-studio,
+  .models-page,
+  .downloads-page,
+  .cluster-page,
+  .account-page,
+  .audit-page,
+  .settings-page,
+  .help-page
+) {
+  --surface: rgba(20, 20, 25, 0.76);
+  --surface-raised: rgba(27, 27, 34, 0.84);
+  --surface-sunken: rgba(16, 16, 20, 0.82);
+  isolation: isolate;
+}
+
+:where(
+  .overview-page,
+  .tasks-page,
+  .activity-page,
+  .image-studio,
+  .models-page,
+  .downloads-page,
+  .cluster-page,
+  .account-page,
+  .audit-page,
+  .settings-page,
+  .help-page
+) > [class$='__bg'] {
+  opacity: 0.92;
+  pointer-events: none;
+}
+
+:where(
+  .overview-page,
+  .tasks-page,
+  .activity-page,
+  .image-studio,
+  .models-page,
+  .downloads-page,
+  .cluster-page,
+  .account-page,
+  .audit-page,
+  .settings-page,
+  .help-page
+) :is(.pagehead, [class*='-panel'], [class*='-workspace'], [class*='-rail'], [class*='-details']) {
+  backdrop-filter: blur(7px) saturate(92%);
+}
+
+.split,
+.split__pane--left {
+  background: color-mix(in srgb, var(--bg) 84%, transparent);
+}
+
+.split__pane--right,
+.chat__foot {
+  background: color-mix(in srgb, var(--gothic-bg) 88%, transparent);
+}
+
+@media (max-width: 860px) {
+  :where(
+    .overview-page,
+    .tasks-page,
+    .activity-page,
+    .image-studio,
+    .models-page,
+    .downloads-page,
+    .cluster-page,
+    .account-page,
+    .audit-page,
+    .settings-page,
+    .help-page
+  ) {
+    --surface: rgba(20, 20, 25, 0.88);
+    --surface-raised: rgba(27, 27, 34, 0.92);
+    --surface-sunken: rgba(16, 16, 20, 0.9);
+  }
+}

@@ -4,7 +4,7 @@
 
 import { useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
-import { ROUTES, routeHref, type RouteId } from '../routes';
+import { PRIMARY_NAV_IDS, ROUTES, routeHref, type RouteId } from '../routes';
 
 interface MobileNavProps {
   open: boolean;
@@ -85,8 +85,9 @@ export function MobileNav({ open, currentId, onClose, onNavigate }: MobileNavPro
           {ROUTES.map((route) => {
             const Icon = route.icon;
             const isActive = route.id === currentId;
+            const isPrimary = PRIMARY_NAV_IDS.includes(route.id);
             return (
-              <li key={route.id}>
+              <li key={route.id} className={isPrimary ? 'mobilenav__item mobilenav__item--primary' : 'mobilenav__item'}>
                 <a
                   className="mobilenav__link"
                   href={routeHref(route.id)}

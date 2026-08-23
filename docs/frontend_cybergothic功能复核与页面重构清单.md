@@ -2,7 +2,7 @@
 
 > 目的：以现有 `frontend` 为历史行为基线，盘点 `frontend_cybergothic` 的缺口，记录单机模式下 Overview 的故障路径，并给出后续分屏布局与逐页背景动效方案。
 >
-> 范围：本文件是实现清单和验收标准，不在本轮直接修改前端代码。已有的 StudyPact 风格分析与首期视觉计划见 [`StudyPact风格分析与frontend_cybergothic前端计划.md`](./StudyPact风格分析与frontend_cybergothic前端计划.md)。
+> 范围：本文件是实现清单和验收标准，不在本轮直接修改前端代码。已有的 StudyPact 风格分析与首期视觉计划见 [`StudyPact风格分析与frontend_cybergothic前端计划.md`](../local_docs/StudyPact风格分析与frontend_cybergothic前端计划.md)。
 
 ## 1. 当前基线
 

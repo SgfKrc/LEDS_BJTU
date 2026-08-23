@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useReducedMotion } from '../motion/useReducedMotion';
+import { drawEtchedFrame, drawRoseWindow } from './canvasOrnaments';
 
 const DPR_MAX = 2;
 
@@ -30,6 +31,8 @@ export function ModelOrbitCanvas({ className = '' }: { className?: string }) {
       const cx = width * 0.66;
       const cy = height * 0.42;
 
+      drawEtchedFrame(ctx, width * 0.06, height * 0.12, width * 0.86, height * 0.72, { stroke: line, alpha: 0.16 });
+
       ctx.save();
       ctx.strokeStyle = line;
       ctx.globalAlpha = 0.35;
@@ -54,6 +57,7 @@ export function ModelOrbitCanvas({ className = '' }: { className?: string }) {
         ctx.ellipse(0, 0, base * (0.2 + ring * 0.08), base * (0.08 + ring * 0.035), ring * 0.22, 0, Math.PI * 2);
         ctx.stroke();
       }
+      drawRoseWindow(ctx, 0, 0, base * 0.16, { stroke: gold, accent: brass, alpha: 0.23, rotation: -time * 0.04, petals: 10 });
       ctx.globalAlpha = 0.5;
       for (let node = 0; node < 12; node += 1) {
         const angle = node * Math.PI / 6;
@@ -64,6 +68,20 @@ export function ModelOrbitCanvas({ className = '' }: { className?: string }) {
         ctx.arc(x, y, 2.3 + (node % 2), 0, Math.PI * 2);
         ctx.fillStyle = node % 3 === 0 ? gold : brass;
         ctx.fill();
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.strokeStyle = brass;
+      ctx.globalAlpha = 0.17;
+      ctx.lineWidth = 1;
+      for (let column = 0; column < 5; column += 1) {
+        const x = width * (0.08 + column * 0.105);
+        ctx.beginPath();
+        ctx.moveTo(x, height * 0.2);
+        ctx.lineTo(x + 26, height * 0.72);
+        ctx.lineTo(x + 52, height * 0.2);
+        ctx.stroke();
       }
       ctx.restore();
 

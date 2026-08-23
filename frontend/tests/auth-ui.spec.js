@@ -110,6 +110,37 @@ test('legacy monolith without an auth capability keeps the existing workspace av
   await expect(page.getByTitle('退出登录')).toHaveCount(0);
 });
 
+test('standalone primary-node compatibility capability keeps the workspace available', async ({ page }) => {
+  await page.route((url) => url.pathname.startsWith('/api/'), async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/auth/capability') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          required: false,
+          enforced: false,
+          available: false,
+          mode: 'local_primary_node',
+          reason_code: 'auth_control_plane_unavailable',
+        }),
+      });
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({}),
+    });
+  });
+
+  await page.addInitScript(() => sessionStorage.setItem('qlh-auth-session-token', 'stale-gateway-token'));
+  await page.goto('/');
+
+  await expect(page.locator('.app-layout')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '认证服务不可用' })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem('qlh-auth-session-token'))).toBeNull();
+});
+
 test('auth capability errors fail closed', async ({ page }) => {
   await page.route('**/api/auth/capability', (route) => route.fulfill({
     status: 502,

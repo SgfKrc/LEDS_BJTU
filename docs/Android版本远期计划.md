@@ -1,14 +1,16 @@
 # Android 版本远期计划
 
-> 更新日期：2026-07-28
+> 更新日期：2026-08-23
 >
-> 状态：规划与技术预研（分布式部分全部未实施；UI 层已完成重构并通过 Full Debug Kotlin 编译，见 §2.3）
+> 状态：历史架构基线 + 远期技术预研（Android Full Worker 与 TaskGraph Stage 接线已完成本机开发门；真机完整推理、认证、长时与设备资源验收仍后置）
 >
-> 适用范围：Android Full/Lite 的当前能力边界，以及完整 Worker、任务链、GPU 后端与层段拆分的远期路线；除 §2.1 与 §2.3 外均为未实施规划
+> 适用范围：保留 Android Full/Lite、完整 Worker、任务链、GPU 后端与层段拆分的架构边界和远期路线；本文不再作为 Android 当前功能状态的唯一来源，现行排期以[安卓与PC功能差距清单](安卓与PC功能差距清单.md)和[总体下一步计划](总体下一步计划.md)为准
 >
-> 当前事实：Android Full 只能执行本机完整 llama.cpp 推理；Lite 只能把请求交给主节点；Android 不能加入现有 PC PyTorch 层间流水线
+> 当前事实：Android Full 已具备本地 GGUF/llama.cpp 推理，以及受模型身份、资源门和租约围栏约束的完整 Worker/TaskGraph Stage 代码路径；Lite 保持薄客户端；Android 仍不能加入现有 PC PyTorch 层间流水线
 >
 > 远期目标：完整推理 Worker -> 任务链拆分与分布式执行 -> 同一 llama.cpp/GGML 运行时的实验性跨设备拆分
+>
+> 2026-08-23 状态映射：下文 P1/P2 的原始设计已完成本机开发门，保留以说明协议和运行时边界；P3-P5 仍为未实施的候选路线，不得因 P1/P2 完成而推断 Android 可参与 PyTorch 层拆分或已通过真机验收。
 >
 > 关联文档：[Android SAF模型存储方案](Android%20SAF模型存储方案.md)、[PC与Android端交互体验优化计划](PC与Android端交互体验优化计划.md)、[分布式推理流水线实施计划](分布式推理流水线实施计划.md)、[混合分布式推理体系规划](混合分布式推理体系规划.md)、[三种分布式拆分细化实施方案](三种分布式拆分细化实施方案.md)
 
@@ -27,7 +29,7 @@ Android 后续不再限定为“全有或全无”，但必须区分三个完全
 核心判断：
 
 1. **当前 Android 不能做层间拆分。** 注册画像明确上报 `pipeline_worker=false`，主节点也会排除 `node_type=android`；JNI 使用 `model_params.n_gpu_layers=0`，当前仅 CPU 完整模型推理。
-2. **完整 Worker 可以落地。** Android 已经具备模型管理、前台 Service、llama.cpp JNI、完整生成和取消基础，只缺少主节点主动派发任务的长连接协议、租约、幂等、结果回传和资源准入。
+2. **完整 Worker 已完成本机开发接线。** Android 已具备模型管理、前台 Service、llama.cpp JNI、完整生成和取消基础，并已接入任务协议、租约/幂等/迟到结果围栏、调度准入和 Stage executor；真实认证、Android 端实际推理、网络切换、温控/电量和长时设备验收仍未完成。
 3. **任务链拆分比层间拆分更适合异构设备。** 阶段之间传递文本或结构化数据，不要求 Android 与 PC 使用同一模型格式、张量布局或执行引擎。
 4. **Android 参与“分布式推理”可以有两种含义。** 一种是完整任务在多个 Worker 间并发/串行编排；另一种才是单次生成的模型层跨设备计算。前者可产品化，后者仍是实验。
 5. **Android GPU 加速应用可以落地，但应叫 GPU 加速版，不应泛称独显版。** 主流 Android 平板使用 SoC 集成 GPU 并共享系统内存。上游 llama.cpp 已明确验证部分 Qualcomm Adreno OpenCL 设备，但这不等于所有 Android GPU 都可稳定运行。
@@ -48,14 +50,14 @@ Android 后续不再限定为“全有或全无”，但必须区分三个完全
 | llama.cpp JNI 完整模型生成 | 是 | 否 |
 | 前台 `InferenceService` | 是 | 仅保留必要壳层 |
 | 集群 presence 注册 | 是 | 是 |
-| 接收主节点完整推理任务 | 否 | 否 |
+| 接收主节点完整推理任务 | 开发门完成；真机未验 | 否 |
 | PC PyTorch 层间流水线 Worker | 否 | 否 |
 | Android GPU 计算后端 | 否 | 否 |
 
 代码层面的当前约束：
 
 - `MainViewModel.buildAndroidPresenceDeviceInfo()` 上报 `pipeline_worker=false`。
-- `api_server.py` 和 `scheduler.py` 将 Android 视为 presence 节点，不纳入 PC 层分配。
+- `api_server.py` 和 `scheduler.py` 继续将 Android 排除在 PC PyTorch 层分配之外；仅在精确模型身份、单并发和 `resource_gate` 均满足时，才允许 `android_full_worker` 承接完整推理 Stage。
 - `qlh_llama_jni.cpp` 固定 `n_gpu_layers=0`。
 - Android CMake 没有启用 `GGML_OPENCL`、`GGML_VULKAN` 或 `GGML_RPC`。
 - 当前集群层间协议由 PC PyTorch 模型执行，传递 PyTorch hidden states，不是 llama.cpp/GGML RPC 协议。
@@ -413,9 +415,9 @@ OpenCL 当前有最明确的上游 Android/Adreno 验证记录，因此建议优
 
 验收：Android 注册不会改变 PC 层配置，任务统计不误报 Android 参与层间推理。
 
-进度（2026-08-17）：P0 的边界约束继续成立（`pipeline_worker=false`、主节点仍排除 Android 层分配）。§2.3 的 UI 层重构已通过 Full Debug Kotlin 编译，属于 P0 中“UI 明确区分状态”的配套改造，但尚未安装与目视验收；P1 已完成 Android `qlh.task_worker` v2 协议、前台 Worker Service、连接退避与取消/迟到结果 fencing 的开发，真实认证、PC scheduler 准入、ServerSocket 对端契约和设备验收后置；P2–P5 尚未开始。
+进度（2026-08-23）：P0 的边界约束继续成立（`pipeline_worker=false`、主节点仍排除 Android 层分配）。§2.3 UI 已完成既有编译/真机验收记录；P1 已完成 Android `qlh.task_worker` v2 协议、前台 Worker Service、连接退避、取消/迟到结果 fencing 和 scheduler `android_full_worker` 准入的本机开发门；P2 已完成可注入 Full Worker Stage executor、TaskGraph/SQLite journal fake 回归。真实认证、Android offer→本地推理、网络切换、温控/电量和长时设备验收后置；P3–P5 尚未开始。
 
-### P1：完整 Worker 协议原型
+### P1：完整 Worker 协议原型（本机开发门已完成）
 
 - Android 主动长连接和能力注册。
 - `TASK_OFFER/ACCEPT/RESULT/CANCEL` 最小协议。
@@ -425,7 +427,7 @@ OpenCL 当前有最明确的上游 Android/Adreno 验证记录，因此建议优
 
 验收：主节点派发一项完整推理；Android 返回结果；断网后任务能重派且旧结果被丢弃。
 
-### P2：任务链/DAG 调度
+### P2：任务链/DAG 调度（本机开发门已完成；真机执行验收后置）
 
 - 新建业务 `TaskGraphScheduler`，与层拓扑 `GraphOrchestrator` 分离。
 - 支持 Stage 依赖、并行分支、checkpoint、重试和聚合。
