@@ -160,6 +160,13 @@ fun formatAuditError(error: Throwable): String = when (error) {
     else -> "读取审计资料失败"
 }
 
+/** Management errors are intentionally generic; never echo response bodies or IDs. */
+fun formatManagementError(error: Throwable): String = when (error) {
+    is java.net.ConnectException -> "无法连接主节点"
+    is java.net.SocketTimeoutException -> "读取管理控制面超时"
+    else -> "管理控制面不可用或权限不足"
+}
+
 /** Authentication failures are intentionally coarse; never echo response bodies or secrets. */
 fun formatAuthError(error: Throwable): String = when (error) {
     is java.net.ConnectException -> "无法连接认证控制面"

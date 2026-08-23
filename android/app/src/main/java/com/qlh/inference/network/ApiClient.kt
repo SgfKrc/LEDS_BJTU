@@ -525,6 +525,7 @@ data class AuthUser(
     val status: String? = null,
     @SerializedName("totp_state") val totpState: String? = null,
     @SerializedName("active_session_count") val activeSessionCount: Int? = null,
+    @SerializedName("aggregate_version") val aggregateVersion: Int? = null,
 )
 
 data class AuthLoginResponse(
@@ -597,6 +598,26 @@ data class ManageConfirmResponse(
     fun isValid(): Boolean = confirmToken.isNotBlank() && action.isNotBlank()
 }
 
+data class ManagedUsersResponse(
+    val users: List<AuthUser> = emptyList(),
+)
+
+data class TailscaleBindingsResponse(
+    val bindings: List<TailscaleBinding> = emptyList(),
+)
+
+data class TailscaleBinding(
+    @SerializedName("binding_id") val bindingId: String = "",
+    @SerializedName("user_id") val userId: String? = null,
+    @SerializedName("tailnet_id") val tailnetId: String? = null,
+    @SerializedName("tailscale_user_id") val tailscaleUserId: String? = null,
+    @SerializedName("node_id") val nodeId: String? = null,
+    val state: String? = null,
+    @SerializedName("authorization_method") val authorizationMethod: String? = null,
+    @SerializedName("confirmed_at") val confirmedAt: String? = null,
+    @SerializedName("updated_at") val updatedAt: String? = null,
+)
+
 // ================================================================
 // API 客户端
 // ================================================================
@@ -636,9 +657,11 @@ class ApiClient(
         }
         .addInterceptor(HttpLoggingInterceptor().apply {
             redactHeader("Authorization")
-            // BODY 级别会打印完整聊天内容，仅 debug 构建时使用
+            redactHeader("X-QLH-Confirm-Token")
+            // Never log request/response bodies: chat content and one-shot
+            // management confirmation tokens are user secrets.
             level = if (BuildConfig.DEBUG) {
-                HttpLoggingInterceptor.Level.BODY
+                HttpLoggingInterceptor.Level.HEADERS
             } else {
                 HttpLoggingInterceptor.Level.NONE
             }
@@ -760,7 +783,10 @@ class ApiClient(
     suspend fun requestManageConfirm(action: String, targetId: String): Result<ManageConfirmResponse> = withContext(Dispatchers.IO) {
         try {
             require(action.isNotBlank()) { "action is required" }
-            val payload = "{\"action\":\"${action}\",\"target_id\":\"${targetId}\"}"
+            require(targetId.isNotBlank()) { "target id is required" }
+            // Use the JSON encoder rather than string interpolation: target IDs are
+            // user-owned data and must not be able to alter the confirmation body.
+            val payload = gson.toJson(mapOf("action" to action, "target_id" to targetId))
             val request = Request.Builder()
                 .url("$baseUrl/api/auth/manage/confirm")
                 .post(payload.toRequestBody(jsonMediaType))
@@ -776,6 +802,34 @@ class ApiClient(
                 return@withContext Result.failure(IOException("confirm token response invalid"))
             }
             Result.success(confirmation)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Bounded manager-only user projection; secret/authenticator fields are discarded by DTO. */
+    suspend fun fetchManagedUsers(): Result<ManagedUsersResponse> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("$baseUrl/api/users")
+                .get()
+                .build()
+            executeJson(request, ManagedUsersResponse::class.java)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /** Read one user's safe Tailnet binding projection for the manager surface. */
+    suspend fun fetchUserTailscaleBindings(userId: String): Result<TailscaleBindingsResponse> = withContext(Dispatchers.IO) {
+        try {
+            require(userId.isNotBlank()) { "user id is required" }
+            val encodedUserId = java.net.URLEncoder.encode(userId, Charsets.UTF_8.name())
+            val request = Request.Builder()
+                .url("$baseUrl/api/auth/users/$encodedUserId/tailscale")
+                .get()
+                .build()
+            executeJson(request, TailscaleBindingsResponse::class.java)
         } catch (e: Exception) {
             Result.failure(e)
         }

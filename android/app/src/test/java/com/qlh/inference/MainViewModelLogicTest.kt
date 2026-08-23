@@ -56,6 +56,34 @@ class MainViewModelLogicTest {
         assertEquals("other", networkTypeFromTransports(false, false, false, false))
     }
 
+    @Test
+    fun `management projection is bounded and only allows manager roles`() {
+        val user = com.qlh.inference.network.AuthUser(
+            userId = "u-1",
+            username = "alice",
+            displayName = "Alice",
+            role = "admin",
+            status = "active",
+            aggregateVersion = 4,
+        )
+        val binding = com.qlh.inference.network.TailscaleBinding(
+            bindingId = "b-1",
+            userId = "u-1",
+            tailnetId = "tailnet-a",
+            tailscaleUserId = "ts-a",
+            nodeId = "node-a",
+            state = "active",
+        )
+        val snapshot = user.toManagedUserSnapshot(listOf(binding.toManagedBindingSnapshot("u-1")))
+        assertEquals("Alice", snapshot.displayName)
+        assertEquals(4, snapshot.aggregateVersion)
+        assertEquals("tailnet-a", snapshot.bindings.single().tailnetId)
+        assertTrue(managementRoleAllowed("owner"))
+        assertTrue(managementRoleAllowed("admin"))
+        assertFalse(managementRoleAllowed("member"))
+        assertFalse(managementRoleAllowed(null))
+    }
+
     // ---- buildAndroidPresencePayload ----
 
     private fun sampleSystem() = SystemStatus(

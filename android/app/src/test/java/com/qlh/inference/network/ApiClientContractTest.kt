@@ -373,6 +373,54 @@ class ApiClientContractTest {
     }
 
     @Test
+    fun `managed users and per-user bindings stay authenticated and bounded`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var usersSeen: Request? = null
+        var bindingsSeen: Request? = null
+        route("/api/users") { req, reply ->
+            usersSeen = req
+            reply(200, """{"users":[{"user_id":"user-2","username":"member","role":"member","status":"active","aggregate_version":3,"secret":"drop"}]}""")
+        }
+        route("/api/auth/users/user-2/tailscale") { req, reply ->
+            bindingsSeen = req
+            reply(200, """{"bindings":[{"binding_id":"binding-2","user_id":"user-2","tailnet_id":"tailnet-a","tailscale_user_id":"ts-user","node_id":"node-a","state":"active","credential_ref":"drop"}]}""")
+        }
+
+        val users = runBlocking { client.fetchManagedUsers() }
+        val bindings = runBlocking { client.fetchUserTailscaleBindings("user-2") }
+        assertTrue(users.isSuccess)
+        assertTrue(bindings.isSuccess)
+        assertEquals("member", users.getOrNull()?.users?.single()?.username)
+        assertEquals(3, users.getOrNull()?.users?.single()?.aggregateVersion)
+        assertEquals("binding-2", bindings.getOrNull()?.bindings?.single()?.bindingId)
+        assertEquals("GET", usersSeen?.method)
+        assertEquals("GET", bindingsSeen?.method)
+        assertNotNull(usersSeen?.headers?.entries?.firstOrNull { it.key.equals("Authorization", ignoreCase = true) })
+        assertNotNull(bindingsSeen?.headers?.entries?.firstOrNull { it.key.equals("Authorization", ignoreCase = true) })
+    }
+
+    @Test
+    fun `manage confirm JSON encodes target and rejects blank target locally`() {
+        val store = FakeAuthStore(storedSession())
+        client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)
+        var seen: Request? = null
+        route("/api/auth/manage/confirm") { req, reply ->
+            seen = req
+            reply(200, """{"confirm_token":"ct_safe_123456789","expires_at":"2030-01-01T00:00:00.000Z","action":"user_manage","target_id":"user-\\\"9"}""")
+        }
+        val encoded = runBlocking { client.requestManageConfirm("user_manage", "user-\"9") }
+        assertTrue(encoded.isSuccess)
+        assertEquals("user-\"9", parseJson(seen!!.body).get("target_id").asString)
+
+        var hitServer = false
+        route("/api/auth/manage/confirm") { _, reply -> hitServer = true; reply(200, "{}") }
+        val blank = runBlocking { client.requestManageConfirm("user_manage", "") }
+        assertTrue(blank.isFailure)
+        assertTrue(!hitServer)
+    }
+
+    @Test
     fun `revoking own tailscale binding may omit confirm token while cross-user revoke fails without it`() {
         val store = FakeAuthStore(storedSession())
         client = ApiClient(baseUrl = "http://127.0.0.1:${server.port}", authStore = store)

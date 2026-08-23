@@ -37,6 +37,9 @@ import com.qlh.inference.update.AndroidAppUpdateManager
 import com.qlh.inference.update.AndroidUpdateCandidate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -102,6 +105,7 @@ data class MainUiState(
     val modelFleet: ModelFleetUiState = ModelFleetUiState(),
     val audit: AuditUiState = AuditUiState(),
     val authControl: AuthControlUiState = AuthControlUiState(),
+    val management: ManagementUiState = ManagementUiState(),
     val appUpdate: AppUpdateUiState = AppUpdateUiState(),
 
     // 上次发送的消息（用于重试）
@@ -207,6 +211,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             autoRegisterAndroidNode()
             refreshModels(showMessage = false)
             refreshRuntimeStatus()
+            refreshManagement()
         }
 
         // 监听会话列表
@@ -482,6 +487,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     error = error,
                 ),
             )
+            if (session != null) refreshManagement()
+            else _uiState.value = _uiState.value.copy(management = ManagementUiState())
         }
     }
 
@@ -503,6 +510,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.value = _uiState.value.copy(
                     authBusy = false,
                     authError = error,
+                    management = ManagementUiState(),
                     authControl = _uiState.value.authControl.copy(
                         capability = null,
                         loading = false,
@@ -519,6 +527,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.value = _uiState.value.copy(
                     authBusy = false,
                     authError = null,
+                    management = ManagementUiState(),
                     authControl = _uiState.value.authControl.copy(
                         capability = capability,
                         loading = false,
@@ -544,6 +553,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     error = error,
                 ),
             )
+            if (sessionResult.isSuccess && managementRoleAllowed(sessionResult.getOrNull()?.user?.role)) {
+                refreshManagement()
+            } else {
+                _uiState.value = _uiState.value.copy(management = ManagementUiState())
+            }
         }
     }
 
@@ -573,6 +587,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     error = error,
                 ),
             )
+            _uiState.value = _uiState.value.copy(management = ManagementUiState())
         }
     }
 
@@ -829,6 +844,133 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                 }
+        }
+    }
+
+    /**
+     * Refresh the owner/admin-only mobile management projection. The server remains
+     * authoritative; a stale local role never grants access because every request
+     * still carries the bearer and is checked by the control/gateway policy.
+     */
+    fun refreshManagement() {
+        if (_uiState.value.management.loading) return
+        val localRole = authStore.read()?.role
+        if (!managementRoleAllowed(localRole)) {
+            _uiState.value = _uiState.value.copy(management = ManagementUiState())
+            return
+        }
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                management = state.management.copy(loading = true, error = null),
+            )
+            val client = apiClient(state)
+            try {
+                val summary = client.fetchManageSummary().getOrThrow()
+                val usersResponse = client.fetchManagedUsers().getOrThrow()
+                val users = usersResponse.users
+                    .asSequence()
+                    .filter { it.userId.isNotBlank() && it.username.isNotBlank() }
+                    .take(MAX_MANAGED_USERS)
+                    .toList()
+
+                // Bindings are fetched per user because the manager endpoint deliberately
+                // avoids a global identity dump. Keep fan-out bounded by the user cap.
+                val usersWithBindings = coroutineScope {
+                    users.map { user ->
+                        async {
+                            val bindings = client.fetchUserTailscaleBindings(user.userId)
+                                .getOrThrow()
+                                .bindings
+                                .asSequence()
+                                .filter { it.bindingId.isNotBlank() }
+                                .take(MAX_MANAGED_BINDINGS)
+                                .map { it.toManagedBindingSnapshot(user.userId) }
+                                .toList()
+                            user.toManagedUserSnapshot(bindings)
+                        }
+                    }.awaitAll()
+                }
+
+                val audit = if (summary.auditAvailable) {
+                    client.fetchManageAudit(MAX_MANAGEMENT_AUDIT_EVENTS)
+                        .getOrThrow()
+                        .events
+                        .take(MAX_MANAGEMENT_AUDIT_EVENTS)
+                } else {
+                    emptyList()
+                }
+                _uiState.value = _uiState.value.copy(
+                    management = ManagementUiState(
+                        summary = summary,
+                        users = usersWithBindings,
+                        audit = audit,
+                    ),
+                )
+            } catch (e: Exception) {
+                QlhLogger.e("MainViewModel", "refreshManagement failed", e)
+                _uiState.value = _uiState.value.copy(
+                    management = _uiState.value.management.copy(
+                        loading = false,
+                        error = formatManagementError(e),
+                        summary = null,
+                        users = emptyList(),
+                        audit = emptyList(),
+                    ),
+                )
+            }
+        }
+    }
+
+    /** Request and consume a one-shot confirmation token entirely inside the ViewModel. */
+    fun revokeManagedUser(user: ManagedUserSnapshot) {
+        if (user.userId.isBlank() || user.aggregateVersion < 1) {
+            _uiState.value = _uiState.value.copy(
+                management = _uiState.value.management.copy(error = "成员版本不可用，已拒绝撤销"),
+            )
+            return
+        }
+        runManagedMutation("revoke-user:${user.userId}") { client ->
+            val confirmation = client.requestManageConfirm("user_manage", user.userId).getOrThrow()
+            client.revokeUser(user.userId, user.aggregateVersion, confirmation.confirmToken).getOrThrow()
+        }
+    }
+
+    /** Request and consume a one-shot confirmation token for a cross-user binding revoke. */
+    fun revokeManagedBinding(binding: ManagedBindingSnapshot) {
+        if (binding.bindingId.isBlank()) {
+            _uiState.value = _uiState.value.copy(
+                management = _uiState.value.management.copy(error = "绑定标识不可用，已拒绝撤销"),
+            )
+            return
+        }
+        runManagedMutation("revoke-binding:${binding.bindingId}") { client ->
+            val confirmation = client.requestManageConfirm("tailnet_bind", binding.bindingId).getOrThrow()
+            client.revokeTailscaleBinding(binding.bindingId, confirmation.confirmToken).getOrThrow()
+        }
+    }
+
+    private fun runManagedMutation(action: String, operation: suspend (ApiClient) -> Unit) {
+        if (_uiState.value.management.busyAction != null) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                management = _uiState.value.management.copy(busyAction = action, error = null),
+            )
+            try {
+                operation(apiClient())
+                _uiState.value = _uiState.value.copy(
+                    management = _uiState.value.management.copy(busyAction = null),
+                )
+                refreshManagement()
+            } catch (e: Exception) {
+                QlhLogger.e("MainViewModel", "management mutation failed", e)
+                _uiState.value = _uiState.value.copy(
+                    management = _uiState.value.management.copy(
+                        busyAction = null,
+                        error = formatManagementError(e),
+                    ),
+                )
+            }
         }
     }
 

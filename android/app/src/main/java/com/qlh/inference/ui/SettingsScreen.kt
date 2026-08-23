@@ -42,6 +42,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -85,6 +86,10 @@ import com.qlh.inference.DiagnosticsUiState
 import com.qlh.inference.ModelFleetEntry
 import com.qlh.inference.ModelFleetStatus
 import com.qlh.inference.ModelFleetUiState
+import com.qlh.inference.ManagementUiState
+import com.qlh.inference.ManagedBindingSnapshot
+import com.qlh.inference.ManagedUserSnapshot
+import com.qlh.inference.MAX_MANAGEMENT_AUDIT_EVENTS
 import com.qlh.inference.network.ConnectionHealthState
 import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.GgufModelInfo
@@ -163,6 +168,10 @@ fun SettingsScreen(
     onRefreshAuthControl: () -> Unit = {},
     onLogin: (String, String?, String?) -> Unit = { _, _, _ -> },
     onLogout: () -> Unit = {},
+    management: ManagementUiState = ManagementUiState(),
+    onRefreshManagement: () -> Unit = {},
+    onRevokeManagedUser: (ManagedUserSnapshot) -> Unit = {},
+    onRevokeManagedBinding: (ManagedBindingSnapshot) -> Unit = {},
     appUpdate: AppUpdateUiState = AppUpdateUiState(),
     onCheckForAppUpdate: () -> Unit = {},
     onDownloadAppUpdate: () -> Unit = {},
@@ -241,6 +250,15 @@ fun SettingsScreen(
                 onLogin = onLogin,
                 onLogout = onLogout,
             )
+
+            if (authControl.account?.role?.lowercase() in setOf("owner", "admin")) {
+                ManagementControlGroup(
+                    state = management,
+                    onRefresh = onRefreshManagement,
+                    onRevokeUser = onRevokeManagedUser,
+                    onRevokeBinding = onRevokeManagedBinding,
+                )
+            }
 
             DiagnosticsGroup(
                 state = diagnostics,
@@ -910,6 +928,170 @@ private fun AuthControlGroup(
             Spacer(Modifier.width(6.dp))
             Text("刷新认证状态")
         }
+    }
+}
+
+@Composable
+private fun ManagementControlGroup(
+    state: ManagementUiState,
+    onRefresh: () -> Unit,
+    onRevokeUser: (ManagedUserSnapshot) -> Unit,
+    onRevokeBinding: (ManagedBindingSnapshot) -> Unit,
+) {
+    var pendingUser by remember { mutableStateOf<ManagedUserSnapshot?>(null) }
+    var pendingBinding by remember { mutableStateOf<ManagedBindingSnapshot?>(null) }
+    val managerActions = state.summary?.actions.orEmpty()
+    val reviewPending = state.summary?.reviewAdminAuthPending == true
+    val summary = when {
+        state.loading -> "正在读取管理控制面"
+        state.summary == null && state.error != null -> "管理控制面不可用"
+        reviewPending -> "成员 ${state.users.size} · 入群审批待授权"
+        else -> "成员 ${state.users.size} · 审计 ${state.audit.size}"
+    }
+
+    CollapsibleSettingsGroup(
+        title = "主节点管理",
+        summary = summary,
+        icon = Icons.Default.AccountCircle,
+        testTag = "management_control_details",
+    ) {
+        state.error?.let { error ->
+            Text(
+                text = error,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        state.summary?.let { matrix ->
+            Text(
+                text = "当前角色：${matrix.role} · 策略 ${matrix.policyVersion}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "成员 ${matrix.counts["users"] ?: 0} · Tailnet 绑定 ${matrix.counts["bindings"] ?: 0} · 审计 ${if (matrix.auditAvailable) "可用" else "不可用"}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (reviewPending) {
+                Text(
+                    text = "入群审批暂不可用：review_admin 授权契约尚未迁移。此页面不会伪造审批按钮。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            managerActions.entries.forEach { (action, rule) ->
+                SettingRow(
+                    title = rule.description.ifBlank { action },
+                    subtitle = "允许：${if (rule.allowed) "是" else "否"} · 二次确认：${if (rule.confirmRequired) "是" else "否"} · 审计：${if (rule.audited) "是" else "否"}",
+                )
+            }
+        }
+
+        Text("成员清单", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
+        if (state.users.isEmpty() && state.error == null) {
+            Text("没有可显示的成员", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        state.users.forEach { user ->
+            SettingRow(
+                title = user.displayName,
+                subtitle = "${user.username} · ${user.role} · ${user.status} · 版本 ${user.aggregateVersion}",
+                modifier = Modifier.testTag("managed_user_${user.userId}"),
+                trailing = {
+                    if (user.status != "revoked" && user.aggregateVersion > 0) {
+                        IconButton(
+                            onClick = { pendingUser = user },
+                            enabled = state.busyAction == null,
+                            modifier = Modifier.testTag("managed_user_revoke_${user.userId}"),
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "撤销成员")
+                        }
+                    }
+                },
+            )
+            user.bindings.forEach { binding ->
+                SettingRow(
+                    title = "Tailnet ${binding.tailnetId.ifBlank { "unknown" }}",
+                    subtitle = "${binding.tailscaleUserId.ifBlank { "unknown user" }} · 节点 ${binding.nodeId.ifBlank { "unknown" }} · ${binding.state}",
+                    modifier = Modifier
+                        .padding(start = 16.dp)
+                        .testTag("managed_binding_${binding.bindingId}"),
+                    trailing = {
+                        if (binding.state != "revoked") {
+                            IconButton(
+                                onClick = { pendingBinding = binding },
+                                enabled = state.busyAction == null,
+                                modifier = Modifier.testTag("managed_binding_revoke_${binding.bindingId}"),
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "撤销绑定")
+                            }
+                        }
+                    },
+                )
+            }
+        }
+
+        Text("最近管理审计", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
+        state.audit.take(MAX_MANAGEMENT_AUDIT_EVENTS).forEach { event ->
+            SettingRow(
+                title = event.eventType.ifBlank { "管理事件" },
+                subtitle = "${event.outcome.ifBlank { "unknown" }} · ${event.createdAt}",
+                modifier = Modifier.testTag("management_audit_${event.eventId}"),
+            )
+        }
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.loading && state.busyAction == null,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("management_refresh"),
+        ) {
+            if (state.loading) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+            else Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("刷新管理摘要")
+        }
+    }
+
+    pendingUser?.let { user ->
+        AlertDialog(
+            onDismissRequest = { if (state.busyAction == null) pendingUser = null },
+            title = { Text("确认撤销成员") },
+            text = { Text("将撤销 ${user.displayName} 的账户。服务端会要求一次性二次确认并写入审计，操作不可在此页面回滚。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingUser = null
+                        onRevokeUser(user)
+                    },
+                    enabled = state.busyAction == null,
+                ) { Text("确认撤销") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingUser = null }, enabled = state.busyAction == null) { Text("取消") }
+            },
+        )
+    }
+    pendingBinding?.let { binding ->
+        AlertDialog(
+            onDismissRequest = { if (state.busyAction == null) pendingBinding = null },
+            title = { Text("确认撤销 Tailnet 绑定") },
+            text = { Text("将撤销该用户的 Tailnet 绑定。服务端会要求一次性二次确认并写入审计。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingBinding = null
+                        onRevokeBinding(binding)
+                    },
+                    enabled = state.busyAction == null,
+                ) { Text("确认撤销") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingBinding = null }, enabled = state.busyAction == null) { Text("取消") }
+            },
+        )
     }
 }
 
