@@ -122,9 +122,9 @@
 | `AND-CTRL-02` | P1 | 模型舰队只读统一视图：已选本地模型、主节点当前模型、注册表、资产状态和已验签 GGUF 清单，最多展开 8 项。既有下载进度保留在原 SAF 下载面板。 | 禁止远程删除、注册、代理/源调整与强制切换；保留用户主动下载的 SHA/SAF 边界。 | **本机开发完成**：Full JVM `132 passed`，`compileFullDebugAndroidTestKotlin` 通过；真机/主节点/大工件/SAF 验收后置。 |
 | `AND-CTRL-03` | P1 | 有界审计/活动只读列表，投影工作流阶段、attempt 状态和 review 摘要。 | 禁止投票、重派、删除、过期或提交结果；不下发提示词、原始错误、路径、投票评论或投票人身份。 | **本机开发完成**：主节点 `summary=1` 安全投影与 `limit`、Android Settings 审计折叠组；Full JVM `135 passed`，后端任务图定向 `1 passed`，`compileFullDebugAndroidTestKotlin` 通过；真机/真实授权验收后置。 |
 | `AND-CTRL-04` | P1 | 账户/Auth App 会话：能力、用户角色/到期、登录/TOTP/恢复码、Keystore 会话校验和登出。 | 不展示或持久化种子、恢复码明文、bearer、管理员密钥或 cluster secret。 | **本机开发完成**：Android Settings 新增账户/Auth App 折叠组，统一解析 gateway `required/enforced` 与单体 `available/reason_code` capability；接入 Keystore 登录/会话校验/登出，能力不可用、会话 401 和退出失败均 fail-closed；登录错误不回显响应体。Full JVM `138 passed`，AndroidTest Kotlin 编译通过；真实 Auth App、control/gateway 和真机验收后置。 |
-| `AND-CTRL-05` | P2 | Owner/admin 的成员、Tailscale 绑定与入群审批受限入口。 | 高风险/批量/破坏性管理保持 PC 优先，Android 仅在明确授权、二次确认和审计均具备时开放。 | 依赖 `AND-CTRL-04`。 |
+| `AND-CTRL-05` | P2 | Owner/admin 的成员、Tailscale 绑定与入群审批受限入口。 | 高风险/批量/破坏性管理保持 PC 优先；Android 仅在明确授权、二次确认和审计均具备时开放，`review_admin` 未迁移时只读。 | **本机开发完成**：管理摘要、成员/绑定/审计投影和撤销确认 UI 已接入；真实权限/审计/真机联调后置。 |
 
-`AND-CTRL-01/02/03/04` 已完成本机开发门；全局交付优先转入 `CY-PKG-01`，`AND-CTRL-05` 仍需权限矩阵、审计和二次确认前置条件。
+`AND-CTRL-01/02/03/04/05` 与 `CY-PKG-01` 已完成本机开发门；下一步转入真实桌面包/E8 和 Android 管理面真机联调。`review_admin` 审批仍保持后端未迁移的只读边界。
 
 `AND-B-01` 只冻结并实现跨语言的 `qlh.task_worker` v2 envelope、Android Full Worker 能力声明、严格 UTF-8/canonical JSON、租约/摘要校验和 1024 条 `message_id` replay cache。Android 的 `worker_kind=android_full_worker` 已被 PC v2 schema 接受；后续 `AND-API-02` 已开放注册节点类型/worker kind 对齐的 scheduler 准入，`AND-API-03` 又接入了统一 Stage executor。真实认证、设备资源门、Android offer→result 和长时验收仍后置。
 
