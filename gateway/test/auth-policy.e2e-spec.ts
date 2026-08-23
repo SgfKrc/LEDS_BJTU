@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { ExecutionContext } from '@nestjs/common';
+import { ForbiddenException } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
 import { ControlClient } from '../src/clients/control.client';
 import { AuthPolicyGuard } from '../src/modules/auth/auth-policy.guard';
@@ -65,5 +66,26 @@ describe('MF-AUTH-N1A gateway authorization policy HTTP integration', () => {
     expect(request.qlhAuthSession).toEqual({
       user: { user_id: 'member-1', role: 'member' },
     });
+  });
+
+  it('rejects a member session from the AND-CTRL-05 management surface', async () => {
+    process.env.QLH_AUTH_REQUIRED = '1';
+    const guard = new AuthPolicyGuard(new ControlClient(controlUrl, 1000));
+    for (const url of ['/api/auth/manage/summary', '/api/auth/manage/audit']) {
+      const request = {
+        method: 'GET',
+        url,
+        headers: { authorization: 'Bearer integration-token' },
+      } as FastifyRequest & { qlhAuthSession?: Record<string, unknown> };
+      await expect(guard.canActivate(context(request)))
+        .rejects.toBeInstanceOf(ForbiddenException);
+    }
+    const revokeRequest = {
+      method: 'POST',
+      url: '/api/auth/tailscale/bindings/b-1/revoke',
+      headers: { authorization: 'Bearer integration-token' },
+    } as FastifyRequest & { qlhAuthSession?: Record<string, unknown> };
+    await expect(guard.canActivate(context(revokeRequest)))
+      .rejects.toBeInstanceOf(ForbiddenException);
   });
 });

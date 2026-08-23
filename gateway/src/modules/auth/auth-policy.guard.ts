@@ -43,6 +43,8 @@ const MANAGER_PREFIXES = [
   '/api/models/credentials',
   '/api/models/licenses',
   '/api/models/registry',
+  // AND-CTRL-05 前置契约：管理摘要/审计/确认签发只对 owner/admin 开放。
+  '/api/auth/manage',
 ];
 
 const MEMBER_MUTATION_PREFIXES = [
@@ -89,6 +91,9 @@ export function accessLevelFor(method: string, url: string): AuthAccessLevel {
   if (MANAGER_PREFIXES.some((prefix) => startsWithRoute(path, prefix))) return 'manager';
   if (isReadOnlyLocalAssetPreflight(verb, path)) return 'authenticated';
   if (startsWithRoute(path, '/api/auth/users')) return 'manager';
+  // Tailnet 绑定撤销是管理写操作（AND-CTRL-05 前置③）：prepare/confirm 仍是
+  // 成员自操作（authenticated），仅 revoke 提级为 manager。
+  if (/^\/api\/auth\/tailscale\/bindings\/[^/]+\/revoke$/.test(path)) return 'manager';
   if (verb !== 'GET' && (
     startsWithRoute(path, '/api/cluster')
     || startsWithRoute(path, '/api/device')
