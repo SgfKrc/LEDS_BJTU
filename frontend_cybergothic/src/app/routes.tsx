@@ -97,39 +97,39 @@ export const ROUTES: RouteDef[] = [
   },
   {
     id: 'models',
-    label: 'Models',
+    label: '模型',
     tag: 'MODEL LAB',
     icon: Boxes,
-    description: 'Model runtime, local assets, and load controls.',
+    description: '模型运行时、本地资产与加载控制。',
     component: ModelsPage,
   },
   {
     id: 'downloads',
-    label: 'Downloads',
+    label: '下载',
     tag: 'MODEL DOWNLOAD',
     icon: Download,
-    description: 'One-click model presets and live download job progress.',
+    description: '模型预设搜索、一键拉取与下载任务进度。',
     component: ModelDownloadsPage,
   },
   {
     id: 'cluster',
-    label: 'Cluster',
+    label: '集群',
     tag: 'CLUSTER CONTROL',
     icon: Network,
-    description: 'Node topology, health, access, and role-gated cluster operations.',
+    description: '节点拓扑、健康状态、访问控制与集群操作。',
     component: ClusterAdminPage,
   },
   {
     id: 'account',
-    label: 'Account',
+    label: '账户',
     tag: 'IRON GATE',
     icon: ShieldCheck,
-    description: 'Authentication, sessions, managed users, and Tailscale identity.',
+    description: '认证、会话、成员管理与 Tailscale 身份绑定。',
     component: AccountPage,
   },
   {
     id: 'audit',
-    label: 'Audit',
+    label: '审计',
     tag: 'AUDIT LEDGER',
     icon: ScrollText,
     description: '日志归档、节点汇总与主节点转让审查。',
@@ -152,6 +152,9 @@ export const ROUTES: RouteDef[] = [
     component: HelpPage,
   },
 ];
+
+/** Desktop keeps only repeated-use views in the top bar; all routes remain in the menu. */
+export const PRIMARY_NAV_IDS: readonly RouteId[] = ['workbench', 'overview', 'tasks', 'image'];
 
 const DEFAULT_ROUTE: RouteId = 'workbench';
 

@@ -18,6 +18,7 @@ import './styles/audit.css';
 import './styles/activity.css';
 import './styles/tasks.css';
 import './styles/model-downloads.css';
+import './styles/scene-surfaces.css';
 
 function sendClientError(source: string, error: unknown, line = 0, col = 0) {
   const message = error instanceof Error ? error.message : String(error);

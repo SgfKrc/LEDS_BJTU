@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useReducedMotion } from '../motion/useReducedMotion';
+import { drawEtchedFrame, drawRoseWindow } from './canvasOrnaments';
 
 const DPR_MAX = 2;
 
@@ -46,6 +47,8 @@ export function ClusterConstellationCanvas({ className = '' }: { className?: str
       const driftX = pointerX * 10;
       const driftY = pointerY * 8;
 
+      drawEtchedFrame(ctx, width * 0.07, height * 0.1, width * 0.84, height * 0.74, { stroke: line, alpha: 0.14 });
+
       ctx.save();
       ctx.translate(driftX * 0.24, driftY * 0.2);
       ctx.strokeStyle = line;
@@ -63,6 +66,14 @@ export function ClusterConstellationCanvas({ className = '' }: { className?: str
       const centerY = height * 0.38 + driftY * 0.45;
       const orbitA = Math.min(width, height) * 0.19;
       const orbitB = Math.min(width, height) * 0.31;
+
+      drawRoseWindow(ctx, centerX, centerY, Math.min(width, height) * 0.105, {
+        stroke: gold,
+        accent: brass,
+        alpha: 0.2,
+        rotation: phase * 0.05,
+        petals: 10,
+      });
 
       ctx.save();
       ctx.translate(centerX, centerY);

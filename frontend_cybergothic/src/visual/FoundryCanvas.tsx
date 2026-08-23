@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useReducedMotion } from '../motion/useReducedMotion';
+import { drawEtchedFrame, drawRoseWindow } from './canvasOrnaments';
 
 const DPR_MAX = 2;
 
@@ -30,6 +31,8 @@ export function FoundryCanvas({ className = '' }: { className?: string }) {
       const cy = height * 0.42;
       const base = Math.min(width, height);
 
+      drawEtchedFrame(ctx, width * 0.055, height * 0.1, width * 0.89, height * 0.78, { stroke: brass, alpha: 0.12 });
+
       ctx.save();
       ctx.strokeStyle = line;
       ctx.globalAlpha = 0.55;
@@ -54,6 +57,7 @@ export function FoundryCanvas({ className = '' }: { className?: string }) {
         ctx.arc(0, 0, base * (0.18 + i * 0.09), 0, Math.PI * 2);
         ctx.stroke();
       }
+      drawRoseWindow(ctx, 0, 0, base * 0.22, { stroke: gold, accent: brass, alpha: 0.22, rotation: -t * 0.1, petals: 12 });
       ctx.globalAlpha = 0.48;
       for (let i = 0; i < 12; i += 1) {
         const angle = (i / 12) * Math.PI * 2;
@@ -62,6 +66,22 @@ export function FoundryCanvas({ className = '' }: { className?: string }) {
         ctx.beginPath();
         ctx.moveTo(Math.cos(angle) * inner, Math.sin(angle) * inner);
         ctx.lineTo(Math.cos(angle + 0.08) * outer, Math.sin(angle + 0.08) * outer);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      ctx.save();
+      ctx.translate(width * 0.18, height * 0.28);
+      ctx.strokeStyle = brass;
+      ctx.globalAlpha = 0.16;
+      ctx.lineWidth = 1;
+      for (let panel = 0; panel < 3; panel += 1) {
+        const panelX = panel * 56;
+        ctx.strokeRect(panelX, panel * 10, 72, 54);
+        ctx.beginPath();
+        ctx.moveTo(panelX + 8, panel * 10 + 45);
+        ctx.lineTo(panelX + 36, panel * 10 + 8);
+        ctx.lineTo(panelX + 64, panel * 10 + 45);
         ctx.stroke();
       }
       ctx.restore();

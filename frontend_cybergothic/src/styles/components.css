@@ -405,6 +405,17 @@ html[data-reduced-motion='true'] [data-reveal] {
 }
 
 .iconbtn--menu {
+  display: grid;
+}
+
+.iconbtn--menu[data-active='true'] {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+/* Primary routes remain visible in the desktop bar and do not repeat in its menu. */
+.mobilenav__item--primary {
   display: none;
 }
 
@@ -434,8 +445,9 @@ html[data-reduced-motion='true'] [data-reveal] {
   flex-direction: column;
   gap: var(--gap-md);
   padding: var(--gap-lg);
-  background: var(--surface);
+  background: rgba(14, 14, 19, 0.98);
   border-left: 4px solid var(--accent);
+  backdrop-filter: blur(18px) saturate(90%);
   animation: cg-enter var(--t-base) var(--ease-out) both;
   overflow-y: auto;
 }
@@ -2225,6 +2237,10 @@ code {
 
   .iconbtn--menu {
     display: grid;
+  }
+
+  .mobilenav__item--primary {
+    display: block;
   }
 
   .topbar__inner {
