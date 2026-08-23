@@ -424,6 +424,24 @@ class ApiClientContractTest {
     }
 
     @Test
+    fun `heartbeatAndroidNode posts only the current lease`() {
+        var seen: Request? = null
+        route("/api/cluster/android/heartbeat") { req, reply ->
+            seen = req
+            reply(200, """{"status":"heartbeat","node_id":"n1","presence_generation":4,"presence_lease_id":"lease-4","lease_expires_at_ms":1700000120000,"server_time_ms":1700000000000,"heartbeat_interval_seconds":45}""")
+        }
+        val response = runBlocking {
+            client.heartbeatAndroidNode(AndroidPresenceHeartbeatRequest("n1", 4L, "lease-4"))
+        }.getOrNull()!!
+        assertEquals("heartbeat", response.status)
+        assertEquals(4L, response.presenceGeneration)
+        assertEquals("POST", seen?.method)
+        assertEquals("/api/cluster/android/heartbeat", seen?.path)
+        assertTrue(seen!!.body.contains("\"presence_lease_id\":\"lease-4\""))
+        assertTrue(!seen!!.body.contains("device_info"))
+    }
+
+    @Test
     fun `firstConnectBootstrap posts to bootstrap endpoint`() {
         var seen: Request? = null
         route("/api/bootstrap/first-connect") { req, reply ->
@@ -576,6 +594,38 @@ class ApiClientContractTest {
         assertEquals(1, models.size)
         assertEquals("qwen.gguf", models[0].filename)
         assertEquals(1024L, models[0].sizeBytes)
+    }
+
+    @Test
+    fun `connection health probe records bounded checks and skips absent auth`() {
+        route("/api/cluster/status") { req, reply ->
+            assertEquals("GET", req.method)
+            reply(200, "{\"status\":\"ok\"}")
+        }
+        val report = runBlocking { client.probeConnectionHealth("wifi") }.getOrThrow()
+        assertEquals("wifi", report.localNetworkType)
+        assertEquals(ConnectionHealthState.PASS, report.checks.first { it.id == "cluster_status" }.state)
+        assertEquals(ConnectionHealthState.SKIPPED, report.checks.first { it.id == "auth_session" }.state)
+    }
+
+    @Test
+    fun `manual client diagnostics uses the log endpoint`() {
+        route("/api/logs/client-error") { req, reply ->
+            assertEquals("POST", req.method)
+            assertTrue(req.body.contains("manual Android diagnostic upload"))
+            assertTrue(req.body.contains("Bearer [REDACTED]"))
+            reply(200, "{\"status\":\"ok\"}")
+        }
+        val result = runBlocking {
+            client.reportClientError(
+                ClientErrorReport(
+                    message = "manual Android diagnostic upload",
+                    source = "manual",
+                    stack = "Authorization: Bearer [REDACTED]",
+                )
+            )
+        }
+        assertTrue("diagnostic upload failed: ${result.exceptionOrNull()}", result.isSuccess)
     }
 
     @Test
