@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -30,13 +31,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.ui.theme.QlhShapeTokens
+import com.qlh.inference.ui.theme.QlhUiTokens
 
 // ================================================================
 // 共享 UI 组件 — 统一各页面的视觉语言
@@ -53,14 +60,23 @@ fun QlhTopBar(
     subtitle: String? = null,
     actions: @Composable RowScope.() -> Unit = {}
 ) {
+    val accentLine = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.72f)
     Surface(
-        modifier = modifier.fillMaxWidth(),
-        color = MaterialTheme.colorScheme.background
+        modifier = modifier
+            .fillMaxWidth()
+            .drawBehind {
+                // A static corner mark gives the mobile shell the same identity as
+                // the PC surface without a background canvas or an animation loop.
+                val y = size.height - 1.dp.toPx()
+                drawLine(accentLine, Offset(0f, y), Offset(QlhUiTokens.cornerMark.toPx(), y), 1.dp.toPx())
+                drawLine(accentLine, Offset(0f, y), Offset(0f, y - 8.dp.toPx()), 1.dp.toPx())
+            },
+        color = MaterialTheme.colorScheme.surfaceContainerLowest
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 20.dp, end = 16.dp, top = 14.dp, bottom = 10.dp),
+                .padding(start = QlhUiTokens.pageHorizontal, end = QlhUiTokens.pageHorizontal, top = 14.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column(modifier = Modifier.weight(1f)) {
@@ -68,7 +84,8 @@ fun QlhTopBar(
                     text = title,
                     style = MaterialTheme.typography.headlineSmall,
                     color = MaterialTheme.colorScheme.onBackground,
-                    maxLines = 1,
+                    maxLines = 2,
+                    modifier = Modifier.semantics { heading() },
                     overflow = TextOverflow.Ellipsis
                 )
                 if (subtitle != null) {
@@ -119,7 +136,8 @@ fun StatusChip(
                 text = text,
                 style = MaterialTheme.typography.labelMedium,
                 color = contentColor,
-                maxLines = 1
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -157,16 +175,20 @@ fun SettingsGroup(
         }
         Card(
             modifier = Modifier.fillMaxWidth(),
-            shape = MaterialTheme.shapes.large,
+            shape = MaterialTheme.shapes.medium,
             colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surfaceContainer
+                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            ),
+            border = androidx.compose.foundation.BorderStroke(
+                QlhUiTokens.hairline,
+                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f),
             ),
             elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(16.dp),
+                    .padding(QlhUiTokens.pageHorizontal),
                 content = content
             )
         }
@@ -186,14 +208,16 @@ fun SettingRow(
     trailing: @Composable (() -> Unit)? = null
 ) {
     val rowModifier = if (onClick != null) {
-        modifier
+            modifier
             .fillMaxWidth()
             .clip(MaterialTheme.shapes.small)
-            .clickable(onClick = onClick)
+            .clickable(role = Role.Button, onClick = onClick)
+            .heightIn(min = QlhUiTokens.touchTarget)
             .padding(vertical = 8.dp)
     } else {
         modifier
             .fillMaxWidth()
+            .heightIn(min = QlhUiTokens.touchTarget)
             .padding(vertical = 8.dp)
     }
     Row(
@@ -222,7 +246,7 @@ fun SettingRow(
                 text = title,
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis
             )
             if (subtitle != null) {
@@ -230,7 +254,7 @@ fun SettingRow(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
+                    maxLines = 3,
                     overflow = TextOverflow.Ellipsis
                 )
             }

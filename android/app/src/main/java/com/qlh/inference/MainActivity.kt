@@ -120,7 +120,7 @@ fun MainApp(
         bottomBar = {
             NavigationBar(
                 containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-                tonalElevation = 0.dp
+                tonalElevation = 0.dp,
             ) {
                 bottomNavItems.forEach { item ->
                     NavigationBarItem(
@@ -130,9 +130,9 @@ fun MainApp(
                         label = { Text(item.label, style = MaterialTheme.typography.labelMedium) },
                         alwaysShowLabel = true,
                         colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            selectedIconColor = MaterialTheme.colorScheme.onTertiaryContainer,
                             selectedTextColor = MaterialTheme.colorScheme.onSurface,
-                            indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                            indicatorColor = MaterialTheme.colorScheme.tertiaryContainer,
                             unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
                             unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
                         )

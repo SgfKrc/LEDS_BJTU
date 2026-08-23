@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -57,7 +58,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
@@ -74,6 +74,9 @@ import com.qlh.inference.ui.components.EmptyState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.StatusChip
 import com.qlh.inference.ui.theme.QlhShapeTokens
+import com.qlh.inference.ui.theme.qlhBrandGold
+import com.qlh.inference.ui.theme.qlhNeonGreen
+import com.qlh.inference.ui.theme.qlhOnNeonGreen
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -152,7 +155,10 @@ fun ChatScreen(
         val spacerItemCount = 1
         val itemCount = messageItemCount + loadingItemCount + errorItemCount + spacerItemCount
         if (itemCount > 0) {
-            listState.animateScrollToItem(itemCount - 1)
+            // Avoid an animated scroll on every token/state update; this keeps
+            // long responses responsive on low-end devices and avoids motion
+            // noise for TalkBack users.
+            listState.scrollToItem(itemCount - 1)
         }
     }
 
@@ -296,7 +302,8 @@ private fun ChatBubble(
                     MaterialTheme.colorScheme.primary
                 } else {
                     MaterialTheme.colorScheme.surfaceContainerHigh
-                }
+                },
+                border = if (isUser) null else BorderStroke(1.dp, qlhBrandGold().copy(alpha = 0.24f))
             ) {
                 Box {
                     Text(
@@ -325,7 +332,7 @@ private fun ChatBubble(
                                 imageVector = Icons.Default.ContentCopy,
                                 contentDescription = "复制回答",
                                 modifier = Modifier.size(15.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                tint = qlhBrandGold().copy(alpha = 0.86f)
                             )
                         }
                     }
@@ -374,7 +381,8 @@ private fun LoadingBubble() {
                 bottomStart = QlhShapeTokens.compact,
                 bottomEnd = QlhShapeTokens.control
             ),
-            color = MaterialTheme.colorScheme.surfaceContainerHigh
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            border = BorderStroke(1.dp, qlhBrandGold().copy(alpha = 0.24f))
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
@@ -383,7 +391,7 @@ private fun LoadingBubble() {
                 CircularProgressIndicator(
                     modifier = Modifier.size(16.dp),
                     strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.primary
+                    color = qlhBrandGold()
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
@@ -506,7 +514,7 @@ private fun ChatInputBar(
                     imageVector = Icons.Default.AddPhotoAlternate,
                     contentDescription = "选择图片",
                     tint = if (canAttachImage && !isEncodingImage) {
-                        MaterialTheme.colorScheme.primary
+                        qlhBrandGold()
                     } else {
                         MaterialTheme.colorScheme.outline
                     }
@@ -532,8 +540,8 @@ private fun ChatInputBar(
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
                 shape = RoundedCornerShape(QlhShapeTokens.control),
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    unfocusedBorderColor = Color.Transparent,
+                    focusedBorderColor = qlhNeonGreen(),
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.68f),
                     focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
                     unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh
                 )
@@ -548,7 +556,7 @@ private fun ChatInputBar(
                     .clip(CircleShape)
                     .background(
                         if (text.isNotBlank() && enabled) {
-                            MaterialTheme.colorScheme.primary
+                            qlhNeonGreen()
                         } else {
                             MaterialTheme.colorScheme.surfaceContainerHighest
                         }
@@ -558,7 +566,7 @@ private fun ChatInputBar(
                     imageVector = Icons.AutoMirrored.Filled.Send,
                     contentDescription = "发送",
                     tint = if (text.isNotBlank() && enabled) {
-                        MaterialTheme.colorScheme.onPrimary
+                        qlhOnNeonGreen()
                     } else {
                         MaterialTheme.colorScheme.outline
                     }
@@ -614,7 +622,11 @@ private fun ChatInputBar(
                             strokeWidth = 2.dp,
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("正在处理图片", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            "正在处理图片",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = qlhBrandGold(),
+                        )
                     }
                     else -> {
                         Text(
