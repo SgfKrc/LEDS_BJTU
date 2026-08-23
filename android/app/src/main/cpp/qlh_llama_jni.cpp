@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -12,6 +13,8 @@
 
 #include "ggml-backend.h"
 #include "llama.h"
+#include "mtmd-helper.h"
+#include "mtmd.h"
 
 #define QLH_LOG_TAG "QlhLlamaJni"
 #define QLH_LOGI(...) __android_log_print(ANDROID_LOG_INFO, QLH_LOG_TAG, __VA_ARGS__)
@@ -31,12 +34,20 @@ struct QlhLlamaContext {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     llama_sampler * sampler = nullptr;
+    mtmd_context * vision = nullptr;
     const llama_vocab * vocab = nullptr;
     int n_ctx = 0;
     int n_threads = 0;
     int n_threads_batch = 0;
     QlhGenerationStats last_stats;
 };
+
+static void free_vision(QlhLlamaContext * qctx) {
+    if (qctx != nullptr && qctx->vision != nullptr) {
+        mtmd_free(qctx->vision);
+        qctx->vision = nullptr;
+    }
+}
 
 static std::once_flag g_backend_once;
 
@@ -258,6 +269,45 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadModel(
     return reinterpret_cast<jlong>(qctx);
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeLoadMultimodalProjector(
+    JNIEnv * env,
+    jobject /* thiz */,
+    jlong ptr,
+    jstring j_mmproj_path
+) {
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(ptr);
+    if (qctx == nullptr || qctx->model == nullptr || j_mmproj_path == nullptr) {
+        throw_java(env, "Model is not loaded");
+        return JNI_FALSE;
+    }
+
+    const char * path_chars = env->GetStringUTFChars(j_mmproj_path, nullptr);
+    if (path_chars == nullptr) {
+        return JNI_FALSE;
+    }
+    std::string mmproj_path(path_chars);
+    env->ReleaseStringUTFChars(j_mmproj_path, path_chars);
+
+    mtmd_context_params params = mtmd_context_params_default();
+    params.use_gpu = false;
+    params.n_threads = qctx->n_threads;
+    params.batch_max_tokens = std::min(1024, qctx->n_ctx);
+    params.warmup = false;
+    mtmd_context * vision = mtmd_init_from_file(
+        mmproj_path.c_str(), qctx->model, params
+    );
+    if (vision == nullptr || !mtmd_support_vision(vision)) {
+        if (vision != nullptr) mtmd_free(vision);
+        QLH_LOGW("mmproj does not provide vision capability: %s", mmproj_path.c_str());
+        return JNI_FALSE;
+    }
+    free_vision(qctx);
+    qctx->vision = vision;
+    QLH_LOGI("mmproj loaded with vision capability");
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_qlh_inference_service_LocalInferenceEngine_nativeFreeModel(
     JNIEnv * /* env */,
@@ -268,6 +318,7 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeFreeModel(
     if (qctx == nullptr) {
         return;
     }
+    free_vision(qctx);
     if (qctx->sampler != nullptr) {
         llama_sampler_free(qctx->sampler);
     }
@@ -405,6 +456,197 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGenerate(
     return env->NewStringUTF(output.c_str());
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_qlh_inference_service_LocalInferenceEngine_nativeGenerateMultimodal(
+    JNIEnv * env,
+    jobject /* thiz */,
+    jlong ptr,
+    jstring j_prompt,
+    jobjectArray j_images,
+    jint j_max_tokens,
+    jfloat j_temperature,
+    jfloat j_top_p,
+    jobject on_token
+) {
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(ptr);
+    if (qctx == nullptr || qctx->model == nullptr || qctx->ctx == nullptr ||
+        qctx->sampler == nullptr || qctx->vision == nullptr) {
+        throw_java(env, "Multimodal model is not ready");
+        return env->NewStringUTF("");
+    }
+    if (j_images == nullptr || env->GetArrayLength(j_images) <= 0) {
+        throw_java(env, "At least one image is required");
+        return env->NewStringUTF("");
+    }
+
+    const char * prompt_chars = env->GetStringUTFChars(j_prompt, nullptr);
+    if (prompt_chars == nullptr) return env->NewStringUTF("");
+    std::string prompt(prompt_chars);
+    env->ReleaseStringUTFChars(j_prompt, prompt_chars);
+    const char * marker = mtmd_default_marker();
+    if (prompt.find(marker) == std::string::npos) {
+        prompt = std::string(marker) + "\n" + prompt;
+    }
+
+    llama_memory_clear(llama_get_memory(qctx->ctx), true);
+    if (qctx->sampler != nullptr) llama_sampler_free(qctx->sampler);
+    auto sampler_params = llama_sampler_chain_default_params();
+    sampler_params.no_perf = true;
+    qctx->sampler = llama_sampler_chain_init(sampler_params);
+    llama_sampler_chain_add(qctx->sampler, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(qctx->sampler, llama_sampler_init_top_p(
+        std::max(0.01f, std::min(1.0f, static_cast<float>(j_top_p))), 1));
+    llama_sampler_chain_add(qctx->sampler, llama_sampler_init_temp(
+        std::max(0.0f, static_cast<float>(j_temperature))));
+    llama_sampler_chain_add(qctx->sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    std::vector<mtmd_bitmap *> bitmaps;
+    std::vector<const mtmd_bitmap *> bitmap_refs;
+    const jsize image_count = env->GetArrayLength(j_images);
+    bitmaps.reserve(static_cast<size_t>(image_count));
+    bitmap_refs.reserve(static_cast<size_t>(image_count));
+    for (jsize i = 0; i < image_count; ++i) {
+        auto image = static_cast<jbyteArray>(env->GetObjectArrayElement(j_images, i));
+        if (image == nullptr) {
+            throw_java(env, "Image payload is null");
+            for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+            return env->NewStringUTF("");
+        }
+        const jsize length = env->GetArrayLength(image);
+        if (length <= 0 || length > 8 * 1024 * 1024) {
+            env->DeleteLocalRef(image);
+            throw_java(env, "Image payload exceeds the Android limit");
+            for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+            return env->NewStringUTF("");
+        }
+        jboolean is_copy = JNI_FALSE;
+        auto * bytes = env->GetByteArrayElements(image, &is_copy);
+        if (bytes == nullptr) {
+            env->DeleteLocalRef(image);
+            throw_java(env, "Unable to access image payload");
+            for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+            return env->NewStringUTF("");
+        }
+        auto wrapper = mtmd_helper_bitmap_init_from_buf(
+            qctx->vision,
+            reinterpret_cast<const unsigned char *>(bytes),
+            static_cast<size_t>(length),
+            false
+        );
+        if (bytes != nullptr) env->ReleaseByteArrayElements(image, bytes, JNI_ABORT);
+        env->DeleteLocalRef(image);
+        if (wrapper.video_ctx != nullptr) mtmd_helper_video_free(wrapper.video_ctx);
+        if (wrapper.bitmap == nullptr) {
+            throw_java(env, "MTMD image decode failed");
+            for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+            return env->NewStringUTF("");
+        }
+        bitmaps.push_back(wrapper.bitmap);
+        bitmap_refs.push_back(wrapper.bitmap);
+    }
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text input_text{
+        prompt.c_str(),
+        true,
+        true
+    };
+    const int32_t tokenize_result = mtmd_tokenize(
+        qctx->vision,
+        chunks,
+        &input_text,
+        bitmap_refs.data(),
+        bitmap_refs.size()
+    );
+    for (auto * bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+    if (tokenize_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        throw_java(env, "MTMD prompt/image tokenize failed");
+        return env->NewStringUTF("");
+    }
+
+    QlhGenerationStats stats;
+    stats.stop_reason = "max_tokens";
+    const size_t chunk_count = mtmd_input_chunks_size(chunks);
+    llama_pos n_past = 0;
+    for (size_t i = 0; i < chunk_count; ++i) {
+        const mtmd_input_chunk * chunk = mtmd_input_chunks_get(chunks, i);
+        const int32_t eval_result = mtmd_helper_eval_chunk_single(
+            qctx->vision,
+            qctx->ctx,
+            chunk,
+            n_past,
+            0,
+            llama_n_batch(qctx->ctx),
+            i + 1 == chunk_count,
+            &n_past
+        );
+        if (eval_result != 0) {
+            mtmd_input_chunks_free(chunks);
+            stats.stop_reason = "mtmd_decode_error";
+            qctx->last_stats = stats;
+            throw_java(env, "MTMD decode failed");
+            return env->NewStringUTF("");
+        }
+        stats.prompt_tokens += static_cast<int>(mtmd_input_chunk_get_n_tokens(chunk));
+    }
+    mtmd_input_chunks_free(chunks);
+    if (stats.prompt_tokens >= qctx->n_ctx) {
+        stats.stop_reason = "context_overflow";
+        qctx->last_stats = stats;
+        throw_java(env, "Multimodal prompt exceeds context window");
+        return env->NewStringUTF("");
+    }
+
+    jclass callback_class = env->GetObjectClass(on_token);
+    jmethodID invoke_method = callback_class == nullptr
+        ? nullptr
+        : env->GetMethodID(callback_class, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    std::string output;
+    std::string pending_utf8;
+    const int max_tokens = std::max(1, static_cast<int>(j_max_tokens));
+    const auto t_start = std::chrono::steady_clock::now();
+    for (int i = 0; i < max_tokens; ++i) {
+        llama_token next_token = llama_sampler_sample(qctx->sampler, qctx->ctx, -1);
+        llama_sampler_accept(qctx->sampler, next_token);
+        if (llama_vocab_is_eog(qctx->vocab, next_token)) {
+            stats.stop_reason = "eog";
+            break;
+        }
+        stats.generated_tokens += 1;
+        pending_utf8 += token_to_piece(qctx, next_token);
+        if (valid_utf8(pending_utf8)) {
+            output += pending_utf8;
+            if (invoke_method != nullptr && !pending_utf8.empty()) {
+                jstring piece = env->NewStringUTF(pending_utf8.c_str());
+                env->CallObjectMethod(on_token, invoke_method, piece);
+                env->DeleteLocalRef(piece);
+                if (env->ExceptionCheck()) {
+                    stats.stop_reason = "callback_exception";
+                    break;
+                }
+            }
+            pending_utf8.clear();
+        }
+        llama_batch next_batch = llama_batch_get_one(&next_token, 1);
+        if (llama_decode(qctx->ctx, next_batch) != 0) {
+            stats.stop_reason = "decode_error";
+            qctx->last_stats = stats;
+            throw_java(env, "llama_decode failed during multimodal generation");
+            return env->NewStringUTF(output.c_str());
+        }
+    }
+    if (!pending_utf8.empty() && valid_utf8(pending_utf8)) output += pending_utf8;
+    const auto t_end = std::chrono::steady_clock::now();
+    stats.total_tokens = stats.prompt_tokens + stats.generated_tokens;
+    stats.elapsed_seconds = std::chrono::duration<double>(t_end - t_start).count();
+    if (stats.elapsed_seconds > 0.0) {
+        stats.tokens_per_second = static_cast<double>(stats.generated_tokens) / stats.elapsed_seconds;
+    }
+    qctx->last_stats = stats;
+    return env->NewStringUTF(output.c_str());
+}
+
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetModelInfo(
     JNIEnv * env,
@@ -471,16 +713,18 @@ Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetBackendInfo(
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_qlh_inference_service_LocalInferenceEngine_nativeGetMultimodalCapability(
     JNIEnv * env,
-    jobject /* thiz */
+    jobject /* thiz */,
+    jlong ptr
 ) {
-    // The Android CMake target currently builds the text-only llama.cpp bridge.
-    // Keep this explicit so image requests fail closed until mtmd is wired in.
     jmethodID put_method = nullptr;
     jobject map = new_string_map(env, &put_method);
-    map_put(env, map, put_method, "vision_supported", "false");
+    auto * qctx = reinterpret_cast<QlhLlamaContext *>(ptr);
+    const bool vision = qctx != nullptr && qctx->vision != nullptr &&
+        mtmd_support_vision(qctx->vision);
+    map_put(env, map, put_method, "vision_supported", vision ? "true" : "false");
     map_put(env, map, put_method, "audio_supported", "false");
-    map_put(env, map, put_method, "mtmd_compiled", "false");
-    map_put(env, map, put_method, "reason", "Android JNI text-only build; MTMD bridge is not compiled");
+    map_put(env, map, put_method, "mtmd_compiled", "true");
+    map_put(env, map, put_method, "reason", vision ? "ready" : "mmproj not loaded");
     return map;
 }
 

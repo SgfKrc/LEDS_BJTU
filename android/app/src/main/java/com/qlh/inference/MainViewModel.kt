@@ -1,33 +1,40 @@
 package com.qlh.inference
 
+import com.google.gson.Gson
 import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import java.io.File
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.core.content.ContextCompat
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.data.MessageEntity
 import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.data.SettingsDataStore
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
+import com.qlh.inference.network.AndroidPresenceSnapshot
+import com.qlh.inference.network.AndroidPresenceState
 import com.qlh.inference.network.DiffusionBlobUpload
 import com.qlh.inference.network.DiffusionEditRequest
 import com.qlh.inference.network.DiffusionGenerateRequest
 import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.httpBaseUrl
+import com.qlh.inference.network.ClientErrorReport
 import com.qlh.inference.network.BootstrapRequest
 import com.qlh.inference.network.ChatRepository
-import com.qlh.inference.network.RegisterNodeRequest
 import com.qlh.inference.service.InferenceService
+import com.qlh.inference.service.AndroidPresenceService
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.system.AndroidDeviceInfoProvider
 import com.qlh.inference.security.AuthTokenStore
 import com.qlh.inference.security.StoredAuthSession
-import kotlinx.coroutines.delay
+import com.qlh.inference.update.AndroidAppUpdateManager
+import com.qlh.inference.update.AndroidUpdateCandidate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -90,6 +97,8 @@ data class MainUiState(
     val runtimeStatusLoading: Boolean = false,
     val runtimeStatusError: String? = null,
     val themeMode: String = SettingsDataStore.DEFAULT_THEME_MODE,
+    val diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
+    val appUpdate: AppUpdateUiState = AppUpdateUiState(),
 
     // 上次发送的消息（用于重试）
     val lastSentMessage: String? = null,
@@ -102,6 +111,7 @@ data class MainUiState(
     val authSession: StoredAuthSession? = null,
     val authBusy: Boolean = false,
     val authError: String? = null,
+    val presence: AndroidPresenceSnapshot = AndroidPresenceSnapshot(),
 )
 
 // ================================================================
@@ -115,6 +125,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settings = SettingsDataStore(application)
     private val modelManager = ModelManager(application)
     private val authStore = AuthTokenStore(application)
+    private val appUpdateManager = AndroidAppUpdateManager(application)
+    private var downloadedUpdateFile: File? = null
 
     private val _uiState = MutableStateFlow(MainUiState())
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
@@ -207,9 +219,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // Android Full 薄客户端 presence 心跳：只在 thin 模式生效，Lite 仍跳过。
         viewModelScope.launch {
-            while (true) {
-                delay(45_000L)
-                autoRegisterAndroidNode(force = true)
+            AndroidPresenceService.snapshot.collect { snapshot ->
+                _uiState.value = _uiState.value.copy(presence = snapshot)
             }
         }
 
@@ -626,6 +637,195 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun refreshDiagnostics() {
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.value = state.copy(
+                diagnostics = state.diagnostics.copy(
+                    healthLoading = true,
+                    healthError = null,
+                )
+            )
+            apiClient(state).probeConnectionHealth(detectNetworkType())
+                .onSuccess { report ->
+                    _uiState.value = _uiState.value.copy(
+                        diagnostics = _uiState.value.diagnostics.copy(
+                            health = report,
+                            healthLoading = false,
+                            healthError = null,
+                        )
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        diagnostics = _uiState.value.diagnostics.copy(
+                            healthLoading = false,
+                            healthError = error.message ?: error.javaClass.simpleName,
+                        )
+                    )
+                }
+        }
+    }
+
+    fun uploadDiagnostics() {
+        viewModelScope.launch {
+            val state = _uiState.value
+            val diagnostics = state.diagnostics.copy(
+                uploadInProgress = true,
+                uploadMessage = null,
+                uploadError = null,
+            )
+            _uiState.value = state.copy(diagnostics = diagnostics)
+            val logText = QlhLogger.readRedactedLogBundle(maxBytes = 20_000L)
+            val report = ClientErrorReport(
+                message = "manual Android diagnostic upload",
+                source = "manual",
+                stack = logText,
+                userAgent = "QLH Android ${BuildConfig.VERSION_NAME}",
+                extra = mapOf(
+                    "variant" to if (BuildConfig.IS_LITE) "lite" else "full",
+                    "network_type" to (state.diagnostics.health?.localNetworkType ?: detectNetworkType()),
+                ),
+            )
+            apiClient(state).reportClientError(report)
+                .onSuccess {
+                    _uiState.value = _uiState.value.copy(
+                        diagnostics = _uiState.value.diagnostics.copy(
+                            uploadInProgress = false,
+                            uploadMessage = "已上报脱敏诊断摘要",
+                        )
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        diagnostics = _uiState.value.diagnostics.copy(
+                            uploadInProgress = false,
+                            uploadError = error.message ?: error.javaClass.simpleName,
+                        )
+                    )
+                }
+        }
+    }
+
+    fun checkForAppUpdate() {
+        if (_uiState.value.appUpdate.checking || _uiState.value.appUpdate.downloading) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                appUpdate = _uiState.value.appUpdate.copy(
+                    checking = true,
+                    candidate = null,
+                    downloadedReady = false,
+                    message = null,
+                    error = null,
+                )
+            )
+            downloadedUpdateFile = null
+            appUpdateManager.checkForUpdate(
+                host = _uiState.value.serverHost,
+                currentVersion = BuildConfig.VERSION_NAME,
+            ).onSuccess { candidate ->
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        checking = false,
+                        candidate = candidate,
+                        installPermissionGranted = appUpdateManager.canRequestPackageInstalls(),
+                        message = if (candidate == null) "当前已是最新版本" else "发现 ${candidate.asset.version}",
+                    )
+                )
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        checking = false,
+                        error = error.message ?: error.javaClass.simpleName,
+                    )
+                )
+            }
+        }
+    }
+
+    fun downloadAppUpdate() {
+        val candidate = _uiState.value.appUpdate.candidate ?: return
+        if (_uiState.value.appUpdate.downloading) return
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                appUpdate = _uiState.value.appUpdate.copy(
+                    downloading = true,
+                    progress = null,
+                    downloadedReady = false,
+                    message = null,
+                    error = null,
+                )
+            )
+            appUpdateManager.downloadAndVerify(candidate) { progress ->
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(progress = progress)
+                )
+            }.onSuccess { file ->
+                downloadedUpdateFile = file
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        downloading = false,
+                        downloadedReady = true,
+                        installPermissionGranted = appUpdateManager.canRequestPackageInstalls(),
+                        message = "下载并校验完成",
+                    )
+                )
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        downloading = false,
+                        error = error.message ?: error.javaClass.simpleName,
+                    )
+                )
+            }
+        }
+    }
+
+    fun openInstallPermissionSettings() {
+        appUpdateManager.openInstallPermissionSettings()
+            .onSuccess {
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        installPermissionGranted = appUpdateManager.canRequestPackageInstalls(),
+                    )
+                )
+            }
+            .onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        error = error.message ?: error.javaClass.simpleName,
+                    )
+                )
+        }
+    }
+
+    fun refreshAppInstallPermission() {
+        _uiState.value = _uiState.value.copy(
+            appUpdate = _uiState.value.appUpdate.copy(
+                installPermissionGranted = appUpdateManager.canRequestPackageInstalls(),
+            )
+        )
+    }
+
+    fun installDownloadedUpdate() {
+        val file = downloadedUpdateFile
+        if (file == null || !file.exists()) {
+            _uiState.value = _uiState.value.copy(
+                appUpdate = _uiState.value.appUpdate.copy(error = "请先下载并校验更新包")
+            )
+            return
+        }
+        appUpdateManager.launchInstaller(file)
+            .onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    appUpdate = _uiState.value.appUpdate.copy(
+                        installPermissionGranted = appUpdateManager.canRequestPackageInstalls(),
+                        error = error.message ?: error.javaClass.simpleName,
+                    )
+                )
+            }
+    }
+
     private fun createPassiveRuntimeStatus(inferenceMode: String): AndroidRuntimeStatus {
         val provider = AndroidDeviceInfoProvider(getApplication())
         val nativeResult = runCatching { System.loadLibrary("qlh_llama_jni") }
@@ -701,9 +901,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val state = _uiState.value
-        if (state.inferenceMode != "thin") return
+        if (state.inferenceMode != "thin") {
+            getApplication<Application>().stopService(AndroidPresenceService.stopIntent(getApplication()))
+            return
+        }
         val key = "${state.serverHost}:${state.serverPort}:${state.inferenceMode}"
-        if (!force && key == lastAutoRegisterKey) return
+        if (key == lastAutoRegisterKey && state.presence.state in setOf(
+                AndroidPresenceState.ONLINE,
+                AndroidPresenceState.REGISTERING,
+                AndroidPresenceState.BACKING_OFF,
+            )
+        ) return
         lastAutoRegisterKey = key
 
         val nodeId = settings.getOrCreateAndroidNodeId()
@@ -714,34 +922,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .joinToString(" ")
             .ifBlank { nodeId }
 
-        // 检测实际网络类型（wifi / mobile / ethernet）
         val networkType = detectNetworkType()
-
-        val deviceInfo = buildAndroidPresenceDeviceInfo()
-        val client = apiClient(state)
-        val result = client.registerAndroidNode(
-            RegisterNodeRequest(
-                nodeId = nodeId,
-                hostname = hostname,
-                networkType = networkType,
-                nodeType = "android",
-                deviceInfo = deviceInfo,
-                clientMode = "thin",
-                appVariant = if (BuildConfig.IS_LITE) "lite" else "full",
-                appVersion = BuildConfig.VERSION_NAME,
+        val deviceInfoJson = Gson().toJson(buildAndroidPresenceDeviceInfo())
+        ContextCompat.startForegroundService(
+            getApplication(),
+            AndroidPresenceService.startIntent(
+                getApplication(),
+                state.serverHost,
+                state.serverPort,
+                nodeId,
+                hostname,
+                networkType,
+                deviceInfoJson,
             )
         )
-        result.onSuccess { response ->
-            QlhLogger.i(
-                "MainViewModel",
-                "Android node registered: nodeId=$nodeId status=${response.status} networkType=$networkType host=${state.serverHost}:${state.serverPort}"
-            )
-        }.onFailure { e ->
-            QlhLogger.w(
-                "MainViewModel",
-                "Android node auto-register failed: ${e.message ?: e.javaClass.simpleName}"
-            )
-        }
+        QlhLogger.i("MainViewModel", "Android presence service started: nodeId=$nodeId host=${state.serverHost}:${state.serverPort}")
+    }
+
+    override fun onCleared() {
+        getApplication<Application>().stopService(AndroidPresenceService.stopIntent(getApplication()))
+        super.onCleared()
     }
 
     private fun buildAndroidPresenceDeviceInfo(): Map<String, Any?> {

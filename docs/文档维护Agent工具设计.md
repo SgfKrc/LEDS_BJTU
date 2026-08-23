@@ -1,8 +1,8 @@
 # 文档维护 Agent 工具设计
 
-> 状态：实施中（**M1 已复核收口，M2.1-M2.4 已完成并通过 opencode 实网传输验收；M3.1-M3.4 开发票完成，M2 语义基准与 M3 embedding 质量待后置验收**）
+> 状态：已收口（**M1、M2 与 M3 已完成本机质量验收；仍保持只读候选与人工核对边界**）
 >
-> 更新日期：2026-08-16
+> 更新日期：2026-08-23
 > 适用范围：仓库 `docs/` 文档元数据一致性维护（状态行、完成登记、链接、提交记录）；不替代文档内容创作、不替代人工审核、不改变"git 是唯一事实源"的纪律
 >
 > 立项背景：2026-08-16 批量筛查 46 份文档发现 4 类遗漏——① 完成提交但头部状态行未收口（SD 离线包阶段 2）；② 整个实现+登记未提交（TG-OPT-G1）；③ 状态行过时（自动化实验"仍受资源门阻塞"）；④ 正文完成但状态行未同步（答辩演示 P5-P8）。此类问题靠人工周期性排查成本高、易漏。
@@ -118,6 +118,7 @@ DOCAGENT_CONFIDENCE_FLOOR=0.6     # 低于此值一律 needs_review
 | **M2.2** | `build/docagent-cache.sqlite` 的 L1/L2 表、懒失效、人工确认回写、`cost_log` | ✅ 2026-08-16 | 纯本地 SQLite；完全相同输入的 L1 复用合法 `needs_review`，输入变化后的 L2 不复用；`human` 结论优先，文档/提交指纹变化后自然 miss |
 | **M2.3** | `--llm`、OpenAI 兼容 HTTP client、DeepSeek→Ollama→跳过回退、超时与用量采集 | ✅ 2026-08-16 | 仅以 loopback fake provider 测试；真实远程调用留到用户显式配置后验收；失败类别不回显 URL/响应体 |
 | **M2.4** | 建议 diff 生成与人工确认导入 | ✅ 2026-08-16 | `--apply` **只写** `build/doc-audit/suggestions.patch` 与 manifest；不写源文档、不执行 `git apply`、不提交 |
+| **M2-GATE** | 冻结四份人工标签、文档/M1 信号完整性校验与 provider-backed 语义一致率门 | ✅ 2026-08-23 | 基线只选定四份已人工复核文档；文档 SHA 或 M1 规则变化即失效；仅 `source=llm` 可计入，provider 回退/缺失的 `needs_review` 一律不能通过 |
 
 M2.1 的 provider 输入只使用匿名文档引用；返回协议中 `doc` 同样必须回显该 `doc_ref`，本地报告阶段才映射回实际相对路径。confidence 低于阈值、非法 JSON、字段额外/缺失或 `doc_ref` 不一致，全部降级为 `needs_review`。
 
@@ -203,8 +204,9 @@ CREATE TABLE check_runs (           -- 核对历史，避免重复人工核对
 |---|---|---|---|
 | **M3.1** | `build/docagent-events.sqlite`，`doc_meta` / `doc_events` / `check_runs` 初始化，M1 快照索引与 `--index` | ✅ 2026-08-17 | 只写本地 `build/`；实仓索引 57 份文档、57 条 scan 事件、1 次 check run，不修改 `docs/` |
 | **M3.2** | `--rebuild` 从 git 历史重建事件索引、重建前备份与可重复性校验 | ✅ 2026-08-17 | 实仓重放 251 个提交、595 条历史事件；临时库成功后原子替换，保留 `.bak-*` 旧库 |
-| **M3.3** | `doc_chunks` 与本地 FTS 检索 CLI，先提供无 embedding 的关键词候选 | ✅ 2026-08-17 | 实仓 57 份文档 / 798 chunks，`task graph` 查询返回 5 个候选；无网络、无 GPU；检索只生成核对候选 |
-| **M3.4** | Ollama embedding adapter、`doc_embeddings` 与 top-5 语义检索 | 开发票 ✅ 2026-08-17 | fake provider 完成增量/替换/cosine 测试；实仓无 Ollama 时安全降级，真实 embedding 质量与模型可用性后验收；FTS 不受影响 |
+| **M3.3** | `doc_chunks` 与本地 FTS 检索 CLI，先提供无 embedding 的关键词候选 | ✅ 2026-08-23 | 新增文档级去重与中文二元词 FTS 回退；当前 66 份文档 / 935 chunks，30 条冻结基准 `hit@5=0.766667`、MRR `0.520556` |
+| **M3.4** | Ollama embedding adapter、`doc_embeddings` 与 top-5 语义检索 | ✅ 2026-08-23 | 本机 `nomic-embed-text:latest` 建立 935 个 768 维向量；同一 30 条基准 `hit@5=0.766667`、MRR `0.440000`，复跑无新增 embedding；provider 不可用时仍安全降级，FTS 不受影响 |
+| **M3-QA** | 文档级 30 条冻结查询、目标文档 SHA 校验、FTS/语义 top-5 质量门 | ✅ 2026-08-23 | `fixtures/docagent/m3-retrieval-baseline-v1.json`；文档内容或模型标签不符即拒绝复用，输出只保存 query SHA、排名和计数，不把检索结果当作 git 事实 |
 
 M3.1 的索引是派生数据：重复执行只新增本次 `check_runs`/扫描审计事件，`doc_meta` 始终代表当前快照；数据库可随时删除并从仓库重建。
 
@@ -213,6 +215,7 @@ python scripts/doc_maintenance_audit.py --index --json --fail-on none
 python scripts/doc_maintenance_audit.py --rebuild --json --fail-on none
 python scripts/doc_maintenance_audit.py --index-chunks --search "task graph" --search-limit 5
 python scripts/doc_maintenance_audit.py --embed --semantic-search "慢网任务调度"
+python scripts/docagent_retrieval_quality_gate.py --mode all
 ```
 
 `--embed` 和 `--semantic-search` 只显式调用本机 Ollama；provider 不可用时报告降级，不影响 M1、事件库或 FTS。
@@ -231,8 +234,8 @@ python scripts/doc_maintenance_audit.py --embed --semantic-search "慢网任务�
 | 里程碑 | 交付 | 验收口径 |
 |---|---|---|
 | **M1 机械化扫描器** | `scripts/doc_maintenance_audit.py` + 规则表 + 清单模板 | ✅ 2026-08-16 复核：54 份文档全量扫描 0.76s；20 项定向测试通过；R2 仅命中实际改动文档、R3 仅按 `src/` 路径粗关联；Windows GBK 父终端下 CLI 强制 UTF-8 输出；零改写 `docs/` 内容 |
-| **M2 LLM 判定** | `--llm` 路径 + 判定协议 + 脱敏检查 + **三级缓存**（L1/L2 本地 SQLite，L3 随 M3 接入） | 开发票 + 实网传输 ✅：opencode 4/4 返回合法 JSON，低置信度均转人工；待语义验收：人工冻结 4 个带结论的样本后，判定一致率 ≥ 3/4；远程缺失时回退 Ollama、均不可用时机械化照常；同提交重扫远程调用 0、人工结论重扫 0、新提交仅关联文档重调 |
-| **M3 事件库 + RAG** | SQLite 三表 + embedding 索引 + 检索 CLI | 变更描述→关联文档 top-5 命中率 ≥ 60%（30 条抽样人工标注）；`--rebuild` 从 git log 重建与 git 一致 |
+| **M2 LLM 判定** | `--llm` 路径 + 判定协议 + 脱敏检查 + **三级缓存**（L1/L2 本地 SQLite，L3 随 M3 接入） | ✅ 2026-08-23：`fixtures/docagent/m2-semantic-baseline-v1.json` 冻结 4 份人工标签；`scripts/docagent_semantic_gate.py` 首轮为 3 次 provider 调用 + 1 次精确缓存、一致 3/4，复跑为 0 次调用 + 4 次缓存。1 份 PyTorch 生命周期样本不一致而保留 `needs_review`，不自动改写文档；远程缺失时回退 Ollama、均不可用时机械化照常 |
+| **M3 事件库 + RAG** | SQLite 三表 + embedding 索引 + 检索 CLI | ✅ 2026-08-23：文档级去重 + 中文二元词 FTS 回退；冻结 30 条查询在 FTS/`nomic-embed-text:latest` 语义检索均达 `hit@5=0.766667`（阈值 ≥0.60），MRR 为 `0.520556/0.440000`；`--rebuild` 从 git log 重建与 git 一致 |
 | 收口 | 全量核对清单清零（或逐项登记为已知/有意） | 2026-08-16 发现的 4 类问题模式在后续扫描中不再以"未发现"状态存在 |
 
 ## 7. 依赖与风险
@@ -264,6 +267,8 @@ python scripts/doc_maintenance_audit.py --embed --semantic-search "慢网任务�
 | 2026-08-17 | M2 实网受控验收：4 个匿名文档批次全部由 opencode 返回合法 JSON，未降级到 Ollama；2 个 R1 与 README 因 confidence 0.3/0.5/0.4 降级 `needs_review`，PyTorch 生命周期场景以 0.8 判定 `accurate`。缺少人工冻结标签，语义一致率门保留待验收 |
 | 2026-08-17 | M3 分票收敛为本地优先路径：M3.1 当前快照事件库、M3.2 git 重建、M3.3 FTS、M3.4 可选本地 embedding；不以模型/硬件可用性阻塞前 3 票开发 |
 | 2026-08-17 | M2 实网重扫修复缓存语义：合法低置信度 `needs_review` 现在可被完全相同输入的 L1 精确缓存复用；L2 状态缓存仍拒绝复用，避免输入变化后沿用不确定结论 |
+| 2026-08-23 | 完成 `M2-GATE`：新增受版本约束的四样本人工基线、文档 SHA/M1 规则漂移拒绝、仅 provider-backed 结果计分的 3/4 语义门和 CLI。受控实测首次 3 次调用 + 1 次 L1 命中、一致 3/4；立即复跑 0 次调用 + 4 次 L1 命中。PyTorch 生命周期样本保持 `needs_review` 分歧，未写回源文档；专项回归 `71 passed`。 |
+| 2026-08-23 | 完成 `M3-QA`：新增 30 条人工冻结的文档级检索基准、目标文档规范化文本 SHA 校验、FTS/semantic CLI 与红脱敏结果。实测揭示原 M3.3 中文整段 AND 查询仅 `hit@5=0.066667`；移植受限中文二元词 OR 回退并添加文档级去重，FTS 提升至 `0.766667`/MRR `0.520556`。本机 `nomic-embed-text:latest` 首次写入 935 个 768 维向量，语义检索 `hit@5=0.766667`/MRR `0.440000`；复跑 935 个向量全复用。 |
 | 2026-08-17 | 完成 M3.1：新增 `docagent-events.sqlite` 三表、`--index` 当前快照入口、最近 git 提交索引、scan/LLM 事件与人工 decisions 回写；实仓 57 份文档索引耗时 3.24s |
 | 2026-08-17 | 完成 M3.2：`--rebuild` 正序重放 git 的 `docs/*.md` 历史为 `manual_edit` 事件，重建前备份旧库、临时库完成后 `os.replace`；实仓 251 提交 / 595 历史事件，耗时 3.53s |
 | 2026-08-17 | 完成 M3.3：新增确定性 Markdown chunks、SQLite FTS5、`--index-chunks` 与 `--search`；实仓生成 798 chunks，FTS 查询耗时 1.12s |

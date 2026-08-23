@@ -343,13 +343,12 @@ class MainViewModelLogicTest {
     }
 
     @Test
-    fun `image submission rejects invalid format and local mode`() {
+    fun `image submission rejects invalid format but allows full mode gate`() {
         assertEquals(
             "图像仅支持 PNG/JPEG/WebP base64 data URL",
             validateChatImageSubmission("thin", listOf("https://example/image.png")),
         )
-        assertEquals(
-            "本地模式暂不支持图像理解，请切换远程模式",
+        assertNull(
             validateChatImageSubmission("full", listOf("data:image/png;base64,iVBORw0KGgo=")),
         )
     }

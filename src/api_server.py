@@ -8381,6 +8381,8 @@ class AndroidPresenceRequest(BaseModel):
     client_mode: str = Field(default="thin", description="客户端模式: thin | full")
     app_variant: str = Field(default="full", description="Android flavor: full | lite")
     app_version: str = Field(default="", description="App 版本")
+    presence_generation: int = Field(default=0, ge=0, description="当前 presence lease 代次")
+    presence_lease_id: str = Field(default="", max_length=128, description="当前 presence lease 标识")
 
 
 @app.post("/api/cluster/nodes/register")
@@ -8436,8 +8438,21 @@ async def register_android_presence(req: AndroidPresenceRequest, request: Reques
 
 @app.post("/api/cluster/android/heartbeat")
 async def heartbeat_android_presence(req: AndroidPresenceRequest, request: Request):
-    """Android Full 薄客户端心跳；实现与 register 相同，重复调用会刷新 last_heartbeat。"""
-    return await register_android_presence(req, request)
+    """Refresh an Android presence lease; this endpoint never re-registers a node."""
+    http_peer = request.client.host if request.client else ""
+    result = scheduler.heartbeat_android_client(
+        node_id=req.node_id,
+        presence_generation=req.presence_generation,
+        presence_lease_id=req.presence_lease_id,
+        http_peer=http_peer,
+    )
+    if result.get("status") == "denied":
+        raise coded_http_error(403, result.get("error_code", "not_master"), result.get("reason", "仅主节点可接收 Android 心跳"))
+    if result.get("status") == "invalid":
+        raise coded_http_error(400, result.get("error_code", "invalid_node_id"), result.get("reason", "无效 Android 节点"))
+    if result.get("status") == "rejected":
+        raise coded_http_error(409, result.get("error_code", "presence_rejected"), result.get("reason", "Android presence 被拒绝"))
+    return result
 
 
 @app.get("/api/cluster/master-health")

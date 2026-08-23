@@ -71,11 +71,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qlh.inference.logging.QlhLogger
+import com.qlh.inference.AppUpdateUiState
+import com.qlh.inference.DiagnosticsUiState
+import com.qlh.inference.network.ConnectionHealthState
 import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.service.ModelManager
 import com.qlh.inference.status.AndroidRuntimeStatus
+import com.qlh.inference.network.AndroidPresenceSnapshot
+import com.qlh.inference.network.AndroidPresenceState
 import com.qlh.inference.ui.components.QlhTopBar
 import com.qlh.inference.ui.components.CollapsibleSettingsGroup
 import com.qlh.inference.ui.components.SettingRow
@@ -124,6 +129,7 @@ fun SettingsScreen(
     runtimeStatusLoading: Boolean,
     runtimeStatusError: String?,
     onRefreshRuntimeStatus: () -> Unit,
+    presence: AndroidPresenceSnapshot = AndroidPresenceSnapshot(),
     onConnectionTestSuccess: () -> Unit = {},
     remoteModels: List<GgufModelInfo> = emptyList(),
     remoteModelsLoading: Boolean = false,
@@ -132,12 +138,21 @@ fun SettingsScreen(
     remoteModelMessage: String? = null,
     onRefreshRemoteModels: () -> Unit = {},
     onDownloadRemoteModel: (GgufModelInfo) -> Unit = {},
+    diagnostics: DiagnosticsUiState = DiagnosticsUiState(),
+    onRefreshDiagnostics: () -> Unit = {},
+    onUploadDiagnostics: () -> Unit = {},
+    appUpdate: AppUpdateUiState = AppUpdateUiState(),
+    onCheckForAppUpdate: () -> Unit = {},
+    onDownloadAppUpdate: () -> Unit = {},
+    onOpenInstallPermissionSettings: () -> Unit = {},
+    onInstallDownloadedUpdate: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isLite = BuildConfig.IS_LITE
 
     LaunchedEffect(Unit) {
         onRefreshRuntimeStatus()
+        onRefreshDiagnostics()
     }
 
     Column(modifier = modifier.fillMaxSize()) {
@@ -175,6 +190,22 @@ fun SettingsScreen(
                 inferenceMode = inferenceMode,
                 isLite = isLite,
                 onInferenceModeChange = onInferenceModeChange
+            )
+
+            PresenceStatusGroup(presence)
+
+            DiagnosticsGroup(
+                state = diagnostics,
+                onRefresh = onRefreshDiagnostics,
+                onUpload = onUploadDiagnostics,
+            )
+
+            AppUpdateGroup(
+                state = appUpdate,
+                onCheck = onCheckForAppUpdate,
+                onDownload = onDownloadAppUpdate,
+                onOpenInstallPermissionSettings = onOpenInstallPermissionSettings,
+                onInstall = onInstallDownloadedUpdate,
             )
 
             AppearanceGroup(
@@ -290,6 +321,189 @@ private fun AppearanceGroup(
 // ================================================================
 // 主节点连接
 // ================================================================
+
+@Composable
+private fun PresenceStatusGroup(snapshot: AndroidPresenceSnapshot) {
+    val label = when (snapshot.state) {
+        AndroidPresenceState.ONLINE -> "online"
+        AndroidPresenceState.REGISTERING -> "registering"
+        AndroidPresenceState.BACKING_OFF -> "offline / retrying"
+        AndroidPresenceState.OFFLINE -> "offline"
+        AndroidPresenceState.STOPPED -> "stopped"
+    }
+    SettingsGroup(title = "Cluster presence", icon = Icons.Default.Cloud) {
+        Text(
+            text = "Status: $label",
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (snapshot.state == AndroidPresenceState.ONLINE) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+        if (!snapshot.lastErrorCode.isNullOrBlank()) {
+            Text(
+                text = "Code: ${snapshot.lastErrorCode}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticsGroup(
+    state: DiagnosticsUiState,
+    onRefresh: () -> Unit,
+    onUpload: () -> Unit,
+) {
+    SettingsGroup(title = "连接诊断", icon = Icons.Default.Info) {
+        state.health?.let { report ->
+            Text(
+                text = "网络：${report.localNetworkType}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            report.checks.forEach { check ->
+                val color = when (check.state) {
+                    ConnectionHealthState.PASS -> MaterialTheme.colorScheme.primary
+                    ConnectionHealthState.FAIL -> MaterialTheme.colorScheme.error
+                    ConnectionHealthState.SKIPPED -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(check.label, color = MaterialTheme.colorScheme.onSurface)
+                    Text(
+                        text = when (check.state) {
+                            ConnectionHealthState.PASS -> "通过"
+                            ConnectionHealthState.FAIL -> "失败"
+                            ConnectionHealthState.SKIPPED -> "跳过"
+                        } + (check.latencyMillis?.let { " · ${it} ms" } ?: ""),
+                        color = color,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                if (check.detail.isNotBlank()) {
+                    Text(
+                        text = check.detail,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+        state.healthError?.let { error ->
+            Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        state.uploadMessage?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall)
+        }
+        state.uploadError?.let { error ->
+            Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onRefresh,
+                enabled = !state.healthLoading && !state.uploadInProgress,
+                modifier = Modifier.weight(1f),
+            ) {
+                if (state.healthLoading) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+                Spacer(Modifier.width(6.dp))
+                Text("刷新")
+            }
+            OutlinedButton(
+                onClick = onUpload,
+                enabled = !state.uploadInProgress,
+                modifier = Modifier.weight(1f),
+            ) {
+                if (state.uploadInProgress) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                }
+                Spacer(Modifier.width(6.dp))
+                Text("上报脱敏日志")
+            }
+        }
+    }
+}
+
+@Composable
+private fun AppUpdateGroup(
+    state: AppUpdateUiState,
+    onCheck: () -> Unit,
+    onDownload: () -> Unit,
+    onOpenInstallPermissionSettings: () -> Unit,
+    onInstall: () -> Unit,
+) {
+    SettingsGroup(title = "应用更新", icon = Icons.Default.CloudDownload) {
+        Text(
+            text = "当前版本 ${BuildConfig.VERSION_NAME}",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        state.candidate?.let { candidate ->
+            Text(
+                text = "可用版本 ${candidate.asset.version} · ${formatBytes(candidate.asset.sizeBytes)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        state.progress?.let { progress ->
+            LinearProgressIndicator(
+                progress = { progress.percent / 100f },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} (${progress.percent}%)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        state.message?.let { Text(it, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodySmall) }
+        state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = onCheck,
+                enabled = !state.checking && !state.downloading,
+                modifier = Modifier.weight(1f),
+            ) {
+                if (state.checking) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                else Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("检查更新")
+            }
+            if (state.candidate != null && !state.downloadedReady) {
+                Button(
+                    onClick = onDownload,
+                    enabled = !state.downloading && !state.checking,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (state.downloading) "下载中" else "下载并校验")
+                }
+            } else if (state.downloadedReady) {
+                Button(
+                    onClick = if (state.installPermissionGranted) onInstall else onOpenInstallPermissionSettings,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text(if (state.installPermissionGranted) "安装更新" else "允许安装")
+                }
+            }
+        }
+    }
+}
 
 @Composable
 private fun ConnectionGroup(
@@ -1335,13 +1549,7 @@ private fun LogManagementGroup(isLite: Boolean) {
             ) {
                 OutlinedButton(
                     onClick = {
-                        val allLogText = buildString {
-                            QlhLogger.getLogFiles().forEach { fi ->
-                                appendLine("===== ${fi.name} (${formatBytes(fi.size)}) =====")
-                                appendLine(QlhLogger.readLogFile(fi.name) ?: "(读取失败)")
-                                appendLine()
-                            }
-                        }
+                        val allLogText = QlhLogger.readRedactedLogBundle()
                         val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("QLH Logs", allLogText))
                     },
@@ -1353,7 +1561,7 @@ private fun LogManagementGroup(isLite: Boolean) {
                 OutlinedButton(
                     onClick = {
                         val file = QlhLogger.getLogFiles().firstOrNull() ?: return@OutlinedButton
-                        val content = QlhLogger.readLogFile(file.name) ?: return@OutlinedButton
+                        val content = QlhLogger.readRedactedLogBundle(maxBytes = QlhLogger.READ_MAX_BYTES)
                         val sendIntent = Intent().apply {
                             action = Intent.ACTION_SEND
                             putExtra(Intent.EXTRA_TEXT, content)
@@ -1383,21 +1591,7 @@ private fun LogManagementGroup(isLite: Boolean) {
                 }
                 OutlinedButton(
                     onClick = {
-                        val allLogText = buildString {
-                            QlhLogger.getLogFiles().forEach { fi ->
-                                appendLine("===== ${fi.name} (${formatBytes(fi.size)}) =====")
-                                val result = QlhLogger.readLogFileWithInfo(fi.name)
-                                if (result.content != null) {
-                                    if (result.truncated) {
-                                        appendLine("[⚠ 文件过大 (${formatBytes(result.fileSize)})，仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)}]")
-                                    }
-                                    appendLine(result.content)
-                                } else {
-                                    appendLine("(读取失败)")
-                                }
-                                appendLine()
-                            }
-                        }
+                        val allLogText = QlhLogger.readRedactedLogBundle()
                         val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                         clipboard.setPrimaryClip(ClipData.newPlainText("QLH Logs", allLogText))
                     },
@@ -1417,11 +1611,8 @@ private fun LogManagementGroup(isLite: Boolean) {
                 OutlinedButton(
                     onClick = {
                         val file = QlhLogger.getLogFiles().firstOrNull() ?: return@OutlinedButton
-                        val result = QlhLogger.readLogFileWithInfo(file.name)
-                        val content = result.content ?: return@OutlinedButton
-                        val prefix = if (result.truncated) {
-                            "[⚠ 文件截断: ${formatBytes(result.fileSize)} 仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)}]\n\n"
-                        } else ""
+                        val content = QlhLogger.readRedactedLogBundle(maxBytes = QlhLogger.READ_MAX_BYTES)
+                        val prefix = ""
                         val sendIntent = Intent().apply {
                             action = Intent.ACTION_SEND
                             putExtra(Intent.EXTRA_TEXT, prefix + content)
@@ -1494,7 +1685,7 @@ private fun LogManagementGroup(isLite: Boolean) {
                             appendLine("  [⚠ 日志文件过大 (${formatBytes(fi.size)})，仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)} 内容]")
                         }
                         appendLine("=".repeat(60))
-                        appendLine(content ?: "(读取失败)")
+                        appendLine(QlhLogger.redactDiagnosticText(content ?: "(读取失败)"))
                         appendLine()
                     }
                 }
@@ -1562,7 +1753,7 @@ private fun LogManagementGroup(isLite: Boolean) {
                     if (result.truncated) {
                         appendLine("[⚠ 文件过大，仅显示末尾 ${formatBytes(QlhLogger.READ_MAX_BYTES)}]")
                     }
-                    appendLine(result.content ?: "(读取失败)")
+                    appendLine(QlhLogger.redactDiagnosticText(result.content ?: "(读取失败)"))
                     appendLine()
                 }
             }

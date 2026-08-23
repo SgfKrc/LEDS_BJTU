@@ -40,6 +40,8 @@ set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "Do not build llama tools" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "Do not build llama examples" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "Do not build llama server" FORCE)
 set(LLAMA_BUILD_APP OFF CACHE BOOL "Do not build llama app" FORCE)
+set(LLAMA_BUILD_MTMD ON CACHE BOOL "Build the standalone multimodal bridge" FORCE)
+set(MTMD_VIDEO OFF CACHE BOOL "Disable video support in Android bridge" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "Disable host-native flags for Android cross compile" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "Avoid libomp packaging for the first Android build" FORCE)
 set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "Avoid build-time KleidiAI download" FORCE)
@@ -52,10 +54,12 @@ add_library(qlh_llama_jni SHARED qlh_llama_jni.cpp)
 target_include_directories(qlh_llama_jni PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/llama.cpp/include
     ${CMAKE_CURRENT_LIST_DIR}/llama.cpp/ggml/include
+    ${CMAKE_CURRENT_LIST_DIR}/llama.cpp/tools/mtmd
 )
 
 target_link_libraries(qlh_llama_jni
     llama
+    mtmd
     android
     log
 )

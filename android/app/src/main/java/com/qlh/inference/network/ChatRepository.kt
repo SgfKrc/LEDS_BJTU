@@ -11,6 +11,7 @@ import com.qlh.inference.data.SessionEntity
 import com.qlh.inference.service.InferenceService
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import java.util.Base64
 
 /**
  * 聊天数据仓库 — 统一管理本地 Room 数据库 + 远程 API + 本地推理。
@@ -90,21 +91,8 @@ class ChatRepository(
         skipUserSave: Boolean = false,
         imageDataUrls: List<String> = emptyList(),
     ): Result<String> {
-        // Android local llama.cpp has no mmproj route yet. Reject before Room writes so
-        // an unsupported image request cannot leave a misleading user message behind.
         val routeClient = apiClient()
         val localService = if (routeClient == null) inferenceService() else null
-        if (imageDataUrls.isNotEmpty() && routeClient == null) {
-            val capabilityReason = localService?.getMultimodalStatus()?.reason.orEmpty()
-            val message = if (capabilityReason.isBlank()) {
-                "本地模式暂不支持图像理解，请切换远程模式"
-            } else {
-                "本地模式暂不支持图像理解：$capabilityReason；请切换远程模式"
-            }
-            return Result.failure(
-                UnsupportedOperationException(message)
-            )
-        }
 
         // 1. 保存用户消息到本地（重试时跳过，避免重复）
         if (!skipUserSave) {
@@ -193,12 +181,27 @@ class ChatRepository(
 
             QlhLogger.i(TAG, "full mode generate start: prompt=${prompt.length} maxTokens=$maxTokens")
             // 执行本地推理（非流式 — 流式版本由 ChatScreen 通过 ViewModel 调用）
-            val genResult = service.generate(
-                prompt = prompt,
-                maxTokens = maxTokens,
-                temperature = temperature,
-                topP = topP
-            )
+            val genResult = if (imageDataUrls.isEmpty()) {
+                service.generate(
+                    prompt = prompt,
+                    maxTokens = maxTokens,
+                    temperature = temperature,
+                    topP = topP,
+                )
+            } else {
+                val decodedResult = decodeImageDataUrls(imageDataUrls)
+                if (decodedResult.isFailure) {
+                    Result.failure(decodedResult.exceptionOrNull()!!)
+                } else {
+                    service.generateMultimodal(
+                        prompt = prompt,
+                        imageBytes = decodedResult.getOrThrow(),
+                        maxTokens = maxTokens,
+                        temperature = temperature,
+                        topP = topP,
+                    )
+                }
+            }
 
             genResult.map { response ->
                 val assistantMsg = MessageEntity(
@@ -329,6 +332,17 @@ class ChatRepository(
             append("<|im_start|>assistant\n")
         }
     }
+
+    private fun decodeImageDataUrls(imageDataUrls: List<String>): Result<List<ByteArray>> =
+        runCatching {
+            imageDataUrls.map { dataUrl ->
+                val comma = dataUrl.indexOf(',')
+                if (!dataUrl.startsWith("data:image/", ignoreCase = true) || comma <= 0) {
+                    throw IllegalArgumentException("图像必须是 data URL")
+                }
+                Base64.getDecoder().decode(dataUrl.substring(comma + 1))
+            }
+        }
 
     // ==================== 服务端同步 ====================
 

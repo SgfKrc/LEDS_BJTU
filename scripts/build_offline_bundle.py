@@ -33,6 +33,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from pathlib import PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = Path(os.environ.get(
@@ -130,6 +131,7 @@ ASSETS: dict[str, dict] = {
 PRUNE_SD_ZIPS = False  # --prune-sd-zips 时置 True
 PRUNE_DRY_RUN = False  # --prune-dry-run：只打印将删文件不执行
 _PRUNE_WARNED = False
+_CAPACITY_HEADROOM_BYTES = 64 << 20
 
 
 def _set_prune_warned() -> None:
@@ -208,6 +210,9 @@ def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
             raise BundleError(f"缺失资产 {asset_id}: {lock}\n  获取: {spec['fetch']}")
         lock_data = json.loads(lock.read_text(encoding="utf-8"))
         declared = lock_data.get("artifacts") or {}
+        # lock 本身是原生 Gemma4 工件身份的一部分，必须随包分发，不能只用它
+        # 做打包时的本地校验。
+        add("models/gemma4-native/gemma4-native.lock.json", lock)
         for name, info in declared.items():
             filename = (info.get("filename") if isinstance(info, dict)
                         else None) or name
@@ -301,6 +306,180 @@ def _missing_assets(scope: tuple[str, ...]) -> list[str]:
     return missing
 
 
+def _existing_parent(path: Path) -> Path:
+    """返回可用于 disk_usage 的现有目录，不创建目录。"""
+    candidate = path.resolve()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _storage_key(path: Path) -> tuple[str, str | int]:
+    """标识 path 所在卷；Windows 优先使用盘符，POSIX 使用 st_dev。"""
+    existing = _existing_parent(path)
+    if os.name == "nt":
+        drive = existing.drive or existing.anchor
+        return "drive", drive.casefold()
+    return "dev", existing.stat().st_dev
+
+
+def _estimate_asset_bytes(asset_id: str) -> int:
+    """只读估算某资产进入整合包前的未压缩字节数。
+
+    不计算 SHA、不创建 staging。SD zip 使用 central directory 的未压缩大小；
+    这会忽略跨包去重，因此预检结果刻意偏保守。
+    """
+    spec = ASSETS[asset_id]
+    root = _resolve(asset_id)
+    kind = spec["kind"]
+    if kind == "file":
+        if not root.is_file():
+            raise BundleError(f"缺失资产 {asset_id}: {root}\n  获取: {spec['fetch']}")
+        return root.stat().st_size
+    if kind == "dir":
+        if not root.is_dir():
+            raise BundleError(f"缺失资产 {asset_id}: {root}\n  获取: {spec['fetch']}")
+        files = [path for path in root.rglob("*") if path.is_file()]
+        if not files:
+            raise BundleError(f"缺失资产 {asset_id}: {root} 为空\n  获取: {spec['fetch']}")
+        return sum(path.stat().st_size for path in files)
+    if kind == "lock":
+        lock = root / "gemma4-native.lock.json"
+        if not lock.is_file():
+            raise BundleError(f"缺失资产 {asset_id}: {lock}\n  获取: {spec['fetch']}")
+        try:
+            declared = json.loads(lock.read_text(encoding="utf-8")).get("artifacts") or {}
+        except json.JSONDecodeError as exc:
+            raise BundleError(f"资产 {asset_id} lock JSON 无效: {lock}") from exc
+        total = lock.stat().st_size
+        for name, info in declared.items():
+            filename = (info.get("filename") if isinstance(info, dict) else None) or name
+            artifact = root / filename
+            if not artifact.is_file():
+                raise BundleError(f"缺失资产 {asset_id} 文件 {filename}: {artifact}")
+            total += artifact.stat().st_size
+        return total
+    if kind == "sd15":
+        if not root.is_dir():
+            raise BundleError(f"缺失资产 {asset_id}: {root}\n  获取: {spec['fetch']}")
+        packages = sorted(root.glob("*.zip"))
+        if not packages:
+            raise BundleError(f"资产 {asset_id}: {root} 无离线包")
+        total = 0
+        for package in packages:
+            try:
+                with zipfile.ZipFile(package) as archive:
+                    total += sum(
+                        info.file_size for info in archive.infolist()
+                        if not info.is_dir() and info.filename.startswith("models/")
+                    )
+            except zipfile.BadZipFile as exc:
+                raise BundleError(f"资产 {asset_id} 离线包损坏: {package}") from exc
+        if total <= 0:
+            raise BundleError(f"资产 {asset_id}: {root} 无 models/ 内容")
+        return total
+    raise BundleError(f"未知资产 kind: {kind}")
+
+
+def _capacity_preflight(scope: tuple[str, ...], variant: str, fmt: str,
+                        *, verify: bool = False) -> dict:
+    """返回构建峰值的保守磁盘预算，不写入文件。
+
+    输出包始终以未压缩 payload 估算，因而对 ZIP_STORED 精确、对 7z 保守。
+    SD 解包 staging 先于压缩存在；去重收益只在真正收集后计算，预检不会把它
+    当作可用空间，避免空间恰好不足时留下半成品。
+    """
+    by_asset = {asset_id: _estimate_asset_bytes(asset_id) for asset_id in scope}
+    payload_bytes = sum(by_asset.values())
+    sd_staging_bytes = by_asset.get("sd15-assets", 0)
+    output_bytes = payload_bytes + _CAPACITY_HEADROOM_BYTES
+    build_peak_bytes = output_bytes + sd_staging_bytes
+    verify_extract_bytes = payload_bytes + _CAPACITY_HEADROOM_BYTES if verify else 0
+
+    out_parent = _existing_parent(OUT_DIR)
+    tmp_parent = _existing_parent(TMP_BASE)
+    out_key = _storage_key(out_parent)
+    tmp_key = _storage_key(tmp_parent)
+    demands: dict[tuple[str, str | int], dict] = {
+        out_key: {
+            "path": str(out_parent),
+            "required_bytes": build_peak_bytes,
+            "purpose": ["bundle_output", "sd15_staging"] if sd_staging_bytes else ["bundle_output"],
+        }
+    }
+    if verify:
+        if tmp_key == out_key:
+            # verify 发生在 bundle 留在输出目录时，因此同卷峰值要保留输出包。
+            demands[out_key]["required_bytes"] = max(
+                demands[out_key]["required_bytes"], output_bytes + verify_extract_bytes,
+            )
+            demands[out_key]["purpose"].append("verify_extract")
+        else:
+            demands[tmp_key] = {
+                "path": str(tmp_parent),
+                "required_bytes": verify_extract_bytes,
+                "purpose": ["verify_extract"],
+            }
+
+    volumes = []
+    for demand in demands.values():
+        free_bytes = shutil.disk_usage(demand["path"]).free
+        volumes.append({
+            **demand,
+            "free_bytes": free_bytes,
+            "admitted": free_bytes >= demand["required_bytes"],
+        })
+    return {
+        "schema_version": "qlh.offline_bundle.capacity.v1",
+        "variant": variant,
+        "format": fmt,
+        "verify": verify,
+        "asset_bytes": by_asset,
+        "payload_bytes": payload_bytes,
+        "sd15_staging_bytes": sd_staging_bytes,
+        "output_bytes": output_bytes,
+        "volumes": volumes,
+        "admitted": all(volume["admitted"] for volume in volumes),
+    }
+
+
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def _print_capacity_preflight(report: dict) -> None:
+    print(
+        f"容量预检 {report['variant']} ({report['format']})："
+        f"payload {_format_bytes(report['payload_bytes'])}，"
+        f"SD staging {_format_bytes(report['sd15_staging_bytes'])}"
+    )
+    for volume in report["volumes"]:
+        verdict = "通过" if volume["admitted"] else "不足"
+        purpose = "+".join(volume["purpose"])
+        print(
+            f"  [{verdict}] {volume['path']}：需 {_format_bytes(volume['required_bytes'])}，"
+            f"可用 {_format_bytes(volume['free_bytes'])} ({purpose})"
+        )
+
+
+def _require_capacity(scope: tuple[str, ...], variant: str, fmt: str,
+                      *, verify: bool = False) -> dict:
+    report = _capacity_preflight(scope, variant, fmt, verify=verify)
+    if report["admitted"]:
+        return report
+    failed = [
+        f"{volume['path']}（需 {_format_bytes(volume['required_bytes'])}，"
+        f"可用 {_format_bytes(volume['free_bytes'])}）"
+        for volume in report["volumes"] if not volume["admitted"]
+    ]
+    raise BundleError("磁盘容量预检失败，拒绝开始打包: " + "; ".join(failed))
+
+
 def _seven_zip() -> str | None:
     exe = shutil.which("7z") or shutil.which("7za")
     if exe:
@@ -317,11 +496,12 @@ def _bundle_root_name(bundle_path: Path) -> str:
 
 def _build_bundle(scope: tuple[str, ...], variant: str,
                   fmt: str = "7z", volume: str | None = None,
-                  threads: int = 4) -> Path:
+                  threads: int = 4, *, verify: bool = False) -> Path:
     manifest_files: list[dict] = []
     checksum_lines: list[str] = []
     collected_all: list[dict] = []
 
+    _require_capacity(scope, variant, fmt, verify=verify)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     ext = ".7z" if fmt == "7z" else ".zip"
     bundle_path = OUT_DIR / f"qlh-models-{variant}-{BUNDLE_VERSION}{ext}"
@@ -348,6 +528,9 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
         "format": fmt,
         "volume": volume or "",
         "asset_ids": list(scope),
+        "payload_bytes": sum(item["size"] for item in manifest_files),
+        "stored_bytes": sum(item["size"] for item in manifest_files
+                            if not item.get("dedup_of")),
         "files": manifest_files,
     }
     manifest_json = json.dumps(manifest, ensure_ascii=False, indent=1,
@@ -364,22 +547,30 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
         # staging 是中间产物：打包完（或失败）立即删，降低磁盘峰值
         if staging_sd is not None and staging_sd.exists():
             shutil.rmtree(staging_sd, ignore_errors=True)
+    _write_archive_checksums(bundle_path, volume=volume)
     return bundle_path
 
 
 def _build_bundle_zip(bundle_path, collected_all, manifest_json,
                       checksum_lines, variant) -> None:
-    with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_STORED) as zf:
-        for collected in collected_all:
-            for f in collected["files"]:
-                if f.get("dedup_of"):
-                    continue  # 去重条目由 restore 阶段恢复
-                zf.write(f["src"], f["path"])
-        zf.writestr("MANIFEST.json", manifest_json)
-        zf.writestr("CHECKSUMS.sha256",
-                    "\n".join(checksum_lines) + "\n")
-        zf.writestr("README-导入说明.md",
-                    _import_readme(variant, manifest_json))
+    partial = Path(str(bundle_path) + ".partial")
+    partial.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(partial, "w", zipfile.ZIP_STORED) as zf:
+            for collected in collected_all:
+                for f in collected["files"]:
+                    if f.get("dedup_of"):
+                        continue  # 去重条目由 restore 阶段恢复
+                    zf.write(f["src"], f["path"])
+            zf.writestr("MANIFEST.json", manifest_json)
+            zf.writestr("CHECKSUMS.sha256",
+                        "\n".join(checksum_lines) + "\n")
+            zf.writestr("README-导入说明.md",
+                        _import_readme(variant, manifest_json))
+        os.replace(partial, bundle_path)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def _build_bundle_7z(bundle_path, collected_all, manifest_json,
@@ -392,16 +583,20 @@ def _build_bundle_7z(bundle_path, collected_all, manifest_json,
     # 分段增量追加（免复制）：models/（cwd=REPO_ROOT）；sd15 staging
     # （cwd=staging）；清单（临时目录）
     parts: list[tuple[Path, list[str]]] = []
+    # SD 内容来自 OUT_DIR/.staging-*，不是 REPO_ROOT；把它混入这一段会让
+    # 7z 在项目根目录寻找尚不存在的 models/sd15-* 文件。
     models_files = [f for c in collected_all for f in c["files"]
-                    if f["path"].startswith("models/") and not f.get("dedup_of")]
+                    if f["path"].startswith("models/")
+                    and not f["path"].startswith("models/sd15-")
+                    and not f.get("dedup_of")]
     if models_files:
         parts.append((REPO_ROOT, [f["path"] for f in models_files]))
     sd15_files = [f for c in collected_all for f in c["files"]
                   if f["path"].startswith("models/sd15-") and not f.get("dedup_of")]
     if sd15_files:
         parts.append((OUT_DIR / f".staging-{variant}", [f["path"] for f in sd15_files]))
-    if bundle_path.exists():
-        bundle_path.unlink()
+    partial = Path(str(bundle_path) + ".partial")
+    partial.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
         staging = Path(td)
         (staging / "MANIFEST.json").write_text(manifest_json, encoding="utf-8")
@@ -414,14 +609,17 @@ def _build_bundle_7z(bundle_path, collected_all, manifest_json,
         for cwd, paths in parts:
             # 单卷三段追加（分卷后置物理切分——7z 不支持对分卷追加）
             cmd = [seven_zip, "a", "-t7z", "-mx=1", f"-mmt={threads}",
-                   "-y", str(bundle_path), *paths]
+                   "-y", str(partial), *paths]
             r = subprocess.run(cmd, cwd=str(cwd), capture_output=True,
                                text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise BundleError(
                     f"7z 打包失败: {r.stderr[-300:] or r.stdout[-300:]}")
     if volume:
-        _split_volumes(bundle_path, volume)
+        _split_volumes(partial, volume)
+        _publish_split_volumes(partial, bundle_path)
+    else:
+        os.replace(partial, bundle_path)
 
 
 def _parse_volume_size(volume: str) -> int:
@@ -439,7 +637,7 @@ def _split_volumes(bundle_path: Path, volume: str) -> None:
     单卷打包完成后按大小切块命名 name.7z.001/.002/...，删除单卷。
     """
     size = _parse_volume_size(volume)
-    for stale in OUT_DIR.glob(f"{bundle_path.name}.*"):
+    for stale in bundle_path.parent.glob(f"{bundle_path.name}.*"):
         stale.unlink()  # 清理上次中断残留的旧分卷
     data = bundle_path.read_bytes() if bundle_path.stat().st_size < (1 << 30) else None
     if data is not None:
@@ -460,29 +658,100 @@ def _split_volumes(bundle_path: Path, volume: str) -> None:
     bundle_path.unlink()
 
 
+def _publish_split_volumes(partial: Path, bundle_path: Path) -> None:
+    """在全部临时分卷成功后再替换对外分卷，避免构建失败污染旧产物。"""
+    partial_volumes = sorted(partial.parent.glob(f"{partial.name}.*"))
+    if not partial_volumes:
+        raise BundleError("7z 分卷构建未产生任何临时分卷")
+    prefix = partial.name + "."
+    for stale in bundle_path.parent.glob(f"{bundle_path.name}.*"):
+        # partial 分卷与正式分卷共享前缀，不能把刚构建好的临时卷删掉。
+        if stale.name.startswith(prefix):
+            continue
+        stale.unlink()
+    for volume in partial_volumes:
+        suffix = volume.name.removeprefix(prefix)
+        os.replace(volume, Path(str(bundle_path) + f".{suffix}"))
+
+
+def _archive_parts(bundle_path: Path, *, volume: str | None = None) -> list[Path]:
+    if volume:
+        parts = sorted(
+            (
+                path for path in bundle_path.parent.glob(f"{bundle_path.name}.*")
+                if re.fullmatch(r"\.\d{3}", path.name.removeprefix(bundle_path.name))
+            ),
+        )
+        if not parts:
+            raise BundleError(f"未找到整合包分卷: {bundle_path}.001")
+        return parts
+    if not bundle_path.is_file():
+        raise BundleError(f"未找到整合包: {bundle_path}")
+    return [bundle_path]
+
+
+def _write_archive_checksums(bundle_path: Path, *, volume: str | None = None) -> Path:
+    """写 archive 级 SHA-256 侧车；分卷逐卷列出，供下载端先验文件完整性。"""
+    parts = _archive_parts(bundle_path, volume=volume)
+    sidecar = Path(str(bundle_path) + ".sha256")
+    partial = Path(str(sidecar) + ".partial")
+    content = "".join(f"{_sha256_file(part)}  {part.name}\n" for part in parts)
+    partial.write_text(content, encoding="utf-8")
+    os.replace(partial, sidecar)
+    return sidecar
+
+
+def _verify_archive_checksums(bundle_path: Path) -> None:
+    """若存在 archive 侧车则先验证；兼容历史包没有侧车的情况。"""
+    sidecar = Path(str(bundle_path) + ".sha256")
+    if not sidecar.is_file():
+        return
+    declared = sidecar.read_text(encoding="utf-8").splitlines()
+    if not declared:
+        raise BundleError("verify 失败：archive SHA 侧车为空")
+    seen: set[str] = set()
+    for line in declared:
+        digest, separator, name = line.partition("  ")
+        if (not separator or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not name or Path(name).name != name or name in seen):
+            raise BundleError("verify 失败：archive SHA 侧车格式无效")
+        seen.add(name)
+        part = bundle_path.parent / name
+        if not part.is_file():
+            raise BundleError(f"verify 失败：archive 分卷缺失 {name}")
+        if _sha256_file(part) != digest:
+            raise BundleError(f"verify 失败：archive 分卷 {name} SHA 不匹配")
+    if bundle_path.is_file() and seen != {bundle_path.name}:
+        raise BundleError("verify 失败：archive SHA 侧车未绑定当前整合包")
+    if not bundle_path.is_file() and f"{bundle_path.name}.001" not in seen:
+        raise BundleError("verify 失败：archive SHA 侧车缺少首分卷")
+
+
 def _import_readme(variant: str, manifest_json: str) -> str:
     if variant == "android":
         return (
             "# 安卓版整合包导入说明\n\n"
             f"> 版本：{BUNDLE_VERSION} | 仅含 GGUF（SAF 目录直接可用）\n\n"
-            "1. 解压本包，得到 `gguf/` 目录（Qwen-1.8B Q4_K_M、Qwen3-4B Q4_K_M）\n"
-            "2. 在安卓 Full 模式设置中选择该目录（SAF 授权）→ 扫描 → 选模型\n"
-            "3. 校验：`sha256sum -c CHECKSUMS.sha256`\n\n"
+            "1. 解压前先校验同名 archive `.sha256` 侧车（分卷需保留全部卷）\n"
+            "2. 解压本包，得到 `models/` 目录（仅为 Android 注册表中的 GGUF）\n"
+            "3. 在安卓 Full 模式设置中选择 `models/`（SAF 授权）→ 扫描 → 选模型\n"
+            "4. 解压后校验：`sha256sum -c CHECKSUMS.sha256`\n\n"
             "说明：安卓本地只跑 GGUF（llama.cpp CPU）；判题/图像生成均走 PC 主节点远程推理。\n"
         )
     return (
         "# PC 版整合包导入说明\n\n"
         f"> 版本：{BUNDLE_VERSION} | 全量资产，解压到项目根即就位\n\n"
-        "1. 解压到 QLH 项目根目录（`models/`、`sd15-assets/` 就位）\n"
-        "2. 校验：`sha256sum -c CHECKSUMS.sha256`\n"
-        "3. SD 资产导入：serve/图像工作区自动发现，或 `import_asset` 逐包导入\n"
-        "4. 判题模型（Qwen3-4B）与 Gemma4 原生工件按 MANIFEST.json 校验后可用\n\n"
+        "1. 解压前先校验同名 archive `.sha256` 侧车（分卷需保留全部卷）\n"
+        "2. 解压到 QLH 项目根目录，`models/` 目录即就位\n"
+        "3. 解压后校验：`sha256sum -c CHECKSUMS.sha256`\n"
+        "4. 图像工作区会发现 `models/sd15-*`；判题模型与 Gemma4 工件按 MANIFEST.json 校验后可用\n\n"
         "清单（自动生成）：\n```json\n" + manifest_json + "\n```\n"
     )
 
 
 def _verify_bundle(bundle_path: Path) -> None:
     """解包到临时目录，恢复 dedup 链接后逐文件 SHA 比对（7z/分卷/zip）。"""
+    _verify_archive_checksums(bundle_path)
     with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
         tmp = Path(td)
         if bundle_path.suffix == ".7z":
@@ -503,28 +772,125 @@ def _verify_bundle(bundle_path: Path) -> None:
                 raise BundleError(f"7z 解包失败: {r.stderr[-300:]}")
             root_dir = tmp
         else:
-            with zipfile.ZipFile(bundle_path) as zf:
-                zf.extractall(tmp)
-                root_dir = tmp
+            _safe_extract_zip(bundle_path, tmp)
+            root_dir = tmp
         # 先恢复 dedup 链接（MANIFEST 里的 dedup_of 映射）
         manifest_path = root_dir / "MANIFEST.json"
-        if manifest_path.is_file():
+        if not manifest_path.is_file():
+            raise BundleError("verify 失败：解包缺少 MANIFEST.json")
+        try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            restored = _restore_dedup(root_dir, manifest)
-            if restored:
-                print(f"  verify 恢复 {restored} 个去重链接")
-        checksums = (root_dir / "CHECKSUMS.sha256").read_text(
-            encoding="utf-8").splitlines()
+        except json.JSONDecodeError as exc:
+            raise BundleError("verify 失败：MANIFEST.json 无效") from exc
+        entries = _validate_manifest(manifest)
+        restored = _restore_dedup(root_dir, manifest)
+        if restored:
+            print(f"  verify 恢复 {restored} 个去重链接")
+        _validate_checksums(root_dir, entries)
         checked = 0
-        for line in checksums:
-            sha, _, rel = line.partition("  ")
-            p = root_dir / rel
+        for rel, entry in entries.items():
+            p = _bundle_path(root_dir, rel)
             if not p.is_file():
                 raise BundleError(f"verify 失败：解包缺文件 {rel}")
-            if _sha256_file(p) != sha:
+            if p.stat().st_size != entry["size"]:
+                raise BundleError(f"verify 失败：{rel} 大小不匹配")
+            if _sha256_file(p) != entry["sha256"]:
                 raise BundleError(f"verify 失败：{rel} SHA 不匹配")
             checked += 1
         print(f"  verify OK：{checked} 文件一致")
+
+
+def _safe_bundle_relpath(value: str) -> str:
+    """校验 archive/manifest 内的 POSIX 相对路径，拒绝 Zip Slip 和歧义路径。"""
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise BundleError(f"整合包包含非法路径: {value!r}")
+    pure = PurePosixPath(value)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        raise BundleError(f"整合包包含越界路径: {value!r}")
+    if any(":" in part for part in pure.parts):
+        raise BundleError(f"整合包包含非法路径: {value!r}")
+    return pure.as_posix()
+
+
+def _bundle_path(root_dir: Path, relative: str) -> Path:
+    return root_dir.joinpath(*PurePosixPath(_safe_bundle_relpath(relative)).parts)
+
+
+def _safe_extract_zip(bundle_path: Path, target_dir: Path) -> None:
+    """受限解压 ZIP，避免未经验证的归档写出临时根目录。"""
+    try:
+        archive = zipfile.ZipFile(bundle_path)
+    except zipfile.BadZipFile as exc:
+        raise BundleError(f"verify 失败：ZIP 损坏: {bundle_path}") from exc
+    with archive:
+        seen: set[str] = set()
+        for info in archive.infolist():
+            raw_name = info.filename[:-1] if info.is_dir() else info.filename
+            relative = _safe_bundle_relpath(raw_name)
+            if relative in seen:
+                raise BundleError(f"verify 失败：ZIP 含重复路径 {relative}")
+            seen.add(relative)
+            destination = _bundle_path(target_dir, relative)
+            if info.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, open(destination, "wb") as output:
+                shutil.copyfileobj(source, output, length=1 << 20)
+
+
+def _validate_manifest(manifest: dict) -> dict[str, dict]:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "qlh.offline_bundle.v1":
+        raise BundleError("verify 失败：MANIFEST schema 不受支持")
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise BundleError("verify 失败：MANIFEST 缺少 files")
+    entries: dict[str, dict] = {}
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise BundleError("verify 失败：MANIFEST 文件条目无效")
+        relative = _safe_bundle_relpath(entry.get("path"))
+        digest = entry.get("sha256")
+        size = entry.get("size")
+        if relative in entries:
+            raise BundleError(f"verify 失败：MANIFEST 含重复路径 {relative}")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise BundleError(f"verify 失败：{relative} SHA 声明无效")
+        if not isinstance(size, int) or size < 0:
+            raise BundleError(f"verify 失败：{relative} 大小声明无效")
+        dedup_of = entry.get("dedup_of")
+        if dedup_of is not None:
+            dedup_of = _safe_bundle_relpath(dedup_of)
+            entry = {**entry, "dedup_of": dedup_of}
+        entries[relative] = entry
+    for relative, entry in entries.items():
+        dedup_of = entry.get("dedup_of")
+        if dedup_of and dedup_of not in entries:
+            raise BundleError(f"verify 失败：{relative} 引用不存在的 dedup_of")
+        if dedup_of == relative:
+            raise BundleError(f"verify 失败：{relative} 不能引用自身 dedup_of")
+    return entries
+
+
+def _validate_checksums(root_dir: Path, entries: dict[str, dict]) -> None:
+    checksums_path = root_dir / "CHECKSUMS.sha256"
+    if not checksums_path.is_file():
+        raise BundleError("verify 失败：解包缺少 CHECKSUMS.sha256")
+    expected = {
+        relative: entry["sha256"]
+        for relative, entry in entries.items() if not entry.get("dedup_of")
+    }
+    declared: dict[str, str] = {}
+    for line in checksums_path.read_text(encoding="utf-8").splitlines():
+        digest, separator, relative = line.partition("  ")
+        if not separator:
+            raise BundleError("verify 失败：CHECKSUMS.sha256 格式无效")
+        relative = _safe_bundle_relpath(relative)
+        if relative in declared or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise BundleError("verify 失败：CHECKSUMS.sha256 条目无效")
+        declared[relative] = digest
+    if declared != expected:
+        raise BundleError("verify 失败：CHECKSUMS 与 MANIFEST 不一致")
 
 
 def _restore_dedup(root_dir: Path, manifest: dict) -> int:
@@ -534,8 +900,10 @@ def _restore_dedup(root_dir: Path, manifest: dict) -> int:
         dedup_of = f.get("dedup_of")
         if not dedup_of:
             continue
-        target = root_dir / f["path"]
-        source = root_dir / dedup_of
+        target = _bundle_path(root_dir, f["path"])
+        source = _bundle_path(root_dir, dedup_of)
+        if not source.is_file():
+            raise BundleError(f"verify 失败：dedup 源不存在 {dedup_of}")
         if target.exists() or target.is_symlink():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -559,6 +927,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--android", action="store_true", help="构建安卓版")
     ap.add_argument("--all", action="store_true", help="构建双版")
     ap.add_argument("--verify", action="store_true", help="打包后自动解包校验")
+    ap.add_argument("--preflight", action="store_true",
+                    help="仅执行只读容量预检，不创建整合包")
     ap.add_argument("--missing", action="store_true",
                     help="只列出缺失资产与获取命令（不打包）")
     ap.add_argument("--format", choices=("7z", "zip"), default="7z",
@@ -611,17 +981,29 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.pc or args.android):
         ap.error("至少指定 --pc / --android / --all / --missing 之一")
 
+    if args.preflight:
+        reports = []
+        if args.pc:
+            reports.append(_capacity_preflight(
+                PC_ASSETS, "pc", args.format, verify=args.verify))
+        if args.android:
+            reports.append(_capacity_preflight(
+                ANDROID_ASSETS, "android", args.format, verify=args.verify))
+        for report in reports:
+            _print_capacity_preflight(report)
+        return 0 if all(report["admitted"] for report in reports) else 2
+
     if args.pc:
         print(f"构建 PC 版（全量，{args.format}）...")
         bundle = _build_bundle(PC_ASSETS, "pc", args.format, args.volume,
-                              args.threads)
+                              args.threads, verify=args.verify)
         _print_bundle_result(bundle, args.volume)
         if args.verify:
             _verify_bundle(bundle)
     if args.android:
         print(f"构建安卓版（纯 GGUF，{args.format}）...")
         bundle = _build_bundle(ANDROID_ASSETS, "android", args.format,
-                              args.volume, args.threads)
+                              args.volume, args.threads, verify=args.verify)
         _print_bundle_result(bundle, args.volume)
         if args.verify:
             _verify_bundle(bundle)

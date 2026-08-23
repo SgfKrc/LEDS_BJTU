@@ -11,6 +11,7 @@ import sqlite3
 import struct
 import subprocess
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +57,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_fts USING fts5(
   doc_id UNINDEXED,
   text
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks_cjk_fts USING fts5(
+  doc_id UNINDEXED,
+  cjk_terms
+);
 CREATE TABLE IF NOT EXISTS doc_embeddings (
   chunk_id INTEGER PRIMARY KEY,
   model TEXT NOT NULL,
@@ -67,6 +72,8 @@ CREATE TABLE IF NOT EXISTS doc_embeddings (
 """
 GIT_EVENT_MARKER = "@@DOCAGENT_EVENT@@"
 CHUNK_MAX_CHARS = 1800
+_CJK_RUN = re.compile(r"[\u3400-\u9fff]{2,}")
+_MAX_CJK_QUERY_TERMS = 24
 
 
 def _now() -> str:
@@ -114,6 +121,21 @@ def _fts_query(query: str) -> str | None:
     return " AND ".join(f'"{term.replace(chr(34), "")}"' for term in terms[:12] if term)
 
 
+def _cjk_terms(text: str) -> str:
+    terms: list[str] = []
+    for match in _CJK_RUN.finditer(unicodedata.normalize("NFKC", text)):
+        value = match.group(0)
+        terms.extend(value[index:index + 2] for index in range(len(value) - 1))
+    return " ".join(terms)
+
+
+def _cjk_query(query: str) -> str | None:
+    terms = _cjk_terms(query).split()
+    if not terms:
+        return None
+    return " OR ".join(list(dict.fromkeys(terms))[:_MAX_CJK_QUERY_TERMS])
+
+
 def _pack_vector(vector: list[float]) -> bytes:
     return struct.pack("<" + "f" * len(vector), *vector)
 
@@ -156,7 +178,22 @@ class DocEventStore:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._ensure_cjk_index()
         self.conn.commit()
+
+    def _ensure_cjk_index(self) -> None:
+        """Backfill the derived CJK index after a schema upgrade if needed."""
+        chunk_count = int(self.conn.execute("SELECT COUNT(*) FROM doc_chunks").fetchone()[0])
+        cjk_count = int(self.conn.execute("SELECT COUNT(*) FROM doc_chunks_cjk_fts").fetchone()[0])
+        if chunk_count == cjk_count:
+            return
+        self.conn.execute("DELETE FROM doc_chunks_cjk_fts")
+        rows = self.conn.execute("SELECT chunk_id, doc_id, text FROM doc_chunks ORDER BY chunk_id").fetchall()
+        for row in rows:
+            self.conn.execute(
+                "INSERT INTO doc_chunks_cjk_fts(rowid, doc_id, cjk_terms) VALUES (?, ?, ?)",
+                (row["chunk_id"], row["doc_id"], _cjk_terms(row["text"])),
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -337,6 +374,9 @@ class DocEventStore:
                         f"DELETE FROM doc_chunks_fts WHERE rowid IN ({placeholders})", old_ids
                     )
                     self.conn.execute(
+                        f"DELETE FROM doc_chunks_cjk_fts WHERE rowid IN ({placeholders})", old_ids
+                    )
+                    self.conn.execute(
                         f"DELETE FROM doc_embeddings WHERE chunk_id IN ({placeholders})", old_ids
                     )
                 self.conn.execute("DELETE FROM doc_chunks WHERE doc_id = ?", (doc_id,))
@@ -352,6 +392,10 @@ class DocEventStore:
                     self.conn.execute(
                         "INSERT INTO doc_chunks_fts (rowid, doc_id, text) VALUES (?, ?, ?)",
                         (int(cursor.lastrowid), doc_id, chunk_text),
+                    )
+                    self.conn.execute(
+                        "INSERT INTO doc_chunks_cjk_fts (rowid, doc_id, cjk_terms) VALUES (?, ?, ?)",
+                        (int(cursor.lastrowid), doc_id, _cjk_terms(chunk_text)),
                     )
                 indexed += 1
                 chunk_count += len(chunks)
@@ -376,7 +420,67 @@ class DocEventStore:
             """,
             (match, limit),
         ).fetchall()
+        if not rows:
+            cjk_match = _cjk_query(query)
+            if cjk_match:
+                rows = self.conn.execute(
+                    """
+                    SELECT chunks.doc_id, chunks.chunk_no,
+                           snippet(doc_chunks_cjk_fts, 1, '[', ']', '...', 18) AS snippet,
+                           bm25(doc_chunks_cjk_fts) AS score
+                    FROM doc_chunks_cjk_fts
+                    JOIN doc_chunks AS chunks ON chunks.chunk_id = doc_chunks_cjk_fts.rowid
+                    WHERE doc_chunks_cjk_fts MATCH ?
+                    ORDER BY score ASC, chunks.doc_id ASC, chunks.chunk_no ASC
+                    LIMIT ?
+                    """,
+                    (cjk_match, limit),
+                ).fetchall()
         return [dict(row) for row in rows]
+
+    def search_documents(self, query: str, limit: int = 5) -> list[dict]:
+        """Return one best FTS hit per document for document-level review."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        match = _fts_query(query)
+        if match is None:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT chunks.doc_id, chunks.chunk_no,
+                   snippet(doc_chunks_fts, 1, '[', ']', '...', 18) AS snippet,
+                   bm25(doc_chunks_fts) AS score
+            FROM doc_chunks_fts
+            JOIN doc_chunks AS chunks ON chunks.chunk_id = doc_chunks_fts.rowid
+            WHERE doc_chunks_fts MATCH ?
+            """,
+            (match,),
+        ).fetchall()
+        if not rows:
+            cjk_match = _cjk_query(query)
+            if cjk_match:
+                rows = self.conn.execute(
+                    """
+                    SELECT chunks.doc_id, chunks.chunk_no,
+                           snippet(doc_chunks_cjk_fts, 1, '[', ']', '...', 18) AS snippet,
+                           bm25(doc_chunks_cjk_fts) AS score
+                    FROM doc_chunks_cjk_fts
+                    JOIN doc_chunks AS chunks ON chunks.chunk_id = doc_chunks_cjk_fts.rowid
+                    WHERE doc_chunks_cjk_fts MATCH ?
+                    """,
+                    (cjk_match,),
+                ).fetchall()
+        best: dict[str, dict] = {}
+        for row in rows:
+            item = dict(row)
+            current = best.get(item["doc_id"])
+            if current is None or (item["score"], item["chunk_no"]) < (
+                current["score"], current["chunk_no"],
+            ):
+                best[item["doc_id"]] = item
+        return sorted(
+            best.values(), key=lambda item: (item["score"], item["doc_id"], item["chunk_no"])
+        )[:limit]
 
     def index_embeddings(self, audit: dict, provider, repo_root: Path,
                          batch_size: int = 32) -> dict:
@@ -467,6 +571,43 @@ class DocEventStore:
             })
         ranked.sort(key=lambda item: (-item["score"], item["doc_id"], item["chunk_no"]))
         return ranked[:limit]
+
+    def semantic_search_documents(self, query: str, provider, limit: int = 5) -> list[dict]:
+        """Return one highest-cosine chunk per document for review candidates."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        query_vectors = provider.embed([query])
+        if len(query_vectors) != 1 or not query_vectors[0]:
+            raise ValueError("embedding provider returned invalid query vector")
+        query_vector = query_vectors[0]
+        rows = self.conn.execute(
+            """
+            SELECT embeddings.chunk_id, chunks.doc_id, chunks.chunk_no, chunks.text,
+                   embeddings.dim, embeddings.vector
+            FROM doc_embeddings AS embeddings
+            JOIN doc_chunks AS chunks ON chunks.chunk_id = embeddings.chunk_id
+            WHERE embeddings.model = ?
+            """,
+            (provider.model,),
+        ).fetchall()
+        best: dict[str, dict] = {}
+        for row in rows:
+            vector = _unpack_vector(row["vector"], row["dim"])
+            if len(vector) != len(query_vector):
+                continue
+            item = {
+                "doc_id": row["doc_id"], "chunk_no": row["chunk_no"],
+                "score": _cosine(query_vector, vector),
+                "snippet": row["text"][:300],
+            }
+            current = best.get(item["doc_id"])
+            if current is None or (item["score"], -item["chunk_no"]) > (
+                current["score"], -current["chunk_no"],
+            ):
+                best[item["doc_id"]] = item
+        return sorted(
+            best.values(), key=lambda item: (-item["score"], item["doc_id"], item["chunk_no"])
+        )[:limit]
 
     def record_decisions(self, run_id: int, decisions: dict) -> None:
         with self.conn:

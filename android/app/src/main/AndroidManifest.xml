@@ -47,5 +47,20 @@
             android:name=".worker.TaskWorkerService"
             android:exported="false"
             android:foregroundServiceType="specialUse" />
+
+        <service
+            android:name=".service.AndroidPresenceService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.update-files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
     </application>
 </manifest>

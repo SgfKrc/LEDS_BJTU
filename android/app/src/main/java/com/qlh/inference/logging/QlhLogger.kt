@@ -243,6 +243,33 @@ object QlhLogger {
         }
     }
 
+    /** Return a bounded, credential-redacted bundle suitable for copy/share/upload. */
+    fun readRedactedLogBundle(maxBytes: Long = 1_000_000L): String {
+        val limit = maxBytes.coerceIn(4_096L, 2_000_000L)
+        val out = StringBuilder()
+        for (file in getLogFiles()) {
+            val result = readLogFileWithInfo(file.name)
+            val section = buildString {
+                appendLine("===== ${file.name} (${file.size} bytes) =====")
+                if (result.truncated) appendLine("[truncated: ${result.fileSize} bytes]")
+                appendLine(result.content ?: "(read failed)")
+                appendLine()
+            }
+            val redacted = redactDiagnosticText(section)
+            if (out.length + redacted.length > limit) {
+                val remaining = (limit - out.length).coerceAtLeast(0L).toInt()
+                if (remaining > 0) out.append(redacted.take(remaining))
+                break
+            }
+            out.append(redacted)
+        }
+        return out.toString()
+    }
+
+    /** Redact a log preview before it is rendered or shared outside the app. */
+    fun redactDiagnosticText(value: String): String =
+        com.qlh.inference.logging.redactDiagnosticText(value)
+
     /** 获取单个日志文件的 [LogFileInfo]（含 size 信息），不存在则返回 null。 */
     fun getLogFileInfo(name: String): LogFileInfo? {
         val file = File(logDir, name)

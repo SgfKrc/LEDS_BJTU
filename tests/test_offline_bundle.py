@@ -107,6 +107,7 @@ def test_pc_bundle_structure_and_manifest(fake_assets):
         assert "README-导入说明.md" in names
         assert any("qwen-1_8b-chat/model.safetensors" in n for n in names)
         assert any("gemma4-native/model.gguf" in n for n in names)
+        assert "models/gemma4-native/gemma4-native.lock.json" in names
         # SD 已解包重组到 models/sd15-*/（不再收 zip）；共享文件只存一份
         assert any("models/sd15-original-v1/unet/model.fp16.safetensors"
                    in n for n in names)
@@ -115,6 +116,10 @@ def test_pc_bundle_structure_and_manifest(fake_assets):
         manifest = json.loads(zf.read("MANIFEST.json"))
         assert manifest["variant"] == "pc"
         assert set(manifest["asset_ids"]) == set(b.PC_ASSETS)
+        assert manifest["payload_bytes"] >= manifest["stored_bytes"] > 0
+        readme = zf.read("README-导入说明.md").decode("utf-8")
+        assert "`models/` 目录即就位" in readme
+        assert "sd15-assets/` 就位" not in readme
         # 所有非去重条目都在包内
         for f in manifest["files"]:
             if f.get("dedup_of"):
@@ -132,6 +137,9 @@ def test_android_bundle_only_gguf(fake_assets):
         assert any("Qwen3-4B-Q4_K_M.gguf" in n for n in names)
         assert not any("safetensors" in n or "gemma" in n.lower()
                        or "sd15" in n for n in names)
+        readme = zf.read("README-导入说明.md").decode("utf-8")
+        assert "选择 `models/`" in readme
+        assert "`gguf/`" not in readme
 
 
 def test_verify_roundtrip(fake_assets):
@@ -139,11 +147,29 @@ def test_verify_roundtrip(fake_assets):
     b._verify_bundle(bundle)  # 不应抛异常
 
 
+def test_archive_checksum_sidecar_detects_tamper(fake_assets):
+    bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="zip")
+    sidecar = Path(str(bundle) + ".sha256")
+    assert sidecar.is_file()
+    assert bundle.name in sidecar.read_text(encoding="utf-8")
+    with open(bundle, "ab") as handle:
+        handle.write(b"tampered-archive")
+    with pytest.raises(b.BundleError, match="archive.*SHA 不匹配"):
+        b._verify_bundle(bundle)
+
+
 @pytest.mark.skipif(b._seven_zip() is None, reason="7-Zip 未安装")
 def test_7z_build_and_verify_roundtrip(fake_assets):
     bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="7z")
     assert bundle.suffix == ".7z"
     b._verify_bundle(bundle)  # 7z 解包逐文件比对，不应抛异常
+
+
+@pytest.mark.skipif(b._seven_zip() is None, reason="7-Zip 未安装")
+def test_7z_pc_bundle_reads_sd_from_staging(fake_assets):
+    """PC 版 SD 文件只能从 staging 追加，不能误按 REPO_ROOT 寻找。"""
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="7z")
+    b._verify_bundle(bundle)
 
 
 def test_sd15_dedup_stores_shared_file_once(fake_assets):
@@ -167,6 +193,65 @@ def test_verify_restores_dedup_links(fake_assets):
     b._verify_bundle(bundle)  # 内部会 restore dedup 后逐文件校验
 
 
+def test_verify_rejects_tampered_dedup_restore(fake_assets):
+    """CHECKSUMS 只列存储项时，MANIFEST 仍必须验证恢复出来的重复文件。"""
+    _, out = fake_assets
+    bundle = b._build_bundle(b.PC_ASSETS, "pc", fmt="zip")
+    with tempfile.TemporaryDirectory(dir=_TEST_TMP) as td:
+        tmp = Path(td)
+        with zipfile.ZipFile(bundle) as zf:
+            zf.extractall(tmp)
+        manifest_path = tmp / "MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        dedup_entry = next(item for item in manifest["files"] if item.get("dedup_of"))
+        alternate = next(
+            item["path"] for item in manifest["files"]
+            if item["path"].endswith("/unet/model.fp16.safetensors")
+        )
+        dedup_entry["dedup_of"] = alternate
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        tampered = out / "tampered-dedup.zip"
+        with zipfile.ZipFile(tampered, "w", zipfile.ZIP_STORED) as zf:
+            for path in sorted(tmp.rglob("*")):
+                if path.is_file():
+                    zf.write(path, path.relative_to(tmp).as_posix())
+        with pytest.raises(b.BundleError, match="SHA 不匹配|大小不匹配"):
+            b._verify_bundle(tampered)
+
+
+def test_verify_rejects_zip_slip_before_extract(fake_assets):
+    _, out = fake_assets
+    out.mkdir()
+    malicious = out / "malicious.zip"
+    with zipfile.ZipFile(malicious, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("../outside.txt", "not allowed")
+    with pytest.raises(b.BundleError, match="越界路径"):
+        b._verify_bundle(malicious)
+
+
+def test_capacity_preflight_is_read_only_and_conservative(fake_assets, monkeypatch):
+    _, out = fake_assets
+    monkeypatch.setattr(b, "TMP_BASE", out / "verify-tmp")
+    report = b._capacity_preflight(b.PC_ASSETS, "pc", "zip", verify=True)
+    assert report["admitted"] is True
+    assert report["payload_bytes"] > 0
+    assert report["output_bytes"] > report["payload_bytes"]
+    assert report["sd15_staging_bytes"] > 0
+    assert not out.exists(), "预检不得创建 staging 或输出文件"
+
+
+def test_capacity_preflight_rejects_before_writing(fake_assets, monkeypatch):
+    _, out = fake_assets
+    monkeypatch.setattr(b, "TMP_BASE", out / "verify-tmp")
+    monkeypatch.setattr(
+        b.shutil, "disk_usage",
+        lambda _path: type("Usage", (), {"free": 0})(),
+    )
+    with pytest.raises(b.BundleError, match="容量预检失败"):
+        b._build_bundle(b.ANDROID_ASSETS, "android", fmt="zip")
+    assert not out.exists(), "容量不足时不得留下输出目录或半成品"
+
+
 def test_volume_split_and_verify(fake_assets):
     # 小 bundle 用 512k 卷切分 -> verify 用 .001 入口
     bundle = b._build_bundle(b.ANDROID_ASSETS, "android", fmt="7z",
@@ -176,6 +261,7 @@ def test_volume_split_and_verify(fake_assets):
             f"qlh-models-android-{b.BUNDLE_VERSION}.7z.*"))
     assert vols and vols[0].name.endswith(".001")
     assert all(v.stat().st_size <= 512 * 1024 for v in vols)
+    assert Path(str(bundle) + ".sha256").is_file()
     b._verify_bundle(bundle)  # 自动找 .001 解包比对
 
 
@@ -201,7 +287,7 @@ def test_verify_detects_tamper(fake_assets):
                 if p == tampered:
                     continue  # 不把输出包自己压进去
                 zf.write(p, p.relative_to(tmp).as_posix())
-        with pytest.raises(b.BundleError, match="SHA 不匹配|缺文件"):
+        with pytest.raises(b.BundleError, match="SHA 不匹配|大小不匹配|缺文件"):
             b._verify_bundle(tampered)
 
 

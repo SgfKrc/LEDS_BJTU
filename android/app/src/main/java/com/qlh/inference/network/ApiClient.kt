@@ -1,6 +1,7 @@
 package com.qlh.inference.network
 
 import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.google.gson.annotations.SerializedName
 import com.qlh.inference.BuildConfig
 import com.qlh.inference.security.AuthSessionStore
@@ -125,7 +126,11 @@ data class RegisterNodeRequest(
     @SerializedName("app_variant")
     val appVariant: String = if (BuildConfig.IS_LITE) "lite" else "full",
     @SerializedName("app_version")
-    val appVersion: String = BuildConfig.VERSION_NAME
+    val appVersion: String = BuildConfig.VERSION_NAME,
+    @SerializedName("presence_generation")
+    val presenceGeneration: Long = 0L,
+    @SerializedName("presence_lease_id")
+    val presenceLeaseId: String = ""
 )
 
 data class RegisterNodeResponse(
@@ -133,8 +138,30 @@ data class RegisterNodeResponse(
     @SerializedName("node_id")
     val nodeId: String? = null,
     val message: String? = null,
-    val state: String? = null
+    val state: String? = null,
+    @SerializedName("server_time_ms")
+    val serverTimeMs: Long = 0L,
+    @SerializedName("presence_generation")
+    val presenceGeneration: Long = 0L,
+    @SerializedName("presence_lease_id")
+    val presenceLeaseId: String = "",
+    @SerializedName("lease_expires_at_ms")
+    val leaseExpiresAtMs: Long = 0L,
+    @SerializedName("heartbeat_interval_seconds")
+    val heartbeatIntervalSeconds: Int = 45
 )
+
+data class AndroidPresenceHeartbeatRequest(
+    @SerializedName("node_id") val nodeId: String,
+    @SerializedName("presence_generation") val presenceGeneration: Long,
+    @SerializedName("presence_lease_id") val presenceLeaseId: String,
+)
+
+class ApiClientHttpException(
+    val statusCode: Int,
+    val errorCode: String,
+    val responseBody: String,
+) : IOException("HTTP $statusCode${if (errorCode.isBlank()) "" else " [$errorCode]"}: $responseBody")
 
 data class BootstrapRequest(
     @SerializedName("node_id")
@@ -359,6 +386,7 @@ class ApiClient(
         "/api/auth/totp/verify",
         "/api/bootstrap/first-connect",
         "/api/cluster/android/register",
+        "/api/cluster/android/heartbeat",
     )
 
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -610,6 +638,77 @@ class ApiClient(
         }
     }
 
+    /** Probe the control plane without exposing response bodies or credentials to the UI. */
+    suspend fun probeConnectionHealth(localNetworkType: String = "unknown"): Result<ConnectionHealthReport> =
+        withContext(Dispatchers.IO) {
+            val checks = mutableListOf<ConnectionHealthCheck>()
+
+            suspend fun probe(id: String, label: String, path: String) {
+                val started = System.nanoTime()
+                try {
+                    val request = Request.Builder()
+                        .url("${baseUrl.trimEnd('/')}$path")
+                        .get()
+                        .build()
+                    executeAsync(request).use { response ->
+                        checks += ConnectionHealthCheck(
+                            id = id,
+                            label = label,
+                            state = if (response.isSuccessful) ConnectionHealthState.PASS else ConnectionHealthState.FAIL,
+                            latencyMillis = (System.nanoTime() - started) / 1_000_000L,
+                            detail = "HTTP ${response.code}",
+                        )
+                    }
+                } catch (error: Exception) {
+                    checks += ConnectionHealthCheck(
+                        id = id,
+                        label = label,
+                        state = ConnectionHealthState.FAIL,
+                        latencyMillis = (System.nanoTime() - started) / 1_000_000L,
+                        detail = error.message ?: error.javaClass.simpleName,
+                    )
+                }
+            }
+
+            probe("cluster_status", "主节点状态", "/api/cluster/status")
+            if (authStore?.read()?.accessToken.isNullOrBlank()) {
+                checks += ConnectionHealthCheck(
+                    id = "auth_session",
+                    label = "认证会话",
+                    state = ConnectionHealthState.SKIPPED,
+                    detail = "未登录",
+                )
+            } else {
+                probe("auth_session", "认证会话", "/api/auth/session")
+            }
+            Result.success(
+                ConnectionHealthReport(
+                    checks = checks,
+                    localNetworkType = localNetworkType,
+                )
+            )
+        }
+
+    /** Upload a bounded, already-redacted client diagnostic report. */
+    suspend fun reportClientError(report: ClientErrorReport): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            val body = gson.toJson(report).toRequestBody(jsonMediaType)
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/api/logs/client-error")
+                .post(body)
+                .header("Content-Type", "application/json")
+                .build()
+            executeAsync(request).use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(IOException("HTTP ${response.code}"))
+                }
+            }
+            Result.success(Unit)
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+    }
+
     /** Android 薄客户端通过 HTTP 向主节点登记自身存在（非 TCP worker 注册）。 */
     suspend fun registerAndroidNode(request: RegisterNodeRequest): Result<RegisterNodeResponse> = withContext(Dispatchers.IO) {
         try {
@@ -623,12 +722,42 @@ class ApiClient(
             val response = executeAsync(httpRequest)
             val responseBody = response.body?.string() ?: "{}"
             if (!response.isSuccessful) {
-                return@withContext Result.failure(IOException("HTTP ${response.code}: $responseBody"))
+                return@withContext Result.failure(httpException(response, responseBody))
             }
             Result.success(gson.fromJson(responseBody, RegisterNodeResponse::class.java))
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    /** Refresh an existing Android presence lease without sending device metadata again. */
+    suspend fun heartbeatAndroidNode(
+        request: AndroidPresenceHeartbeatRequest,
+    ): Result<RegisterNodeResponse> = withContext(Dispatchers.IO) {
+        try {
+            val body = gson.toJson(request).toRequestBody(jsonMediaType)
+            val httpRequest = Request.Builder()
+                .url("$baseUrl/api/cluster/android/heartbeat")
+                .post(body)
+                .header("Content-Type", "application/json")
+                .build()
+            val response = executeAsync(httpRequest)
+            val responseBody = response.body?.string() ?: "{}"
+            if (!response.isSuccessful) {
+                return@withContext Result.failure(httpException(response, responseBody))
+            }
+            Result.success(gson.fromJson(responseBody, RegisterNodeResponse::class.java))
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun httpException(response: Response, body: String): ApiClientHttpException {
+        val headerCode = response.header("X-QLH-Error-Code").orEmpty()
+        val bodyCode = runCatching {
+            JsonParser.parseString(body).asJsonObject.get("error_code")?.asString.orEmpty()
+        }.getOrDefault("")
+        return ApiClientHttpException(response.code, headerCode.ifBlank { bodyCode }, body)
     }
 
     /** 首次连接自动部署：从主节点获取 Android 节点配置。 */

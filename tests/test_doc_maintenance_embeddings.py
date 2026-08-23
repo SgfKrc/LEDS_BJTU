@@ -91,3 +91,33 @@ def test_ollama_provider_normalizes_v1_base_url_and_validates_timeout():
     assert provider.base_url.endswith("/v1")
     with pytest.raises(ValueError):
         OllamaEmbeddingProvider(timeout_seconds=61)
+
+
+def test_document_searches_deduplicate_multiple_chunks_per_document(tmp_path):
+    repo, audit = _repo(tmp_path)
+    (repo / "docs" / "x.md").write_text(
+        "# X\n\n" + ("task scheduler " * 400) + "\n\n" + ("task graph " * 400),
+        encoding="utf-8",
+    )
+    audit["docs"][0]["sha256"] = "c" * 64
+    provider = FakeEmbedding()
+    with DocEventStore(repo / "build" / "events.sqlite") as store:
+        store.index_chunks(audit, repo)
+        store.index_embeddings(audit, provider, repo)
+        fts_hits = store.search_documents("task", limit=2)
+        semantic_hits = store.semantic_search_documents("task", provider, limit=2)
+    assert len({item["doc_id"] for item in fts_hits}) == len(fts_hits)
+    assert len({item["doc_id"] for item in semantic_hits}) == len(semantic_hits)
+    assert {item["doc_id"] for item in semantic_hits} == {"docs/x.md", "docs/y.md"}
+
+
+def test_document_fts_falls_back_to_cjk_bigrams(tmp_path):
+    repo, audit = _repo(tmp_path)
+    (repo / "docs" / "x.md").write_text(
+        "# X\n\n主节点本地 SQLite RAG 不上传用户资料\n", encoding="utf-8",
+    )
+    audit["docs"][0]["sha256"] = "c" * 64
+    with DocEventStore(repo / "build" / "events.sqlite") as store:
+        store.index_chunks(audit, repo)
+        hits = store.search_documents("主节点本地 SQLite RAG 不上传用户资料", limit=2)
+    assert hits[0]["doc_id"] == "docs/x.md"

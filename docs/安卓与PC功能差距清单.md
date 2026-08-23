@@ -5,9 +5,9 @@
 > 更新日期：2026-08-22
 > 适用范围：Android Full/Lite 相对 PC 版（Windows/Linux 主节点）缺失功能的**全面排查清单**，供排期与任务分配使用；能力现状依据 [Android 版本远期计划](Android版本远期计划.md)（2026-07-28 基线 + C5 真机验收）、README 与源码
 
-> 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、远程 SD、主节点 GGUF Range/SHA 下载、bootstrap 和节点注册；但当前用 register 代替独立 heartbeat，Android Full Worker 尚未进入 PC scheduler 正式准入，任务图 Stage executor 尚未接通。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。
+> 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、远程 SD、主节点 GGUF Range/SHA 下载、bootstrap 和带 lease 的 presence；Android Full Worker 已进入 PC scheduler 准入门，并已用可注入 executor 接入任务图 Stage contract；Full 原生构建已接入 Gemma4 `mtmd` projector/图像路径（fake/journal/JVM/交叉编译开发回归通过）。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。
 >
-> 结论一句话：**安卓版当前 = 聊天客户端（远程转发）+ Full 本地单模型 GGUF 推理；PC 版的多模态、任务链、实验判题、模型管理、运维工具在安卓上全部缺失**
+> 结论一句话：**安卓版当前 = 聊天客户端（远程转发）+ Full 本地单模型 GGUF 推理，并已具备 Worker/Stage 与 Gemma4 mmproj 的本机开发门；PC 版的多模态真实质量、任务链真机运行、实验判题、模型管理、运维工具仍未形成 Android 产品闭环**
 
 ## 1. 差距总览（按类别）
 
@@ -15,7 +15,7 @@
 |---|---|---|---|
 | 多模态（图像理解） | Gemma 4 12B 图生文（原生 MTMD + Ollama 双轨） | ❌ 无图像输入/输出，聊天纯文本 | 🔴 大 |
 | 多模态（图像生成） | SD 1.5 全套（文生图/图生图/IP-Adapter/inpaint/指令编辑） | ❌ 本地无；**走远程推理**——安卓 UI 发起请求，全丢给 PC 主节点 SD 工作区生成后回传 | 🟡 中（远程通道） |
-| 分布式参与 | 层流水线 Worker、任务链/任务图、TP 孤岛、外部服务、推测解码 | ❌ 仅 presence 注册，`pipeline_worker=false` | 🔴 大（需协议） |
+| 分布式参与 | 层流水线 Worker、任务链/任务图、TP 孤岛、外部服务、推测解码 | ⚠️ Android Full Worker 准入与 Stage executor 开发门已完成；真实设备/认证/长时仍未验收 | 🔴 大（需设备验收与运行时质量门） |
 | 模型管理 | MODEL-TOOLS 全套（导入向导/GGUF 转换/受管下载/注册表/扫描） | 仅 SAF 本地目录选 GGUF | 🟠 中 |
 | 模型能力梯度 | Qwen 1.8B / Qwen3-4B / Gemma4 12B / SD 多模型并存 | Full 单次一个 GGUF（llama.cpp CPU） | 🟠 中 |
 | 实验与判题 | EX-N3 判题（LLM/Gemma/SD 自动门）、标定、质量总 gate | ❌ 无实验入口 | 🟠 中 |
@@ -32,8 +32,8 @@
 
 **A1 图像理解（图生文）**
 - PC：Gemma 4 12B 原生绑定（MTMD，`gemma4_native_image_smoke` 已验）+ Ollama 双轨；EX-N3 Gemma 判题依赖此能力。
-- 安卓：已具备相册选择、压缩与远程图片发送；`qlh_llama_jni.cpp` 仍是文本生成，并已提供 MTMD 能力闸门与 Gemma4 资源登记，但没有图像 token 处理（llama.cpp submodule 47e1de77 含 mmproj 支持但 JNI 尚未接入）。
-- 差距点：① JNI 图像编码（mmproj）实际接线；② Gemma4 原生 ~7.3GB GGUF+mmproj 在 Android RAM 上的加载与采样验收；③ 本地模式在 MTMD 接线完成前保持 fail-closed。
+- 安卓：已具备相册选择、压缩与远程图片发送；Full `qlh_llama_jni.cpp` 已接入 `mtmd` projector 生命周期、受限内存图片解码和 chunk forward，并由 Gemma4 资产/vision capability 闸门控制；Lite 仍保持 fail-closed。
+- 差距点：① Gemma4 原生 ~7.3GB GGUF+mmproj 在 Android RAM 上的加载与采样验收；② 真机图片语义、多图和长时温控验收；③ 发布包/设备资源门仍不得因交叉编译通过而自动放开。
 
 **A2 图像生成（SD 1.5）——走远程推理**
 - PC：完整图像工作区（五资产 15GB，全部自动质量门通过）。
@@ -44,8 +44,8 @@
 
 | 子项 | PC | 安卓 | 备注 |
 |---|---|---|---|
-| 完整推理 Worker（主节点派发任务） | ✅ 多 Worker 并行 | ❌ 无长连接协议/租约/幂等/结果回传 | 远期计划路线 A，具备基础（前台 Service/生成/取消）只缺协议 |
-| 任务链/任务图拆分 | ✅ G0-G5.2 全套（fencing/journal/优化器/故障注入验证） | ❌ 无 Stage 概念 | 路线 B |
+| 完整推理 Worker（主节点派发任务） | ✅ 多 Worker 并行 | ⚠️ v2 长连接/租约/幂等/结果回传和节点准入已有开发门；真实 Android offer→result 未验收 | 路线 A；AND-API-03 已把 executor 绑定本地 `InferenceService` |
+| 任务链/任务图拆分 | ✅ G0-G5.2 全套（fencing/journal/优化器/故障注入验证） | ⚠️ 已具备 `full_inference` Stage executor 与 fake/journal 回归；真实设备任务图仍后置 | 路线 B |
 | 层流水线 | ✅ PyTorch 层间（gemma4 P1 adapter） | ❌ `pipeline_worker=false` 明确排除 | 路线 C 仅预研，**不接入** |
 
 ### 🟠 C. 模型管理与能力梯度
@@ -96,6 +96,10 @@
 | **AND-B-01** | P1 | Worker A 最小协议：hello、lease、幂等键、结果/错误 envelope | PC 任务链契约 | **开发完成；传输/PC准入后置** |
 | **AND-B-02** | P1 | Android 前台 Service 承载 Worker 客户端、断线/取消状态机 | AND-B-01 | **开发完成；真实连接/设备验收后置** |
 | **AND-B-03** | P1 | ServerSocket/Mock Worker 契约测试与跨平台构建检查 | AND-B-02 | **开发完成；真实认证/准入/设备验收后置** |
+| **AND-API-02** | P0 | PC scheduler Android Full Worker 准入、精确模型身份、单并发和资源门 | AND-B-01/02/03 | **开发完成；真实认证、温控/电量和设备验收后置** |
+| **AND-API-03** | P1 | Android Full Worker 统一 Stage executor、模型门、有界输入和 journal provenance | AND-B-03 | **开发完成；真实 Android 推理、网络和长时验收后置** |
+| **AND-API-04** | P1 | Full `mtmd`/Gemma4 mmproj projector 生命周期、内存图片解码、MTMD chunk forward 与 bounded generation | AND-A1-03；无需真机开发 | **开发完成；真实设备 RAM、图片质量和长时验收后置；Lite 不提供本地多模态** |
+| **AND-API-05** | P2 | Android 更新检查/下载/安装权限、脱敏日志导出/上报和连接健康诊断 | AND-C-01、AND-E-01 | **开发完成；真实 APK/商店、更新源和真机网络验收后置** |
 | **AND-A2-01** | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | **开发完成；真实 PC SD/设备验收后置** |
 | **AND-A2-02** | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | **开发完成；真实 PC SD/设备验收后置** |
 | **AND-C-01** | P2 | 主节点模型清单、下载进度、SHA-256 校验与断点续传 | 主节点分发 API | **开发完成；真实大文件/断网/SAF 提供器验收后置** |
@@ -104,11 +108,19 @@
 
 本阶段不排本地 SD、生成本地判题和分布式真机性能标定；这些属于后续验收项，不作为 Android 开发阻塞条件。
 
-`AND-B-01` 只冻结并实现跨语言的 `qlh.task_worker` v2 envelope、Android Full Worker 能力声明、严格 UTF-8/canonical JSON、租约/摘要校验和 1024 条 `message_id` replay cache。Android 的 `worker_kind=android_full_worker` 已被 PC v2 schema 接受，但 PC scheduler 当前仍只准入已注册 PC Full Worker；TCP framing、认证连接、Android 前台 Service、任务执行和取消状态机分别属于 `AND-B-02/03`，因此本票不代表 Android Worker 已可接单。
+`AND-B-01` 只冻结并实现跨语言的 `qlh.task_worker` v2 envelope、Android Full Worker 能力声明、严格 UTF-8/canonical JSON、租约/摘要校验和 1024 条 `message_id` replay cache。Android 的 `worker_kind=android_full_worker` 已被 PC v2 schema 接受；后续 `AND-API-02` 已开放注册节点类型/worker kind 对齐的 scheduler 准入，`AND-API-03` 又接入了统一 Stage executor。真实认证、设备资源门、Android offer→result 和长时验收仍后置。
 
 `AND-B-02` 已新增独立 `TaskWorkerService` 前台生命周期壳、可注入的 length-prefixed transport、连接/hello/有界指数退避状态机，以及 offer/lease/result/error/cancel 的 attempt identity fencing。断线会将活动 attempt 标记为 `LOST`，迟到结果被丢弃；Android 主动取消使用 `stage_error`，只有协调器发起的 `stage_cancel` 才回 `stage_cancelled`。本票尚未开放 PC scheduler 准入、认证协议和真实设备验收，ServerSocket/Mock Worker 跨平台契约归 `AND-B-03`。
 
 `AND-B-03` 已用本地 `ServerSocket` 验证 Android transport 与 PC 现有 4 字节大端 length-prefix、`task_worker/json` outer envelope 和 v2 inner envelope 的双向 hello/ack/UTF-8 result；非法 outer frame 会 fail-closed。PC 侧直接复用 `tcp_comm.build_message/parse_message` 做同一 framing 检查。Full/Lite JVM 与 PC wire/protocol 专项通过，`compileFullDebugAndroidTestKotlin` 通过；这仍不代表真实认证、PC scheduler 准入或物理设备链路已验收。
+
+`AND-API-02`（2026-08-22）已完成本机准入门：scheduler 只接受注册节点类型与 `worker_kind` 一致的 PC/Android Full Worker；provider 对 Android 强制 `resource_gate.admitted=true`、单并发和 v2 健康连接，Stage 请求继续按完整模型身份精确匹配。Android `TaskWorkerService` 增加模型身份/资源门能力构建器，资源门默认关闭；fake worker Python 回归 `63 passed`，Android Worker 协议/能力 JVM 回归通过，真实认证、offer→result、温控/电量和设备验收后置。
+
+`AND-API-03`（2026-08-22）已完成本机开发门：Android `TaskWorkerClient` 支持可注入 `AndroidFullWorkerStageExecutor`，Service 将其绑定本地 `InferenceService`；executor 只接受 `full_inference`，严格匹配完整模型身份并限制 prompt/context/sampling 参数，失败/取消沿用 lease fencing。Python fake Android provider + `SQLiteTaskJournal` 验证 offer→accept→result、attempt 的 `provider_kind/provider_node_id` 和显式 `commit_result` 终态持久化；Full/Lite JVM 单测通过。真实 Android 模型执行、资源门、认证、网络和长时验收后置。
+
+`AND-API-04`（2026-08-22）已完成本机开发门：Full CMake 启用独立 `mtmd` 静态库，JNI 接入用户自持 Gemma4 mmproj 打开/释放、vision capability、单/多图内存解码、MTMD tokenize/chunk eval 和有界生成；`InferenceService` 在调用前校验 Gemma4 主模型、mmproj 文件身份/大小和 native capability，`ChatRepository` 的 Full 本地图片请求改走该路径，Lite 仍 thin/stub。Full/Lite JVM、Lite 原生构建和 Full arm64 交叉编译通过；真实 Android RAM、Gemma4 12B 图片语义、多图/长时/温控验收后置。
+
+`AND-API-05`（2026-08-22）已完成本机开发门：Settings 接入更新清单检查、下载进度、APK 完整性/签名校验、FileProvider 安装和未知来源权限回到应用后的刷新；日志查看/复制/分享统一使用有界脱敏 bundle；连接诊断接主节点/认证会话探针，手动上报只发送脱敏摘要。Full/Lite Kotlin 编译、更新/脱敏/API client 定向回归通过；真实 APK/商店安装、外部更新源、真机网络切换和长时日志后置。
 
 `AND-A2-01` 已新增 Android PC SD 客户端契约：生成/编辑请求 DTO、PNG/JPEG/WebP multipart 参考图/遮罩上传、job 快照解析、终态轮询和远程取消；轮询有界且遵守协程取消，job ID 使用 fail-closed 字符集校验。结果 blob 下载、缩略图和界面状态归 `AND-A2-02`，真实 PC SD 引擎、网络与设备验收后置。
 
@@ -125,6 +137,10 @@
 | 2026-08-17 | AND-A2-02 已完成：新增 Android 图像导航页、提示词/反向提示词/步数表单、参考图选择与预览、远程生成/变体提交、任务取消、结果 blob 32 MiB 有界下载和 1024px 缩略图展示；补齐状态机、ApiClient 下载和 Compose 契约测试，Full/Lite JVM 与 Full AndroidTest Kotlin 编译通过，真实 PC SD/网络/设备验收后置 |
 | 2026-08-17 | AND-A2-01 已完成：Android `ApiClient` 接入 PC `/api/diffusion/generate`、`/edit`、`/blobs`、`/jobs/{id}` 与取消端点，新增 snake_case DTO、16 MiB 上传限制、multipart 参考图/遮罩上传、有限终态轮询和协程取消传播；Full/Lite 全量 JVM 单测、远程 SD 契约测试与 Full AndroidTest Kotlin 编译通过，真实 PC SD/设备验收后置 |
 | 2026-08-17 | AND-B-03 已完成：新增 Android `ServerSocket` 双向 task-worker framing/hello-ack/UTF-8 result 契约测试、非法 outer frame 拒绝测试和 PC `tcp_comm` length-prefix 对照测试；Full/Lite JVM、PC 23 项协议/wire 专项与 Full AndroidTest Kotlin 编译通过，真实认证、scheduler 准入和设备验收后置 |
+| 2026-08-22 | AND-API-02 已完成本机开发：PC scheduler 开放注册 Android Full Worker，但要求节点类型/worker kind 对齐；provider 引入显式 resource gate、精确模型身份和单并发门；Android Service 增加模型身份/资源门能力构建器，fake worker `63 passed`，真实认证、温控/电量和设备验收后置 |
+| 2026-08-22 | AND-API-03 已完成本机开发：Android Full Worker 接入可注入 Stage executor 并绑定本地 `InferenceService`；Python fake provider + SQLite journal 验证 offer/result 与 attempt provenance，Full/Lite JVM 单测通过；真实 Android 执行、网络和长时验收后置 |
+| 2026-08-22 | AND-API-04 已完成本机开发：Full CMake/JNI 接入 `mtmd` projector 与受限内存图片路径，服务层保留 Gemma4 资产/vision capability 闸门；Full/Lite JVM、Lite 原生和 Full arm64 交叉编译通过；真实设备与图片质量验收后置 |
+| 2026-08-22 | AND-API-05 已完成本机开发：Settings 接入更新/下载/安装权限、FileProvider、脱敏日志 bundle、连接健康探针和可选客户端错误上报；Full/Lite Kotlin、更新/脱敏/API client 定向回归通过；真实 APK/商店与真机验收后置 |
 | 2026-08-17 | AND-B-02 已完成：新增 Android `TaskWorkerService` 前台 Worker 生命周期、socket length-prefixed transport、连接/hello/有界退避、断线丢弃迟到结果、lease 与取消状态机；增加 Full JVM 状态机回归，真实连接、认证、PC 准入和设备验收后置，ServerSocket 契约留待 AND-B-03 |
 | 2026-08-17 | AND-B-01 已完成：新增 Android `qlh.task_worker` v2 Kotlin codec，覆盖 hello/ack、stage offer/accept、lease renew、result/error、cancel envelope；固定 canonical JSON + SHA-256、严格字段/ID/租约校验、UTF-8 拒绝和有界 message-id replay cache；PC `task_worker_protocol.py` v2 接受 `android_full_worker` 角色但不改变当前 scheduler/transport 准入门，Full/Lite JVM 与 PC 协议专项通过 |
 | 2026-08-17 | AND-A1-03 已完成：登记 Gemma4 原生 GGUF/mmproj 固定文件名、大小与 SHA-256 常量，覆盖 SAF/internal 资源配对扫描（当前仅做文件身份/大小闸门，完整 SHA 校验仍由导入链路负责）；新增 JNI MTMD 能力查询并对当前 text-only APK fail-closed；运行时状态与 presence payload 已暴露资源/能力原因，真实 MTMD 接线与真机验收后置 |

@@ -1195,6 +1195,27 @@ class TestAndroidNodeManagement:
         assert sched.nodes["android-live"].state == NodeState.OFFLINE
         assert pushed[-1][1] == "update"
 
+    def test_android_presence_heartbeat_is_lease_fenced(self, sched):
+        registered = sched.register_android_client("android-lease", hostname="Tablet")
+        node = sched.nodes["android-lease"]
+        generation = registered["presence_generation"]
+        lease_id = registered["presence_lease_id"]
+
+        heartbeat = sched.heartbeat_android_client("android-lease", generation, lease_id)
+        assert heartbeat["status"] == "heartbeat"
+        assert heartbeat["presence_generation"] == generation
+
+        stale = sched.heartbeat_android_client("android-lease", generation + 1, lease_id)
+        assert stale["status"] == "rejected"
+        assert stale["error_code"] == "stale_generation"
+        missing = sched.heartbeat_android_client("android-unknown", generation, lease_id)
+        assert missing["error_code"] == "presence_not_registered"
+
+        node.presence_expires_at = time.time() - 1
+        expired = sched.heartbeat_android_client("android-lease", generation, lease_id)
+        assert expired["error_code"] == "lease_expired"
+        assert node.state == NodeState.OFFLINE
+
     def test_android_offline_does_not_block_nodes_ready(self, sched):
         """Android HTTP 客户端离线不影响 PC worker readiness。"""
         sched.nodes["android-offline"] = NodeInfo(

@@ -1,0 +1,39 @@
+{
+  "schema_version": "qlh.docagent.semantic_baseline.v1",
+  "baseline_id": "m2-semantic-v1",
+  "minimum_matches": 3,
+  "samples": [
+    {
+      "id": "qwen38-partial-plan",
+      "doc": "docs/QW3.8-27B分布式运行专项计划.md",
+      "sha256": "facacdb02273da529c321123a18705ce0b5367b977ae9316ae1affaf1da97a36",
+      "rules": ["R1"],
+      "expected_judgement": "needs_review",
+      "human_rationale": "S0 is complete but the overall plan remains planned; the single status line alone is intentionally ambiguous."
+    },
+    {
+      "id": "cybergothic-review-metadata",
+      "doc": "docs/frontend_cybergothic功能复核与页面重构清单.md",
+      "sha256": "7dc2688a738a95c7ba59b7f154074c2e48f901f1444f6e2917a814c24ab861a1",
+      "rules": ["R5"],
+      "expected_judgement": "needs_review",
+      "human_rationale": "The implementation review has no explicit status metadata and requires a maintainer decision rather than an automatic rewrite."
+    },
+    {
+      "id": "readme-scope-metadata",
+      "doc": "docs/README.en.md",
+      "sha256": "89687a823d88c5a1de1f5d60cbd8cabac4afb5cc114c87278056c99ee54594e8",
+      "rules": ["R5"],
+      "expected_judgement": "needs_review",
+      "human_rationale": "The English README declares scope but not document-status metadata; whether to add it is a documentation policy decision."
+    },
+    {
+      "id": "pytorch-lifecycle-current",
+      "doc": "docs/PyTorch层流水线加载峰值优化方案.md",
+      "sha256": "67390ff8ebda8187530f8ceb94e2a52532790d2c31ff7ba7e66d6aa3fd6c437c",
+      "rules": ["R3", "R5"],
+      "expected_judgement": "accurate",
+      "human_rationale": "The lifecycle line explicitly declares the document active; the mechanical status-line and source-date signals do not establish staleness."
+    }
+  ]
+}
