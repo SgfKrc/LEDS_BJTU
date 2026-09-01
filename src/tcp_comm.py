@@ -2081,13 +2081,27 @@ class TCPClient:
 
                     if not self._registered:
                         self.last_register_error = register_reason
-                        self._running = False
-                        try:
-                            if self.sock:
-                                self.sock.close()
-                        except OSError:
-                            pass
-                        self.sock = None
+                        # Fence worker threads before closing a failed
+                        # registration socket. Otherwise an old heartbeat can
+                        # write to the closed descriptor and surface WinError
+                        # 10038 during a reconnect race.
+                        with self._disconnect_callback_lock:
+                            self._connection_generation += 1
+                            self._running = False
+                            self._registered = False
+                            failed_sock = self.sock
+                            self.sock = None
+                        if failed_sock is not None:
+                            try:
+                                shutdown = getattr(failed_sock, "shutdown", None)
+                                if callable(shutdown):
+                                    shutdown(socket.SHUT_RDWR)
+                            except OSError:
+                                pass
+                            try:
+                                failed_sock.close()
+                            except OSError:
+                                pass
                         logger.warning(
                             "注册主节点失败: client=%s target=%s:%s reason=%s",
                             self.client_id, self.server_host, self.server_port,
@@ -2495,12 +2509,24 @@ class TCPClient:
 
     def disconnect(self) -> None:
         """断开连接"""
-        self._running = False
-        if self.sock:
+        # Advance the generation before closing so delayed receive/heartbeat
+        # workers cannot operate on this socket after an explicit disconnect.
+        with self._disconnect_callback_lock:
+            self._connection_generation += 1
+            self._running = False
+            self._registered = False
+            active_sock = self.sock
+            self.sock = None
+        if active_sock is not None:
             try:
-                self.sock.close()
+                shutdown = getattr(active_sock, "shutdown", None)
+                if callable(shutdown):
+                    shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            self.sock = None
+            try:
+                active_sock.close()
+            except OSError:
+                pass
         self._notify_disconnect()
         logger.info("已断开主节点连接")
