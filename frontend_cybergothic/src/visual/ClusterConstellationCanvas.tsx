@@ -4,8 +4,21 @@ import { drawEtchedFrame, drawRoseWindow } from './canvasOrnaments';
 
 const DPR_MAX = 2;
 
+export interface ClusterCanvasNode {
+  node_id: string;
+  role?: string;
+  state?: string;
+  is_available?: boolean;
+}
+
 /** Cluster page backdrop: a restrained, layered node constellation with slow parallax. */
-export function ClusterConstellationCanvas({ className = '' }: { className?: string }) {
+export function ClusterConstellationCanvas({
+  className = '',
+  nodes = [],
+}: {
+  className?: string;
+  nodes?: ClusterCanvasNode[];
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const reduced = useReducedMotion();
 
@@ -90,27 +103,50 @@ export function ClusterConstellationCanvas({ className = '' }: { className?: str
       ctx.stroke();
       ctx.restore();
 
-      const nodes = [
+      const fallbackNodes = [
         { x: centerX, y: centerY, r: 7, tone: gold },
         { x: centerX - orbitA * 0.72, y: centerY - orbitA * 0.18, r: 4, tone: gold },
         { x: centerX + orbitA * 0.58, y: centerY + orbitA * 0.22, r: 4, tone: gold },
         { x: centerX - orbitB * 0.46, y: centerY + orbitB * 0.28, r: 3, tone: brass },
         { x: centerX + orbitB * 0.64, y: centerY - orbitB * 0.08, r: 3, tone: brass },
       ];
+      const registeredNodes = nodes.slice(0, 24);
+      const masterIndex = registeredNodes.findIndex((node) => node.role === 'master');
+      const orderedNodes = masterIndex > 0
+        ? [registeredNodes[masterIndex], ...registeredNodes.slice(0, masterIndex), ...registeredNodes.slice(masterIndex + 1)]
+        : registeredNodes;
+      const topologyNodes = orderedNodes.length
+        ? orderedNodes.map((node, index) => {
+          if (index === 0) return {
+            x: centerX,
+            y: centerY,
+            r: 7,
+            tone: node.is_available ? gold : brass,
+          };
+          const angle = -Math.PI / 2 + ((index - 1) / Math.max(1, orderedNodes.length - 1)) * Math.PI * 2;
+          const radius = index % 2 === 0 ? orbitA : orbitB;
+          return {
+            x: centerX + Math.cos(angle) * radius,
+            y: centerY + Math.sin(angle) * radius * 0.62,
+            r: 4,
+            tone: node.is_available ? gold : brass,
+          };
+        })
+        : fallbackNodes;
 
       ctx.save();
       ctx.strokeStyle = brass;
       ctx.globalAlpha = 0.17;
       ctx.setLineDash([3, 8]);
-      nodes.slice(1).forEach((node) => {
+      topologyNodes.slice(1).forEach((node) => {
         ctx.beginPath();
-        ctx.moveTo(nodes[0].x, nodes[0].y);
+        ctx.moveTo(topologyNodes[0].x, topologyNodes[0].y);
         ctx.lineTo(node.x, node.y);
         ctx.stroke();
       });
       ctx.restore();
 
-      nodes.forEach((node, index) => {
+      topologyNodes.forEach((node, index) => {
         ctx.save();
         ctx.globalAlpha = index === 0 ? 0.65 : 0.42;
         ctx.fillStyle = node.tone;
@@ -189,7 +225,7 @@ export function ClusterConstellationCanvas({ className = '' }: { className?: str
       window.removeEventListener('pointermove', onPointerMove);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [reduced]);
+  }, [nodes, reduced]);
 
-  return <canvas ref={canvasRef} className={`cluster-constellation ${className}`.trim()} aria-hidden="true" role="presentation" />;
+  return <canvas ref={canvasRef} className={`cluster-constellation ${className}`.trim()} data-node-count={nodes.length} aria-hidden="true" role="presentation" />;
 }

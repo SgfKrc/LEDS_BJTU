@@ -371,7 +371,7 @@ export function ClusterAdminPage() {
 
   return (
     <div className="cluster-page" data-testid="cluster-admin-page">
-      <ClusterConstellationCanvas className="cluster-page__bg" />
+      <ClusterConstellationCanvas className="cluster-page__bg" nodes={nodeList} />
       <div className="cluster-page__content">
         <PageHeader
           tag="CLUSTER CONTROL"
