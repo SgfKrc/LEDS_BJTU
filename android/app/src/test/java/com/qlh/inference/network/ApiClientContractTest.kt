@@ -505,6 +505,7 @@ class ApiClientContractTest {
         assertEquals(1024, json.get("max_new_tokens").asInt)
         assertEquals(0.7f, json.get("temperature").asFloat, 1e-6f)
         assertEquals(false, json.get("show_thinking").asBoolean)
+        assertEquals("distributed_preferred", json.get("routing_preference").asString)
         assertTrue("默认请求不应带 allow_external", !json.has("allow_external"))
     }
 
@@ -543,7 +544,7 @@ class ApiClientContractTest {
         route("/api/chat") { _, reply -> reply(500, """{"error":"boom"}""") }
         val result = runBlocking { client.chat(ChatRequest(message = "x")) }
         assertTrue(result.isFailure)
-        assertTrue(result.exceptionOrNull() is IOException)
+        assertTrue(result.exceptionOrNull() is ApiClientHttpException)
         assertTrue(result.exceptionOrNull()!!.message!!.contains("500"))
     }
 
