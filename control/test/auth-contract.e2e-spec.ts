@@ -120,6 +120,22 @@ describe('MF-AUTH-N1 local Auth App and user management contract', () => {
     expect(databaseBytes).not.toContain(result.provisioning.otpauth_uri);
   });
 
+  it('reports an available local control plane and owner bootstrap state', async () => {
+    const capability = await app.inject({
+      method: 'GET',
+      url: '/auth/capability',
+    });
+    expect(capability.statusCode).toBe(200);
+    expect(capability.json()).toMatchObject({
+      required: true,
+      enforced: true,
+      available: true,
+      mode: 'local_totp',
+      service: 'control-svc',
+      bootstrap_available: true,
+    });
+  });
+
   it('creates a member, provisions its Auth App separately, and rotates recovery codes', async () => {
     const result = await bootstrapAndLogin();
     const created = await app.inject({

@@ -58,13 +58,25 @@ describe('MF-AUTH-N1 gateway auth proxy', () => {
 
   it('advertises auth and keeps auth on control-svc without the migration flag', async () => {
     delete process.env.QLH_CONTROL_URL;
-    expect(controller.authCapability()).toEqual({
+    request.mockResolvedValueOnce({
       required: true,
       enforced: true,
+      available: true,
       mode: 'local_totp',
       policy_version: 'n1a-v1',
       service: 'control-svc',
+      bootstrap_available: true,
     });
+    await expect(controller.authCapability()).resolves.toEqual(expect.objectContaining({
+      required: true,
+      enforced: true,
+      available: true,
+      mode: 'local_totp',
+      policy_version: 'n1a-v1',
+      service: 'control-svc',
+      bootstrap_available: true,
+    }));
+    expect(request).toHaveBeenCalledWith('GET', '/auth/capability');
     await controller.authSub({
       method: 'POST',
       url: '/api/auth/login',

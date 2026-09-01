@@ -52,6 +52,19 @@ test('account page reports missing auth service instead of rendering a fake sess
   await expect(page.locator('.account-profile')).toHaveCount(0);
 });
 
+test('account page distinguishes unavailable auth control plane from disabled auth policy', async ({ page }) => {
+  await page.route('**/api/auth/capability', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ required: true, enforced: true, available: false, reason_code: 'auth_control_plane_unavailable' }),
+    });
+  });
+  await page.goto('/#/account');
+  await expect(page.getByRole('heading', { level: 2, name: 'Authentication control plane unavailable' })).toBeVisible();
+  await expect(page.locator('.account-disabled')).toContainText('Start the configured control-svc or gateway');
+  await expect(page.locator('.account-disabled')).not.toContainText('Account controls will appear when the Auth service is enabled');
+});
+
 test('first owner receives local Auth App QR and recovery codes before sign in', async ({ page }) => {
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;

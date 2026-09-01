@@ -87,6 +87,7 @@ const fixtureRecoveryCodes = ['A1C2-E3F4', 'B5D6-G7H8', 'J9K1-L2M3', 'N4P5-Q6R7'
 export function AccountPage() {
   const capability = useAuthCapability();
   const authRequired = capability.data?.required === true;
+  const authUnavailable = capability.data?.available === false;
   const [bootstrapFinished, setBootstrapFinished] = useState(false);
   const [showBootstrap, setShowBootstrap] = useState(false);
   const bootstrapRequired = (capability.data?.bootstrap_available === true || showBootstrap) && !bootstrapFinished;
@@ -407,7 +408,9 @@ export function AccountPage() {
       <div className="account-page__content">
         <PageHeader tag="IRON GATE" title="Account & Security" description="Keep identity, sessions, local users, and tailnet bindings visible at one control surface." actions={<CommandButton variant="ghost" size="sm" icon={RefreshCw} busy={capability.refreshing || session.refreshing} onClick={refresh}>Refresh</CommandButton>} />
 
-        {capability.state === 'loading' ? <EmptyState kind="loading" title="Checking authentication capability" /> : capability.state === 'error' ? <EmptyState kind="error" title="Authentication capability unavailable" detail={authError} errorKind={capability.errorKind} errorStatus={capability.errorStatus} action={<CommandButton variant="ghost" size="sm" onClick={capability.refresh}>Retry</CommandButton>} /> : !authRequired ? (
+        {capability.state === 'loading' ? <EmptyState kind="loading" title="Checking authentication capability" /> : capability.state === 'error' ? <EmptyState kind="error" title="Authentication capability unavailable" detail={authError} errorKind={capability.errorKind} errorStatus={capability.errorStatus} action={<CommandButton variant="ghost" size="sm" onClick={capability.refresh}>Retry</CommandButton>} /> : authUnavailable ? (
+          <section className="account-panel account-disabled account-disabled--unavailable"><ShieldCheck size={24} /><div><h2>Authentication control plane unavailable</h2><p>The local API is running without the Auth control service. Start the configured control-svc or gateway to manage accounts.</p></div></section>
+        ) : !authRequired ? (
           <section className="account-panel account-disabled"><ShieldCheck size={24} /><div><h2>Authentication is disabled</h2><p>This node is running in local mode. Account controls will appear when the Auth service is enabled.</p></div></section>
         ) : !authenticated && bootstrapRequired ? (
           visibleRecoveryCodes.length ? (
