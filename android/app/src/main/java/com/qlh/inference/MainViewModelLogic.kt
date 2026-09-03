@@ -1,5 +1,6 @@
 package com.qlh.inference
 
+import com.qlh.inference.network.ApiClientHttpException
 import com.qlh.inference.status.AndroidRuntimeStatus
 import com.qlh.inference.status.GpuStatus
 import com.qlh.inference.status.MemoryStatus
@@ -133,6 +134,11 @@ fun clearMessageError(state: MainUiState): MainUiState =
     state.copy(error = null)
 
 fun formatMessageSendError(error: Throwable): String = when (error) {
+    is ApiClientHttpException -> when (error.statusCode) {
+        401, 403 -> "远程推理需要先在账户页完成 Auth App 登录"
+        503 -> "主节点暂时拒绝远程推理，请检查分布式节点连接与模型准入"
+        else -> "发送失败（HTTP ${error.statusCode}）"
+    }
     is java.net.ConnectException -> "无法连接主节点，请检查地址和网络"
     is java.net.SocketTimeoutException -> "连接超时，请检查主节点是否运行"
     is UnsupportedOperationException -> error.message ?: "当前模式暂不支持"

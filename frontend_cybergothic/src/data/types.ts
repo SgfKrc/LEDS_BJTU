@@ -157,6 +157,10 @@ export interface ClusterMutationResponse {
 
 export interface AuthCapabilityResponse {
   required: boolean;
+  available?: boolean;
+  enforced?: boolean;
+  service?: string;
+  reason_code?: string;
   mode?: string;
   bootstrap_available?: boolean;
   [key: string]: unknown;

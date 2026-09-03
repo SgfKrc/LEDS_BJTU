@@ -566,6 +566,8 @@ class MainViewModelLogicTest {
 
     @Test
     fun `send error formatting keeps actionable network and fallback messages`() {
+        assertEquals("远程推理需要先在账户页完成 Auth App 登录", formatMessageSendError(com.qlh.inference.network.ApiClientHttpException(401, "", "{}")))
+        assertEquals("主节点暂时拒绝远程推理，请检查分布式节点连接与模型准入", formatMessageSendError(com.qlh.inference.network.ApiClientHttpException(503, "", "{}")))
         assertEquals(
             "无法连接主节点，请检查地址和网络",
             formatMessageSendError(java.net.ConnectException()),

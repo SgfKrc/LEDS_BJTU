@@ -295,6 +295,7 @@ class ChatRepository(
                 clientNodeId = clientNodeId,
                 clientNodeType = "android",
                 clientMode = "thin",
+                routingPreference = "distributed_preferred",
                 clientAppVariant = if (BuildConfig.IS_LITE) "lite" else "full",
                 allowExternal = imageDataUrls.takeIf { it.isNotEmpty() }?.let { true },
                 preferExternal = imageDataUrls.takeIf { it.isNotEmpty() }?.let { true },

@@ -222,6 +222,12 @@ export class AuthService {
     private readonly credentials: ModelCredentialStore,
   ) {}
 
+  bootstrapAvailable(): boolean {
+    return !this.assets.listUsers().some(
+      (entry) => entry.role === 'owner' && entry.status !== 'revoked',
+    );
+  }
+
   async bootstrapOwner(input: { username: string; display_name?: string }): Promise<ProvisioningPayload> {
     const owner = this.assets.listUsers().find((entry) => entry.role === 'owner' && entry.status !== 'revoked');
     if (owner) throw new AuthServiceError(409, '本地主节点 owner 已存在');

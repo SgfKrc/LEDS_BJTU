@@ -18,7 +18,6 @@ import type { FastifyRequest } from 'fastify';
 import { ControlClient } from '../../clients/control.client';
 import { ForwardClient } from '../../clients/forward-client';
 import { LegacyControlClient } from '../../clients/legacy.client';
-import { authPolicyEnabled } from '../auth/auth-policy.guard';
 
 @Controller()
 export class ControlController {
@@ -75,14 +74,10 @@ export class ControlController {
   @All('bootstrap/*') bootstrapSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
 
   @Get('auth/capability')
-  authCapability(): Record<string, unknown> {
-    return {
-      required: true,
-      enforced: authPolicyEnabled(),
-      mode: 'local_totp',
-      policy_version: 'n1a-v1',
-      service: 'control-svc',
-    };
+  async authCapability(): Promise<unknown> {
+    // Capability must come from the user-owned control service so gateway
+    // clients see both bootstrap availability and a real unavailable state.
+    return this.control.request('GET', '/auth/capability');
   }
 
   // Authentication is a control-svc-only domain. It must not silently fall

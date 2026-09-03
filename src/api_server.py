@@ -393,9 +393,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173",
-                   "http://localhost:8000", "http://127.0.0.1:8000",
-                   "http://[::1]:5173", "http://[::1]:3000", "http://[::1]:8000"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000",
+                   "http://127.0.0.1:5173", "http://127.0.0.1:5174",
+                   "http://127.0.0.1:8000", "http://localhost:8000",
+                   "http://[::1]:5173", "http://[::1]:5174", "http://[::1]:3000",
+                   "http://[::1]:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -8429,16 +8431,94 @@ async def auth_capability():
     disabled capability is safer than a 404 (or pretending that auth exists).
     The gateway/control service exposes the enforced ``local_totp`` variant.
     """
+    # The monolith remains the default runtime, but the user-owned auth
+    # database lives in control-svc. Probe the local control plane when it is
+    # available so the UI does not confuse "three nodes online" with auth
+    # state, nor report auth disabled while the control service is active.
+    control_url = os.environ.get("QLH_CONTROL_URL", "http://127.0.0.1:8030").strip().rstrip("/")
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(0.35, connect=0.2)) as client:
+            response = await client.get(f"{control_url}/auth/capability")
+        if response.is_success:
+            payload = response.json()
+            if isinstance(payload, dict):
+                return {
+                    **payload,
+                    "required": True,
+                    "available": True,
+                    "mode": payload.get("mode") or "local_totp",
+                    "policy_version": payload.get("policy_version") or "n1a-v1",
+                    "service": payload.get("service") or "control-svc",
+                }
+    except Exception:
+        # Direct API operation must stay usable when control-svc is not
+        # installed; the explicit fail-closed response below preserves that
+        # contract for existing local deployments.
+        pass
+
+    auth_required = os.environ.get("QLH_AUTH_REQUIRED", "").strip().lower() in {
+        "1", "true", "on", "yes"
+    }
     return {
-        "required": False,
+        "required": auth_required,
         "enforced": False,
         "available": False,
-        "mode": "local_primary_node",
+        "mode": "local_totp" if auth_required else "local_primary_node",
         "policy_version": "n1a-v1",
-        "service": "api_server",
+        "service": "control-svc" if auth_required else "api_server",
         "bootstrap_available": False,
         "reason_code": "auth_control_plane_unavailable",
     }
+
+
+async def _proxy_control_request(request: Request, target_path: str) -> Response:
+    """Forward control-plane auth requests from the monolith when configured."""
+    control_url = os.environ.get("QLH_CONTROL_URL", "http://127.0.0.1:8030").strip().rstrip("/")
+    target = f"{control_url}/{target_path.lstrip('/')}"
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() in {"authorization", "content-type", "x-qlh-confirm-token"}
+    }
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=2.0)) as client:
+            upstream = await client.request(
+                request.method,
+                target,
+                params=list(request.query_params.multi_items()),
+                content=await request.body(),
+                headers=headers,
+            )
+    except Exception as exc:
+        raise HTTPException(503, "Auth control service unavailable") from exc
+    response_headers = {}
+    content_type = upstream.headers.get("content-type")
+    if content_type:
+        response_headers["content-type"] = content_type
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
+@app.api_route("/api/auth/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
+async def proxy_auth_request(path: str, request: Request):
+    return await _proxy_control_request(request, f"/auth/{path}")
+
+
+@app.api_route("/api/users/{path:path}", methods=["GET", "POST", "PATCH", "DELETE"])
+async def proxy_users_request(path: str, request: Request):
+    return await _proxy_control_request(request, f"/users/{path}")
+
+
+@app.api_route("/api/users", methods=["GET", "POST"])
+async def proxy_users_root(request: Request):
+    return await _proxy_control_request(request, "/users")
 
 
 @app.post("/api/cluster/connect")

@@ -55,6 +55,8 @@ data class ChatRequest(
     val clientNodeType: String? = null,
     @SerializedName("client_mode")
     val clientMode: String? = null,
+    @SerializedName("routing_preference")
+    val routingPreference: String = "distributed_preferred",
     @SerializedName("client_app_variant")
     val clientAppVariant: String? = null,
     /** Only populated for an image request; PC requires explicit multimodal routing consent. */
@@ -891,7 +893,7 @@ class ApiClient(
             val responseBody = response.body?.string() ?: "{}"
             if (!response.isSuccessful) {
                 return@withContext Result.failure(
-                    IOException("HTTP ${response.code}: $responseBody")
+                    httpException(response, responseBody)
                 )
             }
             val chatResponse = gson.fromJson(responseBody, ChatResponse::class.java)

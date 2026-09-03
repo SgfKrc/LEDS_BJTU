@@ -8,6 +8,18 @@ test('cluster admin exposes master controls and fixture topology', async ({ page
   await expect(page.locator('.cluster-status-card')).toHaveCount(4);
   await expect(page.locator('.cluster-table tbody tr')).toHaveCount(3);
   await expect(page.locator('canvas.cluster-constellation')).toHaveAttribute('aria-hidden', 'true');
+  await expect(page.locator('canvas.cluster-constellation')).toHaveAttribute('data-node-count', '3');
+  const paintedPixels = await page.locator('canvas.cluster-constellation').evaluate((canvas) => {
+    const context = canvas.getContext('2d');
+    if (!context || canvas.width === 0 || canvas.height === 0) return 0;
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let count = 0;
+    for (let index = 3; index < pixels.length; index += 4) {
+      if (pixels[index] > 0) count += 1;
+    }
+    return count;
+  });
+  expect(paintedPixels).toBeGreaterThan(0);
 
   await page.locator('.cluster-capacity input').fill('4');
   await page.getByRole('button', { name: 'Apply capacity' }).click();

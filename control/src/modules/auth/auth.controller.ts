@@ -104,6 +104,20 @@ export class AuthController {
     private readonly tailscaleStatus: TailscaleLocalStatusService,
   ) {}
 
+  /** Public capability probe shared by the standalone API and gateway UI. */
+  @Get('capability')
+  capability(): Record<string, unknown> {
+    return {
+      required: true,
+      enforced: true,
+      available: true,
+      mode: 'local_totp',
+      policy_version: 'n1a-v1',
+      service: 'control-svc',
+      bootstrap_available: this.auth.bootstrapAvailable(),
+    };
+  }
+
   @Post('bootstrap')
   @HttpCode(201)
   async bootstrap(@Body() body: BootstrapRequest): Promise<Record<string, unknown>> {

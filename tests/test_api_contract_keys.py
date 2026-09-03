@@ -55,8 +55,12 @@ class TestApiResponseKeys:
         body = res.json()
         assert set(body.keys()) == {"status", "timestamp"}
 
-    def test_auth_capability_is_explicit_when_running_direct_api(self, client):
+    def test_auth_capability_is_explicit_when_running_direct_api(self, client, monkeypatch):
         """The standalone API must not make Account fail with a 404 probe."""
+        # Keep the direct-mode contract independent from a developer's local
+        # control-svc process. A reachable control plane is exercised by the
+        # integration/runtime probe instead.
+        monkeypatch.setenv("QLH_CONTROL_URL", "http://127.0.0.1:1")
         res = client.get("/api/auth/capability")
         assert res.status_code == 200
         body = res.json()
