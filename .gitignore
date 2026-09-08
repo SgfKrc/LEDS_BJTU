@@ -119,3 +119,8 @@ models/gemma4-native/*.gguf
 /runtime-*.stdout.log
 /runtime-*.stderr.log
 /surface-ssh*.log
+# Harness 实验模型与下载中间产物（模型文件不进 git）
+models/qwen2.5-0.5b-instruct/
+models/minicpm4-0.5b/
+models/distilqwen25-ds3-0324-7b/
+models/.*.qlh-import-*/
