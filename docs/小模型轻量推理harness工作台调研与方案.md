@@ -185,7 +185,7 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 ├─ adapters/                       # 可插拔后端适配器（统一 Capability/chat/images 接口）
 │  ├─ base.py                      # adapter 接口 + 能力探测契约（禁伪造，§2.3-6）
 │  ├─ llama_server.py              # 本地：自拉起 llama-server 子进程，消费共享 GGUF 工件（默认）
-│  ├─ qlh.py                       # 主节点：QLH api_server 最小 HTTP 客户端（仅契约；含生图/路由映射）
+│  ├─ qlh.py                       # 主节点：QLH api_server 最小 HTTP 客户端（仅契约；含聊天/路由映射）
 │  └─ ollama.py                    # 可选对照（S5）
 ├─ model_profiles/                 # 模型 × 量化 × 后端的版本化画像与能力状态
 │  ├─ registry.py                  # 选择、校验、diff、回滚 profile
@@ -197,11 +197,14 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 │  ├─ policy.py                    # 策略管线：pinned 事实块 + 滚动摘要 + 近 N 轮 verbatim + tool 输出 masking
 │  ├─ summarize.py                 # 摘要 call（结构化 STATE 输出；大模型优先、同模型回退并标记）
 │  └─ notices.py                   # 所有裁剪/摘要动作的可见通知（禁止静默截断）
-├─ session/                        # 会话状态（STATE 落盘 + 决策日志 + 资产引用）
+├─ session/                        # 会话状态（SQLite 落盘 + 决策日志 + 资产引用）
+├─ rag/                            # FTS5 优先检索、可替换 embedding provider、有界上下文
 ├─ image_workbench/                # 生图工作区：/v1/images 封装、图片→会话资产、缩略卡入上下文
 │  ├─ local_engine.py              # 本地生图执行器（子进程直驱共享 SD 工件，文生图基线；不经 HTTP 契约）
 │  └─ remote_qlh.py                # 远端生图映射（qlh adapter → /api/diffusion/*）
 ├─ transport/                      # 连接管理（adapter 底座：重连/超时/退避；不感知具体后端）
+├─ ui_react/                       # 独立 React 工作台（赛博哥特结构，青蓝/洋红主题）
+└─ tui.py                          # Textual 工作台（与 React 共享 /v1 合同）
 ├─ adaptation/                     # 定制化实验编排：模板、grammar、角色和资源策略组合
 │  ├─ prompt_profiles.py            # 模型专属 prompt family 与停止词
 │  ├─ capability_gate.py            # unknown/candidate/verified/rejected 准入
@@ -230,10 +233,10 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 ### 4.4 生图工作区（S3 交付）
 
 - harness 只暴露 OpenAI 兼容生图接口（`POST /v1/images/generations`），本地与远端走**两条独立路径**：
-  - **本地（不经 HTTP 契约）**：harness 以子进程拉起**自带本地生图执行器**（`image_workbench/local_engine.py`，diffusers、延迟导入、CUDA venv），**直接消费共享 SD 工件**（`models/sd15-*/` + manifest 校验 + 资产目录可配）——不依赖主项目 api_server，也不 import `src/diffusion/`；首期只做**文生图基线**（txt2img），img2img/inpaint/IP-Adapter/指令编辑等高级编辑**不在本地执行器首期范围**（需要时走远端 qlh，或 S5 评估以"工件 + 独立脚本"方式补）；
-  - **远端**：`remote_qlh.py` 映射到 `/api/diffusion/*`（含 `distributed` 参数透传）。
-- 能力通告：`/v1/images` 是否可用由**本地执行器探测**（工件在+venv 就绪）或 qlh 后端真实响应决定，禁止伪造（§2.3-6）。
-- 图片作为会话资产（blob id 引用 + 缩略图 + prompt 元数据），可 `/image show <id>` 查看、`/image edit <id>`（远端走现有 img2img/InstructPix2Pix 链路）。
+  - **本地（不经 HTTP 契约）**：`image_workbench/local_engine.py` 先验证 QLH 生成的 `.qlh-sd-asset.json`，再调用注入式本地执行器直接消费共享 SD 工件；首期只做**文生图基线**（txt2img），img2img/inpaint/IP-Adapter/指令编辑等高级编辑继续走远端 qlh。
+  - **远端**：`remote_qlh.py` 提交 `/api/diffusion/generate`，轮询 job 并读取 `/api/diffusion/blobs/{blob_id}`；能力探测映射 `/api/diffusion/capabilities`。
+- **S3.1 本票边界**：`contracts.py` 固化尺寸、步数、提示词和响应格式校验；`manifest.py` 校验资产存在性、大小及可选 SHA-256；`local_engine.py` 保持与主项目解耦。默认执行器明确返回 `local_image_runtime_unavailable`，环境中偶然存在 `torch/diffusers` 不能替代真实执行器证明。
+- 图片由 `ImageAssetStore` 写入用户指定根目录，响应可返回 `b64_json` 或用户资产 URL；绝对路径不出现在 API 响应和报告中。缩略图、会话引用与多模态追问闭环进入后续票。
 - 图片入多模态上下文：缩略图卡（e.g. 256px base64）+ 摘要文本，控制 token 成本；遵循 §2.3-5（mmproj 下前缀缓存收益打折）。
 
 ### 4.5 本地 / 远端双模式（= 后端适配器选择）
@@ -242,6 +245,14 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 - **主节点本地/远端**：`--backend qlh [--host http://<master>:8000]` → 同一 UI 与上下文引擎，走 QLH 契约获得路由偏好（`routing_preference` 透传）/分布式/生图高级编辑/RAG；`--host` 缺省指向本机 8000。
 - **能力差异可视化**：状态栏展示当前 adapter 与能力（models/images/multimodal/routing），不静默降级（如 qlh 断连不悄悄切 llama_server）。
 - 断连：transport 底座统一指数退避重连 + 现有"连接中断"提示模式。
+
+### 4.6 React / TUI 工作台（S6 交付）
+
+- UI 是独立壳，不复制主项目 `frontend_cybergothic` 的数据层；React 与 TUI 都只调用 harness `/v1` 合同。
+- React 首屏是可用工作台：会话栏、对话流、RAG 检索抽屉、运行时能力条和用户资产入口；API 不可用时显式进入 fixture/离线状态，不伪造“已连接”。
+- 视觉沿用赛博哥特的低圆角、切角、分层和克制动效，但主题从荧光绿改为**高亮青蓝 + 洋红强调 + 暗金状态色**；深色保持黑底白字，浅色保持白底黑字，状态色不承担装饰功能。
+- TUI 使用 Textual，复用同一状态术语和错误码；无 Textual 时只提示可选依赖缺失，不影响 API/CLI 核心。
+- UI 开发票只覆盖工作台交互和视觉，不将真实模型质量、CUDA 生图或远端长时连接写成 UI 已验收。
 
 ### 4.6 定制化工作台：把技术亮点变成可验证工件
 
@@ -287,13 +298,23 @@ model profile
 | 阶段 | 交付 | 验收 |
 |---|---|---|
 | **S0 调研**（本次） | 本文档 | 结论已定：包装/反代层 + 双 adapter + 上下文策略管线；模型定制化和证据链列为主线 |
-| **S1 上下文引擎** | `context_engine/` + 单测 | §4.3 验收达成；接 SSE 回放对 harness 消息层验证；所有裁剪有 notice |
-| **S1.5 模型画像与能力探测** | `model_profiles/` + `capability_gate` + profile schema | 至少登记 QW1.8B、Qwen3-0.6B、Gemma 小模型三类候选；模板/stop/thinking/工具/多模态状态可解释；unknown 不得伪装 verified |
-| **S2 API 层 + 本地 adapter** | `api_layer/` + `adapters/llama_server` + `cli.py` + TUI | `curl /v1/chat/completions` 流式自测；本地 llama-server 子进程真机对聊；**不启动主项目也全程可玩** |
-| **S2.5 定制化实验台** | `adaptation/` + `eval/` + fixture/replay 报告 | 同一模型至少比较两种 prompt/template、两种上下文策略和一组资源预算；报告同时给质量、延迟和 RSS/VRAM；失败可回滚 |
-| **S3 生图工作区** | `image_workbench/`（local_engine + remote_qlh） | **本地**：`/v1/images/generations` → 本地执行器直驱共享 SD 工件文生图 → 会话资产 → 多模态追问闭环（**不启动主项目 api_server**）；**远端**：经 qlh 映射 `/api/diffusion/*` 可用 |
-| **S4 远端与 RAG** | qlh 远端 `--host` + 契约单测 + 注入 chunk 预算控制 | 30k 文档对话不越预算、无静默截断；远端真机对聊 + 路由偏好透传 |
+| **S1 上下文引擎** | `context_engine/` + 单测 | **Completed（本机开发门）**；预算、轮次边界、pinned/system 保护、输出 masking、STATE 校验、摘要压缩和 notice/ledger 已通过专项测试；SSE 回放接入留给 S2 |
+| **S1.5 模型画像与能力探测** | `model_profiles/` + `capability_gate` + profile schema | **Completed（本机开发门）**；已登记 QW1.8B、Qwen3-0.6B、Gemma-small 候选；本地元数据、模板/stop/thinking/工具/多模态状态可解释；unknown 不得进入 autonomous tools 或 production |
+| **S2 API 层 + 本地 adapter** | `api_layer/` + `adapters/llama_server` + `cli.py` + TUI | **Completed（本机开发门）**；OpenAI 请求映射、非流式/SSE、能力通告、上下文显式映射、子进程生命周期和 fake transport 已通过专项测试；真实 llama-server 二进制/模型对聊后置验收；**不启动主项目也可独立运行** |
+| **S2.5 定制化实验台** | `adaptation/` + `eval/` + fixture/replay 报告 | **Completed（离线本机开发门）**；同一模型可比较两种 prompt/template、两种上下文策略和两组资源预算；报告同时给质量、延迟、RSS/VRAM、回退和 holdout；真实模型 runner 后置 |
+| **S3 生图工作区** | `image_workbench/`（contracts + manifest + assets + local_engine + remote_qlh） | **开发完成（离线本机门）**：`/v1/images/generations` 契约、本地 manifest 校验、注入式本地执行器、用户资产落盘、远端 qlh job/blob 映射和 `b64_json`/URL 响应已实现；真实 diffusers/CUDA 执行器、多模态追问和高级编辑仍后置验收 |
+| **S4 远端与 RAG** | `adapters/qlh.py` + `session/` + `rag/` + `/v1/rag/*` + `/v1/sessions/*` | **开发完成（离线本机门）**：QLH `/api/chat`/SSE 映射、SQLite 用户会话与资产引用、FTS5 owner scope 硬过滤、可替换 embedding 契约、有界引用上下文；真实 30k 文档预算、远端真机对聊和 nomic 长时 provider 后置验收 |
 | **S5 评估与收口** | `adapters/ollama` 对照、契约漂移检测、文档、Pareto 总结 | 玩具定位复核 + "换后端成本"实测：不行则砍 ollama 而不是返工；至少保留一组可公开演示的定制化前后对照 |
+| **S6 工作台 UI** | `ui_react/` + `tui.py` + UI contract tests | React 工作台与 Textual TUI 共享 `/v1` 合同；主题、fixture/offline 状态、会话/RAG/资产入口一致；真实端到端质量和长时网络仍后置 |
+
+### 4.7 S6 开发票
+
+| 票 | 内容 | 验收门 |
+|---|---|---|
+| `HARNESS-UI-01` | React/Vite 工作台壳 + Textual TUI 壳；共享导航、连接状态、主题和 fixture 状态合同 | React typecheck/build；TUI import/smoke；青蓝/洋红主题无荧光绿主色 |
+| `HARNESS-UI-02` | React/TUI 对话流与会话切换，接 `/v1/chat/completions`、SSE 和 `/v1/sessions/*` | fake API 下新建/切换/发送/断连错误可复现；不静默降级 |
+| `HARNESS-UI-03` | RAG 工作区与引用上下文，接 `/v1/rag/*`；图片/资产抽屉接 `/v1/images/*` | owner scope、预算遗漏、资产 URL 错误状态可见；桌面/窄屏布局稳定 |
+| `HARNESS-UI-04` | 主题/可访问性/视觉回归与 TUI parity；文档、启动脚本、独立依赖锁定 | 深浅色对比、键盘导航、减少动效、React/TUI 术语一致；不改主项目前端 |
 
 > 注：S3 本地生图由 harness 自带执行器消费共享 SD 工件（资产 manifest 校验借用主项目产物），远端高级编辑（img2img/inpaint/IP-Adapter/指令编辑）依赖主节点 SD 侧车（参阅 SD 1.5 计划）；S2 起每个阶段都要求"可运行 + 有接受证据"再进下一阶段；harness 自始至终不 import 主项目代码，违背即视为回归。
 
@@ -348,3 +369,140 @@ model profile
 - 2026-09-04：v2 —— 形态改为 **OpenAI 兼容包装/反代层 + 可插拔后端适配器**（llama_server 本地默认 / qlh 主节点 / ollama 可选），子项目与主项目解耦：不 import 代码、仅共享模型工件（目录约定），风险新增契约漂移与工件路径约定
 - 2026-09-04：v3 —— 生图修正：**本地生图也不经 HTTP 契约**（harness 自带本地生图执行器子进程直驱共享 SD 工件，文生图基线；img2img/inpaint/IP-Adapter/指令编辑仍经远端 qlh），新增"本地生图重复造轮子"取舍风险
 - 2026-09-08：v4 —— 将**小模型定制化**提升为主线：新增模型画像 schema、能力状态、适配流水线、角色分工、实验矩阵、质量-资源 Pareto 和可复现证据要求；明确“玩具”是轻量实验载体，不是无证据的通用 Agent 或性能宣传页
+- 2026-09-08：v5 —— 完成 **S1 上下文引擎本机开发门**：新增独立 `harness_workbench/context_engine/` 纯 Python 核心，提供预算账本、轮次裁剪、pinned 保护、工具/图片输出 masking、结构化 STATE 校验、摘要压缩、可见 notice 和 per-message ledger；专项测试 8 passed，未引入主项目代码依赖
+- 2026-09-08：v6 —— 完成 **S1.5 模型画像与能力探测本机开发门**：新增 `model_profiles/` schema、用户本地 registry、QW1.8B/Qwen3-0.6B/Gemma-small 保守候选画像、静态本地工件探测和 fail-closed capability gate；专项测试 9 passed，不加载权重、不联网、不依赖主项目代码
+- 2026-09-08：v7 —— 完成 **S2 API 层与 llama-server adapter 本机开发门**：新增 OpenAI 兼容 `/v1/models`、`/v1/capabilities`、`/v1/chat/completions`（含 SSE）、严格请求映射、llama-server 子进程生命周期和可注入 HTTP transport；专项测试 7 passed，真实模型对聊后置，不依赖主项目代码
+- 2026-09-08：v8 —— 完成 **S2.5 定制化实验台离线开发门**：新增 adaptation 变体矩阵、内置小模型 prompt/context/resource profiles、fixture/replay runner、质量/格式/截断/回退/延迟/RSS/VRAM 指标、holdout promotion gate 和 Pareto frontier；专项测试 7 passed，不加载权重、不联网、不把 fake runner 结果写成生产能力
+- 2026-09-08：v9 —— 完成 **S3 生图工作区离线开发门**：新增独立 image contracts、QLH `.qlh-sd-asset.json` manifest 校验、注入式本地 txt2img 边界、用户资产原子落盘、远端 `/api/diffusion/generate` job/blob 映射和 `/v1/images/generations` 的 `b64_json`/URL 响应；专项测试 7 passed，真实 diffusers/CUDA 执行器、多模态追问和高级编辑后置
+- 2026-09-08：v10 —— 完成 **S4 远端与 RAG 离线开发门**：新增 QLH `/api/chat` 与 SSE adapter、bounded role transcript、用户-owned SQLite session/asset refs、FTS5 owner scope 检索、可替换 embedding provider 契约、有界 citation context 及 `/v1/rag/*`、`/v1/sessions/*`；专项测试 8 passed，真实远端对聊、30k 文档容量、nomic 长时 provider 和跨进程并发后置
+- 2026-09-08：v11 —— 增加 **S6 React/TUI 工作台分票**：React/Vite 与 Textual 共享 `/v1` 合同，首票先做壳、fixture/offline 状态、会话/RAG/资产入口和青蓝/洋红赛博哥特主题；荧光绿不再作为主强调色。
+
+## 8. S1 实施记录
+
+本票只实现后端无关的上下文消息层，不启动模型、不连接网络、不引入主项目运行时。核心接口如下：
+
+- `ContextBudget`：按 `n_ctx - max_new_tokens - overhead` 计算输入预算，支持对齐，并在生成预算耗尽时 fail-closed。
+- `ContextPolicy.build()`：保留 system/pinned 内容，按显式或隐式 turn 边界选择最近轮次；旧轮次进入 STATE 摘要，无法放入摘要时保留最近轮次并发出 `context.summary_omitted`。
+- `ContextMessage` 与 `ContextLedgerEntry`：为每条消息保留稳定身份、轮次、token 估算、保留原因和 masking/summary 证据。
+- `validate_state()` / `apply_state_patch()`：只允许 `what/decisions/artifacts/open/next` 五个字段；未知字段拒绝，删除必须显式确认。
+- `ContextNotice`：所有裁剪、masking、摘要和异常都以稳定 code 对外报告，禁止静默丢失内容。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_engine.py -q
+8 passed
+```
+
+本票不声明模型真实生成能力已完成；模型画像和静态能力合同在 S1.5 单独收口，下一票进入 S2 API 层与本地 adapter。
+
+## 9. S1.5 实施记录
+
+`model_profiles/` 是模型适配的单一事实来源，画像不包含用户绝对路径、凭据或会话原文：
+
+- `schema.py` 定义 `qlh.harness.model_profile.v1`，区分 profile admission（`unknown/candidate/verified/rejected`）与 capability 状态（`unknown/declared/verified/rejected`），并对 artifact/tokenizer/template digest 做格式校验。
+- `probe.py` 只读取本地配置、tokenizer、chat template、generation config 和文件清单；默认对目录权重做 inventory digest，不把 tensor 加载进框架，`hash_weights=True` 才执行完整流式权重哈希。报告固定声明 `weights_loaded=false`、`network_used=false`。
+- `builtin.py` 登记 QW1.8B、Qwen3-0.6B、Gemma-small 三个候选画像，均不宣称工具调用或多模态已 verified；模型专属 prompt family、tool mode、角色和资源策略显式可 diff。
+- `capability_gate.py` 允许未知模型做普通回答或 host-router，只有工具调用生成和结果回灌同时 verified 才能进入 `autonomous_tools`；目录 inventory digest 不能进入 verified/production，必须显式完成 `full_stream` 内容哈希；拒绝状态永远 fail-closed。
+- `registry.py` 使用用户指定目录保存带内容摘要文件名的 JSON profile，支持精确选择、diff、promotion 和 rollback；篡改文件名摘要或 profile 内容都会被忽略/拒绝。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_engine.py tests/test_harness_model_profiles.py -q
+17 passed
+```
+
+本票完成的是静态画像和准入合同，不是模型真实生成能力验收。真实模型进程、模板运行、工具调用和资源 Pareto 进入 S2.5 定制化实验台。
+
+## 10. S2 实施记录
+
+本票把 harness 变成可独立启动的 API 外壳，但没有把后端能力伪装成主项目能力：
+
+- `api_layer/mapping.py` 将 OpenAI 请求严格转换为 adapter request，显式处理 `max_tokens`、`stop`、`temperature`、`top_p`、`extra_body.num_ctx` 和 `cache_prompt`；未知扩展字段拒绝，不静默吞参数。
+- `api_layer/app.py` 提供 `/healthz`、`/v1/models`、`/v1/capabilities` 和 `/v1/chat/completions`。非流式响应遵循 OpenAI completion envelope；流式响应逐块输出 SSE，错误以稳定 error envelope 结束并发送 `[DONE]`。
+- `adapters/base.py` 固化后端无关的 capability/model/request/response/chunk 合同；`AdapterError` 只暴露稳定 code、retryable 和状态，不泄露本地模型路径。
+- `adapters/llama_server.py` 使用独立的 `llama-server` 子进程参数构造（`--model/--ctx-size/--n-predict/--jinja/--cache-prompt/--mmproj`），`num_ctx` 明确视为进程级配置；支持 `/props`、`/v1/models`、completion 和 SSE 解析，HTTP transport 可注入测试替身。
+- `cli.py` 提供 `python -m harness_workbench.cli --model ...` 入口，主项目 `api_server.py` 不参与启动路径；真实二进制、权重和 CUDA 只在后置真机验收时启用。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_engine.py tests/test_harness_model_profiles.py tests/test_harness_api_layer.py -q
+24 passed
+```
+
+本票已完成协议和进程工程化，不等于真实模型质量验收。下一票进入 S2.5 定制化实验台，建立 prompt/template、上下文策略和资源预算的可复现实验矩阵。
+
+## 11. S2.5 实施记录
+
+本票实现的是“可展示但不作秀”的定制化实验台：
+
+- `adaptation/profiles.py` 定义 `PromptProfile`、`ContextStrategy`、`ResourceProfile` 和 `AdaptationVariant`；变体 ID 由模型 profile digest、prompt、上下文和资源配置规范化计算，不能手工覆盖。`builtin.py` 提供 Qwen/Gemma/generic 两组 prompt 对照、recent-window/STATE-summary 两组上下文策略和 8 GB safe/balanced 两组资源预算。
+- `eval/fixtures.py` 冻结短回答、结构化 JSON、工具拒绝、长上下文召回和 holdout 格式/grounding 样本；fixture digest 进入报告，fixture 不携带本地路径、权重或凭据。
+- `eval/replay.py` 定义可注入 `ReplayRunner`。每次回放绑定 variant、fixture digest、消息 digest、seed、延迟和资源指标；默认报告去除原始输出，固定声明 `weights_loaded=false`、`network_used=false`。
+- `eval/report.py` 统计质量率、格式率、截断率、回退率、延迟 P50/P95、RSS/VRAM 峰值；holdout 不达门时保持 `candidate`；即使通过离线质量门，promotion 也只返回 `verified` candidate，生产路由仍需真实运行时验收。
+- `pareto_frontier()` 同时考虑质量和资源代价，避免只用 tok/s 或单个成功 Demo 选择 profile；被更高质量且更低资源代价的变体标记为 dominated。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_engine.py tests/test_harness_model_profiles.py tests/test_harness_api_layer.py tests/test_harness_adaptation_eval.py -q
+31 passed
+```
+
+当前仍未做真实 QW1.8B/Gemma/其他小模型权重回放、真实 RSS/VRAM 采样或真实 llama-server 质量结论；这些是后置真机验收，不影响本票先完成工程化实验工作台。
+
+## 12. S3 实施记录
+
+本票完成生图工作区的工程合同和两条后端路径，不把 fake executor 或异步 job 结果写成真实本地生图能力：
+
+- `image_workbench/contracts.py` 固化 prompt、尺寸、步数、引导强度、seed、模型和响应格式；非法尺寸、越界参数和不受支持的响应格式在 API 边界 fail-closed。
+- `image_workbench/manifest.py` 独立解析主项目资产工具生成的 `.qlh-sd-asset.json`，检查相对路径、重复项、文件存在性、大小和可选 SHA-256；不 import `src/diffusion/`，也不把绝对资产路径返回给调用方。
+- `image_workbench/local_engine.py` 只负责 manifest 闸门和 executor 生命周期。当前默认 executor 明确返回 `local_image_runtime_unavailable`；测试替身可以证明请求、工件和生成结果的连接，但不能替代 CUDA/diffusers 验收。
+- `image_workbench/remote_qlh.py` 将请求映射到 `/api/diffusion/generate`，轮询 `/api/diffusion/jobs/{job_id}`，读取 `/api/diffusion/blobs/{blob_id}` 或直接解析 base64；能力探测只接受 QLH `/api/diffusion/capabilities` 的真实响应。
+- `ImageAssetStore` 将图片和最小 prompt/尺寸/seed 元数据写入用户指定根目录，先写临时文件再原子替换，读回时重新校验 SHA-256。`api_layer/app.py` 新增 `/v1/images/capabilities`、`/v1/images/generations` 和资产读取端点。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_image_workbench.py -q
+7 passed
+```
+
+本票仍未完成真实本地 diffusers/CUDA executor、实际 SD 采样质量、缩略图/会话多模态回灌和本地高级编辑；这些能力进入后续票并要求真机验收。
+
+## 13. S4 实施记录
+
+本票完成远端主节点和本地知识/会话边界，不把主项目数据库或远端状态偷偷变成 harness 的隐式依赖：
+
+- `adapters/qlh.py` 探测 `/api/status`，将 OpenAI 风格的 messages 明确序列化为有界 role transcript，再映射 `/api/chat`；SSE 同时支持逐 token 和 `done.response` 完整回答，异常保持稳定错误码。QLH 的路由偏好、外部数据授权和客户端类型由配置显式控制。
+- `session/store.py` 使用用户指定的 SQLite WAL 文件保存会话、消息和资产引用。返回对象只有 session/message/asset ID、scope 和元数据，不暴露本地绝对路径；scope 不匹配时硬拒绝读取。
+- `rag/store.py` 默认 FTS5，source/chunk ID 由内容摘要稳定生成，owner scope 在 SQL 查询中硬过滤；`providers.py` 只定义 embedding provider，不因为存在普通聊天模型就宣称 embedding 可用。
+- `rag/context.py` 按完整 chunk 组装引用上下文，超出预算时返回 `omitted_count` 和 `truncated=true`，不静默截断；API 提供 `/v1/rag/health`、`/v1/rag/sources`、`/v1/rag/search` 与 `/v1/sessions`、`/v1/sessions/{id}/messages`、`/v1/sessions/{id}/assets`。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_s4_remote_rag.py -q
+8 passed
+```
+
+真实 QLH 主节点、30k 文档容量与长时 embedding provider 仍是后置环境验收；本票不宣称网络可达、nomic 质量或跨进程压力已通过。
+
+## 14. S6-HARNESS-UI-01 实施记录
+
+本票实现工作台的第一层交互壳，不绑定真实模型进程：
+
+- `ui_react/` 是独立 Vite/React 包，首屏直接进入工作台，包含会话侧栏、对话流、RAG 检索入口、运行时能力面板和资产入口；接口失败时显示离线/fixture 状态，不能把 mock 状态标为在线。
+- 视觉契约采用黑/白底、低圆角、切角分层和少量动效；强调色使用高亮青蓝 `#63e6ff`、洋红 `#ff5bd7`，状态色使用暗金/琥珀，明确不使用荧光绿作为主色。深色和浅色均通过文字/边框对比保持可读。
+- `tui.py` 提供 Textual 工作台壳，连接状态、会话、对话和 RAG 术语与 React 共用；Textual 不可用时只返回可操作的依赖提示。
+- 本票不声明真实 QLH、模型权重、图像采样或 RAG provider 已通过 UI 端到端验收；后续票接入 fake API 后再做交互回归。
+
+验证证据：
+
+```text
+ui_react: npm run build       # tsc --noEmit + vite build 通过
+TUI/UI 合同: tests/test_harness_ui.py 2 passed
+Playwright: 1440x900 与 390x844 截图通过；scrollWidth == innerWidth，无横向溢出
+```
