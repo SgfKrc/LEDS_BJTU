@@ -136,6 +136,7 @@ import local_store as _local_store
 import model_download_jobs
 import model_search
 from rag_store import RagStore, RagStoreError
+from tool_rag_cache import ToolRagCache, ToolRagCacheError
 from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
 from rag_ann import evaluate_ann_decision
 from cluster_join import (
@@ -165,6 +166,8 @@ _log_buffer_lock = threading.RLock()
 _log_buffer_total_seen = 0
 _rag_store_lock = threading.RLock()
 _rag_store_instance: RagStore | None = None
+_tool_rag_cache_lock = threading.RLock()
+_tool_rag_cache_instance: ToolRagCache | None = None
 _join_ledger_lock = threading.RLock()
 _join_ledger_instance: JoinGrantLedger | None = None
 
@@ -200,6 +203,16 @@ def _get_rag_store() -> RagStore:
             _rag_store_instance = RagStore(path)
         _rag_store_instance.initialize()
         return _rag_store_instance
+
+
+def _get_tool_rag_cache() -> ToolRagCache:
+    """Return the explicit-persistence ledger on the same user-owned SQLite file."""
+    global _tool_rag_cache_instance
+    with _tool_rag_cache_lock:
+        if _tool_rag_cache_instance is None:
+            _tool_rag_cache_instance = ToolRagCache(_get_rag_store())
+        _tool_rag_cache_instance.initialize()
+        return _tool_rag_cache_instance
 
 
 class RequestIdFilter(logging.Filter):
@@ -1154,6 +1167,21 @@ class RagEmbeddingRunRequest(BaseModel):
     max_batches: int = Field(default=1, ge=1, le=100)
     lease_seconds: int = Field(default=120, ge=5, le=3_600)
     max_retries: int = Field(default=2, ge=0, le=5)
+
+
+class ToolCachePersistRequest(BaseModel):
+    tool_name: Literal["web_search", "web_fetch"]
+    result: dict[str, Any]
+    persist: bool = False
+    owner_scope: Literal["local_user", "local_system", "project"] = "local_user"
+    access_scope: Literal["owner", "local_system", "project"] = "owner"
+    ttl_seconds: Optional[int] = Field(default=None, ge=1, le=90 * 24 * 60 * 60)
+
+
+class ToolCacheSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=512)
+    access_scope: Literal["owner", "local_system", "project"] = "owner"
+    limit: int = Field(default=20, ge=1, le=100)
 
 
 class DiffusionArtifactInspectRequest(BaseModel):
@@ -2624,6 +2652,118 @@ async def rag_delete_source(source_id: str):
     except Exception as exc:
         logger.error("RAG source deletion failed: %s", exc)
         raise HTTPException(status_code=503, detail="RAG source 删除失败") from exc
+
+
+@app.get("/api/tool-cache/health")
+async def tool_cache_health():
+    """Return bounded cache capacity without exposing the local SQLite path."""
+    try:
+        capacity = await run_in_threadpool(_get_tool_rag_cache().capacity)
+        return {"storage": "sqlite", **capacity}
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache health failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache unavailable") from exc
+
+
+@app.get("/api/tool-cache")
+async def tool_cache_list(access_scope: Literal["owner", "local_system", "project"] = "owner"):
+    try:
+        entries = await run_in_threadpool(lambda: _get_tool_rag_cache().list_cache(access_scope=access_scope))
+        return {"storage": "sqlite", "entries": entries, "count": len(entries)}
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache listing failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache unavailable") from exc
+
+
+@app.post("/api/tool-cache")
+async def tool_cache_persist(req: ToolCachePersistRequest):
+    try:
+        entry = await run_in_threadpool(
+            lambda: _get_tool_rag_cache().save_tool_result(
+                req.result,
+                tool_name=req.tool_name,
+                persist=req.persist,
+                owner_scope=req.owner_scope,
+                access_scope=req.access_scope,
+                ttl_seconds=req.ttl_seconds,
+            )
+        )
+        return {"storage": "sqlite", "entry": entry}
+    except ToolRagCacheError as exc:
+        status = 422 if exc.code.endswith("invalid") or exc.code in {
+            "persistence_not_explicit", "citation_incomplete", "tool_result_error",
+        } else 409
+        raise HTTPException(status_code=status, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache persistence failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache persistence unavailable") from exc
+
+
+@app.get("/api/tool-cache/{cache_id}")
+async def tool_cache_get(cache_id: str, access_scope: Literal["owner", "local_system", "project"] = "owner"):
+    try:
+        return {"storage": "sqlite", "entry": await run_in_threadpool(lambda: _get_tool_rag_cache().get_cache(cache_id, access_scope=access_scope))}
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=404 if exc.code in {"cache_not_found", "cache_expired"} else 422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache read failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache unavailable") from exc
+
+
+@app.post("/api/tool-cache/search")
+async def tool_cache_search(req: ToolCacheSearchRequest):
+    try:
+        entries = await run_in_threadpool(
+            lambda: _get_tool_rag_cache().search(req.query, access_scope=req.access_scope, limit=req.limit)
+        )
+        return {"storage": "sqlite", "entries": entries, "count": len(entries)}
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache search failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache search unavailable") from exc
+
+
+@app.post("/api/tool-cache/rebuild")
+async def tool_cache_rebuild():
+    try:
+        return {"storage": "sqlite", **await run_in_threadpool(_get_tool_rag_cache().rebuild)}
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache rebuild failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache rebuild unavailable") from exc
+
+
+@app.post("/api/tool-cache/purge")
+async def tool_cache_purge(limit: int = 100):
+    try:
+        return {"storage": "sqlite", **await run_in_threadpool(lambda: _get_tool_rag_cache().purge_expired(limit=limit))}
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache purge failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache purge unavailable") from exc
+
+
+@app.delete("/api/tool-cache/{cache_id}")
+async def tool_cache_delete(cache_id: str, access_scope: Literal["owner", "local_system", "project"] = "owner"):
+    try:
+        deleted = await run_in_threadpool(lambda: _get_tool_rag_cache().delete_cache(cache_id, access_scope=access_scope))
+        if not deleted:
+            raise HTTPException(status_code=404, detail="tool cache not found")
+        return {"status": "deleted", "cache_id": cache_id, "storage": "sqlite"}
+    except HTTPException:
+        raise
+    except ToolRagCacheError as exc:
+        raise HTTPException(status_code=422, detail=exc.code) from exc
+    except Exception as exc:
+        logger.error("tool cache delete failed: %s", exc)
+        raise HTTPException(status_code=503, detail="tool cache delete unavailable") from exc
 
 
 @app.get("/api/presets")
