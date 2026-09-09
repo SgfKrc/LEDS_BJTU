@@ -184,6 +184,9 @@ def test_fastapi_app_exposes_models_completion_and_sse() -> None:
     adapter = FakeAdapter()
     client = TestClient(create_app(adapter))
     assert client.get("/v1/models").json()["data"][0]["id"] == "fixture"
+    profiles = client.get("/v1/model-profiles")
+    assert profiles.status_code == 200
+    assert "Qwen2.5-0.5B" in {item["model_id"] for item in profiles.json()["profiles"]}
     response = client.post("/v1/chat/completions", json={"model": "fixture", "messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "ok"

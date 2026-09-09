@@ -6,12 +6,16 @@ import uuid
 from dataclasses import replace
 from typing import Any, Iterable, Mapping
 
-from ..adapters.base import AdapterError, ChatAdapter
+from ..adapters.base import AdapterError, AdapterRequest, ChatAdapter
 from ..context_engine import ContextBudget, ContextPolicy, ContextMessage
 from ..image_workbench.assets import ImageAssetStore
 from ..image_workbench.contracts import ImageAdapter, ImageAdapterError, ImageRequest, ImageRequestError
+from ..memory import MemoryStore
+from ..mcp_server import HarnessMCPDependencies, MCPServer, MCPToolError
+from ..model_profiles import builtin_profiles
 from ..rag import RagStore, build_context
 from ..session import SessionStore
+from ..tools.network import NetworkClient
 from .mapping import APIRequestError, chunk_to_openai, parse_chat_request, response_to_openai
 
 
@@ -36,6 +40,9 @@ def create_app(
     image_store: ImageAssetStore | None = None,
     rag_store: RagStore | None = None,
     session_store: SessionStore | None = None,
+    memory_store: MemoryStore | None = None,
+    network_client: NetworkClient | None = None,
+    mcp_server: MCPServer | None = None,
 ) -> Any:
     """Create an OpenAI-compatible app around one explicit adapter.
 
@@ -54,6 +61,48 @@ def create_app(
 
     app = FastAPI(title="QLH Harness Workbench", docs_url=None, redoc_url=None)
 
+    def mcp_chat(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Adapt the existing synchronous chat adapter to the MCP tool contract."""
+
+        messages = arguments.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty array")
+        model = arguments.get("model")
+        if not isinstance(model, str) or not model.strip():
+            models = adapter.models()
+            model = models[0].id if models else ""
+        if not model:
+            raise AdapterError("no chat model is configured", code="chat_unavailable", status_code=503)
+        request = AdapterRequest(
+            model=model.strip(),
+            messages=tuple({"role": item["role"], "content": item["content"]} for item in messages),
+            stream=False,
+            max_tokens=512,
+        )
+        try:
+            response = adapter.complete(request)
+        except AdapterError as exc:
+            raise MCPToolError(exc.code, str(exc), retryable=exc.retryable) from exc
+        return {
+            "id": response.id,
+            "model": response.model,
+            "content": response.content,
+            "finish_reason": response.finish_reason,
+            "usage": dict(response.usage),
+        }
+
+    resolved_mcp = mcp_server or MCPServer(
+        dependencies=HarnessMCPDependencies(
+            session_store=session_store,
+            rag_store=rag_store,
+            memory_store=memory_store,
+            network_client=network_client,
+            image_adapter=image_adapter,
+            image_store=image_store,
+            chat_handler=mcp_chat,
+        )
+    )
+
     @app.get("/healthz")
     async def healthz() -> Any:
         try:
@@ -71,6 +120,79 @@ def create_app(
         except AdapterError as exc:
             return JSONResponse(_error_body(str(exc), code=exc.code, error_type="backend_error"), status_code=exc.status_code)
         return {"object": "list", "data": [item.as_dict() for item in values]}
+
+    @app.get("/v1/model-profiles")
+    async def model_profiles() -> Any:
+        """Expose conservative model profiles separately from live adapter models."""
+
+        return {
+            "schema": "qlh.harness.model_profiles.v1",
+            "profiles": [profile.as_dict() for profile in builtin_profiles()],
+        }
+
+    @app.get("/v1/mcp/manifest")
+    async def mcp_manifest() -> Any:
+        initialized = resolved_mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": "manifest",
+                "method": "initialize",
+                "params": {"protocolVersion": "2024-11-05"},
+            }
+        )
+        return {
+            "schema": "qlh.mcp_http_manifest.v1",
+            "server": initialized.get("result", {}) if initialized else {},
+            "tools": [tool.as_dict() for tool in resolved_mcp.registry.list_tools()],
+            "external_mcp": {
+                "configurations": resolved_mcp.registry.external_configurations(),
+                "configuration_only": True,
+                "real_connections": False,
+            },
+            "transports": {
+                "jsonrpc": {"method": "POST", "path": "/v1/mcp/rpc"},
+                "call": {"method": "POST", "path": "/v1/mcp/call"},
+                "stdio": {"available": True, "command": "python -m harness_workbench.mcp_server"},
+                "sse": {"available": True, "mode": "loopback_standalone", "path": "/sse"},
+            },
+        }
+
+    @app.get("/v1/mcp/tools")
+    async def mcp_tools() -> Any:
+        return {"schema": "qlh.mcp_tools.v1", "tools": [tool.as_dict() for tool in resolved_mcp.registry.list_tools()]}
+
+    @app.post("/v1/mcp/call")
+    async def mcp_call(request: Request) -> Any:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, Mapping):
+                raise ValueError("MCP call body must be an object")
+            name = payload.get("name")
+            arguments = payload.get("arguments", {})
+            if not isinstance(name, str) or not name:
+                raise ValueError("MCP tool name is required")
+            response = resolved_mcp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": uuid.uuid4().hex,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(_error_body(str(exc), code="invalid_mcp_call"), status_code=400)
+        return response or JSONResponse({}, status_code=204)
+
+    @app.post("/v1/mcp/rpc")
+    async def mcp_rpc(request: Request) -> Any:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, Mapping):
+                raise ValueError("MCP JSON-RPC body must be an object")
+            response = resolved_mcp.handle(payload)
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(_error_body(str(exc), code="invalid_mcp_rpc"), status_code=400)
+        return response or JSONResponse({}, status_code=204)
 
     @app.get("/v1/capabilities")
     async def capabilities() -> Any:
@@ -190,6 +312,18 @@ def create_app(
         except (TypeError, ValueError) as exc:
             return JSONResponse(_error_body(str(exc), code="invalid_session"), status_code=400)
         return JSONResponse(session.as_dict(), status_code=201)
+
+    @app.get("/v1/sessions")
+    async def list_sessions(request: Request) -> Any:
+        if session_store is None:
+            return JSONResponse(_error_body("session store is not configured", code="sessions_unavailable", error_type="backend_error"), status_code=503)
+        try:
+            owner_scope = request.query_params.get("owner_scope", "local")
+            limit = request.query_params.get("limit", "50")
+            sessions = session_store.list(owner_scope=owner_scope, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return JSONResponse(_error_body(str(exc), code="invalid_session_query"), status_code=400)
+        return {"sessions": [session.as_dict() for session in sessions]}
 
     @app.get("/v1/sessions/{session_id}")
     async def get_session(session_id: str, request: Request) -> Any:
