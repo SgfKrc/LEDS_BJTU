@@ -27,6 +27,7 @@ from doc_maintenance_audit import (  # noqa: E402
     scan_all,
     scan_doc,
 )
+from docagent_rules import load_rules  # noqa: E402
 
 
 @pytest.fixture
@@ -271,6 +272,40 @@ def test_r5_miss_when_status_present(fake_repo):
     assert "R5" not in {f["rule"] for f in entry["findings"]}
 
 
+def test_p1b_scanner_uses_rule_data_for_hints_and_levels(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "custom.md", "> 状态：进行中\n\n正文已完成\n")
+    _commit(repo)
+    rules = load_rules()
+    r1 = next(rule for rule in rules["rules"] if rule["id"] == "R1")
+    r1["level"] = "error"
+    r1["parameters"]["stale_status_hints"] = ["进行中"]
+
+    entry = scan_doc(p, repo, None, rules=rules)
+
+    assert entry["findings"] == [{
+        "rule": "R1",
+        "level": "error",
+        "message": "状态行含未收口词但正文含完成标记：> 状态：进行中",
+    }]
+
+
+def test_p1b_scanner_uses_rule_data_for_status_window(fake_repo):
+    repo, docs = fake_repo
+    p = _write(docs, "window.md", "# 标题\n\n> 状态：现行\n")
+    _commit(repo)
+    rules = load_rules()
+    rules["defaults"]["status_window_lines"] = 2
+
+    entry = scan_doc(p, repo, None, rules=rules)
+
+    assert entry["findings"] == [{
+        "rule": "R5",
+        "level": "info",
+        "message": "前 2 行无状态行",
+    }]
+
+
 # ---------- 对真实仓库的烟雾验证（不触碰、只读） ----------
 
 def test_real_repo_scan_is_read_only_and_fast():
@@ -294,3 +329,8 @@ def test_real_repo_scan_is_read_only_and_fast():
     # 至少一类 warn 命中（对当前仓库必然成立：存在已知遗留模式）
     all_findings = [f for d in out["docs"] for f in d["findings"]]
     assert any(f["level"] == "warn" for f in all_findings)
+    assert len(out["rules_fingerprint"]) == 64
+    assert out["rules"] == {
+        "R1": "完成未收口", "R2": "未提交登记", "R3": "状态行滞后",
+        "R4": "链接失效", "R5": "状态行缺失",
+    }

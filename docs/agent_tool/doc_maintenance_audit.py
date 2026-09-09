@@ -97,11 +97,12 @@ def _configure_text_stream(stream) -> None:
         return
 
 
-def _dirty_doc_paths(repo_root: Path) -> dict[str, str]:
+def _dirty_doc_paths(repo_root: Path, git_scope: str = "docs/") -> dict[str, str]:
     """返回有工作区改动的 docs 路径及 porcelain 状态。"""
+    scope = git_scope.rstrip("/") or "."
     output = _git([
         "-c", "core.quotepath=false", "status", "--short",
-        "--untracked-files=all", "--", "docs/",
+        "--untracked-files=all", "--", scope,
     ], repo_root)
     dirty: dict[str, str] = {}
     for line in output.splitlines():
@@ -112,7 +113,7 @@ def _dirty_doc_paths(repo_root: Path) -> dict[str, str]:
         # rename/copy 记录同时登记旧、新路径；普通含空格路径不会被拆分。
         for path in path_field.split(" -> "):
             normalized = path.strip().strip('"').replace("\\", "/")
-            if normalized.startswith("docs/") and normalized.endswith(".md"):
+            if normalized.startswith(f"{scope}/") and normalized.endswith(".md"):
                 dirty[normalized] = state
     return dirty
 
@@ -254,46 +255,73 @@ def _check_link(href: str, docs_dir: Path | None = None,
 
 def scan_doc(doc: Path, repo_root: Path, since: datetime | None,
              *, dirty_docs: dict[str, str] | None = None,
-             source_changes: list[dict] | None = None) -> dict:
+             source_changes: list[dict] | None = None,
+             rules: Mapping[str, Any] | None = None) -> dict:
     """对单份文档执行 5 条规则，返回命中列表。"""
+    configured_rules = DEFAULT_RULES if rules is None else validate_rules(rules)
+    r1 = _rule_parameters(configured_rules, "R1")
+    r3 = _rule_parameters(configured_rules, "R3")
+    r4 = _rule_parameters(configured_rules, "R4")
+    r5 = _rule_parameters(configured_rules, "R5")
     text = doc.read_text(encoding="utf-8", errors="replace")
     rel = doc.relative_to(repo_root).as_posix()
     findings: list[dict] = []
 
-    status = _status_line(text)
+    status = _status_line(
+        text,
+        status_window_lines=int(configured_rules["defaults"]["status_window_lines"]),
+        status_pattern=str(r5["status_pattern"]),
+        ignore_lifecycle_heading=bool(r5["ignore_lifecycle_heading"]),
+        lifecycle_pattern=str(r5["lifecycle_pattern"]),
+    )
     updated = _updated_at(text)
     status_lower = status.lower()
-    exempt = any(h.lower() in status_lower for h in EXEMPT_HINTS)
+    exempt_hints = tuple(
+        str(value) for value in configured_rules["exemptions"]["status_contains"]
+    )
+    exempt = any(hint.lower() in status_lower for hint in exempt_hints)
 
     # R5 状态行缺失（非豁免）
-    if not status:
+    if _rule_enabled(configured_rules, "R5") and not status:
         if not exempt:
-            findings.append({"rule": "R5", "level": "info",
-                             "message": "前 12 行无状态行"})
-    else:
+            findings.append({
+                "rule": "R5", "level": _rule_level(configured_rules, "R5"),
+                "message": f"前 {int(configured_rules['defaults']['status_window_lines'])} 行无状态行",
+            })
+    elif status and _rule_enabled(configured_rules, "R1"):
         # R1 完成未收口（非豁免；只检查状态行主干=去括号内容，避免
         # "（…仍为规划…）"类括号说明误报；状态行自身已含完成标记 → 不命中）
-        status_stem = re.sub(r"[（(][^（）()]*[）)]", "", status)
+        if bool(r1["status_stem_parentheses"]):
+            status_stem = re.sub(r"[（(][^（）()]*[）)]", "", status)
+        else:
+            status_stem = status
         stem_lower = status_stem.lower()
-        if not exempt and not DONE_MARKS.search(status) and any(
-                h.lower() in stem_lower for h in STALE_HINTS):
-            body_head = "\n".join(text.splitlines()[:200])
-            if DONE_MARKS.search(body_head):
+        stale_hints = tuple(str(value) for value in r1["stale_status_hints"])
+        done_marks = _compile_markers(r1["done_markers"])
+        status_has_done = done_marks.search(status) is not None
+        if not exempt and (not bool(r1["ignore_status_done_markers"]) or not status_has_done) and any(
+                hint.lower() in stem_lower for hint in stale_hints):
+            body_window = int(configured_rules["defaults"]["body_window_lines"])
+            body_head = "\n".join(text.splitlines()[:body_window])
+            if done_marks.search(body_head):
                 findings.append({
-                    "rule": "R1", "level": "warn",
+                    "rule": "R1", "level": _rule_level(configured_rules, "R1"),
                     "message": f"状态行含未收口词但正文含完成标记：{status[:60]}",
                 })
 
     # R3 状态行滞后：关联源代码提交晚于文档更新日期（保守粗关联，需人工确认）。
-    if updated:
+    if updated and _rule_enabled(configured_rules, "R3"):
         changes = source_changes
         if changes is None:
-            changes = _source_changes(repo_root, updated)
-        related = _related_source_change(doc, text, updated, changes)
+            changes = _source_changes(repo_root, updated, str(r3["source_root"]))
+        related = _related_source_change(
+            doc, text, updated, changes, str(r3["source_root"]),
+            {str(value) for value in r3["topic_stop_words"]},
+        )
         if related:
             change, matched_path = related
             findings.append({
-                "rule": "R3", "level": "info",
+                "rule": "R3", "level": _rule_level(configured_rules, "R3"),
                 "message": (
                     f"更新日期 {updated} 早于关联代码提交 "
                     f"{change['commit'][:12]} ({change['date']}, {matched_path})"
@@ -301,18 +329,25 @@ def scan_doc(doc: Path, repo_root: Path, since: datetime | None,
             })
 
     # R4 链接失效（以文档所在目录为基）
-    for text_label, href in _extract_links(text):
-        if not _check_link(href, doc.parent):
+    if _rule_enabled(configured_rules, "R4"):
+        ignored_schemes = tuple(str(value) for value in r4["ignored_schemes"])
+        for text_label, href in _extract_links(text, ignored_schemes):
+            if _check_link(href, doc.parent, bool(r4["decode_url_path"])):
+                continue
             findings.append({
-                "rule": "R4", "level": "warn",
+                "rule": "R4", "level": _rule_level(configured_rules, "R4"),
                 "message": f"失效链接 [{text_label}]({href})",
             })
 
     # R2 未提交登记：仅给实际改动的文档命中，避免每份文档重复同一全局告警。
-    dirty = dirty_docs if dirty_docs is not None else _dirty_doc_paths(repo_root)
-    if rel in dirty:
+    if _rule_enabled(configured_rules, "R2"):
+        git_scope = str(_rule_parameters(configured_rules, "R2")["git_scope"])
+        dirty = dirty_docs if dirty_docs is not None else _dirty_doc_paths(repo_root, git_scope)
+    else:
+        dirty = {}
+    if _rule_enabled(configured_rules, "R2") and rel in dirty:
         findings.append({
-            "rule": "R2", "level": "warn",
+            "rule": "R2", "level": _rule_level(configured_rules, "R2"),
             "message": f"当前文档有未提交改动（git status: {dirty[rel]}）",
         })
 
@@ -326,7 +361,11 @@ def scan_doc(doc: Path, repo_root: Path, since: datetime | None,
 
 
 def scan_all(since: timedelta | None, fail_level: str,
-             out_dir: Path | None = None) -> dict:
+             out_dir: Path | None = None,
+             rules: Mapping[str, Any] | None = None) -> dict:
+    configured_rules = DEFAULT_RULES if rules is None else validate_rules(rules)
+    r3 = _rule_parameters(configured_rules, "R3")
+    r2 = _rule_parameters(configured_rules, "R2")
     since_date = datetime.now() - since if since else None
 
     docs = []
@@ -341,21 +380,31 @@ def scan_all(since: timedelta | None, fail_level: str,
         if updated:
             update_dates.append(updated)
 
-    dirty_docs = _dirty_doc_paths(REPO_ROOT)
-    source_changes = _source_changes(REPO_ROOT, min(update_dates)) if update_dates else []
+    dirty_docs = (
+        _dirty_doc_paths(REPO_ROOT, str(r2["git_scope"]))
+        if _rule_enabled(configured_rules, "R2") else {}
+    )
+    source_changes = (
+        _source_changes(REPO_ROOT, min(update_dates), str(r3["source_root"]))
+        if update_dates and _rule_enabled(configured_rules, "R3") else []
+    )
     results = []
     for doc in docs:
         results.append(scan_doc(
             doc, REPO_ROOT, since_date,
             dirty_docs=dirty_docs, source_changes=source_changes,
+            rules=configured_rules,
         ))
 
+    rule_names = {
+        str(rule["id"]): str(rule["name"])
+        for rule in configured_rules["rules"]
+    }
     out = {
         "run_ts": datetime.now().isoformat(timespec="seconds"),
-        "rules": {
-            "R1": "完成未收口", "R2": "未提交登记", "R3": "状态行滞后",
-            "R4": "链接失效", "R5": "状态行缺失",
-        },
+        "rules": rule_names,
+        "ruleset_version": configured_rules["ruleset_version"],
+        "rules_fingerprint": rules_fingerprint(configured_rules),
         "docs": results,
     }
     _write_outputs(out, out_dir or OUT_DIR)

@@ -56,3 +56,13 @@ def test_rules_loader_rejects_duplicate_and_unknown_rule_ids():
     unknown["rules"][0]["id"] = "R9"
     with pytest.raises(RulesConfigError, match="unknown rule id"):
         validate_rules(unknown)
+
+
+def test_rules_loader_rejects_incomplete_rule_parameters():
+    rules = load_rules()
+    malformed = json.loads(json.dumps(rules))
+    r1 = next(rule for rule in malformed["rules"] if rule["id"] == "R1")
+    del r1["parameters"]["done_markers"]
+
+    with pytest.raises(RulesConfigError, match="R1.done_markers"):
+        validate_rules(malformed)

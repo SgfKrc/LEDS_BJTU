@@ -23,4 +23,4 @@ The loader rejects an unknown schema, missing rule IDs, duplicate IDs, invalid l
 | `R4` | `warn` | A repository-relative Markdown link has no file target. |
 | `R5` | `info` | The first 12 lines have no status line. |
 
-`DOCAGENT-P1B` makes the scanner consume these parameters and records the ruleset fingerprint in each audit report. The R1-R5 finding shape, messages, and ordering remain compatible with the pre-data scanner.
+`DOCAGENT-P1B` makes the scanner consume these parameters and records the ruleset fingerprint in each audit report. The R1-R5 finding shape, messages, and ordering remain compatible with the pre-data scanner. The scanner also accepts a validated rules payload in tests and future gate tooling, while the default CLI loads this file.

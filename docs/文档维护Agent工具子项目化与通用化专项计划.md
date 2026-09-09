@@ -1,6 +1,6 @@
 # 文档维护 Agent 工具子项目化与通用化专项计划
 
-> 状态：**`DOCAGENT-P1A` 已完成本机开发门，下一票为 `DOCAGENT-P1B`**；目标 = 将本仓库已有 `docs/agent_tool` 套件抽成**通用子项目 docagent**（各项目通用的文档维护 agent 工具），规则**数据化**为初始规则文档，并交付**规则变更后的机械扫描工具**；"允许 agent 修改维护规则"列为将来门控能力
+> 状态：**`DOCAGENT-P5B` 已完成本机开发门，P5 规则演进门控阶段完成**；目标 = 将本仓库已有 `docs/agent_tool` 套件抽成**通用子项目 docagent**（各项目通用的文档维护 agent 工具），规则**数据化**为初始规则文档，并交付**规则变更后的机械扫描工具**；"允许 agent 修改维护规则"列为将来门控能力
 >
 > 创建日期：2026-09-08
 > 适用范围：文档维护工具的子项目化与规则演进机制；不覆盖文档内容自动改写、语义总结生成、跨项目内容标准统一。与 [文档维护 Agent 工具设计](文档维护Agent工具设计.md)（M1-M3 原始设计）、[小模型轻量推理harness工作台调研与方案](小模型轻量推理harness工作台调研与方案.md) 的关系见 §9。
@@ -180,7 +180,7 @@ proposed ──preflight(§5)──> gates ──> approved ──> released
 
 **当前执行顺序**：`DOCAGENT-P1A → P1B → P2A → P2B → P3A → P3B → P4A → P4B → P5A → P5B`。P1A/P1B/P2A/P3A 不依赖 GPU、网络、LLM 或第二台设备，可连续开发；M2/M3 provider 只在对应可选票中接入，不阻塞 core。
 
-**当前票状态**：`DOCAGENT-P1A` 已完成：新增 `docs/agent_tool/rules.yaml`、`RULES.md` 与 `docagent_rules.py`，完成 v1 schema、R1-R5 参数、版本校验、结构校验和稳定指纹 API；扫描器仍保持旧实现，等 `DOCAGENT-P1B` 通过等价回归后再切换为数据驱动。
+**当前票状态**：`DOCAGENT-P5B` 已完成：扫描报告新增完整内容 `report_fingerprint`，新增 `gate` artifact 与 `gate verify` 规则/报告/基线/演进绑定门；报告或规则文件篡改会 fail-closed，`gate rescan` 提供 revert 后基线重扫路径；新增独立可选 M3 SQLite 事件适配器，默认扫描仍不依赖 SQLite。P5 规则演进门控阶段完成。
 
 ## 8. 风险与边界
 
@@ -202,3 +202,12 @@ proposed ──preflight(§5)──> gates ──> approved ──> released
 - 2026-09-08：初版（现状盘点 + 子项目化方案 + 初始规则文档设计 + 变更机械扫描工具 + P0-P5 计划）
 - 2026-09-08：v2 —— 将 P0-P5 阶段拆为 `DOCAGENT-P0` 至 `DOCAGENT-P5B` 十一张开发票，冻结依赖顺序、core 与可选 provider 的边界，以及每票开发门；下一票为 `DOCAGENT-P1A`。
 - 2026-09-09：完成 `DOCAGENT-P1A` 本机开发门：规则数据文件、规则人读说明、stdlib 优先的加载/校验/指纹 API 与 6 项专项测试；下一票切换为 `DOCAGENT-P1B`。
+- 2026-09-09：完成 `DOCAGENT-P1B` 本机开发门：scanner 改为读取规则数据，审计报告绑定规则集指纹，新增默认等价与规则参数生效回归；下一票切换为 `DOCAGENT-P2A`。
+- 2026-09-09：完成 `DOCAGENT-P2A` 本机开发门：新增独立 `tools/docagent` 包、stdlib core、规则合同副本、`scan/rules/audit/init` CLI、`pyproject.toml` 和外部 cwd 回归；下一票切换为 `DOCAGENT-P2B`。
+- 2026-09-09：完成 `DOCAGENT-P2B` 本机开发门：主项目 M1 入口改为独立包兼容委托，保留 `build/doc-audit` 输出、退出码和 M2/M3 扩展分流；新增旧/新逐文档 finding 等价回归；下一票切换为 `DOCAGENT-P3A`。
+- 2026-09-09：完成 `DOCAGENT-P3A` 本机开发门：新增 profile schema、`qlh`/`minimal` 内置 profile、项目级 `.docagent/profile.yaml`、`docs_dir`/递归扫描/exclude/词表/Git 开关，以及跨 cwd、嵌套文档和绝对路径泄漏回归；下一票切换为 `DOCAGENT-P3B`。
+- 2026-09-09：完成 `DOCAGENT-P3B` 本机开发门：新增统一 JSON/Markdown/text renderer、`--markdown` 与格式互斥约束、按格式写出报告、配置错误诊断和 `tools/docagent/CI.md`；新增 15 项输出/门控/错误回归，确认 JSON stdout 可直接被 CI 解析；下一票切换为 `DOCAGENT-P4A`。
+- 2026-09-09：完成 `DOCAGENT-P4A` 本机开发门：新增 baseline schema、`audit --lock`、`--baseline`/`--dry-run` 校验、rules fingerprint/profile 匹配门和 `rules diff` 结构化字段差异；新增 48 项相关回归，并验证 baseline 与 diff 输出不含绝对路径；下一票切换为 `DOCAGENT-P4B`。
+- 2026-09-09：完成 `DOCAGENT-P4B` 本机开发门：新增 baseline dry-run 增量矩阵 `new/gone/changed/affected_docs`、文档 hash/新增/删除明细和 `--max-new`/`--max-gone` 阈值门；新增 49 项相关回归，确认 dry-run 不改 baseline 且规则/profile 指纹不匹配仍拒绝比较；下一票切换为 `DOCAGENT-P5A`。
+- 2026-09-09：完成 `DOCAGENT-P5A` 本机开发门：新增 `rules evolve` 状态机与 `qlh.docagent.evolution.v1`/`qlh.docagent.approval.v1` 合同，强制 `change_note`，绑定候选规则集指纹与人工审批，低风险变更自动放行，新增/删除 `warn/error` 规则和等级变化 fail-closed；新增 4 项专项回归并更新 README/CI 用法；下一票切换为 `DOCAGENT-P5B`。
+- 2026-09-09：完成 `DOCAGENT-P5B` 本机开发门：扫描报告加入自指纹，新增 `qlh.docagent.gate.v1` / `gate verify` 的规则、报告、profile、baseline、evolution 绑定，新增 `gate rescan` 回滚重扫入口与可选 `qlh.docagent.events.v1` SQLite M3 事件适配；篡改报告/规则/门禁 artifact 均被拒绝，revert 后可重建零差异；新增 4 项专项回归，P5 阶段完成。

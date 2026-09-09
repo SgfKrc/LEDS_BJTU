@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qlh-docagent"
+version = "0.1.0"
+description = "Read-only, data-driven documentation maintenance scanner"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+docagent = "docagent.cli:main"
+
+[tool.setuptools]
+include-package-data = false
+packages = ["docagent"]
+
+[tool.setuptools.package-data]
+docagent = ["data/*.yaml", "data/profiles/*.yaml"]
+
+[tool.setuptools.exclude-package-data]
+docagent = ["__pycache__/*", "*.pyc"]
