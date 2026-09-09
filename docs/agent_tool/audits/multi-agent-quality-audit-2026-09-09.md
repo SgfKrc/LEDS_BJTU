@@ -84,35 +84,39 @@
 这些项目不能在没有上游可信材料或运行环境的情况下伪造为已修复：
 
 1. `AUD-PIN-01` 已关闭：四个远程预设现在有官方仓库的完整 revision、允许/必需文件清单和逐权重 SHA-256，下载服务会固定版本并 fail-closed 校验。当前环境未执行真实模型下载，仍需在有发布源网络和足够磁盘的环境完成联网验收。
-2. MiniCPM4 的 `trust_remote_code=True` 仍是架构兼容探测所需能力；当前已隔离探测环境并强制离线，但尚未具备 OS 级沙箱。生产探测仍应在专用低权限进程/容器中执行。
+2. `AUD-SBX-01` 已关闭：MiniCPM4 的 `trust_remote_code=True` 探测现在运行在 OS 级低权限 worker 中；Linux/macOS 使用 sandbox backend，Windows 使用 restricted token + low-integrity token + Job Object，并对 metadata 使用一次性 snapshot。Windows 低完整性不提供内核级禁网，因此仍强制离线环境变量，网络隔离增强不作为已完成能力宣称。
 3. `AUD-AUTH-01` 已关闭：模型 API 的认证/来源门、Bearer 透传和 control-svc loopback 默认绑定已完成；跨机部署仍必须显式配置受控 CIDR/Tailnet 和防火墙策略。
 4. 尚缺真实 llama-cpp/MiniCPM4 runtime smoke、实际 model switch/load 负向场景和完整 MCP 负向 UI 自动门；本轮只把静态/fixture 契约和可控失败路径补到稳定回归。
 
 ## 待完成工作统计
 
-统计口径：按可以独立验收的行动计数；复合发现拆分为独立工作项。截至 `AUD-PIN-01` 关闭后，共有 **5 项** 待完成工作，分为 **3 类**：
+统计口径：按可以独立验收的行动计数；复合发现拆分为独立工作项。截至 `AUD-SBX-01` 关闭后，共有 **4 项** 待完成工作，分为 **2 类**：
 
 | 类别 | 数量 | 待完成项 |
 | --- | ---: | --- |
-| 发布/安全阻断 | 1 | 为 MiniCPM4 `trust_remote_code` 探测增加 OS 级低权限沙箱 |
 | 真实运行验收 | 2 | 在真实依赖环境执行 llama-cpp/MiniCPM4 runtime smoke；补真实模型 load/switch 成功与失败场景断言 |
 | 自动化回归与契约 | 2 | 补完整 MCP 负向 UI 自动门；完成 CyberGothic Playwright 全量回归 |
 
-当前已完成代码回归、三个前端构建和全量 Python suite；上述 5 项仍不能以 fixture 定向测试或构建成功替代，按后续验收顺序逐项关闭。
+当前已完成代码回归、三个前端构建和全量 Python suite；上述 4 项仍不能以 fixture 定向测试或构建成功替代，按后续验收顺序逐项关闭。
 
 ## 后续验收顺序
 
 ### AUD-AUTH-01 已关闭
 
-模型 API 的认证/来源门已按后续开发票完成：gateway 对模型 registry/GGUF/download 使用 Web Bearer 和管理员角色；单体 api_server 与 inference-svc 默认只接受 loopback，跨机来源必须显式配置 `QLH_MODEL_API_TRUSTED_CIDRS`；control-svc 默认绑定 `127.0.0.1`。相关来源门、Bearer 透传和 HTTP 拒绝测试已通过。原清单中的该项因此从待完成统计中扣除，当前剩余 5 项按下列顺序执行。
+模型 API 的认证/来源门已按后续开发票完成：gateway 对模型 registry/GGUF/download 使用 Web Bearer 和管理员角色；单体 api_server 与 inference-svc 默认只接受 loopback，跨机来源必须显式配置 `QLH_MODEL_API_TRUSTED_CIDRS`；control-svc 默认绑定 `127.0.0.1`。相关来源门、Bearer 透传和 HTTP 拒绝测试已通过。原清单中的该项因此从待完成统计中扣除，当前剩余 4 项按下列顺序执行。
 
 1. 在有发布源网络和足够磁盘的环境跑四个 pin 工件的真实下载、注册和 `llm_smoke_matrix`。
-2. 在专用 sidecar/容器中跑 MiniCPM4 模板/thinking 探测和 llama-cpp 架构兼容探针。
-3. 补真实模型 load/switch 的成功和失败断言。
-4. 增加完整 MCP 负向 UI 自动门并执行 CyberGothic Playwright 全量回归；fixture 定向通过不能替代这两项验收。
+2. 用固定工件和真实 llama-cpp/MiniCPM4 runtime 跑模板/thinking/架构兼容 smoke，并补真实模型 load/switch 的成功和失败断言。
+3. 增加完整 MCP 负向 UI 自动门并执行 CyberGothic Playwright 全量回归；fixture 定向通过不能替代这两项验收。
 
 ## `AUD-PIN-01` 复核结论
 
 - 四个新模型的 pin 文件为 `docs/agent_tool/model-artifacts/remote-model-pins-2026-09-09.json`，包含仓库 revision、下载白名单、必需文件和权重文件 SHA-256。
 - 下载链已把 pin 约束传递到 Hugging Face `snapshot_download`，并在发布前验证文件集合和逐文件哈希；pin 缺失、非法、缺文件、越界路径或哈希不匹配都会阻断 job。
 - 专项测试 `tests/test_model_download_jobs.py`：`15 passed, 1 skipped`。真实模型下载和 runtime smoke 留给具备网络、磁盘和运行时依赖的后续验收票。
+
+## `AUD-SBX-01` 复核结论
+
+- `scripts/model_tools/sandbox_runner.py` 已成为模板 worker 的唯一启动路径；无 OS sandbox backend 时返回 `os_sandbox_unavailable`，不会退回普通 `subprocess`。
+- Windows 实机验证通过：`windows-restricted-token-low-integrity` worker 成功启动并完成 MiniCPM4 tokenizer/template 探测；权重未加载，metadata snapshot 在 worker 退出后清理。
+- `tests/test_small_model_probe.py` + `tests/test_model_probe_sandbox.py`：`9 passed`。Windows low-integrity 不能等同于内核级网络隔离，当前网络控制仍是 sandbox 外的 offline 环境变量，已明确记录为后续增强项。
