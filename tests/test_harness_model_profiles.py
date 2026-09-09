@@ -167,6 +167,17 @@ def test_registry_selects_profiles_and_reports_diff(tmp_path: Path) -> None:
     assert registry.rollback("test-small", backend="llama_server", revision="fixture-v1").digest == candidate.digest
 
 
+def test_registry_alias_keeps_selection_filters(tmp_path: Path) -> None:
+    registry = ProfileRegistry(tmp_path / "profiles")
+    candidate = _profile().with_updates(aliases=("legacy-small",))
+    registry.register(candidate)
+
+    selected = registry.get("legacy-small", backend="llama_server", artifact_sha256="a" * 64)
+    assert selected is not None
+    assert selected.digest == candidate.digest
+    assert registry.get("legacy-small", backend="pytorch") is None
+
+
 def test_registry_rejects_filename_digest_tampering(tmp_path: Path) -> None:
     registry = ProfileRegistry(tmp_path / "profiles")
     path = registry.register(_profile())
