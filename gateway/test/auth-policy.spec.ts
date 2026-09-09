@@ -36,6 +36,9 @@ describe('MF-AUTH-N1A gateway authorization policy', () => {
     expect(accessLevelFor('POST', '/api/auth/login')).toBe('public');
     expect(accessLevelFor('POST', '/api/cluster/nodes/register')).toBe('machine');
     expect(accessLevelFor('GET', '/api/models/files/model.gguf')).toBe('machine');
+    expect(accessLevelFor('GET', '/api/models/gguf')).toBe('manager');
+    expect(accessLevelFor('GET', '/api/models/download/model.gguf')).toBe('manager');
+    expect(accessLevelFor('GET', '/api/models/downloadable')).toBe('machine');
   });
 
   it('classifies member work and manager mutations separately', () => {
@@ -44,6 +47,7 @@ describe('MF-AUTH-N1A gateway authorization policy', () => {
     expect(accessLevelFor('GET', '/api/auth/tailscale/local-status')).toBe('authenticated');
     expect(accessLevelFor('GET', '/api/users')).toBe('manager');
     expect(accessLevelFor('POST', '/api/models/load')).toBe('manager');
+    expect(accessLevelFor('GET', '/api/models/downloads')).toBe('manager');
     expect(accessLevelFor('POST', '/api/models/local-assets/qwen3-4b/preflight')).toBe('authenticated');
     expect(accessLevelFor('PATCH', '/api/cluster/settings')).toBe('manager');
   });

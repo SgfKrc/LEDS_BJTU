@@ -87,10 +87,10 @@ export class ControlController {
   @All('users') usersRoot(@Req() r: FastifyRequest) { return this.forward(r, true, true, true); }
   @All('users/*') usersSub(@Req() r: FastifyRequest) { return this.forward(r, true, true, true); }
 
-  @All('models/registry') registryRoot(@Req() r: FastifyRequest) { return this.forward(r, true); }
-  @All('models/registry/*') registrySub(@Req() r: FastifyRequest) { return this.forward(r, true); }
-  @All('models/gguf') gguf(@Req() r: FastifyRequest) { return this.forward(r, true); }
-  @All('models/download/*') downloadSub(@Req() r: FastifyRequest) { return this.forward(r, true); }
+  @All('models/registry') registryRoot(@Req() r: FastifyRequest) { return this.forward(r, true, true); }
+  @All('models/registry/*') registrySub(@Req() r: FastifyRequest) { return this.forward(r, true, true); }
+  @All('models/gguf') gguf(@Req() r: FastifyRequest) { return this.forward(r, true, true); }
+  @All('models/download/*') downloadSub(@Req() r: FastifyRequest) { return this.forward(r, true, true); }
 
   // MODEL-FLEET local control plane. These paths are intentionally exact so
   // inference-owned /api/models/current|load|switch routes remain untouched.
