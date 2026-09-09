@@ -125,6 +125,25 @@ class SessionStore:
             )
         return record
 
+    def list(self, *, owner_scope: str = "local", limit: int = 50) -> list[SessionRecord]:
+        """Return the most recently active sessions for one local owner scope."""
+        owner_scope = _scope(owner_scope)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session limit is invalid") from exc
+        if not 1 <= limit <= 200:
+            raise ValueError("session limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM sessions WHERE owner_scope = ? ORDER BY updated_at DESC, created_at DESC LIMIT ?",
+                (owner_scope, limit),
+            ).fetchall()
+        return [
+            SessionRecord(row["session_id"], row["owner_scope"], row["title"], row["created_at"], row["updated_at"])
+            for row in rows
+        ]
+
     def get(self, session_id: str, *, owner_scope: str | None = None) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .budget import ContextBudget
 from .notices import ContextNotice
@@ -18,6 +18,7 @@ from .summarize import (
 )
 from .tokenizer import HeuristicTokenizer, TokenCounter, count_message
 from .types import ContextLedgerEntry, ContextMessage
+from ..memory.extract import MemoryCandidate, extract_memory_candidates
 
 
 class ContextBuildError(ValueError):
@@ -57,6 +58,9 @@ class ContextSnapshot:
     notices: tuple[ContextNotice, ...] = ()
     ledger: tuple[ContextLedgerEntry, ...] = ()
     summarized_message_ids: tuple[str, ...] = ()
+    memory_entry_ids: tuple[str, ...] = ()
+    memory_candidates: tuple[Mapping[str, object], ...] = ()
+    memory_write_error: str | None = None
 
     @property
     def input_budget(self) -> int:
@@ -71,6 +75,9 @@ class ContextSnapshot:
             "notices": [notice.as_dict() for notice in self.notices],
             "ledger": [entry.as_dict() for entry in self.ledger],
             "summarized_message_ids": list(self.summarized_message_ids),
+            "memory_entry_ids": list(self.memory_entry_ids),
+            "memory_candidates": [dict(item) for item in self.memory_candidates],
+            "memory_write_error": self.memory_write_error,
         }
 
 
@@ -90,6 +97,9 @@ class ContextPolicy:
         state: Mapping[str, object] | None = None,
         state_patch: Mapping[str, object] | None = None,
         allow_state_delete: bool = False,
+        memory_store: Any | None = None,
+        memory_owner_scope: str = "local",
+        memory_source_session_id: str | None = None,
     ) -> ContextSnapshot:
         normalized = [ContextMessage.from_value(value) for value in messages]
         if not normalized:
@@ -220,6 +230,36 @@ class ContextPolicy:
                 if summary_tokens > summary_budget:
                     summary_message = None
                     summary_tokens = 0
+        memory_entry_ids: tuple[str, ...] = ()
+        memory_candidates: tuple[Mapping[str, object], ...] = ()
+        memory_write_error: str | None = None
+        if memory_store is not None and omitted_messages:
+            memory_entry_ids, memory_candidates, memory_write_error = self._persist_memory(
+                memory_store,
+                memory_owner_scope,
+                memory_source_session_id,
+                omitted_messages,
+                summary_result,
+            )
+            if memory_candidates:
+                notices.append(
+                    ContextNotice(
+                        code="context.memory_persisted" if not memory_write_error else "context.memory_write_failed",
+                        message=(
+                            "High-signal facts from the compressed turns were persisted to user-owned memory."
+                            if memory_entry_ids and not memory_write_error
+                            else "Some high-signal memory candidates were persisted, but others could not be written."
+                            if memory_entry_ids
+                            else "High-signal memory candidates were found but could not be persisted."
+                        ),
+                        severity="info" if memory_entry_ids and not memory_write_error else "warning",
+                        details={
+                            "candidate_count": len(memory_candidates),
+                            "written_count": len(memory_entry_ids),
+                            "error": memory_write_error,
+                        },
+                    )
+                )
         final_messages = self._order_fixed_and_recent(fixed, summary_message, retained_recent)
         final_tokens = sum(token_costs.get(id(message), count_message(self.tokenizer, message)) for message in final_messages)
         if final_tokens > input_budget:
@@ -273,6 +313,45 @@ class ContextPolicy:
             notices=tuple(notices),
             ledger=ledger,
             summarized_message_ids=summary_result.source_message_ids if omitted_messages else (),
+            memory_entry_ids=memory_entry_ids,
+            memory_candidates=memory_candidates,
+            memory_write_error=memory_write_error,
+        )
+
+    def _persist_memory(
+        self,
+        memory_store: Any,
+        owner_scope: str,
+        source_session_id: str | None,
+        messages: Sequence[ContextMessage],
+        summary: SummaryResult,
+    ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str | None]:
+        candidates = extract_memory_candidates(messages, summary)
+        if not candidates:
+            return (), (), None
+        entry_ids: list[str] = []
+        errors: list[str] = []
+        for candidate in candidates:
+            try:
+                entry = memory_store.add(
+                    kind=candidate.kind,
+                    content=candidate.content,
+                    owner_scope=owner_scope,
+                    source_session_id=source_session_id,
+                    source_message_id=candidate.source_message_ids[0] if candidate.source_message_ids else None,
+                    metadata={
+                        "extraction": "context_policy_v1",
+                        "source_message_ids": list(candidate.source_message_ids),
+                    },
+                    deduplicate=True,
+                )
+                entry_ids.append(str(entry.entry_id))
+            except Exception as exc:  # pragma: no cover - defensive boundary for optional persistence
+                errors.append(type(exc).__name__)
+        return (
+            tuple(entry_ids),
+            tuple(candidate.as_dict() for candidate in candidates),
+            ",".join(sorted(set(errors))) if errors else None,
         )
 
     def _group_turns(self, messages: Sequence[ContextMessage]) -> list[list[ContextMessage]]:
