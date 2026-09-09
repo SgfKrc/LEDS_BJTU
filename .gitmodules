@@ -1,3 +1,6 @@
 [submodule "android/app/src/main/cpp/llama.cpp"]
 	path = android/app/src/main/cpp/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "tools/docagent"]
+	path = tools/docagent
+	url = https://github.com/SgfKrc/qlh-docagent.git
