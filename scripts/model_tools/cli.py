@@ -16,6 +16,7 @@ from .qwen3_pipeline_smoke import run_qwen3_pipeline_smoke
 from .qwen3_pipeline_chain_smoke import run_qwen3_pipeline_chain_smoke
 from .llm_smoke_matrix import run_smoke_matrix
 from .tool_capability import run_capability_matrix, probe_model_asset, _fixture_from_path
+from .small_model_probe import run_b1_probe, run_dsw_d1
 from .lora import inspect_lora
 from .maintenance import clean_models, model_disk_usage
 from .sd15_batch import run_prompt_batch, run_sampler_matrix
@@ -138,6 +139,31 @@ def _parser() -> argparse.ArgumentParser:
     capability.add_argument("--runtime", default="")
     capability.add_argument("--output", type=Path, default=None)
     capability.add_argument("--json", action="store_true", dest="as_json")
+    b1 = commands.add_parser(
+        "small-model-b1-probe",
+        aliases=["small_model_b1_probe"],
+        help="probe small-model templates, stop tokens and GGUF architecture without loading weights",
+    )
+    b1.add_argument("--model-id", action="append", default=[])
+    b1.add_argument("--model", action="append", type=Path, default=[])
+    b1.add_argument("--execute-template", action="store_true", help="run tokenizer.apply_chat_template in the isolated sidecar")
+    b1.add_argument("--run-gguf-smoke", action="store_true", help="also run the optional MiniCPM4 GGUF runtime smoke")
+    b1.add_argument("--full-hash", action="store_true")
+    b1.add_argument("--timeout-seconds", type=float, default=60.0)
+    b1.add_argument("--output", type=Path, default=None)
+    b1.add_argument("--json", action="store_true", dest="as_json")
+    dsw = commands.add_parser(
+        "dsw-d1-probe",
+        aliases=["dsw_d1_probe"],
+        help="validate the DistilQwen DS3 manifest, GGUF and conversion plan",
+    )
+    dsw.add_argument("--model-id", default="distilqwen25-ds3-0324-7b")
+    dsw.add_argument("--outtype", default="Q4_K_M")
+    dsw.add_argument("--execute-template", action="store_true")
+    dsw.add_argument("--full-hash", action="store_true")
+    dsw.add_argument("--timeout-seconds", type=float, default=60.0)
+    dsw.add_argument("--output", type=Path, default=None)
+    dsw.add_argument("--json", action="store_true", dest="as_json")
     native_probe = commands.add_parser(
         "gemma4-native-probe",
         aliases=["gemma4_native_probe"],
@@ -358,6 +384,23 @@ def _human(command: str, report: dict[str, Any]) -> None:
                 print(f"  - {error.get('code')}: {error.get('message')}")
             else:
                 print(f"  - {error}")
+        return
+    if command in {"small-model-b1-probe", "small_model_b1_probe"}:
+        summary = report.get("summary", {})
+        print(f"{'PASS' if report.get('gate_passed') else 'WARN/FAIL'}: {report.get('tool')}")
+        print(f"models={summary.get('models_total', 0)} passed={summary.get('models_passed', 0)} static_gate={summary.get('static_gate_passed')}")
+        for item in report.get("models", []):
+            architecture = item.get("architecture", {})
+            source = item.get("safetensors", {})
+            print(f"  {item.get('model_id')}: thinking={source.get('template', {}).get('thinking', {}).get('status')} architecture={architecture.get('status')} gguf={item.get('gguf', {}).get('valid')}")
+        return
+    if command in {"dsw-d1-probe", "dsw_d1_probe"}:
+        conversion = report.get("conversion", {})
+        print(f"{'PASS' if report.get('gate_passed') else 'WARN/FAIL'}: {report.get('tool')} model={report.get('model_id')}")
+        print(f"safetensors={report.get('safetensors', {}).get('valid')} gguf={report.get('gguf', {}).get('valid')} architecture={report.get('architecture', {}).get('status')} conversion_plan={conversion.get('plan_valid')}")
+        for error in conversion.get("errors", []):
+            if isinstance(error, dict):
+                print(f"  - {error.get('code')}: {error.get('message')}")
         return
     if command in {"gemma4-native-probe", "gemma4_native_probe"}:
         state = "READY" if report.get("gate_passed") else report.get("status", "UNKNOWN").upper()
@@ -623,6 +666,29 @@ def main(argv: list[str] | None = None) -> int:
             if args.output is not None:
                 _ensure_output_outside_roots(args.output, [ROOT / "models"])
                 write_json(args.output, report)
+        elif args.command in {"small-model-b1-probe", "small_model_b1_probe"}:
+            _ensure_output_outside_roots(args.output, [ROOT / "models"])
+            report = run_b1_probe(
+                model_ids=args.model_id or None,
+                paths=args.model or None,
+                execute_template=args.execute_template,
+                run_gguf_smoke=args.run_gguf_smoke,
+                full_hash=args.full_hash,
+                timeout_seconds=args.timeout_seconds,
+            )
+            if args.output is not None:
+                write_json(args.output, report)
+        elif args.command in {"dsw-d1-probe", "dsw_d1_probe"}:
+            _ensure_output_outside_roots(args.output, [ROOT / "models"])
+            report = run_dsw_d1(
+                model_id=args.model_id,
+                outtype=args.outtype,
+                execute_template=args.execute_template,
+                full_hash=args.full_hash,
+                timeout_seconds=args.timeout_seconds,
+            )
+            if args.output is not None:
+                write_json(args.output, report)
         elif args.command in {"gemma4-native-probe", "gemma4_native_probe"}:
             report = run_native_probe(
                 model=args.model,
@@ -704,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report = sweep_models(args.root, full_hash=args.full_hash)
     except (OSError, GGUFError, ValueError) as exc:
-        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "tool-capability-probe", "tool_capability_probe", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "qwen3-sidecar-probe", "qwen3_sidecar_probe", "qwen3-pipeline-smoke", "qwen3_pipeline_smoke", "qwen3-pipeline-chain-smoke", "qwen3_pipeline_chain_smoke", "gguf-convert", "gguf_convert"}:
+        if args.command in {"sync-status", "models_sync_status", "llm-smoke-matrix", "llm_smoke_matrix", "tool-capability-probe", "tool_capability_probe", "small-model-b1-probe", "small_model_b1_probe", "dsw-d1-probe", "dsw_d1_probe", "gemma4-native-probe", "gemma4_native_probe", "gemma4-native-assets", "gemma4_native_assets", "gemma4-native-ollama-probe", "gemma4_native_ollama_probe", "qwen3-sidecar-probe", "qwen3_sidecar_probe", "qwen3-pipeline-smoke", "qwen3_pipeline_smoke", "qwen3-pipeline-chain-smoke", "qwen3_pipeline_chain_smoke", "gguf-convert", "gguf_convert"}:
             message = str(exc) if isinstance(exc, ValueError) else f"operation failed (errno={getattr(exc, 'errno', None)})"
             tool_by_command = {
                 "gguf-convert": "gguf_convert", "gguf_convert": "gguf_convert",
@@ -716,6 +782,8 @@ def main(argv: list[str] | None = None) -> int:
                 "gemma4-native-probe": "gemma4_native_probe", "gemma4_native_probe": "gemma4_native_probe",
                 "llm-smoke-matrix": "llm_smoke_matrix", "llm_smoke_matrix": "llm_smoke_matrix",
                 "tool-capability-probe": "tool_capability_probe", "tool_capability_probe": "tool_capability_probe",
+                "small-model-b1-probe": "small_model_b1_probe", "small_model_b1_probe": "small_model_b1_probe",
+                "dsw-d1-probe": "dsw_d1_probe", "dsw_d1_probe": "dsw_d1_probe",
             }
             tool = tool_by_command.get(args.command, "models_sync_status")
             operation_by_tool = {
@@ -724,6 +792,8 @@ def main(argv: list[str] | None = None) -> int:
                 "qwen3_sidecar_probe": "qwen3_sidecar_preflight",
                 "llm_smoke_matrix": "matrix",
                 "tool_capability_probe": "probe",
+                "small_model_b1_probe": "matrix",
+                "dsw_d1_probe": "preflight",
                 "gemma4_native_probe": "native_multimodal_preflight",
                 "gemma4_native_assets": "resolve_ollama_gemma4_12b",
                 "gemma4_ollama_native_preflight": "verify_then_native_preflight",
@@ -758,6 +828,10 @@ def main(argv: list[str] | None = None) -> int:
         if not report.get("valid", False):
             return 2
         return 0 if report.get("summary", {}).get("gate_passed", report.get("admission", {}).get("status") != "rejected") else 1
+    if args.command in {"small-model-b1-probe", "small_model_b1_probe", "dsw-d1-probe", "dsw_d1_probe"}:
+        if not report.get("valid", False):
+            return 2
+        return 0 if report.get("gate_passed", False) else 1
     if args.command in {"gemma4-native-probe", "gemma4_native_probe"}:
         if not report.get("valid", False):
             return 2
