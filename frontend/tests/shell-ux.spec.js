@@ -81,6 +81,45 @@ test('UX-03 separates settings and image asset controls from their primary workf
   await page.screenshot({ path: testInfo.outputPath('ux-03-diffusion-generate.png'), fullPage: true });
 });
 
+test('MODEL-CATALOG exposes the four new registered assets in the selectable model control', async ({ page }) => {
+  const models = [
+    ['qwen2.5-0.5b', 'Qwen2.5-0.5B-Instruct', 'Qwen/Qwen2.5-0.5B-Instruct'],
+    ['qwen3-0.6b', 'Qwen3-0.6B', 'Qwen/Qwen3-0.6B'],
+    ['minicpm4-0.5b', 'MiniCPM4-0.5B', 'openbmb/MiniCPM4-0.5B'],
+    ['distilqwen25-ds3-0324-7b', 'DistilQwen2.5-DS3-0324-7B', 'alibaba-pai/DistilQwen2.5-DS3-0324-7B'],
+  ].map(([model_id, name, huggingface_id]) => ({
+    model_id, name, huggingface_id, is_available: true, is_builtin: true,
+    is_experimental: true, model_type: 'both', available_formats: ['safetensors', 'gguf'],
+    supported_engines: ['llama_cpp', 'pytorch'], preferred_engine: 'pytorch',
+    default_quant_type: 'int4', quant_types: ['fp16', 'int8', 'int4', 'Q4_K_M'],
+    max_context: 32768, description: `${name} fixture`,
+  }));
+
+  await installWorkspaceApi(page, {
+    'GET /api/models': { body: { models, active_model_id: null } },
+    'GET /api/models/available': {
+      body: {
+        available_engines: [
+          { id: 'llama_cpp', name: 'llama.cpp + GGUF', description: 'fixture' },
+          { id: 'pytorch', name: 'PyTorch + Safetensors', description: 'fixture' },
+        ],
+        current: null, current_engine: null,
+      },
+    },
+  });
+
+  await page.goto('/');
+  const selector = page.locator('#sidebar-model-select');
+  await expect(selector).toBeVisible();
+  await expect(selector.locator('option')).toHaveCount(4);
+  for (const [modelId, name] of models.map(({ model_id, name }) => [model_id, name])) {
+    await expect(selector.locator(`option[value="${modelId}"]`)).toHaveText(name);
+  }
+  await selector.selectOption('minicpm4-0.5b');
+  await expect(selector).toHaveValue('minicpm4-0.5b');
+  await expect(page.locator('.model-card.compact')).toContainText('MiniCPM4-0.5B');
+});
+
 test('UX-03R reconciles registered models with local fleet assets and edits custom registrations', async ({ page }) => {
   let models = [
     {
