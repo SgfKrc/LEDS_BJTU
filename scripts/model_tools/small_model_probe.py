@@ -322,6 +322,31 @@ def _sidecar_python() -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _template_probe_environment() -> dict[str, str]:
+    """Pass only non-secret process settings to the tokenizer worker."""
+    secret_markers = (
+        "TOKEN", "PASSWORD", "SECRET", "API_KEY", "PRIVATE_KEY",
+        "CREDENTIAL", "AUTHORIZATION",
+    )
+    safe_names = {
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+        "HOME", "USERPROFILE", "HF_HOME", "HF_HUB_CACHE",
+        "TRANSFORMERS_CACHE", "LANG", "LC_ALL",
+    }
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key.upper() in safe_names
+        and not any(marker in key.upper() for marker in secret_markers)
+    }
+    environment.update({
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "NO_PROXY": "*",
+    })
+    return environment
+
+
 def _execute_template(path: Path, *, timeout_seconds: float, trust_remote_code: bool) -> dict[str, Any]:
     if path.is_file():
         return {"status": "skipped", "reason": "gguf_template_is_static_metadata_only"}
@@ -335,10 +360,7 @@ def _execute_template(path: Path, *, timeout_seconds: float, trust_remote_code: 
         "controller_python": str(Path(sys.executable).absolute().resolve(strict=False)),
         "trust_remote_code": trust_remote_code,
     }
-    env = dict(os.environ)
-    env.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1", "NO_PROXY": "*"})
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-        env.pop(name, None)
+    env = _template_probe_environment()
     try:
         completed = subprocess.run(
             [str(python), str(Path(__file__).with_name("small_model_template_probe_worker.py"))],

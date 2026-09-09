@@ -74,3 +74,16 @@ def test_dsw_d1_report_combines_existing_gguf_and_read_only_conversion_plan(monk
     assert report["gate_passed"] is True
     assert report["read_only"] is True
     assert report["conversion"]["plan_valid"] is True
+
+
+def test_template_probe_environment_excludes_secrets(monkeypatch) -> None:
+    monkeypatch.setenv("HF_TOKEN", "should-not-leak")
+    monkeypatch.setenv("QLH_API_KEY", "should-not-leak")
+    monkeypatch.setenv("PATH", "safe-path")
+
+    environment = probe._template_probe_environment()
+
+    assert environment["PATH"] == "safe-path"
+    assert "HF_TOKEN" not in environment
+    assert "QLH_API_KEY" not in environment
+    assert environment["HF_HUB_OFFLINE"] == "1"
