@@ -43,6 +43,9 @@ const MANAGER_PREFIXES = [
   '/api/models/credentials',
   '/api/models/licenses',
   '/api/models/registry',
+  '/api/models/gguf',
+  '/api/models/download',
+  '/api/models/downloads',
   // AND-CTRL-05 前置契约：管理摘要/审计/确认签发只对 owner/admin 开放。
   '/api/auth/manage',
 ];

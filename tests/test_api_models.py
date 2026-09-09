@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import types
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -1298,6 +1299,27 @@ def test_list_model_registry_returns_db_models(monkeypatch):
     monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: db_models)
     result = asyncio.run(api_server.list_model_registry())
     assert result["models"] == db_models
+
+
+def test_list_model_registry_redacts_persisted_paths(monkeypatch):
+    root = Path(api_server.mc._APP_ROOT).resolve()
+    asset_dir = root / "audit-assets" / "custom"
+    db_models = [{
+        "model_id": "m1",
+        "name": "Model 1",
+        "model_type": "both",
+        "model_path": str(asset_dir),
+        "gguf_path": str(asset_dir / "model.gguf"),
+        "expected_paths": [f"Safetensors: {asset_dir}"],
+    }]
+    monkeypatch.setattr(api_server, "_get_registered_experimental_models", lambda: db_models)
+
+    result = asyncio.run(api_server.list_model_registry())
+    payload = result["models"][0]
+    assert payload["model_path"] == "audit-assets/custom"
+    assert payload["gguf_path"] == "audit-assets/custom/model.gguf"
+    assert payload["expected_paths"] == ["Safetensors: audit-assets/custom"]
+    assert str(root) not in repr(payload)
 
 
 # ================================================================

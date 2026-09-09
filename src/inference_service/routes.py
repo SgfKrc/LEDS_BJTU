@@ -24,6 +24,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from api_errors import coded_http_error
+from model_api_access import require_model_api_source
 from diffusion import (
     DiffusionBlobInUseError,
     DiffusionBlobReferencedError,
@@ -283,6 +284,7 @@ def _check_model_registered(model_id: Optional[str], engine: str) -> None:
 
 @router.post("/models/load")
 async def models_load(req: LoadModelRequest, request: Request):
+    require_model_api_source(request)
     engine = _check_load_engine(req.engine)
     _check_model_registered(req.model_id, engine)
     host = _engine_host(request)
@@ -302,11 +304,13 @@ async def models_load(req: LoadModelRequest, request: Request):
 
 @router.post("/models/unload")
 async def models_unload(req: UnloadModelRequest, request: Request):
+    require_model_api_source(request)
     return _engine_host(request).unload_model()
 
 
 @router.post("/models/switch")
 async def models_switch(req: SwitchModelRequest, request: Request):
+    require_model_api_source(request)
     engine = _check_load_engine(req.engine)
     _check_model_registered(req.model_id, engine)
     try:
@@ -317,6 +321,7 @@ async def models_switch(req: SwitchModelRequest, request: Request):
 
 @router.get("/models/current")
 async def models_current(request: Request):
+    require_model_api_source(request)
     return _engine_host(request).current_model()
 
 
@@ -324,24 +329,28 @@ async def models_current(request: Request):
 async def models_list(request: Request):
     """模型注册表 + 文件状态（对齐 api_server /api/models；DB 实验模型
     由 control-svc /models/registry 承载，此处仅内置模型）。"""
+    require_model_api_source(request)
     return _engine_host(request).list_models()
 
 
 @router.get("/models/local-assets")
 async def models_local_assets(request: Request):
     """Read-only inventory of locally present sidecar/task-route assets."""
+    require_model_api_source(request)
     return _engine_host(request).list_local_model_assets()
 
 
 @router.post("/models/local-assets/{model_id}/preflight")
 async def models_local_asset_preflight(request: Request, model_id: str):
     """Run a supported read-only Sidecar preflight; never loads model weights."""
+    require_model_api_source(request)
     return await run_in_threadpool(_engine_host(request).preflight_local_model_asset, model_id)
 
 
 @router.get("/models/available")
 async def models_available(request: Request):
     """可选模型配置 + 可用引擎（对齐 api_server /api/models/available）。"""
+    require_model_api_source(request)
     return _engine_host(request).available_models()
 
 

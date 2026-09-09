@@ -88,4 +88,33 @@ describe('MF-AUTH-N1 gateway auth proxy', () => {
     );
     expect(legacy.request).not.toHaveBeenCalled();
   });
+
+  it('forwards the session Bearer for model registry and GGUF control routes', async () => {
+    const headers = { authorization: 'Bearer model-manager-token' };
+    await controller.registryRoot({
+      method: 'GET',
+      url: '/api/models/registry',
+      headers,
+    } as FastifyRequest);
+    await controller.gguf({
+      method: 'GET',
+      url: '/api/models/gguf',
+      headers,
+    } as FastifyRequest);
+    await controller.downloadSub({
+      method: 'GET',
+      url: '/api/models/download/model.gguf',
+      headers,
+    } as FastifyRequest);
+
+    expect(request).toHaveBeenNthCalledWith(
+      1, 'GET', '/models/registry', undefined, headers,
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      2, 'GET', '/models/gguf', undefined, headers,
+    );
+    expect(request).toHaveBeenNthCalledWith(
+      3, 'GET', '/models/download/model.gguf', undefined, headers,
+    );
+  });
 });

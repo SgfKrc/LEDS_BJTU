@@ -19,6 +19,7 @@ from typing import Any, Iterable
 
 
 MANIFEST_NAME = ".qlh-model-asset.json"
+COMPAT_MANIFEST_NAME = "model.manifest.json"
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _LLM_MODEL_PREFIXES = (
     "qwen", "deepseek", "gemma", "llama", "mistral", "mixtral", "phi",
@@ -62,6 +63,22 @@ def _read_json(path: Path) -> dict[str, Any]:
     except (OSError, ValueError, TypeError, UnicodeDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _manifest_path(directory: Path) -> Path | None:
+    for name in (MANIFEST_NAME, COMPAT_MANIFEST_NAME):
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _safe_asset_id(value: object, fallback: str) -> str:
@@ -160,22 +177,35 @@ def _runtime_profile(model_id: str, config: dict[str, Any]) -> tuple[str, str]:
 
 
 def _manifest_asset(directory: Path, root: Path) -> dict[str, Any] | None:
-    manifest_path = directory / MANIFEST_NAME
+    manifest_path = _manifest_path(directory)
+    if manifest_path is None:
+        return None
     manifest = _read_json(manifest_path)
     if not manifest:
         return None
 
     asset = manifest.get("asset")
     files = manifest.get("files")
+    if manifest_path.name == COMPAT_MANIFEST_NAME and not isinstance(asset, dict):
+        asset = {"asset_id": directory.name}
     if not isinstance(asset, dict) or not isinstance(files, list):
         return None
 
     config = _read_json(directory / "config.json")
     artifact_kind = str(manifest.get("artifact_kind") or "")
+    if not artifact_kind and manifest_path.name == COMPAT_MANIFEST_NAME:
+        model_type = str(manifest.get("model_type") or "")
+        artifact_kind = (
+            "llama.cpp_gguf" if model_type == "gguf"
+            else "transformers_safetensors" if model_type in {"safetensors", "both"}
+            else ""
+        )
     if artifact_kind not in {"transformers_safetensors", "llama.cpp_gguf"}:
         return None
     listed = []
     complete = True
+    hashes_seen = False
+    hashes_complete = True
     for entry in files:
         if not isinstance(entry, dict):
             complete = False
@@ -189,12 +219,27 @@ def _manifest_asset(directory: Path, root: Path) -> dict[str, Any] | None:
             complete = False
             continue
         try:
-            if candidate.stat().st_size > 0:
+            actual_size = candidate.stat().st_size
+            expected_size = entry.get("size", entry.get("size_bytes"))
+            if expected_size is not None and int(expected_size) != actual_size:
+                return None
+            if actual_size > 0:
                 listed.append(candidate)
             else:
                 complete = False
+            expected_hash = entry.get("sha256")
+            if expected_hash is None:
+                hashes_complete = False
+            else:
+                hashes_seen = True
+                if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+                    return None
+                if _sha256_file(candidate) != expected_hash.lower():
+                    return None
         except OSError:
             complete = False
+        except (TypeError, ValueError):
+            return None
     if not complete:
         return None
 
@@ -217,7 +262,7 @@ def _manifest_asset(directory: Path, root: Path) -> dict[str, Any] | None:
         "gguf_files": ggufs,
         "bytes": sum(path.stat().st_size for path in listed),
         "manifest_path": manifest_path,
-        "integrity": "manifest_verified",
+        "integrity": "manifest_verified" if hashes_seen and hashes_complete else "manifest_unverified",
         "architectures": asset.get("architectures") if isinstance(asset.get("architectures"), list) else [],
         "root": root,
     }
@@ -295,7 +340,11 @@ def _merge_assets(parts: list[dict[str, Any]], app_root: Path) -> dict[str, Any]
         "asset_ids": sorted({part["asset_id"] for part in parts}),
         "source_paths": source_paths,
         "manifest_paths": manifest_paths,
-        "integrity": "manifest_verified" if manifest_paths else "filesystem_discovered",
+        "integrity": (
+            "manifest_verified"
+            if manifest_paths and all(part["integrity"] == "manifest_verified" for part in parts)
+            else "manifest_unverified" if manifest_paths else "filesystem_discovered"
+        ),
         "runtime_profile": runtime_profile,
         "runtime_hint": runtime_hint,
         "runtime_status": "inventory_only",
@@ -322,7 +371,7 @@ def discover_local_model_assets(models_root: str | os.PathLike[str] | None = Non
     except OSError:
         directories = []
     for directory in directories:
-        if (directory / MANIFEST_NAME).is_file():
+        if _manifest_path(directory) is not None:
             parts.append(_manifest_asset(directory, root))
         else:
             parts.append(_filesystem_asset(directory, root))
@@ -364,7 +413,8 @@ def resolve_local_model_asset_metadata(model_id: str) -> dict[str, Any] | None:
     model_path = (app_root / Path(str(asset["model_path"]))).resolve()
     if not _is_within(model_path, models_root) or not model_path.is_dir():
         return None
-    manifest = _read_json(model_path / MANIFEST_NAME)
+    manifest_path = _manifest_path(model_path)
+    manifest = _read_json(manifest_path) if manifest_path is not None else {}
     files = manifest.get("files") if isinstance(manifest, dict) else None
     if not isinstance(files, list) or not files:
         return None
@@ -375,7 +425,7 @@ def resolve_local_model_asset_metadata(model_id: str) -> dict[str, Any] | None:
         relative = str(entry.get("path") or "").replace("\\", "/")
         digest = str(entry.get("sha256") or "").lower()
         try:
-            size = int(entry.get("size", 0) or 0)
+            size = int(entry.get("size", entry.get("size_bytes", 0)) or 0)
         except (TypeError, ValueError):
             return None
         if (
@@ -388,6 +438,8 @@ def resolve_local_model_asset_metadata(model_id: str) -> dict[str, Any] | None:
             return None
         try:
             if candidate.stat().st_size != size:
+                return None
+            if _sha256_file(candidate) != digest:
                 return None
         except OSError:
             return None

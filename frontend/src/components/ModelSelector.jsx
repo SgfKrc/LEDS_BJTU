@@ -34,27 +34,35 @@ export default function ModelSelector({ onModelChange, onToast }) {
   const [loading, setLoading] = useState(false);
 
   const fetchData = useCallback(async () => {
-    try {
-      const [runtimeData, modelData] = await Promise.all([
-        fetchAvailableModels(),
-        fetchModels(),
-      ]);
+    const [runtimeResult, modelResult] = await Promise.allSettled([
+      fetchAvailableModels(),
+      fetchModels(),
+    ]);
+
+    if (modelResult.status === 'fulfilled') {
+      const modelData = modelResult.value;
       const models = modelData.models || [];
       setModelCatalog(models);
-      setEngines(runtimeData.available_engines || []);
-      setCurrentQuant(runtimeData.current);
-      setCurrentEngine(runtimeData.current_engine);
       setCurrentModelId(modelData.active_model_id || null);
 
       setSelectedModelId(prev => {
         if (prev && models.some(m => m.model_id === prev)) return prev;
         return modelData.active_model_id || models.find(m => m.is_available)?.model_id || models[0]?.model_id || '';
       });
+    } else {
+      setModelCatalog([]);
+      setCurrentModelId(null);
+    }
+
+    if (runtimeResult.status === 'fulfilled') {
+      const runtimeData = runtimeResult.value;
+      setEngines(runtimeData.available_engines || []);
+      setCurrentQuant(runtimeData.current);
+      setCurrentEngine(runtimeData.current_engine);
       if (runtimeData.current_engine) {
         setSelectedEngine(runtimeData.current_engine);
       }
-    } catch (_) {
-      setModelCatalog([]);
+    } else {
       setEngines([]);
     }
   }, []);

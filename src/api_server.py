@@ -56,6 +56,7 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
+from model_api_access import require_model_api_source
 from paged_kv_cache import PagedKVCache
 from multimodal import (
     build_openai_user_content,
@@ -3780,8 +3781,9 @@ async def get_status():
 
 
 @app.get("/api/models/current")
-async def get_current_model():
+async def get_current_model(request: Request = None):
     """当前模型信息"""
+    require_model_api_source(request)
     if not model_host.model_loaded:
         if _pipeline_model_is_prepared():
             from pipeline_model_descriptor import public_pipeline_descriptor
@@ -3855,8 +3857,9 @@ def _unload_model_under_model_lock() -> dict:
 
 
 @app.post("/api/models/unload")
-async def unload_model():
+async def unload_model(request: Request = None):
     """Explicitly release the local LLM before loading another engine."""
+    require_model_api_source(request)
     try:
         return await run_in_threadpool(_unload_model_under_model_lock)
     except HTTPException:
@@ -3867,13 +3870,14 @@ async def unload_model():
 
 
 @app.post("/api/models/load")
-async def load_model(req: LoadModelRequest):
+async def load_model(req: LoadModelRequest, request: Request = None):
     """
     加载/切换模型。
 
     耗时约 5-20 秒（取决于量化类型），期间会先卸载旧模型。
     使用 switch_model 获得失败时自动回滚到上一个模型的保护。
     """
+    require_model_api_source(request)
     global kv_cache, conversation_stats
 
     engine = req.engine.lower()
@@ -7739,6 +7743,41 @@ def _get_all_model_configs() -> list[mc.ModelConfig]:
     return models
 
 
+def _public_model_path(value: str) -> str:
+    """Expose an asset-relative path, never the server's filesystem root."""
+    if not value:
+        return ""
+    try:
+        path = Path(value).expanduser().resolve(strict=False)
+        root = Path(mc._APP_ROOT).resolve()
+        return path.relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return Path(str(value)).name
+
+
+def _public_expected_paths(values: list[str] | tuple[str, ...]) -> list[str]:
+    """Redact paths embedded in the human-readable availability hints."""
+    public: list[str] = []
+    for value in values:
+        label, separator, raw_path = str(value).partition(": ")
+        if separator:
+            public.append(f"{label}: {_public_model_path(raw_path)}")
+        else:
+            public.append(_public_model_path(str(value)))
+    return public
+
+
+def _public_registry_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """Project registry rows without exposing persisted server paths."""
+    payload = dict(entry)
+    for field in ("model_path", "gguf_path"):
+        if field in payload:
+            payload[field] = _public_model_path(str(payload[field] or ""))
+    if isinstance(payload.get("expected_paths"), (list, tuple)):
+        payload["expected_paths"] = _public_expected_paths(payload["expected_paths"])
+    return payload
+
+
 def _model_api_payload(model: mc.ModelConfig) -> dict:
     """Serialize a model config with local availability and loadability metadata."""
     file_status = mc.get_model_file_status(model)
@@ -7774,14 +7813,14 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
         "description": model.description,
         "huggingface_id": model.huggingface_id,
         "location": model.location,
-        "model_path": model.model_path,
-        "gguf_path": model.gguf_path,
+        "model_path": _public_model_path(model.model_path),
+        "gguf_path": _public_model_path(model.gguf_path),
         "is_available": is_available,
         "unavailable_reason": unavailable_reason,
         "available_formats": file_status["available_formats"],
         "has_safetensors": file_status["has_safetensors"],
         "has_gguf": file_status["has_gguf"],
-        "expected_paths": file_status["expected_paths"],
+        "expected_paths": _public_expected_paths(file_status["expected_paths"]),
         "supported_engines": supported_engines,
         "preferred_engine": preferred_engine,
         "default_quant_type": default_quant,
@@ -7887,29 +7926,32 @@ async def list_models():
 
 
 @app.get("/api/models/local-assets")
-async def list_local_model_assets():
+async def list_local_model_assets(request: Request = None):
     """List detected local sidecar/task-route assets without registering loaders."""
+    require_model_api_source(request)
     from local_model_assets import discover_local_model_assets
 
     return discover_local_model_assets()
 
 
 @app.post("/api/models/local-assets/{model_id}/preflight")
-async def preflight_local_model_asset(model_id: str):
+async def preflight_local_model_asset(model_id: str, request: Request = None):
     """Run a supported read-only Sidecar preflight; never load model weights."""
+    require_model_api_source(request)
     from local_model_assets import preflight_local_model_asset as run_preflight
 
     return await run_in_threadpool(run_preflight, model_id)
 
 
 @app.post("/api/models/switch")
-async def switch_model(req: SwitchModelRequest):
+async def switch_model(req: SwitchModelRequest, request: Request = None):
     """
     切换到另一个模型（P3 多模型支持）。
 
     会卸载当前模型，然后加载新模型。
     仅 CUDA 环境可用（非 CUDA 返回 403）。
     """
+    require_model_api_source(request)
     global kv_cache, conversation_stats
 
     # 验证 engine 参数
@@ -7981,18 +8023,20 @@ async def switch_model(req: SwitchModelRequest):
 
 
 @app.get("/api/models/registry")
-async def list_model_registry():
+async def list_model_registry(request: Request = None):
     """列出用户注册的实验模型配置。"""
+    require_model_api_source(request)
     db_models = _get_registered_experimental_models()
-    return {"models": db_models}
+    return {"models": [_public_registry_payload(entry) for entry in db_models]}
 
 
 @app.post("/api/models/registry")
-async def register_model(req: RegisterModelRequest):
+async def register_model(req: RegisterModelRequest, request: Request = None):
     """注册一个新的实验模型配置。
 
     模型文件需用户自行下载到指定路径。
     """
+    require_model_api_source(request)
     if req.model_type not in {"safetensors", "gguf", "both"}:
         raise HTTPException(status_code=400, detail="model_type 必须是 safetensors | gguf | both")
     resolved_model_path = mc.resolve_model_path(req.model_path) if req.model_path else ""
@@ -8044,11 +8088,12 @@ async def register_model(req: RegisterModelRequest):
 
 
 @app.delete("/api/models/registry/{model_id}")
-async def unregister_model(model_id: str):
+async def unregister_model(model_id: str, request: Request = None):
     """删除一个用户注册的实验模型配置。
 
     不会删除磁盘上的模型文件，仅取消注册。
     """
+    require_model_api_source(request)
     # 不允许删除内置模型
     if mc.get_builtin_model(model_id):
         raise HTTPException(status_code=400, detail=f"内置模型 '{model_id}' 不允许删除。")
@@ -8086,8 +8131,9 @@ _download_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="qlh-m
 
 
 @app.get("/api/models/presets")
-async def list_model_presets():
+async def list_model_presets(request: Request = None):
     """预设列表，含本机可装性评估（installable / blocked_reasons）。"""
+    require_model_api_source(request)
     return {"presets": model_download_jobs.list_presets()}
 
 
@@ -8095,8 +8141,10 @@ async def list_model_presets():
 async def search_model_repositories(
     q: str = "", source: str = "all", page: int = 1, limit: int = 20,
     proxy: str = "",
+    request: Request = None,
 ):
     """搜索公开模型仓库，HF 直连→代理→ModelScope 兜底。"""
+    require_model_api_source(request)
     try:
         return await run_in_threadpool(
             lambda: model_search.search_models(
@@ -8114,8 +8162,9 @@ async def search_model_repositories(
 
 
 @app.post("/api/models/downloads")
-async def create_model_download(req: CreateModelDownloadRequest):
+async def create_model_download(req: CreateModelDownloadRequest, request: Request = None):
     """排队一个下载 job（异步，轮询 /api/models/downloads/{id} 查进度）。"""
+    require_model_api_source(request)
     try:
         job = model_download_jobs.create_job(
             source=req.source, target=req.target, model_id=req.model_id,
@@ -8135,14 +8184,16 @@ async def create_model_download(req: CreateModelDownloadRequest):
 
 
 @app.get("/api/models/downloads")
-async def list_model_downloads(limit: int = 100):
+async def list_model_downloads(limit: int = 100, request: Request = None):
     """列出下载 job（新到旧）。"""
+    require_model_api_source(request)
     return {"jobs": model_download_jobs.list_jobs(limit=limit)}
 
 
 @app.get("/api/models/downloads/{job_id}")
-async def get_model_download(job_id: str):
+async def get_model_download(job_id: str, request: Request = None):
     """查询单个下载 job 进度。"""
+    require_model_api_source(request)
     job = model_download_jobs.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"下载任务 '{job_id}' 不存在")
@@ -8150,8 +8201,9 @@ async def get_model_download(job_id: str):
 
 
 @app.delete("/api/models/downloads/{job_id}")
-async def cancel_model_download(job_id: str):
+async def cancel_model_download(job_id: str, request: Request = None):
     """取消排队中的下载 job；执行中的由后台线程控制，返回当前状态。"""
+    require_model_api_source(request)
     cancelled = model_download_jobs.cancel_job(job_id)
     if not cancelled:
         job = model_download_jobs.get_job(job_id)
@@ -10406,12 +10458,13 @@ async def downloadable_pipeline_assignment(
 
 
 @app.get("/api/models/gguf")
-async def list_gguf_models():
+async def list_gguf_models(request: Request = None):
     """
     列出可下载的 GGUF 模型文件及其 SHA256 校验值。
 
     Android 全有模式调用此接口获取可下载的模型列表和下载 URL。
     """
+    require_model_api_source(request)
     models = []
     if not os.path.isdir(_MODELS_DIR):
         return {"models": models, "exists": False, "count": 0}
@@ -10462,12 +10515,13 @@ async def list_gguf_models():
 
 
 @app.get("/api/models/download/{filename}")
-async def download_model_file(filename: str):
+async def download_model_file(filename: str, request: Request = None):
     """
     下载 GGUF 模型文件（支持 Range 断点续传）。
 
     Android ModelManager 调用此接口下载模型，支持分段下载和断点续传。
     """
+    require_model_api_source(request)
     # 安全检查：防止路径穿越
     safe_name = os.path.basename(filename)
     if safe_name != filename or ".." in filename:

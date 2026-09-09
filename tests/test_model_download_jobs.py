@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -48,6 +50,120 @@ def test_list_presets_has_expected_fields():
     for p in presets:
         assert {"id", "display", "kind", "hf_repo", "installable"} <= set(p)
         assert "blocked_reasons" in p
+
+
+def test_remote_presets_expose_reviewed_artifact_pins():
+    presets = {item["id"]: item for item in mj.list_presets()}
+    for preset_id in {
+        "qwen2.5-0.5b-instruct",
+        "qwen3-0.6b",
+        "minicpm4-0.5b",
+        "distilqwen25-ds3-0324-7b",
+    }:
+        item = presets[preset_id]
+        assert item["pin_status"] == "pinned"
+        assert len(item["revision"]) == 40
+        assert item["allow_patterns"]
+        assert set(item["required_files"]) <= set(item["allow_patterns"])
+        assert item["weight_files"]
+        assert all(len(entry["sha256"]) == 64 for entry in item["weight_files"])
+
+
+def test_invalid_pin_manifest_blocks_remote_presets(tmp_path, monkeypatch):
+    pin_path = tmp_path / "invalid-pin.json"
+    pin_path.write_text('{"schema": 1}', encoding="utf-8")
+    monkeypatch.setattr(mj, "_PIN_MANIFEST_PATH", pin_path)
+    presets = {item["id"]: item for item in mj.list_presets()}
+    assert presets["qwen3-0.6b"]["installable"] is False
+    assert presets["qwen3-0.6b"]["blocked_reasons"]["artifact_pin"] == "PRESET_PIN_INVALID"
+
+
+def test_pin_paths_reject_parent_and_drive_escape():
+    for value in ("../model.safetensors", "C:/model.safetensors"):
+        with pytest.raises(mj.JobError) as exc:
+            mj._validate_pin_path(value, field="test")
+        assert exc.value.code == "PRESET_PIN_INVALID"
+
+
+def test_download_passes_remote_pin_to_huggingface(tmp_path, monkeypatch):
+    calls = {}
+
+    class FakeHub:
+        @staticmethod
+        def snapshot_download(**kwargs):
+            calls.update(kwargs)
+            (Path(kwargs["local_dir"]) / "model.safetensors").write_bytes(b"fixture")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", FakeHub)
+    staging = tmp_path / "staging"
+    files = mj._download(
+        "owner/repo", staging, use_modelscope=False, proxy="",
+        revision="a" * 40, allow_patterns=["config.json", "model.safetensors"],
+    )
+    assert files == [staging / "model.safetensors"]
+    assert calls["revision"] == "a" * 40
+    assert calls["allow_patterns"] == ["config.json", "model.safetensors"]
+
+
+def test_verify_pinned_files_checks_exact_set_and_sha256(tmp_path):
+    root = tmp_path / "staging"
+    root.mkdir()
+    payload = b"pinned fixture"
+    weight = root / "model.safetensors"
+    weight.write_bytes(payload)
+    expected = [{
+        "path": "model.safetensors",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }]
+    mj._verify_pinned_files(root, [weight], expected)
+
+    with pytest.raises(mj.JobError) as exc:
+        mj._verify_pinned_files(root, [weight], [{
+            "path": "model.safetensors",
+            "sha256": "0" * 64,
+        }])
+    assert exc.value.code == "SHA256_MISMATCH"
+
+    extra = root / "extra.safetensors"
+    extra.write_bytes(b"unexpected")
+    with pytest.raises(mj.JobError) as exc:
+        mj._verify_pinned_files(root, [weight, extra], expected)
+    assert exc.value.code == "PINNED_FILE_SET_MISMATCH"
+
+
+def test_preset_default_targets_match_builtin_asset_directories():
+    presets = {item["id"]: item for item in mj.list_presets()}
+    assert presets["qwen2.5-0.5b-instruct"]["default_target"] == "qwen2.5-0.5b-instruct"
+    assert presets["minicpm4-0.5b"]["default_target"] == "minicpm4-0.5b"
+
+
+def test_download_target_is_confined_to_models_root(tmp_path):
+    root = tmp_path / "models"
+    with pytest.raises(mj.JobError) as exc:
+        mj._resolve_target("owner/repo", str(tmp_path / "outside"), str(root))
+    assert exc.value.code == "TARGET_OUTSIDE_MODELS_ROOT"
+
+    nested = mj._resolve_target("owner/repo", "nested/repo", str(root))
+    assert nested == (root / "nested" / "repo").resolve()
+
+
+def test_download_rejects_symlinked_local_source(tmp_path):
+    if os.name == "nt":
+        pytest.skip("creating symlinks requires elevated privileges on Windows")
+    source = _make_gguf_dir(tmp_path / "source")
+    link = tmp_path / "linked-model"
+    link.symlink_to(source, target_is_directory=True)
+    with pytest.raises(mj.JobError) as exc:
+        mj._download(str(link), tmp_path / "staging", use_modelscope=False, proxy="")
+    assert exc.value.code == "SOURCE_SYMLINK"
+
+
+def test_explicit_gguf_path_cannot_escape_staging(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    with pytest.raises(mj.JobError) as exc:
+        mj._resolve_staged_gguf(str(tmp_path / "outside.gguf"), staging)
+    assert exc.value.code == "GGUF_PATH_OUTSIDE_TARGET"
 
 
 def test_create_job_from_local_source_no_network(tmp_path, monkeypatch):
@@ -120,6 +236,22 @@ def test_sha_mismatch_fails_job(tmp_path):
     assert reloaded["status"] == mj.STATUS_FAILED
     assert reloaded["error_code"] == "SHA256_MISMATCH"
     # staging 已清理，目标未发布
+    assert not target.exists()
+
+
+def test_registration_failure_removes_published_target(tmp_path, monkeypatch):
+    models_root = tmp_path / "models"
+    src = _make_gguf_dir(tmp_path / "src-register-failure")
+    target = models_root / "register-failure"
+    monkeypatch.setattr(mj, "_register", lambda *args, **kwargs: False)
+
+    job = mj.create_job(
+        source=str(src), target=str(target), model_id="register-failure",
+        models_root=str(models_root), executor=lambda fn: fn(),
+    )
+
+    assert job["status"] == mj.STATUS_FAILED
+    assert job["error_code"] == "REGISTER_FAILED"
     assert not target.exists()
 
 

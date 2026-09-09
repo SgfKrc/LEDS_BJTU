@@ -7,7 +7,9 @@ import { createApp } from './app';
 async function bootstrap(): Promise<void> {
   const app = await createApp();
   const port = Number(process.env.QLH_CONTROL_PORT || 8030);
-  const host = process.env.QLH_CONTROL_HOST?.trim() || '::';
+  // control-svc is an internal dependency; the gateway is the authenticated
+  // public boundary. Remote exposure must be an explicit deployment choice.
+  const host = process.env.QLH_CONTROL_HOST?.trim() || '127.0.0.1';
   await app.listen({ port, host, ipv6Only: false });
   // eslint-disable-next-line no-console
   console.log(`CONTROL_SVC_LISTENING:${port}`);

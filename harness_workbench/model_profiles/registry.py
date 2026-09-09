@@ -97,7 +97,7 @@ class ProfileRegistry:
     ) -> ModelProfile | None:
         candidates = [
             profile for profile in self.list_profiles(include_rejected=include_rejected)
-            if profile.model_id == model_id
+            if (profile.model_id == model_id or model_id in profile.aliases)
             and (backend is None or profile.backend == backend)
             and (artifact_sha256 is None or profile.artifact_sha256 == artifact_sha256)
             and (revision is None or profile.revision == revision)

@@ -67,6 +67,24 @@ function runtimeState(runtime: CurrentModelResponse | null): { label: string; to
   return { label: 'UNLOADED', tone: 'idle' };
 }
 
+function localAssetModel(asset: LocalModelAsset): ModelSummary {
+  return {
+    model_id: asset.model_id,
+    name: asset.name || asset.model_id,
+    model_type: asset.model_type,
+    max_context: asset.max_context,
+    available_formats: asset.available_formats || [],
+    model_path: asset.model_path,
+    gguf_path: asset.gguf_path,
+    location: 'local-asset',
+    is_available: false,
+    is_experimental: true,
+    unavailable_reason: asset.runtime_hint || 'Local asset is awaiting a compatible runtime.',
+    preferred_engine: asset.runtime_profile || 'manual',
+    supported_engines: asset.runtime_profile ? [asset.runtime_profile] : [],
+  };
+}
+
 export function ModelsPage() {
   const models = useModels();
   const available = useAvailableModels();
@@ -101,7 +119,9 @@ export function ModelsPage() {
     if (!normalized) return modelList;
     return modelList.filter((model) => `${model.name} ${model.model_id} ${model.description || ''}`.toLowerCase().includes(normalized));
   }, [modelList, query]);
-  const selectedModel = modelList.find((model) => model.model_id === selectedId) ?? filteredModels[0] ?? null;
+  const selectedRegistryModel = modelList.find((model) => model.model_id === selectedId);
+  const selectedLocalAsset = assetList.find((asset) => asset.model_id === selectedId);
+  const selectedModel = selectedRegistryModel ?? (selectedLocalAsset ? localAssetModel(selectedLocalAsset) : filteredModels[0] ?? null);
   const supportedEngines = selectedModel?.supported_engines ?? [];
   const effectiveEngine = selectedEngine === 'auto'
     ? selectedModel?.preferred_engine || available.data?.current_engine || 'auto'
@@ -114,7 +134,7 @@ export function ModelsPage() {
   const effectiveQuant = selectedQuant || selectedModel?.default_quant_type || quantOptions[0] || 'int4';
   const currentState = runtimeState(runtime ?? null);
   const loadedModelId = runtime?.model_id || (runtime as (CurrentModelResponse & { active_model_id?: string | null }) | undefined)?.active_model_id || '';
-  const selectedAsset = assetList.find((asset) => asset.model_id === selectedModel?.model_id) ?? null;
+  const selectedAsset = assetList.find((asset) => asset.model_id === selectedModel?.model_id) ?? selectedLocalAsset ?? null;
   const canManageRegistry = usingFixtures || role.data?.is_master === true;
   const rawArtifactId = String(manifest?.sha256 || manifest?.artifact_sha256 || '');
   const artifactId = rawArtifactId && !rawArtifactId.toLowerCase().startsWith('sha256:') ? `sha256:${rawArtifactId}` : rawArtifactId;

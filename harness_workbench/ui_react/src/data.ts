@@ -74,6 +74,7 @@ export interface ModelProfileSummary {
   revision: string;
   backend: string;
   roles: string[];
+  aliases?: string[];
   status: string;
   production_eligible: boolean;
   context: Record<string, unknown>;
@@ -81,6 +82,20 @@ export interface ModelProfileSummary {
   adaptation: Record<string, unknown>;
   capabilities: Record<string, { status: string; evidence: string[] }>;
   evidence: Record<string, unknown>;
+}
+
+export class HarnessApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly retryable: boolean;
+
+  constructor(message: string, options: { status: number; code?: string | null; retryable?: boolean }) {
+    super(message);
+    this.name = 'HarnessApiError';
+    this.status = options.status;
+    this.code = options.code || null;
+    this.retryable = options.retryable === true;
+  }
 }
 
 export interface MCPToolSchema {
@@ -124,8 +139,16 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
   });
-  const payload = (await response.json().catch(() => ({}))) as T & { error?: { message?: string } };
-  if (!response.ok) throw new Error(payload.error?.message || `HTTP ${response.status}`);
+  const payload = (await response.json().catch(() => ({}))) as T & {
+    error?: { message?: string; code?: string; retryable?: boolean };
+  };
+  if (!response.ok) {
+    throw new HarnessApiError(payload.error?.message || `HTTP ${response.status}`, {
+      status: response.status,
+      code: payload.error?.code || null,
+      retryable: payload.error?.retryable === true,
+    });
+  }
   return payload;
 }
 
@@ -195,8 +218,12 @@ export async function streamChat(
     }),
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { error?: { message?: string } };
-    throw new Error(payload.error?.message || `HTTP ${response.status}`);
+    const payload = await response.json().catch(() => ({})) as { error?: { message?: string; code?: string; retryable?: boolean } };
+    throw new HarnessApiError(payload.error?.message || `HTTP ${response.status}`, {
+      status: response.status,
+      code: payload.error?.code || null,
+      retryable: payload.error?.retryable === true,
+    });
   }
   if (!response.body) throw new Error('stream response body is unavailable');
 
@@ -214,8 +241,14 @@ export async function streamChat(
       if (data === '[DONE]') finished = true;
       return;
     }
-    const payload = JSON.parse(data) as { error?: { message?: string }; choices?: Array<{ delta?: { content?: string } }> };
-    if (payload.error?.message) throw new Error(payload.error.message);
+    const payload = JSON.parse(data) as { error?: { message?: string; code?: string; retryable?: boolean }; choices?: Array<{ delta?: { content?: string } }> };
+    if (payload.error?.message) {
+      throw new HarnessApiError(payload.error.message, {
+        status: 200,
+        code: payload.error.code || null,
+        retryable: payload.error.retryable === true,
+      });
+    }
     const delta = payload.choices?.[0]?.delta?.content;
     if (delta) onDelta(delta);
   };

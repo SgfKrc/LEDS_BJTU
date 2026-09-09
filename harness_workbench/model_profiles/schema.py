@@ -109,6 +109,7 @@ class ModelProfile:
     generation: Mapping[str, Any] = field(default_factory=dict)
     adaptation: Mapping[str, Any] = field(default_factory=dict)
     roles: tuple[str, ...] = ("answer",)
+    aliases: tuple[str, ...] = ()
     resources: Mapping[str, Any] = field(default_factory=dict)
     capabilities: Mapping[str, CapabilityState] = field(default_factory=dict)
     status: str = "unknown"
@@ -137,6 +138,10 @@ class ModelProfile:
             raise ProfileValidationError("roles must contain at least one role")
         if any(not isinstance(role, str) or not role.strip() for role in self.roles):
             raise ProfileValidationError("roles must contain non-empty strings")
+        if not isinstance(self.aliases, (list, tuple)):
+            raise ProfileValidationError("aliases must be an array")
+        if any(not isinstance(alias, str) or not alias.strip() for alias in self.aliases):
+            raise ProfileValidationError("aliases must contain non-empty strings")
         if not isinstance(self.production_eligible, bool):
             raise ProfileValidationError("production_eligible must be boolean")
         for value in (self.context, self.generation, self.adaptation, self.resources, self.evidence):
@@ -148,6 +153,7 @@ class ModelProfile:
         _reject_paths(self.resources)
         _reject_paths(self.evidence)
         object.__setattr__(self, "roles", tuple(dict.fromkeys(self.roles)))
+        object.__setattr__(self, "aliases", tuple(dict.fromkeys(alias.strip() for alias in self.aliases if alias.strip())))
         object.__setattr__(self, "context", dict(self.context))
         object.__setattr__(self, "generation", dict(self.generation))
         object.__setattr__(self, "adaptation", dict(self.adaptation))
@@ -176,6 +182,7 @@ class ModelProfile:
             "generation": dict(self.generation),
             "adaptation": dict(self.adaptation),
             "roles": list(self.roles),
+            "aliases": list(self.aliases),
             "resources": dict(self.resources),
             "capabilities": {
                 name: capability.as_dict() for name, capability in self.capabilities.items()
@@ -197,6 +204,9 @@ class ModelProfile:
         roles_value = value.get("roles", ("answer",))
         if not isinstance(roles_value, (list, tuple)):
             raise ProfileValidationError("roles must be an array")
+        aliases_value = value.get("aliases", ())
+        if not isinstance(aliases_value, (list, tuple)):
+            raise ProfileValidationError("aliases must be an array")
         profile = cls(
             model_id=value.get("model_id", ""),
             revision=value.get("revision", ""),
@@ -208,6 +218,7 @@ class ModelProfile:
             generation=value.get("generation", {}),
             adaptation=value.get("adaptation", {}),
             roles=tuple(roles_value),
+            aliases=tuple(aliases_value),
             resources=value.get("resources", {}),
             capabilities=value.get("capabilities", {}),
             status=value.get("status", "unknown"),
