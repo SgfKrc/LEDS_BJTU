@@ -8,7 +8,9 @@
 >
 > 目标：**加载瞬间峰值 ≈ 分配层段权重 + 常量开销**，与稳态占用同量级，杜绝"全模型峰值压垮从节点"；一期进一步把模型身份/容量发现从权重物化中剥离，向"集群总容量加载"演进。
 
-> **实施复核（2026-08-13）**：P0 已完成，P2 的本机开发基线已完成。`ModelManager.load_layer_range` 现在强制 Qwen/Qwen2 架构加载器返回 `_LayerRangeLoadTracker`；每个 safetensors tensor 在 `get_tensor` 前先校验 key 是否属于分配层段，越界物化、缺失分配层或绕过守卫均 fail-closed。加载过程在 meta 骨架完成、tensor 读取、目标设备安装、裁剪和清理边界采样进程 RSS 与 CUDA allocated，并通过 `get_model_info().layer_load_metrics` 暴露层索引、tensor 数、源/目标字节和峰值增量，不记录文件路径或权重 key。定向回归 `95 passed / 1 skipped`，Python 全量 `2105 passed / 8 skipped`。本机开发门不替代 Surface 7、真实 7B/12B 与多机验收。
+> **实施复核（2026-08-13）**：P0 已完成，P2 的本机开发基线已完成。`ModelManager.load_layer_range` 现在强制 Qwen/Qwen2 架构加载器返回 `_LayerRangeLoadTracker`；每个 safetensors tensor 在 `get_tensor` 前先校验 key 是否属于分配层段，越界物化、缺失分配层或绕过守卫均 fail-closed。加载过程在 meta 骨架完成、tensor 读取、目标设备安装、裁剪和清理边界采样进程 RSS 与 CUDA allocated，并通过 `get_model_info().layer_load_metrics` 暴露层索引、tensor 数、源/目标字节和峰值增量，不记录文件路径或权重 key。定向回归 `95 passed / 1 skipped`，Python 全量 `2105 passed / 8 skipped`。
+>
+> **双机验收补充（2026-08-20）**：QW1.8B 分层数据面真机通过——主节点 RTX 4060（Layer 0-21）+ Surface 从节点（Layer 21-24，无 CUDA），双方本地选择性加载、网络只传 hidden/KV，三次 `distributed_required` 均 `distributed_used=true`/`fallback=false`、RTT 6-12ms、64 心跳窗口无重连（见[项目进展与下一步计划](项目进展与下一步计划.md) 2026-08-20 条目）。**本方案在 QW1.8B 上的真机边界已闭合**；真实 7B/12B 重量级模型三节点分段与峰值实测仍后置（见 §"六期"）。
 
 ---
 
@@ -82,7 +84,7 @@
 - 已完成：`tests/test_model_module.py` 共 `95 passed / 1 skipped`，相邻模型 API/分布式前向 `91 passed`、scheduler `268 passed`，Python 全量 `2105 passed / 8 skipped`；覆盖真实 tiny Qwen2 safetensors 选择性加载、双层段与全模型 logits 等价、守卫在 `get_tensor` 前拒绝未分配 key、缺层 fail-closed、加载器不可绕过守卫、未知架构接入指引、指标结构和源/目标 dtype 字节核算。
 - 新架构接入时必须新增：该架构的 key 过滤等价性测试（过滤加载 vs 全量加载逐层权重一致）及分段前向等价测试。
 - 峰值数值阈值不能用 tiny 模型或当前开发机常量代替；真实工件到位后按 3 轮标定冻结常量，再启用 `层段权重 × 1.2 + 常量` 自动判定。
-- 真机：下月从节点（Surface 7）到位后，DeepSeek 7B 三层段分配的峰值实测入档（验收清单 A4 关联）。
+- 真机：Surface 从节点已参与 2026-08-20 的 QW1.8B 双机分层验收（Layer 21-24）；DeepSeek 7B / Gemma 4 12B 等重量级模型的三层段分配峰值实测仍待真机标定（验收清单 A4 关联后续票）。
 
 ## 7. 关联与登记
 
