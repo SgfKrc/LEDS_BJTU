@@ -24,6 +24,7 @@ from harness_workbench.eval import (
     builtin_fixtures,
     pareto_frontier,
     run_replay,
+    run_red_team,
 )
 from harness_workbench.eval.report import promotion_gate, summarize_replay
 from tests.test_harness_model_profiles import _profile
@@ -119,10 +120,21 @@ def test_report_and_promotion_gate_require_holdout_quality() -> None:
     metrics = summarize_replay(report, fixtures)
     holdout = tuple(fixture for fixture in fixtures if fixture.holdout)
     holdout_report = run_replay(variant, holdout, runner)
-    result = build_evaluation_report(report, fixtures, holdout_report=holdout_report, holdout_fixtures=holdout)
+    result = build_evaluation_report(
+        report,
+        fixtures,
+        holdout_report=holdout_report,
+        holdout_fixtures=holdout,
+        red_team_report=run_red_team(),
+    )
     assert result["promotion"]["status"] == "candidate"
     assert result["promotion"]["production_eligible"] is False
     assert "holdout_quality_below_threshold" in result["promotion"]["reasons"]
+    assert result["metrics"]["red_team_blocked"] == 12
+    assert result["metrics"]["red_team_block_rate"] == 1.0
+    assert result["metrics"]["schema_valid_rate"] == 1.0
+    assert result["metrics"]["unauthorized_pass_count"] == 0
+    assert result["red_team"]["schema"] == "qlh.harness.red_team.v1"
     assert "wrong" not in json.dumps(result)
     assert metrics.quality_rate < 1.0
 

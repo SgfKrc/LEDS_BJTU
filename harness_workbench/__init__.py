@@ -5,4 +5,4 @@ slice exposes the context engine; adapters and the API layer are added in
 later tickets.
 """
 
-__all__ = ["adapters", "api_layer", "context_engine", "image_workbench", "model_profiles", "rag", "session"]
+__all__ = ["adapters", "api_layer", "context_engine", "image_workbench", "memory", "mcp_server", "model_profiles", "rag", "session", "tools"]

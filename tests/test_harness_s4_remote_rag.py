@@ -190,6 +190,9 @@ def test_s4_api_wires_rag_and_session_without_exposing_paths(tmp_path):
     assert "path" not in json.dumps(search.json())
     created = client.post("/v1/sessions", json={"title": "S"})
     assert created.status_code == 201
+    listed = client.get("/v1/sessions?owner_scope=local&limit=10")
+    assert listed.status_code == 200
+    assert listed.json()["sessions"][0]["session_id"] == created.json()["session_id"]
     loaded = client.get(f"/v1/sessions/{created.json()['session_id']}")
     assert loaded.status_code == 200
     assert loaded.json()["session"]["title"] == "S"
