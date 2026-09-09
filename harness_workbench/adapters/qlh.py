@@ -139,8 +139,65 @@ class QLHAdapter:
         return self._capabilities
 
     def models(self) -> tuple[AdapterModel, ...]:
+        try:
+            payload = self.model_catalog()
+            rows = payload.get("models", [])
+            if isinstance(rows, list):
+                return tuple(
+                    AdapterModel(
+                        str(row.get("model_id") or row.get("id") or ""),
+                        owned_by="qlh",
+                        available=bool(row.get("is_available", True)),
+                        unavailable_reason=str(row.get("unavailable_reason") or "") or None,
+                    )
+                    for row in rows
+                    if isinstance(row, Mapping) and str(row.get("model_id") or row.get("id") or "").strip()
+                )
+        except AdapterError:
+            pass
         capability = self.capabilities()
         return tuple(AdapterModel(model_id, owned_by="qlh") for model_id in capability.model_ids)
+
+    def model_catalog(self) -> Mapping[str, Any]:
+        """Return QLH's full model catalog, including assets not downloaded yet."""
+        payload = self._transport.get_json("/api/models")
+        models = payload.get("models", [])
+        normalized: list[dict[str, Any]] = []
+        if isinstance(models, list):
+            for row in models:
+                if not isinstance(row, Mapping):
+                    continue
+                item = dict(row)
+                model_id = str(item.get("model_id") or item.get("id") or "").strip()
+                if not model_id:
+                    continue
+                item["id"] = model_id
+                item["available"] = bool(item.get("is_available", item.get("available", True)))
+                if item.get("unavailable_reason"):
+                    item["unavailable_reason"] = str(item["unavailable_reason"])
+                normalized.append(item)
+        result = dict(payload)
+        result["models"] = normalized
+        return result
+
+    def model_presets(self) -> Mapping[str, Any]:
+        return self._transport.get_json("/api/models/presets")
+
+    def model_downloads(self) -> Mapping[str, Any]:
+        return self._transport.get_json("/api/models/downloads")
+
+    def queue_model_download(self, preset_id: str) -> Mapping[str, Any]:
+        if not isinstance(preset_id, str) or not preset_id.strip():
+            raise AdapterError("model preset is required", code="invalid_model_preset", status_code=400)
+        return self._transport.post_json("/api/models/downloads", {"preset_id": preset_id.strip()})
+
+    def load_model_asset(self, model_id: str, *, engine: str = "auto", quant_type: str = "int4") -> Mapping[str, Any]:
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise AdapterError("model id is required", code="invalid_model_id", status_code=400)
+        return self._transport.post_json(
+            "/api/models/load",
+            {"model_id": model_id.strip(), "engine": engine or "auto", "quant_type": quant_type or "int4"},
+        )
 
     def complete(self, request: AdapterRequest) -> AdapterResponse:
         payload = self._payload(request, streaming_mode="full")
@@ -210,6 +267,7 @@ class QLHAdapter:
     def _payload(self, request: AdapterRequest, *, streaming_mode: str) -> dict[str, Any]:
         transcript = _bounded_transcript(request.messages, max_chars=self.config.max_context_chars)
         payload: dict[str, Any] = {
+            "model": request.model,
             "message": transcript,
             "max_new_tokens": request.max_tokens or 1024,
             "temperature": request.temperature if request.temperature is not None else 0.7,

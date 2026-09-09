@@ -67,6 +67,30 @@ export interface HarnessModel {
   object?: string;
   owned_by?: string;
   created?: number;
+  available?: boolean;
+  unavailable_reason?: string;
+}
+
+export interface HarnessModelPreset {
+  id: string;
+  display: string;
+  kind: string;
+  default_model_id?: string;
+  default_engine?: string;
+  default_quant?: string;
+  installable: boolean;
+  blocked_reasons?: Record<string, string>;
+  description?: string;
+}
+
+export interface HarnessModelDownload {
+  job_id: string;
+  status: string;
+  progress: number;
+  model_id?: string;
+  preset_id?: string;
+  error?: string | null;
+  error_code?: string | null;
 }
 
 export interface ModelProfileSummary {
@@ -162,6 +186,32 @@ export async function listModels(): Promise<{ object?: string; data: HarnessMode
 
 export async function listModelProfiles(): Promise<{ schema: string; profiles: ModelProfileSummary[] }> {
   return requestJson('/v1/model-profiles');
+}
+
+export async function listModelAssets(): Promise<{ models: HarnessModel[]; active_model_id?: string | null }> {
+  return requestJson('/v1/model-assets');
+}
+
+export async function listModelPresets(): Promise<{ presets: HarnessModelPreset[] }> {
+  return requestJson('/v1/model-presets');
+}
+
+export async function listModelDownloads(): Promise<{ jobs: HarnessModelDownload[] }> {
+  return requestJson('/v1/model-downloads');
+}
+
+export async function queueModelDownload(preset_id: string): Promise<{ job?: HarnessModelDownload }> {
+  return requestJson('/v1/model-downloads', {
+    method: 'POST',
+    body: JSON.stringify({ preset_id }),
+  });
+}
+
+export async function loadModelAsset(model_id: string, engine = 'auto', quant_type = 'int4'): Promise<Record<string, unknown>> {
+  return requestJson('/v1/models/load', {
+    method: 'POST',
+    body: JSON.stringify({ model_id, engine, quant_type }),
+  });
 }
 
 export async function completeChat(model: string, messages: ChatMessage[]): Promise<{ content: string }> {
