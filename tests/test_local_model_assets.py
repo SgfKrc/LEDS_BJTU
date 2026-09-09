@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import sys
 
@@ -46,6 +47,7 @@ def test_discovery_pairs_manifest_safetensors_with_filesystem_gguf(tmp_path):
     assert asset["runtime_profile"] == "qwen3_sidecar"
     assert asset["runtime_status"] == "inventory_only"
     assert asset["runtime_action"] == "qwen3_preflight"
+    assert asset["integrity"] == "manifest_unverified"
     assert asset["model_path"].endswith("qwen3-5-2b")
     assert asset["gguf_path"].endswith("Qwen3.5-2B-Q4_K_M.gguf")
 
@@ -95,3 +97,30 @@ def test_discovery_accepts_minicpm4_as_a_local_llm_asset_without_manifest(tmp_pa
     assert inventory["summary"]["total"] == 1
     assert inventory["assets"][0]["model_id"] == "minicpm4-0.5b"
     assert inventory["assets"][0]["available_formats"] == ["safetensors"]
+
+
+def test_compat_manifest_requires_matching_size_and_hash(tmp_path):
+    root = tmp_path / "models"
+    model = root / "qwen2.5-0.5b-instruct"
+    model.mkdir(parents=True)
+    config = model / "config.json"
+    weights = model / "model.safetensors"
+    config.write_text(json.dumps({"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}), encoding="utf-8")
+    weights.write_bytes(b"verified weights")
+
+    def entry(path):
+        data = path.read_bytes()
+        return {"path": path.name, "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+    _write_json(model / "model.manifest.json", {
+        "schema": 1,
+        "model_type": "safetensors",
+        "files": [entry(config), entry(weights)],
+    })
+
+    inventory = discover_local_model_assets(root)
+    assert inventory["summary"]["total"] == 1
+    assert inventory["assets"][0]["integrity"] == "manifest_verified"
+
+    weights.write_bytes(b"tampered weights")
+    assert discover_local_model_assets(root)["summary"]["total"] == 0
