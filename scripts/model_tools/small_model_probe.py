@@ -10,13 +10,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
 from .gguf import GGUFError, inspect_gguf, verify_gguf
 from .gguf_convert import plan_conversion
+from .sandbox_runner import SandboxUnavailable, run_sandboxed
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = "small_model_b1_probe"
@@ -25,6 +28,8 @@ SCHEMA_VERSION = 1
 MAX_METADATA_BYTES = 16 * 1024 * 1024
 DEFAULT_B1_MODEL_IDS = ("qwen2.5-0.5b", "qwen3-0.6b", "minicpm4-0.5b")
 THINKING_MARKERS = ("<think>", "</think>", "<|think|>")
+_TEMPLATE_SNAPSHOT_WEIGHT_SUFFIXES = {".safetensors", ".bin", ".gguf", ".pt", ".pth"}
+MAX_TEMPLATE_SNAPSHOT_BYTES = 128 * 1024 * 1024
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -347,43 +352,136 @@ def _template_probe_environment() -> dict[str, str]:
     return environment
 
 
+def _prepare_template_snapshot(path: Path, *, trust_remote_code: bool) -> Path:
+    """Copy metadata into a disposable low-integrity-readable directory."""
+    if path.is_symlink():
+        raise OSError("template probe source cannot be a symlink")
+    snapshot_root = Path(tempfile.mkdtemp(prefix="qlh-template-probes-"))
+    if os.name == "nt":
+        parent_result = subprocess.run(
+            ["icacls", str(snapshot_root), "/setintegritylevel", "(OI)(CI)L"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if parent_result.returncode != 0:
+            shutil.rmtree(snapshot_root, ignore_errors=True)
+            raise OSError("cannot mark template snapshot parent low-integrity readable")
+    snapshot = Path(tempfile.mkdtemp(prefix="probe-", dir=str(snapshot_root)))
+    total_bytes = 0
+    try:
+        for item in path.rglob("*"):
+            relative = item.relative_to(path)
+            if relative.parts and relative.parts[0] == ".cache":
+                continue
+            if item.is_symlink():
+                raise OSError("template probe source contains a symlink")
+            if not item.is_file() or item.suffix.lower() in _TEMPLATE_SNAPSHOT_WEIGHT_SUFFIXES:
+                continue
+            if relative.is_absolute() or ".." in relative.parts:
+                raise OSError("template probe source contains an unsafe path")
+            if not trust_remote_code and item.suffix.lower() == ".py":
+                continue
+            size = item.stat().st_size
+            total_bytes += size
+            if total_bytes > MAX_TEMPLATE_SNAPSHOT_BYTES:
+                raise OSError("template metadata snapshot exceeds size limit")
+            destination = snapshot / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(item, destination)
+        (snapshot / ".hf-home" / "transformers").mkdir(parents=True, exist_ok=True)
+        (snapshot / ".hf-home" / "datasets").mkdir(parents=True, exist_ok=True)
+        (snapshot / ".tmp").mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            result = subprocess.run(
+                ["icacls", str(snapshot), "/setintegritylevel", "(OI)(CI)L", "/T"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise OSError("cannot mark template snapshot low-integrity readable")
+        return snapshot
+    except Exception:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        try:
+            snapshot_root.rmdir()
+        except OSError:
+            pass
+        raise
+
+
 def _execute_template(path: Path, *, timeout_seconds: float, trust_remote_code: bool) -> dict[str, Any]:
     if path.is_file():
         return {"status": "skipped", "reason": "gguf_template_is_static_metadata_only"}
     python = _sidecar_python()
     if python is None:
         return {"status": "unavailable", "reason": "isolated_template_runtime_missing"}
+    try:
+        snapshot = _prepare_template_snapshot(path, trust_remote_code=trust_remote_code)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "status": "unavailable",
+            "reason": "template_snapshot_failed",
+            "sandbox": {"available": False, "os_level": False, "reason": str(exc)},
+        }
     request = {
         "schema_version": SCHEMA_VERSION,
         "operation": "template_probe",
-        "model_path": str(path),
+        "model_path": str(snapshot),
         "controller_python": str(Path(sys.executable).absolute().resolve(strict=False)),
         "trust_remote_code": trust_remote_code,
     }
     env = _template_probe_environment()
+    env.update({
+        "QLH_TEMPLATE_SNAPSHOT": str(snapshot),
+        "HF_HOME": str(snapshot / ".hf-home"),
+        "TRANSFORMERS_CACHE": str(snapshot / ".hf-home" / "transformers"),
+        "HF_DATASETS_CACHE": str(snapshot / ".hf-home" / "datasets"),
+    })
+    if os.name == "nt":
+        env.update({"TEMP": str(snapshot / ".tmp"), "TMP": str(snapshot / ".tmp")})
     try:
-        completed = subprocess.run(
-            [str(python), str(Path(__file__).with_name("small_model_template_probe_worker.py"))],
-            input=json.dumps(request, ensure_ascii=True, separators=(",", ":")),
-            text=True,
-            capture_output=True,
-            cwd=str(ROOT),
+        completed = run_sandboxed(
+            python,
+            Path(__file__).with_name("small_model_template_probe_worker.py"),
+            input_text=json.dumps(request, ensure_ascii=True, separators=(",", ":")),
+            cwd=ROOT,
             env=env,
-            timeout=timeout_seconds,
-            check=False,
+            timeout_seconds=timeout_seconds,
         )
-    except subprocess.TimeoutExpired:
-        return {"status": "failed", "reason": "template_probe_timeout"}
-    except OSError:
-        return {"status": "failed", "reason": "template_probe_start_failed"}
+    except SandboxUnavailable as exc:
+        return {
+            "status": "unavailable",
+            "reason": "os_sandbox_unavailable",
+            "sandbox": {"available": False, "os_level": False, "reason": str(exc)},
+        }
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
+        try:
+            snapshot.parent.rmdir()
+        except OSError:
+            pass
     for line in reversed(completed.stdout.splitlines()):
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict) and value.get("operation") == "template_probe":
+            value["sandbox"] = {
+                **completed.sandbox,
+                **(value.get("sandbox") or {}),
+                "model_snapshot": True,
+            }
             return value
-    return {"status": "failed", "reason": "template_probe_invalid_output"}
+    return {
+        "status": "failed",
+        "reason": "template_probe_invalid_output",
+        "sandbox": {**completed.sandbox, "model_snapshot": True},
+        "returncode": completed.returncode,
+    }
 
 
 def _attach_template_runtime(report: dict[str, Any], runtime: dict[str, Any]) -> None:
