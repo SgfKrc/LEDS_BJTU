@@ -31,6 +31,10 @@ def builtin_profiles() -> tuple[ModelProfile, ...]:
             "network_used": False,
         },
     }
+    qwen3_common = {
+        **common,
+        "generation": {"temperature": 0.6, "top_p": 0.95, "thinking": "declared"},
+    }
     return (
         ModelProfile(
             model_id="QW1.8B",
@@ -57,8 +61,67 @@ def builtin_profiles() -> tuple[ModelProfile, ...]:
                 "summary_mode": "state_schema_v1",
             },
             roles=("tool_router", "summarizer"),
+            capabilities={
+                **_unknown_capabilities(),
+                "thinking_control": CapabilityState(
+                    "declared", ("b1_template_probe_isolated_tokenizer",)
+                ),
+            },
+            **qwen3_common,
+        ),
+        ModelProfile(
+            model_id="Qwen2.5-0.5B",
+            revision="builtin-qwen25-0.5b-v1",
+            backend="llama_server",
+            context={"n_ctx": 32768, "input_budget": 3072, "max_new_tokens": 512},
+            generation={"temperature": 0.7, "top_p": 0.8, "thinking": "unknown"},
+            adaptation={
+                "prompt_family": "qwen_chat_v1",
+                "tool_mode": "host_router",
+                "structured_output": "json_repair",
+                "summary_mode": "state_schema_v1",
+            },
+            roles=("answer", "summarizer"),
             capabilities=_unknown_capabilities(),
-            **common,
+            evidence={**common["evidence"], "core_model_id": "qwen2.5-0.5b", "probe_ticket": "M-SM-B1"},
+            status="candidate",
+            production_eligible=False,
+        ),
+        ModelProfile(
+            model_id="MiniCPM4-0.5B",
+            revision="builtin-minicpm4-0.5b-v1",
+            backend="llama_server",
+            context={"n_ctx": 32768, "input_budget": 3072, "max_new_tokens": 512},
+            generation={"temperature": 0.8, "top_p": 0.8, "thinking": "unknown"},
+            adaptation={
+                "prompt_family": "minicpm4_chat_v1",
+                "tool_mode": "host_router",
+                "structured_output": "json_repair",
+                "summary_mode": "state_schema_v1",
+            },
+            roles=("answer", "summarizer"),
+            capabilities=_unknown_capabilities(),
+            evidence={**common["evidence"], "core_model_id": "minicpm4-0.5b", "probe_ticket": "M-SM-B1"},
+            status="candidate",
+            production_eligible=False,
+        ),
+        ModelProfile(
+            model_id="DistilQwen2.5-DS3-0324-7B",
+            revision="builtin-distilqwen-ds3-0324-v1",
+            backend="llama_server",
+            context={"n_ctx": 32768, "input_budget": 8192, "max_new_tokens": 1024},
+            generation={"temperature": 0.7, "top_p": 0.8, "thinking": "unknown"},
+            adaptation={
+                "prompt_family": "qwen_chat_v1",
+                "tool_mode": "host_router",
+                "structured_output": "json_repair",
+                "summary_mode": "state_schema_v1",
+            },
+            roles=("answer", "summarizer"),
+            capabilities=_unknown_capabilities(),
+            evidence={**common["evidence"], "core_model_id": "distilqwen25-ds3-0324-7b", "probe_ticket": "DSW-D1"},
+            status="candidate",
+            production_eligible=False,
         ),
         ModelProfile(
             model_id="Gemma-small",

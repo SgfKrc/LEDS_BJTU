@@ -58,13 +58,24 @@ def _profile(*, status: str = "candidate", production: bool = False) -> ModelPro
 
 def test_builtin_profiles_are_conservative_candidates() -> None:
     profiles = builtin_profiles()
-    assert {profile.model_id for profile in profiles} == {"QW1.8B", "Qwen3-0.6B", "Gemma-small"}
+    assert {profile.model_id for profile in profiles} == {
+        "QW1.8B",
+        "Qwen3-0.6B",
+        "Qwen2.5-0.5B",
+        "MiniCPM4-0.5B",
+        "DistilQwen2.5-DS3-0324-7B",
+        "Gemma-small",
+    }
     assert all(profile.status == "candidate" for profile in profiles)
     assert all(profile.production_eligible is False for profile in profiles)
     assert all(
         profile.capabilities["tool_call_generation"].status == "unknown"
         for profile in profiles
     )
+    by_id = {profile.model_id: profile for profile in profiles}
+    assert by_id["Qwen2.5-0.5B"].adaptation["prompt_family"] == "qwen_chat_v1"
+    assert by_id["MiniCPM4-0.5B"].adaptation["prompt_family"] == "minicpm4_chat_v1"
+    assert by_id["DistilQwen2.5-DS3-0324-7B"].context["max_new_tokens"] == 1024
 
 
 def test_profile_round_trip_and_digest_rejects_tampering() -> None:
