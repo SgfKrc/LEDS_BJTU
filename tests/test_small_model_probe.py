@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 from scripts.model_tools import small_model_probe as probe
+from scripts.model_tools.sandbox_runner import SandboxResult, SandboxUnavailable
 
 
 def _write_fixture(root: Path, template: str) -> Path:
@@ -87,3 +89,76 @@ def test_template_probe_environment_excludes_secrets(monkeypatch) -> None:
     assert "HF_TOKEN" not in environment
     assert "QLH_API_KEY" not in environment
     assert environment["HF_HUB_OFFLINE"] == "1"
+
+
+def test_template_execution_requires_os_sandbox(monkeypatch, tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setattr(probe, "_sidecar_python", lambda: Path("sidecar-python"))
+
+    def unavailable(*_args, **_kwargs):
+        raise SandboxUnavailable("test backend missing")
+
+    monkeypatch.setattr(probe, "run_sandboxed", unavailable)
+    result = probe._execute_template(model, timeout_seconds=1, trust_remote_code=True)
+
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "os_sandbox_unavailable"
+    assert result["sandbox"]["os_level"] is False
+
+
+def test_template_execution_attaches_sandbox_evidence(monkeypatch, tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    monkeypatch.setattr(probe, "_sidecar_python", lambda: Path("sidecar-python"))
+    payload = {
+        "schema_version": 1,
+        "operation": "template_probe",
+        "valid": True,
+        "rendering": {},
+        "thinking": {},
+    }
+    monkeypatch.setattr(
+        probe,
+        "run_sandboxed",
+        lambda *_args, **_kwargs: SandboxResult(
+            0,
+            json.dumps(payload),
+            "",
+            {
+                "available": True,
+                "backend": "fixture-sandbox",
+                "os_level": True,
+                "low_privilege": True,
+                "network_disabled": True,
+            },
+        ),
+    )
+
+    result = probe._execute_template(model, timeout_seconds=1, trust_remote_code=False)
+
+    assert result["sandbox"]["backend"] == "fixture-sandbox"
+    assert result["sandbox"]["os_level"] is True
+
+
+def test_template_snapshot_excludes_weights_and_controls_remote_code(tmp_path: Path) -> None:
+    source = tmp_path / "model"
+    source.mkdir()
+    (source / "config.json").write_text("{}", encoding="utf-8")
+    (source / "custom_model.py").write_text("# curated module", encoding="utf-8")
+    (source / "model.safetensors").write_bytes(b"weights")
+
+    metadata_only = probe._prepare_template_snapshot(source, trust_remote_code=False)
+    try:
+        assert (metadata_only / "config.json").is_file()
+        assert not (metadata_only / "custom_model.py").exists()
+        assert not (metadata_only / "model.safetensors").exists()
+    finally:
+        shutil.rmtree(metadata_only.parent, ignore_errors=True)
+
+    curated_code = probe._prepare_template_snapshot(source, trust_remote_code=True)
+    try:
+        assert (curated_code / "custom_model.py").is_file()
+        assert not (curated_code / "model.safetensors").exists()
+    finally:
+        shutil.rmtree(curated_code.parent, ignore_errors=True)

@@ -113,6 +113,16 @@ def _run_worker(unit: dict[str, Any], prompts: list[dict[str, Any]], *, quant: s
             )
         except subprocess.TimeoutExpired:
             return {"status": "failed", "error": {"code": "timeout", "message": "worker timed out"}, "jobs": []}
+    if int(getattr(completed, "returncode", 0) or 0) != 0:
+        stderr = str(getattr(completed, "stderr", "") or "").strip()
+        return {
+            "status": "failed",
+            "error": {
+                "code": "worker_exit_nonzero",
+                "message": (stderr or f"worker exited with code {completed.returncode}")[:2048],
+            },
+            "jobs": [],
+        }
     parsed: dict[str, Any] | None = None
     for line in reversed(completed.stdout.splitlines()):
         try:

@@ -1020,6 +1020,30 @@ def test_llm_smoke_worker_uses_ephemeral_offline_cache(monkeypatch):
     assert not Path(observed["HF_HOME"]).exists()
 
 
+def test_llm_smoke_worker_rejects_nonzero_exit_even_with_stale_stdout(monkeypatch):
+    def fake_run(_command, **_kwargs):
+        return SimpleNamespace(
+            returncode=7,
+            stdout='{"operation":"llm_smoke_worker","status":"passed","jobs":[]}\n',
+            stderr="worker crashed",
+        )
+
+    monkeypatch.setattr("scripts.model_tools.llm_smoke_matrix.subprocess.run", fake_run)
+    from scripts.model_tools.llm_smoke_matrix import _run_worker
+
+    result = _run_worker(
+        {"model_id": "fixture", "format": "gguf", "engine": "llama_cpp", "path": "C:/fixture.gguf"},
+        fixed_prompts(),
+        quant="int4",
+        max_new_tokens=4,
+        timeout_seconds=2,
+        allow_cpu=False,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "worker_exit_nonzero"
+
+
 def test_gguf_convert_f16_dry_run_is_read_only_and_path_redacted(tmp_path: Path):
     source = _write_hf_fixture(tmp_path / "private" / "source-model")
     converter = _write_converter_fixture(tmp_path / "toolchain")

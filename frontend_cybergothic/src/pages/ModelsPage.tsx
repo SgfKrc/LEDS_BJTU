@@ -5,6 +5,7 @@ import {
   CircleAlert,
   Cpu,
   Database,
+  Download,
   Gauge,
   LoaderCircle,
   RefreshCw,
@@ -524,7 +525,12 @@ export function ModelsPage() {
             <section className="model-panel model-panel--assets">
               <SectionHead title="Local assets" hint={`${assetList.length} discovered`} />
               {assetList.length === 0 ? (
-                <EmptyState title="No local assets" description="The models directory is empty or unavailable." compact />
+                <EmptyState
+                  title="No local assets"
+                  description="The models directory is empty or unavailable. Install a preset to make a model selectable."
+                  action={<CommandButton variant="ghost" size="sm" icon={Download} href={routeHref('downloads')}>Open model downloads</CommandButton>}
+                  compact
+                />
               ) : (
                 <ul className="asset-list">
                   {assetList.map((asset) => (
@@ -571,6 +577,7 @@ export function ModelsPage() {
               </div>
               <div className="runtime-actions">
                 <CommandButton icon={Gauge} busy={busy === 'load'} disabled={!selectedModel?.is_available || busy !== ''} onClick={() => void handleLoad()}>Load selected</CommandButton>
+                <CommandButton variant="ghost" icon={Download} href={routeHref('downloads')}>Download models</CommandButton>
                 <CommandButton variant="ghost" icon={Database} busy={busy === 'prepare-pipeline'} disabled={!selectedModel || busy !== ''} onClick={() => void handlePreparePipeline()}>Prepare pipeline</CommandButton>
                 <CommandButton variant="danger" icon={Unplug} busy={busy === 'unload'} disabled={!runtime?.loaded || busy !== ''} onClick={() => void handleUnload()}>Unload runtime</CommandButton>
               </div>

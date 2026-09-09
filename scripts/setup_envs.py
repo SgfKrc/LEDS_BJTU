@@ -154,9 +154,10 @@ ENVS: tuple[PyEnv, ...] = (
 
 # Node 子项目（均有 package-lock.json，用 npm ci 可复现安装）
 NODE_PROJECTS: tuple[tuple[str, str], ...] = (
-    ("frontend", "前端 React 仪表盘"),
+    ("frontend_cybergothic", "唯一产品前端（React + TypeScript + Vite）"),
     ("gateway", "API 网关"),
     ("control", "控制台服务"),
+    ("frontend", "旧前端（已冻结；仅历史对照/旧包兼容资源，可用 --skip frontend 跳过）"),
 )
 
 ENV_BY_NAME = {env.name: env for env in ENVS}

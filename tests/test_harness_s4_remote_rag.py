@@ -22,11 +22,39 @@ class _FakeQLHTransport:
         self.posts = []
 
     def get_json(self, path):
-        assert path == "/api/status"
-        return {"model_loaded": True, "current_model": "QW1.8B"}
+        if path == "/api/status":
+            return {"model_loaded": True, "current_model": "QW1.8B"}
+        if path == "/api/models":
+            return {
+                "models": [
+                    {
+                        "model_id": "Qwen2.5-0.5B",
+                        "is_available": False,
+                        "unavailable_reason": "download_required",
+                    }
+                ]
+            }
+        if path == "/api/models/presets":
+            return {
+                "presets": [
+                    {
+                        "id": "qwen2.5-0.5b",
+                        "name": "Qwen2.5-0.5B",
+                        "default_model_id": "Qwen2.5-0.5B",
+                        "installable": True,
+                    }
+                ]
+            }
+        if path == "/api/models/downloads":
+            return {"jobs": []}
+        raise AssertionError(f"unexpected GET path: {path}")
 
     def post_json(self, path, payload):
         self.posts.append((path, payload))
+        if path == "/api/models/downloads":
+            return {"job": {"id": "job-1", "preset_id": payload["preset_id"], "status": "queued"}}
+        if path == "/api/models/load":
+            return {"loaded": True, "model_id": payload["model_id"], "engine": payload["engine"]}
         return {"generation_id": "gen-1", "content": "answer", "metrics": {"total_prompt_tokens": 4, "total_generated_tokens": 2}}
 
     def post_stream(self, path, payload):
@@ -63,8 +91,32 @@ def test_qlh_adapter_probes_status_and_maps_bounded_transcript():
     assert result.usage == {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
     path, payload = transport.posts[-1]
     assert path == "/api/chat"
+    assert payload["model"] == "QW1.8B"
     assert "[system]" in payload["message"] and "[user]" in payload["message"]
     assert payload["routing_preference"] == "auto"
+
+
+def test_qlh_adapter_exposes_model_assets_downloads_and_load():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    transport = _FakeQLHTransport()
+    adapter = QLHAdapter(QLHAdapterConfig("http://master:8000"), transport=transport)
+    models = adapter.models()
+    assert models[0].id == "Qwen2.5-0.5B"
+    assert models[0].available is False
+    assert adapter.model_presets()["presets"][0]["id"] == "qwen2.5-0.5b"
+    assert adapter.queue_model_download("qwen2.5-0.5b")["job"]["status"] == "queued"
+    assert adapter.load_model_asset("Qwen2.5-0.5B")["loaded"] is True
+
+    client = TestClient(create_app(adapter))
+    assert client.get("/v1/model-assets").json()["models"][0]["available"] is False
+    assert client.get("/v1/model-presets").json()["presets"]
+    assert client.get("/v1/model-downloads").json()["jobs"] == []
+    queued = client.post("/v1/model-downloads", json={"preset_id": "qwen2.5-0.5b"})
+    assert queued.status_code == 200
+    loaded = client.post("/v1/models/load", json={"model_id": "Qwen2.5-0.5B"})
+    assert loaded.status_code == 200
 
 
 def test_qlh_adapter_maps_sse_tokens_and_done():

@@ -130,6 +130,64 @@ def create_app(
             "profiles": [profile.as_dict() for profile in builtin_profiles()],
         }
 
+    def qlh_model_method(name: str):
+        method = getattr(adapter, name, None)
+        if not callable(method):
+            raise AdapterError(
+                "the connected adapter does not expose QLH model assets",
+                code="model_assets_unavailable",
+                status_code=503,
+            )
+        return method
+
+    @app.get("/v1/model-assets")
+    async def model_assets() -> Any:
+        try:
+            return qlh_model_method("model_catalog")()
+        except AdapterError as exc:
+            return JSONResponse(_error_body(str(exc), code=exc.code), status_code=exc.status_code)
+
+    @app.get("/v1/model-presets")
+    async def model_presets() -> Any:
+        try:
+            return qlh_model_method("model_presets")()
+        except AdapterError as exc:
+            return JSONResponse(_error_body(str(exc), code=exc.code), status_code=exc.status_code)
+
+    @app.get("/v1/model-downloads")
+    async def model_downloads() -> Any:
+        try:
+            return qlh_model_method("model_downloads")()
+        except AdapterError as exc:
+            return JSONResponse(_error_body(str(exc), code=exc.code), status_code=exc.status_code)
+
+    @app.post("/v1/model-downloads")
+    async def queue_model_download(request: Request) -> Any:
+        try:
+            payload = await request.json()
+            preset_id = payload.get("preset_id") if isinstance(payload, Mapping) else ""
+            return qlh_model_method("queue_model_download")(preset_id)
+        except AdapterError as exc:
+            return JSONResponse(_error_body(str(exc), code=exc.code), status_code=exc.status_code)
+        except (TypeError, ValueError):
+            return JSONResponse(_error_body("preset_id is required", code="invalid_model_preset"), status_code=400)
+
+    @app.post("/v1/models/load")
+    async def load_model_asset(request: Request) -> Any:
+        try:
+            payload = await request.json()
+            if not isinstance(payload, Mapping):
+                raise ValueError
+            return qlh_model_method("load_model_asset")(
+                payload.get("model_id", ""),
+                engine=str(payload.get("engine") or "auto"),
+                quant_type=str(payload.get("quant_type") or "int4"),
+            )
+        except AdapterError as exc:
+            return JSONResponse(_error_body(str(exc), code=exc.code), status_code=exc.status_code)
+        except (TypeError, ValueError):
+            return JSONResponse(_error_body("model_id is required", code="invalid_model_id"), status_code=400)
+
     @app.get("/v1/mcp/manifest")
     async def mcp_manifest() -> Any:
         initialized = resolved_mcp.handle(

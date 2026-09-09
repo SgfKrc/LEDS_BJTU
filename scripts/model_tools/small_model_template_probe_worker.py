@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ THINKING_MARKERS = ("<think>", "</think>", "<|think|>")
 
 
 def _base() -> dict[str, Any]:
+    sandbox_backend = os.environ.get("QLH_OS_SANDBOX_BACKEND", "")
+    network_disabled = os.environ.get("QLH_OS_SANDBOX_NETWORK_DISABLED") == "1"
     return {
         "schema_version": SCHEMA_VERSION,
         "operation": "template_probe",
@@ -21,6 +24,13 @@ def _base() -> dict[str, Any]:
         "network_used": False,
         "weights_loaded": False,
         "isolated": True,
+        "sandbox": {
+            "available": bool(sandbox_backend),
+            "backend": sandbox_backend or None,
+            "os_level": bool(sandbox_backend),
+            "low_privilege": bool(sandbox_backend),
+            "network_disabled": network_disabled,
+        },
         "runtime": {"transformers_version": None},
         "thinking": {"switch_declared": False, "runtime_status": "unknown"},
         "rendering": {},
@@ -82,6 +92,24 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
     if not model_path.is_dir():
         result["errors"].append({"code": "model_path_invalid", "message": "model directory is missing"})
         return result
+    if not result["sandbox"]["available"]:
+        result["errors"].append({"code": "os_sandbox_missing", "message": "template worker requires an OS-level sandbox"})
+        return result
+    readable_files = {}
+    for name in ("config.json", "tokenizer_config.json", "tokenizer.json", "tokenizer.model"):
+        candidate = model_path / name
+        try:
+            readable_files[name] = candidate.is_file() and candidate.stat().st_size > 0
+        except OSError:
+            readable_files[name] = False
+    result["filesystem"] = {
+        "model_directory_readable": True,
+        "metadata_files": readable_files,
+    }
+    if not any(readable_files.values()):
+        result["filesystem"]["model_directory_readable"] = False
+        result["errors"].append({"code": "model_files_unreadable", "message": "model metadata is not readable inside the sandbox"})
+        return result
     controller = Path(str(request.get("controller_python", ""))).absolute().resolve(strict=False)
     result["isolated"] = controller != Path(sys.executable).absolute().resolve(strict=False)
     if not result["isolated"]:
@@ -120,6 +148,14 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
             else:
                 result["thinking"]["runtime_status"] = "accepted_but_undeclared"
         result["valid"] = not result["errors"]
+        return result
+    except FileNotFoundError as exc:
+        missing_name = Path(str(exc.filename)).name if exc.filename else None
+        result["errors"].append({
+            "code": "tokenizer_probe_failed",
+            "message": exc.__class__.__name__,
+            "missing_name": missing_name,
+        })
         return result
     except Exception as exc:
         result["errors"].append({"code": "tokenizer_probe_failed", "message": exc.__class__.__name__})

@@ -35,11 +35,16 @@ class AdapterModel:
     id: str
     owned_by: str = "harness"
     created: int | None = None
+    available: bool = True
+    unavailable_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {"id": self.id, "object": "model", "owned_by": self.owned_by}
         if self.created is not None:
             value["created"] = self.created
+        value["available"] = self.available
+        if self.unavailable_reason:
+            value["unavailable_reason"] = self.unavailable_reason
         return value
 
 

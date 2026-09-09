@@ -1,6 +1,8 @@
 # 🧠 轻量化大模型分布式边缘推理优化系统
 
 > **Language**: [English](docs/README.en.md) · [简体中文](README.md)
+>
+> 👀 **新人/评审快速入口**：[双语摘要速览 QLH at a Glance](docs/项目速览-QLH-at-a-Glance.md) —— 2 分钟了解项目是什么、已验证什么、如何上手；完整能力边界见本文档。
 
 **面向异构边缘设备的多引擎、可演进分布式大模型推理系统**
 
@@ -62,7 +64,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🧪 **实验质量与文档治理** | EX-N3 以只读生产质量门复核计划、样本、校准、性能、质量和人工复核，历史记录 3/3 通过；文档维护 Agent 已完成本机检索/语义质量门，只生成建议而不自动改写文档 |
 | 🧩 **子项目：小模型 harness 工作台** | 面向玩具/自用的小模型定制化推理工作台（S1-S8 本机/离线开发门完成）：上下文预算与 STATE 压缩、模型画像/能力门、OpenAI 兼容 `/v1`、定制化实验台（A/B + Pareto）、生图工作区、SQLite 会话与 RAG、长期记忆（RAG+压缩+本地 memory）、联网搜索与轻量 MCP 服务、红队安全样本；**不 import 主项目代码、仅共享模型工件**，亚1B 与 DS3 模型画像已登记 → [harness 方案](docs/小模型轻量推理harness工作台调研与方案.md) |
 | 📡 **联网搜索与轻量 Fetch 工具** | WEB-TOOL G1-G6 本机开发门完成：离线能力探测、Tool Gateway fail-closed（HTTPS 强制/SSRF/DNS/重定向复检）、受限 Fetch/SearXNG adapter、TaskGraph `tool_request` Stage、显式 `persist` 工具缓存与 API、质量门与联合审计；`production_network_enabled=false`，真实网络验收后置 → [调研与分期计划](docs/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
-| 📝 **文档维护 Agent 子项目** | 独立包 `tools/docagent/`：规则数据化（`RULES.md` + `rules.yaml` 驱动扫描器）、规则变更机械扫描（增量矩阵 new/gone/changed + `--max-new/--max-gone` 门）、演进门控（agent 改规则 proposed→preflight→gates→released）与等价回归 → [专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) |
+| 📝 **文档维护 Agent 子项目** | 独立包（独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)，主项目以 submodule 引入）：规则数据化（`RULES.md` + `rules.yaml` 驱动扫描器）、规则变更机械扫描（增量矩阵 new/gone/changed + `--max-new/--max-gone` 门）、演进门控（agent 改规则 proposed→preflight→gates→released）与等价回归 → [专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) |
 | 🎯 **判题口径修复与 DS3 替代 R1** | `loose_contains` + 512 token（P5）实证可区分（Qwen3-4B 1/4 vs 1.8B 0/4）；DS3-0324-7B v2 全口径 **2/4×3、8/11×3**（仅预算 192→512 即 0/4→2/4，判题口径问题实证）→ 替代 R1 判题模型的**已批准候选** → [DS3 专项](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
 
 ### 项目设计理念
@@ -392,7 +394,8 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 | `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar（含 pipeline 执行依赖） | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
 | `.venv-packaging` | 集显版打包（torch CPU + PyInstaller） | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
 | `.venv-packaging-cuda` | 独显版打包 + SD 侧车 | `packaging/requirements-cpu.txt` + `packaging/requirements-sd15.txt` | `requirements-lock/packaging-cuda.lock.txt` |
-| frontend / gateway / control | Node 子项目 | 各 `package-lock.json`（`npm ci`，随 --all 处理） | — |
+| frontend_cybergothic / gateway / control | Node 子项目 | 各 `package-lock.json`（`npm ci`，随 `--all` 处理） | — |
+| frontend（旧，已冻结） | 仅历史对照/旧包兼容资源 | `npm ci`（默认随 `--all`，可用 `--skip frontend` 跳过） | 不再接受新功能开发 |
 
 > `setup_all_envs.bat` 在 Windows 会自动 `chcp 65001`；直接跑脚本时若终端乱码，
 > 手动 `chcp 65001` 或 `set PYTHONIOENCODING=utf-8` 即可。
@@ -980,7 +983,7 @@ python serve.py
 - [联网搜索与轻量 Fetch 工具调用可行性调研与分期计划](docs/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) — WEB-TOOL G0-G6/AUDIT 主节点 Tool Gateway 支线：能力探测、fail-closed 联网策略、adapter、TaskGraph Stage、显式持久化缓存与质量门；真实网络验收后置
 - [DistilQwen2.5-DS3-0324 替代 R1 判题模型专项计划](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) — 快思考替代不可关闭 thinking 的 R1：v2 全口径 **2/4×3、8/11×3**，替代 R1 已批准候选；附多模型 0/4 判题口径问题专项分析
 - [亚 1B 小模型专项实验计划](docs/亚1B小模型专项实验计划.md) — Qwen2.5-0.5B / Qwen3-0.6B / MiniCPM4-0.5B 用途（链路轻载体/thinking 开关标杆/新架构探针）与 M-SM-B1~B5 实验票
-- [文档维护 Agent 工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) — `tools/docagent/` 独立包、规则数据化、规则变更机械扫描与演进门控（P1-P5）
+- [文档维护 Agent 工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) — 独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)（主项目 submodule 引入）、规则数据化、规则变更机械扫描与演进门控（P1-P5）
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
@@ -1024,8 +1027,8 @@ python serve.py
 
 ## 📄 许可证
 
-本项目为北京交通大学 2026 年大学生创新创业训练计划项目。
+本项目为北京交通大学 2026 年大学生创新创业训练计划项目，以 [MIT License](LICENSE) 发布（Copyright (c) 2026 SgfKrc）。
 
 ---
 
-© 2026 北京交通大学 · 项目团队
+© 2026 SgfKrc（QLH Project, Beijing Jiaotong University）· MIT License

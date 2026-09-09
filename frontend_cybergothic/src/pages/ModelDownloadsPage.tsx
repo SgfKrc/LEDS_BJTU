@@ -23,6 +23,7 @@ import { PageHeader, SectionHead } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
 import { pushToast } from '../components/Toast';
 import { useRegisterRefresh } from '../app/refreshBus';
+import { routeHref } from '../app/routes';
 import { useReveal } from '../motion/useReveal';
 import {
   fixturesEnabled,
@@ -312,7 +313,7 @@ export function ModelDownloadsPage() {
             <td data-label="状态"><StatusBadge tone={state.tone} label={state.label} size="sm" /></td>
             <td data-label="进度"><div className="downloads-progress" aria-label={`进度 ${percent}%`}><span style={{ width: `${percent}%` }} /></div><small className="table__cell--muted">{job.downloaded_bytes != null && job.total_bytes ? `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.total_bytes)}` : `${percent}%`}</small></td>
             <td data-label="错误" className="table__cell--muted">{job.error_code ? <><span>{job.error_code}</span>{job.error ? <small>{job.error}</small> : null}</> : '—'}</td>
-            <td data-label="操作" className="ttable__action-col downloads-job-actions">{job.status === 'queued' ? <CommandButton variant="ghost" size="sm" icon={X} disabled={Boolean(busy)} busy={busy === `cancel:${job.job_id}`} onClick={() => void handleCancel(job)}>取消</CommandButton> : null}{job.status === 'failed' ? <span className="table__cell--muted"><CircleAlert size={13} /> {job.error_code}</span> : null}{job.status === 'ready' ? <span className="table__cell--muted"><Download size={13} /> 已就绪</span> : null}{active ? <LoaderCircle size={14} className="spin" aria-label="任务进行中" /> : null}</td>
+            <td data-label="操作" className="ttable__action-col downloads-job-actions">{job.status === 'queued' ? <CommandButton variant="ghost" size="sm" icon={X} disabled={Boolean(busy)} busy={busy === `cancel:${job.job_id}`} onClick={() => void handleCancel(job)}>取消</CommandButton> : null}{job.status === 'failed' ? <span className="table__cell--muted"><CircleAlert size={13} /> {job.error_code}</span> : null}{job.status === 'ready' ? <CommandButton variant="ghost" size="sm" icon={Download} href={routeHref('models')}>Open model lab</CommandButton> : null}{active ? <LoaderCircle size={14} className="spin" aria-label="任务进行中" /> : null}</td>
           </tr>;
         })}</tbody>
       </table></div></div> : null}

@@ -34,7 +34,7 @@ import {
   Workflow,
   X,
 } from 'lucide-react';
-import { apiUrl, appendSessionMessage, attachSessionAsset, callMcpTool, checkHealth, createSession, generateImage, getImageCapabilities, getMcpManifest, getRagHealth, getSession, HarnessApiError, listModelProfiles, listModels, listSessions, searchRag, streamChat, type ChatMessage, type ConnectionState, type HarnessModel, type ImageCapabilities, type ImageResult, type MCPCallResponse, type MCPManifest, type MCPTool, type ModelProfileSummary, type RagContext, type RagHit, type SessionSummary } from './data';
+import { apiUrl, appendSessionMessage, attachSessionAsset, callMcpTool, checkHealth, createSession, generateImage, getImageCapabilities, getMcpManifest, getRagHealth, getSession, HarnessApiError, listModelDownloads, listModelPresets, listModelProfiles, listModels, listSessions, loadModelAsset, queueModelDownload, searchRag, streamChat, type ChatMessage, type ConnectionState, type HarnessModel, type HarnessModelDownload, type HarnessModelPreset, type ImageCapabilities, type ImageResult, type MCPCallResponse, type MCPManifest, type MCPTool, type ModelProfileSummary, type RagContext, type RagHit, type SessionSummary } from './data';
 
 type ViewId = 'chat' | 'rag' | 'assets' | 'mcp' | 'runtime';
 type Theme = 'dark' | 'light';
@@ -60,6 +60,10 @@ function App() {
   const [backend, setBackend] = useState('checking');
   const [modelCatalog, setModelCatalog] = useState<HarnessModel[]>([]);
   const [modelProfiles, setModelProfiles] = useState<ModelProfileSummary[]>([]);
+  const [modelPresets, setModelPresets] = useState<HarnessModelPreset[]>([]);
+  const [modelDownloads, setModelDownloads] = useState<HarnessModelDownload[]>([]);
+  const [modelBusy, setModelBusy] = useState('');
+  const [modelNotice, setModelNotice] = useState('');
   const [selectedModel, setSelectedModel] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>(fixtureMessages);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -155,6 +159,8 @@ function App() {
       setModelCatalog([{ id: 'harness-default', owned_by: 'offline-fixture' }]);
       setSelectedModel('harness-default');
       setModelProfiles([]);
+      setModelPresets([]);
+      setModelDownloads([]);
       setImageCapabilities(null);
       setImageNotice('图像 API 未连接，不生成 fixture 图片。');
       setMcpManifest(null);
@@ -168,6 +174,9 @@ function App() {
       setModelCatalog(nextModels);
       setSelectedModel((current) => current && nextModels.some((model) => model.id === current) ? current : nextModels[0]?.id || '');
       setModelProfiles(Array.isArray(profilesResponse.profiles) ? profilesResponse.profiles : []);
+      const [presetResponse, downloadResponse] = await Promise.allSettled([listModelPresets(), listModelDownloads()]);
+      if (presetResponse.status === 'fulfilled') setModelPresets(presetResponse.value.presets || []);
+      if (downloadResponse.status === 'fulfilled') setModelDownloads(downloadResponse.value.jobs || []);
     } catch (error) {
       setModelCatalog([]);
       setSelectedModel('');
@@ -195,6 +204,49 @@ function App() {
   };
 
   useEffect(() => { void refresh(); }, []);
+
+  useEffect(() => {
+    if (!modelDownloads.some((job) => ['queued', 'downloading', 'verifying', 'registering'].includes(job.status))) return undefined;
+    const timer = window.setInterval(async () => {
+      try {
+        const [modelsResponse, downloadResponse] = await Promise.all([listModels(), listModelDownloads()]);
+        setModelCatalog(Array.isArray(modelsResponse.data) ? modelsResponse.data : []);
+        setModelDownloads(downloadResponse.jobs || []);
+      } catch {
+        // The main refresh path retains the last known asset state.
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [modelDownloads]);
+
+  const startModelDownload = async (preset: HarnessModelPreset) => {
+    if (modelBusy || !preset.installable) return;
+    setModelBusy(`download:${preset.id}`);
+    try {
+      await queueModelDownload(preset.id);
+      setModelNotice(`已开始下载 ${preset.display}`);
+      const response = await listModelDownloads();
+      setModelDownloads(response.jobs || []);
+    } catch (error) {
+      setModelNotice(`下载启动失败：${error instanceof Error ? error.message : 'unknown error'}`);
+    } finally {
+      setModelBusy('');
+    }
+  };
+
+  const loadSelectedModel = async (model: HarnessModel) => {
+    if (modelBusy || !model.available) return;
+    setModelBusy(`load:${model.id}`);
+    try {
+      await loadModelAsset(model.id);
+      setModelNotice(`已请求加载 ${model.id}`);
+      await refresh();
+    } catch (error) {
+      setModelNotice(`模型加载失败：${error instanceof Error ? error.message : 'unknown error'}`);
+    } finally {
+      setModelBusy('');
+    }
+  };
 
   const selectedMcpTool = useMemo(() => mcpManifest?.tools.find((tool) => tool.name === mcpToolName) || null, [mcpManifest, mcpToolName]);
 
@@ -262,6 +314,10 @@ function App() {
       } else {
         const activeModel = selectedModel.trim();
         if (!activeModel) throw new Error('后端未返回可用模型，停止发送请求');
+        const selectedCatalogModel = modelCatalog.find((model) => model.id === activeModel);
+        if (selectedCatalogModel?.available === false) {
+          throw new Error('模型尚未下载，请打开运行时页面排队下载后再发送');
+        }
         let sessionId = activeSessionId;
         if (!sessionId) {
           const session = await createSession('默认工作区');
@@ -414,7 +470,7 @@ function App() {
           {view === 'rag' && <RagView query={ragQuery} setQuery={setRagQuery} hits={ragHits} context={ragContext} health={ragHealth} notice={ragNotice} onSubmit={runSearch} />}
           {view === 'assets' && <AssetView capabilities={imageCapabilities} assets={imageAssets} prompt={imagePrompt} setPrompt={setImagePrompt} size={imageSize} setSize={setImageSize} steps={imageSteps} setSteps={setImageSteps} seed={imageSeed} setSeed={setImageSeed} busy={imageBusy} notice={imageNotice} onSubmit={runImageGeneration} />}
           {view === 'mcp' && <McpView manifest={mcpManifest} selectedTool={selectedMcpTool} selectedName={mcpToolName} setSelectedName={setMcpToolName} argumentsValue={mcpArguments} setArgumentsValue={setMcpArguments} result={mcpResult} busy={mcpBusy} notice={mcpNotice} onSubmit={runMcpCall} onRefresh={() => void refreshMcp()} />}
-          {view === 'runtime' && <RuntimeView connection={connection} backend={backend} models={modelCatalog} profiles={modelProfiles} onRefresh={() => void refresh()} />}
+          {view === 'runtime' && <RuntimeView connection={connection} backend={backend} models={modelCatalog} profiles={modelProfiles} presets={modelPresets} downloads={modelDownloads} busy={modelBusy} notice={modelNotice} onDownload={startModelDownload} onLoad={loadSelectedModel} onRefresh={() => void refresh()} />}
         </main>
       </div>
     </div>
@@ -457,7 +513,43 @@ function McpView({ manifest, selectedTool, selectedName, setSelectedName, argume
   </section>;
 }
 
-function RuntimeView({ connection, backend, models, profiles, onRefresh }: { connection: ConnectionState; backend: string; models: HarnessModel[]; profiles: ModelProfileSummary[]; onRefresh: () => void }) {
+function RuntimeView({ connection, backend, models, profiles, presets, downloads, busy, notice, onDownload, onLoad, onRefresh }: {
+  connection: ConnectionState;
+  backend: string;
+  models: HarnessModel[];
+  profiles: ModelProfileSummary[];
+  presets: HarnessModelPreset[];
+  downloads: HarnessModelDownload[];
+  busy: string;
+  notice: string;
+  onDownload: (preset: HarnessModelPreset) => void;
+  onLoad: (model: HarnessModel) => void;
+  onRefresh: () => void;
+}) {
+  const activeDownloads = downloads.filter((job) => ['queued', 'downloading', 'verifying', 'registering'].includes(job.status));
+  return <section className="utility-view" aria-labelledby="runtime-title">
+    <div className="view-heading"><div><span className="eyebrow">RUNTIME / MODEL ASSETS</span><h1 id="runtime-title">运行时能力</h1><p>Harness 直接消费 QLH 模型目录、预设和下载任务；候选画像仍与已安装运行时分开显示。</p></div><Network size={30} className="heading-icon" /></div>
+    <div className="runtime-grid"><div className="runtime-cell"><span className="eyebrow">CONNECTION</span><strong>{connection.toUpperCase()}</strong><small>API healthz</small></div><div className="runtime-cell"><span className="eyebrow">ADAPTER</span><strong>{backend}</strong><small>当前后端</small></div><div className="runtime-cell"><span className="eyebrow">MODEL CATALOG</span><strong>{models.length}</strong><small>可见资产</small></div><div className="runtime-cell"><span className="eyebrow">DOWNLOADS</span><strong>{activeDownloads.length}</strong><small>进行中</small></div></div>
+    {notice ? <p className="utility-notice" role="status">{notice}</p> : null}
+    <div className="profile-list" aria-label="模型资产列表">
+      {models.length === 0 ? <EmptyUtility icon={<CircleAlert size={22} />} title="暂无模型资产" detail="请先确认 QLH API 在线，然后从预设列表安装模型。" /> : models.map((model) => <article className="profile-row" key={model.id}>
+        <div><strong>{model.id}</strong><small>{model.owned_by || 'qlh'} · {model.available === false ? '未下载' : '可加载'}</small>{model.unavailable_reason ? <small>{model.unavailable_reason}</small> : null}</div>
+        <button className="action-button action-button--quiet" type="button" disabled={busy !== '' || model.available === false} onClick={() => onLoad(model)}>{busy === `load:${model.id}` ? '加载中…' : '加载'}</button>
+      </article>)}
+    </div>
+    <div className="profile-list" aria-label="模型预设列表">
+      {presets.length === 0 ? <EmptyUtility icon={<CircleAlert size={22} />} title="暂无可用预设" detail="当前连接的 adapter 没有暴露 QLH 下载服务。" /> : presets.map((preset) => <article className="profile-row" key={preset.id}>
+        <div><strong>{preset.display}</strong><small>{preset.kind} · {preset.default_engine || 'auto'} · {preset.default_model_id || preset.id}</small>{preset.description ? <small>{preset.description}</small> : null}</div>
+        <button className="action-button action-button--quiet" type="button" disabled={busy !== '' || !preset.installable} onClick={() => onDownload(preset)}>{busy === `download:${preset.id}` ? '排队中…' : preset.installable ? '下载' : '资源不足'}</button>
+      </article>)}
+    </div>
+    {downloads.length > 0 ? <div className="profile-list" aria-label="模型下载任务">{downloads.map((job) => <article className="profile-row" key={job.job_id}><div><strong>{job.model_id || job.preset_id || job.job_id}</strong><small>{job.status} · {Math.round((job.progress || 0) * 100)}%</small>{job.error ? <small>{job.error}</small> : null}</div><span className={`profile-status profile-status--${job.status}`}>{job.status}</span></article>)}</div> : null}
+    <div className="profile-list" aria-label="模型画像列表">{profiles.length === 0 ? <EmptyUtility icon={<CircleAlert size={22} />} title="暂无模型画像" detail="连接 Harness API 后读取候选画像。" /> : profiles.map((profile) => <article className="profile-row" key={`${profile.model_id}:${profile.backend}:${profile.revision}`}><div><strong>{profile.model_id}</strong><small>{profile.backend} · {profile.roles.join(' / ')}</small>{profile.aliases?.length ? <small>资产 ID：{profile.aliases.join(' / ')}</small> : null}</div><span className={`profile-status profile-status--${profile.status}`}>{profile.status}</span><small>{profile.production_eligible ? 'production eligible' : 'runtime gate pending'}</small></article>)}</div>
+    <button className="action-button action-button--quiet" type="button" onClick={onRefresh}><RefreshCw size={16} />重新探测</button>
+  </section>;
+}
+
+function ProfileRuntimeView({ connection, backend, models, profiles, onRefresh }: { connection: ConnectionState; backend: string; models: HarnessModel[]; profiles: ModelProfileSummary[]; onRefresh: () => void }) {
   return <section className="utility-view" aria-labelledby="runtime-title"><div className="view-heading"><div><span className="eyebrow">RUNTIME / MODEL PROFILES</span><h1 id="runtime-title">运行时能力</h1><p>在线模型来自 adapter，候选画像来自 Harness registry；候选不会被 UI 自动视为生产模型。</p></div><Network size={30} className="heading-icon" /></div><div className="runtime-grid"><div className="runtime-cell"><span className="eyebrow">CONNECTION</span><strong>{connection.toUpperCase()}</strong><small>API healthz</small></div><div className="runtime-cell"><span className="eyebrow">ADAPTER</span><strong>{backend}</strong><small>当前后端</small></div><div className="runtime-cell"><span className="eyebrow">LIVE MODELS</span><strong>{models.length}</strong><small>可用于对话选择</small></div><div className="runtime-cell"><span className="eyebrow">CANDIDATES</span><strong>{profiles.length}</strong><small>画像待运行时验证</small></div></div><div className="profile-list" aria-label="模型画像列表">{profiles.length === 0 ? <EmptyUtility icon={<CircleAlert size={22} />} title="暂无模型画像" detail="连接 Harness API 后读取候选画像。" /> : profiles.map((profile) => <article className="profile-row" key={`${profile.model_id}:${profile.backend}:${profile.revision}`}><div><strong>{profile.model_id}</strong><small>{profile.backend} · {profile.roles.join(' / ')}</small>{profile.aliases?.length ? <small>资产 ID：{profile.aliases.join(' / ')}</small> : null}</div><span className={`profile-status profile-status--${profile.status}`}>{profile.status}</span><small>{profile.production_eligible ? 'production eligible' : 'runtime gate pending'}</small></article>)}</div><button className="action-button action-button--quiet" type="button" onClick={onRefresh}><RefreshCw size={16} />重新探测</button></section>;
 }
 
