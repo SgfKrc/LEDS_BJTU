@@ -988,6 +988,29 @@ def test_list_models_includes_active_model_id(monkeypatch):
     assert "qwen-1_8b" in model_ids
 
 
+def test_list_models_exposes_new_model_assets_for_frontend_selection(monkeypatch):
+    class FakeManager:
+        active_model_id = ""
+
+    monkeypatch.setattr(api_server, "model_manager", FakeManager())
+    monkeypatch.setattr(model_host, "model_loaded", False)
+    monkeypatch.setattr(api_server.mc, "is_cuda_available", lambda: False)
+
+    result = asyncio.run(api_server.list_models())
+    models = {item["model_id"]: item for item in result["models"]}
+    expected = {
+        "qwen2.5-0.5b",
+        "qwen3-0.6b",
+        "minicpm4-0.5b",
+        "distilqwen25-ds3-0324-7b",
+    }
+
+    assert expected <= models.keys()
+    assert all(models[model_id]["is_builtin"] for model_id in expected)
+    assert all(models[model_id]["is_available"] for model_id in expected)
+    assert all(models[model_id]["supported_engines"] == ["llama_cpp", "pytorch"] for model_id in expected)
+
+
 def test_list_models_returns_null_when_not_loaded(monkeypatch):
     """模型未加载时 active_model_id 为 None"""
     class FakeManager:

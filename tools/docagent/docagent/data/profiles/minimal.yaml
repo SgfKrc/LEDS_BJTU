@@ -1,0 +1,18 @@
+{
+  "schema_version": "qlh.docagent.profile.v1",
+  "profile_version": 1,
+  "name": "minimal",
+  "docs_dir": "docs",
+  "exclude": [],
+  "vocabulary": {
+    "status_exemptions": ["\u5386\u53f2\u53c2\u8003", "\u5f85\u62c6\u5206", "\u4e0d\u4f5c\u4e3a\u5f53\u524d\u80fd\u529b", "\u5df2\u5e9f\u5f03", "\u5e9f\u5f03", "\u51bb\u7ed3", "\u5386\u53f2\u8bb0\u5f55"],
+    "stale_status_hints": ["\u89c4\u5212", "Candidate", "Blocked"],
+    "done_markers": ["\u2705", "Completed", "\u5df2\u5b8c\u6210", "\u5df2\u5173\u95ed", "\u5df2\u9a8c\u6536", "\u5f00\u53d1\u95e8\u5b8c\u6210", "\u9636\u6bb5 2 \u5b8c\u6210", "\u5b8c\u6210\uff08"],
+    "topic_stop_words": ["agent", "audit", "candidate", "completed", "design", "development", "document", "implementation", "maintenance", "model", "plan", "planning", "project", "status", "support", "tool", "update"]
+  },
+  "git": {
+    "enabled": false,
+    "status_scope": "docs",
+    "source_root": "src"
+  }
+}

@@ -38,6 +38,7 @@ from .llama_quantize_toolchain import resolve_quantizer, verify_managed_package
 from .maintenance import clean_models, model_disk_usage
 from .sweep import sweep_models
 from .sync_status import build_inventory, compare_inventories
+from .small_model_probe import probe_artifact, run_b1_probe, run_dsw_d1
 
 __all__ = [
     "build_inventory",
@@ -81,4 +82,7 @@ __all__ = [
     "sweep_models",
     "verify_gguf",
     "verify_managed_package",
+    "probe_artifact",
+    "run_b1_probe",
+    "run_dsw_d1",
 ]

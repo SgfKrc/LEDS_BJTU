@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
+import { ShieldCheck } from 'lucide-react';
 import {
   bootstrapAuthOwner,
   fetchAuthCapability,
@@ -226,6 +227,7 @@ export default function AuthGate({ children }) {
         <section className="auth-panel" aria-labelledby="auth-title">
           <header className="auth-brand">
             <div className="auth-brand-mark" aria-hidden="true"><img src="/qlh.jpg" alt="" width="44" height="44" /></div>
+            <ShieldCheck size={18} aria-hidden="true" />
             <div>
               <h1 id="auth-title">QLH</h1>
               <p>主节点认证</p>
@@ -251,6 +253,7 @@ export default function AuthGate({ children }) {
       <section className="auth-panel" aria-labelledby="auth-title">
         <header className="auth-brand">
           <div className="auth-brand-mark" aria-hidden="true"><img src="/qlh.jpg" alt="" width="44" height="44" /></div>
+          <ShieldCheck size={18} aria-hidden="true" />
           <div>
             <h1 id="auth-title">QLH</h1>
             <p>主节点认证</p>

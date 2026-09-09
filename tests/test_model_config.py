@@ -57,6 +57,25 @@ def test_deepseek_r1_distill_qwen_slots_are_registered():
         assert "int4" in cfg.quant_types
 
 
+def test_new_small_and_distilqwen_slots_are_registered():
+    expected = {
+        "qwen2.5-0.5b": ("Qwen/Qwen2.5-0.5B-Instruct", "models/qwen2.5-0.5b-instruct", "models/qwen2.5-0.5b-instruct-q4_k_m.gguf", 1.5, 32768),
+        "qwen3-0.6b": ("Qwen/Qwen3-0.6B", "models/qwen3-0.6b", "models/qwen3-0.6b-q8_0.gguf", 2.0, 40960),
+        "minicpm4-0.5b": ("openbmb/MiniCPM4-0.5B", "models/minicpm4-0.5b", "models/minicpm4-0.5b-q4_k_m.gguf", 1.5, 32768),
+        "distilqwen25-ds3-0324-7b": ("alibaba-pai/DistilQwen2.5-DS3-0324-7B", "models/distilqwen25-ds3-0324-7b", "models/distilqwen25-ds3-0324-7b-q4_k_m.gguf", 8.0, 32768),
+    }
+    for model_id, (hf_id, model_suffix, gguf_suffix, vram, context) in expected.items():
+        cfg = mc.get_builtin_model(model_id)
+        assert cfg is not None
+        assert cfg.model_type == "both"
+        assert cfg.huggingface_id == hf_id
+        assert cfg.recommended_vram_gb == vram
+        assert cfg.max_context == context
+        assert cfg.is_experimental is True
+        assert os.path.normpath(cfg.model_path).endswith(os.path.normpath(model_suffix))
+        assert os.path.normpath(cfg.gguf_path).endswith(os.path.normpath(gguf_suffix))
+
+
 def test_experimental_models_are_hidden_without_cuda(monkeypatch):
     monkeypatch.setattr(mc, "is_cuda_available", lambda: False)
 

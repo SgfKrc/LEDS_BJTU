@@ -23,6 +23,7 @@ _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _LLM_MODEL_PREFIXES = (
     "qwen", "deepseek", "gemma", "llama", "mistral", "mixtral", "phi",
     "glm", "internlm", "baichuan", "yi", "falcon", "starcoder",
+    "minicpm", "minicpm4",
 )
 
 
