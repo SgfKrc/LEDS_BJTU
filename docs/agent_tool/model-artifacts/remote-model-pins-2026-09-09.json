@@ -1,0 +1,177 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-09",
+  "source": "Official Hugging Face repository file pages",
+  "presets": {
+    "qwen2.5-0.5b-instruct": {
+      "repo_id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "allow_patterns": [
+        ".gitattributes",
+        "LICENSE",
+        "README.md",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json"
+      ],
+      "required_files": [
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json"
+      ],
+      "weight_files": [
+        {
+          "path": "model.safetensors",
+          "sha256": "fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe"
+        }
+      ]
+    },
+    "qwen3-0.6b": {
+      "repo_id": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "allow_patterns": [
+        ".gitattributes",
+        "LICENSE",
+        "README.md",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json"
+      ],
+      "required_files": [
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json"
+      ],
+      "weight_files": [
+        {
+          "path": "model.safetensors",
+          "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+        }
+      ]
+    },
+    "minicpm4-0.5b": {
+      "repo_id": "openbmb/MiniCPM4-0.5B",
+      "revision": "5253c7fcc5e29e1cf3eacb59a58adf1ba4df8630",
+      "allow_patterns": [
+        ".gitattributes",
+        "README.md",
+        "added_tokens.json",
+        "config.json",
+        "configuration_minicpm.py",
+        "generation_config.json",
+        "model.safetensors",
+        "modeling_minicpm.py",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json"
+      ],
+      "required_files": [
+        "added_tokens.json",
+        "config.json",
+        "configuration_minicpm.py",
+        "generation_config.json",
+        "model.safetensors",
+        "modeling_minicpm.py",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json"
+      ],
+      "weight_files": [
+        {
+          "path": "model.safetensors",
+          "sha256": "ef74f4de1d1c580dd64e425d11f29881b9fd39f9be16a485150f727d4583181c"
+        }
+      ]
+    },
+    "distilqwen25-ds3-0324-7b": {
+      "repo_id": "alibaba-pai/DistilQwen2.5-DS3-0324-7B",
+      "revision": "5d7386b1c99a5377b1b6f2826740b954cb68a858",
+      "allow_patterns": [
+        ".gitattributes",
+        "README.md",
+        "added_tokens.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model-00001-of-00007.safetensors",
+        "model-00002-of-00007.safetensors",
+        "model-00003-of-00007.safetensors",
+        "model-00004-of-00007.safetensors",
+        "model-00005-of-00007.safetensors",
+        "model-00006-of-00007.safetensors",
+        "model-00007-of-00007.safetensors",
+        "model.safetensors.index.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json"
+      ],
+      "required_files": [
+        "added_tokens.json",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model-00001-of-00007.safetensors",
+        "model-00002-of-00007.safetensors",
+        "model-00003-of-00007.safetensors",
+        "model-00004-of-00007.safetensors",
+        "model-00005-of-00007.safetensors",
+        "model-00006-of-00007.safetensors",
+        "model-00007-of-00007.safetensors",
+        "model.safetensors.index.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json"
+      ],
+      "weight_files": [
+        {
+          "path": "model-00001-of-00007.safetensors",
+          "sha256": "3da3999265e556c6a17262c581cae5fd464c0662df761a6ce748f98d297db2cd"
+        },
+        {
+          "path": "model-00002-of-00007.safetensors",
+          "sha256": "8b24f88c03736c71ff99f774d7ce7ce60f63f878602519d3d9f6d4d578ec401b"
+        },
+        {
+          "path": "model-00003-of-00007.safetensors",
+          "sha256": "9ca39c4e462ce3107dbeb0cfa352f85ad82b8be63b0d8a9cfec9db1cf299b399"
+        },
+        {
+          "path": "model-00004-of-00007.safetensors",
+          "sha256": "436e19556290a63ce945cd9791ec84ca74ca51e2a14e440cfc976065f9110145"
+        },
+        {
+          "path": "model-00005-of-00007.safetensors",
+          "sha256": "ae1f536219974c5425bad02de9fba2a50e00bacf7436320a6314f8e219fc7039"
+        },
+        {
+          "path": "model-00006-of-00007.safetensors",
+          "sha256": "a5a2610528e42e31068d608a0969aaa4b06fb39c9731c9473aa4c65887e6df11"
+        },
+        {
+          "path": "model-00007-of-00007.safetensors",
+          "sha256": "e491ea771cda28076d0f4421e16f605135c29a7821d078894b43342f3be64bdd"
+        }
+      ]
+    }
+  }
+}
