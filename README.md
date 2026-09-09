@@ -394,7 +394,8 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 | `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar（含 pipeline 执行依赖） | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
 | `.venv-packaging` | 集显版打包（torch CPU + PyInstaller） | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
 | `.venv-packaging-cuda` | 独显版打包 + SD 侧车 | `packaging/requirements-cpu.txt` + `packaging/requirements-sd15.txt` | `requirements-lock/packaging-cuda.lock.txt` |
-| frontend / gateway / control | Node 子项目 | 各 `package-lock.json`（`npm ci`，随 --all 处理） | — |
+| frontend_cybergothic / gateway / control | Node 子项目 | 各 `package-lock.json`（`npm ci`，随 `--all` 处理） | — |
+| frontend（旧，已冻结） | 仅历史对照/旧包兼容资源 | `npm ci`（默认随 `--all`，可用 `--skip frontend` 跳过） | 不再接受新功能开发 |
 
 > `setup_all_envs.bat` 在 Windows 会自动 `chcp 65001`；直接跑脚本时若终端乱码，
 > 手动 `chcp 65001` 或 `set PYTHONIOENCODING=utf-8` 即可。

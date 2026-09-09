@@ -30,7 +30,65 @@
 - 生产路由准入（`task_dispatch` 关闭）、长时多轮/断电恢复、真实 443/WSS、IPv6-only 安装包、SD 分布式跨机、真实模型 7B/12B 三节点峰值——均在后置验收队列，不能凭本机门或模拟结果声称通过。
 - 张量并行（TP）仅作集群外 PoC（route A）；投机解码为实验路径（route C）。
 
-## 快速上手 / Quick start（5 分钟）
+## 首次启动需要做什么 / First-time setup（完整版）
+
+### 0. 前置依赖 / Prerequisites
+
+| 依赖 Dependency | 版本 | 用途 |
+|---|---|---|
+| Python | ≥ 3.10（推荐 3.12） | 主运行时与工具脚本 |
+| Node.js + npm | Node ≥ 18 | 产品前端 / gateway / control（仅开发需要） |
+| JDK 17 + Android SDK (API 34+) | — | 仅构建 Android 时需要（无 Android Studio 也可） |
+| Tailscale | 最新 | 分布式模式必须（校园网可能阻断 UDP，会走中继） |
+| Git | — | clone（含 submodule） |
+| NVIDIA 驱动 + CUDA（可选） | — | 仅 PC 独显版 / SD 侧车需要 |
+
+### 1. 一键配环境 / One-shot environment setup
+
+```bash
+# 从项目根目录运行；Windows 可改用 setup_all_envs.bat / Linux 用 setup_all_envs.sh
+python scripts/setup_envs.py --all            # 全部：8 个 Python 环境 + 3 个 Node 子项目
+python scripts/setup_envs.py --all --no-node  # 仅 Python 环境
+python scripts/setup_envs.py --only test,tui  # 只配指定环境（可用名见脚本 --help）
+python scripts/setup_envs.py --skip frontend  # 跳过旧前端（冻结对照）
+python scripts/setup_envs.py --check          # 只校验现有环境，不安装（无副作用）
+```
+
+**覆盖清单**（`--all`）：主环境（系统 Python）+ `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar` / `.venv-packaging` / `.venv-packaging-cuda`（含 SD 侧车）+ Node：`frontend_cybergothic`（唯一产品前端）/ `gateway` / `control`（旧 `frontend` 冻结对照，默认也装，可用 `--skip frontend`）。
+
+> ⚠️ **torch 等平台相关大件不自动安装**：脚本自动过滤并可打印各环境安装命令（如 `--torch-index-url https://download.pytorch.org/whl/cu126`），避免 CPU/CUDA 版本互相污染。需要时按提示手工安装：`python scripts/setup_envs.py --all --torch-index-url <url>` 后再跑一次 `--check` 验证。
+
+### 2. 获取模型 / Get models
+
+默认示例模型 **Qwen-1.8B-Chat**（两种格式二选一或都装）：
+
+```bash
+# Safetensors（PyTorch / 分布式，~3.5 GB）——推荐国内 ModelScope
+pip install modelscope && python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen-1.8B-Chat', local_dir='models/qwen-1_8b-chat')"
+# GGUF Q4_K_M（CPU/集显/Android，~1.16 GB）
+huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/
+```
+
+其余模型（Qwen3-4B、Gemma 4、SD 1.5 五资产等）与完整获取方式参见 README「克隆后资产获取清单 / 模型下载」；全部模型文件**不进 git**（`models/` 已 gitignore）。
+
+### 3. 启动 / Run
+
+```bash
+python src/api_server.py               # 后端 http://localhost:8000
+cd frontend_cybergothic && npm run dev # 产品前端 http://localhost:5174
+# 或终端版：
+./start_tui.sh                         # Linux/macOS（Windows: start_tui.bat，自动带后端）
+```
+
+### 4. 验证 / Verify
+
+```bash
+python -c "import src.api_server"                              # 后端可导入
+.venv-test\Scripts\python.exe -m pytest tests/ -q --collect-only  # 测试环境就绪
+# 分布式：各节点同一 Tailscale 账号 → 管理面板“连接主节点” → 看节点上线
+```
+
+## 快速上手 / Quick start（5 分钟压缩版）
 
 ```bash
 # 0. 克隆（含子模块 llama.cpp / docagent）
