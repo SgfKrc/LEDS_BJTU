@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { fetchAvailableModels, fetchModels, loadModel } from '../api/client';
+import { createModelDownload, fetchAvailableModels, fetchModelDownloads, fetchModelPresets, fetchModels, loadModel } from '../api/client';
 
 const ENGINE_ICON = { llama_cpp: 'GGUF', pytorch: 'PT', auto: 'AUTO' };
 
@@ -32,11 +32,14 @@ export default function ModelSelector({ onModelChange, onToast }) {
   const [selectedEngine, setSelectedEngine] = useState('auto');
   const [selectedQuant, setSelectedQuant] = useState('int4');
   const [loading, setLoading] = useState(false);
+  const [presets, setPresets] = useState([]);
+  const [downloadId, setDownloadId] = useState('');
 
   const fetchData = useCallback(async () => {
-    const [runtimeResult, modelResult] = await Promise.allSettled([
+    const [runtimeResult, modelResult, presetResult] = await Promise.allSettled([
       fetchAvailableModels(),
       fetchModels(),
+      fetchModelPresets(),
     ]);
 
     if (modelResult.status === 'fulfilled') {
@@ -65,9 +68,41 @@ export default function ModelSelector({ onModelChange, onToast }) {
     } else {
       setEngines([]);
     }
+
+    if (presetResult.status === 'fulfilled') {
+      setPresets(presetResult.value.presets || []);
+    }
   }, []);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  useEffect(() => {
+    if (!downloadId || downloadId === 'starting') return undefined;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const response = await fetchModelDownloads();
+        const job = (response.jobs || []).find(item => item.job_id === downloadId);
+        if (!job || stopped) return;
+        if (job.status === 'ready') {
+          setDownloadId('');
+          onToast?.({ type: 'success', msg: '模型下载完成，目录已刷新' });
+          await fetchData();
+        } else if (['failed', 'cancelled'].includes(job.status)) {
+          setDownloadId('');
+          onToast?.({ type: 'error', msg: job.error || `模型下载${job.status}` });
+        }
+      } catch {
+        // Keep the queued state; the next poll or manual refresh can recover.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [downloadId, fetchData, onToast]);
 
   const selectedModel = useMemo(
     () => modelCatalog.find(m => m.model_id === selectedModelId) || null,
@@ -143,6 +178,29 @@ export default function ModelSelector({ onModelChange, onToast }) {
     }
   };
 
+  const handleDownload = async () => {
+    if (!selectedModel || downloadId) return;
+    const preset = presets.find(item => item.default_model_id === selectedModel.model_id);
+    if (!preset || preset.installable === false) {
+      onToast?.({ type: 'warning', msg: '当前模型没有可安装的预设，或资源门未通过' });
+      return;
+    }
+    setDownloadId('starting');
+    let queued = false;
+    try {
+      const result = await createModelDownload({ preset_id: preset.id });
+      const jobId = result?.job?.job_id || '';
+      setDownloadId(jobId);
+      queued = Boolean(jobId);
+      onToast?.({ type: 'success', msg: `已开始下载 ${preset.display}` });
+      if (!jobId) await fetchData();
+    } catch (err) {
+      onToast?.({ type: 'error', msg: `下载启动失败: ${err.message}` });
+    } finally {
+      if (!queued) setDownloadId('');
+    }
+  };
+
   return (
     <div className="sidebar-section">
       <h3>模型选择</h3>
@@ -156,7 +214,7 @@ export default function ModelSelector({ onModelChange, onToast }) {
           onChange={e => handleModelSelect(e.target.value)}
         >
           {modelCatalog.map(model => (
-            <option key={model.model_id} value={model.model_id} disabled={!model.is_available}>
+            <option key={model.model_id} value={model.model_id}>
               {model.name}{model.is_available ? '' : '（未下载）'}
             </option>
           ))}
@@ -174,11 +232,17 @@ export default function ModelSelector({ onModelChange, onToast }) {
             <span>ctx {selectedModel.max_context}</span>
           </div>
           {!selectedModel.is_available && (
-            <div className="model-unavailable-note">
+            <div className="model-unavailable-note">{/*
               {selectedModel.unavailable_reason || '模型文件未下载，暂不可加载'}
-            </div>
+            */}{selectedModel.unavailable_reason || 'Model asset is not downloaded'}</div>
           )}
         </div>
+      )}
+
+      {selectedModel && !selectedModel.is_available && (
+        <button className="load-btn btn-primary" type="button" onClick={handleDownload} disabled={Boolean(downloadId)}>{/*
+          {downloadId ? '涓嬭浇浠诲姟宸插垱寤?..' : '涓嬭浇姝ゆā鍨嬨€?}
+          */}{downloadId ? 'Downloading...' : 'Download model'}</button>
       )}
 
       {engines.length > 0 && (

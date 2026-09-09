@@ -468,6 +468,21 @@ export async function fetchModels() {
   return request('/models');
 }
 
+export async function fetchModelPresets() {
+  return request('/models/presets');
+}
+
+export async function createModelDownload(payload) {
+  return request('/models/downloads', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchModelDownloads() {
+  return request('/models/downloads');
+}
+
 export async function fetchLocalModelAssets() {
   return request('/models/local-assets');
 }
