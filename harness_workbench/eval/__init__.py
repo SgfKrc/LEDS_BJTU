@@ -14,6 +14,14 @@ from .report import (
     build_evaluation_report,
     pareto_frontier,
 )
+from .red_team import (
+    RedTeamDecision,
+    RedTeamFixture,
+    RedTeamGate,
+    RedTeamReport,
+    builtin_red_team_fixtures,
+    run_red_team,
+)
 
 __all__ = [
     "EvalFixture",
@@ -28,4 +36,10 @@ __all__ = [
     "fixture_digest",
     "pareto_frontier",
     "run_replay",
+    "RedTeamDecision",
+    "RedTeamFixture",
+    "RedTeamGate",
+    "RedTeamReport",
+    "builtin_red_team_fixtures",
+    "run_red_team",
 ]
