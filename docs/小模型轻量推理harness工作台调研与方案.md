@@ -311,10 +311,10 @@ model profile
 
 | 票 | 内容 | 验收门 |
 |---|---|---|
-| `HARNESS-UI-01` | React/Vite 工作台壳 + Textual TUI 壳；共享导航、连接状态、主题和 fixture 状态合同 | React typecheck/build；TUI import/smoke；青蓝/洋红主题无荧光绿主色 |
-| `HARNESS-UI-02` | React/TUI 对话流与会话切换，接 `/v1/chat/completions`、SSE 和 `/v1/sessions/*` | fake API 下新建/切换/发送/断连错误可复现；不静默降级 |
-| `HARNESS-UI-03` | RAG 工作区与引用上下文，接 `/v1/rag/*`；图片/资产抽屉接 `/v1/images/*` | owner scope、预算遗漏、资产 URL 错误状态可见；桌面/窄屏布局稳定 |
-| `HARNESS-UI-04` | 主题/可访问性/视觉回归与 TUI parity；文档、启动脚本、独立依赖锁定 | 深浅色对比、键盘导航、减少动效、React/TUI 术语一致；不改主项目前端 |
+| `HARNESS-UI-01` | React/Vite 工作台壳 + Textual TUI 壳；共享导航、连接状态、主题和 fixture 状态合同 | React typecheck/build；TUI import/smoke；青蓝/洋红主题无荧光绿主色；**已完成** |
+| `HARNESS-UI-02` | React/TUI 对话流与会话切换，接 `/v1/chat/completions`、SSE 和 `/v1/sessions/*` | fake API 下新建/切换/发送/断连错误可复现；不静默降级；**已完成本机开发门** |
+| `HARNESS-UI-03` | RAG 工作区与引用上下文，接 `/v1/rag/*`；图片/资产抽屉接 `/v1/images/*` | owner scope、预算遗漏、资产 URL 错误状态可见；桌面/窄屏布局稳定；**已完成本机开发门** |
+| `HARNESS-UI-04` | 主题/可访问性/视觉回归与 TUI parity；文档、启动脚本、独立依赖锁定 | 深浅色对比、键盘导航、减少动效、React/TUI 术语一致；不改主项目前端；**已完成本机开发门** |
 
 > 注：S3 本地生图由 harness 自带执行器消费共享 SD 工件（资产 manifest 校验借用主项目产物），远端高级编辑（img2img/inpaint/IP-Adapter/指令编辑）依赖主节点 SD 侧车（参阅 SD 1.5 计划）；S2 起每个阶段都要求"可运行 + 有接受证据"再进下一阶段；harness 自始至终不 import 主项目代码，违背即视为回归。
 
@@ -376,6 +376,9 @@ model profile
 - 2026-09-08：v9 —— 完成 **S3 生图工作区离线开发门**：新增独立 image contracts、QLH `.qlh-sd-asset.json` manifest 校验、注入式本地 txt2img 边界、用户资产原子落盘、远端 `/api/diffusion/generate` job/blob 映射和 `/v1/images/generations` 的 `b64_json`/URL 响应；专项测试 7 passed，真实 diffusers/CUDA 执行器、多模态追问和高级编辑后置
 - 2026-09-08：v10 —— 完成 **S4 远端与 RAG 离线开发门**：新增 QLH `/api/chat` 与 SSE adapter、bounded role transcript、用户-owned SQLite session/asset refs、FTS5 owner scope 检索、可替换 embedding provider 契约、有界 citation context 及 `/v1/rag/*`、`/v1/sessions/*`；专项测试 8 passed，真实远端对聊、30k 文档容量、nomic 长时 provider 和跨进程并发后置
 - 2026-09-08：v11 —— 增加 **S6 React/TUI 工作台分票**：React/Vite 与 Textual 共享 `/v1` 合同，首票先做壳、fixture/offline 状态、会话/RAG/资产入口和青蓝/洋红赛博哥特主题；荧光绿不再作为主强调色。
+- 2026-09-09：v12 —— 完成 **HARNESS-UI-02 对话与会话工作流本机开发门**：会话列表/新建/切换/SQLite 恢复、`/v1/chat/completions` SSE 增量渲染、消息落盘、停止生成和 Vite 本地 API 代理；真实模型质量与长时网络仍后置。
+- 2026-09-09：v13 —— 完成 **HARNESS-UI-03 RAG 与图像资产工作区本机开发门**：RAG owner scope/引用上下文/预算省略可见，图像能力准入、URL-only 生成、用户-owned 资产预览和 URL 错误状态接入；真实 CUDA 采样与长时资产服务仍后置。
+- 2026-09-09：v14 —— 完成 **HARNESS-UI-04 主题、可访问性、视觉回归与 TUI parity 本机开发门**：跳过链接、主内容焦点、实时区域语义、深浅色/强制颜色/减少动效规则、TUI 能力状态和 Playwright visual smoke；不改主项目前端。
 
 ## 8. S1 实施记录
 
@@ -506,3 +509,59 @@ ui_react: npm run build       # tsc --noEmit + vite build 通过
 TUI/UI 合同: tests/test_harness_ui.py 2 passed
 Playwright: 1440x900 与 390x844 截图通过；scrollWidth == innerWidth，无横向溢出
 ```
+
+## 15. S6-HARNESS-UI-02 实施记录
+
+本票把 UI-01 的交互壳接入可恢复的本地会话工作流，并保持离线状态可辨识：
+
+- `SessionStore.list()` 和 `GET /v1/sessions` 按 `owner_scope`、更新时间倒序返回有界会话摘要；React 侧栏支持新建、切换和从 SQLite 恢复消息，不暴露本地路径。
+- `data.ts` 增加会话 CRUD 边界和 `streamChat()` SSE 解析器，严格消费 OpenAI 兼容的 `choices[].delta.content`，错误或空流不会伪造助手回答；Vite 开发服务器将 `/healthz`、`/v1` 代理到本地 harness API。
+- 对话发送先持久化用户消息，再以增量占位渲染助手输出，完成后落盘助手消息。停止按钮通过 `AbortController` 中止流并留下系统状态；API 不可用时仍显式使用 fixture，不把 fixture 标为在线。
+
+验证证据：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_api_layer.py tests/test_harness_s4_remote_rag.py tests/test_harness_ui.py -q
+17 passed
+ui_react: npm run build       # tsc --noEmit + vite build 通过
+```
+
+本票完成的是本机协议、状态恢复和 UI 工作流开发门；真实 QW1.8B/Gemma 输出质量、跨设备 SSE 稳定性、长时断线重连和生产资产回灌仍进入后置验收。下一票为 `HARNESS-UI-03`，聚焦 RAG 引用工作区与图片/资产抽屉。
+
+## 16. S6-HARNESS-UI-03 实施记录
+
+本票把 RAG 与图像资产从占位入口接入真实 API，并保持能力和资产边界显式：
+
+- RAG 工作区调用 `/v1/rag/health` 与 `/v1/rag/search`，固定 `owner_scope=local`，显示 FTS5 后端、命中分数、source/chunk 引用、上下文文本、included/omitted 数量和预算截断状态；API 失败时只显示错误，不伪造结果。
+- 图像工作区调用 `/v1/images/capabilities` 和 `/v1/images/generations`，只在 `runtime_available && supports_txt2img` 时启用生成；请求固定使用 `response_format=url`，缺少 `asset_id`/URL 或返回 503 时保持失败状态，不回退为 fixture 图片。
+- 成功图像通过用户-owned URL 预览，并把 asset 引用写入活动 SQLite session；浏览器加载失败会显示“资产 URL 不可用”，原始 URL 可单独打开。尺寸、步数和 seed 使用明确控件，窄屏下改为单列。
+
+验证证据：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_image_workbench.py tests/test_harness_s4_remote_rag.py tests/test_harness_ui.py -q
+18 passed
+ui_react: npm run build       # tsc --noEmit + vite build 通过
+```
+
+本票完成 API 消费、状态呈现和本机布局开发门；真实 SD/diffusers/CUDA 采样质量、远端图像长时任务、真实浏览器回读大图和 30k 文档容量仍需后置验收。下一票为 `HARNESS-UI-04`，聚焦主题/可访问性、视觉回归与 React/TUI parity。
+
+## 17. S6-HARNESS-UI-04 实施记录
+
+本票完成工作台的 UI 收口和可重复回归门：
+
+- React 增加跳过链接、`main-content` 焦点落点、导航 `aria-current`、消息 `role=log`/`aria-busy`、状态播报和输入标签；系统消息不再通过整体透明度降低对比度。
+- 深浅色仍使用黑/白底与青蓝/洋红/暗金强调，补充 `forced-colors`、`prefers-reduced-motion` 和统一 focus-visible 样式；减少动效时关闭动画/过渡，窄屏与键盘焦点不改变布局。
+- TUI 增加键盘焦点样式和 RAG/TXT2IMG 能力状态，与 React 共用 `ONLINE/FIXTURE/RAG/ASSETS/TXT2IMG` 术语；API 不可用时仍明确显示不可用，不伪造能力。
+- `scripts/visual_smoke.mjs` 使用显式 Playwright 模块覆盖桌面/移动端、API fixture、横向溢出、导航后焦点、减少动效、浅色切换和按钮命名；截图写入 ignored 的 `build/ui-visual-smoke/`，不进入用户资产或仓库。
+
+验证证据：
+
+```text
+npm run build                                  # tsc --noEmit + vite build 通过
+npm run visual:smoke -- http://127.0.0.1:5181/ # desktop/mobile 通过
+.\\.venv-test\\Scripts\\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+49 passed
+```
+
+S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 SD/CUDA、生图大图回读、跨设备长时网络和生产部署仍按前置计划后置验收。

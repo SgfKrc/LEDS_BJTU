@@ -1,6 +1,6 @@
 # DistilQwen2.5-DS3-0324 替代 R1 判题模型专项计划（快思考替代不可关闭 thinking）
 
-> 状态：**调研完成，实验计划已定（D1 可启动）**；意图 = 用 `alibaba-pai/DistilQwen2.5-DS3-0324-7B`（DeepSeek-V3-0324 蒸馏的"快思考"模型）**替代 DeepSeek-R1-Distill-Qwen-7B**，解决其"无法可靠关闭 thinking、输出预算耗尽在 `<think>`"导致无法判题的问题。**不是**替换已采纳的 Qwen3-4B 路线，而是填补"要有推理能力又要能判题"的 R1 遗留场景
+> 状态：**D1 本机开发门完成；D2/D3 待后续票**；意图 = 用 `alibaba-pai/DistilQwen2.5-DS3-0324-7B`（DeepSeek-V3-0324 蒸馏的"快思考"模型）**替代 DeepSeek-R1-Distill-Qwen-7B**，解决其"无法可靠关闭 thinking、输出预算耗尽在 `<think>`"导致无法判题的问题。**不是**替换已采纳的 Qwen3-4B 路线，而是填补"要有推理能力又要能判题"的 R1 遗留场景
 >
 > 创建日期：2026-09-08
 > 适用范围：判题/答案生成场景的候选模型替换实验；不覆盖量化算法研究、多模态、文档工具子项目。与 [Qwen3.5与Qwen3-VL小模型支持计划](Qwen3.5与Qwen3-VL小模型支持计划.md)、[模型通用小工具调研与方案](模型通用小工具调研与方案.md)、[2bit与4bit量化调研与实施计划](2bit与4bit量化调研与实施计划.md) 的关系见 §7。
@@ -63,7 +63,7 @@
 
 | 票 | 交付 | 验收 |
 |---|---|---|
-| **DSW-D1 工件与探测** | ModelScope/HF 下载 Safetensors + manifest/SHA 登记；GGUF Q4_K_M 转换（用现有 llama.cpp conversion + Qwen 补丁）或 bnb 4bit 侧车路径；template/tokenizer 探测 | 离线加载成功；探测报告明确输出：`enable_thinking` 支持情况、渲染样例（默认 vs 非思考）、**首 100 token 是否出现 `<think>`/长 CoT**；不联网、不加载权重完成模板检查 |
+| **DSW-D1 工件与探测** | ModelScope/HF 下载 Safetensors + manifest/SHA 登记；GGUF Q4_K_M 转换（用现有 llama.cpp conversion + Qwen 补丁）或 bnb 4bit 侧车路径；template/tokenizer 探测 | **本机开发门已通过**：manifest/SHA、现有 Q4_K_M GGUF 结构/SHA、Qwen2 架构和转换计划通过；隔离 tokenizer 渲染确认模板无 `enable_thinking` 声明且默认渲染无 thinking 标记。首 100 token 生成仍待 D2 权重 smoke，不能提前宣称快思考收敛 |
 | **DSW-D2 三轮标定** | 固定采样（0.7/0.8/20）与 `ps-v1` 客观子集三轮 × 非思考渲染（若 D1 有开关则用；否则默认渲染）；输出 token 统计（验证"快思考"） | 三轮结果落 `build/experiments/`；记录 correctness/format 与**预算内收敛率**；对照 R1 记录（0/4、2/11）与 QW3-4B（0/4、4/11） |
 | **DSW-D3 判读与决策** | 质量门判定：`非 R1 格式率 + 人工复核`（沿用临时规则）；写替代/不替代结论 | 若格式率 ≥ 4/11 且人工复核通过 → 登记"替代 R1 判题模型"（注明仍为 candidate，生产引用点切换需单独票）；否则终止并保留证据；**任何结果都不自动恢复客观正确率门** |
 
@@ -87,3 +87,4 @@
 ## 8. 变更记录
 
 - 2026-09-08：初版（调研 + 替代可行性预判 + DSW-D1~D3 计划）
+- 2026-09-09：`dsw-d1-probe` 完成离线 manifest/SHA、Q4_K_M GGUF、模板和转换工具链验证；DS3 模板未声明 `enable_thinking`，D2 仍需真实生成统计。

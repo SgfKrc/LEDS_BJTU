@@ -1,6 +1,6 @@
 # 文档维护 Agent 工具子项目化与通用化专项计划
 
-> 状态：**调研完成，计划已定（P1 可启动）**；目标 = 将本仓库已有 `docs/agent_tool` 套件抽成**通用子项目 docagent**（各项目通用的文档维护 agent 工具），规则**数据化**为初始规则文档，并交付**规则变更后的机械扫描工具**；"允许 agent 修改维护规则"列为将来门控能力
+> 状态：**`DOCAGENT-P1A` 已完成本机开发门，下一票为 `DOCAGENT-P1B`**；目标 = 将本仓库已有 `docs/agent_tool` 套件抽成**通用子项目 docagent**（各项目通用的文档维护 agent 工具），规则**数据化**为初始规则文档，并交付**规则变更后的机械扫描工具**；"允许 agent 修改维护规则"列为将来门控能力
 >
 > 创建日期：2026-09-08
 > 适用范围：文档维护工具的子项目化与规则演进机制；不覆盖文档内容自动改写、语义总结生成、跨项目内容标准统一。与 [文档维护 Agent 工具设计](文档维护Agent工具设计.md)（M1-M3 原始设计）、[小模型轻量推理harness工作台调研与方案](小模型轻量推理harness工作台调研与方案.md) 的关系见 §9。
@@ -180,6 +180,8 @@ proposed ──preflight(§5)──> gates ──> approved ──> released
 
 **当前执行顺序**：`DOCAGENT-P1A → P1B → P2A → P2B → P3A → P3B → P4A → P4B → P5A → P5B`。P1A/P1B/P2A/P3A 不依赖 GPU、网络、LLM 或第二台设备，可连续开发；M2/M3 provider 只在对应可选票中接入，不阻塞 core。
 
+**当前票状态**：`DOCAGENT-P1A` 已完成：新增 `docs/agent_tool/rules.yaml`、`RULES.md` 与 `docagent_rules.py`，完成 v1 schema、R1-R5 参数、版本校验、结构校验和稳定指纹 API；扫描器仍保持旧实现，等 `DOCAGENT-P1B` 通过等价回归后再切换为数据驱动。
+
 ## 8. 风险与边界
 
 1. **行为漂移**（P1 最大风险）：规则从代码搬 YAML 时语义走样 → 等价回归硬门 + 全量 baseline 对照。
@@ -199,3 +201,4 @@ proposed ──preflight(§5)──> gates ──> approved ──> released
 
 - 2026-09-08：初版（现状盘点 + 子项目化方案 + 初始规则文档设计 + 变更机械扫描工具 + P0-P5 计划）
 - 2026-09-08：v2 —— 将 P0-P5 阶段拆为 `DOCAGENT-P0` 至 `DOCAGENT-P5B` 十一张开发票，冻结依赖顺序、core 与可选 provider 的边界，以及每票开发门；下一票为 `DOCAGENT-P1A`。
+- 2026-09-09：完成 `DOCAGENT-P1A` 本机开发门：规则数据文件、规则人读说明、stdlib 优先的加载/校验/指纹 API 与 6 项专项测试；下一票切换为 `DOCAGENT-P1B`。
