@@ -77,3 +77,21 @@ def test_discovery_ignores_incomplete_manifest_and_non_llm_directory(tmp_path):
     inventory = discover_local_model_assets(root)
 
     assert inventory == {"assets": [], "summary": {"total": 0, "total_bytes": 0}}
+
+
+def test_discovery_accepts_minicpm4_as_a_local_llm_asset_without_manifest(tmp_path):
+    root = tmp_path / "models"
+    model = root / "minicpm4-0.5b"
+    model.mkdir(parents=True)
+    _write_json(model / "config.json", {
+        "model_type": "minicpm",
+        "architectures": ["MiniCPMForCausalLM"],
+        "max_position_embeddings": 32768,
+    })
+    (model / "model.safetensors").write_bytes(b"weights")
+
+    inventory = discover_local_model_assets(root)
+
+    assert inventory["summary"]["total"] == 1
+    assert inventory["assets"][0]["model_id"] == "minicpm4-0.5b"
+    assert inventory["assets"][0]["available_formats"] == ["safetensors"]
