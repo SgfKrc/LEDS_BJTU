@@ -26,33 +26,56 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Mapping
 from urllib.parse import unquote
+
+from docagent_rules import load_rules, rules_fingerprint, validate_rules
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCS_DIR = REPO_ROOT / "docs"
 OUT_DIR = REPO_ROOT / "build" / "doc-audit"
 
-# R1 命中词：状态行含这些词 → "疑似未收口"
-# 注意：① 不用"待"（"待办/待验"是正常状态描述）；② 不用"进行中/实施中/In Progress/
-# Open"（进行中的文档有部分完成记录是正常的）；③ 状态行自身已含完成标记 → 不命中
-STALE_HINTS = ("规划", "Candidate", "Blocked")
-# R1/R5 豁免：状态行含这些词 → 故意不更新的文档
-EXEMPT_HINTS = (
-    "历史参考", "待拆分", "不作为当前能力", "已废弃", "废弃", "冻结", "历史记录",
-)
-# 正文完成标记（前 200 行内）
-DONE_MARKS = re.compile(
-    r"✅|Completed|已完成|已关闭|已验收|开发门完成|阶段 2 完成|完成（", re.IGNORECASE
-)
-# R5：状态行
-STATUS_RE = re.compile(r"(?:\*\*)?状态(?:\*\*)?[:：]")
-LIFECYCLE_RE = re.compile(r"文档生命周期")
+DEFAULT_RULES = load_rules()
+
+
+def _rule(rules: Mapping[str, Any], rule_id: str) -> Mapping[str, Any]:
+    return next(item for item in rules["rules"] if item["id"] == rule_id)
+
+
+def _rule_parameters(rules: Mapping[str, Any], rule_id: str) -> Mapping[str, Any]:
+    return _rule(rules, rule_id)["parameters"]
+
+
+def _rule_level(rules: Mapping[str, Any], rule_id: str) -> str:
+    return str(_rule(rules, rule_id)["level"])
+
+
+def _rule_enabled(rules: Mapping[str, Any], rule_id: str) -> bool:
+    return bool(_rule(rules, rule_id)["enabled"])
+
+
+def _compile_markers(markers: object) -> re.Pattern[str]:
+    values = [re.escape(str(marker)) for marker in markers if str(marker)]
+    return re.compile("|".join(values) if values else r"(?!)", re.IGNORECASE)
+
+
+def _default_rule_values() -> tuple[tuple[str, ...], tuple[str, ...], re.Pattern[str], re.Pattern[str], re.Pattern[str], set[str]]:
+    r1 = _rule_parameters(DEFAULT_RULES, "R1")
+    r3 = _rule_parameters(DEFAULT_RULES, "R3")
+    r5 = _rule_parameters(DEFAULT_RULES, "R5")
+    return (
+        tuple(str(value) for value in r1["stale_status_hints"]),
+        tuple(str(value) for value in DEFAULT_RULES["exemptions"]["status_contains"]),
+        _compile_markers(r1["done_markers"]),
+        re.compile(str(r5["status_pattern"])),
+        re.compile(str(r5["lifecycle_pattern"])),
+        {str(value) for value in r3["topic_stop_words"]},
+    )
+
+
+# Compatibility aliases for callers that imported the old scanner constants.
+STALE_HINTS, EXEMPT_HINTS, DONE_MARKS, STATUS_RE, LIFECYCLE_RE, TOPIC_STOP_WORDS = _default_rule_values()
 GIT_LOG_MARKER = "@@DOCAGENT_COMMIT@@"
-TOPIC_STOP_WORDS = {
-    "agent", "audit", "candidate", "completed", "design", "development",
-    "document", "implementation", "maintenance", "model", "plan", "planning",
-    "project", "status", "support", "tool", "update",
-}
 
 
 def _git(args: list[str], cwd: Path = REPO_ROOT) -> str:
@@ -94,11 +117,12 @@ def _dirty_doc_paths(repo_root: Path) -> dict[str, str]:
     return dirty
 
 
-def _source_changes(repo_root: Path, since_date: str) -> list[dict]:
+def _source_changes(repo_root: Path, since_date: str, source_root: str = "src/") -> list[dict]:
     """一次读取 since_date 后的 src/ 提交，供全库 R3 粗关联复用。"""
+    source_scope = source_root.rstrip("/") or "."
     output = _git([
         "log", f"--since={since_date}T00:00:00", "--date=short",
-        f"--format={GIT_LOG_MARKER}%H%x09%cs%x09%s", "--name-only", "--", "src/",
+        f"--format={GIT_LOG_MARKER}%H%x09%cs%x09%s", "--name-only", "--", source_scope,
     ], repo_root)
     changes: list[dict] = []
     current: dict | None = None
@@ -118,28 +142,34 @@ def _source_changes(repo_root: Path, since_date: str) -> list[dict]:
     return changes
 
 
-def _doc_topics(doc: Path, text: str) -> tuple[set[str], set[str]]:
+def _doc_topics(doc: Path, text: str, source_root: str = "src/",
+                topic_stop_words: set[str] | None = None) -> tuple[set[str], set[str]]:
     """从文件名、首个标题和显式 src/ 引用提取保守的 R3 关联线索。"""
     heading = next(
         (line.lstrip("# ").strip() for line in text.splitlines()
          if line.startswith("#")),
         "",
     )
+    source_prefix = source_root.rstrip("/") or "src"
     source_refs = {
         match.rstrip(".,;:)]}\"").lower()
-        for match in re.findall(r"src/[A-Za-z0-9_./-]+", text)
+        for match in re.findall(
+            rf"{re.escape(source_prefix)}/[A-Za-z0-9_./-]+", text,
+        )
     }
     token_text = " ".join((doc.stem, heading, *source_refs)).lower()
+    stop_words = topic_stop_words if topic_stop_words is not None else TOPIC_STOP_WORDS
     tokens = {
         token for token in re.findall(r"[a-z][a-z0-9-]{3,}", token_text.replace("_", " "))
-        if token not in TOPIC_STOP_WORDS
+        if token not in stop_words
     }
     return tokens, source_refs
 
 
 def _related_source_change(doc: Path, text: str, updated: str,
-                           changes: list[dict]) -> tuple[dict, str] | None:
-    tokens, source_refs = _doc_topics(doc, text)
+                           changes: list[dict], source_root: str = "src/",
+                           topic_stop_words: set[str] | None = None) -> tuple[dict, str] | None:
+    tokens, source_refs = _doc_topics(doc, text, source_root, topic_stop_words)
     if not tokens and not source_refs:
         return None
     for change in changes:  # git log 为新到旧，首个匹配即最近提交
@@ -161,10 +191,23 @@ def _related_source_change(doc: Path, text: str, updated: str,
     return None
 
 
-def _status_line(text: str) -> str:
+def _status_line(text: str, *, status_window_lines: int | None = None,
+                 status_pattern: str | None = None,
+                 ignore_lifecycle_heading: bool | None = None,
+                 lifecycle_pattern: str | None = None) -> str:
     """取前 12 行的状态行原文（跳过文档生命周期行）。"""
-    for ln in text.splitlines()[:12]:
-        if STATUS_RE.search(ln) and not LIFECYCLE_RE.search(ln):
+    parameters = _rule_parameters(DEFAULT_RULES, "R5")
+    window = status_window_lines if status_window_lines is not None else int(
+        DEFAULT_RULES["defaults"]["status_window_lines"]
+    )
+    pattern = re.compile(status_pattern or str(parameters["status_pattern"]))
+    skip_lifecycle = (
+        bool(parameters["ignore_lifecycle_heading"])
+        if ignore_lifecycle_heading is None else ignore_lifecycle_heading
+    )
+    lifecycle = re.compile(lifecycle_pattern or str(parameters["lifecycle_pattern"]))
+    for ln in text.splitlines()[:window]:
+        if pattern.search(ln) and (not skip_lifecycle or not lifecycle.search(ln)):
             return ln.strip()
     return ""
 
@@ -178,12 +221,15 @@ def _updated_at(text: str) -> str | None:
     return None
 
 
-def _extract_links(text: str) -> list[tuple[str, str]]:
+def _extract_links(text: str, ignored_schemes: tuple[str, ...] | None = None) -> list[tuple[str, str]]:
     """提取 markdown 相对链接 [text](path)，返回 (text, path)。"""
+    schemes = ignored_schemes
+    if schemes is None:
+        schemes = tuple(str(value) for value in _rule_parameters(DEFAULT_RULES, "R4")["ignored_schemes"])
     links = []
     for m in re.finditer(r"\[([^\]]*)\]\(([^)]+)\)", text):
         href = m.group(2).strip()
-        if href.startswith(("http://", "https://", "#", "mailto:")):
+        if href.startswith(schemes):
             continue
         # 去掉锚点
         href = href.split("#")[0]
@@ -192,10 +238,13 @@ def _extract_links(text: str) -> list[tuple[str, str]]:
     return links
 
 
-def _check_link(href: str, docs_dir: Path | None = None) -> bool:
+def _check_link(href: str, docs_dir: Path | None = None,
+                decode_url_path: bool | None = None) -> bool:
     """docs/ 内相对链接存在性；../README.md 或 docs/ 同级。"""
     base = docs_dir or DOCS_DIR
-    href = unquote(href)  # 处理 %20 等 URL 编码（markdown 链接常见）
+    if decode_url_path is None:
+        decode_url_path = bool(_rule_parameters(DEFAULT_RULES, "R4")["decode_url_path"])
+    href = unquote(href) if decode_url_path else href
     if href.startswith("../"):
         target = (base.parent / href[3:]).resolve()
     else:
