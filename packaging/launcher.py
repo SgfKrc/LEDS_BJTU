@@ -1163,6 +1163,13 @@ def _detect_engine_preference() -> str:
     return "llama_cpp"
 
 
+def _check_model_assets_for_startup() -> bool:
+    """Check model assets without presenting a blocking download dialog."""
+    from model_downloader import ensure_model_or_warn
+
+    return bool(ensure_model_or_warn())
+
+
 def _has_webview() -> bool:
     """检测 pywebview 是否可用（仅 Windows 支持原生窗口）。"""
     if not IS_WINDOWS:
@@ -1502,15 +1509,20 @@ def main():
     # ---- 第 1 步：检查模型文件 ----
     startup_splash.update(42, "正在检查本地模型...")
     from model_downloader import (
-        check_and_prompt_model,
-        model_exists,
         gguf_model_exists,
         safetensors_model_exists,
     )
 
-    model_ready = check_and_prompt_model(owner_hwnd=startup_splash.hwnd)
+    model_ready = _check_model_assets_for_startup()
+    if check_only and not model_ready:
+        logger.error("No local model is installed; --check-only cannot pass")
+        print("[ERROR] No local model is installed; --check-only requires a model asset.")
+        sys.exit(1)
     if not model_ready:
-        startup_splash.close()
+        logger.warning("No local model is installed; continuing to the model download workspace")
+        print("No local model is installed; the application will open the model download workspace.")
+    if False:  # legacy blocking-model branch retained below for source compatibility
+        logger.warning("No local model is installed; continuing to the model download workspace")
         print()
         print("模型文件未就绪，程序将退出。")
         if engine == "llama_cpp":
@@ -1522,8 +1534,7 @@ def main():
             print("下载: https://huggingface.co/Qwen/Qwen-1.8B-Chat")
         print()
         print("按 Enter 键退出...")
-        _safe_input(default="")
-        sys.exit(1)
+        # A missing model is a recoverable application state, not a launcher failure.
 
     # ---- 报告检测结果 ----
     has_gguf = gguf_model_exists()
