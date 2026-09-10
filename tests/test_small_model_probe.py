@@ -61,6 +61,33 @@ def test_b1_report_keeps_runtime_smoke_explicit(monkeypatch) -> None:
     assert report["gguf_smoke"] is None
 
 
+def test_b1_runtime_gate_does_not_confuse_quality_with_architecture(monkeypatch) -> None:
+    config = SimpleNamespace(model_id="minicpm4-0.5b")
+    source = {"valid": True, "format": "safetensors", "template": {"thinking": {"status": "not_declared"}}}
+    gguf = {"valid": True, "format": "gguf", "architecture": "minicpm"}
+    monkeypatch.setattr(probe, "_core_config", lambda _model_id: (config, Path("model-dir"), Path("model.gguf")))
+    monkeypatch.setattr(probe, "probe_artifact", lambda path, **_kwargs: source if Path(path).name == "model-dir" else gguf)
+    monkeypatch.setattr(probe, "_architecture_probe", lambda *_args: {"status": "metadata_pass"})
+    monkeypatch.setattr(
+        "scripts.model_tools.llm_smoke_matrix.run_smoke_matrix",
+        lambda **_kwargs: {
+            "summary": {
+                "units_executed": 1,
+                "runtime_units_passed": 1,
+                "runtime_gate_passed": True,
+                "quality_gate_passed": False,
+            }
+        },
+    )
+
+    report = probe.run_b1_probe(model_ids=["minicpm4-0.5b"], run_gguf_smoke=True)
+
+    assert report["gate_passed"] is True
+    assert report["weights_loaded"] is True
+    assert report["summary"]["runtime_smoke_passed"] is True
+    assert report["summary"]["quality_gate_passed"] is False
+
+
 def test_dsw_d1_report_combines_existing_gguf_and_read_only_conversion_plan(monkeypatch) -> None:
     config = SimpleNamespace(model_id="distilqwen25-ds3-0324-7b", name="DistilQwen2.5-DS3-0324-7B")
     source = {"valid": True, "format": "safetensors"}

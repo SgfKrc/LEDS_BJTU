@@ -77,7 +77,7 @@
 - Python `compileall`：通过
 - `git diff --check`：通过
 - 最终受影响接口回归：`81 passed, 1 skipped`
-- 全量 Python suite：`3374 passed, 20 skipped`（201.18s；并行 worker 争用共享 task-journal 的告警未导致测试失败）
+- 最终全量 Python suite：`3448 passed, 22 skipped`（202.68s；并行 worker 争用共享 task-journal 的告警未导致测试失败）
 
 ## 仍保留的发布门
 
@@ -86,28 +86,28 @@
 1. `AUD-PIN-01` 已关闭：四个远程预设现在有官方仓库的完整 revision、允许/必需文件清单和逐权重 SHA-256，下载服务会固定版本并 fail-closed 校验。当前环境未执行真实模型下载，仍需在有发布源网络和足够磁盘的环境完成联网验收。
 2. `AUD-SBX-01` 已关闭：MiniCPM4 的 `trust_remote_code=True` 探测现在运行在 OS 级低权限 worker 中；Linux/macOS 使用 sandbox backend，Windows 使用 restricted token + low-integrity token + Job Object，并对 metadata 使用一次性 snapshot。Windows 低完整性不提供内核级禁网，因此仍强制离线环境变量，网络隔离增强不作为已完成能力宣称。
 3. `AUD-AUTH-01` 已关闭：模型 API 的认证/来源门、Bearer 透传和 control-svc loopback 默认绑定已完成；跨机部署仍必须显式配置受控 CIDR/Tailnet 和防火墙策略。
-4. 尚缺真实 llama-cpp/MiniCPM4 runtime smoke 和实际 model switch/load 负向场景；MCP 负向 UI 自动门与 CyberGothic 全量 Playwright 回归均已关闭。
+4. `AUD-RT-01` 与 `AUD-SW-01` 已关闭：真实 llama-cpp/MiniCPM4 runtime smoke、实际 model switch/load 负向场景和回滚断言均已执行；MCP 负向 UI 自动门与 CyberGothic 全量 Playwright 回归也已关闭。
 
 ## 待完成工作统计
 
-统计口径：按可以独立验收的行动计数；复合发现拆分为独立工作项。截至 `AUD-CY-E2E-01` 关闭后，共有 **2 项** 待完成工作，分为 **1 类**：
+统计口径：按可以独立验收的行动计数；复合发现拆分为独立工作项。截至 `AUD-RT-01` 与 `AUD-SW-01` 关闭后，共有 **0 项** 待完成工作：
 
 | 类别 | 数量 | 待完成项 |
 | --- | ---: | --- |
-| 真实运行验收 | 2 | 在真实依赖环境执行 llama-cpp/MiniCPM4 runtime smoke；补真实模型 load/switch 成功与失败场景断言 |
+| 真实运行验收 | 0 | 无；runtime smoke 与 load/switch 成功、失败、回滚、量化错配均已验收 |
 | 自动化回归与契约 | 0 | 无 |
 
-当前已完成代码回归、三个前端构建、MCP 负向 UI 门、CyberGothic Playwright 全量回归和全量 Python suite；剩余 2 项仍不能以 fixture 定向测试或构建成功替代，等待真实模型环境后逐项关闭。
+当前已完成代码回归、三个前端构建、MCP 负向 UI 门、CyberGothic Playwright 全量回归、全量 Python suite 和两张真实模型票。真实票使用本地 GGUF 权重与 `llama-cpp-python 0.3.28` 执行，没有以 fixture 定向测试或构建成功替代。
 
-## 后续验收顺序
+## 最终验收收口
 
 ### AUD-AUTH-01 已关闭
 
-模型 API 的认证/来源门已按后续开发票完成：gateway 对模型 registry/GGUF/download 使用 Web Bearer 和管理员角色；单体 api_server 与 inference-svc 默认只接受 loopback，跨机来源必须显式配置 `QLH_MODEL_API_TRUSTED_CIDRS`；control-svc 默认绑定 `127.0.0.1`。相关来源门、Bearer 透传和 HTTP 拒绝测试已通过。原清单中的该项因此从待完成统计中扣除，当前剩余 2 项按真实模型环境条件执行。
+模型 API 的认证/来源门已按后续开发票完成：gateway 对模型 registry/GGUF/download 使用 Web Bearer 和管理员角色；单体 api_server 与 inference-svc 默认只接受 loopback，跨机来源必须显式配置 `QLH_MODEL_API_TRUSTED_CIDRS`；control-svc 默认绑定 `127.0.0.1`。相关来源门、Bearer 透传和 HTTP 拒绝测试已通过。
 
-1. `AUD-RT-01`：在具备固定工件、发布源网络和真实 llama-cpp/MiniCPM4 runtime 的环境跑模板/thinking/架构兼容 smoke。
-2. `AUD-SW-01`：在同一真实模型环境补 load/switch 成功、失败、回滚和量化不匹配断言。
-3. `AUD-MCP-UI-01` 与 `AUD-CY-E2E-01` 已关闭：MCP 负向 UI 自动门五类失败态均通过，CyberGothic 全量 Playwright 为 `64 passed`；后续只剩上述两张真实模型票。
+1. `AUD-RT-01` 已关闭：三个亚 1B 模板探测在低权限沙箱真实执行；MiniCPM4 GGUF 由 llama.cpp 真实加载，三个亚 1B 模型合计 12/12 次非空生成。runtime 兼容门与严格输出质量门分开记录。
+2. `AUD-SW-01` 已关闭：真实 Qwen2.5→Qwen3 切换、未注册目标保持、缺失工件失败回滚和量化不匹配拒绝均通过；同时修复了未注册目标先卸载健康模型的事务边界缺陷。
+3. `AUD-MCP-UI-01` 与 `AUD-CY-E2E-01` 已关闭：MCP 负向 UI 自动门五类失败态均通过，CyberGothic 全量 Playwright 为 `64 passed`。原审计待办现为 0 项。
 
 ## `AUD-MCP-UI-01` 复核结论
 

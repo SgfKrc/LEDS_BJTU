@@ -548,7 +548,15 @@ def run_b1_probe(
         item.get("safetensors", {}).get("valid") and item.get("gguf", {}).get("valid") and item.get("architecture", {}).get("status") == "metadata_pass"
         for item in models
     )
-    gate_passed = static_passed and (not run_gguf_smoke or bool(smoke and smoke.get("summary", {}).get("gate_passed")))
+    # B1 is a runtime compatibility gate.  Exact JSON/context adherence remains
+    # visible in the nested quality gate, but does not turn a successfully
+    # loaded and generating sub-1B model into an architecture failure.
+    runtime_smoke_passed = bool(
+        smoke and smoke.get("summary", {}).get("runtime_gate_passed")
+    )
+    gate_passed = static_passed and (
+        not run_gguf_smoke or runtime_smoke_passed
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": TOOL,
@@ -557,12 +565,18 @@ def run_b1_probe(
         "gate_passed": gate_passed,
         "read_only": True,
         "network_used": False,
-        "weights_loaded": False,
+        "weights_loaded": bool(run_gguf_smoke and smoke and smoke.get("summary", {}).get("runtime_units_passed")),
         "template_execution_requested": execute_template,
         "gguf_smoke_requested": run_gguf_smoke,
         "models": models,
         "gguf_smoke": smoke,
-        "summary": {"models_total": len(models), "models_passed": sum(item["safetensors"].get("valid") and item["gguf"].get("valid") for item in models), "static_gate_passed": static_passed},
+        "summary": {
+            "models_total": len(models),
+            "models_passed": sum(item["safetensors"].get("valid") and item["gguf"].get("valid") for item in models),
+            "static_gate_passed": static_passed,
+            "runtime_smoke_passed": runtime_smoke_passed if run_gguf_smoke else None,
+            "quality_gate_passed": smoke.get("summary", {}).get("quality_gate_passed") if smoke else None,
+        },
     }
 
 

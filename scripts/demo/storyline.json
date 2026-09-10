@@ -196,7 +196,7 @@
       "action": "Point to FIXTURE / REDACTED / NOT LIVE before discussing the system.",
       "say": [
         "This rehearsal demonstrates repeatability, observability, and recovery of the control plane.",
-        "The current machine does not carry a suitable model, so this is not a real-model or physical dual-host performance claim."
+        "This fixture run does not load a model, so it is not a real-model or physical dual-host performance claim; separate functional acceptance evidence remains distinct."
       ],
       "success_markers": ["FIXTURE / REDACTED / NOT LIVE", "READ-ONLY EVIDENCE"],
       "evidence_ids": ["checklist-document", "preflight-source", "preflight-run", "storyline-manifest", "storyline-validator", "scenario-contract", "launcher-source", "topology-run"],
@@ -293,16 +293,16 @@
       "end_second": 300,
       "ticket_refs": ["DEF-P1", "DEF-P2", "DEF-P3", "DEF-P4"],
       "screen": "ticket plan completion records",
-      "action": "Summarize reproducibility, visible boundaries, deterministic recovery, and the deferred real-model gates.",
+      "action": "Summarize reproducibility, visible boundaries, deterministic recovery, the closed real-model functional gates, and the remaining performance boundary.",
       "say": [
         "The result is a repeatable defense path with explicit evidence for startup, topology, recovery, and measurement.",
-        "Real runtime and model-switch acceptance remain queued until suitable model assets and hardware are available; fixture evidence does not close those gates."
+        "Real runtime and model-switch functional acceptance are closed by separate GGUF evidence; this fixture still makes no model-performance or physical dual-host claim."
       ],
       "success_markers": ["DEF-P1", "DEF-P2", "DEF-P3", "DEF-P4"],
       "evidence_ids": ["storyline-manifest", "storyline-validator", "ticket-plan", "launcher-tests", "topology-ui-tests"],
       "fallback": {
         "trigger": "less than 45 seconds remain",
-        "action": "Skip navigation, state the four evidence points and the two deferred real-model gates, then stop at five minutes.",
+        "action": "Skip navigation, state the four evidence points, the two separately closed functional gates, and the NOT RUN performance boundary, then stop at five minutes.",
         "evidence_id": "ticket-plan"
       }
     }

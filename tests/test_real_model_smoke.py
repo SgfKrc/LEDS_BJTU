@@ -12,7 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-pytestmark = [pytest.mark.real_model, pytest.mark.requires_gpu]
+pytestmark = [pytest.mark.real_model]
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -91,3 +91,75 @@ def test_real_model_load_generate_unload(monkeypatch):
         if loaded:
             host.unload_model()
         host.close()
+
+
+def test_real_model_switch_success_failure_rollback_and_quant_mismatch(tmp_path):
+    """AUD-SW-01: exercise the model lifecycle with actual GGUF runtimes."""
+    if os.environ.get("QLH_RUN_REAL_MODEL_SMOKE") != "1":
+        pytest.skip("set QLH_RUN_REAL_MODEL_SMOKE=1 to run real model acceptance")
+
+    first_model = os.environ.get("QLH_SWITCH_FIRST_MODEL_ID", "qwen2.5-0.5b").strip()
+    second_model = os.environ.get("QLH_SWITCH_SECOND_MODEL_ID", "qwen3-0.6b").strip()
+
+    from fastapi import HTTPException
+    import api_server
+    from model_module import ModelManager
+
+    manager = ModelManager()
+    loaded = False
+    try:
+        manager.load_model(
+            model_id=first_model,
+            engine="llama_cpp",
+            quant_type="int4",
+            profile={"tier": "laptop", "gpu": {"cuda_available": True}},
+        )
+        loaded = True
+        assert manager.is_loaded is True
+        assert manager.active_model_id == first_model
+
+        switched = manager.switch_model(second_model, engine="llama_cpp", quant_type="int4")
+        assert switched["success"] is True
+        assert switched["model_id"] == second_model
+        assert manager.is_loaded is True
+        assert manager.active_model_id == second_model
+
+        active_engine = manager._llama_engine
+        unknown = manager.switch_model("aud-sw-unregistered", engine="llama_cpp")
+        assert unknown["success"] is False
+        assert unknown["error_code"] == "MODEL_NOT_REGISTERED"
+        assert unknown["active_model_preserved"] is True
+        assert manager._llama_engine is active_engine
+        assert manager.active_model_id == second_model
+
+        broken_model = {
+            "model_id": "aud-sw-broken-artifact",
+            "name": "AUD-SW broken artifact",
+            "model_type": "gguf",
+            "model_path": "",
+            "gguf_path": str(tmp_path / "missing.gguf"),
+            "recommended_vram_gb": 1.0,
+            "max_context": 1024,
+            "quant_types": ["Q4_K_M"],
+            "description": "negative acceptance fixture",
+        }
+        rolled_back = manager.switch_model(
+            broken_model["model_id"],
+            engine="llama_cpp",
+            quant_type="Q4_K_M",
+            db_experimental_models=[broken_model],
+        )
+        assert rolled_back["success"] is False
+        assert rolled_back["error_code"] == "MODEL_LOAD_FAILED_ROLLED_BACK"
+        assert rolled_back["model_id"] == second_model
+        assert manager.is_loaded is True
+        assert manager.active_model_id == second_model
+
+        with pytest.raises(HTTPException) as mismatch:
+            api_server._normalize_quant_for_engine("Q4_K_M", "pytorch")
+        assert mismatch.value.status_code == 400
+        assert manager.is_loaded is True
+        assert manager.active_model_id == second_model
+    finally:
+        if loaded and manager.is_loaded:
+            manager.unload_model()

@@ -981,6 +981,25 @@ class ModelManager:
                 target_request = None
                 target_fingerprint = ""
 
+            # Reject an unknown registry target before releasing the active
+            # runtime.  Previously this case returned from the load block only
+            # after unload_model(), which silently discarded a healthy model
+            # without attempting rollback.
+            if (
+                target_request is None
+                and not model_path
+                and mc.get_model_config(model_id, db_experimental_models) is None
+            ):
+                return {
+                    "success": False,
+                    "model_id": rollback_model_id if had_model else model_id,
+                    "requested_model_id": model_id,
+                    "model_name": rollback_model_name if had_model else model_id,
+                    "error_code": "MODEL_NOT_REGISTERED",
+                    "active_model_preserved": bool(had_model),
+                    "error": f"模型 '{model_id}' 未在注册表中找到。请先注册或下载模型文件。",
+                }
+
             if (
                 had_model
                 and not had_pipeline_preparation
@@ -1014,14 +1033,6 @@ class ModelManager:
             # 步骤 2: 加载新模型
             try:
                 cfg = mc.get_model_config(model_id, db_experimental_models)
-                if cfg is None and not model_path:
-                    return {
-                        "success": False,
-                        "model_id": model_id,
-                        "model_name": model_id,
-                        "error_code": "MODEL_NOT_REGISTERED",
-                        "error": f"模型 '{model_id}' 未在注册表中找到。请先注册或下载模型文件。",
-                    }
                 self.load_model(model_id=model_id, model_path=model_path,
                                 quant_type=quant_type, profile=profile,
                                 engine=engine,
