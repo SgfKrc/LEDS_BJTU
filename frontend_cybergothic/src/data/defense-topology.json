@@ -1,0 +1,78 @@
+{
+  "schema": "qlh.defense_topology.v1",
+  "snapshot_id": "def-p4-fixture-v1",
+  "source": "fixture",
+  "claim_guard": {
+    "redacted": true,
+    "live_cluster": false,
+    "real_model_loaded": false,
+    "physical_dual_host": false,
+    "scope": "control-plane UI fixture"
+  },
+  "readiness": {
+    "state": "ready",
+    "checks": [
+      {
+        "id": "coordinator",
+        "label": "Coordinator",
+        "state": "ready",
+        "evidence": "fixture control path available"
+      },
+      {
+        "id": "worker_link",
+        "label": "Worker link",
+        "state": "ready",
+        "evidence": "two active aliases connected"
+      },
+      {
+        "id": "layer_plan",
+        "label": "Layer plan",
+        "state": "ready",
+        "evidence": "contiguous 24-layer projection"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "alias": "node-master",
+      "role": "master",
+      "state": "ready",
+      "heartbeat": "fresh",
+      "summary": "control and first layer segment"
+    },
+    {
+      "alias": "node-worker-a",
+      "role": "worker",
+      "state": "ready",
+      "heartbeat": "fresh",
+      "summary": "second layer segment"
+    },
+    {
+      "alias": "node-standby",
+      "role": "standby",
+      "state": "offline",
+      "heartbeat": "stale",
+      "summary": "excluded from the active plan"
+    }
+  ],
+  "layer_plan": {
+    "total_layers": 24,
+    "strategy": "fixture-contiguous",
+    "assignments": [
+      {
+        "node_alias": "node-master",
+        "start_layer": 0,
+        "end_layer_exclusive": 8,
+        "layer_count": 8,
+        "capabilities": ["embedding"]
+      },
+      {
+        "node_alias": "node-worker-a",
+        "start_layer": 8,
+        "end_layer_exclusive": 24,
+        "layer_count": 16,
+        "capabilities": ["lm_head"]
+      }
+    ]
+  }
+}

@@ -18,6 +18,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { CommandButton } from '../components/CommandButton';
+import { DefenseTopologySnapshot, defenseTopologyCanvasNodes } from '../components/DefenseTopologySnapshot';
 import { EmptyState } from '../components/EmptyState';
 import { PageHeader, SectionHead } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
@@ -79,6 +80,15 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 ** exponent).toFixed(exponent > 1 ? 1 : 0)} ${units[exponent]}`;
 }
 
+function defenseTopologyPresentationEnabled(): boolean {
+  if (typeof window === 'undefined') return false;
+  const fromSearch = new URLSearchParams(window.location.search).get('defense');
+  if (fromSearch !== null) return fromSearch === 'topology';
+  const queryStart = window.location.hash.indexOf('?');
+  if (queryStart === -1) return false;
+  return new URLSearchParams(window.location.hash.slice(queryStart + 1)).get('defense') === 'topology';
+}
+
 export function ClusterAdminPage() {
   const role = useMyRole();
   const nodes = useClusterNodes();
@@ -88,6 +98,7 @@ export function ClusterAdminPage() {
   const invite = useClusterInvite(30_000, canWrite);
   const health = useMasterHealth(15_000, role.state === 'ready' && !canWrite);
   const usingFixtures = fixturesEnabled();
+  const topologyDefenseMode = usingFixtures && defenseTopologyPresentationEnabled();
 
   const [nodeOverride, setNodeOverride] = useState<ClusterNode[] | null>(null);
   const [maxNodes, setMaxNodes] = useState('');
@@ -368,6 +379,25 @@ export function ClusterAdminPage() {
     } catch (error) { pushToast(`Sidecar ${action} failed: ${api.describeError(error)}`, 'danger'); }
     finally { setOperationsBusy(''); }
   };
+
+  if (topologyDefenseMode) {
+    return (
+      <div className="cluster-page" data-testid="cluster-admin-page" data-presentation-mode="defense-topology">
+        <ClusterConstellationCanvas className="cluster-page__bg" nodes={defenseTopologyCanvasNodes} />
+        <div className="cluster-page__content">
+          <PageHeader
+            tag="DEFENSE EVIDENCE"
+            title="Cluster Topology Defense"
+            description="A repeatable, redacted fixture projection for the readiness and layer-allocation walkthrough."
+            actions={<span className="cluster-defense__mode">READ-ONLY EVIDENCE</span>}
+          />
+          <main className="cluster-defense-page">
+            <DefenseTopologySnapshot />
+          </main>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="cluster-page" data-testid="cluster-admin-page">
