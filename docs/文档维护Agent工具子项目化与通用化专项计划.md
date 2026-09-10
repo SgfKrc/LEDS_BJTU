@@ -180,7 +180,7 @@ proposed ──preflight(§5)──> gates ──> approved ──> released
 
 **当前执行顺序**：`DOCAGENT-P1A → P1B → P2A → P2B → P3A → P3B → P4A → P4B → P5A → P5B`。P1A/P1B/P2A/P3A 不依赖 GPU、网络、LLM 或第二台设备，可连续开发；M2/M3 provider 只在对应可选票中接入，不阻塞 core。
 
-**当前票状态**：`DOCAGENT-P5B` 已完成：扫描报告新增完整内容 `report_fingerprint`，新增 `gate` artifact 与 `gate verify` 规则/报告/基线/演进绑定门；报告或规则文件篡改会 fail-closed，`gate rescan` 提供 revert 后基线重扫路径；新增独立可选 M3 SQLite 事件适配器，默认扫描仍不依赖 SQLite。P5 规则演进门控阶段完成。
+**当前票状态**：`DOCAGENT-P5B` 已完成：扫描报告新增完整内容 `report_fingerprint`，新增 `gate` artifact 与 `gate verify` 规则/报告/基线/演进绑定门；报告或规则文件篡改会 fail-closed，`gate rescan` 提供 revert 后基线重扫路径；新增独立可选 M3 SQLite 事件适配器，默认扫描仍不依赖 SQLite。P5 规则演进门控阶段完成。后续易用性票 `DOC-ENV-01` 已于 2026-09-10 在独立子项目完成，下一票为 `DOC-AUDIT-ENTRY-01`。
 
 ## 8. 风险与边界
 
@@ -211,3 +211,4 @@ proposed ──preflight(§5)──> gates ──> approved ──> released
 - 2026-09-09：完成 `DOCAGENT-P4B` 本机开发门：新增 baseline dry-run 增量矩阵 `new/gone/changed/affected_docs`、文档 hash/新增/删除明细和 `--max-new`/`--max-gone` 阈值门；新增 49 项相关回归，确认 dry-run 不改 baseline 且规则/profile 指纹不匹配仍拒绝比较；下一票切换为 `DOCAGENT-P5A`。
 - 2026-09-09：完成 `DOCAGENT-P5A` 本机开发门：新增 `rules evolve` 状态机与 `qlh.docagent.evolution.v1`/`qlh.docagent.approval.v1` 合同，强制 `change_note`，绑定候选规则集指纹与人工审批，低风险变更自动放行，新增/删除 `warn/error` 规则和等级变化 fail-closed；新增 4 项专项回归并更新 README/CI 用法；下一票切换为 `DOCAGENT-P5B`。
 - 2026-09-09：完成 `DOCAGENT-P5B` 本机开发门：扫描报告加入自指纹，新增 `qlh.docagent.gate.v1` / `gate verify` 的规则、报告、profile、baseline、evolution 绑定，新增 `gate rescan` 回滚重扫入口与可选 `qlh.docagent.events.v1` SQLite M3 事件适配；篡改报告/规则/门禁 artifact 均被拒绝，revert 后可重建零差异；新增 4 项专项回归，P5 阶段完成。
+- 2026-09-10：完成后续易用性票 `DOC-ENV-01`：从远端非空仓库初始化 `tools/docagent` submodule，在独立包中新增专用 `.env.docagent` 的严格读取/字段校验/默认值提示、`docagent config`、`--env` 与 profile 优先级；密钥和完整远程 endpoint 不进入输出，缺失或无效的显式配置以中文提示和退出码 2 fail-closed。未加载模型，docagent/M1-M3 相关轻量回归 `135 passed`；下一票为 `DOC-AUDIT-ENTRY-01`。
