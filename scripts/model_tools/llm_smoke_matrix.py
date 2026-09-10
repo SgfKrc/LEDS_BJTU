@@ -206,6 +206,17 @@ def run_smoke_matrix(
         results.append({
             **result_base,
             "status": "passed" if worker_result.get("status") == "passed" else "failed",
+            "runtime_status": (
+                "passed"
+                if worker_result.get("error") is None
+                and bool(worker_result.get("jobs"))
+                and all(
+                    job.get("error") is None
+                    and bool(job.get("validation", {}).get("non_empty", job.get("status") == "passed"))
+                    for job in worker_result.get("jobs", [])
+                )
+                else "failed"
+            ),
             "jobs": worker_result.get("jobs", []),
             "load_ms": worker_result.get("load_ms"),
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
@@ -214,9 +225,23 @@ def run_smoke_matrix(
     executed = [item for item in results if item["status"] in {"passed", "failed"}]
     passed_jobs = sum(1 for item in executed for job in item.get("jobs", []) if job.get("status") == "passed")
     failed_jobs = sum(1 for item in executed for job in item.get("jobs", []) if job.get("status") == "failed")
+    runtime_jobs_passed = sum(
+        1
+        for item in executed
+        for job in item.get("jobs", [])
+        if job.get("error") is None
+        and bool(job.get("validation", {}).get("non_empty", job.get("status") == "passed"))
+    )
+    runtime_jobs_failed = sum(len(item.get("jobs", [])) for item in executed) - runtime_jobs_passed
+    runtime_units_passed = sum(item.get("runtime_status") == "passed" for item in executed)
+    runtime_units_failed = len(executed) - runtime_units_passed
+    runtime_execution_gate_passed = bool(executed) and runtime_units_failed == 0
     execution_gate_passed = bool(executed) and not failed_jobs and all(item["status"] == "passed" for item in executed)
     skipped_count = sum(item["status"] == "skipped" for item in results)
     coverage_complete = bool(results) and not skipped_count and discovered_count == len(results)
+    runtime_gate_passed = runtime_execution_gate_passed and (
+        coverage_complete or not require_complete
+    )
     gate_passed = execution_gate_passed and (coverage_complete or not require_complete)
     return {
         "schema_version": 1,
@@ -238,6 +263,13 @@ def run_smoke_matrix(
             "units_skipped": skipped_count,
             "jobs_passed": passed_jobs,
             "jobs_failed": failed_jobs,
+            "runtime_jobs_passed": runtime_jobs_passed,
+            "runtime_jobs_failed": runtime_jobs_failed,
+            "runtime_units_passed": runtime_units_passed,
+            "runtime_units_failed": runtime_units_failed,
+            "runtime_execution_gate_passed": runtime_execution_gate_passed,
+            "runtime_gate_passed": runtime_gate_passed,
+            "quality_gate_passed": execution_gate_passed,
             "execution_gate_passed": execution_gate_passed,
             "coverage_complete": coverage_complete,
             "gate_passed": gate_passed,

@@ -349,8 +349,10 @@ def _human(command: str, report: dict[str, Any]) -> None:
         state = "PASS" if summary.get("gate_passed") else "FAIL"
         if summary.get("gate_passed") and not summary.get("coverage_complete"):
             state = "PASS (partial coverage)"
+        elif not summary.get("gate_passed") and summary.get("runtime_gate_passed"):
+            state = "QUALITY FAIL (RUNTIME PASS)"
         print(f"{state}: {report.get('tool')}")
-        print(f"units={summary.get('units_total', 0)} executed={summary.get('units_executed', 0)} passed={summary.get('units_passed', 0)} failed={summary.get('units_failed', 0)} skipped={summary.get('units_skipped', 0)} jobs={summary.get('jobs_passed', 0)}/{summary.get('jobs_failed', 0)}")
+        print(f"units={summary.get('units_total', 0)} executed={summary.get('units_executed', 0)} passed={summary.get('units_passed', 0)} failed={summary.get('units_failed', 0)} skipped={summary.get('units_skipped', 0)} jobs={summary.get('jobs_passed', 0)}/{summary.get('jobs_failed', 0)} runtime={summary.get('runtime_units_passed', 0)}/{summary.get('runtime_units_failed', 0)}")
         for item in report.get("models", []):
             print(f"  {item.get('model_id')} [{item.get('format')}]: {item.get('status')} jobs={len(item.get('jobs', []))}")
             if item.get("error"):

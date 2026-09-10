@@ -836,6 +836,13 @@ def test_llm_smoke_matrix_is_bounded_and_isolates_unit_failures(monkeypatch):
         "units_skipped": 1,
         "jobs_passed": 4,
         "jobs_failed": 0,
+        "runtime_jobs_passed": 4,
+        "runtime_jobs_failed": 0,
+        "runtime_units_passed": 1,
+        "runtime_units_failed": 1,
+        "runtime_execution_gate_passed": False,
+        "runtime_gate_passed": False,
+        "quality_gate_passed": False,
         "execution_gate_passed": False,
         "coverage_complete": False,
         "gate_passed": False,
@@ -967,6 +974,20 @@ def test_llm_smoke_cli_exit_codes_for_partial_pass_and_failed_gate(monkeypatch, 
     assert main(["llm_smoke_matrix", "--json"]) == 1
     assert '"gate_passed": false' in capsys.readouterr().out
 
+    runtime_only = {
+        **partial,
+        "summary": {
+            "gate_passed": False,
+            "coverage_complete": True,
+            "runtime_gate_passed": True,
+            "runtime_units_passed": 1,
+            "runtime_units_failed": 0,
+        },
+    }
+    monkeypatch.setattr("scripts.model_tools.cli.run_smoke_matrix", lambda **_kwargs: runtime_only)
+    assert main(["llm_smoke_matrix"]) == 1
+    assert "QUALITY FAIL (RUNTIME PASS)" in capsys.readouterr().out
+
 
 def test_llm_smoke_require_complete_fails_partial_coverage(monkeypatch):
     units = [
@@ -985,6 +1006,44 @@ def test_llm_smoke_require_complete_fails_partial_coverage(monkeypatch):
     assert report["summary"]["coverage_complete"] is False
     assert report["summary"]["gate_passed"] is False
     assert report["errors"] == ["coverage is incomplete"]
+
+
+def test_llm_smoke_runtime_gate_is_distinct_from_quality_gate(monkeypatch):
+    units = [{
+        "model_id": "tiny",
+        "name": "Tiny",
+        "format": "gguf",
+        "engine": "llama_cpp",
+        "path": "C:/tiny.gguf",
+        "available": True,
+        "recommended_vram_gb": 1.0,
+        "asset_size_bytes": 1,
+    }]
+    monkeypatch.setattr("scripts.model_tools.llm_smoke_matrix.discover_units", lambda *_args, **_kwargs: units)
+    monkeypatch.setattr("scripts.model_tools.llm_smoke_matrix._resource_rejection", lambda *_args, **_kwargs: None)
+
+    def runner(_unit, prompts, **_kwargs):
+        return {
+            "status": "failed",
+            "jobs": [
+                {
+                    "prompt_id": prompt["id"],
+                    "status": "failed",
+                    "validation": {"non_empty": True, "passed": False},
+                    "error": None,
+                }
+                for prompt in prompts
+            ],
+            "error": None,
+        }
+
+    report = run_smoke_matrix(worker_runner=runner, allow_cpu=True)
+
+    assert report["models"][0]["runtime_status"] == "passed"
+    assert report["summary"]["runtime_execution_gate_passed"] is True
+    assert report["summary"]["runtime_gate_passed"] is True
+    assert report["summary"]["quality_gate_passed"] is False
+    assert report["summary"]["gate_passed"] is False
 
 
 def test_llm_smoke_cli_refuses_output_inside_model_root(capsys):
