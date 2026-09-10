@@ -101,6 +101,16 @@ DOCAGENT_CONFIDENCE_FLOOR=0.6     # 低于此值一律 needs_review
 - 密钥纪律：sk 只从 `.env.docagent` 读取，**不进入**命令行参数、日志、audit.json 与任何输出；`--llm` 输出只含判定与建议文本。
 - 数据边界：无论哪个 provider，发送内容仅限「疑似项 + 文档头部/相关段落（≤4KB/项）+ 提交标题」；正文、密钥、路径、URL、blob、grant 类字段一律不发送（沿用投影脱敏白名单思路）。
 
+#### 4.1.1 独立子项目配置入口（`DOC-ENV-01`，2026-09-10）
+
+`tools/docagent` 的独立扫描器已先行冻结 `qlh.docagent.environment.v1` 配置合同，供后续 M2 adapter 迁移复用：
+
+- `docagent config --root <repo> [--env <path>] [--json]` 只校验配置并输出脱敏摘要；`scan`、`audit`、`init`、`gate verify` 和主项目 M1 兼容入口均接受 `--env`。
+- 独立配置只读 `.env.docagent`，不读取主 `.env`，也不合并进程环境。显式 `--env` 不存在、未知/重复字段、不安全 URL、非 loopback Ollama 地址、越界 profile 路径或远程必填项不完整，均以退出码 2 和中文提示 fail-closed。
+- profile 选择顺序为命令行 `--profile` > `DOCAGENT_PROFILE` > 项目/内置默认；env 中的相对 profile 路径相对于 env 文件本身解析，并拒绝目录逃逸。
+- API key 不进入对象表示、stdout、stderr、JSON 或扫描报告；配置摘要不打印完整远程 endpoint，只暴露连接是否配置、传输协议和密钥布尔状态。
+- 此入口本身不调用 provider，不改变现有 legacy M2 的调用/回退语义；将真实 M2 adapter 迁入独立包仍须另票实施。因此，本机可在无模型环境完成全部配置与机械扫描验收。
+
 ### 4.2 输入与输出
 - 输入：audit.json 的疑似项 + 文档头部/相关段落（截断到 ≤4KB/项）+ 相关提交 message 列表；**脱敏**：不传 .env 值、密钥、日志正文，仅传提交标题与文档文本。
 - 输出（JSON）：`{"doc": ..., "judgement": "stale|accurate|needs_review", "confidence": 0-1, "suggestion": "建议的状态行文本或说明"}`。

@@ -1,0 +1,34 @@
+{
+  "schema": "qlh.defense_demo.scenarios.v1",
+  "source": "frontend_cybergothic",
+  "scenarios": [
+    {
+      "kind": "dialog",
+      "route": "#/workbench?fixtures=1",
+      "prompt": "当前集群能跑分布式推理吗？",
+      "markers": [
+        {"source": "fixture-data", "value": "当前集群能跑分布式推理吗？"},
+        {"source": "chat-pane", "value": "单机回落"}
+      ]
+    },
+    {
+      "kind": "image",
+      "route": "#/image?fixtures=1",
+      "prompt": "gothic observatory at night",
+      "markers": [
+        {"source": "image-studio", "value": "生图列表"},
+        {"source": "fixture-data", "value": "SD 1.5 Demo"}
+      ]
+    },
+    {
+      "kind": "topology",
+      "route": "#/cluster?fixtures=1&defense=topology",
+      "prompt": "展示脱敏的 readiness、节点状态与层段分配",
+      "markers": [
+        {"source": "topology-snapshot", "value": "qlh.defense_topology.v1"},
+        {"source": "cluster-page", "value": "Defense topology snapshot"},
+        {"source": "cluster-page", "value": "FIXTURE / REDACTED / NOT LIVE"}
+      ]
+    }
+  ]
+}

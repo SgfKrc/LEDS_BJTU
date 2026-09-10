@@ -1,0 +1,310 @@
+{
+  "schema": "qlh.defense_storyline.v1",
+  "ticket": "DEF-A1",
+  "title": "QLH 5-minute defense storyline",
+  "document": "docs/答辩演示-5分钟故事线-2026-09-10.md",
+  "duration_limit_seconds": 300,
+  "claim_guard": {
+    "uses_fixture": true,
+    "real_model_demonstrated": false,
+    "physical_dual_host_demonstrated": false,
+    "model_performance_claimed": false,
+    "external_network_required": false
+  },
+  "rehearsal_commands": {
+    "windows": [
+      "scripts\\demo\\reset.bat --apply",
+      "scripts\\demo\\checklist.bat",
+      "scripts\\demo\\demo.bat --mode failure --report build\\defense-demo\\failure-story.json",
+      "scripts\\demo\\benchmark.bat --report build\\defense-benchmark\\story.json --chart build\\defense-benchmark\\story.svg",
+      "scripts\\demo\\performance_report.bat --benchmark build\\defense-benchmark\\story.json",
+      "scripts\\demo\\demo.bat --mode fixtures --scenario topology --open"
+    ],
+    "unix": [
+      "scripts/demo/reset.sh --apply",
+      "scripts/demo/checklist.sh",
+      "scripts/demo/demo.sh --mode failure --report build/defense-demo/failure-story.json",
+      "scripts/demo/benchmark.sh --report build/defense-benchmark/story.json --chart build/defense-benchmark/story.svg",
+      "scripts/demo/performance_report.sh --benchmark build/defense-benchmark/story.json",
+      "scripts/demo/demo.sh --mode fixtures --scenario topology --open"
+    ]
+  },
+  "evidence": [
+    {
+      "id": "reset-document",
+      "path": "docs/答辩演示-环境重置说明-2026-09-10.md",
+      "required": true,
+      "kind": "document",
+      "purpose": "bounded dry-run/apply procedure, preservation scope, and repeatability contract"
+    },
+    {
+      "id": "reset-source",
+      "path": "scripts/demo/defense_reset.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "fail-closed cleanup of revalidated defense-owned process receipts"
+    },
+    {
+      "id": "reset-ownership-source",
+      "path": "scripts/demo/demo_ownership.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "crash-resilient process ownership receipts and hard-coded identity allowlist"
+    },
+    {
+      "id": "reset-tests",
+      "path": "tests/test_defense_reset.py",
+      "required": true,
+      "kind": "test",
+      "purpose": "dry-run, tamper, mismatch, preservation, and idempotence regression gates"
+    },
+    {
+      "id": "checklist-document",
+      "path": "docs/答辩现场检查清单-2026-09-10.md",
+      "required": true,
+      "kind": "document",
+      "purpose": "device, power, network, model, ports, evidence, and recovery checklist"
+    },
+    {
+      "id": "preflight-source",
+      "path": "scripts/demo/defense_preflight.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "model-free automated checks and redacted readiness report"
+    },
+    {
+      "id": "preflight-run",
+      "path": "build/defense-preflight/latest.json",
+      "required": false,
+      "kind": "runtime",
+      "purpose": "latest local automated preflight; regenerated before defense"
+    },
+    {
+      "id": "storyline-manifest",
+      "path": "scripts/demo/storyline.json",
+      "required": true,
+      "kind": "source",
+      "purpose": "machine-readable timing, evidence, claim, and fallback contract"
+    },
+    {
+      "id": "storyline-validator",
+      "path": "scripts/demo/defense_story.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "fail-closed validation for the five-minute defense contract"
+    },
+    {
+      "id": "scenario-contract",
+      "path": "scripts/demo/scenarios.json",
+      "required": true,
+      "kind": "source",
+      "purpose": "fixed dialog, image, and topology routes and markers"
+    },
+    {
+      "id": "launcher-source",
+      "path": "scripts/demo/defense_demo.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "fixture launcher, failure injection, redacted reports, and startup budget"
+    },
+    {
+      "id": "launcher-tests",
+      "path": "tests/test_defense_demo.py",
+      "required": true,
+      "kind": "test",
+      "purpose": "launcher, failure, topology, and claim-boundary regression tests"
+    },
+    {
+      "id": "topology-snapshot",
+      "path": "frontend_cybergothic/src/data/defense-topology.json",
+      "required": true,
+      "kind": "source",
+      "purpose": "canonical redacted readiness, nodes, and layer assignments"
+    },
+    {
+      "id": "topology-ui-tests",
+      "path": "frontend_cybergothic/tests/p4_defense_topology.spec.js",
+      "required": true,
+      "kind": "test",
+      "purpose": "desktop, narrow viewport, and sensitive-text UI gate"
+    },
+    {
+      "id": "failure-worker-source",
+      "path": "scripts/demo/failure_worker.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "real loopback worker process that exits after accepting a stage"
+    },
+    {
+      "id": "benchmark-source",
+      "path": "scripts/demo/defense_benchmark.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "fixed control-plane workload, claim guard, JSON, and SVG generation"
+    },
+    {
+      "id": "performance-closeout",
+      "path": "docs/答辩演示-性能结题表-2026-09-10.md",
+      "required": true,
+      "kind": "document",
+      "purpose": "claim-safe control-plane and real-model closeout tables"
+    },
+    {
+      "id": "ticket-plan",
+      "path": "docs/开发票计划-审计收口与答辩演示-2026-09-09.md",
+      "required": true,
+      "kind": "document",
+      "purpose": "ticket completion and validation record"
+    },
+    {
+      "id": "topology-run",
+      "path": "build/defense-demo/topology-run-final.json",
+      "required": false,
+      "kind": "runtime",
+      "purpose": "latest local topology rehearsal report; regenerated before defense"
+    },
+    {
+      "id": "failure-run",
+      "path": "build/defense-demo/failure-run-repeat.json",
+      "required": false,
+      "kind": "runtime",
+      "purpose": "latest local worker-exit and reassignment rehearsal report"
+    },
+    {
+      "id": "benchmark-run",
+      "path": "build/defense-benchmark/fixture-single-host-final.json",
+      "required": false,
+      "kind": "runtime",
+      "purpose": "latest local fixed-load measurements"
+    },
+    {
+      "id": "benchmark-chart",
+      "path": "build/defense-benchmark/fixture-single-host-final.svg",
+      "required": false,
+      "kind": "runtime",
+      "purpose": "latest local benchmark chart with visible claim boundary"
+    }
+  ],
+  "segments": [
+    {
+      "id": "S1",
+      "title": "Boundary first",
+      "start_second": 0,
+      "end_second": 35,
+      "ticket_refs": ["DEF-P1"],
+      "screen": "topology defense title and claim banner",
+      "action": "Point to FIXTURE / REDACTED / NOT LIVE before discussing the system.",
+      "say": [
+        "This rehearsal demonstrates repeatability, observability, and recovery of the control plane.",
+        "The current machine does not carry a suitable model, so this is not a real-model or physical dual-host performance claim."
+      ],
+      "success_markers": ["FIXTURE / REDACTED / NOT LIVE", "READ-ONLY EVIDENCE"],
+      "evidence_ids": ["checklist-document", "preflight-source", "preflight-run", "storyline-manifest", "storyline-validator", "scenario-contract", "launcher-source", "topology-run"],
+      "fallback": {
+        "trigger": "browser did not open",
+        "action": "Copy the reported loopback URL into Edge; if Vite is unavailable, open the canonical snapshot source.",
+        "evidence_id": "topology-snapshot"
+      }
+    },
+    {
+      "id": "S2",
+      "title": "One reproducible entrance",
+      "start_second": 35,
+      "end_second": 80,
+      "ticket_refs": ["DEF-P1"],
+      "screen": "fixture banner, scenario manifest, and startup report",
+      "action": "Explain the single launcher, fixed routes, marker verification, two-minute startup budget, and owned-process cleanup.",
+      "say": [
+        "One command starts only the current CyberGothic frontend and validates three fixed scenarios before declaring readiness.",
+        "Reports retain state and markers but omit credentials, model output, absolute paths, and dynamic ports."
+      ],
+      "success_markers": ["fixture-dialog", "fixture-image", "fixture-topology", "startup-budget"],
+      "evidence_ids": ["reset-document", "reset-source", "reset-ownership-source", "reset-tests", "scenario-contract", "launcher-source", "launcher-tests", "topology-run"],
+      "fallback": {
+        "trigger": "startup preflight failed",
+        "action": "Read the fail-closed report, state that this run is unavailable, and continue with tracked source and test evidence.",
+        "evidence_id": "launcher-tests"
+      }
+    },
+    {
+      "id": "S3",
+      "title": "Redacted topology and readiness",
+      "start_second": 80,
+      "end_second": 135,
+      "ticket_refs": ["DEF-P4"],
+      "screen": "readiness checks, alias-only nodes, and layer segments",
+      "action": "Trace node-master to node-worker-a, then point out the excluded standby and complete L0-L23 projection.",
+      "say": [
+        "The snapshot has three passing readiness checks, two ready aliases, and one offline standby excluded from allocation.",
+        "The stored end-exclusive ranges 0-8 and 8-24 render as L0-L7 and L8-L23 without a gap or overlap."
+      ],
+      "success_markers": ["3 / 3", "node-standby", "L0-L7", "L8-L23"],
+      "evidence_ids": ["topology-snapshot", "topology-ui-tests", "topology-run"],
+      "fallback": {
+        "trigger": "canvas or styles did not render",
+        "action": "Use the accessible DOM text or canonical JSON; do not infer live topology from the decorative canvas.",
+        "evidence_id": "topology-snapshot"
+      }
+    },
+    {
+      "id": "S4",
+      "title": "Failure is observable and recoverable",
+      "start_second": 135,
+      "end_second": 200,
+      "ticket_refs": ["DEF-P2"],
+      "screen": "redacted failure report workflow and attempts",
+      "action": "Follow worker-ready, worker-exit, stage-reassigned, workflow-complete and compare lease epochs 1 and 2.",
+      "say": [
+        "A real second worker process accepts the fixture stage and exits with code 23; the production transport observes remote_worker_disconnected.",
+        "The safe pure stage expires once, is reassigned exactly once to deterministic local recovery, and completes with its output redacted."
+      ],
+      "success_markers": ["remote_worker_disconnected", "expired", "completed", "retry_count=1"],
+      "evidence_ids": ["launcher-source", "failure-worker-source", "launcher-tests", "failure-run"],
+      "fallback": {
+        "trigger": "live failure injection did not finish",
+        "action": "Say that the current replay failed, show the last redacted report only if present, and fall back to the deterministic regression test.",
+        "evidence_id": "launcher-tests"
+      }
+    },
+    {
+      "id": "S5",
+      "title": "Measure without overclaiming",
+      "start_second": 200,
+      "end_second": 255,
+      "ticket_refs": ["DEF-P3"],
+      "screen": "performance closeout table and benchmark SVG claim banner",
+      "action": "Name the fixed workload first, read median and p95 second, and finish on the physical-dual-host not-run field.",
+      "say": [
+        "Twelve measured and two warm-up iterations compare in-process with a real loopback worker process on one host.",
+        "These milliseconds measure TaskGraph control-plane fixture overhead, not TTFT, tokens per second, model quality, or dual-host acceleration."
+      ],
+      "success_markers": ["FIXTURE · SINGLE HOST · NOT MODEL PERFORMANCE", "physical_dual_host_data_pending"],
+      "evidence_ids": ["performance-closeout", "benchmark-source", "benchmark-run", "benchmark-chart"],
+      "fallback": {
+        "trigger": "chart or fresh benchmark is unavailable",
+        "action": "Show the JSON claim_guard; omit all measurements if no current report exists.",
+        "evidence_id": "benchmark-source"
+      }
+    },
+    {
+      "id": "S6",
+      "title": "Close on evidence and the next gate",
+      "start_second": 255,
+      "end_second": 300,
+      "ticket_refs": ["DEF-P1", "DEF-P2", "DEF-P3", "DEF-P4"],
+      "screen": "ticket plan completion records",
+      "action": "Summarize reproducibility, visible boundaries, deterministic recovery, and the deferred real-model gates.",
+      "say": [
+        "The result is a repeatable defense path with explicit evidence for startup, topology, recovery, and measurement.",
+        "Real runtime and model-switch acceptance remain queued until suitable model assets and hardware are available; fixture evidence does not close those gates."
+      ],
+      "success_markers": ["DEF-P1", "DEF-P2", "DEF-P3", "DEF-P4"],
+      "evidence_ids": ["storyline-manifest", "storyline-validator", "ticket-plan", "launcher-tests", "topology-ui-tests"],
+      "fallback": {
+        "trigger": "less than 45 seconds remain",
+        "action": "Skip navigation, state the four evidence points and the two deferred real-model gates, then stop at five minutes.",
+        "evidence_id": "ticket-plan"
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema": "qlh.real_model_performance.v1",
+  "status": "not_run",
+  "reason_code": "real_model_environment_unavailable",
+  "claim_guard": {
+    "real_model_measurement": false,
+    "physical_dual_host_measurement": false,
+    "eligible_for_model_claim": false
+  },
+  "metrics": {
+    "ttft_ms": null,
+    "inter_token_ms": null,
+    "e2e_ms": null,
+    "decode_tokens_per_second": null,
+    "peak_memory_gb": null,
+    "model_load_seconds": null
+  }
+}

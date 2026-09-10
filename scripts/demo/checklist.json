@@ -1,0 +1,45 @@
+{
+  "schema": "qlh.defense_checklist.v1",
+  "ticket": "DEF-A3",
+  "profile": "fixture-defense",
+  "document": "docs/答辩现场检查清单-2026-09-10.md",
+  "categories": ["device", "power", "network", "model", "ports", "evidence", "recovery"],
+  "claim_guard": {
+    "external_network_required": false,
+    "model_load_required": false,
+    "real_model_claim_allowed": false,
+    "physical_dual_host_claim_allowed": false
+  },
+  "automated_requirements": [
+    {"id": "device-python", "category": "device", "handler": "python_runtime", "blocking": true},
+    {"id": "device-node", "category": "device", "handler": "node_runtime", "blocking": true},
+    {"id": "device-browser", "category": "device", "handler": "edge_browser", "blocking": true},
+    {"id": "device-storage", "category": "device", "handler": "free_storage", "blocking": true},
+    {"id": "power-supply", "category": "power", "handler": "power_supply", "blocking": false},
+    {"id": "network-loopback", "category": "network", "handler": "loopback", "blocking": true},
+    {"id": "port-frontend", "category": "ports", "handler": "frontend_port", "blocking": true},
+    {"id": "port-api", "category": "ports", "handler": "api_port", "blocking": false},
+    {"id": "port-cluster", "category": "ports", "handler": "cluster_port", "blocking": false},
+    {"id": "model-scope", "category": "model", "handler": "model_scope", "blocking": false},
+    {"id": "evidence-contracts", "category": "evidence", "handler": "evidence_contracts", "blocking": true},
+    {"id": "recovery-entrypoints", "category": "recovery", "handler": "recovery_entrypoints", "blocking": true}
+  ],
+  "manual_requirements": [
+    {"id": "manual-power-adapter", "category": "power", "instruction": "接通电源并确认系统未进入省电模式。"},
+    {"id": "manual-display", "category": "device", "instruction": "确认投屏分辨率、缩放和演讲者可见的计时器。"},
+    {"id": "manual-network-boundary", "category": "network", "instruction": "关闭 VPN/代理变化；fixture 演示不依赖外网。"},
+    {"id": "manual-model-boundary", "category": "model", "instruction": "确认性能表真实模型指标仍为 NOT RUN，不口述模型结论。"},
+    {"id": "manual-port-owner", "category": "ports", "instruction": "若端口占用，先确认 PID 归属；不得盲杀非本票进程。"},
+    {"id": "manual-evidence-tabs", "category": "evidence", "instruction": "预先打开拓扑、故障报告、性能结题表和开发票计划。"},
+    {"id": "manual-recovery-clock", "category": "recovery", "instruction": "熟记 20 秒止损线和 90 秒紧急故事线。"}
+  ],
+  "recovery_playbook": [
+    {"id": "recover-browser", "trigger": "浏览器未自动打开", "action": "复制启动器输出的 loopback URL 到 Edge。", "evidence": "scripts/demo/defense_demo.py"},
+    {"id": "recover-port", "trigger": "前端端口被占用", "action": "确认占用者；若非本票进程则改用空闲端口，不执行盲目终止。", "evidence": "build/defense-preflight/latest.json"},
+    {"id": "recover-fixture", "trigger": "fixture 页面 20 秒内未就绪", "action": "停止本次启动器并转到仓库内固定证据，明确声明本轮 UI 未复演。", "evidence": "tests/test_defense_demo.py"},
+    {"id": "recover-failure", "trigger": "故障注入未完成", "action": "明确声明本轮失败；仅把上次报告称为历史彩排证据。", "evidence": "tests/test_defense_demo.py"},
+    {"id": "recover-benchmark", "trigger": "benchmark 或图表不可用", "action": "展示性能结题表的声明门；没有当前 JSON 时省略全部数值。", "evidence": "docs/答辩演示-性能结题表-2026-09-10.md"},
+    {"id": "recover-power", "trigger": "电量低或未接电源", "action": "接通电源；无法接通则停止现场重跑，仅使用已验证证据。", "evidence": "build/defense-preflight/latest.json"},
+    {"id": "recover-time", "trigger": "剩余时间不足 90 秒", "action": "切换到故事线的 90 秒紧急版，不再启动新进程。", "evidence": "docs/答辩演示-5分钟故事线-2026-09-10.md"}
+  ]
+}

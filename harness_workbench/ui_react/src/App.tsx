@@ -53,6 +53,35 @@ const navItems: { id: ViewId; label: string; icon: typeof MessageSquareText }[] 
   { id: 'runtime', label: '运行时', icon: BrainCircuit },
 ];
 
+function describeHarnessError(error: unknown, fallback: string): string {
+  if (error instanceof HarnessApiError) {
+    const code = error.code ? ` [${error.code}]` : '';
+    const retry = error.retryable ? ' · 可重试' : '';
+    return `${error.message}${code} · HTTP ${error.status}${retry}`;
+  }
+  return error instanceof Error ? error.message : fallback;
+}
+
+function readMcpError(response: MCPCallResponse): { code?: number | string; message: string; retryable?: boolean } | null {
+  if (response.error) return response.error;
+  if (!response.result?.isError) return null;
+  const text = response.result.content?.find((item) => item.type === 'text')?.text;
+  if (!text) return { message: 'MCP 工具返回受控错误' };
+  try {
+    const payload = JSON.parse(text) as { error?: { code?: string; message?: string; retryable?: boolean } };
+    if (payload.error?.message) {
+      return {
+        code: payload.error.code,
+        message: payload.error.message,
+        retryable: payload.error.retryable,
+      };
+    }
+  } catch {
+    // Keep the full raw response available below when a non-JSON MCP server fails.
+  }
+  return { message: 'MCP 工具返回受控错误' };
+}
+
 function App() {
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('harness-theme') as Theme) || 'dark');
   const [view, setView] = useState<ViewId>('chat');
@@ -422,12 +451,16 @@ function App() {
     try {
       const response = await callMcpTool(mcpToolName, argumentsValue);
       setMcpResult(response);
-      if (response.error) setMcpNotice(`MCP RPC 错误：${response.error.message}`);
-      else if (response.result?.isError) setMcpNotice(`${mcpToolName} 返回受控错误；后端未伪造结果。`);
+      const failure = readMcpError(response);
+      if (failure) {
+        const code = failure.code !== undefined ? ` [${String(failure.code)}]` : '';
+        const retry = failure.retryable ? ' · 可重试' : '';
+        setMcpNotice(`${mcpToolName} 失败：${failure.message}${code}${retry}`);
+      }
       else setMcpNotice(`${mcpToolName} 完成。`);
     } catch (error) {
       setMcpResult(null);
-      setMcpNotice(`MCP 调用失败：${error instanceof Error ? error.message : 'unknown MCP error'}`);
+      setMcpNotice(`MCP 调用失败：${describeHarnessError(error, 'unknown MCP error')}`);
     } finally {
       setMcpBusy(false);
     }
@@ -504,10 +537,10 @@ function McpView({ manifest, selectedTool, selectedName, setSelectedName, argume
   return <section className="utility-view mcp-view" aria-labelledby="mcp-title">
     <div className="view-heading"><div><span className="eyebrow">PROTOCOL / JSON-RPC 2.0</span><h1 id="mcp-title">MCP 控制面</h1><p>工具目录、输入合同和执行结果来自同一份 Harness registry。</p></div><Workflow size={30} className="heading-icon" /></div>
     <div className="mcp-statusbar"><div><span className="eyebrow">SERVER</span><strong>{manifest?.server.serverInfo?.name || 'unavailable'}</strong></div><div><span className="eyebrow">TOOLS</span><strong>{tools.length} / {configuredCount} ready</strong></div><div><span className="eyebrow">STDIO</span><strong>{manifest?.transports.stdio.available ? 'READY' : 'BLOCKED'}</strong></div><div><span className="eyebrow">SSE</span><strong>{manifest?.transports.sse.mode || 'offline'}</strong></div><button className="icon-button" type="button" onClick={onRefresh} title="刷新 MCP manifest" aria-label="刷新 MCP manifest"><RefreshCw size={16} /></button></div>
-    <div className="mcp-notice" role="status" aria-live="polite"><ShieldCheck size={16} />{notice}</div>
+    <div className="mcp-notice" data-testid="mcp-notice" role="status" aria-live="polite"><ShieldCheck size={16} />{notice}</div>
     <div className="mcp-layout">
       <aside className="mcp-catalog" aria-label="MCP 工具目录"><div className="mcp-panel-head"><span className="eyebrow">TOOL REGISTRY</span><span>{tools.length.toString().padStart(2, '0')}</span></div>{tools.length === 0 ? <div className="mcp-empty"><CircleAlert size={20} /><span>工具目录不可用</span></div> : <div className="mcp-tool-list">{tools.map((tool) => { const meta = tool._meta?.qlh; const annotations = tool.annotations; return <button className={`mcp-tool-item ${selectedName === tool.name ? 'mcp-tool-item--active' : ''}`} type="button" key={tool.name} onClick={() => setSelectedName(tool.name)}><span className="mcp-tool-icon">{meta?.source === 'external' ? <Cable size={15} /> : <Braces size={15} />}</span><span className="mcp-tool-copy"><strong>{tool.name}</strong><small>{meta?.configured ? 'configured' : meta?.source === 'external' ? 'external declaration' : 'unconfigured'} · {annotations?.readOnlyHint ? 'read' : annotations?.destructiveHint ? 'destructive write' : 'write'}</small></span><ChevronRight size={14} /></button>; })}</div>}</aside>
-      <div className="mcp-inspector">{selectedTool ? <><div className="mcp-inspector-head"><div><span className="eyebrow">SELECTED TOOL</span><h2>{selectedTool.name}</h2></div><span className={`mcp-state ${selectedMeta?.configured ? 'mcp-state--ready' : ''}`}>{selectedMeta?.configured ? <CircleCheck size={14} /> : <CircleAlert size={14} />}{selectedMeta?.capability || 'unconfigured'}</span></div><p className="mcp-description">{selectedTool.description}</p><div className="mcp-badges"><span>{selectedTool.annotations?.readOnlyHint ? 'READ ONLY' : 'WRITE'}</span>{selectedTool.annotations?.destructiveHint && <span className="mcp-badge--danger">CONFIRMATION SENSITIVE</span>}{selectedTool.annotations?.openWorldHint && <span className="mcp-badge--gold">OPEN WORLD</span>}</div><details className="mcp-schema" open><summary><span><Braces size={14} />输入 schema</span><span>{(selectedTool.inputSchema.required || []).length} required</span></summary><pre>{JSON.stringify(selectedTool.inputSchema, null, 2)}</pre></details><form className="mcp-call-form" onSubmit={onSubmit}><label htmlFor="mcp-arguments">调用参数 <small>JSON object</small></label><textarea id="mcp-arguments" value={argumentsValue} onChange={(event) => setArgumentsValue(event.target.value)} spellCheck={false} rows={7} /><button className="action-button" type="submit" disabled={busy || !selectedMeta?.configured}><Play size={15} />{busy ? '调用中' : '调用工具'}</button></form>{result && <div className={`mcp-result ${result.result?.isError || result.error ? 'mcp-result--error' : ''}`}><div className="mcp-panel-head"><span className="eyebrow">LAST RESPONSE</span>{result.result?.isError || result.error ? <CircleAlert size={15} /> : <CircleCheck size={15} />}</div><pre>{JSON.stringify(result, null, 2)}</pre></div>}</> : <div className="mcp-empty mcp-empty--large"><Workflow size={28} /><strong>等待 MCP 工具目录</strong><span>连接 Harness API 后可浏览并调用已注册工具。</span></div>}</div>
+      <div className="mcp-inspector">{selectedTool ? <><div className="mcp-inspector-head"><div><span className="eyebrow">SELECTED TOOL</span><h2>{selectedTool.name}</h2></div><span className={`mcp-state ${selectedMeta?.configured ? 'mcp-state--ready' : ''}`}>{selectedMeta?.configured ? <CircleCheck size={14} /> : <CircleAlert size={14} />}{selectedMeta?.capability || 'unconfigured'}</span></div><p className="mcp-description">{selectedTool.description}</p><div className="mcp-badges"><span>{selectedTool.annotations?.readOnlyHint ? 'READ ONLY' : 'WRITE'}</span>{selectedTool.annotations?.destructiveHint && <span className="mcp-badge--danger">CONFIRMATION SENSITIVE</span>}{selectedTool.annotations?.openWorldHint && <span className="mcp-badge--gold">OPEN WORLD</span>}</div><details className="mcp-schema" open><summary><span><Braces size={14} />输入 schema</span><span>{(selectedTool.inputSchema.required || []).length} required</span></summary><pre>{JSON.stringify(selectedTool.inputSchema, null, 2)}</pre></details><form className="mcp-call-form" onSubmit={onSubmit}><label htmlFor="mcp-arguments">调用参数 <small>JSON object</small></label><textarea id="mcp-arguments" value={argumentsValue} onChange={(event) => setArgumentsValue(event.target.value)} spellCheck={false} rows={7} /><button className="action-button" type="submit" disabled={busy || !selectedMeta?.configured}><Play size={15} />{busy ? '调用中' : '调用工具'}</button></form>{result && <div className={`mcp-result ${result.result?.isError || result.error ? 'mcp-result--error' : ''}`} data-testid="mcp-result"><div className="mcp-panel-head"><span className="eyebrow">LAST RESPONSE</span>{result.result?.isError || result.error ? <CircleAlert size={15} /> : <CircleCheck size={15} />}</div><pre>{JSON.stringify(result, null, 2)}</pre></div>}</> : <div className="mcp-empty mcp-empty--large"><Workflow size={28} /><strong>等待 MCP 工具目录</strong><span>连接 Harness API 后可浏览并调用已注册工具。</span></div>}</div>
     </div>
     {manifest && <div className="mcp-footnote"><span><strong>External MCP</strong> {manifest.external_mcp.configuration_only ? `${manifest.external_mcp.configurations.length} 个配置声明，真实连接未启用。` : '已启用。'}</span><span><strong>SSE</strong> {manifest.transports.sse.mode} · <strong>stdio</strong> {manifest.transports.stdio.command}</span></div>}
   </section>;

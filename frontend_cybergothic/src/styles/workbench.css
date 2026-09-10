@@ -429,7 +429,8 @@
   display: grid;
   grid-template-columns: 4.2rem 4.4rem 1fr;
   gap: var(--gap-sm);
-  align-items: baseline;
+  /* 各字体的基线差异较大，顶部对齐才能在字体加载后保持稳定同行。 */
+  align-items: start;
   padding: var(--gap-sm) 0;
   border-bottom: 1px solid var(--line-faint);
 }
@@ -439,10 +440,14 @@
 }
 
 .evlist__time {
+  display: block;
+  line-height: 1.4;
   color: var(--muted-dim);
 }
 
 .evlist__level {
+  display: block;
+  line-height: 1.4;
   color: var(--muted);
 }
 
@@ -459,7 +464,9 @@
 }
 
 .evlist__msg {
+  display: block;
   min-width: 0;
+  line-height: 1.4;
   color: var(--text);
   font-size: 12.5px;
   overflow-wrap: anywhere; /* 日志里有长 ID / 路径，必须能断行 */
@@ -1268,6 +1275,8 @@
   }
 
   .split__pane {
+    /* 堆叠时 section 必须包住自身内容，避免 flex-shrink 让内容溢出到下一栏。 */
+    flex: 0 0 auto;
     overflow-y: visible; /* 交回给页面统一滚动，避免嵌套滚动容器 */
   }
 
@@ -1346,6 +1355,11 @@
 
   .console {
     padding: var(--gap-md) var(--gap-md) var(--gap-lg);
+  }
+
+  /* 移动端整页滚动时避免控制台入场位移与内容高度测量竞争，保持两栏边界稳定。 */
+  .console[data-enter] {
+    animation: none;
   }
 }
 
