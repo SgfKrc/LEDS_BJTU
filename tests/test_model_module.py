@@ -2201,6 +2201,37 @@ class TestSwitchModel:
         assert result["success"] is False
         assert result["error_code"] == "MODEL_NOT_REGISTERED"
 
+    def test_unknown_target_preserves_loaded_model_without_unload(self, monkeypatch):
+        """An invalid target must be rejected before changing a healthy runtime."""
+        import model_module
+
+        class FakeLlamaEngine:
+            def close(self):
+                raise AssertionError("preflight rejection must not unload the active model")
+
+        monkeypatch.setattr(model_module, "INFERENCE_ENGINE", "auto")
+        monkeypatch.setattr(os.path, "isfile", lambda _path: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        mgr = ModelManager()
+        engine = FakeLlamaEngine()
+
+        def fake_load(*_args, **_kwargs):
+            mgr._llama_engine = engine
+
+        monkeypatch.setattr(mgr, "_load_llama_cpp", fake_load)
+        loaded = mgr.switch_model("qwen2.5-7b-gguf", engine="llama_cpp")
+        assert loaded["success"] is True
+
+        result = mgr.switch_model("nonexistent-model", engine="llama_cpp")
+
+        assert result["success"] is False
+        assert result["error_code"] == "MODEL_NOT_REGISTERED"
+        assert result["requested_model_id"] == "nonexistent-model"
+        assert result["active_model_preserved"] is True
+        assert result["model_id"] == "qwen2.5-7b-gguf"
+        assert mgr.active_model_id == "qwen2.5-7b-gguf"
+        assert mgr._llama_engine is engine
+
     def test_switch_first_model_succeeds(self, monkeypatch):
         """首次加载（无旧模型）→ 直接加载新模型"""
         import model_module
