@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from demo_ownership import OwnershipLedger
+
 
 ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_ROOT = ROOT / "frontend_cybergothic"
@@ -74,31 +76,36 @@ class DemoRun:
     steps: list[dict[str, Any]] = field(default_factory=list)
     log_paths: list[Path] = field(default_factory=list)
     failure_injection: dict[str, Any] | None = None
+    ownership: OwnershipLedger | None = None
 
     def record(self, name: str, ok: bool, detail: str = "") -> None:
         self.steps.append({"name": name, "ok": ok, "detail": detail})
 
     def stop(self) -> None:
-        for managed in reversed(self.processes):
-            process = managed.process
-            if os.name == "nt":
-                # npm/python on Windows can be launcher shims. Kill the tree
-                # so a child server cannot survive the demo process.
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                continue
-            if process.poll() is not None:
-                continue
-            try:
-                process.terminate()
-                process.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                process.kill()
-        self.processes.clear()
+        try:
+            for managed in reversed(self.processes):
+                process = managed.process
+                if process.poll() is not None:
+                    continue
+                if os.name == "nt":
+                    # npm/python on Windows can be launcher shims. Kill the tree
+                    # so a child server cannot survive the demo process.
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    continue
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    process.kill()
+        finally:
+            self.processes.clear()
+            if self.ownership is not None:
+                self.ownership.close()
 
 
 def _port(value: str) -> int:
@@ -384,6 +391,13 @@ def _start_process(
     managed = ManagedProcess(name=name, process=process, log_path=log_path)
     run.processes.append(managed)
     run.log_paths.append(log_path)
+    if run.ownership is not None:
+        try:
+            run.ownership.register(name, process.pid)
+        except Exception:
+            if process.poll() is None:
+                process.terminate()
+            raise
     return managed
 
 
@@ -659,6 +673,13 @@ def run_demo(config: DemoConfig) -> int:
         for error in errors:
             print(f"[QLH-DEMO] ERROR {error}", file=sys.stderr)
         return 2
+
+    owned_ports: list[int] = []
+    if not config.skip_frontend and uses_frontend:
+        owned_ports.append(config.frontend_port)
+    if config.mode == "live":
+        owned_ports.extend((config.api_port, _cluster_port(config)))
+    run.ownership = OwnershipLedger("defense_demo", ports=owned_ports)
 
     try:
         run.record("preflight", True, f"mode={config.mode}")

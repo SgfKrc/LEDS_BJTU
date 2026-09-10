@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from demo_ownership import OwnershipLedger
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = ROOT / "src"
@@ -174,6 +176,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
     server_started = False
     coordinator = None
     worker_process: subprocess.Popen[str] | None = None
+    ownership = OwnershipLedger("defense_benchmark")
     log_path = BUILD_ROOT / "benchmark-worker.log"
 
     def on_server_message(client_id: str, outer: dict[str, Any]) -> None:
@@ -263,6 +266,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
                     subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
                 ),
             )
+            ownership.register("benchmark-worker", worker_process.pid)
         finally:
             log_handle.close()
         if not hello_received.wait(config.startup_timeout):
@@ -348,6 +352,7 @@ def run_benchmark(config: BenchmarkConfig) -> dict[str, Any]:
         if server_started:
             server.stop()
         runtime_config.CLUSTER_SECRET = previous_secret
+        ownership.close()
 
 
 def render_svg(report: dict[str, Any]) -> str:
