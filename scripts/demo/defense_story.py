@@ -128,13 +128,13 @@ def validate_storyline(payload: object, *, root: Path = ROOT) -> dict[str, Any]:
     if not isinstance(commands, dict) or set(commands) != {"windows", "unix"}:
         raise StorylineError("彩排命令必须同时覆盖 Windows 和 Unix")
     for platform, items in commands.items():
-        if not isinstance(items, list) or len(items) != 5:
+        if not isinstance(items, list) or len(items) != 6:
             raise StorylineError(f"{platform} 彩排命令数量无效")
         combined = "\n".join(_text(item, f"{platform} 彩排命令") for item in items)
         if any(pattern.search(combined) for pattern in FORBIDDEN_COMMANDS):
             raise StorylineError(f"{platform} 彩排命令触发真实模型、live 或旧前端禁用项")
-        if "checklist" not in combined or "--mode fixtures" not in combined or "--mode failure" not in combined or "benchmark" not in combined or "performance_report" not in combined:
-            raise StorylineError(f"{platform} 彩排命令未覆盖 A3 预检、P1-P3 与 A2 汇总")
+        if "reset" not in combined or "--apply" not in combined or "checklist" not in combined or "--mode fixtures" not in combined or "--mode failure" not in combined or "benchmark" not in combined or "performance_report" not in combined:
+            raise StorylineError(f"{platform} 彩排命令未覆盖 A4 重置、A3 预检、P1-P3 与 A2 汇总")
 
     segments = payload.get("segments")
     if not isinstance(segments, list) or not segments:

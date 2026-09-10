@@ -365,15 +365,19 @@ def _check_evidence(requirement: dict[str, Any], _config: PreflightConfig) -> di
     required = (
         "scripts/demo/checklist.json",
         "scripts/demo/defense_preflight.py",
+        "scripts/demo/defense_reset.py",
+        "scripts/demo/demo_ownership.py",
         "scripts/demo/storyline.json",
         "scripts/demo/scenarios.json",
         "frontend_cybergothic/src/data/defense-topology.json",
         "docs/答辩现场检查清单-2026-09-10.md",
+        "docs/答辩演示-环境重置说明-2026-09-10.md",
         "docs/答辩演示-5分钟故事线-2026-09-10.md",
         "docs/答辩演示-性能结题表-2026-09-10.md",
         "tests/test_defense_demo.py",
         "tests/test_defense_performance_report.py",
         "tests/test_defense_preflight.py",
+        "tests/test_defense_reset.py",
     )
     missing = [item for item in required if not (ROOT / item).is_file()]
     return _result(requirement, "failed" if missing else "passed", f"required={len(required)}; missing={len(missing)}")
@@ -391,6 +395,8 @@ def _check_recovery(requirement: dict[str, Any], _config: PreflightConfig) -> di
         "scripts/demo/story.sh",
         "scripts/demo/checklist.bat",
         "scripts/demo/checklist.sh",
+        "scripts/demo/reset.bat",
+        "scripts/demo/reset.sh",
     )
     missing = [item for item in required if not (ROOT / item).is_file()]
     return _result(requirement, "failed" if missing else "passed", f"entrypoints={len(required)}; missing={len(missing)}")

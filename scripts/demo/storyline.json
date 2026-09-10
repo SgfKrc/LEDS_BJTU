@@ -13,6 +13,7 @@
   },
   "rehearsal_commands": {
     "windows": [
+      "scripts\\demo\\reset.bat --apply",
       "scripts\\demo\\checklist.bat",
       "scripts\\demo\\demo.bat --mode failure --report build\\defense-demo\\failure-story.json",
       "scripts\\demo\\benchmark.bat --report build\\defense-benchmark\\story.json --chart build\\defense-benchmark\\story.svg",
@@ -20,6 +21,7 @@
       "scripts\\demo\\demo.bat --mode fixtures --scenario topology --open"
     ],
     "unix": [
+      "scripts/demo/reset.sh --apply",
       "scripts/demo/checklist.sh",
       "scripts/demo/demo.sh --mode failure --report build/defense-demo/failure-story.json",
       "scripts/demo/benchmark.sh --report build/defense-benchmark/story.json --chart build/defense-benchmark/story.svg",
@@ -28,6 +30,34 @@
     ]
   },
   "evidence": [
+    {
+      "id": "reset-document",
+      "path": "docs/答辩演示-环境重置说明-2026-09-10.md",
+      "required": true,
+      "kind": "document",
+      "purpose": "bounded dry-run/apply procedure, preservation scope, and repeatability contract"
+    },
+    {
+      "id": "reset-source",
+      "path": "scripts/demo/defense_reset.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "fail-closed cleanup of revalidated defense-owned process receipts"
+    },
+    {
+      "id": "reset-ownership-source",
+      "path": "scripts/demo/demo_ownership.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "crash-resilient process ownership receipts and hard-coded identity allowlist"
+    },
+    {
+      "id": "reset-tests",
+      "path": "tests/test_defense_reset.py",
+      "required": true,
+      "kind": "test",
+      "purpose": "dry-run, tamper, mismatch, preservation, and idempotence regression gates"
+    },
     {
       "id": "checklist-document",
       "path": "docs/答辩现场检查清单-2026-09-10.md",
@@ -189,7 +219,7 @@
         "Reports retain state and markers but omit credentials, model output, absolute paths, and dynamic ports."
       ],
       "success_markers": ["fixture-dialog", "fixture-image", "fixture-topology", "startup-budget"],
-      "evidence_ids": ["scenario-contract", "launcher-source", "launcher-tests", "topology-run"],
+      "evidence_ids": ["reset-document", "reset-source", "reset-ownership-source", "reset-tests", "scenario-contract", "launcher-source", "launcher-tests", "topology-run"],
       "fallback": {
         "trigger": "startup preflight failed",
         "action": "Read the fail-closed report, state that this run is unavailable, and continue with tracked source and test evidence.",

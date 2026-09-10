@@ -24,7 +24,7 @@ def test_current_storyline_is_exactly_five_minutes_and_covers_p1_to_p4():
     assert summary["duration_seconds"] == 300
     assert summary["segment_count"] == 6
     assert summary["covered_tickets"] == ["DEF-P1", "DEF-P2", "DEF-P3", "DEF-P4"]
-    assert summary["required_evidence_count"] == 13
+    assert summary["required_evidence_count"] == 17
     assert summary["claim_guard"]["real_model_demonstrated"] is False
 
 
