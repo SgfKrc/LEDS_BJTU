@@ -389,6 +389,7 @@ model profile
 - 2026-09-11：v22 —— 完成 **TOOL-CTX-RESS-01 ContextPolicy 压力测试工具**：新增 30 轮 fixture 的 window/state/memory 预算矩阵、早期事实召回曲线、六项不变量检查和 JSON/Markdown CLI 报告；全程 fixture-only、无模型权重、无网络。
 - 2026-09-11：v23 —— 完成 **TOOL-REDTEAM-LAB-01 红队样本演练工具**：新增四类 12 条攻击样本的逐条 block/reason 报告、1 条安全 allowlist 对照、fixture/family 过滤和 JSON/Markdown CLI；payload 脱敏、无模型权重、无网络。
 - 2026-09-11：v24 —— 完成 **TOOL-TRACE-RPL-01 双机验收时间线回放工具**：将项目进展/验收清单中的 8 月 20 日分层验收、8 月 21 日重启恢复/断连重派/Tailnet IPv6 事实归一化为 4 个脱敏 fixture、13 个事件，提供场景/事件过滤及 JSON/Markdown CLI；原始地址、绝对路径和凭据 fail-closed，fixture-only、无模型权重、无网络。
+- 2026-09-11：v25 —— 完成 **TOOL-PROMPT-LAB-01 多模板 A/B 渲染工具**：复用 `PromptProfile`/`render_prompt_messages()` 对固定 case 矩阵做模板字段差异、system/消息长度和确定性 token 估算；输入 schema、路径、重复 ID fail-closed，正文只保留 digest，fixture-only、无模型权重、无网络。
 
 ## 8. S1 实施记录
 
@@ -666,6 +667,24 @@ model profile
 ```
 
 当前默认回放为 4 个场景、13 个事件，全部检查通过；未启动服务、未访问网络、未加载 QW1.8B。该工具只证明既有验收事实可以稳定复演和脱敏展示，不替代原始日志归档、长时双机复验或真实模型质量验收。下一票进入 `TOOL-PROMPT-LAB-01`。
+
+### TOOL-PROMPT-LAB-01 实施记录（2026-09-11）
+
+本票把 PromptProfile 的模板差异和渲染成本做成可复现、可脱敏的 A/B 报告，不执行模型生成。默认使用 QW1.8B 内置 profile 家族的 minimal/structured 两个 profile 和 3 个固定对话 case。
+
+- `tools/prompt_lab.py` 复用 `PromptProfile` 与 `render_prompt_messages()`，对所有 profile × case 组合渲染；每个结果保留 profile/case ID、输入/渲染 digest、system 注入次数、消息数、字符数和 `HeuristicTokenizer` 估算 token，不保存 system prompt 或消息正文。
+- `PromptProfileDiff` 逐字段对比 family/version/system_prompt/stop/thinking/tool_mode/structured_output；system prompt/stop 的变化只展示字符数、数量和 digest。`PromptCaseDelta` 给出每个 case 的 B-A 字符/token 差异，避免把长度变化误报为质量收益。
+- CLI：`python -m harness_workbench.tools.prompt_lab --list`、`--profile`、`--case`、`--profile-file`、`--case-file`、`--json`、`--markdown`；规范化 JSON 使用 `qlh.prompt_lab.v1`，原文、绝对路径、未知 schema 和重复 ID 均拒绝。
+- 报告固定检查矩阵完整、身份引用、system 只注入一次、profile digest 有差异、字段 diff 存在、payload 省略和 offline 边界；默认 2 × 3 矩阵为 6 个渲染单元。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_prompt_lab.py -q
+9 passed
+```
+
+当前默认 A/B 差异只有 system prompt 与 structured-output policy；structured profile 在三个 case 各增加 27 字符、3 个估算 token。该数字是确定性估算，不代表真实 tokenizer、模型质量或延迟收益。下一票进入 `TOOL-BENCH-LDG-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 

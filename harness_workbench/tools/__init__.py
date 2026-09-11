@@ -102,6 +102,18 @@ __all__ = [
     "builtin_trace_scenarios",
     "load_trace_events",
     "run_trace_replay",
+    "PROMPT_LAB_INPUT_SCHEMA",
+    "PROMPT_LAB_SCHEMA",
+    "PromptCaseDelta",
+    "PromptLabCase",
+    "PromptLabReport",
+    "PromptProfileDiff",
+    "PromptRenderResult",
+    "build_prompt_lab_report",
+    "builtin_prompt_lab_cases",
+    "load_prompt_cases",
+    "load_prompt_profiles",
+    "run_prompt_lab",
 ]
 
 
@@ -143,4 +155,21 @@ def __getattr__(name: str):
         from . import trace_replay
 
         return getattr(trace_replay, name)
+    if name in {
+        "PROMPT_LAB_INPUT_SCHEMA",
+        "PROMPT_LAB_SCHEMA",
+        "PromptCaseDelta",
+        "PromptLabCase",
+        "PromptLabReport",
+        "PromptProfileDiff",
+        "PromptRenderResult",
+        "build_prompt_lab_report",
+        "builtin_prompt_lab_cases",
+        "load_prompt_cases",
+        "load_prompt_profiles",
+        "run_prompt_lab",
+    }:
+        from . import prompt_lab
+
+        return getattr(prompt_lab, name)
     raise AttributeError(name)
