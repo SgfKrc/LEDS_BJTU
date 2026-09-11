@@ -153,6 +153,20 @@ __all__ = [
     "UrllibAPITransport",
     "builtin_api_cases",
     "run_api_workbench",
+    "FUN_CLI_SCHEMA",
+    "FUN_QUOTES_INPUT_SCHEMA",
+    "FunCliError",
+    "QuoteCard",
+    "QuoteReport",
+    "SayReport",
+    "build_quote_report",
+    "build_say_report",
+    "builtin_quote_cards",
+    "load_quote_cards",
+    "render_banner",
+    "render_progress",
+    "render_quote_cards",
+    "run_fun_cli",
 ]
 
 
@@ -270,4 +284,23 @@ def __getattr__(name: str):
         from . import api_workbench
 
         return getattr(api_workbench, name)
+    if name in {
+        "FUN_CLI_SCHEMA",
+        "FUN_QUOTES_INPUT_SCHEMA",
+        "FunCliError",
+        "QuoteCard",
+        "QuoteReport",
+        "SayReport",
+        "build_quote_report",
+        "build_say_report",
+        "builtin_quote_cards",
+        "load_quote_cards",
+        "render_banner",
+        "render_progress",
+        "render_quote_cards",
+        "run_fun_cli",
+    }:
+        from . import fun_cli
+
+        return getattr(fun_cli, name)
     raise AttributeError(name)

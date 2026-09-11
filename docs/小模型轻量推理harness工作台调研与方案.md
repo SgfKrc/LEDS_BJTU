@@ -394,6 +394,7 @@ model profile
 - 2026-09-11：v27 —— 完成 **TOOL-MODEL-CARD-01 模型卡生成器**：从 manifest health、SHA sidecar、模型画像和有界 GGUF 头自动生成 JSON/Markdown；白名单提取架构、量化、上下文、tokenizer 等声明，manifest 缺口显式标记 `incomplete`，不加载 tensor、不联网、不声明模型质量或性能。
 - 2026-09-11：v28 —— 完成 **TOOL-DL-RUNNER-01 下载编排器**：规范化 revision/SHA pin，提供 `.part`/Range 续传、连续失败重试、SHA sidecar、原子发布和完成后 manifest health gate；真实 HTTPS 默认禁用，fixture transport 全程无网络。
 - 2026-09-11：v29 —— 完成 **TOOL-API-WB-01 API 契约工作台**：用显式 case 对照 harness `/v1` 与主项目 `/api` 的健康、模型列表、聊天、错误和 SSE 流式契约，采样状态码、错误码、响应形状和有界耗时；默认 fixture-only，报告脱敏且固定无网络、无权重加载。
+- 2026-09-11：v30 —— 完成 **FUN-CLI-01 趣味 CLI**：新增零依赖 ASCII 横幅/进度样式和固定 fixture 语录卡片，提供 `qlh_say`/`model_quotes` 入口、输入 schema、脱敏与 JSON/Markdown 产物；不调用模型、不联网。
 
 ## 8. S1 实施记录
 
@@ -767,6 +768,25 @@ model profile
 ```
 
 本票固定 `runner_kind=fixture`、`network_used=false`、`weights_loaded=false`；没有真实网络请求、模型加载或质量/延迟结论。下一票进入 `FUN-CLI-01`。
+
+### FUN-CLI-01 实施记录（2026-09-11）
+
+本票把答辩开场需要的趣味输出收口为纯标准库、可复现的 fixture 工具；语录不是模型实测结果，不触发 QW1.8B，也不连接 API。
+
+- `harness_workbench/tools/fun_cli.py` 提供 `say` 与 `quotes` 子命令。`say` 支持 `cyber/classic/minimal` 三种 ASCII banner、`bar/blocks/dots/steps/none` 五种进度样式、消息 digest 和 JSON/Markdown 输出。
+- `quotes` 默认输出 3 张固定卡片，并支持 `qlh.fun_quotes.v1` 输入和 `--model` 筛选。卡片保留脱敏后的 prompt/quote、digest、source/claim scope；URL、地址和常见凭据在终端/报告中均被替换。
+- `scripts/qlh_say.py` 与 `scripts/model_quotes.py` 是直接入口，仓库根目录可运行；报告固定 `network_used=false`、`weights_loaded=false`、`model_invoked=false`，不声明任何生成质量。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_fun_cli.py -q
+10 passed
+.\.venv-test\Scripts\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+226 passed, 1 skipped
+```
+
+本票完成 F1/F2 趣味工具合并；下一票进入 `DOC-S1-GAP-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
