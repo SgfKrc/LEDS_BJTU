@@ -390,6 +390,7 @@ model profile
 - 2026-09-11：v23 —— 完成 **TOOL-REDTEAM-LAB-01 红队样本演练工具**：新增四类 12 条攻击样本的逐条 block/reason 报告、1 条安全 allowlist 对照、fixture/family 过滤和 JSON/Markdown CLI；payload 脱敏、无模型权重、无网络。
 - 2026-09-11：v24 —— 完成 **TOOL-TRACE-RPL-01 双机验收时间线回放工具**：将项目进展/验收清单中的 8 月 20 日分层验收、8 月 21 日重启恢复/断连重派/Tailnet IPv6 事实归一化为 4 个脱敏 fixture、13 个事件，提供场景/事件过滤及 JSON/Markdown CLI；原始地址、绝对路径和凭据 fail-closed，fixture-only、无模型权重、无网络。
 - 2026-09-11：v25 —— 完成 **TOOL-PROMPT-LAB-01 多模板 A/B 渲染工具**：复用 `PromptProfile`/`render_prompt_messages()` 对固定 case 矩阵做模板字段差异、system/消息长度和确定性 token 估算；输入 schema、路径、重复 ID fail-closed，正文只保留 digest，fixture-only、无模型权重、无网络。
+- 2026-09-11：v26 —— 完成 **TOOL-BENCH-LDG-01 benchmark ledger**：将 P3 控制面、物理双机 `not_run`、真实模型 `not_run` 与可扩展实验 record JSON 聚合为单机/双机/多模型答辩引用表；source/report digest、claim scope 和缺失指标保持显式，fixture-only、无模型权重、无网络。
 
 ## 8. S1 实施记录
 
@@ -685,6 +686,24 @@ model profile
 ```
 
 当前默认 A/B 差异只有 system prompt 与 structured-output policy；structured profile 在三个 case 各增加 27 字符、3 个估算 token。该数字是确定性估算，不代表真实 tokenizer、模型质量或延迟收益。下一票进入 `TOOL-BENCH-LDG-01`。
+
+### TOOL-BENCH-LDG-01 实施记录（2026-09-11）
+
+本票把散落的结构化实验结果整理为答辩可引用 ledger，不解析自由文本或启动任何运行时。默认输入为既有 P3 控制面 benchmark 和真实模型性能 `not_run` 合同。
+
+- `tools/benchmark_ledger.py` 支持 `qlh.defense_benchmark.v1`、`qlh.real_model_performance.v1`、通用 `qlh.experiment_record.v1` 与 `qlh.benchmark_ledger.v1 records[]`；按 claim class 聚合 `single_host`、`dual_host`、`not_run` 和 `multi_model`，指标只从 JSON 数值字段读取。
+- 每条 `BenchmarkRecord` 保留 source 相对路径、source digest、模型/拓扑/host/process/sample、status、有限 metrics、claim scope 和 `eligible_for_claim`。P3 的控制面 `throughput_tasks_per_second` 仍明确是 tasks/s；真实模型 TTFT/tokens/s 与物理双机缺失保持 `NOT RUN`。
+- CLI：`python -m harness_workbench.tools.benchmark_ledger` 默认读取 P3 与 real-model-not-run；`--input PATH` 可重复添加文件，`--root PATH` 递归扫描并忽略不支持 schema，`--strict` 对显式输入 fail-closed；`--json`/`--markdown` 输出汇总表。
+- 安全与资格检查拒绝绝对路径、IPv4/IPv6、凭据、未知 schema、非有限数字和重复 record ID；报告固定验证 source 相对路径、数值有限、claim scope、跨模型聚合及离线边界。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_benchmark_ledger.py -q
+10 passed
+```
+
+当前默认 ledger 为 4 条记录：2 条单机控制面 fixture、1 条物理双机 `not_run`、1 条真实模型 `not_run`；未启动服务、未访问网络、未加载 QW1.8B。该表只提供结构化证据索引，不将控制面指标解释为模型性能。下一票进入 `TOOL-MODEL-CARD-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 

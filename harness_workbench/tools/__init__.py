@@ -114,6 +114,14 @@ __all__ = [
     "load_prompt_cases",
     "load_prompt_profiles",
     "run_prompt_lab",
+    "BENCHMARK_LEDGER_INPUT_SCHEMA",
+    "BENCHMARK_LEDGER_SCHEMA",
+    "BenchmarkLedgerReport",
+    "BenchmarkRecord",
+    "LedgerGroup",
+    "build_benchmark_ledger_report",
+    "load_benchmark_payload",
+    "run_benchmark_ledger",
 ]
 
 
@@ -172,4 +180,17 @@ def __getattr__(name: str):
         from . import prompt_lab
 
         return getattr(prompt_lab, name)
+    if name in {
+        "BENCHMARK_LEDGER_INPUT_SCHEMA",
+        "BENCHMARK_LEDGER_SCHEMA",
+        "BenchmarkLedgerReport",
+        "BenchmarkRecord",
+        "LedgerGroup",
+        "build_benchmark_ledger_report",
+        "load_benchmark_payload",
+        "run_benchmark_ledger",
+    }:
+        from . import benchmark_ledger
+
+        return getattr(benchmark_ledger, name)
     raise AttributeError(name)
