@@ -167,6 +167,16 @@ __all__ = [
     "render_progress",
     "render_quote_cards",
     "run_fun_cli",
+    "RAG_BASELINE_INPUT_SCHEMA",
+    "RAG_BASELINE_SCHEMA",
+    "RagBaselineCase",
+    "RagBaselineDocument",
+    "RagBaselineError",
+    "RagBaselineReport",
+    "builtin_rag_baseline_cases",
+    "builtin_rag_baseline_documents",
+    "load_rag_baseline_input",
+    "run_rag_baseline",
 ]
 
 
@@ -303,4 +313,19 @@ def __getattr__(name: str):
         from . import fun_cli
 
         return getattr(fun_cli, name)
+    if name in {
+        "RAG_BASELINE_INPUT_SCHEMA",
+        "RAG_BASELINE_SCHEMA",
+        "RagBaselineCase",
+        "RagBaselineDocument",
+        "RagBaselineError",
+        "RagBaselineReport",
+        "builtin_rag_baseline_cases",
+        "builtin_rag_baseline_documents",
+        "load_rag_baseline_input",
+        "run_rag_baseline",
+    }:
+        from . import rag_baseline
+
+        return getattr(rag_baseline, name)
     raise AttributeError(name)

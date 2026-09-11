@@ -870,3 +870,20 @@ npm run visual:smoke -- http://127.0.0.1:5181/ # desktop/mobile 通过
 ```
 
 S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 SD/CUDA、生图大图回读、跨设备长时网络和生产部署仍按前置计划后置验收。
+
+## 18. RAG-BASE-01 实施记录
+
+本票冻结主项目与 harness 的双侧离线召回基准，不启动模型、不访问网络，也不把 fixture 结果解释成模型质量：
+
+- `harness_workbench/tools/rag_baseline.py` 固定 6 份目标文档与 30 条问题集；同一 source reference 分别写入 `src.rag_store.RagStore` 与 harness `rag.store.RagStore`，两侧均只使用现有 SQLite FTS5 检索契约。
+- `RagBaselineReport` 使用 `qlh.rag_baseline.v1`，输出 corpus/case-set digest、query SHA-256、目标引用、命中位置和计数，不输出问题原文、文档正文、绝对临时路径或模型信息；默认两侧 hit@5 与 MRR 均为 `1.000000`。
+- CLI：`python -m harness_workbench.tools.rag_baseline --json build/rag-baseline/latest.json --markdown build/rag-baseline/latest.md`；输入 schema、相对路径、重复标识和 30 条问题数均有 fail-closed 校验。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_rag_baseline.py -q
+8 passed
+```
+
+后续 `RAG-META-01`、`RAG-CHUNK-01` 等票必须复用该问题集和报告，改动前后同时复测主项目与 harness，不静默替换度量口径。
