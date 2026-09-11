@@ -381,6 +381,7 @@ model profile
 - 2026-09-09：v14 —— 完成 **HARNESS-UI-04 主题、可访问性、视觉回归与 TUI parity 本机开发门**：跳过链接、主内容焦点、实时区域语义、深浅色/强制颜色/减少动效规则、TUI 能力状态和 Playwright visual smoke；不改主项目前端。
 - 2026-09-11：v15 —— 完成 **HW-CTX-SQZ-01 上下文进一步压榨本机开发门**：新增显式 `adaptive/state/verbatim/mask` 压缩策略、`compact/lines/nonempty` STATE 变体、memory/RAG/STATE/context 四层预算账本、owner scope 有界记忆召回和可序列化降级曲线；30 轮离线 fixture 与邻接回归 `27 passed`，未加载模型、未联网。
 - 2026-09-11：v16 —— 完成 **HW-RAG-SQZ-01 harness RAG 进一步压榨本机开发门**：新增确定性查询改写、多路 FTS/可替换 embedding 混合召回与加权 RRF 去重、fixed/paragraph/sentence 分块、元数据过滤、快照失效跨会话缓存和字符/token 双预算引用边界；专项 `7 passed`，完整 harness/docagent/doc-maintenance 回归 `232 passed, 1 skipped`，未加载模型、未联网。
+- 2026-09-11：v17 —— 完成 **HW-R1 榨干小模型潜力首轮研究设计门**：新增 `research/ceiling.py`，固定 5 个模型对象、6 个上限问题、6 个因素消融、v1/v2 判题口径、单模型/草稿-校验角色 Pareto 和公开证据登记；study digest、holdout、seed、artifact/profile/fixture evidence gate 可复现；专项 `6 passed`，当前不加载模型、不联网。
 
 ## 8. S1 实施记录
 
@@ -532,6 +533,24 @@ model profile
 ```
 
 本票完成的是离线检索管线、引用边界和可复用缓存开发门；真实 embedding 长时质量、30k 文档容量、跨进程并发与主项目 `src/rag_store.py` 双侧 hit@5/MRR 基准进入后续 `RAG-BASE-01` 等票，不把 fake provider 结果宣称为生产质量。
+
+### HW-R1 实施记录（2026-09-11）
+
+本票完成的是“上限研究如何被正确测量”的合同，不执行真实模型冒烟：当前开发机缺少合适小模型且性能一般，研究模块严格保持 model-free。
+
+- `research/ceiling.py` 的 `CeilingStudyPlan` 固定五个研究对象：Qwen2.5-0.5B、Qwen3-0.6B、MiniCPM4-0.5B、QW1.8B、DS3-0324-7B；计划 digest 绑定问题、因素、实验单元、fixture digest、v2 policy 和 seed。
+- 六个首轮因素为 context、template、memory、role、quantization、policy；每个模型生成 baseline 和单因素 ablation，另生成 v1/v2 判题对照与 single/draft_verify 角色对照。所有单元要求 holdout，不允许把 prompt、角色、量化和上下文同时改变后归因。
+- `compare_factor()` 只输出方向性 delta；`pareto_points()` 只标记被支配点，不选择生产赢家；`EvidenceRecord` 明确记录 profile/artifact/runtime/fixture digest、runner、权重和网络状态，fixture/injected 结果通过 `evaluate_evidence_gate()` 保持 candidate。
+- 公开证据登记仅用于定义可核对主张： [Qwen2.5 Technical Report](https://arxiv.org/abs/2412.15115)、[Qwen3 Technical Report](https://arxiv.org/abs/2505.09388)、[MiniCPM 官方项目资料](https://github.com/OpenBMB/MiniCPM)、[llama.cpp quantization README](https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md)。公开分数、模型卡和量化文件大小都不能替代本机同口径实测。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_ceiling_research.py -q
+6 passed
+```
+
+本票不宣称任何模型已加载、质量已提升、真实 RSS/VRAM 或 tok/s 已测量，也不改变既有 R1/DS3 生产引用点；真实三轮标定和公开证据复核进入后续 `EX-QW3V2-01` 等票。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
