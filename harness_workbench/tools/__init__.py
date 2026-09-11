@@ -87,6 +87,11 @@ __all__ = [
     "PressureCheck",
     "build_context_pressure_report",
     "run_context_pressure",
+    "RED_TEAM_LAB_SCHEMA",
+    "RedTeamLabDecision",
+    "RedTeamLabReport",
+    "build_red_team_lab_report",
+    "run_red_team_lab",
 ]
 
 
@@ -103,4 +108,14 @@ def __getattr__(name: str):
         from . import ctx_ressure
 
         return getattr(ctx_ressure, name)
+    if name in {
+        "RED_TEAM_LAB_SCHEMA",
+        "RedTeamLabDecision",
+        "RedTeamLabReport",
+        "build_red_team_lab_report",
+        "run_red_team_lab",
+    }:
+        from . import red_team_lab
+
+        return getattr(red_team_lab, name)
     raise AttributeError(name)

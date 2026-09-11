@@ -387,6 +387,7 @@ model profile
 - 2026-09-11：v20 —— 完成 **TOOL-JUDGE-POLICY-01 判题口径差异工具**：新增 v1/v2 rubric loader、同输出双政策判定、rescue/regression/invalid 分类、completion 脱敏 hash 和答辩 Markdown 报告；全程 fixture-only、无模型权重、无网络。
 - 2026-09-11：v21 —— 完成 **TOOL-MANIFEST-HLTH-01 模型资产体检工具**：新增只读 manifest/lock/index、sidecar SHA 声明、磁盘元数据与仓库级 `.gitignore` 命中报告；默认不读取完整权重，显式 `verify_hash=True` 才计算 SHA-256，并固定声明无模型加载、无网络。
 - 2026-09-11：v22 —— 完成 **TOOL-CTX-RESS-01 ContextPolicy 压力测试工具**：新增 30 轮 fixture 的 window/state/memory 预算矩阵、早期事实召回曲线、六项不变量检查和 JSON/Markdown CLI 报告；全程 fixture-only、无模型权重、无网络。
+- 2026-09-11：v23 —— 完成 **TOOL-REDTEAM-LAB-01 红队样本演练工具**：新增四类 12 条攻击样本的逐条 block/reason 报告、1 条安全 allowlist 对照、fixture/family 过滤和 JSON/Markdown CLI；payload 脱敏、无模型权重、无网络。
 
 ## 8. S1 实施记录
 
@@ -630,6 +631,23 @@ model profile
 ```
 
 本票完成压力矩阵、折叠边界和早召回报告入口；真实 QW1.8B 回答正确率、长时资源和生产路由仍后置。下一票进入 `TOOL-REDTEAM-LAB-01`。
+
+### TOOL-REDTEAM-LAB-01 实施记录（2026-09-11）
+
+本票把既有 `eval/red_team.py` 安全门变成可逐条复演的离线实验台，不调用模型、不执行真实工具、不联网，也不把攻击 payload 写入报告。
+
+- `tools/red_team_lab.py` 默认运行 12 条内置攻击 fixture：prompt injection、tool authorization、image path、context injection 各类均覆盖；另加 `safe-tool-local-v1`，只在 `web_search` allowlist、`local` scope、profile/capability `verified` 且 `production_eligible=true` 时放行。
+- `RedTeamLabDecision` 比较 expected 与 observed 的 block/allow/reason，标记 `blocked`、`allowed`、`mismatch`；`RedTeamLabReport` 输出 fixture digest、schema、未授权放行计数和脱敏决策表，不输出 payload。
+- CLI：`python -m harness_workbench.tools.red_team_lab --json build/red-team-lab.json --markdown build/red-team-lab.md`；可用 `--list`、`--family`、`--fixture`、`--without-safe` 缩小演练范围，期望漂移时退出码为 1。
+
+当前默认演练为 12/12 攻击拦截、1 条安全调用放行、`mismatch=0`、`unauthorized_pass=0`。专项及原红队回归：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_red_team_lab.py tests/test_harness_red_team.py -q
+11 passed
+```
+
+本票完成安全门的逐条演练和答辩报告入口；真实模型生成安全性、真实工具执行和生产授权仍需后置验收。下一票进入 `TOOL-TRACE-RPL-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
