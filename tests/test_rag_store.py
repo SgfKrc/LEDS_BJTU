@@ -129,6 +129,39 @@ def test_fts_search_filters_active_revision_and_audits_without_raw_query(tmp_pat
     assert first.document_id != results[0]["document_id"]
 
 
+def test_metadata_filters_are_indexed_and_pushed_down(tmp_path):
+    store = _store(tmp_path)
+    _ingest(store, source_id="team-guide", relative_ref="docs/team.md", text="shared alpha", metadata={
+        "source": "handbook", "scope": "team", "type": "guide", "tag": ["stable", "review"], "time": "2026-09",
+    })
+    _ingest(store, source_id="public-guide", relative_ref="docs/public.md", text="shared alpha", metadata={
+        "source": "handbook", "scope": "public", "type": "guide", "tag": ["stable"], "time": "2026-09",
+    })
+
+    assert [row["source_id"] for row in store.search("alpha", metadata_filters={"scope": "team", "tag": "review"})] == ["team-guide"]
+    assert [row["source_id"] for row in store.search("alpha", metadata_filters={"tag": ["stable", "review"]})] == ["team-guide", "public-guide"]
+    with pytest.raises(RagStoreError) as exc:
+        store.search("alpha", metadata_filters={"unknown": "x"})
+    assert exc.value.code == "metadata_filter_invalid"
+
+
+def test_metadata_revision_conflict_and_filter_audit_are_explicit(tmp_path):
+    store = _store(tmp_path)
+    _ingest(store, metadata={"type": "guide"})
+    with pytest.raises(RagStoreError) as exc:
+        _ingest(store, metadata={"type": "note"})
+    assert exc.value.code == "revision_conflict"
+    store.search("alpha", metadata_filters={"type": "guide"})
+    connection = sqlite3.connect(store.path)
+    try:
+        filters = connection.execute("SELECT filters_json FROM rag_query_events ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+        assert "metadata_filter_fields" in filters
+        assert '"type"' in filters
+        assert '"alpha"' not in filters
+    finally:
+        connection.close()
+
+
 def test_fts_delete_rebuild_and_invalid_query_are_atomic(tmp_path):
     store = _store(tmp_path)
     _ingest(store)

@@ -13,7 +13,7 @@ from harness_workbench.adapters import (
 )
 from harness_workbench.adapters.qlh import _bounded_transcript
 from harness_workbench.api_layer import create_app
-from harness_workbench.rag import RagStore, build_context, chunk_text
+from harness_workbench.rag import HybridRagRetriever, RagSearchConfig, RagStore, build_context, chunk_text
 from harness_workbench.session import SessionStore
 
 
@@ -175,6 +175,27 @@ def test_rag_store_uses_owner_scope_and_returns_citations(tmp_path):
     assert store.health()["backend"] == "sqlite_fts5"
     assert store.delete_source(created["source_id"], owner_scope="user-a") is True
     assert store.search("retrieval", owner_scope="user-a") == []
+
+
+def test_harness_metadata_filters_are_indexed_and_cache_keyed(tmp_path):
+    store = RagStore(tmp_path / "rag.sqlite3")
+    store.add_document(
+        source_ref="docs/team.md", title="Team", text="shared retrieval",
+        owner_scope="user-a", metadata={"source": "handbook", "scope": "team", "tag": ["stable", "review"]},
+    )
+    store.add_document(
+        source_ref="docs/public.md", title="Public", text="shared retrieval",
+        owner_scope="user-a", metadata={"source": "handbook", "scope": "public", "tag": ["stable"]},
+    )
+    assert len(store.search("retrieval", owner_scope="user-a", metadata_filters={"scope": "team", "tag": "review"})) == 1
+    with pytest.raises(ValueError, match="unsupported"):
+        store.search("retrieval", owner_scope="user-a", metadata_filters={"unknown": "x"})
+
+    retriever = HybridRagRetriever(store, config=RagSearchConfig(embedding_weight=0.0))
+    first = retriever.search("retrieval", owner_scope="user-a", metadata_filters={"scope": "team"})
+    second = retriever.search("retrieval", owner_scope="user-a", metadata_filters={"scope": "team"})
+    assert first.hits and second.cache_hit
+    assert len(second.hits) == 1
 
 
 def test_rag_context_reports_omitted_chunks_instead_of_silent_truncation():

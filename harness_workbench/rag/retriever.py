@@ -88,6 +88,7 @@ class HybridRagRetriever:
         owner_scope: str = "local",
         source_ids: Sequence[str] = (),
         title_prefix: str | None = None,
+        metadata_filters: Mapping[str, Any] | None = None,
         session_id: str | None = None,
         limit: int | None = None,
     ) -> RagSearchResult:
@@ -97,7 +98,7 @@ class HybridRagRetriever:
         plan = rewrite_query(query, expansions=self.expansions, max_variants=self.config.rewrite_limit)
         if not plan.variants:
             return RagSearchResult(query, (), (), {"fts": 0, "embedding": 0}, False, 0)
-        cache_key = self._cache_key(plan, owner_scope, source_ids, title_prefix, effective_top_k)
+        cache_key = self._cache_key(plan, owner_scope, source_ids, title_prefix, metadata_filters, effective_top_k)
         if self.config.cache:
             cached = self.store.cache_get(cache_key, owner_scope=owner_scope)
             if cached:
@@ -120,6 +121,7 @@ class HybridRagRetriever:
                 limit=self.config.per_route_k,
                 source_ids=tuple(source_ids),
                 title_prefix=title_prefix,
+                metadata_filters=metadata_filters,
             )
             route_counts["fts"] += len(hits)
             self._merge_ranked(ranked, hits, "fts", self.config.fts_weight, route_index)
@@ -130,6 +132,7 @@ class HybridRagRetriever:
                 limit=self.config.max_embedding_candidates,
                 source_ids=tuple(source_ids),
                 title_prefix=title_prefix,
+                metadata_filters=metadata_filters,
             )
             try:
                 result = self.embedding_provider.embed([plan.normalized, *[item.text for item in candidates]])
@@ -162,13 +165,22 @@ class HybridRagRetriever:
             )
         return response
 
-    def _cache_key(self, plan: QueryPlan, owner_scope: str, source_ids: Sequence[str], title_prefix: str | None, effective_top_k: int) -> str:
+    def _cache_key(
+        self,
+        plan: QueryPlan,
+        owner_scope: str,
+        source_ids: Sequence[str],
+        title_prefix: str | None,
+        metadata_filters: Mapping[str, Any] | None,
+        effective_top_k: int,
+    ) -> str:
         material = json.dumps(
             {
                 "query": plan.normalized,
                 "owner_scope": owner_scope,
                 "source_ids": sorted(str(item) for item in source_ids),
                 "title_prefix": title_prefix or "",
+                "metadata_filters": metadata_filters or {},
                 "limit": effective_top_k,
                 "config": self.config.as_dict(),
                 "provider": type(self.embedding_provider).__name__ if self.embedding_provider is not None else "none",

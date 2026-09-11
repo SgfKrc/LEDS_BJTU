@@ -887,3 +887,20 @@ S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 S
 ```
 
 后续 `RAG-META-01`、`RAG-CHUNK-01` 等票必须复用该问题集和报告，改动前后同时复测主项目与 harness，不静默替换度量口径。
+
+## 19. RAG-META-01 实施记录
+
+本票为主项目与 harness 增加结构化元数据过滤，仍保持本机 SQLite、FTS5 优先和无模型/无网络边界：
+
+- 两侧新增 `rag_metadata_index` 倒排表，固定支持 `source`、`scope`、`type`、`tag`、`time` 字段；`tag` 可写入/匹配多值，过滤条件使用 SQL `EXISTS` 下推到 FTS/候选召回阶段。
+- 主项目旧库初始化时按 `metadata_index_version` 回填索引；revision 元数据变化显式报冲突，删除会同步清理索引。harness 混合检索、cache key 和 `/v1/rag` source/search API 均透传 `metadata_filters`。
+- 过滤字段和值有数量、长度、类型边界；未知字段和非法值 fail-closed。主项目查询审计只保留过滤字段名，不记录过滤值或查询原文。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py tests/test_harness_mcp_api.py tests/test_harness_mcp_server.py tests/test_harness_rag_squeeze.py -q
+62 passed
+```
+
+下一票进入 `RAG-CHUNK-01`；继续复用 `RAG-BASE-01` 的双侧 hit@5/MRR 口径。
