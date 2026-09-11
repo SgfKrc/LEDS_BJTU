@@ -391,6 +391,7 @@ model profile
 - 2026-09-11：v24 —— 完成 **TOOL-TRACE-RPL-01 双机验收时间线回放工具**：将项目进展/验收清单中的 8 月 20 日分层验收、8 月 21 日重启恢复/断连重派/Tailnet IPv6 事实归一化为 4 个脱敏 fixture、13 个事件，提供场景/事件过滤及 JSON/Markdown CLI；原始地址、绝对路径和凭据 fail-closed，fixture-only、无模型权重、无网络。
 - 2026-09-11：v25 —— 完成 **TOOL-PROMPT-LAB-01 多模板 A/B 渲染工具**：复用 `PromptProfile`/`render_prompt_messages()` 对固定 case 矩阵做模板字段差异、system/消息长度和确定性 token 估算；输入 schema、路径、重复 ID fail-closed，正文只保留 digest，fixture-only、无模型权重、无网络。
 - 2026-09-11：v26 —— 完成 **TOOL-BENCH-LDG-01 benchmark ledger**：将 P3 控制面、物理双机 `not_run`、真实模型 `not_run` 与可扩展实验 record JSON 聚合为单机/双机/多模型答辩引用表；source/report digest、claim scope 和缺失指标保持显式，fixture-only、无模型权重、无网络。
+- 2026-09-11：v27 —— 完成 **TOOL-MODEL-CARD-01 模型卡生成器**：从 manifest health、SHA sidecar、模型画像和有界 GGUF 头自动生成 JSON/Markdown；白名单提取架构、量化、上下文、tokenizer 等声明，manifest 缺口显式标记 `incomplete`，不加载 tensor、不联网、不声明模型质量或性能。
 
 ## 8. S1 实施记录
 
@@ -704,6 +705,27 @@ model profile
 ```
 
 当前默认 ledger 为 4 条记录：2 条单机控制面 fixture、1 条物理双机 `not_run`、1 条真实模型 `not_run`；未启动服务、未访问网络、未加载 QW1.8B。该表只提供结构化证据索引，不将控制面指标解释为模型性能。下一票进入 `TOOL-MODEL-CARD-01`。
+
+### TOOL-MODEL-CARD-01 实施记录（2026-09-11）
+
+本票把模型工件身份与发布缺口生成为可直接用于答辩的模型卡，不调用推理引擎。卡片中的字段来源保持可追踪，未知能力继续为 `unknown`，文件名推断明确标为 hint。
+
+- `tools/model_card.py` 复用 `scan_manifest_health()`，将工件大小、ignore 命中、SHA sidecar 状态、manifest/lock/index 结果和 `ModelProfile` 身份汇入 `qlh.harness.model_card.v1`。证据仅保留仓库相对路径和 digest。
+- GGUF 解析器最多读取有界头部，按 GGUF v3 类型结构跳过 tokenizer 大数组，只物化白名单键；tensor data 不解析。当前 QW1.8B 识别为 GGUF v3、195 tensors、20 项元数据、`qwen` 架构、`Q4_K_M`、`gpt2` tokenizer、声明上下文 8192。
+- 内置 QW1.8B profile 记录 `builtin-qw1-v1`、`llama_server`、`candidate`、`production_eligible=false` 和运行配置上下文 4096；卡片同时展示 GGUF 8192 与运行配置 4096 的差异，不把声明窗口写成已经验证的有效上下文。
+- CLI：`python -m harness_workbench.tools.model_card --root models --model-id QW1.8B --json build/model-card/latest.json --markdown build/model-card/latest.md`；支持 `--health-json` 与 `--profile`，结构错误、绝对路径和未知 schema fail-closed。
+- 当前模型卡结构有效，但资产状态为 `incomplete`：22 个文件中识别 3 个权重工件和 2 个 manifest，Gemma lock 引用的 `main_gguf`/`mmproj` 缺失。该状态保留在 Markdown，而不是隐去非目标模型的发布缺口。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_model_card.py -q
+11 passed
+.\.venv-test\Scripts\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+194 passed, 1 skipped
+```
+
+本票固定 `runner_kind=metadata`、`weights_loaded=false`、`network_used=false`；未测 QW1.8B 的回答质量、TTFT、tokens/s、RSS 或 VRAM。下一票进入 `TOOL-DL-RUNNER-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 

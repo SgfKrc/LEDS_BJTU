@@ -82,6 +82,13 @@ __all__ = [
     "ManifestHealthReport",
     "build_manifest_health_report",
     "scan_manifest_health",
+    "MODEL_CARD_INPUT_SCHEMA",
+    "MODEL_CARD_SCHEMA",
+    "ModelCardArtifact",
+    "ModelCardMetadata",
+    "ModelCardReport",
+    "build_model_card_from_health",
+    "build_model_card_from_json",
     "CTX_RESSURE_SCHEMA",
     "ContextPressureReport",
     "PressureCheck",
@@ -128,6 +135,18 @@ __all__ = [
 def __getattr__(name: str):
     """Lazy-load the CLI module so ``python -m`` has no pre-import warning."""
 
+    if name in {
+        "MODEL_CARD_INPUT_SCHEMA",
+        "MODEL_CARD_SCHEMA",
+        "ModelCardArtifact",
+        "ModelCardMetadata",
+        "ModelCardReport",
+        "build_model_card_from_health",
+        "build_model_card_from_json",
+    }:
+        from . import model_card
+
+        return getattr(model_card, name)
     if name in {
         "CTX_RESSURE_SCHEMA",
         "ContextPressureReport",
