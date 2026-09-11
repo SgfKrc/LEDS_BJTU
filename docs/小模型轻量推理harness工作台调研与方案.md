@@ -382,6 +382,7 @@ model profile
 - 2026-09-11：v15 —— 完成 **HW-CTX-SQZ-01 上下文进一步压榨本机开发门**：新增显式 `adaptive/state/verbatim/mask` 压缩策略、`compact/lines/nonempty` STATE 变体、memory/RAG/STATE/context 四层预算账本、owner scope 有界记忆召回和可序列化降级曲线；30 轮离线 fixture 与邻接回归 `27 passed`，未加载模型、未联网。
 - 2026-09-11：v16 —— 完成 **HW-RAG-SQZ-01 harness RAG 进一步压榨本机开发门**：新增确定性查询改写、多路 FTS/可替换 embedding 混合召回与加权 RRF 去重、fixed/paragraph/sentence 分块、元数据过滤、快照失效跨会话缓存和字符/token 双预算引用边界；专项 `7 passed`，完整 harness/docagent/doc-maintenance 回归 `232 passed, 1 skipped`，未加载模型、未联网。
 - 2026-09-11：v17 —— 完成 **HW-R1 榨干小模型潜力首轮研究设计门**：新增 `research/ceiling.py`，固定 5 个模型对象、6 个上限问题、6 个因素消融、v1/v2 判题口径、单模型/草稿-校验角色 Pareto 和公开证据登记；study digest、holdout、seed、artifact/profile/fixture evidence gate 可复现；专项 `6 passed`，当前不加载模型、不联网。
+- 2026-09-11：v18 —— 根据当前开发机资源收口 **21～37 号票的执行策略**：仅 `QW1.8B` 可用，优先执行 `EX-CTX-MEAS-01`、工具/回放/文档类纯软件票；Qwen3-4B、DS3-7B、Qwen3-0.6B 和多模型对比票保持模型门后置，不下载、不冒烟、不以 QW1.8B 冒充替代。
 
 ## 8. S1 实施记录
 
@@ -550,7 +551,7 @@ model profile
 6 passed
 ```
 
-本票不宣称任何模型已加载、质量已提升、真实 RSS/VRAM 或 tok/s 已测量，也不改变既有 R1/DS3 生产引用点；真实三轮标定和公开证据复核进入后续 `EX-QW3V2-01` 等票。
+本票不宣称任何模型已加载、质量已提升、真实 RSS/VRAM 或 tok/s 已测量，也不改变既有 R1/DS3 生产引用点；按当前 QW1.8B-only 资源门，下一票优先进入 `EX-CTX-MEAS-01`，真实三轮标定和公开证据复核仍后置。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
