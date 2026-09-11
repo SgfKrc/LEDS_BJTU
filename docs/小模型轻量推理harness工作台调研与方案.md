@@ -379,6 +379,10 @@ model profile
 - 2026-09-09：v12 —— 完成 **HARNESS-UI-02 对话与会话工作流本机开发门**：会话列表/新建/切换/SQLite 恢复、`/v1/chat/completions` SSE 增量渲染、消息落盘、停止生成和 Vite 本地 API 代理；真实模型质量与长时网络仍后置。
 - 2026-09-09：v13 —— 完成 **HARNESS-UI-03 RAG 与图像资产工作区本机开发门**：RAG owner scope/引用上下文/预算省略可见，图像能力准入、URL-only 生成、用户-owned 资产预览和 URL 错误状态接入；真实 CUDA 采样与长时资产服务仍后置。
 - 2026-09-09：v14 —— 完成 **HARNESS-UI-04 主题、可访问性、视觉回归与 TUI parity 本机开发门**：跳过链接、主内容焦点、实时区域语义、深浅色/强制颜色/减少动效规则、TUI 能力状态和 Playwright visual smoke；不改主项目前端。
+- 2026-09-11：v15 —— 完成 **HW-CTX-SQZ-01 上下文进一步压榨本机开发门**：新增显式 `adaptive/state/verbatim/mask` 压缩策略、`compact/lines/nonempty` STATE 变体、memory/RAG/STATE/context 四层预算账本、owner scope 有界记忆召回和可序列化降级曲线；30 轮离线 fixture 与邻接回归 `27 passed`，未加载模型、未联网。
+- 2026-09-11：v16 —— 完成 **HW-RAG-SQZ-01 harness RAG 进一步压榨本机开发门**：新增确定性查询改写、多路 FTS/可替换 embedding 混合召回与加权 RRF 去重、fixed/paragraph/sentence 分块、元数据过滤、快照失效跨会话缓存和字符/token 双预算引用边界；专项 `7 passed`，完整 harness/docagent/doc-maintenance 回归 `232 passed, 1 skipped`，未加载模型、未联网。
+- 2026-09-11：v17 —— 完成 **HW-R1 榨干小模型潜力首轮研究设计门**：新增 `research/ceiling.py`，固定 5 个模型对象、6 个上限问题、6 个因素消融、v1/v2 判题口径、单模型/草稿-校验角色 Pareto 和公开证据登记；study digest、holdout、seed、artifact/profile/fixture evidence gate 可复现；专项 `6 passed`，当前不加载模型、不联网。
+- 2026-09-11：v18 —— 根据当前开发机资源收口 **21～37 号票的执行策略**：仅 `QW1.8B` 可用，优先执行 `EX-CTX-MEAS-01`、工具/回放/文档类纯软件票；Qwen3-4B、DS3-7B、Qwen3-0.6B 和多模型对比票保持模型门后置，不下载、不冒烟、不以 QW1.8B 冒充替代。
 
 ## 8. S1 实施记录
 
@@ -398,6 +402,24 @@ model profile
 ```
 
 本票不声明模型真实生成能力已完成；模型画像和静态能力合同在 S1.5 单独收口，下一票进入 S2 API 层与本地 adapter。
+
+### HW-CTX-SQZ-01 实施记录（2026-09-11）
+
+第 18 票在既有 S1 引擎上增量实现，保持默认 `adaptive` 行为和旧三层 `LayeredBudget` 调用兼容：
+
+- `context_engine/compression.py` 提供无模型的完整消息 verbatim 压缩、STATE 渲染变体和 `CompressionStep`；策略只在轮次边界上选择，不切片 pinned/system 或单条记忆。
+- `ContextPolicyConfig` 可显式选择 `adaptive`、`state`、`verbatim`、`mask`；`adaptive` 按 STATE → verbatim → window 的顺序降级，并在每步记录 before/after token、策略、遗漏数和 warning notice。
+- `LayeredBudget` 增加可选 `state_budget`，四层总和严格等于输入预算；适配变体 digest 包含压缩策略、STATE 变体、verbatim 上限和 memory recall 参数，防止实验结果在策略变化后误复用。
+- `ContextPolicy.build()` 增加 `memory_query`：按 `owner_scope` 查询长期记忆，只注入能完整放入预留预算的条目并保留 entry id；无条目适配或预算不足时报告 `context.memory_recall_omitted`，不跨 scope、不静默截断。
+
+离线验收命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_squeeze.py tests/test_harness_context_engine.py tests/test_harness_memory_retrieve.py tests/test_harness_memory_extract.py tests/test_harness_adaptation_eval.py -q
+27 passed
+```
+
+本票仍不启动模型或 provider；`HW-SUMM-01` 的真实/可替换摘要模型 adapter、质量测度和 `EX-CTX-MEAS-01` 的 30 轮召回曲线属于后续票。
 
 ## 9. S1.5 实施记录
 
@@ -492,6 +514,44 @@ model profile
 ```
 
 真实 QLH 主节点、30k 文档容量与长时 embedding provider 仍是后置环境验收；本票不宣称网络可达、nomic 质量或跨进程压力已通过。
+
+### HW-RAG-SQZ-01 实施记录（2026-09-11）
+
+本票只在 harness RAG 检索管线层做确定性增强，不训练或微调 embedding，不启动模型，不连接网络：
+
+- `rag/query.py` 对查询做 NFKC/空白归一化，并按有限别名表生成最多 8 路变体；原始查询、规范化查询和变体均进入检索结果记录，便于复核改写影响。
+- `rag/retriever.py` 的 `HybridRagRetriever` 将每路 FTS 结果与可选 `EmbeddingProvider` 候选以加权 RRF 融合，按 chunk ID 去重；provider 维度/数量异常或运行失败时降级到 FTS，并保留 `route_counts`/`candidate_count` 证据。
+- `rag/store.py` 增加固定/段落/句子三种分块粒度、`source_ids`/`title_prefix` 过滤和 owner scope 硬隔离；查询缓存以配置和文档快照摘要为键，跨 session 可复用，任一文档变更即失效。
+- `rag/context.py` 对完整 chunk 同时施加字符与 token 预算，引用只与实际纳入块对应；超限块逐项记录 `chars`、`tokens` 或 `invalid` 原因，不静默截断。HTTP API 与 MCP 的增强入口均为显式依赖注入，旧 FTS 默认路径保持兼容。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_rag_squeeze.py -q
+7 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_s4_remote_rag.py -q
+9 passed
+```
+
+本票完成的是离线检索管线、引用边界和可复用缓存开发门；真实 embedding 长时质量、30k 文档容量、跨进程并发与主项目 `src/rag_store.py` 双侧 hit@5/MRR 基准进入后续 `RAG-BASE-01` 等票，不把 fake provider 结果宣称为生产质量。
+
+### HW-R1 实施记录（2026-09-11）
+
+本票完成的是“上限研究如何被正确测量”的合同，不执行真实模型冒烟：当前开发机缺少合适小模型且性能一般，研究模块严格保持 model-free。
+
+- `research/ceiling.py` 的 `CeilingStudyPlan` 固定五个研究对象：Qwen2.5-0.5B、Qwen3-0.6B、MiniCPM4-0.5B、QW1.8B、DS3-0324-7B；计划 digest 绑定问题、因素、实验单元、fixture digest、v2 policy 和 seed。
+- 六个首轮因素为 context、template、memory、role、quantization、policy；每个模型生成 baseline 和单因素 ablation，另生成 v1/v2 判题对照与 single/draft_verify 角色对照。所有单元要求 holdout，不允许把 prompt、角色、量化和上下文同时改变后归因。
+- `compare_factor()` 只输出方向性 delta；`pareto_points()` 只标记被支配点，不选择生产赢家；`EvidenceRecord` 明确记录 profile/artifact/runtime/fixture digest、runner、权重和网络状态，fixture/injected 结果通过 `evaluate_evidence_gate()` 保持 candidate。
+- 公开证据登记仅用于定义可核对主张： [Qwen2.5 Technical Report](https://arxiv.org/abs/2412.15115)、[Qwen3 Technical Report](https://arxiv.org/abs/2505.09388)、[MiniCPM 官方项目资料](https://github.com/OpenBMB/MiniCPM)、[llama.cpp quantization README](https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md)。公开分数、模型卡和量化文件大小都不能替代本机同口径实测。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_ceiling_research.py -q
+6 passed
+```
+
+本票不宣称任何模型已加载、质量已提升、真实 RSS/VRAM 或 tok/s 已测量，也不改变既有 R1/DS3 生产引用点；按当前 QW1.8B-only 资源门，下一票优先进入 `EX-CTX-MEAS-01`，真实三轮标定和公开证据复核仍后置。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 

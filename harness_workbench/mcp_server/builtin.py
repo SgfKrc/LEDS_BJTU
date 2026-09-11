@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping
 from ..image_workbench.contracts import ImageAdapter, ImageRequest
 from ..image_workbench.assets import ImageAssetStore
 from ..memory import MemoryStore
-from ..rag import RagStore, build_context
+from ..rag import HybridRagRetriever, RagStore, build_context
 from ..session import SessionStore
 from ..tools.network import NetworkClient, NetworkToolError
 from .registry import MCPToolError, ToolDefinition, ToolRegistry
@@ -64,6 +64,7 @@ class HarnessMCPDependencies:
     image_adapter: ImageAdapter | None = None
     image_store: ImageAssetStore | None = None
     chat_handler: Callable[[Mapping[str, Any]], Any] | None = None
+    rag_retriever: HybridRagRetriever | None = None
 
 
 def register_builtin_tools(
@@ -78,8 +79,8 @@ def register_builtin_tools(
         _definition("session_create", "Create a user-owned harness session.", _schema({"owner_scope": _scope_property(), "title": {"type": "string", "maxLength": 200}}, required=()), _session_create(deps), configured=deps.session_store is not None, read_only=False),
         _definition("sessions_list", "List sessions in one owner scope.", _schema({"owner_scope": _scope_property(), "limit": {"type": "integer", "minimum": 1, "maximum": 200}}), _sessions_list(deps), configured=deps.session_store is not None),
         _definition("session_get", "Read one session and its messages and assets.", _schema({"session_id": {"type": "string", "maxLength": 128}, "owner_scope": _scope_property()}, required=("session_id",)), _session_get(deps), configured=deps.session_store is not None),
-        _definition("rag_search", "Search user-owned RAG chunks and return bounded context and citations.", _schema({"query": {"type": "string", "maxLength": 512}, "owner_scope": _scope_property(), "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "max_chars": {"type": "integer", "minimum": 256, "maximum": 120000}}, required=("query",)), _rag_search(deps), configured=deps.rag_store is not None),
-        _definition("rag_add_source", "Add a user-owned text source to the local RAG store.", _schema({"source_ref": {"type": "string", "maxLength": 4096}, "title": {"type": "string", "maxLength": 512}, "text": {"type": "string", "maxLength": 1_000_000}, "owner_scope": _scope_property(), "max_chars": {"type": "integer", "minimum": 256, "maximum": 120000}, "overlap_chars": {"type": "integer", "minimum": 0, "maximum": 12000}}, required=("source_ref", "title", "text")), _rag_add_source(deps), configured=deps.rag_store is not None, read_only=False),
+        _definition("rag_search", "Search user-owned RAG chunks and return bounded context and citations.", _schema({"query": {"type": "string", "maxLength": 512}, "owner_scope": _scope_property(), "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "max_chars": {"type": "integer", "minimum": 256, "maximum": 120000}, "max_tokens": {"type": "integer", "minimum": 1, "maximum": 100000}, "source_ids": {"type": "array", "items": {"type": "string", "maxLength": 128}}, "title_prefix": {"type": "string", "maxLength": 200}}, required=("query",)), _rag_search(deps), configured=deps.rag_store is not None or deps.rag_retriever is not None),
+        _definition("rag_add_source", "Add a user-owned text source to the local RAG store.", _schema({"source_ref": {"type": "string", "maxLength": 4096}, "title": {"type": "string", "maxLength": 512}, "text": {"type": "string", "maxLength": 1_000_000}, "owner_scope": _scope_property(), "max_chars": {"type": "integer", "minimum": 256, "maximum": 120000}, "overlap_chars": {"type": "integer", "minimum": 0, "maximum": 12000}, "strategy": {"type": "string", "enum": ["fixed", "paragraph", "sentence"]}}, required=("source_ref", "title", "text")), _rag_add_source(deps), configured=deps.rag_store is not None, read_only=False),
         _definition("memory_search", "Search active long-term memory in one owner scope.", _schema({"query": {"type": "string", "maxLength": 512}, "owner_scope": _scope_property(), "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, required=("query",)), _memory_search(deps), configured=deps.memory_store is not None),
         _definition("memory_add", "Add an explicitly supplied fact, preference, or decision.", _schema({"kind": {"type": "string", "enum": ["fact", "preference", "decision"]}, "content": {"type": "string", "maxLength": 32000}, "owner_scope": _scope_property(), "source_session_id": {"type": "string", "maxLength": 128}, "source_message_id": {"type": "string", "maxLength": 128}, "valid_until": {"type": "number"}}, required=("kind", "content")), _memory_add(deps), configured=deps.memory_store is not None, read_only=False),
         _definition("memory_invalidate", "Invalidate a memory entry while retaining its audit record.", _schema({"entry_id": {"type": "string", "maxLength": 128}, "owner_scope": _scope_property(), "reason": {"type": "string", "maxLength": 512}}, required=("entry_id",)), _memory_invalidate(deps), configured=deps.memory_store is not None, read_only=False),
@@ -138,10 +139,20 @@ def _session_get(deps: HarnessMCPDependencies) -> Callable[[Mapping[str, Any]], 
 
 def _rag_search(deps: HarnessMCPDependencies) -> Callable[[Mapping[str, Any]], Any]:
     def handler(arguments: Mapping[str, Any]) -> Any:
-        store = _require(deps.rag_store, "rag_unavailable", "RAG store is not configured")
-        hits = store.search(arguments["query"], owner_scope=arguments.get("owner_scope", "local"), limit=arguments.get("limit", 8))
-        context = build_context([hit.as_dict() for hit in hits], max_chars=arguments.get("max_chars", 8_000))
-        return {"query": arguments["query"], "hits": [hit.as_dict() for hit in hits], "context": context.as_dict()}
+        owner_scope = arguments.get("owner_scope", "local")
+        source_ids = tuple(str(item) for item in arguments.get("source_ids", ()))
+        if deps.rag_retriever is not None:
+            retrieval = deps.rag_retriever.search(arguments["query"], owner_scope=owner_scope, source_ids=source_ids, title_prefix=arguments.get("title_prefix"), limit=arguments.get("limit"))
+            hits = list(retrieval.hits)
+        else:
+            store = _require(deps.rag_store, "rag_unavailable", "RAG store is not configured")
+            hits = store.search(arguments["query"], owner_scope=owner_scope, limit=arguments.get("limit", 8), source_ids=source_ids, title_prefix=arguments.get("title_prefix"))
+            retrieval = None
+        context = build_context([hit.as_dict() for hit in hits], max_chars=arguments.get("max_chars", 8_000), max_tokens=arguments.get("max_tokens"))
+        response = {"query": arguments["query"], "hits": [hit.as_dict() for hit in hits], "context": context.as_dict()}
+        if retrieval is not None:
+            response["retrieval"] = retrieval.as_dict()
+        return response
 
     return handler
 
@@ -149,7 +160,7 @@ def _rag_search(deps: HarnessMCPDependencies) -> Callable[[Mapping[str, Any]], A
 def _rag_add_source(deps: HarnessMCPDependencies) -> Callable[[Mapping[str, Any]], Any]:
     def handler(arguments: Mapping[str, Any]) -> Any:
         store = _require(deps.rag_store, "rag_unavailable", "RAG store is not configured")
-        return store.add_document(source_ref=arguments["source_ref"], title=arguments["title"], text=arguments["text"], owner_scope=arguments.get("owner_scope", "local"), max_chars=arguments.get("max_chars", 1200), overlap_chars=arguments.get("overlap_chars", 120))
+        return store.add_document(source_ref=arguments["source_ref"], title=arguments["title"], text=arguments["text"], owner_scope=arguments.get("owner_scope", "local"), max_chars=arguments.get("max_chars", 1200), overlap_chars=arguments.get("overlap_chars", 120), strategy=arguments.get("strategy", "fixed"))
 
     return handler
 

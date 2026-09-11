@@ -1,6 +1,13 @@
 """Small-model friendly, backend-agnostic context management."""
 
 from .budget import ContextBudget, ContextBudgetError
+from .compression import (
+    COMPRESSION_STRATEGIES,
+    STATE_VARIANTS,
+    CompressionStep,
+    compact_verbatim,
+    render_state,
+)
 from .notices import ContextNotice
 from .policy import (
     ContextBuildError,
@@ -21,6 +28,11 @@ from .types import ContextMessage, ContextLedgerEntry
 __all__ = [
     "ContextBudget",
     "ContextBudgetError",
+    "COMPRESSION_STRATEGIES",
+    "STATE_VARIANTS",
+    "CompressionStep",
+    "compact_verbatim",
+    "render_state",
     "ContextBuildError",
     "ContextLedgerEntry",
     "ContextMessage",

@@ -13,7 +13,7 @@ from ..image_workbench.contracts import ImageAdapter, ImageAdapterError, ImageRe
 from ..memory import MemoryStore
 from ..mcp_server import HarnessMCPDependencies, MCPServer, MCPToolError
 from ..model_profiles import builtin_profiles
-from ..rag import RagStore, build_context
+from ..rag import HybridRagRetriever, RagStore, build_context
 from ..session import SessionStore
 from ..tools.network import NetworkClient
 from .mapping import APIRequestError, chunk_to_openai, parse_chat_request, response_to_openai
@@ -39,6 +39,7 @@ def create_app(
     image_adapter: ImageAdapter | None = None,
     image_store: ImageAssetStore | None = None,
     rag_store: RagStore | None = None,
+    rag_retriever: HybridRagRetriever | None = None,
     session_store: SessionStore | None = None,
     memory_store: MemoryStore | None = None,
     network_client: NetworkClient | None = None,
@@ -53,6 +54,8 @@ def create_app(
 
     if (context_policy is None) != (context_budget is None):
         raise ValueError("context_policy and context_budget must be provided together")
+    if rag_store is None and rag_retriever is not None:
+        rag_store = rag_retriever.store
     try:
         from fastapi import FastAPI, Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -95,6 +98,7 @@ def create_app(
         dependencies=HarnessMCPDependencies(
             session_store=session_store,
             rag_store=rag_store,
+            rag_retriever=rag_retriever,
             memory_store=memory_store,
             network_client=network_client,
             image_adapter=image_adapter,
@@ -339,6 +343,7 @@ def create_app(
                 owner_scope=payload.get("owner_scope", "local"),
                 max_chars=payload.get("max_chars", 1200),
                 overlap_chars=payload.get("overlap_chars", 120),
+                strategy=payload.get("strategy", "fixed"),
             )
         except (TypeError, ValueError) as exc:
             return JSONResponse(_error_body(str(exc), code="invalid_rag_source"), status_code=400)
@@ -353,11 +358,34 @@ def create_app(
             if not isinstance(payload, Mapping):
                 raise ValueError("request body must be an object")
             query = payload.get("query", "")
-            hits = rag_store.search(query, owner_scope=payload.get("owner_scope", "local"), limit=payload.get("limit", 8))
-            context = build_context([hit.as_dict() for hit in hits], max_chars=payload.get("max_chars", 8_000))
+            owner_scope = payload.get("owner_scope", "local")
+            source_ids = payload.get("source_ids", ())
+            if not isinstance(source_ids, (list, tuple)):
+                raise ValueError("source_ids must be an array")
+            if rag_retriever is not None:
+                retrieval = rag_retriever.search(
+                    query,
+                    owner_scope=owner_scope,
+                    source_ids=tuple(str(item) for item in source_ids),
+                    title_prefix=payload.get("title_prefix"),
+                    session_id=payload.get("session_id"),
+                    limit=payload.get("limit"),
+                )
+                hits = list(retrieval.hits)
+            else:
+                retrieval = None
+                hits = rag_store.search(query, owner_scope=owner_scope, limit=payload.get("limit", 8), source_ids=tuple(str(item) for item in source_ids), title_prefix=payload.get("title_prefix"))
+            context = build_context(
+                [hit.as_dict() for hit in hits],
+                max_chars=payload.get("max_chars", 8_000),
+                max_tokens=payload.get("max_tokens"),
+            )
         except (TypeError, ValueError) as exc:
             return JSONResponse(_error_body(str(exc), code="invalid_rag_query"), status_code=400)
-        return {"query": query, "hits": [hit.as_dict() for hit in hits], "context": context.as_dict()}
+        response = {"query": query, "hits": [hit.as_dict() for hit in hits], "context": context.as_dict()}
+        if retrieval is not None:
+            response["retrieval"] = retrieval.as_dict()
+        return response
 
     @app.post("/v1/sessions")
     async def create_session(request: Request) -> Any:
