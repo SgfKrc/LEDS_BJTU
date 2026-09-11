@@ -35,6 +35,13 @@ from .judge_policy import (
     load_judge_rubric,
     run_judge_policy_diff,
 )
+from .manifest_health import (
+    MANIFEST_HEALTH_SCHEMA,
+    MODEL_SUFFIXES,
+    ManifestHealthReport,
+    build_manifest_health_report,
+    scan_manifest_health,
+)
 
 __all__ = [
     "FetchResult",
@@ -70,4 +77,9 @@ __all__ = [
     "builtin_judge_policy_fixture",
     "load_judge_rubric",
     "run_judge_policy_diff",
+    "MANIFEST_HEALTH_SCHEMA",
+    "MODEL_SUFFIXES",
+    "ManifestHealthReport",
+    "build_manifest_health_report",
+    "scan_manifest_health",
 ]

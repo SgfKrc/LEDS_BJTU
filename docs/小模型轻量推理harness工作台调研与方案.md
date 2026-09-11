@@ -385,6 +385,7 @@ model profile
 - 2026-09-11：v18 —— 根据当前开发机资源收口 **21～37 号票的执行策略**：仅 `QW1.8B` 可用，优先执行 `EX-CTX-MEAS-01`、工具/回放/文档类纯软件票；Qwen3-4B、DS3-7B、Qwen3-0.6B 和多模型对比票保持模型门后置，不下载、不冒烟、不以 QW1.8B 冒充替代。
 - 2026-09-11：v19 —— 完成 **EX-CTX-MEAS-01 上下文策略测度开发门**：新增固定 30 轮 fixture、滑窗/STATE/长期记忆三策略的 6 档预算曲线、早期事实召回度量、JSON/Markdown/绘图 series 产物；全程 fixture-only、无模型权重、无网络。
 - 2026-09-11：v20 —— 完成 **TOOL-JUDGE-POLICY-01 判题口径差异工具**：新增 v1/v2 rubric loader、同输出双政策判定、rescue/regression/invalid 分类、completion 脱敏 hash 和答辩 Markdown 报告；全程 fixture-only、无模型权重、无网络。
+- 2026-09-11：v21 —— 完成 **TOOL-MANIFEST-HLTH-01 模型资产体检工具**：新增只读 manifest/lock/index、sidecar SHA 声明、磁盘元数据与仓库级 `.gitignore` 命中报告；默认不读取完整权重，显式 `verify_hash=True` 才计算 SHA-256，并固定声明无模型加载、无网络。
 
 ## 8. S1 实施记录
 
@@ -588,6 +589,27 @@ model profile
 ```
 
 本票只证明判题工具可复现、可审计和能展示口径差异；真实模型三轮重标、人工复核、质量门升级继续后置。下一票进入 `TOOL-MANIFEST-HLTH-01`。
+
+### TOOL-MANIFEST-HLTH-01 实施记录（2026-09-11）
+
+本票把“模型文件在不在、清单是否自洽、是否被版本控制忽略”独立成只读体检工具，不加载权重、不联网，也不把静态资产声明解释为模型可用性或质量结论。
+
+- `tools/manifest_health.py` 提供 `scan_manifest_health()`/`build_manifest_health_report()`；扫描模型后缀文件、`.sha256` sidecar/聚合声明、`.manifest.json`/`.lock.json`/`model.safetensors.index.json`，检查安全相对路径、文件存在性、尺寸和可选完整 SHA-256。
+- `.gitignore` 按仓库根路径匹配，报告每个模型文件的 `ignored`/命中规则、字节数和 SHA 状态；默认只读 sidecar 声明，避免在 QW1.8B-only 开发机上误触多 GB 权重读取。symlink/junction 会被跳过并单独记录。
+- 报告 schema 为 `qlh.harness.manifest_health.v1`，提供稳定 digest、JSON/Markdown 产物和固定边界 `read_only=true`、`network_used=false`、`weights_loaded=false`。
+
+当前本机静态结果：`models/` 扫描 22 个文件、识别 3 个模型资产且全部命中 `.gitignore`；Qwen GGUF sidecar 为 `declared`，两片 safetensors 为 `aggregate_declared`，safetensors index 检查 195 个条目通过；Gemma lock 引用的 `main_gguf`/`mmproj` 缺失，因此报告明确为不通过。该结果只说明资产缺口，不替代模型下载、加载和质量验收。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_manifest_health.py -q
+6 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_manifest_health.py tests/test_harness_judge_policy.py tests/test_harness_tool_context.py tests/test_harness_network_tools.py tests/test_harness_remote_tool.py -q
+36 passed
+```
+
+本票完成静态资产与发布边界体检；下一票进入 `TOOL-CTX-RESS-01`，继续保持 QW1.8B-only、无模型冒烟约束。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
