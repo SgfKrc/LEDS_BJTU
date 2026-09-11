@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 from .budget import ContextBudget
+from .compression import (
+    COMPRESSION_STRATEGIES,
+    STATE_VARIANTS,
+    CompressionStep,
+    compact_verbatim,
+    render_state,
+)
 from .notices import ContextNotice
 from .summarize import (
     RuleBasedSummarizer,
@@ -35,6 +41,11 @@ class ContextPolicyConfig:
     summary_trigger_ratio: float = 0.70
     recent_turn_ratio: float = 0.35
     max_tool_outputs: int = 1
+    compression_strategy: str = "adaptive"
+    state_variant: str = "compact"
+    verbatim_max_characters: int = 8_000
+    memory_recall_ratio: float = 0.10
+    memory_recall_limit: int = 4
 
     def __post_init__(self) -> None:
         if self.recent_turns < 0:
@@ -45,6 +56,16 @@ class ContextPolicyConfig:
             raise ValueError("recent_turn_ratio must be between zero and one")
         if self.max_tool_outputs < 0:
             raise ValueError("max_tool_outputs must be non-negative")
+        if self.compression_strategy not in COMPRESSION_STRATEGIES:
+            raise ValueError("compression_strategy must be adaptive, mask, state, or verbatim")
+        if self.state_variant not in STATE_VARIANTS:
+            raise ValueError("state_variant must be compact, lines, or nonempty")
+        if not isinstance(self.verbatim_max_characters, int) or self.verbatim_max_characters <= 0:
+            raise ValueError("verbatim_max_characters must be positive")
+        if not 0 <= self.memory_recall_ratio < 1:
+            raise ValueError("memory_recall_ratio must be between zero and one")
+        if not isinstance(self.memory_recall_limit, int) or self.memory_recall_limit < 0:
+            raise ValueError("memory_recall_limit must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +82,9 @@ class ContextSnapshot:
     memory_entry_ids: tuple[str, ...] = ()
     memory_candidates: tuple[Mapping[str, object], ...] = ()
     memory_write_error: str | None = None
+    memory_recall_ids: tuple[str, ...] = ()
+    compression_strategy: str = "none"
+    degradation: tuple[CompressionStep, ...] = ()
 
     @property
     def input_budget(self) -> int:
@@ -78,6 +102,9 @@ class ContextSnapshot:
             "memory_entry_ids": list(self.memory_entry_ids),
             "memory_candidates": [dict(item) for item in self.memory_candidates],
             "memory_write_error": self.memory_write_error,
+            "memory_recall_ids": list(self.memory_recall_ids),
+            "compression_strategy": self.compression_strategy,
+            "degradation": [step.as_dict() for step in self.degradation],
         }
 
 
@@ -100,6 +127,7 @@ class ContextPolicy:
         memory_store: Any | None = None,
         memory_owner_scope: str = "local",
         memory_source_session_id: str | None = None,
+        memory_query: str | None = None,
     ) -> ContextSnapshot:
         normalized = [ContextMessage.from_value(value) for value in messages]
         if not normalized:
@@ -108,6 +136,7 @@ class ContextPolicy:
                 budget=budget,
                 input_tokens=0,
                 state=validate_state(state or {}),
+                compression_strategy="none",
             )
         current_state = validate_state(state or {})
         if state_patch is not None:
@@ -119,6 +148,8 @@ class ContextPolicy:
 
         token_costs = {id(message): count_message(self.tokenizer, message) for message in normalized}
         notices: list[ContextNotice] = []
+        degradation: list[CompressionStep] = []
+        original_tokens = sum(token_costs.values())
         masked_ids: set[int] = set()
         output_messages = [message for message in normalized if message.is_output and not message.pinned]
         keep_outputs = (
@@ -130,6 +161,15 @@ class ContextPolicy:
             if id(message) not in keep_outputs:
                 masked_ids.add(id(message))
         if masked_ids:
+            masked_tokens = sum(token_costs[id(message)] for message in normalized if id(message) not in masked_ids)
+            degradation.append(
+                CompressionStep(
+                    "mask",
+                    original_tokens,
+                    masked_tokens,
+                    details={"masked_messages": len(masked_ids)},
+                )
+            )
             notices.append(
                 ContextNotice(
                     code="context.masked_tool_output",
@@ -141,7 +181,7 @@ class ContextPolicy:
         input_budget = budget.input_budget
         full_tokens = sum(token_costs[id(message)] for message in candidates)
         summary_pressure = self._summary_pressure(candidates, token_costs, input_budget)
-        if full_tokens <= input_budget and not summary_pressure:
+        if full_tokens <= input_budget and not summary_pressure and not (memory_store is not None and memory_query):
             ledger = tuple(
                 ContextLedgerEntry(
                     message_id=message.message_id,
@@ -160,6 +200,8 @@ class ContextPolicy:
                 state=current_state,
                 notices=tuple(notices),
                 ledger=ledger,
+                compression_strategy="mask" if masked_ids else "none",
+                degradation=tuple(degradation),
             )
 
         fixed = [message for message in candidates if message.role == "system" or message.pinned]
@@ -174,7 +216,14 @@ class ContextPolicy:
         recent_groups = groups[-self.config.recent_turns :] if self.config.recent_turns else []
         old_groups = groups[: len(groups) - len(recent_groups)] if recent_groups else groups
         old_messages = [message for group in old_groups for message in group]
-        summary_result = self._summarize(old_messages, current_state)
+        strategy = self.config.compression_strategy
+        use_state = strategy in {"adaptive", "state"}
+        use_verbatim = strategy == "verbatim"
+        summary_result = (
+            self._summarize(old_messages, current_state)
+            if old_messages and use_state
+            else SummaryResult(state=validate_state(current_state))
+        )
         summary_message: ContextMessage | None = None
         summary_tokens = 0
         available_without_summary = input_budget - fixed_tokens
@@ -185,15 +234,36 @@ class ContextPolicy:
             available_without_summary,
             max(0, int(input_budget * self.config.recent_turn_ratio)),
         )
+        memory_reserve = (
+            min(available_without_summary, max(0, int(input_budget * self.config.memory_recall_ratio)))
+            if memory_store is not None and memory_query and self.config.memory_recall_limit
+            else 0
+        )
         if old_messages:
             summary_budget = max(0, available_without_summary - recent_reserve)
-            summary_message, summary_result, summary_tokens = self._shrink_summary(
-                summary_result,
-                summary_budget,
-            )
+            summary_budget = max(0, summary_budget - memory_reserve)
+            if use_state:
+                summary_message, summary_result, summary_tokens = self._shrink_summary(
+                    summary_result,
+                    summary_budget,
+                )
+            elif use_verbatim:
+                summary_message, summary_tokens = self._verbatim_message(old_messages, summary_budget)
             if summary_tokens > summary_budget:
-                summary_message = None
-                summary_tokens = 0
+                if strategy == "adaptive":
+                    summary_message, summary_tokens = self._verbatim_message(old_messages, summary_budget)
+                    if summary_message is not None:
+                        notices.append(
+                            ContextNotice(
+                                code="context.verbatim_fallback",
+                                message="Structured STATE did not fit; complete older messages were compacted verbatim.",
+                                severity="warning",
+                                details={"summary_budget": summary_budget},
+                            )
+                        )
+                if summary_message is None or summary_tokens > summary_budget:
+                    summary_message = None
+                    summary_tokens = 0
                 notices.append(
                     ContextNotice(
                         code="context.summary_omitted",
@@ -202,7 +272,7 @@ class ContextPolicy:
                         details={"summary_budget": summary_budget},
                     )
                 )
-        available_for_recent = available_without_summary - summary_tokens
+        available_for_recent = available_without_summary - summary_tokens - memory_reserve
 
         retained_recent: list[ContextMessage] = []
         retained_group_ids: set[int] = set()
@@ -218,18 +288,35 @@ class ContextPolicy:
         if omitted_messages:
             # If the recent-turn cap itself caused omission, include those
             # messages in STATE as well, preserving round boundaries in output.
-            summary_result = self._summarize(omitted_messages, current_state)
-            if summary_message is not None:
-                summary_budget = input_budget - fixed_tokens - sum(
-                    token_costs[id(message)] for message in retained_recent
-                )
+            if use_state:
+                summary_result = self._summarize(omitted_messages, current_state)
+            summary_budget = input_budget - fixed_tokens - sum(
+                token_costs[id(message)] for message in retained_recent
+            )
+            summary_budget = max(0, summary_budget - memory_reserve)
+            if use_state:
                 summary_message, summary_result, summary_tokens = self._shrink_summary(
                     summary_result,
                     summary_budget,
                 )
-                if summary_tokens > summary_budget:
-                    summary_message = None
-                    summary_tokens = 0
+            elif use_verbatim or strategy == "adaptive":
+                summary_message, summary_tokens = self._verbatim_message(omitted_messages, summary_budget)
+            if summary_tokens > summary_budget:
+                summary_message = None
+                summary_tokens = 0
+            if omitted_messages and summary_message is None and strategy == "adaptive":
+                summary_message, summary_tokens = self._verbatim_message(
+                    omitted_messages,
+                    summary_budget,
+                )
+                if summary_message is not None:
+                    notices.append(
+                        ContextNotice(
+                            code="context.verbatim_fallback",
+                            message="Older messages were compacted verbatim after the STATE budget was exhausted.",
+                            severity="warning",
+                        )
+                    )
         memory_entry_ids: tuple[str, ...] = ()
         memory_candidates: tuple[Mapping[str, object], ...] = ()
         memory_write_error: str | None = None
@@ -260,7 +347,25 @@ class ContextPolicy:
                         },
                     )
                 )
-        final_messages = self._order_fixed_and_recent(fixed, summary_message, retained_recent)
+        memory_message: ContextMessage | None = None
+        memory_recall_ids: tuple[str, ...] = ()
+        if memory_store is not None and memory_query and self.config.memory_recall_limit:
+            memory_message, memory_recall_ids = self._recall_memory(
+                memory_store,
+                memory_owner_scope,
+                memory_query,
+                memory_reserve,
+            )
+            if memory_query and memory_message is None:
+                notices.append(
+                    ContextNotice(
+                        code="context.memory_recall_omitted",
+                        message="Long-term memory was available but no complete entry fit the reserved budget.",
+                        severity="warning",
+                        details={"memory_budget": memory_reserve},
+                    )
+                )
+        final_messages = self._order_fixed_and_recent(fixed, summary_message, memory_message, retained_recent)
         final_tokens = sum(token_costs.get(id(message), count_message(self.tokenizer, message)) for message in final_messages)
         if final_tokens > input_budget:
             # This can only happen when a custom tokenizer is inconsistent or
@@ -269,19 +374,50 @@ class ContextPolicy:
                 f"context policy produced {final_tokens} tokens for budget {input_budget}"
             )
 
-        notices.append(
-            ContextNotice(
-                code="context.summarized",
-                message="Older conversation turns were folded into a structured STATE summary.",
-                details={
-                    "omitted_messages": len(omitted_messages),
-                    "retained_turns": len(retained_group_ids),
-                    "input_tokens": final_tokens,
-                    "input_budget": input_budget,
-                    "trigger": "summary_ratio" if summary_pressure else "budget",
-                },
+        if summary_message is not None:
+            strategy_name = "state" if summary_message.kind == "summary" else "verbatim"
+            degradation.append(
+                CompressionStep(
+                    strategy_name,
+                    sum(token_costs[id(message)] for message in omitted_messages),
+                    count_message(self.tokenizer, summary_message),
+                    details={"omitted_messages": len(omitted_messages), "state_variant": self.config.state_variant},
+                )
             )
-        )
+        elif omitted_messages:
+            degradation.append(
+                CompressionStep(
+                    "window",
+                    sum(token_costs[id(message)] for message in omitted_messages),
+                    0,
+                    details={"omitted_messages": len(omitted_messages)},
+                )
+            )
+        if memory_message is not None:
+            degradation.append(
+                CompressionStep(
+                    "memory_recall",
+                    0,
+                    count_message(self.tokenizer, memory_message),
+                    details={"entries": len(memory_recall_ids)},
+                )
+            )
+
+        if omitted_messages:
+            notices.append(
+                ContextNotice(
+                    code="context.summarized",
+                    message="Older conversation turns were folded into a structured STATE summary.",
+                    details={
+                        "omitted_messages": len(omitted_messages),
+                        "retained_turns": len(retained_group_ids),
+                        "input_tokens": final_tokens,
+                        "input_budget": input_budget,
+                        "trigger": "summary_ratio" if summary_pressure else "budget",
+                        "strategy": "state" if summary_message is not None and summary_message.kind == "summary" else "verbatim" if summary_message is not None else "window",
+                    },
+                )
+            )
         masked_message_ids = {id(message) for message in normalized if id(message) in masked_ids}
         retained_ids = {id(item) for item in final_messages}
         fixed_message_ids = {id(item) for item in fixed}
@@ -309,13 +445,22 @@ class ContextPolicy:
             messages=tuple(final_messages),
             budget=budget,
             input_tokens=final_tokens,
-            state=summary_result.validated_state() if omitted_messages else current_state,
+            state=summary_result.validated_state() if omitted_messages and use_state else current_state,
             notices=tuple(notices),
             ledger=ledger,
             summarized_message_ids=summary_result.source_message_ids if omitted_messages else (),
             memory_entry_ids=memory_entry_ids,
             memory_candidates=memory_candidates,
             memory_write_error=memory_write_error,
+            memory_recall_ids=memory_recall_ids,
+            compression_strategy=(
+                "state" if summary_message is not None and summary_message.kind == "summary"
+                else "verbatim" if summary_message is not None
+                else "mask" if masked_ids
+                else "memory_recall" if memory_message is not None
+                else "window" if omitted_messages else "none"
+            ),
+            degradation=tuple(degradation),
         )
 
     def _persist_memory(
@@ -426,9 +571,96 @@ class ContextPolicy:
             role="system",
             kind="summary",
             message_id="context-state-summary",
-            content="[STATE] " + json.dumps(state, ensure_ascii=False, sort_keys=True),
-            metadata={"schema": "qlh.harness.state.v1"},
+            content="[STATE] " + render_state(state, variant=self.config.state_variant),
+            metadata={"schema": "qlh.harness.state.v1", "variant": self.config.state_variant},
         )
+
+    def _verbatim_message(
+        self,
+        messages: Sequence[ContextMessage],
+        token_budget: int,
+    ) -> tuple[ContextMessage | None, int]:
+        """Fit a verbatim block by dropping complete oldest turn groups."""
+
+        if token_budget <= 0 or not messages:
+            return None, 0
+        groups = self._group_turns(messages)
+        selected = [message for group in groups for message in group]
+        content = compact_verbatim(selected)
+        if self.config.verbatim_max_characters and len(content) > self.config.verbatim_max_characters:
+            # Character bounding is only a guard against pathological input;
+            # whole turn groups are removed below, never sliced.
+            while groups and len(compact_verbatim(selected)) > self.config.verbatim_max_characters:
+                groups.pop(0)
+                selected = [message for group in groups for message in group]
+            content = compact_verbatim(selected)
+        while groups:
+            message = ContextMessage(
+                role="system",
+                kind="verbatim",
+                message_id="context-verbatim",
+                content="[VERBATIM]\n" + content,
+                metadata={
+                    "source_message_ids": [item.message_id for item in selected if item.message_id],
+                    "dropped_oldest": len(messages) - len(selected),
+                },
+            )
+            tokens = count_message(self.tokenizer, message)
+            if tokens <= token_budget:
+                return message, tokens
+            groups.pop(0)
+            selected = [item for group in groups for item in group]
+            content = compact_verbatim(selected)
+        return None, 0
+
+    def _recall_memory(
+        self,
+        memory_store: Any,
+        owner_scope: str,
+        query: str,
+        token_budget: int,
+    ) -> tuple[ContextMessage | None, tuple[str, ...]]:
+        if token_budget <= 0 or not query.strip():
+            return None, ()
+        try:
+            hits = tuple(memory_store.search(query, owner_scope=owner_scope, limit=self.config.memory_recall_limit))
+        except Exception:
+            return None, ()
+        selected: list[Any] = []
+        for hit in hits:
+            content = getattr(hit, "content", None)
+            entry_id = getattr(hit, "entry_id", None)
+            if not isinstance(content, str) or not content.strip() or not entry_id:
+                continue
+            candidate = ContextMessage(
+                role="system",
+                kind="memory",
+                message_id=f"context-memory-{entry_id}",
+                content="[MEMORY] " + content.strip(),
+                metadata={"entry_id": str(entry_id), "owner_scope": owner_scope},
+            )
+            candidate_content = "\n".join(item.content for item in (*selected, candidate))
+            aggregate = ContextMessage(
+                role="system",
+                kind="memory",
+                message_id="context-memory-recall",
+                content=candidate_content,
+                metadata={"entry_ids": [item.metadata["entry_id"] for item in (*selected, candidate)], "owner_scope": owner_scope},
+            )
+            if count_message(self.tokenizer, aggregate) > token_budget:
+                break
+            selected.append(candidate)
+        if not selected:
+            return None, ()
+        content = "\n".join(item.content for item in selected)
+        message = ContextMessage(
+            role="system",
+            kind="memory",
+            message_id="context-memory-recall",
+            content=content,
+            metadata={"entry_ids": [item.metadata["entry_id"] for item in selected], "owner_scope": owner_scope},
+        )
+        return message, tuple(str(item.metadata["entry_id"]) for item in selected)
 
     def _shrink_summary(
         self,
@@ -465,8 +697,9 @@ class ContextPolicy:
     def _order_fixed_and_recent(
         fixed: Sequence[ContextMessage],
         summary: ContextMessage | None,
+        memory: ContextMessage | None,
         recent: Sequence[ContextMessage],
     ) -> list[ContextMessage]:
         system = [message for message in fixed if message.role == "system"]
         pinned = [message for message in fixed if message.role != "system"]
-        return system + pinned + ([summary] if summary is not None else []) + list(recent)
+        return system + pinned + ([summary] if summary is not None else []) + ([memory] if memory is not None else []) + list(recent)

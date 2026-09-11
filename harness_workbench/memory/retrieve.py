@@ -82,20 +82,26 @@ class MemoryRetriever:
 
 @dataclass(frozen=True, slots=True)
 class LayeredBudget:
-    """One input budget divided among memory, RAG and recent context."""
+    """One input budget divided among memory, RAG, STATE and recent context.
+
+    ``state_budget`` defaults to zero for backwards compatibility.  Callers
+    that reserve a dedicated structured-state layer can opt in through
+    :meth:`from_input_budget` without changing the existing three-layer API.
+    """
 
     input_budget: int
     memory_budget: int
     rag_budget: int
     context_budget: int
+    state_budget: int = 0
 
     def __post_init__(self) -> None:
-        values = (self.input_budget, self.memory_budget, self.rag_budget, self.context_budget)
+        values = (self.input_budget, self.memory_budget, self.rag_budget, self.context_budget, self.state_budget)
         if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
             raise ValueError("layered budgets must be integers")
         if self.input_budget <= 0 or any(value < 0 for value in values[1:]):
             raise ValueError("layered budgets must be non-negative with a positive input budget")
-        if self.memory_budget + self.rag_budget + self.context_budget != self.input_budget:
+        if self.memory_budget + self.rag_budget + self.context_budget + self.state_budget != self.input_budget:
             raise ValueError("layer budgets must sum to input_budget")
 
     @classmethod
@@ -105,15 +111,22 @@ class LayeredBudget:
         *,
         memory_ratio: float = 0.25,
         rag_ratio: float = 0.25,
+        state_ratio: float = 0.0,
     ) -> "LayeredBudget":
         if not isinstance(input_budget, int) or isinstance(input_budget, bool) or input_budget <= 0:
             raise ValueError("input_budget must be a positive integer")
-        if not 0 <= memory_ratio <= 1 or not 0 <= rag_ratio <= 1 or memory_ratio + rag_ratio > 1:
-            raise ValueError("memory_ratio and rag_ratio must leave context budget")
+        if (
+            not 0 <= memory_ratio <= 1
+            or not 0 <= rag_ratio <= 1
+            or not 0 <= state_ratio <= 1
+            or memory_ratio + rag_ratio + state_ratio > 1
+        ):
+            raise ValueError("memory_ratio, rag_ratio, and state_ratio must leave context budget")
         memory_budget = int(input_budget * memory_ratio)
         rag_budget = int(input_budget * rag_ratio)
-        context_budget = input_budget - memory_budget - rag_budget
-        return cls(input_budget, memory_budget, rag_budget, context_budget)
+        state_budget = int(input_budget * state_ratio)
+        context_budget = input_budget - memory_budget - rag_budget - state_budget
+        return cls(input_budget, memory_budget, rag_budget, context_budget, state_budget)
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -121,6 +134,7 @@ class LayeredBudget:
             "memory_budget": self.memory_budget,
             "rag_budget": self.rag_budget,
             "context_budget": self.context_budget,
+            "state_budget": self.state_budget,
         }
 
 
@@ -175,6 +189,7 @@ def build_layered_context(
     memory_hits: Iterable[MemoryHit | Mapping[str, Any]],
     *,
     rag_hits: Iterable[Mapping[str, Any]] = (),
+    state_items: Iterable[Mapping[str, Any] | str] = (),
     context_messages: Iterable[str | Mapping[str, Any]] = (),
     budget: LayeredBudget,
     tokenizer: TokenCounter | None = None,
@@ -194,6 +209,7 @@ def build_layered_context(
     for name, values, layer_budget in (
         ("memory", memory_hits, budget.memory_budget),
         ("rag", rag_hits, budget.rag_budget),
+        ("state", state_items, budget.state_budget),
         ("context", context_messages, budget.context_budget),
     ):
         layer_blocks, layer_citations, used, omitted = _fit_layer(

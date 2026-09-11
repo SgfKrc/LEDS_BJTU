@@ -379,6 +379,7 @@ model profile
 - 2026-09-09：v12 —— 完成 **HARNESS-UI-02 对话与会话工作流本机开发门**：会话列表/新建/切换/SQLite 恢复、`/v1/chat/completions` SSE 增量渲染、消息落盘、停止生成和 Vite 本地 API 代理；真实模型质量与长时网络仍后置。
 - 2026-09-09：v13 —— 完成 **HARNESS-UI-03 RAG 与图像资产工作区本机开发门**：RAG owner scope/引用上下文/预算省略可见，图像能力准入、URL-only 生成、用户-owned 资产预览和 URL 错误状态接入；真实 CUDA 采样与长时资产服务仍后置。
 - 2026-09-09：v14 —— 完成 **HARNESS-UI-04 主题、可访问性、视觉回归与 TUI parity 本机开发门**：跳过链接、主内容焦点、实时区域语义、深浅色/强制颜色/减少动效规则、TUI 能力状态和 Playwright visual smoke；不改主项目前端。
+- 2026-09-11：v15 —— 完成 **HW-CTX-SQZ-01 上下文进一步压榨本机开发门**：新增显式 `adaptive/state/verbatim/mask` 压缩策略、`compact/lines/nonempty` STATE 变体、memory/RAG/STATE/context 四层预算账本、owner scope 有界记忆召回和可序列化降级曲线；30 轮离线 fixture 与邻接回归 `27 passed`，未加载模型、未联网。
 
 ## 8. S1 实施记录
 
@@ -398,6 +399,24 @@ model profile
 ```
 
 本票不声明模型真实生成能力已完成；模型画像和静态能力合同在 S1.5 单独收口，下一票进入 S2 API 层与本地 adapter。
+
+### HW-CTX-SQZ-01 实施记录（2026-09-11）
+
+第 18 票在既有 S1 引擎上增量实现，保持默认 `adaptive` 行为和旧三层 `LayeredBudget` 调用兼容：
+
+- `context_engine/compression.py` 提供无模型的完整消息 verbatim 压缩、STATE 渲染变体和 `CompressionStep`；策略只在轮次边界上选择，不切片 pinned/system 或单条记忆。
+- `ContextPolicyConfig` 可显式选择 `adaptive`、`state`、`verbatim`、`mask`；`adaptive` 按 STATE → verbatim → window 的顺序降级，并在每步记录 before/after token、策略、遗漏数和 warning notice。
+- `LayeredBudget` 增加可选 `state_budget`，四层总和严格等于输入预算；适配变体 digest 包含压缩策略、STATE 变体、verbatim 上限和 memory recall 参数，防止实验结果在策略变化后误复用。
+- `ContextPolicy.build()` 增加 `memory_query`：按 `owner_scope` 查询长期记忆，只注入能完整放入预留预算的条目并保留 entry id；无条目适配或预算不足时报告 `context.memory_recall_omitted`，不跨 scope、不静默截断。
+
+离线验收命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_squeeze.py tests/test_harness_context_engine.py tests/test_harness_memory_retrieve.py tests/test_harness_memory_extract.py tests/test_harness_adaptation_eval.py -q
+27 passed
+```
+
+本票仍不启动模型或 provider；`HW-SUMM-01` 的真实/可替换摘要模型 adapter、质量测度和 `EX-CTX-MEAS-01` 的 30 轮召回曲线属于后续票。
 
 ## 9. S1.5 实施记录
 
