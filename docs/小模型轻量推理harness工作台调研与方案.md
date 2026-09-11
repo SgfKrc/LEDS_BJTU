@@ -380,6 +380,7 @@ model profile
 - 2026-09-09：v13 —— 完成 **HARNESS-UI-03 RAG 与图像资产工作区本机开发门**：RAG owner scope/引用上下文/预算省略可见，图像能力准入、URL-only 生成、用户-owned 资产预览和 URL 错误状态接入；真实 CUDA 采样与长时资产服务仍后置。
 - 2026-09-09：v14 —— 完成 **HARNESS-UI-04 主题、可访问性、视觉回归与 TUI parity 本机开发门**：跳过链接、主内容焦点、实时区域语义、深浅色/强制颜色/减少动效规则、TUI 能力状态和 Playwright visual smoke；不改主项目前端。
 - 2026-09-11：v15 —— 完成 **HW-CTX-SQZ-01 上下文进一步压榨本机开发门**：新增显式 `adaptive/state/verbatim/mask` 压缩策略、`compact/lines/nonempty` STATE 变体、memory/RAG/STATE/context 四层预算账本、owner scope 有界记忆召回和可序列化降级曲线；30 轮离线 fixture 与邻接回归 `27 passed`，未加载模型、未联网。
+- 2026-09-11：v16 —— 完成 **HW-RAG-SQZ-01 harness RAG 进一步压榨本机开发门**：新增确定性查询改写、多路 FTS/可替换 embedding 混合召回与加权 RRF 去重、fixed/paragraph/sentence 分块、元数据过滤、快照失效跨会话缓存和字符/token 双预算引用边界；专项 `7 passed`，完整 harness/docagent/doc-maintenance 回归 `232 passed, 1 skipped`，未加载模型、未联网。
 
 ## 8. S1 实施记录
 
@@ -511,6 +512,26 @@ model profile
 ```
 
 真实 QLH 主节点、30k 文档容量与长时 embedding provider 仍是后置环境验收；本票不宣称网络可达、nomic 质量或跨进程压力已通过。
+
+### HW-RAG-SQZ-01 实施记录（2026-09-11）
+
+本票只在 harness RAG 检索管线层做确定性增强，不训练或微调 embedding，不启动模型，不连接网络：
+
+- `rag/query.py` 对查询做 NFKC/空白归一化，并按有限别名表生成最多 8 路变体；原始查询、规范化查询和变体均进入检索结果记录，便于复核改写影响。
+- `rag/retriever.py` 的 `HybridRagRetriever` 将每路 FTS 结果与可选 `EmbeddingProvider` 候选以加权 RRF 融合，按 chunk ID 去重；provider 维度/数量异常或运行失败时降级到 FTS，并保留 `route_counts`/`candidate_count` 证据。
+- `rag/store.py` 增加固定/段落/句子三种分块粒度、`source_ids`/`title_prefix` 过滤和 owner scope 硬隔离；查询缓存以配置和文档快照摘要为键，跨 session 可复用，任一文档变更即失效。
+- `rag/context.py` 对完整 chunk 同时施加字符与 token 预算，引用只与实际纳入块对应；超限块逐项记录 `chars`、`tokens` 或 `invalid` 原因，不静默截断。HTTP API 与 MCP 的增强入口均为显式依赖注入，旧 FTS 默认路径保持兼容。
+
+验证命令：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_rag_squeeze.py -q
+7 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_s4_remote_rag.py -q
+9 passed
+```
+
+本票完成的是离线检索管线、引用边界和可复用缓存开发门；真实 embedding 长时质量、30k 文档容量、跨进程并发与主项目 `src/rag_store.py` 双侧 hit@5/MRR 基准进入后续 `RAG-BASE-01` 等票，不把 fake provider 结果宣称为生产质量。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
