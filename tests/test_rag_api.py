@@ -37,6 +37,44 @@ def test_rag_api_returns_citations_and_local_health(monkeypatch, tmp_path):
     assert "vector_blob" not in body["results"][0]
 
 
+def test_rag_api_pushes_metadata_filters_to_store(monkeypatch, tmp_path):
+    store = RagStore(tmp_path / "rag.sqlite3", max_chunk_chars=256)
+    store.ingest_document(
+        source_id="team-doc", relative_ref="docs/team.md", sha256=None,
+        mime="text/markdown", title="Team", text="shared retrieval", revision="r1",
+        metadata={"scope": "team", "type": "guide"},
+    )
+    store.ingest_document(
+        source_id="public-doc", relative_ref="docs/public.md", sha256=None,
+        mime="text/markdown", title="Public", text="shared retrieval", revision="r1",
+        metadata={"scope": "public", "type": "guide"},
+    )
+    monkeypatch.setattr(api_server, "_rag_store_instance", store)
+    body = TestClient(api_server.app).post(
+        "/api/rag/search", json={"query": "retrieval", "mode": "fts", "metadata_filters": {"scope": "team"}}
+    )
+    assert body.status_code == 200
+    assert [row["source_id"] for row in body.json()["results"]] == ["team-doc"]
+    alias = TestClient(api_server.app).post(
+        "/api/rag/search", json={"query": "retrieval", "mode": "fts", "filters": {"scope": "team"}}
+    )
+    assert alias.status_code == 200
+    assert [row["source_id"] for row in alias.json()["results"]] == ["team-doc"]
+
+
+def test_rag_api_exposes_chunk_granularity(monkeypatch, tmp_path):
+    store = RagStore(tmp_path / "rag.sqlite3", max_chunk_chars=256)
+    store.ingest_document(
+        source_id="section-doc", relative_ref="docs/section.md", sha256=None,
+        mime="text/markdown", title="Section", text=("# Intro\n\nstable retrieval marker. " * 30),
+        revision="r1", strategy="section",
+    )
+    monkeypatch.setattr(api_server, "_rag_store_instance", store)
+    response = TestClient(api_server.app).post("/api/rag/search", json={"query": "retrieval", "mode": "fts"})
+    assert response.status_code == 200
+    assert response.json()["results"][0]["granularity"] == "section"
+
+
 def test_rag_api_rebuild_delete_and_hybrid_contract(monkeypatch, tmp_path):
     store = _store(tmp_path)
     monkeypatch.setattr(api_server, "_rag_store_instance", store)

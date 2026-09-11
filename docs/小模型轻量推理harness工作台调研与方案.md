@@ -383,6 +383,20 @@ model profile
 - 2026-09-11：v16 —— 完成 **HW-RAG-SQZ-01 harness RAG 进一步压榨本机开发门**：新增确定性查询改写、多路 FTS/可替换 embedding 混合召回与加权 RRF 去重、fixed/paragraph/sentence 分块、元数据过滤、快照失效跨会话缓存和字符/token 双预算引用边界；专项 `7 passed`，完整 harness/docagent/doc-maintenance 回归 `232 passed, 1 skipped`，未加载模型、未联网。
 - 2026-09-11：v17 —— 完成 **HW-R1 榨干小模型潜力首轮研究设计门**：新增 `research/ceiling.py`，固定 5 个模型对象、6 个上限问题、6 个因素消融、v1/v2 判题口径、单模型/草稿-校验角色 Pareto 和公开证据登记；study digest、holdout、seed、artifact/profile/fixture evidence gate 可复现；专项 `6 passed`，当前不加载模型、不联网。
 - 2026-09-11：v18 —— 根据当前开发机资源收口 **21～37 号票的执行策略**：仅 `QW1.8B` 可用，优先执行 `EX-CTX-MEAS-01`、工具/回放/文档类纯软件票；Qwen3-4B、DS3-7B、Qwen3-0.6B 和多模型对比票保持模型门后置，不下载、不冒烟、不以 QW1.8B 冒充替代。
+- 2026-09-11：v19 —— 完成 **EX-CTX-MEAS-01 上下文策略测度开发门**：新增固定 30 轮 fixture、滑窗/STATE/长期记忆三策略的 6 档预算曲线、早期事实召回度量、JSON/Markdown/绘图 series 产物；全程 fixture-only、无模型权重、无网络。
+- 2026-09-11：v20 —— 完成 **TOOL-JUDGE-POLICY-01 判题口径差异工具**：新增 v1/v2 rubric loader、同输出双政策判定、rescue/regression/invalid 分类、completion 脱敏 hash 和答辩 Markdown 报告；全程 fixture-only、无模型权重、无网络。
+- 2026-09-11：v21 —— 完成 **TOOL-MANIFEST-HLTH-01 模型资产体检工具**：新增只读 manifest/lock/index、sidecar SHA 声明、磁盘元数据与仓库级 `.gitignore` 命中报告；默认不读取完整权重，显式 `verify_hash=True` 才计算 SHA-256，并固定声明无模型加载、无网络。
+- 2026-09-11：v22 —— 完成 **TOOL-CTX-RESS-01 ContextPolicy 压力测试工具**：新增 30 轮 fixture 的 window/state/memory 预算矩阵、早期事实召回曲线、六项不变量检查和 JSON/Markdown CLI 报告；全程 fixture-only、无模型权重、无网络。
+- 2026-09-11：v23 —— 完成 **TOOL-REDTEAM-LAB-01 红队样本演练工具**：新增四类 12 条攻击样本的逐条 block/reason 报告、1 条安全 allowlist 对照、fixture/family 过滤和 JSON/Markdown CLI；payload 脱敏、无模型权重、无网络。
+- 2026-09-11：v24 —— 完成 **TOOL-TRACE-RPL-01 双机验收时间线回放工具**：将项目进展/验收清单中的 8 月 20 日分层验收、8 月 21 日重启恢复/断连重派/Tailnet IPv6 事实归一化为 4 个脱敏 fixture、13 个事件，提供场景/事件过滤及 JSON/Markdown CLI；原始地址、绝对路径和凭据 fail-closed，fixture-only、无模型权重、无网络。
+- 2026-09-11：v25 —— 完成 **TOOL-PROMPT-LAB-01 多模板 A/B 渲染工具**：复用 `PromptProfile`/`render_prompt_messages()` 对固定 case 矩阵做模板字段差异、system/消息长度和确定性 token 估算；输入 schema、路径、重复 ID fail-closed，正文只保留 digest，fixture-only、无模型权重、无网络。
+- 2026-09-11：v26 —— 完成 **TOOL-BENCH-LDG-01 benchmark ledger**：将 P3 控制面、物理双机 `not_run`、真实模型 `not_run` 与可扩展实验 record JSON 聚合为单机/双机/多模型答辩引用表；source/report digest、claim scope 和缺失指标保持显式，fixture-only、无模型权重、无网络。
+- 2026-09-11：v27 —— 完成 **TOOL-MODEL-CARD-01 模型卡生成器**：从 manifest health、SHA sidecar、模型画像和有界 GGUF 头自动生成 JSON/Markdown；白名单提取架构、量化、上下文、tokenizer 等声明，manifest 缺口显式标记 `incomplete`，不加载 tensor、不联网、不声明模型质量或性能。
+- 2026-09-11：v28 —— 完成 **TOOL-DL-RUNNER-01 下载编排器**：规范化 revision/SHA pin，提供 `.part`/Range 续传、连续失败重试、SHA sidecar、原子发布和完成后 manifest health gate；真实 HTTPS 默认禁用，fixture transport 全程无网络。
+- 2026-09-11：v29 —— 完成 **TOOL-API-WB-01 API 契约工作台**：用显式 case 对照 harness `/v1` 与主项目 `/api` 的健康、模型列表、聊天、错误和 SSE 流式契约，采样状态码、错误码、响应形状和有界耗时；默认 fixture-only，报告脱敏且固定无网络、无权重加载。
+- 2026-09-11：v30 —— 完成 **FUN-CLI-01 趣味 CLI**：新增零依赖 ASCII 横幅/进度样式和固定 fixture 语录卡片，提供 `qlh_say`/`model_quotes` 入口、输入 schema、脱敏与 JSON/Markdown 产物；不调用模型、不联网。
+
+- 2026-09-11：v31 —— 完成 **DOC-S1-GAP-01 S1 摘要能力边界收口**：在 S1 实施记录显式标注当前仅有规则摘要，LLM 摘要 call 仍为规划项，并链接实现核查调研，避免把 STATE 摘要误读为模型调用已完成。
 
 ## 8. S1 实施记录
 
@@ -393,6 +407,7 @@ model profile
 - `ContextMessage` 与 `ContextLedgerEntry`：为每条消息保留稳定身份、轮次、token 估算、保留原因和 masking/summary 证据。
 - `validate_state()` / `apply_state_patch()`：只允许 `what/decisions/artifacts/open/next` 五个字段；未知字段拒绝，删除必须显式确认。
 - `ContextNotice`：所有裁剪、masking、摘要和异常都以稳定 code 对外报告，禁止静默丢失内容。
+- 摘要调用边界：当前仅实现无模型的 `RuleBasedSummarizer`；**LLM 摘要 call 未实现（规划中，见[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md)）**，S1 的 STATE 摘要不代表已接入模型。
 
 验证命令：
 
@@ -553,6 +568,236 @@ model profile
 
 本票不宣称任何模型已加载、质量已提升、真实 RSS/VRAM 或 tok/s 已测量，也不改变既有 R1/DS3 生产引用点；按当前 QW1.8B-only 资源门，下一票优先进入 `EX-CTX-MEAS-01`，真实三轮标定和公开证据复核仍后置。
 
+### EX-CTX-MEAS-01 实施记录（2026-09-11）
+
+本票测量的是上下文装配策略对早期事实的保留能力，不执行 QW1.8B 生成，不把 fixture 曲线当作模型质量。
+
+- `research/context_measure.py` 固定 `context-30-round-early-facts`：30 轮、3 条早期事实、固定 `seed=17`；输入预算为 64/96/128/192/256/384 token。
+- 三条策略均复用既有 `ContextPolicy`：`window` 只保留最近轮次，`state` 使用 schema-validated rule-based STATE，`memory` 使用隔离 SQLite FTS memory 写入/召回；每个 cell 记录输入、STATE、记忆和近期消息 token，以及遗漏/写入/召回数量。
+- `ContextMeasureReport` 的 `as_dict()` 输出 digest、provenance 和 chart-ready `series`；`to_markdown()` 输出可直接放入论文/答辩材料的表格。`runner_kind=fixture`、`weights_loaded=false`、`network_used=false` 是硬编码边界。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_context_measure.py -q
+5 passed
+```
+
+本票的早期事实召回率是 context policy 的离线装配指标；真实 QW1.8B 回答正确率、长时延迟、RSS/VRAM 与生产路由继续后置。下一票进入 `TOOL-JUDGE-POLICY-01`。
+
+### TOOL-JUDGE-POLICY-01 实施记录（2026-09-11）
+
+本票把“判题口径问题”独立成可复现的工具，不运行模型，不把 rubric 通过率解释为模型能力。
+
+- `tools/judge_policy.py` 固定 v1 `normalized_contains`/192 与 v2 `loose_contains`/512；v2 保留时间表达（如 `13时54分`）和独立中文数字归一化，并从答案标记/末行提取候选。
+- `load_judge_rubric()` 支持 mapping 或 JSON 文件、correctness 条目筛选和 SHA-256 门；`run_judge_policy_diff()` 对公共 prompt ID 生成 v1/v2 状态、rescue/regression/invalid 原因和计数。completion 只参与内存判定，报告仅保留每条输出的 SHA-256。
+- `JudgePolicyReport.to_markdown()` 输出可答辩表格；内置 fixture 同一批 4 条结果为 v1 `2/4`、v2 `4/4`、rescue `2`。实际项目 v1/v2 rubric prompt-set 不一致时报告显式标记 `prompt_set_match=false`，不隐藏该混杂因素。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_judge_policy.py -q
+5 passed
+```
+
+本票只证明判题工具可复现、可审计和能展示口径差异；真实模型三轮重标、人工复核、质量门升级继续后置。下一票进入 `TOOL-MANIFEST-HLTH-01`。
+
+### TOOL-MANIFEST-HLTH-01 实施记录（2026-09-11）
+
+本票把“模型文件在不在、清单是否自洽、是否被版本控制忽略”独立成只读体检工具，不加载权重、不联网，也不把静态资产声明解释为模型可用性或质量结论。
+
+- `tools/manifest_health.py` 提供 `scan_manifest_health()`/`build_manifest_health_report()`；扫描模型后缀文件、`.sha256` sidecar/聚合声明、`.manifest.json`/`.lock.json`/`model.safetensors.index.json`，检查安全相对路径、文件存在性、尺寸和可选完整 SHA-256。
+- `.gitignore` 按仓库根路径匹配，报告每个模型文件的 `ignored`/命中规则、字节数和 SHA 状态；默认只读 sidecar 声明，避免在 QW1.8B-only 开发机上误触多 GB 权重读取。symlink/junction 会被跳过并单独记录。
+- 报告 schema 为 `qlh.harness.manifest_health.v1`，提供稳定 digest、JSON/Markdown 产物和固定边界 `read_only=true`、`network_used=false`、`weights_loaded=false`。
+
+当前本机静态结果：`models/` 扫描 22 个文件、识别 3 个模型资产且全部命中 `.gitignore`；Qwen GGUF sidecar 为 `declared`，两片 safetensors 为 `aggregate_declared`，safetensors index 检查 195 个条目通过；Gemma lock 引用的 `main_gguf`/`mmproj` 缺失，因此报告明确为不通过。该结果只说明资产缺口，不替代模型下载、加载和质量验收。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_manifest_health.py -q
+6 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_manifest_health.py tests/test_harness_judge_policy.py tests/test_harness_tool_context.py tests/test_harness_network_tools.py tests/test_harness_remote_tool.py -q
+36 passed
+```
+
+本票完成静态资产与发布边界体检；下一票进入 `TOOL-CTX-RESS-01`，继续保持 QW1.8B-only、无模型冒烟约束。
+
+### TOOL-CTX-RESS-01 实施记录（2026-09-11）
+
+本票把 `ContextPolicy` 的 30 轮会话压测包装为可重复 CLI 和答辩报告，度量上下文装配行为，不运行模型、不联网，也不把早期事实召回率写成模型质量。
+
+- `tools/ctx_ressure.py` 复用 `research/context_measure.py` 的固定 fixture、确定性 tokenizer、规则摘要器和隔离 SQLite memory store，默认按 64/96/128/192/256/384 token 运行 `window`、`state`、`memory` 三策略。
+- `ContextPressureReport` 输出每个 cell 的输入 token、遗漏消息、早期事实召回、记忆写入/召回和 `compression_strategy`，并执行 `cells_complete`、`input_budget_bound`、`fixture_provenance`、`recall_curve_monotonic`、`memory_extract_recall_bound`、`folding_observed` 六项检查。
+- CLI：`python -m harness_workbench.tools.ctx_ressure --json build/ctx-ressure.json --markdown build/ctx-ressure.md`；未给输出参数时打印 Markdown，退出码在不变量失败时为 1。顶层 `harness_workbench.tools` 保留兼容导出，模块入口使用 lazy import，避免 `python -m` 预加载警告。
+
+当前默认矩阵 18 个 cell 全部通过：`window` 在本 fixture 未召回早期事实，`state` 首次达到 3/3 召回的预算为 128，`memory` 首次达到 3/3 的预算为 192。专项及相邻回归：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_ctx_ressure.py -q
+6 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_ctx_ressure.py tests/test_harness_manifest_health.py tests/test_harness_judge_policy.py tests/test_harness_tool_context.py tests/test_harness_network_tools.py tests/test_harness_remote_tool.py -q
+42 passed
+```
+
+本票完成压力矩阵、折叠边界和早召回报告入口；真实 QW1.8B 回答正确率、长时资源和生产路由仍后置。下一票进入 `TOOL-REDTEAM-LAB-01`。
+
+### TOOL-REDTEAM-LAB-01 实施记录（2026-09-11）
+
+本票把既有 `eval/red_team.py` 安全门变成可逐条复演的离线实验台，不调用模型、不执行真实工具、不联网，也不把攻击 payload 写入报告。
+
+- `tools/red_team_lab.py` 默认运行 12 条内置攻击 fixture：prompt injection、tool authorization、image path、context injection 各类均覆盖；另加 `safe-tool-local-v1`，只在 `web_search` allowlist、`local` scope、profile/capability `verified` 且 `production_eligible=true` 时放行。
+- `RedTeamLabDecision` 比较 expected 与 observed 的 block/allow/reason，标记 `blocked`、`allowed`、`mismatch`；`RedTeamLabReport` 输出 fixture digest、schema、未授权放行计数和脱敏决策表，不输出 payload。
+- CLI：`python -m harness_workbench.tools.red_team_lab --json build/red-team-lab.json --markdown build/red-team-lab.md`；可用 `--list`、`--family`、`--fixture`、`--without-safe` 缩小演练范围，期望漂移时退出码为 1。
+
+当前默认演练为 12/12 攻击拦截、1 条安全调用放行、`mismatch=0`、`unauthorized_pass=0`。专项及原红队回归：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_red_team_lab.py tests/test_harness_red_team.py -q
+11 passed
+```
+
+本票完成安全门的逐条演练和答辩报告入口；真实模型生成安全性、真实工具执行和生产授权仍需后置验收。下一票进入 `TOOL-TRACE-RPL-01`。
+
+### TOOL-TRACE-RPL-01 实施记录（2026-09-11）
+
+本票把“答辩时如何复盘双机验收”独立成只读、可复现的时间线回放工具。仓库当前没有原始 8 月日志流，因此内置数据明确标记为基于文档证据的 normalized fixture，不伪造实时日志采集或完整原始日志。
+
+- `tools/trace_replay.py` 固定四条场景：8 月 20 日 QW1.8B layer pipeline、Full Worker controlled restart/recovery、remote disconnect → expired → one reassignment → master fallback completion、Tailnet IPv6 dual-machine completion。事件保留 timestamp、kind、actor、status、summary、sequence 和稳定 hash workflow ref，不输出原始 workflow ID、地址或路径。
+- `load_trace_events()`/`--input` 接收规范化 JSON 事件；输入中出现绝对路径、IPv4/IPv6、token/secret/password 等字段会在报告前拒绝。`TraceReplayReport` 检查事件顺序、终态闭合、来源相对路径、载荷脱敏和 fixture/offline 边界。
+- CLI：`python -m harness_workbench.tools.trace_replay --list`、`--scenario`、`--kind`、`--date`、`--input`、`--json` 和 `--markdown`；默认报告适合直接贴入答辩材料，五项检查全部有显式结果。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_trace_replay.py -q
+10 passed
+```
+
+当前默认回放为 4 个场景、13 个事件，全部检查通过；未启动服务、未访问网络、未加载 QW1.8B。该工具只证明既有验收事实可以稳定复演和脱敏展示，不替代原始日志归档、长时双机复验或真实模型质量验收。下一票进入 `TOOL-PROMPT-LAB-01`。
+
+### TOOL-PROMPT-LAB-01 实施记录（2026-09-11）
+
+本票把 PromptProfile 的模板差异和渲染成本做成可复现、可脱敏的 A/B 报告，不执行模型生成。默认使用 QW1.8B 内置 profile 家族的 minimal/structured 两个 profile 和 3 个固定对话 case。
+
+- `tools/prompt_lab.py` 复用 `PromptProfile` 与 `render_prompt_messages()`，对所有 profile × case 组合渲染；每个结果保留 profile/case ID、输入/渲染 digest、system 注入次数、消息数、字符数和 `HeuristicTokenizer` 估算 token，不保存 system prompt 或消息正文。
+- `PromptProfileDiff` 逐字段对比 family/version/system_prompt/stop/thinking/tool_mode/structured_output；system prompt/stop 的变化只展示字符数、数量和 digest。`PromptCaseDelta` 给出每个 case 的 B-A 字符/token 差异，避免把长度变化误报为质量收益。
+- CLI：`python -m harness_workbench.tools.prompt_lab --list`、`--profile`、`--case`、`--profile-file`、`--case-file`、`--json`、`--markdown`；规范化 JSON 使用 `qlh.prompt_lab.v1`，原文、绝对路径、未知 schema 和重复 ID 均拒绝。
+- 报告固定检查矩阵完整、身份引用、system 只注入一次、profile digest 有差异、字段 diff 存在、payload 省略和 offline 边界；默认 2 × 3 矩阵为 6 个渲染单元。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_prompt_lab.py -q
+9 passed
+```
+
+当前默认 A/B 差异只有 system prompt 与 structured-output policy；structured profile 在三个 case 各增加 27 字符、3 个估算 token。该数字是确定性估算，不代表真实 tokenizer、模型质量或延迟收益。下一票进入 `TOOL-BENCH-LDG-01`。
+
+### TOOL-BENCH-LDG-01 实施记录（2026-09-11）
+
+本票把散落的结构化实验结果整理为答辩可引用 ledger，不解析自由文本或启动任何运行时。默认输入为既有 P3 控制面 benchmark 和真实模型性能 `not_run` 合同。
+
+- `tools/benchmark_ledger.py` 支持 `qlh.defense_benchmark.v1`、`qlh.real_model_performance.v1`、通用 `qlh.experiment_record.v1` 与 `qlh.benchmark_ledger.v1 records[]`；按 claim class 聚合 `single_host`、`dual_host`、`not_run` 和 `multi_model`，指标只从 JSON 数值字段读取。
+- 每条 `BenchmarkRecord` 保留 source 相对路径、source digest、模型/拓扑/host/process/sample、status、有限 metrics、claim scope 和 `eligible_for_claim`。P3 的控制面 `throughput_tasks_per_second` 仍明确是 tasks/s；真实模型 TTFT/tokens/s 与物理双机缺失保持 `NOT RUN`。
+- CLI：`python -m harness_workbench.tools.benchmark_ledger` 默认读取 P3 与 real-model-not-run；`--input PATH` 可重复添加文件，`--root PATH` 递归扫描并忽略不支持 schema，`--strict` 对显式输入 fail-closed；`--json`/`--markdown` 输出汇总表。
+- 安全与资格检查拒绝绝对路径、IPv4/IPv6、凭据、未知 schema、非有限数字和重复 record ID；报告固定验证 source 相对路径、数值有限、claim scope、跨模型聚合及离线边界。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_benchmark_ledger.py -q
+10 passed
+```
+
+当前默认 ledger 为 4 条记录：2 条单机控制面 fixture、1 条物理双机 `not_run`、1 条真实模型 `not_run`；未启动服务、未访问网络、未加载 QW1.8B。该表只提供结构化证据索引，不将控制面指标解释为模型性能。下一票进入 `TOOL-MODEL-CARD-01`。
+
+### TOOL-MODEL-CARD-01 实施记录（2026-09-11）
+
+本票把模型工件身份与发布缺口生成为可直接用于答辩的模型卡，不调用推理引擎。卡片中的字段来源保持可追踪，未知能力继续为 `unknown`，文件名推断明确标为 hint。
+
+- `tools/model_card.py` 复用 `scan_manifest_health()`，将工件大小、ignore 命中、SHA sidecar 状态、manifest/lock/index 结果和 `ModelProfile` 身份汇入 `qlh.harness.model_card.v1`。证据仅保留仓库相对路径和 digest。
+- GGUF 解析器最多读取有界头部，按 GGUF v3 类型结构跳过 tokenizer 大数组，只物化白名单键；tensor data 不解析。当前 QW1.8B 识别为 GGUF v3、195 tensors、20 项元数据、`qwen` 架构、`Q4_K_M`、`gpt2` tokenizer、声明上下文 8192。
+- 内置 QW1.8B profile 记录 `builtin-qw1-v1`、`llama_server`、`candidate`、`production_eligible=false` 和运行配置上下文 4096；卡片同时展示 GGUF 8192 与运行配置 4096 的差异，不把声明窗口写成已经验证的有效上下文。
+- CLI：`python -m harness_workbench.tools.model_card --root models --model-id QW1.8B --json build/model-card/latest.json --markdown build/model-card/latest.md`；支持 `--health-json` 与 `--profile`，结构错误、绝对路径和未知 schema fail-closed。
+- 当前模型卡结构有效，但资产状态为 `incomplete`：22 个文件中识别 3 个权重工件和 2 个 manifest，Gemma lock 引用的 `main_gguf`/`mmproj` 缺失。该状态保留在 Markdown，而不是隐去非目标模型的发布缺口。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_model_card.py -q
+11 passed
+.\.venv-test\Scripts\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+194 passed, 1 skipped
+```
+
+本票固定 `runner_kind=metadata`、`weights_loaded=false`、`network_used=false`；未测 QW1.8B 的回答质量、TTFT、tokens/s、RSS 或 VRAM。下一票进入 `TOOL-DL-RUNNER-01`。
+
+### TOOL-DL-RUNNER-01 实施记录（2026-09-11）
+
+本票把模型工件下载从一次性脚本收口为可审计、可恢复的传输契约；本轮只验证离线 fixture，不连接公网或下载新模型。
+
+- `tools/download_runner.py` 接收 `qlh.download_manifest.v1`：模型 ID、非浮动 revision、每个文件的 HTTPS URL、相对目标路径、size 和 SHA-256 必须齐全；`source_base_url` 只能拼出 HTTPS 无凭据 URL。
+- `DownloadRunner` 先检查已有目标：size/SHA 匹配则补写 sidecar 并返回 `already_ready`，不匹配则拒绝覆盖。新传输写 `.part`/`.part.json`，每次请求带有界 `Range`；成功分片会重置连续失败计数，网络临时错误按 `max_attempts` 重试。
+- staging 完整后计算全量 SHA-256，随后使用 `os.replace` 原子发布目标和 sidecar；状态文件只在发布成功后删除。目标/根目录/staging 路径经过 symlink/junction 与路径穿越检查。
+- 发布后调用 `scan_manifest_health()`；体检 error 会让报告的 `post_download_health` 和整体 `valid` 失败，不允许带着缺口进入注册。报告保留每文件状态、attempts、是否续传、hash、sidecar、health digest 和限制项。
+- `MemoryDownloadTransport` 可注入 Range、短响应和 5xx/timeout 失败；`UrllibDownloadTransport(enabled=False)` 是默认安全边界。CLI 默认 `--manifest PATH` 只产出 `planned` JSON/Markdown，`--execute` 没有显式 transport 仍保持 blocked。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_download_runner.py -q
+13 passed
+```
+
+本票固定 `weights_loaded=false`；本轮未执行真实 HTTPS、未下载 DS3/Qwen3 等缺失模型、未运行任何模型冒烟。下一票进入 `TOOL-API-WB-01`。
+
+### TOOL-API-WB-01 实施记录（2026-09-11）
+
+本票把两个已有 HTTP 面的最小契约差异收口为可复现、可审计的离线工作台；不启动 harness 或主项目服务，也不通过 API 触发 QW1.8B 推理。
+
+- `harness_workbench/tools/api_workbench.py` 用 `ProbeCase` 固定 5 组映射：`/healthz` ↔ `/api/health`、`/v1/models` ↔ `/api/models`、OpenAI `/v1/chat/completions` ↔ `/api/chat`、无效请求和 `/v1/chat/completions` SSE ↔ `/api/chat/stream`。
+- `MemoryAPITransport` 提供稳定 fixture；`UrllibAPITransport` 默认禁用，只有调用方显式开启才允许 HTTP。相对路径、非凭据 header、payload 安全边界和输入 schema 均 fail-closed。
+- 报告只保留请求 digest、方法/路径/脱敏形状、状态码、错误码、响应形状、content type 和非负耗时；不写入 prompt、message、响应正文、凭据、绝对地址或模型质量指标。
+- 默认 fixture 结果为 `4 matched / 1 drifted / 0 failed`。唯一漂移是无效聊天：harness 返回 `400 invalid_messages`，主项目返回 `422 validation_error`；这被显式记录为 `status_code; error_code`，不是静默吞掉。两端流式完成事件归一化后匹配。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_api_workbench.py -q
+9 passed
+.\.venv-test\Scripts\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+216 passed, 1 skipped
+```
+
+本票固定 `runner_kind=fixture`、`network_used=false`、`weights_loaded=false`；没有真实网络请求、模型加载或质量/延迟结论。下一票进入 `FUN-CLI-01`。
+
+### FUN-CLI-01 实施记录（2026-09-11）
+
+本票把答辩开场需要的趣味输出收口为纯标准库、可复现的 fixture 工具；语录不是模型实测结果，不触发 QW1.8B，也不连接 API。
+
+- `harness_workbench/tools/fun_cli.py` 提供 `say` 与 `quotes` 子命令。`say` 支持 `cyber/classic/minimal` 三种 ASCII banner、`bar/blocks/dots/steps/none` 五种进度样式、消息 digest 和 JSON/Markdown 输出。
+- `quotes` 默认输出 3 张固定卡片，并支持 `qlh.fun_quotes.v1` 输入和 `--model` 筛选。卡片保留脱敏后的 prompt/quote、digest、source/claim scope；URL、地址和常见凭据在终端/报告中均被替换。
+- `scripts/qlh_say.py` 与 `scripts/model_quotes.py` 是直接入口，仓库根目录可运行；报告固定 `network_used=false`、`weights_loaded=false`、`model_invoked=false`，不声明任何生成质量。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_fun_cli.py -q
+10 passed
+.\.venv-test\Scripts\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+226 passed, 1 skipped
+```
+
+本票完成 F1/F2 趣味工具合并；下一票进入 `DOC-S1-GAP-01`。
+
+### DOC-S1-GAP-01 实施记录（2026-09-11）
+
+本票是文档口径收口，不改代码、不启动模型、不联网。
+
+- 在 `## 8. S1 实施记录` 增加摘要调用边界：当前 `RuleBasedSummarizer` 是唯一实现，LLM 摘要 call 尚未实现，仍属于规划项。
+- 该表述与[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md) §1/§2 结论一致，保留 `HW-SUMM-01` 作为后续模型 adapter 票，避免把 STATE 规则压缩误报为模型能力。
+
 ## 14. S6-HARNESS-UI-01 实施记录
 
 本票实现工作台的第一层交互壳，不绑定真实模型进程：
@@ -625,3 +870,57 @@ npm run visual:smoke -- http://127.0.0.1:5181/ # desktop/mobile 通过
 ```
 
 S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 SD/CUDA、生图大图回读、跨设备长时网络和生产部署仍按前置计划后置验收。
+
+## 18. RAG-BASE-01 实施记录
+
+本票冻结主项目与 harness 的双侧离线召回基准，不启动模型、不访问网络，也不把 fixture 结果解释成模型质量：
+
+- `harness_workbench/tools/rag_baseline.py` 固定 6 份目标文档与 30 条问题集；同一 source reference 分别写入 `src.rag_store.RagStore` 与 harness `rag.store.RagStore`，两侧均只使用现有 SQLite FTS5 检索契约。
+- `RagBaselineReport` 使用 `qlh.rag_baseline.v1`，输出 corpus/case-set digest、query SHA-256、目标引用、命中位置和计数，不输出问题原文、文档正文、绝对临时路径或模型信息；默认两侧 hit@5 与 MRR 均为 `1.000000`。
+- CLI：`python -m harness_workbench.tools.rag_baseline --json build/rag-baseline/latest.json --markdown build/rag-baseline/latest.md`；输入 schema、相对路径、重复标识和 30 条问题数均有 fail-closed 校验。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_rag_baseline.py -q
+8 passed
+```
+
+后续 `RAG-META-01`、`RAG-CHUNK-01` 等票必须复用该问题集和报告，改动前后同时复测主项目与 harness，不静默替换度量口径。
+
+## 19. RAG-META-01 实施记录
+
+本票为主项目与 harness 增加结构化元数据过滤，仍保持本机 SQLite、FTS5 优先和无模型/无网络边界：
+
+- 两侧新增 `rag_metadata_index` 倒排表，固定支持 `source`、`scope`、`type`、`tag`、`time` 字段；`tag` 可写入/匹配多值，过滤条件使用 SQL `EXISTS` 下推到 FTS/候选召回阶段。
+- 主项目旧库初始化时按 `metadata_index_version` 回填索引；revision 元数据变化显式报冲突，删除会同步清理索引。harness 混合检索、cache key 和 `/v1/rag` source/search API 均透传 `metadata_filters`。
+- 过滤字段和值有数量、长度、类型边界；未知字段和非法值 fail-closed。主项目查询审计只保留过滤字段名，不记录过滤值或查询原文。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py tests/test_harness_mcp_api.py tests/test_harness_mcp_server.py tests/test_harness_rag_squeeze.py -q
+62 passed
+```
+
+下一票进入 `RAG-CHUNK-01`；继续复用 `RAG-BASE-01` 的双侧 hit@5/MRR 口径。
+
+## 20. RAG-CHUNK-01 实施记录
+
+本票把主项目与 harness 的分块边界统一为可配置、可复现的本地规则，并将粒度信息随 chunk 持久化：
+
+- 两侧均支持 `fixed`、`paragraph`、`sentence`、`section`、`adaptive`、`semantic` 六种策略；`section` 识别 Markdown/大写标题，`adaptive` 综合章节、段落和句子边界，`semantic` 在没有模型的开发机上仅使用确定性标题/段落/标点启发式。
+- 重叠窗口继续受 `max_chunk_chars` 和 overlap 上限约束，所有 chunk 保存原文 `start_offset/end_offset`；主项目 `rag_chunks.granularity` 与 harness 同名字段记录实际策略，旧 SQLite 初始化自动补列。
+- 主项目 FTS/CJK FTS/向量返回与 API 引用、harness source API 和 `list_chunks` 均透传粒度；相同 source/revision 以不同策略重复写入会报告 `revision_conflict`，避免无声改变引用边界。
+- 新增 `run_rag_chunk_comparison()` 复用冻结的 6 份文档/30 条问题集，逐策略比较主项目与 harness；六种策略两侧均达到 `hit@5=1.000000`、`MRR=1.000000`，且详情签名一致。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_chunking.py -q
+10 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py -q
+44 passed
+```
+
+本票不下载、不加载 QW1.8B、不联网；`RAG-BASE-01` 的双侧 hit@5/MRR 口径保持不变。下一票为 `RAG-QRW-01`，继续在规则和 FTS/候选管线层推进。

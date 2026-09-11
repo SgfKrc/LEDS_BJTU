@@ -1148,6 +1148,8 @@ class RagSearchRequest(BaseModel):
     model_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
     dimensions: Optional[int] = Field(default=None, ge=1, le=32768)
     query_vector: Optional[list[float]] = None
+    metadata_filters: dict[str, Any] = Field(default_factory=dict)
+    filters: Optional[dict[str, Any]] = None
 
 
 class RagRebuildRequest(BaseModel):
@@ -2440,6 +2442,7 @@ def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
         "access_scope": row.get("access_scope"),
         "relative_ref": row.get("relative_ref"),
         "ordinal": row.get("ordinal"),
+        "granularity": row.get("granularity") or "fixed",
         "snippet": text[:800],
         **{
             key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code")
@@ -2492,9 +2495,13 @@ async def rag_sources(owner_scope: Optional[str] = None):
 async def rag_search(req: RagSearchRequest):
     try:
         store = _get_rag_store()
+        metadata_filters = req.metadata_filters or (req.filters or {})
         if req.mode == "fts":
             rows = await run_in_threadpool(
-                lambda: store.search(req.query, access_scope=req.access_scope, limit=req.limit)
+                lambda: store.search(
+                    req.query, access_scope=req.access_scope, limit=req.limit,
+                    metadata_filters=metadata_filters,
+                )
             )
         else:
             if req.model_sha256 is None or req.dimensions is None or req.query_vector is None:
@@ -2509,6 +2516,7 @@ async def rag_search(req: RagSearchRequest):
                     req.query, req.query_vector, provider=req.provider, model_id=req.model_id,
                     model_sha256=req.model_sha256, dimensions=req.dimensions,
                     access_scope=req.access_scope, limit=req.limit,
+                    metadata_filters=metadata_filters,
                 )
             )
         return {

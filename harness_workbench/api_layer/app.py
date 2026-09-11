@@ -344,6 +344,7 @@ def create_app(
                 max_chars=payload.get("max_chars", 1200),
                 overlap_chars=payload.get("overlap_chars", 120),
                 strategy=payload.get("strategy", "fixed"),
+                metadata=payload.get("metadata"),
             )
         except (TypeError, ValueError) as exc:
             return JSONResponse(_error_body(str(exc), code="invalid_rag_source"), status_code=400)
@@ -360,6 +361,7 @@ def create_app(
             query = payload.get("query", "")
             owner_scope = payload.get("owner_scope", "local")
             source_ids = payload.get("source_ids", ())
+            metadata_filters = payload.get("metadata_filters", payload.get("filters"))
             if not isinstance(source_ids, (list, tuple)):
                 raise ValueError("source_ids must be an array")
             if rag_retriever is not None:
@@ -368,13 +370,14 @@ def create_app(
                     owner_scope=owner_scope,
                     source_ids=tuple(str(item) for item in source_ids),
                     title_prefix=payload.get("title_prefix"),
+                    metadata_filters=metadata_filters,
                     session_id=payload.get("session_id"),
                     limit=payload.get("limit"),
                 )
                 hits = list(retrieval.hits)
             else:
                 retrieval = None
-                hits = rag_store.search(query, owner_scope=owner_scope, limit=payload.get("limit", 8), source_ids=tuple(str(item) for item in source_ids), title_prefix=payload.get("title_prefix"))
+                hits = rag_store.search(query, owner_scope=owner_scope, limit=payload.get("limit", 8), source_ids=tuple(str(item) for item in source_ids), title_prefix=payload.get("title_prefix"), metadata_filters=metadata_filters)
             context = build_context(
                 [hit.as_dict() for hit in hits],
                 max_chars=payload.get("max_chars", 8_000),
