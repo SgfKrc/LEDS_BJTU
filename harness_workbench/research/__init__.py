@@ -13,6 +13,17 @@ from .ceiling import (
     evaluate_evidence_gate,
     pareto_points,
 )
+from .context_measure import (
+    CONTEXT_MEASURE_SCHEMA,
+    DEFAULT_BUDGETS,
+    STRATEGIES,
+    ContextMeasureFixture,
+    ContextMeasureObservation,
+    ContextMeasureReport,
+    build_context_measure_fixture,
+    build_context_measure_report,
+    run_context_measure,
+)
 
 __all__ = [
     "DEFAULT_MODEL_IDS",
@@ -26,4 +37,13 @@ __all__ = [
     "compare_factor",
     "evaluate_evidence_gate",
     "pareto_points",
+    "CONTEXT_MEASURE_SCHEMA",
+    "DEFAULT_BUDGETS",
+    "STRATEGIES",
+    "ContextMeasureFixture",
+    "ContextMeasureObservation",
+    "ContextMeasureReport",
+    "build_context_measure_fixture",
+    "build_context_measure_report",
+    "run_context_measure",
 ]
