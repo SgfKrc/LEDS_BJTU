@@ -396,6 +396,8 @@ model profile
 - 2026-09-11：v29 —— 完成 **TOOL-API-WB-01 API 契约工作台**：用显式 case 对照 harness `/v1` 与主项目 `/api` 的健康、模型列表、聊天、错误和 SSE 流式契约，采样状态码、错误码、响应形状和有界耗时；默认 fixture-only，报告脱敏且固定无网络、无权重加载。
 - 2026-09-11：v30 —— 完成 **FUN-CLI-01 趣味 CLI**：新增零依赖 ASCII 横幅/进度样式和固定 fixture 语录卡片，提供 `qlh_say`/`model_quotes` 入口、输入 schema、脱敏与 JSON/Markdown 产物；不调用模型、不联网。
 
+- 2026-09-11：v31 —— 完成 **DOC-S1-GAP-01 S1 摘要能力边界收口**：在 S1 实施记录显式标注当前仅有规则摘要，LLM 摘要 call 仍为规划项，并链接实现核查调研，避免把 STATE 摘要误读为模型调用已完成。
+
 ## 8. S1 实施记录
 
 本票只实现后端无关的上下文消息层，不启动模型、不连接网络、不引入主项目运行时。核心接口如下：
@@ -405,6 +407,7 @@ model profile
 - `ContextMessage` 与 `ContextLedgerEntry`：为每条消息保留稳定身份、轮次、token 估算、保留原因和 masking/summary 证据。
 - `validate_state()` / `apply_state_patch()`：只允许 `what/decisions/artifacts/open/next` 五个字段；未知字段拒绝，删除必须显式确认。
 - `ContextNotice`：所有裁剪、masking、摘要和异常都以稳定 code 对外报告，禁止静默丢失内容。
+- 摘要调用边界：当前仅实现无模型的 `RuleBasedSummarizer`；**LLM 摘要 call 未实现（规划中，见[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md)）**，S1 的 STATE 摘要不代表已接入模型。
 
 验证命令：
 
@@ -787,6 +790,13 @@ model profile
 ```
 
 本票完成 F1/F2 趣味工具合并；下一票进入 `DOC-S1-GAP-01`。
+
+### DOC-S1-GAP-01 实施记录（2026-09-11）
+
+本票是文档口径收口，不改代码、不启动模型、不联网。
+
+- 在 `## 8. S1 实施记录` 增加摘要调用边界：当前 `RuleBasedSummarizer` 是唯一实现，LLM 摘要 call 尚未实现，仍属于规划项。
+- 该表述与[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md) §1/§2 结论一致，保留 `HW-SUMM-01` 作为后续模型 adapter 票，避免把 STATE 规则压缩误报为模型能力。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
