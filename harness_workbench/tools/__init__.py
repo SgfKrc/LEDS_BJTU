@@ -89,6 +89,18 @@ __all__ = [
     "ModelCardReport",
     "build_model_card_from_health",
     "build_model_card_from_json",
+    "DOWNLOAD_MANIFEST_SCHEMA",
+    "DOWNLOAD_RUNNER_SCHEMA",
+    "DownloadError",
+    "DownloadFilePin",
+    "DownloadFileResult",
+    "DownloadManifest",
+    "DownloadResponse",
+    "DownloadRunReport",
+    "DownloadRunner",
+    "MemoryDownloadTransport",
+    "UrllibDownloadTransport",
+    "load_download_manifest",
     "CTX_RESSURE_SCHEMA",
     "ContextPressureReport",
     "PressureCheck",
@@ -135,6 +147,23 @@ __all__ = [
 def __getattr__(name: str):
     """Lazy-load the CLI module so ``python -m`` has no pre-import warning."""
 
+    if name in {
+        "DOWNLOAD_MANIFEST_SCHEMA",
+        "DOWNLOAD_RUNNER_SCHEMA",
+        "DownloadError",
+        "DownloadFilePin",
+        "DownloadFileResult",
+        "DownloadManifest",
+        "DownloadResponse",
+        "DownloadRunReport",
+        "DownloadRunner",
+        "MemoryDownloadTransport",
+        "UrllibDownloadTransport",
+        "load_download_manifest",
+    }:
+        from . import download_runner
+
+        return getattr(download_runner, name)
     if name in {
         "MODEL_CARD_INPUT_SCHEMA",
         "MODEL_CARD_SCHEMA",

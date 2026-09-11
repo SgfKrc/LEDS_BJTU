@@ -392,6 +392,7 @@ model profile
 - 2026-09-11：v25 —— 完成 **TOOL-PROMPT-LAB-01 多模板 A/B 渲染工具**：复用 `PromptProfile`/`render_prompt_messages()` 对固定 case 矩阵做模板字段差异、system/消息长度和确定性 token 估算；输入 schema、路径、重复 ID fail-closed，正文只保留 digest，fixture-only、无模型权重、无网络。
 - 2026-09-11：v26 —— 完成 **TOOL-BENCH-LDG-01 benchmark ledger**：将 P3 控制面、物理双机 `not_run`、真实模型 `not_run` 与可扩展实验 record JSON 聚合为单机/双机/多模型答辩引用表；source/report digest、claim scope 和缺失指标保持显式，fixture-only、无模型权重、无网络。
 - 2026-09-11：v27 —— 完成 **TOOL-MODEL-CARD-01 模型卡生成器**：从 manifest health、SHA sidecar、模型画像和有界 GGUF 头自动生成 JSON/Markdown；白名单提取架构、量化、上下文、tokenizer 等声明，manifest 缺口显式标记 `incomplete`，不加载 tensor、不联网、不声明模型质量或性能。
+- 2026-09-11：v28 —— 完成 **TOOL-DL-RUNNER-01 下载编排器**：规范化 revision/SHA pin，提供 `.part`/Range 续传、连续失败重试、SHA sidecar、原子发布和完成后 manifest health gate；真实 HTTPS 默认禁用，fixture transport 全程无网络。
 
 ## 8. S1 实施记录
 
@@ -726,6 +727,25 @@ model profile
 ```
 
 本票固定 `runner_kind=metadata`、`weights_loaded=false`、`network_used=false`；未测 QW1.8B 的回答质量、TTFT、tokens/s、RSS 或 VRAM。下一票进入 `TOOL-DL-RUNNER-01`。
+
+### TOOL-DL-RUNNER-01 实施记录（2026-09-11）
+
+本票把模型工件下载从一次性脚本收口为可审计、可恢复的传输契约；本轮只验证离线 fixture，不连接公网或下载新模型。
+
+- `tools/download_runner.py` 接收 `qlh.download_manifest.v1`：模型 ID、非浮动 revision、每个文件的 HTTPS URL、相对目标路径、size 和 SHA-256 必须齐全；`source_base_url` 只能拼出 HTTPS 无凭据 URL。
+- `DownloadRunner` 先检查已有目标：size/SHA 匹配则补写 sidecar 并返回 `already_ready`，不匹配则拒绝覆盖。新传输写 `.part`/`.part.json`，每次请求带有界 `Range`；成功分片会重置连续失败计数，网络临时错误按 `max_attempts` 重试。
+- staging 完整后计算全量 SHA-256，随后使用 `os.replace` 原子发布目标和 sidecar；状态文件只在发布成功后删除。目标/根目录/staging 路径经过 symlink/junction 与路径穿越检查。
+- 发布后调用 `scan_manifest_health()`；体检 error 会让报告的 `post_download_health` 和整体 `valid` 失败，不允许带着缺口进入注册。报告保留每文件状态、attempts、是否续传、hash、sidecar、health digest 和限制项。
+- `MemoryDownloadTransport` 可注入 Range、短响应和 5xx/timeout 失败；`UrllibDownloadTransport(enabled=False)` 是默认安全边界。CLI 默认 `--manifest PATH` 只产出 `planned` JSON/Markdown，`--execute` 没有显式 transport 仍保持 blocked。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_download_runner.py -q
+13 passed
+```
+
+本票固定 `weights_loaded=false`；本轮未执行真实 HTTPS、未下载 DS3/Qwen3 等缺失模型、未运行任何模型冒烟。下一票进入 `TOOL-API-WB-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
