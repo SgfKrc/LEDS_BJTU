@@ -82,4 +82,25 @@ __all__ = [
     "ManifestHealthReport",
     "build_manifest_health_report",
     "scan_manifest_health",
+    "CTX_RESSURE_SCHEMA",
+    "ContextPressureReport",
+    "PressureCheck",
+    "build_context_pressure_report",
+    "run_context_pressure",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy-load the CLI module so ``python -m`` has no pre-import warning."""
+
+    if name in {
+        "CTX_RESSURE_SCHEMA",
+        "ContextPressureReport",
+        "PressureCheck",
+        "build_context_pressure_report",
+        "run_context_pressure",
+    }:
+        from . import ctx_ressure
+
+        return getattr(ctx_ressure, name)
+    raise AttributeError(name)

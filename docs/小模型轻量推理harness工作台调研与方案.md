@@ -386,6 +386,7 @@ model profile
 - 2026-09-11：v19 —— 完成 **EX-CTX-MEAS-01 上下文策略测度开发门**：新增固定 30 轮 fixture、滑窗/STATE/长期记忆三策略的 6 档预算曲线、早期事实召回度量、JSON/Markdown/绘图 series 产物；全程 fixture-only、无模型权重、无网络。
 - 2026-09-11：v20 —— 完成 **TOOL-JUDGE-POLICY-01 判题口径差异工具**：新增 v1/v2 rubric loader、同输出双政策判定、rescue/regression/invalid 分类、completion 脱敏 hash 和答辩 Markdown 报告；全程 fixture-only、无模型权重、无网络。
 - 2026-09-11：v21 —— 完成 **TOOL-MANIFEST-HLTH-01 模型资产体检工具**：新增只读 manifest/lock/index、sidecar SHA 声明、磁盘元数据与仓库级 `.gitignore` 命中报告；默认不读取完整权重，显式 `verify_hash=True` 才计算 SHA-256，并固定声明无模型加载、无网络。
+- 2026-09-11：v22 —— 完成 **TOOL-CTX-RESS-01 ContextPolicy 压力测试工具**：新增 30 轮 fixture 的 window/state/memory 预算矩阵、早期事实召回曲线、六项不变量检查和 JSON/Markdown CLI 报告；全程 fixture-only、无模型权重、无网络。
 
 ## 8. S1 实施记录
 
@@ -610,6 +611,25 @@ model profile
 ```
 
 本票完成静态资产与发布边界体检；下一票进入 `TOOL-CTX-RESS-01`，继续保持 QW1.8B-only、无模型冒烟约束。
+
+### TOOL-CTX-RESS-01 实施记录（2026-09-11）
+
+本票把 `ContextPolicy` 的 30 轮会话压测包装为可重复 CLI 和答辩报告，度量上下文装配行为，不运行模型、不联网，也不把早期事实召回率写成模型质量。
+
+- `tools/ctx_ressure.py` 复用 `research/context_measure.py` 的固定 fixture、确定性 tokenizer、规则摘要器和隔离 SQLite memory store，默认按 64/96/128/192/256/384 token 运行 `window`、`state`、`memory` 三策略。
+- `ContextPressureReport` 输出每个 cell 的输入 token、遗漏消息、早期事实召回、记忆写入/召回和 `compression_strategy`，并执行 `cells_complete`、`input_budget_bound`、`fixture_provenance`、`recall_curve_monotonic`、`memory_extract_recall_bound`、`folding_observed` 六项检查。
+- CLI：`python -m harness_workbench.tools.ctx_ressure --json build/ctx-ressure.json --markdown build/ctx-ressure.md`；未给输出参数时打印 Markdown，退出码在不变量失败时为 1。顶层 `harness_workbench.tools` 保留兼容导出，模块入口使用 lazy import，避免 `python -m` 预加载警告。
+
+当前默认矩阵 18 个 cell 全部通过：`window` 在本 fixture 未召回早期事实，`state` 首次达到 3/3 召回的预算为 128，`memory` 首次达到 3/3 的预算为 192。专项及相邻回归：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_ctx_ressure.py -q
+6 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_ctx_ressure.py tests/test_harness_manifest_health.py tests/test_harness_judge_policy.py tests/test_harness_tool_context.py tests/test_harness_network_tools.py tests/test_harness_remote_tool.py -q
+42 passed
+```
+
+本票完成压力矩阵、折叠边界和早召回报告入口；真实 QW1.8B 回答正确率、长时资源和生产路由仍后置。下一票进入 `TOOL-REDTEAM-LAB-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
