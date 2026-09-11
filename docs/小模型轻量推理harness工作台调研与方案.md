@@ -388,6 +388,7 @@ model profile
 - 2026-09-11：v21 —— 完成 **TOOL-MANIFEST-HLTH-01 模型资产体检工具**：新增只读 manifest/lock/index、sidecar SHA 声明、磁盘元数据与仓库级 `.gitignore` 命中报告；默认不读取完整权重，显式 `verify_hash=True` 才计算 SHA-256，并固定声明无模型加载、无网络。
 - 2026-09-11：v22 —— 完成 **TOOL-CTX-RESS-01 ContextPolicy 压力测试工具**：新增 30 轮 fixture 的 window/state/memory 预算矩阵、早期事实召回曲线、六项不变量检查和 JSON/Markdown CLI 报告；全程 fixture-only、无模型权重、无网络。
 - 2026-09-11：v23 —— 完成 **TOOL-REDTEAM-LAB-01 红队样本演练工具**：新增四类 12 条攻击样本的逐条 block/reason 报告、1 条安全 allowlist 对照、fixture/family 过滤和 JSON/Markdown CLI；payload 脱敏、无模型权重、无网络。
+- 2026-09-11：v24 —— 完成 **TOOL-TRACE-RPL-01 双机验收时间线回放工具**：将项目进展/验收清单中的 8 月 20 日分层验收、8 月 21 日重启恢复/断连重派/Tailnet IPv6 事实归一化为 4 个脱敏 fixture、13 个事件，提供场景/事件过滤及 JSON/Markdown CLI；原始地址、绝对路径和凭据 fail-closed，fixture-only、无模型权重、无网络。
 
 ## 8. S1 实施记录
 
@@ -648,6 +649,23 @@ model profile
 ```
 
 本票完成安全门的逐条演练和答辩报告入口；真实模型生成安全性、真实工具执行和生产授权仍需后置验收。下一票进入 `TOOL-TRACE-RPL-01`。
+
+### TOOL-TRACE-RPL-01 实施记录（2026-09-11）
+
+本票把“答辩时如何复盘双机验收”独立成只读、可复现的时间线回放工具。仓库当前没有原始 8 月日志流，因此内置数据明确标记为基于文档证据的 normalized fixture，不伪造实时日志采集或完整原始日志。
+
+- `tools/trace_replay.py` 固定四条场景：8 月 20 日 QW1.8B layer pipeline、Full Worker controlled restart/recovery、remote disconnect → expired → one reassignment → master fallback completion、Tailnet IPv6 dual-machine completion。事件保留 timestamp、kind、actor、status、summary、sequence 和稳定 hash workflow ref，不输出原始 workflow ID、地址或路径。
+- `load_trace_events()`/`--input` 接收规范化 JSON 事件；输入中出现绝对路径、IPv4/IPv6、token/secret/password 等字段会在报告前拒绝。`TraceReplayReport` 检查事件顺序、终态闭合、来源相对路径、载荷脱敏和 fixture/offline 边界。
+- CLI：`python -m harness_workbench.tools.trace_replay --list`、`--scenario`、`--kind`、`--date`、`--input`、`--json` 和 `--markdown`；默认报告适合直接贴入答辩材料，五项检查全部有显式结果。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_trace_replay.py -q
+10 passed
+```
+
+当前默认回放为 4 个场景、13 个事件，全部检查通过；未启动服务、未访问网络、未加载 QW1.8B。该工具只证明既有验收事实可以稳定复演和脱敏展示，不替代原始日志归档、长时双机复验或真实模型质量验收。下一票进入 `TOOL-PROMPT-LAB-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 

@@ -92,6 +92,16 @@ __all__ = [
     "RedTeamLabReport",
     "build_red_team_lab_report",
     "run_red_team_lab",
+    "TRACE_EVENT_KINDS",
+    "TRACE_INPUT_SCHEMA",
+    "TRACE_REPLAY_SCHEMA",
+    "TraceEvent",
+    "TraceReplayReport",
+    "TraceScenario",
+    "build_trace_replay_report",
+    "builtin_trace_scenarios",
+    "load_trace_events",
+    "run_trace_replay",
 ]
 
 
@@ -118,4 +128,19 @@ def __getattr__(name: str):
         from . import red_team_lab
 
         return getattr(red_team_lab, name)
+    if name in {
+        "TRACE_EVENT_KINDS",
+        "TRACE_INPUT_SCHEMA",
+        "TRACE_REPLAY_SCHEMA",
+        "TraceEvent",
+        "TraceReplayReport",
+        "TraceScenario",
+        "build_trace_replay_report",
+        "builtin_trace_scenarios",
+        "load_trace_events",
+        "run_trace_replay",
+    }:
+        from . import trace_replay
+
+        return getattr(trace_replay, name)
     raise AttributeError(name)
