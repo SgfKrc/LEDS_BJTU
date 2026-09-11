@@ -393,6 +393,7 @@ model profile
 - 2026-09-11：v26 —— 完成 **TOOL-BENCH-LDG-01 benchmark ledger**：将 P3 控制面、物理双机 `not_run`、真实模型 `not_run` 与可扩展实验 record JSON 聚合为单机/双机/多模型答辩引用表；source/report digest、claim scope 和缺失指标保持显式，fixture-only、无模型权重、无网络。
 - 2026-09-11：v27 —— 完成 **TOOL-MODEL-CARD-01 模型卡生成器**：从 manifest health、SHA sidecar、模型画像和有界 GGUF 头自动生成 JSON/Markdown；白名单提取架构、量化、上下文、tokenizer 等声明，manifest 缺口显式标记 `incomplete`，不加载 tensor、不联网、不声明模型质量或性能。
 - 2026-09-11：v28 —— 完成 **TOOL-DL-RUNNER-01 下载编排器**：规范化 revision/SHA pin，提供 `.part`/Range 续传、连续失败重试、SHA sidecar、原子发布和完成后 manifest health gate；真实 HTTPS 默认禁用，fixture transport 全程无网络。
+- 2026-09-11：v29 —— 完成 **TOOL-API-WB-01 API 契约工作台**：用显式 case 对照 harness `/v1` 与主项目 `/api` 的健康、模型列表、聊天、错误和 SSE 流式契约，采样状态码、错误码、响应形状和有界耗时；默认 fixture-only，报告脱敏且固定无网络、无权重加载。
 
 ## 8. S1 实施记录
 
@@ -746,6 +747,26 @@ model profile
 ```
 
 本票固定 `weights_loaded=false`；本轮未执行真实 HTTPS、未下载 DS3/Qwen3 等缺失模型、未运行任何模型冒烟。下一票进入 `TOOL-API-WB-01`。
+
+### TOOL-API-WB-01 实施记录（2026-09-11）
+
+本票把两个已有 HTTP 面的最小契约差异收口为可复现、可审计的离线工作台；不启动 harness 或主项目服务，也不通过 API 触发 QW1.8B 推理。
+
+- `harness_workbench/tools/api_workbench.py` 用 `ProbeCase` 固定 5 组映射：`/healthz` ↔ `/api/health`、`/v1/models` ↔ `/api/models`、OpenAI `/v1/chat/completions` ↔ `/api/chat`、无效请求和 `/v1/chat/completions` SSE ↔ `/api/chat/stream`。
+- `MemoryAPITransport` 提供稳定 fixture；`UrllibAPITransport` 默认禁用，只有调用方显式开启才允许 HTTP。相对路径、非凭据 header、payload 安全边界和输入 schema 均 fail-closed。
+- 报告只保留请求 digest、方法/路径/脱敏形状、状态码、错误码、响应形状、content type 和非负耗时；不写入 prompt、message、响应正文、凭据、绝对地址或模型质量指标。
+- 默认 fixture 结果为 `4 matched / 1 drifted / 0 failed`。唯一漂移是无效聊天：harness 返回 `400 invalid_messages`，主项目返回 `422 validation_error`；这被显式记录为 `status_code; error_code`，不是静默吞掉。两端流式完成事件归一化后匹配。
+
+离线验收：
+
+```text
+.\.venv-test\Scripts\python.exe -m pytest tests/test_harness_api_workbench.py -q
+9 passed
+.\.venv-test\Scripts\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+216 passed, 1 skipped
+```
+
+本票固定 `runner_kind=fixture`、`network_used=false`、`weights_loaded=false`；没有真实网络请求、模型加载或质量/延迟结论。下一票进入 `FUN-CLI-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 

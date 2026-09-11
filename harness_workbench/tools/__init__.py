@@ -141,6 +141,18 @@ __all__ = [
     "build_benchmark_ledger_report",
     "load_benchmark_payload",
     "run_benchmark_ledger",
+    "APIResponse",
+    "APITransport",
+    "APIProbeResult",
+    "APIWorkbenchError",
+    "APIWorkbenchReport",
+    "API_WORKBENCH_INPUT_SCHEMA",
+    "API_WORKBENCH_SCHEMA",
+    "MemoryAPITransport",
+    "ProbeCase",
+    "UrllibAPITransport",
+    "builtin_api_cases",
+    "run_api_workbench",
 ]
 
 
@@ -241,4 +253,21 @@ def __getattr__(name: str):
         from . import benchmark_ledger
 
         return getattr(benchmark_ledger, name)
+    if name in {
+        "APIResponse",
+        "APITransport",
+        "APIProbeResult",
+        "APIWorkbenchError",
+        "APIWorkbenchReport",
+        "API_WORKBENCH_INPUT_SCHEMA",
+        "API_WORKBENCH_SCHEMA",
+        "MemoryAPITransport",
+        "ProbeCase",
+        "UrllibAPITransport",
+        "builtin_api_cases",
+        "run_api_workbench",
+    }:
+        from . import api_workbench
+
+        return getattr(api_workbench, name)
     raise AttributeError(name)
