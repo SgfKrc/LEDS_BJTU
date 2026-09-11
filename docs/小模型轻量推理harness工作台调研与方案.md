@@ -384,6 +384,7 @@ model profile
 - 2026-09-11：v17 —— 完成 **HW-R1 榨干小模型潜力首轮研究设计门**：新增 `research/ceiling.py`，固定 5 个模型对象、6 个上限问题、6 个因素消融、v1/v2 判题口径、单模型/草稿-校验角色 Pareto 和公开证据登记；study digest、holdout、seed、artifact/profile/fixture evidence gate 可复现；专项 `6 passed`，当前不加载模型、不联网。
 - 2026-09-11：v18 —— 根据当前开发机资源收口 **21～37 号票的执行策略**：仅 `QW1.8B` 可用，优先执行 `EX-CTX-MEAS-01`、工具/回放/文档类纯软件票；Qwen3-4B、DS3-7B、Qwen3-0.6B 和多模型对比票保持模型门后置，不下载、不冒烟、不以 QW1.8B 冒充替代。
 - 2026-09-11：v19 —— 完成 **EX-CTX-MEAS-01 上下文策略测度开发门**：新增固定 30 轮 fixture、滑窗/STATE/长期记忆三策略的 6 档预算曲线、早期事实召回度量、JSON/Markdown/绘图 series 产物；全程 fixture-only、无模型权重、无网络。
+- 2026-09-11：v20 —— 完成 **TOOL-JUDGE-POLICY-01 判题口径差异工具**：新增 v1/v2 rubric loader、同输出双政策判定、rescue/regression/invalid 分类、completion 脱敏 hash 和答辩 Markdown 报告；全程 fixture-only、无模型权重、无网络。
 
 ## 8. S1 实施记录
 
@@ -570,6 +571,23 @@ model profile
 ```
 
 本票的早期事实召回率是 context policy 的离线装配指标；真实 QW1.8B 回答正确率、长时延迟、RSS/VRAM 与生产路由继续后置。下一票进入 `TOOL-JUDGE-POLICY-01`。
+
+### TOOL-JUDGE-POLICY-01 实施记录（2026-09-11）
+
+本票把“判题口径问题”独立成可复现的工具，不运行模型，不把 rubric 通过率解释为模型能力。
+
+- `tools/judge_policy.py` 固定 v1 `normalized_contains`/192 与 v2 `loose_contains`/512；v2 保留时间表达（如 `13时54分`）和独立中文数字归一化，并从答案标记/末行提取候选。
+- `load_judge_rubric()` 支持 mapping 或 JSON 文件、correctness 条目筛选和 SHA-256 门；`run_judge_policy_diff()` 对公共 prompt ID 生成 v1/v2 状态、rescue/regression/invalid 原因和计数。completion 只参与内存判定，报告仅保留每条输出的 SHA-256。
+- `JudgePolicyReport.to_markdown()` 输出可答辩表格；内置 fixture 同一批 4 条结果为 v1 `2/4`、v2 `4/4`、rescue `2`。实际项目 v1/v2 rubric prompt-set 不一致时报告显式标记 `prompt_set_match=false`，不隐藏该混杂因素。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_judge_policy.py -q
+5 passed
+```
+
+本票只证明判题工具可复现、可审计和能展示口径差异；真实模型三轮重标、人工复核、质量门升级继续后置。下一票进入 `TOOL-MANIFEST-HLTH-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
