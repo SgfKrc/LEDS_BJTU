@@ -169,6 +169,7 @@ __all__ = [
     "run_fun_cli",
     "RAG_BASELINE_INPUT_SCHEMA",
     "RAG_BASELINE_SCHEMA",
+    "RAG_CHUNK_COMPARISON_SCHEMA",
     "RagBaselineCase",
     "RagBaselineDocument",
     "RagBaselineError",
@@ -177,6 +178,7 @@ __all__ = [
     "builtin_rag_baseline_documents",
     "load_rag_baseline_input",
     "run_rag_baseline",
+    "run_rag_chunk_comparison",
 ]
 
 
@@ -316,6 +318,7 @@ def __getattr__(name: str):
     if name in {
         "RAG_BASELINE_INPUT_SCHEMA",
         "RAG_BASELINE_SCHEMA",
+        "RAG_CHUNK_COMPARISON_SCHEMA",
         "RagBaselineCase",
         "RagBaselineDocument",
         "RagBaselineError",
@@ -324,6 +327,7 @@ def __getattr__(name: str):
         "builtin_rag_baseline_documents",
         "load_rag_baseline_input",
         "run_rag_baseline",
+        "run_rag_chunk_comparison",
     }:
         from . import rag_baseline
 

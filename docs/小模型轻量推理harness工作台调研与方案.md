@@ -904,3 +904,23 @@ S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 S
 ```
 
 下一票进入 `RAG-CHUNK-01`；继续复用 `RAG-BASE-01` 的双侧 hit@5/MRR 口径。
+
+## 20. RAG-CHUNK-01 实施记录
+
+本票把主项目与 harness 的分块边界统一为可配置、可复现的本地规则，并将粒度信息随 chunk 持久化：
+
+- 两侧均支持 `fixed`、`paragraph`、`sentence`、`section`、`adaptive`、`semantic` 六种策略；`section` 识别 Markdown/大写标题，`adaptive` 综合章节、段落和句子边界，`semantic` 在没有模型的开发机上仅使用确定性标题/段落/标点启发式。
+- 重叠窗口继续受 `max_chunk_chars` 和 overlap 上限约束，所有 chunk 保存原文 `start_offset/end_offset`；主项目 `rag_chunks.granularity` 与 harness 同名字段记录实际策略，旧 SQLite 初始化自动补列。
+- 主项目 FTS/CJK FTS/向量返回与 API 引用、harness source API 和 `list_chunks` 均透传粒度；相同 source/revision 以不同策略重复写入会报告 `revision_conflict`，避免无声改变引用边界。
+- 新增 `run_rag_chunk_comparison()` 复用冻结的 6 份文档/30 条问题集，逐策略比较主项目与 harness；六种策略两侧均达到 `hit@5=1.000000`、`MRR=1.000000`，且详情签名一致。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_chunking.py -q
+10 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py -q
+44 passed
+```
+
+本票不下载、不加载 QW1.8B、不联网；`RAG-BASE-01` 的双侧 hit@5/MRR 口径保持不变。下一票为 `RAG-QRW-01`，继续在规则和 FTS/候选管线层推进。

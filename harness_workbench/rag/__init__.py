@@ -1,6 +1,6 @@
 """Independent, user-owned FTS-first retrieval for the harness."""
 
-from .chunking import TextChunk, chunk_text
+from .chunking import CHUNK_STRATEGIES, TextChunk, chunk_text
 from .context import RetrievalContext, build_context
 from .providers import EmbeddingProvider, EmbeddingResult
 from .query import QueryPlan, normalize_query, rewrite_query
@@ -20,6 +20,7 @@ __all__ = [
     "RetrievalContext",
     "TextChunk",
     "build_context",
+    "CHUNK_STRATEGIES",
     "chunk_text",
     "normalize_query",
     "rewrite_query",

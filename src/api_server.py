@@ -2442,6 +2442,7 @@ def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
         "access_scope": row.get("access_scope"),
         "relative_ref": row.get("relative_ref"),
         "ordinal": row.get("ordinal"),
+        "granularity": row.get("granularity") or "fixed",
         "snippet": text[:800],
         **{
             key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code")

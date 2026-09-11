@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .chunking import chunk_text
+from .chunking import CHUNK_STRATEGIES, chunk_text
 
 
 RAG_METADATA_FIELDS = frozenset({"source", "scope", "type", "tag", "time"})
@@ -134,6 +134,8 @@ class RagStore:
         owner_scope = _scope(owner_scope)
         source_ref = _relative_ref(source_ref)
         title = _title(title)
+        if strategy not in CHUNK_STRATEGIES:
+            raise ValueError("unsupported chunk strategy")
         metadata_value = _normalize_metadata(metadata)
         metadata_json = json.dumps(metadata_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         metadata_entries = _metadata_entries(metadata_value)
@@ -167,7 +169,7 @@ class RagStore:
                     "INSERT INTO rag_chunks_fts(chunk_id, source_id, owner_scope, title, text) VALUES (?, ?, ?, ?, ?)",
                     (chunk_id, source_id, owner_scope, title, chunk.text),
                 )
-        return {"source_id": source_id, "owner_scope": owner_scope, "title": title, "metadata": metadata_value, "chunk_count": len(chunks), "content_sha256": digest}
+        return {"source_id": source_id, "owner_scope": owner_scope, "title": title, "metadata": metadata_value, "strategy": strategy, "chunk_count": len(chunks), "content_sha256": digest}
 
     def search(
         self,

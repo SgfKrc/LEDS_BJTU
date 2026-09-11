@@ -1,10 +1,13 @@
-"""Deterministic, bounded text chunking with overlap metadata."""
+"""Deterministic, bounded text chunking with explicit strategy metadata."""
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
-import re
+
+
+CHUNK_STRATEGIES = frozenset({"fixed", "paragraph", "sentence", "section", "adaptive", "semantic"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,8 +32,8 @@ def chunk_text(
         raise ValueError("max_chars must be between 128 and 32000")
     if not 0 <= overlap_chars < max_chars // 2:
         raise ValueError("overlap_chars must be non-negative and less than half max_chars")
-    if strategy not in {"fixed", "paragraph", "sentence"}:
-        raise ValueError("strategy must be fixed, paragraph, or sentence")
+    if strategy not in CHUNK_STRATEGIES:
+        raise ValueError("unsupported chunk strategy")
     normalized = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n").strip()
     chunks: list[TextChunk] = []
     start = 0
@@ -53,15 +56,35 @@ def chunk_text(
     return tuple(chunks)
 
 
+def _last_boundary(value: str, start: int, end: int, markers: tuple[str, ...], *, floor_ratio: float = 0.5) -> int:
+    floor = start + max(1, int((end - start) * floor_ratio))
+    positions = [value.rfind(marker, floor, end) + len(marker) for marker in markers if value.rfind(marker, floor, end) >= 0]
+    return max(positions, default=-1)
+
+
+def _section_boundary(value: str, start: int, end: int) -> int:
+    floor = start + max(1, int((end - start) * 0.35))
+    candidates: list[int] = []
+    for match in re.finditer(r"(?m)^(?:#{1,6}\s+|[A-Z][A-Z0-9 _-]{3,}:\s*$)", value[floor:end]):
+        position = floor + match.start()
+        if position > start:
+            candidates.append(position)
+    return max(candidates, default=-1)
+
+
 def _boundary(value: str, start: int, end: int, strategy: str) -> int:
-    floor = start + (end - start) // 2
-    candidates = [value.rfind("\n", floor, end), value.rfind(" ", floor, end)]
+    if strategy == "fixed":
+        return _last_boundary(value, start, end, ("\n", " "))
     if strategy == "paragraph":
-        candidates.append(value.rfind("\n\n", floor, end))
-    elif strategy == "sentence":
-        candidates.extend(floor + match.start() + 1 for match in re.finditer(r"[.!?。！？](?:\s|$)", value[floor:end]))
-        candidates.extend(value.rfind(mark, floor, end) for mark in ("\n", " "))
-    return max(candidates)
+        return max(_last_boundary(value, start, end, ("\n\n",), floor_ratio=0.3), _last_boundary(value, start, end, ("\n", " ")))
+    if strategy == "sentence":
+        return _last_boundary(value, start, end, (". ", "! ", "? ", "。", "！", "？", "\n", " "))
+    if strategy == "section":
+        return max(_section_boundary(value, start, end), _last_boundary(value, start, end, ("\n\n", "\n", " "), floor_ratio=0.35))
+    if strategy == "adaptive":
+        return max(_section_boundary(value, start, end), _last_boundary(value, start, end, ("\n\n",), floor_ratio=0.35), _last_boundary(value, start, end, (". ", "。", "！", "？", "\n", " "), floor_ratio=0.5))
+    # semantic remains deterministic: use punctuation and headings, never a model.
+    return max(_section_boundary(value, start, end), _last_boundary(value, start, end, (". ", "! ", "? ", "。", "！", "？"), floor_ratio=0.4), _last_boundary(value, start, end, ("\n\n", "\n", " "), floor_ratio=0.5))
 
 
-__all__ = ["TextChunk", "chunk_text"]
+__all__ = ["CHUNK_STRATEGIES", "TextChunk", "chunk_text"]

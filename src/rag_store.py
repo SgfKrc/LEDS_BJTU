@@ -60,11 +60,76 @@ _JOB_STATES = frozenset({"queued", "running", "paused", "completed", "failed", "
 _MIN_JOB_LEASE_SECONDS = 5
 _MAX_JOB_LEASE_SECONDS = 3_600
 _DEFAULT_EMBEDDING_MODEL_ID = "nomic-embed-text:latest"
+CHUNK_STRATEGIES = frozenset({"fixed", "paragraph", "sentence", "section", "adaptive", "semantic"})
 RAG_METADATA_FIELDS = frozenset({"source", "scope", "type", "tag", "time"})
 _METADATA_INDEX_VERSION = "1"
 _MAX_METADATA_FILTERS = 5
 _MAX_METADATA_VALUES = 20
 _MAX_METADATA_TEXT = 256
+
+
+def _last_chunk_boundary(
+    value: str,
+    start: int,
+    end: int,
+    markers: tuple[str, ...],
+    *,
+    floor_ratio: float = 0.5,
+) -> int:
+    floor = start + max(1, int((end - start) * floor_ratio))
+    positions = [
+        value.rfind(marker, floor, end) + len(marker)
+        for marker in markers
+        if value.rfind(marker, floor, end) >= 0
+    ]
+    boundary = max(positions, default=-1)
+    if boundary > start:
+        return boundary
+    for index in range(end - 1, floor - 1, -1):
+        if value[index].isspace():
+            return index + 1
+    return -1
+
+
+def _section_chunk_boundary(value: str, start: int, end: int) -> int:
+    floor = start + max(1, int((end - start) * 0.35))
+    candidates: list[int] = []
+    for match in re.finditer(r"(?m)^(?:#{1,6}\s+|[A-Z][A-Z0-9 _-]{3,}:\s*$)", value[floor:end]):
+        position = floor + match.start()
+        if start < position < end:
+            candidates.append(position)
+    return max(candidates, default=-1)
+
+
+def _chunk_boundary(value: str, start: int, end: int, strategy: str) -> int:
+    if strategy == "fixed":
+        return _last_chunk_boundary(value, start, end, ("\n", "\r", " "))
+    if strategy == "paragraph":
+        return max(
+            _last_chunk_boundary(value, start, end, ("\n\n",), floor_ratio=0.3),
+            _last_chunk_boundary(value, start, end, ("\n", "\r", " ")),
+        )
+    if strategy == "sentence":
+        return _last_chunk_boundary(
+            value, start, end, (". ", "! ", "? ", "。", "！", "？", "\n", "\r", " ")
+        )
+    if strategy == "section":
+        return max(
+            _section_chunk_boundary(value, start, end),
+            _last_chunk_boundary(value, start, end, ("\n\n", "\n", "\r", " "), floor_ratio=0.35),
+        )
+    if strategy == "adaptive":
+        return max(
+            _section_chunk_boundary(value, start, end),
+            _last_chunk_boundary(value, start, end, ("\n\n",), floor_ratio=0.35),
+            _last_chunk_boundary(value, start, end, (". ", "。", "！", "？", "\n", "\r", " ")),
+        )
+    # semantic is deliberately deterministic in this local boundary: punctuation and headings only.
+    return max(
+        _section_chunk_boundary(value, start, end),
+        _last_chunk_boundary(value, start, end, (". ", "! ", "? ", "。", "！", "？"), floor_ratio=0.4),
+        _last_chunk_boundary(value, start, end, ("\n\n", "\n", "\r", " ")),
+    )
 
 
 class RagStoreError(ValueError):
@@ -319,6 +384,7 @@ class RagStore:
                       end_offset INTEGER NOT NULL,
                       text_content TEXT NOT NULL,
                       metadata_json TEXT NOT NULL,
+                      granularity TEXT NOT NULL DEFAULT 'fixed',
                       UNIQUE(document_id, ordinal)
                     );
                     CREATE TABLE IF NOT EXISTS rag_metadata_index (
@@ -430,6 +496,9 @@ class RagStore:
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
                         ("metadata_index_version", _METADATA_INDEX_VERSION, _now()),
                     )
+                chunk_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(rag_chunks)").fetchall()}
+                if "granularity" not in chunk_columns:
+                    connection.execute("ALTER TABLE rag_chunks ADD COLUMN granularity TEXT NOT NULL DEFAULT 'fixed'")
                 connection.execute(
                     "INSERT INTO rag_meta(key, value, updated_at) VALUES (?, ?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -455,28 +524,27 @@ class RagStore:
             finally:
                 connection.close()
 
-    def _chunks(self, text: str) -> list[tuple[int, int, str]]:
+    def _chunks(self, text: str, strategy: str = "fixed") -> list[tuple[int, int, str, str]]:
         """Return bounded, overlapping chunks without splitting near a natural boundary.
 
         Character offsets intentionally remain offsets into the original text,
         including the overlap.  This keeps citations stable while letting a
         query that straddles a paragraph or sentence boundary retain context.
         """
+        if strategy not in CHUNK_STRATEGIES:
+            raise RagStoreError("chunk_strategy_invalid", "chunk strategy is unsupported")
         if len(text) <= self.max_chunk_chars:
-            return [(0, len(text), text)]
-        chunks: list[tuple[int, int, str]] = []
+            return [(0, len(text), text, strategy)]
+        chunks: list[tuple[int, int, str, str]] = []
         start = 0
-        boundary_floor = max(1, int(self.max_chunk_chars * 0.60))
-        boundaries = frozenset("\n\r。！？.!?;；")
         while start < len(text):
             hard_end = min(len(text), start + self.max_chunk_chars)
             end = hard_end
             if hard_end < len(text):
-                for index in range(hard_end - 1, start + boundary_floor - 1, -1):
-                    if text[index] in boundaries or text[index].isspace():
-                        end = index + 1
-                        break
-            chunks.append((start, end, text[start:end]))
+                boundary = _chunk_boundary(text, start, hard_end, strategy)
+                if boundary > start:
+                    end = min(boundary, hard_end)
+            chunks.append((start, end, text[start:end], strategy))
             if end >= len(text):
                 break
             next_start = end - self.chunk_overlap_chars
@@ -576,6 +644,7 @@ class RagStore:
         self, *, source_id: str, relative_ref: str, sha256: str | None, mime: str, title: str,
         text: str, revision: str, language: str = "und", owner_scope: str = "local_user",
         access_scope: str = "owner", metadata: Mapping[str, Any] | None = None,
+        strategy: str = "fixed",
     ) -> IngestResult:
         source_id = _safe_id(source_id, _SOURCE_ID, code="source_id_invalid", label="source_id")
         revision = _safe_id(revision, _REVISION, code="revision_invalid", label="revision")
@@ -583,6 +652,8 @@ class RagStore:
         mime = _validate_mime(mime)
         owner_scope = _validate_scope(owner_scope, _OWNER_SCOPES, code="owner_scope_invalid", label="owner_scope")
         access_scope = _validate_scope(access_scope, _ACCESS_SCOPES, code="access_scope_invalid", label="access_scope")
+        if strategy not in CHUNK_STRATEGIES:
+            raise RagStoreError("chunk_strategy_invalid", "chunk strategy is unsupported")
         if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z0-9-]{2,16}", language):
             raise RagStoreError("language_invalid", "language is invalid")
         if not isinstance(title, str) or not title.strip() or len(title) > 256:
@@ -597,7 +668,7 @@ class RagStore:
         if len(metadata_json.encode("utf-8")) > 16 * 1024:
             raise RagStoreError("metadata_too_large", "metadata exceeds the local limit")
         document_id = _digest(f"{source_id}\0{revision}\0{text_digest}".encode("utf-8"))
-        chunks = self._chunks(text)
+        chunks = self._chunks(text, strategy)
         now = _now()
         try:
             with self._write() as connection:
@@ -618,11 +689,13 @@ class RagStore:
                     if existing_doc["text_digest"] != text_digest:
                         raise RagStoreError("revision_conflict", "revision already contains different text")
                     existing_metadata = connection.execute(
-                        "SELECT metadata_json FROM rag_chunks WHERE document_id=? ORDER BY ordinal LIMIT 1",
+                        "SELECT metadata_json, granularity FROM rag_chunks WHERE document_id=? ORDER BY ordinal LIMIT 1",
                         (existing_doc["document_id"],),
                     ).fetchone()
                     if existing_metadata is not None and str(existing_metadata[0]) != metadata_json:
                         raise RagStoreError("revision_conflict", "revision already contains different metadata")
+                    if existing_metadata is not None and str(existing_metadata[1] or "fixed") != strategy:
+                        raise RagStoreError("revision_conflict", "revision already contains different chunk strategy")
                     return IngestResult(source_id, existing_doc["document_id"], revision, text_digest, 0, "duplicate")
                 connection.execute(
                     "INSERT INTO rag_sources(source_id, owner_scope, relative_ref, sha256, mime, title, status, created_at, updated_at) "
@@ -647,12 +720,12 @@ class RagStore:
                     "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
                     (document_id, source_id, revision, text_digest, language, access_scope, now, now),
                 )
-                for ordinal, (start, end, chunk) in enumerate(chunks):
+                for ordinal, (start, end, chunk, granularity) in enumerate(chunks):
                     chunk_id = _digest(f"{document_id}\0{ordinal}\0{_digest(chunk.encode('utf-8'))}".encode("utf-8"))
                     connection.execute(
-                        "INSERT INTO rag_chunks(chunk_id, document_id, ordinal, text_digest, token_count, start_offset, end_offset, text_content, metadata_json) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (chunk_id, document_id, ordinal, _digest(chunk.encode("utf-8")), len(chunk.split()), start, end, chunk, metadata_json),
+                        "INSERT INTO rag_chunks(chunk_id, document_id, ordinal, text_digest, token_count, start_offset, end_offset, text_content, metadata_json, granularity) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (chunk_id, document_id, ordinal, _digest(chunk.encode("utf-8")), len(chunk.split()), start, end, chunk, metadata_json, granularity),
                     )
                     connection.executemany(
                         "INSERT INTO rag_metadata_index(chunk_id, field, value) VALUES (?, ?, ?)",
@@ -1245,7 +1318,7 @@ class RagStore:
                 )
             rows = connection.execute(
                 "SELECT e.chunk_id, e.vector_blob, c.document_id, d.source_id, d.revision, d.access_scope, "
-                "s.relative_ref, c.text_content, c.ordinal FROM rag_embeddings e "
+                "s.relative_ref, c.text_content, c.ordinal, c.granularity FROM rag_embeddings e "
                 "JOIN rag_chunks c ON c.chunk_id=e.chunk_id "
                 "JOIN rag_documents d ON d.document_id=c.document_id "
                 "JOIN rag_sources s ON s.source_id=d.source_id WHERE " + where,
@@ -1342,7 +1415,7 @@ class RagStore:
         params.append(int(limit))
         return connection.execute(
             "SELECT f.chunk_id, c.document_id, d.source_id, d.revision, "
-            "d.access_scope, s.relative_ref, c.text_content, c.ordinal, "
+            "d.access_scope, s.relative_ref, c.text_content, c.ordinal, c.granularity, "
             "bm25(rag_chunks_cjk_fts) AS rank "
             "FROM rag_chunks_cjk_fts AS f "
             "JOIN rag_chunks AS c ON c.chunk_id = f.chunk_id "
@@ -1384,7 +1457,7 @@ class RagStore:
                 params.append(int(limit))
                 rows = connection.execute(
                     "SELECT f.chunk_id, c.document_id, d.source_id, d.revision, "
-                    "d.access_scope, s.relative_ref, f.text_content, c.ordinal, bm25(rag_chunks_fts) AS rank "
+                    "d.access_scope, s.relative_ref, f.text_content, c.ordinal, c.granularity, bm25(rag_chunks_fts) AS rank "
                     "FROM rag_chunks_fts AS f "
                     "JOIN rag_chunks AS c ON c.chunk_id = f.chunk_id "
                     "JOIN rag_documents AS d ON d.document_id = c.document_id "

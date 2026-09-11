@@ -19,9 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from harness_workbench.rag.chunking import CHUNK_STRATEGIES
+
 
 RAG_BASELINE_INPUT_SCHEMA = "qlh.rag_baseline_input.v1"
 RAG_BASELINE_SCHEMA = "qlh.rag_baseline.v1"
+RAG_CHUNK_COMPARISON_SCHEMA = "qlh.rag_chunk_comparison.v1"
 BASELINE_CASE_COUNT = 30
 _MAX_TEXT_CHARS = 16_384
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -354,7 +357,7 @@ def run_rag_baseline(
                 source_id=doc.document_id, relative_ref=doc.source_ref, sha256=None,
                 mime="text/markdown", title=doc.title, text=doc.text, revision="baseline-v1",
                 language="en", owner_scope="project", access_scope="project",
-                metadata={"fixture": "rag-base-v1"},
+                metadata={"fixture": "rag-base-v1"}, strategy="fixed",
             )
 
         def main_search(query: str, limit: int) -> list[dict[str, Any]]:
@@ -383,6 +386,88 @@ def run_rag_baseline(
     )
 
 
+def run_rag_chunk_comparison(
+    *,
+    documents: Sequence[RagBaselineDocument] | None = None,
+    cases: Sequence[RagBaselineCase] | None = None,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Evaluate every deterministic chunk strategy with the frozen case set."""
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 100:
+        raise RagBaselineError("config_invalid", "top_k must be between 1 and 100")
+    raw_documents = documents if documents is not None else builtin_rag_baseline_documents()
+    raw_cases = cases if cases is not None else builtin_rag_baseline_cases()
+    docs, queries = _validate_fixture(
+        tuple(item if isinstance(item, RagBaselineDocument) else RagBaselineDocument.from_mapping(item) for item in raw_documents),
+        tuple(item if isinstance(item, RagBaselineCase) else RagBaselineCase.from_mapping(item) for item in raw_cases),
+    )
+    corpus_digest = _digest([doc.as_dict() for doc in docs])
+    case_set_digest = _digest([case.as_dict() for case in queries])
+    comparisons: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="qlh-rag-chunk-") as root:
+        root_path = Path(root)
+        from src.rag_store import RagStore as MainRagStore
+        from harness_workbench.rag.store import RagStore as HarnessRagStore
+
+        for strategy in sorted(CHUNK_STRATEGIES):
+            main_store = MainRagStore(root_path / f"main-{strategy}.sqlite", max_chunk_chars=1024, chunk_overlap_chars=80)
+            main_store.initialize()
+            harness_store = HarnessRagStore(root_path / f"harness-{strategy}.sqlite")
+            harness_source_ids: dict[str, str] = {}
+            for doc in docs:
+                harness_result = harness_store.add_document(
+                    source_ref=doc.source_ref, title=doc.title, text=doc.text,
+                    owner_scope="project", max_chars=1024, overlap_chars=80, strategy=strategy,
+                )
+                harness_source_ids[doc.source_ref] = str(harness_result["source_id"])
+                main_store.ingest_document(
+                    source_id=doc.document_id, relative_ref=doc.source_ref, sha256=None,
+                    mime="text/markdown", title=doc.title, text=doc.text, revision="baseline-v1",
+                    language="en", owner_scope="project", access_scope="project",
+                    metadata={"fixture": "rag-base-v1"}, strategy=strategy,
+                )
+
+            def main_search(query: str, limit: int) -> list[dict[str, Any]]:
+                return [
+                    {"source_ref": str(row["relative_ref"]), "chunk_id": str(row["chunk_id"])}
+                    for row in main_store.search(query, access_scope="project", limit=limit)
+                ]
+
+            def harness_search(query: str, limit: int) -> list[dict[str, Any]]:
+                rows = harness_store.search(query, owner_scope="project", limit=limit)
+                return [
+                    {"source_ref": next(ref for ref, source_id in harness_source_ids.items() if source_id == hit.source_id), "chunk_id": hit.chunk_id}
+                    for hit in rows
+                ]
+
+            main_result = _evaluate(queries, main_search, top_k=top_k)
+            harness_result = _evaluate(queries, harness_search, top_k=top_k)
+            detail_signature = lambda item: [
+                (entry["case_id"], entry["query_sha256"], entry["target_source_refs"], entry["hit"], entry["rank"], entry["returned_count"])
+                for entry in item["details"]
+            ]
+            comparisons[strategy] = {
+                "main_project": main_result,
+                "harness": harness_result,
+                "details_match": detail_signature(main_result) == detail_signature(harness_result),
+            }
+            del main_search, harness_search, main_store, harness_store
+            gc.collect()
+    return {
+        "schema": RAG_CHUNK_COMPARISON_SCHEMA,
+        "status": "passed" if all(item["details_match"] for item in comparisons.values()) else "failed",
+        "valid": all(item["details_match"] for item in comparisons.values()),
+        "corpus_digest": corpus_digest,
+        "case_set_digest": case_set_digest,
+        "document_count": len(docs),
+        "case_count": len(queries),
+        "top_k": top_k,
+        "strategies": comparisons,
+        "model_used": False,
+        "network_used": False,
+    }
+
+
 def _write_report(report: RagBaselineReport, json_path: Path | None, markdown_path: Path | None) -> None:
     if json_path is not None:
         json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,10 +493,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "BASELINE_CASE_COUNT", "RAG_BASELINE_INPUT_SCHEMA", "RAG_BASELINE_SCHEMA",
+    "BASELINE_CASE_COUNT", "RAG_BASELINE_INPUT_SCHEMA", "RAG_BASELINE_SCHEMA", "RAG_CHUNK_COMPARISON_SCHEMA",
     "RagBaselineCase", "RagBaselineDocument", "RagBaselineError", "RagBaselineReport",
     "builtin_rag_baseline_cases", "builtin_rag_baseline_documents", "load_rag_baseline_input",
     "run_rag_baseline",
+    "run_rag_chunk_comparison",
 ]
 
 
