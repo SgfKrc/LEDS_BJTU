@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1` 已完成，E2–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2` 已完成，E3–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -128,7 +128,7 @@
 4. **C1 profile 同步 + verify drift 检查** —— 消除"配置两处不一致"这一最常见误配
 5. **R1 结构化日志 + R3 队列可观测** —— 先有观测，才谈优化
 6. **C3 doctor 缓存** —— 降低每次启动/配置的固定开销
-7. 其余（C2/C4/R3/E2–E4/G1–G4）按需插入
+7. 其余（C2/C4/R3/E3–E4/G1–G4）按需插入
 
 ---
 
@@ -170,3 +170,4 @@
 | 2026-09-12 | `TOOL-RXB-R2` 完成：`bridge.config.json.limits` 支持 steps/timeout/output/queue 覆盖，非法值回退并一次告警，超过代码硬上限夹紧；`reasonix_status.limits` 反映有效值，离线回归 `npm test` 23 项通过 |
 | 2026-09-12 | `TOOL-RXB-R3` 完成：`reasonix_status` 增加 queueDepth/inFlight/lastRun 脱敏摘要，队列满错误附当前深度、容量和 retry-after 提示；离线并发 stub 验证状态转移，`npm test` 24 项通过 |
 | 2026-09-12 | `TOOL-RXB-E1` 完成：新增只读 `mode=plan`，原样透传机器可解析的 `qlh.reasonix.plan.v1` 建议清单，桥接层不解析或写盘，`implement` 继续禁用；`npm test` 25 项通过 |
+| 2026-09-12 | `TOOL-RXB-E2` 完成：新增设计专文与未接入生产的纯函数 ACP 原型；在固定 128 MiB 历史上限的 75% 触发事务性 compact，compact 后仍超限则 rotate，compact 失败回退 per-call 且持久历史无副作用；`npm test` 28 项通过 |
