@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3` 已完成，C4/R1–R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4` 已完成，R1–R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -165,3 +165,4 @@
 | 2026-09-12 | `TOOL-RXB-T3` 完成：本机 bridge 通过 Reasonix `v1.38.7` 执行 ASCII-only 真实 `mode=inspect` 只读任务，退出码 `0`，登记非空未截断输出与 `10.3s` 耗时；一次 `max_steps=6` 暂停按失败形态保留，不作模型质量结论 |
 | 2026-09-12 | `TOOL-RXB-C2` 完成：Codex bridge 配置写入增加必需键校验、重复段合并、换行风格保持和同目录原子替换/失败恢复；`npm test` 17 项通过 |
 | 2026-09-12 | `TOOL-RXB-C3` 完成：doctor 摘要缓存加入 CLI mtime/version/抓取时间元数据，默认 TTL 10 分钟，支持 `--refresh`，损坏/过期/CLI 变更自动重取；本机 `configure list` 首次/命中/强刷为 `2317ms`/`90ms`/`2227ms`，`npm test` 19 项通过 |
+| 2026-09-12 | `TOOL-RXB-C4` 完成：新增路径无关、脱敏的 `configure export` JSON 摘要与只读 `configure import <file|->` 对照；拒绝 key、endpoint、用户路径等外部敏感值，`npm test` 20 项通过 |
