@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from .providers import EmbeddingProvider
@@ -29,7 +29,13 @@ class RagSearchConfig:
             raise ValueError("top_k and per_route_k must be between 1 and 50")
         if not 1 <= self.rewrite_limit <= 8 or self.rrf_k <= 0:
             raise ValueError("rewrite_limit or rrf_k is invalid")
-        if self.fts_weight < 0 or self.embedding_weight < 0 or self.fts_weight + self.embedding_weight <= 0:
+        if (
+            not math.isfinite(float(self.fts_weight))
+            or not math.isfinite(float(self.embedding_weight))
+            or self.fts_weight < 0
+            or self.embedding_weight < 0
+            or self.fts_weight + self.embedding_weight <= 0
+        ):
             raise ValueError("at least one retrieval route must have a positive weight")
         if not 1 <= self.max_embedding_candidates <= 10_000:
             raise ValueError("max_embedding_candidates must be between 1 and 10000")
@@ -91,15 +97,28 @@ class HybridRagRetriever:
         metadata_filters: Mapping[str, Any] | None = None,
         session_id: str | None = None,
         limit: int | None = None,
+        rewrite_limit: int | None = None,
+        per_route_k: int | None = None,
+        fts_weight: float | None = None,
+        embedding_weight: float | None = None,
     ) -> RagSearchResult:
-        effective_top_k = self.config.top_k if limit is None else int(limit)
+        config = self.config
+        if any(value is not None for value in (rewrite_limit, per_route_k, fts_weight, embedding_weight)):
+            config = replace(
+                config,
+                rewrite_limit=config.rewrite_limit if rewrite_limit is None else int(rewrite_limit),
+                per_route_k=config.per_route_k if per_route_k is None else int(per_route_k),
+                fts_weight=config.fts_weight if fts_weight is None else float(fts_weight),
+                embedding_weight=config.embedding_weight if embedding_weight is None else float(embedding_weight),
+            )
+        effective_top_k = config.top_k if limit is None else int(limit)
         if not 1 <= effective_top_k <= 50:
             raise ValueError("limit must be between 1 and 50")
-        plan = rewrite_query(query, expansions=self.expansions, max_variants=self.config.rewrite_limit)
+        plan = rewrite_query(query, expansions=self.expansions, max_variants=config.rewrite_limit)
         if not plan.variants:
             return RagSearchResult(query, (), (), {"fts": 0, "embedding": 0}, False, 0)
-        cache_key = self._cache_key(plan, owner_scope, source_ids, title_prefix, metadata_filters, effective_top_k)
-        if self.config.cache:
+        cache_key = self._cache_key(plan, owner_scope, source_ids, title_prefix, metadata_filters, effective_top_k, config)
+        if config.cache:
             cached = self.store.cache_get(cache_key, owner_scope=owner_scope)
             if cached:
                 hits = tuple(_hit_from_dict(item) for item in cached.get("hits", ()) if isinstance(item, Mapping))
@@ -118,41 +137,47 @@ class HybridRagRetriever:
             hits = self.store.search(
                 variant,
                 owner_scope=owner_scope,
-                limit=self.config.per_route_k,
+                limit=config.per_route_k,
                 source_ids=tuple(source_ids),
                 title_prefix=title_prefix,
                 metadata_filters=metadata_filters,
             )
             route_counts["fts"] += len(hits)
-            self._merge_ranked(ranked, hits, "fts", self.config.fts_weight, route_index)
+            self._merge_ranked(ranked, hits, "fts", config.fts_weight, route_index, config)
+        route_counts["fts_variants"] = len(plan.variants)
 
-        if self.embedding_provider is not None and self.config.embedding_weight > 0:
+        if self.embedding_provider is not None and config.embedding_weight > 0:
             candidates = self.store.list_chunks(
                 owner_scope=owner_scope,
-                limit=self.config.max_embedding_candidates,
+                limit=config.max_embedding_candidates,
                 source_ids=tuple(source_ids),
                 title_prefix=title_prefix,
                 metadata_filters=metadata_filters,
             )
             try:
-                result = self.embedding_provider.embed([plan.normalized, *[item.text for item in candidates]])
-                if len(result.vectors) != len(candidates) + 1:
+                result = self.embedding_provider.embed([*plan.variants, *[item.text for item in candidates]])
+                if len(result.vectors) != len(candidates) + len(plan.variants):
                     raise ValueError("embedding provider returned an unexpected vector count")
-                query_vector = _vector(result.vectors[0])
-                scored = sorted(
-                    ((self._cosine(query_vector, _vector(vector)), hit) for hit, vector in zip(candidates, result.vectors[1:])),
-                    key=lambda item: (-item[0], item[1].ordinal, item[1].chunk_id),
-                )[: self.config.per_route_k]
-                embedding_hits = [RagHit(hit.source_id, hit.chunk_id, hit.title, hit.ordinal, hit.text, score, hit.granularity) for score, hit in scored if score > 0]
+                embedding_hits: dict[str, RagHit] = {}
+                for variant_index, query_vector_value in enumerate(result.vectors[:len(plan.variants)]):
+                    query_vector = _vector(query_vector_value)
+                    scored = sorted(
+                        ((self._cosine(query_vector, _vector(vector)), hit) for hit, vector in zip(candidates, result.vectors[len(plan.variants):])),
+                        key=lambda item: (-item[0], item[1].ordinal, item[1].chunk_id),
+                    )[: config.per_route_k]
+                    variant_hits = [RagHit(hit.source_id, hit.chunk_id, hit.title, hit.ordinal, hit.text, score, hit.granularity) for score, hit in scored if score > 0]
+                    self._merge_ranked(ranked, variant_hits, "embedding", config.embedding_weight, variant_index, config)
+                    for hit in variant_hits:
+                        embedding_hits.setdefault(hit.chunk_id, hit)
                 route_counts["embedding"] = len(embedding_hits)
-                self._merge_ranked(ranked, embedding_hits, "embedding", self.config.embedding_weight, 0)
+                route_counts["embedding_variants"] = len(plan.variants)
             except Exception:
                 route_counts["embedding_error"] = 1
 
         ordered = sorted(ranked.values(), key=lambda item: (-item[1], item[0].ordinal, item[0].chunk_id))[:effective_top_k]
         final_hits = tuple(RagHit(hit.source_id, hit.chunk_id, hit.title, hit.ordinal, hit.text, float(score), hit.granularity, tuple(sorted(routes))) for hit, score, routes in ordered)
         response = RagSearchResult(plan.original, plan.variants, final_hits, route_counts, False, len(ranked))
-        if self.config.cache:
+        if config.cache:
             self.store.cache_put(
                 cache_key,
                 {
@@ -173,6 +198,7 @@ class HybridRagRetriever:
         title_prefix: str | None,
         metadata_filters: Mapping[str, Any] | None,
         effective_top_k: int,
+        config: RagSearchConfig,
     ) -> str:
         material = json.dumps(
             {
@@ -182,7 +208,7 @@ class HybridRagRetriever:
                 "title_prefix": title_prefix or "",
                 "metadata_filters": metadata_filters or {},
                 "limit": effective_top_k,
-                "config": self.config.as_dict(),
+                "config": config.as_dict(),
                 "provider": type(self.embedding_provider).__name__ if self.embedding_provider is not None else "none",
             },
             sort_keys=True,
@@ -191,11 +217,19 @@ class HybridRagRetriever:
         )
         return "rag_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
-    def _merge_ranked(self, ranked: dict[str, tuple[RagHit, float, set[str]]], hits: Sequence[RagHit], route: str, weight: float, route_index: int) -> None:
+    def _merge_ranked(
+        self,
+        ranked: dict[str, tuple[RagHit, float, set[str]]],
+        hits: Sequence[RagHit],
+        route: str,
+        weight: float,
+        route_index: int,
+        config: RagSearchConfig,
+    ) -> None:
         if weight <= 0:
             return
         for rank, hit in enumerate(hits):
-            contribution = weight / (self.config.rrf_k + rank + 1)
+            contribution = weight / (config.rrf_k + rank + 1)
             previous = ranked.get(hit.chunk_id)
             if previous is None:
                 ranked[hit.chunk_id] = (hit, contribution, {route})

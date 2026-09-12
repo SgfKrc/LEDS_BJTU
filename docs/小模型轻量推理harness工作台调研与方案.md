@@ -924,3 +924,23 @@ S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 S
 ```
 
 本票不下载、不加载 QW1.8B、不联网；`RAG-BASE-01` 的双侧 hit@5/MRR 口径保持不变。下一票为 `RAG-QRW-01`，继续在规则和 FTS/候选管线层推进。
+
+## 21. RAG-QRW-01 实施记录
+
+本票把主项目与 harness 的查询改写和多路召回口径对齐，仍保持本机 SQLite/FTS5、可替换 embedding 和无模型边界：
+
+- 两侧对输入做 Unicode/空白归一，并使用有界确定性词典完成中文/英文同义词、术语和常见口语映射；`and/or/以及/并且` 子查询会拆成独立变体；改写计划有 1～8 个变体上限，不执行外部 LLM 改写。
+- FTS 对各变体分别召回后按 chunk ID 去重并做 RRF；harness embedding provider 在一次调用内编码所有查询变体和候选，主项目使用已提供 query vector 与改写 FTS 结果混排。权重、每路候选数和 top-k 可配置，向量扫描超预算仍显式 FTS fallback。
+- harness `/v1/rag/search` 与主项目 `/api/rag/search` 支持请求级 `rewrite_limit`、每路候选数和 FTS/vector 权重；缓存键包含改写计划和有效配置，避免不同参数复用旧快照。
+- `run_rag_query_comparison()` 复用冻结的 6 份文档/30 条问题集，生成 `qlh.rag_query_comparison.v1`；两侧原始与改写查询均达到 `hit@5=1.000000`、`MRR=1.000000`，详情签名保持一致。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_rag_squeeze.py tests/test_harness_s4_remote_rag.py tests/test_rag_chunking.py -q
+67 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+237 passed, 1 skipped
+```
+
+本票不下载、不加载 QW1.8B、不联网；下一票为 `RAG-IDX-01`，先做关键词/多粒度和轻量知识图谱调研门。

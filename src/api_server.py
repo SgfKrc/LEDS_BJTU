@@ -136,7 +136,7 @@ from config import (
 import local_store as _local_store
 import model_download_jobs
 import model_search
-from rag_store import RagStore, RagStoreError
+from rag_store import RagStore, RagStoreError, rewrite_query
 from tool_rag_cache import ToolRagCache, ToolRagCacheError
 from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
 from rag_ann import evaluate_ann_decision
@@ -1150,6 +1150,10 @@ class RagSearchRequest(BaseModel):
     query_vector: Optional[list[float]] = None
     metadata_filters: dict[str, Any] = Field(default_factory=dict)
     filters: Optional[dict[str, Any]] = None
+    rewrite_limit: int = Field(default=4, ge=1, le=8)
+    per_route_limit: Optional[int] = Field(default=None, ge=1, le=100)
+    fts_weight: float = Field(default=0.55, ge=0)
+    vector_weight: float = Field(default=0.45, ge=0)
 
 
 class RagRebuildRequest(BaseModel):
@@ -2445,7 +2449,7 @@ def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
         "granularity": row.get("granularity") or "fixed",
         "snippet": text[:800],
         **{
-            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code")
+            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code", "rewritten_query_count", "fts_route_count")
             if key in row
         },
     }
@@ -2496,11 +2500,12 @@ async def rag_search(req: RagSearchRequest):
     try:
         store = _get_rag_store()
         metadata_filters = req.metadata_filters or (req.filters or {})
+        rewritten_queries = rewrite_query(req.query, max_variants=req.rewrite_limit)
         if req.mode == "fts":
             rows = await run_in_threadpool(
-                lambda: store.search(
-                    req.query, access_scope=req.access_scope, limit=req.limit,
-                    metadata_filters=metadata_filters,
+                lambda: _search_rewritten_fts(
+                    store, rewritten_queries, access_scope=req.access_scope, limit=req.limit,
+                    route_limit=req.per_route_limit, metadata_filters=metadata_filters,
                 )
             )
         else:
@@ -2517,6 +2522,10 @@ async def rag_search(req: RagSearchRequest):
                     model_sha256=req.model_sha256, dimensions=req.dimensions,
                     access_scope=req.access_scope, limit=req.limit,
                     metadata_filters=metadata_filters,
+                    rewrite_limit=req.rewrite_limit,
+                    per_route_limit=req.per_route_limit,
+                    fts_weight=req.fts_weight,
+                    vector_weight=req.vector_weight,
                 )
             )
         return {
@@ -2525,6 +2534,13 @@ async def rag_search(req: RagSearchRequest):
             "results": [_rag_public_result(row) for row in rows],
             "count": len(rows),
             "storage": "sqlite",
+            "rewritten_queries": list(rewritten_queries),
+            "route_config": {
+                "rewrite_limit": req.rewrite_limit,
+                "per_route_limit": req.per_route_limit,
+                "fts_weight": req.fts_weight,
+                "vector_weight": req.vector_weight,
+            },
         }
     except HTTPException:
         raise
@@ -2534,6 +2550,28 @@ async def rag_search(req: RagSearchRequest):
     except Exception as exc:
         logger.error("RAG search failed: %s", exc)
         raise HTTPException(status_code=503, detail="RAG 检索暂不可用") from exc
+
+
+def _search_rewritten_fts(
+    store: RagStore,
+    variants: tuple[str, ...],
+    *,
+    access_scope: str,
+    limit: int,
+    route_limit: int | None,
+    metadata_filters: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Run deterministic rewritten FTS routes and deduplicate by chunk ID."""
+    merged: dict[str, dict[str, Any]] = {}
+    per_route_limit = int(route_limit or limit)
+    for variant in variants:
+        for row in store.search(variant, access_scope=access_scope, limit=per_route_limit, metadata_filters=metadata_filters):
+            merged.setdefault(str(row["chunk_id"]), dict(row))
+            if len(merged) >= int(limit):
+                break
+        if len(merged) >= int(limit):
+            break
+    return list(merged.values())[:int(limit)]
 
 
 @app.post("/api/rag/rebuild")

@@ -62,6 +62,8 @@ def test_query_rewrite_is_normalized_deterministic_and_bounded():
     assert first.normalized == "SQLite 检索"
     assert first.variants[0] == first.normalized
     assert len(first.variants) <= 4
+    assert "SQLite" in rewrite_query("SQLite and 检索", max_variants=4).variants
+    assert "检索" in rewrite_query("SQLite and 检索", max_variants=4).variants
 
 
 def test_chunking_supports_sentence_and_paragraph_granularity(tmp_path):
@@ -91,6 +93,30 @@ def test_hybrid_retriever_fuses_routes_and_keeps_owner_scope(tmp_path):
     assert len({hit.chunk_id for hit in result.hits}) == len(result.hits)
     assert any(set(hit.routes) == {"embedding", "fts"} for hit in result.hits)
     assert provider.calls == 1
+
+
+def test_rewritten_variants_are_embedded_and_fused_in_one_provider_call(tmp_path):
+    class RecordingProvider:
+        def __init__(self):
+            self.inputs = []
+
+        def embed(self, texts):
+            self.inputs.append(list(texts))
+            vectors = [(1.0, 0.0) if "latency" in text.lower() else (0.0, 1.0) for text in texts]
+            return EmbeddingResult("fixture", "rewrite-v1", 2, tuple(vectors))
+
+    provider = RecordingProvider()
+    retriever = HybridRagRetriever(
+        _store(tmp_path), embedding_provider=provider,
+        config=RagSearchConfig(top_k=3, per_route_k=2, rewrite_limit=2),
+        expansions={"latency": ("delay",)},
+    )
+    result = retriever.search("latency", owner_scope="user-a")
+    assert result.hits
+    assert result.route_counts["fts_variants"] == 2
+    assert result.route_counts["embedding_variants"] == 2
+    assert len(provider.inputs) == 1
+    assert provider.inputs[0][:2] == ["latency", "delay"]
 
 
 def test_embedding_failure_falls_back_to_fts(tmp_path):

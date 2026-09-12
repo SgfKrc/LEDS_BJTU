@@ -373,6 +373,10 @@ def create_app(
                     metadata_filters=metadata_filters,
                     session_id=payload.get("session_id"),
                     limit=payload.get("limit"),
+                    rewrite_limit=payload.get("rewrite_limit"),
+                    per_route_k=payload.get("per_route_k"),
+                    fts_weight=payload.get("fts_weight"),
+                    embedding_weight=payload.get("embedding_weight"),
                 )
                 hits = list(retrieval.hits)
             else:

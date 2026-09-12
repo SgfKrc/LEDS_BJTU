@@ -6,7 +6,12 @@ import unicodedata
 import pytest
 
 from harness_workbench.rag import CHUNK_STRATEGIES, RagStore as HarnessRagStore, chunk_text
-from harness_workbench.tools import RAG_CHUNK_COMPARISON_SCHEMA, run_rag_chunk_comparison
+from harness_workbench.tools import (
+    RAG_CHUNK_COMPARISON_SCHEMA,
+    RAG_QUERY_COMPARISON_SCHEMA,
+    run_rag_chunk_comparison,
+    run_rag_query_comparison,
+)
 from src.rag_store import CHUNK_STRATEGIES as MAIN_CHUNK_STRATEGIES
 from src.rag_store import RagStore, RagStoreError
 
@@ -99,3 +104,14 @@ def test_frozen_baseline_compares_all_chunk_strategies():
         assert comparison["details_match"] is True
         assert comparison["main_project"]["hit_at_k"] == 1.0
         assert comparison["harness"]["hit_at_k"] == 1.0
+
+
+def test_frozen_baseline_compares_original_and_rewritten_queries():
+    report = run_rag_query_comparison(top_k=5)
+    assert report["schema"] == RAG_QUERY_COMPARISON_SCHEMA
+    assert report["valid"] is True
+    for side in report["sides"].values():
+        assert side["details_match"] is True
+        assert side["baseline"]["hit_at_k"] == 1.0
+        assert side["rewritten"]["hit_at_k"] == 1.0
+        assert side["delta"] == {"hit_at_k": 0.0, "mean_reciprocal_rank": 0.0}

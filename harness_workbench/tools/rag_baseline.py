@@ -20,11 +20,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from harness_workbench.rag.chunking import CHUNK_STRATEGIES
+from harness_workbench.rag.query import rewrite_query as harness_rewrite_query
 
 
 RAG_BASELINE_INPUT_SCHEMA = "qlh.rag_baseline_input.v1"
 RAG_BASELINE_SCHEMA = "qlh.rag_baseline.v1"
 RAG_CHUNK_COMPARISON_SCHEMA = "qlh.rag_chunk_comparison.v1"
+RAG_QUERY_COMPARISON_SCHEMA = "qlh.rag_query_comparison.v1"
 BASELINE_CASE_COUNT = 30
 _MAX_TEXT_CHARS = 16_384
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -468,6 +470,97 @@ def run_rag_chunk_comparison(
     }
 
 
+def run_rag_query_comparison(
+    *,
+    documents: Sequence[RagBaselineDocument] | None = None,
+    cases: Sequence[RagBaselineCase] | None = None,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    """Compare original and deterministic rewritten queries on both stores."""
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 100:
+        raise RagBaselineError("config_invalid", "top_k must be between 1 and 100")
+    raw_documents = documents if documents is not None else builtin_rag_baseline_documents()
+    raw_cases = cases if cases is not None else builtin_rag_baseline_cases()
+    docs, queries = _validate_fixture(
+        tuple(item if isinstance(item, RagBaselineDocument) else RagBaselineDocument.from_mapping(item) for item in raw_documents),
+        tuple(item if isinstance(item, RagBaselineCase) else RagBaselineCase.from_mapping(item) for item in raw_cases),
+    )
+    corpus_digest = _digest([doc.as_dict() for doc in docs])
+    case_set_digest = _digest([case.as_dict() for case in queries])
+    with tempfile.TemporaryDirectory(prefix="qlh-rag-query-") as root:
+        root_path = Path(root)
+        from src.rag_store import RagStore as MainRagStore
+        from harness_workbench.rag.store import RagStore as HarnessRagStore
+
+        main_store = MainRagStore(root_path / "main.sqlite", max_chunk_chars=1024, chunk_overlap_chars=80)
+        main_store.initialize()
+        harness_store = HarnessRagStore(root_path / "harness.sqlite")
+        harness_source_refs: dict[str, str] = {}
+        for doc in docs:
+            harness_result = harness_store.add_document(
+                source_ref=doc.source_ref, title=doc.title, text=doc.text,
+                owner_scope="project", max_chars=1024, overlap_chars=80, strategy="fixed",
+            )
+            harness_source_refs[str(harness_result["source_id"])] = doc.source_ref
+            main_store.ingest_document(
+                source_id=doc.document_id, relative_ref=doc.source_ref, sha256=None,
+                mime="text/markdown", title=doc.title, text=doc.text, revision="baseline-v1",
+                language="en", owner_scope="project", access_scope="project",
+                metadata={"fixture": "rag-base-v1"}, strategy="fixed",
+            )
+
+        def main_search(query: str, limit: int, rewritten: bool) -> list[dict[str, Any]]:
+            variants = harness_rewrite_query(query).variants if rewritten else (query,)
+            merged: dict[str, dict[str, Any]] = {}
+            for variant in variants:
+                for row in main_store.search(variant, access_scope="project", limit=limit):
+                    merged.setdefault(str(row["chunk_id"]), {"source_ref": str(row["relative_ref"]), "chunk_id": str(row["chunk_id"])})
+            return list(merged.values())[:limit]
+
+        def harness_search(query: str, limit: int, rewritten: bool) -> list[dict[str, Any]]:
+            variants = harness_rewrite_query(query).variants if rewritten else (query,)
+            merged: dict[str, dict[str, Any]] = {}
+            for variant in variants:
+                for hit in harness_store.search(variant, owner_scope="project", limit=limit):
+                    merged.setdefault(hit.chunk_id, {"source_ref": harness_source_refs[hit.source_id], "chunk_id": hit.chunk_id})
+            return list(merged.values())[:limit]
+
+        sides: dict[str, Any] = {}
+        for name, searcher in (("main_project", main_search), ("harness", harness_search)):
+            baseline = _evaluate(queries, lambda query, limit: searcher(query, limit, False), top_k=top_k)
+            rewritten = _evaluate(queries, lambda query, limit: searcher(query, limit, True), top_k=top_k)
+            sides[name] = {
+                "baseline": baseline,
+                "rewritten": rewritten,
+                "delta": {
+                    "hit_at_k": round(float(rewritten["hit_at_k"]) - float(baseline["hit_at_k"]), 6),
+                    "mean_reciprocal_rank": round(float(rewritten["mean_reciprocal_rank"]) - float(baseline["mean_reciprocal_rank"]), 6),
+                },
+                "details_match": [
+                    (entry["case_id"], entry["query_sha256"], entry["target_source_refs"])
+                    for entry in baseline["details"]
+                ] == [
+                    (entry["case_id"], entry["query_sha256"], entry["target_source_refs"])
+                    for entry in rewritten["details"]
+                ],
+            }
+        del main_search, harness_search, main_store, harness_store
+        gc.collect()
+    return {
+        "schema": RAG_QUERY_COMPARISON_SCHEMA,
+        "status": "passed" if all(side["details_match"] for side in sides.values()) else "failed",
+        "valid": all(side["details_match"] for side in sides.values()),
+        "corpus_digest": corpus_digest,
+        "case_set_digest": case_set_digest,
+        "document_count": len(docs),
+        "case_count": len(queries),
+        "top_k": top_k,
+        "sides": sides,
+        "model_used": False,
+        "network_used": False,
+    }
+
+
 def _write_report(report: RagBaselineReport, json_path: Path | None, markdown_path: Path | None) -> None:
     if json_path is not None:
         json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -493,11 +586,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
-    "BASELINE_CASE_COUNT", "RAG_BASELINE_INPUT_SCHEMA", "RAG_BASELINE_SCHEMA", "RAG_CHUNK_COMPARISON_SCHEMA",
+    "BASELINE_CASE_COUNT", "RAG_BASELINE_INPUT_SCHEMA", "RAG_BASELINE_SCHEMA", "RAG_CHUNK_COMPARISON_SCHEMA", "RAG_QUERY_COMPARISON_SCHEMA",
     "RagBaselineCase", "RagBaselineDocument", "RagBaselineError", "RagBaselineReport",
     "builtin_rag_baseline_cases", "builtin_rag_baseline_documents", "load_rag_baseline_input",
     "run_rag_baseline",
-    "run_rag_chunk_comparison",
+    "run_rag_chunk_comparison", "run_rag_query_comparison",
 ]
 
 

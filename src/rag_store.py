@@ -66,6 +66,26 @@ _METADATA_INDEX_VERSION = "1"
 _MAX_METADATA_FILTERS = 5
 _MAX_METADATA_VALUES = 20
 _MAX_METADATA_TEXT = 256
+_QUERY_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "上下文": ("context",),
+    "context": ("上下文",),
+    "检索": ("retrieval", "search"),
+    "retrieval": ("检索", "search"),
+    "搜索": ("search", "检索"),
+    "数据库": ("database", "sqlite"),
+    "database": ("数据库",),
+    "sqlite": ("数据库",),
+    "SQLite": ("数据库",),
+    "分块": ("chunking", "chunk"),
+    "chunking": ("分块",),
+    "重排": ("rerank", "ranking"),
+    "rerank": ("重排", "ranking"),
+    "怎么回事": ("原因", "说明"),
+    "咋回事": ("原因", "说明"),
+    "为啥": ("原因",),
+    "咋办": ("解决", "处理"),
+    "能不能": ("是否",),
+}
 
 
 def _last_chunk_boundary(
@@ -288,6 +308,51 @@ def _append_metadata_clauses(
             f"WHERE mi.chunk_id = {chunk_alias}.chunk_id AND mi.field = ? AND mi.value IN ({placeholders}))"
         )
         params.extend((field, *values))
+
+
+def rewrite_query(
+    query: str,
+    *,
+    max_variants: int = 4,
+    expansions: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[str, ...]:
+    """Return bounded deterministic query variants for local multi-route search."""
+    if isinstance(max_variants, bool) or not 1 <= int(max_variants) <= 8:
+        raise RagStoreError("rewrite_limit_invalid", "rewrite limit must be between 1 and 8")
+    if not isinstance(query, str) or not query.strip() or "\x00" in query:
+        raise RagStoreError("query_invalid", "query must be non-empty, bounded, and NUL-free")
+    normalized = " ".join(unicodedata.normalize("NFKC", query).replace("\r", " ").replace("\n", " ").split())
+    if not normalized:
+        raise RagStoreError("query_invalid", "query must contain searchable text")
+    if len(normalized) > 512:
+        raise RagStoreError("query_invalid", "query must be non-empty, bounded, and NUL-free")
+    aliases = dict(_QUERY_ALIASES)
+    if expansions:
+        if not isinstance(expansions, Mapping):
+            raise RagStoreError("rewrite_expansions_invalid", "query expansions must be an object")
+        for key, values in expansions.items():
+            clean_key = " ".join(unicodedata.normalize("NFKC", str(key)).split())
+            if not clean_key or not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                continue
+            clean_values = tuple(" ".join(unicodedata.normalize("NFKC", str(item)).split()) for item in values)
+            aliases[clean_key] = tuple(item for item in clean_values if item)[:4]
+    variants: list[str] = [normalized]
+    subqueries = tuple(part.strip() for part in re.split(r"\s+(?:and|or)\s+|[、；;]|(?:以及|并且)", normalized) if part.strip())
+    for candidate in subqueries:
+        if len(subqueries) > 1 and candidate not in variants:
+            variants.append(candidate)
+            if len(variants) >= int(max_variants):
+                return tuple(variants)
+    for source, replacements in aliases.items():
+        if source not in normalized:
+            continue
+        for replacement in replacements:
+            candidate = " ".join(re.sub(re.escape(source), replacement, normalized, count=1).split())
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+            if len(variants) >= int(max_variants):
+                return tuple(variants)
+    return tuple(variants)
 
 
 class RagStore:
@@ -1351,33 +1416,62 @@ class RagStore:
         limit: int = 20,
         max_scan: int = _DEFAULT_VECTOR_SCAN_LIMIT,
         metadata_filters: Mapping[str, Any] | None = None,
+        rewrite_limit: int = 4,
+        per_route_limit: int | None = None,
+        fts_weight: float = 0.55,
+        vector_weight: float = 0.45,
     ) -> list[dict[str, Any]]:
-        """Merge FTS5 and bounded cosine candidates with explicit FTS fallback."""
+        """Merge rewritten FTS5 routes and bounded cosine candidates."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise RagStoreError("limit_invalid", "query limit must be between 1 and 100")
-        lexical = self.search(
-            query, access_scope=access_scope, limit=max(20, min(100, int(limit) * 4)),
-            metadata_filters=metadata_filters,
-        )
-        fallback_reason = ""
-        try:
-            semantic = self.semantic_search(
-                query_vector, provider=provider, model_id=model_id, model_sha256=model_sha256,
-                dimensions=dimensions, access_scope=access_scope, limit=max(20, min(100, int(limit) * 4)),
-                max_scan=max_scan, metadata_filters=metadata_filters,
+        if isinstance(rewrite_limit, bool) or not 1 <= int(rewrite_limit) <= 8:
+            raise RagStoreError("rewrite_limit_invalid", "rewrite limit must be between 1 and 8")
+        route_limit = max(20, min(100, int(limit) * 4)) if per_route_limit is None else per_route_limit
+        if isinstance(route_limit, bool) or not 1 <= int(route_limit) <= 100:
+            raise RagStoreError("route_limit_invalid", "per-route limit must be between 1 and 100")
+        for value, code in ((fts_weight, "fts_weight_invalid"), (vector_weight, "vector_weight_invalid")):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
+                raise RagStoreError(code, "route weight must be a finite non-negative number")
+        if float(fts_weight) + float(vector_weight) <= 0:
+            raise RagStoreError("route_weight_invalid", "at least one route weight must be positive")
+        variants = rewrite_query(query, max_variants=int(rewrite_limit))
+        if not variants:
+            raise RagStoreError("query_invalid", "query must contain searchable text")
+        lexical_ranked: dict[str, tuple[dict[str, Any], float]] = {}
+        lexical_seen = 0
+        for variant in variants:
+            lexical = self.search(
+                variant, access_scope=access_scope, limit=int(route_limit),
+                metadata_filters=metadata_filters,
             )
-        except RagStoreError as exc:
-            if exc.code != "vector_scan_budget_exceeded":
-                raise
-            semantic = []
-            fallback_reason = exc.code
+            lexical_seen += len(lexical)
+            for rank, row in enumerate(lexical):
+                chunk_id = str(row["chunk_id"])
+                contribution = float(fts_weight) / (60 + rank + 1)
+                previous = lexical_ranked.get(chunk_id)
+                lexical_ranked[chunk_id] = (dict(row), contribution if previous is None else previous[1] + contribution)
+        lexical_ordered = sorted(lexical_ranked.values(), key=lambda item: (-item[1], int(item[0]["ordinal"]), str(item[0]["chunk_id"])))
+        lexical_scores = {
+            str(row["chunk_id"]): 1.0 - (index / max(1, len(lexical_ordered) - 1))
+            for index, (row, _) in enumerate(lexical_ordered)
+        }
+        fallback_reason = ""
+        semantic: list[dict[str, Any]] = []
+        if float(vector_weight) > 0:
+            try:
+                semantic = self.semantic_search(
+                    query_vector, provider=provider, model_id=model_id, model_sha256=model_sha256,
+                    dimensions=dimensions, access_scope=access_scope, limit=int(route_limit),
+                    max_scan=max_scan, metadata_filters=metadata_filters,
+                )
+            except RagStoreError as exc:
+                if exc.code != "vector_scan_budget_exceeded":
+                    raise
+                fallback_reason = exc.code
         merged: dict[str, dict[str, Any]] = {}
-        lexical_count = len(lexical)
-        for index, row in enumerate(lexical):
+        for row, _ in lexical_ordered:
             item = dict(row)
-            # bm25 values are implementation-scale dependent (and negative in
-            # SQLite FTS5). Normalize only the candidate ordering instead.
-            item["lexical_score"] = 1.0 - (index / max(1, lexical_count - 1))
+            item["lexical_score"] = lexical_scores[str(row["chunk_id"])]
             item["vector_score"] = 0.0
             merged[str(item["chunk_id"])] = item
         for row in semantic:
@@ -1389,10 +1483,14 @@ class RagStore:
             item["vector_score"] = float(row["vector_score"])
         output = list(merged.values())
         for item in output:
-            item["hybrid_score"] = 0.55 * float(item["lexical_score"]) + 0.45 * ((float(item["vector_score"]) + 1.0) / 2.0)
-            item["hybrid_mode"] = "fts_fallback" if fallback_reason else "fts_vector"
+            item["hybrid_score"] = float(fts_weight) * float(item["lexical_score"]) + float(vector_weight) * ((float(item["vector_score"]) + 1.0) / 2.0)
+            item["hybrid_mode"] = "fts_fallback" if fallback_reason else ("fts_vector" if semantic else "fts_only")
             if fallback_reason:
                 item["vector_reason_code"] = fallback_reason
+            item["rewritten_query_count"] = len(variants)
+            item["fts_route_count"] = lexical_seen
+            item["fts_weight"] = float(fts_weight)
+            item["vector_weight"] = float(vector_weight)
         output.sort(key=lambda row: (-float(row["hybrid_score"]), int(row["ordinal"]), str(row["chunk_id"])))
         return output[:int(limit)]
 
