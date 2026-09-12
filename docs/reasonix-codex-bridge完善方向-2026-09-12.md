@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2` 已完成，R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3` 已完成，E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -168,3 +168,4 @@
 | 2026-09-12 | `TOOL-RXB-C4` 完成：新增路径无关、脱敏的 `configure export` JSON 摘要与只读 `configure import <file|->` 对照；拒绝 key、endpoint、用户路径等外部敏感值，`npm test` 20 项通过 |
 | 2026-09-12 | `TOOL-RXB-R1` 完成：`BRIDGE_LOG` 可选 JSONL 脱敏调用日志覆盖成功、拒绝、非零退出，不记录 task/输出正文、模型 ref 或绝对路径；未设置时零写入，`npm test` 21 项通过 |
 | 2026-09-12 | `TOOL-RXB-R2` 完成：`bridge.config.json.limits` 支持 steps/timeout/output/queue 覆盖，非法值回退并一次告警，超过代码硬上限夹紧；`reasonix_status.limits` 反映有效值，离线回归 `npm test` 23 项通过 |
+| 2026-09-12 | `TOOL-RXB-R3` 完成：`reasonix_status` 增加 queueDepth/inFlight/lastRun 脱敏摘要，队列满错误附当前深度、容量和 retry-after 提示；离线并发 stub 验证状态转移，`npm test` 24 项通过 |
