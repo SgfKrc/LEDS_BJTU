@@ -197,6 +197,26 @@ def test_hybrid_search_fuses_rewritten_fts_routes_with_adjustable_weights(tmp_pa
     assert result.document_id
 
 
+def test_hybrid_search_applies_bounded_rule_rerank_after_fusion(tmp_path):
+    store = _store(tmp_path)
+    _ingest(store, source_id="rerank-doc", relative_ref="docs/rerank.md", text="alpha budget exact phrase", revision="r1")
+    rows = store.hybrid_search(
+        "alpha budget", [1.0, 0.0], provider="ollama", model_id="nomic-embed-text:latest",
+        model_sha256="a" * 64, dimensions=2, fts_weight=1.0, vector_weight=0.0,
+        limit=3, rerank_candidate_k=2, rerank_weight=1.0,
+    )
+    assert rows and len(rows) <= 2
+    assert rows[0]["rerank_mode"] == "lexical"
+    assert 1 <= rows[0]["rerank_candidate_count"] <= 2
+    assert rows[0]["rerank_score"] >= 0
+    disabled = store.hybrid_search(
+        "alpha", [1.0, 0.0], provider="ollama", model_id="nomic-embed-text:latest",
+        model_sha256="a" * 64, dimensions=2, fts_weight=1.0, vector_weight=0.0,
+        limit=2, rerank_candidate_k=1, rerank_mode="none",
+    )
+    assert disabled and disabled[0]["rerank_mode"] == "none"
+
+
 def test_fts_delete_rebuild_and_invalid_query_are_atomic(tmp_path):
     store = _store(tmp_path)
     _ingest(store)

@@ -419,6 +419,19 @@ def _index_relations(text: str, entities: tuple[str, ...]) -> tuple[tuple[str, s
     return tuple(dict.fromkeys(relations))
 
 
+def _rerank_score(query: str, text: str, title: str = "") -> float:
+    normalized_query = unicodedata.normalize("NFKC", query).casefold()
+    normalized_text = unicodedata.normalize("NFKC", f"{title} {text}").casefold()
+    query_tokens = set(_INDEX_TOKEN.findall(normalized_query))
+    text_tokens = set(_INDEX_TOKEN.findall(normalized_text))
+    if not query_tokens:
+        return 0.0
+    overlap = len(query_tokens & text_tokens) / len(query_tokens)
+    phrase_bonus = 0.2 if len(query_tokens) > 1 and normalized_query in normalized_text else 0.0
+    title_bonus = 0.1 if normalized_query and normalized_query in unicodedata.normalize("NFKC", title).casefold() else 0.0
+    return min(1.0, overlap + phrase_bonus + title_bonus)
+
+
 class RagStore:
     """Independent SQLite store whose rows never leave the user's machine."""
 
@@ -1049,6 +1062,7 @@ class RagStore:
     def keyword_search(
         self, query: str, *, access_scope: str = "owner", limit: int = 20,
         granularity: str | None = None, metadata_filters: Mapping[str, Any] | None = None,
+        source_ids: Sequence[str] = (), title_prefix: str | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip() or len(query) > 512 or "\x00" in query:
             raise RagStoreError("query_invalid", "query must be non-empty, bounded, and NUL-free")
@@ -1064,6 +1078,18 @@ class RagStore:
             return []
         clauses = ["d.status='active'", "s.status='active'", "d.access_scope=?"]
         params: list[Any] = [access_scope]
+        source_ids = tuple(str(item) for item in source_ids)
+        if len(source_ids) > 50:
+            raise RagStoreError("source_ids_invalid", "source_ids must contain at most 50 values")
+        if source_ids:
+            clauses.append("d.source_id IN (" + ",".join("?" for _ in source_ids) + ")")
+            params.extend(source_ids)
+        if title_prefix is not None:
+            if not isinstance(title_prefix, str) or len(title_prefix) > 200:
+                raise RagStoreError("title_prefix_invalid", "title_prefix is invalid")
+            if title_prefix:
+                clauses.append("s.title LIKE ? ESCAPE '\\'")
+                params.append(_like_prefix(title_prefix))
         term_clauses: list[str] = []
         if terms:
             term_clauses.append("(k.term_kind='token' AND k.term IN (" + ",".join("?" for _ in terms) + "))")
@@ -1101,11 +1127,15 @@ class RagStore:
 
     def graph_search(
         self, query: str, *, access_scope: str = "owner", limit: int = 20,
-        granularity: str | None = None, depth: int = 1,
+        granularity: str | None = None, depth: int = 1, metadata_filters: Mapping[str, Any] | None = None,
+        source_ids: Sequence[str] = (), title_prefix: str | None = None,
     ) -> list[dict[str, Any]]:
         if isinstance(depth, bool) or not 0 <= int(depth) <= 2:
             raise RagStoreError("graph_depth_invalid", "graph depth must be between 0 and 2")
-        results = self.keyword_search(query, access_scope=access_scope, limit=limit, granularity=granularity)
+        results = self.keyword_search(
+            query, access_scope=access_scope, limit=limit, granularity=granularity,
+            metadata_filters=metadata_filters, source_ids=source_ids, title_prefix=title_prefix,
+        )
         entities = _index_entities(query)
         names = {item.casefold() for item in entities}
         if not names or depth == 0:
@@ -1786,6 +1816,9 @@ class RagStore:
         per_route_limit: int | None = None,
         fts_weight: float = 0.55,
         vector_weight: float = 0.45,
+        rerank_candidate_k: int | None = None,
+        rerank_weight: float = 0.35,
+        rerank_mode: str = "lexical",
     ) -> list[dict[str, Any]]:
         """Merge rewritten FTS5 routes and bounded cosine candidates."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -1800,6 +1833,14 @@ class RagStore:
                 raise RagStoreError(code, "route weight must be a finite non-negative number")
         if float(fts_weight) + float(vector_weight) <= 0:
             raise RagStoreError("route_weight_invalid", "at least one route weight must be positive")
+        if rerank_candidate_k is None:
+            rerank_candidate_k = max(int(limit), min(1000, max(20, int(route_limit) * 2)))
+        if isinstance(rerank_candidate_k, bool) or not 1 <= int(rerank_candidate_k) <= 1000:
+            raise RagStoreError("rerank_candidate_limit_invalid", "rerank candidate limit must be between 1 and 1000")
+        if rerank_mode not in {"lexical", "none"}:
+            raise RagStoreError("rerank_mode_invalid", "rerank mode must be lexical or none")
+        if isinstance(rerank_weight, bool) or not isinstance(rerank_weight, (int, float)) or not math.isfinite(float(rerank_weight)) or not 0 <= float(rerank_weight) <= 1:
+            raise RagStoreError("rerank_weight_invalid", "rerank weight must be between 0 and 1")
         variants = rewrite_query(query, max_variants=int(rewrite_limit))
         if not variants:
             raise RagStoreError("query_invalid", "query must contain searchable text")
@@ -1849,7 +1890,8 @@ class RagStore:
             item["vector_score"] = float(row["vector_score"])
         output = list(merged.values())
         for item in output:
-            item["hybrid_score"] = float(fts_weight) * float(item["lexical_score"]) + float(vector_weight) * ((float(item["vector_score"]) + 1.0) / 2.0)
+            item["fusion_score"] = float(fts_weight) * float(item["lexical_score"]) + float(vector_weight) * ((float(item["vector_score"]) + 1.0) / 2.0)
+            item["hybrid_score"] = item["fusion_score"]
             item["hybrid_mode"] = "fts_fallback" if fallback_reason else ("fts_vector" if semantic else "fts_only")
             if fallback_reason:
                 item["vector_reason_code"] = fallback_reason
@@ -1857,8 +1899,21 @@ class RagStore:
             item["fts_route_count"] = lexical_seen
             item["fts_weight"] = float(fts_weight)
             item["vector_weight"] = float(vector_weight)
-        output.sort(key=lambda row: (-float(row["hybrid_score"]), int(row["ordinal"]), str(row["chunk_id"])))
-        return output[:int(limit)]
+        output.sort(key=lambda row: (-float(row["fusion_score"]), int(row["ordinal"]), str(row["chunk_id"])))
+        candidates = output[:int(rerank_candidate_k)]
+        max_fusion = max((float(row["fusion_score"]) for row in candidates), default=0.0)
+        for row in candidates:
+            normalized_fusion = float(row["fusion_score"]) / max_fusion if max_fusion > 0 else 0.0
+            row["rerank_score"] = _rerank_score(query, str(row.get("text_content", "")), str(row.get("relative_ref", "")))
+            row["rerank_final_score"] = (
+                (1.0 - float(rerank_weight)) * normalized_fusion + float(rerank_weight) * float(row["rerank_score"])
+                if rerank_mode == "lexical" else normalized_fusion
+            )
+            row["rerank_mode"] = rerank_mode
+            row["rerank_candidate_count"] = len(candidates)
+            row["hybrid_score"] = row["rerank_final_score"]
+        candidates.sort(key=lambda row: (-float(row["rerank_final_score"]), int(row["ordinal"]), str(row["chunk_id"])))
+        return candidates[:int(limit)]
 
     @staticmethod
     def _search_cjk(

@@ -94,6 +94,12 @@ class RagHit:
     score: float
     granularity: str = "fixed"
     routes: tuple[str, ...] = ()
+    fusion_score: float | None = None
+    rerank_score: float | None = None
+    rerank_mode: str | None = None
+    keyword_score: float | None = None
+    graph_score: float | None = None
+    graph_entities: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = {
@@ -108,6 +114,18 @@ class RagHit:
             value["granularity"] = self.granularity
         if self.routes:
             value["routes"] = list(self.routes)
+        if self.fusion_score is not None:
+            value["fusion_score"] = self.fusion_score
+        if self.rerank_score is not None:
+            value["rerank_score"] = self.rerank_score
+        if self.rerank_mode is not None:
+            value["rerank_mode"] = self.rerank_mode
+        if self.keyword_score is not None:
+            value["keyword_score"] = self.keyword_score
+        if self.graph_score is not None:
+            value["graph_score"] = self.graph_score
+        if self.graph_entities:
+            value["graph_entities"] = list(self.graph_entities)
         return value
 
 
@@ -380,6 +398,7 @@ class RagStore:
     def keyword_search(
         self, query: str, *, owner_scope: str = "local", limit: int = 20, granularity: str | None = None,
         metadata_filters: Mapping[str, Any] | None = None,
+        source_ids: tuple[str, ...] | list[str] = (), title_prefix: str | None = None,
     ) -> list[dict[str, Any]]:
         owner_scope = _scope(owner_scope)
         if not isinstance(query, str) or not query.strip() or len(query) > 512 or "\x00" in query:
@@ -394,6 +413,18 @@ class RagStore:
             return []
         clauses = ["s.owner_scope=?"]
         params: list[Any] = [owner_scope]
+        source_ids = tuple(str(item) for item in source_ids)
+        if len(source_ids) > 50:
+            raise ValueError("source_ids must contain at most 50 values")
+        if source_ids:
+            clauses.append("i.source_id IN (" + ",".join("?" for _ in source_ids) + ")")
+            params.extend(source_ids)
+        if title_prefix is not None:
+            if not isinstance(title_prefix, str) or len(title_prefix) > 200:
+                raise ValueError("title_prefix is invalid")
+            if title_prefix:
+                clauses.append("s.title LIKE ? ESCAPE '\\'")
+                params.append(_like_prefix(title_prefix))
         route_clauses: list[str] = []
         if terms:
             route_clauses.append("(k.term_kind='token' AND k.term IN (" + ",".join("?" for _ in terms) + "))")
@@ -426,10 +457,13 @@ class RagStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def graph_search(self, query: str, *, owner_scope: str = "local", limit: int = 20, granularity: str | None = None, depth: int = 1) -> list[dict[str, Any]]:
+    def graph_search(self, query: str, *, owner_scope: str = "local", limit: int = 20, granularity: str | None = None, depth: int = 1, metadata_filters: Mapping[str, Any] | None = None, source_ids: tuple[str, ...] | list[str] = (), title_prefix: str | None = None) -> list[dict[str, Any]]:
         if isinstance(depth, bool) or not 0 <= int(depth) <= 2:
             raise ValueError("graph depth must be between 0 and 2")
-        results = self.keyword_search(query, owner_scope=owner_scope, limit=limit, granularity=granularity)
+        results = self.keyword_search(
+            query, owner_scope=owner_scope, limit=limit, granularity=granularity,
+            metadata_filters=metadata_filters, source_ids=source_ids, title_prefix=title_prefix,
+        )
         names = {item.casefold() for item in _index_entities(query)}
         if not names or depth == 0:
             for row in results:

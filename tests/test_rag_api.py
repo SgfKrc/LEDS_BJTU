@@ -93,6 +93,20 @@ def test_rag_api_applies_rewritten_fts_routes_and_returns_route_config(monkeypat
     assert body["route_config"]["per_route_limit"] == 1
 
 
+def test_rag_api_exposes_tunable_fts_rerank(monkeypatch, tmp_path):
+    store = _store(tmp_path)
+    monkeypatch.setattr(api_server, "_rag_store_instance", store)
+    response = TestClient(api_server.app).post(
+        "/api/rag/search",
+        json={"query": "retrieval", "mode": "fts", "rerank_candidate_k": 1, "rerank_weight": 1.0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["route_config"]["rerank_candidate_k"] == 1
+    assert body["results"][0]["rerank_mode"] == "lexical"
+    assert body["results"][0]["rerank_candidate_count"] == 1
+
+
 def test_rag_api_rebuild_delete_and_hybrid_contract(monkeypatch, tmp_path):
     store = _store(tmp_path)
     monkeypatch.setattr(api_server, "_rag_store_instance", store)

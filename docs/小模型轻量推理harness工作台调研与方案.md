@@ -962,3 +962,22 @@ S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 S
 ```
 
 本票完成主项目与 harness 的多粒度、倒排关键词、轻量图谱索引；下一票为 `RAG-RERANK-01`，如无可用小模型则继续仅在规则与融合层推进。
+
+## 23. RAG-RERANK-01 实施记录
+
+本票在既有 FTS/向量 RRF 或加权融合之后增加有界、可解释的候选重排层：
+
+- 主项目 `hybrid_search` 与 harness `HybridRagRetriever` 均先按融合结果截取 `rerank_candidate_k`，再按查询词覆盖、完整词组命中和标题命中计算 lexical score；`rerank_weight` 与 `rerank_mode=lexical|none` 可调。
+- 结果显式保留 `fusion_score`、`rerank_score`、`rerank_final_score`、`rerank_candidate_count` 和模式字段；harness 缓存键包含完整重排配置，避免候选预算或权重变化复用旧结果；主项目 API 同步返回 route config。
+- 轻量重排采用规则而非交叉编码器/小模型。当前本机只有 QW1.8B，本票不下载、不加载、不联网；规则层是后续模型重排的稳定候选接口，不把规则排序提升解释成模型质量。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_rag_squeeze.py tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py tests/test_rag_chunking.py -q
+72 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+239 passed, 1 skipped
+```
+
+本票完成双侧候选集重排与可调截断；下一张可执行票为 `HW-DSV4-9B-EVAL-01`，先做资源评估，不下载模型。

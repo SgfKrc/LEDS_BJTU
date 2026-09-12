@@ -130,6 +130,35 @@ def test_embedding_failure_falls_back_to_fts(tmp_path):
     assert result.route_counts["embedding_error"] == 1
 
 
+def test_rule_rerank_is_bounded_tunable_and_serializable(tmp_path):
+    result = HybridRagRetriever(
+        _store(tmp_path),
+        config=RagSearchConfig(
+            top_k=3, per_route_k=5, embedding_weight=0.0,
+            rerank_candidate_k=2, rerank_weight=1.0,
+        ),
+    ).search("latency budget", owner_scope="user-a")
+    assert result.hits
+    assert result.route_counts["rerank_candidate_count"] <= 2
+    assert result.route_counts["rerank_applied"] == 1
+    assert all(hit.rerank_mode == "lexical" for hit in result.hits)
+    assert all(hit.fusion_score is not None and hit.rerank_score is not None for hit in result.hits)
+    assert result.as_dict()["hits"][0]["rerank_mode"] == "lexical"
+
+
+def test_rule_rerank_can_be_disabled_without_changing_candidate_budget(tmp_path):
+    result = HybridRagRetriever(
+        _store(tmp_path),
+        config=RagSearchConfig(
+            top_k=3, per_route_k=5, embedding_weight=0.0,
+            rerank_candidate_k=2, rerank_mode="none",
+        ),
+    ).search("latency", owner_scope="user-a")
+    assert result.route_counts["rerank_candidate_count"] <= 2
+    assert result.route_counts["rerank_applied"] == 0
+    assert all(hit.rerank_mode == "none" for hit in result.hits)
+
+
 def test_rag_cache_reuses_across_calls_and_invalidates_on_snapshot_change(tmp_path):
     store = _store(tmp_path)
     provider = _KeywordEmbeddings()

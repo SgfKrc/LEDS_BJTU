@@ -136,7 +136,7 @@ from config import (
 import local_store as _local_store
 import model_download_jobs
 import model_search
-from rag_store import RagStore, RagStoreError, rewrite_query
+from rag_store import RagStore, RagStoreError, _rerank_score, rewrite_query
 from tool_rag_cache import ToolRagCache, ToolRagCacheError
 from rag_embedding import DEFAULT_OLLAMA_EMBEDDING_MODEL, OllamaEmbeddingProvider
 from rag_ann import evaluate_ann_decision
@@ -1156,6 +1156,9 @@ class RagSearchRequest(BaseModel):
     per_route_limit: Optional[int] = Field(default=None, ge=1, le=100)
     fts_weight: float = Field(default=0.55, ge=0)
     vector_weight: float = Field(default=0.45, ge=0)
+    rerank_candidate_k: Optional[int] = Field(default=None, ge=1, le=1000)
+    rerank_weight: float = Field(default=0.35, ge=0, le=1)
+    rerank_mode: Literal["lexical", "none"] = "lexical"
 
 
 class RagRebuildRequest(BaseModel):
@@ -2451,7 +2454,7 @@ def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
         "granularity": row.get("granularity") or "fixed",
         "snippet": text[:800],
         **{
-            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code", "rewritten_query_count", "fts_route_count", "keyword_score", "graph_score", "graph_entities")
+            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "fusion_score", "rerank_score", "rerank_final_score", "rerank_mode", "rerank_candidate_count", "hybrid_mode", "vector_reason_code", "rewritten_query_count", "fts_route_count", "keyword_score", "graph_score", "graph_entities")
             if key in row
         },
     }
@@ -2516,6 +2519,8 @@ async def rag_search(req: RagSearchRequest):
                 lambda: _search_rewritten_fts(
                     store, rewritten_queries, access_scope=req.access_scope, limit=req.limit,
                     route_limit=req.per_route_limit, metadata_filters=metadata_filters,
+                    rerank_candidate_k=req.rerank_candidate_k, rerank_weight=req.rerank_weight,
+                    rerank_mode=req.rerank_mode,
                 )
             )
         else:
@@ -2536,6 +2541,9 @@ async def rag_search(req: RagSearchRequest):
                     per_route_limit=req.per_route_limit,
                     fts_weight=req.fts_weight,
                     vector_weight=req.vector_weight,
+                    rerank_candidate_k=req.rerank_candidate_k,
+                    rerank_weight=req.rerank_weight,
+                    rerank_mode=req.rerank_mode,
                 )
             )
         return {
@@ -2552,6 +2560,9 @@ async def rag_search(req: RagSearchRequest):
                 "per_route_limit": req.per_route_limit,
                 "fts_weight": req.fts_weight,
                 "vector_weight": req.vector_weight,
+                "rerank_candidate_k": req.rerank_candidate_k,
+                "rerank_weight": req.rerank_weight,
+                "rerank_mode": req.rerank_mode,
             },
         }
     except HTTPException:
@@ -2572,18 +2583,37 @@ def _search_rewritten_fts(
     limit: int,
     route_limit: int | None,
     metadata_filters: dict[str, Any],
+    rerank_candidate_k: int | None = None,
+    rerank_weight: float = 0.35,
+    rerank_mode: str = "lexical",
 ) -> list[dict[str, Any]]:
-    """Run deterministic rewritten FTS routes and deduplicate by chunk ID."""
+    """Run deterministic rewritten FTS routes and rerank a bounded candidate set."""
     merged: dict[str, dict[str, Any]] = {}
-    per_route_limit = int(route_limit or limit)
+    per_route_limit = int(route_limit or max(limit * 4, 20))
+    candidate_limit = int(rerank_candidate_k or max(limit * 4, 20))
     for variant in variants:
         for row in store.search(variant, access_scope=access_scope, limit=per_route_limit, metadata_filters=metadata_filters):
             merged.setdefault(str(row["chunk_id"]), dict(row))
-            if len(merged) >= int(limit):
+            if len(merged) >= candidate_limit:
                 break
-        if len(merged) >= int(limit):
+        if len(merged) >= candidate_limit:
             break
-    return list(merged.values())[:int(limit)]
+    candidates = list(merged.values())[:candidate_limit]
+    max_fusion = 1.0 / 61.0 if candidates else 0.0
+    for rank, row in enumerate(candidates, start=1):
+        row["fusion_score"] = 1.0 / (60.0 + rank)
+        row["rerank_score"] = _rerank_score(
+            variants[0], str(row.get("text_content", "")), str(row.get("relative_ref", "")),
+        )
+        normalized_fusion = row["fusion_score"] / max_fusion if max_fusion else 0.0
+        row["rerank_final_score"] = (
+            (1.0 - float(rerank_weight)) * normalized_fusion + float(rerank_weight) * row["rerank_score"]
+            if rerank_mode == "lexical" else normalized_fusion
+        )
+        row["rerank_mode"] = rerank_mode
+        row["rerank_candidate_count"] = len(candidates)
+    candidates.sort(key=lambda row: (-float(row["rerank_final_score"]), int(row.get("ordinal", 0)), str(row["chunk_id"])))
+    return candidates[:int(limit)]
 
 
 @app.post("/api/rag/rebuild")

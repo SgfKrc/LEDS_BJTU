@@ -377,6 +377,10 @@ def create_app(
                         str(row["source_id"]), str(row["chunk_id"]), str(row.get("title", "")),
                         int(row.get("ordinal", 0)), str(row.get("text", "")),
                         float(row.get("keyword_score", row.get("graph_score", 0.0))), str(row.get("granularity") or "fixed"),
+                        (), None, None, None,
+                        float(row["keyword_score"]) if row.get("keyword_score") is not None else None,
+                        float(row["graph_score"]) if row.get("graph_score") is not None else None,
+                        tuple(str(item) for item in row.get("graph_entities", ()) if isinstance(item, str)),
                     ) for row in indexed
                 ]
                 retrieval = None
@@ -393,6 +397,9 @@ def create_app(
                     per_route_k=payload.get("per_route_k"),
                     fts_weight=payload.get("fts_weight"),
                     embedding_weight=payload.get("embedding_weight"),
+                    rerank_candidate_k=payload.get("rerank_candidate_k"),
+                    rerank_weight=payload.get("rerank_weight"),
+                    rerank_mode=payload.get("rerank_mode"),
                 )
                 hits = list(retrieval.hits)
             else:
