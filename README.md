@@ -65,6 +65,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🧩 **子项目：小模型 harness 工作台** | 面向玩具/自用的小模型定制化推理工作台（S1-S8 本机/离线开发门完成）：上下文预算与 STATE 压缩、模型画像/能力门、OpenAI 兼容 `/v1`、定制化实验台（A/B + Pareto）、生图工作区、SQLite 会话与 RAG、长期记忆（RAG+压缩+本地 memory）、联网搜索与轻量 MCP 服务、红队安全样本；**不 import 主项目代码、仅共享模型工件**，亚1B 与 DS3 模型画像已登记 → [harness 方案](docs/小模型轻量推理harness工作台调研与方案.md) |
 | 📡 **联网搜索与轻量 Fetch 工具** | WEB-TOOL G1-G6 本机开发门完成：离线能力探测、Tool Gateway fail-closed（HTTPS 强制/SSRF/DNS/重定向复检）、受限 Fetch/SearXNG adapter、TaskGraph `tool_request` Stage、显式 `persist` 工具缓存与 API、质量门与联合审计；`production_network_enabled=false`，真实网络验收后置 → [调研与分期计划](docs/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
 | 📝 **文档维护 Agent 子项目** | 独立包（独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)，主项目以 submodule 引入）：规则数据化（`RULES.md` + `rules.yaml` 驱动扫描器）、规则变更机械扫描（增量矩阵 new/gone/changed + `--max-new/--max-gone` 门）、演进门控（agent 改规则 proposed→preflight→gates→released）与等价回归 → [专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) |
+| 🔌 **Reasonix ↔ Codex 桥接子项目** | 独立包（独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)，主项目以 submodule 引入）：把只读 Reasonix 子智能体以 stdio MCP 工具（`reasonix_run` / `reasonix_status`）接给 Codex；CLI 路径与模型 ref 全部按本机解析、零硬编码（`node src/configure.mjs list/use/codex/verify`）；写能力默认关闭，受控写入登记为规划票 `TOOL-RXB-W1/W2/W3` → [完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) |
 | 🎯 **判题口径修复与 DS3 替代 R1** | `loose_contains` + 512 token（P5）实证可区分（Qwen3-4B 1/4 vs 1.8B 0/4）；DS3-0324-7B v2 全口径 **2/4×3、8/11×3**（仅预算 192→512 即 0/4→2/4，判题口径问题实证）→ 替代 R1 判题模型的**已批准候选** → [DS3 专项](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
 
 ### 项目设计理念
@@ -217,6 +218,16 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 ├── frontend_cybergothic/          # ★ 唯一产品前端（React + TypeScript + Vite）
 │   ├── src/                       # Chat / Models / RAG / Tasks / Image Studio / Account 等产品页面
 │   └── scripts/                   # 对比度与浏览器回归工具
+├── harness_workbench/             # ★ 小模型 harness 工作台（独立子项目；不 import 主项目代码）
+│   ├── context_engine/            # 上下文预算与 STATE 压缩
+│   ├── model_profiles/            # 模型画像与能力门
+│   ├── rag/                       # 本地 RAG（分块/索引/改写/重排）与检索质量门
+│   ├── api_layer/                 # OpenAI 兼容 /v1 与工作台后端
+│   ├── image_workbench/           # 生图工作区
+│   ├── memory/ session/ mcp_server/ research/ adaptation/ eval/  # 长期记忆 / 会话 / 轻量 MCP / 实验与评测
+│   ├── tools/                     # rag_baseline、Tool Gateway 等
+│   ├── ui_react/                  # 工作台前端（React + Vite）
+│   └── cli.py / tui.py            # 命令行与终端入口
 ├── tests/                         # 单元/契约/回归测试（全量基线仅作历史参考；当前证据见计划与专项文档）
 ├── scripts/                       # 工具脚本
 │   ├── quantize_model.py          # 模型准备与量化验证
@@ -226,6 +237,11 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── build_offline_bundle.py    # 离线整合包容量预检、清单与原子发布
 │   ├── experiment_quality_production_gate.py # EX-N3 只读质量复核
 │   └── docagent_*_gate.py         # 文档检索/语义质量门
+├── tools/                         # ★ 子模块与运维工具
+│   ├── docagent/                  # 子模块（自研）：文档维护 Agent 独立仓库
+│   ├── reasonix-codex-bridge/     # 子模块（自研）：Codex ↔ Reasonix MCP 桥接
+│   ├── ssh_sync_*.py              # 从节点同步/补丁分发
+│   └── modelscope_download.py     # ModelScope 下载辅助
 ├── models/                        # 模型文件存放目录（需自行下载）
 │   ├── qwen-1_8b-chat/            # PC: Safetensors 格式
 │   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF 格式（llama.cpp 引擎）
@@ -234,6 +250,24 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 └── README.md                      # 本文件
 ```
 
+### 子模块（Git submodule）
+
+仓库共引入 **3 个** Git 子模块；其中**只有 `llama.cpp` 是第三方依赖，另外两个都是本项目自研并独立维护的子项目**：
+
+| 路径 | 仓库 | 性质 | 用途 |
+|------|------|------|------|
+| `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **自研**（文档维护 Agent 独立化） | 规则数据化扫描器、规则变更机械扫描（new/gone/changed 增量矩阵）与演进门控 |
+| `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **自研**（Codex ↔ Reasonix 协作桥） | stdio MCP 桥接，供 Codex 调用只读 Reasonix 子智能体；CLI 路径与模型 ref 按本机解析，`configure verify` 自检 |
+| `android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **第三方**（唯一非自研） | Android Full 变体原生构建；固定 revision，PC 侧与 Python sidecar 都不需要 |
+
+拉取与更新：
+
+```bash
+git submodule update --init --recursive                              # 已有工作区
+git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 首次克隆（推荐）
+```
+
+> 规划：小模型 harness 工作台（`harness_workbench/`）目前仍是主仓库内的目录，**将来考虑按同样模式独立为子模块**（自研子项目），主仓库届时只保留 gitlink 与接线文档。
 ### PyTorch 层流水线示例（不是固定设备数量）
 
 ```
@@ -437,6 +471,8 @@ python scripts/setup_test_env.py --check
 
 ```bash
 # 1. 仅构建 Android Full 时拉取 llama.cpp 子模块；PC 从节点和 Python sidecar 不需要
+#    仓库另有 2 个自研子模块 tools/docagent（文档维护 Agent）与 tools/reasonix-codex-bridge（Codex 桥接），
+#    随默认克隆带出；llama.cpp 仅构建 Android Full 才需要。完整清单见 §项目架构 的子模块小节
 git submodule update --init --recursive
 
 # 2. 安装 Python 依赖（主环境；联网）
@@ -984,6 +1020,7 @@ python serve.py
 - [DistilQwen2.5-DS3-0324 替代 R1 判题模型专项计划](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) — 快思考替代不可关闭 thinking 的 R1：v2 全口径 **2/4×3、8/11×3**，替代 R1 已批准候选；附多模型 0/4 判题口径问题专项分析
 - [亚 1B 小模型专项实验计划](docs/亚1B小模型专项实验计划.md) — Qwen2.5-0.5B / Qwen3-0.6B / MiniCPM4-0.5B 用途（链路轻载体/thinking 开关标杆/新架构探针）与 M-SM-B1~B5 实验票
 - [文档维护 Agent 工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) — 独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)（主项目 submodule 引入）、规则数据化、规则变更机械扫描与演进门控（P1-P5）
+- [reasonix-codex-bridge 完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) — 独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)（主项目 submodule 引入）：只读 Reasonix 子智能体接入 Codex 的 P0-P2 完善方向与验收门；受控写入（主 agent 指挥 + 子 agent 干活）登记为开发票批次 6
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
