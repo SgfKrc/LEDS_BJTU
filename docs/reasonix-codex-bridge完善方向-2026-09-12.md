@@ -182,3 +182,4 @@
 | 2026-09-12 | `TOOL-RXB-W2` 完成：成功写调用仅返回 `qlh.reasonix.changes.v1` 结构化变更集（路径、增删行数、diff stat、SHA-256），不返回 worker 输出或文件正文；新增 `reasonix_rollback` 一次性回滚令牌，回滚前校验后续修改并冲突拒绝；令牌仅存当前 bridge 进程，离线回归 37 项通过 |
 | 2026-09-12 | `TOOL-RXB-W3` 完成：新增独立 write profile 与专用 prompt，`configure profile --role read/write` 可分别生成/同步并验证角色 guard；write profile 只在 read 工具集合上增加 `edit_file,write_file`，不带 `read-only`，README 固化主 agent 指挥、子 agent 执行、主 agent 审查/回滚流程，离线回归 40 项通过 |
 | 2026-09-12 | `TOOL-RXB-AUD-01` 完成：审计发现的模式授权边界已修复；inspect/review/plan 强制 read-role，implement 要求显式 write-role，canonical `-write` profile 不可被 `REASONIX_SUBAGENT_ROLE=read` 降级；离线回归 43 项通过，子项目 commit `f6bacd7` |
+| 2026-09-12 | `TOOL-RXB-AUD-02` 完成：拒绝不安全的 `requireCleanTree=false` opt-out，受控写入统一要求 clean Git tree；新增 worker 不启动回归，子项目 commit `a361634` |
