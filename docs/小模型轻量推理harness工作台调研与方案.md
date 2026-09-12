@@ -944,3 +944,21 @@ S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 S
 ```
 
 本票不下载、不加载 QW1.8B、不联网；下一票为 `RAG-IDX-01`，先做关键词/多粒度和轻量知识图谱调研门。
+
+## 22. RAG-IDX-01 实施记录
+
+本票在主项目与 harness 各自建立三类本地索引，不依赖 embedding 或模型：
+
+- `rag_index_chunks` 同时存储 document/paragraph/sentence 与当前策略的并行视图，新增文档视图时保持原始 offset 和引用关系。
+- `rag_keyword_index` 包含 token、prefix 和双词组条目；`keyword_search` 支持粒度筛选和原有元数据过滤，与向量索引分离。
+- `rag_entities`/`rag_relations` 用可审计规则抽取英文标识符、中文词组及 uses/depends-on/使用/依赖等关系，`graph_search` 按深度沿边扩展候选。
+- 调研前置结论：本机只有 QW1.8B，本票不下载、不加载、不联网；为保持硬件成本和审计可见性，实体/关系采用规则抽取，小模型抽取留到后续模型门票，不把规则命中解释成模型质量。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_chunking.py tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py -q
+68 passed
+```
+
+本票完成主项目与 harness 的多粒度、倒排关键词、轻量图谱索引；下一票为 `RAG-RERANK-01`，如无可用小模型则继续仅在规则与融合层推进。

@@ -13,7 +13,7 @@ from ..image_workbench.contracts import ImageAdapter, ImageAdapterError, ImageRe
 from ..memory import MemoryStore
 from ..mcp_server import HarnessMCPDependencies, MCPServer, MCPToolError
 from ..model_profiles import builtin_profiles
-from ..rag import HybridRagRetriever, RagStore, build_context
+from ..rag import HybridRagRetriever, RagHit, RagStore, build_context
 from ..session import SessionStore
 from ..tools.network import NetworkClient
 from .mapping import APIRequestError, chunk_to_openai, parse_chat_request, response_to_openai
@@ -364,7 +364,23 @@ def create_app(
             metadata_filters = payload.get("metadata_filters", payload.get("filters"))
             if not isinstance(source_ids, (list, tuple)):
                 raise ValueError("source_ids must be an array")
-            if rag_retriever is not None:
+            index_mode = str(payload.get("index_mode") or "fts")
+            granularity = payload.get("granularity")
+            if index_mode in {"keyword", "graph"}:
+                method = rag_store.keyword_search if index_mode == "keyword" else rag_store.graph_search
+                indexed = method(
+                    query, owner_scope=owner_scope, limit=payload.get("limit", 8),
+                    granularity=granularity, metadata_filters=metadata_filters,
+                )
+                hits = [
+                    RagHit(
+                        str(row["source_id"]), str(row["chunk_id"]), str(row.get("title", "")),
+                        int(row.get("ordinal", 0)), str(row.get("text", "")),
+                        float(row.get("keyword_score", row.get("graph_score", 0.0))), str(row.get("granularity") or "fixed"),
+                    ) for row in indexed
+                ]
+                retrieval = None
+            elif rag_retriever is not None:
                 retrieval = rag_retriever.search(
                     query,
                     owner_scope=owner_scope,
@@ -389,7 +405,7 @@ def create_app(
             )
         except (TypeError, ValueError) as exc:
             return JSONResponse(_error_body(str(exc), code="invalid_rag_query"), status_code=400)
-        response = {"query": query, "hits": [hit.as_dict() for hit in hits], "context": context.as_dict()}
+        response = {"query": query, "index_mode": index_mode, "granularity": granularity, "hits": [hit.as_dict() for hit in hits], "context": context.as_dict()}
         if retrieval is not None:
             response["retrieval"] = retrieval.as_dict()
         return response

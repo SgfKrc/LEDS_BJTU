@@ -8,6 +8,7 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,9 +17,71 @@ from .chunking import CHUNK_STRATEGIES, chunk_text
 
 
 RAG_METADATA_FIELDS = frozenset({"source", "scope", "type", "tag", "time"})
+INDEX_GRANULARITIES = frozenset({"document", "paragraph", "sentence", *CHUNK_STRATEGIES})
+_INDEX_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{1,63}|[\u3400-\u9fff]{2,32}")
+_INDEX_ENTITY = re.compile(r"\b[A-Z][A-Za-z0-9_.:-]{2,63}\b|[\u3400-\u9fff]{2,16}")
+_INDEX_STOPWORDS = frozenset({"the", "and", "or", "for", "with", "from", "this", "that", "uses", "use", "depends", "on"})
 _MAX_METADATA_FILTERS = 5
 _MAX_METADATA_VALUES = 20
 _MAX_METADATA_TEXT = 256
+
+
+def _index_tokens(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    tokens: list[str] = []
+    for match in _INDEX_TOKEN.finditer(normalized):
+        token = match.group(0)
+        if token in _INDEX_STOPWORDS or len(token) < 2:
+            continue
+        if re.fullmatch(r"[\u3400-\u9fff]{2,32}", token) and len(token) > 2:
+            tokens.extend(token[index:index + 2] for index in range(len(token) - 1))
+        else:
+            tokens.append(token)
+    return tuple(dict.fromkeys(tokens))
+
+
+def _index_phrases(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    words = [item for item in re.findall(r"[A-Za-z][A-Za-z0-9_.:-]{1,63}|[\u3400-\u9fff]{2,16}", normalized) if item not in _INDEX_STOPWORDS]
+    phrases = [
+        " ".join(words[index:index + size])
+        for size in range(2, min(4, len(words)) + 1)
+        for index in range(len(words) - size + 1)
+    ]
+    return tuple(dict.fromkeys(phrases))
+
+
+def _index_entities(text: str) -> tuple[str, ...]:
+    entities: list[str] = []
+    seen: set[str] = set()
+    for match in _INDEX_ENTITY.finditer(unicodedata.normalize("NFKC", text)):
+        name = match.group(0).strip()
+        normalized = name.casefold()
+        if len(name) >= 2 and normalized not in _INDEX_STOPWORDS and normalized not in seen:
+            seen.add(normalized)
+            entities.append(name)
+    return tuple(entities[:64])
+
+
+def _index_relations(text: str, entities: tuple[str, ...]) -> tuple[tuple[str, str, str], ...]:
+    if len(entities) < 2:
+        return ()
+    pattern = re.compile(
+        r"(?P<left>[A-Za-z][A-Za-z0-9_.:-]{2,63}|[\u3400-\u9fff]{2,16})\s*"
+        r"(?P<relation>uses?|depends?\s+on|->|浣跨敤|渚濊禆|鍏宠仈|璋冪敤)\s*"
+        r"(?P<right>[A-Za-z][A-Za-z0-9_.:-]{2,63}|[\u3400-\u9fff]{2,16})",
+        re.IGNORECASE,
+    )
+    known = {item.casefold(): item for item in entities}
+    relations: list[tuple[str, str, str]] = []
+    for match in pattern.finditer(text):
+        left = known.get(match.group("left").casefold())
+        right = known.get(match.group("right").casefold())
+        if left and right and left.casefold() != right.casefold():
+            relations.append((left, right, match.group("relation").casefold()))
+    if not relations:
+        relations.extend((entities[index], entities[index + 1], "cooccurs") for index in range(len(entities) - 1))
+    return tuple(dict.fromkeys(relations))
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +120,7 @@ class RagStore:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
@@ -103,6 +167,48 @@ class RagStore:
                     payload_json TEXT NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS rag_index_chunks (
+                    index_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES rag_sources(source_id) ON DELETE CASCADE,
+                    base_chunk_id TEXT REFERENCES rag_chunks(chunk_id) ON DELETE CASCADE,
+                    granularity TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    start_offset INTEGER NOT NULL,
+                    end_offset INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    UNIQUE(source_id, granularity, ordinal)
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_index_chunks_lookup
+                    ON rag_index_chunks(source_id, granularity, ordinal);
+                CREATE TABLE IF NOT EXISTS rag_keyword_index (
+                    index_id TEXT NOT NULL REFERENCES rag_index_chunks(index_id) ON DELETE CASCADE,
+                    term TEXT NOT NULL,
+                    term_kind TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(index_id, term, term_kind, position)
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_keyword_term
+                    ON rag_keyword_index(term, term_kind, index_id);
+                CREATE TABLE IF NOT EXISTS rag_entities (
+                    entity_id TEXT PRIMARY KEY,
+                    index_id TEXT NOT NULL REFERENCES rag_index_chunks(index_id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    entity_type TEXT NOT NULL DEFAULT 'rule',
+                    UNIQUE(index_id, normalized_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_entities_name
+                    ON rag_entities(normalized_name, index_id);
+                CREATE TABLE IF NOT EXISTS rag_relations (
+                    relation_id TEXT PRIMARY KEY,
+                    index_id TEXT NOT NULL REFERENCES rag_index_chunks(index_id) ON DELETE CASCADE,
+                    source_entity_id TEXT NOT NULL REFERENCES rag_entities(entity_id) ON DELETE CASCADE,
+                    target_entity_id TEXT NOT NULL REFERENCES rag_entities(entity_id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL,
+                    UNIQUE(index_id, source_entity_id, target_entity_id, relation)
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_relations_source
+                    ON rag_relations(source_entity_id, target_entity_id);
                 CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(
                     chunk_id UNINDEXED,
                     source_id UNINDEXED,
@@ -118,6 +224,79 @@ class RagStore:
             source_columns = {row[1] for row in connection.execute("PRAGMA table_info(rag_sources)")}
             if "metadata_json" not in source_columns:
                 connection.execute("ALTER TABLE rag_sources ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+            index_count = int(connection.execute("SELECT COUNT(*) FROM rag_index_chunks").fetchone()[0])
+            chunk_count = int(connection.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0])
+            if chunk_count and not index_count:
+                for row in connection.execute("SELECT chunk_id, source_id, ordinal, start_offset, end_offset, text, granularity FROM rag_chunks"):
+                    self._populate_index_row(
+                        connection, source_id=str(row[1]), base_chunk_id=str(row[0]),
+                        granularity=str(row[6] or "fixed"), ordinal=int(row[2]),
+                        start_offset=int(row[3]), end_offset=int(row[4]), text=str(row[5]),
+                    )
+
+    @staticmethod
+    def _index_id(source_id: str, granularity: str, ordinal: int, text: str) -> str:
+        return hashlib.sha256(f"idx\0{source_id}\0{granularity}\0{ordinal}\0{hashlib.sha256(text.encode()).hexdigest()}".encode()).hexdigest()
+
+    @classmethod
+    def _populate_index_row(
+        cls, connection: sqlite3.Connection, *, source_id: str, base_chunk_id: str | None,
+        granularity: str, ordinal: int, start_offset: int, end_offset: int, text: str,
+    ) -> str:
+        index_id = cls._index_id(source_id, granularity, ordinal, text)
+        connection.execute(
+            "INSERT OR REPLACE INTO rag_index_chunks(index_id, source_id, base_chunk_id, granularity, ordinal, start_offset, end_offset, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (index_id, source_id, base_chunk_id, granularity, ordinal, start_offset, end_offset, text),
+        )
+        connection.execute("DELETE FROM rag_keyword_index WHERE index_id=?", (index_id,))
+        terms = _index_tokens(text)
+        phrases = _index_phrases(text)
+        entries = [(index_id, term, "token", position) for position, term in enumerate(terms)]
+        entries.extend(
+            (index_id, term[:size], "prefix", position)
+            for position, term in enumerate(terms)
+            for size in range(2, min(32, len(term)) + 1)
+        )
+        entries.extend((index_id, phrase, "phrase", position) for position, phrase in enumerate(phrases))
+        connection.executemany(
+            "INSERT OR IGNORE INTO rag_keyword_index(index_id, term, term_kind, position) VALUES (?, ?, ?, ?)", entries,
+        )
+        connection.execute("DELETE FROM rag_relations WHERE index_id=?", (index_id,))
+        connection.execute("DELETE FROM rag_entities WHERE index_id=?", (index_id,))
+        entities = _index_entities(text)
+        entity_ids: dict[str, str] = {}
+        for name in entities:
+            normalized = name.casefold()
+            entity_id = hashlib.sha256(f"ent\0{index_id}\0{normalized}".encode()).hexdigest()
+            entity_ids[normalized] = entity_id
+            connection.execute(
+                "INSERT OR IGNORE INTO rag_entities(entity_id, index_id, name, normalized_name, entity_type) VALUES (?, ?, ?, ?, 'rule')",
+                (entity_id, index_id, name, normalized),
+            )
+        for left, right, relation in _index_relations(text, entities):
+            left_id, right_id = entity_ids.get(left.casefold()), entity_ids.get(right.casefold())
+            if left_id and right_id:
+                relation_id = hashlib.sha256(f"rel\0{index_id}\0{left_id}\0{right_id}\0{relation}".encode()).hexdigest()
+                connection.execute(
+                    "INSERT OR IGNORE INTO rag_relations(relation_id, index_id, source_entity_id, target_entity_id, relation) VALUES (?, ?, ?, ?, ?)",
+                    (relation_id, index_id, left_id, right_id, relation),
+                )
+        return index_id
+
+    def _index_document_views(self, connection: sqlite3.Connection, *, source_id: str, text: str, chunks: list[Any], chunk_ids: list[str], max_chars: int, overlap_chars: int) -> None:
+        for ordinal, chunk in enumerate(chunks):
+            self._populate_index_row(
+                connection, source_id=source_id, base_chunk_id=chunk_ids[ordinal], granularity=chunk.granularity,
+                ordinal=ordinal, start_offset=chunk.start_offset, end_offset=chunk.end_offset, text=chunk.text,
+            )
+        self._populate_index_row(connection, source_id=source_id, base_chunk_id=None, granularity="document", ordinal=0, start_offset=0, end_offset=len(text), text=text)
+        for granularity in ("paragraph", "sentence"):
+            views = chunk_text(text, max_chars=max_chars, overlap_chars=overlap_chars, strategy=granularity)
+            for ordinal, chunk in enumerate(views):
+                self._populate_index_row(
+                    connection, source_id=source_id, base_chunk_id=None, granularity=granularity,
+                    ordinal=ordinal, start_offset=chunk.start_offset, end_offset=chunk.end_offset, text=chunk.text,
+                )
 
     def add_document(
         self,
@@ -148,6 +327,7 @@ class RagStore:
         with self._connect() as connection:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("DELETE FROM rag_chunks_fts WHERE source_id = ? AND owner_scope = ?", (source_id, owner_scope))
+            connection.execute("DELETE FROM rag_index_chunks WHERE source_id = ?", (source_id,))
             connection.execute("DELETE FROM rag_chunks WHERE source_id = ? AND owner_scope = ?", (source_id, owner_scope))
             connection.execute("DELETE FROM rag_metadata_index WHERE source_id = ? AND owner_scope = ?", (source_id, owner_scope))
             connection.execute(
@@ -159,8 +339,10 @@ class RagStore:
                     "INSERT INTO rag_metadata_index(source_id, owner_scope, field, value) VALUES (?, ?, ?, ?)",
                     (source_id, owner_scope, field, value),
                 )
+            inserted_chunk_ids: list[str] = []
             for chunk in chunks:
                 chunk_id = f"chk_{hashlib.sha256((source_id + "\0" + str(chunk.ordinal) + "\0" + chunk.text).encode()).hexdigest()[:24]}"
+                inserted_chunk_ids.append(chunk_id)
                 connection.execute(
                     "INSERT INTO rag_chunks(chunk_id, source_id, owner_scope, ordinal, start_offset, end_offset, text, granularity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (chunk_id, source_id, owner_scope, chunk.ordinal, chunk.start_offset, chunk.end_offset, chunk.text, chunk.granularity),
@@ -169,7 +351,134 @@ class RagStore:
                     "INSERT INTO rag_chunks_fts(chunk_id, source_id, owner_scope, title, text) VALUES (?, ?, ?, ?, ?)",
                     (chunk_id, source_id, owner_scope, title, chunk.text),
                 )
+            self._index_document_views(
+                connection, source_id=source_id, text=text, chunks=chunks,
+                chunk_ids=inserted_chunk_ids, max_chars=max_chars, overlap_chars=overlap_chars,
+            )
         return {"source_id": source_id, "owner_scope": owner_scope, "title": title, "metadata": metadata_value, "strategy": strategy, "chunk_count": len(chunks), "content_sha256": digest}
+
+    def list_index_chunks(self, *, owner_scope: str = "local", granularity: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        owner_scope = _scope(owner_scope)
+        if granularity is not None and granularity not in INDEX_GRANULARITIES:
+            raise ValueError("index granularity is unsupported")
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 10_000:
+            raise ValueError("index limit must be between 1 and 10000")
+        clauses = ["s.owner_scope=?"]
+        params: list[Any] = [owner_scope]
+        if granularity:
+            clauses.append("i.granularity=?")
+            params.append(granularity)
+        params.append(int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT i.index_id, i.base_chunk_id, i.source_id, i.granularity, i.ordinal, i.start_offset, i.end_offset, i.text "
+                "FROM rag_index_chunks i JOIN rag_sources s ON s.source_id=i.source_id WHERE " + " AND ".join(clauses) +
+                " ORDER BY i.source_id, i.granularity, i.ordinal LIMIT ?", params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def keyword_search(
+        self, query: str, *, owner_scope: str = "local", limit: int = 20, granularity: str | None = None,
+        metadata_filters: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        owner_scope = _scope(owner_scope)
+        if not isinstance(query, str) or not query.strip() or len(query) > 512 or "\x00" in query:
+            raise ValueError("query must be non-empty, bounded, and NUL-free")
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 100:
+            raise ValueError("query limit must be between 1 and 100")
+        if granularity is not None and granularity not in INDEX_GRANULARITIES:
+            raise ValueError("index granularity is unsupported")
+        filters = _normalize_metadata_filters(metadata_filters)
+        terms, phrases = _index_tokens(query), _index_phrases(query)
+        if not terms and not phrases:
+            return []
+        clauses = ["s.owner_scope=?"]
+        params: list[Any] = [owner_scope]
+        route_clauses: list[str] = []
+        if terms:
+            route_clauses.append("(k.term_kind='token' AND k.term IN (" + ",".join("?" for _ in terms) + "))")
+            params.extend(terms)
+            route_clauses.append("(k.term_kind='prefix' AND k.term IN (" + ",".join("?" for _ in terms) + "))")
+            params.extend(term[:32] for term in terms)
+            route_clauses.append("(k.term_kind='token' AND (" + " OR ".join("k.term LIKE ? ESCAPE '\\'" for _ in terms) + "))")
+            params.extend(term.replace("%", "\\%").replace("_", "\\_") + "%" for term in terms)
+        if phrases:
+            route_clauses.append("(k.term_kind='phrase' AND k.term IN (" + ",".join("?" for _ in phrases) + "))")
+            params.extend(phrases)
+        clauses.append("(" + " OR ".join(route_clauses) + ")")
+        if granularity:
+            clauses.append("i.granularity=?")
+            params.append(granularity)
+        for field, values in filters:
+            placeholders = ",".join("?" for _ in values)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM rag_metadata_index mi WHERE mi.source_id=i.source_id AND mi.owner_scope=s.owner_scope "
+                "AND mi.field=? AND mi.value IN (" + placeholders + "))"
+            )
+            params.extend((field, *values))
+        params.append(int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT i.index_id AS chunk_id, i.base_chunk_id, i.source_id, s.title, i.granularity, i.ordinal, "
+                "i.start_offset, i.end_offset, i.text, SUM(CASE WHEN k.term_kind='phrase' THEN 2.0 ELSE 1.0 END) AS keyword_score "
+                "FROM rag_keyword_index k JOIN rag_index_chunks i ON i.index_id=k.index_id JOIN rag_sources s ON s.source_id=i.source_id "
+                "WHERE " + " AND ".join(clauses) + " GROUP BY i.index_id ORDER BY keyword_score DESC, i.ordinal ASC, i.index_id ASC LIMIT ?", params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def graph_search(self, query: str, *, owner_scope: str = "local", limit: int = 20, granularity: str | None = None, depth: int = 1) -> list[dict[str, Any]]:
+        if isinstance(depth, bool) or not 0 <= int(depth) <= 2:
+            raise ValueError("graph depth must be between 0 and 2")
+        results = self.keyword_search(query, owner_scope=owner_scope, limit=limit, granularity=granularity)
+        names = {item.casefold() for item in _index_entities(query)}
+        if not names or depth == 0:
+            for row in results:
+                row["graph_score"], row["graph_entities"] = 0.0, []
+            return results
+        with self._connect() as connection:
+            matched = connection.execute(
+                "SELECT entity_id FROM rag_entities WHERE normalized_name IN (" + ",".join("?" for _ in names) + ")", tuple(names)
+            ).fetchall()
+            frontier = {str(row[0]) for row in matched}
+            reached = set(frontier)
+            for _ in range(int(depth)):
+                if not frontier:
+                    break
+                placeholders = ",".join("?" for _ in frontier)
+                adjacent = connection.execute(
+                    "SELECT target_entity_id FROM rag_relations WHERE source_entity_id IN (" + placeholders + ") UNION SELECT source_entity_id FROM rag_relations WHERE target_entity_id IN (" + placeholders + ")",
+                    tuple(frontier) + tuple(frontier),
+                ).fetchall()
+                frontier = {str(row[0]) for row in adjacent} - reached
+                reached.update(frontier)
+            related = []
+            if reached:
+                placeholders = ",".join("?" for _ in reached)
+                related = connection.execute(
+                    "SELECT DISTINCT i.index_id, e.name, i.base_chunk_id, i.source_id, s.title, i.ordinal, i.granularity, i.text "
+                    "FROM rag_entities e JOIN rag_index_chunks i ON i.index_id=e.index_id JOIN rag_sources s ON s.source_id=i.source_id "
+                    "WHERE e.entity_id IN (" + placeholders + ") AND s.owner_scope=?", tuple(reached) + (owner_scope,),
+                ).fetchall()
+        by_id: dict[str, list[str]] = {}
+        for row in related:
+            by_id.setdefault(str(row[0]), []).append(str(row[1]))
+        for row in results:
+            matched_names = by_id.get(str(row["chunk_id"]), [])
+            row["graph_score"] = 0.25 * len(matched_names)
+            row["graph_entities"] = matched_names
+        seen = {str(row["chunk_id"]) for row in results}
+        for row in related:
+            index_id = str(row[0])
+            if index_id in seen:
+                continue
+            seen.add(index_id)
+            results.append({
+                "chunk_id": index_id, "base_chunk_id": row[2], "source_id": row[3], "title": row[4],
+                "ordinal": row[5], "granularity": row[6] or "fixed", "text": row[7],
+                "keyword_score": 0.0, "graph_score": 0.25, "graph_entities": by_id.get(index_id, []),
+            })
+        results.sort(key=lambda row: (-float(row.get("graph_score", 0.0)), -float(row.get("keyword_score", 0.0)), str(row["chunk_id"])))
+        return results[:int(limit)]
 
     def search(
         self,
@@ -302,7 +611,30 @@ class RagStore:
         with self._connect() as connection:
             sources = int(connection.execute("SELECT COUNT(*) FROM rag_sources").fetchone()[0])
             chunks = int(connection.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0])
-        return {"backend": "sqlite_fts5", "sources": sources, "chunks": chunks, "embeddings": "optional_not_configured"}
+            index_chunks = int(connection.execute("SELECT COUNT(*) FROM rag_index_chunks").fetchone()[0])
+            keyword_terms = int(connection.execute("SELECT COUNT(*) FROM rag_keyword_index").fetchone()[0])
+            entities = int(connection.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0])
+            relations = int(connection.execute("SELECT COUNT(*) FROM rag_relations").fetchone()[0])
+        return {
+            "backend": "sqlite_fts5", "sources": sources, "chunks": chunks,
+            "index_chunks": index_chunks, "keyword_terms": keyword_terms,
+            "entities": entities, "relations": relations, "embeddings": "optional_not_configured",
+        }
+
+    def index_health(self) -> dict[str, Any]:
+        """Return counts for model-free materialized index layers."""
+        with self._connect() as connection:
+            granularities = {
+                str(row[0]): int(row[1])
+                for row in connection.execute("SELECT granularity, COUNT(*) FROM rag_index_chunks GROUP BY granularity")
+            }
+            return {
+                "schema": "qlh.rag_index.v1", "model_free": True, "granularities": granularities,
+                "index_chunks": int(connection.execute("SELECT COUNT(*) FROM rag_index_chunks").fetchone()[0]),
+                "keyword_terms": int(connection.execute("SELECT COUNT(*) FROM rag_keyword_index").fetchone()[0]),
+                "entities": int(connection.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]),
+                "relations": int(connection.execute("SELECT COUNT(*) FROM rag_relations").fetchone()[0]),
+            }
 
     def _snapshot_digest(self, owner_scope: str, connection: sqlite3.Connection | None = None) -> str:
         owner_scope = _scope(owner_scope)
@@ -435,4 +767,4 @@ def _like_prefix(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
-__all__ = ["RAG_METADATA_FIELDS", "RagHit", "RagStore"]
+__all__ = ["INDEX_GRANULARITIES", "RAG_METADATA_FIELDS", "RagHit", "RagStore"]

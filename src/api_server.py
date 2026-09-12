@@ -1143,6 +1143,8 @@ class RagSearchRequest(BaseModel):
     access_scope: Literal["owner", "local_system", "project"] = "owner"
     limit: int = Field(default=20, ge=1, le=100)
     mode: Literal["fts", "hybrid"] = "fts"
+    index_mode: Literal["fts", "keyword", "graph"] = "fts"
+    granularity: Optional[str] = None
     provider: str = Field(default="ollama", min_length=1, max_length=64)
     model_id: str = Field(default="nomic-embed-text:latest", min_length=1, max_length=128)
     model_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
@@ -2449,7 +2451,7 @@ def _rag_public_result(row: dict[str, Any]) -> dict[str, Any]:
         "granularity": row.get("granularity") or "fixed",
         "snippet": text[:800],
         **{
-            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code", "rewritten_query_count", "fts_route_count")
+            key: row[key] for key in ("rank", "lexical_score", "vector_score", "hybrid_score", "hybrid_mode", "vector_reason_code", "rewritten_query_count", "fts_route_count", "keyword_score", "graph_score", "graph_entities")
             if key in row
         },
     }
@@ -2501,7 +2503,15 @@ async def rag_search(req: RagSearchRequest):
         store = _get_rag_store()
         metadata_filters = req.metadata_filters or (req.filters or {})
         rewritten_queries = rewrite_query(req.query, max_variants=req.rewrite_limit)
-        if req.mode == "fts":
+        if req.mode == "fts" and req.index_mode in {"keyword", "graph"}:
+            search_method = store.keyword_search if req.index_mode == "keyword" else store.graph_search
+            rows = await run_in_threadpool(
+                lambda: search_method(
+                    req.query, access_scope=req.access_scope, limit=req.limit,
+                    granularity=req.granularity, metadata_filters=metadata_filters,
+                )
+            )
+        elif req.mode == "fts":
             rows = await run_in_threadpool(
                 lambda: _search_rewritten_fts(
                     store, rewritten_queries, access_scope=req.access_scope, limit=req.limit,
@@ -2530,6 +2540,8 @@ async def rag_search(req: RagSearchRequest):
             )
         return {
             "mode": req.mode,
+            "index_mode": req.index_mode,
+            "granularity": req.granularity,
             "provider": req.provider if req.mode == "hybrid" else None,
             "results": [_rag_public_result(row) for row in rows],
             "count": len(rows),
