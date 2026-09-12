@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -112,7 +112,7 @@
 
 ## 3. 边界（明确不做）
 
-1. **不给子智能体写权限**：桥接层永远是只读执行器，"谁改代码"始终是 Codex（主智能体）。
+1. **默认不给子智能体写权限**：桥接层默认是只读执行器；只有 W1 的双开关、路径白名单、干净树和回滚门全部满足时，才允许显式 `mode=implement`，主 agent 仍负责审查。
 2. **不把 128MB 会话历史上限做成可配置**：它是 Reasonix 的硬约束，只能压缩或轮换，不能声明为"可调"。
 3. **不引入运行时依赖**：保持 zero-dependency（Node 内置模块 + `node:test`）；需要外部能力时用 CLI 而非 SDK。
 4. **不在桥接层做自动模型选择/降级**：模型必须显式选择；唯一的"自动"是回退到本机 `default_model`，且必须在 `reasonix_status` 里标注来源。
@@ -178,3 +178,4 @@
 | 2026-09-12 | `TOOL-RXB-G2` 完成：package 版本固定为 semver `0.1.0`，新增首版 `CHANGELOG.md` 与版本一致性回归；子仓创建注释 tag `v0.1.0`；`npm test` 32 项通过 |
 | 2026-09-12 | `TOOL-RXB-G3` 暂缓：本机 `wsl.exe --list --quiet` 返回空列表，Docker/QEMU/VirtualBox 不可用，未伪造 POSIX 运行证据 |
 | 2026-09-12 | `TOOL-RXB-G4` 完成：主仓新增接线清单，登记 Codex 配置、`deepseek-worker` profile、Reasonix CLI、workspace root、换机命令与脱敏边界；通过 `configure show`/`codex` 无写入预览核对 |
+| 2026-09-12 | `TOOL-RXB-W1` 完成：bridge 默认关闭 `mode=implement`，显式 `allowWrite` + 非空 `allowedPaths` + 干净 Git 树后才允许写入；越界路径或 worker 失败回滚本次变化，离线回归 36 项通过 |
