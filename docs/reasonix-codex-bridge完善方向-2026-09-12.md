@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -179,3 +179,4 @@
 | 2026-09-12 | `TOOL-RXB-G3` 暂缓：本机 `wsl.exe --list --quiet` 返回空列表，Docker/QEMU/VirtualBox 不可用，未伪造 POSIX 运行证据 |
 | 2026-09-12 | `TOOL-RXB-G4` 完成：主仓新增接线清单，登记 Codex 配置、`deepseek-worker` profile、Reasonix CLI、workspace root、换机命令与脱敏边界；通过 `configure show`/`codex` 无写入预览核对 |
 | 2026-09-12 | `TOOL-RXB-W1` 完成：bridge 默认关闭 `mode=implement`，显式 `allowWrite` + 非空 `allowedPaths` + 干净 Git 树后才允许写入；越界路径或 worker 失败回滚本次变化，离线回归 36 项通过 |
+| 2026-09-12 | `TOOL-RXB-W2` 完成：成功写调用仅返回 `qlh.reasonix.changes.v1` 结构化变更集（路径、增删行数、diff stat、SHA-256），不返回 worker 输出或文件正文；新增 `reasonix_rollback` 一次性回滚令牌，回滚前校验后续修改并冲突拒绝；令牌仅存当前 bridge 进程，离线回归 37 项通过 |

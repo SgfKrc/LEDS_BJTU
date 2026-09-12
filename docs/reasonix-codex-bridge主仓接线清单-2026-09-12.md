@@ -62,7 +62,7 @@ REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 ## 接线后验收
 
 1. `configure verify` 输出 CLI、model ref、profile model/read-only 和实际 `allowed-tools`，且无 `FAIL`。
-2. Codex 重启后，MCP `tools/list` 只出现 `reasonix_run` 与 `reasonix_status`；`mode=implement` 保持拒绝。
+2. Codex 重启后，MCP `tools/list` 出现 `reasonix_run`、`reasonix_rollback` 与 `reasonix_status`；`mode=implement` 只有在写入策略显式启用时才允许。
 3. `reasonix_status` 的 `workspaceRoot`、`modelRefSource`、能力摘要和限额与目标机配置一致。
 4. `npm run check`、`npm test`、`npm run check:links` 全绿；这些检查不下载模型、不联网调用 provider。
 
