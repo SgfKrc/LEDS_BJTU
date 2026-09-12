@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1` 已完成，R2–R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2` 已完成，R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -128,7 +128,7 @@
 4. **C1 profile 同步 + verify drift 检查** —— 消除"配置两处不一致"这一最常见误配
 5. **R1 结构化日志 + R3 队列可观测** —— 先有观测，才谈优化
 6. **C3 doctor 缓存** —— 降低每次启动/配置的固定开销
-7. 其余（C2/C4/R2/E1–E4/G1–G4）按需插入
+7. 其余（C2/C4/R3/E1–E4/G1–G4）按需插入
 
 ---
 
@@ -167,3 +167,4 @@
 | 2026-09-12 | `TOOL-RXB-C3` 完成：doctor 摘要缓存加入 CLI mtime/version/抓取时间元数据，默认 TTL 10 分钟，支持 `--refresh`，损坏/过期/CLI 变更自动重取；本机 `configure list` 首次/命中/强刷为 `2317ms`/`90ms`/`2227ms`，`npm test` 19 项通过 |
 | 2026-09-12 | `TOOL-RXB-C4` 完成：新增路径无关、脱敏的 `configure export` JSON 摘要与只读 `configure import <file|->` 对照；拒绝 key、endpoint、用户路径等外部敏感值，`npm test` 20 项通过 |
 | 2026-09-12 | `TOOL-RXB-R1` 完成：`BRIDGE_LOG` 可选 JSONL 脱敏调用日志覆盖成功、拒绝、非零退出，不记录 task/输出正文、模型 ref 或绝对路径；未设置时零写入，`npm test` 21 项通过 |
+| 2026-09-12 | `TOOL-RXB-R2` 完成：`bridge.config.json.limits` 支持 steps/timeout/output/queue 覆盖，非法值回退并一次告警，超过代码硬上限夹紧；`reasonix_status.limits` 反映有效值，离线回归 `npm test` 23 项通过 |
