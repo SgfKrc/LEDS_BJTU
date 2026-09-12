@@ -30,7 +30,7 @@ cd tools\reasonix-codex-bridge
 node src\configure.mjs list
 node src\configure.mjs use <provider/model-from-list>
 node src\configure.mjs codex --write
-node src\configure.mjs profile --create --write
+node src\configure.mjs profile --role read --create --write
 node src\configure.mjs verify
 
 npm run check
@@ -44,6 +44,13 @@ npm run check:links
 node src\configure.mjs profile --sync --write
 ```
 
+需要受控写入时，先单独生成写角色；它不会改写默认只读 profile：
+
+```powershell
+node src\configure.mjs profile --role write --create --write
+node src\configure.mjs verify --role write
+```
+
 `configure codex --write` 会先校验、备份并原子更新 `%USERPROFILE%\.codex\config.toml`；不希望自动写入时先运行不带 `--write` 的预览命令。`configure profile` 的写入同样必须显式带 `--write`。
 
 ## Codex 环境契约
@@ -53,11 +60,11 @@ node src\configure.mjs profile --sync --write
 ```toml
 REASONIX_EXE = "<目标机 reasonix-cli 路径>"
 REASONIX_ROOT = "<目标 workspace root>"
-REASONIX_SUBAGENT = "deepseek-worker"
+REASONIX_SUBAGENT = "deepseek-worker"  # 默认只读；受控 implement 才显式切换为 deepseek-worker-write
 REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 ```
 
-`REASONIX_EXE` 也可以省略，让 bridge 按 README 的标准路径顺序探测。`REASONIX_MODEL_REF` 不应复制另一台机器的值；目标机必须重新运行 `configure list`。profile 的只读工具集合由 `configure profile --sync --write` 固定为 `read_file, grep, glob, ls, code_index, git_log, git_diff`，`verify` 会列出实际集合并拒绝漂移。
+`REASONIX_EXE` 也可以省略，让 bridge 按 README 的标准路径顺序探测。`REASONIX_MODEL_REF` 不应复制另一台机器的值；目标机必须重新运行 `configure list`。默认 read profile 的工具集合由 `configure profile --role read --sync --write` 固定为 `read_file, grep, glob, ls, code_index, git_log, git_diff`；write profile 只额外增加 `edit_file, write_file` 且不带 `read-only`。`verify --role read/write` 会列出对应实际集合并拒绝漂移。主 agent 负责指挥、diff/测试审查和越界检查，子 agent 只在 W1/W2 策略已显式开启时执行写入。
 
 ## 接线后验收
 
