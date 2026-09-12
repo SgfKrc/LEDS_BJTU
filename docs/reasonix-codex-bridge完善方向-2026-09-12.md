@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1` 已完成，G2–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2` 已完成，G3–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -128,7 +128,7 @@
 4. **C1 profile 同步 + verify drift 检查** —— 消除"配置两处不一致"这一最常见误配
 5. **R1 结构化日志 + R3 队列可观测** —— 先有观测，才谈优化
 6. **C3 doctor 缓存** —— 降低每次启动/配置的固定开销
-7. 其余（C2/C4/R3/G2–G4）按需插入
+7. 其余（C2/C4/R3/G3–G4）按需插入
 
 ---
 
@@ -174,3 +174,4 @@
 | 2026-09-12 | `TOOL-RXB-E3` 完成：`reasonix_status` 透传当前 ref 的 `contextWindow`/`vision`/`base_url_host` 能力摘要；调用前按 UTF-8 字节保守估算 task tokens，明显超过上限时拒绝且不启动 worker；能力探测不落盘 doctor cache，`npm test` 29 项通过 |
 | 2026-09-12 | `TOOL-RXB-E4` 完成：profile 只读白名单扩展为 `read_file,grep,glob,ls,code_index,git_log,git_diff`，README/worker prompt 同步登记；`profile --sync` 固定该集合，`verify` 列出实际工具并对集合漂移 fail-closed；`npm test` 30 项通过 |
 | 2026-09-12 | `TOOL-RXB-G1` 完成：新增 `.github/workflows/ci.yml`，Node 20 离线执行 `npm run check`、`npm test`、`npm run check:links`；链接检查只解析 README 本地相对路径，外部 URL/anchor/mailto 不触网；`npm test` 31 项通过 |
+| 2026-09-12 | `TOOL-RXB-G2` 完成：package 版本固定为 semver `0.1.0`，新增首版 `CHANGELOG.md` 与版本一致性回归；子仓创建注释 tag `v0.1.0`；`npm test` 32 项通过 |
