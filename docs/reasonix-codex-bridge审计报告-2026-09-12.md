@@ -6,7 +6,7 @@
 
 ## 结论
 
-当前默认配置没有 `allowWrite: true`，默认 profile 也是 read profile，因此本机默认暴露面较低。但实现路径目前不应作为“写入安全”已收口：发现 2 项可复现的 P1 缺陷，均涉及越权写入或越权修改保留。修复并补充回归测试前，建议继续保持写入关闭。
+初审时默认配置没有 `allowWrite: true`，默认 profile 也是 read profile，因此本机默认暴露面较低；当时发现 2 项可复现的 P1 缺陷，均涉及越权写入或越权修改保留。2026-09-13 复验确认 BR-001～BR-005 的代码级修复和回归测试已完成，写入策略仍保持关闭，未将受控写 profile 作为默认生产通道开放。
 
 未发现 P0；未发现 MCP 输入可直接绕过 workspace 根目录校验的证据。
 
@@ -75,7 +75,7 @@
 
 | 检查 | 结果 |
 |---|---|
-| `npm test` | 40 passed, 0 failed |
+| `npm test` | 初审 40 passed；复验 47 passed, 0 failed |
 | `npm run check` | 通过，所有模块语法检查通过 |
 | `npm run check:links` | README 本地链接通过 |
 | `node --test --experimental-test-coverage` | 行 90.80%，分支 53.73%，函数 90.34% |
@@ -95,13 +95,13 @@
 
 ## 整改顺序
 
-1. 修复 BR-001：把 profile role 纳入模式授权，默认只读模式不可调用 write profile。
-2. 修复 BR-002：默认强制 clean tree，或改为全工作区快照比较；为该行为补回归测试。
-3. 将 rollback 纳入同一串行队列，并补并发测试。
-4. 收紧 Windows CLI 启动方式并补 shell 参数测试。
-5. 增加失败注入、权限/链接/二进制和真实 CLI 的分层集成测试；解决本机 Reasonix 配置目录的权限迁移问题后，再重新运行桥接子 agent 审查。
+1. 修复 BR-001：把 profile role 纳入模式授权，默认只读模式不可调用 write profile。**已完成（2026-09-12）**。
+2. 修复 BR-002：默认强制 clean tree，或改为全工作区快照比较；为该行为补回归测试。**已完成（2026-09-12）**。
+3. 将 rollback 纳入同一串行队列，并补并发测试。**已完成（2026-09-13）**。
+4. 收紧 Windows CLI 启动方式并补 shell 参数测试。**已完成（2026-09-13）**。
+5. 增加失败注入、权限/链接/二进制和真实 CLI 的分层集成测试；解决本机 Reasonix 配置目录的权限迁移问题后，再重新运行桥接子 agent 审查。**部分完成**：本轮补齐并发、类型变化/缺失、Windows 参数和 restore 后哈希回归；ACL 权限失败、POSIX/WSL、真实 provider/model 质量证据仍待对应环境。
 
-审计判定：功能测试通过不等于写入安全收口。当前可继续用于默认只读 inspect/review，但写 profile 和 `allowWrite=true` 应保持受控，不建议在修复前作为生产写入通道启用。
+审计判定：BR-001～BR-005 的代码级风险已由复验关闭，默认只读 inspect/review 可继续使用；写 profile 和 `allowWrite=true` 仍保持受控，直至 G3 跨 POSIX 环境和真实集成证据补齐后再评估生产开放。
 
 ## 修复跟踪
 
@@ -109,8 +109,16 @@
 |---|---|---|---|
 | `TOOL-RXB-AUD-01` | BR-001 非 implement 模式未强制只读 profile | **已完成（2026-09-12）** | 子项目 commit `f6bacd7`；回归测试 `43 passed` |
 | `TOOL-RXB-AUD-02` | BR-002 dirty-tree 状态不变修改漏报 | **已完成（2026-09-12）** | 子项目 commit `a361634`；`requireCleanTree=false` fail-closed 回归通过 |
-| `TOOL-RXB-AUD-03` | BR-003 rollback 绕过串行队列 | 待处理 | 设计风险，待并发回归 |
-| `TOOL-RXB-AUD-04` | BR-004 Windows `.cmd` shell 参数 | 待处理 | 需 Windows 参数回归 |
-| `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | 待处理 | 需权限失败边界测试 |
+| `TOOL-RXB-AUD-03` | BR-003 rollback 绕过串行队列 | **已完成（2026-09-13）** | 回滚接入 implement 共用队列；同一工作区并发回归通过 |
+| `TOOL-RXB-AUD-04` | BR-004 Windows `.cmd` shell 参数 | **已完成（2026-09-13）** | `shell:false` + 显式 `cmd.exe`；元字符拒绝与 `.cmd` 启动回归通过 |
+| `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | **已完成（2026-09-13）** | `readable/missing/unreadable` 三态；类型变化、缺失和 restore 后 SHA-256 回归通过 |
 
-本次已关闭 BR-001、BR-002；BR-003 及后续发现仍按优先级执行。
+本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
+
+## 复验记录（2026-09-13）
+
+- 主节点 Codex 只读审计复核确认修复方向：AUD-03 的回滚请求进入与 implement 相同的串行队列；AUD-04 的 `.cmd/.bat` 调用不再启用 `shell=true`，危险元字符在启动前 fail-closed；AUD-05 的回滚目标区分 `missing`、`unreadable` 和 SHA-256，恢复后再次检查状态与哈希。
+- 本机 Reasonix 只读复核本轮以 worker exit code 1 结束，没有产出可采纳报告；未把该失败当作通过证据，也未开放 Reasonix 写入配置。
+- `npm test`：47 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
+- 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核。
+- 未伪造 ACL 权限失败、POSIX/WSL 或真实 provider/model 质量证据；这些仍属于环境或集成层后续验证。

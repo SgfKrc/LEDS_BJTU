@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -183,3 +183,6 @@
 | 2026-09-12 | `TOOL-RXB-W3` 完成：新增独立 write profile 与专用 prompt，`configure profile --role read/write` 可分别生成/同步并验证角色 guard；write profile 只在 read 工具集合上增加 `edit_file,write_file`，不带 `read-only`，README 固化主 agent 指挥、子 agent 执行、主 agent 审查/回滚流程，离线回归 40 项通过 |
 | 2026-09-12 | `TOOL-RXB-AUD-01` 完成：审计发现的模式授权边界已修复；inspect/review/plan 强制 read-role，implement 要求显式 write-role，canonical `-write` profile 不可被 `REASONIX_SUBAGENT_ROLE=read` 降级；离线回归 43 项通过，子项目 commit `f6bacd7` |
 | 2026-09-12 | `TOOL-RXB-AUD-02` 完成：拒绝不安全的 `requireCleanTree=false` opt-out，受控写入统一要求 clean Git tree；新增 worker 不启动回归，子项目 commit `a361634` |
+| 2026-09-13 | `TOOL-RXB-AUD-03` 完成：显式 `reasonix_rollback` 纳入与 implement 共用的进程内串行队列；新增同一工作区并发回归，验证 rollback 不与 worker 写入交错 |
+| 2026-09-13 | `TOOL-RXB-AUD-04` 完成：Windows `.cmd/.bat` 通过显式 `cmd.exe /d /s /c`、`shell:false` 启动；命令元字符在进程创建前拒绝，`configure`、doctor、version、worker 共用安全调用解析器，并补启动/参数回归 |
+| 2026-09-13 | `TOOL-RXB-AUD-05` 完成：rollback 哈希改为 `readable/missing/unreadable` 三态；不可读和类型变化默认拒绝，缺失与哈希冲突分别返回语义化错误，restore 后复核 Git 状态与 SHA-256 |
