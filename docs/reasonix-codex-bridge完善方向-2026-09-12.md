@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2` 已完成，`TOOL-RXB-T3` 交主节点执行。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2` 已完成，`TOOL-RXB-T3` 交主节点执行，C1–C4/R1–R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
