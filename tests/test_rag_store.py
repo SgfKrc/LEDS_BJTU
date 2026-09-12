@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from src.rag_store import RagStore, RagStoreError
+from src.rag_store import RagStore, RagStoreError, rewrite_query
 
 
 def _store(tmp_path):
@@ -160,6 +160,61 @@ def test_metadata_revision_conflict_and_filter_audit_are_explicit(tmp_path):
         assert '"alpha"' not in filters
     finally:
         connection.close()
+
+
+def test_query_rewrite_is_deterministic_and_bounded():
+    first = rewrite_query("  SQLite\n检索  ")
+    second = rewrite_query("SQLite 检索")
+    assert first == second
+    assert first[0] == "SQLite 检索"
+    assert any("database" in item.lower() or "数据库" in item for item in first)
+    assert len(first) <= 4
+    assert "SQLite" in rewrite_query("SQLite and 检索", max_variants=4)[0]
+    assert "检索" in rewrite_query("SQLite and 检索", max_variants=4)
+    with pytest.raises(RagStoreError) as exc:
+        rewrite_query("检索", max_variants=0)
+    assert exc.value.code == "rewrite_limit_invalid"
+
+
+def test_hybrid_search_fuses_rewritten_fts_routes_with_adjustable_weights(tmp_path):
+    store = _store(tmp_path)
+    result = _ingest(store, source_id="rewrite-doc", relative_ref="docs/rewrite.md", text="retrieval contract", revision="r1")
+    with pytest.raises(RagStoreError) as exc:
+        store.hybrid_search(
+            "检索", [1.0, 0.0], provider="ollama", model_id="nomic-embed-text:latest",
+            model_sha256="a" * 64, dimensions=2, fts_weight=0, vector_weight=0,
+        )
+    assert exc.value.code == "route_weight_invalid"
+    rows = store.hybrid_search(
+        "检索", [1.0, 0.0], provider="ollama", model_id="nomic-embed-text:latest",
+        model_sha256="a" * 64, dimensions=2, per_route_limit=1, rewrite_limit=2,
+        fts_weight=1.0, vector_weight=0.0,
+    )
+    assert rows[0]["source_id"] == "rewrite-doc"
+    assert rows[0]["hybrid_mode"] == "fts_only"
+    assert rows[0]["rewritten_query_count"] == 2
+    assert rows[0]["fts_route_count"] >= 1
+    assert result.document_id
+
+
+def test_hybrid_search_applies_bounded_rule_rerank_after_fusion(tmp_path):
+    store = _store(tmp_path)
+    _ingest(store, source_id="rerank-doc", relative_ref="docs/rerank.md", text="alpha budget exact phrase", revision="r1")
+    rows = store.hybrid_search(
+        "alpha budget", [1.0, 0.0], provider="ollama", model_id="nomic-embed-text:latest",
+        model_sha256="a" * 64, dimensions=2, fts_weight=1.0, vector_weight=0.0,
+        limit=3, rerank_candidate_k=2, rerank_weight=1.0,
+    )
+    assert rows and len(rows) <= 2
+    assert rows[0]["rerank_mode"] == "lexical"
+    assert 1 <= rows[0]["rerank_candidate_count"] <= 2
+    assert rows[0]["rerank_score"] >= 0
+    disabled = store.hybrid_search(
+        "alpha", [1.0, 0.0], provider="ollama", model_id="nomic-embed-text:latest",
+        model_sha256="a" * 64, dimensions=2, fts_weight=1.0, vector_weight=0.0,
+        limit=2, rerank_candidate_k=1, rerank_mode="none",
+    )
+    assert disabled and disabled[0]["rerank_mode"] == "none"
 
 
 def test_fts_delete_rebuild_and_invalid_query_are_atomic(tmp_path):

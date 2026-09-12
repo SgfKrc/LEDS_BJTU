@@ -75,6 +75,38 @@ def test_rag_api_exposes_chunk_granularity(monkeypatch, tmp_path):
     assert response.json()["results"][0]["granularity"] == "section"
 
 
+def test_rag_api_applies_rewritten_fts_routes_and_returns_route_config(monkeypatch, tmp_path):
+    store = RagStore(tmp_path / "rag.sqlite3", max_chunk_chars=256)
+    store.ingest_document(
+        source_id="rewrite-doc", relative_ref="docs/rewrite.md", sha256=None,
+        mime="text/markdown", title="Rewrite", text="retrieval contract", revision="r1",
+    )
+    monkeypatch.setattr(api_server, "_rag_store_instance", store)
+    response = TestClient(api_server.app).post(
+        "/api/rag/search",
+        json={"query": "检索", "mode": "fts", "rewrite_limit": 2, "per_route_limit": 1, "fts_weight": 1.0, "vector_weight": 0.0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["results"][0]["source_id"] == "rewrite-doc"
+    assert "retrieval" in body["rewritten_queries"]
+    assert body["route_config"]["per_route_limit"] == 1
+
+
+def test_rag_api_exposes_tunable_fts_rerank(monkeypatch, tmp_path):
+    store = _store(tmp_path)
+    monkeypatch.setattr(api_server, "_rag_store_instance", store)
+    response = TestClient(api_server.app).post(
+        "/api/rag/search",
+        json={"query": "retrieval", "mode": "fts", "rerank_candidate_k": 1, "rerank_weight": 1.0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["route_config"]["rerank_candidate_k"] == 1
+    assert body["results"][0]["rerank_mode"] == "lexical"
+    assert body["results"][0]["rerank_candidate_count"] == 1
+
+
 def test_rag_api_rebuild_delete_and_hybrid_contract(monkeypatch, tmp_path):
     store = _store(tmp_path)
     monkeypatch.setattr(api_server, "_rag_store_instance", store)

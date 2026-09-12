@@ -924,3 +924,60 @@ S6 UI 四张开发票均已完成本机开发门；真实模型质量、真实 S
 ```
 
 本票不下载、不加载 QW1.8B、不联网；`RAG-BASE-01` 的双侧 hit@5/MRR 口径保持不变。下一票为 `RAG-QRW-01`，继续在规则和 FTS/候选管线层推进。
+
+## 21. RAG-QRW-01 实施记录
+
+本票把主项目与 harness 的查询改写和多路召回口径对齐，仍保持本机 SQLite/FTS5、可替换 embedding 和无模型边界：
+
+- 两侧对输入做 Unicode/空白归一，并使用有界确定性词典完成中文/英文同义词、术语和常见口语映射；`and/or/以及/并且` 子查询会拆成独立变体；改写计划有 1～8 个变体上限，不执行外部 LLM 改写。
+- FTS 对各变体分别召回后按 chunk ID 去重并做 RRF；harness embedding provider 在一次调用内编码所有查询变体和候选，主项目使用已提供 query vector 与改写 FTS 结果混排。权重、每路候选数和 top-k 可配置，向量扫描超预算仍显式 FTS fallback。
+- harness `/v1/rag/search` 与主项目 `/api/rag/search` 支持请求级 `rewrite_limit`、每路候选数和 FTS/vector 权重；缓存键包含改写计划和有效配置，避免不同参数复用旧快照。
+- `run_rag_query_comparison()` 复用冻结的 6 份文档/30 条问题集，生成 `qlh.rag_query_comparison.v1`；两侧原始与改写查询均达到 `hit@5=1.000000`、`MRR=1.000000`，详情签名保持一致。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_rag_squeeze.py tests/test_harness_s4_remote_rag.py tests/test_rag_chunking.py -q
+67 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+237 passed, 1 skipped
+```
+
+本票不下载、不加载 QW1.8B、不联网；下一票为 `RAG-IDX-01`，先做关键词/多粒度和轻量知识图谱调研门。
+
+## 22. RAG-IDX-01 实施记录
+
+本票在主项目与 harness 各自建立三类本地索引，不依赖 embedding 或模型：
+
+- `rag_index_chunks` 同时存储 document/paragraph/sentence 与当前策略的并行视图，新增文档视图时保持原始 offset 和引用关系。
+- `rag_keyword_index` 包含 token、prefix 和双词组条目；`keyword_search` 支持粒度筛选和原有元数据过滤，与向量索引分离。
+- `rag_entities`/`rag_relations` 用可审计规则抽取英文标识符、中文词组及 uses/depends-on/使用/依赖等关系，`graph_search` 按深度沿边扩展候选。
+- 调研前置结论：本机只有 QW1.8B，本票不下载、不加载、不联网；为保持硬件成本和审计可见性，实体/关系采用规则抽取，小模型抽取留到后续模型门票，不把规则命中解释成模型质量。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_rag_chunking.py tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py -q
+68 passed
+```
+
+本票完成主项目与 harness 的多粒度、倒排关键词、轻量图谱索引；下一票为 `RAG-RERANK-01`，如无可用小模型则继续仅在规则与融合层推进。
+
+## 23. RAG-RERANK-01 实施记录
+
+本票在既有 FTS/向量 RRF 或加权融合之后增加有界、可解释的候选重排层：
+
+- 主项目 `hybrid_search` 与 harness `HybridRagRetriever` 均先按融合结果截取 `rerank_candidate_k`，再按查询词覆盖、完整词组命中和标题命中计算 lexical score；`rerank_weight` 与 `rerank_mode=lexical|none` 可调。
+- 结果显式保留 `fusion_score`、`rerank_score`、`rerank_final_score`、`rerank_candidate_count` 和模式字段；harness 缓存键包含完整重排配置，避免候选预算或权重变化复用旧结果；主项目 API 同步返回 route config。
+- 轻量重排采用规则而非交叉编码器/小模型。当前本机只有 QW1.8B，本票不下载、不加载、不联网；规则层是后续模型重排的稳定候选接口，不把规则排序提升解释成模型质量。
+
+离线验收：
+
+```text
+.\\.venv-test\\Scripts\\python.exe -m pytest tests/test_harness_rag_squeeze.py tests/test_rag_store.py tests/test_rag_api.py tests/test_harness_s4_remote_rag.py tests/test_rag_chunking.py -q
+72 passed
+.\\.venv-test\\Scripts\\python.exe -m pytest (Get-ChildItem tests -Filter 'test_harness_*.py').FullName -q
+239 passed, 1 skipped
+```
+
+本票完成双侧候选集重排与可调截断；下一张可执行票为 `HW-DSV4-9B-EVAL-01`，先做资源评估，不下载模型。

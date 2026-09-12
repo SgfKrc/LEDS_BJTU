@@ -20,6 +20,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 | DS3-0324-7B 替代 R1 判题模型（已批准候选） | v2 口径 **2/4×3、格式率 8/11×3** |
 | 子项目：小模型 harness 工作台（S1-S8） | 上下文预算/STATE 记忆/RAG/MCP，本机门 |
 | 子项目：文档维护 Agent（独立仓库 qlh-docagent，主项目 submodule） | 规则数据化 + 演进门控 |
+| 子项目：Reasonix ↔ Codex 桥接（独立仓库 reasonix-codex-bridge，主项目 submodule） | 只读子智能体接入 Codex；受控写入 W1/W2/W3 已落地（默认关闭） |
 | 联网搜索/轻量 Fetch（WEB-TOOL G1-G6） | 本机开发门，`production_network_enabled=false` |
 
 ## 还不能宣称什么
@@ -43,7 +44,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 ### 1. 克隆与一键配环境
 
 ```bash
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 含 llama.cpp / docagent submodule
+git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 含 llama.cpp（第三方）与 docagent、reasonix-codex-bridge 两个自研子模块
 cd LEDS_BJTU
 python scripts/setup_envs.py --all            # 全部：8 个 Python 环境 + Node 子项目
 python scripts/setup_envs.py --all --no-node  # 仅 Python 环境
@@ -83,7 +84,7 @@ python -c "import src.api_server"                                   # 后端可�
 
 - **主计划**：[总体下一步计划](总体下一步计划.md)（唯一排期入口）· [项目进展与下一步计划](项目进展与下一步计划.md)（证据快照）
 - **新人入门**：[项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
-- **子项目**：[harness 方案](小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [联网工具调研](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
+- **子项目**：[harness 方案](小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [联网工具调研](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
 - **实验与判题**：[DS3 替代 R1 专项](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [亚1B 专项](亚1B小模型专项实验计划.md) · [测试与评判标准](测试与评判标准.md)
 
 ## 工程文化

@@ -25,11 +25,18 @@ _ALIASES: Mapping[str, tuple[str, ...]] = {
     "retrieval": ("检索",),
     "搜索": ("search", "检索"),
     "数据库": ("database", "sqlite"),
+    "database": ("数据库",),
     "sqlite": ("数据库",),
+    "SQLite": ("数据库",),
     "分块": ("chunking", "chunk"),
     "chunking": ("分块",),
     "重排": ("rerank", "ranking"),
     "rerank": ("重排",),
+    "怎么回事": ("原因", "说明"),
+    "咋回事": ("原因", "说明"),
+    "为啥": ("原因",),
+    "咋办": ("解决", "处理"),
+    "能不能": ("是否",),
 }
 
 
@@ -62,6 +69,12 @@ def rewrite_query(
             if clean_key and clean_values:
                 aliases[clean_key] = clean_values[:4]
     variants: list[str] = [normalized]
+    subqueries = tuple(part.strip() for part in re.split(r"\s+(?:and|or)\s+|[、；;]|(?:以及|并且)", normalized) if part.strip())
+    for candidate in subqueries:
+        if len(subqueries) > 1 and candidate not in variants:
+            variants.append(candidate)
+            if len(variants) >= max_variants:
+                return QueryPlan(query, normalized, tuple(variants))
     for source, replacements in aliases.items():
         if source not in normalized:
             continue

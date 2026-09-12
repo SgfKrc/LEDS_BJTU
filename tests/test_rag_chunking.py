@@ -5,8 +5,13 @@ import unicodedata
 
 import pytest
 
-from harness_workbench.rag import CHUNK_STRATEGIES, RagStore as HarnessRagStore, chunk_text
-from harness_workbench.tools import RAG_CHUNK_COMPARISON_SCHEMA, run_rag_chunk_comparison
+from harness_workbench.rag import CHUNK_STRATEGIES, INDEX_GRANULARITIES, RagStore as HarnessRagStore, chunk_text
+from harness_workbench.tools import (
+    RAG_CHUNK_COMPARISON_SCHEMA,
+    RAG_QUERY_COMPARISON_SCHEMA,
+    run_rag_chunk_comparison,
+    run_rag_query_comparison,
+)
 from src.rag_store import CHUNK_STRATEGIES as MAIN_CHUNK_STRATEGIES
 from src.rag_store import RagStore, RagStoreError
 
@@ -90,6 +95,34 @@ def test_harness_store_returns_strategy_and_granularity(tmp_path):
         )
 
 
+def test_index_layers_keyword_prefix_phrase_and_rule_graph_are_model_free(tmp_path):
+    text = "AlphaService uses BetaStore. BetaStore depends on GammaIndex. retrieval pipeline remains local."
+    main = RagStore(tmp_path / "indexed-main.sqlite3", max_chunk_chars=256)
+    main.ingest_document(
+        source_id="indexed-main", relative_ref="docs/indexed.md", sha256=None,
+        mime="text/markdown", title="Indexed", text=text, revision="r1",
+    )
+    assert {row["granularity"] for row in main.list_index_chunks()} >= {"document", "paragraph", "sentence"}
+    assert set(INDEX_GRANULARITIES) >= {"document", "paragraph", "sentence"}
+    assert main.keyword_search("AlphaServ", access_scope="owner", granularity="sentence")
+    assert main.keyword_search("retrieval pipeline", access_scope="owner", granularity="document")[0]["keyword_score"] >= 2
+    with sqlite3.connect(main.path) as connection:
+        assert {row[0] for row in connection.execute("SELECT DISTINCT term_kind FROM rag_keyword_index")} >= {"token", "prefix", "phrase"}
+    graph = main.graph_search("AlphaService", access_scope="owner", granularity="document")
+    assert graph and graph[0]["graph_entities"]
+    assert main.health()["keyword_term_count"] > 0
+    harness = HarnessRagStore(tmp_path / "indexed-harness.sqlite3")
+    harness.add_document(source_ref="docs/indexed.md", title="Indexed", text=text, max_chars=256)
+    assert {row["granularity"] for row in harness.list_index_chunks()} >= {"document", "paragraph", "sentence"}
+    assert harness.keyword_search("AlphaServ", granularity="sentence")
+    assert harness.keyword_search("retrieval pipeline", granularity="document")[0]["keyword_score"] >= 2
+    with sqlite3.connect(harness.path) as connection:
+        assert {row[0] for row in connection.execute("SELECT DISTINCT term_kind FROM rag_keyword_index")} >= {"token", "prefix", "phrase"}
+    graph = harness.graph_search("AlphaService", granularity="document")
+    assert graph and graph[0]["graph_entities"]
+    assert harness.health()["keyword_terms"] > 0
+
+
 def test_frozen_baseline_compares_all_chunk_strategies():
     report = run_rag_chunk_comparison(top_k=5)
     assert report["schema"] == RAG_CHUNK_COMPARISON_SCHEMA
@@ -99,3 +132,14 @@ def test_frozen_baseline_compares_all_chunk_strategies():
         assert comparison["details_match"] is True
         assert comparison["main_project"]["hit_at_k"] == 1.0
         assert comparison["harness"]["hit_at_k"] == 1.0
+
+
+def test_frozen_baseline_compares_original_and_rewritten_queries():
+    report = run_rag_query_comparison(top_k=5)
+    assert report["schema"] == RAG_QUERY_COMPARISON_SCHEMA
+    assert report["valid"] is True
+    for side in report["sides"].values():
+        assert side["details_match"] is True
+        assert side["baseline"]["hit_at_k"] == 1.0
+        assert side["rewritten"]["hit_at_k"] == 1.0
+        assert side["delta"] == {"hit_at_k": 0.0, "mean_reciprocal_rank": 0.0}

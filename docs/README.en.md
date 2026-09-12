@@ -58,6 +58,7 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🧩 **Sub-project: small-model harness workbench** | Toy/self-use workbench for small-model customization (S1-S8 local/offline gates done): context budget & STATE compression, model profiles & capability gate, OpenAI-compatible `/v1`, customization experiment bench (A/B + Pareto), image workbench, SQLite sessions & RAG, long-term memory (RAG+compression+local memory), web search & lightweight MCP, red-team samples; **no main-project imports, only shared model artifacts** → [harness plan](小模型轻量推理harness工作台调研与方案.md) |
 | 📡 **Web search & lightweight Fetch** | WEB-TOOL G1-G6 local gates done: offline capability probe, fail-closed Tool Gateway (HTTPS-only/SSRF/DNS+redirect re-check), restricted Fetch/SearXNG adapters, TaskGraph `tool_request` Stage, explicit-`persist` tool cache & API, quality gate & joint audit; `production_network_enabled=false` → [research plan](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
 | 📝 **Document-maintenance Agent sub-project** | Standalone package (own repo [qlh-docagent](https://github.com/SgfKrc/qlh-docagent), brought in as a submodule): rule-as-data (`RULES.md` + `rules.yaml` driven scanner), rule-change mechanical scanning (delta matrix new/gone/changed + `--max-new/--max-gone` gates), evolution gates (agent rule edits: proposed→preflight→gates→released) with equivalence regression → [plan](文档维护Agent工具子项目化与通用化专项计划.md) |
+| 🔌 **Reasonix ↔ Codex bridge sub-project** | Standalone package (own repo [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge), brought in as a submodule): exposes the Reasonix subagent to Codex as stdio MCP tools (`reasonix_run` / `reasonix_rollback` / `reasonix_status`); CLI path and model ref resolve per machine with zero hard-coding (`node src/configure.mjs list/use/codex/verify`); read-only by default, with controlled writes, change evidence, explicit rollback and read/write profile separation landed by `W1/W2/W3` (off by default); audit fix `AUD-01` done, `AUD-02`–`AUD-05` queued, cross-platform `G3` still pending → [roadmap](reasonix-codex-bridge完善方向-2026-09-12.md) |
 | 🎯 **Judging-policy fix & DS3 replacing R1** | `loose_contains` + 512 tokens (P5) proven discriminative (Qwen3-4B 1/4 vs 1.8B 0/4); DS3-0324-7B full v2 policy **2/4×3, 8/11×3** (budget 192→512 alone flips 0/4→2/4, confirming the judging-policy problem) → **approved candidate to replace R1** as judging model → [DS3 plan](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
 
 ### Project Design Philosophy
@@ -210,6 +211,16 @@ Project root
 ├── frontend_cybergothic/          # ★ Sole product frontend (React + TypeScript + Vite)
 │   ├── src/                       # Chat / Models / RAG / Tasks / Image Studio / Account product pages
 │   └── scripts/                   # Contrast and browser-regression tools
+├── harness_workbench/             # ★ Small-model harness workbench (independent sub-project; no main-project imports)
+│   ├── context_engine/            # Context budget & STATE compression
+│   ├── model_profiles/            # Model profiles and capability gate
+│   ├── rag/                       # Local RAG (chunking/index/rewrite/rerank) and retrieval quality gates
+│   ├── api_layer/                 # OpenAI-compatible /v1 and workbench backend
+│   ├── image_workbench/           # Image workbench
+│   ├── memory/ session/ mcp_server/ research/ adaptation/ eval/  # Memory / sessions / lightweight MCP / experiments & eval
+│   ├── tools/                     # rag_baseline, Tool Gateway, ...
+│   ├── ui_react/                  # Workbench frontend (React + Vite)
+│   └── cli.py / tui.py            # CLI and terminal entry points
 ├── tests/                         # Unit/contract/regression tests (full-run baselines are historical; plans hold current evidence)
 ├── scripts/                       # Utility scripts
 │   ├── quantize_model.py          # Model preparation & quantization verification
@@ -219,6 +230,11 @@ Project root
 │   ├── build_offline_bundle.py    # Offline-bundle preflight, manifest and atomic publish
 │   ├── experiment_quality_production_gate.py # EX-N3 read-only quality audit
 │   └── docagent_*_gate.py         # Document retrieval/semantic quality gates
+├── tools/                         # ★ Submodules and ops tooling
+│   ├── docagent/                  # Submodule (in-house): document-maintenance Agent repo
+│   ├── reasonix-codex-bridge/     # Submodule (in-house): Codex ↔ Reasonix MCP bridge
+│   ├── ssh_sync_*.py              # Worker sync / patch delivery
+│   └── modelscope_download.py     # ModelScope download helper
 ├── models/                        # Model files (download yourself)
 │   ├── qwen-1_8b-chat/            # PC: Safetensors format
 │   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF format (llama.cpp engine)
@@ -227,6 +243,22 @@ Project root
 └── README.md                      # This file
 ```
 
+### Submodules (git submodule)
+
+The repository pins **three** Git submodules; **only `llama.cpp` is third-party — the other two are in-house sub-projects kept in their own repositories**:
+
+| Path | Repository | Kind | Purpose |
+|------|------------|------|---------|
+| `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **In-house** | Rule-as-data scanner, mechanical rule-change scanning (new/gone/changed delta matrix) and evolution gates |
+| `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **In-house** | stdio MCP bridge that lets Codex drive the read-only Reasonix subagent; CLI path and model ref resolve per machine, `configure verify` self-checks |
+| `android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **Third-party** (only non-in-house) | Native builds for the Android Full variant; pinned revision, not needed on PC or in Python sidecars |
+
+```bash
+git submodule update --init --recursive
+git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
+```
+
+> Planned: the small-model harness workbench (`harness_workbench/`) still lives inside the main repo; it is a candidate for the same submodule treatment later (in-house), leaving only a gitlink and wiring docs here.
 ### PyTorch Layer Pipeline Example (device count is not fixed)
 
 ```
@@ -419,6 +451,8 @@ python scripts/setup_test_env.py --check
 
 ```bash
 # 1. Only pull the llama.cpp submodule when building Android Full; PC workers and Python sidecars do NOT need it
+#    Two in-house submodules (tools/docagent, tools/reasonix-codex-bridge) ship with a default clone and are
+#    needed for document maintenance / Codex bridging; llama.cpp is only required for Android Full builds.
 git submodule update --init --recursive
 
 # 2. Install Python dependencies (main environment; online)

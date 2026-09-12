@@ -4,3 +4,6 @@
 [submodule "tools/docagent"]
 	path = tools/docagent
 	url = https://github.com/SgfKrc/qlh-docagent.git
+[submodule "tools/reasonix-codex-bridge"]
+	path = tools/reasonix-codex-bridge
+	url = https://github.com/SgfKrc/reasonix-codex-bridge.git

@@ -170,6 +170,7 @@ __all__ = [
     "RAG_BASELINE_INPUT_SCHEMA",
     "RAG_BASELINE_SCHEMA",
     "RAG_CHUNK_COMPARISON_SCHEMA",
+    "RAG_QUERY_COMPARISON_SCHEMA",
     "RagBaselineCase",
     "RagBaselineDocument",
     "RagBaselineError",
@@ -179,6 +180,7 @@ __all__ = [
     "load_rag_baseline_input",
     "run_rag_baseline",
     "run_rag_chunk_comparison",
+    "run_rag_query_comparison",
 ]
 
 
@@ -319,6 +321,7 @@ def __getattr__(name: str):
         "RAG_BASELINE_INPUT_SCHEMA",
         "RAG_BASELINE_SCHEMA",
         "RAG_CHUNK_COMPARISON_SCHEMA",
+        "RAG_QUERY_COMPARISON_SCHEMA",
         "RagBaselineCase",
         "RagBaselineDocument",
         "RagBaselineError",
@@ -328,6 +331,7 @@ def __getattr__(name: str):
         "load_rag_baseline_input",
         "run_rag_baseline",
         "run_rag_chunk_comparison",
+        "run_rag_query_comparison",
     }:
         from . import rag_baseline
 

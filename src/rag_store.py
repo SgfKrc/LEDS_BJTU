@@ -61,11 +61,36 @@ _MIN_JOB_LEASE_SECONDS = 5
 _MAX_JOB_LEASE_SECONDS = 3_600
 _DEFAULT_EMBEDDING_MODEL_ID = "nomic-embed-text:latest"
 CHUNK_STRATEGIES = frozenset({"fixed", "paragraph", "sentence", "section", "adaptive", "semantic"})
+INDEX_GRANULARITIES = frozenset({"document", "paragraph", "sentence", *CHUNK_STRATEGIES})
+_INDEX_SCHEMA_VERSION = "1"
+_INDEX_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{1,63}|[\u3400-\u9fff]{2,32}")
+_INDEX_ENTITY = re.compile(r"\b[A-Z][A-Za-z0-9_.:-]{2,63}\b|[\u3400-\u9fff]{2,16}")
+_INDEX_STOPWORDS = frozenset({"the", "and", "or", "for", "with", "from", "this", "that", "uses", "use", "depends", "on"})
 RAG_METADATA_FIELDS = frozenset({"source", "scope", "type", "tag", "time"})
 _METADATA_INDEX_VERSION = "1"
 _MAX_METADATA_FILTERS = 5
 _MAX_METADATA_VALUES = 20
 _MAX_METADATA_TEXT = 256
+_QUERY_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "上下文": ("context",),
+    "context": ("上下文",),
+    "检索": ("retrieval", "search"),
+    "retrieval": ("检索", "search"),
+    "搜索": ("search", "检索"),
+    "数据库": ("database", "sqlite"),
+    "database": ("数据库",),
+    "sqlite": ("数据库",),
+    "SQLite": ("数据库",),
+    "分块": ("chunking", "chunk"),
+    "chunking": ("分块",),
+    "重排": ("rerank", "ranking"),
+    "rerank": ("重排", "ranking"),
+    "怎么回事": ("原因", "说明"),
+    "咋回事": ("原因", "说明"),
+    "为啥": ("原因",),
+    "咋办": ("解决", "处理"),
+    "能不能": ("是否",),
+}
 
 
 def _last_chunk_boundary(
@@ -290,6 +315,123 @@ def _append_metadata_clauses(
         params.extend((field, *values))
 
 
+def rewrite_query(
+    query: str,
+    *,
+    max_variants: int = 4,
+    expansions: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[str, ...]:
+    """Return bounded deterministic query variants for local multi-route search."""
+    if isinstance(max_variants, bool) or not 1 <= int(max_variants) <= 8:
+        raise RagStoreError("rewrite_limit_invalid", "rewrite limit must be between 1 and 8")
+    if not isinstance(query, str) or not query.strip() or "\x00" in query:
+        raise RagStoreError("query_invalid", "query must be non-empty, bounded, and NUL-free")
+    normalized = " ".join(unicodedata.normalize("NFKC", query).replace("\r", " ").replace("\n", " ").split())
+    if not normalized:
+        raise RagStoreError("query_invalid", "query must contain searchable text")
+    if len(normalized) > 512:
+        raise RagStoreError("query_invalid", "query must be non-empty, bounded, and NUL-free")
+    aliases = dict(_QUERY_ALIASES)
+    if expansions:
+        if not isinstance(expansions, Mapping):
+            raise RagStoreError("rewrite_expansions_invalid", "query expansions must be an object")
+        for key, values in expansions.items():
+            clean_key = " ".join(unicodedata.normalize("NFKC", str(key)).split())
+            if not clean_key or not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                continue
+            clean_values = tuple(" ".join(unicodedata.normalize("NFKC", str(item)).split()) for item in values)
+            aliases[clean_key] = tuple(item for item in clean_values if item)[:4]
+    variants: list[str] = [normalized]
+    subqueries = tuple(part.strip() for part in re.split(r"\s+(?:and|or)\s+|[、；;]|(?:以及|并且)", normalized) if part.strip())
+    for candidate in subqueries:
+        if len(subqueries) > 1 and candidate not in variants:
+            variants.append(candidate)
+            if len(variants) >= int(max_variants):
+                return tuple(variants)
+    for source, replacements in aliases.items():
+        if source not in normalized:
+            continue
+        for replacement in replacements:
+            candidate = " ".join(re.sub(re.escape(source), replacement, normalized, count=1).split())
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+            if len(variants) >= int(max_variants):
+                return tuple(variants)
+    return tuple(variants)
+
+
+def _index_tokens(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    tokens: list[str] = []
+    for match in _INDEX_TOKEN.finditer(normalized):
+        token = match.group(0)
+        if token in _INDEX_STOPWORDS or len(token) < 2:
+            continue
+        if re.fullmatch(r"[\u3400-\u9fff]{2,32}", token) and len(token) > 2:
+            tokens.extend(token[index:index + 2] for index in range(len(token) - 1))
+        else:
+            tokens.append(token)
+    return tuple(dict.fromkeys(tokens))
+
+
+def _index_phrases(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    words = [item for item in re.findall(r"[A-Za-z][A-Za-z0-9_.:-]{1,63}|[\u3400-\u9fff]{2,16}", normalized) if item not in _INDEX_STOPWORDS]
+    phrases = [
+        " ".join(words[index:index + size])
+        for size in range(2, min(4, len(words)) + 1)
+        for index in range(len(words) - size + 1)
+    ]
+    return tuple(dict.fromkeys(phrases))
+
+
+def _index_entities(text: str) -> tuple[str, ...]:
+    entities: list[str] = []
+    for match in _INDEX_ENTITY.finditer(unicodedata.normalize("NFKC", text)):
+        name = match.group(0).strip()
+        if name.lower() in _INDEX_STOPWORDS or len(name) < 2:
+            continue
+        normalized = name.lower()
+        if normalized not in {item.lower() for item in entities}:
+            entities.append(name)
+    return tuple(entities[:64])
+
+
+def _index_relations(text: str, entities: tuple[str, ...]) -> tuple[tuple[str, str, str], ...]:
+    if len(entities) < 2:
+        return ()
+    relations: list[tuple[str, str, str]] = []
+    relation_pattern = re.compile(
+        r"(?P<left>[A-Za-z][A-Za-z0-9_.:-]{2,63}|[\u3400-\u9fff]{2,16})\s*"
+        r"(?P<relation>uses?|depends?\s+on|->|使用|依赖|关联|调用)\s*"
+        r"(?P<right>[A-Za-z][A-Za-z0-9_.:-]{2,63}|[\u3400-\u9fff]{2,16})",
+        re.IGNORECASE,
+    )
+    known = {item.lower(): item for item in entities}
+    for match in relation_pattern.finditer(text):
+        left = known.get(match.group("left").lower())
+        right = known.get(match.group("right").lower())
+        if left and right and left.lower() != right.lower():
+            relation = match.group("relation").lower()
+            relations.append((left, right, relation))
+    if not relations:
+        relations.extend((entities[index], entities[index + 1], "cooccurs") for index in range(len(entities) - 1))
+    return tuple(dict.fromkeys(relations))
+
+
+def _rerank_score(query: str, text: str, title: str = "") -> float:
+    normalized_query = unicodedata.normalize("NFKC", query).casefold()
+    normalized_text = unicodedata.normalize("NFKC", f"{title} {text}").casefold()
+    query_tokens = set(_INDEX_TOKEN.findall(normalized_query))
+    text_tokens = set(_INDEX_TOKEN.findall(normalized_text))
+    if not query_tokens:
+        return 0.0
+    overlap = len(query_tokens & text_tokens) / len(query_tokens)
+    phrase_bonus = 0.2 if len(query_tokens) > 1 and normalized_query in normalized_text else 0.0
+    title_bonus = 0.1 if normalized_query and normalized_query in unicodedata.normalize("NFKC", title).casefold() else 0.0
+    return min(1.0, overlap + phrase_bonus + title_bonus)
+
+
 class RagStore:
     """Independent SQLite store whose rows never leave the user's machine."""
 
@@ -344,6 +486,7 @@ class RagStore:
             try:
                 connection.executescript(
                     """
+                    PRAGMA foreign_keys=ON;
                     CREATE TABLE IF NOT EXISTS rag_meta (
                       key TEXT PRIMARY KEY,
                       value TEXT NOT NULL,
@@ -436,6 +579,48 @@ class RagStore:
                       result_ids_json TEXT NOT NULL,
                       created_at TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS rag_index_chunks (
+                      index_id TEXT PRIMARY KEY,
+                      document_id TEXT NOT NULL REFERENCES rag_documents(document_id) ON DELETE CASCADE,
+                      base_chunk_id TEXT REFERENCES rag_chunks(chunk_id) ON DELETE CASCADE,
+                      granularity TEXT NOT NULL,
+                      ordinal INTEGER NOT NULL,
+                      start_offset INTEGER NOT NULL,
+                      end_offset INTEGER NOT NULL,
+                      text_content TEXT NOT NULL,
+                      UNIQUE(document_id, granularity, ordinal)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rag_index_chunks_lookup
+                      ON rag_index_chunks(document_id, granularity, ordinal);
+                    CREATE TABLE IF NOT EXISTS rag_keyword_index (
+                      index_id TEXT NOT NULL REFERENCES rag_index_chunks(index_id) ON DELETE CASCADE,
+                      term TEXT NOT NULL,
+                      term_kind TEXT NOT NULL,
+                      position INTEGER NOT NULL DEFAULT 0,
+                      PRIMARY KEY(index_id, term, term_kind, position)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rag_keyword_term
+                      ON rag_keyword_index(term, term_kind, index_id);
+                    CREATE TABLE IF NOT EXISTS rag_entities (
+                      entity_id TEXT PRIMARY KEY,
+                      index_id TEXT NOT NULL REFERENCES rag_index_chunks(index_id) ON DELETE CASCADE,
+                      name TEXT NOT NULL,
+                      normalized_name TEXT NOT NULL,
+                      entity_type TEXT NOT NULL DEFAULT 'rule',
+                      UNIQUE(index_id, normalized_name)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rag_entities_name
+                      ON rag_entities(normalized_name, index_id);
+                    CREATE TABLE IF NOT EXISTS rag_relations (
+                      relation_id TEXT PRIMARY KEY,
+                      index_id TEXT NOT NULL REFERENCES rag_index_chunks(index_id) ON DELETE CASCADE,
+                      source_entity_id TEXT NOT NULL REFERENCES rag_entities(entity_id) ON DELETE CASCADE,
+                      target_entity_id TEXT NOT NULL REFERENCES rag_entities(entity_id) ON DELETE CASCADE,
+                      relation TEXT NOT NULL,
+                      UNIQUE(index_id, source_entity_id, target_entity_id, relation)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_rag_relations_source
+                      ON rag_relations(source_entity_id, target_entity_id);
                     """
                 )
                 # S5B: upgrade S5A job rows without replacing the user-owned DB.
@@ -499,6 +684,16 @@ class RagStore:
                 chunk_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(rag_chunks)").fetchall()}
                 if "granularity" not in chunk_columns:
                     connection.execute("ALTER TABLE rag_chunks ADD COLUMN granularity TEXT NOT NULL DEFAULT 'fixed'")
+                index_version = connection.execute(
+                    "SELECT value FROM rag_meta WHERE key='index_schema_version'"
+                ).fetchone()
+                if index_version is None or str(index_version[0]) != _INDEX_SCHEMA_VERSION:
+                    self._rebuild_index_rows(connection)
+                    connection.execute(
+                        "INSERT INTO rag_meta(key, value, updated_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                        ("index_schema_version", _INDEX_SCHEMA_VERSION, _now()),
+                    )
                 connection.execute(
                     "INSERT INTO rag_meta(key, value, updated_at) VALUES (?, ?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
@@ -596,6 +791,104 @@ class RagStore:
             "INSERT INTO rag_chunks_cjk_fts(chunk_id, document_id, cjk_terms) VALUES (?, ?, ?)",
             (chunk_id, document_id, cls._cjk_terms(text)),
         )
+
+    @staticmethod
+    def _index_id(document_id: str, granularity: str, ordinal: int, text: str) -> str:
+        return _digest(f"idx\0{document_id}\0{granularity}\0{ordinal}\0{_digest(text.encode('utf-8'))}".encode())
+
+    @classmethod
+    def _populate_index_row(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        document_id: str,
+        base_chunk_id: str | None,
+        granularity: str,
+        ordinal: int,
+        start_offset: int,
+        end_offset: int,
+        text: str,
+    ) -> str:
+        index_id = cls._index_id(document_id, granularity, ordinal, text)
+        connection.execute(
+            "INSERT OR REPLACE INTO rag_index_chunks(index_id, document_id, base_chunk_id, granularity, ordinal, start_offset, end_offset, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (index_id, document_id, base_chunk_id, granularity, ordinal, start_offset, end_offset, text),
+        )
+        connection.execute("DELETE FROM rag_keyword_index WHERE index_id=?", (index_id,))
+        terms = _index_tokens(text)
+        phrases = _index_phrases(text)
+        entries = [(index_id, term, "token", position) for position, term in enumerate(terms)]
+        entries.extend(
+            (index_id, term[:size], "prefix", position)
+            for position, term in enumerate(terms)
+            for size in range(2, min(32, len(term)) + 1)
+        )
+        entries.extend((index_id, phrase, "phrase", position) for position, phrase in enumerate(phrases))
+        connection.executemany(
+            "INSERT OR IGNORE INTO rag_keyword_index(index_id, term, term_kind, position) VALUES (?, ?, ?, ?)",
+            entries,
+        )
+        connection.execute("DELETE FROM rag_relations WHERE index_id=?", (index_id,))
+        connection.execute("DELETE FROM rag_entities WHERE index_id=?", (index_id,))
+        entities = _index_entities(text)
+        entity_ids: dict[str, str] = {}
+        for name in entities:
+            normalized = name.casefold()
+            entity_id = _digest(f"ent\0{index_id}\0{normalized}".encode())
+            entity_ids[normalized] = entity_id
+            connection.execute(
+                "INSERT OR IGNORE INTO rag_entities(entity_id, index_id, name, normalized_name, entity_type) VALUES (?, ?, ?, ?, 'rule')",
+                (entity_id, index_id, name, normalized),
+            )
+        for left, right, relation in _index_relations(text, entities):
+            left_id = entity_ids.get(left.casefold())
+            right_id = entity_ids.get(right.casefold())
+            if left_id and right_id:
+                relation_id = _digest(f"rel\0{index_id}\0{left_id}\0{right_id}\0{relation}".encode())
+                connection.execute(
+                    "INSERT OR IGNORE INTO rag_relations(relation_id, index_id, source_entity_id, target_entity_id, relation) VALUES (?, ?, ?, ?, ?)",
+                    (relation_id, index_id, left_id, right_id, relation),
+                )
+        return index_id
+
+    def _rebuild_index_rows(self, connection: sqlite3.Connection) -> None:
+        """Rebuild auxiliary indexes for pre-RAG-IDX databases without a model."""
+        connection.execute("DELETE FROM rag_relations")
+        connection.execute("DELETE FROM rag_entities")
+        connection.execute("DELETE FROM rag_keyword_index")
+        connection.execute("DELETE FROM rag_index_chunks")
+        rows = connection.execute(
+            "SELECT c.chunk_id, c.document_id, c.ordinal, c.start_offset, c.end_offset, c.text_content, c.granularity "
+            "FROM rag_chunks c JOIN rag_documents d ON d.document_id=c.document_id"
+        ).fetchall()
+        for row in rows:
+            self._populate_index_row(
+                connection, document_id=str(row[1]), base_chunk_id=str(row[0]),
+                granularity=str(row[6] or "fixed"), ordinal=int(row[2]),
+                start_offset=int(row[3]), end_offset=int(row[4]), text=str(row[5]),
+            )
+
+    def _index_document_views(
+        self, connection: sqlite3.Connection, *, document_id: str, text: str,
+        chunks: Sequence[tuple[int, int, str, str]], chunk_ids: Sequence[str],
+    ) -> None:
+        for ordinal, (start, end, chunk, granularity) in enumerate(chunks):
+            self._populate_index_row(
+                connection, document_id=document_id, base_chunk_id=chunk_ids[ordinal],
+                granularity=granularity, ordinal=ordinal, start_offset=start, end_offset=end, text=chunk,
+            )
+        # Document/paragraph/sentence views coexist with the configured chunk strategy.
+        self._populate_index_row(
+            connection, document_id=document_id, base_chunk_id=None, granularity="document", ordinal=0,
+            start_offset=0, end_offset=len(text), text=text,
+        )
+        for granularity in ("paragraph", "sentence"):
+            views = self._chunks(text, granularity)
+            for ordinal, (start, end, chunk, _) in enumerate(views):
+                self._populate_index_row(
+                    connection, document_id=document_id, base_chunk_id=None, granularity=granularity,
+                    ordinal=ordinal, start_offset=start, end_offset=end, text=chunk,
+                )
 
     @staticmethod
     def _embedding_identity(
@@ -720,8 +1013,10 @@ class RagStore:
                     "VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)",
                     (document_id, source_id, revision, text_digest, language, access_scope, now, now),
                 )
+                inserted_chunk_ids: list[str] = []
                 for ordinal, (start, end, chunk, granularity) in enumerate(chunks):
                     chunk_id = _digest(f"{document_id}\0{ordinal}\0{_digest(chunk.encode('utf-8'))}".encode("utf-8"))
+                    inserted_chunk_ids.append(chunk_id)
                     connection.execute(
                         "INSERT INTO rag_chunks(chunk_id, document_id, ordinal, text_digest, token_count, start_offset, end_offset, text_content, metadata_json, granularity) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -733,9 +1028,171 @@ class RagStore:
                     )
                     self._fts_insert(connection, chunk_id, document_id, chunk)
                     self._cjk_fts_insert(connection, chunk_id, document_id, chunk)
+                self._index_document_views(
+                    connection, document_id=document_id, text=text,
+                    chunks=chunks, chunk_ids=inserted_chunk_ids,
+                )
         except sqlite3.IntegrityError as exc:
             raise RagStoreError("storage_conflict", "RAG document transaction conflicted") from exc
         return IngestResult(source_id, document_id, revision, text_digest, len(chunks), "ingested")
+
+    def list_index_chunks(
+        self, *, access_scope: str = "owner", granularity: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        access_scope = _validate_scope(access_scope, _ACCESS_SCOPES, code="access_scope_invalid", label="access_scope")
+        if granularity is not None and granularity not in INDEX_GRANULARITIES:
+            raise RagStoreError("granularity_invalid", "index granularity is unsupported")
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 10_000:
+            raise RagStoreError("limit_invalid", "index limit must be between 1 and 10000")
+        clauses = ["d.status='active'", "s.status='active'", "d.access_scope=?"]
+        params: list[Any] = [access_scope]
+        if granularity:
+            clauses.append("i.granularity=?")
+            params.append(granularity)
+        params.append(int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT i.index_id, i.base_chunk_id, d.source_id, d.document_id, i.granularity, i.ordinal, "
+                "i.start_offset, i.end_offset, i.text_content FROM rag_index_chunks i "
+                "JOIN rag_documents d ON d.document_id=i.document_id JOIN rag_sources s ON s.source_id=d.source_id "
+                "WHERE " + " AND ".join(clauses) + " ORDER BY d.source_id, i.granularity, i.ordinal LIMIT ?", params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def keyword_search(
+        self, query: str, *, access_scope: str = "owner", limit: int = 20,
+        granularity: str | None = None, metadata_filters: Mapping[str, Any] | None = None,
+        source_ids: Sequence[str] = (), title_prefix: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(query, str) or not query.strip() or len(query) > 512 or "\x00" in query:
+            raise RagStoreError("query_invalid", "query must be non-empty, bounded, and NUL-free")
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 100:
+            raise RagStoreError("limit_invalid", "query limit must be between 1 and 100")
+        access_scope = _validate_scope(access_scope, _ACCESS_SCOPES, code="access_scope_invalid", label="access_scope")
+        if granularity is not None and granularity not in INDEX_GRANULARITIES:
+            raise RagStoreError("granularity_invalid", "index granularity is unsupported")
+        normalized_filters = _normalize_metadata_filters(metadata_filters)
+        terms = _index_tokens(query)
+        phrases = _index_phrases(query)
+        if not terms and not phrases:
+            return []
+        clauses = ["d.status='active'", "s.status='active'", "d.access_scope=?"]
+        params: list[Any] = [access_scope]
+        source_ids = tuple(str(item) for item in source_ids)
+        if len(source_ids) > 50:
+            raise RagStoreError("source_ids_invalid", "source_ids must contain at most 50 values")
+        if source_ids:
+            clauses.append("d.source_id IN (" + ",".join("?" for _ in source_ids) + ")")
+            params.extend(source_ids)
+        if title_prefix is not None:
+            if not isinstance(title_prefix, str) or len(title_prefix) > 200:
+                raise RagStoreError("title_prefix_invalid", "title_prefix is invalid")
+            if title_prefix:
+                clauses.append("s.title LIKE ? ESCAPE '\\'")
+                params.append(_like_prefix(title_prefix))
+        term_clauses: list[str] = []
+        if terms:
+            term_clauses.append("(k.term_kind='token' AND k.term IN (" + ",".join("?" for _ in terms) + "))")
+            params.extend(terms)
+            term_clauses.append("(k.term_kind='prefix' AND k.term IN (" + ",".join("?" for _ in terms) + "))")
+            params.extend(term[:32] for term in terms)
+            term_clauses.append("(k.term_kind='token' AND (" + " OR ".join("k.term LIKE ? ESCAPE '\\'" for _ in terms) + "))")
+            params.extend(term.replace("%", "\\%").replace("_", "\\_") + "%" for term in terms)
+        if phrases:
+            term_clauses.append("(k.term_kind='phrase' AND k.term IN (" + ",".join("?" for _ in phrases) + "))")
+            params.extend(phrases)
+        clauses.append("(" + " OR ".join(term_clauses) + ")")
+        if granularity:
+            clauses.append("i.granularity=?")
+            params.append(granularity)
+        for field, values in normalized_filters:
+            placeholders = ",".join("?" for _ in values)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM rag_chunks cm JOIN rag_metadata_index mi ON mi.chunk_id=cm.chunk_id "
+                "WHERE cm.document_id=i.document_id AND mi.field=? AND mi.value IN (" + placeholders + "))"
+            )
+            params.extend((field, *values))
+        params.append(int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT i.index_id AS chunk_id, i.base_chunk_id, d.source_id, d.document_id, s.relative_ref, "
+                "i.granularity, i.ordinal, i.start_offset, i.end_offset, i.text_content, "
+                "SUM(CASE WHEN k.term_kind='phrase' THEN 2.0 ELSE 1.0 END) AS keyword_score "
+                "FROM rag_keyword_index k JOIN rag_index_chunks i ON i.index_id=k.index_id "
+                "JOIN rag_documents d ON d.document_id=i.document_id JOIN rag_sources s ON s.source_id=d.source_id "
+                "WHERE " + " AND ".join(clauses) + " GROUP BY i.index_id "
+                "ORDER BY keyword_score DESC, i.ordinal ASC, i.index_id ASC LIMIT ?", params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def graph_search(
+        self, query: str, *, access_scope: str = "owner", limit: int = 20,
+        granularity: str | None = None, depth: int = 1, metadata_filters: Mapping[str, Any] | None = None,
+        source_ids: Sequence[str] = (), title_prefix: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if isinstance(depth, bool) or not 0 <= int(depth) <= 2:
+            raise RagStoreError("graph_depth_invalid", "graph depth must be between 0 and 2")
+        results = self.keyword_search(
+            query, access_scope=access_scope, limit=limit, granularity=granularity,
+            metadata_filters=metadata_filters, source_ids=source_ids, title_prefix=title_prefix,
+        )
+        entities = _index_entities(query)
+        names = {item.casefold() for item in entities}
+        if not names or depth == 0:
+            for row in results:
+                row["graph_score"] = 0.0
+                row["graph_entities"] = []
+            return results
+        with self._connect() as connection:
+            entity_rows = connection.execute(
+                "SELECT entity_id, normalized_name FROM rag_entities WHERE normalized_name IN (" + ",".join("?" for _ in names) + ")", tuple(names)
+            ).fetchall()
+            frontier = {str(row[0]) for row in entity_rows}
+            reached = set(frontier)
+            for _ in range(int(depth)):
+                if not frontier:
+                    break
+                placeholders = ",".join("?" for _ in frontier)
+                adjacent = connection.execute(
+                    "SELECT target_entity_id FROM rag_relations WHERE source_entity_id IN (" + placeholders + ") "
+                    "UNION SELECT source_entity_id FROM rag_relations WHERE target_entity_id IN (" + placeholders + ")",
+                    tuple(frontier) + tuple(frontier),
+                ).fetchall()
+                frontier = {str(row[0]) for row in adjacent} - reached
+                reached.update(frontier)
+            if reached:
+                placeholders = ",".join("?" for _ in reached)
+                related = connection.execute(
+                    "SELECT DISTINCT i.index_id, e.name, i.base_chunk_id, d.source_id, d.document_id, d.revision, "
+                    "d.access_scope, s.relative_ref, i.ordinal, i.granularity, i.text_content "
+                    "FROM rag_entities e JOIN rag_index_chunks i ON i.index_id=e.index_id "
+                    "JOIN rag_documents d ON d.document_id=i.document_id JOIN rag_sources s ON s.source_id=d.source_id "
+                    "WHERE e.entity_id IN (" + placeholders + ") AND d.status='active' AND d.access_scope=?", tuple(reached) + (access_scope,),
+                ).fetchall()
+            else:
+                related = []
+        by_id: dict[str, list[str]] = {}
+        for row in related:
+            by_id.setdefault(str(row[0]), []).append(str(row[1]))
+        seen = {str(row["chunk_id"]) for row in results}
+        for row in results:
+            matched = by_id.get(str(row["chunk_id"]), [])
+            row["graph_score"] = 0.25 * len(matched)
+            row["graph_entities"] = matched
+        for row in related:
+            index_id = str(row[0])
+            if index_id in seen:
+                continue
+            seen.add(index_id)
+            results.append({
+                "chunk_id": index_id, "base_chunk_id": row[2], "source_id": row[3],
+                "document_id": row[4], "revision": row[5], "access_scope": row[6],
+                "relative_ref": row[7], "ordinal": row[8], "granularity": row[9] or "fixed",
+                "text_content": row[10], "keyword_score": 0.0, "graph_score": 0.25,
+                "graph_entities": by_id.get(index_id, []),
+            })
+        results.sort(key=lambda row: (-float(row.get("graph_score", 0.0)), -float(row.get("keyword_score", 0.0)), str(row["chunk_id"])))
+        return results[:int(limit)]
 
     def delete_source(self, source_id: str) -> bool:
         source_id = _safe_id(source_id, _SOURCE_ID, code="source_id_invalid", label="source_id")
@@ -756,6 +1213,10 @@ class RagStore:
             counts = {
                 "embeddings": int(connection.execute("SELECT COUNT(*) FROM rag_embeddings").fetchone()[0]),
                 "chunks": int(connection.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]),
+                "index_chunks": int(connection.execute("SELECT COUNT(*) FROM rag_index_chunks").fetchone()[0]),
+                "keyword_terms": int(connection.execute("SELECT COUNT(*) FROM rag_keyword_index").fetchone()[0]),
+                "entities": int(connection.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]),
+                "relations": int(connection.execute("SELECT COUNT(*) FROM rag_relations").fetchone()[0]),
                 "documents": int(connection.execute("SELECT COUNT(*) FROM rag_documents").fetchone()[0]),
                 "jobs": int(connection.execute("SELECT COUNT(*) FROM rag_jobs").fetchone()[0]),
                 "query_events": int(connection.execute("SELECT COUNT(*) FROM rag_query_events").fetchone()[0]),
@@ -1351,33 +1812,73 @@ class RagStore:
         limit: int = 20,
         max_scan: int = _DEFAULT_VECTOR_SCAN_LIMIT,
         metadata_filters: Mapping[str, Any] | None = None,
+        rewrite_limit: int = 4,
+        per_route_limit: int | None = None,
+        fts_weight: float = 0.55,
+        vector_weight: float = 0.45,
+        rerank_candidate_k: int | None = None,
+        rerank_weight: float = 0.35,
+        rerank_mode: str = "lexical",
     ) -> list[dict[str, Any]]:
-        """Merge FTS5 and bounded cosine candidates with explicit FTS fallback."""
+        """Merge rewritten FTS5 routes and bounded cosine candidates."""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise RagStoreError("limit_invalid", "query limit must be between 1 and 100")
-        lexical = self.search(
-            query, access_scope=access_scope, limit=max(20, min(100, int(limit) * 4)),
-            metadata_filters=metadata_filters,
-        )
-        fallback_reason = ""
-        try:
-            semantic = self.semantic_search(
-                query_vector, provider=provider, model_id=model_id, model_sha256=model_sha256,
-                dimensions=dimensions, access_scope=access_scope, limit=max(20, min(100, int(limit) * 4)),
-                max_scan=max_scan, metadata_filters=metadata_filters,
+        if isinstance(rewrite_limit, bool) or not 1 <= int(rewrite_limit) <= 8:
+            raise RagStoreError("rewrite_limit_invalid", "rewrite limit must be between 1 and 8")
+        route_limit = max(20, min(100, int(limit) * 4)) if per_route_limit is None else per_route_limit
+        if isinstance(route_limit, bool) or not 1 <= int(route_limit) <= 100:
+            raise RagStoreError("route_limit_invalid", "per-route limit must be between 1 and 100")
+        for value, code in ((fts_weight, "fts_weight_invalid"), (vector_weight, "vector_weight_invalid")):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
+                raise RagStoreError(code, "route weight must be a finite non-negative number")
+        if float(fts_weight) + float(vector_weight) <= 0:
+            raise RagStoreError("route_weight_invalid", "at least one route weight must be positive")
+        if rerank_candidate_k is None:
+            rerank_candidate_k = max(int(limit), min(1000, max(20, int(route_limit) * 2)))
+        if isinstance(rerank_candidate_k, bool) or not 1 <= int(rerank_candidate_k) <= 1000:
+            raise RagStoreError("rerank_candidate_limit_invalid", "rerank candidate limit must be between 1 and 1000")
+        if rerank_mode not in {"lexical", "none"}:
+            raise RagStoreError("rerank_mode_invalid", "rerank mode must be lexical or none")
+        if isinstance(rerank_weight, bool) or not isinstance(rerank_weight, (int, float)) or not math.isfinite(float(rerank_weight)) or not 0 <= float(rerank_weight) <= 1:
+            raise RagStoreError("rerank_weight_invalid", "rerank weight must be between 0 and 1")
+        variants = rewrite_query(query, max_variants=int(rewrite_limit))
+        if not variants:
+            raise RagStoreError("query_invalid", "query must contain searchable text")
+        lexical_ranked: dict[str, tuple[dict[str, Any], float]] = {}
+        lexical_seen = 0
+        for variant in variants:
+            lexical = self.search(
+                variant, access_scope=access_scope, limit=int(route_limit),
+                metadata_filters=metadata_filters,
             )
-        except RagStoreError as exc:
-            if exc.code != "vector_scan_budget_exceeded":
-                raise
-            semantic = []
-            fallback_reason = exc.code
+            lexical_seen += len(lexical)
+            for rank, row in enumerate(lexical):
+                chunk_id = str(row["chunk_id"])
+                contribution = float(fts_weight) / (60 + rank + 1)
+                previous = lexical_ranked.get(chunk_id)
+                lexical_ranked[chunk_id] = (dict(row), contribution if previous is None else previous[1] + contribution)
+        lexical_ordered = sorted(lexical_ranked.values(), key=lambda item: (-item[1], int(item[0]["ordinal"]), str(item[0]["chunk_id"])))
+        lexical_scores = {
+            str(row["chunk_id"]): 1.0 - (index / max(1, len(lexical_ordered) - 1))
+            for index, (row, _) in enumerate(lexical_ordered)
+        }
+        fallback_reason = ""
+        semantic: list[dict[str, Any]] = []
+        if float(vector_weight) > 0:
+            try:
+                semantic = self.semantic_search(
+                    query_vector, provider=provider, model_id=model_id, model_sha256=model_sha256,
+                    dimensions=dimensions, access_scope=access_scope, limit=int(route_limit),
+                    max_scan=max_scan, metadata_filters=metadata_filters,
+                )
+            except RagStoreError as exc:
+                if exc.code != "vector_scan_budget_exceeded":
+                    raise
+                fallback_reason = exc.code
         merged: dict[str, dict[str, Any]] = {}
-        lexical_count = len(lexical)
-        for index, row in enumerate(lexical):
+        for row, _ in lexical_ordered:
             item = dict(row)
-            # bm25 values are implementation-scale dependent (and negative in
-            # SQLite FTS5). Normalize only the candidate ordering instead.
-            item["lexical_score"] = 1.0 - (index / max(1, lexical_count - 1))
+            item["lexical_score"] = lexical_scores[str(row["chunk_id"])]
             item["vector_score"] = 0.0
             merged[str(item["chunk_id"])] = item
         for row in semantic:
@@ -1389,12 +1890,30 @@ class RagStore:
             item["vector_score"] = float(row["vector_score"])
         output = list(merged.values())
         for item in output:
-            item["hybrid_score"] = 0.55 * float(item["lexical_score"]) + 0.45 * ((float(item["vector_score"]) + 1.0) / 2.0)
-            item["hybrid_mode"] = "fts_fallback" if fallback_reason else "fts_vector"
+            item["fusion_score"] = float(fts_weight) * float(item["lexical_score"]) + float(vector_weight) * ((float(item["vector_score"]) + 1.0) / 2.0)
+            item["hybrid_score"] = item["fusion_score"]
+            item["hybrid_mode"] = "fts_fallback" if fallback_reason else ("fts_vector" if semantic else "fts_only")
             if fallback_reason:
                 item["vector_reason_code"] = fallback_reason
-        output.sort(key=lambda row: (-float(row["hybrid_score"]), int(row["ordinal"]), str(row["chunk_id"])))
-        return output[:int(limit)]
+            item["rewritten_query_count"] = len(variants)
+            item["fts_route_count"] = lexical_seen
+            item["fts_weight"] = float(fts_weight)
+            item["vector_weight"] = float(vector_weight)
+        output.sort(key=lambda row: (-float(row["fusion_score"]), int(row["ordinal"]), str(row["chunk_id"])))
+        candidates = output[:int(rerank_candidate_k)]
+        max_fusion = max((float(row["fusion_score"]) for row in candidates), default=0.0)
+        for row in candidates:
+            normalized_fusion = float(row["fusion_score"]) / max_fusion if max_fusion > 0 else 0.0
+            row["rerank_score"] = _rerank_score(query, str(row.get("text_content", "")), str(row.get("relative_ref", "")))
+            row["rerank_final_score"] = (
+                (1.0 - float(rerank_weight)) * normalized_fusion + float(rerank_weight) * float(row["rerank_score"])
+                if rerank_mode == "lexical" else normalized_fusion
+            )
+            row["rerank_mode"] = rerank_mode
+            row["rerank_candidate_count"] = len(candidates)
+            row["hybrid_score"] = row["rerank_final_score"]
+        candidates.sort(key=lambda row: (-float(row["rerank_final_score"]), int(row["ordinal"]), str(row["chunk_id"])))
+        return candidates[:int(limit)]
 
     @staticmethod
     def _search_cjk(
@@ -1525,8 +2044,30 @@ class RagStore:
                 "document_count": int(connection.execute("SELECT COUNT(*) FROM rag_documents").fetchone()[0]),
                 "chunk_count": int(connection.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]),
                 "fts_chunk_count": int(connection.execute("SELECT COUNT(*) FROM rag_chunks_fts").fetchone()[0]),
+                "index_chunk_count": int(connection.execute("SELECT COUNT(*) FROM rag_index_chunks").fetchone()[0]),
+                "keyword_term_count": int(connection.execute("SELECT COUNT(*) FROM rag_keyword_index").fetchone()[0]),
+                "entity_count": int(connection.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]),
+                "relation_count": int(connection.execute("SELECT COUNT(*) FROM rag_relations").fetchone()[0]),
                 "embedding_count": int(connection.execute("SELECT COUNT(*) FROM rag_embeddings").fetchone()[0]),
                 "query_event_count": int(connection.execute("SELECT COUNT(*) FROM rag_query_events").fetchone()[0]),
             }
         finally:
             connection.close()
+
+    def index_health(self) -> dict[str, Any]:
+        """Return counts for model-free materialized index layers."""
+        self.initialize()
+        with self._connect() as connection:
+            granularities = {
+                str(row[0]): int(row[1])
+                for row in connection.execute("SELECT granularity, COUNT(*) FROM rag_index_chunks GROUP BY granularity")
+            }
+            return {
+                "schema": _INDEX_SCHEMA_VERSION,
+                "model_free": True,
+                "granularities": granularities,
+                "index_chunks": int(connection.execute("SELECT COUNT(*) FROM rag_index_chunks").fetchone()[0]),
+                "keyword_terms": int(connection.execute("SELECT COUNT(*) FROM rag_keyword_index").fetchone()[0]),
+                "entities": int(connection.execute("SELECT COUNT(*) FROM rag_entities").fetchone()[0]),
+                "relations": int(connection.execute("SELECT COUNT(*) FROM rag_relations").fetchone()[0]),
+            }

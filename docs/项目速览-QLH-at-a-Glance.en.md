@@ -20,6 +20,7 @@ QLH is a lightweight distributed LLM inference system for heterogeneous edge dev
 | DS3-0324-7B replaces R1 as judging model (approved candidate) | v2 policy **2/4×3, format 8/11×3** |
 | Sub-project: small-model harness workbench (S1-S8) | context budget / STATE memory / RAG / MCP, local gates |
 | Sub-project: docagent (own repo, brought in as submodule) | rule-as-data + evolution gates |
+| Sub-project: Reasonix ↔ Codex bridge (own repo, brought in as submodule) | read-only subagent for Codex; controlled writes W1/W2/W3 landed (off by default) |
 | Web search & lightweight Fetch (WEB-TOOL G1-G6) | local gates, `production_network_enabled=false` |
 
 ## What is NOT claimed
@@ -43,7 +44,7 @@ QLH is a lightweight distributed LLM inference system for heterogeneous edge dev
 ### 1. Clone & one-shot environment setup
 
 ```bash
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # includes llama.cpp / docagent submodules
+git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # includes llama.cpp (third-party) plus the in-house docagent and reasonix-codex-bridge submodules
 cd LEDS_BJTU
 python scripts/setup_envs.py --all            # everything: 8 Python envs + Node projects
 python scripts/setup_envs.py --all --no-node  # Python envs only
@@ -83,7 +84,7 @@ Distributed mode: all nodes sign in with the same Tailscale account → "Connect
 
 - **Master plan**: [总体下一步计划](总体下一步计划.md) · Evidence snapshot: [项目进展与下一步计划](项目进展与下一步计划.md)
 - **Newcomer**: [项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
-- **Sub-projects**: [harness plan](小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [web-tool research](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
+- **Sub-projects**: [harness plan](小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [web-tool research](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
 - **Experiments & judging**: [DS3 replaces R1](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [sub-1B plan](亚1B小模型专项实验计划.md) · [tests & criteria](测试与评判标准.md)
 
 *Note: most specialized documents are in Chinese (see the root README index).*

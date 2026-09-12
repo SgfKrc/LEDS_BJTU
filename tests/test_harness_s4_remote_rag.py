@@ -274,3 +274,29 @@ def test_s4_api_wires_rag_and_session_without_exposing_paths(tmp_path):
     assert message.status_code == 201
     asset = client.post(f"/v1/sessions/{session_id}/assets", json={"asset_id": "img_demo"})
     assert asset.status_code == 201
+
+
+def test_s4_api_allows_per_request_rewrite_and_route_tuning(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    rag_store = RagStore(tmp_path / "rag.sqlite3")
+    app = create_app(
+        _ChatAdapter(),
+        rag_store=rag_store,
+        rag_retriever=HybridRagRetriever(rag_store, config=RagSearchConfig(embedding_weight=0.0)),
+    )
+    client = TestClient(app)
+    assert client.post(
+        "/v1/rag/sources",
+        json={"source_ref": "docs/rewrite.md", "title": "Rewrite", "text": "retrieval contract"},
+    ).status_code == 201
+    response = client.post(
+        "/v1/rag/search",
+        json={"query": "检索", "rewrite_limit": 2, "per_route_k": 1, "fts_weight": 1.0, "embedding_weight": 0.0},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["hits"]
+    assert body["retrieval"]["rewritten_queries"][0] == "检索"
+    assert body["retrieval"]["route_counts"]["fts_variants"] == 2
