@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2` 已完成，`TOOL-RXB-T3` 交主节点执行，C1–C4/R1–R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-C1` 已完成，`TOOL-RXB-T3` 交主节点执行，C2–C4/R1–R3/E1–E4/G1–G4 已登记为后续票池。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -161,3 +161,4 @@
 | --- | --- |
 | 2026-09-12 | 首版：基线 commit `1d1e2a6`，列 P0（T1–T3）/P1（C1–C4、R1–R3）/P2（E1–E4、G1–G4）方向与验收门，明确五条边界 |
 | 2026-09-12 | 按资源约束转出 `TOOL-RXB-T1`/`T2`/`T3`；T1/T2 以离线 stub 完成，真实调用 T3 交主节点，不在本机消耗模型额度 |
+| 2026-09-12 | `TOOL-RXB-C1` 完成：profile 预览/同步、model/read-only drift 门与显式写后回读校验落地；本机只做预览与 verify，未改全局 profile |
