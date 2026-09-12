@@ -102,3 +102,15 @@
 5. 增加失败注入、权限/链接/二进制和真实 CLI 的分层集成测试；解决本机 Reasonix 配置目录的权限迁移问题后，再重新运行桥接子 agent 审查。
 
 审计判定：功能测试通过不等于写入安全收口。当前可继续用于默认只读 inspect/review，但写 profile 和 `allowWrite=true` 应保持受控，不建议在修复前作为生产写入通道启用。
+
+## 修复跟踪
+
+| 修复票 | 对应发现 | 状态 | 证据 |
+|---|---|---|---|
+| `TOOL-RXB-AUD-01` | BR-001 非 implement 模式未强制只读 profile | **已完成（2026-09-12）** | 子项目 commit `f6bacd7`；回归测试 `43 passed` |
+| `TOOL-RXB-AUD-02` | BR-002 dirty-tree 状态不变修改漏报 | 待处理 | 本报告复现已锁定，尚未改源代码 |
+| `TOOL-RXB-AUD-03` | BR-003 rollback 绕过串行队列 | 待处理 | 设计风险，待并发回归 |
+| `TOOL-RXB-AUD-04` | BR-004 Windows `.cmd` shell 参数 | 待处理 | 需 Windows 参数回归 |
+| `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | 待处理 | 需权限失败边界测试 |
+
+本次修复只关闭 BR-001，不改变其余发现的审计结论；BR-002 及后续票仍按优先级执行。
