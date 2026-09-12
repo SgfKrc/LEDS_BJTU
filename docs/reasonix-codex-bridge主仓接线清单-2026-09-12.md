@@ -73,6 +73,13 @@ REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 3. `reasonix_status` 的 `workspaceRoot`、`modelRefSource`、能力摘要和限额与目标机配置一致。
 4. `npm run check`、`npm test`、`npm run check:links` 全绿；这些检查不下载模型、不联网调用 provider。
 
+## 审计复验（2026-09-13）
+
+- AUD-03：`reasonix_rollback` 与 implement 共用串行队列，同一工作区并发回归通过。
+- AUD-04：Windows `.cmd/.bat` 通过显式 `cmd.exe`、`shell:false` 启动；含 `&`、`|`、`%`、`!` 等元字符的参数在启动前拒绝。
+- AUD-05：回滚变更集登记 `hash_status`，区分 `readable`、`missing`、`unreadable`；不可读/类型变化默认拒绝，恢复后复核 Git 状态和 SHA-256。
+- 本机复验为 `npm test` 47/47、`npm run check`、`npm run check:links` 全绿；`allowWrite` 默认仍为 `false`，没有启用 Reasonix 写入 profile。
+
 ## 变更边界
 
 - 本清单只登记接线和验收，不执行全局 Codex/profile 写入。

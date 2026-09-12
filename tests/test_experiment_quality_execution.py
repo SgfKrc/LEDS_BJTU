@@ -400,3 +400,31 @@ def test_required_gemma_gate_requires_manual_review_binding(tmp_path):
         evidence2, plan.quality, ("gemma_judge",), baseline_record=None,
     )
     assert gate2["status"] == "passed"
+
+
+def test_qwen3_v2_calibration_plan_is_pinned_and_executable():
+    plan_path = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures" / "experiment-plans"
+        / "plan-quality-qwen3-4b-calibration-v2.json"
+    )
+    plan = load_plan(plan_path)
+
+    assert plan.prompt_set == {
+        "id": "ps-qwen3-nothink",
+        "sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
+    }
+    assert plan.verify_prompt_set().is_dir()
+    assert plan.quality is not None
+    assert plan.quality.llm["rubric_id"] == "llm-objective-ps-v1-v2"
+    assert plan.quality.calibration["rounds_required"] == 3
+    assert len(plan.units) == 3
+
+    for unit in plan.units:
+        command = " ".join(unit.command)
+        assert "models/qwen3-4b-gguf/Qwen3-4B-Q4_K_M.gguf" in command
+        assert "--prompt-mode raw" in command
+        assert "--max-new-tokens 512" in command
+        assert "--temperature 0.7" in command
+        assert unit.params["max_new_tokens"] == 512
+        assert unit.quality_checks == ("llm",)
