@@ -1,6 +1,6 @@
 # reasonix-codex-bridge ACP 会话级恢复专项计划（2026-09-13）
 
-> 状态：**ACP-01～ACP-05 已完成（2026-09-13），ACP-06 未开始**；本文把 ACP 会话级恢复的现状证据、约束、分层交付与验收门写清楚，生产默认仍保持 per-call，持久恢复与强杀演练继续由 ACP-06 收口。
+> 状态：**ACP-01～ACP-05 已完成，ACP-06 离线验收通过（2026-09-13）**；真实 Reasonix provider 的跨进程 resume 因“无 prompt 的空会话未持久化”暂阻塞，生产默认仍保持 per-call。
 >
 > 创建日期：2026-09-13
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目）从"stateless per call"扩展到"ACP 持久会话 + 会话级恢复"的规划。**不覆盖** Reasonix 本体的 ACP 实现（已可用，见 §2.1），也不覆盖已落地的**任务级**续跑（checkpoint，见 §2.3）。
@@ -13,7 +13,7 @@
 1. **ACP 本身可用**：`reasonix acp` 实测可 initialize、`session/new`，能力声明含 `loadSession: true` 与 `sessionCapabilities.{list,resume,close,delete}`。
 2. **bridge 已提供显式 opt-in 共存**：默认 MCP 工具仍走 `reasonix subagent run` 一次性子进程；配置 `transport: "acp"` 且提供 `session_id` 时，只读会话才进入进程内 ACP 管理器，故障自动回退 per-call。
 3. **现状替代**：`012f3c1` + `a596921` 已交付**任务级**续跑（durable task checkpoints，原子 claim）——解决"长任务中断即丢"，但不保留会话上下文（对话与工具轨迹）。
-4. **本文交付**：6 张票 `TOOL-RXB-ACP-01`～`06`，覆盖客户端层、compact 真实化、生命周期、安全回归、共存切换与验收演练。
+4. **本文交付**：6 张票 `TOOL-RXB-ACP-01`～`06`，覆盖客户端层、compact 真实化、生命周期、安全回归、共存切换与验收演练；ACP-06 离线门已通过，真实 provider 恢复门保留为阻塞项。
 
 ---
 
@@ -36,7 +36,7 @@
 ### 2.2 bridge 侧
 
 - `src/acp-prototype.mjs`（91 行）保留**纯决策原型**：定义 `ACP_HISTORY_HARD_CAP_BYTES = 128MB`、`ACP_COMPACT_TRIGGER_RATIO = 0.75`、事务式 `compactHistory`（摘要失败不改原历史）与 `prepareSessionContinuation` 的四分支（`append` / `compact` / `rotate` / `per_call` 回退）。`src/acp-session.mjs`（ACP-02）将该决策接入 `AcpClient`，提供有界规则摘要、替换会话事务和显式 stateless 回退；ACP-05 已在 server 侧做进程内 opt-in 接线。
-- `src/acp-client.mjs`、`src/acp-transport.mjs` 与 `src/acp-security.mjs` 由 server 在 `transport: "acp"` 时加载；注册表仍未接入生产路径，跨进程恢复与强杀后清理留给 ACP-06。
+- `src/acp-client.mjs`、`src/acp-transport.mjs` 与 `src/acp-security.mjs` 由 server 在 `transport: "acp"` 时加载；注册表仍未接入生产路径，生产启用仍需真实 provider 持久化契约通过 ACP-06 复核。
 - 现有 MCP 工具面：`reasonix_run` / `reasonix_status` / `reasonix_rollback`，其中 worker 调用固定为 `reasonix subagent run <profile> --model <ref> --max-steps N --dir <cwd> -- <task>`。
 
 ### 2.3 已落地的替代（任务级续跑）
@@ -50,9 +50,9 @@
 
 | 约束 | 内容 | 对应票 |
 | --- | --- | --- |
-| **128MB 会话历史硬上限** | 持久会话会累积历史，必须在 0.75 触发比与 128MB 硬上限下完成 compact/rotate 的验证；ACP-02 已接入有界规则 summarizer 与替换会话协调器，后续仍需在 ACP-06 做长会话演练 | `ACP-06` |
+| **128MB 会话历史硬上限** | 持久会话会累积历史，必须在 0.75 触发比与 128MB 硬上限下完成 compact/rotate 的验证；ACP-02 已接入有界规则 summarizer 与替换会话协调器，ACP-06 离线演练已覆盖 compact/rotate 边界 | `ACP-06` |
 | **stateless 是现有安全契约** | 一次性调用、可审计、无残留。ACP-05 仅提供显式 opt-in 的进程内只读会话；改成长驻/跨进程会话仍需崩溃恢复、并发串行化、会话/进程清理，以及持久历史下的越权风险控制 | `ACP-06` |
-| **无验收票** | 会话生命周期验证（崩溃后 resume、compact 正确性、rotate 边界、取消/并发、零泄漏）此前无票覆盖 | `ACP-06` |
+| **provider 持久化语义未闭合** | 离线 fixture 已覆盖崩溃后 resume、compact/rotate、取消/并发与资源清理；真实 Reasonix 在未产生 prompt 的空会话上返回 unknown session，需用真实 prompt 或 provider-backed persistence fixture 复验 | `ACP-06` |
 
 ---
 
@@ -64,7 +64,7 @@
 - 不替换现有 MCP 工具面（`reasonix_run/status/rollback` 语义保持不变）；
 - 不把 128MB 历史上限做成可配置；
 - 不允许"跳过 compact 直接长会话"；
-- 不在 `ACP-06` 完成前默认启用 ACP；`transport` 默认值保持 `per-call`。
+- 不在真实 provider 恢复门通过前默认启用 ACP；`transport` 默认值保持 `per-call`。
 
 ---
 
@@ -74,10 +74,10 @@
 | --- | --- | --- | --- | --- |
 | `TOOL-RXB-ACP-01` | ACP 客户端层 | spawn `reasonix acp`；JSON-RPC over stdio 客户端（initialize → 能力探测 → `session/new`/`load`/`resume`）；`session/prompt` 的 `session/update` 事件流汇总为调用结果；`session/cancel` 接超时 | — | **已完成**：create→prompt→事件流→干净关闭 fixture 与真实握手；旧 CLI（`loadSession=false`）能力可探测，实际 per-call 回退由 ACP-05 接线；stdin 关闭无残留进程 |
 | `TOOL-RXB-ACP-02` | compact 策略真实化 | `src/acp-session.mjs` 为 `prepareSessionContinuation` 接入有界规则 summarizer（保留可注入 LLM 接口）；四分支接入会话循环；记录每次决策（字节、动作、耗时） | ACP-01 | **已完成**：离线回归覆盖 0.75 触发、append、compact、rotate、摘要失败与替换会话失败回退；摘要/替换失败均回退 `per_call` 且历史不变；替换成功后旧会话 close/delete，rotate 后协调器历史低于硬上限 |
-| `TOOL-RXB-ACP-03` | 会话生命周期管理 | `src/acp-registry.mjs` 提供 metadata 注册表（sessionId ↔ cwd/profile/model）；封装 `session/list`/`close`/`delete`；孤儿标记与显式 shutdown；崩溃后 capability-gated `session/resume`/`load`；同会话并发串行化 | ACP-01 | **开发门完成（opt-in）**：持久元数据不含 task/response；重启条目标记 orphaned 并可 resume/load；delete 在关闭进程前发送；并发 prompt 串行，删除后的排队请求被阻断；真实强杀 bridge 后的进程表验收留给 ACP-06；server 仍未生产接线 |
+| `TOOL-RXB-ACP-03` | 会话生命周期管理 | `src/acp-registry.mjs` 提供 metadata 注册表（sessionId ↔ cwd/profile/model）；封装 `session/list`/`close`/`delete`；孤儿标记与显式 shutdown；崩溃后 capability-gated `session/resume`/`load`；同会话并发串行化 | ACP-01 | **开发门完成（opt-in）**：持久元数据不含 task/response；重启条目标记 orphaned 并可 resume/load；delete 在关闭进程前发送；并发 prompt 串行，删除后的排队请求被阻断；强杀、进程表和工件清理已由 ACP-06 离线演练覆盖；server 仍未生产接线 |
 | `TOOL-RXB-ACP-04` | 安全回归 | `src/acp-security.mjs` 提供会话作用域、workspace/配置钉死、`WRITE_POLICY` 写路径预检与敏感历史脱敏；服务端 Git diff/rollback 仍是实际写入权威 | ACP-01 | 6 项新增安全回归通过：越界写预检拒绝、跨任务历史隔离、cwd/profile/model 漂移拒绝、`.env`/凭据/私钥脱敏；ACP-05 接线复用该安全门 |
 | `TOOL-RXB-ACP-05` | 共存与切换 | `bridge.config.json` 增 `transport: "per-call" \| "acp"`（默认 per-call）；只读 `session_id` 复用 ACP 会话；implement/parallel 保持 per-call；两条路径共享限额/审计/日志；ACP 初始化、协议或超时失败自动降级 | ACP-02/03/04 | **已完成**：显式切换与会话复用、默认 per-call 回归、implement/parallel 隔离、启动/内部 timeout 降级、失效会话清理；全量 bridge 回归 89/89 |
-| `TOOL-RXB-ACP-06` | 验收与演练 | 崩溃 resume 演练、compact 正确性对照、零泄漏检查（进程/会话/句柄）、并发与取消演练；结果登记回本文档 | ACP-05 | 见 §7 汇总 |
+| `TOOL-RXB-ACP-06` | 验收与演练 | 崩溃 resume 演练、compact 正确性对照、零泄漏检查（进程/会话/句柄）、并发与取消演练；结果登记回本文档 | ACP-05 | **离线门通过**；真实 provider resume 阻塞，见 §7 |
 
 ---
 
@@ -87,10 +87,10 @@
 TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-RXB-ACP-06
                  └─> TOOL-RXB-ACP-03 ─┤
                  └─> TOOL-RXB-ACP-04 ─┘
-（ACP-01～ACP-05 已完成；ACP-06 仅保留跨进程恢复与强杀验收）
+（ACP-01～ACP-05 已完成；ACP-06 离线门通过，真实 provider 恢复门待补 prompt 后复验）
 ```
 
-与 `TOOL-RXB-R3-EXT-01`（并行 worker 池）的关系：并行池是"多 worker 同时跑"，ACP 是"单 worker 长会话"，两者正交。R3 已完成；ACP-01 交付客户端和只读协议 fixture，ACP-02 交付协调器，ACP-03 交付 opt-in 会话注册表，ACP-04 交付安全门，ACP-05 交付进程内共存切换，ACP-06 负责跨进程恢复与强杀验收。
+与 `TOOL-RXB-R3-EXT-01`（并行 worker 池）的关系：并行池是"多 worker 同时跑"，ACP 是"单 worker 长会话"，两者正交。R3 已完成；ACP-01 交付客户端和只读协议 fixture，ACP-02 交付协调器，ACP-03 交付 opt-in 会话注册表，ACP-04 交付安全门，ACP-05 交付进程内共存切换，ACP-06 交付离线跨进程恢复与强杀验收，并保留真实 provider 持久化门。
 
 ---
 
@@ -100,20 +100,32 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 | --- | --- | --- |
 | ACP-01 | create→prompt→事件流→关闭全链路；旧 CLI 能力探测；无残留进程（per-call 降级由 ACP-05 接线） | fixture 回归 + 真实 `initialize/session/new/session/close` |
 | ACP-02 | 0.75/128MB 不越线；摘要失败回退且历史不变；rotate 有效 | `AcpSessionCoordinator` 决策记录 + 历史字节断言 + 五项回归 |
-| ACP-03 | 孤儿状态可识别；可 resume；并发串行；shutdown 有收口路径 | `AcpSessionRegistry` 8 项回归 + 持久注册表/恢复顺序断言；强杀进程表演练留 ACP-06 |
+| ACP-03 | 孤儿状态可识别；可 resume；并发串行；shutdown 有收口路径 | `AcpSessionRegistry` 回归 + 持久注册表/恢复顺序断言；强杀进程表与工件清理由 ACP-06 离线演练覆盖 |
 | ACP-04 | 越界写被拒并回滚；跨任务历史不混；敏感内容不入历史 | `AcpSecurityPolicy` 负向测试 + 协调器历史抽样；ACP-05 server 接线复用安全门 |
-| ACP-05 | 默认路径回归一致；只读会话切换可用；implement/parallel 隔离；启动与内部传输故障降级并清理失效会话 | bridge 全量回归 `89 passed / 0 failed` + 开关/降级/清理测试 |
-| ACP-06 | resume/compact/零泄漏/并发取消四类演练通过 | 演练记录（登记回本文档） |
+| ACP-05 | 默认路径回归一致；只读会话切换可用；implement/parallel 隔离；启动与内部传输故障降级并清理失效会话 | bridge 全量回归 `92 passed / 0 failed` + 开关/降级/清理测试 |
+| ACP-06 | 离线 fixture 的 resume/compact/零泄漏/并发取消四类演练通过；真实 provider 跨进程 resume 需可持久化会话 | `npm run acceptance:acp` 返回 `status=passed`；`npm run acceptance:acp:real` 返回结构化 `status=blocked`、退出码 2（空会话未持久化） |
+
+ACP-06 离线演练（2026-09-13）实际输出摘要：
+
+```json
+{"schema":"qlh.reasonix.acp.acceptance.v1","status":"passed","process":{"childExited":true,"strongKillRequested":true,"childSignal":"SIGKILL"},"resume":{"orphanDetected":true,"resumed":true,"promptAccepted":true},"compact":{"action":"compact","replacementCleanup":true,"rotate":"rotate"},"transport":{"serialized":true,"cancelled":true,"persistentSessionsAfterClose":0},"realClient":{"handshake":true,"prompt":true,"childClosed":true},"artifacts":{"retainedBodies":false}}
+```
+
+真实 provider 控制面探测（Reasonix CLI v1.38.7）创建并强杀空会话后，`session/resume` 返回
+`unknown session`。`npm run acceptance:acp:real` 将其报告为
+`qlh.reasonix.acp.acceptance.real.v1` / `status: "blocked"` / `reason: "empty_session_not_persisted"`
+并以退出码 2 结束；该探测不发送模型 prompt。需 provider-backed 持久化 fixture 或经批准的
+真实 prompt 后再复验，未通过前不启用生产跨进程 ACP。
 
 ---
 
 ## 8. 风险与边界
 
-1. **历史泄漏**：持久会话可能把上一任务的敏感内容带进下一任务——ACP-04 已用"按调用隔离 + 脱敏"关闭本地历史风险，ACP-05 只允许显式只读 opt-in；跨进程恢复仍需 ACP-06 复核。
+1. **历史泄漏**：持久会话可能把上一任务的敏感内容带进下一任务——ACP-04 已用"按调用隔离 + 脱敏"关闭本地历史风险，ACP-05 只允许显式只读 opt-in；真实 provider 跨进程恢复仍需通过持久化语义门。
 2. **摘要失真**：compact 可能丢关键约束；契约是"摘要失败/可疑即回退 `per_call`"，不得"尽力压缩"。
 3. **进程/会话泄漏**：长驻 CLI 是新的资源面；bridge 崩溃、Codex 退出、会话 idle 都要有回收路径。
 4. **CLI 版本耦合**：`loadSession`/`resume` 等能力随版本变化——必须**能力探测 + 降级**，不得假设。
-5. **启用顺序**：`ACP-06` 未完成前，ACP 不得作为默认 transport；`transport` 开关默认值必须保持 `per-call`。
+5. **启用顺序**：真实 provider 恢复门未通过前，ACP 不得作为默认 transport；`transport` 开关默认值必须保持 `per-call`。
 6. **不做的事**：不把 128MB 上限变成配置项；不用 ACP 替代 MCP 工具契约；不在未验证 compact 的情况下开启长会话。
 
 ---
@@ -129,3 +141,4 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 | 2026-09-13 | `TOOL-RXB-ACP-03` 开发门完成：新增 `src/acp-registry.mjs`，提供 metadata-only 持久注册表、孤儿识别、resume/load 能力回退、按会话串行 prompt、close/delete/shutdown 和进程生命周期钩子；测试夹具优先使用项目树内 `build/bridge-test/`，`tmpdir()` 仅作兜底。注册表回归 8 项通过，全量 bridge 回归 `75 passed / 0 failed`；真实强杀 bridge 后的进程表无孤儿演练与生产接线留 ACP-06/05，server 仍默认 stateless |
 | 2026-09-13 | `TOOL-RXB-ACP-04` 开发门完成：新增 `src/acp-security.mjs`，以 opaque `owner/taskId` 绑定会话，钉住 cwd/profile/model，复用 `resolveWritePolicy` 的 fail-closed 白名单做 implement 预检，并对 `.env`/环境变量赋值/JSON 凭据/私钥及协调器响应做有界脱敏；注册表只持久化作用域元数据，并可在每个串行 prompt lane 内重检安全策略，协调器可选传输前脱敏。新增 6 项 ACP-04 测试，全量 bridge 回归 `81 passed / 0 failed`；server 仍默认 stateless，ACP-05/06 负责生产切换和强杀演练 |
 | 2026-09-13 | `TOOL-RXB-ACP-05` 完成：新增 `transport: "per-call" | "acp"` 显式切换与 `AcpTransportManager`；带 `session_id` 的 inspect/review 复用进程内 ACP 会话，compact/替换失败回到 per-call，启动/协议/超时故障进入 degraded 并清理失效会话；implement 与 parallel 始终保持现有 per-call 审计路径，status 提供有界 transport/session/fallback 摘要。新增 8 项 ACP-05 回归，全量 bridge 回归 `89 passed / 0 failed`；默认仍为 per-call，跨进程 registry/resume、强杀与零泄漏演练留 ACP-06 |
+| 2026-09-13 | `TOOL-RXB-ACP-06` 离线验收完成：新增 `scripts/acp-acceptance.mjs` 与 `acceptance:acp` 命令，使用项目树内 `build/bridge-test/` 演练真实子进程强杀、注册表 orphan/resume、metadata-only 防泄漏、compact/rotate、有序并发与取消，并以真实 ACP fixture 验证 child cleanup；全量 bridge 回归 `92 passed / 0 failed`。`acceptance:acp:real` 已实际探测 Reasonix v1.38.7 的控制面，但空会话强杀后 resume 返回 `unknown session`，因此结构化报告为 `blocked`、退出码 2；未发送模型 prompt，待 provider-backed 持久化或真实 prompt 后复验，生产默认继续 per-call |
