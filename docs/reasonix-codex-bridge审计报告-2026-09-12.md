@@ -68,7 +68,7 @@
 
 影响：调用方按“工具轮次”估算任务大小时会过早触发退出码 1，日志也只能看到笼统的 `worker_exit`，难以区分步数耗尽与真正的进程失败或超时。
 
-修复：子项目 commit `21df99d` 新增 `tool_rounds` 参数，按当前 CLI 每轮折算 2 个 raw steps；`reasonix_status.limits` 暴露 `toolRoundsCap`；匹配 Reasonix `paused after ... tool-call rounds (max_steps)` 的 stderr 时记录 `step_limit`、轮次数和“120 秒未到”的诊断。原始 `max_steps` 仍保留以兼容直接 CLI 口径。
+修复：子项目 commit `6d093c1` 新增 `tool_rounds` 参数，按当前 CLI 每轮折算 2 个 raw steps；`reasonix_status.limits` 暴露 `toolRoundsCap`；匹配 Reasonix `paused after ... tool-call rounds (max_steps)` 的 stderr 时记录 `step_limit`、轮次数和“120 秒未到”的诊断。原始 `max_steps` 仍保留以兼容直接 CLI 口径。
 
 ## 子 agent 桥接审查证据
 
@@ -85,10 +85,10 @@
 
 | 检查 | 结果 |
 |---|---|
-| `npm test` | 初审 40 passed；复验 50 passed, 0 failed |
+| `npm test` | 初审 40 passed；复验 51 passed, 0 failed |
 | `npm run check` | 通过，所有模块语法检查通过 |
 | `npm run check:links` | README 本地链接通过 |
-| `node --test --experimental-test-coverage` | 行 91.71%，分支 56.71%，函数 90.23% |
+| `node --test --experimental-test-coverage` | 行 91.87%，分支 56.26%，函数 90.28% |
 | `git diff --check` | 通过 |
 
 现有测试覆盖较好的部分包括：配置解析与 doctor cache、Codex TOML 合并、profile 漂移、MCP 工具/状态、任务和输出限制、队列容量与脱敏日志、默认禁写、clean-tree、白名单、手工修改后的 rollback 拒绝，以及 ACP 原型的压缩/轮换。
@@ -112,7 +112,7 @@
 4. 收紧 Windows CLI 启动方式并补 shell 参数测试。**已完成（2026-09-13）**。
 5. 增加失败注入、权限/链接/二进制和真实 CLI 的分层集成测试；解决本机 Reasonix 配置目录的权限迁移问题后，再重新运行桥接子 agent 审查。**部分完成**：本轮补齐并发、类型变化/缺失、Windows 参数、restore 后哈希和 staged rename 回归；ACL 权限失败、symlink、二进制边界、POSIX/WSL、真实 provider/model 质量证据仍待对应环境。
 
-审计判定：BR-001～BR-005 的代码级风险已由复验关闭，默认只读 inspect/review 可继续使用；写 profile 和 `allowWrite=true` 仍保持受控，直至 G3 跨 POSIX 环境和真实集成证据补齐后再评估生产开放。
+审计判定：BR-001～BR-006 的代码级风险已由复验关闭，默认只读 inspect/review 可继续使用；写 profile 和 `allowWrite=true` 仍保持受控，直至 G3 跨 POSIX 环境和真实集成证据补齐后再评估生产开放。
 
 ## 修复跟踪
 
@@ -124,7 +124,7 @@
 | `TOOL-RXB-AUD-04` | BR-004 Windows `.cmd` shell 参数 | **已完成（2026-09-13）** | `shell:false` + 显式 `cmd.exe`；元字符拒绝与 `.cmd` 启动回归通过 |
 | `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | **已完成（2026-09-13）** | `readable/missing/unreadable` 三态；类型变化、缺失和 restore 后 SHA-256 回归通过 |
 | `TOOL-RXB-AUD-06` | rename/copy 目标回滚的 index 状态未覆盖 | **已完成（2026-09-13）** | 子项目 commit `8e7693c`；rename 目标按新增路径清理并撤销 staged index，回归通过 |
-| `TOOL-RXB-AUD-07` | Reasonix raw `max_steps` 与工具调用轮次口径不一致 | **已完成（2026-09-13）** | 子项目 commit `21df99d`；`tool_rounds` 映射、`step_limit` 分类和 50 项回归通过 |
+| `TOOL-RXB-AUD-07` | Reasonix raw `max_steps` 与工具调用轮次口径不一致 | **已完成（2026-09-13）** | 子项目 commit `6d093c1`；`tool_rounds` 映射、`step_limit` 分类和 51 项回归通过 |
 
 本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
 
@@ -132,7 +132,7 @@
 
 - 主节点 Codex 只读审计复核确认修复方向：AUD-03 的回滚请求进入与 implement 相同的串行队列；AUD-04 的 `.cmd/.bat` 调用不再启用 `shell=true`，危险元字符在启动前 fail-closed；AUD-05 的回滚目标区分 `missing`、`unreadable` 和 SHA-256，恢复后再次检查状态与哈希。
 - 本机 Reasonix 只读复核本轮以 worker exit code 1 结束，没有产出可采纳报告；未把该失败当作通过证据，也未开放 Reasonix 写入配置。
-- `npm test`：50 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
+- `npm test`：51 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
 - 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核，以及 staged rename 目标的 index 清理。
 - 新增步数回归覆盖：Reasonix `max_steps` 暂停识别为 `step_limit`、`timeout_seconds` 未到的诊断，以及 `tool_rounds` 到 raw `--max-steps` 的映射。
 - 未伪造 ACL 权限失败、POSIX/WSL 或真实 provider/model 质量证据；这些仍属于环境或集成层后续验证。

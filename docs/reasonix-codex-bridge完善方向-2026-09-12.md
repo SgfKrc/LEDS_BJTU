@@ -187,4 +187,4 @@
 | 2026-09-13 | `TOOL-RXB-AUD-04` 完成：Windows `.cmd/.bat` 通过显式 `cmd.exe /d /s /c`、`shell:false` 启动；命令元字符在进程创建前拒绝，`configure`、doctor、version、worker 共用安全调用解析器，并补启动/参数回归 |
 | 2026-09-13 | `TOOL-RXB-AUD-05` 完成：rollback 哈希改为 `readable/missing/unreadable` 三态；不可读和类型变化默认拒绝，缺失与哈希冲突分别返回语义化错误，restore 后复核 Git 状态与 SHA-256 |
 | 2026-09-13 | `TOOL-RXB-AUD-06` 完成：Git rename/copy 目标按新增路径处理；回滚清理前撤销 staged index，避免 rename 目标残留导致 post-check 误报；新增 staged rename 回归，子项目 commit `8e7693c`，`npm test` 48 项通过 |
-| 2026-09-13 | `TOOL-RXB-AUD-07` 完成：确认 Reasonix `--max-steps` 是 raw 内部步数而非工具轮次；`max_steps=10` 复现 5 轮后暂停且未到 120 秒，新增 `tool_rounds` 映射、`step_limit` 失败语义与回归，子项目 commit `21df99d`，`npm test` 50 项通过 |
+| 2026-09-13 | `TOOL-RXB-AUD-07` 完成：确认 Reasonix `--max-steps` 是 raw 内部步数而非工具轮次；`max_steps=10` 复现 5 轮后暂停且未到 120 秒，新增 `tool_rounds` 映射、`step_limit` 失败语义与回归，子项目 commit `6d093c1`，`npm test` 51 项通过 |
