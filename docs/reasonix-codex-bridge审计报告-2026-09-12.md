@@ -136,6 +136,7 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 | `TOOL-RXB-AUD-07` | Reasonix raw `max_steps` 与工具调用轮次口径不一致 | **已完成（2026-09-13）** | 子项目 commit `6d093c1`；`tool_rounds` 映射、`step_limit` 分类和 51 项回归通过 |
 | `TOOL-RXB-AUD-08` | Reasonix continuation cursor 失败未分类且可能回显失效 token | **已完成（2026-09-13）** | 子项目 commit `491c435`；prompt 原样回传约束、同步路径修正、`cursor_error` 分类/脱敏、禁止重放和 53 项回归通过 |
 | `TOOL-RXB-R2-EXT-01` | 审计后长任务预算仍偏窄 | **已完成（2026-09-13）** | 子项目 commit `26b4113`；有限上限扩展至 256 raw steps/128 工具轮次/1800 秒，54 项回归通过 |
+| `TOOL-RXB-E2-EXT-01` | 长任务失败后无法显式续跑 | **已完成（2026-09-13）** | 子项目 commit `012f3c1`；任务级 checkpoint、配置/工作区漂移拒绝、一次性 `reasonix_resume` 和 57 项回归通过 |
 
 本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006、BR-007。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
 

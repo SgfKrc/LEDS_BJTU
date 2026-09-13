@@ -69,7 +69,7 @@ REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 ## 接线后验收
 
 1. `configure verify` 输出 CLI、model ref、profile model/read-only 和实际 `allowed-tools`，且无 `FAIL`。
-2. Codex 重启后，MCP `tools/list` 出现 `reasonix_run`、`reasonix_rollback` 与 `reasonix_status`；`mode=implement` 只有在写入策略显式启用时才允许。
+2. Codex 重启后，MCP `tools/list` 出现 `reasonix_run`、`reasonix_resume`、`reasonix_rollback` 与 `reasonix_status`；`mode=implement` 只有在写入策略显式启用时才允许。
 3. `reasonix_status` 的 `workspaceRoot`、`modelRefSource`、能力摘要和限额与目标机配置一致。
 4. `npm run check`、`npm test`、`npm run check:links` 全绿；这些检查不下载模型、不联网调用 provider。
 
@@ -85,5 +85,6 @@ REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 
 ## 变更边界
 
+- `reasonix_resume` 仅接受失败响应中的 checkpoint id；恢复前会校验 workspace/config 指纹，并消费 checkpoint 后才启动新的显式续跑。
 - 本清单只登记接线和验收，不执行全局 Codex/profile 写入。
 - 生产 bridge 仍是 stateless、只读；G3 的 POSIX/WSL 运行证据必须在具备实际 Linux 环境后补齐。
