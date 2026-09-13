@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 工具面现状与能力归属（2026-09-13）
 
-> 状态：**现状登记，`TOOL-RXB-TOOL-01`、`TOOL-RXB-NET-01` 与 `TOOL-RXB-NET-02` 已完成**；本文记录 Reasonix v1.38.7 的真实工具面、bridge 声明与现实的差异，以及"能力归属"原则（能丢给 Reasonix 的都交给 Reasonix）。NET-02 当前为本机 provider unavailable，接通 provider 后需补真实搜索验收。
+> 状态：**现状登记，`TOOL-RXB-TOOL-01`、`TOOL-RXB-NET-01`、`TOOL-RXB-NET-02` 与 `TOOL-RXB-LOOP-01` 已完成**；本文记录 Reasonix v1.38.7 的真实工具面、bridge 声明与现实的差异，以及"能力归属"原则（能丢给 Reasonix 的都交给 Reasonix）。NET-02 当前为本机 provider unavailable，接通 provider 后需补真实搜索验收。
 >
 > 创建日期：2026-09-13
 > 证据类型：Reasonix **内置文档**（`docs/TOOL_CONTRACT.md` 等，随 v1.38.7 打包）+ 本机 `reasonix doctor` / `doctor capabilities` 实测输出。
@@ -98,6 +98,7 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 | `TOOL-RXB-TOOL-01`（P1） | 工具身份对齐：把 `READ_ONLY_PROFILE_TOOLS` 收敛为**真实有效**集合（去掉 `git_log`/`git_diff`）；README 与 profile 同步；`configure verify` 对照 Reasonix 真实清单 | **已完成**：两个 profile doctor 零警告，verify 覆盖新增校验，`npm test` 99/99 |
 | `TOOL-RXB-NET-01`（修订） | worker 侧直接使用 Reasonix 自带 `web_fetch`；bridge 只做透传与结果摘要（引用/unsafe URL 策略由 Reasonix 决定），**不自建网络栈** | **已完成**：两个全局 profile 已同步，原生 `example.com` 抓取返回 200/标题；bridge 未增加 URL/socket 网络路径 |
 | `TOOL-RXB-NET-02`（修订） | `web_search` 归属 provider：未接通时稳定返回 unavailable；接通后只透传 provider 结果（summary/sources/truncated） | **已完成本机门控**：`reasonix_status.providerSearch` 返回 unavailable；原生探测和子智能体均未得到结果，不伪造、不回退 |
+| `TOOL-RXB-LOOP-01` | 主 agent 显式标记 `plan -> implement -> exec -> review` 阶段；job/checkpoint/audit 可见，阶段不自动推进 | **已完成**：`reasonix_status.workflow`、`jobs[*].stage`、`lastRun.stage` 与 checkpoint 均记录阶段；失败仍由调用方显式取消、续跑、审查或回滚 |
 
 ---
 
@@ -112,6 +113,7 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 | 搜索归属 | 内置文档 `docs/WEB_SEARCH.md` + changelog v1.19.7 | "opens a separate model request … backend's native search tool"；官方端点上查询发给 provider 并按搜索计费 |
 | NET-01 原生抓取 | 原生 `reasonix run --allowed-tools web_fetch` + 真实 bridge MCP `reasonix_run(mode=inspect)` | `https://example.com` 返回 `HTTP status: 200 OK`、标题 `Example Domain`；`https://example.invalid` 返回 transport error 且未重试；`doctor capabilities` 为 `errors=0,warnings=0` |
 | NET-02 provider 搜索 | `reasonix_status.providerSearch` + `reasonix run --allowed-tools web_search` + `reasonix subagent try deepseek-worker` | `available=false,status=unavailable,reason=provider_capability_not_advertised`；provider 返回 no native search results；worker 不回退 `web_fetch`，不输出伪造来源 |
+| LOOP-01 阶段审计 | 离线 `npm test` + 真实 bridge `reasonix_status` | `npm test` 101/101；workflow 模板为 `plan,implement,exec,review`；默认预算 hard cap 为 256 raw steps / 128 tool rounds；阶段错配在 spawn 前拒绝 |
 | MCP git 能力 | capability catalog | `mcp-tool:gitcontext/git_pickaxe` 可用 |
 
 ---
@@ -124,3 +126,4 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 | 2026-09-13 | `TOOL-RXB-TOOL-01` 收口：常量、README、prompt 与两个全局 profile 已同步为 5/7 个有效身份；`doctor capabilities` 告警从 4 降为 0，`configure verify` 增加 fail-closed 诊断。 |
 | 2026-09-13 | `TOOL-RXB-NET-01` 收口：profile 接入 Reasonix 原生 `web_fetch`，read/write 为 6/8；bridge 仍不提供任意 URL MCP 工具或自建网络栈，真实抓取验收通过。 |
 | 2026-09-13 | `TOOL-RXB-NET-02` 收口：新增 `providerSearch` fail-closed 摘要；本机 provider 搜索不可用时稳定透传 unavailable，不自建搜索后端、不伪造结果。 |
+| 2026-09-13 | `TOOL-RXB-LOOP-01` 收口：新增显式阶段元数据与 workflow 状态摘要；不自动推进、不隐式重试、不扩大权限，保留 job/checkpoint/exec/回滚审计门。 |

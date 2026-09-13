@@ -114,9 +114,9 @@ npm run acceptance:acp:real
 
 write profile 没有 shell、测试或构建工具，worker 只能编辑文件；实现结果必须由主 agent 审查，并通过显式配置的 `reasonix_exec` 命令 profile 运行测试。执行器补齐了 host 侧写后验证，但仍不是 worker 自主的“编辑→运行测试→修复”闭环。
 
-### P1：没有跨调用自主编排
+### P1：显式阶段编排已补齐，自动流水线仍保持关闭
 
-checkpoint 是一次性、显式 resume；parallel 是显式只读槽位；bridge 不会自行生成子任务、安排 plan→implement→test 阶段或在失败后自动改变策略。这要求 Codex 主 agent 保留编排和最终判断权。
+`TOOL-RXB-LOOP-01` 已补齐主 agent 的显式 `plan→implement→exec/test→review` 阶段标记：`reasonix_run`/`reasonix_exec` 可传 `stage`，`reasonix_status.workflow`、`jobs[*].stage`、`lastRun.stage`、checkpoint 和可选 `BRIDGE_LOG` 可见。阶段错配在 spawn 前拒绝，`implement`/`exec` 仍沿用原有写 profile、白名单、clean-tree 和命名命令门。checkpoint 仍一次性、resume 仍显式；bridge 不自行生成子任务、自动推进、重试或改变权限，主 agent 保留编排和最终判断权。
 
 ### P2：ACP coordinator 直接使用时仍需调用方串行化
 
@@ -135,7 +135,7 @@ checkpoint 不保存 stdout/stderr，但会保存原始任务文本、模式、�
 1. `TOOL-RXB-EXEC-01`、`TOOL-RXB-NET-01` 与 NET-02 本机门控已完成：`reasonix_exec` 只允许命名可执行文件和 argv 数组，`web_fetch` 由 Reasonix 原生 host registry 提供，`providerSearch` 对无后端稳定返回 unavailable；均不复制任意 shell/网络能力。
 2. provider 接通 `web_search` 后补一次真实 summary/sources/truncated 结构化结果验收；在此之前不在 bridge 自建搜索后端。
 3. 为 ACP 增加 provider-backed 非空会话 fixture，先验证“产生 prompt 后强杀→resume/load→close/delete”，再评估 registry 的生产接线；在此之前不改默认 transport。
-4. 在主 agent 层提供显式阶段编排模板（plan→implement→exec/test→review），保持每阶段可审查、可回滚，不在 bridge 内隐式重试。
+4. `TOOL-RXB-LOOP-01` 已完成：主 agent 可在 `reasonix_run`/`reasonix_exec` 显式传入 `stage`，并从 `reasonix_status.workflow`、job、checkpoint 和审计日志观察 `plan→implement→exec/test→review`；阶段仍由主 agent 推进，bridge 不隐式重试或扩大权限。
 5. 长任务若需要进度，增加仅含 job id、阶段和计数的通知/轮询契约，不传任务正文或 worker 输出正文。
 
 ## 文档质量门

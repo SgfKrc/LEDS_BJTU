@@ -1,6 +1,6 @@
 # reasonix-codex-bridge Harness 工具扩展与能力补齐排期（2026-09-13）
 
-> 状态：已完成能力调研；`TOOL-RXB-EXEC-01`、`TOOL-RXB-TOOL-01`、`TOOL-RXB-NET-01` 与 `TOOL-RXB-NET-02` 已实现并通过离线回归与真实 CLI/doctor/原生网络能力探测验收。
+> 状态：已完成能力调研；`TOOL-RXB-EXEC-01`、`TOOL-RXB-TOOL-01`、`TOOL-RXB-NET-01`、`TOOL-RXB-NET-02` 与 `TOOL-RXB-LOOP-01` 已实现并通过离线回归与真实 CLI/doctor/原生网络能力探测验收。
 >
 > 范围：只讨论桥接器如何安全复用 Reasonix Harness 已存在的能力，不把未验证的模型工具调用能力包装成“原生等价”。
 
@@ -27,7 +27,7 @@
 | `TOOL-RXB-NET-01` | P1 | **能力归属 Reasonix**：worker 侧直接使用 Reasonix 自带 `web_fetch`（host registry 可选工具），bridge **不自建网络栈**，只做透传与结果摘要；若未来确需自建，必须复用主仓 Tool Gateway 的 HTTPS 强制/SSRF/DNS/redirect 策略 | 失败态稳定透传；不新增网络代码路径；无任意 socket/代理覆盖 | **已完成** |
 | `TOOL-RXB-NET-02` | P1 | **搜索归属 provider**：按 Reasonix 内置文档，`web_search` 由 provider 侧执行（查询外发、按搜索请求计费）。**本机不自建搜索后端**；bridge 只做能力探测（不可用即稳定返回 unavailable）与结果透传 | 无后端时不得伪造成结果；接通后 summary/sources/truncated 完整 | **已完成（本机 unavailable；provider 接通待真实验收）** |
 | `TOOL-RXB-TOOL-01` | P1 | 工具身份对齐：`READ_ONLY_PROFILE_TOOLS` 收敛为真实有效集合（移除 `git_log`/`git_diff`；如需 git 只读走 MCP `gitcontext` 或受控 exec）；README/profile 同步；`configure verify` 增加对照 Reasonix 真实清单的校验 | 修正后 `doctor` 对两个 profile 零警告；`verify --role read/write` 均通过；`npm test` 全绿 | **已完成** |
-| `TOOL-RXB-LOOP-01` | P1 | 主 agent 显式阶段编排模板：plan -> implement -> exec/test -> review；每阶段 job/checkpoint/audit 可见 | 任一阶段失败可定位、可取消、可回滚；不隐式重试或自动扩大权限 | 排队 |
+| `TOOL-RXB-LOOP-01` | P1 | 主 agent 显式阶段编排模板：plan -> implement -> exec/test -> review；每阶段 job/checkpoint/audit 可见 | 任一阶段失败可定位、可取消、可回滚；不隐式重试或自动扩大权限 | **已完成** |
 | `TOOL-RXB-EVT-01` | P2 | 长任务事件/进度轮询：只暴露 job id、阶段、计数和状态，不透传敏感正文 | 中途取消、重连、事件顺序和脱敏检查 | 排队 |
 | `TOOL-RXB-ACP-07` | P2 | provider-backed 非空 ACP fixture，验证强杀后的跨进程 `resume/load`，再评估生产 registry 接线 | prompt -> kill -> resume/load -> close/delete 全链路真实通过 | 受真实 provider 持久化能力阻塞 |
 | `TOOL-RXB-MSG-01` | P2 | 受控多 agent 派生/消息协议；固定角色、任务作用域和并发额度 | 动态派生不越权、消息不带凭据/正文泄漏、失败可回收 | 排队，风险高于收益 |
@@ -70,6 +70,7 @@
 - 工具身份：同步本机 `%APPDATA%/reasonix/skills/deepseek-worker*` 两个全局 profile 后，`reasonix doctor --json` 不再报告未知工具，`reasonix doctor capabilities --json` 为 `errors=0,warnings=0`；`configure verify --role read` 与 `--role write` 均通过。
 - NET-01：两个全局 profile 已同步为 read 6 / write 8 个有效身份，其中 `web_fetch` 由 Reasonix 原生 host registry 提供；原生 `reasonix run --allowed-tools web_fetch` 与真实 bridge MCP `reasonix_run(mode=inspect)` 对 `https://example.com` 均返回 `HTTP status: 200 OK` 与标题 `Example Domain`，对保留域名 `https://example.invalid` 稳定返回 transport error 且按任务要求不重试。bridge 的 `tools/list` 仍只有 6 个 host 工具，源码未新增 URL/socket/fetch 网络路径。
 - NET-02：`reasonix_status.providerSearch` 新增 provider-owned `web_search` 的 fail-closed 摘要；当前返回 `available=false,status=unavailable,reason=provider_capability_not_advertised`。原生 `reasonix run --allowed-tools web_search` 与 `reasonix subagent try deepseek-worker` 均确认 provider 无 native search results，worker 不回退 `web_fetch`、不伪造来源；bridge 不新增搜索 MCP 或后端。
+- LOOP-01：`reasonix_run`/`reasonix_exec` 接受显式 `stage`（`plan|implement|exec|review`），`reasonix_status.workflow`、`modeDefaults`、`jobs[*].stage`、`lastRun.stage`、checkpoint 与可选 `BRIDGE_LOG` 均记录阶段；阶段不自动推进、不隐式重试、不扩大权限。`npm test` 101/101、`npm run check` 与链接检查通过；真实 bridge status 报告模板四阶段、inspect 默认 40 轮、review/plan/implement 默认 48 轮与 128 tool-round hard cap。
 
 ## 5. 变更记录
 
@@ -81,3 +82,4 @@
 | 2026-09-13 | 完成 `TOOL-RXB-TOOL-01`：profile 工具集收敛为 5/7 个真实身份，read/write 全局 profile 已同步；`doctor` 告警归零，`configure verify` 增加未知身份 fail-closed，99/99 回归通过。 |
 | 2026-09-13 | 完成 `TOOL-RXB-NET-01`：read/write profile 接入 Reasonix 原生 `web_fetch`（6/8）；不新增 bridge 网络栈或任意 URL MCP 工具，真实 `example.com` 抓取返回 200/标题，doctor/verify 零告警。 |
 | 2026-09-13 | 完成 `TOOL-RXB-NET-02`：新增 `providerSearch` fail-closed 能力摘要；本机 provider 搜索探测稳定为 unavailable，结果不伪造、不回退，bridge 不自建搜索后端。 |
+| 2026-09-13 | 完成 `TOOL-RXB-LOOP-01`：新增显式阶段元数据与 `workflow` 状态摘要，串联模板由主 agent 控制，保留取消、checkpoint、exec、回滚和权限门，不做隐式自动流水线。 |
