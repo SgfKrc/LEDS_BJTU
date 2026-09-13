@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G3`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05`/`TOOL-RXB-AUD-06`/`TOOL-RXB-AUD-07`/`TOOL-RXB-AUD-08`/`TOOL-RXB-R2-EXT-01`/`TOOL-RXB-E2-EXT-01`/`TOOL-RXB-R3-EXT-01`/`TOOL-RXB-R4` 已完成；G3 已在 WSL Ubuntu 22.04 完成跨 POSIX 实跑。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -15,7 +15,7 @@
 
 | 能力 | 验证方式（本机实跑） |
 | --- | --- |
-| stdio MCP facade（`reasonix_run` / `reasonix_status`） | stdin 喂 JSON-RPC，返回 `initialize`/`tools/list`/`tools/call` 均正常 |
+| stdio MCP facade（`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_status`） | stdin 喂 JSON-RPC，返回 `initialize`/`tools/list`/`tools/call` 均正常 |
 | 只读子智能体 profile `deepseek-worker` | `reasonix subagent list` 显示 `[global, manual, read-only]`，工具集 `read_file,grep,glob,ls,code_index` |
 | CLI 路径探测（不硬编码） | 未设 `REASONIX_EXE` 时解析到 `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`；`REASONIX_EXE` 指向缺失文件 → exit 2；清空 `LOCALAPPDATA`+`PATH` → exit 2 |
 | 模型解析链 env → `bridge.config.json` → doctor `default_model` | 三条路径分别实跑并核对 `reasonix_status.modelRefSource`；畸形 ref（无 `/`、含空格）→ exit 2 |
@@ -151,7 +151,7 @@
 | E3 | 超长任务调用前被拦截并给出上限值 | 调用输出 |
 | E4 | verify 列出的工具集与文档一致 | verify 输出 |
 | G1–G2 | CI 全绿；首个 tag | CI/tag 记录 |
-| G3 | POSIX/WSL 实跑 CLI 探测、启动自检、verify 与 terminate 分支 | 跨平台命令输出（当前等待） |
+| G3 | POSIX/WSL 实跑 CLI 探测、启动自检、verify 与 terminate 分支 | WSL Ubuntu 22.04 实跑记录；当前 shell 复跑因 Linux Node 未安装而受限 |
 | G4 | 主仓接线清单可照抄完成新机接入 | 文档 + 一次实操 |
 
 ---
@@ -176,7 +176,7 @@
 | 2026-09-12 | `TOOL-RXB-E4` 完成：profile 只读白名单扩展为 `read_file,grep,glob,ls,code_index,git_log,git_diff`，README/worker prompt 同步登记；`profile --sync` 固定该集合，`verify` 列出实际工具并对集合漂移 fail-closed；`npm test` 30 项通过 |
 | 2026-09-12 | `TOOL-RXB-G1` 完成：新增 `.github/workflows/ci.yml`，Node 20 离线执行 `npm run check`、`npm test`、`npm run check:links`；链接检查只解析 README 本地相对路径，外部 URL/anchor/mailto 不触网；`npm test` 31 项通过 |
 | 2026-09-12 | `TOOL-RXB-G2` 完成：package 版本固定为 semver `0.1.0`，新增首版 `CHANGELOG.md` 与版本一致性回归；子仓创建注释 tag `v0.1.0`；`npm test` 32 项通过 |
-| 2026-09-12 | `TOOL-RXB-G3` 暂缓：本机 `wsl.exe --list --quiet` 返回空列表，Docker/QEMU/VirtualBox 不可用，未伪造 POSIX 运行证据 |
+| 2026-09-12 | `TOOL-RXB-G3` 暂缓：当时本机 `wsl.exe --list --quiet` 返回空列表，未伪造 POSIX 运行证据 |
 | 2026-09-12 | `TOOL-RXB-G4` 完成：主仓新增接线清单，登记 Codex 配置、`deepseek-worker` profile、Reasonix CLI、workspace root、换机命令与脱敏边界；通过 `configure show`/`codex` 无写入预览核对 |
 | 2026-09-12 | `TOOL-RXB-W1` 完成：bridge 默认关闭 `mode=implement`，显式 `allowWrite` + 非空 `allowedPaths` + 干净 Git 树后才允许写入；越界路径或 worker 失败回滚本次变化，离线回归 36 项通过 |
 | 2026-09-12 | `TOOL-RXB-W2` 完成：成功写调用仅返回 `qlh.reasonix.changes.v1` 结构化变更集（路径、增删行数、diff stat、SHA-256），不返回 worker 输出或文件正文；新增 `reasonix_rollback` 一次性回滚令牌，回滚前校验后续修改并冲突拒绝；令牌仅存当前 bridge 进程，离线回归 37 项通过 |
@@ -186,3 +186,12 @@
 | 2026-09-13 | `TOOL-RXB-AUD-03` 完成：显式 `reasonix_rollback` 纳入与 implement 共用的进程内串行队列；新增同一工作区并发回归，验证 rollback 不与 worker 写入交错 |
 | 2026-09-13 | `TOOL-RXB-AUD-04` 完成：Windows `.cmd/.bat` 通过显式 `cmd.exe /d /s /c`、`shell:false` 启动；命令元字符在进程创建前拒绝，`configure`、doctor、version、worker 共用安全调用解析器，并补启动/参数回归 |
 | 2026-09-13 | `TOOL-RXB-AUD-05` 完成：rollback 哈希改为 `readable/missing/unreadable` 三态；不可读和类型变化默认拒绝，缺失与哈希冲突分别返回语义化错误，restore 后复核 Git 状态与 SHA-256 |
+| 2026-09-13 | `TOOL-RXB-AUD-06` 完成：Git rename/copy 目标按新增路径处理；回滚清理前撤销 staged index，避免 rename 目标残留导致 post-check 误报；新增 staged rename 回归，子项目 commit `8e7693c`，`npm test` 48 项通过 |
+| 2026-09-13 | `TOOL-RXB-AUD-07` 完成：确认 Reasonix `--max-steps` 是 raw 内部步数而非工具轮次；`max_steps=10` 复现 5 轮后暂停且未到 120 秒，新增 `tool_rounds` 映射、`step_limit` 失败语义与回归，子项目 commit `6d093c1`，`npm test` 51 项通过 |
+| 2026-09-13 | `TOOL-RXB-AUD-08` 完成：read/write prompt 固化 continuation cursor 原样回传约束；bridge 将 malformed/invalid cursor 分类为 `cursor_error`、隐藏失效 token 且禁止自动重放，并修正 prompt 同步命令路径，子项目 commit `491c435`，`npm test` 53 项通过 |
+| 2026-09-13 | `TOOL-RXB-R2-EXT-01` 完成：预算边界放宽为最多 256 raw steps/128 工具轮次和 1800 秒；默认 mode 预算不变，仍需显式传 `tool_rounds`/`timeout_seconds`；配置、夹紧和长预算映射回归共 `npm test` 54 项通过，子项目 commit `26b4113` |
+| 2026-09-13 | `TOOL-RXB-E2-EXT-01` 完成：新增任务级持久 checkpoint 与显式 `reasonix_resume`；失败时保存任务、预算、版本/配置和 Git 状态指纹，不保存 stdout/stderr；恢复前拒绝 workspace/config drift，checkpoint 一次性消费并以原子 claim 锁防并发重复；跨进程 fixture 和派生 write profile 回归后 `npm test` 57 项通过，子项目 commit `a596921` |
+| 2026-09-13 | `TOOL-RXB-R3-EXT-01` 完成：新增显式 `parallel=true` 只读 worker 槽位、job 状态展开和 `reasonix_cancel`；implement/resume/rollback 保持 workspace 独占，取消终止进程树且不生成 checkpoint；并行重叠、取消回收和既有串行写入回归后 `npm test` 59 项通过，子项目 commit `782d6b0` |
+| 2026-09-13 | `TOOL-RXB-G3` 完成：在 WSL Ubuntu 22.04 记录 POSIX CLI 探测、无 CLI 启动拒绝、WSL interop 下 `--version`/doctor/verify 和测试结果；跨平台夹具修复后记录为 58/59，剩余输出截断竞态转为 R4 |
+| 2026-09-13 | `TOOL-RXB-R4` 完成：输出超过 `OUTPUT_CHAR_CAP` 时改为有界缓冲并以成功结果标记 `truncated=true`，不因输出超限终止 worker；timeout/cancel 仍终止。Windows `npm test` 59/59、`npm run check`、`npm run check:links` 通过，子项目 commit `fa06fd2` |
+| 2026-09-14 | `TOOL-RXB-EVT-01` 完成：新增 `reasonix_events` 有界事件流（`after_seq`/`limit` 增量轮询；仅返回 job id、阶段、状态、终态与有界计数，任务文本/模型引用/路径/worker 输出一律不返回；每 job 环形缓冲上限 32 条、完成即清）；工具面现为 `run/resume/rollback/events/exec/cancel/status` 七项；子项目 commit `5104f3d`，`npm test` `103 passed / 0 failed` |
