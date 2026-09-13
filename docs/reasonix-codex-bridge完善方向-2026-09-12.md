@@ -194,3 +194,4 @@
 | 2026-09-13 | `TOOL-RXB-R3-EXT-01` 完成：新增显式 `parallel=true` 只读 worker 槽位、job 状态展开和 `reasonix_cancel`；implement/resume/rollback 保持 workspace 独占，取消终止进程树且不生成 checkpoint；并行重叠、取消回收和既有串行写入回归后 `npm test` 59 项通过，子项目 commit `782d6b0` |
 | 2026-09-13 | `TOOL-RXB-G3` 完成：在 WSL Ubuntu 22.04 记录 POSIX CLI 探测、无 CLI 启动拒绝、WSL interop 下 `--version`/doctor/verify 和测试结果；跨平台夹具修复后记录为 58/59，剩余输出截断竞态转为 R4 |
 | 2026-09-13 | `TOOL-RXB-R4` 完成：输出超过 `OUTPUT_CHAR_CAP` 时改为有界缓冲并以成功结果标记 `truncated=true`，不因输出超限终止 worker；timeout/cancel 仍终止。Windows `npm test` 59/59、`npm run check`、`npm run check:links` 通过，子项目 commit `fa06fd2` |
+| 2026-09-14 | `TOOL-RXB-EVT-01` 完成：新增 `reasonix_events` 有界事件流（`after_seq`/`limit` 增量轮询；仅返回 job id、阶段、状态、终态与有界计数，任务文本/模型引用/路径/worker 输出一律不返回；每 job 环形缓冲上限 32 条、完成即清）；工具面现为 `run/resume/rollback/events/exec/cancel/status` 七项；子项目 commit `5104f3d`，`npm test` `103 passed / 0 failed` |
