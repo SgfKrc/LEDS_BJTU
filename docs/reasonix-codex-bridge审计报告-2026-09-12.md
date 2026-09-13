@@ -93,7 +93,7 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 
 | 检查 | 结果 |
 |---|---|
-| `npm test` | 初审 40 passed；复验 53 passed, 0 failed |
+| `npm test` | 初审 40 passed；R4 收口后复验 59 passed, 0 failed |
 | `npm run check` | 通过，所有模块语法检查通过 |
 | `npm run check:links` | README 本地链接通过 |
 | `node --test --experimental-test-coverage` | 行 91.92%，分支 56.44%，函数 90.32% |
@@ -138,16 +138,17 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 | `TOOL-RXB-R2-EXT-01` | 审计后长任务预算仍偏窄 | **已完成（2026-09-13）** | 子项目 commit `26b4113`；有限上限扩展至 256 raw steps/128 工具轮次/1800 秒，54 项回归通过 |
 | `TOOL-RXB-E2-EXT-01` | 长任务失败后无法显式续跑 | **已完成（2026-09-13）** | 子项目 commit `a596921`；任务级 checkpoint、配置/工作区漂移拒绝、原子 claim、一次性 `reasonix_resume` 和 57 项回归通过 |
 | `TOOL-RXB-R3-EXT-01` | 并行 worker 无隔离、取消和回收观测 | **已完成（2026-09-13）** | 子项目 commit `782d6b0`；显式只读并行槽位、job 状态、`reasonix_cancel`、exclusive 写入 lane 和 59 项回归通过 |
+| `TOOL-RXB-R4` | 输出截断跨平台结果不确定 | **已完成（2026-09-13）** | 子项目 commit `fa06fd2`；输出超限改为有界缓冲并返回成功+`truncated=true`，Windows `npm test` 59/59、check、links 全通过 |
 
-本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006、BR-007。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
+本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006、BR-007，G3 跨 POSIX 实跑与 R4 输出截断竞态也已收口。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；当前 Windows shell 未安装 Linux Node，不能在本轮独立重跑 WSL 证据。
 
 ## 复验记录（2026-09-13）
 
 - 主节点 Codex 只读审计复核确认修复方向：AUD-03 的回滚请求进入与 implement 相同的串行队列；AUD-04 的 `.cmd/.bat` 调用不再启用 `shell=true`，危险元字符在启动前 fail-closed；AUD-05 的回滚目标区分 `missing`、`unreadable` 和 SHA-256，恢复后再次检查状态与哈希。
 - 本机 Reasonix 只读复核本轮以 worker exit code 1 结束，没有产出可采纳报告；未把该失败当作通过证据，也未开放 Reasonix 写入配置。
-- `npm test`：53 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
+- `npm test`：R4 收口后 59 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
 - 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核，以及 staged rename 目标的 index 清理。
 - 新增步数回归覆盖：Reasonix `max_steps` 暂停识别为 `step_limit`、`timeout_seconds` 未到的诊断，以及 `tool_rounds` 到 raw `--max-steps` 的映射。
 - 新增 cursor 回归覆盖：prompt 原样回传约束、malformed/invalid 错误 `cursor_error` 分类、失效 token 不回显、禁止自动重放，以及 implement 日志元数据保留。
-- 审计后增强 `TOOL-RXB-R2-EXT-01` 将有限 runtime budget 扩展至 256 raw steps/128 工具轮次/1800 秒；`TOOL-RXB-E2-EXT-01` 已接入任务级 checkpoint/续跑，`TOOL-RXB-R3-EXT-01` 已接入显式只读并行与取消回收；写入/续跑/回滚仍保持独占，原生 ACP 会话恢复仍未接入。
-- 未伪造 ACL 权限失败、POSIX/WSL 或真实 provider/model 质量证据；这些仍属于环境或集成层后续验证。
+- 审计后增强 `TOOL-RXB-R2-EXT-01` 将有限 runtime budget 扩展至 256 raw steps/128 工具轮次/1800 秒；`TOOL-RXB-E2-EXT-01` 已接入任务级 checkpoint/续跑，`TOOL-RXB-R3-EXT-01` 已接入显式只读并行与取消回收，`TOOL-RXB-R4` 已统一输出超限结果；写入/续跑/回滚仍保持独占，原生 ACP 会话恢复仍未接入。
+- 未伪造 ACL 权限失败或真实 provider/model 质量证据；WSL 实跑证据已由并行主节点记录，但当前 Windows shell 无 Linux Node，无法本轮独立重跑。

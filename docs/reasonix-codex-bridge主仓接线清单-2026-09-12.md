@@ -15,7 +15,7 @@
 | Reasonix profile | `%APPDATA%\reasonix\skills\deepseek-worker\SKILL.md`（本机文件存在） |
 | bridge 本机配置 | `tools/reasonix-codex-bridge/bridge.config.json`（机器文件，已被 `.gitignore` 忽略） |
 | workspace 传递 | `REASONIX_ROOT` 指向目标 workspace；bridge 只允许该根及显式 `REASONIX_ADD_DIRS` |
-| G3 状态 | 本机 `wsl.exe --list --quiet` 返回空列表，Docker/QEMU/VirtualBox 不可用；未伪造 POSIX 证据，G3 保留等待 |
+| G3 状态 | **已完成（2026-09-13）**：记录 WSL Ubuntu 22.04 的 POSIX CLI 探测、无 CLI 启动拒绝、WSL interop 下 `--version`/doctor/verify 与跨平台测试夹具修复；当前 Windows shell 的 Linux Node 未安装，不能在本轮独立复跑 |
 
 ## 标准接线
 
@@ -87,4 +87,4 @@ REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 
 - `reasonix_resume` 仅接受失败响应中的 checkpoint id；恢复前会校验 workspace/config 指纹，并消费 checkpoint 后才启动新的显式续跑。
 - 本清单只登记接线和验收，不执行全局 Codex/profile 写入。
-- 生产 bridge 仍是 stateless、只读；G3 的 POSIX/WSL 运行证据必须在具备实际 Linux 环境后补齐。
+- 生产 bridge 仍是 stateless，写入默认关闭；G3 的 POSIX/WSL 运行证据已登记，R4 的输出截断竞态已在子项目 `fa06fd2` 修复并由 Windows 回归覆盖。
