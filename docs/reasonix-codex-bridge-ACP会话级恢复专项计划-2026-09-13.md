@@ -1,6 +1,6 @@
 # reasonix-codex-bridge ACP 会话级恢复专项计划（2026-09-13）
 
-> 状态：**ACP-01、ACP-02 已完成（2026-09-13），ACP-03～ACP-06 未开始**；本文把 ACP 会话级恢复的现状证据、约束、分层交付与验收门写清楚，后续仍逐票推进，不把客户端层或协调器误记为生产会话接入。
+> 状态：**ACP-01～ACP-03 已完成（2026-09-13），ACP-04～ACP-06 未开始**；本文把 ACP 会话级恢复的现状证据、约束、分层交付与验收门写清楚，后续仍逐票推进，不把客户端层、协调器或注册表误记为生产会话接入。
 >
 > 创建日期：2026-09-13
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目）从"stateless per call"扩展到"ACP 持久会话 + 会话级恢复"的规划。**不覆盖** Reasonix 本体的 ACP 实现（已可用，见 §2.1），也不覆盖已落地的**任务级**续跑（checkpoint，见 §2.3）。
@@ -74,7 +74,7 @@
 | --- | --- | --- | --- | --- |
 | `TOOL-RXB-ACP-01` | ACP 客户端层 | spawn `reasonix acp`；JSON-RPC over stdio 客户端（initialize → 能力探测 → `session/new`/`load`/`resume`）；`session/prompt` 的 `session/update` 事件流汇总为调用结果；`session/cancel` 接超时 | — | **已完成**：create→prompt→事件流→干净关闭 fixture 与真实握手；旧 CLI（`loadSession=false`）能力可探测，实际 per-call 回退由 ACP-05 接线；stdin 关闭无残留进程 |
 | `TOOL-RXB-ACP-02` | compact 策略真实化 | `src/acp-session.mjs` 为 `prepareSessionContinuation` 接入有界规则 summarizer（保留可注入 LLM 接口）；四分支接入会话循环；记录每次决策（字节、动作、耗时） | ACP-01 | **已完成**：离线回归覆盖 0.75 触发、append、compact、rotate、摘要失败与替换会话失败回退；摘要/替换失败均回退 `per_call` 且历史不变；替换成功后旧会话 close/delete，rotate 后协调器历史低于硬上限 |
-| `TOOL-RXB-ACP-03` | 会话生命周期管理 | 会话注册表（sessionId ↔ cwd/profile/model）；封装 `session/list`/`close`/`delete`；bridge 退出/崩溃后的孤儿进程回收；崩溃后 `session/resume` 路径；同会话并发串行化 | ACP-01 | 强杀 bridge 后无孤儿 CLI 进程；重启可按 sessionId resume，或明确报"会话不存在"；并发请求串行且不串话 |
+| `TOOL-RXB-ACP-03` | 会话生命周期管理 | `src/acp-registry.mjs` 提供 metadata 注册表（sessionId ↔ cwd/profile/model）；封装 `session/list`/`close`/`delete`；孤儿标记与显式 shutdown；崩溃后 capability-gated `session/resume`/`load`；同会话并发串行化 | ACP-01 | **开发门完成（opt-in）**：持久元数据不含 task/response；重启条目标记 orphaned 并可 resume/load；delete 在关闭进程前发送；并发 prompt 串行，删除后的排队请求被阻断；真实强杀 bridge 后的进程表验收留给 ACP-06；server 仍未生产接线 |
 | `TOOL-RXB-ACP-04` | 安全回归 | 持久会话下写白名单**仍按调用**检查（复用 `WRITE_POLICY`）；跨任务/跨调用方历史隔离；敏感内容不入历史或先脱敏；会话作用域与 `--workspace-only`、allowed roots 一致 | ACP-01 | 持久会话下越界写仍被拒并回滚；不同任务历史不混；"读取 .env"类任务不得把内容留在历史里 |
 | `TOOL-RXB-ACP-05` | 共存与切换 | `bridge.config.json` 增 `transport: "per-call" \| "acp"`（默认 per-call）；两条路径共享限额/审计/日志；ACP 初始化失败或超时自动降级 | ACP-02/03/04 | 默认行为与现状回归一致；切到 acp 后既有测试全绿或明确标注不适用项；降级路径有测试 |
 | `TOOL-RXB-ACP-06` | 验收与演练 | 崩溃 resume 演练、compact 正确性对照、零泄漏检查（进程/会话/句柄）、并发与取消演练；结果登记回本文档 | ACP-05 | 见 §7 汇总 |
@@ -100,7 +100,7 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 | --- | --- | --- |
 | ACP-01 | create→prompt→事件流→关闭全链路；旧 CLI 能力探测；无残留进程（per-call 降级由 ACP-05 接线） | fixture 回归 + 真实 `initialize/session/new/session/close` |
 | ACP-02 | 0.75/128MB 不越线；摘要失败回退且历史不变；rotate 有效 | `AcpSessionCoordinator` 决策记录 + 历史字节断言 + 五项回归 |
-| ACP-03 | 崩溃无孤儿进程；可 resume；并发串行 | 强杀演练 + 进程表 |
+| ACP-03 | 孤儿状态可识别；可 resume；并发串行；shutdown 有收口路径 | `AcpSessionRegistry` 7 项回归 + 持久注册表/恢复顺序断言；强杀进程表演练留 ACP-06 |
 | ACP-04 | 越界写被拒并回滚；跨任务历史不混；敏感内容不入历史 | 负向测试 + 历史抽样 |
 | ACP-05 | 默认路径回归一致；切换可用；降级有测试 | 回归输出 + 开关测试 |
 | ACP-06 | resume/compact/零泄漏/并发取消四类演练通过 | 演练记录（登记回本文档） |
@@ -126,3 +126,4 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 | 2026-09-13 | `TOOL-RXB-ACP-01` 完成：新增 `src/acp-client.mjs`，实现 newline JSON-RPC `initialize`、能力探测、`session/new`/`load`/`resume`、`session/prompt` 更新汇总、默认拒绝权限、超时 `session/cancel` 与进程清理；离线回归 2 项通过，真实 Reasonix 完成不发 prompt 的 `initialize → session/new → session/close`。server 仍默认 stateless，未启用 ACP |
 | 2026-09-13 | `TOOL-RXB-ACP-02` 完成：新增 `src/acp-session.mjs` 与 `session/delete` 客户端封装；有界确定性摘要接入四分支决策，compact/rotate 采用新会话成功后再关闭/删除旧会话的事务顺序，替换失败和摘要失败显式回退 stateless per-call；协调器回归 6 项通过，bridge 全量回归 67 项通过。server 仍默认 stateless，ACP-03/04/05 生产接线与安全回归未开始 |
 | 2026-09-13 | 真实 Reasonix 子智能体受控验证：只读任务跨 README、server、config、checkpoint、ACP client、测试文件完成架构与风险审计，桥接仓库工作树无改动；写角色任务在一次性临时 Git 仓库读取 4 个文件并仅新增 `docs/architecture.md`（49 行），返回 `qlh.reasonix.changes.v1` 与 `rollback_id`，同一 bridge 进程调用回滚后仓库恢复干净，`src/app.txt` 与 `tests/README.md` 哈希不变。该证据验证当前 per-call 读/写角色链路，不等同于 ACP 持久会话安全验收 |
+| 2026-09-13 | `TOOL-RXB-ACP-03` 开发门完成：新增 `src/acp-registry.mjs`，提供 metadata-only 持久注册表、孤儿识别、resume/load 能力回退、按会话串行 prompt、close/delete/shutdown 和进程生命周期钩子；测试夹具优先使用项目树内 `build/bridge-test/`，`tmpdir()` 仅作兜底。注册表回归 7 项通过，全量 bridge 回归 `74 passed / 0 failed`；真实强杀 bridge 后的进程表无孤儿演练与生产接线留 ACP-06/05，server 仍默认 stateless |
