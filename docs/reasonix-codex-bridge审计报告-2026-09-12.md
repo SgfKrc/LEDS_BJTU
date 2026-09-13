@@ -135,6 +135,7 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 | `TOOL-RXB-AUD-06` | rename/copy 目标回滚的 index 状态未覆盖 | **已完成（2026-09-13）** | 子项目 commit `8e7693c`；rename 目标按新增路径清理并撤销 staged index，回归通过 |
 | `TOOL-RXB-AUD-07` | Reasonix raw `max_steps` 与工具调用轮次口径不一致 | **已完成（2026-09-13）** | 子项目 commit `6d093c1`；`tool_rounds` 映射、`step_limit` 分类和 51 项回归通过 |
 | `TOOL-RXB-AUD-08` | Reasonix continuation cursor 失败未分类且可能回显失效 token | **已完成（2026-09-13）** | 子项目 commit `491c435`；prompt 原样回传约束、同步路径修正、`cursor_error` 分类/脱敏、禁止重放和 53 项回归通过 |
+| `TOOL-RXB-R2-EXT-01` | 审计后长任务预算仍偏窄 | **已完成（2026-09-13）** | 子项目 commit `26b4113`；有限上限扩展至 256 raw steps/128 工具轮次/1800 秒，54 项回归通过 |
 
 本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006、BR-007。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
 
@@ -146,4 +147,5 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 - 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核，以及 staged rename 目标的 index 清理。
 - 新增步数回归覆盖：Reasonix `max_steps` 暂停识别为 `step_limit`、`timeout_seconds` 未到的诊断，以及 `tool_rounds` 到 raw `--max-steps` 的映射。
 - 新增 cursor 回归覆盖：prompt 原样回传约束、malformed/invalid 错误 `cursor_error` 分类、失效 token 不回显、禁止自动重放，以及 implement 日志元数据保留。
+- 审计后增强 `TOOL-RXB-R2-EXT-01` 将有限 runtime budget 扩展至 256 raw steps/128 工具轮次/1800 秒；默认 mode 预算和串行、stateless 架构保持不变，checkpoint/续跑与并行 worker 仍未接入。
 - 未伪造 ACL 权限失败、POSIX/WSL 或真实 provider/model 质量证据；这些仍属于环境或集成层后续验证。
