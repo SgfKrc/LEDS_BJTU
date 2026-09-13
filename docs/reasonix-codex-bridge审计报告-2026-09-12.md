@@ -83,13 +83,13 @@
 
 现有测试覆盖较好的部分包括：配置解析与 doctor cache、Codex TOML 合并、profile 漂移、MCP 工具/状态、任务和输出限制、队列容量与脱敏日志、默认禁写、clean-tree、白名单、手工修改后的 rollback 拒绝，以及 ACP 原型的压缩/轮换。
 
-关键缺口：
+初审缺口与剩余验证：
 
-- 没有验证 write profile 在 `inspect`/`review`/`plan` 下必然不能写（BR-001）。
-- 没有 `requireCleanTree=false` + 调用前已有 dirty 白名单外文件的测试（BR-002）。
-- 没有 rollback 与 implement 并发、同一工作区锁竞争的测试（BR-003）。
-- 没有 Windows `.cmd` shell 参数元字符测试（BR-004）。
-- 没有 symlink、rename/copy、权限失败、不可读文件、二进制新增/删除等 rollback 边界测试。
+- 初审时没有验证 write profile 在 `inspect`/`review`/`plan` 下必然不能写（BR-001）；已由 AUD-01 回归关闭。
+- 初审时没有 `requireCleanTree=false` + 调用前已有 dirty 白名单外文件的测试（BR-002）；已由 AUD-02 回归关闭。
+- 初审时没有 rollback 与 implement 并发、同一工作区锁竞争的测试（BR-003）；已由 AUD-03 回归关闭。
+- 初审时没有 Windows `.cmd` shell 参数元字符测试（BR-004）；已由 AUD-04 回归关闭。
+- rename/copy 回滚目标的 staged index 缺口已由 AUD-06 关闭；symlink、权限失败、不可读文件和二进制新增/删除仍未在本机完整覆盖。
 - 测试使用伪 CLI/worker，未覆盖真实 Reasonix 版本、全局 profile 解析、provider 失败、模型超时和网络故障；本机真实子 agent 调用还受到配置迁移权限和工具 cursor 错误影响。
 - CI 文档声明 Node 20，当前本机测试运行时为较新的 Node 版本；至少应在 Node 20 和当前支持的 Windows/WSL 环境各跑一次。
 
@@ -99,7 +99,7 @@
 2. 修复 BR-002：默认强制 clean tree，或改为全工作区快照比较；为该行为补回归测试。**已完成（2026-09-12）**。
 3. 将 rollback 纳入同一串行队列，并补并发测试。**已完成（2026-09-13）**。
 4. 收紧 Windows CLI 启动方式并补 shell 参数测试。**已完成（2026-09-13）**。
-5. 增加失败注入、权限/链接/二进制和真实 CLI 的分层集成测试；解决本机 Reasonix 配置目录的权限迁移问题后，再重新运行桥接子 agent 审查。**部分完成**：本轮补齐并发、类型变化/缺失、Windows 参数和 restore 后哈希回归；ACL 权限失败、POSIX/WSL、真实 provider/model 质量证据仍待对应环境。
+5. 增加失败注入、权限/链接/二进制和真实 CLI 的分层集成测试；解决本机 Reasonix 配置目录的权限迁移问题后，再重新运行桥接子 agent 审查。**部分完成**：本轮补齐并发、类型变化/缺失、Windows 参数、restore 后哈希和 staged rename 回归；ACL 权限失败、symlink、二进制边界、POSIX/WSL、真实 provider/model 质量证据仍待对应环境。
 
 审计判定：BR-001～BR-005 的代码级风险已由复验关闭，默认只读 inspect/review 可继续使用；写 profile 和 `allowWrite=true` 仍保持受控，直至 G3 跨 POSIX 环境和真实集成证据补齐后再评估生产开放。
 
