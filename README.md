@@ -1021,7 +1021,7 @@ python serve.py
 - [亚 1B 小模型专项实验计划](docs/亚1B小模型专项实验计划.md) — Qwen2.5-0.5B / Qwen3-0.6B / MiniCPM4-0.5B 用途（链路轻载体/thinking 开关标杆/新架构探针）与 M-SM-B1~B5 实验票
 - [文档维护 Agent 工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) — 独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)（主项目 submodule 引入）、规则数据化、规则变更机械扫描与演进门控（P1-P5）
 - [reasonix-codex-bridge 完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) — 独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)（主项目 submodule 引入）：Reasonix 子智能体接入 Codex 的 P0-P2 完善方向与验收门；W1/W2/W3 已落地默认关闭的受控写入、变更证据、显式回滚和读写 profile 分工，审计修复 `AUD-01`～`AUD-08`、G3 跨平台实跑与 R4 输出截断确定性已完成
-- [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 侧仍为 design-only；6 张票（`TOOL-RXB-ACP-01`～`06`）覆盖客户端层、compact 真实化、生命周期、安全回归、共存切换与验收演练，含验收门与五条边界
+- [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01 客户端层但 server 仍默认 stateless；后续 5 张票覆盖 compact 真实化、生命周期、安全回归、共存切换与验收演练，含验收门与五条边界
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期

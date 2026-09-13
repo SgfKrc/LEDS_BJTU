@@ -150,5 +150,5 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 - 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核，以及 staged rename 目标的 index 清理。
 - 新增步数回归覆盖：Reasonix `max_steps` 暂停识别为 `step_limit`、`timeout_seconds` 未到的诊断，以及 `tool_rounds` 到 raw `--max-steps` 的映射。
 - 新增 cursor 回归覆盖：prompt 原样回传约束、malformed/invalid 错误 `cursor_error` 分类、失效 token 不回显、禁止自动重放，以及 implement 日志元数据保留。
-- 审计后增强 `TOOL-RXB-R2-EXT-01` 将有限 runtime budget 扩展至 256 raw steps/128 工具轮次/1800 秒；`TOOL-RXB-E2-EXT-01` 已接入任务级 checkpoint/续跑，`TOOL-RXB-R3-EXT-01` 已接入显式只读并行与取消回收，`TOOL-RXB-R4` 已统一输出超限结果；写入/续跑/回滚仍保持独占，原生 ACP 会话恢复仍未接入。
+- 审计后增强 `TOOL-RXB-R2-EXT-01` 将有限 runtime budget 扩展至 256 raw steps/128 工具轮次/1800 秒；`TOOL-RXB-E2-EXT-01` 已接入任务级 checkpoint/续跑，`TOOL-RXB-R3-EXT-01` 已接入显式只读并行与取消回收，`TOOL-RXB-R4` 已统一输出超限结果，ACP-01 已提供未接入 server 的客户端层；写入/续跑/回滚仍保持独占，原生 ACP 会话恢复与 transport 切换仍未接入。
 - 未伪造 ACL 权限失败或真实 provider/model 质量证据；WSL 实跑证据已由并行主节点记录，但当前 Windows shell 无 Linux Node，无法本轮独立重跑。
