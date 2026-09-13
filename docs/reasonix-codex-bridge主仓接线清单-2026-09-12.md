@@ -80,7 +80,8 @@ REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 - AUD-05：回滚变更集登记 `hash_status`，区分 `readable`、`missing`、`unreadable`；不可读/类型变化默认拒绝，恢复后复核 Git 状态和 SHA-256。
 - AUD-06：Git rename/copy 目标按新增路径处理，清理前撤销 staged index；staged rename 回归通过。
 - AUD-07：Reasonix raw `max_steps` 与工具调用轮次分离；`tool_rounds` 映射和 `step_limit` 失败分类已落地。
-- 本机复验为 `npm test` 51/51、`npm run check`、`npm run check:links` 全绿；`allowWrite` 默认仍为 `false`，没有启用 Reasonix 写入 profile。
+- AUD-08：continuation cursor 必须原样传回；malformed/invalid cursor 分类为 `cursor_error`，失效 token 不回显且不自动重放。
+- 本机复验为 `npm test` 53/53、`npm run check`、`npm run check:links` 全绿；`allowWrite` 默认仍为 `false`，没有启用 Reasonix 写入 profile。
 
 ## 变更边界
 
