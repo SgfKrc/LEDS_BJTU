@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 工具面现状与能力归属（2026-09-13）
 
-> 状态：**现状登记**；本文记录 Reasonix v1.38.7 的真实工具面、bridge 声明与现实的差异，以及"能力归属"原则（能丢给 Reasonix 的都交给 Reasonix）。修复动作见 [排期文档](reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) 的 `TOOL-RXB-TOOL-01` 与 `TOOL-RXB-NET-01/02`。
+> 状态：**现状登记，`TOOL-RXB-TOOL-01` 已完成**；本文记录 Reasonix v1.38.7 的真实工具面、bridge 声明与现实的差异，以及"能力归属"原则（能丢给 Reasonix 的都交给 Reasonix）。网络后续动作见 [排期文档](reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) 的 `TOOL-RXB-NET-01/02`。
 >
 > 创建日期：2026-09-13
 > 证据类型：Reasonix **内置文档**（`docs/TOOL_CONTRACT.md` 等，随 v1.38.7 打包）+ 本机 `reasonix doctor` / `doctor capabilities` 实测输出。
@@ -10,7 +10,7 @@
 ## 1. 结论摘要
 
 1. Reasonix 的工具面分**两层**：provider 可见的 **core**（每次任务固定出现）与留在 host registry、经 `use_capability` 调度的**可选工具**。
-2. bridge 契约中的 **`git_log` 与 `git_diff` 不是 Reasonix 已知的工具身份**——本机 `doctor` 连续报出 4 条警告（read/write 两个 profile × 2），即这两个工具**从未真正生效**。
+2. bridge 契约曾错误声明 **`git_log` 与 `git_diff`**；本机 `doctor` 曾连续报出 4 条警告（read/write 两个 profile × 2），即这两个工具**从未真正生效**。`TOOL-RXB-TOOL-01` 已移除它们并同步 profile，当前 doctor 告警为 0。
 3. `read_file, grep, glob, ls, code_index, edit_file, write_file` 均为**有效**身份（医生清单未对其报警）。
 4. **`web_fetch` 是 Reasonix 自带的可选工具**；搜索（`web_search`）按官方文档是 **provider 侧能力**（搜索会另发一次模型请求，查询交给 provider）。因此网络能力**不落在 bridge**——bridge 只做门控与透传。
 5. bridge 的 `configure verify` 目前按**自己的期望集**比对，因而对上述差异报"一致"；它尚未对照 Reasonix 的真实清单。
@@ -51,10 +51,10 @@ wait, write_file, compress (when registered), use_capability
 
 | 工具 | bridge profile / 契约声明 | Reasonix 现实 | 结论 |
 | --- | --- | --- | --- |
-| `read_file` `grep` `glob` `ls` `code_index` | read profile 5 件套 | 有效身份（doctor 无警告） | ✅ 一致 |
+| `read_file` `grep` `glob` `ls` `code_index` | read profile 5 件套 | 有效身份（同步后 doctor 无警告） | ✅ 一致 |
 | `edit_file` `write_file` | write profile 追加 | core 工具 | ✅ 一致 |
-| **`git_log`** | read + write profile、README "canonical read-only tool set"、`READ_ONLY_PROFILE_TOOLS` | **"not a known tool identity"** | ❌ **无效** |
-| **`git_diff`** | 同上 | **"not a known tool identity"** | ❌ **无效** |
+| **`git_log`** | 历史 profile/README 曾声明 | **"not a known tool identity"**；已从 profile 与常量移除 | ⚠️ **历史错误，已修复** |
+| **`git_diff`** | 历史 profile/README 曾声明 | **"not a known tool identity"**；已从 profile 与常量移除 | ⚠️ **历史错误，已修复** |
 
 本机 `doctor` 原始警告（4 条，原文）：
 
@@ -69,8 +69,8 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 
 ### 3.1 影响
 
-1. **能力缺口**：worker 没有任何 git 只读能力；"让子智能体看 git log/diff"的预期从未成立。
-2. **校验失真**：`configure verify` 的"工具集一致"只对照 bridge 自己的常量，**不能证明 Reasonix 认这些工具**。
+1. **能力缺口**：worker 没有任何 git 只读能力；"让子智能体看 git log/diff"的预期从未成立。当前由主 agent 通过 host/MCP 或受控 exec 审查。
+2. **校验失真（已修复）**：旧版 `configure verify` 只对照 bridge 自己的常量；当前会消费 `reasonix doctor` 的 profile 工具告警并 fail-closed。
 3. **文档失真**：bridge README 的"canonical read-only profile tool set"与"verify 会在工具集漂移时失败"两处描述，需要按真实现实修订。
 
 ---
@@ -95,7 +95,7 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 
 | 票号 | 内容 | 验收门 |
 | --- | --- | --- |
-| `TOOL-RXB-TOOL-01`（新增，P1） | 工具身份对齐：把 `READ_ONLY_PROFILE_TOOLS` 收敛为**真实有效**集合（去掉 `git_log`/`git_diff`）；README 与 profile 同步；`configure verify` 增加"对照 Reasonix 真实清单"的可选校验（或至少在 verify 输出中标注"未对照 CLI 清单"） | 修正后 `doctor` 对两个 profile **零警告**；verify 覆盖新增校验；`npm test` 全绿 |
+| `TOOL-RXB-TOOL-01`（P1） | 工具身份对齐：把 `READ_ONLY_PROFILE_TOOLS` 收敛为**真实有效**集合（去掉 `git_log`/`git_diff`）；README 与 profile 同步；`configure verify` 对照 Reasonix 真实清单 | **已完成**：两个 profile doctor 零警告，verify 覆盖新增校验，`npm test` 99/99 |
 | `TOOL-RXB-NET-01`（修订） | worker 侧直接使用 Reasonix 自带 `web_fetch`；bridge 只做透传与结果摘要（引用/unsafe URL 策略由 Reasonix 决定），**不自建网络栈** | 失败态稳定透传；不引入新网络代码路径 |
 | `TOOL-RXB-NET-02`（修订） | `web_search` 归属 provider：未接通时稳定返回 unavailable；接通后只透传 provider 结果（summary/sources/truncated） | 无搜索后端时不得伪造；接通后 citation 完整 |
 
@@ -119,3 +119,4 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 | 日期 | 变更 |
 | --- | --- |
 | 2026-09-13 | 首版：登记 Reasonix v1.38.7 真实工具面（core 10 + 可选）、`git_log`/`git_diff` 无效身份的实测证据、bridge 校验失真的原因、能力归属原则，并提出 `TOOL-RXB-TOOL-01` 与 NET-01/NET-02 的修订方向 |
+| 2026-09-13 | `TOOL-RXB-TOOL-01` 收口：常量、README、prompt 与两个全局 profile 已同步为 5/7 个有效身份；`doctor capabilities` 告警从 4 降为 0，`configure verify` 增加 fail-closed 诊断。 |

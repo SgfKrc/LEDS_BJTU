@@ -64,7 +64,7 @@ REASONIX_SUBAGENT = "deepseek-worker"  # 默认只读；受控 implement 才显�
 REASONIX_MODEL_REF = "<configure list 选定的 provider/model>"
 ```
 
-`REASONIX_EXE` 也可以省略，让 bridge 按 README 的标准路径顺序探测。`REASONIX_MODEL_REF` 不应复制另一台机器的值；目标机必须重新运行 `configure list`。默认 read profile 的工具集合由 `configure profile --role read --sync --write` 固定为 `read_file, grep, glob, ls, code_index, git_log, git_diff`；write profile 只额外增加 `edit_file, write_file` 且不带 `read-only`。`verify --role read/write` 会列出对应实际集合并拒绝漂移。主 agent 负责指挥、diff/测试审查和越界检查，子 agent 只在 W1/W2 策略已显式开启时执行写入。
+`REASONIX_EXE` 也可以省略，让 bridge 按 README 的标准路径顺序探测。`REASONIX_MODEL_REF` 不应复制另一台机器的值；目标机必须重新运行 `configure list`。当前默认 read profile 的工具集合由 `configure profile --role read --sync --write` 固定为 Reasonix v1.38.7 实际识别的 `read_file, grep, glob, ls, code_index`；write profile 只额外增加 `edit_file, write_file` 且不带 `read-only`。`verify --role read/write` 会同时检查 profile 漂移与 doctor 未知工具身份并 fail-closed。主 agent 负责指挥、diff/测试审查和越界检查，子 agent 只在 W1/W2 策略已显式开启时执行写入。
 
 ## 接线后验收
 

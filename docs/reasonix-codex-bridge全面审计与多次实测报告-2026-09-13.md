@@ -31,7 +31,7 @@
 | 并行 | 受限通过 | `parallel=true` 仅 inspect/review/plan，只读槽位并发；implement/resume/rollback 独占 |
 | compact / rotate | 通过（适配器层） | 固定 128 MiB 上限、75% 触发，事务式替换；不是 Reasonix 原生历史替换声明 |
 | 观测 | 通过 | `reasonix_status`、可选 JSONL 脱敏日志、job 状态；无流式 partial output |
-| 工具生态 | 有意受限 | read profile 声明 7 项但 Reasonix 实际仅识别 5 项（`git_log`/`git_diff` 产生 doctor 告警，见工具面现状文档）；write profile 仅增加 `edit_file`/`write_file`；worker 无 shell/网络，bridge 另有默认关闭的命名 `reasonix_exec` host 通道 |
+| 工具生态 | 有意受限 | read profile 当前为 Reasonix 真实识别的 5 项，write profile 追加 `edit_file`/`write_file`；历史无效的 `git_log`/`git_diff` 已移除并由 doctor/verify 校验；worker 无 shell/网络，bridge 另有默认关闭的命名 `reasonix_exec` host 通道 |
 | 自主迭代 | 部分通过 | 单次 worker 可在预算内多轮；跨调用续跑需主 agent 显式编排，无自动 plan→implement→test loop |
 
 ## 实测记录
@@ -84,7 +84,7 @@ npm run acceptance:acp
 node --test test/bridge.test.mjs
 ```
 
-结果：语法/链接检查通过；ACP-06 离线报告 `status=passed`，覆盖真实子进程强杀、orphan/resume、metadata-only、compact/rotate、并发串行、取消、child cleanup 和工件删除；全量测试 `97 passed / 0 failed`，另含 `reasonix_exec` 的拒绝、超时、截断、取消和变更检测回归。
+结果：语法/链接检查通过；ACP-06 离线报告 `status=passed`，覆盖真实子进程强杀、orphan/resume、metadata-only、compact/rotate、并发串行、取消、child cleanup 和工件删除；全量测试 `99 passed / 0 failed`，另含 `reasonix_exec` 的拒绝、超时、截断、取消和变更检测回归，以及 profile 工具身份诊断。
 
 ```text
 npm run acceptance:acp:real
@@ -94,9 +94,9 @@ npm run acceptance:acp:real
 
 ## 审计发现与优先级
 
-### P1：profile 声明了 Reasonix 不认识的 git 工具身份
+### P1：profile 声明了 Reasonix 不认识的 git 工具身份（已解决）
 
-本机 `reasonix doctor --json` 对 `deepseek-worker` 与 `deepseek-worker-write` 各报告 `git_log`、`git_diff` 为 `not a known tool identity`，共 4 条告警。当前 bridge 常量和文档仍把它们列入只读工具集，因此“工具集一致”只代表 bridge 自己的期望，不代表 Reasonix 运行时真的提供。修复票为 `TOOL-RXB-TOOL-01`：收敛到真实有效身份，git 查看改走 `gitcontext` MCP 或受控 `reasonix_exec`。
+本机 `reasonix doctor --json` 曾对 `deepseek-worker` 与 `deepseek-worker-write` 各报告 `git_log`、`git_diff` 为 `not a known tool identity`，共 4 条告警。`TOOL-RXB-TOOL-01` 已将常量、文档、prompt 与两个全局 profile 收敛到真实有效身份；当前 `doctor capabilities` 为 `errors=0,warnings=0`，`configure verify --role read/write` 均通过。git 查看改走 `gitcontext` MCP 或受控 `reasonix_exec`。
 
 ### P1：真实 ACP 跨进程恢复未闭环
 
@@ -124,7 +124,7 @@ checkpoint 不保存 stdout/stderr，但会保存原始任务文本、模式、�
 
 ## 建议下一步
 
-1. `TOOL-RXB-EXEC-01` 已完成：受控 `reasonix_exec` 只允许命名可执行文件和 argv 数组，禁止 shell，固定 cwd 根，继承 timeout/output caps，记录脱敏审计，并默认关闭；离线 97/97 与真实 CLI 验收均通过。
+1. `TOOL-RXB-EXEC-01` 已完成：受控 `reasonix_exec` 只允许命名可执行文件和 argv 数组，禁止 shell，固定 cwd 根，继承 timeout/output caps，记录脱敏审计，并默认关闭；离线回归与真实 CLI 验收均通过。
 2. 为网络能力排期 `web_fetch` 主仓 Tool Gateway 适配；`web_search` 在本机没有后端，接通前保持 unavailable/fail-closed。
 3. 为 ACP 增加 provider-backed 非空会话 fixture，先验证“产生 prompt 后强杀→resume/load→close/delete”，再评估 registry 的生产接线；在此之前不改默认 transport。
 4. 在主 agent 层提供显式阶段编排模板（plan→implement→exec/test→review），保持每阶段可审查、可回滚，不在 bridge 内隐式重试。
