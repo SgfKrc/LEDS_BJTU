@@ -6,7 +6,7 @@
 
 ## 结论
 
-初审时默认配置没有 `allowWrite: true`，默认 profile 也是 read profile，因此本机默认暴露面较低；当时发现 2 项可复现的 P1 缺陷，均涉及越权写入或越权修改保留。2026-09-13 复验确认 BR-001～BR-005 的代码级修复和回归测试已完成，写入策略仍保持关闭，未将受控写 profile 作为默认生产通道开放。
+初审时默认配置没有 `allowWrite: true`，默认 profile 也是 read profile，因此本机默认暴露面较低；当时发现 2 项可复现的 P1 缺陷，均涉及越权写入或越权修改保留。2026-09-13 复验确认 BR-001～BR-005 的代码级修复和回归测试已完成，写入策略仍保持关闭，未将受控写 profile 作为默认生产通道开放。随后针对“5 轮工具调用后退出码 1”补查，确认是 Reasonix raw `max_steps` 预算耗尽，不是 bridge 120 秒超时；该边界已由 AUD-07 固化。
 
 未发现 P0；未发现 MCP 输入可直接绕过 workspace 根目录校验的证据。
 
@@ -60,11 +60,21 @@
 
 建议：区分 `missing`、`unreadable` 和实际 SHA-256；任何 unreadable 状态默认拒绝 rollback。
 
+### BR-006 P2：Reasonix raw `max_steps` 与工具调用轮次口径不一致
+
+位置：`src/server.mjs` 的 `reasonix_run` 步数参数与 worker 非零退出处理。
+
+桥接层原先直接把调用方的 `max_steps` 传给 Reasonix，但 Reasonix CLI 将其作为内部 agent step 预算，而不是工具调用轮次。对本机 Reasonix `v1.38.7` 的直接复现显示：`--max-steps 10` 在 5 轮工具调用后以退出码 1 暂停；同类 8 次工具调用任务在 `--max-steps 20` 下成功。两次均在 120 秒前结束，因此不是 bridge timeout。
+
+影响：调用方按“工具轮次”估算任务大小时会过早触发退出码 1，日志也只能看到笼统的 `worker_exit`，难以区分步数耗尽与真正的进程失败或超时。
+
+修复：子项目 commit `21df99d` 新增 `tool_rounds` 参数，按当前 CLI 每轮折算 2 个 raw steps；`reasonix_status.limits` 暴露 `toolRoundsCap`；匹配 Reasonix `paused after ... tool-call rounds (max_steps)` 的 stderr 时记录 `step_limit`、轮次数和“120 秒未到”的诊断。原始 `max_steps` 仍保留以兼容直接 CLI 口径。
+
 ## 子 agent 桥接审查证据
 
 主 agent 启动了桥接服务器并调用 `reasonix_run(mode=review)`，服务器日志确认使用了当前 bridge、`role=read`、本机 Reasonix CLI 和配置模型。两次只读审查均未产出可采纳的报告：
 
-1. 全量请求在 8 轮工具调用后返回 `paused`/exit code 1；stderr 同时报告 Reasonix 配置迁移临时文件 `Access is denied`。
+1. 全量请求曾在工具调用轮次耗尽后返回 `paused`/exit code 1；stderr 同时报告 Reasonix 配置迁移临时文件 `Access is denied`。后续直接 CLI 复现将“5 轮暂停”与 120 秒计时拆开，确认前者是 raw `max_steps` 耗尽。
 2. 缩小到 `src/server.mjs` 与测试文件后，worker 又因 `read_file` continuation cursor malformed 退出。
 
 因此本报告没有把子 agent 的未完成输出当作结论；缺陷均由主 agent 源码证据和独立复现确认。调用过程未修改桥接仓库，审查后工作树保持 clean。
@@ -75,10 +85,10 @@
 
 | 检查 | 结果 |
 |---|---|
-| `npm test` | 初审 40 passed；复验 48 passed, 0 failed |
+| `npm test` | 初审 40 passed；复验 50 passed, 0 failed |
 | `npm run check` | 通过，所有模块语法检查通过 |
 | `npm run check:links` | README 本地链接通过 |
-| `node --test --experimental-test-coverage` | 行 90.80%，分支 53.73%，函数 90.34% |
+| `node --test --experimental-test-coverage` | 行 91.71%，分支 56.71%，函数 90.23% |
 | `git diff --check` | 通过 |
 
 现有测试覆盖较好的部分包括：配置解析与 doctor cache、Codex TOML 合并、profile 漂移、MCP 工具/状态、任务和输出限制、队列容量与脱敏日志、默认禁写、clean-tree、白名单、手工修改后的 rollback 拒绝，以及 ACP 原型的压缩/轮换。
@@ -91,6 +101,7 @@
 - 初审时没有 Windows `.cmd` shell 参数元字符测试（BR-004）；已由 AUD-04 回归关闭。
 - rename/copy 回滚目标的 staged index 缺口已由 AUD-06 关闭；symlink、权限失败、不可读文件和二进制新增/删除仍未在本机完整覆盖。
 - 测试使用伪 CLI/worker，未覆盖真实 Reasonix 版本、全局 profile 解析、provider 失败、模型超时和网络故障；本机真实子 agent 调用还受到配置迁移权限和工具 cursor 错误影响。
+- 已直接覆盖真实 Reasonix `v1.38.7` 的步数口径：`max_steps=10` 稳定表现为 5 轮后暂停，`max_steps=20` 可完成 8 次工具调用任务；这证明了步数耗尽与 120 秒超时是不同故障形态。真实 worker 的 `read_file` continuation cursor malformed 仍是独立的工具集成问题。
 - CI 文档声明 Node 20，当前本机测试运行时为较新的 Node 版本；至少应在 Node 20 和当前支持的 Windows/WSL 环境各跑一次。
 
 ## 整改顺序
@@ -113,13 +124,15 @@
 | `TOOL-RXB-AUD-04` | BR-004 Windows `.cmd` shell 参数 | **已完成（2026-09-13）** | `shell:false` + 显式 `cmd.exe`；元字符拒绝与 `.cmd` 启动回归通过 |
 | `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | **已完成（2026-09-13）** | `readable/missing/unreadable` 三态；类型变化、缺失和 restore 后 SHA-256 回归通过 |
 | `TOOL-RXB-AUD-06` | rename/copy 目标回滚的 index 状态未覆盖 | **已完成（2026-09-13）** | 子项目 commit `8e7693c`；rename 目标按新增路径清理并撤销 staged index，回归通过 |
+| `TOOL-RXB-AUD-07` | Reasonix raw `max_steps` 与工具调用轮次口径不一致 | **已完成（2026-09-13）** | 子项目 commit `21df99d`；`tool_rounds` 映射、`step_limit` 分类和 50 项回归通过 |
 
-本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
+本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
 
 ## 复验记录（2026-09-13）
 
 - 主节点 Codex 只读审计复核确认修复方向：AUD-03 的回滚请求进入与 implement 相同的串行队列；AUD-04 的 `.cmd/.bat` 调用不再启用 `shell=true`，危险元字符在启动前 fail-closed；AUD-05 的回滚目标区分 `missing`、`unreadable` 和 SHA-256，恢复后再次检查状态与哈希。
 - 本机 Reasonix 只读复核本轮以 worker exit code 1 结束，没有产出可采纳报告；未把该失败当作通过证据，也未开放 Reasonix 写入配置。
-- `npm test`：48 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
+- `npm test`：50 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
 - 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核，以及 staged rename 目标的 index 清理。
+- 新增步数回归覆盖：Reasonix `max_steps` 暂停识别为 `step_limit`、`timeout_seconds` 未到的诊断，以及 `tool_rounds` 到 raw `--max-steps` 的映射。
 - 未伪造 ACL 权限失败、POSIX/WSL 或真实 provider/model 质量证据；这些仍属于环境或集成层后续验证。
