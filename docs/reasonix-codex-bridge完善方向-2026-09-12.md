@@ -188,4 +188,4 @@
 | 2026-09-13 | `TOOL-RXB-AUD-05` 完成：rollback 哈希改为 `readable/missing/unreadable` 三态；不可读和类型变化默认拒绝，缺失与哈希冲突分别返回语义化错误，restore 后复核 Git 状态与 SHA-256 |
 | 2026-09-13 | `TOOL-RXB-AUD-06` 完成：Git rename/copy 目标按新增路径处理；回滚清理前撤销 staged index，避免 rename 目标残留导致 post-check 误报；新增 staged rename 回归，子项目 commit `8e7693c`，`npm test` 48 项通过 |
 | 2026-09-13 | `TOOL-RXB-AUD-07` 完成：确认 Reasonix `--max-steps` 是 raw 内部步数而非工具轮次；`max_steps=10` 复现 5 轮后暂停且未到 120 秒，新增 `tool_rounds` 映射、`step_limit` 失败语义与回归，子项目 commit `6d093c1`，`npm test` 51 项通过 |
-| 2026-09-13 | `TOOL-RXB-AUD-08` 完成：read/write prompt 固化 continuation cursor 原样回传约束；bridge 将 malformed/invalid cursor 分类为 `cursor_error`、隐藏失效 token 且禁止自动重放，子项目 commit `6e9ee77`，`npm test` 53 项通过 |
+| 2026-09-13 | `TOOL-RXB-AUD-08` 完成：read/write prompt 固化 continuation cursor 原样回传约束；bridge 将 malformed/invalid cursor 分类为 `cursor_error`、隐藏失效 token 且禁止自动重放，并修正 prompt 同步命令路径，子项目 commit `491c435`，`npm test` 53 项通过 |

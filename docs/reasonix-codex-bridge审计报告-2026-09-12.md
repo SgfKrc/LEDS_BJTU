@@ -76,7 +76,7 @@
 
 Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只会作为普通 worker stderr 透传，bridge 没有独立失败语义；read-only 与 write prompt 也没有明确要求 cursor 原样回传。若失效 cursor 被再次改写或错误重放，读取会反复失败；若错误文本包含长 token，原样回传还会把该 token 暴露给上层模型。
 
-修复：子项目 commit `6e9ee77` 在两个 worker prompt 中固化 cursor 不透明值契约，要求逐字原样传回，失效时从明确路径/范围重新读取。bridge 将匹配错误归类为 `cursor_error`，响应中隐藏原始 cursor 诊断，明确不自动重放任务；脱敏日志保留 `cursorError=true`，implement 路径同步保留该分类。该修复不尝试修改 Reasonix 上游工具策略。
+修复：子项目 commit `491c435`（含前序 cursor 处理）在两个 worker prompt 中固化 cursor 不透明值契约，要求逐字原样传回，失效时从明确路径/范围重新读取，并修正 prompt 同步命令路径。bridge 将匹配错误归类为 `cursor_error`，响应中隐藏原始 cursor 诊断，明确不自动重放任务；脱敏日志保留 `cursorError=true`，implement 路径同步保留该分类。该修复不尝试修改 Reasonix 上游工具策略。
 
 ## 子 agent 桥接审查证据
 
@@ -134,7 +134,7 @@ Reasonix 的 `read_file` continuation cursor malformed/invalid 错误此前只�
 | `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | **已完成（2026-09-13）** | `readable/missing/unreadable` 三态；类型变化、缺失和 restore 后 SHA-256 回归通过 |
 | `TOOL-RXB-AUD-06` | rename/copy 目标回滚的 index 状态未覆盖 | **已完成（2026-09-13）** | 子项目 commit `8e7693c`；rename 目标按新增路径清理并撤销 staged index，回归通过 |
 | `TOOL-RXB-AUD-07` | Reasonix raw `max_steps` 与工具调用轮次口径不一致 | **已完成（2026-09-13）** | 子项目 commit `6d093c1`；`tool_rounds` 映射、`step_limit` 分类和 51 项回归通过 |
-| `TOOL-RXB-AUD-08` | Reasonix continuation cursor 失败未分类且可能回显失效 token | **已完成（2026-09-13）** | 子项目 commit `6e9ee77`；prompt 原样回传约束、`cursor_error` 分类/脱敏、禁止重放和 53 项回归通过 |
+| `TOOL-RXB-AUD-08` | Reasonix continuation cursor 失败未分类且可能回显失效 token | **已完成（2026-09-13）** | 子项目 commit `491c435`；prompt 原样回传约束、同步路径修正、`cursor_error` 分类/脱敏、禁止重放和 53 项回归通过 |
 
 本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005、BR-006、BR-007。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
 
