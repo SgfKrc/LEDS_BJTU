@@ -260,6 +260,21 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **自研**（Codex ↔ Reasonix 协作桥） | stdio MCP 桥接，供 Codex 调用只读 Reasonix 子智能体；CLI 路径与模型 ref 按本机解析，`configure verify` 自检 |
 | `android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **第三方**（唯一非自研） | Android Full 变体原生构建；固定 revision，PC 侧与 Python sidecar 都不需要 |
 
+#### 自研子项目一：`qlh-docagent`（文档维护 Agent）
+
+- **定位**：把主仓原本内嵌的文档维护工具（原 `docs/agent_tool` 套件）独立为通用包，规则不再写死在代码里，而是**数据化**为 `RULES.md` + `rules.yaml`。
+- **能力**：规则驱动的机械扫描器；规则变更增量矩阵（`new/gone/changed`，配 `--max-new/--max-gone` 门）；演进门控（`proposed → preflight → gates → released`）与等价回归。
+- **与主仓的关系**：主仓只保留 gitlink（`tools/docagent`）与专项文档；源码与规则在独立仓库演进，主仓不复制其源码。
+- **入口**：[文档维护Agent工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) · [文档维护 Agent 工具设计](docs/文档维护Agent工具设计.md)
+
+#### 自研子项目二：`reasonix-codex-bridge`（Codex ↔ Reasonix 桥）
+
+- **定位**：把 Reasonix（本地多模型编码 agent）接成 Codex 可调用的 stdio MCP 服务，让 Codex 调度一个**独立模型、独立配额**的子智能体。
+- **能力**：5 个 MCP 工具（`reasonix_run` / `status` / `resume` / `rollback` / `cancel`）；CLI 路径与模型 ref 按本机解析、零硬编码（`configure list/use/codex/verify`）；受控写入（`allowWrite` + `allowedPaths` 白名单 + 干净工作区 + git 快照回滚）；任务级 checkpoint 续跑；脱敏 JSONL 调用日志。
+- **与主仓的关系**：主仓只保留 gitlink（`tools/reasonix-codex-bridge`）与规划/审计文档；子智能体 profile（`deepseek-worker` / `deepseek-worker-write`）由子项目的 `configure profile` 在 Reasonix 全局目录创建。
+- **入口**：[完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [审计报告](docs/reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
+
+
 拉取与更新：
 
 ```bash
@@ -1021,7 +1036,7 @@ python serve.py
 - [亚 1B 小模型专项实验计划](docs/亚1B小模型专项实验计划.md) — Qwen2.5-0.5B / Qwen3-0.6B / MiniCPM4-0.5B 用途（链路轻载体/thinking 开关标杆/新架构探针）与 M-SM-B1~B5 实验票
 - [文档维护 Agent 工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) — 独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)（主项目 submodule 引入）、规则数据化、规则变更机械扫描与演进门控（P1-P5）
 - [reasonix-codex-bridge 完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) — 独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)（主项目 submodule 引入）：Reasonix 子智能体接入 Codex 的 P0-P2 完善方向与验收门；W1/W2/W3 已落地默认关闭的受控写入、变更证据、显式回滚和读写 profile 分工，审计修复 `AUD-01`～`AUD-08`、G3 跨平台实跑与 R4 输出截断确定性已完成
-- [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01 客户端层、ACP-02 compact 协调器与 ACP-03 会话注册表，但 server 仍默认 stateless；后续 3 张票覆盖安全回归、共存切换与验收演练，含验收门与五条边界
+- [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01 客户端层、ACP-02 compact 协调器、ACP-03 会话注册表与 ACP-04 安全门，但 server 仍默认 stateless；后续 2 张票覆盖共存切换与验收演练，含验收门与五条边界
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期

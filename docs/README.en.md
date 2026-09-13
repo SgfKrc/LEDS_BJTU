@@ -253,6 +253,21 @@ The repository pins **three** Git submodules; **only `llama.cpp` is third-party 
 | `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **In-house** | stdio MCP bridge that lets Codex drive the read-only Reasonix subagent; CLI path and model ref resolve per machine, `configure verify` self-checks |
 | `android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **Third-party** (only non-in-house) | Native builds for the Android Full variant; pinned revision, not needed on PC or in Python sidecars |
 
+#### In-house sub-project 1: `qlh-docagent` (document-maintenance Agent)
+
+- **What it is**: the repo's document-maintenance toolkit (formerly the `docs/agent_tool` suite) extracted into a general-purpose package where rules are **data** (`RULES.md` + `rules.yaml`), not code.
+- **Capabilities**: rule-driven mechanical scanner; rule-change delta matrix (`new/gone/changed` with `--max-new/--max-gone` gates); evolution gates (`proposed → preflight → gates → released`) with equivalence regression.
+- **Relationship to this repo**: only a gitlink (`tools/docagent`) plus plan docs live here; source and rules evolve in the standalone repository — no source copies in the main repo.
+- **Entry points**: [sub-project plan](文档维护Agent工具子项目化与通用化专项计划.md) · [tool design](文档维护Agent工具设计.md)
+
+#### In-house sub-project 2: `reasonix-codex-bridge` (Codex ↔ Reasonix bridge)
+
+- **What it is**: a stdio MCP service that turns Reasonix (a local multi-model coding agent) into something Codex can call, giving Codex a subagent with its **own model and its own quota**.
+- **Capabilities**: five MCP tools (`reasonix_run` / `status` / `resume` / `rollback` / `cancel`); CLI path and model ref resolve per machine with zero hard-coding (`configure list/use/codex/verify`); controlled writes (`allowWrite` + `allowedPaths` allowlist + clean-tree requirement + git-snapshot rollback); task-level checkpoint resume; redacted JSONL run log.
+- **Relationship to this repo**: only a gitlink (`tools/reasonix-codex-bridge`) plus roadmap/audit docs live here; subagent profiles (`deepseek-worker` / `deepseek-worker-write`) are created by the sub-project's `configure profile` in the global Reasonix directory.
+- **Entry points**: [roadmap](reasonix-codex-bridge完善方向-2026-09-12.md) · [audit report](reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP session-recovery plan](reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
+
+
 ```bash
 git submodule update --init --recursive
 git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
