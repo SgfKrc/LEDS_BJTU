@@ -272,7 +272,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 - **定位**：把 Reasonix（本地多模型编码 agent）接成 Codex 可调用的 stdio MCP 服务，让 Codex 调度一个**独立模型、独立配额**的子智能体。
 - **能力**：6 个 MCP 工具（`reasonix_run` / `status` / `resume` / `rollback` / `cancel` / `exec`）；CLI 路径与模型 ref 按本机解析、零硬编码（`configure list/use/codex/verify`）；受控写入（`allowWrite` + `allowedPaths` 白名单 + 干净工作区 + git 快照回滚）；命名 argv-only 测试/构建执行（默认关闭、`shell:false`、clean-tree、超时/输出上限、变更检测与脱敏）；任务级 checkpoint 续跑；脱敏 JSONL 调用日志。
 - **与主仓的关系**：主仓只保留 gitlink（`tools/reasonix-codex-bridge`）与规划/审计文档；子智能体 profile（`deepseek-worker` / `deepseek-worker-write`）由子项目的 `configure profile` 在 Reasonix 全局目录创建。
-- **入口**：[完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) · [审计报告](docs/reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
+- **入口**：[完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) · [工具面现状](docs/reasonix-codex-bridge工具面现状-2026-09-13.md) · [审计报告](docs/reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
 
 
 拉取与更新：
@@ -1038,6 +1038,7 @@ python serve.py
 - [reasonix-codex-bridge 完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) — 独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)（主项目 submodule 引入）：Reasonix 子智能体接入 Codex 的 P0-P2 完善方向与验收门；W1/W2/W3 已落地默认关闭的受控写入、变更证据、显式回滚和读写 profile 分工，审计修复 `AUD-01`～`AUD-08`、G3 跨平台实跑与 R4 输出截断确定性已完成
 - [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01～ACP-05，ACP-06 离线验收通过（强杀、orphan/resume、compact/rotate、并发取消与零泄漏）；默认仍 per-call，真实 provider 空会话跨进程 resume 返回 `unknown session`，恢复门待 provider 持久化语义补证
 - [reasonix-codex-bridge Harness 工具扩展与能力补齐排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) — 本机 Reasonix capability 调研与 EXEC/NET/LOOP/EVT/ACP/MESSAGE 票排期；`TOOL-RXB-EXEC-01` 已完成命名 argv-only 执行、clean-tree/超时/输出/变更检测与真实 CLI 验收
+- [reasonix-codex-bridge 工具面现状与能力归属](docs/reasonix-codex-bridge工具面现状-2026-09-13.md) — `reasonix doctor` 实测 profile 中 `git_log`/`git_diff` 为未知工具身份，明确 `web_fetch` 归 Reasonix、`web_search` 归 provider，并登记 `TOOL-RXB-TOOL-01`
 - [reasonix-codex-bridge 全面审计与多次实测报告](docs/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md) — 真实覆盖 MCP 控制面、inspect、plan、受控写入/回滚、checkpoint/resume、ACP-06 与命名命令执行；结论为可作为受限文件型低价替代，网络适配、跨进程 ACP 恢复与自主多阶段编排仍待后续票
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
