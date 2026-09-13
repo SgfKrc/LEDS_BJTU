@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05`/`TOOL-RXB-AUD-06`/`TOOL-RXB-AUD-07`/`TOOL-RXB-AUD-08`/`TOOL-RXB-R2-EXT-01`/`TOOL-RXB-E2-EXT-01` 已完成；`TOOL-RXB-R3-EXT-01` 规划中；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05`/`TOOL-RXB-AUD-06`/`TOOL-RXB-AUD-07`/`TOOL-RXB-AUD-08`/`TOOL-RXB-R2-EXT-01`/`TOOL-RXB-E2-EXT-01`/`TOOL-RXB-R3-EXT-01` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -15,7 +15,7 @@
 
 | 能力 | 验证方式（本机实跑） |
 | --- | --- |
-| stdio MCP facade（`reasonix_run` / `reasonix_resume` / `reasonix_status`） | stdin 喂 JSON-RPC，返回 `initialize`/`tools/list`/`tools/call` 均正常 |
+| stdio MCP facade（`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_status`） | stdin 喂 JSON-RPC，返回 `initialize`/`tools/list`/`tools/call` 均正常 |
 | 只读子智能体 profile `deepseek-worker` | `reasonix subagent list` 显示 `[global, manual, read-only]`，工具集 `read_file,grep,glob,ls,code_index` |
 | CLI 路径探测（不硬编码） | 未设 `REASONIX_EXE` 时解析到 `%LOCALAPPDATA%\Programs\Reasonix\reasonix-cli.exe`；`REASONIX_EXE` 指向缺失文件 → exit 2；清空 `LOCALAPPDATA`+`PATH` → exit 2 |
 | 模型解析链 env → `bridge.config.json` → doctor `default_model` | 三条路径分别实跑并核对 `reasonix_status.modelRefSource`；畸形 ref（无 `/`、含空格）→ exit 2 |
@@ -191,3 +191,4 @@
 | 2026-09-13 | `TOOL-RXB-AUD-08` 完成：read/write prompt 固化 continuation cursor 原样回传约束；bridge 将 malformed/invalid cursor 分类为 `cursor_error`、隐藏失效 token 且禁止自动重放，并修正 prompt 同步命令路径，子项目 commit `491c435`，`npm test` 53 项通过 |
 | 2026-09-13 | `TOOL-RXB-R2-EXT-01` 完成：预算边界放宽为最多 256 raw steps/128 工具轮次和 1800 秒；默认 mode 预算不变，仍需显式传 `tool_rounds`/`timeout_seconds`；配置、夹紧和长预算映射回归共 `npm test` 54 项通过，子项目 commit `26b4113` |
 | 2026-09-13 | `TOOL-RXB-E2-EXT-01` 完成：新增任务级持久 checkpoint 与显式 `reasonix_resume`；失败时保存任务、预算、版本/配置和 Git 状态指纹，不保存 stdout/stderr；恢复前拒绝 workspace/config drift，checkpoint 一次性消费并以原子 claim 锁防并发重复；跨进程 fixture 和派生 write profile 回归后 `npm test` 57 项通过，子项目 commit `a596921` |
+| 2026-09-13 | `TOOL-RXB-R3-EXT-01` 完成：新增显式 `parallel=true` 只读 worker 槽位、job 状态展开和 `reasonix_cancel`；implement/resume/rollback 保持 workspace 独占，取消终止进程树且不生成 checkpoint；并行重叠、取消回收和既有串行写入回归后 `npm test` 59 项通过，子项目 commit `782d6b0` |
