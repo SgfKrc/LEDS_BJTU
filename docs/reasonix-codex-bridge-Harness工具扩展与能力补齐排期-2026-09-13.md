@@ -68,7 +68,7 @@
 - 全量回归：`npm test`，99/99 通过；`npm run check`、`npm run check:links` 和 `git diff --check` 均通过。
 - 真实 CLI：使用本机 Reasonix `v1.38.7` 启动 bridge，在项目树内 `build/bridge-test/exec-real-fixture/` 的干净 fixture 中执行 `node-version` 命名 profile；MCP 暴露 6 个工具，返回 `qlh.reasonix.exec.v1`、`outcome=success`、`exitCode=0`、`changedPaths=[]`；不发送模型 prompt，不访问网络。fixture 已清理。
 - 工具身份：同步本机 `%APPDATA%/reasonix/skills/deepseek-worker*` 两个全局 profile 后，`reasonix doctor --json` 不再报告未知工具，`reasonix doctor capabilities --json` 为 `errors=0,warnings=0`；`configure verify --role read` 与 `--role write` 均通过。
-- NET-01：两个全局 profile 已同步为 read 6 / write 8 个有效身份，其中 `web_fetch` 由 Reasonix 原生 host registry 提供；`reasonix run --print --output-format json --max-steps 4 --allowed-tools web_fetch --dir .` 对 `https://example.com` 实测返回 `HTTP status: 200 OK` 与标题 `Example Domain`，对保留域名 `https://example.invalid` 稳定返回 transport error 且按任务要求不重试。bridge 的 `tools/list` 仍只有 6 个 host 工具，源码未新增 URL/socket/fetch 网络路径。
+- NET-01：两个全局 profile 已同步为 read 6 / write 8 个有效身份，其中 `web_fetch` 由 Reasonix 原生 host registry 提供；原生 `reasonix run --allowed-tools web_fetch` 与真实 bridge MCP `reasonix_run(mode=inspect)` 对 `https://example.com` 均返回 `HTTP status: 200 OK` 与标题 `Example Domain`，对保留域名 `https://example.invalid` 稳定返回 transport error 且按任务要求不重试。bridge 的 `tools/list` 仍只有 6 个 host 工具，源码未新增 URL/socket/fetch 网络路径。
 
 ## 5. 变更记录
 
