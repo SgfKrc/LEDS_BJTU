@@ -190,4 +190,4 @@
 | 2026-09-13 | `TOOL-RXB-AUD-07` 完成：确认 Reasonix `--max-steps` 是 raw 内部步数而非工具轮次；`max_steps=10` 复现 5 轮后暂停且未到 120 秒，新增 `tool_rounds` 映射、`step_limit` 失败语义与回归，子项目 commit `6d093c1`，`npm test` 51 项通过 |
 | 2026-09-13 | `TOOL-RXB-AUD-08` 完成：read/write prompt 固化 continuation cursor 原样回传约束；bridge 将 malformed/invalid cursor 分类为 `cursor_error`、隐藏失效 token 且禁止自动重放，并修正 prompt 同步命令路径，子项目 commit `491c435`，`npm test` 53 项通过 |
 | 2026-09-13 | `TOOL-RXB-R2-EXT-01` 完成：预算边界放宽为最多 256 raw steps/128 工具轮次和 1800 秒；默认 mode 预算不变，仍需显式传 `tool_rounds`/`timeout_seconds`；配置、夹紧和长预算映射回归共 `npm test` 54 项通过，子项目 commit `26b4113` |
-| 2026-09-13 | `TOOL-RXB-E2-EXT-01` 完成：新增任务级持久 checkpoint 与显式 `reasonix_resume`；失败时保存任务、预算、版本/配置和 Git 状态指纹，不保存 stdout/stderr；恢复前拒绝 workspace/config drift，checkpoint 一次性消费；跨进程 fixture 和派生 write profile 回归后 `npm test` 57 项通过，子项目 commit `012f3c1` |
+| 2026-09-13 | `TOOL-RXB-E2-EXT-01` 完成：新增任务级持久 checkpoint 与显式 `reasonix_resume`；失败时保存任务、预算、版本/配置和 Git 状态指纹，不保存 stdout/stderr；恢复前拒绝 workspace/config drift，checkpoint 一次性消费并以原子 claim 锁防并发重复；跨进程 fixture 和派生 write profile 回归后 `npm test` 57 项通过，子项目 commit `a596921` |
