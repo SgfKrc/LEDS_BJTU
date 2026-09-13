@@ -1,6 +1,6 @@
 # reasonix-codex-bridge ACP 会话级恢复专项计划（2026-09-13）
 
-> 状态：**ACP-01～ACP-03 已完成（2026-09-13），ACP-04～ACP-06 未开始**；本文把 ACP 会话级恢复的现状证据、约束、分层交付与验收门写清楚，后续仍逐票推进，不把客户端层、协调器或注册表误记为生产会话接入。
+> 状态：**ACP-01～ACP-04 已完成（2026-09-13），ACP-05～ACP-06 未开始**；本文把 ACP 会话级恢复的现状证据、约束、分层交付与验收门写清楚，后续仍逐票推进，不把客户端层、协调器、注册表或安全门误记为生产会话接入。
 >
 > 创建日期：2026-09-13
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目）从"stateless per call"扩展到"ACP 持久会话 + 会话级恢复"的规划。**不覆盖** Reasonix 本体的 ACP 实现（已可用，见 §2.1），也不覆盖已落地的**任务级**续跑（checkpoint，见 §2.3）。
@@ -51,7 +51,7 @@
 | 约束 | 内容 | 对应票 |
 | --- | --- | --- |
 | **128MB 会话历史硬上限** | 持久会话会累积历史，必须在 0.75 触发比与 128MB 硬上限下完成 compact/rotate 的验证；ACP-02 已接入有界规则 summarizer 与替换会话协调器，后续仍需在 ACP-06 做长会话演练 | `ACP-06` |
-| **stateless 是现有安全契约** | 一次性调用、可审计、无残留。改长驻会话需新增崩溃恢复、并发串行化、会话/进程清理，以及持久历史下的越权风险控制（写白名单目前按调用检查） | `ACP-03`、`ACP-04` |
+| **stateless 是现有安全契约** | 一次性调用、可审计、无残留。改长驻会话需新增崩溃恢复、并发串行化、会话/进程清理，以及持久历史下的越权风险控制（写白名单目前按调用检查） | `ACP-05`、`ACP-06` |
 | **无验收票** | 会话生命周期验证（崩溃后 resume、compact 正确性、rotate 边界、取消/并发、零泄漏）此前无票覆盖 | `ACP-06` |
 
 ---
@@ -64,7 +64,7 @@
 - 不替换现有 MCP 工具面（`reasonix_run/status/rollback` 语义保持不变）；
 - 不把 128MB 历史上限做成可配置；
 - 不允许"跳过 compact 直接长会话"；
-- 不在 `ACP-04` 完成前默认启用 ACP。
+- 不在 `ACP-05` 完成前默认启用 ACP。
 
 ---
 
@@ -75,7 +75,7 @@
 | `TOOL-RXB-ACP-01` | ACP 客户端层 | spawn `reasonix acp`；JSON-RPC over stdio 客户端（initialize → 能力探测 → `session/new`/`load`/`resume`）；`session/prompt` 的 `session/update` 事件流汇总为调用结果；`session/cancel` 接超时 | — | **已完成**：create→prompt→事件流→干净关闭 fixture 与真实握手；旧 CLI（`loadSession=false`）能力可探测，实际 per-call 回退由 ACP-05 接线；stdin 关闭无残留进程 |
 | `TOOL-RXB-ACP-02` | compact 策略真实化 | `src/acp-session.mjs` 为 `prepareSessionContinuation` 接入有界规则 summarizer（保留可注入 LLM 接口）；四分支接入会话循环；记录每次决策（字节、动作、耗时） | ACP-01 | **已完成**：离线回归覆盖 0.75 触发、append、compact、rotate、摘要失败与替换会话失败回退；摘要/替换失败均回退 `per_call` 且历史不变；替换成功后旧会话 close/delete，rotate 后协调器历史低于硬上限 |
 | `TOOL-RXB-ACP-03` | 会话生命周期管理 | `src/acp-registry.mjs` 提供 metadata 注册表（sessionId ↔ cwd/profile/model）；封装 `session/list`/`close`/`delete`；孤儿标记与显式 shutdown；崩溃后 capability-gated `session/resume`/`load`；同会话并发串行化 | ACP-01 | **开发门完成（opt-in）**：持久元数据不含 task/response；重启条目标记 orphaned 并可 resume/load；delete 在关闭进程前发送；并发 prompt 串行，删除后的排队请求被阻断；真实强杀 bridge 后的进程表验收留给 ACP-06；server 仍未生产接线 |
-| `TOOL-RXB-ACP-04` | 安全回归 | 持久会话下写白名单**仍按调用**检查（复用 `WRITE_POLICY`）；跨任务/跨调用方历史隔离；敏感内容不入历史或先脱敏；会话作用域与 `--workspace-only`、allowed roots 一致 | ACP-01 | 持久会话下越界写仍被拒并回滚；不同任务历史不混；"读取 .env"类任务不得把内容留在历史里 |
+| `TOOL-RXB-ACP-04` | 安全回归 | `src/acp-security.mjs` 提供 opt-in 会话作用域、workspace/配置钉死、`WRITE_POLICY` 写路径预检与敏感历史脱敏；服务端 Git diff/rollback 仍是实际写入权威 | ACP-01 | 6 项新增安全回归通过：越界写预检拒绝、跨任务历史隔离、cwd/profile/model 漂移拒绝、`.env`/凭据/私钥脱敏；server 仍未生产接线 |
 | `TOOL-RXB-ACP-05` | 共存与切换 | `bridge.config.json` 增 `transport: "per-call" \| "acp"`（默认 per-call）；两条路径共享限额/审计/日志；ACP 初始化失败或超时自动降级 | ACP-02/03/04 | 默认行为与现状回归一致；切到 acp 后既有测试全绿或明确标注不适用项；降级路径有测试 |
 | `TOOL-RXB-ACP-06` | 验收与演练 | 崩溃 resume 演练、compact 正确性对照、零泄漏检查（进程/会话/句柄）、并发与取消演练；结果登记回本文档 | ACP-05 | 见 §7 汇总 |
 
@@ -87,10 +87,10 @@
 TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-RXB-ACP-06
                  └─> TOOL-RXB-ACP-03 ─┤
                  └─> TOOL-RXB-ACP-04 ─┘
-（ACP-03 与 ACP-04 可并行；ACP-02 与 ACP-03/04 亦可并行）
+（ACP-03 与 ACP-04 已完成；ACP-02 与 ACP-03/04 亦可并行）
 ```
 
-与 `TOOL-RXB-R3-EXT-01`（并行 worker 池）的关系：并行池是"多 worker 同时跑"，ACP 是"单 worker 长会话"，两者正交。R3 已完成；ACP-01 交付客户端和只读协议 fixture，ACP-02 交付协调器，生产接线、会话注册表与安全隔离仍分别由 ACP-03～05 负责。
+与 `TOOL-RXB-R3-EXT-01`（并行 worker 池）的关系：并行池是"多 worker 同时跑"，ACP 是"单 worker 长会话"，两者正交。R3 已完成；ACP-01 交付客户端和只读协议 fixture，ACP-02 交付协调器，ACP-03 交付 opt-in 会话注册表，ACP-04 交付 opt-in 安全门，生产接线仍由 ACP-05 负责。
 
 ---
 
@@ -100,8 +100,8 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 | --- | --- | --- |
 | ACP-01 | create→prompt→事件流→关闭全链路；旧 CLI 能力探测；无残留进程（per-call 降级由 ACP-05 接线） | fixture 回归 + 真实 `initialize/session/new/session/close` |
 | ACP-02 | 0.75/128MB 不越线；摘要失败回退且历史不变；rotate 有效 | `AcpSessionCoordinator` 决策记录 + 历史字节断言 + 五项回归 |
-| ACP-03 | 孤儿状态可识别；可 resume；并发串行；shutdown 有收口路径 | `AcpSessionRegistry` 7 项回归 + 持久注册表/恢复顺序断言；强杀进程表演练留 ACP-06 |
-| ACP-04 | 越界写被拒并回滚；跨任务历史不混；敏感内容不入历史 | 负向测试 + 历史抽样 |
+| ACP-03 | 孤儿状态可识别；可 resume；并发串行；shutdown 有收口路径 | `AcpSessionRegistry` 8 项回归 + 持久注册表/恢复顺序断言；强杀进程表演练留 ACP-06 |
+| ACP-04 | 越界写被拒并回滚；跨任务历史不混；敏感内容不入历史 | `AcpSecurityPolicy` 负向测试 + 协调器历史抽样；真实生产回滚仍由 ACP-05/06 演练 |
 | ACP-05 | 默认路径回归一致；切换可用；降级有测试 | 回归输出 + 开关测试 |
 | ACP-06 | resume/compact/零泄漏/并发取消四类演练通过 | 演练记录（登记回本文档） |
 
@@ -109,11 +109,11 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 
 ## 8. 风险与边界
 
-1. **历史泄漏**：持久会话可能把上一任务的敏感内容带进下一任务——必须在 `ACP-04` 用"按调用隔离 + 脱敏"关闭该风险。
+1. **历史泄漏**：持久会话可能把上一任务的敏感内容带进下一任务——ACP-04 已用"按调用隔离 + 脱敏"关闭本地历史风险，生产接线仍需 ACP-05 复核。
 2. **摘要失真**：compact 可能丢关键约束；契约是"摘要失败/可疑即回退 `per_call`"，不得"尽力压缩"。
 3. **进程/会话泄漏**：长驻 CLI 是新的资源面；bridge 崩溃、Codex 退出、会话 idle 都要有回收路径。
 4. **CLI 版本耦合**：`loadSession`/`resume` 等能力随版本变化——必须**能力探测 + 降级**，不得假设。
-5. **启用顺序**：`ACP-04` 未完成前，ACP 不得作为默认 transport；`transport` 开关默认值必须保持 `per-call`。
+5. **启用顺序**：`ACP-05` 未完成前，ACP 不得作为默认 transport；`transport` 开关默认值必须保持 `per-call`。
 6. **不做的事**：不把 128MB 上限变成配置项；不用 ACP 替代 MCP 工具契约；不在未验证 compact 的情况下开启长会话。
 
 ---
@@ -127,3 +127,4 @@ TOOL-RXB-ACP-01 ─┬─> TOOL-RXB-ACP-02 ─┬─> TOOL-RXB-ACP-05 ─> TOOL-
 | 2026-09-13 | `TOOL-RXB-ACP-02` 完成：新增 `src/acp-session.mjs` 与 `session/delete` 客户端封装；有界确定性摘要接入四分支决策，compact/rotate 采用新会话成功后再关闭/删除旧会话的事务顺序，替换失败和摘要失败显式回退 stateless per-call；协调器回归 6 项通过，bridge 全量回归 67 项通过。server 仍默认 stateless，ACP-03/04/05 生产接线与安全回归未开始 |
 | 2026-09-13 | 真实 Reasonix 子智能体受控验证：只读任务跨 README、server、config、checkpoint、ACP client、测试文件完成架构与风险审计，桥接仓库工作树无改动；写角色任务在一次性临时 Git 仓库读取 4 个文件并仅新增 `docs/architecture.md`（49 行），返回 `qlh.reasonix.changes.v1` 与 `rollback_id`，同一 bridge 进程调用回滚后仓库恢复干净，`src/app.txt` 与 `tests/README.md` 哈希不变。该证据验证当前 per-call 读/写角色链路，不等同于 ACP 持久会话安全验收 |
 | 2026-09-13 | `TOOL-RXB-ACP-03` 开发门完成：新增 `src/acp-registry.mjs`，提供 metadata-only 持久注册表、孤儿识别、resume/load 能力回退、按会话串行 prompt、close/delete/shutdown 和进程生命周期钩子；测试夹具优先使用项目树内 `build/bridge-test/`，`tmpdir()` 仅作兜底。注册表回归 8 项通过，全量 bridge 回归 `75 passed / 0 failed`；真实强杀 bridge 后的进程表无孤儿演练与生产接线留 ACP-06/05，server 仍默认 stateless |
+| 2026-09-13 | `TOOL-RXB-ACP-04` 开发门完成：新增 `src/acp-security.mjs`，以 opaque `owner/taskId` 绑定会话，钉住 cwd/profile/model，复用 `resolveWritePolicy` 的 fail-closed 白名单做 implement 预检，并对 `.env`/凭据/私钥及协调器响应做有界脱敏；注册表只持久化作用域元数据，并可在每个串行 prompt lane 内重检安全策略，协调器可选传输前脱敏。新增 6 项 ACP-04 测试，全量 bridge 回归 `81 passed / 0 failed`；server 仍默认 stateless，ACP-05/06 负责生产切换和强杀演练 |
