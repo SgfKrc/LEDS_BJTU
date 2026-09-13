@@ -110,7 +110,7 @@ skill "deepseek-worker-write" allowed-tools reference "git_diff" is not a known 
 | 无效身份（历史证据） | `reasonix doctor --json` → `warnings` | 曾有 4 条 `is not a known tool identity`（`git_log`/`git_diff`）；修复后为 0 |
 | 能力清点（当前） | `reasonix doctor capabilities --json` | `summary.mcp_servers=2`、`skills=10`、`warnings=0` |
 | 搜索归属 | 内置文档 `docs/WEB_SEARCH.md` + changelog v1.19.7 | "opens a separate model request … backend's native search tool"；官方端点上查询发给 provider 并按搜索计费 |
-| NET-01 原生抓取 | `reasonix run --print --output-format json --max-steps 4 --allowed-tools web_fetch --dir .` | `https://example.com` 返回 `HTTP status: 200 OK`、标题 `Example Domain`；`doctor capabilities` 为 `errors=0,warnings=0` |
+| NET-01 原生抓取 | `reasonix run --print --output-format json --max-steps 4 --allowed-tools web_fetch --dir .` | `https://example.com` 返回 `HTTP status: 200 OK`、标题 `Example Domain`；`https://example.invalid` 返回 transport error 且未重试；`doctor capabilities` 为 `errors=0,warnings=0` |
 | MCP git 能力 | capability catalog | `mcp-tool:gitcontext/git_pickaxe` 可用 |
 
 ---
