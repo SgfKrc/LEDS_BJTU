@@ -2,9 +2,9 @@
 
 ## 结论
 
-桥接器已经可以作为“受控、低价、文件型开发助手”使用：只读勘察、review/plan、白名单写入、结构化变更证据、显式回滚、失败 checkpoint/续跑、取消、只读并行，以及默认关闭的命名 argv-only 测试/构建执行均有实现与回归证据。它还不是 Codex 原生子智能体的等价替代：默认 worker 没有 shell、网络、动态子智能体派生、子智能体间消息和流式进度；ACP 跨进程恢复也未通过真实 provider 持久化门。
+桥接器已经可以作为“受控、低价、文件型开发助手”使用：只读勘察、review/plan、白名单写入、结构化变更证据、显式回滚、失败 checkpoint/续跑、取消、只读并行、Reasonix 原生 `web_fetch`，以及默认关闭的命名 argv-only 测试/构建执行均有实现与回归/实测证据。它还不是 Codex 原生子智能体的等价替代：默认 worker 没有 shell、搜索、动态子智能体派生、子智能体间消息和流式进度；ACP 跨进程恢复也未通过真实 provider 持久化门。
 
-因此当前适用边界是：主 agent 拆分任务并审查结果，bridge worker 完成局部读写工作；需要测试/构建时可由主 agent 显式调用已配置的 `reasonix_exec` profile。访问网络或跨多个自主阶段迭代仍必须由主 agent 或后续受控工具完成。
+因此当前适用边界是：主 agent 拆分任务并审查结果，bridge worker 完成局部读写工作；指定 URL 抓取可由 worker 直接调用 Reasonix 原生 `web_fetch`，但 bridge 不提供任意 URL MCP 工具或第二套网络栈；需要测试/构建时可由主 agent 显式调用已配置的 `reasonix_exec` profile。搜索或跨多个自主阶段迭代仍必须由主 agent 或后续受控工具完成。
 
 ## 审计范围
 
@@ -31,7 +31,7 @@
 | 并行 | 受限通过 | `parallel=true` 仅 inspect/review/plan，只读槽位并发；implement/resume/rollback 独占 |
 | compact / rotate | 通过（适配器层） | 固定 128 MiB 上限、75% 触发，事务式替换；不是 Reasonix 原生历史替换声明 |
 | 观测 | 通过 | `reasonix_status`、可选 JSONL 脱敏日志、job 状态；无流式 partial output |
-| 工具生态 | 有意受限 | read profile 当前为 Reasonix 真实识别的 5 项，write profile 追加 `edit_file`/`write_file`；历史无效的 `git_log`/`git_diff` 已移除并由 doctor/verify 校验；worker 无 shell/网络，bridge 另有默认关闭的命名 `reasonix_exec` host 通道 |
+| 工具生态 | 有意受限 | read profile 当前为 Reasonix 真实识别的 6 项（含原生 `web_fetch`），write profile 追加 `edit_file`/`write_file`；历史无效的 `git_log`/`git_diff` 已移除并由 doctor/verify 校验；worker 无 shell/搜索，bridge 另有默认关闭的命名 `reasonix_exec` host 通道 |
 | 自主迭代 | 部分通过 | 单次 worker 可在预算内多轮；跨调用续跑需主 agent 显式编排，无自动 plan→implement→test loop |
 
 ## 实测记录
@@ -98,6 +98,10 @@ npm run acceptance:acp:real
 
 本机 `reasonix doctor --json` 曾对 `deepseek-worker` 与 `deepseek-worker-write` 各报告 `git_log`、`git_diff` 为 `not a known tool identity`，共 4 条告警。`TOOL-RXB-TOOL-01` 已将常量、文档、prompt 与两个全局 profile 收敛到真实有效身份；当前 `doctor capabilities` 为 `errors=0,warnings=0`，`configure verify --role read/write` 均通过。git 查看改走 `gitcontext` MCP 或受控 `reasonix_exec`。
 
+### P1：指定 URL 抓取已接入 Reasonix（已解决）
+
+`TOOL-RXB-NET-01` 已把 `web_fetch` 加入 read/write profile（分别 6/8 项），不在 bridge 内新增网络栈或任意 URL MCP 工具。真实 `reasonix run --allowed-tools web_fetch` 对 `https://example.com` 返回 `HTTP status: 200 OK` 与标题 `Example Domain`；`doctor capabilities` 和两个 `configure verify` 均为零告警/通过。搜索仍归 provider，当前不宣称可用。
+
 ### P1：真实 ACP 跨进程恢复未闭环
 
 `AcpSessionRegistry` 已有 metadata-only、orphan、resume/load、shutdown 和并发串行，但尚未接入 production server。真实 provider 对未产生 prompt 的会话不持久化，导致强杀后 resume 不成立。生产默认保持 `per-call` 是正确的 fail-closed 行为。
@@ -124,8 +128,8 @@ checkpoint 不保存 stdout/stderr，但会保存原始任务文本、模式、�
 
 ## 建议下一步
 
-1. `TOOL-RXB-EXEC-01` 已完成：受控 `reasonix_exec` 只允许命名可执行文件和 argv 数组，禁止 shell，固定 cwd 根，继承 timeout/output caps，记录脱敏审计，并默认关闭；离线回归与真实 CLI 验收均通过。
-2. 为网络能力排期 `web_fetch` 主仓 Tool Gateway 适配；`web_search` 在本机没有后端，接通前保持 unavailable/fail-closed。
+1. `TOOL-RXB-EXEC-01` 与 `TOOL-RXB-NET-01` 已完成：`reasonix_exec` 只允许命名可执行文件和 argv 数组，`web_fetch` 由 Reasonix 原生 host registry 提供；两者均不复制任意 shell/网络能力，离线回归与真实 CLI 验收均通过。
+2. `web_search` 在本机没有后端，继续保持 provider 归属与 unavailable/fail-closed，不在 bridge 自建搜索后端。
 3. 为 ACP 增加 provider-backed 非空会话 fixture，先验证“产生 prompt 后强杀→resume/load→close/delete”，再评估 registry 的生产接线；在此之前不改默认 transport。
 4. 在主 agent 层提供显式阶段编排模板（plan→implement→exec/test→review），保持每阶段可审查、可回滚，不在 bridge 内隐式重试。
 5. 长任务若需要进度，增加仅含 job id、阶段和计数的通知/轮询契约，不传任务正文或 worker 输出正文。
@@ -136,4 +140,4 @@ checkpoint 不保存 stdout/stderr，但会保存原始任务文本、模式、�
 
 ## 最终判定
 
-对文档、配置、代码局部修改和受控审查任务：**可作为低价替代投入使用**；测试/构建可在命名 profile 与干净树门控下由 `reasonix_exec` 执行。对需要网络、长时间跨进程上下文、自主多 agent 协作的任务：**当前只能作为受限执行器，不能宣称达到 Codex 原生子智能体的大多数能力**。本轮没有把小模型响应质量或性能冒充为桥接器能力结论。
+对文档、配置、代码局部修改、指定 URL 抓取和受控审查任务：**可作为低价替代投入使用**；测试/构建可在命名 profile 与干净树门控下由 `reasonix_exec` 执行。对需要搜索、长时间跨进程上下文、自主多 agent 协作的任务：**当前只能作为受限执行器，不能宣称达到 Codex 原生子智能体的大多数能力**。本轮没有把小模型响应质量或性能冒充为桥接器能力结论。
