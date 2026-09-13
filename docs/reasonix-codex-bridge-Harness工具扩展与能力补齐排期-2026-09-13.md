@@ -65,7 +65,7 @@
 ## 4. 验收记录
 
 - 离线定向回归：`reasonix_exec` 禁用门、命令白名单、argv 执行、输出脱敏和工作区变更检测已通过。
-- 全量回归：`npm test`，95/95 通过；`npm run check`、`npm run check:links` 和 `git diff --check` 均通过。
+- 全量回归：`npm test`，97/97 通过；`npm run check`、`npm run check:links` 和 `git diff --check` 均通过。
 - 真实 CLI：使用本机 Reasonix `v1.38.7` 启动 bridge，在项目树内 `build/bridge-test/exec-real-fixture/` 的干净 fixture 中执行 `node-version` 命名 profile；MCP 暴露 6 个工具，返回 `qlh.reasonix.exec.v1`、`outcome=success`、`exitCode=0`、`changedPaths=[]`；不发送模型 prompt，不访问网络。fixture 已清理。
 
 ## 5. 变更记录

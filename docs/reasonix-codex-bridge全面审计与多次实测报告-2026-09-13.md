@@ -2,9 +2,9 @@
 
 ## 结论
 
-桥接器已经可以作为“受控、低价、文件型开发助手”使用：只读勘察、review/plan、白名单写入、结构化变更证据、显式回滚、失败 checkpoint/续跑、取消和只读并行均有实现与回归证据。它还不是 Codex 原生子智能体的等价替代：默认 worker 没有 shell、测试执行、网络、动态子智能体派生、子智能体间消息和流式进度；ACP 跨进程恢复也未通过真实 provider 持久化门。
+桥接器已经可以作为“受控、低价、文件型开发助手”使用：只读勘察、review/plan、白名单写入、结构化变更证据、显式回滚、失败 checkpoint/续跑、取消、只读并行，以及默认关闭的命名 argv-only 测试/构建执行均有实现与回归证据。它还不是 Codex 原生子智能体的等价替代：默认 worker 没有 shell、网络、动态子智能体派生、子智能体间消息和流式进度；ACP 跨进程恢复也未通过真实 provider 持久化门。
 
-因此当前适用边界是：主 agent 拆分任务并审查结果，bridge worker 完成局部读写工作。需要执行测试/构建/安装、访问网络或跨多个自主阶段迭代时，仍必须由主 agent 或后续受控工具完成。
+因此当前适用边界是：主 agent 拆分任务并审查结果，bridge worker 完成局部读写工作；需要测试/构建时可由主 agent 显式调用已配置的 `reasonix_exec` profile。访问网络或跨多个自主阶段迭代仍必须由主 agent 或后续受控工具完成。
 
 ## 审计范围
 
@@ -31,7 +31,7 @@
 | 并行 | 受限通过 | `parallel=true` 仅 inspect/review/plan，只读槽位并发；implement/resume/rollback 独占 |
 | compact / rotate | 通过（适配器层） | 固定 128 MiB 上限、75% 触发，事务式替换；不是 Reasonix 原生历史替换声明 |
 | 观测 | 通过 | `reasonix_status`、可选 JSONL 脱敏日志、job 状态；无流式 partial output |
-| 工具生态 | 有意受限 | read profile 7 项工具，write profile 仅增加 `edit_file`/`write_file`；无 shell、测试、网络 |
+| 工具生态 | 有意受限 | read profile 声明 7 项但 Reasonix 实际仅识别 5 项（`git_log`/`git_diff` 产生 doctor 告警，见工具面现状文档）；write profile 仅增加 `edit_file`/`write_file`；worker 无 shell/网络，bridge 另有默认关闭的命名 `reasonix_exec` host 通道 |
 | 自主迭代 | 部分通过 | 单次 worker 可在预算内多轮；跨调用续跑需主 agent 显式编排，无自动 plan→implement→test loop |
 
 ## 实测记录
@@ -40,7 +40,7 @@
 
 使用本机 Reasonix CLI v1.38.7 启动真实 `src/server.mjs`，发送 `initialize`、`tools/list`、`reasonix_status`：
 
-- MCP 握手正常，暴露 5 个工具：`reasonix_run`、`reasonix_resume`、`reasonix_cancel`、`reasonix_rollback`、`reasonix_status`；
+- MCP 握手正常，暴露 6 个工具：`reasonix_run`、`reasonix_resume`、`reasonix_cancel`、`reasonix_rollback`、`reasonix_exec`、`reasonix_status`；
 - 版本门 `1.38.6` 通过；当前 profile 为 `deepseek-worker` / read；模型能力窗口报告为 1,000,000 tokens；
 - 默认 transport 为 `per-call`，写策略状态可见但只读角色不会被当作写角色；
 - 状态显示本机有 1 个历史 `cursor_error` checkpoint。本轮未消费或修改它。
@@ -84,7 +84,7 @@ npm run acceptance:acp
 node --test test/bridge.test.mjs
 ```
 
-结果：语法/链接检查通过；ACP-06 离线报告 `status=passed`，覆盖真实子进程强杀、orphan/resume、metadata-only、compact/rotate、并发串行、取消、child cleanup 和工件删除；全量测试 `92 passed / 0 failed`。
+结果：语法/链接检查通过；ACP-06 离线报告 `status=passed`，覆盖真实子进程强杀、orphan/resume、metadata-only、compact/rotate、并发串行、取消、child cleanup 和工件删除；全量测试 `97 passed / 0 failed`，另含 `reasonix_exec` 的拒绝、超时、截断、取消和变更检测回归。
 
 ```text
 npm run acceptance:acp:real
@@ -94,13 +94,17 @@ npm run acceptance:acp:real
 
 ## 审计发现与优先级
 
+### P1：profile 声明了 Reasonix 不认识的 git 工具身份
+
+本机 `reasonix doctor --json` 对 `deepseek-worker` 与 `deepseek-worker-write` 各报告 `git_log`、`git_diff` 为 `not a known tool identity`，共 4 条告警。当前 bridge 常量和文档仍把它们列入只读工具集，因此“工具集一致”只代表 bridge 自己的期望，不代表 Reasonix 运行时真的提供。修复票为 `TOOL-RXB-TOOL-01`：收敛到真实有效身份，git 查看改走 `gitcontext` MCP 或受控 `reasonix_exec`。
+
 ### P1：真实 ACP 跨进程恢复未闭环
 
 `AcpSessionRegistry` 已有 metadata-only、orphan、resume/load、shutdown 和并发串行，但尚未接入 production server。真实 provider 对未产生 prompt 的会话不持久化，导致强杀后 resume 不成立。生产默认保持 `per-call` 是正确的 fail-closed 行为。
 
 ### P1：写入后不能由 worker 自己执行测试
 
-write profile 没有 shell、测试或构建工具，worker 只能编辑文件；实现结果必须由主 agent 审查并运行测试。这提高安全性，但与原生 coding subagent 的“编辑→运行测试→修复”闭环有明显差距。
+write profile 没有 shell、测试或构建工具，worker 只能编辑文件；实现结果必须由主 agent 审查，并通过显式配置的 `reasonix_exec` 命令 profile 运行测试。执行器补齐了 host 侧写后验证，但仍不是 worker 自主的“编辑→运行测试→修复”闭环。
 
 ### P1：没有跨调用自主编排
 
@@ -120,10 +124,11 @@ checkpoint 不保存 stdout/stderr，但会保存原始任务文本、模式、�
 
 ## 建议下一步
 
-1. 新增受控 `reasonix_exec`/测试工具：只允许配置的可执行文件和 argv 数组，禁止 shell，固定 cwd 根，继承 timeout/output caps，记录脱敏审计，并默认关闭；这是补齐“写后验证”能力的最高收益改造。
-2. 为 ACP 增加 provider-backed 非空会话 fixture，先验证“产生 prompt 后强杀→resume/load→close/delete”，再评估 registry 的生产接线；在此之前不改默认 transport。
-3. 在主 agent 层提供显式阶段编排模板（plan→implement→test→review），保持每阶段可审查、可回滚，不在 bridge 内隐式重试。
-4. 长任务若需要进度，增加仅含 job id、阶段和计数的通知/轮询契约，不传任务正文或 worker 输出正文。
+1. `TOOL-RXB-EXEC-01` 已完成：受控 `reasonix_exec` 只允许命名可执行文件和 argv 数组，禁止 shell，固定 cwd 根，继承 timeout/output caps，记录脱敏审计，并默认关闭；离线 97/97 与真实 CLI 验收均通过。
+2. 为网络能力排期 `web_fetch` 主仓 Tool Gateway 适配；`web_search` 在本机没有后端，接通前保持 unavailable/fail-closed。
+3. 为 ACP 增加 provider-backed 非空会话 fixture，先验证“产生 prompt 后强杀→resume/load→close/delete”，再评估 registry 的生产接线；在此之前不改默认 transport。
+4. 在主 agent 层提供显式阶段编排模板（plan→implement→exec/test→review），保持每阶段可审查、可回滚，不在 bridge 内隐式重试。
+5. 长任务若需要进度，增加仅含 job id、阶段和计数的通知/轮询契约，不传任务正文或 worker 输出正文。
 
 ## 文档质量门
 
@@ -131,4 +136,4 @@ checkpoint 不保存 stdout/stderr，但会保存原始任务文本、模式、�
 
 ## 最终判定
 
-对文档、配置、代码局部修改和受控审查任务：**可作为低价替代投入使用**。对需要 shell/测试/网络、长时间跨进程上下文、自主多 agent 协作的任务：**当前只能作为受限执行器，不能宣称达到 Codex 原生子智能体的大多数能力**。本轮没有把小模型响应质量或性能冒充为桥接器能力结论。
+对文档、配置、代码局部修改和受控审查任务：**可作为低价替代投入使用**；测试/构建可在命名 profile 与干净树门控下由 `reasonix_exec` 执行。对需要网络、长时间跨进程上下文、自主多 agent 协作的任务：**当前只能作为受限执行器，不能宣称达到 Codex 原生子智能体的大多数能力**。本轮没有把小模型响应质量或性能冒充为桥接器能力结论。
