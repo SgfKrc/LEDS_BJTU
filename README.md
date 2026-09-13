@@ -1039,6 +1039,7 @@ python serve.py
 - [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01～ACP-05，ACP-06 离线验收通过（强杀、orphan/resume、compact/rotate、并发取消与零泄漏）；默认仍 per-call，真实 provider 空会话跨进程 resume 返回 `unknown session`，恢复门待 provider 持久化语义补证
 - [reasonix-codex-bridge Harness 工具扩展与能力补齐排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) — 本机 Reasonix capability 调研与 EXEC/NET/LOOP/EVT/ACP/MESSAGE 票排期；`TOOL-RXB-EXEC-01` 与 `TOOL-RXB-NET-01` 已完成，后者接入 Reasonix 原生 `web_fetch` 并通过 `example.com` 真实抓取验收
 - [reasonix-codex-bridge 工具面现状与能力归属](docs/reasonix-codex-bridge工具面现状-2026-09-13.md) — `reasonix doctor` 曾发现 profile 中 `git_log`/`git_diff` 为未知工具身份，现已由 `TOOL-RXB-TOOL-01` 收敛并验证归零；明确 `web_fetch` 归 Reasonix、`web_search` 归 provider
+- [DeepSeek 缓存机制借鉴与 QLH 落地专项计划](docs/缓存机制专项计划-2026-09-13.md) — 登记 V4.1 磁盘上下文缓存与 SWA 单元匹配机制（三种持久化时机、hit/miss 25–50× 差价、KV 1/4 HBM 与 1/8 SSD），对照 `paged_kv_cache`/harness/bridge 现状，给出前缀稳定性与命中观测（零成本）、两级缓存与单元对齐（工程改造）、架构级压缩（仅跟踪）三档动作与 `CACHE-01`～`CACHE-06` 票
 - [reasonix-codex-bridge 全面审计与多次实测报告](docs/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md) — 真实覆盖 MCP 控制面、inspect、plan、受控写入/回滚、checkpoint/resume、ACP-06、命名命令执行与 Reasonix 原生 `web_fetch`；结论为可作为受限文件型低价替代，搜索、跨进程 ACP 恢复与自主多阶段编排仍待后续票
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
