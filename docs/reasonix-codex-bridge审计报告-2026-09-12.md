@@ -75,7 +75,7 @@
 
 | 检查 | 结果 |
 |---|---|
-| `npm test` | 初审 40 passed；复验 47 passed, 0 failed |
+| `npm test` | 初审 40 passed；复验 48 passed, 0 failed |
 | `npm run check` | 通过，所有模块语法检查通过 |
 | `npm run check:links` | README 本地链接通过 |
 | `node --test --experimental-test-coverage` | 行 90.80%，分支 53.73%，函数 90.34% |
@@ -112,6 +112,7 @@
 | `TOOL-RXB-AUD-03` | BR-003 rollback 绕过串行队列 | **已完成（2026-09-13）** | 回滚接入 implement 共用队列；同一工作区并发回归通过 |
 | `TOOL-RXB-AUD-04` | BR-004 Windows `.cmd` shell 参数 | **已完成（2026-09-13）** | `shell:false` + 显式 `cmd.exe`；元字符拒绝与 `.cmd` 启动回归通过 |
 | `TOOL-RXB-AUD-05` | BR-005 hash 读取失败哨兵混用 | **已完成（2026-09-13）** | `readable/missing/unreadable` 三态；类型变化、缺失和 restore 后 SHA-256 回归通过 |
+| `TOOL-RXB-AUD-06` | rename/copy 目标回滚的 index 状态未覆盖 | **已完成（2026-09-13）** | 子项目 commit `8e7693c`；rename 目标按新增路径清理并撤销 staged index，回归通过 |
 
 本次初审关闭 BR-001、BR-002；2026-09-13 复验关闭 BR-003、BR-004、BR-005。写 profile 和 `allowWrite=true` 仍不作为默认生产通道开放；G3 跨 POSIX 环境实跑仍等待真实 WSL/CI 证据。
 
@@ -119,6 +120,6 @@
 
 - 主节点 Codex 只读审计复核确认修复方向：AUD-03 的回滚请求进入与 implement 相同的串行队列；AUD-04 的 `.cmd/.bat` 调用不再启用 `shell=true`，危险元字符在启动前 fail-closed；AUD-05 的回滚目标区分 `missing`、`unreadable` 和 SHA-256，恢复后再次检查状态与哈希。
 - 本机 Reasonix 只读复核本轮以 worker exit code 1 结束，没有产出可采纳报告；未把该失败当作通过证据，也未开放 Reasonix 写入配置。
-- `npm test`：47 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
-- 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核。
+- `npm test`：48 passed, 0 failed；`npm run check`：通过；`npm run check:links`：通过；`git diff --check`：通过。
+- 新增回归覆盖：同一 MCP 进程中 implement 与 rollback 并发、Windows `.cmd` 参数元字符、非规则文件/缺失目标的 rollback 拒绝、restore 后 SHA-256 复核，以及 staged rename 目标的 index 清理。
 - 未伪造 ACL 权限失败、POSIX/WSL 或真实 provider/model 质量证据；这些仍属于环境或集成层后续验证。

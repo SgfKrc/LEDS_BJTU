@@ -1,6 +1,6 @@
 # reasonix-codex-bridge 完善方向（2026-09-12）
 
-> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
+> 状态：方向文档已转票；`TOOL-RXB-T1`/`TOOL-RXB-T2`/`TOOL-RXB-T3`/`TOOL-RXB-C1`/`TOOL-RXB-C2`/`TOOL-RXB-C3`/`TOOL-RXB-C4`/`TOOL-RXB-R1`/`TOOL-RXB-R2`/`TOOL-RXB-R3`/`TOOL-RXB-E1`/`TOOL-RXB-E2`/`TOOL-RXB-E3`/`TOOL-RXB-E4`/`TOOL-RXB-G1`/`TOOL-RXB-G2`/`TOOL-RXB-G4`/`TOOL-RXB-W1`/`TOOL-RXB-W2`/`TOOL-RXB-W3`/`TOOL-RXB-AUD-01`/`TOOL-RXB-AUD-02`/`TOOL-RXB-AUD-03`/`TOOL-RXB-AUD-04`/`TOOL-RXB-AUD-05`/`TOOL-RXB-AUD-06` 已完成；G3 因本机无可用 WSL/虚拟机环境保留等待。本文件仍保留完整方向与验收门，具体进度以开发票计划为准。写入策略继续默认关闭。
 >
 > 创建日期：2026-09-12
 > 适用范围：`tools/reasonix-codex-bridge`（独立子项目，https://github.com/SgfKrc/reasonix-codex-bridge）及其在 Codex / Reasonix 之间的接线方式。不覆盖 Reasonix 本体的模型、运行时与权限能力。
@@ -186,3 +186,4 @@
 | 2026-09-13 | `TOOL-RXB-AUD-03` 完成：显式 `reasonix_rollback` 纳入与 implement 共用的进程内串行队列；新增同一工作区并发回归，验证 rollback 不与 worker 写入交错 |
 | 2026-09-13 | `TOOL-RXB-AUD-04` 完成：Windows `.cmd/.bat` 通过显式 `cmd.exe /d /s /c`、`shell:false` 启动；命令元字符在进程创建前拒绝，`configure`、doctor、version、worker 共用安全调用解析器，并补启动/参数回归 |
 | 2026-09-13 | `TOOL-RXB-AUD-05` 完成：rollback 哈希改为 `readable/missing/unreadable` 三态；不可读和类型变化默认拒绝，缺失与哈希冲突分别返回语义化错误，restore 后复核 Git 状态与 SHA-256 |
+| 2026-09-13 | `TOOL-RXB-AUD-06` 完成：Git rename/copy 目标按新增路径处理；回滚清理前撤销 staged index，避免 rename 目标残留导致 post-check 误报；新增 staged rename 回归，子项目 commit `8e7693c`，`npm test` 48 项通过 |
