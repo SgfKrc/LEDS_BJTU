@@ -1,0 +1,188 @@
+{
+  "plan_id": "plan-quality-qwen35-9b-dsv4-calibration-v2",
+  "title": "HW-DSV4-9B-EVAL-01 Qwen3.5-9B-DeepSeek-V4-Flash GGUF 客观子集三轮标定",
+  "prompt_set": {
+    "id": "ps-qwen3-nothink",
+    "sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9"
+  },
+  "env": {
+    "engine": "llama-cpp-python local GGUF (qwen35)",
+    "gpu": "none",
+    "notes": "HW-DSV4-9B-EVAL-01; Jackrong/Qwen3.5-9B-DeepSeek-V4-Flash-GGUF Q4_K_M; 口径沿用 EX-QW3V2-01 v2（ps-qwen3-nothink raw 提示 + loose_contains v2 rubric + 0.7/0.8/20/0 + 512 tokens + seed 20260816），Qwen3.5 专属 chat template/thinking 适配未做（QW3-G3 另计），结论按此边界解读；CPU 运行（n-gpu-layers 0）与 EX-QW3V2-01 一致；no network, no SD, no Gemma judge"
+  },
+  "quality": {
+    "required": false,
+    "llm": {
+      "prompt_set_id": "ps-qwen3-nothink",
+      "prompt_set_sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
+      "objective_subset_count": 15,
+      "objective_prompt_ids": [
+        "math-001", "math-002", "math-004", "math-005",
+        "en-001", "code-001", "code-002", "code-003", "code-004", "code-005",
+        "fmt-001", "fmt-002", "fmt-003", "fmt-004", "fmt-005"
+      ],
+      "rubric_id": "llm-objective-ps-v1-v2",
+      "rubric_sha256": "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
+      "correctness_rate_baseline": 0.0,
+      "format_rate_baseline": 0.0,
+      "compare_rule": ">= baseline*0.9"
+    },
+    "manual_review": {
+      "reviewers_required": 2,
+      "upgrade_on": "2 pass, 0 fail"
+    },
+    "calibration": {
+      "series_id": "ex-n3-qwen35-9b-dsv4-v2-calibration-v1",
+      "rounds_required": 3,
+      "threshold_version": "ex-n3-v2-512-loose-v1"
+    }
+  },
+  "defaults": {
+    "runs": 1,
+    "timeout_s": 7200,
+    "max_retries": 0,
+    "resources": {
+      "cpu_model_slot": "qwen35-9b-dsv4-gguf"
+    }
+  },
+  "units": [
+    {
+      "experiment_id": "exp-0001",
+      "name": "Qwen3.5-9B-DSV4-Flash v2 客观质量标定第 1 轮",
+      "command": [
+        "{python}", "scripts/experiment_llm_quality_unit.py",
+        "--model", "models/qwen35-9b-dsv4flash-q4_k_m.gguf",
+        "--expected-model-sha256", "9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada",
+        "--prompt-set-dir", "{prompt_set_dir}",
+        "--prompt-set-sha256", "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
+        "--rubric", "fixtures/quality_rubrics/llm-objective-ps-v1-v2.json",
+        "--expected-rubric-sha256", "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
+        "--result-file", "{out_dir}/{experiment_id}.result.json",
+        "--seed", "20260816",
+        "--prompt-mode", "raw",
+        "--temperature", "0.7",
+        "--top-p", "0.8",
+        "--top-k", "20",
+        "--min-p", "0",
+        "--max-new-tokens", "512",
+        "--n-ctx", "4096",
+        "--n-gpu-layers", "0"
+      ],
+      "params": {
+        "seed": 20260816,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "max_new_tokens": 512,
+        "stream": false,
+        "concurrency": 1
+      },
+      "model": {
+        "id": "qwen35-9b-dsv4-gguf",
+        "artifact_sha256": "9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada",
+        "quant_family": "Q4_K_M",
+        "tokenizer": "qwen35",
+        "context": 4096
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": ["llm"]
+    },
+    {
+      "experiment_id": "exp-0002",
+      "name": "Qwen3.5-9B-DSV4-Flash v2 客观质量标定第 2 轮",
+      "command": [
+        "{python}", "scripts/experiment_llm_quality_unit.py",
+        "--model", "models/qwen35-9b-dsv4flash-q4_k_m.gguf",
+        "--expected-model-sha256", "9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada",
+        "--prompt-set-dir", "{prompt_set_dir}",
+        "--prompt-set-sha256", "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
+        "--rubric", "fixtures/quality_rubrics/llm-objective-ps-v1-v2.json",
+        "--expected-rubric-sha256", "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
+        "--result-file", "{out_dir}/{experiment_id}.result.json",
+        "--seed", "20260816",
+        "--prompt-mode", "raw",
+        "--temperature", "0.7",
+        "--top-p", "0.8",
+        "--top-k", "20",
+        "--min-p", "0",
+        "--max-new-tokens", "512",
+        "--n-ctx", "4096",
+        "--n-gpu-layers", "0"
+      ],
+      "params": {
+        "seed": 20260816,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "max_new_tokens": 512,
+        "stream": false,
+        "concurrency": 1
+      },
+      "model": {
+        "id": "qwen35-9b-dsv4-gguf",
+        "artifact_sha256": "9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada",
+        "quant_family": "Q4_K_M",
+        "tokenizer": "qwen35",
+        "context": 4096
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": ["llm"]
+    },
+    {
+      "experiment_id": "exp-0003",
+      "name": "Qwen3.5-9B-DSV4-Flash v2 客观质量标定第 3 轮",
+      "command": [
+        "{python}", "scripts/experiment_llm_quality_unit.py",
+        "--model", "models/qwen35-9b-dsv4flash-q4_k_m.gguf",
+        "--expected-model-sha256", "9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada",
+        "--prompt-set-dir", "{prompt_set_dir}",
+        "--prompt-set-sha256", "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
+        "--rubric", "fixtures/quality_rubrics/llm-objective-ps-v1-v2.json",
+        "--expected-rubric-sha256", "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
+        "--result-file", "{out_dir}/{experiment_id}.result.json",
+        "--seed", "20260816",
+        "--prompt-mode", "raw",
+        "--temperature", "0.7",
+        "--top-p", "0.8",
+        "--top-k", "20",
+        "--min-p", "0",
+        "--max-new-tokens", "512",
+        "--n-ctx", "4096",
+        "--n-gpu-layers", "0"
+      ],
+      "params": {
+        "seed": 20260816,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "max_new_tokens": 512,
+        "stream": false,
+        "concurrency": 1
+      },
+      "model": {
+        "id": "qwen35-9b-dsv4-gguf",
+        "artifact_sha256": "9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada",
+        "quant_family": "Q4_K_M",
+        "tokenizer": "qwen35",
+        "context": 4096
+      },
+      "gate": {
+        "metric": "quality_completed",
+        "op": ">=",
+        "threshold": 1
+      },
+      "quality_checks": ["llm"]
+    }
+  ]
+}

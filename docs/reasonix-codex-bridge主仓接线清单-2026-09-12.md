@@ -15,7 +15,7 @@
 | Reasonix CLI 探测 | **非标准路径**：`H:\Reasonix\versions\v1.38.7\reasonix-cli.exe`（桌面版目录；标准探测顺序不含 H 盘，**必须显式 `REASONIX_EXE`**；npm 全局 `reasonix` 为 v1.21.3，版本过旧不可用） |
 | Codex 配置 | `C:\Users\Koakuma\.codex\config.toml` → `[mcp_servers.reasonix_local]`（2026-09-14 写入，含自动备份 `config.toml.bak-*`） |
 | Reasonix profile | `%APPDATA%\reasonix\skills\deepseek-worker\SKILL.md`（读角色）与 `…\deepseek-worker-write\SKILL.md`（写角色，2026-09-14 创建） |
-| bridge 本机配置 | `bridge.config.json`（`modelRef = opencode-go-2ae…/deepseek-flash`，当前 V4.1-Flash API ref；**`allowWrite=true` + `allowedPaths=["."]`（整个 workspace，条目写法 `"./"`）+ `requireCleanTree=true` → 写策略 `enabled=true`**，2026-09-14 开放用于真实测试） |
+| bridge 本机配置 | `bridge.config.json` 当前实际 `modelRef = opencode-go-2ae…/deepseek-flash`（项目标准 V4.1-Flash API ref）；**写策略已恢复关闭（2026-09-14，按并行线审查建议）**：`allowWrite=false` + 白名单预置最小集 `["src/","harness_workbench/","tests/"]` + `requireCleanTree=true` → 解析 `enabled=false`；剩余 P1 审计问题关闭后再以最小白名单重开） |
 | **子智能体权限（当前）** | **读角色默认**：`deepseek-worker`（只读：`read_file, grep, glob, ls, code_index, git_log, git_diff`）；**写角色已创建**：`deepseek-worker-write`（读集 + `edit_file, write_file, web_fetch`，无 `read-only`），仅在 `mode=implement` 显式授权时使用；**写入前要求工作树 clean**（`requireCleanTree=true`，⚠️ **开发阶段临时口径**：agent 场景"一写即脏"，连续写入会被拒，已登记 `TOOL-RXB-W1-EXT-01` 将来必须优化/砍掉），主 agent 负责审查 diff |
 | **预算默认（bridge 新版口径）** | **`tool_rounds`：inspect 40 / review·plan·implement 48**（raw `max_steps` 80/96，1 round = 2 steps）；timeout 600s / 900s；硬上限 128 rounds / 256 steps / 1800s。**调用省略参数即用以上默认**——Codex 侧无需传预算（此前 120s 超时是调用方显式传入的保守值） |
 | workspace 传递 | `REASONIX_ROOT = G:\C\PYT\qlh`；bridge 只允许该根及显式 `REASONIX_ADD_DIRS` |
