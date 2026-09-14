@@ -99,3 +99,18 @@ def test_baseline_package_exports_are_lazy():
     report = run_rag_baseline(top_k=1)
     assert report.valid is True
     assert report.top_k == 1
+
+
+def test_main_project_root_is_explicit_and_fail_closed(tmp_path):
+    """An explicit root without src/rag_store.py must fail closed, not fall back silently."""
+    with pytest.raises(RagBaselineError) as excinfo:
+        run_rag_baseline(main_project_root=tmp_path)
+    assert excinfo.value.code == "main_project_root_invalid"
+
+
+def test_main_project_root_env_is_honored(tmp_path, monkeypatch):
+    """QLH_MAIN_PROJECT_ROOT is the documented fallback between argument and cwd."""
+    monkeypatch.setenv("QLH_MAIN_PROJECT_ROOT", str(tmp_path))
+    with pytest.raises(RagBaselineError) as excinfo:
+        run_rag_baseline()
+    assert excinfo.value.code == "main_project_root_invalid"

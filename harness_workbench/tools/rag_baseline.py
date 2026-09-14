@@ -10,14 +10,17 @@ paths.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import hashlib
 import json
+import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from harness_workbench.rag.chunking import CHUNK_STRATEGIES
 from harness_workbench.rag.query import rewrite_query as harness_rewrite_query
@@ -39,6 +42,44 @@ class RagBaselineError(ValueError):
     def __init__(self, code: str, message: str):
         self.code = code
         super().__init__(message)
+
+
+def _resolve_main_project_root(explicit: Path | str | None) -> Path:
+    """Resolve the main project root explicitly (argument -> QLH_MAIN_PROJECT_ROOT -> cwd)."""
+    if explicit is not None:
+        candidate = Path(explicit)
+    else:
+        env_value = os.environ.get("QLH_MAIN_PROJECT_ROOT", "").strip()
+        candidate = Path(env_value) if env_value else Path.cwd()
+    root = candidate.expanduser().resolve()
+    if not (root / "src" / "rag_store.py").is_file():
+        raise RagBaselineError(
+            "main_project_root_invalid",
+            "main project root must contain src/rag_store.py; pass main_project_root or set QLH_MAIN_PROJECT_ROOT",
+        )
+    return root
+
+
+@contextlib.contextmanager
+def _main_project_importable(root: Path) -> Iterator[None]:
+    """Temporarily put an explicitly resolved main-project root on sys.path.
+
+    The comparison intentionally imports the main project's ``src.rag_store``; the
+    explicit injection keeps that dependency visible instead of relying on the
+    ambient working directory or a pre-existing sys.path entry.
+    """
+    entry = str(root)
+    inserted = entry not in sys.path
+    if inserted:
+        sys.path.insert(0, entry)
+    try:
+        yield
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(entry)
+            except ValueError:
+                pass
 
 
 def _canonical(value: Any) -> bytes:
@@ -326,6 +367,7 @@ class RagBaselineReport:
 
 def run_rag_baseline(
     *,
+    main_project_root: Path | str | None = None,
     documents: Sequence[RagBaselineDocument] | None = None,
     cases: Sequence[RagBaselineCase] | None = None,
     top_k: int = 5,
@@ -342,7 +384,8 @@ def run_rag_baseline(
     case_set_digest = _digest([case.as_dict() for case in queries])
     with tempfile.TemporaryDirectory(prefix="qlh-rag-base-", ignore_cleanup_errors=True) as root:
         root_path = Path(root)
-        from src.rag_store import RagStore as MainRagStore
+        with _main_project_importable(_resolve_main_project_root(main_project_root)):
+            from src.rag_store import RagStore as MainRagStore
         from harness_workbench.rag.store import RagStore as HarnessRagStore
 
         main_store = MainRagStore(root_path / "main.sqlite", max_chunk_chars=1024, chunk_overlap_chars=80)
@@ -390,6 +433,7 @@ def run_rag_baseline(
 
 def run_rag_chunk_comparison(
     *,
+    main_project_root: Path | str | None = None,
     documents: Sequence[RagBaselineDocument] | None = None,
     cases: Sequence[RagBaselineCase] | None = None,
     top_k: int = 5,
@@ -408,7 +452,8 @@ def run_rag_chunk_comparison(
     comparisons: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="qlh-rag-chunk-") as root:
         root_path = Path(root)
-        from src.rag_store import RagStore as MainRagStore
+        with _main_project_importable(_resolve_main_project_root(main_project_root)):
+            from src.rag_store import RagStore as MainRagStore
         from harness_workbench.rag.store import RagStore as HarnessRagStore
 
         for strategy in sorted(CHUNK_STRATEGIES):
@@ -472,6 +517,7 @@ def run_rag_chunk_comparison(
 
 def run_rag_query_comparison(
     *,
+    main_project_root: Path | str | None = None,
     documents: Sequence[RagBaselineDocument] | None = None,
     cases: Sequence[RagBaselineCase] | None = None,
     top_k: int = 5,
@@ -489,7 +535,8 @@ def run_rag_query_comparison(
     case_set_digest = _digest([case.as_dict() for case in queries])
     with tempfile.TemporaryDirectory(prefix="qlh-rag-query-") as root:
         root_path = Path(root)
-        from src.rag_store import RagStore as MainRagStore
+        with _main_project_importable(_resolve_main_project_root(main_project_root)):
+            from src.rag_store import RagStore as MainRagStore
         from harness_workbench.rag.store import RagStore as HarnessRagStore
 
         main_store = MainRagStore(root_path / "main.sqlite", max_chunk_chars=1024, chunk_overlap_chars=80)
@@ -573,12 +620,13 @@ def _write_report(report: RagBaselineReport, json_path: Path | None, markdown_pa
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the offline dual-side RAG baseline")
     parser.add_argument("--input", type=Path, help="optional frozen baseline input JSON")
+    parser.add_argument("--main-project-root", type=Path, help="explicit main project root containing src/rag_store.py")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--json", type=Path, help="write redacted JSON report")
     parser.add_argument("--markdown", type=Path, help="write redacted Markdown report")
     args = parser.parse_args(argv)
     documents, cases = load_rag_baseline_input(args.input) if args.input else (None, None)
-    report = run_rag_baseline(documents=documents, cases=cases, top_k=args.top_k)
+    report = run_rag_baseline(main_project_root=args.main_project_root, documents=documents, cases=cases, top_k=args.top_k)
     _write_report(report, args.json, args.markdown)
     if args.json is None and args.markdown is None:
         print(report.to_markdown())

@@ -1,0 +1,132 @@
+{
+  "schema_version": "qlh.fixture_manifest.v1",
+  "fixture_root": "G:/C/PYT/qlh/fixtures",
+  "entry_count": 25,
+  "entries": [
+    {
+      "path": "experiment-plans/plan-model-fleet-explicit-pager-v1.json",
+      "sha256": "c698f6bdaf7d910597f6cd3d2f86eb59e882f911c7f2b67ffd79c4a28530c290",
+      "size_bytes": 2935
+    },
+    {
+      "path": "experiment-plans/plan-model-fleet-memory-transport-v1.json",
+      "sha256": "508ba05d931b6e9fa49c5f9560aa5f67fa5de33d89a45a701b9095c9c45160b3",
+      "size_bytes": 7970
+    },
+    {
+      "path": "experiment-plans/plan-model-fleet-n2f-fixed-tile-v1.json",
+      "sha256": "acaa74b6dcd8ae2d0287538e371163e7409939e56f46069c27833ff8196c86df",
+      "size_bytes": 3032
+    },
+    {
+      "path": "experiment-plans/plan-model-fleet-n2p-latency-v1.json",
+      "sha256": "b8a89c8410ab52162259bd35dbe5f0b9a4e72cedc7122dd6faaed5e1d11bce34",
+      "size_bytes": 3130
+    },
+    {
+      "path": "experiment-plans/plan-model-fleet-n2r-artifact-gate-v1.json",
+      "sha256": "aede862d00fcf8359a599abb1e52771eb73cfa138b01ff8d9fb1ae583a1bfd2d",
+      "size_bytes": 2302
+    },
+    {
+      "path": "experiment-plans/plan-model-fleet-n2r-real-compare-v1.json",
+      "sha256": "1205966be2bdd01a736594b6ce07cd39c3638e7aa1bf8a88daaf659d0821bf23",
+      "size_bytes": 4292
+    },
+    {
+      "path": "experiment-plans/plan-quality-deepseek-r1-qwen-7b-calibration-v1.json",
+      "sha256": "66323e22bcb287da8ed0fb18bbeb19b5cd97ff8169f15ef5d244ca8c30310fb4",
+      "size_bytes": 6792
+    },
+    {
+      "path": "experiment-plans/plan-quality-gemma-bridge-fixture-v1.json",
+      "sha256": "83c252b241b146b464cf5b2a9180ba4d6b508d369155a1d1b5c4c534cb449ec6",
+      "size_bytes": 1854
+    },
+    {
+      "path": "experiment-plans/plan-quality-qwen-1.8b-calibration-v1.json",
+      "sha256": "30fe9ac871a811d5536da36040ccad877e59d02f72b7be079233711ef71c31b6",
+      "size_bytes": 5421
+    },
+    {
+      "path": "experiment-plans/plan-quality-qwen-1.8b-q4-v2.json",
+      "sha256": "11c2ebabf0d4b1af9ca1da28392286a0997e95eaae6952f4c5be7532a6d8069e",
+      "size_bytes": 2809
+    },
+    {
+      "path": "experiment-plans/plan-quality-qwen3-4b-calibration-v1.json",
+      "sha256": "88d3b142fb1016e86f1fdc3acb2b5309db20872aa7aba83aef5a44ac701afb20",
+      "size_bytes": 6713
+    },
+    {
+      "path": "experiment-plans/plan-quality-qwen3-4b-calibration-v2.json",
+      "sha256": "b4a4b88550cd7262b6af2c807a30da966388651a32d75b8e0029e125bd10b3d7",
+      "size_bytes": 6588
+    },
+    {
+      "path": "experiment-plans/plan-quality-qwen35-9b-dsv4-calibration-v2.json",
+      "sha256": "7764c7c3bd7976bafba09c253e865ad210dfdba624af223ab86d45a32c8c9a50",
+      "size_bytes": 6861
+    },
+    {
+      "path": "experiment-plans/plan-quality-sd-gemma-calibration-v1.json",
+      "sha256": "a3b56e444d94eb92288b7a487d54f5b018fca5024e1255bc64704b8efed2e7d6",
+      "size_bytes": 8015
+    },
+    {
+      "path": "experiment-plans/plan-quality-sd15-bridge-fixture-v1.json",
+      "sha256": "4618683548efeca914eddf4edce0aae803f57eb7a6a6d733a32d03e3f2c18475",
+      "size_bytes": 1666
+    },
+    {
+      "path": "experiment-plans/plan-quality-total-gate-v1.json",
+      "sha256": "a61947e197c31eaf8662712ea5713483fe8add365f3fba2aa45f329e05d71398",
+      "size_bytes": 5361
+    },
+    {
+      "path": "experiment-plans/plan-quant-qwen-1.8b-v1.json",
+      "sha256": "d9d15383f19d460b3c3bc9dd548a83a21d454e625b20b88c73e1ef5f216f6450",
+      "size_bytes": 4277
+    },
+    {
+      "path": "prompt_sets/ps-qwen3-nothink/prompts.jsonl",
+      "sha256": "c55caa2a1a5348924624c6aadec912eb4808aff7468b6b21c0f13c0a14d554a9",
+      "size_bytes": 6078
+    },
+    {
+      "path": "prompt_sets/ps-sd-v1/prompts.jsonl",
+      "sha256": "8b1775e0d64e357a854a62870ca7e3c2f58667d96219773d03374bf41ecfabd6",
+      "size_bytes": 1348
+    },
+    {
+      "path": "prompt_sets/ps-v1-zh-en-code/prompts.jsonl",
+      "sha256": "8cc555f57fa23d45c16820f77cc90b507da04578a1e90eebf46e19d4eb2568a3",
+      "size_bytes": 5348
+    },
+    {
+      "path": "quality_rubrics/gemma-judge-counts-v1.json",
+      "sha256": "be7bcea3e736e0009c2ff3e110f54309263a960e2b6ae892e3c5de7a302e4374",
+      "size_bytes": 709
+    },
+    {
+      "path": "quality_rubrics/llm-objective-ps-v1-ds3-chatml-v1.json",
+      "sha256": "a7211aa8ef71ed33bd7a0ea21435f0afb903aa6fb1ced60f4c66bf5f69defdab",
+      "size_bytes": 2470
+    },
+    {
+      "path": "quality_rubrics/llm-objective-ps-v1-qwen3-nothink-v1.json",
+      "sha256": "032a1583302da5d08d5a4450cbe161d8daa7a197c3dcf46f6480b64ebdff6f1e",
+      "size_bytes": 2493
+    },
+    {
+      "path": "quality_rubrics/llm-objective-ps-v1-v1.json",
+      "sha256": "5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
+      "size_bytes": 2100
+    },
+    {
+      "path": "quality_rubrics/llm-objective-ps-v1-v2.json",
+      "sha256": "14d13d9d0eed02e29c62cf625653d7547dc6b5fe00c55cb60517642a93a60525",
+      "size_bytes": 2459
+    }
+  ]
+}
