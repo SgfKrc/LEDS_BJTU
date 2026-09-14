@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .venv/
 .venv-test/
+.venv-edge/
 venv/
 env/
 
@@ -128,3 +129,6 @@ models/qwen2.5-0.5b-instruct/
 models/minicpm4-0.5b/
 models/distilqwen25-ds3-0324-7b/
 models/.*.qlh-import-*/
+
+# frontend_cybergothic: abandoned (kept locally, no longer maintained)
+frontend_cybergothic/

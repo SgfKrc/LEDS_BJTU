@@ -1,8 +1,8 @@
 """Small-model harness image workbench.
 
-The package is intentionally independent from ``src/``.  It owns the stable
-request/asset contracts and delegates actual image generation to either an
-injected local executor or a narrow QLH HTTP transport.
+The package is intentionally independent from ``src/``.  It is Koakumix's
+image-generation boundary and delegates execution to an injected local
+executor.
 """
 
 from .assets import ImageAssetRecord, ImageAssetStore
@@ -16,12 +16,10 @@ from .contracts import (
 )
 from .local_engine import LocalImageEngine, LocalImageEngineConfig
 from .manifest import AssetManifestReport, validate_asset_manifest
-from .remote_qlh import HttpRemoteQLHTransport, RemoteQLHConfig, RemoteQLHImageAdapter
 
 __all__ = [
     "AssetManifestReport",
     "GeneratedImage",
-    "HttpRemoteQLHTransport",
     "ImageAdapter",
     "ImageAdapterCapabilities",
     "ImageAdapterError",
@@ -31,7 +29,5 @@ __all__ = [
     "ImageRequestError",
     "LocalImageEngine",
     "LocalImageEngineConfig",
-    "RemoteQLHImageAdapter",
-    "RemoteQLHConfig",
     "validate_asset_manifest",
 ]

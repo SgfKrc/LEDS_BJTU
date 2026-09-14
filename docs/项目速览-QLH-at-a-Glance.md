@@ -84,7 +84,7 @@ python -c "import src.api_server"                                   # 后端可�
 
 - **主计划**：[总体下一步计划](总体下一步计划.md)（唯一排期入口）· [项目进展与下一步计划](archive/项目进展与下一步计划.md)（证据快照）
 - **新人入门**：[项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
-- **子项目**：[harness 方案](小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [联网工具调研](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
+- **子项目**：[harness 方案](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [联网工具调研](archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
 - **实验与判题**：[DS3 替代 R1 专项](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [亚1B 专项](亚1B小模型专项实验计划.md) · [测试与评判标准](测试与评判标准.md)
 
 ## 工程文化

@@ -26,6 +26,10 @@
   1. 纯核心（verify_draft_tokens / residual_distribution / sample_from_probs）
      只依赖 numpy，无 torch、无网络、RNG 可注入 —— 这是唯一必须"可证明正确"
      的部分，也是唯一被 Monte-Carlo 校验的部分。
+     ⚠️ 工程前提（2026-09-14 实测）：draft 与 verify **必须共享 tokenizer**——
+     跨系组合（如 QwenSeek-2B 的 token id 喂 Qwen3-4B）会在 decode 阶段词表越界
+     （llama_decode 返回 -1）；另 llama-cpp-python 的 logprobs 需 logits_all=True
+     （scores ≈ n_ctx×V×4B，双模型场景需把 n_ctx 压到 128/256）。
   2. SpeculativeSession 是状态机，draft 侧是**注入的可调用对象**
      `(context_ids, gamma) -> (tokens, probs)`，因此既能用假 draft 模型单测，
      也能在具备真实 PyTorch 运行时后直接接上 model_module 的解码循环。

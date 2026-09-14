@@ -16,6 +16,8 @@
 依赖: socket, threading, json, torch
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import socket
@@ -34,7 +36,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Callable
 
-import torch
+try:  # torch is optional: the edge runtime omits it; tensor APIs then fail closed
+    import torch
+except ImportError:  # pragma: no cover - exercised by the edge venv
+    torch = None  # type: ignore[assignment]
+
+
+def _require_torch():
+    """Return the torch module or fail closed (edge runtime has no torch)."""
+    if torch is None:
+        raise ConnectionError("tensor transport requires torch; the edge runtime omits it")
+    return torch
+
 
 from config import (
     SERVER_IP, SERVER_PORT, HEARTBEAT_INTERVAL,
@@ -740,14 +753,14 @@ def recv_exact(sock: socket.socket, n: int, mid_frame: bool = False) -> Optional
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
     """将张量序列化为字节流（torch.save 到内存 buffer）"""
     buffer = io.BytesIO()
-    torch.save(tensor, buffer)
+    _require_torch().save(tensor, buffer)
     return buffer.getvalue()
 
 
 def deserialize_tensor(data: bytes) -> torch.Tensor:
     """从字节流反序列化为张量（torch.load 从内存 buffer）"""
     buffer = io.BytesIO(data)
-    return torch.load(buffer)
+    return _require_torch().load(buffer)
 
 
 # ---- 高速序列化路径（流水线隐藏状态传输优化） ----
@@ -780,7 +793,7 @@ def serialize_tensor_fast(tensor: torch.Tensor) -> bytes:
     if nbytes < 1_000_000:
         # 小张量：torch.save（兼容性好）
         buf = io.BytesIO()
-        torch.save(tensor_cpu, buf)
+        _require_torch().save(tensor_cpu, buf)
         payload = buf.getvalue()
         return b'TNR1' + payload
     else:
@@ -823,7 +836,7 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
     if magic == b'TNR1':
         # 小张量路径
         buf = io.BytesIO(data[4:])
-        return torch.load(buf)
+        return _require_torch().load(buf)
     elif magic == b'TNR0':
         # 大张量路径
         import numpy as np
@@ -849,11 +862,11 @@ def deserialize_tensor_fast(data: bytes) -> torch.Tensor:
         # 重建张量
         raw = data[offset:]
         arr = np.frombuffer(raw, dtype=dtype).reshape(shape)
-        return torch.from_numpy(arr.copy())  # copy 确保内存连续
+        return _require_torch().from_numpy(arr.copy())  # copy 确保内存连续
     else:
         # 未知格式，回退到 torch.load（weights_only 防 pickle 注入）
         buf = io.BytesIO(data)
-        return torch.load(buf, weights_only=True)
+        return _require_torch().load(buf, weights_only=True)
 
 
 # ================================================================
@@ -873,7 +886,7 @@ def build_message(msg_type: MessageType, data: Any = None) -> bytes:
     """
     meta = {"type": msg_type.value}
 
-    if isinstance(data, torch.Tensor):
+    if torch is not None and isinstance(data, torch.Tensor):
         meta["format"] = "tensor"
         tensor_bytes = serialize_tensor(data)
         meta_bytes = json.dumps(meta).encode("utf-8")
