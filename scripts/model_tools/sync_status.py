@@ -21,7 +21,7 @@ IGNORED_FILE_NAMES = {
     "model.sha256.meta.json",
 }
 IGNORED_FILE_SUFFIXES = {".part", ".tmp", ".sha256", ".pyc"}
-ASSET_KINDS = {"gguf", "model_file", "diffusion", "pytorch", "model_directory"}
+ASSET_KINDS = {"gguf", "model_file", "pytorch", "model_directory"}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -48,8 +48,6 @@ def _safe_relative(path: Path, root: Path) -> str:
 
 def _ignore_file(path: Path) -> bool:
     name = path.name.lower()
-    if name == ".qlh-sd-asset.json":
-        return False
     return (
         name.startswith(".")
         or name in IGNORED_FILE_NAMES
@@ -113,8 +111,6 @@ def _asset_kind(asset: Path, files: list[Path]) -> str:
         return "gguf" if asset.suffix.lower() == ".gguf" else "model_file"
     relative_names = {_safe_relative(item, asset) for item in files}
     suffixes = {item.suffix.lower() for item in files}
-    if ".qlh-sd-asset.json" in relative_names or "model_index.json" in relative_names:
-        return "diffusion"
     if suffixes & WEIGHT_SUFFIXES:
         return "pytorch"
     return "model_directory"

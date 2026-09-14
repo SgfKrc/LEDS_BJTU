@@ -19,7 +19,7 @@ from .quality import QualityEvidenceError, normalize_quality_evidence
 
 
 PRODUCTION_QUALITY_SCHEMA_VERSION = "qlh.experiment_quality.production_gate.v1"
-_QUALITY_CHECKS = {"llm", "sd", "gemma_judge"}
+_QUALITY_CHECKS = {"llm", "gemma_judge"}
 
 
 def _reason(
@@ -173,7 +173,7 @@ def _stored_quality_to_raw(
     schema = quality.get("schema_version")
     required_keys = {
         "schema_version", "status", "not_collected_reason", "correct_rate",
-        "format_rate", "llm", "sd",
+        "format_rate", "llm",
     }
     if schema == "qlh.experiment_quality.v2":
         required_keys.add("gemma_judge")
@@ -203,41 +203,6 @@ def _stored_quality_to_raw(
             "format": formatting,
         }
         seen_checks.add("llm")
-
-    sd = quality.get("sd")
-    if sd is not None:
-        item = _strict_mapping(
-            sd,
-            {
-                "mode", "asset_id", "artifact_id", "source_schema_version",
-                "automatic_gate", "manual_review",
-            },
-        )
-        automatic = (
-            _strict_mapping(
-                item.get("automatic_gate"),
-                {"status", "output_count", "unique_output_count"},
-            )
-            if item else None
-        )
-        manual = _raw_manual_review(item.get("manual_review")) if item else None
-        if item is None or automatic is None or manual is None:
-            return None
-        if automatic["status"] not in {"passed", "failed"}:
-            return None
-        raw["sd"] = {
-            "mode": item["mode"],
-            "asset_id": item["asset_id"],
-            "artifact_id": item["artifact_id"],
-            "source_schema_version": item["source_schema_version"],
-            "automatic_gate": {
-                "passed": automatic["status"] == "passed",
-                "output_count": automatic["output_count"],
-                "unique_output_count": automatic["unique_output_count"],
-            },
-            "manual_review": manual,
-        }
-        seen_checks.add("sd")
 
     gemma = quality.get("gemma_judge")
     if gemma is not None:

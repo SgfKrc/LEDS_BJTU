@@ -27,22 +27,13 @@ RUNNER_SCHEMA_VERSION = "qlh.simulation_runner.v1"
 QUICK_TEST_TARGETS = (
     "tests/test_task_graph_simulation.py",
     "tests/test_task_worker_control_simulation.py",
-    "tests/test_diffusion_data_plane_simulation.py",
-    "tests/test_mixed_workflow_simulation.py",
     "tests/test_capacity_simulation.py",
 )
 EXTENDED_TEST_TARGETS = QUICK_TEST_TARGETS + (
     "tests/test_task_graph_parallel.py",
     "tests/test_task_graph_fencing.py",
     "tests/test_task_worker_protocol.py",
-    "tests/test_task_worker_protocol_v3.py",
     "tests/test_task_worker_adapter.py",
-    "tests/test_diffusion_worker_adapter.py",
-    "tests/test_diffusion_data_plane.py",
-    "tests/test_diffusion_transfer.py",
-    "tests/test_diffusion_coordinator_runtime.py",
-    "tests/test_diffusion_distributed.py",
-    "tests/test_diffusion_task_graph_api.py",
 )
 FULL_TEST_TARGETS = ("tests",)
 
@@ -167,14 +158,6 @@ def _collect_evidence() -> list[dict[str, Any]]:
         CapacitySimulationHarness,
         available_scenarios as available_capacity_scenarios,
     )
-    from tests.simulation.diffusion_data_plane_harness import (
-        DiffusionDataPlaneSimulationHarness,
-        available_scenarios as available_data_plane_scenarios,
-    )
-    from tests.simulation.mixed_workflow_harness import (
-        MixedWorkflowSimulationHarness,
-        available_scenarios as available_mixed_workflow_scenarios,
-    )
     from tests.simulation.task_graph_harness import (
         TaskGraphSimulationHarness,
         available_scenarios as available_task_graph_scenarios,
@@ -187,8 +170,6 @@ def _collect_evidence() -> list[dict[str, Any]]:
     families = (
         ("task_graph", TaskGraphSimulationHarness, available_task_graph_scenarios),
         ("task_worker_control", TaskWorkerControlSimulationHarness, available_task_worker_scenarios),
-        ("diffusion_data_plane", DiffusionDataPlaneSimulationHarness, available_data_plane_scenarios),
-        ("mixed_workflow", MixedWorkflowSimulationHarness, available_mixed_workflow_scenarios),
         ("capacity", CapacitySimulationHarness, available_capacity_scenarios),
     )
     evidence: list[dict[str, Any]] = []

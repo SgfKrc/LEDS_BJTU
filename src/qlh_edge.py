@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field  # noqa: E402
 EDGE_BASELINE = {
     "edition": "edge",
     "runtime_whitelist": ["llama-cpp-python", "fastapi", "uvicorn", "psutil", "httpx"],
-    "excluded": ["torch", "transformers", "accelerate", "diffusers", "multimodal", "rag", "tui"],
+    "excluded": ["torch", "transformers", "accelerate", "multimodal", "rag", "tui"],
     "venv_budget_mb": 300,
     "cold_start_budget_s": 15,
 }

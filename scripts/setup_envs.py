@@ -138,16 +138,13 @@ ENVS: tuple[PyEnv, ...] = (
     ),
     PyEnv(
         name="packaging-cuda",
-        description="独显版打包 + SD 侧车（.venv-packaging-cuda；torch CUDA + PyInstaller）",
+        description="独显版打包（.venv-packaging-cuda；torch CUDA + PyInstaller）",
         venv_dir=".venv-packaging-cuda",
-        requirements=(
-            "packaging/requirements-cpu.txt",
-            "packaging/requirements-sd15.txt",
-        ),
+        requirements=("packaging/requirements-cpu.txt",),
         lock_file="packaging-cuda.lock.txt",
         needs_torch=True,
         extra_packages=("pyinstaller",),
-        required_modules=("torch", "diffusers", "PyInstaller"),
+        required_modules=("torch", "PyInstaller"),
         python_version_hint="3.12",
     ),
 )

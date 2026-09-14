@@ -5,7 +5,7 @@
 > 更新日期：2026-08-23
 > 适用范围：Android Full/Lite 相对 PC 版（Windows/Linux 主节点）缺失功能的**全面排查清单**，供排期与任务分配使用；能力现状依据 [Android 版本远期计划](archive/Android版本远期计划.md)（2026-07-28 基线 + C5 真机验收）、README 与源码
 
-> 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、远程 SD、主节点 GGUF Range/SHA 下载、bootstrap 和带 lease 的 presence；Android Full Worker 已进入 PC scheduler 准入门，并已用可注入 executor 接入任务图 Stage contract；Full 原生构建已接入 Gemma4 `mtmd` projector/图像路径（fake/journal/JVM/交叉编译开发回归通过）。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。
+> 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、主节点 GGUF Range/SHA 下载、bootstrap 和带 lease 的 presence；Android Full Worker 已进入 PC scheduler 准入门，并已用可注入 executor 接入任务图 Stage contract；Full 原生构建已接入 Gemma4 `mtmd` projector/图像路径（fake/journal/JVM/交叉编译开发回归通过）。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。图像生成已从 QLH 主项目裁撤，Koakumix 独占生图能力，Android 不再规划远程 QLH 生图入口。
 >
 > **2026-08-23 界面复核补充**：Android 继续采用原生 Material 3 极简风（深色黑底白字、浅色白底黑字、四个底部导航页），不迁移 PC 赛博哥特 canvas/三栏工作台；这是触控、小屏、耗电与可读性优先的产品决定。PC 的新赛博哥特前端已有 pywebview 独立启动器，`CY-PKG-01` 已将默认后端静态页和标准安装包输入统一为 `frontend_cybergothic/dist`；旧 `frontend/dist` 只保留显式兼容覆盖，真实包首启归 E8。完整证据与页面映射见《桌面赛博哥特与安卓原生界面复核-2026-08-23》。
 >
@@ -16,16 +16,16 @@
 | 类别 | PC 版能力 | 安卓现状 | 差距等级 |
 |---|---|---|---|
 | 多模态（图像理解） | Gemma 4 12B 图生文（原生 MTMD + Ollama 双轨） | Full 已有相册/远程图片与本地 `mtmd`/mmproj 开发路径；真实设备 RAM、语义、多图与长时未验收，Lite fail-closed | 🔴 大 |
-| 多模态（图像生成） | SD 1.5 全套（文生图/图生图/IP-Adapter/inpaint/指令编辑） | 本地不做；远程 SD 请求、图片/结果和轮询取消已有开发路径，真实 PC SD/设备验收未完成 | 🟡 中（远程子集） |
+| 多模态（图像生成） | **主项目不提供** | Android 不提供 QLH 生图入口；需要生图时使用 Koakumix | 不纳入 QLH |
 | 分布式参与 | 层流水线 Worker、任务链/任务图、TP 孤岛、外部服务、推测解码 | ⚠️ Android Full Worker 准入与 Stage executor 开发门已完成；真实设备/认证/长时仍未验收 | 🔴 大（需设备验收与运行时质量门） |
 | 模型管理 | MODEL-TOOLS 全套（导入向导/GGUF 转换/受管下载/注册表/扫描） | SAF 本地目录 + 主节点 GGUF Range/SHA/续传下载开发路径；无完整模型注册表/来源许可/多工件管理 | 🟠 中 |
-| 模型能力梯度 | Qwen 1.8B / Qwen3-4B / Gemma4 12B / SD 多模型并存 | Full 单次一个 GGUF（llama.cpp CPU） | 🟠 中 |
-| 实验与判题 | EX-N3 判题（LLM/Gemma/SD 自动门）、标定、质量总 gate | ❌ 无实验入口 | 🟠 中 |
+| 模型能力梯度 | Qwen 1.8B / Qwen3-4B / Gemma4 12B 多模型并存 | Full 单次一个 GGUF（llama.cpp CPU） | 🟠 中 |
+| 实验与判题 | EX-N3 判题（LLM/Gemma）、标定、质量总 gate | ❌ 无实验入口 | 🟠 中 |
 | 用户/凭据管理 | control auth（bootstrap/恢复码/DPAPI token/多用户） | Keystore 登录/会话开发路径已具备；无 Auth App 引导、恢复码、成员/Tailscale 管理产品页 | 🟠 中 |
 | 抗弱网 | TCP 直连专线/WSS/ICE-TCP（计划）、重试与续传 | 基础 HTTP + IPv6 地址选择 | 🟡 小-中 |
 | 运维工具 | TUI 管理、跨节点日志聚合（qlh log）、健康门 | 设置中已有有界脱敏日志、连接诊断与更新开发路径；无 TUI/跨节点运营工作台 | 🟡 中 |
 | 更新与数据 | Launcher A/B 自更新、Ed25519 签名、跨卷数据保留 | APK 更新清单、下载/校验/安装权限开发路径已具备；真实更新源、商店/安装和长时日志未验收 | 🟡 中 |
-| Web 管理面 | 模型舰队、SD 图像工作区、任务图、用户管理、设置 API | 四个原生页（对话/图像/会话/设置）；无桌面运营控制面 | 🟡 中 |
+| Web 管理面 | 模型舰队、任务图、用户管理、设置 API | 四个原生页（对话/会话/设置等）；无桌面运营控制面 | 🟡 中 |
 | 前端工程 | 双语 README、E2E 测试套件 | Full/Lite JVM、AndroidTest 与原生交叉编译开发门；设备视觉/可用性验收后置 | 🟡 小（验收覆盖） |
 
 ## 2. 逐项差距明细
@@ -37,10 +37,10 @@
 - 安卓：已具备相册选择、压缩与远程图片发送；Full `qlh_llama_jni.cpp` 已接入 `mtmd` projector 生命周期、受限内存图片解码和 chunk forward，并由 Gemma4 资产/vision capability 闸门控制；Lite 仍保持 fail-closed。
 - 差距点：① Gemma4 原生 ~7.3GB GGUF+mmproj 在 Android RAM 上的加载与采样验收；② 真机图片语义、多图和长时温控验收；③ 发布包/设备资源门仍不得因交叉编译通过而自动放开。
 
-**A2 图像生成（SD 1.5）——走远程推理**
-- PC：完整图像工作区（五资产 15GB，全部自动质量门通过）。
-- 安卓：**本地不做**——图像生成全丢给 PC 主节点：安卓 UI 发起生成请求（提示词/参考图上传）→ 主节点 SD 工作区执行（质量门照常）→ 结果图回传显示。
-- 差距点：① 已有远程生成/图片上传/结果回传与轮询取消开发路径，仍需真实 PC SD、设备网络和长任务验收；② 缺桌面资产目录、许可证/导入、Inpaint/指令编辑、四宫格工作流与分布式遥测操作面；③ 不要求安卓本地 SD 任何能力（省资源）。
+**A2 图像生成——不属于 QLH 主项目**
+- QLH：已移除 SD 引擎、生成 API、任务协议、资产和前端工作区。
+- Android：不提供本地或远程 QLH 生图入口。
+- Koakumix：独占 `/v1/images/generations`、本地生图资产与执行器；与 QLH 的图片输入/多模态理解边界分离。
 
 ### 🔴 B. 分布式参与（需协议，路线 A/B 未实施）
 
@@ -86,7 +86,7 @@
 | **P2** | C 应用内模型下载 + SHA 校验 | 免人工放文件；配合整合包安卓版（纯 GGUF）分发 | 需 serve 分发端点（已有） |
 | **P2** | E 凭据管理（Keystore + 连接 token） | 主节点开 auth 后安卓无法直连（现状缺口） | 需 control auth 的安卓客户端流程 |
 | **P3** | F 应用内更新/日志 | 运维体验 | 无 |
-| **不做** | ~~本地判题~~ / 安卓本地图像生成 | 判题与 SD 生成都留在 PC 侧，安卓不承担 | — |
+| **不做** | ~~本地判题~~ / 安卓本地图像生成 / 远程 QLH 生图 | QLH 不保留生图实现；Koakumix 独立承担 | — |
 
 ## 3.1 Android 分票排期（2026-08-17）
 
@@ -104,8 +104,8 @@
 | **AND-API-03** | P1 | Android Full Worker 统一 Stage executor、模型门、有界输入和 journal provenance | AND-B-03 | **开发完成；真实 Android 推理、网络和长时验收后置** |
 | **AND-API-04** | P1 | Full `mtmd`/Gemma4 mmproj projector 生命周期、内存图片解码、MTMD chunk forward 与 bounded generation | AND-A1-03；无需真机开发 | **开发完成；真实设备 RAM、图片质量和长时验收后置；Lite 不提供本地多模态** |
 | **AND-API-05** | P2 | Android 更新检查/下载/安装权限、脱敏日志导出/上报和连接健康诊断 | AND-C-01、AND-E-01 | **开发完成；真实 APK/商店、更新源和真机网络验收后置** |
-| **AND-A2-01** | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | **开发完成；真实 PC SD/设备验收后置** |
-| **AND-A2-02** | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | **开发完成；真实 PC SD/设备验收后置** |
+| **AND-A2-01** | P2 | 远程 SD 生成 DTO、上传/任务状态轮询与取消 | PC SD API | **已取消（2026-09-14）：主项目裁撤生图，需求转 Koakumix** |
+| **AND-A2-02** | P2 | SD 结果下载、缩略图/失败状态 UI | AND-A2-01 | **已取消（2026-09-14）：主项目裁撤生图，需求转 Koakumix** |
 | **AND-C-01** | P2 | 主节点模型清单、下载进度、SHA-256 校验与断点续传 | 主节点分发 API | **开发完成；真实大文件/断网/SAF 提供器验收后置** |
 | AND-E-01 | P2 | Auth/Keystore token 保存、轮换与登出清理 | 主节点 auth API | **客户端开发完成；真实 auth API/真机验收后置** |
 | AND-F-01 | P3 | 应用更新、日志上传与连接健康诊断 | Launcher/日志 API | **开发完成（f05bcf3）；真实安装/更新/日志链路验收后置** |
@@ -157,7 +157,7 @@
 | 2026-08-18 | AND-E-01 客户端开发门完成：Android Keystore-backed session store 已接入 ApiClient，登录/会话校验/登出、Bearer 注入、401 清理和 Authorization 日志脱敏均已实现；JVM contract tests 覆盖登录、授权头、失效会话和离线登出。AND-F-01 核对确认已由 f05bcf3 交付。真实 auth API、安装更新与设备验收后置。 |
 | 2026-08-17 | AND-C-01 已完成：Android Full 设置页新增主节点 GGUF 目录、进度与校验状态，下载落入用户授权 SAF 目录并支持严格 Range 续传、大小/SHA-256 校验和 `.part` 提升；PC 清单移除绝对目录泄露并增加 Range 契约测试；Full/Lite JVM、AndroidTest Kotlin 编译和 PC 安全边界测试通过，真实大文件/断网/SAF 提供器验收后置 |
 | 2026-08-17 | AND-A2-02 已完成：新增 Android 图像导航页、提示词/反向提示词/步数表单、参考图选择与预览、远程生成/变体提交、任务取消、结果 blob 32 MiB 有界下载和 1024px 缩略图展示；补齐状态机、ApiClient 下载和 Compose 契约测试，Full/Lite JVM 与 Full AndroidTest Kotlin 编译通过，真实 PC SD/网络/设备验收后置 |
-| 2026-08-17 | AND-A2-01 已完成：Android `ApiClient` 接入 PC `/api/diffusion/generate`、`/edit`、`/blobs`、`/jobs/{id}` 与取消端点，新增 snake_case DTO、16 MiB 上传限制、multipart 参考图/遮罩上传、有限终态轮询和协程取消传播；Full/Lite 全量 JVM 单测、远程 SD 契约测试与 Full AndroidTest Kotlin 编译通过，真实 PC SD/设备验收后置 |
+| 2026-08-17 | AND-A2-01 历史记录 | 原 Android 远程 SD API/DTO/页面链路已于 2026-09-14 随主项目生图裁撤删除；当前 Android 保留图片上传与 Gemma/Qwen 多模态理解，生图由 Koakumix 负责 |
 | 2026-08-17 | AND-B-03 已完成：新增 Android `ServerSocket` 双向 task-worker framing/hello-ack/UTF-8 result 契约测试、非法 outer frame 拒绝测试和 PC `tcp_comm` length-prefix 对照测试；Full/Lite JVM、PC 23 项协议/wire 专项与 Full AndroidTest Kotlin 编译通过，真实认证、scheduler 准入和设备验收后置 |
 | 2026-08-22 | AND-API-02 已完成本机开发：PC scheduler 开放注册 Android Full Worker，但要求节点类型/worker kind 对齐；provider 引入显式 resource gate、精确模型身份和单并发门；Android Service 增加模型身份/资源门能力构建器，fake worker `63 passed`，真实认证、温控/电量和设备验收后置 |
 | 2026-08-22 | AND-API-03 已完成本机开发：Android Full Worker 接入可注入 Stage executor 并绑定本地 `InferenceService`；Python fake provider + SQLite journal 验证 offer/result 与 attempt provenance，Full/Lite JVM 单测通过；真实 Android 执行、网络和长时验收后置 |

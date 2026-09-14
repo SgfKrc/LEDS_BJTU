@@ -23,7 +23,6 @@ _NOT_COLLECTED_REASONS = {
     "source_unavailable",
     "pending_evaluation",
 }
-_SD_MODES = {"text_to_image", "img2img", "ip_adapter", "inpaint", "instruction"}
 _MANUAL_REVIEW_STATUSES = {"passed", "failed", "pending", "not_required"}
 _MAX_COUNT = 1_000_000_000
 
@@ -60,13 +59,6 @@ def _count(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= _MAX_COUNT:
         raise QualityEvidenceError(f"{label} must be an integer in range")
     return value
-
-
-def _report_count(value: Any, label: str) -> int:
-    """Read a count or count a report list without retaining its contents."""
-    if isinstance(value, list):
-        return _count(len(value), label)
-    return _count(value, label)
 
 
 def _rate(raw: Any, label: str) -> dict[str, Any]:
@@ -109,70 +101,6 @@ def _normalize_llm(raw: Any, expected_prompt_set: Mapping[str, Any] | None) -> d
         "prompt_set_sha256": prompt_set_sha256,
         "correctness": _rate(value["correctness"], "llm.correctness"),
         "format": _rate(value["format"], "llm.format"),
-    }
-
-
-def _normalize_sd(raw: Any) -> dict[str, Any]:
-    value = _mapping(raw, "sd")
-    _only_keys(
-        value,
-        {
-            "mode",
-            "asset_id",
-            "artifact_id",
-            "source_schema_version",
-            "automatic_gate",
-            "manual_review",
-        },
-        "sd",
-    )
-    required = {
-        "mode", "asset_id", "artifact_id", "source_schema_version",
-        "automatic_gate", "manual_review",
-    }
-    if not required.issubset(value):
-        raise QualityEvidenceError("sd requires asset, gate, and manual-review evidence")
-    mode = value["mode"]
-    if mode not in _SD_MODES:
-        raise QualityEvidenceError("sd.mode is unsupported")
-    source_schema_version = _count(value["source_schema_version"], "sd.source_schema_version")
-    if source_schema_version != 1:
-        raise QualityEvidenceError("sd.source_schema_version must be 1")
-    automatic = _mapping(value["automatic_gate"], "sd.automatic_gate")
-    _only_keys(automatic, {"passed", "output_count", "unique_output_count"}, "sd.automatic_gate")
-    if not {"passed", "output_count", "unique_output_count"}.issubset(automatic):
-        raise QualityEvidenceError("sd.automatic_gate is incomplete")
-    if not isinstance(automatic["passed"], bool):
-        raise QualityEvidenceError("sd.automatic_gate.passed must be boolean")
-    output_count = _count(automatic["output_count"], "sd.automatic_gate.output_count")
-    unique_output_count = _count(
-        automatic["unique_output_count"], "sd.automatic_gate.unique_output_count",
-    )
-    if unique_output_count > output_count:
-        raise QualityEvidenceError("sd automatic unique_output_count exceeds output_count")
-    manual = _mapping(value["manual_review"], "sd.manual_review")
-    _only_keys(manual, {"status", "required_reviewers"}, "sd.manual_review")
-    if not {"status", "required_reviewers"}.issubset(manual):
-        raise QualityEvidenceError("sd.manual_review is incomplete")
-    if manual["status"] not in _MANUAL_REVIEW_STATUSES:
-        raise QualityEvidenceError("sd.manual_review.status is unsupported")
-    required_reviewers = _count(
-        manual["required_reviewers"], "sd.manual_review.required_reviewers",
-    )
-    return {
-        "mode": mode,
-        "asset_id": _identifier(value["asset_id"], "sd.asset_id"),
-        "artifact_id": _identifier(value["artifact_id"], "sd.artifact_id"),
-        "source_schema_version": source_schema_version,
-        "automatic_gate": {
-            "status": "passed" if automatic["passed"] else "failed",
-            "output_count": output_count,
-            "unique_output_count": unique_output_count,
-        },
-        "manual_review": {
-            "status": manual["status"],
-            "required_reviewers": required_reviewers,
-        },
     }
 
 
@@ -256,7 +184,6 @@ def not_collected_quality(reason: str = "not_provided") -> dict[str, Any]:
         "correct_rate": None,
         "format_rate": None,
         "llm": None,
-        "sd": None,
     }
 
 
@@ -269,7 +196,6 @@ def invalid_quality_evidence() -> dict[str, Any]:
         "correct_rate": None,
         "format_rate": None,
         "llm": None,
-        "sd": None,
     }
 
 
@@ -290,18 +216,16 @@ def normalize_quality_evidence(
     value = _mapping(raw, "quality_evidence")
     _only_keys(
         value,
-        {"llm", "sd", "gemma_judge", "not_collected_reason"},
+        {"llm", "gemma_judge", "not_collected_reason"},
         "quality_evidence",
     )
     llm_raw = value.get("llm")
-    sd_raw = value.get("sd")
     gemma_raw = value.get("gemma_judge")
-    if llm_raw is None and sd_raw is None and gemma_raw is None:
+    if llm_raw is None and gemma_raw is None:
         return not_collected_quality(str(value.get("not_collected_reason", "not_provided")))
     if value.get("not_collected_reason") is not None:
         raise QualityEvidenceError("collected evidence cannot carry not_collected_reason")
     llm = _normalize_llm(llm_raw, expected_prompt_set) if llm_raw is not None else None
-    sd = _normalize_sd(sd_raw) if sd_raw is not None else None
     gemma_judge = (
         _normalize_gemma_judge(gemma_raw, expected_gemma_judge)
         if gemma_raw is not None else None
@@ -315,52 +239,7 @@ def normalize_quality_evidence(
         "correct_rate": llm["correctness"]["rate"] if llm else None,
         "format_rate": llm["format"]["rate"] if llm else None,
         "llm": llm,
-        "sd": sd,
     }
     if gemma_judge is not None:
         normalized["gemma_judge"] = gemma_judge
     return normalized
-
-
-def sd_evidence_from_gate_report(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Make a normalized SD input from an existing SD quality-gate report.
-
-    Callers must explicitly choose to attach this returned value as result-file
-    quality evidence.  The adapter reads only fixed, non-prose report fields.
-    """
-    value = _mapping(report, "sd quality-gate report")
-    if value.get("schema_version") != 1:
-        raise QualityEvidenceError("sd quality-gate report schema_version must be 1")
-    automatic = _mapping(value.get("automatic_gate"), "sd quality-gate automatic_gate")
-    manual = _mapping(value.get("manual_gate"), "sd quality-gate manual_gate")
-    raw_status = value.get("status")
-    if raw_status in {"pending_manual_review", "partial_pass"}:
-        manual_status = "pending"
-    elif raw_status == "failed":
-        manual_status = "failed"
-    elif manual.get("passed") is True:
-        manual_status = "passed"
-    elif manual.get("passed") is False:
-        manual_status = "pending"
-    else:
-        manual_status = "not_required"
-    output_value = automatic.get("output_count", automatic.get("outputs", value.get("images", 0)))
-    unique_value = automatic.get(
-        "unique_output_count",
-        automatic.get("unique_images", automatic.get("unique_results", 0)),
-    )
-    return {
-        "mode": value.get("mode", "text_to_image"),
-        "asset_id": value.get("asset_id"),
-        "artifact_id": value.get("artifact_id"),
-        "source_schema_version": 1,
-        "automatic_gate": {
-            "passed": automatic.get("passed"),
-            "output_count": _report_count(output_value, "sd quality-gate output_count"),
-            "unique_output_count": _report_count(unique_value, "sd quality-gate unique_output_count"),
-        },
-        "manual_review": {
-            "status": manual_status,
-            "required_reviewers": manual.get("required_reviewers", 0),
-        },
-    }

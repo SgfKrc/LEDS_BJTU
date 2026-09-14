@@ -8,7 +8,7 @@
 
 ## 这是什么？
 
-QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。PC 主节点与从节点（PC/Surface/Android）通过 Tailscale 组网，按算力/内存/网络把模型分层协同推理；支持 PyTorch + llama.cpp 双引擎、INT4/INT8 量化、分页 KV 缓存、任务链编排、本地 RAG、SD 1.5 生图、Auth App 本地鉴权与多端客户端。核心设计原则：**数据不出集群、断网可自治、可复现验收**。
+QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。PC 主节点与从节点（PC/Surface/Android）通过 Tailscale 组网，按算力/内存/网络把模型分层协同推理；支持 PyTorch + llama.cpp 双引擎、INT4/INT8 量化、分页 KV 缓存、任务链编排、本地 RAG、多模态图像理解、Auth App 本地鉴权与多端客户端。核心设计原则：**数据不出集群、断网可自治、可复现验收**。图像生成不属于 QLH 主项目，由 Koakumix harness 独立提供。
 
 ## 已验证的能力
 
@@ -25,7 +25,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 
 ## 还不能宣称什么
 
-- 生产路由准入（`task_dispatch` 关闭）、长时多轮/断电恢复、真实 443/WSS、IPv6-only 安装包、SD 分布式跨机、真实 7B/12B 三节点峰值——均在后置验收队列，不能凭本机门或模拟结果声称通过。
+- 生产路由准入（`task_dispatch` 关闭）、长时多轮/断电恢复、真实 443/WSS、IPv6-only 安装包、真实 7B/12B 三节点峰值——均在后置验收队列，不能凭本机门或模拟结果声称通过。
 - 张量并行（TP）仅作集群外 PoC（路线 A）；投机解码为实验路径（路线 C）。
 
 ## 首次启动需要做什么
@@ -39,7 +39,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 | JDK 17 + Android SDK (API 34+) | — | 仅构建 Android 时需要 |
 | Tailscale | 最新 | 分布式模式必须（校园网可能阻断 UDP，会走中继） |
 | Git | — | clone（含 submodule） |
-| NVIDIA 驱动 + CUDA（可选） | — | 仅 PC 独显版 / SD 侧车需要 |
+| NVIDIA 驱动 + CUDA（可选） | — | 仅 PC 独显版需要 |
 
 ### 1. 克隆与一键配环境
 
@@ -53,7 +53,7 @@ python scripts/setup_envs.py --skip frontend  # 跳过旧前端（冻结对照�
 python scripts/setup_envs.py --check          # 只校验不安装（无副作用）
 ```
 
-**覆盖清单**：主环境 + `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar` / `.venv-packaging` / `.venv-packaging-cuda`（含 SD 侧车）；Node：`frontend_cybergothic`（唯一产品前端）/ `gateway` / `control`（旧 `frontend` 冻结，默认也装，可 `--skip frontend`）。
+**覆盖清单**：主环境 + `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar` / `.venv-packaging` / `.venv-packaging-cuda`；Node：`frontend_cybergothic`（唯一产品前端）/ `gateway` / `control`（旧 `frontend` 冻结，默认也装，可 `--skip frontend`）。Koakumix 的生图依赖只在其独立环境管理。
 
 > ⚠️ **torch 等平台相关大件不自动安装**：脚本自动过滤并打印各环境安装命令（如 `--torch-index-url https://download.pytorch.org/whl/cu126`），避免 CPU/CUDA 版本互相污染。按提示装完后再跑一次 `--check` 验证。
 
@@ -66,7 +66,7 @@ pip install modelscope && python -c "from modelscope import snapshot_download; s
 huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/
 ```
 
-其余模型（Qwen3-4B、Gemma 4、SD 1.5 五资产等）见 [README](../README.md)「克隆后资产获取清单 / 模型下载」；模型文件**不进 git**（`models/` 已 gitignore）。
+其余模型（Qwen3-4B、Gemma 4 等）见 [README](../README.md)「克隆后资产获取清单 / 模型下载」；模型文件**不进 git**（`models/` 已 gitignore）。Koakumix 生图资产不属于 QLH 主项目资产清单。
 
 ### 3. 启动与验证
 

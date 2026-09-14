@@ -7,7 +7,7 @@ rem  Usage: model-tools <command> [args...]
 rem         model-tools --help
 rem
 rem  打包版只承诺轻量子命令（inspect/verify/sweep/disk-usage/clean/
-rem  sync-status/gguf-convert 预检/sd15-lora-inspect）；需要 torch/
+rem  sync-status/gguf-convert 预检）；需要 torch/
 rem  transformers 的重型子命令请在源码或 sidecar 环境运行。
 rem ============================================================
 

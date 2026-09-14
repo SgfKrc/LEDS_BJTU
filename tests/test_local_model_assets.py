@@ -63,7 +63,7 @@ def test_discovery_ignores_incomplete_manifest_and_non_llm_directory(tmp_path):
         "asset": {"asset_id": "qwen3-4b"},
         "files": [{"path": "config.json"}, {"path": "missing.safetensors"}],
     })
-    non_llm = root / "diffusion"
+    non_llm = root / "non-llm-package"
     non_llm.mkdir()
     _write_json(non_llm / "config.json", {"model_type": "controlnet"})
     (non_llm / "model.safetensors").write_bytes(b"weights")

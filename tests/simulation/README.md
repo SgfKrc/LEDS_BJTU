@@ -2,7 +2,7 @@
 
 > 状态：现行测试入口；仿真框架存在不等于真实多设备流水线已经通过验收
 
-> 2026-08-12 起，默认自动化入口新增 `TaskGraphSimulationHarness`（`tests/test_task_graph_simulation.py`）、`TaskWorkerControlSimulationHarness`（`tests/test_task_worker_control_simulation.py`）、`DiffusionDataPlaneSimulationHarness`（`tests/test_diffusion_data_plane_simulation.py`）、`MixedWorkflowSimulationHarness`（`tests/test_mixed_workflow_simulation.py`）和 `CapacitySimulationHarness`（`tests/test_capacity_simulation.py`）：它们是无端口、无子进程、无真实模型的确定性 L1 预验证；v3 CAS、混合工作流和容量场景仅在临时本地状态目录持久化，容量报告不作性能结论。旧的 `python -m tests.simulation.test_*` 后端启动脚本保留为人工环境工具，不能被默认 pytest 结果或仿真报告替代。`SIM-N6` 已提供跨平台 `scripts/run_simulation.py`：`quick` 为默认 CI 契约，`extended` 和全量 `full` 必须显式选择，JSON 只包含聚合 pytest 计数和既有脱敏报告，且所有 profile 都不声称完成真实环境验收。
+> 2026-09-14 起，默认自动化入口包含 `TaskGraphSimulationHarness`（`tests/test_task_graph_simulation.py`）、`TaskWorkerControlSimulationHarness`（`tests/test_task_worker_control_simulation.py`）和 `CapacitySimulationHarness`（`tests/test_capacity_simulation.py`）：它们是无端口、无子进程、无真实模型的确定性 L1 预验证。图像生成数据面与混合工作流已从 QLH 主项目裁撤，生图测试归 Koakumix harness 所有。旧的 `python -m tests.simulation.test_*` 后端启动脚本保留为人工环境工具，不能被默认 pytest 结果或仿真报告替代。`SIM-N6` 已提供跨平台 `scripts/run_simulation.py`：`quick` 为默认 CI 契约，`extended` 和全量 `full` 必须显式选择，JSON 只包含聚合 pytest 计数和既有脱敏报告，且所有 profile 都不声称完成真实环境验收。
 
 端到端的仿真测试框架，验证分布式推理在真实环境下的可用性。
 

@@ -3,6 +3,7 @@
 > 状态：**调研完成，方案已定（S1 可启动）**；定位为**面向玩具/自用、但可复现可审计的小模型实验工作台**：核心不是再造一个通用 Agent，而是针对不同小模型做可验证的定制化适配（模板、上下文、工具协议、资源预算和角色分工），以低成本展现技术力、创新力与工程能力；不重写推理引擎，不把单一模型的经验冒充通用能力。**独立性 = 经 OpenAI 兼容 API 包装/反代对接后端，仅共享模型工件，不依赖主项目代码**
 >
 > 创建日期：2026-09-04
+> 边界更新（2026-09-14）：主项目 SD 生图路径已裁撤；Koakumix 是生图与编辑能力的唯一归属，旧 SD 计划仅作历史记录。本页中的旧 SD 路径仅用于历史演进说明。
 > 适用范围：计划中的"轻量 harness 子项目"（工作台形态、模型定制化、上下文管理与 API 包装层）；不覆盖引擎内核重写、完整训练平台、分布式调度内核。这里的“定制化”默认指推理时适配和配置编排，不等于未经证据的权重微调。与 [SD 1.5引擎与分布式图像生成实施计划](SD%201.5引擎与分布式图像生成实施计划.md)、[TUI 适配实施计划](../../docs/TUI适配实施计划.md) 的关系见 §3、§4、§6。
 
 ---
@@ -12,12 +13,12 @@
 成熟框架（Ollama、llama-server、Jan、LM Studio、text-generation-webui、Open WebUI）面向通用负载：调度好、性能好、生态好，但对**小模型（1-7B 级）的短板**几乎不设防：
 
 1. **上下文窗口"垃圾"**：小模型原生 ctx 常见 2k-32k，且量化后可用预算再缩水；长对话/长文档下，框架普遍**静默丢头**（Ollama 从最旧消息截断、无 API 通知），系统提示与工具定义先被丢弃（[ollama#14259](https://github.com/ollama/ollama/issues/14259)）。
-2. **生图/多模态割裂**：生图是独立工具（ComfyUI 等），与对话上下文、会话资产不连通。
+2. **生图/多模态割裂**：生图是独立工具（ComfyUI 等），与对话上下文、会话资产不连通；Koakumix 负责把两者接起来。
 3. **本地/远端体验不统一**：本机玩与连远端集群是两套入口。
 
 本子项目目标：做一个**轻量 harness 工作台**，把上述三件事收进一个工具——"小模型友好"的会话上下文管理 + 生图工作区 + 本地主节点/远端推理双模式。**明确不追求**在吞吐/延迟上追平 ollama/llama-server（玩具性质，性能现状即由所选后端决定）。
 
-**额外独立性目标**：子项目与主项目**低耦合**——harness 自己不 import 主项目任何模块，通过**包装/反代成主流 API 格式（OpenAI 兼容 `/v1`）**对外暴露，后端经可插拔适配器；与主项目只共享**模型工件**（GGUF / SD 离线资产，路径约定可配）。这样子项目可独立演进、可换后端（ollama/llama-server/主节点）。
+**额外独立性目标**：子项目与主项目**低耦合**——harness 自己不 import 主项目任何模块，通过**包装/反代成主流 API 格式（OpenAI 兼容 `/v1`）**对外暴露，后端经可插拔适配器；与主项目只共享**模型工件**（GGUF，路径约定可配）。图像生成资产、依赖和运行时只由 Koakumix 自己管理，不再从主项目借用或远程调用主项目生图。这样子项目可独立演进、可换后端（ollama/llama-server）。
 
 ### 1.1 核心使命：小模型定制化，而不是通用 Agent
 
@@ -153,7 +154,7 @@ evidence:
 |---|---|---|
 | `src/api_server.py`（FastAPI） | `/api/chat`、`/api/chat/stream`（full/fast/interactive 流式）、`/api/chat/upload`（多模态）、`/api/sessions` | **qlh_adapter 反代目标**：仅契约，即本机进程或远端 `--host` |
 | `ChatRequest` 契约 | `routing_preference`（auto/local_only/distributed_preferred/distributed_required）、`max_new_tokens`、`session_id`、`image_data_urls`（≤4）、`show_thinking`、`execution_mode/task_graph` | 适配器内**最小客户端**（复制字段 + 契约单测）；OpenAI 请求 → QLH 请求的映射 |
-| SD 1.5 侧车与资产 | `/api/diffusion/*`（generate/edit/distributed/grid/mixed、blobs、资产目录/下载/导入，进程内托管 `src/diffusion/service.py`）；模型资产在 `models/sd15-*/`（manifest 校验） | **工件共享**（SD 离线资产包 + manifest）：harness 本地生图执行器**直驱共享工件，不经 HTTP 契约**；远端生图经 qlh_adapter 映射 `/api/diffusion/*` |
+| 图像生成与编辑 | 主项目已于 2026-09-14 移除 `/api/diffusion/*`、SD 资产和运行时；仅保留图片上传与多模态理解 | **Koakumix 独占**：`image_workbench` 自行管理生图资产、依赖和执行器，对外提供 `/v1/images/generations`，不再远程调用主项目生图 |
 | RAG | `/api/rag/*`（FTS5 + 有界向量 + 容量预算 + ANN 决策门） | 长文档入口经 qlh_adapter（仅远端/主节点模式；本地独立模式 S4 评估） |
 | 多模态 | `llama_engine.py`（llama.cpp mtmd/mmproj）、`qwen3_multimodal_*`、QW3-VL 契约 | 经 adapter 契约；本地纯玩模式走 llama-server（`--mmproj`），注意 §2.3-5 约束 |
 | `src/tui_chat.py`（Textual） | 已是"HTTP 客户端 + 终端聊天"；`--host` 缺省连本地后端；Markdown 渲染防注入 | **仅作交互形态参考**（双进程入口、防注入、done 指标语义）；harness 自带 UI 不 import |
@@ -165,13 +166,13 @@ evidence:
 
 ### 4.1 定位与边界
 
-- **做**：上下文管理引擎（核心差异化）+ OpenAI 兼容 API 层（包装/反代）+ 会话/资产形态 + 生图工作区 + 本地/远端一体外壳（TUI 优先）。
+- **做**：上下文管理引擎（核心差异化）+ OpenAI 兼容 API 层（包装/反代）+ 会话/资产形态 + **独占生图工作区** + 本地一体外壳（TUI 优先）。
 - **不做**：引擎/调度重写、训练微调、性能对标、Web/Android 工作台（列为二期可选项）、**不 import 主项目任何模块**（`src/`、`scripts/`、前端均不依赖）。
 - **形态决策**：**独立进程 + 包装/反代层**。harness 对外暴露 OpenAI 兼容 API（`/v1/chat/completions` + `/v1/images/generations`，SSE 流式），对内经**可插拔后端适配器（adapter）**转译：
   - `llama_server`（**本地纯玩，默认**）：harness 自行拉起 llama-server 子进程，直接消费共享的 GGUF 工件（`models/` 目录，路径可配）——**零主项目代码依赖，连主项目 api_server 都不需要**；
-  - `qlh`（**主节点/远端**）：最小 HTTP 客户端（仅复制 QLH 私有契约字段 + 契约单测），反代到本机或远端 api_server，换取路由/分布式/生图高级编辑/RAG/多模态能力；
+  - `qlh`（**主节点/远端**）：最小 HTTP 客户端（仅复制 QLH 私有契约字段 + 契约单测），反代到本机或远端 api_server，获取路由/分布式/RAG/多模态理解能力；不提供生图远程路由；
   - `ollama`（可选，S5）：作为易得后端的对照组，验证"换后端"成本。
-- **共享工件约定**：模型工件（GGUF、SD 离线资产包）通过**目录约定**共享（默认同 `models/` 或环境变量指定）；harness **自解析工件元数据**（GGUF 头/sidecar），不调用主项目 `/api/models` 等内部接口。
+- **共享工件约定**：仅模型工件（GGUF）通过**目录约定**共享（默认同 `models/` 或环境变量指定）；Koakumix 生图资产由自身清单管理，不从主项目目录继承；harness **自解析工件元数据**，不调用主项目 `/api/models` 等内部接口。
 - **能力通告**：harness 的 `/v1/models` 与能力信息来自**后端适配器真实探测**（qlh 走其契约端点、llama-server 走 `/props` 等），禁止在 harness 层伪造（如无生图后端的模式不得宣称 images 可用）。
 - **定制化入口**：`model_profiles/` 是模型适配的单一事实来源。请求进入后先按 `model_id + artifact_sha256 + backend + profile_revision` 选择画像，再套用上下文、模板、生成、工具和资源策略；画像缺失时只允许保守默认值和 `unknown` 能力，不允许猜测后放行。
 - **角色分工**：回答模型、工具路由模型、摘要模型、视觉描述模型和 embedding 模型可以是不同工件。harness 只负责编排和证据记录，不要求一个小模型包办全部任务；工具调用默认遵循 [联网搜索与轻量 Fetch 工具调用可行性调研与分期计划](../../docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) 的 host-router/sidecar 准入门。
@@ -199,9 +200,8 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 │  └─ notices.py                   # 所有裁剪/摘要动作的可见通知（禁止静默截断）
 ├─ session/                        # 会话状态（SQLite 落盘 + 决策日志 + 资产引用）
 ├─ rag/                            # FTS5 优先检索、可替换 embedding provider、有界上下文
-├─ image_workbench/                # 生图工作区：/v1/images 封装、图片→会话资产、缩略卡入上下文
-│  ├─ local_engine.py              # 本地生图执行器（子进程直驱共享 SD 工件，文生图基线；不经 HTTP 契约）
-│  └─ remote_qlh.py                # 远端生图映射（qlh adapter → /api/diffusion/*）
+├─ image_workbench/                # Koakumix 独占生图工作区：/v1/images 封装、图片→会话资产、缩略卡入上下文
+│  └─ local_engine.py              # 本地生图执行器（自持资产与依赖；不经 QLH HTTP 契约）
 ├─ transport/                      # 连接管理（adapter 底座：重连/超时/退避；不感知具体后端）
 ├─ ui_react/                       # 独立 React 工作台（赛博哥特结构，青蓝/洋红主题）
 └─ tui.py                          # Textual 工作台（与 React 共享 /v1 合同）
@@ -233,8 +233,8 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 ### 4.4 生图工作区（S3 交付）
 
 - harness 只暴露 OpenAI 兼容生图接口（`POST /v1/images/generations`），本地与远端走**两条独立路径**：
-  - **本地（不经 HTTP 契约）**：`image_workbench/local_engine.py` 先验证 QLH 生成的 `.qlh-sd-asset.json`，再调用注入式本地执行器直接消费共享 SD 工件；首期只做**文生图基线**（txt2img），img2img/inpaint/IP-Adapter/指令编辑等高级编辑继续走远端 qlh。
-  - **远端**：`remote_qlh.py` 提交 `/api/diffusion/generate`，轮询 job 并读取 `/api/diffusion/blobs/{blob_id}`；能力探测映射 `/api/diffusion/capabilities`。
+  - **本地（不经 HTTP 契约）**：`image_workbench/local_engine.py` 验证 Koakumix 自有资产清单，再调用注入式本地执行器消费本地生图工件；高级编辑也只能在 Koakumix 内实现。
+  - **主项目适配**：不再提供远端生图路径；`qlh` 适配器只负责主项目文本推理、路由、RAG 和多模态理解。
 - **S3.1 本票边界**：`contracts.py` 固化尺寸、步数、提示词和响应格式校验；`manifest.py` 校验资产存在性、大小及可选 SHA-256；`local_engine.py` 保持与主项目解耦。默认执行器明确返回 `local_image_runtime_unavailable`，环境中偶然存在 `torch/diffusers` 不能替代真实执行器证明。
 - 图片由 `ImageAssetStore` 写入用户指定根目录，响应可返回 `b64_json` 或用户资产 URL；绝对路径不出现在 API 响应和报告中。缩略图、会话引用与多模态追问闭环进入后续票。
 - 图片入多模态上下文：缩略图卡（e.g. 256px base64）+ 摘要文本，控制 token 成本；遵循 §2.3-5（mmproj 下前缀缓存收益打折）。
@@ -242,7 +242,7 @@ harness_workbench/                 # 独立子项目（独立包/仓库，仅共
 ### 4.5 本地 / 远端双模式（= 后端适配器选择）
 
 - **本地纯玩**（默认）：`--backend llama_server` → harness 自拉 llama-server 子进程（共享 GGUF 工件），**不依赖主项目**；多模态经 `--mmproj`；生图经本地执行器直驱共享 SD 工件（同样不经 HTTP，§4.4）。
-- **主节点本地/远端**：`--backend qlh [--host http://<master>:8000]` → 同一 UI 与上下文引擎，走 QLH 契约获得路由偏好（`routing_preference` 透传）/分布式/生图高级编辑/RAG；`--host` 缺省指向本机 8000。
+- **主节点本地/远端**：`--backend qlh [--host http://<master>:8000]` → 同一 UI 与上下文引擎，走 QLH 契约获得路由偏好（`routing_preference` 透传）/分布式/RAG/多模态理解；`--host` 缺省指向本机 8000。生图始终由 Koakumix 本地工作区负责。
 - **能力差异可视化**：状态栏展示当前 adapter 与能力（models/images/multimodal/routing），不静默降级（如 qlh 断连不悄悄切 llama_server）。
 - 断连：transport 底座统一指数退避重连 + 现有"连接中断"提示模式。
 
@@ -316,7 +316,7 @@ model profile
 | `HARNESS-UI-03` | RAG 工作区与引用上下文，接 `/v1/rag/*`；图片/资产抽屉接 `/v1/images/*` | owner scope、预算遗漏、资产 URL 错误状态可见；桌面/窄屏布局稳定；**已完成本机开发门** |
 | `HARNESS-UI-04` | 主题/可访问性/视觉回归与 TUI parity；文档、启动脚本、独立依赖锁定 | 深浅色对比、键盘导航、减少动效、React/TUI 术语一致；不改主项目前端；**已完成本机开发门** |
 
-> 注：S3 本地生图由 harness 自带执行器消费共享 SD 工件（资产 manifest 校验借用主项目产物），远端高级编辑（img2img/inpaint/IP-Adapter/指令编辑）依赖主节点 SD 侧车（参阅 SD 1.5 计划）；S2 起每个阶段都要求"可运行 + 有接受证据"再进下一阶段；harness 自始至终不 import 主项目代码，违背即视为回归。
+> 注：S3 本地生图由 Koakumix 自带执行器消费自有 SD 工件；不再存在依赖主节点 SD 侧车的远端高级编辑路径。S2 起每个阶段都要求"可运行 + 有接受证据"再进下一阶段；harness 自始至终不 import 主项目代码，违背即视为回归。
 
 ### 5.1 定制化实验矩阵与质量门
 
@@ -337,8 +337,8 @@ model profile
 ## 6. 风险与约束
 
 1. **范围蔓延**（最大风险）：不做训练、不重写引擎、不做 Web 工作台——除非单独立项。**本地生图执行器只保文生图基线**（txt2img），img2img/inpaint/IP-Adapter/指令编辑进本地执行器即视为范围蔓延（该能力经远端 qlh 提供）。
-2. **本地生图重复造轮子**（与主项目 SD 侧车能力重复的取舍）：代价是 harness 侧重实现并维护 diffusers 路径、SD 安全组合与离线加载；收益是本地零契约依赖。首期以"文生图基线 + manifest 复用"封顶；若后续高级编辑本地化，优先以"独立脚本 + 共享工件"扩展而非改写主项目。
-3. **与主项目契约漂移**（解耦的新增风险）：`qlh` 适配器复制了私有契约（`/api/chat`、`/api/diffusion/*` 字段），主项目改端点/字段即可能静默破坏 → 适配器**契约单测固化**（请求/响应 JSON snapshot）+ 启动时**能力探测失败即明确报错**（不猜字段），并定期对主项目契约测试做差异对照。
+2. **本地生图维护边界**：生图只在 Koakumix 维护 diffusers 路径、SD 安全组合与离线加载；主项目不再重复提供同类能力。首期以"文生图基线 + manifest 复用"封顶；高级编辑也必须作为 Koakumix 独立票实现。
+3. **与主项目契约漂移**（解耦的新增风险）：`qlh` 适配器只复制 `/api/chat` 等文本/多模态私有契约；主项目改端点/字段即可能静默破坏 → 适配器**契约单测固化**（请求/响应 JSON snapshot）+ 启动时**能力探测失败即明确报错**（不猜字段），生图不参与该适配器。
 4. **工件路径约定脆弱**：共享模型目录（默认 `models/`）若被主项目变更布局，harness 需自解析 GGUF 元数据兜底；路径必须可配（环境变量/CLI），不得硬编码。
 5. **摘要质量**：小模型摘要会丢细节；靠"决策日志 + pinned + 可回滚完整日志（落盘不裁剪）"兜底。
 6. **多模态前缀缓存失效**（§2.3-5）：性能波动不当作 bug，记入已知限制。
@@ -498,9 +498,9 @@ model profile
 本票完成生图工作区的工程合同和两条后端路径，不把 fake executor 或异步 job 结果写成真实本地生图能力：
 
 - `image_workbench/contracts.py` 固化 prompt、尺寸、步数、引导强度、seed、模型和响应格式；非法尺寸、越界参数和不受支持的响应格式在 API 边界 fail-closed。
-- `image_workbench/manifest.py` 独立解析主项目资产工具生成的 `.qlh-sd-asset.json`，检查相对路径、重复项、文件存在性、大小和可选 SHA-256；不 import `src/diffusion/`，也不把绝对资产路径返回给调用方。
+- `image_workbench/manifest.py` 独立解析 Koakumix 自有 `.qlh-sd-asset.json`，检查相对路径、重复项、文件存在性、大小和可选 SHA-256；不 import QLH 主项目代码，也不把绝对资产路径返回给调用方。
 - `image_workbench/local_engine.py` 只负责 manifest 闸门和 executor 生命周期。当前默认 executor 明确返回 `local_image_runtime_unavailable`；测试替身可以证明请求、工件和生成结果的连接，但不能替代 CUDA/diffusers 验收。
-- `image_workbench/remote_qlh.py` 将请求映射到 `/api/diffusion/generate`，轮询 `/api/diffusion/jobs/{job_id}`，读取 `/api/diffusion/blobs/{blob_id}` 或直接解析 base64；能力探测只接受 QLH `/api/diffusion/capabilities` 的真实响应。
+- 原 `image_workbench/remote_qlh.py` 已删除（2026-09-14）；Koakumix 不再调用 QLH `/api/diffusion/*`，生图能力统一由本地 image_workbench 管理。
 - `ImageAssetStore` 将图片和最小 prompt/尺寸/seed 元数据写入用户指定根目录，先写临时文件再原子替换，读回时重新校验 SHA-256。`api_layer/app.py` 新增 `/v1/images/capabilities`、`/v1/images/generations` 和资产读取端点。
 
 验证命令：

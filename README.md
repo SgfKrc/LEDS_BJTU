@@ -48,7 +48,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🧩 **模型资产治理** | 模型注册、清单/SHA 校验、来源与许可证、Sidecar 契约、部署模拟及下载来源回退（HF 直连 → 用户代理 → ModelScope）均已接入本机产品面；真实大工件、CUDA 和跨机分发仍待验收 |
 | 🖼️ **多模型与多模态 Sidecar** | Qwen3 PyTorch 隔离运行时，以及 Gemma4 原生 GGUF/mmproj MTMD 与 PyTorch Sidecar 路径均已完成开发门；模型可用性仍由工件、显存/内存预算和精确身份契约 fail-closed 决定，不在 8 GB 机器上自动准入重模型 |
 | 🌐 **Tailscale 与双栈组网** | IPv4/IPv6 端点、手动入群和启动重连按“用户首选 → bootstrap → Tailnet”回退；显式连接的偏好会持久化。双机 IPv6 短任务已实测，IPv4-only/IPv6-only 安装包和真实 WSS/443 仍待环境验收 |
-| 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；真实 control/gateway、系统凭据和首次安装联调后置 |
+| 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；系统凭据和首次安装联调后置 |
 | 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
 | 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
 | 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（安装包内置 Textual，源码模式仍可隔离安装；见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
@@ -62,7 +62,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔑 **手动入群（CLUSTER-JOIN）** | 目标节点生成一次性授权票据，主节点 Auth App 审批后签发 Ed25519 client-only grant（文本码 + 二维码，nonce ledger 原子消费），成功即降级为从节点；Web/TUI 已接线 → [集群接入计划](docs/集群接入稳定性与本地RAG实施计划.md) |
 | 🌐 **抗弱网与 Transport v2** | `cluster_transport` 提供 `legacy_tcp`/`wss_443` 能力选择、有界 ACK 窗口、稳定故障矩阵与 circuit breaker；NW3.1 本地自签名 WSS loopback 门完成；真实 443/证书/流量对照后置 → [抗弱网专项](docs/抗弱网通信协议专项计划.md) |
 | 🧪 **实验质量与文档治理** | EX-N3 以只读生产质量门复核文本与多模态理解的计划、样本、校准、性能、质量和人工复核；文档维护 Agent 已完成本机检索/语义质量门，只生成建议而不自动改写文档 |
-| 🧩 **子项目：小模型 harness 工作台** | 面向玩具/自用的小模型定制化推理工作台（S1-S8 本机/离线开发门完成）：上下文预算与 STATE 压缩、模型画像/能力门、OpenAI 兼容 `/v1`、定制化实验台（A/B + Pareto）、生图工作区、SQLite 会话与 RAG、长期记忆（RAG+压缩+本地 memory）、联网搜索与轻量 MCP 服务、红队安全样本；**不 import 主项目代码、仅共享模型工件**，亚1B 与 DS3 模型画像已登记 → [harness 方案](harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) |
+| 🧩 **子项目：Koakumix harness 工作台** | 面向玩具/自用的小模型定制化推理工作台（S1-S8 本机/离线开发门完成）：上下文预算与 STATE 压缩、模型画像/能力门、OpenAI 兼容 `/v1`、定制化实验台（A/B + Pareto）、**唯一生图工作区**、SQLite 会话与 RAG、长期记忆（RAG+压缩+本地 memory）、联网搜索与轻量 MCP 服务、红队安全样本；**不 import 主项目代码、仅共享模型工件**，亚1B 与 DS3 模型画像已登记 → [harness 方案](harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) |
 | 📡 **联网搜索与轻量 Fetch 工具** | WEB-TOOL G1-G6 本机开发门完成：离线能力探测、Tool Gateway fail-closed（HTTPS 强制/SSRF/DNS/重定向复检）、受限 Fetch/SearXNG adapter、TaskGraph `tool_request` Stage、显式 `persist` 工具缓存与 API、质量门与联合审计；`production_network_enabled=false`，真实网络验收后置 → [调研与分期计划](docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
 | 📝 **文档维护 Agent 子项目** | 独立包（独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)，主项目以 submodule 引入）：规则数据化（`RULES.md` + `rules.yaml` 驱动扫描器）、规则变更机械扫描（增量矩阵 new/gone/changed + `--max-new/--max-gone` 门）、演进门控（agent 改规则 proposed→preflight→gates→released）与等价回归 → [专项计划](tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) |
 | 🔌 **Reasonix ↔ Codex 桥接子项目** | 独立包（独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)，主项目以 submodule 引入）：把 Reasonix 子智能体以 stdio MCP 工具（`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_exec` / `reasonix_status`）接给 Codex；CLI 路径与模型 ref 全部按本机解析、零硬编码（`node src/configure.mjs list/use/codex/verify`）；默认只读，W1/W2/W3 已加入受控写入、变更证据、显式回滚和读写 profile 分工，审计修复票 `AUD-01`～`AUD-08` 已完成，`R2-EXT-01` 已放宽有限预算，`E2-EXT-01` 已落地任务级 checkpoint/续跑，`R3-EXT-01` 已落地显式只读并行与取消回收，G3 已完成 WSL 跨平台实跑，R4 已统一输出截断语义，`TOOL-RXB-EXEC-01` 已完成命名命令执行与真实 CLI 验收，`TOOL-RXB-NET-01` 已接入 Reasonix 原生 `web_fetch`（bridge 不自建网络栈），`TOOL-RXB-NET-02` 已加入 provider 搜索 fail-closed 门控，`TOOL-RXB-LOOP-01` 已加入显式 plan/implement/exec/review 阶段审计 → [完善方向](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) |
@@ -169,8 +169,6 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── scheduler_svc_http.py      # scheduler-svc 微服务 HTTP 壳（透传契约）
 │   ├── inference_service/         # ★ inference-svc 微服务（engine_host/协议/路由）
 │   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）
-├── control/                       # ★ control-svc 微服务（NestJS：控制面 9 域 + SQLite 本地事实源）
-├── gateway/                       # ★ api-gateway（NestJS + Fastify 网关，96+ 端点透传）
 ├── schemas/                       # ★ MODEL-FLEET 冻结契约（artifact/pull-job/deployment/profile JSON Schema）
 ├── fixtures/                      # 测试与走查 fixture（API 事件流、模型门样例）
 ├── android/                       # Android 客户端（Kotlin + Jetpack Compose）
@@ -211,9 +209,6 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   │   └── qlh-edge-inference.desktop  # 桌面入口
 │   ├── dist/                      # ★ 最终安装包输出目录（Git 忽略）
 │   └── README.md                  # 打包文档
-├── frontend/                      # 冻结的历史 React 前端，仅作对照与旧包兼容资源
-│   └── src/
-│       └── ...                    # 不再接受新功能开发
 ├── frontend_cybergothic/          # ★ 唯一产品前端（React + TypeScript + Vite）
 │   ├── src/                       # Chat / Models / RAG / Tasks / Account 等产品页面
 │   └── scripts/                   # 对比度与浏览器回归工具
@@ -391,7 +386,7 @@ git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 首次克
 # Python 依赖（主节点 SQLite 自持，无需 PostgreSQL）
 pip install -r requirements.txt
 
-# 产品前端依赖（旧 frontend/ 已冻结）
+# 产品前端依赖（唯一产品前端）
 cd frontend_cybergothic && npm ci && cd ..
 ```
 
@@ -433,8 +428,7 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 | `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar（含 pipeline 执行依赖） | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
 | `.venv-packaging` | 集显版打包（torch CPU + PyInstaller） | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
 | `.venv-packaging-cuda` | 独显版打包 | `packaging/requirements-cpu.txt` | `requirements-lock/packaging-cuda.lock.txt` |
-| frontend_cybergothic / gateway / control | Node 子项目 | 各 `package-lock.json`（`npm ci`，随 `--all` 处理） | — |
-| frontend（旧，已冻结） | 仅历史对照/旧包兼容资源 | `npm ci`（默认随 `--all`，可用 `--skip frontend` 跳过） | 不再接受新功能开发 |
+| frontend_cybergothic | 唯一产品前端 | `package-lock.json`（`npm ci`） | — |
 
 > `setup_all_envs.bat` 在 Windows 会自动 `chcp 65001`；直接跑脚本时若终端乱码，
 > 手动 `chcp 65001` 或 `set PYTHONIOENCODING=utf-8` 即可。
@@ -448,7 +442,7 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 | **主环境**（系统 Python） | 运行时（transformers 4.47.1 / torch / 推理服务）与工具脚本 | `requirements.txt` | 不装 pytest 系测试依赖；不跑全量测试 |
 | **`.venv-test`** | **唯一测试环境**（全量/定向 pytest 都在这跑） | `scripts/setup_test_env.py` + `requirements-test.txt` | 不承载运行时推理；不被当作主环境使用 |
 | `.venv-packaging/` | 集显版打包（torch CPU） | `packaging/requirements-cpu.txt` | — |
-| `.venv-packaging-cuda/` | 独显版打包（torch CUDA）+ SD 侧车 | 见打包文档 | — |
+ | `.venv-packaging-cuda/` | 独显版打包（torch CUDA） | 见打包文档 | — |
 | `.venv-gemma4-native/` | 原生 Gemma 4 MTMD/llama.cpp 运行时 | `packaging/requirements-gemma4-native.txt` | 不得复用给 Transformers pipeline |
 | `.venv-gemma4-pipeline/` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | 与 native/Qwen3 环境隔离 |
 | `.venv-qwen3-sidecar/` | Qwen3 PyTorch sidecar | 各自 requirements | — |
@@ -483,7 +477,7 @@ git submodule update --init --recursive
 # 2. 安装 Python 依赖（主环境；联网）
 pip install -r requirements.txt
 
-# 3. 产品前端依赖（可选，仅开发前端时；旧 frontend/ 已冻结）
+# 3. 产品前端依赖（可选，仅开发前端时）
 cd frontend_cybergothic && npm ci && cd ..
 
 # 4. 环境文件（不进仓库，按需自建）
@@ -642,7 +636,7 @@ cd frontend_cybergothic && npm run dev
 - **产品前端开发服务器**：`http://localhost:5174`（Vite 热更新，代理到 8000）
 - **产品前端桌面壳**：先构建 `frontend_cybergothic`，再执行 `python packaging/launcher_cybergothic.py`（默认 `9851`，反向代理 `/api` 到 `8000`）
 
-> 当前标准后端、pywebview Launcher、CPU/CUDA/Slim spec 与 Linux `.deb` 默认携带 `frontend_cybergothic/dist`。旧 `frontend/dist` 仅可通过显式 `QLH_FRONTEND_DIST` 做兼容对照；干净机首启、WebView2、Linux 安装与升级仍属于后置发布验收。
+> 当前标准后端、pywebview Launcher、CPU/CUDA/Slim spec 与 Linux `.deb` 默认携带 `frontend_cybergothic/dist`；干净机首启、WebView2、Linux 安装与升级仍属于后置发布验收。
 
 ### 单机模式（PC）
 
@@ -793,7 +787,7 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 > 不能混用——集显版 venv 必须装 CPU-only torch，独显版 venv 必须装 CUDA torch。
 > 装错会导致集显版体积从 180 MB 膨胀到 1.8 GB。
 >
-> **SD 1.5 图像侧车**：独显版额外安装 `pip install -r packaging/requirements-sd15.txt`（锁 diffusers 0.35.2 / transformers 4.47.1，独立侧车不污染 LLM 推理环境）；图像模型资产不进入安装包，由 Web 工作区/脚本按固定 revision 下载。正式离线资产包（五资产约 15 GB，含许可副本与模型卡）已可离线导入；真实 Diffusers Worker 和跨机图像生成仍待验收。
+> **图像生成边界**：CPU/CUDA 安装包均不包含生图依赖、模型或工作区；生图只在 Koakumix 中安装和运行。主项目的图片输入与多模态理解不受影响。
 >
 > 安装后双击桌面快捷方式即可启动，无需配置 Python 环境。卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
 >
@@ -985,7 +979,7 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 本地文生图/图生图/参考图/inpaint/指令编辑工作区、固定资产下载、图像 blob 与分布式批次（L4 Candidate；SD-N1/SD-N5.2 Completed；SD-N5.1/5.1A/5.3 本地门与双人目视完成；剩余正式离线发布包、真实 Diffusers Worker 与分布式接入）
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 历史验收记录；主项目实现已于 2026-09-14 裁撤，后续生图只在 Koakumix 演进
 - [微服务架构改造计划](docs/archive/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
 - [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 模型注册、Sidecar、导入/下载、部署模拟与本机产品面已收口；下载治理采用 HF 直连 → 用户代理 → ModelScope 回退，真实大工件、CUDA、跨 PC 分发和生产路由仍待验收
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
@@ -994,7 +988,7 @@ python serve.py
 
 ### 专项文档
 
-- [小模型轻量推理 harness 工作台调研与方案](harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) — 子项目：小模型定制化（模板/上下文/资源/角色分工）工作台；S1-S8 本机/离线开发门完成，真实运行时验收与 S5 收口后置；[下一阶段开发票](harness_workbench/docs/harness下一阶段开发票计划.md)（S3.2 生图真机+红队、S7 联网+MCP、S8 长期记忆）
+- [小模型轻量推理 harness 工作台调研与方案](harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) — Koakumix 子项目：小模型定制化与唯一生图工作台；S1-S8 本机/离线开发门完成，真实运行时验收后置
 - [联网搜索与轻量 Fetch 工具调用可行性调研与分期计划](docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) — WEB-TOOL G0-G6/AUDIT 主节点 Tool Gateway 支线：能力探测、fail-closed 联网策略、adapter、TaskGraph Stage、显式持久化缓存与质量门；真实网络验收后置
 - [DistilQwen2.5-DS3-0324 替代 R1 判题模型专项计划](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) — 快思考替代不可关闭 thinking 的 R1：v2 全口径 **2/4×3、8/11×3**，替代 R1 已批准候选；附多模型 0/4 判题口径问题专项分析
 - [亚 1B 小模型专项实验计划](docs/亚1B小模型专项实验计划.md) — Qwen2.5-0.5B / Qwen3-0.6B / MiniCPM4-0.5B 用途（链路轻载体/thinking 开关标杆/新架构探针）与 M-SM-B1~B5 实验票
@@ -1009,7 +1003,7 @@ python serve.py
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/archive/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
-- [前端、Android 与后端接口缺口审查](docs/前端安卓后端接口与功能缺口审查-2026-08-22.md) — `frontend_cybergothic/` 已成为唯一产品前端，Account/Cluster/Models/RAG/Tasks/Image Studio/诊断等本机产品面已接线；旧 `frontend/` 冻结为历史对照，标准安装包输入已接入，真实首启仍随 E8 打包链路验收
+- [前端、Android 与后端接口缺口审查](docs/前端安卓后端接口与功能缺口审查-2026-08-22.md) — 历史审查记录；`frontend_cybergothic/` 是唯一主项目前端，Image Studio 已随 2026-09-14 生图裁撤移除
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/archive/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研

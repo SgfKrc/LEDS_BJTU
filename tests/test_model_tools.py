@@ -15,12 +15,10 @@ from scripts.model_tools.cli import main
 from scripts.model_tools.gguf import inspect_gguf, verify_gguf
 from scripts.model_tools.gguf_convert import GGUFConvertError, execute_conversion, plan_conversion
 from scripts.model_tools.maintenance import clean_models, model_disk_usage
-from scripts.model_tools.sd15_batch import run_prompt_batch, run_sampler_matrix
 from scripts.model_tools.sweep import sweep_models
 from scripts.model_tools.sync_status import build_inventory, compare_inventories, validate_inventory
 from scripts.model_tools.llm_smoke_matrix import fixed_prompts, run_smoke_matrix
 from scripts.model_tools.llm_smoke_worker import execute_request, validate_output
-from scripts.model_tools.lora import MAX_HEADER_BYTES, inspect_lora
 
 
 def _write_hf_fixture(root: Path, architecture: str = "Qwen2ForCausalLM") -> Path:
@@ -193,132 +191,6 @@ def test_cli_json_output_and_exit_code(tmp_path: Path, capsys):
     assert '"tensor_count": 1' in output
 
 
-def test_sd15_lora_inspect_reads_only_header_and_redacts_training_text(tmp_path: Path, capsys):
-    target = tmp_path / "portrait_lora.safetensors"
-    private_trigger = "private trigger phrase"
-    private_dataset = "C:/private/training-images"
-    _write_safetensors_header(target, {
-        "__metadata__": {
-            "ss_network_dim": "64",
-            "ss_learning_rate": "0.0001",
-            "ss_tag_frequency": json.dumps({private_dataset: {private_trigger: 9}}),
-            "ss_dataset_dirs": json.dumps({private_dataset: {"img_count": 12}}),
-            "ss_custom_comment": "private training comment",
-        },
-        "lora_unet_down_blocks_0.lora_down.weight": {
-            "dtype": "F16", "shape": [4, 4], "data_offsets": [0, 32],
-        },
-        "lora_unet_down_blocks_0.lora_up.weight": {
-            "dtype": "F16", "shape": [4, 4], "data_offsets": [32, 64],
-        },
-    }, payload=b"x" * 64)
-    before = target.read_bytes()
-
-    report = inspect_lora(target)
-
-    assert report["valid"] is True
-    assert report["read_only"] is True
-    assert report["weights_loaded"] is False
-    assert report["cuda_used"] is False
-    assert report["input_kind"] == "safetensors_file"
-    assert report["tensor_summary"] == {
-        "tensor_count": 2,
-        "lora_down_tensor_count": 1,
-        "lora_up_tensor_count": 1,
-        "alpha_tensor_count": 0,
-        "lora_detected": True,
-        "components": ["unet"],
-    }
-    fields = report["metadata"]["fields"]
-    assert fields["ss_network_dim"] == {"kind": "numeric", "value": "64"}
-    assert fields["ss_tag_frequency"]["numeric_entry_count"] == 1
-    assert fields["ss_dataset_dirs"]["numeric_value_total"] == 12
-    rendered = json.dumps(report)
-    assert private_trigger not in rendered
-    assert private_dataset not in rendered
-    assert "private training comment" not in rendered
-    assert str(tmp_path) not in rendered
-    assert target.read_bytes() == before
-
-    assert main(["sd15_lora_inspect", str(target), "--json"]) == 0
-    cli_output = capsys.readouterr().out
-    assert private_trigger not in cli_output
-    assert str(tmp_path) not in cli_output
-
-
-@pytest.mark.parametrize("header, payload, expected_code", [
-    ({"tensor": {"dtype": "F16", "shape": [1], "data_offsets": [0, 99]}}, b"x", "tensor_out_of_range"),
-    ({"tensor": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}, "other": {"dtype": "F16", "shape": [1], "data_offsets": [0, 2]}}, b"xxxx", "overlapping_tensors"),
-])
-def test_sd15_lora_inspect_rejects_invalid_tensor_layout(tmp_path: Path, header: dict, payload: bytes, expected_code: str):
-    target = tmp_path / "invalid.safetensors"
-    _write_safetensors_header(target, header, payload=payload)
-
-    report = inspect_lora(target)
-
-    assert report["valid"] is False
-    assert report["errors"][0]["code"] == expected_code
-
-
-def test_sd15_lora_inspect_rejects_unsupported_dtype_and_size_mismatch(tmp_path: Path):
-    target = tmp_path / "bad_dtype.safetensors"
-    _write_safetensors_header(target, {
-        "tensor": {"dtype": "NOPE", "shape": [1], "data_offsets": [0, 1]},
-    }, payload=b"x")
-    unsupported = inspect_lora(target)
-    assert unsupported["valid"] is False
-    assert unsupported["errors"][0]["code"] == "invalid_tensor_descriptor"
-
-    _write_safetensors_header(target, {
-        "tensor": {"dtype": "F16", "shape": [2], "data_offsets": [0, 2]},
-    }, payload=b"xx")
-    mismatch = inspect_lora(target)
-    assert mismatch["valid"] is False
-    assert mismatch["errors"][0]["code"] == "tensor_size_mismatch"
-
-
-def test_sd15_lora_inspect_rejects_large_headers_and_path_escape(tmp_path: Path):
-    target = tmp_path / "large.safetensors"
-    target.write_bytes(struct.pack("<Q", MAX_HEADER_BYTES + 1) + b"{}")
-
-    too_large = inspect_lora(target)
-
-    assert too_large["valid"] is False
-    assert too_large["errors"][0]["code"] == "header_too_large"
-
-    root = tmp_path / "root"
-    root.mkdir()
-    outside = tmp_path / "outside.safetensors"
-    _write_safetensors_header(outside, {})
-    escaped = inspect_lora(outside, root=root)
-    assert escaped["valid"] is False
-    assert escaped["errors"][0]["code"] == "path_outside_root"
-
-
-def test_sd15_lora_inspect_accepts_no_metadata_and_rejects_truncated_prefix(tmp_path: Path):
-    empty_metadata = tmp_path / "no_metadata.safetensors"
-    _write_safetensors_header(empty_metadata, {
-        "lora_te_text_model.lora_down.weight": {
-            "dtype": "F16", "shape": [2, 2], "data_offsets": [0, 8],
-        },
-        "lora_te_text_model.lora_up.weight": {
-            "dtype": "F16", "shape": [2, 2], "data_offsets": [8, 16],
-        },
-    }, payload=b"x" * 16)
-
-    report = inspect_lora(empty_metadata)
-
-    assert report["valid"] is True
-    assert report["metadata"] == {"ss_field_count": 0, "fields": {}}
-    assert report["tensor_summary"]["lora_detected"] is True
-
-    truncated = tmp_path / "truncated.safetensors"
-    truncated.write_bytes(b"bad")
-    bad = inspect_lora(truncated)
-    assert bad["valid"] is False
-    assert bad["errors"][0]["code"] == "truncated_prefix"
-
-
 def test_model_disk_usage_groups_top_level_assets_and_is_read_only(tmp_path: Path):
     root = tmp_path / "models"
     (root / "qwen").mkdir(parents=True)
@@ -481,157 +353,6 @@ def test_cli_disk_usage_and_clean_json(tmp_path: Path, capsys):
     assert '"candidates"' in capsys.readouterr().out
 
 
-class _FakeImage:
-    def __init__(self, color: tuple[int, int, int]):
-        from PIL import Image
-
-        self._image = Image.new("RGB", (64, 64))
-        self._image.putdata([
-            (
-                (color[0] + x * 7 + y * 3) % 256,
-                (color[1] + x * 5 + y * 11) % 256,
-                (color[2] + x * 13 + y * 2) % 256,
-            )
-            for y in range(64)
-            for x in range(64)
-        ])
-
-    def convert(self, mode: str):
-        return self._image.convert(mode)
-
-
-class _FakeEngine:
-    def __init__(self):
-        self.loaded = None
-        self.unloaded = False
-        self.requests = []
-
-    def load(self, path: str):
-        self.loaded = path
-        return SimpleNamespace(to_dict=lambda: {"path": path})
-
-    def generate(self, request):
-        self.requests.append(request)
-        return SimpleNamespace(
-            image=_FakeImage((request.seed % 255, 80, 140)),
-            seed=request.seed,
-            elapsed_seconds=0.125,
-            metadata={"scheduler": request.scheduler or "DPMSolverMultistepScheduler", "safety_flagged": False},
-        )
-
-    def unload(self):
-        self.unloaded = True
-
-
-def _fake_asset_gate(monkeypatch):
-    import diffusion
-
-    monkeypatch.setattr(diffusion, "verify_asset_directory", lambda *_args, **_kwargs: {
-        "valid": True,
-        "integrity_scope": "fixture",
-    })
-
-
-def test_sd15_prompt_batch_is_bounded_deterministic_and_writes_report(tmp_path: Path, monkeypatch):
-    _fake_asset_gate(monkeypatch)
-    from diffusion import get_preset
-
-    engines = []
-
-    def factory():
-        engine = _FakeEngine()
-        engines.append(engine)
-        return engine
-
-    report = run_prompt_batch(
-        asset_id="sd15_90s_retrovers_v1",
-        model_path=tmp_path / "asset",
-        output_dir=tmp_path / "out",
-        preset=get_preset("sd15_retrovers_space_courier_v1"),
-        prompts=["a red observatory", "a blue observatory"],
-        seeds=[11, 12],
-        steps=2,
-        engine_factory=factory,
-    )
-
-    assert report["tool"] == "sd15_prompt_batch"
-    assert report["valid"] is True
-    assert report["automatic_gate"]["passed"] is True
-    assert report["automatic_gate"]["outputs"] == 4
-    assert Path(report["contact_sheet"]).is_file()
-    assert Path(report["report_path"]).is_file()
-    assert len(engines) == 1 and engines[0].unloaded is True
-    assert [request.seed for request in engines[0].requests] == [11, 12, 11, 12]
-
-
-def test_sd15_sampler_matrix_preserves_scheduler_and_rejects_oversized_matrix(tmp_path: Path, monkeypatch):
-    _fake_asset_gate(monkeypatch)
-    from diffusion import get_preset
-
-    engines = []
-
-    def factory():
-        engine = _FakeEngine()
-        engines.append(engine)
-        return engine
-
-    report = run_sampler_matrix(
-        asset_id="sd15_90s_retrovers_v1",
-        model_path=tmp_path / "asset",
-        output_dir=tmp_path / "out",
-        preset=get_preset("sd15_retrovers_space_courier_v1"),
-        prompt="a test prompt",
-        schedulers=["EulerDiscreteScheduler", "DDIMScheduler"],
-        steps_list=[2, 3],
-        seed=99,
-        engine_factory=factory,
-    )
-
-    assert report["tool"] == "sd15_sampler_matrix"
-    assert [request.scheduler for request in engines[0].requests] == [
-        "EulerDiscreteScheduler", "EulerDiscreteScheduler", "DDIMScheduler", "DDIMScheduler",
-    ]
-    assert [request.steps for request in engines[0].requests] == [2, 3, 2, 3]
-
-    import pytest
-    with pytest.raises(ValueError, match="64 outputs"):
-        run_sampler_matrix(
-            asset_id="sd15_90s_retrovers_v1",
-            model_path=tmp_path / "asset",
-            output_dir=tmp_path / "too-many",
-            preset=get_preset("sd15_retrovers_space_courier_v1"),
-            prompt="a test prompt",
-            schedulers=["EulerDiscreteScheduler"] * 65,
-            steps_list=[2],
-            seed=99,
-            engine_factory=factory,
-        )
-
-
-def test_sd15_batch_asset_failure_writes_fail_closed_report(tmp_path: Path, monkeypatch):
-    import diffusion
-    from diffusion import get_preset
-
-    monkeypatch.setattr(diffusion, "verify_asset_directory", lambda *_args, **_kwargs: {
-        "valid": False,
-        "errors": ["fixture mismatch"],
-    })
-    report = run_prompt_batch(
-        asset_id="sd15_90s_retrovers_v1",
-        model_path=tmp_path / "invalid-asset",
-        output_dir=tmp_path / "out",
-        preset=get_preset("sd15_retrovers_space_courier_v1"),
-        prompts=["a test prompt"],
-        seeds=[1],
-        steps=2,
-        engine_factory=lambda: (_ for _ in ()).throw(AssertionError("engine must not start")),
-    )
-
-    assert report["valid"] is False
-    assert report["status"] == "asset_invalid"
-    assert Path(report["report_path"]).is_file()
-
-
 def _write_model_tree(root: Path, assets: dict[str, bytes]) -> None:
     for asset_id, content in assets.items():
         target = root / asset_id / "model.safetensors"
@@ -642,20 +363,13 @@ def _write_model_tree(root: Path, assets: dict[str, bytes]) -> None:
 def test_sync_inventory_is_stable_and_never_exposes_absolute_paths(tmp_path: Path):
     root = tmp_path / "models"
     _write_model_tree(root, {"z-model": b"z", "a-model": b"a"})
-    sd = root / "sd-asset"
-    sd.mkdir()
-    (sd / ".qlh-sd-asset.json").write_text("{}", encoding="utf-8")
-    (sd / "weights.safetensors").write_bytes(b"weights")
-
     report = build_inventory(root)
     serialized = str(report)
 
     assert report["valid"] is True
     assert report["read_only"] is True
     assert report["hash_mode"] == "structure"
-    assert [item["asset_id"] for item in report["assets"]] == ["a-model", "sd-asset", "z-model"]
-    assert report["assets"][1]["kind"] == "diffusion"
-    assert report["assets"][1]["file_count"] == 2
+    assert [item["asset_id"] for item in report["assets"]] == ["a-model", "z-model"]
     assert all(item["content_digest"] is None for item in report["assets"])
     assert str(tmp_path) not in serialized
     assert "models" not in report

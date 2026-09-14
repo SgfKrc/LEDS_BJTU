@@ -1,27 +1,21 @@
 """Deterministic bounded-capacity pre-validation scenarios.
 
-The harness exercises production TaskGraph reservation and fallback handling,
-plus the diffusion SQLite/CAS capacity cleanup path.  Gate events determine
-progress; no outcome depends on elapsed-time or throughput measurements.
+The harness exercises production TaskGraph reservation and fallback handling.
+Gate events determine progress; no outcome depends on elapsed-time or
+throughput measurements.
 """
 
 from __future__ import annotations
 
-import io
 import sys
-import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-
-from PIL import Image
 
 _SRC_DIR = str(Path(__file__).resolve().parents[2] / "src")
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from diffusion.data_plane import DiffusionDataPlaneRuntime
-from diffusion.distributed import BlobConflict
 from task_graph import StageSpec, TaskGraphCoordinator, WorkflowCancelled
 from task_provider import (
     DeterministicFakeProvider,
@@ -62,10 +56,6 @@ _SCENARIOS = {
     "parallel_cancellation_releases_slots": SimulationScenario(
         "parallel_cancellation_releases_slots",
         "cancellation fences active stages and converges every Provider slot",
-    ),
-    "cas_capacity_recovery": SimulationScenario(
-        "cas_capacity_recovery",
-        "a leased object blocks capacity until explicit lease-aware cleanup",
     ),
 }
 
@@ -216,12 +206,6 @@ class CapacitySimulationHarness:
     def _assert_idle(statuses: list[dict]) -> None:
         if any(status["active_reservations"] != 0 for status in statuses):
             raise RuntimeError("simulated capacity slots did not converge")
-
-    @staticmethod
-    def _png(color: tuple[int, int, int]) -> bytes:
-        output = io.BytesIO()
-        Image.new("RGB", (8, 6), color).save(output, format="PNG")
-        return output.getvalue()
 
     def _run_global_parallel_bound(self) -> dict:
         tracker = _ActiveTracker()
@@ -405,72 +389,3 @@ class CapacitySimulationHarness:
             for provider in providers:
                 provider.allow(2)
             coordinator.close()
-
-    def _run_cas_capacity_recovery(self) -> dict:
-        first = self._png((20, 40, 80))
-        second = self._png((90, 30, 10))
-        now = [100.0]
-        options = {
-            "max_blob_bytes": max(len(first), len(second)),
-            "max_total_bytes": len(first) + len(second) - 1,
-            "upload_ttl_seconds": 1.0,
-        }
-        with tempfile.TemporaryDirectory(prefix="qlh-sim-capacity-") as state_dir:
-            runtime = DiffusionDataPlaneRuntime.create(
-                state_dir=state_dir,
-                cluster_secret="s" * 32,
-                store_options=options,
-                clock=lambda: now[0],
-            )
-            try:
-                first_descriptor = runtime.store.put_bytes(
-                    first,
-                    content_type="image/png",
-                    purpose="output",
-                    owner_scope="distributed:wf_simn5capacity_a",
-                    width=8,
-                    height=6,
-                )
-                lease = runtime.store.acquire_lease(
-                    first_descriptor.blob_id,
-                    attempt_id="att_simn5capacity01",
-                    ttl_seconds=60.0,
-                )
-                try:
-                    runtime.store.put_bytes(
-                        second,
-                        content_type="image/png",
-                        purpose="output",
-                        owner_scope="distributed:wf_simn5capacity_b",
-                        width=8,
-                        height=6,
-                    )
-                except BlobConflict as exc:
-                    rejected_code = exc.code
-                else:
-                    raise RuntimeError("leased CAS object did not block bounded capacity")
-                runtime.store.release_lease(lease.lease_id)
-                cleanup = runtime.store.delete_owner_scope(
-                    "distributed:wf_simn5capacity_a", purpose="output",
-                )
-                now[0] += 2.0
-                runtime.store.cleanup()
-                snapshot = runtime.store.snapshot()
-                summary = {
-                    "blobs": snapshot["blobs"],
-                    "objects": snapshot["objects"],
-                    "uploads": snapshot["uploads"],
-                    "active_leases": snapshot["active_leases"],
-                }
-                if any(summary.values()):
-                    raise RuntimeError("simulated CAS capacity cleanup did not converge")
-                return {
-                    "rejected_codes": [rejected_code],
-                    "cleanup": {
-                        "blobs_removed": cleanup["blobs_removed"],
-                        "leases_revoked": cleanup["leases_revoked"],
-                    },
-                    "store": summary,
-                }
-            finally:
-                runtime.close()

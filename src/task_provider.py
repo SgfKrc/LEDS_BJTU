@@ -267,7 +267,6 @@ class LocalFullModelProvider:
         supported_stage_types: tuple[str, ...] = (
             "full_inference",
             "aggregate",
-            "image_prompt",
         ),
         max_concurrency: int = 1,
         provider_kind: str = "local_full_model",
@@ -476,7 +475,6 @@ class InProcessWorkerProvider(LocalFullModelProvider):
         supported_stage_types: tuple[str, ...] = (
             "full_inference",
             "aggregate",
-            "image_prompt",
         ),
         max_concurrency: int = 1,
     ):
@@ -502,7 +500,6 @@ class DeterministicFakeProvider(LocalFullModelProvider):
         supported_stage_types: tuple[str, ...] = (
             "full_inference",
             "aggregate",
-            "image_prompt",
         ),
         max_concurrency: int = 1,
         delay_seconds: float = 0.0,

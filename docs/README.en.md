@@ -25,7 +25,7 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | Tier | Edition | Target devices | Core capabilities | Excludes / not recommended |
 |------|----------|----------------|-------------------|----------------------------|
 | 1 | **PC iGPU** | Windows / Linux PCs without NVIDIA dGPU | llama.cpp + GGUF CPU/iGPU inference, cluster join, remote request forwarding | PyTorch layer pipeline, heavy-model experiments, CUDA-only features |
-| 2 | **PC dGPU** | Windows / Linux NVIDIA GPU master/experiment PCs | PyTorch + CUDA + bitsandbytes with CPU fallback, **SD 1.5 image sidecar** (txt2img/img2img/reference/inpaint/instruction), future multi-model & heavy-model experiments | Android minimal strategy |
+| 2 | **PC dGPU** | Windows / Linux NVIDIA GPU master/experiment PCs | PyTorch + CUDA + bitsandbytes with CPU fallback, multi-model and heavy-model experiments | Android minimal strategy; image generation belongs to Koakumix |
 | 3 | **Android standard** | Android phones/tablets | Full-on local GGUF, thin forwarding to PC, SAF model directory, update/log/connection diagnostics; Full Worker/Stage and Gemma4 MTMD have local development wiring | Transformer layer splitting and heavy-model experiments; real-device Worker, multimodal quality and background survival remain to be accepted |
 | 4 | **Android lite** | Lightweight phone entry | Minimal chat, remote PC forwarding, smallest APK/cache/model footprint, single recommended small/INT4 route | Local GGUF, full model directory, Worker execution and advanced control surfaces |
 
@@ -41,11 +41,11 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🧩 **Model-asset governance** | Registry, manifest/SHA verification, source/license handling, Sidecar contracts, deployment simulation and HF direct → user proxy → ModelScope fallback are wired into the local product surface; real large artifacts, CUDA and cross-PC delivery remain to be accepted |
 | 🖼️ **Multi-model & multimodal Sidecars** | Qwen3 PyTorch isolated runtime plus Gemma4 native GGUF/mmproj MTMD and PyTorch Sidecar paths have completed development gates. Artifact availability, memory/VRAM budgets and precise identity contracts still fail closed; heavy models are never auto-admitted on an 8 GB machine |
 | 🌐 **Tailscale & dual stack** | IPv4/IPv6 endpoints, manual cluster join and reconnect fall back as “user preference → bootstrap → Tailnet”; explicit successful connects persist the preference. A short dual-machine IPv6 task is verified; IPv4-only/IPv6-only installers and real WSS/443 remain environment acceptance work |
-| 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; real control/gateway, OS credential and first-install integration remain deferred |
+| 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; OS credential and first-install integration remain deferred |
 | 📦 **Install, update & offline bundle** | Independent Launcher signing/update/rollback, download progress and diagnostics are implemented. The offline bundle provides capacity preflight, SHA/manifest, atomic ZIP, 7z/split output and restore validation; real full bundles, empty-root/Android SAF import and cross-platform install acceptance are deferred |
 | 🎛️ **Admin panel** | Node register/deregister, layer overrides, role transfer, spare master, TCP status |
 | 🖥️ **TUI** | Terminal admin menu, zero-dependency stdlib; `bjtu chat` built-in Textual chat page |
-| 🎨 **SD 1.5 image gen** *(dGPU)* | Local workspace: txt2img, img2img, IP-Adapter, inpaint, InstructPix2Pix; offline asset packages ready (5 assets, 15 GB, offline-reproducible) |
+| **Multimodal input** | Main QLH keeps image upload and Gemma/Qwen image understanding; generation/editing and image assets belong to Koakumix |
 | 📱 **Android client** | Standard supports local GGUF/remote PC, SAF, presence lease, Full Worker/Stage, Gemma4 mmproj/JNI image path, update/redacted logs/connection diagnostics; Lite is the remote lightweight entry. These are local/JVM/cross-build gates, with device and production acceptance deferred |
 | 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
@@ -158,16 +158,13 @@ Project root
 │   ├── api_server.py              # FastAPI server (REST API + WebSocket)
 │   ├── local_store.py             # Primary-node SQLite local storage (one-time legacy JSON import)
 │   ├── model_downloader.py        # Model download guidance (HuggingFace/ModelScope/Baidu Netdisk)
-│   ├── model_host.py              # Model lifecycle host (manager-held, LLM/SD mutex)
+│   ├── model_host.py              # Model lifecycle host (manager-held, LLM runtime lifecycle)
 │   ├── email_notifier.py          # SMTP alerts + IMAP voting (recipient configurable via node_config)
 │   ├── scheduler_svc_http.py      # scheduler-svc HTTP shell (contract passthrough)
-│   ├── diffusion/                 # ★ SD 1.5 sidecar (engine/assets/service, separate CUDA venv)
 │   ├── inference_service/         # ★ inference-svc (engine_host/protocol/routes)
 │   └── node_config.py             # Local node configuration (cluster secret/profile, not source-controlled)
-├── control/                       # ★ control-svc (NestJS: 9 control-plane domains + SQLite local facts source)
-├── gateway/                       # ★ api-gateway (NestJS + Fastify, 96+ endpoint passthrough)
 ├── schemas/                       # ★ MODEL-FLEET frozen contracts (artifact/pull-job/deployment/profile JSON Schema)
-├── fixtures/                      # Test & walkthrough fixtures (SD SSE event streams, model-gate samples)
+├── fixtures/                      # Test & walkthrough fixtures (LLM/SSE event streams, model-gate samples)
 ├── android/                       # Android client (Kotlin + Jetpack Compose)
 │   ├── app/
 │   │   ├── build.gradle.kts       # Gradle build script (release signing config)
@@ -206,11 +203,8 @@ Project root
 │   │   └── qlh-edge-inference.desktop  # desktop entry
 │   ├── dist/                      # ★ Final installer output (git-ignored)
 │   └── README.md                  # Packaging docs
-├── frontend/                      # Frozen historical React frontend; comparison and legacy-package resources only
-│   └── src/
-│       └── ...                    # No new product work is accepted here
 ├── frontend_cybergothic/          # ★ Sole product frontend (React + TypeScript + Vite)
-│   ├── src/                       # Chat / Models / RAG / Tasks / Image Studio / Account product pages
+│   ├── src/                       # Chat / Models / RAG / Tasks / Account product pages
 │   └── scripts/                   # Contrast and browser-regression tools
 ├── harness_workbench/             # ★ Small-model harness workbench (independent sub-project; no main-project imports)
 │   ├── context_engine/            # Context budget & STATE compression
@@ -332,14 +326,10 @@ User input → Master → TCP → Worker 1 (Client) → TCP → Worker 2 (Client
 |------|----------|------|
 | llama-cpp-python | ≥ 0.3.0 | CPU-optimized GGUF inference, 3-5x faster than PyTorch on CPU |
 
-### SD 1.5 Image Sidecar (Optional for Discrete-GPU Build)
+### Image generation boundary
 
-| Dependency | Version Requirement | Notes |
-|------|----------|------|
-| diffusers | 0.35.2 (pinned) | Image workspace pipeline; 0.38+ requires DINOv2 config, outside the compatibility window |
-| transformers | 4.47.1 (pinned) | Same library as the LLM side but in a separate CUDA venv (`packaging/requirements-sd15.txt`) |
+QLH no longer ships an image-generation engine, image-generation API, Diffusers dependencies, or image assets. Image upload and Gemma/Qwen multimodal understanding remain in the main project. Koakumix owns the local image workspace and exposes its own OpenAI-compatible `/v1/images/generations` endpoint.
 
-> The SD sidecar lives in a separate CUDA venv (on the `.venv-packaging-cuda` side) and never imports into or upgrades the global interpreter; `torch.compile`/Inductor are explicitly rejected because Triton is unavailable.
 
 ### Web Visualization
 
@@ -393,7 +383,7 @@ User input → Master → TCP → Worker 1 (Client) → TCP → Worker 2 (Client
 # Python dependencies (primary node is self-contained on SQLite; no PostgreSQL needed)
 pip install -r requirements.txt
 
-# Product frontend dependencies (legacy frontend/ is frozen)
+# Product frontend dependencies (sole product frontend)
 cd frontend_cybergothic && npm ci && cd ..
 ```
 
@@ -427,8 +417,8 @@ python scripts/setup_envs.py --list       # show the environment inventory
 | `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
 | `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar (incl. pipeline execution deps) | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
 | `.venv-packaging` | iGPU packaging (CPU torch + PyInstaller) | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
-| `.venv-packaging-cuda` | dGPU packaging + SD sidecar | `packaging/requirements-cpu.txt` + `packaging/requirements-sd15.txt` | `requirements-lock/packaging-cuda.lock.txt` |
-| frontend / gateway / control | Node sub-projects | each `package-lock.json` (`npm ci`, handled with --all) | — |
+| `.venv-packaging-cuda` | dGPU packaging (CUDA torch) | `packaging/requirements-cpu.txt` | `requirements-lock/packaging-cuda.lock.txt` |
+| frontend_cybergothic | Sole product frontend | `package-lock.json` (`npm ci`) | — |
 
 > `setup_all_envs.bat` runs `chcp 65001` automatically on Windows; if you run the script directly and the terminal shows mojibake, run `chcp 65001` or `set PYTHONIOENCODING=utf-8`.
 
@@ -441,7 +431,7 @@ python scripts/setup_envs.py --list       # show the environment inventory
 | **Main** (system Python) | Runtime (transformers 4.47.1 / torch / inference services) and tool scripts | `requirements.txt` | No pytest-family test deps; no full test runs |
 | **`.venv-test`** | **The only test environment** (all pytest runs) | `scripts/setup_test_env.py` + `requirements-test.txt` | No runtime inference; not a main env substitute |
 | `.venv-packaging/` | iGPU packaging (CPU torch) | `packaging/requirements-cpu.txt` | — |
-| `.venv-packaging-cuda/` | dGPU packaging (CUDA torch) + SD sidecar | see packaging docs | — |
+| `.venv-packaging-cuda/` | dGPU packaging (CUDA torch) | see packaging docs | — |
 | `.venv-gemma4-native/`, `.venv-qwen3-sidecar/` | Isolated sidecar runtimes (native MTMD / Qwen3 sidecar) | their own requirements | — |
 
 **Common commands**:
@@ -474,7 +464,7 @@ git submodule update --init --recursive
 # 2. Install Python dependencies (main environment; online)
 pip install -r requirements.txt
 
-# 3. Product frontend dependencies (optional; legacy frontend/ is frozen)
+# 3. Product frontend dependencies (optional)
 cd frontend_cybergothic && npm ci && cd ..
 
 # 4. Environment files (not committed; create per node)
@@ -508,14 +498,14 @@ At runtime use `execution_device=cpu` (or `auto`, which falls back to CPU when C
 | **Qwen3-4B (GGUF Q4_K_M)** | ~2.5 GB | EX-N3 judging model (v2 accuracy criteria), experiments | managed download (MODEL-TOOLS) / HF `Qwen/Qwen3-4B-GGUF` | experiments |
 | **Gemma 4 12B native binding** (GGUF + mmproj) | ~7.3 GB | image understanding (image-to-text) native path | managed artifact manifest `models/gemma4-native/gemma4-native.lock.json` + download script | multimodal experiments |
 | **nomic-embed-text:latest** (Ollama) | on demand | master-node local RAG embedding provider | `ollama pull nomic-embed-text:latest` | local RAG quality/capacity gates |
-| **SD 1.5 five-asset offline package** | ~15 GB (5 packages) | image generation workspace (vanilla/90s/IP-Adapter/inpaint/InstructPix2Pix) | official offline assets (see [SD 1.5 offline asset plan](SD%201.5离线资产包与签名源站发布计划.md)) or `python scripts/download_sd15.py` | image experiments |
+| **Koakumix image assets** | Koakumix-owned | image generation workspace | kept outside the QLH offline bundle; see the Koakumix documentation |
 | **Ollama models** (`gemma4:12b` etc.) | on demand | EX-N3 Gemma judging, external-path verification | `ollama pull gemma4:12b` | judging experiments |
 
 ### 2. Already in the Repo / No Need to Fetch
 
 | Item | Note |
 |---|---|
-| ✅ License texts | `packaging/sd15-licenses/` committed (CreativeML OpenRAIL-M / OpenRAIL / Apache-2.0 / MIT) |
+| ✅ Runtime license records | LLM/multimodal runtime licenses stay with their managed assets; Koakumix owns image-generation licenses outside the QLH bundle |
 | ✅ Test fixtures & experiment plans | all of `fixtures/` committed |
 | ✅ Signature origin / serve distribution | code in `packaging/`, no extra assets |
 | ⚠️ Release signing keys | `packaging/.signing-keys/` **not in the repo**; held by release owners — a clone can only verify, not sign |
@@ -573,33 +563,9 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat
 | Q5_K_M | ~1.31 GB | Higher quality |
 | Q8_0 | ~1.82 GB | Near-lossless |
 
-### SD 1.5 Image Models (Optional, Discrete-GPU Build)
+### Image generation
 
-The image workspace uses local Diffusers assets pinned at fixed revisions (fully offline inference, no Hub access):
-
-| Asset | Pinned Source | Size | Purpose |
-|------|----------|------|------|
-| **Original SD 1.5** | `stable-diffusion-v1-5@451f4fe1…` | ~2.74 GB snapshot | Text-to-image / image-to-image baseline (CreativeML OpenRAIL-M) |
-| **90s DreamBooth** | `aa8a082c…` (with original safety checker) | ~4.87 GB pinned set | 1990s retro anime preset (openrail, dual-reviewer visual pass) |
-| **IP-Adapter reference** | `h94/IP-Adapter@018e4027…` (stable SHA `671c7452…`) | ~2.57 GB | Reference-image consistency (keeps key character elements, not exact identity lock) |
-| **SD 1.5 Inpainting** | `stable-diffusion-inpainting@8a4288a7…` (stable SHA `ddd6d69a…`) | ~2.74 GB | 9-channel U-Net local repainting (white mask repaints, black preserves) |
-| **InstructPix2Pix** | `timbrooks/instruct-pix2pix@31519b5c…` (stable SHA `a6626f7f…`) | ~2.74 GB | Natural-language instruction editing (MIT; auto gates, Edge pipeline and dual-reviewer visual pass all cleared; offline asset packages released, 5 assets 15 GB, offline-importable) |
-
-Download and verification:
-
-```bash
-# One-click download (pinned revision + per-file SHA verification + manifest)
-python scripts/download_sd15.py --asset-id sd15_90s_retrovers_v1 --accept-license
-# Ten-seed automatic quality gate (black/low-entropy/corrupt/duplicate rejection + dual-reviewer registration)
-python scripts/quality_gate_sd15.py --asset-id sd15_90s_retrovers_v1
-# img2img / IP-Adapter full matrix gates (source SHA + strength/scale matrix + VRAM gate)
-python scripts/quality_gate_sd15_img2img.py --review-report build/sd15-img2img-quality/full-90s/quality-report.json --reviewer 审核者=pass
-python scripts/quality_gate_sd15_ip_adapter.py --review-report build/sd15-ip-adapter-quality/sd15_90s_retrovers_v1-v2/quality-report.json --reviewer 审核者=pass
-# InstructPix2Pix ten fixed-instruction gate; two independent reviewers required after the auto gate
-python scripts/quality_gate_sd15_instruction.py
-```
-
-You can also download/import directly in the Web image workspace (asset directory refresh auto-discovers new assets). License and gated status are shown before download; official offline asset packages (5 assets, 15 GB, with license copies + model cards) are released and offline-importable.
+The QLH main project does not provide image generation or editing. Use the independent Koakumix `harness_workbench` image workspace and its `/v1/images/generations` endpoint. QLH still supports image input for multimodal chat.
 
 ### GGUF Format (Android Local Inference)
 
@@ -654,7 +620,7 @@ Once the backend is ready:
 - **Product frontend dev server**: `http://localhost:5174` (Vite HMR, proxied to 8000)
 - **Product desktop shell**: build `frontend_cybergothic`, then run `python packaging/launcher_cybergothic.py` (default `9851`, proxies `/api` to `8000`)
 
-> The standard backend, pywebview Launcher, CPU/CUDA/Slim specs, and Linux `.deb` now use `frontend_cybergothic/dist` by default. The old `frontend/dist` is available only through the explicit `QLH_FRONTEND_DIST` compatibility override; clean-machine first launch, WebView2, Linux install, and upgrade remain release acceptance gates.
+> The standard backend, pywebview Launcher, CPU/CUDA/Slim specs, and Linux `.deb` now use `frontend_cybergothic/dist` by default; clean-machine first launch, WebView2, Linux install, and upgrade remain release acceptance gates.
 
 ### Standalone Mode (PC)
 
@@ -805,7 +771,7 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 > Never mix them — the iGPU venv must install CPU-only torch, and the dGPU venv must install CUDA torch.
 > Installing the wrong one will bloat the iGPU build from 180 MB to 1.8 GB.
 >
-> **SD 1.5 image sidecar**: the dGPU edition additionally installs `pip install -r packaging/requirements-sd15.txt` (pins diffusers 0.35.2 / transformers 4.47.1; the standalone sidecar does not pollute the LLM inference environment); image model assets are not bundled into the installer; official offline asset packages (with license copies + model cards) are released and imported offline.
+> **Image-generation boundary**: CPU/CUDA QLH packages contain no image-generation dependencies, models, or workspace. Install and run that capability only in Koakumix; QLH image input and multimodal understanding remain available.
 >
 > After installation, double-click the desktop shortcut to launch — no Python environment configuration needed. On uninstall you will be asked whether to also delete the `models/` directory; model files are kept by default.
 >

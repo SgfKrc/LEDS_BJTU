@@ -35,21 +35,6 @@ def _quality_for(plan, check: str) -> dict:
                 "format": {"evaluated_count": 11, "passed_count": 0},
             },
         }
-    elif check == "sd":
-        raw = {
-            "sd": {
-                "mode": "text_to_image",
-                "asset_id": "sd15_90s_retrovers_v1",
-                "artifact_id": "sd15_90s_retrovers_v1",
-                "source_schema_version": 1,
-                "automatic_gate": {
-                    "passed": True,
-                    "output_count": 10,
-                    "unique_output_count": 10,
-                },
-                "manual_review": {"status": "passed", "required_reviewers": 2},
-            },
-        }
     else:
         raw = {
             "gemma_judge": {
@@ -110,9 +95,9 @@ def test_production_gate_promotes_complete_three_side_evidence(tmp_path):
     decision = audit_production_quality(PLAN_PATH, _write_records(tmp_path, _valid_records()))
 
     assert decision["status"] == "passed"
-    assert [entry["status"] for entry in decision["coverage"]] == ["passed"] * 3
+    assert [entry["status"] for entry in decision["coverage"]] == ["passed"] * 2
     assert decision["policy"]["quality_required"] is True
-    assert decision["records"]["count"] == 3
+    assert decision["records"]["count"] == 2
     assert decision["reasons"] == []
 
 
@@ -154,7 +139,7 @@ def test_production_gate_recalculates_the_plan_performance_threshold(tmp_path):
 def test_production_gate_treats_missing_manual_review_as_quality_failure(tmp_path):
     records = _valid_records()
     plan = load_plan(PLAN_PATH)
-    records[2]["quality"] = normalize_quality_evidence(
+    records[1]["quality"] = normalize_quality_evidence(
         {
             "gemma_judge": {
                 "model": "gemma4:12b",
@@ -169,7 +154,7 @@ def test_production_gate_treats_missing_manual_review_as_quality_failure(tmp_pat
         expected_prompt_set=plan.prompt_set,
         expected_gemma_judge=plan.quality.gemma_judge,
     )
-    records[2]["quality_gate"] = {
+    records[1]["quality_gate"] = {
         "status": "passed", "required": True, "checks": ["gemma_judge"],
     }
 

@@ -193,21 +193,6 @@ EXPECTED_ENDPOINTS = [
     ("GET", "/v1/models/current"),
     ("GET", "/v1/models/local-assets"),
     ("POST", "/v1/models/local-assets/{model_id}/preflight"),
-    ("GET", "/v1/diffusion/capabilities"),
-    ("POST", "/v1/diffusion/artifacts/inspect"),
-    ("POST", "/v1/diffusion/artifacts/register"),
-    ("GET", "/v1/diffusion/artifacts"),
-    ("GET", "/v1/diffusion/assets/catalog"),
-    ("GET", "/v1/diffusion/assets/{asset_id}/status"),
-    ("POST", "/v1/diffusion/assets/{asset_id}/download"),
-    ("POST", "/v1/diffusion/assets/import"),
-    ("POST", "/v1/diffusion/load"),
-    ("POST", "/v1/diffusion/unload"),
-    ("POST", "/v1/diffusion/generate"),
-    ("GET", "/v1/diffusion/jobs/{job_id}"),
-    ("POST", "/v1/diffusion/jobs/{job_id}/cancel"),
-    ("GET", "/v1/diffusion/blobs/{blob_id}"),
-    ("DELETE", "/v1/diffusion/blobs/{blob_id}"),
     ("POST", "/v1/chat"),
     ("POST", "/v1/chat/stream"),
     ("POST", "/v1/chat/cancel"),
@@ -2089,27 +2074,6 @@ def test_peer_client_no_heavy_imports():
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     )
     assert "BAD: []" in result.stdout, f"从节点入口拉入了重依赖: {result.stdout} {result.stderr}"
-
-
-# ----------------------------------------------------------------------
-# 18. 1.7 scheduler-svc 入口（QLH_MONOLITH 回退选择）
-# ----------------------------------------------------------------------
-def test_scheduler_svc_host_selection(monkeypatch):
-    import scheduler_svc_main
-
-    # 微服务模式：host=InferenceClient
-    monkeypatch.setenv("QLH_MONOLITH", "0")
-    sched = scheduler_svc_main.build_scheduler()
-    from inference_client import InferenceClient
-
-    assert isinstance(sched.inference_host, InferenceClient)
-
-    # 回退模式：host=进程内 model_host（一键回单进程）
-    monkeypatch.setenv("QLH_MONOLITH", "1")
-    sched2 = scheduler_svc_main.build_scheduler()
-    from model_host import ModelHost
-
-    assert isinstance(sched2.inference_host, ModelHost)
 
 
 # ----------------------------------------------------------------------

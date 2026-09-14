@@ -17,41 +17,19 @@ import json
 import logging
 import re
 import threading
-from typing import Any, Dict, Iterator, NoReturn, Optional
+from typing import Any, Dict, Iterator, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from api_errors import coded_http_error
 from model_api_access import require_model_api_source
 from inference_service.kv_host import KVCapacityError, KVCleanupError
-from diffusion import (
-    DiffusionBlobInUseError,
-    DiffusionBlobReferencedError,
-    DiffusionConflictError,
-    DiffusionInputError,
-    DiffusionNotFoundError,
-    DiffusionServiceError,
-    DiffusionUnsupportedError,
-    DIFFUSION_MAX_UPLOAD_BYTES,
-    SD15EditRequest,
-    build_sd15_engine_config,
-    build_sd15_generation_request,
-    list_presets as list_diffusion_presets,
-)
-
 from . import __version__
 from .protocol import (
     ChatCancelRequest,
     ChatRequest,
-    DiffusionArtifactInspectRequest,
-    DiffusionArtifactRegisterRequest,
-    DiffusionAssetDownloadRequest,
-    DiffusionAssetImportRequest,
-    DiffusionEditRequest,
-    DiffusionGenerateRequest,
-    DiffusionLoadRequest,
     EmbeddingRequest,
     KVFreeRequest,
     KVInitRequest,
@@ -128,76 +106,6 @@ def _require_master_role(request: Request) -> None:
         )
 
 
-_LOCAL_PATH_CLIENTS = {
-    "",
-    "127.0.0.1",
-    "::1",
-    "::ffff:127.0.0.1",
-    "localhost",
-    "testclient",
-}
-
-
-def _require_local_path_client(request: Request) -> None:
-    client_host = (request.client.host if request.client else "") or ""
-    if client_host not in _LOCAL_PATH_CLIENTS:
-        raise HTTPException(
-            status_code=403,
-            detail="SD 模型路径检查和登记仅允许在主节点本机执行",
-        )
-
-
-def _raise_diffusion_error(exc: Exception) -> NoReturn:
-    if isinstance(exc, DiffusionInputError):
-        raise HTTPException(
-            status_code=400,
-            detail={'code': exc.code, 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, DiffusionUnsupportedError):
-        raise HTTPException(
-            status_code=501,
-            detail={'code': exc.code, 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, (DiffusionBlobInUseError, DiffusionBlobReferencedError)):
-        raise HTTPException(
-            status_code=409,
-            detail={'code': exc.code, 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, DiffusionNotFoundError):
-        raise HTTPException(
-            status_code=404,
-            detail={'code': exc.code, 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, DiffusionConflictError):
-        raise HTTPException(
-            status_code=409,
-            detail={'code': exc.code, 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, (ValueError, OSError)):
-        raise HTTPException(
-            status_code=400,
-            detail={'code': 'DIFFUSION_INVALID_INPUT', 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, ImportError):
-        raise HTTPException(
-            status_code=503,
-            detail={'code': 'DIFFUSION_DEPENDENCY_MISSING', 'message': str(exc)},
-        ) from exc
-    if isinstance(exc, DiffusionServiceError):
-        raise HTTPException(
-            status_code=500,
-            detail={'code': exc.code, 'message': str(exc)},
-        ) from exc
-    raise HTTPException(
-        status_code=500,
-        detail={
-            'code': 'DIFFUSION_EXECUTION_FAILED',
-            'message': f"SD 1.5 本地引擎失败: {str(exc)[:500]}",
-        },
-    ) from exc
-
-
-# ----------------------------------------------------------------------
 # SSE 序列化（对齐 api_server 事件格式）
 # ----------------------------------------------------------------------
 def _sse_event(payload: Dict[str, Any]) -> str:
@@ -289,15 +197,12 @@ async def models_load(req: LoadModelRequest, request: Request):
     engine = _check_load_engine(req.engine)
     _check_model_registered(req.model_id, engine)
     host = _engine_host(request)
-    try:
-        result = host.load_model(
-            engine=engine,
-            quant_type=req.quant_type,
-            use_compile=req.use_compile,
-            model_id=req.model_id,
-        )
-    except DiffusionConflictError as exc:
-        _raise_diffusion_error(exc)
+    result = host.load_model(
+        engine=engine,
+        quant_type=req.quant_type,
+        use_compile=req.use_compile,
+        model_id=req.model_id,
+    )
     if req.layer_range:
         host.load_layer_range(layer_range=req.layer_range)
     return result
@@ -314,10 +219,7 @@ async def models_switch(req: SwitchModelRequest, request: Request):
     require_model_api_source(request)
     engine = _check_load_engine(req.engine)
     _check_model_registered(req.model_id, engine)
-    try:
-        return _engine_host(request).switch_model(model_id=req.model_id, engine=engine)
-    except DiffusionConflictError as exc:
-        _raise_diffusion_error(exc)
+    return _engine_host(request).switch_model(model_id=req.model_id, engine=engine)
 
 
 @router.get("/models/current")
@@ -353,294 +255,6 @@ async def models_available(request: Request):
     """可选模型配置 + 可用引擎（对齐 api_server /api/models/available）。"""
     require_model_api_source(request)
     return _engine_host(request).available_models()
-
-
-# ----------------------------------------------------------------------
-# Stable Diffusion 1.5 local sidecar
-# ----------------------------------------------------------------------
-@router.get("/diffusion/capabilities")
-async def diffusion_capabilities(request: Request):
-    _require_master_role(request)
-    result = _engine_host(request).diffusion_status()
-    result["presets"] = [
-        {
-            "preset_id": preset.preset_id,
-            "model_id": preset.model_id,
-            "prompt": preset.prompt,
-            "negative_prompt": preset.negative_prompt,
-            "width": preset.width,
-            "height": preset.height,
-            "steps": preset.steps,
-            "guidance_scale": preset.guidance_scale,
-            "scheduler": preset.scheduler,
-            "seeds": list(preset.seeds),
-            "safety_checker_required": preset.safety_checker_required,
-        }
-        for preset in list_diffusion_presets()
-    ]
-    return result
-
-
-@router.post("/diffusion/artifacts/inspect")
-async def diffusion_inspect(
-    req: DiffusionArtifactInspectRequest,
-    request: Request,
-):
-    _require_master_role(request)
-    _require_local_path_client(request)
-    try:
-        artifact = await run_in_threadpool(
-            _engine_host(request).diffusion_inspect,
-            req.path,
-            compute_hash=req.compute_hash,
-        )
-        return artifact.to_dict(include_path=True)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/artifacts/register")
-async def diffusion_register(
-    req: DiffusionArtifactRegisterRequest,
-    request: Request,
-):
-    _require_master_role(request)
-    _require_local_path_client(request)
-    try:
-        artifact = await run_in_threadpool(
-            _engine_host(request).diffusion_register,
-            req.path,
-            artifact_id=req.artifact_id,
-            name=req.name,
-            compute_hash=req.compute_hash,
-        )
-        return artifact.snapshot(include_path=False)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.get("/diffusion/artifacts")
-async def diffusion_artifacts(request: Request):
-    _require_master_role(request)
-    return {"artifacts": _engine_host(request).diffusion_artifacts()}
-
-
-@router.get("/diffusion/assets/catalog")
-async def diffusion_asset_catalog(request: Request):
-    _require_master_role(request)
-    return {"assets": await run_in_threadpool(_engine_host(request).diffusion_asset_catalog)}
-
-
-@router.get("/diffusion/assets/{asset_id}/status")
-async def diffusion_asset_status(asset_id: str, request: Request):
-    _require_master_role(request)
-    try:
-        return await run_in_threadpool(
-            _engine_host(request).diffusion_asset_status,
-            asset_id,
-        )
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/assets/{asset_id}/download", status_code=202)
-async def diffusion_asset_download(
-    asset_id: str,
-    req: DiffusionAssetDownloadRequest,
-    request: Request,
-):
-    _require_master_role(request)
-    _require_local_path_client(request)
-    try:
-        return _engine_host(request).diffusion_asset_download(
-            asset_id,
-            license_accepted=req.license_accepted,
-            use_local_proxy_fallback=req.use_local_proxy_fallback,
-        )
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/assets/import")
-async def diffusion_asset_import(
-    req: DiffusionAssetImportRequest,
-    request: Request,
-):
-    _require_master_role(request)
-    _require_local_path_client(request)
-    try:
-        return await run_in_threadpool(
-            _engine_host(request).diffusion_asset_import,
-            req.asset_id,
-            req.path,
-            license_accepted=req.license_accepted,
-        )
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/load")
-async def diffusion_load(req: DiffusionLoadRequest, request: Request):
-    _require_master_role(request)
-    config = build_sd15_engine_config(
-        req.profile,
-        safety_checker_required=req.safety_checker_required,
-    )
-    try:
-        return await run_in_threadpool(
-            _engine_host(request).diffusion_load,
-            req.artifact_id,
-            config,
-        )
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/unload")
-async def diffusion_unload(request: Request):
-    _require_master_role(request)
-    try:
-        return await run_in_threadpool(_engine_host(request).diffusion_unload)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/generate", status_code=202)
-async def diffusion_generate(req: DiffusionGenerateRequest, request: Request):
-    _require_master_role(request)
-    try:
-        generation = build_sd15_generation_request(
-            preset_id=req.preset_id,
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            seed=req.seed,
-            width=req.width,
-            height=req.height,
-            steps=req.steps,
-            guidance_scale=req.guidance_scale,
-            scheduler=req.scheduler,
-        )
-        return _engine_host(request).diffusion_generate(generation)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post('/diffusion/blobs', status_code=201)
-async def diffusion_upload_blob(
-    request: Request,
-    purpose: str = Form(...),
-    file: UploadFile = File(...),
-):
-    _require_master_role(request)
-    try:
-        if purpose not in {'input_image', 'mask'}:
-            raise DiffusionInputError('purpose must be input_image or mask')
-        data = await file.read(DIFFUSION_MAX_UPLOAD_BYTES + 1)
-        return await run_in_threadpool(
-            lambda: _engine_host(request).diffusion_put_blob(
-                data,
-                purpose=purpose,
-                owner_scope='inference-local',
-            )
-        )
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-    finally:
-        await file.close()
-
-
-@router.post('/diffusion/edit', status_code=202)
-async def diffusion_edit(req: DiffusionEditRequest, request: Request):
-    _require_master_role(request)
-    try:
-        generation = build_sd15_generation_request(
-            preset_id=req.preset_id,
-            prompt=(
-                req.instruction
-                if req.mode == 'instruction'
-                else req.prompt
-            ),
-            negative_prompt=req.negative_prompt,
-            seed=req.seed,
-            width=req.width,
-            height=req.height,
-            steps=req.steps,
-            guidance_scale=req.guidance_scale,
-            scheduler=req.scheduler,
-        )
-        edit_request = SD15EditRequest(
-            mode=req.mode,
-            source_blob_id=req.source_blob_id,
-            mask_blob_id=req.mask_blob_id,
-            prompt=generation.prompt,
-            negative_prompt=generation.negative_prompt,
-            seed=generation.seed,
-            width=generation.width,
-            height=generation.height,
-            steps=generation.steps,
-            guidance_scale=generation.guidance_scale,
-            scheduler=generation.scheduler,
-            strength=req.strength,
-            instruction=req.instruction,
-            edit_adapter_id=req.edit_adapter_id,
-            conditioning_scale=req.conditioning_scale,
-            image_guidance_scale=req.image_guidance_scale,
-            ip_adapter_scale=req.ip_adapter_scale,
-        )
-        return _engine_host(request).diffusion_edit(
-            edit_request,
-            owner_scope='inference-local',
-        )
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.get("/diffusion/jobs/{job_id}")
-async def diffusion_job(job_id: str, request: Request):
-    _require_master_role(request)
-    try:
-        return _engine_host(request).diffusion_job(job_id)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.post("/diffusion/jobs/{job_id}/cancel")
-async def diffusion_cancel(job_id: str, request: Request):
-    _require_master_role(request)
-    try:
-        return _engine_host(request).diffusion_cancel(job_id)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-
-
-@router.get("/diffusion/blobs/{blob_id}")
-async def diffusion_blob(blob_id: str, request: Request):
-    _require_master_role(request)
-    try:
-        blob = _engine_host(request).diffusion_blob(blob_id)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-    return Response(
-        content=blob.data,
-        media_type=blob.content_type,
-        headers={
-            "Cache-Control": "private, no-store",
-            "ETag": f'"{blob.sha256}"',
-            "Content-Disposition": f'inline; filename="{blob.blob_id}.png"',
-        },
-    )
-
-
-@router.delete("/diffusion/blobs/{blob_id}")
-async def diffusion_delete_blob(blob_id: str, request: Request):
-    _require_master_role(request)
-    try:
-        deleted = _engine_host(request).diffusion_delete_blob(blob_id)
-    except Exception as exc:
-        _raise_diffusion_error(exc)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"image blob not found: {blob_id}")
-    return {"deleted": True, "blob_id": blob_id}
 
 
 # ----------------------------------------------------------------------

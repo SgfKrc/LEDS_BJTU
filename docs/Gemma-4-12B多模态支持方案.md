@@ -2,7 +2,7 @@
 
 > 状态：Active（G4.1-G4.4、G4.3.2B 已完成；G4.5 原生产品代码开发门和 CUDA 安装包构建完成，外部干净机实体验收待办；G4.6 调研与开发机对照完成；音频、长上下文继续后置）
 >
-> 更新日期：2026-08-16
+> 更新日期：2026-09-14
 > 适用范围：原版 Gemma 4 12B 同时保留 Ollama `external_api` 基线与受管 GGUF/mmproj 原生 MTMD 路径；原生代码已接入模型注册、API、Web/TUI 和 CUDA spec，安装包实机仍未验收
 >
 > 目标：先提供可验证、可回滚的原版 Gemma 4 12B 图像理解能力，再补产品交互；`myheretic:latest` 仍只作为用户私有资产，不进入项目基线。
@@ -24,7 +24,7 @@
 | 模态能力 | 现状 | 载体 |
 |---|---|---|
 | 文本推理(LLM) | ✅ 已有 8 个内置槽位 | `BUILTIN_MODELS`(`src/model_config.py:85-198`) |
-| 图像生成(文生图) | ✅ 已有 SD 1.5 全系 | `src/diffusion/assets.py` |
+| 图像生成(文生图) | ❌ 不属于 QLH 主项目 | 由 Koakumix 独立维护；QLH 只保留图片输入与图像理解 |
 | **图像理解(图生文)** | ❌ **缺失——多模态实验缺的最后一种** | 本方案补 gemma-4-12B |
 
 项目内**没有**现成的"多模态实验"清单文档(仅 `docs/一键模型部署与自治集群远期计划.md:309,340` 提及多模态 projector 为远期依赖);本方案同时定义该实验的接入与验证基线。
@@ -111,7 +111,7 @@ $ ollama show myheretic
 
 **准入红线（本机 8GB 显存）**：fp16 12B 权重加载需 **≈24GB VRAM**，本机显存门不通过，禁止本机准入；PyTorch 候选仅面向**大显存/多卡/分布式/微调**场景。
 
-**侧车定位（transformers 版本不兼容为预期设计）**：本机现有 transformers 4.47.1（主 venv 与 CUDA venv）均不识别 `gemma4_unified` 架构（实测 `AutoConfig.from_pretrained` 报"does not recognize this architecture"）。**不升级/污染既有 venv**——PyTorch 工件按 SD 1.5 侧车模式独立成 venv（如 `.venv-packaging-gemma4-pt`），独立安装支持 `gemma4_unified` 的新版 transformers，主解释器与 LLM 推理环境不受影响。
+**独立环境定位（仅适用于仍在维护的多模态验证）**：QLH 主项目不再保留 SD 生成侧车；Gemma 原生 MTMD/图片理解验证使用独立、受管运行时，不把生图依赖带入主项目。
 
 **容量预算**（本机实测：磁盘总 166GB / 可用 59GB）：
 
@@ -282,7 +282,7 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 | gemma4 全量 GPU offload | ~8.3GB（Q4 权重 7.6 + mmproj 0.35 + KV 余量） | ❌ 超预算，**禁止** |
 | **部分 offload（G4.5 采用）** | 层数×每层 ~0.21GB（36 层）+ KV 0.3-0.5GB；50% 层 ≈ 4.5-5GB | ✅ 可行（CPU-GPU 混合，吞吐介于 Ollama 与纯 CPU 之间） |
 | KV 缓存（n_ctx 512-2048） | 0.3-0.5GB | ✅ |
-| 与 SD 1.5 侧车并驻留 | 4.5-5 + SD 2-4 > 8 | ❌ **互斥规则**：原生 gemma4 与 SD 生成互斥（显存门 `mem_get_info` 先行） |
+| 与 Koakumix 生图运行时并驻留 | 不属于同一产品进程 | QLH 与 Koakumix 进程/依赖/资产隔离，互不宣称联合驻留 |
 | 与 Ollama gemma4 并驻留 | Ollama 工作集 ~9.9GB（含系统内存） | ❌ **互斥**：原生路径运行前要求 Ollama 无驻留（G4.3.2B 既有规则） |
 
 > G4.5 的 GPU 验收按**部分 offload + 互斥规则**执行，不承诺全量 offload。
@@ -302,7 +302,7 @@ G4.3.2B 已于 2026-08-13 完成（原生图片语义通过，见 §2.1「原生
 | 里程碑 | 内容 | 验收标准 | 依赖 |
 |---|---|---|---|
 | **G4.4 独立工件链** | 从 Hugging Face bartowski 转换仓库（经 7897 代理）下载 gemma-4-12B 的 GGUF + mmproj（Q4_K_M 路线，本机 8GB 可用），SHA-256/许可/manifest 冻结，写入受管资产；原生 smoke 改用独立工件（不再读 `~/.ollama/models/blobs`） | 断网 Ollama 环境下原生路径可加载并完成图像语义 smoke；工件冻结记录（SHA/大小/许可）入库 | §5.6 #1（已完成） |
-| **G4.5 原生引擎产品化** | §5.6 #2 产品接线（chat 接口 `image_url` → 原生 MTMD）、#5 GPU offload（`n_gpu_layers` + 8GB 显存预算门 + 与 SD 并驻留规则）、#6 打包（原生绑定 + 工件进安装包）、#7 卸载/取消矩阵 | `llama_cpp` 引擎在 QLH chat 接口原生图生文；GPU 吞吐对标 Ollama（见 G4.6）；打包产物离线可用；取消不泄漏 | G4.4、§5.6 #2 |
+| **G4.5 原生引擎产品化** | §5.6 #2 产品接线（chat 接口 `image_url` → 原生 MTMD）、#5 GPU offload（`n_gpu_layers` + 8GB 显存预算门 + 与 Koakumix 进程隔离规则）、#6 打包（原生绑定 + 工件进安装包）、#7 卸载/取消矩阵 | `llama_cpp` 引擎在 QLH chat 接口原生图生文；GPU 吞吐对标 Ollama（见 G4.6）；打包产物离线可用；取消不泄漏 | G4.4、§5.6 #2 |
 | **G4.6 Ollama 借鉴与对照验收** | 调研 Ollama 开源仓库：gemma4 思考控制（`think` 参数真实机制）、GPU 调度/offload 策略、runner 进程模型；对照验收：同图原生 GPU vs Ollama 吞吐/时延/语义一致；性能不达标项形成改进清单 | 对照报告（吞吐/时延/语义三表）；借鉴项落地清单（至少 GPU 调度一项） | G4.5 |
 
 **顺序**：G4.4（去 Ollama blobs 依赖）→ G4.5（产品化 + GPU）→ G4.6（借鉴 + 对标）。G4.4 是本机可做（下载 + 冻结 + smoke）；G4.5 的 GPU 部分需 8GB 显存窗口（与 SD 侧车并驻留规则）；G4.6 全程可做（Ollama 仓库调研不依赖硬件）。
@@ -374,7 +374,7 @@ fixture 以 `0.8/0.6` 穿过预注册的 `0.70/0.50` advisory 阈值，仅证明
 **实验矩阵补全后形态**(多模态实验 = 三模态闭环):
 
 ```
-文本推理(qwen / deepseek)  +  图像生成(SD 1.5)  +  图像理解(gemma-4-12B)  ✅ 闭环
+文本推理(qwen / deepseek)  +  图像理解(gemma-4-12B)  ✅ QLH 主项目多模态闭环；生图另属 Koakumix
 ```
 
 ---

@@ -74,14 +74,6 @@ _TEMPLATE_POLICIES = {
         "rules": frozenset(),
         "payload_binding": False,
     },
-    "llm_sd15_v1": {
-        "rules": frozenset(),
-        "payload_binding": False,
-    },
-    "image_grid_v1": {
-        "rules": frozenset(),
-        "payload_binding": False,
-    },
     "g2_fanout_shadow_v1": {
         "rules": frozenset({"semantic_transitive_reduction"}),
         "payload_binding": True,
@@ -97,44 +89,6 @@ _TEMPLATE_SHAPES = {
                 "stage_type": "aggregate",
                 "depends_on": ["candidate_a", "candidate_b"],
                 "minimum_successful_dependencies": 1,
-            },
-        },
-    },
-    "llm_sd15_v1": {
-        "final_stage_id": "image_generate",
-        "stages": {
-            "image_prompt": {
-                "stage_type": "image_prompt",
-                "depends_on": [],
-                "pure": True,
-                "model_identity": True,
-            },
-            "image_generate": {
-                "stage_type": "image_generate",
-                "depends_on": ["image_prompt"],
-                "input_bindings": [{
-                    "dependency_stage_id": "image_prompt",
-                    "output_key": "content",
-                    "target_key": "prompt",
-                }],
-            },
-        },
-    },
-    "image_grid_v1": {
-        "final_stage_id": "image_grid",
-        "stages": {
-            **{
-                f"seed_{index}": {
-                    "stage_type": "image_generate",
-                    "depends_on": [],
-                    "pure": True,
-                }
-                for index in range(4)
-            },
-            "image_grid": {
-                "stage_type": "image_grid",
-                "depends_on": [f"seed_{index}" for index in range(4)],
-                "minimum_successful_dependencies": 4,
             },
         },
     },

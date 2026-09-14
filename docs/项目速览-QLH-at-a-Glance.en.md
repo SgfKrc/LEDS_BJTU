@@ -8,7 +8,7 @@
 
 ## What is this?
 
-QLH is a lightweight distributed LLM inference system for heterogeneous edge devices (a 2026 Beijing Jiaotong University student innovation program project). Master and worker nodes (PC / Surface / Android) join a Tailscale mesh and split models across nodes by compute/memory/network capacity. It features twin engines (PyTorch + llama.cpp), INT4/INT8 quantization, paged KV cache, task-graph orchestration, local RAG, SD 1.5 image generation, a local Auth-App control plane, and multi-client UIs. Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**.
+QLH is a lightweight distributed LLM inference system for heterogeneous edge devices (a 2026 Beijing Jiaotong University student innovation program project). Master and worker nodes (PC / Surface / Android) join a Tailscale mesh and split models across nodes by compute/memory/network capacity. It features twin engines (PyTorch + llama.cpp), INT4/INT8 quantization, paged KV cache, task-graph orchestration, local RAG, multimodal image understanding, a local Auth-App control plane, and multi-client UIs. Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**. Image generation is outside the QLH main project and belongs to the standalone Koakumix harness.
 
 ## Verified capabilities
 
@@ -25,7 +25,7 @@ QLH is a lightweight distributed LLM inference system for heterogeneous edge dev
 
 ## What is NOT claimed
 
-- Production routing admission (`task_dispatch` off), long-running/multi-turn & power-loss recovery, real 443/WSS, IPv6-only installers, distributed SD cross-machine, real 7B/12B three-node peak memory — all remain in the deferred acceptance queue; local gates or simulations must not be presented as passes.
+- Production routing admission (`task_dispatch` off), long-running/multi-turn & power-loss recovery, real 443/WSS, IPv6-only installers, real 7B/12B three-node peak memory — all remain in the deferred acceptance queue; local gates or simulations must not be presented as passes.
 - Tensor parallelism (TP) exists only as an out-of-cluster PoC (route A); speculative decoding is an experimental path (route C).
 
 ## First-time setup
@@ -39,7 +39,7 @@ QLH is a lightweight distributed LLM inference system for heterogeneous edge dev
 | JDK 17 + Android SDK (API 34+) | — | Android builds only |
 | Tailscale | latest | Required for distributed mode (campus networks may block UDP → relay) |
 | Git | — | clone (with submodules) |
-| NVIDIA driver + CUDA (optional) | — | PC dGPU / SD sidecar only |
+| NVIDIA driver + CUDA (optional) | — | PC dGPU only |
 
 ### 1. Clone & one-shot environment setup
 
@@ -53,7 +53,7 @@ python scripts/setup_envs.py --skip frontend  # skip the frozen legacy frontend
 python scripts/setup_envs.py --check          # verify only, no install (no side effects)
 ```
 
-**Coverage**: main env + `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar` / `.venv-packaging` / `.venv-packaging-cuda` (incl. SD sidecar); Node: `frontend_cybergothic` (the only product frontend) / `gateway` / `control` (legacy `frontend` is frozen; installed by default, use `--skip frontend`).
+**Coverage**: main env + `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar` / `.venv-packaging` / `.venv-packaging-cuda`; Node: `frontend_cybergothic` (the only product frontend) / `gateway` / `control` (legacy `frontend` is frozen; installed by default, use `--skip frontend`). Koakumix owns its image-generation dependencies in its own environment.
 
 > ⚠️ **torch and other platform-specific heavy packages are NOT auto-installed**: the script filters them out and prints the platform install commands (e.g. `--torch-index-url https://download.pytorch.org/whl/cu126`) to avoid CPU/CUDA cross-contamination. Install them manually, then re-run `--check`.
 
@@ -66,7 +66,7 @@ pip install modelscope && python -c "from modelscope import snapshot_download; s
 huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat-Q4_K_M.gguf --local-dir models/
 ```
 
-Other models (Qwen3-4B, Gemma 4, SD 1.5 five-asset pack, etc.) see the root README "Post-clone asset checklist / Model download"; model files are **never committed** (`models/` is gitignored).
+Other models (Qwen3-4B, Gemma 4, etc.) see the root README "Post-clone asset checklist / Model download"; model files are **never committed** (`models/` is gitignored). Koakumix image assets are outside the QLH main-project asset list.
 
 ### 3. Run & verify
 

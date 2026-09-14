@@ -17,9 +17,7 @@ from .qwen3_pipeline_chain_smoke import run_qwen3_pipeline_chain_smoke
 from .llm_smoke_matrix import run_smoke_matrix
 from .tool_capability import run_capability_matrix, probe_model_asset, _fixture_from_path
 from .small_model_probe import run_b1_probe, run_dsw_d1
-from .lora import inspect_lora
 from .maintenance import clean_models, model_disk_usage
-from .sd15_batch import run_prompt_batch, run_sampler_matrix
 from .sweep import sweep_models
 from .sync_status import build_inventory, compare_inventories, load_inventory, write_json
 
@@ -65,39 +63,6 @@ def _parser() -> argparse.ArgumentParser:
     clean.add_argument("--include-caches", action="store_true", help="allow stale .cache trees to be removed")
     clean.add_argument("--include-old-backups", action="store_true", help="allow stale models_old_backup trees to be removed")
     clean.add_argument("--json", action="store_true", dest="as_json")
-    prompt_batch = commands.add_parser("sd15-prompt-batch", aliases=["sd15_prompt_batch"], help="run a bounded SD15 prompt matrix")
-    prompt_batch.add_argument("--asset-id", default="sd15_90s_retrovers_v1")
-    prompt_batch.add_argument("--model-path", default="")
-    prompt_batch.add_argument("--output-dir", default="")
-    prompt_batch.add_argument("--preset", default="sd15_retrovers_space_courier_v1")
-    prompt_batch.add_argument("--prompt", action="append", default=[])
-    prompt_batch.add_argument("--prompt-file", default="", help="UTF-8 file with one prompt per line")
-    prompt_batch.add_argument("--seed", action="append", type=int, default=[])
-    prompt_batch.add_argument("--steps", type=int, default=0)
-    prompt_batch.add_argument("--json", action="store_true", dest="as_json")
-    sampler = commands.add_parser("sd15-sampler-matrix", aliases=["sd15_sampler_matrix"], help="run a bounded SD15 sampler/step matrix")
-    sampler.add_argument("--asset-id", default="sd15_90s_retrovers_v1")
-    sampler.add_argument("--model-path", default="")
-    sampler.add_argument("--output-dir", default="")
-    sampler.add_argument("--preset", default="sd15_retrovers_space_courier_v1")
-    sampler.add_argument("--prompt", default="")
-    sampler.add_argument("--scheduler", action="append", dest="schedulers", default=[])
-    sampler.add_argument("--steps", action="append", type=int, dest="steps_list", default=[])
-    sampler.add_argument("--seed", type=int, default=19950101)
-    sampler.add_argument("--json", action="store_true", dest="as_json")
-    lora = commands.add_parser(
-        "sd15-lora-inspect",
-        aliases=["sd15_lora_inspect"],
-        help="inspect a Safetensors LoRA header without loading weights",
-    )
-    lora.add_argument("path", type=Path)
-    lora.add_argument(
-        "--root",
-        type=Path,
-        default=None,
-        help="require the inspected file to remain inside this root",
-    )
-    lora.add_argument("--json", action="store_true", dest="as_json")
     sync = commands.add_parser("sync-status", aliases=["models_sync_status"], help="compare read-only model inventories")
     sync_operations = sync.add_subparsers(dest="sync_operation", required=True)
     inventory = sync_operations.add_parser("inventory", help="generate a model inventory")
@@ -300,28 +265,6 @@ def _human(command: str, report: dict[str, Any]) -> None:
         for error in report.get("errors", []):
             print(f"  - {error}")
         return
-    if command in {"sd15-prompt-batch", "sd15_prompt_batch", "sd15-sampler-matrix", "sd15_sampler_matrix"}:
-        print(f"{'PASS' if report.get('automatic_gate', {}).get('passed') else 'FAIL'}: {report.get('tool')}")
-        print(f"outputs={report.get('automatic_gate', {}).get('outputs', 0)} unique={report.get('automatic_gate', {}).get('unique_images', 0)} contact_sheet={report.get('contact_sheet')}")
-        for item in report.get("jobs", []):
-            print(f"  {item.get('label')}: scheduler={item.get('scheduler')} steps={item.get('steps')} seed={item.get('seed')} elapsed={item.get('elapsed_seconds'):.3f}s")
-        for error in report.get("errors", []):
-            print(f"  - {error}")
-        return
-    if command in {"sd15-lora-inspect", "sd15_lora_inspect"}:
-        summary = report.get("tensor_summary", {})
-        metadata = report.get("metadata", {})
-        print(f"{'OK' if report.get('valid') else 'FAIL'}: {report.get('input_kind')}")
-        print(
-            f"lora_detected={summary.get('lora_detected')} "
-            f"tensors={summary.get('tensor_count', 0)} "
-            f"pairs={summary.get('lora_down_tensor_count', 0)}/"
-            f"{summary.get('lora_up_tensor_count', 0)} "
-            f"ss_fields={metadata.get('ss_field_count', 0)}"
-        )
-        for error in report.get("errors", []):
-            print(f"  - {error.get('code')}: {error.get('message')}")
-        return
     if command in {"sync-status", "models_sync_status"}:
         if report.get("operation") == "inventory":
             print(f"{'OK' if report.get('valid') else 'FAIL'} inventory: mode={report.get('hash_mode')} assets={len(report.get('assets', []))}")
@@ -520,7 +463,7 @@ def _human(command: str, report: dict[str, Any]) -> None:
             print(f"  - {error.get('code')}: {error.get('message')}")
         return
     print(f"{'OK' if report.get('valid') else 'WARN/FAIL'}: {report.get('root')}")
-    print(f"gguf={len(report.get('gguf', []))} diffusion={len(report.get('diffusion_assets', []))} junctions={len(report.get('junctions', []))} orphan_candidates={len(report.get('orphan_files', []))}")
+    print(f"gguf={len(report.get('gguf', []))} pytorch={len(report.get('pytorch_directories', []))} junctions={len(report.get('junctions', []))} orphan_candidates={len(report.get('orphan_files', []))}")
     for warning in report.get("warnings", []):
         print(f"  - {warning}")
 
@@ -544,45 +487,6 @@ def main(argv: list[str] | None = None) -> int:
                 include_caches=args.include_caches,
                 include_old_backups=args.include_old_backups,
             )
-        elif args.command in {"sd15-prompt-batch", "sd15_prompt_batch"}:
-            from diffusion import get_asset_spec, get_preset
-
-            prompts = list(args.prompt)
-            if args.prompt_file:
-                prompts.extend(
-                    line.strip()
-                    for line in Path(args.prompt_file).read_text(encoding="utf-8").splitlines()
-                    if line.strip() and not line.lstrip().startswith("#")
-                )
-            if not prompts:
-                raise ValueError("provide --prompt or --prompt-file")
-            spec = get_asset_spec(args.asset_id)
-            report = run_prompt_batch(
-                asset_id=args.asset_id,
-                model_path=args.model_path or spec.target_path(ROOT),
-                output_dir=args.output_dir or ROOT / "build" / "model-tools" / "sd15-prompt-batch",
-                preset=get_preset(args.preset),
-                prompts=prompts,
-                seeds=args.seed or [19950101],
-                steps=args.steps or get_preset(args.preset).steps,
-            )
-        elif args.command in {"sd15-sampler-matrix", "sd15_sampler_matrix"}:
-            from diffusion import get_asset_spec, get_preset
-
-            preset = get_preset(args.preset)
-            spec = get_asset_spec(args.asset_id)
-            report = run_sampler_matrix(
-                asset_id=args.asset_id,
-                model_path=args.model_path or spec.target_path(ROOT),
-                output_dir=args.output_dir or ROOT / "build" / "model-tools" / "sd15-sampler-matrix",
-                preset=preset,
-                prompt=args.prompt or preset.prompt,
-                schedulers=args.schedulers or ["EulerDiscreteScheduler", "DDIMScheduler", "DPMSolverMultistepScheduler"],
-                steps_list=args.steps_list or [20, 28],
-                seed=args.seed,
-            )
-        elif args.command in {"sd15-lora-inspect", "sd15_lora_inspect"}:
-            report = inspect_lora(args.path, root=args.root)
         elif args.command in {"sync-status", "models_sync_status"}:
             if args.sync_operation == "inventory":
                 _ensure_output_outside_roots(args.output, [args.root])
@@ -592,7 +496,10 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("provide exactly one of --local-root or --local-inventory")
                 if (args.peer_root is None) == (args.peer_inventory is None):
                     raise ValueError("provide exactly one of --peer-root or --peer-inventory")
-                _ensure_output_outside_roots(args.output, [root for root in (args.local_root, args.peer_root) if root is not None])
+                _ensure_output_outside_roots(
+                    args.output,
+                    [root for root in (args.local_root, args.peer_root) if root is not None],
+                )
                 if args.local_root is not None:
                     local = build_inventory(args.local_root, full_hash=args.full_hash)
                     local_errors = [] if local.get("valid") else local.get("errors", ["inventory generation failed"])
@@ -623,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 else:
                     report = compare_inventories(local, peer)
+            if args.output is not None:
+                write_json(args.output, report)
             if args.output is not None:
                 write_json(args.output, report)
         elif args.command in {"llm-smoke-matrix", "llm_smoke_matrix"}:

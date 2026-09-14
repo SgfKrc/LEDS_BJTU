@@ -1,6 +1,6 @@
-# Harness 下一阶段开发票计划（S3.2 生图后置+红队 / S7 联网+MCP / S8 长期记忆）
+# Koakumix 下一阶段开发票计划（生图/多模态闭环 + S7 联网+MCP / S8 长期记忆）
 
-> 状态：**已拆票；`S7-MCP-02` 本机开发门已完成，当前进入 `S5-CLOSE-01`**；真实第三方 MCP 服务、认证与权限仍属于后置验收；前置状态回顾：S1-S4 本机/离线开发门已完成（v10 记录），S6（React 工作台 + Textual TUI）已完成本机开发门；本文档新增三条支线：**S3.2（生图真机后置 + 安全红队合并）、S7（联网搜索 + 轻量 MCP 服务）、S8（小模型长期记忆：RAG + 上下文压缩 + 本地 memory）**
+> 状态：**已拆票；`S7-MCP-02` 本机开发门已完成，当前进入 `S5-CLOSE-01`**；真实第三方 MCP 服务、认证与权限仍属于后置验收；前置状态回顾：S1-S4 本机/离线开发门已完成（v10 记录），S6（React 工作台 + Textual TUI）已完成本机开发门；本文档新增三条支线：**Koakumix 生图/多模态闭环、S7（联网搜索 + 轻量 MCP 服务）、S8（小模型长期记忆：RAG + 上下文压缩 + 本地 memory）**。2026-09-14 起，QLH 主项目不再提供生图侧车、远端生成或 SD 资产；相关票只在 Koakumix 侧执行。
 >
 > 创建日期：2026-09-08
 > 适用范围：harness 子项目下一阶段票；不与 [WEB-TOOL 联网支线](../../docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) 合并（那些是主项目运行时工具，本票是 harness 侧能力与对外服务）；不覆盖训练微调。
@@ -9,13 +9,13 @@
 
 ## 1. 背景（现状盘点）
 
-- **已完成**：S1 上下文引擎、S1.5 模型画像与能力门、S2 API 层 + llama-server adapter、S2.5 定制化实验台（adaptation/eval/Pareto）、S3 生图工作区（离线门）、S4 远端与 RAG（离线门）——全部"本机/离线开发门"，**真实运行时验收整体后置**。
+- **已完成**：S1 上下文引擎、S1.5 模型画像与能力门、S2 API 层 + llama-server adapter、S2.5 定制化实验台（adaptation/eval/Pareto）、Koakumix 生图工作区（离线门）、S4 远端与 RAG（离线门）——全部"本机/离线开发门"，**真实运行时验收整体后置**。
 - **已列计划**：S5 评估收口（ollama 对照/契约漂移/Pareto）、S6 工作台 UI（`ui_react/` + `tui.py`）。
 - **验证命令基线**：`.venv-test\Scripts\python.exe -m pytest tests/test_harness_*.py -q`（`S7-MCP-02` 完成后全量 105 passed；全仓库回归 3324 passed, 19 skipped）。
 
 ## 2. S3 后置项现状说明（归票前澄清）
 
-S3 离线门已封闭：contracts/manifest/注入式执行器/资产原子落盘/远端 QLH job-blob 映射/`b64_json`+URL 响应均有测试；**当前默认本地执行器明确返回 `local_image_runtime_unavailable`**（不伪造能力）。后置项 = **真实 diffusers/CUDA 执行器验证、生图→多模态追问闭环、高级编辑（img2img/inpaint/IP-Adapter/指令编辑）**。S3.5 之前的表述把"安全红队"单独列为候选——现将两者合并为一张票（S3.2），理由：都属"把 demo 边界变成可信证据"（真机证据 + 对抗证据），且都需要先在 harness 侧落固定契约样本再进真机。
+S3 离线门已封闭：contracts/manifest/注入式执行器/资产原子落盘/`b64_json`+URL 响应均有测试；**当前默认本地执行器明确返回 `local_image_runtime_unavailable`**（不伪造能力）。后置项 = **真实 diffusers/CUDA 执行器验证、生图→多模态追问闭环、高级编辑（img2img/inpaint/IP-Adapter/指令编辑）**。S3.5 之前的表述把"安全红队"单独列为候选——现将两者合并为一张票（S3.2），理由：都属"把 demo 边界变成可信证据"（真机证据 + 对抗证据），且都需要先在 Koakumix 侧落固定契约样本再进真机。
 
 ## 3. 票 S3.2：生图真机后置 + 安全红队扩展
 
@@ -29,7 +29,7 @@ S3 离线门已封闭：contracts/manifest/注入式执行器/资产原子落盘
 | **安全红队扩展** | `eval/fixtures.py` 新增红队样本族：① **prompt injection**（系统提示覆盖/角色劫持/越狱）；② **工具越权**（工具调用请求篡改 scope、绕过 host_router、虚构 verified）；③ **图片路径**（manifest 遍历/符号链接/超大图资产）；④ **上下文注入**（伪造 STATE 字段/schema 破坏/删除键越权） | 危险请求拦截 100%（红队样本全被拒绝或 fail-closed）；`schema_valid_rate >= 98%`、越权样本 0 通过；报告含红队检出率（新增指标 `red_team_blocked`） |
 | 边界 | 不做真实生图的安全模型审计（如 prompt 注入到图片），只做 harness 契约层拦截 | — |
 
-**依赖**：真机 CUDA 环境（与主项目 SD 侧车共享资产但不同时运行，互斥避免显存冲突）；S3.2 红队部分不依赖真机，可先行。
+**依赖**：真机 CUDA 环境和 Koakumix 自有生图资产；不再与主项目共享生图运行时或进行显存互斥。S3.2 红队部分不依赖真机，可先行。
 
 ## 4. 票 S7：联网搜索功能 + 轻量 MCP 服务
 
@@ -97,7 +97,7 @@ S6 工作台 UI（依赖 S7/S8 的 API 面）───────────�
 1. 范围控制：S7 的联网工具**不做**主项目 G2 全套策略复刻（只保留核心 SSRF 门）；MCP 服务不替代 harness 自身 run-loop（客户端自治）。
 2. S8 风险：memory 内容污染/过期事实 → 软删除 + 来源/时间戳 + 显式失效；"建议 pin"只做建议不自动写。
 2b. S7 边界：MCP **预留通道**（registry + 端点配置 + schema 校验）本期只做接口与 fixture 验证，**真实第三方 MCP 服务接入**（依赖外部 server 地址/认证/权限）登记后置票，不提前引入不可控依赖。
-3. 生图真机（S3.2）：与主项目 SD 侧车共享工件但**不同时运行**（显存互斥）；真实执行器验证必须真 CUDA 卡——不可用则保持 `unavailable` 码（不关门）。
+3. 生图真机（S3.2）：使用 Koakumix 自有 SD 工件与独立 CUDA 环境；不与 QLH 主项目共享生图运行时。真实执行器验证必须真 CUDA 卡——不可用则保持 `unavailable` 码（不关门）。
 4. 全票贯穿约束：harness 不 import 主项目代码；能力通告来自真实探测；无绝对路径/凭据泄漏。
 
 ## 8. 变更记录

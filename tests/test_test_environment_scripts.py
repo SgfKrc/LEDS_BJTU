@@ -158,8 +158,6 @@ def test_classify_places_quality_gate_and_contract_files():
 
     files_by_class = tcr.classify_test_files(Path("tests"))
     # 质量门文件进 quality_gate 类（marker 入口），不被其他类截胡
-    assert "test_sd15_quality_gate.py" in files_by_class["quality_gate"]
-    assert "test_sd15_img2img_quality_gate.py" in files_by_class["quality_gate"]
     # 契约类文件（命名启发式）
     assert any("contract" in name for name in files_by_class["contract"])
     # 每个文件恰好落入一个分类（不重不漏：顶层 + simulation 子目录）
