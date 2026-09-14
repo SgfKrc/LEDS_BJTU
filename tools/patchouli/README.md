@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | `PATCH-01` | 只读数据层（catalog）：docs/ 扫描 + 状态行/更新日期/票号/互链/分类解析 | ✅ 完成（2026-09-14） |
 | `PATCH-02` | 书架 TUI（三栏：列表→文档卡→预览；分类过滤/归档开关） | ✅ 完成（2026-09-14，Textual） |
-| `PATCH-03` | 检索台（对接 RAG 检索全链路） | 待做 |
+| `PATCH-03` | 检索台（本地元数据+全文检索；RAG 对接待知识库服务化后接） | ✅ 完成（2026-09-14） |
 | `PATCH-04` | 编目诊断（委托 docagent scan：R1-R5 findings + fail-soft + 异步 worker） | ✅ 完成（2026-09-14） |
 | `PATCH-05` | 流通记录（git log/变更记录） | 待做 |
 | `PATCH-06` | 馆藏统计 + 收口 | 待做 |
@@ -22,7 +22,8 @@ python -m pip install -e tools/patchouli
 
 python -m patchouli --root <repo> --summary   # 馆藏摘要（分类/票号/缺状态行）
 python -m patchouli --root <repo> --json      # 全量结构化（qlh.patchouli.catalog.v1）
-python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · 1-7 分类 · 0 全部 · a 归档 · r 刷新 · q 退出）
+python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · / 检索台 · 1-7 分类 · 0 全部 · a 归档 · c 编目诊断 · r 刷新 · q 退出）
+# 检索语法：纯文本（全文）｜ t:PATCH-01（票号）｜ k:report（类型）｜ s:缺（缺状态行）｜ a:（含归档）
 
 # 免安装 fallback
 python tools/patchouli/run.py summary --root <repo>

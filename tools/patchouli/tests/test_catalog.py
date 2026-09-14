@@ -81,3 +81,8 @@ def test_real_repo_catalog_smoke() -> None:
     assert any(p.startswith("docs/archive/") for p in paths)
     parsed = [e for e in catalog["documents"] if "read:" not in " ".join(e["errors"])]
     assert len(parsed) == catalog["doc_count"]  # 全部可读
+
+
+def test_scan_accepts_str_path(tmp_path: Path) -> None:
+    _write(tmp_path, "docs/A专项计划.md", "# A\n> 状态：现行\n")
+    assert scan(str(tmp_path))["doc_count"] == 1

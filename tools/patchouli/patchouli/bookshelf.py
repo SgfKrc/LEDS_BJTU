@@ -1,7 +1,7 @@
 """PATCH-02 书架 TUI：三栏（书架列表 → 文档卡 → 预览）。
 
 开发期工具（与 docagent 同级）：允许 Textual 依赖；只读。
-键位：↑↓ 选择 · 1-7 分类过滤 · a 归档开关 · r 刷新 · q 退出。
+键位：↑↓ 选择 · / 检索台 · 1-7 分类过滤 · a 归档开关 · c 编目诊断 · r 刷新 · q 退出。
 
 用法：python -m patchouli.bookshelf --root <repo>
 """
@@ -12,7 +12,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, Header, Label, ListItem, ListView, Static
+from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Static
 
 from .catalog import scan
 
@@ -37,12 +37,15 @@ class BookshelfApp(App):
     #detail { width: 62%; }
     #card { height: auto; max-height: 45%; border: solid $accent; padding: 0 1; }
     #preview { border: solid $accent; padding: 0 1; }
+    #query { dock: top; display: none; border: solid $accent; }
     """
     BINDINGS = [
         ("q", "quit", "退出"),
         ("r", "reload", "刷新"),
         ("a", "toggle_archive", "归档"),
         ("c", "diag", "编目诊断"),
+        ("/", "focus_search", "检索台"),
+        ("escape", "exit_search", "返回书架"),
         ("0", "clear_filter", "全部"),
         *[(str(i + 1), f"filter({i})", KIND_LABEL[kind]) for i, kind in enumerate(KIND_ORDER)],
     ]
@@ -57,10 +60,14 @@ class BookshelfApp(App):
         self.preview_text = ""
         self.diag: dict | None = None
         self.diag_text = ""
+        self.mode = "shelf"
+        self.search_results: list[dict] = []
+        self.search_query = ""
 
     # ---- layout ----
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Input(placeholder="检索：文本 / t:票号 / k:类型 / s:缺 / a:含归档 → Enter", id="query", disabled=True)
         with Horizontal():
             yield ListView(id="shelf")
             with Vertical(id="detail"):
@@ -124,13 +131,19 @@ class BookshelfApp(App):
             self.preview_text = ""
 
     # ---- events / actions ----
+    def _pick(self, index: int) -> None:
+        if self.mode == "search":
+            self._show_result(index)
+        elif 0 <= index < len(self.entries):
+            self._show_entry(self.entries[index])
+
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.item is not None and 0 <= event.item.index < len(self.entries):
-            self._show_entry(self.entries[event.item.index])
+        if event.item is not None:
+            self._pick(event.item.index)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is not None and 0 <= event.item.index < len(self.entries):
-            self._show_entry(self.entries[event.item.index])
+        if event.item is not None:
+            self._pick(event.item.index)
 
     def action_clear_filter(self) -> None:
         self.filter_kind = None
@@ -144,6 +157,60 @@ class BookshelfApp(App):
     def action_toggle_archive(self) -> None:
         self.show_archive = not self.show_archive
         self._apply_filter()
+
+    # ---- PATCH-03 检索台 ----
+    def action_focus_search(self) -> None:
+        box = self.query_one("#query", Input)
+        box.disabled = False
+        box.display = True
+        box.focus()
+
+    def action_exit_search(self) -> None:
+        if self.mode != "search":
+            return
+        box = self.query_one("#query", Input)
+        box.display = False
+        box.disabled = True
+        box.value = ""
+        self.mode = "shelf"
+        self.search_results = []
+        self._apply_filter()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip()
+        if not query:
+            return
+        from .search import search_docs  # 延迟导入（引擎零依赖）
+
+        self.search_query = query
+        self.search_results = search_docs(self.root, self.catalog, query)
+        self.mode = "search"
+        shelf = self.query_one("#shelf", ListView)
+        shelf.clear()
+        for result in self.search_results:
+            loc = f"L{result['line_no']}" if result["line_no"] else "文件名"
+            shelf.append(ListItem(Label(f"{loc:>6} {result['line']}")))
+        self._show_result(0)
+        self.sub_title = f"检索[{query}] · {len(self.search_results)} 条"
+
+    def _show_result(self, index: int) -> None:
+        card = self.query_one("#card", Static)
+        preview = self.query_one("#preview", Static)
+        if not (0 <= index < len(self.search_results)):
+            card.update("（无结果）")
+            preview.update("")
+            return
+        from .search import context_snippet
+
+        result = self.search_results[index]
+        loc = f"L{result['line_no']}" if result["line_no"] else "文件名命中"
+        card.update("\n".join([
+            f"查询: {self.search_query}",
+            f"文档: {result['name']}",
+            f"路径: {result['path']}",
+            f"命中: {loc}",
+        ]))
+        preview.update(context_snippet(self.root, result["path"], result["line_no"]))
 
     # ---- PATCH-04 编目诊断 ----
     def action_diag(self) -> None:

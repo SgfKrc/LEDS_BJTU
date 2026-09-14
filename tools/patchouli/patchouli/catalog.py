@@ -80,6 +80,7 @@ def parse_document(path: Path, root: Path) -> dict[str, Any]:
 
 
 def scan(root: Path, *, include_archive: bool = True) -> dict[str, Any]:
+    root = Path(root)
     docs = root / "docs"
     if not docs.is_dir():
         raise SystemExit(f"docs/ not found under {root}")
