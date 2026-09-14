@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patchouli"
+version = "0.1.0"
+description = "Patchouli — QLH 知识库/文档库管理 TUI（只读，开发期工具）"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+tui = ["textual>=0.80"]
+
+[project.scripts]
+patchouli = "patchouli.catalog:main"
+patchouli-shelf = "patchouli.bookshelf:main"
+
+[tool.setuptools.packages.find]
+include = ["patchouli*"]

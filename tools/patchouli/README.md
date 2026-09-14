@@ -17,9 +17,16 @@
 ## 用法
 
 ```bash
+# 安装（推荐，editable；只需一次）——之后在任意目录可用
+python -m pip install -e tools/patchouli
+
 python -m patchouli --root <repo> --summary   # 馆藏摘要（分类/票号/缺状态行）
 python -m patchouli --root <repo> --json      # 全量结构化（qlh.patchouli.catalog.v1）
 python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · 1-7 分类 · 0 全部 · a 归档 · r 刷新 · q 退出）
+
+# 免安装 fallback
+python tools/patchouli/run.py summary --root <repo>
+python tools/patchouli/run.py shelf --root <repo>
 ```
 
 > **依赖边界**：Patchouli 是**开发期工具**（与 docagent 同级），书架 TUI 允许 Textual；
