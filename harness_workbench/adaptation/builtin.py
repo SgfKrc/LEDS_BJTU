@@ -6,6 +6,12 @@ from .profiles import ContextStrategy, PromptProfile, ResourceProfile
 from ..context_engine import ContextBudget, ContextPolicyConfig
 
 
+_CACHE_STABLE_PREFIX = (
+    "System policy is fixed across requests. Keep runtime task data, workspace paths, timestamps, "
+    "and request or session IDs in the user/context message rather than changing this policy."
+)
+
+
 def builtin_adaptation_profiles(model_family: str) -> tuple[tuple[PromptProfile, ...], tuple[ContextStrategy, ...], tuple[ResourceProfile, ...]]:
     family = model_family.lower()
     if "gemma" in family:
@@ -21,7 +27,7 @@ def builtin_adaptation_profiles(model_family: str) -> tuple[tuple[PromptProfile,
         PromptProfile(
             id=f"{prompt_family}-minimal",
             family=prompt_family,
-            system_prompt="Answer clearly and briefly. Preserve facts from the user.",
+            system_prompt=f"{_CACHE_STABLE_PREFIX} Answer clearly and briefly. Preserve facts from the user.",
             stop=stop,
             thinking="disabled",
             tool_mode="host_router",
@@ -29,7 +35,7 @@ def builtin_adaptation_profiles(model_family: str) -> tuple[tuple[PromptProfile,
         PromptProfile(
             id=f"{prompt_family}-structured",
             family=prompt_family,
-            system_prompt="Answer clearly. Use the supplied context and return the requested structure exactly.",
+            system_prompt=f"{_CACHE_STABLE_PREFIX} Answer clearly. Use the supplied context and return the requested structure exactly.",
             stop=stop,
             thinking="disabled",
             tool_mode="host_router",

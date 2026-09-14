@@ -311,6 +311,9 @@ class KVInitRequest(BaseModel):
     device: Optional[str] = None
     page_size: Optional[int] = Field(default=None, ge=1, le=4096)
     max_pages: Optional[int] = Field(default=None, ge=1, le=65536)
+    cold_cache_dir: Optional[str] = Field(default=None, min_length=1, max_length=4096)
+    cold_max_pages: Optional[int] = Field(default=None, ge=1, le=65536)
+    cache_unit_size: Optional[int] = Field(default=None, ge=1, le=4096)
 
 
 class KVFreeRequest(BaseModel):

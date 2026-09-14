@@ -27,6 +27,9 @@ class KVHost:
         device: Optional[str] = None,
         page_size: Optional[int] = None,
         max_pages: Optional[int] = None,
+        cold_cache_dir: Optional[str] = None,
+        cold_max_pages: Optional[int] = None,
+        cache_unit_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """为任务创建 KV 缓存页；已存在则复用（幂等）。"""
         with self._lock:
@@ -34,20 +37,34 @@ class KVHost:
             tid = task_id or f"task_{self._counter}"
             existing = self._caches.get(tid)
             if existing is not None:
+                stats = existing.get_stats()
                 return {
                     "task_id": tid,
                     "reused": True,
                     "total_pages": existing.allocated_page_count,
+                    "max_pages": existing.max_pages,
+                    "cold_enabled": stats["cold_enabled"],
+                    "cold_max_pages": stats["cold_max_pages"],
+                    "cache_unit_size": stats["cache_unit_size"],
                 }
             cache = PagedKVCache(
-                page_size=page_size, max_pages=max_pages, device=device
+                page_size=page_size,
+                max_pages=max_pages,
+                device=device,
+                cold_cache_dir=cold_cache_dir,
+                cold_max_pages=cold_max_pages,
+                cache_unit_size=cache_unit_size,
             )
             self._caches[tid] = cache
+            stats = cache.get_stats()
             return {
                 "task_id": tid,
                 "reused": False,
                 "total_pages": cache.allocated_page_count,
                 "max_pages": cache.max_pages,
+                "cold_enabled": stats["cold_enabled"],
+                "cold_max_pages": stats["cold_max_pages"],
+                "cache_unit_size": stats["cache_unit_size"],
             }
 
     def free(self, task_id: str) -> Dict[str, Any]:
@@ -70,6 +87,9 @@ class KVHost:
         dtype: Any = None,
         num_heads: int = 16,
         head_dim: int = 64,
+        cold_cache_dir: Optional[str] = None,
+        cold_max_pages: Optional[int] = None,
+        cache_unit_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """按设备画像自适应初始化 KV 缓存（1.2a 复制自 api_server._init_kv_cache
         api_server.py:1575-1618 的自适应逻辑；源文件保持不动）。
@@ -87,10 +107,15 @@ class KVHost:
             tid = task_id or f"task_{self._counter}"
             existing = self._caches.get(tid)
             if existing is not None:
+                stats = existing.get_stats()
                 return {
                     "task_id": tid,
                     "reused": True,
                     "total_pages": existing.allocated_page_count,
+                    "max_pages": existing.max_pages,
+                    "cold_enabled": stats["cold_enabled"],
+                    "cold_max_pages": stats["cold_max_pages"],
+                    "cache_unit_size": stats["cache_unit_size"],
                 }
             cache = PagedKVCache.from_profile(
                 profile=profile or {},
@@ -98,13 +123,20 @@ class KVHost:
                 dtype=dtype,
                 num_heads=num_heads,
                 head_dim=head_dim,
+                cold_cache_dir=cold_cache_dir,
+                cold_max_pages=cold_max_pages,
+                cache_unit_size=cache_unit_size,
             )
             self._caches[tid] = cache
+            stats = cache.get_stats()
             return {
                 "task_id": tid,
                 "reused": False,
                 "total_pages": cache.allocated_page_count,
                 "max_pages": cache.max_pages,
+                "cold_enabled": stats["cold_enabled"],
+                "cold_max_pages": stats["cold_max_pages"],
+                "cache_unit_size": stats["cache_unit_size"],
             }
 
     def get(self, task_id: str) -> Optional[PagedKVCache]:
@@ -114,15 +146,23 @@ class KVHost:
     def status(self) -> Dict[str, Any]:
         """当前 KV 缓存快照（/v1/status.kv_cache 用）。"""
         with self._lock:
-            return {
-                "task_count": len(self._caches),
-                "tasks": [
+            tasks = []
+            for tid, cache in sorted(self._caches.items()):
+                stats = cache.get_stats()
+                tasks.append(
                     {
                         "task_id": tid,
-                        "total_tokens": c.total_tokens,
-                        "pages": c.allocated_page_count,
-                        "max_pages": c.max_pages,
+                        "total_tokens": cache.total_tokens,
+                        "pages": cache.allocated_page_count,
+                        "max_pages": cache.max_pages,
+                        "cold_enabled": stats["cold_enabled"],
+                        "cold_pages": stats["cold_pages"],
+                        "cold_hit_count": stats["cold_hit_count"],
+                        "cache_unit_size": stats["cache_unit_size"],
+                        "cache_unit_count": stats["cache_unit_count"],
                     }
-                    for tid, c in sorted(self._caches.items())
-                ],
+                )
+            return {
+                "task_count": len(self._caches),
+                "tasks": tasks,
             }

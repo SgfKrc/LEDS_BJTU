@@ -496,6 +496,42 @@ def test_kv_auto_task_id(client):
     assert r.json()["task_id"]
 
 
+def test_kv_init_accepts_cold_tier_configuration(client, tmp_path):
+    r = client.post(
+        "/v1/kv/init",
+        json={
+            "task_id": "cold-api-task",
+            "device": "cpu",
+            "page_size": 4,
+            "max_pages": 1,
+            "cold_cache_dir": str(tmp_path),
+            "cold_max_pages": 1,
+            "cache_unit_size": 2,
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["cold_enabled"] is True
+    assert r.json()["cache_unit_size"] == 2
+
+    status = client.get("/v1/status").json()["kv_cache"]
+    task = next(item for item in status["tasks"] if item["task_id"] == "cold-api-task")
+    assert task["cold_enabled"] is True
+    assert task["cold_pages"] == 0
+
+
+def test_kv_init_rejects_cold_page_count_without_directory(client):
+    r = client.post("/v1/kv/init", json={"cold_max_pages": 1})
+    assert r.status_code == 400
+
+
+def test_kv_init_rejects_unaligned_cache_unit(client):
+    r = client.post(
+        "/v1/kv/init",
+        json={"page_size": 4, "max_pages": 1, "cache_unit_size": 3},
+    )
+    assert r.status_code == 400
+
+
 # ----------------------------------------------------------------------
 # 6. 层段张量传输 roundtrip（tensor_transport）
 # ----------------------------------------------------------------------

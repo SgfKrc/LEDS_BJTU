@@ -341,6 +341,8 @@ def _usage_from_metrics(metrics: Any) -> dict[str, int]:
     mapping = {
         "prompt_tokens": ("prompt_tokens", "total_prompt_tokens"),
         "completion_tokens": ("completion_tokens", "generated_tokens", "total_generated_tokens"),
+        "prompt_cache_hit_tokens": ("prompt_cache_hit_tokens", "promptCacheHitTokens", "cache_hit_tokens"),
+        "prompt_cache_miss_tokens": ("prompt_cache_miss_tokens", "promptCacheMissTokens", "cache_miss_tokens"),
     }
     result: dict[str, int] = {}
     for output_name, keys in mapping.items():

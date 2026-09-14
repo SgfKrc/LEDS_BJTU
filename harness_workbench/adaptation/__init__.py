@@ -9,6 +9,7 @@ from .profiles import (
     build_variant_matrix,
     render_prompt_messages,
 )
+from .cache_policy import PromptCacheViolation, find_prompt_cache_violations
 
 __all__ = [
     "AdaptationPlan",
@@ -18,4 +19,6 @@ __all__ = [
     "ResourceProfile",
     "build_variant_matrix",
     "render_prompt_messages",
+    "PromptCacheViolation",
+    "find_prompt_cache_violations",
 ]

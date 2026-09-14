@@ -956,12 +956,18 @@ def worker_stage(req: WorkerStageRequest, request: Request):
 @router.post("/kv/init")
 async def kv_init(req: KVInitRequest, request: Request):
     kv_host = _kv_host(request)
-    return kv_host.init(
-        task_id=req.task_id,
-        device=req.device,
-        page_size=req.page_size,
-        max_pages=req.max_pages,
-    )
+    try:
+        return kv_host.init(
+            task_id=req.task_id,
+            device=req.device,
+            page_size=req.page_size,
+            max_pages=req.max_pages,
+            cold_cache_dir=req.cold_cache_dir,
+            cold_max_pages=req.cold_max_pages,
+            cache_unit_size=req.cache_unit_size,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/kv/free")
