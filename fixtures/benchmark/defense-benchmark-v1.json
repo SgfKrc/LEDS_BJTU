@@ -1,0 +1,60 @@
+{
+  "schema": "qlh.defense_benchmark.v1",
+  "status": "passed",
+  "created_at": "2026-09-10T07:18:41+00:00",
+  "benchmark_class": "task_graph_control_plane_fixture",
+  "workload": {
+    "id": "def-p3-control-plane-v1",
+    "iterations": 12,
+    "warmup_iterations": 2,
+    "payload_bytes": 288,
+    "stage_count_per_iteration": 1,
+    "stage_type": "full_inference",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "claim_guard": {
+    "real_model_performance": false,
+    "physical_dual_host_performance": false,
+    "allowed_claim": "single-host TaskGraph control-plane fixture only"
+  },
+  "physical_dual_host": {
+    "status": "not_run",
+    "reason_code": "physical_dual_host_data_pending",
+    "eligible_for_claim": false
+  },
+  "series": [
+    {
+      "series_id": "in_process_fixture",
+      "label": "In-process fixture",
+      "topology": "single_host_single_process",
+      "host_count": 1,
+      "process_count": 1,
+      "sample_count": 12,
+      "metrics": {
+        "min_ms": 1.0,
+        "median_ms": 1.5,
+        "mean_ms": 1.6,
+        "p95_ms": 2.0,
+        "max_ms": 2.0,
+        "throughput_tasks_per_second": 625.0
+      }
+    },
+    {
+      "series_id": "loopback_worker_fixture",
+      "label": "Loopback worker fixture",
+      "topology": "single_host_dual_process",
+      "host_count": 1,
+      "process_count": 2,
+      "sample_count": 12,
+      "metrics": {
+        "min_ms": 2.0,
+        "median_ms": 2.5,
+        "mean_ms": 2.6,
+        "p95_ms": 3.0,
+        "max_ms": 3.0,
+        "throughput_tasks_per_second": 384.6
+      }
+    }
+  ],
+  "worker_exit_code": 0
+}

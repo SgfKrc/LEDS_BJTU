@@ -12,7 +12,8 @@ from harness_workbench.tools.benchmark_ledger import (
 )
 
 
-def test_benchmark_ledger_default_preserves_fixture_and_not_run_boundaries():
+def test_benchmark_ledger_default_preserves_fixture_and_not_run_boundaries(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     report = run_benchmark_ledger()
 
     assert report.schema == BENCHMARK_LEDGER_SCHEMA
@@ -23,6 +24,10 @@ def test_benchmark_ledger_default_preserves_fixture_and_not_run_boundaries():
     assert report.records[-1].eligible_for_claim is False
     assert any(record.record_id == "physical-dual-host" for record in report.records)
     assert any(group.dimension == "single_host" for group in report.groups)
+    assert {record.source_ref for record in report.records} == {
+        "fixtures/benchmark/defense-benchmark-v1.json",
+        "scripts/demo/real-model-performance-not-run.json",
+    }
 
 
 def test_benchmark_ledger_default_digest_markdown_is_stable_and_explicit():
