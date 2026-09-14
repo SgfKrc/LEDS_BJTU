@@ -28,12 +28,6 @@ def test_unload_model_is_idempotent_and_keeps_lazy_manager_cold(monkeypatch):
     monkeypatch.setattr(api_server, "model_host", host)
     monkeypatch.setattr(api_server, "model_manager", host)
     monkeypatch.setattr(api_server, "scheduler", scheduler)
-    monkeypatch.setattr(
-        api_server,
-        "diffusion_service",
-        SimpleNamespace(is_loaded=False, is_busy=False),
-    )
-
     assert host._manager._instance is None
     result = api_server._unload_model_under_model_lock()
 
@@ -74,11 +68,6 @@ def test_unload_model_releases_engine_runtime_and_worker_reservation(monkeypatch
     monkeypatch.setattr(api_server, "model_host", host)
     monkeypatch.setattr(api_server, "model_manager", manager)
     monkeypatch.setattr(api_server, "scheduler", scheduler)
-    monkeypatch.setattr(
-        api_server,
-        "diffusion_service",
-        SimpleNamespace(is_loaded=False, is_busy=False),
-    )
     monkeypatch.setattr(
         api_server,
         "_reset_runtime_conversation_state",

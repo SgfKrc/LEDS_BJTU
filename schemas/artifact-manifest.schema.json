@@ -37,10 +37,10 @@
       }
     },
     "format": {
-      "enum": ["safetensors", "gguf", "diffusers"]
+      "enum": ["safetensors", "gguf"]
     },
     "engine": {
-      "enum": ["pytorch_transformers", "llama_cpp", "diffusers_sd15"]
+      "enum": ["pytorch_transformers", "llama_cpp"]
     },
     "family": { "type": "string", "minLength": 1 },
     "quantization": { "type": ["string", "null"] },

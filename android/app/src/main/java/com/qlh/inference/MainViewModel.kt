@@ -18,9 +18,6 @@ import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.network.ApiClient
 import com.qlh.inference.network.AndroidPresenceSnapshot
 import com.qlh.inference.network.AndroidPresenceState
-import com.qlh.inference.network.DiffusionBlobUpload
-import com.qlh.inference.network.DiffusionEditRequest
-import com.qlh.inference.network.DiffusionGenerateRequest
 import com.qlh.inference.network.GgufModelInfo
 import com.qlh.inference.network.httpBaseUrl
 import com.qlh.inference.network.ClientErrorReport
@@ -112,9 +109,6 @@ data class MainUiState(
     val lastSentMessage: String? = null,
     val lastSentImageDataUrls: List<String> = emptyList(),
 
-    // Remote PC Stable Diffusion workspace
-    val diffusion: DiffusionUiState = DiffusionUiState(),
-
     // Local control-plane authentication
     val authSession: StoredAuthSession? = null,
     val authBusy: Boolean = false,
@@ -140,7 +134,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<MainUiState> = _uiState.asStateFlow()
 
     private var lastAutoRegisterKey: String = ""
-    private var diffusionJob: Job? = null
 
     private fun apiClient(state: MainUiState = _uiState.value): ApiClient =
         ApiClient(httpBaseUrl(state.serverHost, state.serverPort), authStore = authStore)
@@ -601,123 +594,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ),
             )
             _uiState.value = _uiState.value.copy(management = ManagementUiState())
-        }
-    }
-
-    // ==================== 远程图像生成 ====================
-
-    /** Submit text-to-image or reference-image img2img work to the configured PC node. */
-    fun submitDiffusion(
-        request: DiffusionGenerateRequest,
-        referenceImage: DiffusionBlobUpload? = null,
-    ) {
-        if (_uiState.value.diffusion.isBusy || request.prompt.orEmpty().isBlank()) {
-            if (request.prompt.orEmpty().isBlank()) {
-                _uiState.value = _uiState.value.copy(
-                    diffusion = failDiffusion(_uiState.value.diffusion, "请输入提示词"),
-                )
-            }
-            return
-        }
-        diffusionJob?.cancel()
-        val initial = startDiffusionSubmission(_uiState.value.diffusion, referenceImage != null)
-        _uiState.value = _uiState.value.copy(diffusion = initial)
-        diffusionJob = viewModelScope.launch {
-            val client = apiClient()
-            try {
-                val submitted = if (referenceImage != null) {
-                    val blob = client.uploadDiffusionBlob(referenceImage).getOrThrow()
-                    _uiState.value = _uiState.value.copy(
-                        diffusion = _uiState.value.diffusion.copy(state = "submitting"),
-                    )
-                    client.submitDiffusionEdit(
-                        DiffusionEditRequest(
-                            mode = "img2img",
-                            sourceBlobId = blob.blobId,
-                            prompt = request.prompt,
-                            negativePrompt = request.negativePrompt,
-                            seed = request.seed,
-                            width = request.width,
-                            height = request.height,
-                            steps = request.steps,
-                            guidanceScale = request.guidanceScale,
-                            scheduler = request.scheduler,
-                        ),
-                    ).getOrThrow()
-                } else {
-                    client.submitDiffusionGeneration(request).getOrThrow()
-                }
-                _uiState.value = _uiState.value.copy(
-                    diffusion = applyDiffusionJob(_uiState.value.diffusion, submitted),
-                )
-
-                val terminal = client.pollDiffusionJob(
-                    submitted.jobId,
-                    intervalMillis = 1_000L,
-                    maxPolls = 1_800,
-                ).getOrThrow()
-                _uiState.value = _uiState.value.copy(
-                    diffusion = applyDiffusionJob(_uiState.value.diffusion, terminal),
-                )
-                if (terminal.state != "completed") return@launch
-
-                val outputBlobId = terminal.outputBlobId ?: terminal.blob?.blobId
-                if (outputBlobId.isNullOrBlank()) {
-                    throw IllegalStateException("任务已完成但没有结果图片")
-                }
-                _uiState.value = _uiState.value.copy(
-                    diffusion = beginDiffusionResultDownload(
-                        _uiState.value.diffusion,
-                        outputBlobId,
-                    ),
-                )
-                val output = client.downloadDiffusionBlob(outputBlobId).getOrThrow()
-                _uiState.value = _uiState.value.copy(
-                    diffusion = completeDiffusionResultDownload(
-                        _uiState.value.diffusion,
-                        output.data,
-                        output.contentType,
-                    ),
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                QlhLogger.e("MainViewModel", "remote diffusion failed", e)
-                _uiState.value = _uiState.value.copy(
-                    diffusion = failDiffusion(
-                        _uiState.value.diffusion,
-                        e.message ?: "远程图像生成失败",
-                    ),
-                )
-            } finally {
-                diffusionJob = null
-            }
-        }
-    }
-
-    /** Request cancellation on the PC and keep polling for its terminal acknowledgement. */
-    fun cancelDiffusion() {
-        val current = _uiState.value.diffusion
-        val jobId = current.jobId ?: return
-        if (!current.canCancel) return
-        val cancelling = markDiffusionCancelling(current)
-        _uiState.value = _uiState.value.copy(diffusion = cancelling)
-        viewModelScope.launch {
-            val client = apiClient()
-            client.cancelDiffusionJob(jobId)
-                .onSuccess { response ->
-                    _uiState.value = _uiState.value.copy(
-                        diffusion = applyDiffusionJob(_uiState.value.diffusion, response.job),
-                    )
-                }
-                .onFailure { error ->
-                    _uiState.value = _uiState.value.copy(
-                        diffusion = current.copy(
-                            error = error.message ?: "取消图像任务失败",
-                            isCancelling = false,
-                        ),
-                    )
-                }
         }
     }
 

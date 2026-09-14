@@ -232,7 +232,6 @@
      "items": {
       "enum": [
        "llm",
-       "sd",
        "gemma_judge"
       ]
      }
@@ -382,8 +381,7 @@
     "not_collected_reason",
     "correct_rate",
     "format_rate",
-    "llm",
-    "sd"
+    "llm"
    ],
    "properties": {
     "schema_version": {
@@ -446,90 +444,6 @@
        "$ref": "#/$defs/quality_rate"
       }
      }
-    },
-    "sd": {
-     "type": [
-      "object",
-      "null"
-     ],
-     "additionalProperties": false,
-     "required": [
-      "mode",
-      "asset_id",
-      "artifact_id",
-      "source_schema_version",
-      "automatic_gate",
-      "manual_review"
-     ],
-     "properties": {
-      "mode": {
-       "enum": [
-        "text_to_image",
-        "img2img",
-        "ip_adapter",
-        "inpaint",
-        "instruction"
-       ]
-      },
-      "asset_id": {
-       "type": "string",
-       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
-      },
-      "artifact_id": {
-       "type": "string",
-       "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
-      },
-      "source_schema_version": {
-       "const": 1
-      },
-      "automatic_gate": {
-       "type": "object",
-       "additionalProperties": false,
-       "required": [
-        "status",
-        "output_count",
-        "unique_output_count"
-       ],
-       "properties": {
-        "status": {
-         "enum": [
-          "passed",
-          "failed"
-         ]
-        },
-        "output_count": {
-         "type": "integer",
-         "minimum": 0
-        },
-        "unique_output_count": {
-         "type": "integer",
-         "minimum": 0
-        }
-       }
-      },
-      "manual_review": {
-       "type": "object",
-       "additionalProperties": false,
-       "required": [
-        "status",
-        "required_reviewers"
-       ],
-       "properties": {
-        "status": {
-         "enum": [
-          "passed",
-          "failed",
-          "pending",
-          "not_required"
-         ]
-        },
-        "required_reviewers": {
-         "type": "integer",
-         "minimum": 0
-        }
-       }
-      }
-     }
     }
    }
   },
@@ -543,7 +457,6 @@
     "correct_rate",
     "format_rate",
     "llm",
-    "sd",
     "gemma_judge"
    ],
    "properties": {
@@ -600,94 +513,6 @@
         },
         "format": {
          "$ref": "#/$defs/quality_rate"
-        }
-       }
-      }
-     ]
-    },
-    "sd": {
-     "oneOf": [
-      {
-       "type": "null"
-      },
-      {
-       "type": "object",
-       "additionalProperties": false,
-       "required": [
-        "mode",
-        "asset_id",
-        "artifact_id",
-        "source_schema_version",
-        "automatic_gate",
-        "manual_review"
-       ],
-       "properties": {
-        "mode": {
-         "enum": [
-          "text_to_image",
-          "img2img",
-          "ip_adapter",
-          "inpaint",
-          "instruction"
-         ]
-        },
-        "asset_id": {
-         "type": "string",
-         "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
-        },
-        "artifact_id": {
-         "type": "string",
-         "pattern": "^[A-Za-z0-9_.:\\-]{1,160}$"
-        },
-        "source_schema_version": {
-         "const": 1
-        },
-        "automatic_gate": {
-         "type": "object",
-         "additionalProperties": false,
-         "required": [
-          "status",
-          "output_count",
-          "unique_output_count"
-         ],
-         "properties": {
-          "status": {
-           "enum": [
-            "passed",
-            "failed"
-           ]
-          },
-          "output_count": {
-           "type": "integer",
-           "minimum": 0
-          },
-          "unique_output_count": {
-           "type": "integer",
-           "minimum": 0
-          }
-         }
-        },
-        "manual_review": {
-         "type": "object",
-         "additionalProperties": false,
-         "required": [
-          "status",
-          "required_reviewers"
-         ],
-         "properties": {
-          "status": {
-           "enum": [
-            "passed",
-            "failed",
-            "pending",
-            "not_required"
-           ]
-          },
-          "required_reviewers": {
-           "type": "integer",
-           "minimum": 0
-          }
-         }
         }
        }
       }

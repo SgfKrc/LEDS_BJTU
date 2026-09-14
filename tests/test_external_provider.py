@@ -489,6 +489,9 @@ def test_scope_gate_blocks_before_any_request(monkeypatch, mock_external_server)
 
 
 def test_backend_down_raises_clean_transport_error(monkeypatch):
+    # Keep the closed-loopback-port assertion independent from CI/system proxies.
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     _patch_external_config(
         monkeypatch, base_url=f"http://127.0.0.1:{_closed_port()}",
         connect_timeout=1, timeout=2,

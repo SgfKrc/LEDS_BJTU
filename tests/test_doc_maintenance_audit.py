@@ -95,7 +95,7 @@ def test_links_extraction_and_existence(tmp_path):
     assert "A.md" in paths and "../README.md" in paths
     assert not any(h.startswith(("http", "#")) for h in paths)
     # 存在性
-    assert _check_link("文档维护Agent工具设计.md")
+    assert _check_link("缓存机制专项计划-2026-09-13.md")
     assert not _check_link("不存在的文档.md")
 
 

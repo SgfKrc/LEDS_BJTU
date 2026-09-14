@@ -324,35 +324,6 @@ def test_required_plan_must_declare_manual_review_and_calibration(tmp_path):
         load_plan(path)
 
 
-def test_required_sd_gate_requires_passed_manual_review(tmp_path):
-    """KIP-16：required 时 SD 证据人工审核未通过 → quality failed。"""
-    import scripts.experiment_core.collector as collector_mod
-    from experiment_core.plan import load_plan
-    from experiment_core.quality import normalize_quality_evidence
-
-    path = _quality_plan(tmp_path, required=False).source_path
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    raw["quality"]["required"] = True
-    raw["quality"]["manual_review"] = {"reviewers_required": 2, "upgrade_on": "2 pass, 0 fail"}
-    raw["quality"]["calibration"] = {"series_id": "s", "rounds_required": 3, "threshold_version": "v1"}
-    raw["quality"]["sd"] = {"asset_ids": ["a1"], "gate": "quality_gate_sd15 automatic_gate.passed"}
-    raw["units"][0]["quality_checks"] = ["sd"]
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    plan = load_plan(path)
-
-    evidence = normalize_quality_evidence({"sd": {
-        "mode": "text_to_image", "asset_id": "a1", "artifact_id": "a1",
-        "source_schema_version": 1,
-        "automatic_gate": {"passed": True, "output_count": 10, "unique_output_count": 10},
-        "manual_review": {"status": "pending", "required_reviewers": 2},
-    }})
-    gate = collector_mod.evaluate_quality_gate(
-        evidence, plan.quality, ("sd",), baseline_record=None,
-    )
-    assert gate["status"] == "failed"
-    assert any("manual_review" in c for c in gate["criteria"])
-
-
 def test_required_gemma_gate_requires_manual_review_binding(tmp_path):
     """KIP-16：required 时 Gemma 判题证据缺人工复核绑定 → quality failed。"""
     import scripts.experiment_core.collector as collector_mod

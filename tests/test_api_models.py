@@ -334,26 +334,6 @@ def test_local_asset_preflight_delegates_to_read_only_inventory_gate(monkeypatch
     assert asyncio.run(api_server.preflight_local_model_asset("qwen3-4b")) == expected
 
 
-def test_diffusion_capabilities_detects_manager_loaded_when_host_flag_is_stale(monkeypatch):
-    class LoadedManager:
-        is_loaded = True
-
-    host = types.SimpleNamespace(
-        model_loaded=False,
-        has_loaded_model=lambda: False,
-    )
-    monkeypatch.setattr(api_server, "model_host", host)
-    monkeypatch.setattr(api_server, "model_manager", LoadedManager())
-    service = types.SimpleNamespace(
-        snapshot=lambda: {"state": "unloaded", "loaded": False},
-    )
-    monkeypatch.setattr(api_server, "diffusion_service", service)
-
-    result = asyncio.run(api_server.get_diffusion_capabilities())
-
-    assert result["local_llm_loaded"] is True
-
-
 def test_register_gguf_model_is_allowed_without_cuda(monkeypatch, tmp_path):
     saved = []
     monkeypatch.setattr(

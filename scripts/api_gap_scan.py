@@ -511,8 +511,6 @@ _INTERNAL_HINTS = (
 _EXPERIMENTAL_PATH_HINTS = (
     "/api/experimental/",
     "/api/speculative",
-    "/api/diffusion/distributed",
-    "/api/diffusion/mixed",
 )
 _EXPERIMENTAL_SOURCE_HINTS = ("experimental.controller.ts", "experimental.py")
 

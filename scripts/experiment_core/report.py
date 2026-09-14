@@ -45,22 +45,17 @@ def _comparison_row(record: Mapping, baseline: Mapping | None) -> list[str]:
 def _quality_cells(record: Mapping) -> list[str]:
     quality = record.get("quality")
     if not isinstance(quality, Mapping):
-        return ["not_collected", "-", "-", "-", "-", "-", "-", "not_collected"]
+        return ["not_collected", "-", "-", "-", "-", "not_collected"]
     llm = quality.get("llm")
-    sd = quality.get("sd")
     gemma = quality.get("gemma_judge")
     correctness = llm.get("correctness") if isinstance(llm, Mapping) else None
     formatting = llm.get("format") if isinstance(llm, Mapping) else None
-    automatic = sd.get("automatic_gate") if isinstance(sd, Mapping) else None
-    manual = sd.get("manual_review") if isinstance(sd, Mapping) else None
     topic_hit = gemma.get("topic_hit") if isinstance(gemma, Mapping) else None
     coverage = gemma.get("key_element_coverage") if isinstance(gemma, Mapping) else None
     return [
         str(quality.get("status", "not_collected")),
         _fmt(correctness.get("rate") if isinstance(correctness, Mapping) else None),
         _fmt(formatting.get("rate") if isinstance(formatting, Mapping) else None),
-        str(automatic.get("status", "-") if isinstance(automatic, Mapping) else "-"),
-        str(manual.get("status", "-") if isinstance(manual, Mapping) else "-"),
         _fmt(topic_hit.get("rate") if isinstance(topic_hit, Mapping) else None),
         _fmt(coverage.get("rate") if isinstance(coverage, Mapping) else None),
         str(
@@ -111,8 +106,8 @@ def build_report(out_dir: Path, records: list[Mapping], plan_meta: Mapping) -> t
             lines.append("质量门独立记录，不改变既有性能 gate；仅 manifest 声明 required 时才参与总 gate。")
     else:
         lines.append("本节只汇总结构化证据，不改变既有性能 gate。")
-    lines.append("| id | evidence | LLM correct rate | LLM format rate | SD automatic gate | manual review | Gemma topic hit | Gemma key coverage | quality gate |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("| id | evidence | LLM correct rate | LLM format rate | Gemma topic hit | Gemma key coverage | quality gate |")
+    lines.append("|---|---|---|---|---|---|---|")
     for record in records:
         lines.append("| " + record["experiment_id"] + " | " + " | ".join(_quality_cells(record)) + " |")
     lines.append("")

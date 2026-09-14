@@ -18,7 +18,6 @@ from experiment_core.plan import load_plan
 from experiment_core.quality import (
     QualityEvidenceError,
     normalize_quality_evidence,
-    sd_evidence_from_gate_report,
 )
 from experiment_core.report import build_report
 from experiment_core.runner import UnitOutcome
@@ -75,29 +74,6 @@ def test_quality_rejects_unknown_or_mismatched_llm_evidence():
     payload["llm"]["prompt_set_id"] = "another-fixed-set"
     with pytest.raises(QualityEvidenceError, match="does not match"):
         normalize_quality_evidence(payload, expected_prompt_set=PROMPT_SET)
-
-
-def test_sd_gate_adapter_counts_lists_without_copying_sensitive_report_fields():
-    raw_report = {
-        "schema_version": 1,
-        "asset_id": "sd15-original-v1",
-        "artifact_id": "sha256:" + "a" * 64,
-        "prompt": "this prompt must never enter experiment records",
-        "images": ["C:/private/image-a.png", "C:/private/image-b.png"],
-        "automatic_gate": {"passed": True, "unique_images": ["hash-a", "hash-b"]},
-        "manual_gate": {"passed": False, "required_reviewers": 2, "reviews": []},
-        "status": "pending_manual_review",
-    }
-    payload = {"sd": sd_evidence_from_gate_report(raw_report)}
-    quality = normalize_quality_evidence(payload, expected_prompt_set=PROMPT_SET)
-    assert quality["sd"]["automatic_gate"] == {
-        "status": "passed", "output_count": 2, "unique_output_count": 2,
-    }
-    assert quality["sd"]["manual_review"]["status"] == "pending"
-    serialized = json.dumps(quality)
-    assert "private" not in serialized
-    assert "prompt" not in serialized
-    assert "hash-a" not in serialized
 
 
 def test_collector_redacts_malformed_evidence_and_keeps_performance_gate(tmp_path):

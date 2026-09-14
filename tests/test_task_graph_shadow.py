@@ -10,7 +10,6 @@ import task_graph_shadow
 from task_graph import (
     StageSpec,
     dual_candidate_template,
-    image_prompt_sd15_template,
 )
 from task_graph_payloads import TaskPayloadStore
 from task_graph_shadow import (
@@ -51,48 +50,6 @@ def test_g2_3_dual_candidate_fixed_template_is_stable_noop():
     assert first["metrics"]["optimized_edge_count"] == 2
     assert first["metrics"]["payload_plan_count"] == 0
     assert validate_shadow_report(first) == first
-
-
-def test_g2_3_llm_sd15_binding_boundary_remains_noop():
-    stages, final_stage_id = image_prompt_sd15_template(
-        text_provider_id="local_text",
-        image_provider_id="local_image",
-        text_model_identity=ModelIdentity(
-            model_id="qwen-test",
-            engine="pytorch",
-            format="safetensors",
-            revision="rev1",
-            sha256="a" * 64,
-        ),
-    )
-    report = run_task_graph_shadow("llm_sd15_v1", stages, final_stage_id)
-
-    assert report["status"] == "evaluated"
-    assert report["metrics"]["reduced_edge_count"] == 0
-    assert report["metrics"]["payload_plan_count"] == 0
-    assert report["metrics"]["logical_edge_count"] == 1
-    assert report["metrics"]["optimized_edge_count"] == 1
-
-
-def test_g2_3_image_grid_fixed_shape_allows_dynamic_providers():
-    seed_ids = [f"seed_{index}" for index in range(4)]
-    stages = [
-        StageSpec(stage_id, "image_generate", provider=f"worker-{index}", pure=True)
-        for index, stage_id in enumerate(seed_ids)
-    ]
-    stages.append(
-        StageSpec(
-            "image_grid",
-            "image_grid",
-            depends_on=tuple(seed_ids),
-            provider="grid-worker",
-        )
-    )
-    report = run_task_graph_shadow("image_grid_v1", stages, "image_grid")
-
-    assert report["status"] == "evaluated"
-    assert report["metrics"]["logical_stage_count"] == 5
-    assert report["metrics"]["logical_edge_count"] == 4
 
 
 def test_g2_3_fanout_shadow_binds_once_for_two_consumers(tmp_path):

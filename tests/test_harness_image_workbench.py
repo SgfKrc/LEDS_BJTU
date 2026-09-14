@@ -13,10 +13,8 @@ from harness_workbench.image_workbench import (
     ImageRequest,
     LocalImageEngine,
     LocalImageEngineConfig,
-    RemoteQLHImageAdapter,
     validate_asset_manifest,
 )
-from harness_workbench.image_workbench.remote_qlh import RemoteQLHConfig
 
 
 def _manifest(root, *, asset_id="sd15-test", content=b"weights"):
@@ -90,38 +88,6 @@ def test_local_engine_reports_unavailable_executor_without_claiming_images(tmp_p
 class _FakeRemoteTransport:
     def __init__(self):
         self.posts = []
-
-    def post_json(self, path, payload):
-        self.posts.append((path, payload))
-        return {"job_id": "job-1", "state": "queued"}
-
-    def get_json(self, path):
-        return {"job_id": "job-1", "state": "completed", "blob": {"blob_id": "img-1"}}
-
-    def get_bytes(self, path):
-        return b"remote-png", "image/png"
-
-
-def test_remote_qlh_maps_job_and_blob_contract():
-    transport = _FakeRemoteTransport()
-    adapter = RemoteQLHImageAdapter(RemoteQLHConfig("http://master:8000", model_id="sd15_original_v1"), transport)
-    result = adapter.generate(ImageRequest.from_mapping({"prompt": "test", "model": "sd15_original_v1", "steps": 2}))
-    assert result.data == b"remote-png"
-    assert transport.posts[0][0] == "/api/diffusion/generate"
-    assert transport.posts[0][1]["preset_id"] == "sd15_original_v1"
-
-
-def test_remote_qlh_decodes_direct_base64_result():
-    class DirectTransport(_FakeRemoteTransport):
-        def post_json(self, path, payload):
-            return {"b64_json": base64.b64encode(b"direct").decode("ascii"), "mime_type": "image/webp"}
-
-    adapter = RemoteQLHImageAdapter(RemoteQLHConfig("http://master:8000"), DirectTransport())
-    result = adapter.generate(ImageRequest.from_mapping({"prompt": "test"}))
-    assert result.data == b"direct"
-    assert result.mime_type == "image/webp"
-
-
 def test_image_asset_store_round_trip_and_integrity(tmp_path):
     store = ImageAssetStore(tmp_path / "assets")
     record = store.put(GeneratedImage(b"png-data"), prompt="a prompt", owner_scope="user-1")
@@ -175,4 +141,3 @@ def test_image_api_returns_base64_and_user_asset_url(tmp_path):
     url_response = client.post("/v1/images/generations", json={"prompt": "test", "response_format": "url"})
     assert url_response.status_code == 200
     assert url_response.json()["data"][0]["url"].startswith("/v1/images/assets/img_")
-

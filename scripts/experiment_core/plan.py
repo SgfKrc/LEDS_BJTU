@@ -16,7 +16,7 @@ _EXPERIMENT_ID_RE = re.compile(r"^exp-[0-9]{4}$")
 _GATE_OPS = {">=", "<=", ">", "<", "=="}
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_QUALITY_CHECKS = {"llm", "sd", "gemma_judge"}
+_QUALITY_CHECKS = {"llm", "gemma_judge"}
 
 
 class PlanError(ValueError):
@@ -42,7 +42,6 @@ class QualitySpec:
 
     required: bool
     llm: Mapping[str, Any] | None = None
-    sd: Mapping[str, Any] | None = None
     gemma_judge: Mapping[str, Any] | None = None
     manual_review: Mapping[str, Any] | None = None
     calibration: Mapping[str, Any] | None = None
@@ -51,7 +50,6 @@ class QualitySpec:
         return {
             "required": self.required,
             "llm": dict(self.llm) if self.llm else None,
-            "sd": dict(self.sd) if self.sd else None,
             "gemma_judge": dict(self.gemma_judge) if self.gemma_judge else None,
             "manual_review": dict(self.manual_review) if self.manual_review else None,
             "calibration": dict(self.calibration) if self.calibration else None,
@@ -247,7 +245,7 @@ def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpe
         return None
     if not isinstance(raw, Mapping):
         raise PlanError("quality must be an object")
-    allowed = {"required", "llm", "sd", "gemma_judge", "manual_review", "calibration"}
+    allowed = {"required", "llm", "gemma_judge", "manual_review", "calibration"}
     if set(raw) - allowed:
         raise PlanError("quality contains unsupported fields")
     required = raw.get("required", False)
@@ -302,23 +300,6 @@ def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpe
             ),
             "compare_rule": compare_rule,
         }
-
-    sd_raw = raw.get("sd")
-    sd: dict[str, Any] | None = None
-    if sd_raw is not None:
-        if not isinstance(sd_raw, Mapping):
-            raise PlanError("quality.sd must be an object")
-        if set(sd_raw) - {"asset_ids", "gate"} or not {"asset_ids", "gate"}.issubset(sd_raw):
-            raise PlanError("quality.sd must contain only asset_ids and gate")
-        asset_ids = sd_raw["asset_ids"]
-        if not isinstance(asset_ids, list) or not asset_ids:
-            raise PlanError("quality.sd.asset_ids must be a non-empty list")
-        sd = {
-            "asset_ids": tuple(_identifier(item, "quality.sd asset") for item in asset_ids),
-            "gate": str(sd_raw["gate"]),
-        }
-        if sd["gate"] != "quality_gate_sd15 automatic_gate.passed":
-            raise PlanError("quality.sd.gate is unsupported")
 
     gemma_raw = raw.get("gemma_judge")
     gemma_judge: dict[str, Any] | None = None
@@ -429,10 +410,10 @@ def _parse_quality_config(raw: Any, prompt_set: Mapping[str, Any]) -> QualitySpe
                 "quality.required must declare calibration with rounds_required = 3 "
                 "(three-round evidence gate)"
             )
-    if required and not any((llm, sd, gemma_judge)):
+    if required and not any((llm, gemma_judge)):
         raise PlanError("quality.required needs at least one configured check")
     return QualitySpec(
-        required=required, llm=llm, sd=sd, gemma_judge=gemma_judge,
+        required=required, llm=llm, gemma_judge=gemma_judge,
         manual_review=manual_review, calibration=calibration,
     )
 
@@ -492,7 +473,6 @@ def _parse_unit(
     configured = {
         name for name, value in (
             ("llm", quality.llm if quality else None),
-            ("sd", quality.sd if quality else None),
             ("gemma_judge", quality.gemma_judge if quality else None),
         ) if value is not None
     }

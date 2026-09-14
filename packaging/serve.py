@@ -10,7 +10,7 @@
 - PC 安装包: packaging/dist/*.exe（主应用，不含启动器）
 - QLH 启动器: packaging/dist/QLH-Launcher-Setup-v*.exe（安装包）+ QLH-Launcher-v*.zip（自更新资产）
 - Android 安装包: packaging/dist/*.apk / *.aab，或 android/app/build/outputs/**/*.apk / *.aab
-- 模型整合包（唯一维护路径）: build/offline-bundles/qlh-models-pc-v1.7z.001-007（PC 分卷）+ qlh-models-android-v1.7z（安卓）；旧 models_pc/models_android/sd15-assets 线路已废弃（2026-08-17，文件不再生成）
+- 模型整合包（唯一维护路径）: build/offline-bundles/qlh-models-pc-v2.7z（PC）+ qlh-models-android-v2.7z（安卓）；生图资产由 Koakumix 独立维护
 
 Ctrl+C 停止。
 """
@@ -549,7 +549,7 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     PC 安装包默认路径: <code>packaging/dist/QLH-Edge-Inference-Setup-v*.exe</code><br>
     启动器: <code>packaging/dist/QLH-Launcher-Setup-v*.exe</code>（安装）+ <code>QLH-Launcher-v*.zip</code>（自更新资产，供 <code>qlh_launcher.py launcher-install</code> 使用）<br>
     整合包由 scripts/build_offline_bundle.py 生成：PC 版为 4GB 分卷（.001-007，全量资产含 SD），
-    安卓版为单卷（仅 GGUF，SAF 目录直接可用）；旧 models_pc/models_android/sd15 包线路已废弃。
+    安卓版为单卷（仅 GGUF，SAF 目录直接可用）；生图不属于 QLH 主项目。
   </p>
 </body>
 </html>

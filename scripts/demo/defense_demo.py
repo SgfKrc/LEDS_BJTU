@@ -39,7 +39,6 @@ STARTUP_BUDGET_SECONDS = 120.0
 SCENARIO_SOURCE_PATHS = {
     "fixture-data": Path("src/data/fixtures.ts"),
     "chat-pane": Path("src/components/ChatPane.tsx"),
-    "image-studio": Path("src/pages/ImageStudioPage.tsx"),
     "topology-snapshot": Path("src/data/defense-topology.json"),
     "cluster-page": Path("src/components/DefenseTopologySnapshot.tsx"),
 }
@@ -183,7 +182,7 @@ def _scenario_sources() -> dict[str, Path]:
 
 
 def _load_fixture_scenarios() -> list[dict[str, Any]]:
-    """Load and validate the offline dialog/image rehearsal contract."""
+    """Load and validate the offline dialog/topology rehearsal contract."""
     try:
         payload = json.loads(SCENARIO_MANIFEST.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -192,7 +191,7 @@ def _load_fixture_scenarios() -> list[dict[str, Any]]:
     if not isinstance(scenarios, list) or not scenarios:
         raise RuntimeError("预置演示剧本为空")
     for item in scenarios:
-        if not isinstance(item, dict) or item.get("kind") not in {"dialog", "image", "topology"}:
+        if not isinstance(item, dict) or item.get("kind") not in {"dialog", "topology"}:
             raise RuntimeError("预置演示剧本包含未知场景")
         if not isinstance(item.get("route"), str) or not item["route"].startswith("#/"):
             raise RuntimeError("预置演示剧本路由无效")
@@ -788,7 +787,7 @@ def _write_report(run: DemoRun) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="QLH defense demo launcher")
     parser.add_argument("--mode", choices=("fixtures", "live", "failure"), default="fixtures")
-    parser.add_argument("--scenario", choices=("dialog", "image", "topology"), help="open a fixture scenario directly")
+    parser.add_argument("--scenario", choices=("dialog", "topology"), help="open a fixture scenario directly")
     parser.add_argument("--api-port", type=_port, default=8000)
     parser.add_argument("--frontend-port", type=_port, default=5174)
     parser.add_argument("--timeout", type=float, default=30.0, dest="startup_timeout")

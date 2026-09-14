@@ -80,8 +80,8 @@
     },
     {
       "path": "experiment-plans/plan-quality-total-gate-v1.json",
-      "sha256": "a61947e197c31eaf8662712ea5713483fe8add365f3fba2aa45f329e05d71398",
-      "size_bytes": 5361
+      "sha256": "06257a3d80414e960987f74e96e0bbce9efa0c46f62fc53d9e8ab5625f80d0b0",
+      "size_bytes": 2710
     },
     {
       "path": "experiment-plans/plan-quant-qwen-1.8b-v1.json",

@@ -316,7 +316,6 @@ def test_scheduler_disconnect_aborts_dry_run(monkeypatch):
     sched = Scheduler()
     sched.begin_qwen3_pipeline_dry_run(_contract())
     monkeypatch.setattr(sched._task_worker_control, "disconnect_worker", lambda _node: None)
-    monkeypatch.setattr(sched._diffusion_worker_control, "disconnect_worker", lambda _node: None)
     monkeypatch.setattr(sched, "_fail_pending_pipeline_results_for_node", lambda *_args: None)
     monkeypatch.setattr(sched, "deregister_node", lambda _node: False)
     sched._on_tcp_disconnect("worker-b")

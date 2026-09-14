@@ -417,38 +417,6 @@ def dual_candidate_template() -> tuple[list[StageSpec], str]:
     ], "aggregate"
 
 
-def image_prompt_sd15_template(
-    *,
-    text_provider_id: str,
-    image_provider_id: str,
-    text_model_identity: ModelIdentity,
-) -> tuple[list[StageSpec], str]:
-    """Return the only admitted v2-text -> v3-image mixed workflow.
-
-    The text result is bound locally into the image root input instead of
-    becoming a v3 dependency. This keeps the image protocol's Blob-only
-    dependency boundary intact and does not create a general DAG API.
-    """
-    return [
-        StageSpec(
-            "image_prompt",
-            "image_prompt",
-            provider=text_provider_id,
-            model_identity=text_model_identity,
-            pure=True,
-            lease_timeout_seconds=120.0,
-        ),
-        StageSpec(
-            "image_generate",
-            "image_generate",
-            depends_on=("image_prompt",),
-            provider=image_provider_id,
-            input_bindings={"prompt": ("image_prompt", "content")},
-            lease_timeout_seconds=600.0,
-        ),
-    ], "image_generate"
-
-
 class TaskGraphCoordinator:
     """Run bounded, in-memory workflows without sharing model-internal state."""
 
@@ -2355,11 +2323,6 @@ class TaskGraphCoordinator:
                     f"stage {stage.spec.stage_id} input binding source output is unavailable"
                 )
             value = dependency_output[output_key]
-            if stage.spec.stage_type == "image_generate" and target_key == "prompt":
-                if not isinstance(value, str) or not value.strip() or len(value) > 1000:
-                    raise TaskGraphError(
-                        "image prompt binding output is empty or exceeds the contract limit"
-                    )
             stage_root_input[target_key] = value
             dependencies.pop(dependency_stage_id, None)
         provider_request = StageRequest(

@@ -47,7 +47,7 @@ a = Analysis(
         "py",
         "zmq",
         # 打包版只承诺轻量子命令（inspect/verify/sweep/disk-usage/clean/
-        # sync-status/gguf-convert 预检/sd15-lora-inspect）。需要 torch/
+        # sync-status/gguf-convert 预检）。需要 torch/
         # transformers 的重型子命令（llm_smoke_matrix、qwen3-* smoke、
         # gguf-convert 真实执行等）在源码或 sidecar 环境运行；显式排除
         # 避免 364MB+ 的 torch 依赖树膨胀安装包。

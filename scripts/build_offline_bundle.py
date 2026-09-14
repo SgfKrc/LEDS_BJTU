@@ -2,7 +2,7 @@
 """离线资产一键整合包打包器（M1/M2）——按《离线资产一键整合包设计》。
 
 一键把本机已下载的离线资产打包成两个整合包：
-  --pc       PC 版（全量：Qwen 双格式 + Qwen3-4B + Gemma4 原生 + SD 五资产包）
+  --pc       PC 版（全量：Qwen 双格式 + Qwen3-4B + Gemma4 原生）
   --android  安卓版（纯 GGUF：Qwen-1.8B Q4 + Qwen3-4B Q4，SAF 目录直接可用）
 
 格式：
@@ -10,7 +10,7 @@
   --format zip（ZIP_STORED 快速模式，不压缩）
 
 原则：
-- 只读资产源（models/、build/sd15-assets/），不重新下载、不新增事实源；
+- 只读资产源（models/），不重新下载、不新增事实源；
 - 逐文件 SHA-256 校验（复用既有 lock/manifest/SHA 侧车）；
 - 缺失资产 fail-closed 并给出获取命令（--missing 只列缺失）。
 
@@ -120,23 +120,8 @@ ASSETS: dict[str, dict] = {
         "desc": "Gemma 4 12B 原生绑定（GGUF + mmproj，图像理解）",
         "fetch": "按 models/gemma4-native/gemma4-native.lock.json 受管下载",
     },
-    "sd15-assets": {
-        "path": "build/sd15-assets", "kind": "sd15", "scope": "pc",
-        "desc": "SD 1.5 五资产离线包（原版/90s/IP-Adapter/inpaint/InstructPix2Pix）",
-        "fetch": "python scripts/package_sd15_assets.py --asset-id <id> "
-                 "--output-dir build/sd15-assets（验收后清理过，需重新打包）",
-    },
 }
-
-PRUNE_SD_ZIPS = False  # --prune-sd-zips 时置 True
-PRUNE_DRY_RUN = False  # --prune-dry-run：只打印将删文件不执行
-_PRUNE_WARNED = False
 _CAPACITY_HEADROOM_BYTES = 64 << 20
-
-
-def _set_prune_warned() -> None:
-    global _PRUNE_WARNED
-    _PRUNE_WARNED = True
 
 # 临时目录放 D 盘（系统盘只有 ~11GB，verify/staging 会写几十 GB）
 TMP_BASE = Path(os.environ.get("QLH_BUNDLE_TMP", "D:/qlh_tmp"))
@@ -154,7 +139,6 @@ PC_ASSETS = (
     "qwen35-9b-safetensors", "qwen35-9b-gguf",
     "gemma4-native", "gemma4-12b-safetensors",
     "deepseek-7b-safetensors", "deepseek-7b-gguf",
-    "sd15-assets",
 )
 ANDROID_ASSETS = ("qwen18b-gguf", "qwen3-4b-gguf",
                   "qwen35-9b-gguf", "qwen35-2b-gguf")
@@ -176,16 +160,14 @@ def _resolve(asset_id: str) -> Path:
     return (REPO_ROOT / ASSETS[asset_id]["path"]).resolve()
 
 
-def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
+def _collect_asset(asset_id: str) -> dict:
     """收集资产文件清单（src=仓库绝对、path=bundle 内相对），校验 SHA。
 
-    sd15 资产会解包去重到 staging_sd（同 SHA 文件只写一份，重复条目记
-    dedup_of）；其余资产直接引用仓库路径。
+    资产直接引用仓库路径。
     """
     spec = ASSETS[asset_id]
     raw_root = REPO_ROOT / spec["path"]
     root = raw_root.resolve()  # 解析 junction 到真实位置（读文件用）
-    is_archive_junction = raw_root.is_junction()  # 必须在 resolve 前检测
     files: list[dict] = []
 
     def add(path_in_bundle: str, src: Path) -> None:
@@ -226,64 +208,6 @@ def _collect_asset(asset_id: str, staging_sd: Path | None = None) -> dict:
                     f"资产 {asset_id} 文件 {filename} SHA 不匹配"
                     f"（lock {declared_sha} != 实际 {actual}）")
             add(f"models/gemma4-native/{filename}", fp)
-    elif spec["kind"] == "sd15":
-        if not root.is_dir():
-            raise BundleError(f"缺失资产 {asset_id}: {root}\n  获取: {spec['fetch']}")
-        if staging_sd is None:
-            raise BundleError("sd15 资产需要 staging 目录（去重重组）")
-        seen_sha: dict[str, str] = {}  # sha -> 已存储的 bundle 路径
-        for fp in sorted(root.glob("*.zip")):
-            sidecar = fp.with_suffix(".zip.sha256")
-            declared_sha = None
-            if sidecar.is_file():
-                declared_sha = sidecar.read_text(encoding="utf-8").strip().split()[0]
-            actual = _sha256_file(fp)
-            if declared_sha and actual != declared_sha:
-                raise BundleError(
-                    f"资产 {asset_id} 包 {fp.name} SHA 不匹配（{declared_sha} != {actual}）")
-            with zipfile.ZipFile(fp) as zf:
-                for info in zf.infolist():
-                    if info.is_dir() or not info.filename.startswith("models/"):
-                        continue
-                    bundle_path = info.filename
-                    entry_sha = hashlib.sha256()
-                    with zf.open(info) as fh:
-                        for chunk in iter(lambda: fh.read(1 << 20), b""):
-                            entry_sha.update(chunk)
-                    digest = entry_sha.hexdigest()
-                    if digest in seen_sha:
-                        # 跨包重复：只记映射，不重复写
-                        files.append({
-                            "src": "", "path": bundle_path,
-                            "size": info.file_size, "sha256": digest,
-                            "dedup_of": seen_sha[digest],
-                        })
-                        continue
-                    seen_sha[digest] = bundle_path
-                    staging_target = staging_sd / bundle_path
-                    staging_target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(info) as fh, open(staging_target, "wb") as out:
-                        for chunk in iter(lambda: fh.read(1 << 20), b""):
-                            out.write(chunk)
-                    files.append({
-                        "src": str(staging_target), "path": bundle_path,
-                        "size": info.file_size, "sha256": digest,
-                    })
-            if PRUNE_SD_ZIPS:
-                # 源 zip 可重建（package_sd15_assets.py），处理完即删以省空间
-                if is_archive_junction:
-                    # 归档 junction（如 H:/qlh-archives）只读：绝不删归档文件
-                    if not _PRUNE_WARNED:
-                        print("  [prune] 源为归档 junction，只读保护——跳过删除")
-                        _set_prune_warned()
-                elif PRUNE_DRY_RUN:
-                    print(f"  [prune-dry-run] 将删除: {fp.name} + 侧车")
-                else:
-                    fp.unlink()
-                    sidecar.unlink(missing_ok=True)
-        if not files:
-            raise BundleError(
-                f"资产 {asset_id}: {root} 无离线包（先跑 download_sd15 / 导入离线包）")
     else:  # pragma: no cover
         raise BundleError(f"未知资产 kind: {spec['kind']}")
 
@@ -294,13 +218,7 @@ def _missing_assets(scope: tuple[str, ...]) -> list[str]:
     missing = []
     for asset_id in scope:
         try:
-            if ASSETS[asset_id]["kind"] == "sd15":
-                # 缺失检查只验证 zip 存在（深解包去重校验在打包时做）
-                root = _resolve(asset_id)
-                if not root.is_dir() or not list(root.glob("*.zip")):
-                    raise BundleError("sd15 无离线包")
-            else:
-                _collect_asset(asset_id)
+            _collect_asset(asset_id)
         except BundleError:
             missing.append(asset_id)
     return missing
@@ -326,8 +244,7 @@ def _storage_key(path: Path) -> tuple[str, str | int]:
 def _estimate_asset_bytes(asset_id: str) -> int:
     """只读估算某资产进入整合包前的未压缩字节数。
 
-    不计算 SHA、不创建 staging。SD zip 使用 central directory 的未压缩大小；
-    这会忽略跨包去重，因此预检结果刻意偏保守。
+    不计算 SHA、不创建 staging。
     """
     spec = ASSETS[asset_id]
     root = _resolve(asset_id)
@@ -359,25 +276,6 @@ def _estimate_asset_bytes(asset_id: str) -> int:
                 raise BundleError(f"缺失资产 {asset_id} 文件 {filename}: {artifact}")
             total += artifact.stat().st_size
         return total
-    if kind == "sd15":
-        if not root.is_dir():
-            raise BundleError(f"缺失资产 {asset_id}: {root}\n  获取: {spec['fetch']}")
-        packages = sorted(root.glob("*.zip"))
-        if not packages:
-            raise BundleError(f"资产 {asset_id}: {root} 无离线包")
-        total = 0
-        for package in packages:
-            try:
-                with zipfile.ZipFile(package) as archive:
-                    total += sum(
-                        info.file_size for info in archive.infolist()
-                        if not info.is_dir() and info.filename.startswith("models/")
-                    )
-            except zipfile.BadZipFile as exc:
-                raise BundleError(f"资产 {asset_id} 离线包损坏: {package}") from exc
-        if total <= 0:
-            raise BundleError(f"资产 {asset_id}: {root} 无 models/ 内容")
-        return total
     raise BundleError(f"未知资产 kind: {kind}")
 
 
@@ -386,14 +284,12 @@ def _capacity_preflight(scope: tuple[str, ...], variant: str, fmt: str,
     """返回构建峰值的保守磁盘预算，不写入文件。
 
     输出包始终以未压缩 payload 估算，因而对 ZIP_STORED 精确、对 7z 保守。
-    SD 解包 staging 先于压缩存在；去重收益只在真正收集后计算，预检不会把它
-    当作可用空间，避免空间恰好不足时留下半成品。
+    预检只按未压缩 payload 和固定余量估算，避免空间不足时留下半成品。
     """
     by_asset = {asset_id: _estimate_asset_bytes(asset_id) for asset_id in scope}
     payload_bytes = sum(by_asset.values())
-    sd_staging_bytes = by_asset.get("sd15-assets", 0)
     output_bytes = payload_bytes + _CAPACITY_HEADROOM_BYTES
-    build_peak_bytes = output_bytes + sd_staging_bytes
+    build_peak_bytes = output_bytes
     verify_extract_bytes = payload_bytes + _CAPACITY_HEADROOM_BYTES if verify else 0
 
     out_parent = _existing_parent(OUT_DIR)
@@ -404,7 +300,7 @@ def _capacity_preflight(scope: tuple[str, ...], variant: str, fmt: str,
         out_key: {
             "path": str(out_parent),
             "required_bytes": build_peak_bytes,
-            "purpose": ["bundle_output", "sd15_staging"] if sd_staging_bytes else ["bundle_output"],
+            "purpose": ["bundle_output"],
         }
     }
     if verify:
@@ -436,7 +332,6 @@ def _capacity_preflight(scope: tuple[str, ...], variant: str, fmt: str,
         "verify": verify,
         "asset_bytes": by_asset,
         "payload_bytes": payload_bytes,
-        "sd15_staging_bytes": sd_staging_bytes,
         "output_bytes": output_bytes,
         "volumes": volumes,
         "admitted": all(volume["admitted"] for volume in volumes),
@@ -456,7 +351,7 @@ def _print_capacity_preflight(report: dict) -> None:
     print(
         f"容量预检 {report['variant']} ({report['format']})："
         f"payload {_format_bytes(report['payload_bytes'])}，"
-        f"SD staging {_format_bytes(report['sd15_staging_bytes'])}"
+        f"输出余量 {_format_bytes(report['output_bytes'] - report['payload_bytes'])}"
     )
     for volume in report["volumes"]:
         verdict = "通过" if volume["admitted"] else "不足"
@@ -506,15 +401,8 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
     ext = ".7z" if fmt == "7z" else ".zip"
     bundle_path = OUT_DIR / f"qlh-models-{variant}-{BUNDLE_VERSION}{ext}"
 
-    staging_sd = None
-    if "sd15-assets" in scope:
-        staging_sd = OUT_DIR / f".staging-{variant}"
-        if staging_sd.exists():
-            shutil.rmtree(staging_sd)
-        staging_sd.mkdir(parents=True)
-
     for asset_id in scope:
-        collected = _collect_asset(asset_id, staging_sd=staging_sd)
+        collected = _collect_asset(asset_id)
         collected_all.append(collected)
         for f in collected["files"]:
             manifest_files.append({k: v for k, v in f.items() if k != "src"})
@@ -536,17 +424,12 @@ def _build_bundle(scope: tuple[str, ...], variant: str,
     manifest_json = json.dumps(manifest, ensure_ascii=False, indent=1,
                                sort_keys=True)
 
-    try:
-        if fmt == "7z":
-            _build_bundle_7z(bundle_path, collected_all, manifest_json,
-                             checksum_lines, variant, volume, threads)
-        else:
-            _build_bundle_zip(bundle_path, collected_all,
-                              manifest_json, checksum_lines, variant)
-    finally:
-        # staging 是中间产物：打包完（或失败）立即删，降低磁盘峰值
-        if staging_sd is not None and staging_sd.exists():
-            shutil.rmtree(staging_sd, ignore_errors=True)
+    if fmt == "7z":
+        _build_bundle_7z(bundle_path, collected_all, manifest_json,
+                         checksum_lines, variant, volume, threads)
+    else:
+        _build_bundle_zip(bundle_path, collected_all,
+                          manifest_json, checksum_lines, variant)
     _write_archive_checksums(bundle_path, volume=volume)
     return bundle_path
 
@@ -580,21 +463,13 @@ def _build_bundle_7z(bundle_path, collected_all, manifest_json,
     if seven_zip is None:
         raise BundleError("7z 模式需要 7-Zip（winget install 7zip.7zip）")
     root = _bundle_root_name(bundle_path)
-    # 分段增量追加（免复制）：models/（cwd=REPO_ROOT）；sd15 staging
-    # （cwd=staging）；清单（临时目录）
+    # 分段增量追加（免复制）：models/（cwd=REPO_ROOT）；清单（临时目录）
     parts: list[tuple[Path, list[str]]] = []
-    # SD 内容来自 OUT_DIR/.staging-*，不是 REPO_ROOT；把它混入这一段会让
-    # 7z 在项目根目录寻找尚不存在的 models/sd15-* 文件。
     models_files = [f for c in collected_all for f in c["files"]
                     if f["path"].startswith("models/")
-                    and not f["path"].startswith("models/sd15-")
                     and not f.get("dedup_of")]
     if models_files:
         parts.append((REPO_ROOT, [f["path"] for f in models_files]))
-    sd15_files = [f for c in collected_all for f in c["files"]
-                  if f["path"].startswith("models/sd15-") and not f.get("dedup_of")]
-    if sd15_files:
-        parts.append((OUT_DIR / f".staging-{variant}", [f["path"] for f in sd15_files]))
     partial = Path(str(bundle_path) + ".partial")
     partial.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
@@ -744,7 +619,7 @@ def _import_readme(variant: str, manifest_json: str) -> str:
         "1. 解压前先校验同名 archive `.sha256` 侧车（分卷需保留全部卷）\n"
         "2. 解压到 QLH 项目根目录，`models/` 目录即就位\n"
         "3. 解压后校验：`sha256sum -c CHECKSUMS.sha256`\n"
-        "4. 图像工作区会发现 `models/sd15-*`；判题模型与 Gemma4 工件按 MANIFEST.json 校验后可用\n\n"
+        "4. QLH 主项目仅提供文本/多模态推理；生图由 Koakumix 独立工作台按自身清单管理\n\n"
         "清单（自动生成）：\n```json\n" + manifest_json + "\n```\n"
     )
 
@@ -935,10 +810,6 @@ def main(argv: list[str] | None = None) -> int:
                     help="打包格式（默认 7z，体积最小；zip=ZIP_STORED 快速）")
     ap.add_argument("--volume", metavar="SIZE", default=None,
                     help="7z 分卷大小（如 4g/2g；PC 版建议 4g 便于 U 盘/局域网分批）")
-    ap.add_argument("--prune-sd-zips", action="store_true",
-                    help="SD 源 zip 处理完即删（可重建；省磁盘，峰值约降 15GB）")
-    ap.add_argument("--prune-dry-run", action="store_true",
-                    help="只打印将删除的 SD 源 zip，不执行删除（先看再删）")
     ap.add_argument("--threads", type=int, default=4, metavar="N",
                     help="7z 压缩线程数（默认 4；本机 20 核默认会吃满，限制后留余量）")
     ap.add_argument("--out-dir", metavar="DIR", default=None,
@@ -947,24 +818,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.out_dir:
         global OUT_DIR
         OUT_DIR = Path(args.out_dir)
-    if args.prune_sd_zips:
-        global PRUNE_SD_ZIPS, PRUNE_DRY_RUN
-        PRUNE_SD_ZIPS = True
-        PRUNE_DRY_RUN = args.prune_dry_run
-
-    if args.prune_dry_run:
-        # 独立预览：列出 SD 源将删除的 zip（不打包、不删除）
-        root = _resolve("sd15-assets")
-        raw = REPO_ROOT / ASSETS["sd15-assets"]["path"]
-        if raw.is_junction():
-            print(f"[prune-dry-run] SD 源是归档 junction（{root}）——只读保护，永不删除")
-        else:
-            zips = sorted((root if root.is_dir() else Path()).glob("*.zip"))
-            print(f"[prune-dry-run] 将删除 {len(zips)} 个可重建 SD 源 zip：")
-            for z in zips:
-                print(f"  - {z.name}（{z.stat().st_size / 1e9:.1f} GB）")
-        return 0
-
     if args.missing:
         for scope, variant in ((PC_ASSETS, "pc"), (ANDROID_ASSETS, "android")):
             missing = _missing_assets(scope)

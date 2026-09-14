@@ -46,19 +46,7 @@ def test_scheduler_and_model_host_expose_no_database_compatibility_flags():
         assert token not in model_host_source
 
 
-def test_control_runtime_has_no_postgresql_driver_or_projector():
-    assert not (ROOT / "control" / "src" / "data" / "config-dao.ts").exists()
-    assert not (ROOT / "control" / "src" / "data" / "postgres-projector.ts").exists()
-
-    runtime_sources = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (ROOT / "control" / "src").rglob("*.ts")
-    )
-    assert "from 'pg'" not in runtime_sources
-    assert 'from "pg"' not in runtime_sources
-    assert "import('pg')" not in runtime_sources
-    assert 'import("pg")' not in runtime_sources
-
-    package_source = (ROOT / "control" / "package.json").read_text(encoding="utf-8")
-    assert '"pg"' not in package_source
-    assert '"@types/pg"' not in package_source
+def test_retired_control_runtime_is_not_present():
+    """The single-node QLH runtime no longer ships the retired control service."""
+    assert not (ROOT / "control").exists()
+    assert not (ROOT / "gateway").exists()

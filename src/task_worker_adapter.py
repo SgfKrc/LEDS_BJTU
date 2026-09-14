@@ -565,7 +565,7 @@ class RemoteFullWorkerProvider:
             provider_kind=self.provider_kind,
             supported_stage_types=tuple(
                 value for value in stage_types
-                if value in {"full_inference", "aggregate", "image_prompt"}
+                if value in {"full_inference", "aggregate"}
             ),
             max_concurrency=max_concurrency,
             active_reservations=active,

@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Forum
-import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -34,7 +33,6 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.qlh.inference.logging.QlhLogger
 import com.qlh.inference.service.InferenceService
 import com.qlh.inference.ui.ChatScreen
-import com.qlh.inference.ui.DiffusionScreen
 import com.qlh.inference.ui.SessionListScreen
 import com.qlh.inference.ui.SettingsScreen
 import com.qlh.inference.ui.theme.QlhTheme
@@ -104,7 +102,6 @@ data class BottomNavItem(
 
 private val bottomNavItems = listOf(
     BottomNavItem("对话", Icons.AutoMirrored.Filled.Chat, "chat"),
-    BottomNavItem("图像", Icons.Default.Image, "diffusion"),
     BottomNavItem("会话", Icons.Default.Forum, "sessions"),
     BottomNavItem("设置", Icons.Default.Settings, "settings")
 )
@@ -164,14 +161,6 @@ fun MainApp(
                 onClearError = { viewModel.clearError() },
                 modifier = Modifier.padding(innerPadding),
                 inferenceMode = uiState.inferenceMode
-            )
-            "diffusion" -> DiffusionScreen(
-                state = uiState.diffusion,
-                onSubmit = { request, reference ->
-                    viewModel.submitDiffusion(request, reference)
-                },
-                onCancel = { viewModel.cancelDiffusion() },
-                modifier = Modifier.padding(innerPadding),
             )
             "sessions" -> SessionListScreen(
                 sessions = uiState.sessions,

@@ -169,10 +169,7 @@ def test_protocol_status_exposes_n2_transport_without_claiming_stage_readiness()
     assert status["adapter_connected"] is False
     assert status["transport"] == "existing_tcp_length_prefixed"
     assert status["preferred_version"] == 2
-    assert status["max_version"] == 3
-    assert status["image_v3_schema_ready"] is True
-    assert status["image_v3_adapter_connected"] is False
-    assert status["image_v3_data_plane"] == "not_enabled"
+    assert status["max_version"] == 2
     assert status["admission_state"] == "n2_4_experiment_disabled"
 
 

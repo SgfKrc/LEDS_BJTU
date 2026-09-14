@@ -77,12 +77,12 @@ sudo apt install -y python3 python3-pip python3-venv python3-tk dpkg-dev \
 
 - **背景**：WSL 侧 npm（10.x）与 Windows 侧 npm（11.x）对 lockfile 的规范化可能不同。
 - **现行处理**：`build-deb.sh` 使用 `npm ci` 而不是 `npm install`，只按已提交的
-  `frontend/package-lock.json` 安装依赖，不应重写锁文件。
+  `frontend_cybergothic/package-lock.json` 安装依赖，不应重写锁文件。
 - **异常处理**：若构建后锁文件仍出现改动，先确认改动来源和内容；它不是打包流程应有的副作用，
   不应在未检查的情况下直接丢弃。
 
   ```bash
-  git diff -- frontend/package-lock.json
+  git diff -- frontend_cybergothic/package-lock.json
   ```
 
 ## 6. Windows 侧 pyc 残留会被打进 deb

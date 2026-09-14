@@ -224,25 +224,6 @@ PRESETS: list[dict[str, Any]] = [
         },
         "description": "Qwen3-VL 4B 视觉多模态，需 CUDA GPU（约 8GB 显存）。",
     },
-    {
-        "id": "sd15-base",
-        "display": "Stable Diffusion 1.5 基础模型",
-        "kind": "safetensors",
-        "default_engine": "pytorch",
-        "default_quant": "fp16",
-        "default_model_id": "sd15-base",
-        "hf_repo": "runwayml/stable-diffusion-v1-5",
-        "ms_path": "",
-        "file_pattern": "",
-        "expected_sha256": "",
-        "resource_gate": {
-            "min_ram_gb": 8.0,
-            "min_vram_gb": 6.0,
-            "min_disk_gb": 4.0,
-            "allow_cpu": False,
-        },
-        "description": "Stable Diffusion 1.5 图像模型，需 CUDA GPU。",
-    },
 ]
 _PRESETS_BY_ID = {p["id"]: p for p in PRESETS}
 _PIN_MANIFEST_PATH = Path(__file__).resolve().parents[1] / "docs" / "agent_tool" / "model-artifacts" / "remote-model-pins-2026-09-09.json"

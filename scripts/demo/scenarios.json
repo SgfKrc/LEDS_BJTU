@@ -12,15 +12,6 @@
       ]
     },
     {
-      "kind": "image",
-      "route": "#/image?fixtures=1",
-      "prompt": "gothic observatory at night",
-      "markers": [
-        {"source": "image-studio", "value": "生图列表"},
-        {"source": "fixture-data", "value": "SD 1.5 Demo"}
-      ]
-    },
-    {
       "kind": "topology",
       "route": "#/cluster?fixtures=1&defense=topology",
       "prompt": "展示脱敏的 readiness、节点状态与层段分配",

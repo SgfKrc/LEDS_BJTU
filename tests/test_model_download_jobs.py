@@ -40,7 +40,7 @@ def _run_job_sync(**kw):
 
 def test_list_presets_has_expected_fields():
     presets = mj.list_presets()
-    assert len(presets) == 9
+    assert len(presets) == 8
     assert {
         "qwen2.5-0.5b-instruct",
         "qwen3-0.6b",

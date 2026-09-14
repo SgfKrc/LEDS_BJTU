@@ -13,7 +13,6 @@ from tests.simulation.capacity_harness import (
 def test_capacity_simulation_catalog_is_fixed():
     assert [item.scenario_id for item in available_scenarios()] == [
         "busy_reservation_fallback",
-        "cas_capacity_recovery",
         "global_parallel_bound",
         "parallel_cancellation_releases_slots",
         "single_provider_serialization",
@@ -55,7 +54,6 @@ def test_capacity_simulation_records_bounded_contracts_without_bodies():
     serialized = harness.run("single_provider_serialization")
     fallback = harness.run("busy_reservation_fallback")
     cancelled = harness.run("parallel_cancellation_releases_slots")
-    cas = harness.run("cas_capacity_recovery")
 
     assert global_bound["contract"] == {
         "terminal_state": "result_ready",
@@ -98,12 +96,7 @@ def test_capacity_simulation_records_bounded_contracts_without_bodies():
             {"provider_id": "sim_cancel_b", "active_reservations": 0, "healthy": True},
         ],
     }
-    assert cas["contract"] == {
-        "rejected_codes": ["blob_store_full"],
-        "cleanup": {"blobs_removed": 1, "leases_revoked": 0},
-        "store": {"blobs": 0, "objects": 0, "uploads": 0, "active_leases": 0},
-    }
-    evidence = json.dumps([global_bound, serialized, fallback, cancelled, cas], sort_keys=True)
+    evidence = json.dumps([global_bound, serialized, fallback, cancelled], sort_keys=True)
     assert "root_input" not in evidence
     assert "blob_id" not in evidence
     assert "content" not in evidence

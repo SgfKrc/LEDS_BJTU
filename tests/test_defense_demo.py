@@ -65,7 +65,6 @@ def test_fixture_scenarios_validate_current_cybergothic_sources():
 
     assert [step["name"] for step in run.steps] == [
         "fixture-dialog",
-        "fixture-image",
         "fixture-topology",
     ]
     assert "claim=fixture/redacted/not-live" in run.steps[-1]["detail"]

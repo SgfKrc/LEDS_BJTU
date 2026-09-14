@@ -8,13 +8,10 @@ def test_simulation_runner_profiles_are_fixed_and_layered():
     assert run_simulation.targets_for_profile("quick") == (
         "tests/test_task_graph_simulation.py",
         "tests/test_task_worker_control_simulation.py",
-        "tests/test_diffusion_data_plane_simulation.py",
-        "tests/test_mixed_workflow_simulation.py",
         "tests/test_capacity_simulation.py",
     )
-    assert run_simulation.targets_for_profile("extended")[:5] == (
-        run_simulation.targets_for_profile("quick")
-    )
+    quick = run_simulation.targets_for_profile("quick")
+    assert run_simulation.targets_for_profile("extended")[:len(quick)] == quick
     assert run_simulation.targets_for_profile("full") == ("tests",)
 
 
@@ -31,12 +28,10 @@ def test_simulation_runner_quick_profile_emits_safe_json(tmp_path):
     assert summary["profile"] == "quick"
     assert summary["outcome"] == "passed"
     assert summary["pytest"]["exit_code"] == 0
-    assert summary["pytest"]["counts"]["passed"] >= 41
+    assert summary["pytest"]["counts"]["passed"] >= 23
     assert [item["family"] for item in summary["evidence"]] == [
         "task_graph",
         "task_worker_control",
-        "diffusion_data_plane",
-        "mixed_workflow",
         "capacity",
     ]
     assert summary["acceptance_scope"] == {
