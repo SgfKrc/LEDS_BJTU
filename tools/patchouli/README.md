@@ -13,7 +13,7 @@
 | `PATCH-04` | 编目诊断（委托 docagent scan：R1-R5 findings + fail-soft + 异步 worker） | ✅ 完成（2026-09-14） |
 | `PATCH-05` | 流通记录（git log --follow 时间线 + ±行统计） | ✅ 完成（2026-09-14） |
 | `PATCH-06` | 馆藏统计（状态行覆盖率/分类/月份/票号 Top/互链）+ 收口 | ✅ 完成（2026-09-14） |
-| `PATCH-07` | 检索增强（父文档上下文，见计划文档） | 待做 |
+| `PATCH-07` | 检索增强：chunk→parent 映射（章节定位+全貌）+ rewrite/rerank 参数对照（`v` 键） | ✅ 完成（2026-09-14） |
 | `PATCH-08` | 启动动画（Claude Code 风格；**不延迟启动**硬约束） | 登记（2026-09-14） |
 
 ## 用法
@@ -24,7 +24,7 @@ python -m pip install -e tools/patchouli
 
 python -m patchouli --root <repo> --summary   # 馆藏摘要（分类/票号/缺状态行）
 python -m patchouli --root <repo> --json      # 全量结构化（qlh.patchouli.catalog.v1）
-python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · / 检索台 · 1-7 分类 · 0 全部 · a 归档 · c 编目诊断 · h 流转记录 · s 馆藏统计 · r 刷新 · q 退出）
+python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · / 检索台 · 1-7 分类 · 0 全部 · a 归档 · c 编目诊断 · h 流转记录 · s 馆藏统计 · v 参数对照 · r 刷新 · q 退出）
 # 检索语法：纯文本（全文）｜ t:PATCH-01（票号）｜ k:report（类型）｜ s:缺（缺状态行）｜ a:（含归档）
 
 # 免安装 fallback

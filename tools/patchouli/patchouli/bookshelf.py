@@ -46,6 +46,7 @@ class BookshelfApp(App):
         ("c", "diag", "编目诊断"),
         ("h", "history", "流转记录"),
         ("s", "stats", "馆藏统计"),
+        ("v", "compare", "参数对照"),
         ("/", "focus_search", "检索台"),
         ("escape", "exit_search", "返回书架"),
         ("0", "clear_filter", "全部"),
@@ -70,6 +71,8 @@ class BookshelfApp(App):
         self.history_shown = False
         self.stats_text = ""
         self.stats_shown = False
+        self.compare_text = ""
+        self.compare_shown = False
         self._last_index = 0
 
     # ---- layout ----
@@ -144,6 +147,7 @@ class BookshelfApp(App):
         self._last_index = index
         self.history_shown = False
         self.stats_shown = False
+        self.compare_shown = False
         if self.mode == "search":
             self._show_result(index)
         elif 0 <= index < len(self.entries):
@@ -206,6 +210,7 @@ class BookshelfApp(App):
             shelf.append(ListItem(Label(f"{loc:>6} {result['line']}")))
         self._show_result(0)
         self.sub_title = f"检索[{query}] · {len(self.search_results)} 条"
+        self.query_one("#shelf", ListView).focus()
 
     def _show_result(self, index: int) -> None:
         card = self.query_one("#card", Static)
@@ -218,14 +223,38 @@ class BookshelfApp(App):
 
         result = self.search_results[index]
         self.current_path = result["path"]
+        from .chunks import chunk_for_line, load_chunks
+
+        chunk = chunk_for_line(load_chunks(self.root, result["path"]), result["line_no"] or 1)
+        section = f"{chunk['heading']} (L{chunk['start_line']}-{chunk['end_line']})" if chunk else "-"
         loc = f"L{result['line_no']}" if result["line_no"] else "文件名命中"
         card.update("\n".join([
             f"查询: {self.search_query}",
             f"文档: {result['name']}",
             f"路径: {result['path']}",
             f"命中: {loc}",
+            f"章节: {section}",
         ]))
         preview.update(context_snippet(self.root, result["path"], result["line_no"]))
+
+    # ---- PATCH-07 参数对照 ----
+    def action_compare(self) -> None:
+        if self.compare_shown:
+            self.compare_shown = False
+            self._pick(self._last_index)
+            return
+        query = self.search_query or ""
+        if not query:
+            self.sub_title = "先检索（/）再按 v 做参数对照"
+            return
+        from .compare import compare_search, render_compare
+
+        self.compare_text = render_compare(compare_search(self.root, self.catalog, query))
+        self.compare_shown = True
+        self.history_shown = False
+        self.stats_shown = False
+        self.query_one("#preview", Static).update(self.compare_text)
+        self.sub_title = f"参数对照[{query}]（v 返回）"
 
     # ---- PATCH-06 馆藏统计 ----
     def action_stats(self) -> None:
