@@ -407,7 +407,7 @@ model profile
 - `ContextMessage` 与 `ContextLedgerEntry`：为每条消息保留稳定身份、轮次、token 估算、保留原因和 masking/summary 证据。
 - `validate_state()` / `apply_state_patch()`：只允许 `what/decisions/artifacts/open/next` 五个字段；未知字段拒绝，删除必须显式确认。
 - `ContextNotice`：所有裁剪、masking、摘要和异常都以稳定 code 对外报告，禁止静默丢失内容。
-- 摘要调用边界：当前仅实现无模型的 `RuleBasedSummarizer`；**LLM 摘要 call 未实现（规划中，见[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md)）**，S1 的 STATE 摘要不代表已接入模型。
+- 摘要调用边界：默认仍使用无模型的 `RuleBasedSummarizer`；`LLMSummarizer` 可显式注入现有 `ChatAdapter`，以 Qwen3-0.6B 角色请求严格 STATE JSON，失败时回退规则摘要并发出 `context.summary_fallback`。S1 的默认 STATE 摘要不代表未经配置就会启动模型。
 
 验证命令：
 
@@ -434,7 +434,7 @@ model profile
 27 passed
 ```
 
-本票仍不启动模型或 provider；`HW-SUMM-01` 的真实/可替换摘要模型 adapter、质量测度和 `EX-CTX-MEAS-01` 的 30 轮召回曲线属于后续票。
+本票仍不启动真实模型或 provider；`LLMSummarizer` 的本地/远端 adapter 通过依赖注入接入，质量测度和 `EX-CTX-MEAS-01` 的 30 轮召回曲线属于后续票。
 
 ## 9. S1.5 实施记录
 
@@ -696,11 +696,11 @@ model profile
 
 ### TOOL-BENCH-LDG-01 实施记录（2026-09-11）
 
-本票把散落的结构化实验结果整理为答辩可引用 ledger，不解析自由文本或启动任何运行时。默认输入为既有 P3 控制面 benchmark 和真实模型性能 `not_run` 合同。
+本票把散落的结构化实验结果整理为答辩可引用 ledger，不解析自由文本或启动任何运行时。默认输入为版本化 P3 控制面 benchmark fixture 和真实模型性能 `not_run` 合同。
 
 - `tools/benchmark_ledger.py` 支持 `qlh.defense_benchmark.v1`、`qlh.real_model_performance.v1`、通用 `qlh.experiment_record.v1` 与 `qlh.benchmark_ledger.v1 records[]`；按 claim class 聚合 `single_host`、`dual_host`、`not_run` 和 `multi_model`，指标只从 JSON 数值字段读取。
 - 每条 `BenchmarkRecord` 保留 source 相对路径、source digest、模型/拓扑/host/process/sample、status、有限 metrics、claim scope 和 `eligible_for_claim`。P3 的控制面 `throughput_tasks_per_second` 仍明确是 tasks/s；真实模型 TTFT/tokens/s 与物理双机缺失保持 `NOT RUN`。
-- CLI：`python -m harness_workbench.tools.benchmark_ledger` 默认读取 P3 与 real-model-not-run；`--input PATH` 可重复添加文件，`--root PATH` 递归扫描并忽略不支持 schema，`--strict` 对显式输入 fail-closed；`--json`/`--markdown` 输出汇总表。
+- CLI：`python -m harness_workbench.tools.benchmark_ledger` 默认读取 `fixtures/benchmark/defense-benchmark-v1.json` 与 real-model-not-run；默认路径按仓库根解析，报告保留仓库相对 source。`--input PATH` 可重复添加文件，`--root PATH` 递归扫描并忽略不支持 schema，`--strict` 对显式输入 fail-closed；`--json`/`--markdown` 输出汇总表。
 - 安全与资格检查拒绝绝对路径、IPv4/IPv6、凭据、未知 schema、非有限数字和重复 record ID；报告固定验证 source 相对路径、数值有限、claim scope、跨模型聚合及离线边界。
 
 离线验收：
@@ -711,6 +711,8 @@ model profile
 ```
 
 当前默认 ledger 为 4 条记录：2 条单机控制面 fixture、1 条物理双机 `not_run`、1 条真实模型 `not_run`；未启动服务、未访问网络、未加载 QW1.8B。该表只提供结构化证据索引，不将控制面指标解释为模型性能。下一票进入 `TOOL-MODEL-CARD-01`。
+
+2026-09-14 `EX-BASE-01` 收口：默认输入不再依赖被 `.gitignore` 排除的 `build/defense-benchmark/latest.json`；benchmark/judge/报告/质量执行定向回归 `35 passed`，主项目全量回归 `3635 passed, 22 skipped`。
 
 ### TOOL-MODEL-CARD-01 实施记录（2026-09-11）
 
@@ -795,8 +797,17 @@ model profile
 
 本票是文档口径收口，不改代码、不启动模型、不联网。
 
-- 在 `## 8. S1 实施记录` 增加摘要调用边界：当前 `RuleBasedSummarizer` 是唯一实现，LLM 摘要 call 尚未实现，仍属于规划项。
-- 该表述与[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md) §1/§2 结论一致，保留 `HW-SUMM-01` 作为后续模型 adapter 票，避免把 STATE 规则压缩误报为模型能力。
+- 在 `## 8. S1 实施记录` 增加摘要调用边界：默认 `RuleBasedSummarizer` 保持不变，LLM 摘要 call 由 `HW-SUMM-01` 以显式 adapter 注入方式补齐。
+- 该表述与[上下文压缩实现核查与摘要模型必要性](harness上下文压缩实现核查与摘要模型必要性.md) §1/§2 结论一致：模型摘要仍不默认启用，未通过质量度量前不改变线上默认路径。
+
+### HW-SUMM-01 实施记录（2026-09-14）
+
+本票为 Qwen3-0.6B 摘要角色的首增量实现，不把它提升为默认摘要器，也不在测试中加载真实权重或访问网络：
+
+- `context_engine/summarize.py` 新增 `LLMSummarizer`，通过现有 `ChatAdapter.complete()` 接口请求 `Qwen3-0.6B`；模型名可配置，adapter、fallback、超时、输入/输出边界均可注入或调整。
+- 请求将旧消息包装为 `qlh.harness.summary_input.v1`，只接受包含 `what/decisions/artifacts/open/next` 五个字段的 STATE JSON；拒绝额外字段、非法类型、超长条目、空响应和超大响应，不执行模型返回的任何动作。
+- 适配器异常、超时、非法 JSON 或 STATE 校验失败统一回退 `RuleBasedSummarizer`，生成 warning `context.summary_fallback`；`ContextPolicy` 将该 notice 传递到 `ContextSnapshot`，保留可审计的回退原因但不暴露后端异常正文。
+- 离线验收：`tests/test_harness_context_summarizer.py` 与上下文/记忆/adaptation 相邻回归共 `35 passed`；真实模型 A/B、30 轮质量曲线和默认启用门留给后续 `EX-CTX-MEAS-01`。
 
 ## 14. S6-HARNESS-UI-01 实施记录
 
