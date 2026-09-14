@@ -122,6 +122,17 @@ def _env_float(name: str, default: float, min_val: float = 0.0,
     return value
 
 
+# The inference service owns this directory; HTTP callers may only opt into
+# the cold tier, never choose its filesystem location.
+KV_COLD_CACHE_ROOT = os.path.abspath(os.path.expanduser(
+    _env_first("QLH_KV_COLD_CACHE_ROOT", default=os.path.join(STATE_DIR, "kv-cold")),
+))
+KV_COLD_MAX_BYTES = _env_int(
+    "QLH_KV_COLD_MAX_BYTES", 4 * 1024 * 1024 * 1024,
+    min_val=1, max_val=1024 * 1024 * 1024 * 1024,
+)
+
+
 def _normalize_node_role(value: str) -> str:
     role = (value or "master").strip().lower()
     if role in {"slave", "worker", "client"}:

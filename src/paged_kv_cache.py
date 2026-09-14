@@ -26,13 +26,14 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, List, Mapping, Tuple, Optional
+from typing import Any, Callable, List, Mapping, Tuple, Optional
 
 import torch
 
@@ -121,6 +122,10 @@ class PagedKVCache:
         cold_cache_dir: str | os.PathLike[str] | None = None,
         cold_max_pages: int | None = None,
         cache_unit_size: int | None = None,
+        cold_bytes_reserve: Callable[[int], None] | None = None,
+        cold_bytes_commit: Callable[[int], None] | None = None,
+        cold_bytes_release: Callable[[int], None] | None = None,
+        cold_bytes_release_reservation: Callable[[int], None] | None = None,
     ):
         """
         初始化分页KV缓存。
@@ -174,6 +179,10 @@ class PagedKVCache:
         self._cold_read_last_ms = 0.0
         self._cold_read_max_ms = 0.0
         self._resident_peak_pages = 0
+        self._cold_bytes_reserve = cold_bytes_reserve
+        self._cold_bytes_commit = cold_bytes_commit
+        self._cold_bytes_release = cold_bytes_release
+        self._cold_bytes_release_reservation = cold_bytes_release_reservation
 
         # ---- 页表: 逻辑 token 位置 → 物理页 ID ----
         self.page_table: List[int] = []
@@ -212,7 +221,11 @@ class PagedKVCache:
                      head_dim: int = 64,
                      cold_cache_dir: str | os.PathLike[str] | None = None,
                      cold_max_pages: int | None = None,
-                     cache_unit_size: int | None = None) -> "PagedKVCache":
+                     cache_unit_size: int | None = None,
+                     cold_bytes_reserve: Callable[[int], None] | None = None,
+                     cold_bytes_commit: Callable[[int], None] | None = None,
+                     cold_bytes_release: Callable[[int], None] | None = None,
+                     cold_bytes_release_reservation: Callable[[int], None] | None = None) -> "PagedKVCache":
         """
         根据设备画像自动选择 page_size 和 max_pages。
 
@@ -264,6 +277,10 @@ class PagedKVCache:
             cold_cache_dir=cold_cache_dir,
             cold_max_pages=cold_max_pages,
             cache_unit_size=cache_unit_size,
+            cold_bytes_reserve=cold_bytes_reserve,
+            cold_bytes_commit=cold_bytes_commit,
+            cold_bytes_release=cold_bytes_release,
+            cold_bytes_release_reservation=cold_bytes_release_reservation,
         )
 
     @property
@@ -319,6 +336,8 @@ class PagedKVCache:
             )
         final_path = self.cold_cache_dir / f"page-{page.page_id}.pt"
         temporary = self.cold_cache_dir / f".page-{page.page_id}-{uuid.uuid4().hex}.tmp"
+        reserved_bytes = 0
+        committed = False
         payload = {
             "schema": "qlh.paged_kv_page.v1",
             "page_id": page.page_id,
@@ -328,13 +347,17 @@ class PagedKVCache:
         }
         try:
             torch.save(payload, temporary)
+            bytes_count = temporary.stat().st_size
+            if self._cold_bytes_reserve is not None:
+                self._cold_bytes_reserve(bytes_count)
+                reserved_bytes = bytes_count
             os.replace(temporary, final_path)
             record = ColdPageRecord(
                 page_id=page.page_id,
                 path=final_path,
                 used=page.used,
                 sha256=self._file_sha256(final_path),
-                bytes_count=final_path.stat().st_size,
+                bytes_count=bytes_count,
                 shape=tuple(int(value) for value in page.k.shape),
             )
             self._cold_pages[page.page_id] = record
@@ -344,6 +367,20 @@ class PagedKVCache:
                 self._cold_pages.pop(page.page_id, None)
                 final_path.unlink(missing_ok=True)
                 raise
+            if self._cold_bytes_commit is not None:
+                self._cold_bytes_commit(bytes_count)
+            committed = True
+        except Exception:
+            if not committed:
+                self._cold_pages.pop(page.page_id, None)
+                final_path.unlink(missing_ok=True)
+            if (
+                reserved_bytes
+                and not committed
+                and self._cold_bytes_release_reservation is not None
+            ):
+                self._cold_bytes_release_reservation(reserved_bytes)
+            raise
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -418,6 +455,8 @@ class PagedKVCache:
         page = self._load_cold_page(page_id)
         record = self._cold_pages.pop(page_id)
         record.path.unlink(missing_ok=True)
+        if self._cold_bytes_release is not None:
+            self._cold_bytes_release(record.bytes_count)
         if self.free_pages:
             self.free_pages.pop()
             page = KVPage(page_id=page_id, k=page.k, v=page.v, used=page.used, is_free=False)
@@ -427,11 +466,18 @@ class PagedKVCache:
         return page
 
     def _delete_cold_page(self, page_id: int) -> None:
-        record = self._cold_pages.pop(page_id, None)
+        record = self._cold_pages.get(page_id)
         if record is None:
             return
         record.path.unlink(missing_ok=True)
-        self._write_cold_manifest()
+        self._cold_pages.pop(page_id, None)
+        try:
+            self._write_cold_manifest()
+        except Exception:
+            self._cold_pages[page_id] = record
+            raise
+        if self._cold_bytes_release is not None:
+            self._cold_bytes_release(record.bytes_count)
 
     def _page_for_read(self, page_id: int) -> KVPage:
         page = self._page_index.get(page_id)
@@ -876,15 +922,15 @@ class PagedKVCache:
     @_synchronized
     def clear(self) -> None:
         """清空当前会话缓存，回收所有页面至空闲池（零释放，可复用）"""
-        for page in self.allocated_pages:
-            page.used = 0
-            page.is_free = True
-            self.free_pages.append(page)
-
         if self._cold_enabled:
             for page_id in list(self._cold_pages):
                 self._delete_cold_page(page_id)
             self._page_order.clear()
+
+        for page in self.allocated_pages:
+            page.used = 0
+            page.is_free = True
+            self.free_pages.append(page)
 
         self.allocated_pages.clear()
         self._page_index.clear()
@@ -896,6 +942,17 @@ class PagedKVCache:
             f"KV缓存已清空 — {len(self.free_pages)} 个页面已回收至空闲池 "
             f"（下次 append 将零分配复用）"
         )
+
+    @_synchronized
+    def close(self) -> None:
+        """清空并删除当前缓存实例自有的冷层会话目录。"""
+        self.clear()
+        if self.cold_cache_dir is None:
+            return
+        try:
+            shutil.rmtree(self.cold_cache_dir)
+        except FileNotFoundError:
+            pass
 
     @_synchronized
     def to(self, device: str) -> "PagedKVCache":

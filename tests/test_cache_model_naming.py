@@ -9,11 +9,14 @@ def test_bridge_preset_examples_use_current_v41_api_ref():
     presets = json.loads(
         (ROOT / "tools" / "reasonix-codex-bridge" / "presets.example.json").read_text(encoding="utf-8")
     )
+    docagent_env = (ROOT / "tools" / "docagent" / ".env.docagent.example").read_text(encoding="utf-8")
 
     refs = [item["modelRef"] for item in presets["presets"]]
     assert refs
     assert all(ref.endswith("/deepseek-flash") for ref in refs)
     assert not any("deepseek-v4-flash" in ref for ref in refs)
+    assert "DOCAGENT_DEEPSEEK_MODEL=deepseek-flash" in docagent_env
+    assert "DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash" not in docagent_env
 
 
 def test_main_docs_distinguish_current_ref_from_legacy_aliases():
