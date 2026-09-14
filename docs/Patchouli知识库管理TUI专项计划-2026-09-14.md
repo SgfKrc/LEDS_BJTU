@@ -94,7 +94,7 @@
 
 > 执行建议序：`PATCH-01 → 02 → 03 → 04 → 05 → 06`（07 可与 03 并行，属检索增强；08 启动动画可随时插入）；01/02 完成即可日常试用。
 >
-> **执行状态（2026-09-14）**：`PATCH-01`～`06` **全部完成**——实现在 `tools/patchouli/`（34 测试全绿；editable 安装 + `run.py` fallback）；键位：`/` 检索台 · `c` 编目诊断 · `h` 流转记录 · `s` 馆藏统计 · `1-7` 分类 · `a` 归档。
+> **执行状态（2026-09-14）**：`PATCH-01`～`06` **全部完成**——实现在 `tools/docagent/patchouli/`（docagent 子项目内）（34 测试全绿；editable 安装 + `run.py` fallback）；键位：`/` 检索台 · `c` 编目诊断 · `h` 流转记录 · `s` 馆藏统计 · `1-7` 分类 · `a` 归档。
 >
 > | `PATCH-08` | 启动动画（Claude Code/opencode 风格首页）——**硬约束：动画不延迟启动**（动画与数据加载并行，启动时长 = max(动画, 加载)；任意键跳过；非 TTY/管道自动跳过；低帧率开销、零额外依赖） | 启动耗时对比基准（有/无动画增量 ≤ ~50ms）；跳过路径测试；非 TTY 自动跳过测试 |
 > 与 RAG 票系联动：模型化 rerank / HyDE / Step-back / LLM 拆解属 RAG 票系列（前置为 9B 评估），Patchouli 只做可视化与父文档等纯软件增强（见 §3.6）。
@@ -123,6 +123,7 @@
 | --- | --- |
 | 2026-09-14 | 首版：登记 docagent 现状查证（v0.2.0 / M1 已迁 / M2-M3 未迁 / 测试薄 / 无界面）与 `PATCH-01`～`PATCH-06` 票草案；定位只读 TUI + Textual 栈复用 |
 | 2026-09-14 | 完善：新增 §3.6 RAG 能力现状对照（6 类方向：元数据过滤 ✅ / embedding 微调 ⛔ 不做 / rerank ✅ 规则层 / 分块 ✅ 缺父文档 / 索引 ✅ 全落地 / 改写多路 ✅ 缺 HyDE·Step-back）；检索台（PATCH-03）改为对接既有 RAG 全链路；新增 `PATCH-07`（父文档上下文 + RAG 参数对照）；边界修订（模型侧增强为可选接线） |
-| 2026-09-14 | **实施完成**：PATCH-01～06 全部落地（`tools/patchouli/`，34 测试全绿；editable 安装 + `run.py` fallback）；登记 `PATCH-08`（启动动画，不延迟启动硬约束） |
+| 2026-09-14 | **实施完成**：PATCH-01～06 全部落地（`tools/docagent/patchouli/`（docagent 子项目内），34 测试全绿；editable 安装 + `run.py` fallback）；登记 `PATCH-08`（启动动画，不延迟启动硬约束） |
+| 2026-09-14 | **归属合订**（用户指示）：Patchouli 与文档维护工具**合二为一**——全部代码迁入子仓 `tools/docagent/patchouli/`（上游 `SgfKrc/qlh-docagent` `befb507`，v0.3.0，console scripts `patchouli`/`patchouli-shelf`，47 测试随迁全绿）；主仓 `tools/patchouli/` 移除（仅保留 gitlink 指针）；editable 重装为 `pip install -e tools/docagent` |
 | 2026-09-14 | **PATCH-08 实施完成**：`splash.py`（与数据加载并行、加载完即关、任意键跳过、非 TTY 自动跳过、`--no-splash`/env 关闭）；`config_check.py` + `config_editor.py`（`.env.docagent` 检测/脱敏键名/模板引导/TextArea 编辑屏 + Ctrl+S 保存 + `.bak` 备份 + 路径逃逸防护 + 保存后自动 `docagent config` 校验）；写权限边界限定 `.env.docagent`；47 测试全绿 |
 | 2026-09-14 | **PATCH-07 实施完成**：`chunks.py`（标题分节 chunk→parent 映射 + 章节定位）+ `compare.py`（复用 `src/rag_store.rewrite_query` 规则层 + lexical rerank；MRR 口径对齐 `rag_quality`）；`v` 键对照视图；真实对照「缓存」MRR@5 0.3333→0.4444；40 测试全绿 |
