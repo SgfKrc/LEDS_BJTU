@@ -224,7 +224,7 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - 验收：用例 2、3、40、42 转绿（41 passed / 3 skipped）。
 
 - [x] **T6 日志端点代理（#36-38）** ✅ 2026-08-02
-  - **legacy-control Python 桩**：`src/legacy_control.py`（纯标准库零依赖，未来 legacy-control 进程原型；`/logs/recent`、`/logs`、`/logs/stats`，X-QLH-Log-Token 可选，stdout 探活 `LEGACY_CONTROL_LISTENING:<port>`）。
+  - **legacy-control Python 桩**：`src/legacy_control.py`（纯标准库零依赖，未来 legacy-control 进程原型；`/logs/recent`、`/logs`、`/logs/stats`，X-QLH-Log-Token 可选，stdout 探活 `LEGACY_CONTROL_LISTENING:<port>`）。**⚠️ 已随微服务叫停删除（2026-09-14），本条为历史记录。**
   - 网关 `gateway/src/modules/logs/logs.controller.ts`：`/api/logs` 与 `/api/logs/*` 均透传 legacy-control（拆两个方法——fastify adapter 下同一方法叠加多个 @All 会覆盖）；`ForwardClient` 增加 `extraHeaders` 参数透传 X-QLH-Log-Token；`clients/legacy.client.ts`（QLH_LEGACY_CONTROL_URL，默认 :8040）。
   - 测试：jest 直接 spawn Python 桩（真实网关→Python 链路）；用例 36-38 打开；用例 41 补 logs 段 status=200 + 带 token 透传断言。
   - 验收：**44/44 全部用例通过（0 skipped）**。

@@ -299,7 +299,7 @@ def check(output: str, mode: str, real: bool = False) -> list:
         # 从节点：Dashboard + Nodes（master-health 分支）+ 远程日志
         for key in ["系统状态总览", "节点管理", "日志查看",
                     "主节点健康",          # master-health 渲染（桩: 在线 100.64.0.1:8888）
-                    "节点注册成功"]:       # 远程日志内容（legacy_control SAMPLE_LOGS）
+                    "节点注册成功"]:       # 远程日志内容（历史 legacy_control 桩样本；桩已随微服务叫停删除，2026-09-14）
             if real and key == "节点注册成功":
                 continue  # 桩样本日志；真实 control-svc 日志 buffer 无此内容
             if key not in output:
