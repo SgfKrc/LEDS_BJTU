@@ -1,31 +1,85 @@
-"""Crash-resilient ownership receipts for defense-demo child processes.
-
-Receipts are hints, never authority: reset code must re-check PID creation time,
-working directory, and a hard-coded command signature before stopping anything.
-"""
+"""QLH policy adapter for the reusable spawnledger ownership package."""
 
 from __future__ import annotations
 
-import json
 import os
 import re
-import secrets
-import threading
-import time
+import shutil
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
-
-import psutil
 
 
 ROOT = Path(__file__).resolve().parents[2]
 FRONTEND_ROOT = ROOT / "frontend_cybergothic"
 OWNERSHIP_ROOT = ROOT / "build" / "defense-runtime" / "ownership"
+_PACKAGE_ROOT = ROOT / "packages" / "spawnledger"
+if str(_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PACKAGE_ROOT))
+
+from spawnledger import (  # noqa: E402
+    IDENTITY_KEYS,
+    RECEIPT_KEYS,
+    RUN_ID_PATTERN,
+    OwnershipLedger as BaseOwnershipLedger,
+    OwnershipPolicy,
+    inspect_identity as inspect_with_policy,
+    load_receipt as load_with_policy,
+)
+
+
 RECEIPT_SCHEMA = "qlh.defense_process_ownership.v1"
 ALLOWED_KINDS = {"frontend", "backend", "failure-worker", "benchmark-worker"}
-RECEIPT_KEYS = {"schema", "run_id", "source", "created_by_pid", "ports", "processes"}
-IDENTITY_KEYS = {"pid", "create_time", "kind", "root_pid"}
-RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+
+
+def _npm_candidates() -> tuple[frozenset[Path], frozenset[Path]]:
+    launchers: set[Path] = set()
+    cli_scripts: set[Path] = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for executable in ("npm", "npm.cmd"):
+            launcher = Path(directory) / executable
+            if not launcher.is_file():
+                continue
+            resolved = launcher.resolve()
+            launchers.add(resolved)
+            if resolved.name.lower() == "npm-cli.js":
+                cli_scripts.add(resolved)
+            candidate = (launcher.parent / "node_modules" / "npm" / "bin" / "npm-cli.js").resolve()
+            if candidate.is_file():
+                cli_scripts.add(candidate)
+    return frozenset(launchers), frozenset(cli_scripts)
+
+
+NPM_LAUNCHER_CANDIDATES, NPM_CLI_CANDIDATES = _npm_candidates()
+
+
+def _path_launchers(*names: str) -> frozenset[Path]:
+    candidates: set[Path] = set()
+    for name in names:
+        located = shutil.which(name)
+        if located:
+            candidates.add(Path(located).resolve())
+    return frozenset(candidates)
+
+
+CMD_LAUNCHER_CANDIDATES = _path_launchers("cmd", "cmd.exe")
+NODE_LAUNCHER_CANDIDATES = _path_launchers("node", "node.exe")
+PYTHON_LAUNCHER = Path(sys.executable).resolve()
+
+
+def _trusted_launcher(value: str, candidates: frozenset[Path]) -> bool:
+    path = Path(value.strip('"'))
+    if path.parent == Path("."):
+        located = shutil.which(str(path))
+        return located is not None and any(_same_path(located, candidate) for candidate in candidates)
+    return any(_same_path(path, candidate) for candidate in candidates)
+
+
+def _trusted_npm_launcher(value: str) -> bool:
+    return _trusted_launcher(value, NPM_LAUNCHER_CANDIDATES)
 
 
 def _same_path(left: str | Path, right: Path) -> bool:
@@ -43,7 +97,7 @@ def _under_path(value: str | Path, parent: Path) -> bool:
         return False
 
 
-def _has_pair(command: list[str], option: str, value: str) -> bool:
+def _has_pair(command: Sequence[str], option: str, value: str) -> bool:
     lowered = [item.lower() for item in command]
     return any(
         lowered[index] == option and lowered[index + 1] == value
@@ -51,8 +105,23 @@ def _has_pair(command: list[str], option: str, value: str) -> bool:
     )
 
 
-def _command_matches(kind: str, command: list[str], cwd: str) -> bool:
-    """Hard-coded allowlist; receipt content cannot expand this authority."""
+def _vite_arguments(arguments: Sequence[str]) -> bool:
+    normalized = [item.lower() for item in arguments]
+    if normalized[:1] == ["--"]:
+        normalized = normalized[1:]
+    if normalized == ["--host", "127.0.0.1"]:
+        return True
+    if len(normalized) != 4 or normalized[:3] != ["--host", "127.0.0.1", "--port"]:
+        return False
+    try:
+        port = int(normalized[3])
+    except ValueError:
+        return False
+    return str(port) == normalized[3] and 1 <= port <= 65535
+
+
+def _command_matches(kind: str, command: Sequence[str], cwd: str) -> bool:
+    """QLH command allowlist; receipt content cannot expand this authority."""
     if not command:
         return False
     executable_name = Path(command[0]).name.lower()
@@ -61,22 +130,44 @@ def _command_matches(kind: str, command: list[str], cwd: str) -> bool:
         if not _same_path(cwd, FRONTEND_ROOT):
             return False
         if _has_pair(command, "--host", "127.0.0.1"):
-            if executable_name in {"cmd", "cmd.exe"}:
-                is_npm = any(Path(item).name.lower() in {"npm", "npm.cmd"} for item in command[1:])
-                is_vite = any(item.lower() == "vite" for item in command[1:])
-                if is_vite or (is_npm and "run" in lowered and "dev" in lowered):
-                    return True
-            if executable_name in {"node", "node.exe"} and len(command) >= 2:
+            if executable_name in {"cmd", "cmd.exe"} and _trusted_launcher(command[0], CMD_LAUNCHER_CANDIDATES):
+                has_shell_operator = any(item in {"&", "&&", "|", "||"} for item in command)
+                command_indexes = [
+                    index for index, item in enumerate(lowered[:-1])
+                    if item in {"/c", "/k"}
+                ]
+                if command_indexes and not has_shell_operator:
+                    payload = command[command_indexes[-1] + 1:]
+                    payload_lowered = [item.lower() for item in payload]
+                    launcher = Path(payload[0].strip('"')).name.lower() if payload else ""
+                    if launcher in {"vite", "vite.cmd"} and _vite_arguments(payload[1:]):
+                        return True
+                    if (
+                        launcher in {"npm", "npm.cmd"}
+                        and _trusted_npm_launcher(payload[0])
+                        and payload_lowered[1:3] == ["run", "dev"]
+                        and _vite_arguments(payload[3:])
+                    ):
+                        return True
+            if (
+                executable_name in {"node", "node.exe"}
+                and _trusted_launcher(command[0], NODE_LAUNCHER_CANDIDATES)
+                and len(command) >= 2
+            ):
                 script = Path(command[1])
-                if script.name.lower() == "npm-cli.js" and "run" in lowered and "dev" in lowered:
+                if (
+                    script.name.lower() == "npm-cli.js"
+                    and Path(script).resolve() in NPM_CLI_CANDIDATES
+                    and lowered[2:4] == ["run", "dev"]
+                    and _vite_arguments(command[4:])
+                ):
                     return True
                 if (
                     script.name.lower() == "vite.js"
                     and _under_path(script, FRONTEND_ROOT / "node_modules" / "vite")
+                    and _vite_arguments(command[2:])
                 ):
                     return True
-        # Vite owns one esbuild service child.  Accept only its installed
-        # binary under this frontend and its exact service/ping argument form.
         if len(command) != 3:
             return False
         try:
@@ -85,7 +176,9 @@ def _command_matches(kind: str, command: list[str], cwd: str) -> bool:
         except (OSError, RuntimeError, ValueError):
             return False
         executable_name = relative.name.lower()
-        esbuild_package = "@esbuild" in {part.lower() for part in relative.parts} or relative.as_posix().lower().startswith("esbuild/bin/")
+        esbuild_package = "@esbuild" in {
+            part.lower() for part in relative.parts
+        } or relative.as_posix().lower().startswith("esbuild/bin/")
         return (
             executable_name in {"esbuild", "esbuild.exe"}
             and esbuild_package
@@ -95,208 +188,58 @@ def _command_matches(kind: str, command: list[str], cwd: str) -> bool:
     if kind == "backend":
         return (
             _same_path(cwd, ROOT)
-            and executable_name in {"python", "python.exe"}
-            and any(lowered[index:index + 2] == ["-m", "uvicorn"] for index in range(len(lowered) - 1))
-            and "src.api_server:app" in lowered
+            and _same_path(command[0], PYTHON_LAUNCHER)
+            and lowered[1:4] == ["-m", "uvicorn", "src.api_server:app"]
             and _has_pair(command, "--host", "127.0.0.1")
         )
     if kind == "failure-worker":
         return (
             _same_path(cwd, ROOT)
-            and executable_name in {"python", "python.exe"}
+            and _same_path(command[0], PYTHON_LAUNCHER)
             and len(command) >= 2
             and _same_path(command[1], ROOT / "scripts" / "demo" / "failure_worker.py")
         )
     if kind == "benchmark-worker":
         return (
             _same_path(cwd, ROOT)
-            and executable_name in {"python", "python.exe"}
+            and _same_path(command[0], PYTHON_LAUNCHER)
             and len(command) >= 2
             and _same_path(command[1], ROOT / "scripts" / "demo" / "benchmark_worker.py")
         )
     return False
 
 
-def inspect_identity(identity: object) -> tuple[str, psutil.Process | None]:
-    """Return matched/dead/mismatch/invalid without exposing the command line."""
-    if not isinstance(identity, dict) or set(identity) != IDENTITY_KEYS:
-        return "invalid", None
-    pid = identity.get("pid")
-    create_time = identity.get("create_time")
-    kind = identity.get("kind")
-    root_pid = identity.get("root_pid")
-    if (
-        isinstance(pid, bool)
-        or not isinstance(pid, int)
-        or pid <= 0
-        or isinstance(root_pid, bool)
-        or not isinstance(root_pid, int)
-        or root_pid <= 0
-        or isinstance(create_time, bool)
-        or not isinstance(create_time, (int, float))
-        or kind not in ALLOWED_KINDS
-    ):
-        return "invalid", None
-    try:
-        process = psutil.Process(pid)
-        actual_create_time = process.create_time()
-    except psutil.NoSuchProcess:
-        return "dead", None
-    except (psutil.AccessDenied, OSError):
-        return "mismatch", None
-    if abs(actual_create_time - float(create_time)) > 0.05:
-        return "mismatch", None
-    try:
-        command = process.cmdline()
-        cwd = process.cwd()
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return "dead", None
-    except (psutil.AccessDenied, OSError):
-        return "mismatch", None
-    if not _command_matches(str(kind), command, cwd):
-        return "mismatch", None
-    return "matched", process
+QLH_OWNERSHIP_POLICY = OwnershipPolicy(
+    schema=RECEIPT_SCHEMA,
+    allowed_sources=frozenset({"defense_demo", "defense_benchmark"}),
+    matchers={
+        kind: (lambda command, cwd, selected=kind: _command_matches(selected, command, cwd))
+        for kind in ALLOWED_KINDS
+    },
+)
 
 
-def _identity(process: psutil.Process, *, kind: str, root_pid: int) -> dict[str, Any] | None:
-    try:
-        create_time = process.create_time()
-    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied, OSError):
-        return None
-    return {
-        "pid": process.pid,
-        "create_time": create_time,
-        "kind": kind,
-        "root_pid": root_pid,
-    }
+class OwnershipLedger(BaseOwnershipLedger):
+    """Backward-compatible QLH ledger with the defense-demo policy prebound."""
+
+    def __init__(
+        self,
+        source: str,
+        *,
+        ports: list[int] | None = None,
+        ownership_root: Path = OWNERSHIP_ROOT,
+    ) -> None:
+        super().__init__(
+            source,
+            policy=QLH_OWNERSHIP_POLICY,
+            ports=ports,
+            ownership_root=ownership_root,
+        )
 
 
-class OwnershipLedger:
-    """Persist identities for children that may outlive an abruptly killed launcher."""
-
-    def __init__(self, source: str, *, ports: list[int] | None = None, ownership_root: Path = OWNERSHIP_ROOT):
-        self.source = source
-        self.ports = sorted(set(ports or []))
-        self.run_id = secrets.token_hex(12)
-        self.ownership_root = ownership_root
-        self.path = ownership_root / f"{self.run_id}.json"
-        self._roots: dict[int, str] = {}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def register(self, kind: str, pid: int) -> None:
-        if kind not in ALLOWED_KINDS:
-            raise ValueError(f"unapproved demo process kind: {kind}")
-        with self._lock:
-            self._roots[pid] = kind
-            self._refresh_locked()
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._monitor, name="demo-ownership", daemon=True)
-                self._thread.start()
-
-    def _monitor(self) -> None:
-        while not self._stop.wait(0.2):
-            with self._lock:
-                self._refresh_locked()
-
-    def refresh(self) -> None:
-        with self._lock:
-            self._refresh_locked()
-
-    def _refresh_locked(self) -> None:
-        identities: dict[tuple[int, float], dict[str, Any]] = {}
-        for root_pid, kind in list(self._roots.items()):
-            try:
-                root_process = psutil.Process(root_pid)
-                processes = [root_process, *root_process.children(recursive=True)]
-            except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied, OSError):
-                continue
-            for process in processes:
-                item = _identity(process, kind=kind, root_pid=root_pid)
-                if item is not None:
-                    identities[(item["pid"], item["create_time"])] = item
-        if not identities:
-            return
-        payload = {
-            "schema": RECEIPT_SCHEMA,
-            "run_id": self.run_id,
-            "source": self.source,
-            "created_by_pid": os.getpid(),
-            "ports": self.ports,
-            "processes": sorted(identities.values(), key=lambda item: (item["root_pid"], item["pid"])),
-        }
-        self.ownership_root.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, self.path)
-
-    def close(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        with self._lock:
-            self._refresh_locked()
-            if self.path.is_file():
-                try:
-                    payload = json.loads(self.path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    return
-                states = [inspect_identity(item)[0] for item in payload.get("processes", [])]
-                if all(state == "dead" for state in states):
-                    self.path.unlink(missing_ok=True)
+def inspect_identity(identity: object):
+    return inspect_with_policy(identity, QLH_OWNERSHIP_POLICY)
 
 
 def load_receipt(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"ownership receipt unreadable: {type(exc).__name__}") from exc
-    if not isinstance(payload, dict) or set(payload) != RECEIPT_KEYS or payload.get("schema") != RECEIPT_SCHEMA:
-        raise ValueError("ownership receipt schema invalid")
-    if not RUN_ID_PATTERN.fullmatch(path.stem) or path.stem != payload.get("run_id"):
-        raise ValueError("ownership receipt run id mismatch")
-    if payload.get("source") not in {"defense_demo", "defense_benchmark"}:
-        raise ValueError("ownership receipt source invalid")
-    created_by_pid = payload.get("created_by_pid")
-    if isinstance(created_by_pid, bool) or not isinstance(created_by_pid, int) or created_by_pid <= 0:
-        raise ValueError("ownership receipt creator invalid")
-    ports = payload.get("ports")
-    if (
-        not isinstance(ports, list)
-        or any(isinstance(item, bool) or not isinstance(item, int) or not 1 <= item <= 65535 for item in ports)
-        or len(set(ports)) != len(ports)
-    ):
-        raise ValueError("ownership receipt ports invalid")
-    processes = payload.get("processes")
-    if not isinstance(processes, list) or not processes:
-        raise ValueError("ownership receipt processes invalid")
-    if any(not isinstance(item, dict) or set(item) != IDENTITY_KEYS for item in processes):
-        raise ValueError("ownership receipt process identity invalid")
-    for item in processes:
-        if (
-            isinstance(item.get("pid"), bool)
-            or not isinstance(item.get("pid"), int)
-            or item["pid"] <= 0
-            or isinstance(item.get("root_pid"), bool)
-            or not isinstance(item.get("root_pid"), int)
-            or item["root_pid"] <= 0
-            or isinstance(item.get("create_time"), bool)
-            or not isinstance(item.get("create_time"), (int, float))
-            or item.get("kind") not in ALLOWED_KINDS
-        ):
-            raise ValueError("ownership receipt process identity invalid")
-    identity_keys = [(item.get("pid"), item.get("create_time")) for item in processes]
-    if len(set(identity_keys)) != len(identity_keys):
-        raise ValueError("ownership receipt process identity duplicated")
-    process_pids = {item.get("pid") for item in processes}
-    if any(item.get("root_pid") not in process_pids for item in processes):
-        raise ValueError("ownership receipt root identity missing")
-    root_kinds: dict[object, object] = {}
-    for item in processes:
-        root_pid = item.get("root_pid")
-        kind = item.get("kind")
-        if root_pid in root_kinds and root_kinds[root_pid] != kind:
-            raise ValueError("ownership receipt root kind mismatch")
-        root_kinds[root_pid] = kind
-    return payload
+    return load_with_policy(path, QLH_OWNERSHIP_POLICY)

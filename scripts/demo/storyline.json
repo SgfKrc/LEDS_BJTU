@@ -49,7 +49,21 @@
       "path": "scripts/demo/demo_ownership.py",
       "required": true,
       "kind": "source",
-      "purpose": "crash-resilient process ownership receipts and hard-coded identity allowlist"
+      "purpose": "QLH-specific trusted process policy and compatibility adapter"
+    },
+    {
+      "id": "reset-core-source",
+      "path": "packages/spawnledger/spawnledger/reset.py",
+      "required": true,
+      "kind": "source",
+      "purpose": "reusable dry-run-first reset engine with point-of-action identity checks"
+    },
+    {
+      "id": "reset-core-tests",
+      "path": "packages/spawnledger/tests/test_spawnledger.py",
+      "required": true,
+      "kind": "test",
+      "purpose": "policy injection, receipt integrity, stale cleanup, and fail-closed package gates"
     },
     {
       "id": "reset-tests",
@@ -219,7 +233,7 @@
         "Reports retain state and markers but omit credentials, model output, absolute paths, and dynamic ports."
       ],
       "success_markers": ["fixture-dialog", "fixture-image", "fixture-topology", "startup-budget"],
-      "evidence_ids": ["reset-document", "reset-source", "reset-ownership-source", "reset-tests", "scenario-contract", "launcher-source", "launcher-tests", "topology-run"],
+      "evidence_ids": ["reset-document", "reset-source", "reset-ownership-source", "reset-core-source", "reset-core-tests", "reset-tests", "scenario-contract", "launcher-source", "launcher-tests", "topology-run"],
       "fallback": {
         "trigger": "startup preflight failed",
         "action": "Read the fail-closed report, state that this run is unavailable, and continue with tracked source and test evidence.",

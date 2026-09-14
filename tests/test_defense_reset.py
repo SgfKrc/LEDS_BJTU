@@ -81,7 +81,7 @@ def test_mismatched_identity_fails_closed_and_keeps_receipt(monkeypatch, tmp_pat
 
 def test_apply_removes_only_stale_receipt_and_owned_atomic_temp(monkeypatch, tmp_path):
     receipt = _receipt(tmp_path)
-    owned_temp = tmp_path / f"{'b' * 24}.tmp"
+    owned_temp = tmp_path / f"{'b' * 24}.99999999.1000000.tmp"
     owned_temp.write_text("partial", encoding="utf-8")
     unrelated = tmp_path / "keep.log"
     unrelated.write_text("evidence", encoding="utf-8")
@@ -144,19 +144,36 @@ def test_current_python_process_cannot_be_claimed_as_demo_frontend():
 def test_command_allowlist_accepts_only_expected_demo_shapes():
     frontend = str(ownership.FRONTEND_ROOT)
     root = str(ownership.ROOT)
-    assert ownership._command_matches(
-        "frontend",
-        ["node.exe", str(ownership.FRONTEND_ROOT / "node_modules" / "vite" / "bin" / "vite.js"), "--host", "127.0.0.1"],
-        frontend,
-    )
+    node = next(iter(ownership.NODE_LAUNCHER_CANDIDATES), None)
+    cmd = next(iter(ownership.CMD_LAUNCHER_CANDIDATES), None)
+    python = str(ownership.PYTHON_LAUNCHER)
+    if node is not None:
+        assert ownership._command_matches(
+            "frontend",
+            [str(node), str(ownership.FRONTEND_ROOT / "node_modules" / "vite" / "bin" / "vite.js"), "--host", "127.0.0.1"],
+            frontend,
+        )
+    if cmd is not None:
+        assert ownership._command_matches(
+            "frontend",
+            [str(cmd), "/d", "/s", "/c", "vite", "--host", "127.0.0.1", "--port", "5174"],
+            frontend,
+        )
+    if cmd is not None and ownership.NPM_LAUNCHER_CANDIDATES:
+        npm_launcher = next(iter(ownership.NPM_LAUNCHER_CANDIDATES))
+        assert ownership._command_matches(
+            "frontend",
+            [str(cmd), "/d", "/s", "/c", str(npm_launcher), "run", "dev", "--", "--host", "127.0.0.1"],
+            frontend,
+        )
     assert ownership._command_matches(
         "backend",
-        ["python.exe", "-m", "uvicorn", "src.api_server:app", "--host", "127.0.0.1"],
+        [python, "-m", "uvicorn", "src.api_server:app", "--host", "127.0.0.1"],
         root,
     )
     assert ownership._command_matches(
         "failure-worker",
-        ["python.exe", str(ownership.ROOT / "scripts" / "demo" / "failure_worker.py"), "--port", "12345"],
+        [python, str(ownership.ROOT / "scripts" / "demo" / "failure_worker.py"), "--port", "12345"],
         root,
     )
     assert not ownership._command_matches(
@@ -169,6 +186,45 @@ def test_command_allowlist_accepts_only_expected_demo_shapes():
         ["python.exe", "malicious.py", "uvicorn", "src.api_server:app", "--host", "127.0.0.1"],
         root,
     )
+    assert not ownership._command_matches(
+        "backend",
+        ["python.exe", "malicious.py", "-m", "uvicorn", "src.api_server:app", "--host", "127.0.0.1"],
+        root,
+    )
+    assert not ownership._command_matches(
+        "frontend",
+        ["cmd.exe", "/c", "npm.cmd", "run", "dev", "&", "malicious", "--host", "127.0.0.1"],
+        frontend,
+    )
+    assert not ownership._command_matches(
+        "frontend",
+        [r"cmd.exe", "/c", r"C:\untrusted\npm.cmd", "run", "dev", "--", "--host", "127.0.0.1"],
+        frontend,
+    )
+    assert not ownership._command_matches(
+        "frontend",
+        ["cmd.exe", "/d", "/s", "/c", "vite", "malicious.js", "--host", "127.0.0.1"],
+        frontend,
+    )
+    assert not ownership._command_matches(
+        "frontend",
+        ["node.exe", str(ROOT / "outside" / "npm-cli.js"), "run", "dev", "--host", "127.0.0.1"],
+        frontend,
+    )
+    if node is not None and ownership.NPM_CLI_CANDIDATES:
+        assert ownership._command_matches(
+            "frontend",
+            [
+                str(node),
+                str(next(iter(ownership.NPM_CLI_CANDIDATES))),
+                "run",
+                "dev",
+                "--",
+                "--host",
+                "127.0.0.1",
+            ],
+            frontend,
+        )
 
 
 def test_report_path_must_stay_inside_repository(tmp_path):
