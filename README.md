@@ -62,10 +62,10 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔑 **手动入群（CLUSTER-JOIN）** | 目标节点生成一次性授权票据，主节点 Auth App 审批后签发 Ed25519 client-only grant（文本码 + 二维码，nonce ledger 原子消费），成功即降级为从节点；Web/TUI 已接线 → [集群接入计划](docs/集群接入稳定性与本地RAG实施计划.md) |
 | 🌐 **抗弱网与 Transport v2** | `cluster_transport` 提供 `legacy_tcp`/`wss_443` 能力选择、有界 ACK 窗口、稳定故障矩阵与 circuit breaker；NW3.1 本地自签名 WSS loopback 门完成；真实 443/证书/流量对照后置 → [抗弱网专项](docs/抗弱网通信协议专项计划.md) |
 | 🧪 **实验质量与文档治理** | EX-N3 以只读生产质量门复核计划、样本、校准、性能、质量和人工复核，历史记录 3/3 通过；文档维护 Agent 已完成本机检索/语义质量门，只生成建议而不自动改写文档 |
-| 🧩 **子项目：小模型 harness 工作台** | 面向玩具/自用的小模型定制化推理工作台（S1-S8 本机/离线开发门完成）：上下文预算与 STATE 压缩、模型画像/能力门、OpenAI 兼容 `/v1`、定制化实验台（A/B + Pareto）、生图工作区、SQLite 会话与 RAG、长期记忆（RAG+压缩+本地 memory）、联网搜索与轻量 MCP 服务、红队安全样本；**不 import 主项目代码、仅共享模型工件**，亚1B 与 DS3 模型画像已登记 → [harness 方案](docs/小模型轻量推理harness工作台调研与方案.md) |
-| 📡 **联网搜索与轻量 Fetch 工具** | WEB-TOOL G1-G6 本机开发门完成：离线能力探测、Tool Gateway fail-closed（HTTPS 强制/SSRF/DNS/重定向复检）、受限 Fetch/SearXNG adapter、TaskGraph `tool_request` Stage、显式 `persist` 工具缓存与 API、质量门与联合审计；`production_network_enabled=false`，真实网络验收后置 → [调研与分期计划](docs/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
-| 📝 **文档维护 Agent 子项目** | 独立包（独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)，主项目以 submodule 引入）：规则数据化（`RULES.md` + `rules.yaml` 驱动扫描器）、规则变更机械扫描（增量矩阵 new/gone/changed + `--max-new/--max-gone` 门）、演进门控（agent 改规则 proposed→preflight→gates→released）与等价回归 → [专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) |
-| 🔌 **Reasonix ↔ Codex 桥接子项目** | 独立包（独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)，主项目以 submodule 引入）：把 Reasonix 子智能体以 stdio MCP 工具（`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_exec` / `reasonix_status`）接给 Codex；CLI 路径与模型 ref 全部按本机解析、零硬编码（`node src/configure.mjs list/use/codex/verify`）；默认只读，W1/W2/W3 已加入受控写入、变更证据、显式回滚和读写 profile 分工，审计修复票 `AUD-01`～`AUD-08` 已完成，`R2-EXT-01` 已放宽有限预算，`E2-EXT-01` 已落地任务级 checkpoint/续跑，`R3-EXT-01` 已落地显式只读并行与取消回收，G3 已完成 WSL 跨平台实跑，R4 已统一输出截断语义，`TOOL-RXB-EXEC-01` 已完成命名命令执行与真实 CLI 验收，`TOOL-RXB-NET-01` 已接入 Reasonix 原生 `web_fetch`（bridge 不自建网络栈），`TOOL-RXB-NET-02` 已加入 provider 搜索 fail-closed 门控，`TOOL-RXB-LOOP-01` 已加入显式 plan/implement/exec/review 阶段审计 → [完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) |
+| 🧩 **子项目：小模型 harness 工作台** | 面向玩具/自用的小模型定制化推理工作台（S1-S8 本机/离线开发门完成）：上下文预算与 STATE 压缩、模型画像/能力门、OpenAI 兼容 `/v1`、定制化实验台（A/B + Pareto）、生图工作区、SQLite 会话与 RAG、长期记忆（RAG+压缩+本地 memory）、联网搜索与轻量 MCP 服务、红队安全样本；**不 import 主项目代码、仅共享模型工件**，亚1B 与 DS3 模型画像已登记 → [harness 方案](harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) |
+| 📡 **联网搜索与轻量 Fetch 工具** | WEB-TOOL G1-G6 本机开发门完成：离线能力探测、Tool Gateway fail-closed（HTTPS 强制/SSRF/DNS/重定向复检）、受限 Fetch/SearXNG adapter、TaskGraph `tool_request` Stage、显式 `persist` 工具缓存与 API、质量门与联合审计；`production_network_enabled=false`，真实网络验收后置 → [调研与分期计划](docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
+| 📝 **文档维护 Agent 子项目** | 独立包（独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)，主项目以 submodule 引入）：规则数据化（`RULES.md` + `rules.yaml` 驱动扫描器）、规则变更机械扫描（增量矩阵 new/gone/changed + `--max-new/--max-gone` 门）、演进门控（agent 改规则 proposed→preflight→gates→released）与等价回归 → [专项计划](tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) |
+| 🔌 **Reasonix ↔ Codex 桥接子项目** | 独立包（独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)，主项目以 submodule 引入）：把 Reasonix 子智能体以 stdio MCP 工具（`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_exec` / `reasonix_status`）接给 Codex；CLI 路径与模型 ref 全部按本机解析、零硬编码（`node src/configure.mjs list/use/codex/verify`）；默认只读，W1/W2/W3 已加入受控写入、变更证据、显式回滚和读写 profile 分工，审计修复票 `AUD-01`～`AUD-08` 已完成，`R2-EXT-01` 已放宽有限预算，`E2-EXT-01` 已落地任务级 checkpoint/续跑，`R3-EXT-01` 已落地显式只读并行与取消回收，G3 已完成 WSL 跨平台实跑，R4 已统一输出截断语义，`TOOL-RXB-EXEC-01` 已完成命名命令执行与真实 CLI 验收，`TOOL-RXB-NET-01` 已接入 Reasonix 原生 `web_fetch`（bridge 不自建网络栈），`TOOL-RXB-NET-02` 已加入 provider 搜索 fail-closed 门控，`TOOL-RXB-LOOP-01` 已加入显式 plan/implement/exec/review 阶段审计 → [完善方向](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) |
 | 🎯 **判题口径修复与 DS3 替代 R1** | `loose_contains` + 512 token（P5）实证可区分（Qwen3-4B 1/4 vs 1.8B 0/4）；DS3-0324-7B v2 全口径 **2/4×3、8/11×3**（仅预算 192→512 即 0/4→2/4，判题口径问题实证）→ 替代 R1 判题模型的**已批准候选** → [DS3 专项](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
 
 ### 项目设计理念
@@ -265,14 +265,14 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 - **定位**：把主仓原本内嵌的文档维护工具（原 `docs/agent_tool` 套件）独立为通用包，规则不再写死在代码里，而是**数据化**为 `RULES.md` + `rules.yaml`。
 - **能力**：规则驱动的机械扫描器；规则变更增量矩阵（`new/gone/changed`，配 `--max-new/--max-gone` 门）；演进门控（`proposed → preflight → gates → released`）与等价回归。
 - **与主仓的关系**：主仓只保留 gitlink（`tools/docagent`）与专项文档；源码与规则在独立仓库演进，主仓不复制其源码。
-- **入口**：[文档维护Agent工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) · [文档维护 Agent 工具设计](docs/文档维护Agent工具设计.md)
+- **入口**：[文档维护Agent工具子项目化与通用化专项计划](tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) · [文档维护 Agent 工具设计](tools/docagent/docs/文档维护Agent工具设计.md)
 
 #### 自研子项目二：`reasonix-codex-bridge`（Codex ↔ Reasonix 桥）
 
 - **定位**：把 Reasonix（本地多模型编码 agent）接成 Codex 可调用的 stdio MCP 服务，让 Codex 调度一个**独立模型、独立配额**的子智能体。
 - **能力**：6 个 MCP 工具（`reasonix_run` / `status` / `resume` / `rollback` / `cancel` / `exec`）；CLI 路径与模型 ref 按本机解析、零硬编码（`configure list/use/codex/verify`）；受控写入（`allowWrite` + `allowedPaths` 白名单 + 干净工作区 + git 快照回滚）；命名 argv-only 测试/构建执行（默认关闭、`shell:false`、clean-tree、超时/输出上限、变更检测与脱敏）；任务级 checkpoint 续跑；脱敏 JSONL 调用日志。
 - **与主仓的关系**：主仓只保留 gitlink（`tools/reasonix-codex-bridge`）与规划/审计文档；子智能体 profile（`deepseek-worker` / `deepseek-worker-write`）由子项目的 `configure profile` 在 Reasonix 全局目录创建。
-- **入口**：[完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) · [工具面现状](docs/reasonix-codex-bridge工具面现状-2026-09-13.md) · [审计报告](docs/reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
+- **入口**：[完善方向](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [Harness 工具扩展排期](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) · [工具面现状](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge工具面现状-2026-09-13.md) · [审计报告](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP 会话级恢复专项计划](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
 
 
 拉取与更新：
@@ -1030,25 +1030,25 @@ python serve.py
 
 ### 专项文档
 
-- [小模型轻量推理 harness 工作台调研与方案](docs/小模型轻量推理harness工作台调研与方案.md) — 子项目：小模型定制化（模板/上下文/资源/角色分工）工作台；S1-S8 本机/离线开发门完成，真实运行时验收与 S5 收口后置；[下一阶段开发票](docs/harness下一阶段开发票计划.md)（S3.2 生图真机+红队、S7 联网+MCP、S8 长期记忆）
-- [联网搜索与轻量 Fetch 工具调用可行性调研与分期计划](docs/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) — WEB-TOOL G0-G6/AUDIT 主节点 Tool Gateway 支线：能力探测、fail-closed 联网策略、adapter、TaskGraph Stage、显式持久化缓存与质量门；真实网络验收后置
+- [小模型轻量推理 harness 工作台调研与方案](harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) — 子项目：小模型定制化（模板/上下文/资源/角色分工）工作台；S1-S8 本机/离线开发门完成，真实运行时验收与 S5 收口后置；[下一阶段开发票](harness_workbench/docs/harness下一阶段开发票计划.md)（S3.2 生图真机+红队、S7 联网+MCP、S8 长期记忆）
+- [联网搜索与轻量 Fetch 工具调用可行性调研与分期计划](docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) — WEB-TOOL G0-G6/AUDIT 主节点 Tool Gateway 支线：能力探测、fail-closed 联网策略、adapter、TaskGraph Stage、显式持久化缓存与质量门；真实网络验收后置
 - [DistilQwen2.5-DS3-0324 替代 R1 判题模型专项计划](docs/DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) — 快思考替代不可关闭 thinking 的 R1：v2 全口径 **2/4×3、8/11×3**，替代 R1 已批准候选；附多模型 0/4 判题口径问题专项分析
 - [亚 1B 小模型专项实验计划](docs/亚1B小模型专项实验计划.md) — Qwen2.5-0.5B / Qwen3-0.6B / MiniCPM4-0.5B 用途（链路轻载体/thinking 开关标杆/新架构探针）与 M-SM-B1~B5 实验票
-- [文档维护 Agent 工具子项目化与通用化专项计划](docs/文档维护Agent工具子项目化与通用化专项计划.md) — 独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)（主项目 submodule 引入）、规则数据化、规则变更机械扫描与演进门控（P1-P5）
-- [reasonix-codex-bridge 完善方向](docs/reasonix-codex-bridge完善方向-2026-09-12.md) — 独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)（主项目 submodule 引入）：Reasonix 子智能体接入 Codex 的 P0-P2 完善方向与验收门；W1/W2/W3 已落地默认关闭的受控写入、变更证据、显式回滚和读写 profile 分工，审计修复 `AUD-01`～`AUD-08`、G3 跨平台实跑与 R4 输出截断确定性已完成
-- [reasonix-codex-bridge ACP 会话级恢复专项计划](docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01～ACP-05，ACP-06 离线验收通过（强杀、orphan/resume、compact/rotate、并发取消与零泄漏）；默认仍 per-call，真实 provider 空会话跨进程 resume 返回 `unknown session`，恢复门待 provider 持久化语义补证
-- [reasonix-codex-bridge Harness 工具扩展与能力补齐排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) — 本机 Reasonix capability 调研与 EXEC/NET/LOOP/EVT/ACP/MESSAGE 票排期；`TOOL-RXB-EXEC-01`、`TOOL-RXB-NET-01`、`TOOL-RXB-NET-02` 与 `TOOL-RXB-LOOP-01` 已完成，搜索票在本机按 provider unavailable 门控，阶段编排保持主 agent 显式推进
-- [reasonix-codex-bridge 工具面现状与能力归属](docs/reasonix-codex-bridge工具面现状-2026-09-13.md) — `reasonix doctor` 曾发现 profile 中 `git_log`/`git_diff` 为未知工具身份，现已由 `TOOL-RXB-TOOL-01` 收敛并验证归零；`web_fetch` 归 Reasonix，`web_search` 归 provider 并由 `providerSearch` fail-closed 门控；LOOP-01 阶段标记已接入 status/job/checkpoint
+- [文档维护 Agent 工具子项目化与通用化专项计划](tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) — 独立仓库 [qlh-docagent](https://github.com/SgfKrc/qlh-docagent)（主项目 submodule 引入）、规则数据化、规则变更机械扫描与演进门控（P1-P5）
+- [reasonix-codex-bridge 完善方向](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge完善方向-2026-09-12.md) — 独立仓库 [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge)（主项目 submodule 引入）：Reasonix 子智能体接入 Codex 的 P0-P2 完善方向与验收门；W1/W2/W3 已落地默认关闭的受控写入、变更证据、显式回滚和读写 profile 分工，审计修复 `AUD-01`～`AUD-08`、G3 跨平台实跑与 R4 输出截断确定性已完成
+- [reasonix-codex-bridge ACP 会话级恢复专项计划](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md) — ACP 侧实测可用（`loadSession` / `session/{list,resume,close,delete}`），bridge 已完成 ACP-01～ACP-05，ACP-06 离线验收通过（强杀、orphan/resume、compact/rotate、并发取消与零泄漏）；默认仍 per-call，真实 provider 空会话跨进程 resume 返回 `unknown session`，恢复门待 provider 持久化语义补证
+- [reasonix-codex-bridge Harness 工具扩展与能力补齐排期](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) — 本机 Reasonix capability 调研与 EXEC/NET/LOOP/EVT/ACP/MESSAGE 票排期；`TOOL-RXB-EXEC-01`、`TOOL-RXB-NET-01`、`TOOL-RXB-NET-02` 与 `TOOL-RXB-LOOP-01` 已完成，搜索票在本机按 provider unavailable 门控，阶段编排保持主 agent 显式推进
+- [reasonix-codex-bridge 工具面现状与能力归属](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge工具面现状-2026-09-13.md) — `reasonix doctor` 曾发现 profile 中 `git_log`/`git_diff` 为未知工具身份，现已由 `TOOL-RXB-TOOL-01` 收敛并验证归零；`web_fetch` 归 Reasonix，`web_search` 归 provider 并由 `providerSearch` fail-closed 门控；LOOP-01 阶段标记已接入 status/job/checkpoint
 - [DeepSeek 缓存机制借鉴与 QLH 落地专项计划](docs/缓存机制专项计划-2026-09-13.md) — 登记 V4.1 磁盘上下文缓存与 SWA 单元匹配机制（三种持久化时机、hit/miss 25–50× 差价、KV 1/4 HBM 与 1/8 SSD），对照 `paged_kv_cache`/harness/bridge 现状，给出前缀稳定性与命中观测（零成本）、两级缓存与单元对齐（工程改造）、架构级压缩（仅跟踪）三档动作与 `CACHE-01`～`CACHE-06` 票
 - [CACHE-05 非对称分工论证](docs/非对称分工论证-2026-09-14.md) — DeepSeek 输入/输出非对称仅作架构参考；QLH 以 draft-verify 与亚 1B 岗位化定义可验证控制变量、指标和停止规则
-- [reasonix-codex-bridge 全面审计与多次实测报告](docs/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md) — 真实覆盖 MCP 控制面、inspect、plan、受控写入/回滚、checkpoint/resume、ACP-06、命名命令执行、Reasonix 原生 `web_fetch` 与 provider 搜索不可用门控；结论为可作为受限文件型低价替代，跨进程 ACP 恢复、自主多阶段编排和 provider 搜索接通验收仍待后续
+- [reasonix-codex-bridge 全面审计与多次实测报告](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md) — 真实覆盖 MCP 控制面、inspect、plan、受控写入/回滚、checkpoint/resume、ACP-06、命名命令执行、Reasonix 原生 `web_fetch` 与 provider 搜索不可用门控；结论为可作为受限文件型低价替代，跨进程 ACP 恢复、自主多阶段编排和 provider 搜索接通验收仍待后续
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
 - [前端、Android 与后端接口缺口审查](docs/前端安卓后端接口与功能缺口审查-2026-08-22.md) — `frontend_cybergothic/` 已成为唯一产品前端，Account/Cluster/Models/RAG/Tasks/Image Studio/诊断等本机产品面已接线；旧 `frontend/` 冻结为历史对照，标准安装包输入已接入，真实首启仍随 E8 打包链路验收
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
-- [混合分布式推理体系规划](docs/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
+- [混合分布式推理体系规划](docs/archive/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
 - [三种分布式拆分细化实施方案](docs/三种分布式拆分细化实施方案.md) — PyTorch 层间待测试项、任务链和张量并行的协议、容错与实施阶段
 - [Android 与 PC 功能差距清单](docs/安卓与PC功能差距清单.md) — 当前 Android Full/Lite 与 PC 的能力边界；presence、Full Worker/Stage、Gemma4 MTMD、更新/日志/诊断已完成本机开发门，真机/生产验收后置
 - [Android 版本远期计划](docs/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分的历史架构基线与远期边界
@@ -1059,7 +1059,7 @@ python serve.py
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
 - [数据库测试指南](docs/数据库测试指南.md) — 存储层测试现状：SQLite 契约、退场 fail-closed 用例与运行方式（PG 已退场）
 - [离线资产一键整合包设计](docs/离线资产一键整合包设计.md) — M1 已完成容量预检、清单、原子 ZIP、7z/分卷与恢复校验；真实全量出包和 Android SAF 导入后置
-- [文档维护 Agent 工具设计](docs/文档维护Agent工具设计.md) — M1-M3 已完成本机检索/语义质量门；工具只提供证据和建议，不自动改写文档
+- [文档维护 Agent 工具设计](tools/docagent/docs/文档维护Agent工具设计.md) — M1-M3 已完成本机检索/语义质量门；工具只提供证据和建议，不自动改写文档
 - [通用工具与子项目候选计划](docs/通用工具与子项目候选计划-2026-09-12.md) — 从主仓与 harness 筛选可跨项目复用的模块：A 档 5 项（进程归属/重置、演示证据链、签名更新、零依赖 TUI、多机同步与补丁分发）、B 档 7 项（harness 内部独立包，RAG 优先）、C 档 venv 环境治理入选；含判定标准、优先级与毕设选题映射
 
 ### 外部算力辅助（张量并行在异构 mesh 内不可行，改走集群外辅助）

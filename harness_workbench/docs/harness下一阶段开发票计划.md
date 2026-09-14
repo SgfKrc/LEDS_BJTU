@@ -3,7 +3,7 @@
 > 状态：**已拆票；`S7-MCP-02` 本机开发门已完成，当前进入 `S5-CLOSE-01`**；真实第三方 MCP 服务、认证与权限仍属于后置验收；前置状态回顾：S1-S4 本机/离线开发门已完成（v10 记录），S6（React 工作台 + Textual TUI）已完成本机开发门；本文档新增三条支线：**S3.2（生图真机后置 + 安全红队合并）、S7（联网搜索 + 轻量 MCP 服务）、S8（小模型长期记忆：RAG + 上下文压缩 + 本地 memory）**
 >
 > 创建日期：2026-09-08
-> 适用范围：harness 子项目下一阶段票；不与 [WEB-TOOL 联网支线](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) 合并（那些是主项目运行时工具，本票是 harness 侧能力与对外服务）；不覆盖训练微调。
+> 适用范围：harness 子项目下一阶段票；不与 [WEB-TOOL 联网支线](../../docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) 合并（那些是主项目运行时工具，本票是 harness 侧能力与对外服务）；不覆盖训练微调。
 
 ---
 
@@ -37,7 +37,7 @@ S3 离线门已封闭：contracts/manifest/注入式执行器/资产原子落盘
 
 | 项 | 交付 | 验收 |
 |---|---|---|
-| 联网搜索工具 | `tools/`（或 `adapters/tool_*`）：`web_search` / `web_fetch` 工具实现；**本地模式** = 标准库受限 HTTP（仅 HTTPS、显式 opt-in、拒绝 loopback/RFC1918/metadata、DNS+重定向复检、大小/content-type 门——约束思路沿用主项目 [Tool Gateway 方案](联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)§G2，但 harness **不 import 主项目代码**，自实现轻量版）；**远端模式** = 经 qlh adapter 走主项目 `/api/tool-*`（复用已验证的 G2-G5 链路） | 本地：fake transport 下 SSRF 拦截矩阵 + 大小/类型门测试全过；远端：真实 qlh 契约映射测试；**生产网络默认关闭**（`production_network_enabled=false` 直到显式验收） |
+| 联网搜索工具 | `tools/`（或 `adapters/tool_*`）：`web_search` / `web_fetch` 工具实现；**本地模式** = 标准库受限 HTTP（仅 HTTPS、显式 opt-in、拒绝 loopback/RFC1918/metadata、DNS+重定向复检、大小/content-type 门——约束思路沿用主项目 [Tool Gateway 方案](../../docs/archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)§G2，但 harness **不 import 主项目代码**，自实现轻量版）；**远端模式** = 经 qlh adapter 走主项目 `/api/tool-*`（复用已验证的 G2-G5 链路） | 本地：fake transport 下 SSRF 拦截矩阵 + 大小/类型门测试全过；远端：真实 qlh 契约映射测试；**生产网络默认关闭**（`production_network_enabled=false` 直到显式验收） |
 | 工具协议接入 | 工具结果 → `qlh.tool_context.v1` 有界注入回答模型（对齐 harness 角色分工：模型不自行生成工具调用，**host_router 模式**）；能力通告随 model_profiles capability 门（未 verified 不启用 autonomous_tools） | 与 S1.5 capability_gate 联动；无 verified 时工具不可用（fail-closed）；红队样本（越权/伪工具）复用 S3.2 红队族 |
 | **轻量 MCP 服务** | 新增 `mcp_server/`：**harness 自带的好玩 MCP 功能集**——chat、sessions、rag/search、images、web_search/web_fetch、memory(§S8) 全部以 MCP 工具暴露（stdio 与 SSE 两种 transport，工具名/schema 与 `/v1/*` 合同一致、可离线玩耍）；**同时预留接入其他 MCP 服务的通道**：MCP tool registry + 外部 MCP server 端点配置声明（本期只落地接口、契约、schema 校验与能力通告，不实现真实第三方接入） | ① server 角色：任一 MCP 客户端（如 Claude Code）连接后可列出工具并调用 1 个读工具（rag/search）+ 1 个写工具（session create）成功；② **接入预留**：以 fixture fake MCP server 证明"仅配置即可接入并隔离失败"的通道可用（工具发现/调用/错误传播），真实第三方 MCP 服务留后续票；**无密钥泄漏、无绝对路径**；harness 不 import 主项目代码约束保持 |
 | 边界 | 不做通用 Agent 循环（模型自治选择工具由客户端侧承担；harness 只提供工具与 gate）；不做主项目那套完整 Tool Gateway 策略（复用思路，简化实现） | — |
