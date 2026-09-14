@@ -10,7 +10,7 @@
 | `PATCH-01` | 只读数据层（catalog）：docs/ 扫描 + 状态行/更新日期/票号/互链/分类解析 | ✅ 完成（2026-09-14） |
 | `PATCH-02` | 书架 TUI（三栏：列表→文档卡→预览；分类过滤/归档开关） | ✅ 完成（2026-09-14，Textual） |
 | `PATCH-03` | 检索台（对接 RAG 检索全链路） | 待做 |
-| `PATCH-04` | 编目（docagent scan/audit 集成） | 待做 |
+| `PATCH-04` | 编目诊断（委托 docagent scan：R1-R5 findings + fail-soft + 异步 worker） | ✅ 完成（2026-09-14） |
 | `PATCH-05` | 流通记录（git log/变更记录） | 待做 |
 | `PATCH-06` | 馆藏统计 + 收口 | 待做 |
 

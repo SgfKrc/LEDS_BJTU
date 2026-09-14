@@ -42,6 +42,7 @@ class BookshelfApp(App):
         ("q", "quit", "退出"),
         ("r", "reload", "刷新"),
         ("a", "toggle_archive", "归档"),
+        ("c", "diag", "编目诊断"),
         ("0", "clear_filter", "全部"),
         *[(str(i + 1), f"filter({i})", KIND_LABEL[kind]) for i, kind in enumerate(KIND_ORDER)],
     ]
@@ -54,6 +55,8 @@ class BookshelfApp(App):
         self.show_archive = False
         self.entries: list[dict] = []
         self.preview_text = ""
+        self.diag: dict | None = None
+        self.diag_text = ""
 
     # ---- layout ----
     def compose(self) -> ComposeResult:
@@ -141,6 +144,33 @@ class BookshelfApp(App):
     def action_toggle_archive(self) -> None:
         self.show_archive = not self.show_archive
         self._apply_filter()
+
+    # ---- PATCH-04 编目诊断 ----
+    def action_diag(self) -> None:
+        if self.diag is not None:  # 再按一次回到文档预览
+            self.diag = None
+            self._show_entry(self.entries[0] if self.entries else None)
+            self.sub_title = self._filter_desc(len(self.entries))
+            return
+        preview = self.query_one("#preview", Static)
+        preview.update("编目诊断运行中（docagent scan）…")
+        self.diag_text = ""
+        self.run_worker(self._run_diag, thread=True, name="diag")
+
+    def _run_diag(self) -> None:
+        from .catalog_diag import run_scan  # 延迟导入：数据层保持零依赖
+
+        self.call_from_thread(self._render_diag, run_scan(self.root))
+
+    def _render_diag(self, result: dict) -> None:
+        from .catalog_diag import render_diag
+
+        self.diag = result
+        text = render_diag(result)
+        self.diag_text = text
+        self.query_one("#preview", Static).update(text)
+        status = "诊断完成" if result.get("ok") else "诊断失败（c 返回）"
+        self.sub_title = f"{status} · 问题 {len(result.get('findings', []))}"
 
 
 def main(argv: list[str] | None = None) -> int:
