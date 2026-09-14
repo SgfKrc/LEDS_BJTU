@@ -18,7 +18,7 @@ from model_tools import gguf_convert as gc  # noqa: E402
 from model_tools import import_model as im  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REAL_PATCH = (REPO_ROOT / "packaging" / "patches"
+REAL_PATCH = (REPO_ROOT / "tools" / "model_tools" / "patches"
               / "llama-cpp-converter-qwen-eps.patch")
 
 
@@ -60,7 +60,7 @@ def test_patch_idempotent_when_already_applied(tmp_path, monkeypatch):
 
 
 def test_patch_auto_applies_when_missing(tmp_path, monkeypatch):
-    """未打补丁 -> 自动 git apply 真实补丁文件（packaging/patches/）。"""
+    """未打补丁 -> 自动 git apply 真实补丁文件（tools/model_tools/patches/）。"""
     assert REAL_PATCH.is_file(), "补丁文件必须入库"
     llama = _fake_submodule(tmp_path)
     (llama / "conversion" / "base.py").write_text("unpatched", encoding="utf-8")

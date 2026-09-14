@@ -86,6 +86,20 @@ def managed_package_dir(
     return default_package_root(project_root) / "packages" / (target_id or host_target_id())
 
 
+def llama_cpp_source(project_root: Path = ROOT) -> Path:
+    """Resolve the Android-owned llama.cpp checkout used by core model tools."""
+    roots: list[Path] = []
+    configured_root = os.environ.get("QLH_ANDROID_ROOT")
+    if configured_root:
+        roots.append(Path(configured_root).expanduser())
+    roots.extend((project_root.parent / "qlh-android", project_root / "android"))
+    for android_root in roots:
+        candidate = android_root / "app" / "src" / "main" / "cpp" / "llama.cpp"
+        if candidate.is_dir():
+            return candidate
+    return roots[0] / "app" / "src" / "main" / "cpp" / "llama.cpp"
+
+
 def verify_managed_package(
     package_dir: Path,
     *,
@@ -291,7 +305,7 @@ def resolve_quantizer(
         if found:
             candidate = Path(found).absolute()
             return candidate, _unmanaged_summary(candidate, "path")
-    repo = project_root / "android" / "app" / "src" / "main" / "cpp" / "llama.cpp"
+    repo = llama_cpp_source(project_root)
     for relative in ("build/bin/llama-quantize", "build/bin/llama-quantize.exe", "build/bin/Release/llama-quantize.exe"):
         candidate = repo / relative
         if candidate.is_file() and not candidate.is_symlink():
@@ -307,6 +321,7 @@ __all__ = [
     "file_sha256",
     "host_target_id",
     "load_lock",
+    "llama_cpp_source",
     "managed_package_candidates",
     "managed_package_dir",
     "normalize_architecture",

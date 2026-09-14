@@ -84,6 +84,52 @@ def test_unified_setup_keeps_test_environment_isolated():
     assert {"pytest", "xdist", "pytest_timeout"} <= set(test_env.required_modules)
 
 
+def test_unified_setup_defaults_to_mainline_python_only():
+    args = SimpleNamespace(
+        only=None,
+        all=True,
+        check=False,
+        snapshot=False,
+        no_node=False,
+        with_node=False,
+        skip=None,
+    )
+
+    _, node_projects = setup_envs._select(args)
+
+    assert node_projects == []
+
+
+def test_unified_setup_keeps_product_shell_out_of_mainline():
+    args = SimpleNamespace(
+        only=None,
+        all=True,
+        check=False,
+        snapshot=False,
+        no_node=False,
+        with_node=True,
+        skip=None,
+    )
+
+    _, node_projects = setup_envs._select(args)
+
+    assert node_projects == []
+
+
+def test_bjtu_routes_extracted_shell_and_release_repositories():
+    windows = Path("bjtu.bat").read_text(encoding="utf-8")
+    unix = Path("bjtu.sh").read_text(encoding="utf-8")
+
+    for script in (windows, unix):
+        assert "QLH_SHELL_ROOT" in script
+        assert "QLH_RELEASE_ROOT" in script
+        assert "QLH_CORE_ROOT" in script
+    assert "%QLH_RELEASE_ROOT%\\packaging\\qlh_launcher.py" in windows
+    assert "$RELEASE_ROOT/packaging/qlh_launcher.py" in unix
+    assert "pip install -r \"%QLH_SHELL_ROOT%\\requirements-tui.txt\"" in windows
+    assert "$SHELL_ROOT/requirements-tui.txt" in unix
+
+
 def test_sidecar_checks_require_torch_runtime_modules():
     qwen = setup_envs.ENV_BY_NAME["qwen3-sidecar"]
     gemma = setup_envs.ENV_BY_NAME["gemma4-pipeline"]

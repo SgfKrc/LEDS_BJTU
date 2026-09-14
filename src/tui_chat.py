@@ -39,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover - 环境引导路径
     print(
         "T9 聊天页需要可选依赖 Textual + httpx。\n"
-        "安装: pip install -r packaging/requirements-tui.txt\n"
+        "安装: pip install -r ../qlh-shell/requirements-tui.txt\n"
         "管理 TUI（start_tui.bat）不受影响。"
     )
     sys.exit(2)

@@ -12,8 +12,8 @@ import venv
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_DIR = ROOT / ".venv-qwen3-sidecar"
-REQUIREMENTS = ROOT / "packaging" / "requirements-qwen3-sidecar.txt"
-PIPELINE_REQUIREMENTS = ROOT / "packaging" / "requirements-qwen3-pipeline-sidecar.txt"
+REQUIREMENTS = ROOT / "requirements" / "requirements-qwen3-sidecar.txt"
+PIPELINE_REQUIREMENTS = ROOT / "requirements" / "requirements-qwen3-pipeline-sidecar.txt"
 DEFAULT_TORCH_SPEC = os.environ.get("QLH_QWEN3_TORCH_SPEC", "torch>=2.0")
 DEFAULT_TORCHVISION_SPEC = os.environ.get(
     "QLH_QWEN3_TORCHVISION_SPEC", "torchvision>=0.28,<0.29",

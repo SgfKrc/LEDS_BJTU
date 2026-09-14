@@ -9831,14 +9831,19 @@ def _resolve_frontend_dist() -> str:
         return os.path.abspath(os.path.expanduser(explicit))
 
     if getattr(sys, "frozen", False):
+        # Frozen datas are self-contained. A developer shell checkout must
+        # not override the packaged UI unless QLH_FRONTEND_DIST was explicit.
         root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    else:
-        root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-    return os.path.join(root, "frontend_cybergothic", "dist")
+        return os.path.join(os.path.abspath(os.path.expanduser(root)), "frontend_cybergothic", "dist")
+    root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    shell_root = os.environ.get("QLH_SHELL_ROOT", "").strip()
+    if not shell_root:
+        shell_root = os.path.join(os.path.dirname(root), "qlh-shell")
+    return os.path.join(os.path.abspath(os.path.expanduser(shell_root)), "frontend_cybergothic", "dist")
 
 
-# PyInstaller and source runs both use frontend_cybergothic/dist by default.
-# The old frontend can only be selected explicitly with QLH_FRONTEND_DIST.
+# PyInstaller and source runs use the external qlh-shell checkout when present.
+# The packaged path or another shell can be selected explicitly with QLH_FRONTEND_DIST.
 _frontend_dist = _resolve_frontend_dist()
 
 if os.path.isdir(_frontend_dist):

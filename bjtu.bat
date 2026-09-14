@@ -16,6 +16,11 @@ rem  This file MUST stay in the project root (same dir as src/).
 rem ============================================================
 cd /d "%~dp0"
 
+if not defined QLH_CORE_ROOT set "QLH_CORE_ROOT=%~dp0"
+if not defined QLH_SHELL_ROOT set "QLH_SHELL_ROOT=%~dp0..\qlh-shell"
+if not defined QLH_RELEASE_ROOT set "QLH_RELEASE_ROOT=%~dp0..\qlh-release"
+set "QLH_RELEASE_LAUNCHER=%QLH_RELEASE_ROOT%\packaging\qlh_launcher.py"
+
 if not exist "src\api_server.py" (
     if exist "QLH-Edge-Inference.exe" goto :packaged_launcher
     echo [ERROR] bjtu.bat must be placed in the QLH project root.
@@ -169,12 +174,12 @@ exit /b %errorlevel%
 
 :chat
 set "PYTHON_CMD=python"
-if exist ".venv-tui\Scripts\python.exe" set "PYTHON_CMD=.venv-tui\Scripts\python.exe"
+if exist "%QLH_SHELL_ROOT%\.venv-tui\Scripts\python.exe" set "PYTHON_CMD=%QLH_SHELL_ROOT%\.venv-tui\Scripts\python.exe"
 %PYTHON_CMD% -c "import textual, httpx" >nul 2>nul
 if not %errorlevel%==0 (
     echo [T9] 聊天页缺少可选依赖 Textual/httpx。
-    echo      安装: python scripts\setup_tui_env.py
-    echo      或:   pip install -r packaging\requirements-tui.txt
+    echo      安装: python "%QLH_SHELL_ROOT%\scripts\setup_tui_env.py"
+    echo      或:   pip install -r "%QLH_SHELL_ROOT%\requirements-tui.txt"
     echo      管理 TUI（bjtu / start_tui.bat）不受影响。
     exit /b 2
 )
@@ -184,32 +189,32 @@ exit /b %errorlevel%
 
 :launcher
 set "PYTHON_CMD=python"
-if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
-%PYTHON_CMD% packaging\qlh_launcher.py --gui %2 %3 %4 %5 %6
+if exist "%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe" set "PYTHON_CMD=%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% "%QLH_RELEASE_LAUNCHER%" --gui %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :ui
 set "PYTHON_CMD=python"
-if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
-%PYTHON_CMD% packaging\qlh_launcher.py app-ui %2 %3 %4 %5 %6
+if exist "%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe" set "PYTHON_CMD=%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% "%QLH_RELEASE_LAUNCHER%" app-ui %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :tui
 set "PYTHON_CMD=python"
-if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
-%PYTHON_CMD% packaging\qlh_launcher.py app-tui %2 %3 %4 %5 %6
+if exist "%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe" set "PYTHON_CMD=%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% "%QLH_RELEASE_LAUNCHER%" app-tui %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :update
 set "PYTHON_CMD=python"
-if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
-%PYTHON_CMD% packaging\qlh_launcher.py check %2 %3 %4 %5 %6
+if exist "%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe" set "PYTHON_CMD=%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% "%QLH_RELEASE_LAUNCHER%" check %2 %3 %4 %5 %6
 exit /b %errorlevel%
 
 :launcher_n4
 set "PYTHON_CMD=python"
-if exist ".venv-packaging\Scripts\python.exe" set "PYTHON_CMD=.venv-packaging\Scripts\python.exe"
-%PYTHON_CMD% packaging\qlh_launcher.py %*
+if exist "%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe" set "PYTHON_CMD=%QLH_RELEASE_ROOT%\.venv-packaging\Scripts\python.exe"
+%PYTHON_CMD% "%QLH_RELEASE_LAUNCHER%" %*
 exit /b %errorlevel%
 
 :packaged_launcher_n4

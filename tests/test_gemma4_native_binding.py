@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -43,9 +44,12 @@ def test_binding_source_verification_rejects_patch_digest_drift(tmp_path, monkey
 
 
 def test_cuda_package_carries_and_verifies_the_binding_manifest():
-    root = Path(__file__).resolve().parents[1]
-    spec = (root / "packaging" / "qlh-cuda.spec").read_text(encoding="utf-8")
-    builder = (root / "scripts" / "model_tools" / "build-cuda-llamacpp.bat").read_text(
+    core_root = Path(__file__).resolve().parents[1]
+    release_root = Path(
+        os.environ.get("QLH_RELEASE_ROOT", core_root.parent / "qlh-release")
+    )
+    spec = (release_root / "packaging" / "qlh-cuda.spec").read_text(encoding="utf-8")
+    builder = (core_root / "scripts" / "model_tools" / "build-cuda-llamacpp.bat").read_text(
         encoding="utf-8"
     )
 

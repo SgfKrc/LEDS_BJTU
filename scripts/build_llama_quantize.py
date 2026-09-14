@@ -20,6 +20,7 @@ if __package__:
         default_package_root,
         file_sha256,
         host_target_id,
+        llama_cpp_source,
         load_lock,
         verify_managed_package,
     )
@@ -29,6 +30,7 @@ else:
         default_package_root,
         file_sha256,
         host_target_id,
+        llama_cpp_source,
         load_lock,
         verify_managed_package,
     )
@@ -227,7 +229,7 @@ def build_and_package(
     target = lock["targets"].get(target_id)
     if target is None:
         raise BuildError(f"host target is not locked: {target_id}")
-    source = project_root / lock["source"]
+    source = llama_cpp_source(project_root)
     if not source.is_dir() or source.is_symlink():
         raise BuildError("pinned llama.cpp submodule is missing or unsafe")
     revision = _source_revision(source, project_root)

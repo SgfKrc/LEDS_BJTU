@@ -21,6 +21,12 @@ if command -v readlink >/dev/null 2>&1 && readlink -f "$0" >/dev/null 2>&1; then
 fi
 PROJECT_ROOT="$(cd "$(dirname "$SELF")" && pwd)" || exit 1
 cd "$PROJECT_ROOT" || exit 1
+SHELL_ROOT="${QLH_SHELL_ROOT:-$PROJECT_ROOT/../qlh-shell}"
+RELEASE_ROOT="${QLH_RELEASE_ROOT:-$PROJECT_ROOT/../qlh-release}"
+export QLH_CORE_ROOT="${QLH_CORE_ROOT:-$PROJECT_ROOT}"
+export QLH_SHELL_ROOT="$SHELL_ROOT"
+export QLH_RELEASE_ROOT="$RELEASE_ROOT"
+RELEASE_LAUNCHER="$RELEASE_ROOT/packaging/qlh_launcher.py"
 
 if [ ! -f "src/api_server.py" ]; then
     echo "[错误] 未找到 src/api_server.py —— bjtu 脚本必须位于 QLH 项目根目录。"
@@ -54,8 +60,8 @@ if [ "$1" = "launcher" ] || [ "$1" = "ui" ] || [ "$1" = "tui" ]; then
     MODE="$1"
     shift
     PY=""
-    if [ -x "$PROJECT_ROOT/.venv-packaging/bin/python" ]; then
-        PY="$PROJECT_ROOT/.venv-packaging/bin/python"
+    if [ -x "$RELEASE_ROOT/.venv-packaging/bin/python" ]; then
+        PY="$RELEASE_ROOT/.venv-packaging/bin/python"
     elif command -v python3 >/dev/null 2>&1; then
         PY=python3
     else
@@ -63,34 +69,34 @@ if [ "$1" = "launcher" ] || [ "$1" = "ui" ] || [ "$1" = "tui" ]; then
     fi
     export PYTHONIOENCODING=utf-8
     if [ "$MODE" = "launcher" ]; then
-        exec "$PY" "$PROJECT_ROOT/packaging/launcher.py" --launcher "$@"
+        exec "$PY" "$RELEASE_ROOT/packaging/launcher.py" --launcher "$@"
     elif [ "$MODE" = "ui" ]; then
-        exec "$PY" "$PROJECT_ROOT/packaging/launcher.py" --ui "$@"
+        exec "$PY" "$RELEASE_ROOT/packaging/launcher.py" --ui "$@"
     else
-        exec "$PY" "$PROJECT_ROOT/packaging/launcher.py" --tui "$@"
+        exec "$PY" "$RELEASE_ROOT/packaging/launcher.py" --tui "$@"
     fi
 fi
 
 # UP-N4 Launcher maintenance always runs through the stable Bootstrap.
 case "${1:-}" in
     launcher-status|launcher-check|launcher-download|launcher-install|launcher-stage|launcher-activate|launcher-rollback|launcher-recover|diagnostics|verify|diagnose|repair|data-status|retain-data|reassociate-data|reinstall)
-        if [ -x "$PROJECT_ROOT/.venv-packaging/bin/python" ]; then
-            PY="$PROJECT_ROOT/.venv-packaging/bin/python"
+        if [ -x "$RELEASE_ROOT/.venv-packaging/bin/python" ]; then
+            PY="$RELEASE_ROOT/.venv-packaging/bin/python"
         elif command -v python3 >/dev/null 2>&1; then
             PY=python3
         else
             PY=python
         fi
         export PYTHONIOENCODING=utf-8
-        exec "$PY" "$PROJECT_ROOT/packaging/qlh_launcher.py" "$@"
+        exec "$PY" "$RELEASE_LAUNCHER" "$@"
         ;;
 esac
 
 # ---- chat: T9 简化聊天页（可选依赖 Textual/httpx）----
 if [ "$1" = "chat" ]; then
     PY=""
-    if [ -x "$PROJECT_ROOT/.venv-tui/bin/python" ]; then
-        PY="$PROJECT_ROOT/.venv-tui/bin/python"
+    if [ -x "$SHELL_ROOT/.venv-tui/bin/python" ]; then
+        PY="$SHELL_ROOT/.venv-tui/bin/python"
     elif command -v python3 >/dev/null 2>&1; then
         PY=python3
     else
@@ -98,8 +104,8 @@ if [ "$1" = "chat" ]; then
     fi
     if ! "$PY" -c "import textual, httpx" >/dev/null 2>&1; then
         echo "[T9] 聊天页缺少可选依赖 Textual/httpx。"
-        echo "     安装: python3 scripts/setup_tui_env.py"
-        echo "     或:   pip install -r packaging/requirements-tui.txt"
+        echo "     安装: python3 $SHELL_ROOT/scripts/setup_tui_env.py"
+        echo "     或:   pip install -r $SHELL_ROOT/requirements-tui.txt"
         echo "     管理 TUI（bjtu / start_tui.sh）不受影响。"
         exit 2
     fi
