@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -15,6 +16,9 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Input, Label, ListItem, ListView, Static
 
 from .catalog import scan
+from .config_check import env_status
+from .config_editor import ConfigEditor
+from .splash import SplashScreen
 
 KIND_ORDER = ["decision", "special-plan", "ticket-plan", "report", "guide", "reference", "other"]
 KIND_LABEL = {
@@ -38,6 +42,9 @@ class BookshelfApp(App):
     #card { height: auto; max-height: 45%; border: solid $accent; padding: 0 1; }
     #preview { border: solid $accent; padding: 0 1; }
     #query { dock: top; display: none; border: solid $accent; }
+    #splash-box { border: solid $accent; padding: 1 2; }
+    #editor-box { width: 92%; height: 92%; border: solid $accent; padding: 0 1; }
+    #editor-area { height: 1fr; }
     """
     BINDINGS = [
         ("q", "quit", "退出"),
@@ -47,15 +54,17 @@ class BookshelfApp(App):
         ("h", "history", "流转记录"),
         ("s", "stats", "馆藏统计"),
         ("v", "compare", "参数对照"),
+        ("e", "edit_config", "配置"),
         ("/", "focus_search", "检索台"),
         ("escape", "exit_search", "返回书架"),
         ("0", "clear_filter", "全部"),
         *[(str(i + 1), f"filter({i})", KIND_LABEL[kind]) for i, kind in enumerate(KIND_ORDER)],
     ]
 
-    def __init__(self, root: Path, **kwargs):
+    def __init__(self, root: Path, splash: bool | None = None, **kwargs):
         super().__init__(**kwargs)
         self.root = Path(root)
+        self._splash_arg = splash
         self.catalog: dict = {}
         self.filter_kind: str | None = None
         self.show_archive = False
@@ -88,7 +97,39 @@ class BookshelfApp(App):
 
     def on_mount(self) -> None:
         self.title = "Patchouli 书架"
-        self.action_reload()
+        use_splash = self._splash_arg if self._splash_arg is not None else not self.is_headless
+        if use_splash:
+            self.push_screen(SplashScreen("扫描文档树…"))
+            self.run_worker(self._load_async, thread=True, name="boot")
+        else:
+            self.action_reload()
+        self._check_env()
+
+    def _load_async(self) -> None:
+        self.call_from_thread(self._finish_load, scan(self.root, include_archive=True))
+
+    def _finish_load(self, catalog: dict) -> None:
+        self.catalog = catalog
+        self._apply_filter()
+        if len(self.screen_stack) > 1:  # 关闭 splash（加载完成即关，不额外等待）
+            self.pop_screen()
+
+    def _check_env(self) -> None:
+        try:
+            status = env_status(self.root)
+        except Exception:  # noqa: BLE001
+            return
+        if not status.get("exists"):
+            self.notify("未配置 docagent（缺 .env.docagent）：按 e 打开配置编辑（已预填模板）", severity="warning", timeout=12)
+
+    # ---- 配置编辑（写权限仅限 .env.docagent） ----
+    def action_edit_config(self) -> None:
+        self.push_screen(ConfigEditor(self.root), self._on_editor_closed)
+
+    def _on_editor_closed(self, result: dict | None) -> None:
+        if result and result.get("saved", {}).get("ok"):
+            self.notify("配置已保存（.env.docagent，已备份 .bak）", timeout=6)
+            self._check_env()
 
     # ---- data ----
     def action_reload(self) -> None:
@@ -330,8 +371,10 @@ class BookshelfApp(App):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Patchouli 书架 TUI（只读）")
     parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--no-splash", action="store_true", help="跳过启动动画")
     args = parser.parse_args(argv)
-    BookshelfApp(args.root.expanduser().resolve()).run()
+    splash = False if (args.no_splash or os.environ.get("PATCHOULI_NO_SPLASH") == "1") else None
+    BookshelfApp(args.root.expanduser().resolve(), splash=splash).run()
     return 0
 
 

@@ -1,7 +1,7 @@
 # Patchouli — 知识库/文档库管理 TUI（只读）
 
 > 设计与票分解见主仓 `docs/Patchouli知识库管理TUI专项计划-2026-09-14.md`。
-> 纪律：只读、零第三方依赖、fail-soft（未知格式不崩溃）。
+> 纪律：**除 `.env.docagent` 外只读**（配置编辑为唯一写路径，自动 .bak 备份）、零第三方依赖（除 Textual 本体）、fail-soft（未知格式不崩溃）。
 
 ## 现状
 
@@ -14,7 +14,7 @@
 | `PATCH-05` | 流通记录（git log --follow 时间线 + ±行统计） | ✅ 完成（2026-09-14） |
 | `PATCH-06` | 馆藏统计（状态行覆盖率/分类/月份/票号 Top/互链）+ 收口 | ✅ 完成（2026-09-14） |
 | `PATCH-07` | 检索增强：chunk→parent 映射（章节定位+全貌）+ rewrite/rerank 参数对照（`v` 键） | ✅ 完成（2026-09-14） |
-| `PATCH-08` | 启动动画（Claude Code 风格；**不延迟启动**硬约束） | 登记（2026-09-14） |
+| `PATCH-08` | 启动动画（并行加载**不延迟启动**）+ `.env.docagent` 检测引导与 TUI 内编辑（`e` 键） | ✅ 完成（2026-09-14） |
 
 ## 用法
 
@@ -24,8 +24,10 @@ python -m pip install -e tools/patchouli
 
 python -m patchouli --root <repo> --summary   # 馆藏摘要（分类/票号/缺状态行）
 python -m patchouli --root <repo> --json      # 全量结构化（qlh.patchouli.catalog.v1）
-python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · / 检索台 · 1-7 分类 · 0 全部 · a 归档 · c 编目诊断 · h 流转记录 · s 馆藏统计 · v 参数对照 · r 刷新 · q 退出）
+python -m patchouli.bookshelf --root <repo>   # 书架 TUI（↑↓ 选择 · / 检索台 · 1-7 分类 · 0 全部 · a 归档 · c 编目诊断 · h 流转记录 · s 馆藏统计 · v 参数对照 · e 配置编辑 · r 刷新 · q 退出）
 # 检索语法：纯文本（全文）｜ t:PATCH-01（票号）｜ k:report（类型）｜ s:缺（缺状态行）｜ a:（含归档）
+
+# 选项：--no-splash 跳过启动动画（或 PATCHOULI_NO_SPLASH=1）
 
 # 免安装 fallback
 python tools/patchouli/run.py summary --root <repo>
