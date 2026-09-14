@@ -6,11 +6,11 @@
 
 **面向异构边缘设备的多引擎、可演进分布式大模型推理系统**
 
-模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
+模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · TUI 主入口 · 边缘优化
 
 **v0.1.8.3**（更新日期：2026-09-14）
 
-> 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/archive/项目进展与下一步计划.md)**。
+> 📌 当前主线：[主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md)；当前支线：[支线开发计划：外置迁移与 Koakumix](docs/支线开发计划-外置迁移与Koakumix-2026-09-14.md)；历史能力快照：**[项目进展与下一步计划](docs/archive/项目进展与下一步计划.md)**。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 > 🧰 **刚克隆仓库？先看 [克隆后资产获取清单](#-克隆后资产获取清单)。**
@@ -50,10 +50,10 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🌐 **Tailscale 与双栈组网** | IPv4/IPv6 端点、手动入群和启动重连按“用户首选 → bootstrap → Tailnet”回退；显式连接的偏好会持久化。双机 IPv6 短任务已实测，IPv4-only/IPv6-only 安装包和真实 WSS/443 仍待环境验收 |
 | 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；系统凭据和首次安装联调后置 |
 | 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
-| 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
-| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（安装包内置 Textual，源码模式仍可隔离安装；见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
+| 🎛️ **控制面** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控；用户交互以 TUI 为主 |
+| 🖥️ **TUI 主入口** | `qlh chat` 面向本地/远端引擎；管理 TUI 负责节点、模型舰队、任务和状态；`qlh_edge` 提供最小 HTTP → [使用指南](docs/TUI使用指南.md) |
 | 🖼️ **图像能力边界** | 主项目保留图片上传、Gemma/Qwen 多模态理解和图生文，不提供图像生成或编辑，也不安装相关运行时与模型资产。生图唯一归属为 Koakumix `harness_workbench`，接口为 `/v1/images/generations`；旧 SD 计划只作历史记录。 |
-| 📱 **Android 客户端** | 普通版支持本地 GGUF/远程 PC、SAF、presence lease、Full Worker/Stage、Gemma4 mmproj/JNI 图像路径、更新/脱敏日志/连接诊断；极简版保留远程轻量入口。以上为本机/JVM/交叉编译开发门，真机与生产验收后置 |
+| 📱 **Android 客户端（支线）** | Android Full/Lite、SAF、Full Worker/Stage 和真机证据由独立端侧仓库维护；主仓只冻结任务、模型和能力合同 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
@@ -140,7 +140,9 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── 三种分布式拆分细化实施方案.md  # 层间待测试、任务链与张量并行实施方案
 │   ├── Android版本远期计划.md       # Android 端方案评估与规划
 │   ├── Android SAF模型存储方案.md   # Android SAF 外部模型目录方案
-│   ├── 总体下一步计划.md             # ★ 唯一总计划入口：L0-L5、生命周期、依赖与发布门
+│   ├── 主线开发计划-分布式推理与边缘优化-2026-09-14.md # ★ 当前主线基线
+│   ├── 支线开发计划-外置迁移与Koakumix-2026-09-14.md # ★ 当前支线基线
+│   ├── 总体下一步计划.md             # 历史总排期与计划索引
 │   ├── 项目进展与下一步计划.md       # ★ 能力、证据与原 P0/P1/P2 快照
 │   ├── 张量并行外部辅助与混合拆分调研方案.md  # ★ mesh 内 TP 不可行的量化论证 + 三条外部辅助路线
 │   ├── TP孤岛接入指南.md            # ★ 路线 A：孤岛=单逻辑高算力节点（PoC）
@@ -171,7 +173,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）
 ├── schemas/                       # ★ MODEL-FLEET 冻结契约（artifact/pull-job/deployment/profile JSON Schema）
 ├── fixtures/                      # 测试与走查 fixture（API 事件流、模型门样例）
-├── android/                       # Android 客户端（Kotlin + Jetpack Compose）
+├── android/                       # Android 支线迁移源（最终独立端仓库）
 │   ├── app/
 │   │   ├── build.gradle.kts       # Gradle 构建脚本（含 release 签名配置）
 │   │   └── src/main/java/com/qlh/inference/
@@ -185,7 +187,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 ├── .venv-packaging/               # 集显版打包专用 venv（torch CPU + PyInstaller）
 ├── .venv-packaging-cuda/          # 独显版打包专用 venv（torch CUDA + PyInstaller）
 ├── .venv-test/                    # 隔离测试环境（setup_test_env.py 创建；全量测试专用，勿装系统 Python）
-├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
+├── packaging/                     # 发布支线迁移源（最终独立 qlh-release）
 │   ├── launcher.py                # 主应用启动载荷（Tailscale → 模型检查 → 引擎选择 → 启动）
 │   ├── qlh_launcher.py            # ★ 独立 Bootstrap（GUI/TUI/更新，不导入推理依赖）
 │   ├── launcher_cybergothic.py    # CyberGothic 桌面壳：静态页 + /api 反向代理
@@ -209,7 +211,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   │   └── qlh-edge-inference.desktop  # 桌面入口
 │   ├── dist/                      # ★ 最终安装包输出目录（Git 忽略）
 │   └── README.md                  # 打包文档
-├── frontend_cybergothic/          # ★ 唯一产品前端（React + TypeScript + Vite）
+├── frontend_cybergothic/          # 产品壳迁移源（最终独立 qlh-shell）
 │   ├── src/                       # Chat / Models / RAG / Tasks / Account 等产品页面
 │   └── scripts/                   # 对比度与浏览器回归工具
 ├── harness_workbench/             # ★ 小模型 harness 工作台（独立子项目；不 import 主项目代码）
@@ -979,7 +981,7 @@ python serve.py
 - [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 历史验收记录；主项目实现已于 2026-09-14 裁撤，后续生图只在 Koakumix 演进
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/archive/SD%201.5引擎与分布式图像生成实施计划.md) — 历史验收记录；主项目实现已于 2026-09-14 裁撤，后续生图只在 Koakumix 演进
 - [微服务架构改造计划](docs/archive/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
 - [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 模型注册、Sidecar、导入/下载、部署模拟与本机产品面已收口；下载治理采用 HF 直连 → 用户代理 → ModelScope 回退，真实大工件、CUDA、跨 PC 分发和生产路由仍待验收
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式

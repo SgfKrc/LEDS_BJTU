@@ -1,5 +1,9 @@
 # QLH at a Glance (Newcomers · Reviewers Quick Entry)
 
+> 状态：**现行**
+>
+> 更新日期：2026-09-15
+
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
 > A 2-minute tour for newcomers; the full feature list, boundaries and evidence live in the [root README](../README.md) and specialized plans.

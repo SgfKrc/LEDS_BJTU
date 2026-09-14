@@ -1,5 +1,9 @@
 # reasonix-codex-bridge 主仓接线清单（2026-09-12）
 
+> 状态：**历史参考（已归档 2026-09-15）**
+>
+> 更新日期：2026-09-15
+
 > 用途：把 Codex、Reasonix CLI、profile 与 bridge workspace 的接线登记成可照抄步骤。
 > 本清单不记录 API key、token、完整 endpoint 或实际 provider 凭据；模型 ref 由目标机 `reasonix doctor` 选择。
 

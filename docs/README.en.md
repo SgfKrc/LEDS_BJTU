@@ -1,5 +1,9 @@
 # QLH — Lightweight Distributed Edge LLM Inference
 
+> 状态：**现行**
+>
+> 更新日期：2026-09-15
+
 > **Language**: [English](README.en.md) · [简体中文](../README.md)
 
 **A multi-engine, evolvable distributed LLM inference system for heterogeneous edge devices.**
