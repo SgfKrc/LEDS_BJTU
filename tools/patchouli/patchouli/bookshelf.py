@@ -44,6 +44,7 @@ class BookshelfApp(App):
         ("r", "reload", "刷新"),
         ("a", "toggle_archive", "归档"),
         ("c", "diag", "编目诊断"),
+        ("h", "history", "流转记录"),
         ("/", "focus_search", "检索台"),
         ("escape", "exit_search", "返回书架"),
         ("0", "clear_filter", "全部"),
@@ -63,6 +64,10 @@ class BookshelfApp(App):
         self.mode = "shelf"
         self.search_results: list[dict] = []
         self.search_query = ""
+        self.current_path: str | None = None
+        self.history_text = ""
+        self.history_shown = False
+        self._last_index = 0
 
     # ---- layout ----
     def compose(self) -> ComposeResult:
@@ -112,6 +117,7 @@ class BookshelfApp(App):
             preview.update("")
             self.preview_text = ""
             return
+        self.current_path = entry["path"]
         rows = [
             f"标题: {entry['title'] or entry['name']}",
             f"路径: {entry['path']}",
@@ -132,6 +138,8 @@ class BookshelfApp(App):
 
     # ---- events / actions ----
     def _pick(self, index: int) -> None:
+        self._last_index = index
+        self.history_shown = False
         if self.mode == "search":
             self._show_result(index)
         elif 0 <= index < len(self.entries):
@@ -203,6 +211,7 @@ class BookshelfApp(App):
         from .search import context_snippet
 
         result = self.search_results[index]
+        self.current_path = result["path"]
         loc = f"L{result['line_no']}" if result["line_no"] else "文件名命中"
         card.update("\n".join([
             f"查询: {self.search_query}",
@@ -211,6 +220,35 @@ class BookshelfApp(App):
             f"命中: {loc}",
         ]))
         preview.update(context_snippet(self.root, result["path"], result["line_no"]))
+
+    # ---- PATCH-05 流通记录 ----
+    def action_history(self) -> None:
+        if self.history_shown:
+            self.history_shown = False
+            self._pick(self._last_index)
+            return
+        if not self.current_path:
+            return
+        preview = self.query_one("#preview", Static)
+        preview.update("流通记录读取中（git log）…")
+        path = self.current_path
+        self.run_worker(lambda: self._run_history(path), thread=True, name="history")
+
+    def _run_history(self, path: str) -> None:
+        from .history import file_history  # 延迟导入
+
+        self.call_from_thread(self._render_history, path, file_history(self.root, path))
+
+    def _render_history(self, path: str, result: dict) -> None:
+        from .history import render_history
+
+        self.history_text = render_history(result, path)
+        self.history_shown = True
+        self.query_one("#preview", Static).update(self.history_text)
+        if result.get("ok"):
+            self.sub_title = f"流通记录 · {len(result.get('commits', []))} 次提交"
+        else:
+            self.sub_title = "流通记录不可用（h 返回）"
 
     # ---- PATCH-04 编目诊断 ----
     def action_diag(self) -> None:
