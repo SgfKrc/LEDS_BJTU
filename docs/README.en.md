@@ -8,11 +8,11 @@
 
 **A multi-engine, evolvable distributed LLM inference system for heterogeneous edge devices.**
 
-Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Multi-terminal collaborative inference · Visual monitoring · External-compute assistance
+Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Distributed inference · TUI-first edge operation
 
 **v0.1.8.3** (updated 2026-08-23)
 
-> 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** (Chinese).
+> 📌 Current mainline: **[Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)**; side lines: **[Externalization & Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md)**; historical snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)**.
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
 > Scope: capability overview, quick start and documentation index; the authoritative capability boundary lives in the specialized plans, source code and tests. Specialized documentation is currently in Chinese.
 
@@ -47,10 +47,10 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🌐 **Tailscale & dual stack** | IPv4/IPv6 endpoints, manual cluster join and reconnect fall back as “user preference → bootstrap → Tailnet”; explicit successful connects persist the preference. A short dual-machine IPv6 task is verified; IPv4-only/IPv6-only installers and real WSS/443 remain environment acceptance work |
 | 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; OS credential and first-install integration remain deferred |
 | 📦 **Install, update & offline bundle** | Independent Launcher signing/update/rollback, download progress and diagnostics are implemented. The offline bundle provides capacity preflight, SHA/manifest, atomic ZIP, 7z/split output and restore validation; real full bundles, empty-root/Android SAF import and cross-platform install acceptance are deferred |
-| 🎛️ **Admin panel** | Node register/deregister, layer overrides, role transfer, spare master, TCP status |
-| 🖥️ **TUI** | Terminal admin menu, zero-dependency stdlib; `bjtu chat` built-in Textual chat page |
+| 🎛️ **Control plane** | Node register/deregister, layer overrides, role transfer, spare master, TCP status; operated primarily through TUI |
+| 🖥️ **TUI-first entry** | `qlh chat` for local/remote inference, model fleet and cluster status; `qlh_edge` provides the minimal HTTP surface |
 | **Multimodal input** | Main QLH keeps image upload and Gemma/Qwen image understanding; generation/editing and image assets belong to Koakumix |
-| 📱 **Android client** | Standard supports local GGUF/remote PC, SAF, presence lease, Full Worker/Stage, Gemma4 mmproj/JNI image path, update/redacted logs/connection diagnostics; Lite is the remote lightweight entry. These are local/JVM/cross-build gates, with device and production acceptance deferred |
+| 📱 **Android client (side line)** | Android Full/Lite, SAF, Full Worker/Stage and real-device evidence are maintained by the external shell/device project; QLH freezes only task, model and capability contracts |
 | 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
 | 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |

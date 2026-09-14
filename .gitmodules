@@ -10,3 +10,6 @@
 [submodule "packages/spawnledger"]
 	path = packages/spawnledger
 	url = https://github.com/SgfKrc/spawnledger.git
+[submodule "harness_workbench"]
+	path = harness_workbench
+	url = https://github.com/SgfKrc/Koakumix.git
