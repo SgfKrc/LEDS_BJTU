@@ -3,7 +3,7 @@
 > 状态：现行（随两端开发持续更新）
 >
 > 更新日期：2026-08-23
-> 适用范围：Android Full/Lite 相对 PC 版（Windows/Linux 主节点）缺失功能的**全面排查清单**，供排期与任务分配使用；能力现状依据 [Android 版本远期计划](Android版本远期计划.md)（2026-07-28 基线 + C5 真机验收）、README 与源码
+> 适用范围：Android Full/Lite 相对 PC 版（Windows/Linux 主节点）缺失功能的**全面排查清单**，供排期与任务分配使用；能力现状依据 [Android 版本远期计划](archive/Android版本远期计划.md)（2026-07-28 基线 + C5 真机验收）、README 与源码
 
 > 本次接口复核补充：Android HTTP 控制面已覆盖登录/会话、聊天、远程 SD、主节点 GGUF Range/SHA 下载、bootstrap 和带 lease 的 presence；Android Full Worker 已进入 PC scheduler 准入门，并已用可注入 executor 接入任务图 Stage contract；Full 原生构建已接入 Gemma4 `mtmd` projector/图像路径（fake/journal/JVM/交叉编译开发回归通过）。旧 `frontend/` 已冻结；PC 管理面缺口以 `frontend_cybergothic` 为唯一目标，详见《前端安卓后端接口与功能缺口审查-2026-08-22》。
 >

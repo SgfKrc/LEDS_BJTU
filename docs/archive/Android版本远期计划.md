@@ -4,7 +4,7 @@
 >
 > 状态：历史架构基线 + 远期技术预研（Android Full Worker 与 TaskGraph Stage 接线已完成本机开发门；真机完整推理、认证、长时与设备资源验收仍后置）
 >
-> 适用范围：保留 Android Full/Lite、完整 Worker、任务链、GPU 后端与层段拆分的架构边界和远期路线；本文不再作为 Android 当前功能状态的唯一来源，现行排期以[安卓与PC功能差距清单](安卓与PC功能差距清单.md)和[总体下一步计划](总体下一步计划.md)为准
+> 适用范围：保留 Android Full/Lite、完整 Worker、任务链、GPU 后端与层段拆分的架构边界和远期路线；本文不再作为 Android 当前功能状态的唯一来源，现行排期以[安卓与PC功能差距清单](../安卓与PC功能差距清单.md)和[总体下一步计划](../总体下一步计划.md)为准
 >
 > 当前事实：Android Full 已具备本地 GGUF/llama.cpp 推理，以及受模型身份、资源门和租约围栏约束的完整 Worker/TaskGraph Stage 代码路径；Lite 保持薄客户端；Android 仍不能加入现有 PC PyTorch 层间流水线
 >
@@ -12,7 +12,7 @@
 >
 > 2026-08-23 状态映射：下文 P1/P2 的原始设计已完成本机开发门，保留以说明协议和运行时边界；P3-P5 仍为未实施的候选路线，不得因 P1/P2 完成而推断 Android 可参与 PyTorch 层拆分或已通过真机验收。
 >
-> 关联文档：[Android SAF模型存储方案](Android%20SAF模型存储方案.md)、[PC与Android端交互体验优化计划](archive/PC与Android端交互体验优化计划.md)、[分布式推理流水线实施计划](分布式推理流水线实施计划.md)、[混合分布式推理体系规划](archive/混合分布式推理体系规划.md)、[三种分布式拆分细化实施方案](三种分布式拆分细化实施方案.md)
+> 关联文档：[Android SAF模型存储方案](Android%20SAF模型存储方案.md)、[PC与Android端交互体验优化计划](archive/PC与Android端交互体验优化计划.md)、[分布式推理流水线实施计划](../分布式推理流水线实施计划.md)、[混合分布式推理体系规划](archive/混合分布式推理体系规划.md)、[三种分布式拆分细化实施方案](../三种分布式拆分细化实施方案.md)
 
 ---
 
@@ -98,7 +98,7 @@ Android Full 使用 GGUF + llama.cpp。其公开 API 面向完整 decode，量�
 | 会话页 | `SessionListScreen` 改为卡片式 |
 | 设置页 | `SettingsScreen` 重排为 8 个分组卡片；36 个参数、回调、`testTag` 与极简版分支全部保留 |
 
-详细逐页说明见 [Android UI 改进说明](../android/UI改进说明.md)。
+详细逐页说明见 [Android UI 改进说明](../../android/UI改进说明.md)。
 
 **验收状态：已验收（2026-08-13 真机实测）。** 2026-07-28 已执行 `gradlew.bat :app:compileFullDebugKotlin` 并成功通过资源处理、KSP 与 Kotlin 编译；Full Release APK 已在真机多轮安装运行，暗色模式对比度与长消息气泡限宽均已目视核对通过。安全前缀默认暗色（0xFF171D23）与隐藏 token 的 `无明文` 占位、StatusChip "本地推理/远程推理" 显示均已核验。
 
@@ -499,12 +499,12 @@ OpenCL 当前有最明确的上游 Android/Adreno 验证记录，因此建议优
 
 本次结论以项目当前源码和仓库内锁定的 llama.cpp 上游快照为主要依据：
 
-- [Android presence 能力上报](../android/app/src/main/java/com/qlh/inference/MainViewModel.kt)：当前固定上报 `pipeline_worker=false`。
-- [Android JNI 模型加载](../android/app/src/main/cpp/qlh_llama_jni.cpp)：当前固定 `n_gpu_layers=0`。
-- [Android CMake 配置](../android/app/src/main/cpp/CMakeLists.txt)：当前未启用 OpenCL、Vulkan 或 RPC backend。
-- [锁定快照的 Android 文档](../android/app/src/main/cpp/llama.cpp/docs/android.md)：Android Studio binding、NDK 交叉编译与 Arm CPU 能力。
-- [锁定快照的 OpenCL 文档](../android/app/src/main/cpp/llama.cpp/docs/backend/OPENCL.md)：Android/Adreno 支持、已验证 Snapdragon/Adreno 型号和构建方法。
-- [锁定快照的 RPC 文档](../android/app/src/main/cpp/llama.cpp/tools/rpc/README.md)：远端 GGML device、权重/KV 分布、tensor cache，以及 POC/不安全警告。
+- [Android presence 能力上报](../../android/app/src/main/java/com/qlh/inference/MainViewModel.kt)：当前固定上报 `pipeline_worker=false`。
+- [Android JNI 模型加载](../../android/app/src/main/cpp/qlh_llama_jni.cpp)：当前固定 `n_gpu_layers=0`。
+- [Android CMake 配置](../../android/app/src/main/cpp/CMakeLists.txt)：当前未启用 OpenCL、Vulkan 或 RPC backend。
+- [锁定快照的 Android 文档](../../android/app/src/main/cpp/llama.cpp/docs/android.md)：Android Studio binding、NDK 交叉编译与 Arm CPU 能力。
+- [锁定快照的 OpenCL 文档](../../android/app/src/main/cpp/llama.cpp/docs/backend/OPENCL.md)：Android/Adreno 支持、已验证 Snapdragon/Adreno 型号和构建方法。
+- [锁定快照的 RPC 文档](../../android/app/src/main/cpp/llama.cpp/tools/rpc/README.md)：远端 GGML device、权重/KV 分布、tensor cache，以及 POC/不安全警告。
 - [Android 官方 NDK Vulkan 文档](https://developer.android.com/ndk/guides/graphics/getting-started)。
 - [Android 官方 Vulkan 设备兼容文档](https://developer.android.com/games/develop/vulkan/device-compatibility)。
 - [llama.cpp 上游 OpenCL 文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENCL.md)。
