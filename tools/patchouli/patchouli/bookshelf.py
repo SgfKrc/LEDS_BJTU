@@ -45,6 +45,7 @@ class BookshelfApp(App):
         ("a", "toggle_archive", "归档"),
         ("c", "diag", "编目诊断"),
         ("h", "history", "流转记录"),
+        ("s", "stats", "馆藏统计"),
         ("/", "focus_search", "检索台"),
         ("escape", "exit_search", "返回书架"),
         ("0", "clear_filter", "全部"),
@@ -67,6 +68,8 @@ class BookshelfApp(App):
         self.current_path: str | None = None
         self.history_text = ""
         self.history_shown = False
+        self.stats_text = ""
+        self.stats_shown = False
         self._last_index = 0
 
     # ---- layout ----
@@ -140,18 +143,21 @@ class BookshelfApp(App):
     def _pick(self, index: int) -> None:
         self._last_index = index
         self.history_shown = False
+        self.stats_shown = False
         if self.mode == "search":
             self._show_result(index)
         elif 0 <= index < len(self.entries):
             self._show_entry(self.entries[index])
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.item is not None:
-            self._pick(event.item.index)
+        index = self.query_one("#shelf", ListView).index
+        if index is not None:
+            self._pick(index)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.item is not None:
-            self._pick(event.item.index)
+        index = self.query_one("#shelf", ListView).index
+        if index is not None:
+            self._pick(index)
 
     def action_clear_filter(self) -> None:
         self.filter_kind = None
@@ -220,6 +226,20 @@ class BookshelfApp(App):
             f"命中: {loc}",
         ]))
         preview.update(context_snippet(self.root, result["path"], result["line_no"]))
+
+    # ---- PATCH-06 馆藏统计 ----
+    def action_stats(self) -> None:
+        if self.stats_shown:
+            self.stats_shown = False
+            self._pick(self._last_index)
+            return
+        from .stats import compute_stats, render_stats
+
+        self.stats_text = render_stats(compute_stats(self.catalog))
+        self.stats_shown = True
+        self.history_shown = False
+        self.query_one("#preview", Static).update(self.stats_text)
+        self.sub_title = "馆藏统计（s 返回）"
 
     # ---- PATCH-05 流通记录 ----
     def action_history(self) -> None:

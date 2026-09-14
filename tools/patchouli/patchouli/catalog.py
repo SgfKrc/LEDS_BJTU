@@ -25,6 +25,7 @@ _KIND_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("reference", re.compile(r"(架构|原理|接口|标准|速览|At-a-Glance|README)")),
 )
 _TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,7}(?:-[A-Z0-9]+){1,5})\b")
+_TICKET_BLOCKLIST = {"SHA", "UTF", "MD", "RFC", "ISO", "HTTP", "HTTPS", "AES", "RSA", "CRC", "UUID"}
 _LINK_RE = re.compile(r"\]\(([^)]+\.md)\)")
 _STATUS_RE = re.compile(r"^>\s*(?:文档)?状态[：:]\s*(.+?)\s*$", re.MULTILINE)
 _UPDATED_RE = re.compile(r"^>\s*更新日期[：:]\s*(\d{4}-\d{2}-\d{2})", re.MULTILINE)
@@ -70,7 +71,9 @@ def parse_document(path: Path, root: Path) -> dict[str, Any]:
     updated = _UPDATED_RE.search(text)
     if updated:
         entry["updated"] = updated.group(1)
-    entry["tickets"] = sorted(set(_TICKET_RE.findall(text)))
+    entry["tickets"] = sorted(
+        value for value in set(_TICKET_RE.findall(text)) if value.split("-", 1)[0] not in _TICKET_BLOCKLIST
+    )
     entry["link_count"] = len(_LINK_RE.findall(text))
     if entry["title"] is None:
         entry["errors"].append("no-h1-title")
