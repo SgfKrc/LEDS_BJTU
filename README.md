@@ -156,7 +156,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
 │   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx；安装包内置，源码可选）
 │   ├── tui_sse.py / tui_shared.py # T9 SSE 增量解析器与共享层（端点/命令/metrics）
-│   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存页管理、动态分配）
+│   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存热页；可选磁盘冷页）
 │   ├── tcp_comm.py                # TCP主从通信（长连接、心跳、封包解包、张量序列化）
 │   ├── scheduler.py               # 任务调度（节点管理、层分配、流水线控制、请求队列）
 │   ├── graph_orchestrator.py      # ★ 图算法智能编排（最大带宽生成树 + DFS 路径搜索）
@@ -1040,6 +1040,7 @@ python serve.py
 - [reasonix-codex-bridge Harness 工具扩展与能力补齐排期](docs/reasonix-codex-bridge-Harness工具扩展与能力补齐排期-2026-09-13.md) — 本机 Reasonix capability 调研与 EXEC/NET/LOOP/EVT/ACP/MESSAGE 票排期；`TOOL-RXB-EXEC-01`、`TOOL-RXB-NET-01`、`TOOL-RXB-NET-02` 与 `TOOL-RXB-LOOP-01` 已完成，搜索票在本机按 provider unavailable 门控，阶段编排保持主 agent 显式推进
 - [reasonix-codex-bridge 工具面现状与能力归属](docs/reasonix-codex-bridge工具面现状-2026-09-13.md) — `reasonix doctor` 曾发现 profile 中 `git_log`/`git_diff` 为未知工具身份，现已由 `TOOL-RXB-TOOL-01` 收敛并验证归零；`web_fetch` 归 Reasonix，`web_search` 归 provider 并由 `providerSearch` fail-closed 门控；LOOP-01 阶段标记已接入 status/job/checkpoint
 - [DeepSeek 缓存机制借鉴与 QLH 落地专项计划](docs/缓存机制专项计划-2026-09-13.md) — 登记 V4.1 磁盘上下文缓存与 SWA 单元匹配机制（三种持久化时机、hit/miss 25–50× 差价、KV 1/4 HBM 与 1/8 SSD），对照 `paged_kv_cache`/harness/bridge 现状，给出前缀稳定性与命中观测（零成本）、两级缓存与单元对齐（工程改造）、架构级压缩（仅跟踪）三档动作与 `CACHE-01`～`CACHE-06` 票
+- [CACHE-05 非对称分工论证](docs/非对称分工论证-2026-09-14.md) — DeepSeek 输入/输出非对称仅作架构参考；QLH 以 draft-verify 与亚 1B 岗位化定义可验证控制变量、指标和停止规则
 - [reasonix-codex-bridge 全面审计与多次实测报告](docs/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md) — 真实覆盖 MCP 控制面、inspect、plan、受控写入/回滚、checkpoint/resume、ACP-06、命名命令执行、Reasonix 原生 `web_fetch` 与 provider 搜索不可用门控；结论为可作为受限文件型低价替代，跨进程 ACP 恢复、自主多阶段编排和 provider 搜索接通验收仍待后续
 - [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
