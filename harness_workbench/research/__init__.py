@@ -24,6 +24,14 @@ from .context_measure import (
     build_context_measure_report,
     run_context_measure,
 )
+from .role_asymmetry import (
+    ROLE_ASYMMETRY_SCHEMA,
+    RoleAssignment,
+    RoleAsymmetryReport,
+    RoleComparison,
+    RoleHypothesis,
+    build_role_asymmetry_report,
+)
 
 __all__ = [
     "DEFAULT_MODEL_IDS",
@@ -46,4 +54,10 @@ __all__ = [
     "build_context_measure_fixture",
     "build_context_measure_report",
     "run_context_measure",
+    "ROLE_ASYMMETRY_SCHEMA",
+    "RoleAssignment",
+    "RoleAsymmetryReport",
+    "RoleComparison",
+    "RoleHypothesis",
+    "build_role_asymmetry_report",
 ]

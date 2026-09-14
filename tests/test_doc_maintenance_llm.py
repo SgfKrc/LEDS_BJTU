@@ -37,7 +37,7 @@ def test_deepseek_requires_explicit_complete_configuration(tmp_path):
     env_path = tmp_path / ".env.docagent"
     env_path.write_text(
         "DOCAGENT_DEEPSEEK_BASE_URL=https://example.invalid/v1\n"
-        "DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash\n"
+        "DOCAGENT_DEEPSEEK_MODEL=deepseek-flash\n"
         "DOCAGENT_DEEPSEEK_API_KEY=sk-super-secret-key\n",
         encoding="utf-8",
     )
@@ -53,7 +53,7 @@ def test_deepseek_then_ollama_when_explicit_and_complete(tmp_path):
     env_path.write_text(
         "DOCAGENT_PROVIDER=deepseek\n"
         "DOCAGENT_DEEPSEEK_BASE_URL=https://example.invalid/v1\n"
-        "DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash\n"
+        "DOCAGENT_DEEPSEEK_MODEL=deepseek-flash\n"
         "DOCAGENT_DEEPSEEK_API_KEY=sk-super-secret-key\n",
         encoding="utf-8",
     )
@@ -66,7 +66,7 @@ def test_opencode_provider_name_uses_existing_remote_configuration(tmp_path):
     env_path.write_text(
         "DOCAGENT_PROVIDER=opencode\n"
         "DOCAGENT_DEEPSEEK_BASE_URL=https://example.invalid/v1\n"
-        "DOCAGENT_DEEPSEEK_MODEL=deepseek-v4-flash\n"
+        "DOCAGENT_DEEPSEEK_MODEL=deepseek-flash\n"
         "DOCAGENT_DEEPSEEK_API_KEY=sk-super-secret-key\n",
         encoding="utf-8",
     )

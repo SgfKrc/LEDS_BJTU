@@ -1,6 +1,6 @@
 # Harness 上下文压缩实现核查与摘要模型必要性
 
-> 状态：**调研完成**（实现核查：上下文压缩为纯规则实现，无任何模型参与；结论：**"专用压缩小模型"作为独立目标没有必要**；值得做的是"把现成小模型接成 summarizer 角色 + A/B 度量"，且已有规划票承接）
+> 状态：**调研完成，HW-SUMM-01 首增量已落地**（实现核查：默认上下文压缩仍为纯规则；可选的 Qwen3-0.6B summarizer 已通过 adapter 注入实现；结论：**"专用压缩小模型"作为独立目标没有必要**，仍需 A/B 度量后再决定是否启用）
 >
 > 创建日期：2026-09-09
 > 适用范围：harness `context_engine/` 的摘要/折叠路径与记忆抽取的现状与演进建议；不涉及主项目判题/工具支线。关联票：[HW-CTX-SQZ-01](开发票计划-审计收口与答辩演示-2026-09-09.md)（上下文压榨）、`EX-CTX-MEAS-01`/`TOOL-CTX-RESS-01`（测度与压力测试）。
@@ -12,14 +12,15 @@
 | 位置 | 实现 | 模型参与 |
 |---|---|---|
 | `context_engine/summarize.py` — `SummaryProvider`（Protocol） | 摘要提供者接口：`summarize(messages) -> SummaryResult`（含 STATE 校验/渲染，模型无关） | —（接口层） |
-| `context_engine/summarize.py` — `RuleBasedSummarizer`（**唯一实现**） | 确定性规则：按角色归类（user→`what`、输出→`artifacts`、assistant→`decisions`、其他→`open`），每字段 ≤4 条 × 160 字符；`next` 记录"review omitted messages: N"；`source_message_ids` 溯源 | **无**（纯规则，docstring 自注"used before a dedicated summary model exists"） |
+| `context_engine/summarize.py` — `RuleBasedSummarizer` | 确定性规则：按角色归类（user→`what`、输出→`artifacts`、assistant→`decisions`、其他→`open`），每字段 ≤4 条 × 160 字符；`next` 记录"review omitted messages: N"；`source_message_ids` 溯源 | **无**（默认 fallback） |
+| `context_engine/summarize.py` — `LLMSummarizer` | 经注入的 `ChatAdapter.complete()` 请求 Qwen3-0.6B 角色，解析严格 STATE JSON；adapter/超时/JSON/schema/边界失败统一回退规则摘要并产出 `context.summary_fallback` | **可选**（不默认启用） |
 | `context_engine/policy.py` | `ContextPolicyConfig.summarizer: SummaryProvider = default_factory(RuleBasedSummarizer)`；折叠触发时 `_summarize(old_messages, current_state)`，STATE 经 `validate_state`/`apply_state_patch`（未知字段拒绝、删除需显式确认——防小模型注入的护栏已就位） | 无 |
 | `memory/extract.py` | `extract_memory_candidates(summary, ...)`：从 SummaryResult 的规范化 STATE 抽取候选（显式候选 + 摘要字段清洗/去重标记），**同样无模型** | 无 |
 | `adapters/`、`api_layer/` | 无任何 summarize/sub-summary 调用 | 无 |
 
-**结论**：harness 的上下文压缩 = **确定性规则压缩**（安全、零成本、零幻觉，但信息保留粗糙）；**没有用任何模型做摘要，更没有专门用来压缩的小模型**。
+**结论**：harness 的默认上下文压缩 = **确定性规则压缩**（安全、零成本、零幻觉，但信息保留粗糙）；现在有可选的模型摘要角色，但**没有专门训练的压缩小模型**，也没有把未经度量的 LLM 摘要设为默认。
 
-**与 S1 方案设计的差异**（需登记）：S1 设计原文写"摘要 call（结构化 STATE 输出；大模型优先、同模型回退并标记）"——实现只落地了"无模型回退"（RuleBased），**LLM 摘要 call 从未实现**；`SummaryProvider` 协议与 STATE 校验护栏（validate_state/apply_state_patch）是为它预留的插槽，且针对"小模型压缩"的防注入设计已就绪。
+**与 S1 方案设计的差异**（已在 `HW-SUMM-01` 收口）：LLM 摘要 call 通过 `LLMSummarizer` 接入，但仍是显式注入能力；默认仍是 `RuleBased`，且模型输出必须通过 STATE schema、长度边界和 fallback notice 门禁。`SummaryProvider` 协议与 `validate_state/apply_state_patch` 护栏继续作为模型无关边界。
 
 ## 2. "专用压缩小模型"是否有必要
 
@@ -39,12 +40,13 @@
 3. **"专门"的价值应来自角色分工而非专用模型**：用现成 0.6B 当 `summarizer`（专用角色、不训练），保留规则压缩为 fallback；质量差异用 A/B 度量（`EX-CTX-MEAS-01` 的早召回-预算曲线）验证——**用数据决定是否继续**，不给模型承诺。
 4. **护栏复用**：`validate_state`/`apply_state_patch` 已针对"小模型压缩输出不可信"实现（未知字段拒绝、删除显式确认、字段类型/长度边界），LLM 摘要器接入无需新安全设计。
 
-## 3. 建议（登记为规划，不在此落地）
+## 3. 后续建议
 
-1. `HW-CTX-SQZ-01` 首增量：实现 `LLMSummarizer(SummaryProvider)`——调用 harness 现有 chat 路径（本地 llama_server/qlh 后端无所谓），**summarizer 角色固定为 Qwen3-0.6B**（配置可换），输出 JSON STATE → `validate_state` 校验 → 失败/超时/非法 JSON **fail-closed 回退 RuleBasedSummarizer** 并发出 `context.summary_fallback` notice；
+1. `HW-SUMM-01` 已完成首增量：`LLMSummarizer(SummaryProvider)` 调用 harness 现有 chat adapter，**summarizer 角色默认标识为 Qwen3-0.6B**（配置可换），输出 JSON STATE → 边界与 `validate_state` 校验 → 失败/超时/非法 JSON **fail-closed 回退 RuleBasedSummarizer** 并发出 `context.summary_fallback` notice；
 2. `EX-CTX-MEAS-01`/`TOOL-CTX-RESS-01`：A/B（RuleBased vs 0.6B-summarizer）× 30 轮 fixture → 早召回-预算曲线 + 摘要覆盖错误率；**只有度量通过才把 summarizer 角色设为默认**；
-3. 设计差异收口：在 harness 方案文档 S1 实施记录补一行"LLM 摘要 call 未实现（规划中，见本调研）"，避免"摘要已完成"的误读。
+3. 设计差异收口：在 harness 方案文档 S1 实施记录明确默认规则摘要不变，LLM 摘要器由 `HW-SUMM-01` 显式注入，避免把默认 STATE 摘要误读为自动模型调用。
 
 ## 4. 变更记录
 
 - 2026-09-09：初版（实现核查 + 必要性结论 + 建议与关联票）
+- 2026-09-14：完成 `HW-SUMM-01` 首增量（可替换 adapter、严格 STATE JSON、超时/异常/非法输出 fallback 与 `context.summary_fallback` notice）；默认仍为规则摘要，真实模型质量 A/B 后置。

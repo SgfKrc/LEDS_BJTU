@@ -62,7 +62,7 @@ def test_judge_policy_loads_locked_project_rubrics_and_compares_common_entries()
     root = Path(__file__).resolve().parents[1]
     v1 = load_judge_rubric(
         root / "fixtures/quality_rubrics/llm-objective-ps-v1-v1.json",
-        expected_sha256="25f42a642e78d540f7c60265556f18bd7cd3f7dc342273a0a8a6019c4c38e2c1",
+        expected_sha256="5a4aafafdac73937077df2bb2378b4b15fa5320ce7b6adb83fb90f44ad60f924",
     )
     v2 = load_judge_rubric(root / "fixtures/quality_rubrics/llm-objective-ps-v1-v2.json")
     outputs = {

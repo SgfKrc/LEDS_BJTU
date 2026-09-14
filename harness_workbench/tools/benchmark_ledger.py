@@ -34,6 +34,11 @@ _ABSOLUTE_PATH = re.compile(r"(?:^[A-Za-z]:[\\/]|^[A-Za-z]:|^/|^\\\\)")
 _IP_TEXT = re.compile(r"(?<![0-9A-Fa-f:.])(?:[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2,})(?![0-9A-Fa-f:.])")
 _SECRET_KEYS = frozenset({"token", "secret", "password", "authorization", "api_key", "private_key"})
 _VOLATILE_KEYS = frozenset({"created_at", "generated_at", "timestamp", "started_at", "ended_at"})
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_SOURCE_REFS = (
+    Path("fixtures/benchmark/defense-benchmark-v1.json"),
+    Path("scripts/demo/real-model-performance-not-run.json"),
+)
 
 
 def _canonical(value: Any) -> bytes:
@@ -450,10 +455,7 @@ def load_benchmark_payload(path: str | Path, *, source_ref: str | None = None) -
 
 
 def _default_sources() -> tuple[Path, ...]:
-    candidates = (
-        Path("build/defense-benchmark/latest.json"),
-        Path("scripts/demo/real-model-performance-not-run.json"),
-    )
+    candidates = tuple(_REPOSITORY_ROOT / path for path in _DEFAULT_SOURCE_REFS)
     return tuple(path for path in candidates if path.is_file())
 
 
@@ -465,6 +467,7 @@ def run_benchmark_ledger(
 ) -> BenchmarkLedgerReport:
     if paths and root is not None:
         raise ValueError("provide input paths or root, not both")
+    using_defaults = not paths and root is None
     if root is not None:
         root_path = Path(root)
         source_paths = tuple(sorted(root_path.rglob("*.json")))
@@ -477,7 +480,8 @@ def run_benchmark_ledger(
     ignored: list[str] = []
     for path in source_paths:
         try:
-            records.extend(load_benchmark_payload(path))
+            source_ref = path.relative_to(_REPOSITORY_ROOT).as_posix() if using_defaults else None
+            records.extend(load_benchmark_payload(path, source_ref=source_ref))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             if strict:
                 raise ValueError(f"{path}: {exc}") from exc

@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from api_errors import coded_http_error
 from model_api_access import require_model_api_source
+from inference_service.kv_host import KVCapacityError, KVCleanupError
 from diffusion import (
     DiffusionBlobInUseError,
     DiffusionBlobReferencedError,
@@ -955,19 +956,38 @@ def worker_stage(req: WorkerStageRequest, request: Request):
 # ----------------------------------------------------------------------
 @router.post("/kv/init")
 async def kv_init(req: KVInitRequest, request: Request):
+    require_model_api_source(request)
     kv_host = _kv_host(request)
-    return kv_host.init(
-        task_id=req.task_id,
-        device=req.device,
-        page_size=req.page_size,
-        max_pages=req.max_pages,
-    )
+    try:
+        return kv_host.init(
+            task_id=req.task_id,
+            device=req.device,
+            page_size=req.page_size,
+            max_pages=req.max_pages,
+            cold_cache_dir=req.cold_cache_dir,
+            cold_max_pages=req.cold_max_pages,
+            cache_unit_size=req.cache_unit_size,
+        )
+    except KVCapacityError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/kv/free")
 async def kv_free(req: KVFreeRequest, request: Request):
+    require_model_api_source(request)
     kv_host = _kv_host(request)
     try:
         return kv_host.free(task_id=req.task_id)
+    except KVCleanupError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "KV_CLEANUP_FAILED",
+                "message": str(exc),
+                "task_id": exc.task_id,
+            },
+        ) from exc
     except KeyError:
         raise HTTPException(status_code=404, detail=f"未知任务: {req.task_id}")

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "koakumix"
+version = "0.1.0"
+description = "Koakumix — local small-model harness workbench (prefix-cache-first enhancement layer)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = []
+
+[project.optional-dependencies]
+tui = ["textual>=8.2"]
+
+[project.scripts]
+koakumix = "harness_workbench.cli:main"
+
+[tool.setuptools]
+package-dir = { "harness_workbench" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["harness_workbench*"]
+namespaces = true

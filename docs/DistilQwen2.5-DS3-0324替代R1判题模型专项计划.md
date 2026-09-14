@@ -124,6 +124,17 @@
 
 **下一步**：① 对 DS3 v2 结果补做计划中的人工复核（重点是 math 题，quality unit 不落输出）；② 按 `EX-QW3V2-01` 的 1/4、7/11 基线复核 DS3 的 2/4、8/11 优势；③ 口径规则修订按 EX-N3 流程独立登记，不搭车本计划。
 
+### 6.3 Qwen3.5-9B-DeepSeek-V4-Flash 参考标定（HW-DSV4-9B-EVAL-01，2026-09-14，主节点）
+
+**执行**：`Jackrong/Qwen3.5-9B-DeepSeek-V4-Flash-GGUF` Q4_K_M（SHA `9be227448d319e6a7acca8056b71bf7d9a2c6b2811986e6658a9dedc208d0ada`，架构 `qwen35`、ctx 262144）；口径完全沿用 `EX-QW3V2-01` v2（`ps-qwen3-nothink` raw 提示 + `llm-objective-ps-v1-v2` + 采样 0.7/0.8/20/0 + `--seed 20260816` + `max_new_tokens=512` + `n_ctx=4096` + **CPU（n-gpu-layers 0，与对照一致）**）；三轮串行（~580s/轮；主节点 16GB RAM / RTX 4060 8GB）。plan：`fixtures/experiment-plans/plan-quality-qwen35-9b-dsv4-calibration-v2.json`；证据 `build/experiments/ex-dsv4-9b-eval-20260914/`（含 `calibration-summary.json`，**variation_margin=0.0**）。
+
+| 指标 | Qwen3.5-9B-DSV4-Flash Q4_K_M | DS3-0324-7B v2（512） | Qwen3-4B v2（P5 基线） |
+|---|---|---|---|
+| correctness（4 题） | 1/4 ×3 | **2/4 ×3** | 1/4 ×3 |
+| format（11 题） | 8/11 ×3 | 8/11 ×3 | 7/11 ×3 |
+
+**定性（重要，必须随结果引用）**：**DeepSeek-V4 系列蒸馏更注重 agent 能力**（工具调用、指令遵循、多轮代理场景），本客观子集（数学/代码/格式客观题 + 非思考集提示）**只覆盖有限的问答维度**——因此以上结果**只能作参考**：既不构成对模型综合能力的判定，也不改变 DS3-0324-7B 在判题场景的既有地位；**不建议仅凭本表在两者间做取舍**。Qwen3.5 专属 chat template / thinking 适配未做（`QW3-G3` 另计）。
+
 ## 7. 与既有文档关系
 
 - [Qwen3.5与Qwen3-VL小模型支持计划](Qwen3.5与Qwen3-VL小模型支持计划.md)：R1 失败证据与"首选替代 Qwen3-4B"的原始来源；本计划是其"R1 遗留替代"的补充票系列，不得改动其既有结论（QW3 已关闭）。

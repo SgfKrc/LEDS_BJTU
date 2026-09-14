@@ -476,6 +476,7 @@ def test_kv_init_reuse_free(client):
     assert r.status_code == 200
     assert r.json()["task_id"] == "t1"
     assert r.json()["reused"] is False
+    assert r.json()["cold_enabled"] is False
 
     r = client.post("/v1/kv/init", json={"task_id": "t1"})  # 幂等复用
     assert r.json()["reused"] is True
@@ -494,6 +495,83 @@ def test_kv_auto_task_id(client):
     r = client.post("/v1/kv/init", json={})
     assert r.status_code == 200
     assert r.json()["task_id"]
+
+
+def test_kv_init_accepts_cold_tier_configuration(client, tmp_path):
+    managed_root = tmp_path / "managed-kv"
+    app = make_app(kv_host=KVHost(cold_cache_root=managed_root))
+    with TestClient(app) as managed_client:
+        rejected = managed_client.post(
+            "/v1/kv/init",
+            json={
+                "task_id": "caller-path-task",
+                "cold_cache_dir": str(tmp_path / "caller-controlled"),
+                "cold_max_pages": 1,
+            },
+        )
+        assert rejected.status_code == 400
+        assert not (tmp_path / "caller-controlled").exists()
+
+        r = managed_client.post(
+            "/v1/kv/init",
+            json={
+                "task_id": "cold-api-task",
+                "device": "cpu",
+                "page_size": 4,
+                "max_pages": 1,
+                "cold_max_pages": 1,
+                "cache_unit_size": 2,
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["cold_enabled"] is True
+        assert r.json()["cache_unit_size"] == 2
+        assert list(managed_root.glob("session-*"))
+
+        status = managed_client.get("/v1/status").json()["kv_cache"]
+
+    task = next(item for item in status["tasks"] if item["task_id"] == "cold-api-task")
+    assert task["cold_enabled"] is True
+    assert task["cold_pages"] == 0
+
+
+def test_kv_endpoints_reject_untrusted_remote(tmp_path):
+    app = make_app(kv_host=KVHost(cold_cache_root=tmp_path / "managed-kv"))
+    with TestClient(app, client=("10.0.0.2", 12345)) as remote_client:
+        assert remote_client.post("/v1/kv/init", json={}).status_code == 403
+        assert remote_client.post("/v1/kv/free", json={"task_id": "missing"}).status_code == 403
+    assert not (tmp_path / "managed-kv").exists()
+
+
+def test_kv_free_reports_cleanup_failure_and_preserves_handle(tmp_path, monkeypatch):
+    kv_host = KVHost(cold_cache_root=tmp_path / "managed-kv")
+    app = make_app(kv_host=kv_host)
+    kv_host.init(task_id="cleanup-api-task")
+    cache = kv_host.get("cleanup-api-task")
+
+    def fail_close():
+        raise OSError("cleanup unavailable")
+
+    monkeypatch.setattr(cache, "close", fail_close)
+    with TestClient(app) as local_client:
+        failed = local_client.post("/v1/kv/free", json={"task_id": "cleanup-api-task"})
+        assert failed.status_code == 500
+        assert failed.json()["detail"]["code"] == "KV_CLEANUP_FAILED"
+    assert kv_host.get("cleanup-api-task") is cache
+
+
+def test_kv_init_uses_server_managed_directory_without_caller_path(client):
+    r = client.post("/v1/kv/init", json={"task_id": "managed-cold-task", "cold_max_pages": 1})
+    assert r.status_code == 200
+    assert r.json()["cold_enabled"] is True
+
+
+def test_kv_init_rejects_unaligned_cache_unit(client):
+    r = client.post(
+        "/v1/kv/init",
+        json={"page_size": 4, "max_pages": 1, "cache_unit_size": 3},
+    )
+    assert r.status_code == 400
 
 
 # ----------------------------------------------------------------------

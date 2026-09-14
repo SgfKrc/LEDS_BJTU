@@ -7,3 +7,6 @@
 [submodule "tools/reasonix-codex-bridge"]
 	path = tools/reasonix-codex-bridge
 	url = https://github.com/SgfKrc/reasonix-codex-bridge.git
+[submodule "packages/spawnledger"]
+	path = packages/spawnledger
+	url = https://github.com/SgfKrc/spawnledger.git

@@ -92,6 +92,9 @@ _to_delete/
 test-results/
 sd15-offline-smoke/
 
+# Local archive for retired files (kept on disk, ignored by git)
+_archive/
+
 # Reasonix local tool config
 reasonix.toml
 tests/simulation/results/
@@ -108,6 +111,7 @@ models/qwen3-4b-gguf/
 models/qwen3-vl-4b-instruct/
 models/qwen3-vl-4b-instruct-gguf/
 models/qwen3-5-2b/
+models/qwenseek-2b/
 models/.qlh-*/
 
 # QW3 runtime logs

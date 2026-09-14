@@ -8,7 +8,7 @@ Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orche
 
 **v0.1.8.3** (updated 2026-08-23)
 
-> 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** (Chinese).
+> 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** (Chinese).
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
 > Scope: capability overview, quick start and documentation index; the authoritative capability boundary lives in the specialized plans, source code and tests. Specialized documentation is currently in Chinese.
 
@@ -50,6 +50,7 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
 | 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |
+| 🧭 **Role asymmetry evidence** *(CACHE-05)* | DeepSeek input/output asymmetry is reference-only; QLH records draft/verify and sub-1B role hypotheses with offline evidence boundaries → [report](非对称分工论证-2026-09-14.md) |
 | ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, recoverable task state/journal, lease-epoch winner fencing, provider registry; PC Full Worker & task graph verified for restart & disconnect recovery and IPv6 TCP (2026-08-21); `task_dispatch` production gate stays closed → [task chain plan](任务链下一阶段实施计划.md) |
 | 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → [cluster-join & local RAG plan](集群接入稳定性与本地RAG实施计划.md) |
 | 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → [cluster-join plan](集群接入稳定性与本地RAG实施计划.md) |
@@ -149,7 +150,7 @@ Project root
 │   ├── tui_admin.py               # ★ Cross-platform TUI admin menu (pure stdlib, zero dependencies)
 │   ├── tui_chat.py                # ★ T9 chat page (Textual + httpx; bundled in installers, optional in source)
 │   ├── tui_sse.py / tui_shared.py # T9 SSE incremental parser & shared layer
-│   ├── paged_kv_cache.py          # Lightweight paged KV cache (memory page management, dynamic allocation)
+│   ├── paged_kv_cache.py          # Lightweight paged KV cache (hot memory pages; optional cold disk tier)
 │   ├── tcp_comm.py                # TCP master/worker communication (long-lived conns, heartbeats, framing, tensor serialization)
 │   ├── scheduler.py               # Task scheduling (node management, layer assignment, pipeline control, request queue)
 │   ├── graph_orchestrator.py      # ★ Graph-algorithm orchestration (max-bandwidth spanning tree + DFS)
@@ -985,7 +986,7 @@ The homepage lists:
 
 ## 📚 Documentation Index
 
-Specialized plans are currently in Chinese; start from the **[Overall Next-Step Plan](../docs/总体下一步计划.md)** and the **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** snapshot. A full index of design docs, specialized plans and engineering docs: [文档索引](../README.md#-文档索引).
+Specialized plans are currently in Chinese; start from the **[Overall Next-Step Plan](../docs/总体下一步计划.md)** and the **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** snapshot. A full index of design docs, specialized plans and engineering docs: [文档索引](../README.md#-文档索引).
 
 > **Translation status**: all sections are translated; the Chinese README remains the source of truth for ongoing changes.
 

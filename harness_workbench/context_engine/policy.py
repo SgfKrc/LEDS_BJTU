@@ -219,11 +219,11 @@ class ContextPolicy:
         strategy = self.config.compression_strategy
         use_state = strategy in {"adaptive", "state"}
         use_verbatim = strategy == "verbatim"
-        summary_result = (
-            self._summarize(old_messages, current_state)
-            if old_messages and use_state
-            else SummaryResult(state=validate_state(current_state))
-        )
+        if old_messages and use_state:
+            summary_result = self._summarize(old_messages, current_state)
+            self._append_summary_notices(summary_result, notices)
+        else:
+            summary_result = SummaryResult(state=validate_state(current_state))
         summary_message: ContextMessage | None = None
         summary_tokens = 0
         available_without_summary = input_budget - fixed_tokens
@@ -290,6 +290,7 @@ class ContextPolicy:
             # messages in STATE as well, preserving round boundaries in output.
             if use_state:
                 summary_result = self._summarize(omitted_messages, current_state)
+                self._append_summary_notices(summary_result, notices)
             summary_budget = input_budget - fixed_tokens - sum(
                 token_costs[id(message)] for message in retained_recent
             )
@@ -564,6 +565,15 @@ class ContextPolicy:
         except StateValidationError as exc:
             raise ContextBuildError(f"invalid structured summary: {exc}") from exc
         return result
+
+    @staticmethod
+    def _append_summary_notices(
+        result: SummaryResult,
+        notices: list[ContextNotice],
+    ) -> None:
+        for notice in result.notices:
+            if notice not in notices:
+                notices.append(notice)
 
     def _summary_message(self, result: SummaryResult) -> ContextMessage:
         state = result.validated_state()

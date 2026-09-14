@@ -10,7 +10,7 @@
 >
 > **使用入口**：当前日常使用与启动方式见 [TUI 使用指南](TUI使用指南.md)；`bjtu chat` 已存在，`bjtu launcher/ui/tui/update/version` 由独立 Bootstrap 接线
 >
-> **关联文档**：[总体下一步计划](总体下一步计划.md) · [微服务架构改造计划](微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md) · [TUI 指令集](TUI指令集.md)
+> **关联文档**：[总体下一步计划](总体下一步计划.md) · [微服务架构改造计划](archive/微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md) · [TUI 指令集](TUI指令集.md)
 >
 > **前置条件**：T1-T8 已完成。T9 原型可在现有网关上开始；正式接线必须先冻结 chat SSE、会话持久化和请求级路由契约。分布式真机验收依赖《总体下一步计划》L1-1/L1-2/L1-3。
 
@@ -224,7 +224,7 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
   - 验收：用例 2、3、40、42 转绿（41 passed / 3 skipped）。
 
 - [x] **T6 日志端点代理（#36-38）** ✅ 2026-08-02
-  - **legacy-control Python 桩**：`src/legacy_control.py`（纯标准库零依赖，未来 legacy-control 进程原型；`/logs/recent`、`/logs`、`/logs/stats`，X-QLH-Log-Token 可选，stdout 探活 `LEGACY_CONTROL_LISTENING:<port>`）。
+  - **legacy-control Python 桩**：`src/legacy_control.py`（纯标准库零依赖，未来 legacy-control 进程原型；`/logs/recent`、`/logs`、`/logs/stats`，X-QLH-Log-Token 可选，stdout 探活 `LEGACY_CONTROL_LISTENING:<port>`）。**⚠️ 已随微服务叫停删除（2026-09-14），本条为历史记录。**
   - 网关 `gateway/src/modules/logs/logs.controller.ts`：`/api/logs` 与 `/api/logs/*` 均透传 legacy-control（拆两个方法——fastify adapter 下同一方法叠加多个 @All 会覆盖）；`ForwardClient` 增加 `extraHeaders` 参数透传 X-QLH-Log-Token；`clients/legacy.client.ts`（QLH_LEGACY_CONTROL_URL，默认 :8040）。
   - 测试：jest 直接 spawn Python 桩（真实网关→Python 链路）；用例 36-38 打开；用例 41 补 logs 段 status=200 + 带 token 透传断言。
   - 验收：**44/44 全部用例通过（0 skipped）**。
@@ -238,7 +238,7 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
 
 - [x] **T8 回归与收尾** ✅ 2026-08-02
   - `pytest -q`（Python 侧回归）；前端 9/9（确认网关改动未破坏 Web 面）。
-  - 更新 [微服务架构改造计划](微服务架构改造计划.md) §2.4 勾选状态与本文档状态为"现行"。
+  - 更新 [微服务架构改造计划](archive/微服务架构改造计划.md) §2.4 勾选状态与本文档状态为"现行"。
   - 验收：全部测试绿，提交。
   - 2026-08-02 实测：Python 全量回归 **1086 passed / 3 skipped**（112.6s）；前端 `npm test` **9/9** + 生产构建成功；网关契约测试 **63/63**（tui-contract + rest-contract）；TUI 7 屏 × 2 角色自动化走查通过（`scripts/tui_walkthrough.py`）。已提交。
 
@@ -271,7 +271,7 @@ describe('TUI 契约：/api 前缀与 JSON 错误', () => {
 
 ### 7.1 已知技术坑（2026-08-02 T1 排障记录）
 
-> 完整排障链与验证方式见 [gateway/README.md](../gateway/README.md)。任何改动 fastify 版本、
+> 完整排障链与验证方式见历史 `gateway/README.md`（**网关已随微服务叫停删除，2026-09-14**；原文见 git 历史 `148a0a6` 之前版本）。任何改动 fastify 版本、
 > beforeAll 初始化或 404 处理的 PR 必须先跑 `npm run test:tui`。
 
 | # | 坑 | 根因 | 修复 |

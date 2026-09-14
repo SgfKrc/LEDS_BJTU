@@ -108,6 +108,32 @@
 - **G3 跨平台验证**：至少在 WSL 或 CI 上跑一次 CLI 探测 + 启动自检 + `configure verify`，覆盖 `terminate()` 的 POSIX 分支。
 - **G4 主仓集成登记**：在主仓 `docs/` 登记接线清单（Codex 配置位置、profile 名、本机 CLI 与 workspace root），换机时照抄即可，避免重做。
 
+### 2.6 网络能力委派修复（2026-09-14，修复票）
+
+> 背景（2026-09-14 诊断）：`web_search` 现只认 **provider 原生声明**（`resolveProviderSearchCapability` 检查 provider 的 `web_search/webSearch/capabilities.*/tools.*`；缺失即 fail-closed，不推断），而 `reasonix doctor --json` 的 provider schema 不含这类字段 → 对**所有**配置 provider 稳定 `provider_capability_not_advertised`；同时 Reasonix 直连时宿主层联网可用（宿主/插件/网关通道），造成"直连能搜、桥接内稳定 unavailable"的观感差异。`web_fetch` 已由 NET-01 委派宿主（`f6a539c`），`web_search` 缺对应委派。
+
+- **`TOOL-RXB-NET-03` host search 委派通道（P0）**
+  - 做什么：按 NET-01 对 `web_fetch` 的委派模式，探测 **Reasonix 宿主声明的 search 能力**并委派执行；通道选择明确化：provider 原生声明优先 → host 委派兜底 → 无通道则 fail-closed（原因码保持稳定）；`reasonix_status` 增加 search 通道来源（`provider` / `host` / `unavailable`）；修正探测口径（不再只吃 doctor 的 provider 字段，需覆盖宿主能力渠道）。
+  - 验收门：宿主 search 可用时 `web_search` 返回真实结果且标注通道来源；宿主不可用时 fail-closed 且原因码与现行为一致；与 NET-01 fetch 委派的脱敏/边界合同一致；回归覆盖"provider/host/无通道"三态选择矩阵。
+
+- **`TOOL-RXB-NET-04` Codex 主 agent 联网回退（P1）**
+  - 背景：本地两通道（provider + host）都不可用时，子 agent 需要外部信息却拿不到；但主 agent（Codex）本身有联网能力，可作为兜底供料方。
+  - 做什么：设计"联网求助"协议——bridge 在子 agent 明确需要联网而本地通道不可用时，返回**结构化缺口信号**（如 `needs_network: true` + 查询意图/URL 列表；不夹带无关上下文）；主 agent 用自身联网获取信息后，把结果作为**一次性补充上下文**经新参数/工具（如 `reasonix_run` 的 `context`/`attachments` 字段或独立 `reasonix_inject`）回灌给随后调用的 Reasonix 子 agent；全链路审计（记录"本次调用由主 agent 供料"）。
+  - 边界：回退通道不替代 NET-03；主 agent 供料遵守数据边界策略（敏感内容不默认外发）；一次性注入，不做持久共享；默认只读/写入边界不变。
+  - 验收门：无本地通道时子 agent 收到结构化缺口信号（不空转、不乱猜）；主 agent 供料后子 agent 能基于供料完成回答；审计与事件流标注供料来源；不改变现有写策略与脱敏合同。
+
+### 2.7 写入策略演进（2026-09-14，修复票）
+
+> 背景（2026-09-14 实测与用户判定）：`requireCleanTree=true` 要求**每次写入调用前工作树 clean**——但 agent 场景中**一写即脏**，第二次写入起即被拒（"写入 → 树变脏 → 后续写入全被 clean-tree 门拦死"），与真实使用不兼容。**当前开发阶段**（工具不成熟）接受这种严格受控的写入；**将来不允许**保留该前置门，必须砍掉/优化。
+
+- **`TOOL-RXB-W1-EXT-01` clean-tree 前置门优化（P1，当前保留、将来必改）**
+  - 问题：clean-tree 作为**写入前置门**与 agent 工作模式根本冲突——任何一次成功写入都会让工作树变脏，使后续写入被自己造成的脏树拒绝；实际使用中无法连续写入。
+  - 优化方向（择一或组合，实现时再定）：
+    - **a) 前置门 → 回滚依据**：允许脏树写入，改为写入前记录**目标路径的内容/哈希快照**，回滚令牌与冲突检测基于快照（目标文件在写入后被外部修改 → 拒绝回滚，fail-closed），不再要求整树 clean；
+    - **b) 范围收窄**：仅校验 `allowedPaths` 内、且为**本次目标路径**的 dirty 状态；工作树其他部分的未提交改动不阻塞；
+    - **c) 策略档位**：区分"开发/测试态"（允许脏树 + 快照回滚）与"生产态"（保留 clean-tree 前置门），默认档位显式配置并在 `reasonix_status` 可见。
+  - 验收门：**连续两次写入**（第一次后工作树已脏）第二次不被 clean-tree 拒绝；回滚令牌仍能精确回滚本次变化且**不误伤既有未提交改动**；目标文件被第三方修改后回滚/冲突检测仍 fail-closed；`reasonix_status` 明确展示当前 clean-tree 策略与档位。迁移前保持现状并在文档/票中标注"严格受控仅为开发阶段临时口径"。
+
 ---
 
 ## 3. 边界（明确不做）
@@ -195,3 +221,5 @@
 | 2026-09-13 | `TOOL-RXB-G3` 完成：在 WSL Ubuntu 22.04 记录 POSIX CLI 探测、无 CLI 启动拒绝、WSL interop 下 `--version`/doctor/verify 和测试结果；跨平台夹具修复后记录为 58/59，剩余输出截断竞态转为 R4 |
 | 2026-09-13 | `TOOL-RXB-R4` 完成：输出超过 `OUTPUT_CHAR_CAP` 时改为有界缓冲并以成功结果标记 `truncated=true`，不因输出超限终止 worker；timeout/cancel 仍终止。Windows `npm test` 59/59、`npm run check`、`npm run check:links` 通过，子项目 commit `fa06fd2` |
 | 2026-09-14 | `TOOL-RXB-EVT-01` 完成：新增 `reasonix_events` 有界事件流（`after_seq`/`limit` 增量轮询；仅返回 job id、阶段、状态、终态与有界计数，任务文本/模型引用/路径/worker 输出一律不返回；每 job 环形缓冲上限 32 条、完成即清）；工具面现为 `run/resume/rollback/events/exec/cancel/status` 七项；子项目 commit `5104f3d`，`npm test` `103 passed / 0 failed` |
+| 2026-09-14 | 登记修复票 `TOOL-RXB-NET-03`（host search 委派通道，P0）与 `TOOL-RXB-NET-04`（Codex 主 agent 联网回退，P1），详见 §2.6；背景为 2026-09-14 诊断"`web_search` 仅认 provider 原生声明（doctor 不含该字段）→ 对全部 provider 稳定 fail-closed，而 Reasonix 直连宿主联网可用"的通道归属差异 |
+| 2026-09-14 | 本机开放写权限用于真实测试（write profile `deepseek-worker-write` 创建、`bridge.config.json` 写策略 `enabled=true`）；同时登记修复票 `TOOL-RXB-W1-EXT-01`（clean-tree 前置门优化，详见 §2.7）：`requireCleanTree` 使"一写即脏、后续写入被拒"与 agent 场景不兼容，**当前开发阶段接受严格受控，将来必须砍掉/优化**（方向：前置门→快照回滚依据 / 范围为本次目标路径 / 开发态与生产态策略档位） |
