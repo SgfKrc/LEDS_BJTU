@@ -92,6 +92,9 @@ _to_delete/
 test-results/
 sd15-offline-smoke/
 
+# Local archive for retired files (kept on disk, ignored by git)
+_archive/
+
 # Reasonix local tool config
 reasonix.toml
 tests/simulation/results/
