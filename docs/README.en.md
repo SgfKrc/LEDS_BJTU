@@ -8,7 +8,7 @@ Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orche
 
 **v0.1.8.3** (updated 2026-08-23)
 
-> 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** (Chinese).
+> 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** (Chinese).
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
 > Scope: capability overview, quick start and documentation index; the authoritative capability boundary lives in the specialized plans, source code and tests. Specialized documentation is currently in Chinese.
 
@@ -986,7 +986,7 @@ The homepage lists:
 
 ## 📚 Documentation Index
 
-Specialized plans are currently in Chinese; start from the **[Overall Next-Step Plan](../docs/总体下一步计划.md)** and the **[Progress & Next Steps](../docs/项目进展与下一步计划.md)** snapshot. A full index of design docs, specialized plans and engineering docs: [文档索引](../README.md#-文档索引).
+Specialized plans are currently in Chinese; start from the **[Overall Next-Step Plan](../docs/总体下一步计划.md)** and the **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** snapshot. A full index of design docs, specialized plans and engineering docs: [文档索引](../README.md#-文档索引).
 
 > **Translation status**: all sections are translated; the Chinese README remains the source of truth for ongoing changes.
 
