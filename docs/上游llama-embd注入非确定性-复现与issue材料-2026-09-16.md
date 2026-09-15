@@ -34,6 +34,7 @@
 | 项 | 值 |
 | --- | --- |
 | commit | `6f04274cc145cf76aafc46eb8c1ea054ca221368`（2026-08-14；含 PR #27073 hidden-state 提取） |
+| 版本串 | `version: 0.1.0-dev (build 10436, commit 6f04274cc)` / `built with GNU 15.2.0 for Windows AMD64`（取自同一次构建的 `llama-server --version`；`git describe` = `b10431-5-g6f04274cc`） |
 | 构建 | `cmake -B build-cpu -G "MinGW Makefiles" -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF` + `mingw32-make -j4`（MSYS2 **UCRT64** g++） |
 | 运行 | Windows（`windows/amd64`），**纯 CPU 后端**（`n_gpu_layers = 0`），`n_threads = n_threads_batch = 1`（除注明处） |
 | 模型 | `Qwen3.5-2B`（`qwen35` 架构：混合 **SSM/Gated Delta Net** + **每 4 层一个 full attention**），f16 GGUF；另用"裁掉前 4 层"的同源模型 |
