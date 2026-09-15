@@ -54,7 +54,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -8691,13 +8690,6 @@ async def storage_health():
     }
 
 
-# ============================================================
-# 生产模式：挂载 React 前端静态文件
-# ============================================================
-# 构建前端: cd frontend_cybergothic && npm run build （输出到 frontend_cybergothic/dist/）
-# 生产模式下 FastAPI 在 8000 端口直接提供全部服务（无需 Vite dev server）
-# 开发模式下 dist 目录不存在，跳过挂载，使用 Vite proxy 模式
-
 # ================================================================
 # 模型文件下载（供 Android 等远程节点下载 GGUF 模型）
 # ================================================================
@@ -9834,38 +9826,8 @@ async def delete_log_file(filename: str, request: Request):
     return {"status": "ok", "deleted": safe_name, "failed": []}
 
 
-def _resolve_frontend_dist() -> str:
-    """Resolve the product UI without silently falling back to the frozen legacy UI.
-
-    ``QLH_FRONTEND_DIST`` is an explicit escape hatch for compatibility checks or
-    local migration work. The normal source and packaged paths are always the
-    CyberGothic build output; an absent build leaves the API in API-only mode.
-    """
-    explicit = os.environ.get("QLH_FRONTEND_DIST", "").strip()
-    if explicit:
-        return os.path.abspath(os.path.expanduser(explicit))
-
-    if getattr(sys, "frozen", False):
-        # Frozen datas are self-contained. A developer shell checkout must
-        # not override the packaged UI unless QLH_FRONTEND_DIST was explicit.
-        root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(os.path.abspath(os.path.expanduser(root)), "frontend_cybergothic", "dist")
-    root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-    shell_root = os.environ.get("QLH_SHELL_ROOT", "").strip()
-    if not shell_root:
-        shell_root = os.path.join(os.path.dirname(root), "qlh-shell")
-    return os.path.join(os.path.abspath(os.path.expanduser(shell_root)), "frontend_cybergothic", "dist")
-
-
-# PyInstaller and source runs use the external qlh-shell checkout when present.
-# The packaged path or another shell can be selected explicitly with QLH_FRONTEND_DIST.
-_frontend_dist = _resolve_frontend_dist()
-
-if os.path.isdir(_frontend_dist):
-    app.mount("/", StaticFiles(directory=_frontend_dist, html=True), name="frontend")
-    logger.info(f"前端静态文件已挂载: {_frontend_dist}")
-else:
-    logger.info("前端 dist 目录未找到，使用纯 API 模式（开发时由 Vite 提供前端）")
+# The core API intentionally does not mount a product shell.  Web/Android
+# clients live in sibling repositories and consume the versioned API/contracts.
 
 # ============================================================
 # 启动入口

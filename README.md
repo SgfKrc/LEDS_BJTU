@@ -50,7 +50,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；系统凭据和首次安装联调后置 |
 | 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
 | 🎛️ **控制面** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控；用户交互以 TUI 为主 |
-| 🖥️ **TUI 主入口** | `qlh chat` 面向本地/集群引擎；管理 TUI 负责节点、模型舰队、任务和状态；`qlh_edge` 提供最小 HTTP/节点接入面，不替代本地或分布式推理 → [使用指南](docs/TUI使用指南.md) |
+| 🖥️ **TUI 主入口** | `qlh chat` 面向本地/集群引擎；管理 TUI 负责节点、模型舰队、任务和状态；`qlh_edge` 提供最小 HTTP/能力合同与原生 RPC worker 接入面，不替代本地或分布式推理 → [使用指南](docs/TUI使用指南.md) |
 | 🖼️ **图像能力边界** | 主项目保留图片上传、Gemma/Qwen 多模态理解和图生文，不提供图像生成或编辑，也不安装相关运行时与模型资产。生图唯一归属为 Koakumix `harness_workbench`，接口为 `/v1/images/generations`；旧 SD 计划只作历史记录。 |
 | 📱 **Android 端侧（支线）** | Android 本地推理、RPC worker、SAF 和真机证据由独立端侧仓库维护；主仓只冻结任务、模型和能力合同；不再把 Lite 作为独立产品线 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
@@ -156,7 +156,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── speculative.py             # ★ draft-verify 投机解码（默认关闭的实验路径，路线 C）
 │   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
 │   ├── qlh.py                     # 主仓跨平台 TUI 命令入口
-│   ├── qlh_edge.py                # Edge L 档最小 HTTP 服务
+│   ├── qlh_edge.py                # Edge 本地 <=1B 推理 + 原生 RPC worker 能力面
 │   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx；安装包内置，源码可选）
 │   ├── tui_sse.py / tui_shared.py # T9 SSE 增量解析器与共享层（端点/命令/metrics）
 │   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存热页；可选磁盘冷页）
@@ -168,8 +168,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── local_store.py             # 主节点 SQLite 本地存储（旧 JSON 一次性只读导入）
 │   ├── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
 │   ├── model_host.py              # 模型生命周期宿主（统一持有 LLM/多模态理解引擎）
-│   ├── scheduler_svc_http.py      # scheduler-svc 微服务 HTTP 壳（透传契约）
-│   ├── inference_service/         # ★ inference-svc 微服务（engine_host/协议/路由）
+│   ├── scheduler_svc_http.py      # 控制面兼容适配器（PC/reference 契约测试使用）
+│   ├── inference_service/         # ★ PC Reference P sidecar（不进入 Edge 默认运行时）
 │   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）
 ├── schemas/                       # ★ MODEL-FLEET 冻结契约（artifact/pull-job/deployment/profile JSON Schema）
 ├── fixtures/                      # 测试与走查 fixture（API 事件流、模型门样例）

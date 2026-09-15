@@ -26,7 +26,7 @@ REQUIRED_MODULES = {
     "psutil": "psutil",
     "httpx": "httpx",
 }
-REQUIRED_ROUTES = ("/health", "/status", "/generate")
+REQUIRED_ROUTES = ("/health", "/status", "/generate", "/capabilities", "/rpc/status")
 PROBE_MARKER = "QLH_EDGE_PREFLIGHT="
 
 
