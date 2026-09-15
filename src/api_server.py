@@ -31,9 +31,22 @@ from contextvars import ContextVar
 from dataclasses import replace
 from functools import wraps
 from pathlib import Path
-from typing import Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
-import torch
+try:  # PyTorch is optional: the L-tier (GGUF/llama.cpp) setup ships without it.
+    import torch
+except ImportError:  # pragma: no cover - exercised by the L-tier environment
+    torch = None  # type: ignore[assignment]
+
+
+def _torch_cuda_available() -> bool:
+    """Whether CUDA is usable, *without* requiring PyTorch to be installed.
+
+    Status and model-listing endpoints must still answer in the L-tier environment
+    (GGUF/llama.cpp, no torch), reporting "no CUDA" rather than raising there.
+    """
+
+    return torch is not None and torch.cuda.is_available()
 
 # 确保 src 目录在 path 中
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +60,9 @@ from starlette.concurrency import run_in_threadpool
 
 from api_errors import coded_http_error, error_response_content
 from model_api_access import require_model_api_source
-from paged_kv_cache import PagedKVCache
+
+if TYPE_CHECKING:  # torch-backed (D-tier); imported lazily so the L-tier can start.
+    from paged_kv_cache import PagedKVCache
 from multimodal import (
     build_openai_user_content,
     materialize_image_data_url,
@@ -396,7 +411,7 @@ async def http_exception_with_request_id(request: Request, exc: HTTPException):
 from model_host import model_host
 
 model_manager = model_host
-kv_cache: Optional[PagedKVCache] = None
+kv_cache: "Optional[PagedKVCache]" = None  # PagedKVCache is D-tier (torch) only
 active_session_id: Optional[str] = None           # 当前活跃会话 ID
 session_histories: dict[str, list[dict]] = {}     # session_id → 对话历史列表
 conversation_stats: dict = {                    # 累计对话统计（实际消耗追踪）
@@ -1908,6 +1923,8 @@ def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
 def _init_kv_cache():
     """初始化分页 KV 缓存（根据设备画像自适应大小）"""
     global kv_cache
+    from paged_kv_cache import PagedKVCache  # torch-backed; imported on first use only
+
     num_heads = 16      # Qwen-1.8B: 16 attention heads
     head_dim = 64       # 隐藏维度 2048 / 16 heads = 128, 但实际是 64 per head for K/V
     # 从模型获取实际的 head_dim
@@ -2588,7 +2605,7 @@ async def select_gpu(req: SelectGpuRequest):
 async def get_status():
     """获取系统完整状态（含设备档位）"""
     gpu_info = {}
-    if torch.cuda.is_available():
+    if _torch_cuda_available():
         gpu_info = {
             "name": torch.cuda.get_device_name(0),
             "total_mb": round(torch.cuda.get_device_properties(0).total_memory / (1024**2)),
@@ -5983,7 +6000,7 @@ async def list_available_models():
         })
 
     if "pytorch" in engine_ids:
-        has_cuda = torch.cuda.is_available()
+        has_cuda = _torch_cuda_available()
         available_engines.append({
             "id": "pytorch",
             "name": "PyTorch + Safetensors" + (" (CUDA)" if has_cuda else " (CPU)"),
@@ -5994,7 +6011,7 @@ async def list_available_models():
     # P3修复: 量化选项动态化 — 仅返回当前环境实际可用的量化精度
     pytorch_quants = []
     if "pytorch" in engine_ids:
-        has_cuda = torch.cuda.is_available()
+        has_cuda = _torch_cuda_available()
         pytorch_quants = [
             {
                 "id": "int4",
