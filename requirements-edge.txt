@@ -1,0 +1,9 @@
+# QLH Edge L runtime: the small GGUF/llama.cpp profile.
+# Keep this file independent from requirements.txt; torch/Transformers are
+# intentionally absent from the edge installation.
+llama-cpp-python==0.3.35
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+psutil==7.2.2
+httpx==0.28.1
+numpy==2.5.3

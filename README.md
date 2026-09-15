@@ -158,6 +158,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── speculative.py             # ★ draft-verify 投机解码（默认关闭的实验路径，路线 C）
 │   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
 │   ├── qlh.py                     # 主仓跨平台 TUI 命令入口
+│   ├── qlh_edge.py                # Edge L 档最小 HTTP 服务
 │   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx；安装包内置，源码可选）
 │   ├── tui_sse.py / tui_shared.py # T9 SSE 增量解析器与共享层（端点/命令/metrics）
 │   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存热页；可选磁盘冷页）
@@ -196,6 +197,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── benchmark_compile.py       # torch.compile 融合测试
 │   ├── convert_to_gguf.py         # Safetensors → GGUF 转换
 │   ├── build_offline_bundle.py    # 离线整合包容量预检、清单与原子发布
+│   ├── edge_preflight.py          # Edge L 档体积/冷启动/依赖/路由预检
 │   ├── experiment_quality_production_gate.py # EX-N3 只读质量复核
 │   └── docagent_*_gate.py         # 文档检索/语义质量门
 ├── tools/                         # ★ 子模块与运维工具
@@ -208,6 +210,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   └── qwen-1_8b-chat-Q4_K_M.gguf # PC: GGUF 格式（llama.cpp 引擎）
 ├── logs/                          # 运行日志目录
 ├── requirements.txt               # Python 依赖清单
+├── requirements-edge.txt          # Edge L 档最小依赖（无 torch）
 └── README.md                      # 本文件
 ```
 
@@ -358,6 +361,31 @@ pip install -r requirements.txt
 # 产品壳在支线仓库维护：cd ../qlh-shell/frontend_cybergothic && npm ci
 ```
 
+### Edge L 档最小环境
+
+边缘节点使用独立环境和 `requirements-edge.txt`，不安装主环境的 torch、Transformers 或其他重型依赖：
+
+```bash
+python -m venv .venv-edge
+.venv-edge/Scripts/python.exe -m pip install -r requirements-edge.txt  # Windows
+# Linux/macOS: .venv-edge/bin/python -m pip install -r requirements-edge.txt
+
+.venv-edge/Scripts/python.exe scripts/edge_preflight.py \
+  --python .venv-edge/Scripts/python.exe --json
+.venv-edge/Scripts/python.exe qlh_edge.py --help
+```
+
+预检固定检查 venv 不超过 300 MB、导入冷启动不超过 15 秒、禁用模块未安装/未导入，以及
+`/health`、`/status`、`/generate` 路由存在。启动服务时设置 `QLH_EDGE_MODEL` 指向本地 GGUF：
+
+```bash
+# Linux/macOS
+QLH_EDGE_MODEL=models/Qwen-1_8B-Chat.Q4_K_M.gguf \
+  .venv-edge/bin/python qlh_edge.py --port 8010
+# Windows PowerShell: $env:QLH_EDGE_MODEL = "models/Qwen-1_8B-Chat.Q4_K_M.gguf"
+# .venv-edge\\Scripts\\python.exe qlh_edge.py --port 8010
+```
+
 ### 🚀 一键配置全部开发环境（克隆后推荐）
 
 仓库包含**主运行时 + Python 虚拟环境**；Node 子项目属于支线迁移源，不是主线运行前置。
@@ -389,6 +417,7 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 | 环境 | 用途 | 依赖来源 | lock 快照 |
 |---|---|---|---|
 | **主环境**（系统 Python） | 运行时（transformers/torch 推理服务）与工具脚本 | `requirements.txt` | `requirements-lock/main.lock.txt` |
+| `.venv-edge` | Edge L 档 GGUF/CPU 节点 | `requirements-edge.txt` | 本票以预检 JSON 为证据 |
 | `.venv-test` | 唯一测试环境（全量/定向 pytest） | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
 | `../qlh-shell/.venv-tui` | T9 终端聊天页（textual） | `../qlh-shell/requirements-tui.txt` | `../qlh-shell/requirements-lock/tui.lock.txt` |
 | `.venv-gemma4-native` | 原生 Gemma 4 MTMD / llama.cpp | `requirements/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
