@@ -6215,6 +6215,109 @@ def _public_expected_paths(values: list[str] | tuple[str, ...]) -> list[str]:
     return public
 
 
+def _model_manifest_metadata(model: mc.ModelConfig) -> dict[str, Any]:
+    """Read verified digest fields without exposing manifest paths."""
+    model_dir = Path(mc.resolve_model_path(model.model_path))
+    if not model_dir.is_dir():
+        return {}
+    for filename in (".qlh-model-asset.json", "model.manifest.json"):
+        manifest_path = model_dir / filename
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+            continue
+        artifact_sha256 = str(manifest.get("artifact_sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", artifact_sha256):
+            continue
+        digests: dict[str, str] = {}
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            digest = str(entry.get("sha256") or "").lower()
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                digests[Path(str(entry.get("path") or "")).name] = digest
+        return {
+            "artifact_sha256": artifact_sha256,
+            "tokenizer_digest": digests.get("tokenizer.json"),
+            "chat_template_digest": digests.get("tokenizer_config.json"),
+            "evidence": {
+                "artifact_digest_mode": "manifest",
+                "manifest_sha256": str(manifest.get("manifest_sha256") or ""),
+            },
+        }
+    return {}
+
+
+def _model_profile_payload(
+    model: mc.ModelConfig,
+    *,
+    preferred_engine: str,
+) -> dict[str, Any]:
+    """Build the path-free model-fleet contract consumed by Harness."""
+    metadata = mc.get_model_profile_metadata(model.model_id)
+    manifest = _model_manifest_metadata(model)
+    thinking = str(metadata.get("thinking", "unknown"))
+    vision = str(metadata.get("vision", "unknown"))
+    roles = list(metadata.get("roles", ("answer",)))
+    resources = {
+        "recommended_vram_gb": model.recommended_vram_gb,
+        "max_context": model.max_context,
+        **dict(metadata.get("resources", {})),
+    }
+    profile: dict[str, Any] = {
+        "profile_schema": "qlh.harness.model_profile.v1",
+        "model_id": model.model_id,
+        "revision": str(metadata.get("revision") or f"catalog-{model.model_id}-v1"),
+        "backend": preferred_engine,
+        "format": model.model_type,
+        "artifact_sha256": manifest.get("artifact_sha256"),
+        "tokenizer_digest": manifest.get("tokenizer_digest"),
+        "chat_template_digest": manifest.get("chat_template_digest"),
+        "context": {
+            "n_ctx": model.max_context,
+            "input_budget": min(8192, model.max_context),
+            "max_new_tokens": 1024 if model.recommended_vram_gb >= 8 else 512,
+        },
+        "generation": {"thinking": thinking},
+        "adaptation": {
+            "prompt_family": str(metadata.get("template") or "unknown"),
+            "tool_mode": "host_router",
+        },
+        "roles": roles,
+        "aliases": [model.model_id],
+        "resources": resources,
+        "capabilities": {
+            "json_output": {"status": "unknown", "evidence": []},
+            "tool_call_generation": {"status": "unknown", "evidence": []},
+            "tool_result_reinjection": {"status": "unknown", "evidence": []},
+            "multimodal": {"status": vision, "evidence": []},
+            "thinking_control": {
+                "status": "declared" if thinking == "declared" else "unknown",
+                "evidence": [],
+            },
+        },
+        "status": "candidate",
+        "production_eligible": False,
+        "evidence": {
+            "source": "qlh.main_model_catalog",
+            "weights_loaded": False,
+            "network_used": False,
+            **dict(metadata.get("evidence", {})),
+            **dict(manifest.get("evidence", {})),
+        },
+    }
+    canonical = json.dumps(
+        profile,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    profile["profile_digest"] = hashlib.sha256(canonical).hexdigest()
+    return profile
+
+
 def _public_registry_payload(entry: dict[str, Any]) -> dict[str, Any]:
     """Project registry rows without exposing persisted server paths."""
     payload = dict(entry)
@@ -6248,6 +6351,7 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
     else:
         preferred_engine = "auto"
     default_quant = "Q4_K_M" if preferred_engine == "llama_cpp" else "int4"
+    profile = _model_profile_payload(model, preferred_engine=preferred_engine)
 
     return {
         "model_id": model.model_id,
@@ -6272,6 +6376,7 @@ def _model_api_payload(model: mc.ModelConfig) -> dict:
         "supported_engines": supported_engines,
         "preferred_engine": preferred_engine,
         "default_quant_type": default_quant,
+        "profile": profile,
         "requires_cuda": bool(
             model.is_experimental
             and file_status["has_safetensors"]

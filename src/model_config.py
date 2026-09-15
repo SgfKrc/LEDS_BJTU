@@ -43,6 +43,59 @@ def _get_bundled_asset_root() -> str:
 _BUNDLED_ASSET_ROOT = _get_bundled_asset_root()
 
 
+# Shared, path-free model-fleet metadata.  Artifact digests stay unset until
+# the downloaded files are verified by the manifest pipeline.
+MODEL_PROFILE_METADATA: dict[str, dict] = {
+    "qwen2.5-0.5b": {
+        "revision": "builtin-qwen25-0.5b-v2",
+        "template": "qwen_chat_v1",
+        "thinking": "unknown",
+        "vision": "unknown",
+        "roles": ("answer", "summarizer"),
+        "resources": {"min_ram_gb": 3.0, "min_vram_gb": 1.5, "min_disk_gb": 2.0, "edge_compatible": True},
+        "evidence": {"probe_ticket": "M-SM-B1", "artifact_digest_mode": "missing"},
+    },
+    "qwen3-0.6b": {
+        "revision": "builtin-qwen3-0.6b-v2",
+        "template": "qwen3_chat_v1",
+        "thinking": "declared",
+        "vision": "unknown",
+        "roles": ("tool_router", "summarizer"),
+        "resources": {"min_ram_gb": 4.0, "min_vram_gb": 2.0, "min_disk_gb": 3.0, "edge_compatible": True},
+        "evidence": {"probe_ticket": "M-SM-B1", "artifact_digest_mode": "missing"},
+    },
+    "minicpm4-0.5b": {
+        "revision": "builtin-minicpm4-0.5b-v2",
+        "template": "minicpm4_chat_v1",
+        "thinking": "unknown",
+        "vision": "unknown",
+        "roles": ("answer", "summarizer"),
+        "resources": {"min_ram_gb": 3.0, "min_vram_gb": 1.5, "min_disk_gb": 3.0, "edge_compatible": True},
+        "evidence": {"probe_ticket": "M-SM-B1", "artifact_digest_mode": "missing"},
+    },
+    "distilqwen25-ds3-0324-7b": {
+        "revision": "builtin-distilqwen-ds3-0324-v2",
+        "template": "qwen_chat_v1",
+        "thinking": "unknown",
+        "vision": "unknown",
+        "roles": ("answer", "summarizer"),
+        "resources": {"min_ram_gb": 12.0, "min_vram_gb": 8.0, "min_disk_gb": 20.0, "edge_compatible": False},
+        "evidence": {"probe_ticket": "DSW-D1", "artifact_digest_mode": "missing"},
+    },
+}
+
+
+def get_model_profile_metadata(model_id: str) -> dict:
+    """Return a defensive copy of path-free fleet metadata for one model."""
+    value = MODEL_PROFILE_METADATA.get(model_id, {})
+    return {
+        **value,
+        "roles": tuple(value.get("roles", ("answer",))),
+        "resources": dict(value.get("resources", {})),
+        "evidence": dict(value.get("evidence", {})),
+    }
+
+
 def resolve_model_path(path: str) -> str:
     """Return an absolute path for a model file or directory."""
     if not path:
