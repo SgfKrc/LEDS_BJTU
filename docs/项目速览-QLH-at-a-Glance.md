@@ -1,5 +1,9 @@
 # QLH 速览 / 新人 · 评审快速入口
 
+> 状态：**现行**
+>
+> 更新日期：2026-09-15
+
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
 > 本页是给**不熟悉仓库的人**的 2 分钟导览；详细能力、边界与证据见 [README](../README.md) 全文与专项文档。
@@ -8,7 +12,7 @@
 
 ## 这是什么？
 
-QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。PC 主节点与从节点（PC/Surface/Android）通过 Tailscale 组网，按算力/内存/网络把模型分层协同推理；支持 PyTorch + llama.cpp 双引擎、INT4/INT8 量化、分页 KV 缓存、任务链编排、本地 RAG、多模态图像理解、Auth App 本地鉴权与多端客户端。核心设计原则：**数据不出集群、断网可自治、可复现验收**。图像生成不属于 QLH 主项目，由 Koakumix harness 独立提供。
+QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。主仓聚焦 PyTorch + llama.cpp 双引擎、任务级/层流水线分布式推理、INT4/INT8 量化、分页 KV 缓存、TUI 和可复现实验；模型舰队让用户按设备选择文本或可选多模态模型。产品 Web、Android、知识库、发布工具和图像生成属于支线，图像生成唯一由 Koakumix harness 提供。核心设计原则：**数据不出集群、断网可自治、可复现验收**。
 
 ## 已验证的能力
 
@@ -35,7 +39,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 | 依赖 | 版本 | 用途 |
 |---|---|---|
 | Python | ≥ 3.10（推荐 3.12） | 主运行时与工具脚本 |
-| Node.js + npm | Node ≥ 18 | 产品前端 / gateway / control（仅开发需要） |
+| Node.js + npm | Node ≥ 18 | 仅迁移/开发产品壳支线 |
 | JDK 17 + Android SDK (API 34+) | — | 仅构建 Android 时需要 |
 | Tailscale | 最新 | 分布式模式必须（校园网可能阻断 UDP，会走中继） |
 | Git | — | clone（含 submodule） |
@@ -46,14 +50,14 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 ```bash
 git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 含 llama.cpp（第三方）与 docagent、reasonix-codex-bridge 两个自研子模块
 cd LEDS_BJTU
-python scripts/setup_envs.py --all            # 全部：8 个 Python 环境 + Node 子项目
-python scripts/setup_envs.py --all --no-node  # 仅 Python 环境
+python scripts/setup_envs.py --all            # 主线 Python 环境（默认不含 Node）
+python scripts/setup_envs.py --all --with-node # 另行配置产品壳 Node 迁移源
 python scripts/setup_envs.py --only test,tui  # 只配指定环境
 python scripts/setup_envs.py --skip frontend  # 跳过旧前端（冻结对照）
 python scripts/setup_envs.py --check          # 只校验不安装（无副作用）
 ```
 
-**覆盖清单**：主环境 + `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar` / `.venv-packaging` / `.venv-packaging-cuda`；Node：`frontend_cybergothic`（唯一产品前端）/ `gateway` / `control`（旧 `frontend` 冻结，默认也装，可 `--skip frontend`）。Koakumix 的生图依赖只在其独立环境管理。
+**覆盖清单**：主环境 + `.venv-test` / `.venv-tui` / `.venv-gemma4-native` / `.venv-gemma4-pipeline` / `.venv-qwen3-sidecar`；产品壳、Android、打包和 Node 环境属于支线迁移源，不是主线运行前置。Koakumix 的生图依赖只在其独立环境管理。
 
 > ⚠️ **torch 等平台相关大件不自动安装**：脚本自动过滤并打印各环境安装命令（如 `--torch-index-url https://download.pytorch.org/whl/cu126`），避免 CPU/CUDA 版本互相污染。按提示装完后再跑一次 `--check` 验证。
 
@@ -72,17 +76,17 @@ huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf Qwen-1_8B-Chat
 
 ```bash
 python src/api_server.py               # 后端 http://localhost:8000
-cd frontend_cybergothic && npm run dev # 产品前端 http://localhost:5174
+python -m src.tui_admin --plain --host http://127.0.0.1:8000 # 主线 TUI
 # 或终端版：./start_tui.sh（Windows: start_tui.bat，自动带后端）
 python -c "import src.api_server"                                   # 后端可导入
 .venv-test\Scripts\python.exe -m pytest tests/ -q --collect-only    # 测试环境就绪
 ```
 
-分布式：各节点同一 Tailscale 账号 → 管理面板「连接主节点」→ 节点上线。
+分布式：各节点同一 Tailscale 账号 → TUI 的集群/节点命令 → 节点上线。
 
 ## 文档怎么读
 
-- **主计划**：[总体下一步计划](总体下一步计划.md)（唯一排期入口）· [项目进展与下一步计划](archive/项目进展与下一步计划.md)（证据快照）
+- **主线计划**：[主线开发计划：分布式推理与边缘优化](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **支线计划**：[支线开发计划：外置迁移与 Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md) · [总体下一步计划](总体下一步计划.md)（历史总排期）
 - **新人入门**：[项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
 - **子项目**：[harness 方案](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [联网工具调研](archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
 - **实验与判题**：[DS3 替代 R1 专项](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [亚1B 专项](亚1B小模型专项实验计划.md) · [测试与评判标准](测试与评判标准.md)

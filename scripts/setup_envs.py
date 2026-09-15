@@ -5,8 +5,8 @@
 用法示例
 --------
   python scripts/setup_envs.py --list                    # 查看环境清单
-  python scripts/setup_envs.py --all                     # 全部（Python 环境 + Node 子项目）
-  python scripts/setup_envs.py --all --no-node           # 仅 Python 环境
+  python scripts/setup_envs.py --all                     # 全部主线 Python 环境（默认不含 Node）
+  python scripts/setup_envs.py --all --with-node         # 另行配置产品壳 Node 迁移源
   python scripts/setup_envs.py --only test,tui           # 只配指定环境
   python scripts/setup_envs.py --skip packaging,packaging-cuda --all
   python scripts/setup_envs.py --check                   # 只校验现有环境，不安装
@@ -87,18 +87,10 @@ ENVS: tuple[PyEnv, ...] = (
         python_version_hint="3.12",
     ),
     PyEnv(
-        name="tui",
-        description="T9 终端聊天页（.venv-tui；textual）",
-        venv_dir=".venv-tui",
-        requirements=("packaging/requirements-tui.txt",),
-        lock_file="tui.lock.txt",
-        required_modules=("textual", "httpx"),
-    ),
-    PyEnv(
         name="gemma4-native",
         description="Gemma 4 MTMD 原生运行时（.venv-gemma4-native；llama.cpp GGUF）",
         venv_dir=".venv-gemma4-native",
-        requirements=("packaging/requirements-gemma4-native.txt",),
+        requirements=("requirements/requirements-gemma4-native.txt",),
         lock_file="gemma4-native.lock.txt",
         required_modules=("llama_cpp",),
     ),
@@ -106,7 +98,7 @@ ENVS: tuple[PyEnv, ...] = (
         name="gemma4-pipeline",
         description="Gemma 4 PyTorch Transformers 5.10.1 侧车（.venv-gemma4-pipeline）",
         venv_dir=".venv-gemma4-pipeline",
-        requirements=("packaging/requirements-gemma4-pipeline-sidecar.txt",),
+        requirements=("requirements/requirements-gemma4-pipeline-sidecar.txt",),
         lock_file="gemma4-pipeline.lock.txt",
         needs_torch=True,
         required_modules=("torch", "accelerate", "safetensors", "transformers"),
@@ -117,45 +109,19 @@ ENVS: tuple[PyEnv, ...] = (
         description="Qwen3 PyTorch sidecar（.venv-qwen3-sidecar；含 pipeline 执行依赖）",
         venv_dir=".venv-qwen3-sidecar",
         requirements=(
-            "packaging/requirements-qwen3-sidecar.txt",
-            "packaging/requirements-qwen3-pipeline-sidecar.txt",
+            "requirements/requirements-qwen3-sidecar.txt",
+            "requirements/requirements-qwen3-pipeline-sidecar.txt",
         ),
         lock_file="qwen3-sidecar.lock.txt",
         needs_torch=True,
         required_modules=("torch", "torchvision", "accelerate", "safetensors", "transformers"),
         python_version_hint="3.12",
     ),
-    PyEnv(
-        name="packaging",
-        description="集显版打包（.venv-packaging；torch CPU + PyInstaller）",
-        venv_dir=".venv-packaging",
-        requirements=("packaging/requirements-cpu.txt",),
-        lock_file="packaging.lock.txt",
-        needs_torch=True,
-        extra_packages=("pyinstaller",),
-        required_modules=("torch", "transformers", "PyInstaller"),
-        python_version_hint="3.12",
-    ),
-    PyEnv(
-        name="packaging-cuda",
-        description="独显版打包（.venv-packaging-cuda；torch CUDA + PyInstaller）",
-        venv_dir=".venv-packaging-cuda",
-        requirements=("packaging/requirements-cpu.txt",),
-        lock_file="packaging-cuda.lock.txt",
-        needs_torch=True,
-        extra_packages=("pyinstaller",),
-        required_modules=("torch", "PyInstaller"),
-        python_version_hint="3.12",
-    ),
 )
 
-# Node 子项目（均有 package-lock.json，用 npm ci 可复现安装）
-NODE_PROJECTS: tuple[tuple[str, str], ...] = (
-    ("frontend_cybergothic", "唯一产品前端（React + TypeScript + Vite）"),
-    ("gateway", "API 网关"),
-    ("control", "控制台服务"),
-    ("frontend", "旧前端（已冻结；仅历史对照/旧包兼容资源，可用 --skip frontend 跳过）"),
-)
+# The Web shell is a standalone repository. Mainline setup must not install
+# or inspect its Node dependencies.
+NODE_PROJECTS: tuple[tuple[str, str], ...] = ()
 
 ENV_BY_NAME = {env.name: env for env in ENVS}
 NODE_BY_NAME = {name: desc for name, desc in NODE_PROJECTS}
@@ -510,7 +476,7 @@ def snapshot_env(env: PyEnv, base_python: Path) -> None:
         f"# 环境: {env.description}",
         "# 生成: python scripts/setup_envs.py --snapshot",
         "# 说明: torch/torchvision/torchaudio 与 editable/本地路径安装不在此锁定；",
-        "#       各类依赖按 packaging/requirements-*.txt 安装，torch 按 setup_envs.py 提示手动补齐。",
+        "#       主仓运行时依赖按 requirements*.txt 安装；发布和 TUI 依赖在 qlh-release/qlh-shell 中维护。",
         "# ============================================================",
     ]
     torch_versions: list[str] = []
@@ -545,9 +511,9 @@ def _select(args: argparse.Namespace) -> tuple[list[PyEnv], list[tuple[str, str]
         elif args.no_node is False:
             node_projects = [p for p in NODE_PROJECTS if p[0] in names]
     elif args.all or args.check or args.snapshot:
-        # 无副作用的 --check / --snapshot：未显式指定范围时默认全部
+        # 主线默认只处理 Python；产品壳 Node 环境必须显式 opt-in。
         py_envs = list(ENVS)
-        if not args.no_node:
+        if args.with_node and not args.no_node:
             node_projects = list(NODE_PROJECTS)
     else:
         parser.error("请使用 --all 或 --only <name,...> 指定要配置的环境")
@@ -565,14 +531,15 @@ def _select(args: argparse.Namespace) -> tuple[list[PyEnv], list[tuple[str, str]
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="setup_envs.py",
-        description="QLH 一键环境配置：主运行时 + 全部虚拟环境 + Node 子项目。",
+        description="QLH 主线环境配置：主运行时 + Python 虚拟环境；产品壳 Node 环境需显式 opt-in。",
     )
-    parser.add_argument("--all", action="store_true", help="配置全部 Python 环境（及 Node 子项目）")
-    parser.add_argument("--only", metavar="NAME,...", help="只配置指定环境（逗号分隔；node 单配 Node 项目）")
+    parser.add_argument("--all", action="store_true", help="配置全部 Python 环境（主线默认不含 Node）")
+    parser.add_argument("--only", metavar="NAME,...", help="只配置指定环境（逗号分隔；产品壳 Node 可单独指定）")
     parser.add_argument("--skip", metavar="NAME,...", help="跳过指定环境（配合 --all）")
     parser.add_argument("--check", action="store_true", help="只校验现有环境，不安装任何东西")
     parser.add_argument("--snapshot", action="store_true", help="从现有 venv 导出 requirements-lock/*.lock.txt")
     parser.add_argument("--no-node", action="store_true", help="跳过 Node 子项目")
+    parser.add_argument("--with-node", action="store_true", help="显式配置产品壳 Node 迁移源（支线可选）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印将执行的命令，不执行任何安装/创建")
     parser.add_argument("--torch-index-url", default="", metavar="URL",

@@ -1,14 +1,18 @@
 # QLH — Lightweight Distributed Edge LLM Inference
 
+> 状态：**现行**
+>
+> 更新日期：2026-09-15
+
 > **Language**: [English](README.en.md) · [简体中文](../README.md)
 
 **A multi-engine, evolvable distributed LLM inference system for heterogeneous edge devices.**
 
-Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Multi-terminal collaborative inference · Visual monitoring · External-compute assistance
+Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Distributed inference · TUI-first edge operation
 
-**v0.1.8.3** (updated 2026-08-23)
+**v0.1.8.3** (updated 2026-09-15)
 
-> 📌 Scheduling & lifecycle: **[Overall Next-Step Plan](../docs/总体下一步计划.md)** (Chinese); capability snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** (Chinese).
+> 📌 Current mainline: **[Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)**; side lines: **[Externalization & Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md)**; historical snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)**.
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
 > Scope: capability overview, quick start and documentation index; the authoritative capability boundary lives in the specialized plans, source code and tests. Specialized documentation is currently in Chinese.
 
@@ -43,10 +47,10 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🌐 **Tailscale & dual stack** | IPv4/IPv6 endpoints, manual cluster join and reconnect fall back as “user preference → bootstrap → Tailnet”; explicit successful connects persist the preference. A short dual-machine IPv6 task is verified; IPv4-only/IPv6-only installers and real WSS/443 remain environment acceptance work |
 | 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; OS credential and first-install integration remain deferred |
 | 📦 **Install, update & offline bundle** | Independent Launcher signing/update/rollback, download progress and diagnostics are implemented. The offline bundle provides capacity preflight, SHA/manifest, atomic ZIP, 7z/split output and restore validation; real full bundles, empty-root/Android SAF import and cross-platform install acceptance are deferred |
-| 🎛️ **Admin panel** | Node register/deregister, layer overrides, role transfer, spare master, TCP status |
-| 🖥️ **TUI** | Terminal admin menu, zero-dependency stdlib; `bjtu chat` built-in Textual chat page |
+| 🎛️ **Control plane** | Node register/deregister, layer overrides, role transfer, spare master, TCP status; operated primarily through TUI |
+| 🖥️ **TUI-first entry** | `qlh chat` for local/remote inference, model fleet and cluster status; `qlh_edge` provides the minimal HTTP surface |
 | **Multimodal input** | Main QLH keeps image upload and Gemma/Qwen image understanding; generation/editing and image assets belong to Koakumix |
-| 📱 **Android client** | Standard supports local GGUF/remote PC, SAF, presence lease, Full Worker/Stage, Gemma4 mmproj/JNI image path, update/redacted logs/connection diagnostics; Lite is the remote lightweight entry. These are local/JVM/cross-build gates, with device and production acceptance deferred |
+| 📱 **Android client (side line)** | Android Full/Lite, SAF, Full Worker/Stage and real-device evidence are maintained by the external shell/device project; QLH freezes only task, model and capability contracts |
 | 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
 | 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |
@@ -134,7 +138,7 @@ Project root
 │   ├── 三种分布式拆分细化实施方案.md  # Inter-layer pending tests, task chain & tensor-parallel implementation
 │   ├── Android版本远期计划.md       # Android plan evaluation
 │   ├── Android SAF模型存储方案.md   # Android SAF external model directory plan
-│   ├── 总体下一步计划.md             # ★ Sole master plan: L0-L5, lifecycle, dependencies, release gates
+│   ├── 总体下一步计划.md             # Historical schedule/index; current priority is in the main/side-line plans
 │   ├── 项目进展与下一步计划.md       # ★ Capability & evidence snapshot
 │   ├── 张量并行外部辅助与混合拆分调研方案.md  # ★ Quantitative argument that in-mesh TP is infeasible + three external routes
 │   ├── TP孤岛接入指南.md            # ★ Route A: island = single logical high-compute node (PoC)
@@ -165,47 +169,14 @@ Project root
 │   └── node_config.py             # Local node configuration (cluster secret/profile, not source-controlled)
 ├── schemas/                       # ★ MODEL-FLEET frozen contracts (artifact/pull-job/deployment/profile JSON Schema)
 ├── fixtures/                      # Test & walkthrough fixtures (LLM/SSE event streams, model-gate samples)
-├── android/                       # Android client (Kotlin + Jetpack Compose)
-│   ├── app/
-│   │   ├── build.gradle.kts       # Gradle build script (release signing config)
-│   │   └── src/main/java/com/qlh/inference/
-│   │       ├── data/              # Room database + DataStore settings persistence
-│   │       ├── network/           # OkHttp API client + ChatRepository
-│   │       ├── service/           # InferenceService foreground service + ModelManager + LocalInferenceEngine
-│   │       └── ui/                # ChatScreen / SettingsScreen / SessionListScreen
-│   ├── keystore.properties        # Release signing config (git-ignored, generate locally)
-│   ├── qlh-release.jks            # Release signing keystore (git-ignored)
-│   └── gradlew / gradlew.bat      # Gradle Wrapper (no Android Studio required)
-├── .venv-packaging/               # iGPU packaging venv (CPU torch + PyInstaller)
-├── .venv-packaging-cuda/          # dGPU packaging venv (CUDA torch + PyInstaller)
+├── (sibling) qlh-android/         # Android Full/Lite, JNI, Gradle, Android tests/resources
+├── (sibling) qlh-shell/           # CyberGothic Web/Desktop shell, Node tests, optional Textual
+├── (sibling) qlh-release/         # Launcher, PyInstaller/Inno/Linux release and release venvs
+├── (sibling) qlh-toolbox/         # SSH/patch, demo, defense and performance tools
 ├── .venv-test/                    # Isolated test env (created by setup_test_env.py; full test runs only — never install into system Python)
-├── packaging/                     # Packaging config + distribution server (no build artifacts)
-│   ├── launcher.py                # Main-app launch payload (Tailscale → model check → engine selection → start)
-│   ├── qlh_launcher.py            # ★ Standalone Bootstrap (GUI/TUI/update, no inference deps)
-│   ├── launcher_cybergothic.py    # CyberGothic desktop shell: static UI + /api reverse proxy
-│   ├── updater.py                 # Update CLI
-│   ├── update_core.py             # Manifest, version, download & SHA-256 core
-│   ├── qlh-launcher.spec          # Standalone Launcher PyInstaller spec
-│   ├── setup-launcher.iss         # Standalone Launcher Setup
-│   ├── serve.py                   # ★ Minimal HTTP file distribution server (PC + Android + Linux installers)
-│   ├── qlh-cpu.spec               # PyInstaller spec (iGPU edition)
-│   ├── qlh-cuda.spec              # PyInstaller spec (dGPU edition, CUDA + CPU fallback)
-│   ├── qlh-tui-chat.spec          # Textual chat companion console (bundled)
-│   ├── setup.iss                  # Inno Setup script, iGPU edition
-│   ├── setup-cuda.iss             # Inno Setup script, dGPU edition
-│   ├── requirements-cpu.txt       # CPU-only dependency list
-│   ├── linux/                     # Linux .deb packaging
-│   │   ├── build-deb.sh           # deb build script
-│   │   ├── launcher.py            # Linux cross-platform launcher
-│   │   ├── control-cpu / control-cuda  # dpkg metadata
-│   │   ├── postinst / prerm / postrm   # install/uninstall scripts
-│   │   ├── qlh-edge-inference.service  # systemd unit
-│   │   └── qlh-edge-inference.desktop  # desktop entry
-│   ├── dist/                      # ★ Final installer output (git-ignored)
-│   └── README.md                  # Packaging docs
-├── frontend_cybergothic/          # ★ Sole product frontend (React + TypeScript + Vite)
-│   ├── src/                       # Chat / Models / RAG / Tasks / Account product pages
-│   └── scripts/                   # Contrast and browser-regression tools
+├── requirements/                  # Main and sidecar dependency manifests
+├── requirements-lock/             # Main-repo reproducibility locks
+├── _to_delete/                    # Recoverable migration/archive material; never a runtime dependency
 ├── harness_workbench/             # ★ Small-model harness workbench (independent sub-project; no main-project imports)
 │   ├── context_engine/            # Context budget & STATE compression
 │   ├── model_profiles/            # Model profiles and capability gate
@@ -238,15 +209,15 @@ Project root
 └── README.md                      # This file
 ```
 
-### Submodules (git submodule)
+### Submodules and external repositories
 
-The repository pins **three** Git submodules; **only `llama.cpp` is third-party — the other two are in-house sub-projects kept in their own repositories**:
+The main repository pins **three in-house Git submodules**. Android, shell, release, and toolbox code lives in sibling repositories and is not a main-repository startup prerequisite:
 
 | Path | Repository | Kind | Purpose |
 |------|------------|------|---------|
 | `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **In-house** | Rule-as-data scanner, mechanical rule-change scanning (new/gone/changed delta matrix) and evolution gates |
 | `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **In-house** | stdio MCP bridge that lets Codex drive the read-only Reasonix subagent; CLI path and model ref resolve per machine, `configure verify` self-checks |
-| `android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **Third-party** (only non-in-house) | Native builds for the Android Full variant; pinned revision, not needed on PC or in Python sidecars |
+| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **External third-party dependency** | Native builds for the Android Full variant; pinned revision, not needed on PC or in Python sidecars |
 
 #### In-house sub-project 1: `qlh-docagent` (document-maintenance Agent)
 
@@ -265,7 +236,8 @@ The repository pins **three** Git submodules; **only `llama.cpp` is third-party 
 
 ```bash
 git submodule update --init --recursive
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU
+git clone --recurse-submodules https://github.com/SgfKrc/qlh
+# Optional siblings: qlh-android, qlh-shell, qlh-release, qlh-toolbox
 ```
 
 > Planned: the small-model harness workbench (`harness_workbench/`) still lives inside the main repo; it is a candidate for the same submodule treatment later (in-house), leaving only a gitlink and wiring docs here.
@@ -293,7 +265,7 @@ User input → Master → TCP → Worker 1 (Client) → TCP → Worker 2 (Client
 
 | Layer | Function | Technology |
 |------|------|------|
-| Application | Visual interaction & node management & performance monitoring | React + TUI (standard library) + Jetpack Compose (Android) |
+| Application | TUI-first inference and node control; optional product shells are external | Standard-library TUI + versioned HTTP/contracts |
 | Scheduling | Task scheduling, instruction dispatch, state management, request queue | Python threading + graph algorithms |
 | Communication | Long-lived TCP connections, packet de-framing, heartbeats, tensor serialization | Python socket + struct |
 | Inference | Multi-engine: model loading, quantization, fusion, KV cache | PyTorch (CUDA) / llama.cpp (CPU / Android) / island *(PoC)* |
@@ -383,13 +355,13 @@ QLH no longer ships an image-generation engine, image-generation API, Diffusers 
 # Python dependencies (primary node is self-contained on SQLite; no PostgreSQL needed)
 pip install -r requirements.txt
 
-# Product frontend dependencies (sole product frontend)
-cd frontend_cybergothic && npm ci && cd ..
+# Product shell dependencies (optional side line; not needed by mainline)
+# cd ../qlh-shell/frontend_cybergothic && npm ci && cd ../..
 ```
 
 ### 🚀 One-Click Setup for All Development Environments (recommended after cloning)
 
-The repo contains **the main runtime + 8 Python virtual environments + 3 Node sub-projects**; wiring them up one by one is tedious. The unified entrypoint `scripts/setup_envs.py` (or the root-level `setup_all_envs.bat` / `setup_all_envs.sh`) prepares them all at once:
+The repo contains **the main runtime + Python virtual environments**. Product-shell Node projects are optional migration sources, not mainline prerequisites. The unified entrypoint `scripts/setup_envs.py` (or the root-level `setup_all_envs.bat` / `setup_all_envs.sh`) prepares the mainline environments:
 
 ```bash
 # Windows
@@ -412,13 +384,13 @@ python scripts/setup_envs.py --list       # show the environment inventory
 |---|---|---|---|
 | **Main** (system Python) | Runtime (transformers/torch inference services) & tool scripts | `requirements.txt` | `requirements-lock/main.lock.txt` |
 | `.venv-test` | The only test environment (all pytest runs) | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
-| `.venv-tui` | T9 terminal chat page (textual) | `packaging/requirements-tui.txt` | `requirements-lock/tui.lock.txt` |
-| `.venv-gemma4-native` | Native Gemma 4 MTMD / llama.cpp | `packaging/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
-| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
-| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar (incl. pipeline execution deps) | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
-| `.venv-packaging` | iGPU packaging (CPU torch + PyInstaller) | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
-| `.venv-packaging-cuda` | dGPU packaging (CUDA torch) | `packaging/requirements-cpu.txt` | `requirements-lock/packaging-cuda.lock.txt` |
-| frontend_cybergothic | Sole product frontend | `package-lock.json` (`npm ci`) | — |
+| `../qlh-shell/.venv-tui` | T9 terminal chat page (textual) | `../qlh-shell/requirements-tui.txt` | `../qlh-shell/requirements-lock/tui.lock.txt` |
+| `.venv-gemma4-native` | Native Gemma 4 MTMD / llama.cpp | `requirements/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
+| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `requirements/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
+| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar (incl. pipeline execution deps) | `requirements/requirements-qwen3-sidecar.txt` + `requirements/requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
+| `../qlh-release/.venv-packaging` | iGPU packaging (CPU torch + PyInstaller) | `../qlh-release/packaging/requirements-cpu.txt` | `../qlh-release/requirements-lock/packaging.lock.txt` |
+| `../qlh-release/.venv-packaging-cuda` | dGPU packaging (CUDA torch) | `../qlh-release/packaging/requirements-cpu.txt` | `../qlh-release/requirements-lock/packaging-cuda.lock.txt` |
+| `../qlh-shell/frontend_cybergothic` | Product shell (side line) | `package-lock.json` (`npm ci`) | — |
 
 > `setup_all_envs.bat` runs `chcp 65001` automatically on Windows; if you run the script directly and the terminal shows mojibake, run `chcp 65001` or `set PYTHONIOENCODING=utf-8`.
 
@@ -430,8 +402,8 @@ python scripts/setup_envs.py --list       # show the environment inventory
 |---|---|---|---|
 | **Main** (system Python) | Runtime (transformers 4.47.1 / torch / inference services) and tool scripts | `requirements.txt` | No pytest-family test deps; no full test runs |
 | **`.venv-test`** | **The only test environment** (all pytest runs) | `scripts/setup_test_env.py` + `requirements-test.txt` | No runtime inference; not a main env substitute |
-| `.venv-packaging/` | iGPU packaging (CPU torch) | `packaging/requirements-cpu.txt` | — |
-| `.venv-packaging-cuda/` | dGPU packaging (CUDA torch) | see packaging docs | — |
+| `../qlh-release/.venv-packaging/` | iGPU packaging (CPU torch) | `../qlh-release/packaging/requirements-cpu.txt` | — |
+| `../qlh-release/.venv-packaging-cuda/` | dGPU packaging (CUDA torch) | see qlh-release docs | — |
 | `.venv-gemma4-native/`, `.venv-qwen3-sidecar/` | Isolated sidecar runtimes (native MTMD / Qwen3 sidecar) | their own requirements | — |
 
 **Common commands**:
@@ -456,16 +428,14 @@ python scripts/setup_test_env.py --check
 ### 0. First Steps After Cloning (one-time environment steps)
 
 ```bash
-# 1. Only pull the llama.cpp submodule when building Android Full; PC workers and Python sidecars do NOT need it
-#    Two in-house submodules (tools/docagent, tools/reasonix-codex-bridge) ship with a default clone and are
-#    needed for document maintenance / Codex bridging; llama.cpp is only required for Android Full builds.
+# 1. Initialize the main repository's in-house submodules (docagent/reasonix bridge)
 git submodule update --init --recursive
 
 # 2. Install Python dependencies (main environment; online)
 pip install -r requirements.txt
 
-# 3. Product frontend dependencies (optional)
-cd frontend_cybergothic && npm ci && cd ..
+# 3. Product shell dependencies (optional; maintained in qlh-shell)
+# cd ../qlh-shell/frontend_cybergothic && npm ci && cd ../..
 
 # 4. Environment files (not committed; create per node)
 #    The main .env needs at least QLH_CLUSTER_SECRET (distributed secret);
@@ -475,7 +445,7 @@ cd frontend_cybergothic && npm ci && cd ..
 python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
 ```
 
-`llama.cpp` is pinned as the `android/app/src/main/cpp/llama.cpp` Git submodule. To keep Android Full build capability, prefer a first clone with `git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU`; if a node only runs PC CPU workers / Qwen3 or Gemma 4 PyTorch sidecars, a plain clone is enough — no separate clone or build of `llama.cpp`. `.venv-gemma4-native` uses `llama-cpp-python` and does not reference that Android source submodule either.
+`llama.cpp` is pinned inside the external `qlh-android` repository at `app/src/main/cpp/llama.cpp`. To keep Android Full build capability, clone `https://github.com/SgfKrc/qlh-android` beside the main repository and initialize its submodule; PC workers and Python sidecars do not need it. `.venv-gemma4-native` uses `llama-cpp-python` and does not reference the Android source tree.
 
 A PC worker without CUDA / discrete GPU must explicitly install CPU PyTorch; never copy the master's CUDA venv:
 
@@ -507,20 +477,20 @@ At runtime use `execution_device=cpu` (or `auto`, which falls back to CPU when C
 |---|---|
 | ✅ Runtime license records | LLM/multimodal runtime licenses stay with their managed assets; Koakumix owns image-generation licenses outside the QLH bundle |
 | ✅ Test fixtures & experiment plans | all of `fixtures/` committed |
-| ✅ Signature origin / serve distribution | code in `packaging/`, no extra assets |
-| ⚠️ Release signing keys | `packaging/.signing-keys/` **not in the repo**; held by release owners — a clone can only verify, not sign |
+| ✅ Signature origin / serve distribution | code in `../qlh-release/`, no main-repo assets |
+| ⚠️ Release signing keys | `../qlh-release/.signing-keys/` **not in the repo**; held by release owners — a clone can only verify, not sign |
 | ⚠️ `.env` (e.g. QLH_CLUSTER_SECRET) | each node provides its own; not committed |
 | ⚠️ `models/` large files | all gitignored; fetch per the table above, not shipped with the repo |
 
 ### 3. Installers (usable without cloning)
 
-Windows CPU/CUDA Setup, Launcher, Android Full/Lite APK and Linux `.deb` are all obtained from the **release channel** (on this project's intranet: the master node's `python packaging/serve.py` distribution server, browser download). Installing does not require cloning the repo; cloning is mainly for development and acceptance.
+Windows CPU/CUDA Setup, Launcher, Android Full/Lite APK and Linux `.deb` are all obtained from the **release channel** (on this project's intranet: run `python packaging/serve.py` from the sibling `qlh-release` repository). Installing does not require cloning the main repo; cloning is mainly for development and acceptance.
 
 ---
 
 ## 🤖 Model Download
 
-> **Default source**: the current control-svc has the Hugging Face official source built in and enabled, and also registers HF mirror and ModelScope endpoint descriptions (the latter two are disabled by default, pending the corresponding adapters / real-network acceptance); source priority, enable/disable and `credential_ref` are supported. Windows tokens are protected by the current user's DPAPI; the model proxy follows `QLH_HTTP_PROXY > user-persisted config > direct connection` and can be set or cleared via the local `/models/network/proxy` API without modifying the system proxy. Gated repositories require registered credentials and explicit license acceptance first; plaintext never enters SQLite/jobs/manifests/responses. See [Special Plan](一键模型部署与自治集群远期计划.md) §4.2/§7.1 for the mechanism.
+> **Default source**: the current control-svc has the Hugging Face official source built in and enabled, and also registers HF mirror and ModelScope endpoint descriptions (the latter two are disabled by default, pending the corresponding adapters / real-network acceptance); source priority, enable/disable and `credential_ref` are supported. Windows tokens are protected by the current user's DPAPI; the model proxy follows `QLH_HTTP_PROXY > user-persisted config > direct connection` and can be set or cleared via the local `/models/network/proxy` API without modifying the system proxy. Gated repositories require registered credentials and explicit license acceptance first; plaintext never enters SQLite/jobs/manifests/responses. See [Special Plan](../../qlh-release/docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1 for the mechanism.
 
 The project's default example model is **Qwen-1.8B-Chat**, and the model registry provides additional Qwen/DeepSeek experimental slots. The following covers only the two formats of the default model and does not imply the system supports only that model:
 
@@ -610,17 +580,17 @@ Open app → Settings → switch to "Full mode" → Model management → pick di
 # Terminal 1: start the Python backend (run from the project root)
 python src/api_server.py
 
-# Terminal 2: start the sole product frontend (Vite proxies to 8000)
-cd frontend_cybergothic && npm run dev
+# Terminal 2: start the mainline TUI (the product shell is a side line)
+python -m src.tui_admin --plain --host http://127.0.0.1:8000
 ```
 
 Once the backend is ready:
 
 - **Backend API**: `http://localhost:8000`
-- **Product frontend dev server**: `http://localhost:5174` (Vite HMR, proxied to 8000)
-- **Product desktop shell**: build `frontend_cybergothic`, then run `python packaging/launcher_cybergothic.py` (default `9851`, proxies `/api` to `8000`)
+- **Mainline TUI**: terminal conversation, model fleet and cluster control
+- **Product shell**: maintained by the side-line migration plan; it is not a mainline startup prerequisite
 
-> The standard backend, pywebview Launcher, CPU/CUDA/Slim specs, and Linux `.deb` now use `frontend_cybergothic/dist` by default; clean-machine first launch, WebView2, Linux install, and upgrade remain release acceptance gates.
+> The product shell, pywebview Launcher, packaging specs and Linux `.deb` are side-line migration scope; their clean-machine and upgrade gates do not define mainline TUI or Edge readiness.
 
 ### Standalone Mode (PC)
 
@@ -717,7 +687,7 @@ curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
 
 > ⚠️ **Data boundary**: Routes B / C send user content (including speculative-decoding draft tokens) out of the cluster. The scope levels `deny` / `opt_in` (default) / `allow_all` are a security boundary, not a performance switch; an invalid value fails closed to `deny`. Confirm compliance requirements before enabling.
 
-### Windows Packaging Baseline and Build Scripts
+### Windows Packaging Baseline and Build Scripts (optional side line)
 
 The table below is the historical size baseline for the existing full-package build scripts, not a `PACK-SLIM` release promise. `PACK-SLIM` has completed its local development gate; real PyInstaller builds and first external-runtime bootstrap still await packaging-environment acceptance.
 
@@ -729,20 +699,21 @@ The table below is the historical size baseline for the existing full-package bu
 **iGPU (CPU) build**:
 
 ```bash
-# 0. Create and activate the iGPU venv (first time only)
+# 0. Run the release workflow from the sibling release repository
+cd ..\qlh-release
+# 1. Create and activate the iGPU venv (first time only)
 python -m venv .venv-packaging
 .venv-packaging\Scripts\activate
 
-# 1. Install dependencies (first time only)
+# 2. Install dependencies (first time only)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
-# 2. Build historical compatibility static resources for the current installer
-#    Product UI development/desktop shell uses frontend_cybergothic; see Quick Start.
-cd frontend_cybergothic && npm install && npx vite build && cd ..
+# 3. Build the shell in its sibling repository when a fresh dist is needed
+# cd ..\qlh-shell\frontend_cybergothic && npm ci && npm run build && cd ..\..\qlh-release
 
-# 3. PyInstaller packaging (★ run from the project root)
+# 4. PyInstaller packaging (run from qlh-release)
 pyinstaller packaging/qlh-cpu.spec --noconfirm
 
 # 4. Inno Setup installer compilation
@@ -753,16 +724,18 @@ cd packaging
 **dGPU (CUDA) build** (requires a separate venv):
 
 ```bash
-# 0. Create and activate the dGPU venv (first time only)
+# 0. Run from the sibling release repository
+cd ..\qlh-release
+# 1. Create and activate the dGPU venv (first time only)
 python -m venv .venv-packaging-cuda
 .venv-packaging-cuda\Scripts\activate
 
-# 1. Install dependencies (first time only; torch first, then shared deps — they don't overwrite each other)
+# 2. Install dependencies (first time only; torch first, then shared deps — they don't overwrite each other)
 pip install torch                        # ★ CUDA 12.x (default), NOT the CPU build
 pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
-# 2-4. Same as the iGPU edition, but use qlh-cuda.spec / setup-cuda.iss
+# 3-5. Same as the iGPU edition, but use qlh-cuda.spec / setup-cuda.iss
 pyinstaller packaging/qlh-cuda.spec --noconfirm
 cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 ```
@@ -775,7 +748,7 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 >
 > After installation, double-click the desktop shortcut to launch — no Python environment configuration needed. On uninstall you will be asked whether to also delete the `models/` directory; model files are kept by default.
 >
-> See [packaging/README.md](../packaging/README.md) for the detailed packaging workflow.
+> See [qlh-release README](../../qlh-release/README.md) for the detailed packaging workflow.
 
 ### Linux `.deb` Packaging Baseline
 
@@ -789,7 +762,7 @@ The Linux build scripts cover Ubuntu 22.04+ / Debian 12+. Versions and sizes bel
 **Build** (requires an Ubuntu/Debian environment):
 
 ```bash
-cd packaging/linux
+cd ../qlh-release/packaging/linux
 bash build-deb.sh cpu     # iGPU edition
 bash build-deb.sh cuda    # dGPU edition
 ```
@@ -814,18 +787,19 @@ sudo systemctl enable --now qlh-edge-inference  # Enable at boot
 
 ### Android Client
 
-> Prerequisite: JDK 17 + Android SDK (API 34+) installed, with the SDK path configured in `android/local.properties`
+> Prerequisite: JDK 17 + Android SDK (API 34+) installed, with the SDK path configured in `../qlh-android/local.properties`
 >
-> After cloning the repository fresh, initialize the llama.cpp submodule first (required for the Full variant's native build; not needed for Lite):
+> After cloning `qlh-android`, initialize its llama.cpp submodule first (required for the Full variant's native build; not needed for Lite):
 
 ```bash
+cd ../qlh-android
 git submodule update --init --recursive
 ```
 
 **Build** (no Android Studio required):
 
 ```bash
-cd android
+cd ../qlh-android
 
 # Debug APK (uncompressed, for development)
 ./gradlew.bat assembleDebug
@@ -838,14 +812,14 @@ Artifacts:
 
 | Artifact | Path | Typical size | Notes |
 |------|------|---------|------|
-| Full Debug | `android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | Includes the llama.cpp native backend |
-| Full Release | `android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
-| Lite Release | `android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | Pure thin client, no native libraries |
+| Full Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | Includes the llama.cpp native backend |
+| Full Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
+| Lite Release | `../qlh-android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | Pure thin client, no native libraries |
 
 **Install**:
 
 ```bash
-adb install android/app/build/outputs/apk/full/release/app-full-release.apk
+adb install ../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk
 ```
 
 **Usage**:
@@ -859,7 +833,7 @@ adb install android/app/build/outputs/apk/full/release/app-full-release.apk
 Distribute installers within the same Tailscale network so other devices can download them directly from a browser:
 
 ```bash
-cd packaging
+cd ../qlh-release
 python serve.py
 # Default port 9090; browse to http://<local Tailscale IP>:9090/
 ```
@@ -952,7 +926,7 @@ The homepage lists:
 
 ## 📚 Documentation Index
 
-Specialized plans are currently in Chinese; start from the **[Overall Next-Step Plan](../docs/总体下一步计划.md)** and the **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)** snapshot. A full index of design docs, specialized plans and engineering docs: [文档索引](../README.md#-文档索引).
+Specialized plans are currently in Chinese; start from the **[Mainline Plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md)** and **[Side-line Plan](支线开发计划-外置迁移与Koakumix-2026-09-14.md)**. The [Overall Next-Step Plan](../docs/总体下一步计划.md) is retained as the historical schedule/index, and the [Progress & Next Steps](../docs/archive/项目进展与下一步计划.md) page is an evidence snapshot. Full index: [文档索引](../README.md#-文档索引).
 
 > **Translation status**: all sections are translated; the Chinese README remains the source of truth for ongoing changes.
 

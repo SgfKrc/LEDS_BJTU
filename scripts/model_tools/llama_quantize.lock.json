@@ -6,7 +6,7 @@
     "revision": "47e1de77aa0f06bf73cfd8c5281d95979f89fcbe",
     "license": "MIT"
   },
-  "source": "android/app/src/main/cpp/llama.cpp",
+  "source": "../qlh-android/app/src/main/cpp/llama.cpp",
   "cmake_target": "llama-quantize",
   "targets": {
     "windows-x86_64": {

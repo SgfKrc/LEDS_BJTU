@@ -6,11 +6,12 @@
 
 **面向异构边缘设备的多引擎、可演进分布式大模型推理系统**
 
-模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · 可视化监控 · 外部算力辅助
+模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · TUI 主入口 · 边缘优化
 
-**v0.1.8.3**（更新日期：2026-09-14）
+**v0.1.8.3**（更新日期：2026-09-15）
 
-> 📌 总排期与生命周期：**[总体下一步计划](docs/总体下一步计划.md)**；当前能力与证据快照：**[项目进展与下一步计划](docs/archive/项目进展与下一步计划.md)**。
+> 📌 当前主线：[主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md)；当前支线：[支线开发计划：外置迁移与 Koakumix](docs/支线开发计划-外置迁移与Koakumix-2026-09-14.md)；历史能力快照：**[项目进展与下一步计划](docs/archive/项目进展与下一步计划.md)**。
+> 📦 **仓库边界已固化**：主仓只保留分布式推理核心、控制面、跨平台 TUI、模型合同和核心质量门；Android、Web/Desktop shell、发布和工具箱位于工作区兄弟仓库。详见[主仓拆分后仓库边界与环境合同](docs/主仓拆分后仓库边界与环境合同-2026-09-15.md)。
 > 本 README 描述**已实现**的能力；标注 *PoC* 的部分默认关闭、能力边界见对应专项文档，不等同于生产能力。
 > 适用范围：QLH 项目能力总览、快速上手与文档索引；能力边界与最新证据以专项文档、源码和测试为准。
 > 🧰 **刚克隆仓库？先看 [克隆后资产获取清单](#-克隆后资产获取清单)。**
@@ -50,10 +51,10 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🌐 **Tailscale 与双栈组网** | IPv4/IPv6 端点、手动入群和启动重连按“用户首选 → bootstrap → Tailnet”回退；显式连接的偏好会持久化。双机 IPv6 短任务已实测，IPv4-only/IPv6-only 安装包和真实 WSS/443 仍待环境验收 |
 | 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；系统凭据和首次安装联调后置 |
 | 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
-| 🎛️ **管理面板** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控 |
-| 🖥️ **TUI 管理菜单** | 终端版管理菜单，纯标准库零依赖，Windows/Linux/macOS 通用；`start_tui.bat` / `start_tui.sh` 一键启动（自动带后端）；`--host` 直管远程 Tailscale 主节点；`bjtu chat` 进入 T9 简化聊天页（安装包内置 Textual，源码模式仍可隔离安装；见[适配计划](docs/TUI适配实施计划.md)）→ [使用指南](docs/TUI使用指南.md) |
+| 🎛️ **控制面** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控；用户交互以 TUI 为主 |
+| 🖥️ **TUI 主入口** | `qlh chat` 面向本地/远端引擎；管理 TUI 负责节点、模型舰队、任务和状态；`qlh_edge` 提供最小 HTTP → [使用指南](docs/TUI使用指南.md) |
 | 🖼️ **图像能力边界** | 主项目保留图片上传、Gemma/Qwen 多模态理解和图生文，不提供图像生成或编辑，也不安装相关运行时与模型资产。生图唯一归属为 Koakumix `harness_workbench`，接口为 `/v1/images/generations`；旧 SD 计划只作历史记录。 |
-| 📱 **Android 客户端** | 普通版支持本地 GGUF/远程 PC、SAF、presence lease、Full Worker/Stage、Gemma4 mmproj/JNI 图像路径、更新/脱敏日志/连接诊断；极简版保留远程轻量入口。以上为本机/JVM/交叉编译开发门，真机与生产验收后置 |
+| 📱 **Android 客户端（支线）** | Android Full/Lite、SAF、Full Worker/Stage 和真机证据由独立端侧仓库维护；主仓只冻结任务、模型和能力合同 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
@@ -140,7 +141,9 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── 三种分布式拆分细化实施方案.md  # 层间待测试、任务链与张量并行实施方案
 │   ├── Android版本远期计划.md       # Android 端方案评估与规划
 │   ├── Android SAF模型存储方案.md   # Android SAF 外部模型目录方案
-│   ├── 总体下一步计划.md             # ★ 唯一总计划入口：L0-L5、生命周期、依赖与发布门
+│   ├── 主线开发计划-分布式推理与边缘优化-2026-09-14.md # ★ 当前主线基线
+│   ├── 支线开发计划-外置迁移与Koakumix-2026-09-14.md # ★ 当前支线基线
+│   ├── 总体下一步计划.md             # 历史总排期与计划索引
 │   ├── 项目进展与下一步计划.md       # ★ 能力、证据与原 P0/P1/P2 快照
 │   ├── 张量并行外部辅助与混合拆分调研方案.md  # ★ mesh 内 TP 不可行的量化论证 + 三条外部辅助路线
 │   ├── TP孤岛接入指南.md            # ★ 路线 A：孤岛=单逻辑高算力节点（PoC）
@@ -171,47 +174,11 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）
 ├── schemas/                       # ★ MODEL-FLEET 冻结契约（artifact/pull-job/deployment/profile JSON Schema）
 ├── fixtures/                      # 测试与走查 fixture（API 事件流、模型门样例）
-├── android/                       # Android 客户端（Kotlin + Jetpack Compose）
-│   ├── app/
-│   │   ├── build.gradle.kts       # Gradle 构建脚本（含 release 签名配置）
-│   │   └── src/main/java/com/qlh/inference/
-│   │       ├── data/              # Room 数据库 + DataStore 设置持久化
-│   │       ├── network/           # OkHttp API 客户端 + ChatRepository
-│   │       ├── service/           # InferenceService 前台 Service + ModelManager + LocalInferenceEngine
-│   │       └── ui/                # ChatScreen / SettingsScreen / SessionListScreen
-│   ├── keystore.properties        # release 签名配置（Git 忽略，需本地生成）
-│   ├── qlh-release.jks            # release 签名密钥库（Git 忽略）
-│   └── gradlew / gradlew.bat      # Gradle Wrapper（无需 Android Studio）
-├── .venv-packaging/               # 集显版打包专用 venv（torch CPU + PyInstaller）
-├── .venv-packaging-cuda/          # 独显版打包专用 venv（torch CUDA + PyInstaller）
+├── (sibling) qlh-android/         # Android Full/Lite、JNI、Gradle、Android tests/resources
+├── (sibling) qlh-shell/            # CyberGothic Web/Desktop shell、Node tests、可选 Textual
+├── (sibling) qlh-release/          # Launcher、PyInstaller/Inno/Linux 发布与发布 venv
+├── (sibling) qlh-toolbox/          # SSH/patch、演示、答辩和性能工具
 ├── .venv-test/                    # 隔离测试环境（setup_test_env.py 创建；全量测试专用，勿装系统 Python）
-├── packaging/                     # 打包配置 + 分发服务器（不含构建产物）
-│   ├── launcher.py                # 主应用启动载荷（Tailscale → 模型检查 → 引擎选择 → 启动）
-│   ├── qlh_launcher.py            # ★ 独立 Bootstrap（GUI/TUI/更新，不导入推理依赖）
-│   ├── launcher_cybergothic.py    # CyberGothic 桌面壳：静态页 + /api 反向代理
-│   ├── updater.py                 # 更新 CLI
-│   ├── update_core.py             # 清单、版本、下载与 SHA-256 核心
-│   ├── qlh-launcher.spec          # 独立 Launcher PyInstaller 规格
-│   ├── setup-launcher.iss         # 独立 Launcher Setup
-│   ├── serve.py                   # ★ 极简 HTTP 文件分发服务器（PC + Android + Linux 安装包）
-│   ├── qlh-cpu.spec               # PyInstaller 规格文件（集显版）
-│   ├── qlh-cuda.spec              # PyInstaller 规格文件（独显版，CUDA + CPU 回退）
-│   ├── qlh-tui-chat.spec          # Textual 聊天页控制台伴随程序（主包内置）
-│   ├── setup.iss                  # Inno Setup 安装脚本 集显版
-│   ├── setup-cuda.iss             # Inno Setup 安装脚本 独显版
-│   ├── requirements-cpu.txt       # CPU-only 依赖清单
-│   ├── linux/                     # Linux .deb 打包
-│   │   ├── build-deb.sh           # deb 构建脚本
-│   │   ├── launcher.py            # Linux 跨平台启动器
-│   │   ├── control-cpu / control-cuda  # dpkg 元数据
-│   │   ├── postinst / prerm / postrm   # 安装/卸载脚本
-│   │   ├── qlh-edge-inference.service  # systemd 服务单元
-│   │   └── qlh-edge-inference.desktop  # 桌面入口
-│   ├── dist/                      # ★ 最终安装包输出目录（Git 忽略）
-│   └── README.md                  # 打包文档
-├── frontend_cybergothic/          # ★ 唯一产品前端（React + TypeScript + Vite）
-│   ├── src/                       # Chat / Models / RAG / Tasks / Account 等产品页面
-│   └── scripts/                   # 对比度与浏览器回归工具
 ├── harness_workbench/             # ★ 小模型 harness 工作台（独立子项目；不 import 主项目代码）
 │   ├── context_engine/            # 上下文预算与 STATE 压缩
 │   ├── model_profiles/            # 模型画像与能力门
@@ -252,7 +219,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 |------|------|------|------|
 | `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **自研**（文档维护 Agent 独立化） | 规则数据化扫描器、规则变更机械扫描（new/gone/changed 增量矩阵）与演进门控 |
 | `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **自研**（Codex ↔ Reasonix 协作桥） | stdio MCP 桥接，供 Codex 调用只读 Reasonix 子智能体；CLI 路径与模型 ref 按本机解析，`configure verify` 自检 |
-| `android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **第三方**（唯一非自研） | Android Full 变体原生构建；固定 revision，PC 侧与 Python sidecar 都不需要 |
+| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **第三方**（Android 外置仓库依赖） | Android Full 变体原生构建；固定 revision，PC 侧与 Python sidecar 都不需要 |
 
 #### 自研子项目一：`qlh-docagent`（文档维护 Agent）
 
@@ -273,7 +240,8 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 
 ```bash
 git submodule update --init --recursive                              # 已有工作区
-git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 首次克隆（推荐）
+git clone --recurse-submodules https://github.com/SgfKrc/qlh       # 主仓首次克隆
+# 按需在同级目录克隆 https://github.com/SgfKrc/qlh-android、qlh-shell、qlh-release、qlh-toolbox
 ```
 
 > 规划：小模型 harness 工作台（`harness_workbench/`）目前仍是主仓库内的目录，**将来考虑按同样模式独立为子模块**（自研子项目），主仓库届时只保留 gitlink 与接线文档。
@@ -362,11 +330,11 @@ git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 首次克
 | tqdm | ≥ 4.65.0 | 进度条 |
 | psutil | ≥ 5.9.0 | 系统资源监控 |
 
-### 前端
+### 产品壳（支线，可选）
 
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
-| Node.js | ≥ 18 | 前端构建 |
+| Node.js | ≥ 18 | 仅迁移/开发产品壳支线 |
 | npm | — | 包管理器 |
 
 ### Android 客户端
@@ -386,13 +354,13 @@ git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU   # 首次克
 # Python 依赖（主节点 SQLite 自持，无需 PostgreSQL）
 pip install -r requirements.txt
 
-# 产品前端依赖（唯一产品前端）
-cd frontend_cybergothic && npm ci && cd ..
+# 产品壳依赖（支线；主线运行不需要）
+# 产品壳在支线仓库维护：cd ../qlh-shell/frontend_cybergothic && npm ci
 ```
 
 ### 🚀 一键配置全部开发环境（克隆后推荐）
 
-仓库包含**主运行时 + 8 个 Python 虚拟环境 + 3 个 Node 子项目**，逐个手配繁琐。
+仓库包含**主运行时 + Python 虚拟环境**；Node 子项目属于支线迁移源，不是主线运行前置。
 统一入口 `scripts/setup_envs.py`（或根目录 `setup_all_envs.bat` / `setup_all_envs.sh`）可一次配完：
 
 ```bash
@@ -422,13 +390,13 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 |---|---|---|---|
 | **主环境**（系统 Python） | 运行时（transformers/torch 推理服务）与工具脚本 | `requirements.txt` | `requirements-lock/main.lock.txt` |
 | `.venv-test` | 唯一测试环境（全量/定向 pytest） | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
-| `.venv-tui` | T9 终端聊天页（textual） | `packaging/requirements-tui.txt` | `requirements-lock/tui.lock.txt` |
-| `.venv-gemma4-native` | 原生 Gemma 4 MTMD / llama.cpp | `packaging/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
-| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
-| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar（含 pipeline 执行依赖） | `packaging/requirements-qwen3-sidecar.txt` + `requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
-| `.venv-packaging` | 集显版打包（torch CPU + PyInstaller） | `packaging/requirements-cpu.txt` | `requirements-lock/packaging.lock.txt` |
-| `.venv-packaging-cuda` | 独显版打包 | `packaging/requirements-cpu.txt` | `requirements-lock/packaging-cuda.lock.txt` |
-| frontend_cybergothic | 唯一产品前端 | `package-lock.json`（`npm ci`） | — |
+| `../qlh-shell/.venv-tui` | T9 终端聊天页（textual） | `../qlh-shell/requirements-tui.txt` | `../qlh-shell/requirements-lock/tui.lock.txt` |
+| `.venv-gemma4-native` | 原生 Gemma 4 MTMD / llama.cpp | `requirements/requirements-gemma4-native.txt` | `requirements-lock/gemma4-native.lock.txt` |
+| `.venv-gemma4-pipeline` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `requirements/requirements-gemma4-pipeline-sidecar.txt` | `requirements-lock/gemma4-pipeline.lock.txt` |
+| `.venv-qwen3-sidecar` | Qwen3 PyTorch sidecar（含 pipeline 执行依赖） | `requirements/requirements-qwen3-sidecar.txt` + `requirements/requirements-qwen3-pipeline-sidecar.txt` | `requirements-lock/qwen3-sidecar.lock.txt` |
+| `../qlh-release/.venv-packaging` | 集显版打包（torch CPU + PyInstaller） | `../qlh-release/packaging/requirements-cpu.txt` | `../qlh-release/requirements-lock/packaging.lock.txt` |
+| `../qlh-release/.venv-packaging-cuda` | 独显版打包 | `../qlh-release/packaging/requirements-cpu.txt` | `../qlh-release/requirements-lock/packaging-cuda.lock.txt` |
+| `../qlh-shell/frontend_cybergothic` | 产品壳（支线） | `package-lock.json`（`npm ci`） | — |
 
 > `setup_all_envs.bat` 在 Windows 会自动 `chcp 65001`；直接跑脚本时若终端乱码，
 > 手动 `chcp 65001` 或 `set PYTHONIOENCODING=utf-8` 即可。
@@ -441,10 +409,10 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 |---|---|---|---|
 | **主环境**（系统 Python） | 运行时（transformers 4.47.1 / torch / 推理服务）与工具脚本 | `requirements.txt` | 不装 pytest 系测试依赖；不跑全量测试 |
 | **`.venv-test`** | **唯一测试环境**（全量/定向 pytest 都在这跑） | `scripts/setup_test_env.py` + `requirements-test.txt` | 不承载运行时推理；不被当作主环境使用 |
-| `.venv-packaging/` | 集显版打包（torch CPU） | `packaging/requirements-cpu.txt` | — |
- | `.venv-packaging-cuda/` | 独显版打包（torch CUDA） | 见打包文档 | — |
-| `.venv-gemma4-native/` | 原生 Gemma 4 MTMD/llama.cpp 运行时 | `packaging/requirements-gemma4-native.txt` | 不得复用给 Transformers pipeline |
-| `.venv-gemma4-pipeline/` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `packaging/requirements-gemma4-pipeline-sidecar.txt` | 与 native/Qwen3 环境隔离 |
+| `../qlh-release/.venv-packaging/` | 集显版打包（torch CPU） | `../qlh-release/packaging/requirements-cpu.txt` | — |
+ | `../qlh-release/.venv-packaging-cuda/` | 独显版打包（torch CUDA） | 见 qlh-release 打包文档 | — |
+| `.venv-gemma4-native/` | 原生 Gemma 4 MTMD/llama.cpp 运行时 | `requirements/requirements-gemma4-native.txt` | 不得复用给 Transformers pipeline |
+| `.venv-gemma4-pipeline/` | Gemma 4 PyTorch Transformers 5.10.1 sidecar | `requirements/requirements-gemma4-pipeline-sidecar.txt` | 与 native/Qwen3 环境隔离 |
 | `.venv-qwen3-sidecar/` | Qwen3 PyTorch sidecar | 各自 requirements | — |
 
 **常用命令**：
@@ -469,16 +437,15 @@ python scripts/setup_test_env.py --check
 ### 0. 克隆后必做（一次性的环境步骤）
 
 ```bash
-# 1. 仅构建 Android Full 时拉取 llama.cpp 子模块；PC 从节点和 Python sidecar 不需要
-#    仓库另有 2 个自研子模块 tools/docagent（文档维护 Agent）与 tools/reasonix-codex-bridge（Codex 桥接），
-#    随默认克隆带出；llama.cpp 仅构建 Android Full 才需要。完整清单见 §项目架构 的子模块小节
+# 1. 主仓只拉取自己的自研子模块；Android Full 的 llama.cpp 在 qlh-android 仓内维护，主线可跳过
+#    产品壳、Android、发布工具和 Toolbox 是兄弟仓库，按需在工作区另行 clone。
 git submodule update --init --recursive
 
 # 2. 安装 Python 依赖（主环境；联网）
 pip install -r requirements.txt
 
-# 3. 产品前端依赖（可选，仅开发前端时）
-cd frontend_cybergothic && npm ci && cd ..
+# 3. 产品壳依赖（可选，仅开发 qlh-shell 时；主线可跳过）
+# cd ../qlh-shell/frontend_cybergothic && npm ci
 
 # 4. 环境文件（不进仓库，按需自建）
 #    主环境 .env 至少含 QLH_CLUSTER_SECRET（分布式密钥）；判题/工具密钥见
@@ -488,8 +455,8 @@ cd frontend_cybergothic && npm ci && cd ..
 python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
 ```
 
-`llama.cpp` 已锁定为 `android/app/src/main/cpp/llama.cpp` Git submodule。要保留 Android Full
-构建能力，推荐首次使用 `git clone --recurse-submodules https://github.com/SgfKrc/LEDS_BJTU`；
+`llama.cpp` 已锁定为外置仓库 `../qlh-android/app/src/main/cpp/llama.cpp` 的 Git submodule。要保留 Android Full
+构建能力，需在兄弟目录 clone `https://github.com/SgfKrc/qlh-android`，进入该仓库后使用 `git submodule update --init --recursive`；
 若从节点只运行 PC CPU Worker、Qwen3/Gemma 4 PyTorch sidecar，则普通 clone 即可，不需要另行
 clone 或编译 `llama.cpp`。`.venv-gemma4-native` 使用 `llama-cpp-python`，也不直接引用该 Android
 源码子模块。
@@ -523,20 +490,20 @@ python scripts/setup_envs.py --check --no-node
 | 项 | 说明 |
 |---|---|
 | ✅ 测试 fixture 与实验计划 | `fixtures/` 全部入库 |
-| ✅ 签名源站 / serve 分发 | 代码在 `packaging/`，无需额外资产 |
-| ⚠️ 发布签名密钥 | `packaging/.signing-keys/` **不进仓库**；由发布者持有，克隆者无密钥只能验签不能签发 |
+| ✅ 签名源站 / serve 分发 | 代码在 `../qlh-release/`，无需主仓额外资产 |
+| ⚠️ 发布签名密钥 | `../qlh-release/.signing-keys/` **不进仓库**；由发布者持有，克隆者无密钥只能验签不能签发 |
 | ⚠️ `.env`（QLH_CLUSTER_SECRET 等） | 各节点自备，不入库 |
 | ⚠️ `models/` 大文件 | 全部 gitignore；按上表获取，不随仓库分发 |
 
 ### 3. 安装包（不克隆也可用）
 
-Windows CPU/CUDA Setup、Launcher、Android Full/Lite APK、Linux `.deb` 均从**发布渠道**获取（本项目内网：主节点 `python packaging/serve.py` 分发服务器浏览器直下）。不要求克隆仓库即可安装使用；克隆仓库主要用于开发与验收。
+Windows CPU/CUDA Setup、Launcher、Android Full/Lite APK、Linux `.deb` 均从**发布渠道**获取（本项目内网：主节点在 `qlh-release` 运行 `python packaging/serve.py`）。不要求克隆主仓即可安装使用；克隆仓库主要用于开发与验收。
 
 ---
 
 ## 🤖 模型下载
 
-> **默认源**：当前 control-svc 内置并启用 Hugging Face 官方源，同时登记 HF 镜像与 ModelScope 端点描述（后两者默认关闭，待对应 adapter/真实网络验收）；支持来源优先级、启停和 `credential_ref`。Windows token 由当前用户 DPAPI 保护；模型代理按 `QLH_HTTP_PROXY > 用户持久化配置 > 直连` 选择，可通过本机 `/models/network/proxy` API 设置或清除，不修改系统代理。gated 仓库必须先登记凭据并显式接受许可证；明文不进入 SQLite/job/manifest/响应。机制见 [专项计划](docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1。
+> **默认源**：当前 control-svc 内置并启用 Hugging Face 官方源，同时登记 HF 镜像与 ModelScope 端点描述（后两者默认关闭，待对应 adapter/真实网络验收）；支持来源优先级、启停和 `credential_ref`。Windows token 由当前用户 DPAPI 保护；模型代理按 `QLH_HTTP_PROXY > 用户持久化配置 > 直连` 选择，可通过本机 `/models/network/proxy` API 设置或清除，不修改系统代理。gated 仓库必须先登记凭据并显式接受许可证；明文不进入 SQLite/job/manifest/响应。机制见 [专项计划](../qlh-release/docs/一键模型部署与自治集群远期计划.md) §4.2/§7.1。
 
 项目默认示例模型是 **Qwen-1.8B-Chat**，并通过模型注册表提供其他 Qwen/DeepSeek 实验槽位。下面仅说明默认模型的两种格式，不代表系统只支持该模型：
 
@@ -627,16 +594,16 @@ Android 本地模式（现有 UI 中称“全有模式”）下，模型需放�
 # 终端 1：启动 Python 后端（从项目根目录运行）
 python src/api_server.py
 
-# 终端 2：启动唯一产品前端（Vite 代理到 8000）
-cd frontend_cybergothic && npm run dev
+# 终端 2：主线交互入口（标准库 TUI；产品壳属于支线）
+python -m src.tui_admin --plain --host http://127.0.0.1:8000
 ```
 
 后端就绪后：
 - **后端 API**：`http://localhost:8000`
-- **产品前端开发服务器**：`http://localhost:5174`（Vite 热更新，代理到 8000）
-- **产品前端桌面壳**：先构建 `frontend_cybergothic`，再执行 `python packaging/launcher_cybergothic.py`（默认 `9851`，反向代理 `/api` 到 `8000`）
+- **主线 TUI**：终端内多轮/流式对话和模型/节点控制
+- **产品壳**：由支线 `qlh-shell` 迁移计划维护，不能作为主线启动前置
 
-> 当前标准后端、pywebview Launcher、CPU/CUDA/Slim spec 与 Linux `.deb` 默认携带 `frontend_cybergothic/dist`；干净机首启、WebView2、Linux 安装与升级仍属于后置发布验收。
+> 产品壳、pywebview Launcher、安装 spec 与 Linux `.deb` 属于支线迁移范围；它们的干净机/升级验收不构成主线 TUI 或 Edge L 档的启动前置。
 
 ### 单机模式（PC）
 
@@ -733,7 +700,7 @@ curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
 
 > ⚠️ **数据边界**：路线 B / C 会把用户内容（含投机解码的草稿 token）送出集群。作用域档位 `deny` / `opt_in`（默认）/ `allow_all` 是安全边界而非性能开关，取值写错会 fail-closed 回落 `deny`。放开前请确认合规要求。
 
-### Windows 打包基线与构建脚本
+### Windows 打包基线与构建脚本（发布支线，可选）
 
 下表是现有完整包构建脚本的历史体积基线，不是 `PACK-SLIM` 的发布承诺。`PACK-SLIM` 已完成本机开发门，但真实 PyInstaller 构建与首次外置 runtime 引导仍待打包环境验收。
 
@@ -745,6 +712,8 @@ curl -X POST localhost:8000/api/chat -H "Content-Type: application/json" \
 **集显版 (CPU) 构建**：
 
 ```bash
+# 发布构建在同级 qlh-release 仓库执行
+cd ..\qlh-release
 # 0. 创建并激活集显版 venv（仅首次）
 python -m venv .venv-packaging
 .venv-packaging\Scripts\activate
@@ -754,9 +723,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r packaging/requirements-cpu.txt
 pip install pyinstaller
 
-# 2. 构建当前安装包的历史兼容静态资源
-#    新产品 UI 的开发/桌面壳使用 frontend_cybergothic；见“快速开始”。
-cd frontend_cybergothic && npm install && npx vite build && cd ..
+# 2. 构建发布支线的历史兼容静态资源（主线可跳过）
+#    产品壳迁移由支线计划管理。
+# cd ..\qlh-shell\frontend_cybergothic && npm install && npm run build && cd ..\..\qlh-release
 
 # 3. PyInstaller 打包（★ 从项目根目录运行）
 pyinstaller packaging/qlh-cpu.spec --noconfirm
@@ -769,6 +738,8 @@ cd packaging
 **独显版 (CUDA) 构建**（需另一独立 venv）：
 
 ```bash
+# 发布构建在同级 qlh-release 仓库执行
+cd ..\qlh-release
 # 0. 创建并激活独显版 venv（仅首次）
 python -m venv .venv-packaging-cuda
 .venv-packaging-cuda\Scripts\activate
@@ -791,7 +762,7 @@ cd packaging && "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup-cuda.iss
 >
 > 安装后双击桌面快捷方式即可启动，无需配置 Python 环境。卸载时会询问是否同时删除 `models/` 目录，默认保留模型文件。
 >
-> 详细打包流程参见 [packaging/README.md](packaging/README.md)。
+> 详细打包流程参见 [qlh-release README](../qlh-release/README.md)。
 
 ### Linux `.deb` 打包基线
 
@@ -805,7 +776,7 @@ Linux 构建脚本覆盖 Ubuntu 22.04+ / Debian 12+；下表的版本号和体�
 **构建**（需 Ubuntu/Debian 环境）：
 
 ```bash
-cd packaging/linux
+cd ..\qlh-release\packaging\linux
 bash build-deb.sh cpu     # 集显版
 bash build-deb.sh cuda    # 独显版
 ```
@@ -830,18 +801,19 @@ sudo systemctl enable --now qlh-edge-inference  # 开机自启
 
 ### Android 客户端
 
-> 前提：已安装 JDK 17 + Android SDK（API 34+），SDK 路径配置在 `android/local.properties`
+> 前提：已安装 JDK 17 + Android SDK（API 34+），SDK 路径配置在 `../qlh-android/local.properties`
 >
-> 新克隆仓库后需先初始化 llama.cpp submodule（Full 变体原生构建必需，Lite 不需要）：
+> 新克隆 `qlh-android` 后需先初始化其 llama.cpp submodule（Full 变体原生构建必需，Lite 不需要）：
 
 ```bash
+cd ..\qlh-android
 git submodule update --init --recursive
 ```
 
 **编译**（无需 Android Studio）：
 
 ```bash
-cd android
+cd ..\qlh-android
 
 # Debug APK（未压缩，开发用）
 ./gradlew.bat assembleDebug
@@ -854,14 +826,14 @@ cd android
 
 | 产物 | 路径 | 典型大小 | 说明 |
 |------|------|---------|------|
-| Full Debug | `android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | 含 llama.cpp native 后端 |
-| Full Release | `android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
-| Lite Release | `android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | 纯薄客户端，不含 native 库 |
+| Full Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | 含 llama.cpp native 后端 |
+| Full Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
+| Lite Release | `../qlh-android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | 纯薄客户端，不含 native 库 |
 
 **安装**：
 
 ```bash
-adb install android/app/build/outputs/apk/full/release/app-full-release.apk
+adb install ../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk
 ```
 
 **使用**：
@@ -970,21 +942,23 @@ python serve.py
 
 ### 设计文档
 
-- [总体下一步计划](docs/总体下一步计划.md) — **唯一总计划入口**：L0–L4 阶段门、工作项生命周期、依赖、止损和归档规则
-- [项目进展与下一步计划](docs/archive/项目进展与下一步计划.md) — **历史能力与证据快照**；当前排期、验收边界和唯一决策入口以《总体下一步计划》为准
+- [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) — 当前主线基线：双引擎、三种分布式形态、TUI 和 Edge L 档
+- [支线开发计划：外置迁移与 Koakumix](docs/支线开发计划-外置迁移与Koakumix-2026-09-14.md) — 产品壳、侧车、发布和工具迁移边界
+- [总体下一步计划](docs/总体下一步计划.md) — 历史总排期与当前计划索引
+- [项目进展与下一步计划](docs/archive/项目进展与下一步计划.md) — **历史能力与证据快照**；当前主线/支线排期以两份 2026-09-15 基线计划为准
 - [项目技术说明（新人入门）](docs/项目技术说明.md) — KV、算子融合、模型量化、分布式架构、并发调度与通信协议
 - [文档状态与维护规则](docs/文档状态与清理清单.md) — 文档状态定义与后续维护规则
 - [整体架构](docs/整体架构.md)
 - [核心技术原理](docs/核心技术原理.md)
-- [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
+- [2-bit、3-bit 与 4-bit 量化调研与实施计划](docs/archive/2bit与4bit量化调研与实施计划.md) — 14B+ 低比特容量路线、Q2/Q3/IQ2 与 NF4/Q4 对照、GGUF/Android 验证、PyTorch sidecar 与 Go/No-Go 门槛
 - [模块接口说明](docs/模块接口说明.md)
 - [测试与评判标准](docs/测试与评判标准.md)
-- [SD 1.5 引擎与分布式图像生成实施计划](docs/SD%201.5引擎与分布式图像生成实施计划.md) — 历史验收记录；主项目实现已于 2026-09-14 裁撤，后续生图只在 Koakumix 演进
+- [SD 1.5 引擎与分布式图像生成实施计划](docs/archive/SD%201.5引擎与分布式图像生成实施计划.md) — 历史验收记录；主项目实现已于 2026-09-14 裁撤，后续生图只在 Koakumix 演进
 - [微服务架构改造计划](docs/archive/微服务架构改造计划.md) — 控制面/调度/推理三服务拆分、契约冻结与并行共存（阶段 3.2 完成；2.5/3.3 删除动作冻结至清理阶段）
-- [一键模型部署与自治集群远期计划](docs/一键模型部署与自治集群远期计划.md) — 模型注册、Sidecar、导入/下载、部署模拟与本机产品面已收口；下载治理采用 HF 直连 → 用户代理 → ModelScope 回退，真实大工件、CUDA、跨 PC 分发和生产路由仍待验收
+- [一键模型部署与自治集群远期计划](../qlh-release/docs/一键模型部署与自治集群远期计划.md) — 模型注册、Sidecar、导入/下载、部署模拟与本机产品面已收口；下载治理采用 HF 直连 → 用户代理 → ModelScope 回退，真实大工件、CUDA、跨 PC 分发和生产路由仍待验收
 - [测试通道运行说明](docs/测试通道运行说明.md) — 测试通道、标记（external/real_model）与运行方式
 - [自动化优化实验与报告方案](docs/自动化优化实验与报告方案.md) — 固定提示词/seed/工件、串并行调度、统一 schema 与对照报告；EX-N3 只读生产质量门已复核既有记录 3/3 通过，真实模型采样、CUDA、双机和生产路由仍待验收
-- [桌面赛博哥特与安卓原生界面复核](docs/桌面赛博哥特与安卓原生界面复核-2026-08-23.md) — PC 新前端与 pywebview/安装包交付链路、Android 原生极简风的边界、端间功能映射与 `CY-PKG-01` 计划
+- [桌面赛博哥特与安卓原生界面复核](../qlh-shell/docs/桌面赛博哥特与安卓原生界面复核-2026-08-23.md) — PC 新前端与 pywebview/安装包交付链路、Android 原生极简风的边界、端间功能映射与 `CY-PKG-01` 计划
 
 ### 专项文档
 
@@ -1000,23 +974,23 @@ python serve.py
 - [DeepSeek 缓存机制借鉴与 QLH 落地专项计划](docs/缓存机制专项计划-2026-09-13.md) — 登记 V4.1 磁盘上下文缓存与 SWA 单元匹配机制（三种持久化时机、hit/miss 25–50× 差价、KV 1/4 HBM 与 1/8 SSD），对照 `paged_kv_cache`/harness/bridge 现状，给出前缀稳定性与命中观测（零成本）、两级缓存与单元对齐（工程改造）、架构级压缩（仅跟踪）三档动作与 `CACHE-01`～`CACHE-06` 票
 - [CACHE-05 非对称分工论证](docs/非对称分工论证-2026-09-14.md) — DeepSeek 输入/输出非对称仅作架构参考；QLH 以 draft-verify 与亚 1B 岗位化定义可验证控制变量、指标和停止规则
 - [reasonix-codex-bridge 全面审计与多次实测报告](tools/reasonix-codex-bridge/docs/reasonix-codex-bridge全面审计与多次实测报告-2026-09-13.md) — 真实覆盖 MCP 控制面、inspect、plan、受控写入/回滚、checkpoint/resume、ACP-06、命名命令执行、Reasonix 原生 `web_fetch` 与 provider 搜索不可用门控；结论为可作为受限文件型低价替代，跨进程 ACP 恢复、自主多阶段编排和 provider 搜索接通验收仍待后续
-- [答辩辅助工具细化与发散方案](docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/archive/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
+- [答辩辅助工具细化与发散方案](../qlh-toolbox/docs/答辩辅助工具细化与发散方案.md) — P1-P4 细化与整体辅助工具发散；[模型文件 LZ4 压缩调研](docs/archive/模型文件LZ4压缩必要性调研与评估.md)（结论：不做本地转换）
 - [抗弱网通信协议专项计划](docs/抗弱网通信协议专项计划.md) — 校园网 UDP 阻断、Tailscale/自建 DERP 现状、路径感知、应用层 WSS、Transport v2 与 UDP-over-WSS sidecar 分阶段计划
 - [集群接入稳定性与本地RAG实施计划](docs/集群接入稳定性与本地RAG实施计划.md) — 手动入群一次性授权（CLUSTER-JOIN）、分布式角色/可用性审计、SSH 补丁传输、主节点本地 SQLite FTS5 + 向量 RAG、竞态/时序测试（T-RACE/G5.3）分期
-- [前端、Android 与后端接口缺口审查](docs/前端安卓后端接口与功能缺口审查-2026-08-22.md) — 历史审查记录；`frontend_cybergothic/` 是唯一主项目前端，Image Studio 已随 2026-09-14 生图裁撤移除
+- [前端、Android 与后端接口缺口审查](../qlh-shell/docs/前端安卓后端接口与功能缺口审查-2026-08-22.md) — 历史审查记录；产品壳已转入支线计划，Image Studio 已随 2026-09-14 生图裁撤移除
 - [图算法智能编排](docs/图算法.md) — 最大带宽生成树 + DFS 路径搜索
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/archive/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
 - [三种分布式拆分细化实施方案](docs/三种分布式拆分细化实施方案.md) — PyTorch 层间待测试项、任务链和张量并行的协议、容错与实施阶段
-- [Android 与 PC 功能差距清单](docs/安卓与PC功能差距清单.md) — 当前 Android Full/Lite 与 PC 的能力边界；presence、Full Worker/Stage、Gemma4 MTMD、更新/日志/诊断已完成本机开发门，真机/生产验收后置
+- [Android 与 PC 功能差距清单](../qlh-shell/docs/安卓与PC功能差距清单.md) — 当前 Android Full/Lite 与 PC 的能力边界；presence、Full Worker/Stage、Gemma4 MTMD、更新/日志/诊断已完成本机开发门，真机/生产验收后置
 - [Android 版本远期计划](docs/archive/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分的历史架构基线与远期边界
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
-- Android llama.cpp 已迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并移入 `docs_to_delete/`
+- Android llama.cpp 已随 `qlh-android` 迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](../qlh-android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并移入 qlh-android 的 `_to_delete/`
 - [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC/Android Full Worker；开发门与短程双机证据已具备，`task_dispatch` 生产准入、长时/断电恢复仍后置
 - [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
 - [数据库测试指南](docs/数据库测试指南.md) — 存储层测试现状：SQLite 契约、退场 fail-closed 用例与运行方式（PG 已退场）
-- [离线资产一键整合包设计](docs/离线资产一键整合包设计.md) — M1 已完成容量预检、清单、原子 ZIP、7z/分卷与恢复校验；真实全量出包和 Android SAF 导入后置
+- [离线资产一键整合包设计](../qlh-release/docs/离线资产一键整合包设计.md) — M1 已完成容量预检、清单、原子 ZIP、7z/分卷与恢复校验；真实全量出包和 Android SAF 导入后置
 - [文档维护 Agent 工具设计](tools/docagent/docs/文档维护Agent工具设计.md) — M1-M3 已完成本机检索/语义质量门；工具只提供证据和建议，不自动改写文档
 - [通用工具与子项目候选计划](docs/通用工具与子项目候选计划-2026-09-12.md) — 从主仓与 harness 筛选可跨项目复用的模块：A 档 5 项（进程归属/重置、演示证据链、签名更新、零依赖 TUI、多机同步与补丁分发）、B 档 7 项（harness 内部独立包，RAG 优先）、C 档 venv 环境治理入选；含判定标准、优先级与毕设选题映射
 
@@ -1036,9 +1010,9 @@ python serve.py
 - [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) — T1-T8 管理 TUI 网关适配与验收（Active）；T9.0-T9.5、T9.6 接线、T9.6-R2 Windows 开发机实装门和 UP-N6.4W 跨卷保留门已完成；外部干净机/Linux/真实模型会话、分布式真机与默认入口仍待（L4 Candidate）
 - [TUI 指令集](docs/TUI指令集.md) — 27 条 `/` 命令全量参考（别名/参数/退出语义）
 - TUI 技术栈与实现机制说明已并入 [TUI 适配与聊天页实施计划](docs/TUI适配实施计划.md) 和 [TUI 指令集](docs/TUI指令集.md)
-- [双机补丁分发工具专项计划](docs/双机补丁分发工具专项计划.md) — 从节点签名补丁收发（`tools/patch_dispatch.py` / `patch_listener.py` + 根目录 bat；推送走本地 7897 代理、帧/分支校验、force-clean 保护节点身份）
-- [打包说明](packaging/README.md) — PyInstaller + Inno Setup 打包流程
-- [独立安装包启动器与自动更新方案](docs/安装包自动更新引导器方案.md) — 独立 Bootstrap、GUI/TUI、清单下载、Ed25519 验签/key rotation、UP-N3 原子版本与 UP-N4 A/B 自更新回滚；Launcher ZIP 发布链路已实测，Windows/Linux 干净机与 Android 更新仍待
+- [双机补丁分发工具专项计划](../qlh-toolbox/docs/双机补丁分发工具专项计划.md) — 从节点签名补丁收发（`tools/patch_dispatch.py` / `patch_listener.py` + 根目录 bat；推送走本地 7897 代理、帧/分支校验、force-clean 保护节点身份）
+- [打包说明](../qlh-release/README.md) — PyInstaller + Inno Setup 打包流程
+- [独立安装包启动器与自动更新方案](../qlh-release/docs/安装包自动更新引导器方案.md) — 独立 Bootstrap、GUI/TUI、清单下载、Ed25519 验签/key rotation、UP-N3 原子版本与 UP-N4 A/B 自更新回滚；Launcher ZIP 发布链路已实测，Windows/Linux 干净机与 Android 更新仍待
 
 ---
 

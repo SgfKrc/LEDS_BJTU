@@ -10,7 +10,7 @@
 >
 > **使用入口**：当前日常使用与启动方式见 [TUI 使用指南](TUI使用指南.md)；`bjtu chat` 已存在，`bjtu launcher/ui/tui/update/version` 由独立 Bootstrap 接线
 >
-> **关联文档**：[总体下一步计划](总体下一步计划.md) · [微服务架构改造计划](archive/微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md) · [TUI 指令集](TUI指令集.md)
+> **关联文档**：[总体下一步计划](总体下一步计划.md) · [微服务架构改造计划](archive/微服务架构改造计划.md)（§2.2 / §2.4 / §4.2 / §6.2）· [模块接口说明](模块接口说明.md) · [Python后端冷启动优化方案](archive/Python后端冷启动优化方案.md) · [TUI 使用指南](TUI使用指南.md) · [TUI 指令集](TUI指令集.md)
 >
 > **前置条件**：T1-T8 已完成。T9 原型可在现有网关上开始；正式接线必须先冻结 chat SSE、会话持久化和请求级路由契约。分布式真机验收依赖《总体下一步计划》L1-1/L1-2/L1-3。
 
@@ -356,9 +356,9 @@ T9 不是 Claude Code 的代码 Agent 复刻。首期不实现 shell 执行、�
 
 引入第三方依赖是有意决策，但必须隔离：
 
-1. 新增 `packaging/requirements-tui.txt`，锁定与项目 Python 3.10-3.12、现有 `httpx` 兼容的 Textual 版本。
-2. 源码用户使用项目内 `.venv-tui` 或已有项目虚拟环境；禁止静默写入系统/全局 Python。
-3. `bjtu chat` 缺依赖时只显示检测结果和明确命令，可在用户确认后调用 `scripts/setup_tui_env.py` 创建 `.venv-tui`。
+1. 在 `qlh-shell/requirements-tui.txt` 锁定与项目 Python 3.10-3.12、现有 `httpx` 兼容的 Textual 版本。
+2. 源码用户使用 `qlh-shell/.venv-tui` 或已有项目虚拟环境；禁止静默写入系统/全局 Python。
+3. `bjtu chat` 缺依赖时只显示检测结果和明确命令，可在用户确认后调用 `QLH_SHELL_ROOT/scripts/setup_tui_env.py` 创建 `qlh-shell/.venv-tui`。
 4. 安装引导尊重 `HTTPS_PROXY`、`PIP_INDEX_URL` 和用户指定镜像；网络失败保留重试命令，不让启动器循环弹窗。
 5. Windows/Linux 正式安装包直接携带 TUI 运行依赖，不要求最终用户首次启动联网安装。
 6. 可提供 wheelhouse 离线安装路径；无 Textual 时当前管理 TUI 和 `--plain` 不受影响。
@@ -494,10 +494,10 @@ routing_preference = auto | local_only | distributed_preferred | distributed_req
   - 冻结 `routing_preference`、interactive SSE 事件和会话取消/提交语义（§9.4.1）。
   - `src/tui_chat.py`（Textual + httpx）单页 PoC：fixture 重放与真实后端双模式、Enter 发送/Alt+Enter 换行、Ctrl+C 取消、epoch 迟到事件 fencing、metrics 状态行。
   - 验收：`tests/test_chat_interactive.py` 8 + `tests/test_tui_sse.py` 13 + `tests/test_tui_chat.py` 6 全绿；管理 TUI 回归 `tests/test_tui_commands.py` 无回归（245 项相关回归全绿）。
-  - 环境：`packaging/requirements-tui.txt`、`scripts/setup_tui_env.py`、`bjtu chat` / `bjtu.sh chat` 启动路由（缺依赖只提示不污染全局解释器）。
+  - 环境：`qlh-shell/requirements-tui.txt`、`qlh-shell/scripts/setup_tui_env.py`、`bjtu chat` / `bjtu.sh chat` 启动路由（缺依赖只提示不污染全局解释器）。
 
 - [x] **T9.1 可选依赖与启动引导** ✅ 2026-08-06（主体完成）
-  - `packaging/requirements-tui.txt`（textual==8.2.8 + httpx）、`scripts/setup_tui_env.py`（创建 `.venv-tui`、幂等、尊重代理/镜像、`--wheelhouse` 离线安装、失败保留重试命令）。
+  - `qlh-shell/requirements-tui.txt`（textual==8.2.8 + httpx）、`qlh-shell/scripts/setup_tui_env.py`（创建 `qlh-shell/.venv-tui`、幂等、尊重代理/镜像、`--wheelhouse` 离线安装、失败保留重试命令）。
   - `bjtu chat` / `bjtu.sh chat` 启动路由：缺依赖只显示检测结果与安装命令并 exit 2，不污染全局解释器；管理 TUI 与 `--plain` 不受影响。
   - Windows/Linux 安装包携带依赖的开发接线已在 T9.6 完成；干净环境实测截图仍属于 T9.6-R 发布门。
 

@@ -176,7 +176,16 @@ def _source_summary(source: Path) -> tuple[dict[str, Any], list[dict[str, str]]]
 def _find_converter(explicit: Path | None) -> tuple[Path | None, str]:
     if explicit is not None:
         return (explicit.absolute(), "available") if explicit.is_file() else (None, "missing")
-    candidates = [Path(__file__).resolve().parents[2] / "android" / "app" / "src" / "main" / "cpp" / "llama.cpp" / "convert_hf_to_gguf.py"]
+    root = Path(__file__).resolve().parents[2]
+    android_roots: list[Path] = []
+    configured_root = os.environ.get("QLH_ANDROID_ROOT")
+    if configured_root:
+        android_roots.append(Path(configured_root).expanduser())
+    android_roots.extend((root.parent / "qlh-android", root / "android"))
+    candidates = [
+        android_root / "app" / "src" / "main" / "cpp" / "llama.cpp" / "convert_hf_to_gguf.py"
+        for android_root in android_roots
+    ]
     for name in ("convert-hf-to-gguf.py", "convert_hf_to_gguf.py"):
         found = shutil.which(name)
         if found:
@@ -190,7 +199,7 @@ def _find_converter(explicit: Path | None) -> tuple[Path | None, str]:
 # QLH converter patch marker (2026-08-16): legacy Qwen (QWenLMHeadModel) needs
 # `layer_norm_epsilon` accepted as an rms-epsilon source in conversion/base.py.
 # The llama.cpp submodule points at read-only upstream and cannot be pushed,
-# so the patch is tracked in packaging/patches/ and auto-applied on demand;
+# so the patch is tracked in tools/model_tools/patches/ and auto-applied on demand;
 # a fresh submodule init is repaired on the next conversion (no silent failure).
 _PATCH_MARKER = "QLH patch (2026-08-16): legacy Qwen (QWenLMHeadModel)"
 
@@ -209,11 +218,11 @@ def _ensure_converter_patch(converter: Path) -> None:
         return
     patch = (
         Path(__file__).resolve().parents[2]
-        / "packaging" / "patches" / "llama-cpp-converter-qwen-eps.patch"
+        / "tools" / "model_tools" / "patches" / "llama-cpp-converter-qwen-eps.patch"
     )
     if not patch.is_file():
         raise GGUFConvertError(
-            "converter patch file packaging/patches/llama-cpp-converter-qwen-eps.patch "
+            "converter patch file tools/model_tools/patches/llama-cpp-converter-qwen-eps.patch "
             "is missing; see docs/已知问题记录.md #10"
         )
     result = subprocess.run(

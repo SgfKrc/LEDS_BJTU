@@ -67,7 +67,7 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 
 已安装的 Windows 主应用包通过 `QLH-TUI-Chat/QLH-TUI-Chat.exe` 运行聊天页；Linux `.deb` 使用 `/opt/qlh-edge-inference/venv`。两者都已携带 Textual/httpx，首次进入不安装依赖也不联网。它与管理 TUI 是独立进程，`tui_admin.py --plain` 和原有 `bjtu` 默认入口不变。
 
-源码检出模式仍可使用隔离的 `.venv-tui`：先运行 `python scripts/setup_tui_env.py`，再执行 `bjtu chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列，当前不把聊天页设为默认入口。
+源码检出模式仍可使用 Shell 仓库隔离的 `qlh-shell/.venv-tui`：先运行 `python ..\qlh-shell\scripts\setup_tui_env.py`，再执行 `bjtu chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列，当前不把聊天页设为默认入口。
 
 ## 三、一键启动（start_tui.bat / start_tui.sh）
 

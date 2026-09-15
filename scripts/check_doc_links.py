@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """P1-6 文档收口：检查仓库内 Markdown 相对链接是否指向存在文件。
 
-覆盖范围：docs/、README.md、packaging/README.md、gateway/README.md 等。
+覆盖范围：docs/、README.md、tests/simulation/README.md 等主仓文档。
 - 提取 [text](url) 与 [text](url "title") 形式链接
 - 跳过 http(s)://、mailto:、# 锚点、<...> 自动链接
 - 解码 URL 编码，去掉 #锚点 后按相对路径解析
@@ -20,12 +20,14 @@ SKIP_PREFIX = ('http://', 'https://', 'mailto:', 'ftp://', '#')
 
 
 def iter_md_files():
-    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, 'docs')):
+    for dirpath, dirs, files in os.walk(os.path.join(ROOT, 'docs')):
+        # Archived documents keep historical references and are outside the
+        # active link quality gate after their one-time migration repair.
+        dirs[:] = [name for name in dirs if name != 'archive']
         for f in files:
             if f.endswith('.md'):
                 yield os.path.join(dirpath, f)
-    for f in ['README.md', 'packaging/README.md', 'gateway/README.md',
-              'tests/simulation/README.md']:
+    for f in ['README.md', 'tests/simulation/README.md']:
         p = os.path.join(ROOT, f)
         if os.path.exists(p):
             yield p
