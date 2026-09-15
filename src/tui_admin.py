@@ -840,7 +840,6 @@ class NodesScreen(Screen):
             ("v", "自动发现主节点", self.act_discover),
             ("j", "入群授权向导", self.act_join),
             ("l", "转让日志", self.act_transfer_logs),
-            ("e", "邮件告警测试", self.act_email_test),
             ("z", "重置主节点身份", self.act_reset_identity),
         ]
 
@@ -988,12 +987,6 @@ class NodesScreen(Screen):
             r.get("count", len(logs)), latest.get("direction", "—"),
             latest.get("from_role", "—"), latest.get("to_role", "—"),
             latest.get("related_node", "—"))
-
-    def act_email_test(self, ui: BaseUI):
-        if not ui.confirm("发送一封 SMTP 测试邮件?"):
-            return "已取消"
-        r = self.api.post("/cluster/email-test")
-        return "邮件测试: %s" % (r.get("message") or r.get("status", "已发送"))
 
     def act_reset_identity(self, ui: BaseUI):
         word = ui.prompt("危险操作！输入 reset 确认重置主节点 MAC 身份: ")
@@ -1736,6 +1729,14 @@ def _cmd_model_jobs(app, opts):
 def cmd_model(app, args, opts):
     if args:
         subcommand = str(args[0]).lower()
+        if subcommand == "fleet":
+            if len(args) > 1:
+                return ("用法: /model fleet", "warn")
+            return cmd_models(app, [], opts)
+        if subcommand == "select":
+            if len(args) != 2:
+                return ("用法: /model select <模型ID> [--quant 精度] [--engine 引擎]", "warn")
+            return _do_model_change(app, "/models/switch", [args[1]], opts)
         if subcommand == "presets":
             if len(args) > 1:
                 return ("用法: /model presets", "warn")
@@ -1746,7 +1747,7 @@ def cmd_model(app, args, opts):
             return _cmd_model_jobs(app, opts)
         if subcommand == "install":
             return _cmd_model_install(app, args, opts)
-        return ("未知模型子命令: %s（可用 install|jobs|presets）" % args[0], "err")
+        return ("未知模型子命令: %s（可用 fleet|select|install|jobs|presets）" % args[0], "err")
     cur = app.api.get("/models/current")
     if not cur.get("loaded"):
         return ("模型未加载。可用: /models 查看列表，/load <模型ID> 加载", "warn")
@@ -1774,12 +1775,32 @@ def cmd_models(app, args, opts):
         models = (app.api.get("/models") or {}).get("models") or []
     except ApiError:
         pass
-    lines = ["可用模型:"]
+    try:
+        profile = app.api.get("/device/profile") or {}
+    except ApiError:
+        profile = {}
+    try:
+        current = app.api.get("/models/current") or {}
+    except ApiError:
+        current = {}
+    tier = profile.get("tier_label") or profile.get("tier") or "unknown"
+    current_id = current.get("model_id") or "未加载"
+    lines = [
+        "模型舰队:",
+        "  当前模型: %s    设备档位: %s" % (current_id, tier),
+        "  状态字段: ready=本地可用，download=需先从模型预设下载",
+    ]
     for m in models:
         engines = ",".join(m.get("supported_engines") or [])
-        lines.append("  %-16s %s  [%s]  %s" % (
-            m.get("model_id", "—"), m.get("name", ""), engines,
-            m.get("description", "")))
+        formats = ",".join(m.get("available_formats") or []) or "—"
+        state = "ready" if m.get("is_available") else "download"
+        vram = m.get("recommended_vram_gb")
+        vram_text = "%sGB" % vram if vram is not None else "—"
+        lines.append("  %-28s %-26s [%s] fmt=%s engine=%s vram=%s" % (
+            m.get("model_id", "—"), m.get("name", ""), state,
+            formats, engines or "—", vram_text))
+        if m.get("description"):
+            lines.append("      %s" % m["description"])
     if not models:
         lines.append("  （无可用模型）")
     lines.append("")
@@ -1790,7 +1811,8 @@ def cmd_models(app, args, opts):
     lines.append("")
     lines.append("当前: quant=%s  engine=%s" % (
         avail.get("current") or "—", avail.get("current_engine") or "—"))
-    app.show_output(lines, title="◆ 模型 / 量化 / 引擎")
+    lines.append("选择: /model select <模型ID> [--quant 精度] [--engine 引擎]")
+    app.show_output(lines, title="◆ 模型舰队 / 量化 / 引擎")
     return ("共 %d 个模型配置" % len(models), "ok")
 
 
@@ -2184,10 +2206,10 @@ COMMANDS = [
     {"name": "/refresh", "aliases": ["/r"], "usage": "/refresh",
      "summary": "立即刷新当前屏幕", "handler": cmd_refresh},
     {"name": "/model", "aliases": [],
-     "usage": "/model [install|jobs|presets] ...", "max_args": 2,
+     "usage": "/model [fleet|select|install|jobs|presets] ...", "max_args": 2,
      "summary": "当前模型详情 / 安装预设 / 查看下载任务", "handler": cmd_model},
     {"name": "/models", "aliases": [], "usage": "/models",
-     "summary": "列出可用模型 / 量化 / 引擎", "handler": cmd_models},
+     "summary": "列出模型舰队、设备档位、格式与引擎", "handler": cmd_models},
     {"name": "/switch", "aliases": [], "usage": "/switch <模型ID> [--quant 精度] [--engine 引擎] [--compile]",
      "summary": "切换模型（失败自动回滚）", "handler": cmd_switch, "min_args": 1, "max_args": 1},
     {"name": "/load", "aliases": [], "usage": "/load <模型ID> [--quant 精度] [--engine 引擎] [--compile]",

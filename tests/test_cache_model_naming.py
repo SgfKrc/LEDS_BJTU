@@ -20,13 +20,13 @@ def test_bridge_preset_examples_use_current_v41_api_ref():
 
 
 def test_main_docs_distinguish_current_ref_from_legacy_aliases():
-    cache_plan = (ROOT / "docs" / "缓存机制专项计划-2026-09-13.md").read_text(encoding="utf-8")
-    bridge_checklist = (ROOT / "docs" / "archive" / "reasonix-codex-bridge主仓接线清单-2026-09-12.md").read_text(encoding="utf-8")
+    cache_plan = (ROOT / "docs" / "\u7f13\u5b58\u673a\u5236\u4e13\u9879\u8ba1\u5212-2026-09-13.md").read_text(encoding="utf-8")
+    bridge_config = (ROOT / "tools" / "reasonix-codex-bridge" / "config.example.toml").read_text(encoding="utf-8")
 
     assert "deepseek-flash" in cache_plan
-    assert "deepseek-flash" in cache_plan
-    assert "modelRef = opencode-go-2ae…/deepseek-flash" in bridge_checklist
-    assert "旧名仅作兼容说明" in cache_plan
+    assert "deepseek-flash" in bridge_config
+    assert "deepseek-v4-flash" not in bridge_config
+    assert "\u65e7\u540d\u4ec5\u4f5c\u517c\u5bb9\u8bf4\u660e" in cache_plan
 
 
 def test_readme_does_not_present_legacy_deepseek_api_ref():

@@ -905,7 +905,7 @@ def update_local_review_ticket(ticket_id: str, updates: dict) -> Optional[dict]:
     if current is None:
         return None
     current.update({key: value for key, value in updates.items() if key in {
-        "status", "score", "votes", "resolved_at", "notification_sent",
+        "status", "score", "votes", "resolved_at",
         "transfer_reason", "expires_at",
     }})
     return upsert_local_review_ticket(current)

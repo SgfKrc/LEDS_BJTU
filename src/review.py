@@ -65,7 +65,6 @@ class ReviewTicket:
     score: int = 0
     expires_at: float = 0.0
     resolved_at: Optional[float] = None
-    notification_sent: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -87,7 +86,6 @@ class ReviewTicket:
             "score": self.score,
             "expires_at": self.expires_at,
             "resolved_at": self.resolved_at,
-            "notification_sent": self.notification_sent,
         }
 
     @classmethod
@@ -125,7 +123,6 @@ class ReviewTicket:
             score=d.get("score", 0),
             expires_at=d.get("expires_at", 0.0),
             resolved_at=d.get("resolved_at"),
-            notification_sent=d.get("notification_sent", False),
         )
 
 
@@ -187,21 +184,6 @@ class ReviewManager:
             f"score={ticket.score}, "
             f"expires_in={timeout}h)"
         )
-
-        # 触发邮件通知（延迟导入，避免循环）
-        try:
-            from email_notifier import send_review_created_alert
-            send_review_created_alert(
-                ticket_id=ticket.ticket_id,
-                created_by=created_by,
-                target_node_id=target_node_id,
-                reason=reason,
-                expires_at=ticket.expires_at,
-            )
-            ticket.notification_sent = True
-            self._persist_ticket(ticket)
-        except Exception as e:
-            logger.warning(f"审查邮件通知发送失败: {e}")
 
         return ticket
 
@@ -287,14 +269,12 @@ class ReviewManager:
                 logger.info(
                     f"审查通过: {ticket_id} score={ticket.score} >= {self.APPROVE_THRESHOLD}"
                 )
-                self._send_resolved_alert(ticket)
             elif ticket.score <= self.REJECT_THRESHOLD:
                 ticket.status = TicketStatus.REJECTED
                 ticket.resolved_at = now
                 logger.info(
                     f"审查被阻止: {ticket_id} score={ticket.score} <= {self.REJECT_THRESHOLD}"
                 )
-                self._send_resolved_alert(ticket)
 
             if self._persist_ticket(ticket):
                 return ticket
@@ -422,9 +402,6 @@ class ReviewManager:
                     })
                     expired_ids.append(tid)
                     logger.info(f"审查工单已过期: {tid}")
-                    self._send_resolved_alert(ReviewTicket.from_dict({
-                        **row, "status": "expired", "resolved_at": now,
-                    }))
         except Exception as e:
             logger.warning(f"过期检查失败: {e}")
 
@@ -505,16 +482,3 @@ class ReviewManager:
         except Exception as e:
             logger.error(f"持久化工单失败 ({ticket.ticket_id}): {e}")
             return False
-
-    def _send_resolved_alert(self, ticket: ReviewTicket) -> None:
-        """工单已解决时发送邮件通知。"""
-        try:
-            from email_notifier import send_review_resolved_alert
-            send_review_resolved_alert(
-                ticket_id=ticket.ticket_id,
-                status=ticket.status.value,
-                score=ticket.score,
-                target_node_id=ticket.target_node_id,
-            )
-        except Exception as e:
-            logger.warning(f"审查结果通知邮件发送失败: {e}")

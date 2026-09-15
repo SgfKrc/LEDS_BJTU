@@ -157,6 +157,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── external_provider.py       # ★ 外部推理服务 Provider + 数据作用域门控（路线 B）
 │   ├── speculative.py             # ★ draft-verify 投机解码（默认关闭的实验路径，路线 C）
 │   ├── tui_admin.py               # ★ 跨平台 TUI 管理菜单（纯标准库，零依赖）
+│   ├── qlh.py                     # 主仓跨平台 TUI 命令入口
 │   ├── tui_chat.py                # ★ T9 简化聊天页（Textual + httpx；安装包内置，源码可选）
 │   ├── tui_sse.py / tui_shared.py # T9 SSE 增量解析器与共享层（端点/命令/metrics）
 │   ├── paged_kv_cache.py          # 轻量化分页KV缓存（内存热页；可选磁盘冷页）
@@ -168,7 +169,6 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   ├── local_store.py             # 主节点 SQLite 本地存储（旧 JSON 一次性只读导入）
 │   ├── model_downloader.py        # 模型下载引导（HuggingFace/ModelScope/百度网盘）
 │   ├── model_host.py              # 模型生命周期宿主（统一持有 LLM/多模态理解引擎）
-│   ├── email_notifier.py          # SMTP 告警 + IMAP 投票（收件邮箱 node_config 可配置）
 │   ├── scheduler_svc_http.py      # scheduler-svc 微服务 HTTP 壳（透传契约）
 │   ├── inference_service/         # ★ inference-svc 微服务（engine_host/协议/路由）
 │   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）

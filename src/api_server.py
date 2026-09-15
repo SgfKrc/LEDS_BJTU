@@ -746,15 +746,6 @@ async def _startup_device_detection():
 
     logger.info("主节点 SQLite 已就绪")
 
-    # P3: 启动邮件投票轮询器（仅 master 节点，IMAP 轮询不需要 CUDA）
-    try:
-        if active_scheduler._effective_role() == "master":
-            from email_notifier import start_mail_poller
-            start_mail_poller(poll_interval=60)
-            logger.info("📬 邮件投票轮询器已启动 (master)")
-    except Exception as e:
-        logger.warning(f"邮件投票轮询器启动失败: {e}")
-
     # P3: 启动审查工单过期检查后台线程（仅 master，每 5 分钟）
     try:
         if active_scheduler._effective_role() == "master":
@@ -794,14 +785,6 @@ async def _shutdown_resources():
         logger.info("调度器已停止")
     except Exception as e:
         logger.warning(f"调度器停止异常: {e}")
-
-    # 2. P3: 停止邮件投票轮询器
-    try:
-        from email_notifier import stop_mail_poller
-        stop_mail_poller()
-    except Exception:
-        pass
-
 
 # ============================================================
 # 优雅退出（TUI / 外部命令触发）
@@ -7378,83 +7361,6 @@ async def reset_master_identity(req: ResetIdentityRequest):
     return result
 
 
-@app.post("/api/cluster/email-test")
-async def test_email_notification():
-    """
-    发送一封测试邮件，验证 SMTP 邮件告警配置是否正确。
-
-    邮件将发送到当前配置的管理员收件邮箱（集群配置优先，回退环境变量）。
-    仅主节点可调用（管理员邮箱为集群级配置，见 docs/已知问题记录.md 问题 #1）。
-    """
-    if scheduler._effective_role() != "master":
-        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
-    try:
-        from email_notifier import send_test_email
-        # SMTP 发送为同步网络操作（可阻塞数秒），放入线程池执行
-        ok = await run_in_threadpool(send_test_email)
-        if ok:
-            return {"status": "ok", "message": "测试邮件已发送，请检查目标邮箱"}
-        else:
-            raise HTTPException(500, "邮件发送失败，请检查后端日志了解详情")
-    except ImportError as e:
-        raise HTTPException(500, f"邮件模块导入失败: {e}")
-    except Exception as e:
-        raise HTTPException(500, f"邮件发送异常: {e}")
-
-
-class EmailConfigRequest(BaseModel):
-    # 允许空串：传空表示清除自定义配置、回退环境变量（set_admin_email 校验）
-    recipient: str = Field(..., max_length=320, description="管理员收件邮箱（空串=清除自定义配置）")
-
-
-@app.get("/api/cluster/email-config")
-async def get_email_config():
-    """
-    查询管理员收件邮箱配置（不返回任何 SMTP 凭据）。
-
-    仅主节点可调用；从节点不显示该配置条目（见 docs/已知问题记录.md 问题 #1）。
-
-    Returns:
-        recipient: 当前生效收件邮箱（可能为空）
-        source: cluster | env | node_config | none
-        smtp_configured: 发件账号是否已配置
-    """
-    if scheduler._effective_role() != "master":
-        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
-    try:
-        from email_notifier import admin_email_config
-        from email_notifier import SMTP_SENDER, SMTP_PASSWORD
-    except ImportError as e:
-        raise HTTPException(500, f"邮件模块导入失败: {e}")
-    config = admin_email_config()
-    return {
-        "recipient": config["recipient"],
-        "source": config["source"],
-        "smtp_configured": bool(SMTP_SENDER and SMTP_PASSWORD),
-    }
-
-
-@app.post("/api/cluster/email-config")
-async def update_email_config(req: EmailConfigRequest):
-    """
-    设置管理员收件邮箱并持久化为集群级配置，运行中立即生效。
-
-    仅主节点可调用；传空字符串可清除集群配置，回退到环境变量 QLH_SMTP_RECIPIENT。
-    """
-    if scheduler._effective_role() != "master":
-        raise HTTPException(403, "仅主节点可配置管理员收件邮箱")
-    try:
-        from email_notifier import set_admin_email
-        recipient = await run_in_threadpool(set_admin_email, req.recipient)
-    except ImportError as e:
-        raise HTTPException(500, f"邮件模块导入失败: {e}")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"保存邮箱配置失败: {e}")
-    return {"status": "ok", "recipient": recipient}
-
-
 # ============================================================
 # 推理调度队列 API (Phase 3 — MLFQ 三级队列可视化与管理)
 # ============================================================
@@ -8016,7 +7922,7 @@ async def create_review_ticket(req: CreateReviewRequest):
     创建主节点转让审查工单（仅 master 可用）。
 
     需要先指定备用主节点。
-    创建成功后发送邮件通知管理员。
+    创建成功后通过 TUI/API 查询和处理工单。
     """
     if scheduler._effective_role() != "master":
         raise HTTPException(status_code=403, detail="仅主节点可创建审查工单")
@@ -8032,8 +7938,6 @@ async def create_review_ticket(req: CreateReviewRequest):
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        # create_ticket 内部会同步发送 SMTP 邮件通知（可阻塞数秒），
-        # 放入线程池避免阻塞事件循环
         ticket = await run_in_threadpool(
             review_mgr.create_ticket,
             created_by=scheduler.get_effective_node_id(),
@@ -8074,8 +7978,6 @@ async def cast_review_vote(req: CastVoteRequest):
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        # 达到阈值时 cast_vote 会同步发送 SMTP 结果通知（可阻塞数秒），
-        # 放入线程池避免阻塞事件循环
         ticket = await run_in_threadpool(
             review_mgr.cast_vote,
             ticket_id=req.ticket_id,
@@ -8163,7 +8065,6 @@ async def trigger_expire_check():
     try:
         from review import ReviewManager
         review_mgr = ReviewManager()
-        # 过期工单会同步发送 SMTP 结果通知（可阻塞数秒），放入线程池执行
         expired = await run_in_threadpool(review_mgr.resolve_expired)
         return {"expired": expired, "count": len(expired)}
     except Exception as e:
@@ -8198,20 +8099,6 @@ async def delete_resolved_review_tickets():
         return {"status": "deleted", "count": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"批量删除工单失败: {e}")
-
-
-@app.post("/api/cluster/review/mail-poll")
-async def trigger_mail_poll():
-    """手动触发邮件投票轮询（用于测试 / 调试）。"""
-    if scheduler._effective_role() != "master":
-        raise HTTPException(status_code=403, detail="仅主节点可执行此操作")
-    try:
-        from email_notifier import poll_mail_once
-        # IMAP 轮询为同步网络操作（可阻塞数秒），放入线程池执行
-        result = await run_in_threadpool(poll_mail_once)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"邮件轮询失败: {e}")
 
 
 # ============================================================

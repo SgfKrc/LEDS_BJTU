@@ -367,6 +367,22 @@ class TestModelInfoCommands:
         assert "qwen-1.8b" in "\n".join(app.out)
         assert "INT4" in "\n".join(app.out)  # /models/available 选项
 
+    def test_model_fleet_shows_device_and_model_capabilities(self, app):
+        msg, style = app.exec_command("/model fleet")
+        assert style == "ok"
+        output = "\n".join(app.out)
+        assert "设备档位: laptop" in output
+        assert "engine=pytorch,llama_cpp" in output
+        assert "/model select <模型ID>" in output
+
+    def test_model_select_uses_switch_contract(self, app):
+        msg, style = app.exec_command(
+            "/model select qwen-1.8b --quant int8 --engine pytorch")
+        assert style == "ok"
+        post = [c for c in app.api.calls if c[0] == "POST" and c[1] == "/models/switch"]
+        assert post and post[0][2]["model_id"] == "qwen-1.8b"
+        assert post[0][2]["quant_type"] == "int8"
+
     def test_presets(self, app):
         msg, style = app.exec_command("/presets")
         assert style == "ok"
