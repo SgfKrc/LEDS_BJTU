@@ -16,11 +16,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from src.llama_rpc_contract import RpcShardLeaseBook
+from src.llama_rpc_planner import RpcNodeProfile, RpcSplitDecision, plan_rpc_split
 
 from scripts.llama_rpc_sim import (
     DEFAULT_RUNTIME,
@@ -53,13 +56,15 @@ class PcRpcPlan:
     remote_log_dir: str
     rpc_port: int
     http_port: int
-    gpu_layers: int
+    gpu_layers: int | None
     ctx_size: int
     max_tokens: int
     worker_budget_mib: float
     timeout_seconds: float
     remote_threads: int = 8
     ssh_tunnel: bool = False
+    total_layers: int = 25
+    auto_split: bool = True
 
     @property
     def target(self) -> str:
@@ -82,6 +87,7 @@ class PcRpcPlan:
     @property
     def host_command(self) -> list[str]:
         rpc_host = "127.0.0.1" if self.ssh_tunnel else self.remote_host
+        selected_gpu_layers = self.gpu_layers if self.gpu_layers is not None else 0
         return [
             str(self.runtime_dir / "llama-server.exe"),
             "--model",
@@ -95,7 +101,7 @@ class PcRpcPlan:
             "--device",
             "RPC0",
             "--gpu-layers",
-            str(self.gpu_layers),
+            str(selected_gpu_layers),
             "--ctx-size",
             str(self.ctx_size),
             "--n-predict",
@@ -120,14 +126,18 @@ def build_plan(
     remote_log_dir: str = DEFAULT_REMOTE_LOG_DIR,
     rpc_port: int = 50163,
     http_port: int = 18093,
-    gpu_layers: int = 8,
+    gpu_layers: int | None = None,
     ctx_size: int = 128,
     max_tokens: int = 2,
     worker_budget_mib: float = 512,
     timeout_seconds: float = 120,
     remote_threads: int = 8,
     ssh_tunnel: bool = False,
+    total_layers: int = 25,
+    auto_split: bool | None = None,
 ) -> PcRpcPlan:
+    if auto_split is None:
+        auto_split = gpu_layers is None
     return PcRpcPlan(
         model=Path(model).expanduser().resolve(),
         runtime_dir=Path(runtime_dir).expanduser().resolve(),
@@ -145,6 +155,8 @@ def build_plan(
         timeout_seconds=timeout_seconds,
         remote_threads=remote_threads,
         ssh_tunnel=ssh_tunnel,
+        total_layers=max(0, int(total_layers)),
+        auto_split=bool(auto_split),
     )
 
 
@@ -186,6 +198,89 @@ def _remote_hash(plan: PcRpcPlan) -> str:
         if len(value) == 64 and all(char in "0123456789ABCDEF" for char in value):
             return value
     raise RuntimeError("remote model hash was not returned")
+
+
+def _remote_profile(plan: PcRpcPlan) -> dict[str, Any]:
+    """Read the same CPU/RAM fields used by DeviceProfiler from the worker."""
+    script = r"""
+$cpu=Get-CimInstance Win32_Processor
+$os=Get-CimInstance Win32_OperatingSystem
+$load=($cpu | Measure-Object -Property LoadPercentage -Average).Average
+if ($null -eq $load) { $load=0 }
+$freq=($cpu | Measure-Object -Property MaxClockSpeed -Maximum).Maximum
+@{
+  node_id = $env:COMPUTERNAME
+  cpu_cores = [int](($cpu | Measure-Object -Property NumberOfCores -Sum).Sum)
+  logical_cores = [int](($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum)
+  cpu_freq_mhz = [double]$freq
+  cpu_load_percent = [double]$load
+  ram_total_gb = [math]::Round([double]$os.TotalVisibleMemorySize / 1MB, 2)
+  ram_available_gb = [math]::Round([double]$os.FreePhysicalMemory / 1MB, 2)
+} | ConvertTo-Json -Compress
+"""
+    result = _ssh(plan, script, timeout=20)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "remote device profile failed")
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            profile = json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(profile, dict):
+            return profile
+    raise RuntimeError("remote device profile was not returned")
+
+
+def _split_decision(plan: PcRpcPlan, profile: dict[str, Any] | None = None) -> RpcSplitDecision:
+    model_size_mib = 0.0
+    try:
+        model_size_mib = plan.model.stat().st_size / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    if profile is None:
+        profile = {}
+    decision = plan_rpc_split(
+        plan.total_layers,
+        model_size_mib,
+        profile,
+        worker_budget_mib=plan.worker_budget_mib,
+    )
+    if not plan.auto_split:
+        selected = max(0, min(plan.total_layers - 1, int(plan.gpu_layers or 0)))
+        return replace(
+            decision,
+            admitted=selected > 0,
+            strategy="manual",
+            rpc_layers=selected,
+            local_layers=max(0, plan.total_layers - selected),
+            reason="manual_gpu_layers",
+        )
+    return decision
+
+
+def _resolved_plan(plan: PcRpcPlan, decision: RpcSplitDecision) -> PcRpcPlan:
+    return replace(plan, gpu_layers=decision.rpc_layers, auto_split=False)
+
+
+def _lease_decision_payload(decision: Any) -> dict[str, Any]:
+    payload = {
+        "accepted": bool(decision.accepted),
+        "reason": str(decision.reason),
+        "result_digest": str(decision.result_digest or ""),
+    }
+    lease = decision.lease
+    if lease is not None:
+        payload["lease"] = {
+            "shard_id": lease.shard_id,
+            "worker_id": lease.worker_id,
+            "lease_id": lease.lease_id,
+            "epoch": lease.epoch,
+            "attempt": lease.attempt,
+            "status": lease.status,
+            "lease_expires_at": lease.lease_expires_at,
+            "lease_ttl_seconds": lease.lease_ttl_seconds,
+        }
+    return payload
 
 
 def _local_hash(path: Path) -> str:
@@ -412,7 +507,13 @@ def _chat_with_timeout(url: str, max_tokens: int, timeout: float) -> dict[str, A
         return {"ok": False, "status": None, "error": "connection_or_timeout"}
 
 
-def plan_report(plan: PcRpcPlan) -> dict[str, Any]:
+def plan_report(
+    plan: PcRpcPlan,
+    *,
+    split_decision: RpcSplitDecision | None = None,
+    remote_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    split_decision = split_decision or _split_decision(plan, remote_profile)
     return {
         "status": "dry_run",
         "local_model": _display_path(plan.model),
@@ -424,11 +525,13 @@ def plan_report(plan: PcRpcPlan) -> dict[str, Any]:
         "ssh_tunnel_command": _command_display(_ssh_tunnel_command(plan)) if plan.ssh_tunnel else None,
         "worker_backend": "CPU",
         "remote_threads": plan.remote_threads,
-        "host_command": _command_display(plan.host_command),
+        "host_command": _command_display(_resolved_plan(plan, split_decision).host_command),
         "remote_worker_command": plan.worker_command,
         "remote_worker_receives_model": False,
         "model_identity_required": True,
         "configured_worker_budget_mib": plan.worker_budget_mib,
+        "split_decision": split_decision.to_dict(),
+        "automatic_split": plan.auto_split,
         "torch_imported": False,
     }
 
@@ -442,6 +545,7 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
 
     local_hash = _local_hash(plan.model)
     remote_hash = _remote_hash(plan)
+    requested_plan = plan
     report = plan_report(plan)
     report.update(
         {
@@ -453,6 +557,52 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
     if local_hash != remote_hash:
         report["status"] = "model_identity_mismatch"
         return report
+
+    try:
+        remote_profile = _remote_profile(plan)
+    except RuntimeError as exc:
+        report.update({"status": "split_profile_unavailable", "split_profile_error": str(exc)})
+        return report
+    decision = _split_decision(plan, remote_profile)
+    report = plan_report(
+        requested_plan,
+        split_decision=decision,
+        remote_profile=remote_profile,
+    )
+    report.update(
+        {
+            "local_model_sha256": local_hash,
+            "remote_model_sha256": remote_hash,
+            "model_identity_match": True,
+            "remote_device_profile": remote_profile,
+        }
+    )
+    if requested_plan.auto_split and not decision.admitted:
+        report["status"] = "split_not_admitted"
+        return report
+    plan = _resolved_plan(plan, decision)
+
+    lease_book = RpcShardLeaseBook()
+    remote_lease = lease_book.assign(
+        "llama-rpc-offload",
+        plan.target,
+        local_hash,
+        {"backend": "RPC0", "gpu_layers": plan.gpu_layers, "total_layers": plan.total_layers},
+        lease_seconds=max(30.0, plan.timeout_seconds + 60.0),
+    )
+    report["lease"] = {
+        "schema": "llama-rpc-lease-v1",
+        "initial": {
+            "shard_id": remote_lease.shard_id,
+            "worker_id": remote_lease.worker_id,
+            "lease_id": remote_lease.lease_id,
+            "epoch": remote_lease.epoch,
+            "attempt": remote_lease.attempt,
+            "lease_expires_at": remote_lease.lease_expires_at,
+            "lease_ttl_seconds": remote_lease.lease_ttl_seconds,
+            "allocation": dict(remote_lease.allocation),
+        },
+    }
 
     run_id = f"{int(time.time())}-{plan.rpc_port}"
     remote: RemoteWorkerHandle | None = None
@@ -485,6 +635,9 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
                 report["host"] = _process_metrics(host)
                 report["ready"] = ready
                 report["remote_worker_before_request"] = _remote_process_metrics(plan, remote.pid)
+                report["lease"]["renew_before_request"] = _lease_decision_payload(
+                    lease_book.renew(remote_lease.lease_id, remote_lease.epoch)
+                )
                 if ready:
                     report["distributed_response"] = _chat_with_timeout(
                         f"http://127.0.0.1:{plan.http_port}/v1/chat/completions",
@@ -494,6 +647,11 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
                     time.sleep(1)
                     report["host_after_request"] = _process_metrics(host)
                     report["remote_worker_after_request"] = _remote_process_metrics(plan, remote.pid)
+                    if report["distributed_response"].get("ok"):
+                        result = report["distributed_response"].get("content", "")
+                        report["lease"]["remote_commit"] = _lease_decision_payload(
+                            lease_book.commit(remote_lease.lease_id, remote_lease.epoch, result)
+                        )
                 else:
                     report["distributed_response"] = {"ok": False, "error": "host_not_ready"}
 
@@ -509,6 +667,27 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
                     8,
                 )
                 report["disconnect_detected"] = not report["remote_worker_disconnect"].get("ok", False)
+                if report["disconnect_detected"]:
+                    fallback_lease = lease_book.reassign(
+                        remote_lease.shard_id,
+                        "local-cpu-fallback",
+                        local_hash,
+                        {"backend": "local", "gpu_layers": 0, "total_layers": plan.total_layers},
+                    )
+                    stale = lease_book.commit(
+                        remote_lease.lease_id,
+                        remote_lease.epoch,
+                        "stale remote result after worker loss",
+                    )
+                    report["lease"]["reassignment"] = {
+                        "worker_id": fallback_lease.worker_id,
+                        "lease_id": fallback_lease.lease_id,
+                        "epoch": fallback_lease.epoch,
+                        "attempt": fallback_lease.attempt,
+                        "stale_remote_commit": _lease_decision_payload(stale),
+                    }
+                else:
+                    fallback_lease = None
             finally:
                 _stop(host)
                 host_out.close()
@@ -557,6 +736,14 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
                         "process": _process_metrics(fallback),
                         "command": _command_display(fallback_command),
                     }
+                    if fallback_lease is not None and report["fallback"]["response"].get("ok"):
+                        report["lease"]["fallback_commit"] = _lease_decision_payload(
+                            lease_book.commit(
+                                fallback_lease.lease_id,
+                                fallback_lease.epoch,
+                                report["fallback"]["response"].get("content", ""),
+                            )
+                        )
                 finally:
                     _stop(fallback)
                     fallback_out.close()
@@ -598,6 +785,8 @@ def run_probe(plan: PcRpcPlan, *, check_fallback: bool = True) -> dict[str, Any]
         and report.get("distributed_response", {}).get("ok")
         and report.get("backend_evidence", {}).get("partial_backend_residency_proven")
         and report.get("disconnect_detected")
+        and report.get("lease", {}).get("reassignment", {}).get("stale_remote_commit", {}).get("accepted") is False
+        and report.get("lease", {}).get("fallback_commit", {}).get("accepted", not check_fallback)
         and (not check_fallback or report.get("output_match"))
         else "failed_acceptance"
     )
@@ -618,7 +807,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--remote-log-dir", default=DEFAULT_REMOTE_LOG_DIR)
     parser.add_argument("--rpc-port", type=int, default=50163)
     parser.add_argument("--http-port", type=int, default=18093)
-    parser.add_argument("--gpu-layers", type=int, default=8)
+    parser.add_argument(
+        "--gpu-layers",
+        type=int,
+        default=None,
+        help="manual RPC layer count; omit to let the device-profile planner decide",
+    )
+    parser.add_argument("--total-layers", type=int, default=25)
     parser.add_argument("--ctx-size", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=2)
     parser.add_argument("--worker-budget-mib", type=float, default=512)
@@ -654,6 +849,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout_seconds=args.timeout_seconds,
         remote_threads=args.remote_threads,
         ssh_tunnel=args.ssh_tunnel,
+        total_layers=args.total_layers,
     )
     try:
         report = plan_report(plan) if not args.run else run_probe(plan, check_fallback=not args.no_fallback)

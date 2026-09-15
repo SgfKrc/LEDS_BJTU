@@ -28,7 +28,8 @@ def test_pc_rpc_defaults_pin_qwen_18b_identity_path():
 
     assert plan.remote_model.endswith(r"models\Qwen-1_8B-Chat.Q4_K_M.gguf")
     assert plan.worker_budget_mib == 512
-    assert plan.gpu_layers == 8
+    assert plan.gpu_layers is None
+    assert plan.auto_split is True
     assert plan.remote_threads == 8
 
 
