@@ -4,7 +4,7 @@
 >
 > 👀 **新人/评审快速入口**：[双语摘要速览 QLH at a Glance](docs/项目速览-QLH-at-a-Glance.md) —— 2 分钟了解项目是什么、已验证什么、如何上手；完整能力边界见本文档。
 
-**面向异构边缘设备的多引擎、可演进分布式大模型推理系统**
+**面向异构边缘设备的 llama.cpp 主引擎分布式大模型推理系统**
 
 模型量化 · 算子融合 · 分页KV缓存 · 图算法智能编排 · 多终端协同推理 · TUI 主入口 · 边缘优化
 
@@ -20,20 +20,20 @@
 
 ## 📋 项目简介
 
-QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Windows/Linux 台式机、工作站、服务器、笔记本以及 Android 手机和平板。PC PyTorch 路线可将兼容模型按 Transformer 层拆分到多个节点；PC/Android 的 llama.cpp 路线负责 GGUF 本地完整推理。系统保留 INT4/INT8 量化、算子融合、分页 KV 缓存、图算法编排和降级恢复能力；PC Full Worker、任务图、Android Full Worker/Stage 与 GGUF Stage 的本机开发门已完成，短程双机证据已覆盖 PyTorch 层流水线与任务图。`task_dispatch`、真实 CUDA、多轮断网恢复与生产路由仍是后置验收门，张量并行仍只作为集群外 PoC 路线。
+QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Windows/Linux 台式机、工作站、服务器、笔记本以及 Android 手机和平板。生产主线是 GGUF/llama.cpp：先完成单机基线，再攻克 host + RPC worker 模型分片，让单机装不下的模型由多个节点共同承载、每个节点只保有实际分配的部分。PyTorch/Safetensors 层流水线只保留为 PC 对照实验，任务图/整请求只作为临时完整模型回退；Web、Android UI、发布、工具和生图均在外置仓库或 Koakumix 支线维护。当前主线的硬门是裁切/低耦合 → llama.cpp 单机 → 同机双进程 RPC → PC 真机 → Android 真机，不能用旧双机证据替代新模型分片证据。
 
 现已覆盖 **Windows PC + Linux PC + Android**。设备类型不是调度能力的充分条件：是否能参与某种分布式执行，还取决于运行引擎、模型格式、模型指纹、可用内存、加速器和网络拓扑。
 
-### 软件版本分级（四级四种）
+### 主仓运行形态（四类边界）
 
 项目按硬件能力和使用场景划分为四种软件版本：
 
-| 级别 | 软件版本 | 目标设备 | 核心能力 | 不包含/不推荐 |
+| 级别 | 形态 | 目标设备 | 核心能力 | 不包含/不推荐 |
 |------|----------|----------|----------|---------------|
-| 1 | **PC 集显版** | Windows / Linux 无 NVIDIA 独显的 PC | llama.cpp + GGUF CPU/集显推理、集群接入与远程请求转发 | 当前 PyTorch 层流水线、重模型实验、CUDA 专属能力 |
-| 2 | **PC 独显版** | Windows / Linux NVIDIA GPU 主节点 / 实验 PC | PyTorch + CUDA + bitsandbytes、支持 CPU 回退、后续支持多模型/重模型实验 | Android 极简化策略、图像生成（仅 Koakumix 提供） |
-| 3 | **Android 普通版** | Android 手机/平板 | 全有模式本地 GGUF 推理、全无模式转发 PC、SAF 模型目录、更新/日志/连接诊断；Full Worker/Stage 和 Gemma4 MTMD 已完成本机开发接线 | Transformer 层间拆分、重模型实验；真实设备 Worker、多模态质量和后台存活仍待验收 |
-| 4 | **Android 极简版** | 普通手机轻量入口 | 极简聊天、远程 PC 转发、尽量压缩 APK/缓存/模型存储占用、单一推荐小模型/INT4 路线 | 本地 GGUF、完整 models 目录、Worker 接收任务和高级控制面板 |
+| 1 | **Edge/TUI 单机** | 无 NVIDIA 的 Windows/Linux PC、弱设备 | llama.cpp + GGUF CPU/集显推理、跨平台 TUI、模型下载/选择 | torch、Web UI、发布工具、图像生成 |
+| 2 | **PC llama.cpp 分片** | 普通 PC/工作站/异构节点 | llama host + `ggml-rpc-server` worker，目标是模型部分驻留和容量合并 | 未通过 G0-G2 前不得宣称生产 RPC |
+| 3 | **PC Reference P** | NVIDIA/高内存 PC | PyTorch + Safetensors 层流水线，用于正确性、性能和容量对照 | 不进入边缘安装、默认路由或正式发行 |
+| 4 | **Android worker/client** | Android 手机/平板 | 外置仓维护本地 GGUF、RPC worker 或 HTTP 客户端；按模型舰队选择能力 | Android UI、Gradle、JNI 不回流主仓 |
 
 > Android 普通版和极简版的区别：普通版面向“完整移动客户端”，极简版面向“尽量小、尽量少设置、尽量低存储占用”的手机轻量入口。
 
@@ -41,13 +41,13 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 
 | 特性 | 说明 |
 |------|------|
-| 🧠 **智能编排** | PyTorch 层流水线可按算力、内存和网络状态分配连续层段；较大拓扑可使用最大带宽生成树 + DFS → [详见分布式资源调度系统](docs/分布式资源调度系统.md) |
-| 🔗 **PyTorch 层流水线** | 兼容的 Safetensors 模型按连续层段分配，hidden states 逐节点传递，支持 KV Cache 增量解码；**QW1.8B 双机分层数据面已验收**（2026-08-20，`master 0-21 + client 21-24`，`distributed_used=true`/`fallback=false`，L1-3） |
-| 🔄 **双引擎架构** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/集显)，自动切换 |
+| 🧠 **模型分片攻关** | llama.cpp/GGUF 主线按节点能力研究模型部分驻留、RPC、租约和故障重分配；先通过单机与同机双进程门 → [详见主线计划](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
+| 🔗 **PyTorch 参考路径** | 兼容 Safetensors 的层流水线仅用于 PC 正确性/性能/容量对照；既有 QW1.8B 双机证据是历史参考，不代表 llama.cpp 模型分片已验收 |
+| 🔄 **生产引擎边界** | llama.cpp + GGUF 是默认生产/边缘路径；PyTorch + bitsandbytes 只在 PC Reference P 环境存在，不自动切换到边缘 |
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
 | 🗄️ **多会话与本地事实源** | 会话/设置/模型注册等由主节点本地 SQLite 承载（远端 PostgreSQL 已退场，仅一次性迁移审计通道），旧数据一次性导入；断网本地不中断 |
 | 🧩 **模型资产治理** | 模型注册、清单/SHA 校验、来源与许可证、Sidecar 契约、部署模拟及下载来源回退（HF 直连 → 用户代理 → ModelScope）均已接入本机产品面；真实大工件、CUDA 和跨机分发仍待验收 |
-| 🖼️ **多模型与多模态 Sidecar** | Qwen3 PyTorch 隔离运行时，以及 Gemma4 原生 GGUF/mmproj MTMD 与 PyTorch Sidecar 路径均已完成开发门；模型可用性仍由工件、显存/内存预算和精确身份契约 fail-closed 决定，不在 8 GB 机器上自动准入重模型 |
+| 🖼️ **多模型与多模态** | 模型舰队按设备能力按需选择文本或多模态 GGUF；画像声明模板、thinking、vision、内存预算和工件摘要，缺少能力时降级文本；PyTorch sidecar 只作 PC 对照 |
 | 🌐 **Tailscale 与双栈组网** | IPv4/IPv6 端点、手动入群和启动重连按“用户首选 → bootstrap → Tailnet”回退；显式连接的偏好会持久化。双机 IPv6 短任务已实测，IPv4-only/IPv6-only 安装包和真实 WSS/443 仍待环境验收 |
 | 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；系统凭据和首次安装联调后置 |
 | 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
@@ -58,7 +58,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
-| ⚙️ **任务链 Full Worker** | `dual_candidate` DAG、可恢复任务状态/ journal / lease-epoch winner fencing、Provider registry；PC Full Worker 与任务图已完成重启与断线恢复、IPv6 TCP 实测（2026-08-21），`task_dispatch` 生产准入门保持关闭 → [任务链专项](docs/任务链下一阶段实施计划.md) |
+| ⚙️ **任务链 Full Worker** | `dual_candidate` DAG、journal、lease-epoch fencing 和 Provider registry 保留为临时整模回退；不代表模型已分片，`task_dispatch` 生产准入门保持关闭 → [任务链专项](docs/任务链下一阶段实施计划.md) |
 | 🗂️ **本地 RAG** | 主节点 SQLite FTS5 + 有界向量 embedding（Ollama `nomic-embed-text` / 原生 llama.cpp 双 provider）、可恢复 job、容量预算与 ANN 决策门（RAG-S0…S5D）；30 条人工查询的本机质量门已完成，真实长时、规模与 sqlite-vec benchmark 后置 → [集群接入与本地 RAG 计划](docs/集群接入稳定性与本地RAG实施计划.md) |
 | 🔑 **手动入群（CLUSTER-JOIN）** | 目标节点生成一次性授权票据，主节点 Auth App 审批后签发 Ed25519 client-only grant（文本码 + 二维码，nonce ledger 原子消费），成功即降级为从节点；Web/TUI 已接线 → [集群接入计划](docs/集群接入稳定性与本地RAG实施计划.md) |
 | 🌐 **抗弱网与 Transport v2** | `cluster_transport` 提供 `legacy_tcp`/`wss_443` 能力选择、有界 ACK 窗口、稳定故障矩阵与 circuit breaker；NW3.1 本地自签名 WSS loopback 门完成；真实 443/证书/流量对照后置 → [抗弱网专项](docs/抗弱网通信协议专项计划.md) |
@@ -247,8 +247,8 @@ git clone --recurse-submodules https://github.com/SgfKrc/qlh       # 主仓首�
 # 按需在同级目录克隆 https://github.com/SgfKrc/qlh-android、qlh-shell、qlh-release、qlh-toolbox
 ```
 
-> 规划：小模型 harness 工作台（`harness_workbench/`）目前仍是主仓库内的目录，**将来考虑按同样模式独立为子模块**（自研子项目），主仓库届时只保留 gitlink 与接线文档。
-### PyTorch 层流水线示例（不是固定设备数量）
+> `harness_workbench/` 是独立子模块；Koakumix harness 的生图、RAG、MCP 和定制化实验不属于 QLH 主线，主仓只保留 gitlink 与边界说明。
+### PyTorch 层流水线示例（PC 参考路径，历史对照）
 
 ```
 用户输入 → 主节点(Master)  → TCP → 从节点1(Client) → TCP → 从节点2(Client) → 结果回传
@@ -275,7 +275,7 @@ git clone --recurse-submodules https://github.com/SgfKrc/qlh       # 主仓首�
 | 应用层 | 可视化交互 & 节点管理 & 性能监控 | React + TUI（标准库）+ Jetpack Compose (Android) |
 | 调度层 | 任务调度、指令分发、状态管理、请求队列 | Python threading + 图算法 |
 | 通信层 | TCP长连接、粘包处理、心跳、张量序列化 | Python socket + struct |
-| 推理层 | 多引擎：模型加载、量化、融合、KV缓存 | PyTorch (CUDA) / llama.cpp (CPU / Android) / island *(PoC)* |
+| 推理层 | llama.cpp/GGUF 生产主引擎；PyTorch 仅 PC 对照；模型分片/RPC 正在攻关 | llama.cpp (CPU / 集显 / Android worker) / PyTorch Reference P / island *(PoC)* |
 | 外部辅助层 *(PoC)* | 整请求外发的路由与数据作用域门控、投机解码校验 | OpenAI 兼容 HTTP（vLLM / SGLang 等） |
 | 存储层 | 对话持久化、节点注册、配置管理 | 主节点 SQLite（Python/Node 共库）+ Room (Android) |
 | 基础层 | 运行环境 | Python / CUDA / bitsandbytes / llama.cpp |
@@ -289,7 +289,7 @@ git clone --recurse-submodules https://github.com/SgfKrc/qlh       # 主仓首�
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
 | Python | ≥ 3.10 | 开发环境 3.12.10；源码已核对可在 3.10 / 3.11 / 3.12 解析 |
-| PyTorch | ≥ 2.2.0 | CUDA 版本用于独显；CPU 版本用于集成显卡 |
+| PyTorch | ≥ 2.2.0 | 仅 PC Reference P/独立 sidecar；不进入 Edge 或默认生产环境 |
 | **transformers** | **≥ 4.45, < 5.0** | ⚠️ 必须保持 4.x！5.x 移除了 `load_in_4bit`/`load_in_8bit` |
 | accelerate | ≥ 1.0.0 | 模型加载加速（bitsandbytes 依赖） |
 
@@ -303,7 +303,7 @@ git clone --recurse-submodules https://github.com/SgfKrc/qlh       # 主仓首�
 
 | 依赖 | 版本要求 | 说明 |
 |------|----------|------|
-| llama-cpp-python | ≥ 0.3.0 | CPU 优化 GGUF 推理，3-5x 快于 PyTorch CPU |
+| llama-cpp-python | ≥ 0.3.0 | 本地 GGUF 推理；分布式路径使用原生 llama.cpp host/RPC worker 合同 |
 
 ### Web 可视化
 
@@ -404,9 +404,9 @@ python scripts/setup_envs.py --check      # 只校验现有环境，不安装
 python scripts/setup_envs.py --list       # 查看环境清单
 ```
 
-> ⚠️ **torch 等平台相关大件不自动安装**：脚本自动过滤 `torch/torchvision/torchaudio`
-> 并打印各环境的平台安装命令，避免 CPU/CUDA 版本互相污染（两个打包 venv 严禁混用，
-> 集显版只准 CPU torch、独显版默认 CUDA）。需要时用
+> ⚠️ **torch 等平台相关大件不自动进入主线 Edge 环境**：脚本自动过滤 `torch/torchvision/torchaudio`
+> 并打印 Reference P/sidecar 环境的平台安装命令，避免 CPU/CUDA 版本互相污染。llama.cpp/GGUF
+> 主线不要求 torch；需要 PC 对照时用
 > `--torch-index-url URL` 让提示带好源，例如 `https://download.pytorch.org/whl/cu126`。
 > llama-cpp-python 等需源码构建的包会在缺编译工具链时报错，按对应 requirements 头注释处理。
 
@@ -416,7 +416,7 @@ venv 的 `pip freeze` 自动生成，记录精确版本做复现参考（torch �
 
 | 环境 | 用途 | 依赖来源 | lock 快照 |
 |---|---|---|---|
-| **主环境**（系统 Python） | 运行时（transformers/torch 推理服务）与工具脚本 | `requirements.txt` | `requirements-lock/main.lock.txt` |
+| **主环境**（系统 Python） | Control/TUI、工具脚本与可选 PC Reference P 开发 | `requirements.txt` | `requirements-lock/main.lock.txt` |
 | `.venv-edge` | Edge L 档 GGUF/CPU 节点 | `requirements-edge.txt` | 本票以预检 JSON 为证据 |
 | `.venv-test` | 唯一测试环境（全量/定向 pytest） | `requirements-test.txt` | `requirements-lock/test.lock.txt` |
 | `../qlh-shell/.venv-tui` | T9 终端聊天页（textual） | `../qlh-shell/requirements-tui.txt` | `../qlh-shell/requirements-lock/tui.lock.txt` |
@@ -486,11 +486,12 @@ python -c "import src.api_server" && python -m pytest tests/ -q --collect-only |
 
 `llama.cpp` 已锁定为外置仓库 `../qlh-android/app/src/main/cpp/llama.cpp` 的 Git submodule。要保留 Android Full
 构建能力，需在兄弟目录 clone `https://github.com/SgfKrc/qlh-android`，进入该仓库后使用 `git submodule update --init --recursive`；
-若从节点只运行 PC CPU Worker、Qwen3/Gemma 4 PyTorch sidecar，则普通 clone 即可，不需要另行
-clone 或编译 `llama.cpp`。`.venv-gemma4-native` 使用 `llama-cpp-python`，也不直接引用该 Android
-源码子模块。
+PC llama.cpp host/worker 与 Android RPC worker 需要对应平台的原生 llama.cpp 构建；本地 Python
+单机入口使用 `llama-cpp-python`。只有运行 PC Reference P 的 Qwen3/Gemma 4 PyTorch sidecar
+时，才另行准备 PyTorch 环境；sidecar 不属于 Edge 或默认生产路径。
 
-无 CUDA/独显的 PC 从节点必须显式安装 CPU PyTorch，不要复制主节点 CUDA venv：
+无 CUDA/独显的 PC 主线节点无需安装 PyTorch，直接使用 llama.cpp/GGUF。若该节点被明确指定为
+PC Reference P 对照节点，才显式安装 CPU PyTorch，且不要复制主节点 CUDA venv：
 
 ```bash
 python scripts/setup_qwen3_sidecar_env.py --pipeline \
@@ -507,8 +508,8 @@ python scripts/setup_envs.py --check --no-node
 
 | 资产 | 大小 | 用途 | 获取方式 | 必需性 |
 |---|---|---|---|---|
-| **Qwen-1.8B-Chat（Safetensors）** | ~3.5 GB | 默认示例模型：独显推理、分布式流水线 | ModelScope `Qwen/Qwen-1.8B-Chat` 或 HF（见下文模型下载节） | ⭐ 必需（默认模型） |
-| **Qwen-1.8B-Chat（GGUF Q4_K_M）** | ~1.16 GB | CPU/集显单机、Android 本地推理 | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ 必需（CPU 路径） |
+| **Qwen-1.8B-Chat（Safetensors）** | ~3.5 GB | PC Reference P 历史对照 | ModelScope `Qwen/Qwen-1.8B-Chat` 或 HF（见下文模型下载节） | 可选（参考环境） |
+| **Qwen-1.8B-Chat（GGUF Q4_K_M）** | ~1.16 GB | llama.cpp CPU/集显单机、Android 本地推理和分片 PoC | `huggingface-cli download RichardErkhov/Qwen_-_Qwen-1_8B-Chat-gguf ...` | ⭐ 推荐（主线基线） |
 | **Qwen3-4B（GGUF Q4_K_M）** | ~2.5 GB | EX-N3 判题模型（v2 正确率判据）、实验 | 受管下载（MODEL-TOOLS）/ HF `Qwen/Qwen3-4B-GGUF` | 实验必需 |
 | **Gemma 4 12B 原生绑定**（GGUF + mmproj） | ~7.3 GB | 图像理解（图生文）原生路径 | 受管工件清单 `models/gemma4-native/gemma4-native.lock.json` + 下载脚本 | 多模态实验 |
 | **nomic-embed-text:latest**（Ollama） | 按需 | 主节点本地 RAG embedding provider | `ollama pull nomic-embed-text:latest` | RAG 本机质量/容量门 |
@@ -971,7 +972,7 @@ python serve.py
 
 ### 设计文档
 
-- [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) — 当前主线基线：双引擎、三种分布式形态、TUI 和 Edge L 档
+- [主线开发计划：分布式推理与边缘优化](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) — 当前主线基线：llama.cpp/GGUF 模型分片、TUI、控制面和 Edge 无 torch 路径
 - [支线开发计划：外置迁移与 Koakumix](docs/支线开发计划-外置迁移与Koakumix-2026-09-14.md) — 产品壳、侧车、发布和工具迁移边界
 - [总体下一步计划](docs/总体下一步计划.md) — 历史总排期与当前计划索引
 - [项目进展与下一步计划](docs/archive/项目进展与下一步计划.md) — **历史能力与证据快照**；当前主线/支线排期以两份 2026-09-15 基线计划为准

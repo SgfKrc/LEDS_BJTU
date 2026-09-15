@@ -6,7 +6,7 @@
 
 > **Language**: [English](README.en.md) · [简体中文](../README.md)
 
-**A multi-engine, evolvable distributed LLM inference system for heterogeneous edge devices.**
+**A llama.cpp-first distributed LLM inference system for heterogeneous edge devices.**
 
 Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Distributed inference · TUI-first edge operation
 
@@ -20,26 +20,26 @@ Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orche
 
 ## 📋 Project Introduction
 
-QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The PC PyTorch pipeline can split compatible models across nodes by Transformer layers; the PC/Android llama.cpp path runs full local GGUF inference. INT4/INT8 quantization, operator fusion, paged KV cache, graph orchestration and graceful degradation remain available. Local development gates are complete for PC Full Worker/task graphs, Android Full Worker/Stage and GGUF stages; short dual-machine evidence covers the PyTorch layer pipeline and task graph. `task_dispatch`, real CUDA parity, long disconnect recovery and production routing remain deferred acceptance gates; tensor parallelism remains an out-of-cluster PoC only.
+QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The production mainline is GGUF/llama.cpp: first establish a single-machine baseline, then attack host + RPC worker model sharding so a model that does not fit one machine can be held partly by multiple nodes. The PyTorch/Safetensors layer pipeline remains a PC reference experiment; TaskGraph/whole-request dispatch is only a temporary full-model fallback. Web, Android UI, release, toolbox and image generation are external side lines. The hard gates are cutover/low coupling → llama.cpp single machine → same-machine dual-process RPC → PC hardware → Android hardware.
 
 Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient for scheduling — eligibility depends on engine, model format, model fingerprint, available memory, accelerator and network topology.
 
-### Software Editions (four tiers)
+### Main Repository Runtime Shapes (four boundaries)
 
-| Tier | Edition | Target devices | Core capabilities | Excludes / not recommended |
+| Tier | Shape | Target devices | Core capabilities | Excludes / not recommended |
 |------|----------|----------------|-------------------|----------------------------|
-| 1 | **PC iGPU** | Windows / Linux PCs without NVIDIA dGPU | llama.cpp + GGUF CPU/iGPU inference, cluster join, remote request forwarding | PyTorch layer pipeline, heavy-model experiments, CUDA-only features |
-| 2 | **PC dGPU** | Windows / Linux NVIDIA GPU master/experiment PCs | PyTorch + CUDA + bitsandbytes with CPU fallback, multi-model and heavy-model experiments | Android minimal strategy; image generation belongs to Koakumix |
-| 3 | **Android standard** | Android phones/tablets | Full-on local GGUF, thin forwarding to PC, SAF model directory, update/log/connection diagnostics; Full Worker/Stage and Gemma4 MTMD have local development wiring | Transformer layer splitting and heavy-model experiments; real-device Worker, multimodal quality and background survival remain to be accepted |
-| 4 | **Android lite** | Lightweight phone entry | Minimal chat, remote PC forwarding, smallest APK/cache/model footprint, single recommended small/INT4 route | Local GGUF, full model directory, Worker execution and advanced control surfaces |
+| 1 | **Edge/TUI single machine** | Windows/Linux PCs without NVIDIA, constrained devices | llama.cpp + GGUF CPU/iGPU inference, cross-platform TUI, model download/selection | torch, Web UI, release tooling, image generation |
+| 2 | **PC llama.cpp sharding** | PCs/workstations/heterogeneous nodes | llama host + `ggml-rpc-server` worker, targeting partial residency and capacity aggregation | No production RPC claim before G0-G2 gates pass |
+| 3 | **PC Reference P** | NVIDIA/high-memory PCs | PyTorch + Safetensors layer pipeline for correctness, performance and capacity comparison | Not part of Edge install, default routing or release |
+| 4 | **Android worker/client** | Android phones/tablets | External repository maintains local GGUF, RPC worker or HTTP client; model fleet selects capability per device | Android UI, Gradle and JNI do not return to the main repository |
 
 ### Core Features
 
 | Feature | Description |
 |------|------|
-| 🧠 **Intelligent orchestration** | PyTorch layer pipeline assigns contiguous layer segments by compute/memory/network; large topologies use max-bandwidth spanning tree + DFS → [distributed resource scheduling](分布式资源调度系统.md) |
-| 🔗 **PyTorch layer pipeline** | Compatible Safetensors models split by contiguous layers; hidden states passed node-to-node with KV cache incremental decoding; **QW1.8B dual-machine layered data plane verified** (2026-08-20, `master 0-21 + client 21-24`, `distributed_used=true`/`fallback=false`, L1-3) |
-| 🔄 **Dual engine** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/iGPU), automatic switching |
+| 🧠 **Model-sharding research** | The llama.cpp/GGUF mainline studies partial residency, RPC, leases and fault redistribution; single-machine and same-machine dual-process gates come first → [mainline plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
+| 🔗 **PyTorch reference path** | The Safetensors layer pipeline is retained for PC correctness/performance/capacity comparison; existing QW1.8B dual-machine evidence does not verify llama.cpp model sharding |
+| 🔄 **Production engine boundary** | llama.cpp + GGUF is the default production/Edge path; PyTorch + bitsandbytes exists only in PC Reference P and is not auto-selected on Edge |
 | 📋 **MLFQ queue** | Three-level feedback queue: short-interaction priority + aging anti-starvation + FIFO compatibility → [scheduling doc](分布式资源调度系统.md) |
 | 🗄️ **Local facts source** | Sessions/settings/model registry on the master-node SQLite (remote PostgreSQL retired); offline-safe |
 | 🧩 **Model-asset governance** | Registry, manifest/SHA verification, source/license handling, Sidecar contracts, deployment simulation and HF direct → user proxy → ModelScope fallback are wired into the local product surface; real large artifacts, CUDA and cross-PC delivery remain to be accepted |
@@ -55,7 +55,7 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
 | 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |
 | 🧭 **Role asymmetry evidence** *(CACHE-05)* | DeepSeek input/output asymmetry is reference-only; QLH records draft/verify and sub-1B role hypotheses with offline evidence boundaries → [report](非对称分工论证-2026-09-14.md) |
-| ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, recoverable task state/journal, lease-epoch winner fencing, provider registry; PC Full Worker & task graph verified for restart & disconnect recovery and IPv6 TCP (2026-08-21); `task_dispatch` production gate stays closed → [task chain plan](任务链下一阶段实施计划.md) |
+| ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, journal, lease-epoch fencing and provider registry remain a temporary full-model fallback; this does not mean the model is sharded and `task_dispatch` stays closed → [task chain plan](任务链下一阶段实施计划.md) |
 | 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → [cluster-join & local RAG plan](集群接入稳定性与本地RAG实施计划.md) |
 | 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → [cluster-join plan](集群接入稳定性与本地RAG实施计划.md) |
 | 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](抗弱网通信协议专项计划.md) |
