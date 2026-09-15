@@ -288,3 +288,4 @@ but bit-exact reproducibility across processes is not achievable today.
 | --- | --- |
 | 2026-09-16 | 新建：把 §7.10/§7.11 发现的 `embd` 非确定性整理成可提交的 issue 材料。含环境、最小复现探针（自包含源码）、16 项实验数据、逐层定位（分叉始于第一个 full-attention 层、需要 >1 token）、7 条已排除成因、候选假设、QLH 侧绕开口径、pin 版本与打补丁流程、英文 issue 正文草稿。**根因未坐实，本轮不提供上游修复补丁**；曾尝试的"清零 `inp->tokens`"已回退，工作树干净。 |
 | 2026-09-16 | **补实验 #17/#18（增量注入）**：新增 `relay-incr-probe`（整段注入 vs 逐 token 增量注入对比）→ **增量注入同样逐位不等**（cosine 0.994），"改用更细注入粒度即可复现"的期望**被证伪**；并据此细化定位为"**pos = 0 单 token 确定、pos ≥ 1（有历史状态）单 token 不确定**"。同步更新 §8 绕开口径（可复现性只能靠 argmax / 单进程口径）与提交指引。 |
+| 2026-09-16 | **issue 已提交**：[ggml-org/llama.cpp#28963](https://github.com/ggml-org/llama.cpp/issues/28963)（作者 `SgfKrc`，`open`，0 评论）—— `Misc. bug: CPU backend: llama_batch.embd (embedding input) decoding is non-deterministic`。 |

@@ -113,13 +113,27 @@ for 16/16 steps, but bit-exact reproducibility across processes is not achievabl
 
 ## 提交前自检清单（建议）
 
-- [ ] 用中文/英文重述一遍 Summary 与 steps（**改成你自己的语言**，避免直贴）
-- [ ] 确认 gist 可公开访问：https://gist.github.com/SgfKrc/ce1d31578fd39b531c6274bc8434558e
-- [ ] 选模板 **Bug (misc.)**（`Misc. bug: ` 前缀由模板自动加）
-- [ ] 提交后把 issue URL 回填到本文件与《上游llama-embd注入非确定性-复现与issue材料》的变更记录
+- [x] 用中文/英文重述一遍 Summary 与 steps（提交时已人工过稿）
+- [x] 确认 gist 可公开访问：https://gist.github.com/SgfKrc/ce1d31578fd39b531c6274bc8434558e
+- [x] 选模板 **Bug (misc.)**（`Misc. bug: ` 前缀由模板自动加）
+- [x] 提交后把 issue URL 回填到本文件与《上游llama-embd注入非确定性-复现与issue材料》的变更记录
+
+## 已提交（2026-09-16）
+
+- **issue**：**https://github.com/ggml-org/llama.cpp/issues/28963**
+  标题：`Misc. bug: CPU backend: llama_batch.embd (embedding input) decoding is non-deterministic`
+- 提交者 `SgfKrc`；状态 `open`；0 评论；创建于 2026-09-15T18:58:17Z
+- **两处建议在 issue 页直接编辑**（不影响正文内容）：
+  1. 模板的 *Which llama.cpp modules do you know to be affected?* 目前是 `Documentation/Github`，建议改为 **`libllama (core library)`**（问题在库层）；
+  2. *Command line* 段为空，建议补上探针调用，例如：
+     ```
+     probe.exe model.gguf embd5.f32 repeat 6 1
+     probe.exe model.gguf embd5.f32 tokens 6 1
+     ```
 
 ## 变更记录
 
 | 日期 | 变更 |
 | --- | --- |
 | 2026-09-16 | 新建：按 `019-bug-misc` 模板整理的可提交 issue 正文草稿 + 提交信息表 + gist 链接（gist 已创建）。**不代为提交**（上游有 AI 使用政策），由人工审阅改写后提交。 |
+| 2026-09-16 | **已提交**：issue [#28963](https://github.com/ggml-org/llama.cpp/issues/28963)（作者 `SgfKrc`，open）；勾选自检清单，并记录两处可在 issue 页直接编辑的待改进项（模块下拉应为 `libllama`、`Command line` 为空）。 |
