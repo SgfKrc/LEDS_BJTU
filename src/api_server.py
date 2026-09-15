@@ -1923,7 +1923,13 @@ def _fallback_followups(history: list[dict], existing: list[str]) -> list[str]:
 def _init_kv_cache():
     """初始化分页 KV 缓存（根据设备画像自适应大小）"""
     global kv_cache
-    from paged_kv_cache import PagedKVCache  # torch-backed; imported on first use only
+    try:
+        from paged_kv_cache import PagedKVCache  # torch-backed (D-tier only)
+    except ImportError:
+        # L-tier (no torch): the paged KV cache is a PyTorch feature and is not wired
+        # into the single-machine decode loop anyway (see the note further down).
+        kv_cache = None
+        return
 
     num_heads = 16      # Qwen-1.8B: 16 attention heads
     head_dim = 64       # 隐藏维度 2048 / 16 heads = 128, 但实际是 64 per head for K/V
