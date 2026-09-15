@@ -10,3 +10,15 @@
 [submodule "harness_workbench"]
 	path = harness_workbench
 	url = https://github.com/SgfKrc/Koakumix.git
+[submodule "frontend_cybergothic"]
+	path = frontend_cybergothic
+	url = https://github.com/SgfKrc/qlh-shell.git
+[submodule "packaging"]
+	path = packaging
+	url = https://github.com/SgfKrc/qlh-release.git
+[submodule "tools/toolbox"]
+	path = tools/toolbox
+	url = https://github.com/SgfKrc/qlh-toolbox.git
+[submodule "android"]
+	path = android
+	url = https://github.com/SgfKrc/qlh-android.git

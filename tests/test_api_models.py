@@ -991,6 +991,15 @@ def test_list_models_exposes_new_model_assets_for_frontend_selection(monkeypatch
     assert all(models[model_id]["is_available"] for model_id in expected)
     assert all(models[model_id]["supported_engines"] == ["llama_cpp", "pytorch"] for model_id in expected)
 
+    profiles = {model_id: models[model_id]["profile"] for model_id in expected}
+    assert all(profile["profile_schema"] == "qlh.harness.model_profile.v1" for profile in profiles.values())
+    assert all(profile["format"] == "both" for profile in profiles.values())
+    assert all(len(profile["artifact_sha256"]) == 64 for profile in profiles.values())
+    assert all(profile["evidence"]["artifact_digest_mode"] == "manifest" for profile in profiles.values())
+    assert profiles["qwen3-0.6b"]["generation"]["thinking"] == "declared"
+    assert profiles["minicpm4-0.5b"]["adaptation"]["prompt_family"] == "minicpm4_chat_v1"
+    assert profiles["distilqwen25-ds3-0324-7b"]["resources"]["min_vram_gb"] == 8.0
+
 
 def test_list_models_returns_null_when_not_loaded(monkeypatch):
     """模型未加载时 active_model_id 为 None"""

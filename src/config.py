@@ -441,9 +441,6 @@ MAX_NODES = 3                    # 最大节点数上限（主节点可动态调
 CLIENT_MASTER_HOST = _env_first("QLH_CLIENT_MASTER_HOST", "QLH_MASTER_HOST", default="")
 CLIENT_MASTER_PORT = _env_int("QLH_CLIENT_MASTER_PORT", _env_int("QLH_MASTER_PORT", 8888))
 
-# SMTP 邮件告警配置（详见 src/email_notifier.py）
-MASTER_DOWN_EMAIL_TIMEOUT = 180      # 主节点宕机超过此秒数（3分钟）后发送邮件告警（0=禁用）
-
 # P3: 主节点转让审查配置（详见 src/review.py）
 REVIEW_TIMEOUT_HOURS = 48            # 审查工单超时时间（小时）
 REVIEW_APPROVE_THRESHOLD = 2         # 通过阈值: score >= +2

@@ -106,7 +106,6 @@ from config import (
     RUN_MODE, HEARTBEAT_INTERVAL,
     SERVER_IP, SERVER_PORT,
     NODE_ROLE, NODE_ID, MAX_NODES,
-    MASTER_DOWN_EMAIL_TIMEOUT,
     PIPELINE_TIMEOUT, PIPELINE_MODEL_SYNC_TIMEOUT, PIPELINE_STEP_TIMEOUT,
     PIPELINE_QUEUE_POLL_INTERVAL,
     PIPELINE_QUEUE_MAX_SIZE, PIPELINE_QUEUE_RESULT_TTL,
@@ -13923,8 +13922,7 @@ class Scheduler:
 
         每 15 秒检查一次本机 TCP 连接状态。
         当检测到主节点从在线变为离线时，记录告警日志。
-        当宕机超过 MASTER_DOWN_EMAIL_TIMEOUT 秒时，发送邮件告警。
-        当主节点恢复在线时，发送恢复通知 + 自动重连（如已配置）。
+        当主节点恢复在线时，记录恢复日志并自动重连（如已配置）。
         """
         with self._client_health_start_lock:
             if (self._client_health_thread is not None
@@ -13946,9 +13944,7 @@ class Scheduler:
         self._client_master_online = initial_online
         self._client_reconnect_enabled = True
 
-        # 邮件告警状态
         self._client_master_down_since = 0.0         # 主节点首次检测到宕机的时间戳
-        self._client_master_down_email_sent = False  # 本轮宕机是否已发送告警邮件
 
         # 周期性重连：当主节点在线但本地 TCP 未连接时，每隔一定时间重试
         self._client_last_reconnect_attempt = 0.0    # 上次重连尝试的时间戳
@@ -13959,8 +13955,7 @@ class Scheduler:
             daemon=True,
         )
         self._client_health_thread.start()
-        threshold_info = f"，宕机邮件告警阈值: {MASTER_DOWN_EMAIL_TIMEOUT}s" if MASTER_DOWN_EMAIL_TIMEOUT > 0 else "（邮件告警已禁用）"
-        logger.info(f"从节点主节点健康监控已启动（间隔 15s，重连间隔 60s）{threshold_info}")
+        logger.info("从节点主节点健康监控已启动（间隔 15s，重连间隔 60s）")
 
     def _client_health_monitor_loop(self) -> None:
         """从节点健康监控循环（后台 daemon 线程）"""
@@ -13975,38 +13970,10 @@ class Scheduler:
                 # ---- 检测主节点宕机 ----
                 if was_online and not is_online:
                     self._client_master_down_since = time.time()
-                    self._client_master_down_email_sent = False
                     logger.warning(
                         f"⚠️ 检测到主节点宕机！上次心跳: "
                         f"{health.get('last_seen_seconds_ago', '?')}s 前"
                     )
-
-                # ---- 主节点持续宕机：检查是否需要发送邮件告警 ----
-                if (not is_online
-                        and self._client_master_down_since > 0
-                        and MASTER_DOWN_EMAIL_TIMEOUT > 0
-                        and not self._client_master_down_email_sent):
-                    downtime = time.time() - self._client_master_down_since
-                    if downtime >= MASTER_DOWN_EMAIL_TIMEOUT:
-                        try:
-                            from email_notifier import send_master_down_alert
-                            host = health.get("master_host", "")
-                            port = health.get("master_port", 0)
-                            last_seen = health.get("last_seen_seconds_ago")
-                            client_id = self.get_effective_node_id()
-                            ok = send_master_down_alert(
-                                host, port, downtime,
-                                last_seen_seconds_ago=last_seen,
-                                client_node_id=client_id,
-                            )
-                            if ok:
-                                self._client_master_down_email_sent = True
-                                logger.info(
-                                    f"📧 主节点宕机告警邮件已发送 "
-                                    f"（宕机 {downtime:.0f}s，阈值 {MASTER_DOWN_EMAIL_TIMEOUT}s）"
-                                )
-                        except Exception as e:
-                            logger.error(f"发送宕机告警邮件失败: {e}")
 
                 # ---- 检测主节点恢复 ----
                 if not was_online and is_online:
@@ -14014,26 +13981,8 @@ class Scheduler:
                     # 首轮循环会出现 was_online=False → is_online=True 的
                     # 假"恢复"跳变（链路其实一直健康），此时不应打恢复日志
                     observed_down = self._client_master_down_since > 0
-                    total_downtime = time.time() - self._client_master_down_since if self._client_master_down_since > 0 else 0
-
-                    # 发送恢复通知邮件（仅在本轮曾发送过宕机告警时）
-                    if self._client_master_down_email_sent:
-                        try:
-                            from email_notifier import send_master_recovery_alert
-                            host = health.get("master_host", "")
-                            port = health.get("master_port", 0)
-                            client_id = self.get_effective_node_id()
-                            send_master_recovery_alert(
-                                host, port, total_downtime,
-                                client_node_id=client_id,
-                            )
-                            logger.info(f"📧 主节点恢复通知邮件已发送（总宕机 {total_downtime:.0f}s）")
-                        except Exception as e:
-                            logger.error(f"发送恢复通知邮件失败: {e}")
-
                     # 重置宕机追踪状态
                     self._client_master_down_since = 0.0
-                    self._client_master_down_email_sent = False
 
                     if observed_down:
                         logger.info(

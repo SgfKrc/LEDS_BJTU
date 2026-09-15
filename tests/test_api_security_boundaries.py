@@ -14,6 +14,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import api_server
 
 
+def test_retired_email_surface_has_no_api_routes():
+    paths = {route.path for route in api_server.app.routes}
+    assert paths.isdisjoint({
+        "/api/cluster/email-test",
+        "/api/cluster/email-config",
+        "/api/cluster/review/mail-poll",
+    })
+
+
 def _request(host: str, *, headers: dict[str, str] | None = None) -> Request:
     encoded_headers = [
         (name.lower().encode("latin-1"), value.encode("latin-1"))
@@ -276,7 +285,6 @@ def test_review_side_effect_endpoints_require_master_role(monkeypatch):
         lambda: api_server.trigger_expire_check(),
         lambda: api_server.delete_review_ticket("review-test"),
         api_server.delete_resolved_review_tickets,
-        api_server.trigger_mail_poll,
     )
     for endpoint in endpoints:
         with pytest.raises(HTTPException) as rejected:
@@ -286,7 +294,6 @@ def test_review_side_effect_endpoints_require_master_role(monkeypatch):
 
 
 def test_review_side_effect_endpoints_execute_for_master(monkeypatch):
-    import email_notifier
     import review
 
     class MasterScheduler:
@@ -307,10 +314,6 @@ def test_review_side_effect_endpoints_execute_for_master(monkeypatch):
 
     monkeypatch.setattr(api_server, "scheduler", MasterScheduler())
     monkeypatch.setattr(review, "ReviewManager", FakeReviewManager)
-    monkeypatch.setattr(
-        email_notifier, "poll_mail_once", lambda: {"polled": 1},
-    )
-
     assert asyncio.run(api_server.trigger_expire_check()) == {
         "expired": ["review-expired"],
         "count": 1,
@@ -323,7 +326,6 @@ def test_review_side_effect_endpoints_execute_for_master(monkeypatch):
         "status": "deleted",
         "count": 2,
     }
-    assert asyncio.run(api_server.trigger_mail_poll()) == {"polled": 1}
 
 
 # ================================================================

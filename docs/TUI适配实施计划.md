@@ -79,7 +79,6 @@
 | 16 | `/cluster/spare-master` | DELETE | :833 | 节点 | `status`、`message` |
 | 17 | `/cluster/config/max-nodes` | PUT | :844 | 节点 | `status` |
 | 18 | `/cluster/transfer-logs` | GET | :856 | 节点 | `logs[0]{direction,from_role,to_role,related_node}`、`count` |
-| 19 | `/cluster/email-test` | POST | :869 | 节点 | `message`、`status` |
 | 20 | `/cluster/reset-identity` | POST | :876 | 节点 | `status` |
 | 21 | `/cluster/config/distributed-inference` | GET | :889 | 分布式 | `enabled`、`default` |
 | 22 | `/cluster/config/distributed-inference` | PUT | :953 | 分布式 | `status` |
@@ -126,7 +125,7 @@
 | `/status`（2） | scheduler-svc + inference-svc + 本地 | **聚合**：scheduler `/v1/status` + inference `/v1/status`（模型/显存）+ 网关本机画像缓存；嵌套字段按 §2.2 #2 原样输出 |
 | `/models/current`（3） | inference-svc | 代理：`GET /v1/models/current` |
 | `/cluster/my-role`、`nodes`、`invite`、`spare-master`(GET)、`master-health`、`discover`（4-9） | scheduler-svc | 代理（scheduler-svc 需按 §2.2 字段提供；内部端点形态自行决定，见主计划 §4.2 对外适配原则） |
-| `/cluster/connect`、`nodes/register`、`nodes/{id}/deregister`、`nodes/{id}`(DELETE)、`transfer-master`、`spare-master`(POST/DELETE)、`config/max-nodes`、`transfer-logs`、`email-test`、`reset-identity`（10-20） | scheduler-svc（email-test 阶段 2 由 legacy-control 承载，见 3.3） | 代理 |
+| `/cluster/connect`、`nodes/register`、`nodes/{id}/deregister`、`nodes/{id}`(DELETE)、`transfer-master`、`spare-master`(POST/DELETE)、`config/max-nodes`、`transfer-logs`、`reset-identity`（10-19） | scheduler-svc | 代理 |
 | `/cluster/config/distributed-inference`(GET/PUT)、`layers`(GET/PUT/DELETE)、`config`(GET)（21-26） | scheduler-svc | 代理；**保留 PUT/DELETE 方法语义**（对外 ≠ 内部 POST 设计） |
 | `/cluster/queue*`（27-32） | scheduler-svc | 代理；`queue/task/{id}` DELETE 透传 JSON 响应 |
 | `/device/profile`、`select-gpu`、`auto-configure`（33-35） | scheduler-svc（采集库 device_profiler 留 Python） | 代理 |
@@ -136,7 +135,7 @@
 
 `/logs/*` 的 `buffer_*` 字段来自 FastAPI 进程内 logging 内存缓冲（非纯文件读取），TS 侧无法在阶段 2 低成本复刻。因此：
 
-- **阶段 2 期间**：主计划 §2.2 允许"控制面域端点暂由 FastAPI 遗留进程承载"——从 api_server 剥离出**控制面遗留进程 `legacy-control`**（端口 `QLH_LEGACY_CONTROL_PORT`=8040，仅挂 logs/review/email/sessions/conversations/settings/bootstrap 等控制面路由），网关对 `/logs/*` 反向代理并透传请求头。迁移域端点（chat/cluster/queue/device 等）从遗留进程移除，实现主计划 §2.5"端点壳退役"。
+- **阶段 2 期间**：主计划 §2.2 允许"控制面域端点暂由 FastAPI 遗留进程承载"——从 api_server 剥离出**控制面遗留进程 `legacy-control`**（端口 `QLH_LEGACY_CONTROL_PORT`=8040，仅挂 logs/review/sessions/conversations/settings/bootstrap 等控制面路由），网关对 `/logs/*` 反向代理并透传请求头。迁移域端点（chat/cluster/queue/device 等）从遗留进程移除，实现主计划 §2.5"端点壳退役"。邮件能力已裁撤，不进入 legacy-control。
 - **阶段 3**：control-svc 就绪后，`/logs/*` 改代理到 control-svc，legacy-control 退役。**契约（路径/字段/token 语义）全程不变**。
 
 ---

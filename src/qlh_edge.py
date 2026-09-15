@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import threading
@@ -127,7 +128,21 @@ def generate(req: GenerateRequest):
 _STARTED_AT = time.time()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the QLH minimal edge inference service.")
+    parser.add_argument("--host", default=os.environ.get("QLH_EDGE_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("QLH_EDGE_PORT", "8010")),
+    )
+    args = parser.parse_args(argv)
+
     import uvicorn
 
-    uvicorn.run(app, host=os.environ.get("QLH_EDGE_HOST", "127.0.0.1"), port=int(os.environ.get("QLH_EDGE_PORT", "8010")))
+    uvicorn.run(app, host=args.host, port=args.port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

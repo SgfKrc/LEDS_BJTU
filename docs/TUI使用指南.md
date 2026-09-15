@@ -8,7 +8,7 @@
 >
 > **更新日期**：2026-08-11
 >
-> **适用范围**：QLH 终端版管理菜单（`src/tui_admin.py`）与全局 `bjtu` 命令的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
+> **适用范围**：QLH 终端版聊天/管理 TUI（`qlh chat`、`src/tui_admin.py`）的启动方式、参数与使用说明；实现细节与网关契约见 [TUI 适配实施计划](TUI适配实施计划.md)，功能口径以源码与本文为准
 
 ---
 
@@ -18,7 +18,17 @@
 
 TUI 是**纯 HTTP 客户端**：所有数据来自后端 API（默认 `http://127.0.0.1:8000/api`）。后端未运行时 TUI 无法工作，因此一键启动脚本会先确保后端就绪再进入 TUI。
 
-## 二、全局 `bjtu` 命令（推荐）
+## 二、全局 `qlh` 命令（推荐）
+
+主仓的统一入口是 `qlh`：`chat` 进入聊天壳，`admin` 进入管理 TUI，`status`/`models` 执行不启动后端的单命令查询。源码检出时使用根目录的 `qlh.bat`（Windows）或 `qlh.sh`（Linux/macOS）。聊天壳的 Textual/httpx 依赖仍由可选环境提供，不进入 Edge 标准库 TUI。
+
+```bash
+qlh chat --host http://127.0.0.1:8000
+qlh admin --plain
+qlh models
+```
+
+## 三、全局 `bjtu` 命令（兼容）
 
 把一键启动封装为全局命令 `bjtu`：**在任何目录的终端输入 `bjtu` 即可自动启动后端 + TUI**（无需先进入项目目录）。新增的 `bjtu launcher` 是统一选择入口，启动器和 TUI 使用同一套深色信息层级、后端健康检查、模型检查与错误处理；没有图形环境时自动降级为终端选择页。
 
@@ -41,7 +51,8 @@ bjtu                                # 启动后端 + TUI（保持原有默认行
 bjtu launcher                       # 显式打开统一选择页
 bjtu ui                             # 直接启动普通 Web/Windows 原生界面
 bjtu tui                            # 启动后端并进入 TUI 管理界面
-bjtu chat --host http://127.0.0.1:8000  # 进入 Textual 终端对话页
+qlh chat --host http://127.0.0.1:8000   # 主仓统一聊天入口
+bjtu chat --host http://127.0.0.1:8000  # 兼容入口
 bjtu --host 100.x.x.x               # 启动后端后，TUI 管理远程主节点
 bjtu --plain                        # 纯文本编号菜单
 ```
@@ -67,9 +78,9 @@ bjtu --host 100.x.x.x status        # 对远程主节点执行单命令
 
 已安装的 Windows 主应用包通过 `QLH-TUI-Chat/QLH-TUI-Chat.exe` 运行聊天页；Linux `.deb` 使用 `/opt/qlh-edge-inference/venv`。两者都已携带 Textual/httpx，首次进入不安装依赖也不联网。它与管理 TUI 是独立进程，`tui_admin.py --plain` 和原有 `bjtu` 默认入口不变。
 
-源码检出模式仍可使用 Shell 仓库隔离的 `qlh-shell/.venv-tui`：先运行 `python ..\qlh-shell\scripts\setup_tui_env.py`，再执行 `bjtu chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列，当前不把聊天页设为默认入口。
+源码检出模式仍可使用 Shell 仓库隔离的 `qlh-shell/.venv-tui`：先运行 `python ..\qlh-shell\scripts\setup_tui_env.py`，再执行 `qlh chat --host http://127.0.0.1:8000`。主应用完整安装包和干净机回归仍在发布验收队列；Edge 最小入口继续使用标准库管理 TUI。
 
-## 三、一键启动（start_tui.bat / start_tui.sh）
+## 四、一键启动（start_tui.bat / start_tui.sh）
 
 > 一键启动 = 自动检查后端 → 未运行则启动后端 → 等待就绪 → 进入 TUI。
 
@@ -114,7 +125,7 @@ kill "$(cat logs/backend_tui.pid)"
 
 > 提示：若 `logs/backend_tui.log` 里出现启动失败，通常是端口占用、Python 环境或依赖缺失，见 §六排查。
 
-## 四、手动启动（高级/排障用）
+## 五、手动启动（高级/排障用）
 
 不依赖一键脚本，先启动后端，再启动 TUI：
 
@@ -126,7 +137,7 @@ python src/api_server.py            # 或 python -m uvicorn src.api_server:app -
 python src/tui_admin.py             # 连本机 8000
 ```
 
-## 五、参数说明
+## 六、参数说明
 
 ### 一键启动脚本
 
@@ -155,7 +166,7 @@ python src/tui_admin.py --host 100.x.x.x --log-token xxx   # 远程模式带日�
 python src/tui_admin.py --plain                    # 纯文本编号菜单
 ```
 
-## 六、常见问题
+## 七、常见问题
 
 | 现象 | 原因与处理 |
 |------|-----------|
@@ -165,7 +176,7 @@ python src/tui_admin.py --plain                    # 纯文本编号菜单
 | 中文乱码 | Windows：脚本已自动 `chcp 65001`，直接双击即可；若手动启动请先执行 `chcp 65001`。Linux/macOS：确认终端使用 UTF-8 |
 | 远程模式日志打不开 | 远程日志需 `--log-token`（未配置 token 时后端也允许放行）；本地模式（TUI 与后端同机）不走 HTTP，直接读 `logs/` 目录 |
 
-## 七、自动化走查与测试
+## 八、自动化走查与测试
 
 - **契约测试**：`cd gateway && npm run test:tui`（44 用例：38 端点调用点 + 5 项细节 + 错误契约）。
 - **7 屏 × 2 角色走查**：`scripts/tui_walkthrough.py --host <网关> --port <端口> --mode master|client`，配套桩 `scripts/dev_stubs.py`（scheduler-svc :8020 + inference-svc :8010，`--client-mode` 模拟从节点身份）与 `src/legacy_control.py`（:8040，`/logs/*`）——**两个桩与网关均已随微服务叫停删除（2026-09-14）**，走查以其历史记录为准。

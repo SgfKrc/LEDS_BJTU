@@ -152,6 +152,7 @@ Project root
 │   ├── external_provider.py       # ★ External inference provider + data-scope gating (Route B)
 │   ├── speculative.py             # ★ draft-verify speculative decoding (experimental, disabled, Route C)
 │   ├── tui_admin.py               # ★ Cross-platform TUI admin menu (pure stdlib, zero dependencies)
+│   ├── qlh.py                     # Cross-platform core TUI command entry
 │   ├── tui_chat.py                # ★ T9 chat page (Textual + httpx; bundled in installers, optional in source)
 │   ├── tui_sse.py / tui_shared.py # T9 SSE incremental parser & shared layer
 │   ├── paged_kv_cache.py          # Lightweight paged KV cache (hot memory pages; optional cold disk tier)
@@ -163,7 +164,6 @@ Project root
 │   ├── local_store.py             # Primary-node SQLite local storage (one-time legacy JSON import)
 │   ├── model_downloader.py        # Model download guidance (HuggingFace/ModelScope/Baidu Netdisk)
 │   ├── model_host.py              # Model lifecycle host (manager-held, LLM runtime lifecycle)
-│   ├── email_notifier.py          # SMTP alerts + IMAP voting (recipient configurable via node_config)
 │   ├── scheduler_svc_http.py      # scheduler-svc HTTP shell (contract passthrough)
 │   ├── inference_service/         # ★ inference-svc (engine_host/protocol/routes)
 │   └── node_config.py             # Local node configuration (cluster secret/profile, not source-controlled)

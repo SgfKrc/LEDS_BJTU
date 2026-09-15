@@ -126,7 +126,6 @@ class TestTicketSerialization:
             "score": 1,
             "expires_at": time.time() + 172800,
             "resolved_at": None,
-            "notification_sent": False,
         }
 
         ticket = ReviewTicket.from_dict(d)
@@ -147,7 +146,6 @@ class TestTicketSerialization:
             "score": 0,
             "expires_at": time.time() + 3600,
             "resolved_at": None,
-            "notification_sent": False,
         }
         ticket = ReviewTicket.from_dict(d)
         assert ticket.status.value == "pending"
@@ -233,7 +231,7 @@ class TestStateMachine:
 def review_store(monkeypatch, tmp_path):
     """把 local_store 指向临时目录并初始化，返回隔离的 ReviewManager。
 
-    屏蔽邮件通知（无 SMTP 凭据时 _send_email 最长阻塞 30s）。
+    使用隔离的本地 SQLite 存储。
     """
     import local_store
     sqlite_path = tmp_path / "qlh-local-store.sqlite3"
@@ -243,7 +241,6 @@ def review_store(monkeypatch, tmp_path):
     monkeypatch.setattr(local_store, '_get_store_dir', lambda: str(legacy_dir))
     monkeypatch.setattr(local_store, '_legacy_store_dir', lambda: str(legacy_dir))
     monkeypatch.setattr(local_store, '_sqlite_path', lambda: str(sqlite_path))
-    monkeypatch.setattr('email_notifier.send_review_created_alert', lambda **kwargs: None)
     local_store.initialize_local_store()
 
     from review import ReviewManager
