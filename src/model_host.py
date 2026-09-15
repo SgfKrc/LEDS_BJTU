@@ -217,11 +217,39 @@ class ModelHost:
         if not gguf_path or not os.path.isfile(gguf_path):
             raise FileNotFoundError(f"GGUF 模型文件未找到: {gguf_path or '(未解析到路径)'}")
 
+        resolved_id = model_id
+        if not resolved_id:
+            try:
+                from model_config import get_builtin_models, resolve_model_path
+
+                absolute_path = os.path.abspath(gguf_path)
+                for candidate in get_builtin_models():
+                    if candidate.gguf_path and os.path.abspath(
+                        resolve_model_path(candidate.gguf_path),
+                    ) == absolute_path:
+                        resolved_id = candidate.model_id
+                        break
+            except Exception:
+                resolved_id = None
+
+        model_metadata = {}
+        if resolved_id:
+            try:
+                from model_config import get_model_profile_metadata
+
+                model_metadata = get_model_profile_metadata(resolved_id)
+            except Exception:
+                model_metadata = {}
+
         tier = (profile or {}).get("tier", "laptop")
         n_ctx = {"edge": 1024, "mobile": 512, "ultrabook": 2048}.get(tier, 4096)
 
         engine_obj = LlamaCppEngine()
-        engine_obj.load_model(model_path=gguf_path, n_ctx=n_ctx)
+        engine_obj.load_model(
+            model_path=gguf_path,
+            n_ctx=n_ctx,
+            model_profile=model_metadata,
+        )
         # Install the engine as the manager: chat/chat_stream/is_loaded are then proxied
         # to it unchanged (their signatures already match ModelManager's).
         object.__setattr__(self, "_manager", engine_obj)
@@ -229,7 +257,7 @@ class ModelHost:
         # Callers (api_server.get_status, scheduler) read these manager-side fields, so
         # mirror them here.  __getattr__ only fires when the instance dict misses, so
         # setting them on the instance keeps the proxy working normally otherwise.
-        resolved_id = model_id or gguf_path
+        resolved_id = resolved_id or gguf_path
         object.__setattr__(self, "active_model_id", resolved_id)
         object.__setattr__(self, "_active_model_id", resolved_id)
         object.__setattr__(self, "_engine_type", "llama_cpp")

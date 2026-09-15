@@ -217,6 +217,64 @@ def test_chat_pre_cancelled_does_not_start_llama_generation():
     assert result["finish_reason"] == "cancelled"
 
 
+def test_qwen3_thinking_flag_updates_registered_chat_template_state():
+    cancel_event = threading.Event()
+    model = FakeLlamaModel(cancel_event)
+    engine = LlamaCppEngine()
+    engine._model = model
+    engine._model_path = "qwen3-0.6b.gguf"
+    engine._loaded = True
+    engine._chat_template = "qwen3_chat_v1"
+    engine._thinking_controlled = True
+
+    engine.chat(
+        [{"role": "user", "content": "question"}],
+        max_tokens=4,
+        show_thinking=False,
+        _cancel_event=cancel_event,
+    )
+
+    assert engine._thinking_enabled is False
+    assert engine._chat_template_kwargs == {"enable_thinking": False}
+
+
+def test_chat_stream_closes_native_stream_and_forwards_thinking_flag():
+    class Stream:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            return iter([
+                {"choices": [{"delta": {"content": "one"}}]},
+                {"choices": [{"delta": {"content": "two"}}]},
+            ])
+
+        def close(self):
+            self.closed = True
+
+    class Model:
+        def __init__(self):
+            self.stream = Stream()
+            self.call_kwargs = None
+
+        def create_chat_completion(self, **kwargs):
+            self.call_kwargs = kwargs
+            return self.stream
+
+    model = Model()
+    engine = LlamaCppEngine()
+    engine._model = model
+    engine._model_path = "qwen25.gguf"
+    engine._loaded = True
+
+    assert list(engine.chat_stream(
+        [{"role": "user", "content": "question"}],
+        show_thinking=False,
+    )) == ["one", "two"]
+    assert model.stream.closed is True
+    assert model.call_kwargs["stream"] is True
+
+
 def test_mtmd_capabilities_are_registered_and_released(tmp_path):
     mtmd = make_fake_mtmd()
     engine = LlamaCppEngine()

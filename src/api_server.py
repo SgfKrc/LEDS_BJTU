@@ -4562,13 +4562,14 @@ def _execute_chat_full(
                     max_tokens=req.max_new_tokens,
                     temperature=req.temperature,
                     top_p=req.top_p,
+                    show_thinking=req.show_thinking,
                     _cancel_event=cancel_event,
                 )
             _raise_if_generation_cancelled(cancel_event, req.generation_id)
-            response_text = result.get("content", "")
-            # P3修复: llama.cpp/孤岛路径同样需要剥离本地思考标记
-            if not req.show_thinking:
-                response_text = _strip_native_thinking_tags(response_text)
+            response_text, thinking_content = _format_model_response(
+                result.get("content", ""),
+                req.show_thinking,
+            )
             completed_history = [
                 *request_history,
                 {"role": "assistant", "content": response_text},
@@ -4629,7 +4630,7 @@ def _execute_chat_full(
 
             return {
                 "content": response_text,
-                "thinking_content": None,
+                "thinking_content": thinking_content,
                 "metrics": metrics,
                 "followups": followups,
             }
@@ -5267,6 +5268,27 @@ async def chat_stream(req: ChatRequest, request: Request):
                                 if frame:
                                     yield frame
                         # 路径 2: 单机 PyTorch 流式
+                        elif (model_manager._engine_type == "llama_cpp"
+                              and model_manager.is_loaded
+                              and callable(getattr(model_manager, "chat_stream", None))
+                              and callable(getattr(
+                                  scheduler, "_run_full_model_inference_stream", None,
+                              ))):
+                            async for event in _iterate_sync_generator(
+                                scheduler._run_full_model_inference_stream(
+                                    req.message,
+                                    max_new_tokens=req.max_new_tokens,
+                                    temperature=req.temperature,
+                                    top_p=req.top_p,
+                                    messages=[{"role": "user", "content": req.message}],
+                                    show_thinking=req.show_thinking,
+                                    _cancel_event=cancel_event,
+                                ),
+                            ):
+                                _append_event(event)
+                                frame = _token_frame(event)
+                                if frame:
+                                    yield frame
                         elif (model_manager._engine_type == "pytorch"
                                 and model_manager.is_loaded):
                             async for event in _iterate_sync_generator(scheduler._run_full_model_inference_stream(
@@ -5536,6 +5558,29 @@ async def chat_stream(req: ChatRequest, request: Request):
                 yield _error_event(str(e))
 
         # ---- 路径 2: 单机 PyTorch 流式 ----
+        elif (model_manager._engine_type == "llama_cpp"
+                and model_manager.is_loaded
+                and callable(getattr(model_manager, "chat_stream", None))
+                and callable(getattr(
+                    scheduler, "_run_full_model_inference_stream", None,
+                ))):
+            try:
+                async for event in _iterate_sync_generator(
+                    scheduler._run_full_model_inference_stream(
+                        req.message,
+                        max_new_tokens=req.max_new_tokens,
+                        temperature=req.temperature,
+                        top_p=req.top_p,
+                        messages=[{"role": "user", "content": req.message}],
+                        show_thinking=req.show_thinking,
+                        _cancel_event=cancel_event,
+                    ),
+                ):
+                    yield f"data: {_json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                logger.error(f"llama.cpp 流式推理失败: {e}", exc_info=True)
+                yield _error_event(str(e))
+
         elif (model_manager._engine_type == "pytorch"
                 and model_manager.is_loaded):
             try:

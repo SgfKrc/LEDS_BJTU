@@ -13480,11 +13480,16 @@ class Scheduler:
         top_p = kwargs.pop('top_p', 0.9)
         show_thinking = bool(kwargs.pop('show_thinking', False))
         messages = kwargs.pop("messages", None) or [{"role": "user", "content": prompt}]
+        engine_name = getattr(mgr, "_engine_type", "pytorch") or "pytorch"
         try:
             model_prompt = self._host._build_model_chat_prompt(mgr.tokenizer, messages)
             native_thinking_prompt = "<think>" in model_prompt[-128:].lower()
         except Exception:
-            native_thinking_prompt = False
+            native_thinking_prompt = bool(
+                engine_name == "llama_cpp"
+                and getattr(mgr, "_chat_template", "") == "qwen3_chat_v1"
+                and not getattr(mgr, "_thinking_controlled", False)
+            )
 
         q = queue.Queue()
         full_text_parts = []
@@ -13501,6 +13506,7 @@ class Scheduler:
                     max_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
+                    show_thinking=show_thinking,
                     _cancel_event=cancel_event,
                 ):
                     if chunk:
@@ -13510,7 +13516,7 @@ class Scheduler:
                 elapsed = time.time() - t0
                 metrics_info[0] = {
                     "mode": "single_streaming",
-                    "engine": "pytorch",
+                    "engine": engine_name,
                     "chunks": token_count,
                     "elapsed_seconds": round(elapsed, 3),
                 }
