@@ -8,7 +8,7 @@
 >
 > 适用范围：Qwen3 文本系列、Qwen3-VL 系列与 Qwen3.5 原生多模态系列的工件获取、引擎准入和 EX-N3 质量标定。Gemma 4 的新格式工件另立候选票，不在本文引用或预设未建立的 Gemma 子票。
 >
-> 总计划入口：[总体下一步计划](总体下一步计划.md)；下载与用户代理规则：[一键模型部署与自治集群远期计划](一键模型部署与自治集群远期计划.md) §7.1。
+> 总计划入口：[总体下一步计划](总体下一步计划.md)；下载与用户代理规则：[一键模型部署与自治集群远期计划](../../qlh-release/docs/一键模型部署与自治集群远期计划.md) §7.1。
 
 > **2026-08-14 `PT-PIPE-QW3.4` 增量**：Scheduler dry-run canonical 合同与 prepare/commit/abort/release 故障矩阵已完成；真实 Qwen3-4B 三段 C3 manifest 摘要合同约 2.9 KiB。该票明确 `network_dispatch=false / weight_materialization=false / full_model_fallback=false`，仅证明控制协议可承接真实 revision，不构成跨节点或生产准入。
 
