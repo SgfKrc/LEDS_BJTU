@@ -2,7 +2,7 @@
 
 > 状态：**现行**
 >
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 
 > **Language**: [English](README.en.md) · [简体中文](../README.md)
 
@@ -10,7 +10,7 @@
 
 Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Distributed inference · TUI-first edge operation
 
-**v0.1.8.3** (updated 2026-09-15)
+**v0.1.8.3** (updated 2026-09-16)
 
 > 📌 Current mainline: **[Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)**; side lines: **[Externalization & Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md)**; historical snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)**.
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
@@ -20,25 +20,26 @@ Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orche
 
 ## 📋 Project Introduction
 
-QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The production mainline is GGUF/llama.cpp: an Edge node defaults to local inference with a model at or below 1B parameters, while it can also join as an RPC worker for a larger distributed model. Models that do not fit one machine are held partly by multiple nodes. The PyTorch/Safetensors layer pipeline remains a PC reference experiment; TaskGraph/whole-request dispatch is only a temporary full-model fallback. Web, Android UI, release, toolbox and image generation are external side lines. The hard gates are cutover/low coupling → llama.cpp single machine → same-machine dual-process RPC → PC hardware → Android hardware.
+QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The production mainline is GGUF/llama.cpp: an Edge node defaults to local inference with a model at or below 1B parameters, while it can also join as an RPC worker for a larger distributed model. Models that do not fit one machine are held partly by multiple nodes. The main repository also carries a PC-only Relay R compatibility track: cut GGUF plus `embd` injection reached 16/16 same-process L→L behavioral matches, while D→L, cross-process/network and long-sequence behavior remain unverified. The PyTorch/Safetensors layer pipeline remains a PC reference and Relay source; TaskGraph/whole-request dispatch is only a temporary full-model fallback. Web, Android UI, release, toolbox and image generation are external side lines. The production hard gates are cutover/low coupling → llama.cpp single machine → same-machine dual-process RPC → PC hardware → Android hardware; Relay has separate `CORE-RELAY-01` / `CORE-RELAY-XFRAME-01` gates and does not replace RPC.
 
 Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient for scheduling — eligibility depends on engine, model format, model fingerprint, available memory, accelerator and network topology.
 
-### Main Repository Runtime Roles (four boundaries)
+### Main Repository Runtime Roles (five boundaries)
 
 | Tier | Shape | Target devices | Core capabilities | Excludes / not recommended |
 |------|----------|----------------|-------------------|----------------------------|
 | 1 | **Edge node** | Windows/Linux PCs without NVIDIA, constrained devices, Android | Local llama.cpp + GGUF inference (default <=1B), plus RPC worker participation in larger models and cross-platform TUI | torch, Web UI, release tooling, image generation |
 | 2 | **PC llama.cpp sharding** | PCs/workstations/heterogeneous nodes | llama host + `ggml-rpc-server` worker, targeting partial residency and capacity aggregation | No production RPC claim before G0-G2 gates pass |
-| 3 | **PC Reference P** | NVIDIA/high-memory PCs | PyTorch + Safetensors layer pipeline for correctness, performance and capacity comparison | Not part of Edge install, default routing or release |
-| 4 | **Failure-bypass role** | Any node that remains online | On node failure, route to a full-model node, another shard topology, or a local <=1B model; a scheduling strategy, not a Lite product | No separate Lite package or UI |
+| 3 | **PC Relay R** | PCs that can run llama.cpp; PC Reference P supplies the D→L source | Cut GGUF + hidden/`embd` handoff; L→L behavior is verified | Explicitly off by default; does not replace RPC or enter the Edge default path |
+| 4 | **PC Reference P** | NVIDIA/high-memory PCs | PyTorch + Safetensors layer pipeline for correctness, performance, capacity comparison and D→L Relay source | Not part of Edge install, default routing or release |
+| 5 | **Failure-bypass role** | Any node that remains online | On node failure, route to a full-model node, another shard topology, or a local <=1B model; a scheduling strategy, not a Lite product | No separate Lite package or UI |
 
 ### Core Features
 
 | Feature | Description |
 |------|------|
 | 🧠 **Model-sharding research** | The llama.cpp/GGUF mainline studies partial residency, RPC, leases and fault redistribution; Edge nodes serve <=1B locally and can join larger sharded inference; single-machine and same-machine dual-process gates come first → [mainline plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
-| 🔗 **PyTorch reference path** | The Safetensors layer pipeline is retained for PC correctness/performance/capacity comparison; existing QW1.8B dual-machine evidence does not verify llama.cpp model sharding |
+| 🔗 **Relay & PyTorch reference path** | Same-process PC L→L Relay behavior is verified 16/16; the Safetensors layer pipeline remains for PC correctness/performance/capacity comparison and D→L source validation; existing QW1.8B dual-machine evidence does not verify llama.cpp model sharding |
 | 🔄 **Production engine boundary** | llama.cpp + GGUF is the default production/Edge path; PyTorch + bitsandbytes exists only in PC Reference P and is not auto-selected on Edge |
 | 📋 **MLFQ queue** | Three-level feedback queue: short-interaction priority + aging anti-starvation + FIFO compatibility → [scheduling doc](分布式资源调度系统.md) |
 | 🗄️ **Local facts source** | Sessions/settings/model registry on the master-node SQLite (remote PostgreSQL retired); offline-safe |

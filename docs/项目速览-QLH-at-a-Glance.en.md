@@ -2,7 +2,7 @@
 
 > 状态：**现行**
 >
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
@@ -12,7 +12,7 @@
 
 ## What is this?
 
-QLH is a lightweight distributed LLM inference system for heterogeneous edge devices (a 2026 Beijing Jiaotong University student innovation program project). Master and worker nodes (PC / Surface / Android) join a Tailscale mesh and split models across nodes by compute/memory/network capacity. It features twin engines (PyTorch + llama.cpp), INT4/INT8 quantization, paged KV cache, task-graph orchestration, local RAG, multimodal image understanding, a local Auth-App control plane, and multi-client UIs. Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**. Image generation is outside the QLH main project and belongs to the standalone Koakumix harness.
+QLH is a lightweight distributed LLM inference system for heterogeneous edge devices (a 2026 Beijing Jiaotong University student innovation program project). Edge nodes use <=1B llama.cpp/GGUF models locally by default and can join larger model sharding as RPC workers; the production path is built from single-node validation through same-host simulation and real PC/Android workers. The main repository also carries a PC-only Relay R compatibility track: cut GGUF plus `embd` injection reached 16/16 same-process L→L behavioral matches, while D→L, cross-process/network and long-sequence behavior remain unverified. PyTorch is retained only as a PC reference and Relay source; task graphs are temporary full-model fallback. The main repository keeps INT4/INT8 quantization, paged KV cache, TUI and reproducible experiments. Product Web, Android UI, knowledge base, release tooling and image generation are side-line work; image generation belongs exclusively to the standalone Koakumix harness. Design principles: **data stays in-cluster, offline autonomy, reproducible acceptance**.
 
 ## Verified capabilities
 
@@ -22,6 +22,7 @@ QLH is a lightweight distributed LLM inference system for heterogeneous edge dev
 | Task-graph recovery + Tailnet IPv6 | 2026-08-21: `wf_330d0aa1…`, reassignment=0 |
 | Judging-policy fix (multi-model 0/4 → loose+512 discriminative) | P5: Qwen3-4B 1/4 vs 1.8B 0/4 |
 | DS3-0324-7B replaces R1 as judging model (approved candidate) | v2 policy **2/4×3, format 8/11×3** |
+| PC-only Relay R: cut GGUF + `embd` L→L handoff | 2026-09-16: 16/16 same-process behavioral matches; `embd` is not bitwise deterministic, D→L/cross-boundary work pending |
 | Sub-project: small-model harness workbench (S1-S8) | context budget / STATE memory / RAG / MCP, local gates |
 | Sub-project: docagent (own repo, brought in as submodule) | rule-as-data + evolution gates |
 | Sub-project: Reasonix ↔ Codex bridge (own repo, brought in as submodule) | read-only subagent for Codex; controlled writes W1/W2/W3 landed (off by default) |
@@ -30,6 +31,7 @@ QLH is a lightweight distributed LLM inference system for heterogeneous edge dev
 ## What is NOT claimed
 
 - Production routing admission (`task_dispatch` off), long-running/multi-turn & power-loss recovery, real 443/WSS, IPv6-only installers, real 7B/12B three-node peak memory — all remain in the deferred acceptance queue; local gates or simulations must not be presented as passes.
+- Relay currently has only same-process PC L→L behavioral evidence; no bitwise, PyTorch→llama.cpp, cross-process/network, long-sequence or sampling production claim is allowed.
 - Tensor parallelism (TP) exists only as an out-of-cluster PoC (route A); speculative decoding is an experimental path (route C).
 
 ## First-time setup
