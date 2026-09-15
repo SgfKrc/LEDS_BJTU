@@ -49,3 +49,15 @@ def test_plan_is_loopback_and_worker_does_not_receive_model_path(tmp_path: Path)
     assert "--model" not in report["worker_command"]
     assert "127.0.0.1" in report["worker_command"]
     assert report["sharding_contract"]["reject_full_model_copy"] is True
+
+
+def test_plan_allows_cpu_worker_diagnostic(tmp_path: Path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"gguf")
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+
+    report = plan_report(build_plan(model, runtime, worker_device="CPU"))
+
+    assert report["sharding_contract"]["worker_device"] == "CPU"
+    assert report["worker_command"][-1] == "CPU"

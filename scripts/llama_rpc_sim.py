@@ -42,6 +42,7 @@ class ProbePlan:
     ctx_size: int
     max_tokens: int
     worker_budget_mib: float
+    worker_device: str
 
     @property
     def worker_command(self) -> list[str]:
@@ -52,7 +53,7 @@ class ProbePlan:
             "--port",
             str(self.rpc_port),
             "--device",
-            "CUDA0",
+            self.worker_device,
         ]
 
     @property
@@ -100,6 +101,7 @@ def build_plan(
     ctx_size: int = 256,
     max_tokens: int = 2,
     worker_budget_mib: float = 2048,
+    worker_device: str = "CUDA0",
 ) -> ProbePlan:
     return ProbePlan(
         model=Path(model).expanduser().resolve(),
@@ -110,6 +112,7 @@ def build_plan(
         ctx_size=ctx_size,
         max_tokens=max_tokens,
         worker_budget_mib=worker_budget_mib,
+        worker_device=worker_device,
     )
 
 
@@ -135,7 +138,7 @@ def plan_report(plan: ProbePlan) -> dict[str, Any]:
         "host_command": _command_display(plan.host_command),
         "sharding_contract": {
             "host_device": "RPC0",
-            "worker_device": "CUDA0",
+            "worker_device": plan.worker_device,
             "requires_cpu_and_rpc_buffers": True,
             "reject_full_model_copy": True,
             "loopback_only": True,
@@ -455,6 +458,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--ctx-size", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=2)
     parser.add_argument("--worker-budget-mib", type=float, default=2048)
+    parser.add_argument("--worker-device", default="CUDA0")
     parser.add_argument("--no-fallback", action="store_true", help="skip the local CPU fallback probe")
     parser.add_argument("--report", type=Path, help="write the JSON report to this path")
     parser.add_argument("--json", action="store_true", help="print JSON instead of a short summary")
@@ -472,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
         ctx_size=args.ctx_size,
         max_tokens=args.max_tokens,
         worker_budget_mib=args.worker_budget_mib,
+        worker_device=args.worker_device,
     )
     try:
         report = plan_report(plan) if not args.run else run_probe(plan, check_fallback=not args.no_fallback)
