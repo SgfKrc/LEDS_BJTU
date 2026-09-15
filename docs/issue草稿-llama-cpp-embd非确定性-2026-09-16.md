@@ -21,8 +21,17 @@
 
 ### Name and Version
 
-version: 6f04274cc145cf76aafc46eb8c1ea054ca221368
-built with MSYS2 UCRT64 g++ (x86_64-w64-mingw32) on Windows, CPU-only build:
+```
+$ ./llama-cli --version
+version: 0.1.0-dev (build 10436, commit 6f04274cc)
+built with GNU 15.2.0 for Windows AMD64
+```
+
+> 本机只构建了库与实验工具（未构建 `llama-cli`），上面的版本串取自**同一次构建**的
+> `llama-server --version`（同一份版本宏）。若你手边有 `llama-cli`，提交前可再跑一次替换。
+
+- full commit: `6f04274cc145cf76aafc46eb8c1ea054ca221368`（`git describe`：`b10431-5-g6f04274cc`；2026-08-14；含 PR #27073 的 hidden-state 提取）
+- build（CPU-only、无 CUDA、无 tests）：
 
 ```
 cmake -B build-cpu -G "MinGW Makefiles" -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF
