@@ -20,28 +20,26 @@
 
 ## 📋 项目简介
 
-QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Windows/Linux 台式机、工作站、服务器、笔记本以及 Android 手机和平板。生产主线是 GGUF/llama.cpp：先完成单机基线，再攻克 host + RPC worker 模型分片，让单机装不下的模型由多个节点共同承载、每个节点只保有实际分配的部分。PyTorch/Safetensors 层流水线只保留为 PC 对照实验，任务图/整请求只作为临时完整模型回退；Web、Android UI、发布、工具和生图均在外置仓库或 Koakumix 支线维护。当前主线的硬门是裁切/低耦合 → llama.cpp 单机 → 同机双进程 RPC → PC 真机 → Android 真机，不能用旧双机证据替代新模型分片证据。
+QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Windows/Linux 台式机、工作站、服务器、笔记本以及 Android 手机和平板。生产主线是 GGUF/llama.cpp：Edge 节点默认使用 1B 以内模型完成本地推理，同时可以作为分片/RPC worker 参与更大模型推理；单机装不下的模型由多个节点共同承载、每个节点只保有实际分配的部分。PyTorch/Safetensors 层流水线只保留为 PC 对照实验，任务图/整请求只作为临时完整模型回退；Web、Android UI、发布、工具和生图均在外置仓库或 Koakumix 支线维护。当前主线的硬门是裁切/低耦合 → llama.cpp 单机 → 同机双进程 RPC → PC 真机 → Android 真机，不能用旧双机证据替代新模型分片证据。
 
 现已覆盖 **Windows PC + Linux PC + Android**。设备类型不是调度能力的充分条件：是否能参与某种分布式执行，还取决于运行引擎、模型格式、模型指纹、可用内存、加速器和网络拓扑。
 
 ### 主仓运行形态（四类边界）
 
-项目按硬件能力和使用场景划分为四种软件版本：
+项目按硬件能力和使用场景划分为四类运行角色；它们不是互斥安装包，也不再单列 Lite 产品模式：
 
 | 级别 | 形态 | 目标设备 | 核心能力 | 不包含/不推荐 |
 |------|----------|----------|----------|---------------|
-| 1 | **Edge/TUI 单机** | 无 NVIDIA 的 Windows/Linux PC、弱设备 | llama.cpp + GGUF CPU/集显推理、跨平台 TUI、模型下载/选择 | torch、Web UI、发布工具、图像生成 |
-| 2 | **PC llama.cpp 分片** | 普通 PC/工作站/异构节点 | llama host + `ggml-rpc-server` worker，目标是模型部分驻留和容量合并 | 未通过 G0-G2 前不得宣称生产 RPC |
+| 1 | **Edge 节点** | 无 NVIDIA 的 Windows/Linux PC、弱设备、Android | 本地 llama.cpp + GGUF（默认 <=1B）推理；可注册为 RPC worker 参与更大模型；跨平台 TUI | torch、Web UI、发布工具、图像生成 |
+| 2 | **PC llama.cpp host/worker** | 普通 PC/工作站/异构节点 | host + `ggml-rpc-server` 模型分片，目标是部分驻留和容量合并 | 未通过 G0-G2 前不得宣称生产 RPC |
 | 3 | **PC Reference P** | NVIDIA/高内存 PC | PyTorch + Safetensors 层流水线，用于正确性、性能和容量对照 | 不进入边缘安装、默认路由或正式发行 |
-| 4 | **Android worker/client** | Android 手机/平板 | 外置仓维护本地 GGUF、RPC worker 或 HTTP 客户端；按模型舰队选择能力 | Android UI、Gradle、JNI 不回流主仓 |
-
-> Android 普通版和极简版的区别：普通版面向“完整移动客户端”，极简版面向“尽量小、尽量少设置、尽量低存储占用”的手机轻量入口。
+| 4 | **故障绕行角色** | 任意仍在线节点 | 节点故障时，将请求转给已具备完整模型的节点、其他分片拓扑或本地 <=1B 模型；这是调度策略，不是 Lite 产品 | 不新增单独 Lite 包或 UI |
 
 ### 核心特性
 
 | 特性 | 说明 |
 |------|------|
-| 🧠 **模型分片攻关** | llama.cpp/GGUF 主线按节点能力研究模型部分驻留、RPC、租约和故障重分配；先通过单机与同机双进程门 → [详见主线计划](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
+| 🧠 **模型分片攻关** | llama.cpp/GGUF 主线按节点能力研究模型部分驻留、RPC、租约和故障重分配；Edge 既能本地完成 <=1B 推理，也能参与大模型分片；先通过单机与同机双进程门 → [详见主线计划](docs/主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
 | 🔗 **PyTorch 参考路径** | 兼容 Safetensors 的层流水线仅用于 PC 正确性/性能/容量对照；既有 QW1.8B 双机证据是历史参考，不代表 llama.cpp 模型分片已验收 |
 | 🔄 **生产引擎边界** | llama.cpp + GGUF 是默认生产/边缘路径；PyTorch + bitsandbytes 只在 PC Reference P 环境存在，不自动切换到边缘 |
 | 📋 **MLFQ 请求队列** | 三级反馈队列管理并发推理请求，短交互优先 + 老化防饥饿 + FIFO 兼容 → [详见调度文档](docs/分布式资源调度系统.md) |
@@ -52,9 +50,9 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 | 🔐 **本地 Auth App 控制面** | Owner bootstrap、Auth-App 字符串/二维码下发、TOTP、恢复码轮换、成员管理与一次性入群票据均有本机 UI/API 门；系统凭据和首次安装联调后置 |
 | 📦 **安装、更新与离线整合包** | 独立 Launcher 的签名更新/回滚、下载进度与诊断已实现；离线整合包支持容量预检、SHA/manifest、原子 ZIP、7z/分卷和恢复校验。真实全量出包、空目录/Android SAF 导入和跨平台安装验收后置 |
 | 🎛️ **控制面** | 节点注册/注销、分层覆盖、角色转让、备用主节点、TCP 连接状态监控；用户交互以 TUI 为主 |
-| 🖥️ **TUI 主入口** | `qlh chat` 面向本地/远端引擎；管理 TUI 负责节点、模型舰队、任务和状态；`qlh_edge` 提供最小 HTTP → [使用指南](docs/TUI使用指南.md) |
+| 🖥️ **TUI 主入口** | `qlh chat` 面向本地/集群引擎；管理 TUI 负责节点、模型舰队、任务和状态；`qlh_edge` 提供最小 HTTP/节点接入面，不替代本地或分布式推理 → [使用指南](docs/TUI使用指南.md) |
 | 🖼️ **图像能力边界** | 主项目保留图片上传、Gemma/Qwen 多模态理解和图生文，不提供图像生成或编辑，也不安装相关运行时与模型资产。生图唯一归属为 Koakumix `harness_workbench`，接口为 `/v1/images/generations`；旧 SD 计划只作历史记录。 |
-| 📱 **Android 客户端（支线）** | Android Full/Lite、SAF、Full Worker/Stage 和真机证据由独立端侧仓库维护；主仓只冻结任务、模型和能力合同 |
+| 📱 **Android 端侧（支线）** | Android 本地推理、RPC worker、SAF 和真机证据由独立端侧仓库维护；主仓只冻结任务、模型和能力合同；不再把 Lite 作为独立产品线 |
 | 🏝️ **TP 孤岛接入** *(PoC)* | 集群外的同构 GPU 张量并行子集群（vLLM/SGLang/llama.cpp rpc）封装为**单个逻辑高算力节点**接入，承担整请求推理 → [接入指南](docs/TP孤岛接入指南.md) |
 | ☁️ **外部推理服务辅助** *(PoC)* | 整条请求按策略路由到集群外 OpenAI 兼容端点，**数据作用域门控默认不出集群** → [接入指南](docs/外部推理服务Provider接入指南.md) |
 | 🎯 **投机解码辅助** *(实验)* | 本地小模型起草 + 外部大模型校验，跨慢网只传 token id；默认关闭，未接生产解码循环 → [实施说明](docs/投机解码外部辅助实施说明.md) |
@@ -175,7 +173,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 │   └── node_config.py             # 本机节点配置（集群密钥/档案等，非源码控制）
 ├── schemas/                       # ★ MODEL-FLEET 冻结契约（artifact/pull-job/deployment/profile JSON Schema）
 ├── fixtures/                      # 测试与走查 fixture（API 事件流、模型门样例）
-├── (sibling) qlh-android/         # Android Full/Lite、JNI、Gradle、Android tests/resources
+├── (sibling) qlh-android/         # Android Edge runtime/client、JNI、Gradle、Android tests/resources
 ├── (sibling) qlh-shell/            # CyberGothic Web/Desktop shell、Node tests、可选 Textual
 ├── (sibling) qlh-release/          # Launcher、PyInstaller/Inno/Linux 发布与发布 venv
 ├── (sibling) qlh-toolbox/          # SSH/patch、演示、答辩和性能工具
@@ -222,7 +220,7 @@ QLH 面向算力、内存和网络条件不同的异构边缘设备，包括 Win
 |------|------|------|------|
 | `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **自研**（文档维护 Agent 独立化） | 规则数据化扫描器、规则变更机械扫描（new/gone/changed 增量矩阵）与演进门控 |
 | `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **自研**（Codex ↔ Reasonix 协作桥） | stdio MCP 桥接，供 Codex 调用只读 Reasonix 子智能体；CLI 路径与模型 ref 按本机解析，`configure verify` 自检 |
-| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **第三方**（Android 外置仓库依赖） | Android Full 变体原生构建；固定 revision，PC 侧与 Python sidecar 都不需要 |
+| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **第三方**（Android 外置仓库依赖） | Android Edge runtime 原生构建；固定 revision，PC 侧与 Python sidecar 都不需要 |
 
 #### 自研子项目一：`qlh-docagent`（文档维护 Agent）
 
@@ -256,15 +254,15 @@ git clone --recurse-submodules https://github.com/SgfKrc/qlh       # 主仓首�
           独显主节点参与首段计算，不再仅协调调度
 ```
 
-### Android 当前两种运行方式
+### Android / Edge 当前运行方式
 
 ```
 ┌──────────────────────────────┬──────────────────────────────┐
-│ 本地模式（现有 UI：全有模式）   │ 远程模式（现有 UI：全无模式）   │
+│ 本地/节点模式                   │ 集群/故障绕行模式              │
 │                              │                              │
-│  Android 本地 llama.cpp      │  Android 聊天 UI             │
-│  GGUF Q4_K_M (~1.16 GB)      │  HTTP → PC 主节点             │
-│  离线可用，不依赖网络          │  PC 集群分布式推理            │
+│  Android 本地 llama.cpp      │  HTTP → PC 主节点             │
+│  GGUF Q4_K_M (~1.16 GB)      │  PC/Edge 集群分布式推理       │
+│  离线可用，不依赖网络          │  节点故障时才启用绕行          │
 └──────────────────────────────┴──────────────────────────────┘
 ```
 
@@ -466,7 +464,7 @@ python scripts/setup_test_env.py --check
 ### 0. 克隆后必做（一次性的环境步骤）
 
 ```bash
-# 1. 主仓只拉取自己的自研子模块；Android Full 的 llama.cpp 在 qlh-android 仓内维护，主线可跳过
+# 1. 主仓只拉取自己的自研子模块；Android Edge 的 llama.cpp 在 qlh-android 仓内维护，主线可跳过
 #    产品壳、Android、发布工具和 Toolbox 是兄弟仓库，按需在工作区另行 clone。
 git submodule update --init --recursive
 
@@ -484,7 +482,7 @@ pip install -r requirements.txt
 python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
 ```
 
-`llama.cpp` 已锁定为外置仓库 `../qlh-android/app/src/main/cpp/llama.cpp` 的 Git submodule。要保留 Android Full
+`llama.cpp` 已锁定为外置仓库 `../qlh-android/app/src/main/cpp/llama.cpp` 的 Git submodule。要保留 Android Edge
 构建能力，需在兄弟目录 clone `https://github.com/SgfKrc/qlh-android`，进入该仓库后使用 `git submodule update --init --recursive`；
 PC llama.cpp host/worker 与 Android RPC worker 需要对应平台的原生 llama.cpp 构建；本地 Python
 单机入口使用 `llama-cpp-python`。只有运行 PC Reference P 的 Qwen3/Gemma 4 PyTorch sidecar
@@ -527,7 +525,7 @@ python scripts/setup_envs.py --check --no-node
 
 ### 3. 安装包（不克隆也可用）
 
-Windows CPU/CUDA Setup、Launcher、Android Full/Lite APK、Linux `.deb` 均从**发布渠道**获取（本项目内网：主节点在 `qlh-release` 运行 `python packaging/serve.py`）。不要求克隆主仓即可安装使用；克隆仓库主要用于开发与验收。
+Windows CPU/CUDA Setup、Launcher、Android Edge runtime APK、Linux `.deb` 均从**发布渠道**获取（本项目内网：主节点在 `qlh-release` 运行 `python packaging/serve.py`）。不要求克隆主仓即可安装使用；克隆仓库主要用于开发与验收。
 
 ---
 
@@ -583,7 +581,7 @@ QLH 主项目不提供图像生成、图像编辑或相关模型下载。图片�
 
 ### GGUF 格式（Android 本地推理）
 
-Android 本地模式（现有 UI 中称“全有模式”）下，模型需放在**用户选择的外部目录**中（SAF `ACTION_OPEN_DOCUMENT_TREE`），**不放在应用内部存储**，这样卸载 APK 时模型会默认保留。
+Android Edge 本地模式下，模型需放在**用户选择的外部目录**中（SAF `ACTION_OPEN_DOCUMENT_TREE`），**不放在应用内部存储**，这样卸载 APK 时模型会默认保留。
 
 **Android 模型存放位置**：
 
@@ -608,7 +606,7 @@ Android 本地模式（现有 UI 中称“全有模式”）下，模型需放�
 **操作流程**：
 
 ```text
-打开应用 → 设置 → 切换"全有模式" → 模型管理 → 选择目录
+打开应用 → 设置 → 本地模型 → 模型管理 → 选择目录
   → 选择包含 .gguf 的目录 → 扫描 → 选中模型 → 完成
 ```
 
@@ -833,7 +831,7 @@ sudo systemctl enable --now qlh-edge-inference  # 开机自启
 
 > 前提：已安装 JDK 17 + Android SDK（API 34+），SDK 路径配置在 `../qlh-android/local.properties`
 >
-> 新克隆 `qlh-android` 后需先初始化其 llama.cpp submodule（Full 变体原生构建必需，Lite 不需要）：
+> 新克隆 `qlh-android` 后需先初始化其 llama.cpp submodule（Edge 本地运行时构建必需）：
 
 ```bash
 cd ..\qlh-android
@@ -856,9 +854,8 @@ cd ..\qlh-android
 
 | 产物 | 路径 | 典型大小 | 说明 |
 |------|------|---------|------|
-| Full Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | 含 llama.cpp native 后端 |
-| Full Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
-| Lite Release | `../qlh-android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | 纯薄客户端，不含 native 库 |
+| Android Edge Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | 含 llama.cpp native 后端 |
+| Android Edge Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip；故障绕行由运行策略决定 |
 
 **安装**：
 
@@ -869,8 +866,8 @@ adb install ../qlh-android/app/build/outputs/apk/full/release/app-full-release.a
 **使用**：
 
 1. 启动 App → 底部导航选择「设置」
-2. 全无模式：输入 PC 主节点 Tailscale IP 和端口 → 测试连接 → 开始对话
-3. 全有模式：切换模式 → 选择包含 `.gguf` 的 SAF 外部目录 → 扫描并选中模型 → 离线推理
+2. 本地模式：选择包含 `.gguf` 的 SAF 外部目录，默认优先 <=1B 模型并离线推理
+3. 集群模式：注册为 Edge 节点，参与大模型分片；节点故障或资源不足时才走其他节点、完整模型或本地小模型绕行
 
 ### 安装包分发服务器
 
@@ -886,7 +883,7 @@ python serve.py
 
 - Windows PC 安装包 (.exe)
 - Linux 安装包 (.deb)
-- Android Full / Lite APK
+- Android Edge runtime APK
 - PC 模型压缩包 `models_pc.7z`
 - Android 模型压缩包 `models_android.7z`（仅包含 GGUF 模型）
 
@@ -1012,11 +1009,11 @@ python serve.py
 - [分布式推理流水线实施计划](docs/分布式推理流水线实施计划.md) — 链式拓扑、LAYER_FORWARD 协议、KV Cache
 - [混合分布式推理体系规划](docs/archive/混合分布式推理体系规划.md) — PyTorch 层间流水线、任务链、张量并行、exo 与 Mesh-LLM/GGUF stage 调研
 - [三种分布式拆分细化实施方案](docs/三种分布式拆分细化实施方案.md) — PyTorch 层间待测试项、任务链和张量并行的协议、容错与实施阶段
-- [Android 与 PC 功能差距清单](../qlh-shell/docs/安卓与PC功能差距清单.md) — 当前 Android Full/Lite 与 PC 的能力边界；presence、Full Worker/Stage、Gemma4 MTMD、更新/日志/诊断已完成本机开发门，真机/生产验收后置
+- [Android 与 PC 功能差距清单](../qlh-shell/docs/安卓与PC功能差距清单.md) — 当前 Android Edge 与 PC 的能力边界；presence、Worker/Stage、Gemma4 MTMD、更新/日志/诊断已完成本机开发门，真机/生产验收后置
 - [Android 版本远期计划](docs/archive/Android版本远期计划.md) — Android 完整 Worker、任务链、GPU 平板与层间拆分的历史架构基线与远期边界
 - [Android SAF 模型存储方案](docs/Android SAF模型存储方案.md) — SAF 外部目录、`/proc/self/fd` 加载、缓存副本 fallback
 - Android llama.cpp 已随 `qlh-android` 迁移为 git submodule（`47e1de77`）；版本与维护事实源见 [`LLAMA_CPP_VERSION.md`](../qlh-android/app/src/main/cpp/LLAMA_CPP_VERSION.md)，迁移方案文档已废弃并移入 qlh-android 的 `_to_delete/`
-- [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC/Android Full Worker；开发门与短程双机证据已具备，`task_dispatch` 生产准入、长时/断电恢复仍后置
+- [任务链下一阶段实施计划](docs/任务链下一阶段实施计划.md) — dual_candidate DAG、journal、Provider registry、PC/Android Worker；开发门与短程双机证据已具备，`task_dispatch` 生产准入、长时/断电恢复仍后置
 - [分布式推理仿真测试计划](docs/分布式推理仿真测试计划.md) — 无真实从节点时的仿真测试矩阵与运行方式
 - [从节点部署配置指南](docs/从节点部署配置指南.md) — 从节点注册、模型目录与启动配置
 - [数据库测试指南](docs/数据库测试指南.md) — 存储层测试现状：SQLite 契约、退场 fail-closed 用例与运行方式（PG 已退场）
