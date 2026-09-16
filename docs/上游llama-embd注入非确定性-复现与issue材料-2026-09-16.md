@@ -282,6 +282,88 @@ via `llama_batch.embd`). Greedy generation still matches the non-relay baseline 
 but bit-exact reproducibility across processes is not achievable today.
 ```
 
+## 11. 补充实测（2026-09-16 晚，141-token 长批）：**argmax 判据在长序列上失效**
+
+> 本节由主节点在本轮 XFRAME 控制组复跑中新增，**修正 §8 绕开口径第 1 条**。
+
+**背景**：本报告 §1/§4 的非确定性观测基于 **5×2048 注入**（5 token），结论是"逐位不稳、但 **argmax 恒为 11751**"，据此给出绕开口径"判据用 argmax"。
+
+**本轮实测（同一构建、同一 CPU 后端、同源模型 `qwen35-2b-f16.gguf`、141 tokens、`--dump-all` 逐位置 logits）**：
+
+| # | 对比 | argmax 一致 | 说明 |
+|---|---|---|---|
+| 19 | token 路径 vs 既有 baseline | **141/141**（cosine min 0.999999） | token 路径**跨进程完全可复现**（复现 §4 #1） |
+| 20 | **同 exe、同一 embd 输入、连续两次运行** | **126/141** | ⚠️ **argmax 本身不稳定（15 处不同）** |
+| 21 | 补丁（embd 模式不构建 token 分支）后 embd vs baseline | **130/141 / 128/141**（两次） | 与 §9 已回退的"清零 `inp->tokens`"一样**未回到 141/141** |
+
+**结论（新增）**：
+
+1. **"argmax 稳定"只在短注入（≈1–5 token）成立**；在本模型的 **141-token 长批**上，embd 路径的 **argmax 序列也不可复现**。
+2. 因此 **§8 第 1 条"判据用 argmax / top-k 重合，不用 cosine 阈值"在长序列场景下不成立** —— 逐位置 logits 的比较（argmax 或 top-k）都受同一抖动影响。
+3. **可用的判据只剩"端到端的贪心生成序列一致"**（比较生成出的 token 序列本身，而非逐位置 logits）—— 这正是 **L→L 16/16** 所采用的口径：单个位置若抖动到改变 argmax，会立即改变生成序列从而被发现；而**未改变生成的抖动**本就不影响行为等价。
+4. 对 XFRAME/D→L 的影响：**判据应从"逐位置 argmax（`per_token_argmax`）"改为"贪心生成序列一致"**，`RELAY_ACCEPTANCE` 的定义需同步修订（见《基线重写方案》§1.4、《跨框架层接力重启评估》）。
+5. **§9 的"根因未坐实、无可改代码点"得到再次支持**：清零未写入 input（已回退）与"不构建未选中分支"（本轮编译通过）**两种补丁都未使结果回到 141/141**。
+
+**复现命令（本轮）**：
+
+```bash
+# baseline（token 路径，完全可复现）
+llama-relay-check.exe out/qwen35-2b-f16.gguf --tokens out/xframe-dl-long-prompt.txt \
+  --n-ubatch 141 --dump-all --dump <A.f32>
+# embd 路径：同一输入连跑两次
+llama-relay-check.exe out/qwen35-2b-f16.gguf --embd <emb.f32> \
+  --n-tokens 141 --n-ubatch 141 --dump-all --dump <B1.f32>
+llama-relay-check.exe out/qwen35-2b-f16.gguf --embd <emb.f32> \
+  --n-tokens 141 --n-ubatch 141 --dump-all --dump <B2.f32>
+# 判定（compare_all.py = 逐位置 cosine + argmax 比较）
+python compare_all.py <A.f32>  <B1.f32>   # → 130/141（与既有 132/141 同一噪声带）
+python compare_all.py <B1.f32> <B2.f32>   # → 126/141（纯噪声，argmax 已不一致）
+```
+
+> 注：`--n-ubatch N` 会**同时**把 `n_batch` 设为 N，因此 `--n-ubatch 1` 会触发
+> `GGML_ASSERT(n_tokens_all <= cparams.n_batch)`；该工具无法只改 `n_ubatch`。
+
+## 12. 长序列补充实测（2026-09-16 晚，L→L 生成 141 步）：**问题从"不可复现"升级为"长序列生成实际出错"**
+
+> 本节由主节点在按"改用生成序列判据"重测时新增。
+> **重要：它需要修正本文 §0 与 §10 issue 草稿中的一句话** —— 原文称 "practical impact is on *reproducibility*, not on greedy generation"。
+
+**载体**：`llama-relay-gen`（A=整模型 `qwen35-2b-f16.gguf` 算 layer 0..3 → B=裁前 4 层模型 `qwen35-2b-f16-cut.gguf` + `embd` 注入算 layer 4..N，逐 token 贪心）。prompt：`out/prompt-single.txt`。
+
+**对照（同一工具、同一命令）**：
+
+| 生成长度 | 运行 | baseline（token 路径） | relay（embd 注入） | 结果 |
+|---|---|---|---|---|
+| **16 步** | r1/r2/r3 | 3 次完全相同 | 3 次完全相同 | ✅ **16/16 一致**（复现既有结论） |
+| **141 步** | L1 | 完整 141 步 | 停在 50 步 | ✗ **第 51 步分叉**（`relay=223145984` vs `baseline=13`） |
+| **141 步** | L2 | 完整 141 步 | 停在 45 步 | ✗ **第 46 步分叉**（`relay=37` vs `baseline=2912`） |
+
+**三个关键事实**：
+
+1. **分叉点不稳定**：同一命令两次运行分别在 **51 / 46** 步分叉 → 由 §1 的非确定性驱动；
+2. **分叉时 relay 侧出现非法 token**：`223145984` **远超 vocab（248320）** → 不是"语义偏差"，更像**读到了非 logits 数据**（与 §7 候选假设 1"attention 相关 buffer 的残留/复用"吻合）；
+3. **baseline（token 路径）两次的 141 步序列逐 token 完全相同** → 问题在 embd 注入路径，不在 token 路径。
+
+**结论（新增）**：
+
+1. **既有"L→L 16/16 行为等价"的适用边界是 ≈16 步**；**拉到 141 步，L→L 接力自身就会分叉** —— 无需引入跨框架（D→L）即已复现。
+2. **问题性质从"不可逐位复现"升级为"长序列生成实际出错"** → issue #28963 中 "practical impact is on *reproducibility*, not on greedy generation" 这句需要更正（建议由人工补充评论）。
+3. **"改用生成序列判据"这个方向被验证为必要且正确**：prefill 逐位置 logits 的比较（§11）只看到"cosine 0.97 / argmax 差几处"的抖动，**完全看不到生成会在第 46/51 步崩掉**。
+4. **可用的工程绕开**：**分段短序列接力**（每段 ≤16 步已验证一致，段间重同步）。这不改变"embd 路径需上游修复"的结论。
+
+**复现命令**：
+
+```bash
+export PATH="/c/msys64/ucrt64/bin:$PATH"
+BIN=build/cross-framework-layer-poc/llama.cpp/build-cpu/bin/llama-relay-gen.exe
+ROOT=build/cross-framework-layer-poc
+"$BIN" "$ROOT/out/qwen35-2b-f16.gguf" "$ROOT/out/qwen35-2b-f16-cut.gguf" \
+  --prompt "$ROOT/out/prompt-single.txt" --gen 141 --threads 4 --tag long --dump-dir "$ROOT/out"
+# → RESULT: 在第 4x~5x 步分叉（两次运行分叉点不同）
+```
+
+**待验证（本轮未做）**：`--threads 1` 下的长序列对照；分叉点是否随 `--gen` 与 prompt 变化；`223145984` 是否可能由工具侧越界打印造成（需在 dump 的完整序列里核对 token id 合法性）。
+
 ## 变更记录
 
 | 日期 | 变更 |
@@ -289,3 +371,4 @@ but bit-exact reproducibility across processes is not achievable today.
 | 2026-09-16 | 新建：把 §7.10/§7.11 发现的 `embd` 非确定性整理成可提交的 issue 材料。含环境、最小复现探针（自包含源码）、16 项实验数据、逐层定位（分叉始于第一个 full-attention 层、需要 >1 token）、7 条已排除成因、候选假设、QLH 侧绕开口径、pin 版本与打补丁流程、英文 issue 正文草稿。**根因未坐实，本轮不提供上游修复补丁**；曾尝试的"清零 `inp->tokens`"已回退，工作树干净。 |
 | 2026-09-16 | **补实验 #17/#18（增量注入）**：新增 `relay-incr-probe`（整段注入 vs 逐 token 增量注入对比）→ **增量注入同样逐位不等**（cosine 0.994），"改用更细注入粒度即可复现"的期望**被证伪**；并据此细化定位为"**pos = 0 单 token 确定、pos ≥ 1（有历史状态）单 token 不确定**"。同步更新 §8 绕开口径（可复现性只能靠 argmax / 单进程口径）与提交指引。 |
 | 2026-09-16 | **issue 已提交**：[ggml-org/llama.cpp#28963](https://github.com/ggml-org/llama.cpp/issues/28963)（作者 `SgfKrc`，`open`，0 评论）—— `Misc. bug: CPU backend: llama_batch.embd (embedding input) decoding is non-deterministic`。 |
+| 2026-09-16 | **长序列实测（§12，主节点）**：按"改用生成序列判据"重测 —— `llama-relay-gen --gen 16` 的 L→L 三次全一致（复现 16/16）；**`--gen 141` 两次分别在 51 / 46 步分叉**（relay 侧出现非法 token `223145984` ≫ vocab 248320），baseline（token 路径）的 141 步两次完全一致 → **问题性质从"不可逐位复现"升级为"长序列生成实际出错"，且 L→L 自身即复现，无需跨框架**；"16/16" 的适用边界 ≈16 步。同时给出 141-token 长批下 **argmax 判据失效**（同命令两次仅 126/141）的证据。**§0/§10 中 "impact is reproducibility, not greedy generation" 需更正（建议人工补 issue 评论）。** |

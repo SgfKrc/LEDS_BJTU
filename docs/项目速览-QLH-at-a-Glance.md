@@ -12,7 +12,7 @@
 
 ## 这是什么？
 
-QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。Edge 节点默认用 <=1B 的 llama.cpp/GGUF 模型本地完成推理，同时可作为 RPC worker 参与更大模型分片；先做单机，再攻克 host + RPC worker 模型分片，让单机装不下的模型由多个 PC/Android 节点共同承载。主仓另设 PC-only Relay R 架构兼容轨道：裁层 GGUF + `embd` 注入的 L→L 同机单进程逐 token 行为已 16/16 对拍，但 D→L、跨进程/网络和长序列仍未验证，默认关闭且不替代 RPC。PyTorch 层流水线只保留为 PC 对照，任务图只作临时整模回退；节点故障时才启用完整模型节点、其他分片拓扑或本地小模型绕行。主仓同时维护 INT4/INT8 量化、分页 KV 缓存、TUI 和可复现实验；模型舰队让用户按设备选择文本或可选多模态模型。产品 Web、Android UI、知识库、发布工具和图像生成属于支线，图像生成唯一由 Koakumix harness 提供。核心设计原则：**数据不出集群、断网可自治、可复现验收**。
+QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。Edge 节点默认用 <=1B 的 llama.cpp/GGUF 模型本地完成推理，同时可作为 RPC worker 参与更大模型分片；先做单机，再攻克 host + RPC worker 模型分片，让单机装不下的模型由多个 PC/Android 节点共同承载。主仓另设 PC-only Relay R 架构兼容轨道：裁层 GGUF + `embd` 注入的 L→L 同机单进程逐 token 行为已 16/16 对拍；D→L 仅 5-token prefill 通过，141-token f16/f32 均失败，默认关闭且不替代 RPC。PyTorch 层流水线只保留为 PC 对照，任务图只作临时整模回退；节点故障时才启用完整模型节点、其他分片拓扑或本地小模型绕行。主仓同时维护 INT4/INT8 量化、分页 KV 缓存、TUI 和可复现实验；模型舰队让用户按设备选择文本或可选多模态模型。产品 Web、Android UI、知识库、发布工具和图像生成属于支线，图像生成唯一由 Koakumix harness 提供。核心设计原则：**数据不出集群、断网可自治、可复现验收**。
 
 ## 已验证的能力
 
@@ -22,7 +22,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 | 任务链重启/杀进程恢复 + Tailnet IPv6 | 2026-08-21：`wf_330d0aa1…`，重派 0 |
 | 判题口径修复（多模型 0/4 → loose+512 可区分） | P5：Qwen3-4B 1/4 vs 1.8B 0/4 |
 | DS3-0324-7B 替代 R1 判题模型（已批准候选） | v2 口径 **2/4×3、格式率 8/11×3** |
-| PC-only Relay R：裁层 GGUF + `embd` L→L 接力 | 2026-09-16：同机单进程逐 token 行为 16/16；`embd` 路径 bitwise 非确定，D→L/跨边界待验证 |
+| PC-only Relay R：裁层 GGUF + `embd` L→L 接力 | 2026-09-16：同机单进程逐 token 行为 16/16；D→L 5-token 通过，但 141-token f16/f32 拒绝；生产门关闭 |
 | 子项目：小模型 harness 工作台（S1-S8） | 上下文预算/STATE 记忆/RAG/MCP，本机门 |
 | 子项目：文档维护 Agent（独立仓库 qlh-docagent，主项目 submodule） | 规则数据化 + 演进门控 |
 | 子项目：Reasonix ↔ Codex 桥接（独立仓库 reasonix-codex-bridge，主项目 submodule） | 只读子智能体接入 Codex；受控写入 W1/W2/W3 已落地（默认关闭） |
