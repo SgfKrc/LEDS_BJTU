@@ -465,6 +465,60 @@ Invalid read of size 4
    `top_k_tolerant_argmax`（`src/relay_contract.py`）**保留为诊断档**，但**不再作为准入依据**；
 6. **未改变的**：Relay 用 argmax 判定、接力实验固定单进程、"行为等价"与"逐位复现"分开声明 —— 这些仍是好实践。
 
+### 13.5 触发条件与模型影响面（2026-09-16，本仓库实测）
+
+**触发需要同时满足两条**（源码即判据）：
+
+1. **走 `embd` 批次**（`ubatch->token == NULL`）—— **普通 token 路径永不触发**；
+2. **`n_pos_per_embd > 1`**，即模型声明了多段 `rope.dimension_sections`（**M-RoPE**）。
+   其中 `n_pos_per_embd = len(<arch>.rope.dimension_sections)`；**无该键的模型即为 1 段**。
+
+**实测**（同一 exe，用 `QLH_NO_POS_FIX=1` 控制是否做调用方修复；随机 embd 向量 × 5 token；各连跑两次）：
+
+| 组 | 模型 | `rope.dimension_sections` | `n_pos_per_embd` | 是否修复 | 两次结果 |
+| --- | --- | --- | --- | --- | --- |
+| A | `qwen35-2b-f16.gguf`（arch `qwen35`） | `[11, 11, 10, 0]` | **4** | ✗ | **`identical=False`（maxabsdiff 0.959）→ 触发** |
+| B | 同上 | 同上 | 4 | ✓ | `identical=True` |
+| C | `Qwen-1_8B-Chat.Q4_K_M.gguf`（arch `qwen`） | **无该键** | **1** | ✗ | **`identical=True` → 不触发** |
+| D | 同上 | 同上 | 1 | ✓ | `identical=True` |
+
+**结论**：
+
+- **不是"多模态模型"的问题，而是「M-RoPE（`n_pos_per_embd > 1`）+ `embd` 批次」的组合**；
+- **1D RoPE 模型即使走 `embd` 批次也不受影响**（C 组：不做修复也逐位一致）—— 因为 `j` 循环只跑 `j = 0`，只读 `pos[0..n)`；
+- **任何模型走 token 路径都不受影响**。
+
+**模型族对照**：
+
+| 模型族 | `rope.dimension_sections` | `embd` 批次下是否受影响 |
+| --- | --- | --- |
+| Qwen3.5 / Qwen3-VL / Qwen2-VL / Qwen2.5-VL（M-RoPE） | 多段 | ⚠️ **受影响**（须按契约填 `pos`） |
+| Qwen2.5 文本 / Qwen1.5 / Qwen2 / Llama / Mistral / DeepSeek | 无（=1 段） | ✅ 不受影响 |
+| 任意模型 + token 路径 | — | ✅ 不受影响 |
+
+**复现命令**（随机向量即可，不依赖真模型权重）：
+
+```bash
+export PATH="/c/msys64/ucrt64/bin:$PATH"
+BIN=build/cross-framework-layer-poc/llama.cpp/build-cpu/bin
+D=build/cross-framework-layer-poc/out/npe-check
+# 造随机 embd（5 × 2048）
+python -c "import numpy as np; np.random.default_rng(0).standard_normal((5,2048),dtype=np.float32).tofile('$D/rand5x2048.f32')"
+# A) M-RoPE 模型 + 跳过修复 → 两次不一致
+QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe out/qwen35-2b-f16.gguf --embd $D/rand5x2048.f32 --n-tokens 5 --dump-all --dump /tmp/a1.f32
+QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe out/qwen35-2b-f16.gguf --embd $D/rand5x2048.f32 --n-tokens 5 --dump-all --dump /tmp/a2.f32
+# C) 1D RoPE 模型 + 跳过修复 → 仍逐位一致
+QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe H:/qlh_models/Qwen-1_8B-Chat.Q4_K_M.gguf --embd $D/rand5x2048.f32 --n-tokens 5 --dump-all --dump /tmp/c1.f32
+QLH_NO_POS_FIX=1 $BIN/llama-relay-check.exe H:/qlh_models/Qwen-1_8B-Chat.Q4_K_M.gguf --embd $D/rand5x2048.f32 --n-tokens 5 --dump-all --dump /tmp/c2.f32
+```
+
+**对 QLH 的含义**：
+
+1. **主线（L 档单机推理 / TUI 对话 / RPC 分片）都是 token 路径 → 任何模型都不触发**；
+2. **仅"跨框架层接力"（`embd` 注入）轨道受影响**：选 M-RoPE 模型须按契约填 `pos`；**选 1D RoPE 模型则天然安全**；
+3. 本项目接力实验恰好选用 **Qwen3.5-2B（M-RoPE，最坏情况）**；此前"现象随权重类型变化"的假象，实质是该 20 字节 malloc 之后恰好是什么堆内容；
+4. **MTMD（图像 embedding）同样走 `embd` 批次** → 在 M-RoPE 模型上命中同一处（这正是上游 #28910 修 `pos == NULL` 的动因）。
+
 ### 13.4 待办
 
 - 若上游在**库侧**修复（对单段位置做广播，或扩展 header 语义），本地补丁即可移除；
