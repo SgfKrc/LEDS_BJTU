@@ -2,7 +2,7 @@
 
 > 状态：**现行**
 >
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 
 > **Language**: [English](项目速览-QLH-at-a-Glance.en.md) · [简体中文](项目速览-QLH-at-a-Glance.md)
 >
@@ -12,7 +12,7 @@
 
 ## 这是什么？
 
-QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。主仓聚焦 PyTorch + llama.cpp 双引擎、任务级/层流水线分布式推理、INT4/INT8 量化、分页 KV 缓存、TUI 和可复现实验；模型舰队让用户按设备选择文本或可选多模态模型。产品 Web、Android、知识库、发布工具和图像生成属于支线，图像生成唯一由 Koakumix harness 提供。核心设计原则：**数据不出集群、断网可自治、可复现验收**。
+QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（北京交通大学 2026 大创项目）。Edge 节点默认用 <=1B 的 llama.cpp/GGUF 模型本地完成推理，同时可作为 RPC worker 参与更大模型分片；先做单机，再攻克 host + RPC worker 模型分片，让单机装不下的模型由多个 PC/Android 节点共同承载。主仓另设 PC-only Relay R 架构兼容轨道：裁层 GGUF + `embd` 注入的 L→L 同机单进程逐 token 行为已 16/16 对拍；D→L 仅 5-token prefill 通过，141-token f16/f32 均失败，默认关闭且不替代 RPC。PyTorch 层流水线只保留为 PC 对照，任务图只作临时整模回退；节点故障时才启用完整模型节点、其他分片拓扑或本地小模型绕行。主仓同时维护 INT4/INT8 量化、分页 KV 缓存、TUI 和可复现实验；模型舰队让用户按设备选择文本或可选多模态模型。产品 Web、Android UI、知识库、发布工具和图像生成属于支线，图像生成唯一由 Koakumix harness 提供。核心设计原则：**数据不出集群、断网可自治、可复现验收**。
 
 ## 已验证的能力
 
@@ -22,6 +22,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 | 任务链重启/杀进程恢复 + Tailnet IPv6 | 2026-08-21：`wf_330d0aa1…`，重派 0 |
 | 判题口径修复（多模型 0/4 → loose+512 可区分） | P5：Qwen3-4B 1/4 vs 1.8B 0/4 |
 | DS3-0324-7B 替代 R1 判题模型（已批准候选） | v2 口径 **2/4×3、格式率 8/11×3** |
+| PC-only Relay R：裁层 GGUF + `embd` L→L 接力 | 2026-09-16：同机单进程逐 token 行为 16/16；D→L 5-token 通过，但 141-token f16/f32 拒绝；生产门关闭 |
 | 子项目：小模型 harness 工作台（S1-S8） | 上下文预算/STATE 记忆/RAG/MCP，本机门 |
 | 子项目：文档维护 Agent（独立仓库 qlh-docagent，主项目 submodule） | 规则数据化 + 演进门控 |
 | 子项目：Reasonix ↔ Codex 桥接（独立仓库 reasonix-codex-bridge，主项目 submodule） | 只读子智能体接入 Codex；受控写入 W1/W2/W3 已落地（默认关闭） |
@@ -30,6 +31,7 @@ QLH 是面向异构边缘设备的**轻量化分布式大模型推理系统**（
 ## 还不能宣称什么
 
 - 生产路由准入（`task_dispatch` 关闭）、长时多轮/断电恢复、真实 443/WSS、IPv6-only 安装包、真实 7B/12B 三节点峰值——均在后置验收队列，不能凭本机门或模拟结果声称通过。
+- Relay 当前只有 PC 同引擎 L→L 行为证据；不宣称 `embd` bitwise 一致、PyTorch→llama.cpp、跨进程/网络、长序列或采样生产能力。
 - 张量并行（TP）仅作集群外 PoC（路线 A）；投机解码为实验路径（路线 C）。
 
 ## 首次启动需要做什么
@@ -86,9 +88,9 @@ python -c "import src.api_server"                                   # 后端可�
 
 ## 文档怎么读
 
-- **主线计划**：[主线开发计划：分布式推理与边缘优化](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **支线计划**：[支线开发计划：外置迁移与 Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md) · [总体下一步计划](总体下一步计划.md)（历史总排期）
+- **主线计划**：[主线开发计划：分布式推理与边缘优化](主线开发计划-分布式推理与边缘优化-2026-09-14.md) · **支线计划**：支线开发计划：外置迁移与 Koakumix · [总体下一步计划](总体下一步计划.md)（历史总排期）
 - **新人入门**：[项目技术说明](项目技术说明.md) → [整体架构](整体架构.md) → [模块接口说明](模块接口说明.md)
-- **子项目**：[harness 方案](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · [联网工具调研](archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md)
+- **子项目**：[harness 方案](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) · [qlh-docagent](https://github.com/SgfKrc/qlh-docagent) · [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) · 联网工具调研
 - **实验与判题**：[DS3 替代 R1 专项](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) · [亚1B 专项](亚1B小模型专项实验计划.md) · [测试与评判标准](测试与评判标准.md)
 
 ## 工程文化

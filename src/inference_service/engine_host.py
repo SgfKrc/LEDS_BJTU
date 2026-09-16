@@ -25,6 +25,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import local_store as _local_store
+from koakuma_engine import (
+    Capability,
+    backend_id_for,
+    registered_backends,
+    runtime_supports,
+)
 from multimodal import materialize_image_data_url
 
 
@@ -848,7 +854,7 @@ class EngineHost:
             try:
                 mgr = self._host
                 if bool(getattr(mgr, "is_loaded", False)):
-                    current_engine = getattr(mgr, "_engine_type", None)
+                    current_engine = backend_id_for(mgr) or None
             except Exception:
                 current_engine = None
         return {
@@ -980,7 +986,7 @@ class EngineHost:
         except Exception:
             model_id = None
         return {
-            "engine": getattr(mgr, "_engine_type", None),
+            "engine": backend_id_for(mgr) or None,
             "model_id": model_id,
             "device": device,
             "model_loaded": loaded,
@@ -1239,7 +1245,7 @@ class EngineHost:
                 and distributed_enabled
                 and self._run_mode == "distributed"
                 and sched._effective_role() == "master"
-                and getattr(self._host, "_engine_type", None) == "pytorch"):
+                and runtime_supports(self._host, Capability.FORWARD_LAYERS)):
             try:
                 pipeline_result = sched.run_pipeline_safe(
                     req.message,
@@ -1297,9 +1303,9 @@ class EngineHost:
                         if not pipeline_metrics.get("distributed_used"):
                             self._record_task_complete()
 
-                        if getattr(self._host, "_engine_type", None) in ("llama_cpp", "island"):
+                        if backend_id_for(self._host) in ("llama_cpp", "island"):
                             followups = self.generate_followups_llama(history)
-                        elif getattr(self._host, "_engine_type", None) == "pytorch":
+                        elif backend_id_for(self._host) == "pytorch":
                             followups = _fallback_followups(history, [])
                         else:
                             followups = _fallback_followups(history, [])
@@ -1319,9 +1325,9 @@ class EngineHost:
 
         model_manager = self._host
         # ---- llama.cpp / 孤岛引擎路径（整请求推理，不参与层拆分）----
-        if getattr(model_manager, "_engine_type", None) in ("llama_cpp", "island"):
+        if backend_id_for(model_manager) in ("llama_cpp", "island"):
             try:
-                engine_name = model_manager._engine_type
+                engine_name = backend_id_for(model_manager)
                 request_history = [
                     *history,
                     {"role": "user", "content": req.message},
@@ -1420,7 +1426,7 @@ class EngineHost:
                 self._record_task_error()
                 _engine_label = (
                     "孤岛引擎"
-                    if getattr(model_manager, "_engine_type", "") == "island"
+                    if backend_id_for(model_manager) == "island"
                     else "llama.cpp"
                 )
                 logger.error(f"{_engine_label} 推理失败: {e}", exc_info=True)
@@ -1968,10 +1974,10 @@ class EngineHost:
         from task_provider import ModelIdentity
         if not self._host.model_loaded or not self._host.is_loaded:
             return None
-        engine = str(getattr(self._host, "_engine_type", "") or "")
+        engine = backend_id_for(self._host)
         model_path = str(getattr(self._host, "_model_path", "") or "")
         model_id = str(getattr(self._host, "active_model_id", "") or "")
-        if engine not in {"pytorch", "llama_cpp", "island"} or not model_id or not model_path:
+        if engine not in registered_backends() or not model_id or not model_path:
             return None
         if engine == "island":
             # 孤岛模型无本地 artifact：以"端点指纹 + 后端模型名"替代文件摘要，
@@ -2526,7 +2532,7 @@ class EngineHost:
         )
         metrics = _augment_chat_metrics(
             {
-                "engine": self._host._engine_type,
+                "engine": backend_id_for(self._host),
                 "execution_mode": "task_graph",
                 "provider": (
                     providers[0] if len(providers) == 1 else "task_graph"

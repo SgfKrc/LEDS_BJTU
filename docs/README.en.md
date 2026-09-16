@@ -2,17 +2,17 @@
 
 > 状态：**现行**
 >
-> 更新日期：2026-09-15
+> 更新日期：2026-09-16
 
 > **Language**: [English](README.en.md) · [简体中文](../README.md)
 
-**A multi-engine, evolvable distributed LLM inference system for heterogeneous edge devices.**
+**A llama.cpp-first distributed LLM inference system for heterogeneous edge devices.**
 
 Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orchestration · Distributed inference · TUI-first edge operation
 
-**v0.1.8.3** (updated 2026-09-15)
+**v0.1.8.3** (updated 2026-09-16)
 
-> 📌 Current mainline: **[Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)**; side lines: **[Externalization & Koakumix](支线开发计划-外置迁移与Koakumix-2026-09-14.md)**; historical snapshot: **[Progress & Next Steps](../docs/archive/项目进展与下一步计划.md)**.
+> 📌 Current mainline: **[Distributed Inference & Edge Optimization](主线开发计划-分布式推理与边缘优化-2026-09-14.md)**; side lines: **Externalization & Koakumix**; historical snapshot: **Progress & Next Steps**.
 > This README describes **implemented** capabilities; items marked *PoC* are disabled by default and are not production capabilities — see the dedicated plans for boundaries.
 > Scope: capability overview, quick start and documentation index; the authoritative capability boundary lives in the specialized plans, source code and tests. Specialized documentation is currently in Chinese.
 
@@ -20,26 +20,27 @@ Model quantization · Operator fusion · Paged KV cache · Graph-algorithm orche
 
 ## 📋 Project Introduction
 
-QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The PC PyTorch pipeline can split compatible models across nodes by Transformer layers; the PC/Android llama.cpp path runs full local GGUF inference. INT4/INT8 quantization, operator fusion, paged KV cache, graph orchestration and graceful degradation remain available. Local development gates are complete for PC Full Worker/task graphs, Android Full Worker/Stage and GGUF stages; short dual-machine evidence covers the PyTorch layer pipeline and task graph. `task_dispatch`, real CUDA parity, long disconnect recovery and production routing remain deferred acceptance gates; tensor parallelism remains an out-of-cluster PoC only.
+QLH targets heterogeneous edge devices — Windows/Linux desktops, workstations, servers, laptops, Android phones and tablets. The production mainline is GGUF/llama.cpp: an Edge node defaults to local inference with a model at or below 1B parameters, while it can also join as an RPC worker for a larger distributed model. Models that do not fit one machine are held partly by multiple nodes. The main repository also carries a PC-only Relay R compatibility track: cut GGUF plus `embd` injection reached 16/16 same-process L→L behavioral matches. A D→L five-token prefill matched, but both 141-token f16 and f32 runs diverged, so the gate remains closed and real-time cross-process/network behavior is still unverified. The PyTorch/Safetensors layer pipeline remains a PC reference and Relay source; TaskGraph/whole-request dispatch is only a temporary full-model fallback. Web, Android UI, release, toolbox and image generation are external side lines. The production hard gates are cutover/low coupling → llama.cpp single machine → same-machine dual-process RPC → PC hardware → Android hardware; Relay has separate `CORE-RELAY-01` / `CORE-RELAY-XFRAME-01` gates and does not replace RPC.
 
 Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient for scheduling — eligibility depends on engine, model format, model fingerprint, available memory, accelerator and network topology.
 
-### Software Editions (four tiers)
+### Main Repository Runtime Roles (five boundaries)
 
-| Tier | Edition | Target devices | Core capabilities | Excludes / not recommended |
+| Tier | Shape | Target devices | Core capabilities | Excludes / not recommended |
 |------|----------|----------------|-------------------|----------------------------|
-| 1 | **PC iGPU** | Windows / Linux PCs without NVIDIA dGPU | llama.cpp + GGUF CPU/iGPU inference, cluster join, remote request forwarding | PyTorch layer pipeline, heavy-model experiments, CUDA-only features |
-| 2 | **PC dGPU** | Windows / Linux NVIDIA GPU master/experiment PCs | PyTorch + CUDA + bitsandbytes with CPU fallback, multi-model and heavy-model experiments | Android minimal strategy; image generation belongs to Koakumix |
-| 3 | **Android standard** | Android phones/tablets | Full-on local GGUF, thin forwarding to PC, SAF model directory, update/log/connection diagnostics; Full Worker/Stage and Gemma4 MTMD have local development wiring | Transformer layer splitting and heavy-model experiments; real-device Worker, multimodal quality and background survival remain to be accepted |
-| 4 | **Android lite** | Lightweight phone entry | Minimal chat, remote PC forwarding, smallest APK/cache/model footprint, single recommended small/INT4 route | Local GGUF, full model directory, Worker execution and advanced control surfaces |
+| 1 | **Edge node** | Windows/Linux PCs without NVIDIA, constrained devices, Android | Local llama.cpp + GGUF inference (default <=1B), plus RPC worker participation in larger models and cross-platform TUI | torch, Web UI, release tooling, image generation |
+| 2 | **PC llama.cpp sharding** | PCs/workstations/heterogeneous nodes | llama host + `ggml-rpc-server` worker, targeting partial residency and capacity aggregation | No production RPC claim before G0-G2 gates pass |
+| 3 | **PC Relay R** | PCs that can run llama.cpp; PC Reference P supplies the D→L source | Cut GGUF + hidden/`embd` handoff; L→L behavior is verified | Explicitly off by default; does not replace RPC or enter the Edge default path |
+| 4 | **PC Reference P** | NVIDIA/high-memory PCs | PyTorch + Safetensors layer pipeline for correctness, performance, capacity comparison and D→L Relay source | Not part of Edge install, default routing or release |
+| 5 | **Failure-bypass role** | Any node that remains online | On node failure, route to a full-model node, another shard topology, or a local <=1B model; a scheduling strategy, not a Lite product | No separate Lite package or UI |
 
 ### Core Features
 
 | Feature | Description |
 |------|------|
-| 🧠 **Intelligent orchestration** | PyTorch layer pipeline assigns contiguous layer segments by compute/memory/network; large topologies use max-bandwidth spanning tree + DFS → [distributed resource scheduling](分布式资源调度系统.md) |
-| 🔗 **PyTorch layer pipeline** | Compatible Safetensors models split by contiguous layers; hidden states passed node-to-node with KV cache incremental decoding; **QW1.8B dual-machine layered data plane verified** (2026-08-20, `master 0-21 + client 21-24`, `distributed_used=true`/`fallback=false`, L1-3) |
-| 🔄 **Dual engine** | PyTorch + bitsandbytes (CUDA) / llama.cpp + GGUF (CPU/iGPU), automatic switching |
+| 🧠 **Model-sharding research** | The llama.cpp/GGUF mainline studies partial residency, RPC, leases and fault redistribution; Edge nodes serve <=1B locally and can join larger sharded inference; single-machine and same-machine dual-process gates come first → [mainline plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md) |
+| 🔗 **Relay & PyTorch reference path** | Same-process PC L→L Relay behavior is verified 16/16; the Safetensors layer pipeline remains for PC correctness/performance/capacity comparison and D→L source validation; existing QW1.8B dual-machine evidence does not verify llama.cpp model sharding |
+| 🔄 **Production engine boundary** | llama.cpp + GGUF is the default production/Edge path; PyTorch + bitsandbytes exists only in PC Reference P and is not auto-selected on Edge |
 | 📋 **MLFQ queue** | Three-level feedback queue: short-interaction priority + aging anti-starvation + FIFO compatibility → [scheduling doc](分布式资源调度系统.md) |
 | 🗄️ **Local facts source** | Sessions/settings/model registry on the master-node SQLite (remote PostgreSQL retired); offline-safe |
 | 🧩 **Model-asset governance** | Registry, manifest/SHA verification, source/license handling, Sidecar contracts, deployment simulation and HF direct → user proxy → ModelScope fallback are wired into the local product surface; real large artifacts, CUDA and cross-PC delivery remain to be accepted |
@@ -48,22 +49,22 @@ Coverage: **Windows PC + Linux PC + Android**. A device type is not sufficient f
 | 🔐 **Local Auth-App control plane** | Owner bootstrap, Auth-App string/QR delivery, TOTP, recovery-code rotation, membership and one-time cluster grants have local UI/API gates; OS credential and first-install integration remain deferred |
 | 📦 **Install, update & offline bundle** | Independent Launcher signing/update/rollback, download progress and diagnostics are implemented. The offline bundle provides capacity preflight, SHA/manifest, atomic ZIP, 7z/split output and restore validation; real full bundles, empty-root/Android SAF import and cross-platform install acceptance are deferred |
 | 🎛️ **Control plane** | Node register/deregister, layer overrides, role transfer, spare master, TCP status; operated primarily through TUI |
-| 🖥️ **TUI-first entry** | `qlh chat` for local/remote inference, model fleet and cluster status; `qlh_edge` provides the minimal HTTP surface |
+| 🖥️ **TUI-first entry** | `qlh chat` for local/cluster inference, model fleet and cluster status; `qlh_edge` provides a minimal HTTP/node surface and does not replace local or distributed inference |
 | **Multimodal input** | Main QLH keeps image upload and Gemma/Qwen image understanding; generation/editing and image assets belong to Koakumix |
-| 📱 **Android client (side line)** | Android Full/Lite, SAF, Full Worker/Stage and real-device evidence are maintained by the external shell/device project; QLH freezes only task, model and capability contracts |
-| 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](TP孤岛接入指南.md) |
-| ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](外部推理服务Provider接入指南.md) |
-| 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](投机解码外部辅助实施说明.md) |
+| 📱 **Android edge role (side line)** | Android local inference, RPC worker, SAF and real-device evidence are maintained by the external device project; QLH freezes only task, model and capability contracts, with no separate Lite product |
+| 🏝️ **TP island** *(PoC)* | Out-of-cluster homogeneous GPU tensor-parallel subcluster (vLLM/SGLang/llama.cpp rpc) as one logical node → [guide](archive/TP孤岛接入指南.md) |
+| ☁️ **External provider** *(PoC)* | Route whole requests to OpenAI-compatible endpoints outside the cluster; **data scope defaults to deny** → [guide](archive/外部推理服务Provider接入指南.md) |
+| 🎯 **Speculative decoding** *(experiment)* | Local small draft + external verify; disabled by default, not wired into production decoding → [notes](archive/投机解码外部辅助实施说明.md) |
 | 🧭 **Role asymmetry evidence** *(CACHE-05)* | DeepSeek input/output asymmetry is reference-only; QLH records draft/verify and sub-1B role hypotheses with offline evidence boundaries → [report](非对称分工论证-2026-09-14.md) |
-| ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, recoverable task state/journal, lease-epoch winner fencing, provider registry; PC Full Worker & task graph verified for restart & disconnect recovery and IPv6 TCP (2026-08-21); `task_dispatch` production gate stays closed → [task chain plan](任务链下一阶段实施计划.md) |
-| 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → [cluster-join & local RAG plan](集群接入稳定性与本地RAG实施计划.md) |
-| 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → [cluster-join plan](集群接入稳定性与本地RAG实施计划.md) |
+| ⚙️ **Task-chain Full Worker** | `dual_candidate` DAG, journal, lease-epoch fencing and provider registry remain a temporary full-model fallback; this does not mean the model is sharded and `task_dispatch` stays closed → [task chain plan](archive/任务链下一阶段实施计划.md) |
+| 🗂️ **Local RAG** | Master-node SQLite FTS5 + bounded vector embeddings (local Ollama `nomic-embed-text` / native llama.cpp dual providers), recoverable jobs, capacity budgeting and ANN decision gate (RAG-S0…S5D). The 30-query human quality gate is complete locally; long-running, scale and sqlite-vec benchmarks remain deferred → cluster-join & local RAG plan |
+| 🔑 **Manual cluster join (CLUSTER-JOIN)** | Target node issues a one-time grant; master signs an Ed25519 client-only grant after Auth-App approval (text code + QR, atomic nonce ledger), then the node is demoted to worker; Web/TUI wired → cluster-join plan |
 | 🌐 **Weak-network & Transport v2** | `cluster_transport` provides `legacy_tcp`/`wss_443` capability choice, bounded ACK window, stable failure matrix and circuit breaker; NW3.1 local self-signed WSS loopback gate done; real 443/cert/traffic comparison deferred → [weak-network plan](抗弱网通信协议专项计划.md) |
 | 🧪 **Experiment quality & document governance** | EX-N3 read-only production gate verifies plan, samples, calibration, performance, quality and human review; historical records pass 3/3. The document-maintenance Agent has local retrieval/semantic quality gates and only produces suggestions, never automatic rewrites |
 | 🧩 **Sub-project: small-model harness workbench** | Toy/self-use workbench for small-model customization (S1-S8 local/offline gates done): context budget & STATE compression, model profiles & capability gate, OpenAI-compatible `/v1`, customization experiment bench (A/B + Pareto), image workbench, SQLite sessions & RAG, long-term memory (RAG+compression+local memory), web search & lightweight MCP, red-team samples; **no main-project imports, only shared model artifacts** → [harness plan](../harness_workbench/docs/小模型轻量推理harness工作台调研与方案.md) |
-| 📡 **Web search & lightweight Fetch** | WEB-TOOL G1-G6 local gates done: offline capability probe, fail-closed Tool Gateway (HTTPS-only/SSRF/DNS+redirect re-check), restricted Fetch/SearXNG adapters, TaskGraph `tool_request` Stage, explicit-`persist` tool cache & API, quality gate & joint audit; `production_network_enabled=false` → [research plan](archive/联网搜索与轻量Fetch工具调用可行性调研与分期计划.md) |
+| 📡 **Web search & lightweight Fetch** | WEB-TOOL G1-G6 local gates done: offline capability probe, fail-closed Tool Gateway (HTTPS-only/SSRF/DNS+redirect re-check), restricted Fetch/SearXNG adapters, TaskGraph `tool_request` Stage, explicit-`persist` tool cache & API, quality gate & joint audit; `production_network_enabled=false` → research plan |
 | 📝 **Document-maintenance Agent sub-project** | Standalone package (own repo [qlh-docagent](https://github.com/SgfKrc/qlh-docagent), brought in as a submodule): rule-as-data (`RULES.md` + `rules.yaml` driven scanner), rule-change mechanical scanning (delta matrix new/gone/changed + `--max-new/--max-gone` gates), evolution gates (agent rule edits: proposed→preflight→gates→released) with equivalence regression → [plan](../tools/docagent/docs/文档维护Agent工具子项目化与通用化专项计划.md) |
-| 🔌 **Reasonix ↔ Codex bridge sub-project** | Standalone package (own repo [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge), brought in as a submodule): exposes the Reasonix subagent to Codex as stdio MCP tools (`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_status`); CLI path and model ref resolve per machine with zero hard-coding (`node src/configure.mjs list/use/codex/verify`); read-only by default, with controlled writes, change evidence, explicit rollback and read/write profile separation landed by `W1/W2/W3` (off by default); audit fixes `AUD-01`–`AUD-08`, bounded runtime budget extension `R2-EXT-01`, task-level checkpoint/resume `E2-EXT-01`, and explicit read-only parallel/cancel reclamation `R3-EXT-01` landed; `G3` has WSL cross-platform evidence and `R4` makes output truncation deterministic → [roadmap](../tools/reasonix-codex-bridge/docs/reasonix-codex-bridge完善方向-2026-09-12.md) |
+| 🔌 **Reasonix ↔ Codex bridge sub-project** | Standalone package (own repo [reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge), brought in as a submodule): exposes the Reasonix subagent to Codex as stdio MCP tools (`reasonix_run` / `reasonix_resume` / `reasonix_cancel` / `reasonix_rollback` / `reasonix_status`); CLI path and model ref resolve per machine with zero hard-coding (`node src/configure.mjs list/use/codex/verify`); read-only by default, with controlled writes, change evidence, explicit rollback and read/write profile separation landed by `W1/W2/W3` (off by default); audit fixes `AUD-01`–`AUD-08`, bounded runtime budget extension `R2-EXT-01`, task-level checkpoint/resume `E2-EXT-01`, and explicit read-only parallel/cancel reclamation `R3-EXT-01` landed; `G3` has WSL cross-platform evidence and `R4` makes output truncation deterministic → roadmap |
 | 🎯 **Judging-policy fix & DS3 replacing R1** | `loose_contains` + 512 tokens (P5) proven discriminative (Qwen3-4B 1/4 vs 1.8B 0/4); DS3-0324-7B full v2 policy **2/4×3, 8/11×3** (budget 192→512 alone flips 0/4→2/4, confirming the judging-policy problem) → **approved candidate to replace R1** as judging model → [DS3 plan](DistilQwen2.5-DS3-0324替代R1判题模型专项计划.md) |
 
 ### Project Design Philosophy
@@ -169,7 +170,7 @@ Project root
 │   └── node_config.py             # Local node configuration (cluster secret/profile, not source-controlled)
 ├── schemas/                       # ★ MODEL-FLEET frozen contracts (artifact/pull-job/deployment/profile JSON Schema)
 ├── fixtures/                      # Test & walkthrough fixtures (LLM/SSE event streams, model-gate samples)
-├── (sibling) qlh-android/         # Android Full/Lite, JNI, Gradle, Android tests/resources
+├── (sibling) qlh-android/         # Android Edge runtime/client, JNI, Gradle, Android tests/resources
 ├── (sibling) qlh-shell/           # CyberGothic Web/Desktop shell, Node tests, optional Textual
 ├── (sibling) qlh-release/         # Launcher, PyInstaller/Inno/Linux release and release venvs
 ├── (sibling) qlh-toolbox/         # SSH/patch, demo, defense and performance tools
@@ -217,7 +218,7 @@ The main repository pins **three in-house Git submodules**. Android, shell, rele
 |------|------------|------|---------|
 | `tools/docagent` | [SgfKrc/qlh-docagent](https://github.com/SgfKrc/qlh-docagent) | **In-house** | Rule-as-data scanner, mechanical rule-change scanning (new/gone/changed delta matrix) and evolution gates |
 | `tools/reasonix-codex-bridge` | [SgfKrc/reasonix-codex-bridge](https://github.com/SgfKrc/reasonix-codex-bridge) | **In-house** | stdio MCP bridge that lets Codex drive the read-only Reasonix subagent; CLI path and model ref resolve per machine, `configure verify` self-checks |
-| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **External third-party dependency** | Native builds for the Android Full variant; pinned revision, not needed on PC or in Python sidecars |
+| `../qlh-android/app/src/main/cpp/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | **External third-party dependency** | Native builds for the Android Edge runtime; pinned revision, not needed on PC or in Python sidecars |
 
 #### In-house sub-project 1: `qlh-docagent` (document-maintenance Agent)
 
@@ -231,7 +232,7 @@ The main repository pins **three in-house Git submodules**. Android, shell, rele
 - **What it is**: a stdio MCP service that turns Reasonix (a local multi-model coding agent) into something Codex can call, giving Codex a subagent with its **own model and its own quota**.
 - **Capabilities**: five MCP tools (`reasonix_run` / `status` / `resume` / `rollback` / `cancel`); CLI path and model ref resolve per machine with zero hard-coding (`configure list/use/codex/verify`); controlled writes (`allowWrite` + `allowedPaths` allowlist + clean-tree requirement + git-snapshot rollback); task-level checkpoint resume; redacted JSONL run log.
 - **Relationship to this repo**: only a gitlink (`tools/reasonix-codex-bridge`) plus roadmap/audit docs live here; subagent profiles (`deepseek-worker` / `deepseek-worker-write`) are created by the sub-project's `configure profile` in the global Reasonix directory.
-- **Entry points**: [roadmap](../tools/reasonix-codex-bridge/docs/reasonix-codex-bridge完善方向-2026-09-12.md) · [audit report](../tools/reasonix-codex-bridge/docs/reasonix-codex-bridge审计报告-2026-09-12.md) · [ACP session-recovery plan](../tools/reasonix-codex-bridge/docs/reasonix-codex-bridge-ACP会话级恢复专项计划-2026-09-13.md)
+- **Entry points**: roadmap · audit report · ACP session-recovery plan
 
 
 ```bash
@@ -445,7 +446,7 @@ pip install -r requirements.txt
 python -c "import src.api_server" && python -m pytest tests/ -q --collect-only | tail -1
 ```
 
-`llama.cpp` is pinned inside the external `qlh-android` repository at `app/src/main/cpp/llama.cpp`. To keep Android Full build capability, clone `https://github.com/SgfKrc/qlh-android` beside the main repository and initialize its submodule; PC workers and Python sidecars do not need it. `.venv-gemma4-native` uses `llama-cpp-python` and does not reference the Android source tree.
+`llama.cpp` is pinned inside the external `qlh-android` repository at `app/src/main/cpp/llama.cpp`. To keep Android Edge build capability, clone `https://github.com/SgfKrc/qlh-android` beside the main repository and initialize its submodule; PC workers and Python sidecars do not need it. `.venv-gemma4-native` uses `llama-cpp-python` and does not reference the Android source tree.
 
 A PC worker without CUDA / discrete GPU must explicitly install CPU PyTorch; never copy the master's CUDA venv:
 
@@ -484,7 +485,7 @@ At runtime use `execution_device=cpu` (or `auto`, which falls back to CPU when C
 
 ### 3. Installers (usable without cloning)
 
-Windows CPU/CUDA Setup, Launcher, Android Full/Lite APK and Linux `.deb` are all obtained from the **release channel** (on this project's intranet: run `python packaging/serve.py` from the sibling `qlh-release` repository). Installing does not require cloning the main repo; cloning is mainly for development and acceptance.
+Windows CPU/CUDA Setup, Launcher, Android Edge runtime APK and Linux `.deb` are all obtained from the **release channel** (on this project's intranet: run `python packaging/serve.py` from the sibling `qlh-release` repository). Installing does not require cloning the main repo; cloning is mainly for development and acceptance.
 
 ---
 
@@ -789,7 +790,7 @@ sudo systemctl enable --now qlh-edge-inference  # Enable at boot
 
 > Prerequisite: JDK 17 + Android SDK (API 34+) installed, with the SDK path configured in `../qlh-android/local.properties`
 >
-> After cloning `qlh-android`, initialize its llama.cpp submodule first (required for the Full variant's native build; not needed for Lite):
+> After cloning `qlh-android`, initialize its llama.cpp submodule first (required for the Android Edge native runtime):
 
 ```bash
 cd ../qlh-android
@@ -812,9 +813,8 @@ Artifacts:
 
 | Artifact | Path | Typical size | Notes |
 |------|------|---------|------|
-| Full Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | Includes the llama.cpp native backend |
-| Full Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip |
-| Lite Release | `../qlh-android/app/build/outputs/apk/lite/release/app-lite-release.apk` | **~1.5 MB** | Pure thin client, no native libraries |
+| Android Edge Debug | `../qlh-android/app/build/outputs/apk/full/debug/app-full-debug.apk` | ~29 MB | Includes the llama.cpp native backend |
+| Android Edge Release | `../qlh-android/app/build/outputs/apk/full/release/app-full-release.apk` | **~6.7 MB** | R8 + native strip; failure bypass is a runtime policy |
 
 **Install**:
 
@@ -825,8 +825,8 @@ adb install ../qlh-android/app/build/outputs/apk/full/release/app-full-release.a
 **Usage**:
 
 1. Launch the app → select "Settings" in the bottom navigation
-2. Full-Remote Mode: enter the PC master node's Tailscale IP and port → test the connection → start chatting
-3. Full-Local Mode: switch modes → pick a SAF external directory containing `.gguf` files → scan and select a model → run inference offline
+2. Local mode: pick a SAF external directory containing `.gguf` files, prefer a <=1B model, and run inference offline
+3. Cluster mode: register as an Edge node for larger-model sharding; use another node, a full-model node, or a local small model only as failure/resource bypass
 
 ### Distribution Server
 
@@ -842,7 +842,7 @@ The homepage lists:
 
 - Windows PC installer (.exe)
 - Linux installer (.deb)
-- Android Full / Lite APK
+- Android Edge runtime APK
 - PC model archive `models_pc.7z`
 - Android model archive `models_android.7z` (GGUF models only)
 
@@ -926,7 +926,7 @@ The homepage lists:
 
 ## 📚 Documentation Index
 
-Specialized plans are currently in Chinese; start from the **[Mainline Plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md)** and **[Side-line Plan](支线开发计划-外置迁移与Koakumix-2026-09-14.md)**. The [Overall Next-Step Plan](../docs/总体下一步计划.md) is retained as the historical schedule/index, and the [Progress & Next Steps](../docs/archive/项目进展与下一步计划.md) page is an evidence snapshot. Full index: [文档索引](../README.md#-文档索引).
+Specialized plans are currently in Chinese; start from the **[Mainline Plan](主线开发计划-分布式推理与边缘优化-2026-09-14.md)** and **Side-line Plan**. The [Overall Next-Step Plan](../docs/总体下一步计划.md) is retained as the historical schedule/index, and the Progress & Next Steps page is an evidence snapshot. Full index: [文档索引](../README.md#-文档索引).
 
 > **Translation status**: all sections are translated; the Chinese README remains the source of truth for ongoing changes.
 

@@ -108,6 +108,11 @@ class LlamaCppEngine:
         self._embedding_enabled: bool = False
         self._embedding_dimension: int | None = None
         self._embedding_model_id: str = ""
+        self._chat_template: str = ""
+        self._thinking_mode: str = "unknown"
+        self._thinking_enabled: bool | None = None
+        self._thinking_controlled: bool = False
+        self._chat_template_kwargs: Dict[str, Any] = {}
 
     # ================================================================
     # 模型加载
@@ -119,6 +124,7 @@ class LlamaCppEngine:
         n_ctx: int = None,
         n_threads: int = None,
         chat_format: str = None,
+        model_profile: dict = None,
         mmproj_path: str = None,
         mtmd_use_gpu: bool = False,
         embedding: bool = False,
@@ -151,6 +157,12 @@ class LlamaCppEngine:
         if self.is_loaded or self._mtmd_context is not None:
             self.unload()
         self._model_path = model_path
+        model_profile = model_profile if isinstance(model_profile, dict) else {}
+        self._chat_template = str(model_profile.get("template") or "")
+        self._thinking_mode = str(model_profile.get("thinking") or "unknown")
+        self._thinking_enabled = None
+        self._thinking_controlled = False
+        self._chat_template_kwargs = {}
 
         # 自动检测量化类型（从文件名提取）
         for quant_name, fname in QUANT_FILES.items():
@@ -189,6 +201,8 @@ class LlamaCppEngine:
 
             if chat_format:
                 load_kwargs["chat_format"] = chat_format
+            elif self._chat_template == "qwen_chat_v1":
+                load_kwargs["chat_format"] = "chatml"
             elif model_path and "qwen-1_8b" in os.path.basename(model_path).lower():
                 # Qwen-1.8B GGUF metadata is not always detected reliably.
                 load_kwargs["chat_format"] = "chatml"
@@ -197,6 +211,7 @@ class LlamaCppEngine:
 
             self._model = Llama(**load_kwargs)
             self._loaded = True
+            self._install_chat_template_controls()
             self._embedding_enabled = embedding
             self._embedding_dimension = embedding_dimension if embedding else None
             self._embedding_model_id = embedding_model_id.strip() if embedding else ""
@@ -277,6 +292,73 @@ class LlamaCppEngine:
         if budget <= 0:
             return 0
         return max(0, min(total_layers, budget // per_layer))
+
+    def _install_chat_template_controls(self) -> None:
+        """Expose registered template kwargs through the llama.cpp handler."""
+        if self._chat_template != "qwen3_chat_v1":
+            return
+        try:
+            from llama_cpp import llama_chat_format
+
+            base_handler = (
+                getattr(self._model, "chat_handler", None)
+                or getattr(self._model, "_chat_handlers", {}).get(
+                    getattr(self._model, "chat_format", None),
+                )
+                or llama_chat_format.get_chat_completion_handler(
+                    getattr(self._model, "chat_format", None),
+                )
+            )
+            if not callable(base_handler):
+                return
+
+            def chat_handler(*args, **handler_kwargs):
+                template_kwargs = dict(self._chat_template_kwargs)
+                if not template_kwargs:
+                    return base_handler(*args, **handler_kwargs)
+                try:
+                    return base_handler(
+                        *args, **{**template_kwargs, **handler_kwargs},
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword" not in str(exc):
+                        raise
+                    self._thinking_controlled = False
+                    return base_handler(*args, **handler_kwargs)
+
+            self._model.chat_handler = chat_handler
+            self._thinking_controlled = True
+        except Exception:
+            logger.debug("Qwen3 chat-template control unavailable", exc_info=True)
+
+    def _set_thinking_mode(self, enabled: bool | None) -> None:
+        if self._chat_template != "qwen3_chat_v1" or enabled is None:
+            return
+        self._thinking_enabled = bool(enabled)
+        self._chat_template_kwargs = {"enable_thinking": bool(enabled)}
+
+    def _create_chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: List[str] = None,
+        stream: bool,
+        **kwargs,
+    ):
+        self._set_thinking_mode(kwargs.pop("show_thinking", None))
+        self._set_thinking_mode(kwargs.pop("enable_thinking", None))
+        return self._model.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=_merge_stop_sequences(stop),
+            stream=stream,
+            **kwargs,
+        )
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -440,6 +522,11 @@ class LlamaCppEngine:
         self._embedding_enabled = False
         self._embedding_dimension = None
         self._embedding_model_id = ""
+        self._chat_template = ""
+        self._thinking_mode = "unknown"
+        self._thinking_enabled = None
+        self._thinking_controlled = False
+        self._chat_template_kwargs = {}
         logger.info("GGUF 模型已卸载")
 
     @property
@@ -545,6 +632,10 @@ class LlamaCppEngine:
             "embedding": self._embedding_enabled and self.is_loaded,
             "embedding_dimension": self._embedding_dimension if self._embedding_enabled else None,
             "embedding_model_id": self._embedding_model_id if self._embedding_enabled else None,
+            "chat_template": self._chat_template or None,
+            "thinking": self._thinking_mode,
+            "thinking_controlled": self._thinking_controlled,
+            "thinking_enabled": self._thinking_enabled,
         }
 
     @staticmethod
@@ -939,13 +1030,14 @@ class LlamaCppEngine:
         # cooperative cancellation, consume its stream and close at a token
         # boundary; the task coordinator then discards this partial output.
         if cancel_event is not None:
-            stream = self._model.create_chat_completion(
+            stream = self._create_chat_completion(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 stop=_merge_stop_sequences(stop),
                 stream=True,
+                **kwargs,
             )
             content_parts: List[str] = []
             finish_reason = "stop"
@@ -987,12 +1079,14 @@ class LlamaCppEngine:
                 "usage_estimated": True,
             }
 
-        response = self._model.create_chat_completion(
+        response = self._create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             stop=_merge_stop_sequences(stop),
+            stream=False,
+            **kwargs,
         )
 
         elapsed = time.time() - t0
@@ -1042,22 +1136,31 @@ class LlamaCppEngine:
         if not self.is_loaded:
             raise RuntimeError("模型未加载，请先调用 load_model()")
 
-        stream = self._model.create_chat_completion(
+        cancel_event = kwargs.pop("_cancel_event", None)
+        stream = self._create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             stop=_merge_stop_sequences(stop),
             stream=True,
+            **kwargs,
         )
 
-        for chunk in stream:
-            choices = chunk.get("choices", [])
-            if choices:
-                delta = choices[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    yield content
+        try:
+            for chunk in stream:
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
 
     # ================================================================
     # 工具方法
