@@ -1,18 +1,49 @@
 # 上游 llama.cpp `embd` 注入路径非确定性：复现、定位与 issue 材料（2026-09-16）
 
-> 状态：**现行 · issue 材料就绪（根因未坐实）**
+> ## ⚠️ 状态更新（2026-09-16 晚）：**根因已确定并已修复** —— 本文 §5–§12 的结论**全部作废**
 >
-> 适用范围：llama.cpp **CPU 后端**在 `llama_batch.embd`（向量注入）输入路径上的**非确定性**；QLH 层间接力的可复现性口径与绕开方案。
+> **上游给出的根因**（[issue #28963](https://github.com/ggml-org/llama.cpp/issues/28963) 回复）：
+> `llama_batch_allocr::ubatch_add` 对**调用方 `pos` 数组的堆越界读** —— M-RoPE 模型的 `embd` 批次会读
+> `batch.pos[0 .. n_pos_per_embd*n_tokens)`，而 `llama_batch_init` 只分配 `n_tokens` 个条目
+> （valgrind：`Invalid read of size 4 … 0 bytes after a block of size 20 alloc'd`）。
 >
-> 关联：[跨框架层接力重启评估](跨框架层接力重启评估-2026-09-15.md) §7.10/§7.11（该非确定性正是在那里被发现并量化的）· [基线重写方案](基线重写方案-2026-09-16.md) §1.4（工程约束的来源）
+> **本仓库独立复现并验证**（Windows 11 / MSYS2 UCRT64 g++ 15.2.0 / Qwen3.5-2B f16 GGUF / CPU 后端；
+> `qwen35.rope.dimension_sections` 为 4 段，故 `n_pos_per_embd = 4`）。按上游的**调用方修法**
+> （`embd` 批次的 `pos` 按 `4*n_tokens` 分配、每段都填 `pos[j*n_tokens+i] = i`）后：
+>
+> | 实验 | 修复前 | 修复后 |
+> | --- | --- | --- |
+> | `embd` 同输入连跑两次（141 位置） | argmax `126/141`、cosine 0.85–0.99 | **`141/141`，cosine min = 1.000000** |
+> | `embd` vs token 路径（同一 141-token prompt） | argmax `132/141` | **`141/141`，cosine min = 0.999999** |
+> | L→L 层接力 141 步贪心生成 | 第 46–67 步分叉（逐次不同） | **141/141，可重复** |
+>
+> **所以**：所谓"`embd` 路径非确定性"由 **`pos` 越界读**造成，**不是** llama.cpp 的架构限制，
+> 也**不是**跨框架接力的固有缺陷。本文 **§5（定位结论）、§6（已排除项）、§7（候选假设）、
+> §8（绕开口径）、§9（pin 与打补丁）、§11、§12 全部建立在错误前提上，仅作历史记录保留**；
+> 正确结论见 **§13**。
+>
+> 修复补丁（**仅位于被忽略的实验 fork，主仓运行时不依赖**）：
+> `build/cross-framework-layer-poc/patches/embd-pos-overread-fix-2026-09-16.patch`。
 
-## 0. 结论摘要
+> 状态（历史记录）：**issue 材料就绪（根因未坐实）** —— 已被上面的更新取代。
+>
+> 适用范围（历史）：llama.cpp **CPU 后端**在 `llama_batch.embd`（向量注入）输入路径上的**非确定性**；QLH 层间接力的可复现性口径与绕开方案。
+>
+> 关联：[跨框架层接力重启评估](跨框架层接力重启评估-2026-09-15.md) §7.10/§7.11 · [基线重写方案](基线重写方案-2026-09-16.md) §1.4
 
-- **现象可稳定复现**：同一进程、同一 context、同一输入、`llama_memory_clear` 之后重复 decode，`llama_batch.embd` 路径的结果**逐位不等**（cosine 0.984–0.9999）；而 **token 路径逐位完全一致**。
-- **已排除 7 类成因**（见 §6，每条都有实验）：未写入的 `inp->tokens`、多线程归约、KV 容量/未使用区域、残留 KV 内容、ggml 融合算子、Flash Attention、CPU repack。
-- **已定位**：非确定性**只在 attention 层出现**（SSM 层逐位置完全一致，**分叉精确始于第一个 full-attention 层**），且**需要 >1 个 token**；结果由输入决定（全零输入 → 全零输出且确定），但会在**少数几个状态之间循环**。
-- **未找到可直接修改的代码点** → 本轮**不提供上游修复补丁**。交付：① 可粘贴的 issue 材料（§4–§6 + §10 英文正文草稿）② pin 版本口径与**应用层绕开方案**（§8）③ 若上游修复或我们独立定位后的打补丁流程（§9）。
-- **对 QLH 的口径**（已写入《跨框架层接力重启评估》§7.11.3 与《基线重写方案》§1.4）：判据用 argmax、接力实验固定单进程、跨进程"行为等价"与"逐位复现"分开声明。
+## 0. 结论摘要（**已作废 —— 见文首横幅与 §13**）
+
+> 以下五条是 2026-09-16 早期结论，其共同前提（"这是 llama.cpp 固有的非确定性"）**已被推翻**。
+> 保留原文仅为追溯，**任何后续决策不得引用本节**。
+>
+> - ~~**现象可稳定复现**：同一进程、同一 context、同一输入、`llama_memory_clear` 之后重复 decode，`llama_batch.embd` 路径的结果**逐位不等**（cosine 0.984–0.9999）；而 **token 路径逐位完全一致**。~~
+> - ~~**已排除 7 类成因**（见 §6）：未写入的 `inp->tokens`、多线程归约、KV 容量/未使用区域、残留 KV 内容、ggml 融合算子、Flash Attention、CPU repack。~~
+> - ~~**已定位**：非确定性**只在 attention 层出现**，**分叉精确始于第一个 full-attention 层**，且**需要 >1 个 token**。~~
+> - ~~**未找到可直接修改的代码点** → 本轮**不提供上游修复补丁**。~~
+> - ~~**对 QLH 的口径**：判据用 argmax、接力实验固定单进程、跨进程"行为等价"与"逐位复现"分开声明。~~
+>
+> **实际结论**：以上现象的成因是调用方 `pos` 数组被越界读；**按上游修法修好后，`embd` 路径完全逐位确定**
+> （cosine min = 1.000000），上述"排除项/定位/绕开口径"均不再需要。
 
 ## 1. 现象（What）
 
@@ -374,7 +405,70 @@ ROOT=build/cross-framework-layer-poc
 # → RESULT: 在第 4x~5x 步分叉（两次运行分叉点不同）
 ```
 
-**待验证（本轮未做）**：`--threads 1` 下的长序列对照；分叉点是否随 `--gen` 与 prompt 变化；`223145984` 是否可能由工具侧越界打印造成（需在 dump 的完整序列里核对 token id 合法性）。
+**待验证（本节已作废，见 §13）**：~~`--threads 1` 下的长序列对照；分叉点是否随 `--gen` 与 prompt 变化；`223145984` 是否可能由工具侧越界打印造成~~ → 见 §13：分叉成因是调用方 `pos` 越界读；`223145984` 确为工具侧越界打印（已修）。
+
+## 13. 根因确定与修复验证（2026-09-16 晚 —— **本文的有效结论**）
+
+> 本节是本文的**有效结论**；§5–§12 全部作废（原因见文首横幅）。
+
+### 13.1 根因（上游给出，本仓库独立复现确认）
+
+`llama_batch_allocr::ubatch_add`（`llama-batch.cpp`）：
+
+```cpp
+for (size_t j = 0; j < (size_t)n_pos_per_embd; ++j) {
+    // ... otherwise, the input batch is image embeddings, we copy the positions as-is
+    size_t src_off = batch.token ? 0 : j*batch.n_tokens;
+    udata->pos[j*n_tokens + i] = batch.pos[src_off + idxs[i]];
+}
+```
+
+对 **M-RoPE 模型的 `embd` 批次**，该循环读 `batch.pos[0 .. n_pos_per_embd*n_tokens)`；而 `llama.h`
+声明"数组必须为 `n_tokens` 大小"、`llama_batch_init` 也**只分配 `n_tokens` 个 `pos`**
+→ **sections 1..n-1 属堆越界读**。上游 valgrind 实证：
+
+```
+Invalid read of size 4
+   at llama_batch_allocr::ubatch_add(...)
+ Address 0xb4e4244 is 0 bytes after a block of size 20 alloc'd   (20 bytes = 5 positions)
+```
+
+**这解释了此前所有"看着像变量"的现象**：N 的大小、graph reuse 与 fresh context、权重类型
+（F16/Q8_0 的"确定"只是碰巧堆内容）、`X_PERTURB_`、以及"全零输入稳定"（垃圾位置旋转零仍是零）。
+它与 `pos == NULL` 的 #28902 / #28910 是同一循环的孪生情形。
+
+### 13.2 我们的独立验证（Windows / MSYS2 UCRT64 / Qwen3.5-2B f16 / CPU 后端）
+
+`qwen35.rope.dimension_sections` 为 4 段 → `n_pos_per_embd = 4`。采用上游建议的**调用方修法**：
+`embd` 批次的 `pos` 按 `4*n_tokens` 分配，且每段都填 `pos[j*n_tokens + i] = i`。
+
+| 实验（同一 exe、同一输入） | 修复前 | 修复后 |
+| --- | --- | --- |
+| `embd` 连跑两次（141 位置，`relay-check --dump-all`） | argmax `126/141`、cosine 0.85–0.99 | **`141/141`、cosine min = `1.000000`** |
+| `embd` vs token 路径（同一 141-token prompt） | argmax `132/141` | **`141/141`、cosine min = `0.999999`** |
+| token 路径对照（连跑两次） | bitwise 一致 | bitwise 一致（不变） |
+| `llama-relay-gen` L→L 141 步贪心生成（连跑 2 次） | 第 46 / 51 步分叉 | **`全部 141 步一致`（2/2）** |
+
+修法实现见 `build/cross-framework-layer-poc/patches/embd-pos-overread-fix-2026-09-16.patch`
+（`relay-check.cpp` / `relay-gen.cpp` / `embd-inject-test.cpp` 的 `pos4` 分配）。
+**主仓运行时不依赖该补丁**；主仓只记录契约事实 —— **在 M-RoPE 模型上使用 `embd` 批次时，
+调用方的 `pos` 必须按 `n_pos_per_embd * n_tokens` 提供**。
+
+### 13.3 对项目结论的影响（改写）
+
+1. **"`embd` 路径进程内固有非确定性"** ✗ 不成立 —— 是 `pos` 越界读，且**已有可行修复**；
+2. **"D→L 长序列拒绝（132/141、128/141）"** ✗ 不成立 —— 修复后 **141/141**；
+3. **"L→L 16/16 的边界 ≈16 步、长序列会分叉"** ✗ 不成立 —— 修复后 **141/141 全一致**；
+4. **"分歧是 top-1↔top-2 互换、严格判据不可达"** ✗ —— 那些"近并列翻转"同源于越界读；
+5. **"分段短序列接力 / `top_k_tolerant_argmax` 是必要绕开"** ✗ 不再必要 —— 严格判据在修复后可达。
+   `top_k_tolerant_argmax`（`src/relay_contract.py`）**保留为诊断档**，但**不再作为准入依据**；
+6. **未改变的**：Relay 用 argmax 判定、接力实验固定单进程、"行为等价"与"逐位复现"分开声明 —— 这些仍是好实践。
+
+### 13.4 待办
+
+- 若上游在**库侧**修复（对单段位置做广播，或扩展 header 语义），本地补丁即可移除；
+- 重跑此前被"非确定性"阻断的 D→L 正式实验，重新给出准入证据；
+- 回复上游：**仅做独立复现确认**，草稿见 `local_docs/给上游的回复草稿-embd-pos越界-2026-09-16.md`。
 
 ## 变更记录
 
