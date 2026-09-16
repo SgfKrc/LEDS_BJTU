@@ -59,6 +59,8 @@ Runner = Callable[[list[str], float], "tuple[int, str]"]
 class RelaySequences:
     baseline: list[int]
     relay: list[int]
+    baseline_declared: int | None = None
+    relay_declared: int | None = None
 
     @property
     def length(self) -> int:
@@ -119,11 +121,11 @@ class RelayProbePlan:
 def build_plan(
     root: str | Path = DEFAULT_EXPERIMENT_ROOT,
     *,
-    runner: str | Path = DEFAULT_RUNNER,
-    fallback_runner: str | Path = DEFAULT_FALLBACK_RUNNER,
-    upstream_model: str | Path = DEFAULT_UPSTREAM_MODEL,
-    downstream_model: str | Path = DEFAULT_DOWNSTREAM_MODEL,
-    prompt: str | Path = DEFAULT_PROMPT,
+    runner: str | Path | None = None,
+    fallback_runner: str | Path | None = None,
+    upstream_model: str | Path | None = None,
+    downstream_model: str | Path | None = None,
+    prompt: str | Path | None = None,
     n_gen: int = DEFAULT_GEN,
     threads: int = DEFAULT_THREADS,
     timeout_seconds: float = 900.0,
@@ -152,13 +154,20 @@ def parse_sequences(stdout: str) -> RelaySequences | None:
     mistaken for a completed comparison.
     """
     found: dict[str, list[int]] = {}
-    for kind, _declared, payload in _SEQUENCE_PATTERN.findall(stdout or ""):
+    declared: dict[str, int] = {}
+    for kind, count_text, payload in _SEQUENCE_PATTERN.findall(stdout or ""):
         tokens = [int(part) for part in payload.split()]
         if tokens:
             found[kind] = tokens
+            declared[kind] = int(count_text)
     if "baseline" not in found or "relay" not in found:
         return None
-    return RelaySequences(baseline=found["baseline"], relay=found["relay"])
+    return RelaySequences(
+        baseline=found["baseline"],
+        relay=found["relay"],
+        baseline_declared=declared.get("baseline"),
+        relay_declared=declared.get("relay"),
+    )
 
 
 def plan_report(plan: RelayProbePlan) -> dict[str, Any]:
@@ -268,6 +277,23 @@ def _run_relay(plan: RelayProbePlan, *, runner: Runner | None = None) -> dict[st
         report["status"] = "unparsable_output"
         return report
 
+    report["sequence_lengths"] = {
+        "baseline": len(sequences.baseline),
+        "relay": len(sequences.relay),
+        "baseline_declared": sequences.baseline_declared,
+        "relay_declared": sequences.relay_declared,
+        "requested": plan.n_gen,
+    }
+    if (
+        sequences.baseline_declared != len(sequences.baseline)
+        or sequences.relay_declared != len(sequences.relay)
+    ):
+        report["status"] = "sequence_count_mismatch"
+        return report
+    if len(sequences.baseline) != plan.n_gen or len(sequences.relay) != plan.n_gen:
+        report["status"] = "incomplete_sequence"
+        return report
+
     verdict = judge_relay_generation(sequences.baseline, sequences.relay)
     report["status"] = "accepted" if verdict.accepted else "rejected"
     report["verdict"] = verdict.to_dict()
@@ -321,11 +347,11 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = build_plan(
         args.root,
-        runner=args.runner or DEFAULT_RUNNER,
-        fallback_runner=args.fallback_runner or DEFAULT_FALLBACK_RUNNER,
-        upstream_model=args.upstream_model or DEFAULT_UPSTREAM_MODEL,
-        downstream_model=args.downstream_model or DEFAULT_DOWNSTREAM_MODEL,
-        prompt=args.prompt or DEFAULT_PROMPT,
+        runner=args.runner,
+        fallback_runner=args.fallback_runner,
+        upstream_model=args.upstream_model,
+        downstream_model=args.downstream_model,
+        prompt=args.prompt,
         n_gen=args.gen,
         threads=args.threads,
         timeout_seconds=args.timeout,

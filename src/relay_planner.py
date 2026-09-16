@@ -116,8 +116,15 @@ def plan_relay_cut(
     at ``n_layer - 1`` so the handed-off layer stays ``<= n_layer - 2`` (the engine-specific
     last layer never crosses the boundary).
     """
-    total = max(0, int(total_layers))
-    hidden = RelayHiddenSpec(n_embd=int(n_embd), dtype=hidden_dtype)
+    try:
+        total = max(0, int(total_layers))
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        embedding_width = int(n_embd)
+    except (TypeError, ValueError):
+        embedding_width = 0
+    hidden = RelayHiddenSpec(n_embd=embedding_width, dtype=hidden_dtype)
     if isinstance(downstream_profile, RelayDownstreamProfile):
         profile = downstream_profile
     else:
@@ -145,13 +152,18 @@ def plan_relay_cut(
         return reject("model_has_no_relay_range")
 
     if requested_cut is not None:
-        cut = int(requested_cut)
+        try:
+            cut = int(requested_cut)
+        except (TypeError, ValueError):
+            return reject("cut_layer_invalid")
         if cut < CUT_LAYER_MIN or cut > max_cut:
             return reject("cut_layer_out_of_range", cut)
         return _admit(cut, total, hidden.bytes_per_token, profile)
 
     if not profile.profile_available:
         return reject("downstream_profile_missing")
+    if profile.ram_available_gb <= 0:
+        return reject("downstream_capacity_insufficient")
 
     # Conservative auto split: keep one layer downstream, never more than the memory the
     # profile reports as available (hidden bytes per token are tiny, layers are not).

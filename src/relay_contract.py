@@ -44,6 +44,7 @@ def _as_int(value: Any, default: int = 0) -> int:
 class RelayModelIdentity:
     """Identity of one llama.cpp artifact taking part in a relay pipeline."""
 
+    #: Canonical identity of the complete logical model. It is shared by full and cut GGUF.
     model_sha256: str
     architecture: str
     #: GGUF ``<arch>.block_count`` -- includes the multi-token-prediction layer.
@@ -51,6 +52,8 @@ class RelayModelIdentity:
     n_embd: int
     #: GGUF ``<arch>.nextn_predict_layers``; normally 1 for qwen3.5-style models.
     nextn_predict_layers: int = 0
+    #: Digest of this exact artifact. A cut GGUF normally differs from the upstream artifact.
+    artifact_sha256: str = ""
     engine: str = RELAY_ENGINE
 
     @property
@@ -86,7 +89,7 @@ class RelayTrimPlan:
         return _as_int(local_layer) + self.trim_layers
 
     def is_valid(self) -> bool:
-        return CUT_LAYER_MIN <= self.trim_layers < self.source.block_count
+        return CUT_LAYER_MIN <= self.trim_layers < self.source.n_layer
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -180,7 +183,7 @@ def build_relay_handoff(
         return RelayHandoffDecision(False, "model_identity_mismatch")
     if upstream.architecture != downstream.architecture:
         return RelayHandoffDecision(False, "architecture_mismatch")
-    if upstream.n_embd != downstream.n_embd or upstream.n_layer != downstream.n_layer:
+    if upstream.n_embd != downstream.n_embd:
         return RelayHandoffDecision(False, "shape_mismatch")
 
     n_layer = upstream.n_layer
@@ -194,6 +197,16 @@ def build_relay_handoff(
     hidden = RelayHiddenSpec(n_embd=upstream.n_embd, dtype=hidden_dtype)
     if not hidden.supported:
         return RelayHandoffDecision(False, "unsupported_hidden_format")
+
+    # A cut artifact is expected to differ in digest, but its GGUF layout must match the
+    # declared boundary exactly.
+    expected_block_count = upstream.block_count - cut
+    if (
+        downstream.nextn_predict_layers != upstream.nextn_predict_layers
+        or downstream.block_count != expected_block_count
+        or downstream.n_layer != upstream.n_layer - cut
+    ):
+        return RelayHandoffDecision(False, "trim_layout_mismatch")
 
     trim = RelayTrimPlan(trim_layers=cut, source=upstream)
     return RelayHandoffDecision(

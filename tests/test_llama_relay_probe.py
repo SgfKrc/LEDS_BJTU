@@ -17,14 +17,14 @@ from scripts.llama_relay_probe import (
 
 MATCHING_OUTPUT = (
     "=== 汇总 ===\n"
-    "baseline (16): 11751 13 198 32\n"
-    "relay    (16): 11751 13 198 32\n"
-    "RESULT: 全部 16 步一致（relay == baseline）\n"
+    "baseline (4): 11751 13 198 32\n"
+    "relay    (4): 11751 13 198 32\n"
+    "RESULT: 全部 4 步一致（relay == baseline）\n"
 )
 DIVERGING_OUTPUT = (
     "=== 汇总 ===\n"
-    "baseline (16): 11751 13 198 32\n"
-    "relay    (16): 11751 13 999 32\n"
+    "baseline (4): 11751 13 198 32\n"
+    "relay    (4): 11751 13 999 32\n"
 )
 
 
@@ -40,7 +40,7 @@ def _plan(tmp_path: Path, *, create: bool = True, **overrides):
             (tmp_path / name).write_bytes(b"placeholder")
     paths = {key: tmp_path / name for key, name in names.items()}
     paths.update(overrides)
-    return build_plan(root=tmp_path, **paths)
+    return build_plan(root=tmp_path, n_gen=4, **paths)
 
 
 def test_plan_report_is_a_dry_run_that_names_the_argmax_criterion(tmp_path: Path):
@@ -75,6 +75,14 @@ def test_parse_sequences_returns_none_when_a_line_is_missing():
     assert parse_sequences("") is None
 
 
+def test_parse_sequences_preserves_declared_lengths():
+    sequences = parse_sequences("baseline (16): 1 2\nrelay (16): 1 2\n")
+
+    assert sequences is not None
+    assert sequences.baseline_declared == 16
+    assert sequences.relay_declared == 16
+
+
 def test_run_probe_refuses_to_execute_with_missing_assets(tmp_path: Path):
     calls: list[list[str]] = []
 
@@ -105,6 +113,17 @@ def test_run_probe_rejects_a_diverging_relay_sequence(tmp_path: Path):
     assert report["verdict"]["reason"] == "token_mismatch"
     assert report["verdict"]["matched_steps"] == 2
     assert report["verdict"]["diagnostics"] == "first_divergence_step=2"
+
+
+def test_run_probe_rejects_a_short_sequence_even_when_both_sides_match(tmp_path: Path):
+    short = "baseline (2): 1 2\nrelay (2): 1 2\n"
+    report = run_probe(
+        _plan(tmp_path),
+        runner=lambda command, timeout: (0, short),
+    )
+
+    assert report["status"] == "incomplete_sequence"
+    assert report["sequence_lengths"]["requested"] == 4
 
 
 def test_run_probe_never_reports_acceptance_after_a_runner_failure(tmp_path: Path):
@@ -156,3 +175,11 @@ def test_build_plan_clamps_generation_and_thread_bounds(tmp_path: Path):
     assert plan.n_gen == 1
     assert plan.threads == 1
     assert plan.timeout_seconds > 0
+
+
+def test_build_plan_defaults_follow_the_supplied_root(tmp_path: Path):
+    plan = build_plan(root=tmp_path)
+
+    assert plan.runner == tmp_path / "llama.cpp" / "build-cpu" / "bin" / "llama-relay-gen.exe"
+    assert plan.fallback_runner == tmp_path / "llama.cpp" / "build-cpu" / "bin" / "llama-relay-check.exe"
+    assert plan.upstream_model == tmp_path / "out" / "qwen35-2b-f16.gguf"

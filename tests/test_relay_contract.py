@@ -22,6 +22,7 @@ def _identity(**overrides) -> RelayModelIdentity:
         block_count=25,
         n_embd=2048,
         nextn_predict_layers=1,
+        artifact_sha256="b" * 64,
     )
     base.update(overrides)
     return RelayModelIdentity(**base)
@@ -46,7 +47,9 @@ def test_trim_maps_local_layer_to_source_layer_and_keeps_block_count():
 
 
 def test_handoff_admits_matching_engines_and_carries_the_trim_offset():
-    decision = build_relay_handoff(_identity(), _identity(), 4)
+    decision = build_relay_handoff(
+        _identity(), _identity(block_count=21, artifact_sha256="c" * 64), 4
+    )
 
     assert decision.admitted is True
     assert decision.reason == "admitted"
@@ -57,11 +60,15 @@ def test_handoff_admits_matching_engines_and_carries_the_trim_offset():
     assert handoff.downstream_first_source_layer == 4
     assert handoff.hidden.n_embd == 2048
     assert handoff.hidden.bytes_per_token == 2048 * 4
+    assert handoff.downstream.artifact_sha256 != handoff.upstream.artifact_sha256
+    assert handoff.trim.kept_block_count == handoff.downstream.block_count
 
 
 def test_handoff_admits_highest_legal_cut_but_never_the_last_layer():
-    legal = build_relay_handoff(_identity(), _identity(), 23)
-    illegal = build_relay_handoff(_identity(), _identity(), 24)
+    legal = build_relay_handoff(_identity(), _identity(block_count=2), 23)
+    illegal = build_relay_handoff(
+        _identity(), _identity(block_count=1, nextn_predict_layers=0), 24
+    )
 
     assert legal.admitted is True
     assert legal.handoff.upstream_last_layer == 22  # == last_handoff_layer
@@ -76,9 +83,15 @@ def test_handoff_rejects_zero_cut_and_missing_identity():
 
 
 def test_handoff_rejects_identity_architecture_and_shape_mismatch():
-    other_model = build_relay_handoff(_identity(), _identity(model_sha256="b" * 64), 4)
-    other_arch = build_relay_handoff(_identity(), _identity(architecture="llama"), 4)
-    other_shape = build_relay_handoff(_identity(), _identity(n_embd=4096), 4)
+    other_model = build_relay_handoff(
+        _identity(), _identity(model_sha256="c" * 64, block_count=21), 4
+    )
+    other_arch = build_relay_handoff(
+        _identity(), _identity(architecture="llama", block_count=21), 4
+    )
+    other_shape = build_relay_handoff(
+        _identity(), _identity(n_embd=4096, block_count=21), 4
+    )
 
     assert other_model.reason == "model_identity_mismatch"
     assert other_arch.reason == "architecture_mismatch"
@@ -95,10 +108,28 @@ def test_handoff_rejects_cross_engine_until_xframe_ticket():
 
 
 def test_handoff_rejects_unsupported_hidden_format():
-    decision = build_relay_handoff(_identity(), _identity(), 4, hidden_dtype="bfloat16")
+    decision = build_relay_handoff(
+        _identity(), _identity(block_count=21), 4, hidden_dtype="bfloat16"
+    )
 
     assert decision.admitted is False
     assert decision.reason == "unsupported_hidden_format"
+
+
+def test_handoff_rejects_a_downstream_artifact_that_is_not_the_declared_cut():
+    decision = build_relay_handoff(_identity(), _identity(block_count=20), 4)
+
+    assert decision.admitted is False
+    assert decision.reason == "trim_layout_mismatch"
+
+
+def test_handoff_rejects_a_different_mtp_layout():
+    decision = build_relay_handoff(
+        _identity(), _identity(block_count=21, nextn_predict_layers=0), 4
+    )
+
+    assert decision.admitted is False
+    assert decision.reason == "trim_layout_mismatch"
 
 
 def test_hidden_spec_reports_wire_size():

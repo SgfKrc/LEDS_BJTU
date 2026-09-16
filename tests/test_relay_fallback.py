@@ -13,13 +13,13 @@ from scripts.llama_relay_probe import build_plan, run_probe
 
 DIVERGING_OUTPUT = (
     "=== 汇总 ===\n"
-    "baseline (16): 11751 13 198 32\n"
-    "relay    (16): 11751 13 999 32\n"
+    "baseline (4): 11751 13 198 32\n"
+    "relay    (4): 11751 13 999 32\n"
 )
 MATCHING_OUTPUT = (
     "=== 汇总 ===\n"
-    "baseline (16): 11751 13 198 32\n"
-    "relay    (16): 11751 13 198 32\n"
+    "baseline (4): 11751 13 198 32\n"
+    "relay    (4): 11751 13 198 32\n"
 )
 
 
@@ -38,7 +38,7 @@ def _plan(tmp_path: Path, *, create: bool = True, with_fallback: bool = True, **
             (tmp_path / name).write_bytes(b"placeholder")
     paths = {key: tmp_path / name for key, name in names.items()}
     paths.update(overrides)
-    return build_plan(root=tmp_path, **paths)
+    return build_plan(root=tmp_path, n_gen=4, **paths)
 
 
 def test_no_fallback_block_when_the_relay_run_is_accepted(tmp_path: Path):

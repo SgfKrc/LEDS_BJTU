@@ -41,6 +41,13 @@ def test_requested_cut_bounds_never_hand_off_the_last_layer():
     assert too_high.reason == too_low.reason == "cut_layer_out_of_range"
 
 
+def test_invalid_requested_cut_is_rejected_without_raising():
+    decision = plan_relay_cut(24, n_embd=2048, requested_cut="not-an-int")
+
+    assert decision.admitted is False
+    assert decision.reason == "cut_layer_invalid"
+
+
 def test_short_models_and_unsupported_hidden_formats_are_rejected():
     short = plan_relay_cut(1, n_embd=2048, requested_cut=1)
     fmt = plan_relay_cut(24, n_embd=2048, requested_cut=4, hidden_dtype="int8")
@@ -89,3 +96,10 @@ def test_profile_from_device_info_marks_missing_telemetry():
     assert profile.profile_available is False
     assert profile.ram_available_gb == 0.0
     assert profile.rtt_ms == 0.0
+
+
+def test_auto_split_rejects_profile_without_memory_capacity():
+    decision = plan_relay_cut(24, n_embd=2048, downstream_profile=_profile(ram_available_gb=0.0))
+
+    assert decision.admitted is False
+    assert decision.reason == "downstream_capacity_insufficient"
