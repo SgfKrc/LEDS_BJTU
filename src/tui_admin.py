@@ -48,7 +48,8 @@ else:
     import termios
     import tty
 
-APP_TITLE = "QLH 分布式边缘推理 · TUI 管理菜单"
+APP_TITLE = "Koakuma"
+APP_SUBTITLE = "leds-bjtu"
 TUI_VERSION = "1.1.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -2452,7 +2453,7 @@ class InteractiveApp(BaseApp):
     def render(self):
         w, h = self.term.size()
         rows = []
-        title = " %s  v%s   后端 %s" % (APP_TITLE, TUI_VERSION, self.api.base_url)
+        title = " %s · %s  v%s   后端 %s" % (APP_TITLE, APP_SUBTITLE, TUI_VERSION, self.api.base_url)
         rows.append(("title", truncate_display(title, w)))
         rows.append(("dim", "─" * w))
         body_h = max(h - 4, 3)
@@ -2616,7 +2617,7 @@ class PlainApp(BaseApp):
 
     def run(self) -> int:
         print("=" * 64)
-        print(APP_TITLE + "  v" + TUI_VERSION + "  (纯文本模式)")
+        print(APP_TITLE + " · " + APP_SUBTITLE + "  v" + TUI_VERSION + "  (纯文本模式)")
         print("后端: " + self.api.base_url)
         print("输入 / 开头的命令（如 /help /quant int4）可直接操作")
         print("=" * 64)
@@ -2770,6 +2771,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-token", default="",
                    help="远程访问日志接口的 X-QLH-Log-Token")
     p.add_argument("--no-color", action="store_true", help="关闭彩色输出")
+    p.add_argument("--no-splash", action="store_true",
+                   help="跳过启动动画（灰蓝 Koakuma splash；非 TTY 与 --plain 下本就自动跳过）")
     p.add_argument("--version", action="version",
                    version="qlh-tui-admin %s" % TUI_VERSION)
     p.add_argument("command", nargs="?", default=None, metavar="命令",
@@ -2858,6 +2861,27 @@ def main(argv=None) -> int:
         parser.error("unrecognized arguments: %s" % " ".join(command_tail))
 
     if not args.plain:
+        # 启动动画（灰蓝 Koakuma splash）：与"后端健康探测"并行，既播动画又不空等；
+        # 非 TTY（管道/CI）与 --no-splash 自动跳过；动画任何异常都不阻断启动。
+        if not args.no_splash:
+            try:
+                from tui_splash import play_splash  # 同目录（src/）
+
+                def _probe_health():
+                    import urllib.request
+
+                    try:
+                        url = api.base_url.rstrip("/") + "/api/health"
+                        with urllib.request.urlopen(
+                            url, timeout=min(2.0, max(0.5, args.timeout))
+                        ) as resp:
+                            return getattr(resp, "status", None)
+                    except Exception:  # noqa: BLE001 - 后端未起也算正常，启动流程继续
+                        return None
+
+                play_splash(_probe_health, min_show=1.0)
+            except Exception:  # noqa: BLE001 - splash 失败绝不阻断 TUI
+                pass
         term = AnsiTerm(color=not args.no_color)
         try:
             with term:
